@@ -1,0 +1,17 @@
+{
+  "name": "@ours.network/fleet-claude-code",
+  "version": "0.1.0",
+  "description": "Claude Code plugin for ours-fleet — spawn and oversee fleet agents from inside a session. Bundles the spawn-ours-agent and oversee-agents skills; the ours-fleet CLI (@ours.network/fleet) does the actual work.",
+  "license": "FSL-1.1-Apache-2.0",
+  "author": "ours.network contributors",
+  "homepage": "https://github.com/adapt-toolkit/ours-fleet/tree/main/integrations/claude-code#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/adapt-toolkit/ours-fleet.git",
+    "directory": "integrations/claude-code"
+  },
+  "keywords": ["claude", "claude-code", "plugin", "fleet", "agents", "tmux", "spawn", "oversight", "ours"],
+  "files": [".claude-plugin", "skills"],
+  "publishConfig": { "access": "public" },
+  "engines": { "node": ">=20" }
+}
