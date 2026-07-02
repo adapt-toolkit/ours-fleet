@@ -1,0 +1,45 @@
+# fleet.yaml — declarative fleet of persistent agents ("docker-compose for agents").
+#
+#   ours-fleet up            create/start every role (idempotent)
+#   ours-fleet up Alice      only the named role(s)
+#   ours-fleet restart       re-sync + bounce, resuming context
+#   ours-fleet down          stop everything
+#   ours-fleet config        validate + print the merged plan
+#
+# This file is yours — ours-fleet never edits it. Spawned roles land in
+# ~/fleet.d/<Name>.yaml (one machine-written file per role; delete = unspawn).
+
+vars:
+  work_root: /home/me/work
+
+defaults:
+  harness: claude-code        # adapter for roles that don't set their own
+  max_tokens: 500000          # session cap before auto-compact (harness-interpreted)
+
+roles:
+
+  FleetCoordinator:
+    identity: FleetCoordinator
+    cwd: ${work_root}
+    persona: |
+      You are the always-on hub of this fleet. You do not do the work yourself —
+      you decompose owner goals into tasks, dispatch them to the other roles over
+      ours messaging, keep an eye on your wards, and report back.
+    bio: |
+      Fleet coordinator: routes tasks, oversees worker agents, first point of contact.
+    oversee:                  # rendered into the briefing as explicit assignments
+      - { role: Alice, interval: 5m }
+
+  Alice:
+    coordinator: FleetCoordinator   # announces here on boot
+    cwd: ${work_root}/alice
+    mission: Own the alice repository end to end.
+    persona: |
+      You are Alice, sole owner of the alice repository. Fix things at the source,
+      ship sound tests, and escalate cross-repo questions to the coordinator.
+    env:
+      EXAMPLE_FLAG: "1"             # extra env passed into the session
+    harness_options:                # adapter-owned (claude-code shown)
+      plugins:
+        "some-plugin@some-marketplace": false
+      # mem_palace: false           # example: fully disable a memory plugin for this role
