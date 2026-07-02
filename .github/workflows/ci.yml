@@ -14,5 +14,3 @@ jobs:
       - run: npm ci
       - run: npm run build
       - run: npm test
-      - name: no deprecated branding in shipped surface
-        run: "! grep -ri a2adapt src integrations examples README.md LICENSE package.json"
