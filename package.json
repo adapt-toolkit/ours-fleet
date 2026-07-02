@@ -1,0 +1,19 @@
+{
+  "name": "@ours.network/fleet",
+  "version": "0.1.0",
+  "description": "Harness-agnostic fleet of persistent, identity-bound AI agents. Declarative fleet.yaml, tmux consoles, systemd/launchd supervision, ours.network messaging.",
+  "type": "module",
+  "license": "FSL-1.1-Apache-2.0",
+  "repository": { "type": "git", "url": "https://github.com/adapt-toolkit/ours-fleet.git" },
+  "bin": { "ours-fleet": "dist/cli.js" },
+  "main": "dist/index.js",
+  "files": ["dist", "README.md", "LICENSE"],
+  "engines": { "node": ">=20" },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "test": "vitest run",
+    "prepublishOnly": "npm run build && npm test"
+  },
+  "dependencies": { "commander": "^12.1.0", "yaml": "^2.5.0" },
+  "devDependencies": { "@types/node": "^20.14.0", "typescript": "^5.5.0", "vitest": "^2.0.0" }
+}
