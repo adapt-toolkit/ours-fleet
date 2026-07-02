@@ -1,0 +1,5 @@
+{
+  "name": "ours-fleet",
+  "description": "Spawn and oversee ours-fleet agents from inside Claude Code",
+  "version": "0.1.0"
+}
