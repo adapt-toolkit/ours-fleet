@@ -1,0 +1,127 @@
+import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { stringify } from 'yaml';
+import { runOnce, runTemp, buildPaneCommand } from '../src/runner.js';
+import { registerAdapter } from '../src/harness/registry.js';
+import { agentDir } from '../src/paths.js';
+import { Tmux } from '../src/tmux.js';
+import { fakeAdapter } from './registry.test.js';
+import type { Exec } from '../src/exec.js';
+
+let dir: string;
+beforeEach(() => {
+  dir = mkdtempSync(join(tmpdir(), 'ours-fleet-run-'));
+  process.env.OURS_FLEET_HOME = dir;
+  registerAdapter(fakeAdapter);
+});
+afterEach(() => {
+  delete process.env.OURS_FLEET_HOME;
+  rmSync(dir, { recursive: true, force: true });
+});
+
+/** Fake tmux whose pane "process" dies after `lifeChecks` liveness polls,
+ *  writing `.exit-status` (like the pane shell would) at the moment of death. */
+function fakeWorld(opts: { exitCode?: string; lifeChecks?: number; exitDelayMs?: number; exitFile?: string } = {}) {
+  const paneCommands: string[] = [];
+  let clock = 0;
+  let checks = 0;
+  const exec: Exec = async (cmd, args) => {
+    if (args[0] === 'new-session') paneCommands.push(args[args.length - 1]);
+    if (args[0] === 'list-panes') return { stdout: '4242\n', stderr: '', code: 0 };
+    return { stdout: '', stderr: '', code: 0 };
+  };
+  const deps = {
+    tmux: new Tmux(exec),
+    isAlive: () => {
+      checks++;
+      if (checks >= (opts.lifeChecks ?? 2)) {
+        if (opts.exitFile) writeFileSync(opts.exitFile, (opts.exitCode ?? '0') + '\n');
+        return false;
+      }
+      return true;
+    },
+    sleep: async (ms: number) => { clock += opts.exitDelayMs ?? ms; },
+    now: () => clock,
+    log: () => {},
+  };
+  return { deps, paneCommands };
+}
+
+const writeCfg = (roles: Record<string, object>) =>
+  writeFileSync(join(dir, 'fleet.yaml'), stringify({ roles }));
+
+describe('buildPaneCommand', () => {
+  it('escapes argv and env, appends exit capture', () => {
+    const cmd = buildPaneCommand(
+      { argv: ['bin', "it's"], env: { A: 'x y' } }, { B: 'z' }, '/tmp/es');
+    expect(cmd).toContain(`A='x y'`);
+    expect(cmd).toContain(`B='z'`);
+    expect(cmd).toContain(`'bin' 'it'\\''s'`);
+    expect(cmd).toContain(`; echo $? > '/tmp/es'`);
+  });
+});
+
+describe('runOnce', () => {
+  it('fresh boot writes markers and launches with fresh args', async () => {
+    writeCfg({ A: { harness: 'fake' } });
+    const d = agentDir('A');
+    mkdirSync(d, { recursive: true });
+    const { deps, paneCommands } = fakeWorld({ exitCode: '1', lifeChecks: 30, exitFile: join(d, '.exit-status') });
+    await runOnce('A', {}, deps);
+    expect(existsSync(join(d, '.session-id'))).toBe(true);
+    expect(paneCommands[0]).toContain('--sid');       // fake adapter fresh marker
+    expect(paneCommands[0]).toContain('--fake-prep');
+    expect(paneCommands[0]).toContain('FAKE=');
+    // crash (code 1, slow) keeps .booted → next run resumes
+    expect(existsSync(join(d, '.booted'))).toBe(true);
+  });
+
+  it('clean exit rotates session-id and clears .booted', async () => {
+    writeCfg({ A: { harness: 'fake' } });
+    const d = agentDir('A'); mkdirSync(d, { recursive: true });
+    writeFileSync(join(d, '.session-id'), 'OLD\n');
+    const { deps } = fakeWorld({ exitCode: '0', exitFile: join(d, '.exit-status') });
+    await runOnce('A', {}, deps);
+    expect(readFileSync(join(d, '.session-id'), 'utf8').trim()).not.toBe('OLD');
+    expect(existsSync(join(d, '.booted'))).toBe(false);
+  });
+
+  it('fast-failing resume self-heals to fresh', async () => {
+    writeCfg({ A: { harness: 'fake' } });
+    const d = agentDir('A'); mkdirSync(d, { recursive: true });
+    writeFileSync(join(d, '.session-id'), 'OLD\n');
+    writeFileSync(join(d, '.booted'), '');
+    const { deps, paneCommands } = fakeWorld(
+      { exitCode: '1', exitDelayMs: 100, exitFile: join(d, '.exit-status') }); // dies ~0.2s < 20s
+    await runOnce('A', {}, deps);
+    expect(paneCommands[0]).toContain('--resume');
+    expect(readFileSync(join(d, '.session-id'), 'utf8').trim()).not.toBe('OLD');
+    expect(existsSync(join(d, '.booted'))).toBe(false);
+  });
+
+  it('slow crash keeps resume state', async () => {
+    writeCfg({ A: { harness: 'fake' } });
+    const d = agentDir('A'); mkdirSync(d, { recursive: true });
+    writeFileSync(join(d, '.session-id'), 'KEEP\n');
+    writeFileSync(join(d, '.booted'), '');
+    // 30 liveness checks × 2000ms simulated = 60s > fastFailSecs
+    const { deps } = fakeWorld({ exitCode: '137', lifeChecks: 30, exitFile: join(d, '.exit-status') });
+    await runOnce('A', {}, deps);
+    expect(readFileSync(join(d, '.session-id'), 'utf8').trim()).toBe('KEEP');
+    expect(existsSync(join(d, '.booted'))).toBe(true);
+  });
+});
+
+describe('runTemp', () => {
+  it('runs from the tmp snapshot and removes the dir afterwards', async () => {
+    const d = agentDir('T', true);
+    mkdirSync(d, { recursive: true });
+    writeFileSync(join(d, 'role.yaml'),
+      stringify({ name: 'T', harness: 'fake', identity: 'T', sourceFile: 'tmp' }));
+    const { deps } = fakeWorld({ exitCode: '0', exitFile: join(d, '.exit-status') });
+    await runTemp('T', deps);
+    expect(existsSync(d)).toBe(false);
+  });
+});
