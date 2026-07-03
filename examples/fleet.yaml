@@ -14,6 +14,7 @@ vars:
 
 defaults:
   harness: claude-code        # adapter for roles that don't set their own
+  # model: claude-fable-5       # default model for roles without their own (per-role model / --model wins)
   max_tokens: 500000          # session cap before auto-compact (harness-interpreted)
 
 roles:

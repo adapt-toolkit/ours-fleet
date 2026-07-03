@@ -99,6 +99,7 @@ export function loadConfig(configPath?: string): FleetConfig {
         sourceFile: file,
         harness: r.harness ?? (defaults.harness as string | undefined) ?? 'claude-code',
         identity: r.identity ?? name,
+        model: r.model ?? (defaults.model as string | undefined),
         max_tokens: r.max_tokens ?? (defaults.max_tokens as number | undefined),
       });
     }

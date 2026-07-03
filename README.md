@@ -149,6 +149,7 @@ ours-fleet init
 vars: { work_root: /home/me/work }      # ${var} substitution anywhere below
 defaults:
   harness: claude-code                  # for roles that don't set one
+  model: claude-fable-5                 # default model for roles that don't set one (per-role model / --model wins)
   max_tokens: 500000                    # session cap (harness-interpreted)
 roles:
   Name:                                 # [A-Za-z0-9_-]+

@@ -86,6 +86,23 @@ describe('spawn --model', () => {
     const doc = parse(readFileSync(file, 'utf8'));
     expect(doc.roles.Worker2.model).toBeUndefined();
   });
+
+  it('a temp role without model inherits defaults.model', async () => {
+    writeFileSync(join(dir, 'fleet.yaml'),
+      stringify({ defaults: { harness: 'fake', model: 'claude-fable-5' }, roles: {} }));
+    const d = await spawnTemp({ name: 'Scout', mission: 'recon' }, '/b/ours-fleet', () => {});
+    const snap = parse(readFileSync(join(d, 'role.yaml'), 'utf8'));
+    expect(snap.model).toBe('claude-fable-5');
+  });
+
+  it('a temp role model overrides defaults.model', async () => {
+    writeFileSync(join(dir, 'fleet.yaml'),
+      stringify({ defaults: { harness: 'fake', model: 'claude-fable-5' }, roles: {} }));
+    const d = await spawnTemp(
+      { name: 'Scout', model: 'claude-opus-4-8' }, '/b/ours-fleet', () => {});
+    const snap = parse(readFileSync(join(d, 'role.yaml'), 'utf8'));
+    expect(snap.model).toBe('claude-opus-4-8');
+  });
 });
 
 describe('spawnTemp', () => {

@@ -78,6 +78,7 @@ export async function spawnTemp(
     name: o.name,
     harness: o.harness ?? (cfg.defaults.harness as string | undefined) ?? 'claude-code',
     identity: o.identity ?? o.name,
+    model: o.model?.trim() || (cfg.defaults.model as string | undefined),
     sourceFile: '(temp)',
   };
   const dir = applyRole(role, { temp: true });
