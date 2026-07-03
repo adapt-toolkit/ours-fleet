@@ -137,7 +137,7 @@ ours-fleet up|down|restart|force-restart [-c FILE] [Name...]
 ours-fleet config [-c FILE]         validate + print merged plan
 ours-fleet ls | attach | peek | logs [-f] | status <Name>
 ours-fleet send <Name> "text" | --key <K>
-ours-fleet spawn [--temp] <Name> [--mission --bio-file --persona-file ...]
+ours-fleet spawn [--temp] <Name> [--mission --model --bio-file --persona-file ...]
 ours-fleet rm <Name>
 ours-fleet doctor [--harness H]
 ours-fleet init
@@ -149,6 +149,7 @@ ours-fleet init
 vars: { work_root: /home/me/work }      # ${var} substitution anywhere below
 defaults:
   harness: claude-code                  # for roles that don't set one
+  model: claude-fable-5                 # default model for roles that don't set one (per-role model / --model wins)
   max_tokens: 500000                    # session cap (harness-interpreted)
 roles:
   Name:                                 # [A-Za-z0-9_-]+
@@ -156,6 +157,7 @@ roles:
     identity: "Display Name"            # ours identity to bind (default: Name)
     cwd: ${work_root}/repo              # where the harness process runs
     coordinator: FleetCoordinator       # announce target on boot
+    model: claude-fable-5               # launch on a specific model (pass-through id; default: launcher default)
     mission: one line
     persona: |                          # operating contract (published as persona)
     bio: |                              # public card (published as bio)

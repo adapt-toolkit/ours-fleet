@@ -14,6 +14,7 @@ vars:
 
 defaults:
   harness: claude-code        # adapter for roles that don't set their own
+  # model: claude-fable-5       # default model for roles without their own (per-role model / --model wins)
   max_tokens: 500000          # session cap before auto-compact (harness-interpreted)
 
 roles:
@@ -34,6 +35,7 @@ roles:
     coordinator: FleetCoordinator   # announces here on boot
     cwd: ${work_root}/alice
     mission: Own the alice repository end to end.
+    # model: claude-fable-5          # launch this role on a specific model (default: launcher default)
     persona: |
       You are Alice, sole owner of the alice repository. Fix things at the source,
       ship sound tests, and escalate cross-repo questions to the coordinator.

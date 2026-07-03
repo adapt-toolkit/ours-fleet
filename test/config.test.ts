@@ -70,6 +70,35 @@ describe('loadConfig', () => {
     expect(() => loadConfig()).toThrowError(/persnoa.*allowed:.*persona/s);
   });
 
+  it('accepts a per-role model field', () => {
+    base('roles:\n  A:\n    model: claude-fable-5\n  B: {}\n');
+    const cfg = loadConfig();
+    expect(cfg.roles.find(r => r.name === 'A')!.model).toBe('claude-fable-5');
+    expect(cfg.roles.find(r => r.name === 'B')!.model).toBeUndefined();
+  });
+
+  it('still rejects an unknown role key', () => {
+    base('roles:\n  A:\n    modell: oops\n');
+    expect(() => loadConfig()).toThrowError(/unknown key/);
+  });
+
+  it('a role without model inherits defaults.model', () => {
+    base('defaults:\n  model: claude-fable-5\nroles:\n  A: {}\n  B:\n    model: claude-opus-4-8\n');
+    const cfg = loadConfig();
+    expect(findRole(cfg, 'A').model).toBe('claude-fable-5');
+    expect(cfg.defaults.model).toBe('claude-fable-5');
+  });
+
+  it('a per-role model overrides defaults.model', () => {
+    base('defaults:\n  model: claude-fable-5\nroles:\n  B:\n    model: claude-opus-4-8\n');
+    expect(findRole(loadConfig(), 'B').model).toBe('claude-opus-4-8');
+  });
+
+  it('leaves model undefined when neither role nor defaults set it', () => {
+    base('roles:\n  A: {}\n');
+    expect(findRole(loadConfig(), 'A').model).toBeUndefined();
+  });
+
   it('rejects drop-ins defining more than roles', () => {
     base('roles: {}\n');
     dropin('bad.yaml', 'vars:\n  x: 1\nroles: {}\n');

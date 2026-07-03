@@ -62,6 +62,49 @@ describe('spawnPermanent', () => {
   });
 });
 
+describe('spawn --model', () => {
+  it('persists a permanent role model to fleet.d', async () => {
+    const { d } = fakeDeps();
+    const file = await spawnPermanent({ name: 'Worker', model: 'claude-fable-5' }, d);
+    const doc = parse(readFileSync(file, 'utf8'));
+    expect(doc.roles.Worker.model).toBe('claude-fable-5');
+  });
+
+  it('snapshots a temp role model into role.yaml', async () => {
+    const dir = await spawnTemp(
+      { name: 'Scout', model: 'claude-fable-5' },
+      '/b/ours-fleet',
+      () => {},
+    );
+    const snap = parse(readFileSync(join(dir, 'role.yaml'), 'utf8'));
+    expect(snap.model).toBe('claude-fable-5');
+  });
+
+  it('drops an empty/whitespace model', async () => {
+    const { d } = fakeDeps();
+    const file = await spawnPermanent({ name: 'Worker2', model: '   ' }, d);
+    const doc = parse(readFileSync(file, 'utf8'));
+    expect(doc.roles.Worker2.model).toBeUndefined();
+  });
+
+  it('a temp role without model inherits defaults.model', async () => {
+    writeFileSync(join(dir, 'fleet.yaml'),
+      stringify({ defaults: { harness: 'fake', model: 'claude-fable-5' }, roles: {} }));
+    const d = await spawnTemp({ name: 'Scout', mission: 'recon' }, '/b/ours-fleet', () => {});
+    const snap = parse(readFileSync(join(d, 'role.yaml'), 'utf8'));
+    expect(snap.model).toBe('claude-fable-5');
+  });
+
+  it('a temp role model overrides defaults.model', async () => {
+    writeFileSync(join(dir, 'fleet.yaml'),
+      stringify({ defaults: { harness: 'fake', model: 'claude-fable-5' }, roles: {} }));
+    const d = await spawnTemp(
+      { name: 'Scout', model: 'claude-opus-4-8' }, '/b/ours-fleet', () => {});
+    const snap = parse(readFileSync(join(d, 'role.yaml'), 'utf8'));
+    expect(snap.model).toBe('claude-opus-4-8');
+  });
+});
+
 describe('spawnTemp', () => {
   it('snapshots the role and launches the supervisor detached (not in a same-named tmux session)', async () => {
     const launched: { binPath: string; args: string[]; dir: string }[] = [];
