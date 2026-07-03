@@ -1,11 +1,10 @@
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { spawn as spawnChild } from 'node:child_process';
+import { existsSync, mkdirSync, openSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { stringify } from 'yaml';
 import { agentDir, fleetDDir } from './paths.js';
 import { loadConfig, type ResolvedRole, type RoleConfig } from './config.js';
 import { applyRole, up, type OpsDeps } from './ops.js';
-import { shq } from './exec.js';
-import type { Tmux } from './tmux.js';
 
 export interface SpawnOpts {
   name: string;
@@ -51,8 +50,25 @@ export async function spawnPermanent(o: SpawnOpts, deps: OpsDeps): Promise<strin
   return file;
 }
 
+/** Launches the detached temp supervisor (`_run-temp <name>`). Injectable for tests. */
+export type SupervisorLauncher = (binPath: string, args: string[], dir: string) => void;
+
+const detachedSupervisor: SupervisorLauncher = (binPath, args, dir) => {
+  // Log to the temp dir; the fd stays valid even after runTemp removes the dir.
+  const out = openSync(join(dir, 'supervisor.log'), 'a');
+  const child = spawnChild(process.execPath, [binPath, ...args], {
+    detached: true,
+    stdio: ['ignore', out, out],
+  });
+  child.unref();
+};
+
 /** Temp spawn: state under ~/.ours-fleet/tmp, plain tmux, auto-clean on exit. */
-export async function spawnTemp(o: SpawnOpts, tmux: Tmux, binPath: string): Promise<string> {
+export async function spawnTemp(
+  o: SpawnOpts,
+  binPath: string,
+  launch: SupervisorLauncher = detachedSupervisor,
+): Promise<string> {
   assertNameFree(o);
   const cfg = loadConfig(o.configPath);
   const role: ResolvedRole = {
@@ -64,6 +80,11 @@ export async function spawnTemp(o: SpawnOpts, tmux: Tmux, binPath: string): Prom
   };
   const dir = applyRole(role, { temp: true });
   writeFileSync(join(dir, 'role.yaml'), stringify(role));
-  await tmux.newSession(o.name, dir, `${shq(binPath)} _run-temp ${shq(o.name)}`);
+  // Run the supervisor DETACHED — NOT inside a tmux session named <name>.
+  // `_run-temp` -> runOnce() creates AND kills the tmux session <name> for the
+  // agent itself; a supervisor sharing that session name would SIGHUP its own
+  // process before the agent ever launches. Detaching mirrors how systemd hosts
+  // the supervisor for permanent roles, leaving runOnce to own the <name> session.
+  launch(binPath, ['_run-temp', o.name], dir);
   return dir;
 }

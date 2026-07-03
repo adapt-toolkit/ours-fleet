@@ -6,11 +6,9 @@ import { parse, stringify } from 'yaml';
 import { spawnPermanent, spawnTemp } from '../src/spawn.js';
 import { agentDir } from '../src/paths.js';
 import { registerAdapter } from '../src/harness/registry.js';
-import { Tmux } from '../src/tmux.js';
 import { fakeAdapter } from './registry.test.js';
 import type { OpsDeps } from '../src/ops.js';
 import type { SupervisorBackend } from '../src/supervisor/types.js';
-import type { Exec } from '../src/exec.js';
 
 let dir: string;
 beforeEach(() => {
@@ -65,16 +63,20 @@ describe('spawnPermanent', () => {
 });
 
 describe('spawnTemp', () => {
-  it('snapshots the role and launches _run-temp in tmux', async () => {
-    const tmuxCalls: string[][] = [];
-    const exec: Exec = async (cmd, args) => { tmuxCalls.push([cmd, ...args]); return { stdout: '', stderr: '', code: 0 }; };
-    const d = await spawnTemp({ name: 'Scout', mission: 'recon' }, new Tmux(exec), '/b/ours-fleet');
+  it('snapshots the role and launches the supervisor detached (not in a same-named tmux session)', async () => {
+    const launched: { binPath: string; args: string[]; dir: string }[] = [];
+    const d = await spawnTemp(
+      { name: 'Scout', mission: 'recon' },
+      '/b/ours-fleet',
+      (binPath, args, dir) => { launched.push({ binPath, args, dir }); },
+    );
     expect(d).toBe(agentDir('Scout', true));
     const snap = parse(readFileSync(join(d, 'role.yaml'), 'utf8'));
     expect(snap.harness).toBe('fake');       // from defaults
     expect(snap.mission).toBe('recon');
     expect(readFileSync(join(d, 'briefing.md'), 'utf8')).toContain('recon');
-    const ns = tmuxCalls.find(c => c[1] === 'new-session')!;
-    expect(ns[ns.length - 1]).toBe(`'/b/ours-fleet' _run-temp 'Scout'`);
+    // Supervisor launched detached with the temp dir as its state — NOT inside a
+    // tmux session named 'Scout' (which runOnce owns and kills for the agent).
+    expect(launched).toEqual([{ binPath: '/b/ours-fleet', args: ['_run-temp', 'Scout'], dir: d }]);
   });
 });

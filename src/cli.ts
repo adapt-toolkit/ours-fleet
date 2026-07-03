@@ -131,7 +131,7 @@ cOpt(program.command('spawn <name>').description('spawn a new agent (permanent b
     };
     try {
       if (o.temp) {
-        const dir = await spawnTemp(o, new Tmux(), binPath);
+        const dir = await spawnTemp(o, binPath);
         console.log(`spawned temp agent '${name}' (state: ${dir}; gone on exit/reboot)`);
       } else {
         const file = await spawnPermanent(o, deps());
