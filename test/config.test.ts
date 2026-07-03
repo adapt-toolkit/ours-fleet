@@ -70,6 +70,18 @@ describe('loadConfig', () => {
     expect(() => loadConfig()).toThrowError(/persnoa.*allowed:.*persona/s);
   });
 
+  it('accepts a per-role model field', () => {
+    base('roles:\n  A:\n    model: claude-fable-5\n  B: {}\n');
+    const cfg = loadConfig();
+    expect(cfg.roles.find(r => r.name === 'A')!.model).toBe('claude-fable-5');
+    expect(cfg.roles.find(r => r.name === 'B')!.model).toBeUndefined();
+  });
+
+  it('still rejects an unknown role key', () => {
+    base('roles:\n  A:\n    modell: oops\n');
+    expect(() => loadConfig()).toThrowError(/unknown key/);
+  });
+
   it('rejects drop-ins defining more than roles', () => {
     base('roles: {}\n');
     dropin('bad.yaml', 'vars:\n  x: 1\nroles: {}\n');

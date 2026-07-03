@@ -14,6 +14,7 @@ export interface RoleConfig {
   persona?: string;
   bio?: string;
   briefing_file?: string;
+  model?: string;
   max_tokens?: number;
   autocompact_pct?: number;
   env?: Record<string, string>;
@@ -40,7 +41,7 @@ export class ConfigError extends Error {}
 const NAME_RE = /^[A-Za-z0-9_-]+$/;
 const ROLE_KEYS = [
   'harness', 'identity', 'cwd', 'coordinator', 'mission', 'persona', 'bio',
-  'briefing_file', 'max_tokens', 'autocompact_pct', 'env', 'oversee', 'harness_options',
+  'briefing_file', 'model', 'max_tokens', 'autocompact_pct', 'env', 'oversee', 'harness_options',
 ];
 
 function deepSub(v: unknown, vars: Record<string, string>): unknown {
