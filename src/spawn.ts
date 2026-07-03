@@ -14,6 +14,7 @@ export interface SpawnOpts {
   identity?: string;
   cwd?: string;
   coordinator?: string;
+  model?: string;
   bioFile?: string;
   personaFile?: string;
   overseeInterval?: string;
@@ -27,6 +28,7 @@ function roleFromOpts(o: SpawnOpts): RoleConfig {
   if (o.cwd) r.cwd = o.cwd;
   if (o.coordinator) r.coordinator = o.coordinator;
   if (o.mission) r.mission = o.mission;
+  if (o.model?.trim()) r.model = o.model.trim();
   if (o.bioFile) r.bio = readFileSync(o.bioFile, 'utf8').trim();
   if (o.personaFile) r.persona = readFileSync(o.personaFile, 'utf8').trim();
   return r;
