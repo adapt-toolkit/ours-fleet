@@ -91,7 +91,8 @@ export function makeClaudeCodeAdapter(exec: Exec = realExec): HarnessAdapter {
 
     buildLaunch(role: ResolvedRole, mode: 'fresh' | 'resume', s: SessionState, prep: SessionPrep): Launch {
       const stateDir = roleStateDir(role);
-      const base = ['claude', ...prep.argv, '--remote-control', role.name];
+      const base = ['claude', ...(role.model ? ['--model', role.model] : []),
+                    ...prep.argv, '--remote-control', role.name];
       const argv = mode === 'fresh'
         ? [...base, '--session-id', s.sessionId, `Read and follow ${join(stateDir, 'briefing.md')} now.`]
         : [...base, '--resume', s.sessionId,

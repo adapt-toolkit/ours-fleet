@@ -99,6 +99,22 @@ describe('buildLaunch', () => {
     expect(resume.argv[7]).toContain('ours-mcp watch "Alice Dev"');
     expect(resume.argv[7].toLowerCase()).not.toContain('a2adapt');
   });
+
+  it('injects --model right after claude when role.model is set (fresh + resume)', () => {
+    const a = makeClaudeCodeAdapter(okExec);
+    const r = role({ model: 'claude-fable-5' });
+    const prep = { argv: ['--settings', '/o.json'], env: {} };
+
+    const fresh = a.buildLaunch(r, 'fresh', { sessionId: 'SID' }, prep);
+    expect(fresh.argv.slice(0, 5)).toEqual(
+      ['claude', '--model', 'claude-fable-5', '--settings', '/o.json']);
+    // trailing positional prompt is still last
+    expect(fresh.argv[fresh.argv.length - 1]).toContain('briefing.md now.');
+
+    const resume = a.buildLaunch(r, 'resume', { sessionId: 'SID' }, prep);
+    expect(resume.argv.slice(0, 5)).toEqual(
+      ['claude', '--model', 'claude-fable-5', '--settings', '/o.json']);
+  });
 });
 
 describe('validateOptions / prereqs', () => {
