@@ -1,6 +1,6 @@
 {
   "name": "@ours.network/fleet",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "Harness-agnostic fleet of persistent, identity-bound AI agents. Declarative fleet.yaml, tmux consoles, systemd/launchd supervision, ours.network messaging.",
   "type": "module",
   "license": "FSL-1.1-Apache-2.0",
