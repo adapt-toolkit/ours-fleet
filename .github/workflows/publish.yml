@@ -1,0 +1,107 @@
+name: CI
+
+# Gates → Conventional-Commits version bump → publish @ours.network/fleet
+# (the CLI, repo root) then @ours.network/fleet-claude-code (the Claude Code
+# plugin, integrations/claude-code — static files, no build).
+#
+# Prerequisites (one-time, GitHub repo settings → secrets):
+#   - NPM_TOKEN: npm automation token with publish rights to the
+#     @ours.network scope (covers BOTH packages).
+#   - VERSION_BUMP_APP_ID / VERSION_BUMP_APP_PRIVATE_KEY: the version-bump
+#     GitHub App (must be installed on this repo) so the bump commit can push
+#     past branch protection.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+# Cancel superseded runs on the same ref so a burst of pushes doesn't queue a
+# full release per commit — only the latest ref state is gated and published.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  gates:
+    runs-on: ubuntu-latest
+    name: Gates (build · test)
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+      - run: npm ci
+      - run: npm run build
+      - run: npm test
+
+  # Bumps BOTH package versions in one [skip ci] commit (each from
+  # max(local, npm-published)) and pushes back to main via a GitHub App token.
+  # Gated on gates going green.
+  version-bump:
+    needs: gates
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    name: Version bump
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    outputs:
+      bumped: ${{ steps.bump.outputs.bumped }}
+      new-sha: ${{ steps.bump.outputs.new-sha }}
+      cli-version: ${{ steps.bump.outputs.cli-version }}
+      plugin-version: ${{ steps.bump.outputs.plugin-version }}
+    steps:
+      - name: Generate app token
+        id: app-token
+        uses: actions/create-github-app-token@v2
+        with:
+          app-id: ${{ secrets.VERSION_BUMP_APP_ID }}
+          private-key: ${{ secrets.VERSION_BUMP_APP_PRIVATE_KEY }}
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+          token: ${{ steps.app-token.outputs.token }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+      - name: Run version bump
+        id: bump
+        run: bash .github/workflows/scripts/bump-versions.sh
+
+  # Publishes the CLI then the plugin from the post-bump SHA, so published
+  # versions always match the committed package.json files. Only runs when the
+  # bump produced new versions (re-publishing an existing version would 403).
+  npm-publish:
+    needs: [gates, version-bump]
+    if: needs.version-bump.outputs.bumped == 'true'
+    runs-on: ubuntu-latest
+    name: Publish to npm
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.version-bump.outputs.new-sha }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          registry-url: https://registry.npmjs.org
+      - run: npm ci
+      - name: Publish @ours.network/fleet
+        run: npm publish --access public
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+      - name: Publish @ours.network/fleet-claude-code
+        working-directory: integrations/claude-code
+        run: npm publish --access public
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+      - name: Summary
+        run: |
+          echo "Published @ours.network/fleet@${{ needs.version-bump.outputs.cli-version }} and @ours.network/fleet-claude-code@${{ needs.version-bump.outputs.plugin-version }}." >> "$GITHUB_STEP_SUMMARY"
