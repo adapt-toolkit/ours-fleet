@@ -48,4 +48,24 @@ describe('ours-fleet CLI', () => {
     expect(r.code).toBe(1);
     expect(r.stderr).toContain('config not found');
   });
+
+  it('spawn --help lists the --model option', async () => {
+    const r = await run(['spawn', '--help']);
+    expect(r.code).toBe(0);
+    expect(r.stdout).toContain('--model');
+  });
+
+  it('config prints a role model from fleet.d', async () => {
+    const { mkdirSync, writeFileSync } = await import('node:fs');
+    const { stringify } = await import('yaml');
+    mkdirSync(join(dir, 'fleet.d'), { recursive: true });
+    writeFileSync(
+      join(dir, 'fleet.d', 'M.yaml'),
+      stringify({ roles: { M: { model: 'claude-fable-5' } } }));
+    const r = await run(['config']);
+    expect(r.code).toBe(0);
+    expect(r.stdout).toContain('● M');
+    expect(r.stdout).toContain('model:');
+    expect(r.stdout).toContain('claude-fable-5');
+  });
 });

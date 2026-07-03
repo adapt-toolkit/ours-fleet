@@ -50,6 +50,7 @@ cOpt(program.command('config').description('validate + print the merged plan (no
         console.log(`    identity:    ${r.identity}`);
         console.log(`    source:      ${r.sourceFile}`);
         if (r.cwd) console.log(`    cwd:         ${r.cwd}`);
+        if (r.model) console.log(`    model:       ${r.model}`);
         if (r.coordinator) console.log(`    coordinator: ${r.coordinator}`);
         if (r.mission) console.log(`    mission:     ${r.mission.split('\n')[0]}`);
         if (r.oversee?.length) console.log(`    oversees:    ${r.oversee.map(o => `${o.role}@${o.interval}`).join(', ')}`);
@@ -121,12 +122,14 @@ cOpt(program.command('spawn <name>').description('spawn a new agent (permanent b
   .option('--identity <name>', 'ours identity to bind (default: role name)')
   .option('--cwd <dir>', 'working directory')
   .option('--coordinator <name>', 'announce target')
+  .option('--model <id>', 'model id to launch on (e.g. claude-fable-5); default: launcher default')
   .option('--bio-file <file>', 'public bio (file)')
   .option('--persona-file <file>', 'persona / operating contract (file)')
   .action(async (name, opts) => {
     const o: SpawnOpts = {
       name, temp: opts.temp, harness: opts.harness, mission: opts.mission,
       identity: opts.identity, cwd: opts.cwd, coordinator: opts.coordinator,
+      model: opts.model,
       bioFile: opts.bioFile, personaFile: opts.personaFile, configPath: opts.configuration,
     };
     try {
