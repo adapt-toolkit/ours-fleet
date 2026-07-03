@@ -187,7 +187,7 @@ for the reference implementation.
 ours-fleet is part of [ours.network](https://ours.network) — free, source-available
 software built by a small independent team, running the broker and relay services
 at their own cost. If this is useful to you, please consider chipping in:
-**→ https://ours.network/donate**
+**→ https://github.com/adapt-toolkit/ours-donate**
 
 ## License
 
