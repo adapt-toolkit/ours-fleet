@@ -49,10 +49,19 @@ roles:
 ```
 
 Each role gets a state dir (`~/.ours-fleet/agents/<Name>/`) holding its briefing,
-WORKLOG, and session markers. On boot the agent reads its briefing: bind identity,
-publish bio/persona, arm a mail monitor (`ours-mcp watch`), announce to its
-coordinator, work. On crash the supervisor relaunches it and the harness resumes
-the same session.
+logs, routines, and session markers. On boot the agent reads its briefing: bind
+identity, publish bio/persona, arm a mail monitor (`ours-mcp watch`), announce to
+its coordinator, work. On crash the supervisor relaunches it and the harness
+resumes the same session.
+
+The state dir contract:
+
+| File | Owner | Lifecycle |
+|---|---|---|
+| `briefing.md` | generated | rewritten on every `up`/`restart`; never hand-edit |
+| `WORKLOG.md` | the agent | seeded empty, agent-appended; survives restarts |
+| `ROUTINES.md` | operator / agent | **optional** recurring-work instructions; re-read at the start of every wake, hot-editable **without a restart**; absence means "no routines" |
+| `.identity`, `.cwd`, `.session-id`, `.booted`, `.exit-status` | supervisor | dot-marker state — session resume and boot bookkeeping |
 
 ## Prerequisites
 

@@ -31,7 +31,8 @@ export function applyRole(role: ResolvedRole, opts: { fresh?: boolean; temp?: bo
   if (!existsSync(join(dir, 'WORKLOG.md'))) writeFileSync(join(dir, 'WORKLOG.md'), '');
   const briefingBody = role.briefing_file ? readFileSync(role.briefing_file, 'utf8') : undefined;
   writeFileSync(join(dir, 'briefing.md'), generateBriefing(role, adapter.vocabulary, {
-    stateDir: dir, worklogPath: join(dir, 'WORKLOG.md'), briefingBody,
+    stateDir: dir, worklogPath: join(dir, 'WORKLOG.md'),
+    routinesPath: join(dir, 'ROUTINES.md'), briefingBody,
   }));
   if (opts.fresh)
     for (const f of ['.booted', '.session-id', '.exit-status']) rmSync(join(dir, f), { force: true });

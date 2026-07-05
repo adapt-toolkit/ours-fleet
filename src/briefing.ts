@@ -5,6 +5,7 @@ import type { BriefingVocab } from './harness/types.js';
 export interface BriefingOpts {
   stateDir: string;
   worklogPath: string;
+  routinesPath: string;
   /** Curated body (from briefing_file) replacing the narrative sections. */
   briefingBody?: string;
 }
@@ -68,6 +69,10 @@ export function generateBriefing(role: ResolvedRole, v: BriefingVocab, opts: Bri
   L.push('', '## Durable log');
   L.push(`Append important commands / decisions / results to \`${opts.worklogPath}\` as you go —`);
   L.push('it survives restarts.');
+  L.push('', '## Routines');
+  L.push(`If \`${opts.routinesPath}\` exists, re-read it at the START of every wake — before acting`);
+  L.push('on messages, timers, or prompts — and follow it for recurring or scheduled work. It may');
+  L.push('change between wakes without a restart; treat the file, not your memory of it, as current.');
   L.push('', '## On restart (you run under a supervised launcher)');
   L.push(`On restart, WITHOUT asking: re-bind (**${v.bindTool}** name "${id}" force=true),`);
   L.push(`re-arm the \`${v.watchCommand(id)}\` monitor, then continue from your WORKLOG.`);
