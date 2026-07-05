@@ -126,6 +126,54 @@ describe('buildLaunch', () => {
     const fresh = a.buildLaunch(r, 'fresh', { sessionId: 'SID' }, prep);
     expect(fresh.argv.slice(0, 3)).toEqual(['claude', '--model', 'claude-fable-5']);
   });
+
+  it('injects --permission-mode when harness_options.permission_mode is set', () => {
+    const a = makeClaudeCodeAdapter(okExec);
+    const r = role({ harness_options: { permission_mode: 'dontAsk' } });
+    const prep = { argv: ['--settings', '/o.json'], env: {} };
+    const fresh = a.buildLaunch(r, 'fresh', { sessionId: 'SID' }, prep);
+    expect(fresh.argv).toEqual([
+      'claude', '--permission-mode', 'dontAsk', '--settings', '/o.json',
+      '--remote-control', 'Alice',
+      '--session-id', 'SID', `Read and follow ${agentDir('Alice')}/briefing.md now.`,
+    ]);
+    const resume = a.buildLaunch(r, 'resume', { sessionId: 'SID' }, prep);
+    expect(resume.argv.slice(0, 5)).toEqual(
+      ['claude', '--permission-mode', 'dontAsk', '--settings', '/o.json']);
+  });
+
+  it('accepts every valid permission mode', () => {
+    const a = makeClaudeCodeAdapter(okExec);
+    const prep = { argv: [], env: {} };
+    for (const pm of ['default', 'acceptEdits', 'plan', 'dontAsk', 'bypassPermissions']) {
+      const r = role({ harness_options: { permission_mode: pm } });
+      const launch = a.buildLaunch(r, 'fresh', { sessionId: 'SID' }, prep);
+      expect(launch.argv.slice(0, 3)).toEqual(['claude', '--permission-mode', pm]);
+    }
+  });
+
+  it('argv is byte-identical to before when permission_mode is unset (backward compat)', () => {
+    const a = makeClaudeCodeAdapter(okExec);
+    const prep = { argv: ['--settings', '/o.json'], env: {} };
+    const without = a.buildLaunch(role(), 'fresh', { sessionId: 'SID' }, prep);
+    const withEmpty = a.buildLaunch(
+      role({ harness_options: {} }), 'fresh', { sessionId: 'SID' }, prep);
+    expect(without.argv).toEqual([
+      'claude', '--settings', '/o.json', '--remote-control', 'Alice',
+      '--session-id', 'SID', `Read and follow ${agentDir('Alice')}/briefing.md now.`,
+    ]);
+    expect(withEmpty.argv).toEqual(without.argv);
+  });
+
+  it('throws a clear error naming allowed values on a bad permission_mode', () => {
+    const a = makeClaudeCodeAdapter(okExec);
+    const r = role({ harness_options: { permission_mode: 'yolo' } });
+    const prep = { argv: [], env: {} };
+    expect(() => a.buildLaunch(r, 'fresh', { sessionId: 'SID' }, prep))
+      .toThrow(/permission_mode/);
+    expect(() => a.buildLaunch(r, 'fresh', { sessionId: 'SID' }, prep))
+      .toThrow(/default, acceptEdits, plan, dontAsk, bypassPermissions/);
+  });
 });
 
 describe('validateOptions / prereqs', () => {
@@ -134,6 +182,10 @@ describe('validateOptions / prereqs', () => {
     const errs = a.validateOptions({ plugin: {} });
     expect(errs).toHaveLength(1);
     expect(errs[0].message).toContain('allowed: plugins');
+  });
+  it('accepts permission_mode as a known option key', () => {
+    const a = makeClaudeCodeAdapter(okExec);
+    expect(a.validateOptions({ permission_mode: 'dontAsk' })).toEqual([]);
   });
   it('reports missing claude binary', async () => {
     const a = makeClaudeCodeAdapter(async () => ({ stdout: '', stderr: '', code: 127 }));

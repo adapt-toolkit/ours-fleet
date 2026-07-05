@@ -12,8 +12,22 @@ interface ClaudeOptions {
   plugins?: Record<string, boolean>;
   mem_palace?: boolean;
   mem_palace_midsession_autosave?: boolean;
+  permission_mode?: string;
 }
-const OPTION_KEYS = ['plugins', 'mem_palace', 'mem_palace_midsession_autosave'];
+const OPTION_KEYS = ['plugins', 'mem_palace', 'mem_palace_midsession_autosave', 'permission_mode'];
+
+/** Claude Code's accepted --permission-mode values. */
+const PERMISSION_MODES = ['default', 'acceptEdits', 'plan', 'dontAsk', 'bypassPermissions'];
+
+/** Resolve & validate the per-role permission mode, throwing on an unknown value. */
+function permissionMode(role: ResolvedRole): string | undefined {
+  const pm = (role.harness_options as ClaudeOptions | undefined)?.permission_mode;
+  if (pm == null) return undefined;
+  if (!PERMISSION_MODES.includes(pm))
+    throw new Error(
+      `invalid harness_options.permission_mode "${pm}"; allowed: ${PERMISSION_MODES.join(', ')}`);
+  return pm;
+}
 
 /** Context window of the fleet model (1M); max_tokens → % of this. */
 const WINDOW = 1_000_000;
@@ -91,7 +105,9 @@ export function makeClaudeCodeAdapter(exec: Exec = realExec): HarnessAdapter {
 
     buildLaunch(role: ResolvedRole, mode: 'fresh' | 'resume', s: SessionState, prep: SessionPrep): Launch {
       const stateDir = roleStateDir(role);
+      const pm = permissionMode(role);
       const base = ['claude', ...(role.model ? ['--model', role.model] : []),
+                    ...(pm ? ['--permission-mode', pm] : []),
                     ...prep.argv, '--remote-control', role.name];
       const argv = mode === 'fresh'
         ? [...base, '--session-id', s.sessionId, `Read and follow ${join(stateDir, 'briefing.md')} now.`]

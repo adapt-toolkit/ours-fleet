@@ -167,6 +167,8 @@ roles:
     harness_options:                    # adapter-owned, adapter-validated
       plugins: { "name@marketplace": false }   # claude-code: plugin overrides
       # mem_palace: false                      # claude-code: disable memory plugin
+      # permission_mode: dontAsk               # claude-code: launch permission mode —
+      #   one of default | acceptEdits | plan | dontAsk | bypassPermissions
 ```
 
 Merge order: `fleet.yaml` ← `fleet.d/*.yaml`; a duplicate role name is a hard
