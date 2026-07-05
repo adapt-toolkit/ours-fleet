@@ -62,6 +62,13 @@ describe('applyRole', () => {
     expect(readFileSync(join(d1, '.session-id'), 'utf8')).toBe(sid);
   });
 
+  it('references ROUTINES.md in the briefing but never seeds the file', () => {
+    writeCfg({ A: { harness: 'fake', identity: 'Ay' } });
+    const d1 = applyRole(loadConfig().roles[0]);
+    expect(readFileSync(join(d1, 'briefing.md'), 'utf8')).toContain(join(d1, 'ROUTINES.md'));
+    expect(existsSync(join(d1, 'ROUTINES.md'))).toBe(false);   // absence is meaningful
+  });
+
   it('fresh clears resume markers', () => {
     writeCfg({ A: { harness: 'fake' } });
     const role = loadConfig().roles[0];

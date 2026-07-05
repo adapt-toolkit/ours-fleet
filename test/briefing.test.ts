@@ -8,7 +8,11 @@ const base: ResolvedRole = {
   name: 'Alice', harness: 'fake', identity: 'Alice Dev', sourceFile: 'x.yaml',
   persona: 'Own the Alice codebase.', mission: 'ship v1',
 };
-const opts = { stateDir: '/s/agents/Alice', worklogPath: '/s/agents/Alice/WORKLOG.md' };
+const opts = {
+  stateDir: '/s/agents/Alice',
+  worklogPath: '/s/agents/Alice/WORKLOG.md',
+  routinesPath: '/s/agents/Alice/ROUTINES.md',
+};
 
 describe('generateBriefing', () => {
   it('renders identity boot steps from the vocabulary', () => {
@@ -65,5 +69,22 @@ describe('generateBriefing', () => {
     expect(b).not.toContain('## Charter');
     expect(b).toContain('choose_identity');   // boot steps always appended
     expect(b).toContain('## On restart');
+  });
+
+  it('renders the Routines section with the injected routinesPath', () => {
+    const b = generateBriefing(base, vocab, opts);
+    expect(b).toContain('## Routines');
+    expect(b).toContain('/s/agents/Alice/ROUTINES.md');
+    expect(b).toContain('re-read it at the START of every wake');
+    // Mechanical section: sits right after the Durable log section.
+    expect(b.indexOf('## Routines')).toBeGreaterThan(b.indexOf('## Durable log'));
+  });
+
+  it('renders the Routines section even with a curated briefingBody', () => {
+    const b = generateBriefing(base, vocab, { ...opts, briefingBody: 'CUSTOM CURATED TEXT' });
+    expect(b).toContain('CUSTOM CURATED TEXT');
+    expect(b).not.toContain('## Charter');   // narrative replaced
+    expect(b).toContain('## Routines');       // mechanical section still rendered
+    expect(b).toContain('/s/agents/Alice/ROUTINES.md');
   });
 });
