@@ -2,15 +2,21 @@ import { existsSync, readFileSync, writeFileSync, rmSync, mkdirSync } from 'node
 import { join } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { parse } from 'yaml';
-import { agentDir } from './paths.js';
+import { agentDir, home } from './paths.js';
 import { loadConfig, findRole, type ResolvedRole } from './config.js';
 import { getAdapter } from './harness/registry.js';
 import type { Launch } from './harness/types.js';
 import { Tmux } from './tmux.js';
-import { shq } from './exec.js';
+import { realExec, shq, type Exec } from './exec.js';
+import { resolveIsolation } from './isolation/policy.js';
+import { selectIsolationBackend } from './isolation/registry.js';
+import { resourceArgs, cpuControllerDelegated } from './isolation/resources.js';
+import type { WrapContext } from './isolation/types.js';
 
 export interface RunnerDeps {
   tmux: Tmux;
+  exec: Exec;
+  cpuDelegated(): boolean;
   isAlive(pid: number): boolean;
   sleep(ms: number): Promise<void>;
   now(): number;
@@ -19,19 +25,28 @@ export interface RunnerDeps {
 
 const defaultDeps = (): RunnerDeps => ({
   tmux: new Tmux(),
+  exec: realExec,
+  cpuDelegated: () => cpuControllerDelegated(),
   isAlive: pid => { try { process.kill(pid, 0); return true; } catch { return false; } },
   sleep: ms => new Promise(r => setTimeout(r, ms)),
   now: () => Date.now(),
   log: line => process.stderr.write(line + '\n'),
 });
 
-/** Compose the tmux pane shell command: env prefix + argv + exit-status capture. */
+/**
+ * Compose the tmux pane shell command: env prefix + argv + exit-status capture.
+ * `paneArgv` defaults to `launch.argv`; when isolation is active the caller passes
+ * the sandbox-wrapped argv (e.g. `bwrap … -- claude …`). The `env` prefix and the
+ * `echo $? > exitfile` capture stay host-side, outside the sandbox, so the runner
+ * still sees the real exit code.
+ */
 export function buildPaneCommand(
   launch: Launch, roleEnv: Record<string, string> | undefined, exitStatusPath: string,
+  paneArgv: string[] = launch.argv,
 ): string {
   const env = { PATH: process.env.PATH ?? '', ...launch.env, ...(roleEnv ?? {}) };
   const envPfx = 'env ' + Object.entries(env).map(([k, v]) => `${k}=${shq(v)}`).join(' ');
-  const cmd = launch.argv.map(shq).join(' ');
+  const cmd = paneArgv.map(shq).join(' ');
   return `${envPfx} ${cmd}; echo $? > ${shq(exitStatusPath)}`;
 }
 
@@ -69,9 +84,30 @@ export async function runOnce(
   const runCwd = role.cwd && existsSync(role.cwd) ? role.cwd : dir;
   const prep = await adapter.prepareSession(role, { stateDir: dir, runCwd });
   const launch = adapter.buildLaunch(role, mode, { sessionId }, prep);
+
+  // Isolation is additive: only roles that declare `isolation:` are wrapped. The
+  // env prefix + exit capture in buildPaneCommand stay host-side (see §5.3).
+  let paneArgv = launch.argv;
+  if (role.isolation) {
+    const ctx: WrapContext = { stateDir: dir, runCwd, home: home() };
+    const policy = resolveIsolation(role.isolation, ctx);
+    const sel = await selectIsolationBackend(policy, deps.exec);  // throws on strict + unavailable
+    if (sel.degraded)
+      deps.log(`[${name}] WARNING isolation requested but unavailable -> running UN-ISOLATED: ${sel.detail}`);
+    else
+      deps.log(`[${name}] isolation: ${sel.backend.id} (net=${policy.network}) ${sel.detail}`);
+    paneArgv = sel.backend.wrap(launch.argv, policy, ctx);
+
+    // Resource caps wrap the sandbox from OUTSIDE, at the pane's own cgroup scope
+    // (§5.4). Applies even when the sandbox degraded to none.
+    const { argv: rprefix, warnings } = resourceArgs(policy.resources, deps.cpuDelegated());
+    for (const w of warnings) deps.log(`[${name}] WARNING ${w}`);
+    if (rprefix.length) paneArgv = [...rprefix, ...paneArgv];
+  }
+
   rmSync(exitFile, { force: true });
   await deps.tmux.kill(name);
-  await deps.tmux.newSession(name, runCwd, buildPaneCommand(launch, role.env, exitFile));
+  await deps.tmux.newSession(name, runCwd, buildPaneCommand(launch, role.env, exitFile, paneArgv));
 
   let pid: number | null = null;
   for (let i = 0; i < 40 && pid === null; i++) {
