@@ -55,6 +55,18 @@ describe('ours-fleet CLI', () => {
     expect(r.stdout).toContain('--model');
   });
 
+  it('config prints an isolation summary for a role that declares it', async () => {
+    const { writeFileSync } = await import('node:fs');
+    writeFileSync(join(dir, 'fleet.yaml'),
+      'roles:\n  Sec:\n    isolation:\n      network: deny\n      resources:\n        mem: 2G\n        cpu: "1.5"\n');
+    const r = await run(['config']);
+    expect(r.code).toBe(0);
+    expect(r.stdout).toContain('● Sec');
+    expect(r.stdout).toContain('isolation:');
+    expect(r.stdout).toMatch(/net=deny/);
+    expect(r.stdout).toMatch(/mem=2G/);
+  });
+
   it('config prints a role model from fleet.d', async () => {
     const { mkdirSync, writeFileSync } = await import('node:fs');
     const { stringify } = await import('yaml');
