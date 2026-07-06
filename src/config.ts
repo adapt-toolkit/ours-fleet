@@ -2,6 +2,8 @@ import { existsSync, readFileSync, readdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { parse } from 'yaml';
 import { defaultConfigPath, fleetDDir } from './paths.js';
+import { validateIsolationConfig } from './isolation/policy.js';
+import type { IsolationConfig } from './isolation/types.js';
 
 export interface OverseeEntry { role: string; interval: string }
 
@@ -20,6 +22,7 @@ export interface RoleConfig {
   env?: Record<string, string>;
   oversee?: OverseeEntry[];
   harness_options?: Record<string, unknown>;
+  isolation?: IsolationConfig;
 }
 
 export interface ResolvedRole extends RoleConfig {
@@ -42,6 +45,7 @@ const NAME_RE = /^[A-Za-z0-9_-]+$/;
 const ROLE_KEYS = [
   'harness', 'identity', 'cwd', 'coordinator', 'mission', 'persona', 'bio',
   'briefing_file', 'model', 'max_tokens', 'autocompact_pct', 'env', 'oversee', 'harness_options',
+  'isolation',
 ];
 
 function deepSub(v: unknown, vars: Record<string, string>): unknown {
@@ -93,6 +97,12 @@ export function loadConfig(configPath?: string): FleetConfig {
       if (bad.length)
         throw new ConfigError(
           `${file}: role '${name}' has unknown key(s) ${bad.join(', ')}; allowed: ${ROLE_KEYS.join(', ')}`);
+      const isolation = r.isolation ?? (defaults.isolation as IsolationConfig | undefined);
+      if (isolation !== undefined) {
+        const problems = validateIsolationConfig(isolation);
+        if (problems.length)
+          throw new ConfigError(`${file}: role '${name}' ${problems.join('; ')}`);
+      }
       roles.push({
         ...r,
         name,
@@ -101,6 +111,7 @@ export function loadConfig(configPath?: string): FleetConfig {
         identity: r.identity ?? name,
         model: r.model ?? (defaults.model as string | undefined),
         max_tokens: r.max_tokens ?? (defaults.max_tokens as number | undefined),
+        isolation,
       });
     }
   }
