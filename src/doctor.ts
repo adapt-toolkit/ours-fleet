@@ -1,8 +1,23 @@
 import { userInfo } from 'node:os';
+import { readFileSync } from 'node:fs';
 import { realExec, type Exec } from './exec.js';
 import { loadConfig } from './config.js';
 import { getAdapter } from './harness/registry.js';
+import { agentDir, home } from './paths.js';
+import { resolveIsolation } from './isolation/policy.js';
+import { makeBubblewrapBackend } from './isolation/bubblewrap.js';
 import type { PrereqCheck, PrereqReport } from './harness/types.js';
+
+/** Which cgroup-v2 controllers are delegated to this user manager (advisory). */
+function cgroupDelegationDetail(): string {
+  try {
+    const uid = process.getuid?.() ?? 0;
+    const c = readFileSync(`/sys/fs/cgroup/user.slice/user-${uid}.slice/cgroup.controllers`, 'utf8').split(/\s+/);
+    const has = (n: string) => (c.includes(n) ? 'yes' : 'no');
+    return `memory=${has('memory')} pids=${has('pids')} cpu=${has('cpu')}` +
+      (c.includes('cpu') ? '' : ' — cpu caps degrade to a warning (one-time: Delegate=cpu)');
+  } catch { return 'unknown (not cgroup-v2 or no delegation info)'; }
+}
 
 /** Host-level + per-harness prerequisite report with actionable messages. */
 export async function doctor(
@@ -48,9 +63,42 @@ export async function doctor(
     });
   }
 
+  // Isolation reporting (AC-9). Backend availability is advisory — isolation is
+  // opt-in per role (OQ-1), so a missing bwrap must not fail doctor for fleets that
+  // don't use it. Only a role that DECLARES isolation and cannot get it under
+  // `strict` is a hard failure.
+  const roles = loadConfigSafe(opts.configPath);
+  const bw = await makeBubblewrapBackend(exec).available();
+  checks.push({
+    name: 'isolation: bubblewrap', ok: true,
+    detail: bw.ok
+      ? `available — ${bw.detail}`
+      : `not available: ${bw.detail} (only needed for roles declaring isolation:)`,
+  });
+  if (platform === 'linux')
+    checks.push({ name: 'isolation: cgroup delegation', ok: true, detail: cgroupDelegationDetail() });
+  for (const r of roles.filter(r => r.isolation)) {
+    const stateDir = agentDir(r.name);
+    const policy = resolveIsolation(r.isolation!, { stateDir, runCwd: r.cwd ?? stateDir, home: home() });
+    const caps = [
+      policy.resources.mem && `mem=${policy.resources.mem}`,
+      policy.resources.cpu && `cpu=${policy.resources.cpu}`,
+      policy.resources.pids !== undefined && `pids=${policy.resources.pids}`,
+    ].filter(Boolean).join(',') || 'none';
+    const wantsBwrap = policy.backend === 'auto' || policy.backend === 'bubblewrap';
+    let ok = true, detail: string;
+    if (policy.backend === 'none') detail = 'backend=none (explicitly un-sandboxed)';
+    else if (wantsBwrap && bw.ok) detail = `backend=bubblewrap net=${policy.network} caps=${caps}`;
+    else if (wantsBwrap && policy.onUnavailable === 'strict') {
+      ok = false; detail = 'WILL REFUSE to launch (strict): bubblewrap unavailable';
+    } else if (wantsBwrap) detail = `degraded->un-isolated (warn): bubblewrap unavailable; caps=${caps} still apply`;
+    else detail = `backend=${policy.backend} (not yet implemented)`;
+    checks.push({ name: `isolation: ${r.name}`, ok, detail });
+  }
+
   const harnesses = opts.harness
     ? [opts.harness]
-    : [...new Set(loadConfigSafe(opts.configPath).map(r => r.harness))];
+    : [...new Set(roles.map(r => r.harness))];
   for (const h of harnesses) {
     try {
       const rep = await getAdapter(h).checkPrereqs();
