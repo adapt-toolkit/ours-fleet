@@ -41,6 +41,17 @@ roles:
       ship sound tests, and escalate cross-repo questions to the coordinator.
     env:
       EXAMPLE_FLAG: "1"             # extra env passed into the session
+    isolation:                      # OS-level sandbox (additive — omit for today's behavior)
+      network: broker               # broker (default): ours messaging works, general egress denied
+      resources:                    # per-agent cgroup caps at the pane
+        mem: 4G                     # → MemoryMax=4G + MemorySwapMax=0 (hard OOM bound)
+        cpu: "2"                    # → CPUQuota=200% (2 cores)
+      # backend: auto               # auto (default): bubblewrap if usable, else degrade per on_unavailable
+      # on_unavailable: warn        # warn (default): run un-isolated + drop a marker; strict: refuse to launch
+      # fs:
+      #   read: [ /opt/toolchains ] # extra read-only binds (state dir + cwd are always included)
+      #   write: [ ]                # extra read-write binds
+      # secrets: [ "${work_root}/.secrets/tok:/run/secrets/tok" ]  # host:container, mounted read-only
     harness_options:                # adapter-owned (claude-code shown)
       plugins:
         "some-plugin@some-marketplace": false

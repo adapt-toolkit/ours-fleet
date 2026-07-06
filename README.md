@@ -178,11 +178,50 @@ roles:
       # mem_palace: false                      # claude-code: disable memory plugin
       # permission_mode: dontAsk               # claude-code: launch permission mode —
       #   one of default | acceptEdits | plan | dontAsk | bypassPermissions
+    isolation:                          # OS-level sandbox (additive; omit = today's behavior)
+      backend: auto                     # auto | bubblewrap | podman | none   (default auto)
+      on_unavailable: warn              # warn (un-isolated + marker) | strict (refuse)   (default warn)
+      network: broker                   # broker | deny | allow | allowlist   (default broker)
+      fs: { read: [/opt/toolchains], write: [] }   # extra binds (state dir + cwd always included)
+      resources: { mem: 2G, cpu: "1.5", pids: 512 }
+      secrets: ["/host/tok:/run/secrets/tok"]      # host:container, mounted read-only
 ```
 
 Merge order: `fleet.yaml` ← `fleet.d/*.yaml`; a duplicate role name is a hard
 error naming both files. Identities and roles are decoupled — removing a role
 never deletes an identity.
+
+## Agent isolation
+
+Each role can be sandboxed at the environment level via an `isolation:` block —
+**fully additive: a role with no block behaves exactly as before.** The agent's
+tmux-pane process is wrapped in [bubblewrap](https://github.com/containers/bubblewrap)
+(rootless, no setuid), resource-limited by `systemd-run --user --scope`.
+
+An empty `isolation: {}` gives a sensible default posture: filesystem-confined to
+the state dir + `cwd`, the ours key store / other agents' state / `~/.ssh` / `~/.aws`
+all invisible, ours messaging still works, no hard resource caps.
+
+- **`backend`** — `auto` (bubblewrap if usable, else degrade per `on_unavailable`),
+  or force `bubblewrap` / `none`. (`podman` is planned.)
+- **`on_unavailable`** — `warn` (default, fail-open: run un-isolated, log, and drop a
+  `.isolation-degraded` marker in the state dir) or `strict` (fail closed: refuse to launch).
+- **`network`** — `broker` (default; ours messaging works), `deny` (no network),
+  `allow` (unrestricted), `allowlist` (planned). *Current status:* `deny` fully
+  unshares the network; `broker` keeps host networking so the loopback ours daemon
+  stays reachable — full broker egress-hardening is a follow-up.
+- **`fs.read` / `fs.write`** — extra read-only / read-write binds on top of the durable set.
+- **`resources`** — `mem` (→ `MemoryMax` + `MemorySwapMax=0`, a hard OOM bound),
+  `cpu` cores (→ `CPUQuota`), `pids` (→ `TasksMax`). CPU degrades to a warning if the
+  cpu cgroup controller isn't delegated (mem/pids still enforced).
+- **`secrets`** — `host:container` pairs, mounted read-only; the only way host files
+  enter the sandbox.
+
+`ours-fleet doctor` reports bubblewrap availability, cgroup delegation, and each
+role's effective isolation; `ours-fleet config` prints a per-role isolation summary.
+Isolation composes with `model`, `permission_mode`, and `ROUTINES.md`. See
+[SECURITY.md](SECURITY.md#agent-isolation-sandboxing) for the threat model and the
+rootless prerequisites.
 
 ## Development
 
