@@ -10,11 +10,13 @@ import { Tmux } from './tmux.js';
 import { realExec, shq, type Exec } from './exec.js';
 import { resolveIsolation } from './isolation/policy.js';
 import { selectIsolationBackend } from './isolation/registry.js';
+import { resourceArgs, cpuControllerDelegated } from './isolation/resources.js';
 import type { WrapContext } from './isolation/types.js';
 
 export interface RunnerDeps {
   tmux: Tmux;
   exec: Exec;
+  cpuDelegated(): boolean;
   isAlive(pid: number): boolean;
   sleep(ms: number): Promise<void>;
   now(): number;
@@ -24,6 +26,7 @@ export interface RunnerDeps {
 const defaultDeps = (): RunnerDeps => ({
   tmux: new Tmux(),
   exec: realExec,
+  cpuDelegated: () => cpuControllerDelegated(),
   isAlive: pid => { try { process.kill(pid, 0); return true; } catch { return false; } },
   sleep: ms => new Promise(r => setTimeout(r, ms)),
   now: () => Date.now(),
@@ -94,6 +97,12 @@ export async function runOnce(
     else
       deps.log(`[${name}] isolation: ${sel.backend.id} (net=${policy.network}) ${sel.detail}`);
     paneArgv = sel.backend.wrap(launch.argv, policy, ctx);
+
+    // Resource caps wrap the sandbox from OUTSIDE, at the pane's own cgroup scope
+    // (§5.4). Applies even when the sandbox degraded to none.
+    const { argv: rprefix, warnings } = resourceArgs(policy.resources, deps.cpuDelegated());
+    for (const w of warnings) deps.log(`[${name}] WARNING ${w}`);
+    if (rprefix.length) paneArgv = [...rprefix, ...paneArgv];
   }
 
   rmSync(exitFile, { force: true });

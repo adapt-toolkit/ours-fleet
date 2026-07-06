@@ -23,7 +23,7 @@ afterEach(() => {
 
 /** Fake tmux whose pane "process" dies after `lifeChecks` liveness polls,
  *  writing `.exit-status` (like the pane shell would) at the moment of death. */
-function fakeWorld(opts: { exitCode?: string; lifeChecks?: number; exitDelayMs?: number; exitFile?: string; bwrap?: 'ok' | 'missing' } = {}) {
+function fakeWorld(opts: { exitCode?: string; lifeChecks?: number; exitDelayMs?: number; exitFile?: string; bwrap?: 'ok' | 'missing'; cpuDelegated?: boolean } = {}) {
   const paneCommands: string[] = [];
   let clock = 0;
   let checks = 0;
@@ -36,6 +36,7 @@ function fakeWorld(opts: { exitCode?: string; lifeChecks?: number; exitDelayMs?:
   const deps = {
     tmux: new Tmux(exec),
     exec,
+    cpuDelegated: () => opts.cpuDelegated ?? true,
     isAlive: () => {
       checks++;
       if (checks >= (opts.lifeChecks ?? 2)) {
@@ -120,6 +121,40 @@ describe('runOnce isolation', () => {
     const d = agentDir('A'); mkdirSync(d, { recursive: true });
     const { deps } = fakeWorld({ exitCode: '0', exitFile: join(d, '.exit-status'), bwrap: 'missing' });
     await expect(runOnce('A', {}, deps)).rejects.toThrow(/strict|unavailable|refus/i);
+  });
+
+  it('composes a systemd-run resource scope OUTSIDE the sandbox when resources are set', async () => {
+    writeCfg({ A: { harness: 'fake', isolation: { resources: { mem: '256M', cpu: '1', pids: 128 } } } });
+    const d = agentDir('A'); mkdirSync(d, { recursive: true });
+    const { deps, paneCommands } = fakeWorld({ exitCode: '0', exitFile: join(d, '.exit-status'), cpuDelegated: true });
+    await runOnce('A', {}, deps);
+    const cmd = paneCommands[0];
+    expect(cmd).toContain('systemd-run');
+    expect(cmd).toContain('MemoryMax=256M');
+    expect(cmd).toContain('CPUQuota=100%');
+    expect(cmd).toContain('TasksMax=128');
+    expect(cmd.indexOf('systemd-run')).toBeLessThan(cmd.indexOf('bwrap')); // resource scope is outermost
+  });
+
+  it('degrades cpu cap to a warning when the cpu controller is not delegated', async () => {
+    writeCfg({ A: { harness: 'fake', isolation: { resources: { mem: '256M', cpu: '2' } } } });
+    const d = agentDir('A'); mkdirSync(d, { recursive: true });
+    const { deps, paneCommands } = fakeWorld({ exitCode: '0', exitFile: join(d, '.exit-status'), cpuDelegated: false });
+    await runOnce('A', {}, deps);
+    const cmd = paneCommands[0];
+    expect(cmd).toContain('MemoryMax=256M');   // mem still enforced
+    expect(cmd).not.toContain('CPUQuota');       // cpu dropped
+  });
+
+  it('applies resource caps even when the sandbox degrades to none', async () => {
+    writeCfg({ A: { harness: 'fake', isolation: { on_unavailable: 'warn', resources: { mem: '128M' } } } });
+    const d = agentDir('A'); mkdirSync(d, { recursive: true });
+    const { deps, paneCommands } = fakeWorld({ exitCode: '0', exitFile: join(d, '.exit-status'), bwrap: 'missing' });
+    await runOnce('A', {}, deps);
+    const cmd = paneCommands[0];
+    expect(cmd).not.toContain('bwrap');          // sandbox degraded
+    expect(cmd).toContain('systemd-run');        // but resources still capped
+    expect(cmd).toContain('MemoryMax=128M');
   });
 });
 
