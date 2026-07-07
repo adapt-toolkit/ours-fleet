@@ -1,7 +1,5 @@
 # ADAPT / ours.network Trademark Policy
 
-<!-- DRAFT — for counsel review before publication -->
-
 "ADAPT", "ours.network", and the associated logos (the "Marks") are trademarks of Adapt Framework Solutions Ltd. The source-available licences covering our code **do not grant any rights to use the Marks**.
 
 ## You MAY, without permission

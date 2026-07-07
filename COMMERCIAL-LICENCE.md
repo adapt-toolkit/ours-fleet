@@ -16,7 +16,7 @@ You do **not** need a commercial licence for a Permitted Purpose under the FSL â
 
 ## How to obtain one
 
-Contact Adapt Framework Solutions Ltd: **COMMERCIAL_CONTACT_TBD**
+Contact Adapt Framework Solutions Ltd: **license@adaptframework.solutions**
 
 Please include a short description of your intended use so we can propose suitable terms.
 

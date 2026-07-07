@@ -1,7 +1,5 @@
 # Contributing to ours.network
 
-<!-- DRAFT — finalise once the CLA is in force. Until then, repo settings must block external PRs. -->
-
 Thank you for your interest in ours.network. We welcome bug reports, feature discussion, documentation fixes, and code contributions.
 
 ## Before you start

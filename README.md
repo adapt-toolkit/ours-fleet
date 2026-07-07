@@ -225,7 +225,7 @@ commercial product or service that substitutes for, or provides substantially
 the same functionality as, ours.network. Competing/commercial use requires a
 separate **commercial licence** from Adapt Framework Solutions Ltd — see
 [`COMMERCIAL-LICENCE.md`](COMMERCIAL-LICENCE.md) (contact:
-**COMMERCIAL_CONTACT_TBD**).
+**license@adaptframework.solutions**).
 
 ours.network builds on Adapt Framework Solutions Ltd's own FSL-licensed core (the
 `@adapt-toolkit` packages); **Adapt itself is not part of this release** and is

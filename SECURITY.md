@@ -1,7 +1,5 @@
 # Security Policy
 
-<!-- DRAFT — confirm the contact mailbox exists and is monitored before publication. -->
-
 ours.network is security software. We take vulnerability reports seriously and we appreciate the work of security researchers.
 
 ## Disclaimer
