@@ -156,6 +156,25 @@ describe('runOnce isolation', () => {
     expect(cmd).toContain('systemd-run');        // but resources still capped
     expect(cmd).toContain('MemoryMax=128M');
   });
+
+  it('writes a .isolation-degraded marker when isolation degrades under warn', async () => {
+    writeCfg({ A: { harness: 'fake', isolation: { on_unavailable: 'warn' } } });
+    const d = agentDir('A'); mkdirSync(d, { recursive: true });
+    const { deps } = fakeWorld({ exitCode: '0', exitFile: join(d, '.exit-status'), bwrap: 'missing' });
+    await runOnce('A', {}, deps);
+    const marker = join(d, '.isolation-degraded');
+    expect(existsSync(marker)).toBe(true);
+    expect(readFileSync(marker, 'utf8')).toMatch(/bubblewrap|bwrap|unavailable/i);
+  });
+
+  it('clears a stale .isolation-degraded marker when isolation succeeds', async () => {
+    writeCfg({ A: { harness: 'fake', isolation: {} } });
+    const d = agentDir('A'); mkdirSync(d, { recursive: true });
+    writeFileSync(join(d, '.isolation-degraded'), 'stale\n');
+    const { deps } = fakeWorld({ exitCode: '0', exitFile: join(d, '.exit-status') });
+    await runOnce('A', {}, deps);
+    expect(existsSync(join(d, '.isolation-degraded'))).toBe(false);
+  });
 });
 
 describe('runOnce', () => {

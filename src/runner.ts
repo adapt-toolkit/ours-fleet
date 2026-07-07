@@ -92,10 +92,14 @@ export async function runOnce(
     const ctx: WrapContext = { stateDir: dir, runCwd, home: home() };
     const policy = resolveIsolation(role.isolation, ctx);
     const sel = await selectIsolationBackend(policy, deps.exec);  // throws on strict + unavailable
-    if (sel.degraded)
+    const degradedMarker = join(dir, '.isolation-degraded');
+    if (sel.degraded) {
       deps.log(`[${name}] WARNING isolation requested but unavailable -> running UN-ISOLATED: ${sel.detail}`);
-    else
+      writeFileSync(degradedMarker, `${new Date().toISOString()} ${sel.detail}\n`);
+    } else {
       deps.log(`[${name}] isolation: ${sel.backend.id} (net=${policy.network}) ${sel.detail}`);
+      rmSync(degradedMarker, { force: true });
+    }
     paneArgv = sel.backend.wrap(launch.argv, policy, ctx);
 
     // Resource caps wrap the sandbox from OUTSIDE, at the pane's own cgroup scope

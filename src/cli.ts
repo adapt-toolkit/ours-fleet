@@ -54,6 +54,16 @@ cOpt(program.command('config').description('validate + print the merged plan (no
         if (r.coordinator) console.log(`    coordinator: ${r.coordinator}`);
         if (r.mission) console.log(`    mission:     ${r.mission.split('\n')[0]}`);
         if (r.oversee?.length) console.log(`    oversees:    ${r.oversee.map(o => `${o.role}@${o.interval}`).join(', ')}`);
+        if (r.isolation) {
+          const iso = r.isolation;
+          const caps = [
+            iso.resources?.mem && `mem=${iso.resources.mem}`,
+            iso.resources?.cpu && `cpu=${iso.resources.cpu}`,
+            iso.resources?.pids !== undefined && `pids=${iso.resources.pids}`,
+          ].filter(Boolean).join(',') || 'none';
+          console.log(`    isolation:   backend=${iso.backend ?? 'auto'} net=${iso.network ?? 'broker'} `
+            + `on_unavailable=${iso.on_unavailable ?? 'warn'} caps=${caps}`);
+        }
       }
     } catch (e) { die(e); }
   });
