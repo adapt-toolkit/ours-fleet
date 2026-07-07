@@ -202,8 +202,33 @@ software built by a small independent team, running the broker and relay service
 at their own cost. If this is useful to you, please consider chipping in:
 **→ https://github.com/adapt-toolkit/ours-donate**
 
-## License
+## Licence, status & warranty
 
-[FSL-1.1-Apache-2.0](LICENSE) — Functional Source License, converting to
-Apache-2.0 two years after each release. Free for any use except offering a
-competing product or service. Copyright 2026 ours.network contributors.
+> **Alpha software.** ours-fleet is part of **ours.network**, which is early,
+> experimental, **alpha-stage** software. It is under active development, its
+> behaviour and interfaces may change without notice, and it is **not
+> production-ready**.
+
+> **No warranty / not security-audited.** ours.network has **not** been
+> independently security-audited. It is provided **"as is", without warranty of
+> any kind**, and you use it **at your own risk**. See [`LICENSE`](LICENSE) and
+> [`SECURITY.md`](SECURITY.md).
+
+**ours.network** is owned and licensed by **Adapt Framework Solutions Ltd**. It
+is released under the **Functional Source License, Version 1.1
+([FSL-1.1-Apache-2.0](LICENSE))** — **source-available, not open source** during
+the FSL period. Each release **converts to Apache 2.0 two years after it is
+published**.
+
+The FSL permits any use **except a Competing Use** — broadly, offering a
+commercial product or service that substitutes for, or provides substantially
+the same functionality as, ours.network. Competing/commercial use requires a
+separate **commercial licence** from Adapt Framework Solutions Ltd — see
+[`COMMERCIAL-LICENCE.md`](COMMERCIAL-LICENCE.md) (contact:
+**COMMERCIAL_CONTACT_TBD**).
+
+ours.network builds on Adapt Framework Solutions Ltd's own FSL-licensed core (the
+`@adapt-toolkit` packages); **Adapt itself is not part of this release** and is
+licensed separately.
+
+Copyright 2026 Adapt Framework Solutions Ltd.
