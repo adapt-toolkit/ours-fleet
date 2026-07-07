@@ -3,7 +3,7 @@
   "version": "0.5.0",
   "description": "Claude Code plugin for ours-fleet — spawn and oversee fleet agents from inside a session. Bundles the spawn-ours-agent and oversee-agents skills; the ours-fleet CLI (@ours.network/fleet) does the actual work.",
   "license": "FSL-1.1-Apache-2.0",
-  "author": "ours.network contributors",
+  "author": "Adapt Framework Solutions Ltd",
   "homepage": "https://github.com/adapt-toolkit/ours-fleet/tree/main/integrations/claude-code#readme",
   "repository": {
     "type": "git",
