@@ -1,6 +1,6 @@
 # ours-fleet
 
-**Run a fleet of persistent, identity-bound AI agents — across different agent
+**Run a fleet of persistent, securely isolated, identity-bound AI agents — across different agent
 harnesses — from one declarative file.**
 
 ## What is this?
