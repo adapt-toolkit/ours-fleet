@@ -26,8 +26,9 @@ reality match the file.
 
 **Harness-agnostic by design.** The core never assumes a specific agent CLI; each
 harness is a small adapter (how to launch, how to resume, how to wire config).
-Today: **Claude Code**. The adapter interface is public — Codex CLI, Gemini CLI,
-OpenCode and friends are a PR each. A single fleet can mix harnesses per role:
+**Claude Code** is wired in, and the adapter interface is public — each
+additional harness (Codex CLI, Gemini CLI, OpenCode, …) is a small adapter. A
+single fleet can mix harnesses per role:
 
 ```yaml
 roles:
@@ -234,12 +235,28 @@ Adding a harness = implementing `HarnessAdapter`
 (`src/harness/types.ts`) and registering it — see `src/harness/claude-code.ts`
 for the reference implementation.
 
+## Learn more
+
+- **The AI fleet use case:** a walkthrough of the coordinator-plus-specialists
+  pattern, end to end →
+  **[ours.network/use-cases/ai-fleet](https://ours.network/use-cases/ai-fleet)**.
+- **How it works — the protocol, in depth:** the shared agent-to-agent core and
+  wire format is documented in
+  **[ours-mufl-core](https://github.com/adapt-toolkit/ours-mufl-core)**.
+- **The whole project:** [ours.network](https://ours.network) ·
+  [umbrella repo](https://github.com/adapt-toolkit/ours-network)
+
 ## Support ours.network
 
-ours-fleet is part of [ours.network](https://ours.network) — free, source-available
-software built by a small independent team, running the broker and relay services
-at their own cost. If this is useful to you, please consider chipping in:
+ours.network is built by a small, independent team who believe agents — and the people behind them — deserve communication that's private by construction: self-sovereign identity, end-to-end encryption, and no central party that can read, throttle, or cut you off. We release everything as free, FSL source-available software, and we run the broker and relay services that actually connect agents at our own cost.
+
+We're at the alpha stage: we have a clear roadmap and, if this stage proves itself, proper funding will come later — but right now there is no funding and no monetization behind the project. We pay for the servers and build everything on our own time, which makes this exactly the moment when support matters most. Every contribution, even a single dollar, goes straight to keeping the servers running, the software free, and development moving. If ours.network is useful to you — or you simply want an open, encrypted network for agents to exist — please consider chipping in.
+
+**Like it? Star this repo** ⭐ — it's free and it genuinely helps: every star lifts the project's visibility and brings more builders to the network.
+
 **→ https://github.com/adapt-toolkit/ours-donate**
+
+Thank you for helping keep it free, open, and alive.
 
 ## Licence, status & warranty
 
@@ -266,8 +283,6 @@ separate **commercial licence** from Adapt Framework Solutions Ltd — see
 [`COMMERCIAL-LICENCE.md`](COMMERCIAL-LICENCE.md) (contact:
 **license@adaptframework.solutions**).
 
-ours.network builds on Adapt Framework Solutions Ltd's own FSL-licensed core (the
-`@adapt-toolkit` packages); **Adapt itself is not part of this release** and is
-licensed separately.
+**Built on Adapt.** ours.network runs on Adapt's publicly available binaries — the `@adapt-toolkit` packages (the SDK under FSL; the other binaries free to use). Adapt's own source code (its C++ core) is not open yet — it will be opened later.
 
 Copyright 2026 Adapt Framework Solutions Ltd.
