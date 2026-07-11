@@ -1,6 +1,7 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import {
   home, stateRoot, agentsRoot, tmpRoot, logsRoot, agentDir, defaultConfigPath, fleetDDir,
+  deriveXdgRuntimeDir,
 } from '../src/paths.js';
 
 describe('paths', () => {
@@ -27,5 +28,28 @@ describe('paths', () => {
     delete process.env.OURS_FLEET_HOME;
     expect(home().length).toBeGreaterThan(0);
     expect(home()).not.toBe('/x');
+  });
+});
+
+describe('deriveXdgRuntimeDir (#9)', () => {
+  it('derives /run/user/<uid> when unset and the dir exists', () => {
+    const env: NodeJS.ProcessEnv = {};
+    const got = deriveXdgRuntimeDir(env, 1234, p => p === '/run/user/1234');
+    expect(got).toBe('/run/user/1234');
+    expect(env.XDG_RUNTIME_DIR).toBe('/run/user/1234');
+  });
+
+  it('never overrides an existing value', () => {
+    const env: NodeJS.ProcessEnv = { XDG_RUNTIME_DIR: '/run/user/999' };
+    const got = deriveXdgRuntimeDir(env, 1234, () => true);
+    expect(got).toBe('/run/user/999');
+    expect(env.XDG_RUNTIME_DIR).toBe('/run/user/999');
+  });
+
+  it('leaves env untouched when /run/user/<uid> does not exist (linger off)', () => {
+    const env: NodeJS.ProcessEnv = {};
+    const got = deriveXdgRuntimeDir(env, 1234, () => false);
+    expect(got).toBeUndefined();
+    expect('XDG_RUNTIME_DIR' in env).toBe(false);
   });
 });

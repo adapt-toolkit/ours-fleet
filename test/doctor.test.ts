@@ -122,3 +122,34 @@ describe('doctor isolation reporting', () => {
     expect(rep.ok).toBe(false);
   });
 });
+
+describe('user bus check (#9)', () => {
+  let savedXdg: string | undefined;
+  beforeEach(() => { savedXdg = process.env.XDG_RUNTIME_DIR; });
+  afterEach(() => {
+    if (savedXdg === undefined) delete process.env.XDG_RUNTIME_DIR;
+    else process.env.XDG_RUNTIME_DIR = savedXdg;
+  });
+
+  it('reports the user bus as ok when XDG_RUNTIME_DIR is set', async () => {
+    process.env.XDG_RUNTIME_DIR = '/run/user/424242';
+    const rep = await doctor({}, execWith({
+      'tmux -V': { stdout: 'tmux 3.4', stderr: '', code: 0 },
+      'ours-mcp --version': { stdout: '0.1.2', stderr: '', code: 0 },
+      'ours-mcp status': { stdout: 'running', stderr: '', code: 0 },
+      'loginctl show-user': { stdout: 'Linger=yes', stderr: '', code: 0 },
+    }), 'linux');
+    const bus = rep.checks.find(c => c.name === 'user bus');
+    expect(bus?.ok).toBe(true);
+    expect(bus?.detail).toContain('/run/user/424242');
+  });
+
+  it('is a linux-only check', async () => {
+    const rep = await doctor({}, execWith({
+      'tmux -V': { stdout: 'tmux 3.4', stderr: '', code: 0 },
+      'ours-mcp --version': { stdout: '0.1.2', stderr: '', code: 0 },
+      'ours-mcp status': { stdout: 'running', stderr: '', code: 0 },
+    }), 'darwin');
+    expect(rep.checks.find(c => c.name === 'user bus')).toBeUndefined();
+  });
+});

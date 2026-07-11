@@ -4,7 +4,7 @@ import { mkdirSync } from 'node:fs';
 import { realpathSync } from 'node:fs';
 import { Command } from 'commander';
 import { VERSION } from './version.js';
-import { agentsRoot, tmpRoot, logsRoot } from './paths.js';
+import { agentsRoot, tmpRoot, logsRoot, deriveXdgRuntimeDir } from './paths.js';
 import { loadConfig } from './config.js';
 import { Tmux } from './tmux.js';
 import { pickBackend } from './supervisor/index.js';
@@ -13,6 +13,10 @@ import { runOnce, runTemp } from './runner.js';
 import { spawnPermanent, spawnTemp, type SpawnOpts } from './spawn.js';
 import { doctor } from './doctor.js';
 import './harness/claude-code.js';   // registers the claude-code adapter
+
+// sudo/su shells lack XDG_RUNTIME_DIR, breaking every systemctl/journalctl
+// --user child (supervisor commands, logs, doctor). Derive it before dispatch. (#9)
+deriveXdgRuntimeDir();
 
 const binPath = (() => { try { return realpathSync(process.argv[1]); } catch { return process.argv[1]; } })();
 
