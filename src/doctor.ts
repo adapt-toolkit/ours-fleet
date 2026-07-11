@@ -3,7 +3,7 @@ import { readFileSync } from 'node:fs';
 import { realExec, type Exec } from './exec.js';
 import { loadConfig } from './config.js';
 import { getAdapter } from './harness/registry.js';
-import { agentDir, home } from './paths.js';
+import { agentDir, home, deriveXdgRuntimeDir } from './paths.js';
 import { resolveIsolation } from './isolation/policy.js';
 import { makeBubblewrapBackend } from './isolation/bubblewrap.js';
 import type { PrereqCheck, PrereqReport } from './harness/types.js';
@@ -60,6 +60,17 @@ export async function doctor(
       name: 'linger', ok,
       detail: ok ? 'enabled (roles survive logout/reboot)'
         : `not enabled — run: ours-fleet init (or: sudo loginctl enable-linger ${user})`,
+    });
+
+    // systemctl --user needs $XDG_RUNTIME_DIR/bus. The cli entry point derives
+    // it from /run/user/<uid> when possible (#9), so a failure here means the
+    // user manager itself is unreachable — sudo/su shell with linger off.
+    const xdg = deriveXdgRuntimeDir();
+    checks.push({
+      name: 'user bus', ok: !!xdg,
+      detail: xdg
+        ? `XDG_RUNTIME_DIR=${xdg}`
+        : `no XDG_RUNTIME_DIR and /run/user/<uid> missing — systemctl --user cannot reach the user manager; enable linger: sudo loginctl enable-linger ${user}`,
     });
   }
 

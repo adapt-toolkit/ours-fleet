@@ -84,3 +84,27 @@ describe('pickBackend', () => {
     expect(() => pickBackend(undefined, 'win32')).toThrowError(/unsupported platform/);
   });
 });
+
+describe('systemd bus-error hint (#9)', () => {
+  const BUS_ERR = 'Failed to connect to user scope bus via local transport: $DBUS_SESSION_BUS_ADDRESS and $XDG_RUNTIME_DIR not defined';
+  const failing = (stderr: string): Exec => async () => ({ stdout: '', stderr, code: 1 });
+
+  it('install failure on the user-bus error carries the linger hint', async () => {
+    await expect(makeSystemdBackend(failing(BUS_ERR)).install('A', '/b'))
+      .rejects.toThrow(/enable-linger/);
+    await expect(makeSystemdBackend(failing(BUS_ERR)).install('A', '/b'))
+      .rejects.toThrow(/XDG_RUNTIME_DIR=\/run\/user/);
+  });
+
+  it('restart and stop failures carry it too', async () => {
+    await expect(makeSystemdBackend(failing(BUS_ERR)).restart('A')).rejects.toThrow(/enable-linger/);
+    await expect(makeSystemdBackend(failing(BUS_ERR)).stop('A')).rejects.toThrow(/enable-linger/);
+  });
+
+  it('unrelated failures stay unhinted', async () => {
+    const e = await makeSystemdBackend(failing('Unit ours-fleet-agent@A.service not found.'))
+      .restart('A').then(() => null, err => err as Error);
+    expect(String(e)).toContain('not found');
+    expect(String(e)).not.toContain('enable-linger');
+  });
+});
