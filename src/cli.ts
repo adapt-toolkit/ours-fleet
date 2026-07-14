@@ -13,6 +13,7 @@ import { runOnce, runTemp } from './runner.js';
 import { spawnPermanent, spawnTemp, type SpawnOpts } from './spawn.js';
 import { doctor } from './doctor.js';
 import './harness/claude-code.js';   // registers the claude-code adapter
+import './harness/codex.js';         // registers the codex adapter
 
 // sudo/su shells lack XDG_RUNTIME_DIR, breaking every systemctl/journalctl
 // --user child (supervisor commands, logs, doctor). Derive it before dispatch. (#9)

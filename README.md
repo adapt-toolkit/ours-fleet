@@ -26,15 +26,15 @@ reality match the file.
 
 **Harness-agnostic by design.** The core never assumes a specific agent CLI; each
 harness is a small adapter (how to launch, how to resume, how to wire config).
-**Claude Code** is wired in, and the adapter interface is public — each
-additional harness (Codex CLI, Gemini CLI, OpenCode, …) is a small adapter. A
-single fleet can mix harnesses per role:
+**Claude Code** and **Codex CLI** are wired in, and the adapter interface is
+public — each additional harness (Gemini CLI, OpenCode, …) is a small adapter.
+A single fleet can mix harnesses per role:
 
 ```yaml
 roles:
   Reviewer:                 # runs in Claude Code
     harness: claude-code
-  Prototyper:               # (future) runs elsewhere
+  Prototyper:                # runs in Codex CLI
     harness: codex
 ```
 
@@ -70,7 +70,7 @@ The state dir contract:
 |---|---|---|
 | Node ≥ 20 | runs `ours-fleet` itself | nodejs.org, `apt`, or `brew` |
 | tmux | every role's console | `apt install tmux` / `brew install tmux` |
-| a harness CLI, logged in | the agent itself | e.g. Claude Code (`claude`) |
+| a harness CLI, logged in | the agent itself | e.g. Claude Code (`claude`) or Codex CLI (`codex`) |
 | `ours-mcp` daemon | identity + agent-to-agent messaging | `npm i -g @ours.network/mcp && ours-mcp start` |
 
 Linux only: `ours-fleet init` enables *linger* so roles run without a login session
@@ -179,6 +179,11 @@ roles:
       # mem_palace: false                      # claude-code: disable memory plugin
       # permission_mode: dontAsk               # claude-code: launch permission mode —
       #   one of default | acceptEdits | plan | dontAsk | bypassPermissions
+      # sandbox: workspace-write                # codex: --sandbox —
+      #   one of read-only | workspace-write | danger-full-access
+      # approval: never                         # codex: --ask-for-approval —
+      #   one of untrusted | on-request | never
+      # search: true                            # codex: enable --search (live web search)
     isolation:                          # OS-level sandbox (additive; omit = today's behavior)
       backend: auto                     # auto | bubblewrap | podman | none   (default auto)
       on_unavailable: warn              # warn (un-isolated + marker) | strict (refuse)   (default warn)
@@ -233,7 +238,22 @@ npm run build
 
 Adding a harness = implementing `HarnessAdapter`
 (`src/harness/types.ts`) and registering it — see `src/harness/claude-code.ts`
-for the reference implementation.
+and `src/harness/codex.ts` for reference implementations.
+
+**Codex CLI notes.** Codex assigns its own session id (there's no `--session-id`
+equivalent to pin at creation), so resume uses `codex resume --last`, which
+picks the most recently active session **in the role's `cwd`**. This works
+cleanly as long as each role has its own `cwd` (the common case); two roles
+sharing an identical `cwd` could have their resumes cross — give them distinct
+working directories if that matters. Codex also has no persistent "Monitor"
+primitive like Claude Code's, so its briefing wording has the agent run
+`ours-mcp watch <identity>` as a background shell command and poll it (or poll
+`get_messages`) between turns instead of arming a Monitor tool. MCP wiring
+(registering the `ours` MCP server, the `ours` skill) is handled by the
+separate [`@ours.network/codex`](https://github.com/adapt-toolkit/ours-mcp/tree/main/packages/codex)
+package, not by `ours-fleet` itself — install and run `ours-codex-install` once
+per host, same as Claude Code's plugin marketplace registration is a one-time,
+separate step.
 
 ## Learn more
 
