@@ -93,6 +93,24 @@ describe('applyRole', () => {
     writeCfg({ A: { harness: 'strict', harness_options: { x: 1 } } });
     expect(() => applyRole(loadConfig().roles[0])).toThrowError(/role 'A'.*x: bad/);
   });
+
+  it('records the config path used, empty for the default', () => {
+    writeCfg({ A: { harness: 'fake' } });
+    const d1 = applyRole(loadConfig().roles[0]);
+    expect(readFileSync(join(d1, '.config-path'), 'utf8')).toBe('\n');
+  });
+
+  it('records an explicit config path for later reload', () => {
+    writeCfg({ A: { harness: 'fake' } });
+    const d1 = applyRole(loadConfig().roles[0], { configPath: '/custom/fleet.yaml' });
+    expect(readFileSync(join(d1, '.config-path'), 'utf8')).toBe('/custom/fleet.yaml\n');
+  });
+
+  it('does not write a .config-path marker for temp roles', () => {
+    writeCfg({ A: { harness: 'fake' } });
+    const d1 = applyRole(loadConfig().roles[0], { temp: true });
+    expect(existsSync(join(d1, '.config-path'))).toBe(false);
+  });
 });
 
 describe('up / down / restart', () => {
@@ -124,6 +142,22 @@ describe('up / down / restart', () => {
     await restartRoles(loadConfig(), ['A'], d, 'fresh');
     expect(existsSync(join(stateDir, '.booted'))).toBe(false);
     expect(calls).toContainEqual(['restart', 'A']);
+  });
+
+  it('up records the given configPath in each role\'s .config-path marker', async () => {
+    writeCfg({ A: { harness: 'fake' } });
+    const { backend } = fakeBackend();
+    const { d } = deps(backend);
+    await up(loadConfig(join(dir, 'fleet.yaml')), [], d, join(dir, 'fleet.yaml'));
+    expect(readFileSync(join(agentDir('A'), '.config-path'), 'utf8')).toBe(`${join(dir, 'fleet.yaml')}\n`);
+  });
+
+  it('restartRoles records the given configPath in the marker too', async () => {
+    writeCfg({ A: { harness: 'fake' } });
+    const { backend } = fakeBackend();
+    const { d } = deps(backend);
+    await restartRoles(loadConfig(join(dir, 'fleet.yaml')), ['A'], d, 'keep', join(dir, 'fleet.yaml'));
+    expect(readFileSync(join(agentDir('A'), '.config-path'), 'utf8')).toBe(`${join(dir, 'fleet.yaml')}\n`);
   });
 });
 

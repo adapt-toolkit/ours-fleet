@@ -62,6 +62,14 @@ describe('spawnPermanent', () => {
     await expect(spawnPermanent({ name: 'Coord' }, d)).rejects.toThrowError(/already exists/);
     expect(existsSync(join(dir, 'fleet.d', 'Coord.yaml'))).toBe(false);
   });
+
+  it('records configPath in the .config-path marker so systemd restarts reload the same file', async () => {
+    const { d } = fakeDeps();
+    const customCfg = join(dir, 'custom.yaml');
+    writeFileSync(customCfg, stringify({ defaults: { harness: 'fake' }, roles: { Coord: {} } }));
+    await spawnPermanent({ name: 'Worker2', configPath: customCfg }, d);
+    expect(readFileSync(join(agentDir('Worker2'), '.config-path'), 'utf8')).toBe(`${customCfg}\n`);
+  });
 });
 
 describe('spawn --model', () => {

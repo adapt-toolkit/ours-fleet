@@ -94,7 +94,7 @@ cOpt(program.command('config').description('validate + print the merged plan (no
 
 cOpt(program.command('up [names...]').description('create/start every role (or just the named ones)'))
   .action(async (names, opts) => {
-    try { await up(loadConfig(opts.configuration), names, deps()); } catch (e) { die(e); }
+    try { await up(loadConfig(opts.configuration), names, deps(), opts.configuration); } catch (e) { die(e); }
   });
 
 cOpt(program.command('down [names...]').description('stop roles'))
@@ -104,12 +104,12 @@ cOpt(program.command('down [names...]').description('stop roles'))
 
 cOpt(program.command('restart [names...]').description('re-sync config + bounce, RESUMING context'))
   .action(async (names, opts) => {
-    try { await restartRoles(loadConfig(opts.configuration), names, deps(), 'keep'); } catch (e) { die(e); }
+    try { await restartRoles(loadConfig(opts.configuration), names, deps(), 'keep', opts.configuration); } catch (e) { die(e); }
   });
 
 cOpt(program.command('force-restart [names...]').description('re-sync + bounce FRESH (context wiped)'))
   .action(async (names, opts) => {
-    try { await restartRoles(loadConfig(opts.configuration), names, deps(), 'fresh'); } catch (e) { die(e); }
+    try { await restartRoles(loadConfig(opts.configuration), names, deps(), 'fresh', opts.configuration); } catch (e) { die(e); }
   });
 
 program.command('ls').description('list running tmux consoles')
