@@ -74,8 +74,8 @@ export function generateBriefing(role: ResolvedRole, v: BriefingVocab, opts: Bri
   L.push('on messages, timers, or prompts — and follow it for recurring or scheduled work. It may');
   L.push('change between wakes without a restart; treat the file, not your memory of it, as current.');
   L.push('', '## On restart (you run under a supervised launcher)');
-  L.push(`On restart, WITHOUT asking: re-bind (**${v.bindTool}** name "${id}" force=true),`);
-  L.push(`re-arm the \`${v.watchCommand(id)}\` monitor, then continue from your WORKLOG.`);
+  L.push(`On restart, WITHOUT asking: re-bind (**${v.bindTool}** name "${id}" force=true), then`);
+  L.push(`${v.monitorInstruction(id)} Then continue from your WORKLOG.`);
   L.push('Do not blindly re-run whatever may have crashed you.');
   L.push('', '## House rules');
   L.push('- Never broad `rm -rf` on home/critical paths; quote globs; use explicit paths.');
