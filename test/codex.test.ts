@@ -39,6 +39,10 @@ describe('buildLaunch', () => {
     expect(prompt).toContain('choose_identity name "Alice Dev" force=true');
     expect(prompt).toContain('ours-mcp watch "Alice Dev"');
     expect(prompt.toLowerCase()).not.toContain('a2adapt');
+    // A backgrounded watch never wakes a Codex turn (no persistent Monitor primitive) —
+    // the restart prompt must not tell the agent to background it.
+    expect(prompt).not.toContain('as a background shell command');
+    expect(prompt).toContain('blocking foreground');
   });
 
   it('injects --model when role.model is set (fresh + resume)', () => {
@@ -94,6 +98,17 @@ describe('buildLaunch', () => {
       .toThrow(/harness_options\.approval/);
     expect(() => a.buildLaunch(r, 'fresh', { sessionId: 'SID' }, prep))
       .toThrow(/untrusted, on-request, never/);
+  });
+});
+
+describe('vocabulary.monitorInstruction', () => {
+  it('never tells the agent to background the watch, and offers the two real options', () => {
+    const a = makeCodexAdapter(okExec);
+    const text = a.vocabulary.monitorInstruction('Alice Dev');
+    expect(text).not.toContain('as a background shell command');
+    expect(text).toContain('blocking foreground');
+    expect(text).toContain('get_messages');
+    expect(text).toContain('ours-mcp watch "Alice Dev"');
   });
 });
 
