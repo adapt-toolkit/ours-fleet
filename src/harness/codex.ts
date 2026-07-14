@@ -108,14 +108,19 @@ export function makeCodexAdapter(exec: Exec = realExec): HarnessAdapter {
       getMessagesTool: 'get_messages',
       watchCommand: id => `ours-mcp watch "${id}"`,
       monitorInstruction: id =>
-        `Codex has no persistent Monitor primitive, so arm mail-watch yourself: run ` +
-        `\`${`ours-mcp watch "${id}"`}\` as a background shell command and check its output ` +
-        `between turns (or poll **get_messages** at the top of each turn).`,
+        `Codex has no persistent Monitor primitive — do NOT run \`${`ours-mcp watch "${id}"`}\` as a ` +
+        `backgrounded/detached shell command; a background process detecting mail does not wake you, ` +
+        `you only react while a turn is actively occupying the session. Pick one: (a) hold ` +
+        `\`${`ours-mcp watch "${id}"`}\` as a **blocking foreground** shell call and react each time it ` +
+        `returns, then re-arm it — this occupies the session until interrupted; or (b) poll ` +
+        `**get_messages** yourself every ~5s while on duty, which does not block. See the **ours** skill's ` +
+        `"Getting woken on new mail" section.`,
       launchNote: name => `You were launched as the fleet role \`${name}\` under a Codex session. Confirm you are running.`,
       restartPrompt: (id, worklog) =>
         `Session restarted. Re-bind your ours identity now (choose_identity name "${id}" force=true), ` +
-        `re-arm mail-watch (\`ours-mcp watch "${id}"\` as a background shell command), then continue ` +
-        `from ${worklog}. Do not re-run whatever crashed you.`,
+        `then re-arm reactivity — hold a **blocking foreground** \`ours-mcp watch "${id}"\` or poll ` +
+        `get_messages every ~5s (never background the watch), then continue from ${worklog}. Do not ` +
+        `re-run whatever crashed you.`,
     },
 
     exitPolicy: { cleanExitIsFresh: true, fastFailSecs: 20 },
