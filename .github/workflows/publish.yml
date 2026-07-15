@@ -1,12 +1,12 @@
 name: CI
 
 # Gates → Conventional-Commits version bump → publish @ours.network/fleet
-# (the CLI, repo root) then @ours.network/fleet-claude-code (the Claude Code
-# plugin, integrations/claude-code — static files, no build).
+# (the CLI, repo root), @ours.network/fleet-claude-code, and
+# @ours.network/fleet-codex (native Codex skills plugin).
 #
 # Prerequisites (one-time, GitHub repo settings → secrets):
 #   - NPM_TOKEN: npm automation token with publish rights to the
-#     @ours.network scope (covers BOTH packages).
+#     @ours.network scope (covers all packages).
 #   - VERSION_BUMP_APP_ID / VERSION_BUMP_APP_PRIVATE_KEY: the version-bump
 #     GitHub App (must be installed on this repo) so the bump commit can push
 #     past branch protection.
@@ -38,8 +38,12 @@ jobs:
       - run: npm ci
       - run: npm run build
       - run: npm test
+      - run: npm pack --dry-run
+        working-directory: integrations/claude-code
+      - run: npm pack --dry-run
+        working-directory: integrations/codex/ours-fleet
 
-  # Bumps BOTH package versions in one [skip ci] commit (each from
+  # Bumps all package versions in one [skip ci] commit (each from
   # max(local, npm-published)) and pushes back to main via a GitHub App token.
   # Gated on gates going green.
   version-bump:
@@ -55,6 +59,7 @@ jobs:
       new-sha: ${{ steps.bump.outputs.new-sha }}
       cli-version: ${{ steps.bump.outputs.cli-version }}
       plugin-version: ${{ steps.bump.outputs.plugin-version }}
+      codex-plugin-version: ${{ steps.bump.outputs.codex-plugin-version }}
     steps:
       - name: Generate app token
         id: app-token
@@ -74,7 +79,7 @@ jobs:
         id: bump
         run: bash .github/workflows/scripts/bump-versions.sh
 
-  # Publishes the CLI then the plugin from the post-bump SHA, so published
+  # Publishes the CLI and both plugins from the post-bump SHA, so published
   # versions always match the committed package.json files. Only runs when the
   # bump produced new versions (re-publishing an existing version would 403).
   npm-publish:
@@ -102,6 +107,11 @@ jobs:
         run: npm publish --access public
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+      - name: Publish @ours.network/fleet-codex
+        working-directory: integrations/codex/ours-fleet
+        run: npm publish --access public
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
       - name: Summary
         run: |
-          echo "Published @ours.network/fleet@${{ needs.version-bump.outputs.cli-version }} and @ours.network/fleet-claude-code@${{ needs.version-bump.outputs.plugin-version }}." >> "$GITHUB_STEP_SUMMARY"
+          echo "Published @ours.network/fleet@${{ needs.version-bump.outputs.cli-version }}, @ours.network/fleet-claude-code@${{ needs.version-bump.outputs.plugin-version }}, and @ours.network/fleet-codex@${{ needs.version-bump.outputs.codex-plugin-version }}." >> "$GITHUB_STEP_SUMMARY"

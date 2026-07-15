@@ -1,0 +1,24 @@
+{
+  "name": "@ours.network/fleet-codex",
+  "version": "0.0.0",
+  "description": "Native Codex plugin for spawning, configuring, and overseeing ours-fleet agents.",
+  "type": "module",
+  "license": "FSL-1.1-Apache-2.0",
+  "author": "Adapt Framework Solutions Ltd",
+  "homepage": "https://github.com/adapt-toolkit/ours-fleet/tree/main/integrations/codex/ours-fleet#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/adapt-toolkit/ours-fleet.git",
+    "directory": "integrations/codex/ours-fleet"
+  },
+  "keywords": ["codex", "openai", "plugin", "fleet", "agents", "spawn", "oversight", "ours.network"],
+  "files": [".codex-plugin", "skills", "bin", "README.md", "LICENSE"],
+  "bin": {
+    "ours-fleet-codex-install": "bin/ours-fleet-codex-install.mjs"
+  },
+  "engines": { "node": ">=20" },
+  "publishConfig": { "access": "public" },
+  "scripts": {
+    "test": "node --test"
+  }
+}

@@ -1,0 +1,4 @@
+interface:
+  display_name: "Spawn ours Agent"
+  short_description: "Create a persistent or temporary fleet agent"
+  default_prompt: "Use $spawn-ours-agent to create a new Codex fleet role."
