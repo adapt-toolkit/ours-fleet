@@ -1,0 +1,29 @@
+{
+  "name": "ours-fleet",
+  "version": "0.0.0",
+  "description": "Spawn, configure, and oversee ours-fleet roles from OpenAI Codex.",
+  "author": {
+    "name": "Adapt Framework Solutions Ltd",
+    "url": "https://ours.network"
+  },
+  "homepage": "https://github.com/adapt-toolkit/ours-fleet/tree/main/integrations/codex/ours-fleet",
+  "repository": "https://github.com/adapt-toolkit/ours-fleet",
+  "license": "FSL-1.1-Apache-2.0",
+  "keywords": ["codex", "ours.network", "fleet", "agents", "spawn", "oversight"],
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "ours.network Fleet",
+    "shortDescription": "Spawn and oversee persistent Codex agents",
+    "longDescription": "Create temporary or supervised ours-fleet roles, configure Codex models and permissions, and keep spawned agents healthy from inside Codex.",
+    "developerName": "Adapt Framework Solutions Ltd",
+    "category": "Productivity",
+    "capabilities": ["Interactive", "Read", "Write"],
+    "websiteURL": "https://ours.network",
+    "defaultPrompt": [
+      "Spawn a new Codex fleet agent for this task.",
+      "Show me the status of my fleet roles.",
+      "Keep an eye on the agents I spawned."
+    ],
+    "brandColor": "#6D5EF5"
+  }
+}

@@ -122,6 +122,17 @@ From inside Claude Code: install the `ours-fleet` plugin (ships in this repo und
 temp-vs-permanent, co-drafts the bio and persona with you, spawns, and arms
 oversight.
 
+From inside Codex, install the native fleet plugin:
+
+```sh
+npm i -g @ours.network/fleet-codex
+ours-fleet-codex-install
+```
+
+Start a new Codex session and say **"spawn an ours agent …"**. The bundled skill
+walks through lifetime, model, sandbox, approval policy, profile, launcher, and
+mail-monitor consent, then verifies the real tmux session and offers oversight.
+
 ## Oversight ("keep an eye")
 
 Spawned agents are subagents; their spawner (or any assigned overseer) checks on
@@ -213,11 +224,11 @@ and override individual keys per role.
 
 ## Codex roles
 
-Install Codex and the native ours plugin once on the fleet host:
+Install Codex, the native ours plugin, and the fleet skills once on the fleet host:
 
 ```sh
-npm i -g @ours.network/codex
-ours-codex-install
+npm i -g @ours.network/fleet-codex
+ours-fleet-codex-install
 ours-fleet doctor --harness codex
 ```
 
@@ -319,7 +330,8 @@ cleanly as long as each role has its own `cwd` (the common case); two roles
 sharing an identical `cwd` could have their resumes cross — give them distinct
 working directories if that matters. MCP and monitor wiring is provided by
 [`@ours.network/codex`](https://github.com/adapt-toolkit/ours-mcp/tree/main/packages/codex);
-`ours-fleet doctor --harness codex` verifies the CLI, plugin, and enhanced launcher/fallback.
+the native spawn/oversight skills are provided by `@ours.network/fleet-codex`.
+`ours-fleet doctor --harness codex` verifies the CLI, ours plugin, and enhanced launcher/fallback.
 
 ## Learn more
 

@@ -1,0 +1,4 @@
+interface:
+  display_name: "Oversee Fleet Agents"
+  short_description: "Monitor and unstick spawned fleet agents"
+  default_prompt: "Use $oversee-agents to watch and assist my fleet roles."
