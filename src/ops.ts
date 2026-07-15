@@ -18,13 +18,21 @@ export interface OpsDeps {
 const STAGGER_MS = () => 1000 * Number(process.env.FLEET_START_STAGGER ?? 5);
 
 /** Materialize a role's state dir from config: briefing + markers. Returns the dir. */
-export function applyRole(role: ResolvedRole, opts: { fresh?: boolean; temp?: boolean } = {}): string {
+export function applyRole(
+  role: ResolvedRole, opts: { fresh?: boolean; temp?: boolean; configPath?: string } = {},
+): string {
   const adapter = getAdapter(role.harness);
   const errs = adapter.validateOptions(role.harness_options);
   if (errs.length)
     throw new Error(`role '${role.name}': ` + errs.map(e => `${e.path}: ${e.message}`).join('; '));
   const dir = agentDir(role.name, opts.temp === true);
   mkdirSync(dir, { recursive: true });
+  // systemd's shared unit template invokes `_run <name>` on every restart with no
+  // -c (see supervisor/systemd.ts) — record which config this permanent role was
+  // brought up from so the supervised process can reload the SAME file instead of
+  // silently falling back to the default ~/fleet.yaml. Temp roles snapshot their
+  // whole resolved role into role.yaml instead and don't need this.
+  if (!opts.temp) writeFileSync(join(dir, '.config-path'), (opts.configPath ?? '') + '\n');
   writeFileSync(join(dir, '.identity'), role.identity + '\n');
   if (role.cwd) writeFileSync(join(dir, '.cwd'), role.cwd + '\n');
   if (!existsSync(join(dir, '.session-id'))) writeFileSync(join(dir, '.session-id'), randomUUID() + '\n');
@@ -44,12 +52,14 @@ function selectRoles(cfg: FleetConfig, names: string[]): ResolvedRole[] {
 }
 
 /** Create/start roles declaratively. Idempotent; active roles keep their context. */
-export async function up(cfg: FleetConfig, names: string[], deps: OpsDeps): Promise<void> {
+export async function up(
+  cfg: FleetConfig, names: string[], deps: OpsDeps, configPath?: string,
+): Promise<void> {
   let first = true;
   for (const role of selectRoles(cfg, names)) {
     if (!first) await deps.sleep(STAGGER_MS());
     first = false;
-    const dir = applyRole(role);
+    const dir = applyRole(role, { configPath });
     // If the role isn't running, boot fresh so it reads the briefing we just wrote.
     const status = await deps.backend.status(role.name).catch(() => '');
     if (!/running|active \(/.test(status)) rmSync(join(dir, '.booted'), { force: true });
@@ -67,13 +77,13 @@ export async function down(cfg: FleetConfig, names: string[], deps: OpsDeps): Pr
 
 /** Re-sync from config + bounce. mode 'keep' resumes context; 'fresh' wipes it. */
 export async function restartRoles(
-  cfg: FleetConfig, names: string[], deps: OpsDeps, mode: 'keep' | 'fresh',
+  cfg: FleetConfig, names: string[], deps: OpsDeps, mode: 'keep' | 'fresh', configPath?: string,
 ): Promise<void> {
   let first = true;
   for (const role of selectRoles(cfg, names)) {
     if (!first) await deps.sleep(STAGGER_MS());
     first = false;
-    applyRole(role, { fresh: mode === 'fresh' });
+    applyRole(role, { fresh: mode === 'fresh', configPath });
     await deps.backend.restart(role.name);
     deps.log(mode === 'fresh'
       ? `↻ ${role.name} — force-restarted (FRESH — context cleared, briefing reloaded)`

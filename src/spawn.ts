@@ -70,7 +70,7 @@ export async function spawnPermanent(o: SpawnOpts, deps: OpsDeps): Promise<strin
   writeFileSync(file, stringify({
     roles: { [o.name]: roleFromOpts(o, cfg.defaults.harness as string | undefined) },
   }));
-  await up(loadConfig(o.configPath), [o.name], deps);
+  await up(loadConfig(o.configPath), [o.name], deps, o.configPath);
   return file;
 }
 

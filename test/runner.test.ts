@@ -228,6 +228,40 @@ describe('runOnce', () => {
   });
 });
 
+describe('runOnce config-path fallback', () => {
+  it('falls back to the .config-path marker when no -c is given (systemd restart path)', async () => {
+    // Default ~/fleet.yaml has no role A at all — only the custom file does.
+    writeCfg({});
+    const customCfg = join(dir, 'custom.yaml');
+    writeFileSync(customCfg, stringify({ roles: { A: { harness: 'fake' } } }));
+    const d = agentDir('A');
+    mkdirSync(d, { recursive: true });
+    writeFileSync(join(d, '.config-path'), customCfg + '\n');
+    const { deps } = fakeWorld({ exitCode: '0', exitFile: join(d, '.exit-status') });
+    // No opts.configPath passed — this is exactly what systemd's `_run A` does.
+    await expect(runOnce('A', {}, deps)).resolves.not.toThrow();
+  });
+
+  it('an explicit configPath still wins over the marker', async () => {
+    writeCfg({ A: { harness: 'fake' } });
+    const staleCfg = join(dir, 'stale.yaml');
+    writeFileSync(staleCfg, stringify({ roles: {} }));   // no A here
+    const d = agentDir('A');
+    mkdirSync(d, { recursive: true });
+    writeFileSync(join(d, '.config-path'), staleCfg + '\n');
+    const { deps } = fakeWorld({ exitCode: '0', exitFile: join(d, '.exit-status') });
+    await expect(runOnce('A', { configPath: join(dir, 'fleet.yaml') }, deps)).resolves.not.toThrow();
+  });
+
+  it('no marker + no explicit path falls back to the default config, unchanged', async () => {
+    writeCfg({ A: { harness: 'fake' } });
+    const d = agentDir('A');
+    mkdirSync(d, { recursive: true });
+    const { deps } = fakeWorld({ exitCode: '0', exitFile: join(d, '.exit-status') });
+    await expect(runOnce('A', {}, deps)).resolves.not.toThrow();
+  });
+});
+
 describe('runTemp', () => {
   it('runs from the tmp snapshot and removes the dir afterwards', async () => {
     const d = agentDir('T', true);

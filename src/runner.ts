@@ -59,6 +59,22 @@ export function loadTempRole(name: string): ResolvedRole {
   return role;
 }
 
+/**
+ * Fall back to the config path applyRole() recorded at the last up/restart/spawn
+ * for this role. systemd's shared unit template (`ours-fleet-agent@.service`)
+ * execs `_run <name>` with no -c on every restart, so a role brought up from a
+ * non-default config (`ours-fleet up -c custom.yaml`) would otherwise silently
+ * resolve against the default ~/fleet.yaml on its very first restart and fail
+ * with "no such role". An empty/missing marker means "use the default", same as
+ * no -c was ever given.
+ */
+function resolveConfigPath(dir: string, explicit?: string): string | undefined {
+  if (explicit) return explicit;
+  const marker = join(dir, '.config-path');
+  if (!existsSync(marker)) return undefined;
+  return readFileSync(marker, 'utf8').trim() || undefined;
+}
+
 /** One supervised session lifecycle. The supervisor re-invokes us after we return. */
 export async function runOnce(
   name: string,
@@ -67,9 +83,10 @@ export async function runOnce(
 ): Promise<void> {
   const deps = { ...defaultDeps(), ...partialDeps };
   const temp = opts.temp === true;
-  const role = temp ? loadTempRole(name) : findRole(loadConfig(opts.configPath), name);
-  const adapter = getAdapter(role.harness);
   const dir = agentDir(name, temp);
+  const configPath = temp ? opts.configPath : resolveConfigPath(dir, opts.configPath);
+  const role = temp ? loadTempRole(name) : findRole(loadConfig(configPath), name);
+  const adapter = getAdapter(role.harness);
   mkdirSync(dir, { recursive: true });
 
   const sidFile = join(dir, '.session-id');

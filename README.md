@@ -62,7 +62,7 @@ The state dir contract:
 | `briefing.md` | generated | rewritten on every `up`/`restart`; never hand-edit |
 | `WORKLOG.md` | the agent | seeded empty, agent-appended; survives restarts |
 | `ROUTINES.md` | operator / agent | **optional** recurring-work instructions; re-read at the start of every wake, hot-editable **without a restart**; absence means "no routines" |
-| `.identity`, `.cwd`, `.session-id`, `.booted`, `.exit-status` | supervisor | dot-marker state — session resume and boot bookkeeping |
+| `.identity`, `.cwd`, `.session-id`, `.booted`, `.exit-status`, `.config-path` | supervisor | dot-marker state — session resume and boot bookkeeping |
 
 ## Prerequisites
 
@@ -168,6 +168,11 @@ ours-fleet rm <Name>
 ours-fleet doctor [--harness H]
 ours-fleet init
 ```
+
+A permanent role brought up via `-c custom.yaml` remembers that file (`.config-path`
+in its state dir) across supervisor-triggered restarts — systemd/launchd re-invoke the
+agent process with no arguments, so without this the role would silently fall back to
+the default `~/fleet.yaml` on its very first crash-restart and fail to resolve.
 
 ## fleet.yaml reference
 
