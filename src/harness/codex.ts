@@ -88,7 +88,7 @@ function hasInstalledOursPlugin(output: string): boolean {
   try {
     const value = JSON.parse(output) as { installed?: Array<Record<string, unknown>> };
     return (value.installed ?? []).some(plugin =>
-      plugin.pluginId === 'ours@ours-codex-marketplace'
+      (plugin.name === 'ours' || (typeof plugin.pluginId === 'string' && plugin.pluginId.startsWith('ours@')))
       && plugin.installed === true
       && plugin.enabled === true);
   } catch { return false; }
@@ -103,7 +103,7 @@ export function makeCodexAdapter(exec: Exec = realExec): HarnessAdapter {
       const [r, hasOursCodex, plugins] = await Promise.all([
         exec('codex', ['--version']),
         commandAvailable('ours-codex', exec),
-        exec('codex', ['plugin', 'list', '--json', '--marketplace', 'ours-codex-marketplace']),
+        exec('codex', ['plugin', 'list', '--json']),
       ]);
       const ok = r.code === 0;
       const hasOursPlugin = plugins.code === 0 && hasInstalledOursPlugin(plugins.stdout);

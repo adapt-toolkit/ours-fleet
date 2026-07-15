@@ -213,4 +213,20 @@ describe('validateOptions / prereqs', () => {
     expect(rep.ok).toBe(false);
     expect(rep.checks.find(c => c.name === 'ours plugin')?.detail).toContain('ours-codex-install');
   });
+
+  it('accepts an enabled ours plugin from a local testing marketplace', async () => {
+    const exec: Exec = async (cmd, args) => {
+      if (cmd === 'codex' && args[0] === '--version')
+        return { code: 0, stdout: 'codex-cli 0.144.4\n', stderr: '' };
+      if (cmd === 'sh') return { code: 0, stdout: '', stderr: '' };
+      if (cmd === 'codex' && args[0] === 'plugin') return {
+        code: 0, stderr: '', stdout: JSON.stringify({ installed: [{
+          pluginId: 'ours@ours-local-testing', name: 'ours', installed: true, enabled: true,
+        }] }),
+      };
+      return { code: 1, stdout: '', stderr: '' };
+    };
+    const rep = await makeCodexAdapter(exec).checkPrereqs();
+    expect(rep.ok).toBe(true);
+  });
 });
