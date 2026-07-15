@@ -90,11 +90,18 @@ export function resolveIsolation(cfg: IsolationConfig, ctx: WrapContext): Resolv
   const addRw = (p: string) => { if (!mounts.some(m => m.src === p)) mounts.push({ src: p, dst: p, mode: 'rw' }); };
   const addRo = (p: string) => { if (!mounts.some(m => m.src === p)) mounts.push({ src: p, dst: p, mode: 'ro' }); };
 
-  // Durable set (always present, rw): state dir, cwd, Claude config.
+  // Durable set: state dir + cwd, then only the active harness's config/auth roots.
   addRw(stateDir);
   addRw(runCwd);
-  addRw(join(home, '.claude'));
-  addRw(join(home, '.claude.json'));
+  if (ctx.harness === 'codex') {
+    addRw(join(home, '.codex'));
+    addRo(join(home, '.agents'));
+  } else {
+    // Preserve the historical default for callers that predate harness-aware contexts.
+    addRw(join(home, '.claude'));
+    addRw(join(home, '.claude.json'));
+  }
+  for (const dir of ctx.additionalWriteDirs ?? []) addRw(dir);
 
   // Declared fs extras.
   for (const p of cfg.fs?.write ?? []) addRw(p);

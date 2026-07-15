@@ -112,7 +112,7 @@ export function makeClaudeCodeAdapter(exec: Exec = realExec): HarnessAdapter {
       const argv = mode === 'fresh'
         ? [...base, '--session-id', s.sessionId, `Read and follow ${join(stateDir, 'briefing.md')} now.`]
         : [...base, '--resume', s.sessionId,
-            this.vocabulary.restartPrompt(role.identity, join(stateDir, 'WORKLOG.md'))];
+            this.vocabulary.restartPrompt(role.identity, join(stateDir, 'WORKLOG.md'), role)];
       return { argv, env: prep.env };
     },
 

@@ -9,6 +9,8 @@ import { registerAdapter } from '../src/harness/registry.js';
 import { fakeAdapter } from './registry.test.js';
 import type { OpsDeps } from '../src/ops.js';
 import type { SupervisorBackend } from '../src/supervisor/types.js';
+import '../src/harness/claude-code.js';
+import '../src/harness/codex.js';
 
 let dir: string;
 beforeEach(() => {
@@ -102,6 +104,33 @@ describe('spawn --model', () => {
       { name: 'Scout', model: 'claude-opus-4-8' }, '/b/ours-fleet', () => {});
     const snap = parse(readFileSync(join(d, 'role.yaml'), 'utf8'));
     expect(snap.model).toBe('claude-opus-4-8');
+  });
+});
+
+describe('spawn Codex options', () => {
+  it('persists launcher, permission, sandbox, profile, search, config, and add-dir', async () => {
+    const { d } = fakeDeps();
+    const file = await spawnPermanent({
+      name: 'Coder', harness: 'codex', model: 'gpt-5.4', permissionMode: 'never',
+      sandbox: 'workspace-write', profile: 'fleet', launcher: 'auto', search: true,
+      codexConfig: { model_reasoning_effort: 'high' }, addDirs: ['/data/shared'], monitor: true,
+    }, d);
+    const role = parse(readFileSync(file, 'utf8')).roles.Coder;
+    expect(role.model).toBe('gpt-5.4');
+    expect(role.harness_options).toEqual({
+      approval: 'never', sandbox: 'workspace-write', profile: 'fleet', launcher: 'auto',
+      search: true, config: { model_reasoning_effort: 'high' }, add_dirs: ['/data/shared'],
+      monitor: true,
+    });
+  });
+
+  it('maps the generic permission flag to Claude permission_mode', async () => {
+    const { d } = fakeDeps();
+    const file = await spawnPermanent({
+      name: 'ClaudeWorker', harness: 'claude-code', permissionMode: 'dontAsk',
+    }, d);
+    expect(parse(readFileSync(file, 'utf8')).roles.ClaudeWorker.harness_options)
+      .toEqual({ permission_mode: 'dontAsk' });
   });
 });
 

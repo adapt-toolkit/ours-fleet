@@ -90,7 +90,12 @@ export async function doctor(
     checks.push({ name: 'isolation: cgroup delegation', ok: true, detail: cgroupDelegationDetail() });
   for (const r of roles.filter(r => r.isolation)) {
     const stateDir = agentDir(r.name);
-    const policy = resolveIsolation(r.isolation!, { stateDir, runCwd: r.cwd ?? stateDir, home: home() });
+    const policy = resolveIsolation(r.isolation!, {
+      stateDir, runCwd: r.cwd ?? stateDir, home: home(), harness: r.harness,
+      additionalWriteDirs: r.harness === 'codex'
+        ? ((r.harness_options as { add_dirs?: string[] } | undefined)?.add_dirs ?? [])
+        : [],
+    });
     const caps = [
       policy.resources.mem && `mem=${policy.resources.mem}`,
       policy.resources.cpu && `cpu=${policy.resources.cpu}`,

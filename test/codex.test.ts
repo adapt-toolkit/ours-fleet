@@ -7,13 +7,35 @@ import type { Exec } from '../src/exec.js';
 const role = (over: Partial<ResolvedRole> = {}): ResolvedRole => ({
   name: 'Alice', harness: 'codex', identity: 'Alice Dev', sourceFile: 'x', ...over,
 });
-const okExec: Exec = async () => ({ stdout: 'codex-cli 0.144.4', stderr: '', code: 0 });
+const execWith = (oursCodex: boolean): Exec => async (cmd, args) => {
+  if (cmd === 'codex' && args[0] === '--version')
+    return { stdout: 'codex-cli 0.144.4', stderr: '', code: 0 };
+  if (cmd === 'codex' && args[0] === 'plugin')
+    return { stdout: JSON.stringify({ installed: [{
+      pluginId: 'ours@ours-codex-marketplace', installed: true, enabled: true,
+    }] }), stderr: '', code: 0 };
+  if (cmd === 'sh') return { stdout: '', stderr: '', code: oursCodex ? 0 : 1 };
+  return { stdout: '', stderr: '', code: 0 };
+};
+const okExec = execWith(false);
 
 describe('prepareSession', () => {
-  it('is a no-op: no argv, no env', async () => {
-    const a = makeCodexAdapter(okExec);
+  it('prefers ours-codex when installed', async () => {
+    const a = makeCodexAdapter(execWith(true));
     const prep = await a.prepareSession(role(), { stateDir: '/s', runCwd: '/s' });
-    expect(prep).toEqual({ argv: [], env: {} });
+    expect(prep).toEqual({ argv: [], env: {}, command: 'ours-codex' });
+  });
+
+  it('falls back to native codex when ours-codex is absent', async () => {
+    const a = makeCodexAdapter(execWith(false));
+    const prep = await a.prepareSession(role(), { stateDir: '/s', runCwd: '/s' });
+    expect(prep).toEqual({ argv: [], env: {}, command: 'codex' });
+  });
+
+  it('fails clearly when ours-codex was explicitly required', async () => {
+    const a = makeCodexAdapter(execWith(false));
+    await expect(a.prepareSession(role({ harness_options: { launcher: 'ours-codex' } }),
+      { stateDir: '/s', runCwd: '/s' })).rejects.toThrow(/not on PATH/);
   });
 });
 
@@ -37,12 +59,13 @@ describe('buildLaunch', () => {
     expect(resume.argv).toContain('--last');
     const prompt = resume.argv[resume.argv.length - 1];
     expect(prompt).toContain('choose_identity name "Alice Dev" force=true');
-    expect(prompt).toContain('ours-mcp watch "Alice Dev"');
+    expect(prompt).toContain('ask the fleet owner');
+    expect(prompt).toContain('foreground_monitor');
     expect(prompt.toLowerCase()).not.toContain('a2adapt');
     // A backgrounded watch never wakes a Codex turn (no persistent Monitor primitive) —
     // the restart prompt must not tell the agent to background it.
     expect(prompt).not.toContain('as a background shell command');
-    expect(prompt).toContain('blocking foreground');
+    expect(prompt).toContain('native-codex fallback');
   });
 
   it('injects --model when role.model is set (fresh + resume)', () => {
@@ -67,6 +90,24 @@ describe('buildLaunch', () => {
     expect(fresh.argv.slice(0, 6)).toEqual([
       'codex', '--sandbox', 'workspace-write', '--ask-for-approval', 'never', '--search',
     ]);
+  });
+
+  it('injects profile, config overrides, add-dir and permission_mode alias', () => {
+    const a = makeCodexAdapter(okExec);
+    const r = role({ harness_options: {
+      profile: 'fleet', permission_mode: 'on-request', add_dirs: ['/data/reports'],
+      config: { model_reasoning_effort: 'high', hide_agent_reasoning: true, max_tool_output: 42 },
+    } });
+    const launch = a.buildLaunch(r, 'fresh', { sessionId: 'SID' }, { argv: [], env: {}, command: 'ours-codex' });
+    expect(launch.argv[0]).toBe('ours-codex');
+    expect(launch.argv).toContain('--profile');
+    expect(launch.argv).toContain('fleet');
+    expect(launch.argv).toContain('--add-dir');
+    expect(launch.argv).toContain('/data/reports');
+    expect(launch.argv).toContain('model_reasoning_effort="high"');
+    expect(launch.argv).toContain('hide_agent_reasoning=true');
+    expect(launch.argv).toContain('max_tool_output=42');
+    expect(launch.argv).toContain('on-request');
   });
 
   it('argv is byte-identical to before when harness_options is unset (backward compat)', () => {
@@ -102,13 +143,24 @@ describe('buildLaunch', () => {
 });
 
 describe('vocabulary.monitorInstruction', () => {
-  it('never tells the agent to background the watch, and offers the two real options', () => {
+  it('asks before arming by default and never backgrounds the watch', () => {
     const a = makeCodexAdapter(okExec);
-    const text = a.vocabulary.monitorInstruction('Alice Dev');
+    const text = a.vocabulary.monitorInstruction('Alice Dev', role());
     expect(text).not.toContain('as a background shell command');
-    expect(text).toContain('blocking foreground');
+    expect(text).toContain('Ask the fleet owner');
+    expect(text).toContain('blocking wait');
     expect(text).toContain('get_messages');
-    expect(text).toContain('ours-mcp watch "Alice Dev"');
+    expect(text).toContain('arm_monitor');
+    expect(text).toContain('foreground_monitor');
+  });
+
+  it('treats monitor: true as explicit persistent fleet consent', () => {
+    const a = makeCodexAdapter(okExec);
+    const configured = role({ harness_options: { monitor: true } });
+    const text = a.vocabulary.monitorInstruction('Alice Dev', configured);
+    expect(text).toContain('explicitly consented');
+    expect(text).toContain('Call **arm_monitor**');
+    expect(text).not.toContain('Do not call **arm_monitor**');
   });
 });
 
@@ -117,11 +169,23 @@ describe('validateOptions / prereqs', () => {
     const a = makeCodexAdapter(okExec);
     const errs = a.validateOptions({ sandboxx: 'workspace-write' });
     expect(errs).toHaveLength(1);
-    expect(errs[0].message).toContain('allowed: sandbox, approval, search');
+    expect(errs[0].message).toContain('launcher, sandbox, approval');
   });
-  it('accepts sandbox/approval/search as known option keys', () => {
+  it('accepts sandbox/approval/search/monitor as known option keys', () => {
     const a = makeCodexAdapter(okExec);
-    expect(a.validateOptions({ sandbox: 'workspace-write', approval: 'never', search: true })).toEqual([]);
+    expect(a.validateOptions({ sandbox: 'workspace-write', approval: 'never', search: true, monitor: true })).toEqual([]);
+  });
+  it('validates launcher/profile/config/add_dirs and conflicting approval aliases', () => {
+    const a = makeCodexAdapter(okExec);
+    const errs = a.validateOptions({
+      launcher: 'magic', profile: '', add_dirs: [''], config: { nested: { nope: true } },
+      approval: 'never', permission_mode: 'on-request', monitor: 'yes',
+    });
+    expect(errs.map(e => e.path)).toEqual(expect.arrayContaining([
+      'harness_options.launcher', 'harness_options.profile', 'harness_options.add_dirs',
+      'harness_options.config.nested', 'harness_options.permission_mode',
+      'harness_options.monitor',
+    ]));
   });
   it('flags a bad sandbox/approval value', () => {
     const a = makeCodexAdapter(okExec);
@@ -133,5 +197,20 @@ describe('validateOptions / prereqs', () => {
     const rep = await a.checkPrereqs();
     expect(rep.ok).toBe(false);
     expect(rep.checks[0].detail).toContain('not found');
+  });
+  it('reports ours-codex as an optional enhancement, not a failed prerequisite', async () => {
+    const rep = await makeCodexAdapter(execWith(false)).checkPrereqs();
+    expect(rep.ok).toBe(true);
+    expect(rep.checks.find(c => c.name === 'ours-codex')).toMatchObject({ ok: true });
+    expect(rep.checks.find(c => c.name === 'ours-codex')?.detail).toContain('fall back');
+  });
+  it('requires the native ours plugin for monitor tools', async () => {
+    const exec: Exec = async (cmd, args) => {
+      if (cmd === 'codex' && args[0] === '--version') return { stdout: 'codex-cli 1.0.0', stderr: '', code: 0 };
+      return { stdout: '', stderr: '', code: 1 };
+    };
+    const rep = await makeCodexAdapter(exec).checkPrereqs();
+    expect(rep.ok).toBe(false);
+    expect(rep.checks.find(c => c.name === 'ours plugin')?.detail).toContain('ours-codex-install');
   });
 });

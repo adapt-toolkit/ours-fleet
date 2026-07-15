@@ -6,6 +6,7 @@ export type {
 } from './harness/types.js';
 export { registerAdapter, getAdapter, knownAdapters } from './harness/registry.js';
 export { claudeCodeAdapter, makeClaudeCodeAdapter } from './harness/claude-code.js';
+export { codexAdapter, makeCodexAdapter } from './harness/codex.js';
 export { generateBriefing } from './briefing.js';
 export { pickBackend } from './supervisor/index.js';
 export type { SupervisorBackend } from './supervisor/types.js';

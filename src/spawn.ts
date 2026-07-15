@@ -15,13 +15,21 @@ export interface SpawnOpts {
   cwd?: string;
   coordinator?: string;
   model?: string;
+  permissionMode?: string;
+  sandbox?: string;
+  profile?: string;
+  launcher?: string;
+  search?: boolean;
+  codexConfig?: Record<string, string | number | boolean>;
+  addDirs?: string[];
+  monitor?: boolean;
   bioFile?: string;
   personaFile?: string;
   overseeInterval?: string;
   configPath?: string;
 }
 
-function roleFromOpts(o: SpawnOpts): RoleConfig {
+function roleFromOpts(o: SpawnOpts, defaultHarness?: string): RoleConfig {
   const r: RoleConfig = {};
   if (o.harness) r.harness = o.harness;
   if (o.identity) r.identity = o.identity;
@@ -29,6 +37,17 @@ function roleFromOpts(o: SpawnOpts): RoleConfig {
   if (o.coordinator) r.coordinator = o.coordinator;
   if (o.mission) r.mission = o.mission;
   if (o.model?.trim()) r.model = o.model.trim();
+  const harness = o.harness ?? defaultHarness;
+  const harnessOptions: Record<string, unknown> = {};
+  if (o.permissionMode) harnessOptions[harness === 'claude-code' ? 'permission_mode' : 'approval'] = o.permissionMode;
+  if (o.sandbox) harnessOptions.sandbox = o.sandbox;
+  if (o.profile) harnessOptions.profile = o.profile;
+  if (o.launcher) harnessOptions.launcher = o.launcher;
+  if (o.search === true) harnessOptions.search = true;
+  if (o.codexConfig && Object.keys(o.codexConfig).length) harnessOptions.config = o.codexConfig;
+  if (o.addDirs?.length) harnessOptions.add_dirs = o.addDirs;
+  if (o.monitor === true) harnessOptions.monitor = true;
+  if (Object.keys(harnessOptions).length) r.harness_options = harnessOptions;
   if (o.bioFile) r.bio = readFileSync(o.bioFile, 'utf8').trim();
   if (o.personaFile) r.persona = readFileSync(o.personaFile, 'utf8').trim();
   return r;
@@ -45,9 +64,12 @@ function assertNameFree(o: SpawnOpts): void {
 /** Permanent spawn: persist to ~/fleet.d/<Name>.yaml, then bring it up. */
 export async function spawnPermanent(o: SpawnOpts, deps: OpsDeps): Promise<string> {
   assertNameFree(o);
+  const cfg = loadConfig(o.configPath);
   mkdirSync(fleetDDir(), { recursive: true });
   const file = join(fleetDDir(), `${o.name}.yaml`);
-  writeFileSync(file, stringify({ roles: { [o.name]: roleFromOpts(o) } }));
+  writeFileSync(file, stringify({
+    roles: { [o.name]: roleFromOpts(o, cfg.defaults.harness as string | undefined) },
+  }));
   await up(loadConfig(o.configPath), [o.name], deps);
   return file;
 }
@@ -73,12 +95,19 @@ export async function spawnTemp(
 ): Promise<string> {
   assertNameFree(o);
   const cfg = loadConfig(o.configPath);
+  const defaultHarness = cfg.defaults.harness as string | undefined;
+  const fromOpts = roleFromOpts(o, defaultHarness);
+  const mergedHarnessOptions = {
+    ...((cfg.defaults.harness_options ?? {}) as Record<string, unknown>),
+    ...(fromOpts.harness_options ?? {}),
+  };
   const role: ResolvedRole = {
-    ...roleFromOpts(o),
+    ...fromOpts,
     name: o.name,
-    harness: o.harness ?? (cfg.defaults.harness as string | undefined) ?? 'claude-code',
+    harness: o.harness ?? defaultHarness ?? 'claude-code',
     identity: o.identity ?? o.name,
     model: o.model?.trim() || (cfg.defaults.model as string | undefined),
+    harness_options: Object.keys(mergedHarnessOptions).length ? mergedHarnessOptions : undefined,
     sourceFile: '(temp)',
   };
   const dir = applyRole(role, { temp: true });

@@ -107,6 +107,11 @@ From the shell:
 ours-fleet spawn Worker --mission "own the worker repo" \
   --bio-file bio.md --persona-file persona.md --coordinator FleetCoordinator
 ours-fleet spawn --temp Scout --mission "one-off research"   # gone on exit/reboot
+
+# Codex role: ours-codex is preferred automatically; plain codex is the fallback
+ours-fleet spawn Coder --harness codex --model gpt-5.4 \
+  --permission-mode on-request --sandbox workspace-write \
+  --profile fleet --search --monitor --coordinator FleetCoordinator
 ```
 
 Permanent spawns are written to `~/fleet.d/<Name>.yaml` — your hand-written
@@ -147,7 +152,7 @@ ours-fleet up|down|restart|force-restart [-c FILE] [Name...]
 ours-fleet config [-c FILE]         validate + print merged plan
 ours-fleet ls | attach | peek | logs [-f] | status <Name>
 ours-fleet send <Name> "text" | --key <K>
-ours-fleet spawn [--temp] <Name> [--mission --model --bio-file --persona-file ...]
+ours-fleet spawn [--temp] <Name> [--harness --mission --model --permission-mode ...]
 ours-fleet rm <Name>
 ours-fleet doctor [--harness H]
 ours-fleet init
@@ -183,7 +188,14 @@ roles:
       #   one of read-only | workspace-write | danger-full-access
       # approval: never                         # codex: --ask-for-approval —
       #   one of untrusted | on-request | never
+      # permission_mode: never                  # codex alias for approval
+      # launcher: auto                          # codex: auto | ours-codex | codex
+      # profile: fleet                          # codex: $CODEX_HOME/fleet.config.toml
       # search: true                            # codex: enable --search (live web search)
+      # add_dirs: [/data/shared]                # codex: repeat --add-dir
+      # monitor: true                           # explicit persistent consent to arm mail wake
+      # config:                                 # codex: repeat --config key=<TOML value>
+      #   model_reasoning_effort: high
     isolation:                          # OS-level sandbox (additive; omit = today's behavior)
       backend: auto                     # auto | bubblewrap | podman | none   (default auto)
       on_unavailable: warn              # warn (un-isolated + marker) | strict (refuse)   (default warn)
@@ -195,7 +207,65 @@ roles:
 
 Merge order: `fleet.yaml` ← `fleet.d/*.yaml`; a duplicate role name is a hard
 error naming both files. Identities and roles are decoupled — removing a role
-never deletes an identity.
+never deletes an identity. `defaults.harness_options` is shallow-merged with each
+role's `harness_options`, so a fleet can set common Codex permission/profile defaults
+and override individual keys per role.
+
+## Codex roles
+
+Install Codex and the native ours plugin once on the fleet host:
+
+```sh
+npm i -g @ours.network/codex
+ours-codex-install
+ours-fleet doctor --harness codex
+```
+
+A role with `harness: codex` resolves its launcher at every supervised start:
+
+1. `harness_options.launcher: auto` (the default) uses `ours-codex` when it is on
+   `PATH`, giving the role session-scoped background mail wake.
+2. If `ours-codex` is absent, it launches ordinary `codex`; the native ours plugin's
+   blocking `foreground_monitor` is used as the supported fallback.
+3. `launcher: ours-codex` makes the enhanced launcher mandatory and fails clearly if
+   it is missing; `launcher: codex` explicitly selects standard mode.
+
+Monitoring remains consent-first. By default the generated briefing asks in the role's
+console before calling `arm_monitor`. Set `harness_options.monitor: true` (or pass
+`ours-fleet spawn --monitor`) to record explicit persistent consent for that role, including
+supervised restarts. In the standard-Codex fallback, the agent separately surfaces the
+`ours-codex` recommendation before asking to enter `foreground_monitor`. It never backgrounds
+`ours-mcp watch`, because a detached watch cannot wake a Codex turn. The foreground
+wait is re-entered after each handled message; `ours-codex` instead wakes the idle
+session through its App Server integration.
+
+The main Codex controls needed by fleet roles are available declaratively and when spawning:
+
+```yaml
+defaults:
+  harness: codex
+  model: gpt-5.4
+  harness_options:
+    launcher: auto
+    profile: fleet                 # $CODEX_HOME/fleet.config.toml
+    sandbox: workspace-write
+    approval: on-request
+    monitor: true                  # explicit consent for unattended mail wake
+    search: true
+    add_dirs: [/data/shared]
+    config:
+      model_reasoning_effort: high
+
+roles:
+  Reviewer:
+    harness_options:
+      sandbox: read-only           # overrides just this default key
+```
+
+Equivalent one-off/permanent spawn controls include `--model`, `--permission-mode`,
+`--sandbox`, `--profile`, `--launcher`, `--search`, `--monitor`, repeatable
+`--codex-config key=value`, and repeatable `--add-dir`. Use `env.OURS_PORT`/`env.OURS_CONFIG` for a
+role-specific ours daemon, or configure the host default in `~/.ours/config.json`.
 
 ## Agent isolation
 
@@ -217,6 +287,8 @@ all invisible, ours messaging still works, no hard resource caps.
   unshares the network; `broker` keeps host networking so the loopback ours daemon
   stays reachable — full broker egress-hardening is a follow-up.
 - **`fs.read` / `fs.write`** — extra read-only / read-write binds on top of the durable set.
+  The durable harness credentials are selected automatically: `~/.claude*` for Claude Code,
+  or `~/.codex` plus read-only `~/.agents` for Codex.
 - **`resources`** — `mem` (→ `MemoryMax` + `MemorySwapMax=0`, a hard OOM bound),
   `cpu` cores (→ `CPUQuota`), `pids` (→ `TasksMax`). CPU degrades to a warning if the
   cpu cgroup controller isn't delegated (mem/pids still enforced).
@@ -240,20 +312,14 @@ Adding a harness = implementing `HarnessAdapter`
 (`src/harness/types.ts`) and registering it — see `src/harness/claude-code.ts`
 and `src/harness/codex.ts` for reference implementations.
 
-**Codex CLI notes.** Codex assigns its own session id (there's no `--session-id`
+**Codex CLI resume note.** Codex assigns its own session id (there's no `--session-id`
 equivalent to pin at creation), so resume uses `codex resume --last`, which
 picks the most recently active session **in the role's `cwd`**. This works
 cleanly as long as each role has its own `cwd` (the common case); two roles
 sharing an identical `cwd` could have their resumes cross — give them distinct
-working directories if that matters. Codex also has no persistent "Monitor"
-primitive like Claude Code's, so its briefing wording has the agent run
-`ours-mcp watch <identity>` as a background shell command and poll it (or poll
-`get_messages`) between turns instead of arming a Monitor tool. MCP wiring
-(registering the `ours` MCP server, the `ours` skill) is handled by the
-separate [`@ours.network/codex`](https://github.com/adapt-toolkit/ours-mcp/tree/main/packages/codex)
-package, not by `ours-fleet` itself — install and run `ours-codex-install` once
-per host, same as Claude Code's plugin marketplace registration is a one-time,
-separate step.
+working directories if that matters. MCP and monitor wiring is provided by
+[`@ours.network/codex`](https://github.com/adapt-toolkit/ours-mcp/tree/main/packages/codex);
+`ours-fleet doctor --harness codex` verifies the CLI, plugin, and enhanced launcher/fallback.
 
 ## Learn more
 
