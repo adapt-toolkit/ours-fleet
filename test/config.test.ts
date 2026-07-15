@@ -55,6 +55,18 @@ describe('loadConfig', () => {
     expect(b.identity).toBe('Bee');
   });
 
+  it('merges defaults.harness_options with per-role overrides', () => {
+    base('defaults:\n  harness: codex\n  harness_options:\n    launcher: auto\n    sandbox: workspace-write\nroles:\n  A: {}\n  B:\n    harness_options:\n      sandbox: read-only\n      search: true\n');
+    const cfg = loadConfig();
+    expect(findRole(cfg, 'A').harness_options).toEqual({ launcher: 'auto', sandbox: 'workspace-write' });
+    expect(findRole(cfg, 'B').harness_options).toEqual({ launcher: 'auto', sandbox: 'read-only', search: true });
+  });
+
+  it('rejects a non-map defaults.harness_options', () => {
+    base('defaults:\n  harness_options: nope\nroles:\n  A: {}\n');
+    expect(() => loadConfig()).toThrowError(/defaults\.harness_options must be a map/);
+  });
+
   it('defaults harness to claude-code with no defaults section', () => {
     base('roles:\n  A: {}\n');
     expect(findRole(loadConfig(), 'A').harness).toBe('claude-code');

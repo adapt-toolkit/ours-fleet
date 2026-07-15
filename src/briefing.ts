@@ -42,13 +42,15 @@ export function generateBriefing(role: ResolvedRole, v: BriefingVocab, opts: Bri
     : '   with a 1–2 sentence summary of your Charter above. Skip if it already matches.');
   L.push(`5. SET your **persona** (local operating contract, never shared in invites) via`);
   L.push(`   **${v.setPersonaTool}** with the **Charter** section above, verbatim. Skip if it matches.`);
-  L.push(`6. ${v.monitorInstruction(id)}`);
+  L.push(`6. ${v.monitorInstruction(id, role)}`);
   if (role.coordinator) {
     L.push(`7. ANNOUNCE yourself: call **${v.sendTool}** to contact "${role.coordinator}" with text:`);
-    L.push(`   "${role.name} online — identity '${id}' bound, monitor armed, ready."`);
-    L.push(`8. Await messages. When the monitor wakes you, call **${v.getMessagesTool}**, act, reply.`);
+    L.push(`   "${role.name} online — identity '${id}' bound, ready."`);
+    L.push(`8. Await messages. When the monitor wakes you (or the owner requests a manual check),`);
+    L.push(`   call **${v.getMessagesTool}**, act, and reply.`);
   } else {
-    L.push(`7. Await messages. When the monitor wakes you, call **${v.getMessagesTool}**, act on them,`);
+    L.push(`7. Await messages. When the monitor wakes you (or the owner requests a manual check),`);
+    L.push(`   call **${v.getMessagesTool}**, act on them,`);
     L.push(`   and reply with ${v.sendTool}. No coordinator is configured — the owner drives you`);
     L.push(`   via \`tmux attach -t ${role.name}\` or by messaging "${id}".`);
   }
@@ -74,8 +76,8 @@ export function generateBriefing(role: ResolvedRole, v: BriefingVocab, opts: Bri
   L.push('on messages, timers, or prompts — and follow it for recurring or scheduled work. It may');
   L.push('change between wakes without a restart; treat the file, not your memory of it, as current.');
   L.push('', '## On restart (you run under a supervised launcher)');
-  L.push(`On restart, WITHOUT asking: re-bind (**${v.bindTool}** name "${id}" force=true),`);
-  L.push(`re-arm the \`${v.watchCommand(id)}\` monitor, then continue from your WORKLOG.`);
+  L.push(`On restart, WITHOUT asking: re-bind (**${v.bindTool}** name "${id}" force=true), then`);
+  L.push(`${v.monitorInstruction(id, role)} Then continue from your WORKLOG.`);
   L.push('Do not blindly re-run whatever may have crashed you.');
   L.push('', '## House rules');
   L.push('- Never broad `rm -rf` on home/critical paths; quote globs; use explicit paths.');

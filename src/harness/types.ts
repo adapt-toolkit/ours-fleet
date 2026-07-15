@@ -6,8 +6,13 @@ export interface PrereqReport { ok: boolean; checks: PrereqCheck[] }
 export interface RoleDirs { stateDir: string; runCwd: string }
 export interface SessionState { sessionId: string }
 
-/** Extra argv/env contributed by prepareSession (overlays, trust, limits). */
-export interface SessionPrep { argv: string[]; env: Record<string, string> }
+/** Extra command/argv/env contributed by prepareSession (overlays, trust, limits). */
+export interface SessionPrep {
+  argv: string[];
+  env: Record<string, string>;
+  /** Optional launcher selected after runtime prerequisite probing. */
+  command?: string;
+}
 export interface Launch { argv: string[]; env: Record<string, string> }
 
 /** Harness-correct wording/tool names used to generate briefing.md. */
@@ -20,9 +25,9 @@ export interface BriefingVocab {
   sendTool: string;
   getMessagesTool: string;
   watchCommand(identity: string): string;
-  monitorInstruction(identity: string): string;
+  monitorInstruction(identity: string, role?: ResolvedRole): string;
   launchNote(name: string): string;
-  restartPrompt(identity: string, worklogPath: string): string;
+  restartPrompt(identity: string, worklogPath: string, role?: ResolvedRole): string;
 }
 
 export interface ExitPolicy { cleanExitIsFresh: boolean; fastFailSecs: number }

@@ -13,6 +13,7 @@ import { runOnce, runTemp } from './runner.js';
 import { spawnPermanent, spawnTemp, type SpawnOpts } from './spawn.js';
 import { doctor } from './doctor.js';
 import './harness/claude-code.js';   // registers the claude-code adapter
+import './harness/codex.js';         // registers the codex adapter
 
 // sudo/su shells lack XDG_RUNTIME_DIR, breaking every systemctl/journalctl
 // --user child (supervisor commands, logs, doctor). Derive it before dispatch. (#9)
@@ -43,6 +44,23 @@ const program = new Command()
 
 const cOpt = (cmd: Command) => cmd.option('-c, --configuration <file>', 'config file (default: ~/fleet.yaml + ~/fleet.d/)');
 
+const collect = (value: string, previous: string[]) => [...previous, value];
+
+function parseCodexConfig(values: string[] | undefined): Record<string, string | number | boolean> | undefined {
+  if (!values?.length) return undefined;
+  const out: Record<string, string | number | boolean> = {};
+  for (const raw of values) {
+    const i = raw.indexOf('=');
+    if (i < 1) throw new Error(`invalid --codex-config '${raw}'; expected key=value`);
+    const key = raw.slice(0, i);
+    const value = raw.slice(i + 1);
+    if (value === 'true' || value === 'false') out[key] = value === 'true';
+    else if (value.trim() !== '' && Number.isFinite(Number(value))) out[key] = Number(value);
+    else out[key] = value;
+  }
+  return out;
+}
+
 cOpt(program.command('config').description('validate + print the merged plan (no side effects)'))
   .action(opts => {
     try {
@@ -55,6 +73,8 @@ cOpt(program.command('config').description('validate + print the merged plan (no
         console.log(`    source:      ${r.sourceFile}`);
         if (r.cwd) console.log(`    cwd:         ${r.cwd}`);
         if (r.model) console.log(`    model:       ${r.model}`);
+        if (r.harness_options && Object.keys(r.harness_options).length)
+          console.log(`    options:     ${JSON.stringify(r.harness_options)}`);
         if (r.coordinator) console.log(`    coordinator: ${r.coordinator}`);
         if (r.mission) console.log(`    mission:     ${r.mission.split('\n')[0]}`);
         if (r.oversee?.length) console.log(`    oversees:    ${r.oversee.map(o => `${o.role}@${o.interval}`).join(', ')}`);
@@ -137,16 +157,27 @@ cOpt(program.command('spawn <name>').description('spawn a new agent (permanent b
   .option('--cwd <dir>', 'working directory')
   .option('--coordinator <name>', 'announce target')
   .option('--model <id>', 'model id to launch on (e.g. claude-fable-5); default: launcher default')
+  .option('--permission-mode <mode>', 'harness permission mode (Codex: untrusted|on-request|never; Claude: native values)')
+  .option('--sandbox <mode>', 'Codex sandbox: read-only|workspace-write|danger-full-access')
+  .option('--profile <name>', 'Codex profile file name ($CODEX_HOME/<name>.config.toml)')
+  .option('--launcher <mode>', 'Codex launcher: auto|ours-codex|codex (default: auto)')
+  .option('--search', 'enable Codex live web search')
+  .option('--codex-config <key=value>', 'Codex config override (repeatable)', collect, [])
+  .option('--add-dir <dir>', 'additional Codex writable directory (repeatable)', collect, [])
+  .option('--monitor', 'explicitly consent to arm this Codex role\'s ours mail monitor')
   .option('--bio-file <file>', 'public bio (file)')
   .option('--persona-file <file>', 'persona / operating contract (file)')
   .action(async (name, opts) => {
-    const o: SpawnOpts = {
-      name, temp: opts.temp, harness: opts.harness, mission: opts.mission,
-      identity: opts.identity, cwd: opts.cwd, coordinator: opts.coordinator,
-      model: opts.model,
-      bioFile: opts.bioFile, personaFile: opts.personaFile, configPath: opts.configuration,
-    };
     try {
+      const o: SpawnOpts = {
+        name, temp: opts.temp, harness: opts.harness, mission: opts.mission,
+        identity: opts.identity, cwd: opts.cwd, coordinator: opts.coordinator,
+        model: opts.model,
+        permissionMode: opts.permissionMode, sandbox: opts.sandbox, profile: opts.profile,
+        launcher: opts.launcher, search: opts.search,
+        codexConfig: parseCodexConfig(opts.codexConfig), addDirs: opts.addDir, monitor: opts.monitor,
+        bioFile: opts.bioFile, personaFile: opts.personaFile, configPath: opts.configuration,
+      };
       if (o.temp) {
         const dir = await spawnTemp(o, binPath);
         console.log(`spawned temp agent '${name}' (state: ${dir}; gone on exit/reboot)`);

@@ -49,10 +49,12 @@ describe('ours-fleet CLI', () => {
     expect(r.stderr).toContain('config not found');
   });
 
-  it('spawn --help lists the --model option', async () => {
+  it('spawn --help lists model and Codex controls', async () => {
     const r = await run(['spawn', '--help']);
     expect(r.code).toBe(0);
     expect(r.stdout).toContain('--model');
+    for (const flag of ['--permission-mode', '--sandbox', '--profile', '--launcher', '--codex-config', '--add-dir', '--monitor'])
+      expect(r.stdout).toContain(flag);
   });
 
   it('config prints an isolation summary for a role that declares it', async () => {

@@ -89,7 +89,12 @@ export async function runOnce(
   // env prefix + exit capture in buildPaneCommand stay host-side (see §5.3).
   let paneArgv = launch.argv;
   if (role.isolation) {
-    const ctx: WrapContext = { stateDir: dir, runCwd, home: home() };
+    const addDirs = role.harness === 'codex'
+      ? ((role.harness_options as { add_dirs?: string[] } | undefined)?.add_dirs ?? [])
+      : [];
+    const ctx: WrapContext = {
+      stateDir: dir, runCwd, home: home(), harness: role.harness, additionalWriteDirs: addDirs,
+    };
     const policy = resolveIsolation(role.isolation, ctx);
     const sel = await selectIsolationBackend(policy, deps.exec);  // throws on strict + unavailable
     const degradedMarker = join(dir, '.isolation-degraded');

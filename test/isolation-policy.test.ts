@@ -45,6 +45,19 @@ describe('resolveIsolation durable mount set', () => {
     expect(mount(r, '/home/fleet/.claude.json')?.mode).toBe('rw');
   });
 
+  it('mounts Codex config/auth rw and shared skills ro for Codex roles', () => {
+    const r = resolveIsolation({}, ctx({ harness: 'codex' }));
+    expect(mount(r, '/home/fleet/.codex')?.mode).toBe('rw');
+    expect(mount(r, '/home/fleet/.agents')?.mode).toBe('ro');
+    expect(mount(r, '/home/fleet/.claude')).toBeUndefined();
+    expect(mount(r, '/home/fleet/.claude.json')).toBeUndefined();
+  });
+
+  it('mounts harness-declared additional writable directories', () => {
+    const r = resolveIsolation({}, ctx({ harness: 'codex', additionalWriteDirs: ['/data/shared'] }));
+    expect(mount(r, '/data/shared')?.mode).toBe('rw');
+  });
+
   it('does not duplicate cwd when it equals the state dir (cwd fallback)', () => {
     const sd = '/home/fleet/.ours-fleet/agents/Dev';
     const r = resolveIsolation({}, ctx({ runCwd: sd }));

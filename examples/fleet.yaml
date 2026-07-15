@@ -17,6 +17,19 @@ defaults:
   # model: claude-fable-5       # default model for roles without their own (per-role model / --model wins)
   max_tokens: 500000          # session cap before auto-compact (harness-interpreted)
 
+  # To make Codex the fleet default instead:
+  # harness: codex
+  # model: gpt-5.4
+  # harness_options:
+  #   launcher: auto          # prefer ours-codex; fall back to codex
+  #   profile: fleet          # ~/.codex/fleet.config.toml (or $CODEX_HOME equivalent)
+  #   sandbox: workspace-write
+  #   approval: on-request
+  #   monitor: true             # explicit persistent consent for unattended wake
+  #   search: true
+  #   config:
+  #     model_reasoning_effort: high
+
 roles:
 
   FleetCoordinator:
@@ -56,3 +69,15 @@ roles:
       plugins:
         "some-plugin@some-marketplace": false
       # mem_palace: false           # example: fully disable a memory plugin for this role
+
+  # CodexReviewer:
+  #   harness: codex
+  #   coordinator: FleetCoordinator
+  #   cwd: ${work_root}/alice
+  #   model: gpt-5.4
+  #   mission: Review Alice's changes independently.
+  #   harness_options:
+  #     launcher: auto              # ours-codex when installed, otherwise codex
+  #     sandbox: read-only
+  #     approval: on-request
+  #     monitor: true

@@ -98,6 +98,17 @@ export function loadConfig(configPath?: string): FleetConfig {
         throw new ConfigError(
           `${file}: role '${name}' has unknown key(s) ${bad.join(', ')}; allowed: ${ROLE_KEYS.join(', ')}`);
       const isolation = r.isolation ?? (defaults.isolation as IsolationConfig | undefined);
+      const defaultHarnessOptions = defaults.harness_options;
+      if (defaultHarnessOptions !== undefined
+          && (typeof defaultHarnessOptions !== 'object' || defaultHarnessOptions === null
+              || Array.isArray(defaultHarnessOptions)))
+        throw new ConfigError(`${base}: defaults.harness_options must be a map`);
+      const harnessOptions = defaultHarnessOptions === undefined && r.harness_options === undefined
+        ? undefined
+        : {
+            ...((defaultHarnessOptions ?? {}) as Record<string, unknown>),
+            ...(r.harness_options ?? {}),
+          };
       if (isolation !== undefined) {
         const problems = validateIsolationConfig(isolation);
         if (problems.length)
@@ -111,6 +122,7 @@ export function loadConfig(configPath?: string): FleetConfig {
         identity: r.identity ?? name,
         model: r.model ?? (defaults.model as string | undefined),
         max_tokens: r.max_tokens ?? (defaults.max_tokens as number | undefined),
+        harness_options: harnessOptions,
         isolation,
       });
     }

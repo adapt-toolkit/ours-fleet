@@ -48,6 +48,10 @@ export interface WrapContext {
   stateDir: string;
   runCwd: string;
   home: string;
+  /** Harness selects the minimum credential/config mounts needed by that CLI. */
+  harness?: string;
+  /** Harness-declared writable roots (for example Codex --add-dir). */
+  additionalWriteDirs?: string[];
   brokerEndpoint?: string;
 }
 
