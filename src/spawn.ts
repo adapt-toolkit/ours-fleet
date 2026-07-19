@@ -5,6 +5,7 @@ import { stringify } from 'yaml';
 import { agentDir, fleetDDir } from './paths.js';
 import { loadConfig, resolveMonitorConfig, type ResolvedRole, type RoleConfig } from './config.js';
 import { applyRole, up, type OpsDeps } from './ops.js';
+import { START_STAGGER_FILE } from './runner.js';
 
 export interface SpawnOpts {
   name: string;
@@ -114,6 +115,11 @@ export async function spawnTemp(
   };
   const dir = applyRole(role, { temp: true });
   writeFileSync(join(dir, 'role.yaml'), stringify(role));
+  // Snapshot the fleet start-stagger so the detached temp supervisor (no config path
+  // threaded through it) honors the same launch gate — a burst of temp spawns spaces
+  // out; a lone temp spawn still waits zero (time-based gate).
+  if (cfg.startStaggerMs > 0)
+    writeFileSync(join(dir, START_STAGGER_FILE), String(cfg.startStaggerMs));
   // Run the supervisor DETACHED — NOT inside a tmux session named <name>.
   // `_run-temp` -> runOnce() creates AND kills the tmux session <name> for the
   // agent itself; a supervisor sharing that session name would SIGHUP its own

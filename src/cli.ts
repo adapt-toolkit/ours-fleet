@@ -24,7 +24,6 @@ const binPath = (() => { try { return realpathSync(process.argv[1]); } catch { r
 const deps = (): OpsDeps => ({
   backend: pickBackend(),
   binPath,
-  sleep: ms => new Promise(r => setTimeout(r, ms)),
   log: l => console.log(l),
 });
 

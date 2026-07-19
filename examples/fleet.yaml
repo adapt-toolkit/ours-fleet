@@ -12,6 +12,13 @@
 vars:
   work_root: /home/me/work
 
+# Space out agent LAUNCHES host-wide (ms) so a burst of boots doesn't hit the
+# harness/API rate limit at once. Default 0 (no stagger). Enforced at the launch
+# point, so it covers systemd host-boot too — not just `ours-fleet up`/restart.
+# A lone start/restart waits zero; only concurrent boots are spread out.
+# (Replaces the retired FLEET_START_STAGGER env var — see README "Start staggering".)
+# start_stagger_ms: 4000
+
 defaults:
   harness: claude-code        # adapter for roles that don't set their own
   # model: claude-fable-5       # default model for roles without their own (per-role model / --model wins)

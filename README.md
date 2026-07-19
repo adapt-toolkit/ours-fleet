@@ -180,6 +180,7 @@ the default `~/fleet.yaml` on its very first crash-restart and fail to resolve.
 
 ```yaml
 vars: { work_root: /home/me/work }      # ${var} substitution anywhere below
+start_stagger_ms: 0                     # delay between agent LAUNCHES (host-wide, ms); 0 = no stagger
 defaults:
   harness: claude-code                  # for roles that don't set one
   model: claude-fable-5                 # default model for roles that don't set one (per-role model / --model wins)
@@ -239,6 +240,24 @@ never deletes an identity. `defaults.harness_options` is shallow-merged with eac
 role's `harness_options`, so a fleet can set common Codex permission/profile defaults
 and override individual keys per role. `monitor` merges the same way — a role block
 overrides `defaults.monitor` key-by-key.
+
+### Start staggering
+
+`start_stagger_ms` (top-level, host-wide, default `0`) spaces out agent **launches**
+so a burst of boots doesn't hit the harness/API rate limit (429) all at once. When
+set, each launch is held until at least `start_stagger_ms` after the previous one
+across the whole host. It is enforced at the harness-launch point inside the runner,
+so — unlike a delay in the `up`/`restart` command loop — it also covers **systemd
+host boot**, where every agent's unit starts concurrently. The gate is time-based:
+a lone start or a solo crash-restart waits **zero**; only genuinely concurrent
+launches are spread out. Example: `start_stagger_ms: 4000` on a 7-agent fleet spaces
+their boots ~4 s apart instead of firing all seven at once.
+
+> **Migration (v0.9+):** this replaces the old `FLEET_START_STAGGER` environment
+> variable, which only staggered the `ours-fleet up`/`restart` command loop (not
+> host boot) and defaulted to 5 s. `FLEET_START_STAGGER` is **retired** — set
+> `start_stagger_ms` in `fleet.yaml` instead (note: milliseconds, and the default
+> is now `0`, so add it explicitly if you relied on the old implicit 5 s spacing).
 
 ### Mail monitor
 

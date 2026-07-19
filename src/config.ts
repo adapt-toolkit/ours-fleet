@@ -93,6 +93,8 @@ export interface FleetConfig {
   vars: Record<string, string>;
   defaults: Record<string, unknown>;
   files: string[];
+  /** Fleet-wide delay (ms) enforced between agent launches to avoid boot bursts (0 = none). */
+  startStaggerMs: number;
 }
 
 export class ConfigError extends Error {}
@@ -139,6 +141,7 @@ export function loadConfig(configPath?: string): FleetConfig {
   const baseDoc = docs.length && docs[0].file === base ? docs[0].doc : {};
   const vars = (baseDoc.vars ?? {}) as Record<string, string>;
   const defaults = (baseDoc.defaults ?? {}) as Record<string, unknown>;
+  const startStaggerMs = resolveStartStaggerMs(baseDoc.start_stagger_ms, base);
   const seen = new Map<string, string>();
   const roles: ResolvedRole[] = [];
   for (const { file, doc } of docs) {
@@ -185,7 +188,16 @@ export function loadConfig(configPath?: string): FleetConfig {
       });
     }
   }
-  return { roles, vars, defaults, files };
+  return { roles, vars, defaults, files, startStaggerMs };
+}
+
+/** Validate the top-level `start_stagger_ms` (supervisor launch spacing); default 0. */
+function resolveStartStaggerMs(raw: unknown, base: string): number {
+  if (raw === undefined || raw === null) return 0;
+  if (typeof raw !== 'number' || !Number.isFinite(raw) || raw < 0)
+    throw new ConfigError(
+      `${base}: start_stagger_ms must be a non-negative number of milliseconds (got ${JSON.stringify(raw)})`);
+  return raw;
 }
 
 /**

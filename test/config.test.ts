@@ -55,6 +55,26 @@ describe('loadConfig', () => {
     expect(b.identity).toBe('Bee');
   });
 
+  it('defaults start_stagger_ms to 0 (no stagger) when unset', () => {
+    base('roles:\n  A: {}\n');
+    expect(loadConfig().startStaggerMs).toBe(0);
+  });
+
+  it('reads a top-level start_stagger_ms', () => {
+    base('start_stagger_ms: 3000\nroles:\n  A: {}\n');
+    expect(loadConfig().startStaggerMs).toBe(3000);
+  });
+
+  it('rejects a negative start_stagger_ms', () => {
+    base('start_stagger_ms: -1\nroles:\n  A: {}\n');
+    expect(() => loadConfig()).toThrowError(/start_stagger_ms.*non-negative/);
+  });
+
+  it('rejects a non-numeric start_stagger_ms', () => {
+    base('start_stagger_ms: soon\nroles:\n  A: {}\n');
+    expect(() => loadConfig()).toThrowError(/start_stagger_ms.*non-negative/);
+  });
+
   it('merges defaults.harness_options with per-role overrides', () => {
     base('defaults:\n  harness: codex\n  harness_options:\n    launcher: auto\n    sandbox: workspace-write\nroles:\n  A: {}\n  B:\n    harness_options:\n      sandbox: read-only\n      search: true\n');
     const cfg = loadConfig();
