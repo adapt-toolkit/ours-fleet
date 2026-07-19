@@ -16,13 +16,11 @@ let dir: string;
 beforeEach(() => {
   dir = mkdtempSync(join(tmpdir(), 'ours-fleet-spawn-'));
   process.env.OURS_FLEET_HOME = dir;
-  process.env.FLEET_START_STAGGER = '0';
   registerAdapter(fakeAdapter);
   writeFileSync(join(dir, 'fleet.yaml'), stringify({ defaults: { harness: 'fake' }, roles: { Coord: {} } }));
 });
 afterEach(() => {
   delete process.env.OURS_FLEET_HOME;
-  delete process.env.FLEET_START_STAGGER;
   rmSync(dir, { recursive: true, force: true });
 });
 

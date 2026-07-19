@@ -18,7 +18,6 @@ beforeEach(() => {
 });
 afterEach(() => {
   delete process.env.OURS_FLEET_HOME;
-  delete process.env.FLEET_START_STAGGER;
   rmSync(dir, { recursive: true, force: true });
 });
 
@@ -38,14 +37,12 @@ function fakeBackend() {
   return { calls, backend };
 }
 function deps(backend: SupervisorBackend) {
-  const slept: number[] = [];
   const logs: string[] = [];
   const d: OpsDeps = {
     backend, binPath: '/bin/ours-fleet',
-    sleep: async ms => { slept.push(ms); },
     log: l => logs.push(l),
   };
-  return { d, slept, logs };
+  return { d, logs };
 }
 const writeCfg = (roles: Record<string, object>) =>
   writeFileSync(join(dir, 'fleet.yaml'), stringify({ roles }));
@@ -114,14 +111,12 @@ describe('applyRole', () => {
 });
 
 describe('up / down / restart', () => {
-  it('up staggers boots and installs every role', async () => {
-    process.env.FLEET_START_STAGGER = '3';
+  it('installs every role promptly (launch spacing is enforced by the start gate, not here)', async () => {
     writeCfg({ A: { harness: 'fake' }, B: { harness: 'fake' } });
     const { calls, backend } = fakeBackend();
-    const { d, slept } = deps(backend);
+    const { d } = deps(backend);
     await up(loadConfig(), [], d);
     expect(calls.filter(c => c[0] === 'install').map(c => c[1])).toEqual(['A', 'B']);
-    expect(slept).toEqual([3000]);   // once, between the two boots
   });
 
   it('down stops each named role', async () => {

@@ -11,11 +11,14 @@ import type { SupervisorBackend } from './supervisor/types.js';
 export interface OpsDeps {
   backend: SupervisorBackend;
   binPath: string;
-  sleep(ms: number): Promise<void>;
   log(line: string): void;
 }
 
-const STAGGER_MS = () => 1000 * Number(process.env.FLEET_START_STAGGER ?? 5);
+// Launch staggering now lives at the harness-launch point (the runner's start
+// gate, driven by `start_stagger_ms`), so it covers systemd host-boot too — not
+// just the `up`/`restart` command loop below. The old in-loop FLEET_START_STAGGER
+// sleep is retired; `up`/`restart` fire installs promptly and the gate spaces the
+// resulting launches.
 
 /** Materialize a role's state dir from config: briefing + markers. Returns the dir. */
 export function applyRole(
@@ -55,10 +58,7 @@ function selectRoles(cfg: FleetConfig, names: string[]): ResolvedRole[] {
 export async function up(
   cfg: FleetConfig, names: string[], deps: OpsDeps, configPath?: string,
 ): Promise<void> {
-  let first = true;
   for (const role of selectRoles(cfg, names)) {
-    if (!first) await deps.sleep(STAGGER_MS());
-    first = false;
     const dir = applyRole(role, { configPath });
     // If the role isn't running, boot fresh so it reads the briefing we just wrote.
     const status = await deps.backend.status(role.name).catch(() => '');
@@ -79,10 +79,7 @@ export async function down(cfg: FleetConfig, names: string[], deps: OpsDeps): Pr
 export async function restartRoles(
   cfg: FleetConfig, names: string[], deps: OpsDeps, mode: 'keep' | 'fresh', configPath?: string,
 ): Promise<void> {
-  let first = true;
   for (const role of selectRoles(cfg, names)) {
-    if (!first) await deps.sleep(STAGGER_MS());
-    first = false;
     applyRole(role, { fresh: mode === 'fresh', configPath });
     await deps.backend.restart(role.name);
     deps.log(mode === 'fresh'
