@@ -189,3 +189,72 @@ describe('loadConfig isolation', () => {
     expect(() => loadConfig()).toThrowError(/isolation\.resources.*memory.*allowed:.*mem/s);
   });
 });
+
+describe('loadConfig monitor', () => {
+  it('resolves code-constant defaults when no monitor block is present', () => {
+    base('roles:\n  A: {}\n');
+    const a = findRole(loadConfig(), 'A');
+    expect(a.monitor.enabled).toBe(true);
+    expect(a.monitor.wake_sources).toEqual([
+      'message_received', 'file_received', 'local_contact_request', 'pending_message',
+    ]);
+    expect(a.monitor.batch_ms).toBe(2000);
+    expect(a.monitor.inject).toBe('notification');
+  });
+
+  it('inherits defaults.monitor.enabled and lets a role override it', () => {
+    base('defaults:\n  monitor:\n    enabled: false\nroles:\n  A: {}\n  B:\n    monitor:\n      enabled: true\n');
+    const cfg = loadConfig();
+    expect(findRole(cfg, 'A').monitor.enabled).toBe(false);
+    expect(findRole(cfg, 'B').monitor.enabled).toBe(true);
+  });
+
+  it('merges role monitor over defaults.monitor key-by-key', () => {
+    base('defaults:\n  monitor:\n    batch_ms: 5000\nroles:\n  A:\n    monitor:\n      wake_sources: [message_received]\n');
+    const a = findRole(loadConfig(), 'A');
+    expect(a.monitor.batch_ms).toBe(5000);            // from defaults
+    expect(a.monitor.wake_sources).toEqual(['message_received']); // from role
+    expect(a.monitor.enabled).toBe(true);             // code default
+  });
+
+  it('accepts a role wake_sources subset', () => {
+    base('roles:\n  A:\n    monitor:\n      wake_sources: [message_received, file_received]\n');
+    expect(findRole(loadConfig(), 'A').monitor.wake_sources)
+      .toEqual(['message_received', 'file_received']);
+  });
+
+  it('accepts inject: full (validated; delivery lands in phase 2)', () => {
+    base('roles:\n  A:\n    monitor:\n      inject: full\n');
+    expect(findRole(loadConfig(), 'A').monitor.inject).toBe('full');
+  });
+
+  it('rejects unknown monitor keys with the allowed list', () => {
+    base('roles:\n  A:\n    monitor:\n      enabledd: true\n');
+    expect(() => loadConfig()).toThrowError(/monitor.*enabledd.*allowed:.*enabled/s);
+  });
+
+  it('rejects an unknown wake_source', () => {
+    base('roles:\n  A:\n    monitor:\n      wake_sources: [message_recieved]\n');
+    expect(() => loadConfig()).toThrowError(/wake_sources.*message_recieved.*allowed:.*message_received/s);
+  });
+
+  it('rejects an invalid inject mode', () => {
+    base('roles:\n  A:\n    monitor:\n      inject: firehose\n');
+    expect(() => loadConfig()).toThrowError(/monitor\.inject.*firehose.*notification.*full/s);
+  });
+
+  it('rejects a non-numeric / negative batch_ms', () => {
+    base('roles:\n  A:\n    monitor:\n      batch_ms: -5\n');
+    expect(() => loadConfig()).toThrowError(/monitor\.batch_ms/);
+  });
+
+  it('rejects a non-map monitor block', () => {
+    base('roles:\n  A:\n    monitor: nope\n');
+    expect(() => loadConfig()).toThrowError(/monitor.*mapping/);
+  });
+
+  it('rejects a non-map defaults.monitor', () => {
+    base('defaults:\n  monitor: nope\nroles:\n  A: {}\n');
+    expect(() => loadConfig()).toThrowError(/defaults\.monitor must be a map/);
+  });
+});
