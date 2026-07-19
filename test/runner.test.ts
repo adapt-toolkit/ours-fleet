@@ -3,9 +3,9 @@ import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync, rmSync
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { stringify } from 'yaml';
-import { runOnce, runTemp, buildPaneCommand } from '../src/runner.js';
+import { runOnce, runTemp, buildPaneCommand, reserveLaunchSlot } from '../src/runner.js';
 import { registerAdapter } from '../src/harness/registry.js';
-import { agentDir } from '../src/paths.js';
+import { agentDir, stateRoot } from '../src/paths.js';
 import { Tmux } from '../src/tmux.js';
 import { fakeAdapter } from './registry.test.js';
 import type { Exec } from '../src/exec.js';
@@ -265,6 +265,65 @@ describe('runOnce monitor integration', () => {
     const { deps, monitor } = fakeWorld({ exitCode: '0', exitFile: join(d, '.exit-status') });
     await runOnce('A', {}, deps);
     expect(monitor.constructed).toBe(0);
+  });
+});
+
+describe('reserveLaunchSlot (start gate)', () => {
+  const gateDeps = (clock: { t: number }) => ({
+    now: () => clock.t,
+    sleep: async (ms: number) => { clock.t += ms; },
+    log: () => {},
+  });
+
+  it('returns now for a lone start and records the timestamp', async () => {
+    const clock = { t: 1000 };
+    const t = await reserveLaunchSlot(dir, 5000, gateDeps(clock));
+    expect(t).toBe(1000);                                   // zero wait for a lone launch
+    expect(readFileSync(join(dir, '.last-launch'), 'utf8').trim()).toBe('1000');
+  });
+
+  it('spaces successive launches by staggerMs (concurrent boot burst)', async () => {
+    const clock = { t: 1000 };                              // clock held: all "arrive" together
+    const deps = gateDeps(clock);
+    const t1 = await reserveLaunchSlot(dir, 5000, deps);
+    const t2 = await reserveLaunchSlot(dir, 5000, deps);
+    const t3 = await reserveLaunchSlot(dir, 5000, deps);
+    expect([t1, t2, t3]).toEqual([1000, 6000, 11000]);      // spread out by 5000ms each
+  });
+
+  it('does not delay a lone start that follows a long idle gap', async () => {
+    writeFileSync(join(dir, '.last-launch'), '500');        // ancient prior launch
+    const clock = { t: 100000 };
+    const t = await reserveLaunchSlot(dir, 5000, gateDeps(clock));
+    expect(t).toBe(100000);                                 // max(now, 500+5000) = now
+  });
+
+  it('breaks a stale lock left by a crashed launcher instead of deadlocking', async () => {
+    mkdirSync(join(dir, '.launch-gate.lock'), { recursive: true });
+    writeFileSync(join(dir, '.launch-gate.lock', 'ts'), '0');  // lock stamped far in the past
+    const clock = { t: 100000 };                               // now ≫ staleMs ⇒ steal it
+    const t = await reserveLaunchSlot(dir, 1000, gateDeps(clock));
+    expect(t).toBe(100000);
+    expect(existsSync(join(dir, '.launch-gate.lock'))).toBe(false);  // released
+  });
+});
+
+describe('runOnce start-stagger', () => {
+  it('runs the launch through the gate when start_stagger_ms is set (lone = no real wait)', async () => {
+    writeFileSync(join(dir, 'fleet.yaml'), stringify({ start_stagger_ms: 5000, roles: { A: { harness: 'fake' } } }));
+    const d = agentDir('A'); mkdirSync(d, { recursive: true });
+    const { deps, paneCommands } = fakeWorld({ exitCode: '0', exitFile: join(d, '.exit-status') });
+    await runOnce('A', {}, deps);
+    expect(paneCommands).toHaveLength(1);                                  // launched
+    expect(existsSync(join(stateRoot(), '.last-launch'))).toBe(true);      // gate engaged
+  });
+
+  it('touches no launch gate when start_stagger_ms is unset (default behavior)', async () => {
+    writeCfg({ A: { harness: 'fake' } });
+    const d = agentDir('A'); mkdirSync(d, { recursive: true });
+    const { deps } = fakeWorld({ exitCode: '0', exitFile: join(d, '.exit-status') });
+    await runOnce('A', {}, deps);
+    expect(existsSync(join(stateRoot(), '.last-launch'))).toBe(false);
   });
 });
 

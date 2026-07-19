@@ -2,7 +2,7 @@ import { existsSync, readFileSync, writeFileSync, rmSync, mkdirSync } from 'node
 import { join } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { parse } from 'yaml';
-import { agentDir, home } from './paths.js';
+import { agentDir, home, stateRoot } from './paths.js';
 import { loadConfig, findRole, type ResolvedRole } from './config.js';
 import { getAdapter } from './harness/registry.js';
 import type { Launch } from './harness/types.js';
@@ -71,6 +71,66 @@ function monitorDeps(deps: RunnerDeps): MonitorDeps {
   };
 }
 
+/** Filename spawnTemp writes into a temp agent dir to carry the fleet start-stagger. */
+export const START_STAGGER_FILE = '.start-stagger-ms';
+
+/** Read the start-stagger a temp agent was spawned with (0 if none / unreadable). */
+function readStartStagger(dir: string): number {
+  try {
+    const n = parseInt(readFileSync(join(dir, START_STAGGER_FILE), 'utf8').trim(), 10);
+    return Number.isFinite(n) && n > 0 ? n : 0;
+  } catch { return 0; }
+}
+
+/**
+ * Reserve this process's launch slot on the host-wide start gate and return the
+ * wall-clock time it may launch at. A tiny atomic mutex (mkdir is atomic across
+ * processes) guards a single `.last-launch` timestamp: each launcher takes the
+ * next slot = max(now, last + staggerMs), so concurrent boots serialize and spread
+ * out by staggerMs while a lone/idle start returns `now` (zero wait). A crashed
+ * launcher's stale lock is broken so the gate can never deadlock the fleet.
+ */
+export async function reserveLaunchSlot(
+  root: string, staggerMs: number, deps: Pick<RunnerDeps, 'now' | 'sleep' | 'log'>,
+): Promise<number> {
+  mkdirSync(root, { recursive: true });
+  const lockDir = join(root, '.launch-gate.lock');
+  const lockTsFile = join(lockDir, 'ts');
+  const tsFile = join(root, '.last-launch');
+  const staleMs = Math.max(staggerMs * 4, 10_000);
+  const POLL_MS = 50;
+
+  const readTs = (p: string): number | null => {
+    try { const n = parseInt(readFileSync(p, 'utf8').trim(), 10); return Number.isFinite(n) ? n : null; }
+    catch { return null; }
+  };
+
+  for (let waited = 0; ;) {
+    try { mkdirSync(lockDir); writeFileSync(lockTsFile, String(deps.now())); break; }
+    catch (e) {
+      if ((e as NodeJS.ErrnoException).code !== 'EEXIST') throw e;
+      const lockTs = readTs(lockTsFile);
+      const stale = lockTs !== null && deps.now() - lockTs > staleMs;
+      if (stale || waited > staleMs * 2) {   // break a crashed launcher's lock; never deadlock
+        rmSync(lockDir, { recursive: true, force: true });
+        continue;
+      }
+      await deps.sleep(POLL_MS);
+      waited += POLL_MS;
+    }
+  }
+
+  try {
+    const now = deps.now();
+    const last = readTs(tsFile);
+    const target = last === null ? now : Math.max(now, last + staggerMs);
+    writeFileSync(tsFile, String(target));
+    return target;
+  } finally {
+    rmSync(lockDir, { recursive: true, force: true });
+  }
+}
+
 /** Read a temp role's config snapshot written by spawnTemp. */
 export function loadTempRole(name: string): ResolvedRole {
   const p = join(agentDir(name, true), 'role.yaml');
@@ -106,7 +166,19 @@ export async function runOnce(
   const temp = opts.temp === true;
   const dir = agentDir(name, temp);
   const configPath = temp ? opts.configPath : resolveConfigPath(dir, opts.configPath);
-  const role = temp ? loadTempRole(name) : findRole(loadConfig(configPath), name);
+  // Resolve the role and the fleet-wide start-stagger. Permanent roles read the
+  // live config; temp/detached agents read the value spawnTemp snapshotted into
+  // their dir (they have no config path threaded through the detached supervisor).
+  let role: ResolvedRole;
+  let staggerMs: number;
+  if (temp) {
+    role = loadTempRole(name);
+    staggerMs = readStartStagger(dir);
+  } else {
+    const cfg = loadConfig(configPath);
+    role = findRole(cfg, name);
+    staggerMs = cfg.startStaggerMs;
+  }
   const adapter = getAdapter(role.harness);
   mkdirSync(dir, { recursive: true });
 
@@ -150,6 +222,21 @@ export async function runOnce(
     const { argv: rprefix, warnings } = resourceArgs(policy.resources, deps.cpuDelegated());
     for (const w of warnings) deps.log(`[${name}] WARNING ${w}`);
     if (rprefix.length) paneArgv = [...rprefix, ...paneArgv];
+  }
+
+  // Start-stagger: space this launch at least start_stagger_ms after the previous
+  // agent launch across the whole host, so a burst of boots (systemd starts every
+  // user unit concurrently on boot; `ours-fleet up`/restart-all bulk-start) does not
+  // hit the harness/API rate limit at once. Time-based via a shared launch gate, so
+  // a lone start or a solo crash-restart waits zero. Applied right before the harness
+  // launch (tmux.newSession); the cheap monitor prime still runs immediately after.
+  if (staggerMs > 0) {
+    const slot = await reserveLaunchSlot(stateRoot(), staggerMs, deps);
+    const wait = slot - deps.now();
+    if (wait > 0) {
+      deps.log(`[${name}] start-stagger: holding ${wait}ms before launch`);
+      await deps.sleep(wait);
+    }
   }
 
   // Supervisor mail monitor (design §1): prime the notification cursor at the
