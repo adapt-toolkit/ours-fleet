@@ -42,7 +42,12 @@ export function generateBriefing(role: ResolvedRole, v: BriefingVocab, opts: Bri
     : '   with a 1–2 sentence summary of your Charter above. Skip if it already matches.');
   L.push(`5. SET your **persona** (local operating contract, never shared in invites) via`);
   L.push(`   **${v.setPersonaTool}** with the **Charter** section above, verbatim. Skip if it matches.`);
-  L.push(`6. ${v.monitorInstruction(id, role)}`);
+  // When the supervisor owns the monitor (monitor.enabled), the agent must NOT arm
+  // its own in-session watch — wakes are injected as [fleet-monitor] lines (design §5).
+  const wakeNote = role.monitor?.enabled
+    ? v.supervisedWakeNote(id, role)
+    : v.monitorInstruction(id, role);
+  L.push(`6. ${wakeNote}`);
   if (role.coordinator) {
     L.push(`7. ANNOUNCE yourself: call **${v.sendTool}** to contact "${role.coordinator}" with text:`);
     L.push(`   "${role.name} online — identity '${id}' bound, ready."`);
@@ -77,7 +82,7 @@ export function generateBriefing(role: ResolvedRole, v: BriefingVocab, opts: Bri
   L.push('change between wakes without a restart; treat the file, not your memory of it, as current.');
   L.push('', '## On restart (you run under a supervised launcher)');
   L.push(`On restart, WITHOUT asking: re-bind (**${v.bindTool}** name "${id}" force=true), then`);
-  L.push(`${v.monitorInstruction(id, role)} Then continue from your WORKLOG.`);
+  L.push(`${wakeNote} Then continue from your WORKLOG.`);
   L.push('Do not blindly re-run whatever may have crashed you.');
   L.push('', '## House rules');
   L.push('- Never broad `rm -rf` on home/critical paths; quote globs; use explicit paths.');

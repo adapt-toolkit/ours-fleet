@@ -80,6 +80,21 @@ describe('generateBriefing', () => {
     expect(b.indexOf('## Routines')).toBeGreaterThan(b.indexOf('## Durable log'));
   });
 
+  it('tells a supervised (monitor.enabled) role NOT to arm its own watch', () => {
+    const enabled = { ...base, monitor: { enabled: true, wake_sources: [], batch_ms: 2000, inject: 'notification' as const } };
+    const b = generateBriefing(enabled as ResolvedRole, vocab, opts);
+    expect(b).toContain('[fleet-monitor]');
+    expect(b).toContain('do NOT arm');
+    expect(b).not.toContain('ours-mcp watch');   // legacy watch dropped from both step 6 and restart
+  });
+
+  it('keeps the legacy watch instruction for a monitor.enabled=false role', () => {
+    const disabled = { ...base, monitor: { enabled: false, wake_sources: [], batch_ms: 2000, inject: 'notification' as const } };
+    const b = generateBriefing(disabled as ResolvedRole, vocab, opts);
+    expect(b).toContain('ours-mcp watch "Alice Dev"');
+    expect(b).not.toContain('[fleet-monitor]');
+  });
+
   it('renders the Routines section even with a curated briefingBody', () => {
     const b = generateBriefing(base, vocab, { ...opts, briefingBody: 'CUSTOM CURATED TEXT' });
     expect(b).toContain('CUSTOM CURATED TEXT');

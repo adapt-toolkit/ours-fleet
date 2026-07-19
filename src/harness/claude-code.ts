@@ -127,11 +127,17 @@ export function makeClaudeCodeAdapter(exec: Exec = realExec): HarnessAdapter {
       watchCommand: id => `ours-mcp watch "${id}"`,
       monitorInstruction: id =>
         `Arm a **persistent Monitor** running the shell command \`ours-mcp watch "${id}"\` so inbound ours mail wakes you.`,
+      supervisedWakeNote: () =>
+        'Your mail wake-ups are delivered by the fleet supervisor directly into this console as ' +
+        '`[fleet-monitor]` lines — do NOT arm an in-session Monitor. When such a line appears, run ' +
+        '**get_messages** to drain the mail.',
       launchNote: name => `You were launched with \`--remote-control ${name}\`. Confirm you are running.`,
-      restartPrompt: (id, worklog) =>
+      restartPrompt: (id, worklog, role) =>
         `Session restarted. Re-bind your ours identity now (choose_identity name "${id}" force=true), ` +
-        `re-arm your monitor (ours-mcp watch "${id}"), then continue from ${worklog}. ` +
-        'Do not re-run whatever crashed you.',
+        (role?.monitor?.enabled
+          ? 'then continue from '
+          : `re-arm your monitor (ours-mcp watch "${id}"), then continue from `) +
+        `${worklog}. Do not re-run whatever crashed you.`,
     },
 
     exitPolicy: { cleanExitIsFresh: true, fastFailSecs: 20 },

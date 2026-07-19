@@ -215,8 +215,16 @@ export function makeCodexAdapter(exec: Exec = realExec): HarnessAdapter {
           `fallback. After each arrival, call **get_messages**, handle the mail, and re-enter ` +
           `**foreground_monitor** while the approved monitoring session remains armed.`;
       },
+      supervisedWakeNote: () =>
+        'Your mail wake-ups are delivered by the fleet supervisor directly into this console as ' +
+        '`[fleet-monitor]` lines — do NOT arm arm_monitor or foreground_monitor. When such a line ' +
+        'appears, call **get_messages**, handle the mail, and reply with send_message.',
       launchNote: name => `You were launched as the fleet role \`${name}\` under a Codex session. Confirm you are running.`,
       restartPrompt: (id, worklog, configuredRole) => {
+        if (configuredRole?.monitor?.enabled)
+          return `Session restarted. Re-bind your ours identity now (choose_identity name "${id}" force=true); ` +
+            'your mail wakes are delivered by the fleet supervisor as `[fleet-monitor]` console lines, so do ' +
+            `NOT arm arm_monitor/foreground_monitor. Continue from ${worklog}. Do not re-run whatever crashed you.`;
         const consented = (configuredRole?.harness_options as CodexOptions | undefined)?.monitor === true;
         return `Session restarted. Re-bind your ours identity now (choose_identity name "${id}" force=true), ` +
           (consented

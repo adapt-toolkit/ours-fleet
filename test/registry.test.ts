@@ -17,8 +17,11 @@ export const fakeAdapter: HarnessAdapter = {
     sendTool: 'send_message', getMessagesTool: 'get_messages',
     watchCommand: id => `ours-mcp watch "${id}"`,
     monitorInstruction: id => `Arm a persistent Monitor running \`ours-mcp watch "${id}"\`.`,
+    supervisedWakeNote: () => 'Wakes arrive as [fleet-monitor] lines — do NOT arm a Monitor. Run get_messages.',
     launchNote: name => `You are session ${name}.`,
-    restartPrompt: (id, wl) => `Restarted. Re-bind "${id}", continue from ${wl}.`,
+    restartPrompt: (id, wl, role) => role?.monitor?.enabled
+      ? `Restarted. Re-bind "${id}"; wakes via [fleet-monitor] lines. Continue from ${wl}.`
+      : `Restarted. Re-bind "${id}", continue from ${wl}.`,
   },
   exitPolicy: { cleanExitIsFresh: true, fastFailSecs: 20 },
 };
