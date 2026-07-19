@@ -16,6 +16,9 @@ defaults:
   harness: claude-code        # adapter for roles that don't set their own
   # model: claude-fable-5       # default model for roles without their own (per-role model / --model wins)
   max_tokens: 500000          # session cap before auto-compact (harness-interpreted)
+  monitor:                    # supervisor-owned mail wake (fleet-wide default)
+    enabled: true             # true (default): supervisor injects [fleet-monitor] console lines;
+    #                         #   false: legacy — the agent arms its own `ours-mcp watch`
 
   # To make Codex the fleet default instead:
   # harness: codex
@@ -54,6 +57,12 @@ roles:
       ship sound tests, and escalate cross-repo questions to the coordinator.
     env:
       EXAMPLE_FLAG: "1"             # extra env passed into the session
+    monitor:                        # override the fleet default per role (merges key-by-key)
+      wake_sources:                 # default: message_received, file_received,
+        - message_received          #          local_contact_request, pending_message
+        - file_received
+      batch_ms: 2000                # coalesce a burst into one console line (default 2000)
+      # enabled: false              # opt this role out: it arms its own `ours-mcp watch`
     isolation:                      # OS-level sandbox (additive — omit for today's behavior)
       network: broker               # broker (default): ours messaging works, general egress denied
       resources:                    # per-agent cgroup caps at the pane
