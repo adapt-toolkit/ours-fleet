@@ -6,6 +6,7 @@ import { getAdapter } from './harness/registry.js';
 import { agentDir, home, deriveXdgRuntimeDir } from './paths.js';
 import { resolveIsolation } from './isolation/policy.js';
 import { makeBubblewrapBackend } from './isolation/bubblewrap.js';
+import { type FetchLike } from './monitor.js';
 import type { PrereqCheck, PrereqReport } from './harness/types.js';
 
 /** Which cgroup-v2 controllers are delegated to this user manager (advisory). */
@@ -24,6 +25,7 @@ export async function doctor(
   opts: { harness?: string; configPath?: string } = {},
   exec: Exec = realExec,
   platform: NodeJS.Platform = process.platform,
+  fetchImpl: FetchLike = (u, i) => globalThis.fetch(u, i) as unknown as ReturnType<FetchLike>,
 ): Promise<PrereqReport> {
   const checks: PrereqCheck[] = [];
 
@@ -110,6 +112,34 @@ export async function doctor(
     } else if (wantsBwrap) detail = `degraded->un-isolated (warn): bubblewrap unavailable; caps=${caps} still apply`;
     else detail = `backend=${policy.backend} (not yet implemented)`;
     checks.push({ name: `isolation: ${r.name}`, ok, detail });
+  }
+
+  // Monitor daemon-API reachability (design §5): only when a role is supervised.
+  // /state-dir is unauthenticated (liveness); /identities exercises the token so a
+  // shared-mode misconfig (401) surfaces here rather than as a silent deaf monitor.
+  if (roles.some(r => r.monitor?.enabled)) {
+    const port = Number(process.env.OURS_PORT) || 3050;
+    const token = process.env.OURS_API_TOKEN;
+    const headers: Record<string, string> = token ? { 'x-ours-api-token': token } : {};
+    let ok = false, detail: string;
+    try {
+      const live = await fetchImpl(`http://127.0.0.1:${port}/state-dir`, {});
+      if (!live.ok) {
+        detail = `daemon on :${port} answered /state-dir with HTTP ${live.status} — not the ours daemon?`;
+      } else {
+        const auth = await fetchImpl(`http://127.0.0.1:${port}/identities`, { headers });
+        if (auth.status === 401)
+          detail = `reachable on :${port} but the API token was rejected (401) — set OURS_API_TOKEN to the ` +
+            `daemon's token (shared mode) or run the fleet as the daemon owner`;
+        else if (!auth.ok)
+          detail = `reachable on :${port} but /identities returned HTTP ${auth.status}`;
+        else { ok = true; detail = `reachable on :${port}, authorized — supervisor wake stream available`; }
+      }
+    } catch (e) {
+      detail = `unreachable on :${port} — monitored roles run degraded until it is up ` +
+        `(start it: ours-mcp start) [${(e as Error)?.message ?? e}]`;
+    }
+    checks.push({ name: 'monitor: daemon API', ok, detail });
   }
 
   const harnesses = opts.harness

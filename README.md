@@ -51,9 +51,11 @@ roles:
 
 Each role gets a state dir (`~/.ours-fleet/agents/<Name>/`) holding its briefing,
 logs, routines, and session markers. On boot the agent reads its briefing: bind
-identity, publish bio/persona, arm a mail monitor (`ours-mcp watch`), announce to
-its coordinator, work. On crash the supervisor relaunches it and the harness
-resumes the same session.
+identity, publish bio/persona, announce to its coordinator, work — while the
+supervisor delivers its mail wakes as `[fleet-monitor]` console lines (see
+[Mail monitor](#mail-monitor); `monitor.enabled: false` reverts to the agent
+arming its own `ours-mcp watch`). On crash the supervisor relaunches it and the
+harness resumes the same session.
 
 The state dir contract:
 
@@ -182,12 +184,22 @@ defaults:
   harness: claude-code                  # for roles that don't set one
   model: claude-fable-5                 # default model for roles that don't set one (per-role model / --model wins)
   max_tokens: 500000                    # session cap (harness-interpreted)
+  monitor:                              # supervisor-owned mail wake (fleet-wide default)
+    enabled: true                       # default true; a role block overrides key-by-key
 roles:
   Name:                                 # [A-Za-z0-9_-]+
     harness: claude-code
     identity: "Display Name"            # ours identity to bind (default: Name)
     cwd: ${work_root}/repo              # where the harness process runs
     coordinator: FleetCoordinator       # announce target on boot
+    monitor:                            # deterministic wake, owned by the supervisor
+      enabled: true                     # default (defaults.monitor.enabled ?? true);
+      #                                 #   false = legacy in-session `ours-mcp watch`
+      wake_sources:                     # which daemon events wake the console (default:
+        - message_received              #   message_received, file_received,
+        - file_received                 #   local_contact_request, pending_message)
+      batch_ms: 2000                    # coalesce a burst into one line (default 2000)
+      inject: notification              # notification (default) | full (bodies inline; roadmap)
     model: claude-fable-5               # launch on a specific model (pass-through id; default: launcher default)
     mission: one line
     persona: |                          # operating contract (published as persona)
@@ -225,7 +237,23 @@ Merge order: `fleet.yaml` ← `fleet.d/*.yaml`; a duplicate role name is a hard
 error naming both files. Identities and roles are decoupled — removing a role
 never deletes an identity. `defaults.harness_options` is shallow-merged with each
 role's `harness_options`, so a fleet can set common Codex permission/profile defaults
-and override individual keys per role.
+and override individual keys per role. `monitor` merges the same way — a role block
+overrides `defaults.monitor` key-by-key.
+
+### Mail monitor
+
+With `monitor.enabled` (the default), the **supervisor** delivers a role's mail
+wakes: the per-role runner long-polls the ours daemon's notification API and
+injects a single `[fleet-monitor] N new messages from … — run get_messages` line
+straight into the console. It is a deterministic program whose lifetime is fused to
+the tmux session — it primes the notification cursor *before* the session launches
+(no missed arrivals), cannot be orphaned or left deaf-but-armed, and writes its
+health to `<agentDir>/.monitor-status` (`armed | degraded | failed`), surfaced in
+`ours-fleet status`/`doctor`. The agent's briefing tells it **not** to arm an
+in-session Monitor. Set `monitor.enabled: false` to keep the legacy behavior where
+the agent arms its own `ours-mcp watch`. `inject: full` (pushing message bodies
+inline) is on the roadmap and needs two new ours-mcp daemon endpoints; today all
+roles deliver `notification` lines and drain via `get_messages`.
 
 ## Codex roles
 

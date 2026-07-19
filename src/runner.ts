@@ -7,6 +7,7 @@ import { loadConfig, findRole, type ResolvedRole } from './config.js';
 import { getAdapter } from './harness/registry.js';
 import type { Launch } from './harness/types.js';
 import { Tmux } from './tmux.js';
+import { createMonitor, type MonitorDeps, type MonitorHandle, type MonitorOpts, type FetchLike } from './monitor.js';
 import { realExec, shq, type Exec } from './exec.js';
 import { resolveIsolation } from './isolation/policy.js';
 import { selectIsolationBackend } from './isolation/registry.js';
@@ -21,6 +22,10 @@ export interface RunnerDeps {
   sleep(ms: number): Promise<void>;
   now(): number;
   log(line: string): void;
+  /** HTTP transport for the monitor's daemon long-poll (injectable for tests). */
+  fetch: FetchLike;
+  /** Construct the supervisor mail monitor (injectable so tests stub it out). */
+  createMonitor(opts: MonitorOpts): MonitorHandle;
 }
 
 const defaultDeps = (): RunnerDeps => ({
@@ -31,6 +36,8 @@ const defaultDeps = (): RunnerDeps => ({
   sleep: ms => new Promise(r => setTimeout(r, ms)),
   now: () => Date.now(),
   log: line => process.stderr.write(line + '\n'),
+  fetch: (url, init) => globalThis.fetch(url, init) as unknown as ReturnType<FetchLike>,
+  createMonitor: opts => createMonitor(opts),
 });
 
 /**
@@ -48,6 +55,20 @@ export function buildPaneCommand(
   const envPfx = 'env ' + Object.entries(env).map(([k, v]) => `${k}=${shq(v)}`).join(' ');
   const cmd = paneArgv.map(shq).join(' ');
   return `${envPfx} ${cmd}; echo $? > ${shq(exitStatusPath)}`;
+}
+
+/** Adapt the runner's injected deps into the monitor's dependency surface. */
+function monitorDeps(deps: RunnerDeps): MonitorDeps {
+  return {
+    fetch: deps.fetch,
+    tmux: deps.tmux,
+    isAlive: deps.isAlive,
+    sleep: deps.sleep,
+    now: deps.now,
+    log: deps.log,
+    env: process.env,
+    timers: { set: (fn, ms) => setTimeout(fn, ms), clear: t => clearTimeout(t) },
+  };
 }
 
 /** Read a temp role's config snapshot written by spawnTemp. */
@@ -131,6 +152,17 @@ export async function runOnce(
     if (rprefix.length) paneArgv = [...rprefix, ...paneArgv];
   }
 
+  // Supervisor mail monitor (design §1): prime the notification cursor at the
+  // stream tip BEFORE the session launches so no arrival is missed during boot
+  // (backlog before the tip is the SessionStart hook's job). Disabled roles keep
+  // the legacy in-session watch. Temp snapshots predating `monitor:` are treated
+  // as disabled (monitor may be undefined on an old role.yaml).
+  const monitor = role.monitor?.enabled ? deps.createMonitor({
+    name, agentDir: dir, cfg: role.monitor,
+    deps: monitorDeps(deps),
+  }) : null;
+  if (monitor) await monitor.prime();
+
   rmSync(exitFile, { force: true });
   await deps.tmux.kill(name);
   await deps.tmux.newSession(name, runCwd, buildPaneCommand(launch, role.env, exitFile, paneArgv));
@@ -143,8 +175,13 @@ export async function runOnce(
   if (pid === null) throw new Error(`[${name}] could not resolve tmux pane pid`);
   deps.log(`[${name}] up; pid=${pid} cwd=${runCwd} harness=${role.harness} mode=${mode}`);
 
+  // The monitor loop lives exactly as long as the session: it starts once the
+  // pane pid is known and is stopped when that pid dies (task dies with runner).
+  const monitorLoop = monitor?.run(pid);
+
   const start = deps.now();
   while (deps.isAlive(pid)) await deps.sleep(2000);
+  if (monitor) { monitor.stop(); await monitorLoop; }
   const elapsed = (deps.now() - start) / 1000;
   const code = existsSync(exitFile) ? readFileSync(exitFile, 'utf8').trim() : 'crash';
 

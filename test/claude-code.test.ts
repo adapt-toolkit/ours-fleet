@@ -34,6 +34,30 @@ describe('autocompactPct', () => {
   it('defaults to 50', () => expect(autocompactPct(role())).toBe(50));
 });
 
+describe('vocabulary — supervised monitor migration', () => {
+  const v = makeClaudeCodeAdapter(okExec).vocabulary;
+  const mon = (enabled: boolean) => ({ enabled, wake_sources: [], batch_ms: 2000, inject: 'notification' as const });
+
+  it('supervisedWakeNote steers the agent off its own Monitor', () => {
+    const note = v.supervisedWakeNote('Alice Dev');
+    expect(note).toContain('[fleet-monitor]');
+    expect(note).toContain('do NOT arm');
+    expect(note).toContain('get_messages');
+  });
+
+  it('restartPrompt drops the re-arm line when the monitor is supervised', () => {
+    const p = v.restartPrompt('Alice Dev', '/w/WORKLOG.md', role({ monitor: mon(true) }));
+    expect(p).not.toContain('re-arm');
+    expect(p).not.toContain('ours-mcp watch');
+    expect(p).toContain('choose_identity name "Alice Dev"');
+  });
+
+  it('restartPrompt keeps the re-arm line for a legacy (disabled) role', () => {
+    const p = v.restartPrompt('Alice Dev', '/w/WORKLOG.md', role({ monitor: mon(false) }));
+    expect(p).toContain('ours-mcp watch "Alice Dev"');
+  });
+});
+
 describe('pretrust', () => {
   it('merges trust flags without clobbering other projects', () => {
     const cj = join(dir, '.claude.json');

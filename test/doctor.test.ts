@@ -6,6 +6,16 @@ import { doctor } from '../src/doctor.js';
 import { registerAdapter } from '../src/harness/registry.js';
 import { fakeAdapter } from './registry.test.js';
 import type { Exec, ExecResult } from '../src/exec.js';
+import type { FetchLike } from '../src/monitor.js';
+
+// A stub daemon-API for the monitor reachability probe (design §5).
+const stubFetch = (state: 'ok' | '401' | 'down' | 'notdaemon' = 'ok'): FetchLike => async (url) => {
+  if (state === 'down') throw new Error('ECONNREFUSED');
+  if (url.includes('/state-dir'))
+    return { status: state === 'notdaemon' ? 404 : 200, ok: state !== 'notdaemon', json: async () => ({ stateDir: '/s' }) };
+  if (state === '401') return { status: 401, ok: false, json: async () => ({}) };
+  return { status: 200, ok: true, json: async () => ({ identities: [] }) };
+};
 
 let dir: string;
 beforeEach(() => {
@@ -102,7 +112,7 @@ describe('doctor isolation reporting', () => {
     registerAdapter(fakeAdapter);
     writeFileSync(join(dir, 'fleet.yaml'),
       'roles:\n  Sec:\n    harness: fake\n    isolation:\n      network: deny\n      resources:\n        mem: 2G\n        cpu: "1"\n');
-    const rep = await doctor({}, green(), 'linux');
+    const rep = await doctor({}, green(), 'linux', stubFetch('ok'));
     const r = rep.checks.find(c => c.name === 'isolation: Sec')!;
     expect(r).toBeTruthy();
     expect(r.ok).toBe(true);
@@ -115,11 +125,61 @@ describe('doctor isolation reporting', () => {
     registerAdapter(fakeAdapter);
     writeFileSync(join(dir, 'fleet.yaml'),
       'roles:\n  Sec:\n    harness: fake\n    isolation:\n      on_unavailable: strict\n');
-    const rep = await doctor({}, green({ 'bwrap --version': { stdout: '', stderr: '', code: 127 } }), 'linux');
+    const rep = await doctor({}, green({ 'bwrap --version': { stdout: '', stderr: '', code: 127 } }), 'linux', stubFetch('ok'));
     const r = rep.checks.find(c => c.name === 'isolation: Sec')!;
     expect(r.ok).toBe(false);
     expect(r.detail).toMatch(/strict|refuse/i);
     expect(rep.ok).toBe(false);
+  });
+});
+
+describe('doctor monitor probe (§5)', () => {
+  const green = (over: Record<string, ExecResult> = {}): Exec => execWith({
+    'tmux -V': { stdout: 'tmux 3.6', stderr: '', code: 0 },
+    'ours-mcp --version': { stdout: '0.1.2', stderr: '', code: 0 },
+    'ours-mcp status': { stdout: 'running', stderr: '', code: 0 },
+    'loginctl show-user': { stdout: 'Linger=yes', stderr: '', code: 0 },
+    ...over,
+  });
+  const withRole = (monitorYaml: string) => {
+    registerAdapter(fakeAdapter);
+    writeFileSync(join(dir, 'fleet.yaml'), `roles:\n  A:\n    harness: fake\n${monitorYaml}`);
+  };
+
+  it('reports the daemon API reachable + authorized for a supervised role', async () => {
+    withRole('');   // monitor.enabled defaults true
+    const rep = await doctor({}, green(), 'linux', stubFetch('ok'));
+    const m = rep.checks.find(c => c.name === 'monitor: daemon API')!;
+    expect(m).toBeTruthy();
+    expect(m.ok).toBe(true);
+    expect(m.detail).toMatch(/authorized/);
+  });
+
+  it('flags a 401 from the daemon API with a token hint', async () => {
+    withRole('');
+    const rep = await doctor({}, green(), 'linux', stubFetch('401'));
+    const m = rep.checks.find(c => c.name === 'monitor: daemon API')!;
+    expect(m.ok).toBe(false);
+    expect(m.detail).toMatch(/401/);
+    expect(m.detail).toMatch(/OURS_API_TOKEN/);
+    expect(rep.ok).toBe(false);
+  });
+
+  it('flags an unreachable daemon with a start hint', async () => {
+    withRole('');
+    const rep = await doctor({}, green(), 'linux', stubFetch('down'));
+    const m = rep.checks.find(c => c.name === 'monitor: daemon API')!;
+    expect(m.ok).toBe(false);
+    expect(m.detail).toMatch(/ours-mcp start/);
+  });
+
+  it('skips the probe entirely when no role is supervised', async () => {
+    let called = false;
+    withRole('    monitor:\n      enabled: false\n');
+    const spy: FetchLike = async (...a) => { called = true; return stubFetch('ok')(...a); };
+    const rep = await doctor({}, green(), 'linux', spy);
+    expect(rep.checks.find(c => c.name === 'monitor: daemon API')).toBeUndefined();
+    expect(called).toBe(false);
   });
 });
 
