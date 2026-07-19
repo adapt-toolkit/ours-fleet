@@ -153,6 +153,13 @@ export interface MonitorOpts {
   deps: MonitorDeps;
 }
 
+/** The lifecycle surface the runner drives: prime pre-launch, run, stop on pid death. */
+export interface MonitorHandle {
+  prime(): Promise<void>;
+  run(pid: number): Promise<void>;
+  stop(): void;
+}
+
 export class Monitor {
   private readonly name: string;
   private readonly cfg: MonitorConfig;
