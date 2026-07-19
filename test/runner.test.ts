@@ -21,18 +21,35 @@ afterEach(() => {
   rmSync(dir, { recursive: true, force: true });
 });
 
+/** Records the monitor lifecycle the runner drives, and proves prime happens
+ *  before the tmux session is created. */
+function monitorRecorder(sessionCreated: () => boolean) {
+  const rec = { constructed: 0, primedBeforeSession: null as boolean | null, ranPid: null as number | null, stopped: false };
+  const createMonitor = () => {
+    rec.constructed++;
+    return {
+      prime: async () => { rec.primedBeforeSession = !sessionCreated(); },
+      run: async (pid: number) => { rec.ranPid = pid; },
+      stop: () => { rec.stopped = true; },
+    };
+  };
+  return { rec, createMonitor };
+}
+
 /** Fake tmux whose pane "process" dies after `lifeChecks` liveness polls,
  *  writing `.exit-status` (like the pane shell would) at the moment of death. */
 function fakeWorld(opts: { exitCode?: string; lifeChecks?: number; exitDelayMs?: number; exitFile?: string; bwrap?: 'ok' | 'missing'; cpuDelegated?: boolean } = {}) {
   const paneCommands: string[] = [];
   let clock = 0;
   let checks = 0;
+  let sessionCreated = false;
   const exec: Exec = async (cmd, args) => {
     if (cmd === 'bwrap') return { stdout: 'bubblewrap 0.11.1\n', stderr: '', code: opts.bwrap === 'missing' ? 127 : 0 };
-    if (args[0] === 'new-session') paneCommands.push(args[args.length - 1]);
+    if (args[0] === 'new-session') { paneCommands.push(args[args.length - 1]); sessionCreated = true; }
     if (args[0] === 'list-panes') return { stdout: '4242\n', stderr: '', code: 0 };
     return { stdout: '', stderr: '', code: 0 };
   };
+  const { rec, createMonitor } = monitorRecorder(() => sessionCreated);
   const deps = {
     tmux: new Tmux(exec),
     exec,
@@ -48,8 +65,10 @@ function fakeWorld(opts: { exitCode?: string; lifeChecks?: number; exitDelayMs?:
     sleep: async (ms: number) => { clock += opts.exitDelayMs ?? ms; },
     now: () => clock,
     log: () => {},
+    fetch: async () => ({ status: 200, ok: true, json: async () => ({ cursor: 0, events: [] }) }),
+    createMonitor,
   };
-  return { deps, paneCommands };
+  return { deps, paneCommands, monitor: rec };
 }
 
 const writeCfg = (roles: Record<string, object>) =>
@@ -225,6 +244,27 @@ describe('runOnce', () => {
     await runOnce('A', {}, deps);
     expect(readFileSync(join(d, '.session-id'), 'utf8').trim()).toBe('KEEP');
     expect(existsSync(join(d, '.booted'))).toBe(true);
+  });
+});
+
+describe('runOnce monitor integration', () => {
+  it('primes the monitor before creating the session and stops it after pid death', async () => {
+    writeCfg({ A: { harness: 'fake' } });   // monitor.enabled defaults to true
+    const d = agentDir('A'); mkdirSync(d, { recursive: true });
+    const { deps, monitor } = fakeWorld({ exitCode: '0', exitFile: join(d, '.exit-status') });
+    await runOnce('A', {}, deps);
+    expect(monitor.constructed).toBe(1);
+    expect(monitor.primedBeforeSession).toBe(true);   // cursor primed before tmux.newSession
+    expect(monitor.ranPid).toBe(4242);
+    expect(monitor.stopped).toBe(true);               // stopped when the pane pid died
+  });
+
+  it('does not construct a monitor when monitor.enabled is false (legacy watch)', async () => {
+    writeCfg({ A: { harness: 'fake', monitor: { enabled: false } } });
+    const d = agentDir('A'); mkdirSync(d, { recursive: true });
+    const { deps, monitor } = fakeWorld({ exitCode: '0', exitFile: join(d, '.exit-status') });
+    await runOnce('A', {}, deps);
+    expect(monitor.constructed).toBe(0);
   });
 });
 

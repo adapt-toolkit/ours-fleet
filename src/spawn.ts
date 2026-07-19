@@ -3,7 +3,7 @@ import { existsSync, mkdirSync, openSync, readFileSync, writeFileSync } from 'no
 import { join } from 'node:path';
 import { stringify } from 'yaml';
 import { agentDir, fleetDDir } from './paths.js';
-import { loadConfig, type ResolvedRole, type RoleConfig } from './config.js';
+import { loadConfig, resolveMonitorConfig, type ResolvedRole, type RoleConfig } from './config.js';
 import { applyRole, up, type OpsDeps } from './ops.js';
 
 export interface SpawnOpts {
@@ -108,6 +108,8 @@ export async function spawnTemp(
     identity: o.identity ?? o.name,
     model: o.model?.trim() || (cfg.defaults.model as string | undefined),
     harness_options: Object.keys(mergedHarnessOptions).length ? mergedHarnessOptions : undefined,
+    // Temp agents inherit the fleet-wide monitor defaults via the snapshot (design §2).
+    monitor: resolveMonitorConfig(cfg.defaults.monitor, fromOpts.monitor),
     sourceFile: '(temp)',
   };
   const dir = applyRole(role, { temp: true });

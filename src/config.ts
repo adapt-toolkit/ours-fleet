@@ -170,7 +170,7 @@ export function loadConfig(configPath?: string): FleetConfig {
         if (problems.length)
           throw new ConfigError(`${file}: role '${name}' ${problems.join('; ')}`);
       }
-      const monitor = resolveMonitor(defaults.monitor, r.monitor, base, file, name);
+      const monitor = resolveMonitorConfig(defaults.monitor, r.monitor, { base, file, name });
       roles.push({
         ...r,
         name,
@@ -193,21 +193,23 @@ export function loadConfig(configPath?: string): FleetConfig {
  * result, and fill code-constant defaults (design §2). `defaults.monitor.enabled`
  * is the fleet-wide default; absent everywhere ⇒ enabled. Throws ConfigError on a
  * malformed block so a typo fails loudly rather than silently disarming a monitor.
+ * Exported so temp-spawn (which builds a ResolvedRole by hand) resolves identically.
  */
-function resolveMonitor(
-  defMonitor: unknown, roleMonitor: Partial<MonitorConfig> | undefined,
-  base: string, file: string, name: string,
+export function resolveMonitorConfig(
+  defMonitor: unknown, roleMonitor?: Partial<MonitorConfig>,
+  labels: { base?: string; file?: string; name?: string } = {},
 ): MonitorConfig {
+  const where = labels.file && labels.name ? `${labels.file}: role '${labels.name}' ` : '';
   if (defMonitor !== undefined && !isPlainObject(defMonitor))
-    throw new ConfigError(`${base}: defaults.monitor must be a map`);
+    throw new ConfigError(`${labels.base ?? 'config'}: defaults.monitor must be a map`);
   if (roleMonitor !== undefined && !isPlainObject(roleMonitor))
-    throw new ConfigError(`${file}: role '${name}' monitor: must be a mapping`);
+    throw new ConfigError(`${where}monitor: must be a mapping`);
   const merged: Record<string, unknown> = {
     ...((defMonitor ?? {}) as Record<string, unknown>),
     ...((roleMonitor ?? {}) as Record<string, unknown>),
   };
   const problems = validateMonitorConfig(merged);
-  if (problems.length) throw new ConfigError(`${file}: role '${name}' ${problems.join('; ')}`);
+  if (problems.length) throw new ConfigError(`${where}${problems.join('; ')}`);
   return {
     enabled: (merged.enabled as boolean | undefined) ?? true,
     wake_sources: (merged.wake_sources as string[] | undefined) ?? [...DEFAULT_WAKE_SOURCES],
