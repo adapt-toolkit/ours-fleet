@@ -52,6 +52,17 @@ export function pretrust(dir: string): void {
   writeFileSync(p, JSON.stringify(d, null, 2));
 }
 
+/**
+ * Shared Monitor-arming mandate (issue #16). Single-sourced so the briefing and
+ * the restart prompt can never diverge on how the agent must arm its monitor —
+ * it must be the Monitor TOOL, not a background Bash task (which never wakes the
+ * agent on output → an armed-looking but deaf monitor).
+ */
+const armMonitor = (id: string): string =>
+  'arm a **persistent Monitor** (the Monitor TOOL — NOT a background Bash command; a ' +
+  `background Bash task never wakes you on output) running \`ours-mcp watch "${id}"\` ` +
+  'so inbound ours mail wakes you';
+
 export function makeClaudeCodeAdapter(exec: Exec = realExec): HarnessAdapter {
   return {
     id: 'claude-code',
@@ -125,8 +136,10 @@ export function makeClaudeCodeAdapter(exec: Exec = realExec): HarnessAdapter {
       sendTool: 'send_message',
       getMessagesTool: 'get_messages',
       watchCommand: id => `ours-mcp watch "${id}"`,
-      monitorInstruction: id =>
-        `Arm a **persistent Monitor** running the shell command \`ours-mcp watch "${id}"\` so inbound ours mail wakes you.`,
+      monitorInstruction: id => {
+        const m = armMonitor(id);
+        return `${m.charAt(0).toUpperCase()}${m.slice(1)}.`;
+      },
       supervisedWakeNote: () =>
         'Your mail wake-ups are delivered by the fleet supervisor directly into this console as ' +
         '`[fleet-monitor]` lines — do NOT arm an in-session Monitor. When such a line appears, run ' +
@@ -136,8 +149,12 @@ export function makeClaudeCodeAdapter(exec: Exec = realExec): HarnessAdapter {
         `Session restarted. Re-bind your ours identity now (choose_identity name "${id}" force=true), ` +
         (role?.monitor?.enabled
           ? 'then continue from '
-          : `re-arm your monitor (ours-mcp watch "${id}"), then continue from `) +
-        `${worklog}. Do not re-run whatever crashed you.`,
+          : `then ${armMonitor(id)}, then continue from `) +
+        `${worklog}. Do not re-run whatever crashed you.` +
+        (role?.monitor?.enabled
+          ? ' Your mail wakes arrive as `[fleet-monitor]` console lines from the supervisor — ' +
+            'do NOT arm an in-session Monitor.'
+          : ''),
     },
 
     exitPolicy: { cleanExitIsFresh: true, fastFailSecs: 20 },

@@ -57,8 +57,8 @@ export function buildPaneCommand(
   return `${envPfx} ${cmd}; echo $? > ${shq(exitStatusPath)}`;
 }
 
-/** Adapt the runner's injected deps into the monitor's dependency surface. */
-function monitorDeps(deps: RunnerDeps): MonitorDeps {
+/** Adapt runner deps and the role's daemon-profile overrides for the monitor. */
+function monitorDeps(deps: RunnerDeps, roleEnv?: Record<string, string>): MonitorDeps {
   return {
     fetch: deps.fetch,
     tmux: deps.tmux,
@@ -66,7 +66,9 @@ function monitorDeps(deps: RunnerDeps): MonitorDeps {
     sleep: deps.sleep,
     now: deps.now,
     log: deps.log,
-    env: process.env,
+    // The agent pane receives role.env too. The supervisor monitor must select
+    // the same ours daemon profile, with per-role values winning over service env.
+    env: { ...process.env, ...(roleEnv ?? {}) },
     timers: { set: (fn, ms) => setTimeout(fn, ms), clear: t => clearTimeout(t) },
   };
 }
@@ -246,7 +248,7 @@ export async function runOnce(
   // as disabled (monitor may be undefined on an old role.yaml).
   const monitor = role.monitor?.enabled ? deps.createMonitor({
     name, agentDir: dir, cfg: role.monitor,
-    deps: monitorDeps(deps),
+    deps: monitorDeps(deps, role.env),
   }) : null;
   if (monitor) await monitor.prime();
 

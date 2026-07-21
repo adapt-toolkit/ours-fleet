@@ -56,6 +56,44 @@ describe('vocabulary — supervised monitor migration', () => {
     const p = v.restartPrompt('Alice Dev', '/w/WORKLOG.md', role({ monitor: mon(false) }));
     expect(p).toContain('ours-mcp watch "Alice Dev"');
   });
+
+  // ── issue #16: mandate the Monitor TOOL, not a background Bash command ──
+  it('monitorInstruction forbids a background Bash task and names the watch command', () => {
+    const m = v.monitorInstruction('Alice Dev');
+    expect(m).toContain('persistent Monitor');
+    expect(m).toContain('NOT a background Bash');
+    expect(m).toContain('ours-mcp watch "Alice Dev"');
+  });
+
+  it('non-supervised restartPrompt mandates the Monitor TOOL, not background Bash', () => {
+    const p = v.restartPrompt('Alice Dev', '/w/WORKLOG.md', role({ monitor: mon(false) }));
+    expect(p).toContain('persistent Monitor');
+    expect(p).toContain('NOT a background Bash');
+    expect(p).toContain('ours-mcp watch "Alice Dev"');
+  });
+
+  it('non-supervised restartPrompt (no monitor field at all) also mandates the Monitor TOOL', () => {
+    const p = v.restartPrompt('Alice Dev', '/w/WORKLOG.md', role());
+    expect(p).toContain('persistent Monitor');
+    expect(p).toContain('NOT a background Bash');
+    expect(p).toContain('ours-mcp watch "Alice Dev"');
+  });
+
+  it('supervised restartPrompt states mail arrives as [fleet-monitor] and forbids an in-session Monitor', () => {
+    const p = v.restartPrompt('Alice Dev', '/w/WORKLOG.md', role({ monitor: mon(true) }));
+    expect(p).toContain('[fleet-monitor]');
+    expect(p).toContain('do NOT arm an in-session Monitor');
+    expect(p).not.toContain('ours-mcp watch');
+  });
+
+  it('monitorInstruction and non-supervised restartPrompt share the same mandate wording', () => {
+    const mi = v.monitorInstruction('Alice Dev');
+    const rp = v.restartPrompt('Alice Dev', '/w/WORKLOG.md', role({ monitor: mon(false) }));
+    for (const frag of ['persistent Monitor', 'NOT a background Bash', 'ours-mcp watch "Alice Dev"']) {
+      expect(mi).toContain(frag);
+      expect(rp).toContain(frag);
+    }
+  });
 });
 
 describe('pretrust', () => {

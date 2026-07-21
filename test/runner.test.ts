@@ -9,6 +9,7 @@ import { agentDir, stateRoot } from '../src/paths.js';
 import { Tmux } from '../src/tmux.js';
 import { fakeAdapter } from './registry.test.js';
 import type { Exec } from '../src/exec.js';
+import type { MonitorOpts } from '../src/monitor.js';
 
 let dir: string;
 beforeEach(() => {
@@ -24,9 +25,16 @@ afterEach(() => {
 /** Records the monitor lifecycle the runner drives, and proves prime happens
  *  before the tmux session is created. */
 function monitorRecorder(sessionCreated: () => boolean) {
-  const rec = { constructed: 0, primedBeforeSession: null as boolean | null, ranPid: null as number | null, stopped: false };
-  const createMonitor = () => {
+  const rec = {
+    constructed: 0,
+    primedBeforeSession: null as boolean | null,
+    ranPid: null as number | null,
+    stopped: false,
+    env: null as NodeJS.ProcessEnv | null,
+  };
+  const createMonitor = (opts: MonitorOpts) => {
     rec.constructed++;
+    rec.env = opts.deps.env;
     return {
       prime: async () => { rec.primedBeforeSession = !sessionCreated(); },
       run: async (pid: number) => { rec.ranPid = pid; },
@@ -265,6 +273,39 @@ describe('runOnce monitor integration', () => {
     const { deps, monitor } = fakeWorld({ exitCode: '0', exitFile: join(d, '.exit-status') });
     await runOnce('A', {}, deps);
     expect(monitor.constructed).toBe(0);
+  });
+
+  it('passes service env plus role daemon-profile overrides to the monitor', async () => {
+    const savedPort = process.env.OURS_PORT;
+    const savedToken = process.env.OURS_API_TOKEN;
+    process.env.OURS_PORT = '3001';
+    process.env.OURS_API_TOKEN = 'service-token';
+    try {
+      writeCfg({
+        A: {
+          harness: 'fake',
+          env: {
+            OURS_PORT: '4555',
+            OURS_API_TOKEN: 'role-token',
+            OURS_CONFIG: '/role/ours.json',
+            OURS_STATE_DIR: '/role/state',
+          },
+        },
+      });
+      const d = agentDir('A'); mkdirSync(d, { recursive: true });
+      const { deps, monitor } = fakeWorld({ exitCode: '0', exitFile: join(d, '.exit-status') });
+      await runOnce('A', {}, deps);
+      expect(monitor.env?.OURS_PORT).toBe('4555');
+      expect(monitor.env?.OURS_API_TOKEN).toBe('role-token');
+      expect(monitor.env?.OURS_CONFIG).toBe('/role/ours.json');
+      expect(monitor.env?.OURS_STATE_DIR).toBe('/role/state');
+      expect(monitor.env?.PATH).toBe(process.env.PATH); // inherited service env remains present
+    } finally {
+      if (savedPort === undefined) delete process.env.OURS_PORT;
+      else process.env.OURS_PORT = savedPort;
+      if (savedToken === undefined) delete process.env.OURS_API_TOKEN;
+      else process.env.OURS_API_TOKEN = savedToken;
+    }
   });
 });
 
