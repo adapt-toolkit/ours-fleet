@@ -179,6 +179,15 @@ describe('token resolution (issue #17)', () => {
     expect(resolveEndpoint(baseEnv()).url('A')).toContain(':3050/');
   });
 
+  it('matches ours-mcp parseInt + nullish port semantics', () => {
+    writeCfg({ port: 4100 });
+    expect(resolveEndpoint(baseEnv({ OURS_PORT: '4200suffix' })).port).toBe(4200);
+    expect(resolveEndpoint(baseEnv({ OURS_PORT: 'not-a-port' })).port).toBe(4100);
+    writeCfg({ port: 0 });
+    expect(resolveEndpoint(baseEnv()).port).toBe(0);
+    expect(resolveEndpoint(baseEnv({ OURS_PORT: '0' })).port).toBe(0);
+  });
+
   it('unreadable daemon-token (chmod 000) → no throw, no token', () => {
     const sd = join(dir, 'locked-state');
     writeToken(sd, 'secret');
@@ -272,6 +281,21 @@ describe('Monitor.prime', () => {
     expect(readFileSync(join(dir, '.monitor-status'), 'utf8')).toMatch(/failed/);
     await mon.run(1);                       // must return immediately, no throw
     expect(tmux.sent).toEqual([]);
+  });
+
+  it('names the selected config and token-file paths on a 401 without exposing the token', async () => {
+    const configPath = join(dir, 'selected-profile.json');
+    const stateDir = join(dir, 'selected-state');
+    writeFileSync(configPath, JSON.stringify({ apiToken: 'super-secret', stateDir }));
+    const { fetch } = scriptedFetch([{ status: 401 }]);
+    const deps = makeDeps(fetch, fakeTmux(), { env: { OURS_CONFIG: configPath } });
+    const mon = createMonitor({ name: 'A', agentDir: dir, cfg: CFG(), deps });
+    await mon.prime();
+    const status = readFileSync(join(dir, '.monitor-status'), 'utf8');
+    expect(status).toContain(configPath);
+    expect(status).toContain(join(stateDir, 'daemon-token'));
+    expect(status).not.toContain('super-secret');
+    expect(status).not.toContain('~/.ours/config.json');
   });
 
   it('degrades (does not throw) when the daemon is down at prime', async () => {

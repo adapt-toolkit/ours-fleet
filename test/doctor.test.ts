@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { doctor } from '../src/doctor.js';
@@ -18,12 +18,24 @@ const stubFetch = (state: 'ok' | '401' | 'down' | 'notdaemon' = 'ok'): FetchLike
 };
 
 let dir: string;
+const PROFILE_ENV_KEYS = ['OURS_CONFIG', 'OURS_STATE_DIR', 'OURS_PORT', 'OURS_API_TOKEN'] as const;
+let savedProfileEnv: Partial<Record<(typeof PROFILE_ENV_KEYS)[number], string | undefined>>;
 beforeEach(() => {
   dir = mkdtempSync(join(tmpdir(), 'ours-fleet-doc-'));
   process.env.OURS_FLEET_HOME = dir;   // empty config → no harness checks unless --harness
+  savedProfileEnv = Object.fromEntries(PROFILE_ENV_KEYS.map(k => [k, process.env[k]]));
+  process.env.OURS_CONFIG = join(dir, 'missing-ours-config.json');
+  process.env.OURS_STATE_DIR = join(dir, 'missing-ours-state');
+  delete process.env.OURS_PORT;
+  delete process.env.OURS_API_TOKEN;
 });
 afterEach(() => {
   delete process.env.OURS_FLEET_HOME;
+  for (const key of PROFILE_ENV_KEYS) {
+    const value = savedProfileEnv[key];
+    if (value === undefined) delete process.env[key];
+    else process.env[key] = value;
+  }
   rmSync(dir, { recursive: true, force: true });
 });
 
@@ -171,6 +183,78 @@ describe('doctor monitor probe (§5)', () => {
     const m = rep.checks.find(c => c.name === 'monitor: daemon API')!;
     expect(m.ok).toBe(false);
     expect(m.detail).toMatch(/ours-mcp start/);
+  });
+
+  it('uses config port and apiToken for the same profile as the runtime monitor', async () => {
+    const oursConfig = join(dir, 'ours-profile.json');
+    writeFileSync(oursConfig, JSON.stringify({ port: 4111, apiToken: 'config-token' }));
+    process.env.OURS_CONFIG = oursConfig;
+    const calls: Array<{ url: string; headers?: Record<string, string> }> = [];
+    const fetch: FetchLike = async (url, init) => {
+      calls.push({ url, headers: init?.headers });
+      return { status: 200, ok: true, json: async () => ({}) };
+    };
+    withRole('');
+    const rep = await doctor({}, green(), 'linux', fetch);
+    const m = rep.checks.find(c => c.name === 'monitor: daemon API')!;
+    expect(m.ok).toBe(true);
+    expect(calls.map(c => c.url)).toEqual([
+      'http://127.0.0.1:4111/state-dir',
+      'http://127.0.0.1:4111/identities',
+    ]);
+    expect(calls[1].headers).toEqual({ 'x-ours-api-token': 'config-token' });
+  });
+
+  it('uses the owner daemon-token when no explicit token is configured', async () => {
+    const stateDir = join(dir, 'owner-state');
+    mkdirSync(stateDir, { recursive: true });
+    writeFileSync(join(stateDir, 'daemon-token'), 'owner-token\n');
+    process.env.OURS_STATE_DIR = stateDir;
+    let authHeaders: Record<string, string> | undefined;
+    const fetch: FetchLike = async (url, init) => {
+      if (url.endsWith('/identities')) authHeaders = init?.headers;
+      return { status: 200, ok: true, json: async () => ({}) };
+    };
+    withRole('');
+    const rep = await doctor({}, green(), 'linux', fetch);
+    expect(rep.checks.find(c => c.name === 'monitor: daemon API')?.ok).toBe(true);
+    expect(authHeaders).toEqual({ 'x-ours-api-token': 'owner-token' });
+  });
+
+  it('deduplicates identical role profiles and probes distinct role.env profiles separately', async () => {
+    registerAdapter(fakeAdapter);
+    writeFileSync(join(dir, 'fleet.yaml'), JSON.stringify({
+      roles: {
+        A: { harness: 'fake', env: { OURS_PORT: '4201', OURS_API_TOKEN: 'shared' } },
+        B: { harness: 'fake', env: { OURS_PORT: '4201', OURS_API_TOKEN: 'shared' } },
+        C: { harness: 'fake', env: { OURS_PORT: '4202', OURS_API_TOKEN: 'other' } },
+      },
+    }));
+    const calls: Array<{ url: string; token?: string }> = [];
+    const fetch: FetchLike = async (url, init) => {
+      calls.push({ url, token: init?.headers?.['x-ours-api-token'] });
+      return { status: 200, ok: true, json: async () => ({}) };
+    };
+    const rep = await doctor({}, green(), 'linux', fetch);
+    expect(calls).toHaveLength(4); // two requests per distinct profile, not per role
+    expect(calls.filter(c => c.url.includes(':4201/'))).toHaveLength(2);
+    expect(calls.filter(c => c.url.includes(':4202/'))).toHaveLength(2);
+    expect(calls.find(c => c.url === 'http://127.0.0.1:4201/identities')?.token).toBe('shared');
+    expect(calls.find(c => c.url === 'http://127.0.0.1:4202/identities')?.token).toBe('other');
+    expect(rep.checks.some(c => c.name === 'monitor: daemon API (A, B)')).toBe(true);
+    expect(rep.checks.some(c => c.name === 'monitor: daemon API (C)')).toBe(true);
+  });
+
+  it('uses the selected config path in its 401 hint without exposing the token', async () => {
+    const oursConfig = join(dir, 'custom-profile.json');
+    writeFileSync(oursConfig, JSON.stringify({ apiToken: 'never-print-me' }));
+    process.env.OURS_CONFIG = oursConfig;
+    withRole('');
+    const rep = await doctor({}, green(), 'linux', stubFetch('401'));
+    const detail = rep.checks.find(c => c.name === 'monitor: daemon API')!.detail;
+    expect(detail).toContain(oursConfig);
+    expect(detail).not.toContain('never-print-me');
+    expect(detail).not.toContain('~/.ours/config.json');
   });
 
   it('skips the probe entirely when no role is supervised', async () => {

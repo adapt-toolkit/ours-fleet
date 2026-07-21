@@ -78,6 +78,14 @@ interface DaemonConfig {
 const daemonConfigPath = (env: NodeJS.ProcessEnv): string =>
   env.OURS_CONFIG ?? join(homedir(), '.ours', 'config.json');
 
+/** Match ours-mcp's env integer semantics: parseInt, invalid → absent. */
+function envInt(env: NodeJS.ProcessEnv, name: string): number | undefined {
+  const raw = env[name];
+  if (raw === undefined) return undefined;
+  const n = parseInt(raw, 10);
+  return Number.isNaN(n) ? undefined : n;
+}
+
 /**
  * Read the daemon config the way the MCP client does — best-effort. Any missing,
  * malformed, or unreadable config yields `{}` so token resolution falls through
@@ -116,17 +124,38 @@ export function resolveApiToken(
   return undefined;
 }
 
-/** Resolve the daemon endpoint + auth header from the environment (design §6c). */
-export function resolveEndpoint(env: NodeJS.ProcessEnv): {
-  url(name: string): string; headers: Record<string, string>;
-} {
+export interface DaemonEndpoint {
+  origin: string;
+  port: number;
+  configPath: string;
+  stateDir: string;
+  url(name: string): string;
+  headers: Record<string, string>;
+}
+
+/** Resolve the daemon endpoint + auth header from env → config → defaults. */
+export function resolveEndpoint(env: NodeJS.ProcessEnv): DaemonEndpoint {
   const file = readDaemonConfig(env);
-  const port = Number(env.OURS_PORT) || file.port || DEFAULT_PORT;
+  const port = envInt(env, 'OURS_PORT') ?? file.port ?? DEFAULT_PORT;
+  const configPath = daemonConfigPath(env);
+  const stateDir = env.OURS_STATE_DIR ?? file.stateDir ?? join(homedir(), '.ours');
   const token = resolveApiToken(env, file);
+  const origin = `http://127.0.0.1:${port}`;
   return {
-    url: (name: string) => `http://127.0.0.1:${port}/identities/${encodeURIComponent(name)}/notifications`,
+    origin,
+    port,
+    configPath,
+    stateDir,
+    url: (name: string) => `${origin}/identities/${encodeURIComponent(name)}/notifications`,
     headers: token ? { 'x-ours-api-token': token } : {},
   };
+}
+
+/** Actionable, secret-free description of every token source for this profile. */
+export function authResolutionHint(ep: DaemonEndpoint): string {
+  const tokenPath = join(ep.stateDir, 'daemon-token');
+  return `set OURS_API_TOKEN, set apiToken in ${JSON.stringify(ep.configPath)}, or ensure ` +
+    `${JSON.stringify(tokenPath)} is readable by the fleet supervisor`;
 }
 
 /** Keep only the events whose type the role asked to wake on. */
@@ -345,8 +374,7 @@ export class Monitor {
     }
     if (resp.status === 401)
       throw new AuthError(
-        'daemon rejected the API token (401) — set OURS_API_TOKEN, or an apiToken in ' +
-        '~/.ours/config.json, or run as the daemon owner (readable <stateDir>/daemon-token)');
+        `daemon rejected the API token (401) — ${authResolutionHint(this.ep)}`);
     if (!resp.ok) throw new Error(`daemon returned HTTP ${resp.status}`);
     return resp.json();
   }

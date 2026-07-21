@@ -1,12 +1,15 @@
 import { userInfo } from 'node:os';
 import { readFileSync } from 'node:fs';
 import { realExec, type Exec } from './exec.js';
-import { loadConfig } from './config.js';
+import { loadConfig, type ResolvedRole } from './config.js';
 import { getAdapter } from './harness/registry.js';
 import { agentDir, home, deriveXdgRuntimeDir } from './paths.js';
 import { resolveIsolation } from './isolation/policy.js';
 import { makeBubblewrapBackend } from './isolation/bubblewrap.js';
-import { type FetchLike } from './monitor.js';
+import {
+  authResolutionHint, resolveEndpoint,
+  type DaemonEndpoint, type FetchLike,
+} from './monitor.js';
 import type { PrereqCheck, PrereqReport } from './harness/types.js';
 
 /** Which cgroup-v2 controllers are delegated to this user manager (advisory). */
@@ -18,6 +21,26 @@ function cgroupDelegationDetail(): string {
     return `memory=${has('memory')} pids=${has('pids')} cpu=${has('cpu')}` +
       (c.includes('cpu') ? '' : ' — cpu caps degrade to a warning (one-time: Delegate=cpu)');
   } catch { return 'unknown (not cgroup-v2 or no delegation info)'; }
+}
+
+interface MonitorProfile {
+  endpoint: DaemonEndpoint;
+  roles: string[];
+}
+
+/** Resolve and deduplicate the effective daemon profiles used by monitored roles. */
+function resolveMonitorProfiles(roles: ResolvedRole[]): MonitorProfile[] {
+  const profiles: MonitorProfile[] = [];
+  for (const role of roles.filter(r => r.monitor?.enabled)) {
+    const endpoint = resolveEndpoint({ ...process.env, ...(role.env ?? {}) });
+    const token = endpoint.headers['x-ours-api-token'];
+    const existing = profiles.find(p =>
+      p.endpoint.origin === endpoint.origin
+      && p.endpoint.headers['x-ours-api-token'] === token);
+    if (existing) existing.roles.push(role.name);
+    else profiles.push({ endpoint, roles: [role.name] });
+  }
+  return profiles;
 }
 
 /** Host-level + per-harness prerequisite report with actionable messages. */
@@ -117,29 +140,34 @@ export async function doctor(
   // Monitor daemon-API reachability (design §5): only when a role is supervised.
   // /state-dir is unauthenticated (liveness); /identities exercises the token so a
   // shared-mode misconfig (401) surfaces here rather than as a silent deaf monitor.
-  if (roles.some(r => r.monitor?.enabled)) {
-    const port = Number(process.env.OURS_PORT) || 3050;
-    const token = process.env.OURS_API_TOKEN;
-    const headers: Record<string, string> = token ? { 'x-ours-api-token': token } : {};
+  const monitorProfiles = resolveMonitorProfiles(roles);
+  for (const profile of monitorProfiles) {
+    const { endpoint } = profile;
+    const checkName = monitorProfiles.length === 1
+      ? 'monitor: daemon API'
+      : `monitor: daemon API (${profile.roles.join(', ')})`;
     let ok = false, detail: string;
     try {
-      const live = await fetchImpl(`http://127.0.0.1:${port}/state-dir`, {});
+      const live = await fetchImpl(`${endpoint.origin}/state-dir`, {});
       if (!live.ok) {
-        detail = `daemon on :${port} answered /state-dir with HTTP ${live.status} — not the ours daemon?`;
+        detail = `daemon on :${endpoint.port} answered /state-dir with HTTP ${live.status} — not the ours daemon?`;
       } else {
-        const auth = await fetchImpl(`http://127.0.0.1:${port}/identities`, { headers });
+        const auth = await fetchImpl(`${endpoint.origin}/identities`, { headers: endpoint.headers });
         if (auth.status === 401)
-          detail = `reachable on :${port} but the API token was rejected (401) — set OURS_API_TOKEN to the ` +
-            `daemon's token (shared mode) or run the fleet as the daemon owner`;
+          detail = `reachable on :${endpoint.port} but the API token was rejected (401) — ` +
+            authResolutionHint(endpoint);
         else if (!auth.ok)
-          detail = `reachable on :${port} but /identities returned HTTP ${auth.status}`;
-        else { ok = true; detail = `reachable on :${port}, authorized — supervisor wake stream available`; }
+          detail = `reachable on :${endpoint.port} but /identities returned HTTP ${auth.status}`;
+        else {
+          ok = true;
+          detail = `reachable on :${endpoint.port}, authorized — supervisor wake stream available`;
+        }
       }
     } catch (e) {
-      detail = `unreachable on :${port} — monitored roles run degraded until it is up ` +
+      detail = `unreachable on :${endpoint.port} — monitored roles run degraded until it is up ` +
         `(start it: ours-mcp start) [${(e as Error)?.message ?? e}]`;
     }
-    checks.push({ name: 'monitor: daemon API', ok, detail });
+    checks.push({ name: checkName, ok, detail });
   }
 
   const harnesses = opts.harness
