@@ -1,4 +1,5 @@
 import { existsSync, readFileSync, writeFileSync } from 'node:fs';
+import { homedir } from 'node:os';
 import { join } from 'node:path';
 import type { MonitorConfig, NotifyEventType } from './config.js';
 
@@ -66,12 +67,62 @@ const MAX_LINE = 260;
 
 class AuthError extends Error {}
 
+/** Best-effort daemon config (issue #17): the fields the MCP client reads. */
+interface DaemonConfig {
+  apiToken?: string;
+  port?: number;
+  stateDir?: string;
+}
+
+/** Path to the daemon config the MCP client uses: OURS_CONFIG ?? real ~/.ours/config.json. */
+const daemonConfigPath = (env: NodeJS.ProcessEnv): string =>
+  env.OURS_CONFIG ?? join(homedir(), '.ours', 'config.json');
+
+/**
+ * Read the daemon config the way the MCP client does — best-effort. Any missing,
+ * malformed, or unreadable config yields `{}` so token resolution falls through
+ * (issue #17). Only the well-typed fields we consume are surfaced.
+ */
+export function readDaemonConfig(env: NodeJS.ProcessEnv): DaemonConfig {
+  try {
+    const p = JSON.parse(readFileSync(daemonConfigPath(env), 'utf8'));
+    const o: DaemonConfig = {};
+    if (typeof p.apiToken === 'string' && p.apiToken.trim()) o.apiToken = p.apiToken.trim();
+    if (typeof p.port === 'number' && Number.isFinite(p.port)) o.port = p.port;
+    if (typeof p.stateDir === 'string') o.stateDir = p.stateDir;
+    return o;
+  } catch {
+    return {};
+  }
+}
+
+/**
+ * Resolve the daemon API token exactly like the MCP client (issue #17), a 3-step
+ * chain: `OURS_API_TOKEN` (trimmed) → config `apiToken` (trimmed) → the 0600 owner
+ * token at `<stateDir>/daemon-token`. Never generates a token; a failed read of
+ * any source (missing/unreadable) silently falls through to the next.
+ */
+export function resolveApiToken(
+  env: NodeJS.ProcessEnv, file: DaemonConfig = readDaemonConfig(env),
+): string | undefined {
+  const e = env.OURS_API_TOKEN?.trim();
+  if (e) return e;
+  if (file.apiToken) return file.apiToken;
+  const sd = env.OURS_STATE_DIR ?? file.stateDir ?? join(homedir(), '.ours');
+  try {
+    const t = readFileSync(join(sd, 'daemon-token'), 'utf8').trim();
+    if (t) return t;
+  } catch { /* missing/unreadable (e.g. cross-user 0600) → fall through */ }
+  return undefined;
+}
+
 /** Resolve the daemon endpoint + auth header from the environment (design §6c). */
 export function resolveEndpoint(env: NodeJS.ProcessEnv): {
   url(name: string): string; headers: Record<string, string>;
 } {
-  const port = Number(env.OURS_PORT) || DEFAULT_PORT;
-  const token = env.OURS_API_TOKEN;
+  const file = readDaemonConfig(env);
+  const port = Number(env.OURS_PORT) || file.port || DEFAULT_PORT;
+  const token = resolveApiToken(env, file);
   return {
     url: (name: string) => `http://127.0.0.1:${port}/identities/${encodeURIComponent(name)}/notifications`,
     headers: token ? { 'x-ours-api-token': token } : {},
@@ -293,7 +344,9 @@ export class Monitor {
       this.currentAbort = null;
     }
     if (resp.status === 401)
-      throw new AuthError('daemon rejected the API token (401) — set OURS_API_TOKEN or run as the daemon owner');
+      throw new AuthError(
+        'daemon rejected the API token (401) — set OURS_API_TOKEN, or an apiToken in ' +
+        '~/.ours/config.json, or run as the daemon owner (readable <stateDir>/daemon-token)');
     if (!resp.ok) throw new Error(`daemon returned HTTP ${resp.status}`);
     return resp.json();
   }

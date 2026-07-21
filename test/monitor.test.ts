@@ -1,9 +1,10 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
-import { mkdtempSync, rmSync, existsSync, readFileSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, rmSync, existsSync, readFileSync, writeFileSync, chmodSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
-  resolveEndpoint, filterEvents, formatNotificationLine, looksModal, createMonitor,
+  resolveEndpoint, resolveApiToken, readDaemonConfig, filterEvents, formatNotificationLine,
+  looksModal, createMonitor,
   type NotifyEvent, type MonitorDeps, type FetchResponse,
 } from '../src/monitor.js';
 import type { MonitorConfig } from '../src/config.js';
@@ -77,19 +78,122 @@ function makeDeps(fetch: MonitorDeps['fetch'], tmux: FakeTmux, over: Partial<Mon
   };
 }
 
+// Hermetic base env: OURS_CONFIG points at a nonexistent path so no test ever
+// reads the real ~/.ours/config.json, and OURS_STATE_DIR isolates daemon-token.
+const NO_CONFIG = join(tmpdir(), 'ours-fleet-no-such-config-xyz.json');
+const hermetic = (over: NodeJS.ProcessEnv = {}): NodeJS.ProcessEnv => ({
+  OURS_CONFIG: NO_CONFIG, OURS_STATE_DIR: join(tmpdir(), 'ours-fleet-no-such-state-xyz'), ...over,
+});
+
 describe('resolveEndpoint', () => {
   it('defaults to port 3050 and sends no token header when unset', () => {
-    const ep = resolveEndpoint({});
+    const ep = resolveEndpoint(hermetic());
     expect(ep.url('Alice')).toBe('http://127.0.0.1:3050/identities/Alice/notifications');
     expect(ep.headers).toEqual({});
   });
   it('honors OURS_PORT and sends the token header when set', () => {
-    const ep = resolveEndpoint({ OURS_PORT: '4000', OURS_API_TOKEN: 'sek' });
+    const ep = resolveEndpoint(hermetic({ OURS_PORT: '4000', OURS_API_TOKEN: 'sek' }));
     expect(ep.url('A')).toContain(':4000/');
     expect(ep.headers).toEqual({ 'x-ours-api-token': 'sek' });
   });
   it('url-encodes the identity name', () => {
-    expect(resolveEndpoint({}).url('a b')).toContain('/identities/a%20b/');
+    expect(resolveEndpoint(hermetic()).url('a b')).toContain('/identities/a%20b/');
+  });
+});
+
+describe('token resolution (issue #17)', () => {
+  // Precedence chain: env OURS_API_TOKEN (trimmed) > config apiToken (trimmed)
+  // > <stateDir>/daemon-token. Config & daemon-token live under the temp `dir`.
+  const cfgPath = () => join(dir, 'config.json');
+  const writeCfg = (o: unknown) => writeFileSync(cfgPath(), JSON.stringify(o));
+  const writeToken = (sd: string, t: string) => { mkdirSync(sd, { recursive: true }); writeFileSync(join(sd, 'daemon-token'), t); };
+  const baseEnv = (over: NodeJS.ProcessEnv = {}): NodeJS.ProcessEnv =>
+    ({ OURS_CONFIG: cfgPath(), OURS_STATE_DIR: join(dir, 'state'), ...over });
+  const tokenOf = (env: NodeJS.ProcessEnv) =>
+    resolveEndpoint(env).headers['x-ours-api-token'];
+
+  it('env token present → header uses env token', () => {
+    writeCfg({ apiToken: 'from-config' });
+    writeToken(join(dir, 'state'), 'from-file');
+    expect(tokenOf(baseEnv({ OURS_API_TOKEN: 'from-env' }))).toBe('from-env');
+  });
+
+  it('env token whitespace-only → falls through to config', () => {
+    writeCfg({ apiToken: 'from-config' });
+    expect(tokenOf(baseEnv({ OURS_API_TOKEN: '   ' }))).toBe('from-config');
+  });
+
+  it('env token trimmed of surrounding whitespace', () => {
+    expect(tokenOf(baseEnv({ OURS_API_TOKEN: '  padded  ' }))).toBe('padded');
+  });
+
+  it('no env → config apiToken (trimmed) wins over daemon-token', () => {
+    writeCfg({ apiToken: '  cfg-token  ' });
+    writeToken(join(dir, 'state'), 'file-token');
+    expect(tokenOf(baseEnv())).toBe('cfg-token');
+  });
+
+  it('config apiToken whitespace-only → ignored → falls through to daemon-token', () => {
+    writeCfg({ apiToken: '   ' });
+    writeToken(join(dir, 'state'), 'file-token');
+    expect(tokenOf(baseEnv())).toBe('file-token');
+  });
+
+  it('no env, no config → reads <stateDir>/daemon-token (trimmed)', () => {
+    writeToken(join(dir, 'state'), '  daemon-tok\n');
+    expect(tokenOf(baseEnv())).toBe('daemon-tok');
+  });
+
+  it('malformed config JSON → treated as absent → daemon-token', () => {
+    writeFileSync(cfgPath(), '{ this is not json ');
+    writeToken(join(dir, 'state'), 'file-token');
+    expect(tokenOf(baseEnv())).toBe('file-token');
+  });
+
+  it('nothing present anywhere → no token header', () => {
+    expect(resolveEndpoint(baseEnv()).headers).toEqual({});
+    expect(resolveApiToken(baseEnv())).toBeUndefined();
+  });
+
+  it('stateDir precedence: OURS_STATE_DIR wins over config.stateDir for daemon-token', () => {
+    const envSd = join(dir, 'env-state');
+    const cfgSd = join(dir, 'cfg-state');
+    writeCfg({ stateDir: cfgSd });
+    writeToken(envSd, 'from-env-statedir');
+    writeToken(cfgSd, 'from-cfg-statedir');
+    expect(tokenOf(baseEnv({ OURS_STATE_DIR: envSd }))).toBe('from-env-statedir');
+  });
+
+  it('stateDir precedence: config.stateDir used when OURS_STATE_DIR unset', () => {
+    const cfgSd = join(dir, 'cfg-state2');
+    writeCfg({ stateDir: cfgSd });
+    writeToken(cfgSd, 'from-cfg-statedir');
+    expect(tokenOf({ OURS_CONFIG: cfgPath() })).toBe('from-cfg-statedir');
+  });
+
+  it('port precedence: OURS_PORT > config.port > 3050', () => {
+    writeCfg({ port: 4100 });
+    expect(resolveEndpoint(baseEnv({ OURS_PORT: '4200' })).url('A')).toContain(':4200/');
+    expect(resolveEndpoint(baseEnv()).url('A')).toContain(':4100/');
+    writeCfg({});
+    expect(resolveEndpoint(baseEnv()).url('A')).toContain(':3050/');
+  });
+
+  it('unreadable daemon-token (chmod 000) → no throw, no token', () => {
+    const sd = join(dir, 'locked-state');
+    writeToken(sd, 'secret');
+    chmodSync(join(sd, 'daemon-token'), 0o000);
+    try {
+      expect(() => resolveApiToken(baseEnv({ OURS_STATE_DIR: sd }))).not.toThrow();
+      // On most CI runners chmod 000 blocks the read → undefined; if root can still
+      // read it, the token comes back — either way the call must not throw.
+    } finally {
+      chmodSync(join(sd, 'daemon-token'), 0o600);
+    }
+  });
+
+  it('readDaemonConfig returns {} on a missing file', () => {
+    expect(readDaemonConfig({ OURS_CONFIG: join(dir, 'nope.json') })).toEqual({});
   });
 });
 
