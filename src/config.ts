@@ -21,14 +21,22 @@ export interface MonitorConfig {
   wake_sources: string[];
   batch_ms: number;
   inject: InjectMode;
+  /**
+   * Consecutive delivered wakes that must end in an `API Error:`-terminated turn
+   * (with no completed turn in between) before `.monitor-status` degrades to
+   * `turns failing (api error)` — the refusal-wedge detector (issue #19). Must be
+   * a positive integer; resolved default is 3. Optional so old snapshots resolve.
+   */
+  turn_fail_threshold?: number;
 }
 
 /** Default wake sources when a role does not list its own (design §2). */
 export const DEFAULT_WAKE_SOURCES: NotifyEventType[] =
   ['message_received', 'file_received', 'local_contact_request', 'pending_message'];
-const MONITOR_KEYS = ['enabled', 'wake_sources', 'batch_ms', 'inject'];
+const MONITOR_KEYS = ['enabled', 'wake_sources', 'batch_ms', 'inject', 'turn_fail_threshold'];
 const INJECT_MODES: InjectMode[] = ['notification', 'full'];
 const MONITOR_DEFAULT_BATCH_MS = 2000;
+const MONITOR_DEFAULT_TURN_FAIL_THRESHOLD = 3;
 
 const isPlainObject = (v: unknown): v is Record<string, unknown> =>
   v !== null && typeof v === 'object' && !Array.isArray(v);
@@ -48,6 +56,10 @@ export function validateMonitorConfig(raw: unknown): string[] {
     problems.push('monitor.batch_ms: must be a non-negative number');
   if (m.inject !== undefined && !INJECT_MODES.includes(m.inject as InjectMode))
     problems.push(`monitor.inject: invalid value '${m.inject}'; allowed: ${INJECT_MODES.join(', ')}`);
+  if (m.turn_fail_threshold !== undefined
+      && (typeof m.turn_fail_threshold !== 'number' || !Number.isInteger(m.turn_fail_threshold)
+          || m.turn_fail_threshold < 1))
+    problems.push('monitor.turn_fail_threshold: must be a positive integer');
   if (m.wake_sources !== undefined) {
     if (!Array.isArray(m.wake_sources)) problems.push('monitor.wake_sources: must be a list');
     else {
@@ -227,6 +239,8 @@ export function resolveMonitorConfig(
     wake_sources: (merged.wake_sources as string[] | undefined) ?? [...DEFAULT_WAKE_SOURCES],
     batch_ms: (merged.batch_ms as number | undefined) ?? MONITOR_DEFAULT_BATCH_MS,
     inject: (merged.inject as InjectMode | undefined) ?? 'notification',
+    turn_fail_threshold:
+      (merged.turn_fail_threshold as number | undefined) ?? MONITOR_DEFAULT_TURN_FAIL_THRESHOLD,
   };
 }
 

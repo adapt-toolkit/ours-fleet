@@ -64,6 +64,11 @@ const BACKOFF_STEP_MS = 1_000;
 const BACKOFF_MAX_MS = 5_000;
 const PREFIX = '[fleet-monitor]';
 const MAX_LINE = 260;
+// Turn-outcome observation (issue #19): after a delivered wake, watch the pane
+// until the triggered turn settles, then classify it. Code constants (not config):
+const TURN_OBSERVE_POLLS = 20;         // give up after ~POLLS × INTERVAL of a still-running turn
+const TURN_OBSERVE_INTERVAL_MS = 1_500;
+const DEFAULT_TURN_FAIL_THRESHOLD = 3; // fallback when the resolved config omits it
 
 class AuthError extends Error {}
 
@@ -219,6 +224,31 @@ export function looksModal(pane: string): boolean {
   return hasPointer && hasNumbered;
 }
 
+/**
+ * Heuristic: did the turn shown in this pane TERMINATE in an API-level error?
+ * Claude Code renders a failed turn's tail as an `API Error:` line (a Usage-Policy
+ * refusal, a 4xx, etc.). We scan a generous tail window so the marker survives a
+ * trailing idle composer redrawn beneath it (design §3.2, refine empirically).
+ * The N-consecutive threshold in the Monitor debounces the odd false match.
+ */
+export function looksApiError(pane: string): boolean {
+  const tail = pane.split('\n').slice(-15).join('\n');
+  return /\bAPI Error\b/i.test(tail);
+}
+
+/**
+ * Heuristic: is a turn still RUNNING in this pane? Claude Code shows a live
+ * "esc to interrupt" footer (often with an elapsed-seconds meter) while a turn
+ * streams. Absence of any running marker — and no API error — means the turn has
+ * settled (completed). Kept a positive check so a quiet idle pane reads as done.
+ */
+export function looksRunning(pane: string): boolean {
+  const tail = pane.split('\n').slice(-6).join('\n');
+  if (/esc to interrupt/i.test(tail)) return true;   // Claude Code's running footer
+  if (/\(\s*\d+s\b/.test(tail)) return true;         // "(12s · … tokens)" elapsed meter
+  return false;
+}
+
 /** Is the injected line still sitting unsubmitted in the composer (bottom of pane)? */
 function stillInComposer(pane: string, line: string): boolean {
   const frag = line.slice(0, 48);
@@ -252,6 +282,10 @@ export class Monitor {
   private stopped = false;
   private bootDeadline = 0;
   private currentAbort: AbortController | null = null;
+  // Refusal-wedge detector (issue #19): consecutive delivered wakes whose turn
+  // ended in an API error with no completed turn in between.
+  private apiErrorStreak = 0;
+  private readonly turnFailThreshold: number;
 
   constructor(o: MonitorOpts) {
     this.name = o.name;
@@ -260,6 +294,8 @@ export class Monitor {
     this.ep = resolveEndpoint(o.deps.env);
     this.statusPath = join(o.agentDir, '.monitor-status');
     this.cursorPath = join(o.agentDir, '.notify-cursor');
+    const n = o.cfg.turn_fail_threshold;
+    this.turnFailThreshold = typeof n === 'number' && n >= 1 ? n : DEFAULT_TURN_FAIL_THRESHOLD;
   }
 
   /** Prime at the stream tip (or resume a persisted cursor if the daemon is down). */
@@ -344,7 +380,40 @@ export class Monitor {
       if (!stillInComposer(pane, line)) { delivered = true; break; }
       await this.deps.tmux.sendKey(this.name, 'Enter');
     }
-    this.setStatus(delivered ? 'armed' : 'degraded: injection unverified');
+    if (!delivered) { this.setStatus('degraded: injection unverified'); return; }
+    // The wake landed and a turn started; observe how that turn terminates so a
+    // refusal-wedge (every turn dies with `API Error:` while delivery stays green)
+    // becomes visible in `.monitor-status` instead of masquerading as armed (#19).
+    await this.observeTurnOutcome(pid);
+  }
+
+  /**
+   * Watch the pane until the just-triggered turn settles, then fold its outcome
+   * into the API-error streak and republish `.monitor-status`. A completed turn
+   * (or an inconclusive give-up) resets/keeps the streak; an `API Error:` tail
+   * grows it. Once the streak reaches the threshold the status degrades; a later
+   * completed turn flips it back to armed. Detection only — no remediation (#19).
+   */
+  private async observeTurnOutcome(pid: number): Promise<void> {
+    for (let i = 0; i < TURN_OBSERVE_POLLS; i++) {
+      if (this.stopped) return;                                  // shutting down — leave status
+      if (!this.deps.isAlive(pid) || !(await this.deps.tmux.has(this.name))) return; // loop marks offline
+      const pane = await safeCapture(this.deps.tmux, this.name);
+      if (looksApiError(pane)) { this.recordTurn('api-error'); return; }
+      if (!looksRunning(pane)) { this.recordTurn('completed'); return; }
+      await this.deps.sleep(TURN_OBSERVE_INTERVAL_MS);
+    }
+    this.recordTurn('inconclusive');   // still running at give-up: hold the streak, don't re-arm
+  }
+
+  /** Update the consecutive-API-error streak and derive `.monitor-status` from it. */
+  private recordTurn(outcome: 'api-error' | 'completed' | 'inconclusive'): void {
+    if (outcome === 'api-error') this.apiErrorStreak++;
+    else if (outcome === 'completed') this.apiErrorStreak = 0;
+    // 'inconclusive' leaves the streak (and therefore the status) unchanged.
+    this.setStatus(this.apiErrorStreak >= this.turnFailThreshold
+      ? 'degraded: turns failing (api error)'
+      : 'armed');
   }
 
   /** Block until the console can accept input; classify offline/stopped/ready. */
