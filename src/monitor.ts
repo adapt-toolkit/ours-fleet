@@ -60,6 +60,11 @@ const BOOT_GRACE_MS = 15_000;         // hold injection until the TUI is up
 const POST_VERIFY_MS = 1_000;
 const MAX_ENTER_RETRIES = 2;
 const MODAL_RETRY_MS = 5_000;
+// Keys that reset the composer to empty before we type a wake, so a human's
+// unsubmitted keystrokes can't concatenate with — or wedge (e.g. via an open
+// slash-command menu that captures Enter) — the injected line. C-e moves to end
+// of line, C-u kills to start ⇒ whole single line cleared regardless of cursor.
+const COMPOSER_CLEAR_KEYS = ['C-e', 'C-u'];
 const BACKOFF_STEP_MS = 1_000;
 const BACKOFF_MAX_MS = 5_000;
 const PREFIX = '[fleet-monitor]';
@@ -333,6 +338,7 @@ export class Monitor {
       return; // events remain covered by unread.json / SessionStart backlog
     }
     const line = formatNotificationLine(batch);
+    await this.clearComposer();                        // start from an empty composer
     await this.deps.tmux.sendText(this.name, line);   // send-keys -l + Enter
     let delivered = false;
     // Verify submission for THIS line even if stop() arrives mid-flight: the text
@@ -345,6 +351,18 @@ export class Monitor {
       await this.deps.tmux.sendKey(this.name, 'Enter');
     }
     this.setStatus(delivered ? 'armed' : 'degraded: injection unverified');
+  }
+
+  /**
+   * Reset the composer to empty before typing a wake. Without this, any
+   * unsubmitted text a human left in the input concatenates with the injected
+   * line (`stray[fleet-monitor] …`) or, when it has opened a slash-command menu,
+   * swallows the submit Enter entirely — wedging every subsequent injection until
+   * the composer is cleared by hand. Best-effort: a dead pane just makes the keys
+   * no-ops (delivery is still verified downstream).
+   */
+  private async clearComposer(): Promise<void> {
+    for (const key of COMPOSER_CLEAR_KEYS) await this.deps.tmux.sendKey(this.name, key);
   }
 
   /** Block until the console can accept input; classify offline/stopped/ready. */

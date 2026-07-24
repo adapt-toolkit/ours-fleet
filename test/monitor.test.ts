@@ -407,3 +407,66 @@ describe('Monitor.run — delivery', () => {
     expect(calls()).toHaveLength(1);        // only the prime fetch happened
   });
 });
+
+describe('Monitor.run — injection into a dirty composer (unsubmitted human text)', () => {
+  // A STATEFUL tmux composer. It models the two ways stray, unsubmitted keystrokes
+  // break injection today: (1) the typed line concatenates onto them, and (2) if
+  // they opened a slash-command menu (buffer starts with '/'), the menu captures
+  // Enter so nothing submits at all — the wedge. `send-keys -l text` then Enter is
+  // one sendText call (mirrors Tmux.sendText); C-u clears the line.
+  interface Composer extends FakeTmux { submitted: string[]; buffer(): string }
+  function composerTmux(initial = ''): Composer {
+    let buf = initial;
+    const submitted: string[] = [];
+    const sent: string[] = [];
+    const enter = () => { if (buf.length > 0 && !buf.startsWith('/')) { submitted.push(buf); buf = ''; } };
+    return {
+      sent, submitted, buffer: () => buf,
+      get enters() { return 0; },
+      has: async () => true,
+      capture: async () => `assistant: earlier reply\n> ${buf}`,
+      sendText: async (_n: string, t: string) => { sent.push(t); buf += t; enter(); }, // -l text, then Enter
+      sendKey: async (_n: string, k: string) => {
+        if (k === 'C-u') buf = '';                 // kill to line start
+        else if (k === 'Enter') enter();
+        // 'C-e' (cursor to end) is a no-op in this single-line model
+      },
+    } as Composer;
+  }
+
+  const LINE = '[fleet-monitor] 1 new message from Coord (#1) — run get_messages';
+  const status = () => readFileSync(join(dir, '.monitor-status'), 'utf8').trim();
+  // Distinct cursor per poll, fixed msg_id so every wake renders the same LINE.
+  const wake = (k: number) => ({ cursor: 10 + k, events: [{ event: 'message_received', from: 'Coord', msg_id: 1 }] as NotifyEvent[] });
+
+  it('clears stray text so the submitted wake is the clean line, not stray+line', async () => {
+    const tmux = composerTmux('draft note I never sent');   // unsubmitted human text
+    const { fetch } = scriptedFetch(
+      [{ cursor: 1, events: [] }, wake(0)],
+      (_url, i) => { if (i === 2) mon.stop(); },
+    );
+    let mon: ReturnType<typeof createMonitor>;
+    mon = createMonitor({ name: 'A', agentDir: dir, cfg: CFG({ batch_ms: 0 }), deps: makeDeps(fetch, tmux) });
+    await mon.prime();
+    await mon.run(1);
+    expect(tmux.submitted).toEqual([LINE]);   // exactly the wake — no 'draft note' prefix
+    expect(tmux.buffer()).toBe('');           // composer left clean
+    expect(status()).toBe('armed');
+  });
+
+  it('delivers despite an open slash-command menu, and the stray text does not wedge the next injection', async () => {
+    const tmux = composerTmux('/');            // a lone '/' left the slash menu open — captures Enter
+    const { fetch } = scriptedFetch(
+      [{ cursor: 1, events: [] }, wake(0), wake(1)],
+      (_url, i) => { if (i === 3) mon.stop(); },
+    );
+    let mon: ReturnType<typeof createMonitor>;
+    mon = createMonitor({ name: 'A', agentDir: dir, cfg: CFG({ batch_ms: 0 }), deps: makeDeps(fetch, tmux) });
+    await mon.prime();
+    await mon.run(1);
+    // Both wakes submit as clean lines; no lingering wedge from the stray '/'.
+    expect(tmux.submitted).toHaveLength(2);
+    expect(tmux.submitted.every(m => m === LINE)).toBe(true);
+    expect(status()).toBe('armed');
+  });
+});
