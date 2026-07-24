@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
   resolveEndpoint, resolveApiToken, readDaemonConfig, filterEvents, formatNotificationLine,
-  looksModal, createMonitor,
+  looksModal, looksApiError, looksRunning, createMonitor,
   type NotifyEvent, type MonitorDeps, type FetchResponse,
 } from '../src/monitor.js';
 import type { MonitorConfig } from '../src/config.js';
@@ -262,6 +262,24 @@ describe('looksModal', () => {
   });
 });
 
+describe('looksApiError / looksRunning (issue #19 turn-outcome heuristics)', () => {
+  it('flags a turn whose tail is an API Error line', () => {
+    expect(looksApiError('running get_messages…\n⎿  API Error: Claude Code is unable to respond (usage policy)\n')).toBe(true);
+    expect(looksApiError('API Error: 400 invalid_request_error')).toBe(true);
+  });
+  it('does not flag a clean completed turn', () => {
+    expect(looksApiError('assistant: replied to Coord and drained the mail.\n> ')).toBe(false);
+  });
+  it('detects a running turn from the "esc to interrupt" footer or elapsed meter', () => {
+    expect(looksRunning('✻ Cerebrating… (esc to interrupt)')).toBe(true);
+    expect(looksRunning('· Working… (12s · ↓ 1.2k tokens)')).toBe(true);
+  });
+  it('treats a quiet idle / errored pane as not running', () => {
+    expect(looksRunning('assistant: done.\n> ')).toBe(false);
+    expect(looksRunning('⎿  API Error: usage policy\n> ')).toBe(false);
+  });
+});
+
 describe('Monitor.prime', () => {
   it('primes at tip, records the cursor, and marks armed', async () => {
     const { fetch, calls } = scriptedFetch([{ cursor: 128, events: [] }]);
@@ -405,5 +423,84 @@ describe('Monitor.run — delivery', () => {
     await mon.prime();
     await mon.run(1);
     expect(calls()).toHaveLength(1);        // only the prime fetch happened
+  });
+});
+
+describe('Monitor.run — turn-outcome degradation (issue #19: refusal-wedge)', () => {
+  // A wedged session: delivery keeps succeeding (status looks armed) but every
+  // delivered wake's turn dies with `API Error:`. After N consecutive such turns
+  // the monitor must degrade `.monitor-status`, then re-arm on the first turn that
+  // completes cleanly. The pane the monitor captures during turn observation is
+  // what encodes the outcome.
+  const API_ERROR_PANE = 'ran get_messages\n⎿  API Error: Claude Code is unable to respond (usage policy)\n';
+  const COMPLETED_PANE = 'assistant: replied to Coord and drained the mail.\n> ';
+  const status = () => readFileSync(join(dir, '.monitor-status'), 'utf8').trim();
+
+  it('degrades after N consecutive API-error turns and re-arms on a completed turn', async () => {
+    const N = 3;
+    let pane = API_ERROR_PANE;
+    const tmux = fakeTmux({ pane: () => pane });
+    // prime, then N api-error wakes, then one final wake whose turn completes cleanly.
+    const wake = (k: number) => ({ cursor: 10 + k, events: [{ event: 'message_received', from: 'Coord', msg_id: k }] as NotifyEvent[] });
+    const { fetch } = scriptedFetch(
+      [{ cursor: 1, events: [] }, ...Array.from({ length: N + 1 }, (_, k) => wake(k))],
+      (_url, i) => { if (i === N + 2) mon.stop(); },   // stop on the quiet poll after the last delivery
+    );
+    let mon: ReturnType<typeof createMonitor>;
+    const deps = makeDeps(fetch, tmux);
+    mon = createMonitor({ name: 'A', agentDir: dir, cfg: CFG({ batch_ms: 0, turn_fail_threshold: N }), deps });
+
+    let delivered = 0;
+    const perTurnStatus: string[] = [];
+    const origSend = tmux.sendText;
+    tmux.sendText = async (n, t) => {
+      if (delivered > 0) perTurnStatus.push(status());   // status left by the PREVIOUS turn's observation
+      await origSend(n, t);
+      delivered++;
+      if (delivered === N + 1) pane = COMPLETED_PANE;     // the final turn completes cleanly
+    };
+
+    await mon.prime();
+    await mon.run(1);
+
+    // perTurnStatus[k] is the status after delivered turn (k+1). The first N-1 stay
+    // armed (streak below N); the Nth reading (after the Nth api-error turn) degrades.
+    expect(perTurnStatus).toEqual([
+      'armed',                                   // after turn 1 (streak 1)
+      'armed',                                   // after turn 2 (streak 2)
+      'degraded: turns failing (api error)',     // after turn 3 (streak 3 === N)
+    ]);
+    expect(status()).toBe('armed');              // after the final completed turn: re-armed
+    expect(tmux.sent).toHaveLength(N + 1);       // delivery itself never stopped
+  });
+
+  it('does not degrade when API-error turns are broken up by a completed turn (needs CONSECUTIVE)', async () => {
+    let pane = API_ERROR_PANE;
+    const tmux = fakeTmux({ pane: () => pane });
+    // err, err, COMPLETED, err, err — never 3 in a row, so with N=3 it must stay armed.
+    const outcomes = [API_ERROR_PANE, API_ERROR_PANE, COMPLETED_PANE, API_ERROR_PANE, API_ERROR_PANE];
+    const wake = (k: number) => ({ cursor: 10 + k, events: [{ event: 'message_received', from: 'Coord', msg_id: k }] as NotifyEvent[] });
+    const { fetch } = scriptedFetch(
+      [{ cursor: 1, events: [] }, ...outcomes.map((_, k) => wake(k))],
+      (_url, i) => { if (i === outcomes.length + 1) mon.stop(); },
+    );
+    let mon: ReturnType<typeof createMonitor>;
+    mon = createMonitor({ name: 'A', agentDir: dir, cfg: CFG({ batch_ms: 0, turn_fail_threshold: 3 }), deps: makeDeps(fetch, tmux) });
+
+    let delivered = 0;
+    const seen: string[] = [];
+    const origSend = tmux.sendText;
+    tmux.sendText = async (n, t) => {
+      if (delivered > 0) seen.push(status());
+      pane = outcomes[delivered];                // set THIS turn's outcome before it is observed
+      await origSend(n, t);
+      delivered++;
+    };
+
+    await mon.prime();
+    await mon.run(1);
+    seen.push(status());                          // final turn's outcome
+    expect(seen).not.toContain('degraded: turns failing (api error)');
+    expect(status()).toBe('armed');
   });
 });
