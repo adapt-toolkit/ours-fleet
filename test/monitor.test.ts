@@ -69,7 +69,10 @@ function makeDeps(fetch: MonitorDeps['fetch'], tmux: FakeTmux, over: Partial<Mon
     fetch,
     tmux,
     isAlive: () => true,
-    sleep: async (ms: number) => { clock += ms; },
+    // Virtual clock, but yield to the macrotask queue so a runaway loop in the
+    // monitor surfaces as a vitest timeout instead of starving timers and hanging
+    // the worker (a microtask-only sleep never lets the test timeout fire).
+    sleep: async (ms: number) => { clock += ms; await new Promise(r => setImmediate(r)); },
     now: () => clock,
     log: () => {},
     env: {},
@@ -251,6 +254,16 @@ describe('formatNotificationLine', () => {
 });
 
 describe('looksModal', () => {
+  // The composer Claude Code renders when it is idle and injectable. `❯` is its
+  // ordinary prompt glyph, so it is present in essentially every pane capture —
+  // it must never on its own make a pane read as modal.
+  const COMPOSER = [
+    '╭──────────────────────────────────────────────────────────╮',
+    '│ ❯                                                        │',
+    '╰──────────────────────────────────────────────────────────╯',
+    '  ? for shortcuts',
+  ].join('\n');
+
   it('detects a "Do you want" trust/permission dialog', () => {
     expect(looksModal('Do you want to proceed?\n❯ 1. Yes\n  2. No')).toBe(true);
   });
@@ -259,6 +272,90 @@ describe('looksModal', () => {
   });
   it('does not flag ordinary transcript text', () => {
     expect(looksModal('The agent replied with 3 ideas and a summary.\n> ')).toBe(false);
+  });
+
+  // ── true positives: real dialogs must keep reading as modal ────────────────
+  // The guard exists so the monitor never presses Enter into a live dialog;
+  // narrowing it must not neuter it.
+
+  it('detects a boxed permission dialog (pointer on a numbered option)', () => {
+    expect(looksModal([
+      '⏺ Update(src/monitor.ts)',
+      '╭─────────────────────────────────────────────────────────╮',
+      '│ Do you want to make this edit to monitor.ts?             │',
+      '│ ❯ 1. Yes                                                │',
+      "│   2. Yes, and don't ask again this session               │",
+      '│   3. No, and tell Claude what to do differently (esc)   │',
+      '╰─────────────────────────────────────────────────────────╯',
+    ].join('\n'))).toBe(true);
+  });
+
+  it('detects the MCP-server dialog, which carries no "Do you want" text', () => {
+    // Verbatim shape of a dialog this monitor really halted on.
+    expect(looksModal([
+      'New MCP server found in this project: shakhmatov',
+      '',
+      '❯ 1. Use this MCP server',
+      '  2. Use this MCP server and add to project settings',
+      '  3. Continue without using this MCP server',
+      '',
+      'Enter to confirm · Esc to cancel',
+    ].join('\n'))).toBe(true);
+  });
+
+  it('detects a dialog captured mid-redraw, with no pointer row on screen', () => {
+    // The pane can be captured between frames, before the `❯` row is painted.
+    // The dialog's own markers plus its numbered options still identify it.
+    expect(looksModal([
+      'New MCP server found in this project: shakhmatov',
+      '',
+      '  1. Use this MCP server',
+      '  2. Use this MCP server and add to project settings',
+      '  3. Continue without using this MCP server',
+      '',
+      'Enter to confirm · Esc to cancel',
+    ].join('\n'))).toBe(true);
+  });
+
+  // ── false positives: a numbered list is not a dialog ───────────────────────
+  // `❯` sits in the composer on every capture, so requiring it "somewhere in the
+  // pane" plus "a numbered list somewhere in the pane" flags ordinary output.
+
+  it('does not flag a prose numbered list with the composer prompt on screen', () => {
+    expect(looksModal([
+      '⏺ Three sessions are running:',
+      '  1) ГРАФИК  2) WATCHTOWER  3) OURS-FLEET',
+      '',
+      COMPOSER,
+    ].join('\n'))).toBe(false);
+  });
+
+  it('does not flag markdown numbered steps with the composer prompt on screen', () => {
+    expect(looksModal([
+      '⏺ To set it up:',
+      '',
+      '  1. Install the thing',
+      '  2. Run the thing',
+      '  3. Profit',
+      '',
+      COMPOSER,
+    ].join('\n'))).toBe(false);
+  });
+
+  it('does not flag a numbered list sitting directly above the composer', () => {
+    // Adjacency alone is not the signal: a transcript list can end one line above
+    // the composer's `❯`. The pointer must sit ON a numbered option.
+    expect(looksModal('  1. Install the thing\n  2. Run the thing\n❯ ')).toBe(false);
+  });
+
+  it('does not flag tabular output that merely starts with a number', () => {
+    expect(looksModal(`  1 | 20260626_initial | 1\n  2 | 20260701_wakes | 1\n${COMPOSER}`)).toBe(false);
+  });
+
+  it('does not flag the assistant merely asking "do you want …" in prose', () => {
+    // Claude Code's own closing question. No numbered options ⇒ not a dialog, so
+    // it must not hold the wake hostage.
+    expect(looksModal(`⏺ Tests pass. Do you want me to open the PR?\n\n${COMPOSER}`)).toBe(false);
   });
 });
 
@@ -415,6 +512,60 @@ describe('Monitor.run — delivery', () => {
     await mon.run(1);
     expect(tmux.sent).toHaveLength(1);
     expect(tmux.sent[0]).toContain('#9');
+  });
+
+  it('gives up on a persistent modal and degrades instead of waiting forever', async () => {
+    // A pane the modal heuristic never clears (a real dialog nobody answers, or a
+    // false positive). Delivery must not spin silently: it has to stop, leave an
+    // explicit status, and still never press Enter into the dialog.
+    const tmux = fakeTmux({ pane: () => 'Do you want to proceed?\n❯ 1. Yes\n  2. No' });
+    const { fetch } = scriptedFetch(
+      [{ cursor: 1, events: [] }, { cursor: 2, events: [{ event: 'message_received', from: 'C', msg_id: 1 }] }],
+      (_url, i) => { if (i === 2) mon.stop(); },      // stop on the poll after delivery gave up
+    );
+    let mon: ReturnType<typeof createMonitor>;
+    const base = makeDeps(fetch, tmux);
+    const modalWaitMs: number[] = [];
+    mon = createMonitor({
+      name: 'A', agentDir: dir, cfg: CFG({ batch_ms: 0 }),
+      deps: { ...base, sleep: async (ms: number) => { modalWaitMs.push(ms); await base.sleep(ms); } },
+    });
+    await mon.prime();
+    await mon.run(1);                                 // must return, not hang
+
+    expect(tmux.sent).toEqual([]);                    // never typed into the dialog
+    expect(readFileSync(join(dir, '.monitor-status'), 'utf8')).toMatch(/degraded: modal wedge/);
+    // Bounded, but not trigger-happy: long enough for a human to answer a real
+    // dialog, short enough that a wedge surfaces in the status within minutes.
+    const waited = modalWaitMs.filter(ms => ms === 5_000).reduce((a, b) => a + b, 0);
+    expect(waited).toBeGreaterThanOrEqual(60_000);
+    expect(waited).toBeLessThanOrEqual(300_000);
+  });
+
+  it('re-arms after a modal wedge once the pane clears on a later wake', async () => {
+    // The degraded status must not be sticky: the next wake that gets through
+    // re-arms it.
+    let modal = true;
+    const tmux = fakeTmux({ pane: () => (modal ? 'Do you want to proceed?\n❯ 1. Yes\n  2. No' : 'idle\n> ') });
+    const { fetch } = scriptedFetch(
+      [
+        { cursor: 1, events: [] },
+        { cursor: 2, events: [{ event: 'message_received', from: 'C', msg_id: 1 }] },  // wedges
+        { cursor: 3, events: [{ event: 'message_received', from: 'C', msg_id: 2 }] },  // delivers
+      ],
+      (_url, i) => { if (i === 2) modal = false; if (i === 3) mon.stop(); },
+    );
+    let mon: ReturnType<typeof createMonitor>;
+    const statuses: string[] = [];
+    mon = createMonitor({ name: 'A', agentDir: dir, cfg: CFG({ batch_ms: 0 }), deps: makeDeps(fetch, tmux) });
+    const orig = tmux.sendText;
+    tmux.sendText = async (n, t) => { statuses.push(readFileSync(join(dir, '.monitor-status'), 'utf8').trim()); await orig(n, t); };
+    await mon.prime();
+    await mon.run(1);
+
+    expect(tmux.sent).toHaveLength(1);                          // only the second wake landed
+    expect(statuses[0]).toMatch(/degraded: modal wedge/);       // the wedge was recorded…
+    expect(readFileSync(join(dir, '.monitor-status'), 'utf8').trim()).toBe('armed');  // …and cleared
   });
 
   it('is disabled short-circuit: run() with a fatal prime never polls the loop', async () => {
