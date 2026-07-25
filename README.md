@@ -268,7 +268,12 @@ straight into the console. It is a deterministic program whose lifetime is fused
 the tmux session — it primes the notification cursor *before* the session launches
 (no missed arrivals), cannot be orphaned or left deaf-but-armed, and writes its
 health to `<agentDir>/.monitor-status` (`armed | degraded | failed`), surfaced in
-`ours-fleet status`/`doctor`. The agent's briefing tells it **not** to arm an
+`ours-fleet status`/`doctor`. Injection is held while the pane shows a modal dialog,
+so an injected wake can never answer a trust/permission prompt; if the dialog is
+still up after 2 minutes the monitor gives up on that wake and records
+`degraded: modal wedge …` instead of waiting silently forever (the mail stays
+queued — the agent drains it on the next wake or at SessionStart). The agent's
+briefing tells it **not** to arm an
 in-session Monitor. Set `monitor.enabled: false` to keep the legacy behavior where
 the agent arms its own `ours-mcp watch`. `inject: full` (pushing message bodies
 inline) is on the roadmap and needs two new ours-mcp daemon endpoints; today all

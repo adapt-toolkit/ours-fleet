@@ -60,6 +60,15 @@ const BOOT_GRACE_MS = 15_000;         // hold injection until the TUI is up
 const POST_VERIFY_MS = 1_000;
 const MAX_ENTER_RETRIES = 2;
 const MODAL_RETRY_MS = 5_000;
+// How long delivery may wait on a modal before giving up. Unbounded waiting made
+// any modal — real or false-positive — wedge wake delivery forever while
+// `.monitor-status` still read `armed`, so the failure was invisible from outside.
+// 2 minutes: long enough that a human answering a real dialog is not punished with
+// a spurious `degraded`, short enough that a wedge shows up in the status while
+// it still matters. Giving up drops nothing — the events stay covered by
+// unread.json / the SessionStart backlog, and the next wake retries.
+const MODAL_GIVE_UP_MS = 120_000;
+const MAX_MODAL_WAITS = Math.floor(MODAL_GIVE_UP_MS / MODAL_RETRY_MS);
 // Keys that reset the composer to empty before we type a wake, so a human's
 // unsubmitted keystrokes can't concatenate with — or wedge (e.g. via an open
 // slash-command menu that captures Enter) — the injected line. C-e moves to end
@@ -216,17 +225,56 @@ export function formatNotificationLine(events: NotifyEvent[]): string {
   return `${PREFIX} ${compact} — run get_messages`;
 }
 
+// ─── Modal-dialog detection (design §3.2, refined empirically) ────────────────
+//
+// `❯` is Claude Code's ordinary composer prompt, so it is on screen in nearly
+// every capture. Testing for it *anywhere* in the pane therefore says nothing;
+// paired with "a numbered line anywhere", it flagged every prose list ("1) foo
+// 2) bar") and every markdown step list as a dialog. What actually distinguishes
+// a select dialog is that its pointer sits ON one of the numbered options.
+//
+// `[^\S\n]` is horizontal whitespace: unlike `\s` it cannot span a line break,
+// so these patterns can't stitch a `❯` in the composer onto a number ten lines up.
+
+/** `❯ 1. Yes` — the pointer on a numbered option. The shape of every CC dialog. */
+const POINTED_OPTION = /❯[^\S\n]*\d+[.)][^\S\n]+\S/;
+/** A dialog's own chrome. Neither is sufficient alone — see `looksModal`. */
+const DIALOG_MARKERS = [/\bDo you want\b/i, /\bEnter to confirm\b/i];
+/**
+ * A numbered option as a dialog paints it: line start (or a box border), then the
+ * number. Anchored so prose can't match mid-sentence ("…rewrote 3. Then we…").
+ */
+const OPTION_LINE = /^[^\S\n]*(?:[│┃|][^\S\n]*)?(?:❯[^\S\n]*)?\d+[.)][^\S\n]+\S/;
+/** How far from a marker line the options may sit (footers trail them, questions lead). */
+const OPTION_WINDOW = 10;
+/** Options rendered inline on the marker's own line: "…? 1. Yes 2. No". */
+const INLINE_OPTION = /\d+[.)][^\S\n]+\S/g;
+
 /**
  * Heuristic: does the pane show a modal selection dialog we must not `Enter`
- * into? Markers are the deployed Claude Code trust/permission dialogs — a `❯`
- * pointer beside numbered options, or a "Do you want …" prompt (design §3.2,
- * open question (a): refine empirically). A running turn is NOT modal.
+ * into? Two independent signals, both requiring the *option* shape, not just a
+ * loose numbered line:
+ *
+ *  1. the `❯` pointer sitting on a numbered option — `❯ 1. Use this MCP server`;
+ *  2. a dialog marker ("Do you want …", "Enter to confirm") with ≥2 numbered
+ *     options within `OPTION_WINDOW` lines — this still catches a dialog captured
+ *     mid-redraw, before its pointer row is painted.
+ *
+ * A running turn, a prose list, and a markdown step list are all NOT modal.
+ * Erring modal is the safe direction (a wake is retried; an `Enter` into a live
+ * permission dialog is not undoable), which is why signal 2 is kept — but a bare
+ * marker with no options no longer suffices, because Claude Code closes turns
+ * with exactly that prose ("Do you want me to open the PR?").
  */
 export function looksModal(pane: string): boolean {
-  if (/Do you want\b/i.test(pane)) return true;
-  const hasPointer = /❯/.test(pane);
-  const hasNumbered = /(^|\n)\s*[❯>]?\s*\d+[.)]\s+\S/.test(pane);
-  return hasPointer && hasNumbered;
+  if (POINTED_OPTION.test(pane)) return true;
+  const lines = pane.split('\n');
+  const marker = lines.findIndex(l => DIALOG_MARKERS.some(re => re.test(l)));
+  if (marker < 0) return false;
+  const from = Math.max(0, marker - OPTION_WINDOW);
+  const near = lines.slice(from, marker + OPTION_WINDOW + 1);
+  if (near.filter(l => OPTION_LINE.test(l)).length >= 2) return true;
+  return (lines[marker].match(INLINE_OPTION) ?? []).length >= 2;
 }
 
 /**
@@ -371,6 +419,9 @@ export class Monitor {
     const state = await this.awaitInjectable(pid);
     if (state !== 'ready') {
       if (state === 'offline') this.setStatus('degraded: offline during delivery');
+      else if (state === 'modal')
+        this.setStatus(`degraded: modal wedge — pane held a dialog for ` +
+          `${MODAL_GIVE_UP_MS / 1000}s, wake not injected`);
       return; // events remain covered by unread.json / SessionStart backlog
     }
     const line = formatNotificationLine(batch);
@@ -434,16 +485,23 @@ export class Monitor {
     for (const key of COMPOSER_CLEAR_KEYS) await this.deps.tmux.sendKey(this.name, key);
   }
 
-  /** Block until the console can accept input; classify offline/stopped/ready. */
-  private async awaitInjectable(pid: number): Promise<'ready' | 'offline' | 'stopped'> {
+  /**
+   * Block until the console can accept input; classify offline/stopped/ready, or
+   * `modal` when the pane still looks modal after `MODAL_GIVE_UP_MS`. The bound is
+   * what keeps a modal from wedging delivery silently: we still never `Enter` into
+   * the dialog, but the give-up is reported instead of retried forever.
+   */
+  private async awaitInjectable(pid: number): Promise<'ready' | 'offline' | 'stopped' | 'modal'> {
+    let modalWaits = 0;
     for (;;) {
       if (this.stopped) return 'stopped';
       if (!this.deps.isAlive(pid) || !(await this.deps.tmux.has(this.name))) return 'offline';
       const now = this.deps.now();
       if (now < this.bootDeadline) { await this.deps.sleep(this.bootDeadline - now); continue; }
       const pane = await safeCapture(this.deps.tmux, this.name);
-      if (looksModal(pane)) { await this.deps.sleep(MODAL_RETRY_MS); continue; }
-      return 'ready';
+      if (!looksModal(pane)) return 'ready';
+      if (modalWaits++ >= MAX_MODAL_WAITS) return 'modal';
+      await this.deps.sleep(MODAL_RETRY_MS);
     }
   }
 
