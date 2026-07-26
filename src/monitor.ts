@@ -302,11 +302,65 @@ export function looksRunning(pane: string): boolean {
   return false;
 }
 
-/** Is the injected line still sitting unsubmitted in the composer (bottom of pane)? */
+const COMPOSER_TOP = /^[^\S\n]*[╭┌][─━]/;
+const COMPOSER_BOTTOM = /^[^\S\n]*[╰└][─━]/;
+const COMPOSER_PROMPT = /^[^\S\n]*(?:[│┃|][^\S\n]*)?[❯›>][^\S\n]*$/;
+
+/**
+ * Remove wrapping-only whitespace and box chrome from composer rows. Notification
+ * lines contain no meaningful whitespace distinction, so this lets a fragment
+ * cross an arbitrary terminal wrap without matching unrelated transcript text.
+ */
+function normalizeComposerRows(rows: string[]): string {
+  return rows.map((raw, i) => {
+    let row = raw;
+    if (i > 0) row = row.replace(/^[^\S\n]*(?:[│┃|][^\S\n]*)?/, '');
+    row = row.replace(/[^\S\n]*(?:[│┃|])?[^\S\n]*$/, '');
+    return row;
+  }).join('').replace(/\s+/g, '');
+}
+
+/**
+ * Is the injected line still sitting unsubmitted in the composer?
+ *
+ * The footer has variable height and the line may wrap across any number of
+ * rows, so a fixed tail window cannot identify the composer. Prefer the final
+ * bordered composer region; for a borderless/truncated capture, require the
+ * notification prefix to follow a composer prompt. This keeps old submitted
+ * wake lines in the transcript from causing stray Enters.
+ */
 function stillInComposer(pane: string, line: string): boolean {
-  const frag = line.slice(0, 48);
-  const tail = pane.split('\n').slice(-4).join('\n');
-  return tail.includes(frag);
+  if (!pane) return false; // dead pane: do not waste Enters
+  const lines = pane.split('\n');
+
+  let bottom = -1;
+  for (let i = lines.length - 1; i >= 0; i--) {
+    if (COMPOSER_BOTTOM.test(lines[i])) { bottom = i; break; }
+  }
+  let top = -1;
+  if (bottom >= 0) {
+    for (let i = bottom - 1; i >= 0; i--) {
+      if (COMPOSER_TOP.test(lines[i])) { top = i; break; }
+    }
+  }
+
+  const from = top >= 0 ? top + 1 : 0;
+  const to = bottom >= 0 ? bottom : lines.length;
+  let wakeRow = -1;
+  let wakeColumn = -1;
+  for (let i = to - 1; i >= from; i--) {
+    const column = lines[i].lastIndexOf(PREFIX);
+    if (column >= 0) { wakeRow = i; wakeColumn = column; break; }
+  }
+  if (wakeRow < 0) return false;
+
+  // Without both box boundaries, only trust text visibly in a composer prompt.
+  // This is the safe fallback for borderless TUIs and truncated captures.
+  if (top < 0 && !COMPOSER_PROMPT.test(lines[wakeRow].slice(0, wakeColumn))) return false;
+
+  const rows = lines.slice(wakeRow, to);
+  rows[0] = rows[0].slice(wakeColumn);
+  return normalizeComposerRows(rows).includes(line.replace(/\s+/g, ''));
 }
 
 export interface MonitorOpts {
@@ -431,11 +485,24 @@ export class Monitor {
     // Verify submission for THIS line even if stop() arrives mid-flight: the text
     // is already in the composer and we want it submitted (at-least-once). A truly
     // dead pane makes safeCapture return '' ⇒ not-in-composer ⇒ breaks, no wasted Enter.
-    for (let i = 0; i < MAX_ENTER_RETRIES; i++) {
+    for (let i = 0; i < MAX_ENTER_RETRIES;) {
       await this.deps.sleep(POST_VERIFY_MS);
       const pane = await safeCapture(this.deps.tmux, this.name);
+      // A dialog can appear after the initial send. Never let a verification
+      // retry confirm it. Wait under the same bounded modal policy as initial
+      // injection, then re-capture immediately before considering Enter.
+      if (looksModal(pane)) {
+        const state = await this.awaitInjectable(pid);
+        if (state === 'ready') continue;
+        if (state === 'offline') this.setStatus('degraded: offline during injection verification');
+        else if (state === 'modal')
+          this.setStatus(`degraded: modal wedge during injection verification — ` +
+            `no Enter sent for ${MODAL_GIVE_UP_MS / 1000}s`);
+        return;
+      }
       if (!stillInComposer(pane, line)) { delivered = true; break; }
       await this.deps.tmux.sendKey(this.name, 'Enter');
+      i++;
     }
     if (!delivered) { this.setStatus('degraded: injection unverified'); return; }
     // The wake landed and a turn started; observe how that turn terminates so a

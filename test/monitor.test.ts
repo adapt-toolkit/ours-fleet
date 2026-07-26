@@ -498,6 +498,194 @@ describe('Monitor.run — delivery', () => {
     expect(entersSeen).toBeGreaterThanOrEqual(1);   // re-sent Enter at least once
   });
 
+  it('re-sends Enter when a wrapped composer line starts fifth from the bottom', async () => {
+    const pane = [
+      `│ ❯ ${LONG_WAKE.slice(0, -12)}`,
+      `│   ${LONG_WAKE.slice(-12)}`,
+      '╰──────────────────────────────────────────────────────────╯',
+      '  ? for shortcuts',
+      '  /rc',
+    ].join('\n');
+    expect(await retryEntersForPane(pane)).toBe(1);
+  });
+
+  async function retryEntersForPane(pane: string): Promise<number> {
+    let stuck = true;
+    let submitEnters = 0;
+    const tmux = fakeTmux({ pane: () => stuck ? pane : 'submitted\n> ' });
+    tmux.sendKey = async (_name, key) => {
+      if (key === 'Enter') {
+        submitEnters++;
+        stuck = false;
+      }
+    };
+    const { fetch } = scriptedFetch([
+      { cursor: 1, events: [] },
+      { cursor: 2, events: [{ event: 'message_received', from: 'FleetCoordinator', msg_id: 459 }] },
+    ]);
+    const mon = createMonitor({ name: 'A', agentDir: dir, cfg: CFG({ batch_ms: 0 }), deps: makeDeps(fetch, tmux) });
+    const orig = tmux.sendText;
+    tmux.sendText = async (n, t) => { await orig(n, t); mon.stop(); };
+    await mon.prime();
+    await mon.run(1);
+    return submitEnters;
+  }
+
+  const LONG_WAKE = '[fleet-monitor] 1 new message from FleetCoordinator (#459) — run get_messages';
+
+  it('keeps detecting an unwrapped composer line with a one-row footer', async () => {
+    const pane = [
+      `│ ❯ ${LONG_WAKE}`,
+      '╰──────────────────────────────────────────────────────────╯',
+      '  ? for shortcuts',
+    ].join('\n');
+    expect(await retryEntersForPane(pane)).toBe(1);
+  });
+
+  it('detects an unwrapped line at the borderless Codex composer prompt', async () => {
+    const pane = [
+      `› ${LONG_WAKE}`,
+      '',
+      '  gpt-5 high · ~/work',
+    ].join('\n');
+    expect(await retryEntersForPane(pane)).toBe(1);
+  });
+
+  it('detects a wrapped composer line with a one-row footer', async () => {
+    const pane = [
+      `│ ❯ ${LONG_WAKE.slice(0, 60)}`,
+      `│   ${LONG_WAKE.slice(60)}`,
+      '╰──────────────────────────────────────────────────────────╯',
+      '  ? for shortcuts',
+    ].join('\n');
+    expect(await retryEntersForPane(pane)).toBe(1);
+  });
+
+  it('detects a wrapped composer line above a three-row footer', async () => {
+    const pane = [
+      `│ ❯ ${LONG_WAKE.slice(0, 60)}`,
+      `│   ${LONG_WAKE.slice(60)}`,
+      '╰──────────────────────────────────────────────────────────╯',
+      '  ? for shortcuts',
+      '  install gh for PR status',
+      '  /rc',
+    ].join('\n');
+    expect(await retryEntersForPane(pane)).toBe(1);
+  });
+
+  it('detects a composer line wrapped across three rows', async () => {
+    const pane = [
+      `│ ❯ ${LONG_WAKE.slice(0, 26)}`,
+      `│   ${LONG_WAKE.slice(26, 52)}`,
+      `│   ${LONG_WAKE.slice(52)}`,
+      '╰──────────────────────────────────────────────────────────╯',
+      '  ? for shortcuts',
+    ].join('\n');
+    expect(await retryEntersForPane(pane)).toBe(1);
+  });
+
+  it('detects a composer line when its first 48 characters cross a wrap boundary', async () => {
+    const pane = [
+      `│ ❯ ${LONG_WAKE.slice(0, 24)}`,
+      `│   ${LONG_WAKE.slice(24)}`,
+      '╰──────────────────────────────────────────────────────────╯',
+      '  ? for shortcuts',
+    ].join('\n');
+    expect(await retryEntersForPane(pane)).toBe(1);
+  });
+
+  it('treats an empty capture as not in the composer and wastes no Enter', async () => {
+    expect(await retryEntersForPane('')).toBe(0);
+  });
+
+  it('never re-sends Enter and degrades when a modal opens after wake submission', async () => {
+    let sent = false;
+    let retryEnters = 0;
+    const tmux = fakeTmux({
+      pane: () => sent ? [
+        `❯ ${LONG_WAKE}`,
+        'Do you want to allow this action?',
+        '❯ 1. Yes',
+        '  2. No',
+      ].join('\n') : 'idle\n> ',
+    });
+    tmux.sendKey = async (_name, key) => {
+      if (key === 'Enter') retryEnters++;
+    };
+    const { fetch } = scriptedFetch(
+      [
+        { cursor: 1, events: [] },
+        { cursor: 2, events: [{ event: 'message_received', from: 'FleetCoordinator', msg_id: 459 }] },
+      ],
+      (_url, i) => { if (i === 2) mon.stop(); },
+    );
+    let mon: ReturnType<typeof createMonitor>;
+    mon = createMonitor({ name: 'A', agentDir: dir, cfg: CFG({ batch_ms: 0 }), deps: makeDeps(fetch, tmux) });
+    const orig = tmux.sendText;
+    tmux.sendText = async (n, t) => {
+      await orig(n, t);
+      sent = true;
+    };
+
+    await mon.prime();
+    await mon.run(1);
+
+    expect(retryEnters).toBe(0);
+    expect(readFileSync(join(dir, '.monitor-status'), 'utf8'))
+      .toMatch(/degraded: modal wedge during injection verification/);
+  });
+
+  it('resumes verification after a retry-path modal clears', async () => {
+    let sent = false;
+    let modal = true;
+    let stuck = true;
+    let retryEnters = 0;
+    const tmux = fakeTmux({
+      pane: () => {
+        if (!sent) return 'idle\n> ';
+        if (modal) return 'Do you want to allow this action?\n❯ 1. Yes\n  2. No';
+        if (stuck) return `│ ❯ ${LONG_WAKE}\n╰────────╯\n  ? for shortcuts`;
+        return 'submitted\n> ';
+      },
+    });
+    tmux.sendKey = async (_name, key) => {
+      if (key === 'Enter') {
+        retryEnters++;
+        stuck = false;
+        mon.stop();
+      }
+    };
+    const { fetch } = scriptedFetch([
+      { cursor: 1, events: [] },
+      { cursor: 2, events: [{ event: 'message_received', from: 'FleetCoordinator', msg_id: 459 }] },
+    ]);
+    const base = makeDeps(fetch, tmux);
+    let mon: ReturnType<typeof createMonitor>;
+    mon = createMonitor({
+      name: 'A',
+      agentDir: dir,
+      cfg: CFG({ batch_ms: 0 }),
+      deps: {
+        ...base,
+        sleep: async ms => {
+          await base.sleep(ms);
+          if (ms === 5_000) modal = false;
+        },
+      },
+    });
+    const orig = tmux.sendText;
+    tmux.sendText = async (n, t) => {
+      await orig(n, t);
+      sent = true;
+    };
+
+    await mon.prime();
+    await mon.run(1);
+
+    expect(retryEnters).toBe(1);
+    expect(readFileSync(join(dir, '.monitor-status'), 'utf8').trim()).toBe('armed');
+  });
+
   it('retries with backoff on a transient error, then delivers', async () => {
     const tmux = fakeTmux();
     const { fetch } = scriptedFetch([
