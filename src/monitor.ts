@@ -1,4 +1,4 @@
-import { existsSync, readFileSync, writeFileSync } from 'node:fs';
+import { existsSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 import type { MonitorConfig, NotifyEventType } from './config.js';
@@ -49,6 +49,10 @@ export interface MonitorDeps {
   timers: {
     set(fn: () => void, ms: number): ReturnType<typeof setTimeout>;
     clear(t: ReturnType<typeof setTimeout>): void;
+  };
+  /** Structured prompt delivery used by ACP sessions. Tmux remains the fallback. */
+  delivery?: {
+    submit(text: string): Promise<{ accepted: boolean; detail?: string }>;
   };
 }
 
@@ -311,6 +315,8 @@ function stillInComposer(pane: string, line: string): boolean {
 
 export interface MonitorOpts {
   name: string;
+  /** Ours identity whose notification stream is authoritative (may differ from role name). */
+  identity?: string;
   agentDir: string;
   cfg: MonitorConfig;
   deps: MonitorDeps;
@@ -325,12 +331,16 @@ export interface MonitorHandle {
 
 export class Monitor {
   private readonly name: string;
+  private readonly identity: string;
   private readonly cfg: MonitorConfig;
   private readonly deps: MonitorDeps;
   private readonly ep: ReturnType<typeof resolveEndpoint>;
   private readonly statusPath: string;
   private readonly cursorPath: string;
+  private readonly statePath: string;
   private cursor: number | null = null;
+  private deliveredCursor: number | null = null;
+  private pendingState: { count: number; eventTypes: string[]; attempts: number } | null = null;
   private fatal = false;
   private stopped = false;
   private bootDeadline = 0;
@@ -342,17 +352,26 @@ export class Monitor {
 
   constructor(o: MonitorOpts) {
     this.name = o.name;
+    this.identity = o.identity ?? o.name;
     this.cfg = o.cfg;
     this.deps = o.deps;
     this.ep = resolveEndpoint(o.deps.env);
     this.statusPath = join(o.agentDir, '.monitor-status');
     this.cursorPath = join(o.agentDir, '.notify-cursor');
+    this.statePath = join(o.agentDir, '.monitor-state.json');
     const n = o.cfg.turn_fail_threshold;
     this.turnFailThreshold = typeof n === 'number' && n >= 1 ? n : DEFAULT_TURN_FAIL_THRESHOLD;
   }
 
-  /** Prime at the stream tip (or resume a persisted cursor if the daemon is down). */
+  /** Resume the last delivered cursor; only a brand-new monitor primes at stream tip. */
   async prime(): Promise<void> {
+    const persisted = this.readPersistedCursor();
+    if (persisted !== null) {
+      this.cursor = persisted;
+      this.deliveredCursor = persisted;
+      this.setStatus('armed');
+      return;
+    }
     try {
       const body = await this.doFetch('tip', LONGPOLL_TIMEOUT_MS);
       this.cursor = typeof body.cursor === 'number' ? body.cursor : 0;
@@ -363,7 +382,7 @@ export class Monitor {
         this.fatal = true;
         this.setStatus(`failed: ${e.message}`);
       } else {
-        this.cursor = this.readPersistedCursor();
+        this.cursor = null;
         this.setStatus(`degraded: prime failed (${msg(e)})`);
       }
     }
@@ -374,6 +393,7 @@ export class Monitor {
     if (this.fatal) return;
     this.bootDeadline = this.deps.now() + BOOT_GRACE_MS;
     let backoff = 0;
+    const pending: NotifyEvent[] = [];
     while (!this.stopped) {
       if (!this.deps.isAlive(pid)) { this.setStatus('degraded: session offline'); return; }
       let body: { cursor?: number; events?: NotifyEvent[] };
@@ -388,11 +408,34 @@ export class Monitor {
         await this.deps.sleep(backoff);
         continue;
       }
-      this.advance(body.cursor);
+      this.advance(body.cursor, false);
       const batch = filterEvents(body.events ?? [], this.cfg.wake_sources);
-      if (batch.length === 0) continue;
-      await this.coalesce(batch);
-      await this.deliver(pid, batch);
+      pending.push(...batch);
+      if (pending.length === 0) {
+        this.persistCursor();
+        continue;
+      }
+      this.pendingState = {
+        count: pending.length,
+        eventTypes: uniq(pending.map(event => event.event ?? 'unknown')),
+        attempts: (this.pendingState?.attempts ?? 0) + 1,
+      };
+      this.persistState();
+      await this.coalesce(pending);
+      // Do not durably commit this cursor until the session explicitly accepts
+      // the wake. If delivery fails or the runner crashes, the daemon replays
+      // from the last committed cursor and the wake is attempted again.
+      let accepted = false;
+      try {
+        accepted = await this.deliver(pid, pending);
+      } catch (e) {
+        this.setStatus(`degraded: delivery failed (${msg(e)})`);
+      }
+      if (accepted) {
+        pending.length = 0;
+        this.pendingState = null;
+        this.persistCursor();
+      }
     }
   }
 
@@ -410,21 +453,30 @@ export class Monitor {
     if (this.stopped) return;
     try {
       const more = await this.doFetch(String(this.cursor ?? 0), COALESCE_HOLD_MS);
-      this.advance(more.cursor);
+      this.advance(more.cursor, false);
       batch.push(...filterEvents(more.events ?? [], this.cfg.wake_sources));
     } catch { /* no stragglers / abort — deliver what we have */ }
   }
 
-  private async deliver(pid: number, batch: NotifyEvent[]): Promise<void> {
+  private async deliver(pid: number, batch: NotifyEvent[]): Promise<boolean> {
+    const line = formatNotificationLine(batch);
+    if (this.deps.delivery) {
+      const result = await this.deps.delivery.submit(line);
+      if (!result.accepted) {
+        this.setStatus(`degraded: ACP prompt not accepted${result.detail ? ` (${result.detail})` : ''}`);
+        return false;
+      }
+      this.recordTurn('completed');
+      return true;
+    }
     const state = await this.awaitInjectable(pid);
     if (state !== 'ready') {
       if (state === 'offline') this.setStatus('degraded: offline during delivery');
       else if (state === 'modal')
         this.setStatus(`degraded: modal wedge — pane held a dialog for ` +
           `${MODAL_GIVE_UP_MS / 1000}s, wake not injected`);
-      return; // events remain covered by unread.json / SessionStart backlog
+      return false;
     }
-    const line = formatNotificationLine(batch);
     await this.clearComposer();                        // start from an empty composer
     await this.deps.tmux.sendText(this.name, line);   // send-keys -l + Enter
     let delivered = false;
@@ -433,15 +485,20 @@ export class Monitor {
     // dead pane makes safeCapture return '' ⇒ not-in-composer ⇒ breaks, no wasted Enter.
     for (let i = 0; i < MAX_ENTER_RETRIES; i++) {
       await this.deps.sleep(POST_VERIFY_MS);
-      const pane = await safeCapture(this.deps.tmux, this.name);
-      if (!stillInComposer(pane, line)) { delivered = true; break; }
+      const capture = await safeCapture(this.deps.tmux, this.name);
+      if (!capture.ok) {
+        this.setStatus('degraded: capture failed during injection verification');
+        return false;
+      }
+      if (!stillInComposer(capture.pane, line)) { delivered = true; break; }
       await this.deps.tmux.sendKey(this.name, 'Enter');
     }
-    if (!delivered) { this.setStatus('degraded: injection unverified'); return; }
+    if (!delivered) { this.setStatus('degraded: injection unverified'); return false; }
     // The wake landed and a turn started; observe how that turn terminates so a
     // refusal-wedge (every turn dies with `API Error:` while delivery stays green)
     // becomes visible in `.monitor-status` instead of masquerading as armed (#19).
     await this.observeTurnOutcome(pid);
+    return true;
   }
 
   /**
@@ -455,9 +512,13 @@ export class Monitor {
     for (let i = 0; i < TURN_OBSERVE_POLLS; i++) {
       if (this.stopped) return;                                  // shutting down — leave status
       if (!this.deps.isAlive(pid) || !(await this.deps.tmux.has(this.name))) return; // loop marks offline
-      const pane = await safeCapture(this.deps.tmux, this.name);
-      if (looksApiError(pane)) { this.recordTurn('api-error'); return; }
-      if (!looksRunning(pane)) { this.recordTurn('completed'); return; }
+      const capture = await safeCapture(this.deps.tmux, this.name);
+      if (!capture.ok) {
+        this.setStatus('degraded: capture failed during turn observation');
+        return;
+      }
+      if (looksApiError(capture.pane)) { this.recordTurn('api-error'); return; }
+      if (!looksRunning(capture.pane)) { this.recordTurn('completed'); return; }
       await this.deps.sleep(TURN_OBSERVE_INTERVAL_MS);
     }
     this.recordTurn('inconclusive');   // still running at give-up: hold the streak, don't re-arm
@@ -498,8 +559,13 @@ export class Monitor {
       if (!this.deps.isAlive(pid) || !(await this.deps.tmux.has(this.name))) return 'offline';
       const now = this.deps.now();
       if (now < this.bootDeadline) { await this.deps.sleep(this.bootDeadline - now); continue; }
-      const pane = await safeCapture(this.deps.tmux, this.name);
-      if (!looksModal(pane)) return 'ready';
+      const capture = await safeCapture(this.deps.tmux, this.name);
+      if (!capture.ok) {
+        this.setStatus('degraded: capture failed while checking session readiness');
+        await this.deps.sleep(MODAL_RETRY_MS);
+        continue;
+      }
+      if (!looksModal(capture.pane)) return 'ready';
       if (modalWaits++ >= MAX_MODAL_WAITS) return 'modal';
       await this.deps.sleep(MODAL_RETRY_MS);
     }
@@ -511,7 +577,7 @@ export class Monitor {
     const timer = this.deps.timers.set(() => ctrl.abort(), holdMs);
     let resp: FetchResponse;
     try {
-      resp = await this.deps.fetch(`${this.ep.url(this.name)}?since=${since}`,
+      resp = await this.deps.fetch(`${this.ep.url(this.identity)}?since=${since}`,
         { headers: this.ep.headers, signal: ctrl.signal });
     } finally {
       this.deps.timers.clear(timer);
@@ -524,24 +590,63 @@ export class Monitor {
     return resp.json();
   }
 
-  private advance(cursor: number | undefined): void {
+  private advance(cursor: number | undefined, persist = true): void {
     if (typeof cursor === 'number' && cursor !== this.cursor) {
       this.cursor = cursor;
-      this.persistCursor();
+      if (persist) this.persistCursor();
+      else this.persistState();
     }
   }
 
   private persistCursor(): void {
-    try { if (this.cursor !== null) writeFileSync(this.cursorPath, `${this.cursor}\n`); }
+    try {
+      if (this.cursor !== null) {
+        this.deliveredCursor = this.cursor;
+        writeFileSync(this.cursorPath, `${this.cursor}\n`);
+        this.persistState();
+      }
+    }
     catch (e) { this.deps.log(`[${this.name}] monitor: failed to persist cursor: ${msg(e)}`); }
   }
 
   private readPersistedCursor(): number | null {
     try {
+      if (existsSync(this.statePath)) {
+        const state = JSON.parse(readFileSync(this.statePath, 'utf8')) as {
+          identity?: string; profileKey?: string; deliveredCursor?: number;
+        };
+        if ((state.identity !== undefined && state.identity !== this.identity)
+            || (state.profileKey !== undefined && state.profileKey !== this.ep.origin))
+          return null;
+        if (typeof state.deliveredCursor === 'number') {
+          this.deliveredCursor = state.deliveredCursor;
+          return state.deliveredCursor;
+        }
+      }
       if (!existsSync(this.cursorPath)) return null;
       const n = parseInt(readFileSync(this.cursorPath, 'utf8').trim(), 10);
+      if (Number.isFinite(n)) this.deliveredCursor = n;
       return Number.isFinite(n) ? n : null;
     } catch { return null; }
+  }
+
+  /** Atomically persist body-free delivery state; restart always resumes from deliveredCursor. */
+  private persistState(): void {
+    try {
+      const tmp = `${this.statePath}.${process.pid}.tmp`;
+      writeFileSync(tmp, JSON.stringify({
+        version: 1,
+        identity: this.identity,
+        profileKey: this.ep.origin,
+        observedCursor: this.cursor,
+        deliveredCursor: this.deliveredCursor,
+        pending: this.pendingState,
+        updatedAt: new Date(this.deps.now()).toISOString(),
+      }, null, 2) + '\n', { mode: 0o600 });
+      renameSync(tmp, this.statePath);
+    } catch (e) {
+      this.deps.log(`[${this.name}] monitor: failed to persist state: ${msg(e)}`);
+    }
   }
 
   private setStatus(s: string): void {
@@ -555,8 +660,11 @@ export function createMonitor(o: MonitorOpts): Monitor {
   return new Monitor(o);
 }
 
-async function safeCapture(tmux: MonitorTmux, name: string): Promise<string> {
-  try { return await tmux.capture(name); } catch { return ''; }
+async function safeCapture(
+  tmux: MonitorTmux, name: string,
+): Promise<{ ok: true; pane: string } | { ok: false; pane: '' }> {
+  try { return { ok: true, pane: await tmux.capture(name) }; }
+  catch { return { ok: false, pane: '' }; }
 }
 
 const msg = (e: unknown): string => (e as Error)?.message ?? String(e);

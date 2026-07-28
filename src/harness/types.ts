@@ -1,4 +1,4 @@
-import type { ResolvedRole } from '../config.js';
+import type { CommonPermissions, ResolvedRole } from '../config.js';
 
 export interface PrereqCheck { name: string; ok: boolean; detail: string }
 export interface PrereqReport { ok: boolean; checks: PrereqCheck[] }
@@ -14,6 +14,12 @@ export interface SessionPrep {
   command?: string;
 }
 export interface Launch { argv: string[]; env: Record<string, string> }
+export interface AcpLaunch { argv: string[]; env: Record<string, string> }
+export interface PermissionTranslation {
+  native: Record<string, unknown>;
+  exact: boolean;
+  warnings: string[];
+}
 
 /** Harness-correct wording/tool names used to generate briefing.md. */
 export interface BriefingVocab {
@@ -42,6 +48,8 @@ export interface HarnessAdapter {
   validateOptions(opts: unknown): ValidationError[];
   prepareSession(role: ResolvedRole, dirs: RoleDirs): Promise<SessionPrep>;
   buildLaunch(role: ResolvedRole, mode: 'fresh' | 'resume', s: SessionState, prep: SessionPrep): Launch;
+  buildAcpLaunch?(role: ResolvedRole, prep: SessionPrep): AcpLaunch;
+  translatePermissions?(permissions: CommonPermissions): PermissionTranslation;
   vocabulary: BriefingVocab;
   exitPolicy: ExitPolicy;
 }

@@ -1,7 +1,7 @@
 {
   "name": "@ours.network/fleet",
   "version": "0.9.4",
-  "description": "Harness-agnostic fleet of persistent, identity-bound AI agents. Declarative fleet.yaml, tmux consoles, systemd/launchd supervision, ours.network messaging.",
+  "description": "Harness-agnostic fleet of persistent, identity-bound AI agents. Declarative fleet.yaml, tmux or ACP sessions, supervision, and ours.network messaging.",
   "type": "module",
   "license": "FSL-1.1-Apache-2.0",
   "repository": {
@@ -26,6 +26,7 @@
     "prepublishOnly": "npm run build && npm test"
   },
   "dependencies": {
+    "@agentclientprotocol/sdk": "^1.3.0",
     "commander": "^12.1.0",
     "yaml": "^2.5.0"
   },
