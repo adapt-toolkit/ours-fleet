@@ -7,6 +7,7 @@ import type {
   HarnessAdapter, RoleDirs, SessionPrep, SessionState, Launch, ValidationError,
 } from './types.js';
 import { registerAdapter } from './registry.js';
+import { bundledAcpAgent } from './acp-agent.js';
 
 interface ClaudeOptions {
   plugins?: Record<string, boolean>;
@@ -137,7 +138,8 @@ export function makeClaudeCodeAdapter(exec: Exec = realExec): HarnessAdapter {
         ? [...configured]
         : typeof configured === 'string'
           ? ['sh', '-c', configured]
-          : ['claude-agent-acp'];
+          : bundledAcpAgent(
+              '@agentclientprotocol/claude-agent-acp', 'claude-agent-acp', 'claude-agent-acp');
       return { argv, env: prep.env };
     },
 

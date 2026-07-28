@@ -75,7 +75,7 @@ The state dir contract:
 |---|---|---|
 | Node ≥ 20 | runs `ours-fleet` itself | nodejs.org, `apt`, or `brew` |
 | tmux | roles using `session: tmux` (the default) | `apt install tmux` / `brew install tmux` |
-| an ACP adapter | roles using `session: acp` | `codex-acp` or `claude-agent-acp` |
+| Node ≥ 22 | Claude roles using `session: acp` | required by the maintained Claude ACP adapter |
 | a harness CLI, logged in | the agent itself | e.g. Claude Code (`claude`) or Codex CLI (`codex`) |
 | `ours-mcp` daemon | identity + agent-to-agent messaging | `npm i -g @ours.network/mcp && ours-mcp start` |
 
@@ -90,6 +90,12 @@ npm i -g @ours.network/fleet
 ours-fleet init      # units/dirs/linger for this user
 ours-fleet doctor    # verifies everything above, with actionable messages
 ```
+
+The maintained Codex and Claude ACP adapters install as optional dependencies of
+`ours-fleet` and are resolved internally; users do not install adapter commands
+or add them to `PATH`. An explicit `session_options.acp.command` remains
+available for custom adapters. On Node 20–21, tmux and Codex ACP remain
+available, while maintained Claude ACP requires upgrading to Node 22.
 
 Each OS user manages their own fleet — to host roles under a sandboxed account,
 become that account and repeat.
@@ -123,21 +129,11 @@ ours-fleet spawn Coder --harness codex --model gpt-5.4 \
 Permanent spawns are written to `~/fleet.d/<Name>.yaml` — your hand-written
 `~/fleet.yaml` is **never** machine-edited. `ours-fleet rm <Name>` unspawns.
 
-From inside Claude Code: install the `ours-fleet` plugin (ships in this repo under
-`integrations/claude-code`) and say **"spawn ours agent …"** — the agent asks
-temp-vs-permanent, co-drafts the bio and persona with you, spawns, and arms
-oversight.
-
-From inside Codex, install the native fleet plugin:
-
-```sh
-npm i -g @ours.network/fleet-codex
-ours-fleet-codex-install
-```
-
-Start a new Codex session and say **"spawn an ours agent …"**. The bundled skill
-walks through lifetime, model, sandbox, approval policy, profile, launcher, and
-mail-monitor consent, then verifies the real tmux session and offers oversight.
+From inside Claude Code, Codex, or Hermes with the core `ours` plugin installed,
+say **"spawn an ours agent …"**. The core skill checks for `ours-fleet`, installs
+and initializes it when absent, then consults `ours-fleet docs` for the exact
+version-matched workflow. The older fleet-specific harness packages remain
+published for compatibility but are no longer required or installed by default.
 
 ## Oversight ("keep an eye")
 
@@ -165,6 +161,7 @@ roles:
 ## Command reference
 
 ```
+ours-fleet docs | man                 AI-friendly complete reference
 ours-fleet up|down|restart|force-restart [-c FILE] [Name...]
 ours-fleet config [-c FILE]         validate + print merged plan
 ours-fleet ls | attach | peek | logs [-f] | status <Name>
@@ -301,11 +298,11 @@ console later; no terminal UI is part of the monitor or session backend.
 
 ## Codex roles
 
-Install Codex, the native ours plugin, and the fleet skills once on the fleet host:
+Install Codex, the native ours plugin, and the fleet CLI once on the fleet host:
 
 ```sh
-npm i -g @ours.network/fleet-codex
-ours-fleet-codex-install
+npm i -g @ours.network/fleet
+ours-fleet init
 ours-fleet doctor --harness codex
 ```
 
@@ -407,7 +404,7 @@ cleanly as long as each role has its own `cwd` (the common case); two roles
 sharing an identical `cwd` could have their resumes cross — give them distinct
 working directories if that matters. MCP and monitor wiring is provided by
 [`@ours.network/codex`](https://github.com/adapt-toolkit/ours-mcp/tree/main/packages/codex);
-the native spawn/oversight skills are provided by `@ours.network/fleet-codex`.
+the core ours skill discovers fleet behavior through `ours-fleet docs`.
 `ours-fleet doctor --harness codex` verifies the CLI, ours plugin, and enhanced launcher/fallback.
 
 ## Learn more
