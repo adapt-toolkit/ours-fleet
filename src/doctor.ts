@@ -3,6 +3,7 @@ import { readFileSync } from 'node:fs';
 import { realExec, type Exec } from './exec.js';
 import { loadConfig, type ResolvedRole } from './config.js';
 import { getAdapter } from './harness/registry.js';
+import { resolveBundledAcpAgent } from './harness/acp-agent.js';
 import { agentDir, home, deriveXdgRuntimeDir } from './paths.js';
 import { resolveIsolation } from './isolation/policy.js';
 import { makeBubblewrapBackend } from './isolation/bubblewrap.js';
@@ -58,11 +59,14 @@ export async function doctor(
     detail: major >= 20 ? `v${process.versions.node}` : `v${process.versions.node} — need >= 20`,
   });
 
-  const tmux = await exec('tmux', ['-V']);
-  checks.push({
-    name: 'tmux', ok: tmux.code === 0,
-    detail: tmux.code === 0 ? tmux.stdout.trim() : 'not found — apt install tmux / brew install tmux',
-  });
+  const roles = loadConfigSafe(opts.configPath);
+  if (roles.length === 0 || roles.some(role => (role.session ?? 'tmux') === 'tmux')) {
+    const tmux = await exec('tmux', ['-V']);
+    checks.push({
+      name: 'tmux', ok: tmux.code === 0,
+      detail: tmux.code === 0 ? tmux.stdout.trim() : 'not found — apt install tmux / brew install tmux',
+    });
+  }
 
   const mcp = await exec('ours-mcp', ['--version']);
   checks.push({
@@ -103,7 +107,6 @@ export async function doctor(
   // opt-in per role (OQ-1), so a missing bwrap must not fail doctor for fleets that
   // don't use it. Only a role that DECLARES isolation and cannot get it under
   // `strict` is a hard failure.
-  const roles = loadConfigSafe(opts.configPath);
   const bw = await makeBubblewrapBackend(exec).available();
   checks.push({
     name: 'isolation: bubblewrap', ok: true,
@@ -180,6 +183,49 @@ export async function doctor(
     } catch (e) {
       checks.push({ name: h, ok: false, detail: (e as Error).message });
     }
+  }
+  for (const role of roles.filter(role => role.session === 'acp')) {
+    const configured = role.session_options?.acp?.command;
+    const bundled = configured == null
+      ? role.harness === 'codex'
+        ? resolveBundledAcpAgent(
+            '@agentclientprotocol/codex-acp', 'codex-acp', 'codex-acp')
+        : role.harness === 'claude-code'
+          ? resolveBundledAcpAgent(
+              '@agentclientprotocol/claude-agent-acp', 'claude-agent-acp', 'claude-agent-acp')
+          : undefined
+      : undefined;
+    const command = Array.isArray(configured)
+      ? configured[0]
+      : typeof configured === 'string'
+        ? configured.trim().split(/\s+/)[0]
+        : role.harness === 'codex'
+          ? 'codex-acp'
+          : role.harness === 'claude-code'
+            ? 'claude-agent-acp'
+            : '';
+    if (!command) {
+      checks.push({
+        name: `acp: ${role.name}`, ok: false,
+        detail: `harness '${role.harness}' has no default ACP agent; set session_options.acp.command`,
+      });
+      continue;
+    }
+    if (bundled?.bundled) {
+      checks.push({
+        name: `acp: ${role.name}`, ok: true,
+        detail: `${command} bundled with ours-fleet`,
+      });
+      continue;
+    }
+    const result = await exec('sh', ['-c', 'command -v "$1" >/dev/null 2>&1', 'sh', command]);
+    checks.push({
+      name: `acp: ${role.name}`,
+      ok: result.code === 0,
+      detail: result.code === 0
+        ? `${command} available`
+        : `${command} not found or failed — install the ACP adapter or set session_options.acp.command`,
+    });
   }
 
   return { ok: checks.every(c => c.ok), checks };

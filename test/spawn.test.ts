@@ -68,6 +68,16 @@ describe('spawnPermanent', () => {
     await spawnPermanent({ name: 'Worker2', configPath: customCfg }, d);
     expect(readFileSync(join(agentDir('Worker2'), '.config-path'), 'utf8')).toBe(`${customCfg}\n`);
   });
+
+  it('supports ACP for permanent roles', async () => {
+    const { d } = fakeDeps();
+    const file = await spawnPermanent({
+      name: 'AcpWorker', harness: 'codex', session: 'acp',
+    }, d);
+    const role = parse(readFileSync(file, 'utf8')).roles.AcpWorker;
+    expect(role.harness).toBe('codex');
+    expect(role.session).toBe('acp');
+  });
 });
 
 describe('spawn --model', () => {
@@ -156,5 +166,16 @@ describe('spawnTemp', () => {
     // Supervisor launched detached with the temp dir as its state — NOT inside a
     // tmux session named 'Scout' (which runOnce owns and kills for the agent).
     expect(launched).toEqual([{ binPath: '/b/ours-fleet', args: ['_run-temp', 'Scout'], dir: d }]);
+  });
+
+  it('supports ACP for temporary roles', async () => {
+    const d = await spawnTemp(
+      { name: 'AcpScout', harness: 'codex', session: 'acp' },
+      '/b/ours-fleet',
+      () => {},
+    );
+    const snap = parse(readFileSync(join(d, 'role.yaml'), 'utf8'));
+    expect(snap.harness).toBe('codex');
+    expect(snap.session).toBe('acp');
   });
 });

@@ -6,6 +6,7 @@ import type {
   HarnessAdapter, RoleDirs, SessionPrep, SessionState, Launch, ValidationError,
 } from './types.js';
 import { registerAdapter } from './registry.js';
+import { bundledAcpAgent } from './acp-agent.js';
 
 interface CodexOptions {
   launcher?: string;
@@ -33,7 +34,13 @@ const APPROVAL_POLICIES = ['untrusted', 'on-request', 'never'];
 /** Resolve & validate the per-role sandbox mode, throwing on an unknown value. */
 function sandboxMode(role: ResolvedRole): string | undefined {
   const s = (role.harness_options as CodexOptions | undefined)?.sandbox;
-  if (s == null) return undefined;
+  if (s == null) {
+    const filesystem = role.permissions?.filesystem;
+    if (filesystem === 'read-only') return 'read-only';
+    if (filesystem === 'unrestricted') return 'danger-full-access';
+    if (filesystem === 'workspace') return 'workspace-write';
+    return undefined;
+  }
   if (!SANDBOX_MODES.includes(s))
     throw new Error(`invalid harness_options.sandbox "${s}"; allowed: ${SANDBOX_MODES.join(', ')}`);
   return s;
@@ -43,7 +50,12 @@ function sandboxMode(role: ResolvedRole): string | undefined {
 function approvalPolicy(role: ResolvedRole): string | undefined {
   const o = role.harness_options as CodexOptions | undefined;
   const a = o?.approval ?? o?.permission_mode;
-  if (a == null) return undefined;
+  if (a == null) {
+    const approval = role.permissions?.approval;
+    if (approval === 'allow') return 'never';
+    if (approval === 'ask' || approval === 'deny') return 'on-request';
+    return undefined;
+  }
   if (!APPROVAL_POLICIES.includes(a))
     throw new Error(`invalid harness_options.approval "${a}"; allowed: ${APPROVAL_POLICIES.join(', ')}`);
   return a;
@@ -189,6 +201,32 @@ export function makeCodexAdapter(exec: Exec = realExec): HarnessAdapter {
         : [command, 'resume', '--last', ...flags, ...prep.argv,
             this.vocabulary.restartPrompt(role.identity, join(stateDir, 'WORKLOG.md'), role)];
       return { argv, env: prep.env };
+    },
+
+    buildAcpLaunch(role: ResolvedRole, prep: SessionPrep): Launch {
+      const configured = role.session_options?.acp?.command;
+      const argv = Array.isArray(configured)
+        ? [...configured]
+        : typeof configured === 'string'
+          ? ['sh', '-c', configured]
+          : bundledAcpAgent(
+              '@agentclientprotocol/codex-acp', 'codex-acp', 'codex-acp');
+      return { argv, env: prep.env };
+    },
+
+    translatePermissions(permissions) {
+      return {
+        native: {
+          approval: permissions.approval === 'allow' ? 'never' : 'on-request',
+          sandbox: permissions.filesystem === 'read-only'
+            ? 'read-only'
+            : permissions.filesystem === 'unrestricted'
+              ? 'danger-full-access'
+              : 'workspace-write',
+        },
+        exact: true,
+        warnings: [],
+      };
     },
 
     vocabulary: {

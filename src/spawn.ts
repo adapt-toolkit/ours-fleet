@@ -3,7 +3,11 @@ import { existsSync, mkdirSync, openSync, readFileSync, writeFileSync } from 'no
 import { join } from 'node:path';
 import { stringify } from 'yaml';
 import { agentDir, fleetDDir } from './paths.js';
-import { loadConfig, resolveMonitorConfig, type ResolvedRole, type RoleConfig } from './config.js';
+import {
+  loadConfig, resolveMonitorConfig, resolvePermissions,
+  type ApprovalMode, type FilesystemMode, type ResolvedRole, type RoleConfig,
+  type SessionBackendId, type UnattendedMode,
+} from './config.js';
 import { applyRole, up, type OpsDeps } from './ops.js';
 import { START_STAGGER_FILE } from './runner.js';
 
@@ -11,12 +15,16 @@ export interface SpawnOpts {
   name: string;
   temp?: boolean;
   harness?: string;
+  session?: SessionBackendId;
   mission?: string;
   identity?: string;
   cwd?: string;
   coordinator?: string;
   model?: string;
   permissionMode?: string;
+  approval?: ApprovalMode;
+  filesystem?: FilesystemMode;
+  unattended?: UnattendedMode;
   sandbox?: string;
   profile?: string;
   launcher?: string;
@@ -33,6 +41,7 @@ export interface SpawnOpts {
 function roleFromOpts(o: SpawnOpts, defaultHarness?: string): RoleConfig {
   const r: RoleConfig = {};
   if (o.harness) r.harness = o.harness;
+  if (o.session) r.session = o.session;
   if (o.identity) r.identity = o.identity;
   if (o.cwd) r.cwd = o.cwd;
   if (o.coordinator) r.coordinator = o.coordinator;
@@ -49,9 +58,28 @@ function roleFromOpts(o: SpawnOpts, defaultHarness?: string): RoleConfig {
   if (o.addDirs?.length) harnessOptions.add_dirs = o.addDirs;
   if (o.monitor === true) harnessOptions.monitor = true;
   if (Object.keys(harnessOptions).length) r.harness_options = harnessOptions;
+  if (o.approval || o.filesystem || o.unattended) {
+    r.permissions = {
+      ...(o.approval ? { approval: o.approval } : {}),
+      ...(o.filesystem ? { filesystem: o.filesystem } : {}),
+      ...(o.unattended ? { unattended: o.unattended } : {}),
+    };
+  }
   if (o.bioFile) r.bio = readFileSync(o.bioFile, 'utf8').trim();
   if (o.personaFile) r.persona = readFileSync(o.personaFile, 'utf8').trim();
   return r;
+}
+
+function validateSpawnOpts(o: SpawnOpts): void {
+  if (o.session && !['tmux', 'acp'].includes(o.session))
+    throw new Error(`invalid --session '${o.session}'; allowed: tmux, acp`);
+  if (o.approval && !['ask', 'allow', 'deny'].includes(o.approval))
+    throw new Error(`invalid --approval '${o.approval}'; allowed: ask, allow, deny`);
+  if (o.filesystem && !['read-only', 'workspace', 'unrestricted'].includes(o.filesystem))
+    throw new Error(
+      `invalid --filesystem '${o.filesystem}'; allowed: read-only, workspace, unrestricted`);
+  if (o.unattended && !['deny', 'wait'].includes(o.unattended))
+    throw new Error(`invalid --unattended '${o.unattended}'; allowed: deny, wait`);
 }
 
 function assertNameFree(o: SpawnOpts): void {
@@ -64,6 +92,7 @@ function assertNameFree(o: SpawnOpts): void {
 
 /** Permanent spawn: persist to ~/fleet.d/<Name>.yaml, then bring it up. */
 export async function spawnPermanent(o: SpawnOpts, deps: OpsDeps): Promise<string> {
+  validateSpawnOpts(o);
   assertNameFree(o);
   const cfg = loadConfig(o.configPath);
   mkdirSync(fleetDDir(), { recursive: true });
@@ -94,6 +123,7 @@ export async function spawnTemp(
   binPath: string,
   launch: SupervisorLauncher = detachedSupervisor,
 ): Promise<string> {
+  validateSpawnOpts(o);
   assertNameFree(o);
   const cfg = loadConfig(o.configPath);
   const defaultHarness = cfg.defaults.harness as string | undefined;
@@ -106,9 +136,11 @@ export async function spawnTemp(
     ...fromOpts,
     name: o.name,
     harness: o.harness ?? defaultHarness ?? 'claude-code',
+    session: o.session ?? (cfg.defaults.session as SessionBackendId | undefined) ?? 'tmux',
     identity: o.identity ?? o.name,
     model: o.model?.trim() || (cfg.defaults.model as string | undefined),
     harness_options: Object.keys(mergedHarnessOptions).length ? mergedHarnessOptions : undefined,
+    permissions: resolvePermissions(cfg.defaults.permissions, fromOpts.permissions),
     // Temp agents inherit the fleet-wide monitor defaults via the snapshot (design §2).
     monitor: resolveMonitorConfig(cfg.defaults.monitor, fromOpts.monitor),
     sourceFile: '(temp)',

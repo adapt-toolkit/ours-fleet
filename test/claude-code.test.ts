@@ -256,3 +256,25 @@ describe('validateOptions / prereqs', () => {
     expect(rep.checks[0].detail).toContain('not found');
   });
 });
+
+describe('buildAcpLaunch', () => {
+  it('uses the bundled Claude ACP adapter when supported and preserves the Node 20 fallback', () => {
+    const launch = makeClaudeCodeAdapter(okExec).buildAcpLaunch!(
+      role(), { argv: [], env: {} });
+    if (Number(process.versions.node.split('.')[0]) >= 22) {
+      expect(launch.argv[0]).toBe(process.execPath);
+      expect(launch.argv[1]).toMatch(
+        /@agentclientprotocol[/\\]claude-agent-acp[/\\]dist[/\\]index\.js$/);
+    } else {
+      expect(launch.argv).toEqual(['claude-agent-acp']);
+    }
+  });
+
+  it('preserves an explicit ACP command override', () => {
+    const launch = makeClaudeCodeAdapter(okExec).buildAcpLaunch!(
+      role({ session_options: { acp: { command: 'custom-claude-acp --flag' } } }),
+      { argv: [], env: {} },
+    );
+    expect(launch.argv).toEqual(['sh', '-c', 'custom-claude-acp --flag']);
+  });
+});

@@ -7,6 +7,7 @@ import type {
   HarnessAdapter, RoleDirs, SessionPrep, SessionState, Launch, ValidationError,
 } from './types.js';
 import { registerAdapter } from './registry.js';
+import { bundledAcpAgent } from './acp-agent.js';
 
 interface ClaudeOptions {
   plugins?: Record<string, boolean>;
@@ -22,7 +23,11 @@ const PERMISSION_MODES = ['default', 'acceptEdits', 'plan', 'dontAsk', 'bypassPe
 /** Resolve & validate the per-role permission mode, throwing on an unknown value. */
 function permissionMode(role: ResolvedRole): string | undefined {
   const pm = (role.harness_options as ClaudeOptions | undefined)?.permission_mode;
-  if (pm == null) return undefined;
+  if (pm == null) {
+    if (role.permissions?.approval === 'allow') return 'dontAsk';
+    if (role.permissions?.approval === 'deny') return 'plan';
+    return undefined;
+  }
   if (!PERMISSION_MODES.includes(pm))
     throw new Error(
       `invalid harness_options.permission_mode "${pm}"; allowed: ${PERMISSION_MODES.join(', ')}`);
@@ -125,6 +130,33 @@ export function makeClaudeCodeAdapter(exec: Exec = realExec): HarnessAdapter {
         : [...base, '--resume', s.sessionId,
             this.vocabulary.restartPrompt(role.identity, join(stateDir, 'WORKLOG.md'), role)];
       return { argv, env: prep.env };
+    },
+
+    buildAcpLaunch(role: ResolvedRole, prep: SessionPrep): Launch {
+      const configured = role.session_options?.acp?.command;
+      const argv = Array.isArray(configured)
+        ? [...configured]
+        : typeof configured === 'string'
+          ? ['sh', '-c', configured]
+          : bundledAcpAgent(
+              '@agentclientprotocol/claude-agent-acp', 'claude-agent-acp', 'claude-agent-acp');
+      return { argv, env: prep.env };
+    },
+
+    translatePermissions(permissions) {
+      const native = permissions.approval === 'allow'
+        ? 'dontAsk'
+        : permissions.approval === 'deny'
+          ? 'plan'
+          : 'default';
+      const exact = permissions.filesystem === 'workspace' && permissions.approval === 'ask';
+      return {
+        native: { permission_mode: native },
+        exact,
+        warnings: exact ? [] : [
+          'Claude permission modes do not exactly represent independent approval and filesystem intent; fleet isolation remains the outer boundary',
+        ],
+      };
     },
 
     vocabulary: {

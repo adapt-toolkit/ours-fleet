@@ -1,6 +1,6 @@
 ---
 name: oversee-agents
-description: Inspect, monitor, and unstick ours-fleet agents from Codex using their tmux consoles and supervisor state. Use when the user asks to keep an eye on agents, oversee spawned roles, check agent status, babysit a subagent, resolve a fleet prompt, or when Codex has just spawned a role and should verify its progress.
+description: Inspect, monitor, and unstick ours-fleet agents from Codex using their tmux or ACP session controls and supervisor state. Use when the user asks to keep an eye on agents, oversee spawned roles, check agent status, babysit a subagent, resolve a fleet prompt, or when Codex has just spawned a role and should verify its progress.
 ---
 
 # Oversee ours-fleet agents
@@ -8,6 +8,7 @@ description: Inspect, monitor, and unstick ours-fleet agents from Codex using th
 Use fleet state and console output as evidence:
 
 ```sh
+ours-fleet docs
 ours-fleet ls
 ours-fleet peek <Name> [lines]
 ours-fleet status <Name>
@@ -15,6 +16,9 @@ ours-fleet logs <Name>
 ours-fleet send <Name> "<text>"
 ours-fleet send <Name> --key <key>
 ```
+
+Text `send`, `peek`, and `attach` work for tmux and ACP. Raw `send --key` is
+tmux-only; use the `/permit` control shown by ACP `attach` for ACP permissions.
 
 ## Establish scope
 
