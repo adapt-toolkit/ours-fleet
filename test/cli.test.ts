@@ -44,6 +44,7 @@ describe('ours-fleet CLI', () => {
       expect(r.stdout).toContain('Both lifetimes support `--session acp`');
       expect(r.stdout).toContain('approval: ask|allow|deny');
       expect(r.stdout).toContain('@agentclientprotocol/codex-acp');
+      expect(r.stdout).toContain('bundled automatically');
       expect(r.stdout).toContain('Reliable mail wake');
     }
   });

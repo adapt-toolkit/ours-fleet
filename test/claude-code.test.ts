@@ -256,3 +256,21 @@ describe('validateOptions / prereqs', () => {
     expect(rep.checks[0].detail).toContain('not found');
   });
 });
+
+describe('buildAcpLaunch', () => {
+  it('uses the Claude ACP adapter bundled with ours-fleet by default', () => {
+    const launch = makeClaudeCodeAdapter(okExec).buildAcpLaunch!(
+      role(), { argv: [], env: {} });
+    expect(launch.argv[0]).toBe(process.execPath);
+    expect(launch.argv[1]).toMatch(
+      /@agentclientprotocol[/\\]claude-agent-acp[/\\]dist[/\\]index\.js$/);
+  });
+
+  it('preserves an explicit ACP command override', () => {
+    const launch = makeClaudeCodeAdapter(okExec).buildAcpLaunch!(
+      role({ session_options: { acp: { command: 'custom-claude-acp --flag' } } }),
+      { argv: [], env: {} },
+    );
+    expect(launch.argv).toEqual(['sh', '-c', 'custom-claude-acp --flag']);
+  });
+});

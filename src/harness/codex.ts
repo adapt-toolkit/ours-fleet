@@ -6,6 +6,7 @@ import type {
   HarnessAdapter, RoleDirs, SessionPrep, SessionState, Launch, ValidationError,
 } from './types.js';
 import { registerAdapter } from './registry.js';
+import { bundledAcpAgent } from './acp-agent.js';
 
 interface CodexOptions {
   launcher?: string;
@@ -208,7 +209,8 @@ export function makeCodexAdapter(exec: Exec = realExec): HarnessAdapter {
         ? [...configured]
         : typeof configured === 'string'
           ? ['sh', '-c', configured]
-          : ['codex-acp'];
+          : bundledAcpAgent(
+              '@agentclientprotocol/codex-acp', 'codex-acp', 'codex-acp');
       return { argv, env: prep.env };
     },
 

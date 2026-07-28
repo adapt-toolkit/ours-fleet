@@ -3,6 +3,7 @@ import { readFileSync } from 'node:fs';
 import { realExec, type Exec } from './exec.js';
 import { loadConfig, type ResolvedRole } from './config.js';
 import { getAdapter } from './harness/registry.js';
+import { resolveBundledAcpAgent } from './harness/acp-agent.js';
 import { agentDir, home, deriveXdgRuntimeDir } from './paths.js';
 import { resolveIsolation } from './isolation/policy.js';
 import { makeBubblewrapBackend } from './isolation/bubblewrap.js';
@@ -185,6 +186,15 @@ export async function doctor(
   }
   for (const role of roles.filter(role => role.session === 'acp')) {
     const configured = role.session_options?.acp?.command;
+    const bundled = configured == null
+      ? role.harness === 'codex'
+        ? resolveBundledAcpAgent(
+            '@agentclientprotocol/codex-acp', 'codex-acp', 'codex-acp')
+        : role.harness === 'claude-code'
+          ? resolveBundledAcpAgent(
+              '@agentclientprotocol/claude-agent-acp', 'claude-agent-acp', 'claude-agent-acp')
+          : undefined
+      : undefined;
     const command = Array.isArray(configured)
       ? configured[0]
       : typeof configured === 'string'
@@ -198,6 +208,13 @@ export async function doctor(
       checks.push({
         name: `acp: ${role.name}`, ok: false,
         detail: `harness '${role.harness}' has no default ACP agent; set session_options.acp.command`,
+      });
+      continue;
+    }
+    if (bundled?.bundled) {
+      checks.push({
+        name: `acp: ${role.name}`, ok: true,
+        detail: `${command} bundled with ours-fleet`,
       });
       continue;
     }

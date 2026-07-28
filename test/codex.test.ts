@@ -142,6 +142,24 @@ describe('buildLaunch', () => {
   });
 });
 
+describe('buildAcpLaunch', () => {
+  it('uses the Codex ACP adapter bundled with ours-fleet by default', () => {
+    const launch = makeCodexAdapter(okExec).buildAcpLaunch!(
+      role(), { argv: [], env: {} });
+    expect(launch.argv[0]).toBe(process.execPath);
+    expect(launch.argv[1]).toMatch(
+      /@agentclientprotocol[/\\]codex-acp[/\\]dist[/\\]index\.js$/);
+  });
+
+  it('preserves an explicit ACP command override', () => {
+    const launch = makeCodexAdapter(okExec).buildAcpLaunch!(
+      role({ session_options: { acp: { command: ['custom-codex-acp', '--flag'] } } }),
+      { argv: [], env: {} },
+    );
+    expect(launch.argv).toEqual(['custom-codex-acp', '--flag']);
+  });
+});
+
 describe('vocabulary.monitorInstruction', () => {
   it('asks before arming by default and never backgrounds the watch', () => {
     const a = makeCodexAdapter(okExec);

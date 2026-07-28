@@ -92,6 +92,27 @@ describe('doctor', () => {
     expect(h.ok).toBe(false);
     expect(h.detail).toContain('unknown harness');
   });
+
+  it('recognizes the ACP adapter bundled with ours-fleet when no global bin is on PATH', async () => {
+    writeFileSync(join(dir, 'fleet.yaml'),
+      'roles:\n  Coder:\n    harness: codex\n    session: acp\n    monitor:\n      enabled: false\n');
+    const rep = await doctor({}, execWith({
+      'ours-mcp --version': { stdout: '0.1.2', stderr: '', code: 0 },
+      'ours-mcp status': { stdout: 'running', stderr: '', code: 0 },
+      'codex --version': { stdout: 'codex-cli 1.0.0', stderr: '', code: 0 },
+      'codex plugin': {
+        stdout: JSON.stringify({ installed: [{
+          pluginId: 'ours@ours-codex-marketplace', installed: true, enabled: true,
+        }] }),
+        stderr: '',
+        code: 0,
+      },
+      'sh -c': { stdout: '', stderr: '', code: 1 },
+    }), 'darwin');
+    const acp = rep.checks.find(c => c.name === 'acp: Coder')!;
+    expect(acp.ok).toBe(true);
+    expect(acp.detail).toContain('bundled');
+  });
 });
 
 describe('doctor isolation reporting', () => {

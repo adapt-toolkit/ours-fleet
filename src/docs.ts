@@ -94,9 +94,9 @@ roles:
       approval: ask
       filesystem: workspace
       unattended: deny
-    session_options:
-      acp:
-        command: codex-acp
+    session_options:                    # advanced overrides; normally omit
+      # acp:
+      #   command: [/custom/codex-acp, --flag]
       tmux:
         boot_grace_ms: 10000
     monitor:
@@ -150,14 +150,19 @@ Codex \`harness_options\`: \`launcher\` (auto, ours-codex, codex), \`sandbox\`
 \`permission_mode\` (untrusted, on-request, never), \`profile\`, \`search\`,
 \`config\`, \`add_dirs\`, and \`monitor\`.
 
-## ACP prerequisites
+## ACP adapters
 
-- Codex: install \`@agentclientprotocol/codex-acp\` (provides \`codex-acp\`)
-- Claude: install \`@agentclientprotocol/claude-agent-acp\` (provides
-  \`claude-agent-acp\`)
+The maintained \`@agentclientprotocol/codex-acp\` and
+\`@agentclientprotocol/claude-agent-acp\` runtimes are bundled automatically as
+optional ours-fleet dependencies. The supervisor resolves their executable
+entrypoints internally, so default ACP roles do not depend on global PATH.
+The maintained Claude adapter requires Node 22; tmux and Codex ACP continue to
+work on the ours-fleet core minimum of Node 20.
 
-Override an adapter with \`session_options.acp.command\` (string or argv list).
-\`ours-fleet doctor -c FILE\` verifies the resolved adapter before launch.
+Override an adapter only when necessary with \`session_options.acp.command\`
+(string or argv list). If optional dependencies were deliberately omitted,
+ours-fleet falls back to a compatible globally installed \`codex-acp\` or
+\`claude-agent-acp\`. \`ours-fleet doctor -c FILE\` verifies the resolved adapter.
 
 ## Reliable mail wake
 
