@@ -258,12 +258,16 @@ describe('validateOptions / prereqs', () => {
 });
 
 describe('buildAcpLaunch', () => {
-  it('uses the Claude ACP adapter bundled with ours-fleet by default', () => {
+  it('uses the bundled Claude ACP adapter when supported and preserves the Node 20 fallback', () => {
     const launch = makeClaudeCodeAdapter(okExec).buildAcpLaunch!(
       role(), { argv: [], env: {} });
-    expect(launch.argv[0]).toBe(process.execPath);
-    expect(launch.argv[1]).toMatch(
-      /@agentclientprotocol[/\\]claude-agent-acp[/\\]dist[/\\]index\.js$/);
+    if (Number(process.versions.node.split('.')[0]) >= 22) {
+      expect(launch.argv[0]).toBe(process.execPath);
+      expect(launch.argv[1]).toMatch(
+        /@agentclientprotocol[/\\]claude-agent-acp[/\\]dist[/\\]index\.js$/);
+    } else {
+      expect(launch.argv).toEqual(['claude-agent-acp']);
+    }
   });
 
   it('preserves an explicit ACP command override', () => {
