@@ -156,12 +156,4 @@ jobs:
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
       - name: Verify nightly moved and latest stayed stable
-        run: |
-          expected="${{ steps.nightly.outputs.version }}"
-          for package in @ours.network/fleet @ours.network/fleet-claude-code @ours.network/fleet-codex; do
-            nightly="$(npm view "$package" dist-tags.nightly 2>/dev/null || echo '')"
-            latest="$(npm view "$package" dist-tags.latest 2>/dev/null || echo '')"
-            test "$nightly" = "$expected"
-            test -n "$latest"
-            case "$latest" in *-*) echo "::error::$package latest unexpectedly points to $latest"; exit 1 ;; esac
-          done
+        run: bash .github/workflows/scripts/verify-nightly-tags.sh "${{ steps.nightly.outputs.version }}"
