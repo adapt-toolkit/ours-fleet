@@ -136,8 +136,9 @@ ours-fleet-codex-install
 ```
 
 Start a new Codex session and say **"spawn an ours agent …"**. The bundled skill
-walks through lifetime, model, sandbox, approval policy, profile, launcher, and
-mail-monitor consent, then verifies the real tmux session and offers oversight.
+walks through lifetime, tmux/ACP session, model, common permissions, Codex
+controls, and mail-monitor consent, then verifies the real session and offers
+oversight.
 
 ## Oversight ("keep an eye")
 
@@ -165,6 +166,7 @@ roles:
 ## Command reference
 
 ```
+ours-fleet docs | man                 AI-friendly complete reference
 ours-fleet up|down|restart|force-restart [-c FILE] [Name...]
 ours-fleet config [-c FILE]         validate + print merged plan
 ours-fleet ls | attach | peek | logs [-f] | status <Name>

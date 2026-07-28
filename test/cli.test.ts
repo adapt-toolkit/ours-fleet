@@ -32,8 +32,20 @@ describe('ours-fleet CLI', () => {
   it('--help lists the important commands', async () => {
     const r = await run(['--help']);
     expect(r.code).toBe(0);
-    for (const c of ['up', 'down', 'spawn', 'send', 'peek', 'doctor', 'init'])
+    for (const c of ['docs', 'up', 'down', 'spawn', 'send', 'peek', 'doctor', 'init'])
       expect(r.stdout).toContain(c);
+  });
+
+  it('docs and man print the AI-friendly configuration reference', async () => {
+    for (const command of ['docs', 'man']) {
+      const r = await run([command]);
+      expect(r.code).toBe(0);
+      expect(r.stdout).toContain('# ours-fleet reference');
+      expect(r.stdout).toContain('Both lifetimes support `--session acp`');
+      expect(r.stdout).toContain('approval: ask|allow|deny');
+      expect(r.stdout).toContain('@agentclientprotocol/codex-acp');
+      expect(r.stdout).toContain('Reliable mail wake');
+    }
   });
 
   it('doctor runs and exits 0/1 without crashing', async () => {

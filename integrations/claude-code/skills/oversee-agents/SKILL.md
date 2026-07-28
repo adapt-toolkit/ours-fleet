@@ -1,17 +1,20 @@
 ---
 name: oversee-agents
-description: Keep an eye on ours-fleet agents you spawned or were assigned - periodically peek into their tmux consoles, unstick them (answer prompts, approve dialogs, nudge) via ours-fleet send, escalate only when unsure. Use when the user or your persona/briefing says "keep an eye on X", "oversee agents", "watch agents", or right after spawning an agent.
+description: Keep an eye on ours-fleet agents you spawned or were assigned, across tmux or ACP sessions. Inspect state, unstick agents through ours-fleet controls, and escalate consequential choices. Use when the user or your persona/briefing says "keep an eye on X", "oversee agents", "watch agents", or right after spawning an agent.
 ---
 
 # Oversee ours-fleet agents
 
-Your wards are subagents — you own their liveness. The core gives you two
-primitives; the judgment is yours.
+Your wards are subagents — you own their liveness. Run `ours-fleet docs` when
+you need the installed backend-specific controls.
 
-```bash
-ours-fleet peek <Name> [lines]        # console snapshot (default 40 lines)
-ours-fleet send <Name> "<text>"       # type into its console (+ Enter)
-ours-fleet send <Name> --key <K>      # raw key: Escape, Up, C-c, "1", ...
+```sh
+ours-fleet status <Name>
+ours-fleet peek <Name> [lines]
+ours-fleet logs <Name>
+ours-fleet send <Name> "<text>"
+ours-fleet send <Name> --key <K>      # tmux only
+ours-fleet attach <Name>              # tmux or ACP interactive control
 ```
 
 ## 1. Determine your assignment
@@ -35,7 +38,7 @@ Run `ours-fleet peek <Name>` per ward and classify the console:
 
 | Console shows | Action |
 |---|---|
-| Permission prompt, trust dialog, numbered menu ("1. Yes…") | Answer it directly: `ours-fleet send <Name> --key 1` (or the right key/text). Prefer the safe affirmative that unblocks the task the agent was assigned. |
+| Permission prompt or trust dialog | Answer only within already-authorized scope. Use `send --key` for tmux or the `/permit` control shown by ACP `attach`. |
 | A question the agent asked its (absent) user | Answer with what you know of the mission: `ours-fleet send <Name> "<answer>"`. |
 | Crashed to a shell prompt / error text | Investigate (`ours-fleet logs <Name>`); for permanent roles `ours-fleet restart <Name>`; report to the owner. |
 | Idle with work still assigned | Nudge: `ours-fleet send <Name> "Status? Continue with <task> or declare BLOCKED."` |
@@ -45,7 +48,7 @@ Run `ours-fleet peek <Name>` per ward and classify the console:
 
 If the resolution would make a decision that is not yours (spending, deleting,
 publishing, changing scope), do NOT press through it — message the owner or
-coordinator over ours messaging (`send_message`) with the pane snapshot and your
+coordinator over ours messaging (`send_message`) with the session snapshot and your
 recommendation.
 
 ## 5. Log

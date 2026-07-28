@@ -14,6 +14,7 @@ import { up, down, restartRoles, rmRole, type OpsDeps } from './ops.js';
 import { runOnce, runTemp } from './runner.js';
 import { spawnPermanent, spawnTemp, type SpawnOpts } from './spawn.js';
 import { doctor } from './doctor.js';
+import { AI_DOCS } from './docs.js';
 import {
   controlRequest, controlSocketPath, followControl,
 } from './session/control.js';
@@ -44,12 +45,17 @@ const passthrough = (cmd: string, args: string[]) =>
 
 const program = new Command()
   .name('ours-fleet')
-  .description('Fleet of persistent, identity-bound AI agents — harness-agnostic, tmux + systemd/launchd.')
+  .description('Fleet of persistent, identity-bound AI agents — selectable harness and tmux/ACP sessions.')
   .version(VERSION);
 
 const cOpt = (cmd: Command) => cmd.option('-c, --configuration <file>', 'config file (default: ~/fleet.yaml + ~/fleet.d/)');
 
 const collect = (value: string, previous: string[]) => [...previous, value];
+
+program.command('docs')
+  .alias('man')
+  .description('print the complete AI-friendly command and configuration reference')
+  .action(() => { process.stdout.write(AI_DOCS); });
 
 function acpStateDir(name: string): string | undefined {
   const permanent = agentDir(name);
@@ -248,7 +254,7 @@ cOpt(program.command('rm <name>').description('stop + delete state dir (+ its fl
   });
 
 cOpt(program.command('spawn <name>').description('spawn a new agent (permanent by default)'))
-  .option('--temp', 'temporary: plain tmux, auto-cleaned, gone on reboot')
+  .option('--temp', 'temporary: detached supervisor, auto-cleaned, gone on reboot')
   .option('--harness <id>', 'harness adapter (default: defaults.harness)')
   .option('--session <backend>', 'session backend: tmux|acp (default: defaults.session or tmux)')
   .option('--mission <text>', 'one-line mission')
