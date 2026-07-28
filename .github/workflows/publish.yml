@@ -13,9 +13,9 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    branches: [main, prerelease]
   pull_request:
-    branches: [main]
+    branches: [main, prerelease]
   workflow_dispatch:
 
 # Cancel superseded runs on the same ref so a burst of pushes doesn't queue a
@@ -99,19 +99,69 @@ jobs:
           registry-url: https://registry.npmjs.org
       - run: npm ci
       - name: Publish @ours.network/fleet
-        run: npm publish --access public
+        run: |
+          bash .github/workflows/scripts/publish-guard.sh stable package.json latest
+          npm publish --access public
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
       - name: Publish @ours.network/fleet-claude-code
         working-directory: integrations/claude-code
-        run: npm publish --access public
+        run: |
+          bash ../../.github/workflows/scripts/publish-guard.sh stable package.json latest
+          npm publish --access public
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
       - name: Publish @ours.network/fleet-codex
         working-directory: integrations/codex/ours-fleet
-        run: npm publish --access public
+        run: |
+          bash ../../../.github/workflows/scripts/publish-guard.sh stable package.json latest
+          npm publish --access public
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
       - name: Summary
         run: |
           echo "Published @ours.network/fleet@${{ needs.version-bump.outputs.cli-version }}, @ours.network/fleet-claude-code@${{ needs.version-bump.outputs.plugin-version }}, and @ours.network/fleet-codex@${{ needs.version-bump.outputs.codex-plugin-version }}." >> "$GITHUB_STEP_SUMMARY"
+
+  # Prerelease is a branch-exclusive channel. Versions are ephemeral and can
+  # only reach the npm `nightly` dist-tag through the fail-closed wrapper.
+  nightly-publish:
+    needs: gates
+    if: github.event_name == 'push' && github.ref == 'refs/heads/prerelease'
+    runs-on: ubuntu-latest
+    name: Publish nightly to npm
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          registry-url: https://registry.npmjs.org
+      - run: npm ci
+      - name: Compute ephemeral lockstep nightly version
+        id: nightly
+        run: bash .github/workflows/scripts/set-nightly-versions.sh
+      - run: npm run build
+      - run: npm test
+      - name: Publish @ours.network/fleet (nightly)
+        run: bash .github/workflows/scripts/publish-nightly.sh .
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+      - name: Publish @ours.network/fleet-claude-code (nightly)
+        run: bash .github/workflows/scripts/publish-nightly.sh integrations/claude-code
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+      - name: Publish @ours.network/fleet-codex (nightly)
+        run: bash .github/workflows/scripts/publish-nightly.sh integrations/codex/ours-fleet
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+      - name: Verify nightly moved and latest stayed stable
+        run: |
+          expected="${{ steps.nightly.outputs.version }}"
+          for package in @ours.network/fleet @ours.network/fleet-claude-code @ours.network/fleet-codex; do
+            nightly="$(npm view "$package" dist-tags.nightly 2>/dev/null || echo '')"
+            latest="$(npm view "$package" dist-tags.latest 2>/dev/null || echo '')"
+            test "$nightly" = "$expected"
+            test -n "$latest"
+            case "$latest" in *-*) echo "::error::$package latest unexpectedly points to $latest"; exit 1 ;; esac
+          done

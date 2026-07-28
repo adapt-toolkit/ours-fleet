@@ -388,6 +388,23 @@ describe('Monitor.prime', () => {
     expect(readFileSync(join(dir, '.monitor-status'), 'utf8')).toMatch(/armed/);
   });
 
+  it('resumes the last delivered cursor instead of jumping to tip after restart', async () => {
+    writeFileSync(join(dir, '.monitor-state.json'), JSON.stringify({
+      version: 1,
+      identity: 'A',
+      observedCursor: 20,
+      deliveredCursor: 10,
+      pending: { count: 1, eventTypes: ['message_received'], attempts: 1 },
+    }));
+    const { fetch, calls } = scriptedFetch([]);
+    const mon = createMonitor({
+      name: 'A', agentDir: dir, cfg: CFG(), deps: makeDeps(fetch, fakeTmux()),
+    });
+    await mon.prime();
+    expect(calls()).toEqual([]);
+    expect(readFileSync(join(dir, '.monitor-status'), 'utf8')).toBe('armed\n');
+  });
+
   it('marks failed and never injects on a 401', async () => {
     const { fetch } = scriptedFetch([{ status: 401 }]);
     const tmux = fakeTmux();
@@ -422,6 +439,90 @@ describe('Monitor.prime', () => {
 });
 
 describe('Monitor.run — delivery', () => {
+  it('routes notifications by configured identity, not role name', async () => {
+    const tmux = fakeTmux();
+    const { fetch, calls } = scriptedFetch([
+      { cursor: 1, events: [] },
+      { cursor: 2, events: [] },
+    ], (_url, i) => { if (i === 1) mon.stop(); });
+    let mon: ReturnType<typeof createMonitor>;
+    mon = createMonitor({
+      name: 'Reviewer', identity: 'Alice', agentDir: dir, cfg: CFG({ batch_ms: 0 }),
+      deps: makeDeps(fetch, tmux),
+    });
+    await mon.prime();
+    await mon.run(1);
+    expect(calls().every(url => url.includes('/identities/Alice/notifications'))).toBe(true);
+    expect(calls().some(url => url.includes('/identities/Reviewer/'))).toBe(false);
+  });
+
+  it('does not commit the cursor until a failed delivery is later accepted', async () => {
+    const tmux = fakeTmux();
+    let attempts = 0;
+    tmux.sendText = async (_name, text) => {
+      tmux.sent.push(text);
+      attempts++;
+      if (attempts === 1) throw new Error('tmux send failed');
+      mon.stop();
+    };
+    const { fetch } = scriptedFetch([
+      { cursor: 1, events: [] },
+      { cursor: 2, events: [{ event: 'message_received', from: 'C', msg_id: 1 }] },
+      { cursor: 2, events: [] },
+    ]);
+    let mon: ReturnType<typeof createMonitor>;
+    mon = createMonitor({
+      name: 'A', agentDir: dir, cfg: CFG({ batch_ms: 0 }), deps: makeDeps(fetch, tmux),
+    });
+    await mon.prime();
+    await mon.run(1);
+    expect(attempts).toBe(2);
+    expect(readFileSync(join(dir, '.notify-cursor'), 'utf8').trim()).toBe('2');
+  });
+
+  it('persists body-free pending state while leaving the delivered cursor behind', async () => {
+    const tmux = fakeTmux();
+    let alive = true;
+    tmux.sendText = async () => { alive = false; throw new Error('pane disappeared'); };
+    const { fetch } = scriptedFetch([
+      { cursor: 1, events: [] },
+      { cursor: 2, events: [{ event: 'message_received', from: 'C', msg_id: 44 }] },
+    ]);
+    const mon = createMonitor({
+      name: 'Role', identity: 'Identity', agentDir: dir, cfg: CFG({ batch_ms: 0 }),
+      deps: makeDeps(fetch, tmux, { isAlive: () => alive }),
+    });
+    await mon.prime();
+    await mon.run(1);
+    expect(readFileSync(join(dir, '.notify-cursor'), 'utf8').trim()).toBe('1');
+    const state = JSON.parse(readFileSync(join(dir, '.monitor-state.json'), 'utf8'));
+    expect(state).toMatchObject({
+      identity: 'Identity',
+      observedCursor: 2,
+      deliveredCursor: 1,
+      pending: { count: 1, eventTypes: ['message_received'] },
+    });
+    expect(JSON.stringify(state)).not.toContain('44');
+  });
+
+  it('uses structured prompt delivery for ACP without touching tmux', async () => {
+    const tmux = fakeTmux();
+    const delivered: string[] = [];
+    const { fetch } = scriptedFetch([
+      { cursor: 1, events: [] },
+      { cursor: 2, events: [{ event: 'message_received', from: 'C', msg_id: 9 }] },
+    ]);
+    const deps = makeDeps(fetch, tmux, {
+      delivery: { submit: async text => { delivered.push(text); mon.stop(); return { accepted: true }; } },
+    });
+    let mon: ReturnType<typeof createMonitor>;
+    mon = createMonitor({ name: 'A', agentDir: dir, cfg: CFG({ batch_ms: 0 }), deps });
+    await mon.prime();
+    await mon.run(1);
+    expect(delivered).toEqual(['[fleet-monitor] 1 new message from C (#9) — run get_messages']);
+    expect(tmux.sent).toEqual([]);
+  });
+
   it('injects one notification line for a filtered wake and advances the cursor', async () => {
     const tmux = fakeTmux();
     const { fetch } = scriptedFetch([

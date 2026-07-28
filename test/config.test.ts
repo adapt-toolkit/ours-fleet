@@ -55,6 +55,44 @@ describe('loadConfig', () => {
     expect(b.identity).toBe('Bee');
   });
 
+  it('selects the session backend with one setting and defaults to tmux', () => {
+    base('defaults:\n  session: acp\nroles:\n  A: {}\n  B:\n    session: tmux\n');
+    expect(findRole(loadConfig(), 'A').session).toBe('acp');
+    expect(findRole(loadConfig(), 'B').session).toBe('tmux');
+    base('roles:\n  C: {}\n');
+    expect(findRole(loadConfig(), 'C').session).toBe('tmux');
+  });
+
+  it('merges common permission intent and ACP command settings', () => {
+    base([
+      'defaults:',
+      '  permissions:',
+      '    approval: ask',
+      '    filesystem: read-only',
+      '  session_options:',
+      '    acp:',
+      '      command: [node, agent.mjs]',
+      'roles:',
+      '  A:',
+      '    session: acp',
+      '    permissions:',
+      '      approval: allow',
+      '',
+    ].join('\n'));
+    const role = findRole(loadConfig(), 'A');
+    expect(role.permissions).toEqual({
+      approval: 'allow', filesystem: 'read-only', unattended: 'deny',
+    });
+    expect(role.session_options?.acp?.command).toEqual(['node', 'agent.mjs']);
+  });
+
+  it('rejects invalid session and common permission values', () => {
+    base('roles:\n  A:\n    session: screen\n');
+    expect(() => loadConfig()).toThrowError(/session.*tmux, acp/);
+    base('roles:\n  A:\n    permissions:\n      approval: maybe\n');
+    expect(() => loadConfig()).toThrowError(/permissions\.approval/);
+  });
+
   it('defaults start_stagger_ms to 0 (no stagger) when unset', () => {
     base('roles:\n  A: {}\n');
     expect(loadConfig().startStaggerMs).toBe(0);

@@ -3,7 +3,7 @@ import { join } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { parse } from 'yaml';
 import { agentDir, home, stateRoot } from './paths.js';
-import { loadConfig, findRole, type ResolvedRole } from './config.js';
+import { loadConfig, findRole, resolvePermissions, type ResolvedRole } from './config.js';
 import { getAdapter } from './harness/registry.js';
 import type { Launch } from './harness/types.js';
 import { Tmux } from './tmux.js';
@@ -13,6 +13,10 @@ import { resolveIsolation } from './isolation/policy.js';
 import { selectIsolationBackend } from './isolation/registry.js';
 import { resourceArgs, cpuControllerDelegated } from './isolation/resources.js';
 import type { WrapContext } from './isolation/types.js';
+import { AcpSession } from './session/acp.js';
+import { RoleControlServer } from './session/control.js';
+import { TmuxSession } from './session/tmux.js';
+import type { SessionHandle } from './session/types.js';
 
 export interface RunnerDeps {
   tmux: Tmux;
@@ -195,11 +199,18 @@ export async function runOnce(
 
   const runCwd = role.cwd && existsSync(role.cwd) ? role.cwd : dir;
   const prep = await adapter.prepareSession(role, { stateDir: dir, runCwd });
-  const launch = adapter.buildLaunch(role, mode, { sessionId }, prep);
+  const sessionBackend = role.session ?? 'tmux';
+  const launch = sessionBackend === 'acp'
+    ? (() => {
+        if (!adapter.buildAcpLaunch)
+          throw new Error(`harness '${role.harness}' does not support the ACP session backend`);
+        return adapter.buildAcpLaunch(role, prep);
+      })()
+    : adapter.buildLaunch(role, mode, { sessionId }, prep);
 
   // Isolation is additive: only roles that declare `isolation:` are wrapped. The
   // env prefix + exit capture in buildPaneCommand stay host-side (see §5.3).
-  let paneArgv = launch.argv;
+  let wrappedArgv = launch.argv;
   if (role.isolation) {
     const addDirs = role.harness === 'codex'
       ? ((role.harness_options as { add_dirs?: string[] } | undefined)?.add_dirs ?? [])
@@ -217,13 +228,13 @@ export async function runOnce(
       deps.log(`[${name}] isolation: ${sel.backend.id} (net=${policy.network}) ${sel.detail}`);
       rmSync(degradedMarker, { force: true });
     }
-    paneArgv = sel.backend.wrap(launch.argv, policy, ctx);
+    wrappedArgv = sel.backend.wrap(launch.argv, policy, ctx);
 
     // Resource caps wrap the sandbox from OUTSIDE, at the pane's own cgroup scope
     // (§5.4). Applies even when the sandbox degraded to none.
     const { argv: rprefix, warnings } = resourceArgs(policy.resources, deps.cpuDelegated());
     for (const w of warnings) deps.log(`[${name}] WARNING ${w}`);
-    if (rprefix.length) paneArgv = [...rprefix, ...paneArgv];
+    if (rprefix.length) wrappedArgv = [...rprefix, ...wrappedArgv];
   }
 
   // Start-stagger: space this launch at least start_stagger_ms after the previous
@@ -246,31 +257,74 @@ export async function runOnce(
   // (backlog before the tip is the SessionStart hook's job). Disabled roles keep
   // the legacy in-session watch. Temp snapshots predating `monitor:` are treated
   // as disabled (monitor may be undefined on an old role.yaml).
+  const resolvedMonitorDeps = monitorDeps(deps, role.env);
   const monitor = role.monitor?.enabled ? deps.createMonitor({
-    name, agentDir: dir, cfg: role.monitor,
-    deps: monitorDeps(deps, role.env),
+    name, identity: role.identity, agentDir: dir, cfg: role.monitor,
+    deps: resolvedMonitorDeps,
   }) : null;
   if (monitor) await monitor.prime();
 
   rmSync(exitFile, { force: true });
-  await deps.tmux.kill(name);
-  await deps.tmux.newSession(name, runCwd, buildPaneCommand(launch, role.env, exitFile, paneArgv));
-
-  let pid: number | null = null;
-  for (let i = 0; i < 40 && pid === null; i++) {
-    pid = await deps.tmux.panePid(name);
-    if (pid === null) await deps.sleep(250);
+  let pid: number;
+  let sessionHandle: SessionHandle;
+  let acpSession: AcpSession | undefined;
+  let control: RoleControlServer | undefined;
+  if (sessionBackend === 'acp') {
+    acpSession = await AcpSession.start({
+      name,
+      argv: wrappedArgv,
+      cwd: runCwd,
+      env: { ...launch.env, ...(role.env ?? {}) },
+      stateDir: dir,
+      mode,
+      permissions: role.permissions ?? resolvePermissions(undefined, undefined),
+      log: deps.log,
+    });
+    pid = acpSession.pid;
+    sessionHandle = acpSession;
+    control = new RoleControlServer(dir, acpSession, deps.log);
+    await control.start();
+    resolvedMonitorDeps.delivery = {
+      submit: async text => {
+        const result = await acpSession!.submitPrompt(text);
+        return { accepted: result.accepted, detail: result.detail };
+      },
+    };
+    const firstPrompt = mode === 'fresh'
+      ? `Read and follow ${join(dir, 'briefing.md')} now.`
+      : adapter.vocabulary.restartPrompt(role.identity, join(dir, 'WORKLOG.md'), role);
+    const started = await acpSession.submitPrompt(firstPrompt);
+    if (!started.accepted) {
+      monitor?.stop();
+      await control.close();
+      await acpSession.close();
+      throw new Error(`[${name}] ACP session rejected startup prompt: ${started.detail ?? started.outcome}`);
+    }
+  } else {
+    await deps.tmux.kill(name);
+    await deps.tmux.newSession(
+      name, runCwd, buildPaneCommand(launch, role.env, exitFile, wrappedArgv));
+    let panePid: number | null = null;
+    for (let i = 0; i < 40 && panePid === null; i++) {
+      panePid = await deps.tmux.panePid(name);
+      if (panePid === null) await deps.sleep(250);
+    }
+    if (panePid === null) throw new Error(`[${name}] could not resolve tmux pane pid`);
+    pid = panePid;
+    sessionHandle = new TmuxSession(name, pid, deps.tmux, deps.isAlive);
   }
-  if (pid === null) throw new Error(`[${name}] could not resolve tmux pane pid`);
-  deps.log(`[${name}] up; pid=${pid} cwd=${runCwd} harness=${role.harness} mode=${mode}`);
+  deps.log(
+    `[${name}] up; pid=${pid} cwd=${runCwd} harness=${role.harness} session=${sessionBackend} mode=${mode}`);
 
   // The monitor loop lives exactly as long as the session: it starts once the
   // pane pid is known and is stopped when that pid dies (task dies with runner).
   const monitorLoop = monitor?.run(pid);
 
   const start = deps.now();
-  while (deps.isAlive(pid)) await deps.sleep(2000);
+  while (sessionHandle.isAlive()) await deps.sleep(2000);
   if (monitor) { monitor.stop(); await monitorLoop; }
+  if (control) await control.close();
+  if (acpSession) await acpSession.close();
   const elapsed = (deps.now() - start) / 1000;
   const code = existsSync(exitFile) ? readFileSync(exitFile, 'utf8').trim() : 'crash';
 
