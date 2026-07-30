@@ -82,6 +82,36 @@ describe('ours-fleet CLI', () => {
     expect(r.stdout).toMatch(/mem=2G/);
   });
 
+  it('peek renders automatic permission decisions on a live ACP role (1.3)', async () => {
+    const { mkdirSync } = await import('node:fs');
+    const { AcpSession } = await import('../src/session/acp.js');
+    const { RoleControlServer } = await import('../src/session/control.js');
+    const fixture = resolve('test/fixtures/acp-agent.mjs');
+    const stateDir = join(dir, '.ours-fleet', 'agents', 'Perm');   // agentDir('Perm')
+    mkdirSync(stateDir, { recursive: true });
+
+    const session = await AcpSession.start({
+      name: 'Perm', argv: [process.execPath, fixture], cwd: stateDir, env: {},
+      stateDir, mode: 'fresh',
+      permissions: { approval: 'ask', filesystem: 'workspace', unattended: 'deny' },
+      log: () => {},
+    });
+    const control = new RoleControlServer(stateDir, session, () => {});
+    await control.start();
+    try {
+      await session.submitPrompt('permission twice');       // both auto-denied
+      const r = await run(['peek', 'Perm']);
+      expect(r.code).toBe(0);
+      expect(r.stdout).toContain('automatic decision: denied');
+      expect(r.stdout).toContain('via permissions.unattended=deny');
+      expect(r.stdout).toContain('reason: no controller is attached');
+      expect(r.stdout).not.toContain('respond: /permit');   // nothing is pending
+    } finally {
+      await control.close();
+      await session.close();
+    }
+  }, 30_000);
+
   it('config prints a role model from fleet.d', async () => {
     const { mkdirSync, writeFileSync } = await import('node:fs');
     const { stringify } = await import('yaml');

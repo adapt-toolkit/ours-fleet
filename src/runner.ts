@@ -270,6 +270,13 @@ export async function runOnce(
   let acpSession: AcpSession | undefined;
   let control: RoleControlServer | undefined;
   if (sessionBackend === 'acp') {
+    const perms = role.permissions ?? resolvePermissions(undefined, undefined);
+    // Say once, at startup, that this role will decide permission requests by
+    // itself. Without it the only trace of an auto-denied tool call is a turn
+    // that quietly did less than it was asked to.
+    if (perms.unattended === 'deny')
+      deps.log(`[${name}] permission policy: unattended=deny — with no console attached, ` +
+        `permission requests are automatically denied once each (reject_once) and the turn continues`);
     acpSession = await AcpSession.start({
       name,
       argv: wrappedArgv,
@@ -277,7 +284,7 @@ export async function runOnce(
       env: { ...launch.env, ...(role.env ?? {}) },
       stateDir: dir,
       mode,
-      permissions: role.permissions ?? resolvePermissions(undefined, undefined),
+      permissions: perms,
       log: deps.log,
     });
     pid = acpSession.pid;

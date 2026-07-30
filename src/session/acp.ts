@@ -9,7 +9,9 @@ import * as acp from '@agentclientprotocol/sdk';
 import type { CommonPermissions } from '../config.js';
 import { SessionEvents } from './events.js';
 import { turnResult } from './types.js';
-import type { SessionEvent, SessionHandle, SessionSnapshot, TurnOutcome, TurnResult } from './types.js';
+import type {
+  PermissionDecision, SessionEvent, SessionHandle, SessionSnapshot, TurnOutcome, TurnResult,
+} from './types.js';
 
 interface PendingPermission {
   options: Array<{ optionId: string; kind: string }>;
@@ -145,9 +147,18 @@ export class AcpSession implements SessionHandle {
 
   respondPermission(permissionId: string, optionId: string): boolean {
     const pending = this.pendingPermissions.get(permissionId);
-    if (!pending || !pending.options.some(option => option.optionId === optionId)) return false;
+    const chosen = pending?.options.find(option => option.optionId === optionId);
+    if (!pending || !chosen) return false;
     this.pendingPermissions.delete(permissionId);
     pending.resolve({ outcome: { outcome: 'selected', optionId } });
+    this.events.emit('permission', {
+      permissionId,
+      status: 'completed',
+      decision: chosen.kind.startsWith('reject') ? 'denied' : 'allowed',
+      decisionSource: 'manual',
+      reason: `answered from an attached controller (${chosen.kind})`,
+      optionId,
+    });
     this.readiness = 'running';
     return true;
   }
@@ -243,20 +254,34 @@ export class AcpSession implements SessionHandle {
   }
 
   private requestPermission(params: acp.RequestPermissionRequest): Promise<acp.RequestPermissionResponse> {
-    const choose = (kinds: string[]) =>
-      params.options.find(option => kinds.includes(option.kind));
+    // `kinds` is a PRIORITY order. Scanning the agent's option array instead
+    // (`options.find(o => kinds.includes(o.kind))`) hands the choice to whatever
+    // order the agent happened to list, which is exactly how an automatic denial
+    // could land on `reject_always`.
+    const choose = (kinds: string[]) => {
+      for (const kind of kinds) {
+        const option = params.options.find(o => o.kind === kind);
+        if (option) return option;
+      }
+      return undefined;
+    };
     if (this.options.permissions.approval === 'allow' && this.withinAutomaticBoundary(params)) {
       const option = choose(['allow_always', 'allow_once']);
-      return Promise.resolve(option
-        ? { outcome: { outcome: 'selected', optionId: option.optionId } }
-        : { outcome: { outcome: 'cancelled' } });
+      return Promise.resolve(this.settleAutomatically(params, option, 'allowed',
+        'permissions.approval=allow',
+        `the request is inside the ${this.options.permissions.filesystem} boundary`));
     }
-    if (this.options.permissions.approval === 'deny'
-        || (this.controllerCount === 0 && this.options.permissions.unattended === 'deny')) {
-      const option = choose(['reject_always', 'reject_once']);
-      return Promise.resolve(option
-        ? { outcome: { outcome: 'selected', optionId: option.optionId } }
-        : { outcome: { outcome: 'cancelled' } });
+    const unattended = this.controllerCount === 0 && this.options.permissions.unattended === 'deny';
+    if (this.options.permissions.approval === 'deny' || unattended) {
+      // reject_once FIRST: `reject_always` teaches the agent a standing rule from
+      // a decision no human made, so one unattended denial would silently disable
+      // the tool for the rest of the session.
+      const option = choose(['reject_once', 'reject_always']);
+      return Promise.resolve(this.settleAutomatically(params, option, 'denied',
+        unattended ? 'permissions.unattended=deny' : 'permissions.approval=deny',
+        unattended
+          ? 'no controller is attached, so the request cannot be shown to anyone'
+          : 'the role denies every permission request by policy'));
     }
 
     const permissionId = randomUUID();
@@ -273,6 +298,36 @@ export class AcpSession implements SessionHandle {
     return new Promise(resolve => {
       this.pendingPermissions.set(permissionId, { options: params.options, resolve });
     });
+  }
+
+  /**
+   * Resolve a permission request from policy alone and leave a record of it.
+   * Nothing else in the system can observe an automatic decision, so an
+   * unrecorded one is indistinguishable from a request that was never made.
+   */
+  private settleAutomatically(
+    params: acp.RequestPermissionRequest,
+    option: { optionId: string; name: string; kind: string } | undefined,
+    decision: PermissionDecision,
+    policy: string,
+    reason: string,
+  ): acp.RequestPermissionResponse {
+    const settled: PermissionDecision = option ? decision : 'cancelled';
+    this.events.emit('permission', {
+      permissionId: randomUUID(),
+      toolCallId: params.toolCall.toolCallId,
+      title: params.toolCall.title ?? 'Permission requested',
+      status: 'completed',
+      decision: settled,
+      decisionSource: 'automatic',
+      policy,
+      reason: option ? reason : `${reason}, but the agent offered no matching option`,
+      optionId: option?.optionId,
+      options: params.options.map(o => ({ optionId: o.optionId, name: o.name, kind: o.kind })),
+    });
+    return option
+      ? { outcome: { outcome: 'selected', optionId: option.optionId } }
+      : { outcome: { outcome: 'cancelled' } };
   }
 
   private withinAutomaticBoundary(params: acp.RequestPermissionRequest): boolean {

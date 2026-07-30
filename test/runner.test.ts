@@ -312,6 +312,34 @@ describe('runOnce ACP startup outcome (1.2)', () => {
     expect(logs.some(l => l.includes('[A] up;'))).toBe(false);
   });
 
+  it('warns once at startup that an unattended role auto-denies (1.3)', async () => {
+    writeCfg({ A: {
+      harness: 'fake-acp', session: 'acp',
+      permissions: { approval: 'ask', filesystem: 'workspace', unattended: 'deny' },
+      env: { ACP_FIXTURE_EXIT_AFTER: '1' },
+    } });
+    mkdirSync(agentDir('A'), { recursive: true });
+    const { deps, logs } = acpDeps();
+
+    await runOnce('A', {}, deps);
+    const warnings = logs.filter(l => l.includes('permission policy: unattended=deny'));
+    expect(warnings).toHaveLength(1);
+    expect(warnings[0]).toContain('reject_once');
+  });
+
+  it('says nothing about auto-denial when the role waits instead (1.3)', async () => {
+    writeCfg({ A: {
+      harness: 'fake-acp', session: 'acp',
+      permissions: { approval: 'ask', filesystem: 'workspace', unattended: 'wait' },
+      env: { ACP_FIXTURE_EXIT_AFTER: '1' },
+    } });
+    mkdirSync(agentDir('A'), { recursive: true });
+    const { deps, logs } = acpDeps();
+
+    await runOnce('A', {}, deps);
+    expect(logs.some(l => l.includes('permission policy'))).toBe(false);
+  });
+
   it('a completed startup prompt does log the role up', async () => {
     writeCfg({ A: {
       harness: 'fake-acp', session: 'acp',

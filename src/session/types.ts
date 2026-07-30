@@ -58,6 +58,9 @@ export type SessionEventKind =
   | 'turn_stop'
   | 'error';
 
+/** What a settled permission request resolved to. */
+export type PermissionDecision = 'allowed' | 'denied' | 'cancelled';
+
 export interface SessionEvent {
   version: 1;
   seq: number;
@@ -71,6 +74,17 @@ export interface SessionEvent {
   status?: string;
   stopReason?: string;
   options?: Array<{ optionId: string; name: string; kind: string }>;
+  // ── settled permission events (status: 'completed') ────────────────────────
+  /** What was decided. */
+  decision?: PermissionDecision;
+  /** Whether policy decided it, or a human answered the prompt. */
+  decisionSource?: 'automatic' | 'manual';
+  /** The configured policy that produced an automatic decision. */
+  policy?: string;
+  /** Why, in one human-readable line. */
+  reason?: string;
+  /** The option actually selected, when one was. */
+  optionId?: string;
 }
 
 export interface SessionHandle {

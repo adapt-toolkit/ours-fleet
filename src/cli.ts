@@ -74,6 +74,16 @@ function renderSessionEvent(event: SessionEvent): void {
       console.log(`\n[${event.kind}] ${event.title ?? event.toolCallId ?? ''} ${event.status ?? ''}`.trimEnd());
       break;
     case 'permission':
+      if (event.status === 'completed') {
+        // A settled request. Automatic decisions are the ones nobody saw happen,
+        // so peek/attach must show what was decided and which policy decided it.
+        console.log(`\n[permission ${event.permissionId}] ${event.title ?? ''}`.trimEnd());
+        console.log(`  ${event.decisionSource ?? 'manual'} decision: ${event.decision ?? 'unknown'}`
+          + `${event.optionId ? ` (${event.optionId})` : ''}`
+          + `${event.policy ? ` via ${event.policy}` : ''}`);
+        if (event.reason) console.log(`  reason: ${event.reason}`);
+        break;
+      }
       console.log(`\n[permission ${event.permissionId}] ${event.title ?? ''}`);
       for (const option of event.options ?? [])
         console.log(`  ${option.optionId}: ${option.name} (${option.kind})`);
