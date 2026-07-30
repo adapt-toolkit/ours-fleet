@@ -48,6 +48,8 @@ Baseline before any work: **339 passed**.
 | 7.1 rewrite the spawn skills from one source of truth | `580372b` | 593 |
 | 7.2 stop using one console command as a liveness verdict | `39943f9` | 611 |
 | (6.2) verify the unit started; the exit code is not the signal | `4023e72` | 618 |
+| #32 one tmux server per role, not one for the whole fleet | `0bf6474` | 625 |
+| (6.2) verify the launchd start too, not just the systemd one | `e71e861` | 635 |
 
 **All 22 scoped fixes are committed with tests**, plus one defect found in 6.2 after the fact
 (see below). Sections 1 through 6 are complete.
@@ -171,6 +173,82 @@ CLIs (soak check 9); all 13 soak checks; **systemd versions other than 255** —
 behaviour was measured there only, and while the fix is written not to depend on which way a
 version behaves, that independence has been exercised against fakes rather than against another
 real systemd.
+
+## Implementer-3's two commits
+
+Assigned by Coordinator after Implementer-2 finished: issue #32, which the plan's editorial
+cut had excluded, and the launchd half of the start verification.
+
+### #32 — the shared-tmux-server cascade (`0bf6474`)
+
+No tmux invocation passed `-L`, so every role's pane lived on the ONE default tmux server.
+That server is a child of whichever role started it first and therefore sits in that role's
+unit cgroup: stopping that one unit killed every role's pane fleet-wide.
+
+Each session now has its own socket, `ours-fleet-<name>`. `tmuxSocket`/`tmuxArgs` in
+`src/tmux.ts` are the single source of the name, and every tmux invocation goes through them —
+the `Tmux` class plus the three raw call sites outside it (`none`'s liveness probe, its
+`logsArgs`, and the CLI `attach` passthrough).
+
+**Why this entry was missing from the spec, and what it means for anyone editing here.** Its
+plan entry made two claims: the cascade is real, and per-agent resource limits are fictional. A
+verifier confirmed the first and found the SECOND FALSE — `resources.ts` does build a
+`systemd-run --user --scope` prefix and `runner.ts` wraps the pane with it. One verdict was
+recorded for both claims and the entry was excluded whole. **The resource-limit machinery is
+therefore deliberately untouched.** What was corrected is the COMMENT above `resourceArgs`,
+which asserted panes are children of the SHARED server — a sentence this change falsifies.
+
+Consequences, none of them a change to what an operator types:
+
+- `Tmux.list()` takes the names to ask about; there is no fleet-wide `tmux ls` when there is no
+  fleet-wide server. `ours-fleet ls` passes the role names it already enumerates for ACP.
+- generated briefings say `ours-fleet attach <name>` instead of `tmux attach -t <name>`, which
+  would now find no server. An existing command.
+- **Upgrade note for the release:** panes created before this change live on the default server
+  and are invisible to the new code until the role is re-installed with `ours-fleet up` — the
+  normal upgrade path.
+
+### 6.2 (third) — the launchd half of the start verification (`e71e861`)
+
+`launchctl bootstrap` exits 0 once the job is LOADED; `RunAtLoad` then starts the program
+asynchronously. So the exit code describes the load, not the program — the same lie
+`systemctl enable --now` tells on systemd 255, in the other backend's dialect.
+
+After a zero-exit bootstrap the job is asked what it is actually doing, and a failed start
+takes the same rollback path as a failed bootstrap. The systemd distinction is kept: only a
+DEFINITE stop fails the install — not loaded at all, or `state = not running` WITH an exit
+status already recorded. `waiting` between KeepAlive restarts is not a stop, `not running` with
+nothing exited yet is the asynchrony itself and is not a stop, and an unreadable probe is
+`unknown` (1.1).
+
+**`install` and `liveness` ask DIFFERENT questions here**, unlike on systemd where one
+`ActiveState` answers both. `install` asks whether the job started; `liveness` asks whether the
+role's context still exists, and a loaded job answers yes to the second even when it answers no
+to the first. What is shared is `printJob` — the READING of `launchctl print` — not its
+classification. A test pins that the two stay distinct; `liveness` behaviour is unchanged.
+
+The last-exit line is the load-bearing signal and its spelling is not stable across macOS
+releases, so the pattern matches the family (`code|status|reason`) and an unrecognised spelling
+yields `unknown` rather than a false failure.
+
+### Mutation checks (evidence, not confidence)
+
+- made `tmuxArgs` return its arguments unchanged, i.e. the pre-fix behaviour → **40 tests fail**,
+  7 of them the new #32 ones;
+- disabled the launchd start check (`if (false)`) → **4 of the 10 new tests fail** — the
+  negative paths, which are the ones that encode the fix. The other six assert the
+  must-NOT-fail paths and pass either way, by design.
+
+### State at `e71e861`
+
+`tsc` clean, `npm run build` succeeds, **26 files, 635 passed, 0 failed, 0 skipped**. Working
+tree clean apart from untracked `IMPLEMENTATION.md`.
+
+**Not verified by Implementer-3, in those words:** the #32 fix against a real tmux or a real
+running fleet — the cascade was never reproduced here and the fix was never observed preventing
+it; the launchd verification against a real `launchctl` — there is no macOS host here, so the
+tests drive the parser and the decision, not macOS, and that `bootstrap` lies the way
+`enable --now` does is reasoned from `bootstrap`/`RunAtLoad` semantics rather than measured.
 
 ---
 
