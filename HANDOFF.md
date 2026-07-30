@@ -169,6 +169,27 @@ paths; use a realistic failure instead (e.g. a directory where a file is expecte
   killed-before-rename test waits out the 10s stale-lock window on purpose, so that file takes
   ~12s.
 
+## Release acceptance — an addition the spec does not state
+
+**The 5.1 sandbox tests must have RUN, not merely passed.**
+`test/isolation-credentials.test.ts` drives real `bwrap`. On a host without working user
+namespaces those tests SKIP — legitimately, since a developer machine may not sandbox — and a
+suite that reported green would then say nothing at all about the credential boundary. That is
+this release's own disease inside its verification: absence of a signal read as absence of a
+problem.
+
+The skip is therefore loud: the file prints a banner naming what was NOT verified and why, and
+vitest reports the tests as `skipped`, never as passed. When they do run it prints the host's
+bwrap version.
+
+Sign-off requires the suite output to contain
+`[5.1] sandbox tests RUNNING against real bubblewrap — <version>`,
+with that version recorded in the evidence bundle. On the machine this branch was built,
+that line reads **bubblewrap 0.11.0** and user namespaces work, so the 5.1 tests were real here.
+
+I did NOT add this to `IMPLEMENTATION.md`: that file is the approved spec, not mine to edit.
+It belongs in the release checklist alongside the 13 soak checks.
+
 ## Mutation checks performed (evidence, not confidence)
 
 Each of these was run by breaking the fix and confirming the tests go red:
@@ -178,3 +199,5 @@ Each of these was run by breaking the fix and confirming the tests go red:
   fail.
 - 6.1: removed the lock from `pretrust` (keeping the atomic replace) — the ten-process test
   fails with entries missing.
+- 5.1 loud skip: forced `sandbox.ok = false` — the banner prints and vitest reports
+  `6 skipped`, never `6 passed`.

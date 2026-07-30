@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeAll, beforeEach, afterEach } from 'vitest';
 import { mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -15,8 +15,35 @@ import type { WrapContext } from '../src/isolation/types.js';
  * from inside the sandbox, while the role's own runtime state is writable and a
  * minimal session completes normally.
  */
-const bwrapUsable = async (): Promise<boolean> =>
-  (await makeBubblewrapBackend(realExec).available()).ok;
+/**
+ * Whether this host can actually sandbox. A machine without working user
+ * namespaces is legitimate, so a missing sandbox is not a test failure — but it
+ * must never be SILENT. A suite that reports green while the tests carrying the
+ * security property never ran is the same defect this release exists to fix:
+ * absence of a signal read as absence of a problem.
+ */
+let sandbox: { ok: boolean; detail: string };
+
+beforeAll(async () => {
+  sandbox = await makeBubblewrapBackend(realExec).available();
+  if (sandbox.ok) {
+    console.log(
+      `\n[5.1] sandbox tests RUNNING against real bubblewrap — ${sandbox.detail}\n`);
+    return;
+  }
+  const bar = '!'.repeat(78);
+  console.warn(
+    `\n${bar}\n`
+    + '[5.1] SANDBOX TESTS DID NOT RUN. The credential/configuration boundary is\n'
+    + '      UNVERIFIED on this host. A green suite here does NOT mean the sandbox\n'
+    + `      boundary was checked.\n      reason: ${sandbox.detail}\n`
+    + '      Release sign-off requires these tests to have RUN, not merely passed,\n'
+    + '      with the host bwrap version recorded.\n'
+    + `${bar}\n`);
+});
+
+/** Skip loudly: vitest reports these as SKIPPED, never as passed. */
+const requireSandbox = (ctx: { skip(): void }) => { if (!sandbox.ok) ctx.skip(); };
 
 let home: string;
 let stateDir: string;
@@ -60,8 +87,8 @@ async function inSandbox(script: string) {
 }
 
 describe('shared harness credentials are read-only inside a real sandbox (5.1)', () => {
-  it('refuses a write to the shared credential file', async () => {
-    if (!await bwrapUsable()) return;                       // host cannot sandbox; skip
+  it('refuses a write to the shared credential file', async ctx => {
+    requireSandbox(ctx);
     const r = await inSandbox(`echo STOLEN > ${JSON.stringify(join(home, '.claude.json'))}`);
     expect(r.code).not.toBe(0);
     expect(`${r.stderr}`.toLowerCase()).toMatch(/read-only|permission denied/);
@@ -69,22 +96,22 @@ describe('shared harness credentials are read-only inside a real sandbox (5.1)',
     expect(readFileSync(join(home, '.claude.json'), 'utf8')).toContain('SHARED');
   });
 
-  it('refuses a write to the shared global instructions', async () => {
-    if (!await bwrapUsable()) return;
+  it('refuses a write to the shared global instructions', async ctx => {
+    requireSandbox(ctx);
     const r = await inSandbox(`echo OVERRIDDEN > ${JSON.stringify(join(claudeHome, 'CLAUDE.md'))}`);
     expect(r.code).not.toBe(0);
     expect(readFileSync(join(claudeHome, 'CLAUDE.md'), 'utf8')).toBe('GLOBAL INSTRUCTIONS\n');
   });
 
-  it('refuses a write to the shared settings', async () => {
-    if (!await bwrapUsable()) return;
+  it('refuses a write to the shared settings', async ctx => {
+    requireSandbox(ctx);
     const r = await inSandbox(`echo BAD > ${JSON.stringify(join(claudeHome, 'settings.json'))}`);
     expect(r.code).not.toBe(0);
     expect(readFileSync(join(claudeHome, 'settings.json'), 'utf8')).toContain('"shared":true');
   });
 
-  it('still lets the agent READ the shared credentials and instructions', async () => {
-    if (!await bwrapUsable()) return;
+  it('still lets the agent READ the shared credentials and instructions', async ctx => {
+    requireSandbox(ctx);
     const r = await inSandbox(
       `cat ${JSON.stringify(join(home, '.claude.json'))} ${JSON.stringify(join(claudeHome, 'CLAUDE.md'))}`);
     expect(r.code).toBe(0);
@@ -92,8 +119,8 @@ describe('shared harness credentials are read-only inside a real sandbox (5.1)',
     expect(r.stdout).toContain('GLOBAL INSTRUCTIONS');
   });
 
-  it('completes a normal minimal session using its own per-role state', async () => {
-    if (!await bwrapUsable()) return;
+  it('completes a normal minimal session using its own per-role state', async ctx => {
+    requireSandbox(ctx);
     // The harness home is writable — sessions, history, caches all land in the
     // per-role directory — and the work is done in the role's own cwd.
     const r = await inSandbox(
@@ -115,8 +142,8 @@ describe('shared harness credentials are read-only inside a real sandbox (5.1)',
     expect(() => readFileSync(join(claudeHome, 'history.jsonl'), 'utf8')).toThrow();
   });
 
-  it("one role's runtime state is invisible to another role", async () => {
-    if (!await bwrapUsable()) return;
+  it("one role's runtime state is invisible to another role", async ctx => {
+    requireSandbox(ctx);
     const sibling = join(home, '.ours-fleet', 'agents', 'Other');
     mkdirSync(join(sibling, 'harness', 'claude-code'), { recursive: true });
     writeFileSync(join(sibling, 'secret.txt'), 'PEER STATE\n');
