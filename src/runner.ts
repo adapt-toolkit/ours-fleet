@@ -285,20 +285,27 @@ export async function runOnce(
     control = new RoleControlServer(dir, acpSession, deps.log);
     await control.start();
     resolvedMonitorDeps.delivery = {
+      // A wake is only delivered when its turn TERMINATES successfully. A
+      // refusal or a cancellation reached the agent and was not acted on, so
+      // the monitor must keep its cursor and try again.
       submit: async text => {
         const result = await acpSession!.submitPrompt(text);
-        return { accepted: result.accepted, detail: result.detail };
+        return { succeeded: result.succeeded, outcome: result.outcome, detail: result.detail };
       },
     };
     const firstPrompt = mode === 'fresh'
       ? `Read and follow ${join(dir, 'briefing.md')} now.`
       : adapter.vocabulary.restartPrompt(role.identity, join(dir, 'WORKLOG.md'), role);
+    // Wait for the first turn's TERMINAL result. An agent that accepts the
+    // startup prompt and then refuses it has not started; logging the role as
+    // up would hide a role that never read its briefing.
     const started = await acpSession.submitPrompt(firstPrompt);
-    if (!started.accepted) {
+    if (!started.succeeded) {
       monitor?.stop();
       await control.close();
       await acpSession.close();
-      throw new Error(`[${name}] ACP session rejected startup prompt: ${started.detail ?? started.outcome}`);
+      throw new Error(`[${name}] ACP startup prompt ${started.outcome}` +
+        `${started.detail ? `: ${started.detail}` : ''}`);
     }
   } else {
     await deps.tmux.kill(name);

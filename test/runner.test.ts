@@ -1,7 +1,8 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { stringify } from 'yaml';
 import { runOnce, runTemp, buildPaneCommand, reserveLaunchSlot } from '../src/runner.js';
 import { registerAdapter } from '../src/harness/registry.js';
@@ -9,6 +10,7 @@ import { agentDir, stateRoot } from '../src/paths.js';
 import { Tmux } from '../src/tmux.js';
 import { fakeAdapter } from './registry.test.js';
 import type { Exec } from '../src/exec.js';
+import type { HarnessAdapter } from '../src/harness/types.js';
 import type { MonitorOpts } from '../src/monitor.js';
 
 let dir: string;
@@ -252,6 +254,74 @@ describe('runOnce', () => {
     await runOnce('A', {}, deps);
     expect(readFileSync(join(d, '.session-id'), 'utf8').trim()).toBe('KEEP');
     expect(existsSync(join(d, '.booted'))).toBe(true);
+  });
+});
+
+describe('runOnce ACP startup outcome (1.2)', () => {
+  const acpFixture = join(dirname(fileURLToPath(import.meta.url)), 'fixtures', 'acp-agent.mjs');
+
+  /** The fake adapter, taught to launch the ACP fixture as its agent process. */
+  const acpAdapter: HarnessAdapter = {
+    ...fakeAdapter,
+    id: 'fake-acp',
+    buildAcpLaunch: () => ({ argv: [process.execPath, acpFixture], env: {} }),
+  };
+
+  /** Real-clock deps: an ACP session is a real child process, not a fake pane. */
+  function acpDeps() {
+    const logs: string[] = [];
+    const exec: Exec = async () => ({ stdout: '', stderr: '', code: 0 });
+    return {
+      logs,
+      deps: {
+        tmux: new Tmux(exec), exec,
+        cpuDelegated: () => true,
+        isAlive: () => true,
+        sleep: (ms: number) => new Promise<void>(r => setTimeout(r, Math.min(ms, 25))),
+        now: () => Date.now(),
+        log: (l: string) => { logs.push(l); },
+        fetch: async () => ({ status: 200, ok: true, json: async () => ({ cursor: 0, events: [] }) }),
+        createMonitor: () => ({ prime: async () => {}, run: async () => {}, stop: () => {} }),
+      },
+    };
+  }
+
+  beforeEach(() => { registerAdapter(acpAdapter); });
+
+  it('a refused startup prompt fails the role instead of logging it up', async () => {
+    writeCfg({ A: {
+      harness: 'fake-acp', session: 'acp',
+      env: { ACP_FIXTURE_STOP_REASON: 'refusal' },
+    } });
+    mkdirSync(agentDir('A'), { recursive: true });
+    const { deps, logs } = acpDeps();
+
+    await expect(runOnce('A', {}, deps)).rejects.toThrow(/startup prompt refused/);
+    expect(logs.some(l => l.includes('[A] up;'))).toBe(false);
+  });
+
+  it('a cancelled startup prompt fails the role too', async () => {
+    writeCfg({ A: {
+      harness: 'fake-acp', session: 'acp',
+      env: { ACP_FIXTURE_STOP_REASON: 'cancelled' },
+    } });
+    mkdirSync(agentDir('A'), { recursive: true });
+    const { deps, logs } = acpDeps();
+
+    await expect(runOnce('A', {}, deps)).rejects.toThrow(/startup prompt cancelled/);
+    expect(logs.some(l => l.includes('[A] up;'))).toBe(false);
+  });
+
+  it('a completed startup prompt does log the role up', async () => {
+    writeCfg({ A: {
+      harness: 'fake-acp', session: 'acp',
+      env: { ACP_FIXTURE_EXIT_AFTER: '1' },      // agent leaves once startup is answered
+    } });
+    mkdirSync(agentDir('A'), { recursive: true });
+    const { deps, logs } = acpDeps();
+
+    await runOnce('A', {}, deps);
+    expect(logs.some(l => l.includes('[A] up;') && l.includes('session=acp'))).toBe(true);
   });
 });
 

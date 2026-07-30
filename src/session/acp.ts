@@ -8,7 +8,8 @@ import * as acp from '@agentclientprotocol/sdk';
 
 import type { CommonPermissions } from '../config.js';
 import { SessionEvents } from './events.js';
-import type { SessionEvent, SessionHandle, SessionSnapshot, TurnResult } from './types.js';
+import { turnResult } from './types.js';
+import type { SessionEvent, SessionHandle, SessionSnapshot, TurnOutcome, TurnResult } from './types.js';
 
 interface PendingPermission {
   options: Array<{ optionId: string; kind: string }>;
@@ -24,6 +25,19 @@ export interface AcpSessionOptions {
   mode: 'fresh' | 'resume';
   permissions: CommonPermissions;
   log(line: string): void;
+}
+
+/**
+ * Classify an ACP `stopReason` into a terminal outcome. A refusal and a
+ * cancellation are the two ways a delivered prompt ends without being carried
+ * out; every other stop reason ran the turn to an end the agent chose.
+ */
+export function classifyStopReason(stopReason: string | undefined): TurnOutcome {
+  switch (stopReason) {
+    case 'refusal': return 'refused';
+    case 'cancelled': return 'cancelled';
+    default: return 'completed';
+  }
 }
 
 /**
@@ -204,7 +218,7 @@ export class AcpSession implements SessionHandle {
 
   private async runPrompt(text: string): Promise<TurnResult> {
     if (!this.sessionId || !this.isAlive())
-      return { accepted: false, outcome: 'failed', detail: this.lastError ?? 'ACP session is offline' };
+      return turnResult(false, 'failed', this.lastError ?? 'ACP session is offline');
     this.readiness = 'running';
     const turnId = randomUUID();
     this.events.emit('state', { turnId, status: 'running' });
@@ -216,18 +230,15 @@ export class AcpSession implements SessionHandle {
       this.readiness = 'idle';
       this.events.emit('turn_stop', { turnId, stopReason: response.stopReason });
       this.events.emit('state', { status: 'idle' });
-      const outcome = response.stopReason === 'cancelled'
-        ? 'cancelled'
-        : response.stopReason === 'refusal'
-          ? 'refused'
-          : 'completed';
-      return { accepted: true, outcome, detail: response.stopReason };
+      // The prompt was accepted either way — the agent answered. Whether the
+      // turn SUCCEEDED is a separate question, and only `stopReason` answers it.
+      return turnResult(true, classifyStopReason(response.stopReason), response.stopReason);
     } catch (error) {
       this.lastError = (error as Error)?.message ?? String(error);
       this.readiness = this.isAlive() ? 'idle' : 'failed';
       this.events.emit('error', { turnId, text: this.lastError });
       if (this.isAlive()) this.events.emit('state', { status: 'idle' });
-      return { accepted: false, outcome: 'failed', detail: this.lastError };
+      return turnResult(false, 'failed', this.lastError);
     }
   }
 

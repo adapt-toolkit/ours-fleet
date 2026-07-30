@@ -1,4 +1,5 @@
 import type { Tmux } from '../tmux.js';
+import { turnResult } from './types.js';
 import type { SessionEvent, SessionHandle, SessionSnapshot, TurnResult } from './types.js';
 
 /** SessionHandle adapter for the existing tmux transport. */
@@ -25,9 +26,10 @@ export class TmuxSession implements SessionHandle {
   }
 
   async submitPrompt(text: string): Promise<TurnResult> {
-    if (!this.isAlive()) return { accepted: false, outcome: 'failed', detail: 'tmux pane is offline' };
+    if (!this.isAlive()) return turnResult(false, 'failed', 'tmux pane is offline');
     await this.tmux.sendText(this.name, text);
-    return { accepted: true, outcome: 'inconclusive' };
+    // Keystrokes carry no terminal result: tmux cannot tell us how the turn ended.
+    return turnResult(true, 'inconclusive');
   }
 
   async interrupt(): Promise<void> {

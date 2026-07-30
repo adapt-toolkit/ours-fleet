@@ -5,6 +5,25 @@ let permissionRequestId = 10_000;
 const pendingPermission = new Map();
 const send = value => process.stdout.write(JSON.stringify(value) + '\n');
 
+// Terminal-outcome modes. A prompt's own text picks one ("refuse …"/"cancel …");
+// ACP_FIXTURE_STOP_REASON forces one for EVERY prompt, which is how the runner
+// tests exercise a refused startup prompt whose text they do not control.
+const FORCED_STOP_REASON = process.env.ACP_FIXTURE_STOP_REASON;
+// Exit the agent process after this many prompts (0 = never), so a runner test
+// can let a normal session finish instead of blocking forever.
+const EXIT_AFTER = parseInt(process.env.ACP_FIXTURE_EXIT_AFTER ?? '0', 10) || 0;
+let promptsAnswered = 0;
+
+const stopReasonFor = text =>
+  FORCED_STOP_REASON ??
+  (/\brefuse\b/i.test(text) ? 'refusal' : /\bcancel\b/i.test(text) ? 'cancelled' : 'end_turn');
+
+const answerPrompt = (id, stopReason) => {
+  send({ jsonrpc: '2.0', id, result: { stopReason } });
+  if (EXIT_AFTER && ++promptsAnswered >= EXIT_AFTER)
+    setTimeout(() => process.exit(0), 20);   // let the reply flush first
+};
+
 createInterface({ input: process.stdin }).on('line', line => {
   const message = JSON.parse(line);
   if ('result' in message || 'error' in message) {
@@ -24,7 +43,7 @@ createInterface({ input: process.stdin }).on('line', line => {
         },
       },
     });
-    send({ jsonrpc: '2.0', id: pending.promptId, result: { stopReason: 'end_turn' } });
+    answerPrompt(pending.promptId, FORCED_STOP_REASON ?? 'end_turn');
     return;
   }
   switch (message.method) {
@@ -83,7 +102,7 @@ createInterface({ input: process.stdin }).on('line', line => {
           },
         });
       } else {
-        send({ jsonrpc: '2.0', id: message.id, result: { stopReason: 'end_turn' } });
+        answerPrompt(message.id, stopReasonFor(text));
       }
       break;
     }

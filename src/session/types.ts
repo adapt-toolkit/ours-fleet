@@ -7,10 +7,36 @@ export type SessionReadiness =
   | 'awaiting_permission'
   | 'failed';
 
+export type TurnOutcome = 'completed' | 'refused' | 'cancelled' | 'failed' | 'inconclusive';
+
+/**
+ * Two independent facts about one turn, deliberately kept apart:
+ *
+ * - `accepted` — the live session took responsibility for the prompt. It says
+ *   nothing about what the agent then did with it.
+ * - `outcome` / `succeeded` — how the turn TERMINATED. Only `completed` is a
+ *   terminal success. A refusal or a cancellation is a prompt that was
+ *   delivered and then not carried out; every caller that needs the work
+ *   actually done (mail delivery, role startup) must treat it as a failure.
+ *
+ * Collapsing the two is what let a refused wake commit its notification cursor
+ * and a refused startup prompt log the role as up.
+ */
 export interface TurnResult {
   accepted: boolean;
-  outcome: 'completed' | 'refused' | 'cancelled' | 'failed' | 'inconclusive';
+  outcome: TurnOutcome;
+  succeeded: boolean;
   detail?: string;
+}
+
+/** The single definition of terminal success. Nothing else may re-derive it. */
+export const isTerminalSuccess = (outcome: TurnOutcome): boolean => outcome === 'completed';
+
+/** Build a TurnResult with `succeeded` always consistent with `outcome`. */
+export function turnResult(
+  accepted: boolean, outcome: TurnOutcome, detail?: string,
+): TurnResult {
+  return { accepted, outcome, succeeded: isTerminalSuccess(outcome), detail };
 }
 
 export interface SessionSnapshot {

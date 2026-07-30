@@ -33,10 +33,38 @@ describe('AcpSession', () => {
   it('initializes ACP v1, streams typed events, and completes a prompt', async () => {
     const session = await start();
     const result = await session.submitPrompt('hello');
-    expect(result).toMatchObject({ accepted: true, outcome: 'completed', detail: 'end_turn' });
+    expect(result).toMatchObject({
+      accepted: true, outcome: 'completed', succeeded: true, detail: 'end_turn',
+    });
     expect(session.eventsSince(0).some(event =>
       event.kind === 'agent_text' && event.text === 'echo:hello')).toBe(true);
     await session.close();
+  });
+
+  it('a refused turn is delivered but not successful (1.2)', async () => {
+    const session = await start();
+    const result = await session.submitPrompt('refuse this');
+    expect(result).toMatchObject({
+      accepted: true,          // the agent did answer — delivery happened
+      outcome: 'refused',      // …and declined to do the work
+      succeeded: false,        // …so no caller may treat it as done
+      detail: 'refusal',
+    });
+    await session.close();
+  });
+
+  it('a cancelled turn is delivered but not successful (1.2)', async () => {
+    const session = await start();
+    const result = await session.submitPrompt('cancel this');
+    expect(result).toMatchObject({ accepted: true, outcome: 'cancelled', succeeded: false });
+    await session.close();
+  });
+
+  it('an offline session neither accepts nor succeeds', async () => {
+    const session = await start();
+    await session.close();
+    const result = await session.submitPrompt('hello');
+    expect(result).toMatchObject({ accepted: false, outcome: 'failed', succeeded: false });
   });
 
   it('applies common automatic approval to ACP permission requests', async () => {

@@ -513,7 +513,13 @@ describe('Monitor.run — delivery', () => {
       { cursor: 2, events: [{ event: 'message_received', from: 'C', msg_id: 9 }] },
     ]);
     const deps = makeDeps(fetch, tmux, {
-      delivery: { submit: async text => { delivered.push(text); mon.stop(); return { accepted: true }; } },
+      delivery: {
+        submit: async text => {
+          delivered.push(text);
+          mon.stop();
+          return { succeeded: true, outcome: 'completed' };
+        },
+      },
     });
     let mon: ReturnType<typeof createMonitor>;
     mon = createMonitor({ name: 'A', agentDir: dir, cfg: CFG({ batch_ms: 0 }), deps });
@@ -521,6 +527,89 @@ describe('Monitor.run — delivery', () => {
     await mon.run(1);
     expect(delivered).toEqual(['[fleet-monitor] 1 new message from C (#9) — run get_messages']);
     expect(tmux.sent).toEqual([]);
+    expect(readFileSync(join(dir, '.notify-cursor'), 'utf8').trim()).toBe('2');
+  });
+
+  it('a refused ACP wake keeps the cursor, degrades with the reason, and replays (1.2)', async () => {
+    const tmux = fakeTmux();
+    const submitted: string[] = [];
+    const { fetch } = scriptedFetch([
+      { cursor: 1, events: [] },                                                  // prime tip
+      { cursor: 2, events: [{ event: 'message_received', from: 'C', msg_id: 9 }] },
+      { cursor: 2, events: [] },                                                  // replay poll
+    ]);
+    const deps = makeDeps(fetch, tmux, {
+      delivery: {
+        submit: async text => {
+          submitted.push(text);
+          if (submitted.length >= 2) mon.stop();
+          // First wake is refused by the agent; the retry completes.
+          return submitted.length === 1
+            ? { succeeded: false, outcome: 'refused', detail: 'refusal' }
+            : { succeeded: true, outcome: 'completed' };
+        },
+      },
+    });
+    let mon: ReturnType<typeof createMonitor>;
+    mon = createMonitor({ name: 'A', agentDir: dir, cfg: CFG({ batch_ms: 0 }), deps });
+    await mon.prime();
+    await mon.run(1);
+
+    expect(submitted).toHaveLength(2);                      // the wake was retried
+    expect(submitted[0]).toBe(submitted[1]);                // …with the same batch
+    expect(readFileSync(join(dir, '.notify-cursor'), 'utf8').trim()).toBe('2');
+  });
+
+  it('a refusal that never recovers leaves the durable cursor behind and says why (1.2)', async () => {
+    const tmux = fakeTmux();
+    let submits = 0;
+    const { fetch } = scriptedFetch([
+      { cursor: 1, events: [] },
+      { cursor: 2, events: [{ event: 'message_received', from: 'C', msg_id: 9 }] },
+    ]);
+    const deps = makeDeps(fetch, tmux, {
+      delivery: {
+        submit: async () => {
+          submits++;
+          mon.stop();
+          return { succeeded: false, outcome: 'refused', detail: 'refusal' };
+        },
+      },
+    });
+    let mon: ReturnType<typeof createMonitor>;
+    mon = createMonitor({ name: 'A', agentDir: dir, cfg: CFG({ batch_ms: 0 }), deps });
+    await mon.prime();
+    await mon.run(1);
+
+    expect(submits).toBe(1);
+    // Prior durable cursor is intact, so the daemon replays event 2 next time.
+    expect(readFileSync(join(dir, '.notify-cursor'), 'utf8').trim()).toBe('1');
+    const status = readFileSync(join(dir, '.monitor-status'), 'utf8');
+    expect(status).toContain('degraded');
+    expect(status).toContain('refused');
+    expect(status).not.toMatch(/^armed/);
+    // The undelivered batch survives a restart as pending state.
+    const state = JSON.parse(readFileSync(join(dir, '.monitor-state.json'), 'utf8'));
+    expect(state).toMatchObject({ deliveredCursor: 1, pending: { count: 1 } });
+  });
+
+  it('a cancelled wake is likewise not a delivery (1.2)', async () => {
+    const tmux = fakeTmux();
+    const { fetch } = scriptedFetch([
+      { cursor: 1, events: [] },
+      { cursor: 2, events: [{ event: 'message_received', from: 'C', msg_id: 9 }] },
+    ]);
+    const deps = makeDeps(fetch, tmux, {
+      delivery: {
+        submit: async () => { mon.stop(); return { succeeded: false, outcome: 'cancelled' }; },
+      },
+    });
+    let mon: ReturnType<typeof createMonitor>;
+    mon = createMonitor({ name: 'A', agentDir: dir, cfg: CFG({ batch_ms: 0 }), deps });
+    await mon.prime();
+    await mon.run(1);
+    expect(readFileSync(join(dir, '.notify-cursor'), 'utf8').trim()).toBe('1');
+    expect(readFileSync(join(dir, '.monitor-status'), 'utf8')).toContain('cancelled');
   });
 
   it('injects one notification line for a filtered wake and advances the cursor', async () => {

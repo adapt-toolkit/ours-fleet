@@ -50,9 +50,14 @@ export interface MonitorDeps {
     set(fn: () => void, ms: number): ReturnType<typeof setTimeout>;
     clear(t: ReturnType<typeof setTimeout>): void;
   };
-  /** Structured prompt delivery used by ACP sessions. Tmux remains the fallback. */
+  /**
+   * Structured prompt delivery used by ACP sessions. Tmux remains the fallback.
+   * `succeeded` is the turn's TERMINAL result, not merely that the session took
+   * the prompt: a refused or cancelled wake was seen and not acted on, and must
+   * not commit the cursor.
+   */
   delivery?: {
-    submit(text: string): Promise<{ accepted: boolean; detail?: string }>;
+    submit(text: string): Promise<{ succeeded: boolean; outcome: string; detail?: string }>;
   };
 }
 
@@ -462,8 +467,11 @@ export class Monitor {
     const line = formatNotificationLine(batch);
     if (this.deps.delivery) {
       const result = await this.deps.delivery.submit(line);
-      if (!result.accepted) {
-        this.setStatus(`degraded: ACP prompt not accepted${result.detail ? ` (${result.detail})` : ''}`);
+      if (!result.succeeded) {
+        // Name the reason: "refused" and "cancelled" are the agent's answer,
+        // not a transport problem, and an operator has to be able to tell them
+        // apart from a dead socket.
+        this.setStatus(`degraded: wake ${result.outcome}${result.detail ? ` (${result.detail})` : ''}`);
         return false;
       }
       this.recordTurn('completed');
