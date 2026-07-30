@@ -141,6 +141,27 @@ The backend translates this common intent. Harness-native settings in
 \`allow\`/\`unrestricted\`, Codex \`never\`/\`danger-full-access\`, or Claude
 \`bypassPermissions\` without explicit authorization.
 
+### Creation-time isolation
+
+\`ours-fleet spawn --isolation-file <path>\` supplies a role's sandbox policy at
+creation, so the FIRST launch is already confined — a role that only gains
+\`isolation:\` on a later \`up\` ran unsandboxed until then.
+
+The file holds exactly the \`isolation:\` mapping documented above and nothing
+else — the same schema, validated by the same code, so a policy written here
+cannot mean something different from the identical block in fleet.yaml:
+
+\`\`\`yaml
+network: deny
+fs:
+  read: [/opt/reference]
+resources:
+  mem: 2G
+\`\`\`
+
+Invalid files are rejected before anything is created: no config, no state
+directory, no identity reservation. Works for both permanent and \`--temp\` roles.
+
 ### The unattended capability floor
 
 An unattended role has no console, so a permission request cannot be answered —

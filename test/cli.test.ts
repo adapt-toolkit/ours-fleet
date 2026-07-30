@@ -70,6 +70,21 @@ describe('ours-fleet CLI', () => {
       expect(r.stdout).toContain(flag);
   });
 
+  it('spawn offers --isolation-file, the one new operator input (6.3)', async () => {
+    const r = await run(['spawn', '--help']);
+    expect(r.code).toBe(0);
+    expect(r.stdout).toContain('--isolation-file');
+    // Commander wraps help text, so match on words rather than a whole phrase.
+    expect(r.stdout).toContain('isolation:');
+    expect(r.stdout).toContain('fleet.yaml');
+  });
+
+  it('docs describe creation-time isolation (6.3)', async () => {
+    const r = await run(['docs']);
+    expect(r.stdout).toContain('--isolation-file');
+    expect(r.stdout).toContain('Creation-time isolation');
+  });
+
   it('config prints an isolation summary for a role that declares it', async () => {
     const { writeFileSync } = await import('node:fs');
     writeFileSync(join(dir, 'fleet.yaml'),

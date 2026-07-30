@@ -266,6 +266,21 @@ describe('runOnce', () => {
   });
 });
 
+describe('creation-time isolation reaches the FIRST launch (6.3)', () => {
+  it("a role whose config carries `isolation` is sandbox-wrapped on its first start", async () => {
+    // This is the property --isolation-file exists for: the very first process
+    // is confined, not the one after the operator edits fleet.yaml.
+    writeCfg({ Sec: { harness: 'fake', isolation: { network: 'deny' } } });
+    const d = agentDir('Sec');
+    mkdirSync(d, { recursive: true });
+    const { deps, paneCommands } = fakeWorld({ exitCode: '0', exitFile: join(d, '.exit-status') });
+    await runOnce('Sec', {}, deps);
+    expect(paneCommands[0]).toContain(`'bwrap'`);
+    expect(paneCommands[0]).toContain(`'--unshare-net'`);      // network: deny honoured
+    expect(paneCommands[0]).toMatch(/'--'.*'fakebin'/);
+  });
+});
+
 describe('exit classification (1.6)', () => {
   const readRecord = (d: string) =>
     JSON.parse(readFileSync(join(d, '.exit-status'), 'utf8')) as { class: string; detail: string };

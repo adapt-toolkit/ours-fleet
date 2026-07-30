@@ -336,6 +336,7 @@ cOpt(program.command('spawn <name>').description('spawn a new agent (permanent b
   .option('--monitor', 'explicitly consent to arm this Codex role\'s ours mail monitor')
   .option('--bio-file <file>', 'public bio (file)')
   .option('--persona-file <file>', 'persona / operating contract (file)')
+  .option('--isolation-file <path>', 'file holding an isolation: mapping (same schema as fleet.yaml)')
   .action(async (name, opts) => {
     try {
       const o: SpawnOpts = {
@@ -347,7 +348,8 @@ cOpt(program.command('spawn <name>').description('spawn a new agent (permanent b
         sandbox: opts.sandbox, profile: opts.profile,
         launcher: opts.launcher, search: opts.search,
         codexConfig: parseCodexConfig(opts.codexConfig), addDirs: opts.addDir, monitor: opts.monitor,
-        bioFile: opts.bioFile, personaFile: opts.personaFile, configPath: opts.configuration,
+        bioFile: opts.bioFile, personaFile: opts.personaFile,
+        isolationFile: opts.isolationFile, configPath: opts.configuration,
       };
       if (o.temp) {
         const dir = await spawnTemp(o, binPath);

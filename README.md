@@ -286,6 +286,32 @@ the mode that actually permits the actions the role was authorized to take.
 [`isolation:`](#agent-isolation) as the outer boundary, which no permission
 mode can cross.
 
+### Isolation at creation time
+
+```sh
+ours-fleet spawn Sec --isolation-file policy.yaml
+ours-fleet spawn --temp Scout --isolation-file policy.yaml
+```
+
+`--isolation-file` supplies the role's sandbox policy when it is created, so its
+**first** launch is already confined. Without it a role gains `isolation:` only when
+you edit `fleet.yaml` and run `up`, and everything before that ran unsandboxed.
+
+The file contains exactly the [`isolation:` mapping](#agent-isolation) — the same schema,
+validated by the same code, so it cannot mean something different from the identical block
+in `fleet.yaml`:
+
+```yaml
+network: deny
+fs:
+  read: [/opt/reference]
+resources:
+  mem: 2G
+```
+
+An invalid file is rejected before anything is created — no config, no state directory, no
+identity reservation.
+
 ### Sandboxed credentials and configuration
 
 A sandboxed role gets a **per-role writable harness home** under its own state directory

@@ -473,3 +473,77 @@ describe('every failed creation stage rolls back (6.2)', () => {
     expect(err!.message).toContain('and rollback broke too');
   });
 });
+
+describe('creation-time isolation (6.3)', () => {
+  const policy = 'network: deny\nfs:\n  read:\n    - /opt/reference\nresources:\n  mem: 2G\n';
+  const writePolicy = (body = policy) => {
+    const p = join(dir, 'policy.yaml');
+    writeFileSync(p, body);
+    return p;
+  };
+
+  it('a permanent role is created WITH the policy, round-tripped exactly', async () => {
+    const { d } = fakeDeps();
+    const file = await spawnPermanent({ name: 'Sec', isolationFile: writePolicy() }, d);
+    const role = parse(readFileSync(file, 'utf8')).roles.Sec;
+    // The same schema, not a translation of it.
+    expect(role.isolation).toEqual({
+      network: 'deny', fs: { read: ['/opt/reference'] }, resources: { mem: '2G' },
+    });
+  });
+
+  it('a temp role snapshots it too, so its first launch is confined', async () => {
+    const d = await spawnTemp(
+      { name: 'Scout', isolationFile: writePolicy() }, '/b/ours-fleet', () => {});
+    const snap = parse(readFileSync(join(d, 'role.yaml'), 'utf8'));
+    expect(snap.isolation).toEqual({
+      network: 'deny', fs: { read: ['/opt/reference'] }, resources: { mem: '2G' },
+    });
+  });
+
+  it('an empty (comments-only) file is a valid request for default isolation', async () => {
+    const { d } = fakeDeps();
+    const file = await spawnPermanent(
+      { name: 'Defaults', isolationFile: writePolicy('# just a comment\n') }, d);
+    expect(parse(readFileSync(file, 'utf8')).roles.Defaults.isolation).toEqual({});
+  });
+
+  it('an invalid policy is rejected BEFORE anything is created', async () => {
+    const { d, calls } = fakeDeps();
+    const bad = writePolicy('network: telepathy\n');
+    await expect(spawnPermanent({ name: 'Bad', isolationFile: bad }, d))
+      .rejects.toThrowError(/isolation.network: invalid value 'telepathy'/);
+    expect(existsSync(join(dir, 'fleet.d', 'Bad.yaml'))).toBe(false);
+    expect(existsSync(agentDir('Bad'))).toBe(false);
+    expect(calls.filter(c => c[0] === 'install')).toEqual([]);
+  });
+
+  it('an unknown key is rejected by the SAME validator fleet.yaml uses', async () => {
+    const { d } = fakeDeps();
+    await expect(spawnPermanent(
+      { name: 'Bad2', isolationFile: writePolicy('nteork: deny\n') }, d))
+      .rejects.toThrowError(/unknown key\(s\) nteork/);
+  });
+
+  it('a missing file fails by name, before creating anything', async () => {
+    const { d } = fakeDeps();
+    await expect(spawnPermanent(
+      { name: 'Bad3', isolationFile: join(dir, 'nope.yaml') }, d))
+      .rejects.toThrowError(/--isolation-file/);
+    expect(existsSync(agentDir('Bad3'))).toBe(false);
+  });
+
+  it('a forbidden mount in the policy is refused at creation (5.2 still applies)', async () => {
+    const { d } = fakeDeps();
+    await expect(spawnPermanent({
+      name: 'Sneaky',
+      isolationFile: writePolicy(`fs:\n  write:\n    - ${join(dir, '.ssh')}\n`),
+    }, d)).rejects.toThrowError(/refusing to mount/);
+  });
+
+  it('a role without the flag is unchanged — no isolation block appears', async () => {
+    const { d } = fakeDeps();
+    const file = await spawnPermanent({ name: 'Plain' }, d);
+    expect(parse(readFileSync(file, 'utf8')).roles.Plain.isolation).toBeUndefined();
+  });
+});

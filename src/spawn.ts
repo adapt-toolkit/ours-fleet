@@ -1,8 +1,10 @@
 import { spawn as spawnChild } from 'node:child_process';
 import { existsSync, mkdirSync, openSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { stringify } from 'yaml';
+import { parse, stringify } from 'yaml';
 import { agentDir, fleetDDir } from './paths.js';
+import { validateIsolationConfig } from './isolation/policy.js';
+import type { IsolationConfig } from './isolation/types.js';
 import {
   loadConfig, resolveMonitorConfig, resolvePermissions,
   type ApprovalMode, type FilesystemMode, type ResolvedRole, type RoleConfig,
@@ -38,6 +40,12 @@ export interface SpawnOpts {
   monitor?: boolean;
   bioFile?: string;
   personaFile?: string;
+  /**
+   * Path to a file holding exactly the existing `isolation:` mapping — the same
+   * schema fleet.yaml uses, not a second policy language. The ONE new operator
+   * input in this release (6.3).
+   */
+  isolationFile?: string;
   overseeInterval?: string;
   configPath?: string;
 }
@@ -71,7 +79,31 @@ function roleFromOpts(o: SpawnOpts, defaultHarness?: string): RoleConfig {
   }
   if (o.bioFile) r.bio = readFileSync(o.bioFile, 'utf8').trim();
   if (o.personaFile) r.persona = readFileSync(o.personaFile, 'utf8').trim();
+  if (o.isolationFile) r.isolation = readIsolationFile(o.isolationFile);
   return r;
+}
+
+/**
+ * Read and validate an `--isolation-file`. The file is the existing
+ * `isolation:` mapping and nothing else — the same schema, the same validator
+ * (`validateIsolationConfig`), so a policy written here cannot mean something
+ * different from the identical block in fleet.yaml.
+ *
+ * Called BEFORE the creation transaction reserves anything: an invalid file
+ * must fail before any artifact exists.
+ */
+export function readIsolationFile(path: string): IsolationConfig {
+  let raw: unknown;
+  try { raw = parse(readFileSync(path, 'utf8')); }
+  catch (e) {
+    throw new Error(`--isolation-file ${path}: ${(e as Error).message}`);
+  }
+  // A file holding only comments parses to null; treat it as an empty policy,
+  // which is a meaningful request ("sandbox me with defaults").
+  const cfg = (raw ?? {}) as IsolationConfig;
+  const problems = validateIsolationConfig(cfg);
+  if (problems.length) throw new Error(`--isolation-file ${path}: ${problems.join('; ')}`);
+  return cfg;
 }
 
 function validateSpawnOpts(o: SpawnOpts): void {
@@ -108,6 +140,7 @@ export async function spawnPermanent(
   o: SpawnOpts, deps: OpsDeps, creation: CreationDeps = {},
 ): Promise<string> {
   validateSpawnOpts(o);
+  if (o.isolationFile) readIsolationFile(o.isolationFile);   // fail before reserving
   // Name AND identity reserved together, before anything is written or started
   // (6.4). A loser of the race creates no config, no state, no service.
   return withCreationTransaction(
@@ -183,6 +216,7 @@ export async function spawnTemp(
   creation: CreationDeps = {},
 ): Promise<string> {
   validateSpawnOpts(o);
+  if (o.isolationFile) readIsolationFile(o.isolationFile);   // fail before reserving
   // Temporary roles go through the SAME reservation boundary as permanent ones
   // (6.4): a temp agent competes for the same names.
   return withCreationTransaction(
@@ -213,7 +247,7 @@ async function spawnTempInner(
     ...(fromOpts.harness_options ?? {}),
   };
   const role: ResolvedRole = {
-    ...fromOpts,
+    ...fromOpts,          // includes `isolation` when --isolation-file was given
     name: o.name,
     harness: o.harness ?? defaultHarness ?? 'claude-code',
     session: o.session ?? (cfg.defaults.session as SessionBackendId | undefined) ?? 'tmux',

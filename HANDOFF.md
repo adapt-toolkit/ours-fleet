@@ -41,16 +41,16 @@ Baseline before any work: **339 passed**.
 | 6.4 atomic role + identity reservation | `c7eccb9` | 533 |
 | 7.3 guarantee identity existence before launch | `f759a35` | 545 |
 | 6.2 roll back every failed creation stage | `b077947` | 554 |
+| 6.3 `spawn --isolation-file` | `PENDING` | 565 |
 
-Sections 1-4 complete. Section 5 in progress: 6.1, 6.4, 7.3, 6.2 done; 6.3 next.
+Sections 1-4 complete. Section 5 in progress: 6.1, 6.4, 7.3, 6.2, 6.3 done; 6.6 next.
 
 ## Remaining, in spec dependency order
 
-1. **6.3** `spawn --isolation-file` (the ONE approved new operator input)
-2. **6.6** persist creation provenance
-3. **7.1** correct the spawn skill
-4. **7.2** stop using one console command as a liveness verdict
-5. **7.4** document never-prompt failure and the capability floor
+1. **6.6** persist creation provenance
+2. **7.1** correct the spawn skill
+3. **7.2** stop using one console command as a liveness verdict
+4. **7.4** document never-prompt failure and the capability floor
 
 Nothing is part-way done. Every commit above is complete with its tests.
 
@@ -89,6 +89,8 @@ anyway so he is not surprised:
 - `.monitor-status` is now one line per active cause, each ISO-timestamped.
 - `.exit-status` is now a JSON record (legacy bare number still read).
 - New file per role: `.restart-ledger.json`.
+- **`ours-fleet spawn --isolation-file <path>`** — the ONE approved new operator input (6.3).
+  Optional; nothing else about what an operator types changed anywhere in this release.
 - `ours-fleet config` now REFUSES a role whose isolation asks for a forbidden mount (5.2).
   That is a refusal-behaviour change, which the release rule allows; a config that used to
   load and silently mount `~/.ssh` now fails by role and path.
