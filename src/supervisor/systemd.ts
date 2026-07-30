@@ -76,7 +76,24 @@ WantedBy=default.target
       const before = await ctl('is-enabled', unitFor(name));
       const alreadyEnabled = before.stdout.trim() === 'enabled';
       const r = await ctl('enable', '--now', unitFor(name));
-      if (r.code !== 0) throw new Error(`systemctl enable --now ${unitFor(name)} failed: ${r.stderr.trim()}${busHint(r.stderr)}`);
+      if (r.code !== 0) {
+        // `enable --now` is enable THEN start, so a non-zero result can arrive
+        // with the symlink already written. Throwing then means `install` never
+        // returns `{created: true}`, the creation transaction records nothing,
+        // and a spawn that failed at registration leaves an enabled unit behind
+        // (6.2). Undo only what we enabled.
+        //
+        // Measured on systemd 255 (see the test alongside this): a `--now`
+        // START failure does NOT set a non-zero exit code — `enable --now`
+        // returns 0 and reports the failed job on stderr, while a bare `start`
+        // of the same unit returns 1. So on that version this branch is not
+        // reached by a failing start; it is reached when systemctl itself
+        // fails. The cleanup is here because the exit code is the only signal
+        // we get and its meaning varies by systemd version, not because one
+        // version's behaviour was assumed.
+        if (!alreadyEnabled) await ctl('disable', '--now', unitFor(name));
+        throw new Error(`systemctl enable --now ${unitFor(name)} failed: ${r.stderr.trim()}${busHint(r.stderr)}`);
+      }
       return alreadyEnabled
         ? { created: false, detail: `${unitFor(name)} was already enabled` }
         : { created: true, detail: `enabled ${unitFor(name)}` };

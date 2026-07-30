@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
-import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { makeSystemdBackend, makeLaunchdBackend, makeNoneBackend, pickBackend, unitFor, labelFor } from '../src/supervisor/index.js';
@@ -256,5 +256,71 @@ describe('install/uninstall outcomes are explicit and idempotent (6.2)', () => {
     expect(await makeNoneBackend(hadSession).install('A', '/b')).toMatchObject({ created: false });
     expect(await makeNoneBackend(hadSession).uninstall('A')).toMatchObject({ removed: true });
     expect(await makeNoneBackend(noSession).uninstall('A')).toMatchObject({ removed: false });
+  });
+});
+
+/**
+ * A failing `install` throws, so it never returns `{created: true}` and the
+ * creation transaction records nothing to roll back. Whatever the install had
+ * already written therefore has to be cleaned up by the install itself, or a
+ * failed spawn leaves a live launch artifact behind.
+ */
+describe('a failed registration leaves no artifact (6.2)', () => {
+  const launchAgent = () => join(dir, 'Library/LaunchAgents/network.ours.fleet.A.plist');
+
+  /** bootstrap fails; everything else succeeds. */
+  const bootstrapFails = () => {
+    const calls: string[][] = [];
+    const exec: Exec = async (cmd, args): Promise<ExecResult> => {
+      calls.push([cmd, ...args]);
+      return args[0] === 'bootstrap'
+        ? { stdout: '', stderr: 'Bootstrap failed: 5: Input/output error', code: 5 }
+        : { stdout: '', stderr: '', code: 0 };
+    };
+    return { calls, exec };
+  };
+
+  it('launchd removes the plist it just wrote when bootstrap fails', async () => {
+    const { calls, exec } = bootstrapFails();
+    await expect(makeLaunchdBackend(exec, 501).install('A', '/b')).rejects.toThrow(/bootstrap/);
+    // The plist carries RunAtLoad: leaving it is leaving a service that starts
+    // at the next login, for a role whose spawn failed.
+    expect(existsSync(launchAgent())).toBe(false);
+    // and it was booted out of the domain, not merely deleted from disk.
+    expect(calls.filter(c => c[1] === 'bootout').length).toBeGreaterThanOrEqual(2);
+  });
+
+  it('launchd does NOT delete a plist that was already there', async () => {
+    const ok = recorder();
+    await makeLaunchdBackend(ok.exec, 501).install('A', '/b');   // pre-existing registration
+    expect(existsSync(launchAgent())).toBe(true);
+    const { exec } = bootstrapFails();
+    await expect(makeLaunchdBackend(exec, 501).install('A', '/b')).rejects.toThrow(/bootstrap/);
+    expect(existsSync(launchAgent())).toBe(true);                // not ours to remove
+  });
+
+  it('systemd disables a unit it enabled when enable --now fails', async () => {
+    const calls: string[][] = [];
+    const exec: Exec = async (cmd, args): Promise<ExecResult> => {
+      calls.push([cmd, ...args]);
+      if (args[1] === 'is-enabled') return { stdout: 'disabled\n', stderr: '', code: 1 };
+      if (args[1] === 'enable') return { stdout: '', stderr: 'Job failed', code: 1 };
+      return { stdout: '', stderr: '', code: 0 };
+    };
+    await expect(makeSystemdBackend(exec).install('A', '/b')).rejects.toThrow(/enable --now/);
+    expect(calls).toContainEqual(
+      ['systemctl', '--user', 'disable', '--now', 'ours-fleet-agent@A.service']);
+  });
+
+  it('systemd does NOT disable a unit that was already enabled', async () => {
+    const calls: string[][] = [];
+    const exec: Exec = async (cmd, args): Promise<ExecResult> => {
+      calls.push([cmd, ...args]);
+      if (args[1] === 'is-enabled') return { stdout: 'enabled\n', stderr: '', code: 0 };
+      if (args[1] === 'enable') return { stdout: '', stderr: 'Job failed', code: 1 };
+      return { stdout: '', stderr: '', code: 0 };
+    };
+    await expect(makeSystemdBackend(exec).install('A', '/b')).rejects.toThrow(/enable --now/);
+    expect(calls.filter(c => c[2] === 'disable')).toEqual([]);
   });
 });

@@ -431,16 +431,43 @@ describe('every failed creation stage rolls back (6.2)', () => {
     });
   }
 
+  /**
+   * The registration is really made, and something after it fails before `up()`
+   * can return its outcomes. Rollback has to learn about the registration at
+   * the moment it happens, or the service stays behind.
+   *
+   * This test used to assert the OPPOSITE of its own title — that nothing was
+   * uninstalled — with a comment explaining that install had thrown so nothing
+   * was recorded. The assertion described the defect; the title described the
+   * fix. Anyone reading test names saw 6.2's rollback promise covered.
+   *
+   * The other half of the same defect — a backend `install` that throws AFTER
+   * writing its artifact, where no caller can ever hear about it — is the
+   * backend's own responsibility and is covered in test/supervisor.test.ts,
+   * "a failed registration leaves no artifact (6.2)".
+   */
   it('a service registration this transaction created is uninstalled on failure', async () => {
     const { d, calls } = fakeDeps();
-    // install succeeds and reports it CREATED the registration; a later stage fails.
-    const realInstall = d.backend.install.bind(d.backend);
-    d.backend.install = async (n, b) => { await realInstall(n, b); throw new Error('inject: after-install'); };
+    // `up` logs immediately after installing; throwing from the log stands in
+    // for any failure between registering and returning.
+    d.log = line => { if (line.includes('↑ up:')) throw new Error('inject: post-registration'); };
     const err = await spawnPermanent({ name: 'Late' }, d,
       { identityProvisioner: provisioner([], []) }).then(() => null, e => e as Error);
-    expect(err!.message).toContain('after-install');
+    expect(err!.message).toContain('post-registration');
     expect(calls).toContainEqual(['install', 'Late']);
-    // install threw, so nothing was RECORDED as created — and nothing is removed.
+    expect(calls).toContainEqual(['uninstall', 'Late']);
+  });
+
+  it('a registration install found already there is NOT uninstalled by rollback', async () => {
+    const { d, calls } = fakeDeps();
+    d.backend.install = async n => {
+      calls.push(['install', n]);
+      return { created: false, detail: 'was already installed' };
+    };
+    d.log = line => { if (line.includes('↑ up:')) throw new Error('inject: post-registration'); };
+    const err = await spawnPermanent({ name: 'Adopted' }, d,
+      { identityProvisioner: provisioner([], []) }).then(() => null, e => e as Error);
+    expect(err!.message).toContain('post-registration');
     expect(calls.filter(c => c[0] === 'uninstall')).toEqual([]);
   });
 

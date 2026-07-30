@@ -51,7 +51,19 @@ export function makeLaunchdBackend(exec: Exec = realExec, uid: number = process.
       writeFileSync(plistPath(name), plist(name, binPath));
       await exec('launchctl', ['bootout', `${domain}/${labelFor(name)}`]); // best-effort refresh
       const r = await exec('launchctl', ['bootstrap', domain, plistPath(name)]);
-      if (r.code !== 0) throw new Error(`launchctl bootstrap ${labelFor(name)} failed: ${r.stderr.trim()}`);
+      if (r.code !== 0) {
+        // The plist is already on disk, carrying RunAtLoad. Throwing here means
+        // `install` never returns `{created: true}`, so the creation transaction
+        // records nothing and its rollback removes nothing — and a spawn that
+        // failed at registration leaves a launch artifact behind (6.2). Undo our
+        // own partial write before throwing, and only when WE wrote it: a plist
+        // that was already there belongs to whoever put it there.
+        if (!existed) {
+          await exec('launchctl', ['bootout', `${domain}/${labelFor(name)}`]);
+          rmSync(plistPath(name), { force: true });
+        }
+        throw new Error(`launchctl bootstrap ${labelFor(name)} failed: ${r.stderr.trim()}`);
+      }
       return existed
         ? { created: false, detail: `${labelFor(name)} was already installed` }
         : { created: true, detail: `installed ${labelFor(name)}` };

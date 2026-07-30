@@ -219,7 +219,10 @@ export async function spawnPermanent(
         undo: () => { if (!stateExisted) rmSync(stateDir, { recursive: true, force: true }); },
       });
       // Journal the service registration BEFORE it happens, and undo only the
-      // registrations this transaction actually created (6.2).
+      // registrations this transaction actually created (6.2). `registered` is
+      // filled by `up`'s onInstalled hook at the moment each registration is
+      // made — not from its return value, which never arrives when `up` throws
+      // after registering.
       const registered: string[] = [];
       tx.record({
         stage: `service registration for ${o.name}`,
@@ -233,9 +236,10 @@ export async function spawnPermanent(
       });
       mkdirSync(agentDir(o.name), { recursive: true });
       writeProvenance(agentDir(o.name), provenance);
-      const outcomes = await up(
-        loadConfig(o.configPath), [o.name], deps, o.configPath, guarantee.state);
-      for (const outcome of outcomes) if (outcome.created) registered.push(outcome.role);
+      await up(
+        loadConfig(o.configPath), [o.name],
+        { ...deps, onInstalled: outcome => registered.push(outcome.role) },
+        o.configPath, guarantee.state);
       lastProvenance = provenance;
       return file;
     },

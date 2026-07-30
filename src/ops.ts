@@ -16,6 +16,14 @@ export interface OpsDeps {
   backend: SupervisorBackend;
   binPath: string;
   log(line: string): void;
+  /**
+   * Called the INSTANT a registration is created, before anything else can
+   * fail. A creation transaction that learns about registrations only from
+   * `up()`'s return value learns nothing when `up()` throws — and the service
+   * it just registered is then invisible to rollback (6.2). Optional: plain
+   * `ours-fleet up` has no transaction to tell.
+   */
+  onInstalled?(outcome: InstallOutcome): void;
 }
 
 // Launch staggering now lives at the harness-launch point (the runner's start
@@ -84,8 +92,12 @@ export async function up(
     else if (live.state === 'unknown')
       deps.log(`  ! ${role.name}: liveness unknown, keeping session context — ${live.detail}`);
     // Report what each install actually did, so a creation transaction can undo
-    // only the registrations IT made (6.2).
-    outcomes.push({ ...await deps.backend.install(role.name, deps.binPath), role: role.name });
+    // only the registrations IT made (6.2). Announced immediately as well as
+    // returned: a later role in this same loop can throw, and the registrations
+    // already made must still be undoable.
+    const outcome = { ...await deps.backend.install(role.name, deps.binPath), role: role.name };
+    if (outcome.created) deps.onInstalled?.(outcome);
+    outcomes.push(outcome);
     deps.log(`↑ up: ${role.name} (harness: ${role.harness}, identity: ${role.identity}${role.cwd ? `, cwd: ${role.cwd}` : ''})`);
   }
   return outcomes;
