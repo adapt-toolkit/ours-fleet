@@ -103,3 +103,42 @@ describe('generateBriefing', () => {
     expect(b).toContain('/s/agents/Alice/ROUTINES.md');
   });
 });
+
+describe('the briefing states only what was verified about the identity (7.3)', () => {
+  const brief = (guarantee?: 'verified' | 'created' | 'unverified') =>
+    generateBriefing(base, vocab, { ...opts, identityGuarantee: guarantee });
+
+  it('never calls the identity "predefined" — the claim that was not checked', () => {
+    for (const g of [undefined, 'verified', 'created', 'unverified'] as const)
+      expect(brief(g), String(g)).not.toContain('predefined');
+  });
+
+  it('an unverified identity is described as possibly absent, with the fallback', () => {
+    const b = brief('unverified');
+    expect(b).toContain('was NOT verified when your role was created');
+    expect(b).toContain('create_identity');
+  });
+
+  it('a verified identity says binding should succeed, and to report it if not', () => {
+    const b = brief('verified');
+    expect(b).toContain('verified to exist');
+    expect(b).toContain('report the discrepancy');
+    expect(b).not.toContain('NOT verified');
+  });
+
+  it('a created identity says so', () => {
+    expect(brief('created')).toContain('It was created when your role');
+  });
+
+  it('defaults to unverified when the generator was told nothing', () => {
+    // A briefing produced without that knowledge must not invent a guarantee.
+    expect(brief()).toContain('was NOT verified');
+  });
+
+  it('keeps a defensive bind-time check in every case', () => {
+    for (const g of ['verified', 'created', 'unverified'] as const) {
+      expect(brief(g), g).toContain('choose_identity');
+      expect(brief(g), g).toContain('create_identity');
+    }
+  });
+});

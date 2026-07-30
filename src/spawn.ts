@@ -11,8 +11,8 @@ import {
 import { applyRole, up, type OpsDeps } from './ops.js';
 import { START_STAGGER_FILE } from './runner.js';
 import {
-  withCreationTransaction, writeRoleFile,
-  type CreationDeps, type CreationTransaction,
+  daemonIdentityProvisioner, ensureIdentity, withCreationTransaction, writeRoleFile,
+  type CreationDeps, type CreationTransaction, type IdentityGuarantee,
 } from './creation.js';
 
 export interface SpawnOpts {
@@ -115,6 +115,14 @@ export async function spawnPermanent(
     async tx => {
       assertNameFree(o);
       const cfg = loadConfig(o.configPath);
+      // Establish the identity BEFORE the service is enabled (7.3), and record
+      // what was actually guaranteed so the briefing can say something true.
+      const guarantee = await ensureIdentity(
+        effectiveIdentity(o),
+        { bio: o.bioFile ? readFileSync(o.bioFile, 'utf8').trim() : undefined,
+          persona: o.personaFile ? readFileSync(o.personaFile, 'utf8').trim() : undefined },
+        creation.identityProvisioner ?? daemonIdentityProvisioner(),
+        deps.log);
       mkdirSync(fleetDDir(), { recursive: true });
       const file = join(fleetDDir(), `${o.name}.yaml`);
       writeRoleFile(tx, file, stringify({
@@ -129,7 +137,7 @@ export async function spawnPermanent(
         stage: `state dir ${stateDir}`,
         undo: () => { if (!stateExisted) rmSync(stateDir, { recursive: true, force: true }); },
       });
-      await up(loadConfig(o.configPath), [o.name], deps, o.configPath);
+      await up(loadConfig(o.configPath), [o.name], deps, o.configPath, guarantee.state);
       return file;
     },
     creation,
@@ -161,13 +169,22 @@ export async function spawnTemp(
   // (6.4): a temp agent competes for the same names.
   return withCreationTransaction(
     { role: o.name, identity: effectiveIdentity(o) },
-    async tx => spawnTempInner(o, binPath, launch, tx),
+    async tx => {
+      const guarantee = await ensureIdentity(
+        effectiveIdentity(o),
+        { bio: o.bioFile ? readFileSync(o.bioFile, 'utf8').trim() : undefined,
+          persona: o.personaFile ? readFileSync(o.personaFile, 'utf8').trim() : undefined },
+        creation.identityProvisioner ?? daemonIdentityProvisioner(),
+        creation.log);
+      return spawnTempInner(o, binPath, launch, tx, guarantee);
+    },
     creation,
   );
 }
 
 async function spawnTempInner(
   o: SpawnOpts, binPath: string, launch: SupervisorLauncher, tx: CreationTransaction,
+  guarantee: IdentityGuarantee,
 ): Promise<string> {
   assertNameFree(o);
   const cfg = loadConfig(o.configPath);
@@ -192,7 +209,7 @@ async function spawnTempInner(
     monitor: resolveMonitorConfig(cfg.defaults.monitor, fromOpts.monitor),
     sourceFile: '(temp)',
   };
-  const dir = applyRole(role, { temp: true });
+  const dir = applyRole(role, { temp: true, identityGuarantee: guarantee.state });
   tx.record({ stage: `temp state dir ${dir}`, undo: () => rmSync(dir, { recursive: true, force: true }) });
   writeFileSync(join(dir, 'role.yaml'), stringify(role));
   // Snapshot the fleet start-stagger so the detached temp supervisor (no config path

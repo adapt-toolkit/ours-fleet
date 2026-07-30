@@ -23,7 +23,11 @@ export interface OpsDeps {
 
 /** Materialize a role's state dir from config: briefing + markers. Returns the dir. */
 export function applyRole(
-  role: ResolvedRole, opts: { fresh?: boolean; temp?: boolean; configPath?: string } = {},
+  role: ResolvedRole,
+  opts: {
+    fresh?: boolean; temp?: boolean; configPath?: string;
+    identityGuarantee?: 'verified' | 'created' | 'unverified';
+  } = {},
 ): string {
   const adapter = getAdapter(role.harness);
   const errs = adapter.validateOptions(role.harness_options);
@@ -45,6 +49,7 @@ export function applyRole(
   writeFileSync(join(dir, 'briefing.md'), generateBriefing(role, adapter.vocabulary, {
     stateDir: dir, worklogPath: join(dir, 'WORKLOG.md'),
     routinesPath: join(dir, 'ROUTINES.md'), briefingBody,
+    identityGuarantee: opts.identityGuarantee,
   }));
   if (opts.fresh)
     for (const f of ['.booted', '.session-id', '.exit-status']) rmSync(join(dir, f), { force: true });
@@ -58,9 +63,10 @@ function selectRoles(cfg: FleetConfig, names: string[]): ResolvedRole[] {
 /** Create/start roles declaratively. Idempotent; active roles keep their context. */
 export async function up(
   cfg: FleetConfig, names: string[], deps: OpsDeps, configPath?: string,
+  identityGuarantee?: 'verified' | 'created' | 'unverified',
 ): Promise<void> {
   for (const role of selectRoles(cfg, names)) {
-    const dir = applyRole(role, { configPath });
+    const dir = applyRole(role, { configPath, identityGuarantee });
     // Only a *definite* stop boots fresh so the role reads the briefing we just
     // wrote. A running, restarting, or unprobeable role keeps its context —
     // guessing "stopped" from an unanswered probe silently discards a live

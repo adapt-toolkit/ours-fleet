@@ -304,3 +304,81 @@ describe('atomic role + identity reservation (6.4)', () => {
     expect(existsSync(reservations) ? readdirSync(reservations) : []).toEqual([]);
   });
 });
+
+describe('identity is established before launch (7.3)', () => {
+  const provisioner = (
+    exists: boolean | 'unknown',
+    create?: (n: string, p: { bio?: string; persona?: string }) => Promise<void>,
+  ) => ({ async exists() { return exists; }, ...(create ? { create } : {}) });
+
+  const briefingOf = (name: string) =>
+    readFileSync(join(agentDir(name), 'briefing.md'), 'utf8');
+
+  it('an existing identity is verified, and the briefing says so', async () => {
+    const { d } = fakeDeps();
+    await spawnPermanent({ name: 'Known', identity: 'Known' }, d,
+      { identityProvisioner: provisioner(true) });
+    expect(briefingOf('Known')).toContain('verified to exist');
+    expect(briefingOf('Known')).not.toContain('predefined');
+  });
+
+  it('a missing identity is CREATED before the service is enabled, with its profile', async () => {
+    writeFileSync(join(dir, 'bio.txt'), 'A public card.');
+    writeFileSync(join(dir, 'persona.txt'), 'An operating contract.');
+    const created: Array<[string, { bio?: string; persona?: string }]> = [];
+    const { d, calls } = fakeDeps();
+    // Record the order: identity creation must precede service registration.
+    const order: string[] = [];
+    const backend = d.backend;
+    backend.install = async n => { order.push(`install:${n}`); calls.push(['install', n]); };
+
+    await spawnPermanent(
+      { name: 'Fresh', identity: 'Fresh', bioFile: join(dir, 'bio.txt'), personaFile: join(dir, 'persona.txt') },
+      d,
+      { identityProvisioner: provisioner(false, async (n, p) => { order.push(`identity:${n}`); created.push([n, p]); }) });
+
+    expect(created).toEqual([['Fresh', { bio: 'A public card.', persona: 'An operating contract.' }]]);
+    expect(order).toEqual(['identity:Fresh', 'install:Fresh']);   // before, not after
+    expect(briefingOf('Fresh')).toContain('It was created when your role');
+  });
+
+  it('a failed identity setup aborts and rolls back before the harness starts', async () => {
+    const { d, calls } = fakeDeps();
+    const err = await spawnPermanent({ name: 'Broken', identity: 'Broken' }, d, {
+      identityProvisioner: provisioner(false, async () => { throw new Error('daemon refused'); }),
+    }).then(() => null, e => e as Error);
+
+    expect(err!.message).toContain('daemon refused');
+    expect(calls.filter(c => c[0] === 'install')).toEqual([]);    // never started
+    expect(existsSync(join(dir, 'fleet.d', 'Broken.yaml'))).toBe(false);
+    expect(existsSync(agentDir('Broken'))).toBe(false);
+  });
+
+  it('a host that cannot create says so, and the briefing does not claim a guarantee', async () => {
+    const logs: string[] = [];
+    const { d } = fakeDeps();
+    d.log = l => logs.push(l);
+    await spawnPermanent({ name: 'Unchecked', identity: 'Unchecked' }, d,
+      { identityProvisioner: provisioner(false) });          // exists=false, no create()
+
+    expect(logs.join('\n')).toContain('cannot create one automatically');
+    expect(briefingOf('Unchecked')).toContain('was NOT verified');
+    expect(briefingOf('Unchecked')).toContain('create_identity');
+  });
+
+  it('an unreachable daemon is "unknown", never mistaken for absent', async () => {
+    const { d } = fakeDeps();
+    let createCalled = false;
+    await spawnPermanent({ name: 'Offline', identity: 'Offline' }, d, {
+      identityProvisioner: provisioner('unknown', async () => { createCalled = true; }),
+    });
+    expect(createCalled).toBe(false);       // do not create on no evidence
+    expect(briefingOf('Offline')).toContain('was NOT verified');
+  });
+
+  it('a temp spawn gets the same guarantee in its briefing', async () => {
+    const d = await spawnTemp({ name: 'TempKnown', identity: 'TempKnown' }, '/b/ours-fleet', () => {},
+      { identityProvisioner: provisioner(true) });
+    expect(readFileSync(join(d, 'briefing.md'), 'utf8')).toContain('verified to exist');
+  });
+});

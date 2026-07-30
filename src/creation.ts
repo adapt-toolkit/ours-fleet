@@ -2,6 +2,7 @@ import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync
 import { join } from 'node:path';
 import { replaceFileAtomically, withFileLock, type LockDeps } from './atomic-file.js';
 import { stateRoot } from './paths.js';
+import { resolveEndpoint, type FetchLike } from './monitor.js';
 
 /**
  * One creation transaction: role name and ours identity reserved together,
@@ -53,6 +54,8 @@ export interface CreationDeps {
   log?(line: string): void;
   /** Reserve the ours identity name. Injectable so tests need no daemon. */
   identityRegistry?: IdentityRegistry;
+  /** Verify/create the ours identity. Injectable so tests need no daemon. */
+  identityProvisioner?: IdentityProvisioner;
 }
 
 /**
@@ -190,6 +193,93 @@ export function clearStaleReservations(olderThanMs = 60_000, now = Date.now()): 
 function readdirSyncSafe(dir: string): string[] {
   try { return readdirSync(dir); }
   catch { return []; }
+}
+
+/**
+ * Identity provisioning (7.3). The fleet must know — before the harness starts
+ * — whether the role's identity exists, and create it when it does not.
+ *
+ * `exists()` is answerable today: the daemon's authenticated `/identities`
+ * endpoint is already used by doctor. `create()` is NOT: `ours-mcp` exposes only
+ * `create-root`, and role identities are minted through the MCP `create_identity`
+ * tool inside an agent session. So creation is a seam, injected by whoever can
+ * satisfy it, and its absence is reported rather than papered over.
+ */
+export interface IdentityProvisioner {
+  /** Does this identity exist? `unknown` when the daemon could not be asked. */
+  exists(name: string): Promise<boolean | 'unknown'>;
+  /** Create it, publishing bio/persona through the same path. Absent = cannot. */
+  create?(name: string, profile: { bio?: string; persona?: string }): Promise<void>;
+}
+
+export type IdentityGuarantee =
+  | { state: 'verified'; detail: string }        // it exists; the agent may just bind
+  | { state: 'created'; detail: string }         // we made it, with its profile
+  | { state: 'unverified'; detail: string };     // we could not tell, or could not make it
+
+/**
+ * Establish the identity before the role's service is enabled.
+ *
+ * Returns what was actually GUARANTEED, so the generated briefing can say
+ * something true instead of asserting a "predefined" identity nobody checked —
+ * the failure a real agent hit on its first boot, having been told to bind an
+ * identity that did not exist.
+ */
+export async function ensureIdentity(
+  name: string,
+  profile: { bio?: string; persona?: string },
+  provisioner: IdentityProvisioner | undefined,
+  log: (line: string) => void = () => {},
+): Promise<IdentityGuarantee> {
+  if (!provisioner)
+    return { state: 'unverified', detail: 'no identity provisioner is configured' };
+
+  let present: boolean | 'unknown';
+  try { present = await provisioner.exists(name); }
+  catch (e) {
+    present = 'unknown';
+    log(`identity '${name}': could not be verified (${(e as Error).message})`);
+  }
+
+  if (present === true) return { state: 'verified', detail: 'the ours daemon reports it exists' };
+  if (present === 'unknown')
+    return { state: 'unverified', detail: 'the ours daemon could not be asked' };
+
+  if (!provisioner.create) {
+    // Loud, and named. The briefing will tell the agent to mint it — which is
+    // what actually happens today — but nobody is told it was "predefined".
+    log(`identity '${name}' does not exist and this host cannot create one automatically — `
+      + `the role will be told to mint it on first boot. Create it in advance to avoid that.`);
+    return { state: 'unverified', detail: 'it does not exist and cannot be created here' };
+  }
+  await provisioner.create(name, profile);
+  return { state: 'created', detail: 'created during spawn, with its bio and persona published' };
+}
+
+/**
+ * Ask the running ours daemon whether an identity exists, over the same
+ * authenticated endpoint doctor already probes. Answers `unknown` rather than
+ * guessing when the daemon cannot be reached — an unreachable daemon is not
+ * evidence that the identity is missing.
+ *
+ * It deliberately has no `create()`: role identities are minted through the MCP
+ * `create_identity` tool, and inventing a daemon endpoint we cannot test is the
+ * failure mode this release exists to stop.
+ */
+export function daemonIdentityProvisioner(
+  env: NodeJS.ProcessEnv = process.env,
+  fetchImpl: FetchLike = (u, i) => globalThis.fetch(u, i) as unknown as ReturnType<FetchLike>,
+): IdentityProvisioner {
+  return {
+    async exists(name: string) {
+      const ep = resolveEndpoint(env);
+      const resp = await fetchImpl(`${ep.origin}/identities`, { headers: ep.headers });
+      if (!resp.ok) return 'unknown';
+      const body = await resp.json() as { identities?: Array<string | { name?: string }> };
+      if (!Array.isArray(body.identities)) return 'unknown';
+      return body.identities.some(i => (typeof i === 'string' ? i : i?.name) === name);
+    },
+  };
 }
 
 /** Atomically write a role's fleet.d file, journalling it for rollback. */

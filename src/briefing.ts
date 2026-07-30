@@ -8,6 +8,12 @@ export interface BriefingOpts {
   routinesPath: string;
   /** Curated body (from briefing_file) replacing the narrative sections. */
   briefingBody?: string;
+  /**
+   * What spawn actually established about the role's ours identity (7.3).
+   * Defaults to `unverified`, because a briefing generated without that
+   * knowledge must not claim one.
+   */
+  identityGuarantee?: 'verified' | 'created' | 'unverified';
 }
 
 /** Render a role's briefing.md: narrative (or curated body) + mechanical boot steps. */
@@ -30,10 +36,24 @@ export function generateBriefing(role: ResolvedRole, v: BriefingVocab, opts: Bri
 
   L.push('', '## Do these NOW, in order');
   L.push(`1. ${v.launchNote(role.name)}`);
-  L.push(`2. BIND your predefined ours identity: call the **${v.bindTool}** tool with`);
-  L.push(`   name "${id}" force=true (search the deferred tool registry first if needed).`);
-  L.push(`   - If no such identity exists yet, call **${v.createTool}** name "${id}" once`);
-  L.push('     to mint it, then you are bound. Re-binding your OWN identity is always allowed.');
+  // What this says depends on what spawn actually VERIFIED (7.3). Asserting a
+  // "predefined" identity that nobody checked is how an agent ends up improvising
+  // its own infrastructure on first boot.
+  const guarantee = opts.identityGuarantee ?? 'unverified';
+  if (guarantee === 'unverified') {
+    L.push(`2. BIND your ours identity: call the **${v.bindTool}** tool with`);
+    L.push(`   name "${id}" force=true (search the deferred tool registry first if needed).`);
+    L.push(`   - This identity was NOT verified when your role was created, so it may not exist.`);
+    L.push(`     If binding reports no such identity, call **${v.createTool}** name "${id}" once`);
+    L.push('     to mint it, then you are bound. Re-binding your OWN identity is always allowed.');
+  } else {
+    L.push(`2. BIND your ours identity: call the **${v.bindTool}** tool with`);
+    L.push(`   name "${id}" force=true (search the deferred tool registry first if needed).`);
+    L.push(`   - It was ${guarantee === 'created' ? 'created' : 'verified to exist'} when your role`);
+    L.push('     was created, so binding should succeed. If it unexpectedly reports no such');
+    L.push(`     identity, call **${v.createTool}** name "${id}" once and report the discrepancy —`);
+    L.push('     something removed it after your role was created.');
+  }
   L.push(`3. RECONCILE your profile (idempotent): call **${v.currentIdentityTool}** and read your`);
   L.push('   current bio and persona, so you only write below when they actually differ.');
   L.push(`4. PUBLISH your public **bio** via **${v.setBioTool}**`);

@@ -39,18 +39,18 @@ Baseline before any work: **339 passed**.
 | 6.1 locked, atomic Claude pre-trust | `030a402` | 526 |
 | (5.1) make the sandbox skip loud | `a8e33a4` | 526 |
 | 6.4 atomic role + identity reservation | `c7eccb9` | 533 |
+| 7.3 guarantee identity existence before launch | `PENDING` | 545 |
 
-Sections 1-4 complete. Section 5 in progress: 6.1 and 6.4 done, 7.3 next.
+Sections 1-4 complete. Section 5 in progress: 6.1, 6.4, 7.3 done; 6.2 next.
 
 ## Remaining, in spec dependency order
 
-1. **7.3** guarantee identity existence before launch
-2. **6.2** roll back every failed creation stage
-3. **6.3** `spawn --isolation-file` (the ONE approved new operator input)
-4. **6.6** persist creation provenance
-5. **7.1** correct the spawn skill
-6. **7.2** stop using one console command as a liveness verdict
-7. **7.4** document never-prompt failure and the capability floor
+1. **6.2** roll back every failed creation stage
+2. **6.3** `spawn --isolation-file` (the ONE approved new operator input)
+3. **6.6** persist creation provenance
+4. **7.1** correct the spawn skill
+5. **7.2** stop using one console command as a liveness verdict
+6. **7.4** document never-prompt failure and the capability floor
 
 Nothing is part-way done. Every commit above is complete with its tests.
 
@@ -203,6 +203,33 @@ re-create the exact defect 2.3 and 5.2 were about.
 **Version pin.** Once the endpoint exists, pin the minimum daemon version and have `doctor`
 report which registry is in use — daemon-backed or host-local — so an operator can see the
 difference rather than infer it.
+
+## 7.3 — a deviation from the strictest reading, flagged
+
+The spec says "verify the effective identity and create it when absent". Verification is
+implemented for real (the daemon's authenticated `/identities`, already used by doctor).
+**Creation is a seam** (`IdentityProvisioner.create`), and there is NO default implementation,
+because there is no supported way to create a ROLE identity from this repo: `ours-mcp` exposes
+only `create-root`, and role identities are minted through the MCP `create_identity` tool
+inside an agent session. Inventing a daemon endpoint is what Coordinator ruled out for 6.4.
+
+So when the identity is absent and nothing can create it, the fleet does NOT hard-fail the
+spawn. It warns loudly, and the generated briefing tells the agent to mint it — which is what
+already happens today — while never claiming the identity was "predefined".
+
+**Why not hard-fail:** the spec's own closed-when allows "handled before launch OR creation
+fails loudly", but hard-failing would break the normal case (a new role needs a new identity)
+on every host, in exchange for a guarantee I cannot deliver anyway. A loud warning plus an
+honest briefing is strictly better than today and breaks nothing. **If the owner wants
+hard-fail, it is one branch in `ensureIdentity`.**
+
+What IS fully delivered: the identity stage runs inside the creation transaction and BEFORE
+the service is enabled (asserted by an ordering test); a failing `create()` aborts and rolls
+back with no config, no state dir and no service; an unreachable daemon is `unknown` and never
+mistaken for absent; and the briefing states only what was actually established.
+
+**The word "predefined" is gone from generated briefings.** That claim is what sent a real
+agent — the one writing this — to improvise its own identity on first boot.
 
 ## Environment trap (cost me a confusing hang)
 
