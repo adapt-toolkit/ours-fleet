@@ -40,7 +40,7 @@ Baseline before any work: **339 passed**.
 | (5.1) make the sandbox skip loud | `a8e33a4` | 526 |
 | 6.4 atomic role + identity reservation | `c7eccb9` | 533 |
 | 7.3 guarantee identity existence before launch | `f759a35` | 545 |
-| 6.2 roll back every failed creation stage | `PENDING` | 554 |
+| 6.2 roll back every failed creation stage | `b077947` | 554 |
 
 Sections 1-4 complete. Section 5 in progress: 6.1, 6.4, 7.3, 6.2 done; 6.3 next.
 
