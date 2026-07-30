@@ -120,6 +120,13 @@ export interface ResolvedRole extends RoleConfig {
   harness: string;
   session: SessionBackendId;
   permissions: CommonPermissions;
+  /**
+   * Whether `permissions:` was actually written by the operator (on the role or
+   * in defaults), as opposed to resolved from built-in defaults. A role that
+   * states its intent only once — neutrally OR natively — has nothing to
+   * contradict, and must not be warned at (2.4).
+   */
+  permissionsDeclared: boolean;
   identity: string;
   sourceFile: string;
   monitor: MonitorConfig;
@@ -198,6 +205,7 @@ export function loadConfig(configPath?: string): FleetConfig {
       const sessionOptions = resolveSessionOptions(
         defaults.session_options, r.session_options, session, file, name);
       const permissions = resolvePermissions(defaults.permissions, r.permissions, file, name);
+      const permissionsDeclared = r.permissions !== undefined || defaults.permissions !== undefined;
       const defaultHarnessOptions = defaults.harness_options;
       if (defaultHarnessOptions !== undefined
           && (typeof defaultHarnessOptions !== 'object' || defaultHarnessOptions === null
@@ -223,6 +231,7 @@ export function loadConfig(configPath?: string): FleetConfig {
         session,
         session_options: sessionOptions,
         permissions,
+        permissionsDeclared,
         identity: r.identity ?? name,
         model: r.model ?? (defaults.model as string | undefined),
         max_tokens: r.max_tokens ?? (defaults.max_tokens as number | undefined),

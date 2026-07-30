@@ -141,6 +141,8 @@ export async function spawnTemp(
     model: o.model?.trim() || (cfg.defaults.model as string | undefined),
     harness_options: Object.keys(mergedHarnessOptions).length ? mergedHarnessOptions : undefined,
     permissions: resolvePermissions(cfg.defaults.permissions, fromOpts.permissions),
+    permissionsDeclared:
+      fromOpts.permissions !== undefined || cfg.defaults.permissions !== undefined,
     // Temp agents inherit the fleet-wide monitor defaults via the snapshot (design §2).
     monitor: resolveMonitorConfig(cfg.defaults.monitor, fromOpts.monitor),
     sourceFile: '(temp)',

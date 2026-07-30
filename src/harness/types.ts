@@ -81,6 +81,12 @@ export interface HarnessAdapter {
    * explicitly declare that it cannot. Enforced at registration.
    */
   translatePermissions(permissions: CommonPermissions): PermissionTranslation;
+  /**
+   * The permission settings this role states NATIVELY in `harness_options`,
+   * keyed the same way `translatePermissions().native` is, so the two can be
+   * compared directly. Only keys the operator actually wrote appear.
+   */
+  nativePermissionOverrides(options: unknown): Record<string, unknown>;
   vocabulary: BriefingVocab;
   exitPolicy: ExitPolicy;
 }

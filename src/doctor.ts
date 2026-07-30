@@ -135,6 +135,13 @@ export async function doctor(
         : `${summary} (exact)`,
     });
 
+    // A role that states its permission intent twice, in two disagreeing places
+    // (2.4). Quiet when there is a single source of intent.
+    for (const conflict of analysis.conflicts ?? [])
+      checks.push({
+        name: `permission conflict: ${analysis.role}`, ok: true, detail: conflict.warning,
+      });
+
     // The floor is checked BEFORE start (2.1): an under-permissioned unattended
     // role never reports its own failure, because the denial happens inside the
     // harness with nobody attached to see it.

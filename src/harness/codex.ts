@@ -227,6 +227,15 @@ export function makeCodexAdapter(exec: Exec = realExec): HarnessAdapter {
       return { argv, env: prep.env };
     },
 
+    nativePermissionOverrides(options: unknown): Record<string, unknown> {
+      const o = options as CodexOptions | undefined;
+      const approval = o?.approval ?? o?.permission_mode;   // permission_mode is the alias
+      return {
+        ...(approval == null ? {} : { approval }),
+        ...(o?.sandbox == null ? {} : { sandbox: o.sandbox }),
+      };
+    },
+
     translatePermissions(permissions) {
       const approval = permissions.approval === 'allow' ? 'never' : 'on-request';
       const sandbox = permissions.filesystem === 'read-only'

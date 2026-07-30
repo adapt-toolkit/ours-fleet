@@ -53,10 +53,52 @@ export interface RolePermissionAnalysis {
    * least be rescued by a human attaching a console, so that is a warning.
    */
   floorSeverity?: 'fail' | 'warn';
+  /** Native settings that contradict the neutral block; empty when they agree. */
+  conflicts?: PermissionConflict[];
   /** A role-named line when the floor is not met; absent when it is. */
   floorWarning?: string;
   /** Role-named translation warnings, ready to print verbatim by any command. */
   warnings: string[];
+}
+
+export interface PermissionConflict {
+  /** The native setting both sources speak to, e.g. `permission_mode`. */
+  key: string;
+  /** What the neutral `permissions:` block translates to. */
+  fromNeutral: string;
+  /** What `harness_options` states directly. */
+  fromNative: string;
+  /** The role-named line commands print. */
+  warning: string;
+}
+
+/**
+ * Find native settings that contradict the neutral block. Only fires when the
+ * operator wrote BOTH — a role that states its intent once, neutrally or
+ * natively, has nothing to contradict and stays quiet. `harness_options` wins
+ * at launch, which is precisely why a silent disagreement is dangerous: the
+ * neutral block reads like the source of truth and is not.
+ */
+function findConflicts(
+  role: ResolvedRole,
+  fromNeutral: Record<string, unknown>,
+  fromNative: Record<string, unknown>,
+): PermissionConflict[] {
+  if (!role.permissionsDeclared) return [];
+  const conflicts: PermissionConflict[] = [];
+  for (const [key, nativeValue] of Object.entries(fromNative)) {
+    const neutralValue = fromNeutral[key];
+    if (neutralValue === undefined || String(neutralValue) === String(nativeValue)) continue;
+    conflicts.push({
+      key,
+      fromNeutral: String(neutralValue),
+      fromNative: String(nativeValue),
+      warning: `role '${role.name}': harness_options.${key}=${String(nativeValue)} contradicts the `
+        + `permissions block, which translates to ${key}=${String(neutralValue)} — `
+        + `harness_options.${key}=${String(nativeValue)} wins`,
+    });
+  }
+  return conflicts;
 }
 
 /** Resolve one role's permissions through its adapter. Never throws. */
@@ -76,6 +118,7 @@ export function analyzeRolePermissions(role: ResolvedRole): RolePermissionAnalys
         `permissions — ${translation.reason}`],
     };
   }
+  const conflicts = findConflicts(role, translation.native, adapter.nativePermissionOverrides(role.harness_options));
   const floor = checkUnattendedFloor(translation.capabilities);
   const floorSeverity = role.permissions.unattended === 'deny' ? 'fail' as const : 'warn' as const;
   return {
@@ -86,6 +129,7 @@ export function analyzeRolePermissions(role: ResolvedRole): RolePermissionAnalys
     capabilities: translation.capabilities,
     floor,
     floorSeverity,
+    conflicts,
     floorWarning: floor.meets ? undefined : (
       `role '${role.name}': resolved ${role.harness} permissions do not meet the unattended ` +
       `capability floor — missing ${floor.missing.join(', ')} ` +
@@ -95,9 +139,13 @@ export function analyzeRolePermissions(role: ResolvedRole): RolePermissionAnalys
   };
 }
 
-/** Every line a command should show for a role: translation first, then the floor. */
+/** Every line a command should show for a role: translation, conflicts, floor. */
 export function allWarnings(a: RolePermissionAnalysis): string[] {
-  return a.floorWarning ? [...a.warnings, a.floorWarning] : a.warnings;
+  return [
+    ...a.warnings,
+    ...(a.conflicts ?? []).map(c => c.warning),
+    ...(a.floorWarning ? [a.floorWarning] : []),
+  ];
 }
 
 /** Resolve every role's permissions, in config order. */

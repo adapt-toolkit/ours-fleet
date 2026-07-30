@@ -103,6 +103,29 @@ describe('ours-fleet CLI', () => {
     expect(doc.stdout).toMatch(/permissions: Exact.*\(exact\)/);
   });
 
+  it('config and doctor both report a contradicted permission intent (2.4)', async () => {
+    const { writeFileSync } = await import('node:fs');
+    writeFileSync(join(dir, 'fleet.yaml'),
+      'roles:\n'
+      + '  Contradicted:\n    harness: claude-code\n'
+      + '    permissions:\n      approval: allow\n'
+      + '    harness_options:\n      permission_mode: plan\n'
+      + '  Single:\n    harness: claude-code\n'
+      + '    harness_options:\n      permission_mode: plan\n');
+
+    const cfg = await run(['config']);
+    const doc = await run(['doctor']);
+    const WARNING = "role 'Contradicted': harness_options.permission_mode=plan contradicts the "
+      + 'permissions block, which translates to permission_mode=bypassPermissions — '
+      + 'harness_options.permission_mode=plan wins';
+    expect(cfg.stdout).toContain(WARNING);
+    expect(doc.stdout).toContain(WARNING);
+
+    // A single source of intent says nothing about being contradicted.
+    expect(cfg.stdout).not.toContain("role 'Single': harness_options");
+    expect(doc.stdout).not.toContain("role 'Single': harness_options");
+  });
+
   it('peek and send never call an unreachable role dead (1.5)', async () => {
     // No tmux session and no control socket: the honest answer is "I could not
     // reach it", plus what that does and does not prove.

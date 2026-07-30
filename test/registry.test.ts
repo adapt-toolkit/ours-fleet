@@ -8,6 +8,10 @@ export const fakeAdapter: HarnessAdapter = {
   async checkPrereqs() { return { ok: true, checks: [] }; },
   validateOptions() { return []; },
   async prepareSession() { return { argv: ['--fake-prep'], env: { FAKE: '1' } }; },
+  nativePermissionOverrides(options: unknown) {
+    const mode = (options as { fake_mode?: string } | undefined)?.fake_mode;
+    return mode == null ? {} : { fake_mode: mode };
+  },
   translatePermissions(permissions) {
     return {
       supported: true,

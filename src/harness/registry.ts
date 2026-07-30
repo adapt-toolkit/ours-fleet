@@ -10,6 +10,10 @@ export function registerAdapter(a: HarnessAdapter): void {
     throw new Error(
       `harness adapter '${a.id}' must implement translatePermissions(): either translate ` +
       `neutral permissions or return { supported: false, reason }`);
+  if (typeof a.nativePermissionOverrides !== 'function')
+    throw new Error(
+      `harness adapter '${a.id}' must implement nativePermissionOverrides(): report the ` +
+      `native permission settings a role states in harness_options, or {}`);
   adapters.set(a.id, a);
 }
 

@@ -178,6 +178,11 @@ export function makeClaudeCodeAdapter(exec: Exec = realExec): HarnessAdapter {
       return { argv, env: prep.env };
     },
 
+    nativePermissionOverrides(options: unknown): Record<string, unknown> {
+      const pm = (options as ClaudeOptions | undefined)?.permission_mode;
+      return pm == null ? {} : { permission_mode: pm };
+    },
+
     translatePermissions(permissions) {
       const native = nativePermissionMode(permissions.approval) ?? 'default';
       const exact = permissions.filesystem === 'workspace' && permissions.approval === 'ask';

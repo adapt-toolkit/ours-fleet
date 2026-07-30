@@ -532,3 +532,90 @@ describe('doctor unattended capability floor (2.1)', () => {
     expect(c.detail).toContain('messaging');
   });
 });
+
+describe('native overrides contradicting neutral intent (2.4)', () => {
+  const HEALTHY = {
+    'tmux -V': { stdout: 'tmux 3.4', stderr: '', code: 0 },
+    'ours-mcp --version': { stdout: '0.1.2', stderr: '', code: 0 },
+    'ours-mcp status': { stdout: 'running', stderr: '', code: 0 },
+    'loginctl show-user': { stdout: 'Linger=yes', stderr: '', code: 0 },
+  };
+  const run = () => doctor({}, execWith(HEALTHY), 'linux', stubFetch());
+  const writeCfg = (yaml: string) => writeFileSync(join(dir, 'fleet.yaml'), yaml);
+  const conflicts = (rep: Awaited<ReturnType<typeof doctor>>, role: string) =>
+    rep.checks.filter(c => c.name === `permission conflict: ${role}`);
+
+  /** label, role yaml body, expected conflicting key (null = must stay quiet). */
+  const CLAUDE: Array<[string, string, string | null]> = [
+    ['neutral only', '    permissions:\n      approval: allow\n', null],
+    ['native only', '    harness_options:\n      permission_mode: plan\n', null],
+    ['both, matching', '    permissions:\n      approval: allow\n'
+      + '    harness_options:\n      permission_mode: bypassPermissions\n', null],
+    ['both, conflicting', '    permissions:\n      approval: allow\n'
+      + '    harness_options:\n      permission_mode: plan\n', 'permission_mode'],
+    ['both, conflicting the other way', '    permissions:\n      approval: deny\n'
+      + '    harness_options:\n      permission_mode: bypassPermissions\n', 'permission_mode'],
+  ];
+
+  for (const [label, body, key] of CLAUDE) {
+    it(`Claude, ${label}: ${key ? 'warns' : 'stays quiet'}`, async () => {
+      writeCfg(`roles:\n  R:\n    harness: claude-code\n${body}`);
+      const found = conflicts(await run(), 'R');
+      if (!key) { expect(found).toHaveLength(0); return; }
+      expect(found).toHaveLength(1);
+      expect(found[0].detail).toContain(`harness_options.${key}=`);
+      expect(found[0].detail).toContain('contradicts');
+      expect(found[0].detail).toContain('wins');
+    });
+  }
+
+  /** Codex states TWO native permission settings, so both must be compared. */
+  const CODEX: Array<[string, string, string[]]> = [
+    ['both, matching', '    permissions:\n      approval: allow\n      filesystem: workspace\n'
+      + '    harness_options:\n      approval: never\n      sandbox: workspace-write\n', []],
+    ['approval conflicts', '    permissions:\n      approval: allow\n      filesystem: workspace\n'
+      + '    harness_options:\n      approval: on-request\n', ['approval']],
+    ['sandbox conflicts', '    permissions:\n      approval: allow\n      filesystem: workspace\n'
+      + '    harness_options:\n      sandbox: danger-full-access\n', ['sandbox']],
+    ['both conflict', '    permissions:\n      approval: ask\n      filesystem: read-only\n'
+      + '    harness_options:\n      approval: never\n      sandbox: danger-full-access\n',
+      ['approval', 'sandbox']],
+    ['native only', '    harness_options:\n      sandbox: danger-full-access\n', []],
+  ];
+
+  for (const [label, body, keys] of CODEX) {
+    it(`Codex, ${label}: ${keys.length} warning(s)`, async () => {
+      writeCfg(`roles:\n  R:\n    harness: codex\n${body}`);
+      const found = conflicts(await run(), 'R');
+      expect(found).toHaveLength(keys.length);
+      for (const key of keys)
+        expect(found.some(c => c.detail.includes(`harness_options.${key}=`)), key).toBe(true);
+    });
+  }
+
+  it('the permission_mode alias is compared as approval for Codex', async () => {
+    writeCfg('roles:\n  R:\n    harness: codex\n'
+      + '    permissions:\n      approval: allow\n'
+      + '    harness_options:\n      permission_mode: on-request\n');
+    const found = conflicts(await run(), 'R');
+    expect(found).toHaveLength(1);
+    expect(found[0].detail).toContain('harness_options.approval=on-request');
+  });
+
+  it('a defaults-level permissions block still counts as a declared source', async () => {
+    writeCfg('defaults:\n  permissions:\n    approval: allow\n'
+      + 'roles:\n  R:\n    harness: claude-code\n'
+      + '    harness_options:\n      permission_mode: plan\n');
+    expect(conflicts(await run(), 'R')).toHaveLength(1);
+  });
+
+  it('names both values and which one wins', async () => {
+    writeCfg('roles:\n  R:\n    harness: claude-code\n'
+      + '    permissions:\n      approval: allow\n'
+      + '    harness_options:\n      permission_mode: plan\n');
+    const detail = conflicts(await run(), 'R')[0].detail;
+    expect(detail).toContain('permission_mode=plan');            // the native value
+    expect(detail).toContain('permission_mode=bypassPermissions'); // the neutral translation
+    expect(detail).toMatch(/harness_options\.permission_mode=plan wins/);
+  });
+});
