@@ -3,7 +3,7 @@ import { join } from 'node:path';
 import { userInfo } from 'node:os';
 import { home } from '../paths.js';
 import { realExec, type Exec } from '../exec.js';
-import type { SupervisorBackend } from './types.js';
+import type { LivenessState, SupervisorBackend } from './types.js';
 
 export const UNIT_TEMPLATE = 'ours-fleet-agent@.service';
 
@@ -19,6 +19,20 @@ export const busHint = (stderr: string): string =>
       `\n      (if linger is already on: export XDG_RUNTIME_DIR=/run/user/$(id -u))`
     : '';
 export const unitFor = (name: string) => `ours-fleet-agent@${name}.service`;
+
+/**
+ * systemd's own ActiveState vocabulary, classified. `activating` covers
+ * `auto-restart` — the unit is mid-restart, not stopped, so its context stands.
+ * `deactivating`/`reloading` still have a process. Only `inactive` and `failed`
+ * are definite stops. Anything systemd did not report is `unknown`.
+ */
+export function classifyActiveState(activeState: string): LivenessState {
+  switch (activeState) {
+    case 'active': case 'activating': case 'reloading': case 'deactivating': return 'running';
+    case 'inactive': case 'failed': return 'stopped';
+    default: return 'unknown';
+  }
+}
 
 export function makeSystemdBackend(exec: Exec = realExec): SupervisorBackend {
   const ctl = (...args: string[]) => exec('systemctl', ['--user', ...args]);
@@ -68,6 +82,19 @@ WantedBy=default.target
     async status(name) {
       const r = await ctl('status', unitFor(name), '--no-pager');
       return r.stdout || r.stderr;
+    },
+    async liveness(name) {
+      // `show --value` is machine-readable and stable; `status` prose is not.
+      const r = await ctl('show', '-p', 'ActiveState', '-p', 'SubState', '--value', unitFor(name));
+      const [activeState = '', subState = ''] = r.stdout.trim().split('\n').map(l => l.trim());
+      if (!activeState) return {
+        state: 'unknown',
+        detail: `systemctl show ${unitFor(name)} failed: ${r.stderr.trim() || `exit ${r.code}`}${busHint(r.stderr)}`,
+      };
+      return {
+        state: classifyActiveState(activeState),
+        detail: subState ? `${activeState} (${subState})` : activeState,
+      };
     },
     async uninstall(name) { await ctl('disable', '--now', unitFor(name)); },
     logsArgs(name, follow) {

@@ -60,9 +60,15 @@ export async function up(
 ): Promise<void> {
   for (const role of selectRoles(cfg, names)) {
     const dir = applyRole(role, { configPath });
-    // If the role isn't running, boot fresh so it reads the briefing we just wrote.
-    const status = await deps.backend.status(role.name).catch(() => '');
-    if (!/running|active \(/.test(status)) rmSync(join(dir, '.booted'), { force: true });
+    // Only a *definite* stop boots fresh so the role reads the briefing we just
+    // wrote. A running, restarting, or unprobeable role keeps its context —
+    // guessing "stopped" from an unanswered probe silently discards a live
+    // conversation.
+    const live = await deps.backend.liveness(role.name)
+      .catch(e => ({ state: 'unknown' as const, detail: e instanceof Error ? e.message : String(e) }));
+    if (live.state === 'stopped') rmSync(join(dir, '.booted'), { force: true });
+    else if (live.state === 'unknown')
+      deps.log(`  ! ${role.name}: liveness unknown, keeping session context — ${live.detail}`);
     await deps.backend.install(role.name, deps.binPath);
     deps.log(`↑ up: ${role.name} (harness: ${role.harness}, identity: ${role.identity}${role.cwd ? `, cwd: ${role.cwd}` : ''})`);
   }

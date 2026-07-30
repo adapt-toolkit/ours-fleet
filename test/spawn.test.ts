@@ -32,6 +32,7 @@ function fakeDeps() {
     async install(n) { calls.push(['install', n]); },
     async start() {}, async stop() {}, async restart() {},
     async status() { return 'inactive'; }, async uninstall() {},
+    async liveness() { return { state: 'stopped' as const, detail: 'inactive (dead)' }; },
     logsArgs: n => ({ cmd: 'true', args: [n] }),
   };
   const d: OpsDeps = { backend, binPath: '/b/ours-fleet', sleep: async () => {}, log: () => {} };

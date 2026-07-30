@@ -65,6 +65,22 @@ export function makeLaunchdBackend(exec: Exec = realExec, uid: number = process.
       if (r.code !== 0) return `not loaded (${labelFor(name)})`;
       return r.stdout.split('\n').slice(0, 12).join('\n');
     },
+    async liveness(name) {
+      const r = await exec('launchctl', ['print', `${domain}/${labelFor(name)}`]);
+      if (r.code === 0) {
+        // Loaded. `state = waiting` is a KeepAlive service between restarts —
+        // still supervised, so its context stands.
+        const state = /^\s*state\s*=\s*(\S+)/m.exec(r.stdout)?.[1];
+        return { state: 'running', detail: state ? `loaded (state = ${state})` : 'loaded' };
+      }
+      const out = `${r.stdout}\n${r.stderr}`;
+      if (/could not find service|no such process/i.test(out))
+        return { state: 'stopped', detail: `not loaded (${labelFor(name)})` };
+      return {
+        state: 'unknown',
+        detail: `launchctl print ${labelFor(name)} failed: ${r.stderr.trim() || r.stdout.trim() || `exit ${r.code}`}`,
+      };
+    },
     async uninstall(name) {
       await exec('launchctl', ['bootout', `${domain}/${labelFor(name)}`]);
       rmSync(plistPath(name), { force: true });

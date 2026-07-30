@@ -20,6 +20,14 @@ export function makeNoneBackend(exec: Exec = realExec): SupervisorBackend {
     async stop(name) { await tmux.kill(name); },
     async restart(name) { throw new Error(`restart unsupported under the none backend — stop + install '${name}'`); },
     async status(name) { return (await tmux.has(name)) ? `tmux session '${name}' running` : `'${name}' not running`; },
+    async liveness(name) {
+      // Report the tmux probe directly: 0 = session exists, 1 = it does not.
+      // Any other code (127 = no tmux binary) is a failed probe, not a stop.
+      const r = await exec('tmux', ['has-session', '-t', name]);
+      if (r.code === 0) return { state: 'running', detail: `tmux session '${name}' exists` };
+      if (r.code === 1) return { state: 'stopped', detail: `no tmux session '${name}'` };
+      return { state: 'unknown', detail: `tmux has-session '${name}' failed (${r.code}): ${r.stderr.trim() || 'no output'}` };
+    },
     async uninstall(name) { await tmux.kill(name); },
     logsArgs(name) { return { cmd: 'tmux', args: ['capture-pane', '-t', name, '-p'] }; },
   };
