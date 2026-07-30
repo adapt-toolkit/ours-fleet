@@ -8,14 +8,23 @@ import type { IsolationConfig } from './isolation/types.js';
 import {
   loadConfig, resolveMonitorConfig, resolvePermissions,
   type ApprovalMode, type FilesystemMode, type ResolvedRole, type RoleConfig,
-  type SessionBackendId, type UnattendedMode,
+  type CommonPermissions, type SessionBackendId, type UnattendedMode,
 } from './config.js';
 import { applyRole, up, type OpsDeps } from './ops.js';
 import { START_STAGGER_FILE } from './runner.js';
 import {
-  daemonIdentityProvisioner, ensureIdentity, withCreationTransaction, writeRoleFile,
-  type CreationDeps, type CreationTransaction, type IdentityGuarantee,
+  buildProvenance, daemonIdentityProvisioner, ensureIdentity, provenanceOf,
+  withCreationTransaction, writeProvenance, writeRoleFile,
+  type CreationDeps, type CreationProvenance, type CreationTransaction,
+  type IdentityGuarantee, type ProvenanceEntry,
 } from './creation.js';
+import { VERSION } from './version.js';
+
+/**
+ * The provenance record written by the most recent spawn in this process, so
+ * the CLI can print the same summary it persisted rather than rebuilding it.
+ */
+export let lastProvenance: CreationProvenance | undefined;
 
 export interface SpawnOpts {
   name: string;
@@ -135,6 +144,36 @@ function assertNameFree(o: SpawnOpts): void {
 /** The ours identity a spawn will bind: explicit, else the role name. */
 export const effectiveIdentity = (o: SpawnOpts): string => o.identity ?? o.name;
 
+/**
+ * Which settings came from the operator, from fleet defaults, or from a
+ * built-in (6.6). Built while the options are still separable — once they are
+ * merged into a ResolvedRole the distinction is gone.
+ *
+ * `env`, `bio`, `persona` and `harness_options` are deliberately absent: the
+ * record exists to be read, and must not become a place credentials collect.
+ */
+function provenanceSettings(
+  o: SpawnOpts, defaults: Record<string, unknown>,
+): Record<string, ProvenanceEntry> {
+  const perms = (defaults.permissions ?? {}) as Partial<CommonPermissions>;
+  return {
+    harness: provenanceOf(o.harness, defaults.harness, 'claude-code'),
+    session: provenanceOf(o.session, defaults.session, 'tmux'),
+    identity: o.identity
+      ? { value: o.identity, source: 'cli' }
+      : { value: o.name, source: 'built-in' },     // defaults to the role name
+    cwd: provenanceOf(o.cwd, undefined, undefined),
+    model: provenanceOf(o.model?.trim(), defaults.model, undefined),
+    coordinator: provenanceOf(o.coordinator, undefined, undefined),
+    approval: provenanceOf(o.approval, perms.approval, 'ask'),
+    filesystem: provenanceOf(o.filesystem, perms.filesystem, 'workspace'),
+    unattended: provenanceOf(o.unattended, perms.unattended, 'deny'),
+    isolation: o.isolationFile
+      ? { value: 'declared via --isolation-file', source: 'cli' }
+      : { value: defaults.isolation ? 'from fleet defaults' : undefined, source: defaults.isolation ? 'fleet-default' : 'built-in' },
+  };
+}
+
 /** Permanent spawn: persist to ~/fleet.d/<Name>.yaml, then bring it up. */
 export async function spawnPermanent(
   o: SpawnOpts, deps: OpsDeps, creation: CreationDeps = {},
@@ -186,9 +225,18 @@ export async function spawnPermanent(
         stage: `service registration for ${o.name}`,
         undo: async () => { for (const n of registered) await deps.backend.uninstall(n); },
       });
+      // Provenance is written BEFORE the role starts, so a role that fails to
+      // launch still records how it was asked for (6.6).
+      const provenance = buildProvenance({
+        role: o.name, lifetime: 'permanent', fleetVersion: VERSION,
+        settings: provenanceSettings(o, cfg.defaults),
+      });
+      mkdirSync(agentDir(o.name), { recursive: true });
+      writeProvenance(agentDir(o.name), provenance);
       const outcomes = await up(
         loadConfig(o.configPath), [o.name], deps, o.configPath, guarantee.state);
       for (const outcome of outcomes) if (outcome.created) registered.push(outcome.role);
+      lastProvenance = provenance;
       return file;
     },
     creation,
@@ -262,6 +310,12 @@ async function spawnTempInner(
     sourceFile: '(temp)',
   };
   const dir = applyRole(role, { temp: true, identityGuarantee: guarantee.state });
+  const provenance = buildProvenance({
+    role: o.name, lifetime: 'temporary', fleetVersion: VERSION,
+    settings: provenanceSettings(o, cfg.defaults),
+  });
+  writeProvenance(dir, provenance);
+  lastProvenance = provenance;
   tx.record({ stage: `temp state dir ${dir}`, undo: () => rmSync(dir, { recursive: true, force: true }) });
   writeFileSync(join(dir, 'role.yaml'), stringify(role));
   // Snapshot the fleet start-stagger so the detached temp supervisor (no config path

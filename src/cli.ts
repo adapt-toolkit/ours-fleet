@@ -12,7 +12,8 @@ import { Tmux } from './tmux.js';
 import { pickBackend } from './supervisor/index.js';
 import { up, down, restartRoles, rmRole, type OpsDeps } from './ops.js';
 import { readRestartLedger, runSupervised, runTemp } from './runner.js';
-import { spawnPermanent, spawnTemp, type SpawnOpts } from './spawn.js';
+import { lastProvenance, spawnPermanent, spawnTemp, type SpawnOpts } from './spawn.js';
+import { formatProvenance } from './creation.js';
 import { doctor } from './doctor.js';
 import { allWarnings, analyzeFleetPermissions, formatNative } from './permissions.js';
 import { AI_DOCS } from './docs.js';
@@ -357,6 +358,13 @@ cOpt(program.command('spawn <name>').description('spawn a new agent (permanent b
       } else {
         const file = await spawnPermanent(o, deps());
         console.log(`spawned '${name}' (config: ${file})`);
+      }
+      // The same provenance that was persisted, so what the operator reads now
+      // and what a reviewer reads later cannot disagree (6.6).
+      if (lastProvenance) {
+        console.log(`  created by ${lastProvenance.command} v${lastProvenance.fleetVersion} `
+          + `at ${lastProvenance.createdAt} (${lastProvenance.lifetime})`);
+        for (const line of formatProvenance(lastProvenance)) console.log(line);
       }
       console.log(`→ watch it: ours-fleet peek ${name}   |   attach: ours-fleet attach ${name}`);
     } catch (e) { die(e); }

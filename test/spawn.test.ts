@@ -4,6 +4,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { parse, stringify } from 'yaml';
 import { spawnPermanent, spawnTemp, type SupervisorLauncher } from '../src/spawn.js';
+import { formatProvenance } from '../src/creation.js';
 import { agentDir } from '../src/paths.js';
 import { registerAdapter } from '../src/harness/registry.js';
 import { fakeAdapter } from './registry.test.js';
@@ -545,5 +546,91 @@ describe('creation-time isolation (6.3)', () => {
     const { d } = fakeDeps();
     const file = await spawnPermanent({ name: 'Plain' }, d);
     expect(parse(readFileSync(file, 'utf8')).roles.Plain.isolation).toBeUndefined();
+  });
+});
+
+describe('creation provenance (6.6)', () => {
+  const provenanceOf = (name: string, temp = false) =>
+    JSON.parse(readFileSync(join(agentDir(name, temp), 'creation.json'), 'utf8'));
+
+  it('a default role records every setting as built-in, with version and time', async () => {
+    writeFileSync(join(dir, 'fleet.yaml'), stringify({ roles: {} }));   // no defaults at all
+    const { d } = fakeDeps();
+    await spawnPermanent({ name: 'Plain' }, d);
+    const p = provenanceOf('Plain');
+
+    expect(p.version).toBe(1);
+    expect(p.role).toBe('Plain');
+    expect(p.lifetime).toBe('permanent');
+    expect(p.command).toBe('ours-fleet spawn');
+    expect(p.fleetVersion).toMatch(/\d+\.\d+\.\d+/);
+    expect(Number.isNaN(Date.parse(p.createdAt))).toBe(false);
+    expect(p.settings.approval).toEqual({ value: 'ask', source: 'built-in' });
+    expect(p.settings.harness).toEqual({ value: 'claude-code', source: 'built-in' });
+    expect(p.settings.identity).toEqual({ value: 'Plain', source: 'built-in' });
+  });
+
+  it('distinguishes an explicit CLI value from a fleet default from a built-in', async () => {
+    writeFileSync(join(dir, 'fleet.yaml'), stringify({
+      defaults: { harness: 'fake', model: 'from-defaults', permissions: { filesystem: 'read-only' } },
+      roles: {},
+    }));
+    const { d } = fakeDeps();
+    await spawnPermanent({ name: 'Mixed', approval: 'allow', identity: 'Explicit' }, d);
+    const s = provenanceOf('Mixed').settings;
+
+    expect(s.approval).toEqual({ value: 'allow', source: 'cli' });          // typed by the operator
+    expect(s.filesystem).toEqual({ value: 'read-only', source: 'fleet-default' });
+    expect(s.model).toEqual({ value: 'from-defaults', source: 'fleet-default' });
+    expect(s.unattended).toEqual({ value: 'deny', source: 'built-in' });    // nobody chose it
+    expect(s.identity).toEqual({ value: 'Explicit', source: 'cli' });
+    expect(s.harness).toEqual({ value: 'fake', source: 'fleet-default' });
+  });
+
+  it('records creation-time isolation as an explicit choice', async () => {
+    writeFileSync(join(dir, 'policy.yaml'), 'network: deny\n');
+    const { d } = fakeDeps();
+    await spawnPermanent({ name: 'Sec', isolationFile: join(dir, 'policy.yaml') }, d);
+    expect(provenanceOf('Sec').settings.isolation.source).toBe('cli');
+  });
+
+  it('a temp role records its own lifetime', async () => {
+    const d = await spawnTemp({ name: 'Scout', mission: 'recon' }, '/b/ours-fleet', () => {});
+    void d;
+    expect(provenanceOf('Scout', true).lifetime).toBe('temporary');
+  });
+
+  it('NEVER records secrets, env, bio or persona', async () => {
+    writeFileSync(join(dir, 'bio.txt'), 'PUBLIC-CARD-TEXT');
+    writeFileSync(join(dir, 'persona.txt'), 'PERSONA-CONTRACT-TEXT');
+    writeFileSync(join(dir, 'fleet.yaml'), stringify({
+      defaults: { harness: 'fake' },
+      roles: {},
+    }));
+    const { d } = fakeDeps();
+    await spawnPermanent({
+      name: 'Careful',
+      bioFile: join(dir, 'bio.txt'), personaFile: join(dir, 'persona.txt'),
+      codexConfig: { api_key_like: 'SUPER-SECRET-VALUE' },
+    }, d);
+
+    const raw = readFileSync(join(agentDir('Careful'), 'creation.json'), 'utf8');
+    for (const forbidden of ['PUBLIC-CARD-TEXT', 'PERSONA-CONTRACT-TEXT', 'SUPER-SECRET-VALUE'])
+      expect(raw, forbidden).not.toContain(forbidden);
+    const p = JSON.parse(raw);
+    expect(p.settings.env).toBeUndefined();
+    expect(p.settings.bio).toBeUndefined();
+    expect(p.settings.persona).toBeUndefined();
+    expect(p.settings.harness_options).toBeUndefined();
+  });
+
+  it('the printed summary is built from the SAME record that was persisted', async () => {
+    const { d } = fakeDeps();
+    await spawnPermanent({ name: 'Shown', approval: 'allow' }, d);
+    const p = provenanceOf('Shown');
+    const lines = formatProvenance(p);
+    expect(lines.join('\n')).toContain('approval');
+    expect(lines.join('\n')).toContain('(explicit)');
+    expect(lines.join('\n')).toContain('(built-in)');
   });
 });

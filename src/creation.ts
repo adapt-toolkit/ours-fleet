@@ -298,3 +298,81 @@ export function writeRoleFile(tx: CreationTransaction, file: string, contents: s
     undo: () => { if (!existed) rmSync(file, { force: true }); },
   });
 }
+
+// ─── Creation provenance (6.6) ───────────────────────────────────────────────
+
+/** Where a setting's effective value came from. */
+export type ProvenanceSource = 'cli' | 'fleet-default' | 'built-in';
+
+export interface ProvenanceEntry {
+  value: unknown;
+  source: ProvenanceSource;
+}
+
+export interface CreationProvenance {
+  version: 1;
+  /** The command that created the role, without its arguments. */
+  command: string;
+  fleetVersion: string;
+  createdAt: string;
+  lifetime: 'permanent' | 'temporary';
+  role: string;
+  /** Effective settings, each tagged with where its value came from. */
+  settings: Record<string, ProvenanceEntry>;
+}
+
+export const CREATION_PROVENANCE_FILE = 'creation.json';
+
+/**
+ * Record HOW a role was created, so nobody has to remember.
+ *
+ * Six months on, "why does this role have `approval: allow`?" is unanswerable:
+ * the resolved config shows the value but not whether an operator typed it, a
+ * fleet default supplied it, or it fell through to a built-in. Those have very
+ * different implications for whether it is safe to change.
+ *
+ * Deliberately excluded: `env`, `bio`, `persona`, and `harness_options`. The
+ * first two can carry credentials, and this file exists to be read — it must
+ * never become a place secrets accumulate.
+ */
+export function buildProvenance(o: {
+  role: string;
+  lifetime: 'permanent' | 'temporary';
+  fleetVersion: string;
+  now?: Date;
+  settings: Record<string, ProvenanceEntry>;
+}): CreationProvenance {
+  return {
+    version: 1,
+    command: 'ours-fleet spawn',
+    fleetVersion: o.fleetVersion,
+    createdAt: (o.now ?? new Date()).toISOString(),
+    lifetime: o.lifetime,
+    role: o.role,
+    settings: o.settings,
+  };
+}
+
+/** Write the provenance record atomically, before the role is started. */
+export function writeProvenance(stateDir: string, p: CreationProvenance): void {
+  replaceFileAtomically(join(stateDir, CREATION_PROVENANCE_FILE), JSON.stringify(p, null, 2) + '\n', 0o600);
+}
+
+/** One concise line per non-built-in setting, for the post-creation summary. */
+export function formatProvenance(p: CreationProvenance): string[] {
+  const mark = { cli: 'explicit', 'fleet-default': 'fleet default', 'built-in': 'built-in' } as const;
+  return Object.entries(p.settings)
+    .filter(([, e]) => e.value !== undefined)
+    .map(([k, e]) => `    ${k.padEnd(12)} ${String(e.value)}  (${mark[e.source]})`);
+}
+
+/** Classify one setting: an explicit CLI value, a fleet default, or built-in. */
+export function provenanceOf(
+  cliValue: unknown, fleetDefault: unknown, builtIn?: unknown,
+): ProvenanceEntry {
+  if (cliValue !== undefined && cliValue !== null && cliValue !== '')
+    return { value: cliValue, source: 'cli' };
+  if (fleetDefault !== undefined && fleetDefault !== null)
+    return { value: fleetDefault, source: 'fleet-default' };
+  return { value: builtIn, source: 'built-in' };
+}

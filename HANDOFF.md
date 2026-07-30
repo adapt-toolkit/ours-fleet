@@ -42,17 +42,31 @@ Baseline before any work: **339 passed**.
 | 7.3 guarantee identity existence before launch | `f759a35` | 545 |
 | 6.2 roll back every failed creation stage | `b077947` | 554 |
 | 6.3 `spawn --isolation-file` | `312ce61` | 565 |
+| 6.6 persist creation provenance | `PENDING` | 571 |
 
-Sections 1-4 complete. Section 5 in progress: 6.1, 6.4, 7.3, 6.2, 6.3 done; 6.6 next.
+**Sections 1 through 5 are COMPLETE.** Only section 6 (documentation) remains: 7.1, 7.2, 7.4.
 
-## Remaining, in spec dependency order
+## Remaining — all three are documentation (section 6)
 
-1. **6.6** persist creation provenance
-2. **7.1** correct the spawn skill
-3. **7.2** stop using one console command as a liveness verdict
-4. **7.4** document never-prompt failure and the capability floor
+1. **7.1** correct the spawn skill —
+   `integrations/claude-code/skills/spawn-ours-agent/SKILL.md` and
+   `integrations/codex/ours-fleet/skills/spawn-ours-agent/SKILL.md`, rewritten from one source
+   of truth. Must explain BOTH permission traps (2.1's `allow`→`dontAsk` denial and the
+   unattended floor), require reading `ours-fleet docs`, and cover `--isolation-file`. Needs a
+   packaging/content parity test across variants.
+2. **7.2** stop using one console command as a liveness verdict — update `src/briefing.ts`'s
+   oversight procedure and `integrations/*/skills/oversee-agents/SKILL.md` to the taxonomy 1.5
+   already implements: queued, timeout/maybe-delivered, rejected, control-unavailable, confirmed
+   offline. `livenessNote()` in `src/session/control.ts` is the single source for that wording —
+   reuse it rather than restating it.
+3. **7.4** document never-prompt failure and the capability floor — PARTLY DONE: 2.1 already
+   added the floor, its six capabilities and the security meaning of `allow` to both
+   `src/docs.ts` and README. What remains is the automatic-ACP-decision half (1.3) and
+   cross-links from the spawn/permissions references.
 
-Nothing is part-way done. Every commit above is complete with its tests.
+Nothing is part-way done. Every commit above is complete with its tests. All three remaining
+fixes DESCRIBE behaviour that already exists and is tested, so nothing is blocked by their
+absence — which is why they were left last.
 
 ## Rulings from Coordinator (do not re-litigate)
 
