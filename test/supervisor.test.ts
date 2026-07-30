@@ -30,7 +30,9 @@ describe('systemd backend', () => {
     const { calls, exec } = recorder();
     const msgs = await makeSystemdBackend(exec).init('/usr/local/bin/ours-fleet');
     const unit = readFileSync(join(dir, '.config/systemd/user/ours-fleet-agent@.service'), 'utf8');
-    expect(unit).toContain('ExecStart=/usr/local/bin/ours-fleet _run %i');
+    // Anchored: this file now carries `#` comments, and a substring match can be
+    // satisfied by one of them rather than by the directive itself.
+    expect(unit).toMatch(/^ExecStart=\/usr\/local\/bin\/ours-fleet _run %i$/m);
     expect(unit).toMatch(/^Restart=on-failure$/m);   // the runner owns the retry loop (3.2)
     expect(calls).toContainEqual(['systemctl', '--user', 'daemon-reload']);
     expect(calls.some(c => c[0] === 'loginctl' && c[1] === 'enable-linger')).toBe(true);
@@ -59,7 +61,7 @@ describe('launchd backend', () => {
     expect(plist).toContain('<string>network.ours.fleet.A</string>');
     expect(plist).toContain('<string>/usr/local/bin/ours-fleet</string>');
     expect(plist).toContain('<string>_run</string>');
-    expect(plist).toContain('<key>KeepAlive</key><dict><key>SuccessfulExit</key><false/></dict>');
+    expect(plist).toMatch(/^\s*<key>KeepAlive<\/key><dict><key>SuccessfulExit<\/key><false\/><\/dict>$/m);
     expect(calls.some(c => c[0] === 'launchctl' && c[1] === 'bootstrap' && c[2] === 'gui/501')).toBe(true);
     expect(labelFor('A')).toBe('network.ours.fleet.A');
   });
@@ -192,7 +194,7 @@ describe('service managers no longer run the child-session loop (3.2)', () => {
     const unit = readFileSync(join(dir, '.config/systemd/user/ours-fleet-agent@.service'), 'utf8');
     // Restart=always would resume the uncounted two-second relaunch loop and
     // would restart a runner that is deliberately holding an agent down.
-    expect(unit).toContain('Restart=on-failure');
+    expect(unit).toMatch(/^Restart=on-failure$/m);
     expect(unit).not.toMatch(/^Restart=always$/m);
     expect(unit).not.toMatch(/^RestartSec=2$/m);
   });
@@ -201,7 +203,7 @@ describe('service managers no longer run the child-session loop (3.2)', () => {
     const { exec } = recorder();
     await makeLaunchdBackend(exec, 501).install('A', '/usr/local/bin/ours-fleet');
     const plist = readFileSync(join(dir, 'Library/LaunchAgents/network.ours.fleet.A.plist'), 'utf8');
-    expect(plist).toContain('<key>SuccessfulExit</key><false/>');
-    expect(plist).not.toContain('<key>KeepAlive</key><true/>');
+    expect(plist).toMatch(/^\s*<key>KeepAlive<\/key><dict><key>SuccessfulExit<\/key><false\/><\/dict>$/m);
+    expect(plist).not.toMatch(/^\s*<key>KeepAlive<\/key><true\/>$/m);
   });
 });
