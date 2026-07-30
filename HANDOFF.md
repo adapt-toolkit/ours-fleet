@@ -42,7 +42,7 @@ Baseline before any work: **339 passed**.
 | 7.3 guarantee identity existence before launch | `f759a35` | 545 |
 | 6.2 roll back every failed creation stage | `b077947` | 554 |
 | 6.3 `spawn --isolation-file` | `312ce61` | 565 |
-| 6.6 persist creation provenance | `PENDING` | 571 |
+| 6.6 persist creation provenance | `c6de9a2` | 571 |
 
 **Sections 1 through 5 are COMPLETE.** Only section 6 (documentation) remains: 7.1, 7.2, 7.4.
 
