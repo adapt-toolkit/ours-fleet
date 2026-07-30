@@ -82,6 +82,23 @@ describe('ours-fleet CLI', () => {
     expect(r.stdout).toMatch(/mem=2G/);
   });
 
+  it('doctor fails with the parser cause for a config `config` rejects (1.4)', async () => {
+    const { writeFileSync } = await import('node:fs');
+    writeFileSync(join(dir, 'fleet.yaml'), 'roles:\n  A:\n    harnes: claude-code\n');
+
+    const cfg = await run(['config']);
+    expect(cfg.code).toBe(1);
+    expect(cfg.stderr).toContain('unknown key(s) harnes');
+
+    const doc = await run(['doctor']);
+    expect(doc.code).toBe(1);                        // must not read green
+    expect(doc.stdout).toContain('unknown key(s) harnes');   // same actionable cause
+    expect(doc.stdout).toContain('node');            // host checks still ran
+    expect(doc.stdout).toContain('tmux');
+    expect(doc.stdout).toMatch(/claude-code: /);     // AI CLI checks did not disappear
+    expect(doc.stdout).toMatch(/MISS roles\s+unknown/);
+  });
+
   it('peek renders automatic permission decisions on a live ACP role (1.3)', async () => {
     const { mkdirSync } = await import('node:fs');
     const { AcpSession } = await import('../src/session/acp.js');

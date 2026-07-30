@@ -3,8 +3,11 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { doctor } from '../src/doctor.js';
+import { loadConfig } from '../src/config.js';
 import { registerAdapter } from '../src/harness/registry.js';
 import { fakeAdapter } from './registry.test.js';
+import '../src/harness/claude-code.js';   // registers the production adapters
+import '../src/harness/codex.js';
 import type { Exec, ExecResult } from '../src/exec.js';
 import type { FetchLike } from '../src/monitor.js';
 
@@ -316,5 +319,99 @@ describe('user bus check (#9)', () => {
       'ours-mcp status': { stdout: 'running', stderr: '', code: 0 },
     }), 'darwin');
     expect(rep.checks.find(c => c.name === 'user bus')).toBeUndefined();
+  });
+});
+
+describe('doctor config validity (1.4)', () => {
+  const HEALTHY_HOST = {
+    'tmux -V': { stdout: 'tmux 3.4', stderr: '', code: 0 },
+    'ours-mcp --version': { stdout: '0.1.2', stderr: '', code: 0 },
+    'ours-mcp status': { stdout: 'running', stderr: '', code: 0 },
+    'loginctl show-user': { stdout: 'Linger=yes', stderr: '', code: 0 },
+  };
+  const run = (opts: Parameters<typeof doctor>[0] = {}) =>
+    doctor(opts, execWith(HEALTHY_HOST), 'linux', stubFetch());
+  const writeCfg = (yaml: string) => writeFileSync(join(dir, 'fleet.yaml'), yaml);
+
+  /** Every configuration `ours-fleet config` refuses. */
+  const REJECTED: Array<[string, string, RegExp]> = [
+    ['a YAML syntax error', 'roles:\n  A: [oops\n', /./],
+    ['an unknown role key', 'roles:\n  A:\n    harnes: fake\n', /unknown key\(s\) harnes/],
+    ['a misspelled permission key', 'roles:\n  A:\n    permissions:\n      aproval: allow\n',
+      /permissions: unknown key\(s\) aproval/],
+    ['an invalid session backend', 'roles:\n  A:\n    session: telepathy\n', /session: must be one of/],
+    ['a role name with illegal characters', 'roles:\n  "bad name":\n    harness: fake\n',
+      /invalid role name/],
+  ];
+
+  for (const [label, yaml, cause] of REJECTED) {
+    it(`fails on ${label}, naming the same cause as \`config\``, async () => {
+      writeCfg(yaml);
+      // The premise: `config` rejects this exact input.
+      expect(() => loadConfig(join(dir, 'fleet.yaml'))).toThrow();
+      const parserMessage = (() => {
+        try { loadConfig(join(dir, 'fleet.yaml')); return ''; }
+        catch (e) { return (e as Error).message; }
+      })();
+
+      const rep = await run();
+      const cfg = rep.checks.find(c => c.name === 'config')!;
+      expect(cfg.ok).toBe(false);
+      expect(cfg.detail).toMatch(cause);
+      expect(cfg.detail).toBe(parserMessage);      // same actionable cause
+      expect(rep.ok).toBe(false);                  // and the command exits non-zero
+    });
+  }
+
+  it('keeps running the host checks when the config is invalid', async () => {
+    writeCfg('roles:\n  A:\n    harnes: fake\n');
+    const rep = await run();
+    for (const name of ['node', 'tmux', 'ours-mcp', 'ours-mcp daemon', 'linger', 'user bus'])
+      expect(rep.checks.find(c => c.name === name), name).toBeDefined();
+  });
+
+  it('still runs the AI CLI prerequisites when the config resolves no harness', async () => {
+    writeCfg('roles:\n  A:\n    harnes: fake\n');
+    const rep = await run();
+    // Production adapters are registered by importing them (as the CLI does).
+    expect(rep.checks.some(c => c.name.startsWith('claude-code: '))).toBe(true);
+    expect(rep.checks.some(c => c.name.startsWith('codex: '))).toBe(true);
+  });
+
+  it('honours an explicit --harness over the fallback', async () => {
+    writeCfg('roles:\n  A:\n    harnes: fake\n');
+    const rep = await run({ harness: 'codex' });
+    expect(rep.checks.some(c => c.name.startsWith('codex: '))).toBe(true);
+    expect(rep.checks.some(c => c.name.startsWith('claude-code: '))).toBe(false);
+  });
+
+  it('reports the configured-role count and does not fail an empty fleet', async () => {
+    const rep = await run();                          // no fleet.yaml at all
+    expect(rep.checks.find(c => c.name === 'roles')).toMatchObject({ ok: true, detail: '0 configured' });
+    expect(rep.checks.find(c => c.name === 'config')!.ok).toBe(true);
+  });
+
+  it('counts the roles a valid config resolves and names the files', async () => {
+    writeCfg('roles:\n  A:\n    harness: fake\n  B:\n    harness: fake\n');
+    const rep = await run();
+    expect(rep.checks.find(c => c.name === 'roles')!.detail).toBe('2 configured');
+    expect(rep.checks.find(c => c.name === 'config')!.detail).toContain('fleet.yaml');
+  });
+
+  it('reports the role count as unknown — not zero — when the config did not load', async () => {
+    writeCfg('roles:\n  A:\n    harnes: fake\n');
+    const rep = await run();
+    const rolesCheck = rep.checks.find(c => c.name === 'roles')!;
+    expect(rolesCheck.ok).toBe(false);
+    expect(rolesCheck.detail).toContain('unknown');
+    expect(rolesCheck.detail).not.toContain('0 configured');
+  });
+
+  it('fails on a missing explicit config file', async () => {
+    const rep = await doctor(
+      { configPath: join(dir, 'nope.yaml') }, execWith(HEALTHY_HOST), 'linux', stubFetch());
+    const cfg = rep.checks.find(c => c.name === 'config')!;
+    expect(cfg.ok).toBe(false);
+    expect(cfg.detail).toContain('config not found');
   });
 });

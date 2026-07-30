@@ -2,7 +2,7 @@ import { userInfo } from 'node:os';
 import { readFileSync } from 'node:fs';
 import { realExec, type Exec } from './exec.js';
 import { loadConfig, type ResolvedRole } from './config.js';
-import { getAdapter } from './harness/registry.js';
+import { getAdapter, productionAdapters } from './harness/registry.js';
 import { resolveBundledAcpAgent } from './harness/acp-agent.js';
 import { agentDir, home, deriveXdgRuntimeDir } from './paths.js';
 import { resolveIsolation } from './isolation/policy.js';
@@ -59,7 +59,18 @@ export async function doctor(
     detail: major >= 20 ? `v${process.versions.node}` : `v${process.versions.node} — need >= 20`,
   });
 
-  const roles = loadConfigSafe(opts.configPath);
+  // The configuration is a checked prerequisite in its own right. A config the
+  // `config` command rejects must fail here too, with the same cause — while the
+  // host checks below still run, because they are what the operator needs next.
+  const loaded = loadConfigResult(opts.configPath);
+  const roles = loaded.ok ? loaded.roles : [];
+  checks.push(loaded.ok
+    ? { name: 'config', ok: true, detail: loaded.files.join(' + ') || '(none — no fleet.yaml or fleet.d)' }
+    : { name: 'config', ok: false, detail: loaded.error });
+  checks.push(loaded.ok
+    ? { name: 'roles', ok: true, detail: `${roles.length} configured` }
+    : { name: 'roles', ok: false, detail: 'unknown — the configuration did not load' });
+
   if (roles.length === 0 || roles.some(role => (role.session ?? 'tmux') === 'tmux')) {
     const tmux = await exec('tmux', ['-V']);
     checks.push({
@@ -173,9 +184,14 @@ export async function doctor(
     checks.push({ name: checkName, ok, detail });
   }
 
+  // A broken config resolves no roles and therefore no harnesses. Without a
+  // fallback the AI CLI prerequisites would simply vanish from the report at
+  // exactly the moment the operator is trying to work out what is wrong.
   const harnesses = opts.harness
     ? [opts.harness]
-    : [...new Set(roles.map(r => r.harness))];
+    : loaded.ok
+      ? [...new Set(roles.map(r => r.harness))]
+      : productionAdapters();
   for (const h of harnesses) {
     try {
       const rep = await getAdapter(h).checkPrereqs();
@@ -231,6 +247,21 @@ export async function doctor(
   return { ok: checks.every(c => c.ok), checks };
 }
 
-function loadConfigSafe(configPath?: string) {
-  try { return loadConfig(configPath).roles; } catch { return []; }
+/**
+ * Loading the configuration either works or fails for a stated reason. The old
+ * `loadConfigSafe()` swallowed the reason and returned `[]`, which is
+ * indistinguishable from a valid fleet with no roles — so doctor reported a
+ * clean bill of health for a configuration `ours-fleet config` refuses outright.
+ */
+type ConfigLoad =
+  | { ok: true; roles: ResolvedRole[]; files: string[] }
+  | { ok: false; error: string };
+
+function loadConfigResult(configPath?: string): ConfigLoad {
+  try {
+    const cfg = loadConfig(configPath);
+    return { ok: true, roles: cfg.roles, files: cfg.files };
+  } catch (e) {
+    return { ok: false, error: e instanceof Error ? e.message : String(e) };
+  }
 }
