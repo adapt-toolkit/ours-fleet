@@ -35,7 +35,7 @@ Baseline before any work: **339 passed**.
 | 3.2 backoff + durable fast-failure circuit breaker | `ead5572` | 484 |
 | 5.2 forbidden-path enforcement | `994cbd0` | 502 |
 | (audit) anchor directive assertions in generated files | `338e220` | 502 |
-| 5.1 shared harness credentials read-only | `PENDING` | 514 |
+| 5.1 shared harness credentials read-only | `6ece53d` | 514 |
 
 Sections 1, 2, 3 and 4 are complete. Section 5 (creation/trust) is next.
 
