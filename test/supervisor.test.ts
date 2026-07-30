@@ -149,6 +149,39 @@ describe('none backend liveness (1.1)', () => {
   });
 });
 
+/**
+ * #32 — the none backend is where `stop` and `uninstall` actually kill a pane.
+ * If any of its tmux calls omits the socket it talks to the shared default
+ * server, and stopping one role takes the whole fleet's panes with it.
+ */
+describe('none backend addresses one server per role (#32)', () => {
+  it('install, stop, uninstall, status and liveness all carry the role own socket', async () => {
+    const { calls, exec } = recorder();
+    const backend = makeNoneBackend(exec);
+    await backend.install('A', '/b');
+    await backend.stop('A');
+    await backend.uninstall('A');
+    await backend.status('A');
+    await backend.liveness('A');
+
+    expect(calls.length).toBeGreaterThan(0);
+    for (const call of calls) expect(call.slice(0, 3)).toEqual(['tmux', '-L', 'ours-fleet-A']);
+  });
+
+  it('logsArgs reads the role own server', () => {
+    const { cmd, args } = makeNoneBackend().logsArgs('A', false);
+    expect(cmd).toBe('tmux');
+    expect(args).toEqual(['-L', 'ours-fleet-A', 'capture-pane', '-t', 'A', '-p']);
+  });
+
+  it('stopping one role issues no command against another role server', async () => {
+    const { calls, exec } = recorder();
+    await makeNoneBackend(exec).stop('Alpha');
+    expect(calls.every(c => c[2] === 'ours-fleet-Alpha')).toBe(true);
+    expect(calls.some(c => c.includes('ours-fleet-Beta'))).toBe(false);
+  });
+});
+
 describe('pickBackend', () => {
   it('selects by platform', () => {
     expect(pickBackend(undefined, 'linux').id).toBe('systemd');
@@ -250,7 +283,7 @@ describe('install/uninstall outcomes are explicit and idempotent (6.2)', () => {
 
   it('the none backend reports whether a session was already there', async () => {
     const noSession: Exec = async (_c, args) =>
-      ({ stdout: '', stderr: '', code: args[0] === 'kill-session' ? 1 : 0 });
+      ({ stdout: '', stderr: '', code: args.includes('kill-session') ? 1 : 0 });
     const hadSession: Exec = async () => ({ stdout: '', stderr: '', code: 0 });
     expect(await makeNoneBackend(noSession).install('A', '/b')).toMatchObject({ created: true });
     expect(await makeNoneBackend(hadSession).install('A', '/b')).toMatchObject({ created: false });

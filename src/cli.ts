@@ -8,7 +8,7 @@ import { Command } from 'commander';
 import { VERSION } from './version.js';
 import { agentDir, agentsRoot, tmpRoot, logsRoot, deriveXdgRuntimeDir } from './paths.js';
 import { loadConfig } from './config.js';
-import { Tmux } from './tmux.js';
+import { Tmux, tmuxArgs } from './tmux.js';
 import { pickBackend } from './supervisor/index.js';
 import { up, down, restartRoles, rmRole, type OpsDeps } from './ops.js';
 import { readRestartLedger, runSupervised, runTemp } from './runner.js';
@@ -175,11 +175,14 @@ cOpt(program.command('force-restart [names...]').description('re-sync + bounce F
 
 program.command('ls').description('list running fleet sessions')
   .action(async () => {
-    const tmux = await new Tmux().list();
+    // Each session has its own tmux server (#32), so there is no single server
+    // to ask: the known role names ARE the list of servers to poll.
+    const names: string[] = [];
     const acp: string[] = [];
     for (const root of [agentsRoot(), tmpRoot()]) {
       if (!existsSync(root)) continue;
       for (const name of readdirSync(root)) {
+        names.push(name);
         const stateDir = joinPath(root, name);
         if (!existsSync(controlSocketPath(stateDir))) continue;
         try {
@@ -189,13 +192,14 @@ program.command('ls').description('list running fleet sessions')
         } catch { /* ignore stale sockets */ }
       }
     }
+    const tmux = await new Tmux().list(names);
     console.log([tmux, ...acp].filter(Boolean).join('\n') || '(none)');
   });
 
 program.command('attach <name>').description('open the live console (Ctrl-b d to leave)')
   .action(async name => {
     const stateDir = acpStateDir(name);
-    if (!stateDir) process.exit(await passthrough('tmux', ['attach', '-t', name]));
+    if (!stateDir) process.exit(await passthrough('tmux', tmuxArgs(name, ['attach', '-t', name])));
     try {
       const { socket, send } = await followControl(stateDir, message => {
         if ('event' in message) renderSessionEvent(message.event as SessionEvent);

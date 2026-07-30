@@ -60,9 +60,17 @@ function fakeWorld(opts: { exitCode?: string; lifeChecks?: number; exitDelayMs?:
   let sessionCreated = false;
   const exec: Exec = async (cmd, args) => {
     if (cmd === 'bwrap') return { stdout: 'bubblewrap 0.11.1\n', stderr: '', code: opts.bwrap === 'missing' ? 127 : 0 };
-    if (args[0] === 'new-session') { paneCommands.push(args[args.length - 1]); sessionCreated = true; }
-    if (args[0] === 'list-panes') return { stdout: '4242\n', stderr: '', code: 0 };
-    if (args[0] === 'has-session') return { stdout: '', stderr: '', code: opts.sessionGone ? 1 : 0 };
+    if (cmd === 'tmux') {
+      // Faithful to #32: a real tmux invoked without `-L` talks to the SHARED
+      // default server, which is a different server from this role's. A fake
+      // that answered anyway would let the socket flag be dropped unnoticed.
+      if (args[0] !== '-L' || !args[1].startsWith('ours-fleet-'))
+        return { stdout: '', stderr: 'no server running on the default socket', code: 1 };
+      const sub = args[2];
+      if (sub === 'new-session') { paneCommands.push(args[args.length - 1]); sessionCreated = true; }
+      if (sub === 'list-panes') return { stdout: '4242\n', stderr: '', code: 0 };
+      if (sub === 'has-session') return { stdout: '', stderr: '', code: opts.sessionGone ? 1 : 0 };
+    }
     return { stdout: '', stderr: '', code: 0 };
   };
   const { rec, createMonitor } = monitorRecorder(() => sessionCreated);

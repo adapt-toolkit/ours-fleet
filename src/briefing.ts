@@ -78,7 +78,10 @@ export function generateBriefing(role: ResolvedRole, v: BriefingVocab, opts: Bri
     L.push(`7. Await messages. When the monitor wakes you (or the owner requests a manual check),`);
     L.push(`   call **${v.getMessagesTool}**, act on them,`);
     L.push(`   and reply with ${v.sendTool}. No coordinator is configured — the owner drives you`);
-    L.push(`   via \`tmux attach -t ${role.name}\` or by messaging "${id}".`);
+    // NOT `tmux attach -t <name>`: each role's pane lives on its own tmux
+    // socket (#32), so a bare attach finds no server. `ours-fleet attach`
+    // addresses the right one.
+    L.push(`   via \`ours-fleet attach ${role.name}\` or by messaging "${id}".`);
   }
 
   if (role.oversee?.length) {
