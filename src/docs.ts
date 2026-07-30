@@ -258,3 +258,53 @@ Set \`monitor.enabled: false\` only to retain legacy in-session monitoring.
 Inspect \`ours-fleet status Name\`, \`peek Name\`, role logs, and
 \`~/.ours-fleet/agents/Name/.monitor-status\` when diagnosing delivery.
 `;
+
+/**
+ * What every shipped spawn-skill variant must say, and must not say (7.1).
+ *
+ * The skills are separate markdown files in two published plugins, written for
+ * two different harnesses, so they cannot literally be one file. This is the
+ * source of truth they are all written from, and a test holds each variant to
+ * it — including the CLI reference above, so a skill and \`ours-fleet docs\`
+ * cannot name different permission settings.
+ *
+ * \`forbidden\` is the more important half. The old skills prescribed
+ * \`--approval ask --filesystem workspace --unattended deny\` as a blanket
+ * default while also telling the agent to stop at a failed doctor check — and
+ * that combination is exactly what \`doctor\` FAILS, because \`ask\` grants an
+ * unattended role nothing but \`read-state\` and \`deny\` makes the shortfall
+ * fatal. Following the skill produced a role the CLI then refused.
+ */
+export const SPAWN_SKILL_CONTRACT = {
+  /** Substrings every variant must contain (whitespace-normalised). */
+  required: [
+    // The installed reference is authoritative and must actually be read.
+    'ours-fleet docs',
+    'ours-fleet doctor',
+    // Trap 1: a mode that suppresses the prompt without granting the action.
+    'dontAsk',
+    'bypassPermissions',
+    // Trap 2: the floor, and the command that reports it before launch.
+    'unattended capability floor',
+    'unattended floor:',
+    // The only intent that clears the floor, and the honest alternative.
+    '--approval allow',
+    '--unattended wait',
+    // Creation-time isolation (6.3) — the one new operator input this release adds.
+    '--isolation-file',
+  ],
+  /**
+   * Substrings no variant may contain. Deliberately short: the real guard is
+   * the acceptance test, which runs every spawn command a variant prints
+   * through the same analysis `doctor` uses and fails if doctor would fail it.
+   * This list only pins the specific claim that was wrong.
+   */
+  forbidden: [
+    // The contradictory blanket default both variants used to prescribe.
+    // `ask` grants an unattended role only `read-state`, and `deny` makes the
+    // shortfall a doctor FAILURE — so the skill told you to build a role the
+    // CLI then refused, in the same breath as telling you to trust doctor.
+    '--approval ask --filesystem workspace --unattended deny',
+    '[TODO:',
+  ],
+} as const;
