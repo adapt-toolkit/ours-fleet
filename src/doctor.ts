@@ -3,6 +3,7 @@ import { readFileSync } from 'node:fs';
 import { realExec, type Exec } from './exec.js';
 import { loadConfig, type ResolvedRole } from './config.js';
 import { getAdapter, productionAdapters } from './harness/registry.js';
+import { analyzeFleetPermissions, formatNative } from './permissions.js';
 import { resolveBundledAcpAgent } from './harness/acp-agent.js';
 import { agentDir, home, deriveXdgRuntimeDir } from './paths.js';
 import { resolveIsolation } from './isolation/policy.js';
@@ -111,6 +112,27 @@ export async function doctor(
       detail: xdg
         ? `XDG_RUNTIME_DIR=${xdg}`
         : `no XDG_RUNTIME_DIR and /run/user/<uid> missing — systemctl --user cannot reach the user manager; enable linger: sudo loginctl enable-linger ${user}`,
+    });
+  }
+
+  // Per-role permission translation (2.3). Rendered from the same analysis the
+  // `config` command prints, so the two commands cannot disagree.
+  for (const analysis of analyzeFleetPermissions(roles)) {
+    if (!analysis.supported) {
+      checks.push({
+        name: `permissions: ${analysis.role}`, ok: false,
+        detail: analysis.warnings.join('; '),
+      });
+      continue;
+    }
+    const p = analysis.permissions;
+    const summary = `approval=${p.approval} filesystem=${p.filesystem} unattended=${p.unattended}`
+      + ` -> ${formatNative(analysis.native)}`;
+    checks.push({
+      name: `permissions: ${analysis.role}`, ok: true,
+      detail: analysis.warnings.length
+        ? `${summary} — ${analysis.warnings.join('; ')}`
+        : `${summary} (exact)`,
     });
   }
 

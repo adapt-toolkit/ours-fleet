@@ -14,6 +14,7 @@ import { up, down, restartRoles, rmRole, type OpsDeps } from './ops.js';
 import { runOnce, runTemp } from './runner.js';
 import { spawnPermanent, spawnTemp, type SpawnOpts } from './spawn.js';
 import { doctor } from './doctor.js';
+import { analyzeFleetPermissions, formatNative } from './permissions.js';
 import { AI_DOCS } from './docs.js';
 import {
   controlRequest, controlSocketPath, followControl, livenessNote,
@@ -116,11 +117,18 @@ cOpt(program.command('config').description('validate + print the merged plan (no
     try {
       const cfg = loadConfig(opts.configuration);
       console.log(`config: ${cfg.files.join(' + ') || '(none)'}`);
+      const analyses = analyzeFleetPermissions(cfg.roles);
       for (const r of cfg.roles) {
+        const perms = analyses.find(a => a.role === r.name);
         console.log(`\n● ${r.name}`);
         console.log(`    harness:     ${r.harness}`);
         console.log(`    session:     ${r.session}`);
         console.log(`    identity:    ${r.identity}`);
+        console.log(`    permissions: approval=${r.permissions.approval} `
+          + `filesystem=${r.permissions.filesystem} unattended=${r.permissions.unattended}`);
+        if (perms?.supported)
+          console.log(`    native:      ${formatNative(perms.native)}`
+            + `${perms.exact ? '' : ' (not an exact representation)'}`);
         console.log(`    source:      ${r.sourceFile}`);
         if (r.cwd) console.log(`    cwd:         ${r.cwd}`);
         if (r.model) console.log(`    model:       ${r.model}`);
@@ -139,6 +147,7 @@ cOpt(program.command('config').description('validate + print the merged plan (no
           console.log(`    isolation:   backend=${iso.backend ?? 'auto'} net=${iso.network ?? 'broker'} `
             + `on_unavailable=${iso.on_unavailable ?? 'warn'} caps=${caps}`);
         }
+        for (const w of perms?.warnings ?? []) console.log(`    warning:     ${w}`);
       }
     } catch (e) { die(e); }
   });

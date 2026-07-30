@@ -151,6 +151,7 @@ export function makeClaudeCodeAdapter(exec: Exec = realExec): HarnessAdapter {
           : 'default';
       const exact = permissions.filesystem === 'workspace' && permissions.approval === 'ask';
       return {
+        supported: true,
         native: { permission_mode: native },
         exact,
         warnings: exact ? [] : [

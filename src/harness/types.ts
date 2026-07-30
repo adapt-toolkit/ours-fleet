@@ -15,11 +15,17 @@ export interface SessionPrep {
 }
 export interface Launch { argv: string[]; env: Record<string, string> }
 export interface AcpLaunch { argv: string[]; env: Record<string, string> }
-export interface PermissionTranslation {
-  native: Record<string, unknown>;
-  exact: boolean;
-  warnings: string[];
-}
+/**
+ * The result of expressing neutral `permissions:` in a harness's own terms.
+ *
+ * `supported: false` is a first-class answer, not an absence. The previous
+ * shape made `translatePermissions` optional, so an adapter that simply never
+ * implemented it was indistinguishable from one that had nothing to say — and
+ * the warnings the implementations DID produce had no caller at all.
+ */
+export type PermissionTranslation =
+  | { supported: true; native: Record<string, unknown>; exact: boolean; warnings: string[] }
+  | { supported: false; reason: string };
 
 /** Harness-correct wording/tool names used to generate briefing.md. */
 export interface BriefingVocab {
@@ -49,7 +55,11 @@ export interface HarnessAdapter {
   prepareSession(role: ResolvedRole, dirs: RoleDirs): Promise<SessionPrep>;
   buildLaunch(role: ResolvedRole, mode: 'fresh' | 'resume', s: SessionState, prep: SessionPrep): Launch;
   buildAcpLaunch?(role: ResolvedRole, prep: SessionPrep): AcpLaunch;
-  translatePermissions?(permissions: CommonPermissions): PermissionTranslation;
+  /**
+   * REQUIRED. Every adapter must either translate neutral permissions or
+   * explicitly declare that it cannot. Enforced at registration.
+   */
+  translatePermissions(permissions: CommonPermissions): PermissionTranslation;
   vocabulary: BriefingVocab;
   exitPolicy: ExitPolicy;
 }

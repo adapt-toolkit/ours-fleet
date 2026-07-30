@@ -216,6 +216,7 @@ export function makeCodexAdapter(exec: Exec = realExec): HarnessAdapter {
 
     translatePermissions(permissions) {
       return {
+        supported: true,
         native: {
           approval: permissions.approval === 'allow' ? 'never' : 'on-request',
           sandbox: permissions.filesystem === 'read-only'

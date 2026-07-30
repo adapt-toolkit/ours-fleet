@@ -415,3 +415,54 @@ describe('doctor config validity (1.4)', () => {
     expect(cfg.detail).toContain('config not found');
   });
 });
+
+describe('doctor permission translation (2.3)', () => {
+  const HEALTHY = {
+    'tmux -V': { stdout: 'tmux 3.4', stderr: '', code: 0 },
+    'ours-mcp --version': { stdout: '0.1.2', stderr: '', code: 0 },
+    'ours-mcp status': { stdout: 'running', stderr: '', code: 0 },
+    'loginctl show-user': { stdout: 'Linger=yes', stderr: '', code: 0 },
+  };
+  const run = () => doctor({}, execWith(HEALTHY), 'linux', stubFetch());
+  const writeCfg = (yaml: string) => writeFileSync(join(dir, 'fleet.yaml'), yaml);
+  const check = (rep: Awaited<ReturnType<typeof doctor>>, role: string) =>
+    rep.checks.find(c => c.name === `permissions: ${role}`)!;
+
+  it('warns on a lossy Claude combination and names the native mode', async () => {
+    writeCfg('roles:\n  A:\n    harness: claude-code\n    permissions:\n      approval: allow\n');
+    const c = check(await run(), 'A');
+    expect(c.ok).toBe(true);                         // lossy is a warning, not a failure
+    expect(c.detail).toContain('approval=allow');
+    expect(c.detail).toContain('permission_mode=');
+    expect(c.detail).toContain('do not exactly represent');
+  });
+
+  it('stays quiet for the one Claude combination that is exact', async () => {
+    writeCfg('roles:\n  A:\n    harness: claude-code\n'
+      + '    permissions:\n      approval: ask\n      filesystem: workspace\n');
+    const c = check(await run(), 'A');
+    expect(c.detail).toContain('(exact)');
+    expect(c.detail).not.toContain('do not exactly represent');
+  });
+
+  it('does not warn for Codex, which represents the intent exactly', async () => {
+    writeCfg('roles:\n  A:\n    harness: codex\n'
+      + '    permissions:\n      approval: allow\n      filesystem: unrestricted\n');
+    const c = check(await run(), 'A');
+    expect(c.ok).toBe(true);
+    expect(c.detail).toContain('(exact)');
+    expect(c.detail).toContain('sandbox=danger-full-access');
+  });
+
+  it('fails the role when its harness declares neutral permissions unsupported', async () => {
+    registerAdapter({
+      ...fakeAdapter, id: 'no-perms',
+      translatePermissions: () => ({ supported: false, reason: 'it has no permission model' }),
+    });
+    writeCfg('roles:\n  A:\n    harness: no-perms\n');
+    const c = check(await run(), 'A');
+    expect(c.ok).toBe(false);
+    expect(c.detail).toContain('cannot express neutral permissions');
+    expect(c.detail).toContain('it has no permission model');
+  });
+});

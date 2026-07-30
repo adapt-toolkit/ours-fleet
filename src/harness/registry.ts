@@ -3,6 +3,13 @@ import type { HarnessAdapter } from './types.js';
 const adapters = new Map<string, HarnessAdapter>();
 
 export function registerAdapter(a: HarnessAdapter): void {
+  // Enforced here rather than left to the type system: an adapter that silently
+  // omits the capability is how the neutral-permission warnings ended up with no
+  // caller and no reader.
+  if (typeof a.translatePermissions !== 'function')
+    throw new Error(
+      `harness adapter '${a.id}' must implement translatePermissions(): either translate ` +
+      `neutral permissions or return { supported: false, reason }`);
   adapters.set(a.id, a);
 }
 

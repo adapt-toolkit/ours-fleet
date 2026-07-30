@@ -8,6 +8,14 @@ export const fakeAdapter: HarnessAdapter = {
   async checkPrereqs() { return { ok: true, checks: [] }; },
   validateOptions() { return []; },
   async prepareSession() { return { argv: ['--fake-prep'], env: { FAKE: '1' } }; },
+  translatePermissions(permissions) {
+    return {
+      supported: true,
+      native: { fake_mode: permissions.approval },
+      exact: permissions.approval === 'ask',
+      warnings: permissions.approval === 'ask' ? [] : ['the fake harness only approximates this'],
+    };
+  },
   buildLaunch(role, mode, s, prep) {
     return { argv: ['fakebin', ...prep.argv, mode === 'fresh' ? '--sid' : '--resume', s.sessionId, 'go'], env: prep.env };
   },
@@ -36,5 +44,34 @@ describe('harness registry', () => {
   it('throws for unknown ids, listing known ones', () => {
     registerAdapter(fakeAdapter);
     expect(() => getAdapter('nope')).toThrowError(/unknown harness 'nope'.*fake/);
+  });
+});
+
+describe('adapter permission-translation contract (2.3)', () => {
+  it('refuses to register an adapter that does not declare translatePermissions', () => {
+    const { translatePermissions, ...silent } = fakeAdapter;
+    expect(() => registerAdapter({ ...silent, id: 'silent' } as unknown as HarnessAdapter))
+      .toThrowError(/'silent' must implement translatePermissions/);
+    expect(knownAdapters()).not.toContain('silent');
+  });
+
+  it('accepts an adapter that explicitly declares neutral permissions unsupported', () => {
+    const declining: HarnessAdapter = {
+      ...fakeAdapter,
+      id: 'declining',
+      translatePermissions: () => ({ supported: false, reason: 'it has no permission model' }),
+    };
+    expect(() => registerAdapter(declining)).not.toThrow();
+    expect(getAdapter('declining')).toBe(declining);
+  });
+
+  it('both production adapters translate', async () => {
+    await import('../src/harness/claude-code.js');
+    await import('../src/harness/codex.js');
+    for (const id of ['claude-code', 'codex']) {
+      const t = getAdapter(id).translatePermissions(
+        { approval: 'ask', filesystem: 'workspace', unattended: 'deny' });
+      expect(t.supported, id).toBe(true);
+    }
   });
 });

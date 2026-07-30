@@ -82,6 +82,27 @@ describe('ours-fleet CLI', () => {
     expect(r.stdout).toMatch(/mem=2G/);
   });
 
+  it('config and doctor print the SAME permission warning (2.3)', async () => {
+    const { writeFileSync } = await import('node:fs');
+    writeFileSync(join(dir, 'fleet.yaml'),
+      'roles:\n'
+      + '  Lossy:\n    harness: claude-code\n    permissions:\n      approval: allow\n'
+      + '  Exact:\n    harness: codex\n    permissions:\n      approval: allow\n      filesystem: unrestricted\n');
+
+    const cfg = await run(['config']);
+    const doc = await run(['doctor']);
+    expect(cfg.code).toBe(0);
+
+    const WARNING = "role 'Lossy': Claude permission modes do not exactly represent "
+      + 'independent approval and filesystem intent; fleet isolation remains the outer boundary';
+    expect(cfg.stdout).toContain(WARNING);        // the warning has a caller at last…
+    expect(doc.stdout).toContain(WARNING);        // …and both commands say the same thing
+
+    // The exact Codex combination stays quiet in both.
+    expect(cfg.stdout).not.toContain("role 'Exact':");
+    expect(doc.stdout).toMatch(/permissions: Exact.*\(exact\)/);
+  });
+
   it('peek and send never call an unreachable role dead (1.5)', async () => {
     // No tmux session and no control socket: the honest answer is "I could not
     // reach it", plus what that does and does not prove.
