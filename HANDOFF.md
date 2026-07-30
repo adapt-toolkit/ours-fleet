@@ -56,7 +56,10 @@ documentation.
 - `npm run build` — succeeds
 - `npx vitest run` — **25 files, 575 passed, 0 failed, 0 skipped** (baseline was 339)
 - working tree clean apart from untracked `IMPLEMENTATION.md` (the spec)
-- 39 commits on `stability/release-fixes`, never pushed, never merged, never tagged
+- **35** commits on `stability/release-fixes` (count with `git rev-list --count 5648ccb..HEAD`,
+  the branch base — NOT `main..HEAD`, which includes 5 pre-existing commits because `main`
+  lags the base and gives a misleading 40). 20 of them are `fix(` commits, one per fix.
+  Never pushed, never merged, never tagged, never published
 
 I stopped at a clean commit rather than starting 7.1, which I could not have finished. Both
 remaining fixes are documentation describing behaviour that already exists and is tested.
