@@ -113,7 +113,13 @@ createInterface({ input: process.stdin }).on('line', line => {
           },
         },
       });
-      if (text.includes('permission')) {
+      const slow = /\bblock(?:\s+(\d+))?\b/i.exec(text);
+      if (slow) {
+        // A turn that stays running for a while: the "busy agent" case. It
+        // releases itself so the test never depends on a second prompt getting
+        // through — prompts are serialized, so one never could.
+        setTimeout(() => answerPrompt(message.id, 'end_turn'), Number(slow[1] ?? 800));
+      } else if (text.includes('permission')) {
         // "twice" asks for the SAME tool two times in one turn, so a test can
         // check that each request is decided independently.
         const times = /\btwice\b/i.test(text) ? 2 : 1;

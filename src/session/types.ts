@@ -29,6 +29,38 @@ export interface TurnResult {
   detail?: string;
 }
 
+/**
+ * Why a control operation failed. The distinctions exist because collapsing
+ * them is what made a busy agent look dead: only `offline` is evidence that the
+ * session is gone, and `timeout` explicitly does NOT say the prompt was lost.
+ */
+export type ControlFailureKind =
+  | 'offline'              // the session is confirmed gone
+  | 'control-unavailable'  // nothing answered the control plane — says nothing about the agent
+  | 'timeout'              // no answer in time; the request may already have been acted on
+  | 'rejected'             // the session understood the request and refused it
+  | 'backend';             // the transport itself failed
+
+export class SessionControlError extends Error {
+  constructor(readonly kind: ControlFailureKind, message: string) {
+    super(message);
+    this.name = 'SessionControlError';
+  }
+}
+
+/**
+ * A prompt the live session has taken responsibility for. Interactive callers
+ * stop here: the session has the prompt, and waiting for the turn to finish is
+ * a different question with a different, much longer, timescale.
+ */
+export interface QueuedPrompt {
+  promptId: string;
+  /** Turns already queued ahead of this one. 0 means it starts immediately. */
+  queuedBehind: number;
+  /** The turn's terminal result. Never rejects. */
+  completion: Promise<TurnResult>;
+}
+
 /** The single definition of terminal success. Nothing else may re-derive it. */
 export const isTerminalSuccess = (outcome: TurnOutcome): boolean => outcome === 'completed';
 
@@ -92,6 +124,12 @@ export interface SessionHandle {
   readonly pid: number;
   isAlive(): boolean;
   snapshot(): SessionSnapshot;
+  /**
+   * Hand the session a prompt and return as soon as it has accepted
+   * responsibility for it. Throws `SessionControlError` if it cannot.
+   */
+  queuePrompt(text: string): Promise<QueuedPrompt>;
+  /** Queue a prompt and wait for its terminal result. */
   submitPrompt(text: string): Promise<TurnResult>;
   interrupt(): Promise<void>;
   respondPermission(permissionId: string, optionId: string): boolean;

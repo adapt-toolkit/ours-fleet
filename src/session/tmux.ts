@@ -1,6 +1,7 @@
 import type { Tmux } from '../tmux.js';
-import { turnResult } from './types.js';
-import type { SessionEvent, SessionHandle, SessionSnapshot, TurnResult } from './types.js';
+import { randomUUID } from 'node:crypto';
+import { SessionControlError, turnResult } from './types.js';
+import type { QueuedPrompt, SessionEvent, SessionHandle, SessionSnapshot, TurnResult } from './types.js';
 
 /** SessionHandle adapter for the existing tmux transport. */
 export class TmuxSession implements SessionHandle {
@@ -25,11 +26,29 @@ export class TmuxSession implements SessionHandle {
     };
   }
 
-  async submitPrompt(text: string): Promise<TurnResult> {
-    if (!this.isAlive()) return turnResult(false, 'failed', 'tmux pane is offline');
-    await this.tmux.sendText(this.name, text);
+  async queuePrompt(text: string): Promise<QueuedPrompt> {
+    if (!this.isAlive())
+      throw new SessionControlError('offline', `tmux pane for '${this.name}' is offline`);
+    try {
+      await this.tmux.sendText(this.name, text);
+    } catch (error) {
+      throw new SessionControlError('backend', (error as Error)?.message ?? String(error));
+    }
     // Keystrokes carry no terminal result: tmux cannot tell us how the turn ended.
-    return turnResult(true, 'inconclusive');
+    return {
+      promptId: randomUUID(),
+      queuedBehind: 0,
+      completion: Promise.resolve(turnResult(true, 'inconclusive')),
+    };
+  }
+
+  async submitPrompt(text: string): Promise<TurnResult> {
+    try {
+      return await (await this.queuePrompt(text)).completion;
+    } catch (error) {
+      if (error instanceof SessionControlError) return turnResult(false, 'failed', error.message);
+      throw error;
+    }
   }
 
   async interrupt(): Promise<void> {

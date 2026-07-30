@@ -136,6 +136,18 @@ describe('up / down / restart', () => {
     expect(calls).toEqual([['stop', 'B']]);
   });
 
+  it('down reports the backend\'s real stop failure (1.5)', async () => {
+    writeCfg({ A: { harness: 'fake' } });
+    const { backend } = fakeBackend();
+    backend.stop = async () => {
+      throw new Error('systemctl stop ours-fleet-agent@A.service failed: Job is in progress');
+    };
+    const { d, logs } = deps(backend);
+    await down(loadConfig(), ['A'], d);
+    expect(logs.join('\n')).toContain('Job is in progress');
+    expect(logs.join('\n')).not.toContain('maybe not running');   // the old guess
+  });
+
   it('restart fresh clears markers then bounces', async () => {
     writeCfg({ A: { harness: 'fake' } });
     const { calls, backend } = fakeBackend();

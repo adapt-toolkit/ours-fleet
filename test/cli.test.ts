@@ -82,6 +82,54 @@ describe('ours-fleet CLI', () => {
     expect(r.stdout).toMatch(/mem=2G/);
   });
 
+  it('peek and send never call an unreachable role dead (1.5)', async () => {
+    // No tmux session and no control socket: the honest answer is "I could not
+    // reach it", plus what that does and does not prove.
+    for (const argv of [['peek', 'Ghost'], ['send', 'Ghost', 'hi']]) {
+      const r = await run(argv);
+      expect(r.code).toBe(1);
+      expect(r.stderr).toContain(`${argv[0]} Ghost:`);          // the real failure, named
+      expect(r.stderr).not.toContain('is not running');         // the old blanket verdict
+    }
+  });
+
+  it('send into a busy ACP role returns as queued, not as a dead agent (1.5)', async () => {
+    const { mkdirSync } = await import('node:fs');
+    const { AcpSession } = await import('../src/session/acp.js');
+    const { RoleControlServer } = await import('../src/session/control.js');
+    const fixture = resolve('test/fixtures/acp-agent.mjs');
+    const stateDir = join(dir, '.ours-fleet', 'agents', 'Busy');
+    mkdirSync(stateDir, { recursive: true });
+
+    const session = await AcpSession.start({
+      name: 'Busy', argv: [process.execPath, fixture], cwd: stateDir, env: {},
+      stateDir, mode: 'fresh',
+      permissions: { approval: 'allow', filesystem: 'workspace', unattended: 'deny' },
+      log: () => {},
+    });
+    const control = new RoleControlServer(stateDir, session, () => {});
+    await control.start();
+    try {
+      const busy = session.submitPrompt('block 3000');    // hold a turn open
+      await new Promise(r => setTimeout(r, 100));
+
+      const started = Date.now();
+      const r = await run(['send', 'Busy', 'while you are busy']);
+      expect(r.code).toBe(0);                             // not an error at all
+      expect(r.stdout).toContain('queued for Busy');
+      expect(r.stderr).not.toContain('is not running');
+      expect(Date.now() - started).toBeLessThan(3_000);   // did not wait for the turn
+
+      // peek must not call it dead either.
+      const p = await run(['peek', 'Busy']);
+      expect(p.code).toBe(0);
+      await busy;
+    } finally {
+      await control.close();
+      await session.close();
+    }
+  }, 40_000);
+
   it('doctor fails with the parser cause for a config `config` rejects (1.4)', async () => {
     const { writeFileSync } = await import('node:fs');
     writeFileSync(join(dir, 'fleet.yaml'), 'roles:\n  A:\n    harnes: claude-code\n');

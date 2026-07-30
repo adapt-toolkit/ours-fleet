@@ -1,11 +1,15 @@
-import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { createServer, type Socket } from 'node:net';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { afterEach, describe, expect, it } from 'vitest';
 
 import { AcpSession } from '../src/session/acp.js';
-import { RoleControlServer, controlRequest } from '../src/session/control.js';
+import {
+  RoleControlServer, controlRequest, controlSocketPath, controlTokenPath, livenessNote,
+} from '../src/session/control.js';
+import { SessionControlError } from '../src/session/types.js';
 import type { SessionEvent } from '../src/session/types.js';
 
 const fixture = join(dirname(fileURLToPath(import.meta.url)), 'fixtures', 'acp-agent.mjs');
@@ -158,6 +162,33 @@ describe('AcpSession', () => {
     await session.close();
   });
 
+  it('queues a prompt behind a running turn instead of waiting for it (1.5)', async () => {
+    const session = await start();
+    const busy = session.submitPrompt('block 1500');        // a turn that runs for 1.5s
+    await new Promise(r => setTimeout(r, 50));              // let it actually start
+
+    const started = Date.now();
+    const queued = await session.queuePrompt('second');
+    const elapsed = Date.now() - started;
+
+    expect(queued.promptId).toBeTruthy();
+    expect(queued.queuedBehind).toBeGreaterThan(0);          // it can see the busy turn
+    expect(elapsed).toBeLessThan(500);                       // …and did not wait for it
+    expect(session.snapshot().alive).toBe(true);
+
+    expect((await busy).succeeded).toBe(true);
+    expect((await queued.completion).succeeded).toBe(true);  // it does run, afterwards
+    await session.close();
+  });
+
+  it('queuePrompt on a dead session is a typed offline error (1.5)', async () => {
+    const session = await start();
+    await session.close();
+    const error = await session.queuePrompt('hi').then(() => null, e => e as SessionControlError);
+    expect(error).toBeInstanceOf(SessionControlError);
+    expect(error!.kind).toBe('offline');
+  });
+
   it('exposes prompt submission and snapshots over the role control socket', async () => {
     const session = await start();
     const stateDir = dirs.at(-1)!;
@@ -168,7 +199,112 @@ describe('AcpSession', () => {
     expect(snapshot.result).toMatchObject({ backend: 'acp', alive: true });
     const prompt = await controlRequest(stateDir, { command: 'submit_prompt', text: 'control' });
     expect(prompt.ok).toBe(true);
+    expect(prompt.result).toMatchObject({ state: 'queued' });
     await control.close();
     await session.close();
+  });
+});
+
+describe('role control failures are typed (1.5)', () => {
+  it('accepts a prompt into a busy session promptly, and says how deep the queue is', async () => {
+    const session = await start();
+    const stateDir = dirs.at(-1)!;
+    const control = new RoleControlServer(stateDir, session, () => {});
+    await control.start();
+    try {
+      const busy = session.submitPrompt('block 1500');
+      await new Promise(r => setTimeout(r, 50));
+
+      const started = Date.now();
+      const response = await controlRequest(
+        stateDir, { command: 'submit_prompt', text: 'while busy' }, 1_000);
+      expect(response.ok).toBe(true);                       // NOT an error, NOT a timeout
+      expect(response.result).toMatchObject({ state: 'queued' });
+      expect((response.result as { queuedBehind: number }).queuedBehind).toBeGreaterThan(0);
+      expect(Date.now() - started).toBeLessThan(500);       // returned promptly
+
+      await busy;
+    } finally {
+      await control.close();
+      await session.close();
+    }
+  });
+
+  it('an absent control socket is control-unavailable, not offline', async () => {
+    const stateDir = mkdtempSync(join(tmpdir(), 'ours-fleet-noctl-'));
+    dirs.push(stateDir);
+    const error = await controlRequest(stateDir, { command: 'status' })
+      .then(() => null, e => e as SessionControlError);
+    expect(error).toBeInstanceOf(SessionControlError);
+    expect(error!.kind).toBe('control-unavailable');
+  });
+
+  /** A stand-in control plane, so a failing socket can be produced on demand. */
+  async function stubControlPlane(onConnect: (socket: Socket) => void) {
+    const stateDir = mkdtempSync(join(tmpdir(), 'ours-fleet-stub-'));
+    dirs.push(stateDir);
+    writeFileSync(controlTokenPath(stateDir), 'token\n');
+    const live = new Set<Socket>();
+    const server = createServer(socket => {
+      live.add(socket);
+      socket.on('close', () => live.delete(socket));
+      onConnect(socket);
+    });
+    await new Promise<void>(r => { server.listen(controlSocketPath(stateDir), r); });
+    return {
+      stateDir,
+      async close() {
+        for (const socket of live) socket.destroy();
+        await new Promise<void>(r => { server.close(() => r()); });
+      },
+    };
+  }
+
+  it('a server that never answers is a timeout, not a dead agent', async () => {
+    const stub = await stubControlPlane(() => { /* accept, then say nothing */ });
+    try {
+      const error = await controlRequest(stub.stateDir, { command: 'status' }, 150)
+        .then(() => null, e => e as SessionControlError);
+      expect(error!.kind).toBe('timeout');
+      expect(error!.message).toContain('did not answer');
+    } finally {
+      await stub.close();
+    }
+  });
+
+  it('a malformed response is a backend failure', async () => {
+    const stub = await stubControlPlane(socket => socket.write('not json at all\n'));
+    try {
+      const error = await controlRequest(stub.stateDir, { command: 'status' }, 2_000)
+        .then(() => null, e => e as SessionControlError);
+      expect(error!.kind).toBe('backend');
+      expect(error!.message).toContain('malformed control response');
+    } finally {
+      await stub.close();
+    }
+  });
+
+  it('an explicit refusal is rejected, and says the role is running', async () => {
+    const session = await start();
+    const stateDir = dirs.at(-1)!;
+    const control = new RoleControlServer(stateDir, session, () => {});
+    await control.start();
+    try {
+      const response = await controlRequest(
+        stateDir, { command: 'respond_permission', permissionId: 'stale', optionId: 'allow' });
+      expect(response.ok).toBe(false);
+      expect(response.kind).toBe('rejected');
+      expect(livenessNote('rejected', 'A')).toContain('is running');
+    } finally {
+      await control.close();
+      await session.close();
+    }
+  });
+
+  it('only offline claims the agent is gone', () => {
+    expect(livenessNote('offline', 'A')).toContain('confirmed offline');
+    for (const kind of ['control-unavailable', 'timeout', 'backend'] as const)
+      expect(livenessNote(kind, 'A')).not.toContain('confirmed offline');
+    expect(livenessNote('timeout', 'A')).toContain('busy agent looks exactly like this');
   });
 });

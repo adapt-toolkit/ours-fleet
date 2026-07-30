@@ -76,8 +76,12 @@ export async function up(
 
 export async function down(cfg: FleetConfig, names: string[], deps: OpsDeps): Promise<void> {
   for (const role of selectRoles(cfg, names)) {
+    // Never swallow the backend's reason. "maybe not running" hid real stop
+    // failures — a wedged unit, an unreachable user bus — behind a guess.
     try { await deps.backend.stop(role.name); deps.log(`■ stopped ${role.name}`); }
-    catch { deps.log(`  (could not stop ${role.name} — maybe not running)`); }
+    catch (e) {
+      deps.log(`  ! could not stop ${role.name}: ${e instanceof Error ? e.message : String(e)}`);
+    }
   }
 }
 

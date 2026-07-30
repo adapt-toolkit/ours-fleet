@@ -16,8 +16,9 @@ import { spawnPermanent, spawnTemp, type SpawnOpts } from './spawn.js';
 import { doctor } from './doctor.js';
 import { AI_DOCS } from './docs.js';
 import {
-  controlRequest, controlSocketPath, followControl,
+  controlRequest, controlSocketPath, followControl, livenessNote,
 } from './session/control.js';
+import { SessionControlError } from './session/types.js';
 import type { SessionEvent } from './session/types.js';
 import './harness/claude-code.js';   // registers the claude-code adapter
 import './harness/codex.js';         // registers the codex adapter
@@ -208,36 +209,67 @@ program.command('attach <name>').description('open the live console (Ctrl-b d to
     } catch (e) { die(e); }
   });
 
+/** Classify a raw tmux failure: only "no such session" proves the pane is gone. */
+const asControlError = (e: unknown): SessionControlError => {
+  if (e instanceof SessionControlError) return e;
+  const message = e instanceof Error ? e.message : String(e);
+  return new SessionControlError(
+    /can't find session|no server running|session not found/i.test(message) ? 'offline' : 'backend',
+    message);
+};
+
+/**
+ * Report what actually went wrong, then say what it proves about the agent.
+ * The old handler replaced every failure — timeouts, socket errors, refusals —
+ * with "is not running", which is how an overseer came to restart busy agents.
+ */
+const controlFailure = (name: string, action: string, e: unknown, extra = ''): string => {
+  const err = asControlError(e);
+  return `${action} ${name}: ${err.message}\n  ${livenessNote(err.kind, name)}${extra}`;
+};
+
 program.command('peek <name> [lines]').description('pane snapshot without attaching')
   .action(async (name, lines) => {
     try {
       const stateDir = acpStateDir(name);
       if (stateDir) {
         const response = await controlRequest(stateDir, { command: 'follow', since: 0 });
+        if (!response.ok)
+          throw new SessionControlError(response.kind ?? 'backend', response.error ?? 'peek failed');
         const events = (response.result as { events?: SessionEvent[] } | undefined)?.events ?? [];
         for (const event of events.slice(-(lines ? Number(lines) : 40))) renderSessionEvent(event);
       } else {
         console.log(await new Tmux().capture(name, lines ? Number(lines) : 40));
       }
     }
-    catch { die(`'${name}' is not running; try: ours-fleet status ${name}`); }
+    catch (e) { die(controlFailure(name, 'peek', e)); }
   });
 
 program.command('send <name> [text...]').description("type into the agent's console")
   .option('--key <key>', 'send a raw key instead (Escape, Up, C-c, ...)')
   .action(async (name, text, opts) => {
+    const stateDir = acpStateDir(name);
+    if (stateDir && opts.key) die('--key is available only for tmux sessions');
+    if (!stateDir && !opts.key && !text?.length) die('nothing to send: give text or --key');
+    if (stateDir && !text?.length) die('nothing to send: give text');
     try {
-      const stateDir = acpStateDir(name);
       if (stateDir) {
-        if (opts.key) die('--key is available only for tmux sessions');
-        if (!text?.length) die('nothing to send: give text');
+        // Returns on queue acceptance: a turn already running is not a failure.
         const response = await controlRequest(
           stateDir, { command: 'submit_prompt', text: text.join(' ') });
-        if (!response.ok) throw new Error(response.error ?? 'prompt rejected');
+        if (!response.ok)
+          throw new SessionControlError(response.kind ?? 'backend', response.error ?? 'prompt rejected');
+        const queued = response.result as { queuedBehind?: number } | undefined;
+        console.log(queued?.queuedBehind
+          ? `queued for ${name} behind ${queued.queuedBehind} running turn(s)`
+          : `queued for ${name}`);
       } else if (opts.key) await new Tmux().sendKey(name, opts.key);
-      else if (text?.length) await new Tmux().sendText(name, text.join(' '));
-      else die('nothing to send: give text or --key');
-    } catch { die(`'${name}' is not running; try: ours-fleet status ${name}`); }
+      else await new Tmux().sendText(name, text.join(' '));
+    } catch (e) {
+      die(controlFailure(name, 'send', e, asControlError(e).kind === 'timeout'
+        ? '\n  The prompt may already have been delivered — do not assume it was lost.'
+        : ''));
+    }
   });
 
 program.command('logs <name>').description('show the role log').option('-f, --follow', 'follow')

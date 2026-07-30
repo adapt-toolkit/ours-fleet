@@ -8,9 +8,10 @@ import * as acp from '@agentclientprotocol/sdk';
 
 import type { CommonPermissions } from '../config.js';
 import { SessionEvents } from './events.js';
-import { turnResult } from './types.js';
+import { SessionControlError, turnResult } from './types.js';
 import type {
-  PermissionDecision, SessionEvent, SessionHandle, SessionSnapshot, TurnOutcome, TurnResult,
+  PermissionDecision, QueuedPrompt, SessionEvent, SessionHandle, SessionSnapshot,
+  TurnOutcome, TurnResult,
 } from './types.js';
 
 interface PendingPermission {
@@ -59,6 +60,7 @@ export class AcpSession implements SessionHandle {
   private readiness: SessionSnapshot['readiness'] = 'starting';
   private lastError?: string;
   private promptTail: Promise<unknown> = Promise.resolve();
+  private queueDepth = 0;
   private capabilities?: acp.AgentCapabilities;
   private controllerCount = 0;
 
@@ -134,10 +136,35 @@ export class AcpSession implements SessionHandle {
     };
   }
 
-  submitPrompt(text: string): Promise<TurnResult> {
-    const operation = this.promptTail.then(() => this.runPrompt(text));
-    this.promptTail = operation.then(() => undefined, () => undefined);
-    return operation;
+  /**
+   * Accept responsibility for a prompt, then return. The turn itself may run
+   * for minutes behind other queued turns; making an interactive caller wait
+   * for it is what turned a busy agent into a timeout and then into "dead".
+   */
+  async queuePrompt(text: string): Promise<QueuedPrompt> {
+    if (!this.sessionId || !this.isAlive())
+      throw new SessionControlError('offline', this.lastError ?? 'ACP session is offline');
+    const promptId = randomUUID();
+    const queuedBehind = this.queueDepth++;
+    const run = this.promptTail.then(() => this.runPrompt(text, promptId));
+    this.promptTail = run.then(() => undefined, () => undefined);
+    const completion = run.then(
+      result => { this.queueDepth = Math.max(0, this.queueDepth - 1); return result; },
+      error => {
+        this.queueDepth = Math.max(0, this.queueDepth - 1);
+        return turnResult(false, 'failed', (error as Error)?.message ?? String(error));
+      },
+    );
+    return { promptId, queuedBehind, completion };
+  }
+
+  async submitPrompt(text: string): Promise<TurnResult> {
+    try {
+      return await (await this.queuePrompt(text)).completion;
+    } catch (error) {
+      if (error instanceof SessionControlError) return turnResult(false, 'failed', error.message);
+      throw error;
+    }
   }
 
   async interrupt(): Promise<void> {
@@ -227,11 +254,10 @@ export class AcpSession implements SessionHandle {
     this.events.emit('state', { status: 'idle', text: `ACP session ${this.sessionId}` });
   }
 
-  private async runPrompt(text: string): Promise<TurnResult> {
+  private async runPrompt(text: string, turnId: string = randomUUID()): Promise<TurnResult> {
     if (!this.sessionId || !this.isAlive())
       return turnResult(false, 'failed', this.lastError ?? 'ACP session is offline');
     this.readiness = 'running';
-    const turnId = randomUUID();
     this.events.emit('state', { turnId, status: 'running' });
     try {
       const response = await this.connection.agent.request(acp.methods.agent.session.prompt, {
