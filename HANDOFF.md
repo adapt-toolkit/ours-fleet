@@ -48,6 +48,19 @@ Baseline before any work: **339 passed**.
 **Sections 1 through 5 are COMPLETE**, and 7.4 of section 6. Remaining: 7.1 and 7.2 — both
 documentation.
 
+## FINAL STATE (Implementer-1 stopped here)
+
+20 of the 22 scoped fixes are committed with tests. Verified at the last commit:
+
+- `npx tsc -p tsconfig.json --noEmit` — clean
+- `npm run build` — succeeds
+- `npx vitest run` — **25 files, 575 passed, 0 failed, 0 skipped** (baseline was 339)
+- working tree clean apart from untracked `IMPLEMENTATION.md` (the spec)
+- 39 commits on `stability/release-fixes`, never pushed, never merged, never tagged
+
+I stopped at a clean commit rather than starting 7.1, which I could not have finished. Both
+remaining fixes are documentation describing behaviour that already exists and is tested.
+
 ## Remaining — both are documentation (section 6)
 
 1. **7.1** correct the spawn skill —
