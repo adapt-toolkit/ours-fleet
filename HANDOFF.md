@@ -33,22 +33,22 @@ Baseline before any work: **339 passed**.
 | 2.1 neutral `allow` actually allows + unattended floor | `75d91f1` | 454 |
 | 2.4 warn when native overrides contradict neutral intent | `68e4a49` | 468 |
 | 3.2 backoff + durable fast-failure circuit breaker | `ead5572` | 484 |
+| 5.2 forbidden-path enforcement | `e058036` | 502 |
 
-Sections 1, 2 and 3 are complete.
+Sections 1, 2 and 3 are complete; section 4 is in progress (5.2 done, 5.1 next).
 
 ## Remaining, in spec dependency order
 
-1. **5.2** forbidden-path enforcement (isolation) — section 4 of the spec
-2. **5.1** shared harness credentials read-only
-3. **6.1** locked, atomic Claude pre-trust
-4. **6.4** one atomic reservation for role and identity names
-5. **7.3** guarantee identity existence before launch
-6. **6.2** roll back every failed creation stage
-7. **6.3** `spawn --isolation-file` (the ONE approved new operator input)
-8. **6.6** persist creation provenance
-9. **7.1** correct the spawn skill
-10. **7.2** stop using one console command as a liveness verdict
-11. **7.4** document never-prompt failure and the capability floor
+1. **5.1** shared harness credentials read-only
+2. **6.1** locked, atomic Claude pre-trust
+3. **6.4** one atomic reservation for role and identity names
+4. **7.3** guarantee identity existence before launch
+5. **6.2** roll back every failed creation stage
+6. **6.3** `spawn --isolation-file` (the ONE approved new operator input)
+7. **6.6** persist creation provenance
+8. **7.1** correct the spawn skill
+9. **7.2** stop using one console command as a liveness verdict
+10. **7.4** document never-prompt failure and the capability floor
 
 Nothing is part-way done. Every commit above is complete with its tests.
 
@@ -87,6 +87,9 @@ anyway so he is not surprised:
 - `.monitor-status` is now one line per active cause, each ISO-timestamped.
 - `.exit-status` is now a JSON record (legacy bare number still read).
 - New file per role: `.restart-ledger.json`.
+- `ours-fleet config` now REFUSES a role whose isolation asks for a forbidden mount (5.2).
+  That is a refusal-behaviour change, which the release rule allows; a config that used to
+  load and silently mount `~/.ssh` now fails by role and path.
 
 ## The unit-file upgrade question (Coordinator raised it before 3.2 — answered)
 

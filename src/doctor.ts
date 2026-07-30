@@ -1,7 +1,7 @@
 import { userInfo } from 'node:os';
 import { readFileSync } from 'node:fs';
 import { realExec, type Exec } from './exec.js';
-import { loadConfig, type ResolvedRole } from './config.js';
+import { isolationContextFor, loadConfig, type ResolvedRole } from './config.js';
 import { getAdapter, productionAdapters } from './harness/registry.js';
 import { analyzeFleetPermissions, formatNative } from './permissions.js';
 import { resolveBundledAcpAgent } from './harness/acp-agent.js';
@@ -171,13 +171,13 @@ export async function doctor(
   if (platform === 'linux')
     checks.push({ name: 'isolation: cgroup delegation', ok: true, detail: cgroupDelegationDetail() });
   for (const r of roles.filter(r => r.isolation)) {
-    const stateDir = agentDir(r.name);
-    const policy = resolveIsolation(r.isolation!, {
-      stateDir, runCwd: r.cwd ?? stateDir, home: home(), harness: r.harness,
-      additionalWriteDirs: r.harness === 'codex'
-        ? ((r.harness_options as { add_dirs?: string[] } | undefined)?.add_dirs ?? [])
-        : [],
-    });
+    // A refused mount is a launch-blocking policy error (5.2), not a warning.
+    let policy;
+    try { policy = resolveIsolation(r.isolation!, isolationContextFor(r)); }
+    catch (e) {
+      checks.push({ name: `isolation: ${r.name}`, ok: false, detail: (e as Error).message });
+      continue;
+    }
     const caps = [
       policy.resources.mem && `mem=${policy.resources.mem}`,
       policy.resources.cpu && `cpu=${policy.resources.cpu}`,

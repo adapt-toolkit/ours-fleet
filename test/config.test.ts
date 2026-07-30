@@ -316,3 +316,25 @@ describe('loadConfig monitor', () => {
     expect(() => loadConfig()).toThrowError(/defaults\.monitor must be a map/);
   });
 });
+
+describe('isolation forbidden-path errors surface at config time (5.2)', () => {
+  it('a role asking for a forbidden mount fails `config` by role and path', () => {
+    writeFileSync(join(dir, 'fleet.yaml'),
+      'roles:\n  Sec:\n    harness: claude-code\n'
+      + '    isolation:\n      fs:\n        write:\n          - ' + join(dir, '.ssh') + '\n');
+    expect(() => loadConfig()).toThrowError(/role 'Sec'.*refusing to mount/s);
+    expect(() => loadConfig()).toThrowError(/\.ssh/);
+  });
+
+  it('a role with an allowed mount still loads', () => {
+    writeFileSync(join(dir, 'fleet.yaml'),
+      'roles:\n  Ok:\n    harness: claude-code\n'
+      + '    isolation:\n      fs:\n        read:\n          - /opt/reference\n');
+    expect(loadConfig().roles).toHaveLength(1);
+  });
+
+  it('a role with no isolation block is unaffected', () => {
+    writeFileSync(join(dir, 'fleet.yaml'), 'roles:\n  Plain:\n    harness: claude-code\n');
+    expect(loadConfig().roles).toHaveLength(1);
+  });
+});

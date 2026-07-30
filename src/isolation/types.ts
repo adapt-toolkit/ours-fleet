@@ -71,7 +71,12 @@ export interface ResolvedIsolation {
   system: string[];
   /** ephemeral scratch tmpfs mounts (/tmp, ~/.cache). */
   tmpfs: string[];
-  /** sensitive host paths guaranteed absent from the sandbox (observability). */
+  /**
+   * Sensitive host paths that are ENFORCED absent from the sandbox: any mount
+   * that is, sits inside, or would expose one of these is refused by
+   * `resolveIsolation` before a backend argv is built. Retained on the resolved
+   * policy for diagnostics — doctor and `config` report what is being enforced.
+   */
   blocklist: string[];
 }
 

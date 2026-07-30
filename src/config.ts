@@ -1,9 +1,9 @@
 import { existsSync, readFileSync, readdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { parse } from 'yaml';
-import { defaultConfigPath, fleetDDir } from './paths.js';
-import { validateIsolationConfig } from './isolation/policy.js';
-import type { IsolationConfig } from './isolation/types.js';
+import { agentDir, defaultConfigPath, fleetDDir, home } from './paths.js';
+import { resolveIsolation, validateIsolationConfig } from './isolation/policy.js';
+import type { IsolationConfig, WrapContext } from './isolation/types.js';
 
 export interface OverseeEntry { role: string; interval: string }
 
@@ -143,6 +143,25 @@ export interface FleetConfig {
 
 export class ConfigError extends Error {}
 
+/**
+ * The runtime facts the isolation resolver needs for a role. Single-sourced so
+ * config validation, doctor, and the runner all judge the SAME mount set — a
+ * policy checked against a different context than the one that launches is not
+ * a check at all.
+ */
+export function isolationContextFor(role: ResolvedRole): WrapContext {
+  const stateDir = agentDir(role.name, (role as ResolvedRole & { __temp?: boolean }).__temp === true);
+  return {
+    stateDir,
+    runCwd: role.cwd ?? stateDir,
+    home: home(),
+    harness: role.harness,
+    additionalWriteDirs: role.harness === 'codex'
+      ? ((role.harness_options as { add_dirs?: string[] } | undefined)?.add_dirs ?? [])
+      : [],
+  };
+}
+
 const NAME_RE = /^[A-Za-z0-9_-]+$/;
 const ROLE_KEYS = [
   'harness', 'session', 'session_options', 'permissions', 'identity', 'cwd', 'coordinator', 'mission', 'persona', 'bio',
@@ -239,6 +258,15 @@ export function loadConfig(configPath?: string): FleetConfig {
         isolation,
         monitor,
       });
+      // Forbidden-path enforcement (5.2): a mount that would breach the policy
+      // is a configuration error, caught by `config` rather than at launch.
+      if (isolation !== undefined) {
+        const role = roles[roles.length - 1];
+        try { resolveIsolation(isolation, isolationContextFor(role)); }
+        catch (e) {
+          throw new ConfigError(`${file}: role '${name}' ${(e as Error).message}`);
+        }
+      }
     }
   }
   return { roles, vars, defaults, files, startStaggerMs };

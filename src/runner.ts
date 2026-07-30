@@ -3,7 +3,9 @@ import { join } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { parse } from 'yaml';
 import { agentDir, home, stateRoot } from './paths.js';
-import { loadConfig, findRole, resolvePermissions, type ResolvedRole } from './config.js';
+import {
+  loadConfig, findRole, isolationContextFor, resolvePermissions, type ResolvedRole,
+} from './config.js';
 import { getAdapter } from './harness/registry.js';
 import type { Launch } from './harness/types.js';
 import { Tmux } from './tmux.js';
@@ -323,12 +325,10 @@ export async function runOnce(
   // env prefix + exit capture in buildPaneCommand stay host-side (see §5.3).
   let wrappedArgv = launch.argv;
   if (role.isolation) {
-    const addDirs = role.harness === 'codex'
-      ? ((role.harness_options as { add_dirs?: string[] } | undefined)?.add_dirs ?? [])
-      : [];
-    const ctx: WrapContext = {
-      stateDir: dir, runCwd, home: home(), harness: role.harness, additionalWriteDirs: addDirs,
-    };
+    // The SAME context config validation and doctor judged (5.2): a policy
+    // checked against a different mount set than the one that launches is not a
+    // check at all.
+    const ctx: WrapContext = { ...isolationContextFor(role), stateDir: dir, runCwd };
     const policy = resolveIsolation(role.isolation, ctx);
     const sel = await selectIsolationBackend(policy, deps.exec);  // throws on strict + unavailable
     const degradedMarker = join(dir, '.isolation-degraded');
