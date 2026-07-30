@@ -42,8 +42,25 @@ function fakeBackend(live: Liveness = { state: 'stopped', detail: 'inactive (dea
 }
 
 /** A systemd backend whose `systemctl show` answers with a canned state pair. */
+/**
+ * A systemd whose unit reports `activeState (subState)` to the liveness probe
+ * `up` makes BEFORE installing, and `active (running)` to any probe after it.
+ *
+ * That is what a successful `enable --now` actually leaves behind — measured on
+ * systemd 255. The distinction matters because `install` now verifies the start
+ * rather than trusting systemctl's exit code, which on that version stays 0
+ * even when the start failed. A fixture that replayed the pre-install state to
+ * the post-install probe would be describing a unit that never started, and
+ * would make a correct check look wrong.
+ */
 function systemdSaying(activeState: string, subState: string) {
-  const exec: Exec = async () => ({ stdout: `${activeState}\n${subState}\n`, stderr: '', code: 0 });
+  let probes = 0;
+  const exec: Exec = async (_cmd, args) => {
+    if (!args.includes('show')) return { stdout: '', stderr: '', code: 0 };
+    return probes++ === 0
+      ? { stdout: `${activeState}\n${subState}\n`, stderr: '', code: 0 }
+      : { stdout: 'active\nrunning\n', stderr: '', code: 0 };
+  };
   return makeSystemdBackend(exec);
 }
 function deps(backend: SupervisorBackend) {

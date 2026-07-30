@@ -312,6 +312,98 @@ describe('a failed registration leaves no artifact (6.2)', () => {
       ['systemctl', '--user', 'disable', '--now', 'ours-fleet-agent@A.service']);
   });
 
+  /**
+   * MEASURED on real systemd 255, not reasoned about:
+   *   `systemctl --user enable --now <unit>` whose START half fails returns
+   *   exit 0, leaves the unit enabled, and reports the failed job only as
+   *   prose on stderr. A bare `start` of the same unit returns 1.
+   *   With Type=simple and a missing ExecStart binary the unit settles at
+   *   ActiveState=failed SubState=failed.
+   * Trusting the exit code there makes `spawn` report success while the role's
+   * unit sits enabled and dead — this release's own disease, inside the command
+   * that creates the role.
+   */
+  describe('the exit code is not the signal: the start is verified (systemd)', () => {
+    /** exit code, then whatever `show` should report. */
+    const systemctl = (enableCode: number, activeState: string, subState = ''): {
+      calls: string[][]; exec: Exec;
+    } => {
+      const calls: string[][] = [];
+      const exec: Exec = async (cmd, args): Promise<ExecResult> => {
+        calls.push([cmd, ...args]);
+        if (args[1] === 'is-enabled') return { stdout: 'disabled\n', stderr: '', code: 1 };
+        if (args[1] === 'enable') return { stdout: '', stderr: '', code: enableCode };
+        if (args[1] === 'show') return { stdout: `${activeState}\n${subState}\n`, stderr: '', code: 0 };
+        return { stdout: '', stderr: '', code: 0 };
+      };
+      return { calls, exec };
+    };
+
+    it('a unit left FAILED by a zero-exit `enable --now` is a failed install', async () => {
+      const { calls, exec } = systemctl(0, 'failed', 'failed');
+      const err = await makeSystemdBackend(exec).install('A', '/b').then(() => null, e => e as Error);
+      expect(err, 'install resolved on a dead unit').not.toBeNull();
+      expect(err!.message).toContain('reported success but the unit is not running');
+      expect(err!.message).toContain('failed (failed)');
+      // and it entered the same rollback path as any other failed registration.
+      expect(calls).toContainEqual(
+        ['systemctl', '--user', 'disable', '--now', 'ours-fleet-agent@A.service']);
+    });
+
+    it('an INACTIVE unit is a failed install too', async () => {
+      const { exec } = systemctl(0, 'inactive', 'dead');
+      await expect(makeSystemdBackend(exec).install('A', '/b'))
+        .rejects.toThrow(/not running/);
+    });
+
+    it('a unit that really started installs normally, and says what state it is in', async () => {
+      const { calls, exec } = systemctl(0, 'active', 'running');
+      expect(await makeSystemdBackend(exec).install('A', '/b'))
+        .toMatchObject({ created: true, detail: 'enabled ours-fleet-agent@A.service (active (running))' });
+      expect(calls.filter(c => c[2] === 'disable')).toEqual([]);
+    });
+
+    it('an `activating` unit is not a failed start — systemd is still working on it', async () => {
+      const { exec } = systemctl(0, 'activating', 'auto-restart');
+      await expect(makeSystemdBackend(exec).install('A', '/b')).resolves.toMatchObject({ created: true });
+    });
+
+    it('an UNANSWERABLE probe is never read as a failed start (1.1)', async () => {
+      // The unit may be perfectly fine and the bus merely unreachable. Refusing
+      // the install here would take down a healthy role for a failed probe.
+      const calls: string[][] = [];
+      const exec: Exec = async (cmd, args): Promise<ExecResult> => {
+        calls.push([cmd, ...args]);
+        if (args[1] === 'is-enabled') return { stdout: 'disabled\n', stderr: '', code: 1 };
+        if (args[1] === 'show') return { stdout: '', stderr: 'Failed to connect to bus', code: 1 };
+        return { stdout: '', stderr: '', code: 0 };
+      };
+      await expect(makeSystemdBackend(exec).install('A', '/b')).resolves.toMatchObject({ created: true });
+      expect(calls.filter(c => c[2] === 'disable')).toEqual([]);
+    });
+
+    it('a unit that was ALREADY enabled is not disabled by the verification', async () => {
+      const calls: string[][] = [];
+      const exec: Exec = async (cmd, args): Promise<ExecResult> => {
+        calls.push([cmd, ...args]);
+        if (args[1] === 'is-enabled') return { stdout: 'enabled\n', stderr: '', code: 0 };
+        if (args[1] === 'show') return { stdout: 'failed\nfailed\n', stderr: '', code: 0 };
+        return { stdout: '', stderr: '', code: 0 };
+      };
+      await expect(makeSystemdBackend(exec).install('A', '/b')).rejects.toThrow(/not running/);
+      expect(calls.filter(c => c[2] === 'disable')).toEqual([]);
+    });
+
+    it('works on a systemd that DOES propagate the failure into the exit code', async () => {
+      // Version-independence is the point: the check asks the unit its own
+      // state, so it is correct whether or not this systemd sets the code.
+      const { calls, exec } = systemctl(1, 'failed', 'failed');
+      await expect(makeSystemdBackend(exec).install('A', '/b')).rejects.toThrow(/enable --now/);
+      expect(calls).toContainEqual(
+        ['systemctl', '--user', 'disable', '--now', 'ours-fleet-agent@A.service']);
+    });
+  });
+
   it('systemd does NOT disable a unit that was already enabled', async () => {
     const calls: string[][] = [];
     const exec: Exec = async (cmd, args): Promise<ExecResult> => {
