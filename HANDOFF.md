@@ -33,7 +33,7 @@ Baseline before any work: **339 passed**.
 | 2.1 neutral `allow` actually allows + unattended floor | `75d91f1` | 454 |
 | 2.4 warn when native overrides contradict neutral intent | `68e4a49` | 468 |
 | 3.2 backoff + durable fast-failure circuit breaker | `ead5572` | 484 |
-| 5.2 forbidden-path enforcement | `e058036` | 502 |
+| 5.2 forbidden-path enforcement | `994cbd0` | 502 |
 
 Sections 1, 2 and 3 are complete; section 4 is in progress (5.2 done, 5.1 next).
 
