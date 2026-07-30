@@ -103,6 +103,25 @@ describe('ours-fleet CLI', () => {
     expect(doc.stdout).toMatch(/permissions: Exact.*\(exact\)/);
   });
 
+  it('status names a held-down role, its reason and when (3.2)', async () => {
+    const { mkdirSync, writeFileSync } = await import('node:fs');
+    const stateDir = join(dir, '.ours-fleet', 'agents', 'Wedged');
+    mkdirSync(stateDir, { recursive: true });
+    writeFileSync(join(stateDir, '.restart-ledger.json'), JSON.stringify({
+      version: 1, consecutiveImmediateFailures: 5,
+      lastReason: 'exited with code 127 after 0.2s', nextDelayMs: 0,
+      resumeDiscarded: true, circuit: 'open',
+      updatedAt: '2026-07-30T10:00:00.000Z', openedAt: '2026-07-30T10:00:00.000Z',
+    }));
+
+    const r = await run(['status', 'Wedged']);
+    // A held-down role's unit looks healthy — the runner is alive on purpose.
+    expect(r.stdout).toContain('HELD DOWN since 2026-07-30T10:00:00.000Z');
+    expect(r.stdout).toContain('5 immediate failures');
+    expect(r.stdout).toContain('exited with code 127');
+    expect(r.stdout).toContain('ours-fleet restart Wedged');
+  });
+
   it('config and doctor both report a contradicted permission intent (2.4)', async () => {
     const { writeFileSync } = await import('node:fs');
     writeFileSync(join(dir, 'fleet.yaml'),

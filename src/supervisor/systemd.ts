@@ -50,8 +50,12 @@ After=default.target
 [Service]
 Type=simple
 ExecStart=${binPath} _run %i
-Restart=always
-RestartSec=2
+# The RUNNER owns the child-session restart loop, with a counted, backed-off
+# circuit breaker (3.2). systemd must only recover the runner PROCESS crashing —
+# Restart=always here would resume the uncounted two-second relaunch loop, and
+# would also restart a runner that is deliberately holding a failing agent down.
+Restart=on-failure
+RestartSec=5
 TimeoutStopSec=15
 
 [Install]

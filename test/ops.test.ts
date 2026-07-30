@@ -6,6 +6,7 @@ import { stringify } from 'yaml';
 import { applyRole, up, down, restartRoles, rmRole, type OpsDeps } from '../src/ops.js';
 import { loadConfig } from '../src/config.js';
 import { agentDir } from '../src/paths.js';
+import { readRestartLedger, writeRestartLedger } from '../src/runner.js';
 import { registerAdapter } from '../src/harness/registry.js';
 import { fakeAdapter } from './registry.test.js';
 import { makeSystemdBackend } from '../src/supervisor/systemd.js';
@@ -253,6 +254,49 @@ describe('up liveness (1.1) — only a definite stop discards session context', 
 
     expect(readFileSync(join(stateDir, 'briefing.md'), 'utf8')).toContain('SECOND BRIEFING BODY');
     expect(existsSync(join(stateDir, '.booted'))).toBe(false);   // will re-read it on next start
+  });
+});
+
+describe('explicit operator actions reset the restart circuit (3.2)', () => {
+  const heldDown = () => {
+    const stateDir = agentDir('A');
+    mkdirSync(stateDir, { recursive: true });
+    writeRestartLedger(stateDir, {
+      version: 1, consecutiveImmediateFailures: 5, lastReason: 'exited with code 1',
+      nextDelayMs: 0, resumeDiscarded: true, circuit: 'open',
+      updatedAt: '2026-07-30T00:00:00.000Z', openedAt: '2026-07-30T00:00:00.000Z',
+    });
+    return stateDir;
+  };
+
+  it('`up` releases a held-down role', async () => {
+    writeCfg({ A: { harness: 'fake' } });
+    const stateDir = heldDown();
+    const { backend } = fakeBackend();
+    const { d } = deps(backend);
+    await up(loadConfig(), [], d);
+    const ledger = readRestartLedger(stateDir);
+    expect(ledger.circuit).toBe('closed');
+    expect(ledger.consecutiveImmediateFailures).toBe(0);
+    expect(ledger.resumeDiscarded).toBe(false);
+  });
+
+  it('`restart` releases it too', async () => {
+    writeCfg({ A: { harness: 'fake' } });
+    const stateDir = heldDown();
+    const { backend } = fakeBackend();
+    const { d } = deps(backend);
+    await restartRoles(loadConfig(), ['A'], d, 'keep');
+    expect(readRestartLedger(stateDir).circuit).toBe('closed');
+  });
+
+  it('`down` does NOT release it — stopping a role is not a decision to retry', async () => {
+    writeCfg({ A: { harness: 'fake' } });
+    const stateDir = heldDown();
+    const { backend } = fakeBackend();
+    const { d } = deps(backend);
+    await down(loadConfig(), ['A'], d);
+    expect(readRestartLedger(stateDir).circuit).toBe('open');
   });
 });
 

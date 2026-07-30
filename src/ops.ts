@@ -6,6 +6,7 @@ import type { FleetConfig, ResolvedRole } from './config.js';
 import { findRole } from './config.js';
 import { getAdapter } from './harness/registry.js';
 import { generateBriefing } from './briefing.js';
+import { resetRestartLedger } from './runner.js';
 import type { SupervisorBackend } from './supervisor/types.js';
 
 export interface OpsDeps {
@@ -64,6 +65,9 @@ export async function up(
     // wrote. A running, restarting, or unprobeable role keeps its context —
     // guessing "stopped" from an unanswered probe silently discards a live
     // conversation.
+    // An explicit operator `up` is the sanctioned way to release a held-down
+    // role: the still-alive runner polls this file and resumes (3.2).
+    resetRestartLedger(dir);
     const live = await deps.backend.liveness(role.name)
       .catch(e => ({ state: 'unknown' as const, detail: e instanceof Error ? e.message : String(e) }));
     if (live.state === 'stopped') rmSync(join(dir, '.booted'), { force: true });
@@ -90,7 +94,8 @@ export async function restartRoles(
   cfg: FleetConfig, names: string[], deps: OpsDeps, mode: 'keep' | 'fresh', configPath?: string,
 ): Promise<void> {
   for (const role of selectRoles(cfg, names)) {
-    applyRole(role, { fresh: mode === 'fresh', configPath });
+    const dir = applyRole(role, { fresh: mode === 'fresh', configPath });
+    resetRestartLedger(dir);                    // explicit restart closes the circuit
     await deps.backend.restart(role.name);
     deps.log(mode === 'fresh'
       ? `↻ ${role.name} — force-restarted (FRESH — context cleared, briefing reloaded)`

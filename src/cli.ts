@@ -11,7 +11,7 @@ import { loadConfig } from './config.js';
 import { Tmux } from './tmux.js';
 import { pickBackend } from './supervisor/index.js';
 import { up, down, restartRoles, rmRole, type OpsDeps } from './ops.js';
-import { runOnce, runTemp } from './runner.js';
+import { readRestartLedger, runSupervised, runTemp } from './runner.js';
 import { spawnPermanent, spawnTemp, type SpawnOpts } from './spawn.js';
 import { doctor } from './doctor.js';
 import { allWarnings, analyzeFleetPermissions, formatNative } from './permissions.js';
@@ -290,6 +290,16 @@ program.command('logs <name>').description('show the role log').option('-f, --fo
 program.command('status <name>').description('unit/agent state')
   .action(async name => {
     console.log(await pickBackend().status(name));
+    // A held-down role looks like a healthy running unit from the outside — the
+    // runner is alive on purpose. Say so, with the reason and when (3.2).
+    const ledger = readRestartLedger(agentDir(name));
+    if (ledger.circuit === 'open')
+      console.log(`HELD DOWN since ${ledger.openedAt ?? ledger.updatedAt} after `
+        + `${ledger.consecutiveImmediateFailures} immediate failures: ${ledger.lastReason}`
+        + `\n  release it with: ours-fleet restart ${name}`);
+    else if (ledger.consecutiveImmediateFailures > 0)
+      console.log(`restarts: ${ledger.consecutiveImmediateFailures} consecutive immediate `
+        + `failures, next delay ${ledger.nextDelayMs}ms (${ledger.lastReason})`);
     const stateDir = acpStateDir(name);
     if (stateDir) {
       try {
@@ -368,7 +378,9 @@ program.command('init').description('one-time host setup (units, dirs, linger)')
 program.command('_run <name>', { hidden: true }).description('internal: supervisor entrypoint')
   .option('-c, --configuration <file>')
   .action(async (name, opts) => {
-    try { await runOnce(name, { configPath: opts.configuration }); } catch (e) { die(e); }
+    // The supervised loop, not a single session: restart policy lives here now,
+    // where it can count across attempts (3.2).
+    try { await runSupervised(name, { configPath: opts.configuration }); } catch (e) { die(e); }
   });
 
 program.command('_run-temp <name>', { hidden: true }).description('internal: temp-agent entrypoint')

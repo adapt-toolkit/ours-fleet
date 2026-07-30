@@ -31,6 +31,8 @@ export interface RunnerDeps {
   fetch: FetchLike;
   /** Construct the supervisor mail monitor (injectable so tests stub it out). */
   createMonitor(opts: MonitorOpts): MonitorHandle;
+  /** Lets a test (or a shutdown path) end the supervised restart loop. */
+  shouldStop?(): boolean;
 }
 
 const defaultDeps = (): RunnerDeps => ({
@@ -100,6 +102,81 @@ export function readExitRecord(path: string): ExitRecord | null {
     if (typeof parsed.status === 'number') return classifyShellStatus(parsed.status);
   } catch { /* fall through to unknown */ }
   return { version: 1, class: 'unknown', detail: `unreadable exit record: ${raw.slice(0, 120)}` };
+}
+
+// ─── Restart-loop containment (3.2) ──────────────────────────────────────────
+//
+// The child-session restart loop used to BE the service manager: systemd's
+// `Restart=always RestartSec=2` and launchd's `KeepAlive`. Neither can count,
+// so a program that dies instantly was relaunched every two seconds forever,
+// and each relaunch was a fresh process with no memory of the previous one.
+// The count now lives with the role, in its state directory, so it survives the
+// runner being restarted and is consistent across both service managers.
+
+export const RESTART_LEDGER_FILE = '.restart-ledger.json';
+
+/** Consecutive immediate failures tolerated before the agent is held down. */
+export const RESTART_FAIL_THRESHOLD = 5;
+const RESTART_BACKOFF_BASE_MS = 2_000;
+const RESTART_BACKOFF_MAX_MS = 60_000;
+/** How often a held-down runner re-reads its ledger, so `up` can release it. */
+const HELD_DOWN_POLL_MS = 5_000;
+
+export interface RestartLedger {
+  version: 1;
+  consecutiveImmediateFailures: number;
+  lastReason: string;
+  nextDelayMs: number;
+  /** Whether this failure sequence has already thrown away resume state. */
+  resumeDiscarded: boolean;
+  circuit: 'closed' | 'open';
+  updatedAt: string;
+  /** When the circuit opened, for the held-down status line. */
+  openedAt?: string;
+}
+
+const emptyLedger = (): RestartLedger => ({
+  version: 1,
+  consecutiveImmediateFailures: 0,
+  lastReason: '',
+  nextDelayMs: 0,
+  resumeDiscarded: false,
+  circuit: 'closed',
+  updatedAt: new Date(0).toISOString(),
+});
+
+/** Bounded exponential backoff for the nth consecutive immediate failure. */
+export function backoffFor(consecutiveFailures: number): number {
+  if (consecutiveFailures <= 0) return 0;
+  return Math.min(
+    RESTART_BACKOFF_BASE_MS * 2 ** (consecutiveFailures - 1), RESTART_BACKOFF_MAX_MS);
+}
+
+/** Read a role's restart ledger; a missing or corrupt one starts clean. */
+export function readRestartLedger(dir: string): RestartLedger {
+  try {
+    const raw = JSON.parse(readFileSync(join(dir, RESTART_LEDGER_FILE), 'utf8')) as Partial<RestartLedger>;
+    if (raw.version !== 1) return emptyLedger();
+    return { ...emptyLedger(), ...raw, version: 1 };
+  } catch { return emptyLedger(); }
+}
+
+export function writeRestartLedger(dir: string, ledger: RestartLedger): void {
+  try {
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(join(dir, RESTART_LEDGER_FILE), JSON.stringify(ledger, null, 2) + '\n');
+  } catch { /* diagnostics must never take the role down */ }
+}
+
+/**
+ * Close the circuit and forget the failure streak. Called by an explicit
+ * operator `up`/`restart`, which is the only thing that may release a held-down
+ * role — a held-down runner polls this file, so a role can be released without
+ * bouncing its unit.
+ */
+export function resetRestartLedger(dir: string): void {
+  if (!existsSync(dir)) return;
+  writeRestartLedger(dir, { ...emptyLedger(), updatedAt: new Date().toISOString() });
 }
 
 /** Filename spawnTemp writes into a temp agent dir to carry the fleet start-stagger. */
@@ -187,12 +264,21 @@ function resolveConfigPath(dir: string, explicit?: string): string | undefined {
   return readFileSync(marker, 'utf8').trim() || undefined;
 }
 
-/** One supervised session lifecycle. The supervisor re-invokes us after we return. */
+/** What one child session did, so the supervising loop can decide what follows. */
+export interface AttemptResult {
+  elapsedSecs: number;
+  exit: ExitRecord;
+  /** Whether this attempt threw away resume state to start fresh. */
+  rotated: boolean;
+  mode: 'fresh' | 'resume';
+}
+
+/** One session lifecycle. `runSupervised` (or a one-shot caller) drives it. */
 export async function runOnce(
   name: string,
-  opts: { temp?: boolean; configPath?: string } = {},
+  opts: { temp?: boolean; configPath?: string; allowResumeRotation?: boolean } = {},
   partialDeps: Partial<RunnerDeps> = {},
-): Promise<void> {
+): Promise<AttemptResult> {
   const deps = { ...defaultDeps(), ...partialDeps };
   const temp = opts.temp === true;
   const dir = agentDir(name, temp);
@@ -379,9 +465,11 @@ export async function runOnce(
     ...exitRecord, at: new Date(deps.now()).toISOString(), elapsedSecs: Number(elapsed.toFixed(1)),
   }) + '\n');
 
+  let rotated = false;
   const rotate = (why: string) => {
     writeFileSync(sidFile, randomUUID() + '\n');
     rmSync(bootedFile, { force: true });
+    rotated = true;
     deps.log(`[${name}] ${why} -> rotated session-id; next start is FRESH`);
   };
   if (exitRecord.class === 'clean' && adapter.exitPolicy.cleanExitIsFresh)
@@ -390,10 +478,122 @@ export async function runOnce(
     // Someone tore the console down; the agent did not fail. Rotating here
     // would discard a live conversation for an operator action.
     deps.log(`[${name}] ${exitRecord.detail} (${elapsed.toFixed(0)}s) -> next start RESUMES context`);
-  else if (mode === 'resume' && elapsed < adapter.exitPolicy.fastFailSecs)
-    rotate(`resume failed fast (${elapsed.toFixed(0)}s, ${exitRecord.detail})`);
-  else deps.log(
+  else if (mode === 'resume' && elapsed < adapter.exitPolicy.fastFailSecs) {
+    // Self-heal a poisoned resume — but only once per failure sequence. Rotating
+    // on every attempt would discard the conversation again and again while the
+    // real cause (a broken command, a missing binary) went unaddressed.
+    if (opts.allowResumeRotation === false)
+      deps.log(`[${name}] resume failed fast again (${elapsed.toFixed(0)}s, ${exitRecord.detail}) ` +
+        `-> resume state was already discarded once; keeping it`);
+    else rotate(`resume failed fast (${elapsed.toFixed(0)}s, ${exitRecord.detail})`);
+  } else deps.log(
     `[${name}] ${exitRecord.detail} (${elapsed.toFixed(0)}s) -> next start RESUMES context`);
+
+  return { elapsedSecs: elapsed, exit: exitRecord, rotated, mode };
+}
+
+/**
+ * The persistent supervisor for one permanent role: run child sessions in a
+ * loop, count consecutive immediate failures across them, back off between
+ * attempts, and after `RESTART_FAIL_THRESHOLD` hold the agent down while
+ * staying alive — so the service manager has nothing to restart and cannot
+ * resume the two-second loop behind our back.
+ *
+ * `attempt` is injectable so the policy can be tested against a fake clock and
+ * fake child instead of real sessions.
+ */
+export async function runSupervised(
+  name: string,
+  opts: { configPath?: string } = {},
+  partialDeps: Partial<RunnerDeps> = {},
+  attempt: (
+    n: string, o: { configPath?: string; allowResumeRotation?: boolean }, d: Partial<RunnerDeps>,
+  ) => Promise<AttemptResult> = runOnce,
+): Promise<RestartLedger> {
+  const deps = { ...defaultDeps(), ...partialDeps };
+  const dir = agentDir(name);
+  mkdirSync(dir, { recursive: true });
+  const shouldStop = deps.shouldStop ?? (() => false);
+  const stamp = () => new Date(deps.now()).toISOString();
+
+  while (!shouldStop()) {
+    let ledger = readRestartLedger(dir);
+
+    if (ledger.circuit === 'open') {
+      // Held down. Stay alive — exiting would hand the role straight back to
+      // the service manager — and watch for an operator reset.
+      await deps.sleep(HELD_DOWN_POLL_MS);
+      continue;
+    }
+
+    let result: AttemptResult;
+    try {
+      result = await attempt(
+        name, { configPath: opts.configPath, allowResumeRotation: !ledger.resumeDiscarded }, deps);
+    } catch (e) {
+      // A session that could not even start is an immediate failure like any
+      // other; it must count, or an unstartable role loops forever.
+      result = {
+        elapsedSecs: 0,
+        exit: { version: 1, class: 'unknown', detail: e instanceof Error ? e.message : String(e) },
+        rotated: false,
+        mode: 'fresh',
+      };
+    }
+
+    // Re-read: the attempt itself may have taken minutes, and an operator may
+    // have reset the ledger meanwhile.
+    ledger = readRestartLedger(dir);
+    const fastFailSecs = fastFailSecsFor(name, opts.configPath);
+    const immediate = result.elapsedSecs < fastFailSecs;
+
+    if (!immediate) {
+      // A session that ran for a while is not a restart loop, whatever ended it.
+      writeRestartLedger(dir, {
+        ...emptyLedger(),
+        lastReason: result.exit.detail,
+        updatedAt: stamp(),
+      });
+      continue;
+    }
+
+    const failures = ledger.consecutiveImmediateFailures + 1;
+    const reason = `${result.exit.detail} after ${result.elapsedSecs.toFixed(1)}s`;
+    const next: RestartLedger = {
+      version: 1,
+      consecutiveImmediateFailures: failures,
+      lastReason: reason,
+      nextDelayMs: backoffFor(failures),
+      resumeDiscarded: ledger.resumeDiscarded || result.rotated,
+      circuit: failures >= RESTART_FAIL_THRESHOLD ? 'open' : 'closed',
+      updatedAt: stamp(),
+    };
+    if (next.circuit === 'open') {
+      next.openedAt = stamp();
+      next.nextDelayMs = 0;
+      writeRestartLedger(dir, next);
+      deps.log(`[${name}] HELD DOWN after ${failures} immediate failures at ${next.openedAt} — ` +
+        `${reason}; the agent will not be restarted until: ours-fleet restart ${name}`);
+      continue;
+    }
+    writeRestartLedger(dir, next);
+    deps.log(`[${name}] immediate failure ${failures}/${RESTART_FAIL_THRESHOLD} (${reason}) ` +
+      `-> backing off ${next.nextDelayMs}ms`);
+    await deps.sleep(next.nextDelayMs);
+  }
+  return readRestartLedger(dir);
+}
+
+/**
+ * How short an attempt has to be to count as immediate. The role's harness
+ * decides; an unreadable config falls back to the common 20s so a broken config
+ * cannot disable the breaker.
+ */
+function fastFailSecsFor(name: string, configPath?: string): number {
+  try {
+    const role = findRole(loadConfig(configPath), name);
+    return getAdapter(role.harness).exitPolicy.fastFailSecs;
+  } catch { return 20; }
 }
 
 /** Temp-agent entrypoint: run one session, then remove the temp dir. */

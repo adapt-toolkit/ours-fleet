@@ -4,7 +4,11 @@ import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { stringify } from 'yaml';
-import { runOnce, runTemp, buildPaneCommand, reserveLaunchSlot, readExitRecord } from '../src/runner.js';
+import {
+  runOnce, runTemp, runSupervised, buildPaneCommand, reserveLaunchSlot, readExitRecord,
+  readRestartLedger, resetRestartLedger, backoffFor, RESTART_FAIL_THRESHOLD,
+  type AttemptResult, type RunnerDeps,
+} from '../src/runner.js';
 import { classifyChildExit, classifyShellStatus } from '../src/session/types.js';
 import { registerAdapter } from '../src/harness/registry.js';
 import { agentDir, stateRoot } from '../src/paths.js';
@@ -679,5 +683,168 @@ describe('runTemp', () => {
     const { deps } = fakeWorld({ exitCode: '0', exitFile: join(d, '.exit-status') });
     await runTemp('T', deps);
     expect(existsSync(d)).toBe(false);
+  });
+});
+
+describe('restart-loop containment (3.2)', () => {
+  /** A fake clock and a fake child, so the policy is tested, not the sessions. */
+  function supervisorWorld(stateDir: string, opts: {
+    /** Seconds each attempt "lasts", by attempt index. Last value repeats. */
+    durations?: number[];
+    /** Attempts after which the loop stops (default: 20, a runaway guard). */
+    stopAfter?: number;
+    /** Attempt indices whose session rotated its resume state. */
+    rotatesAt?: number[];
+    throwAt?: number[];
+  } = {}) {
+    const durations = opts.durations ?? [0];
+    const sleeps: number[] = [];
+    const attempts: Array<{ allowResumeRotation?: boolean }> = [];
+    const logs: string[] = [];
+    let clock = 0;
+    const deps: Partial<RunnerDeps> = {
+      sleep: async (ms: number) => { sleeps.push(ms); clock += ms; },
+      now: () => clock,
+      log: (l: string) => { logs.push(l); },
+      // Stop once the breaker has opened: the real loop then holds down forever
+      // on purpose, which against a fake clock is an infinite spin.
+      shouldStop: () => attempts.length >= (opts.stopAfter ?? 20)
+        || readRestartLedger(stateDir).circuit === 'open',
+    };
+    const attempt = async (
+      _n: string, o: { allowResumeRotation?: boolean },
+    ): Promise<AttemptResult> => {
+      const i = attempts.length;
+      attempts.push({ allowResumeRotation: o.allowResumeRotation });
+      if (opts.throwAt?.includes(i)) throw new Error('could not start the session');
+      const secs = durations[Math.min(i, durations.length - 1)];
+      clock += secs * 1000;
+      return {
+        elapsedSecs: secs,
+        exit: { version: 1, class: 'program-exit', code: 1, detail: 'exited with code 1' },
+        rotated: opts.rotatesAt?.includes(i) ?? false,
+        mode: 'resume',
+      };
+    };
+    return { deps, attempt, sleeps, attempts, logs };
+  }
+
+  const setup = () => {
+    writeCfg({ A: { harness: 'fake' } });
+    const d = agentDir('A');
+    mkdirSync(d, { recursive: true });
+    return d;
+  };
+
+  it('grows the delay exponentially, bounded', () => {
+    expect(backoffFor(0)).toBe(0);
+    expect(backoffFor(1)).toBe(2_000);
+    expect(backoffFor(2)).toBe(4_000);
+    expect(backoffFor(3)).toBe(8_000);
+    expect(backoffFor(4)).toBe(16_000);
+    expect(backoffFor(5)).toBe(32_000);
+    expect(backoffFor(99)).toBe(60_000);          // bounded
+  });
+
+  it('an immediate-exit program reaches exactly N attempts, then holds down', async () => {
+    const d = setup();
+    const w = supervisorWorld(d, { durations: [0.1] });
+    const ledger = await runSupervised('A', {}, w.deps, w.attempt);
+
+    expect(w.attempts).toHaveLength(RESTART_FAIL_THRESHOLD);   // exactly N child attempts
+    expect(ledger.circuit).toBe('open');
+    expect(ledger.consecutiveImmediateFailures).toBe(RESTART_FAIL_THRESHOLD);
+    expect(ledger.lastReason).toContain('exited with code 1');
+    expect(Number.isNaN(Date.parse(ledger.openedAt!))).toBe(false);   // dated reason
+    // Backoff was applied between attempts, growing, and never after the open.
+    expect(w.sleeps).toEqual([2_000, 4_000, 8_000, 16_000]);
+    expect(w.logs.some(l => l.includes('HELD DOWN'))).toBe(true);
+  });
+
+  it('stays held down without starting another child', async () => {
+    const d = setup();
+    const boot = supervisorWorld(d, { durations: [0.1] });
+    await runSupervised('A', {}, boot.deps, boot.attempt);
+    expect(readRestartLedger(d).circuit).toBe('open');
+
+    // A fresh runner process (e.g. the host rebooted) must honour the ledger.
+    const w = supervisorWorld(d, { stopAfter: 1 });
+    let polls = 0;
+    w.deps.shouldStop = () => ++polls > 3;
+    await runSupervised('A', {}, w.deps, w.attempt);
+    expect(w.attempts).toHaveLength(0);            // no child was started at all
+  });
+
+  it('the ledger survives a runner restart and keeps counting', async () => {
+    const d = setup();
+    // Two separate runner "processes", two attempts each.
+    for (let i = 0; i < 2; i++) {
+      const w = supervisorWorld(d, { durations: [0.1], stopAfter: 2 });
+      await runSupervised('A', {}, w.deps, w.attempt);
+    }
+    expect(readRestartLedger(d).consecutiveImmediateFailures).toBe(4);
+    expect(readRestartLedger(d).circuit).toBe('closed');       // one short of N
+
+    const w = supervisorWorld(d, { durations: [0.1], stopAfter: 1 });
+    await runSupervised('A', {}, w.deps, w.attempt);
+    expect(readRestartLedger(d).circuit).toBe('open');         // the 5th opens it
+  });
+
+  it('an explicit reset closes the circuit and releases a held-down runner', async () => {
+    const d = setup();
+    const first = supervisorWorld(d, { durations: [0.1] });
+    await runSupervised('A', {}, first.deps, first.attempt);
+    expect(readRestartLedger(d).circuit).toBe('open');
+
+    resetRestartLedger(d);
+    expect(readRestartLedger(d).circuit).toBe('closed');
+    expect(readRestartLedger(d).consecutiveImmediateFailures).toBe(0);
+
+    const w = supervisorWorld(d, { durations: [0.1], stopAfter: 1 });
+    await runSupervised('A', {}, w.deps, w.attempt);
+    expect(w.attempts).toHaveLength(1);            // it starts children again
+  });
+
+  it('a session that runs for a while clears the streak', async () => {
+    const d = setup();
+    // Four instant failures, then one long session, then instant failures again.
+    const w = supervisorWorld(d, { durations: [0.1, 0.1, 0.1, 0.1, 999, 0.1], stopAfter: 7 });
+    await runSupervised('A', {}, w.deps, w.attempt);
+    // Without the reset, 7 instant failures would have opened the circuit.
+    expect(readRestartLedger(d).circuit).toBe('closed');
+    expect(readRestartLedger(d).consecutiveImmediateFailures).toBe(2);
+  });
+
+  it('discards resume state at most once in a failure sequence', async () => {
+    const d = setup();
+    const w = supervisorWorld(d, { durations: [0.1], rotatesAt: [0] });
+    await runSupervised('A', {}, w.deps, w.attempt);
+    // The first attempt was allowed to rotate; every later one was not.
+    expect(w.attempts[0].allowResumeRotation).toBe(true);
+    expect(w.attempts.slice(1).every(a => a.allowResumeRotation === false)).toBe(true);
+  });
+
+  it('allows rotation again once the streak is broken', async () => {
+    const d = setup();
+    const w = supervisorWorld(d, { durations: [0.1, 999, 0.1], rotatesAt: [0], stopAfter: 3 });
+    await runSupervised('A', {}, w.deps, w.attempt);
+    expect(w.attempts[0].allowResumeRotation).toBe(true);
+    expect(w.attempts[1].allowResumeRotation).toBe(false);   // still inside the streak
+    expect(w.attempts[2].allowResumeRotation).toBe(true);    // long session reset it
+  });
+
+  it('a session that cannot even start counts as an immediate failure', async () => {
+    const d = setup();
+    const w = supervisorWorld(d, { durations: [0.1], throwAt: [0, 1, 2, 3, 4] });
+    await runSupervised('A', {}, w.deps, w.attempt);
+    const ledger = readRestartLedger(d);
+    expect(ledger.circuit).toBe('open');
+    expect(ledger.lastReason).toContain('could not start the session');
+  });
+
+  it('a corrupt ledger starts clean instead of taking the role down', () => {
+    const d = setup();
+    writeFileSync(join(d, '.restart-ledger.json'), '{not json');
+    expect(readRestartLedger(d)).toMatchObject({ circuit: 'closed', consecutiveImmediateFailures: 0 });
   });
 });

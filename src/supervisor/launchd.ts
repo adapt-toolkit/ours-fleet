@@ -17,7 +17,10 @@ function plist(name: string, binPath: string): string {
   <key>Label</key><string>${labelFor(name)}</string>
   <key>ProgramArguments</key>
   <array><string>${binPath}</string><string>_run</string><string>${name}</string></array>
-  <key>KeepAlive</key><true/>
+  <!-- The runner owns the child-session restart loop (3.2). launchd must only
+       recover the runner PROCESS crashing: a bare KeepAlive would resume the
+       uncounted relaunch loop and restart a deliberately held-down agent. -->
+  <key>KeepAlive</key><dict><key>SuccessfulExit</key><false/></dict>
   <key>RunAtLoad</key><true/>
   <key>StandardOutPath</key><string>${log}</string>
   <key>StandardErrorPath</key><string>${log}</string>
