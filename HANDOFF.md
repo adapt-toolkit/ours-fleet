@@ -170,6 +170,40 @@ can make the reservation authoritative.
 package. `IdentityRegistry` is the seam — implement it against the daemon endpoint and inject
 it; no fleet-side code changes.
 
+### The contract the ours daemon would have to provide
+
+Hand this to whoever owns the daemon. It is deliberately minimal: three operations, one
+authenticated endpoint family, no new concepts.
+
+| Operation | Semantics |
+| --- | --- |
+| `reserve(name, holder, ttlMs)` | Atomically claim an identity name. Succeeds only if the name is neither an existing identity nor a live reservation. Returns a `reservationId`. MUST be atomic against every client of this daemon — that is the entire reason it lives here rather than in the fleet. |
+| `commit(reservationId)` | The identity now exists; drop the reservation without freeing the name. |
+| `release(reservationId)` | Abandon the claim; the name becomes available immediately. |
+
+**Authentication:** the same `x-ours-api-token` header the fleet's monitor already uses
+(`resolveEndpoint()` in `src/monitor.ts` resolves the token identically to the MCP client). No
+new auth path.
+
+**Crash between reserve and commit.** This is the case that decides the design. A fleet process
+that dies after `reserve` and before `commit` or `release` must not block the name forever, so
+reservations MUST expire: `ttlMs` is supplied by the caller and the daemon drops the
+reservation when it lapses. The fleet passes a TTL a little longer than its own creation
+transaction. A lapsed reservation is indistinguishable from a released one — no repair step,
+no operator action. The fleet's host-local equivalent already behaves this way
+(`clearStaleReservations`).
+
+**If the daemon is older than required.** The fleet MUST NOT fail the spawn and MUST NOT
+pretend the guarantee holds. It should fall back to `hostLocalIdentityRegistry` — which still
+makes concurrent `ours-fleet spawn` safe — and say so once, plainly, naming what is not
+guaranteed: that another ours client creating the same identity concurrently can still win.
+Degrading loudly is the rule this whole release is built on; degrading silently here would
+re-create the exact defect 2.3 and 5.2 were about.
+
+**Version pin.** Once the endpoint exists, pin the minimum daemon version and have `doctor`
+report which registry is in use — daemon-backed or host-local — so an operator can see the
+difference rather than infer it.
+
 ## Environment trap (cost me a confusing hang)
 
 `mkdirSync` on a path under `/proc` HANGS in this sandbox rather than throwing — a bare
