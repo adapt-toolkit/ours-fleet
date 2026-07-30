@@ -43,7 +43,7 @@ Baseline before any work: **339 passed**.
 | 6.2 roll back every failed creation stage | `b077947` | 554 |
 | 6.3 `spawn --isolation-file` | `312ce61` | 565 |
 | 6.6 persist creation provenance | `c6de9a2` | 571 |
-| 7.4 document never-prompt failure + the floor | `PENDING` | 575 |
+| 7.4 document never-prompt failure + the floor | `cdbf6d2` | 575 |
 
 **Sections 1 through 5 are COMPLETE**, and 7.4 of section 6. Remaining: 7.1 and 7.2 — both
 documentation.
