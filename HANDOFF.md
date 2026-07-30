@@ -36,7 +36,7 @@ Baseline before any work: **339 passed**.
 | 5.2 forbidden-path enforcement | `994cbd0` | 502 |
 | (audit) anchor directive assertions in generated files | `338e220` | 502 |
 | 5.1 shared harness credentials read-only | `6ece53d` | 514 |
-| 6.1 locked, atomic Claude pre-trust | `PENDING` | 526 |
+| 6.1 locked, atomic Claude pre-trust | `030a402` | 526 |
 
 Sections 1-4 complete. Section 5 (creation/trust) in progress: 6.1 done, 6.4 next.
 
