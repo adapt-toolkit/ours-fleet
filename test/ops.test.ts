@@ -29,13 +29,13 @@ function fakeBackend(live: Liveness = { state: 'stopped', detail: 'inactive (dea
   const backend: SupervisorBackend = {
     id: 'none',
     async init() { return []; },
-    async install(n) { calls.push(['install', n]); },
+    async install(n) { calls.push(['install', n]); return { created: true, detail: 'installed' }; },
     async start(n) { calls.push(['start', n]); },
     async stop(n) { calls.push(['stop', n]); },
     async restart(n) { calls.push(['restart', n]); },
     async status(n) { calls.push(['status', n]); return 'inactive'; },
     async liveness(n) { calls.push(['liveness', n]); return live; },
-    async uninstall(n) { calls.push(['uninstall', n]); },
+    async uninstall(n) { calls.push(['uninstall', n]); return { removed: true, detail: 'removed' }; },
     logsArgs: n => ({ cmd: 'true', args: [n] }),
   };
   return { calls, backend };

@@ -71,8 +71,15 @@ WantedBy=default.target
     },
 
     async install(name) {
+      // Ask FIRST whether this unit was already enabled, so a rollback can tell
+      // "we registered this" from "it was already here" (6.2).
+      const before = await ctl('is-enabled', unitFor(name));
+      const alreadyEnabled = before.stdout.trim() === 'enabled';
       const r = await ctl('enable', '--now', unitFor(name));
       if (r.code !== 0) throw new Error(`systemctl enable --now ${unitFor(name)} failed: ${r.stderr.trim()}${busHint(r.stderr)}`);
+      return alreadyEnabled
+        ? { created: false, detail: `${unitFor(name)} was already enabled` }
+        : { created: true, detail: `enabled ${unitFor(name)}` };
     },
     async start(name) { await ctl('start', unitFor(name)); },
     async stop(name) {
@@ -100,7 +107,14 @@ WantedBy=default.target
         detail: subState ? `${activeState} (${subState})` : activeState,
       };
     },
-    async uninstall(name) { await ctl('disable', '--now', unitFor(name)); },
+    async uninstall(name) {
+      const before = await ctl('is-enabled', unitFor(name));
+      const wasEnabled = before.stdout.trim() === 'enabled';
+      await ctl('disable', '--now', unitFor(name));     // idempotent
+      return wasEnabled
+        ? { removed: true, detail: `disabled ${unitFor(name)}` }
+        : { removed: false, detail: `${unitFor(name)} was not enabled` };
+    },
     logsArgs(name, follow) {
       return { cmd: 'journalctl', args: ['--user', '-u', unitFor(name), ...(follow ? ['-f'] : ['-n', '200'])] };
     },

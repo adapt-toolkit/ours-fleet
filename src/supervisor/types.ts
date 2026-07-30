@@ -12,12 +12,21 @@ export interface Liveness {
   detail: string;
 }
 
+/** Whether `install` had to create the registration, or found it already there. */
+export interface InstallOutcome { created: boolean; detail: string }
+export interface UninstallOutcome { removed: boolean; detail: string }
+
 export interface SupervisorBackend {
   id: 'systemd' | 'launchd' | 'none';
   /** One-time host setup (unit template / dirs / linger). Returns human-readable messages. */
   init(binPath: string): Promise<string[]>;
-  /** Ensure the role's unit exists and is enabled + started. */
-  install(name: string, binPath: string): Promise<void>;
+  /**
+   * Ensure the role's unit exists and is enabled + started. Idempotent, and
+   * EXPLICIT about whether it created the registration: rollback may only
+   * remove what this transaction made, so "did I create this?" has to be
+   * answerable rather than assumed (6.2).
+   */
+  install(name: string, binPath: string): Promise<InstallOutcome>;
   start(name: string): Promise<void>;
   stop(name: string): Promise<void>;
   restart(name: string): Promise<void>;
@@ -28,7 +37,8 @@ export interface SupervisorBackend {
    * probe is `unknown` with the failure in `detail`.
    */
   liveness(name: string): Promise<Liveness>;
-  uninstall(name: string): Promise<void>;
+  /** Remove the registration. Idempotent; reports whether anything was there. */
+  uninstall(name: string): Promise<UninstallOutcome>;
   /** Command the CLI execs (stdio inherited) to show logs. */
   logsArgs(name: string, follow: boolean): { cmd: string; args: string[] };
 }

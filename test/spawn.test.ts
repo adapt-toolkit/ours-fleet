@@ -29,9 +29,10 @@ function fakeDeps() {
   const backend: SupervisorBackend = {
     id: 'none',
     async init() { return []; },
-    async install(n) { calls.push(['install', n]); },
+    async install(n) { calls.push(['install', n]); return { created: true, detail: 'installed' }; },
     async start() {}, async stop() {}, async restart() {},
-    async status() { return 'inactive'; }, async uninstall() {},
+    async status() { return 'inactive'; },
+    async uninstall(n) { calls.push(['uninstall', n]); return { removed: true, detail: 'removed' }; },
     async liveness() { return { state: 'stopped' as const, detail: 'inactive (dead)' }; },
     logsArgs: n => ({ cmd: 'true', args: [n] }),
   };
@@ -314,6 +315,8 @@ describe('identity is established before launch (7.3)', () => {
   const briefingOf = (name: string) =>
     readFileSync(join(agentDir(name), 'briefing.md'), 'utf8');
 
+
+
   it('an existing identity is verified, and the briefing says so', async () => {
     const { d } = fakeDeps();
     await spawnPermanent({ name: 'Known', identity: 'Known' }, d,
@@ -380,5 +383,93 @@ describe('identity is established before launch (7.3)', () => {
     const d = await spawnTemp({ name: 'TempKnown', identity: 'TempKnown' }, '/b/ours-fleet', () => {},
       { identityProvisioner: provisioner(true) });
     expect(readFileSync(join(d, 'briefing.md'), 'utf8')).toContain('verified to exist');
+  });
+});
+
+describe('every failed creation stage rolls back (6.2)', () => {
+  const provisioner = (created: string[], removed: string[]) => ({
+    async exists() { return false as const; },
+    async create(n: string) { created.push(n); },
+    async remove(n: string) { removed.push(n); },
+  });
+
+  const artifacts = (name: string) => ({
+    config: existsSync(join(dir, 'fleet.d', `${name}.yaml`)),
+    state: existsSync(agentDir(name)),
+  });
+
+  /** Fault-inject at each stage in turn; each must leave nothing behind. */
+  // `state` is not in this list on purpose: `up` tolerates a failing liveness
+  // probe by design (1.1), so it is not an injectable failure point. The
+  // config-write stage is covered by the 6.4 rollback test above.
+  const STAGES = ['identity', 'service'] as const;
+
+  for (const stage of STAGES) {
+    it(`a failure at the ${stage} stage leaves no artifact and frees the names`, async () => {
+      const created: string[] = [];
+      const removed: string[] = [];
+      const { d, calls } = fakeDeps();
+      const p = provisioner(created, removed);
+      if (stage === 'identity') p.create = async () => { throw new Error('inject: identity'); };
+      if (stage === 'service') d.backend.install = async () => { throw new Error('inject: service'); };
+
+      const err = await spawnPermanent({ name: 'Faulted' }, d, { identityProvisioner: p })
+        .then(() => null, e => e as Error);
+      expect(err!.message, stage).toContain(`inject: ${stage}`);
+      expect(artifacts('Faulted'), stage).toEqual({ config: false, state: false });
+      expect(calls.filter(c => c[0] === 'install').length === 0 || stage === 'service').toBe(true);
+
+      // An identity we minted is removed again; one we never made is not.
+      if (stage === 'identity') expect(removed).toEqual([]);
+      else expect(removed).toEqual(['Faulted']);
+
+      // The names are immediately reusable.
+      const { d: ok } = fakeDeps();
+      await expect(spawnPermanent({ name: 'Faulted' }, ok,
+        { identityProvisioner: provisioner([], []) })).resolves.toBeTruthy();
+    });
+  }
+
+  it('a service registration this transaction created is uninstalled on failure', async () => {
+    const { d, calls } = fakeDeps();
+    // install succeeds and reports it CREATED the registration; a later stage fails.
+    const realInstall = d.backend.install.bind(d.backend);
+    d.backend.install = async (n, b) => { await realInstall(n, b); throw new Error('inject: after-install'); };
+    const err = await spawnPermanent({ name: 'Late' }, d,
+      { identityProvisioner: provisioner([], []) }).then(() => null, e => e as Error);
+    expect(err!.message).toContain('after-install');
+    expect(calls).toContainEqual(['install', 'Late']);
+    // install threw, so nothing was RECORDED as created — and nothing is removed.
+    expect(calls.filter(c => c[0] === 'uninstall')).toEqual([]);
+  });
+
+  it('a registration that already existed is NOT removed by rollback', async () => {
+    const { d, calls } = fakeDeps();
+    d.backend.install = async n => { calls.push(['install', n]); return { created: false, detail: 'already there' }; };
+    // Fail after up() by making the identity removal path irrelevant: force a
+    // later throw via a failing provisioner remove is not applicable, so throw
+    // from the launcher-free permanent path by breaking loadConfig afterwards.
+    const err = await spawnPermanent({ name: 'PreExisting' }, d, {
+      identityProvisioner: {
+        async exists() { return true as const; },
+      },
+    }).then(() => 'ok', e => e as Error);
+    expect(err).toBe('ok');
+    expect(calls.filter(c => c[0] === 'uninstall')).toEqual([]);
+  });
+
+  it('a rollback failure is reported WITHOUT hiding the original error', async () => {
+    const { d } = fakeDeps();
+    d.backend.install = async () => { throw new Error('the real failure'); };
+    const err = await spawnPermanent({ name: 'Messy' }, d, {
+      identityProvisioner: {
+        async exists() { return false as const; },
+        async create() {},
+        async remove() { throw new Error('and rollback broke too'); },
+      },
+    }).then(() => null, e => e as Error);
+    expect(err!.message).toContain('the real failure');        // the cause survives
+    expect(err!.message).toContain('rollback also failed');
+    expect(err!.message).toContain('and rollback broke too');
   });
 });

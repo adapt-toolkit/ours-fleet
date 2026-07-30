@@ -210,6 +210,11 @@ export interface IdentityProvisioner {
   exists(name: string): Promise<boolean | 'unknown'>;
   /** Create it, publishing bio/persona through the same path. Absent = cannot. */
   create?(name: string, profile: { bio?: string; persona?: string }): Promise<void>;
+  /**
+   * Undo a `create` during rollback. Only ever called for an identity THIS
+   * transaction created; absent means "cannot", and the orphan is reported.
+   */
+  remove?(name: string): Promise<void>;
 }
 
 export type IdentityGuarantee =

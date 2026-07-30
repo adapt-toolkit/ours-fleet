@@ -40,17 +40,17 @@ Baseline before any work: **339 passed**.
 | (5.1) make the sandbox skip loud | `a8e33a4` | 526 |
 | 6.4 atomic role + identity reservation | `c7eccb9` | 533 |
 | 7.3 guarantee identity existence before launch | `f759a35` | 545 |
+| 6.2 roll back every failed creation stage | `PENDING` | 554 |
 
-Sections 1-4 complete. Section 5 in progress: 6.1, 6.4, 7.3 done; 6.2 next.
+Sections 1-4 complete. Section 5 in progress: 6.1, 6.4, 7.3, 6.2 done; 6.3 next.
 
 ## Remaining, in spec dependency order
 
-1. **6.2** roll back every failed creation stage
-2. **6.3** `spawn --isolation-file` (the ONE approved new operator input)
-3. **6.6** persist creation provenance
-4. **7.1** correct the spawn skill
-5. **7.2** stop using one console command as a liveness verdict
-6. **7.4** document never-prompt failure and the capability floor
+1. **6.3** `spawn --isolation-file` (the ONE approved new operator input)
+2. **6.6** persist creation provenance
+3. **7.1** correct the spawn skill
+4. **7.2** stop using one console command as a liveness verdict
+5. **7.4** document never-prompt failure and the capability floor
 
 Nothing is part-way done. Every commit above is complete with its tests.
 

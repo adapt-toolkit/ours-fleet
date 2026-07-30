@@ -207,3 +207,54 @@ describe('service managers no longer run the child-session loop (3.2)', () => {
     expect(plist).not.toMatch(/^\s*<key>KeepAlive<\/key><true\/>$/m);
   });
 });
+
+describe('install/uninstall outcomes are explicit and idempotent (6.2)', () => {
+  const answering = (table: Record<string, ExecResult>): Exec =>
+    async (cmd, args) => table[[cmd, ...args].join(' ')] ?? { stdout: '', stderr: '', code: 0 };
+
+  it('systemd reports whether it created the registration', async () => {
+    const enabled = answering({
+      'systemctl --user is-enabled ours-fleet-agent@A.service':
+        { stdout: 'enabled\n', stderr: '', code: 0 },
+    });
+    const fresh = answering({
+      'systemctl --user is-enabled ours-fleet-agent@A.service':
+        { stdout: '', stderr: 'not found', code: 1 },
+    });
+    expect(await makeSystemdBackend(fresh).install('A', '/b')).toMatchObject({ created: true });
+    expect(await makeSystemdBackend(enabled).install('A', '/b')).toMatchObject({ created: false });
+  });
+
+  it('systemd uninstall is idempotent and says whether anything was there', async () => {
+    const enabled = answering({
+      'systemctl --user is-enabled ours-fleet-agent@A.service':
+        { stdout: 'enabled\n', stderr: '', code: 0 },
+    });
+    const absent = answering({
+      'systemctl --user is-enabled ours-fleet-agent@A.service':
+        { stdout: '', stderr: '', code: 1 },
+    });
+    expect(await makeSystemdBackend(enabled).uninstall('A')).toMatchObject({ removed: true });
+    expect(await makeSystemdBackend(absent).uninstall('A')).toMatchObject({ removed: false });
+  });
+
+  it('launchd reports creation from the plist it had to write', async () => {
+    const { exec } = recorder();
+    const first = await makeLaunchdBackend(exec, 501).install('A', '/b');
+    expect(first).toMatchObject({ created: true });
+    const second = await makeLaunchdBackend(exec, 501).install('A', '/b');
+    expect(second).toMatchObject({ created: false });          // idempotent
+    expect(await makeLaunchdBackend(exec, 501).uninstall('A')).toMatchObject({ removed: true });
+    expect(await makeLaunchdBackend(exec, 501).uninstall('A')).toMatchObject({ removed: false });
+  });
+
+  it('the none backend reports whether a session was already there', async () => {
+    const noSession: Exec = async (_c, args) =>
+      ({ stdout: '', stderr: '', code: args[0] === 'kill-session' ? 1 : 0 });
+    const hadSession: Exec = async () => ({ stdout: '', stderr: '', code: 0 });
+    expect(await makeNoneBackend(noSession).install('A', '/b')).toMatchObject({ created: true });
+    expect(await makeNoneBackend(hadSession).install('A', '/b')).toMatchObject({ created: false });
+    expect(await makeNoneBackend(hadSession).uninstall('A')).toMatchObject({ removed: true });
+    expect(await makeNoneBackend(noSession).uninstall('A')).toMatchObject({ removed: false });
+  });
+});

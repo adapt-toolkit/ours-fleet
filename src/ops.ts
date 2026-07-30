@@ -7,7 +7,10 @@ import { findRole } from './config.js';
 import { getAdapter } from './harness/registry.js';
 import { generateBriefing } from './briefing.js';
 import { resetRestartLedger } from './runner.js';
-import type { SupervisorBackend } from './supervisor/types.js';
+import type { InstallOutcome as BackendInstallOutcome, SupervisorBackend } from './supervisor/types.js';
+
+/** An install outcome tagged with the role it belongs to. */
+export interface InstallOutcome extends BackendInstallOutcome { role: string }
 
 export interface OpsDeps {
   backend: SupervisorBackend;
@@ -64,7 +67,8 @@ function selectRoles(cfg: FleetConfig, names: string[]): ResolvedRole[] {
 export async function up(
   cfg: FleetConfig, names: string[], deps: OpsDeps, configPath?: string,
   identityGuarantee?: 'verified' | 'created' | 'unverified',
-): Promise<void> {
+): Promise<InstallOutcome[]> {
+  const outcomes: InstallOutcome[] = [];
   for (const role of selectRoles(cfg, names)) {
     const dir = applyRole(role, { configPath, identityGuarantee });
     // Only a *definite* stop boots fresh so the role reads the briefing we just
@@ -79,9 +83,12 @@ export async function up(
     if (live.state === 'stopped') rmSync(join(dir, '.booted'), { force: true });
     else if (live.state === 'unknown')
       deps.log(`  ! ${role.name}: liveness unknown, keeping session context — ${live.detail}`);
-    await deps.backend.install(role.name, deps.binPath);
+    // Report what each install actually did, so a creation transaction can undo
+    // only the registrations IT made (6.2).
+    outcomes.push({ ...await deps.backend.install(role.name, deps.binPath), role: role.name });
     deps.log(`↑ up: ${role.name} (harness: ${role.harness}, identity: ${role.identity}${role.cwd ? `, cwd: ${role.cwd}` : ''})`);
   }
+  return outcomes;
 }
 
 export async function down(cfg: FleetConfig, names: string[], deps: OpsDeps): Promise<void> {

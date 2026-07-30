@@ -123,6 +123,15 @@ export async function spawnPermanent(
           persona: o.personaFile ? readFileSync(o.personaFile, 'utf8').trim() : undefined },
         creation.identityProvisioner ?? daemonIdentityProvisioner(),
         deps.log);
+      if (guarantee.state === 'created')
+        // We minted it; a failed creation must not leave an orphan identity
+        // behind. Only ever removes an identity THIS transaction created.
+        tx.record({
+          stage: `ours identity ${effectiveIdentity(o)}`,
+          undo: async () => {
+            await creation.identityProvisioner?.remove?.(effectiveIdentity(o));
+          },
+        });
       mkdirSync(fleetDDir(), { recursive: true });
       const file = join(fleetDDir(), `${o.name}.yaml`);
       writeRoleFile(tx, file, stringify({
@@ -137,7 +146,16 @@ export async function spawnPermanent(
         stage: `state dir ${stateDir}`,
         undo: () => { if (!stateExisted) rmSync(stateDir, { recursive: true, force: true }); },
       });
-      await up(loadConfig(o.configPath), [o.name], deps, o.configPath, guarantee.state);
+      // Journal the service registration BEFORE it happens, and undo only the
+      // registrations this transaction actually created (6.2).
+      const registered: string[] = [];
+      tx.record({
+        stage: `service registration for ${o.name}`,
+        undo: async () => { for (const n of registered) await deps.backend.uninstall(n); },
+      });
+      const outcomes = await up(
+        loadConfig(o.configPath), [o.name], deps, o.configPath, guarantee.state);
+      for (const outcome of outcomes) if (outcome.created) registered.push(outcome.role);
       return file;
     },
     creation,

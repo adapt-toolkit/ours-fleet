@@ -1,4 +1,4 @@
-import { mkdirSync, writeFileSync, rmSync } from 'node:fs';
+import { existsSync, mkdirSync, writeFileSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
 import { home, logsRoot } from '../paths.js';
 import { realExec, type Exec } from '../exec.js';
@@ -46,10 +46,15 @@ export function makeLaunchdBackend(exec: Exec = realExec, uid: number = process.
     async install(name, binPath) {
       mkdirSync(agentsDir(), { recursive: true });
       mkdirSync(logsRoot(), { recursive: true });
+      // The plist's prior existence is the record of whether we created this.
+      const existed = existsSync(plistPath(name));
       writeFileSync(plistPath(name), plist(name, binPath));
       await exec('launchctl', ['bootout', `${domain}/${labelFor(name)}`]); // best-effort refresh
       const r = await exec('launchctl', ['bootstrap', domain, plistPath(name)]);
       if (r.code !== 0) throw new Error(`launchctl bootstrap ${labelFor(name)} failed: ${r.stderr.trim()}`);
+      return existed
+        ? { created: false, detail: `${labelFor(name)} was already installed` }
+        : { created: true, detail: `installed ${labelFor(name)}` };
     },
     async start(name) {
       const r = await exec('launchctl', ['bootstrap', domain, plistPath(name)]);
@@ -85,8 +90,12 @@ export function makeLaunchdBackend(exec: Exec = realExec, uid: number = process.
       };
     },
     async uninstall(name) {
-      await exec('launchctl', ['bootout', `${domain}/${labelFor(name)}`]);
+      const existed = existsSync(plistPath(name));
+      await exec('launchctl', ['bootout', `${domain}/${labelFor(name)}`]);   // idempotent
       rmSync(plistPath(name), { force: true });
+      return existed
+        ? { removed: true, detail: `removed ${labelFor(name)}` }
+        : { removed: false, detail: `${labelFor(name)} was not installed` };
     },
     logsArgs(name, follow) {
       const log = join(logsRoot(), `${name}.log`);

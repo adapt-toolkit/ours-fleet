@@ -13,8 +13,11 @@ export function makeNoneBackend(exec: Exec = realExec): SupervisorBackend {
     id: 'none',
     async init() { return ['no supervisor: sessions are plain tmux (no reboot survival)']; },
     async install(name, binPath) {
-      await tmux.kill(name);
+      const existed = await tmux.kill(name);        // true when a session was there
       await tmux.newSession(name, process.cwd(), `${shq(binPath)} _run ${shq(name)}`);
+      return existed
+        ? { created: false, detail: `replaced the existing tmux session '${name}'` }
+        : { created: true, detail: `created tmux session '${name}'` };
     },
     async start(name) { throw new Error(`'${name}' has no unit under the none backend — use install/spawn`); },
     async stop(name) { await tmux.kill(name); },
@@ -28,7 +31,12 @@ export function makeNoneBackend(exec: Exec = realExec): SupervisorBackend {
       if (r.code === 1) return { state: 'stopped', detail: `no tmux session '${name}'` };
       return { state: 'unknown', detail: `tmux has-session '${name}' failed (${r.code}): ${r.stderr.trim() || 'no output'}` };
     },
-    async uninstall(name) { await tmux.kill(name); },
+    async uninstall(name) {
+      const killed = await tmux.kill(name);         // idempotent
+      return killed
+        ? { removed: true, detail: `killed tmux session '${name}'` }
+        : { removed: false, detail: `no tmux session '${name}'` };
+    },
     logsArgs(name) { return { cmd: 'tmux', args: ['capture-pane', '-t', name, '-p'] }; },
   };
 }
