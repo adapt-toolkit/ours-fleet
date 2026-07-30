@@ -4,6 +4,7 @@ import { realExec, type Exec } from '../exec.js';
 import type { ResolvedRole } from '../config.js';
 import type {
   HarnessAdapter, RoleDirs, SessionPrep, SessionState, Launch, ValidationError,
+  UnattendedCapability,
 } from './types.js';
 import { registerAdapter } from './registry.js';
 import { bundledAcpAgent } from './acp-agent.js';
@@ -30,6 +31,18 @@ const LAUNCHERS = ['auto', 'ours-codex', 'codex'];
 const SANDBOX_MODES = ['read-only', 'workspace-write', 'danger-full-access'];
 /** Codex CLI's accepted `--ask-for-approval` values. */
 const APPROVAL_POLICIES = ['untrusted', 'on-request', 'never'];
+
+/**
+ * What an unattended role can actually do under Codex's native settings.
+ * `on-request` and `untrusted` stop to ask, and with no console attached that
+ * request is refused rather than answered — so the role can only read.
+ */
+export function codexCapabilities(approval: string, sandbox: string): UnattendedCapability[] {
+  if (approval !== 'never') return ['read-state'];
+  const caps: UnattendedCapability[] = ['read-state', 'messaging', 'monitor', 'status-commands'];
+  if (sandbox !== 'read-only') caps.push('write-state', 'workspace-edit');
+  return caps;
+}
 
 /** Resolve & validate the per-role sandbox mode, throwing on an unknown value. */
 function sandboxMode(role: ResolvedRole): string | undefined {
@@ -215,18 +228,18 @@ export function makeCodexAdapter(exec: Exec = realExec): HarnessAdapter {
     },
 
     translatePermissions(permissions) {
+      const approval = permissions.approval === 'allow' ? 'never' : 'on-request';
+      const sandbox = permissions.filesystem === 'read-only'
+        ? 'read-only'
+        : permissions.filesystem === 'unrestricted'
+          ? 'danger-full-access'
+          : 'workspace-write';
       return {
         supported: true,
-        native: {
-          approval: permissions.approval === 'allow' ? 'never' : 'on-request',
-          sandbox: permissions.filesystem === 'read-only'
-            ? 'read-only'
-            : permissions.filesystem === 'unrestricted'
-              ? 'danger-full-access'
-              : 'workspace-write',
-        },
+        native: { approval, sandbox },
         exact: true,
         warnings: [],
+        capabilities: codexCapabilities(approval, sandbox),
       };
     },
 

@@ -134,6 +134,20 @@ export async function doctor(
         ? `${summary} — ${analysis.warnings.join('; ')}`
         : `${summary} (exact)`,
     });
+
+    // The floor is checked BEFORE start (2.1): an under-permissioned unattended
+    // role never reports its own failure, because the denial happens inside the
+    // harness with nobody attached to see it.
+    const floor = analysis.floor!;
+    checks.push({
+      name: `unattended floor: ${analysis.role}`,
+      ok: floor.meets || analysis.floorSeverity !== 'fail',
+      detail: floor.meets
+        ? `grants ${analysis.capabilities!.join(', ')}`
+        : `MISSING ${floor.missing.join(', ')} — with unattended=${p.unattended} these requests will `
+          + `${p.unattended === 'deny' ? 'be denied silently' : 'block the turn'}; `
+          + `grants only ${analysis.capabilities!.join(', ') || '(nothing)'}`,
+    });
   }
 
   // Isolation reporting (AC-9). Backend availability is advisory — isolation is

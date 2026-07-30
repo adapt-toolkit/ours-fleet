@@ -13,6 +13,9 @@ const FORCED_STOP_REASON = process.env.ACP_FIXTURE_STOP_REASON;
 // can let a normal session finish instead of blocking forever.
 const EXIT_AFTER = parseInt(process.env.ACP_FIXTURE_EXIT_AFTER ?? '0', 10) || 0;
 const EXIT_CODE = parseInt(process.env.ACP_FIXTURE_EXIT_CODE ?? '0', 10) || 0;
+// Request a tool permission on EVERY prompt, including ones whose text the test
+// does not control (the runner's own startup prompt).
+const ALWAYS_PERMISSION = process.env.ACP_FIXTURE_ALWAYS_PERMISSION === '1';
 let promptsAnswered = 0;
 
 const stopReasonFor = text =>
@@ -120,7 +123,7 @@ createInterface({ input: process.stdin }).on('line', line => {
         // releases itself so the test never depends on a second prompt getting
         // through — prompts are serialized, so one never could.
         setTimeout(() => answerPrompt(message.id, 'end_turn'), Number(slow[1] ?? 800));
-      } else if (text.includes('permission')) {
+      } else if (ALWAYS_PERMISSION || text.includes('permission')) {
         // "twice" asks for the SAME tool two times in one turn, so a test can
         // check that each request is decided independently.
         const times = /\btwice\b/i.test(text) ? 2 : 1;

@@ -484,6 +484,32 @@ describe('runOnce ACP startup outcome (1.2)', () => {
     }
   }, 20_000);
 
+  it('a floor-compliant role starts with ZERO permission prompts (2.1)', async () => {
+    // The startup prompt makes the agent request a tool permission. A role whose
+    // resolved permissions clear the floor must have it granted automatically —
+    // nothing pending, nothing denied, and the turn completes.
+    writeCfg({ A: {
+      harness: 'fake-acp', session: 'acp',
+      permissions: { approval: 'allow', filesystem: 'workspace', unattended: 'deny' },
+      env: { ACP_FIXTURE_EXIT_AFTER: '1', ACP_FIXTURE_ALWAYS_PERMISSION: '1' },
+    } });
+    const d = agentDir('A');
+    rmSync(d, { recursive: true, force: true });
+    mkdirSync(d, { recursive: true });
+    const { deps, logs } = acpDeps();
+
+    await runOnce('A', {}, deps);
+
+    const events = readFileSync(join(d, '.session-events.jsonl'), 'utf8')
+      .trim().split('\n').map(l => JSON.parse(l) as { kind: string; status?: string; decision?: string });
+    const permissions = events.filter(e => e.kind === 'permission');
+    expect(permissions.length).toBeGreaterThan(0);                    // one was requested
+    expect(permissions.every(e => e.status === 'completed')).toBe(true);  // none left pending
+    expect(permissions.every(e => e.decision === 'allowed')).toBe(true);  // and none denied
+    expect(logs.some(l => l.includes('[A] up;'))).toBe(true);
+    expect(events.some(e => e.kind === 'turn_stop')).toBe(true);      // the turn finished
+  }, 20_000);
+
   it('a completed startup prompt does log the role up', async () => {
     writeCfg({ A: {
       harness: 'fake-acp', session: 'acp',

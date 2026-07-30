@@ -466,3 +466,69 @@ describe('doctor permission translation (2.3)', () => {
     expect(c.detail).toContain('it has no permission model');
   });
 });
+
+describe('doctor unattended capability floor (2.1)', () => {
+  const HEALTHY = {
+    'tmux -V': { stdout: 'tmux 3.4', stderr: '', code: 0 },
+    'ours-mcp --version': { stdout: '0.1.2', stderr: '', code: 0 },
+    'ours-mcp status': { stdout: 'running', stderr: '', code: 0 },
+    'loginctl show-user': { stdout: 'Linger=yes', stderr: '', code: 0 },
+  };
+  const run = () => doctor({}, execWith(HEALTHY), 'linux', stubFetch());
+  const writeCfg = (yaml: string) => writeFileSync(join(dir, 'fleet.yaml'), yaml);
+  const floor = (rep: Awaited<ReturnType<typeof doctor>>, role: string) =>
+    rep.checks.find(c => c.name === `unattended floor: ${role}`)!;
+
+  it('fails an under-permissioned unattended role before it is ever started', async () => {
+    writeCfg('roles:\n  Worker:\n    harness: claude-code\n'
+      + '    permissions:\n      approval: ask\n      unattended: deny\n');
+    const rep = await run();
+    const c = floor(rep, 'Worker');
+    expect(c.ok).toBe(false);
+    expect(c.detail).toContain('MISSING');
+    expect(c.detail).toContain('workspace-edit');
+    expect(c.detail).toContain('denied silently');
+    expect(rep.ok).toBe(false);                    // and the command exits non-zero
+  });
+
+  it('passes a floor-compliant role and lists what it grants', async () => {
+    writeCfg('roles:\n  Worker:\n    harness: claude-code\n'
+      + '    permissions:\n      approval: allow\n      filesystem: workspace\n      unattended: deny\n');
+    const c = floor(await run(), 'Worker');
+    expect(c.ok).toBe(true);
+    expect(c.detail).toContain('workspace-edit');
+    expect(c.detail).toContain('messaging');
+  });
+
+  it('warns rather than fails when the role waits instead of denying', async () => {
+    writeCfg('roles:\n  Worker:\n    harness: claude-code\n'
+      + '    permissions:\n      approval: ask\n      unattended: wait\n');
+    const c = floor(await run(), 'Worker');
+    expect(c.ok).toBe(true);                       // a human can still attach…
+    expect(c.detail).toContain('MISSING');         // …but the shortfall is still stated
+    expect(c.detail).toContain('block the turn');
+  });
+
+  it('checks Codex roles on the same floor', async () => {
+    writeCfg('roles:\n  Under:\n    harness: codex\n'
+      + '    permissions:\n      approval: ask\n      unattended: deny\n'
+      + '  Ok:\n    harness: codex\n'
+      + '    permissions:\n      approval: allow\n      filesystem: workspace\n      unattended: deny\n');
+    const rep = await run();
+    expect(floor(rep, 'Under').ok).toBe(false);
+    expect(floor(rep, 'Ok').ok).toBe(true);
+  });
+
+  it('a read-only allow role is failed for exactly the write capabilities', async () => {
+    writeCfg('roles:\n  Reader:\n    harness: claude-code\n'
+      + '    permissions:\n      approval: allow\n      filesystem: read-only\n      unattended: deny\n');
+    const c = floor(await run(), 'Reader');
+    expect(c.ok).toBe(false);
+    const missing = /MISSING ([^—]+)/.exec(c.detail)![1];
+    expect(missing).toContain('write-state');
+    expect(missing).toContain('workspace-edit');
+    expect(missing).not.toContain('messaging');    // messaging IS granted
+    expect(c.detail).toContain('grants only');
+    expect(c.detail).toContain('messaging');
+  });
+});

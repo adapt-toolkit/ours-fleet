@@ -141,6 +141,34 @@ The backend translates this common intent. Harness-native settings in
 \`allow\`/\`unrestricted\`, Codex \`never\`/\`danger-full-access\`, or Claude
 \`bypassPermissions\` without explicit authorization.
 
+### The unattended capability floor
+
+An unattended role has no console, so a permission request cannot be answered —
+it is refused, silently, inside the harness. The agent then does less than it
+was told to and reports no error. To make that visible before launch,
+\`ours-fleet config\` and \`ours-fleet doctor\` resolve each role's neutral
+permissions through its harness and check the result against a fixed floor:
+
+- \`read-state\` — read its briefing, ROUTINES.md, and WORKLOG.md
+- \`write-state\` — append its WORKLOG and its own state files
+- \`messaging\` — bind its identity, send and receive ours mail
+- \`monitor\` — arm and observe its mail monitor
+- \`workspace-edit\` — edit and test files in its working directory
+- \`status-commands\` — run the inspection commands its briefing prescribes
+
+\`doctor\` reports this per role as \`unattended floor: <Role>\`. A role with
+\`unattended: deny\` that cannot meet the floor FAILS doctor, because it will
+deny those requests with nobody to see it; with \`unattended: wait\` it warns,
+because a human can still attach and answer.
+
+Security meaning: \`approval: allow\` maps to Claude's \`bypassPermissions\`,
+which genuinely permits the actions the role was authorized to take —
+\`dontAsk\` only suppresses the prompt while still refusing the action. Nothing
+other than an explicit \`allow\` is elevated: \`ask\` stays on Claude's default
+mode and \`deny\` maps to \`plan\`. \`allow\` is therefore a real grant and
+requires explicit authorization; per-role \`isolation:\` remains the outer
+boundary that a permission mode cannot cross.
+
 Claude \`harness_options\`: \`permission_mode\` (default, acceptEdits, plan,
 dontAsk, bypassPermissions), \`plugins\`, \`mem_palace\`, and
 \`mem_palace_midsession_autosave\`.

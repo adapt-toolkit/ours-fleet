@@ -4,7 +4,7 @@ import { home } from '../paths.js';
 import { realExec, type Exec } from '../exec.js';
 import type { ResolvedRole } from '../config.js';
 import type {
-  HarnessAdapter, RoleDirs, SessionPrep, SessionState, Launch, ValidationError,
+  HarnessAdapter, RoleDirs, SessionPrep, SessionState, Launch, UnattendedCapability, ValidationError,
 } from './types.js';
 import { registerAdapter } from './registry.js';
 import { bundledAcpAgent } from './acp-agent.js';
@@ -20,14 +20,49 @@ const OPTION_KEYS = ['plugins', 'mem_palace', 'mem_palace_midsession_autosave', 
 /** Claude Code's accepted --permission-mode values. */
 const PERMISSION_MODES = ['default', 'acceptEdits', 'plan', 'dontAsk', 'bypassPermissions'];
 
+/**
+ * Neutral approval → native Claude mode. The ONE definition, shared by launch
+ * and by translation so the two can never disagree about what a role will run
+ * with.
+ *
+ * `allow` maps to `bypassPermissions`, not `dontAsk`. `dontAsk` suppresses the
+ * PROMPT, not the denial: an unattended role configured with the operator's
+ * explicit `approval: allow` was silently refused the actions it was told to
+ * take, with no prompt and no error to show for it. Only an explicit `allow`
+ * gets this; `ask` and `deny` are never elevated.
+ */
+export function nativePermissionMode(
+  approval: ResolvedRole['permissions']['approval'],
+): string | undefined {
+  switch (approval) {
+    case 'allow': return 'bypassPermissions';
+    case 'deny': return 'plan';
+    default: return undefined;               // 'ask' → Claude's own default
+  }
+}
+
+/**
+ * What an unattended role can actually do under a native mode. Derived from the
+ * NATIVE mode, so an operator's explicit `harness_options.permission_mode`
+ * override is judged on what it really grants.
+ */
+export function claudeCapabilities(
+  mode: string | undefined, filesystem: ResolvedRole['permissions']['filesystem'],
+): UnattendedCapability[] {
+  // `plan` may not act at all; `default` and `acceptEdits` still stop to ask,
+  // and with no console attached that request is refused rather than answered.
+  if (mode !== 'bypassPermissions' && mode !== 'dontAsk') return ['read-state'];
+  // `dontAsk` reaches the tools but is refused the actions behind them.
+  if (mode === 'dontAsk') return ['read-state', 'status-commands'];
+  const caps: UnattendedCapability[] = ['read-state', 'messaging', 'monitor', 'status-commands'];
+  if (filesystem !== 'read-only') caps.push('write-state', 'workspace-edit');
+  return caps;
+}
+
 /** Resolve & validate the per-role permission mode, throwing on an unknown value. */
 function permissionMode(role: ResolvedRole): string | undefined {
   const pm = (role.harness_options as ClaudeOptions | undefined)?.permission_mode;
-  if (pm == null) {
-    if (role.permissions?.approval === 'allow') return 'dontAsk';
-    if (role.permissions?.approval === 'deny') return 'plan';
-    return undefined;
-  }
+  if (pm == null) return nativePermissionMode(role.permissions?.approval);
   if (!PERMISSION_MODES.includes(pm))
     throw new Error(
       `invalid harness_options.permission_mode "${pm}"; allowed: ${PERMISSION_MODES.join(', ')}`);
@@ -144,11 +179,7 @@ export function makeClaudeCodeAdapter(exec: Exec = realExec): HarnessAdapter {
     },
 
     translatePermissions(permissions) {
-      const native = permissions.approval === 'allow'
-        ? 'dontAsk'
-        : permissions.approval === 'deny'
-          ? 'plan'
-          : 'default';
+      const native = nativePermissionMode(permissions.approval) ?? 'default';
       const exact = permissions.filesystem === 'workspace' && permissions.approval === 'ask';
       return {
         supported: true,
@@ -157,6 +188,7 @@ export function makeClaudeCodeAdapter(exec: Exec = realExec): HarnessAdapter {
         warnings: exact ? [] : [
           'Claude permission modes do not exactly represent independent approval and filesystem intent; fleet isolation remains the outer boundary',
         ],
+        capabilities: claudeCapabilities(native, permissions.filesystem),
       };
     },
 

@@ -253,6 +253,39 @@ role's `harness_options`, so a fleet can set common Codex permission/profile def
 and override individual keys per role. `monitor` merges the same way — a role block
 overrides `defaults.monitor` key-by-key.
 
+### The unattended capability floor
+
+A fleet role runs with no console attached, so a permission request has nobody
+to answer it and is refused inside the harness — silently. The agent then does
+less than its briefing told it to and reports no error at all.
+
+`ours-fleet config` and `ours-fleet doctor` therefore resolve each role's
+neutral `permissions:` through its harness adapter and check what the resulting
+native settings actually grant, against a fixed floor:
+
+| capability | what the role must be able to do |
+| --- | --- |
+| `read-state` | read its briefing, `ROUTINES.md`, and `WORKLOG.md` |
+| `write-state` | append its `WORKLOG.md` and its own state files |
+| `messaging` | bind its identity, send and receive ours mail |
+| `monitor` | arm and observe its mail monitor |
+| `workspace-edit` | edit and test files in its working directory |
+| `status-commands` | run the inspection commands its briefing prescribes |
+
+`doctor` reports this per role as `unattended floor: <Role>`. A role configured
+`unattended: deny` that cannot meet the floor **fails** doctor — it would deny
+those requests with nobody to see it. With `unattended: wait` it **warns**,
+since a human can still attach a console and answer.
+
+**Security meaning.** `approval: allow` maps to Claude's `bypassPermissions`,
+the mode that actually permits the actions the role was authorized to take.
+`dontAsk` suppresses only the *prompt*, not the denial, which is why an
+`allow` role previously ran unable to do its job. Nothing but an explicit
+`allow` is elevated: `ask` keeps Claude's default mode and `deny` maps to
+`plan`. `allow` is a real grant — give it deliberately, and keep per-role
+[`isolation:`](#agent-isolation) as the outer boundary, which no permission
+mode can cross.
+
 ### Start staggering
 
 `start_stagger_ms` (top-level, host-wide, default `0`) spaces out agent **launches**

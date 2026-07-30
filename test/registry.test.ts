@@ -14,6 +14,9 @@ export const fakeAdapter: HarnessAdapter = {
       native: { fake_mode: permissions.approval },
       exact: permissions.approval === 'ask',
       warnings: permissions.approval === 'ask' ? [] : ['the fake harness only approximates this'],
+      capabilities: [
+        'read-state', 'write-state', 'messaging', 'monitor', 'workspace-edit', 'status-commands',
+      ],
     };
   },
   buildLaunch(role, mode, s, prep) {

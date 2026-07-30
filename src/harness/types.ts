@@ -23,8 +23,29 @@ export interface AcpLaunch { argv: string[]; env: Record<string, string> }
  * implemented it was indistinguishable from one that had nothing to say — and
  * the warnings the implementations DID produce had no caller at all.
  */
+/**
+ * What an unattended agent must actually be able to DO to run its own briefing.
+ * A role that cannot meet this floor does not fail loudly — it silently does
+ * less than it was asked to, because the denial happens inside the harness with
+ * nobody to see it.
+ */
+export type UnattendedCapability =
+  | 'read-state'        // read its briefing, ROUTINES.md and WORKLOG.md
+  | 'write-state'       // append its WORKLOG and its own state files
+  | 'messaging'         // bind an identity, send and receive ours mail
+  | 'monitor'           // arm and observe its mail monitor
+  | 'workspace-edit'    // edit and test files in its working directory
+  | 'status-commands';  // run the inspection commands its briefing prescribes
+
 export type PermissionTranslation =
-  | { supported: true; native: Record<string, unknown>; exact: boolean; warnings: string[] }
+  | {
+      supported: true;
+      native: Record<string, unknown>;
+      exact: boolean;
+      warnings: string[];
+      /** What the native settings above actually permit, unattended. */
+      capabilities: UnattendedCapability[];
+    }
   | { supported: false; reason: string };
 
 /** Harness-correct wording/tool names used to generate briefing.md. */

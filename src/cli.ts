@@ -14,7 +14,7 @@ import { up, down, restartRoles, rmRole, type OpsDeps } from './ops.js';
 import { runOnce, runTemp } from './runner.js';
 import { spawnPermanent, spawnTemp, type SpawnOpts } from './spawn.js';
 import { doctor } from './doctor.js';
-import { analyzeFleetPermissions, formatNative } from './permissions.js';
+import { allWarnings, analyzeFleetPermissions, formatNative } from './permissions.js';
 import { AI_DOCS } from './docs.js';
 import {
   controlRequest, controlSocketPath, followControl, livenessNote,
@@ -147,7 +147,7 @@ cOpt(program.command('config').description('validate + print the merged plan (no
           console.log(`    isolation:   backend=${iso.backend ?? 'auto'} net=${iso.network ?? 'broker'} `
             + `on_unavailable=${iso.on_unavailable ?? 'warn'} caps=${caps}`);
         }
-        for (const w of perms?.warnings ?? []) console.log(`    warning:     ${w}`);
+        for (const w of perms ? allWarnings(perms) : []) console.log(`    warning:     ${w}`);
       }
     } catch (e) { die(e); }
   });
