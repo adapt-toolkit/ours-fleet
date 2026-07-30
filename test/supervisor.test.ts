@@ -3,6 +3,7 @@ import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { makeSystemdBackend, makeLaunchdBackend, makeNoneBackend, pickBackend, unitFor, labelFor } from '../src/supervisor/index.js';
+import { classifyStart } from '../src/supervisor/launchd.js';
 import type { Exec, ExecResult } from '../src/exec.js';
 
 let dir: string;
@@ -434,6 +435,122 @@ describe('a failed registration leaves no artifact (6.2)', () => {
       await expect(makeSystemdBackend(exec).install('A', '/b')).rejects.toThrow(/enable --now/);
       expect(calls).toContainEqual(
         ['systemctl', '--user', 'disable', '--now', 'ours-fleet-agent@A.service']);
+    });
+  });
+
+  /**
+   * The launchd half of the same fix.
+   *
+   * `launchctl bootstrap` exits 0 once the job is LOADED; `RunAtLoad` then
+   * starts the program asynchronously, so the exit code is a statement about the
+   * load and not about the program. NOT VERIFIED against a real launchctl —
+   * there is no macOS host here, so these tests drive the parser and the
+   * decision, not macOS itself. What IS verified is that the decision is the
+   * same one systemd's makes from the same kind of evidence.
+   */
+  describe('the exit code is not the signal: the start is verified (launchd)', () => {
+    /** bootstrap exit code, then whatever `launchctl print` should report. */
+    const launchctl = (bootstrapCode: number, print: { stdout?: string; stderr?: string; code?: number }): {
+      calls: string[][]; exec: Exec;
+    } => {
+      const calls: string[][] = [];
+      const exec: Exec = async (cmd, args): Promise<ExecResult> => {
+        calls.push([cmd, ...args]);
+        if (args[0] === 'bootstrap') return { stdout: '', stderr: '', code: bootstrapCode };
+        if (args[0] === 'print')
+          return { stdout: print.stdout ?? '', stderr: print.stderr ?? '', code: print.code ?? 0 };
+        return { stdout: '', stderr: '', code: 0 };
+      };
+      return { calls, exec };
+    };
+    const launchAgent = () => join(dir, 'Library/LaunchAgents/network.ours.fleet.A.plist');
+
+    it('a job left DEAD by a zero-exit bootstrap is a failed install', async () => {
+      const { calls, exec } = launchctl(0, {
+        stdout: 'network.ours.fleet.A = {\n\tstate = not running\n\tlast exit code = 1\n}',
+      });
+      const err = await makeLaunchdBackend(exec, 501).install('A', '/b').then(() => null, e => e as Error);
+      expect(err, 'install resolved on a dead job').not.toBeNull();
+      expect(err!.message).toContain('reported success but the job is not running');
+      expect(err!.message).toContain('last exit = 1');
+      // and it entered the SAME rollback path as a failed bootstrap: nothing
+      // is left behind, on disk or in the domain.
+      expect(existsSync(launchAgent())).toBe(false);
+      expect(calls.filter(c => c[1] === 'bootout').length).toBeGreaterThanOrEqual(2);
+    });
+
+    it('a job that bootstrap loaded but the domain does not have is a failed install', async () => {
+      const { exec } = launchctl(0, {
+        stderr: 'Could not find service "network.ours.fleet.A" in domain for gui/501', code: 113,
+      });
+      await expect(makeLaunchdBackend(exec, 501).install('A', '/b'))
+        .rejects.toThrow(/not running.*not loaded in the domain/s);
+      expect(existsSync(launchAgent())).toBe(false);
+    });
+
+    it('a job that really started installs normally, and says what state it is in', async () => {
+      const { calls, exec } = launchctl(0, { stdout: '\tstate = running\n\tpid = 4242\n' });
+      expect(await makeLaunchdBackend(exec, 501).install('A', '/b'))
+        .toMatchObject({ created: true, detail: 'installed network.ours.fleet.A (state = running)' });
+      expect(existsSync(launchAgent())).toBe(true);
+      expect(calls.filter(c => c[1] === 'bootout').length).toBe(1);   // the pre-bootstrap refresh only
+    });
+
+    it('a job WAITING for a KeepAlive restart is not a failed start', async () => {
+      // launchd is still working on it — the launchd analogue of `activating`.
+      const { exec } = launchctl(0, { stdout: '\tstate = waiting\n\tlast exit code = 1\n' });
+      await expect(makeLaunchdBackend(exec, 501).install('A', '/b'))
+        .resolves.toMatchObject({ created: true });
+    });
+
+    it('not running with NOTHING exited yet is not a failed start — RunAtLoad is async', async () => {
+      // The program has not been spawned yet. Reading this as a failure would
+      // roll back healthy roles on a slow host, which is the asynchrony trap.
+      const { exec } = launchctl(0, { stdout: '\tstate = not running\n' });
+      await expect(makeLaunchdBackend(exec, 501).install('A', '/b'))
+        .resolves.toMatchObject({ created: true });
+    });
+
+    it('an UNANSWERABLE probe is never read as a failed start (1.1)', async () => {
+      // launchd may be perfectly fine and launchctl merely unable to answer.
+      const { exec } = launchctl(0, { stderr: 'Bootstrap failed: 5: Input/output error', code: 5 });
+      await expect(makeLaunchdBackend(exec, 501).install('A', '/b'))
+        .resolves.toMatchObject({ created: true });
+      expect(existsSync(launchAgent())).toBe(true);
+    });
+
+    it('a plist that was ALREADY there is not deleted by the verification', async () => {
+      await makeLaunchdBackend(recorder().exec, 501).install('A', '/b');   // pre-existing
+      const { exec } = launchctl(0, { stdout: '\tstate = not running\n\tlast exit code = 78\n' });
+      await expect(makeLaunchdBackend(exec, 501).install('A', '/b')).rejects.toThrow(/not running/);
+      expect(existsSync(launchAgent())).toBe(true);                        // not ours to remove
+    });
+
+    it('reads every spelling launchd uses for the last-exit line', async () => {
+      for (const line of ['last exit code = 1', 'last exit status = 256', 'last exit reason = Killed']) {
+        const { exec } = launchctl(0, { stdout: `\tstate = not running\n\t${line}\n` });
+        await expect(makeLaunchdBackend(exec, 501).install('A', '/b'), line).rejects.toThrow(/not running/);
+        expect(existsSync(launchAgent()), line).toBe(false);   // rolled back each time
+      }
+    });
+
+    it('an unrecognised last-exit spelling yields unknown, never a false failure', async () => {
+      // The spelling is not stable across macOS releases and cannot be checked
+      // from here, so a line this does not recognise must not fail the install.
+      const { exec } = launchctl(0, { stdout: '\tstate = not running\n\tlast termination = 9\n' });
+      await expect(makeLaunchdBackend(exec, 501).install('A', '/b'))
+        .resolves.toMatchObject({ created: true });
+    });
+
+    it('classifyStart keeps liveness distinct: a loaded dead job is still LIVE for 1.1', async () => {
+      // The two questions differ. `install` asks whether the job started;
+      // `liveness` asks whether the role's context still exists, and a loaded
+      // job — even one between KeepAlive restarts — answers yes (1.1).
+      const dead = '\tstate = not running\n\tlast exit code = 1\n';
+      expect(classifyStart({ loaded: true, notFound: false, state: 'not running', lastExit: '1' }).started)
+        .toBe('no');
+      const l = await makeLaunchdBackend(launchctl(0, { stdout: dead }).exec, 501).liveness('A');
+      expect(l).toEqual({ state: 'running', detail: 'loaded (state = not running)' });
     });
   });
 
