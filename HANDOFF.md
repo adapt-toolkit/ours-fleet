@@ -47,6 +47,7 @@ Baseline before any work: **339 passed**.
 | (6.2) failed service registration leaves no artifact | `14748cd` | 580 |
 | 7.1 rewrite the spawn skills from one source of truth | `580372b` | 593 |
 | 7.2 stop using one console command as a liveness verdict | `39943f9` | 611 |
+| (6.2) verify the unit started; the exit code is not the signal | `4023e72` | 618 |
 
 **All 22 scoped fixes are committed with tests**, plus one defect found in 6.2 after the fact
 (see below). Sections 1 through 6 are complete.
@@ -84,9 +85,28 @@ suspected "throws with the unit left enabled" path is NOT reachable via a start 
 The disable-on-failure cleanup was kept anyway, because the exit code is the only signal
 available and its meaning varies by systemd version.
 
-**Flagged, not built:** because `enable --now` returns 0 on a failed start, a permanent spawn on
-systemd 255 can report success while the unit is enabled and dead. Out of the given scope and not
-in `IMPLEMENTATION.md`.
+### 6.2 (second) — the exit code was not the signal (`4023e72`)
+
+The measurement above was first flagged rather than built; the owner then ruled it in, as
+fixable entirely within this repository. Because `enable --now` returns 0 on a failed start,
+`install` reported success and `ours-fleet spawn` reported a created role while that role's unit
+sat enabled and dead.
+
+After a zero-exit `enable --now`, the unit is now asked its own `ActiveState` through the same
+machine-readable probe `liveness` uses — extracted to a shared `probeLiveness` so the two cannot
+disagree about what "running" means. **Version-independent by construction:** a non-zero code
+still fails the install as before, and a definite stop fails it even when the code is 0, so a
+systemd that behaves either way is covered without the code knowing which it is on. Only a
+DEFINITE stop counts — an unanswerable probe is `unknown` and is never read as a failed start
+(1.1), and `activating` is not a stop. A failed start enters the same rollback path as any other
+failed registration.
+
+**A test fixture was unfaithful and is corrected.** `systemdSaying` in `test/ops.test.ts`
+answered every `show` with one constant state, replaying the pre-install state to the post-install
+probe — describing a unit that never started, and making the new check look wrong on three 1.1
+tests. It now reports the given state to the pre-install probe and `active (running)` afterwards.
+Worth remembering as its own category: a fixture that cannot distinguish before from after will
+refute a correct finding.
 
 ### 7.1 — the spawn skills (`580372b`)
 
@@ -119,24 +139,38 @@ values, each with what it proves, what to do, and a `restartJustified` flag true
 `src/briefing.ts` renders it; both oversee-agents skills carry the same lines verbatim and in
 order, enforced by test.
 
+### Owner's rulings on the three items Implementer-2 raised (do not re-litigate)
+
+- **The `enable --now` truthfulness gap — TAKEN.** Fixable entirely within this repository, so it
+  belongs in this release. Built as `4023e72`.
+- **6.4's atomicity against other ours daemon clients — OUT, settled.** It needs the daemon
+  endpoint, which lives in another repository. The three-operation contract is written out below;
+  hand it to whoever owns the daemon. This is decided, not pending.
+- **The `UNATTENDED_FLOOR` list — STANDS as implemented.** The six named capabilities are the
+  release's definition. Decided, not pending.
+
 ### Mutation checks (evidence, not confidence)
 
 - removed `deps.onInstalled?.(outcome)` from `ops.ts` → the spawn rollback test fails;
 - removed either backend's install cleanup → its supervisor test fails;
+- removed the post-install start verification → four supervisor tests fail;
 - restored the old `--approval ask … --unattended deny` recipe in a skill → three 7.1 tests fail;
 - removed one floor capability from a skill → the capability test fails;
 - paraphrased one taxonomy line in a skill → two 7.2 skill tests fail;
 - marked `timeout` as restart-justified → two 7.2 briefing tests fail.
 
-### State at `39943f9`
+### State at `4023e72`
 
-`tsc` clean, `npm run build` succeeds, **26 files, 611 passed, 0 failed, 0 skipped**. The 5.1
+`tsc` clean, `npm run build` succeeds, **26 files, 618 passed, 0 failed, 0 skipped**. The 5.1
 sandbox tests RAN (banner: `bubblewrap 0.11.0`). Working tree clean apart from untracked
 `IMPLEMENTATION.md`.
 
 **Not verified by Implementer-2, in those words:** launchd against a real `launchctl` (no macOS
 host — unit-tested only); the skill-only spawn acceptance run against real `claude` and `codex`
-CLIs (soak check 9); all 13 soak checks.
+CLIs (soak check 9); all 13 soak checks; **systemd versions other than 255** — the `enable --now`
+behaviour was measured there only, and while the fix is written not to depend on which way a
+version behaves, that independence has been exercised against fakes rather than against another
+real systemd.
 
 ---
 
