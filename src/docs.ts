@@ -162,6 +162,36 @@ resources:
 Invalid files are rejected before anything is created: no config, no state
 directory, no identity reservation. Works for both permanent and \`--temp\` roles.
 
+### Never-prompt failure
+
+The failure this section exists to prevent leaves no error message anywhere.
+
+An unattended role has no console. When the harness needs a permission decision
+there is nobody to ask, so the request is refused INSIDE the harness — no
+prompt, no error, no log line. The agent simply does less than its briefing told
+it to, reports success, and nothing distinguishes that from having done the
+work. Two settings produce it:
+
+1. a permission mode that suppresses the prompt without granting the action
+   (Claude \`dontAsk\`, which is why neutral \`allow\` maps to
+   \`bypassPermissions\` instead); and
+2. \`unattended: deny\`, which refuses every request that reaches it.
+
+**Automatic decisions are now recorded.** Every permission request decided
+without a human emits a completed event into
+\`~/.ours-fleet/agents/<Name>/.session-events.jsonl\` carrying the decision,
+whether policy or a person made it, the policy that produced it
+(\`permissions.unattended=deny\` vs \`permissions.approval=deny\`/\`=allow\`),
+the reason, and the option selected. \`ours-fleet peek\` and \`attach\` render
+them. Automatic denial asks for a one-shot rejection, never a standing one, so a
+single unattended refusal cannot disable a tool for the rest of the session.
+
+A role that can auto-deny logs one line at startup saying so.
+
+To detect an under-permissioned role BEFORE it runs, use the capability floor
+below: \`ours-fleet doctor\` fails such a role rather than letting it discover
+the problem silently at work.
+
 ### The unattended capability floor
 
 An unattended role has no console, so a permission request cannot be answered —
@@ -189,6 +219,10 @@ other than an explicit \`allow\` is elevated: \`ask\` stays on Claude's default
 mode and \`deny\` maps to \`plan\`. \`allow\` is therefore a real grant and
 requires explicit authorization; per-role \`isolation:\` remains the outer
 boundary that a permission mode cannot cross.
+
+See also: \`spawn --approval/--filesystem/--unattended\` set this intent at
+creation, and \`ours-fleet config\` prints each role's neutral settings, their
+native translation, and any warning — the same text \`doctor\` reports.
 
 Claude \`harness_options\`: \`permission_mode\` (default, acceptEdits, plan,
 dontAsk, bypassPermissions), \`plugins\`, \`mem_palace\`, and

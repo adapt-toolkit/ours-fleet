@@ -43,10 +43,12 @@ Baseline before any work: **339 passed**.
 | 6.2 roll back every failed creation stage | `b077947` | 554 |
 | 6.3 `spawn --isolation-file` | `312ce61` | 565 |
 | 6.6 persist creation provenance | `c6de9a2` | 571 |
+| 7.4 document never-prompt failure + the floor | `PENDING` | 575 |
 
-**Sections 1 through 5 are COMPLETE.** Only section 6 (documentation) remains: 7.1, 7.2, 7.4.
+**Sections 1 through 5 are COMPLETE**, and 7.4 of section 6. Remaining: 7.1 and 7.2 — both
+documentation.
 
-## Remaining — all three are documentation (section 6)
+## Remaining — both are documentation (section 6)
 
 1. **7.1** correct the spawn skill —
    `integrations/claude-code/skills/spawn-ours-agent/SKILL.md` and
@@ -59,10 +61,7 @@ Baseline before any work: **339 passed**.
    already implements: queued, timeout/maybe-delivered, rejected, control-unavailable, confirmed
    offline. `livenessNote()` in `src/session/control.ts` is the single source for that wording —
    reuse it rather than restating it.
-3. **7.4** document never-prompt failure and the capability floor — PARTLY DONE: 2.1 already
-   added the floor, its six capabilities and the security meaning of `allow` to both
-   `src/docs.ts` and README. What remains is the automatic-ACP-decision half (1.3) and
-   cross-links from the spawn/permissions references.
+
 
 Nothing is part-way done. Every commit above is complete with its tests. All three remaining
 fixes DESCRIBE behaviour that already exists and is tested, so nothing is blocked by their

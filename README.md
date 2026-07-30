@@ -253,6 +253,28 @@ role's `harness_options`, so a fleet can set common Codex permission/profile def
 and override individual keys per role. `monitor` merges the same way — a role block
 overrides `defaults.monitor` key-by-key.
 
+### Never-prompt failure
+
+An unattended role has no console, so a permission request has nobody to answer
+it and is refused **inside the harness** — no prompt, no error, no log line. The
+agent does less than its briefing told it to, reports success, and nothing
+distinguishes that from having done the work. It is caused by a permission mode
+that suppresses the prompt without granting the action (Claude `dontAsk`), or by
+`unattended: deny`.
+
+Automatic decisions are now recorded rather than invisible. Every permission
+decided without a human is written to
+`~/.ours-fleet/agents/<Name>/.session-events.jsonl` with the decision, whether
+policy or a person made it, which policy produced it, the reason, and the option
+chosen — and `ours-fleet peek`/`attach` render them. Automatic denial always
+asks for a one-shot rejection, never a standing one, so one unattended refusal
+cannot disable a tool for the rest of the session. A role that can auto-deny
+says so once at startup.
+
+To catch this **before** a role runs, see the capability floor below —
+`ours-fleet doctor` fails an under-permissioned unattended role rather than
+letting it discover the problem silently.
+
 ### The unattended capability floor
 
 A fleet role runs with no console attached, so a permission request has nobody

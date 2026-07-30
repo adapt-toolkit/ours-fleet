@@ -3,6 +3,7 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { realExec } from '../src/exec.js';
+import { UNATTENDED_FLOOR } from '../src/permissions.js';
 
 const CLI = resolve('dist/cli.js');
 let dir: string;
@@ -267,5 +268,38 @@ describe('ours-fleet CLI', () => {
     expect(r.stdout).toContain('● M');
     expect(r.stdout).toContain('model:');
     expect(r.stdout).toContain('claude-fable-5');
+  });
+});
+
+describe('never-prompt failure and the capability floor are documented (7.4)', () => {
+  it('docs explain the silent denial and how to detect it before launch', async () => {
+    const r = await run(['docs']);
+    expect(r.code).toBe(0);
+    expect(r.stdout).toContain('Never-prompt failure');
+    expect(r.stdout).toContain('no error, no log line');   // (the line wraps before this)
+    expect(r.stdout).toContain('.session-events.jsonl');
+    expect(r.stdout).toContain('one-shot rejection');
+  });
+
+  it('docs list EVERY capability the doctor check enforces', async () => {
+    const r = await run(['docs']);
+    // The documented floor must match the code exactly — a doc listing five of
+    // six would be worse than none, because it would read as complete.
+    for (const capability of UNATTENDED_FLOOR) expect(r.stdout, capability).toContain(capability);
+  });
+
+  it('docs carry no stale permission prescription', async () => {
+    const r = await run(['docs']);
+    // `dontAsk` may only appear as a named trap or in the list of native values,
+    // never as advice. The old guidance recommended it for unattended roles.
+    expect(r.stdout).not.toMatch(/use\s+`?dontAsk/i);
+    expect(r.stdout).not.toMatch(/recommend\w*\s+`?dontAsk/i);
+    expect(r.stdout).toContain('bypassPermissions');
+  });
+
+  it('docs cross-link the floor from the spawn and permissions references', async () => {
+    const r = await run(['docs']);
+    expect(r.stdout).toContain('--approval/--filesystem/--unattended');
+    expect(r.stdout).toContain('unattended floor: <Role>');
   });
 });
