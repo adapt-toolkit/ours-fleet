@@ -41,7 +41,7 @@ Baseline before any work: **339 passed**.
 | 6.4 atomic role + identity reservation | `c7eccb9` | 533 |
 | 7.3 guarantee identity existence before launch | `f759a35` | 545 |
 | 6.2 roll back every failed creation stage | `b077947` | 554 |
-| 6.3 `spawn --isolation-file` | `PENDING` | 565 |
+| 6.3 `spawn --isolation-file` | `312ce61` | 565 |
 
 Sections 1-4 complete. Section 5 in progress: 6.1, 6.4, 7.3, 6.2, 6.3 done; 6.6 next.
 
