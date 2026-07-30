@@ -36,20 +36,20 @@ Baseline before any work: **339 passed**.
 | 5.2 forbidden-path enforcement | `994cbd0` | 502 |
 | (audit) anchor directive assertions in generated files | `338e220` | 502 |
 | 5.1 shared harness credentials read-only | `6ece53d` | 514 |
+| 6.1 locked, atomic Claude pre-trust | `PENDING` | 526 |
 
-Sections 1, 2, 3 and 4 are complete. Section 5 (creation/trust) is next.
+Sections 1-4 complete. Section 5 (creation/trust) in progress: 6.1 done, 6.4 next.
 
 ## Remaining, in spec dependency order
 
-1. **6.1** locked, atomic Claude pre-trust
-2. **6.4** one atomic reservation for role and identity names
-3. **7.3** guarantee identity existence before launch
-4. **6.2** roll back every failed creation stage
-5. **6.3** `spawn --isolation-file` (the ONE approved new operator input)
-6. **6.6** persist creation provenance
-7. **7.1** correct the spawn skill
-8. **7.2** stop using one console command as a liveness verdict
-9. **7.4** document never-prompt failure and the capability floor
+1. **6.4** one atomic reservation for role and identity names
+2. **7.3** guarantee identity existence before launch
+3. **6.2** roll back every failed creation stage
+4. **6.3** `spawn --isolation-file` (the ONE approved new operator input)
+5. **6.6** persist creation provenance
+6. **7.1** correct the spawn skill
+7. **7.2** stop using one console command as a liveness verdict
+8. **7.4** document never-prompt failure and the capability floor
 
 Nothing is part-way done. Every commit above is complete with its tests.
 
@@ -146,6 +146,13 @@ spec. Flagged rather than built.
   the shared credential/instruction files fail while a minimal session completes on per-role
   state. It skips silently on a host that cannot sandbox — so on such a host it proves nothing.
 
+## Environment trap (cost me a confusing hang)
+
+`mkdirSync` on a path under `/proc` HANGS in this sandbox rather than throwing — a bare
+`node -e "mkdirSync('/proc/x', {recursive:true})"` hangs too, so it is the environment's
+filesystem, not ours-fleet code. Do not write tests that provoke failures via `/proc`
+paths; use a realistic failure instead (e.g. a directory where a file is expected).
+
 ## Test-harness notes for a successor
 
 - `test/fixtures/acp-agent.mjs` is a real ACP agent used by several suites. Modes:
@@ -157,3 +164,17 @@ spec. Flagged rather than built.
 - 3.2's tests drive `runSupervised` with an injected `attempt` function and a fake clock. The
   loop holds down forever by design, so a test world MUST stop on `circuit === 'open'` or it
   spins.
+- `test/atomic-file.test.ts` and `test/cli.test.ts` both run `npm run build` in `beforeAll` and
+  drive the built `dist/`. The 6.1 concurrency test spawns 10 real processes; the
+  killed-before-rename test waits out the 10s stale-lock window on purpose, so that file takes
+  ~12s.
+
+## Mutation checks performed (evidence, not confidence)
+
+Each of these was run by breaking the fix and confirming the tests go red:
+- 3.2 / false-pass audit: deleted `Restart=on-failure` from the unit template while LEAVING the
+  comment that mentions it — 2 tests fail; under the old `toContain` they stayed green.
+- 5.1: reverted the wrap context to the pre-fix whole-home mount — 4 of 6 real-bubblewrap tests
+  fail.
+- 6.1: removed the lock from `pretrust` (keeping the atomic replace) — the ten-process test
+  fails with entries missing.

@@ -7,6 +7,7 @@ import type {
   HarnessAdapter, RoleDirs, SessionPrep, SessionState, Launch, UnattendedCapability, ValidationError,
 } from './types.js';
 import { registerAdapter } from './registry.js';
+import { replaceFileAtomically, withFileLock, type LockDeps } from '../atomic-file.js';
 import { harnessRuntimeDir } from '../isolation/policy.js';
 import { bundledAcpAgent } from './acp-agent.js';
 
@@ -81,16 +82,58 @@ export function autocompactPct(role: ResolvedRole): number {
   return Math.max(1, Math.min(100, pct));
 }
 
-/** Pre-trust a dir in ~/.claude.json so the first launch never blocks on the trust dialog. */
-export function pretrust(dir: string): void {
+/**
+ * Pre-trust a dir in ~/.claude.json so the first launch never blocks on the
+ * trust dialog.
+ *
+ * `~/.claude.json` is SHARED by every role and by the operator's own Claude
+ * Code. The previous read-modify-write held nothing while it worked, so two
+ * roles starting together interleaved and one silently lost its trust entry —
+ * and that role then blocked on the dialog it was supposed to be spared,
+ * unattended, with nobody to answer it. A crash mid-write truncated the file
+ * for everyone.
+ *
+ * Now: take a cross-process lock, re-read inside it, merge ONLY this project's
+ * entry so unrelated operator state survives untouched, and replace the file
+ * atomically. Never fatal — a role that cannot be pre-trusted still launches.
+ */
+export async function pretrust(
+  dir: string,
+  deps: { log?(line: string): void; lock?: LockDeps } = {},
+): Promise<void> {
   const p = join(home(), '.claude.json');
-  const d = existsSync(p) ? JSON.parse(readFileSync(p, 'utf8')) : {};
-  const projects = (d.projects ??= {});
-  const e = (projects[dir] ??= {});
-  e.hasTrustDialogAccepted = true;
-  e.hasCompletedProjectOnboarding = true;
-  e.projectOnboardingSeenCount = Math.max(e.projectOnboardingSeenCount ?? 0, 1);
-  writeFileSync(p, JSON.stringify(d, null, 2));
+  const log = deps.log ?? (() => {});
+  try {
+    await withFileLock(`${p}.lock`, () => {
+      let doc: Record<string, unknown>;
+      if (!existsSync(p)) doc = {};
+      else {
+        const raw = readFileSync(p, 'utf8');
+        try {
+          doc = JSON.parse(raw) as Record<string, unknown>;
+        } catch (e) {
+          // Someone else's file, and it is already broken. Overwriting it would
+          // destroy operator state we cannot read; refusing to launch would take
+          // the role down for a file it does not own.
+          log(`pretrust: ${p} is not valid JSON (${(e as Error).message}) — skipping pre-trust; `
+            + `the role may block on Claude's trust dialog until the file is repaired`);
+          return;
+        }
+        if (doc === null || typeof doc !== 'object' || Array.isArray(doc)) {
+          log(`pretrust: ${p} does not contain a JSON object — skipping pre-trust`);
+          return;
+        }
+      }
+      const projects = (doc.projects ??= {}) as Record<string, Record<string, unknown>>;
+      const e = (projects[dir] ??= {});
+      e.hasTrustDialogAccepted = true;
+      e.hasCompletedProjectOnboarding = true;
+      e.projectOnboardingSeenCount = Math.max((e.projectOnboardingSeenCount as number) ?? 0, 1);
+      replaceFileAtomically(p, JSON.stringify(doc, null, 2));
+    }, deps.lock);
+  } catch (e) {
+    log(`pretrust: could not update ${p} (${(e as Error).message}) — continuing without pre-trust`);
+  }
 }
 
 /**
@@ -135,8 +178,8 @@ export function makeClaudeCodeAdapter(exec: Exec = realExec): HarnessAdapter {
       // Pre-trust stays a HOST-side step: inside the sandbox ~/.claude.json is
       // read-only, and it is the fleet's job to trust the role's dirs, not the
       // agent's (5.1, 6.1).
-      pretrust(dirs.stateDir);
-      if (dirs.runCwd && dirs.runCwd !== dirs.stateDir) pretrust(dirs.runCwd);
+      await pretrust(dirs.stateDir);
+      if (dirs.runCwd && dirs.runCwd !== dirs.stateDir) await pretrust(dirs.runCwd);
       const o = (role.harness_options ?? {}) as ClaudeOptions;
       const memPalace = o.mem_palace !== false;
       const enabledPlugins: Record<string, boolean> = { ...(o.plugins ?? {}) };

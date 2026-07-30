@@ -1,5 +1,7 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
-import { mkdtempSync, mkdirSync, readFileSync, writeFileSync, existsSync, rmSync } from 'node:fs';
+import {
+  mkdtempSync, mkdirSync, readFileSync, readdirSync, writeFileSync, existsSync, rmSync,
+} from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
@@ -100,15 +102,55 @@ describe('vocabulary — supervised monitor migration', () => {
 });
 
 describe('pretrust', () => {
-  it('merges trust flags without clobbering other projects', () => {
-    const cj = join(dir, '.claude.json');
-    writeFileSync(cj, JSON.stringify({ projects: { '/other': { keep: true } }, topLevel: 1 }));
-    pretrust('/w');
-    const d = JSON.parse(readFileSync(cj, 'utf8'));
+  const cj = () => join(dir, '.claude.json');
+
+  it('merges trust flags without clobbering other projects', async () => {
+    writeFileSync(cj(), JSON.stringify({ projects: { '/other': { keep: true } }, topLevel: 1 }));
+    await pretrust('/w');
+    const d = JSON.parse(readFileSync(cj(), 'utf8'));
     expect(d.projects['/w'].hasTrustDialogAccepted).toBe(true);
     expect(d.projects['/w'].projectOnboardingSeenCount).toBe(1);
     expect(d.projects['/other'].keep).toBe(true);
     expect(d.topLevel).toBe(1);
+  });
+
+  it('creates the file when absent', async () => {
+    await pretrust('/w');
+    expect(JSON.parse(readFileSync(cj(), 'utf8')).projects['/w'].hasTrustDialogAccepted).toBe(true);
+  });
+
+  it('on malformed JSON: warns, skips, and NEVER overwrites the file (6.1)', async () => {
+    const corrupt = '{ "projects": { broken';
+    writeFileSync(cj(), corrupt);
+    const logs: string[] = [];
+    await expect(pretrust('/w', { log: l => logs.push(l) })).resolves.toBeUndefined();
+    // The operator's file is left exactly as found — we cannot read it, so we
+    // have no right to replace it.
+    expect(readFileSync(cj(), 'utf8')).toBe(corrupt);
+    expect(logs.join('\n')).toContain('not valid JSON');
+    expect(logs.join('\n')).toContain('skipping pre-trust');
+  });
+
+  it('a non-object JSON document is skipped just as safely', async () => {
+    writeFileSync(cj(), '["not", "an", "object"]');
+    const logs: string[] = [];
+    await pretrust('/w', { log: l => logs.push(l) });
+    expect(readFileSync(cj(), 'utf8')).toBe('["not", "an", "object"]');
+    expect(logs.join('\n')).toContain('does not contain a JSON object');
+  });
+
+  it('leaves no temp file behind', async () => {
+    await pretrust('/w');
+    expect(readdirSync(dir).filter(f => f.includes('.tmp'))).toEqual([]);
+    expect(readdirSync(dir).filter(f => f.endsWith('.lock'))).toEqual([]);
+  });
+
+  it('a role launch is never failed by pre-trust, whatever goes wrong (6.1)', async () => {
+    // A realistic mess: something has left a DIRECTORY where the file belongs.
+    mkdirSync(cj(), { recursive: true });
+    const logs: string[] = [];
+    await expect(pretrust('/w', { log: l => logs.push(l) })).resolves.toBeUndefined();
+    expect(logs.join('\n')).toContain('continuing without pre-trust');
   });
 });
 
