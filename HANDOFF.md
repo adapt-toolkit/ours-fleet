@@ -44,9 +44,101 @@ Baseline before any work: **339 passed**.
 | 6.3 `spawn --isolation-file` | `312ce61` | 565 |
 | 6.6 persist creation provenance | `c6de9a2` | 571 |
 | 7.4 document never-prompt failure + the floor | `cdbf6d2` | 575 |
+| (6.2) failed service registration leaves no artifact | `14748cd` | 580 |
+| 7.1 rewrite the spawn skills from one source of truth | `580372b` | 593 |
+| 7.2 stop using one console command as a liveness verdict | `39943f9` | 611 |
 
-**Sections 1 through 5 are COMPLETE**, and 7.4 of section 6. Remaining: 7.1 and 7.2 — both
-documentation.
+**All 22 scoped fixes are committed with tests**, plus one defect found in 6.2 after the fact
+(see below). Sections 1 through 6 are complete.
+
+## Implementer-2's three commits
+
+Implementer-1 stopped after 20 fixes (its report is preserved below, unchanged). Implementer-2
+finished 7.1 and 7.2 and, ahead of both, fixed a defect in the already-landed 6.2 that an
+independent reviewer found.
+
+### 6.2 — a failed service registration left an artifact behind (`14748cd`)
+
+The defect was in two places, not one.
+
+- **Backend.** `install()` writes its artifact and can then fail. launchd wrote the plist —
+  carrying `RunAtLoad` — and only then ran `launchctl bootstrap`; a bootstrap failure threw, so
+  `install` never returned `{created: true}`, the creation transaction recorded nothing, and
+  rollback removed nothing. Both backends now undo their own partial work before throwing, and
+  only what they created.
+- **Transaction.** The transaction learned which registrations to undo from `up()`'s RETURN
+  value, which never arrives when `up()` throws after registering. `up()` now announces each
+  registration through an optional `onInstalled` hook at the moment it is made.
+
+**The test that should have caught it was a false pass by title.** `test/spawn.test.ts`, "a
+service registration this transaction created is uninstalled on failure", asserted
+`expect(calls.filter(c => c[0] === 'uninstall')).toEqual([])` — the opposite of its own title —
+with a comment explaining that nothing had been recorded as created. The assertion described the
+defect; the title described the fix. This is the second false pass found inside this suite, after
+the `toContain` that matched a string in a comment (3.2).
+
+**systemd was probed, not reasoned about.** On real systemd 255, with a throwaway user unit:
+`systemctl --user enable --now <unit>` whose START fails returns **exit 0** — while a bare
+`systemctl --user start` on the same unit returns 1 — and leaves the unit enabled. So the
+suspected "throws with the unit left enabled" path is NOT reachable via a start failure there.
+The disable-on-failure cleanup was kept anyway, because the exit code is the only signal
+available and its meaning varies by systemd version.
+
+**Flagged, not built:** because `enable --now` returns 0 on a failed start, a permanent spawn on
+systemd 255 can report success while the unit is enabled and dead. Out of the given scope and not
+in `IMPLEMENTATION.md`.
+
+### 7.1 — the spawn skills (`580372b`)
+
+Both variants prescribed `--approval ask --filesystem workspace --unattended deny` as a blanket
+default, in the same document that says to stop at a failed doctor check. Measured through
+`analyzeRolePermissions`, that combination is exactly what doctor FAILS. On both harnesses only
+`--approval allow` with `--filesystem workspace|unrestricted` clears the floor;
+`--filesystem read-only` never does; `unattended: deny` makes a shortfall fatal and `wait` makes
+it a warning. So the skill instructed an agent to build a role the CLI would then refuse.
+
+`SPAWN_SKILL_CONTRACT` in `src/docs.ts` is the source of truth; `test/skills.test.ts` holds every
+variant to it. **The tests are derived from the code, not from a second copy of the prose** —
+this is the part worth reading before changing anything here:
+
+- every capability in `UNATTENDED_FLOOR` must be named by every variant;
+- the native mode each variant names for neutral `allow` is computed through that harness's
+  adapter, so the doc cannot drift from the translation;
+- every `ours-fleet spawn` command a skill PRINTS is parsed and run through the same analysis
+  doctor uses, and must not be one doctor would fail;
+- at least one printed command must CLEAR the floor, not merely avoid failing.
+
+The skills also declare the INSTALLED `ours-fleet docs` authoritative over the shipped skill,
+because the plugin and the CLI upgrade separately.
+
+### 7.2 — the oversight taxonomy (`39943f9`)
+
+`oversightTaxonomy()` in `src/session/control.ts` is the single definition, built on
+`livenessNote()` rather than restating it. It covers `queued` plus all five `ControlFailureKind`
+values, each with what it proves, what to do, and a `restartJustified` flag true for exactly one.
+`src/briefing.ts` renders it; both oversee-agents skills carry the same lines verbatim and in
+order, enforced by test.
+
+### Mutation checks (evidence, not confidence)
+
+- removed `deps.onInstalled?.(outcome)` from `ops.ts` → the spawn rollback test fails;
+- removed either backend's install cleanup → its supervisor test fails;
+- restored the old `--approval ask … --unattended deny` recipe in a skill → three 7.1 tests fail;
+- removed one floor capability from a skill → the capability test fails;
+- paraphrased one taxonomy line in a skill → two 7.2 skill tests fail;
+- marked `timeout` as restart-justified → two 7.2 briefing tests fail.
+
+### State at `39943f9`
+
+`tsc` clean, `npm run build` succeeds, **26 files, 611 passed, 0 failed, 0 skipped**. The 5.1
+sandbox tests RAN (banner: `bubblewrap 0.11.0`). Working tree clean apart from untracked
+`IMPLEMENTATION.md`.
+
+**Not verified by Implementer-2, in those words:** launchd against a real `launchctl` (no macOS
+host — unit-tested only); the skill-only spawn acceptance run against real `claude` and `codex`
+CLIs (soak check 9); all 13 soak checks.
+
+---
 
 ## FINAL STATE (Implementer-1 stopped here)
 
@@ -64,7 +156,7 @@ documentation.
 I stopped at a clean commit rather than starting 7.1, which I could not have finished. Both
 remaining fixes are documentation describing behaviour that already exists and is tested.
 
-## Remaining — both are documentation (section 6)
+## Remaining, as Implementer-1 left it — BOTH ARE NOW DONE (see above)
 
 1. **7.1** correct the spawn skill —
    `integrations/claude-code/skills/spawn-ours-agent/SKILL.md` and
