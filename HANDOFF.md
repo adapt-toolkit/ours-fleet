@@ -39,7 +39,7 @@ Baseline before any work: **339 passed**.
 | 6.1 locked, atomic Claude pre-trust | `030a402` | 526 |
 | (5.1) make the sandbox skip loud | `a8e33a4` | 526 |
 | 6.4 atomic role + identity reservation | `c7eccb9` | 533 |
-| 7.3 guarantee identity existence before launch | `PENDING` | 545 |
+| 7.3 guarantee identity existence before launch | `f759a35` | 545 |
 
 Sections 1-4 complete. Section 5 in progress: 6.1, 6.4, 7.3 done; 6.2 next.
 
