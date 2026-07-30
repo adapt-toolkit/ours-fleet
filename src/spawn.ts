@@ -1,5 +1,5 @@
 import { spawn as spawnChild } from 'node:child_process';
-import { existsSync, mkdirSync, openSync, readFileSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, openSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { stringify } from 'yaml';
 import { agentDir, fleetDDir } from './paths.js';
@@ -10,6 +10,10 @@ import {
 } from './config.js';
 import { applyRole, up, type OpsDeps } from './ops.js';
 import { START_STAGGER_FILE } from './runner.js';
+import {
+  withCreationTransaction, writeRoleFile,
+  type CreationDeps, type CreationTransaction,
+} from './creation.js';
 
 export interface SpawnOpts {
   name: string;
@@ -82,6 +86,12 @@ function validateSpawnOpts(o: SpawnOpts): void {
     throw new Error(`invalid --unattended '${o.unattended}'; allowed: deny, wait`);
 }
 
+/**
+ * Reject names that are already USED. This is a precondition, not a claim: it
+ * runs INSIDE the creation transaction, after both names are reserved, so the
+ * gap between checking and creating that let two spawns both succeed is closed
+ * by the reservation rather than by this function.
+ */
 function assertNameFree(o: SpawnOpts): void {
   const cfg = loadConfig(o.configPath);
   if (cfg.roles.some(r => r.name === o.name))
@@ -90,18 +100,40 @@ function assertNameFree(o: SpawnOpts): void {
     throw new Error(`agent dir for '${o.name}' already exists — pick another name or 'ours-fleet rm ${o.name}'`);
 }
 
+/** The ours identity a spawn will bind: explicit, else the role name. */
+export const effectiveIdentity = (o: SpawnOpts): string => o.identity ?? o.name;
+
 /** Permanent spawn: persist to ~/fleet.d/<Name>.yaml, then bring it up. */
-export async function spawnPermanent(o: SpawnOpts, deps: OpsDeps): Promise<string> {
+export async function spawnPermanent(
+  o: SpawnOpts, deps: OpsDeps, creation: CreationDeps = {},
+): Promise<string> {
   validateSpawnOpts(o);
-  assertNameFree(o);
-  const cfg = loadConfig(o.configPath);
-  mkdirSync(fleetDDir(), { recursive: true });
-  const file = join(fleetDDir(), `${o.name}.yaml`);
-  writeFileSync(file, stringify({
-    roles: { [o.name]: roleFromOpts(o, cfg.defaults.harness as string | undefined) },
-  }));
-  await up(loadConfig(o.configPath), [o.name], deps, o.configPath);
-  return file;
+  // Name AND identity reserved together, before anything is written or started
+  // (6.4). A loser of the race creates no config, no state, no service.
+  return withCreationTransaction(
+    { role: o.name, identity: effectiveIdentity(o) },
+    async tx => {
+      assertNameFree(o);
+      const cfg = loadConfig(o.configPath);
+      mkdirSync(fleetDDir(), { recursive: true });
+      const file = join(fleetDDir(), `${o.name}.yaml`);
+      writeRoleFile(tx, file, stringify({
+        roles: { [o.name]: roleFromOpts(o, cfg.defaults.harness as string | undefined) },
+      }));
+      // `up` materialises the state dir and registers the service. Journal the
+      // dir before it exists so a failure leaves the name genuinely reusable
+      // rather than blocked by a half-built directory.
+      const stateDir = agentDir(o.name);
+      const stateExisted = existsSync(stateDir);
+      tx.record({
+        stage: `state dir ${stateDir}`,
+        undo: () => { if (!stateExisted) rmSync(stateDir, { recursive: true, force: true }); },
+      });
+      await up(loadConfig(o.configPath), [o.name], deps, o.configPath);
+      return file;
+    },
+    creation,
+  );
 }
 
 /** Launches the detached temp supervisor (`_run-temp <name>`). Injectable for tests. */
@@ -122,8 +154,21 @@ export async function spawnTemp(
   o: SpawnOpts,
   binPath: string,
   launch: SupervisorLauncher = detachedSupervisor,
+  creation: CreationDeps = {},
 ): Promise<string> {
   validateSpawnOpts(o);
+  // Temporary roles go through the SAME reservation boundary as permanent ones
+  // (6.4): a temp agent competes for the same names.
+  return withCreationTransaction(
+    { role: o.name, identity: effectiveIdentity(o) },
+    async tx => spawnTempInner(o, binPath, launch, tx),
+    creation,
+  );
+}
+
+async function spawnTempInner(
+  o: SpawnOpts, binPath: string, launch: SupervisorLauncher, tx: CreationTransaction,
+): Promise<string> {
   assertNameFree(o);
   const cfg = loadConfig(o.configPath);
   const defaultHarness = cfg.defaults.harness as string | undefined;
@@ -148,6 +193,7 @@ export async function spawnTemp(
     sourceFile: '(temp)',
   };
   const dir = applyRole(role, { temp: true });
+  tx.record({ stage: `temp state dir ${dir}`, undo: () => rmSync(dir, { recursive: true, force: true }) });
   writeFileSync(join(dir, 'role.yaml'), stringify(role));
   // Snapshot the fleet start-stagger so the detached temp supervisor (no config path
   // threaded through it) honors the same launch gate — a burst of temp spawns spaces

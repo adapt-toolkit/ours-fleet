@@ -1,9 +1,9 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
-import { mkdtempSync, writeFileSync, readFileSync, existsSync, rmSync } from 'node:fs';
+import { mkdtempSync, writeFileSync, readFileSync, readdirSync, existsSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { parse, stringify } from 'yaml';
-import { spawnPermanent, spawnTemp } from '../src/spawn.js';
+import { spawnPermanent, spawnTemp, type SupervisorLauncher } from '../src/spawn.js';
 import { agentDir } from '../src/paths.js';
 import { registerAdapter } from '../src/harness/registry.js';
 import { fakeAdapter } from './registry.test.js';
@@ -178,5 +178,129 @@ describe('spawnTemp', () => {
     const snap = parse(readFileSync(join(d, 'role.yaml'), 'utf8'));
     expect(snap.harness).toBe('codex');
     expect(snap.session).toBe('acp');
+  });
+});
+
+describe('atomic role + identity reservation (6.4)', () => {
+  /** A registry that records claims, so races are observable. */
+  function fakeRegistry() {
+    const held = new Set<string>();
+    const attempts: string[] = [];
+    return {
+      held, attempts,
+      registry: {
+        async reserve(name: string) {
+          attempts.push(name);
+          if (held.has(name)) return false;
+          held.add(name);
+          return true;
+        },
+        async release(name: string) { held.delete(name); },
+      },
+    };
+  }
+
+  /** Spawn that blocks inside the transaction until released, to force overlap. */
+  const slowDeps = (gate: Promise<void>) => {
+    const { d, calls } = fakeDeps();
+    const backend = d.backend;
+    const original = backend.install.bind(backend);
+    backend.install = async (n: string, b: string) => { await gate; return original(n, b); };
+    return { d, calls };
+  };
+
+  it('two spawns of the SAME role name: exactly one succeeds', async () => {
+    let release!: () => void;
+    const gate = new Promise<void>(r => { release = r; });
+    const { d: d1 } = slowDeps(gate);
+    const { d: d2 } = fakeDeps();
+
+    const first = spawnPermanent({ name: 'Race' }, d1);
+    await new Promise(r => setTimeout(r, 30));            // let it take the reservation
+    const second = await spawnPermanent({ name: 'Race' }, d2).then(() => null, e => e as Error);
+    release();
+    await first;
+
+    expect(second).toBeInstanceOf(Error);
+    expect(second!.message).toMatch(/being created by another process/);
+  });
+
+  it('two spawns with DIFFERENT roles but the SAME identity: exactly one succeeds', async () => {
+    const { registry } = fakeRegistry();
+    const { d } = fakeDeps();
+    await spawnPermanent({ name: 'Alpha', identity: 'Shared' }, d, { identityRegistry: registry });
+    // Alpha released its reservation on success, so the identity is free again
+    // by reservation — but a SECOND in-flight transaction must not get it.
+    let release!: () => void;
+    const gate = new Promise<void>(r => { release = r; });
+    const { d: dSlow } = slowDeps(gate);
+    const first = spawnPermanent(
+      { name: 'Beta', identity: 'Contested' }, dSlow, { identityRegistry: registry });
+    await new Promise(r => setTimeout(r, 30));
+    const second = await spawnPermanent(
+      { name: 'Gamma', identity: 'Contested' }, fakeDeps().d, { identityRegistry: registry })
+      .then(() => null, e => e as Error);
+    release();
+    await first;
+
+    expect(second).toBeInstanceOf(Error);
+    expect(second!.message).toMatch(/identity 'Contested' is already taken|being created/);
+  });
+
+  it('the same role with a DIFFERENT identity still conflicts on the role name', async () => {
+    let release!: () => void;
+    const gate = new Promise<void>(r => { release = r; });
+    const { d: d1 } = slowDeps(gate);
+    const first = spawnPermanent({ name: 'Solo', identity: 'One' }, d1);
+    await new Promise(r => setTimeout(r, 30));
+    const second = await spawnPermanent({ name: 'Solo', identity: 'Two' }, fakeDeps().d)
+      .then(() => null, e => e as Error);
+    release();
+    await first;
+    expect(second).toBeInstanceOf(Error);
+  });
+
+  it('the loser leaves NO config, NO state and NO service behind', async () => {
+    const { registry, held } = fakeRegistry();
+    held.add('Taken');                                    // identity already claimed
+    const { d, calls } = fakeDeps();
+    const err = await spawnPermanent({ name: 'Loser', identity: 'Taken' }, d, { identityRegistry: registry })
+      .then(() => null, e => e as Error);
+
+    expect(err).toBeInstanceOf(Error);
+    expect(existsSync(join(dir, 'fleet.d', 'Loser.yaml'))).toBe(false);
+    expect(existsSync(agentDir('Loser'))).toBe(false);
+    expect(calls.filter(c => c[0] === 'install')).toEqual([]);   // no service registered
+  });
+
+  it('a failure mid-creation rolls the fleet.d file back and frees both names', async () => {
+    const { d } = fakeDeps();
+    d.backend.install = async () => { throw new Error('systemctl refused'); };
+    const err = await spawnPermanent({ name: 'Doomed' }, d).then(() => null, e => e as Error);
+    expect(err!.message).toContain('systemctl refused');
+    expect(existsSync(join(dir, 'fleet.d', 'Doomed.yaml'))).toBe(false);
+
+    // Both names are immediately reusable — the point of releasing on failure.
+    const { d: ok } = fakeDeps();
+    await expect(spawnPermanent({ name: 'Doomed' }, ok)).resolves.toContain('Doomed.yaml');
+  });
+
+  it('a temp spawn uses the same boundary and rolls back its state dir', async () => {
+    const { d } = fakeDeps();
+    void d;
+    const failing: SupervisorLauncher = () => { throw new Error('could not detach'); };
+    const err = await spawnTemp({ name: 'TempFail' }, '/b/ours-fleet', failing)
+      .then(() => null, e => e as Error);
+    expect(err!.message).toContain('could not detach');
+    expect(existsSync(agentDir('TempFail', true))).toBe(false);
+    // Name reusable straight away.
+    await expect(spawnTemp({ name: 'TempFail' }, '/b/ours-fleet', () => {})).resolves.toBeTruthy();
+  });
+
+  it('a successful spawn releases its reservations so nothing leaks', async () => {
+    const { d } = fakeDeps();
+    await spawnPermanent({ name: 'Clean' }, d);
+    const reservations = join(dir, '.ours-fleet', 'creation', 'reservations');
+    expect(existsSync(reservations) ? readdirSync(reservations) : []).toEqual([]);
   });
 });

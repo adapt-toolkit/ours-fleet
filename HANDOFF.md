@@ -37,19 +37,20 @@ Baseline before any work: **339 passed**.
 | (audit) anchor directive assertions in generated files | `338e220` | 502 |
 | 5.1 shared harness credentials read-only | `6ece53d` | 514 |
 | 6.1 locked, atomic Claude pre-trust | `030a402` | 526 |
+| (5.1) make the sandbox skip loud | `a8e33a4` | 526 |
+| 6.4 atomic role + identity reservation | `PENDING` | 533 |
 
-Sections 1-4 complete. Section 5 (creation/trust) in progress: 6.1 done, 6.4 next.
+Sections 1-4 complete. Section 5 in progress: 6.1 and 6.4 done, 7.3 next.
 
 ## Remaining, in spec dependency order
 
-1. **6.4** one atomic reservation for role and identity names
-2. **7.3** guarantee identity existence before launch
-3. **6.2** roll back every failed creation stage
-4. **6.3** `spawn --isolation-file` (the ONE approved new operator input)
-5. **6.6** persist creation provenance
-6. **7.1** correct the spawn skill
-7. **7.2** stop using one console command as a liveness verdict
-8. **7.4** document never-prompt failure and the capability floor
+1. **7.3** guarantee identity existence before launch
+2. **6.2** roll back every failed creation stage
+3. **6.3** `spawn --isolation-file` (the ONE approved new operator input)
+4. **6.6** persist creation provenance
+5. **7.1** correct the spawn skill
+6. **7.2** stop using one console command as a liveness verdict
+7. **7.4** document never-prompt failure and the capability floor
 
 Nothing is part-way done. Every commit above is complete with its tests.
 
@@ -145,6 +146,29 @@ spec. Flagged rather than built.
   runs actual `bwrap` on this host (bubblewrap 0.11.0, userns available) and asserts writes to
   the shared credential/instruction files fail while a minimal session completes on per-role
   state. It skips silently on a host that cannot sandbox — so on such a host it proves nothing.
+
+## 6.4 — the part that is NOT done, and cannot be done from this repo
+
+The spec says: "The ours daemon needs an internal reserve/commit/release operation (or
+equivalent transactional endpoint) ... Corresponding ours daemon package: add the minimal
+authenticated atomic identity-name reservation contract; pin the required version."
+
+That is a change to a DIFFERENT package. I implemented the fleet side against a defined
+contract (`IdentityRegistry` in `src/creation.ts`: `reserve(name)` / `release(name)`), and the
+default implementation is `hostLocalIdentityRegistry` — a file reservation taken under the same
+host-wide creation lock as the role name.
+
+**What that buys:** atomic across every ours-fleet process on this host. Two `ours-fleet spawn`
+commands racing for the same identity — the realistic case — now have exactly one winner.
+
+**What it does NOT buy, and must be stated in the release notes:** it is not atomic against
+OTHER clients of the same ours daemon. Another tool creating that identity between our
+reservation and our creation still wins. Only the daemon sees every client, so only the daemon
+can make the reservation authoritative.
+
+**Not done:** the daemon-side endpoint, and the version pin. Both belong to the ours daemon
+package. `IdentityRegistry` is the seam — implement it against the daemon endpoint and inject
+it; no fleet-side code changes.
 
 ## Environment trap (cost me a confusing hang)
 
