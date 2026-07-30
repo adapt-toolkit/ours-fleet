@@ -52,6 +52,88 @@ export function livenessNote(kind: ControlFailureKind, name: string): string {
   }
 }
 
+/**
+ * The result taxonomy an overseer judges a role by (7.2).
+ *
+ * One console command is not a liveness verdict. `peek` and `send` can fail for
+ * five distinct reasons and succeed for one, and only ONE of the six says the
+ * agent is gone — collapsing them into "not running" is how busy agents got
+ * restarted. This is the single definition of that vocabulary: the generated
+ * briefing renders it, and the shipped oversee-agents skills quote it. The
+ * per-result wording comes from `livenessNote` rather than being restated, so
+ * the words an overseer reads in its instructions are the words the CLI prints.
+ */
+export interface OversightResult {
+  /** What the command reported: the one success, or the failure kind. */
+  result: 'queued' | ControlFailureKind;
+  /** What it proves about the agent. */
+  meaning: string;
+  /** What the overseer does next. */
+  action: string;
+  /**
+   * Whether this result ALONE justifies restarting the role. True for exactly
+   * one result. Every other one requires corroboration before touching a role
+   * that may simply be working.
+   */
+  restartJustified: boolean;
+}
+
+/** The taxonomy, in the order generated guidance presents it. */
+export function oversightTaxonomy(name = '<Name>'): OversightResult[] {
+  return [
+    {
+      result: 'queued',
+      meaning: `the session accepted the prompt for '${name}'; a turn already running is not a failure.`,
+      action: 'Nothing. Do not resend, and do not read the absence of a reply as a stall — '
+        + `check progress with: ours-fleet peek ${name}`,
+      restartJustified: false,
+    },
+    {
+      result: 'timeout',
+      meaning: livenessNote('timeout', name),
+      action: 'Treat delivery as UNCERTAIN — the request may already have been acted on, so do not '
+        + 'resend it blindly.',
+      restartJustified: false,
+    },
+    {
+      result: 'rejected',
+      meaning: livenessNote('rejected', name),
+      action: 'Fix the request, not the agent. A refusal is proof of life.',
+      restartJustified: false,
+    },
+    {
+      result: 'control-unavailable',
+      meaning: livenessNote('control-unavailable', name),
+      action: 'Read the role logs as well. The control plane and the agent are separate things, '
+        + 'and one being unreachable is not evidence about the other.',
+      restartJustified: false,
+    },
+    {
+      result: 'backend',
+      meaning: livenessNote('backend', name),
+      action: 'Investigate the transport, not the agent.',
+      restartJustified: false,
+    },
+    {
+      result: 'offline',
+      meaning: livenessNote('offline', name),
+      action: `This is the ONLY result that justifies a restart on its own: ours-fleet restart ${name} `
+        + 'for a permanent role. Read the logs first.',
+      restartJustified: true,
+    },
+  ];
+}
+
+/**
+ * The taxonomy as guidance lines, for a briefing or any generated document.
+ * The shipped oversee-agents skills carry these same lines, and a test holds
+ * them to it — so an overseer reading its briefing and an overseer reading the
+ * skill cannot be given different rules.
+ */
+export function oversightTaxonomyLines(name = '<Name>'): string[] {
+  return oversightTaxonomy(name).map(r => `- **${r.result}** — ${r.meaning} → ${r.action}`);
+}
+
 export const controlSocketPath = (stateDir: string) => join(stateDir, '.control.sock');
 export const controlTokenPath = (stateDir: string) => join(stateDir, '.control-token');
 

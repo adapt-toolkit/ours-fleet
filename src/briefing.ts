@@ -1,6 +1,7 @@
 import { userInfo } from 'node:os';
 import type { ResolvedRole } from './config.js';
 import type { BriefingVocab } from './harness/types.js';
+import { oversightTaxonomyLines } from './session/control.js';
 
 export interface BriefingOpts {
   stateDir: string;
@@ -85,12 +86,23 @@ export function generateBriefing(role: ResolvedRole, v: BriefingVocab, opts: Bri
     L.push('These agents are your wards — you keep them unstuck:');
     for (const o of role.oversee) L.push(`- **${o.role}** — check every ${o.interval}`);
     L.push('');
-    L.push('Procedure (see also the oversee-agents skill if available): on each tick, run');
-    for (const o of role.oversee) L.push(`\`ours-fleet peek ${o.role}\``);
-    L.push('and judge the console: stuck on a prompt/menu/trust dialog → answer it directly with');
-    L.push('`ours-fleet send <Name> "<text>"` (or `--key <K>` for raw keys); crashed to a shell →');
-    L.push('investigate and restart; idle with work assigned → nudge; healthy → do nothing.');
-    L.push('Escalate over ours messaging only when you cannot resolve it yourself.');
+    L.push('Procedure (see also the oversee-agents skill if available). On each tick, for each ward');
+    L.push('run BOTH — they answer different questions:');
+    for (const o of role.oversee) L.push(`\`ours-fleet status ${o.role}\` then \`ours-fleet peek ${o.role}\``);
+    L.push('');
+    L.push('**One console command is not a liveness verdict.** A `peek` or `send` that fails tells');
+    L.push('you what happened to YOUR REQUEST, and only one of its outcomes says the agent is gone.');
+    L.push('Read the result you actually got:');
+    L.push('');
+    L.push(...oversightTaxonomyLines());
+    L.push('');
+    L.push('Never translate any other failure into "dead". A busy agent, an unanswered control');
+    L.push('plane and a confirmed stop look identical if you only look at one command.');
+    L.push('');
+    L.push('Then judge the console content: stuck on a prompt/menu/trust dialog → answer it directly');
+    L.push('with `ours-fleet send <Name> "<text>"` (or `--key <K>` for raw keys); idle with work');
+    L.push('assigned → nudge; actively working → do nothing, and do not mistake a long turn for a');
+    L.push('stall. Escalate over ours messaging only when you cannot resolve it yourself.');
   }
 
   L.push('', '## Durable log');

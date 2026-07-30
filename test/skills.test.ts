@@ -4,6 +4,7 @@ import { describe, expect, it } from 'vitest';
 
 import { AI_DOCS, SPAWN_SKILL_CONTRACT } from '../src/docs.js';
 import { UNATTENDED_FLOOR, analyzeRolePermissions } from '../src/permissions.js';
+import { oversightTaxonomyLines } from '../src/session/control.js';
 import { getAdapter } from '../src/harness/registry.js';
 import '../src/harness/claude-code.js';
 import '../src/harness/codex.js';
@@ -126,4 +127,47 @@ describe('following only the shipped skill produces a role doctor accepts (7.1)'
       expect(clearing.length, 'no example meets the unattended floor').toBeGreaterThan(0);
     });
   }
+});
+
+/**
+ * The oversight half (7.2). An overseer reads its generated briefing OR this
+ * skill; if they disagree about what a `peek` failure proves, one of them is
+ * telling it to restart a working agent.
+ */
+describe('shipped oversee skills use the one result taxonomy (7.2)', () => {
+  for (const v of VARIANTS) {
+    const text = skill(v.path, 'oversee-agents');
+
+    it(`${v.id}: carries the taxonomy verbatim, not a paraphrase`, () => {
+      for (const line of oversightTaxonomyLines())
+        expect(text, `${v.id} is missing or has reworded: ${line.slice(0, 60)}…`).toContain(line);
+    });
+
+    it(`${v.id}: says one console command is not a liveness verdict`, () => {
+      expect(text).toContain('One console command is not a liveness verdict');
+      expect(text).toContain('ours-fleet status <Name>');
+      expect(text).toContain('ours-fleet peek <Name>');
+    });
+
+    it(`${v.id}: restarts only on a confirmed stop`, () => {
+      // The wording differs per variant; what must hold is that the restart
+      // instruction is tied to `status` confirming the role is offline, and
+      // that the old "crashed → restart" shortcut is gone.
+      expect(text).toMatch(/only once `status` confirms it is offline/);
+      expect(text).not.toContain('for permanent roles `ours-fleet restart');
+      expect(text).not.toContain('then restart permanent\nroles');
+    });
+  }
+
+  it('both variants and the generated briefing agree line for line', () => {
+    // The same array, in the same order, in all three places.
+    const lines = oversightTaxonomyLines();
+    for (const v of VARIANTS) {
+      const text = skill(v.path, 'oversee-agents');
+      const positions = lines.map(l => text.indexOf(l));
+      expect(positions.every(p => p >= 0), v.id).toBe(true);
+      expect(positions, `${v.id} lists the taxonomy out of order`)
+        .toEqual([...positions].sort((a, b) => a - b));
+    }
+  });
 });
