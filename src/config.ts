@@ -2,7 +2,10 @@ import { existsSync, readFileSync, readdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { parse } from 'yaml';
 import { agentDir, defaultConfigPath, fleetDDir, home } from './paths.js';
-import { resolveIsolation, validateIsolationConfig } from './isolation/policy.js';
+import {
+  harnessRuntimeDir, resolveIsolation, validateIsolationConfig,
+} from './isolation/policy.js';
+import { getAdapter } from './harness/registry.js';
 import type { IsolationConfig, WrapContext } from './isolation/types.js';
 
 export interface OverseeEntry { role: string; interval: string }
@@ -151,14 +154,23 @@ export class ConfigError extends Error {}
  */
 export function isolationContextFor(role: ResolvedRole): WrapContext {
   const stateDir = agentDir(role.name, (role as ResolvedRole & { __temp?: boolean }).__temp === true);
+  const runCwd = role.cwd ?? stateDir;
+  // Ask the harness how its host state splits (5.1). An adapter that declares
+  // none keeps the historical whole-home mount.
+  let split: { home?: string; shared: string[] } | undefined;
+  try { split = getAdapter(role.harness).isolationPaths?.(role, { stateDir, runCwd }); }
+  catch { split = undefined; }
   return {
     stateDir,
-    runCwd: role.cwd ?? stateDir,
+    runCwd,
     home: home(),
     harness: role.harness,
     additionalWriteDirs: role.harness === 'codex'
       ? ((role.harness_options as { add_dirs?: string[] } | undefined)?.add_dirs ?? [])
       : [],
+    harnessHome: split?.home,
+    harnessRuntimeDir: split?.home ? harnessRuntimeDir(stateDir, role.harness) : undefined,
+    harnessSharedPaths: split?.shared,
   };
 }
 

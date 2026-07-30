@@ -52,6 +52,19 @@ export interface WrapContext {
   harness?: string;
   /** Harness-declared writable roots (for example Codex --add-dir). */
   additionalWriteDirs?: string[];
+  /**
+   * The harness's home directory on the host (`~/.claude`, `~/.codex`). Mounted
+   * from `harnessRuntimeDir` so the agent's own runtime state is per-role (5.1).
+   */
+  harnessHome?: string;
+  /** Per-role writable directory backing `harnessHome` inside the sandbox. */
+  harnessRuntimeDir?: string;
+  /**
+   * Shared credentials, global instructions and configuration. Mounted READ-ONLY
+   * on top of the per-role home, so an agent can read them and cannot rewrite
+   * them for itself or for its peers.
+   */
+  harnessSharedPaths?: string[];
   brokerEndpoint?: string;
 }
 

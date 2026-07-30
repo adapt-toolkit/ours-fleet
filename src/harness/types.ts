@@ -65,6 +65,17 @@ export interface BriefingVocab {
   restartPrompt(identity: string, worklogPath: string, role?: ResolvedRole): string;
 }
 
+/**
+ * How a harness's host state splits for sandboxing (5.1). `home` is the
+ * directory the CLI treats as its own and whose RUNTIME state must be per-role;
+ * `shared` are the credential, instruction and configuration paths that stay
+ * shared and become read-only inside the sandbox.
+ */
+export interface HarnessIsolationPaths {
+  home?: string;
+  shared: string[];
+}
+
 export interface ExitPolicy { cleanExitIsFresh: boolean; fastFailSecs: number }
 export interface ValidationError { path: string; message: string }
 
@@ -87,6 +98,12 @@ export interface HarnessAdapter {
    * compared directly. Only keys the operator actually wrote appear.
    */
   nativePermissionOverrides(options: unknown): Record<string, unknown>;
+  /**
+   * Host paths this harness needs inside a sandbox, split into a per-role
+   * writable home and shared read-only credentials/config (5.1). Omit for a
+   * harness with no host state of its own.
+   */
+  isolationPaths?(role: ResolvedRole, dirs: RoleDirs): HarnessIsolationPaths;
   vocabulary: BriefingVocab;
   exitPolicy: ExitPolicy;
 }

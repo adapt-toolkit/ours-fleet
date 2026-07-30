@@ -1,4 +1,4 @@
-import { existsSync, readFileSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { home } from '../paths.js';
 import { realExec, type Exec } from '../exec.js';
@@ -7,6 +7,7 @@ import type {
   HarnessAdapter, RoleDirs, SessionPrep, SessionState, Launch, UnattendedCapability, ValidationError,
 } from './types.js';
 import { registerAdapter } from './registry.js';
+import { harnessRuntimeDir } from '../isolation/policy.js';
 import { bundledAcpAgent } from './acp-agent.js';
 
 interface ClaudeOptions {
@@ -131,6 +132,9 @@ export function makeClaudeCodeAdapter(exec: Exec = realExec): HarnessAdapter {
     },
 
     async prepareSession(role: ResolvedRole, dirs: RoleDirs): Promise<SessionPrep> {
+      // Pre-trust stays a HOST-side step: inside the sandbox ~/.claude.json is
+      // read-only, and it is the fleet's job to trust the role's dirs, not the
+      // agent's (5.1, 6.1).
       pretrust(dirs.stateDir);
       if (dirs.runCwd && dirs.runCwd !== dirs.stateDir) pretrust(dirs.runCwd);
       const o = (role.harness_options ?? {}) as ClaudeOptions;
@@ -144,6 +148,12 @@ export function makeClaudeCodeAdapter(exec: Exec = realExec): HarnessAdapter {
         MEMPALACE_MIDSESSION_AUTOSAVE: o.mem_palace_midsession_autosave ? 'true' : 'false',
       };
       if (!memPalace) env.MEMPALACE_DISABLED = 'true';
+
+      // Per-role harness runtime home (5.1). Created before sandbox entry so the
+      // bind has something to mount; harmless for un-isolated roles.
+      // Only a role that declares `isolation:` gets a sandbox, and only a
+      // sandbox needs this directory to exist before entry.
+      if (role.isolation) mkdirSync(harnessRuntimeDir(dirs.stateDir, 'claude'), { recursive: true });
 
       const argv: string[] = [];
       if (Object.keys(enabledPlugins).length) {
@@ -176,6 +186,23 @@ export function makeClaudeCodeAdapter(exec: Exec = realExec): HarnessAdapter {
           : bundledAcpAgent(
               '@agentclientprotocol/claude-agent-acp', 'claude-agent-acp', 'claude-agent-acp');
       return { argv, env: prep.env };
+    },
+
+    isolationPaths(_role: ResolvedRole, _dirs: RoleDirs) {
+      const claudeHome = join(home(), '.claude');
+      return {
+        home: claudeHome,
+        // Credentials and project trust (~/.claude.json), the global
+        // instructions every role shares, and the shared settings. Everything
+        // else under ~/.claude — sessions, projects, caches, history — is
+        // runtime state and belongs to the role, not to the fleet.
+        shared: [
+          join(home(), '.claude.json'),
+          join(claudeHome, 'CLAUDE.md'),
+          join(claudeHome, 'settings.json'),
+          join(claudeHome, 'plugins'),
+        ],
+      };
     },
 
     nativePermissionOverrides(options: unknown): Record<string, unknown> {

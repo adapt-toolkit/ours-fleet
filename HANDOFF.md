@@ -34,21 +34,22 @@ Baseline before any work: **339 passed**.
 | 2.4 warn when native overrides contradict neutral intent | `68e4a49` | 468 |
 | 3.2 backoff + durable fast-failure circuit breaker | `ead5572` | 484 |
 | 5.2 forbidden-path enforcement | `994cbd0` | 502 |
+| (audit) anchor directive assertions in generated files | `338e220` | 502 |
+| 5.1 shared harness credentials read-only | `PENDING` | 514 |
 
-Sections 1, 2 and 3 are complete; section 4 is in progress (5.2 done, 5.1 next).
+Sections 1, 2, 3 and 4 are complete. Section 5 (creation/trust) is next.
 
 ## Remaining, in spec dependency order
 
-1. **5.1** shared harness credentials read-only
-2. **6.1** locked, atomic Claude pre-trust
-3. **6.4** one atomic reservation for role and identity names
-4. **7.3** guarantee identity existence before launch
-5. **6.2** roll back every failed creation stage
-6. **6.3** `spawn --isolation-file` (the ONE approved new operator input)
-7. **6.6** persist creation provenance
-8. **7.1** correct the spawn skill
-9. **7.2** stop using one console command as a liveness verdict
-10. **7.4** document never-prompt failure and the capability floor
+1. **6.1** locked, atomic Claude pre-trust
+2. **6.4** one atomic reservation for role and identity names
+3. **7.3** guarantee identity existence before launch
+4. **6.2** roll back every failed creation stage
+5. **6.3** `spawn --isolation-file` (the ONE approved new operator input)
+6. **6.6** persist creation provenance
+7. **7.1** correct the spawn skill
+8. **7.2** stop using one console command as a liveness verdict
+9. **7.4** document never-prompt failure and the capability floor
 
 Nothing is part-way done. Every commit above is complete with its tests.
 
@@ -140,7 +141,10 @@ spec. Flagged rather than built.
   prompts"). These are not the same claim; do not merge them.
 - **All 13 release soak checks.** None have been run. This branch has unit/integration tests
   only.
-- Real bubblewrap sandbox behaviour (relevant to 5.1/5.2 when they are built).
+- Real bubblewrap sandbox behaviour is now COVERED for 5.1: `test/isolation-credentials.test.ts`
+  runs actual `bwrap` on this host (bubblewrap 0.11.0, userns available) and asserts writes to
+  the shared credential/instruction files fail while a minimal session completes on per-role
+  state. It skips silently on a host that cannot sandbox — so on such a host it proves nothing.
 
 ## Test-harness notes for a successor
 

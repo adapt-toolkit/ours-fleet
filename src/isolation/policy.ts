@@ -120,6 +120,14 @@ export function validateIsolationConfig(raw: unknown): string[] {
   return problems;
 }
 
+/**
+ * Where a role's per-role harness runtime state lives (5.1). Under the agent's
+ * own state directory, so it is covered by the state dir's existing lifecycle
+ * and by the forbidden-path exception, and is never shared with a peer.
+ */
+export const harnessRuntimeDir = (stateDir: string, harnessId: string): string =>
+  join(stateDir, 'harness', harnessId);
+
 /** Parse a `host:container` secret pair; a bare path maps to itself. */
 function parseSecret(pair: string): Mount {
   const i = pair.indexOf(':');
@@ -148,11 +156,24 @@ export function resolveIsolation(cfg: IsolationConfig, ctx: WrapContext): Resolv
   const mounts: Mount[] = [];
   const addRw = (p: string) => { if (!mounts.some(m => m.src === p)) mounts.push({ src: p, dst: p, mode: 'rw' }); };
   const addRo = (p: string) => { if (!mounts.some(m => m.src === p)) mounts.push({ src: p, dst: p, mode: 'ro' }); };
+  /** Writable bind whose destination differs from its source (the per-role home). */
+  const addRw2 = (src: string, dst: string) => {
+    if (!mounts.some(m => m.src === src && m.dst === dst)) mounts.push({ src, dst, mode: 'rw' });
+  };
 
   // Durable set: state dir + cwd, then only the active harness's config/auth roots.
   addRw(stateDir);
   addRw(runCwd);
-  if (ctx.harness === 'codex') {
+  if (ctx.harnessHome && ctx.harnessRuntimeDir) {
+    // The harness home is backed by a PER-ROLE directory (5.1): the agent gets a
+    // writable home for its sessions, caches and history, and anything a future
+    // CLI version writes lands there too. The shared credentials, global
+    // instructions and configuration are then layered back read-only, so they
+    // are readable and cannot be rewritten — for this role or for its peers.
+    // Order matters: the writable home must precede the read-only overlays.
+    addRw2(ctx.harnessRuntimeDir, ctx.harnessHome);
+    for (const p of ctx.harnessSharedPaths ?? []) addRo(p);
+  } else if (ctx.harness === 'codex') {
     addRw(join(home, '.codex'));
     addRo(join(home, '.agents'));
   } else {
@@ -190,7 +211,10 @@ export function resolveIsolation(cfg: IsolationConfig, ctx: WrapContext): Resolv
   for (const m of mounts) {
     for (const [role, path] of [['source', m.src], ['destination', m.dst]] as const) {
       const canon = canonicalPath(path);
-      if (canon === ownStateDir) continue;
+      // The role's own state dir and anything inside it (its per-role harness
+      // runtime home, 5.1) is the one legitimate descendant of the agents root.
+      // This does not exempt the root above it, nor a sibling beside it.
+      if (within(canon, ownStateDir)) continue;
       for (let i = 0; i < forbidden.length; i++) {
         const kind = mountConflict(canon, forbidden[i]);
         if (!kind) continue;

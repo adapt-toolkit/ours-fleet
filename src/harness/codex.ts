@@ -1,5 +1,6 @@
+import { mkdirSync } from 'node:fs';
 import { join } from 'node:path';
-import { agentDir } from '../paths.js';
+import { agentDir, home } from '../paths.js';
 import { realExec, type Exec } from '../exec.js';
 import type { ResolvedRole } from '../config.js';
 import type {
@@ -7,6 +8,7 @@ import type {
   UnattendedCapability,
 } from './types.js';
 import { registerAdapter } from './registry.js';
+import { harnessRuntimeDir } from '../isolation/policy.js';
 import { bundledAcpAgent } from './acp-agent.js';
 
 interface CodexOptions {
@@ -196,7 +198,11 @@ export function makeCodexAdapter(exec: Exec = realExec): HarnessAdapter {
       return errs;
     },
 
-    async prepareSession(role: ResolvedRole, _dirs: RoleDirs): Promise<SessionPrep> {
+    async prepareSession(role: ResolvedRole, dirs: RoleDirs): Promise<SessionPrep> {
+      // Per-role harness runtime home (5.1); harmless for un-isolated roles.
+      // Only a role that declares `isolation:` gets a sandbox, and only a
+      // sandbox needs this directory to exist before entry.
+      if (role.isolation) mkdirSync(harnessRuntimeDir(dirs.stateDir, 'codex'), { recursive: true });
       const requested = launcherMode(role);
       const hasOursCodex = await commandAvailable('ours-codex', exec);
       if (requested === 'ours-codex' && !hasOursCodex)
@@ -225,6 +231,25 @@ export function makeCodexAdapter(exec: Exec = realExec): HarnessAdapter {
           : bundledAcpAgent(
               '@agentclientprotocol/codex-acp', 'codex-acp', 'codex-acp');
       return { argv, env: prep.env };
+    },
+
+    isolationPaths(role: ResolvedRole, _dirs: RoleDirs) {
+      const codexHome = join(home(), '.codex');
+      const profile = (role.harness_options as CodexOptions | undefined)?.profile;
+      return {
+        home: codexHome,
+        // Credentials, shared config, shared instructions, and the role's own
+        // profile file if it names one. Sessions, history, caches and the local
+        // sqlite stores are runtime state and stay per-role.
+        shared: [
+          join(codexHome, 'auth.json'),
+          join(codexHome, 'config.toml'),
+          join(codexHome, 'AGENTS.md'),
+          join(codexHome, 'plugins'),
+          ...(profile ? [join(codexHome, `${profile}.config.toml`)] : []),
+          join(home(), '.agents'),
+        ],
+      };
     },
 
     nativePermissionOverrides(options: unknown): Record<string, unknown> {

@@ -286,6 +286,26 @@ the mode that actually permits the actions the role was authorized to take.
 [`isolation:`](#agent-isolation) as the outer boundary, which no permission
 mode can cross.
 
+### Sandboxed credentials and configuration
+
+A sandboxed role gets a **per-role writable harness home** under its own state directory
+(`<state>/harness/<harness>/`), so its sessions, history and caches are its own and are
+invisible to every other role. The **shared** credentials, global instructions and
+configuration are layered back read-only:
+
+| Harness | Read-only (shared) | Per-role writable |
+| --- | --- | --- |
+| `claude-code` | `~/.claude.json`, `~/.claude/CLAUDE.md`, `settings.json`, `plugins/` | everything else under `~/.claude` |
+| `codex` | `~/.codex/auth.json`, `config.toml`, `AGENTS.md`, `plugins/`, `~/.agents` | everything else under `~/.codex` |
+
+An agent can read the credentials it needs and cannot rewrite them, cannot edit the
+instructions every role shares, and cannot alter a peer's configuration. Claude pre-trust
+stays a host-side step performed by the fleet.
+
+The forbidden-path list is enforced, not advisory: a role that asks for `~/.ssh`, the ours
+key store, a sibling's state directory — or a parent directory that would expose one, or a
+symlink to one — is refused by `ours-fleet config` before it can launch.
+
 ### Start staggering
 
 `start_stagger_ms` (top-level, host-wide, default `0`) spaces out agent **launches**

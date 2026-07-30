@@ -254,3 +254,97 @@ describe('forbidden-path enforcement (5.2)', () => {
     expect(canonicalPath(missing)).toBe(missing);
   });
 });
+
+describe('shared harness credentials are read-only (5.1)', () => {
+  const stateDir = '/home/fleet/.ours-fleet/agents/Dev';
+  const runtime = (h: string) => join(stateDir, 'harness', h);
+
+  const claudeCtx = (): WrapContext => ({
+    stateDir, runCwd: '/home/fleet/work/repo', home: '/home/fleet', harness: 'claude-code',
+    harnessHome: '/home/fleet/.claude',
+    harnessRuntimeDir: runtime('claude-code'),
+    harnessSharedPaths: [
+      '/home/fleet/.claude.json',
+      '/home/fleet/.claude/CLAUDE.md',
+      '/home/fleet/.claude/settings.json',
+      '/home/fleet/.claude/plugins',
+    ],
+  });
+
+  const codexCtx = (): WrapContext => ({
+    stateDir, runCwd: '/home/fleet/work/repo', home: '/home/fleet', harness: 'codex',
+    harnessHome: '/home/fleet/.codex',
+    harnessRuntimeDir: runtime('codex'),
+    harnessSharedPaths: [
+      '/home/fleet/.codex/auth.json',
+      '/home/fleet/.codex/config.toml',
+      '/home/fleet/.codex/AGENTS.md',
+      '/home/fleet/.agents',
+    ],
+  });
+
+  it('Claude: the home is per-role writable, the shared files read-only', () => {
+    const r = resolveIsolation({}, claudeCtx());
+    const homeMount = r.mounts.find(m => m.dst === '/home/fleet/.claude')!;
+    expect(homeMount.mode).toBe('rw');
+    expect(homeMount.src).toBe(runtime('claude-code'));      // NOT the shared host dir
+
+    for (const shared of ['/home/fleet/.claude.json', '/home/fleet/.claude/CLAUDE.md',
+                          '/home/fleet/.claude/settings.json', '/home/fleet/.claude/plugins'])
+      expect(r.mounts.find(m => m.dst === shared)?.mode, shared).toBe('ro');
+
+    // The shared host ~/.claude is never bound writable anywhere.
+    expect(r.mounts.some(m => m.src === '/home/fleet/.claude' && m.mode === 'rw')).toBe(false);
+  });
+
+  it('Codex: same split, including credentials and shared instructions', () => {
+    const r = resolveIsolation({}, codexCtx());
+    const homeMount = r.mounts.find(m => m.dst === '/home/fleet/.codex')!;
+    expect(homeMount.mode).toBe('rw');
+    expect(homeMount.src).toBe(runtime('codex'));
+    for (const shared of ['/home/fleet/.codex/auth.json', '/home/fleet/.codex/config.toml',
+                          '/home/fleet/.codex/AGENTS.md', '/home/fleet/.agents'])
+      expect(r.mounts.find(m => m.dst === shared)?.mode, shared).toBe('ro');
+    expect(r.mounts.some(m => m.src === '/home/fleet/.codex' && m.mode === 'rw')).toBe(false);
+  });
+
+  it('the writable home is ordered BEFORE the read-only overlays', () => {
+    // bwrap applies mounts in order; a shared file bound before the home would
+    // be replaced by it and silently become writable again.
+    const r = resolveIsolation({}, claudeCtx());
+    const homeIdx = r.mounts.findIndex(m => m.dst === '/home/fleet/.claude');
+    for (const shared of r.mounts.filter(m => m.dst.startsWith('/home/fleet/.claude/')))
+      expect(r.mounts.indexOf(shared)).toBeGreaterThan(homeIdx);
+  });
+
+  it("the per-role runtime dir is allowed despite living under the forbidden agents root", () => {
+    // It is inside the role's own state dir, which is the one legitimate
+    // descendant — and the exception covers the whole subtree, not just the
+    // directory itself.
+    expect(() => resolveIsolation({}, claudeCtx())).not.toThrow();
+  });
+
+  it('a harness that declares no split keeps the historical whole-home mount', () => {
+    const r = resolveIsolation({}, ctx());       // no harnessHome in context
+    expect(mount(r, '/home/fleet/.claude')?.mode).toBe('rw');
+  });
+
+  it('the bwrap argv binds the per-role dir at the harness home, then the shared files ro', () => {
+    const c = claudeCtx();
+    const argv = makeBubblewrapBackend().wrap(['claude'], resolveIsolation({}, c), c);
+    const at = (flag: string, src: string, dst: string) => {
+      for (let i = 0; i < argv.length - 2; i++)
+        if (argv[i] === flag && argv[i + 1] === src && argv[i + 2] === dst) return i;
+      return -1;
+    };
+    const homeAt = at('--bind-try', runtime('claude-code'), '/home/fleet/.claude');
+    const credsAt = at('--ro-bind-try', '/home/fleet/.claude.json', '/home/fleet/.claude.json');
+    const instrAt = at('--ro-bind-try', '/home/fleet/.claude/CLAUDE.md', '/home/fleet/.claude/CLAUDE.md');
+    expect(homeAt).toBeGreaterThan(-1);
+    expect(credsAt).toBeGreaterThan(-1);
+    expect(instrAt).toBeGreaterThan(homeAt);       // layered on top of the writable home
+    // No writable bind of the shared host home anywhere in the argv.
+    expect(at('--bind', '/home/fleet/.claude', '/home/fleet/.claude')).toBe(-1);
+    expect(at('--bind-try', '/home/fleet/.claude', '/home/fleet/.claude')).toBe(-1);
+  });
+});
