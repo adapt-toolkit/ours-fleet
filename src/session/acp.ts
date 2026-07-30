@@ -8,9 +8,9 @@ import * as acp from '@agentclientprotocol/sdk';
 
 import type { CommonPermissions } from '../config.js';
 import { SessionEvents } from './events.js';
-import { SessionControlError, turnResult } from './types.js';
+import { SessionControlError, classifyChildExit, turnResult } from './types.js';
 import type {
-  PermissionDecision, QueuedPrompt, SessionEvent, SessionHandle, SessionSnapshot,
+  ExitRecord, PermissionDecision, QueuedPrompt, SessionEvent, SessionHandle, SessionSnapshot,
   TurnOutcome, TurnResult,
 } from './types.js';
 
@@ -61,6 +61,7 @@ export class AcpSession implements SessionHandle {
   private lastError?: string;
   private promptTail: Promise<unknown> = Promise.resolve();
   private queueDepth = 0;
+  private exit: ExitRecord | null = null;
   private capabilities?: acp.AgentCapabilities;
   private controllerCount = 0;
 
@@ -76,9 +77,12 @@ export class AcpSession implements SessionHandle {
     this.sessionFile = join(options.stateDir, '.acp-session-id');
     child.stderr.on('data', chunk => options.log(`[${options.name}] acp: ${String(chunk).trimEnd()}`));
     child.once('exit', (code, signal) => {
+      // Record the child's real exit code/signal. The tmux path can only see a
+      // shell's `$?`; here the truth is available, so keep it.
+      this.exit = classifyChildExit(code, signal);
       if (this.readiness !== 'failed') {
         this.readiness = 'failed';
-        this.lastError = `ACP agent exited (${code ?? signal ?? 'unknown'})`;
+        this.lastError = `ACP agent ${this.exit.detail}`;
       }
       this.events.emit('state', { status: 'failed', text: this.lastError });
     });
@@ -200,6 +204,10 @@ export class AcpSession implements SessionHandle {
 
   setControllerAttached(attached: boolean): void {
     this.controllerCount = Math.max(0, this.controllerCount + (attached ? 1 : -1));
+  }
+
+  exitResult(): ExitRecord | null {
+    return this.exit;
   }
 
   async close(): Promise<void> {

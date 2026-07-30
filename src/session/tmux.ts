@@ -1,7 +1,9 @@
 import type { Tmux } from '../tmux.js';
 import { randomUUID } from 'node:crypto';
 import { SessionControlError, turnResult } from './types.js';
-import type { QueuedPrompt, SessionEvent, SessionHandle, SessionSnapshot, TurnResult } from './types.js';
+import type {
+  ExitRecord, QueuedPrompt, SessionEvent, SessionHandle, SessionSnapshot, TurnResult,
+} from './types.js';
 
 /** SessionHandle adapter for the existing tmux transport. */
 export class TmuxSession implements SessionHandle {
@@ -68,6 +70,15 @@ export class TmuxSession implements SessionHandle {
   }
 
   setControllerAttached(): void {}
+
+  /**
+   * A tmux pane's exit is only visible through the record its shell wrapper
+   * writes; the runner owns that file and classifies it. Nothing observable
+   * from here, so say `null` rather than guess.
+   */
+  exitResult(): ExitRecord | null {
+    return null;
+  }
 
   async close(): Promise<void> {
     await this.tmux.kill(this.name);

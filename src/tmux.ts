@@ -13,8 +13,13 @@ export class Tmux {
     if (r.code !== 0) throw new Error(`tmux new-session '${name}' failed (${r.code}): ${r.stderr.trim()}`);
   }
 
-  async kill(name: string): Promise<void> {
-    await this.exec('tmux', ['kill-session', '-t', name]); // best-effort
+  /**
+   * Best-effort kill. Returns whether a session was actually there to destroy —
+   * the caller needs that to tell "we tore this session down" apart from "the
+   * program inside it exited on its own".
+   */
+  async kill(name: string): Promise<boolean> {
+    return (await this.exec('tmux', ['kill-session', '-t', name])).code === 0;
   }
 
   async capture(name: string, lines = 40): Promise<string> {

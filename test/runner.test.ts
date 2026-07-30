@@ -4,7 +4,8 @@ import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { stringify } from 'yaml';
-import { runOnce, runTemp, buildPaneCommand, reserveLaunchSlot } from '../src/runner.js';
+import { runOnce, runTemp, buildPaneCommand, reserveLaunchSlot, readExitRecord } from '../src/runner.js';
+import { classifyChildExit, classifyShellStatus } from '../src/session/types.js';
 import { registerAdapter } from '../src/harness/registry.js';
 import { agentDir, stateRoot } from '../src/paths.js';
 import { Tmux } from '../src/tmux.js';
@@ -48,7 +49,7 @@ function monitorRecorder(sessionCreated: () => boolean) {
 
 /** Fake tmux whose pane "process" dies after `lifeChecks` liveness polls,
  *  writing `.exit-status` (like the pane shell would) at the moment of death. */
-function fakeWorld(opts: { exitCode?: string; lifeChecks?: number; exitDelayMs?: number; exitFile?: string; bwrap?: 'ok' | 'missing'; cpuDelegated?: boolean } = {}) {
+function fakeWorld(opts: { exitCode?: string; lifeChecks?: number; exitDelayMs?: number; exitFile?: string; bwrap?: 'ok' | 'missing'; cpuDelegated?: boolean; legacyExitFile?: boolean; sessionGone?: boolean } = {}) {
   const paneCommands: string[] = [];
   let clock = 0;
   let checks = 0;
@@ -57,6 +58,7 @@ function fakeWorld(opts: { exitCode?: string; lifeChecks?: number; exitDelayMs?:
     if (cmd === 'bwrap') return { stdout: 'bubblewrap 0.11.1\n', stderr: '', code: opts.bwrap === 'missing' ? 127 : 0 };
     if (args[0] === 'new-session') { paneCommands.push(args[args.length - 1]); sessionCreated = true; }
     if (args[0] === 'list-panes') return { stdout: '4242\n', stderr: '', code: 0 };
+    if (args[0] === 'has-session') return { stdout: '', stderr: '', code: opts.sessionGone ? 1 : 0 };
     return { stdout: '', stderr: '', code: 0 };
   };
   const { rec, createMonitor } = monitorRecorder(() => sessionCreated);
@@ -67,7 +69,9 @@ function fakeWorld(opts: { exitCode?: string; lifeChecks?: number; exitDelayMs?:
     isAlive: () => {
       checks++;
       if (checks >= (opts.lifeChecks ?? 2)) {
-        if (opts.exitFile) writeFileSync(opts.exitFile, (opts.exitCode ?? '0') + '\n');
+        if (opts.exitFile) writeFileSync(opts.exitFile, opts.legacyExitFile
+          ? (opts.exitCode ?? '0') + '\n'                       // pre-upgrade `echo $?`
+          : JSON.stringify({ version: 1, backend: 'tmux', status: Number(opts.exitCode ?? '0') }));
         return false;
       }
       return true;
@@ -91,7 +95,8 @@ describe('buildPaneCommand', () => {
     expect(cmd).toContain(`A='x y'`);
     expect(cmd).toContain(`B='z'`);
     expect(cmd).toContain(`'bin' 'it'\\''s'`);
-    expect(cmd).toContain(`; echo $? > '/tmp/es'`);
+    expect(cmd).toContain(`__ofs=$?`);
+    expect(cmd).toContain(`> '/tmp/es'`);
   });
 
   it('runs a sandbox-wrapped argv while keeping env + exit capture host-side', () => {
@@ -101,8 +106,8 @@ describe('buildPaneCommand', () => {
     expect(cmd.startsWith('env ')).toBe(true);         // env prefix host-side
     expect(cmd).toContain(`A='x'`);
     expect(cmd).toContain(`'bwrap' '--die-with-parent' '--' 'claude' 'go'`);
-    expect(cmd).toContain(`; echo $? > '/tmp/es'`);     // exit capture host-side
-    expect(cmd.indexOf('bwrap')).toBeLessThan(cmd.indexOf('echo $?')); // capture is outside
+    expect(cmd).toContain(`> '/tmp/es'`);                              // exit capture host-side
+    expect(cmd.indexOf('bwrap')).toBeLessThan(cmd.indexOf('__ofs=$?')); // capture is outside
   });
 });
 
@@ -114,7 +119,7 @@ describe('runOnce isolation', () => {
     await runOnce('A', {}, deps);
     expect(paneCommands[0]).toContain(`'bwrap'`);
     expect(paneCommands[0]).toMatch(/'--'.*'fakebin'/);      // original argv after --
-    expect(paneCommands[0]).toContain('; echo $? >');        // exit capture preserved
+    expect(paneCommands[0]).toContain('__ofs=$?');           // exit capture preserved
   });
 
   it('does not wrap when the role has no isolation block', async () => {
@@ -257,6 +262,124 @@ describe('runOnce', () => {
   });
 });
 
+describe('exit classification (1.6)', () => {
+  const readRecord = (d: string) =>
+    JSON.parse(readFileSync(join(d, '.exit-status'), 'utf8')) as { class: string; detail: string };
+
+  it('classifies a shell wait status into clean, program-exit, or signal', () => {
+    expect(classifyShellStatus(0)).toMatchObject({ class: 'clean', code: 0 });
+    expect(classifyShellStatus(1)).toMatchObject({ class: 'program-exit', code: 1 });
+    expect(classifyShellStatus(127)).toMatchObject({ class: 'program-exit', code: 127 });
+    expect(classifyShellStatus(137)).toMatchObject({ class: 'signal', signal: 'SIG9' });
+    expect(classifyShellStatus(143)).toMatchObject({ class: 'signal', signal: 'SIG15' });
+  });
+
+  it('classifies a child exit reported by node, keeping the real signal name', () => {
+    expect(classifyChildExit(0, null)).toMatchObject({ class: 'clean', code: 0 });
+    expect(classifyChildExit(3, null)).toMatchObject({ class: 'program-exit', code: 3 });
+    expect(classifyChildExit(null, 'SIGKILL')).toMatchObject({ class: 'signal', signal: 'SIGKILL' });
+    expect(classifyChildExit(null, null)).toMatchObject({ class: 'unknown' });
+  });
+
+  it('never calls an absent or unreadable record a crash', () => {
+    const p = join(dir, 'nothing-here');
+    expect(readExitRecord(p)).toBeNull();
+    writeFileSync(p, '');
+    expect(readExitRecord(p)).toMatchObject({ class: 'unknown' });
+    writeFileSync(p, 'garbage not json');
+    expect(readExitRecord(p)).toMatchObject({ class: 'unknown' });
+    expect(JSON.stringify(readExitRecord(p))).not.toContain('crash');
+  });
+
+  it('still reads a bare number left by a pre-upgrade pane', () => {
+    const p = join(dir, 'legacy');
+    writeFileSync(p, '0\n');
+    expect(readExitRecord(p)).toMatchObject({ class: 'clean', code: 0 });
+    writeFileSync(p, '137\n');
+    expect(readExitRecord(p)).toMatchObject({ class: 'signal', signal: 'SIG9' });
+  });
+
+  /** label, shell status, resulting class, does the next start resume? */
+  const TMUX_CASES: Array<[string, string, string, boolean]> = [
+    ['a clean exit', '0', 'clean', false],
+    ['a non-zero program exit', '1', 'program-exit', true],
+    ['a signal', '137', 'signal', true],
+  ];
+
+  for (const [label, status, cls, resumes] of TMUX_CASES) {
+    it(`records ${label} and ${resumes ? 'resumes' : 'starts fresh'} next time`, async () => {
+      writeCfg({ A: { harness: 'fake' } });
+      const d = agentDir('A'); mkdirSync(d, { recursive: true });
+      writeFileSync(join(d, '.session-id'), 'OLD\n');
+      writeFileSync(join(d, '.booted'), '');
+      // 30 liveness checks × 2000ms simulated keeps it out of the fast-fail window
+      const { deps } = fakeWorld({ exitCode: status, lifeChecks: 30, exitFile: join(d, '.exit-status') });
+      await runOnce('A', {}, deps);
+      expect(readRecord(d).class).toBe(cls);
+      expect(existsSync(join(d, '.booted'))).toBe(resumes);
+    });
+  }
+
+  it('a missing record with the session still alive is unknown, and keeps context', async () => {
+    writeCfg({ A: { harness: 'fake' } });
+    const d = agentDir('A'); mkdirSync(d, { recursive: true });
+    writeFileSync(join(d, '.booted'), '');
+    const { deps } = fakeWorld({ lifeChecks: 30 });          // no exitFile ⇒ nothing written
+    await runOnce('A', {}, deps);
+    expect(readRecord(d).class).toBe('unknown');
+    expect(existsSync(join(d, '.booted'))).toBe(true);
+  });
+
+  it('a destroyed session is its own class, not a program exit', async () => {
+    writeCfg({ A: { harness: 'fake' } });
+    const d = agentDir('A'); mkdirSync(d, { recursive: true });
+    writeFileSync(join(d, '.session-id'), 'KEEP\n');
+    writeFileSync(join(d, '.booted'), '');
+    const { deps } = fakeWorld({ lifeChecks: 30, sessionGone: true });
+    await runOnce('A', {}, deps);
+    const record = readRecord(d);
+    expect(record.class).toBe('session-destroyed');
+    expect(record.detail).toContain('no longer exists');
+    expect(existsSync(join(d, '.booted'))).toBe(true);
+  });
+
+  it('a session destroyed early is NOT treated as a fast-failing resume', async () => {
+    writeCfg({ A: { harness: 'fake' } });
+    const d = agentDir('A'); mkdirSync(d, { recursive: true });
+    writeFileSync(join(d, '.session-id'), 'KEEP\n');
+    writeFileSync(join(d, '.booted'), '');                   // resume mode
+    // dies after ~0.2s simulated — well inside fastFailSecs (20)
+    const { deps } = fakeWorld({ exitDelayMs: 100, sessionGone: true });
+    await runOnce('A', {}, deps);
+    expect(readRecord(d).class).toBe('session-destroyed');
+    expect(readFileSync(join(d, '.session-id'), 'utf8').trim()).toBe('KEEP');
+    expect(existsSync(join(d, '.booted'))).toBe(true);
+  });
+
+  it('a program that exits fast during resume still self-heals to fresh', async () => {
+    writeCfg({ A: { harness: 'fake' } });
+    const d = agentDir('A'); mkdirSync(d, { recursive: true });
+    writeFileSync(join(d, '.session-id'), 'OLD\n');
+    writeFileSync(join(d, '.booted'), '');
+    const { deps } = fakeWorld({ exitCode: '1', exitDelayMs: 100, exitFile: join(d, '.exit-status') });
+    await runOnce('A', {}, deps);
+    expect(readRecord(d).class).toBe('program-exit');
+    expect(readFileSync(join(d, '.session-id'), 'utf8').trim()).not.toBe('OLD');
+  });
+
+  it('a legacy bare-number record drives the same decision', async () => {
+    writeCfg({ A: { harness: 'fake' } });
+    const d = agentDir('A'); mkdirSync(d, { recursive: true });
+    writeFileSync(join(d, '.session-id'), 'OLD\n');
+    const { deps } = fakeWorld({
+      exitCode: '0', legacyExitFile: true, exitFile: join(d, '.exit-status'),
+    });
+    await runOnce('A', {}, deps);
+    expect(readRecord(d).class).toBe('clean');
+    expect(readFileSync(join(d, '.session-id'), 'utf8').trim()).not.toBe('OLD');
+  });
+});
+
 describe('runOnce ACP startup outcome (1.2)', () => {
   const acpFixture = join(dirname(fileURLToPath(import.meta.url)), 'fixtures', 'acp-agent.mjs');
 
@@ -339,6 +462,27 @@ describe('runOnce ACP startup outcome (1.2)', () => {
     await runOnce('A', {}, deps);
     expect(logs.some(l => l.includes('permission policy'))).toBe(false);
   });
+
+  it('records the ACP child\'s real exit, per class (1.6)', async () => {
+    for (const [code, cls, fresh] of [['0', 'clean', true], ['4', 'program-exit', false]] as const) {
+      writeCfg({ A: {
+        harness: 'fake-acp', session: 'acp',
+        env: { ACP_FIXTURE_EXIT_AFTER: '1', ACP_FIXTURE_EXIT_CODE: code },
+      } });
+      const d = agentDir('A');
+      rmSync(d, { recursive: true, force: true });
+      mkdirSync(d, { recursive: true });
+      writeFileSync(join(d, '.session-id'), 'OLD\n');
+      const { deps } = acpDeps();
+
+      await runOnce('A', {}, deps);
+      const record = JSON.parse(readFileSync(join(d, '.exit-status'), 'utf8'));
+      expect(record.class, `exit code ${code}`).toBe(cls);
+      if (cls === 'program-exit') expect(record.code).toBe(4);
+      // A clean exit rotates under this adapter's policy; a program exit does not.
+      expect(readFileSync(join(d, '.session-id'), 'utf8').trim() !== 'OLD').toBe(fresh);
+    }
+  }, 20_000);
 
   it('a completed startup prompt does log the role up', async () => {
     writeCfg({ A: {

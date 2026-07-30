@@ -16,7 +16,8 @@ import type { WrapContext } from './isolation/types.js';
 import { AcpSession } from './session/acp.js';
 import { RoleControlServer } from './session/control.js';
 import { TmuxSession } from './session/tmux.js';
-import type { SessionHandle } from './session/types.js';
+import { classifyShellStatus } from './session/types.js';
+import type { ExitRecord, SessionHandle } from './session/types.js';
 
 export interface RunnerDeps {
   tmux: Tmux;
@@ -58,7 +59,12 @@ export function buildPaneCommand(
   const env = { PATH: process.env.PATH ?? '', ...launch.env, ...(roleEnv ?? {}) };
   const envPfx = 'env ' + Object.entries(env).map(([k, v]) => `${k}=${shq(v)}`).join(' ');
   const cmd = paneArgv.map(shq).join(' ');
-  return `${envPfx} ${cmd}; echo $? > ${shq(exitStatusPath)}`;
+  // Write a structured record, not a bare number: the wait status alone cannot
+  // say whether the file is missing because the program never exited or because
+  // nothing ever wrote it. `printf` is POSIX; no shell branching is needed
+  // because classification happens in one place, in TypeScript.
+  const record = `'{"version":1,"backend":"tmux","status":'"$__ofs"'}'`;
+  return `${envPfx} ${cmd}; __ofs=$?; printf %s ${record} > ${shq(exitStatusPath)}`;
 }
 
 /** Adapt runner deps and the role's daemon-profile overrides for the monitor. */
@@ -75,6 +81,25 @@ function monitorDeps(deps: RunnerDeps, roleEnv?: Record<string, string>): Monito
     env: { ...process.env, ...(roleEnv ?? {}) },
     timers: { set: (fn, ms) => setTimeout(fn, ms), clear: t => clearTimeout(t) },
   };
+}
+
+/**
+ * Read the pane's `.exit-status`. Three shapes are accepted: the structured
+ * record written above, a bare number left by a pre-upgrade pane (so an
+ * in-place upgrade does not misread a real exit), and anything else — which is
+ * `unknown`, never an invented failure. A missing file returns null so the
+ * caller can distinguish "no record" from "a record saying unknown".
+ */
+export function readExitRecord(path: string): ExitRecord | null {
+  if (!existsSync(path)) return null;
+  const raw = readFileSync(path, 'utf8').trim();
+  if (!raw) return { version: 1, class: 'unknown', detail: 'the pane left an empty exit record' };
+  if (/^-?\d+$/.test(raw)) return classifyShellStatus(Number(raw));   // legacy `echo $?`
+  try {
+    const parsed = JSON.parse(raw) as { status?: unknown };
+    if (typeof parsed.status === 'number') return classifyShellStatus(parsed.status);
+  } catch { /* fall through to unknown */ }
+  return { version: 1, class: 'unknown', detail: `unreadable exit record: ${raw.slice(0, 120)}` };
 }
 
 /** Filename spawnTemp writes into a temp agent dir to carry the fleet start-stagger. */
@@ -340,17 +365,35 @@ export async function runOnce(
   if (control) await control.close();
   if (acpSession) await acpSession.close();
   const elapsed = (deps.now() - start) / 1000;
-  const code = existsSync(exitFile) ? readFileSync(exitFile, 'utf8').trim() : 'crash';
+  // Establish what actually happened before deciding anything. Absence of a
+  // record is `unknown` — except when the console itself is gone, which is a
+  // different event with a different consequence.
+  const exitRecord: ExitRecord = acpSession
+    ? acpSession.exitResult()
+      ?? { version: 1, class: 'unknown', detail: 'the ACP agent stopped without reporting an exit' }
+    : readExitRecord(exitFile)
+      ?? (await deps.tmux.has(name)
+        ? { version: 1, class: 'unknown', detail: 'the pane process ended without writing an exit record' }
+        : { version: 1, class: 'session-destroyed', detail: `the tmux session '${name}' no longer exists` });
+  writeFileSync(exitFile, JSON.stringify({
+    ...exitRecord, at: new Date(deps.now()).toISOString(), elapsedSecs: Number(elapsed.toFixed(1)),
+  }) + '\n');
 
   const rotate = (why: string) => {
     writeFileSync(sidFile, randomUUID() + '\n');
     rmSync(bootedFile, { force: true });
     deps.log(`[${name}] ${why} -> rotated session-id; next start is FRESH`);
   };
-  if (code === '0' && adapter.exitPolicy.cleanExitIsFresh) rotate(`clean exit (code 0)`);
+  if (exitRecord.class === 'clean' && adapter.exitPolicy.cleanExitIsFresh)
+    rotate(`clean exit (code 0)`);
+  else if (exitRecord.class === 'session-destroyed')
+    // Someone tore the console down; the agent did not fail. Rotating here
+    // would discard a live conversation for an operator action.
+    deps.log(`[${name}] ${exitRecord.detail} (${elapsed.toFixed(0)}s) -> next start RESUMES context`);
   else if (mode === 'resume' && elapsed < adapter.exitPolicy.fastFailSecs)
-    rotate(`resume failed fast (${elapsed.toFixed(0)}s, code ${code})`);
-  else deps.log(`[${name}] exited (code ${code}, ${elapsed.toFixed(0)}s) -> next start RESUMES context`);
+    rotate(`resume failed fast (${elapsed.toFixed(0)}s, ${exitRecord.detail})`);
+  else deps.log(
+    `[${name}] ${exitRecord.detail} (${elapsed.toFixed(0)}s) -> next start RESUMES context`);
 }
 
 /** Temp-agent entrypoint: run one session, then remove the temp dir. */

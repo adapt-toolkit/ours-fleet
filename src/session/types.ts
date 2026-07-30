@@ -61,6 +61,61 @@ export interface QueuedPrompt {
   completion: Promise<TurnResult>;
 }
 
+/**
+ * How a session's process ended.
+ *
+ * `unknown` is the honest answer when no evidence was recorded — the previous
+ * code wrote the word `crash` there, asserting a failure it had not observed.
+ * `session-destroyed` (the console was torn down out from under a live process)
+ * and `program-exit` (the program decided to leave) are different events and
+ * must not collapse into one another, because they imply different next starts.
+ */
+export type ExitClass = 'clean' | 'program-exit' | 'signal' | 'session-destroyed' | 'unknown';
+
+export interface ExitRecord {
+  version: 1;
+  class: ExitClass;
+  /** Exit code, when the program exited of its own accord. */
+  code?: number;
+  /** Signal that killed it, when one did. */
+  signal?: string;
+  /** Raw wait status as the pane shell saw it (tmux only). */
+  status?: number;
+  at?: string;
+  /** One line an operator can read. */
+  detail: string;
+}
+
+/**
+ * Classify a shell `$?`. Above 128 the shell is reporting 128+signal — the only
+ * signal evidence a pane wrapper can give us.
+ */
+export function classifyShellStatus(status: number): ExitRecord {
+  if (!Number.isFinite(status))
+    return { version: 1, class: 'unknown', detail: 'pane wrote an unreadable exit status' };
+  if (status === 0)
+    return { version: 1, class: 'clean', code: 0, status, detail: 'exited cleanly (code 0)' };
+  if (status > 128) {
+    const signal = status - 128;
+    return {
+      version: 1, class: 'signal', signal: `SIG${signal}`, status,
+      detail: `killed by signal ${signal} (shell status ${status})`,
+    };
+  }
+  return { version: 1, class: 'program-exit', code: status, status, detail: `exited with code ${status}` };
+}
+
+/** Classify a child process exit reported directly by node. */
+export function classifyChildExit(code: number | null, signal: string | null): ExitRecord {
+  if (signal)
+    return { version: 1, class: 'signal', signal, detail: `killed by ${signal}` };
+  if (code === 0)
+    return { version: 1, class: 'clean', code: 0, detail: 'exited cleanly (code 0)' };
+  if (code === null)
+    return { version: 1, class: 'unknown', detail: 'the process ended with neither a code nor a signal' };
+  return { version: 1, class: 'program-exit', code, detail: `exited with code ${code}` };
+}
+
 /** The single definition of terminal success. Nothing else may re-derive it. */
 export const isTerminalSuccess = (outcome: TurnOutcome): boolean => outcome === 'completed';
 
@@ -136,5 +191,7 @@ export interface SessionHandle {
   eventsSince(seq: number): SessionEvent[];
   subscribe(listener: (event: SessionEvent) => void): () => void;
   setControllerAttached(attached: boolean): void;
+  /** How the backing process ended, or null while it is still running. */
+  exitResult(): ExitRecord | null;
   close(): Promise<void>;
 }

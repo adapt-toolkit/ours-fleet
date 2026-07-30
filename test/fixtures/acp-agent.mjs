@@ -12,6 +12,7 @@ const FORCED_STOP_REASON = process.env.ACP_FIXTURE_STOP_REASON;
 // Exit the agent process after this many prompts (0 = never), so a runner test
 // can let a normal session finish instead of blocking forever.
 const EXIT_AFTER = parseInt(process.env.ACP_FIXTURE_EXIT_AFTER ?? '0', 10) || 0;
+const EXIT_CODE = parseInt(process.env.ACP_FIXTURE_EXIT_CODE ?? '0', 10) || 0;
 let promptsAnswered = 0;
 
 const stopReasonFor = text =>
@@ -50,7 +51,7 @@ const requestPermission = promptId => {
 const answerPrompt = (id, stopReason) => {
   send({ jsonrpc: '2.0', id, result: { stopReason } });
   if (EXIT_AFTER && ++promptsAnswered >= EXIT_AFTER)
-    setTimeout(() => process.exit(0), 20);   // let the reply flush first
+    setTimeout(() => process.exit(EXIT_CODE), 20);   // let the reply flush first
 };
 
 createInterface({ input: process.stdin }).on('line', line => {
