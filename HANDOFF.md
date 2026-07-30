@@ -200,9 +200,13 @@ guaranteed: that another ours client creating the same identity concurrently can
 Degrading loudly is the rule this whole release is built on; degrading silently here would
 re-create the exact defect 2.3 and 5.2 were about.
 
-**Version pin.** Once the endpoint exists, pin the minimum daemon version and have `doctor`
-report which registry is in use — daemon-backed or host-local — so an operator can see the
-difference rather than infer it.
+**Version pin.** Once the endpoint exists, pin the minimum daemon version.
+
+**Recommendation to whoever builds the daemon side:** have `doctor` report WHICH registry is in
+use — daemon-backed or host-local — so an operator sees the difference rather than infers it.
+The fallback must announce itself once and name exactly what is no longer guaranteed. Degrading
+silently there would re-create the defect 2.3 and 5.2 were about, inside the fix for a third
+one.
 
 ## 7.3 — a deviation from the strictest reading, flagged
 
