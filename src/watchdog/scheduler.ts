@@ -3,8 +3,9 @@ import { join } from 'node:path';
 import { loadConfig } from '../config.js';
 import type { ResolvedWatchdog } from './config.js';
 import { errorReport } from './report.js';
-import { executeWatchdogRun, type WatchdogRunOutcome } from './run.js';
+import { executeNotifierRun, executeWatchdogRun, type WatchdogRunOutcome } from './run.js';
 import { acquireRunLock, formatRunId, releaseRunLock, watchdogDir, writeReport } from './store.js';
+import { readLedger, writeLedger } from './alerts.js';
 
 const STATE_FILE = 'state.json';
 
@@ -35,10 +36,16 @@ export function writeSchedulerState(name: string, s: WatchdogSchedulerState): vo
 
 /**
  * Operator release (Task 15): clears failures and heldDown so a held-down
- * loop's next held-down poll sees a clean state and resumes running.
+ * loop's next held-down poll sees a clean state and resumes running. Also
+ * clears the ledger's `heldDownAlerted` flag — that flag is what makes "alert
+ * once per hold-down" durable across scheduler restarts (it lives in
+ * alerts.json, not state.json), so a release must reset it too or a
+ * subsequent hold-down would silently alert zero times.
  */
 export function resetSchedulerState(name: string): void {
   writeSchedulerState(name, cleanState());
+  const ledger = readLedger(name);
+  if (ledger.heldDownAlerted) writeLedger(name, { ...ledger, heldDownAlerted: false });
 }
 
 export const WATCHDOG_HOLD_THRESHOLD = 3;
@@ -59,8 +66,22 @@ export interface SchedulerDeps {
   runOnceFor?: typeof executeWatchdogRun;
   /** Loop exit for tests + SIGTERM (wired by the CLI, not here). */
   shouldStop?(): boolean;
-  /** Phase 2 hook; default no-op. */
+  /**
+   * Scheduler-level alert hook (Task 14, spec §5.5): fired once per hold-down
+   * transition (guarded in `settle` by `ledger.heldDownAlerted`, cleared by
+   * `resetSchedulerState`). Default: `executeNotifierRun` — the fleet
+   * process can't message on its own (deviation 4), so the default delivers
+   * the alert via a one-shot notifier agent under the watchdog's identity.
+   */
   onSchedulerAlert?(wd: ResolvedWatchdog, text: string): Promise<void>;
+  /**
+   * Injectable notifier launcher backing the default `onSchedulerAlert` —
+   * consulted only when `onSchedulerAlert` itself is not supplied. Default:
+   * `executeNotifierRun`. Lets tests observe/short-circuit the default alert
+   * path (binPath/log/now/sleep wiring) without replacing onSchedulerAlert
+   * wholesale.
+   */
+  notifierRun?: typeof executeNotifierRun;
   /** Poll cadence while held down. Default 5000. */
   heldPollMs?: number;
   /**
@@ -82,15 +103,19 @@ export interface SchedulerDeps {
 export async function runWatchdogLoop(wd: ResolvedWatchdog, deps: SchedulerDeps): Promise<void> {
   const runOnceFor = deps.runOnceFor ?? executeWatchdogRun;
   const shouldStop = deps.shouldStop ?? (() => false);
-  const onSchedulerAlert = deps.onSchedulerAlert ?? (async () => {});
+  const notifierRun = deps.notifierRun ?? executeNotifierRun;
+  const onSchedulerAlert = deps.onSchedulerAlert ?? ((wd, text) => notifierRun(wd, text, {
+    binPath: deps.binPath, log: deps.log, now: deps.now, sleep: deps.sleep,
+  }));
   const heldPollMs = deps.heldPollMs ?? 5_000;
   const locks = deps.locks ?? { acquire: acquireRunLock, release: releaseRunLock };
 
   /**
    * Apply one tick's outcome to state.json: update the failure streak,
    * transition into hold-down on the Nth consecutive failure (firing the
-   * alert exactly once via the `!heldDown` guard), then sleep before the
-   * next tick. On the tick that transitions into hold-down, sleep
+   * alert at most once per transition via the ledger's `heldDownAlerted`
+   * guard — durable across restarts, unlike an in-memory flag), then sleep
+   * before the next tick. On the tick that transitions into hold-down, sleep
    * `heldPollMs` rather than the (possibly hour-long) backoff delay — an
    * operator's resetSchedulerState must be noticed within one poll cycle,
    * not after the last backoff finishes (review finding #2).
@@ -120,7 +145,13 @@ export async function runWatchdogLoop(wd: ResolvedWatchdog, deps: SchedulerDeps)
     if (justHeld) {
       const msg = `watchdog ${wd.name} held down after ${WATCHDOG_HOLD_THRESHOLD} consecutive failed runs: ${s.lastError}`;
       deps.log(msg);
-      await onSchedulerAlert(wd, msg);
+      // "Once per state change" (spec §5.5) must survive a scheduler restart, so the guard
+      // lives in the ledger (alerts.json), not in memory — resetSchedulerState clears it.
+      const ledger = readLedger(wd.name);
+      if (!ledger.heldDownAlerted) {
+        await onSchedulerAlert(wd, msg);
+        writeLedger(wd.name, { ...ledger, heldDownAlerted: true });
+      }
     }
 
     await deps.sleep(delay);

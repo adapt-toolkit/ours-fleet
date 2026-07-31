@@ -4,8 +4,8 @@ import {
 } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { executeWatchdogRun } from '../src/watchdog/run.js';
-import { listRuns, writeReport } from '../src/watchdog/store.js';
+import { executeNotifierRun, executeWatchdogRun } from '../src/watchdog/run.js';
+import { acquireRunLock, listRuns, releaseRunLock, writeReport } from '../src/watchdog/store.js';
 import { errorReport } from '../src/watchdog/report.js';
 import { readLedger, writeLedger } from '../src/watchdog/alerts.js';
 import type { WatchManifest } from '../src/watchdog/briefing.js';
@@ -181,5 +181,54 @@ describe('executeWatchdogRun', () => {
     });
     await executeWatchdogRun(wd as never, baseDeps(launch) as never);
     expect(readLedger('nightwatch').open).toEqual({});
+  });
+});
+
+describe('executeNotifierRun', () => {
+  it('writes a minimal briefing (text + coordinator + sendTool), no watch.json, waits for sent.json, stores no report', async () => {
+    const seen: { briefing?: string; hasManifest?: boolean } = {};
+    const launch = fakeChild(async runDir => {
+      seen.briefing = readFileSync(join(runDir, 'briefing.md'), 'utf8');
+      seen.hasManifest = existsSync(join(runDir, 'watch.json'));
+      writeFileSync(join(runDir, 'sent.json'), JSON.stringify({ sent: true }));
+      const old = new Date(Date.now() - 5_000);
+      utimesSync(join(runDir, 'sent.json'), old, old);
+    });
+    await executeNotifierRun(wd as never, 'Alice is stale', baseDeps(launch) as never);
+    expect(seen.briefing).toContain('Alice is stale');
+    expect(seen.briefing).toContain('FleetCoordinator');
+    expect(seen.briefing).toContain('send_message');   // claude-code adapter's sendTool
+    expect(seen.briefing).toContain('sent.json');
+    expect(seen.hasManifest).toBe(false);
+    expect(listRuns('nightwatch')).toHaveLength(0);      // no report stored
+    expect(existsSync(agentDir('Watchdog-nightwatch', true))).toBe(false);   // cleaned up
+  });
+
+  it('logs a warning and does not throw when the 2-minute deadline passes', async () => {
+    let t = 0;
+    const launch = fakeChild(() => new Promise(() => {}));   // never exits, never writes
+    const logs: string[] = [];
+    const deps = { ...baseDeps(launch), log: (l: string) => logs.push(l), now: () => new Date(t += 130_000) };
+    await expect(executeNotifierRun(wd as never, 'hi', deps as never)).resolves.toBeUndefined();
+    expect(logs.some(l => l.includes(`notifier run for 'nightwatch' timed out`))).toBe(true);
+    expect(listRuns('nightwatch')).toHaveLength(0);
+  });
+
+  it('logs a warning and does not throw when the child launch throws', async () => {
+    const logs: string[] = [];
+    const launch = () => { throw new Error('spawn EMFILE'); };
+    const deps = { ...baseDeps(launch as never), log: (l: string) => logs.push(l) };
+    await expect(executeNotifierRun(wd as never, 'hi', deps as never)).resolves.toBeUndefined();
+    expect(logs.some(l => l.includes(`notifier run for 'nightwatch' failed: spawn EMFILE`))).toBe(true);
+  });
+
+  it('skips and logs when the run lock is already held, without throwing', async () => {
+    acquireRunLock('nightwatch');
+    const logs: string[] = [];
+    const launch = fakeChild(async () => {});
+    const deps = { ...baseDeps(launch), log: (l: string) => logs.push(l) };
+    await expect(executeNotifierRun(wd as never, 'hi', deps as never)).resolves.toBeUndefined();
+    releaseRunLock('nightwatch');
+    expect(logs.some(l => l.includes(`notifier run for 'nightwatch' skipped: run lock held`))).toBe(true);
   });
 });

@@ -29,6 +29,32 @@ export interface WatchdogBriefingOpts {
 }
 
 /**
+ * The "bind or mint your identity" block shared by every watchdog-family briefing (the
+ * inspection contract and the notifier contract alike): call bindTool, and if the identity
+ * wasn't verified when configured, fall back to createTool on first run.
+ */
+function bindSection(
+  heading: string, wd: ResolvedWatchdog, v: BriefingVocab,
+  guarantee: 'verified' | 'created' | 'unverified',
+): string[] {
+  const L: string[] = ['', heading];
+  L.push(`Call the **${v.bindTool}** tool with name "${wd.identity}" force=true (search the`);
+  L.push('deferred tool registry first if needed).');
+  if (guarantee === 'unverified') {
+    L.push(`- This identity was NOT verified when this watchdog was configured, so it may not`);
+    L.push(`  exist yet. If binding reports no such identity, call **${v.createTool}** name`);
+    L.push(`  "${wd.identity}" once to mint it on this first run, then you are bound. Re-binding`);
+    L.push('  your OWN identity is always allowed.');
+  } else {
+    L.push(`- It was ${guarantee === 'created' ? 'created' : 'verified to exist'} when this`);
+    L.push('  watchdog was configured, so binding should succeed. If it unexpectedly reports no');
+    L.push(`  such identity, call **${v.createTool}** name "${wd.identity}" once and report the`);
+    L.push('  discrepancy — something removed it since.');
+  }
+  return L;
+}
+
+/**
  * Render a watchdog run's fixed contract (briefing.md-equivalent for a one-shot clean-context
  * run): bind, observe-only rules, procedure, status vocabulary, evidence rules, alert rules,
  * report schema, and — if the watchdog configures one — an appended prompt_file focus.
@@ -47,20 +73,7 @@ export function generateWatchdogBriefing(opts: WatchdogBriefingOpts): string {
   L.push(`You are a fresh, one-shot inspection agent for the **${wd.name}** watchdog. You carry`);
   L.push('no memory from any previous run — this run stands alone, and nothing you learn here');
   L.push('persists past writing your report.');
-  L.push('', '## 1. Bind your identity');
-  L.push(`Call the **${v.bindTool}** tool with name "${wd.identity}" force=true (search the`);
-  L.push('deferred tool registry first if needed).');
-  if (guarantee === 'unverified') {
-    L.push(`- This identity was NOT verified when this watchdog was configured, so it may not`);
-    L.push(`  exist yet. If binding reports no such identity, call **${v.createTool}** name`);
-    L.push(`  "${wd.identity}" once to mint it on this first run, then you are bound. Re-binding`);
-    L.push('  your OWN identity is always allowed.');
-  } else {
-    L.push(`- It was ${guarantee === 'created' ? 'created' : 'verified to exist'} when this`);
-    L.push('  watchdog was configured, so binding should succeed. If it unexpectedly reports no');
-    L.push(`  such identity, call **${v.createTool}** name "${wd.identity}" once and report the`);
-    L.push('  discrepancy — something removed it since.');
-  }
+  L.push(...bindSection('## 1. Bind your identity', wd, v, guarantee));
 
   // 2. Observe-only rules, verbatim (spec §1).
   L.push('', '## 2. Observe-only — non-negotiable');
@@ -194,6 +207,45 @@ export function generateWatchdogBriefing(opts: WatchdogBriefingOpts): string {
       'alert rules above are unchanged and non-negotiable.',
     );
   }
+
+  return L.join('\n') + '\n';
+}
+
+export interface NotifierBriefingOpts {
+  wd: ResolvedWatchdog;
+  vocabulary: BriefingVocab;
+  /** What spawn actually established about the watchdog's ours identity (7.3, decision 3). */
+  identityGuarantee: 'verified' | 'created' | 'unverified';
+  /** The exact message to relay — the scheduler composed this, the notifier only delivers it. */
+  text: string;
+}
+
+/**
+ * Render a scheduler-alert notifier run's entire contract: a minimal one-shot agent whose sole
+ * job is to bind its identity, send one exact message to the coordinator, and write `sent.json`
+ * as its completion sentinel. Used only for scheduler-level alerts (e.g. held-down) — the fleet
+ * process itself cannot send ours messages (deviation 4), so this is how it delegates the send.
+ * Unlike `generateWatchdogBriefing`, there is no report.json, no manifest, and no inspection.
+ */
+export function generateNotifierBriefing(opts: NotifierBriefingOpts): string {
+  const { wd, vocabulary: v, identityGuarantee: guarantee, text } = opts;
+  const L: string[] = [];
+
+  L.push(`# Watchdog alert notifier: ${wd.name} (ours identity: ${wd.identity})`, '');
+  L.push('You are a minimal one-shot notifier agent. You carry no memory from any previous run —');
+  L.push('this run stands alone, and it has exactly one job: relay one message, then stop.');
+  L.push(...bindSection('## Bind your identity', wd, v, guarantee));
+
+  L.push('', '## Send the message');
+  L.push(`Send exactly this message to ${wd.coordinator} using **${v.sendTool}**:`);
+  L.push('');
+  L.push(text);
+
+  L.push('', '## Finish');
+  L.push(
+    `Then write a file \`sent.json\` containing \`{"sent": true}\` in your cwd as your LAST ` +
+    'action — it ends the run. Do nothing else: no inspection, no report.json, no other messages.',
+  );
 
   return L.join('\n') + '\n';
 }

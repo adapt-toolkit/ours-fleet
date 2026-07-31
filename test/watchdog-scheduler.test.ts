@@ -7,6 +7,7 @@ import {
 } from '../src/watchdog/scheduler.js';
 import { listRuns, acquireRunLock, releaseRunLock, formatRunId } from '../src/watchdog/store.js';
 import { errorReport } from '../src/watchdog/report.js';
+import { readLedger, writeLedger } from '../src/watchdog/alerts.js';
 
 let dir: string;
 beforeEach(() => {
@@ -150,5 +151,42 @@ describe('watchdog scheduler', () => {
     expect(s.heldDown).toBe(true);
     expect(s.lastError).toBe('spawn failed');
     expect(deps.alerts).toHaveLength(1);
+  });
+
+  it('a hold-down transition with ledger.heldDownAlerted already true fires no alert (durable "once per state change", spec §5.5)', async () => {
+    writeLedger('nightwatch', { version: 1, open: {}, heldDownAlerted: true });
+    const deps = world({ results: ['error', 'error', 'error'] });
+    await runWatchdogLoop(wd as never, deps as never);
+    expect(readSchedulerState('nightwatch').heldDown).toBe(true);
+    expect(deps.alerts).toHaveLength(0);   // guard held, so onSchedulerAlert never fired
+  });
+
+  it('a fresh hold-down transition sets ledger.heldDownAlerted after alerting', async () => {
+    const deps = world({ results: ['error', 'error', 'error'] });
+    await runWatchdogLoop(wd as never, deps as never);
+    expect(deps.alerts).toHaveLength(1);
+    expect(readLedger('nightwatch').heldDownAlerted).toBe(true);
+  });
+
+  it('resetSchedulerState clears ledger.heldDownAlerted, so a later hold-down alerts again', async () => {
+    writeLedger('nightwatch', { version: 1, open: {}, heldDownAlerted: true });
+    resetSchedulerState('nightwatch');
+    expect(readLedger('nightwatch').heldDownAlerted).toBe(false);
+
+    const deps = world({ results: ['error', 'error', 'error'] });
+    await runWatchdogLoop(wd as never, deps as never);
+    expect(deps.alerts).toHaveLength(1);   // alerts again after the reset cleared the flag
+  });
+
+  it('the default onSchedulerAlert (no override) invokes the injected notifierRun hook with the alert text', async () => {
+    const deps = world({ results: ['error', 'error', 'error'] });
+    delete (deps as { onSchedulerAlert?: unknown }).onSchedulerAlert;
+    const calls: Array<{ name: string; text: string }> = [];
+    (deps as unknown as { notifierRun: (wd: { name: string }, text: string, d: unknown) => Promise<void> }).notifierRun =
+      async (w, text) => { calls.push({ name: w.name, text }); };
+    await runWatchdogLoop(wd as never, deps as never);
+    expect(calls).toHaveLength(1);
+    expect(calls[0].name).toBe('nightwatch');
+    expect(calls[0].text).toMatch(/held down after 3/);
   });
 });
