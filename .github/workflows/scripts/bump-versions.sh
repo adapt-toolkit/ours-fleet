@@ -32,17 +32,19 @@ no_bump() {
 }
 
 msg=$(git log -1 --pretty=%B HEAD)
-subject=$(printf '%s\n' "$msg" | head -n1)
-body=$(printf '%s\n' "$msg" | tail -n +2)
+# Avoid short-reading pipelines under `set -o pipefail`: a large commit body
+# makes `head`/`grep -q` close early, SIGPIPEs `printf`, and aborts the job.
+subject=${msg%%$'\n'*}
+body=${msg#"$subject"}
 log "head subject: $subject"
 
-printf '%s\n' "$msg" | grep -qiE '\[skip ci\]|\[ci skip\]' && no_bump "[skip ci] marker present"
+grep -qiE '\[skip ci\]|\[ci skip\]' <<<"$msg" && no_bump "[skip ci] marker present"
 
-if printf '%s\n' "$subject" | grep -qE '^[a-z]+(\([^)]+\))?!:' \
-   || printf '%s\n' "$body" | grep -qE '^BREAKING CHANGE:'; then
+if grep -qE '^[a-z]+(\([^)]+\))?!:' <<<"$subject" \
+   || grep -qE '^BREAKING CHANGE:' <<<"$body"; then
   level=major
 else
-  type=$(printf '%s\n' "$subject" | grep -oE '^[a-z]+' || true)
+  if [[ "$subject" =~ ^([a-z]+) ]]; then type=${BASH_REMATCH[1]}; else type=; fi
   case "$type" in
     feat)                                level=minor ;;
     fix)                                 level=patch ;;
@@ -98,7 +100,7 @@ git diff --cached --quiet && no_bump "no changes after patch"
 
 git commit -m "chore(release): fleet v${cli_new}, fleet-claude-code v${plug_new}, fleet-codex v${codex_new} [skip ci]
 
-Triggered by $(git rev-parse --short HEAD): $(printf '%s' "$subject" | head -c 200)"
+Triggered by $(git rev-parse --short HEAD): ${subject:0:200}"
 git push origin "HEAD:${GITHUB_REF_NAME:-main}"
 
 emit "bumped=true"
