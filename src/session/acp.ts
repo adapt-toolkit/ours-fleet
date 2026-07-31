@@ -8,7 +8,11 @@ import * as acp from '@agentclientprotocol/sdk';
 
 import type { CommonPermissions } from '../config.js';
 import { SessionEvents } from './events.js';
-import type { SessionEvent, SessionHandle, SessionSnapshot, TurnResult } from './types.js';
+import { SessionControlError, classifyChildExit, turnResult } from './types.js';
+import type {
+  ExitRecord, PermissionDecision, QueuedPrompt, SessionEvent, SessionHandle, SessionSnapshot,
+  TurnOutcome, TurnResult,
+} from './types.js';
 
 interface PendingPermission {
   options: Array<{ optionId: string; kind: string }>;
@@ -24,6 +28,19 @@ export interface AcpSessionOptions {
   mode: 'fresh' | 'resume';
   permissions: CommonPermissions;
   log(line: string): void;
+}
+
+/**
+ * Classify an ACP `stopReason` into a terminal outcome. A refusal and a
+ * cancellation are the two ways a delivered prompt ends without being carried
+ * out; every other stop reason ran the turn to an end the agent chose.
+ */
+export function classifyStopReason(stopReason: string | undefined): TurnOutcome {
+  switch (stopReason) {
+    case 'refusal': return 'refused';
+    case 'cancelled': return 'cancelled';
+    default: return 'completed';
+  }
 }
 
 /**
@@ -43,6 +60,8 @@ export class AcpSession implements SessionHandle {
   private readiness: SessionSnapshot['readiness'] = 'starting';
   private lastError?: string;
   private promptTail: Promise<unknown> = Promise.resolve();
+  private queueDepth = 0;
+  private exit: ExitRecord | null = null;
   private capabilities?: acp.AgentCapabilities;
   private controllerCount = 0;
 
@@ -58,9 +77,12 @@ export class AcpSession implements SessionHandle {
     this.sessionFile = join(options.stateDir, '.acp-session-id');
     child.stderr.on('data', chunk => options.log(`[${options.name}] acp: ${String(chunk).trimEnd()}`));
     child.once('exit', (code, signal) => {
+      // Record the child's real exit code/signal. The tmux path can only see a
+      // shell's `$?`; here the truth is available, so keep it.
+      this.exit = classifyChildExit(code, signal);
       if (this.readiness !== 'failed') {
         this.readiness = 'failed';
-        this.lastError = `ACP agent exited (${code ?? signal ?? 'unknown'})`;
+        this.lastError = `ACP agent ${this.exit.detail}`;
       }
       this.events.emit('state', { status: 'failed', text: this.lastError });
     });
@@ -118,10 +140,35 @@ export class AcpSession implements SessionHandle {
     };
   }
 
-  submitPrompt(text: string): Promise<TurnResult> {
-    const operation = this.promptTail.then(() => this.runPrompt(text));
-    this.promptTail = operation.then(() => undefined, () => undefined);
-    return operation;
+  /**
+   * Accept responsibility for a prompt, then return. The turn itself may run
+   * for minutes behind other queued turns; making an interactive caller wait
+   * for it is what turned a busy agent into a timeout and then into "dead".
+   */
+  async queuePrompt(text: string): Promise<QueuedPrompt> {
+    if (!this.sessionId || !this.isAlive())
+      throw new SessionControlError('offline', this.lastError ?? 'ACP session is offline');
+    const promptId = randomUUID();
+    const queuedBehind = this.queueDepth++;
+    const run = this.promptTail.then(() => this.runPrompt(text, promptId));
+    this.promptTail = run.then(() => undefined, () => undefined);
+    const completion = run.then(
+      result => { this.queueDepth = Math.max(0, this.queueDepth - 1); return result; },
+      error => {
+        this.queueDepth = Math.max(0, this.queueDepth - 1);
+        return turnResult(false, 'failed', (error as Error)?.message ?? String(error));
+      },
+    );
+    return { promptId, queuedBehind, completion };
+  }
+
+  async submitPrompt(text: string): Promise<TurnResult> {
+    try {
+      return await (await this.queuePrompt(text)).completion;
+    } catch (error) {
+      if (error instanceof SessionControlError) return turnResult(false, 'failed', error.message);
+      throw error;
+    }
   }
 
   async interrupt(): Promise<void> {
@@ -131,9 +178,18 @@ export class AcpSession implements SessionHandle {
 
   respondPermission(permissionId: string, optionId: string): boolean {
     const pending = this.pendingPermissions.get(permissionId);
-    if (!pending || !pending.options.some(option => option.optionId === optionId)) return false;
+    const chosen = pending?.options.find(option => option.optionId === optionId);
+    if (!pending || !chosen) return false;
     this.pendingPermissions.delete(permissionId);
     pending.resolve({ outcome: { outcome: 'selected', optionId } });
+    this.events.emit('permission', {
+      permissionId,
+      status: 'completed',
+      decision: chosen.kind.startsWith('reject') ? 'denied' : 'allowed',
+      decisionSource: 'manual',
+      reason: `answered from an attached controller (${chosen.kind})`,
+      optionId,
+    });
     this.readiness = 'running';
     return true;
   }
@@ -148,6 +204,10 @@ export class AcpSession implements SessionHandle {
 
   setControllerAttached(attached: boolean): void {
     this.controllerCount = Math.max(0, this.controllerCount + (attached ? 1 : -1));
+  }
+
+  exitResult(): ExitRecord | null {
+    return this.exit;
   }
 
   async close(): Promise<void> {
@@ -202,11 +262,10 @@ export class AcpSession implements SessionHandle {
     this.events.emit('state', { status: 'idle', text: `ACP session ${this.sessionId}` });
   }
 
-  private async runPrompt(text: string): Promise<TurnResult> {
+  private async runPrompt(text: string, turnId: string = randomUUID()): Promise<TurnResult> {
     if (!this.sessionId || !this.isAlive())
-      return { accepted: false, outcome: 'failed', detail: this.lastError ?? 'ACP session is offline' };
+      return turnResult(false, 'failed', this.lastError ?? 'ACP session is offline');
     this.readiness = 'running';
-    const turnId = randomUUID();
     this.events.emit('state', { turnId, status: 'running' });
     try {
       const response = await this.connection.agent.request(acp.methods.agent.session.prompt, {
@@ -216,36 +275,47 @@ export class AcpSession implements SessionHandle {
       this.readiness = 'idle';
       this.events.emit('turn_stop', { turnId, stopReason: response.stopReason });
       this.events.emit('state', { status: 'idle' });
-      const outcome = response.stopReason === 'cancelled'
-        ? 'cancelled'
-        : response.stopReason === 'refusal'
-          ? 'refused'
-          : 'completed';
-      return { accepted: true, outcome, detail: response.stopReason };
+      // The prompt was accepted either way — the agent answered. Whether the
+      // turn SUCCEEDED is a separate question, and only `stopReason` answers it.
+      return turnResult(true, classifyStopReason(response.stopReason), response.stopReason);
     } catch (error) {
       this.lastError = (error as Error)?.message ?? String(error);
       this.readiness = this.isAlive() ? 'idle' : 'failed';
       this.events.emit('error', { turnId, text: this.lastError });
       if (this.isAlive()) this.events.emit('state', { status: 'idle' });
-      return { accepted: false, outcome: 'failed', detail: this.lastError };
+      return turnResult(false, 'failed', this.lastError);
     }
   }
 
   private requestPermission(params: acp.RequestPermissionRequest): Promise<acp.RequestPermissionResponse> {
-    const choose = (kinds: string[]) =>
-      params.options.find(option => kinds.includes(option.kind));
+    // `kinds` is a PRIORITY order. Scanning the agent's option array instead
+    // (`options.find(o => kinds.includes(o.kind))`) hands the choice to whatever
+    // order the agent happened to list, which is exactly how an automatic denial
+    // could land on `reject_always`.
+    const choose = (kinds: string[]) => {
+      for (const kind of kinds) {
+        const option = params.options.find(o => o.kind === kind);
+        if (option) return option;
+      }
+      return undefined;
+    };
     if (this.options.permissions.approval === 'allow' && this.withinAutomaticBoundary(params)) {
       const option = choose(['allow_always', 'allow_once']);
-      return Promise.resolve(option
-        ? { outcome: { outcome: 'selected', optionId: option.optionId } }
-        : { outcome: { outcome: 'cancelled' } });
+      return Promise.resolve(this.settleAutomatically(params, option, 'allowed',
+        'permissions.approval=allow',
+        `the request is inside the ${this.options.permissions.filesystem} boundary`));
     }
-    if (this.options.permissions.approval === 'deny'
-        || (this.controllerCount === 0 && this.options.permissions.unattended === 'deny')) {
-      const option = choose(['reject_always', 'reject_once']);
-      return Promise.resolve(option
-        ? { outcome: { outcome: 'selected', optionId: option.optionId } }
-        : { outcome: { outcome: 'cancelled' } });
+    const unattended = this.controllerCount === 0 && this.options.permissions.unattended === 'deny';
+    if (this.options.permissions.approval === 'deny' || unattended) {
+      // reject_once FIRST: `reject_always` teaches the agent a standing rule from
+      // a decision no human made, so one unattended denial would silently disable
+      // the tool for the rest of the session.
+      const option = choose(['reject_once', 'reject_always']);
+      return Promise.resolve(this.settleAutomatically(params, option, 'denied',
+        unattended ? 'permissions.unattended=deny' : 'permissions.approval=deny',
+        unattended
+          ? 'no controller is attached, so the request cannot be shown to anyone'
+          : 'the role denies every permission request by policy'));
     }
 
     const permissionId = randomUUID();
@@ -262,6 +332,36 @@ export class AcpSession implements SessionHandle {
     return new Promise(resolve => {
       this.pendingPermissions.set(permissionId, { options: params.options, resolve });
     });
+  }
+
+  /**
+   * Resolve a permission request from policy alone and leave a record of it.
+   * Nothing else in the system can observe an automatic decision, so an
+   * unrecorded one is indistinguishable from a request that was never made.
+   */
+  private settleAutomatically(
+    params: acp.RequestPermissionRequest,
+    option: { optionId: string; name: string; kind: string } | undefined,
+    decision: PermissionDecision,
+    policy: string,
+    reason: string,
+  ): acp.RequestPermissionResponse {
+    const settled: PermissionDecision = option ? decision : 'cancelled';
+    this.events.emit('permission', {
+      permissionId: randomUUID(),
+      toolCallId: params.toolCall.toolCallId,
+      title: params.toolCall.title ?? 'Permission requested',
+      status: 'completed',
+      decision: settled,
+      decisionSource: 'automatic',
+      policy,
+      reason: option ? reason : `${reason}, but the agent offered no matching option`,
+      optionId: option?.optionId,
+      options: params.options.map(o => ({ optionId: o.optionId, name: o.name, kind: o.kind })),
+    });
+    return option
+      ? { outcome: { outcome: 'selected', optionId: option.optionId } }
+      : { outcome: { outcome: 'cancelled' } };
   }
 
   private withinAutomaticBoundary(params: acp.RequestPermissionRequest): boolean {

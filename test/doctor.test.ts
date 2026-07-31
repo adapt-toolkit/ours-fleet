@@ -3,8 +3,11 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { doctor } from '../src/doctor.js';
+import { loadConfig } from '../src/config.js';
 import { registerAdapter } from '../src/harness/registry.js';
 import { fakeAdapter } from './registry.test.js';
+import '../src/harness/claude-code.js';   // registers the production adapters
+import '../src/harness/codex.js';
 import type { Exec, ExecResult } from '../src/exec.js';
 import type { FetchLike } from '../src/monitor.js';
 
@@ -316,5 +319,303 @@ describe('user bus check (#9)', () => {
       'ours-mcp status': { stdout: 'running', stderr: '', code: 0 },
     }), 'darwin');
     expect(rep.checks.find(c => c.name === 'user bus')).toBeUndefined();
+  });
+});
+
+describe('doctor config validity (1.4)', () => {
+  const HEALTHY_HOST = {
+    'tmux -V': { stdout: 'tmux 3.4', stderr: '', code: 0 },
+    'ours-mcp --version': { stdout: '0.1.2', stderr: '', code: 0 },
+    'ours-mcp status': { stdout: 'running', stderr: '', code: 0 },
+    'loginctl show-user': { stdout: 'Linger=yes', stderr: '', code: 0 },
+  };
+  const run = (opts: Parameters<typeof doctor>[0] = {}) =>
+    doctor(opts, execWith(HEALTHY_HOST), 'linux', stubFetch());
+  const writeCfg = (yaml: string) => writeFileSync(join(dir, 'fleet.yaml'), yaml);
+
+  /** Every configuration `ours-fleet config` refuses. */
+  const REJECTED: Array<[string, string, RegExp]> = [
+    ['a YAML syntax error', 'roles:\n  A: [oops\n', /./],
+    ['an unknown role key', 'roles:\n  A:\n    harnes: fake\n', /unknown key\(s\) harnes/],
+    ['a misspelled permission key', 'roles:\n  A:\n    permissions:\n      aproval: allow\n',
+      /permissions: unknown key\(s\) aproval/],
+    ['an invalid session backend', 'roles:\n  A:\n    session: telepathy\n', /session: must be one of/],
+    ['a role name with illegal characters', 'roles:\n  "bad name":\n    harness: fake\n',
+      /invalid role name/],
+  ];
+
+  for (const [label, yaml, cause] of REJECTED) {
+    it(`fails on ${label}, naming the same cause as \`config\``, async () => {
+      writeCfg(yaml);
+      // The premise: `config` rejects this exact input.
+      expect(() => loadConfig(join(dir, 'fleet.yaml'))).toThrow();
+      const parserMessage = (() => {
+        try { loadConfig(join(dir, 'fleet.yaml')); return ''; }
+        catch (e) { return (e as Error).message; }
+      })();
+
+      const rep = await run();
+      const cfg = rep.checks.find(c => c.name === 'config')!;
+      expect(cfg.ok).toBe(false);
+      expect(cfg.detail).toMatch(cause);
+      expect(cfg.detail).toBe(parserMessage);      // same actionable cause
+      expect(rep.ok).toBe(false);                  // and the command exits non-zero
+    });
+  }
+
+  it('keeps running the host checks when the config is invalid', async () => {
+    writeCfg('roles:\n  A:\n    harnes: fake\n');
+    const rep = await run();
+    for (const name of ['node', 'tmux', 'ours-mcp', 'ours-mcp daemon', 'linger', 'user bus'])
+      expect(rep.checks.find(c => c.name === name), name).toBeDefined();
+  });
+
+  it('still runs the AI CLI prerequisites when the config resolves no harness', async () => {
+    writeCfg('roles:\n  A:\n    harnes: fake\n');
+    const rep = await run();
+    // Production adapters are registered by importing them (as the CLI does).
+    expect(rep.checks.some(c => c.name.startsWith('claude-code: '))).toBe(true);
+    expect(rep.checks.some(c => c.name.startsWith('codex: '))).toBe(true);
+  });
+
+  it('honours an explicit --harness over the fallback', async () => {
+    writeCfg('roles:\n  A:\n    harnes: fake\n');
+    const rep = await run({ harness: 'codex' });
+    expect(rep.checks.some(c => c.name.startsWith('codex: '))).toBe(true);
+    expect(rep.checks.some(c => c.name.startsWith('claude-code: '))).toBe(false);
+  });
+
+  it('reports the configured-role count and does not fail an empty fleet', async () => {
+    const rep = await run();                          // no fleet.yaml at all
+    expect(rep.checks.find(c => c.name === 'roles')).toMatchObject({ ok: true, detail: '0 configured' });
+    expect(rep.checks.find(c => c.name === 'config')!.ok).toBe(true);
+  });
+
+  it('counts the roles a valid config resolves and names the files', async () => {
+    writeCfg('roles:\n  A:\n    harness: fake\n  B:\n    harness: fake\n');
+    const rep = await run();
+    expect(rep.checks.find(c => c.name === 'roles')!.detail).toBe('2 configured');
+    expect(rep.checks.find(c => c.name === 'config')!.detail).toContain('fleet.yaml');
+  });
+
+  it('reports the role count as unknown — not zero — when the config did not load', async () => {
+    writeCfg('roles:\n  A:\n    harnes: fake\n');
+    const rep = await run();
+    const rolesCheck = rep.checks.find(c => c.name === 'roles')!;
+    expect(rolesCheck.ok).toBe(false);
+    expect(rolesCheck.detail).toContain('unknown');
+    expect(rolesCheck.detail).not.toContain('0 configured');
+  });
+
+  it('fails on a missing explicit config file', async () => {
+    const rep = await doctor(
+      { configPath: join(dir, 'nope.yaml') }, execWith(HEALTHY_HOST), 'linux', stubFetch());
+    const cfg = rep.checks.find(c => c.name === 'config')!;
+    expect(cfg.ok).toBe(false);
+    expect(cfg.detail).toContain('config not found');
+  });
+});
+
+describe('doctor permission translation (2.3)', () => {
+  const HEALTHY = {
+    'tmux -V': { stdout: 'tmux 3.4', stderr: '', code: 0 },
+    'ours-mcp --version': { stdout: '0.1.2', stderr: '', code: 0 },
+    'ours-mcp status': { stdout: 'running', stderr: '', code: 0 },
+    'loginctl show-user': { stdout: 'Linger=yes', stderr: '', code: 0 },
+  };
+  const run = () => doctor({}, execWith(HEALTHY), 'linux', stubFetch());
+  const writeCfg = (yaml: string) => writeFileSync(join(dir, 'fleet.yaml'), yaml);
+  const check = (rep: Awaited<ReturnType<typeof doctor>>, role: string) =>
+    rep.checks.find(c => c.name === `permissions: ${role}`)!;
+
+  it('warns on a lossy Claude combination and names the native mode', async () => {
+    writeCfg('roles:\n  A:\n    harness: claude-code\n    permissions:\n      approval: allow\n');
+    const c = check(await run(), 'A');
+    expect(c.ok).toBe(true);                         // lossy is a warning, not a failure
+    expect(c.detail).toContain('approval=allow');
+    expect(c.detail).toContain('permission_mode=');
+    expect(c.detail).toContain('do not exactly represent');
+  });
+
+  it('stays quiet for the one Claude combination that is exact', async () => {
+    writeCfg('roles:\n  A:\n    harness: claude-code\n'
+      + '    permissions:\n      approval: ask\n      filesystem: workspace\n');
+    const c = check(await run(), 'A');
+    expect(c.detail).toContain('(exact)');
+    expect(c.detail).not.toContain('do not exactly represent');
+  });
+
+  it('does not warn for Codex, which represents the intent exactly', async () => {
+    writeCfg('roles:\n  A:\n    harness: codex\n'
+      + '    permissions:\n      approval: allow\n      filesystem: unrestricted\n');
+    const c = check(await run(), 'A');
+    expect(c.ok).toBe(true);
+    expect(c.detail).toContain('(exact)');
+    expect(c.detail).toContain('sandbox=danger-full-access');
+  });
+
+  it('fails the role when its harness declares neutral permissions unsupported', async () => {
+    registerAdapter({
+      ...fakeAdapter, id: 'no-perms',
+      translatePermissions: () => ({ supported: false, reason: 'it has no permission model' }),
+    });
+    writeCfg('roles:\n  A:\n    harness: no-perms\n');
+    const c = check(await run(), 'A');
+    expect(c.ok).toBe(false);
+    expect(c.detail).toContain('cannot express neutral permissions');
+    expect(c.detail).toContain('it has no permission model');
+  });
+});
+
+describe('doctor unattended capability floor (2.1)', () => {
+  const HEALTHY = {
+    'tmux -V': { stdout: 'tmux 3.4', stderr: '', code: 0 },
+    'ours-mcp --version': { stdout: '0.1.2', stderr: '', code: 0 },
+    'ours-mcp status': { stdout: 'running', stderr: '', code: 0 },
+    'loginctl show-user': { stdout: 'Linger=yes', stderr: '', code: 0 },
+  };
+  const run = () => doctor({}, execWith(HEALTHY), 'linux', stubFetch());
+  const writeCfg = (yaml: string) => writeFileSync(join(dir, 'fleet.yaml'), yaml);
+  const floor = (rep: Awaited<ReturnType<typeof doctor>>, role: string) =>
+    rep.checks.find(c => c.name === `unattended floor: ${role}`)!;
+
+  it('fails an under-permissioned unattended role before it is ever started', async () => {
+    writeCfg('roles:\n  Worker:\n    harness: claude-code\n'
+      + '    permissions:\n      approval: ask\n      unattended: deny\n');
+    const rep = await run();
+    const c = floor(rep, 'Worker');
+    expect(c.ok).toBe(false);
+    expect(c.detail).toContain('MISSING');
+    expect(c.detail).toContain('workspace-edit');
+    expect(c.detail).toContain('denied silently');
+    expect(rep.ok).toBe(false);                    // and the command exits non-zero
+  });
+
+  it('passes a floor-compliant role and lists what it grants', async () => {
+    writeCfg('roles:\n  Worker:\n    harness: claude-code\n'
+      + '    permissions:\n      approval: allow\n      filesystem: workspace\n      unattended: deny\n');
+    const c = floor(await run(), 'Worker');
+    expect(c.ok).toBe(true);
+    expect(c.detail).toContain('workspace-edit');
+    expect(c.detail).toContain('messaging');
+  });
+
+  it('warns rather than fails when the role waits instead of denying', async () => {
+    writeCfg('roles:\n  Worker:\n    harness: claude-code\n'
+      + '    permissions:\n      approval: ask\n      unattended: wait\n');
+    const c = floor(await run(), 'Worker');
+    expect(c.ok).toBe(true);                       // a human can still attach…
+    expect(c.detail).toContain('MISSING');         // …but the shortfall is still stated
+    expect(c.detail).toContain('block the turn');
+  });
+
+  it('checks Codex roles on the same floor', async () => {
+    writeCfg('roles:\n  Under:\n    harness: codex\n'
+      + '    permissions:\n      approval: ask\n      unattended: deny\n'
+      + '  Ok:\n    harness: codex\n'
+      + '    permissions:\n      approval: allow\n      filesystem: workspace\n      unattended: deny\n');
+    const rep = await run();
+    expect(floor(rep, 'Under').ok).toBe(false);
+    expect(floor(rep, 'Ok').ok).toBe(true);
+  });
+
+  it('a read-only allow role is failed for exactly the write capabilities', async () => {
+    writeCfg('roles:\n  Reader:\n    harness: claude-code\n'
+      + '    permissions:\n      approval: allow\n      filesystem: read-only\n      unattended: deny\n');
+    const c = floor(await run(), 'Reader');
+    expect(c.ok).toBe(false);
+    const missing = /MISSING ([^—]+)/.exec(c.detail)![1];
+    expect(missing).toContain('write-state');
+    expect(missing).toContain('workspace-edit');
+    expect(missing).not.toContain('messaging');    // messaging IS granted
+    expect(c.detail).toContain('grants only');
+    expect(c.detail).toContain('messaging');
+  });
+});
+
+describe('native overrides contradicting neutral intent (2.4)', () => {
+  const HEALTHY = {
+    'tmux -V': { stdout: 'tmux 3.4', stderr: '', code: 0 },
+    'ours-mcp --version': { stdout: '0.1.2', stderr: '', code: 0 },
+    'ours-mcp status': { stdout: 'running', stderr: '', code: 0 },
+    'loginctl show-user': { stdout: 'Linger=yes', stderr: '', code: 0 },
+  };
+  const run = () => doctor({}, execWith(HEALTHY), 'linux', stubFetch());
+  const writeCfg = (yaml: string) => writeFileSync(join(dir, 'fleet.yaml'), yaml);
+  const conflicts = (rep: Awaited<ReturnType<typeof doctor>>, role: string) =>
+    rep.checks.filter(c => c.name === `permission conflict: ${role}`);
+
+  /** label, role yaml body, expected conflicting key (null = must stay quiet). */
+  const CLAUDE: Array<[string, string, string | null]> = [
+    ['neutral only', '    permissions:\n      approval: allow\n', null],
+    ['native only', '    harness_options:\n      permission_mode: plan\n', null],
+    ['both, matching', '    permissions:\n      approval: allow\n'
+      + '    harness_options:\n      permission_mode: bypassPermissions\n', null],
+    ['both, conflicting', '    permissions:\n      approval: allow\n'
+      + '    harness_options:\n      permission_mode: plan\n', 'permission_mode'],
+    ['both, conflicting the other way', '    permissions:\n      approval: deny\n'
+      + '    harness_options:\n      permission_mode: bypassPermissions\n', 'permission_mode'],
+  ];
+
+  for (const [label, body, key] of CLAUDE) {
+    it(`Claude, ${label}: ${key ? 'warns' : 'stays quiet'}`, async () => {
+      writeCfg(`roles:\n  R:\n    harness: claude-code\n${body}`);
+      const found = conflicts(await run(), 'R');
+      if (!key) { expect(found).toHaveLength(0); return; }
+      expect(found).toHaveLength(1);
+      expect(found[0].detail).toContain(`harness_options.${key}=`);
+      expect(found[0].detail).toContain('contradicts');
+      expect(found[0].detail).toContain('wins');
+    });
+  }
+
+  /** Codex states TWO native permission settings, so both must be compared. */
+  const CODEX: Array<[string, string, string[]]> = [
+    ['both, matching', '    permissions:\n      approval: allow\n      filesystem: workspace\n'
+      + '    harness_options:\n      approval: never\n      sandbox: workspace-write\n', []],
+    ['approval conflicts', '    permissions:\n      approval: allow\n      filesystem: workspace\n'
+      + '    harness_options:\n      approval: on-request\n', ['approval']],
+    ['sandbox conflicts', '    permissions:\n      approval: allow\n      filesystem: workspace\n'
+      + '    harness_options:\n      sandbox: danger-full-access\n', ['sandbox']],
+    ['both conflict', '    permissions:\n      approval: ask\n      filesystem: read-only\n'
+      + '    harness_options:\n      approval: never\n      sandbox: danger-full-access\n',
+      ['approval', 'sandbox']],
+    ['native only', '    harness_options:\n      sandbox: danger-full-access\n', []],
+  ];
+
+  for (const [label, body, keys] of CODEX) {
+    it(`Codex, ${label}: ${keys.length} warning(s)`, async () => {
+      writeCfg(`roles:\n  R:\n    harness: codex\n${body}`);
+      const found = conflicts(await run(), 'R');
+      expect(found).toHaveLength(keys.length);
+      for (const key of keys)
+        expect(found.some(c => c.detail.includes(`harness_options.${key}=`)), key).toBe(true);
+    });
+  }
+
+  it('the permission_mode alias is compared as approval for Codex', async () => {
+    writeCfg('roles:\n  R:\n    harness: codex\n'
+      + '    permissions:\n      approval: allow\n'
+      + '    harness_options:\n      permission_mode: on-request\n');
+    const found = conflicts(await run(), 'R');
+    expect(found).toHaveLength(1);
+    expect(found[0].detail).toContain('harness_options.approval=on-request');
+  });
+
+  it('a defaults-level permissions block still counts as a declared source', async () => {
+    writeCfg('defaults:\n  permissions:\n    approval: allow\n'
+      + 'roles:\n  R:\n    harness: claude-code\n'
+      + '    harness_options:\n      permission_mode: plan\n');
+    expect(conflicts(await run(), 'R')).toHaveLength(1);
+  });
+
+  it('names both values and which one wins', async () => {
+    writeCfg('roles:\n  R:\n    harness: claude-code\n'
+      + '    permissions:\n      approval: allow\n'
+      + '    harness_options:\n      permission_mode: plan\n');
+    const detail = conflicts(await run(), 'R')[0].detail;
+    expect(detail).toContain('permission_mode=plan');            // the native value
+    expect(detail).toContain('permission_mode=bypassPermissions'); // the neutral translation
+    expect(detail).toMatch(/harness_options\.permission_mode=plan wins/);
   });
 });

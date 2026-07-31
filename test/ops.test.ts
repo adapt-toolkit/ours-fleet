@@ -6,9 +6,12 @@ import { stringify } from 'yaml';
 import { applyRole, up, down, restartRoles, rmRole, type OpsDeps } from '../src/ops.js';
 import { loadConfig } from '../src/config.js';
 import { agentDir } from '../src/paths.js';
+import { readRestartLedger, writeRestartLedger } from '../src/runner.js';
 import { registerAdapter } from '../src/harness/registry.js';
 import { fakeAdapter } from './registry.test.js';
-import type { SupervisorBackend } from '../src/supervisor/types.js';
+import { makeSystemdBackend } from '../src/supervisor/systemd.js';
+import type { Exec } from '../src/exec.js';
+import type { Liveness, SupervisorBackend } from '../src/supervisor/types.js';
 
 let dir: string;
 beforeEach(() => {
@@ -21,20 +24,44 @@ afterEach(() => {
   rmSync(dir, { recursive: true, force: true });
 });
 
-function fakeBackend() {
+function fakeBackend(live: Liveness = { state: 'stopped', detail: 'inactive (dead)' }) {
   const calls: string[][] = [];
   const backend: SupervisorBackend = {
     id: 'none',
     async init() { return []; },
-    async install(n) { calls.push(['install', n]); },
+    async install(n) { calls.push(['install', n]); return { created: true, detail: 'installed' }; },
     async start(n) { calls.push(['start', n]); },
     async stop(n) { calls.push(['stop', n]); },
     async restart(n) { calls.push(['restart', n]); },
     async status(n) { calls.push(['status', n]); return 'inactive'; },
-    async uninstall(n) { calls.push(['uninstall', n]); },
+    async liveness(n) { calls.push(['liveness', n]); return live; },
+    async uninstall(n) { calls.push(['uninstall', n]); return { removed: true, detail: 'removed' }; },
     logsArgs: n => ({ cmd: 'true', args: [n] }),
   };
   return { calls, backend };
+}
+
+/** A systemd backend whose `systemctl show` answers with a canned state pair. */
+/**
+ * A systemd whose unit reports `activeState (subState)` to the liveness probe
+ * `up` makes BEFORE installing, and `active (running)` to any probe after it.
+ *
+ * That is what a successful `enable --now` actually leaves behind — measured on
+ * systemd 255. The distinction matters because `install` now verifies the start
+ * rather than trusting systemctl's exit code, which on that version stays 0
+ * even when the start failed. A fixture that replayed the pre-install state to
+ * the post-install probe would be describing a unit that never started, and
+ * would make a correct check look wrong.
+ */
+function systemdSaying(activeState: string, subState: string) {
+  let probes = 0;
+  const exec: Exec = async (_cmd, args) => {
+    if (!args.includes('show')) return { stdout: '', stderr: '', code: 0 };
+    return probes++ === 0
+      ? { stdout: `${activeState}\n${subState}\n`, stderr: '', code: 0 }
+      : { stdout: 'active\nrunning\n', stderr: '', code: 0 };
+  };
+  return makeSystemdBackend(exec);
 }
 function deps(backend: SupervisorBackend) {
   const logs: string[] = [];
@@ -127,6 +154,18 @@ describe('up / down / restart', () => {
     expect(calls).toEqual([['stop', 'B']]);
   });
 
+  it('down reports the backend\'s real stop failure (1.5)', async () => {
+    writeCfg({ A: { harness: 'fake' } });
+    const { backend } = fakeBackend();
+    backend.stop = async () => {
+      throw new Error('systemctl stop ours-fleet-agent@A.service failed: Job is in progress');
+    };
+    const { d, logs } = deps(backend);
+    await down(loadConfig(), ['A'], d);
+    expect(logs.join('\n')).toContain('Job is in progress');
+    expect(logs.join('\n')).not.toContain('maybe not running');   // the old guess
+  });
+
   it('restart fresh clears markers then bounces', async () => {
     writeCfg({ A: { harness: 'fake' } });
     const { calls, backend } = fakeBackend();
@@ -153,6 +192,128 @@ describe('up / down / restart', () => {
     const { d } = deps(backend);
     await restartRoles(loadConfig(join(dir, 'fleet.yaml')), ['A'], d, 'keep', join(dir, 'fleet.yaml'));
     expect(readFileSync(join(agentDir('A'), '.config-path'), 'utf8')).toBe(`${join(dir, 'fleet.yaml')}\n`);
+  });
+});
+
+describe('up liveness (1.1) — only a definite stop discards session context', () => {
+  /** label, systemd ActiveState, SubState, does `up` boot it fresh? */
+  const SHAPES: Array<[string, string, string, boolean]> = [
+    ['running', 'active', 'running', false],
+    ['active (exited)', 'active', 'exited', false],
+    ['inactive (dead)', 'inactive', 'dead', true],
+    ['activating (auto-restart)', 'activating', 'auto-restart', false],
+    ['failed (error)', 'failed', 'failed', true],
+  ];
+
+  const bootedRole = () => {
+    writeCfg({ A: { harness: 'fake' } });
+    const stateDir = agentDir('A');
+    mkdirSync(stateDir, { recursive: true });
+    writeFileSync(join(stateDir, '.booted'), '');
+    return stateDir;
+  };
+
+  for (const [label, activeState, subState, bootsFresh] of SHAPES) {
+    it(`systemd '${label}' ${bootsFresh ? 'clears' : 'preserves'} .booted`, async () => {
+      const stateDir = bootedRole();
+      const { d, logs } = deps(systemdSaying(activeState, subState));
+      await up(loadConfig(), [], d);
+      expect(existsSync(join(stateDir, '.booted'))).toBe(!bootsFresh);
+      expect(logs.join('\n')).not.toContain('liveness unknown');
+    });
+  }
+
+  it('a failed status probe is unknown: context is kept and the failure is visible', async () => {
+    const stateDir = bootedRole();
+    const failing: Exec = async (_cmd, args) => args.includes('show')
+      ? { stdout: '', stderr: 'Failed to connect to user scope bus', code: 1 }
+      : { stdout: '', stderr: '', code: 0 };
+    const { d, logs } = deps(makeSystemdBackend(failing));
+    await up(loadConfig(), [], d);
+    expect(existsSync(join(stateDir, '.booted'))).toBe(true);
+    expect(logs.join('\n')).toContain('liveness unknown');
+    expect(logs.join('\n')).toContain('Failed to connect to user scope bus');
+  });
+
+  it('an unrecognised state is unknown, never a stop', async () => {
+    const stateDir = bootedRole();
+    const { d, logs } = deps(systemdSaying('maintenance', 'unknown'));
+    await up(loadConfig(), [], d);
+    expect(existsSync(join(stateDir, '.booted'))).toBe(true);
+    expect(logs.join('\n')).toContain('liveness unknown');
+  });
+
+  it('a backend that throws is unknown, not a stop', async () => {
+    const stateDir = bootedRole();
+    const { backend } = fakeBackend();
+    backend.liveness = async () => { throw new Error('probe exploded'); };
+    const { d, logs } = deps(backend);
+    await up(loadConfig(), [], d);
+    expect(existsSync(join(stateDir, '.booted'))).toBe(true);
+    expect(logs.join('\n')).toContain('probe exploded');
+  });
+
+  it('a stopped role boots fresh and reads the briefing `up` just rewrote', async () => {
+    const first = join(dir, 'brief-1.md');
+    writeFileSync(first, 'FIRST BRIEFING BODY');
+    writeFileSync(join(dir, 'fleet.yaml'), stringify({ roles: { A: { harness: 'fake', briefing_file: first } } }));
+    const { d: d1 } = deps(systemdSaying('active', 'running'));
+    await up(loadConfig(), [], d1);
+    const stateDir = agentDir('A');
+    writeFileSync(join(stateDir, '.booted'), '');           // role has since booted
+    expect(readFileSync(join(stateDir, 'briefing.md'), 'utf8')).toContain('FIRST BRIEFING BODY');
+
+    const second = join(dir, 'brief-2.md');
+    writeFileSync(second, 'SECOND BRIEFING BODY');
+    writeFileSync(join(dir, 'fleet.yaml'), stringify({ roles: { A: { harness: 'fake', briefing_file: second } } }));
+    const { d: d2 } = deps(systemdSaying('inactive', 'dead'));
+    await up(loadConfig(), [], d2);
+
+    expect(readFileSync(join(stateDir, 'briefing.md'), 'utf8')).toContain('SECOND BRIEFING BODY');
+    expect(existsSync(join(stateDir, '.booted'))).toBe(false);   // will re-read it on next start
+  });
+});
+
+describe('explicit operator actions reset the restart circuit (3.2)', () => {
+  const heldDown = () => {
+    const stateDir = agentDir('A');
+    mkdirSync(stateDir, { recursive: true });
+    writeRestartLedger(stateDir, {
+      version: 1, consecutiveImmediateFailures: 5, lastReason: 'exited with code 1',
+      nextDelayMs: 0, resumeDiscarded: true, circuit: 'open',
+      updatedAt: '2026-07-30T00:00:00.000Z', openedAt: '2026-07-30T00:00:00.000Z',
+    });
+    return stateDir;
+  };
+
+  it('`up` releases a held-down role', async () => {
+    writeCfg({ A: { harness: 'fake' } });
+    const stateDir = heldDown();
+    const { backend } = fakeBackend();
+    const { d } = deps(backend);
+    await up(loadConfig(), [], d);
+    const ledger = readRestartLedger(stateDir);
+    expect(ledger.circuit).toBe('closed');
+    expect(ledger.consecutiveImmediateFailures).toBe(0);
+    expect(ledger.resumeDiscarded).toBe(false);
+  });
+
+  it('`restart` releases it too', async () => {
+    writeCfg({ A: { harness: 'fake' } });
+    const stateDir = heldDown();
+    const { backend } = fakeBackend();
+    const { d } = deps(backend);
+    await restartRoles(loadConfig(), ['A'], d, 'keep');
+    expect(readRestartLedger(stateDir).circuit).toBe('closed');
+  });
+
+  it('`down` does NOT release it — stopping a role is not a decision to retry', async () => {
+    writeCfg({ A: { harness: 'fake' } });
+    const stateDir = heldDown();
+    const { backend } = fakeBackend();
+    const { d } = deps(backend);
+    await down(loadConfig(), ['A'], d);
+    expect(readRestartLedger(stateDir).circuit).toBe('open');
   });
 });
 

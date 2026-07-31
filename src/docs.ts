@@ -141,6 +141,89 @@ The backend translates this common intent. Harness-native settings in
 \`allow\`/\`unrestricted\`, Codex \`never\`/\`danger-full-access\`, or Claude
 \`bypassPermissions\` without explicit authorization.
 
+### Creation-time isolation
+
+\`ours-fleet spawn --isolation-file <path>\` supplies a role's sandbox policy at
+creation, so the FIRST launch is already confined — a role that only gains
+\`isolation:\` on a later \`up\` ran unsandboxed until then.
+
+The file holds exactly the \`isolation:\` mapping documented above and nothing
+else — the same schema, validated by the same code, so a policy written here
+cannot mean something different from the identical block in fleet.yaml:
+
+\`\`\`yaml
+network: deny
+fs:
+  read: [/opt/reference]
+resources:
+  mem: 2G
+\`\`\`
+
+Invalid files are rejected before anything is created: no config, no state
+directory, no identity reservation. Works for both permanent and \`--temp\` roles.
+
+### Never-prompt failure
+
+The failure this section exists to prevent leaves no error message anywhere.
+
+An unattended role has no console. When the harness needs a permission decision
+there is nobody to ask, so the request is refused INSIDE the harness — no
+prompt, no error, no log line. The agent simply does less than its briefing told
+it to, reports success, and nothing distinguishes that from having done the
+work. Two settings produce it:
+
+1. a permission mode that suppresses the prompt without granting the action
+   (Claude \`dontAsk\`, which is why neutral \`allow\` maps to
+   \`bypassPermissions\` instead); and
+2. \`unattended: deny\`, which refuses every request that reaches it.
+
+**Automatic decisions are now recorded.** Every permission request decided
+without a human emits a completed event into
+\`~/.ours-fleet/agents/<Name>/.session-events.jsonl\` carrying the decision,
+whether policy or a person made it, the policy that produced it
+(\`permissions.unattended=deny\` vs \`permissions.approval=deny\`/\`=allow\`),
+the reason, and the option selected. \`ours-fleet peek\` and \`attach\` render
+them. Automatic denial asks for a one-shot rejection, never a standing one, so a
+single unattended refusal cannot disable a tool for the rest of the session.
+
+A role that can auto-deny logs one line at startup saying so.
+
+To detect an under-permissioned role BEFORE it runs, use the capability floor
+below: \`ours-fleet doctor\` fails such a role rather than letting it discover
+the problem silently at work.
+
+### The unattended capability floor
+
+An unattended role has no console, so a permission request cannot be answered —
+it is refused, silently, inside the harness. The agent then does less than it
+was told to and reports no error. To make that visible before launch,
+\`ours-fleet config\` and \`ours-fleet doctor\` resolve each role's neutral
+permissions through its harness and check the result against a fixed floor:
+
+- \`read-state\` — read its briefing, ROUTINES.md, and WORKLOG.md
+- \`write-state\` — append its WORKLOG and its own state files
+- \`messaging\` — bind its identity, send and receive ours mail
+- \`monitor\` — arm and observe its mail monitor
+- \`workspace-edit\` — edit and test files in its working directory
+- \`status-commands\` — run the inspection commands its briefing prescribes
+
+\`doctor\` reports this per role as \`unattended floor: <Role>\`. A role with
+\`unattended: deny\` that cannot meet the floor FAILS doctor, because it will
+deny those requests with nobody to see it; with \`unattended: wait\` it warns,
+because a human can still attach and answer.
+
+Security meaning: \`approval: allow\` maps to Claude's \`bypassPermissions\`,
+which genuinely permits the actions the role was authorized to take —
+\`dontAsk\` only suppresses the prompt while still refusing the action. Nothing
+other than an explicit \`allow\` is elevated: \`ask\` stays on Claude's default
+mode and \`deny\` maps to \`plan\`. \`allow\` is therefore a real grant and
+requires explicit authorization; per-role \`isolation:\` remains the outer
+boundary that a permission mode cannot cross.
+
+See also: \`spawn --approval/--filesystem/--unattended\` set this intent at
+creation, and \`ours-fleet config\` prints each role's neutral settings, their
+native translation, and any warning — the same text \`doctor\` reports.
+
 Claude \`harness_options\`: \`permission_mode\` (default, acceptEdits, plan,
 dontAsk, bypassPermissions), \`plugins\`, \`mem_palace\`, and
 \`mem_palace_midsession_autosave\`.
@@ -175,3 +258,53 @@ Set \`monitor.enabled: false\` only to retain legacy in-session monitoring.
 Inspect \`ours-fleet status Name\`, \`peek Name\`, role logs, and
 \`~/.ours-fleet/agents/Name/.monitor-status\` when diagnosing delivery.
 `;
+
+/**
+ * What every shipped spawn-skill variant must say, and must not say (7.1).
+ *
+ * The skills are separate markdown files in two published plugins, written for
+ * two different harnesses, so they cannot literally be one file. This is the
+ * source of truth they are all written from, and a test holds each variant to
+ * it — including the CLI reference above, so a skill and \`ours-fleet docs\`
+ * cannot name different permission settings.
+ *
+ * \`forbidden\` is the more important half. The old skills prescribed
+ * \`--approval ask --filesystem workspace --unattended deny\` as a blanket
+ * default while also telling the agent to stop at a failed doctor check — and
+ * that combination is exactly what \`doctor\` FAILS, because \`ask\` grants an
+ * unattended role nothing but \`read-state\` and \`deny\` makes the shortfall
+ * fatal. Following the skill produced a role the CLI then refused.
+ */
+export const SPAWN_SKILL_CONTRACT = {
+  /** Substrings every variant must contain (whitespace-normalised). */
+  required: [
+    // The installed reference is authoritative and must actually be read.
+    'ours-fleet docs',
+    'ours-fleet doctor',
+    // Trap 1: a mode that suppresses the prompt without granting the action.
+    'dontAsk',
+    'bypassPermissions',
+    // Trap 2: the floor, and the command that reports it before launch.
+    'unattended capability floor',
+    'unattended floor:',
+    // The only intent that clears the floor, and the honest alternative.
+    '--approval allow',
+    '--unattended wait',
+    // Creation-time isolation (6.3) — the one new operator input this release adds.
+    '--isolation-file',
+  ],
+  /**
+   * Substrings no variant may contain. Deliberately short: the real guard is
+   * the acceptance test, which runs every spawn command a variant prints
+   * through the same analysis `doctor` uses and fails if doctor would fail it.
+   * This list only pins the specific claim that was wrong.
+   */
+  forbidden: [
+    // The contradictory blanket default both variants used to prescribe.
+    // `ask` grants an unattended role only `read-state`, and `deny` makes the
+    // shortfall a doctor FAILURE — so the skill told you to build a role the
+    // CLI then refused, in the same breath as telling you to trust doctor.
+    '--approval ask --filesystem workspace --unattended deny',
+    '[TODO:',
+  ],
+} as const;

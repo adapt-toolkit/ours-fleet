@@ -253,6 +253,107 @@ role's `harness_options`, so a fleet can set common Codex permission/profile def
 and override individual keys per role. `monitor` merges the same way — a role block
 overrides `defaults.monitor` key-by-key.
 
+### Never-prompt failure
+
+An unattended role has no console, so a permission request has nobody to answer
+it and is refused **inside the harness** — no prompt, no error, no log line. The
+agent does less than its briefing told it to, reports success, and nothing
+distinguishes that from having done the work. It is caused by a permission mode
+that suppresses the prompt without granting the action (Claude `dontAsk`), or by
+`unattended: deny`.
+
+Automatic decisions are now recorded rather than invisible. Every permission
+decided without a human is written to
+`~/.ours-fleet/agents/<Name>/.session-events.jsonl` with the decision, whether
+policy or a person made it, which policy produced it, the reason, and the option
+chosen — and `ours-fleet peek`/`attach` render them. Automatic denial always
+asks for a one-shot rejection, never a standing one, so one unattended refusal
+cannot disable a tool for the rest of the session. A role that can auto-deny
+says so once at startup.
+
+To catch this **before** a role runs, see the capability floor below —
+`ours-fleet doctor` fails an under-permissioned unattended role rather than
+letting it discover the problem silently.
+
+### The unattended capability floor
+
+A fleet role runs with no console attached, so a permission request has nobody
+to answer it and is refused inside the harness — silently. The agent then does
+less than its briefing told it to and reports no error at all.
+
+`ours-fleet config` and `ours-fleet doctor` therefore resolve each role's
+neutral `permissions:` through its harness adapter and check what the resulting
+native settings actually grant, against a fixed floor:
+
+| capability | what the role must be able to do |
+| --- | --- |
+| `read-state` | read its briefing, `ROUTINES.md`, and `WORKLOG.md` |
+| `write-state` | append its `WORKLOG.md` and its own state files |
+| `messaging` | bind its identity, send and receive ours mail |
+| `monitor` | arm and observe its mail monitor |
+| `workspace-edit` | edit and test files in its working directory |
+| `status-commands` | run the inspection commands its briefing prescribes |
+
+`doctor` reports this per role as `unattended floor: <Role>`. A role configured
+`unattended: deny` that cannot meet the floor **fails** doctor — it would deny
+those requests with nobody to see it. With `unattended: wait` it **warns**,
+since a human can still attach a console and answer.
+
+**Security meaning.** `approval: allow` maps to Claude's `bypassPermissions`,
+the mode that actually permits the actions the role was authorized to take.
+`dontAsk` suppresses only the *prompt*, not the denial, which is why an
+`allow` role previously ran unable to do its job. Nothing but an explicit
+`allow` is elevated: `ask` keeps Claude's default mode and `deny` maps to
+`plan`. `allow` is a real grant — give it deliberately, and keep per-role
+[`isolation:`](#agent-isolation) as the outer boundary, which no permission
+mode can cross.
+
+### Isolation at creation time
+
+```sh
+ours-fleet spawn Sec --isolation-file policy.yaml
+ours-fleet spawn --temp Scout --isolation-file policy.yaml
+```
+
+`--isolation-file` supplies the role's sandbox policy when it is created, so its
+**first** launch is already confined. Without it a role gains `isolation:` only when
+you edit `fleet.yaml` and run `up`, and everything before that ran unsandboxed.
+
+The file contains exactly the [`isolation:` mapping](#agent-isolation) — the same schema,
+validated by the same code, so it cannot mean something different from the identical block
+in `fleet.yaml`:
+
+```yaml
+network: deny
+fs:
+  read: [/opt/reference]
+resources:
+  mem: 2G
+```
+
+An invalid file is rejected before anything is created — no config, no state directory, no
+identity reservation.
+
+### Sandboxed credentials and configuration
+
+A sandboxed role gets a **per-role writable harness home** under its own state directory
+(`<state>/harness/<harness>/`), so its sessions, history and caches are its own and are
+invisible to every other role. The **shared** credentials, global instructions and
+configuration are layered back read-only:
+
+| Harness | Read-only (shared) | Per-role writable |
+| --- | --- | --- |
+| `claude-code` | `~/.claude.json`, `~/.claude/CLAUDE.md`, `settings.json`, `plugins/` | everything else under `~/.claude` |
+| `codex` | `~/.codex/auth.json`, `config.toml`, `AGENTS.md`, `plugins/`, `~/.agents` | everything else under `~/.codex` |
+
+An agent can read the credentials it needs and cannot rewrite them, cannot edit the
+instructions every role shares, and cannot alter a peer's configuration. Claude pre-trust
+stays a host-side step performed by the fleet.
+
+The forbidden-path list is enforced, not advisory: a role that asks for `~/.ssh`, the ours
+key store, a sibling's state directory — or a parent directory that would expose one, or a
+symlink to one — is refused by `ours-fleet config` before it can launch.
+
 ### Start staggering
 
 `start_stagger_ms` (top-level, host-wide, default `0`) spaces out agent **launches**

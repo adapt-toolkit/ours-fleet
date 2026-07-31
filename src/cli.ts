@@ -8,16 +8,19 @@ import { Command } from 'commander';
 import { VERSION } from './version.js';
 import { agentDir, agentsRoot, tmpRoot, logsRoot, deriveXdgRuntimeDir } from './paths.js';
 import { loadConfig } from './config.js';
-import { Tmux } from './tmux.js';
+import { Tmux, tmuxArgs } from './tmux.js';
 import { pickBackend } from './supervisor/index.js';
 import { up, down, restartRoles, rmRole, type OpsDeps } from './ops.js';
-import { runOnce, runTemp } from './runner.js';
-import { spawnPermanent, spawnTemp, type SpawnOpts } from './spawn.js';
+import { readRestartLedger, runSupervised, runTemp } from './runner.js';
+import { lastProvenance, spawnPermanent, spawnTemp, type SpawnOpts } from './spawn.js';
+import { formatProvenance } from './creation.js';
 import { doctor } from './doctor.js';
+import { allWarnings, analyzeFleetPermissions, formatNative } from './permissions.js';
 import { AI_DOCS } from './docs.js';
 import {
-  controlRequest, controlSocketPath, followControl,
+  controlRequest, controlSocketPath, followControl, livenessNote,
 } from './session/control.js';
+import { SessionControlError } from './session/types.js';
 import type { SessionEvent } from './session/types.js';
 import './harness/claude-code.js';   // registers the claude-code adapter
 import './harness/codex.js';         // registers the codex adapter
@@ -74,6 +77,16 @@ function renderSessionEvent(event: SessionEvent): void {
       console.log(`\n[${event.kind}] ${event.title ?? event.toolCallId ?? ''} ${event.status ?? ''}`.trimEnd());
       break;
     case 'permission':
+      if (event.status === 'completed') {
+        // A settled request. Automatic decisions are the ones nobody saw happen,
+        // so peek/attach must show what was decided and which policy decided it.
+        console.log(`\n[permission ${event.permissionId}] ${event.title ?? ''}`.trimEnd());
+        console.log(`  ${event.decisionSource ?? 'manual'} decision: ${event.decision ?? 'unknown'}`
+          + `${event.optionId ? ` (${event.optionId})` : ''}`
+          + `${event.policy ? ` via ${event.policy}` : ''}`);
+        if (event.reason) console.log(`  reason: ${event.reason}`);
+        break;
+      }
       console.log(`\n[permission ${event.permissionId}] ${event.title ?? ''}`);
       for (const option of event.options ?? [])
         console.log(`  ${option.optionId}: ${option.name} (${option.kind})`);
@@ -105,11 +118,18 @@ cOpt(program.command('config').description('validate + print the merged plan (no
     try {
       const cfg = loadConfig(opts.configuration);
       console.log(`config: ${cfg.files.join(' + ') || '(none)'}`);
+      const analyses = analyzeFleetPermissions(cfg.roles);
       for (const r of cfg.roles) {
+        const perms = analyses.find(a => a.role === r.name);
         console.log(`\n● ${r.name}`);
         console.log(`    harness:     ${r.harness}`);
         console.log(`    session:     ${r.session}`);
         console.log(`    identity:    ${r.identity}`);
+        console.log(`    permissions: approval=${r.permissions.approval} `
+          + `filesystem=${r.permissions.filesystem} unattended=${r.permissions.unattended}`);
+        if (perms?.supported)
+          console.log(`    native:      ${formatNative(perms.native)}`
+            + `${perms.exact ? '' : ' (not an exact representation)'}`);
         console.log(`    source:      ${r.sourceFile}`);
         if (r.cwd) console.log(`    cwd:         ${r.cwd}`);
         if (r.model) console.log(`    model:       ${r.model}`);
@@ -128,6 +148,7 @@ cOpt(program.command('config').description('validate + print the merged plan (no
           console.log(`    isolation:   backend=${iso.backend ?? 'auto'} net=${iso.network ?? 'broker'} `
             + `on_unavailable=${iso.on_unavailable ?? 'warn'} caps=${caps}`);
         }
+        for (const w of perms ? allWarnings(perms) : []) console.log(`    warning:     ${w}`);
       }
     } catch (e) { die(e); }
   });
@@ -154,11 +175,14 @@ cOpt(program.command('force-restart [names...]').description('re-sync + bounce F
 
 program.command('ls').description('list running fleet sessions')
   .action(async () => {
-    const tmux = await new Tmux().list();
+    // Each session has its own tmux server (#32), so there is no single server
+    // to ask: the known role names ARE the list of servers to poll.
+    const names: string[] = [];
     const acp: string[] = [];
     for (const root of [agentsRoot(), tmpRoot()]) {
       if (!existsSync(root)) continue;
       for (const name of readdirSync(root)) {
+        names.push(name);
         const stateDir = joinPath(root, name);
         if (!existsSync(controlSocketPath(stateDir))) continue;
         try {
@@ -168,13 +192,14 @@ program.command('ls').description('list running fleet sessions')
         } catch { /* ignore stale sockets */ }
       }
     }
+    const tmux = await new Tmux().list(names);
     console.log([tmux, ...acp].filter(Boolean).join('\n') || '(none)');
   });
 
 program.command('attach <name>').description('open the live console (Ctrl-b d to leave)')
   .action(async name => {
     const stateDir = acpStateDir(name);
-    if (!stateDir) process.exit(await passthrough('tmux', ['attach', '-t', name]));
+    if (!stateDir) process.exit(await passthrough('tmux', tmuxArgs(name, ['attach', '-t', name])));
     try {
       const { socket, send } = await followControl(stateDir, message => {
         if ('event' in message) renderSessionEvent(message.event as SessionEvent);
@@ -198,36 +223,67 @@ program.command('attach <name>').description('open the live console (Ctrl-b d to
     } catch (e) { die(e); }
   });
 
+/** Classify a raw tmux failure: only "no such session" proves the pane is gone. */
+const asControlError = (e: unknown): SessionControlError => {
+  if (e instanceof SessionControlError) return e;
+  const message = e instanceof Error ? e.message : String(e);
+  return new SessionControlError(
+    /can't find session|no server running|session not found/i.test(message) ? 'offline' : 'backend',
+    message);
+};
+
+/**
+ * Report what actually went wrong, then say what it proves about the agent.
+ * The old handler replaced every failure — timeouts, socket errors, refusals —
+ * with "is not running", which is how an overseer came to restart busy agents.
+ */
+const controlFailure = (name: string, action: string, e: unknown, extra = ''): string => {
+  const err = asControlError(e);
+  return `${action} ${name}: ${err.message}\n  ${livenessNote(err.kind, name)}${extra}`;
+};
+
 program.command('peek <name> [lines]').description('pane snapshot without attaching')
   .action(async (name, lines) => {
     try {
       const stateDir = acpStateDir(name);
       if (stateDir) {
         const response = await controlRequest(stateDir, { command: 'follow', since: 0 });
+        if (!response.ok)
+          throw new SessionControlError(response.kind ?? 'backend', response.error ?? 'peek failed');
         const events = (response.result as { events?: SessionEvent[] } | undefined)?.events ?? [];
         for (const event of events.slice(-(lines ? Number(lines) : 40))) renderSessionEvent(event);
       } else {
         console.log(await new Tmux().capture(name, lines ? Number(lines) : 40));
       }
     }
-    catch { die(`'${name}' is not running; try: ours-fleet status ${name}`); }
+    catch (e) { die(controlFailure(name, 'peek', e)); }
   });
 
 program.command('send <name> [text...]').description("type into the agent's console")
   .option('--key <key>', 'send a raw key instead (Escape, Up, C-c, ...)')
   .action(async (name, text, opts) => {
+    const stateDir = acpStateDir(name);
+    if (stateDir && opts.key) die('--key is available only for tmux sessions');
+    if (!stateDir && !opts.key && !text?.length) die('nothing to send: give text or --key');
+    if (stateDir && !text?.length) die('nothing to send: give text');
     try {
-      const stateDir = acpStateDir(name);
       if (stateDir) {
-        if (opts.key) die('--key is available only for tmux sessions');
-        if (!text?.length) die('nothing to send: give text');
+        // Returns on queue acceptance: a turn already running is not a failure.
         const response = await controlRequest(
           stateDir, { command: 'submit_prompt', text: text.join(' ') });
-        if (!response.ok) throw new Error(response.error ?? 'prompt rejected');
+        if (!response.ok)
+          throw new SessionControlError(response.kind ?? 'backend', response.error ?? 'prompt rejected');
+        const queued = response.result as { queuedBehind?: number } | undefined;
+        console.log(queued?.queuedBehind
+          ? `queued for ${name} behind ${queued.queuedBehind} running turn(s)`
+          : `queued for ${name}`);
       } else if (opts.key) await new Tmux().sendKey(name, opts.key);
-      else if (text?.length) await new Tmux().sendText(name, text.join(' '));
-      else die('nothing to send: give text or --key');
-    } catch { die(`'${name}' is not running; try: ours-fleet status ${name}`); }
+      else await new Tmux().sendText(name, text.join(' '));
+    } catch (e) {
+      die(controlFailure(name, 'send', e, asControlError(e).kind === 'timeout'
+        ? '\n  The prompt may already have been delivered — do not assume it was lost.'
+        : ''));
+    }
   });
 
 program.command('logs <name>').description('show the role log').option('-f, --follow', 'follow')
@@ -239,6 +295,16 @@ program.command('logs <name>').description('show the role log').option('-f, --fo
 program.command('status <name>').description('unit/agent state')
   .action(async name => {
     console.log(await pickBackend().status(name));
+    // A held-down role looks like a healthy running unit from the outside — the
+    // runner is alive on purpose. Say so, with the reason and when (3.2).
+    const ledger = readRestartLedger(agentDir(name));
+    if (ledger.circuit === 'open')
+      console.log(`HELD DOWN since ${ledger.openedAt ?? ledger.updatedAt} after `
+        + `${ledger.consecutiveImmediateFailures} immediate failures: ${ledger.lastReason}`
+        + `\n  release it with: ours-fleet restart ${name}`);
+    else if (ledger.consecutiveImmediateFailures > 0)
+      console.log(`restarts: ${ledger.consecutiveImmediateFailures} consecutive immediate `
+        + `failures, next delay ${ledger.nextDelayMs}ms (${ledger.lastReason})`);
     const stateDir = acpStateDir(name);
     if (stateDir) {
       try {
@@ -275,6 +341,7 @@ cOpt(program.command('spawn <name>').description('spawn a new agent (permanent b
   .option('--monitor', 'explicitly consent to arm this Codex role\'s ours mail monitor')
   .option('--bio-file <file>', 'public bio (file)')
   .option('--persona-file <file>', 'persona / operating contract (file)')
+  .option('--isolation-file <path>', 'file holding an isolation: mapping (same schema as fleet.yaml)')
   .action(async (name, opts) => {
     try {
       const o: SpawnOpts = {
@@ -286,7 +353,8 @@ cOpt(program.command('spawn <name>').description('spawn a new agent (permanent b
         sandbox: opts.sandbox, profile: opts.profile,
         launcher: opts.launcher, search: opts.search,
         codexConfig: parseCodexConfig(opts.codexConfig), addDirs: opts.addDir, monitor: opts.monitor,
-        bioFile: opts.bioFile, personaFile: opts.personaFile, configPath: opts.configuration,
+        bioFile: opts.bioFile, personaFile: opts.personaFile,
+        isolationFile: opts.isolationFile, configPath: opts.configuration,
       };
       if (o.temp) {
         const dir = await spawnTemp(o, binPath);
@@ -294,6 +362,13 @@ cOpt(program.command('spawn <name>').description('spawn a new agent (permanent b
       } else {
         const file = await spawnPermanent(o, deps());
         console.log(`spawned '${name}' (config: ${file})`);
+      }
+      // The same provenance that was persisted, so what the operator reads now
+      // and what a reviewer reads later cannot disagree (6.6).
+      if (lastProvenance) {
+        console.log(`  created by ${lastProvenance.command} v${lastProvenance.fleetVersion} `
+          + `at ${lastProvenance.createdAt} (${lastProvenance.lifetime})`);
+        for (const line of formatProvenance(lastProvenance)) console.log(line);
       }
       console.log(`→ watch it: ours-fleet peek ${name}   |   attach: ours-fleet attach ${name}`);
     } catch (e) { die(e); }
@@ -317,7 +392,9 @@ program.command('init').description('one-time host setup (units, dirs, linger)')
 program.command('_run <name>', { hidden: true }).description('internal: supervisor entrypoint')
   .option('-c, --configuration <file>')
   .action(async (name, opts) => {
-    try { await runOnce(name, { configPath: opts.configuration }); } catch (e) { die(e); }
+    // The supervised loop, not a single session: restart policy lives here now,
+    // where it can count across attempts (3.2).
+    try { await runSupervised(name, { configPath: opts.configuration }); } catch (e) { die(e); }
   });
 
 program.command('_run-temp <name>', { hidden: true }).description('internal: temp-agent entrypoint')

@@ -1,14 +1,21 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { stringify } from 'yaml';
-import { runOnce, runTemp, buildPaneCommand, reserveLaunchSlot } from '../src/runner.js';
+import {
+  runOnce, runTemp, runSupervised, buildPaneCommand, reserveLaunchSlot, readExitRecord,
+  readRestartLedger, resetRestartLedger, backoffFor, RESTART_FAIL_THRESHOLD,
+  type AttemptResult, type RunnerDeps,
+} from '../src/runner.js';
+import { classifyChildExit, classifyShellStatus } from '../src/session/types.js';
 import { registerAdapter } from '../src/harness/registry.js';
 import { agentDir, stateRoot } from '../src/paths.js';
 import { Tmux } from '../src/tmux.js';
 import { fakeAdapter } from './registry.test.js';
 import type { Exec } from '../src/exec.js';
+import type { HarnessAdapter } from '../src/harness/types.js';
 import type { MonitorOpts } from '../src/monitor.js';
 
 let dir: string;
@@ -46,15 +53,24 @@ function monitorRecorder(sessionCreated: () => boolean) {
 
 /** Fake tmux whose pane "process" dies after `lifeChecks` liveness polls,
  *  writing `.exit-status` (like the pane shell would) at the moment of death. */
-function fakeWorld(opts: { exitCode?: string; lifeChecks?: number; exitDelayMs?: number; exitFile?: string; bwrap?: 'ok' | 'missing'; cpuDelegated?: boolean } = {}) {
+function fakeWorld(opts: { exitCode?: string; lifeChecks?: number; exitDelayMs?: number; exitFile?: string; bwrap?: 'ok' | 'missing'; cpuDelegated?: boolean; legacyExitFile?: boolean; sessionGone?: boolean } = {}) {
   const paneCommands: string[] = [];
   let clock = 0;
   let checks = 0;
   let sessionCreated = false;
   const exec: Exec = async (cmd, args) => {
     if (cmd === 'bwrap') return { stdout: 'bubblewrap 0.11.1\n', stderr: '', code: opts.bwrap === 'missing' ? 127 : 0 };
-    if (args[0] === 'new-session') { paneCommands.push(args[args.length - 1]); sessionCreated = true; }
-    if (args[0] === 'list-panes') return { stdout: '4242\n', stderr: '', code: 0 };
+    if (cmd === 'tmux') {
+      // Faithful to #32: a real tmux invoked without `-L` talks to the SHARED
+      // default server, which is a different server from this role's. A fake
+      // that answered anyway would let the socket flag be dropped unnoticed.
+      if (args[0] !== '-L' || !args[1].startsWith('ours-fleet-'))
+        return { stdout: '', stderr: 'no server running on the default socket', code: 1 };
+      const sub = args[2];
+      if (sub === 'new-session') { paneCommands.push(args[args.length - 1]); sessionCreated = true; }
+      if (sub === 'list-panes') return { stdout: '4242\n', stderr: '', code: 0 };
+      if (sub === 'has-session') return { stdout: '', stderr: '', code: opts.sessionGone ? 1 : 0 };
+    }
     return { stdout: '', stderr: '', code: 0 };
   };
   const { rec, createMonitor } = monitorRecorder(() => sessionCreated);
@@ -65,7 +81,9 @@ function fakeWorld(opts: { exitCode?: string; lifeChecks?: number; exitDelayMs?:
     isAlive: () => {
       checks++;
       if (checks >= (opts.lifeChecks ?? 2)) {
-        if (opts.exitFile) writeFileSync(opts.exitFile, (opts.exitCode ?? '0') + '\n');
+        if (opts.exitFile) writeFileSync(opts.exitFile, opts.legacyExitFile
+          ? (opts.exitCode ?? '0') + '\n'                       // pre-upgrade `echo $?`
+          : JSON.stringify({ version: 1, backend: 'tmux', status: Number(opts.exitCode ?? '0') }));
         return false;
       }
       return true;
@@ -89,7 +107,8 @@ describe('buildPaneCommand', () => {
     expect(cmd).toContain(`A='x y'`);
     expect(cmd).toContain(`B='z'`);
     expect(cmd).toContain(`'bin' 'it'\\''s'`);
-    expect(cmd).toContain(`; echo $? > '/tmp/es'`);
+    expect(cmd).toContain(`__ofs=$?`);
+    expect(cmd).toContain(`> '/tmp/es'`);
   });
 
   it('runs a sandbox-wrapped argv while keeping env + exit capture host-side', () => {
@@ -99,8 +118,8 @@ describe('buildPaneCommand', () => {
     expect(cmd.startsWith('env ')).toBe(true);         // env prefix host-side
     expect(cmd).toContain(`A='x'`);
     expect(cmd).toContain(`'bwrap' '--die-with-parent' '--' 'claude' 'go'`);
-    expect(cmd).toContain(`; echo $? > '/tmp/es'`);     // exit capture host-side
-    expect(cmd.indexOf('bwrap')).toBeLessThan(cmd.indexOf('echo $?')); // capture is outside
+    expect(cmd).toContain(`> '/tmp/es'`);                              // exit capture host-side
+    expect(cmd.indexOf('bwrap')).toBeLessThan(cmd.indexOf('__ofs=$?')); // capture is outside
   });
 });
 
@@ -112,7 +131,7 @@ describe('runOnce isolation', () => {
     await runOnce('A', {}, deps);
     expect(paneCommands[0]).toContain(`'bwrap'`);
     expect(paneCommands[0]).toMatch(/'--'.*'fakebin'/);      // original argv after --
-    expect(paneCommands[0]).toContain('; echo $? >');        // exit capture preserved
+    expect(paneCommands[0]).toContain('__ofs=$?');           // exit capture preserved
   });
 
   it('does not wrap when the role has no isolation block', async () => {
@@ -252,6 +271,282 @@ describe('runOnce', () => {
     await runOnce('A', {}, deps);
     expect(readFileSync(join(d, '.session-id'), 'utf8').trim()).toBe('KEEP');
     expect(existsSync(join(d, '.booted'))).toBe(true);
+  });
+});
+
+describe('creation-time isolation reaches the FIRST launch (6.3)', () => {
+  it("a role whose config carries `isolation` is sandbox-wrapped on its first start", async () => {
+    // This is the property --isolation-file exists for: the very first process
+    // is confined, not the one after the operator edits fleet.yaml.
+    writeCfg({ Sec: { harness: 'fake', isolation: { network: 'deny' } } });
+    const d = agentDir('Sec');
+    mkdirSync(d, { recursive: true });
+    const { deps, paneCommands } = fakeWorld({ exitCode: '0', exitFile: join(d, '.exit-status') });
+    await runOnce('Sec', {}, deps);
+    expect(paneCommands[0]).toContain(`'bwrap'`);
+    expect(paneCommands[0]).toContain(`'--unshare-net'`);      // network: deny honoured
+    expect(paneCommands[0]).toMatch(/'--'.*'fakebin'/);
+  });
+});
+
+describe('exit classification (1.6)', () => {
+  const readRecord = (d: string) =>
+    JSON.parse(readFileSync(join(d, '.exit-status'), 'utf8')) as { class: string; detail: string };
+
+  it('classifies a shell wait status into clean, program-exit, or signal', () => {
+    expect(classifyShellStatus(0)).toMatchObject({ class: 'clean', code: 0 });
+    expect(classifyShellStatus(1)).toMatchObject({ class: 'program-exit', code: 1 });
+    expect(classifyShellStatus(127)).toMatchObject({ class: 'program-exit', code: 127 });
+    expect(classifyShellStatus(137)).toMatchObject({ class: 'signal', signal: 'SIG9' });
+    expect(classifyShellStatus(143)).toMatchObject({ class: 'signal', signal: 'SIG15' });
+  });
+
+  it('classifies a child exit reported by node, keeping the real signal name', () => {
+    expect(classifyChildExit(0, null)).toMatchObject({ class: 'clean', code: 0 });
+    expect(classifyChildExit(3, null)).toMatchObject({ class: 'program-exit', code: 3 });
+    expect(classifyChildExit(null, 'SIGKILL')).toMatchObject({ class: 'signal', signal: 'SIGKILL' });
+    expect(classifyChildExit(null, null)).toMatchObject({ class: 'unknown' });
+  });
+
+  it('never calls an absent or unreadable record a crash', () => {
+    const p = join(dir, 'nothing-here');
+    expect(readExitRecord(p)).toBeNull();
+    writeFileSync(p, '');
+    expect(readExitRecord(p)).toMatchObject({ class: 'unknown' });
+    writeFileSync(p, 'garbage not json');
+    expect(readExitRecord(p)).toMatchObject({ class: 'unknown' });
+    expect(JSON.stringify(readExitRecord(p))).not.toContain('crash');
+  });
+
+  it('still reads a bare number left by a pre-upgrade pane', () => {
+    const p = join(dir, 'legacy');
+    writeFileSync(p, '0\n');
+    expect(readExitRecord(p)).toMatchObject({ class: 'clean', code: 0 });
+    writeFileSync(p, '137\n');
+    expect(readExitRecord(p)).toMatchObject({ class: 'signal', signal: 'SIG9' });
+  });
+
+  /** label, shell status, resulting class, does the next start resume? */
+  const TMUX_CASES: Array<[string, string, string, boolean]> = [
+    ['a clean exit', '0', 'clean', false],
+    ['a non-zero program exit', '1', 'program-exit', true],
+    ['a signal', '137', 'signal', true],
+  ];
+
+  for (const [label, status, cls, resumes] of TMUX_CASES) {
+    it(`records ${label} and ${resumes ? 'resumes' : 'starts fresh'} next time`, async () => {
+      writeCfg({ A: { harness: 'fake' } });
+      const d = agentDir('A'); mkdirSync(d, { recursive: true });
+      writeFileSync(join(d, '.session-id'), 'OLD\n');
+      writeFileSync(join(d, '.booted'), '');
+      // 30 liveness checks × 2000ms simulated keeps it out of the fast-fail window
+      const { deps } = fakeWorld({ exitCode: status, lifeChecks: 30, exitFile: join(d, '.exit-status') });
+      await runOnce('A', {}, deps);
+      expect(readRecord(d).class).toBe(cls);
+      expect(existsSync(join(d, '.booted'))).toBe(resumes);
+    });
+  }
+
+  it('a missing record with the session still alive is unknown, and keeps context', async () => {
+    writeCfg({ A: { harness: 'fake' } });
+    const d = agentDir('A'); mkdirSync(d, { recursive: true });
+    writeFileSync(join(d, '.booted'), '');
+    const { deps } = fakeWorld({ lifeChecks: 30 });          // no exitFile ⇒ nothing written
+    await runOnce('A', {}, deps);
+    expect(readRecord(d).class).toBe('unknown');
+    expect(existsSync(join(d, '.booted'))).toBe(true);
+  });
+
+  it('a destroyed session is its own class, not a program exit', async () => {
+    writeCfg({ A: { harness: 'fake' } });
+    const d = agentDir('A'); mkdirSync(d, { recursive: true });
+    writeFileSync(join(d, '.session-id'), 'KEEP\n');
+    writeFileSync(join(d, '.booted'), '');
+    const { deps } = fakeWorld({ lifeChecks: 30, sessionGone: true });
+    await runOnce('A', {}, deps);
+    const record = readRecord(d);
+    expect(record.class).toBe('session-destroyed');
+    expect(record.detail).toContain('no longer exists');
+    expect(existsSync(join(d, '.booted'))).toBe(true);
+  });
+
+  it('a session destroyed early is NOT treated as a fast-failing resume', async () => {
+    writeCfg({ A: { harness: 'fake' } });
+    const d = agentDir('A'); mkdirSync(d, { recursive: true });
+    writeFileSync(join(d, '.session-id'), 'KEEP\n');
+    writeFileSync(join(d, '.booted'), '');                   // resume mode
+    // dies after ~0.2s simulated — well inside fastFailSecs (20)
+    const { deps } = fakeWorld({ exitDelayMs: 100, sessionGone: true });
+    await runOnce('A', {}, deps);
+    expect(readRecord(d).class).toBe('session-destroyed');
+    expect(readFileSync(join(d, '.session-id'), 'utf8').trim()).toBe('KEEP');
+    expect(existsSync(join(d, '.booted'))).toBe(true);
+  });
+
+  it('a program that exits fast during resume still self-heals to fresh', async () => {
+    writeCfg({ A: { harness: 'fake' } });
+    const d = agentDir('A'); mkdirSync(d, { recursive: true });
+    writeFileSync(join(d, '.session-id'), 'OLD\n');
+    writeFileSync(join(d, '.booted'), '');
+    const { deps } = fakeWorld({ exitCode: '1', exitDelayMs: 100, exitFile: join(d, '.exit-status') });
+    await runOnce('A', {}, deps);
+    expect(readRecord(d).class).toBe('program-exit');
+    expect(readFileSync(join(d, '.session-id'), 'utf8').trim()).not.toBe('OLD');
+  });
+
+  it('a legacy bare-number record drives the same decision', async () => {
+    writeCfg({ A: { harness: 'fake' } });
+    const d = agentDir('A'); mkdirSync(d, { recursive: true });
+    writeFileSync(join(d, '.session-id'), 'OLD\n');
+    const { deps } = fakeWorld({
+      exitCode: '0', legacyExitFile: true, exitFile: join(d, '.exit-status'),
+    });
+    await runOnce('A', {}, deps);
+    expect(readRecord(d).class).toBe('clean');
+    expect(readFileSync(join(d, '.session-id'), 'utf8').trim()).not.toBe('OLD');
+  });
+});
+
+describe('runOnce ACP startup outcome (1.2)', () => {
+  const acpFixture = join(dirname(fileURLToPath(import.meta.url)), 'fixtures', 'acp-agent.mjs');
+
+  /** The fake adapter, taught to launch the ACP fixture as its agent process. */
+  const acpAdapter: HarnessAdapter = {
+    ...fakeAdapter,
+    id: 'fake-acp',
+    buildAcpLaunch: () => ({ argv: [process.execPath, acpFixture], env: {} }),
+  };
+
+  /** Real-clock deps: an ACP session is a real child process, not a fake pane. */
+  function acpDeps() {
+    const logs: string[] = [];
+    const exec: Exec = async () => ({ stdout: '', stderr: '', code: 0 });
+    return {
+      logs,
+      deps: {
+        tmux: new Tmux(exec), exec,
+        cpuDelegated: () => true,
+        isAlive: () => true,
+        sleep: (ms: number) => new Promise<void>(r => setTimeout(r, Math.min(ms, 25))),
+        now: () => Date.now(),
+        log: (l: string) => { logs.push(l); },
+        fetch: async () => ({ status: 200, ok: true, json: async () => ({ cursor: 0, events: [] }) }),
+        createMonitor: () => ({ prime: async () => {}, run: async () => {}, stop: () => {} }),
+      },
+    };
+  }
+
+  beforeEach(() => { registerAdapter(acpAdapter); });
+
+  it('a refused startup prompt fails the role instead of logging it up', async () => {
+    writeCfg({ A: {
+      harness: 'fake-acp', session: 'acp',
+      env: { ACP_FIXTURE_STOP_REASON: 'refusal' },
+    } });
+    mkdirSync(agentDir('A'), { recursive: true });
+    const { deps, logs } = acpDeps();
+
+    await expect(runOnce('A', {}, deps)).rejects.toThrow(/startup prompt refused/);
+    expect(logs.some(l => l.includes('[A] up;'))).toBe(false);
+  });
+
+  it('a cancelled startup prompt fails the role too', async () => {
+    writeCfg({ A: {
+      harness: 'fake-acp', session: 'acp',
+      env: { ACP_FIXTURE_STOP_REASON: 'cancelled' },
+    } });
+    mkdirSync(agentDir('A'), { recursive: true });
+    const { deps, logs } = acpDeps();
+
+    await expect(runOnce('A', {}, deps)).rejects.toThrow(/startup prompt cancelled/);
+    expect(logs.some(l => l.includes('[A] up;'))).toBe(false);
+  });
+
+  it('warns once at startup that an unattended role auto-denies (1.3)', async () => {
+    writeCfg({ A: {
+      harness: 'fake-acp', session: 'acp',
+      permissions: { approval: 'ask', filesystem: 'workspace', unattended: 'deny' },
+      env: { ACP_FIXTURE_EXIT_AFTER: '1' },
+    } });
+    mkdirSync(agentDir('A'), { recursive: true });
+    const { deps, logs } = acpDeps();
+
+    await runOnce('A', {}, deps);
+    const warnings = logs.filter(l => l.includes('permission policy: unattended=deny'));
+    expect(warnings).toHaveLength(1);
+    expect(warnings[0]).toContain('reject_once');
+  });
+
+  it('says nothing about auto-denial when the role waits instead (1.3)', async () => {
+    writeCfg({ A: {
+      harness: 'fake-acp', session: 'acp',
+      permissions: { approval: 'ask', filesystem: 'workspace', unattended: 'wait' },
+      env: { ACP_FIXTURE_EXIT_AFTER: '1' },
+    } });
+    mkdirSync(agentDir('A'), { recursive: true });
+    const { deps, logs } = acpDeps();
+
+    await runOnce('A', {}, deps);
+    expect(logs.some(l => l.includes('permission policy'))).toBe(false);
+  });
+
+  it('records the ACP child\'s real exit, per class (1.6)', async () => {
+    for (const [code, cls, fresh] of [['0', 'clean', true], ['4', 'program-exit', false]] as const) {
+      writeCfg({ A: {
+        harness: 'fake-acp', session: 'acp',
+        env: { ACP_FIXTURE_EXIT_AFTER: '1', ACP_FIXTURE_EXIT_CODE: code },
+      } });
+      const d = agentDir('A');
+      rmSync(d, { recursive: true, force: true });
+      mkdirSync(d, { recursive: true });
+      writeFileSync(join(d, '.session-id'), 'OLD\n');
+      const { deps } = acpDeps();
+
+      await runOnce('A', {}, deps);
+      const record = JSON.parse(readFileSync(join(d, '.exit-status'), 'utf8'));
+      expect(record.class, `exit code ${code}`).toBe(cls);
+      if (cls === 'program-exit') expect(record.code).toBe(4);
+      // A clean exit rotates under this adapter's policy; a program exit does not.
+      expect(readFileSync(join(d, '.session-id'), 'utf8').trim() !== 'OLD').toBe(fresh);
+    }
+  }, 20_000);
+
+  it('a floor-compliant role starts with ZERO permission prompts (2.1)', async () => {
+    // The startup prompt makes the agent request a tool permission. A role whose
+    // resolved permissions clear the floor must have it granted automatically —
+    // nothing pending, nothing denied, and the turn completes.
+    writeCfg({ A: {
+      harness: 'fake-acp', session: 'acp',
+      permissions: { approval: 'allow', filesystem: 'workspace', unattended: 'deny' },
+      env: { ACP_FIXTURE_EXIT_AFTER: '1', ACP_FIXTURE_ALWAYS_PERMISSION: '1' },
+    } });
+    const d = agentDir('A');
+    rmSync(d, { recursive: true, force: true });
+    mkdirSync(d, { recursive: true });
+    const { deps, logs } = acpDeps();
+
+    await runOnce('A', {}, deps);
+
+    const events = readFileSync(join(d, '.session-events.jsonl'), 'utf8')
+      .trim().split('\n').map(l => JSON.parse(l) as { kind: string; status?: string; decision?: string });
+    const permissions = events.filter(e => e.kind === 'permission');
+    expect(permissions.length).toBeGreaterThan(0);                    // one was requested
+    expect(permissions.every(e => e.status === 'completed')).toBe(true);  // none left pending
+    expect(permissions.every(e => e.decision === 'allowed')).toBe(true);  // and none denied
+    expect(logs.some(l => l.includes('[A] up;'))).toBe(true);
+    expect(events.some(e => e.kind === 'turn_stop')).toBe(true);      // the turn finished
+  }, 20_000);
+
+  it('a completed startup prompt does log the role up', async () => {
+    writeCfg({ A: {
+      harness: 'fake-acp', session: 'acp',
+      env: { ACP_FIXTURE_EXIT_AFTER: '1' },      // agent leaves once startup is answered
+    } });
+    mkdirSync(agentDir('A'), { recursive: true });
+    const { deps, logs } = acpDeps();
+
+    await runOnce('A', {}, deps);
+    expect(logs.some(l => l.includes('[A] up;') && l.includes('session=acp'))).toBe(true);
   });
 });
 
@@ -411,5 +706,168 @@ describe('runTemp', () => {
     const { deps } = fakeWorld({ exitCode: '0', exitFile: join(d, '.exit-status') });
     await runTemp('T', deps);
     expect(existsSync(d)).toBe(false);
+  });
+});
+
+describe('restart-loop containment (3.2)', () => {
+  /** A fake clock and a fake child, so the policy is tested, not the sessions. */
+  function supervisorWorld(stateDir: string, opts: {
+    /** Seconds each attempt "lasts", by attempt index. Last value repeats. */
+    durations?: number[];
+    /** Attempts after which the loop stops (default: 20, a runaway guard). */
+    stopAfter?: number;
+    /** Attempt indices whose session rotated its resume state. */
+    rotatesAt?: number[];
+    throwAt?: number[];
+  } = {}) {
+    const durations = opts.durations ?? [0];
+    const sleeps: number[] = [];
+    const attempts: Array<{ allowResumeRotation?: boolean }> = [];
+    const logs: string[] = [];
+    let clock = 0;
+    const deps: Partial<RunnerDeps> = {
+      sleep: async (ms: number) => { sleeps.push(ms); clock += ms; },
+      now: () => clock,
+      log: (l: string) => { logs.push(l); },
+      // Stop once the breaker has opened: the real loop then holds down forever
+      // on purpose, which against a fake clock is an infinite spin.
+      shouldStop: () => attempts.length >= (opts.stopAfter ?? 20)
+        || readRestartLedger(stateDir).circuit === 'open',
+    };
+    const attempt = async (
+      _n: string, o: { allowResumeRotation?: boolean },
+    ): Promise<AttemptResult> => {
+      const i = attempts.length;
+      attempts.push({ allowResumeRotation: o.allowResumeRotation });
+      if (opts.throwAt?.includes(i)) throw new Error('could not start the session');
+      const secs = durations[Math.min(i, durations.length - 1)];
+      clock += secs * 1000;
+      return {
+        elapsedSecs: secs,
+        exit: { version: 1, class: 'program-exit', code: 1, detail: 'exited with code 1' },
+        rotated: opts.rotatesAt?.includes(i) ?? false,
+        mode: 'resume',
+      };
+    };
+    return { deps, attempt, sleeps, attempts, logs };
+  }
+
+  const setup = () => {
+    writeCfg({ A: { harness: 'fake' } });
+    const d = agentDir('A');
+    mkdirSync(d, { recursive: true });
+    return d;
+  };
+
+  it('grows the delay exponentially, bounded', () => {
+    expect(backoffFor(0)).toBe(0);
+    expect(backoffFor(1)).toBe(2_000);
+    expect(backoffFor(2)).toBe(4_000);
+    expect(backoffFor(3)).toBe(8_000);
+    expect(backoffFor(4)).toBe(16_000);
+    expect(backoffFor(5)).toBe(32_000);
+    expect(backoffFor(99)).toBe(60_000);          // bounded
+  });
+
+  it('an immediate-exit program reaches exactly N attempts, then holds down', async () => {
+    const d = setup();
+    const w = supervisorWorld(d, { durations: [0.1] });
+    const ledger = await runSupervised('A', {}, w.deps, w.attempt);
+
+    expect(w.attempts).toHaveLength(RESTART_FAIL_THRESHOLD);   // exactly N child attempts
+    expect(ledger.circuit).toBe('open');
+    expect(ledger.consecutiveImmediateFailures).toBe(RESTART_FAIL_THRESHOLD);
+    expect(ledger.lastReason).toContain('exited with code 1');
+    expect(Number.isNaN(Date.parse(ledger.openedAt!))).toBe(false);   // dated reason
+    // Backoff was applied between attempts, growing, and never after the open.
+    expect(w.sleeps).toEqual([2_000, 4_000, 8_000, 16_000]);
+    expect(w.logs.some(l => l.includes('HELD DOWN'))).toBe(true);
+  });
+
+  it('stays held down without starting another child', async () => {
+    const d = setup();
+    const boot = supervisorWorld(d, { durations: [0.1] });
+    await runSupervised('A', {}, boot.deps, boot.attempt);
+    expect(readRestartLedger(d).circuit).toBe('open');
+
+    // A fresh runner process (e.g. the host rebooted) must honour the ledger.
+    const w = supervisorWorld(d, { stopAfter: 1 });
+    let polls = 0;
+    w.deps.shouldStop = () => ++polls > 3;
+    await runSupervised('A', {}, w.deps, w.attempt);
+    expect(w.attempts).toHaveLength(0);            // no child was started at all
+  });
+
+  it('the ledger survives a runner restart and keeps counting', async () => {
+    const d = setup();
+    // Two separate runner "processes", two attempts each.
+    for (let i = 0; i < 2; i++) {
+      const w = supervisorWorld(d, { durations: [0.1], stopAfter: 2 });
+      await runSupervised('A', {}, w.deps, w.attempt);
+    }
+    expect(readRestartLedger(d).consecutiveImmediateFailures).toBe(4);
+    expect(readRestartLedger(d).circuit).toBe('closed');       // one short of N
+
+    const w = supervisorWorld(d, { durations: [0.1], stopAfter: 1 });
+    await runSupervised('A', {}, w.deps, w.attempt);
+    expect(readRestartLedger(d).circuit).toBe('open');         // the 5th opens it
+  });
+
+  it('an explicit reset closes the circuit and releases a held-down runner', async () => {
+    const d = setup();
+    const first = supervisorWorld(d, { durations: [0.1] });
+    await runSupervised('A', {}, first.deps, first.attempt);
+    expect(readRestartLedger(d).circuit).toBe('open');
+
+    resetRestartLedger(d);
+    expect(readRestartLedger(d).circuit).toBe('closed');
+    expect(readRestartLedger(d).consecutiveImmediateFailures).toBe(0);
+
+    const w = supervisorWorld(d, { durations: [0.1], stopAfter: 1 });
+    await runSupervised('A', {}, w.deps, w.attempt);
+    expect(w.attempts).toHaveLength(1);            // it starts children again
+  });
+
+  it('a session that runs for a while clears the streak', async () => {
+    const d = setup();
+    // Four instant failures, then one long session, then instant failures again.
+    const w = supervisorWorld(d, { durations: [0.1, 0.1, 0.1, 0.1, 999, 0.1], stopAfter: 7 });
+    await runSupervised('A', {}, w.deps, w.attempt);
+    // Without the reset, 7 instant failures would have opened the circuit.
+    expect(readRestartLedger(d).circuit).toBe('closed');
+    expect(readRestartLedger(d).consecutiveImmediateFailures).toBe(2);
+  });
+
+  it('discards resume state at most once in a failure sequence', async () => {
+    const d = setup();
+    const w = supervisorWorld(d, { durations: [0.1], rotatesAt: [0] });
+    await runSupervised('A', {}, w.deps, w.attempt);
+    // The first attempt was allowed to rotate; every later one was not.
+    expect(w.attempts[0].allowResumeRotation).toBe(true);
+    expect(w.attempts.slice(1).every(a => a.allowResumeRotation === false)).toBe(true);
+  });
+
+  it('allows rotation again once the streak is broken', async () => {
+    const d = setup();
+    const w = supervisorWorld(d, { durations: [0.1, 999, 0.1], rotatesAt: [0], stopAfter: 3 });
+    await runSupervised('A', {}, w.deps, w.attempt);
+    expect(w.attempts[0].allowResumeRotation).toBe(true);
+    expect(w.attempts[1].allowResumeRotation).toBe(false);   // still inside the streak
+    expect(w.attempts[2].allowResumeRotation).toBe(true);    // long session reset it
+  });
+
+  it('a session that cannot even start counts as an immediate failure', async () => {
+    const d = setup();
+    const w = supervisorWorld(d, { durations: [0.1], throwAt: [0, 1, 2, 3, 4] });
+    await runSupervised('A', {}, w.deps, w.attempt);
+    const ledger = readRestartLedger(d);
+    expect(ledger.circuit).toBe('open');
+    expect(ledger.lastReason).toContain('could not start the session');
+  });
+
+  it('a corrupt ledger starts clean instead of taking the role down', () => {
+    const d = setup();
+    writeFileSync(join(d, '.restart-ledger.json'), '{not json');
+    expect(readRestartLedger(d)).toMatchObject({ circuit: 'closed', consecutiveImmediateFailures: 0 });
   });
 });

@@ -3,7 +3,9 @@ import { join } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { parse } from 'yaml';
 import { agentDir, home, stateRoot } from './paths.js';
-import { loadConfig, findRole, resolvePermissions, type ResolvedRole } from './config.js';
+import {
+  loadConfig, findRole, isolationContextFor, resolvePermissions, type ResolvedRole,
+} from './config.js';
 import { getAdapter } from './harness/registry.js';
 import type { Launch } from './harness/types.js';
 import { Tmux } from './tmux.js';
@@ -16,7 +18,8 @@ import type { WrapContext } from './isolation/types.js';
 import { AcpSession } from './session/acp.js';
 import { RoleControlServer } from './session/control.js';
 import { TmuxSession } from './session/tmux.js';
-import type { SessionHandle } from './session/types.js';
+import { classifyShellStatus } from './session/types.js';
+import type { ExitRecord, SessionHandle } from './session/types.js';
 
 export interface RunnerDeps {
   tmux: Tmux;
@@ -30,6 +33,8 @@ export interface RunnerDeps {
   fetch: FetchLike;
   /** Construct the supervisor mail monitor (injectable so tests stub it out). */
   createMonitor(opts: MonitorOpts): MonitorHandle;
+  /** Lets a test (or a shutdown path) end the supervised restart loop. */
+  shouldStop?(): boolean;
 }
 
 const defaultDeps = (): RunnerDeps => ({
@@ -58,7 +63,12 @@ export function buildPaneCommand(
   const env = { PATH: process.env.PATH ?? '', ...launch.env, ...(roleEnv ?? {}) };
   const envPfx = 'env ' + Object.entries(env).map(([k, v]) => `${k}=${shq(v)}`).join(' ');
   const cmd = paneArgv.map(shq).join(' ');
-  return `${envPfx} ${cmd}; echo $? > ${shq(exitStatusPath)}`;
+  // Write a structured record, not a bare number: the wait status alone cannot
+  // say whether the file is missing because the program never exited or because
+  // nothing ever wrote it. `printf` is POSIX; no shell branching is needed
+  // because classification happens in one place, in TypeScript.
+  const record = `'{"version":1,"backend":"tmux","status":'"$__ofs"'}'`;
+  return `${envPfx} ${cmd}; __ofs=$?; printf %s ${record} > ${shq(exitStatusPath)}`;
 }
 
 /** Adapt runner deps and the role's daemon-profile overrides for the monitor. */
@@ -75,6 +85,100 @@ function monitorDeps(deps: RunnerDeps, roleEnv?: Record<string, string>): Monito
     env: { ...process.env, ...(roleEnv ?? {}) },
     timers: { set: (fn, ms) => setTimeout(fn, ms), clear: t => clearTimeout(t) },
   };
+}
+
+/**
+ * Read the pane's `.exit-status`. Three shapes are accepted: the structured
+ * record written above, a bare number left by a pre-upgrade pane (so an
+ * in-place upgrade does not misread a real exit), and anything else — which is
+ * `unknown`, never an invented failure. A missing file returns null so the
+ * caller can distinguish "no record" from "a record saying unknown".
+ */
+export function readExitRecord(path: string): ExitRecord | null {
+  if (!existsSync(path)) return null;
+  const raw = readFileSync(path, 'utf8').trim();
+  if (!raw) return { version: 1, class: 'unknown', detail: 'the pane left an empty exit record' };
+  if (/^-?\d+$/.test(raw)) return classifyShellStatus(Number(raw));   // legacy `echo $?`
+  try {
+    const parsed = JSON.parse(raw) as { status?: unknown };
+    if (typeof parsed.status === 'number') return classifyShellStatus(parsed.status);
+  } catch { /* fall through to unknown */ }
+  return { version: 1, class: 'unknown', detail: `unreadable exit record: ${raw.slice(0, 120)}` };
+}
+
+// ─── Restart-loop containment (3.2) ──────────────────────────────────────────
+//
+// The child-session restart loop used to BE the service manager: systemd's
+// `Restart=always RestartSec=2` and launchd's `KeepAlive`. Neither can count,
+// so a program that dies instantly was relaunched every two seconds forever,
+// and each relaunch was a fresh process with no memory of the previous one.
+// The count now lives with the role, in its state directory, so it survives the
+// runner being restarted and is consistent across both service managers.
+
+export const RESTART_LEDGER_FILE = '.restart-ledger.json';
+
+/** Consecutive immediate failures tolerated before the agent is held down. */
+export const RESTART_FAIL_THRESHOLD = 5;
+const RESTART_BACKOFF_BASE_MS = 2_000;
+const RESTART_BACKOFF_MAX_MS = 60_000;
+/** How often a held-down runner re-reads its ledger, so `up` can release it. */
+const HELD_DOWN_POLL_MS = 5_000;
+
+export interface RestartLedger {
+  version: 1;
+  consecutiveImmediateFailures: number;
+  lastReason: string;
+  nextDelayMs: number;
+  /** Whether this failure sequence has already thrown away resume state. */
+  resumeDiscarded: boolean;
+  circuit: 'closed' | 'open';
+  updatedAt: string;
+  /** When the circuit opened, for the held-down status line. */
+  openedAt?: string;
+}
+
+const emptyLedger = (): RestartLedger => ({
+  version: 1,
+  consecutiveImmediateFailures: 0,
+  lastReason: '',
+  nextDelayMs: 0,
+  resumeDiscarded: false,
+  circuit: 'closed',
+  updatedAt: new Date(0).toISOString(),
+});
+
+/** Bounded exponential backoff for the nth consecutive immediate failure. */
+export function backoffFor(consecutiveFailures: number): number {
+  if (consecutiveFailures <= 0) return 0;
+  return Math.min(
+    RESTART_BACKOFF_BASE_MS * 2 ** (consecutiveFailures - 1), RESTART_BACKOFF_MAX_MS);
+}
+
+/** Read a role's restart ledger; a missing or corrupt one starts clean. */
+export function readRestartLedger(dir: string): RestartLedger {
+  try {
+    const raw = JSON.parse(readFileSync(join(dir, RESTART_LEDGER_FILE), 'utf8')) as Partial<RestartLedger>;
+    if (raw.version !== 1) return emptyLedger();
+    return { ...emptyLedger(), ...raw, version: 1 };
+  } catch { return emptyLedger(); }
+}
+
+export function writeRestartLedger(dir: string, ledger: RestartLedger): void {
+  try {
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(join(dir, RESTART_LEDGER_FILE), JSON.stringify(ledger, null, 2) + '\n');
+  } catch { /* diagnostics must never take the role down */ }
+}
+
+/**
+ * Close the circuit and forget the failure streak. Called by an explicit
+ * operator `up`/`restart`, which is the only thing that may release a held-down
+ * role — a held-down runner polls this file, so a role can be released without
+ * bouncing its unit.
+ */
+export function resetRestartLedger(dir: string): void {
+  if (!existsSync(dir)) return;
+  writeRestartLedger(dir, { ...emptyLedger(), updatedAt: new Date().toISOString() });
 }
 
 /** Filename spawnTemp writes into a temp agent dir to carry the fleet start-stagger. */
@@ -162,12 +266,21 @@ function resolveConfigPath(dir: string, explicit?: string): string | undefined {
   return readFileSync(marker, 'utf8').trim() || undefined;
 }
 
-/** One supervised session lifecycle. The supervisor re-invokes us after we return. */
+/** What one child session did, so the supervising loop can decide what follows. */
+export interface AttemptResult {
+  elapsedSecs: number;
+  exit: ExitRecord;
+  /** Whether this attempt threw away resume state to start fresh. */
+  rotated: boolean;
+  mode: 'fresh' | 'resume';
+}
+
+/** One session lifecycle. `runSupervised` (or a one-shot caller) drives it. */
 export async function runOnce(
   name: string,
-  opts: { temp?: boolean; configPath?: string } = {},
+  opts: { temp?: boolean; configPath?: string; allowResumeRotation?: boolean } = {},
   partialDeps: Partial<RunnerDeps> = {},
-): Promise<void> {
+): Promise<AttemptResult> {
   const deps = { ...defaultDeps(), ...partialDeps };
   const temp = opts.temp === true;
   const dir = agentDir(name, temp);
@@ -212,12 +325,10 @@ export async function runOnce(
   // env prefix + exit capture in buildPaneCommand stay host-side (see §5.3).
   let wrappedArgv = launch.argv;
   if (role.isolation) {
-    const addDirs = role.harness === 'codex'
-      ? ((role.harness_options as { add_dirs?: string[] } | undefined)?.add_dirs ?? [])
-      : [];
-    const ctx: WrapContext = {
-      stateDir: dir, runCwd, home: home(), harness: role.harness, additionalWriteDirs: addDirs,
-    };
+    // The SAME context config validation and doctor judged (5.2): a policy
+    // checked against a different mount set than the one that launches is not a
+    // check at all.
+    const ctx: WrapContext = { ...isolationContextFor(role), stateDir: dir, runCwd };
     const policy = resolveIsolation(role.isolation, ctx);
     const sel = await selectIsolationBackend(policy, deps.exec);  // throws on strict + unavailable
     const degradedMarker = join(dir, '.isolation-degraded');
@@ -270,6 +381,13 @@ export async function runOnce(
   let acpSession: AcpSession | undefined;
   let control: RoleControlServer | undefined;
   if (sessionBackend === 'acp') {
+    const perms = role.permissions ?? resolvePermissions(undefined, undefined);
+    // Say once, at startup, that this role will decide permission requests by
+    // itself. Without it the only trace of an auto-denied tool call is a turn
+    // that quietly did less than it was asked to.
+    if (perms.unattended === 'deny')
+      deps.log(`[${name}] permission policy: unattended=deny — with no console attached, ` +
+        `permission requests are automatically denied once each (reject_once) and the turn continues`);
     acpSession = await AcpSession.start({
       name,
       argv: wrappedArgv,
@@ -277,7 +395,7 @@ export async function runOnce(
       env: { ...launch.env, ...(role.env ?? {}) },
       stateDir: dir,
       mode,
-      permissions: role.permissions ?? resolvePermissions(undefined, undefined),
+      permissions: perms,
       log: deps.log,
     });
     pid = acpSession.pid;
@@ -285,20 +403,27 @@ export async function runOnce(
     control = new RoleControlServer(dir, acpSession, deps.log);
     await control.start();
     resolvedMonitorDeps.delivery = {
+      // A wake is only delivered when its turn TERMINATES successfully. A
+      // refusal or a cancellation reached the agent and was not acted on, so
+      // the monitor must keep its cursor and try again.
       submit: async text => {
         const result = await acpSession!.submitPrompt(text);
-        return { accepted: result.accepted, detail: result.detail };
+        return { succeeded: result.succeeded, outcome: result.outcome, detail: result.detail };
       },
     };
     const firstPrompt = mode === 'fresh'
       ? `Read and follow ${join(dir, 'briefing.md')} now.`
       : adapter.vocabulary.restartPrompt(role.identity, join(dir, 'WORKLOG.md'), role);
+    // Wait for the first turn's TERMINAL result. An agent that accepts the
+    // startup prompt and then refuses it has not started; logging the role as
+    // up would hide a role that never read its briefing.
     const started = await acpSession.submitPrompt(firstPrompt);
-    if (!started.accepted) {
+    if (!started.succeeded) {
       monitor?.stop();
       await control.close();
       await acpSession.close();
-      throw new Error(`[${name}] ACP session rejected startup prompt: ${started.detail ?? started.outcome}`);
+      throw new Error(`[${name}] ACP startup prompt ${started.outcome}` +
+        `${started.detail ? `: ${started.detail}` : ''}`);
     }
   } else {
     await deps.tmux.kill(name);
@@ -326,17 +451,149 @@ export async function runOnce(
   if (control) await control.close();
   if (acpSession) await acpSession.close();
   const elapsed = (deps.now() - start) / 1000;
-  const code = existsSync(exitFile) ? readFileSync(exitFile, 'utf8').trim() : 'crash';
+  // Establish what actually happened before deciding anything. Absence of a
+  // record is `unknown` — except when the console itself is gone, which is a
+  // different event with a different consequence.
+  const exitRecord: ExitRecord = acpSession
+    ? acpSession.exitResult()
+      ?? { version: 1, class: 'unknown', detail: 'the ACP agent stopped without reporting an exit' }
+    : readExitRecord(exitFile)
+      ?? (await deps.tmux.has(name)
+        ? { version: 1, class: 'unknown', detail: 'the pane process ended without writing an exit record' }
+        : { version: 1, class: 'session-destroyed', detail: `the tmux session '${name}' no longer exists` });
+  writeFileSync(exitFile, JSON.stringify({
+    ...exitRecord, at: new Date(deps.now()).toISOString(), elapsedSecs: Number(elapsed.toFixed(1)),
+  }) + '\n');
 
+  let rotated = false;
   const rotate = (why: string) => {
     writeFileSync(sidFile, randomUUID() + '\n');
     rmSync(bootedFile, { force: true });
+    rotated = true;
     deps.log(`[${name}] ${why} -> rotated session-id; next start is FRESH`);
   };
-  if (code === '0' && adapter.exitPolicy.cleanExitIsFresh) rotate(`clean exit (code 0)`);
-  else if (mode === 'resume' && elapsed < adapter.exitPolicy.fastFailSecs)
-    rotate(`resume failed fast (${elapsed.toFixed(0)}s, code ${code})`);
-  else deps.log(`[${name}] exited (code ${code}, ${elapsed.toFixed(0)}s) -> next start RESUMES context`);
+  if (exitRecord.class === 'clean' && adapter.exitPolicy.cleanExitIsFresh)
+    rotate(`clean exit (code 0)`);
+  else if (exitRecord.class === 'session-destroyed')
+    // Someone tore the console down; the agent did not fail. Rotating here
+    // would discard a live conversation for an operator action.
+    deps.log(`[${name}] ${exitRecord.detail} (${elapsed.toFixed(0)}s) -> next start RESUMES context`);
+  else if (mode === 'resume' && elapsed < adapter.exitPolicy.fastFailSecs) {
+    // Self-heal a poisoned resume — but only once per failure sequence. Rotating
+    // on every attempt would discard the conversation again and again while the
+    // real cause (a broken command, a missing binary) went unaddressed.
+    if (opts.allowResumeRotation === false)
+      deps.log(`[${name}] resume failed fast again (${elapsed.toFixed(0)}s, ${exitRecord.detail}) ` +
+        `-> resume state was already discarded once; keeping it`);
+    else rotate(`resume failed fast (${elapsed.toFixed(0)}s, ${exitRecord.detail})`);
+  } else deps.log(
+    `[${name}] ${exitRecord.detail} (${elapsed.toFixed(0)}s) -> next start RESUMES context`);
+
+  return { elapsedSecs: elapsed, exit: exitRecord, rotated, mode };
+}
+
+/**
+ * The persistent supervisor for one permanent role: run child sessions in a
+ * loop, count consecutive immediate failures across them, back off between
+ * attempts, and after `RESTART_FAIL_THRESHOLD` hold the agent down while
+ * staying alive — so the service manager has nothing to restart and cannot
+ * resume the two-second loop behind our back.
+ *
+ * `attempt` is injectable so the policy can be tested against a fake clock and
+ * fake child instead of real sessions.
+ */
+export async function runSupervised(
+  name: string,
+  opts: { configPath?: string } = {},
+  partialDeps: Partial<RunnerDeps> = {},
+  attempt: (
+    n: string, o: { configPath?: string; allowResumeRotation?: boolean }, d: Partial<RunnerDeps>,
+  ) => Promise<AttemptResult> = runOnce,
+): Promise<RestartLedger> {
+  const deps = { ...defaultDeps(), ...partialDeps };
+  const dir = agentDir(name);
+  mkdirSync(dir, { recursive: true });
+  const shouldStop = deps.shouldStop ?? (() => false);
+  const stamp = () => new Date(deps.now()).toISOString();
+
+  while (!shouldStop()) {
+    let ledger = readRestartLedger(dir);
+
+    if (ledger.circuit === 'open') {
+      // Held down. Stay alive — exiting would hand the role straight back to
+      // the service manager — and watch for an operator reset.
+      await deps.sleep(HELD_DOWN_POLL_MS);
+      continue;
+    }
+
+    let result: AttemptResult;
+    try {
+      result = await attempt(
+        name, { configPath: opts.configPath, allowResumeRotation: !ledger.resumeDiscarded }, deps);
+    } catch (e) {
+      // A session that could not even start is an immediate failure like any
+      // other; it must count, or an unstartable role loops forever.
+      result = {
+        elapsedSecs: 0,
+        exit: { version: 1, class: 'unknown', detail: e instanceof Error ? e.message : String(e) },
+        rotated: false,
+        mode: 'fresh',
+      };
+    }
+
+    // Re-read: the attempt itself may have taken minutes, and an operator may
+    // have reset the ledger meanwhile.
+    ledger = readRestartLedger(dir);
+    const fastFailSecs = fastFailSecsFor(name, opts.configPath);
+    const immediate = result.elapsedSecs < fastFailSecs;
+
+    if (!immediate) {
+      // A session that ran for a while is not a restart loop, whatever ended it.
+      writeRestartLedger(dir, {
+        ...emptyLedger(),
+        lastReason: result.exit.detail,
+        updatedAt: stamp(),
+      });
+      continue;
+    }
+
+    const failures = ledger.consecutiveImmediateFailures + 1;
+    const reason = `${result.exit.detail} after ${result.elapsedSecs.toFixed(1)}s`;
+    const next: RestartLedger = {
+      version: 1,
+      consecutiveImmediateFailures: failures,
+      lastReason: reason,
+      nextDelayMs: backoffFor(failures),
+      resumeDiscarded: ledger.resumeDiscarded || result.rotated,
+      circuit: failures >= RESTART_FAIL_THRESHOLD ? 'open' : 'closed',
+      updatedAt: stamp(),
+    };
+    if (next.circuit === 'open') {
+      next.openedAt = stamp();
+      next.nextDelayMs = 0;
+      writeRestartLedger(dir, next);
+      deps.log(`[${name}] HELD DOWN after ${failures} immediate failures at ${next.openedAt} — ` +
+        `${reason}; the agent will not be restarted until: ours-fleet restart ${name}`);
+      continue;
+    }
+    writeRestartLedger(dir, next);
+    deps.log(`[${name}] immediate failure ${failures}/${RESTART_FAIL_THRESHOLD} (${reason}) ` +
+      `-> backing off ${next.nextDelayMs}ms`);
+    await deps.sleep(next.nextDelayMs);
+  }
+  return readRestartLedger(dir);
+}
+
+/**
+ * How short an attempt has to be to count as immediate. The role's harness
+ * decides; an unreadable config falls back to the common 20s so a broken config
+ * cannot disable the breaker.
+ */
+function fastFailSecsFor(name: string, configPath?: string): number {
+  try {
+    const role = findRole(loadConfig(configPath), name);
+    return getAdapter(role.harness).exitPolicy.fastFailSecs;
+  } catch { return 20; }
 }
 
 /** Temp-agent entrypoint: run one session, then remove the temp dir. */

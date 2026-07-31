@@ -1,6 +1,11 @@
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { resolveIsolation } from '../src/isolation/policy.js';
+import {
+  IsolationPolicyError, canonicalPath, mountConflict, resolveIsolation,
+} from '../src/isolation/policy.js';
+import { makeBubblewrapBackend } from '../src/isolation/bubblewrap.js';
 import type { WrapContext } from '../src/isolation/types.js';
 
 const ctx = (over: Partial<WrapContext> = {}): WrapContext => ({
@@ -106,5 +111,240 @@ describe('resolveIsolation fs extras and secrets', () => {
     const m = mount(r, '/host/gh_token');
     expect(m?.dst).toBe('/run/secrets/gh_token');
     expect(m?.mode).toBe('ro');
+  });
+});
+
+describe('forbidden-path enforcement (5.2)', () => {
+  // A real directory tree, so canonicalisation (and symlinks) are exercised
+  // rather than mocked. The forbidden set is derived from `home` and from the
+  // agents root, so both must be real paths under the temp home.
+  let home: string;
+  let agentsRoot: string;
+  let stateDir: string;
+  let siblingDir: string;
+  let workDir: string;
+
+  beforeEach(() => {
+    home = realpathSync(mkdtempSync(join(tmpdir(), 'ours-fleet-iso-')));
+    agentsRoot = join(home, '.ours-fleet', 'agents');
+    stateDir = join(agentsRoot, 'Dev');
+    siblingDir = join(agentsRoot, 'Other');
+    workDir = join(home, 'work', 'repo');
+    for (const d of [stateDir, siblingDir, workDir, join(home, '.ssh'), join(home, '.ours')])
+      mkdirSync(d, { recursive: true });
+  });
+  afterEach(() => rmSync(home, { recursive: true, force: true }));
+
+  const live = (over: Partial<WrapContext> = {}): WrapContext =>
+    ({ stateDir, runCwd: workDir, home, harness: 'claude-code', ...over });
+
+  const refuse = (cfg: Parameters<typeof resolveIsolation>[0], over: Partial<WrapContext> = {}) =>
+    (() => { try { resolveIsolation(cfg, live(over)); return null; }
+             catch (e) { return e as Error; } })();
+
+  it('refuses an EXACT forbidden path', () => {
+    const e = refuse({ fs: { write: [join(home, '.ssh')] } });
+    expect(e).toBeInstanceOf(IsolationPolicyError);
+    expect(e!.message).toContain('.ssh');
+    expect(e!.message).toContain(' is the forbidden path');
+  });
+
+  it('refuses a DESCENDANT of a forbidden path', () => {
+    const e = refuse({ fs: { read: [join(home, '.ssh', 'id_ed25519')] } });
+    expect(e!.message).toContain('is inside the forbidden path');
+  });
+
+  it('refuses a PARENT that would expose a forbidden descendant', () => {
+    // $HOME names nothing forbidden, but it contains ~/.ssh and ~/.ours.
+    const e = refuse({ fs: { write: [home] } });
+    expect(e!.message).toContain('would expose the forbidden path');
+  });
+
+  it('refuses a SYMLINK alias of a forbidden path, and says what it resolved to', () => {
+    const alias = join(home, 'work', 'keys');
+    symlinkSync(join(home, '.ssh'), alias);
+    const e = refuse({ fs: { read: [alias] } });
+    expect(e).toBeInstanceOf(IsolationPolicyError);
+    expect(e!.message).toContain(alias);
+    expect(e!.message).toContain('resolves to');
+    expect(e!.message).toContain(join(home, '.ssh'));
+  });
+
+  it('refuses a Codex add_dirs entry the same way', () => {
+    const e = refuse({}, { harness: 'codex', additionalWriteDirs: [join(home, '.ours')] });
+    expect(e).toBeInstanceOf(IsolationPolicyError);
+    expect(e!.message).toContain('.ours');
+  });
+
+  it('refuses a secret whose SOURCE is forbidden', () => {
+    const e = refuse({ secrets: [`${join(home, '.ssh', 'id_rsa')}:/run/secrets/key`] });
+    expect(e!.message).toContain('source');
+    expect(e!.message).toContain('.ssh');
+  });
+
+  it('refuses a secret whose DESTINATION lands on a forbidden path', () => {
+    const e = refuse({ secrets: [`${join(workDir, 'key')}:${join(home, '.ssh', 'authorized_keys')}`] });
+    expect(e!.message).toContain('destination');
+    expect(e!.message).toContain('.ssh');
+  });
+
+  it("permits the role's OWN state dir, which sits inside the forbidden agents root", () => {
+    const r = resolveIsolation({}, live());
+    expect(r.mounts.some(m => m.src === stateDir)).toBe(true);
+  });
+
+  it('does NOT permit a sibling agent state dir', () => {
+    const e = refuse({ fs: { read: [siblingDir] } });
+    expect(e).toBeInstanceOf(IsolationPolicyError);
+    expect(e!.message).toContain('Other');
+  });
+
+  it('does NOT permit the agents root itself, which would expose every sibling', () => {
+    const e = refuse({ fs: { write: [agentsRoot] } });
+    expect(e).toBeInstanceOf(IsolationPolicyError);
+  });
+
+  it('still allows ordinary paths', () => {
+    const r = resolveIsolation(
+      { fs: { write: [join(home, 'work', 'data')], read: ['/opt/reference'] } }, live());
+    expect(r.mounts.some(m => m.src === join(home, 'work', 'data'))).toBe(true);
+    expect(r.mounts.some(m => m.src === '/opt/reference')).toBe(true);
+  });
+
+  it('keeps the blocklist on the resolved policy for diagnostics', () => {
+    const r = resolveIsolation({}, live());
+    expect(r.blocklist).toContain(join(home, '.ssh'));
+    expect(r.blocklist).toContain(agentsRoot);
+  });
+
+  it('no forbidden path can reach the final bwrap argv', () => {
+    // Everything that resolves is safe by construction; prove the argv agrees.
+    // Compared as PATHS, not substrings — `~/.ours` is a substring of
+    // `~/.ours-fleet` and an unrelated directory, which is precisely why the
+    // implementation compares with a separator rather than startsWith alone.
+    const r = resolveIsolation({ fs: { write: [join(home, 'work', 'data')] } }, live());
+    const argv = makeBubblewrapBackend().wrap(['claude'], r, live());
+
+    // Only BIND flags expose host content. `--tmpfs`, `--proc` and `--dev`
+    // cover a path with something empty, which hides it rather than sharing it.
+    const BIND = new Set(['--bind', '--bind-try', '--ro-bind', '--ro-bind-try']);
+    const bound: string[] = [];
+    for (let i = 0; i < argv.length; i++)
+      if (BIND.has(argv[i])) bound.push(argv[i + 1], argv[i + 2]);
+    expect(bound.length).toBeGreaterThan(0);
+
+    for (const token of bound) {
+      if (canonicalPath(token) === canonicalPath(stateDir)) continue;   // the allowed exception
+      for (const forbidden of r.blocklist)
+        expect(mountConflict(canonicalPath(token), canonicalPath(forbidden)),
+          `${token} vs ${forbidden}`).toBeNull();
+    }
+  });
+
+  it('the path comparison is not a substring match', () => {
+    // The regression this guards: `~/.ours` (forbidden) vs `~/.ours-fleet`.
+    expect(mountConflict('/home/u/.ours-fleet', '/home/u/.ours')).toBeNull();
+    expect(mountConflict('/home/u/.ours/keys', '/home/u/.ours')).toBe('descendant');
+    expect(mountConflict('/home/u', '/home/u/.ours')).toBe('parent');
+    expect(mountConflict('/home/u/.ours', '/home/u/.ours')).toBe('exact');
+  });
+
+  it('canonicalises a path whose leading components exist but whose tail does not', () => {
+    const missing = join(workDir, 'not-created-yet', 'deep');
+    expect(canonicalPath(missing)).toBe(missing);
+  });
+});
+
+describe('shared harness credentials are read-only (5.1)', () => {
+  const stateDir = '/home/fleet/.ours-fleet/agents/Dev';
+  const runtime = (h: string) => join(stateDir, 'harness', h);
+
+  const claudeCtx = (): WrapContext => ({
+    stateDir, runCwd: '/home/fleet/work/repo', home: '/home/fleet', harness: 'claude-code',
+    harnessHome: '/home/fleet/.claude',
+    harnessRuntimeDir: runtime('claude-code'),
+    harnessSharedPaths: [
+      '/home/fleet/.claude.json',
+      '/home/fleet/.claude/CLAUDE.md',
+      '/home/fleet/.claude/settings.json',
+      '/home/fleet/.claude/plugins',
+    ],
+  });
+
+  const codexCtx = (): WrapContext => ({
+    stateDir, runCwd: '/home/fleet/work/repo', home: '/home/fleet', harness: 'codex',
+    harnessHome: '/home/fleet/.codex',
+    harnessRuntimeDir: runtime('codex'),
+    harnessSharedPaths: [
+      '/home/fleet/.codex/auth.json',
+      '/home/fleet/.codex/config.toml',
+      '/home/fleet/.codex/AGENTS.md',
+      '/home/fleet/.agents',
+    ],
+  });
+
+  it('Claude: the home is per-role writable, the shared files read-only', () => {
+    const r = resolveIsolation({}, claudeCtx());
+    const homeMount = r.mounts.find(m => m.dst === '/home/fleet/.claude')!;
+    expect(homeMount.mode).toBe('rw');
+    expect(homeMount.src).toBe(runtime('claude-code'));      // NOT the shared host dir
+
+    for (const shared of ['/home/fleet/.claude.json', '/home/fleet/.claude/CLAUDE.md',
+                          '/home/fleet/.claude/settings.json', '/home/fleet/.claude/plugins'])
+      expect(r.mounts.find(m => m.dst === shared)?.mode, shared).toBe('ro');
+
+    // The shared host ~/.claude is never bound writable anywhere.
+    expect(r.mounts.some(m => m.src === '/home/fleet/.claude' && m.mode === 'rw')).toBe(false);
+  });
+
+  it('Codex: same split, including credentials and shared instructions', () => {
+    const r = resolveIsolation({}, codexCtx());
+    const homeMount = r.mounts.find(m => m.dst === '/home/fleet/.codex')!;
+    expect(homeMount.mode).toBe('rw');
+    expect(homeMount.src).toBe(runtime('codex'));
+    for (const shared of ['/home/fleet/.codex/auth.json', '/home/fleet/.codex/config.toml',
+                          '/home/fleet/.codex/AGENTS.md', '/home/fleet/.agents'])
+      expect(r.mounts.find(m => m.dst === shared)?.mode, shared).toBe('ro');
+    expect(r.mounts.some(m => m.src === '/home/fleet/.codex' && m.mode === 'rw')).toBe(false);
+  });
+
+  it('the writable home is ordered BEFORE the read-only overlays', () => {
+    // bwrap applies mounts in order; a shared file bound before the home would
+    // be replaced by it and silently become writable again.
+    const r = resolveIsolation({}, claudeCtx());
+    const homeIdx = r.mounts.findIndex(m => m.dst === '/home/fleet/.claude');
+    for (const shared of r.mounts.filter(m => m.dst.startsWith('/home/fleet/.claude/')))
+      expect(r.mounts.indexOf(shared)).toBeGreaterThan(homeIdx);
+  });
+
+  it("the per-role runtime dir is allowed despite living under the forbidden agents root", () => {
+    // It is inside the role's own state dir, which is the one legitimate
+    // descendant — and the exception covers the whole subtree, not just the
+    // directory itself.
+    expect(() => resolveIsolation({}, claudeCtx())).not.toThrow();
+  });
+
+  it('a harness that declares no split keeps the historical whole-home mount', () => {
+    const r = resolveIsolation({}, ctx());       // no harnessHome in context
+    expect(mount(r, '/home/fleet/.claude')?.mode).toBe('rw');
+  });
+
+  it('the bwrap argv binds the per-role dir at the harness home, then the shared files ro', () => {
+    const c = claudeCtx();
+    const argv = makeBubblewrapBackend().wrap(['claude'], resolveIsolation({}, c), c);
+    const at = (flag: string, src: string, dst: string) => {
+      for (let i = 0; i < argv.length - 2; i++)
+        if (argv[i] === flag && argv[i + 1] === src && argv[i + 2] === dst) return i;
+      return -1;
+    };
+    const homeAt = at('--bind-try', runtime('claude-code'), '/home/fleet/.claude');
+    const credsAt = at('--ro-bind-try', '/home/fleet/.claude.json', '/home/fleet/.claude.json');
+    const instrAt = at('--ro-bind-try', '/home/fleet/.claude/CLAUDE.md', '/home/fleet/.claude/CLAUDE.md');
+    expect(homeAt).toBeGreaterThan(-1);
+    expect(credsAt).toBeGreaterThan(-1);
+    expect(instrAt).toBeGreaterThan(homeAt);       // layered on top of the writable home
+    // No writable bind of the shared host home anywhere in the argv.
+    expect(at('--bind', '/home/fleet/.claude', '/home/fleet/.claude')).toBe(-1);
+    expect(at('--bind-try', '/home/fleet/.claude', '/home/fleet/.claude')).toBe(-1);
   });
 });

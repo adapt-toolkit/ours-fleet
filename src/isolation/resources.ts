@@ -5,9 +5,12 @@ export interface ResourceArgs { argv: string[]; warnings: string[] }
 
 /**
  * Build the `systemd-run --user --scope -p … --` prefix that caps the pane's
- * cgroup-v2 scope. Composed OUTSIDE the sandbox wrap (§5.3/§5.4): because tmux
- * panes are children of the shared tmux server rather than the per-role unit, the
- * only reliable per-agent limit is a transient scope at the pane itself.
+ * cgroup-v2 scope. Composed OUTSIDE the sandbox wrap (§5.3/§5.4): a tmux pane is
+ * a child of a tmux SERVER rather than of the role's own runner process, so the
+ * only reliable per-agent limit is a transient scope at the pane itself. (Since
+ * #32 that server is per role rather than fleet-wide, which is what keeps one
+ * role's `stop` off every other role's pane — the limit still belongs on the
+ * pane.)
  *
  * mem/pids are always enforced (their controllers are delegated to `--user` by
  * default). cpu degrades to a warning when the cpu controller is not delegated.
