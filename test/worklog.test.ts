@@ -48,4 +48,3 @@ describe('worklog rotation', () => {
     expect(readFileSync(path, 'utf8')).toBe(`${original}concurrent\n`);
   });
 });
-

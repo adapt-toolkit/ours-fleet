@@ -166,4 +166,3 @@ const writeStatus = (dir: string, ledger: ModelRecoveryLedger) =>
     heldDown: ledger.heldDown,
     transitionedAt: ledger.transitionedAt,
   }, null, 2)}\n`);
-

@@ -65,4 +65,3 @@ describe('model recovery', () => {
     expect(modelRecoveryHeld(dir)).toBe(false);
   });
 });
-

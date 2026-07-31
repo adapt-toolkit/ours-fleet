@@ -83,4 +83,3 @@ http.createServer((req, res) => {
 }).listen(port, '127.0.0.1', () => {
   process.stderr.write(`anthropic auth proxy listening on 127.0.0.1:${port}\n`);
 });
-

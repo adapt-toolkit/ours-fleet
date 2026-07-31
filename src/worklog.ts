@@ -95,4 +95,3 @@ export function rotateWorklog(
     archivePath,
   };
 }
-
