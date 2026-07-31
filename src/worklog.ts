@@ -1,7 +1,8 @@
 import {
-  existsSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync,
+  existsSync, linkSync, readdirSync, readFileSync, renameSync, rmSync, statSync,
 } from 'node:fs';
 import { basename, dirname, join } from 'node:path';
+import { randomUUID } from 'node:crypto';
 import { replaceFileAtomically } from './atomic-file.js';
 import type { WorklogPolicy } from './config.js';
 
@@ -55,7 +56,12 @@ export function pruneWorklogArchives(path: string, maxArchives: number): void {
 export function rotateWorklog(
   path: string,
   policy?: WorklogPolicy,
-  deps: { now?: () => Date; beforeCommit?: () => void } = {},
+  deps: {
+    now?: () => Date;
+    beforeCommit?: () => void;
+    /** Deterministic test hook for the rename→link commit window. */
+    afterArchiveRename?: () => void;
+  } = {},
 ): WorklogRotation {
   const inspection = inspectWorklog(path, policy);
   if (!policy || !inspection.overLimit)
@@ -63,7 +69,6 @@ export function rotateWorklog(
   const before = statSync(path);
   const content = readFileSync(path);
   const start = safeTailStart(content, policy.keep_tail_kb * 1024);
-  const head = content.subarray(0, start);
   const tail = content.subarray(start);
   deps.beforeCommit?.();
   const current = statSync(path);
@@ -77,21 +82,44 @@ export function rotateWorklog(
   let collision = 0;
   let archivePath = archiveName(path, deps.now?.() ?? new Date(), collision);
   while (existsSync(archivePath)) archivePath = archiveName(path, deps.now?.() ?? new Date(), ++collision);
-  writeFileSync(archivePath, head, { mode: before.mode & 0o777 });
-  replaceFileAtomically(path, tail.toString('utf8'), before.mode & 0o777);
+  // Prepare the intended tail before moving the live inode. replaceFileAtomically
+  // gives us a fully written/fsynced inode; hard-linking it below publishes that
+  // inode without ever overwriting a path a concurrent appender may create.
+  const preparedTail = join(dirname(path), `.${basename(path)}.${randomUUID()}.rotate`);
+  replaceFileAtomically(preparedTail, tail.toString('utf8'), before.mode & 0o777);
+  try {
+    // Linearization point: the complete original inode becomes the archive.
+    // Writers that opened before this rename keep appending to that inode, so
+    // their acknowledged bytes remain in the archive even after the move.
+    renameSync(path, archivePath);
+    deps.afterArchiveRename?.();
+    try {
+      // Atomic create-without-overwrite. If a writer opened the missing path in
+      // the rename→link window, it created the new live file; EEXIST means leave
+      // that file untouched. The intended tail remains recoverable in the full
+      // archive, and every concurrent suffix remains in the writer-created live.
+      linkSync(preparedTail, path);
+    } catch (e) {
+      if ((e as NodeJS.ErrnoException).code !== 'EEXIST') throw e;
+    }
+  } finally {
+    rmSync(preparedTail, { force: true });
+  }
+  const liveBytes = existsSync(path) ? statSync(path).size : 0;
   const status = {
     schemaVersion: 1,
     rotatedAt: (deps.now?.() ?? new Date()).toISOString(),
     beforeBytes: before.size,
-    afterBytes: tail.length,
+    afterBytes: liveBytes,
     archive: basename(archivePath),
+    archiveContainsFullSnapshot: true,
   };
   replaceFileAtomically(join(dirname(path), '.worklog-rotation.json'), `${JSON.stringify(status, null, 2)}\n`);
   pruneWorklogArchives(path, policy.max_archives);
   return {
     rotated: true,
     beforeBytes: before.size,
-    afterBytes: tail.length,
+    afterBytes: liveBytes,
     archivePath,
   };
 }
