@@ -57,10 +57,37 @@ export function validateWatchdogReport(v: unknown): string[] {
         errors.push(`roles[${i}].status: expected one of ${WATCHDOG_ROLE_STATUSES.join('|')}, got '${String(role.status)}'`);
       if (role.status !== 'healthy' && role.status !== 'idle' && !role.reason)
         errors.push(`roles[${i}]: non-healthy finding requires a reason`);
+      if (role.reason !== undefined && typeof role.reason !== 'string')
+        errors.push(`roles[${i}].reason: expected a string`);
+      if (role.evidence !== undefined) {
+        if (!Array.isArray(role.evidence)) {
+          errors.push(`roles[${i}].evidence: expected an array`);
+        } else {
+          role.evidence.forEach((ev, j) => {
+            if (!isPlainObject(ev)) {
+              errors.push(`roles[${i}].evidence[${j}]: expected an object`);
+              return;
+            }
+            for (const key of ['source', 'detail', 'observed_at'] as const)
+              if (typeof ev[key] !== 'string') errors.push(`roles[${i}].evidence[${j}].${key}: expected a string`);
+          });
+        }
+      }
     });
   }
 
-  if (!Array.isArray(r.alerts)) errors.push('alerts: expected an array');
+  if (!Array.isArray(r.alerts)) {
+    errors.push('alerts: expected an array');
+  } else {
+    r.alerts.forEach((alert, i) => {
+      if (!isPlainObject(alert)) {
+        errors.push(`alerts[${i}]: expected an object`);
+        return;
+      }
+      for (const key of ['role', 'code', 'coordinator', 'sent_at'] as const)
+        if (typeof alert[key] !== 'string') errors.push(`alerts[${i}].${key}: expected a string`);
+    });
+  }
 
   if (r.error !== null && typeof r.error !== 'string') errors.push('error: expected string or null');
 

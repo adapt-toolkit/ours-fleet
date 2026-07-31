@@ -37,6 +37,39 @@ describe('validateWatchdogReport', () => {
     expect(validateWatchdogReport(bad).some(e => e.startsWith('summary'))).toBe(true);
     expect(validateWatchdogReport({ ...good(), roles: 'nope' })).toContain('roles: expected an array');
   });
+  it('rejects a non-string reason', () => {
+    const bad = good(); (bad.roles[0] as { reason: unknown }).reason = 12345;
+    expect(validateWatchdogReport(bad)).toContain('roles[0].reason: expected a string');
+  });
+  it('rejects a non-array evidence', () => {
+    const bad = good(); (bad.roles[0] as { evidence: unknown }).evidence = 'not-an-array';
+    expect(validateWatchdogReport(bad)).toContain('roles[0].evidence: expected an array');
+  });
+  it('rejects evidence items with non-string fields', () => {
+    const bad = good();
+    (bad.roles[0] as { evidence: unknown }).evidence = [{ source: 's', detail: 42, observed_at: 't' }];
+    expect(validateWatchdogReport(bad)).toContain('roles[0].evidence[0].detail: expected a string');
+  });
+  it('rejects non-object alerts entries', () => {
+    expect(validateWatchdogReport({ ...good(), alerts: ['not-an-object'] }))
+      .toContain('alerts[0]: expected an object');
+  });
+  it('rejects alerts entries with non-string fields', () => {
+    const bad = good();
+    bad.alerts = [{ role: 'Alice', code: 1, coordinator: 'FleetCoordinator', sent_at: 't' } as never];
+    expect(validateWatchdogReport(bad)).toContain('alerts[0].code: expected a string');
+  });
+  it('never lets a report that passes validation crash normalizeWatchdogReport', () => {
+    for (const bad of [
+      { ...good(), roles: [{ ...good().roles[0], evidence: 'not-an-array' }] },
+      { ...good(), roles: [{ ...good().roles[0], reason: 12345 }] },
+      { ...good(), roles: [{ ...good().roles[0], evidence: [{ source: 's', detail: 42, observed_at: 't' }] }] },
+      { ...good(), alerts: ['not-an-object'] },
+    ]) {
+      if (validateWatchdogReport(bad).length === 0)
+        expect(() => normalizeWatchdogReport(bad as never, { watchdog: 'w', run_id: 'r' })).not.toThrow();
+    }
+  });
 });
 
 describe('normalizeWatchdogReport', () => {
