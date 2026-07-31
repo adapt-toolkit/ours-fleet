@@ -1,4 +1,6 @@
-import { existsSync, openSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import {
+  closeSync, existsSync, openSync, readFileSync, rmSync, statSync, writeFileSync,
+} from 'node:fs';
 import { spawn as spawnChild, execFile } from 'node:child_process';
 import { join } from 'node:path';
 import { promisify } from 'node:util';
@@ -12,7 +14,7 @@ import { applyRole } from '../ops.js';
 import {
   daemonIdentityProvisioner, ensureIdentity, type IdentityProvisioner,
 } from '../creation.js';
-import { runOnce } from '../runner.js';
+import { runOnce, START_STAGGER_FILE } from '../runner.js';
 import { agentDir, agentsRoot } from '../paths.js';
 import {
   loadConfig, resolveMonitorConfig, resolveWorklogPolicy, type FleetConfig, type ResolvedRole,
@@ -58,6 +60,11 @@ function defaultLaunchChild(binPath: string, roleName: string, runDir: string): 
   const child = spawnChild(process.execPath, [binPath, '_run-watchdog', roleName], {
     detached: false, stdio: ['ignore', out, out],
   });
+  // spawn() dup's the fd into the child; Node never closes our copy on its own,
+  // so a long-running scheduler launching many watchdog runs would leak one fd
+  // per run and eventually hit EMFILE. Safe to close immediately — the child
+  // keeps writing to its own dup'd descriptor.
+  closeSync(out);
   return {
     kill: () => { child.kill(); },
     exited: new Promise(resolve => {
@@ -146,6 +153,11 @@ export async function executeWatchdogRun(
       digest: { cooldown_ms: wd.alertCooldownMs, open: [] },   // Phase 2 fills open[]
     };
     writeFileSync(manifestPath, JSON.stringify(manifest, null, 2) + '\n');
+    // Snapshot the fleet start-stagger so the detached run (no config path
+    // threaded through `_run-watchdog`) honors the same host-wide launch gate
+    // as every other role (spec §3) — mirrors src/spawn.ts:503-504.
+    if (cfg.startStaggerMs > 0)
+      writeFileSync(join(dir, START_STAGGER_FILE), String(cfg.startStaggerMs));
 
     const launch = deps.launchChild ?? defaultLaunchChild;
     const child = launch(deps.binPath, roleName, dir);

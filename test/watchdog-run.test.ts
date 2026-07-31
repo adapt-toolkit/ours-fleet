@@ -8,6 +8,7 @@ import { executeWatchdogRun } from '../src/watchdog/run.js';
 import { listRuns, writeReport } from '../src/watchdog/store.js';
 import { errorReport } from '../src/watchdog/report.js';
 import { agentDir } from '../src/paths.js';
+import { START_STAGGER_FILE } from '../src/runner.js';
 import '../src/harness/claude-code.js';
 
 let dir: string;
@@ -85,6 +86,11 @@ describe('executeWatchdogRun', () => {
     const { report } = await executeWatchdogRun(wd as never, baseDeps(launch) as never);
     expect(report.status).toBe('error');
     expect(report.error).toMatch(/invalid report/);
+    // The tail attached to the error report must be redacted, not raw run.log —
+    // confirmed redactLogLine's actual replacement text ('boom secret=hunter2' ->
+    // 'boom secret=[REDACTED]') before asserting on it.
+    expect((report as { tail?: string }).tail).not.toContain('hunter2');
+    expect((report as { tail?: string }).tail).toContain('[REDACTED]');
   });
 
   it('kills and stores error:timeout when the deadline passes (acceptance 9)', async () => {
@@ -115,5 +121,17 @@ describe('executeWatchdogRun', () => {
     });
     const { report } = await executeWatchdogRun(wd as never, baseDeps(launch) as never);
     expect((report as { isolation?: string }).isolation).toBe('degraded');
+  });
+
+  it('snapshots start_stagger_ms into the run dir before launch (spec §3)', async () => {
+    let seen = '';
+    const launch = fakeChild(async runDir => {
+      seen = readFileSync(join(runDir, START_STAGGER_FILE), 'utf8');
+      writeGoodReport(runDir);
+    });
+    const deps = baseDeps(launch);
+    deps.cfg = { ...deps.cfg, startStaggerMs: 1234 };
+    await executeWatchdogRun(wd as never, deps as never);
+    expect(seen).toBe('1234');
   });
 });
