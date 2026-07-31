@@ -18,7 +18,7 @@ export const UNATTENDED_FLOOR: readonly UnattendedCapability[] = [
 
 /** Fleet-owned wake delivery removes the native Monitor-tool requirement. */
 export function requiredUnattendedFloor(role: ResolvedRole): readonly UnattendedCapability[] {
-  return role.monitor.mode === 'fleet'
+  return role.monitor?.mode === 'fleet'
     ? UNATTENDED_FLOOR.filter(capability => capability !== 'monitor')
     : UNATTENDED_FLOOR;
 }
@@ -205,7 +205,7 @@ function inspectClaudeDontAskSettings(role: ResolvedRole): {
   if (permitted([/^Read(?:\(|$)/i])) capabilities.push('read-state');
   if (permitted([/^Write(?:\(|$)/i, /^Edit(?:\(|$)/i])) capabilities.push('write-state');
   if (permitted([/^mcp__(?:ours|plugin_ours)__|^ours[:_]/i])) capabilities.push('messaging');
-  if (role.monitor.mode === 'fleet' || permitted([/^Monitor(?:\(|$)/i])) capabilities.push('monitor');
+  if (role.monitor?.mode === 'fleet' || permitted([/^Monitor(?:\(|$)/i])) capabilities.push('monitor');
   if (permitted([/^Write(?:\(|$)/i, /^Edit(?:\(|$)/i, /^Bash(?:\(|$)/i]))
     capabilities.push('workspace-edit');
   if (permitted([/^Bash(?:\(|$)/i])) capabilities.push('status-commands');
