@@ -75,11 +75,15 @@ export async function buildWebServer(
     reply.header('X-Frame-Options', 'DENY');
     reply.header('Content-Security-Policy',
       `default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; ` +
-      `connect-src 'self' ws://${auth.host}; object-src 'none'; base-uri 'none'; ` +
+      `connect-src 'self' ${auth.secureCookies ? 'wss' : 'ws'}://${auth.host}; object-src 'none'; base-uri 'none'; ` +
       `frame-ancestors 'none'; form-action 'self'; manifest-src 'self'; worker-src 'self'`);
     if (request.url.startsWith('/api/')) reply.header('Cache-Control', 'no-store');
-    if (request.headers.host !== auth.host)
-      throw new FleetError('forbidden', 'invalid Host header');
+    try { auth.validateBoundary(request, false); }
+    catch (error) {
+      if (request.url.startsWith('/api/')) throw error;
+      const message = normalizeError(error).message;
+      return reply.code(421).type('text/html').send(`<!doctype html><html><head><title>Fleet console address</title></head><body><main><h1>This fleet-console address is not configured</h1><p>${escapeHtml(message)}</p><p>For nginx or VPS access, configure an explicit public origin. The console does not guess proxy hosts.</p></main></body></html>`);
+    }
   });
 
   app.setErrorHandler(async (error, request, reply) => {
@@ -93,14 +97,33 @@ export async function buildWebServer(
 
   app.post('/api/v1/auth/exchange', async (request, reply) => {
     const { session, device } = auth.exchange(request);
-    setAuthCookies(reply, session.id, device.token);
+    setAuthCookies(reply, session.id, device.token, auth.secureCookies);
     await audit.record({ requestId: request.id, browser: session.id, action: 'auth.exchange', result: 'succeeded' });
+    return { csrfToken: session.csrf, expiresAt: new Date(session.absoluteExpiresAt).toISOString() };
+  });
+
+  app.get('/api/v1/auth/mode', async () => ({
+    mode: auth.mode,
+    warning: auth.mode === 'none'
+      ? 'Unprotected mode: anyone who can reach this address can control the fleet.' : undefined,
+  }));
+
+  app.post('/api/v1/auth/login', async (request, reply) => {
+    const { session, device } = auth.login(request, String((request.body as { password?: unknown })?.password ?? ''));
+    setAuthCookies(reply, session.id, device.token, auth.secureCookies);
+    await audit.record({ requestId: request.id, browser: session.id, action: 'auth.password', result: 'succeeded' });
+    return { csrfToken: session.csrf, expiresAt: new Date(session.absoluteExpiresAt).toISOString() };
+  });
+
+  app.post('/api/v1/auth/anonymous', async (request, reply) => {
+    const session = auth.anonymous(request);
+    setSessionCookie(reply, session.id, auth.secureCookies);
     return { csrfToken: session.csrf, expiresAt: new Date(session.absoluteExpiresAt).toISOString() };
   });
 
   app.post('/api/v1/auth/resume', async (request, reply) => {
     const { session, device } = auth.resume(request);
-    setAuthCookies(reply, session.id, device.token);
+    setAuthCookies(reply, session.id, device.token, auth.secureCookies);
     await audit.record({ requestId: request.id, browser: session.id, action: 'auth.resume', result: 'succeeded' });
     return { csrfToken: session.csrf, expiresAt: new Date(session.absoluteExpiresAt).toISOString() };
   });
@@ -293,11 +316,16 @@ export async function buildWebServer(
   };
 }
 
-function setAuthCookies(reply: { header(name: string, value: string | string[]): unknown }, session: string, device: string): void {
+function setAuthCookies(reply: { header(name: string, value: string | string[]): unknown }, session: string, device: string, secure = false): void {
+  const suffix = secure ? '; Secure' : '';
   reply.header('Set-Cookie', [
-    `ofs_session=${encodeURIComponent(session)}; HttpOnly; SameSite=Strict; Path=/api; Max-Age=28800`,
-    `ofs_device=${encodeURIComponent(device)}; HttpOnly; SameSite=Strict; Path=/api; Max-Age=2592000`,
+    `ofs_session=${encodeURIComponent(session)}; HttpOnly; SameSite=Strict; Path=/api; Max-Age=28800${suffix}`,
+    `ofs_device=${encodeURIComponent(device)}; HttpOnly; SameSite=Strict; Path=/api; Max-Age=2592000${suffix}`,
   ]);
+}
+
+function setSessionCookie(reply: { header(name: string, value: string | string[]): unknown }, session: string, secure = false): void {
+  reply.header('Set-Cookie', `ofs_session=${encodeURIComponent(session)}; HttpOnly; SameSite=Strict; Path=/api; Max-Age=28800${secure ? '; Secure' : ''}`);
 }
 
 function clearAuthCookies(reply: { header(name: string, value: string | string[]): unknown }): void {
@@ -308,6 +336,10 @@ function clearAuthCookies(reply: { header(name: string, value: string | string[]
 }
 
 function cryptoRandomId(): string { return randomBytes(12).toString('hex'); }
+
+function escapeHtml(value: string): string {
+  return value.replace(/[&<>"']/g, char => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[char]!));
+}
 
 function requireSubprotocol(request: FastifyRequest, expected: string): void {
   const protocols = String(request.headers['sec-websocket-protocol'] ?? '')

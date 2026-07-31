@@ -72,10 +72,26 @@ ours-fleet web uninstall
 ours-fleet web serve --port 0 --no-open # isolated foreground/testing mode
 \`\`\`
 
-The console is intentionally IPv4-loopback-only. It has no LAN/Internet host,
-proxy, TLS, or remote-access mode. Do not expose port 49271 through a reverse
-proxy. Browser credentials are HttpOnly/SameSite, and \`revoke-all\` invalidates
-all trusted devices. Role creation offers harness-scoped known-model choices
+The console is IPv4-loopback-only by default. Both \`localhost\` and
+\`127.0.0.1\` are accepted locally. For an nginx/TLS reverse proxy, keep the
+default bind and declare the exact browser origin:
+
+\`ours-fleet web install --public-origin https://fleet.example.com --password-file /secure/fleet-password\`
+
+Fleet reads the password file during setup and persists only a salted scrypt
+verifier. New browsers authenticate and retain rotating HttpOnly/SameSite
+trusted-device credentials. If nginx already authenticates, the operator may
+deliberately select \`--no-password\`; the CLI and browser warn that anyone
+reaching the origin can control the fleet. Trusted pairing remains the safe
+local default, and \`--pairing\` restores it.
+
+Use \`--bind ADDRESS\` only for an intentional direct listen. A non-loopback
+bind is rejected unless \`--public-origin\` is also present. Host/Origin checks
+use the declaration and do not trust forwarded headers. Configure nginx to
+proxy HTTP and WebSocket upgrades to \`127.0.0.1:49271\` and terminate TLS;
+fleet accepts nginx's loopback upstream Host, so no Host rewrite is required.
+Browser credentials add Secure for HTTPS, and \`revoke-all\` invalidates all
+trusted devices. Role creation offers harness-scoped known-model choices
 while still accepting a typed model ID; blank explicitly uses the selected
 harness's own default.
 

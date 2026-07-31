@@ -3,6 +3,7 @@ import { api, idempotencyKey } from './api';
 import { CreateRole } from './CreateRole';
 import { RoleWorkspace } from './RoleWorkspace';
 import { isInactive, needsAttention, presentFleet } from './fleet-presentation';
+import { useLivePoll } from './use-live-poll';
 
 type FleetItem = {
   role: {
@@ -23,6 +24,8 @@ type FleetItem = {
 
 export function App() {
   const [ready, setReady] = useState(false);
+  const [passwordRequired, setPasswordRequired] = useState(false);
+  const [password, setPassword] = useState('');
   const [error, setError] = useState('');
   const [items, setItems] = useState<FleetItem[]>([]);
   const [selected, setSelected] = useState('');
@@ -34,24 +37,26 @@ export function App() {
   const [connection, setConnection] = useState<'connecting' | 'live' | 'polling'>('connecting');
   const [meta, setMeta] = useState<{ version?: string; auditDegraded?: string }>();
 
-  const refresh = useCallback(async () => {
-    try {
-      const [fleet, serverMeta] = await Promise.all([
-        api.get<{ roles: FleetItem[] }>('/api/v1/roles'),
-        api.get<{ version: string; auditDegraded?: string }>('/api/v1/meta'),
-      ]);
-      setItems(fleet.roles);
-      setMeta(serverMeta);
-      setError('');
-    } catch (reason) { setError((reason as Error).message); }
+  const refresh = useCallback(async (signal: AbortSignal) => {
+    const [fleet, serverMeta] = await Promise.all([
+      api.get<{ roles: FleetItem[] }>('/api/v1/roles', signal),
+      api.get<{ version: string; auditDegraded?: string }>('/api/v1/meta', signal),
+    ]);
+    if (signal.aborted) return;
+    setItems(fleet.roles);
+    setMeta(serverMeta);
+    setError('');
   }, []);
 
   useEffect(() => {
-    void api.bootstrap().then(async () => {
+    void api.bootstrap().then(result => {
+      if (result === 'password') { setPasswordRequired(true); return; }
       setReady(true);
-      await refresh();
+      // The live poll starts as soon as bootstrap marks the app ready.
     }).catch(reason => setError((reason as Error).message));
-  }, [refresh]);
+  }, []);
+
+  const requestRefresh = useLivePoll(refresh, reason => setError((reason as Error).message), ready);
 
   useEffect(() => {
     if (!ready) return;
@@ -59,18 +64,17 @@ export function App() {
     let cancelled = false;
     void api.post<{ ticket: string }>('/api/v1/ws-tickets', { purpose: 'events' }).then(({ ticket }) => {
       if (cancelled) return;
-      socket = new WebSocket(`ws://${location.host}/api/v1/events`, 'ours-fleet-events.v1');
+      socket = new WebSocket(`${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.host}/api/v1/events`, 'ours-fleet-events.v1');
       socket.onopen = () => socket?.send(JSON.stringify({ ticket }));
       socket.onmessage = event => {
         const message = JSON.parse(event.data);
         if (message.kind === 'ready') setConnection('live');
-        else void refresh();
+        else requestRefresh();
       };
       socket.onclose = () => setConnection('polling');
     }).catch(() => setConnection('polling'));
-    const timer = setInterval(() => void refresh(), selected ? 1_000 : 3_000);
-    return () => { cancelled = true; socket?.close(); clearInterval(timer); };
-  }, [ready, refresh, selected]);
+    return () => { cancelled = true; socket?.close(); };
+  }, [ready, requestRefresh]);
 
   useEffect(() => {
     if (matchMedia('(display-mode: standalone)').matches) return;
@@ -91,6 +95,15 @@ export function App() {
   if (!ready) return <main className="auth-screen">
     <div className="brand-wordmark">Ours</div>
     <h1>fleet console</h1>
+    {passwordRequired && <form onSubmit={event => {
+      event.preventDefault();
+      void api.login(password).then(() => { setPasswordRequired(false); setReady(true); setError(''); })
+        .catch(reason => setError((reason as Error).message));
+    }}>
+      <label>Control-panel password<input autoFocus type="password" autoComplete="current-password"
+        value={password} onChange={event => setPassword(event.target.value)} /></label>
+      <button className="primary" type="submit">Sign in</button>
+    </form>}
     <p>{error || 'Securing this local session…'}</p>
   </main>;
 
@@ -120,12 +133,14 @@ export function App() {
           {installPrompt && <button className="secondary" onClick={() => {
             void installPrompt.prompt(); setInstallPrompt(undefined);
           }}>Install app</button>}
-          <button className="secondary" onClick={() => void refresh()}>Refresh</button>
-          <button className="secondary" onClick={() => void api.logout().finally(() => location.reload())}>Sign out</button>
+          <button className="secondary" onClick={requestRefresh}>Refresh</button>
+          {api.accessMode !== 'none' && <button className="secondary"
+            onClick={() => void api.logout().finally(() => location.reload())}>Sign out</button>}
           <button className="primary" onClick={() => setCreating(true)}>＋ Create role</button>
         </div>
       </header>
       {meta?.auditDegraded && <div className="banner warning">Audit degraded: {meta.auditDegraded}</div>}
+      {api.accessWarning && <div className="banner warning">{api.accessWarning}</div>}
       {error && <div className="banner error">{error}</div>}
       {selected
         ? <RoleWorkspace roleId={selected} onBack={() => setSelected('')} />
@@ -169,7 +184,7 @@ export function App() {
           </div>}
     </section>
     {creating && <CreateRole onClose={() => setCreating(false)} onCreated={(role, path) => {
-      setCreating(false); void refresh(); setSelected(role);
+      setCreating(false); requestRefresh(); setSelected(role);
       if (path) history.replaceState(null, '', path);
     }} />}
   </div>;
@@ -199,9 +214,15 @@ function serviceLabel(liveness: string): string {
 
 function AuditView() {
   const [records, setRecords] = useState<Array<Record<string, string>>>([]);
-  useEffect(() => { void api.get<{ records: Array<Record<string, string>> }>('/api/v1/audit').then(value => setRecords(value.records)); }, []);
+  const [error, setError] = useState('');
+  const refresh = useCallback(async (signal: AbortSignal) => {
+    const value = await api.get<{ records: Array<Record<string, string>> }>('/api/v1/audit', signal);
+    if (!signal.aborted) { setRecords(value.records); setError(''); }
+  }, []);
+  useLivePoll(refresh, reason => setError((reason as Error).message));
   return <div className="content"><div className="panel"><h2>Security & action metadata</h2>
     <p className="muted">Prompt text, terminal bytes, credentials, and log content are never recorded here.</p>
+    {error && <p className="warning">Refresh failed: {error}</p>}
     <div className="audit-list">{records.map((record, index) =>
       <div key={index}><time>{new Date(record.at).toLocaleString()}</time><strong>{record.action}</strong><span>{record.result}</span></div>)}</div>
   </div></div>;

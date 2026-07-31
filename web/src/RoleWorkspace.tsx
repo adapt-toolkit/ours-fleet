@@ -2,6 +2,7 @@ import { lazy, Suspense, useCallback, useEffect, useState } from 'react';
 import { api, idempotencyKey } from './api';
 import { isInactive } from './fleet-presentation';
 import { partitionActivity } from './activity-presentation';
+import { useLivePoll } from './use-live-poll';
 
 const TerminalView = lazy(() => import('./TerminalView').then(module => ({ default: module.TerminalView })));
 
@@ -13,15 +14,25 @@ export function RoleWorkspace({ roleId, onBack }: { roleId: string; onBack(): vo
   const [text, setText] = useState('');
   const [notice, setNotice] = useState('');
   const [showTechnicalActivity, setShowTechnicalActivity] = useState(false);
-  const refresh = useCallback(async () => {
-    const value = await api.get(`/api/v1/roles/${encodeURIComponent(roleId)}`);
-    setDetail(value);
+  const [refreshError, setRefreshError] = useState('');
+  const refresh = useCallback(async (signal: AbortSignal) => {
+    const value = await api.get(`/api/v1/roles/${encodeURIComponent(roleId)}`, signal);
+    if (!signal.aborted) { setDetail(value); setRefreshError(''); }
   }, [roleId]);
-  useEffect(() => { void refresh(); const timer = setInterval(() => void refresh(), 1_000); return () => clearInterval(timer); }, [refresh]);
-  useEffect(() => {
-    if (tab === 'activity') void api.get(`/api/v1/roles/${encodeURIComponent(roleId)}/output?limit=200`).then(setOutput);
-    if (tab === 'logs') void api.get(`/api/v1/roles/${encodeURIComponent(roleId)}/logs?limit=200`).then(setLogs);
-  }, [roleId, tab]);
+  useLivePoll(refresh, reason => setRefreshError((reason as Error).message));
+  const refreshActivity = useCallback(async (signal: AbortSignal) => {
+    const since = output?.lastSeq;
+    const suffix = since === undefined ? '' : `&since=${encodeURIComponent(since)}`;
+    const next: any = await api.get(`/api/v1/roles/${encodeURIComponent(roleId)}/output?limit=200${suffix}`, signal);
+    if (!signal.aborted) setOutput((current: any) => mergeOutput(current, next));
+  }, [output?.lastSeq, roleId]);
+  const requestActivityRefresh = useLivePoll(
+    refreshActivity, reason => setRefreshError((reason as Error).message), tab === 'activity');
+  const refreshLogs = useCallback(async (signal: AbortSignal) => {
+    const value = await api.get(`/api/v1/roles/${encodeURIComponent(roleId)}/logs?limit=200`, signal);
+    if (!signal.aborted) setLogs(value);
+  }, [roleId]);
+  useLivePoll(refreshLogs, reason => setRefreshError((reason as Error).message), tab === 'logs');
   if (!detail) return <div className="content">Loading role evidence…</div>;
   const { role, status, capabilities } = detail;
   const inactive = isInactive({ role, status });
@@ -40,7 +51,7 @@ export function RoleWorkspace({ roleId, onBack }: { roleId: string; onBack(): vo
     try {
       const receipt: any = await api.post(`/api/v1/roles/${roleId}/input`, { text });
       setNotice(receipt.detail); setText('');
-      setTimeout(() => tab === 'activity' && api.get(`/api/v1/roles/${roleId}/output?limit=200`).then(setOutput), 400);
+      requestActivityRefresh();
     } catch (reason) { setNotice((reason as Error).message); }
   };
   return <div className="workspace">
@@ -53,6 +64,7 @@ export function RoleWorkspace({ roleId, onBack }: { roleId: string; onBack(): vo
         <button key={name} className={tab === name ? 'active' : ''} disabled={name === 'terminal' && !capabilities.terminal.available}
           onClick={() => setTab(name)}>{name}{name === 'terminal' && !capabilities.terminal.available ? ' · unavailable' : ''}</button>)}
     </div>
+    {refreshError && <div className="banner error">Live refresh failed: {refreshError}</div>}
     {notice && <div className="banner info">{notice}</div>}
     {tab === 'overview' && <div className="dashboard-grid">
       <Evidence title="Supervisor" state={status.supervisor.liveness} rows={{ backend: status.supervisor.backend, evidence: status.supervisor.detail }} />
@@ -97,6 +109,20 @@ export function RoleWorkspace({ roleId, onBack }: { roleId: string; onBack(): vo
     {tab === 'diagnostics' && <div className="panel"><h2>Capabilities & problems</h2><pre>{JSON.stringify(capabilities, null, 2)}</pre>
       {[...role.problems, ...status.problems].map((problem: any, index: number) => <p className="warning" key={index}>{problem.detail}</p>)}</div>}
   </div>;
+}
+
+export function mergeOutput(current: any, next: any): any {
+  if (!current || next.text !== undefined || current.text !== undefined) return next;
+  const bySeq = new Map<number, any>();
+  for (const event of [...(current.events ?? []), ...(next.events ?? [])]) bySeq.set(event.seq, event);
+  const events = [...bySeq.values()].sort((a, b) => a.seq - b.seq).slice(-200);
+  return {
+    ...next,
+    events,
+    firstSeq: events[0]?.seq ?? next.firstSeq,
+    lastSeq: Math.max(current.lastSeq ?? 0, next.lastSeq ?? 0) || undefined,
+    truncated: Boolean(current.truncated || next.truncated || bySeq.size > 200),
+  };
 }
 
 function LogLine({ record }: { record: any }) {

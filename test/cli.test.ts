@@ -87,11 +87,15 @@ describe('ours-fleet CLI', () => {
     for (const command of [
       'serve', 'install', 'start', 'stop', 'restart', 'status', 'uninstall', 'open', 'revoke-all',
     ]) expect(r.stdout).toContain(command);
+    for (const option of ['--bind', '--public-origin', '--password-file', '--no-password', '--pairing'])
+      expect(r.stdout).toContain(option);
     expect(r.stdout).not.toContain('#bootstrap=');
   });
 
   it('web serve accepts port zero for an isolated ephemeral listener', async () => {
-    const child = spawn(process.execPath, [CLI, 'web', 'serve', '--port', '0', '--no-open'], {
+    const child = spawn(process.execPath, [
+      CLI, 'web', 'serve', '--port', '0', '--no-open', '--no-password',
+    ], {
       env: { ...process.env, OURS_FLEET_HOME: dir }, stdio: ['ignore', 'pipe', 'pipe'],
     });
     let stdout = '';
@@ -105,6 +109,10 @@ describe('ours-fleet CLI', () => {
         new Promise((_, reject) => setTimeout(() => reject(new Error('web serve did not listen')), 5_000)),
       ]);
       expect(stdout).toMatch(/ours-fleet web listening on http:\/\/127\.0\.0\.1:\d+/);
+      expect(stdout).toContain('WARNING: unprotected mode enabled');
+      const { readFileSync } = await import('node:fs');
+      expect(JSON.parse(readFileSync(join(dir, '.ours-fleet/web/access.json'), 'utf8')).mode)
+        .toBe('none');
     } finally {
       child.kill('SIGTERM');
       await once(child, 'exit');
@@ -125,7 +133,10 @@ describe('ours-fleet CLI', () => {
       expect(r.stdout).toContain('## Local web console');
       expect(r.stdout).toContain('ours-fleet web open');
       expect(r.stdout).toContain('ours-fleet web revoke-all');
-      expect(r.stdout).toContain('intentionally IPv4-loopback-only');
+      expect(r.stdout).toContain('IPv4-loopback-only by default');
+      expect(r.stdout).toContain('--public-origin');
+      expect(r.stdout).toContain('--password-file');
+      expect(r.stdout).toContain('--no-password');
     }
   });
 
