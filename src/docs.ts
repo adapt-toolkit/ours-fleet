@@ -39,6 +39,8 @@ ours-fleet logs -f Name
 ours-fleet send Name "prompt"
 ours-fleet send Name --key Enter        # tmux only
 ours-fleet rm Name
+ours-fleet watchdog-report <name> [run-id] [--list] [--json]
+ours-fleet watchdog-run <name>
 \`\`\`
 
 \`peek\`, \`attach\`, and text \`send\` work with tmux and ACP. ACP attachment
@@ -159,7 +161,27 @@ roles:
       KEY: value
     oversee:
       - { role: Worker, interval: 5m }
+watchdogs:
+  nightwatch:                       # [A-Za-z0-9_-], must not collide with a role name
+    coordinator: FleetCoordinator   # required — where alerts go
+    # everything below is optional
+    enabled: true                   # default true; false = configured but never scheduled
+    interval: 10m                   # default 10m; 30s | 10m | 2h, minimum 1m
+    watch: [Alice, CodexReviewer]   # default: every role in the merged config
+    harness: claude-code            # default: defaults.harness
+    model: claude-fable-5           # default: same resolution rule roles use (resolveRoleModel)
+    session: acp                    # default: defaults.session
+    identity: Watchdog-nightwatch   # default: Watchdog-<name>
+    timeout: 5m                     # default 5m; a run past this is killed and recorded as error
+    keep_reports: 50                # default 50 reports retained per watchdog
+    alert_cooldown: 60m             # default 60m before the same finding alerts again
+    prompt_file: /abs/extra.md      # optional extra focus, APPENDED to the fixed contract
 \`\`\`
+
+A watchdog observes and reports; it never restarts, stops, spawns, or removes a
+role, answers a pending permission, edits a workspace, or approves anything on
+the owner's behalf. \`watchdogs:\` may appear only in the base config
+(\`~/fleet.yaml\` or \`-c FILE\`), not in \`~/fleet.d/*.yaml\` drop-ins.
 
 Role values override defaults. \`\${name}\` substitutes entries from \`vars\`.
 Other role fields include \`max_tokens\`, \`autocompact_pct\`, and \`isolation\`.

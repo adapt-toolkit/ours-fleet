@@ -142,6 +142,36 @@ describe('ours-fleet CLI', () => {
     expect(r.stderr).toContain('config not found');
   });
 
+  it('config shows watchdogs and --json includes them in the plan (acceptance 1)', async () => {
+    const { writeFileSync } = await import('node:fs');
+    writeFileSync(join(dir, 'fleet.yaml'),
+      'roles:\n  Alice: {}\n  Docs: {}\n'
+      + 'watchdogs:\n'
+      + '  nightwatch: { coordinator: FleetCoordinator }\n'
+      + '  slowlane: { coordinator: Owner, interval: 2h, watch: [Docs], enabled: false }\n');
+    const human = await run(['config']);
+    expect(human.stdout).toContain('watchdogs:');
+    expect(human.stdout).toMatch(/nightwatch.*every 10m.*-> FleetCoordinator/s);
+    expect(human.stdout).toMatch(/slowlane.*disabled/s);
+    const json = await run(['config', '--json']);
+    const plan = JSON.parse(json.stdout);
+    expect(plan.watchdogs).toHaveLength(2);
+    expect(plan.watchdogs[0]).toMatchObject({
+      name: 'nightwatch', enabled: true, intervalMs: 600000,
+      coordinator: 'FleetCoordinator', watch: ['Alice', 'Docs'],
+      identity: 'Watchdog-nightwatch', model: null, promptFile: null,
+    });
+  });
+
+  it('config fails on a watchdog with an unknown key (acceptance 1)', async () => {
+    const { writeFileSync } = await import('node:fs');
+    writeFileSync(join(dir, 'fleet.yaml'),
+      'roles:\n  A: {}\nwatchdogs:\n  w: { coordinator: C, intervall: 5m }\n');
+    const r = await run(['config']);
+    expect(r.code).toBe(1);
+    expect(r.stderr + r.stdout).toMatch(/unknown key\(s\) intervall/);
+  });
+
   it('spawn --help lists model and Codex controls', async () => {
     const r = await run(['spawn', '--help']);
     expect(r.code).toBe(0);

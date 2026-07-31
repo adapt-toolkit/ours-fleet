@@ -9,6 +9,7 @@ import { VERSION } from './version.js';
 import { agentDir, agentsRoot, tmpRoot, logsRoot, deriveXdgRuntimeDir } from './paths.js';
 import { loadConfig } from './config.js';
 import type { YamlMode } from './config-yaml.js';
+import { formatDuration } from './duration.js';
 import { resolvedPlan } from './resolved-plan.js';
 import { Tmux, tmuxArgs } from './tmux.js';
 import { pickBackend } from './supervisor/index.js';
@@ -171,6 +172,17 @@ cOpt(program.command('config').description('validate + print the merged plan (no
             + `on_unavailable=${iso.on_unavailable ?? 'warn'} caps=${caps}`);
         }
         for (const w of perms ? allWarnings(perms) : []) console.log(`    warning:     ${w}`);
+      }
+      if (cfg.watchdogs.length) {
+        console.log('watchdogs:');
+        for (const w of cfg.watchdogs) {
+          console.log(`● ${w.name}${w.enabled ? '' : '  (disabled)'}`);
+          console.log(`  every ${formatDuration(w.intervalMs)} -> ${w.coordinator}`);
+          console.log(`  harness:  ${w.harness} (${w.session})${w.model ? `, model: ${w.model}` : ''}`);
+          console.log(`  identity: ${w.identity}`);
+          console.log(`  watch:    ${w.watch.join(', ')}`);
+          if (w.promptFile) console.log(`  focus:    ${w.promptFile}`);
+        }
       }
     } catch (e) { die(e); }
   });
