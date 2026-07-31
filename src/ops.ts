@@ -24,6 +24,17 @@ export interface OpsDeps {
    * `ours-fleet up` has no transaction to tell.
    */
   onInstalled?(outcome: InstallOutcome): void;
+  /**
+   * Optional: supervises the single watchdog-scheduler process (Task 10).
+   * Absent for callers that predate watchdogs — `up`/`down` must never throw
+   * just because this hook is missing.
+   */
+  watchdogService?: {
+    install(binPath: string, configPath?: string): Promise<void>;
+    start(): Promise<void>;
+    stop(): Promise<void>;
+    supervised(): boolean;
+  };
 }
 
 // Launch staggering now lives at the harness-launch point (the runner's start
@@ -100,7 +111,34 @@ export async function up(
     outcomes.push(outcome);
     deps.log(`↑ up: ${role.name} (harness: ${role.harness}, identity: ${role.identity}${role.cwd ? `, cwd: ${role.cwd}` : ''})`);
   }
+  await reconcileWatchdogScheduler(cfg, deps, configPath);
   return outcomes;
+}
+
+/**
+ * Install/start (or stop) the single supervised watchdog-scheduler process
+ * (Task 10) to match the config's enabled watchdogs. Runs on every `up`,
+ * including a named `up <Role>` — cheap and idempotent, and the alternative
+ * (only reconciling on a whole-fleet `up`) would leave a newly-enabled
+ * watchdog unscheduled until the next bare `up`. Never throws: a scheduler
+ * hiccup must not fail the role installs that already succeeded.
+ */
+async function reconcileWatchdogScheduler(cfg: FleetConfig, deps: OpsDeps, configPath?: string): Promise<void> {
+  const svc = deps.watchdogService;
+  if (!svc) return;
+  const enabled = cfg.watchdogs.filter(w => w.enabled);
+  try {
+    if (!enabled.length) { await svc.stop(); return; }
+    if (!svc.supervised()) {
+      deps.log("! watchdogs configured but OURS_FLEET_SUPERVISOR=none — run 'ours-fleet _run-watchdogs' in the foreground");
+      return;
+    }
+    await svc.install(deps.binPath, configPath);
+    await svc.start();
+    deps.log(`↑ watchdogs scheduler (${enabled.map(w => w.name).join(', ')})`);
+  } catch (e) {
+    deps.log(`  ! watchdogs scheduler: ${e instanceof Error ? e.message : String(e)}`);
+  }
 }
 
 export async function down(cfg: FleetConfig, names: string[], deps: OpsDeps): Promise<void> {
@@ -110,6 +148,15 @@ export async function down(cfg: FleetConfig, names: string[], deps: OpsDeps): Pr
     try { await deps.backend.stop(role.name); deps.log(`■ stopped ${role.name}`); }
     catch (e) {
       deps.log(`  ! could not stop ${role.name}: ${e instanceof Error ? e.message : String(e)}`);
+    }
+  }
+  // Only a whole-fleet `down` (no names) stops the scheduler — stopping one
+  // named role is not a decision to stop watching the others (tolerate
+  // absence/errors: a never-installed scheduler must not fail `down`).
+  if (names.length === 0 && deps.watchdogService) {
+    try { await deps.watchdogService.stop(); }
+    catch (e) {
+      deps.log(`  ! could not stop watchdogs scheduler: ${e instanceof Error ? e.message : String(e)}`);
     }
   }
 }

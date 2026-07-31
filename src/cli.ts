@@ -16,6 +16,8 @@ import { pickBackend } from './supervisor/index.js';
 import { up, down, restartRoles, rmRole, type OpsDeps } from './ops.js';
 import { readRestartLedger, runSupervised, runTemp } from './runner.js';
 import { executeWatchdogRun, runWatchdogAgent } from './watchdog/run.js';
+import { runScheduler } from './watchdog/scheduler.js';
+import { WatchdogServiceManager } from './watchdog/service.js';
 import { acquireRunLock, releaseRunLock } from './watchdog/store.js';
 import type { WatchdogReport } from './watchdog/report.js';
 import {
@@ -48,6 +50,7 @@ const deps = (): OpsDeps => ({
   backend: pickBackend(),
   binPath,
   log: l => console.log(l),
+  watchdogService: new WatchdogServiceManager(),
 });
 
 const die = (e: unknown): never => { console.error(String(e instanceof Error ? e.message : e)); process.exit(1); };
@@ -620,6 +623,19 @@ program.command('_run-watchdog <name>', { hidden: true })
   .description('internal: one watchdog agent run (no cleanup — parent harvests)')
   .action(async name => {
     try { await runWatchdogAgent(name); } catch (e) { die(e); }
+  });
+
+cOpt(program.command('_run-watchdogs', { hidden: true }))
+  .description('internal: the watchdog scheduler process')
+  .action(async (opts: { configuration?: string }) => {
+    try {
+      let stop = false;
+      process.on('SIGTERM', () => { stop = true; });
+      await runScheduler(opts.configuration, {
+        now: () => new Date(), sleep: ms => new Promise(r => setTimeout(r, ms)),
+        log: l => console.log(l), binPath, shouldStop: () => stop,
+      });
+    } catch (e) { die(e); }
   });
 
 program.parseAsync(process.argv);
