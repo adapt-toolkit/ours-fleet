@@ -44,3 +44,11 @@ it('appends prompt_file focus without touching the contract (owner decision 1)',
 it('makes interval thresholds concrete', () => {
   expect(gen()).toContain('10m');
 });
+it('defines the escalation severity ordering explicitly, matching WATCHDOG_STATUS_RANK', () => {
+  const b = gen();
+  expect(b).toContain(
+    'Severity ordering, lowest to highest: healthy = idle (0) < unknown (1) < stale (2) < ' +
+    'blocked = unreachable (3) < off_briefing (4)',
+  );
+  expect(b).toContain("a finding is escalated when its status ranks strictly higher than the digest entry's status");
+});

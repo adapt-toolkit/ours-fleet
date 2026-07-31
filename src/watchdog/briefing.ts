@@ -130,6 +130,12 @@ export function generateWatchdogBriefing(opts: WatchdogBriefingOpts): string {
   L.push('4. One message per run, listing all qualifying findings — never one message per role.');
   L.push('');
   L.push(
+    'Severity ordering, lowest to highest: healthy = idle (0) < unknown (1) < stale (2) < ' +
+    "blocked = unreachable (3) < off_briefing (4); a finding is escalated when its status ranks " +
+    "strictly higher than the digest entry's status.",
+  );
+  L.push('');
+  L.push(
     'the suppression digest in watch.json is authoritative: alert only on findings that are new ' +
     '(role not in digest.open), escalated (higher severity than the digest entry), or past ' +
     'realert_after; send one resolved notice when a digest-open role is now healthy; ONE message ' +
@@ -173,8 +179,10 @@ export function generateWatchdogBriefing(opts: WatchdogBriefingOpts): string {
   L.push('  "error": null');
   L.push('}');
   L.push('```');
-  L.push(`Write the report to \`${reportPath}\` (your cwd) as your LAST action — writing it ends`);
-  L.push('the run. Send your coordinator message BEFORE writing report.json.');
+  L.push(
+    `Write the report to \`${reportPath}\` (your cwd) as your LAST action — writing it ends ` +
+    'the run. Send your coordinator message BEFORE writing report.json.',
+  );
 
   // 8. Appended prompt_file focus — extra emphasis only, contract stays non-negotiable.
   if (opts.promptFocus) {
