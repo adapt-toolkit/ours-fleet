@@ -407,6 +407,25 @@ describe('Monitor.prime', () => {
     expect(readFileSync(join(dir, '.monitor-status'), 'utf8')).toMatch(/^armed at \S+\n$/);
   });
 
+  it('re-primes at tip when ownership returns from a native monitor', async () => {
+    writeFileSync(join(dir, '.monitor-state.json'), JSON.stringify({
+      version: 1,
+      identity: 'A',
+      observedCursor: 20,
+      deliveredCursor: 10,
+      pending: { count: 1, eventTypes: ['message_received'], attempts: 1 },
+    }));
+    const { fetch, calls } = scriptedFetch([{ cursor: 128, events: [] }]);
+    const mon = createMonitor({
+      name: 'A', agentDir: dir, cfg: CFG(), deps: makeDeps(fetch, fakeTmux()),
+    });
+    await mon.prime({ resetCursor: true });
+    expect(calls()[0]).toContain('since=tip');
+    expect(readFileSync(join(dir, '.notify-cursor'), 'utf8').trim()).toBe('128');
+    expect(JSON.parse(readFileSync(join(dir, '.monitor-state.json'), 'utf8')))
+      .toMatchObject({ observedCursor: 128, deliveredCursor: 128, pending: null });
+  });
+
   it('marks failed and never injects on a 401', async () => {
     const { fetch } = scriptedFetch([{ status: 401 }]);
     const tmux = fakeTmux();
