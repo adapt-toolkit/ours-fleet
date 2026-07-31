@@ -6,7 +6,7 @@ import { join as joinPath } from 'node:path';
 import { createInterface } from 'node:readline';
 import { Command } from 'commander';
 import { VERSION } from './version.js';
-import { agentDir, agentsRoot, tmpRoot, logsRoot, deriveXdgRuntimeDir } from './paths.js';
+import { agentDir, agentsRoot, tmpRoot, logsRoot, deriveXdgRuntimeDir, watchdogsRoot } from './paths.js';
 import { loadConfig } from './config.js';
 import type { YamlMode } from './config-yaml.js';
 import { formatDuration } from './duration.js';
@@ -16,9 +16,11 @@ import { pickBackend } from './supervisor/index.js';
 import { up, down, restartRoles, rmRole, type OpsDeps } from './ops.js';
 import { readRestartLedger, runSupervised, runTemp } from './runner.js';
 import { executeWatchdogRun, runWatchdogAgent } from './watchdog/run.js';
-import { runScheduler } from './watchdog/scheduler.js';
+import { readSchedulerState, runScheduler, type WatchdogSchedulerState } from './watchdog/scheduler.js';
 import { WatchdogServiceManager } from './watchdog/service.js';
-import { acquireRunLock, releaseRunLock } from './watchdog/store.js';
+import {
+  acquireRunLock, latestReport, listRuns, readReport, releaseRunLock, reportsDir, type RunListEntry,
+} from './watchdog/store.js';
 import type { WatchdogReport } from './watchdog/report.js';
 import {
   lastProvenance, spawnDryRun, spawnPermanent, spawnTemp, type SpawnOpts,
@@ -366,12 +368,62 @@ program.command('status <name>').description('unit/agent state')
     }
   });
 
-// Task 11 replaces this with the real renderer; this is a minimal stand-in
-// so `watchdog-run` has something to print now.
-function renderReportSummaryLine(report: WatchdogReport): string {
+/** A watchdog is addressable if it's still configured, or its store dir survives config removal. */
+function watchdogKnown(name: string, configPath?: string): boolean {
+  try {
+    if (loadConfig(configPath).watchdogs.some(w => w.name === name)) return true;
+  } catch { /* config missing/broken: fall through to the store check */ }
+  return existsSync(joinPath(watchdogsRoot(), name));
+}
+
+function renderHeldDownLine(state: WatchdogSchedulerState): string | undefined {
+  if (!state.heldDown) return undefined;
+  return `HELD DOWN since ${state.heldSince ?? 'unknown'} after ${state.consecutiveFailures} `
+    + `consecutive failures: ${state.lastError ?? 'unknown error'}`;
+}
+
+/** Full human rendering of one report: header, held-down warning, counts, then non-healthy roles + evidence. */
+function renderReport(report: WatchdogReport, heldState: WatchdogSchedulerState): string {
+  const lines: string[] = [`● ${report.watchdog} — run ${report.run_id} (${report.status})`];
+  const held = renderHeldDownLine(heldState);
+  if (held) lines.push(held);
   const s = report.summary;
-  return `${report.watchdog} ${report.run_id} ${report.status} `
-    + `checked=${s.checked} healthy=${s.healthy} idle=${s.idle} anomalies=${s.anomalies}`;
+  lines.push(`  checked=${s.checked} healthy=${s.healthy} idle=${s.idle} anomalies=${s.anomalies}`);
+  if (report.error) lines.push(`  error: ${report.error}`);
+  for (const role of report.roles) {
+    if (role.status === 'healthy') continue;
+    lines.push(`  ${role.role}  ${role.status}  ${role.reason ?? ''}`.trimEnd());
+    for (const ev of role.evidence ?? []) lines.push(`    - [${ev.source}] ${ev.detail} (${ev.observed_at})`);
+    if (role.alerted) {
+      const alert = report.alerts.find(a => a.role === role.role);
+      lines.push(`    alerted -> ${alert?.coordinator ?? '?'}`);
+    }
+  }
+  return lines.join('\n');
+}
+
+function renderRunDuration(startedAt: string, finishedAt: string): string {
+  const started = Date.parse(startedAt);
+  const finished = Date.parse(finishedAt);
+  return Number.isFinite(started) && Number.isFinite(finished)
+    ? formatDuration(Math.max(0, finished - started)) : '-';
+}
+
+/** `--list` table: run-id, started, duration, status, checked/healthy/idle/anomalies, [error]. */
+function renderRunList(entries: RunListEntry[]): string {
+  const header = ['run-id'.padEnd(18), 'started'.padEnd(22), 'duration'.padEnd(8),
+    'status'.padEnd(10), 'checked/healthy/idle/anomalies', 'error'].join('  ');
+  const rows = entries.map(e => {
+    const s = e.summary;
+    const cols = [
+      e.runId.padEnd(18), (e.startedAt || '-').padEnd(22),
+      renderRunDuration(e.startedAt, e.finishedAt).padEnd(8), e.status.padEnd(10),
+      `${s.checked}/${s.healthy}/${s.idle}/${s.anomalies}`.padEnd(31),
+    ];
+    if (e.error) cols.push(e.error);
+    return cols.join('  ').trimEnd();
+  });
+  return [header, ...rows].join('\n');
 }
 
 cOpt(program.command('watchdog-run <name>')
@@ -387,8 +439,39 @@ cOpt(program.command('watchdog-run <name>')
           binPath, log: l => console.log(l), cfg,
         });
         console.log(`stored: ${storedPath}`);
-        console.log(renderReportSummaryLine(report));
+        console.log(renderReport(report, readSchedulerState(name)));
       } finally { releaseRunLock(name); }
+    } catch (e) { die(e); }
+  });
+
+cOpt(program.command('watchdog-report <name> [runId]')
+  .description('show a watchdog run report: latest by default, a specific run by id, --list, or --json'))
+  .option('--list', 'list runs instead of showing one')
+  .option('--json', 'print the stored report file bytes unmodified')
+  .action((name: string, runId: string | undefined, opts: { configuration?: string; list?: boolean; json?: boolean }) => {
+    try {
+      if (!watchdogKnown(name, opts.configuration)) throw new Error(`unknown watchdog '${name}'`);
+
+      if (opts.list) {
+        const held = renderHeldDownLine(readSchedulerState(name));
+        if (held) console.log(held);
+        console.log(renderRunList(listRuns(name)));
+        return;
+      }
+
+      const report = runId !== undefined ? readReport(name, runId) : latestReport(name);
+      if (!report) {
+        throw new Error(runId !== undefined
+          ? `watchdog '${name}': no such run '${runId}'`
+          : `watchdog '${name}' has no reports`);
+      }
+
+      if (opts.json) {
+        console.log(readFileSync(joinPath(reportsDir(name), `${runId ?? report.run_id}.json`), 'utf8'));
+        return;
+      }
+
+      console.log(renderReport(report, readSchedulerState(name)));
     } catch (e) { die(e); }
   });
 

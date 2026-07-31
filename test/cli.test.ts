@@ -184,6 +184,39 @@ describe('ours-fleet CLI', () => {
     expect(r2.stderr + r2.stdout).toMatch(/already running/);
   });
 
+  it('watchdog-report shows latest, --list, run-id and --json (acceptance 7)', async () => {
+    const { writeFileSync, readFileSync } = await import('node:fs');
+    writeFileSync(join(dir, 'fleet.yaml'), 'roles:\n  A: {}\nwatchdogs:\n  w: { coordinator: C }\n');
+    const reportsDir = join(dir, '.ours-fleet', 'watchdogs', 'w', 'reports');
+    mkdirSync(reportsDir, { recursive: true });
+    const fixture = JSON.parse(
+      readFileSync(resolve('test/fixtures/watchdog-good-report.json'), 'utf8'),
+    ) as Record<string, unknown>;
+    const report = { ...fixture, watchdog: 'w', run_id: '20260731T115000Z' };
+    writeFileSync(join(reportsDir, '20260731T115000Z.json'), JSON.stringify(report));
+
+    const latest = await run(['watchdog-report', 'w']);
+    expect(latest.code).toBe(0);
+    expect(latest.stdout).toMatch(/w.*20260731T115000Z/s);
+    expect(latest.stdout).toMatch(/Alice\s+blocked/);
+    expect(latest.stdout).toContain('Waiting on a trust dialog');
+
+    const list = await run(['watchdog-report', 'w', '--list']);
+    expect(list.code).toBe(0);
+    expect(list.stdout).toMatch(/20260731T115000Z\s+.*anomalies/);
+
+    const one = await run(['watchdog-report', 'w', '20260731T115000Z', '--json']);
+    expect(one.code).toBe(0);
+    expect(JSON.parse(one.stdout).run_id).toBe('20260731T115000Z');
+    expect(one.stdout).toBe(JSON.stringify(report) + '\n'); // stored JSON, unmodified
+
+    const missing = await run(['watchdog-report', 'w', '29990101T000000Z']);
+    expect(missing.code).toBe(1);
+
+    const unknown = await run(['watchdog-report', 'ghost']);
+    expect(unknown.code).toBe(1);
+  });
+
   it('spawn --help lists model and Codex controls', async () => {
     const r = await run(['spawn', '--help']);
     expect(r.code).toBe(0);
