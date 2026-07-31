@@ -1,5 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import { SessionControlError } from '../session/types.js';
+import { CreationConflictError } from '../creation.js';
 
 export type FleetErrorCode =
   | 'role_not_found' | 'capability_unavailable' | 'invalid_request'
@@ -63,6 +64,8 @@ export function safeLine(input: string, max = 512): string {
 
 export function normalizeError(error: unknown, requestId?: string): FleetError {
   if (error instanceof FleetError) return error;
+  if (error instanceof CreationConflictError)
+    return new FleetError('conflict', error.message, { requestId, retryable: true });
   if (error instanceof SessionControlError) {
     const code = CONTROL_CODES[error.kind];
     return new FleetError(code, error.message, {

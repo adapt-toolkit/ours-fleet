@@ -2,17 +2,19 @@ import { useMemo, useState } from 'react';
 import { api, idempotencyKey } from './api';
 
 type Form = {
-  name: string; identity: string; harness: 'codex' | 'claude-code'; model: string;
+  name: string; harness: 'codex' | 'claude-code'; model: string;
   session: 'acp' | 'tmux'; cwd: string; lifetime: 'permanent' | 'temporary';
   mission: string; coordinator: string; approval: 'ask' | 'allow' | 'deny';
   filesystem: 'read-only' | 'workspace' | 'unrestricted'; unattended: 'deny' | 'wait';
   bio: string; persona: string; highRiskAcknowledged: boolean; openAfterCreate: boolean;
+  reuseExistingIdentityAcknowledged: boolean; unverifiedIdentityAcknowledged: boolean;
 };
 const initial: Form = {
-  name: '', identity: '', harness: 'codex', model: '', session: 'acp', cwd: '',
+  name: '', harness: 'codex', model: '', session: 'acp', cwd: '',
   lifetime: 'permanent', mission: '', coordinator: '', approval: 'ask',
   filesystem: 'workspace', unattended: 'deny', bio: '', persona: '',
   highRiskAcknowledged: false, openAfterCreate: true,
+  reuseExistingIdentityAcknowledged: false, unverifiedIdentityAcknowledged: false,
 };
 
 export function CreateRole({ onClose, onCreated }: {
@@ -24,13 +26,16 @@ export function CreateRole({ onClose, onCreated }: {
   const [error, setError] = useState('');
   const [busy, setBusy] = useState(false);
   const request = useMemo(() => ({
-    name: form.name, identity: form.identity || undefined, harness: form.harness,
+    name: form.name, harness: form.harness,
     model: form.model || undefined, session: form.session, cwd: form.cwd || undefined,
     lifetime: form.lifetime, mission: form.mission || undefined,
     coordinator: form.coordinator || undefined,
     permissions: { approval: form.approval, filesystem: form.filesystem, unattended: form.unattended },
     bio: form.bio || undefined, persona: form.persona || undefined,
-    highRiskAcknowledged: form.highRiskAcknowledged, openAfterCreate: form.openAfterCreate,
+    highRiskAcknowledged: form.highRiskAcknowledged,
+    reuseExistingIdentityAcknowledged: form.reuseExistingIdentityAcknowledged,
+    unverifiedIdentityAcknowledged: form.unverifiedIdentityAcknowledged,
+    openAfterCreate: form.openAfterCreate,
   }), [form]);
   const change = <K extends keyof Form>(key: K, value: Form[K]) => {
     setForm(current => ({ ...current, [key]: value }));
@@ -52,7 +57,7 @@ export function CreateRole({ onClose, onCreated }: {
       const poll = async () => {
         const latest: any = await api.get(`/api/v1/creation-actions/${next.actionId}`);
         setAction(latest);
-        if (['ready', 'attention', 'launched_unconfirmed'].includes(latest.state))
+        if (['session_reachable', 'attention', 'launched_unconfirmed'].includes(latest.state))
           onCreated(latest.roleId, latest.openPath);
         else if (!['failed', 'rollback_incomplete'].includes(latest.state))
           setTimeout(() => void poll(), 400);
@@ -67,7 +72,7 @@ export function CreateRole({ onClose, onCreated }: {
       {!action ? <div className="wizard">
         <fieldset><legend>Identity</legend><div className="form-grid">
           <label>Role / session name<input value={form.name} onChange={e => change('name', e.target.value)} placeholder="Researcher" /></label>
-          <label>Identity <small>defaults to role</small><input value={form.identity} onChange={e => change('identity', e.target.value)} placeholder={form.name || 'Researcher'} /></label>
+          <label>Derived identity <small>fixed to role name</small><input value={form.name} readOnly aria-readonly="true" placeholder="Researcher" /></label>
           <label className="wide">Mission<input value={form.mission} onChange={e => change('mission', e.target.value)} /></label>
           <label>Coordinator<input value={form.coordinator} onChange={e => change('coordinator', e.target.value)} /></label>
         </div></fieldset>
@@ -93,6 +98,13 @@ export function CreateRole({ onClose, onCreated }: {
           <dl>{Object.entries(preview.effective).map(([key, value]) => <div key={key}><dt>{key}</dt><dd>{typeof value === 'object' ? JSON.stringify(value) : String(value ?? 'default')}</dd></div>)}</dl>
           {preview.warnings?.map((warning: string) => <p className="warning" key={warning}>△ {warning}</p>)}
           {preview.prerequisites?.map((item: string) => <p className="error" key={item}>× {item}</p>)}
+          {preview.identityBootstrap?.existingIdentity === 'verified' && !form.reuseExistingIdentityAcknowledged &&
+            <label className="risk"><input type="checkbox" checked={false} onChange={() => change('reuseExistingIdentityAcknowledged', true)} />
+              Reuse the existing local identity named {form.name}.</label>}
+          {preview.identityBootstrap?.existingIdentity === 'unknown' && !form.unverifiedIdentityAcknowledged &&
+            <label className="risk"><input type="checkbox" checked={false} onChange={() => change('unverifiedIdentityAcknowledged', true)} />
+              Continue although identity existence could not be verified.</label>}
+          <p className="muted">Binding is completed by the harness from its generated first-boot briefing; this console does not claim host-side identity creation.</p>
         </div>}
         {error && <div className="banner error">{error}</div>}
         <div className="modal-actions"><button className="secondary" onClick={onClose}>Cancel</button>

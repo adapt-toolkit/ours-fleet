@@ -1,11 +1,11 @@
-import { mkdtempSync, mkdirSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import { RoleRepository } from '../../src/application/role-repository.js';
 import { FleetError, normalizeError } from '../../src/application/errors.js';
 import { roleCapabilities } from '../../src/application/capabilities.js';
-import { RoleCreationService, type AtomicCreationIdentityProvider } from '../../src/application/role-creation-service.js';
+import { RoleCreationService } from '../../src/application/role-creation-service.js';
 import type { SupervisorBackend } from '../../src/supervisor/types.js';
 import type { OpsDeps } from '../../src/ops.js';
 import { SessionControlError } from '../../src/session/types.js';
@@ -100,47 +100,100 @@ identity: Temp
     expect(caps.terminal).toMatchObject({ available: false, reason: 'pty_unavailable' });
   });
 
-  it('previews and executes one idempotent typed permanent creation', async () => {
+  for (const flow of [
+    { lifetime: 'permanent', session: 'acp', harness: 'codex', check: false, probe: 'ready' },
+    { lifetime: 'permanent', session: 'tmux', harness: 'claude-code', check: 'unknown', probe: 'attention' },
+    { lifetime: 'temporary', session: 'acp', harness: 'claude-code', check: false, probe: 'ready' },
+    { lifetime: 'temporary', session: 'tmux', harness: 'codex', check: 'unknown', probe: 'attention' },
+  ] as const) {
+    it(`creates ${flow.lifetime} ${flow.harness}/${flow.session} with honest ${String(flow.check)} identity evidence`, async () => {
+      const root = fixture();
+      writeFileSync(join(root, 'fleet.yaml'), 'defaults: { harness: codex, session: acp }\nroles: {}\n');
+      let mutationCalls = 0;
+      const service = new RoleCreationService({
+        configPath: join(root, 'fleet.yaml'),
+        ops: { backend, binPath: '/bin/true', log() {} } satisfies OpsDeps,
+        binPath: '/bin/true',
+        identityProvisioner: {
+          async exists() { return flow.check; },
+          async create() { mutationCalls++; },
+          async remove() { mutationCalls++; },
+        },
+        tempLauncher() {},
+        allowedCwdRoots: [root],
+        journalDir: join(root, '.ours-fleet', 'web-actions'),
+        probeReady: async () => flow.probe,
+      });
+      const request = {
+        name: `Created_${flow.lifetime}_${flow.session}`,
+        harness: flow.harness, session: flow.session, lifetime: flow.lifetime,
+        openAfterCreate: true,
+        unverifiedIdentityAcknowledged: flow.check === 'unknown',
+        permissions: {
+          approval: 'ask' as const, filesystem: 'workspace' as const,
+          unattended: 'deny' as const,
+        },
+      };
+      const preview = await service.preview(request);
+      expect(preview.effective.identity).toBe(request.name);
+      expect(preview.identityBootstrap).toMatchObject({
+        existingIdentity: flow.check === false ? 'missing' : 'unknown',
+        mode: 'current-fleet-first-boot', bindingEvidence: 'not-structured',
+      });
+      const first = await service.create(
+        request, preview.previewHash, '0123456789abcdef0123456789abcdef', 'browser',
+      );
+      const duplicate = await service.create(
+        request, preview.previewHash, '0123456789abcdef0123456789abcdef', 'browser',
+      );
+      expect(duplicate.actionId).toBe(first.actionId);
+      await expect(service.create(
+        { ...request, mission: 'changed request' }, preview.previewHash,
+        '0123456789abcdef0123456789abcdef', 'browser',
+      )).rejects.toMatchObject({ code: 'idempotency_conflict' });
+      const finalState = flow.probe === 'ready' ? 'session_reachable' : 'attention';
+      for (let i = 0; i < 100 && service.get(first.actionId)?.state !== finalState; i++)
+        await new Promise(resolve => setTimeout(resolve, 10));
+      expect(service.get(first.actionId)).toMatchObject({
+        state: finalState,
+        identityCheck: flow.check === false ? 'missing' : 'unknown',
+        identityBindingEvidence: 'not-structured',
+      });
+      const stateDir = join(
+        root, '.ours-fleet', flow.lifetime === 'permanent' ? 'agents' : 'tmp', request.name,
+      );
+      const briefing = readFileSync(join(stateDir, 'briefing.md'), 'utf8');
+      expect(briefing).toContain('choose_identity');
+      expect(briefing).toContain('create_identity');
+      expect(service.get(first.actionId)?.stages.map(stage => stage.stage)).toContain(
+        'identity_bootstrap_pending',
+      );
+      expect(mutationCalls).toBe(0);
+    });
+  }
+
+  it('requires explicit confirmation before reusing an existing identity', async () => {
     const root = fixture();
-    writeFileSync(join(root, 'fleet.yaml'), 'defaults: { harness: codex, session: acp }\nroles: {}\n');
-    const reservations = new Set<string>();
-    const identities = new Set<string>();
-    const provider: AtomicCreationIdentityProvider = {
-      async capability() { return { available: true, version: 1 }; },
-      async reserve(name) {
-        if (reservations.has(name)) return false;
-        reservations.add(name); return true;
-      },
-      async release(name) { reservations.delete(name); },
-      async exists(name) { return identities.has(name); },
-      async create(name) { identities.add(name); },
-      async remove(name) { identities.delete(name); },
-    };
-    const ops: OpsDeps = { backend, binPath: '/bin/true', log() {} };
+    writeFileSync(join(root, 'fleet.yaml'), 'roles: {}\n');
     const service = new RoleCreationService({
-      configPath: join(root, 'fleet.yaml'), ops, binPath: '/bin/true',
-      identityProvider: provider, allowedCwdRoots: [root],
+      configPath: join(root, 'fleet.yaml'),
+      ops: { backend, binPath: '/bin/true', log() {} },
+      binPath: '/bin/true',
+      identityProvisioner: { async exists() { return true; } },
       journalDir: join(root, '.ours-fleet', 'web-actions'),
-      probeReady: async () => 'ready',
     });
     const request = {
-      name: 'Created', harness: 'codex' as const, session: 'acp' as const,
+      name: 'Existing', harness: 'codex' as const, session: 'acp' as const,
       lifetime: 'permanent' as const, openAfterCreate: true,
-      permissions: { approval: 'ask' as const, filesystem: 'workspace' as const, unattended: 'deny' as const },
+      permissions: {
+        approval: 'ask' as const, filesystem: 'workspace' as const,
+        unattended: 'deny' as const,
+      },
     };
     const preview = await service.preview(request);
-    const first = await service.create(request, preview.previewHash, '0123456789abcdef0123456789abcdef', 'browser');
-    const duplicate = await service.create(request, preview.previewHash, '0123456789abcdef0123456789abcdef', 'browser');
-    expect(duplicate.actionId).toBe(first.actionId);
-    for (let i = 0; i < 50 && service.get(first.actionId)?.state !== 'ready'; i++)
-      await new Promise(resolve => setTimeout(resolve, 10));
-    expect(service.get(first.actionId)).toMatchObject({
-      state: 'ready', openPath: '/roles/Created/activity',
-    });
-    expect(identities.has('Created')).toBe(true);
+    expect(preview.prerequisites).toContain('confirm reuse of the existing local identity');
     await expect(service.create(
-      { ...request, mission: 'different' }, preview.previewHash,
-      '0123456789abcdef0123456789abcdef', 'browser',
-    )).rejects.toBeInstanceOf(FleetError);
+      request, preview.previewHash, 'fedcba9876543210fedcba9876543210', 'browser',
+    )).rejects.toMatchObject({ code: 'prerequisite_unavailable' });
   });
 });

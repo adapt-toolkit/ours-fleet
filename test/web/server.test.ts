@@ -43,7 +43,11 @@ function services() {
       async capabilities() {
         return {
           available: false, reasons: ['fixture'], harnesses: [], lifetimes: [],
-          identityProvisioning: 'unavailable', safePermissionSchemaVersion: 1,
+          identityBootstrap: {
+            mode: 'current-fleet-first-boot', existingIdentity: 'unknown',
+            bindingEvidence: 'not-structured', warnings: [],
+          },
+          safePermissionSchemaVersion: 1,
         };
       },
       async preview(body: unknown) { return { request: body, previewHash: 'hash' }; },

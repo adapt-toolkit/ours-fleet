@@ -139,6 +139,7 @@ export async function buildWebServer(
     const action = await services.creation.create(
       body.request, body.previewHash, idempotencyKey, session.id);
     events.publish('creation.changed', action, action.roleId);
+    reply.header('Location', `/api/v1/creation-actions/${encodeURIComponent(action.actionId)}`);
     reply.code(202);
     return action;
   });

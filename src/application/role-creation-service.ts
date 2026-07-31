@@ -2,7 +2,10 @@ import { createHash, randomUUID } from 'node:crypto';
 import { mkdirSync, readFileSync, readdirSync, realpathSync, statSync } from 'node:fs';
 import { isAbsolute, relative } from 'node:path';
 import { loadConfig, resolvePermissions, ROLE_NAME_RE, type CommonPermissions } from '../config.js';
-import type { CreationDeps, IdentityProvisioner, IdentityRegistry } from '../creation.js';
+import {
+  daemonIdentityProvisioner,
+  type CreationCoreStage, type CreationDeps, type IdentityProvisioner,
+} from '../creation.js';
 import { replaceFileAtomically } from '../atomic-file.js';
 import { stateRoot } from '../paths.js';
 import {
@@ -11,11 +14,9 @@ import {
 } from '../spawn.js';
 import type { OpsDeps } from '../ops.js';
 import { FleetError, normalizeError } from './errors.js';
-import type { IdentityProviderCapability } from '../infrastructure/daemon-identity.js';
 
 export interface CreateRoleSessionRequest {
   name: string;
-  identity?: string;
   harness: 'codex' | 'claude-code';
   model?: string;
   session: 'acp' | 'tmux';
@@ -28,6 +29,8 @@ export interface CreateRoleSessionRequest {
   persona?: string;
   openAfterCreate: boolean;
   highRiskAcknowledged?: boolean;
+  reuseExistingIdentityAcknowledged?: boolean;
+  unverifiedIdentityAcknowledged?: boolean;
 }
 
 export interface CreationCapabilities {
@@ -38,9 +41,16 @@ export interface CreationCapabilities {
     sessions: Array<'acp' | 'tmux'>; defaultModel?: string; warnings: string[];
   }>;
   lifetimes: Array<'permanent' | 'temporary'>;
-  identityProvisioning: 'atomic' | 'unavailable' | 'incompatible';
+  identityBootstrap: {
+    mode: 'current-fleet-first-boot';
+    existingIdentity: IdentityPreflight;
+    bindingEvidence: 'not-structured';
+    warnings: string[];
+  };
   safePermissionSchemaVersion: 1;
 }
+
+export type IdentityPreflight = 'verified' | 'missing' | 'unknown';
 
 export interface CreationPreview {
   request: CreateRoleSessionRequest;
@@ -52,13 +62,21 @@ export interface CreationPreview {
   provenance: Record<string, 'request' | 'fleet-default' | 'built-in'>;
   warnings: string[];
   prerequisites: string[];
+  identityBootstrap: {
+    existingIdentity: IdentityPreflight;
+    derivedIdentity: string;
+    mode: 'current-fleet-first-boot';
+    bindingEvidence: 'not-structured';
+  };
   previewHash: string;
 }
 
 export type CreationStage =
-  | 'validating' | 'reserving' | 'provisioning_identity' | 'writing_role'
-  | 'registering_supervisor' | 'starting_temp' | 'launched' | 'waiting_for_session'
-  | 'ready' | 'attention' | 'launched_unconfirmed' | 'failed' | 'rollback_incomplete';
+  | 'validating' | 'reserving' | 'checking_identity' | 'writing_role'
+  | 'registering_supervisor' | 'starting_temp' | 'launched'
+  | 'identity_bootstrap_pending' | 'waiting_for_session'
+  | 'session_reachable' | 'attention' | 'launched_unconfirmed'
+  | 'failed' | 'rollback_incomplete';
 
 export interface CreationAction {
   actionId: string;
@@ -72,21 +90,18 @@ export interface CreationAction {
   updatedAt: string;
   error?: ReturnType<FleetError['toJSON']>;
   openPath?: string;
+  identityCheck?: IdentityPreflight;
+  identityBindingEvidence: 'not-structured';
   /** Hash only; the browser's raw idempotency key is never persisted. */
   idempotencyHash?: string;
-}
-
-export interface AtomicCreationIdentityProvider extends IdentityProvisioner, IdentityRegistry {
-  capability(): Promise<IdentityProviderCapability>;
-  reserve(name: string): Promise<boolean>;
-  release(name: string): Promise<void>;
 }
 
 export interface RoleCreationServiceOptions {
   configPath?: string;
   ops: OpsDeps;
   binPath: string;
-  identityProvider?: AtomicCreationIdentityProvider;
+  /** Test seam for today's authenticated GET /identities existence check. */
+  identityProvisioner?: IdentityProvisioner;
   tempLauncher?: SupervisorLauncher;
   allowedCwdRoots?: string[];
   journalDir?: string;
@@ -114,22 +129,17 @@ export class RoleCreationService {
   private readonly idempotency = new Map<string, { requestHash: string; actionId: string }>();
   private readonly inFlight = new Set<string>();
   private readonly journalDir: string;
+  private readonly identityProvisioner: IdentityProvisioner;
 
   constructor(private readonly options: RoleCreationServiceOptions) {
     this.journalDir = options.journalDir ?? `${stateRoot()}/web/creation-actions`;
     mkdirSync(this.journalDir, { recursive: true, mode: 0o700 });
+    this.identityProvisioner = options.identityProvisioner ?? daemonIdentityProvisioner();
     this.restore();
   }
 
   async capabilities(): Promise<CreationCapabilities> {
     const reasons: string[] = [];
-    let identityProvisioning: CreationCapabilities['identityProvisioning'] = 'unavailable';
-    if (this.options.identityProvider) {
-      const capability = await this.options.identityProvider.capability();
-      identityProvisioning = capability.available ? 'atomic'
-        : capability.version === undefined ? 'unavailable' : 'incompatible';
-      if (!capability.available) reasons.push(capability.reason ?? 'atomic identity provisioning unavailable');
-    } else reasons.push('atomic identity provisioning is not configured');
     try { loadConfig(this.options.configPath); }
     catch (error) { reasons.push(`configuration is invalid: ${(error as Error).message}`); }
     return {
@@ -140,7 +150,14 @@ export class RoleCreationService {
         { id: 'claude-code', available: true, sessions: ['acp', 'tmux'], warnings: [] },
       ],
       lifetimes: ['permanent', 'temporary'],
-      identityProvisioning,
+      identityBootstrap: {
+        mode: 'current-fleet-first-boot',
+        existingIdentity: 'unknown',
+        bindingEvidence: 'not-structured',
+        warnings: [
+          'Identity binding is completed by the new harness from its generated first-boot briefing.',
+        ],
+      },
       safePermissionSchemaVersion: 1,
     };
   }
@@ -154,7 +171,7 @@ export class RoleCreationService {
     buildRoleConfig(opts, defaults.harness as string | undefined);
     const cwd = request.cwd ? this.resolveCwd(request.cwd) : undefined;
     const effective = {
-      name: request.name, identity: request.identity ?? request.name,
+      name: request.name, identity: request.name,
       harness: request.harness ?? (defaults.harness as string | undefined) ?? 'claude-code',
       session: request.session ?? (defaults.session as 'acp' | 'tmux' | undefined) ?? 'tmux',
       model: request.model?.trim() || (defaults.model as string | undefined),
@@ -170,18 +187,37 @@ export class RoleCreationService {
       warnings.push('unattended permission requests may hold until a controller attaches');
     if (request.lifetime === 'temporary')
       warnings.push('temporary sessions are gone on exit or reboot');
+    const existingIdentity = await this.checkIdentity(request.name);
+    if (existingIdentity === 'verified')
+      warnings.push(`local identity '${request.name}' already exists and will be reused`);
+    else if (existingIdentity === 'missing')
+      warnings.push(`identity '${request.name}' will be created and bound by the harness on first boot`);
+    else
+      warnings.push('identity existence could not be verified; first-boot creation may be required');
     if (warnings.some(warning => /elevated|outside/.test(warning)) && !request.highRiskAcknowledged)
       throw new FleetError('invalid_request', 'high-risk permissions require explicit acknowledgment');
     const capabilities = await this.capabilities();
-    const prerequisites = capabilities.reasons;
+    const prerequisites = [...capabilities.reasons];
+    if (existingIdentity === 'verified' && !request.reuseExistingIdentityAcknowledged)
+      prerequisites.push('confirm reuse of the existing local identity');
+    if (existingIdentity === 'unknown' && !request.unverifiedIdentityAcknowledged)
+      prerequisites.push('confirm creation with an unverified identity preflight');
     const provenance = {
-      harness: 'request', session: 'request', identity: request.identity ? 'request' : 'built-in',
+      harness: 'request', session: 'request', identity: 'built-in',
       model: request.model ? 'request' : defaults.model ? 'fleet-default' : 'built-in',
       cwd: request.cwd ? 'request' : 'built-in', permissions: 'request',
     } as const;
     const fingerprint = this.configFingerprint(cfg.files);
-    const previewHash = hash({ request, effective, fingerprint });
-    return { request, effective, provenance, warnings, prerequisites, previewHash };
+    const identityBootstrap = {
+      existingIdentity, derivedIdentity: request.name,
+      mode: 'current-fleet-first-boot' as const,
+      bindingEvidence: 'not-structured' as const,
+    };
+    const previewHash = hash({ request, effective, identityBootstrap, fingerprint });
+    return {
+      request, effective, provenance, warnings, prerequisites,
+      identityBootstrap, previewHash,
+    };
   }
 
   async create(
@@ -189,20 +225,22 @@ export class RoleCreationService {
   ): Promise<CreationAction> {
     if (!/^[A-Za-z0-9_-]{22,256}$/.test(idempotencyKey))
       throw new FleetError('invalid_request', 'Idempotency-Key must contain at least 128 bits');
-    const preview = await this.preview(input);
-    if (preview.previewHash !== previewHash)
-      throw new FleetError('stale_state', 'preview is stale; review the effective plan again');
-    const capabilities = await this.capabilities();
-    if (!capabilities.available)
-      throw new FleetError('prerequisite_unavailable', capabilities.reasons.join('; '));
-    const requestHash = hash(input);
-    const key = hash(idempotencyKey);
+    const requestHash = hash(this.validate(input));
+    const key = hash(`${browserSession}\0${idempotencyKey}`);
     const existing = this.idempotency.get(key);
     if (existing) {
       if (existing.requestHash !== requestHash)
         throw new FleetError('idempotency_conflict', 'Idempotency-Key was already used for another request');
       return this.actions.get(existing.actionId)!;
     }
+    const preview = await this.preview(input);
+    if (preview.previewHash !== previewHash)
+      throw new FleetError('stale_state', 'preview is stale; review the effective plan again');
+    if (preview.prerequisites.length)
+      throw new FleetError('prerequisite_unavailable', preview.prerequisites.join('; '));
+    const capabilities = await this.capabilities();
+    if (!capabilities.available)
+      throw new FleetError('prerequisite_unavailable', capabilities.reasons.join('; '));
     if (this.inFlight.has(preview.effective.name))
       throw new FleetError('conflict', `role '${preview.effective.name}' is already being created`);
     const now = new Date().toISOString();
@@ -212,6 +250,7 @@ export class RoleCreationService {
       state: 'validating', stages: [{ stage: 'validating', at: now }],
       createdAt: now, updatedAt: now,
       idempotencyHash: key,
+      identityBindingEvidence: 'not-structured',
     };
     this.idempotency.set(key, { requestHash, actionId: action.actionId });
     this.actions.set(action.actionId, action);
@@ -225,31 +264,51 @@ export class RoleCreationService {
 
   private async run(action: CreationAction, preview: CreationPreview): Promise<void> {
     try {
-      this.stage(action, 'reserving');
-      this.stage(action, 'provisioning_identity');
-      const provider = this.options.identityProvider!;
-      const creation: CreationDeps = { identityRegistry: provider, identityProvisioner: provider };
-      this.stage(action, 'writing_role');
+      const latestIdentity = await this.checkIdentity(action.roleId);
+      if (
+        latestIdentity === 'verified'
+        && preview.identityBootstrap.existingIdentity !== 'verified'
+        && !preview.request.reuseExistingIdentityAcknowledged
+      ) {
+        throw new FleetError(
+          'stale_state',
+          `identity '${action.roleId}' appeared after preview; review and confirm reuse`,
+        );
+      }
+      const creation: CreationDeps = {
+        // Deliberately strip any mutation methods from the test seam. The web
+        // uses today's read-only daemon preflight; first-boot owns create/bind.
+        identityProvisioner: { exists: name => this.identityProvisioner.exists(name) },
+        onStage: (stage, evidence) => this.coreStage(action, stage, evidence),
+      };
       if (preview.effective.lifetime === 'permanent') {
-        this.stage(action, 'registering_supervisor');
         await spawnPermanent(this.spawnOptions(preview.request, action.actionId), this.options.ops, creation);
       } else {
-        this.stage(action, 'starting_temp');
         await spawnTemp(
           this.spawnOptions(preview.request, action.actionId), this.options.binPath,
           this.options.tempLauncher, creation);
       }
       this.stage(action, 'launched', 'launch accepted; readiness not yet confirmed');
+      this.stage(
+        action, 'identity_bootstrap_pending',
+        'the harness must choose or create and bind its identity from the generated briefing',
+      );
       this.stage(action, 'waiting_for_session');
       const ready = await this.waitForReady(action.roleId, action.session);
       if (ready === 'ready') {
         action.openPath = action.session === 'acp'
           ? `/roles/${encodeURIComponent(action.roleId)}/activity`
           : `/roles/${encodeURIComponent(action.roleId)}/terminal`;
-        this.stage(action, 'ready');
+        this.stage(
+          action, 'session_reachable',
+          'session is reachable; identity binding has no structured evidence in this version',
+        );
       } else if (ready === 'attention') {
         action.openPath = `/roles/${encodeURIComponent(action.roleId)}`;
-        this.stage(action, 'attention');
+        this.stage(
+          action, 'attention',
+          'session evidence needs attention; first-boot identity binding remains unconfirmed',
+        );
       } else {
         action.openPath = `/roles/${encodeURIComponent(action.roleId)}`;
         this.stage(action, 'launched_unconfirmed', 'launch committed; session readiness timed out');
@@ -279,8 +338,6 @@ export class RoleCreationService {
 
   private validate(input: CreateRoleSessionRequest): CreateRoleSessionRequest {
     if (!ROLE_NAME_RE.test(input.name)) throw new FleetError('invalid_request', 'invalid role name');
-    if (input.identity && !ROLE_NAME_RE.test(input.identity))
-      throw new FleetError('invalid_request', 'invalid identity name');
     if (!['codex', 'claude-code'].includes(input.harness))
       throw new FleetError('invalid_request', 'unsupported harness');
     if (!['acp', 'tmux'].includes(input.session))
@@ -294,7 +351,7 @@ export class RoleCreationService {
     bounded(input.persona, 'persona', 16_384);
     resolvePermissions(undefined, input.permissions);
     return {
-      ...input, identity: input.identity || undefined, model: input.model?.trim() || undefined,
+      ...input, model: input.model?.trim() || undefined,
       mission: input.mission?.trim() || undefined, coordinator: input.coordinator?.trim() || undefined,
       bio: input.bio?.trim() || undefined, persona: input.persona?.trim() || undefined,
     };
@@ -319,7 +376,7 @@ export class RoleCreationService {
 
   private spawnOptions(request: CreateRoleSessionRequest, creationActionId?: string): SpawnOpts {
     return {
-      name: request.name, identity: request.identity, harness: request.harness,
+      name: request.name, identity: request.name, harness: request.harness,
       model: request.model, session: request.session, cwd: request.cwd,
       mission: request.mission, coordinator: request.coordinator,
       approval: request.permissions.approval, filesystem: request.permissions.filesystem,
@@ -327,6 +384,30 @@ export class RoleCreationService {
       configPath: this.options.configPath,
       surface: creationActionId ? 'web' : undefined, creationActionId,
     };
+  }
+
+  private async checkIdentity(name: string): Promise<IdentityPreflight> {
+    try {
+      const present = await this.identityProvisioner.exists(name);
+      return present === true ? 'verified' : present === false ? 'missing' : 'unknown';
+    } catch {
+      return 'unknown';
+    }
+  }
+
+  private coreStage(
+    action: CreationAction, stage: CreationCoreStage,
+    evidence?: Record<string, string | boolean>,
+  ): void {
+    if (stage === 'checking_identity' && evidence?.result) {
+      action.identityCheck = evidence.result as IdentityPreflight;
+      this.stage(
+        action, stage,
+        `${evidence.result}; host guarantee ${String(evidence.guarantee ?? 'unverified')}`,
+      );
+      return;
+    }
+    this.stage(action, stage);
   }
 
   private configFingerprint(files: string[]): Array<{ file: string; mtimeMs: number; size: number }> {
@@ -339,7 +420,13 @@ export class RoleCreationService {
   private stage(action: CreationAction, stage: CreationStage, detail?: string): void {
     action.state = stage;
     action.updatedAt = new Date().toISOString();
-    action.stages.push({ stage, at: action.updatedAt, detail });
+    const previous = action.stages.at(-1);
+    if (previous?.stage === stage) {
+      previous.at = action.updatedAt;
+      previous.detail = detail ?? previous.detail;
+    } else {
+      action.stages.push({ stage, at: action.updatedAt, detail });
+    }
     this.persist(action);
     this.options.onProgress?.(structuredClone(action));
   }
@@ -355,7 +442,11 @@ export class RoleCreationService {
       for (const file of readdirSync(this.journalDir).filter(name => /^[0-9a-f-]+\.json$/.test(name))) {
         try {
           const action = JSON.parse(readFileSync(`${this.journalDir}/${file}`, 'utf8')) as CreationAction;
-          if (!['ready', 'attention', 'launched_unconfirmed', 'failed', 'rollback_incomplete'].includes(action.state)) {
+          action.identityBindingEvidence ??= 'not-structured';
+          if (![
+            'session_reachable', 'attention', 'launched_unconfirmed',
+            'failed', 'rollback_incomplete',
+          ].includes(action.state)) {
             action.state = 'launched_unconfirmed';
             action.updatedAt = new Date().toISOString();
             action.stages.push({

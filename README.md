@@ -148,9 +148,11 @@ TLS, or remote-access mode.
 The console provides evidence-separated inventory and status, ACP activity and
 permission controls, redacted logs, typed text send, confirmed lifecycle
 actions, transactional permanent/temporary creation, and a shared tmux browser
-terminal. Role creation is enabled only when the local ours daemon advertises
-the atomic identity transaction protocol; otherwise the UI remains fully
-usable in read/interaction mode and explains why creation is unavailable.
+terminal. Identity is fixed to the role name. Creation uses the current
+authenticated identity existence check and reports verified, missing, or
+unknown evidence; a newly launched harness follows its generated first-boot
+instructions to choose or create and bind the identity. The console never
+claims that the host created an identity and never deletes one.
 `node-pty` is optional: if its native module cannot load, ACP and all
 non-terminal features remain available and tmux Terminal is disabled with a
 diagnostic.

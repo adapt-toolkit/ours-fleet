@@ -296,6 +296,7 @@ export async function spawnPermanent(
   if (o.missionFile) readMissionFile(o.missionFile);         // fail before reserving
   // Name AND identity reserved together, before anything is written or started
   // (6.4). A loser of the race creates no config, no state, no service.
+  creation.onStage?.('reserving');
   return withCreationTransaction(
     { role: o.name, identity: effectiveIdentity(o) },
     async tx => {
@@ -303,11 +304,15 @@ export async function spawnPermanent(
       const cfg = loadConfig(o.configPath);
       // Establish the identity BEFORE the service is enabled (7.3), and record
       // what was actually guaranteed so the briefing can say something true.
+      creation.onStage?.('checking_identity');
       const guarantee = await ensureIdentity(
         effectiveIdentity(o),
         profileValues(o),
         creation.identityProvisioner ?? daemonIdentityProvisioner(),
         deps.log);
+      creation.onStage?.('checking_identity', {
+        result: guarantee.evidence, guarantee: guarantee.state,
+      });
       if (guarantee.state === 'created')
         // We minted it; a failed creation must not leave an orphan identity
         // behind. Only ever removes an identity THIS transaction created.
@@ -318,6 +323,7 @@ export async function spawnPermanent(
           },
         });
       mkdirSync(fleetDDir(), { recursive: true });
+      creation.onStage?.('writing_role');
       const file = join(fleetDDir(), `${o.name}.yaml`);
       writeRoleFile(tx, file, stringify({
         roles: { [o.name]: buildRoleConfig(o, cfg.defaults.harness as string | undefined) },
@@ -350,6 +356,7 @@ export async function spawnPermanent(
       });
       mkdirSync(agentDir(o.name), { recursive: true });
       writeProvenance(agentDir(o.name), provenance);
+      creation.onStage?.('registering_supervisor');
       await up(
         loadConfig(o.configPath), [o.name],
         { ...deps, onInstalled: outcome => registered.push(outcome.role) },
@@ -386,15 +393,20 @@ export async function spawnTemp(
   if (o.missionFile) readMissionFile(o.missionFile);         // fail before reserving
   // Temporary roles go through the SAME reservation boundary as permanent ones
   // (6.4): a temp agent competes for the same names.
+  creation.onStage?.('reserving');
   return withCreationTransaction(
     { role: o.name, identity: effectiveIdentity(o) },
     async tx => {
       assertNameFree(o);
+      creation.onStage?.('checking_identity');
       const guarantee = await ensureIdentity(
         effectiveIdentity(o),
         profileValues(o),
         creation.identityProvisioner ?? daemonIdentityProvisioner(),
         creation.log);
+      creation.onStage?.('checking_identity', {
+        result: guarantee.evidence, guarantee: guarantee.state,
+      });
       if (guarantee.state === 'created')
         tx.record({
           stage: `ours identity ${effectiveIdentity(o)}`,
@@ -402,7 +414,7 @@ export async function spawnTemp(
             await creation.identityProvisioner?.remove?.(effectiveIdentity(o));
           },
         });
-      return spawnTempInner(o, binPath, launch, tx, guarantee);
+      return spawnTempInner(o, binPath, launch, tx, guarantee, creation.onStage);
     },
     creation,
   );
@@ -410,7 +422,7 @@ export async function spawnTemp(
 
 async function spawnTempInner(
   o: SpawnOpts, binPath: string, launch: SupervisorLauncher, tx: CreationTransaction,
-  guarantee: IdentityGuarantee,
+  guarantee: IdentityGuarantee, onStage: CreationDeps['onStage'],
 ): Promise<string> {
   const cfg = loadConfig(o.configPath);
   const defaultHarness = cfg.defaults.harness as string | undefined;
@@ -447,6 +459,7 @@ async function spawnTempInner(
   };
   if (role.auth_proxy && role.harness !== 'claude-code')
     throw new Error('auth_proxy is supported only by claude-code');
+  onStage?.('writing_role');
   const dir = applyRole(role, { temp: true, identityGuarantee: guarantee.state });
   const provenance = buildProvenance({
     role: o.name, lifetime: 'temporary', fleetVersion: VERSION,
@@ -467,6 +480,7 @@ async function spawnTempInner(
   // agent itself; a supervisor sharing that session name would SIGHUP its own
   // process before the agent ever launches. Detaching mirrors how systemd hosts
   // the supervisor for permanent roles, leaving runOnce to own the <name> session.
+  onStage?.('starting_temp');
   launch(binPath, ['_run-temp', o.name], dir);
   return dir;
 }

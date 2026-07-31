@@ -30,7 +30,6 @@ export { RoleCommandService } from './application/role-command-service.js';
 export { StructuredLogService } from './application/log-service.js';
 export { roleCapabilities } from './application/capabilities.js';
 export { FleetError, normalizeError } from './application/errors.js';
-export { DaemonAtomicIdentityProvider } from './infrastructure/daemon-identity.js';
 export type * from './application/types.js';
 export { doctor } from './doctor.js';
 export { runOnce, runTemp } from './runner.js';

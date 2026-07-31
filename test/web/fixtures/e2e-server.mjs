@@ -68,15 +68,23 @@ const services = {
       return {
         available: true, reasons: [],
         harnesses: [{ id: 'codex', available: true, sessions: ['acp', 'tmux'], warnings: [] }],
-        lifetimes: ['permanent', 'temporary'], identityProvisioning: 'atomic',
+        lifetimes: ['permanent', 'temporary'],
+        identityBootstrap: {
+          mode: 'current-fleet-first-boot', existingIdentity: 'missing',
+          bindingEvidence: 'not-structured', warnings: [],
+        },
         safePermissionSchemaVersion: 1,
       };
     },
     async preview(request) {
       return {
         request, effective: {
-          ...request, identity: request.identity || request.name,
+          ...request, identity: request.name,
           permissions: request.permissions,
+        },
+        identityBootstrap: {
+          existingIdentity: 'missing', derivedIdentity: request.name,
+          mode: 'current-fleet-first-boot', bindingEvidence: 'not-structured',
         },
         provenance: {}, warnings: [], prerequisites: [], previewHash: 'fixture-preview',
       };
@@ -84,12 +92,14 @@ const services = {
     async create(request) {
       const action = {
         actionId: 'fixture-creation', requestHash: 'fixture', roleId: request.name,
-        session: request.session, lifetime: request.lifetime, state: 'ready',
+        session: request.session, lifetime: request.lifetime, state: 'session_reachable',
         stages: [
           { stage: 'validating', at: new Date().toISOString() },
-          { stage: 'ready', at: new Date().toISOString() },
+          { stage: 'identity_bootstrap_pending', at: new Date().toISOString() },
+          { stage: 'session_reachable', at: new Date().toISOString() },
         ],
         createdAt: new Date().toISOString(), updatedAt: new Date().toISOString(),
+        identityCheck: 'missing', identityBindingEvidence: 'not-structured',
         openPath: `/roles/${request.name}/activity`,
       };
       actions.set(action.actionId, action); return action;

@@ -13,7 +13,6 @@ import { Tmux } from '../tmux.js';
 import { pickBackend } from '../supervisor/index.js';
 import { realExec } from '../exec.js';
 import { home } from '../paths.js';
-import { DaemonAtomicIdentityProvider } from '../infrastructure/daemon-identity.js';
 import { AuditSink } from './audit.js';
 import { FleetEventBus } from './events.js';
 import { buildWebServer, type WebServer } from './server.js';
@@ -63,10 +62,9 @@ export async function startWebConsole(options: StartWebOptions): Promise<Running
     capabilityContext: { terminalPtyAvailable: terminalAvailable },
   });
   const ops = { backend, binPath: options.binPath, log: options.log ?? (() => {}) };
-  const identityProvider = new DaemonAtomicIdentityProvider();
   const creation = new RoleCreationService({
     configPath: options.configPath, ops, binPath: options.binPath,
-    identityProvider, allowedCwdRoots: [realpathSync(home()), realpathSync(process.cwd())],
+    allowedCwdRoots: [realpathSync(home()), realpathSync(process.cwd())],
     probeReady: async name => {
       const detail = await query.detail(name).catch(() => undefined);
       return detail?.status.overall === 'ready' || detail?.status.overall === 'busy'

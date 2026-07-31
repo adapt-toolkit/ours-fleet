@@ -22,7 +22,8 @@
     "node": ">=20"
   },
   "scripts": {
-    "build": "tsc -p tsconfig.json && vite build",
+    "clean": "node -e \"require('node:fs').rmSync('dist',{recursive:true,force:true})\"",
+    "build": "npm run clean && tsc -p tsconfig.json && vite build",
     "typecheck": "tsc -p tsconfig.json --noEmit && tsc -p web/tsconfig.json --noEmit",
     "lint": "npm run typecheck",
     "test": "vitest run",

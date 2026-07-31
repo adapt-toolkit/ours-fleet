@@ -56,7 +56,13 @@ export interface CreationDeps {
   identityRegistry?: IdentityRegistry;
   /** Verify/create the ours identity. Injectable so tests need no daemon. */
   identityProvisioner?: IdentityProvisioner;
+  /** Descriptive progress around the existing transaction; never a second workflow. */
+  onStage?(stage: CreationCoreStage, evidence?: Record<string, string | boolean>): void;
 }
+
+export type CreationCoreStage =
+  | 'reserving' | 'checking_identity' | 'writing_role'
+  | 'registering_supervisor' | 'starting_temp';
 
 /**
  * The contract the ours daemon must satisfy for identity names to be reserved
@@ -218,9 +224,9 @@ export interface IdentityProvisioner {
 }
 
 export type IdentityGuarantee =
-  | { state: 'verified'; detail: string }        // it exists; the agent may just bind
-  | { state: 'created'; detail: string }         // we made it, with its profile
-  | { state: 'unverified'; detail: string };     // we could not tell, or could not make it
+  | { state: 'verified'; evidence: 'verified'; detail: string }
+  | { state: 'created'; evidence: 'missing'; detail: string }
+  | { state: 'unverified'; evidence: 'missing' | 'unknown'; detail: string };
 
 /**
  * Establish the identity before the role's service is enabled.
@@ -237,7 +243,10 @@ export async function ensureIdentity(
   log: (line: string) => void = () => {},
 ): Promise<IdentityGuarantee> {
   if (!provisioner)
-    return { state: 'unverified', detail: 'no identity provisioner is configured' };
+    return {
+      state: 'unverified', evidence: 'unknown',
+      detail: 'no identity provisioner is configured',
+    };
 
   let present: boolean | 'unknown';
   try { present = await provisioner.exists(name); }
@@ -246,19 +255,32 @@ export async function ensureIdentity(
     log(`identity '${name}': could not be verified (${(e as Error).message})`);
   }
 
-  if (present === true) return { state: 'verified', detail: 'the ours daemon reports it exists' };
+  if (present === true)
+    return {
+      state: 'verified', evidence: 'verified',
+      detail: 'the ours daemon reports it exists',
+    };
   if (present === 'unknown')
-    return { state: 'unverified', detail: 'the ours daemon could not be asked' };
+    return {
+      state: 'unverified', evidence: 'unknown',
+      detail: 'the ours daemon could not be asked',
+    };
 
   if (!provisioner.create) {
     // Loud, and named. The briefing will tell the agent to mint it — which is
     // what actually happens today — but nobody is told it was "predefined".
     log(`identity '${name}' does not exist and this host cannot create one automatically — `
       + `the role will be told to mint it on first boot. Create it in advance to avoid that.`);
-    return { state: 'unverified', detail: 'it does not exist and cannot be created here' };
+    return {
+      state: 'unverified', evidence: 'missing',
+      detail: 'it does not exist and cannot be created here',
+    };
   }
   await provisioner.create(name, profile);
-  return { state: 'created', detail: 'created during spawn, with its bio and persona published' };
+  return {
+    state: 'created', evidence: 'missing',
+    detail: 'created during spawn, with its bio and persona published',
+  };
 }
 
 /**
