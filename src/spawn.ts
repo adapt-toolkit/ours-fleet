@@ -6,7 +6,8 @@ import { agentDir, fleetDDir } from './paths.js';
 import { validateIsolationConfig } from './isolation/policy.js';
 import type { IsolationConfig } from './isolation/types.js';
 import {
-  loadConfig, resolveMonitorConfig, resolvePermissions,
+  loadConfig, resolveAuthProxy, resolveModelChain, resolveMonitorConfig, resolvePermissions,
+  resolveWorklogPolicy,
   type ApprovalMode, type FilesystemMode, type ResolvedRole, type RoleConfig,
   type CommonPermissions, type SessionBackendId, type UnattendedMode,
 } from './config.js';
@@ -19,6 +20,7 @@ import {
   type IdentityGuarantee, type ProvenanceEntry,
 } from './creation.js';
 import { VERSION } from './version.js';
+import { getAdapter } from './harness/registry.js';
 
 /**
  * The provenance record written by the most recent spawn in this process, so
@@ -32,6 +34,7 @@ export interface SpawnOpts {
   harness?: string;
   session?: SessionBackendId;
   mission?: string;
+  missionFile?: string;
   identity?: string;
   cwd?: string;
   coordinator?: string;
@@ -57,6 +60,8 @@ export interface SpawnOpts {
   isolationFile?: string;
   overseeInterval?: string;
   configPath?: string;
+  dryRun?: boolean;
+  json?: boolean;
 }
 
 function roleFromOpts(o: SpawnOpts, defaultHarness?: string): RoleConfig {
@@ -66,7 +71,8 @@ function roleFromOpts(o: SpawnOpts, defaultHarness?: string): RoleConfig {
   if (o.identity) r.identity = o.identity;
   if (o.cwd) r.cwd = o.cwd;
   if (o.coordinator) r.coordinator = o.coordinator;
-  if (o.mission) r.mission = o.mission;
+  if (o.missionFile) r.mission = readMissionFile(o.missionFile);
+  else if (o.mission !== undefined) r.mission = o.mission;
   if (o.model?.trim()) r.model = o.model.trim();
   const harness = o.harness ?? defaultHarness;
   const harnessOptions: Record<string, unknown> = {};
@@ -116,6 +122,8 @@ export function readIsolationFile(path: string): IsolationConfig {
 }
 
 function validateSpawnOpts(o: SpawnOpts): void {
+  if (o.mission !== undefined && o.missionFile)
+    throw new Error('--mission and --mission-file are mutually exclusive');
   if (o.session && !['tmux', 'acp'].includes(o.session))
     throw new Error(`invalid --session '${o.session}'; allowed: tmux, acp`);
   if (o.approval && !['ask', 'allow', 'deny'].includes(o.approval))
@@ -125,6 +133,12 @@ function validateSpawnOpts(o: SpawnOpts): void {
       `invalid --filesystem '${o.filesystem}'; allowed: read-only, workspace, unrestricted`);
   if (o.unattended && !['deny', 'wait'].includes(o.unattended))
     throw new Error(`invalid --unattended '${o.unattended}'; allowed: deny, wait`);
+}
+
+/** Read mission text without trimming or newline rewriting. */
+export function readMissionFile(path: string): string {
+  try { return readFileSync(path, 'utf8'); }
+  catch (e) { throw new Error(`--mission-file ${path}: ${(e as Error).message}`); }
 }
 
 /**
@@ -139,10 +153,80 @@ function assertNameFree(o: SpawnOpts): void {
     throw new Error(`role '${o.name}' already exists (${cfg.roles.find(r => r.name === o.name)!.sourceFile})`);
   if (existsSync(agentDir(o.name)) || existsSync(agentDir(o.name, true)))
     throw new Error(`agent dir for '${o.name}' already exists — pick another name or 'ours-fleet rm ${o.name}'`);
+  const identity = effectiveIdentity(o);
+  const owner = cfg.roles.find(role => role.identity === identity);
+  if (owner)
+    throw new Error(
+      `identity '${identity}' is already used by role '${owner.name}' (${owner.sourceFile}); `
+      + 'identity sharing is unsupported because binding is exclusive');
 }
 
 /** The ours identity a spawn will bind: explicit, else the role name. */
 export const effectiveIdentity = (o: SpawnOpts): string => o.identity ?? o.name;
+
+export interface SpawnDryRun {
+  schemaVersion: 1;
+  warning: string;
+  roleDocument: { roles: Record<string, RoleConfig> };
+  resolvedRole: ResolvedRole;
+}
+
+/**
+ * Validate and resolve a spawn without reserving names, contacting the daemon,
+ * or writing state. Collision checks are necessarily a point-in-time snapshot.
+ */
+export function spawnDryRun(o: SpawnOpts): SpawnDryRun {
+  validateSpawnOpts(o);
+  if (o.isolationFile) readIsolationFile(o.isolationFile);
+  if (o.missionFile) readMissionFile(o.missionFile);
+  assertNameFree(o);
+  const cfg = loadConfig(o.configPath);
+  const raw = roleFromOpts(o, cfg.defaults.harness as string | undefined);
+  const harnessOptions = {
+    ...((cfg.defaults.harness_options ?? {}) as Record<string, unknown>),
+    ...(raw.harness_options ?? {}),
+  };
+  const resolvedRole: ResolvedRole = {
+    ...raw,
+    name: o.name,
+    sourceFile: o.temp ? '(temp dry-run)' : join(fleetDDir(), `${o.name}.yaml`),
+    harness: raw.harness ?? (cfg.defaults.harness as string | undefined) ?? 'claude-code',
+    session: raw.session ?? (cfg.defaults.session as SessionBackendId | undefined) ?? 'tmux',
+    session_options: raw.session_options,
+    permissions: resolvePermissions(cfg.defaults.permissions, raw.permissions),
+    permissionsDeclared: raw.permissions !== undefined || cfg.defaults.permissions !== undefined,
+    identity: effectiveIdentity(o),
+    model: raw.model ?? (cfg.defaults.model as string | undefined),
+    model_chain: resolveModelChain(
+      raw.model ?? (cfg.defaults.model as string | undefined),
+      raw.model_chain ?? (cfg.defaults.model_chain as string[] | undefined),
+    ),
+    harness_options: Object.keys(harnessOptions).length ? harnessOptions : undefined,
+    isolation: raw.isolation ?? (cfg.defaults.isolation as IsolationConfig | undefined),
+    monitor: resolveMonitorConfig(cfg.defaults.monitor, raw.monitor),
+    worklog: resolveWorklogPolicy(cfg.defaults.worklog, raw.worklog),
+    auth_proxy: resolveAuthProxy(cfg.defaults.auth_proxy, raw.auth_proxy),
+  };
+  resolvedRole.env = {
+    ...((cfg.defaults.env ?? {}) as Record<string, string>),
+    ...(raw.env ?? {}),
+    ...(resolvedRole.auth_proxy
+      ? { ANTHROPIC_BASE_URL: resolvedRole.auth_proxy.base_url }
+      : {}),
+  };
+  const adapter = getAdapter(resolvedRole.harness);
+  if (resolvedRole.auth_proxy && resolvedRole.harness !== 'claude-code')
+    throw new Error('auth_proxy is supported only by claude-code');
+  const optionProblems = adapter.validateOptions(resolvedRole.harness_options);
+  if (optionProblems.length)
+    throw new Error(optionProblems.map(problem => `${problem.path}: ${problem.message}`).join('; '));
+  return {
+    schemaVersion: 1,
+    warning: 'collision checks are a snapshot; a real spawn reserves names atomically',
+    roleDocument: { roles: { [o.name]: raw } },
+    resolvedRole,
+  };
+}
 
 /**
  * Which settings came from the operator, from fleet defaults, or from a
@@ -180,6 +264,7 @@ export async function spawnPermanent(
 ): Promise<string> {
   validateSpawnOpts(o);
   if (o.isolationFile) readIsolationFile(o.isolationFile);   // fail before reserving
+  if (o.missionFile) readMissionFile(o.missionFile);         // fail before reserving
   // Name AND identity reserved together, before anything is written or started
   // (6.4). A loser of the race creates no config, no state, no service.
   return withCreationTransaction(
@@ -269,11 +354,13 @@ export async function spawnTemp(
 ): Promise<string> {
   validateSpawnOpts(o);
   if (o.isolationFile) readIsolationFile(o.isolationFile);   // fail before reserving
+  if (o.missionFile) readMissionFile(o.missionFile);         // fail before reserving
   // Temporary roles go through the SAME reservation boundary as permanent ones
   // (6.4): a temp agent competes for the same names.
   return withCreationTransaction(
     { role: o.name, identity: effectiveIdentity(o) },
     async tx => {
+      assertNameFree(o);
       const guarantee = await ensureIdentity(
         effectiveIdentity(o),
         { bio: o.bioFile ? readFileSync(o.bioFile, 'utf8').trim() : undefined,
@@ -290,7 +377,6 @@ async function spawnTempInner(
   o: SpawnOpts, binPath: string, launch: SupervisorLauncher, tx: CreationTransaction,
   guarantee: IdentityGuarantee,
 ): Promise<string> {
-  assertNameFree(o);
   const cfg = loadConfig(o.configPath);
   const defaultHarness = cfg.defaults.harness as string | undefined;
   const fromOpts = roleFromOpts(o, defaultHarness);
@@ -305,14 +391,27 @@ async function spawnTempInner(
     session: o.session ?? (cfg.defaults.session as SessionBackendId | undefined) ?? 'tmux',
     identity: o.identity ?? o.name,
     model: o.model?.trim() || (cfg.defaults.model as string | undefined),
+    model_chain: resolveModelChain(
+      o.model?.trim() || (cfg.defaults.model as string | undefined),
+      fromOpts.model_chain ?? (cfg.defaults.model_chain as string[] | undefined),
+    ),
     harness_options: Object.keys(mergedHarnessOptions).length ? mergedHarnessOptions : undefined,
     permissions: resolvePermissions(cfg.defaults.permissions, fromOpts.permissions),
     permissionsDeclared:
       fromOpts.permissions !== undefined || cfg.defaults.permissions !== undefined,
     // Temp agents inherit the fleet-wide monitor defaults via the snapshot (design §2).
     monitor: resolveMonitorConfig(cfg.defaults.monitor, fromOpts.monitor),
+    worklog: resolveWorklogPolicy(cfg.defaults.worklog, fromOpts.worklog),
+    auth_proxy: resolveAuthProxy(cfg.defaults.auth_proxy, fromOpts.auth_proxy),
     sourceFile: '(temp)',
   };
+  role.env = {
+    ...((cfg.defaults.env ?? {}) as Record<string, string>),
+    ...(fromOpts.env ?? {}),
+    ...(role.auth_proxy ? { ANTHROPIC_BASE_URL: role.auth_proxy.base_url } : {}),
+  };
+  if (role.auth_proxy && role.harness !== 'claude-code')
+    throw new Error('auth_proxy is supported only by claude-code');
   const dir = applyRole(role, { temp: true, identityGuarantee: guarantee.state });
   const provenance = buildProvenance({
     role: o.name, lifetime: 'temporary', fleetVersion: VERSION,

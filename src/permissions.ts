@@ -1,6 +1,9 @@
 import type { CommonPermissions, ResolvedRole } from './config.js';
 import { getAdapter } from './harness/registry.js';
 import type { UnattendedCapability } from './harness/types.js';
+import { existsSync, readFileSync } from 'node:fs';
+import { join } from 'node:path';
+import { home } from './paths.js';
 
 /**
  * The capability floor every unattended role must clear. These are not
@@ -13,14 +16,24 @@ export const UNATTENDED_FLOOR: readonly UnattendedCapability[] = [
   'read-state', 'write-state', 'messaging', 'monitor', 'workspace-edit', 'status-commands',
 ];
 
+/** Fleet-owned wake delivery removes the native Monitor-tool requirement. */
+export function requiredUnattendedFloor(role: ResolvedRole): readonly UnattendedCapability[] {
+  return role.monitor?.mode === 'fleet'
+    ? UNATTENDED_FLOOR.filter(capability => capability !== 'monitor')
+    : UNATTENDED_FLOOR;
+}
+
 export interface FloorResult {
   meets: boolean;
   missing: UnattendedCapability[];
 }
 
 /** Which floor capabilities a set of granted capabilities fails to cover. */
-export function checkUnattendedFloor(granted: readonly UnattendedCapability[]): FloorResult {
-  const missing = UNATTENDED_FLOOR.filter(c => !granted.includes(c));
+export function checkUnattendedFloor(
+  granted: readonly UnattendedCapability[],
+  required: readonly UnattendedCapability[] = UNATTENDED_FLOOR,
+): FloorResult {
+  const missing = required.filter(c => !granted.includes(c));
   return { meets: missing.length === 0, missing };
 }
 
@@ -110,7 +123,8 @@ export function analyzeRolePermissions(role: ResolvedRole): RolePermissionAnalys
     return { ...base, supported: false, warnings: [`role '${role.name}': ${(e as Error).message}`] };
   }
 
-  const translation = adapter.translatePermissions(role.permissions);
+  const neutral = adapter.translatePermissions(role.permissions);
+  let translation = adapter.effectivePermissions?.(role) ?? neutral;
   if (!translation.supported) {
     return {
       ...base, supported: false,
@@ -118,8 +132,14 @@ export function analyzeRolePermissions(role: ResolvedRole): RolePermissionAnalys
         `permissions — ${translation.reason}`],
     };
   }
-  const conflicts = findConflicts(role, translation.native, adapter.nativePermissionOverrides(role.harness_options));
-  const floor = checkUnattendedFloor(translation.capabilities);
+  const inspection = inspectClaudeDontAskSettings(role);
+  if (inspection && translation.supported) {
+    translation = { ...translation, capabilities: inspection.capabilities };
+  }
+  const conflicts = neutral.supported
+    ? findConflicts(role, neutral.native, adapter.nativePermissionOverrides(role.harness_options))
+    : [];
+  const floor = checkUnattendedFloor(translation.capabilities, requiredUnattendedFloor(role));
   const floorSeverity = role.permissions.unattended === 'deny' ? 'fail' as const : 'warn' as const;
   return {
     ...base,
@@ -135,7 +155,65 @@ export function analyzeRolePermissions(role: ResolvedRole): RolePermissionAnalys
       `capability floor — missing ${floor.missing.join(', ')} ` +
       `(${formatNative(translation.native)}; unattended=${role.permissions.unattended} means these ` +
       `requests will ${role.permissions.unattended === 'deny' ? 'be denied silently' : 'block the turn'})`),
-    warnings: translation.warnings.map(w => `role '${role.name}': ${w}`),
+    warnings: [
+      ...translation.warnings.map(w => `role '${role.name}': ${w}`),
+      ...(inspection?.warning ? [`role '${role.name}': ${inspection.warning}`] : []),
+    ],
+  };
+}
+
+function inspectClaudeDontAskSettings(role: ResolvedRole): {
+  capabilities: UnattendedCapability[];
+  warning?: string;
+} | undefined {
+  if (role.harness !== 'claude-code'
+      || (role.harness_options as { permission_mode?: string } | undefined)?.permission_mode !== 'dontAsk')
+    return undefined;
+  const sources = [
+    join(home(), '.claude', 'settings.json'),
+    ...(role.cwd ? [
+      join(role.cwd, '.claude', 'settings.json'),
+      join(role.cwd, '.claude', 'settings.local.json'),
+    ] : []),
+  ];
+  const allow: string[] = [];
+  const deny: string[] = [];
+  const used: string[] = [];
+  for (const source of sources) {
+    if (!existsSync(source)) continue;
+    try {
+      const parsed = JSON.parse(readFileSync(source, 'utf8')) as {
+        permissions?: { allow?: unknown; deny?: unknown };
+      };
+      if (Array.isArray(parsed.permissions?.allow))
+        allow.push(...parsed.permissions!.allow.filter((v): v is string => typeof v === 'string'));
+      if (Array.isArray(parsed.permissions?.deny))
+        deny.push(...parsed.permissions!.deny.filter((v): v is string => typeof v === 'string'));
+      used.push(source);
+    } catch (e) {
+      return {
+        capabilities: ['read-state'],
+        warning: `cannot prove Claude dontAsk allow-list because ${source} is unreadable or invalid: `
+          + `${(e as Error).message}`,
+      };
+    }
+  }
+  const permitted = (patterns: RegExp[]): boolean =>
+    patterns.some(pattern => allow.some(rule => pattern.test(rule)))
+    && !patterns.some(pattern => deny.some(rule => pattern.test(rule)));
+  const capabilities: UnattendedCapability[] = [];
+  if (permitted([/^Read(?:\(|$)/i])) capabilities.push('read-state');
+  if (permitted([/^Write(?:\(|$)/i, /^Edit(?:\(|$)/i])) capabilities.push('write-state');
+  if (permitted([/^mcp__(?:ours|plugin_ours)__|^ours[:_]/i])) capabilities.push('messaging');
+  if (role.monitor?.mode === 'fleet' || permitted([/^Monitor(?:\(|$)/i])) capabilities.push('monitor');
+  if (permitted([/^Write(?:\(|$)/i, /^Edit(?:\(|$)/i, /^Bash(?:\(|$)/i]))
+    capabilities.push('workspace-edit');
+  if (permitted([/^Bash(?:\(|$)/i])) capabilities.push('status-commands');
+  return {
+    capabilities,
+    warning: used.length
+      ? `Claude dontAsk allow-list inspected from ${used.join(' + ')}`
+      : 'cannot prove Claude dontAsk allow-list: no readable settings source',
   };
 }
 

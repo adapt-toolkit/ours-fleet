@@ -20,6 +20,47 @@ const run = (args: string[]) =>
   realExec('node', [CLI, ...args], { env: { ...process.env, OURS_FLEET_HOME: dir } });
 
 describe('ours-fleet CLI', () => {
+  it('config --json emits a versioned deterministic plan without env secrets', async () => {
+    const file = join(dir, 'fleet.yaml');
+    const { writeFileSync } = await import('node:fs');
+    writeFileSync(file, [
+      'roles:',
+      '  A:',
+      '    model: approved-model',
+      '    env:',
+      '      Z_SECRET: canary-must-not-leak',
+      '      A_PUBLIC: still-redacted',
+      '',
+    ].join('\n'));
+    const first = await run(['config', '-c', file, '--json']);
+    const second = await run(['config', '-c', file, '--json']);
+    expect(first.code).toBe(0);
+    expect(first.stdout).toBe(second.stdout);
+    expect(first.stderr).toBe('');
+    expect(first.stdout).not.toContain('canary-must-not-leak');
+    const plan = JSON.parse(first.stdout);
+    expect(plan.schemaVersion).toBe(1);
+    expect(plan.roles[0].env).toEqual({
+      redacted: true,
+      keys: ['A_PUBLIC', 'Z_SECRET'],
+      values: { A_PUBLIC: '<redacted>', Z_SECRET: '<redacted>' },
+    });
+  });
+
+  it('config --json keeps compatibility warnings off stdout and strict mode fails', async () => {
+    const file = join(dir, 'fleet.yaml');
+    const { writeFileSync } = await import('node:fs');
+    writeFileSync(file, 'roles:\n  A: &role {}\n  B: *role\n');
+    const compat = await run(['config', '-c', file, '--json']);
+    expect(compat.code).toBe(0);
+    expect(() => JSON.parse(compat.stdout)).not.toThrow();
+    expect(compat.stderr).toContain('non-plain YAML');
+    const strict = await run(['config', '-c', file, '--json', '--yaml-mode', 'strict']);
+    expect(strict.code).toBe(1);
+    expect(strict.stdout).toBe('');
+    expect(strict.stderr).toContain('non-plain YAML');
+  });
+
   it('config prints the merged plan from the example file', async () => {
     const r = await run(['config', '-c', resolve('examples/fleet.yaml')]);
     expect(r.code).toBe(0);

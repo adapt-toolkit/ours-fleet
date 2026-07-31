@@ -3,7 +3,9 @@ import { mkdtempSync, writeFileSync, readFileSync, readdirSync, existsSync, rmSy
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { parse, stringify } from 'yaml';
-import { spawnPermanent, spawnTemp, type SupervisorLauncher } from '../src/spawn.js';
+import {
+  spawnDryRun, spawnPermanent, spawnTemp, type SupervisorLauncher,
+} from '../src/spawn.js';
 import { formatProvenance } from '../src/creation.js';
 import { agentDir } from '../src/paths.js';
 import { registerAdapter } from '../src/harness/registry.js';
@@ -42,6 +44,40 @@ function fakeDeps() {
 }
 
 describe('spawnPermanent', () => {
+  it('rejects an effective identity already owned by a static role', async () => {
+    const { d } = fakeDeps();
+    await expect(spawnPermanent({ name: 'Other', identity: 'Coord' }, d))
+      .rejects.toThrow(/identity 'Coord'.*role 'Coord'.*fleet\.yaml/s);
+    expect(existsSync(join(dir, 'fleet.d', 'Other.yaml'))).toBe(false);
+  });
+
+  it('reads a multiline Unicode mission file verbatim and rejects option conflicts', async () => {
+    const path = join(dir, 'mission.txt');
+    writeFileSync(path, 'first line\nžluťoučký kůň\n');
+    const { d } = fakeDeps();
+    const file = await spawnPermanent({ name: 'Mission', missionFile: path }, d);
+    expect(parse(readFileSync(file, 'utf8')).roles.Mission.mission)
+      .toBe('first line\nžluťoučký kůň\n');
+    await expect(spawnPermanent({
+      name: 'Conflict', mission: 'inline', missionFile: path,
+    }, d)).rejects.toThrow(/mutually exclusive/);
+  });
+
+  it('dry-run resolves the exact role document without filesystem or daemon mutation', () => {
+    const mission = join(dir, 'mission.txt');
+    writeFileSync(mission, 'long\nmission\n');
+    const before = readdirSync(dir).sort();
+    const result = spawnDryRun({
+      name: 'Preview', model: 'approved', missionFile: mission,
+    });
+    expect(result.roleDocument.roles.Preview).toMatchObject({
+      model: 'approved', mission: 'long\nmission\n',
+    });
+    expect(result.resolvedRole.name).toBe('Preview');
+    expect(readdirSync(dir).sort()).toEqual(before);
+    expect(existsSync(agentDir('Preview'))).toBe(false);
+  });
+
   it('writes fleet.d/<Name>.yaml from files and brings the role up', async () => {
     writeFileSync(join(dir, 'bio.txt'), 'A public card.');
     writeFileSync(join(dir, 'persona.txt'), 'An operating contract.');

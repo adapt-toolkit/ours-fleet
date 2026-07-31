@@ -267,6 +267,17 @@ export function makeClaudeCodeAdapter(exec: Exec = realExec): HarnessAdapter {
       };
     },
 
+    effectivePermissions(role) {
+      const translated = this.translatePermissions(role.permissions);
+      if (!translated.supported) return translated;
+      const native = permissionMode(role) ?? 'default';
+      return {
+        ...translated,
+        native: { permission_mode: native },
+        capabilities: claudeCapabilities(native, role.permissions.filesystem),
+      };
+    },
+
     vocabulary: {
       bindTool: 'choose_identity',
       createTool: 'create_identity',

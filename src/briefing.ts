@@ -111,6 +111,11 @@ export function generateBriefing(role: ResolvedRole, v: BriefingVocab, opts: Bri
   L.push('', '## Durable log');
   L.push(`Append important commands / decisions / results to \`${opts.worklogPath}\` as you go —`);
   L.push('it survives restarts.');
+  if (role.worklog) {
+    L.push(`Fleet rotates it above ${role.worklog.max_kb} KiB, keeps approximately the newest ` +
+      `${role.worklog.keep_tail_kb} KiB here, and retains ${role.worklog.max_archives} archives ` +
+      'beside it. Continue writing only WORKLOG.md.');
+  }
   L.push('', '## Routines');
   L.push(`If \`${opts.routinesPath}\` exists, re-read it at the START of every wake — before acting`);
   L.push('on messages, timers, or prompts — and follow it for recurring or scheduled work. It may');

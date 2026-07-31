@@ -277,6 +277,18 @@ export function makeCodexAdapter(exec: Exec = realExec): HarnessAdapter {
       };
     },
 
+    effectivePermissions(role) {
+      const translated = this.translatePermissions(role.permissions);
+      if (!translated.supported) return translated;
+      const approval = approvalPolicy(role) ?? 'on-request';
+      const sandbox = sandboxMode(role) ?? 'workspace-write';
+      return {
+        ...translated,
+        native: { approval, sandbox },
+        capabilities: codexCapabilities(approval, sandbox),
+      };
+    },
+
     vocabulary: {
       bindTool: 'choose_identity',
       createTool: 'create_identity',

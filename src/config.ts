@@ -1,7 +1,9 @@
 import { existsSync, readFileSync, readdirSync } from 'node:fs';
 import { join } from 'node:path';
-import { parse } from 'yaml';
 import { agentDir, defaultConfigPath, fleetDDir, home } from './paths.js';
+import {
+  parseFleetDocument, type ConfigDiagnostic, type YamlMode,
+} from './config-yaml.js';
 import {
   harnessRuntimeDir, resolveIsolation, validateIsolationConfig,
 } from './isolation/policy.js';
@@ -9,6 +11,17 @@ import { getAdapter } from './harness/registry.js';
 import type { IsolationConfig, WrapContext } from './isolation/types.js';
 
 export interface OverseeEntry { role: string; interval: string }
+export interface WorklogPolicy {
+  max_kb: number;
+  keep_tail_kb: number;
+  max_archives: number;
+}
+export interface AuthProxyConfig {
+  kind: 'anthropic';
+  base_url: string;
+  required: boolean;
+  health_url: string;
+}
 
 /** The 8 content-free event types the ours daemon appends to notifications.log. */
 export const NOTIFY_EVENT_TYPES = [
@@ -125,6 +138,7 @@ export interface RoleConfig {
   bio?: string;
   briefing_file?: string;
   model?: string;
+  model_chain?: string[];
   max_tokens?: number;
   autocompact_pct?: number;
   env?: Record<string, string>;
@@ -132,6 +146,8 @@ export interface RoleConfig {
   harness_options?: Record<string, unknown>;
   isolation?: IsolationConfig;
   monitor?: Partial<MonitorConfig>;
+  worklog?: WorklogPolicy;
+  auth_proxy?: Partial<AuthProxyConfig>;
 }
 
 export interface ResolvedRole extends RoleConfig {
@@ -149,6 +165,8 @@ export interface ResolvedRole extends RoleConfig {
   identity: string;
   sourceFile: string;
   monitor: MonitorConfig;
+  worklog?: WorklogPolicy;
+  auth_proxy?: AuthProxyConfig;
 }
 
 export interface FleetConfig {
@@ -158,6 +176,8 @@ export interface FleetConfig {
   files: string[];
   /** Fleet-wide delay (ms) enforced between agent launches to avoid boot bursts (0 = none). */
   startStaggerMs: number;
+  /** Warning-first non-plain YAML migration diagnostics, in source order. */
+  diagnostics: ConfigDiagnostic[];
 }
 
 export class ConfigError extends Error {}
@@ -193,8 +213,8 @@ export function isolationContextFor(role: ResolvedRole): WrapContext {
 const NAME_RE = /^[A-Za-z0-9_-]+$/;
 const ROLE_KEYS = [
   'harness', 'session', 'session_options', 'permissions', 'identity', 'cwd', 'coordinator', 'mission', 'persona', 'bio',
-  'briefing_file', 'model', 'max_tokens', 'autocompact_pct', 'env', 'oversee', 'harness_options',
-  'isolation', 'monitor',
+  'briefing_file', 'model', 'model_chain', 'max_tokens', 'autocompact_pct', 'env', 'oversee', 'harness_options',
+  'isolation', 'monitor', 'worklog', 'auth_proxy',
 ];
 
 function deepSub(v: unknown, vars: Record<string, string>): unknown {
@@ -207,12 +227,18 @@ function deepSub(v: unknown, vars: Record<string, string>): unknown {
 }
 
 /** Load ~/fleet.yaml (or an explicit path) merged with ~/fleet.d/*.yaml drop-ins. */
-export function loadConfig(configPath?: string): FleetConfig {
+export function loadConfig(
+  configPath?: string,
+  options: { yamlMode?: YamlMode } = {},
+): FleetConfig {
   const base = configPath ?? defaultConfigPath();
   const files: string[] = [];
+  const diagnostics: ConfigDiagnostic[] = [];
   const docs: { file: string; doc: Record<string, unknown> }[] = [];
   if (existsSync(base)) {
-    docs.push({ file: base, doc: (parse(readFileSync(base, 'utf8')) ?? {}) as Record<string, unknown> });
+    const parsed = parseFleetDocument(base, readFileSync(base, 'utf8'), options.yamlMode);
+    docs.push({ file: base, doc: parsed.value });
+    diagnostics.push(...parsed.diagnostics);
     files.push(base);
   } else if (configPath) {
     throw new ConfigError(`config not found: ${base}`);
@@ -221,7 +247,9 @@ export function loadConfig(configPath?: string): FleetConfig {
   if (existsSync(dd)) {
     for (const f of readdirSync(dd).filter(f => f.endsWith('.yaml') || f.endsWith('.yml')).sort()) {
       const p = join(dd, f);
-      const doc = (parse(readFileSync(p, 'utf8')) ?? {}) as Record<string, unknown>;
+      const parsed = parseFleetDocument(p, readFileSync(p, 'utf8'), options.yamlMode);
+      const doc = parsed.value;
+      diagnostics.push(...parsed.diagnostics);
       const extra = Object.keys(doc).filter(k => k !== 'roles');
       if (extra.length)
         throw new ConfigError(`${p}: fleet.d files may only define roles: (found: ${extra.join(', ')})`);
@@ -270,21 +298,42 @@ export function loadConfig(configPath?: string): FleetConfig {
           throw new ConfigError(`${file}: role '${name}' ${problems.join('; ')}`);
       }
       const monitor = resolveMonitorConfig(defaults.monitor, r.monitor, { base, file, name });
+      const worklog = resolveWorklogPolicy(defaults.worklog, r.worklog, file, name);
+      const authProxy = resolveAuthProxy(defaults.auth_proxy, r.auth_proxy, file, name);
+      const model = r.model ?? (defaults.model as string | undefined);
+      const modelChain = resolveModelChain(
+        model,
+        r.model_chain ?? (defaults.model_chain as string[] | undefined),
+        file,
+        name,
+      );
+      const harness = r.harness ?? (defaults.harness as string | undefined) ?? 'claude-code';
+      if (authProxy && harness !== 'claude-code')
+        throw new ConfigError(`${file}: role '${name}' auth_proxy is supported only by claude-code`);
+      const env = {
+        ...((defaults.env ?? {}) as Record<string, string>),
+        ...(r.env ?? {}),
+        ...(authProxy ? { ANTHROPIC_BASE_URL: authProxy.base_url } : {}),
+      };
       roles.push({
         ...r,
         name,
         sourceFile: file,
-        harness: r.harness ?? (defaults.harness as string | undefined) ?? 'claude-code',
+        harness,
         session,
         session_options: sessionOptions,
         permissions,
         permissionsDeclared,
         identity: r.identity ?? name,
-        model: r.model ?? (defaults.model as string | undefined),
+        model,
+        model_chain: modelChain,
         max_tokens: r.max_tokens ?? (defaults.max_tokens as number | undefined),
         harness_options: harnessOptions,
         isolation,
         monitor,
+        worklog,
+        auth_proxy: authProxy,
+        env: Object.keys(env).length ? env : undefined,
       });
       // Forbidden-path enforcement (5.2): a mount that would breach the policy
       // is a configuration error, caught by `config` rather than at launch.
@@ -297,7 +346,98 @@ export function loadConfig(configPath?: string): FleetConfig {
       }
     }
   }
-  return { roles, vars, defaults, files, startStaggerMs };
+  return { roles, vars, defaults, files, startStaggerMs, diagnostics };
+}
+
+export function resolveModelChain(
+  model: string | undefined, chain: string[] | undefined, file = 'config', name = 'role',
+): string[] | undefined {
+  if (chain === undefined) return undefined;
+  if (!Array.isArray(chain) || chain.length === 0)
+    throw new ConfigError(`${file}: role '${name}' model_chain must be a non-empty list`);
+  if (chain.some(entry => typeof entry !== 'string' || entry.trim() === ''))
+    throw new ConfigError(`${file}: role '${name}' model_chain entries must be non-blank strings`);
+  const normalized = chain.map(entry => entry.trim());
+  if (new Set(normalized).size !== normalized.length)
+    throw new ConfigError(`${file}: role '${name}' model_chain must not contain duplicates`);
+  if (model !== undefined && model !== normalized[0])
+    throw new ConfigError(`${file}: role '${name}' model must equal model_chain[0]`);
+  return normalized;
+}
+
+export function resolveAuthProxy(
+  defaults: unknown, role: Partial<AuthProxyConfig> | undefined,
+  file = 'config', name = 'role',
+): AuthProxyConfig | undefined {
+  if (defaults === undefined && role === undefined) return undefined;
+  if (defaults !== undefined && !isPlainObject(defaults))
+    throw new ConfigError(`${file}: defaults.auth_proxy must be a map`);
+  if (role !== undefined && !isPlainObject(role))
+    throw new ConfigError(`${file}: role '${name}' auth_proxy must be a map`);
+  const merged = {
+    ...((defaults ?? {}) as Partial<AuthProxyConfig>),
+    ...(role ?? {}),
+  };
+  const bad = Object.keys(merged).filter(key =>
+    !['kind', 'base_url', 'required', 'health_url'].includes(key));
+  if (bad.length) throw new ConfigError(
+    `${file}: role '${name}' auth_proxy: unknown key(s) ${bad.join(', ')}`);
+  if (merged.kind !== 'anthropic')
+    throw new ConfigError(`${file}: role '${name}' auth_proxy.kind must be 'anthropic'`);
+  if (typeof merged.base_url !== 'string')
+    throw new ConfigError(`${file}: role '${name}' auth_proxy.base_url is required`);
+  const checked = (label: string, raw: string): URL => {
+    let url: URL;
+    try { url = new URL(raw); } catch {
+      throw new ConfigError(`${file}: role '${name}' auth_proxy.${label} must be a valid URL`);
+    }
+    if (!['http:', 'https:'].includes(url.protocol))
+      throw new ConfigError(`${file}: role '${name}' auth_proxy.${label} must use http or https`);
+    if (!['127.0.0.1', 'localhost', '[::1]'].includes(url.hostname))
+      throw new ConfigError(`${file}: role '${name}' auth_proxy.${label} must be loopback-only`);
+    if (url.username || url.password)
+      throw new ConfigError(`${file}: role '${name}' auth_proxy.${label} must not contain credentials`);
+    return url;
+  };
+  const base = checked('base_url', merged.base_url);
+  const healthRaw = merged.health_url ?? new URL('/healthz', base).toString();
+  checked('health_url', healthRaw);
+  if (merged.required !== undefined && typeof merged.required !== 'boolean')
+    throw new ConfigError(`${file}: role '${name}' auth_proxy.required must be true or false`);
+  return {
+    kind: 'anthropic',
+    base_url: base.toString().replace(/\/$/, ''),
+    required: merged.required ?? true,
+    health_url: healthRaw,
+  };
+}
+
+export function resolveWorklogPolicy(
+  defaults: unknown, role: WorklogPolicy | undefined, file = 'config', name = 'role',
+): WorklogPolicy | undefined {
+  if (defaults === undefined && role === undefined) return undefined;
+  if (defaults !== undefined && !isPlainObject(defaults))
+    throw new ConfigError(`${file}: defaults.worklog must be a map`);
+  if (role !== undefined && !isPlainObject(role))
+    throw new ConfigError(`${file}: role '${name}' worklog must be a map`);
+  const merged = {
+    ...((defaults ?? {}) as Partial<WorklogPolicy>),
+    ...(role ?? {}),
+  };
+  const bad = Object.keys(merged).filter(key =>
+    !['max_kb', 'keep_tail_kb', 'max_archives'].includes(key));
+  if (bad.length) throw new ConfigError(
+    `${file}: role '${name}' worklog: unknown key(s) ${bad.join(', ')}`);
+  for (const key of ['max_kb', 'keep_tail_kb', 'max_archives'] as const) {
+    const value = merged[key];
+    if (!Number.isInteger(value) || (value as number) <= 0)
+      throw new ConfigError(`${file}: role '${name}' worklog.${key} must be a positive integer`);
+  }
+  if ((merged.max_archives as number) > 1000)
+    throw new ConfigError(`${file}: role '${name}' worklog.max_archives must be at most 1000`);
+  if ((merged.keep_tail_kb as number) >= (merged.max_kb as number))
+    throw new ConfigError(`${file}: role '${name}' worklog.keep_tail_kb must be less than max_kb`);
+  return merged as WorklogPolicy;
 }
 
 function resolveSession(raw: unknown, file: string, name: string): SessionBackendId {

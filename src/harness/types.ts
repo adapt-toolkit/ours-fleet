@@ -92,6 +92,8 @@ export interface HarnessAdapter {
    * explicitly declare that it cannot. Enforced at registration.
    */
   translatePermissions(permissions: CommonPermissions): PermissionTranslation;
+  /** Permission result after native harness_options precedence is applied. */
+  effectivePermissions?(role: ResolvedRole): PermissionTranslation;
   /**
    * The permission settings this role states NATIVELY in `harness_options`,
    * keyed the same way `translatePermissions().native` is, so the two can be

@@ -272,6 +272,40 @@ Legacy \`monitor.enabled: true|false\` remains accepted as an alias for
 selection.
 Inspect \`ours-fleet status Name\`, \`peek Name\`, role logs, and
 \`~/.ours-fleet/agents/Name/.monitor-status\` when diagnosing delivery.
+
+## Stable config and YAML migration
+
+\`ours-fleet config --json\` emits schemaVersion 1 resolved plans. Environment
+values and mission/persona/bio bodies are withheld; environment keys are sorted
+and values are marked redacted. Additive fields may appear in schema 1, while a
+removal or semantic reuse requires a new schema version.
+
+YAML parsing always rejects duplicate keys. The current default
+\`--yaml-mode compat\` warns with file/line/column for anchors, aliases, explicit
+tags, non-scalar keys, and multiple documents. Use \`--yaml-mode strict\` in CI
+now; strict becomes the next-major default and compat is the temporary migration
+escape hatch.
+
+## Bounded worklogs, auth proxy, and model recovery
+
+An optional \`worklog: { max_kb, keep_tail_kb, max_archives }\` policy rotates a
+stable snapshot at fleet-owned lifecycle points. Concurrent changes defer
+rotation. Archives remain beside WORKLOG.md with the same sensitive-state
+boundary; retention deletes only recognized fleet archive names.
+
+\`auth_proxy: { kind: anthropic, base_url, required, health_url }\` is Claude-only
+and loopback-only. Fleet injects only ANTHROPIC_BASE_URL and doctor rejects
+credential env keys. The privileged reference companion is
+\`contrib/anthropic-auth-proxy.mjs\`; deploy it separately as a dedicated account
+with a 0600 token file and per-role listener access. Fleet never installs it or
+reads its credential.
+
+\`model_chain\` is an ordered authorization list and its first entry must equal
+\`model\`. Only sustained high-confidence entitlement/quota 429 evidence advances
+one entry. Transient 429, overload, auth, policy, and unknown errors never
+down-shift. Runtime state is atomic in .model-recovery.json; exhaustion is
+fail-closed and held down. Change the declared chain/model and restart to
+reconcile explicitly; no chain preserves detection-only behavior.
 `;
 
 /**
