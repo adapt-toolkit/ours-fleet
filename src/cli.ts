@@ -15,6 +15,7 @@ import { Tmux, tmuxArgs } from './tmux.js';
 import { pickBackend } from './supervisor/index.js';
 import { up, down, restartRoles, rmRole, type OpsDeps } from './ops.js';
 import { readRestartLedger, runSupervised, runTemp } from './runner.js';
+import { runWatchdogAgent } from './watchdog/run.js';
 import {
   lastProvenance, spawnDryRun, spawnPermanent, spawnTemp, type SpawnOpts,
 } from './spawn.js';
@@ -585,6 +586,12 @@ program.command('_run <name>', { hidden: true }).description('internal: supervis
 program.command('_run-temp <name>', { hidden: true }).description('internal: temp-agent entrypoint')
   .action(async name => {
     try { await runTemp(name); } catch (e) { die(e); }
+  });
+
+program.command('_run-watchdog <name>', { hidden: true })
+  .description('internal: one watchdog agent run (no cleanup — parent harvests)')
+  .action(async name => {
+    try { await runWatchdogAgent(name); } catch (e) { die(e); }
   });
 
 program.parseAsync(process.argv);

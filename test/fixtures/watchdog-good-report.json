@@ -1,0 +1,42 @@
+{
+  "schema_version": 1,
+  "watchdog": "nightwatch",
+  "run_id": "20260731T115000Z",
+  "started_at": "2026-07-31T11:50:00Z",
+  "finished_at": "2026-07-31T11:51:12Z",
+  "status": "anomalies",
+  "summary": {
+    "checked": 2,
+    "healthy": 1,
+    "idle": 0,
+    "anomalies": 1
+  },
+  "roles": [
+    {
+      "role": "Alice",
+      "status": "blocked",
+      "reason": "Waiting on a trust dialog.",
+      "evidence": [
+        {
+          "source": "status",
+          "detail": "readiness=awaiting_permission",
+          "observed_at": "2026-07-31T11:50:31Z"
+        }
+      ],
+      "alerted": true
+    },
+    {
+      "role": "Docs",
+      "status": "healthy"
+    }
+  ],
+  "alerts": [
+    {
+      "role": "Alice",
+      "code": "blocked",
+      "coordinator": "FleetCoordinator",
+      "sent_at": "2026-07-31T11:51:10Z"
+    }
+  ],
+  "error": null
+}
