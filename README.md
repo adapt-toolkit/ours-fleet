@@ -581,3 +581,52 @@ separate **commercial licence** from Adapt Framework Solutions Ltd — see
 **Audit status.** The core has not yet had an independent security audit. We're raising funding to commission one from a recognized firm and prove these guarantees, and we'll open-source the full core once it passes. Until then it's source-available and documented, but not independently audited — run anything critical on it at your own risk.
 
 Copyright 2026 Adapt Framework Solutions Ltd.
+# Open-issues configuration contracts
+
+`ours-fleet config --json` emits a deterministic, versioned, secret-safe
+resolved plan (`schemaVersion: 1`). Environment keys are visible for policy
+checks but values are always redacted. Human output remains the default.
+
+The YAML loader explicitly rejects duplicate keys. During the compatibility
+rollout, anchors, aliases, explicit tags, non-scalar keys, and multiple documents
+produce source-positioned warnings; opt into enforcement with
+`--yaml-mode strict`. Strict mode will become the next-major default.
+
+Long-running roles may opt into bounded durable logs:
+
+```yaml
+worklog:
+  max_kb: 1024
+  keep_tail_kb: 256
+  max_archives: 12
+```
+
+Rotation is conservative: a concurrent change aborts the attempt and retries at
+a later fleet lifecycle point. Archives remain in the role state directory and
+may contain the same sensitive material as `WORKLOG.md`.
+
+Claude roles can use a credential-free loopback proxy:
+
+```yaml
+auth_proxy:
+  kind: anthropic
+  base_url: http://127.0.0.1:9411
+  required: true
+  health_url: http://127.0.0.1:9411/healthz
+```
+
+Only `ANTHROPIC_BASE_URL` is injected. Do not put provider credentials in fleet
+configuration. See `contrib/anthropic-auth-proxy.mjs` for the separately
+deployed, dedicated-service-account reference and its 0600 token-file contract.
+
+Approved automatic recovery is opt-in:
+
+```yaml
+model: primary-model
+model_chain: [primary-model, approved-fallback]
+```
+
+Only sustained, high-confidence model entitlement/quota 429 evidence advances
+the chain. Generic rate limits, overload, authentication, policy, and unknown
+errors remain detection-only. Exhaustion holds the role down; fleet never edits
+human-owned YAML or selects a model outside the declared chain.
