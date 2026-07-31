@@ -44,8 +44,18 @@ test('bootstrap, inventory, navigation, send, create, and security boundaries', 
   await expect(page.getByText('accepted; turn may still be running')).toBeVisible();
   await page.getByRole('button', { name: /Create role/ }).click();
   await page.getByLabel('Role / session name').fill('Researcher');
+  await page.getByLabel('Monitor mode').selectOption('native');
+  await expect(page.getByLabel('Monitor wake sources')).toHaveCount(0);
+  await page.getByLabel('Monitor mode').selectOption('fleet');
+  await expect(page.getByLabel('Monitor injection').locator('option')).toHaveCount(1);
+  await expect(page.getByLabel('Monitor injection').locator('option')).toHaveText('Notification summary');
+  await page.getByLabel('Monitor batch milliseconds').fill('750');
+  await page.getByLabel('Monitor wake sources').getByText('inbound error').click();
+  await page.getByText('Interrupt an active turn before wake delivery').click();
   await page.getByRole('button', { name: 'Review effective plan' }).click();
   await expect(page.getByText('Effective plan')).toBeVisible();
+  await expect(page.getByText(/"batch_ms":750/)).toBeVisible();
+  await expect(page.getByText(/"inbound_error"/)).toBeVisible();
   await page.getByRole('button', { name: 'Create atomically' }).click();
   await expect(page.getByRole('heading', { name: 'Researcher' })).toBeVisible();
 

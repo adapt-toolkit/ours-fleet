@@ -1,4 +1,4 @@
-import { useMemo, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import { api, idempotencyKey } from './api';
 
 type Form = {
@@ -8,13 +8,22 @@ type Form = {
   filesystem: 'read-only' | 'workspace' | 'unrestricted'; unattended: 'deny' | 'wait';
   bio: string; persona: string; highRiskAcknowledged: boolean; openAfterCreate: boolean;
   reuseExistingIdentityAcknowledged: boolean; unverifiedIdentityAcknowledged: boolean;
+  monitorMode: 'fleet' | 'native'; monitorInterrupt: boolean;
+  monitorWakeSources: string[]; monitorBatchMs: string; monitorInject: 'notification';
 };
+const WAKE_SOURCES = [
+  'message_received', 'file_received', 'sibling_contact_added', 'local_contact_request',
+  'pending_message', 'contact_restored', 'inbound_error', 'state_import_failed',
+] as const;
 const initial: Form = {
   name: '', harness: 'codex', model: '', session: 'acp', cwd: '',
   lifetime: 'permanent', mission: '', coordinator: '', approval: 'ask',
   filesystem: 'workspace', unattended: 'deny', bio: '', persona: '',
   highRiskAcknowledged: false, openAfterCreate: true,
   reuseExistingIdentityAcknowledged: false, unverifiedIdentityAcknowledged: false,
+  monitorMode: 'fleet', monitorInterrupt: false,
+  monitorWakeSources: ['message_received', 'file_received', 'local_contact_request', 'pending_message'],
+  monitorBatchMs: '2000', monitorInject: 'notification',
 };
 
 export function CreateRole({ onClose, onCreated }: {
@@ -25,6 +34,20 @@ export function CreateRole({ onClose, onCreated }: {
   const [action, setAction] = useState<any>();
   const [error, setError] = useState('');
   const [busy, setBusy] = useState(false);
+  useEffect(() => {
+    void api.get<any>('/api/v1/creation-capabilities').then(capabilities => {
+      const defaults = capabilities.monitor?.defaults;
+      if (!defaults) return;
+      setForm(current => ({
+        ...current,
+        monitorMode: defaults.mode,
+        monitorInterrupt: defaults.interrupt,
+        monitorWakeSources: defaults.wake_sources,
+        monitorBatchMs: String(defaults.batch_ms),
+        monitorInject: 'notification',
+      }));
+    }).catch(() => undefined);
+  }, []);
   const request = useMemo(() => ({
     name: form.name, harness: form.harness,
     model: form.model || undefined, session: form.session, cwd: form.cwd || undefined,
@@ -35,6 +58,11 @@ export function CreateRole({ onClose, onCreated }: {
     highRiskAcknowledged: form.highRiskAcknowledged,
     reuseExistingIdentityAcknowledged: form.reuseExistingIdentityAcknowledged,
     unverifiedIdentityAcknowledged: form.unverifiedIdentityAcknowledged,
+    monitor: form.monitorMode === 'native' ? { mode: 'native' as const } : {
+      mode: 'fleet' as const, interrupt: form.monitorInterrupt,
+      wake_sources: form.monitorWakeSources, batch_ms: Number(form.monitorBatchMs),
+      inject: form.monitorInject,
+    },
     openAfterCreate: form.openAfterCreate,
   }), [form]);
   const change = <K extends keyof Form>(key: K, value: Form[K]) => {
@@ -83,6 +111,33 @@ export function CreateRole({ onClose, onCreated }: {
           <label>Lifetime<select value={form.lifetime} onChange={e => change('lifetime', e.target.value as Form['lifetime'])}><option value="permanent">Permanent</option><option value="temporary">Temporary — gone on exit/reboot</option></select></label>
           <label className="wide">Working directory <small>blank uses private role state</small><input value={form.cwd} onChange={e => change('cwd', e.target.value)} placeholder="/absolute/existing/path" /></label>
         </div></fieldset>
+        <fieldset><legend>Monitoring</legend><div className="form-grid">
+          <label>Wake owner<select aria-label="Monitor mode" value={form.monitorMode}
+            onChange={e => change('monitorMode', e.target.value as Form['monitorMode'])}>
+            <option value="fleet">Fleet monitor</option><option value="native">Native harness monitor</option>
+          </select></label>
+          {form.monitorMode === 'fleet' && <>
+            <label>Injection<select aria-label="Monitor injection" value={form.monitorInject}
+              onChange={e => change('monitorInject', e.target.value as 'notification')}>
+              <option value="notification">Notification summary</option>
+            </select></label>
+            <label>Batch window (ms)<input aria-label="Monitor batch milliseconds" type="number" min="0"
+              value={form.monitorBatchMs} onChange={e => change('monitorBatchMs', e.target.value)} /></label>
+            <label className="risk"><input type="checkbox" checked={form.monitorInterrupt}
+              onChange={e => change('monitorInterrupt', e.target.checked)} />Interrupt an active turn before wake delivery</label>
+            <div className="wide wake-sources" role="group" aria-label="Monitor wake sources">
+              <small>Wake sources</small>
+              {WAKE_SOURCES.map(source => <label key={source}><input type="checkbox"
+                checked={form.monitorWakeSources.includes(source)} onChange={e => change(
+                  'monitorWakeSources', e.target.checked
+                    ? [...form.monitorWakeSources, source]
+                    : form.monitorWakeSources.filter(item => item !== source),
+                )} />{source.replaceAll('_', ' ')}</label>)}
+            </div>
+          </>}
+        </div>{form.monitorMode === 'native' &&
+          <p className="muted">The harness owns wake delivery; fleet batching and injection are disabled.</p>}
+        </fieldset>
         <fieldset><legend>Neutral permissions</legend><div className="form-grid three">
           <label>Approval<select value={form.approval} onChange={e => change('approval', e.target.value as Form['approval'])}><option>ask</option><option>deny</option><option>allow</option></select></label>
           <label>Filesystem<select value={form.filesystem} onChange={e => change('filesystem', e.target.value as Form['filesystem'])}><option>workspace</option><option>read-only</option><option>unrestricted</option></select></label>

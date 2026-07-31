@@ -127,6 +127,9 @@ fieldset { border: 0; border-bottom: 1px solid var(--line); padding: 0 0 20px; m
 legend { margin-bottom: 13px; color: var(--mint); text-transform: uppercase; font-size: 10px; letter-spacing: 1.5px; font-weight: 700; }
 .form-grid { display: grid; grid-template-columns: repeat(2, 1fr); gap: 13px; }
 .form-grid.three { grid-template-columns: repeat(3, 1fr); }
+.wake-sources { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 7px 14px; }
+.wake-sources > small { grid-column: 1 / -1; color: var(--muted); }
+.wake-sources label { display: flex; flex-direction: row; align-items: center; gap: 7px; color: #c7d0d1; font-size: 11px; text-transform: none; letter-spacing: 0; }
 .form-grid label { display: grid; gap: 6px; color: #b7c0c2; font-size: 12px; }
 .form-grid label small { color: var(--muted); }
 .form-grid .wide { grid-column: 1 / -1; }

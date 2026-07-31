@@ -7,9 +7,9 @@ import { validateIsolationConfig } from './isolation/policy.js';
 import type { IsolationConfig } from './isolation/types.js';
 import {
   loadConfig, resolveAuthProxy, resolveModelChain, resolveMonitorConfig, resolvePermissions,
-  resolveWorklogPolicy,
+  resolveWorklogPolicy, validateMonitorConfig,
   type ApprovalMode, type FilesystemMode, type ResolvedRole, type RoleConfig,
-  type CommonPermissions, type SessionBackendId, type UnattendedMode,
+  type CommonPermissions, type MonitorConfig, type SessionBackendId, type UnattendedMode,
 } from './config.js';
 import { applyRole, up, type OpsDeps } from './ops.js';
 import { START_STAGGER_FILE } from './runner.js';
@@ -52,6 +52,8 @@ export interface SpawnOpts {
   codexConfig?: Record<string, string | number | boolean>;
   addDirs?: string[];
   monitor?: boolean;
+  /** Typed external monitor configuration used by trusted creation surfaces. */
+  monitorConfig?: Partial<MonitorConfig>;
   bioFile?: string;
   personaFile?: string;
   /** Inline profile values for trusted typed callers such as the local web service. */
@@ -118,6 +120,7 @@ export function buildRoleConfig(o: SpawnOpts, defaultHarness?: string): RoleConf
   if (profile.bio) r.bio = profile.bio;
   if (profile.persona) r.persona = profile.persona;
   if (o.isolationFile) r.isolation = readIsolationFile(o.isolationFile);
+  if (o.monitorConfig) r.monitor = { ...o.monitorConfig };
   return r;
 }
 
@@ -162,6 +165,10 @@ export function validateSpawnOpts(o: SpawnOpts): void {
     throw new Error(`invalid identity name '${o.identity}'`);
   if (o.model && (o.model.length > 128 || /[\0-\x1f\x7f]/.test(o.model)))
     throw new Error('model must be printable and at most 128 characters');
+  if (o.monitorConfig) {
+    const problems = validateMonitorConfig(o.monitorConfig);
+    if (problems.length) throw new Error(problems.join('; '));
+  }
 }
 
 /** Read mission text without trimming or newline rewriting. */
@@ -284,6 +291,7 @@ function provenanceSettings(
     isolation: o.isolationFile
       ? { value: 'declared via --isolation-file', source: 'cli' }
       : { value: defaults.isolation ? 'from fleet defaults' : undefined, source: defaults.isolation ? 'fleet-default' : 'built-in' },
+    monitor: provenanceOf(o.monitorConfig, defaults.monitor, { mode: 'fleet' }),
   };
 }
 

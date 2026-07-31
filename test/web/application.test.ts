@@ -2,6 +2,7 @@ import { mkdtempSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
+import { parse } from 'yaml';
 import { RoleRepository } from '../../src/application/role-repository.js';
 import { FleetError, normalizeError } from '../../src/application/errors.js';
 import { roleCapabilities } from '../../src/application/capabilities.js';
@@ -133,6 +134,11 @@ identity: Temp
           approval: 'ask' as const, filesystem: 'workspace' as const,
           unattended: 'deny' as const,
         },
+        monitor: flow.lifetime === 'permanent' ? {
+          mode: 'fleet' as const, interrupt: true, batch_ms: 750,
+          inject: 'notification' as const,
+          wake_sources: ['message_received', 'inbound_error'] as const,
+        } : { mode: 'native' as const },
       };
       const preview = await service.preview(request);
       expect(preview.effective.identity).toBe(request.name);
@@ -169,8 +175,66 @@ identity: Temp
         'identity_bootstrap_pending',
       );
       expect(mutationCalls).toBe(0);
+      const written = flow.lifetime === 'permanent'
+        ? parse(readFileSync(join(root, 'fleet.d', `${request.name}.yaml`), 'utf8')).roles[request.name]
+        : parse(readFileSync(join(stateDir, 'role.yaml'), 'utf8'));
+      expect(written.monitor.mode).toBe(request.monitor.mode);
+      const creation = JSON.parse(readFileSync(join(stateDir, 'creation.json'), 'utf8'));
+      expect(creation.settings.monitor).toEqual({ source: 'cli', value: request.monitor });
+      if (flow.lifetime === 'permanent') expect(written.monitor).toMatchObject({
+        interrupt: true, batch_ms: 750, inject: 'notification',
+        wake_sources: ['message_received', 'inbound_error'],
+      });
     });
   }
+
+  it('previews monitor defaults/provenance and rejects unsupported or invalid web monitor input', async () => {
+    const root = fixture();
+    writeFileSync(join(root, 'fleet.yaml'), `defaults:
+  monitor: { mode: native, batch_ms: 5000 }
+roles: {}
+`);
+    const service = new RoleCreationService({
+      configPath: join(root, 'fleet.yaml'),
+      ops: { backend, binPath: '/bin/true', log() {} }, binPath: '/bin/true',
+      identityProvisioner: { async exists() { return false; } },
+      journalDir: join(root, '.ours-fleet', 'web-actions'),
+    });
+    const base = {
+      name: 'MonitorPreview', harness: 'codex' as const, session: 'acp' as const,
+      lifetime: 'permanent' as const, openAfterCreate: true,
+      permissions: {
+        approval: 'ask' as const, filesystem: 'workspace' as const, unattended: 'deny' as const,
+      },
+    };
+    const inherited = await service.preview(base);
+    expect(inherited.effective.monitor).toMatchObject({ mode: 'native', batch_ms: 5000 });
+    expect(inherited.provenance.monitor).toBe('fleet-default');
+    expect((await service.capabilities()).monitor).toMatchObject({
+      modes: ['fleet', 'native'], injectModes: ['notification'],
+      defaults: { mode: 'native', batch_ms: 5000 },
+    });
+    const explicit = await service.preview({
+      ...base,
+      monitor: {
+        mode: 'fleet', interrupt: false, batch_ms: 25, inject: 'notification',
+        wake_sources: ['state_import_failed'],
+      },
+    });
+    expect(explicit.effective.monitor).toMatchObject({
+      mode: 'fleet', batch_ms: 25, wake_sources: ['state_import_failed'],
+    });
+    expect(explicit.provenance.monitor).toBe('request');
+    await expect(service.preview({
+      ...base, monitor: { mode: 'fleet', wake_sources: ['not_real'] },
+    } as any)).rejects.toMatchObject({ code: 'invalid_request' });
+    await expect(service.preview({
+      ...base,
+      monitor: {
+        mode: 'fleet', interrupt: false, batch_ms: 25, inject: 'full', wake_sources: [],
+      },
+    } as any)).rejects.toMatchObject({ code: 'invalid_request' });
+  });
 
   it('requires explicit confirmation before reusing an existing identity', async () => {
     const root = fixture();

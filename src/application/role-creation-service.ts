@@ -1,7 +1,11 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { mkdirSync, readFileSync, readdirSync, realpathSync, statSync } from 'node:fs';
 import { isAbsolute, relative } from 'node:path';
-import { loadConfig, resolvePermissions, ROLE_NAME_RE, type CommonPermissions } from '../config.js';
+import {
+  loadConfig, NOTIFY_EVENT_TYPES, resolveMonitorConfig,
+  resolvePermissions, ROLE_NAME_RE, validateMonitorConfig,
+  type CommonPermissions, type MonitorConfig, type NotifyEventType,
+} from '../config.js';
 import {
   daemonIdentityProvisioner,
   type CreationCoreStage, type CreationDeps, type IdentityProvisioner,
@@ -27,11 +31,19 @@ export interface CreateRoleSessionRequest {
   permissions: CommonPermissions;
   bio?: string;
   persona?: string;
+  monitor?: WebCreationMonitor;
   openAfterCreate: boolean;
   highRiskAcknowledged?: boolean;
   reuseExistingIdentityAcknowledged?: boolean;
   unverifiedIdentityAcknowledged?: boolean;
 }
+
+export type WebCreationMonitor =
+  | { mode: 'native' }
+  | {
+    mode: 'fleet'; interrupt: boolean; wake_sources: NotifyEventType[];
+    batch_ms: number; inject: 'notification';
+  };
 
 export interface CreationCapabilities {
   available: boolean;
@@ -48,6 +60,12 @@ export interface CreationCapabilities {
     warnings: string[];
   };
   safePermissionSchemaVersion: 1;
+  monitor: {
+    modes: Array<'fleet' | 'native'>;
+    wakeSources: NotifyEventType[];
+    injectModes: ['notification'];
+    defaults: MonitorConfig;
+  };
 }
 
 export type IdentityPreflight = 'verified' | 'missing' | 'unknown';
@@ -58,6 +76,7 @@ export interface CreationPreview {
     name: string; identity: string; harness: string; session: 'acp' | 'tmux';
     model?: string; cwd?: string; lifetime: 'permanent' | 'temporary';
     permissions: CommonPermissions;
+    monitor: MonitorConfig;
   };
   provenance: Record<string, 'request' | 'fleet-default' | 'built-in'>;
   warnings: string[];
@@ -140,7 +159,8 @@ export class RoleCreationService {
 
   async capabilities(): Promise<CreationCapabilities> {
     const reasons: string[] = [];
-    try { loadConfig(this.options.configPath); }
+    let defaults: Record<string, unknown> = {};
+    try { defaults = loadConfig(this.options.configPath).defaults; }
     catch (error) { reasons.push(`configuration is invalid: ${(error as Error).message}`); }
     return {
       available: reasons.length === 0,
@@ -159,6 +179,11 @@ export class RoleCreationService {
         ],
       },
       safePermissionSchemaVersion: 1,
+      monitor: {
+        modes: ['fleet', 'native'], wakeSources: [...NOTIFY_EVENT_TYPES],
+        injectModes: ['notification'],
+        defaults: resolveMonitorConfig(defaults.monitor, undefined),
+      },
     };
   }
 
@@ -177,6 +202,7 @@ export class RoleCreationService {
       model: request.model?.trim() || (defaults.model as string | undefined),
       cwd, lifetime: request.lifetime,
       permissions: resolvePermissions(defaults.permissions, request.permissions),
+      monitor: resolveMonitorConfig(defaults.monitor, request.monitor),
     };
     const warnings: string[] = [];
     if (request.permissions.approval === 'allow')
@@ -206,6 +232,7 @@ export class RoleCreationService {
       harness: 'request', session: 'request', identity: 'built-in',
       model: request.model ? 'request' : defaults.model ? 'fleet-default' : 'built-in',
       cwd: request.cwd ? 'request' : 'built-in', permissions: 'request',
+      monitor: request.monitor ? 'request' : defaults.monitor ? 'fleet-default' : 'built-in',
     } as const;
     const fingerprint = this.configFingerprint(cfg.files);
     const identityBootstrap = {
@@ -350,10 +377,17 @@ export class RoleCreationService {
     bounded(input.bio, 'bio', 8_192);
     bounded(input.persona, 'persona', 16_384);
     resolvePermissions(undefined, input.permissions);
+    if (input.monitor) {
+      const problems = validateMonitorConfig(input.monitor);
+      if (problems.length) throw new FleetError('invalid_request', problems.join('; '));
+      if ('inject' in input.monitor && input.monitor.inject !== 'notification')
+        throw new FleetError('invalid_request', 'web creation supports monitor.inject=notification only');
+    }
     return {
       ...input, model: input.model?.trim() || undefined,
       mission: input.mission?.trim() || undefined, coordinator: input.coordinator?.trim() || undefined,
       bio: input.bio?.trim() || undefined, persona: input.persona?.trim() || undefined,
+      monitor: input.monitor ? structuredClone(input.monitor) : undefined,
     };
   }
 
@@ -381,6 +415,7 @@ export class RoleCreationService {
       mission: request.mission, coordinator: request.coordinator,
       approval: request.permissions.approval, filesystem: request.permissions.filesystem,
       unattended: request.permissions.unattended, bio: request.bio, persona: request.persona,
+      monitorConfig: request.monitor,
       configPath: this.options.configPath,
       surface: creationActionId ? 'web' : undefined, creationActionId,
     };
