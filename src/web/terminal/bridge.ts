@@ -29,6 +29,19 @@ interface HeadlessProjection {
   serialize(): string;
 }
 
+type Constructor<T> = new (...args: any[]) => T;
+
+/** Node exposes these CommonJS xterm packages under `default`; Vite may expose named exports. */
+export function resolveModuleConstructor<T>(module: unknown, name: string): Constructor<T> {
+  const record = module && typeof module === 'object' ? module as Record<string, unknown> : {};
+  const fallback = record.default && typeof record.default === 'object'
+    ? record.default as Record<string, unknown> : {};
+  const value = record[name] ?? fallback[name];
+  if (typeof value !== 'function')
+    throw new FleetError('capability_unavailable', `${name} constructor is unavailable`);
+  return value as Constructor<T>;
+}
+
 export interface TerminalBridgeManagerOptions {
   repository: RoleRepository;
   audit: AuditSink;
@@ -110,9 +123,18 @@ class TerminalBridge {
     roleId: string, tmux: Tmux, ptyModule: typeof import('node-pty'), audit: AuditSink,
     onDisposed: () => void, graceMs: number,
   ): Promise<TerminalBridge> {
-    const [{ Terminal }, { SerializeAddon }] = await Promise.all([
+    const [headless, serialization] = await Promise.all([
       import('@xterm/headless'), import('@xterm/addon-serialize'),
     ]);
+    const Terminal = resolveModuleConstructor<{
+      write(data: string | Uint8Array, callback?: () => void): void;
+      resize(cols: number, rows: number): void;
+      loadAddon(addon: unknown): void;
+      dispose(): void;
+    }>(headless, 'Terminal');
+    const SerializeAddon = resolveModuleConstructor<{
+      serialize(): string; dispose(): void;
+    }>(serialization, 'SerializeAddon');
     const terminal = new Terminal({ cols: 120, rows: 36, scrollback: 5_000, allowProposedApi: true });
     const serialize = new SerializeAddon();
     terminal.loadAddon(serialize);

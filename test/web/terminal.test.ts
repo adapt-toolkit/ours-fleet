@@ -3,7 +3,7 @@ import { mkdtempSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
-import { TerminalBridgeManager } from '../../src/web/terminal/bridge.js';
+import { resolveModuleConstructor, TerminalBridgeManager } from '../../src/web/terminal/bridge.js';
 import { AuditSink } from '../../src/web/audit.js';
 
 class SocketStub extends EventEmitter {
@@ -20,6 +20,14 @@ class SocketStub extends EventEmitter {
 }
 
 describe('tmux terminal bridge', () => {
+  it('resolves xterm constructors from Node CommonJS default interop', () => {
+    class TerminalFixture {}
+    expect(resolveModuleConstructor({ default: { Terminal: TerminalFixture } }, 'Terminal'))
+      .toBe(TerminalFixture);
+    expect(() => resolveModuleConstructor({ default: {} }, 'Terminal'))
+      .toThrow(/constructor is unavailable/);
+  });
+
   it('shares one PTY, enforces one writer lease, and never kills the role', async () => {
     let onData = (_data: string) => {};
     let onExit = () => {};
