@@ -11,12 +11,16 @@ import { SessionEvents } from './events.js';
 import { SessionControlError, classifyChildExit, turnResult } from './types.js';
 import type {
   ExitRecord, PermissionDecision, QueuedPrompt, SessionEvent, SessionHandle, SessionSnapshot,
-  TurnOutcome, TurnResult,
+  SubmitPromptOptions, TurnOutcome, TurnResult,
 } from './types.js';
 
 interface PendingPermission {
   options: Array<{ optionId: string; kind: string }>;
   resolve(response: acp.RequestPermissionResponse): void;
+}
+
+interface SteeringResponse {
+  outcome: 'injected' | 'startedNewTurn' | 'failed';
 }
 
 export interface AcpSessionOptions {
@@ -62,6 +66,7 @@ export class AcpSession implements SessionHandle {
   private promptTail: Promise<unknown> = Promise.resolve();
   private queueDepth = 0;
   private exit: ExitRecord | null = null;
+  private steeringSupported = false;
   private capabilities?: acp.AgentCapabilities;
   private controllerCount = 0;
 
@@ -80,6 +85,7 @@ export class AcpSession implements SessionHandle {
       // Record the child's real exit code/signal. The tmux path can only see a
       // shell's `$?`; here the truth is available, so keep it.
       this.exit = classifyChildExit(code, signal);
+      options.log(`[${options.name}] acp: agent exited (${code ?? signal ?? 'unknown'})`);
       if (this.readiness !== 'failed') {
         this.readiness = 'failed';
         this.lastError = `ACP agent ${this.exit.detail}`;
@@ -145,9 +151,14 @@ export class AcpSession implements SessionHandle {
    * for minutes behind other queued turns; making an interactive caller wait
    * for it is what turned a busy agent into a timeout and then into "dead".
    */
-  async queuePrompt(text: string): Promise<QueuedPrompt> {
+  async queuePrompt(text: string, options: SubmitPromptOptions = {}): Promise<QueuedPrompt> {
     if (!this.sessionId || !this.isAlive())
       throw new SessionControlError('offline', this.lastError ?? 'ACP session is offline');
+    if (options.interrupt) await this.interrupt();
+    else if (options.steer && this.steeringSupported) {
+      const promptId = randomUUID();
+      return { promptId, queuedBehind: 0, completion: this.steerPrompt(text) };
+    }
     const promptId = randomUUID();
     const queuedBehind = this.queueDepth++;
     const run = this.promptTail.then(() => this.runPrompt(text, promptId));
@@ -162,9 +173,9 @@ export class AcpSession implements SessionHandle {
     return { promptId, queuedBehind, completion };
   }
 
-  async submitPrompt(text: string): Promise<TurnResult> {
+  async submitPrompt(text: string, options: SubmitPromptOptions = {}): Promise<TurnResult> {
     try {
-      return await (await this.queuePrompt(text)).completion;
+      return await (await this.queuePrompt(text, options)).completion;
     } catch (error) {
       if (error instanceof SessionControlError) return turnResult(false, 'failed', error.message);
       throw error;
@@ -174,6 +185,9 @@ export class AcpSession implements SessionHandle {
   async interrupt(): Promise<void> {
     if (!this.sessionId) return;
     await this.connection.agent.notify(acp.methods.agent.session.cancel, { sessionId: this.sessionId });
+    for (const pending of this.pendingPermissions.values())
+      pending.resolve({ outcome: { outcome: 'cancelled' } });
+    this.pendingPermissions.clear();
   }
 
   respondPermission(permissionId: string, optionId: string): boolean {
@@ -232,6 +246,9 @@ export class AcpSession implements SessionHandle {
       throw new Error(
         `ACP protocol mismatch: agent selected ${initialized.protocolVersion}, client supports ${acp.PROTOCOL_VERSION}`);
     this.capabilities = initialized.agentCapabilities;
+    const steering = initialized._meta?.steering;
+    this.steeringSupported = steering !== null && typeof steering === 'object'
+      && (steering as { supported?: unknown }).supported === true;
 
     const persisted = this.options.mode === 'resume' && existsSync(this.sessionFile)
       ? readFileSync(this.sessionFile, 'utf8').trim()
@@ -284,6 +301,28 @@ export class AcpSession implements SessionHandle {
       this.events.emit('error', { turnId, text: this.lastError });
       if (this.isAlive()) this.events.emit('state', { status: 'idle' });
       return turnResult(false, 'failed', this.lastError);
+    }
+  }
+
+  private async steerPrompt(text: string): Promise<TurnResult> {
+    if (!this.sessionId || !this.isAlive())
+      return turnResult(false, 'failed', this.lastError ?? 'ACP session is offline');
+    try {
+      const response = await this.connection.agent.request<SteeringResponse, {
+        sessionId: string;
+        prompt: Array<{ type: 'text'; text: string }>;
+      }>('_session/steering', {
+        sessionId: this.sessionId,
+        prompt: [{ type: 'text', text }],
+      });
+      if (response.outcome === 'failed')
+        return turnResult(false, 'failed', 'ACP steering failed');
+      return turnResult(true, 'inconclusive', response.outcome);
+    } catch (error) {
+      const detail = (error as Error)?.message ?? String(error);
+      this.lastError = detail;
+      this.events.emit('error', { text: detail });
+      return turnResult(false, 'failed', detail);
     }
   }
 

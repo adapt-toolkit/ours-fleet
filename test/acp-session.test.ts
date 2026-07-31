@@ -203,6 +203,37 @@ describe('AcpSession', () => {
     await control.close();
     await session.close();
   });
+
+  it('steers a live prompt instead of waiting behind it', async () => {
+    const session = await start('ask');
+    session.setControllerAttached(true);
+    const active = session.submitPrompt('permission');
+    for (let i = 0; i < 20 && session.snapshot().readiness !== 'awaiting_permission'; i++)
+      await new Promise(resolve => setTimeout(resolve, 10));
+    const steered = await session.submitPrompt('important message', { steer: true });
+    expect(steered).toMatchObject({
+      accepted: true, outcome: 'inconclusive', detail: 'injected',
+    });
+    expect(session.eventsSince(0).some(event =>
+      event.kind === 'agent_text' && event.text === 'steer:important message')).toBe(true);
+    await session.interrupt();
+    expect((await active).outcome).toBe('cancelled');
+    session.setControllerAttached(false);
+    await session.close();
+  });
+
+  it('cancels a live prompt before interrupting delivery starts a new turn', async () => {
+    const session = await start('ask');
+    session.setControllerAttached(true);
+    const active = session.submitPrompt('permission');
+    for (let i = 0; i < 20 && session.snapshot().readiness !== 'awaiting_permission'; i++)
+      await new Promise(resolve => setTimeout(resolve, 10));
+    const delivered = session.submitPrompt('wake', { interrupt: true });
+    expect((await active).outcome).toBe('cancelled');
+    expect(await delivered).toMatchObject({ accepted: true, outcome: 'completed' });
+    session.setControllerAttached(false);
+    await session.close();
+  });
 });
 
 describe('role control failures are typed (1.5)', () => {

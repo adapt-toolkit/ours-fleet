@@ -28,9 +28,9 @@ defaults:
     unattended: deny          # deny | wait when no ACP console is attached
   # model: claude-fable-5       # default model for roles without their own (per-role model / --model wins)
   max_tokens: 500000          # session cap before auto-compact (harness-interpreted)
-  monitor:                    # supervisor-owned mail wake (fleet-wide default)
-    enabled: true             # true (default): supervisor injects [fleet-monitor] console lines;
-    #                         #   false: legacy — the agent arms its own `ours-mcp watch`
+  monitor:
+    mode: fleet               # fleet (default): ours-fleet supervisor; native: harness-owned monitor
+    interrupt: false          # true: cancel active work before every configured wake
 
   # To make Codex the fleet default instead:
   # harness: codex
@@ -40,7 +40,7 @@ defaults:
   #   profile: fleet          # ~/.codex/fleet.config.toml (or $CODEX_HOME equivalent)
   #   sandbox: workspace-write
   #   approval: on-request
-  #   monitor: true             # explicit persistent consent for unattended wake
+  #   monitor: true             # consent for Codex's native monitor; not monitor.mode
   #   search: true
   #   config:
   #     model_reasoning_effort: high
@@ -80,7 +80,8 @@ roles:
         - message_received          #          local_contact_request, pending_message
         - file_received
       batch_ms: 2000                # coalesce a burst into one console line (default 2000)
-      # enabled: false              # opt this role out: it arms its own `ours-mcp watch`
+      # interrupt: true             # cancel active work so this role handles every wake immediately
+      # mode: native                # use this harness's native monitor instead of ours-fleet
     isolation:                      # OS-level sandbox (additive — omit for today's behavior)
       network: broker               # broker (default): ours messaging works, general egress denied
       resources:                    # per-agent cgroup caps at the pane

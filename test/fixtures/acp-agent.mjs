@@ -3,6 +3,7 @@ import { createInterface } from 'node:readline';
 const sessionId = 'fixture-session';
 let permissionRequestId = 10_000;
 const pendingPermission = new Map();
+let activePromptId;
 const send = value => process.stdout.write(JSON.stringify(value) + '\n');
 
 // Terminal-outcome modes. A prompt's own text picks one ("refuse …"/"cancel …");
@@ -53,6 +54,7 @@ const requestPermission = promptId => {
 
 const answerPrompt = (id, stopReason) => {
   send({ jsonrpc: '2.0', id, result: { stopReason } });
+  if (activePromptId === id) activePromptId = undefined;
   if (EXIT_AFTER && ++promptsAnswered >= EXIT_AFTER)
     setTimeout(() => process.exit(EXIT_CODE), 20);   // let the reply flush first
 };
@@ -76,6 +78,10 @@ createInterface({ input: process.stdin }).on('line', line => {
         },
       },
     });
+    if (selected === 'cancelled') {
+      outstanding.delete(pending.promptId);
+      return;
+    }
     // A prompt may have several outstanding requests; answer it once they settle.
     const left = (outstanding.get(pending.promptId) ?? 1) - 1;
     outstanding.set(pending.promptId, left);
@@ -95,6 +101,7 @@ createInterface({ input: process.stdin }).on('line', line => {
             loadSession: false,
             sessionCapabilities: { close: {} },
           },
+          _meta: { steering: { supported: true } },
         },
       });
       break;
@@ -117,6 +124,7 @@ createInterface({ input: process.stdin }).on('line', line => {
           },
         },
       });
+      activePromptId = message.id;
       const slow = /\bblock(?:\s+(\d+))?\b/i.exec(text);
       if (slow) {
         // A turn that stays running for a while: the "busy agent" case. It
@@ -134,5 +142,31 @@ createInterface({ input: process.stdin }).on('line', line => {
       }
       break;
     }
+    case '_session/steering': {
+      const text = message.params.prompt.find(block => block.type === 'text')?.text ?? '';
+      send({
+        jsonrpc: '2.0',
+        method: 'session/update',
+        params: {
+          sessionId,
+          update: {
+            sessionUpdate: 'agent_message_chunk',
+            content: { type: 'text', text: `steer:${text}` },
+          },
+        },
+      });
+      send({
+        jsonrpc: '2.0',
+        id: message.id,
+        result: { outcome: activePromptId ? 'injected' : 'startedNewTurn' },
+      });
+      break;
+    }
+    case 'session/cancel':
+      if (activePromptId !== undefined) {
+        send({ jsonrpc: '2.0', id: activePromptId, result: { stopReason: 'cancelled' } });
+        activePromptId = undefined;
+      }
+      break;
   }
 });

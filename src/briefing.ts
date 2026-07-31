@@ -63,9 +63,9 @@ export function generateBriefing(role: ResolvedRole, v: BriefingVocab, opts: Bri
     : '   with a 1–2 sentence summary of your Charter above. Skip if it already matches.');
   L.push(`5. SET your **persona** (local operating contract, never shared in invites) via`);
   L.push(`   **${v.setPersonaTool}** with the **Charter** section above, verbatim. Skip if it matches.`);
-  // When the supervisor owns the monitor (monitor.enabled), the agent must NOT arm
+  // When the supervisor owns the monitor (monitor.mode=fleet), the agent must NOT arm
   // its own in-session watch — wakes are injected as [fleet-monitor] lines (design §5).
-  const wakeNote = role.monitor?.enabled
+  const wakeNote = role.monitor?.mode === 'fleet'
     ? v.supervisedWakeNote(id, role)
     : v.monitorInstruction(id, role);
   L.push(`6. ${wakeNote}`);

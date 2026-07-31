@@ -183,7 +183,7 @@ describe('doctor monitor probe (§5)', () => {
   };
 
   it('reports the daemon API reachable + authorized for a supervised role', async () => {
-    withRole('');   // monitor.enabled defaults true
+    withRole('');   // monitor.mode defaults fleet
     const rep = await doctor({}, green(), 'linux', stubFetch('ok'));
     const m = rep.checks.find(c => c.name === 'monitor: daemon API')!;
     expect(m).toBeTruthy();
@@ -283,7 +283,7 @@ describe('doctor monitor probe (§5)', () => {
 
   it('skips the probe entirely when no role is supervised', async () => {
     let called = false;
-    withRole('    monitor:\n      enabled: false\n');
+    withRole('    monitor:\n      mode: native\n');
     const spy: FetchLike = async (...a) => { called = true; return stubFetch('ok')(...a); };
     const rep = await doctor({}, green(), 'linux', spy);
     expect(rep.checks.find(c => c.name === 'monitor: daemon API')).toBeUndefined();

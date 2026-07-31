@@ -252,12 +252,14 @@ describe('loadConfig monitor', () => {
   it('resolves code-constant defaults when no monitor block is present', () => {
     base('roles:\n  A: {}\n');
     const a = findRole(loadConfig(), 'A');
+    expect(a.monitor.mode).toBe('fleet');
     expect(a.monitor.enabled).toBe(true);
     expect(a.monitor.wake_sources).toEqual([
       'message_received', 'file_received', 'local_contact_request', 'pending_message',
     ]);
     expect(a.monitor.batch_ms).toBe(2000);
     expect(a.monitor.inject).toBe('notification');
+    expect(a.monitor.interrupt).toBe(false);
   });
 
   it('inherits defaults.monitor.enabled and lets a role override it', () => {
@@ -267,12 +269,53 @@ describe('loadConfig monitor', () => {
     expect(findRole(cfg, 'B').monitor.enabled).toBe(true);
   });
 
+  it('selects fleet or native monitor ownership explicitly with monitor.mode', () => {
+    base(
+      'defaults:\n  monitor:\n    mode: native\nroles:\n  A: {}\n  B:\n'
+      + '    monitor:\n      mode: fleet\n',
+    );
+    const cfg = loadConfig();
+    expect(findRole(cfg, 'A').monitor).toMatchObject({ mode: 'native', enabled: false });
+    expect(findRole(cfg, 'B').monitor).toMatchObject({ mode: 'fleet', enabled: true });
+  });
+
+  it('lets explicit role mode override a legacy default enabled value', () => {
+    base(
+      'defaults:\n  monitor:\n    enabled: true\nroles:\n  A:\n'
+      + '    monitor:\n      mode: native\n',
+    );
+    expect(findRole(loadConfig(), 'A').monitor)
+      .toMatchObject({ mode: 'native', enabled: false });
+  });
+
+  it('rejects invalid or contradictory monitor modes', () => {
+    base('roles:\n  A:\n    monitor:\n      mode: external\n');
+    expect(() => loadConfig()).toThrowError(/monitor\.mode.*external.*fleet.*native/);
+    base('roles:\n  A:\n    monitor:\n      mode: native\n      enabled: true\n');
+    expect(() => loadConfig()).toThrowError(/mode 'native'.*conflicts.*enabled true/);
+  });
+
   it('merges role monitor over defaults.monitor key-by-key', () => {
     base('defaults:\n  monitor:\n    batch_ms: 5000\nroles:\n  A:\n    monitor:\n      wake_sources: [message_received]\n');
     const a = findRole(loadConfig(), 'A');
     expect(a.monitor.batch_ms).toBe(5000);            // from defaults
     expect(a.monitor.wake_sources).toEqual(['message_received']); // from role
     expect(a.monitor.enabled).toBe(true);             // code default
+  });
+
+  it('inherits monitor.interrupt and allows a per-role override', () => {
+    base(
+      'defaults:\n  monitor:\n    interrupt: true\nroles:\n  A: {}\n  B:\n'
+      + '    monitor:\n      interrupt: false\n',
+    );
+    const cfg = loadConfig();
+    expect(findRole(cfg, 'A').monitor.interrupt).toBe(true);
+    expect(findRole(cfg, 'B').monitor.interrupt).toBe(false);
+  });
+
+  it('rejects a non-boolean monitor.interrupt', () => {
+    base('roles:\n  A:\n    monitor:\n      interrupt: always\n');
+    expect(() => loadConfig()).toThrowError(/monitor\.interrupt.*true or false/);
   });
 
   it('accepts a role wake_sources subset', () => {

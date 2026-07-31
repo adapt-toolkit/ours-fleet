@@ -2,7 +2,8 @@ import type { Tmux } from '../tmux.js';
 import { randomUUID } from 'node:crypto';
 import { SessionControlError, turnResult } from './types.js';
 import type {
-  ExitRecord, QueuedPrompt, SessionEvent, SessionHandle, SessionSnapshot, TurnResult,
+  ExitRecord, QueuedPrompt, SessionEvent, SessionHandle, SessionSnapshot, SubmitPromptOptions,
+  TurnResult,
 } from './types.js';
 
 /** SessionHandle adapter for the existing tmux transport. */
@@ -28,10 +29,11 @@ export class TmuxSession implements SessionHandle {
     };
   }
 
-  async queuePrompt(text: string): Promise<QueuedPrompt> {
+  async queuePrompt(text: string, options: SubmitPromptOptions = {}): Promise<QueuedPrompt> {
     if (!this.isAlive())
       throw new SessionControlError('offline', `tmux pane for '${this.name}' is offline`);
     try {
+      if (options.interrupt) await this.interrupt();
       await this.tmux.sendText(this.name, text);
     } catch (error) {
       throw new SessionControlError('backend', (error as Error)?.message ?? String(error));
@@ -44,9 +46,9 @@ export class TmuxSession implements SessionHandle {
     };
   }
 
-  async submitPrompt(text: string): Promise<TurnResult> {
+  async submitPrompt(text: string, options: SubmitPromptOptions = {}): Promise<TurnResult> {
     try {
-      return await (await this.queuePrompt(text)).completion;
+      return await (await this.queuePrompt(text, options)).completion;
     } catch (error) {
       if (error instanceof SessionControlError) return turnResult(false, 'failed', error.message);
       throw error;

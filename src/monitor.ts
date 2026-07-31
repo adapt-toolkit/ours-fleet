@@ -57,7 +57,10 @@ export interface MonitorDeps {
    * not commit the cursor.
    */
   delivery?: {
-    submit(text: string): Promise<{ succeeded: boolean; outcome: string; detail?: string }>;
+    submit(
+      text: string,
+      options?: { interrupt?: boolean },
+    ): Promise<{ succeeded: boolean; outcome: string; detail?: string }>;
   };
 }
 
@@ -544,7 +547,7 @@ export class Monitor {
   private async deliver(pid: number, batch: NotifyEvent[]): Promise<boolean> {
     const line = formatNotificationLine(batch);
     if (this.deps.delivery) {
-      const result = await this.deps.delivery.submit(line);
+      const result = await this.deps.delivery.submit(line, { interrupt: this.cfg.interrupt });
       if (!result.succeeded) {
         // Name the reason: "refused" and "cancelled" are the agent's answer,
         // not a transport problem, and an operator has to be able to tell them
@@ -553,9 +556,11 @@ export class Monitor {
         return false;
       }
       this.recover('delivery', 'modal');
-      this.recordTurn('completed');
+      if (result.detail !== 'injected' && result.detail !== 'startedNewTurn')
+        this.recordTurn('completed');
       return true;
     }
+    if (this.cfg.interrupt) await this.deps.tmux.sendKey(this.name, 'C-c');
     const state = await this.awaitInjectable(pid);
     if (state !== 'ready') {
       if (state === 'offline') this.degrade('offline', 'offline during delivery');

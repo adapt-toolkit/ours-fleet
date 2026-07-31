@@ -126,6 +126,13 @@ export function turnResult(
   return { accepted, outcome, succeeded: isTerminalSuccess(outcome), detail };
 }
 
+export interface SubmitPromptOptions {
+  /** Cancel active work before delivering this prompt. */
+  interrupt?: boolean;
+  /** Use the ACP steering extension when available; ignored by other backends. */
+  steer?: boolean;
+}
+
 export interface SessionSnapshot {
   backend: SessionBackendId;
   alive: boolean;
@@ -183,9 +190,9 @@ export interface SessionHandle {
    * Hand the session a prompt and return as soon as it has accepted
    * responsibility for it. Throws `SessionControlError` if it cannot.
    */
-  queuePrompt(text: string): Promise<QueuedPrompt>;
+  queuePrompt(text: string, options?: SubmitPromptOptions): Promise<QueuedPrompt>;
   /** Queue a prompt and wait for its terminal result. */
-  submitPrompt(text: string): Promise<TurnResult>;
+  submitPrompt(text: string, options?: SubmitPromptOptions): Promise<TurnResult>;
   interrupt(): Promise<void>;
   respondPermission(permissionId: string, optionId: string): boolean;
   eventsSince(seq: number): SessionEvent[];

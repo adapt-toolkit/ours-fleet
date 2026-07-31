@@ -26,6 +26,7 @@ describe('ours-fleet CLI', () => {
     expect(r.stdout).toContain('● FleetCoordinator');
     expect(r.stdout).toContain('● Alice');
     expect(r.stdout).toContain('harness:     claude-code');
+    expect(r.stdout).toContain('monitor:     fleet (interrupt=false)');
     expect(r.stdout).toContain('oversees:    Alice@5m');
     expect(r.stdout).toContain('source:');
   });
@@ -47,6 +48,7 @@ describe('ours-fleet CLI', () => {
       expect(r.stdout).toContain('@agentclientprotocol/codex-acp');
       expect(r.stdout).toContain('bundled automatically');
       expect(r.stdout).toContain('Reliable mail wake');
+      expect(r.stdout).toContain('monitor.mode');
     }
   });
 

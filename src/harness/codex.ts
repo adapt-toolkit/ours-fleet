@@ -307,7 +307,7 @@ export function makeCodexAdapter(exec: Exec = realExec): HarnessAdapter {
         'appears, call **get_messages**, handle the mail, and reply with send_message.',
       launchNote: name => `You were launched as the fleet role \`${name}\` under a Codex session. Confirm you are running.`,
       restartPrompt: (id, worklog, configuredRole) => {
-        if (configuredRole?.monitor?.enabled)
+        if (configuredRole?.monitor?.mode === 'fleet')
           return `Session restarted. Re-bind your ours identity now (choose_identity name "${id}" force=true); ` +
             'your mail wakes are delivered by the fleet supervisor as `[fleet-monitor]` console lines, so do ' +
             `NOT arm arm_monitor/foreground_monitor. Continue from ${worklog}. Do not re-run whatever crashed you.`;

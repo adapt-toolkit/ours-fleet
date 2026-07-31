@@ -54,8 +54,8 @@ Each role gets a state dir (`~/.ours-fleet/agents/<Name>/`) holding its briefing
 logs, routines, and session markers. On boot the agent reads its briefing: bind
 identity, publish bio/persona, announce to its coordinator, work — while the
 supervisor delivers its mail wakes as `[fleet-monitor]` console lines (see
-[Mail monitor](#mail-monitor); `monitor.enabled: false` reverts to the agent
-arming its own `ours-mcp watch`). On crash the supervisor relaunches it and the
+[Mail monitor](#mail-monitor)). Set `monitor.mode: native` when the harness
+should own mail wake instead. On crash the supervisor relaunches it and the
 harness resumes the same session.
 
 The state dir contract:
@@ -124,6 +124,8 @@ ours-fleet spawn --temp Scout --mission "one-off research"   # gone on exit/rebo
 ours-fleet spawn Coder --harness codex --model gpt-5.4 \
   --session acp --approval ask --filesystem workspace \
   --profile fleet --search --monitor --coordinator FleetCoordinator
+# Note: --monitor is legacy consent for Codex's native monitor. Choose the
+# wake owner separately in fleet.yaml with monitor.mode: fleet|native.
 ```
 
 Permanent spawns are written to `~/fleet.d/<Name>.yaml` — your hand-written
@@ -191,8 +193,8 @@ defaults:
     unattended: deny                    # deny | wait
   model: claude-fable-5                 # default model for roles that don't set one (per-role model / --model wins)
   max_tokens: 500000                    # session cap (harness-interpreted)
-  monitor:                              # supervisor-owned mail wake (fleet-wide default)
-    enabled: true                       # default true; a role block overrides key-by-key
+  monitor:
+    mode: fleet                         # fleet (default) | native
 roles:
   Name:                                 # [A-Za-z0-9_-]+
     harness: claude-code
@@ -203,9 +205,9 @@ roles:
     identity: "Display Name"            # ours identity to bind (default: Name)
     cwd: ${work_root}/repo              # where the harness process runs
     coordinator: FleetCoordinator       # announce target on boot
-    monitor:                            # deterministic wake, owned by the supervisor
-      enabled: true                     # default (defaults.monitor.enabled ?? true);
-      #                                 #   false = legacy in-session `ours-mcp watch`
+    monitor:
+      mode: fleet                       # fleet = ours-fleet supervisor; native = harness monitor
+      interrupt: false                  # true cancels active work before every configured wake
       wake_sources:                     # which daemon events wake the console (default:
         - message_received              #   message_received, file_received,
         - file_received                 #   local_contact_request, pending_message)
@@ -374,21 +376,33 @@ their boots ~4 s apart instead of firing all seven at once.
 
 ### Mail monitor
 
-With `monitor.enabled` (the default), the **supervisor** delivers a role's mail
-wakes: the per-role runner long-polls the ours daemon's notification API and
+With `monitor.mode: fleet` (the default), the **ours-fleet supervisor** delivers
+a role's mail wakes: the per-role runner long-polls the ours daemon's notification API and
 submits a single `[fleet-monitor] N new messages from … — run get_messages` prompt
-through the selected backend. ACP uses structured `session/prompt`; tmux uses
-verified console input. It primes the notification cursor *before* the session launches
+through the selected backend. ACP uses live steering when its adapter supports it
+and falls back to structured `session/prompt`; tmux uses verified console input.
+Set `monitor.interrupt: true` on roles where every configured wake should cancel
+the active turn before the notification is delivered. This is intentionally
+content-blind: the supervisor cannot inspect encrypted message bodies, so all
+events selected by `wake_sources` receive the same interrupt policy.
+It primes the notification cursor *before* the session launches
 (no missed arrivals), cannot be orphaned or left deaf-but-armed, and writes its
 health to `<agentDir>/.monitor-status` (`armed | degraded | failed`), surfaced in
 `ours-fleet status`/`doctor`. Injection is held while the pane shows a modal dialog,
 so an injected wake can never answer a trust/permission prompt; if the dialog is
 still up after 2 minutes the monitor gives up on that wake and records
 `degraded: modal wedge …` instead of waiting silently forever (the mail stays
-queued and its cursor is not committed until a later delivery is accepted). The agent's
-briefing tells it **not** to arm an
-in-session Monitor. Set `monitor.enabled: false` to keep the legacy behavior where
-the agent arms its own `ours-mcp watch`. `inject: full` (pushing message bodies
+queued and its cursor is not committed until a later delivery is accepted). The
+agent's briefing tells it **not** to arm a native harness Monitor.
+
+With `monitor.mode: native`, ours-fleet does not start its supervisor monitor;
+the generated briefing instead instructs the harness to arm its own wake
+mechanism (`ours-mcp watch` for Claude Code, or the Codex
+`arm_monitor`/`foreground_monitor` flow). The old `monitor.enabled: true|false`
+form remains accepted as a compatibility alias for `fleet|native`, respectively,
+but new configuration should use `mode`.
+
+`inject: full` (pushing message bodies
 inline) is on the roadmap and needs two new ours-mcp daemon endpoints; today all
 roles deliver `notification` lines and drain via `get_messages`.
 
@@ -416,10 +430,11 @@ A role with `harness: codex` resolves its launcher at every supervised start:
 3. `launcher: ours-codex` makes the enhanced launcher mandatory and fails clearly if
    it is missing; `launcher: codex` explicitly selects standard mode.
 
-Monitoring remains consent-first. By default the generated briefing asks in the role's
-console before calling `arm_monitor`. Set `harness_options.monitor: true` (or pass
-`ours-fleet spawn --monitor`) to record explicit persistent consent for that role, including
-supervised restarts. In the standard-Codex fallback, the agent separately surfaces the
+Native Codex monitoring remains consent-first. By default the generated briefing asks in
+the role's console before calling `arm_monitor`. Set `harness_options.monitor: true` (or
+pass the legacy `ours-fleet spawn --monitor` flag) to record explicit persistent consent
+for the harness-native monitor, including supervised restarts. This does not choose the
+wake owner; use `monitor.mode: fleet|native` for that. In the standard-Codex fallback, the agent separately surfaces the
 `ours-codex` recommendation before asking to enter `foreground_monitor`. It never backgrounds
 `ours-mcp watch`, because a detached watch cannot wake a Codex turn. The foreground
 wait is re-entered after each handled message; `ours-codex` instead wakes the idle
@@ -436,7 +451,7 @@ defaults:
     profile: fleet                 # $CODEX_HOME/fleet.config.toml
     sandbox: workspace-write
     approval: on-request
-    monitor: true                  # explicit consent for unattended mail wake
+    monitor: true                  # consent for Codex's native monitor; not the wake-owner selector
     search: true
     add_dirs: [/data/shared]
     config:
@@ -449,7 +464,8 @@ roles:
 ```
 
 Equivalent one-off/permanent spawn controls include `--model`, `--permission-mode`,
-`--sandbox`, `--profile`, `--launcher`, `--search`, `--monitor`, repeatable
+`--sandbox`, `--profile`, `--launcher`, `--search`, legacy `--monitor` (native
+Codex monitor consent), repeatable
 `--codex-config key=value`, and repeatable `--add-dir`. Use `env.OURS_PORT`/`env.OURS_CONFIG` for a
 role-specific ours daemon, or configure the host default in `~/.ours/config.json`.
 
