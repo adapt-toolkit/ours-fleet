@@ -1,5 +1,7 @@
 import { describe, it, expect, beforeAll, beforeEach, afterEach } from 'vitest';
 import { mkdtempSync, rmSync } from 'node:fs';
+import { spawn } from 'node:child_process';
+import { once } from 'node:events';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { realExec } from '../src/exec.js';
@@ -86,6 +88,27 @@ describe('ours-fleet CLI', () => {
       'serve', 'install', 'start', 'stop', 'restart', 'status', 'uninstall', 'open', 'revoke-all',
     ]) expect(r.stdout).toContain(command);
     expect(r.stdout).not.toContain('#bootstrap=');
+  });
+
+  it('web serve accepts port zero for an isolated ephemeral listener', async () => {
+    const child = spawn(process.execPath, [CLI, 'web', 'serve', '--port', '0', '--no-open'], {
+      env: { ...process.env, OURS_FLEET_HOME: dir }, stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    let stdout = '';
+    child.stdout.setEncoding('utf8');
+    child.stdout.on('data', chunk => { stdout += chunk; });
+    try {
+      await Promise.race([
+        new Promise<void>(resolve => child.stdout.on('data', () => {
+          if (/ours-fleet web listening on http:\/\/127\.0\.0\.1:\d+/.test(stdout)) resolve();
+        })),
+        new Promise((_, reject) => setTimeout(() => reject(new Error('web serve did not listen')), 5_000)),
+      ]);
+      expect(stdout).toMatch(/ours-fleet web listening on http:\/\/127\.0\.0\.1:\d+/);
+    } finally {
+      child.kill('SIGTERM');
+      await once(child, 'exit');
+    }
   });
 
   it('docs and man print the AI-friendly configuration reference', async () => {

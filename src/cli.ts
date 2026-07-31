@@ -58,6 +58,7 @@ const passthrough = (cmd: string, args: string[]) =>
 const program = new Command()
   .name('ours-fleet')
   .description('Fleet of persistent, identity-bound AI agents — selectable harness and tmux/ACP sessions.')
+  .enablePositionalOptions()
   .version(VERSION);
 
 const cOpt = (cmd: Command) => cmd.option('-c, --configuration <file>', 'config file (default: ~/fleet.yaml + ~/fleet.d/)');
@@ -451,6 +452,7 @@ program.command('init').description('one-time host setup (units, dirs, linger)')
   });
 
 const webCommand = cOpt(program.command('web').description('start or open the secure localhost fleet web console'))
+  .enablePositionalOptions()
   .option('--port <port>', 'loopback service port (default: 49271)', value => {
     const port = Number(value);
     if (!Number.isInteger(port) || port < 1 || port > 65_535) throw new Error('invalid port');
