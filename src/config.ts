@@ -1,9 +1,12 @@
 import { existsSync, readFileSync, readdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { parse } from 'yaml';
-import { defaultConfigPath, fleetDDir } from './paths.js';
-import { validateIsolationConfig } from './isolation/policy.js';
-import type { IsolationConfig } from './isolation/types.js';
+import { agentDir, defaultConfigPath, fleetDDir, home } from './paths.js';
+import {
+  harnessRuntimeDir, resolveIsolation, validateIsolationConfig,
+} from './isolation/policy.js';
+import { getAdapter } from './harness/registry.js';
+import type { IsolationConfig, WrapContext } from './isolation/types.js';
 
 export interface OverseeEntry { role: string; interval: string }
 
@@ -14,6 +17,26 @@ export const NOTIFY_EVENT_TYPES = [
 ] as const;
 export type NotifyEventType = (typeof NOTIFY_EVENT_TYPES)[number];
 export type InjectMode = 'notification' | 'full';
+export type SessionBackendId = 'tmux' | 'acp';
+export type ApprovalMode = 'ask' | 'allow' | 'deny';
+export type FilesystemMode = 'read-only' | 'workspace' | 'unrestricted';
+export type UnattendedMode = 'deny' | 'wait';
+
+export interface CommonPermissions {
+  approval: ApprovalMode;
+  filesystem: FilesystemMode;
+  unattended: UnattendedMode;
+}
+
+export interface SessionOptions {
+  acp?: {
+    /** ACP agent command and arguments. Defaults are supplied by the harness adapter. */
+    command?: string | string[];
+  };
+  tmux?: {
+    boot_grace_ms?: number;
+  };
+}
 
 /** Resolved per-role supervisor-monitor config (see DESIGN-external-monitor §2). */
 export interface MonitorConfig {
@@ -75,6 +98,9 @@ export function validateMonitorConfig(raw: unknown): string[] {
 
 export interface RoleConfig {
   harness?: string;
+  session?: SessionBackendId;
+  session_options?: SessionOptions;
+  permissions?: Partial<CommonPermissions>;
   identity?: string;
   cwd?: string;
   coordinator?: string;
@@ -95,6 +121,15 @@ export interface RoleConfig {
 export interface ResolvedRole extends RoleConfig {
   name: string;
   harness: string;
+  session: SessionBackendId;
+  permissions: CommonPermissions;
+  /**
+   * Whether `permissions:` was actually written by the operator (on the role or
+   * in defaults), as opposed to resolved from built-in defaults. A role that
+   * states its intent only once — neutrally OR natively — has nothing to
+   * contradict, and must not be warned at (2.4).
+   */
+  permissionsDeclared: boolean;
   identity: string;
   sourceFile: string;
   monitor: MonitorConfig;
@@ -111,9 +146,37 @@ export interface FleetConfig {
 
 export class ConfigError extends Error {}
 
+/**
+ * The runtime facts the isolation resolver needs for a role. Single-sourced so
+ * config validation, doctor, and the runner all judge the SAME mount set — a
+ * policy checked against a different context than the one that launches is not
+ * a check at all.
+ */
+export function isolationContextFor(role: ResolvedRole): WrapContext {
+  const stateDir = agentDir(role.name, (role as ResolvedRole & { __temp?: boolean }).__temp === true);
+  const runCwd = role.cwd ?? stateDir;
+  // Ask the harness how its host state splits (5.1). An adapter that declares
+  // none keeps the historical whole-home mount.
+  let split: { home?: string; shared: string[] } | undefined;
+  try { split = getAdapter(role.harness).isolationPaths?.(role, { stateDir, runCwd }); }
+  catch { split = undefined; }
+  return {
+    stateDir,
+    runCwd,
+    home: home(),
+    harness: role.harness,
+    additionalWriteDirs: role.harness === 'codex'
+      ? ((role.harness_options as { add_dirs?: string[] } | undefined)?.add_dirs ?? [])
+      : [],
+    harnessHome: split?.home,
+    harnessRuntimeDir: split?.home ? harnessRuntimeDir(stateDir, role.harness) : undefined,
+    harnessSharedPaths: split?.shared,
+  };
+}
+
 const NAME_RE = /^[A-Za-z0-9_-]+$/;
 const ROLE_KEYS = [
-  'harness', 'identity', 'cwd', 'coordinator', 'mission', 'persona', 'bio',
+  'harness', 'session', 'session_options', 'permissions', 'identity', 'cwd', 'coordinator', 'mission', 'persona', 'bio',
   'briefing_file', 'model', 'max_tokens', 'autocompact_pct', 'env', 'oversee', 'harness_options',
   'isolation', 'monitor',
 ];
@@ -169,6 +232,11 @@ export function loadConfig(configPath?: string): FleetConfig {
         throw new ConfigError(
           `${file}: role '${name}' has unknown key(s) ${bad.join(', ')}; allowed: ${ROLE_KEYS.join(', ')}`);
       const isolation = r.isolation ?? (defaults.isolation as IsolationConfig | undefined);
+      const session = resolveSession(r.session ?? defaults.session, file, name);
+      const sessionOptions = resolveSessionOptions(
+        defaults.session_options, r.session_options, session, file, name);
+      const permissions = resolvePermissions(defaults.permissions, r.permissions, file, name);
+      const permissionsDeclared = r.permissions !== undefined || defaults.permissions !== undefined;
       const defaultHarnessOptions = defaults.harness_options;
       if (defaultHarnessOptions !== undefined
           && (typeof defaultHarnessOptions !== 'object' || defaultHarnessOptions === null
@@ -191,6 +259,10 @@ export function loadConfig(configPath?: string): FleetConfig {
         name,
         sourceFile: file,
         harness: r.harness ?? (defaults.harness as string | undefined) ?? 'claude-code',
+        session,
+        session_options: sessionOptions,
+        permissions,
+        permissionsDeclared,
         identity: r.identity ?? name,
         model: r.model ?? (defaults.model as string | undefined),
         max_tokens: r.max_tokens ?? (defaults.max_tokens as number | undefined),
@@ -198,9 +270,102 @@ export function loadConfig(configPath?: string): FleetConfig {
         isolation,
         monitor,
       });
+      // Forbidden-path enforcement (5.2): a mount that would breach the policy
+      // is a configuration error, caught by `config` rather than at launch.
+      if (isolation !== undefined) {
+        const role = roles[roles.length - 1];
+        try { resolveIsolation(isolation, isolationContextFor(role)); }
+        catch (e) {
+          throw new ConfigError(`${file}: role '${name}' ${(e as Error).message}`);
+        }
+      }
     }
   }
   return { roles, vars, defaults, files, startStaggerMs };
+}
+
+function resolveSession(raw: unknown, file: string, name: string): SessionBackendId {
+  const value = raw ?? 'tmux';
+  if (value !== 'tmux' && value !== 'acp')
+    throw new ConfigError(`${file}: role '${name}' session: must be one of: tmux, acp`);
+  return value;
+}
+
+function resolveSessionOptions(
+  defaults: unknown, role: SessionOptions | undefined, session: SessionBackendId,
+  file: string, name: string,
+): SessionOptions | undefined {
+  if (defaults !== undefined && !isPlainObject(defaults))
+    throw new ConfigError(`${file}: defaults.session_options must be a map`);
+  if (role !== undefined && !isPlainObject(role))
+    throw new ConfigError(`${file}: role '${name}' session_options must be a map`);
+  const merged = {
+    ...((defaults ?? {}) as SessionOptions),
+    ...(role ?? {}),
+    acp: {
+      ...(((defaults as SessionOptions | undefined)?.acp) ?? {}),
+      ...(role?.acp ?? {}),
+    },
+    tmux: {
+      ...(((defaults as SessionOptions | undefined)?.tmux) ?? {}),
+      ...(role?.tmux ?? {}),
+    },
+  };
+  const bad = Object.keys(merged).filter(k => k !== 'acp' && k !== 'tmux');
+  if (bad.length)
+    throw new ConfigError(`${file}: role '${name}' session_options: unknown key(s) ${bad.join(', ')}`);
+  if (!isPlainObject(merged.acp) || !isPlainObject(merged.tmux))
+    throw new ConfigError(`${file}: role '${name}' session_options.${session} must be a map`);
+  const acpBad = Object.keys(merged.acp).filter(k => k !== 'command');
+  const tmuxBad = Object.keys(merged.tmux).filter(k => k !== 'boot_grace_ms');
+  if (acpBad.length)
+    throw new ConfigError(`${file}: role '${name}' session_options.acp: unknown key(s) ${acpBad.join(', ')}`);
+  if (tmuxBad.length)
+    throw new ConfigError(`${file}: role '${name}' session_options.tmux: unknown key(s) ${tmuxBad.join(', ')}`);
+  const command = merged.acp.command;
+  if (command !== undefined
+      && !(typeof command === 'string' && command.trim())
+      && !(Array.isArray(command) && command.length > 0
+        && command.every(v => typeof v === 'string' && v.length > 0)))
+    throw new ConfigError(
+      `${file}: role '${name}' session_options.acp.command must be a non-empty string or string list`);
+  const grace = merged.tmux.boot_grace_ms;
+  if (grace !== undefined
+      && (typeof grace !== 'number' || !Number.isFinite(grace) || grace < 0))
+    throw new ConfigError(
+      `${file}: role '${name}' session_options.tmux.boot_grace_ms must be a non-negative number`);
+  return Object.keys(merged.acp).length || Object.keys(merged.tmux).length ? merged : undefined;
+}
+
+export function resolvePermissions(
+  defaults: unknown, role: Partial<CommonPermissions> | undefined,
+  file = 'config', name = 'role',
+): CommonPermissions {
+  if (defaults !== undefined && !isPlainObject(defaults))
+    throw new ConfigError(`${file}: defaults.permissions must be a map`);
+  if (role !== undefined && !isPlainObject(role))
+    throw new ConfigError(`${file}: role '${name}' permissions must be a map`);
+  const merged = {
+    ...((defaults ?? {}) as Partial<CommonPermissions>),
+    ...(role ?? {}),
+  };
+  const allowed = ['approval', 'filesystem', 'unattended'];
+  const bad = Object.keys(merged).filter(k => !allowed.includes(k));
+  if (bad.length)
+    throw new ConfigError(`${file}: role '${name}' permissions: unknown key(s) ${bad.join(', ')}`);
+  if (merged.approval !== undefined && !['ask', 'allow', 'deny'].includes(merged.approval))
+    throw new ConfigError(`${file}: role '${name}' permissions.approval must be one of: ask, allow, deny`);
+  if (merged.filesystem !== undefined
+      && !['read-only', 'workspace', 'unrestricted'].includes(merged.filesystem))
+    throw new ConfigError(
+      `${file}: role '${name}' permissions.filesystem must be one of: read-only, workspace, unrestricted`);
+  if (merged.unattended !== undefined && !['deny', 'wait'].includes(merged.unattended))
+    throw new ConfigError(`${file}: role '${name}' permissions.unattended must be one of: deny, wait`);
+  return {
+    approval: merged.approval ?? 'ask',
+    filesystem: merged.filesystem ?? 'workspace',
+    unattended: merged.unattended ?? 'deny',
+  };
 }
 
 /** Validate the top-level `start_stagger_ms` (supervisor launch spacing); default 0. */

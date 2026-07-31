@@ -6,12 +6,24 @@ import type { FleetConfig, ResolvedRole } from './config.js';
 import { findRole } from './config.js';
 import { getAdapter } from './harness/registry.js';
 import { generateBriefing } from './briefing.js';
-import type { SupervisorBackend } from './supervisor/types.js';
+import { resetRestartLedger } from './runner.js';
+import type { InstallOutcome as BackendInstallOutcome, SupervisorBackend } from './supervisor/types.js';
+
+/** An install outcome tagged with the role it belongs to. */
+export interface InstallOutcome extends BackendInstallOutcome { role: string }
 
 export interface OpsDeps {
   backend: SupervisorBackend;
   binPath: string;
   log(line: string): void;
+  /**
+   * Called the INSTANT a registration is created, before anything else can
+   * fail. A creation transaction that learns about registrations only from
+   * `up()`'s return value learns nothing when `up()` throws — and the service
+   * it just registered is then invisible to rollback (6.2). Optional: plain
+   * `ours-fleet up` has no transaction to tell.
+   */
+  onInstalled?(outcome: InstallOutcome): void;
 }
 
 // Launch staggering now lives at the harness-launch point (the runner's start
@@ -22,7 +34,11 @@ export interface OpsDeps {
 
 /** Materialize a role's state dir from config: briefing + markers. Returns the dir. */
 export function applyRole(
-  role: ResolvedRole, opts: { fresh?: boolean; temp?: boolean; configPath?: string } = {},
+  role: ResolvedRole,
+  opts: {
+    fresh?: boolean; temp?: boolean; configPath?: string;
+    identityGuarantee?: 'verified' | 'created' | 'unverified';
+  } = {},
 ): string {
   const adapter = getAdapter(role.harness);
   const errs = adapter.validateOptions(role.harness_options);
@@ -44,6 +60,7 @@ export function applyRole(
   writeFileSync(join(dir, 'briefing.md'), generateBriefing(role, adapter.vocabulary, {
     stateDir: dir, worklogPath: join(dir, 'WORKLOG.md'),
     routinesPath: join(dir, 'ROUTINES.md'), briefingBody,
+    identityGuarantee: opts.identityGuarantee,
   }));
   if (opts.fresh)
     for (const f of ['.booted', '.session-id', '.exit-status']) rmSync(join(dir, f), { force: true });
@@ -57,21 +74,43 @@ function selectRoles(cfg: FleetConfig, names: string[]): ResolvedRole[] {
 /** Create/start roles declaratively. Idempotent; active roles keep their context. */
 export async function up(
   cfg: FleetConfig, names: string[], deps: OpsDeps, configPath?: string,
-): Promise<void> {
+  identityGuarantee?: 'verified' | 'created' | 'unverified',
+): Promise<InstallOutcome[]> {
+  const outcomes: InstallOutcome[] = [];
   for (const role of selectRoles(cfg, names)) {
-    const dir = applyRole(role, { configPath });
-    // If the role isn't running, boot fresh so it reads the briefing we just wrote.
-    const status = await deps.backend.status(role.name).catch(() => '');
-    if (!/running|active \(/.test(status)) rmSync(join(dir, '.booted'), { force: true });
-    await deps.backend.install(role.name, deps.binPath);
+    const dir = applyRole(role, { configPath, identityGuarantee });
+    // Only a *definite* stop boots fresh so the role reads the briefing we just
+    // wrote. A running, restarting, or unprobeable role keeps its context —
+    // guessing "stopped" from an unanswered probe silently discards a live
+    // conversation.
+    // An explicit operator `up` is the sanctioned way to release a held-down
+    // role: the still-alive runner polls this file and resumes (3.2).
+    resetRestartLedger(dir);
+    const live = await deps.backend.liveness(role.name)
+      .catch(e => ({ state: 'unknown' as const, detail: e instanceof Error ? e.message : String(e) }));
+    if (live.state === 'stopped') rmSync(join(dir, '.booted'), { force: true });
+    else if (live.state === 'unknown')
+      deps.log(`  ! ${role.name}: liveness unknown, keeping session context — ${live.detail}`);
+    // Report what each install actually did, so a creation transaction can undo
+    // only the registrations IT made (6.2). Announced immediately as well as
+    // returned: a later role in this same loop can throw, and the registrations
+    // already made must still be undoable.
+    const outcome = { ...await deps.backend.install(role.name, deps.binPath), role: role.name };
+    if (outcome.created) deps.onInstalled?.(outcome);
+    outcomes.push(outcome);
     deps.log(`↑ up: ${role.name} (harness: ${role.harness}, identity: ${role.identity}${role.cwd ? `, cwd: ${role.cwd}` : ''})`);
   }
+  return outcomes;
 }
 
 export async function down(cfg: FleetConfig, names: string[], deps: OpsDeps): Promise<void> {
   for (const role of selectRoles(cfg, names)) {
+    // Never swallow the backend's reason. "maybe not running" hid real stop
+    // failures — a wedged unit, an unreachable user bus — behind a guess.
     try { await deps.backend.stop(role.name); deps.log(`■ stopped ${role.name}`); }
-    catch { deps.log(`  (could not stop ${role.name} — maybe not running)`); }
+    catch (e) {
+      deps.log(`  ! could not stop ${role.name}: ${e instanceof Error ? e.message : String(e)}`);
+    }
   }
 }
 
@@ -80,7 +119,8 @@ export async function restartRoles(
   cfg: FleetConfig, names: string[], deps: OpsDeps, mode: 'keep' | 'fresh', configPath?: string,
 ): Promise<void> {
   for (const role of selectRoles(cfg, names)) {
-    applyRole(role, { fresh: mode === 'fresh', configPath });
+    const dir = applyRole(role, { fresh: mode === 'fresh', configPath });
+    resetRestartLedger(dir);                    // explicit restart closes the circuit
     await deps.backend.restart(role.name);
     deps.log(mode === 'fresh'
       ? `↻ ${role.name} — force-restarted (FRESH — context cleared, briefing reloaded)`

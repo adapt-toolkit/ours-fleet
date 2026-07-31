@@ -1,8 +1,10 @@
 import { userInfo } from 'node:os';
 import { readFileSync } from 'node:fs';
 import { realExec, type Exec } from './exec.js';
-import { loadConfig, type ResolvedRole } from './config.js';
-import { getAdapter } from './harness/registry.js';
+import { isolationContextFor, loadConfig, type ResolvedRole } from './config.js';
+import { getAdapter, productionAdapters } from './harness/registry.js';
+import { analyzeFleetPermissions, formatNative } from './permissions.js';
+import { resolveBundledAcpAgent } from './harness/acp-agent.js';
 import { agentDir, home, deriveXdgRuntimeDir } from './paths.js';
 import { resolveIsolation } from './isolation/policy.js';
 import { makeBubblewrapBackend } from './isolation/bubblewrap.js';
@@ -58,11 +60,25 @@ export async function doctor(
     detail: major >= 20 ? `v${process.versions.node}` : `v${process.versions.node} — need >= 20`,
   });
 
-  const tmux = await exec('tmux', ['-V']);
-  checks.push({
-    name: 'tmux', ok: tmux.code === 0,
-    detail: tmux.code === 0 ? tmux.stdout.trim() : 'not found — apt install tmux / brew install tmux',
-  });
+  // The configuration is a checked prerequisite in its own right. A config the
+  // `config` command rejects must fail here too, with the same cause — while the
+  // host checks below still run, because they are what the operator needs next.
+  const loaded = loadConfigResult(opts.configPath);
+  const roles = loaded.ok ? loaded.roles : [];
+  checks.push(loaded.ok
+    ? { name: 'config', ok: true, detail: loaded.files.join(' + ') || '(none — no fleet.yaml or fleet.d)' }
+    : { name: 'config', ok: false, detail: loaded.error });
+  checks.push(loaded.ok
+    ? { name: 'roles', ok: true, detail: `${roles.length} configured` }
+    : { name: 'roles', ok: false, detail: 'unknown — the configuration did not load' });
+
+  if (roles.length === 0 || roles.some(role => (role.session ?? 'tmux') === 'tmux')) {
+    const tmux = await exec('tmux', ['-V']);
+    checks.push({
+      name: 'tmux', ok: tmux.code === 0,
+      detail: tmux.code === 0 ? tmux.stdout.trim() : 'not found — apt install tmux / brew install tmux',
+    });
+  }
 
   const mcp = await exec('ours-mcp', ['--version']);
   checks.push({
@@ -99,11 +115,52 @@ export async function doctor(
     });
   }
 
+  // Per-role permission translation (2.3). Rendered from the same analysis the
+  // `config` command prints, so the two commands cannot disagree.
+  for (const analysis of analyzeFleetPermissions(roles)) {
+    if (!analysis.supported) {
+      checks.push({
+        name: `permissions: ${analysis.role}`, ok: false,
+        detail: analysis.warnings.join('; '),
+      });
+      continue;
+    }
+    const p = analysis.permissions;
+    const summary = `approval=${p.approval} filesystem=${p.filesystem} unattended=${p.unattended}`
+      + ` -> ${formatNative(analysis.native)}`;
+    checks.push({
+      name: `permissions: ${analysis.role}`, ok: true,
+      detail: analysis.warnings.length
+        ? `${summary} — ${analysis.warnings.join('; ')}`
+        : `${summary} (exact)`,
+    });
+
+    // A role that states its permission intent twice, in two disagreeing places
+    // (2.4). Quiet when there is a single source of intent.
+    for (const conflict of analysis.conflicts ?? [])
+      checks.push({
+        name: `permission conflict: ${analysis.role}`, ok: true, detail: conflict.warning,
+      });
+
+    // The floor is checked BEFORE start (2.1): an under-permissioned unattended
+    // role never reports its own failure, because the denial happens inside the
+    // harness with nobody attached to see it.
+    const floor = analysis.floor!;
+    checks.push({
+      name: `unattended floor: ${analysis.role}`,
+      ok: floor.meets || analysis.floorSeverity !== 'fail',
+      detail: floor.meets
+        ? `grants ${analysis.capabilities!.join(', ')}`
+        : `MISSING ${floor.missing.join(', ')} — with unattended=${p.unattended} these requests will `
+          + `${p.unattended === 'deny' ? 'be denied silently' : 'block the turn'}; `
+          + `grants only ${analysis.capabilities!.join(', ') || '(nothing)'}`,
+    });
+  }
+
   // Isolation reporting (AC-9). Backend availability is advisory — isolation is
   // opt-in per role (OQ-1), so a missing bwrap must not fail doctor for fleets that
   // don't use it. Only a role that DECLARES isolation and cannot get it under
   // `strict` is a hard failure.
-  const roles = loadConfigSafe(opts.configPath);
   const bw = await makeBubblewrapBackend(exec).available();
   checks.push({
     name: 'isolation: bubblewrap', ok: true,
@@ -114,13 +171,13 @@ export async function doctor(
   if (platform === 'linux')
     checks.push({ name: 'isolation: cgroup delegation', ok: true, detail: cgroupDelegationDetail() });
   for (const r of roles.filter(r => r.isolation)) {
-    const stateDir = agentDir(r.name);
-    const policy = resolveIsolation(r.isolation!, {
-      stateDir, runCwd: r.cwd ?? stateDir, home: home(), harness: r.harness,
-      additionalWriteDirs: r.harness === 'codex'
-        ? ((r.harness_options as { add_dirs?: string[] } | undefined)?.add_dirs ?? [])
-        : [],
-    });
+    // A refused mount is a launch-blocking policy error (5.2), not a warning.
+    let policy;
+    try { policy = resolveIsolation(r.isolation!, isolationContextFor(r)); }
+    catch (e) {
+      checks.push({ name: `isolation: ${r.name}`, ok: false, detail: (e as Error).message });
+      continue;
+    }
     const caps = [
       policy.resources.mem && `mem=${policy.resources.mem}`,
       policy.resources.cpu && `cpu=${policy.resources.cpu}`,
@@ -170,9 +227,14 @@ export async function doctor(
     checks.push({ name: checkName, ok, detail });
   }
 
+  // A broken config resolves no roles and therefore no harnesses. Without a
+  // fallback the AI CLI prerequisites would simply vanish from the report at
+  // exactly the moment the operator is trying to work out what is wrong.
   const harnesses = opts.harness
     ? [opts.harness]
-    : [...new Set(roles.map(r => r.harness))];
+    : loaded.ok
+      ? [...new Set(roles.map(r => r.harness))]
+      : productionAdapters();
   for (const h of harnesses) {
     try {
       const rep = await getAdapter(h).checkPrereqs();
@@ -181,10 +243,68 @@ export async function doctor(
       checks.push({ name: h, ok: false, detail: (e as Error).message });
     }
   }
+  for (const role of roles.filter(role => role.session === 'acp')) {
+    const configured = role.session_options?.acp?.command;
+    const bundled = configured == null
+      ? role.harness === 'codex'
+        ? resolveBundledAcpAgent(
+            '@agentclientprotocol/codex-acp', 'codex-acp', 'codex-acp')
+        : role.harness === 'claude-code'
+          ? resolveBundledAcpAgent(
+              '@agentclientprotocol/claude-agent-acp', 'claude-agent-acp', 'claude-agent-acp')
+          : undefined
+      : undefined;
+    const command = Array.isArray(configured)
+      ? configured[0]
+      : typeof configured === 'string'
+        ? configured.trim().split(/\s+/)[0]
+        : role.harness === 'codex'
+          ? 'codex-acp'
+          : role.harness === 'claude-code'
+            ? 'claude-agent-acp'
+            : '';
+    if (!command) {
+      checks.push({
+        name: `acp: ${role.name}`, ok: false,
+        detail: `harness '${role.harness}' has no default ACP agent; set session_options.acp.command`,
+      });
+      continue;
+    }
+    if (bundled?.bundled) {
+      checks.push({
+        name: `acp: ${role.name}`, ok: true,
+        detail: `${command} bundled with ours-fleet`,
+      });
+      continue;
+    }
+    const result = await exec('sh', ['-c', 'command -v "$1" >/dev/null 2>&1', 'sh', command]);
+    checks.push({
+      name: `acp: ${role.name}`,
+      ok: result.code === 0,
+      detail: result.code === 0
+        ? `${command} available`
+        : `${command} not found or failed — install the ACP adapter or set session_options.acp.command`,
+    });
+  }
 
   return { ok: checks.every(c => c.ok), checks };
 }
 
-function loadConfigSafe(configPath?: string) {
-  try { return loadConfig(configPath).roles; } catch { return []; }
+/**
+ * Loading the configuration either works or fails for a stated reason. The old
+ * `loadConfigSafe()` swallowed the reason and returned `[]`, which is
+ * indistinguishable from a valid fleet with no roles — so doctor reported a
+ * clean bill of health for a configuration `ours-fleet config` refuses outright.
+ */
+type ConfigLoad =
+  | { ok: true; roles: ResolvedRole[]; files: string[] }
+  | { ok: false; error: string };
+
+function loadConfigResult(configPath?: string): ConfigLoad {
+  try {
+    const cfg = loadConfig(configPath);
+    return { ok: true, roles: cfg.roles, files: cfg.files };
+  } catch (e) {
+    return { ok: false, error: e instanceof Error ? e.message : String(e) };
+  }
 }

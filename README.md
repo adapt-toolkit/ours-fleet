@@ -8,8 +8,8 @@ harnesses — from one declarative file.**
 An AI coding agent in a terminal dies when you close the laptop. `ours-fleet`
 turns such sessions into **roles**: long-lived agents that
 
-- **live in a detached tmux console** you can attach to, peek at, or type into at
-  any time,
+- **run through a selectable session backend** — existing detached tmux consoles
+  or structured ACP sessions — which you can attach to, peek at, or prompt,
 - are **supervised** — systemd (Linux) or launchd (macOS) restarts them on crash
   and brings them back after a reboot,
 - **resume their context** across restarts (when the harness supports it),
@@ -44,7 +44,8 @@ roles:
 ~/fleet.yaml + ~/fleet.d/*.yaml           your declaration
         │  ours-fleet up
         ▼
- briefing.md per role  ──►  tmux session  ──►  harness CLI (claude …)
+briefing.md per role  ──►  tmux session  ──►  harness CLI (claude …)
+                       └─►  ACP client   ──►  ACP agent (codex-acp …)
         ▲                        │
  systemd --user / launchd ───────┘   restart on crash, start at boot/login
 ```
@@ -65,13 +66,16 @@ The state dir contract:
 | `WORKLOG.md` | the agent | seeded empty, agent-appended; survives restarts |
 | `ROUTINES.md` | operator / agent | **optional** recurring-work instructions; re-read at the start of every wake, hot-editable **without a restart**; absence means "no routines" |
 | `.identity`, `.cwd`, `.session-id`, `.booted`, `.exit-status`, `.config-path` | supervisor | dot-marker state — session resume and boot bookkeeping |
+| `.monitor-state.json`, `.monitor-status` | supervisor monitor | atomic body-free cursor/pending state and health |
+| `.session-events.jsonl`, `.control.sock`, `.control-token` | ACP backend | bounded typed console projection and private attachment control |
 
 ## Prerequisites
 
 | What | Why | Install |
 |---|---|---|
 | Node ≥ 20 | runs `ours-fleet` itself | nodejs.org, `apt`, or `brew` |
-| tmux | every role's console | `apt install tmux` / `brew install tmux` |
+| tmux | roles using `session: tmux` (the default) | `apt install tmux` / `brew install tmux` |
+| Node ≥ 22 | Claude roles using `session: acp` | required by the maintained Claude ACP adapter |
 | a harness CLI, logged in | the agent itself | e.g. Claude Code (`claude`) or Codex CLI (`codex`) |
 | `ours-mcp` daemon | identity + agent-to-agent messaging | `npm i -g @ours.network/mcp && ours-mcp start` |
 
@@ -86,6 +90,12 @@ npm i -g @ours.network/fleet
 ours-fleet init      # units/dirs/linger for this user
 ours-fleet doctor    # verifies everything above, with actionable messages
 ```
+
+The maintained Codex and Claude ACP adapters install as optional dependencies of
+`ours-fleet` and are resolved internally; users do not install adapter commands
+or add them to `PATH`. An explicit `session_options.acp.command` remains
+available for custom adapters. On Node 20–21, tmux and Codex ACP remain
+available, while maintained Claude ACP requires upgrading to Node 22.
 
 Each OS user manages their own fleet — to host roles under a sandboxed account,
 become that account and repeat.
@@ -112,28 +122,18 @@ ours-fleet spawn --temp Scout --mission "one-off research"   # gone on exit/rebo
 
 # Codex role: ours-codex is preferred automatically; plain codex is the fallback
 ours-fleet spawn Coder --harness codex --model gpt-5.4 \
-  --permission-mode on-request --sandbox workspace-write \
+  --session acp --approval ask --filesystem workspace \
   --profile fleet --search --monitor --coordinator FleetCoordinator
 ```
 
 Permanent spawns are written to `~/fleet.d/<Name>.yaml` — your hand-written
 `~/fleet.yaml` is **never** machine-edited. `ours-fleet rm <Name>` unspawns.
 
-From inside Claude Code: install the `ours-fleet` plugin (ships in this repo under
-`integrations/claude-code`) and say **"spawn ours agent …"** — the agent asks
-temp-vs-permanent, co-drafts the bio and persona with you, spawns, and arms
-oversight.
-
-From inside Codex, install the native fleet plugin:
-
-```sh
-npm i -g @ours.network/fleet-codex
-ours-fleet-codex-install
-```
-
-Start a new Codex session and say **"spawn an ours agent …"**. The bundled skill
-walks through lifetime, model, sandbox, approval policy, profile, launcher, and
-mail-monitor consent, then verifies the real tmux session and offers oversight.
+From inside Claude Code, Codex, or Hermes with the core `ours` plugin installed,
+say **"spawn an ours agent …"**. The core skill checks for `ours-fleet`, installs
+and initializes it when absent, then consults `ours-fleet docs` for the exact
+version-matched workflow. The older fleet-specific harness packages remain
+published for compatibility but are no longer required or installed by default.
 
 ## Oversight ("keep an eye")
 
@@ -161,11 +161,12 @@ roles:
 ## Command reference
 
 ```
+ours-fleet docs | man                 AI-friendly complete reference
 ours-fleet up|down|restart|force-restart [-c FILE] [Name...]
 ours-fleet config [-c FILE]         validate + print merged plan
 ours-fleet ls | attach | peek | logs [-f] | status <Name>
 ours-fleet send <Name> "text" | --key <K>
-ours-fleet spawn [--temp] <Name> [--harness --mission --model --permission-mode ...]
+ours-fleet spawn [--temp] <Name> [--harness --session --mission --model --approval ...]
 ours-fleet rm <Name>
 ours-fleet doctor [--harness H]
 ours-fleet init
@@ -183,6 +184,11 @@ vars: { work_root: /home/me/work }      # ${var} substitution anywhere below
 start_stagger_ms: 0                     # delay between agent LAUNCHES (host-wide, ms); 0 = no stagger
 defaults:
   harness: claude-code                  # for roles that don't set one
+  session: tmux                         # tmux (default) | acp
+  permissions:                         # common intent, translated by each harness/backend
+    approval: ask                       # ask | allow | deny
+    filesystem: workspace               # read-only | workspace | unrestricted
+    unattended: deny                    # deny | wait
   model: claude-fable-5                 # default model for roles that don't set one (per-role model / --model wins)
   max_tokens: 500000                    # session cap (harness-interpreted)
   monitor:                              # supervisor-owned mail wake (fleet-wide default)
@@ -190,6 +196,10 @@ defaults:
 roles:
   Name:                                 # [A-Za-z0-9_-]+
     harness: claude-code
+    session: acp                         # one flag selects ACP; omit for tmux
+    session_options:
+      acp:
+        command: claude-agent-acp        # optional advanced override
     identity: "Display Name"            # ours identity to bind (default: Name)
     cwd: ${work_root}/repo              # where the harness process runs
     coordinator: FleetCoordinator       # announce target on boot
@@ -236,10 +246,113 @@ roles:
 
 Merge order: `fleet.yaml` ← `fleet.d/*.yaml`; a duplicate role name is a hard
 error naming both files. Identities and roles are decoupled — removing a role
-never deletes an identity. `defaults.harness_options` is shallow-merged with each
+never deletes an identity. `session` is independent of `harness`, so changing a
+role from tmux to ACP does not change its identity, mission, monitor, or permission
+contract. `defaults.harness_options` is shallow-merged with each
 role's `harness_options`, so a fleet can set common Codex permission/profile defaults
 and override individual keys per role. `monitor` merges the same way — a role block
 overrides `defaults.monitor` key-by-key.
+
+### Never-prompt failure
+
+An unattended role has no console, so a permission request has nobody to answer
+it and is refused **inside the harness** — no prompt, no error, no log line. The
+agent does less than its briefing told it to, reports success, and nothing
+distinguishes that from having done the work. It is caused by a permission mode
+that suppresses the prompt without granting the action (Claude `dontAsk`), or by
+`unattended: deny`.
+
+Automatic decisions are now recorded rather than invisible. Every permission
+decided without a human is written to
+`~/.ours-fleet/agents/<Name>/.session-events.jsonl` with the decision, whether
+policy or a person made it, which policy produced it, the reason, and the option
+chosen — and `ours-fleet peek`/`attach` render them. Automatic denial always
+asks for a one-shot rejection, never a standing one, so one unattended refusal
+cannot disable a tool for the rest of the session. A role that can auto-deny
+says so once at startup.
+
+To catch this **before** a role runs, see the capability floor below —
+`ours-fleet doctor` fails an under-permissioned unattended role rather than
+letting it discover the problem silently.
+
+### The unattended capability floor
+
+A fleet role runs with no console attached, so a permission request has nobody
+to answer it and is refused inside the harness — silently. The agent then does
+less than its briefing told it to and reports no error at all.
+
+`ours-fleet config` and `ours-fleet doctor` therefore resolve each role's
+neutral `permissions:` through its harness adapter and check what the resulting
+native settings actually grant, against a fixed floor:
+
+| capability | what the role must be able to do |
+| --- | --- |
+| `read-state` | read its briefing, `ROUTINES.md`, and `WORKLOG.md` |
+| `write-state` | append its `WORKLOG.md` and its own state files |
+| `messaging` | bind its identity, send and receive ours mail |
+| `monitor` | arm and observe its mail monitor |
+| `workspace-edit` | edit and test files in its working directory |
+| `status-commands` | run the inspection commands its briefing prescribes |
+
+`doctor` reports this per role as `unattended floor: <Role>`. A role configured
+`unattended: deny` that cannot meet the floor **fails** doctor — it would deny
+those requests with nobody to see it. With `unattended: wait` it **warns**,
+since a human can still attach a console and answer.
+
+**Security meaning.** `approval: allow` maps to Claude's `bypassPermissions`,
+the mode that actually permits the actions the role was authorized to take.
+`dontAsk` suppresses only the *prompt*, not the denial, which is why an
+`allow` role previously ran unable to do its job. Nothing but an explicit
+`allow` is elevated: `ask` keeps Claude's default mode and `deny` maps to
+`plan`. `allow` is a real grant — give it deliberately, and keep per-role
+[`isolation:`](#agent-isolation) as the outer boundary, which no permission
+mode can cross.
+
+### Isolation at creation time
+
+```sh
+ours-fleet spawn Sec --isolation-file policy.yaml
+ours-fleet spawn --temp Scout --isolation-file policy.yaml
+```
+
+`--isolation-file` supplies the role's sandbox policy when it is created, so its
+**first** launch is already confined. Without it a role gains `isolation:` only when
+you edit `fleet.yaml` and run `up`, and everything before that ran unsandboxed.
+
+The file contains exactly the [`isolation:` mapping](#agent-isolation) — the same schema,
+validated by the same code, so it cannot mean something different from the identical block
+in `fleet.yaml`:
+
+```yaml
+network: deny
+fs:
+  read: [/opt/reference]
+resources:
+  mem: 2G
+```
+
+An invalid file is rejected before anything is created — no config, no state directory, no
+identity reservation.
+
+### Sandboxed credentials and configuration
+
+A sandboxed role gets a **per-role writable harness home** under its own state directory
+(`<state>/harness/<harness>/`), so its sessions, history and caches are its own and are
+invisible to every other role. The **shared** credentials, global instructions and
+configuration are layered back read-only:
+
+| Harness | Read-only (shared) | Per-role writable |
+| --- | --- | --- |
+| `claude-code` | `~/.claude.json`, `~/.claude/CLAUDE.md`, `settings.json`, `plugins/` | everything else under `~/.claude` |
+| `codex` | `~/.codex/auth.json`, `config.toml`, `AGENTS.md`, `plugins/`, `~/.agents` | everything else under `~/.codex` |
+
+An agent can read the credentials it needs and cannot rewrite them, cannot edit the
+instructions every role shares, and cannot alter a peer's configuration. Claude pre-trust
+stays a host-side step performed by the fleet.
+
+The forbidden-path list is enforced, not advisory: a role that asks for `~/.ssh`, the ours
+key store, a sibling's state directory — or a parent directory that would expose one, or a
+symlink to one — is refused by `ours-fleet config` before it can launch.
 
 ### Start staggering
 
@@ -263,29 +376,34 @@ their boots ~4 s apart instead of firing all seven at once.
 
 With `monitor.enabled` (the default), the **supervisor** delivers a role's mail
 wakes: the per-role runner long-polls the ours daemon's notification API and
-injects a single `[fleet-monitor] N new messages from … — run get_messages` line
-straight into the console. It is a deterministic program whose lifetime is fused to
-the tmux session — it primes the notification cursor *before* the session launches
+submits a single `[fleet-monitor] N new messages from … — run get_messages` prompt
+through the selected backend. ACP uses structured `session/prompt`; tmux uses
+verified console input. It primes the notification cursor *before* the session launches
 (no missed arrivals), cannot be orphaned or left deaf-but-armed, and writes its
 health to `<agentDir>/.monitor-status` (`armed | degraded | failed`), surfaced in
 `ours-fleet status`/`doctor`. Injection is held while the pane shows a modal dialog,
 so an injected wake can never answer a trust/permission prompt; if the dialog is
 still up after 2 minutes the monitor gives up on that wake and records
 `degraded: modal wedge …` instead of waiting silently forever (the mail stays
-queued — the agent drains it on the next wake or at SessionStart). The agent's
+queued and its cursor is not committed until a later delivery is accepted). The agent's
 briefing tells it **not** to arm an
 in-session Monitor. Set `monitor.enabled: false` to keep the legacy behavior where
 the agent arms its own `ours-mcp watch`. `inject: full` (pushing message bodies
 inline) is on the roadmap and needs two new ours-mcp daemon endpoints; today all
 roles deliver `notification` lines and drain via `get_messages`.
 
+ACP stdio remains private to the persistent runner. `send`, `peek`, and the basic
+ACP `attach` console use a private, authenticated per-role control socket with
+typed replayable events. This is also the stable extension boundary for a richer
+console later; no terminal UI is part of the monitor or session backend.
+
 ## Codex roles
 
-Install Codex, the native ours plugin, and the fleet skills once on the fleet host:
+Install Codex, the native ours plugin, and the fleet CLI once on the fleet host:
 
 ```sh
-npm i -g @ours.network/fleet-codex
-ours-fleet-codex-install
+npm i -g @ours.network/fleet
+ours-fleet init
 ours-fleet doctor --harness codex
 ```
 
@@ -387,7 +505,7 @@ cleanly as long as each role has its own `cwd` (the common case); two roles
 sharing an identical `cwd` could have their resumes cross — give them distinct
 working directories if that matters. MCP and monitor wiring is provided by
 [`@ours.network/codex`](https://github.com/adapt-toolkit/ours-mcp/tree/main/packages/codex);
-the native spawn/oversight skills are provided by `@ours.network/fleet-codex`.
+the core ours skill discovers fleet behavior through `ours-fleet docs`.
 `ours-fleet doctor --harness codex` verifies the CLI, ours plugin, and enhanced launcher/fallback.
 
 ## Learn more

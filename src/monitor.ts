@@ -1,4 +1,4 @@
-import { existsSync, readFileSync, writeFileSync } from 'node:fs';
+import { existsSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 import type { MonitorConfig, NotifyEventType } from './config.js';
@@ -50,6 +50,15 @@ export interface MonitorDeps {
     set(fn: () => void, ms: number): ReturnType<typeof setTimeout>;
     clear(t: ReturnType<typeof setTimeout>): void;
   };
+  /**
+   * Structured prompt delivery used by ACP sessions. Tmux remains the fallback.
+   * `succeeded` is the turn's TERMINAL result, not merely that the session took
+   * the prompt: a refused or cancelled wake was seen and not acted on, and must
+   * not commit the cursor.
+   */
+  delivery?: {
+    submit(text: string): Promise<{ succeeded: boolean; outcome: string; detail?: string }>;
+  };
 }
 
 // Code constants (not config — YAGNI, design §2).
@@ -85,6 +94,26 @@ const TURN_OBSERVE_INTERVAL_MS = 1_500;
 const DEFAULT_TURN_FAIL_THRESHOLD = 3; // fallback when the resolved config omits it
 
 class AuthError extends Error {}
+
+/**
+ * Why the monitor is not healthy. Each cause clears on its OWN recovery signal
+ * and nothing else — a successful poll proves the stream works, and proves
+ * nothing whatsoever about whether wakes are being delivered or whether the
+ * turns they trigger keep dying.
+ */
+export type StatusCause =
+  | 'connectivity'    // prime/poll/stream failure      → cleared by a successful poll
+  | 'delivery'        // the wake could not be injected → cleared by a delivered wake
+  | 'modal'           // the pane held a dialog         → cleared by a delivered wake
+  | 'offline'         // the session is gone            → the run loop ends
+  | 'turns-failing'   // delivered wakes keep dying     → cleared by a completed turn
+  | 'auth';           // the daemon rejected the token  → fatal
+
+interface StatusEntry {
+  level: 'degraded' | 'failed';
+  detail: string;
+  at: string;
+}
 
 /** Best-effort daemon config (issue #17): the fields the MCP client reads. */
 interface DaemonConfig {
@@ -365,6 +394,8 @@ function stillInComposer(pane: string, line: string): boolean {
 
 export interface MonitorOpts {
   name: string;
+  /** Ours identity whose notification stream is authoritative (may differ from role name). */
+  identity?: string;
   agentDir: string;
   cfg: MonitorConfig;
   deps: MonitorDeps;
@@ -379,12 +410,16 @@ export interface MonitorHandle {
 
 export class Monitor {
   private readonly name: string;
+  private readonly identity: string;
   private readonly cfg: MonitorConfig;
   private readonly deps: MonitorDeps;
   private readonly ep: ReturnType<typeof resolveEndpoint>;
   private readonly statusPath: string;
   private readonly cursorPath: string;
+  private readonly statePath: string;
   private cursor: number | null = null;
+  private deliveredCursor: number | null = null;
+  private pendingState: { count: number; eventTypes: string[]; attempts: number } | null = null;
   private fatal = false;
   private stopped = false;
   private bootDeadline = 0;
@@ -393,32 +428,43 @@ export class Monitor {
   // ended in an API error with no completed turn in between.
   private apiErrorStreak = 0;
   private readonly turnFailThreshold: number;
+  /** Active degradations, keyed by cause. Empty means armed. */
+  private readonly causes = new Map<StatusCause, StatusEntry>();
 
   constructor(o: MonitorOpts) {
     this.name = o.name;
+    this.identity = o.identity ?? o.name;
     this.cfg = o.cfg;
     this.deps = o.deps;
     this.ep = resolveEndpoint(o.deps.env);
     this.statusPath = join(o.agentDir, '.monitor-status');
     this.cursorPath = join(o.agentDir, '.notify-cursor');
+    this.statePath = join(o.agentDir, '.monitor-state.json');
     const n = o.cfg.turn_fail_threshold;
     this.turnFailThreshold = typeof n === 'number' && n >= 1 ? n : DEFAULT_TURN_FAIL_THRESHOLD;
   }
 
-  /** Prime at the stream tip (or resume a persisted cursor if the daemon is down). */
+  /** Resume the last delivered cursor; only a brand-new monitor primes at stream tip. */
   async prime(): Promise<void> {
+    const persisted = this.readPersistedCursor();
+    if (persisted !== null) {
+      this.cursor = persisted;
+      this.deliveredCursor = persisted;
+      this.writeStatus();
+      return;
+    }
     try {
       const body = await this.doFetch('tip', LONGPOLL_TIMEOUT_MS);
       this.cursor = typeof body.cursor === 'number' ? body.cursor : 0;
       this.persistCursor();
-      this.setStatus('armed');
+      this.writeStatus();
     } catch (e) {
       if (e instanceof AuthError) {
         this.fatal = true;
-        this.setStatus(`failed: ${e.message}`);
+        this.degrade('auth', e.message, 'failed');
       } else {
-        this.cursor = this.readPersistedCursor();
-        this.setStatus(`degraded: prime failed (${msg(e)})`);
+        this.cursor = null;
+        this.degrade('connectivity', `prime failed (${msg(e)})`);
       }
     }
   }
@@ -428,25 +474,51 @@ export class Monitor {
     if (this.fatal) return;
     this.bootDeadline = this.deps.now() + BOOT_GRACE_MS;
     let backoff = 0;
+    const pending: NotifyEvent[] = [];
     while (!this.stopped) {
-      if (!this.deps.isAlive(pid)) { this.setStatus('degraded: session offline'); return; }
+      if (!this.deps.isAlive(pid)) { this.degrade('offline', 'session offline'); return; }
       let body: { cursor?: number; events?: NotifyEvent[] };
       try {
         body = await this.doFetch(String(this.cursor ?? 0), LONGPOLL_TIMEOUT_MS);
         backoff = 0;
+        // A poll that worked proves the stream is healthy — and only that.
+        this.recover('connectivity');
       } catch (e) {
         if (this.stopped) return;
-        if (e instanceof AuthError) { this.fatal = true; this.setStatus(`failed: ${e.message}`); return; }
+        if (e instanceof AuthError) { this.fatal = true; this.degrade('auth', e.message, 'failed'); return; }
         backoff = Math.min(backoff + BACKOFF_STEP_MS, BACKOFF_MAX_MS);
-        this.setStatus(`degraded: stream hiccup (${msg(e)})`);
+        this.degrade('connectivity', `stream hiccup (${msg(e)})`);
         await this.deps.sleep(backoff);
         continue;
       }
-      this.advance(body.cursor);
+      this.advance(body.cursor, false);
       const batch = filterEvents(body.events ?? [], this.cfg.wake_sources);
-      if (batch.length === 0) continue;
-      await this.coalesce(batch);
-      await this.deliver(pid, batch);
+      pending.push(...batch);
+      if (pending.length === 0) {
+        this.persistCursor();
+        continue;
+      }
+      this.pendingState = {
+        count: pending.length,
+        eventTypes: uniq(pending.map(event => event.event ?? 'unknown')),
+        attempts: (this.pendingState?.attempts ?? 0) + 1,
+      };
+      this.persistState();
+      await this.coalesce(pending);
+      // Do not durably commit this cursor until the session explicitly accepts
+      // the wake. If delivery fails or the runner crashes, the daemon replays
+      // from the last committed cursor and the wake is attempted again.
+      let accepted = false;
+      try {
+        accepted = await this.deliver(pid, pending);
+      } catch (e) {
+        this.degrade('delivery', `delivery failed (${msg(e)})`);
+      }
+      if (accepted) {
+        pending.length = 0;
+        this.pendingState = null;
+        this.persistCursor();
+      }
     }
   }
 
@@ -464,21 +536,34 @@ export class Monitor {
     if (this.stopped) return;
     try {
       const more = await this.doFetch(String(this.cursor ?? 0), COALESCE_HOLD_MS);
-      this.advance(more.cursor);
+      this.advance(more.cursor, false);
       batch.push(...filterEvents(more.events ?? [], this.cfg.wake_sources));
     } catch { /* no stragglers / abort — deliver what we have */ }
   }
 
-  private async deliver(pid: number, batch: NotifyEvent[]): Promise<void> {
+  private async deliver(pid: number, batch: NotifyEvent[]): Promise<boolean> {
+    const line = formatNotificationLine(batch);
+    if (this.deps.delivery) {
+      const result = await this.deps.delivery.submit(line);
+      if (!result.succeeded) {
+        // Name the reason: "refused" and "cancelled" are the agent's answer,
+        // not a transport problem, and an operator has to be able to tell them
+        // apart from a dead socket.
+        this.degrade('delivery', `wake ${result.outcome}${result.detail ? ` (${result.detail})` : ''}`);
+        return false;
+      }
+      this.recover('delivery', 'modal');
+      this.recordTurn('completed');
+      return true;
+    }
     const state = await this.awaitInjectable(pid);
     if (state !== 'ready') {
-      if (state === 'offline') this.setStatus('degraded: offline during delivery');
+      if (state === 'offline') this.degrade('offline', 'offline during delivery');
       else if (state === 'modal')
-        this.setStatus(`degraded: modal wedge — pane held a dialog for ` +
+        this.degrade('modal', `modal wedge — pane held a dialog for ` +
           `${MODAL_GIVE_UP_MS / 1000}s, wake not injected`);
-      return; // events remain covered by unread.json / SessionStart backlog
+      return false;
     }
-    const line = formatNotificationLine(batch);
     await this.clearComposer();                        // start from an empty composer
     await this.deps.tmux.sendText(this.name, line);   // send-keys -l + Enter
     let delivered = false;
@@ -487,28 +572,35 @@ export class Monitor {
     // dead pane makes safeCapture return '' ⇒ not-in-composer ⇒ breaks, no wasted Enter.
     for (let i = 0; i < MAX_ENTER_RETRIES;) {
       await this.deps.sleep(POST_VERIFY_MS);
-      const pane = await safeCapture(this.deps.tmux, this.name);
+      const capture = await safeCapture(this.deps.tmux, this.name);
+      if (!capture.ok) {
+        this.degrade('delivery', 'capture failed during injection verification');
+        return false;
+      }
       // A dialog can appear after the initial send. Never let a verification
       // retry confirm it. Wait under the same bounded modal policy as initial
       // injection, then re-capture immediately before considering Enter.
-      if (looksModal(pane)) {
+      if (looksModal(capture.pane)) {
         const state = await this.awaitInjectable(pid);
         if (state === 'ready') continue;
-        if (state === 'offline') this.setStatus('degraded: offline during injection verification');
+        if (state === 'offline')
+          this.degrade('offline', 'offline during injection verification');
         else if (state === 'modal')
-          this.setStatus(`degraded: modal wedge during injection verification — ` +
+          this.degrade('modal', `modal wedge during injection verification — ` +
             `no Enter sent for ${MODAL_GIVE_UP_MS / 1000}s`);
-        return;
+        return false;
       }
-      if (!stillInComposer(pane, line)) { delivered = true; break; }
+      if (!stillInComposer(capture.pane, line)) { delivered = true; break; }
       await this.deps.tmux.sendKey(this.name, 'Enter');
       i++;
     }
-    if (!delivered) { this.setStatus('degraded: injection unverified'); return; }
+    if (!delivered) { this.degrade('delivery', 'injection unverified'); return false; }
+    this.recover('delivery', 'modal');
     // The wake landed and a turn started; observe how that turn terminates so a
     // refusal-wedge (every turn dies with `API Error:` while delivery stays green)
     // becomes visible in `.monitor-status` instead of masquerading as armed (#19).
     await this.observeTurnOutcome(pid);
+    return true;
   }
 
   /**
@@ -522,9 +614,13 @@ export class Monitor {
     for (let i = 0; i < TURN_OBSERVE_POLLS; i++) {
       if (this.stopped) return;                                  // shutting down — leave status
       if (!this.deps.isAlive(pid) || !(await this.deps.tmux.has(this.name))) return; // loop marks offline
-      const pane = await safeCapture(this.deps.tmux, this.name);
-      if (looksApiError(pane)) { this.recordTurn('api-error'); return; }
-      if (!looksRunning(pane)) { this.recordTurn('completed'); return; }
+      const capture = await safeCapture(this.deps.tmux, this.name);
+      if (!capture.ok) {
+        this.degrade('delivery', 'capture failed during turn observation');
+        return;
+      }
+      if (looksApiError(capture.pane)) { this.recordTurn('api-error'); return; }
+      if (!looksRunning(capture.pane)) { this.recordTurn('completed'); return; }
       await this.deps.sleep(TURN_OBSERVE_INTERVAL_MS);
     }
     this.recordTurn('inconclusive');   // still running at give-up: hold the streak, don't re-arm
@@ -532,12 +628,14 @@ export class Monitor {
 
   /** Update the consecutive-API-error streak and derive `.monitor-status` from it. */
   private recordTurn(outcome: 'api-error' | 'completed' | 'inconclusive'): void {
+    if (outcome === 'inconclusive') return;   // no evidence either way; leave the streak
     if (outcome === 'api-error') this.apiErrorStreak++;
-    else if (outcome === 'completed') this.apiErrorStreak = 0;
-    // 'inconclusive' leaves the streak (and therefore the status) unchanged.
-    this.setStatus(this.apiErrorStreak >= this.turnFailThreshold
-      ? 'degraded: turns failing (api error)'
-      : 'armed');
+    else this.apiErrorStreak = 0;
+    if (this.apiErrorStreak >= this.turnFailThreshold)
+      this.degrade('turns-failing', 'turns failing (api error)');
+    else if (outcome === 'completed')
+      // A turn that ran to the end is the ONLY thing that clears this.
+      this.recover('turns-failing');
   }
 
   /**
@@ -565,8 +663,13 @@ export class Monitor {
       if (!this.deps.isAlive(pid) || !(await this.deps.tmux.has(this.name))) return 'offline';
       const now = this.deps.now();
       if (now < this.bootDeadline) { await this.deps.sleep(this.bootDeadline - now); continue; }
-      const pane = await safeCapture(this.deps.tmux, this.name);
-      if (!looksModal(pane)) return 'ready';
+      const capture = await safeCapture(this.deps.tmux, this.name);
+      if (!capture.ok) {
+        this.degrade('delivery', 'capture failed while checking session readiness');
+        await this.deps.sleep(MODAL_RETRY_MS);
+        continue;
+      }
+      if (!looksModal(capture.pane)) return 'ready';
       if (modalWaits++ >= MAX_MODAL_WAITS) return 'modal';
       await this.deps.sleep(MODAL_RETRY_MS);
     }
@@ -578,7 +681,7 @@ export class Monitor {
     const timer = this.deps.timers.set(() => ctrl.abort(), holdMs);
     let resp: FetchResponse;
     try {
-      resp = await this.deps.fetch(`${this.ep.url(this.name)}?since=${since}`,
+      resp = await this.deps.fetch(`${this.ep.url(this.identity)}?since=${since}`,
         { headers: this.ep.headers, signal: ctrl.signal });
     } finally {
       this.deps.timers.clear(timer);
@@ -591,30 +694,95 @@ export class Monitor {
     return resp.json();
   }
 
-  private advance(cursor: number | undefined): void {
+  private advance(cursor: number | undefined, persist = true): void {
     if (typeof cursor === 'number' && cursor !== this.cursor) {
       this.cursor = cursor;
-      this.persistCursor();
+      if (persist) this.persistCursor();
+      else this.persistState();
     }
   }
 
   private persistCursor(): void {
-    try { if (this.cursor !== null) writeFileSync(this.cursorPath, `${this.cursor}\n`); }
+    try {
+      if (this.cursor !== null) {
+        this.deliveredCursor = this.cursor;
+        writeFileSync(this.cursorPath, `${this.cursor}\n`);
+        this.persistState();
+      }
+    }
     catch (e) { this.deps.log(`[${this.name}] monitor: failed to persist cursor: ${msg(e)}`); }
   }
 
   private readPersistedCursor(): number | null {
     try {
+      if (existsSync(this.statePath)) {
+        const state = JSON.parse(readFileSync(this.statePath, 'utf8')) as {
+          identity?: string; profileKey?: string; deliveredCursor?: number;
+        };
+        if ((state.identity !== undefined && state.identity !== this.identity)
+            || (state.profileKey !== undefined && state.profileKey !== this.ep.origin))
+          return null;
+        if (typeof state.deliveredCursor === 'number') {
+          this.deliveredCursor = state.deliveredCursor;
+          return state.deliveredCursor;
+        }
+      }
       if (!existsSync(this.cursorPath)) return null;
       const n = parseInt(readFileSync(this.cursorPath, 'utf8').trim(), 10);
+      if (Number.isFinite(n)) this.deliveredCursor = n;
       return Number.isFinite(n) ? n : null;
     } catch { return null; }
   }
 
-  private setStatus(s: string): void {
-    try { writeFileSync(this.statusPath, `${s}\n`); }
+  /** Atomically persist body-free delivery state; restart always resumes from deliveredCursor. */
+  private persistState(): void {
+    try {
+      const tmp = `${this.statePath}.${process.pid}.tmp`;
+      writeFileSync(tmp, JSON.stringify({
+        version: 1,
+        identity: this.identity,
+        profileKey: this.ep.origin,
+        observedCursor: this.cursor,
+        deliveredCursor: this.deliveredCursor,
+        pending: this.pendingState,
+        updatedAt: new Date(this.deps.now()).toISOString(),
+      }, null, 2) + '\n', { mode: 0o600 });
+      renameSync(tmp, this.statePath);
+    } catch (e) {
+      this.deps.log(`[${this.name}] monitor: failed to persist state: ${msg(e)}`);
+    }
+  }
+
+  /** Record a degradation under its own cause and republish the status. */
+  private degrade(cause: StatusCause, detail: string, level: StatusEntry['level'] = 'degraded'): void {
+    const previous = this.causes.get(cause);
+    this.causes.set(cause, { level, detail, at: new Date(this.deps.now()).toISOString() });
+    this.writeStatus();
+    if (previous?.detail !== detail) this.deps.log(`[${this.name}] monitor ${level}: ${cause} — ${detail}`);
+  }
+
+  /**
+   * Clear exactly the causes this recovery signal speaks to. Anything else
+   * stays: one successful poll must never be able to erase `turns failing`.
+   */
+  private recover(...causes: StatusCause[]): void {
+    let changed = false;
+    for (const cause of causes) changed = this.causes.delete(cause) || changed;
+    if (changed) this.deps.log(`[${this.name}] monitor recovered: ${causes.join(', ')}`);
+    this.writeStatus();
+  }
+
+  /**
+   * One line per active cause, each dated; `armed` when there are none. Every
+   * line carries an ISO timestamp so an operator can tell a live status from a
+   * stale one left behind by a monitor that stopped writing.
+   */
+  private writeStatus(): void {
+    const lines = this.causes.size
+      ? [...this.causes.entries()].map(([cause, e]) => `${e.level}: ${cause} at ${e.at} — ${e.detail}`)
+      : [`armed at ${new Date(this.deps.now()).toISOString()}`];
+    try { writeFileSync(this.statusPath, lines.join('\n') + '\n'); }
     catch (e) { this.deps.log(`[${this.name}] monitor: failed to write status: ${msg(e)}`); }
-    if (!s.startsWith('armed')) this.deps.log(`[${this.name}] monitor ${s}`);
   }
 }
 
@@ -622,8 +790,11 @@ export function createMonitor(o: MonitorOpts): Monitor {
   return new Monitor(o);
 }
 
-async function safeCapture(tmux: MonitorTmux, name: string): Promise<string> {
-  try { return await tmux.capture(name); } catch { return ''; }
+async function safeCapture(
+  tmux: MonitorTmux, name: string,
+): Promise<{ ok: true; pane: string } | { ok: false; pane: '' }> {
+  try { return { ok: true, pane: await tmux.capture(name) }; }
+  catch { return { ok: false, pane: '' }; }
 }
 
 const msg = (e: unknown): string => (e as Error)?.message ?? String(e);

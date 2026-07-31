@@ -1,22 +1,45 @@
 import { spawn as spawnChild } from 'node:child_process';
-import { existsSync, mkdirSync, openSync, readFileSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, openSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { stringify } from 'yaml';
+import { parse, stringify } from 'yaml';
 import { agentDir, fleetDDir } from './paths.js';
-import { loadConfig, resolveMonitorConfig, type ResolvedRole, type RoleConfig } from './config.js';
+import { validateIsolationConfig } from './isolation/policy.js';
+import type { IsolationConfig } from './isolation/types.js';
+import {
+  loadConfig, resolveMonitorConfig, resolvePermissions,
+  type ApprovalMode, type FilesystemMode, type ResolvedRole, type RoleConfig,
+  type CommonPermissions, type SessionBackendId, type UnattendedMode,
+} from './config.js';
 import { applyRole, up, type OpsDeps } from './ops.js';
 import { START_STAGGER_FILE } from './runner.js';
+import {
+  buildProvenance, daemonIdentityProvisioner, ensureIdentity, provenanceOf,
+  withCreationTransaction, writeProvenance, writeRoleFile,
+  type CreationDeps, type CreationProvenance, type CreationTransaction,
+  type IdentityGuarantee, type ProvenanceEntry,
+} from './creation.js';
+import { VERSION } from './version.js';
+
+/**
+ * The provenance record written by the most recent spawn in this process, so
+ * the CLI can print the same summary it persisted rather than rebuilding it.
+ */
+export let lastProvenance: CreationProvenance | undefined;
 
 export interface SpawnOpts {
   name: string;
   temp?: boolean;
   harness?: string;
+  session?: SessionBackendId;
   mission?: string;
   identity?: string;
   cwd?: string;
   coordinator?: string;
   model?: string;
   permissionMode?: string;
+  approval?: ApprovalMode;
+  filesystem?: FilesystemMode;
+  unattended?: UnattendedMode;
   sandbox?: string;
   profile?: string;
   launcher?: string;
@@ -26,6 +49,12 @@ export interface SpawnOpts {
   monitor?: boolean;
   bioFile?: string;
   personaFile?: string;
+  /**
+   * Path to a file holding exactly the existing `isolation:` mapping — the same
+   * schema fleet.yaml uses, not a second policy language. The ONE new operator
+   * input in this release (6.3).
+   */
+  isolationFile?: string;
   overseeInterval?: string;
   configPath?: string;
 }
@@ -33,6 +62,7 @@ export interface SpawnOpts {
 function roleFromOpts(o: SpawnOpts, defaultHarness?: string): RoleConfig {
   const r: RoleConfig = {};
   if (o.harness) r.harness = o.harness;
+  if (o.session) r.session = o.session;
   if (o.identity) r.identity = o.identity;
   if (o.cwd) r.cwd = o.cwd;
   if (o.coordinator) r.coordinator = o.coordinator;
@@ -49,11 +79,60 @@ function roleFromOpts(o: SpawnOpts, defaultHarness?: string): RoleConfig {
   if (o.addDirs?.length) harnessOptions.add_dirs = o.addDirs;
   if (o.monitor === true) harnessOptions.monitor = true;
   if (Object.keys(harnessOptions).length) r.harness_options = harnessOptions;
+  if (o.approval || o.filesystem || o.unattended) {
+    r.permissions = {
+      ...(o.approval ? { approval: o.approval } : {}),
+      ...(o.filesystem ? { filesystem: o.filesystem } : {}),
+      ...(o.unattended ? { unattended: o.unattended } : {}),
+    };
+  }
   if (o.bioFile) r.bio = readFileSync(o.bioFile, 'utf8').trim();
   if (o.personaFile) r.persona = readFileSync(o.personaFile, 'utf8').trim();
+  if (o.isolationFile) r.isolation = readIsolationFile(o.isolationFile);
   return r;
 }
 
+/**
+ * Read and validate an `--isolation-file`. The file is the existing
+ * `isolation:` mapping and nothing else — the same schema, the same validator
+ * (`validateIsolationConfig`), so a policy written here cannot mean something
+ * different from the identical block in fleet.yaml.
+ *
+ * Called BEFORE the creation transaction reserves anything: an invalid file
+ * must fail before any artifact exists.
+ */
+export function readIsolationFile(path: string): IsolationConfig {
+  let raw: unknown;
+  try { raw = parse(readFileSync(path, 'utf8')); }
+  catch (e) {
+    throw new Error(`--isolation-file ${path}: ${(e as Error).message}`);
+  }
+  // A file holding only comments parses to null; treat it as an empty policy,
+  // which is a meaningful request ("sandbox me with defaults").
+  const cfg = (raw ?? {}) as IsolationConfig;
+  const problems = validateIsolationConfig(cfg);
+  if (problems.length) throw new Error(`--isolation-file ${path}: ${problems.join('; ')}`);
+  return cfg;
+}
+
+function validateSpawnOpts(o: SpawnOpts): void {
+  if (o.session && !['tmux', 'acp'].includes(o.session))
+    throw new Error(`invalid --session '${o.session}'; allowed: tmux, acp`);
+  if (o.approval && !['ask', 'allow', 'deny'].includes(o.approval))
+    throw new Error(`invalid --approval '${o.approval}'; allowed: ask, allow, deny`);
+  if (o.filesystem && !['read-only', 'workspace', 'unrestricted'].includes(o.filesystem))
+    throw new Error(
+      `invalid --filesystem '${o.filesystem}'; allowed: read-only, workspace, unrestricted`);
+  if (o.unattended && !['deny', 'wait'].includes(o.unattended))
+    throw new Error(`invalid --unattended '${o.unattended}'; allowed: deny, wait`);
+}
+
+/**
+ * Reject names that are already USED. This is a precondition, not a claim: it
+ * runs INSIDE the creation transaction, after both names are reserved, so the
+ * gap between checking and creating that let two spawns both succeed is closed
+ * by the reservation rather than by this function.
+ */
 function assertNameFree(o: SpawnOpts): void {
   const cfg = loadConfig(o.configPath);
   if (cfg.roles.some(r => r.name === o.name))
@@ -62,17 +141,110 @@ function assertNameFree(o: SpawnOpts): void {
     throw new Error(`agent dir for '${o.name}' already exists — pick another name or 'ours-fleet rm ${o.name}'`);
 }
 
+/** The ours identity a spawn will bind: explicit, else the role name. */
+export const effectiveIdentity = (o: SpawnOpts): string => o.identity ?? o.name;
+
+/**
+ * Which settings came from the operator, from fleet defaults, or from a
+ * built-in (6.6). Built while the options are still separable — once they are
+ * merged into a ResolvedRole the distinction is gone.
+ *
+ * `env`, `bio`, `persona` and `harness_options` are deliberately absent: the
+ * record exists to be read, and must not become a place credentials collect.
+ */
+function provenanceSettings(
+  o: SpawnOpts, defaults: Record<string, unknown>,
+): Record<string, ProvenanceEntry> {
+  const perms = (defaults.permissions ?? {}) as Partial<CommonPermissions>;
+  return {
+    harness: provenanceOf(o.harness, defaults.harness, 'claude-code'),
+    session: provenanceOf(o.session, defaults.session, 'tmux'),
+    identity: o.identity
+      ? { value: o.identity, source: 'cli' }
+      : { value: o.name, source: 'built-in' },     // defaults to the role name
+    cwd: provenanceOf(o.cwd, undefined, undefined),
+    model: provenanceOf(o.model?.trim(), defaults.model, undefined),
+    coordinator: provenanceOf(o.coordinator, undefined, undefined),
+    approval: provenanceOf(o.approval, perms.approval, 'ask'),
+    filesystem: provenanceOf(o.filesystem, perms.filesystem, 'workspace'),
+    unattended: provenanceOf(o.unattended, perms.unattended, 'deny'),
+    isolation: o.isolationFile
+      ? { value: 'declared via --isolation-file', source: 'cli' }
+      : { value: defaults.isolation ? 'from fleet defaults' : undefined, source: defaults.isolation ? 'fleet-default' : 'built-in' },
+  };
+}
+
 /** Permanent spawn: persist to ~/fleet.d/<Name>.yaml, then bring it up. */
-export async function spawnPermanent(o: SpawnOpts, deps: OpsDeps): Promise<string> {
-  assertNameFree(o);
-  const cfg = loadConfig(o.configPath);
-  mkdirSync(fleetDDir(), { recursive: true });
-  const file = join(fleetDDir(), `${o.name}.yaml`);
-  writeFileSync(file, stringify({
-    roles: { [o.name]: roleFromOpts(o, cfg.defaults.harness as string | undefined) },
-  }));
-  await up(loadConfig(o.configPath), [o.name], deps, o.configPath);
-  return file;
+export async function spawnPermanent(
+  o: SpawnOpts, deps: OpsDeps, creation: CreationDeps = {},
+): Promise<string> {
+  validateSpawnOpts(o);
+  if (o.isolationFile) readIsolationFile(o.isolationFile);   // fail before reserving
+  // Name AND identity reserved together, before anything is written or started
+  // (6.4). A loser of the race creates no config, no state, no service.
+  return withCreationTransaction(
+    { role: o.name, identity: effectiveIdentity(o) },
+    async tx => {
+      assertNameFree(o);
+      const cfg = loadConfig(o.configPath);
+      // Establish the identity BEFORE the service is enabled (7.3), and record
+      // what was actually guaranteed so the briefing can say something true.
+      const guarantee = await ensureIdentity(
+        effectiveIdentity(o),
+        { bio: o.bioFile ? readFileSync(o.bioFile, 'utf8').trim() : undefined,
+          persona: o.personaFile ? readFileSync(o.personaFile, 'utf8').trim() : undefined },
+        creation.identityProvisioner ?? daemonIdentityProvisioner(),
+        deps.log);
+      if (guarantee.state === 'created')
+        // We minted it; a failed creation must not leave an orphan identity
+        // behind. Only ever removes an identity THIS transaction created.
+        tx.record({
+          stage: `ours identity ${effectiveIdentity(o)}`,
+          undo: async () => {
+            await creation.identityProvisioner?.remove?.(effectiveIdentity(o));
+          },
+        });
+      mkdirSync(fleetDDir(), { recursive: true });
+      const file = join(fleetDDir(), `${o.name}.yaml`);
+      writeRoleFile(tx, file, stringify({
+        roles: { [o.name]: roleFromOpts(o, cfg.defaults.harness as string | undefined) },
+      }));
+      // `up` materialises the state dir and registers the service. Journal the
+      // dir before it exists so a failure leaves the name genuinely reusable
+      // rather than blocked by a half-built directory.
+      const stateDir = agentDir(o.name);
+      const stateExisted = existsSync(stateDir);
+      tx.record({
+        stage: `state dir ${stateDir}`,
+        undo: () => { if (!stateExisted) rmSync(stateDir, { recursive: true, force: true }); },
+      });
+      // Journal the service registration BEFORE it happens, and undo only the
+      // registrations this transaction actually created (6.2). `registered` is
+      // filled by `up`'s onInstalled hook at the moment each registration is
+      // made — not from its return value, which never arrives when `up` throws
+      // after registering.
+      const registered: string[] = [];
+      tx.record({
+        stage: `service registration for ${o.name}`,
+        undo: async () => { for (const n of registered) await deps.backend.uninstall(n); },
+      });
+      // Provenance is written BEFORE the role starts, so a role that fails to
+      // launch still records how it was asked for (6.6).
+      const provenance = buildProvenance({
+        role: o.name, lifetime: 'permanent', fleetVersion: VERSION,
+        settings: provenanceSettings(o, cfg.defaults),
+      });
+      mkdirSync(agentDir(o.name), { recursive: true });
+      writeProvenance(agentDir(o.name), provenance);
+      await up(
+        loadConfig(o.configPath), [o.name],
+        { ...deps, onInstalled: outcome => registered.push(outcome.role) },
+        o.configPath, guarantee.state);
+      lastProvenance = provenance;
+      return file;
+    },
+    creation,
+  );
 }
 
 /** Launches the detached temp supervisor (`_run-temp <name>`). Injectable for tests. */
@@ -93,6 +265,30 @@ export async function spawnTemp(
   o: SpawnOpts,
   binPath: string,
   launch: SupervisorLauncher = detachedSupervisor,
+  creation: CreationDeps = {},
+): Promise<string> {
+  validateSpawnOpts(o);
+  if (o.isolationFile) readIsolationFile(o.isolationFile);   // fail before reserving
+  // Temporary roles go through the SAME reservation boundary as permanent ones
+  // (6.4): a temp agent competes for the same names.
+  return withCreationTransaction(
+    { role: o.name, identity: effectiveIdentity(o) },
+    async tx => {
+      const guarantee = await ensureIdentity(
+        effectiveIdentity(o),
+        { bio: o.bioFile ? readFileSync(o.bioFile, 'utf8').trim() : undefined,
+          persona: o.personaFile ? readFileSync(o.personaFile, 'utf8').trim() : undefined },
+        creation.identityProvisioner ?? daemonIdentityProvisioner(),
+        creation.log);
+      return spawnTempInner(o, binPath, launch, tx, guarantee);
+    },
+    creation,
+  );
+}
+
+async function spawnTempInner(
+  o: SpawnOpts, binPath: string, launch: SupervisorLauncher, tx: CreationTransaction,
+  guarantee: IdentityGuarantee,
 ): Promise<string> {
   assertNameFree(o);
   const cfg = loadConfig(o.configPath);
@@ -103,17 +299,28 @@ export async function spawnTemp(
     ...(fromOpts.harness_options ?? {}),
   };
   const role: ResolvedRole = {
-    ...fromOpts,
+    ...fromOpts,          // includes `isolation` when --isolation-file was given
     name: o.name,
     harness: o.harness ?? defaultHarness ?? 'claude-code',
+    session: o.session ?? (cfg.defaults.session as SessionBackendId | undefined) ?? 'tmux',
     identity: o.identity ?? o.name,
     model: o.model?.trim() || (cfg.defaults.model as string | undefined),
     harness_options: Object.keys(mergedHarnessOptions).length ? mergedHarnessOptions : undefined,
+    permissions: resolvePermissions(cfg.defaults.permissions, fromOpts.permissions),
+    permissionsDeclared:
+      fromOpts.permissions !== undefined || cfg.defaults.permissions !== undefined,
     // Temp agents inherit the fleet-wide monitor defaults via the snapshot (design §2).
     monitor: resolveMonitorConfig(cfg.defaults.monitor, fromOpts.monitor),
     sourceFile: '(temp)',
   };
-  const dir = applyRole(role, { temp: true });
+  const dir = applyRole(role, { temp: true, identityGuarantee: guarantee.state });
+  const provenance = buildProvenance({
+    role: o.name, lifetime: 'temporary', fleetVersion: VERSION,
+    settings: provenanceSettings(o, cfg.defaults),
+  });
+  writeProvenance(dir, provenance);
+  lastProvenance = provenance;
+  tx.record({ stage: `temp state dir ${dir}`, undo: () => rmSync(dir, { recursive: true, force: true }) });
   writeFileSync(join(dir, 'role.yaml'), stringify(role));
   // Snapshot the fleet start-stagger so the detached temp supervisor (no config path
   // threaded through it) honors the same launch gate — a burst of temp spawns spaces

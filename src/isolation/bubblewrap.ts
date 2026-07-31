@@ -11,7 +11,13 @@ export function unsharesNet(network: NetworkMode): boolean {
   return network === 'deny';
 }
 
-/** Build the `bwrap … -- <argv>` sandbox launcher argv. Pure — no I/O. */
+/**
+ * Build the `bwrap … -- <argv>` sandbox launcher argv. Pure — no I/O.
+ *
+ * Consumes an ALREADY-ENFORCED mount set: `resolveIsolation` has refused
+ * anything that breaches the forbidden-path list, so no forbidden path can
+ * reach this argv. This function must never add a mount of its own.
+ */
 function wrap(argv: string[], policy: ResolvedIsolation, ctx: WrapContext): string[] {
   const out: string[] = [
     'bwrap',

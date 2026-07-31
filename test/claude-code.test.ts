@@ -1,8 +1,13 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
-import { mkdtempSync, mkdirSync, readFileSync, writeFileSync, existsSync, rmSync } from 'node:fs';
+import {
+  mkdtempSync, mkdirSync, readFileSync, readdirSync, writeFileSync, existsSync, rmSync,
+} from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { makeClaudeCodeAdapter, autocompactPct, pretrust } from '../src/harness/claude-code.js';
+import {
+  makeClaudeCodeAdapter, autocompactPct, pretrust, claudeCapabilities,
+} from '../src/harness/claude-code.js';
+import { checkUnattendedFloor } from '../src/permissions.js';
 import { agentDir } from '../src/paths.js';
 import { loadConfig, findRole, type ResolvedRole } from '../src/config.js';
 import type { Exec } from '../src/exec.js';
@@ -97,15 +102,55 @@ describe('vocabulary — supervised monitor migration', () => {
 });
 
 describe('pretrust', () => {
-  it('merges trust flags without clobbering other projects', () => {
-    const cj = join(dir, '.claude.json');
-    writeFileSync(cj, JSON.stringify({ projects: { '/other': { keep: true } }, topLevel: 1 }));
-    pretrust('/w');
-    const d = JSON.parse(readFileSync(cj, 'utf8'));
+  const cj = () => join(dir, '.claude.json');
+
+  it('merges trust flags without clobbering other projects', async () => {
+    writeFileSync(cj(), JSON.stringify({ projects: { '/other': { keep: true } }, topLevel: 1 }));
+    await pretrust('/w');
+    const d = JSON.parse(readFileSync(cj(), 'utf8'));
     expect(d.projects['/w'].hasTrustDialogAccepted).toBe(true);
     expect(d.projects['/w'].projectOnboardingSeenCount).toBe(1);
     expect(d.projects['/other'].keep).toBe(true);
     expect(d.topLevel).toBe(1);
+  });
+
+  it('creates the file when absent', async () => {
+    await pretrust('/w');
+    expect(JSON.parse(readFileSync(cj(), 'utf8')).projects['/w'].hasTrustDialogAccepted).toBe(true);
+  });
+
+  it('on malformed JSON: warns, skips, and NEVER overwrites the file (6.1)', async () => {
+    const corrupt = '{ "projects": { broken';
+    writeFileSync(cj(), corrupt);
+    const logs: string[] = [];
+    await expect(pretrust('/w', { log: l => logs.push(l) })).resolves.toBeUndefined();
+    // The operator's file is left exactly as found — we cannot read it, so we
+    // have no right to replace it.
+    expect(readFileSync(cj(), 'utf8')).toBe(corrupt);
+    expect(logs.join('\n')).toContain('not valid JSON');
+    expect(logs.join('\n')).toContain('skipping pre-trust');
+  });
+
+  it('a non-object JSON document is skipped just as safely', async () => {
+    writeFileSync(cj(), '["not", "an", "object"]');
+    const logs: string[] = [];
+    await pretrust('/w', { log: l => logs.push(l) });
+    expect(readFileSync(cj(), 'utf8')).toBe('["not", "an", "object"]');
+    expect(logs.join('\n')).toContain('does not contain a JSON object');
+  });
+
+  it('leaves no temp file behind', async () => {
+    await pretrust('/w');
+    expect(readdirSync(dir).filter(f => f.includes('.tmp'))).toEqual([]);
+    expect(readdirSync(dir).filter(f => f.endsWith('.lock'))).toEqual([]);
+  });
+
+  it('a role launch is never failed by pre-trust, whatever goes wrong (6.1)', async () => {
+    // A realistic mess: something has left a DIRECTORY where the file belongs.
+    mkdirSync(cj(), { recursive: true });
+    const logs: string[] = [];
+    await expect(pretrust('/w', { log: l => logs.push(l) })).resolves.toBeUndefined();
+    expect(logs.join('\n')).toContain('continuing without pre-trust');
   });
 });
 
@@ -254,5 +299,94 @@ describe('validateOptions / prereqs', () => {
     const rep = await a.checkPrereqs();
     expect(rep.ok).toBe(false);
     expect(rep.checks[0].detail).toContain('not found');
+  });
+});
+
+describe('buildAcpLaunch', () => {
+  it('uses the bundled Claude ACP adapter when supported and preserves the Node 20 fallback', () => {
+    const launch = makeClaudeCodeAdapter(okExec).buildAcpLaunch!(
+      role(), { argv: [], env: {} });
+    if (Number(process.versions.node.split('.')[0]) >= 22) {
+      expect(launch.argv[0]).toBe(process.execPath);
+      expect(launch.argv[1]).toMatch(
+        /@agentclientprotocol[/\\]claude-agent-acp[/\\]dist[/\\]index\.js$/);
+    } else {
+      expect(launch.argv).toEqual(['claude-agent-acp']);
+    }
+  });
+
+  it('preserves an explicit ACP command override', () => {
+    const launch = makeClaudeCodeAdapter(okExec).buildAcpLaunch!(
+      role({ session_options: { acp: { command: 'custom-claude-acp --flag' } } }),
+      { argv: [], env: {} },
+    );
+    expect(launch.argv).toEqual(['sh', '-c', 'custom-claude-acp --flag']);
+  });
+});
+
+describe('neutral permission mapping and the unattended floor (2.1)', () => {
+  const a = makeClaudeCodeAdapter(okExec);
+  const APPROVALS = ['ask', 'allow', 'deny'] as const;
+  const FILESYSTEMS = ['read-only', 'workspace', 'unrestricted'] as const;
+  const UNATTENDED = ['deny', 'wait'] as const;
+
+  it('maps approval: allow to bypassPermissions, the mode that actually allows', () => {
+    const t = a.translatePermissions(
+      { approval: 'allow', filesystem: 'workspace', unattended: 'deny' });
+    expect(t.supported).toBe(true);
+    // dontAsk suppresses the prompt but still refuses the action.
+    expect((t as { native: Record<string, unknown> }).native.permission_mode).toBe('bypassPermissions');
+  });
+
+  it('elevates nothing but an explicit allow', () => {
+    const mode = (approval: 'ask' | 'allow' | 'deny') => {
+      const t = a.translatePermissions({ approval, filesystem: 'workspace', unattended: 'deny' });
+      return (t as { native: Record<string, unknown> }).native.permission_mode;
+    };
+    expect(mode('ask')).toBe('default');
+    expect(mode('deny')).toBe('plan');
+  });
+
+  it('launch argv uses the same mapping as the translation', () => {
+    const prep = { argv: [], env: {} };
+    for (const approval of APPROVALS) {
+      const r = role({ permissions: { approval, filesystem: 'workspace', unattended: 'deny' } });
+      const argv = a.buildLaunch(r, 'fresh', { sessionId: 's' }, prep).argv;
+      const t = a.translatePermissions(r.permissions!) as { native: Record<string, unknown> };
+      const i = argv.indexOf('--permission-mode');
+      if (approval === 'ask') expect(i, approval).toBe(-1);        // Claude's own default
+      else expect(argv[i + 1], approval).toBe(t.native.permission_mode);
+    }
+  });
+
+  it('every neutral combination resolves, and only allow clears the floor', () => {
+    for (const approval of APPROVALS)
+      for (const filesystem of FILESYSTEMS)
+        for (const unattended of UNATTENDED) {
+          const label = `${approval}/${filesystem}/${unattended}`;
+          const t = a.translatePermissions({ approval, filesystem, unattended });
+          expect(t.supported, label).toBe(true);
+          const { capabilities } = t as { capabilities: string[] };
+          const meets = checkUnattendedFloor(capabilities as never).meets;
+          // Only an explicit allow that can also write clears the whole floor.
+          expect(meets, label).toBe(approval === 'allow' && filesystem !== 'read-only');
+          expect(capabilities, label).toContain('read-state');
+        }
+  });
+
+  it('a read-only allow role is missing exactly the write capabilities', () => {
+    const t = a.translatePermissions(
+      { approval: 'allow', filesystem: 'read-only', unattended: 'deny' });
+    const { missing } = checkUnattendedFloor((t as { capabilities: never }).capabilities);
+    expect(missing).toEqual(['write-state', 'workspace-edit']);
+  });
+
+  it('an explicit dontAsk override is judged on what it really grants', () => {
+    // The operator may still write dontAsk by hand; the floor must not be fooled
+    // by it just because it looks permissive.
+    const caps = claudeCapabilities('dontAsk', 'workspace');
+    expect(checkUnattendedFloor(caps).meets).toBe(false);
+    expect(checkUnattendedFloor(claudeCapabilities('bypassPermissions', 'workspace')).meets).toBe(true);
+    expect(checkUnattendedFloor(claudeCapabilities('plan', 'workspace')).missing.length).toBeGreaterThan(0);
   });
 });

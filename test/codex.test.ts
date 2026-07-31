@@ -1,5 +1,6 @@
 import { describe, it, expect } from 'vitest';
-import { makeCodexAdapter } from '../src/harness/codex.js';
+import { makeCodexAdapter, codexCapabilities } from '../src/harness/codex.js';
+import { checkUnattendedFloor } from '../src/permissions.js';
 import { agentDir } from '../src/paths.js';
 import type { ResolvedRole } from '../src/config.js';
 import type { Exec } from '../src/exec.js';
@@ -142,6 +143,24 @@ describe('buildLaunch', () => {
   });
 });
 
+describe('buildAcpLaunch', () => {
+  it('uses the Codex ACP adapter bundled with ours-fleet by default', () => {
+    const launch = makeCodexAdapter(okExec).buildAcpLaunch!(
+      role(), { argv: [], env: {} });
+    expect(launch.argv[0]).toBe(process.execPath);
+    expect(launch.argv[1]).toMatch(
+      /@agentclientprotocol[/\\]codex-acp[/\\]dist[/\\]index\.js$/);
+  });
+
+  it('preserves an explicit ACP command override', () => {
+    const launch = makeCodexAdapter(okExec).buildAcpLaunch!(
+      role({ session_options: { acp: { command: ['custom-codex-acp', '--flag'] } } }),
+      { argv: [], env: {} },
+    );
+    expect(launch.argv).toEqual(['custom-codex-acp', '--flag']);
+  });
+});
+
 describe('vocabulary.monitorInstruction', () => {
   it('asks before arming by default and never backgrounds the watch', () => {
     const a = makeCodexAdapter(okExec);
@@ -228,5 +247,39 @@ describe('validateOptions / prereqs', () => {
     };
     const rep = await makeCodexAdapter(exec).checkPrereqs();
     expect(rep.ok).toBe(true);
+  });
+});
+
+describe('Codex neutral permission mapping and the unattended floor (2.1)', () => {
+  const a = makeCodexAdapter(okExec);
+  const APPROVALS = ['ask', 'allow', 'deny'] as const;
+  const FILESYSTEMS = ['read-only', 'workspace', 'unrestricted'] as const;
+  const UNATTENDED = ['deny', 'wait'] as const;
+
+  it('reports the capability set its native settings actually grant', () => {
+    const t = a.translatePermissions(
+      { approval: 'allow', filesystem: 'workspace', unattended: 'deny' });
+    expect(t).toMatchObject({ supported: true, native: { approval: 'never', sandbox: 'workspace-write' } });
+    expect(checkUnattendedFloor((t as { capabilities: never }).capabilities).meets).toBe(true);
+  });
+
+  it('every neutral combination resolves, and only allow clears the floor', () => {
+    for (const approval of APPROVALS)
+      for (const filesystem of FILESYSTEMS)
+        for (const unattended of UNATTENDED) {
+          const label = `${approval}/${filesystem}/${unattended}`;
+          const t = a.translatePermissions({ approval, filesystem, unattended });
+          expect(t.supported, label).toBe(true);
+          const { capabilities } = t as { capabilities: never };
+          expect(checkUnattendedFloor(capabilities).meets, label)
+            .toBe(approval === 'allow' && filesystem !== 'read-only');
+        }
+  });
+
+  it('on-request cannot meet the floor: nobody is there to answer', () => {
+    expect(checkUnattendedFloor(codexCapabilities('on-request', 'workspace-write')).meets).toBe(false);
+    expect(checkUnattendedFloor(codexCapabilities('never', 'read-only')).missing)
+      .toEqual(['write-state', 'workspace-edit']);
+    expect(checkUnattendedFloor(codexCapabilities('never', 'danger-full-access')).meets).toBe(true);
   });
 });

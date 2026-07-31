@@ -55,6 +55,44 @@ describe('loadConfig', () => {
     expect(b.identity).toBe('Bee');
   });
 
+  it('selects the session backend with one setting and defaults to tmux', () => {
+    base('defaults:\n  session: acp\nroles:\n  A: {}\n  B:\n    session: tmux\n');
+    expect(findRole(loadConfig(), 'A').session).toBe('acp');
+    expect(findRole(loadConfig(), 'B').session).toBe('tmux');
+    base('roles:\n  C: {}\n');
+    expect(findRole(loadConfig(), 'C').session).toBe('tmux');
+  });
+
+  it('merges common permission intent and ACP command settings', () => {
+    base([
+      'defaults:',
+      '  permissions:',
+      '    approval: ask',
+      '    filesystem: read-only',
+      '  session_options:',
+      '    acp:',
+      '      command: [node, agent.mjs]',
+      'roles:',
+      '  A:',
+      '    session: acp',
+      '    permissions:',
+      '      approval: allow',
+      '',
+    ].join('\n'));
+    const role = findRole(loadConfig(), 'A');
+    expect(role.permissions).toEqual({
+      approval: 'allow', filesystem: 'read-only', unattended: 'deny',
+    });
+    expect(role.session_options?.acp?.command).toEqual(['node', 'agent.mjs']);
+  });
+
+  it('rejects invalid session and common permission values', () => {
+    base('roles:\n  A:\n    session: screen\n');
+    expect(() => loadConfig()).toThrowError(/session.*tmux, acp/);
+    base('roles:\n  A:\n    permissions:\n      approval: maybe\n');
+    expect(() => loadConfig()).toThrowError(/permissions\.approval/);
+  });
+
   it('defaults start_stagger_ms to 0 (no stagger) when unset', () => {
     base('roles:\n  A: {}\n');
     expect(loadConfig().startStaggerMs).toBe(0);
@@ -276,5 +314,27 @@ describe('loadConfig monitor', () => {
   it('rejects a non-map defaults.monitor', () => {
     base('defaults:\n  monitor: nope\nroles:\n  A: {}\n');
     expect(() => loadConfig()).toThrowError(/defaults\.monitor must be a map/);
+  });
+});
+
+describe('isolation forbidden-path errors surface at config time (5.2)', () => {
+  it('a role asking for a forbidden mount fails `config` by role and path', () => {
+    writeFileSync(join(dir, 'fleet.yaml'),
+      'roles:\n  Sec:\n    harness: claude-code\n'
+      + '    isolation:\n      fs:\n        write:\n          - ' + join(dir, '.ssh') + '\n');
+    expect(() => loadConfig()).toThrowError(/role 'Sec'.*refusing to mount/s);
+    expect(() => loadConfig()).toThrowError(/\.ssh/);
+  });
+
+  it('a role with an allowed mount still loads', () => {
+    writeFileSync(join(dir, 'fleet.yaml'),
+      'roles:\n  Ok:\n    harness: claude-code\n'
+      + '    isolation:\n      fs:\n        read:\n          - /opt/reference\n');
+    expect(loadConfig().roles).toHaveLength(1);
+  });
+
+  it('a role with no isolation block is unaffected', () => {
+    writeFileSync(join(dir, 'fleet.yaml'), 'roles:\n  Plain:\n    harness: claude-code\n');
+    expect(loadConfig().roles).toHaveLength(1);
   });
 });

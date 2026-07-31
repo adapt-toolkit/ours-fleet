@@ -1,11 +1,15 @@
+import { mkdirSync } from 'node:fs';
 import { join } from 'node:path';
-import { agentDir } from '../paths.js';
+import { agentDir, home } from '../paths.js';
 import { realExec, type Exec } from '../exec.js';
 import type { ResolvedRole } from '../config.js';
 import type {
   HarnessAdapter, RoleDirs, SessionPrep, SessionState, Launch, ValidationError,
+  UnattendedCapability,
 } from './types.js';
 import { registerAdapter } from './registry.js';
+import { harnessRuntimeDir } from '../isolation/policy.js';
+import { bundledAcpAgent } from './acp-agent.js';
 
 interface CodexOptions {
   launcher?: string;
@@ -30,10 +34,28 @@ const SANDBOX_MODES = ['read-only', 'workspace-write', 'danger-full-access'];
 /** Codex CLI's accepted `--ask-for-approval` values. */
 const APPROVAL_POLICIES = ['untrusted', 'on-request', 'never'];
 
+/**
+ * What an unattended role can actually do under Codex's native settings.
+ * `on-request` and `untrusted` stop to ask, and with no console attached that
+ * request is refused rather than answered — so the role can only read.
+ */
+export function codexCapabilities(approval: string, sandbox: string): UnattendedCapability[] {
+  if (approval !== 'never') return ['read-state'];
+  const caps: UnattendedCapability[] = ['read-state', 'messaging', 'monitor', 'status-commands'];
+  if (sandbox !== 'read-only') caps.push('write-state', 'workspace-edit');
+  return caps;
+}
+
 /** Resolve & validate the per-role sandbox mode, throwing on an unknown value. */
 function sandboxMode(role: ResolvedRole): string | undefined {
   const s = (role.harness_options as CodexOptions | undefined)?.sandbox;
-  if (s == null) return undefined;
+  if (s == null) {
+    const filesystem = role.permissions?.filesystem;
+    if (filesystem === 'read-only') return 'read-only';
+    if (filesystem === 'unrestricted') return 'danger-full-access';
+    if (filesystem === 'workspace') return 'workspace-write';
+    return undefined;
+  }
   if (!SANDBOX_MODES.includes(s))
     throw new Error(`invalid harness_options.sandbox "${s}"; allowed: ${SANDBOX_MODES.join(', ')}`);
   return s;
@@ -43,7 +65,12 @@ function sandboxMode(role: ResolvedRole): string | undefined {
 function approvalPolicy(role: ResolvedRole): string | undefined {
   const o = role.harness_options as CodexOptions | undefined;
   const a = o?.approval ?? o?.permission_mode;
-  if (a == null) return undefined;
+  if (a == null) {
+    const approval = role.permissions?.approval;
+    if (approval === 'allow') return 'never';
+    if (approval === 'ask' || approval === 'deny') return 'on-request';
+    return undefined;
+  }
   if (!APPROVAL_POLICIES.includes(a))
     throw new Error(`invalid harness_options.approval "${a}"; allowed: ${APPROVAL_POLICIES.join(', ')}`);
   return a;
@@ -171,7 +198,11 @@ export function makeCodexAdapter(exec: Exec = realExec): HarnessAdapter {
       return errs;
     },
 
-    async prepareSession(role: ResolvedRole, _dirs: RoleDirs): Promise<SessionPrep> {
+    async prepareSession(role: ResolvedRole, dirs: RoleDirs): Promise<SessionPrep> {
+      // Per-role harness runtime home (5.1); harmless for un-isolated roles.
+      // Only a role that declares `isolation:` gets a sandbox, and only a
+      // sandbox needs this directory to exist before entry.
+      if (role.isolation) mkdirSync(harnessRuntimeDir(dirs.stateDir, 'codex'), { recursive: true });
       const requested = launcherMode(role);
       const hasOursCodex = await commandAvailable('ours-codex', exec);
       if (requested === 'ours-codex' && !hasOursCodex)
@@ -189,6 +220,61 @@ export function makeCodexAdapter(exec: Exec = realExec): HarnessAdapter {
         : [command, 'resume', '--last', ...flags, ...prep.argv,
             this.vocabulary.restartPrompt(role.identity, join(stateDir, 'WORKLOG.md'), role)];
       return { argv, env: prep.env };
+    },
+
+    buildAcpLaunch(role: ResolvedRole, prep: SessionPrep): Launch {
+      const configured = role.session_options?.acp?.command;
+      const argv = Array.isArray(configured)
+        ? [...configured]
+        : typeof configured === 'string'
+          ? ['sh', '-c', configured]
+          : bundledAcpAgent(
+              '@agentclientprotocol/codex-acp', 'codex-acp', 'codex-acp');
+      return { argv, env: prep.env };
+    },
+
+    isolationPaths(role: ResolvedRole, _dirs: RoleDirs) {
+      const codexHome = join(home(), '.codex');
+      const profile = (role.harness_options as CodexOptions | undefined)?.profile;
+      return {
+        home: codexHome,
+        // Credentials, shared config, shared instructions, and the role's own
+        // profile file if it names one. Sessions, history, caches and the local
+        // sqlite stores are runtime state and stay per-role.
+        shared: [
+          join(codexHome, 'auth.json'),
+          join(codexHome, 'config.toml'),
+          join(codexHome, 'AGENTS.md'),
+          join(codexHome, 'plugins'),
+          ...(profile ? [join(codexHome, `${profile}.config.toml`)] : []),
+          join(home(), '.agents'),
+        ],
+      };
+    },
+
+    nativePermissionOverrides(options: unknown): Record<string, unknown> {
+      const o = options as CodexOptions | undefined;
+      const approval = o?.approval ?? o?.permission_mode;   // permission_mode is the alias
+      return {
+        ...(approval == null ? {} : { approval }),
+        ...(o?.sandbox == null ? {} : { sandbox: o.sandbox }),
+      };
+    },
+
+    translatePermissions(permissions) {
+      const approval = permissions.approval === 'allow' ? 'never' : 'on-request';
+      const sandbox = permissions.filesystem === 'read-only'
+        ? 'read-only'
+        : permissions.filesystem === 'unrestricted'
+          ? 'danger-full-access'
+          : 'workspace-write';
+      return {
+        supported: true,
+        native: { approval, sandbox },
+        exact: true,
+        warnings: [],
+        capabilities: codexCapabilities(approval, sandbox),
+      };
     },
 
     vocabulary: {

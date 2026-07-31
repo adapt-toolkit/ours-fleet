@@ -1,8 +1,62 @@
-import { join, dirname } from 'node:path';
+import { realpathSync } from 'node:fs';
+import { basename, dirname, join, resolve, sep } from 'node:path';
 import {
   BACKENDS, ON_UNAVAILABLE, NETWORK_MODES,
   type IsolationConfig, type Mount, type ResolvedIsolation, type WrapContext,
 } from './types.js';
+
+/** A mount that the forbidden-path policy refuses. Raised before any launch. */
+export class IsolationPolicyError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'IsolationPolicyError';
+  }
+}
+
+/**
+ * Resolve a path to its canonical form, following symlinks as far as the
+ * filesystem allows and normalising the rest. Without this, `~/link-to-ssh`
+ * and `/home/u/.ssh` are different strings for the same directory, and a
+ * string comparison against the forbidden list is trivially side-stepped.
+ */
+export function canonicalPath(p: string): string {
+  const abs = resolve(p);
+  let head = abs;
+  let tail = '';
+  for (;;) {
+    try { return tail ? join(realpathSync.native(head), tail) : realpathSync.native(head); }
+    catch {
+      const parent = dirname(head);
+      if (parent === head) return abs;          // nothing on this path exists yet
+      tail = tail ? join(basename(head), tail) : basename(head);
+      head = parent;
+    }
+  }
+}
+
+const within = (child: string, parent: string): boolean =>
+  child === parent || child.startsWith(parent + sep);
+
+/**
+ * How a canonical mount path collides with a canonical forbidden path.
+ *
+ * `parent` matters as much as the other two: binding `$HOME` does not name
+ * `~/.ssh`, but it exposes it just as completely.
+ */
+export function mountConflict(
+  mount: string, forbidden: string,
+): 'exact' | 'descendant' | 'parent' | null {
+  if (mount === forbidden) return 'exact';
+  if (within(mount, forbidden)) return 'descendant';
+  if (within(forbidden, mount)) return 'parent';
+  return null;
+}
+
+const CONFLICT_WORDING = {
+  exact: 'is',
+  descendant: 'is inside',
+  parent: 'would expose',
+} as const;
 
 /** Read-only system dirs exposed under the allowlist model. */
 const SYSTEM_RO = ['/usr', '/bin', '/sbin', '/lib', '/lib64', '/etc'];
@@ -66,6 +120,14 @@ export function validateIsolationConfig(raw: unknown): string[] {
   return problems;
 }
 
+/**
+ * Where a role's per-role harness runtime state lives (5.1). Under the agent's
+ * own state directory, so it is covered by the state dir's existing lifecycle
+ * and by the forbidden-path exception, and is never shared with a peer.
+ */
+export const harnessRuntimeDir = (stateDir: string, harnessId: string): string =>
+  join(stateDir, 'harness', harnessId);
+
 /** Parse a `host:container` secret pair; a bare path maps to itself. */
 function parseSecret(pair: string): Mount {
   const i = pair.indexOf(':');
@@ -76,12 +138,17 @@ function parseSecret(pair: string): Mount {
 
 /**
  * Resolve a raw (already validated) isolation block against runtime context into
- * a defaults-filled, backend-agnostic policy. Pure — no I/O, no probing.
+ * a defaults-filled, backend-agnostic policy, and REFUSE any mount that would
+ * breach the forbidden-path list.
  *
- * The mount model is an allowlist: only the durable set (state dir, cwd, Claude
- * config, declared fs/secrets) plus read-only system dirs are exposed; everything
- * else on the host — the ours key store, sibling agent state dirs, ~/.ssh, ~/.aws —
- * is simply never mounted, and thus absent inside the sandbox (§5.2).
+ * The mount model is an allowlist: only the durable set (state dir, cwd, harness
+ * config, declared fs/secrets) plus read-only system dirs are exposed. The
+ * forbidden list — the ours key store, sibling agent state dirs, ~/.ssh, ~/.aws
+ * — is now enforced on top of that, so a role cannot ask its way back in.
+ *
+ * Not pure: canonicalising a path reads the filesystem, because symlink aliases
+ * are one of the ways a forbidden path gets requested. Throws
+ * `IsolationPolicyError`; callers surface it against the role.
  */
 export function resolveIsolation(cfg: IsolationConfig, ctx: WrapContext): ResolvedIsolation {
   const { stateDir, runCwd, home } = ctx;
@@ -89,11 +156,24 @@ export function resolveIsolation(cfg: IsolationConfig, ctx: WrapContext): Resolv
   const mounts: Mount[] = [];
   const addRw = (p: string) => { if (!mounts.some(m => m.src === p)) mounts.push({ src: p, dst: p, mode: 'rw' }); };
   const addRo = (p: string) => { if (!mounts.some(m => m.src === p)) mounts.push({ src: p, dst: p, mode: 'ro' }); };
+  /** Writable bind whose destination differs from its source (the per-role home). */
+  const addRw2 = (src: string, dst: string) => {
+    if (!mounts.some(m => m.src === src && m.dst === dst)) mounts.push({ src, dst, mode: 'rw' });
+  };
 
   // Durable set: state dir + cwd, then only the active harness's config/auth roots.
   addRw(stateDir);
   addRw(runCwd);
-  if (ctx.harness === 'codex') {
+  if (ctx.harnessHome && ctx.harnessRuntimeDir) {
+    // The harness home is backed by a PER-ROLE directory (5.1): the agent gets a
+    // writable home for its sessions, caches and history, and anything a future
+    // CLI version writes lands there too. The shared credentials, global
+    // instructions and configuration are then layered back read-only, so they
+    // are readable and cannot be rewritten — for this role or for its peers.
+    // Order matters: the writable home must precede the read-only overlays.
+    addRw2(ctx.harnessRuntimeDir, ctx.harnessHome);
+    for (const p of ctx.harnessSharedPaths ?? []) addRo(p);
+  } else if (ctx.harness === 'codex') {
     addRw(join(home, '.codex'));
     addRo(join(home, '.agents'));
   } else {
@@ -117,6 +197,34 @@ export function resolveIsolation(cfg: IsolationConfig, ctx: WrapContext): Resolv
     ...SENSITIVE_HOME.map(p => join(home, p)),
     agentsRoot, // sibling agents' state dirs (this agent's own is explicitly mounted)
   ];
+
+  // ENFORCE the list, before anything builds a backend argv. Until now it was
+  // observational: the allowlist model kept these paths out by default, but a
+  // role that asked for one in `fs.write`, `secrets`, or a Codex `add_dirs` got
+  // it mounted anyway, and the "blocklist" recorded a guarantee it never made.
+  //
+  // The role's OWN state dir is the one legitimate descendant of the agents
+  // root, so it is excepted by exact canonical identity — which does not
+  // exempt its parent, and does not exempt a sibling.
+  const forbidden = blocklist.map(canonicalPath);
+  const ownStateDir = canonicalPath(stateDir);
+  for (const m of mounts) {
+    for (const [role, path] of [['source', m.src], ['destination', m.dst]] as const) {
+      const canon = canonicalPath(path);
+      // The role's own state dir and anything inside it (its per-role harness
+      // runtime home, 5.1) is the one legitimate descendant of the agents root.
+      // This does not exempt the root above it, nor a sibling beside it.
+      if (within(canon, ownStateDir)) continue;
+      for (let i = 0; i < forbidden.length; i++) {
+        const kind = mountConflict(canon, forbidden[i]);
+        if (!kind) continue;
+        const alias = canon === resolve(path) ? '' : ` (resolves to '${canon}')`;
+        throw new IsolationPolicyError(
+          `isolation: refusing to mount ${role} '${path}'${alias} — it ` +
+          `${CONFLICT_WORDING[kind]} the forbidden path '${blocklist[i]}'`);
+      }
+    }
+  }
 
   return {
     backend: cfg.backend ?? 'auto',

@@ -21,6 +21,11 @@ vars:
 
 defaults:
   harness: claude-code        # adapter for roles that don't set their own
+  session: tmux               # tmux (default) | acp; independent of harness
+  permissions:                # common intent translated to each harness/backend
+    approval: ask             # ask | allow | deny
+    filesystem: workspace     # read-only | workspace | unrestricted
+    unattended: deny          # deny | wait when no ACP console is attached
   # model: claude-fable-5       # default model for roles without their own (per-role model / --model wins)
   max_tokens: 500000          # session cap before auto-compact (harness-interpreted)
   monitor:                    # supervisor-owned mail wake (fleet-wide default)
@@ -39,6 +44,12 @@ defaults:
   #   search: true
   #   config:
   #     model_reasoning_effort: high
+  #
+  # To run those roles over ACP instead of tmux:
+  # session: acp
+  # session_options:
+  #   acp:
+  #     command: codex-acp     # optional; this is the Codex default
 
 roles:
 
