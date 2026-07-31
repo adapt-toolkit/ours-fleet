@@ -63,6 +63,13 @@ export interface SchedulerDeps {
   onSchedulerAlert?(wd: ResolvedWatchdog, text: string): Promise<void>;
   /** Poll cadence while held down. Default 5000. */
   heldPollMs?: number;
+  /**
+   * Injectable run-lock primitives. Default: store's acquireRunLock /
+   * releaseRunLock. Both are mkdir/rmdir-backed and can throw (EACCES, EIO,
+   * ENOTEMPTY on release) — the loop always classifies such a throw as a
+   * failed tick rather than letting it escape (review finding #1).
+   */
+  locks?: { acquire(name: string): boolean; release(name: string): void };
 }
 
 /**
@@ -77,60 +84,22 @@ export async function runWatchdogLoop(wd: ResolvedWatchdog, deps: SchedulerDeps)
   const shouldStop = deps.shouldStop ?? (() => false);
   const onSchedulerAlert = deps.onSchedulerAlert ?? (async () => {});
   const heldPollMs = deps.heldPollMs ?? 5_000;
+  const locks = deps.locks ?? { acquire: acquireRunLock, release: releaseRunLock };
 
-  for (;;) {
-    if (shouldStop()) return;
-
-    if (readSchedulerState(wd.name).heldDown) {
-      await deps.sleep(heldPollMs);
-      if (shouldStop()) return;
-      continue;
-    }
-
-    if (!acquireRunLock(wd.name)) {
-      const t = deps.now();
-      writeReport(wd.name, errorReport({
-        watchdog: wd.name, run_id: formatRunId(t),
-        started_at: t.toISOString(), finished_at: t.toISOString(),
-        error: 'skipped_overlap',
-      }));
-      deps.log(`watchdog ${wd.name}: skipped run (previous run still holds the lock)`);
-      // Failure count is untouched by a skip; only lastRunAt/nextRunAt move.
-      const skipState = readSchedulerState(wd.name);
-      const delay = watchdogBackoffMs(wd.intervalMs, skipState.consecutiveFailures);
-      writeSchedulerState(wd.name, {
-        ...skipState,
-        lastRunAt: t.toISOString(),
-        nextRunAt: new Date(t.getTime() + delay).toISOString(),
-      });
-      await deps.sleep(delay);
-      if (shouldStop()) return;
-      continue;
-    }
-
-    const startedAt = deps.now();
-    let outcome: WatchdogRunOutcome | undefined;
-    let thrownMessage: string | undefined;
-    try {
-      try {
-        outcome = await runOnceFor(wd, {
-          binPath: deps.binPath, log: deps.log, now: deps.now, sleep: deps.sleep,
-        });
-      } catch (e) {
-        thrownMessage = e instanceof Error ? e.message : String(e);
-      }
-    } finally {
-      releaseRunLock(wd.name);
-    }
-
-    const isFailure = outcome === undefined
-      ? true
-      : outcome.report.status === 'error' && outcome.report.error !== 'skipped_overlap';
-
+  /**
+   * Apply one tick's outcome to state.json: update the failure streak,
+   * transition into hold-down on the Nth consecutive failure (firing the
+   * alert exactly once via the `!heldDown` guard), then sleep before the
+   * next tick. On the tick that transitions into hold-down, sleep
+   * `heldPollMs` rather than the (possibly hour-long) backoff delay — an
+   * operator's resetSchedulerState must be noticed within one poll cycle,
+   * not after the last backoff finishes (review finding #2).
+   */
+  const settle = async (isFailure: boolean, errorMessage: string | undefined, startedAt: Date): Promise<void> => {
     const s = readSchedulerState(wd.name);
     if (isFailure) {
       s.consecutiveFailures += 1;
-      s.lastError = outcome ? (outcome.report.error ?? thrownMessage ?? 'unknown error') : thrownMessage;
+      s.lastError = errorMessage;
     } else {
       s.consecutiveFailures = 0;
       s.lastError = undefined;
@@ -144,7 +113,7 @@ export async function runWatchdogLoop(wd: ResolvedWatchdog, deps: SchedulerDeps)
       justHeld = true;
     }
 
-    const delay = watchdogBackoffMs(wd.intervalMs, s.consecutiveFailures);
+    const delay = justHeld ? heldPollMs : watchdogBackoffMs(wd.intervalMs, s.consecutiveFailures);
     s.nextRunAt = new Date(deps.now().getTime() + delay).toISOString();
     writeSchedulerState(wd.name, s);
 
@@ -155,6 +124,90 @@ export async function runWatchdogLoop(wd: ResolvedWatchdog, deps: SchedulerDeps)
     }
 
     await deps.sleep(delay);
+  };
+
+  for (;;) {
+    if (shouldStop()) return;
+
+    if (readSchedulerState(wd.name).heldDown) {
+      await deps.sleep(heldPollMs);
+      if (shouldStop()) return;
+      continue;
+    }
+
+    const tickStart = deps.now();
+
+    // The run-lock is a filesystem mutex (mkdir/rmdir) and can throw
+    // (EACCES, EIO, ENOTEMPTY on release — store.ts's release deliberately
+    // rethrows non-ENOENT failures). Never let that throw escape this loop:
+    // runScheduler drives every watchdog's loop via Promise.all, so an
+    // uncaught throw here would kill every OTHER watchdog's loop too.
+    // Classify it as this tick's failure instead (review finding #1).
+    let acquired = false;
+    let acquireError: string | undefined;
+    try {
+      acquired = locks.acquire(wd.name);
+    } catch (e) {
+      acquireError = e instanceof Error ? e.message : String(e);
+    }
+
+    if (acquireError !== undefined) {
+      await settle(true, acquireError, tickStart);
+      if (shouldStop()) return;
+      continue;
+    }
+
+    if (!acquired) {
+      writeReport(wd.name, errorReport({
+        watchdog: wd.name, run_id: formatRunId(tickStart),
+        started_at: tickStart.toISOString(), finished_at: tickStart.toISOString(),
+        error: 'skipped_overlap',
+      }));
+      deps.log(`watchdog ${wd.name}: skipped run (previous run still holds the lock)`);
+      // Failure count is untouched by a skip; only lastRunAt/nextRunAt move.
+      // The backoff cadence (not the raw interval) still governs during an
+      // active failure streak: a skip isn't a finished run, so it shouldn't
+      // reset the retry cadence to full speed either (spec §3).
+      const skipState = readSchedulerState(wd.name);
+      const delay = watchdogBackoffMs(wd.intervalMs, skipState.consecutiveFailures);
+      writeSchedulerState(wd.name, {
+        ...skipState,
+        lastRunAt: tickStart.toISOString(),
+        nextRunAt: new Date(tickStart.getTime() + delay).toISOString(),
+      });
+      await deps.sleep(delay);
+      if (shouldStop()) return;
+      continue;
+    }
+
+    let outcome: WatchdogRunOutcome | undefined;
+    let tickError: string | undefined;
+    try {
+      outcome = await runOnceFor(wd, {
+        binPath: deps.binPath, log: deps.log, now: deps.now, sleep: deps.sleep,
+      });
+    } catch (e) {
+      tickError = e instanceof Error ? e.message : String(e);
+    } finally {
+      // Same "never escape" rule applies to release: fold a throw into this
+      // tick's failure rather than letting it propagate out of the loop.
+      try {
+        locks.release(wd.name);
+      } catch (e) {
+        tickError = tickError ?? (e instanceof Error ? e.message : String(e));
+      }
+    }
+
+    let errorMessage: string | undefined;
+    if (outcome === undefined) {
+      errorMessage = tickError;
+    } else if (outcome.report.status === 'error' && outcome.report.error !== 'skipped_overlap') {
+      errorMessage = outcome.report.error ?? tickError ?? 'unknown error';
+    } else {
+      errorMessage = tickError;
+    }
+
+    await settle(errorMessage !== undefined, errorMessage, tickStart);
     if (shouldStop()) return;
   }
 }

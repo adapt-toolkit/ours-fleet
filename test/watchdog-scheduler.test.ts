@@ -3,7 +3,7 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
-  watchdogBackoffMs, runWatchdogLoop, readSchedulerState, resetSchedulerState,
+  watchdogBackoffMs, runWatchdogLoop, readSchedulerState, resetSchedulerState, writeSchedulerState,
 } from '../src/watchdog/scheduler.js';
 import { listRuns, acquireRunLock, releaseRunLock, formatRunId } from '../src/watchdog/store.js';
 import { errorReport } from '../src/watchdog/report.js';
@@ -107,5 +107,48 @@ describe('watchdog scheduler', () => {
     await runWatchdogLoop(wd as never, deps as never);
     resetSchedulerState('nightwatch');
     expect(readSchedulerState('nightwatch').heldDown).toBe(false);
+  });
+
+  it('a lock-primitive throw (acquire) counts as a failed tick and the loop survives (review #1)', async () => {
+    const deps = world({ results: ['ok', 'ok', 'ok'] });   // safety net only; should never be consumed
+    let attempts = 0;
+    (deps as unknown as { locks: { acquire(name: string): boolean; release(name: string): void } }).locks = {
+      acquire: (_name: string) => { attempts++; throw new Error('EACCES: lock dir'); },
+      release: (_name: string) => {},
+    };
+    // Bounded independently of `attempts` so a build that ignores injected
+    // locks (i.e. still calls the real store fns) can't hang the suite.
+    deps.shouldStop = () => attempts >= 3 || deps.sleeps.length >= 10;
+    await runWatchdogLoop(wd as never, deps as never);
+    expect(attempts).toBe(3);
+    const s = readSchedulerState('nightwatch');
+    expect(s.consecutiveFailures).toBe(3);
+    expect(s.lastError).toBe('EACCES: lock dir');
+  });
+
+  it('the tick that transitions into hold-down sleeps heldPollMs, not the backoff delay (review #2)', async () => {
+    const deps = world({ results: ['error', 'error', 'error'] });
+    await runWatchdogLoop(wd as never, deps as never);
+    expect(deps.sleeps[2]).toBe(5_000);   // would be 2_400_000 (4x backoff) pre-fix
+  });
+
+  it('a skip tick during an active failure streak keeps the backoff cadence, not the raw interval (review #3, pinned deviation)', async () => {
+    writeSchedulerState('nightwatch', { version: 1, consecutiveFailures: 2, heldDown: false });
+    acquireRunLock('nightwatch');
+    const deps = world({ results: [] });
+    deps.shouldStop = () => deps.sleeps.length >= 1;
+    await runWatchdogLoop(wd as never, deps as never);
+    releaseRunLock('nightwatch');
+    expect(deps.sleeps).toEqual([1_200_000]);   // 2x interval: watchdogBackoffMs(600_000, 2)
+    expect(readSchedulerState('nightwatch').consecutiveFailures).toBe(2);
+  });
+
+  it('three consecutive thrown runs also trip the hold-down circuit, proving throws count as failures (review #4)', async () => {
+    const deps = world({ results: ['throw', 'throw', 'throw'] });
+    await runWatchdogLoop(wd as never, deps as never);
+    const s = readSchedulerState('nightwatch');
+    expect(s.heldDown).toBe(true);
+    expect(s.lastError).toBe('spawn failed');
+    expect(deps.alerts).toHaveLength(1);
   });
 });
