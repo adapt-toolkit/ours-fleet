@@ -7,6 +7,8 @@ import { join } from 'node:path';
 import { executeWatchdogRun } from '../src/watchdog/run.js';
 import { listRuns, writeReport } from '../src/watchdog/store.js';
 import { errorReport } from '../src/watchdog/report.js';
+import { readLedger, writeLedger } from '../src/watchdog/alerts.js';
+import type { WatchManifest } from '../src/watchdog/briefing.js';
 import { agentDir } from '../src/paths.js';
 import { START_STAGGER_FILE } from '../src/runner.js';
 import '../src/harness/claude-code.js';
@@ -133,5 +135,43 @@ describe('executeWatchdogRun', () => {
     deps.cfg = { ...deps.cfg, startStaggerMs: 1234 };
     await executeWatchdogRun(wd as never, deps as never);
     expect(seen).toBe('1234');
+  });
+
+  it('injects the suppression digest into watch.json and reconciles the ledger after the run (acceptance 5/6)', async () => {
+    writeLedger('nightwatch', {
+      version: 1, heldDownAlerted: false,
+      open: { Alice: { role: 'Alice', status: 'stale', since: '2026-07-31T10:00:00Z', lastAlertedAt: '2026-07-31T10:00:00Z' } },
+    });
+    let manifest: WatchManifest | undefined;
+    const launch = fakeChild(async runDir => {
+      manifest = JSON.parse(readFileSync(join(runDir, 'watch.json'), 'utf8'));
+      writeGoodReport(runDir);   // Alice blocked, alerted:true, alerts:[Alice] (Task 7 fixture)
+    });
+    await executeWatchdogRun(wd as never, baseDeps(launch) as never);
+    expect(manifest!.digest.open[0]).toMatchObject({ role: 'Alice', status: 'stale' });
+    expect(manifest!.digest.open[0].realert_after).toBe('2026-07-31T11:00:00.000Z');
+    const ledger = readLedger('nightwatch');
+    expect(ledger.open.Alice.status).toBe('blocked');       // escalated, since preserved
+    expect(ledger.open.Alice.since).toBe('2026-07-31T10:00:00Z');
+    expect(ledger.open.Alice.lastAlertedAt).not.toBeNull(); // report.alerts stamped it
+  });
+
+  it('a healthy report closes the open finding (resolved path, acceptance 6)', async () => {
+    writeLedger('nightwatch', {
+      version: 1, heldDownAlerted: false,
+      open: { Alice: { role: 'Alice', status: 'blocked', since: '2026-07-31T10:00:00Z', lastAlertedAt: '2026-07-31T10:00:00Z' } },
+    });
+    const launch = fakeChild(async runDir => {
+      const healthy = {
+        ...JSON.parse(readFileSync('test/fixtures/watchdog-good-report.json', 'utf8')),
+        status: 'ok', roles: [{ role: 'Alice', status: 'healthy' }], alerts: [],
+        summary: { checked: 1, healthy: 1, idle: 0, anomalies: 0 },
+      };
+      writeFileSync(join(runDir, 'report.json'), JSON.stringify(healthy));
+      const old = new Date(Date.now() - 5_000);
+      utimesSync(join(runDir, 'report.json'), old, old);
+    });
+    await executeWatchdogRun(wd as never, baseDeps(launch) as never);
+    expect(readLedger('nightwatch').open).toEqual({});
   });
 });

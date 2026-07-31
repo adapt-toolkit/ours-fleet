@@ -10,6 +10,7 @@ import type { WatchdogReport } from './report.js';
 import { errorReport, normalizeWatchdogReport, validateWatchdogReport } from './report.js';
 import { formatRunId, pruneReports, writeReport } from './store.js';
 import { generateWatchdogBriefing, type WatchManifest } from './briefing.js';
+import { computeDigest, reconcileLedger, readLedger, writeLedger } from './alerts.js';
 import { applyRole } from '../ops.js';
 import {
   daemonIdentityProvisioner, ensureIdentity, type IdentityProvisioner,
@@ -108,6 +109,9 @@ export async function executeWatchdogRun(
   const startedAt = start.toISOString();
   const roleName = wd.identity;
   const runDir = agentDir(roleName, true);
+  // Read once, before the manifest is written: the same snapshot both seeds the
+  // digest the agent sees and is the base the post-run reconcile folds into.
+  const ledger = readLedger(wd.name);
 
   // A crashed previous run can leave the temp dir behind; start clean.
   if (existsSync(runDir)) rmSync(runDir, { recursive: true, force: true });
@@ -150,7 +154,7 @@ export async function executeWatchdogRun(
     const manifest: WatchManifest = {
       watchdog: wd.name, run_id: runId, coordinator: wd.coordinator, started_at: startedAt,
       roles: wd.watch.map(r => ({ name: r, stateDir: agentDir(r) })),
-      digest: { cooldown_ms: wd.alertCooldownMs, open: [] },   // Phase 2 fills open[]
+      digest: computeDigest(ledger, wd.alertCooldownMs, now()),
     };
     writeFileSync(manifestPath, JSON.stringify(manifest, null, 2) + '\n');
     // Snapshot the fleet start-stagger so the detached run (no config path
@@ -220,6 +224,10 @@ export async function executeWatchdogRun(
   }
 
   const storedPath = writeReport(wd.name, report);
+  // Reconciles against the FINAL stored report (normalized or error) — reconcileLedger
+  // itself no-ops on error-status reports, so a timeout/invalid run leaves the ledger
+  // byte-for-byte unchanged.
+  writeLedger(wd.name, reconcileLedger(ledger, report, now()));
   pruneReports(wd.name, wd.keepReports);
   return { report, storedPath };
 }
