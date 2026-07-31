@@ -3,11 +3,16 @@ import { test, expect } from '@playwright/test';
 test('bootstrap, inventory, navigation, send, create, and security boundaries', async ({ page, request }) => {
   const bootstrap = (await (await request.post('/__test/bootstrap')).json()).url as string;
   await page.goto(bootstrap);
-  await expect(page.getByRole('heading', { name: 'Your fleet' })).toBeVisible();
+  await expect(page.getByRole('heading', { name: 'All roles' })).toBeVisible();
   await expect(page).toHaveURL('http://127.0.0.1:49371/');
   await expect(page.getByText('Alpha', { exact: true }).first()).toBeVisible();
   await expect(page.getByText('live · idle')).toBeVisible();
   await expect(page.getByText(/service inactive · authoritative/)).toBeVisible();
+  await expect(page.getByLabel('Fleet status meanings')).toContainText('Busy active turn or permission');
+  await expect(page.getByLabel('Fleet status meanings')).toContainText(
+    'Needs attention includes attention, unknown, and offline roles.',
+  );
+  await expect(page.locator('.status-chip.ready')).toHaveText(/Ready/);
   const manifest = await request.get('/manifest.webmanifest');
   expect(manifest.status()).toBe(200);
   expect(manifest.headers()['content-type']).toMatch(/manifest|json/);
@@ -19,7 +24,7 @@ test('bootstrap, inventory, navigation, send, create, and security boundaries', 
   expect(installErrors.filter(error => error.errorId !== 'in-incognito')).toEqual([]);
   await request.post('/__test/restart-auth');
   await page.reload();
-  await expect(page.getByRole('heading', { name: 'Your fleet' })).toBeVisible();
+  await expect(page.getByRole('heading', { name: 'All roles' })).toBeVisible();
   await expect(page).toHaveURL('http://127.0.0.1:49371/');
   const mission = page.locator('.mission-summary').first();
   await expect(mission).toHaveAttribute('title', /intentionally long mission/);
@@ -68,7 +73,7 @@ test('bootstrap, inventory, navigation, send, create, and security boundaries', 
   await expect(page.getByText('Alpha', { exact: true })).toHaveCount(0);
   await page.context().setOffline(false);
   await page.goto('http://127.0.0.1:49371/');
-  await expect(page.getByRole('heading', { name: 'Your fleet' })).toBeVisible();
+  await expect(page.getByRole('heading', { name: 'All roles' })).toBeVisible();
   const cached = await page.evaluate(async () => (await Promise.all(
     (await caches.keys()).map(async key => (await caches.open(key)).keys()),
   )).flat().map(request => new URL(request.url).pathname));

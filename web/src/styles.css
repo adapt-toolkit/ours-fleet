@@ -47,6 +47,14 @@ button.secondary:hover, .actions button:hover { border-color: #526064; }
 .content, .workspace { padding: 28px 36px 60px; }
 .toolbar { display: flex; align-items: center; justify-content: space-between; margin-bottom: 16px; color: var(--muted); font-size: 12px; }
 .toolbar input { width: 340px; padding: 10px 13px; color: white; background: #101516; border: 1px solid var(--line); border-radius: 8px; }
+.status-guide { display: flex; flex-wrap: wrap; gap: 7px; align-items: center; margin-bottom: 15px; color: var(--muted); font-size: 11px; }
+.status-guide > span, .status-chip { display: inline-flex; align-items: center; gap: 5px; border: 1px solid #30393b; border-radius: 12px; padding: 3px 7px; white-space: nowrap; }
+.status-guide b { color: white; font-size: 11px; }
+.status-guide small { flex-basis: 100%; color: var(--muted); }
+.status-guide .ready, .status-chip.ready { border-color: #315e4a; }
+.status-guide .busy, .status-chip.busy { border-color: #315478; }
+.status-guide .attention, .status-chip.attention, .status-chip.unknown { border-color: #66552f; }
+.status-guide .offline, .status-chip.offline { border-color: #693b38; }
 .role-table { border: 1px solid var(--line); border-radius: 10px; overflow: hidden; background: rgba(14,18,19,.8); }
 .role-row { display: grid; grid-template-columns: minmax(260px, 1.55fr) repeat(4, minmax(125px, 1fr)); width: 100%; align-items: center; gap: 15px; padding: 14px 18px; border: 0; border-bottom: 1px solid var(--line); background: transparent; text-align: left; cursor: pointer; }
 button.role-row:hover { background: #141a1b; }
@@ -55,9 +63,14 @@ button.role-row:hover { background: #141a1b; }
 .role-row > span { min-width: 0; display: flex; flex-direction: column; gap: 3px; }
 .role-row strong { font-size: 13px; text-transform: capitalize; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .role-row small { color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-.role-name { position: relative; display: grid !important; grid-template-columns: 13px 1fr auto; align-items: center; }
+.role-name { position: relative; display: grid !important; grid-template-columns: auto 1fr auto; align-items: center; }
 .role-name .mission-summary { display: -webkit-box; max-height: 2.5em; line-height: 1.25; overflow: hidden; overflow-wrap: anywhere; white-space: normal; -webkit-box-orient: vertical; -webkit-line-clamp: 2; }
-.role-name .state { width: 7px; height: 7px; border-radius: 50%; background: #667174; }
+.status-chip { color: #c9d1d3; font-size: 10px; padding: 3px 6px; }
+.status-chip i { width: 6px; height: 6px; border-radius: 50%; background: #667174; }
+.status-chip.ready i { background: var(--mint); }
+.status-chip.busy i { background: #71b7ff; }
+.status-chip.attention i, .status-chip.unknown i { background: var(--amber); }
+.status-chip.offline i { background: var(--red); }
 .state.ready, .hero-state.ready i { background: var(--mint); box-shadow: 0 0 7px #69dba0; }
 .state.busy, .hero-state.busy i { background: #71b7ff; }
 .state.attention, .state.unknown, .hero-state.attention i, .hero-state.unknown i { background: var(--amber); }

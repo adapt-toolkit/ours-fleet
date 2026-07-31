@@ -20,6 +20,8 @@ type FleetItem = {
   capabilities: Record<string, unknown>;
 };
 
+const attentionStates = ['attention', 'offline', 'unknown'];
+
 export function App() {
   const [ready, setReady] = useState(false);
   const [error, setError] = useState('');
@@ -83,9 +85,9 @@ export function App() {
   const shown = useMemo(() => items.filter(item => {
     const text = `${item.role.id} ${item.role.config?.mission ?? ''} ${item.status.overall}`.toLowerCase();
     return text.includes(filter.toLowerCase())
-      && (view !== 'attention' || ['attention', 'offline', 'unknown'].includes(item.status.overall));
+      && (view !== 'attention' || attentionStates.includes(item.status.overall));
   }).sort((a, b) => {
-    const attention = (item: FleetItem) => ['attention', 'offline', 'unknown'].includes(item.status.overall) ? 0 : 1;
+    const attention = (item: FleetItem) => attentionStates.includes(item.status.overall) ? 0 : 1;
     return attention(a) - attention(b) || a.role.id.localeCompare(b.role.id);
   }), [filter, items, view]);
 
@@ -103,8 +105,9 @@ export function App() {
           <button className={view === name ? 'active' : ''} key={name} onClick={() => {
             setView(name); setSelected('');
           }}>
-            <span>{name === 'fleet' ? '◫' : name === 'attention' ? '△' : '≡'}</span>{name}
-            {name === 'attention' && <b>{items.filter(item => ['attention', 'offline', 'unknown'].includes(item.status.overall)).length}</b>}
+            <span aria-hidden="true">{name === 'fleet' ? '◫' : name === 'attention' ? '△' : '≡'}</span>
+            {name === 'fleet' ? 'All roles' : name === 'attention' ? 'Needs attention' : 'Audit trail'}
+            {name === 'attention' && <b>{items.filter(item => attentionStates.includes(item.status.overall)).length}</b>}
           </button>)}
       </nav>
       <div className="sidebar-foot"><i className={connection} /> {connection}
@@ -114,7 +117,7 @@ export function App() {
       <header>
         <div>
           <span className="eyebrow">{selected ? 'role workspace' : view}</span>
-          <h1>{selected || (view === 'attention' ? 'Needs attention' : view === 'audit' ? 'Audit trail' : 'Your fleet')}</h1>
+          <h1>{selected || (view === 'attention' ? 'Needs attention' : view === 'audit' ? 'Audit trail' : 'All roles')}</h1>
         </div>
         <div className="header-actions">
           {installPrompt && <button className="secondary" onClick={() => {
@@ -132,6 +135,13 @@ export function App() {
         : view === 'audit'
           ? <AuditView />
           : <div className="content">
+            <div className="status-guide" aria-label="Fleet status meanings">
+              <span className="ready"><b>Ready</b> live and idle</span>
+              <span className="busy"><b>Busy</b> active turn or permission</span>
+              <span className="attention"><b>Attention</b> warning or unknown evidence</span>
+              <span className="offline"><b>Offline</b> authoritative session stop</span>
+              <small>Needs attention includes attention, unknown, and offline roles.</small>
+            </div>
             <div className="toolbar">
               <input aria-label="Filter roles" placeholder="Filter roles, missions, state…" value={filter}
                 onChange={event => setFilter(event.target.value)} />
@@ -142,7 +152,8 @@ export function App() {
                 <span>Role</span><span>Runtime</span><span>Evidence</span><span>Monitor</span><span>Observed</span>
               </div>
               {shown.map(item => <button className="role-row" key={item.role.id} onClick={() => setSelected(item.role.id)}>
-                <span className="role-name"><i className={`state ${item.status.overall}`} />
+                <span className="role-name"><span className={`status-chip ${item.status.overall}`}>
+                  <i aria-hidden="true" />{statusLabel(item.status.overall)}</span>
                   <span><strong>{item.role.id}</strong><small className="mission-summary"
                     title={item.role.config?.mission}>{item.role.config?.mission || 'No mission summary'}</small></span>
                   <em>{item.role.lifetime}</em></span>
@@ -161,6 +172,13 @@ export function App() {
       if (path) history.replaceState(null, '', path);
     }} />}
   </div>;
+}
+
+function statusLabel(overall: string): string {
+  return overall === 'ready' ? 'Ready'
+    : overall === 'busy' ? 'Busy'
+      : overall === 'offline' ? 'Offline'
+        : overall === 'attention' ? 'Attention' : 'Unknown';
 }
 
 interface InstallPromptEvent extends Event {
