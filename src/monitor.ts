@@ -2,6 +2,7 @@ import { existsSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 import type { MonitorConfig, NotifyEventType } from './config.js';
+import { classifyFailureText, type FailureEvidence } from './model-recovery.js';
 
 // ─── The supervisor-owned message monitor (DESIGN-external-monitor §1, §3, §4) ──
 //
@@ -62,6 +63,8 @@ export interface MonitorDeps {
       options?: { interrupt?: boolean },
     ): Promise<{ succeeded: boolean; outcome: string; detail?: string }>;
   };
+  /** Body-free, typed evidence for runner-owned model recovery. */
+  onFailureEvidence?(evidence: FailureEvidence): boolean;
 }
 
 // Code constants (not config — YAGNI, design §2).
@@ -608,8 +611,8 @@ export class Monitor {
     // The wake landed and a turn started; observe how that turn terminates so a
     // refusal-wedge (every turn dies with `API Error:` while delivery stays green)
     // becomes visible in `.monitor-status` instead of masquerading as armed (#19).
-    await this.observeTurnOutcome(pid);
-    return true;
+    const recoveryTriggered = await this.observeTurnOutcome(pid);
+    return !recoveryTriggered;
   }
 
   /**
@@ -619,20 +622,28 @@ export class Monitor {
    * grows it. Once the streak reaches the threshold the status degrades; a later
    * completed turn flips it back to armed. Detection only — no remediation (#19).
    */
-  private async observeTurnOutcome(pid: number): Promise<void> {
+  private async observeTurnOutcome(pid: number): Promise<boolean> {
     for (let i = 0; i < TURN_OBSERVE_POLLS; i++) {
-      if (this.stopped) return;                                  // shutting down — leave status
-      if (!this.deps.isAlive(pid) || !(await this.deps.tmux.has(this.name))) return; // loop marks offline
+      if (this.stopped) return false;                                  // shutting down — leave status
+      if (!this.deps.isAlive(pid) || !(await this.deps.tmux.has(this.name))) return false; // loop marks offline
       const capture = await safeCapture(this.deps.tmux, this.name);
       if (!capture.ok) {
         this.degrade('delivery', 'capture failed during turn observation');
-        return;
+        return false;
       }
-      if (looksApiError(capture.pane)) { this.recordTurn('api-error'); return; }
-      if (!looksRunning(capture.pane)) { this.recordTurn('completed'); return; }
+      if (looksApiError(capture.pane)) {
+        const evidence = classifyFailureText(capture.pane);
+        const recoveryTriggered = evidence
+          ? this.deps.onFailureEvidence?.(evidence) === true
+          : false;
+        this.recordTurn('api-error');
+        return recoveryTriggered;
+      }
+      if (!looksRunning(capture.pane)) { this.recordTurn('completed'); return false; }
       await this.deps.sleep(TURN_OBSERVE_INTERVAL_MS);
     }
     this.recordTurn('inconclusive');   // still running at give-up: hold the streak, don't re-arm
+    return false;
   }
 
   /** Update the consecutive-API-error streak and derive `.monitor-status` from it. */

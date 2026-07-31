@@ -21,6 +21,11 @@ import { RoleControlServer } from './session/control.js';
 import { TmuxSession } from './session/tmux.js';
 import { classifyShellStatus } from './session/types.js';
 import type { ExitRecord, SessionHandle } from './session/types.js';
+import {
+  effectiveModelForRole, modelRecoveryHeld, reconcileModelRecovery, recordModelFailure,
+  classifyFailureText,
+} from './model-recovery.js';
+import { rotateWorklog } from './worklog.js';
 
 export interface RunnerDeps {
   tmux: Tmux;
@@ -295,6 +300,7 @@ export interface AttemptResult {
   /** Whether this attempt threw away resume state to start fresh. */
   rotated: boolean;
   mode: 'fresh' | 'resume';
+  modelRecovery?: 'advance' | 'hold';
 }
 
 /** One session lifecycle. `runSupervised` (or a one-shot caller) drives it. */
@@ -320,8 +326,20 @@ export async function runOnce(
     role = findRole(cfg, name);
     staggerMs = cfg.startStaggerMs;
   }
+  const effectiveModel = effectiveModelForRole(dir, role);
+  if (effectiveModel !== role.model) {
+    deps.log(`[${name}] model recovery drift: declared=${role.model ?? '(none)'} effective=${effectiveModel}`);
+    role = { ...role, model: effectiveModel };
+  }
+  if (modelRecoveryHeld(dir))
+    throw new Error(`[${name}] model chain exhausted — held down until config changes or recovery reset`);
   const adapter = getAdapter(role.harness);
   mkdirSync(dir, { recursive: true });
+  const rotation = rotateWorklog(join(dir, 'WORKLOG.md'), role.worklog);
+  if (rotation.deferred)
+    deps.log(`[${name}] worklog rotation deferred: concurrent modification detected`);
+  else if (rotation.rotated)
+    deps.log(`[${name}] worklog rotated: ${rotation.beforeBytes} -> ${rotation.afterBytes} bytes`);
 
   const sidFile = join(dir, '.session-id');
   if (!existsSync(sidFile)) writeFileSync(sidFile, randomUUID() + '\n');
@@ -390,7 +408,30 @@ export async function runOnce(
   // (backlog before the tip is the SessionStart hook's job). Native-mode roles
   // leave wake ownership to the harness. Temp snapshots predating `monitor:` are
   // treated as native (monitor may be undefined on an old role.yaml).
+  let sessionHandle: SessionHandle | undefined;
+  let modelRecovery: 'advance' | 'hold' | undefined;
   const resolvedMonitorDeps = monitorDeps(deps, role.env);
+  resolvedMonitorDeps.onFailureEvidence = evidence => {
+    if (!role.model_chain) return false;
+    const action = recordModelFailure(
+      dir,
+      role,
+      { ...evidence, model: evidence.model ?? role.model },
+      role.monitor.turn_fail_threshold ?? 3,
+    );
+    if (action.kind === 'advance') {
+      modelRecovery = 'advance';
+      deps.log(`[${name}] MODEL DOWN-SHIFT ${action.from} -> ${action.to}; restarting with resume`);
+      void sessionHandle?.close();
+      return true;
+    } else if (action.kind === 'hold') {
+      modelRecovery = 'hold';
+      deps.log(`[${name}] MODEL CHAIN EXHAUSTED at ${action.model}; held down`);
+      void sessionHandle?.close();
+      return true;
+    }
+    return false;
+  };
   const monitorOwner = role.monitor?.mode === 'fleet' ? 'fleet' : 'native';
   const resetMonitorCursor = recordMonitorOwner(dir, monitorOwner);
   const monitor = monitorOwner === 'fleet' ? deps.createMonitor({
@@ -401,9 +442,9 @@ export async function runOnce(
 
   rmSync(exitFile, { force: true });
   let pid: number;
-  let sessionHandle: SessionHandle;
   let acpSession: AcpSession | undefined;
   let control: RoleControlServer | undefined;
+  let unsubscribeRecovery: (() => void) | undefined;
   let monitorLoop: Promise<void> | undefined;
   let acpStartupComplete = false;
   if (sessionBackend === 'acp') {
@@ -426,6 +467,12 @@ export async function runOnce(
     });
     pid = acpSession.pid;
     sessionHandle = acpSession;
+    unsubscribeRecovery = acpSession.subscribe(event => {
+      if (event.kind !== 'error' || !event.text) return;
+      const evidence = classifyFailureText(
+        event.text, 'acp', new Date(deps.now()).toISOString());
+      if (evidence) resolvedMonitorDeps.onFailureEvidence?.(evidence);
+    });
     control = new RoleControlServer(dir, acpSession, deps.log);
     await control.start();
     resolvedMonitorDeps.delivery = {
@@ -464,6 +511,21 @@ export async function runOnce(
       monitor?.stop();
       await control.close();
       await acpSession.close();
+      unsubscribeRecovery?.();
+      if (modelRecovery) {
+        if (monitorLoop) await monitorLoop;
+        return {
+          elapsedSecs: 0,
+          exit: {
+            version: 1,
+            class: 'program-exit',
+            detail: `ACP startup triggered model recovery (${modelRecovery})`,
+          },
+          rotated: false,
+          mode,
+          modelRecovery,
+        };
+      }
       throw new Error(`[${name}] ACP startup prompt ${started.outcome}` +
         `${started.detail ? `: ${started.detail}` : ''}`);
     }
@@ -491,6 +553,7 @@ export async function runOnce(
   const start = deps.now();
   while (sessionHandle.isAlive()) await deps.sleep(2000);
   if (monitor) { monitor.stop(); await monitorLoop; }
+  unsubscribeRecovery?.();
   if (control) await control.close();
   if (acpSession) await acpSession.close();
   const elapsed = (deps.now() - start) / 1000;
@@ -532,7 +595,7 @@ export async function runOnce(
   } else deps.log(
     `[${name}] ${exitRecord.detail} (${elapsed.toFixed(0)}s) -> next start RESUMES context`);
 
-  return { elapsedSecs: elapsed, exit: exitRecord, rotated, mode };
+  return { elapsedSecs: elapsed, exit: exitRecord, rotated, mode, modelRecovery };
 }
 
 /**
@@ -561,6 +624,17 @@ export async function runSupervised(
 
   while (!shouldStop()) {
     let ledger = readRestartLedger(dir);
+    try {
+      const configPath = resolveConfigPath(dir, opts.configPath);
+      const role = findRole(loadConfig(configPath), name);
+      reconcileModelRecovery(dir, role, stamp());
+      if (modelRecoveryHeld(dir)) {
+        await deps.sleep(HELD_DOWN_POLL_MS);
+        continue;
+      }
+    } catch {
+      // Normal attempt path reports config errors through the restart circuit.
+    }
 
     if (ledger.circuit === 'open') {
       // Held down. Stay alive — exiting would hand the role straight back to
@@ -587,6 +661,18 @@ export async function runSupervised(
     // Re-read: the attempt itself may have taken minutes, and an operator may
     // have reset the ledger meanwhile.
     ledger = readRestartLedger(dir);
+    if (result.modelRecovery === 'advance') {
+      writeRestartLedger(dir, {
+        ...emptyLedger(),
+        lastReason: 'approved model-chain transition',
+        updatedAt: stamp(),
+      });
+      continue;
+    }
+    if (result.modelRecovery === 'hold') {
+      await deps.sleep(HELD_DOWN_POLL_MS);
+      continue;
+    }
     const fastFailSecs = fastFailSecsFor(name, opts.configPath);
     const immediate = result.elapsedSecs < fastFailSecs;
 
