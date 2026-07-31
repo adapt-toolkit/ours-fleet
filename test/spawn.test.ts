@@ -165,7 +165,10 @@ describe('spawn --model', () => {
 
   it('web harness-default intent suppresses a fleet model in permanent and temp launches', async () => {
     writeFileSync(join(dir, 'fleet.yaml'), stringify({
-      defaults: { harness: 'codex', model: 'gpt-5.6' }, roles: {},
+      defaults: {
+        harness: 'codex', model: 'gpt-5.6', model_chain: ['gpt-5.6', 'gpt-fallback'],
+      },
+      roles: {},
     }));
     const { d } = fakeDeps();
     const file = await spawnPermanent({
@@ -174,6 +177,7 @@ describe('spawn --model', () => {
     expect(parse(readFileSync(file, 'utf8')).roles.ClaudePermanent.model).toBeNull();
     const permanent = findRole(loadConfig(), 'ClaudePermanent');
     expect(permanent.model).toBeUndefined();
+    expect(permanent.model_chain).toBeUndefined();
     expect(getAdapter('claude-code').buildLaunch(
       permanent, 'fresh', { sessionId: 'SID' }, { argv: [], env: {} },
     ).argv).not.toContain('--model');
@@ -183,6 +187,7 @@ describe('spawn --model', () => {
     }, '/b/ours-fleet', () => {});
     const temporary = parse(readFileSync(join(tempDir, 'role.yaml'), 'utf8'));
     expect(temporary.model).toBeUndefined();
+    expect(temporary.model_chain).toBeUndefined();
     expect(getAdapter('claude-code').buildLaunch(
       temporary, 'fresh', { sessionId: 'SID' }, { argv: [], env: {} },
     ).argv).not.toContain('--model');

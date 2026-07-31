@@ -34,8 +34,13 @@ export function CreateRole({ onClose, onCreated }: {
   const [action, setAction] = useState<any>();
   const [error, setError] = useState('');
   const [busy, setBusy] = useState(false);
+  const [modelChoices, setModelChoices] = useState<Record<Form['harness'], string[]>>({
+    codex: [], 'claude-code': [],
+  });
   useEffect(() => {
     void api.get<any>('/api/v1/creation-capabilities').then(capabilities => {
+      setModelChoices(Object.fromEntries((capabilities.harnesses ?? []).map((harness: any) =>
+        [harness.id, harness.models ?? []])) as Record<Form['harness'], string[]>);
       const defaults = capabilities.monitor?.defaults;
       if (!defaults) return;
       setForm(current => ({
@@ -107,7 +112,15 @@ export function CreateRole({ onClose, onCreated }: {
         <fieldset><legend>Runtime</legend><div className="form-grid">
           <label>Harness<select value={form.harness} onChange={e => change('harness', e.target.value as Form['harness'])}><option value="codex">Codex</option><option value="claude-code">Claude Code</option></select></label>
           <label>Session<select value={form.session} onChange={e => change('session', e.target.value as Form['session'])}><option value="acp">ACP activity</option><option value="tmux">tmux terminal</option></select></label>
-          <label>Model <small>blank uses harness default</small><input value={form.model} onChange={e => change('model', e.target.value)} placeholder="harness default" /></label>
+          <label>Known model<select aria-label="Known model" value={modelChoices[form.harness].includes(form.model) ? form.model : ''}
+            onChange={e => change('model', e.target.value)}>
+            <option value="">Harness default / custom ID</option>
+            {modelChoices[form.harness].map(model => <option value={model} key={model}>{model}</option>)}
+          </select></label>
+          <label>Model ID <small>type any ID; blank uses harness default</small>
+            <input aria-label="Model" value={form.model}
+              onChange={e => change('model', e.target.value)} placeholder="harness default" />
+          </label>
           <label>Lifetime<select value={form.lifetime} onChange={e => change('lifetime', e.target.value as Form['lifetime'])}><option value="permanent">Permanent</option><option value="temporary">Temporary — gone on exit/reboot</option></select></label>
           <label className="wide">Working directory <small>blank uses private role state</small><input value={form.cwd} onChange={e => change('cwd', e.target.value)} placeholder="/absolute/existing/path" /></label>
         </div></fieldset>

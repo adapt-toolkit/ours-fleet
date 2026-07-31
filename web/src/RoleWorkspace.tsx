@@ -1,6 +1,7 @@
 import { lazy, Suspense, useCallback, useEffect, useState } from 'react';
 import { api, idempotencyKey } from './api';
 import { isInactive } from './fleet-presentation';
+import { partitionActivity } from './activity-presentation';
 
 const TerminalView = lazy(() => import('./TerminalView').then(module => ({ default: module.TerminalView })));
 
@@ -11,6 +12,7 @@ export function RoleWorkspace({ roleId, onBack }: { roleId: string; onBack(): vo
   const [logs, setLogs] = useState<any>();
   const [text, setText] = useState('');
   const [notice, setNotice] = useState('');
+  const [showTechnicalActivity, setShowTechnicalActivity] = useState(false);
   const refresh = useCallback(async () => {
     const value = await api.get(`/api/v1/roles/${encodeURIComponent(roleId)}`);
     setDetail(value);
@@ -23,6 +25,10 @@ export function RoleWorkspace({ roleId, onBack }: { roleId: string; onBack(): vo
   if (!detail) return <div className="content">Loading role evidence…</div>;
   const { role, status, capabilities } = detail;
   const inactive = isInactive({ role, status });
+  const activity = partitionActivity(output?.events ?? []);
+  const visibleActivity = showTechnicalActivity
+    ? [...activity.meaningful, ...activity.technical].sort((a, b) => (a.seq ?? 0) - (b.seq ?? 0))
+    : activity.meaningful;
   const action = async (name: string) => {
     const confirmation = name === 'restart_fresh' ? prompt(`Type ${roleId} to clear context`) ?? '' : undefined;
     const receipt: any = await api.post(`/api/v1/roles/${roleId}/actions`, {
@@ -64,8 +70,17 @@ export function RoleWorkspace({ roleId, onBack }: { roleId: string; onBack(): vo
     {tab === 'activity' && <div className="activity-layout"><div className="activity panel">
       <h2>{status.session.backend === 'acp' ? 'Structured activity' : 'Recent pane output'}</h2>
       {output?.text && <pre>{output.text}</pre>}
-      {output?.events?.map((event: any) => <article className={`event ${event.kind}`} key={event.seq}>
-        <small>#{event.seq} · {event.kind.replaceAll('_', ' ')}</small>
+      {activity.technical.length > 0 && <div className="activity-filter">
+        <span>{activity.technical.length} low-level update{activity.technical.length === 1 ? '' : 's'} hidden</span>
+        <button className="secondary" aria-pressed={showTechnicalActivity}
+          onClick={() => setShowTechnicalActivity(value => !value)}>
+          {showTechnicalActivity ? 'Hide technical details' : 'Show technical details'}
+        </button>
+      </div>}
+      {!output?.text && visibleActivity.length === 0 &&
+        <p className="muted">No meaningful agent activity yet.</p>}
+      {visibleActivity.map((event: any) => <article className={`event ${event.kind}`} key={event.seq}>
+        <small>#{event.seq}{event.lastSeq && event.lastSeq !== event.seq ? `–${event.lastSeq}` : ''} · {event.kind.replaceAll('_', ' ')}</small>
         <p>{event.text || event.title || event.status || event.stopReason}</p>
         {event.kind === 'permission' && event.options?.map((option: any) =>
           <button key={option.optionId} onClick={() => void api.post(`/api/v1/roles/${roleId}/permissions/${event.permissionId}`, { optionId: option.optionId })}>{option.name}</button>)}

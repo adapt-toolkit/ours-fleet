@@ -51,7 +51,7 @@ export interface CreationCapabilities {
   reasons: string[];
   harnesses: Array<{
     id: 'codex' | 'claude-code'; available: boolean;
-    sessions: Array<'acp' | 'tmux'>; defaultModel?: string; warnings: string[];
+    sessions: Array<'acp' | 'tmux'>; defaultModel?: string; models: string[]; warnings: string[];
   }>;
   lifetimes: Array<'permanent' | 'temporary'>;
   identityBootstrap: {
@@ -161,14 +161,34 @@ export class RoleCreationService {
   async capabilities(): Promise<CreationCapabilities> {
     const reasons: string[] = [];
     let defaults: Record<string, unknown> = {};
-    try { defaults = loadConfig(this.options.configPath).defaults; }
+    let roles: ReturnType<typeof loadConfig>['roles'] = [];
+    try {
+      const config = loadConfig(this.options.configPath);
+      defaults = config.defaults;
+      roles = config.roles;
+    }
     catch (error) { reasons.push(`configuration is invalid: ${(error as Error).message}`); }
+    const modelsFor = (harness: 'codex' | 'claude-code', suggested: string[]): string[] => {
+      const configured = roles.filter(role => role.harness === harness)
+        .flatMap(role => [role.model, ...(role.model_chain ?? [])])
+        .filter((model): model is string => Boolean(model));
+      const inherited = resolveRoleModel(undefined, harness, defaults);
+      return [...new Set([...(inherited ? [inherited] : []), ...configured, ...suggested])];
+    };
     return {
       available: reasons.length === 0,
       reasons,
       harnesses: [
-        { id: 'codex', available: true, sessions: ['acp', 'tmux'], warnings: [] },
-        { id: 'claude-code', available: true, sessions: ['acp', 'tmux'], warnings: [] },
+        {
+          id: 'codex', available: true, sessions: ['acp', 'tmux'],
+          defaultModel: resolveRoleModel(undefined, 'codex', defaults),
+          models: modelsFor('codex', ['gpt-5.6', 'gpt-5.4']), warnings: [],
+        },
+        {
+          id: 'claude-code', available: true, sessions: ['acp', 'tmux'],
+          defaultModel: resolveRoleModel(undefined, 'claude-code', defaults),
+          models: modelsFor('claude-code', ['sonnet', 'opus', 'haiku']), warnings: [],
+        },
       ],
       lifetimes: ['permanent', 'temporary'],
       identityBootstrap: {

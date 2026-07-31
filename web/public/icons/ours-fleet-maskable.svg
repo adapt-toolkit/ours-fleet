@@ -1,5 +1,4 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="512" height="512" viewBox="0 0 512 512">
   <rect width="512" height="512" fill="#111318"/>
-  <circle cx="256" cy="256" r="142" fill="none" stroke="#8cf0c5" stroke-width="48"/>
-  <circle cx="256" cy="256" r="45" fill="#8cf0c5"/>
+  <text x="256" y="289" text-anchor="middle" fill="#8cf0c5" font-family="system-ui, sans-serif" font-size="138" font-weight="800" letter-spacing="-5">Ours</text>
 </svg>

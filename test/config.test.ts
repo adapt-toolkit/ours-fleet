@@ -70,6 +70,30 @@ describe('loadConfig', () => {
     expect(() => loadConfig()).toThrow(/loopback-only/);
   });
 
+  it('keeps model and recovery-chain defaults scoped to their harness', () => {
+    base([
+      'defaults:',
+      '  harness: codex',
+      '  model: gpt-primary',
+      '  model_chain: [gpt-primary, gpt-fallback]',
+      'roles:',
+      '  Codex: {}',
+      '  Claude:',
+      '    harness: claude-code',
+      '  ExplicitDefault:',
+      '    model: null',
+      '',
+    ].join('\n'));
+    const cfg = loadConfig();
+    expect(findRole(cfg, 'Codex')).toMatchObject({
+      model: 'gpt-primary', model_chain: ['gpt-primary', 'gpt-fallback'],
+    });
+    expect(findRole(cfg, 'Claude').model).toBeUndefined();
+    expect(findRole(cfg, 'Claude').model_chain).toBeUndefined();
+    expect(findRole(cfg, 'ExplicitDefault').model).toBeUndefined();
+    expect(findRole(cfg, 'ExplicitDefault').model_chain).toBeUndefined();
+  });
+
   it('merges fleet.yaml with fleet.d drop-ins', () => {
     base('roles:\n  A:\n    mission: base role\n');
     dropin('b.yaml', 'roles:\n  B:\n    mission: spawned\n');

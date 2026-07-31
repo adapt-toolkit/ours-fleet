@@ -4,6 +4,7 @@ test('bootstrap, inventory, navigation, send, create, and security boundaries', 
   const bootstrap = (await (await request.post('/__test/bootstrap')).json()).url as string;
   await page.goto(bootstrap);
   await expect(page.getByRole('heading', { name: 'All roles' })).toBeVisible();
+  await expect(page.getByText('Ours', { exact: true }).first()).toBeVisible();
   await expect(page).toHaveURL('http://127.0.0.1:49371/');
   await expect(page.getByText('Alpha', { exact: true }).first()).toBeVisible();
   await expect(page.getByText('Terminal', { exact: true }).first()).toBeVisible();
@@ -52,13 +53,25 @@ test('bootstrap, inventory, navigation, send, create, and security boundaries', 
   await expect(page.getByText('authoritative')).toBeVisible();
   await page.getByRole('button', { name: 'activity' }).click();
   await expect(page.getByText('Fixture agent is ready.')).toBeVisible();
+  await expect(page.getByText(/#1–3 · agent text/)).toBeVisible();
+  await expect(page.getByText('2 low-level updates hidden')).toBeVisible();
+  await expect(page.getByText(/#4 · tool update/)).toHaveCount(0);
+  await page.getByRole('button', { name: 'Show technical details' }).click();
+  await expect(page.getByText(/#4 · tool update/)).toBeVisible();
+  await page.getByRole('button', { name: 'Hide technical details' }).click();
   await page.getByPlaceholder('Prompt the live session…').fill('hello fixture');
   await page.getByRole('button', { name: 'Send' }).click();
   await expect(page.getByText('accepted; turn may still be running')).toBeVisible();
   await page.getByRole('button', { name: /Create role/ }).click();
   await page.getByLabel('Role / session name').fill('Researcher');
-  await expect(page.getByText('blank uses harness default')).toBeVisible();
-  await page.getByLabel(/Model/).fill('');
+  await expect(page.getByText('type any ID; blank uses harness default')).toBeVisible();
+  await expect(page.getByLabel('Known model').locator('option')).toHaveText([
+    'Harness default / custom ID', 'gpt-5.6', 'gpt-5.4',
+  ]);
+  await page.getByLabel('Known model').selectOption('gpt-5.6');
+  const modelId = page.getByRole('textbox', { name: 'Model', exact: true });
+  await expect(modelId).toHaveValue('gpt-5.6');
+  await modelId.fill('');
   await page.getByLabel('Monitor mode').selectOption('native');
   await expect(page.getByLabel('Monitor wake sources')).toHaveCount(0);
   await page.getByLabel('Monitor mode').selectOption('fleet');
@@ -68,9 +81,10 @@ test('bootstrap, inventory, navigation, send, create, and security boundaries', 
   await page.getByLabel('Monitor wake sources').getByText('inbound error').click();
   await page.getByText('Interrupt an active turn before wake delivery').click();
   await page.getByRole('button', { name: 'Review effective plan' }).click();
-  await expect(page.getByText('Effective plan')).toBeVisible();
-  await expect(page.getByText('harness default', { exact: true })).toBeVisible();
-  await expect(page.getByText('gpt-5.6')).toHaveCount(0);
+  const effectivePlan = page.locator('.review');
+  await expect(effectivePlan.getByText('Effective plan')).toBeVisible();
+  await expect(effectivePlan.getByText('harness default', { exact: true })).toBeVisible();
+  await expect(effectivePlan.getByText('gpt-5.6')).toHaveCount(0);
   await expect(page.getByText(/"batch_ms":750/)).toBeVisible();
   await expect(page.getByText(/"inbound_error"/)).toBeVisible();
   await page.getByRole('button', { name: 'Create atomically' }).click();

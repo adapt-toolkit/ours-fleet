@@ -89,14 +89,14 @@ export function App() {
   }), [filter, items, showInactive, view]);
 
   if (!ready) return <main className="auth-screen">
-    <div className="brand-mark">O</div>
-    <h1>ours fleet</h1>
+    <div className="brand-wordmark">Ours</div>
+    <h1>fleet console</h1>
     <p>{error || 'Securing this local session…'}</p>
   </main>;
 
   return <div className="shell">
     <aside>
-      <div className="brand"><span>O</span><div><strong>ours</strong><small>fleet console</small></div></div>
+      <div className="brand"><span className="brand-wordmark">Ours</span><div><small>fleet console</small></div></div>
       <nav aria-label="Primary">
         {(['fleet', 'attention', 'audit'] as const).map(name =>
           <button className={view === name ? 'active' : ''} key={name} onClick={() => {

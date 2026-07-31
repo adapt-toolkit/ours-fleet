@@ -86,8 +86,14 @@ const services = {
       async snapshot() { return { backend: 'acp', alive: true, readiness: 'idle' }; },
       async recentOutput() {
         return {
-          events: [{ version: 1, seq: 1, at: new Date().toISOString(), kind: 'agent_text', text: 'Fixture agent is ready.' }],
-          firstSeq: 1, lastSeq: 1, truncated: false,
+          events: [
+            { version: 1, seq: 1, at: new Date().toISOString(), kind: 'agent_text', text: 'Fixture' },
+            { version: 1, seq: 2, at: new Date().toISOString(), kind: 'agent_text', text: ' agent' },
+            { version: 1, seq: 3, at: new Date().toISOString(), kind: 'agent_text', text: ' is ready.' },
+            { version: 1, seq: 4, at: new Date().toISOString(), kind: 'tool_update', status: 'streaming' },
+            { version: 1, seq: 5, at: new Date().toISOString(), kind: 'tool_update', status: 'complete' },
+          ],
+          firstSeq: 1, lastSeq: 5, truncated: false,
         };
       },
       async sendText() {
@@ -114,7 +120,10 @@ const services = {
     async capabilities() {
       return {
         available: true, reasons: [],
-        harnesses: [{ id: 'codex', available: true, sessions: ['acp', 'tmux'], warnings: [] }],
+        harnesses: [
+          { id: 'codex', available: true, sessions: ['acp', 'tmux'], models: ['gpt-5.6', 'gpt-5.4'], warnings: [] },
+          { id: 'claude-code', available: true, sessions: ['acp', 'tmux'], models: ['sonnet', 'opus', 'haiku'], warnings: [] },
+        ],
         lifetimes: ['permanent', 'temporary'],
         identityBootstrap: {
           mode: 'current-fleet-first-boot', existingIdentity: 'missing',

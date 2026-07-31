@@ -45,6 +45,40 @@ ours-fleet rm Name
 also accepts \`/permit <permission-id> <option-id>\`, \`/interrupt\`, and
 \`/detach\`. Raw \`--key\` input is tmux-only.
 
+## Local web console
+
+The npm package includes the web console; installed users do not clone the repo
+or run \`npm run build\`:
+
+\`\`\`sh
+npm i -g @ours.network/fleet
+ours-fleet init
+ours-fleet doctor
+ours-fleet web                         # install/update service, start, pair browser
+\`\`\`
+
+The normal command uses stable \`http://127.0.0.1:49271/\`, installs an
+owner-level systemd user service (Linux) or LaunchAgent (macOS), and opens a
+five-minute one-use pairing link in the local browser. After pairing, bookmark
+the plain URL or install the PWA. To pair a new, signed-out, or revoked browser,
+run \`ours-fleet web open\`.
+
+\`\`\`sh
+ours-fleet web status
+ours-fleet web start|stop|restart
+ours-fleet web open
+ours-fleet web revoke-all              # revoke every browser and active session
+ours-fleet web uninstall
+ours-fleet web serve --port 0 --no-open # isolated foreground/testing mode
+\`\`\`
+
+The console is intentionally IPv4-loopback-only. It has no LAN/Internet host,
+proxy, TLS, or remote-access mode. Do not expose port 49271 through a reverse
+proxy. Browser credentials are HttpOnly/SameSite, and \`revoke-all\` invalidates
+all trusted devices. Role creation offers harness-scoped known-model choices
+while still accepting a typed model ID; blank explicitly uses the selected
+harness's own default.
+
 ## Spawn
 
 \`\`\`sh

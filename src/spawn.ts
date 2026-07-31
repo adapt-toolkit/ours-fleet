@@ -224,20 +224,26 @@ export function spawnDryRun(o: SpawnOpts): SpawnDryRun {
     ...((cfg.defaults.harness_options ?? {}) as Record<string, unknown>),
     ...(raw.harness_options ?? {}),
   };
+  const harness = raw.harness ?? (cfg.defaults.harness as string | undefined) ?? 'claude-code';
+  const defaultHarness = (cfg.defaults.harness as string | undefined) ?? 'claude-code';
+  const inheritsModelDefaults = harness === defaultHarness && raw.model !== null;
+  const model = resolveRoleModel(raw.model, raw.harness, cfg.defaults);
   const resolvedRole: ResolvedRole = {
     ...raw,
     name: o.name,
     sourceFile: o.temp ? '(temp dry-run)' : join(fleetDDir(), `${o.name}.yaml`),
-    harness: raw.harness ?? (cfg.defaults.harness as string | undefined) ?? 'claude-code',
+    harness,
     session: raw.session ?? (cfg.defaults.session as SessionBackendId | undefined) ?? 'tmux',
     session_options: raw.session_options,
     permissions: resolvePermissions(cfg.defaults.permissions, raw.permissions),
     permissionsDeclared: raw.permissions !== undefined || cfg.defaults.permissions !== undefined,
     identity: effectiveIdentity(o),
-    model: raw.model ?? (cfg.defaults.model as string | undefined),
+    model,
     model_chain: resolveModelChain(
-      raw.model ?? (cfg.defaults.model as string | undefined),
-      raw.model_chain ?? (cfg.defaults.model_chain as string[] | undefined),
+      model,
+      raw.model_chain ?? (inheritsModelDefaults
+        ? cfg.defaults.model_chain as string[] | undefined
+        : undefined),
     ),
     harness_options: Object.keys(harnessOptions).length ? harnessOptions : undefined,
     isolation: raw.isolation ?? (cfg.defaults.isolation as IsolationConfig | undefined),
@@ -413,8 +419,8 @@ export async function spawnTemp(
   return withCreationTransaction(
     { role: o.name, identity: effectiveIdentity(o) },
     async tx => {
-      assertNameFree(o);
       creation.onStage?.('checking_identity');
+      assertNameFree(o);
       const guarantee = await ensureIdentity(
         effectiveIdentity(o),
         profileValues(o),

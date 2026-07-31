@@ -17,12 +17,12 @@ button { color: inherit; }
 button:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-visible { outline: 2px solid var(--mint); outline-offset: 2px; }
 .auth-screen { display: grid; place-content: center; text-align: center; min-height: 100vh; color: var(--muted); }
 .auth-screen h1 { color: white; margin-bottom: 0; }
-.brand-mark, .brand > span { display: grid; place-items: center; width: 44px; height: 44px; border: 1px solid #4c7e68; border-radius: 50%; color: var(--mint); font: 700 22px Georgia, serif; box-shadow: inset 0 0 0 5px #0d1713; }
+.brand-wordmark { color: var(--mint); font-size: 21px; font-weight: 820; letter-spacing: -.02em; }
+.auth-screen .brand-wordmark { justify-self: center; font-size: 32px; }
 .shell { display: grid; grid-template-columns: 224px 1fr; min-height: 100vh; }
 aside { position: fixed; inset: 0 auto 0 0; width: 224px; display: flex; flex-direction: column; padding: 24px 14px; border-right: 1px solid #1d2425; background: rgba(8,11,12,.92); backdrop-filter: blur(18px); }
 .brand { display: flex; gap: 12px; align-items: center; padding: 0 8px 30px; }
 .brand div { display: flex; flex-direction: column; }
-.brand strong { font-size: 20px; letter-spacing: -.5px; }
 .brand small { color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: 1.4px; }
 nav { display: grid; gap: 5px; }
 nav button { display: grid; grid-template-columns: 24px 1fr auto; gap: 8px; align-items: center; width: 100%; border: 0; border-radius: 8px; padding: 10px 12px; text-align: left; color: #98a3a5; background: transparent; text-transform: capitalize; cursor: pointer; }
@@ -107,6 +107,8 @@ dt { color: var(--muted); } dd { margin: 0; word-break: break-word; }
 .danger { color: #ff9e99 !important; border-color: #613432 !important; }
 .activity-layout { display: grid; grid-template-columns: 1fr 290px; gap: 14px; align-items: start; }
 .activity { display: grid; gap: 9px; }
+.activity-filter { display: flex; align-items: center; justify-content: space-between; gap: 12px; color: var(--muted); font-size: 11px; }
+.activity-filter button { padding: 6px 9px; }
 .event { border-left: 2px solid #334044; padding: 10px 13px; background: #0d1213; }
 .event.agent_text { border-color: var(--mint); }
 .event.error, .event.permission { border-color: var(--amber); }

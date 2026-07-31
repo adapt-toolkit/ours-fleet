@@ -122,6 +122,10 @@ describe('ours-fleet CLI', () => {
       expect(r.stdout).toContain('bundled automatically');
       expect(r.stdout).toContain('Reliable mail wake');
       expect(r.stdout).toContain('monitor.mode');
+      expect(r.stdout).toContain('## Local web console');
+      expect(r.stdout).toContain('ours-fleet web open');
+      expect(r.stdout).toContain('ours-fleet web revoke-all');
+      expect(r.stdout).toContain('intentionally IPv4-loopback-only');
     }
   });
 

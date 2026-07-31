@@ -191,8 +191,13 @@ identity: Temp
   it('previews monitor defaults/provenance and rejects unsupported or invalid web monitor input', async () => {
     const root = fixture();
     writeFileSync(join(root, 'fleet.yaml'), `defaults:
+  harness: codex
+  model: fleet-codex
   monitor: { mode: native, batch_ms: 5000 }
-roles: {}
+roles:
+  ExistingClaude:
+    harness: claude-code
+    model: fleet-sonnet
 `);
     const service = new RoleCreationService({
       configPath: join(root, 'fleet.yaml'),
@@ -210,10 +215,15 @@ roles: {}
     const inherited = await service.preview(base);
     expect(inherited.effective.monitor).toMatchObject({ mode: 'native', batch_ms: 5000 });
     expect(inherited.provenance.monitor).toBe('fleet-default');
-    expect((await service.capabilities()).monitor).toMatchObject({
+    const creationCapabilities = await service.capabilities();
+    expect(creationCapabilities.monitor).toMatchObject({
       modes: ['fleet', 'native'], injectModes: ['notification'],
       defaults: { mode: 'native', batch_ms: 5000 },
     });
+    expect(creationCapabilities.harnesses.find(harness => harness.id === 'codex')?.models)
+      .toEqual(expect.arrayContaining(['fleet-codex', 'gpt-5.6', 'gpt-5.4']));
+    expect(creationCapabilities.harnesses.find(harness => harness.id === 'claude-code')?.models)
+      .toEqual(expect.arrayContaining(['fleet-sonnet', 'sonnet', 'opus', 'haiku']));
     const explicit = await service.preview({
       ...base,
       monitor: {
