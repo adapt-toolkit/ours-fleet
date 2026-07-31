@@ -9,6 +9,8 @@ import {
 } from './isolation/policy.js';
 import { getAdapter } from './harness/registry.js';
 import type { IsolationConfig, WrapContext } from './isolation/types.js';
+import { resolveWatchdogs } from './watchdog/config.js';
+import type { ResolvedWatchdog } from './watchdog/config.js';
 
 export interface OverseeEntry { role: string; interval: string }
 export interface WorklogPolicy {
@@ -180,6 +182,7 @@ export interface FleetConfig {
   startStaggerMs: number;
   /** Warning-first non-plain YAML migration diagnostics, in source order. */
   diagnostics: ConfigDiagnostic[];
+  watchdogs: ResolvedWatchdog[];
 }
 
 export class ConfigError extends Error {}
@@ -365,7 +368,8 @@ export function loadConfig(
       }
     }
   }
-  return { roles, vars, defaults, files, startStaggerMs, diagnostics };
+  const watchdogs = resolveWatchdogs(baseDoc, base, roles, vars, defaults);
+  return { roles, vars, defaults, files, startStaggerMs, diagnostics, watchdogs };
 }
 
 export function resolveModelChain(
