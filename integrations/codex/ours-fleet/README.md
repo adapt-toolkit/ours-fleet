@@ -19,6 +19,8 @@ Then ask Codex to “spawn an ours agent”, “create a persistent Codex role�
 “keep an eye on my fleet agents”.
 
 Codex may ask for one-time authorization before individual ours MCP tools run.
-Mail wake is consent-first: a spawned role receives `--monitor` only when the
-user explicitly requests it. `ours-codex` supplies background wake; native
-`codex` remains the supported foreground-monitor fallback.
+Native Codex mail wake is consent-first: a spawned role receives the legacy
+`--monitor` consent flag only when the user explicitly requests it.
+In fleet YAML, `monitor.mode: fleet|native` separately chooses whether
+ours-fleet or the harness owns wake delivery. `ours-codex` supplies native
+background wake; plain `codex` remains the supported native foreground fallback.

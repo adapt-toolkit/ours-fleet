@@ -17,6 +17,7 @@ export const NOTIFY_EVENT_TYPES = [
 ] as const;
 export type NotifyEventType = (typeof NOTIFY_EVENT_TYPES)[number];
 export type InjectMode = 'notification' | 'full';
+export type MonitorMode = 'fleet' | 'native';
 export type SessionBackendId = 'tmux' | 'acp';
 export type ApprovalMode = 'ask' | 'allow' | 'deny';
 export type FilesystemMode = 'read-only' | 'workspace' | 'unrestricted';
@@ -40,10 +41,15 @@ export interface SessionOptions {
 
 /** Resolved per-role supervisor-monitor config (see DESIGN-external-monitor §2). */
 export interface MonitorConfig {
+  /** Who owns mail wake delivery: ours-fleet supervisor or the native harness. */
+  mode: MonitorMode;
+  /** @deprecated Legacy alias retained in resolved snapshots; use mode. */
   enabled: boolean;
   wake_sources: string[];
   batch_ms: number;
   inject: InjectMode;
+  /** Cancel the active agent turn before delivering every configured wake. */
+  interrupt: boolean;
   /**
    * Consecutive delivered wakes that must end in an `API Error:`-terminated turn
    * (with no completed turn in between) before `.monitor-status` degrades to
@@ -56,8 +62,11 @@ export interface MonitorConfig {
 /** Default wake sources when a role does not list its own (design §2). */
 export const DEFAULT_WAKE_SOURCES: NotifyEventType[] =
   ['message_received', 'file_received', 'local_contact_request', 'pending_message'];
-const MONITOR_KEYS = ['enabled', 'wake_sources', 'batch_ms', 'inject', 'turn_fail_threshold'];
+const MONITOR_KEYS = [
+  'mode', 'enabled', 'wake_sources', 'batch_ms', 'inject', 'interrupt', 'turn_fail_threshold',
+];
 const INJECT_MODES: InjectMode[] = ['notification', 'full'];
+const MONITOR_MODES: MonitorMode[] = ['fleet', 'native'];
 const MONITOR_DEFAULT_BATCH_MS = 2000;
 const MONITOR_DEFAULT_TURN_FAIL_THRESHOLD = 3;
 
@@ -74,11 +83,18 @@ export function validateMonitorConfig(raw: unknown): string[] {
     problems.push(`monitor: unknown key(s) ${bad.join(', ')}; allowed: ${MONITOR_KEYS.join(', ')}`);
   if (m.enabled !== undefined && typeof m.enabled !== 'boolean')
     problems.push('monitor.enabled: must be true or false');
+  if (m.mode !== undefined && !MONITOR_MODES.includes(m.mode as MonitorMode))
+    problems.push(`monitor.mode: invalid value '${m.mode}'; allowed: ${MONITOR_MODES.join(', ')}`);
+  if (m.mode !== undefined && typeof m.enabled === 'boolean'
+      && m.enabled !== (m.mode === 'fleet'))
+    problems.push(`monitor.mode '${m.mode}' conflicts with legacy monitor.enabled ${m.enabled}`);
   if (m.batch_ms !== undefined
       && (typeof m.batch_ms !== 'number' || !Number.isFinite(m.batch_ms) || m.batch_ms < 0))
     problems.push('monitor.batch_ms: must be a non-negative number');
   if (m.inject !== undefined && !INJECT_MODES.includes(m.inject as InjectMode))
     problems.push(`monitor.inject: invalid value '${m.inject}'; allowed: ${INJECT_MODES.join(', ')}`);
+  if (m.interrupt !== undefined && typeof m.interrupt !== 'boolean')
+    problems.push('monitor.interrupt: must be true or false');
   if (m.turn_fail_threshold !== undefined
       && (typeof m.turn_fail_threshold !== 'number' || !Number.isInteger(m.turn_fail_threshold)
           || m.turn_fail_threshold < 1))
@@ -379,8 +395,9 @@ function resolveStartStaggerMs(raw: unknown, base: string): number {
 
 /**
  * Merge `defaults.monitor` under the role's own `monitor:` key-by-key, validate the
- * result, and fill code-constant defaults (design §2). `defaults.monitor.enabled`
- * is the fleet-wide default; absent everywhere ⇒ enabled. Throws ConfigError on a
+ * result, and fill code-constant defaults (design §2). `monitor.mode` selects
+ * fleet-owned or native-harness monitoring; absent everywhere ⇒ fleet. The old
+ * `enabled` boolean remains a compatibility alias. Throws ConfigError on a
  * malformed block so a typo fails loudly rather than silently disarming a monitor.
  * Exported so temp-spawn (which builds a ResolvedRole by hand) resolves identically.
  */
@@ -393,17 +410,34 @@ export function resolveMonitorConfig(
     throw new ConfigError(`${labels.base ?? 'config'}: defaults.monitor must be a map`);
   if (roleMonitor !== undefined && !isPlainObject(roleMonitor))
     throw new ConfigError(`${where}monitor: must be a mapping`);
+  const def = (defMonitor ?? {}) as Record<string, unknown>;
+  const own = (roleMonitor ?? {}) as Record<string, unknown>;
+  const defProblems = validateMonitorConfig(def);
+  if (defProblems.length)
+    throw new ConfigError(`${labels.base ?? 'config'}: defaults.${defProblems.join('; defaults.')}`);
+  const ownProblems = validateMonitorConfig(own);
+  if (ownProblems.length) throw new ConfigError(`${where}${ownProblems.join('; ')}`);
   const merged: Record<string, unknown> = {
-    ...((defMonitor ?? {}) as Record<string, unknown>),
-    ...((roleMonitor ?? {}) as Record<string, unknown>),
+    ...def,
+    ...own,
   };
-  const problems = validateMonitorConfig(merged);
-  if (problems.length) throw new ConfigError(`${where}${problems.join('; ')}`);
+  const selected = own.mode !== undefined
+    ? own.mode
+    : own.enabled !== undefined
+      ? (own.enabled ? 'fleet' : 'native')
+      : def.mode !== undefined
+        ? def.mode
+        : def.enabled !== undefined
+          ? (def.enabled ? 'fleet' : 'native')
+          : 'fleet';
+  const mode = selected as MonitorMode;
   return {
-    enabled: (merged.enabled as boolean | undefined) ?? true,
+    mode,
+    enabled: mode === 'fleet',
     wake_sources: (merged.wake_sources as string[] | undefined) ?? [...DEFAULT_WAKE_SOURCES],
     batch_ms: (merged.batch_ms as number | undefined) ?? MONITOR_DEFAULT_BATCH_MS,
     inject: (merged.inject as InjectMode | undefined) ?? 'notification',
+    interrupt: (merged.interrupt as boolean | undefined) ?? false,
     turn_fail_threshold:
       (merged.turn_fail_threshold as number | undefined) ?? MONITOR_DEFAULT_TURN_FAIL_THRESHOLD,
   };

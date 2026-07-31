@@ -6,7 +6,7 @@ import { fileURLToPath } from 'node:url';
 import { stringify } from 'yaml';
 import {
   runOnce, runTemp, runSupervised, buildPaneCommand, reserveLaunchSlot, readExitRecord,
-  readRestartLedger, resetRestartLedger, backoffFor, RESTART_FAIL_THRESHOLD,
+  readRestartLedger, resetRestartLedger, backoffFor, loadTempRole, RESTART_FAIL_THRESHOLD,
   type AttemptResult, type RunnerDeps,
 } from '../src/runner.js';
 import { classifyChildExit, classifyShellStatus } from '../src/session/types.js';
@@ -224,6 +224,27 @@ describe('runOnce isolation', () => {
 });
 
 describe('runOnce', () => {
+  it('upgrades legacy temp snapshots to explicit monitor ownership', () => {
+    const d = agentDir('OldTemp', true);
+    mkdirSync(d, { recursive: true });
+    writeFileSync(join(d, 'role.yaml'), stringify({
+      name: 'OldTemp',
+      harness: 'fake',
+      session: 'tmux',
+      identity: 'OldTemp',
+      sourceFile: '(temp)',
+      monitor: {
+        enabled: true,
+        wake_sources: ['message_received'],
+        batch_ms: 2000,
+        inject: 'notification',
+      },
+    }));
+
+    expect(loadTempRole('OldTemp').monitor)
+      .toMatchObject({ mode: 'fleet', enabled: true, interrupt: false });
+  });
+
   it('fresh boot writes markers and launches with fresh args', async () => {
     writeCfg({ A: { harness: 'fake' } });
     const d = agentDir('A');
@@ -552,7 +573,7 @@ describe('runOnce ACP startup outcome (1.2)', () => {
 
 describe('runOnce monitor integration', () => {
   it('primes the monitor before creating the session and stops it after pid death', async () => {
-    writeCfg({ A: { harness: 'fake' } });   // monitor.enabled defaults to true
+    writeCfg({ A: { harness: 'fake' } });   // monitor.mode defaults to fleet
     const d = agentDir('A'); mkdirSync(d, { recursive: true });
     const { deps, monitor } = fakeWorld({ exitCode: '0', exitFile: join(d, '.exit-status') });
     await runOnce('A', {}, deps);
@@ -562,8 +583,8 @@ describe('runOnce monitor integration', () => {
     expect(monitor.stopped).toBe(true);               // stopped when the pane pid died
   });
 
-  it('does not construct a monitor when monitor.enabled is false (legacy watch)', async () => {
-    writeCfg({ A: { harness: 'fake', monitor: { enabled: false } } });
+  it('does not construct a fleet monitor when monitor.mode is native', async () => {
+    writeCfg({ A: { harness: 'fake', monitor: { mode: 'native' } } });
     const d = agentDir('A'); mkdirSync(d, { recursive: true });
     const { deps, monitor } = fakeWorld({ exitCode: '0', exitFile: join(d, '.exit-status') });
     await runOnce('A', {}, deps);

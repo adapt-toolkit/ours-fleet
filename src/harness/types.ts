@@ -59,7 +59,7 @@ export interface BriefingVocab {
   getMessagesTool: string;
   watchCommand(identity: string): string;
   monitorInstruction(identity: string, role?: ResolvedRole): string;
-  /** Wake-source wording for a role whose monitor is supervisor-owned (monitor.enabled). */
+  /** Wake-source wording for a role whose monitor is supervisor-owned (monitor.mode=fleet). */
   supervisedWakeNote(identity: string, role?: ResolvedRole): string;
   launchNote(name: string): string;
   restartPrompt(identity: string, worklogPath: string, role?: ResolvedRole): string;

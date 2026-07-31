@@ -124,6 +124,8 @@ cOpt(program.command('config').description('validate + print the merged plan (no
         console.log(`\n● ${r.name}`);
         console.log(`    harness:     ${r.harness}`);
         console.log(`    session:     ${r.session}`);
+        console.log(`    monitor:     ${r.monitor.mode}`
+          + (r.monitor.mode === 'fleet' ? ` (interrupt=${r.monitor.interrupt})` : ''));
         console.log(`    identity:    ${r.identity}`);
         console.log(`    permissions: approval=${r.permissions.approval} `
           + `filesystem=${r.permissions.filesystem} unattended=${r.permissions.unattended}`);
@@ -338,7 +340,7 @@ cOpt(program.command('spawn <name>').description('spawn a new agent (permanent b
   .option('--search', 'enable Codex live web search')
   .option('--codex-config <key=value>', 'Codex config override (repeatable)', collect, [])
   .option('--add-dir <dir>', 'additional Codex writable directory (repeatable)', collect, [])
-  .option('--monitor', 'explicitly consent to arm this Codex role\'s ours mail monitor')
+  .option('--monitor', 'legacy: consent to arm Codex\'s native monitor (wake owner is monitor.mode in YAML)')
   .option('--bio-file <file>', 'public bio (file)')
   .option('--persona-file <file>', 'persona / operating contract (file)')
   .option('--isolation-file <path>', 'file holding an isolation: mapping (same schema as fleet.yaml)')

@@ -99,8 +99,9 @@ Ask only for choices not already supplied:
 - **Persona:** local operating contract covering mandate, quality bar,
   boundaries, and escalation. Use the writing-agent-bios skill when available.
 - **Coordinator:** optionally announce readiness to an existing ours identity.
-- **Mail monitoring:** explicitly ask whether to arm it. Pass `--monitor` only
-  after a clear yes. This consent persists in the role configuration.
+- **Native Codex mail monitoring:** explicitly ask whether to arm it. Pass the
+  legacy `--monitor` consent flag only after a clear yes. This is distinct from
+  fleet YAML `monitor.mode: fleet|native`, which chooses the wake owner.
 
 Codex-native controls, offered when relevant:
 
@@ -163,7 +164,8 @@ ours-fleet spawn Worker --harness codex --launcher auto \
 ```
 
 Add `--temp` for a temporary role; it can also use `--session acp`.
-Pass `--monitor` only after monitoring consent.
+Pass the legacy `--monitor` flag only after consent to arm Codex's native
+monitor. It does not select the wake owner; `monitor.mode` does that in YAML.
 Pass model, profile, search, config, and additional directories exactly as
 approved. Do not persist secrets in `--codex-config` or fleet YAML; use the
 role's `env` configuration for environment-based credentials.

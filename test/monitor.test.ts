@@ -10,10 +10,12 @@ import {
 import type { MonitorConfig } from '../src/config.js';
 
 const CFG = (over: Partial<MonitorConfig> = {}): MonitorConfig => ({
+  mode: 'fleet',
   enabled: true,
   wake_sources: ['message_received', 'file_received', 'local_contact_request', 'pending_message'],
   batch_ms: 2000,
   inject: 'notification',
+  interrupt: false,
   ...over,
 });
 
@@ -610,6 +612,62 @@ describe('Monitor.run — delivery', () => {
     await mon.run(1);
     expect(readFileSync(join(dir, '.notify-cursor'), 'utf8').trim()).toBe('1');
     expect(readFileSync(join(dir, '.monitor-status'), 'utf8')).toContain('cancelled');
+  });
+
+  it('requests ACP interruption before delivering when monitor.interrupt is enabled', async () => {
+    const tmux = fakeTmux();
+    const delivered: Array<{ text: string; interrupt?: boolean }> = [];
+    const { fetch } = scriptedFetch([
+      { cursor: 1, events: [] },
+      { cursor: 2, events: [{ event: 'message_received', from: 'C', msg_id: 10 }] },
+    ]);
+    const deps = makeDeps(fetch, tmux, {
+      delivery: {
+        submit: async (text, options) => {
+          delivered.push({ text, interrupt: options?.interrupt });
+          mon.stop();
+          return { accepted: true };
+        },
+      },
+    });
+    let mon: ReturnType<typeof createMonitor>;
+    mon = createMonitor({
+      name: 'A', agentDir: dir, cfg: CFG({ batch_ms: 0, interrupt: true }), deps,
+    });
+    await mon.prime();
+    await mon.run(1);
+    expect(delivered).toEqual([{
+      text: '[fleet-monitor] 1 new message from C (#10) — run get_messages',
+      interrupt: true,
+    }]);
+  });
+
+  it('presses C-c before tmux wake delivery when monitor.interrupt is enabled', async () => {
+    const tmux = fakeTmux();
+    const keys: string[] = [];
+    const originalSendKey = tmux.sendKey;
+    tmux.sendKey = async (name, key) => {
+      keys.push(key);
+      await originalSendKey(name, key);
+    };
+    const { fetch } = scriptedFetch([
+      { cursor: 1, events: [] },
+      { cursor: 2, events: [{ event: 'message_received', from: 'C', msg_id: 11 }] },
+    ]);
+    const originalSendText = tmux.sendText;
+    tmux.sendText = async (name, text) => {
+      await originalSendText(name, text);
+      mon.stop();
+    };
+    let mon: ReturnType<typeof createMonitor>;
+    mon = createMonitor({
+      name: 'A', agentDir: dir, cfg: CFG({ batch_ms: 0, interrupt: true }),
+      deps: makeDeps(fetch, tmux),
+    });
+    await mon.prime();
+    await mon.run(1);
+    expect(keys[0]).toBe('C-c');
+    expect(tmux.sent).toHaveLength(1);
   });
 
   it('injects one notification line for a filtered wake and advances the cursor', async () => {

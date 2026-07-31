@@ -64,7 +64,9 @@ role after exit/reboot. Both lifetimes support \`--session acp\`.
 
 Codex-specific spawn flags: \`--sandbox\`, \`--permission-mode\`, \`--launcher\`,
 \`--profile\`, \`--search\`, repeatable \`--codex-config key=value\`, repeatable
-\`--add-dir\`, and \`--monitor\`. Run \`ours-fleet help spawn\` for exact values.
+\`--add-dir\`, and legacy \`--monitor\` (consent for the native Codex monitor,
+not the \`monitor.mode\` wake-owner selector). Run \`ours-fleet help spawn\` for
+exact values.
 
 ## fleet.yaml
 
@@ -81,7 +83,7 @@ defaults:
     filesystem: workspace
     unattended: deny
   monitor:
-    enabled: true
+    mode: fleet                          # fleet (default) | native
 roles:
   Coordinator:
     harness: codex
@@ -100,7 +102,8 @@ roles:
       tmux:
         boot_grace_ms: 10000
     monitor:
-      enabled: true
+      mode: fleet                        # fleet supervisor | native harness monitor
+      interrupt: false                    # true cancels active work before every configured wake
       wake_sources: [message_received, file_received, local_contact_request, pending_message]
       batch_ms: 2000
       inject: notification
@@ -249,12 +252,24 @@ ours-fleet falls back to a compatible globally installed \`codex-acp\` or
 
 ## Reliable mail wake
 
-The supervisor monitor is enabled by default. It consumes body-free daemon
-events and advances its durable cursor only after delivery is accepted. ACP uses
-a structured \`session/prompt\`; tmux uses verified console injection. Message
-bodies are released only when the role calls the ours \`get_messages\` tool.
+\`monitor.mode\` selects exactly one wake owner:
 
-Set \`monitor.enabled: false\` only to retain legacy in-session monitoring.
+- \`fleet\` (default): the ours-fleet supervisor consumes body-free daemon
+  events and advances its durable cursor only after delivery is accepted. ACP
+  uses live steering when supported and falls back to structured
+  \`session/prompt\`; tmux uses verified console injection.
+- \`native\`: ours-fleet starts no supervisor monitor; the generated briefing
+  instructs Claude Code or Codex to arm its harness-native wake mechanism.
+
+Set \`monitor.interrupt: true\` in fleet mode to cancel active work before every
+configured wake. The policy is content-blind because the supervisor cannot
+inspect encrypted message bodies. Message bodies are released only when the
+role calls the ours \`get_messages\` tool.
+
+Legacy \`monitor.enabled: true|false\` remains accepted as an alias for
+\`mode: fleet|native\`; use \`mode\` in new configuration. Codex's separate
+\`harness_options.monitor: true\` is native-monitor consent, not monitor-owner
+selection.
 Inspect \`ours-fleet status Name\`, \`peek Name\`, role logs, and
 \`~/.ours-fleet/agents/Name/.monitor-status\` when diagnosing delivery.
 `;

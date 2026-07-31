@@ -287,11 +287,11 @@ export function makeClaudeCodeAdapter(exec: Exec = realExec): HarnessAdapter {
       launchNote: name => `You were launched with \`--remote-control ${name}\`. Confirm you are running.`,
       restartPrompt: (id, worklog, role) =>
         `Session restarted. Re-bind your ours identity now (choose_identity name "${id}" force=true), ` +
-        (role?.monitor?.enabled
+        (role?.monitor?.mode === 'fleet'
           ? 'then continue from '
           : `then ${armMonitor(id)}, then continue from `) +
         `${worklog}. Do not re-run whatever crashed you.` +
-        (role?.monitor?.enabled
+        (role?.monitor?.mode === 'fleet'
           ? ' Your mail wakes arrive as `[fleet-monitor]` console lines from the supervisor — ' +
             'do NOT arm an in-session Monitor.'
           : ''),

@@ -33,7 +33,7 @@ interface MonitorProfile {
 /** Resolve and deduplicate the effective daemon profiles used by monitored roles. */
 function resolveMonitorProfiles(roles: ResolvedRole[]): MonitorProfile[] {
   const profiles: MonitorProfile[] = [];
-  for (const role of roles.filter(r => r.monitor?.enabled)) {
+  for (const role of roles.filter(r => r.monitor?.mode === 'fleet')) {
     const endpoint = resolveEndpoint({ ...process.env, ...(role.env ?? {}) });
     const token = endpoint.headers['x-ours-api-token'];
     const existing = profiles.find(p =>

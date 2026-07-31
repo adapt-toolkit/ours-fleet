@@ -4,7 +4,8 @@ import { randomUUID } from 'node:crypto';
 import { parse } from 'yaml';
 import { agentDir, home, stateRoot } from './paths.js';
 import {
-  loadConfig, findRole, isolationContextFor, resolvePermissions, type ResolvedRole,
+  loadConfig, findRole, isolationContextFor, resolveMonitorConfig, resolvePermissions,
+  type ResolvedRole,
 } from './config.js';
 import { getAdapter } from './harness/registry.js';
 import type { Launch } from './harness/types.js';
@@ -246,6 +247,9 @@ export function loadTempRole(name: string): ResolvedRole {
   const p = join(agentDir(name, true), 'role.yaml');
   if (!existsSync(p)) throw new Error(`temp role '${name}' has no snapshot at ${p}`);
   const role = parse(readFileSync(p, 'utf8')) as ResolvedRole;
+  // Upgrade snapshots written before monitor.mode/interrupt existed. A snapshot
+  // with no monitor block keeps the historical native/no-supervisor behavior.
+  if (role.monitor) role.monitor = resolveMonitorConfig(undefined, role.monitor);
   (role as ResolvedRole & { __temp?: boolean }).__temp = true;
   return role;
 }
@@ -365,11 +369,11 @@ export async function runOnce(
 
   // Supervisor mail monitor (design §1): prime the notification cursor at the
   // stream tip BEFORE the session launches so no arrival is missed during boot
-  // (backlog before the tip is the SessionStart hook's job). Disabled roles keep
-  // the legacy in-session watch. Temp snapshots predating `monitor:` are treated
-  // as disabled (monitor may be undefined on an old role.yaml).
+  // (backlog before the tip is the SessionStart hook's job). Native-mode roles
+  // leave wake ownership to the harness. Temp snapshots predating `monitor:` are
+  // treated as native (monitor may be undefined on an old role.yaml).
   const resolvedMonitorDeps = monitorDeps(deps, role.env);
-  const monitor = role.monitor?.enabled ? deps.createMonitor({
+  const monitor = role.monitor?.mode === 'fleet' ? deps.createMonitor({
     name, identity: role.identity, agentDir: dir, cfg: role.monitor,
     deps: resolvedMonitorDeps,
   }) : null;
@@ -380,6 +384,7 @@ export async function runOnce(
   let sessionHandle: SessionHandle;
   let acpSession: AcpSession | undefined;
   let control: RoleControlServer | undefined;
+  let monitorLoop: Promise<void> | undefined;
   if (sessionBackend === 'acp') {
     const perms = role.permissions ?? resolvePermissions(undefined, undefined);
     // Say once, at startup, that this role will decide permission requests by
@@ -406,9 +411,15 @@ export async function runOnce(
       // A wake is only delivered when its turn TERMINATES successfully. A
       // refusal or a cancellation reached the agent and was not acted on, so
       // the monitor must keep its cursor and try again.
-      submit: async text => {
-        const result = await acpSession!.submitPrompt(text);
-        return { succeeded: result.succeeded, outcome: result.outcome, detail: result.detail };
+      submit: async (text, options) => {
+        const result = await acpSession!.submitPrompt(text, { ...options, steer: true });
+        const steered = result.accepted
+          && (result.detail === 'injected' || result.detail === 'startedNewTurn');
+        return {
+          succeeded: result.succeeded || steered,
+          outcome: steered ? result.detail! : result.outcome,
+          detail: result.detail,
+        };
       },
     };
     const firstPrompt = mode === 'fresh'
@@ -417,7 +428,11 @@ export async function runOnce(
     // Wait for the first turn's TERMINAL result. An agent that accepts the
     // startup prompt and then refuses it has not started; logging the role as
     // up would hide a role that never read its briefing.
-    const started = await acpSession.submitPrompt(firstPrompt);
+    const starting = acpSession.submitPrompt(firstPrompt);
+    // Start monitoring as soon as the initial prompt has been submitted. ACP
+    // steering can deliver a wake into that turn without a boot-time deaf gap.
+    monitorLoop = monitor?.run(pid);
+    const started = await starting;
     if (!started.succeeded) {
       monitor?.stop();
       await control.close();
@@ -443,7 +458,7 @@ export async function runOnce(
 
   // The monitor loop lives exactly as long as the session: it starts once the
   // pane pid is known and is stopped when that pid dies (task dies with runner).
-  const monitorLoop = monitor?.run(pid);
+  monitorLoop ??= monitor?.run(pid);
 
   const start = deps.now();
   while (sessionHandle.isAlive()) await deps.sleep(2000);

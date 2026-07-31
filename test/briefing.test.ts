@@ -83,17 +83,23 @@ describe('generateBriefing', () => {
     expect(b.indexOf('## Routines')).toBeGreaterThan(b.indexOf('## Durable log'));
   });
 
-  it('tells a supervised (monitor.enabled) role NOT to arm its own watch', () => {
-    const enabled = { ...base, monitor: { enabled: true, wake_sources: [], batch_ms: 2000, inject: 'notification' as const } };
-    const b = generateBriefing(enabled as ResolvedRole, vocab, opts);
+  it('tells a fleet-monitored role NOT to arm its native watch', () => {
+    const fleet = {
+      ...base,
+      monitor: { mode: 'fleet', enabled: true, wake_sources: [], batch_ms: 2000, inject: 'notification' as const },
+    };
+    const b = generateBriefing(fleet as ResolvedRole, vocab, opts);
     expect(b).toContain('[fleet-monitor]');
     expect(b).toContain('do NOT arm');
     expect(b).not.toContain('ours-mcp watch');   // legacy watch dropped from both step 6 and restart
   });
 
-  it('keeps the legacy watch instruction for a monitor.enabled=false role', () => {
-    const disabled = { ...base, monitor: { enabled: false, wake_sources: [], batch_ms: 2000, inject: 'notification' as const } };
-    const b = generateBriefing(disabled as ResolvedRole, vocab, opts);
+  it('uses the native harness watch instruction for monitor.mode=native', () => {
+    const native = {
+      ...base,
+      monitor: { mode: 'native', enabled: false, wake_sources: [], batch_ms: 2000, inject: 'notification' as const },
+    };
+    const b = generateBriefing(native as ResolvedRole, vocab, opts);
     expect(b).toContain('ours-mcp watch "Alice Dev"');
     expect(b).not.toContain('[fleet-monitor]');
   });

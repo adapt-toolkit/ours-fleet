@@ -41,7 +41,9 @@ describe('autocompactPct', () => {
 
 describe('vocabulary — supervised monitor migration', () => {
   const v = makeClaudeCodeAdapter(okExec).vocabulary;
-  const mon = (enabled: boolean) => ({ enabled, wake_sources: [], batch_ms: 2000, inject: 'notification' as const });
+  const mon = (mode: 'fleet' | 'native') => ({
+    mode, enabled: mode === 'fleet', wake_sources: [], batch_ms: 2000, inject: 'notification' as const,
+  });
 
   it('supervisedWakeNote steers the agent off its own Monitor', () => {
     const note = v.supervisedWakeNote('Alice Dev');
@@ -51,14 +53,14 @@ describe('vocabulary — supervised monitor migration', () => {
   });
 
   it('restartPrompt drops the re-arm line when the monitor is supervised', () => {
-    const p = v.restartPrompt('Alice Dev', '/w/WORKLOG.md', role({ monitor: mon(true) }));
+    const p = v.restartPrompt('Alice Dev', '/w/WORKLOG.md', role({ monitor: mon('fleet') }));
     expect(p).not.toContain('re-arm');
     expect(p).not.toContain('ours-mcp watch');
     expect(p).toContain('choose_identity name "Alice Dev"');
   });
 
-  it('restartPrompt keeps the re-arm line for a legacy (disabled) role', () => {
-    const p = v.restartPrompt('Alice Dev', '/w/WORKLOG.md', role({ monitor: mon(false) }));
+  it('restartPrompt keeps the re-arm line for a native-monitor role', () => {
+    const p = v.restartPrompt('Alice Dev', '/w/WORKLOG.md', role({ monitor: mon('native') }));
     expect(p).toContain('ours-mcp watch "Alice Dev"');
   });
 
@@ -71,7 +73,7 @@ describe('vocabulary — supervised monitor migration', () => {
   });
 
   it('non-supervised restartPrompt mandates the Monitor TOOL, not background Bash', () => {
-    const p = v.restartPrompt('Alice Dev', '/w/WORKLOG.md', role({ monitor: mon(false) }));
+    const p = v.restartPrompt('Alice Dev', '/w/WORKLOG.md', role({ monitor: mon('native') }));
     expect(p).toContain('persistent Monitor');
     expect(p).toContain('NOT a background Bash');
     expect(p).toContain('ours-mcp watch "Alice Dev"');
@@ -85,7 +87,7 @@ describe('vocabulary — supervised monitor migration', () => {
   });
 
   it('supervised restartPrompt states mail arrives as [fleet-monitor] and forbids an in-session Monitor', () => {
-    const p = v.restartPrompt('Alice Dev', '/w/WORKLOG.md', role({ monitor: mon(true) }));
+    const p = v.restartPrompt('Alice Dev', '/w/WORKLOG.md', role({ monitor: mon('fleet') }));
     expect(p).toContain('[fleet-monitor]');
     expect(p).toContain('do NOT arm an in-session Monitor');
     expect(p).not.toContain('ours-mcp watch');
@@ -93,7 +95,7 @@ describe('vocabulary — supervised monitor migration', () => {
 
   it('monitorInstruction and non-supervised restartPrompt share the same mandate wording', () => {
     const mi = v.monitorInstruction('Alice Dev');
-    const rp = v.restartPrompt('Alice Dev', '/w/WORKLOG.md', role({ monitor: mon(false) }));
+    const rp = v.restartPrompt('Alice Dev', '/w/WORKLOG.md', role({ monitor: mon('native') }));
     for (const frag of ['persistent Monitor', 'NOT a background Bash', 'ours-mcp watch "Alice Dev"']) {
       expect(mi).toContain(frag);
       expect(rp).toContain(frag);
