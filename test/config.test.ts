@@ -21,6 +21,55 @@ const dropin = (name: string, s: string) => {
 };
 
 describe('loadConfig', () => {
+  it('always rejects duplicate mapping keys with a source position', () => {
+    base('roles:\n  A:\n    model: first\n    model: second\n');
+    expect(() => loadConfig()).toThrow(/fleet\.yaml:.*Map keys must be unique.*line 4/i);
+  });
+
+  it.each([
+    ['anchor and alias', 'roles:\n  A: &shared {}\n  B: *shared\n', ['anchor', 'alias']],
+    ['explicit tag', 'roles:\n  A:\n    mission: !!str hello\n', ['explicit-tag']],
+    ['non-scalar key', 'vars:\n  ? [A]\n  : value\nroles: {}\n', ['non-scalar-key']],
+    ['multiple documents', 'roles:\n  A: {}\n---\nroles:\n  B: {}\n', ['multiple-documents']],
+  ])('warns for %s in compat and rejects it in strict mode', (_name, yaml, kinds) => {
+    base(yaml);
+    expect(loadConfig(undefined, { yamlMode: 'compat' }).diagnostics.map(d => d.kind))
+      .toEqual(expect.arrayContaining(kinds));
+    expect(() => loadConfig(undefined, { yamlMode: 'strict' })).toThrow(/non-plain YAML/);
+  });
+
+  it('continues to allow multiline plain strings in strict mode', () => {
+    base('roles:\n  A:\n    mission: |\n      first\n      second\n');
+    expect(findRole(loadConfig(undefined, { yamlMode: 'strict' }), 'A').mission)
+      .toBe('first\nsecond\n');
+  });
+
+  it('validates worklog, loopback auth proxy, and approved model chains', () => {
+    base([
+      'defaults:',
+      '  harness: claude-code',
+      '  worklog: { max_kb: 10, keep_tail_kb: 2, max_archives: 3 }',
+      'roles:',
+      '  A:',
+      '    model: primary',
+      '    model_chain: [primary, fallback]',
+      '    auth_proxy:',
+      '      kind: anthropic',
+      '      base_url: http://127.0.0.1:9411',
+      '      required: true',
+      '',
+    ].join('\n'));
+    const role = findRole(loadConfig(), 'A');
+    expect(role.worklog).toEqual({ max_kb: 10, keep_tail_kb: 2, max_archives: 3 });
+    expect(role.model_chain).toEqual(['primary', 'fallback']);
+    expect(role.env?.ANTHROPIC_BASE_URL).toBe('http://127.0.0.1:9411');
+    expect(role.auth_proxy?.health_url).toContain('/healthz');
+    base('roles:\n  A:\n    model: primary\n    model_chain: [other]\n');
+    expect(() => loadConfig()).toThrow(/model must equal model_chain/);
+    base('roles:\n  A:\n    auth_proxy: { kind: anthropic, base_url: https://example.com }\n');
+    expect(() => loadConfig()).toThrow(/loopback-only/);
+  });
+
   it('merges fleet.yaml with fleet.d drop-ins', () => {
     base('roles:\n  A:\n    mission: base role\n');
     dropin('b.yaml', 'roles:\n  B:\n    mission: spawned\n');

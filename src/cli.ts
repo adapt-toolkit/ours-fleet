@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 import { spawn as spawnChild } from 'node:child_process';
-import { existsSync, mkdirSync, readdirSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, readdirSync, statSync } from 'node:fs';
 import { realpathSync } from 'node:fs';
 import { join as joinPath } from 'node:path';
 import { createInterface } from 'node:readline';
@@ -8,11 +8,17 @@ import { Command } from 'commander';
 import { VERSION } from './version.js';
 import { agentDir, agentsRoot, tmpRoot, logsRoot, deriveXdgRuntimeDir } from './paths.js';
 import { loadConfig } from './config.js';
+import type { YamlMode } from './config-yaml.js';
+import { resolvedPlan } from './resolved-plan.js';
 import { Tmux, tmuxArgs } from './tmux.js';
 import { pickBackend } from './supervisor/index.js';
 import { up, down, restartRoles, rmRole, type OpsDeps } from './ops.js';
 import { readRestartLedger, runSupervised, runTemp } from './runner.js';
-import { lastProvenance, spawnPermanent, spawnTemp, type SpawnOpts } from './spawn.js';
+import {
+  lastProvenance, spawnDryRun, spawnPermanent, spawnTemp, type SpawnOpts,
+} from './spawn.js';
+import { stringify } from 'yaml';
+import { resolvedRolePlan } from './resolved-plan.js';
 import { formatProvenance } from './creation.js';
 import { doctor } from './doctor.js';
 import { allWarnings, analyzeFleetPermissions, formatNative } from './permissions.js';
@@ -114,10 +120,20 @@ function parseCodexConfig(values: string[] | undefined): Record<string, string |
 }
 
 cOpt(program.command('config').description('validate + print the merged plan (no side effects)'))
+  .option('--json', 'emit the stable, versioned, secret-safe resolved plan')
+  .option('--yaml-mode <mode>', 'non-plain YAML policy: compat|strict', 'compat')
   .action(opts => {
     try {
-      const cfg = loadConfig(opts.configuration);
+      if (!['compat', 'strict'].includes(opts.yamlMode))
+        throw new Error(`invalid --yaml-mode '${opts.yamlMode}'; allowed: compat, strict`);
+      const cfg = loadConfig(opts.configuration, { yamlMode: opts.yamlMode as YamlMode });
+      if (opts.json) {
+        for (const diagnostic of cfg.diagnostics) console.error(`warning: ${diagnostic.message}`);
+        process.stdout.write(`${JSON.stringify(resolvedPlan(cfg), null, 2)}\n`);
+        return;
+      }
       console.log(`config: ${cfg.files.join(' + ') || '(none)'}`);
+      for (const diagnostic of cfg.diagnostics) console.log(`warning: ${diagnostic.message}`);
       const analyses = analyzeFleetPermissions(cfg.roles);
       for (const r of cfg.roles) {
         const perms = analyses.find(a => a.role === r.name);
@@ -307,6 +323,18 @@ program.command('status <name>').description('unit/agent state')
     else if (ledger.consecutiveImmediateFailures > 0)
       console.log(`restarts: ${ledger.consecutiveImmediateFailures} consecutive immediate `
         + `failures, next delay ${ledger.nextDelayMs}ms (${ledger.lastReason})`);
+    const modelStatus = joinPath(agentDir(name), '.model-status');
+    if (existsSync(modelStatus)) {
+      try {
+        const status = JSON.parse(readFileSync(modelStatus, 'utf8')) as {
+          declaredModel?: string; effectiveModel?: string; heldDown?: boolean;
+        };
+        console.log(`model: declared=${status.declaredModel} effective=${status.effectiveModel}`
+          + `${status.heldDown ? ' HELD DOWN (chain exhausted)' : ' (runtime drift)'}`);
+      } catch { console.log('model: recovery status unreadable (fail-closed)'); }
+    }
+    const worklog = joinPath(agentDir(name), 'WORKLOG.md');
+    if (existsSync(worklog)) console.log(`worklog: ${statSync(worklog).size} bytes`);
     const stateDir = acpStateDir(name);
     if (stateDir) {
       try {
@@ -326,6 +354,7 @@ cOpt(program.command('spawn <name>').description('spawn a new agent (permanent b
   .option('--harness <id>', 'harness adapter (default: defaults.harness)')
   .option('--session <backend>', 'session backend: tmux|acp (default: defaults.session or tmux)')
   .option('--mission <text>', 'one-line mission')
+  .option('--mission-file <path>', 'UTF-8 mission text (mutually exclusive with --mission)')
   .option('--identity <name>', 'ours identity to bind (default: role name)')
   .option('--cwd <dir>', 'working directory')
   .option('--coordinator <name>', 'announce target')
@@ -344,10 +373,13 @@ cOpt(program.command('spawn <name>').description('spawn a new agent (permanent b
   .option('--bio-file <file>', 'public bio (file)')
   .option('--persona-file <file>', 'persona / operating contract (file)')
   .option('--isolation-file <path>', 'file holding an isolation: mapping (same schema as fleet.yaml)')
+  .option('--dry-run', 'validate and print without reserving or creating anything')
+  .option('--json', 'with --dry-run, emit a stable secret-safe JSON result')
   .action(async (name, opts) => {
     try {
       const o: SpawnOpts = {
         name, temp: opts.temp, harness: opts.harness, session: opts.session, mission: opts.mission,
+        missionFile: opts.missionFile,
         identity: opts.identity, cwd: opts.cwd, coordinator: opts.coordinator,
         model: opts.model,
         permissionMode: opts.permissionMode, approval: opts.approval,
@@ -357,7 +389,24 @@ cOpt(program.command('spawn <name>').description('spawn a new agent (permanent b
         codexConfig: parseCodexConfig(opts.codexConfig), addDirs: opts.addDir, monitor: opts.monitor,
         bioFile: opts.bioFile, personaFile: opts.personaFile,
         isolationFile: opts.isolationFile, configPath: opts.configuration,
+        dryRun: opts.dryRun, json: opts.json,
       };
+      if (o.json && !o.dryRun) throw new Error('--json is currently valid only with --dry-run');
+      if (o.dryRun) {
+        const result = spawnDryRun(o);
+        if (o.json) {
+          process.stdout.write(`${JSON.stringify({
+            schemaVersion: result.schemaVersion,
+            warning: result.warning,
+            roleDocument: result.roleDocument,
+            resolvedRole: resolvedRolePlan(result.resolvedRole),
+          }, null, 2)}\n`);
+        } else {
+          console.log(`# dry-run: ${result.warning}`);
+          process.stdout.write(stringify(result.roleDocument));
+        }
+        return;
+      }
       if (o.temp) {
         const dir = await spawnTemp(o, binPath);
         console.log(`spawned temp agent '${name}' (state: ${dir}; gone on exit/reboot)`);
@@ -378,8 +427,15 @@ cOpt(program.command('spawn <name>').description('spawn a new agent (permanent b
 
 cOpt(program.command('doctor').description('prerequisite report'))
   .option('--harness <id>', 'check one harness explicitly')
+  .option('--yaml-mode <mode>', 'non-plain YAML policy: compat|strict', 'compat')
   .action(async opts => {
-    const rep = await doctor({ harness: opts.harness, configPath: opts.configuration });
+    if (!['compat', 'strict'].includes(opts.yamlMode))
+      die(`invalid --yaml-mode '${opts.yamlMode}'; allowed: compat, strict`);
+    const rep = await doctor({
+      harness: opts.harness,
+      configPath: opts.configuration,
+      yamlMode: opts.yamlMode as YamlMode,
+    });
     for (const c of rep.checks) console.log(`${c.ok ? 'ok  ' : 'MISS'} ${c.name.padEnd(22)} ${c.detail}`);
     process.exit(rep.ok ? 0 : 1);
   });
