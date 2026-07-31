@@ -8,6 +8,15 @@ test('bootstrap, inventory, navigation, send, create, and security boundaries', 
   await expect(page.getByText('Alpha', { exact: true }).first()).toBeVisible();
   await expect(page.getByText('live · idle')).toBeVisible();
   await expect(page.getByText(/service inactive · authoritative/)).toBeVisible();
+  const manifest = await request.get('/manifest.webmanifest');
+  expect(manifest.status()).toBe(200);
+  expect(manifest.headers()['content-type']).toMatch(/manifest|json/);
+  expect((await manifest.json()).display).toBe('standalone');
+  const cdp = await page.context().newCDPSession(page);
+  const installErrors = (await cdp.send('Page.getInstallabilityErrors')).installabilityErrors;
+  // Playwright's temporary browser context is incognito by construction; no
+  // manifest/icon/worker installability error is allowed beyond that fixture constraint.
+  expect(installErrors.filter(error => error.errorId !== 'in-incognito')).toEqual([]);
   await request.post('/__test/restart-auth');
   await page.reload();
   await expect(page.getByRole('heading', { name: 'Your fleet' })).toBeVisible();
@@ -51,6 +60,20 @@ test('bootstrap, inventory, navigation, send, create, and security boundaries', 
   expect(hostile.status()).toBe(403);
 
   await page.screenshot({ path: 'test-results/web-console-overview.png', fullPage: true });
+  await page.evaluate(() => navigator.serviceWorker.ready.then(() => undefined));
+  await page.waitForFunction(() => navigator.serviceWorker.controller !== null);
+  await page.context().setOffline(true);
+  await page.goto('http://127.0.0.1:49371/offline-check');
+  await expect(page.getByRole('heading', { name: 'Local daemon unavailable' })).toBeVisible();
+  await expect(page.getByText('Alpha', { exact: true })).toHaveCount(0);
+  await page.context().setOffline(false);
+  await page.goto('http://127.0.0.1:49371/');
+  await expect(page.getByRole('heading', { name: 'Your fleet' })).toBeVisible();
+  const cached = await page.evaluate(async () => (await Promise.all(
+    (await caches.keys()).map(async key => (await caches.open(key)).keys()),
+  )).flat().map(request => new URL(request.url).pathname));
+  expect(cached).toContain('/offline.html');
+  expect(cached.every(path => path === '/offline.html' || path.startsWith('/assets/'))).toBe(true);
   await page.getByRole('button', { name: 'Sign out' }).click();
   await expect(page.getByText(/ours-fleet web open/)).toBeVisible();
   expect((await page.context().cookies()).filter(cookie =>

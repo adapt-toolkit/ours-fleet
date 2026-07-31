@@ -165,6 +165,13 @@ local processes running as the same OS user are therefore inside the trust
 boundary. Keep the console local: it has no `--host`, proxy, TLS, or
 remote-access mode.
 
+The console is installable as a standalone PWA. Its service worker caches only
+the data-free offline page and successful content-hashed JavaScript/CSS assets.
+HTML stays network-first and no API, authentication, bootstrap, device,
+WebSocket, terminal, event, audit, log, session, query-bearing, or error response
+is cached. When the local daemon is unavailable, the PWA shows an explicit
+offline shell and no stale fleet state.
+
 The console provides evidence-separated inventory and status, ACP activity and
 permission controls, redacted logs, typed text send, confirmed lifecycle
 actions, transactional permanent/temporary creation, and a shared tmux browser

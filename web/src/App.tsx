@@ -28,6 +28,7 @@ export function App() {
   const [filter, setFilter] = useState('');
   const [view, setView] = useState<'fleet' | 'attention' | 'audit'>('fleet');
   const [creating, setCreating] = useState(false);
+  const [installPrompt, setInstallPrompt] = useState<InstallPromptEvent>();
   const [connection, setConnection] = useState<'connecting' | 'live' | 'polling'>('connecting');
   const [meta, setMeta] = useState<{ version?: string; auditDegraded?: string }>();
 
@@ -69,6 +70,16 @@ export function App() {
     return () => { cancelled = true; socket?.close(); clearInterval(timer); };
   }, [ready, refresh, selected]);
 
+  useEffect(() => {
+    if (matchMedia('(display-mode: standalone)').matches) return;
+    const capture = (event: Event) => {
+      event.preventDefault();
+      setInstallPrompt(event as InstallPromptEvent);
+    };
+    window.addEventListener('beforeinstallprompt', capture);
+    return () => window.removeEventListener('beforeinstallprompt', capture);
+  }, []);
+
   const shown = useMemo(() => items.filter(item => {
     const text = `${item.role.id} ${item.role.config?.mission ?? ''} ${item.status.overall}`.toLowerCase();
     return text.includes(filter.toLowerCase())
@@ -106,6 +117,9 @@ export function App() {
           <h1>{selected || (view === 'attention' ? 'Needs attention' : view === 'audit' ? 'Audit trail' : 'Your fleet')}</h1>
         </div>
         <div className="header-actions">
+          {installPrompt && <button className="secondary" onClick={() => {
+            void installPrompt.prompt(); setInstallPrompt(undefined);
+          }}>Install app</button>}
           <button className="secondary" onClick={() => void refresh()}>Refresh</button>
           <button className="secondary" onClick={() => void api.logout().finally(() => location.reload())}>Sign out</button>
           <button className="primary" onClick={() => setCreating(true)}>＋ Create role</button>
@@ -147,6 +161,10 @@ export function App() {
       if (path) history.replaceState(null, '', path);
     }} />}
   </div>;
+}
+
+interface InstallPromptEvent extends Event {
+  prompt(): Promise<void>;
 }
 
 function sessionLabel(session: FleetItem['status']['session']): string {

@@ -76,7 +76,7 @@ export async function buildWebServer(
     reply.header('Content-Security-Policy',
       `default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; ` +
       `connect-src 'self' ws://${auth.host}; object-src 'none'; base-uri 'none'; ` +
-      `frame-ancestors 'none'; form-action 'self'`);
+      `frame-ancestors 'none'; form-action 'self'; manifest-src 'self'; worker-src 'self'`);
     if (request.url.startsWith('/api/')) reply.header('Cache-Control', 'no-store');
     if (request.headers.host !== auth.host)
       throw new FleetError('forbidden', 'invalid Host header');
