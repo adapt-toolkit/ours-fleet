@@ -7,7 +7,7 @@ import { validateIsolationConfig } from './isolation/policy.js';
 import type { IsolationConfig } from './isolation/types.js';
 import {
   loadConfig, resolveAuthProxy, resolveModelChain, resolveMonitorConfig, resolvePermissions,
-  resolveWorklogPolicy, validateMonitorConfig,
+  resolveRoleModel, resolveWorklogPolicy, validateMonitorConfig,
   type ApprovalMode, type FilesystemMode, type ResolvedRole, type RoleConfig,
   type CommonPermissions, type MonitorConfig, type SessionBackendId, type UnattendedMode,
 } from './config.js';
@@ -40,7 +40,8 @@ export interface SpawnOpts {
   identity?: string;
   cwd?: string;
   coordinator?: string;
-  model?: string;
+  /** null explicitly selects the harness default; undefined retains normal fleet inheritance. */
+  model?: string | null;
   permissionMode?: string;
   approval?: ApprovalMode;
   filesystem?: FilesystemMode;
@@ -97,7 +98,8 @@ export function buildRoleConfig(o: SpawnOpts, defaultHarness?: string): RoleConf
   if (o.coordinator) r.coordinator = o.coordinator;
   if (o.missionFile) r.mission = readMissionFile(o.missionFile);
   else if (o.mission !== undefined) r.mission = o.mission;
-  if (o.model?.trim()) r.model = o.model.trim();
+  if (o.model === null) r.model = null;
+  else if (o.model?.trim()) r.model = o.model.trim();
   const harness = o.harness ?? defaultHarness;
   const harnessOptions: Record<string, unknown> = {};
   if (o.permissionMode) harnessOptions[harness === 'claude-code' ? 'permission_mode' : 'approval'] = o.permissionMode;
@@ -276,6 +278,8 @@ function provenanceSettings(
   o: SpawnOpts, defaults: Record<string, unknown>,
 ): Record<string, ProvenanceEntry> {
   const perms = (defaults.permissions ?? {}) as Partial<CommonPermissions>;
+  const explicitModel = typeof o.model === 'string' ? o.model.trim() : undefined;
+  const inheritedModel = resolveRoleModel(undefined, o.harness, defaults);
   return {
     harness: provenanceOf(o.harness, defaults.harness, 'claude-code'),
     session: provenanceOf(o.session, defaults.session, 'tmux'),
@@ -283,7 +287,11 @@ function provenanceSettings(
       ? { value: o.identity, source: 'cli' }
       : { value: o.name, source: 'built-in' },     // defaults to the role name
     cwd: provenanceOf(o.cwd, undefined, undefined),
-    model: provenanceOf(o.model?.trim(), defaults.model, undefined),
+    model: o.model === null
+      ? { value: undefined, source: 'cli' }
+      : explicitModel
+        ? { value: explicitModel, source: 'cli' }
+        : { value: inheritedModel, source: inheritedModel ? 'fleet-default' : 'built-in' },
     coordinator: provenanceOf(o.coordinator, undefined, undefined),
     approval: provenanceOf(o.approval, perms.approval, 'ask'),
     filesystem: provenanceOf(o.filesystem, perms.filesystem, 'workspace'),
@@ -439,16 +447,21 @@ async function spawnTempInner(
     ...((cfg.defaults.harness_options ?? {}) as Record<string, unknown>),
     ...(fromOpts.harness_options ?? {}),
   };
+  const harness = o.harness ?? defaultHarness ?? 'claude-code';
+  const inheritsModelDefaults = harness === (defaultHarness ?? 'claude-code') && o.model !== null;
+  const model = resolveRoleModel(o.model, o.harness, cfg.defaults);
   const role: ResolvedRole = {
     ...fromOpts,          // includes `isolation` when --isolation-file was given
     name: o.name,
-    harness: o.harness ?? defaultHarness ?? 'claude-code',
+    harness,
     session: o.session ?? (cfg.defaults.session as SessionBackendId | undefined) ?? 'tmux',
     identity: o.identity ?? o.name,
-    model: o.model?.trim() || (cfg.defaults.model as string | undefined),
+    model,
     model_chain: resolveModelChain(
-      o.model?.trim() || (cfg.defaults.model as string | undefined),
-      fromOpts.model_chain ?? (cfg.defaults.model_chain as string[] | undefined),
+      model,
+      fromOpts.model_chain ?? (inheritsModelDefaults
+        ? cfg.defaults.model_chain as string[] | undefined
+        : undefined),
     ),
     harness_options: Object.keys(mergedHarnessOptions).length ? mergedHarnessOptions : undefined,
     permissions: resolvePermissions(cfg.defaults.permissions, fromOpts.permissions),

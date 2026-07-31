@@ -213,6 +213,29 @@ describe('loadConfig', () => {
     expect(findRole(loadConfig(), 'B').model).toBe('claude-opus-4-8');
   });
 
+  it('does not inherit a fleet model across an explicit harness switch', () => {
+    base(`defaults:
+  harness: codex
+  model: gpt-5.6
+roles:
+  Foreign:
+    harness: claude-code
+  Same:
+    harness: codex
+  Override:
+    harness: claude-code
+    model: claude-sonnet-4-5
+  HarnessDefault:
+    harness: codex
+    model: null
+`);
+    const cfg = loadConfig();
+    expect(findRole(cfg, 'Foreign').model).toBeUndefined();
+    expect(findRole(cfg, 'Same').model).toBe('gpt-5.6');
+    expect(findRole(cfg, 'Override').model).toBe('claude-sonnet-4-5');
+    expect(findRole(cfg, 'HarnessDefault').model).toBeUndefined();
+  });
+
   it('leaves model undefined when neither role nor defaults set it', () => {
     base('roles:\n  A: {}\n');
     expect(findRole(loadConfig(), 'A').model).toBeUndefined();

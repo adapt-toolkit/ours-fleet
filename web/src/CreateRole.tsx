@@ -50,7 +50,7 @@ export function CreateRole({ onClose, onCreated }: {
   }, []);
   const request = useMemo(() => ({
     name: form.name, harness: form.harness,
-    model: form.model || undefined, session: form.session, cwd: form.cwd || undefined,
+    model: form.model.trim() || null, session: form.session, cwd: form.cwd || undefined,
     lifetime: form.lifetime, mission: form.mission || undefined,
     coordinator: form.coordinator || undefined,
     permissions: { approval: form.approval, filesystem: form.filesystem, unattended: form.unattended },
@@ -107,7 +107,7 @@ export function CreateRole({ onClose, onCreated }: {
         <fieldset><legend>Runtime</legend><div className="form-grid">
           <label>Harness<select value={form.harness} onChange={e => change('harness', e.target.value as Form['harness'])}><option value="codex">Codex</option><option value="claude-code">Claude Code</option></select></label>
           <label>Session<select value={form.session} onChange={e => change('session', e.target.value as Form['session'])}><option value="acp">ACP activity</option><option value="tmux">tmux terminal</option></select></label>
-          <label>Model<input value={form.model} onChange={e => change('model', e.target.value)} placeholder="adapter default" /></label>
+          <label>Model <small>blank uses harness default</small><input value={form.model} onChange={e => change('model', e.target.value)} placeholder="harness default" /></label>
           <label>Lifetime<select value={form.lifetime} onChange={e => change('lifetime', e.target.value as Form['lifetime'])}><option value="permanent">Permanent</option><option value="temporary">Temporary — gone on exit/reboot</option></select></label>
           <label className="wide">Working directory <small>blank uses private role state</small><input value={form.cwd} onChange={e => change('cwd', e.target.value)} placeholder="/absolute/existing/path" /></label>
         </div></fieldset>
@@ -150,7 +150,9 @@ export function CreateRole({ onClose, onCreated }: {
           <label>Local persona<textarea value={form.persona} onChange={e => change('persona', e.target.value)} /></label>
         </div></fieldset>
         {preview && <div className="review"><h3>Effective plan</h3>
-          <dl>{Object.entries(preview.effective).map(([key, value]) => <div key={key}><dt>{key}</dt><dd>{typeof value === 'object' ? JSON.stringify(value) : String(value ?? 'default')}</dd></div>)}</dl>
+          <dl>{Object.entries(preview.effective).map(([key, value]) => <div key={key}><dt>{key}</dt><dd>{key === 'model' && value == null
+            ? 'harness default'
+            : typeof value === 'object' ? JSON.stringify(value) : String(value ?? 'default')}</dd></div>)}</dl>
           {preview.warnings?.map((warning: string) => <p className="warning" key={warning}>△ {warning}</p>)}
           {preview.prerequisites?.map((item: string) => <p className="error" key={item}>× {item}</p>)}
           {preview.identityBootstrap?.existingIdentity === 'verified' && !form.reuseExistingIdentityAcknowledged &&

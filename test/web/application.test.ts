@@ -236,6 +236,39 @@ roles: {}
     } as any)).rejects.toMatchObject({ code: 'invalid_request' });
   });
 
+  it('treats blank web model as harness default instead of a foreign fleet default', async () => {
+    const root = fixture();
+    writeFileSync(join(root, 'fleet.yaml'), `defaults:
+  harness: codex
+  model: gpt-5.6
+roles: {}
+`);
+    const service = new RoleCreationService({
+      configPath: join(root, 'fleet.yaml'),
+      ops: { backend, binPath: '/bin/true', log() {} }, binPath: '/bin/true',
+      identityProvisioner: { async exists() { return false; } },
+      journalDir: join(root, '.ours-fleet', 'web-actions'),
+    });
+    const base = {
+      name: 'ClaudeBlank', harness: 'claude-code' as const, model: null,
+      session: 'tmux' as const, lifetime: 'temporary' as const, openAfterCreate: true,
+      permissions: {
+        approval: 'ask' as const, filesystem: 'workspace' as const, unattended: 'deny' as const,
+      },
+    };
+    const blank = await service.preview(base);
+    expect(blank.effective.model).toBeUndefined();
+    expect(blank.provenance.model).toBe('request');
+    const inherited = await service.preview({
+      ...base, name: 'CodexInherited', harness: 'codex', model: undefined,
+    });
+    expect(inherited.effective.model).toBe('gpt-5.6');
+    expect(inherited.provenance.model).toBe('fleet-default');
+    const explicit = await service.preview({ ...base, name: 'ClaudeExplicit', model: 'claude-x' });
+    expect(explicit.effective.model).toBe('claude-x');
+    expect(explicit.provenance.model).toBe('request');
+  });
+
   it('requires explicit confirmation before reusing an existing identity', async () => {
     const root = fixture();
     writeFileSync(join(root, 'fleet.yaml'), 'roles: {}\n');

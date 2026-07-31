@@ -137,7 +137,8 @@ export interface RoleConfig {
   persona?: string;
   bio?: string;
   briefing_file?: string;
-  model?: string;
+  /** Explicit null means use the selected harness's own default, bypassing fleet defaults. */
+  model?: string | null;
   model_chain?: string[];
   max_tokens?: number;
   autocompact_pct?: number;
@@ -150,7 +151,7 @@ export interface RoleConfig {
   auth_proxy?: Partial<AuthProxyConfig>;
 }
 
-export interface ResolvedRole extends RoleConfig {
+export interface ResolvedRole extends Omit<RoleConfig, 'model'> {
   name: string;
   harness: string;
   session: SessionBackendId;
@@ -163,6 +164,7 @@ export interface ResolvedRole extends RoleConfig {
    */
   permissionsDeclared: boolean;
   identity: string;
+  model?: string;
   sourceFile: string;
   monitor: MonitorConfig;
   worklog?: WorklogPolicy;
@@ -181,6 +183,19 @@ export interface FleetConfig {
 }
 
 export class ConfigError extends Error {}
+
+/** Resolve a model without leaking a default that belongs to another harness. */
+export function resolveRoleModel(
+  model: string | null | undefined,
+  harness: string | undefined,
+  defaults: Record<string, unknown>,
+): string | undefined {
+  if (model === null) return undefined;
+  if (typeof model === 'string' && model.trim()) return model.trim();
+  const defaultHarness = (defaults.harness as string | undefined) ?? 'claude-code';
+  const effectiveHarness = harness ?? defaultHarness;
+  return effectiveHarness === defaultHarness ? defaults.model as string | undefined : undefined;
+}
 
 /**
  * The runtime facts the isolation resolver needs for a role. Single-sourced so
@@ -300,14 +315,18 @@ export function loadConfig(
       const monitor = resolveMonitorConfig(defaults.monitor, r.monitor, { base, file, name });
       const worklog = resolveWorklogPolicy(defaults.worklog, r.worklog, file, name);
       const authProxy = resolveAuthProxy(defaults.auth_proxy, r.auth_proxy, file, name);
-      const model = r.model ?? (defaults.model as string | undefined);
+      const harness = r.harness ?? (defaults.harness as string | undefined) ?? 'claude-code';
+      const defaultHarness = (defaults.harness as string | undefined) ?? 'claude-code';
+      const inheritsModelDefaults = harness === defaultHarness && r.model !== null;
+      const model = resolveRoleModel(r.model, r.harness, defaults);
       const modelChain = resolveModelChain(
         model,
-        r.model_chain ?? (defaults.model_chain as string[] | undefined),
+        r.model_chain ?? (inheritsModelDefaults
+          ? defaults.model_chain as string[] | undefined
+          : undefined),
         file,
         name,
       );
-      const harness = r.harness ?? (defaults.harness as string | undefined) ?? 'claude-code';
       if (authProxy && harness !== 'claude-code')
         throw new ConfigError(`${file}: role '${name}' auth_proxy is supported only by claude-code`);
       const env = {

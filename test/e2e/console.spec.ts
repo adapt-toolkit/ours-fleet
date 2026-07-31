@@ -44,6 +44,8 @@ test('bootstrap, inventory, navigation, send, create, and security boundaries', 
   await expect(page.getByText('accepted; turn may still be running')).toBeVisible();
   await page.getByRole('button', { name: /Create role/ }).click();
   await page.getByLabel('Role / session name').fill('Researcher');
+  await expect(page.getByText('blank uses harness default')).toBeVisible();
+  await page.getByLabel(/Model/).fill('');
   await page.getByLabel('Monitor mode').selectOption('native');
   await expect(page.getByLabel('Monitor wake sources')).toHaveCount(0);
   await page.getByLabel('Monitor mode').selectOption('fleet');
@@ -54,6 +56,8 @@ test('bootstrap, inventory, navigation, send, create, and security boundaries', 
   await page.getByText('Interrupt an active turn before wake delivery').click();
   await page.getByRole('button', { name: 'Review effective plan' }).click();
   await expect(page.getByText('Effective plan')).toBeVisible();
+  await expect(page.getByText('harness default', { exact: true })).toBeVisible();
+  await expect(page.getByText('gpt-5.6')).toHaveCount(0);
   await expect(page.getByText(/"batch_ms":750/)).toBeVisible();
   await expect(page.getByText(/"inbound_error"/)).toBeVisible();
   await page.getByRole('button', { name: 'Create atomically' }).click();

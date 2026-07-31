@@ -9,6 +9,8 @@ import {
 import { formatProvenance } from '../src/creation.js';
 import { agentDir } from '../src/paths.js';
 import { registerAdapter } from '../src/harness/registry.js';
+import { getAdapter } from '../src/harness/registry.js';
+import { findRole, loadConfig } from '../src/config.js';
 import { fakeAdapter } from './registry.test.js';
 import type { OpsDeps } from '../src/ops.js';
 import type { SupervisorBackend } from '../src/supervisor/types.js';
@@ -159,6 +161,31 @@ describe('spawn --model', () => {
       { name: 'Scout', model: 'claude-opus-4-8' }, '/b/ours-fleet', () => {});
     const snap = parse(readFileSync(join(d, 'role.yaml'), 'utf8'));
     expect(snap.model).toBe('claude-opus-4-8');
+  });
+
+  it('web harness-default intent suppresses a fleet model in permanent and temp launches', async () => {
+    writeFileSync(join(dir, 'fleet.yaml'), stringify({
+      defaults: { harness: 'codex', model: 'gpt-5.6' }, roles: {},
+    }));
+    const { d } = fakeDeps();
+    const file = await spawnPermanent({
+      name: 'ClaudePermanent', harness: 'claude-code', model: null, surface: 'web',
+    }, d);
+    expect(parse(readFileSync(file, 'utf8')).roles.ClaudePermanent.model).toBeNull();
+    const permanent = findRole(loadConfig(), 'ClaudePermanent');
+    expect(permanent.model).toBeUndefined();
+    expect(getAdapter('claude-code').buildLaunch(
+      permanent, 'fresh', { sessionId: 'SID' }, { argv: [], env: {} },
+    ).argv).not.toContain('--model');
+
+    const tempDir = await spawnTemp({
+      name: 'ClaudeTemporary', harness: 'claude-code', model: null, surface: 'web',
+    }, '/b/ours-fleet', () => {});
+    const temporary = parse(readFileSync(join(tempDir, 'role.yaml'), 'utf8'));
+    expect(temporary.model).toBeUndefined();
+    expect(getAdapter('claude-code').buildLaunch(
+      temporary, 'fresh', { sessionId: 'SID' }, { argv: [], env: {} },
+    ).argv).not.toContain('--model');
   });
 });
 

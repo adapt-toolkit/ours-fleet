@@ -2,7 +2,7 @@ import { createHash, randomUUID } from 'node:crypto';
 import { mkdirSync, readFileSync, readdirSync, realpathSync, statSync } from 'node:fs';
 import { isAbsolute, relative } from 'node:path';
 import {
-  loadConfig, NOTIFY_EVENT_TYPES, resolveMonitorConfig,
+  loadConfig, NOTIFY_EVENT_TYPES, resolveMonitorConfig, resolveRoleModel,
   resolvePermissions, ROLE_NAME_RE, validateMonitorConfig,
   type CommonPermissions, type MonitorConfig, type NotifyEventType,
 } from '../config.js';
@@ -22,7 +22,8 @@ import { FleetError, normalizeError } from './errors.js';
 export interface CreateRoleSessionRequest {
   name: string;
   harness: 'codex' | 'claude-code';
-  model?: string;
+  /** null means the selected harness's own default; web blank fields send null. */
+  model?: string | null;
   session: 'acp' | 'tmux';
   cwd?: string;
   lifetime: 'permanent' | 'temporary';
@@ -199,7 +200,7 @@ export class RoleCreationService {
       name: request.name, identity: request.name,
       harness: request.harness ?? (defaults.harness as string | undefined) ?? 'claude-code',
       session: request.session ?? (defaults.session as 'acp' | 'tmux' | undefined) ?? 'tmux',
-      model: request.model?.trim() || (defaults.model as string | undefined),
+      model: resolveRoleModel(request.model, request.harness, defaults),
       cwd, lifetime: request.lifetime,
       permissions: resolvePermissions(defaults.permissions, request.permissions),
       monitor: resolveMonitorConfig(defaults.monitor, request.monitor),
@@ -230,7 +231,8 @@ export class RoleCreationService {
       prerequisites.push('confirm creation with an unverified identity preflight');
     const provenance = {
       harness: 'request', session: 'request', identity: 'built-in',
-      model: request.model ? 'request' : defaults.model ? 'fleet-default' : 'built-in',
+      model: request.model !== undefined ? 'request'
+        : resolveRoleModel(undefined, request.harness, defaults) ? 'fleet-default' : 'built-in',
       cwd: request.cwd ? 'request' : 'built-in', permissions: 'request',
       monitor: request.monitor ? 'request' : defaults.monitor ? 'fleet-default' : 'built-in',
     } as const;
@@ -371,7 +373,7 @@ export class RoleCreationService {
       throw new FleetError('invalid_request', 'unsupported session backend');
     if (!['permanent', 'temporary'].includes(input.lifetime))
       throw new FleetError('invalid_request', 'unsupported lifetime');
-    bounded(input.model, 'model', 128);
+    bounded(input.model ?? undefined, 'model', 128);
     bounded(input.mission, 'mission', 4_096);
     bounded(input.coordinator, 'coordinator', 128);
     bounded(input.bio, 'bio', 8_192);
@@ -384,7 +386,7 @@ export class RoleCreationService {
         throw new FleetError('invalid_request', 'web creation supports monitor.inject=notification only');
     }
     return {
-      ...input, model: input.model?.trim() || undefined,
+      ...input, model: input.model === null ? null : input.model?.trim() || undefined,
       mission: input.mission?.trim() || undefined, coordinator: input.coordinator?.trim() || undefined,
       bio: input.bio?.trim() || undefined, persona: input.persona?.trim() || undefined,
       monitor: input.monitor ? structuredClone(input.monitor) : undefined,
