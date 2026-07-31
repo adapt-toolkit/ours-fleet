@@ -1,0 +1,118 @@
+import { spawn } from 'node:child_process';
+import { existsSync, realpathSync } from 'node:fs';
+import { resolve } from 'node:path';
+import { RoleRepository } from '../application/role-repository.js';
+import { FleetQueryService } from '../application/fleet-query-service.js';
+import { AcpRoleSessionAdapter, TmuxRoleSessionAdapter } from '../application/session-control.js';
+import { StructuredLogService } from '../application/log-service.js';
+import { RoleCommandService } from '../application/role-command-service.js';
+import { RoleCreationService } from '../application/role-creation-service.js';
+import { FleetError } from '../application/errors.js';
+import { controlRequest, controlSocketPath } from '../session/control.js';
+import { Tmux } from '../tmux.js';
+import { pickBackend } from '../supervisor/index.js';
+import { realExec } from '../exec.js';
+import { home } from '../paths.js';
+import { DaemonAtomicIdentityProvider } from '../infrastructure/daemon-identity.js';
+import { AuditSink } from './audit.js';
+import { FleetEventBus } from './events.js';
+import { buildWebServer, type WebServer } from './server.js';
+
+export interface StartWebOptions {
+  configPath?: string;
+  port?: number;
+  open?: boolean;
+  binPath: string;
+  log?(line: string): void;
+}
+
+export interface RunningWebConsole extends WebServer {
+  address: string;
+  bootstrapUrl: string;
+}
+
+export async function startWebConsole(options: StartWebOptions): Promise<RunningWebConsole> {
+  const requestedPort = options.port ?? 49_271;
+  if (!Number.isInteger(requestedPort) || requestedPort < 0 || requestedPort > 65_535)
+    throw new FleetError('invalid_request', 'port must be between 0 and 65535');
+  const tmux = new Tmux();
+  const backend = pickBackend();
+  const repository = new RoleRepository({
+    configPath: options.configPath,
+    probeBackend: async name => {
+      let acp = false;
+      const permanent = resolve(home(), '.ours-fleet', 'agents', name);
+      const temporary = resolve(home(), '.ours-fleet', 'tmp', name);
+      for (const dir of [permanent, temporary]) {
+        if (!existsSync(controlSocketPath(dir))) continue;
+        try { acp = (await controlRequest(dir, { command: 'snapshot' }, 500)).ok; }
+        catch { /* stale socket is evidence, not reachability */ }
+      }
+      return { acp, tmux: await tmux.has(name).catch(() => false) };
+    },
+  });
+  const events = new FleetEventBus();
+  const query = new FleetQueryService({
+    repository, supervisor: backend, tmux,
+    capabilityContext: { terminalPtyAvailable: await hasNodePty() },
+  });
+  const ops = { backend, binPath: options.binPath, log: options.log ?? (() => {}) };
+  const identityProvider = new DaemonAtomicIdentityProvider();
+  const creation = new RoleCreationService({
+    configPath: options.configPath, ops, binPath: options.binPath,
+    identityProvider, allowedCwdRoots: [realpathSync(home()), realpathSync(process.cwd())],
+    probeReady: async name => {
+      const detail = await query.detail(name).catch(() => undefined);
+      return detail?.status.overall === 'ready' || detail?.status.overall === 'busy'
+        ? 'ready' : detail?.status.overall === 'attention' ? 'attention' : 'unknown';
+    },
+    onProgress: action => events.publish('creation.changed', action, action.roleId),
+  });
+  const commands = new RoleCommandService({
+    repository, ops, configPath: options.configPath,
+    status: async roleId => (await query.detail(roleId)).status,
+    onProgress: receipt => events.publish('action.changed', receipt, receipt.roleId),
+  });
+  const logs = new StructuredLogService(backend, realExec);
+  const audit = new AuditSink();
+  const server = await buildWebServer({
+    query, repository, logs, commands, creation, audit, events,
+    async session(roleId) {
+      const role = await repository.get(roleId);
+      if (!role) throw new FleetError('role_not_found', `no such role '${roleId}'`);
+      if (role.configuredBackend === 'acp') {
+        const dir = repository.stateDir(role);
+        if (!dir) throw new FleetError('control_unavailable', 'role state directory is unavailable');
+        return new AcpRoleSessionAdapter(dir);
+      }
+      if (role.configuredBackend === 'tmux' || role.detectedBackend === 'tmux')
+        return new TmuxRoleSessionAdapter(roleId, tmux);
+      throw new FleetError('capability_unavailable', 'role session backend is unavailable');
+    },
+  }, { origin: `http://127.0.0.1:${requestedPort}`, host: `127.0.0.1:${requestedPort}` });
+  const address = await server.app.listen({ host: '127.0.0.1', port: requestedPort });
+  const actual = new URL(address);
+  if (actual.hostname !== '127.0.0.1') {
+    await server.close();
+    throw new FleetError('forbidden', 'web console refused a non-loopback bind');
+  }
+  const host = `127.0.0.1:${actual.port}`;
+  server.auth.setBoundary(`http://${host}`, host);
+  const bootstrapUrl = `http://${host}/#bootstrap=${server.auth.bootstrapSecret}`;
+  if (options.open !== false) openBrowser(bootstrapUrl);
+  return { ...server, address: `http://${host}`, bootstrapUrl };
+}
+
+async function hasNodePty(): Promise<boolean> {
+  try { await import('node-pty'); return true; }
+  catch { return false; }
+}
+
+function openBrowser(url: string): void {
+  const command = process.platform === 'darwin' ? 'open'
+    : process.platform === 'win32' ? 'cmd' : 'xdg-open';
+  const args = process.platform === 'win32' ? ['/c', 'start', '', url] : [url];
+  const child = spawn(command, args, { stdio: 'ignore', detached: true, shell: false });
+  child.on('error', () => undefined);
+  child.unref();
+}
