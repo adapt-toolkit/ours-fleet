@@ -35,6 +35,7 @@ function monitorRecorder(sessionCreated: () => boolean) {
   const rec = {
     constructed: 0,
     primedBeforeSession: null as boolean | null,
+    resetCursor: null as boolean | null,
     ranPid: null as number | null,
     stopped: false,
     env: null as NodeJS.ProcessEnv | null,
@@ -43,7 +44,10 @@ function monitorRecorder(sessionCreated: () => boolean) {
     rec.constructed++;
     rec.env = opts.deps.env;
     return {
-      prime: async () => { rec.primedBeforeSession = !sessionCreated(); },
+      prime: async options => {
+        rec.primedBeforeSession = !sessionCreated();
+        rec.resetCursor = options?.resetCursor ?? false;
+      },
       run: async (pid: number) => { rec.ranPid = pid; },
       stop: () => { rec.stopped = true; },
     };
@@ -569,6 +573,37 @@ describe('runOnce ACP startup outcome (1.2)', () => {
     await runOnce('A', {}, deps);
     expect(logs.some(l => l.includes('[A] up;') && l.includes('session=acp'))).toBe(true);
   });
+
+  it('steers an interrupting wake during ACP startup instead of cancelling startup', async () => {
+    writeCfg({ A: {
+      harness: 'fake-acp',
+      session: 'acp',
+      monitor: { mode: 'fleet', interrupt: true },
+      env: { ACP_FIXTURE_EXIT_AFTER: '1', ACP_FIXTURE_PROMPT_DELAY_MS: '100' },
+    } });
+    const d = agentDir('A');
+    mkdirSync(d, { recursive: true });
+    const { deps } = acpDeps();
+    let startupWasActive = false;
+    let wakeOutcome: string | undefined;
+    deps.createMonitor = opts => ({
+      prime: async () => {},
+      run: async () => {
+        const before = readFileSync(join(d, '.session-events.jsonl'), 'utf8');
+        startupWasActive = !before.includes('"kind":"turn_stop"');
+        const result = await opts.deps.delivery!.submit('wake during startup', { interrupt: true });
+        wakeOutcome = result.outcome;
+      },
+      stop: () => {},
+    });
+
+    await runOnce('A', {}, deps);
+    expect(startupWasActive).toBe(true);
+    expect(['injected', 'startedNewTurn']).toContain(wakeOutcome);
+    const events = readFileSync(join(d, '.session-events.jsonl'), 'utf8');
+    expect(events).not.toContain('"stopReason":"cancelled"');
+    expect(events).toContain('"kind":"turn_stop"');
+  });
 });
 
 describe('runOnce monitor integration', () => {
@@ -589,6 +624,30 @@ describe('runOnce monitor integration', () => {
     const { deps, monitor } = fakeWorld({ exitCode: '0', exitFile: join(d, '.exit-status') });
     await runOnce('A', {}, deps);
     expect(monitor.constructed).toBe(0);
+  });
+
+  it('re-primes at tip when wake ownership moves from native back to fleet', async () => {
+    writeCfg({ A: { harness: 'fake', monitor: { mode: 'native' } } });
+    const d = agentDir('A'); mkdirSync(d, { recursive: true });
+    await runOnce('A', {}, fakeWorld({ exitCode: '0', exitFile: join(d, '.exit-status') }).deps);
+
+    writeCfg({ A: { harness: 'fake', monitor: { mode: 'fleet' } } });
+    const { deps, monitor } = fakeWorld({ exitCode: '0', exitFile: join(d, '.exit-status') });
+    await runOnce('A', {}, deps);
+    expect(monitor.resetCursor).toBe(true);
+  });
+
+  it('does not request a cursor reset across fleet-to-fleet restarts', async () => {
+    writeCfg({ A: { harness: 'fake', monitor: { mode: 'fleet' } } });
+    const d = agentDir('A'); mkdirSync(d, { recursive: true });
+
+    const first = fakeWorld({ exitCode: '0', exitFile: join(d, '.exit-status') });
+    await runOnce('A', {}, first.deps);
+    expect(first.monitor.resetCursor).toBe(false);
+
+    const second = fakeWorld({ exitCode: '0', exitFile: join(d, '.exit-status') });
+    await runOnce('A', {}, second.deps);
+    expect(second.monitor.resetCursor).toBe(false);
   });
 
   it('passes service env plus role daemon-profile overrides to the monitor', async () => {

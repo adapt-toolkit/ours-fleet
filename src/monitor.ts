@@ -406,7 +406,7 @@ export interface MonitorOpts {
 
 /** The lifecycle surface the runner drives: prime pre-launch, run, stop on pid death. */
 export interface MonitorHandle {
-  prime(): Promise<void>;
+  prime(options?: { resetCursor?: boolean }): Promise<void>;
   run(pid: number): Promise<void>;
   stop(): void;
 }
@@ -447,9 +447,13 @@ export class Monitor {
     this.turnFailThreshold = typeof n === 'number' && n >= 1 ? n : DEFAULT_TURN_FAIL_THRESHOLD;
   }
 
-  /** Resume the last delivered cursor; only a brand-new monitor primes at stream tip. */
-  async prime(): Promise<void> {
-    const persisted = this.readPersistedCursor();
+  /**
+   * Resume the last delivered cursor during ordinary fleet-owned restarts.
+   * A native→fleet ownership transition resets at stream tip because the native
+   * owner was responsible for arrivals while the supervisor was inactive.
+   */
+  async prime(options: { resetCursor?: boolean } = {}): Promise<void> {
+    const persisted = options.resetCursor ? null : this.readPersistedCursor();
     if (persisted !== null) {
       this.cursor = persisted;
       this.deliveredCursor = persisted;

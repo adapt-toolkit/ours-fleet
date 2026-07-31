@@ -50,6 +50,24 @@ const defaultDeps = (): RunnerDeps => ({
   createMonitor: opts => createMonitor(opts),
 });
 
+const MONITOR_OWNER_FILE = '.monitor-owner';
+
+/**
+ * Record who owns wake delivery for this run. Returning true means a fleet
+ * monitor is taking ownership back from a native harness and must start at the
+ * current stream tip rather than replay notifications the native owner was
+ * responsible for.
+ */
+export function recordMonitorOwner(dir: string, owner: 'fleet' | 'native'): boolean {
+  let previous: string | null = null;
+  try {
+    const path = join(dir, MONITOR_OWNER_FILE);
+    if (existsSync(path)) previous = readFileSync(path, 'utf8').trim();
+    writeFileSync(path, `${owner}\n`);
+  } catch { /* ownership diagnostics must never take the role down */ }
+  return owner === 'fleet' && previous === 'native';
+}
+
 /**
  * Compose the tmux pane shell command: env prefix + argv + exit-status capture.
  * `paneArgv` defaults to `launch.argv`; when isolation is active the caller passes
@@ -373,11 +391,13 @@ export async function runOnce(
   // leave wake ownership to the harness. Temp snapshots predating `monitor:` are
   // treated as native (monitor may be undefined on an old role.yaml).
   const resolvedMonitorDeps = monitorDeps(deps, role.env);
-  const monitor = role.monitor?.mode === 'fleet' ? deps.createMonitor({
+  const monitorOwner = role.monitor?.mode === 'fleet' ? 'fleet' : 'native';
+  const resetMonitorCursor = recordMonitorOwner(dir, monitorOwner);
+  const monitor = monitorOwner === 'fleet' ? deps.createMonitor({
     name, identity: role.identity, agentDir: dir, cfg: role.monitor,
     deps: resolvedMonitorDeps,
   }) : null;
-  if (monitor) await monitor.prime();
+  if (monitor) await monitor.prime({ resetCursor: resetMonitorCursor });
 
   rmSync(exitFile, { force: true });
   let pid: number;
@@ -385,6 +405,7 @@ export async function runOnce(
   let acpSession: AcpSession | undefined;
   let control: RoleControlServer | undefined;
   let monitorLoop: Promise<void> | undefined;
+  let acpStartupComplete = false;
   if (sessionBackend === 'acp') {
     const perms = role.permissions ?? resolvePermissions(undefined, undefined);
     // Say once, at startup, that this role will decide permission requests by
@@ -412,7 +433,12 @@ export async function runOnce(
       // refusal or a cancellation reached the agent and was not acted on, so
       // the monitor must keep its cursor and try again.
       submit: async (text, options) => {
-        const result = await acpSession!.submitPrompt(text, { ...options, steer: true });
+        // Cancelling the runner-owned startup prompt makes startup look failed
+        // and closes the session before the wake turn can run. During startup,
+        // steer into the live turn instead; after it completes, honor the
+        // configured interrupt policy normally.
+        const interrupt = options?.interrupt === true && acpStartupComplete;
+        const result = await acpSession!.submitPrompt(text, { ...options, interrupt, steer: true });
         const steered = result.accepted
           && (result.detail === 'injected' || result.detail === 'startedNewTurn');
         return {
@@ -429,8 +455,9 @@ export async function runOnce(
     // startup prompt and then refuses it has not started; logging the role as
     // up would hide a role that never read its briefing.
     const starting = acpSession.submitPrompt(firstPrompt);
-    // Start monitoring as soon as the initial prompt has been submitted. ACP
-    // steering can deliver a wake into that turn without a boot-time deaf gap.
+    // Monitoring starts immediately. The delivery adapter above downgrades
+    // interruption to steering until this startup turn reaches a terminal
+    // success, so there is neither a deaf gap nor a boot-cancellation loop.
     monitorLoop = monitor?.run(pid);
     const started = await starting;
     if (!started.succeeded) {
@@ -440,6 +467,7 @@ export async function runOnce(
       throw new Error(`[${name}] ACP startup prompt ${started.outcome}` +
         `${started.detail ? `: ${started.detail}` : ''}`);
     }
+    acpStartupComplete = true;
   } else {
     await deps.tmux.kill(name);
     await deps.tmux.newSession(

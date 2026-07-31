@@ -17,6 +17,7 @@ const EXIT_CODE = parseInt(process.env.ACP_FIXTURE_EXIT_CODE ?? '0', 10) || 0;
 // Request a tool permission on EVERY prompt, including ones whose text the test
 // does not control (the runner's own startup prompt).
 const ALWAYS_PERMISSION = process.env.ACP_FIXTURE_ALWAYS_PERMISSION === '1';
+const PROMPT_DELAY_MS = parseInt(process.env.ACP_FIXTURE_PROMPT_DELAY_MS ?? '0', 10) || 0;
 let promptsAnswered = 0;
 
 const stopReasonFor = text =>
@@ -126,7 +127,9 @@ createInterface({ input: process.stdin }).on('line', line => {
       });
       activePromptId = message.id;
       const slow = /\bblock(?:\s+(\d+))?\b/i.exec(text);
-      if (slow) {
+      if (PROMPT_DELAY_MS > 0) {
+        setTimeout(() => answerPrompt(message.id, stopReasonFor(text)), PROMPT_DELAY_MS);
+      } else if (slow) {
         // A turn that stays running for a while: the "busy agent" case. It
         // releases itself so the test never depends on a second prompt getting
         // through — prompts are serialized, so one never could.
