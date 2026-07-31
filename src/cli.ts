@@ -382,6 +382,9 @@ function renderHeldDownLine(state: WatchdogSchedulerState): string | undefined {
     + `consecutive failures: ${state.lastError ?? 'unknown error'}`;
 }
 
+/** errorReport() rides a bounded diagnostic tail as an extra key outside WatchdogReport proper (spec: acceptance 9). */
+type ReportWithTail = WatchdogReport & { tail?: string };
+
 /** Full human rendering of one report: header, held-down warning, counts, then non-healthy roles + evidence. */
 function renderReport(report: WatchdogReport, heldState: WatchdogSchedulerState): string {
   const lines: string[] = [`● ${report.watchdog} — run ${report.run_id} (${report.status})`];
@@ -398,6 +401,11 @@ function renderReport(report: WatchdogReport, heldState: WatchdogSchedulerState)
       const alert = report.alerts.find(a => a.role === role.role);
       lines.push(`    alerted -> ${alert?.coordinator ?? '?'}`);
     }
+  }
+  const tail = (report as ReportWithTail).tail;
+  if (report.status === 'error' && tail) {
+    lines.push('  --- output tail ---');
+    for (const l of tail.split('\n')) lines.push(`  ${l}`);
   }
   return lines.join('\n');
 }
@@ -453,6 +461,15 @@ cOpt(program.command('watchdog-report <name> [runId]')
       if (!watchdogKnown(name, opts.configuration)) throw new Error(`unknown watchdog '${name}'`);
 
       if (opts.list) {
+        // --list has no single stored file to echo byte-for-byte, so --json here can't
+        // mean "raw stored bytes" the way it does for a single report. Contract: emit
+        // machine-readable run metadata instead (JSON.stringify of listRuns()'s
+        // RunListEntry[], wrapped in { runs }) — the single-report --json path below is
+        // unaffected and still prints the exact stored bytes.
+        if (opts.json) {
+          console.log(JSON.stringify({ runs: listRuns(name) }, null, 2));
+          return;
+        }
         const held = renderHeldDownLine(readSchedulerState(name));
         if (held) console.log(held);
         console.log(renderRunList(listRuns(name)));

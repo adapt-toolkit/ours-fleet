@@ -217,6 +217,42 @@ describe('ours-fleet CLI', () => {
     expect(unknown.code).toBe(1);
   });
 
+  it('watchdog-report --list --json emits machine-readable run metadata, not the human table', async () => {
+    const { writeFileSync, readFileSync } = await import('node:fs');
+    writeFileSync(join(dir, 'fleet.yaml'), 'roles:\n  A: {}\nwatchdogs:\n  w: { coordinator: C }\n');
+    const reportsDir = join(dir, '.ours-fleet', 'watchdogs', 'w', 'reports');
+    mkdirSync(reportsDir, { recursive: true });
+    const fixture = JSON.parse(
+      readFileSync(resolve('test/fixtures/watchdog-good-report.json'), 'utf8'),
+    ) as Record<string, unknown>;
+    const report = { ...fixture, watchdog: 'w', run_id: '20260731T115000Z' };
+    writeFileSync(join(reportsDir, '20260731T115000Z.json'), JSON.stringify(report));
+
+    const r = await run(['watchdog-report', 'w', '--list', '--json']);
+    expect(r.code).toBe(0);
+    const parsed = JSON.parse(r.stdout);
+    expect(parsed.runs[0].runId).toBe('20260731T115000Z');
+  });
+
+  it('watchdog-report surfaces an error report\'s diagnostic tail (acceptance 9)', async () => {
+    const { writeFileSync } = await import('node:fs');
+    writeFileSync(join(dir, 'fleet.yaml'), 'roles:\n  A: {}\nwatchdogs:\n  w: { coordinator: C }\n');
+    const reportsDir = join(dir, '.ours-fleet', 'watchdogs', 'w', 'reports');
+    mkdirSync(reportsDir, { recursive: true });
+    const report = {
+      schema_version: 1, watchdog: 'w', run_id: '20260731T115000Z',
+      started_at: '2026-07-31T11:50:00Z', finished_at: '2026-07-31T11:51:12Z',
+      status: 'error', summary: { checked: 0, healthy: 0, idle: 0, anomalies: 0 },
+      roles: [], alerts: [], error: 'timeout', tail: 'boom line',
+    };
+    writeFileSync(join(reportsDir, '20260731T115000Z.json'), JSON.stringify(report));
+
+    const r = await run(['watchdog-report', 'w']);
+    expect(r.code).toBe(0);
+    expect(r.stdout).toContain('output tail');
+    expect(r.stdout).toContain('boom line');
+  });
+
   it('spawn --help lists model and Codex controls', async () => {
     const r = await run(['spawn', '--help']);
     expect(r.code).toBe(0);
