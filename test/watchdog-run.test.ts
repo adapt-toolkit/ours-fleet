@@ -147,13 +147,21 @@ describe('executeWatchdogRun', () => {
       manifest = JSON.parse(readFileSync(join(runDir, 'watch.json'), 'utf8'));
       writeGoodReport(runDir);   // Alice blocked, alerted:true, alerts:[Alice] (Task 7 fixture)
     });
-    await executeWatchdogRun(wd as never, baseDeps(launch) as never);
+    // Freeze the run's clock to one deterministic instant (still close enough to real
+    // wall-clock time that the write-stable heuristic against report.json's real mtime
+    // still holds) so the reconcile-time re-stamp can be asserted exactly, not just
+    // "truthy" — a frozen seeded value would make that assertion pass vacuously.
+    const runNow = new Date();
+    const deps = { ...baseDeps(launch), now: () => runNow };
+    await executeWatchdogRun(wd as never, deps as never);
     expect(manifest!.digest.open[0]).toMatchObject({ role: 'Alice', status: 'stale' });
     expect(manifest!.digest.open[0].realert_after).toBe('2026-07-31T11:00:00.000Z');
     const ledger = readLedger('nightwatch');
     expect(ledger.open.Alice.status).toBe('blocked');       // escalated, since preserved
     expect(ledger.open.Alice.since).toBe('2026-07-31T10:00:00Z');
-    expect(ledger.open.Alice.lastAlertedAt).not.toBeNull(); // report.alerts stamped it
+    // report.alerts named Alice, so reconcile re-stamps lastAlertedAt to the run's
+    // finished_at instant — must have moved off the seeded 10:00:00Z value.
+    expect(ledger.open.Alice.lastAlertedAt).toBe(runNow.toISOString());
   });
 
   it('a healthy report closes the open finding (resolved path, acceptance 6)', async () => {
