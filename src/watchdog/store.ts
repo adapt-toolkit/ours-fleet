@@ -46,7 +46,12 @@ export function acquireRunLock(name: string): boolean {
 
 /** Release-tolerant of absence: a lock already gone (or never acquired) is not an error. */
 export function releaseRunLock(name: string): void {
-  try { rmdirSync(runLockPath(name)); } catch { /* already gone */ }
+  try {
+    rmdirSync(runLockPath(name));
+  } catch (e) {
+    if ((e as NodeJS.ErrnoException).code === 'ENOENT') return;
+    throw e;
+  }
 }
 
 /** Lexical-chronological UTC run id, e.g. '20260731T115000Z'. */

@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
-import { mkdtempSync, rmSync, writeFileSync, statSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync, statSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
@@ -58,5 +58,11 @@ describe('watchdog store', () => {
   });
   it('releaseRunLock tolerates a missing lock', () => {
     expect(() => releaseRunLock('w')).not.toThrow();
+  });
+  it('releaseRunLock rethrows a non-ENOENT failure instead of masking it as "already gone"', () => {
+    const lockDir = join(watchdogDir('w'), '.run-lock');
+    mkdirSync(lockDir);
+    writeFileSync(join(lockDir, 'occupant'), 'x');   // rmdirSync on a non-empty dir -> ENOTEMPTY
+    expect(() => releaseRunLock('w')).toThrow();
   });
 });
