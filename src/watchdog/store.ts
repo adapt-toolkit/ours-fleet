@@ -1,4 +1,4 @@
-import { chmodSync, mkdirSync, readFileSync, readdirSync, unlinkSync, writeFileSync } from 'node:fs';
+import { chmodSync, mkdirSync, readFileSync, readdirSync, rmdirSync, unlinkSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { watchdogsRoot } from '../paths.js';
 import type { WatchdogReport, WatchdogReportStatus } from './report.js';
@@ -23,6 +23,30 @@ export function watchdogDir(name: string): string {
 
 export function reportsDir(name: string): string {
   return ensureDir(join(watchdogDir(name), 'reports'));
+}
+
+function runLockPath(name: string): string {
+  return join(watchdogDir(name), '.run-lock');
+}
+
+/**
+ * mkdir-as-mutex: atomic across processes, unlike a lock file (open+O_EXCL
+ * would work too, but a directory needs no cleanup of file contents and
+ * can't be partially written). EEXIST means another run holds it.
+ */
+export function acquireRunLock(name: string): boolean {
+  try {
+    mkdirSync(runLockPath(name));
+    return true;
+  } catch (e) {
+    if ((e as NodeJS.ErrnoException).code === 'EEXIST') return false;
+    throw e;
+  }
+}
+
+/** Release-tolerant of absence: a lock already gone (or never acquired) is not an error. */
+export function releaseRunLock(name: string): void {
+  try { rmdirSync(runLockPath(name)); } catch { /* already gone */ }
 }
 
 /** Lexical-chronological UTC run id, e.g. '20260731T115000Z'. */

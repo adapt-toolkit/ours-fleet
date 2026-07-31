@@ -15,7 +15,9 @@ import { Tmux, tmuxArgs } from './tmux.js';
 import { pickBackend } from './supervisor/index.js';
 import { up, down, restartRoles, rmRole, type OpsDeps } from './ops.js';
 import { readRestartLedger, runSupervised, runTemp } from './runner.js';
-import { runWatchdogAgent } from './watchdog/run.js';
+import { executeWatchdogRun, runWatchdogAgent } from './watchdog/run.js';
+import { acquireRunLock, releaseRunLock } from './watchdog/store.js';
+import type { WatchdogReport } from './watchdog/report.js';
 import {
   lastProvenance, spawnDryRun, spawnPermanent, spawnTemp, type SpawnOpts,
 } from './spawn.js';
@@ -359,6 +361,32 @@ program.command('status <name>').description('unit/agent state')
         if (response.ok) console.log(`session: ${JSON.stringify(response.result)}`);
       } catch { console.log('session: acp control unavailable'); }
     }
+  });
+
+// Task 11 replaces this with the real renderer; this is a minimal stand-in
+// so `watchdog-run` has something to print now.
+function renderReportSummaryLine(report: WatchdogReport): string {
+  const s = report.summary;
+  return `${report.watchdog} ${report.run_id} ${report.status} `
+    + `checked=${s.checked} healthy=${s.healthy} idle=${s.idle} anomalies=${s.anomalies}`;
+}
+
+cOpt(program.command('watchdog-run <name>')
+  .description('run one watchdog check now, foreground, same storage as the scheduler'))
+  .action(async (name: string, opts: { configuration?: string }) => {
+    try {
+      const cfg = loadConfig(opts.configuration);
+      const wd = cfg.watchdogs.find(w => w.name === name);
+      if (!wd) throw new Error(`unknown watchdog '${name}'`);
+      if (!acquireRunLock(name)) throw new Error(`watchdog '${name}' is already running (run lock held)`);
+      try {
+        const { report, storedPath } = await executeWatchdogRun(wd, {
+          binPath, log: l => console.log(l), cfg,
+        });
+        console.log(`stored: ${storedPath}`);
+        console.log(renderReportSummaryLine(report));
+      } finally { releaseRunLock(name); }
+    } catch (e) { die(e); }
   });
 
 cOpt(program.command('rm <name>').description('stop + delete state dir (+ its fleet.d file if spawned)'))

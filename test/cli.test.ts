@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeAll, beforeEach, afterEach } from 'vitest';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, rmSync } from 'node:fs';
 import { spawn } from 'node:child_process';
 import { once } from 'node:events';
 import { tmpdir } from 'node:os';
@@ -170,6 +170,18 @@ describe('ours-fleet CLI', () => {
     const r = await run(['config']);
     expect(r.code).toBe(1);
     expect(r.stderr + r.stdout).toMatch(/unknown key\(s\) intervall/);
+  });
+
+  it('watchdog-run refuses an unknown watchdog and respects the run lock', async () => {
+    const { writeFileSync } = await import('node:fs');
+    writeFileSync(join(dir, 'fleet.yaml'), 'roles:\n  A: {}\nwatchdogs:\n  w: { coordinator: C }\n');
+    const r = await run(['watchdog-run', 'ghost']);
+    expect(r.code).toBe(1);
+    expect(r.stderr + r.stdout).toMatch(/unknown watchdog 'ghost'/);
+    mkdirSync(join(dir, '.ours-fleet', 'watchdogs', 'w', '.run-lock'), { recursive: true });
+    const r2 = await run(['watchdog-run', 'w']);
+    expect(r2.code).toBe(1);
+    expect(r2.stderr + r2.stdout).toMatch(/already running/);
   });
 
   it('spawn --help lists model and Codex controls', async () => {

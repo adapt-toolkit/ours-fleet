@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
   formatRunId, writeReport, listRuns, readReport, latestReport, pruneReports,
-  watchdogDir, reportsDir,
+  watchdogDir, reportsDir, acquireRunLock, releaseRunLock,
 } from '../src/watchdog/store.js';
 import { errorReport } from '../src/watchdog/report.js';
 
@@ -48,5 +48,15 @@ describe('watchdog store', () => {
   });
   it('readReport refuses path traversal in runId', () => {
     expect(readReport('w', '../../../etc/passwd')).toBeUndefined();
+  });
+  it('acquireRunLock is a mutex: second acquire fails until released', () => {
+    expect(acquireRunLock('w')).toBe(true);
+    expect(acquireRunLock('w')).toBe(false);
+    releaseRunLock('w');
+    expect(acquireRunLock('w')).toBe(true);
+    releaseRunLock('w');
+  });
+  it('releaseRunLock tolerates a missing lock', () => {
+    expect(() => releaseRunLock('w')).not.toThrow();
   });
 });
