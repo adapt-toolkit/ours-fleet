@@ -608,8 +608,10 @@ function configureWebAccess(opts: {
     store.write({ version: 1, mode: 'pairing' });
     return 'Access mode: trusted-browser pairing.';
   }
-  if (!existsSync(store.path))
-    return 'Access mode: trusted-browser pairing (safe default). For password protection, rerun with --password-file; use --no-password only intentionally.';
+  if (!existsSync(store.path)) throw new Error(
+    'first web setup requires an explicit access choice: use --password-file <path> '
+    + 'or --pairing for protection, or --no-password only for intentional unprotected access',
+  );
   return undefined;
 }
 

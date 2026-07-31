@@ -119,6 +119,40 @@ describe('ours-fleet CLI', () => {
     }
   });
 
+  it('requires an explicit protected or unprotected access choice on first web setup', async () => {
+    const omitted = await run(['web', 'serve', '--port', '0', '--no-open']);
+    expect(omitted.code).toBe(1);
+    expect(omitted.stdout).toBe('');
+    expect(omitted.stderr).toContain('first web setup requires an explicit access choice');
+    expect(omitted.stderr).toContain('--password-file <path>');
+    expect(omitted.stderr).toContain('--pairing');
+    expect(omitted.stderr).toContain('--no-password');
+
+    const paired = spawn(process.execPath, [
+      CLI, 'web', 'serve', '--port', '0', '--no-open', '--pairing',
+    ], {
+      env: { ...process.env, OURS_FLEET_HOME: dir }, stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    let stdout = '';
+    paired.stdout.setEncoding('utf8');
+    paired.stdout.on('data', chunk => { stdout += chunk; });
+    try {
+      await Promise.race([
+        new Promise<void>(resolve => paired.stdout.on('data', () => {
+          if (/ours-fleet web listening on http:\/\/127\.0\.0\.1:\d+/.test(stdout)) resolve();
+        })),
+        new Promise((_, reject) => setTimeout(() => reject(new Error('paired web serve did not listen')), 5_000)),
+      ]);
+      expect(stdout).toContain('Access mode: trusted-browser pairing.');
+      const { readFileSync } = await import('node:fs');
+      expect(JSON.parse(readFileSync(join(dir, '.ours-fleet/web/access.json'), 'utf8')).mode)
+        .toBe('pairing');
+    } finally {
+      paired.kill('SIGTERM');
+      await once(paired, 'exit');
+    }
+  });
+
   it('docs and man print the AI-friendly configuration reference', async () => {
     for (const command of ['docs', 'man']) {
       const r = await run([command]);

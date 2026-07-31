@@ -168,12 +168,13 @@ atomic file). The re-pair and revoke controls use an owner-private Unix socket;
 local processes running as the same OS user are therefore inside the trust
 boundary.
 
-On first setup, trusted-browser pairing remains the safe local default and the
-CLI prints the password/no-password choices. `--password-file` stores only a
-salted scrypt verifier in the owner-private web state; the source file remains
-operator-managed. New browsers sign in and then receive the same rotating
-HttpOnly trusted-device credential. `--no-password` is deliberately named and
-prints a warning: anyone who can reach that origin can control the fleet.
+On first setup, the CLI requires an explicit access choice: `--password-file`
+or `--pairing` for protected access, or `--no-password` for intentional
+unprotected access. `--password-file` stores only a salted scrypt verifier in
+the owner-private web state; the source file remains operator-managed. New
+browsers sign in and then receive the same rotating HttpOnly trusted-device
+credential. `--no-password` is deliberately named and prints a warning: anyone
+who can reach that origin can control the fleet.
 
 For nginx on a VPS, keep the default loopback bind and set the exact external
 `--public-origin` (scheme, hostname, optional port). nginx should proxy HTTP and

@@ -82,8 +82,9 @@ Fleet reads the password file during setup and persists only a salted scrypt
 verifier. New browsers authenticate and retain rotating HttpOnly/SameSite
 trusted-device credentials. If nginx already authenticates, the operator may
 deliberately select \`--no-password\`; the CLI and browser warn that anyone
-reaching the origin can control the fleet. Trusted pairing remains the safe
-local default, and \`--pairing\` restores it.
+reaching the origin can control the fleet. First setup requires an explicit
+choice: \`--password-file\` or \`--pairing\` for protected access, or
+\`--no-password\` for intentional unprotected access.
 
 Use \`--bind ADDRESS\` only for an intentional direct listen. A non-loopback
 bind is rejected unless \`--public-origin\` is also present. Host/Origin checks
