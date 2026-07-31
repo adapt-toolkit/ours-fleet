@@ -1,8 +1,7 @@
-import { readFileSync } from 'node:fs';
 import { test, expect } from '@playwright/test';
 
 test('bootstrap, inventory, navigation, send, create, and security boundaries', async ({ page, request }) => {
-  const bootstrap = readFileSync('.e2e-bootstrap', 'utf8').trim();
+  const bootstrap = (await (await request.post('/__test/bootstrap')).json()).url as string;
   await page.goto(bootstrap);
   await expect(page.getByRole('heading', { name: 'Your fleet' })).toBeVisible();
   await expect(page).toHaveURL('http://127.0.0.1:49371/');

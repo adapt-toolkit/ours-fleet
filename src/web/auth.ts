@@ -26,7 +26,7 @@ const same = (a: string, b: string) => {
 };
 
 export class WebAuth {
-  readonly bootstrapSecret = token(32);
+  private _bootstrapSecret = token(32);
   private bootstrapExpiresAt = Date.now() + 5 * 60_000;
   private bootstrapUsed = false;
   private readonly sessions = new Map<string, BrowserSession>();
@@ -38,11 +38,19 @@ export class WebAuth {
     private _host: string,
     private readonly now: () => number = Date.now,
   ) {}
+  get bootstrapSecret(): string { return this._bootstrapSecret; }
   get origin(): string { return this._origin; }
   get host(): string { return this._host; }
   setBoundary(origin: string, host: string): void {
     this._origin = origin;
     this._host = host;
+  }
+  /** Mint a replacement for an operator-triggered reauthentication ceremony. */
+  mintBootstrap(): string {
+    this._bootstrapSecret = token(32);
+    this.bootstrapExpiresAt = this.now() + 5 * 60_000;
+    this.bootstrapUsed = false;
+    return this._bootstrapSecret;
   }
 
   validateBoundary(request: FastifyRequest, requireOrigin: boolean): void {
@@ -60,7 +68,7 @@ export class WebAuth {
     this.consumeRate('bootstrap', 10, 60_000);
     const authorization = request.headers.authorization ?? '';
     const supplied = authorization.startsWith('Bootstrap ') ? authorization.slice(10) : '';
-    if (this.bootstrapUsed || this.now() > this.bootstrapExpiresAt || !same(this.bootstrapSecret, supplied))
+    if (this.bootstrapUsed || this.now() > this.bootstrapExpiresAt || !same(this._bootstrapSecret, supplied))
       throw new FleetError('unauthorized', 'bootstrap credential is invalid or expired');
     this.bootstrapUsed = true;
     const now = this.now();

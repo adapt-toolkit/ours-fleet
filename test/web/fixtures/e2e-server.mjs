@@ -1,4 +1,3 @@
-import { writeFileSync } from 'node:fs';
 import { buildWebServer } from '../../../dist/web/server.js';
 
 const status = {
@@ -102,8 +101,10 @@ const services = {
 const server = await buildWebServer(services, {
   origin: 'http://127.0.0.1:49371', host: '127.0.0.1:49371',
 });
+server.app.post('/__test/bootstrap', async () => ({
+  url: `http://127.0.0.1:49371/#bootstrap=${server.auth.mintBootstrap()}`,
+}));
 await server.app.listen({ host: '127.0.0.1', port: 49371 });
-writeFileSync('.e2e-bootstrap', `http://127.0.0.1:49371/#bootstrap=${server.auth.bootstrapSecret}\n`);
 for (const signal of ['SIGINT', 'SIGTERM']) process.once(signal, async () => {
   await server.close(); process.exit(0);
 });
