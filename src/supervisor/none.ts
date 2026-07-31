@@ -31,6 +31,21 @@ export function makeNoneBackend(exec: Exec = realExec): SupervisorBackend {
       if (r.code === 1) return { state: 'stopped', detail: `no tmux session '${name}'` };
       return { state: 'unknown', detail: `tmux has-session '${name}' failed (${r.code}): ${r.stderr.trim() || 'no output'}` };
     },
+    async inspect(name) {
+      const r = await exec('tmux', tmuxArgs(name, ['has-session', '-t', name]));
+      if (r.code === 0) return {
+        backend: 'none' as const, state: 'running' as const,
+        nativeState: 'tmux-present', detail: `tmux session '${name}' exists`,
+      };
+      if (r.code === 1) return {
+        backend: 'none' as const, state: 'stopped' as const,
+        nativeState: 'tmux-absent', detail: `no tmux session '${name}'`,
+      };
+      return {
+        backend: 'none' as const, state: 'unknown' as const,
+        detail: `tmux has-session '${name}' failed (${r.code}): ${r.stderr.trim() || 'no output'}`,
+      };
+    },
     async uninstall(name) {
       const killed = await tmux.kill(name);         // idempotent
       return killed

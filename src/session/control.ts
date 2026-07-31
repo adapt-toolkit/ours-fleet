@@ -9,14 +9,16 @@ import type { ControlFailureKind, SessionHandle } from './types.js';
 const MAX_LINE_BYTES = 64 * 1024;
 
 export interface ControlRequest {
-  version: 1;
+  version: 1 | 2;
   id: string;
   token: string;
-  command: 'status' | 'snapshot' | 'submit_prompt' | 'respond_permission' | 'interrupt' | 'follow';
+  command: 'status' | 'snapshot' | 'submit_prompt' | 'respond_permission' | 'interrupt' | 'follow' | 'events_since';
   text?: string;
   permissionId?: string;
   optionId?: string;
   since?: number;
+  /** Existing clients omit this and remain interactive controllers. */
+  controller?: boolean;
 }
 
 export interface ControlResponse {
@@ -188,6 +190,7 @@ export class RoleControlServer {
     socket.setEncoding('utf8');
     let buffer = '';
     let unsubscribe: (() => void) | undefined;
+    let controllerAttached = false;
     socket.on('data', chunk => {
       buffer += chunk;
       if (Buffer.byteLength(buffer) > MAX_LINE_BYTES) {
@@ -200,13 +203,14 @@ export class RoleControlServer {
         const line = buffer.slice(0, newline);
         buffer = buffer.slice(newline + 1);
         if (!line.trim()) continue;
-        void this.handle(line, socket).then(stop => {
-          if (stop) {
+        void this.handle(line, socket).then(follow => {
+          if (follow) {
             if (unsubscribe) {
               unsubscribe();
-              this.session.setControllerAttached(false);
+              if (controllerAttached) this.session.setControllerAttached(false);
             }
-            unsubscribe = stop;
+            unsubscribe = follow.stop;
+            controllerAttached = follow.controller;
           }
         });
       }
@@ -215,20 +219,22 @@ export class RoleControlServer {
       this.sockets.delete(socket);
       if (unsubscribe) {
         unsubscribe();
-        this.session.setControllerAttached(false);
+        if (controllerAttached) this.session.setControllerAttached(false);
       }
     });
     socket.on('error', error => this.log(`control socket: ${error.message}`));
   }
 
-  private async handle(line: string, socket: Socket): Promise<(() => void) | undefined> {
+  private async handle(
+    line: string, socket: Socket,
+  ): Promise<{ stop: () => void; controller: boolean } | undefined> {
     let request: ControlRequest;
     try { request = JSON.parse(line) as ControlRequest; }
     catch {
       this.write(socket, { version: 1, id: '?', ok: false, error: 'invalid JSON' });
       return;
     }
-    if (request.version !== 1 || typeof request.id !== 'string'
+    if ((request.version !== 1 && request.version !== 2) || typeof request.id !== 'string'
         || !sameToken(this.token, request.token ?? '')) {
       this.write(socket, { version: 1, id: request.id ?? '?', ok: false, error: 'unauthorized' });
       return;
@@ -237,7 +243,13 @@ export class RoleControlServer {
       switch (request.command) {
         case 'status':
         case 'snapshot':
-          this.write(socket, { version: 1, id: request.id, ok: true, result: this.session.snapshot() });
+          this.write(socket, {
+            version: 1, id: request.id, ok: true,
+            result: {
+              ...this.session.snapshot(), protocolVersion: 2,
+              features: ['events_since', 'observer_follow', 'retained_range'],
+            },
+          });
           return;
         case 'submit_prompt': {
           if (!request.text?.trim())
@@ -270,16 +282,37 @@ export class RoleControlServer {
           await this.session.interrupt();
           this.write(socket, { version: 1, id: request.id, ok: true });
           return;
-        case 'follow': {
+        case 'events_since': {
           const since = Number.isFinite(request.since) ? Number(request.since) : 0;
+          const events = this.session.eventsSince(since);
+          const all = this.session.eventsSince(0);
           this.write(socket, {
             version: 1, id: request.id, ok: true,
-            result: { events: this.session.eventsSince(since), snapshot: this.session.snapshot() },
+            result: {
+              events, snapshot: this.session.snapshot(),
+              firstSeq: all[0]?.seq ?? 0, lastSeq: all.at(-1)?.seq ?? 0,
+              truncated: Boolean(all[0] && since > 0 && since < all[0].seq - 1),
+            },
           });
-          this.session.setControllerAttached(true);
-          return this.session.subscribe(event => {
+          return;
+        }
+        case 'follow': {
+          const since = Number.isFinite(request.since) ? Number(request.since) : 0;
+          const events = this.session.eventsSince(since);
+          const all = this.session.eventsSince(0);
+          this.write(socket, {
+            version: 1, id: request.id, ok: true,
+            result: {
+              events, snapshot: this.session.snapshot(),
+              firstSeq: all[0]?.seq ?? 0, lastSeq: all.at(-1)?.seq ?? 0,
+              truncated: Boolean(all[0] && since > 0 && since < all[0].seq - 1),
+            },
+          });
+          const controller = request.controller !== false;
+          if (controller) this.session.setControllerAttached(true);
+          return { controller, stop: this.session.subscribe(event => {
             if (!socket.destroyed) socket.write(JSON.stringify({ version: 1, event }) + '\n');
-          });
+          }) };
         }
       }
     } catch (error) {

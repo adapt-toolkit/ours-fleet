@@ -210,6 +210,21 @@ export function makeLaunchdBackend(exec: Exec = realExec, uid: number = process.
       if (job.notFound) return { state: 'stopped', detail: `not loaded (${labelFor(name)})` };
       return { state: 'unknown', detail: job.failure ?? `launchctl print ${labelFor(name)} failed` };
     },
+    async inspect(name) {
+      const job = await printJob(name);
+      if (job.loaded) return {
+        backend: 'launchd' as const, state: 'running' as const,
+        nativeState: job.state, detail: job.state ? `loaded (state = ${job.state})` : 'loaded',
+      };
+      if (job.notFound) return {
+        backend: 'launchd' as const, state: 'stopped' as const,
+        nativeState: 'not-loaded', detail: `not loaded (${labelFor(name)})`,
+      };
+      return {
+        backend: 'launchd' as const, state: 'unknown' as const,
+        detail: job.failure ?? `launchctl print ${labelFor(name)} failed`,
+      };
+    },
     async uninstall(name) {
       const existed = existsSync(plistPath(name));
       await exec('launchctl', ['bootout', `${domain}/${labelFor(name)}`]);   // idempotent

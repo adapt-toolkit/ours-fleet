@@ -20,6 +20,8 @@ import {
   type IdentityGuarantee, type ProvenanceEntry,
 } from './creation.js';
 import { VERSION } from './version.js';
+import './harness/claude-code.js';
+import './harness/codex.js';
 import { getAdapter } from './harness/registry.js';
 
 /**
@@ -52,6 +54,9 @@ export interface SpawnOpts {
   monitor?: boolean;
   bioFile?: string;
   personaFile?: string;
+  /** Inline profile values for trusted typed callers such as the local web service. */
+  bio?: string;
+  persona?: string;
   /**
    * Path to a file holding exactly the existing `isolation:` mapping — the same
    * schema fleet.yaml uses, not a second policy language. The ONE new operator
@@ -64,7 +69,21 @@ export interface SpawnOpts {
   json?: boolean;
 }
 
-function roleFromOpts(o: SpawnOpts, defaultHarness?: string): RoleConfig {
+export function profileValues(o: SpawnOpts): { bio?: string; persona?: string } {
+  if (o.bio !== undefined && o.bioFile)
+    throw new Error('bio and bioFile are mutually exclusive');
+  if (o.persona !== undefined && o.personaFile)
+    throw new Error('persona and personaFile are mutually exclusive');
+  return {
+    bio: o.bio !== undefined ? o.bio.trim()
+      : o.bioFile ? readFileSync(o.bioFile, 'utf8').trim() : undefined,
+    persona: o.persona !== undefined ? o.persona.trim()
+      : o.personaFile ? readFileSync(o.personaFile, 'utf8').trim() : undefined,
+  };
+}
+
+/** Pure option-to-role mapping shared by CLI and application services. */
+export function buildRoleConfig(o: SpawnOpts, defaultHarness?: string): RoleConfig {
   const r: RoleConfig = {};
   if (o.harness) r.harness = o.harness;
   if (o.session) r.session = o.session;
@@ -92,8 +111,9 @@ function roleFromOpts(o: SpawnOpts, defaultHarness?: string): RoleConfig {
       ...(o.unattended ? { unattended: o.unattended } : {}),
     };
   }
-  if (o.bioFile) r.bio = readFileSync(o.bioFile, 'utf8').trim();
-  if (o.personaFile) r.persona = readFileSync(o.personaFile, 'utf8').trim();
+  const profile = profileValues(o);
+  if (profile.bio) r.bio = profile.bio;
+  if (profile.persona) r.persona = profile.persona;
   if (o.isolationFile) r.isolation = readIsolationFile(o.isolationFile);
   return r;
 }
@@ -121,7 +141,7 @@ export function readIsolationFile(path: string): IsolationConfig {
   return cfg;
 }
 
-function validateSpawnOpts(o: SpawnOpts): void {
+export function validateSpawnOpts(o: SpawnOpts): void {
   if (o.mission !== undefined && o.missionFile)
     throw new Error('--mission and --mission-file are mutually exclusive');
   if (o.session && !['tmux', 'acp'].includes(o.session))
@@ -133,6 +153,12 @@ function validateSpawnOpts(o: SpawnOpts): void {
       `invalid --filesystem '${o.filesystem}'; allowed: read-only, workspace, unrestricted`);
   if (o.unattended && !['deny', 'wait'].includes(o.unattended))
     throw new Error(`invalid --unattended '${o.unattended}'; allowed: deny, wait`);
+  if (!/^[A-Za-z0-9_-]+$/.test(o.name))
+    throw new Error(`invalid role name '${o.name}'`);
+  if (o.identity && !/^[A-Za-z0-9_-]+$/.test(o.identity))
+    throw new Error(`invalid identity name '${o.identity}'`);
+  if (o.model && (o.model.length > 128 || /[\0-\x1f\x7f]/.test(o.model)))
+    throw new Error('model must be printable and at most 128 characters');
 }
 
 /** Read mission text without trimming or newline rewriting. */
@@ -181,7 +207,7 @@ export function spawnDryRun(o: SpawnOpts): SpawnDryRun {
   if (o.missionFile) readMissionFile(o.missionFile);
   assertNameFree(o);
   const cfg = loadConfig(o.configPath);
-  const raw = roleFromOpts(o, cfg.defaults.harness as string | undefined);
+  const raw = buildRoleConfig(o, cfg.defaults.harness as string | undefined);
   const harnessOptions = {
     ...((cfg.defaults.harness_options ?? {}) as Record<string, unknown>),
     ...(raw.harness_options ?? {}),
@@ -276,8 +302,7 @@ export async function spawnPermanent(
       // what was actually guaranteed so the briefing can say something true.
       const guarantee = await ensureIdentity(
         effectiveIdentity(o),
-        { bio: o.bioFile ? readFileSync(o.bioFile, 'utf8').trim() : undefined,
-          persona: o.personaFile ? readFileSync(o.personaFile, 'utf8').trim() : undefined },
+        profileValues(o),
         creation.identityProvisioner ?? daemonIdentityProvisioner(),
         deps.log);
       if (guarantee.state === 'created')
@@ -292,7 +317,7 @@ export async function spawnPermanent(
       mkdirSync(fleetDDir(), { recursive: true });
       const file = join(fleetDDir(), `${o.name}.yaml`);
       writeRoleFile(tx, file, stringify({
-        roles: { [o.name]: roleFromOpts(o, cfg.defaults.harness as string | undefined) },
+        roles: { [o.name]: buildRoleConfig(o, cfg.defaults.harness as string | undefined) },
       }));
       // `up` materialises the state dir and registers the service. Journal the
       // dir before it exists so a failure leaves the name genuinely reusable
@@ -363,10 +388,16 @@ export async function spawnTemp(
       assertNameFree(o);
       const guarantee = await ensureIdentity(
         effectiveIdentity(o),
-        { bio: o.bioFile ? readFileSync(o.bioFile, 'utf8').trim() : undefined,
-          persona: o.personaFile ? readFileSync(o.personaFile, 'utf8').trim() : undefined },
+        profileValues(o),
         creation.identityProvisioner ?? daemonIdentityProvisioner(),
         creation.log);
+      if (guarantee.state === 'created')
+        tx.record({
+          stage: `ours identity ${effectiveIdentity(o)}`,
+          undo: async () => {
+            await creation.identityProvisioner?.remove?.(effectiveIdentity(o));
+          },
+        });
       return spawnTempInner(o, binPath, launch, tx, guarantee);
     },
     creation,
@@ -379,7 +410,7 @@ async function spawnTempInner(
 ): Promise<string> {
   const cfg = loadConfig(o.configPath);
   const defaultHarness = cfg.defaults.harness as string | undefined;
-  const fromOpts = roleFromOpts(o, defaultHarness);
+  const fromOpts = buildRoleConfig(o, defaultHarness);
   const mergedHarnessOptions = {
     ...((cfg.defaults.harness_options ?? {}) as Record<string, unknown>),
     ...(fromOpts.harness_options ?? {}),

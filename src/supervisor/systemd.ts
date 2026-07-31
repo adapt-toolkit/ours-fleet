@@ -153,6 +153,10 @@ WantedBy=default.target
       return r.stdout || r.stderr;
     },
     liveness(name) { return probeLiveness(ctl, name); },
+    async inspect(name) {
+      const live = await probeLiveness(ctl, name);
+      return { backend: 'systemd' as const, ...live, nativeState: live.detail.split(/\s/)[0] };
+    },
     async uninstall(name) {
       const before = await ctl('is-enabled', unitFor(name));
       const wasEnabled = before.stdout.trim() === 'enabled';

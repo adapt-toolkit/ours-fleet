@@ -210,7 +210,7 @@ export function isolationContextFor(role: ResolvedRole): WrapContext {
   };
 }
 
-const NAME_RE = /^[A-Za-z0-9_-]+$/;
+export const ROLE_NAME_RE = /^[A-Za-z0-9_-]+$/;
 const ROLE_KEYS = [
   'harness', 'session', 'session_options', 'permissions', 'identity', 'cwd', 'coordinator', 'mission', 'persona', 'bio',
   'briefing_file', 'model', 'model_chain', 'max_tokens', 'autocompact_pct', 'env', 'oversee', 'harness_options',
@@ -265,7 +265,7 @@ export function loadConfig(
   const roles: ResolvedRole[] = [];
   for (const { file, doc } of docs) {
     for (const [name, raw] of Object.entries((doc.roles ?? {}) as Record<string, RoleConfig | null>)) {
-      if (!NAME_RE.test(name))
+      if (!ROLE_NAME_RE.test(name))
         throw new ConfigError(`${file}: invalid role name '${name}' (allowed: [A-Za-z0-9_-])`);
       const prev = seen.get(name);
       if (prev) throw new ConfigError(`role '${name}' defined in both ${prev} and ${file}`);

@@ -19,7 +19,19 @@ export { generateBriefing } from './briefing.js';
 export { pickBackend } from './supervisor/index.js';
 export type { SupervisorBackend } from './supervisor/types.js';
 export { up, down, restartRoles, rmRole, applyRole } from './ops.js';
-export { spawnPermanent, spawnTemp } from './spawn.js';
+export {
+  spawnPermanent, spawnTemp, buildRoleConfig, profileValues, validateSpawnOpts,
+} from './spawn.js';
+export { RoleRepository } from './application/role-repository.js';
+export { FleetQueryService } from './application/fleet-query-service.js';
+export { AcpRoleSessionAdapter, TmuxRoleSessionAdapter } from './application/session-control.js';
+export { RoleCreationService } from './application/role-creation-service.js';
+export { RoleCommandService } from './application/role-command-service.js';
+export { StructuredLogService } from './application/log-service.js';
+export { roleCapabilities } from './application/capabilities.js';
+export { FleetError, normalizeError } from './application/errors.js';
+export { DaemonAtomicIdentityProvider } from './infrastructure/daemon-identity.js';
+export type * from './application/types.js';
 export { doctor } from './doctor.js';
 export { runOnce, runTemp } from './runner.js';
 export { Tmux } from './tmux.js';

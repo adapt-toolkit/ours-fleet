@@ -15,6 +15,10 @@ export interface Liveness {
 /** Whether `install` had to create the registration, or found it already there. */
 export interface InstallOutcome { created: boolean; detail: string }
 export interface UninstallOutcome { removed: boolean; detail: string }
+export interface SupervisorInspection extends Liveness {
+  backend: 'systemd' | 'launchd' | 'none';
+  nativeState?: string;
+}
 
 export interface SupervisorBackend {
   id: 'systemd' | 'launchd' | 'none';
@@ -37,6 +41,8 @@ export interface SupervisorBackend {
    * probe is `unknown` with the failure in `detail`.
    */
   liveness(name: string): Promise<Liveness>;
+  /** Structured machine-derived status for application-service consumers. */
+  inspect?(name: string): Promise<SupervisorInspection>;
   /** Remove the registration. Idempotent; reports whether anything was there. */
   uninstall(name: string): Promise<UninstallOutcome>;
   /** Command the CLI execs (stdio inherited) to show logs. */
