@@ -8,6 +8,10 @@ test('bootstrap, inventory, navigation, send, create, and security boundaries', 
   await expect(page.getByText('Alpha', { exact: true }).first()).toBeVisible();
   await expect(page.getByText('live · idle')).toBeVisible();
   await expect(page.getByText(/service inactive · authoritative/)).toBeVisible();
+  await request.post('/__test/restart-auth');
+  await page.reload();
+  await expect(page.getByRole('heading', { name: 'Your fleet' })).toBeVisible();
+  await expect(page).toHaveURL('http://127.0.0.1:49371/');
   const mission = page.locator('.mission-summary').first();
   await expect(mission).toHaveAttribute('title', /intentionally long mission/);
   expect(await mission.evaluate(element => ({
@@ -47,4 +51,8 @@ test('bootstrap, inventory, navigation, send, create, and security boundaries', 
   expect(hostile.status()).toBe(403);
 
   await page.screenshot({ path: 'test-results/web-console-overview.png', fullPage: true });
+  await page.getByRole('button', { name: 'Sign out' }).click();
+  await expect(page.getByText(/ours-fleet web open/)).toBeVisible();
+  expect((await page.context().cookies()).filter(cookie =>
+    ['ofs_session', 'ofs_device'].includes(cookie.name))).toHaveLength(0);
 });

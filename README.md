@@ -140,10 +140,21 @@ ours-fleet web --no-open
 ours-fleet web --port 0 --no-open
 ```
 
-Open the one-time fragment URL printed at startup. The fragment is exchanged
-for a short-lived `HttpOnly; SameSite=Strict` browser session and removed from
-history. Keep the console local: the MVP deliberately has no `--host`, proxy,
-TLS, or remote-access mode.
+The normal command opens a one-time five-minute fragment directly in the local
+browser; it does not print a reusable secret. If the browser needs pairing
+again while the server is running, use `ours-fleet web open`. The fragment is
+exchanged once and removed from history. A paired browser receives a rotating,
+30-day `HttpOnly; SameSite=Strict` device credential and can return after a
+session idle timeout or server restart. Use **Sign out** to revoke the current
+browser, or `ours-fleet web revoke-all` to revoke every trusted browser and
+active web session.
+
+Only a domain-separated SHA-256 device-secret hash and bounded timestamps are
+stored in the owner-private fleet state directory (`0700` directory, `0600`
+atomic file). The re-pair and revoke controls use an owner-private Unix socket;
+local processes running as the same OS user are therefore inside the trust
+boundary. Keep the console local: it has no `--host`, proxy, TLS, or
+remote-access mode.
 
 The console provides evidence-separated inventory and status, ACP activity and
 permission controls, redacted logs, typed text send, confirmed lifecycle

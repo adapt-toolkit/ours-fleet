@@ -12,12 +12,15 @@ import { controlRequest, controlSocketPath } from '../session/control.js';
 import { Tmux } from '../tmux.js';
 import { pickBackend } from '../supervisor/index.js';
 import { realExec } from '../exec.js';
-import { home } from '../paths.js';
+import { home, stateRoot } from '../paths.js';
 import { AuditSink } from './audit.js';
 import { FleetEventBus } from './events.js';
 import { buildWebServer, type WebServer } from './server.js';
 import { TerminalBridgeManager } from './terminal/bridge.js';
 import { acquireWebServerLock } from './lock.js';
+import { TrustedDeviceStore } from './device-store.js';
+import { WebAuth } from './auth.js';
+import { startWebControlServer, type WebControlServer } from './control.js';
 
 export interface StartWebOptions {
   configPath?: string;
@@ -29,7 +32,6 @@ export interface StartWebOptions {
 
 export interface RunningWebConsole extends WebServer {
   address: string;
-  bootstrapUrl: string;
 }
 
 export async function startWebConsole(options: StartWebOptions): Promise<RunningWebConsole> {
@@ -37,6 +39,11 @@ export async function startWebConsole(options: StartWebOptions): Promise<Running
   if (!Number.isInteger(requestedPort) || requestedPort < 0 || requestedPort > 65_535)
     throw new FleetError('invalid_request', 'port must be between 0 and 65535');
   const lock = acquireWebServerLock();
+  const webDir = resolve(stateRoot(), 'web');
+  const auth = new WebAuth(
+    `http://127.0.0.1:${requestedPort}`, `127.0.0.1:${requestedPort}`,
+    Date.now, new TrustedDeviceStore(webDir),
+  );
   const tmux = new Tmux();
   const backend = pickBackend();
   const repository = new RoleRepository({
@@ -109,14 +116,14 @@ export async function startWebConsole(options: StartWebOptions): Promise<Running
         return new TmuxRoleSessionAdapter(roleId, tmux);
       throw new FleetError('capability_unavailable', 'role session backend is unavailable');
     },
-    }, { origin: `http://127.0.0.1:${requestedPort}`, host: `127.0.0.1:${requestedPort}` });
+    }, { origin: `http://127.0.0.1:${requestedPort}`, host: `127.0.0.1:${requestedPort}` }, { auth });
   } catch (error) {
     lock.release();
     throw error;
   }
   let address: string;
   try { address = await server.app.listen({ host: '127.0.0.1', port: requestedPort }); }
-  catch (error) { lock.release(); throw error; }
+  catch (error) { await server.close(); lock.release(); throw error; }
   const actual = new URL(address);
   if (actual.hostname !== '127.0.0.1') {
     await server.close();
@@ -125,12 +132,27 @@ export async function startWebConsole(options: StartWebOptions): Promise<Running
   }
   const host = `127.0.0.1:${actual.port}`;
   server.auth.setBoundary(`http://${host}`, host);
-  const bootstrapUrl = `http://${host}/#bootstrap=${server.auth.bootstrapSecret}`;
-  if (options.open !== false) openBrowser(bootstrapUrl);
+  let control: WebControlServer;
+  try {
+    control = await startWebControlServer({
+      dir: webDir,
+      onOpen() {
+        const url = `http://${host}/#bootstrap=${server.auth.mintBootstrap()}`;
+        openBrowser(url);
+      },
+      onRevokeAll() { server.auth.revokeAllTrustedDevices(); },
+    });
+  } catch (error) {
+    await server.close();
+    lock.release();
+    throw error;
+  }
+  if (options.open !== false)
+    openBrowser(`http://${host}/#bootstrap=${server.auth.bootstrapSecret}`);
   return {
-    ...server, address: `http://${host}`, bootstrapUrl,
+    ...server, address: `http://${host}`,
     async close() {
-      try { await terminals.close(); await server.close(); }
+      try { await control.close(); await terminals.close(); await server.close(); }
       finally { lock.release(); }
     },
   };

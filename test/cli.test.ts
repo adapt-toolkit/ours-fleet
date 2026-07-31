@@ -79,6 +79,14 @@ describe('ours-fleet CLI', () => {
       expect(r.stdout).toContain(c);
   });
 
+  it('web help exposes secure re-pair and revocation commands', async () => {
+    const r = await run(['web', '--help']);
+    expect(r.code).toBe(0);
+    expect(r.stdout).toContain('open');
+    expect(r.stdout).toContain('revoke-all');
+    expect(r.stdout).not.toContain('#bootstrap=');
+  });
+
   it('docs and man print the AI-friendly configuration reference', async () => {
     for (const command of ['docs', 'man']) {
       const r = await run([command]);

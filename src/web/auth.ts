@@ -1,6 +1,8 @@
 import { randomBytes, timingSafeEqual } from 'node:crypto';
 import type { FastifyRequest } from 'fastify';
+import type { WebSocket } from 'ws';
 import { FleetError } from '../application/errors.js';
+import { TrustedDeviceStore, type TrustedDeviceIssue } from './device-store.js';
 
 export interface BrowserSession {
   id: string;
@@ -8,6 +10,11 @@ export interface BrowserSession {
   createdAt: number;
   lastSeenAt: number;
   absoluteExpiresAt: number;
+}
+
+export interface AuthResult {
+  session: BrowserSession;
+  device: TrustedDeviceIssue;
 }
 
 interface Ticket {
@@ -30,13 +37,16 @@ export class WebAuth {
   private bootstrapExpiresAt = Date.now() + 5 * 60_000;
   private bootstrapUsed = false;
   private readonly sessions = new Map<string, BrowserSession>();
+  private readonly sessionDevices = new Map<string, string>();
   private readonly tickets = new Map<string, Ticket>();
   private readonly rates = new Map<string, { count: number; resetAt: number }>();
+  private readonly sockets = new Map<string, Set<WebSocket>>();
 
   constructor(
     private _origin: string,
     private _host: string,
     private readonly now: () => number = Date.now,
+    private readonly devices = new TrustedDeviceStore(),
   ) {}
   get bootstrapSecret(): string { return this._bootstrapSecret; }
   get origin(): string { return this._origin; }
@@ -63,7 +73,7 @@ export class WebAuth {
       throw new FleetError('forbidden', 'cross-site request rejected');
   }
 
-  exchange(request: FastifyRequest): BrowserSession {
+  exchange(request: FastifyRequest): AuthResult {
     this.validateBoundary(request, true);
     this.consumeRate('bootstrap', 10, 60_000);
     const authorization = request.headers.authorization ?? '';
@@ -71,13 +81,17 @@ export class WebAuth {
     if (this.bootstrapUsed || this.now() > this.bootstrapExpiresAt || !same(this._bootstrapSecret, supplied))
       throw new FleetError('unauthorized', 'bootstrap credential is invalid or expired');
     this.bootstrapUsed = true;
-    const now = this.now();
-    const session: BrowserSession = {
-      id: token(), csrf: token(), createdAt: now, lastSeenAt: now,
-      absoluteExpiresAt: now + 8 * 60 * 60_000,
-    };
-    this.sessions.set(session.id, session);
-    return session;
+    const device = this.devices.issue();
+    return { session: this.createSession(device.id), device };
+  }
+
+  resume(request: FastifyRequest): AuthResult {
+    this.validateBoundary(request, true);
+    this.consumeRate('device-resume', 30, 60_000);
+    const current = parseCookies(request.headers.cookie ?? '').ofs_device;
+    const device = current ? this.devices.rotate(current) : undefined;
+    if (!device) throw new FleetError('unauthorized', 'trusted device is missing, expired, or revoked');
+    return { session: this.createSession(device.id), device };
   }
 
   authenticate(request: FastifyRequest, mutation = false): BrowserSession {
@@ -86,7 +100,7 @@ export class WebAuth {
     const session = id ? this.sessions.get(id) : undefined;
     const now = this.now();
     if (!session || now > session.absoluteExpiresAt || now - session.lastSeenAt > 30 * 60_000) {
-      if (id) this.sessions.delete(id);
+      if (id) this.removeSession(id);
       throw new FleetError('unauthorized', 'browser session is missing or expired');
     }
     if (mutation) {
@@ -100,9 +114,9 @@ export class WebAuth {
 
   logout(request: FastifyRequest): void {
     const session = this.authenticate(request, true);
-    this.sessions.delete(session.id);
-    for (const [ticket, value] of this.tickets)
-      if (value.sessionId === session.id) this.tickets.delete(ticket);
+    const deviceId = this.sessionDevices.get(session.id);
+    if (deviceId) this.devices.revokeId(deviceId);
+    this.removeSession(session.id);
   }
 
   mintTicket(
@@ -132,9 +146,48 @@ export class WebAuth {
     return session;
   }
 
-  revokeAll(): void {
+  bindSocket(sessionId: string, socket: WebSocket): void {
+    let sockets = this.sockets.get(sessionId);
+    if (!sockets) { sockets = new Set(); this.sockets.set(sessionId, sockets); }
+    sockets.add(socket);
+    socket.once('close', () => sockets?.delete(socket));
+  }
+
+  clearSessions(): void {
+    for (const sockets of this.sockets.values())
+      for (const socket of sockets) socket.close(4401, 'authentication revoked');
+    this.sockets.clear();
     this.sessions.clear();
+    this.sessionDevices.clear();
     this.tickets.clear();
+  }
+
+  revokeAllTrustedDevices(): number {
+    const count = this.devices.revokeAll();
+    this.clearSessions();
+    return count;
+  }
+
+  shutdown(): void { this.clearSessions(); }
+
+  private createSession(deviceId: string): BrowserSession {
+    const now = this.now();
+    const session = {
+      id: token(), csrf: token(), createdAt: now, lastSeenAt: now,
+      absoluteExpiresAt: now + 8 * 60 * 60_000,
+    };
+    this.sessions.set(session.id, session);
+    this.sessionDevices.set(session.id, deviceId);
+    return session;
+  }
+
+  private removeSession(id: string): void {
+    this.sessions.delete(id);
+    this.sessionDevices.delete(id);
+    for (const [ticket, value] of this.tickets)
+      if (value.sessionId === id) this.tickets.delete(ticket);
+    for (const socket of this.sockets.get(id) ?? []) socket.close(4401, 'authentication revoked');
+    this.sockets.delete(id);
   }
 
   private consumeRate(key: string, limit: number, windowMs: number): void {

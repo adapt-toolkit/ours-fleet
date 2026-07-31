@@ -1,4 +1,10 @@
+import { mkdtempSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { buildWebServer } from '../../../dist/web/server.js';
+import { WebAuth } from '../../../dist/web/auth.js';
+import { TrustedDeviceStore } from '../../../dist/web/device-store.js';
+import { AuditSink } from '../../../dist/web/audit.js';
 
 const status = {
   roleId: 'Alpha', observedAt: new Date().toISOString(), overall: 'ready',
@@ -108,12 +114,20 @@ const services = {
   },
 };
 
-const server = await buildWebServer(services, {
-  origin: 'http://127.0.0.1:49371', host: '127.0.0.1:49371',
-});
+const boundary = { origin: 'http://127.0.0.1:49371', host: '127.0.0.1:49371' };
+const deviceDir = mkdtempSync(join(tmpdir(), 'ours-fleet-e2e-device-'));
+services.audit = new AuditSink(join(deviceDir, 'audit'));
+const auth = new WebAuth(
+  boundary.origin, boundary.host, Date.now, new TrustedDeviceStore(deviceDir),
+);
+const server = await buildWebServer(services, boundary, { auth });
 server.app.post('/__test/bootstrap', async () => ({
   url: `http://127.0.0.1:49371/#bootstrap=${server.auth.mintBootstrap()}`,
 }));
+server.app.post('/__test/restart-auth', async () => {
+  server.auth.clearSessions();
+  return { ok: true };
+});
 await server.app.listen({ host: '127.0.0.1', port: 49371 });
 for (const signal of ['SIGINT', 'SIGTERM']) process.once(signal, async () => {
   await server.close(); process.exit(0);

@@ -107,6 +107,7 @@ export function App() {
         </div>
         <div className="header-actions">
           <button className="secondary" onClick={() => void refresh()}>Refresh</button>
+          <button className="secondary" onClick={() => void api.logout().finally(() => location.reload())}>Sign out</button>
           <button className="primary" onClick={() => setCreating(true)}>＋ Create role</button>
         </div>
       </header>

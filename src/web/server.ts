@@ -53,12 +53,13 @@ const statusFor = (code: string): number => ({
 export async function buildWebServer(
   services: WebServices,
   boundary: { origin: string; host: string },
+  options: { auth?: WebAuth } = {},
 ): Promise<WebServer> {
   const app = Fastify({
     trustProxy: false, bodyLimit: 64 * 1024, logger: false,
     requestIdHeader: false, genReqId: () => cryptoRandomId(),
   });
-  const auth = new WebAuth(boundary.origin, boundary.host);
+  const auth = options.auth ?? new WebAuth(boundary.origin, boundary.host);
   const audit = services.audit ?? new AuditSink();
   const events = services.events ?? new FleetEventBus();
   const digestKey = randomBytes(32);
@@ -91,17 +92,22 @@ export async function buildWebServer(
   });
 
   app.post('/api/v1/auth/exchange', async (request, reply) => {
-    const session = auth.exchange(request);
-    reply.header(
-      'Set-Cookie',
-      `ofs_session=${encodeURIComponent(session.id)}; HttpOnly; SameSite=Strict; Path=/api; Max-Age=28800`);
+    const { session, device } = auth.exchange(request);
+    setAuthCookies(reply, session.id, device.token);
     await audit.record({ requestId: request.id, browser: session.id, action: 'auth.exchange', result: 'succeeded' });
+    return { csrfToken: session.csrf, expiresAt: new Date(session.absoluteExpiresAt).toISOString() };
+  });
+
+  app.post('/api/v1/auth/resume', async (request, reply) => {
+    const { session, device } = auth.resume(request);
+    setAuthCookies(reply, session.id, device.token);
+    await audit.record({ requestId: request.id, browser: session.id, action: 'auth.resume', result: 'succeeded' });
     return { csrfToken: session.csrf, expiresAt: new Date(session.absoluteExpiresAt).toISOString() };
   });
 
   app.post('/api/v1/auth/logout', async (request, reply) => {
     auth.logout(request);
-    reply.header('Set-Cookie', 'ofs_session=; HttpOnly; SameSite=Strict; Path=/api; Max-Age=0');
+    clearAuthCookies(reply);
     await audit.record({ requestId: request.id, action: 'auth.logout', result: 'succeeded' });
     return { ok: true };
   });
@@ -247,7 +253,8 @@ export async function buildWebServer(
   app.get('/api/v1/events', { websocket: true }, (socket, request) => {
     requireSubprotocol(request, 'ours-fleet-events.v1');
     authorizeSocket(socket, request, async hello => {
-      auth.consumeTicket(request, String(hello.ticket ?? ''), 'events');
+      const session = auth.consumeTicket(request, String(hello.ticket ?? ''), 'events');
+      auth.bindSocket(session.id, socket);
       const detach = events.attach(socket, typeof hello.lastEventId === 'string' ? hello.lastEventId : undefined);
       socket.on('close', detach);
       socket.send(JSON.stringify({ kind: 'ready', at: new Date().toISOString() }));
@@ -259,7 +266,8 @@ export async function buildWebServer(
       requireSubprotocol(request, 'ours-fleet-terminal.v1');
       authorizeSocket(socket, request, async hello => {
         const ticket = String(hello.ticket ?? '');
-        auth.consumeTicket(request, ticket, 'terminal', request.params.id);
+        const session = auth.consumeTicket(request, ticket, 'terminal', request.params.id);
+        auth.bindSocket(session.id, socket);
         if (!services.terminalUpgrade)
           throw new FleetError('capability_unavailable', 'terminal PTY support is unavailable');
         await services.terminalUpgrade(socket, request, request.params.id, ticket, hello);
@@ -278,11 +286,25 @@ export async function buildWebServer(
   return {
     app, auth, audit, events,
     async close() {
-      auth.revokeAll();
+      auth.shutdown();
       events.close();
       await app.close();
     },
   };
+}
+
+function setAuthCookies(reply: { header(name: string, value: string | string[]): unknown }, session: string, device: string): void {
+  reply.header('Set-Cookie', [
+    `ofs_session=${encodeURIComponent(session)}; HttpOnly; SameSite=Strict; Path=/api; Max-Age=28800`,
+    `ofs_device=${encodeURIComponent(device)}; HttpOnly; SameSite=Strict; Path=/api; Max-Age=2592000`,
+  ]);
+}
+
+function clearAuthCookies(reply: { header(name: string, value: string | string[]): unknown }): void {
+  reply.header('Set-Cookie', [
+    'ofs_session=; HttpOnly; SameSite=Strict; Path=/api; Max-Age=0',
+    'ofs_device=; HttpOnly; SameSite=Strict; Path=/api; Max-Age=0',
+  ]);
 }
 
 function cryptoRandomId(): string { return randomBytes(12).toString('hex'); }

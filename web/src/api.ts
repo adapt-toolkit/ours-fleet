@@ -21,9 +21,15 @@ export class ApiClient {
       this.csrf = body.csrfToken;
       return;
     }
-    const response = await fetch('/api/v1/auth/session');
-    if (!response.ok) throw new Error('Open the one-time URL printed by ours-fleet web.');
-    this.csrf = (await response.json()).csrfToken;
+    const current = await fetch('/api/v1/auth/session');
+    if (current.ok) {
+      this.csrf = (await current.json()).csrfToken;
+      return;
+    }
+    const resumed = await fetch('/api/v1/auth/resume', { method: 'POST' });
+    if (!resumed.ok)
+      throw new Error('Run `ours-fleet web open` on this computer.');
+    this.csrf = (await resumed.json()).csrfToken;
   }
   async request<T>(path: string, init: RequestInit = {}): Promise<T> {
     const method = init.method ?? 'GET';
@@ -46,6 +52,10 @@ export class ApiClient {
   get<T>(path: string): Promise<T> { return this.request(path); }
   post<T>(path: string, body: unknown, headers?: Record<string, string>): Promise<T> {
     return this.request(path, { method: 'POST', body: JSON.stringify(body), headers });
+  }
+  async logout(): Promise<void> {
+    await this.post('/api/v1/auth/logout', {});
+    this.csrf = '';
   }
 }
 

@@ -29,6 +29,7 @@ import {
 import { SessionControlError } from './session/types.js';
 import type { SessionEvent } from './session/types.js';
 import { startWebConsole } from './web/runtime.js';
+import { requestWebControl } from './web/control.js';
 import './harness/claude-code.js';   // registers the claude-code adapter
 import './harness/codex.js';         // registers the codex adapter
 
@@ -448,7 +449,7 @@ program.command('init').description('one-time host setup (units, dirs, linger)')
     console.log('\nNext: copy examples/fleet.yaml to ~/fleet.yaml, edit, then: ours-fleet up');
   });
 
-cOpt(program.command('web').description('start the secure localhost fleet web console'))
+const webCommand = cOpt(program.command('web').description('start or open the secure localhost fleet web console'))
   .option('--port <port>', 'loopback port (default: 49271; 0 chooses a free port)', value => {
     const port = Number(value);
     if (!Number.isInteger(port) || port < 0 || port > 65_535) throw new Error('invalid port');
@@ -462,15 +463,32 @@ cOpt(program.command('web').description('start the secure localhost fleet web co
         open: opts.open !== false, binPath,
         log: line => process.stderr.write(line + '\n'),
       });
-      // This is intentionally the only display of the one-time fragment credential.
       process.stdout.write(`ours-fleet web listening on ${consoleServer.address}\n`);
-      process.stdout.write(`Open once: ${consoleServer.bootstrapUrl}\n`);
+      process.stdout.write(opts.open !== false
+        ? 'Trusted-browser pairing opened locally.\n'
+        : 'Run `ours-fleet web open` on this computer to pair a browser.\n');
       const shutdown = async () => {
         await consoleServer.close();
         process.exit(0);
       };
       process.once('SIGINT', () => { void shutdown(); });
       process.once('SIGTERM', () => { void shutdown(); });
+    } catch (e) { die(e); }
+  });
+
+webCommand.command('open').description('securely open or re-pair a browser with the running console')
+  .action(async () => {
+    try {
+      await requestWebControl('open');
+      process.stdout.write('Trusted-browser pairing opened locally.\n');
+    } catch (e) { die(e); }
+  });
+
+webCommand.command('revoke-all').description('revoke all trusted browsers and active web sessions')
+  .action(async () => {
+    try {
+      await requestWebControl('revoke-all');
+      process.stdout.write('Revoked all trusted browsers and active web sessions.\n');
     } catch (e) { die(e); }
   });
 
