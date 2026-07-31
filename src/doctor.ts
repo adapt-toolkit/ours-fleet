@@ -2,6 +2,7 @@ import { userInfo } from 'node:os';
 import { readFileSync } from 'node:fs';
 import { realExec, type Exec } from './exec.js';
 import { isolationContextFor, loadConfig, type ResolvedRole } from './config.js';
+import type { ConfigDiagnostic, YamlMode } from './config-yaml.js';
 import { getAdapter, productionAdapters } from './harness/registry.js';
 import { analyzeFleetPermissions, formatNative } from './permissions.js';
 import { resolveBundledAcpAgent } from './harness/acp-agent.js';
@@ -47,7 +48,7 @@ function resolveMonitorProfiles(roles: ResolvedRole[]): MonitorProfile[] {
 
 /** Host-level + per-harness prerequisite report with actionable messages. */
 export async function doctor(
-  opts: { harness?: string; configPath?: string } = {},
+  opts: { harness?: string; configPath?: string; yamlMode?: YamlMode } = {},
   exec: Exec = realExec,
   platform: NodeJS.Platform = process.platform,
   fetchImpl: FetchLike = (u, i) => globalThis.fetch(u, i) as unknown as ReturnType<FetchLike>,
@@ -63,7 +64,7 @@ export async function doctor(
   // The configuration is a checked prerequisite in its own right. A config the
   // `config` command rejects must fail here too, with the same cause — while the
   // host checks below still run, because they are what the operator needs next.
-  const loaded = loadConfigResult(opts.configPath);
+  const loaded = loadConfigResult(opts.configPath, opts.yamlMode);
   const roles = loaded.ok ? loaded.roles : [];
   checks.push(loaded.ok
     ? { name: 'config', ok: true, detail: loaded.files.join(' + ') || '(none — no fleet.yaml or fleet.d)' }
@@ -71,6 +72,11 @@ export async function doctor(
   checks.push(loaded.ok
     ? { name: 'roles', ok: true, detail: `${roles.length} configured` }
     : { name: 'roles', ok: false, detail: 'unknown — the configuration did not load' });
+  if (loaded.ok) for (const diagnostic of loaded.diagnostics) checks.push({
+    name: `yaml: ${diagnostic.kind}`,
+    ok: true,
+    detail: `warning: ${diagnostic.message}`,
+  });
 
   if (roles.length === 0 || roles.some(role => (role.session ?? 'tmux') === 'tmux')) {
     const tmux = await exec('tmux', ['-V']);
@@ -154,6 +160,38 @@ export async function doctor(
         : `MISSING ${floor.missing.join(', ')} — with unattended=${p.unattended} these requests will `
           + `${p.unattended === 'deny' ? 'be denied silently' : 'block the turn'}; `
           + `grants only ${analysis.capabilities!.join(', ') || '(nothing)'}`,
+    });
+  }
+
+  for (const role of roles.filter(candidate => candidate.auth_proxy !== undefined)) {
+    const proxy = role.auth_proxy!;
+    const credentialKeys = Object.keys(role.env ?? {}).filter(key =>
+      /^(ANTHROPIC_API_KEY|ANTHROPIC_AUTH_TOKEN|AUTHORIZATION)$/i.test(key)
+      || /authorization/i.test(key));
+    checks.push({
+      name: `auth proxy secrets: ${role.name}`,
+      ok: credentialKeys.length === 0,
+      detail: credentialKeys.length
+        ? `proxy-enabled role also exposes credential env key(s): ${credentialKeys.join(', ')}`
+        : 'credential-free role environment',
+    });
+    let ok = false;
+    let detail: string;
+    try {
+      const response = await fetchImpl(proxy.health_url, {
+        signal: AbortSignal.timeout(2_000),
+      });
+      ok = response.ok;
+      detail = response.ok
+        ? `reachable (${proxy.health_url})`
+        : `HTTP ${response.status} from ${proxy.health_url}`;
+    } catch (e) {
+      detail = `unreachable (${proxy.health_url}): ${(e as Error).message}`;
+    }
+    checks.push({
+      name: `auth proxy: ${role.name}`,
+      ok: ok || !proxy.required,
+      detail: `${detail}${proxy.required ? ' [required]' : ' [optional]'}`,
     });
   }
 
@@ -297,13 +335,13 @@ export async function doctor(
  * clean bill of health for a configuration `ours-fleet config` refuses outright.
  */
 type ConfigLoad =
-  | { ok: true; roles: ResolvedRole[]; files: string[] }
+  | { ok: true; roles: ResolvedRole[]; files: string[]; diagnostics: ConfigDiagnostic[] }
   | { ok: false; error: string };
 
-function loadConfigResult(configPath?: string): ConfigLoad {
+function loadConfigResult(configPath?: string, yamlMode?: YamlMode): ConfigLoad {
   try {
-    const cfg = loadConfig(configPath);
-    return { ok: true, roles: cfg.roles, files: cfg.files };
+    const cfg = loadConfig(configPath, { yamlMode });
+    return { ok: true, roles: cfg.roles, files: cfg.files, diagnostics: cfg.diagnostics };
   } catch (e) {
     return { ok: false, error: e instanceof Error ? e.message : String(e) };
   }
