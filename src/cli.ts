@@ -30,6 +30,7 @@ import { SessionControlError } from './session/types.js';
 import type { SessionEvent } from './session/types.js';
 import { startWebConsole } from './web/runtime.js';
 import { requestWebControl } from './web/control.js';
+import { WebServiceManager } from './web/service.js';
 import './harness/claude-code.js';   // registers the claude-code adapter
 import './harness/codex.js';         // registers the codex adapter
 
@@ -450,11 +451,40 @@ program.command('init').description('one-time host setup (units, dirs, linger)')
   });
 
 const webCommand = cOpt(program.command('web').description('start or open the secure localhost fleet web console'))
+  .option('--port <port>', 'loopback service port (default: 49271)', value => {
+    const port = Number(value);
+    if (!Number.isInteger(port) || port < 1 || port > 65_535) throw new Error('invalid port');
+    return port;
+  })
+  .option('--no-open', 'do not open a browser automatically')
+  .action(async opts => {
+    try {
+      const manager = new WebServiceManager();
+      for (const line of await manager.install(binPath, opts.port ?? 49_271, opts.configuration))
+        process.stdout.write(line + '\n');
+      await manager.start();
+      if (opts.open !== false) {
+        await requestWebControlWhenReady('open');
+        process.stdout.write('Trusted-browser pairing opened locally.\n');
+      } else process.stdout.write('Web service started; run `ours-fleet web open` to pair a browser.\n');
+    } catch (e) { die(e); }
+  });
+
+const webPort = (command: Command) => cOpt(command)
+  .option('--port <port>', 'loopback service port (default: 49271)', value => {
+    const port = Number(value);
+    if (!Number.isInteger(port) || port < 1 || port > 65_535) throw new Error('invalid port');
+    return port;
+  });
+
+const webServe = cOpt(webCommand.command('serve').description('run the web console in the foreground'))
   .option('--port <port>', 'loopback port (default: 49271; 0 chooses a free port)', value => {
     const port = Number(value);
     if (!Number.isInteger(port) || port < 0 || port > 65_535) throw new Error('invalid port');
     return port;
-  })
+  });
+
+webServe
   .option('--no-open', 'do not open a browser automatically')
   .action(async opts => {
     try {
@@ -467,13 +497,42 @@ const webCommand = cOpt(program.command('web').description('start or open the se
       process.stdout.write(opts.open !== false
         ? 'Trusted-browser pairing opened locally.\n'
         : 'Run `ours-fleet web open` on this computer to pair a browser.\n');
-      const shutdown = async () => {
-        await consoleServer.close();
-        process.exit(0);
-      };
+      const shutdown = async () => { await consoleServer.close(); process.exit(0); };
       process.once('SIGINT', () => { void shutdown(); });
       process.once('SIGTERM', () => { void shutdown(); });
     } catch (e) { die(e); }
+  });
+
+webPort(webCommand.command('install').description('install or update the owner web service'))
+  .action(async opts => {
+    try {
+      for (const line of await new WebServiceManager().install(
+        binPath, opts.port ?? 49_271, opts.configuration)) process.stdout.write(line + '\n');
+    } catch (e) { die(e); }
+  });
+
+for (const [name, description] of [
+  ['start', 'start the installed owner web service'],
+  ['stop', 'stop the owner web service'],
+  ['restart', 'restart the owner web service'],
+] as const) webCommand.command(name).description(description).action(async () => {
+  try {
+    await new WebServiceManager()[name]();
+    process.stdout.write(`Web service ${{ start: 'started', stop: 'stopped', restart: 'restarted' }[name]}.\n`);
+  }
+  catch (e) { die(e); }
+});
+
+webCommand.command('status').description('show native web service status')
+  .action(async () => {
+    try { process.stdout.write(await new WebServiceManager().status() + '\n'); }
+    catch (e) { die(e); }
+  });
+
+webCommand.command('uninstall').description('stop and uninstall the owner web service')
+  .action(async () => {
+    try { process.stdout.write(await new WebServiceManager().uninstall() + '\n'); }
+    catch (e) { die(e); }
   });
 
 webCommand.command('open').description('securely open or re-pair a browser with the running console')
@@ -491,6 +550,15 @@ webCommand.command('revoke-all').description('revoke all trusted browsers and ac
       process.stdout.write('Revoked all trusted browsers and active web sessions.\n');
     } catch (e) { die(e); }
   });
+
+async function requestWebControlWhenReady(command: 'open' | 'revoke-all'): Promise<void> {
+  let last: unknown;
+  for (let attempt = 0; attempt < 40; attempt++) {
+    try { await requestWebControl(command, undefined, 500); return; }
+    catch (error) { last = error; await new Promise(resolve => setTimeout(resolve, 125)); }
+  }
+  throw last;
+}
 
 program.command('_run <name>', { hidden: true }).description('internal: supervisor entrypoint')
   .option('-c, --configuration <file>')

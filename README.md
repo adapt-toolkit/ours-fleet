@@ -135,10 +135,19 @@ IPv4 loopback:
 
 ```sh
 npm run build
-ours-fleet web --no-open
+ours-fleet web
 # choose a free port for an isolated test:
-ours-fleet web --port 0 --no-open
+ours-fleet web serve --port 0 --no-open
 ```
+
+The normal `ours-fleet web` command installs or updates an owner-level native
+service, starts it on stable `127.0.0.1:49271`, and opens/re-pairs the browser.
+Linux uses a systemd user unit and macOS uses a LaunchAgent; both restart after
+process failures and send logs to the native supervisor. Service management is
+explicit through `ours-fleet web install|start|stop|restart|status|uninstall`.
+Use `ours-fleet web serve` for a foreground development process. Linux login
+persistence requires linger; the installer reports when it is missing but
+never enables it or requests root privileges.
 
 The normal command opens a one-time five-minute fragment directly in the local
 browser; it does not print a reusable secret. If the browser needs pairing

@@ -82,8 +82,9 @@ describe('ours-fleet CLI', () => {
   it('web help exposes secure re-pair and revocation commands', async () => {
     const r = await run(['web', '--help']);
     expect(r.code).toBe(0);
-    expect(r.stdout).toContain('open');
-    expect(r.stdout).toContain('revoke-all');
+    for (const command of [
+      'serve', 'install', 'start', 'stop', 'restart', 'status', 'uninstall', 'open', 'revoke-all',
+    ]) expect(r.stdout).toContain(command);
     expect(r.stdout).not.toContain('#bootstrap=');
   });
 
