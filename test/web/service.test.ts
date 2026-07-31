@@ -1,6 +1,7 @@
-import { chmodSync, mkdtempSync, readFileSync, statSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, readFileSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { spawnSync } from 'node:child_process';
 import { describe, expect, it } from 'vitest';
 import type { Exec } from '../../src/exec.js';
 import {
@@ -10,8 +11,7 @@ import {
 function fixture(platform: 'linux' | 'darwin') {
   const root = mkdtempSync(join(tmpdir(), 'ours-fleet-web-service-'));
   const executable = join(root, 'ours fleet & safe');
-  writeFileSync(executable, '#!/bin/sh\n');
-  chmodSync(executable, 0o700);
+  writeFileSync(executable, 'console.log("fixture")\n', { mode: 0o644 });
   const calls: Array<[string, string[]]> = [];
   const exec: Exec = async (command, args) => {
     calls.push([command, args]);
@@ -22,6 +22,7 @@ function fixture(platform: 'linux' | 'darwin') {
   };
   const manager = new WebServiceManager({
     platform, exec, homeDir: root, stateDir: join(root, 'state'), uid: 123,
+    runtimeExecutable: process.execPath,
   });
   return { root, executable, calls, manager };
 }
@@ -32,7 +33,12 @@ describe('native supervised web service', () => {
     const messages = await manager.install(executable, 49_271, '/tmp/fleet config.yaml');
     const unit = readFileSync(manager.definitionPath, 'utf8');
     const metadata = readFileSync(manager.metadataPath, 'utf8');
-    expect(unit).toContain(`ExecStart="${executable}" web serve --port 49271 --no-open`);
+    expect(unit).toContain(
+      `ExecStart="${process.execPath}" "${executable}" web serve --port 49271 --no-open`,
+    );
+    expect(statSync(executable).mode & 0o111).toBe(0);
+    expect(spawnSync(process.execPath, [executable], { encoding: 'utf8' }).status).toBe(0);
+    expect(JSON.parse(metadata)).toMatchObject({ runtime: process.execPath, script: executable });
     expect(unit).toContain('Restart=on-failure');
     expect(unit).not.toMatch(/#bootstrap|device|secret/i);
     expect(metadata).not.toMatch(/secret|credential|cookie/i);
@@ -53,6 +59,7 @@ describe('native supervised web service', () => {
     await manager.install(executable, 49_271, '/tmp/a&b.yaml');
     const plist = readFileSync(manager.definitionPath, 'utf8');
     expect(plist).toContain('ours fleet &amp; safe');
+    expect(plist).toContain(process.execPath);
     expect(plist).toContain('/tmp/a&amp;b.yaml');
     expect(plist).not.toMatch(/#bootstrap|device|secret/i);
     await manager.start();
@@ -65,10 +72,10 @@ describe('native supervised web service', () => {
   });
 
   it('quotes template arguments without shell interpolation', () => {
-    const unit = systemdUnit('/tmp/a";%n', 49_271, '/tmp/$(touch nope)');
+    const unit = systemdUnit('/runtime/node', '/tmp/a";%n', 49_271, '/tmp/$(touch nope)');
     expect(unit).toContain('/tmp/a\\";%%n');
     expect(unit).toContain('"/tmp/$(touch nope)"');
-    const plist = launchdPlist('/tmp/a<&', 49_271, '/tmp/"config"');
+    const plist = launchdPlist('/runtime/node', '/tmp/a<&', 49_271, '/tmp/"config"');
     expect(plist).toContain('/tmp/a&lt;&amp;');
     expect(plist).toContain('/tmp/&quot;config&quot;');
   });
