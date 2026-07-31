@@ -98,10 +98,14 @@ jobs:
           cache: npm
           registry-url: https://registry.npmjs.org
       - run: npm ci
+      # Gates already ran the full suite against the shipping source. The release
+      # commit changes versions only, so build its artifacts here without letting
+      # npm publish invoke prepublishOnly and rerun the entire suite flakily.
+      - run: npm run build
       - name: Publish @ours.network/fleet
         run: |
           bash .github/workflows/scripts/publish-guard.sh stable package.json latest
-          npm publish --access public
+          npm publish --access public --ignore-scripts
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
       - name: Publish @ours.network/fleet-claude-code
