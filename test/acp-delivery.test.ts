@@ -60,24 +60,45 @@ describe('AcpSession live delivery', () => {
     expect(requests).toEqual(['session/prompt']);
   });
 
-  it('cancels first, then starts interrupting delivery as a normal prompt', async () => {
+  it('cancels first, then acknowledges interrupting delivery when its turn starts', async () => {
     const calls: string[] = [];
-    let releaseActive!: () => void;
-    const active = new Promise<void>(resolve => { releaseActive = resolve; });
     const session = fakeSession({
       notify: async method => {
         calls.push(method);
-        releaseActive();
       },
       request: async method => {
         calls.push(method);
-        return { stopReason: 'end_turn' };
+        return { outcome: 'startedNewTurn' };
       },
-    }, { promptTail: active });
+    });
 
-    const result = await session.submitPrompt('interrupting mail', { interrupt: true });
+    const result = await session.submitPrompt(
+      'interrupting mail', { interrupt: true, steer: true });
 
-    expect(result).toMatchObject({ accepted: true, outcome: 'completed' });
-    expect(calls).toEqual(['session/cancel', 'session/prompt']);
+    expect(result).toMatchObject({
+      accepted: true, outcome: 'inconclusive', detail: 'startedNewTurn',
+    });
+    expect(calls).toEqual(['session/cancel', '_session/steering']);
+  });
+
+  it('can deliver another interrupt while the preceding wake turn is still running', async () => {
+    const calls: string[] = [];
+    const session = fakeSession({
+      notify: async method => { calls.push(method); },
+      request: async method => {
+        calls.push(method);
+        return { outcome: 'startedNewTurn' };
+      },
+    });
+
+    const first = await session.submitPrompt('first wake', { interrupt: true, steer: true });
+    const second = await session.submitPrompt('second wake', { interrupt: true, steer: true });
+
+    expect(first.detail).toBe('startedNewTurn');
+    expect(second.detail).toBe('startedNewTurn');
+    expect(calls).toEqual([
+      'session/cancel', '_session/steering',
+      'session/cancel', '_session/steering',
+    ]);
   });
 });

@@ -228,9 +228,11 @@ describe('AcpSession', () => {
     const active = session.submitPrompt('permission');
     for (let i = 0; i < 20 && session.snapshot().readiness !== 'awaiting_permission'; i++)
       await new Promise(resolve => setTimeout(resolve, 10));
-    const delivered = session.submitPrompt('wake', { interrupt: true });
+    const delivered = session.submitPrompt('wake', { interrupt: true, steer: true });
     expect((await active).outcome).toBe('cancelled');
-    expect(await delivered).toMatchObject({ accepted: true, outcome: 'completed' });
+    expect(await delivered).toMatchObject({
+      accepted: true, outcome: 'inconclusive', detail: 'startedNewTurn',
+    });
     session.setControllerAttached(false);
     await session.close();
   });

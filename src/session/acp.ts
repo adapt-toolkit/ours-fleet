@@ -155,7 +155,11 @@ export class AcpSession implements SessionHandle {
     if (!this.sessionId || !this.isAlive())
       throw new SessionControlError('offline', this.lastError ?? 'ACP session is offline');
     if (options.interrupt) await this.interrupt();
-    else if (options.steer && this.steeringSupported) {
+    // Interrupting delivery must still use steering when supported. With no
+    // live turn, the extension starts one and acknowledges `startedNewTurn`
+    // immediately; a normal session/prompt would keep the monitor blocked until
+    // the entire wake-triggered turn terminated.
+    if (options.steer && this.steeringSupported) {
       const promptId = randomUUID();
       return { promptId, queuedBehind: 0, completion: this.steerPrompt(text) };
     }
