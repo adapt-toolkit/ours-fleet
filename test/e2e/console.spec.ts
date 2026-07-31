@@ -7,13 +7,25 @@ test('bootstrap, inventory, navigation, send, create, and security boundaries', 
   await expect(page).toHaveURL('http://127.0.0.1:49371/');
   await expect(page.getByText('Alpha', { exact: true }).first()).toBeVisible();
   await expect(page.getByText('Terminal', { exact: true }).first()).toBeVisible();
+  await expect(page.getByText('Dormant', { exact: true })).toHaveCount(0);
+  await expect(page.getByRole('button', { name: 'Needs attention 0' })).toBeVisible();
+  await expect(page.getByRole('button', { name: 'Show inactive (1)' })).toBeVisible();
   await expect(page.getByText('live · idle').first()).toBeVisible();
   await expect(page.getByText(/service inactive · authoritative/).first()).toBeVisible();
   await expect(page.getByLabel('Fleet status meanings')).toContainText('Busy active turn or permission');
   await expect(page.getByLabel('Fleet status meanings')).toContainText(
-    'Needs attention includes attention, unknown, and offline roles.',
+    'Needs attention includes active attention and unknown roles. Inactive roles are shown separately.',
   );
   await expect(page.locator('.status-chip.ready').first()).toHaveText(/Ready/);
+  await page.getByRole('button', { name: 'Show inactive (1)' }).click();
+  await expect(page.getByText('Dormant', { exact: true })).toBeVisible();
+  await expect(page.getByRole('button', { name: /Inactive Dormant/ })).toBeVisible();
+  await page.getByRole('button', { name: /Inactive Dormant/ }).click();
+  await expect(page.getByText('Inactive — start is the only applicable lifecycle action.')).toBeVisible();
+  await expect(page.getByRole('button', { name: 'Start' })).toBeVisible();
+  await expect(page.getByRole('button', { name: 'Stop' })).toHaveCount(0);
+  await expect(page.getByRole('button', { name: 'Restart & resume' })).toHaveCount(0);
+  await page.getByRole('button', { name: 'All roles' }).click();
   const manifest = await request.get('/manifest.webmanifest');
   expect(manifest.status()).toBe(200);
   expect(manifest.headers()['content-type']).toMatch(/manifest|json/);

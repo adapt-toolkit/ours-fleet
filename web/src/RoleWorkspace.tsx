@@ -1,5 +1,6 @@
 import { lazy, Suspense, useCallback, useEffect, useState } from 'react';
 import { api, idempotencyKey } from './api';
+import { isInactive } from './fleet-presentation';
 
 const TerminalView = lazy(() => import('./TerminalView').then(module => ({ default: module.TerminalView })));
 
@@ -21,6 +22,7 @@ export function RoleWorkspace({ roleId, onBack }: { roleId: string; onBack(): vo
   }, [roleId, tab]);
   if (!detail) return <div className="content">Loading role evidence…</div>;
   const { role, status, capabilities } = detail;
+  const inactive = isInactive({ role, status });
   const action = async (name: string) => {
     const confirmation = name === 'restart_fresh' ? prompt(`Type ${roleId} to clear context`) ?? '' : undefined;
     const receipt: any = await api.post(`/api/v1/roles/${roleId}/actions`, {
@@ -37,7 +39,7 @@ export function RoleWorkspace({ roleId, onBack }: { roleId: string; onBack(): vo
   };
   return <div className="workspace">
     <button className="back" onClick={onBack}>← Fleet</button>
-    <div className="workspace-summary"><span className={`hero-state ${status.overall}`}><i />{status.overall}</span>
+    <div className="workspace-summary"><span className={`hero-state ${inactive ? 'offline' : status.overall}`}><i />{inactive ? 'inactive' : status.overall}</span>
       <span>{role.lifetime}</span><span>{role.config?.harness}</span><span>{status.session.backend}</span>
       <small>observed {new Date(status.observedAt).toLocaleTimeString()}</small></div>
     <div className="tabs" role="tablist">
@@ -53,9 +55,10 @@ export function RoleWorkspace({ roleId, onBack }: { roleId: string; onBack(): vo
       <Evidence title="Restart circuit" state={status.restart.circuit} rows={{ failures: status.restart.consecutiveImmediateFailures, reason: status.restart.lastReason }} />
       <div className="panel wide"><h2>Safe actions</h2><div className="actions">
         {capabilities.lifecycle.start && <button onClick={() => void action('start')}>Start</button>}
-        {capabilities.lifecycle.stop && <button onClick={() => void action('stop')}>Stop</button>}
-        {capabilities.lifecycle.restartResume && <button onClick={() => void action('restart_resume')}>Restart & resume</button>}
-        {capabilities.lifecycle.restartFresh && <button className="danger" onClick={() => void action('restart_fresh')}>Fresh restart…</button>}
+        {!inactive && capabilities.lifecycle.stop && <button onClick={() => void action('stop')}>Stop</button>}
+        {!inactive && capabilities.lifecycle.restartResume && <button onClick={() => void action('restart_resume')}>Restart & resume</button>}
+        {!inactive && capabilities.lifecycle.restartFresh && <button className="danger" onClick={() => void action('restart_fresh')}>Fresh restart…</button>}
+        {inactive && <span className="muted">Inactive — start is the only applicable lifecycle action.</span>}
       </div></div>
     </div>}
     {tab === 'activity' && <div className="activity-layout"><div className="activity panel">

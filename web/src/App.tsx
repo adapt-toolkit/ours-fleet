@@ -2,6 +2,7 @@ import { useCallback, useEffect, useMemo, useState } from 'react';
 import { api, idempotencyKey } from './api';
 import { CreateRole } from './CreateRole';
 import { RoleWorkspace } from './RoleWorkspace';
+import { isInactive, needsAttention, presentFleet } from './fleet-presentation';
 
 type FleetItem = {
   role: {
@@ -20,14 +21,13 @@ type FleetItem = {
   capabilities: Record<string, unknown>;
 };
 
-const attentionStates = ['attention', 'offline', 'unknown'];
-
 export function App() {
   const [ready, setReady] = useState(false);
   const [error, setError] = useState('');
   const [items, setItems] = useState<FleetItem[]>([]);
   const [selected, setSelected] = useState('');
   const [filter, setFilter] = useState('');
+  const [showInactive, setShowInactive] = useState(false);
   const [view, setView] = useState<'fleet' | 'attention' | 'audit'>('fleet');
   const [creating, setCreating] = useState(false);
   const [installPrompt, setInstallPrompt] = useState<InstallPromptEvent>();
@@ -82,14 +82,11 @@ export function App() {
     return () => window.removeEventListener('beforeinstallprompt', capture);
   }, []);
 
-  const shown = useMemo(() => items.filter(item => {
-    const text = `${item.role.id} ${item.role.config?.mission ?? ''} ${item.status.overall}`.toLowerCase();
-    return text.includes(filter.toLowerCase())
-      && (view !== 'attention' || attentionStates.includes(item.status.overall));
-  }).sort((a, b) => {
-    const attention = (item: FleetItem) => attentionStates.includes(item.status.overall) ? 0 : 1;
-    return attention(a) - attention(b) || a.role.id.localeCompare(b.role.id);
-  }), [filter, items, view]);
+  const inactiveCount = items.filter(isInactive).length;
+  const attentionCount = items.filter(needsAttention).length;
+  const shown = useMemo(() => presentFleet(items, {
+    filter, showInactive: view === 'fleet' && showInactive, attentionOnly: view === 'attention',
+  }), [filter, items, showInactive, view]);
 
   if (!ready) return <main className="auth-screen">
     <div className="brand-mark">O</div>
@@ -107,7 +104,7 @@ export function App() {
           }}>
             <span aria-hidden="true">{name === 'fleet' ? '◫' : name === 'attention' ? '△' : '≡'}</span>
             {name === 'fleet' ? 'All roles' : name === 'attention' ? 'Needs attention' : 'Audit trail'}
-            {name === 'attention' && <b>{items.filter(item => attentionStates.includes(item.status.overall)).length}</b>}
+            {name === 'attention' && <b>{attentionCount}</b>}
           </button>)}
       </nav>
       <div className="sidebar-foot"><i className={connection} /> {connection}
@@ -140,20 +137,24 @@ export function App() {
               <span className="busy"><b>Busy</b> active turn or permission</span>
               <span className="attention"><b>Attention</b> warning or unknown evidence</span>
               <span className="offline"><b>Offline</b> authoritative session stop</span>
-              <small>Needs attention includes attention, unknown, and offline roles.</small>
+              <small>Needs attention includes active attention and unknown roles. Inactive roles are shown separately.</small>
             </div>
             <div className="toolbar">
               <input aria-label="Filter roles" placeholder="Filter roles, missions, state…" value={filter}
                 onChange={event => setFilter(event.target.value)} />
-              <span>{shown.length} roles</span>
+              <div><span>{shown.length} roles</span>{view === 'fleet' && inactiveCount > 0 &&
+                <button className="secondary" aria-pressed={showInactive}
+                  onClick={() => setShowInactive(value => !value)}>
+                  {showInactive ? 'Hide inactive' : 'Show inactive'} ({inactiveCount})
+                </button>}</div>
             </div>
             <div className="role-table">
               <div className="role-row heading">
                 <span>Role</span><span>Runtime</span><span>Evidence</span><span>Monitor</span><span>Observed</span>
               </div>
-              {shown.map(item => <button className="role-row" key={item.role.id} onClick={() => setSelected(item.role.id)}>
-                <span className="role-name"><span className={`status-chip ${item.status.overall}`}>
-                  <i aria-hidden="true" />{statusLabel(item.status.overall)}</span>
+              {shown.map(item => <button className={`role-row${isInactive(item) ? ' inactive' : ''}`} key={item.role.id} onClick={() => setSelected(item.role.id)}>
+                <span className="role-name"><span className={`status-chip ${isInactive(item) ? 'offline' : item.status.overall}`}>
+                  <i aria-hidden="true" />{isInactive(item) ? 'Inactive' : statusLabel(item.status.overall)}</span>
                   <span><strong>{item.role.id}</strong><small className="mission-summary"
                     title={item.role.config?.mission}>{item.role.config?.mission || 'No mission summary'}</small></span>
                   <em>{item.role.lifetime}</em></span>

@@ -14,6 +14,8 @@ export function roleCapabilities(
   const acp = backend === 'acp';
   const tmux = backend === 'tmux';
   const protocolVersion = context.controlProtocolVersion ?? 1;
+  const inactive = status.overall === 'offline'
+    || (!online && status.supervisor.liveness === 'stopped');
   const terminalAvailable = tmux && online && context.terminalPtyAvailable === true;
   const terminalReason = terminalAvailable ? undefined
     : !tmux ? 'wrong_backend'
@@ -35,9 +37,9 @@ export function roleCapabilities(
     },
     lifecycle: {
       start: role.lifetime === 'permanent' && status.supervisor.liveness !== 'running',
-      stop: role.lifetime === 'permanent' && status.supervisor.liveness !== 'stopped',
-      restartResume: role.lifetime === 'permanent',
-      restartFresh: role.lifetime === 'permanent',
+      stop: role.lifetime === 'permanent' && !inactive && status.supervisor.liveness !== 'stopped',
+      restartResume: role.lifetime === 'permanent' && !inactive,
+      restartFresh: role.lifetime === 'permanent' && !inactive,
       remove: false,
     },
     logs: { tail: true, follow: status.supervisor.backend !== 'none', cursor: status.supervisor.backend !== 'none' },

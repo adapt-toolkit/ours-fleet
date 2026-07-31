@@ -3,6 +3,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import { FleetQueryService } from '../../src/application/fleet-query-service.js';
+import { roleCapabilities } from '../../src/application/capabilities.js';
 import type { Problem, RoleRecord } from '../../src/application/types.js';
 import type { SessionReadiness } from '../../src/session/types.js';
 import type { SupervisorBackend } from '../../src/supervisor/types.js';
@@ -66,5 +67,22 @@ describe('authoritative session liveness precedence', () => {
       code: 'fixture_error', severity: 'error', detail: 'operator attention required',
     }]);
     expect(result.overall).toBe('attention');
+  });
+
+  it('offers only start lifecycle control for an inactive permanent role', async () => {
+    const stateDir = mkdtempSync(join(tmpdir(), 'fleet-query-offline-acp-'));
+    const query = new FleetQueryService({
+      repository: { stateDir: () => stateDir } as never, supervisor,
+      control: async () => ({
+        ok: true, result: { backend: 'acp', alive: false, readiness: 'failed' },
+      }) as never,
+    });
+    const stopped = await query.status(role());
+    // Attention evidence retains precedence, but stopped + non-online is still
+    // inactive for topology and lifecycle-control purposes.
+    expect(stopped.overall).toBe('attention');
+    expect(roleCapabilities(role(), stopped).lifecycle).toMatchObject({
+      start: true, stop: false, restartResume: false, restartFresh: false,
+    });
   });
 });

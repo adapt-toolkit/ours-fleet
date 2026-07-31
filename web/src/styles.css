@@ -47,6 +47,9 @@ button.secondary:hover, .actions button:hover { border-color: #526064; }
 .content, .workspace { padding: 28px 36px 60px; }
 .toolbar { display: flex; align-items: center; justify-content: space-between; margin-bottom: 16px; color: var(--muted); font-size: 12px; }
 .toolbar input { width: 340px; padding: 10px 13px; color: white; background: #101516; border: 1px solid var(--line); border-radius: 8px; }
+.toolbar > div { display: flex; align-items: center; gap: 10px; }
+.toolbar button { padding: 7px 10px; }
+.role-row.inactive { opacity: .72; }
 .status-guide { display: flex; flex-wrap: wrap; gap: 7px; align-items: center; margin-bottom: 15px; color: var(--muted); font-size: 11px; }
 .status-guide > span, .status-chip { display: inline-flex; align-items: center; gap: 5px; border: 1px solid #30393b; border-radius: 12px; padding: 3px 7px; white-space: nowrap; }
 .status-guide b { color: white; font-size: 11px; }

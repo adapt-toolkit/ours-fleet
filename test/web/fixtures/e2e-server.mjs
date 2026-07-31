@@ -28,6 +28,10 @@ const terminalRole = {
   config: { ...role.config, name: 'Terminal', identity: 'Terminal', session: 'tmux',
     mission: 'Verify ANSI and Unicode terminal fidelity', model: undefined },
 };
+const inactiveRole = {
+  ...role, id: 'Dormant',
+  config: { ...role.config, name: 'Dormant', identity: 'Dormant', mission: 'Stopped historical role' },
+};
 const capabilities = {
   protocolVersion: 2, inventory: true, status: true,
   output: { recent: true, stream: true, structured: true, replayCursor: true },
@@ -42,6 +46,17 @@ const terminalCapabilities = {
   terminal: { available: true, multiViewer: true, writerLease: true },
   input: { text: false, rawKeys: true, interrupt: false, steering: false },
 };
+const inactiveCapabilities = {
+  ...capabilities,
+  lifecycle: { start: true, stop: true, restartResume: true, restartFresh: true, remove: false },
+};
+const inactiveStatus = {
+  ...status, roleId: 'Dormant', overall: 'offline', supervisor: {
+    backend: 'systemd', liveness: 'stopped', detail: 'inactive (dead)',
+  }, session: {
+    backend: 'acp', reachability: 'offline', readiness: 'failed', evidence: 'authoritative',
+  },
+};
 const actions = new Map();
 const services = {
   query: {
@@ -49,18 +64,22 @@ const services = {
       { role, status: { ...status, observedAt: new Date().toISOString() }, capabilities },
       { role: terminalRole, status: { ...status, roleId: 'Terminal', observedAt: new Date().toISOString(),
         session: { ...status.session, backend: 'tmux' } }, capabilities: terminalCapabilities },
+      { role: inactiveRole, status: { ...inactiveStatus, observedAt: new Date().toISOString() },
+        capabilities: inactiveCapabilities },
     ]; },
     async detail(id) {
       const terminal = id === 'Terminal';
+      const inactive = id === 'Dormant';
       return {
-        role: terminal ? terminalRole : role,
-        status: { ...status, roleId: terminal ? 'Terminal' : 'Alpha', observedAt: new Date().toISOString(),
-          session: terminal ? { ...status.session, backend: 'tmux' } : status.session },
-        capabilities: terminal ? terminalCapabilities : capabilities,
+        role: inactive ? inactiveRole : terminal ? terminalRole : role,
+        status: inactive ? { ...inactiveStatus, observedAt: new Date().toISOString() }
+          : { ...status, roleId: terminal ? 'Terminal' : 'Alpha', observedAt: new Date().toISOString(),
+            session: terminal ? { ...status.session, backend: 'tmux' } : status.session },
+        capabilities: inactive ? inactiveCapabilities : terminal ? terminalCapabilities : capabilities,
       };
     },
   },
-  repository: { async get(id) { return id === 'Terminal' ? terminalRole : role; } },
+  repository: { async get(id) { return id === 'Dormant' ? inactiveRole : id === 'Terminal' ? terminalRole : role; } },
   async session() {
     return {
       async describe() { return { backend: 'acp', protocolVersion: 2, features: [] }; },
