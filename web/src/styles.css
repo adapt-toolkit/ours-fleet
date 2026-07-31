@@ -56,6 +56,7 @@ button.role-row:hover { background: #141a1b; }
 .role-row strong { font-size: 13px; text-transform: capitalize; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .role-row small { color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .role-name { position: relative; display: grid !important; grid-template-columns: 13px 1fr auto; align-items: center; }
+.role-name .mission-summary { display: -webkit-box; max-height: 2.5em; line-height: 1.25; overflow: hidden; overflow-wrap: anywhere; white-space: normal; -webkit-box-orient: vertical; -webkit-line-clamp: 2; }
 .role-name .state { width: 7px; height: 7px; border-radius: 50%; background: #667174; }
 .state.ready, .hero-state.ready i { background: var(--mint); box-shadow: 0 0 7px #69dba0; }
 .state.busy, .hero-state.busy i { background: #71b7ff; }

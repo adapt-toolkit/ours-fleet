@@ -2,7 +2,7 @@ import { buildWebServer } from '../../../dist/web/server.js';
 
 const status = {
   roleId: 'Alpha', observedAt: new Date().toISOString(), overall: 'ready',
-  supervisor: { backend: 'none', liveness: 'running', detail: 'isolated fixture supervisor' },
+  supervisor: { backend: 'systemd', liveness: 'stopped', detail: 'inactive' },
   session: { backend: 'acp', reachability: 'online', readiness: 'idle', evidence: 'authoritative' },
   restart: { circuit: 'closed', consecutiveImmediateFailures: 0, nextDelayMs: 0 },
   monitor: { mode: 'fleet', health: 'armed', stale: false },
@@ -13,7 +13,7 @@ const role = {
   configuredBackend: 'acp', detectedBackend: 'acp', compatibility: { compatible: true },
   problems: [], config: {
     name: 'Alpha', harness: 'codex', session: 'acp', identity: 'Alpha',
-    mission: 'Validate the secure console', model: 'fixture-model',
+    mission: 'Validate the secure console with an intentionally long mission that wraps across compact role-list lines without making the table materially taller', model: 'fixture-model',
     permissions: { approval: 'ask', filesystem: 'workspace', unattended: 'deny' },
   },
 };

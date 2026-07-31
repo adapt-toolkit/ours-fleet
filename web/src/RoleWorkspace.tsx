@@ -75,10 +75,20 @@ export function RoleWorkspace({ roleId, onBack }: { roleId: string; onBack(): vo
       <TerminalView roleId={roleId} />
     </Suspense>}
     {tab === 'logs' && <div className="panel log-panel"><h2>Redacted logs</h2><p className="muted">Raw export is disabled.</p>
-      {logs?.records?.map((record: any, index: number) => <pre key={index}>{record.at ? `${record.at} ` : ''}{record.text}{record.redactionApplied ? '  [redacted]' : ''}</pre>)}</div>}
+      {logs?.records?.map((record: any, index: number) => <LogLine record={record} key={index} />)}</div>}
     {tab === 'diagnostics' && <div className="panel"><h2>Capabilities & problems</h2><pre>{JSON.stringify(capabilities, null, 2)}</pre>
       {[...role.problems, ...status.problems].map((problem: any, index: number) => <p className="warning" key={index}>{problem.detail}</p>)}</div>}
   </div>;
+}
+
+function LogLine({ record }: { record: any }) {
+  if (record.compacted?.kind === 'monitor_stream_hiccup') return <pre>
+    {record.text} ({record.compacted.reason}) — {record.compacted.count} consecutive occurrences
+    {record.compacted.firstAt ? ` · first ${record.compacted.firstAt}` : ''}
+    {record.compacted.lastAt ? ` · last ${record.compacted.lastAt}` : ''}
+    {record.redactionApplied ? '  [redacted]' : ''}
+  </pre>;
+  return <pre>{record.at ? `${record.at} ` : ''}{record.text}{record.redactionApplied ? '  [redacted]' : ''}</pre>;
 }
 
 function Evidence({ title, state, rows }: { title: string; state: string; rows: Record<string, unknown> }) {

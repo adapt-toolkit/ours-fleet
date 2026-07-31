@@ -12,7 +12,7 @@ type FleetItem = {
   status: {
     overall: string; observedAt: string;
     supervisor: { liveness: string };
-    session: { backend: string; readiness: string; evidence: string; pendingPermissionId?: string };
+    session: { backend: string; reachability: string; readiness: string; evidence: string; pendingPermissionId?: string };
     monitor: { health: string };
     restart: { circuit: string };
     problems: Array<{ detail: string }>;
@@ -128,10 +128,12 @@ export function App() {
               </div>
               {shown.map(item => <button className="role-row" key={item.role.id} onClick={() => setSelected(item.role.id)}>
                 <span className="role-name"><i className={`state ${item.status.overall}`} />
-                  <span><strong>{item.role.id}</strong><small>{item.role.config?.mission || 'No mission summary'}</small></span>
+                  <span><strong>{item.role.id}</strong><small className="mission-summary"
+                    title={item.role.config?.mission}>{item.role.config?.mission || 'No mission summary'}</small></span>
                   <em>{item.role.lifetime}</em></span>
                 <span><strong>{item.role.config?.harness ?? 'unknown'}</strong><small>{item.status.session.backend} · {item.role.config?.model ?? 'default model'}</small></span>
-                <span><strong>{item.status.overall}</strong><small>{item.status.supervisor.liveness} · {item.status.session.readiness} ({item.status.session.evidence})</small></span>
+                <span><strong>{sessionLabel(item.status.session)}</strong>
+                  <small>{serviceLabel(item.status.supervisor.liveness)} · {item.status.session.evidence}</small></span>
                 <span><strong>{item.status.monitor.health}</strong><small>{item.status.restart.circuit === 'open' ? 'circuit open' : 'circuit closed'}</small></span>
                 <span><strong>{new Date(item.status.observedAt).toLocaleTimeString()}</strong><small>open →</small></span>
               </button>)}
@@ -144,6 +146,17 @@ export function App() {
       if (path) history.replaceState(null, '', path);
     }} />}
   </div>;
+}
+
+function sessionLabel(session: FleetItem['status']['session']): string {
+  if (session.reachability === 'online') return `live · ${session.readiness}`;
+  if (session.reachability === 'offline') return 'offline';
+  return 'unknown';
+}
+
+function serviceLabel(liveness: string): string {
+  return liveness === 'running' ? 'service active'
+    : liveness === 'stopped' ? 'service inactive' : 'service unknown';
 }
 
 function AuditView() {

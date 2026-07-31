@@ -59,10 +59,16 @@ function sessionOverall(
   if (restart.circuit === 'open' || monitor.health === 'failed' || monitor.health === 'degraded'
       || isolation.degraded || problems.some(problem => problem.severity === 'error')
       || session.readiness === 'failed') return 'attention';
-  if (session.readiness === 'running' || session.readiness === 'awaiting_permission') return 'busy';
-  if (supervisor.liveness === 'stopped' && session.reachability === 'offline') return 'offline';
-  if (supervisor.liveness === 'running' && session.reachability === 'online'
-      && session.readiness === 'idle') return 'ready';
+  // A reachable ACP/tmux session is the user's live interaction surface. Its
+  // evidence remains authoritative even when a service manager no longer owns
+  // the process (for example, a detached ACP session with an inactive unit).
+  if (session.reachability === 'online'
+      && (session.readiness === 'running' || session.readiness === 'awaiting_permission'))
+    return 'busy';
+  if (session.reachability === 'online' && session.readiness === 'idle') return 'ready';
+  if (session.reachability === 'offline'
+      && (session.evidence === 'authoritative' || supervisor.liveness === 'stopped'))
+    return 'offline';
   return 'unknown';
 }
 
@@ -118,6 +124,12 @@ export class FleetQueryService {
         code: 'supervisor_session_disagreement', severity: 'warning',
         detail: 'supervisor is live but the session is not reachable',
       });
+    if (role.lifetime === 'permanent' && live.state === 'stopped'
+        && session.reachability === 'online')
+      problems.push({
+        code: 'session_supervisor_disagreement', severity: 'warning',
+        detail: 'session is live while its permanent supervisor service is inactive',
+      });
     const supervisor = {
       backend: this.options.supervisor.id, liveness: live.state,
       nativeState: live.detail.split(/\s/)[0], detail: clean(live.detail),
@@ -153,11 +165,13 @@ export class FleetQueryService {
           pendingPermissionId: snapshot.pendingPermissionId,
         };
       } catch (error) {
-        const unavailable = error instanceof SessionControlError && error.kind === 'control-unavailable';
+        const failure = error instanceof SessionControlError ? error.kind : 'backend';
+        const offline = failure === 'offline';
         return {
           backend: 'acp',
-          reachability: supervisor === 'stopped' ? 'offline' : unavailable ? 'unavailable' : 'unknown',
-          readiness: supervisor === 'stopped' ? 'failed' : 'unknown',
+          reachability: offline ? 'offline'
+            : failure === 'control-unavailable' ? 'unavailable' : 'unknown',
+          readiness: offline ? 'failed' : 'unknown',
           evidence: 'authoritative', lastError: clean((error as Error).message),
         };
       }

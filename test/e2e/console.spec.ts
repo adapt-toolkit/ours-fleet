@@ -6,6 +6,15 @@ test('bootstrap, inventory, navigation, send, create, and security boundaries', 
   await expect(page.getByRole('heading', { name: 'Your fleet' })).toBeVisible();
   await expect(page).toHaveURL('http://127.0.0.1:49371/');
   await expect(page.getByText('Alpha', { exact: true }).first()).toBeVisible();
+  await expect(page.getByText('live · idle')).toBeVisible();
+  await expect(page.getByText(/service inactive · authoritative/)).toBeVisible();
+  const mission = page.locator('.mission-summary').first();
+  await expect(mission).toHaveAttribute('title', /intentionally long mission/);
+  expect(await mission.evaluate(element => ({
+    lineClamp: getComputedStyle(element).webkitLineClamp,
+    overflow: getComputedStyle(element).overflow,
+    overflowWrap: getComputedStyle(element).overflowWrap,
+  }))).toEqual({ lineClamp: '2', overflow: 'hidden', overflowWrap: 'anywhere' });
   await page.getByLabel('Filter roles').fill('validate');
   await expect(page.getByText('Validate the secure console')).toBeVisible();
   await page.getByText('Alpha', { exact: true }).first().click();

@@ -29,6 +29,50 @@ export function redactLogLine(input: string, patterns: RegExp[] = []): {
 
 export interface RoleLogSource { tail(limit: number, cursor?: string): Promise<LogPage> }
 
+const MONITOR_STREAM_HICCUP = /^monitor degraded:\s*stream hiccup\s*\((.+)\)\s*$/;
+
+/**
+ * Presentation-only compaction for noisy historical monitor transport hiccups.
+ * Exact reason and adjacency are part of the key: a different or intervening
+ * record always starts a new run. Source journal/file records are untouched.
+ */
+export function compactMonitorStreamHiccups(records: LogRecord[]): LogRecord[] {
+  const result: LogRecord[] = [];
+  for (let index = 0; index < records.length;) {
+    const first = records[index];
+    const match = MONITOR_STREAM_HICCUP.exec(first.text);
+    if (!match) {
+      result.push(first);
+      index++;
+      continue;
+    }
+    const reason = match[1];
+    let end = index + 1;
+    while (end < records.length) {
+      const candidate = MONITOR_STREAM_HICCUP.exec(records[end].text);
+      if (!candidate || candidate[1] !== reason) break;
+      end++;
+    }
+    if (end - index === 1) {
+      result.push(first);
+    } else {
+      const last = records[end - 1];
+      result.push({
+        at: first.at,
+        text: 'monitor degraded: stream hiccup',
+        cursor: last.cursor,
+        redactionApplied: records.slice(index, end).some(record => record.redactionApplied),
+        compacted: {
+          kind: 'monitor_stream_hiccup', reason, count: end - index,
+          firstAt: first.at, lastAt: last.at,
+        },
+      });
+    }
+    index = end;
+  }
+  return result;
+}
+
 export class StructuredLogService {
   private readonly cursorKey = randomBytes(32);
   constructor(
@@ -55,7 +99,7 @@ export class StructuredLogService {
     if (result.code !== 0)
       throw new FleetError('backend_failure', `log query failed with exit ${result.code}`);
     const lines = result.stdout.split(/\r?\n/).filter(Boolean).slice(-limit);
-    const records = lines.map((line, index): LogRecord => {
+    const parsed = lines.map((line, index): LogRecord => {
       let text = line;
       let at: string | undefined;
       if (this.backend.id === 'systemd') {
@@ -74,6 +118,7 @@ export class StructuredLogService {
         cursor: this.cursor(`${roleId}:${index}:${line.length}`),
       };
     });
+    const records = compactMonitorStreamHiccups(parsed);
     return {
       records, nextCursor: records.at(-1)?.cursor,
       truncated: lines.length >= limit || Boolean(cursor && !this.validCursor(cursor)),

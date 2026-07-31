@@ -122,6 +122,13 @@ export interface LogRecord {
   text: string;
   cursor?: string;
   redactionApplied: boolean;
+  compacted?: {
+    kind: 'monitor_stream_hiccup';
+    reason: string;
+    count: number;
+    firstAt?: string;
+    lastAt?: string;
+  };
 }
 
 export interface LogPage { records: LogRecord[]; nextCursor?: string; truncated: boolean }
