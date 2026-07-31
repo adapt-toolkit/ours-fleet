@@ -57,6 +57,9 @@ export interface SpawnOpts {
   /** Inline profile values for trusted typed callers such as the local web service. */
   bio?: string;
   persona?: string;
+  /** Internal, non-sensitive provenance correlation for typed presentation layers. */
+  surface?: 'cli' | 'web';
+  creationActionId?: string;
   /**
    * Path to a file holding exactly the existing `isolation:` mapping — the same
    * schema fleet.yaml uses, not a second policy language. The ONE new operator
@@ -343,6 +346,7 @@ export async function spawnPermanent(
       const provenance = buildProvenance({
         role: o.name, lifetime: 'permanent', fleetVersion: VERSION,
         settings: provenanceSettings(o, cfg.defaults),
+        surface: o.surface, creationActionId: o.creationActionId,
       });
       mkdirSync(agentDir(o.name), { recursive: true });
       writeProvenance(agentDir(o.name), provenance);
@@ -447,6 +451,7 @@ async function spawnTempInner(
   const provenance = buildProvenance({
     role: o.name, lifetime: 'temporary', fleetVersion: VERSION,
     settings: provenanceSettings(o, cfg.defaults),
+    surface: o.surface, creationActionId: o.creationActionId,
   });
   writeProvenance(dir, provenance);
   lastProvenance = provenance;

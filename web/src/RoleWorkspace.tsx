@@ -1,6 +1,7 @@
-import { useCallback, useEffect, useState } from 'react';
+import { lazy, Suspense, useCallback, useEffect, useState } from 'react';
 import { api, idempotencyKey } from './api';
-import { TerminalView } from './TerminalView';
+
+const TerminalView = lazy(() => import('./TerminalView').then(module => ({ default: module.TerminalView })));
 
 export function RoleWorkspace({ roleId, onBack }: { roleId: string; onBack(): void }) {
   const [detail, setDetail] = useState<any>();
@@ -70,7 +71,9 @@ export function RoleWorkspace({ roleId, onBack }: { roleId: string; onBack(): vo
         <button className="primary" disabled={!text.trim()} onClick={() => void send()}>Send</button>
         {capabilities.input.interrupt && <button className="danger" onClick={() => confirm('Interrupt the active ACP turn?') && void api.post(`/api/v1/roles/${roleId}/interrupt`, {})}>Interrupt turn</button>}
         <small>Acceptance is not completion. Timeouts remain uncertain.</small></div>}</div>}
-    {tab === 'terminal' && <TerminalView roleId={roleId} />}
+    {tab === 'terminal' && <Suspense fallback={<div className="panel">Loading terminal runtime…</div>}>
+      <TerminalView roleId={roleId} />
+    </Suspense>}
     {tab === 'logs' && <div className="panel log-panel"><h2>Redacted logs</h2><p className="muted">Raw export is disabled.</p>
       {logs?.records?.map((record: any, index: number) => <pre key={index}>{record.at ? `${record.at} ` : ''}{record.text}{record.redactionApplied ? '  [redacted]' : ''}</pre>)}</div>}
     {tab === 'diagnostics' && <div className="panel"><h2>Capabilities & problems</h2><pre>{JSON.stringify(capabilities, null, 2)}</pre>

@@ -317,6 +317,9 @@ export interface CreationProvenance {
   createdAt: string;
   lifetime: 'permanent' | 'temporary';
   role: string;
+  /** Additive correlation for non-CLI creation surfaces; never contains request data. */
+  surface?: 'cli' | 'web';
+  creationActionId?: string;
   /** Effective settings, each tagged with where its value came from. */
   settings: Record<string, ProvenanceEntry>;
 }
@@ -341,6 +344,8 @@ export function buildProvenance(o: {
   fleetVersion: string;
   now?: Date;
   settings: Record<string, ProvenanceEntry>;
+  surface?: 'cli' | 'web';
+  creationActionId?: string;
 }): CreationProvenance {
   return {
     version: 1,
@@ -349,6 +354,8 @@ export function buildProvenance(o: {
     createdAt: (o.now ?? new Date()).toISOString(),
     lifetime: o.lifetime,
     role: o.role,
+    surface: o.surface ?? 'cli',
+    creationActionId: o.creationActionId,
     settings: o.settings,
   };
 }

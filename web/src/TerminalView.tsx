@@ -25,6 +25,7 @@ export function TerminalView({ roleId }: { roleId: string }) {
           const message = JSON.parse(event.data);
           if (message.type === 'ready') setMode(message.mode);
           if (message.type === 'lease.granted') { leaseId = message.leaseId; setMode('controlling'); }
+          if (message.type === 'lease.released') { leaseId = ''; setMode('viewer'); }
           if (message.type === 'snapshot') { terminal.reset(); terminal.write(message.data); }
           if (message.type === 'resync.required') setWarning('Reconnecting from a fresh terminal snapshot…');
           if (message.type === 'error') setWarning(message.message ?? message.code);
@@ -38,6 +39,7 @@ export function TerminalView({ roleId }: { roleId: string }) {
     const data = terminal.onData(value => {
       const socket = socketRef.current;
       if (!leaseId || socket?.readyState !== WebSocket.OPEN) return;
+      if (value.length > 1_024 && !confirm(`Paste ${value.length} terminal characters? Terminal content is unredacted.`)) return;
       const bytes = new TextEncoder().encode(value);
       const frame = new Uint8Array(9 + bytes.length); frame[0] = 2; frame.set(bytes, 9);
       socket.send(frame);

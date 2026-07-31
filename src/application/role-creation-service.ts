@@ -72,6 +72,8 @@ export interface CreationAction {
   updatedAt: string;
   error?: ReturnType<FleetError['toJSON']>;
   openPath?: string;
+  /** Hash only; the browser's raw idempotency key is never persisted. */
+  idempotencyHash?: string;
 }
 
 export interface AtomicCreationIdentityProvider extends IdentityProvisioner, IdentityRegistry {
@@ -194,7 +196,7 @@ export class RoleCreationService {
     if (!capabilities.available)
       throw new FleetError('prerequisite_unavailable', capabilities.reasons.join('; '));
     const requestHash = hash(input);
-    const key = `${browserSession}:${idempotencyKey}`;
+    const key = hash(idempotencyKey);
     const existing = this.idempotency.get(key);
     if (existing) {
       if (existing.requestHash !== requestHash)
@@ -209,6 +211,7 @@ export class RoleCreationService {
       session: preview.effective.session, lifetime: preview.effective.lifetime,
       state: 'validating', stages: [{ stage: 'validating', at: now }],
       createdAt: now, updatedAt: now,
+      idempotencyHash: key,
     };
     this.idempotency.set(key, { requestHash, actionId: action.actionId });
     this.actions.set(action.actionId, action);
@@ -229,11 +232,11 @@ export class RoleCreationService {
       this.stage(action, 'writing_role');
       if (preview.effective.lifetime === 'permanent') {
         this.stage(action, 'registering_supervisor');
-        await spawnPermanent(this.spawnOptions(preview.request), this.options.ops, creation);
+        await spawnPermanent(this.spawnOptions(preview.request, action.actionId), this.options.ops, creation);
       } else {
         this.stage(action, 'starting_temp');
         await spawnTemp(
-          this.spawnOptions(preview.request), this.options.binPath,
+          this.spawnOptions(preview.request, action.actionId), this.options.binPath,
           this.options.tempLauncher, creation);
       }
       this.stage(action, 'launched', 'launch accepted; readiness not yet confirmed');
@@ -314,7 +317,7 @@ export class RoleCreationService {
     return canonicalPath;
   }
 
-  private spawnOptions(request: CreateRoleSessionRequest): SpawnOpts {
+  private spawnOptions(request: CreateRoleSessionRequest, creationActionId?: string): SpawnOpts {
     return {
       name: request.name, identity: request.identity, harness: request.harness,
       model: request.model, session: request.session, cwd: request.cwd,
@@ -322,6 +325,7 @@ export class RoleCreationService {
       approval: request.permissions.approval, filesystem: request.permissions.filesystem,
       unattended: request.permissions.unattended, bio: request.bio, persona: request.persona,
       configPath: this.options.configPath,
+      surface: creationActionId ? 'web' : undefined, creationActionId,
     };
   }
 
@@ -360,6 +364,10 @@ export class RoleCreationService {
             });
           }
           this.actions.set(action.actionId, action);
+          if (action.idempotencyHash)
+            this.idempotency.set(action.idempotencyHash, {
+              requestHash: action.requestHash, actionId: action.actionId,
+            });
         } catch { /* isolate corrupt journal entry */ }
       }
     } catch { /* no journal yet */ }

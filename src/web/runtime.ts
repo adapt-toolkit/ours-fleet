@@ -17,6 +17,8 @@ import { DaemonAtomicIdentityProvider } from '../infrastructure/daemon-identity.
 import { AuditSink } from './audit.js';
 import { FleetEventBus } from './events.js';
 import { buildWebServer, type WebServer } from './server.js';
+import { TerminalBridgeManager } from './terminal/bridge.js';
+import { acquireWebServerLock } from './lock.js';
 
 export interface StartWebOptions {
   configPath?: string;
@@ -35,6 +37,7 @@ export async function startWebConsole(options: StartWebOptions): Promise<Running
   const requestedPort = options.port ?? 49_271;
   if (!Number.isInteger(requestedPort) || requestedPort < 0 || requestedPort > 65_535)
     throw new FleetError('invalid_request', 'port must be between 0 and 65535');
+  const lock = acquireWebServerLock();
   const tmux = new Tmux();
   const backend = pickBackend();
   const repository = new RoleRepository({
@@ -52,9 +55,12 @@ export async function startWebConsole(options: StartWebOptions): Promise<Running
     },
   });
   const events = new FleetEventBus();
+  const audit = new AuditSink();
+  const terminals = new TerminalBridgeManager({ repository, audit, tmux });
+  const terminalAvailable = await terminals.available();
   const query = new FleetQueryService({
     repository, supervisor: backend, tmux,
-    capabilityContext: { terminalPtyAvailable: await hasNodePty() },
+    capabilityContext: { terminalPtyAvailable: terminalAvailable },
   });
   const ops = { backend, binPath: options.binPath, log: options.log ?? (() => {}) };
   const identityProvider = new DaemonAtomicIdentityProvider();
@@ -66,17 +72,33 @@ export async function startWebConsole(options: StartWebOptions): Promise<Running
       return detail?.status.overall === 'ready' || detail?.status.overall === 'busy'
         ? 'ready' : detail?.status.overall === 'attention' ? 'attention' : 'unknown';
     },
-    onProgress: action => events.publish('creation.changed', action, action.roleId),
+    onProgress: action => {
+      events.publish('creation.changed', action, action.roleId);
+      void audit.record({
+        roleId: action.roleId, action: `creation.${action.state}`,
+        result: action.error?.code ?? action.state,
+      });
+    },
   });
   const commands = new RoleCommandService({
     repository, ops, configPath: options.configPath,
     status: async roleId => (await query.detail(roleId)).status,
-    onProgress: receipt => events.publish('action.changed', receipt, receipt.roleId),
+    onProgress: receipt => {
+      events.publish('action.changed', receipt, receipt.roleId);
+      void audit.record({
+        roleId: receipt.roleId, action: `lifecycle.${receipt.action}`,
+        result: receipt.state, errorCode: receipt.error?.code,
+      });
+    },
   });
   const logs = new StructuredLogService(backend, realExec);
-  const audit = new AuditSink();
-  const server = await buildWebServer({
+  let server: WebServer;
+  try {
+    server = await buildWebServer({
     query, repository, logs, commands, creation, audit, events,
+    terminalUpgrade: terminalAvailable
+      ? async (socket, _request, roleId, _ticket, hello) => terminals.connect(socket, roleId, hello)
+      : undefined,
     async session(roleId) {
       const role = await repository.get(roleId);
       if (!role) throw new FleetError('role_not_found', `no such role '${roleId}'`);
@@ -89,23 +111,31 @@ export async function startWebConsole(options: StartWebOptions): Promise<Running
         return new TmuxRoleSessionAdapter(roleId, tmux);
       throw new FleetError('capability_unavailable', 'role session backend is unavailable');
     },
-  }, { origin: `http://127.0.0.1:${requestedPort}`, host: `127.0.0.1:${requestedPort}` });
-  const address = await server.app.listen({ host: '127.0.0.1', port: requestedPort });
+    }, { origin: `http://127.0.0.1:${requestedPort}`, host: `127.0.0.1:${requestedPort}` });
+  } catch (error) {
+    lock.release();
+    throw error;
+  }
+  let address: string;
+  try { address = await server.app.listen({ host: '127.0.0.1', port: requestedPort }); }
+  catch (error) { lock.release(); throw error; }
   const actual = new URL(address);
   if (actual.hostname !== '127.0.0.1') {
     await server.close();
+    lock.release();
     throw new FleetError('forbidden', 'web console refused a non-loopback bind');
   }
   const host = `127.0.0.1:${actual.port}`;
   server.auth.setBoundary(`http://${host}`, host);
   const bootstrapUrl = `http://${host}/#bootstrap=${server.auth.bootstrapSecret}`;
   if (options.open !== false) openBrowser(bootstrapUrl);
-  return { ...server, address: `http://${host}`, bootstrapUrl };
-}
-
-async function hasNodePty(): Promise<boolean> {
-  try { await import('node-pty'); return true; }
-  catch { return false; }
+  return {
+    ...server, address: `http://${host}`, bootstrapUrl,
+    async close() {
+      try { await terminals.close(); await server.close(); }
+      finally { lock.release(); }
+    },
+  };
 }
 
 function openBrowser(url: string): void {

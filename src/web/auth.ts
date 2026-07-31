@@ -31,6 +31,7 @@ export class WebAuth {
   private bootstrapUsed = false;
   private readonly sessions = new Map<string, BrowserSession>();
   private readonly tickets = new Map<string, Ticket>();
+  private readonly rates = new Map<string, { count: number; resetAt: number }>();
 
   constructor(
     private _origin: string,
@@ -56,6 +57,7 @@ export class WebAuth {
 
   exchange(request: FastifyRequest): BrowserSession {
     this.validateBoundary(request, true);
+    this.consumeRate('bootstrap', 10, 60_000);
     const authorization = request.headers.authorization ?? '';
     const supplied = authorization.startsWith('Bootstrap ') ? authorization.slice(10) : '';
     if (this.bootstrapUsed || this.now() > this.bootstrapExpiresAt || !same(this.bootstrapSecret, supplied))
@@ -82,6 +84,7 @@ export class WebAuth {
     if (mutation) {
       const supplied = String(request.headers['x-csrf-token'] ?? '');
       if (!same(session.csrf, supplied)) throw new FleetError('forbidden', 'invalid CSRF token');
+      this.consumeRate(`mutation:${session.id}`, 120, 60_000);
     }
     session.lastSeenAt = now;
     return session;
@@ -124,6 +127,20 @@ export class WebAuth {
   revokeAll(): void {
     this.sessions.clear();
     this.tickets.clear();
+  }
+
+  private consumeRate(key: string, limit: number, windowMs: number): void {
+    const now = this.now();
+    let rate = this.rates.get(key);
+    if (!rate || rate.resetAt <= now) {
+      rate = { count: 0, resetAt: now + windowMs };
+      this.rates.set(key, rate);
+    }
+    rate.count++;
+    if (rate.count > limit)
+      throw new FleetError('rate_limited', 'request rate limit exceeded', {
+        retryable: true, details: { retryAfterMs: rate.resetAt - now },
+      });
   }
 }
 

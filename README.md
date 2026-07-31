@@ -128,6 +128,43 @@ ours-fleet spawn Coder --harness codex --model gpt-5.4 \
 # wake owner separately in fleet.yaml with monitor.mode: fleet|native.
 ```
 
+## Local web console
+
+The interactive console is packaged with `@ours.network/fleet` and runs only on
+IPv4 loopback:
+
+```sh
+npm run build
+ours-fleet web --no-open
+# choose a free port for an isolated test:
+ours-fleet web --port 0 --no-open
+```
+
+Open the one-time fragment URL printed at startup. The fragment is exchanged
+for a short-lived `HttpOnly; SameSite=Strict` browser session and removed from
+history. Keep the console local: the MVP deliberately has no `--host`, proxy,
+TLS, or remote-access mode.
+
+The console provides evidence-separated inventory and status, ACP activity and
+permission controls, redacted logs, typed text send, confirmed lifecycle
+actions, transactional permanent/temporary creation, and a shared tmux browser
+terminal. Role creation is enabled only when the local ours daemon advertises
+the atomic identity transaction protocol; otherwise the UI remains fully
+usable in read/interaction mode and explains why creation is unavailable.
+`node-pty` is optional: if its native module cannot load, ACP and all
+non-terminal features remain available and tmux Terminal is disabled with a
+diagnostic.
+
+Security boundaries:
+
+- exact runtime `Host` and `Origin`, CSRF, one-time WebSocket tickets, and
+  loopback binding are enforced server-side;
+- cwd values must resolve beneath configured local roots;
+- terminal bytes are intentionally unredacted and are never copied into audit
+  records; normal logs are bounded and redacted;
+- tests use temporary fleet homes, fake supervisors/identity providers, and
+  isolated tmux sockets—never active role state.
+
 Permanent spawns are written to `~/fleet.d/<Name>.yaml` — your hand-written
 `~/fleet.yaml` is **never** machine-edited. `ours-fleet rm <Name>` unspawns.
 

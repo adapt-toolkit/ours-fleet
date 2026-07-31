@@ -1,5 +1,8 @@
 node_modules/
 dist/
+.e2e-bootstrap
+test-results/
+playwright-report/
 *.tgz
 docs/superpowers/
 .env

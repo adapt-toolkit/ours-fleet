@@ -55,6 +55,15 @@ export class Tmux {
     return all.slice(-lines).join('\n');
   }
 
+  /** Bounded ANSI/history seed for the browser terminal projection. */
+  async captureHistory(name: string, lines = 5_000): Promise<string> {
+    const bounded = Math.min(Math.max(Math.trunc(lines), 1), 20_000);
+    const r = await this.exec(
+      'tmux', tmuxArgs(name, ['capture-pane', '-t', name, '-p', '-e', '-J', '-S', `-${bounded}`]));
+    if (r.code !== 0) throw new Error(`tmux capture-pane '${name}' failed: ${r.stderr.trim()}`);
+    return Buffer.from(r.stdout).subarray(0, 4 * 1024 * 1024).toString();
+  }
+
   async panePid(name: string): Promise<number | null> {
     const r = await this.exec('tmux', tmuxArgs(name, ['list-panes', '-t', name, '-F', '#{pane_pid}']));
     if (r.code !== 0) return null;

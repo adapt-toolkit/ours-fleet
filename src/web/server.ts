@@ -30,7 +30,10 @@ export interface WebServices {
   creation: RoleCreationService;
   audit?: AuditSink;
   events?: FleetEventBus;
-  terminalUpgrade?: (socket: WebSocket, request: FastifyRequest, roleId: string, ticket: string) => Promise<void>;
+  terminalUpgrade?: (
+    socket: WebSocket, request: FastifyRequest, roleId: string,
+    ticket: string, hello: Record<string, unknown>,
+  ) => Promise<void>;
 }
 
 export interface WebServer {
@@ -258,7 +261,7 @@ export async function buildWebServer(
         auth.consumeTicket(request, ticket, 'terminal', request.params.id);
         if (!services.terminalUpgrade)
           throw new FleetError('capability_unavailable', 'terminal PTY support is unavailable');
-        await services.terminalUpgrade(socket, request, request.params.id, ticket);
+        await services.terminalUpgrade(socket, request, request.params.id, ticket, hello);
       });
     });
 
