@@ -391,4 +391,19 @@ describe('neutral permission mapping and the unattended floor (2.1)', () => {
     expect(checkUnattendedFloor(claudeCapabilities('bypassPermissions', 'workspace')).meets).toBe(true);
     expect(checkUnattendedFloor(claudeCapabilities('plan', 'workspace')).missing.length).toBeGreaterThan(0);
   });
+
+  it('effective analysis applies the direct native override that launch uses', () => {
+    const r = role({
+      permissions: { approval: 'allow', filesystem: 'workspace', unattended: 'deny' },
+      harness_options: { permission_mode: 'dontAsk' },
+    });
+    const effective = a.effectivePermissions!(r);
+    expect(effective.supported).toBe(true);
+    expect((effective as { native: Record<string, unknown> }).native)
+      .toEqual({ permission_mode: 'dontAsk' });
+    expect(checkUnattendedFloor(
+      (effective as { capabilities: never[] }).capabilities,
+      ['read-state', 'write-state', 'messaging', 'workspace-edit', 'status-commands'],
+    ).meets).toBe(false);
+  });
 });
