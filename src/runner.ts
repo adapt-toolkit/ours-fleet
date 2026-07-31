@@ -84,8 +84,16 @@ export function buildPaneCommand(
   launch: Launch, roleEnv: Record<string, string> | undefined, exitStatusPath: string,
   paneArgv: string[] = launch.argv,
 ): string {
-  const env = { PATH: process.env.PATH ?? '', ...launch.env, ...(roleEnv ?? {}) };
-  const envPfx = 'env ' + Object.entries(env).map(([k, v]) => `${k}=${shq(v)}`).join(' ');
+  const env = {
+    PATH: process.env.PATH ?? '', COLORTERM: 'truecolor', ...launch.env, ...(roleEnv ?? {}),
+  };
+  // Interactive panes should advertise colour even when the supervisor itself
+  // was launched with NO_COLOR. A role may still deliberately opt back in to
+  // NO_COLOR (or replace COLORTERM) through its explicit env block.
+  const unsetNoColor = Object.prototype.hasOwnProperty.call(roleEnv ?? {}, 'NO_COLOR')
+    ? '' : '-u NO_COLOR ';
+  const envPfx = 'env ' + unsetNoColor
+    + Object.entries(env).map(([k, v]) => `${k}=${shq(v)}`).join(' ');
   const cmd = paneArgv.map(shq).join(' ');
   // Write a structured record, not a bare number: the wait status alone cannot
   // say whether the file is missing because the program never exited or because

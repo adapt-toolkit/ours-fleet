@@ -48,7 +48,7 @@ describe('tmux terminal bridge', () => {
     let roleKills = 0;
     const tmux = {
       async has() { return true; },
-      async captureHistory() { return 'seed\n'; },
+      async captureHistory() { return '\u001b[1;31mseed ┌─ █ \u001b[0m\n'; },
       async kill() { roleKills++; return true; },
     };
     const repository = {
@@ -71,7 +71,9 @@ describe('tmux terminal bridge', () => {
     await manager.connect(first as any, 'Alpha', {});
     await manager.connect(second as any, 'Alpha', {});
     expect(spawns).toBe(1);
-    expect(first.json().some(message => message.type === 'snapshot')).toBe(true);
+    const snapshot = first.json().find(message => message.type === 'snapshot');
+    expect(snapshot.data).toMatch(/\u001b\[[0-9;]*m/);
+    expect(snapshot.data).toContain('┌─ █ ');
     first.emit('message', Buffer.from(JSON.stringify({ type: 'lease.request' })), false);
     const lease = first.json().find(message => message.type === 'lease.granted');
     expect(lease.leaseId).toBeTruthy();
@@ -83,8 +85,10 @@ describe('tmux terminal bridge', () => {
     expect(writes).toEqual([]);
     first.emit('message', frame, true);
     expect(writes).toEqual(['hello']);
-    onData('world');
-    expect(first.sent.some(value => value instanceof Uint8Array)).toBe(true);
+    onData('\u001b[38;2;12;200;99mworld └─ ▄ \u001b[0m');
+    const output = first.sent.find(value => value instanceof Uint8Array) as Uint8Array;
+    expect(new TextDecoder().decode(output.slice(9))).toContain('\u001b[38;2;12;200;99m');
+    expect(new TextDecoder().decode(output.slice(9))).toContain('└─ ▄ ');
     await manager.close();
     expect(ptyKills).toBe(1);
     expect(roleKills).toBe(0);

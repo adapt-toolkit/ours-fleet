@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from 'react';
 import { Terminal } from '@xterm/xterm';
 import { FitAddon } from '@xterm/addon-fit';
 import { api } from './api';
+import { TERMINAL_OPTIONS } from './terminal-options';
 
 export function TerminalView({ roleId }: { roleId: string }) {
   const host = useRef<HTMLDivElement>(null);
@@ -9,7 +10,7 @@ export function TerminalView({ roleId }: { roleId: string }) {
   const [warning, setWarning] = useState('Terminal bytes are privileged and unredacted.');
   const socketRef = useRef<WebSocket | undefined>(undefined);
   useEffect(() => {
-    const terminal = new Terminal({ convertEol: true, cursorBlink: true, scrollback: 5_000, fontSize: 13 });
+    const terminal = new Terminal(TERMINAL_OPTIONS);
     const fit = new FitAddon();
     terminal.loadAddon(fit);
     terminal.open(host.current!); fit.fit();
@@ -60,6 +61,6 @@ export function TerminalView({ roleId }: { roleId: string }) {
       {mode !== 'controlling'
         ? <button onClick={() => socketRef.current?.send(JSON.stringify({ type: 'lease.request' }))}>Take control</button>
         : <button onClick={() => socketRef.current?.send(JSON.stringify({ type: 'lease.release' }))}>Release</button>}</div>
-    <div className="terminal-host" ref={host} />
+    <div className="terminal-host" ref={host} style={{ fontFamily: TERMINAL_OPTIONS.fontFamily }} />
   </div>;
 }

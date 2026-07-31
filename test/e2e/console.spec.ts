@@ -6,13 +6,14 @@ test('bootstrap, inventory, navigation, send, create, and security boundaries', 
   await expect(page.getByRole('heading', { name: 'All roles' })).toBeVisible();
   await expect(page).toHaveURL('http://127.0.0.1:49371/');
   await expect(page.getByText('Alpha', { exact: true }).first()).toBeVisible();
-  await expect(page.getByText('live · idle')).toBeVisible();
-  await expect(page.getByText(/service inactive · authoritative/)).toBeVisible();
+  await expect(page.getByText('Terminal', { exact: true }).first()).toBeVisible();
+  await expect(page.getByText('live · idle').first()).toBeVisible();
+  await expect(page.getByText(/service inactive · authoritative/).first()).toBeVisible();
   await expect(page.getByLabel('Fleet status meanings')).toContainText('Busy active turn or permission');
   await expect(page.getByLabel('Fleet status meanings')).toContainText(
     'Needs attention includes attention, unknown, and offline roles.',
   );
-  await expect(page.locator('.status-chip.ready')).toHaveText(/Ready/);
+  await expect(page.locator('.status-chip.ready').first()).toHaveText(/Ready/);
   const manifest = await request.get('/manifest.webmanifest');
   expect(manifest.status()).toBe(200);
   expect(manifest.headers()['content-type']).toMatch(/manifest|json/);
@@ -62,6 +63,19 @@ test('bootstrap, inventory, navigation, send, create, and security boundaries', 
   await expect(page.getByText(/"inbound_error"/)).toBeVisible();
   await page.getByRole('button', { name: 'Create atomically' }).click();
   await expect(page.getByRole('heading', { name: 'Researcher' })).toBeVisible();
+
+  await page.getByRole('button', { name: 'All roles' }).click();
+  await page.getByLabel('Filter roles').fill('');
+  await page.getByRole('button', { name: /Terminal/ }).click();
+  await page.getByRole('button', { name: 'terminal' }).click();
+  await expect(page.locator('.terminal-host .xterm')).toBeVisible();
+  await expect(page.locator('.terminal-host')).toContainText('ANSI BOLD');
+  await expect(page.locator('.terminal-host')).toContainText('┌─ █ ');
+  const terminalStyle = await page.locator('.terminal-host .xterm-rows').evaluate(element => ({
+    fontFamily: getComputedStyle(element).fontFamily,
+    fontWeight: getComputedStyle(element).fontWeight,
+  }));
+  expect(terminalStyle.fontFamily).toContain('JetBrainsMono Nerd Font');
 
   const cookies = await page.context().cookies();
   const session = cookies.find(cookie => cookie.name === 'ofs_session')!;

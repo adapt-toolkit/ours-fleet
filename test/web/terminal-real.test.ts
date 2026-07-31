@@ -25,6 +25,11 @@ describe.skipIf(!hasTmux)('real isolated tmux PTY bridge', () => {
     const tmux = new Tmux();
     await tmux.newSession(roleId, dir, 'sh');
     try {
+      await tmux.sendText(roleId, `printf '\\033[1;31mHISTORY┌─█\\033[0m\\n'`);
+      await new Promise(resolve => setTimeout(resolve, 100));
+      const history = await tmux.captureHistory(roleId);
+      expect(history).toMatch(/\u001b\[[0-9;]*m/);
+      expect(history).toContain('HISTORY┌─█');
       const repository = {
         async get() {
           return {
@@ -44,6 +49,16 @@ describe.skipIf(!hasTmux)('real isolated tmux PTY bridge', () => {
       await new Promise(resolve => setTimeout(resolve, 100));
       expect(socket.sent.some(value => typeof value === 'string'
         && JSON.parse(value).type === 'ready')).toBe(true);
+      const snapshot = socket.sent.filter(value => typeof value === 'string')
+        .map(value => JSON.parse(value as string)).find(value => value.type === 'snapshot');
+      expect(snapshot.data).toMatch(/\u001b\[[0-9;]*m/);
+      expect(snapshot.data).toContain('HISTORY┌─█');
+      await tmux.sendText(roleId, `printf '\\033[3;4;38;2;12;200;99mLIVE└─▄\\033[0m\\n'`);
+      await new Promise(resolve => setTimeout(resolve, 100));
+      const raw = Buffer.concat(socket.sent.filter(value => value instanceof Uint8Array)
+        .map(value => Buffer.from((value as Uint8Array).slice(9)))).toString();
+      expect(raw).toMatch(/\u001b\[[0-9;]*m/);
+      expect(raw).toContain('LIVE└─▄');
       await manager.close();
       expect(await tmux.has(roleId)).toBe(true);
     } finally {

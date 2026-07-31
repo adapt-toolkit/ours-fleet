@@ -3,6 +3,7 @@ import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync, rmSync
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { execFileSync } from 'node:child_process';
 import { stringify } from 'yaml';
 import {
   runOnce, runTemp, runSupervised, buildPaneCommand, reserveLaunchSlot, readExitRecord,
@@ -124,6 +125,25 @@ describe('buildPaneCommand', () => {
     expect(cmd).toContain(`'bwrap' '--die-with-parent' '--' 'claude' 'go'`);
     expect(cmd).toContain(`> '/tmp/es'`);                              // exit capture host-side
     expect(cmd.indexOf('bwrap')).toBeLessThan(cmd.indexOf('__ofs=$?')); // capture is outside
+  });
+
+  it('unsets inherited NO_COLOR, defaults truecolor, and honors explicit role overrides', () => {
+    const exitFile = join(dir, 'pane-exit');
+    const probe = ['sh', '-c', 'printf "%s|%s" "${NO_COLOR-unset}" "$COLORTERM"'];
+    const inherited = buildPaneCommand({ argv: probe, env: {} }, undefined, exitFile);
+    expect(inherited).toContain('env -u NO_COLOR ');
+    expect(inherited).toContain("COLORTERM='truecolor'");
+    expect(execFileSync('sh', ['-c', inherited], {
+      env: { ...process.env, NO_COLOR: '1' }, encoding: 'utf8',
+    })).toBe('unset|truecolor');
+
+    const explicit = buildPaneCommand(
+      { argv: probe, env: {} }, { NO_COLOR: '1', COLORTERM: 'legacy' }, exitFile,
+    );
+    expect(explicit).not.toContain('-u NO_COLOR');
+    expect(execFileSync('sh', ['-c', explicit], {
+      env: { ...process.env, NO_COLOR: 'parent' }, encoding: 'utf8',
+    })).toBe('1|legacy');
   });
 });
 

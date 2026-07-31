@@ -23,6 +23,11 @@ const role = {
     permissions: { approval: 'ask', filesystem: 'workspace', unattended: 'deny' },
   },
 };
+const terminalRole = {
+  ...role, id: 'Terminal', configuredBackend: 'tmux', detectedBackend: 'tmux',
+  config: { ...role.config, name: 'Terminal', identity: 'Terminal', session: 'tmux',
+    mission: 'Verify ANSI and Unicode terminal fidelity', model: undefined },
+};
 const capabilities = {
   protocolVersion: 2, inventory: true, status: true,
   output: { recent: true, stream: true, structured: true, replayCursor: true },
@@ -32,13 +37,30 @@ const capabilities = {
   lifecycle: { start: false, stop: true, restartResume: true, restartFresh: true, remove: false },
   logs: { tail: true, follow: false, cursor: false },
 };
+const terminalCapabilities = {
+  ...capabilities,
+  terminal: { available: true, multiViewer: true, writerLease: true },
+  input: { text: false, rawKeys: true, interrupt: false, steering: false },
+};
 const actions = new Map();
 const services = {
   query: {
-    async list() { return [{ role, status: { ...status, observedAt: new Date().toISOString() }, capabilities }]; },
-    async detail() { return { role, status: { ...status, observedAt: new Date().toISOString() }, capabilities }; },
+    async list() { return [
+      { role, status: { ...status, observedAt: new Date().toISOString() }, capabilities },
+      { role: terminalRole, status: { ...status, roleId: 'Terminal', observedAt: new Date().toISOString(),
+        session: { ...status.session, backend: 'tmux' } }, capabilities: terminalCapabilities },
+    ]; },
+    async detail(id) {
+      const terminal = id === 'Terminal';
+      return {
+        role: terminal ? terminalRole : role,
+        status: { ...status, roleId: terminal ? 'Terminal' : 'Alpha', observedAt: new Date().toISOString(),
+          session: terminal ? { ...status.session, backend: 'tmux' } : status.session },
+        capabilities: terminal ? terminalCapabilities : capabilities,
+      };
+    },
   },
-  repository: { async get() { return role; } },
+  repository: { async get(id) { return id === 'Terminal' ? terminalRole : role; } },
   async session() {
     return {
       async describe() { return { backend: 'acp', protocolVersion: 2, features: [] }; },
@@ -111,6 +133,13 @@ const services = {
       actions.set(action.actionId, action); return action;
     },
     get(id) { return actions.get(id); },
+  },
+  async terminalUpgrade(socket) {
+    socket.send(JSON.stringify({
+      type: 'snapshot', bridgeId: 'fixture-terminal', seq: '1',
+      data: '\u001b[1;38;2;123;216;143mANSI BOLD\u001b[0m \u001b[3;4mITALIC UNDERLINE\u001b[0m ┌─ █ ',
+    }));
+    socket.send(JSON.stringify({ type: 'ready', mode: 'viewer', bridgeId: 'fixture-terminal' }));
   },
 };
 
