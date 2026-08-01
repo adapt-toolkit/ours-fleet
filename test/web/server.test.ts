@@ -270,7 +270,7 @@ describe('watchdog read endpoints', () => {
     const body = res.json();
     expect(body.watchdogs).toHaveLength(1);
     expect(body.watchdogs[0]).toMatchObject({
-      name: 'nightwatch', enabled: true, heldDown: true, intervalMs: 600_000,
+      name: 'nightwatch', enabled: true, heldDown: true, heldSince: '2026-07-31T12:00:00Z', intervalMs: 600_000,
       coordinator: 'FleetCoordinator', watch: ['Alice'],
     });
     expect(body.watchdogs[0].latest.runId).toBe('20260731T120000Z');

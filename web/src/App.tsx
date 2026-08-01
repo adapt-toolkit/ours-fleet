@@ -3,6 +3,7 @@ import { api, idempotencyKey } from './api';
 import { CreateRole } from './CreateRole';
 import { RoleWorkspace } from './RoleWorkspace';
 import { isInactive, needsAttention, presentFleet } from './fleet-presentation';
+import { WatchdogsView } from './Watchdogs';
 
 type FleetItem = {
   role: {
@@ -28,7 +29,8 @@ export function App() {
   const [selected, setSelected] = useState('');
   const [filter, setFilter] = useState('');
   const [showInactive, setShowInactive] = useState(false);
-  const [view, setView] = useState<'fleet' | 'attention' | 'audit'>('fleet');
+  const [view, setView] = useState<'fleet' | 'attention' | 'watchdogs' | 'audit'>('fleet');
+  const [selectedWatchdog, setSelectedWatchdog] = useState('');
   const [creating, setCreating] = useState(false);
   const [installPrompt, setInstallPrompt] = useState<InstallPromptEvent>();
   const [connection, setConnection] = useState<'connecting' | 'live' | 'polling'>('connecting');
@@ -98,12 +100,12 @@ export function App() {
     <aside>
       <div className="brand"><span className="brand-wordmark">Ours</span><div><small>fleet console</small></div></div>
       <nav aria-label="Primary">
-        {(['fleet', 'attention', 'audit'] as const).map(name =>
+        {(['fleet', 'attention', 'watchdogs', 'audit'] as const).map(name =>
           <button className={view === name ? 'active' : ''} key={name} onClick={() => {
-            setView(name); setSelected('');
+            setView(name); setSelected(''); setSelectedWatchdog('');
           }}>
-            <span aria-hidden="true">{name === 'fleet' ? '◫' : name === 'attention' ? '△' : '≡'}</span>
-            {name === 'fleet' ? 'All roles' : name === 'attention' ? 'Needs attention' : 'Audit trail'}
+            <span aria-hidden="true">{name === 'fleet' ? '◫' : name === 'attention' ? '△' : name === 'watchdogs' ? '◉' : '≡'}</span>
+            {name === 'fleet' ? 'All roles' : name === 'attention' ? 'Needs attention' : name === 'watchdogs' ? 'Watchdogs' : 'Audit trail'}
             {name === 'attention' && <b>{attentionCount}</b>}
           </button>)}
       </nav>
@@ -113,8 +115,9 @@ export function App() {
     <section className="main">
       <header>
         <div>
-          <span className="eyebrow">{selected ? 'role workspace' : view}</span>
-          <h1>{selected || (view === 'attention' ? 'Needs attention' : view === 'audit' ? 'Audit trail' : 'All roles')}</h1>
+          <span className="eyebrow">{selected ? 'role workspace' : selectedWatchdog ? 'watchdog' : view}</span>
+          <h1>{selected || selectedWatchdog || (view === 'attention' ? 'Needs attention'
+            : view === 'watchdogs' ? 'Watchdogs' : view === 'audit' ? 'Audit trail' : 'All roles')}</h1>
         </div>
         <div className="header-actions">
           {installPrompt && <button className="secondary" onClick={() => {
@@ -131,7 +134,15 @@ export function App() {
         ? <RoleWorkspace roleId={selected} onBack={() => setSelected('')} />
         : view === 'audit'
           ? <AuditView />
-          : <div className="content">
+          : view === 'watchdogs'
+            ? (selectedWatchdog
+              ? <div className="content">
+                <button className="back" onClick={() => setSelectedWatchdog('')}>← Back to watchdogs</button>
+                <h2>{selectedWatchdog}</h2>
+                <p className="muted">Watchdog detail view coming soon.</p>
+              </div>
+              : <WatchdogsView api={api} onSelect={setSelectedWatchdog} />)
+            : <div className="content">
             <div className="status-guide" aria-label="Fleet status meanings">
               <span className="ready"><b>Ready</b> live and idle</span>
               <span className="busy"><b>Busy</b> active turn or permission</span>

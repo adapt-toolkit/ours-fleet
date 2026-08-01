@@ -8,7 +8,7 @@ import { readSchedulerState } from './scheduler.js';
 import { listRuns, readReport, type RunListEntry } from './store.js';
 
 export interface WatchdogSummary {
-  name: string; enabled: boolean; heldDown: boolean; intervalMs: number;
+  name: string; enabled: boolean; heldDown: boolean; heldSince: string | null; intervalMs: number;
   coordinator: string; watch: string[];
   lastRunAt: string | null; nextRunAt: string | null;
   latest: RunListEntry | null;
@@ -34,7 +34,8 @@ export class WatchdogQueryService {
       const state = readSchedulerState(wd.name);
       const [latest = null] = listRuns(wd.name);
       return {
-        name: wd.name, enabled: wd.enabled, heldDown: state.heldDown, intervalMs: wd.intervalMs,
+        name: wd.name, enabled: wd.enabled, heldDown: state.heldDown, heldSince: state.heldSince ?? null,
+        intervalMs: wd.intervalMs,
         coordinator: wd.coordinator, watch: wd.watch,
         lastRunAt: state.lastRunAt ?? null, nextRunAt: state.nextRunAt ?? null,
         latest,
