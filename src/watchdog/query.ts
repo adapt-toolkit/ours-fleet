@@ -40,6 +40,27 @@ export function buildWatchdogFindings(
   return findings;
 }
 
+/**
+ * Memoizes a findings-map builder with a short TTL (mirrors runtime.ts's
+ * cachedConfigProvider pattern). status() calls its injected watchdogFindings
+ * provider once per role, so an unmemoized thunk turns a single list() sweep
+ * into O(roles x watchdogs) disk reads, repeated every 1-3s of console
+ * polling. `now` is injectable (defaults to Date.now) so the TTL boundary is
+ * unit-testable without real timers.
+ */
+export function cachedWatchdogFindingsProvider(
+  build: () => Map<string, WatchdogRoleFinding>,
+  ttlMs: number,
+  now: () => number = Date.now,
+): () => Map<string, WatchdogRoleFinding> {
+  let cached: { at: number; value: Map<string, WatchdogRoleFinding> } | undefined;
+  return () => {
+    const at = now();
+    if (!cached || at - cached.at >= ttlMs) cached = { at, value: build() };
+    return cached.value;
+  };
+}
+
 export interface WatchdogSummary {
   name: string; enabled: boolean; heldDown: boolean; heldSince: string | null; intervalMs: number;
   coordinator: string; watch: string[];

@@ -1,5 +1,5 @@
-import { describe, expect, it } from 'vitest';
-import { buildWatchdogFindings } from '../src/watchdog/query.js';
+import { describe, expect, it, vi } from 'vitest';
+import { buildWatchdogFindings, cachedWatchdogFindingsProvider } from '../src/watchdog/query.js';
 import type { WatchdogReport } from '../src/watchdog/report.js';
 
 function report(overrides: Partial<WatchdogReport> = {}): WatchdogReport {
@@ -68,5 +68,34 @@ describe('buildWatchdogFindings', () => {
     expect(findings.has('Bob')).toBe(false);
     expect(findings.has('Carol')).toBe(false);
     expect(findings.size).toBe(1);
+  });
+});
+
+describe('cachedWatchdogFindingsProvider', () => {
+  it('memoizes build() within the TTL and rebuilds once the TTL elapses', () => {
+    let clock = 0;
+    const build = vi.fn(() => new Map([['Alice', { watchdog: 'nightwatch', status: 'blocked' as const, reason: 'x' }]]));
+    const provider = cachedWatchdogFindingsProvider(build, 5_000, () => clock);
+
+    provider();
+    provider();
+    expect(build).toHaveBeenCalledTimes(1);
+
+    clock += 4_999;
+    provider();
+    expect(build).toHaveBeenCalledTimes(1);
+
+    clock += 1;
+    const findings = provider();
+    expect(build).toHaveBeenCalledTimes(2);
+    expect(findings.get('Alice')).toEqual({ watchdog: 'nightwatch', status: 'blocked', reason: 'x' });
+  });
+
+  it('rebuilds on every call when ttlMs is 0', () => {
+    const build = vi.fn(() => new Map());
+    const provider = cachedWatchdogFindingsProvider(build, 0, () => 0);
+    provider();
+    provider();
+    expect(build).toHaveBeenCalledTimes(2);
   });
 });
