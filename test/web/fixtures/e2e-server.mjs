@@ -57,10 +57,13 @@ const inactiveStatus = {
     backend: 'acp', reachability: 'offline', readiness: 'failed', evidence: 'authoritative',
   },
 };
-// Two stored runs for the 'nightwatch' watchdog: an older healthy run and the
-// current (newest) run with one blocked finding — reason, evidence, and a
-// matching alerts[] entry, so the detail view's evidence <details> and
-// alert-note derivation both have something real to render.
+// Three stored runs for the 'nightwatch' watchdog, newest first: the current
+// run with one blocked finding (reason, evidence, and a matching alerts[]
+// entry, so the detail view's evidence <details> and alert-note derivation
+// both have something real to render), an older all-healthy run (so
+// run-switching has a distinguishable target — no blocked text, no evidence,
+// no alert note), and the oldest run which failed outright (status 'error',
+// so the error+tail rendering branch has fixture coverage too).
 const watchdogRuns = {
   nightwatch: [
     {
@@ -72,6 +75,11 @@ const watchdogRuns = {
       runId: '20260731T110000Z', status: 'ok',
       startedAt: '2026-07-31T11:00:00Z', finishedAt: '2026-07-31T11:00:45Z',
       summary: { checked: 2, healthy: 2, idle: 0, anomalies: 0 }, error: null,
+    },
+    {
+      runId: '20260731T100000Z', status: 'error',
+      startedAt: '2026-07-31T10:00:00Z', finishedAt: '2026-07-31T10:00:05Z',
+      summary: { checked: 0, healthy: 0, idle: 0, anomalies: 0 }, error: 'timeout',
     },
   ],
 };
@@ -98,6 +106,13 @@ const watchdogReports = {
       summary: { checked: 2, healthy: 2, idle: 0, anomalies: 0 },
       roles: [{ role: 'Alice', status: 'healthy' }, { role: 'Docs', status: 'healthy' }],
       alerts: [], error: null,
+    },
+    '20260731T100000Z': {
+      schema_version: 1, watchdog: 'nightwatch', run_id: '20260731T100000Z',
+      started_at: '2026-07-31T10:00:00Z', finished_at: '2026-07-31T10:00:05Z', status: 'error',
+      summary: { checked: 0, healthy: 0, idle: 0, anomalies: 0 },
+      roles: [], alerts: [], error: 'timeout',
+      tail: 'connecting to Alice...\nconnection refused\n',
     },
   },
 };
