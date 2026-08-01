@@ -17,6 +17,7 @@ import { up, down, restartRoles, rmRole, type OpsDeps } from './ops.js';
 import { readRestartLedger, runSupervised, runTemp } from './runner.js';
 import { executeWatchdogRun, runWatchdogAgent } from './watchdog/run.js';
 import { readSchedulerState, resetSchedulerState, runScheduler, type WatchdogSchedulerState } from './watchdog/scheduler.js';
+import { partitionRestartNames } from './watchdog/config.js';
 import { WatchdogServiceManager } from './watchdog/service.js';
 import {
   acquireRunLock, latestReport, listRuns, readReport, releaseRunLock, reportsDir, type RunListEntry,
@@ -215,12 +216,11 @@ cOpt(program.command('restart [names...]').description('re-sync config + bounce,
       // watchdog is always a release, never a role restart. Release each
       // named watchdog directly instead of handing it to restartRoles, which
       // only knows about roles and would reject it as unknown (3.2 release path).
-      const watchdogNames = names.filter(n => cfg.watchdogs.some(w => w.name === n));
+      const { watchdogNames, roleNames } = partitionRestartNames(cfg, names);
       for (const wn of watchdogNames) {
         resetSchedulerState(wn);
         console.log(`released watchdog '${wn}' — scheduler resumes on its next poll`);
       }
-      const roleNames = names.filter(n => !watchdogNames.includes(n));
       // Bare `restart` (no names) restarts every role — that meaning must
       // survive even though filtering an empty array also yields [].
       if (names.length === 0 || roleNames.length > 0)

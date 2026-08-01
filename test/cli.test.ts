@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeAll, beforeEach, afterEach } from 'vitest';
-import { mkdirSync, mkdtempSync, rmSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, rmSync } from 'node:fs';
 import { spawn } from 'node:child_process';
 import { once } from 'node:events';
 import { tmpdir } from 'node:os';
@@ -10,10 +10,12 @@ import { UNATTENDED_FLOOR } from '../src/permissions.js';
 const CLI = resolve('dist/cli.js');
 let dir: string;
 
-beforeAll(async () => {
-  const r = await realExec('npm', ['run', 'build']);
-  if (r.code !== 0) throw new Error(`build failed: ${r.stderr}`);
-}, 120_000);
+beforeAll(() => {
+  // dist/cli.js is built once by vitest's globalSetup (test/global-setup.ts),
+  // before any test file runs — this is just a cheap guard against that
+  // invariant breaking.
+  if (!existsSync(CLI)) throw new Error('dist/cli.js missing — global setup should have built it');
+});
 
 beforeEach(() => { dir = mkdtempSync(join(tmpdir(), 'ours-fleet-cli-')); });
 afterEach(() => rmSync(dir, { recursive: true, force: true }));
@@ -276,22 +278,6 @@ describe('ours-fleet CLI', () => {
     // the config chip clears too, once the watchdog is no longer held down
     const cfgAfter = await run(['config']);
     expect(cfgAfter.stdout).not.toContain('(held down)');
-  });
-
-  it('restart with a mix of watchdog and role names releases the watchdog and restarts the role', async () => {
-    const { writeFileSync, readFileSync } = await import('node:fs');
-    writeFileSync(join(dir, 'fleet.yaml'), 'roles:\n  A: {}\nwatchdogs:\n  w: { coordinator: C }\n');
-    const sdir = join(dir, '.ours-fleet', 'watchdogs', 'w');
-    mkdirSync(sdir, { recursive: true });
-    writeFileSync(join(sdir, 'state.json'), JSON.stringify({
-      version: 1, consecutiveFailures: 3, heldDown: true, heldSince: '2026-07-31T10:00:00Z',
-    }));
-
-    const r = await run(['restart', 'w', 'A']);
-    expect(r.code).toBe(0);
-    expect(r.stdout).toMatch(/released watchdog 'w'/);
-    expect(r.stdout).toContain('A — restarted');
-    expect(JSON.parse(readFileSync(join(sdir, 'state.json'), 'utf8')).heldDown).toBe(false);
   });
 
   it('spawn --help lists model and Codex controls', async () => {

@@ -2,7 +2,7 @@ import { existsSync } from 'node:fs';
 import { isAbsolute } from 'node:path';
 import { parseDuration } from '../duration.js';
 import { ConfigError, ROLE_NAME_RE, resolveRoleModel } from '../config.js';
-import type { ResolvedRole, SessionBackendId } from '../config.js';
+import type { FleetConfig, ResolvedRole, SessionBackendId } from '../config.js';
 
 export interface WatchdogConfig {
   coordinator?: string; enabled?: boolean; interval?: string; watch?: string[];
@@ -109,4 +109,20 @@ export function resolveWatchdogs(
     });
   }
   return out;
+}
+
+/**
+ * Split `restart`'s argument names into watchdogs (a release, handled
+ * directly) and roles (handed to restartRoles). Watchdog names can't collide
+ * with role names (config validation guarantees dispatch is unambiguous), so
+ * a name matching a configured watchdog is always a release, never a role
+ * restart. Order is preserved within each bucket; unknown names fall through
+ * to roleNames — findRole errors later, same as today.
+ */
+export function partitionRestartNames(
+  cfg: FleetConfig, names: string[],
+): { watchdogNames: string[]; roleNames: string[] } {
+  const watchdogNames = names.filter(n => cfg.watchdogs.some(w => w.name === n));
+  const roleNames = names.filter(n => !watchdogNames.includes(n));
+  return { watchdogNames, roleNames };
 }

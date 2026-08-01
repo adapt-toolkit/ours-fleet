@@ -3,6 +3,9 @@ import { mkdtempSync, rmSync, writeFileSync, mkdirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { loadConfig } from '../src/config.js';
+import { partitionRestartNames } from '../src/watchdog/config.js';
+import type { FleetConfig } from '../src/config.js';
+import type { ResolvedWatchdog } from '../src/watchdog/config.js';
 
 let dir: string;
 beforeEach(() => { dir = mkdtempSync(join(tmpdir(), 'ours-fleet-wd-')); process.env.OURS_FLEET_HOME = dir; });
@@ -90,5 +93,37 @@ describe('watchdogs config', () => {
     mkdirSync(join(dir, 'fleet.d'), { recursive: true });
     writeFileSync(join(dir, 'fleet.d', 'w.yaml'), 'watchdogs:\n  w: { coordinator: C }\n');
     expect(() => loadConfig()).toThrowError(/fleet.d files may only define roles:/);
+  });
+});
+
+describe('partitionRestartNames', () => {
+  // partitionRestartNames only reads cfg.watchdogs, so a minimal fake config
+  // (just the watchdog names that matter for dispatch) is enough here.
+  const cfgWith = (...watchdogNames: string[]): FleetConfig => ({
+    roles: [], vars: {}, defaults: {}, files: [], startStaggerMs: 0, diagnostics: [],
+    watchdogs: watchdogNames.map(name => ({ name }) as unknown as ResolvedWatchdog),
+  });
+
+  it('splits a mixed list into watchdogNames and roleNames, preserving order', () => {
+    const cfg = cfgWith('w1', 'w2');
+    expect(partitionRestartNames(cfg, ['A', 'w1', 'B', 'w2', 'C']))
+      .toEqual({ watchdogNames: ['w1', 'w2'], roleNames: ['A', 'B', 'C'] });
+  });
+
+  it('an all-watchdog list yields empty roleNames', () => {
+    const cfg = cfgWith('w1', 'w2');
+    expect(partitionRestartNames(cfg, ['w2', 'w1']))
+      .toEqual({ watchdogNames: ['w2', 'w1'], roleNames: [] });
+  });
+
+  it('an all-role/unknown-name list puts everything in roleNames (unknown names are roles\' problem — findRole errors later)', () => {
+    const cfg = cfgWith('w1');
+    expect(partitionRestartNames(cfg, ['A', 'Ghost']))
+      .toEqual({ watchdogNames: [], roleNames: ['A', 'Ghost'] });
+  });
+
+  it('an empty list yields both empty', () => {
+    const cfg = cfgWith('w1');
+    expect(partitionRestartNames(cfg, [])).toEqual({ watchdogNames: [], roleNames: [] });
   });
 });
