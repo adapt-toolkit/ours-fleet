@@ -1,15 +1,21 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { spawnSync } from 'node:child_process';
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
   watchdogBackoffMs, runWatchdogLoop, readSchedulerState, resetSchedulerState, writeSchedulerState,
   runScheduler,
 } from '../src/watchdog/scheduler.js';
-import { listRuns, acquireRunLock, releaseRunLock, formatRunId } from '../src/watchdog/store.js';
+import { listRuns, acquireRunLock, releaseRunLock, formatRunId, watchdogDir } from '../src/watchdog/store.js';
 import { errorReport } from '../src/watchdog/report.js';
 import { readLedger, writeLedger } from '../src/watchdog/alerts.js';
 import { loadConfig } from '../src/config.js';
+
+/** A pid that is guaranteed dead: spawnSync blocks until the child has exited. */
+function deadPid(): number {
+  return spawnSync(process.execPath, ['-e', 'process.exit(0)']).pid!;
+}
 
 let dir: string;
 beforeEach(() => {
@@ -250,26 +256,78 @@ describe('runScheduler threads its loaded cfg through to run + notifier deps (fi
   });
 });
 
-describe('runScheduler recovers a stale run lock at startup (final review #2a)', () => {
-  it('clears each enabled watchdog\'s run lock before looping, so a SIGKILLed prior run does not wedge scheduling forever', async () => {
-    writeFileSync(join(dir, 'fleet.yaml'),
-      'roles:\n  Alice: {}\nwatchdogs:\n  nightwatch: { coordinator: FleetCoordinator }\n');
-    acquireRunLock('nightwatch'); // simulate a stale lock left by a SIGKILLed prior run
+describe('runScheduler recovers a run lock at startup, but only when it is demonstrably stale (finding #2)', () => {
+  const writeCfg = () => writeFileSync(join(dir, 'fleet.yaml'),
+    'roles:\n  Alice: {}\nwatchdogs:\n  nightwatch: { coordinator: FleetCoordinator }\n');
+
+  it('reclaims a lock whose owner pid is dead, so a SIGKILLed prior run does not wedge scheduling forever', async () => {
+    writeCfg();
+    // Simulate a stale lock left by a SIGKILLed prior run: a lock dir whose
+    // owner.json names a pid that is no longer alive (acquireRunLock itself
+    // always stamps our OWN — live — pid, so it can't be used to construct
+    // this fixture; the owner file has to be written directly).
+    const lockDir = join(watchdogDir('nightwatch'), '.run-lock');
+    mkdirSync(lockDir, { recursive: true });
+    writeFileSync(join(lockDir, 'owner.json'), JSON.stringify({ pid: deadPid(), at: new Date().toISOString() }));
     const deps = {
       now: () => new Date(), sleep: async () => {}, log: () => {}, binPath: '/bin/false',
       shouldStop: () => true, // never actually tick — only prove the startup sweep ran
     };
     await runScheduler(join(dir, 'fleet.yaml'), deps as never);
-    expect(acquireRunLock('nightwatch')).toBe(true); // lock was released; re-acquirable
+    expect(acquireRunLock('nightwatch')).toBe(true); // lock was reclaimed; re-acquirable
     releaseRunLock('nightwatch');
+  });
+
+  it('reclaims a legacy lock dir with no owner.json (pre-finding-#2 locks)', async () => {
+    writeCfg();
+    mkdirSync(join(watchdogDir('nightwatch'), '.run-lock'), { recursive: true });
+    const deps = {
+      now: () => new Date(), sleep: async () => {}, log: () => {}, binPath: '/bin/false',
+      shouldStop: () => true,
+    };
+    await runScheduler(join(dir, 'fleet.yaml'), deps as never);
+    expect(acquireRunLock('nightwatch')).toBe(true);
+    releaseRunLock('nightwatch');
+  });
+
+  it('does NOT clear a lock held by a live process — a foreground watchdog-run (or another scheduler) must survive a scheduler restart', async () => {
+    writeCfg();
+    acquireRunLock('nightwatch'); // owner.json now names THIS (alive) process's pid
+    const logs: string[] = [];
+    let sleeps = 0;
+    const deps = {
+      now: () => new Date(), sleep: async () => { sleeps += 1; }, log: (l: string) => logs.push(l),
+      binPath: '/bin/false',
+      shouldStop: () => sleeps >= 1,   // one tick (the skip) is enough to prove the point
+      // If the startup sweep wrongly cleared the live lock (pre-fix behavior), the loop
+      // would reach here instead of observing the lock still held and skipping.
+      runOnceFor: async () => { throw new Error('must not have run: lock was live'); },
+    };
+    await runScheduler(join(dir, 'fleet.yaml'), deps as never);
+    // The lock is untouched: still acquirable only after we release it ourselves.
+    expect(acquireRunLock('nightwatch')).toBe(false);
+    expect(logs.some(l => /run lock held by live pid \d+ — not reclaimed/.test(l))).toBe(true);
+    releaseRunLock('nightwatch');
+    // And the tick that ran against the still-held lock recorded skipped_overlap,
+    // exactly as an ordinary overlap would — never the thrown "must not have run".
+    expect(listRuns('nightwatch')[0]?.error).toBe('skipped_overlap');
   });
 });
 
-describe('resetSchedulerState releases the run lock too (final review #2b)', () => {
-  it('an operator restart of a held-down watchdog clears a stale lock, not just the failure/hold-down state', () => {
-    acquireRunLock('nightwatch');
+describe('resetSchedulerState reclaims the run lock too, but only if stale (final review #2b, tightened by finding #2)', () => {
+  it('an operator restart of a held-down watchdog clears a STALE lock, not just the failure/hold-down state', () => {
+    const lockDir = join(watchdogDir('nightwatch'), '.run-lock');
+    mkdirSync(lockDir, { recursive: true });
+    writeFileSync(join(lockDir, 'owner.json'), JSON.stringify({ pid: deadPid(), at: new Date().toISOString() }));
     resetSchedulerState('nightwatch');
     expect(acquireRunLock('nightwatch')).toBe(true);
+    releaseRunLock('nightwatch');
+  });
+
+  it('does NOT clear a lock held by a live process', () => {
+    acquireRunLock('nightwatch');
+    resetSchedulerState('nightwatch');
+    expect(acquireRunLock('nightwatch')).toBe(false);   // still held — reset must not have reclaimed it
     releaseRunLock('nightwatch');
   });
 });

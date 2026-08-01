@@ -1,4 +1,6 @@
-import { chmodSync, mkdirSync, readFileSync, readdirSync, rmdirSync, unlinkSync, writeFileSync } from 'node:fs';
+import {
+  chmodSync, existsSync, mkdirSync, readFileSync, readdirSync, rmSync, unlinkSync, writeFileSync,
+} from 'node:fs';
 import { join } from 'node:path';
 import { watchdogsRoot } from '../paths.js';
 // store.ts imports config.ts (ROLE_NAME_RE) but not the reverse — config.ts's
@@ -42,29 +44,86 @@ function runLockPath(name: string): string {
   return join(watchdogDir(name), '.run-lock');
 }
 
+function runLockOwnerPath(name: string): string {
+  return join(runLockPath(name), 'owner.json');
+}
+
+export interface RunLockOwner { pid: number; at: string }
+
 /**
  * mkdir-as-mutex: atomic across processes, unlike a lock file (open+O_EXCL
  * would work too, but a directory needs no cleanup of file contents and
  * can't be partially written). EEXIST means another run holds it.
+ *
+ * After the mkdir succeeds, stamps `owner.json` with our pid (finding #2):
+ * ownership metadata is what lets a later `reclaimStaleRunLock` tell a lock
+ * abandoned by a dead process apart from one genuinely held by a live run.
  */
 export function acquireRunLock(name: string): boolean {
   try {
     mkdirSync(runLockPath(name));
-    return true;
   } catch (e) {
     if ((e as NodeJS.ErrnoException).code === 'EEXIST') return false;
     throw e;
   }
+  const owner: RunLockOwner = { pid: process.pid, at: new Date().toISOString() };
+  writeFileSync(runLockOwnerPath(name), JSON.stringify(owner), { mode: 0o600 });
+  chmodSync(runLockOwnerPath(name), 0o600);
+  return true;
 }
 
-/** Release-tolerant of absence: a lock already gone (or never acquired) is not an error. */
+/**
+ * Release-tolerant of absence: a lock already gone (or never acquired) is not
+ * an error. Recursive because the lock dir now holds `owner.json` alongside
+ * the mkdir mutex itself (finding #2) — a plain rmdir would fail ENOTEMPTY.
+ */
 export function releaseRunLock(name: string): void {
   try {
-    rmdirSync(runLockPath(name));
+    rmSync(runLockPath(name), { recursive: true });
   } catch (e) {
     if ((e as NodeJS.ErrnoException).code === 'ENOENT') return;
     throw e;
   }
+}
+
+/** Reads a run lock's owner metadata; missing or corrupt yields undefined (treated as stale). */
+export function readRunLockOwner(name: string): RunLockOwner | undefined {
+  try {
+    const raw = JSON.parse(readFileSync(runLockOwnerPath(name), 'utf8')) as Partial<RunLockOwner>;
+    if (!Number.isInteger(raw.pid) || (raw.pid as number) <= 0 || typeof raw.at !== 'string') return undefined;
+    return { pid: raw.pid as number, at: raw.at };
+  } catch {
+    return undefined;
+  }
+}
+
+/** True iff `pid` names a live process. EPERM means the process exists but we can't signal it — still alive. */
+function pidAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (e) {
+    return (e as NodeJS.ErrnoException).code === 'EPERM';
+  }
+}
+
+/**
+ * Owner-mandated (finding #2): only a DEMONSTRABLY stale run lock may be
+ * reclaimed — a lock is stale iff it isn't held at all, its owner metadata is
+ * missing/corrupt (a legacy lock, or one whose owner.json write never
+ * happened), or the owning pid is no longer alive. A live owner (a foreground
+ * `watchdog-run`, another scheduler instance, an in-progress run) is left
+ * strictly alone: reclaiming it would let two runs share the same temp dir.
+ * Returns true when the lock is (now) not held — whether because it was
+ * already absent or because a stale lock was just removed; false when a live
+ * lock was found and deliberately left in place.
+ */
+export function reclaimStaleRunLock(name: string): boolean {
+  if (!existsSync(runLockPath(name))) return true;
+  const owner = readRunLockOwner(name);
+  if (owner !== undefined && pidAlive(owner.pid)) return false;
+  releaseRunLock(name);
+  return true;
 }
 
 /** Lexical-chronological UTC run id, e.g. '20260731T115000Z'. */

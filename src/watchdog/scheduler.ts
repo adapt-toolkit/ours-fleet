@@ -5,7 +5,9 @@ import type { FleetConfig } from '../config.js';
 import type { ResolvedWatchdog } from './config.js';
 import { errorReport } from './report.js';
 import { executeNotifierRun, executeWatchdogRun, type WatchdogRunOutcome } from './run.js';
-import { acquireRunLock, formatRunId, releaseRunLock, watchdogDir, writeReport } from './store.js';
+import {
+  acquireRunLock, formatRunId, readRunLockOwner, reclaimStaleRunLock, releaseRunLock, watchdogDir, writeReport,
+} from './store.js';
 import { readLedger, writeLedger } from './alerts.js';
 
 const STATE_FILE = 'state.json';
@@ -43,20 +45,26 @@ export function writeSchedulerState(name: string, s: WatchdogSchedulerState): vo
  * alerts.json, not state.json), so a release must reset it too or a
  * subsequent hold-down would silently alert zero times.
  *
- * Also releases the run lock (final review #2): a watchdog SIGKILLed mid-run
- * (e.g. systemd's TimeoutStopSec on a fleet-wide stop) leaves `.run-lock`
- * behind forever — the loop's `finally` that would normally release it never
- * runs. Without this, every future tick sees the lock held and reports
- * `skipped_overlap` indefinitely, and skips never alert. `ours-fleet restart
- * <watchdog>` is the documented recovery, so it must clear the lock too, not
- * just the failure/hold-down bookkeeping. Best-effort: a release failure here
- * must not turn an operator's recovery action into a crash.
+ * Also reclaims a STALE run lock (final review #2, tightened by finding #2):
+ * a watchdog SIGKILLed mid-run (e.g. systemd's TimeoutStopSec on a
+ * fleet-wide stop) leaves `.run-lock` behind forever — the loop's `finally`
+ * that would normally release it never runs. Without this, every future tick
+ * sees the lock held and reports `skipped_overlap` indefinitely, and skips
+ * never alert. `ours-fleet restart <watchdog>` is the documented recovery, so
+ * it must clear a stale lock too, not just the failure/hold-down bookkeeping.
+ * But only a DEMONSTRABLY stale lock (dead owner pid, or legacy lock with no
+ * owner metadata) — a lock genuinely held by a live run (foreground
+ * `watchdog-run`, another scheduler instance) must survive an operator's
+ * `restart` of a DIFFERENT problem (e.g. releasing hold-down) unrelated to
+ * that live run; two runs sharing the same temp dir would corrupt each
+ * other's output. Best-effort: a reclaim failure here must not turn an
+ * operator's recovery action into a crash.
  */
 export function resetSchedulerState(name: string): void {
   writeSchedulerState(name, cleanState());
   const ledger = readLedger(name);
   if (ledger.heldDownAlerted) writeLedger(name, { ...ledger, heldDownAlerted: false });
-  try { releaseRunLock(name); } catch { /* best effort */ }
+  try { reclaimStaleRunLock(name); } catch { /* best effort */ }
 }
 
 export const WATCHDOG_HOLD_THRESHOLD = 3;
@@ -271,16 +279,22 @@ export async function runWatchdogLoop(wd: ResolvedWatchdog, deps: SchedulerDeps)
 export async function runScheduler(configPath: string | undefined, deps: SchedulerDeps): Promise<void> {
   const cfg = loadConfig(configPath);
   const watchdogs = cfg.watchdogs.filter(w => w.enabled);
-  const locks = deps.locks ?? { acquire: acquireRunLock, release: releaseRunLock };
-  // Recover from a SIGKILLed prior run (final review #2a): a scheduler
-  // restart is proof no scheduler-owned run is in flight for any of these
-  // watchdogs, so any `.run-lock` still on disk is stale — left behind by a
-  // process that never reached its `finally`. Without this sweep the lock
-  // survives forever and every future tick reports `skipped_overlap`, which
-  // never alerts and never counts as a failure either. Best-effort: a
-  // release failure here must not prevent the scheduler from starting.
+  // Recover from a SIGKILLed prior run (final review #2a, tightened by
+  // finding #2): a scheduler restart is EVIDENCE, not proof, that no
+  // scheduler-owned run is in flight — a foreground `watchdog-run`, or
+  // another scheduler instance, may genuinely still hold a watchdog's lock.
+  // Only a DEMONSTRABLY stale lock (dead owner pid, or a legacy lock with no
+  // owner metadata) may be reclaimed; a live lock is left alone so the two
+  // runs never share the same temp dir — the loop then simply observes
+  // skipped_overlap on its first tick, same as any other overlap. Best-effort:
+  // a reclaim failure here must not prevent the scheduler from starting.
   for (const wd of watchdogs) {
-    try { locks.release(wd.name); } catch { /* best effort */ }
+    try {
+      if (!reclaimStaleRunLock(wd.name)) {
+        const owner = readRunLockOwner(wd.name);
+        deps.log(`watchdog '${wd.name}': run lock held by live pid ${owner?.pid ?? 'unknown'} — not reclaimed`);
+      }
+    } catch { /* best effort */ }
   }
   await Promise.all(watchdogs.map(wd => runWatchdogLoop(wd, { ...deps, cfg })));
 }

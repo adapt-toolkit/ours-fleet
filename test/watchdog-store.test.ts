@@ -1,12 +1,18 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync, statSync } from 'node:fs';
+import { spawnSync } from 'node:child_process';
+import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync, statSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
   formatRunId, writeReport, listRuns, readReport, latestReport, pruneReports,
-  watchdogDir, reportsDir, acquireRunLock, releaseRunLock,
+  watchdogDir, reportsDir, acquireRunLock, releaseRunLock, readRunLockOwner, reclaimStaleRunLock,
 } from '../src/watchdog/store.js';
 import { errorReport } from '../src/watchdog/report.js';
+
+/** A pid that is guaranteed dead: spawnSync blocks until the child has exited. */
+function deadPid(): number {
+  return spawnSync(process.execPath, ['-e', 'process.exit(0)']).pid!;
+}
 
 let dir: string;
 beforeEach(() => { dir = mkdtempSync(join(tmpdir(), 'ours-fleet-wd-')); process.env.OURS_FLEET_HOME = dir; });
@@ -60,10 +66,64 @@ describe('watchdog store', () => {
     expect(() => releaseRunLock('w')).not.toThrow();
   });
   it('releaseRunLock rethrows a non-ENOENT failure instead of masking it as "already gone"', () => {
+    // Recursive rm now happily deletes a non-empty lock dir (it must, to clear
+    // owner.json alongside the mkdir mutex — finding #2), so ENOTEMPTY can no
+    // longer be forced this way. Force a real permission failure instead: no
+    // write permission on the lock dir means its child (owner.json) can't be
+    // unlinked.
+    acquireRunLock('w');
     const lockDir = join(watchdogDir('w'), '.run-lock');
-    mkdirSync(lockDir);
-    writeFileSync(join(lockDir, 'occupant'), 'x');   // rmdirSync on a non-empty dir -> ENOTEMPTY
-    expect(() => releaseRunLock('w')).toThrow();
+    chmodSync(lockDir, 0o500);
+    try {
+      expect(() => releaseRunLock('w')).toThrow();
+    } finally {
+      chmodSync(lockDir, 0o700);   // restore so afterEach's recursive cleanup can proceed
+    }
+  });
+
+  describe('run lock ownership (finding #2)', () => {
+    it('acquireRunLock stamps owner.json with our own pid', () => {
+      acquireRunLock('w');
+      expect(readRunLockOwner('w')).toMatchObject({ pid: process.pid });
+      releaseRunLock('w');
+    });
+
+    it('reclaimStaleRunLock leaves a lock held by a live pid (this process) alone', () => {
+      acquireRunLock('w');
+      expect(reclaimStaleRunLock('w')).toBe(false);
+      expect(readRunLockOwner('w')).toMatchObject({ pid: process.pid });   // still there
+      releaseRunLock('w');
+    });
+
+    it('reclaimStaleRunLock removes a lock whose owner pid is dead', () => {
+      const lockDir = join(watchdogDir('w'), '.run-lock');
+      mkdirSync(lockDir);
+      writeFileSync(join(lockDir, 'owner.json'), JSON.stringify({ pid: deadPid(), at: new Date().toISOString() }));
+      expect(reclaimStaleRunLock('w')).toBe(true);
+      expect(acquireRunLock('w')).toBe(true);   // lock dir is gone; re-acquirable
+      releaseRunLock('w');
+    });
+
+    it('reclaimStaleRunLock removes a legacy lock dir with no owner.json', () => {
+      mkdirSync(join(watchdogDir('w'), '.run-lock'));
+      expect(reclaimStaleRunLock('w')).toBe(true);
+      expect(acquireRunLock('w')).toBe(true);
+      releaseRunLock('w');
+    });
+
+    it('reclaimStaleRunLock is a no-op (returns true) when no lock is held', () => {
+      expect(reclaimStaleRunLock('w')).toBe(true);
+    });
+  });
+
+  describe('watchdogDir path traversal (finding #1)', () => {
+    it('rejects a traversal-shaped name before any fs effect', () => {
+      expect(() => watchdogDir('../x')).toThrow();
+    });
+    it('rejects other non-conforming names (path separator, empty)', () => {
+      expect(() => watchdogDir('a/b')).toThrow();
+      expect(() => watchdogDir('')).toThrow();
+    });
   });
 
   describe('watchdogDir path traversal (finding #1)', () => {
