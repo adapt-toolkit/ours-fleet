@@ -65,4 +65,14 @@ describe('watchdog store', () => {
     writeFileSync(join(lockDir, 'occupant'), 'x');   // rmdirSync on a non-empty dir -> ENOTEMPTY
     expect(() => releaseRunLock('w')).toThrow();
   });
+
+  describe('watchdogDir path traversal (finding #1)', () => {
+    it('rejects a traversal-shaped name before any fs effect', () => {
+      expect(() => watchdogDir('../x')).toThrow();
+    });
+    it('rejects other non-conforming names (path separator, empty)', () => {
+      expect(() => watchdogDir('a/b')).toThrow();
+      expect(() => watchdogDir('')).toThrow();
+    });
+  });
 });

@@ -7,7 +7,7 @@ import { createInterface } from 'node:readline';
 import { Command } from 'commander';
 import { VERSION } from './version.js';
 import { agentDir, agentsRoot, tmpRoot, logsRoot, deriveXdgRuntimeDir, watchdogsRoot } from './paths.js';
-import { loadConfig } from './config.js';
+import { loadConfig, ROLE_NAME_RE } from './config.js';
 import type { YamlMode } from './config-yaml.js';
 import { formatDuration } from './duration.js';
 import { resolvedPlan } from './resolved-plan.js';
@@ -386,12 +386,18 @@ program.command('status <name>').description('unit/agent state')
     }
   });
 
-/** A watchdog is addressable if it's still configured, or its store dir survives config removal. */
+/**
+ * A watchdog is addressable if it's still configured, or its store dir survives
+ * config removal. The name-shape check runs BEFORE any filesystem lookup
+ * (finding #1): a hostile `name` (path separators, '..', etc.) must never
+ * reach `join(watchdogsRoot(), name)` — treated as simply unknown, same as
+ * store.ts's own `watchdogDir` choke-point guard (defense in depth).
+ */
 function watchdogKnown(name: string, configPath?: string): boolean {
   try {
     if (loadConfig(configPath).watchdogs.some(w => w.name === name)) return true;
   } catch { /* config missing/broken: fall through to the store check */ }
-  return existsSync(joinPath(watchdogsRoot(), name));
+  return ROLE_NAME_RE.test(name) && existsSync(joinPath(watchdogsRoot(), name));
 }
 
 function renderHeldDownLine(state: WatchdogSchedulerState): string | undefined {

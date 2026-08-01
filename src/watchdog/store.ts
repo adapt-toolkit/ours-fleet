@@ -1,6 +1,10 @@
 import { chmodSync, mkdirSync, readFileSync, readdirSync, rmdirSync, unlinkSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { watchdogsRoot } from '../paths.js';
+// store.ts imports config.ts (ROLE_NAME_RE) but not the reverse — config.ts's
+// import graph (config-yaml, isolation/policy, harness/registry, watchdog/config)
+// never reaches back into watchdog/store.ts, so this does not create a cycle.
+import { ROLE_NAME_RE } from '../config.js';
 import type { WatchdogReport, WatchdogReportStatus } from './report.js';
 
 const RUN_ID_RE = /^\d{8}T\d{6}Z$/;
@@ -17,7 +21,16 @@ function ensureDir(dir: string): string {
   return dir;
 }
 
+/**
+ * Choke point every other helper in this module goes through to reach a
+ * watchdog's on-disk state. Validates `name` BEFORE any join/mkdir (defense
+ * in depth, finding #1): a caller that forgets its own ROLE_NAME_RE guard
+ * (as the CLI's `watchdogKnown` once did) must not be able to turn an
+ * unvalidated `name` into `join(watchdogsRoot(), '../../victim')` and mkdir
+ * an arbitrary path on disk.
+ */
 export function watchdogDir(name: string): string {
+  if (!ROLE_NAME_RE.test(name)) throw new Error(`invalid watchdog name '${name}'`);
   return ensureDir(join(watchdogsRoot(), name));
 }
 

@@ -219,6 +219,28 @@ describe('ours-fleet CLI', () => {
     expect(unknown.code).toBe(1);
   });
 
+  it('watchdog-report refuses a path-traversal-shaped name and touches nothing outside watchdogsRoot (finding #1)', async () => {
+    const { writeFileSync, mkdirSync: mkdir, statSync } = await import('node:fs');
+    writeFileSync(join(dir, 'fleet.yaml'), 'roles:\n  A: {}\nwatchdogs:\n  w: { coordinator: C }\n');
+    // watchdogsRoot() is `<dir>/.ours-fleet/watchdogs`; join(watchdogsRoot(), '../../evil')
+    // lands at `<dir>/evil` — two levels up from `watchdogs`. Pre-create that as an unrelated
+    // "victim" directory (0755, no reports/) so the traversal target actually exists: without
+    // that, `watchdogKnown`'s pre-fix existsSync check legitimately returns false regardless of
+    // any guard, and the test would pass vacuously.
+    const victim = join(dir, 'evil');
+    mkdir(victim, { recursive: true, mode: 0o755 });
+    const before = statSync(victim).mode & 0o777;
+
+    const r = await run(['watchdog-report', '../../evil', '--list']);
+    expect(r.code).toBe(1);
+    expect(r.stderr + r.stdout).toMatch(/unknown watchdog '\.\.\/\.\.\/evil'/);
+    // Pre-fix, watchdogKnown resolves this traversal to an existing dir, so listRuns() proceeds
+    // into store.ts's ensureDir, which chmods the target 0700 and mkdirs a reports/ inside it —
+    // an unrelated directory outside watchdogsRoot mutated by an unvalidated CLI arg.
+    expect(statSync(victim).mode & 0o777).toBe(before);
+    expect(existsSync(join(victim, 'reports'))).toBe(false);
+  });
+
   it('watchdog-report --list --json emits machine-readable run metadata, not the human table', async () => {
     const { writeFileSync, readFileSync } = await import('node:fs');
     writeFileSync(join(dir, 'fleet.yaml'), 'roles:\n  A: {}\nwatchdogs:\n  w: { coordinator: C }\n');
