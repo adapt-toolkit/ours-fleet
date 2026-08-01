@@ -16,7 +16,7 @@ import { pickBackend } from './supervisor/index.js';
 import { up, down, restartRoles, rmRole, type OpsDeps } from './ops.js';
 import { readRestartLedger, runSupervised, runTemp } from './runner.js';
 import { executeWatchdogRun, runWatchdogAgent } from './watchdog/run.js';
-import { readSchedulerState, runScheduler, type WatchdogSchedulerState } from './watchdog/scheduler.js';
+import { readSchedulerState, resetSchedulerState, runScheduler, type WatchdogSchedulerState } from './watchdog/scheduler.js';
 import { WatchdogServiceManager } from './watchdog/service.js';
 import {
   acquireRunLock, latestReport, listRuns, readReport, releaseRunLock, reportsDir, type RunListEntry,
@@ -184,7 +184,8 @@ cOpt(program.command('config').description('validate + print the merged plan (no
       if (cfg.watchdogs.length) {
         console.log('watchdogs:');
         for (const w of cfg.watchdogs) {
-          console.log(`● ${w.name}${w.enabled ? '' : '  (disabled)'}`);
+          console.log(`● ${w.name}${w.enabled ? '' : '  (disabled)'}`
+            + `${readSchedulerState(w.name).heldDown ? '  (held down)' : ''}`);
           console.log(`  every ${formatDuration(w.intervalMs)} -> ${w.coordinator}`);
           console.log(`  harness:  ${w.harness} (${w.session})${w.model ? `, model: ${w.model}` : ''}`);
           console.log(`  identity: ${w.identity}`);
@@ -206,8 +207,25 @@ cOpt(program.command('down [names...]').description('stop roles'))
   });
 
 cOpt(program.command('restart [names...]').description('re-sync config + bounce, RESUMING context'))
-  .action(async (names, opts) => {
-    try { await restartRoles(loadConfig(opts.configuration), names, deps(), 'keep', opts.configuration); } catch (e) { die(e); }
+  .action(async (names: string[], opts) => {
+    try {
+      const cfg = loadConfig(opts.configuration);
+      // Watchdog names can't collide with role names (config validation
+      // guarantees dispatch is unambiguous), so a name matching a configured
+      // watchdog is always a release, never a role restart. Release each
+      // named watchdog directly instead of handing it to restartRoles, which
+      // only knows about roles and would reject it as unknown (3.2 release path).
+      const watchdogNames = names.filter(n => cfg.watchdogs.some(w => w.name === n));
+      for (const wn of watchdogNames) {
+        resetSchedulerState(wn);
+        console.log(`released watchdog '${wn}' — scheduler resumes on its next poll`);
+      }
+      const roleNames = names.filter(n => !watchdogNames.includes(n));
+      // Bare `restart` (no names) restarts every role — that meaning must
+      // survive even though filtering an empty array also yields [].
+      if (names.length === 0 || roleNames.length > 0)
+        await restartRoles(cfg, roleNames, deps(), 'keep', opts.configuration);
+    } catch (e) { die(e); }
   });
 
 cOpt(program.command('force-restart [names...]').description('re-sync + bounce FRESH (context wiped)'))

@@ -253,6 +253,47 @@ describe('ours-fleet CLI', () => {
     expect(r.stdout).toContain('boom line');
   });
 
+  it('restart <watchdog> releases a held-down watchdog (spec §3, Task 15)', async () => {
+    const { writeFileSync, readFileSync } = await import('node:fs');
+    writeFileSync(join(dir, 'fleet.yaml'), 'roles:\n  A: {}\nwatchdogs:\n  w: { coordinator: C }\n');
+    const sdir = join(dir, '.ours-fleet', 'watchdogs', 'w');
+    mkdirSync(sdir, { recursive: true });
+    writeFileSync(join(sdir, 'state.json'), JSON.stringify({
+      version: 1, consecutiveFailures: 3, heldDown: true, heldSince: '2026-07-31T10:00:00Z',
+    }));
+
+    const cfgOut = await run(['config']);
+    expect(cfgOut.stdout).toContain('● w  (held down)');
+
+    const rep = await run(['watchdog-report', 'w', '--list']);
+    expect(rep.stdout).toMatch(/HELD DOWN/);
+
+    const r = await run(['restart', 'w']);
+    expect(r.code).toBe(0);
+    expect(r.stdout).toMatch(/released watchdog 'w'/);
+    expect(JSON.parse(readFileSync(join(sdir, 'state.json'), 'utf8')).heldDown).toBe(false);
+
+    // the config chip clears too, once the watchdog is no longer held down
+    const cfgAfter = await run(['config']);
+    expect(cfgAfter.stdout).not.toContain('(held down)');
+  });
+
+  it('restart with a mix of watchdog and role names releases the watchdog and restarts the role', async () => {
+    const { writeFileSync, readFileSync } = await import('node:fs');
+    writeFileSync(join(dir, 'fleet.yaml'), 'roles:\n  A: {}\nwatchdogs:\n  w: { coordinator: C }\n');
+    const sdir = join(dir, '.ours-fleet', 'watchdogs', 'w');
+    mkdirSync(sdir, { recursive: true });
+    writeFileSync(join(sdir, 'state.json'), JSON.stringify({
+      version: 1, consecutiveFailures: 3, heldDown: true, heldSince: '2026-07-31T10:00:00Z',
+    }));
+
+    const r = await run(['restart', 'w', 'A']);
+    expect(r.code).toBe(0);
+    expect(r.stdout).toMatch(/released watchdog 'w'/);
+    expect(r.stdout).toContain('A — restarted');
+    expect(JSON.parse(readFileSync(join(sdir, 'state.json'), 'utf8')).heldDown).toBe(false);
+  });
+
   it('spawn --help lists model and Codex controls', async () => {
     const r = await run(['spawn', '--help']);
     expect(r.code).toBe(0);
