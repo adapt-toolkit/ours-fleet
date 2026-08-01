@@ -183,6 +183,11 @@ export function resolveIsolation(cfg: IsolationConfig, ctx: WrapContext): Resolv
   }
   for (const dir of ctx.additionalWriteDirs ?? []) addRw(dir);
 
+  // The selected harness/session command may live outside the system allowlist
+  // (for example Node and a bundled ACP adapter under ~/.local). The runner
+  // resolves its exact executable/package closure; keep every such bind RO.
+  for (const path of ctx.runtimeReadPaths ?? []) addRo(path);
+
   // Declared fs extras.
   for (const p of cfg.fs?.write ?? []) addRw(p);
   for (const p of cfg.fs?.read ?? []) addRo(p);

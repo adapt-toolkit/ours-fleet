@@ -65,6 +65,8 @@ export interface WrapContext {
    * them for itself or for its peers.
    */
   harnessSharedPaths?: string[];
+  /** Exact launcher/interpreter/module closure required by the selected command. */
+  runtimeReadPaths?: string[];
   brokerEndpoint?: string;
 }
 

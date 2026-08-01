@@ -158,6 +158,27 @@ describe('runOnce isolation', () => {
     expect(paneCommands[0]).toContain('__ofs=$?');           // exit capture preserved
   });
 
+  it('resolves and read-only binds a home-scoped tmux launcher', async () => {
+    const binDir = join(dir, '.local', 'bin');
+    const launcher = join(binDir, 'home-launcher');
+    mkdirSync(binDir, { recursive: true });
+    writeFileSync(launcher, '#!/bin/sh\nexit 0\n', { mode: 0o755 });
+    registerAdapter({
+      ...fakeAdapter,
+      id: 'home-runtime',
+      buildLaunch: (_role, _mode, _state, prep) => ({ argv: ['home-launcher'], env: prep.env }),
+    });
+    writeCfg({ A: { harness: 'home-runtime', isolation: {} } });
+    const d = agentDir('A'); mkdirSync(d, { recursive: true });
+    const { deps, paneCommands } = fakeWorld({ exitCode: '0', exitFile: join(d, '.exit-status') });
+    const oldPath = process.env.PATH;
+    process.env.PATH = `${binDir}:${oldPath ?? ''}`;
+    try { await runOnce('A', {}, deps); }
+    finally { process.env.PATH = oldPath; }
+    expect(paneCommands[0]).toContain(`'--ro-bind-try' '${launcher}' '${launcher}'`);
+    expect(paneCommands[0]).toMatch(new RegExp(`'--'.*'${launcher}'`));
+  });
+
   it('does not wrap when the role has no isolation block', async () => {
     writeCfg({ A: { harness: 'fake' } });
     const d = agentDir('A'); mkdirSync(d, { recursive: true });

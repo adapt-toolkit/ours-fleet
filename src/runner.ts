@@ -16,6 +16,7 @@ import { resolveIsolation } from './isolation/policy.js';
 import { selectIsolationBackend } from './isolation/registry.js';
 import { resourceArgs, cpuControllerDelegated } from './isolation/resources.js';
 import type { WrapContext } from './isolation/types.js';
+import { resolveLaunchRuntime } from './isolation/runtime.js';
 import { AcpSession } from './session/acp.js';
 import { RoleControlServer } from './session/control.js';
 import { TmuxSession } from './session/tmux.js';
@@ -361,7 +362,7 @@ export async function runOnce(
   const runCwd = role.cwd && existsSync(role.cwd) ? role.cwd : dir;
   const prep = await adapter.prepareSession(role, { stateDir: dir, runCwd });
   const sessionBackend = role.session ?? 'tmux';
-  const launch = sessionBackend === 'acp'
+  let launch = sessionBackend === 'acp'
     ? (() => {
         if (!adapter.buildAcpLaunch)
           throw new Error(`harness '${role.harness}' does not support the ACP session backend`);
@@ -373,10 +374,15 @@ export async function runOnce(
   // env prefix + exit capture in buildPaneCommand stay host-side (see §5.3).
   let wrappedArgv = launch.argv;
   if (role.isolation) {
-    // The SAME context config validation and doctor judged (5.2): a policy
-    // checked against a different mount set than the one that launches is not a
-    // check at all.
-    const ctx: WrapContext = { ...isolationContextFor(role), stateDir: dir, runCwd };
+    // Start with the SAME durable context config validation and doctor judged
+    // (5.2), then add the selected launch's exact runtime closure. Those paths
+    // still pass through resolveIsolation's canonical blocklist enforcement.
+    const runtime = resolveLaunchRuntime(launch.argv);
+    launch = { ...launch, argv: runtime.argv };
+    const ctx: WrapContext = {
+      ...isolationContextFor(role), stateDir: dir, runCwd,
+      runtimeReadPaths: runtime.readPaths,
+    };
     const policy = resolveIsolation(role.isolation, ctx);
     const sel = await selectIsolationBackend(policy, deps.exec);  // throws on strict + unavailable
     const degradedMarker = join(dir, '.isolation-degraded');
