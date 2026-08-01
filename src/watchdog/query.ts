@@ -3,9 +3,42 @@ import { join } from 'node:path';
 import { FleetError } from '../application/errors.js';
 import { ROLE_NAME_RE, type FleetConfig } from '../config.js';
 import { watchdogsRoot } from '../paths.js';
-import type { WatchdogReport } from './report.js';
+import { WATCHDOG_STATUS_RANK } from './alerts.js';
+import type { WatchdogReport, WatchdogRoleStatus } from './report.js';
 import { readSchedulerState } from './scheduler.js';
 import { listRuns, readReport, type RunListEntry } from './store.js';
+
+export interface WatchdogRoleFinding { watchdog: string; status: WatchdogRoleStatus; reason: string }
+
+/**
+ * Needs-attention integration (Task 19): worst current finding per role across
+ * every configured watchdog, for FleetQueryService.status() to fold into a
+ * role's problems. An `error`-status report carries no role evidence (the run
+ * itself failed) so it's skipped outright, matching alerts.ts's
+ * reconcileLedger rule. Healthy/idle findings (rank 0) never surface here —
+ * only actionable anomalies do. "Worst" is decided by WATCHDOG_STATUS_RANK;
+ * ties keep whichever watchdog was seen first. Takes `latestReport` as a
+ * parameter (rather than importing store.ts directly) so it stays a pure,
+ * disk-free function for unit testing; runtime.ts wires the real store.
+ */
+export function buildWatchdogFindings(
+  cfg: { watchdogs: Array<{ name: string }> },
+  latestReport: (name: string) => WatchdogReport | undefined,
+): Map<string, WatchdogRoleFinding> {
+  const findings = new Map<string, WatchdogRoleFinding>();
+  for (const wd of cfg.watchdogs) {
+    const report = latestReport(wd.name);
+    if (!report || report.status === 'error') continue;
+    for (const finding of report.roles) {
+      const rank = WATCHDOG_STATUS_RANK[finding.status];
+      if (rank <= 0) continue;
+      const existing = findings.get(finding.role);
+      if (existing && WATCHDOG_STATUS_RANK[existing.status] >= rank) continue;
+      findings.set(finding.role, { watchdog: wd.name, status: finding.status, reason: finding.reason ?? '' });
+    }
+  }
+  return findings;
+}
 
 export interface WatchdogSummary {
   name: string; enabled: boolean; heldDown: boolean; heldSince: string | null; intervalMs: number;

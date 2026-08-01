@@ -93,6 +93,7 @@ button.role-row:hover { background: #141a1b; }
 .state.attention, .state.unknown, .hero-state.attention i, .hero-state.unknown i { background: var(--amber); }
 .state.offline, .hero-state.offline i { background: var(--red); }
 .role-name em { color: #7f8a8d; font-size: 10px; font-style: normal; border: 1px solid #2e3739; border-radius: 10px; padding: 3px 6px; }
+.role-pills { display: flex; flex-direction: column; align-items: flex-end; gap: 4px; }
 .empty { padding: 60px; text-align: center; color: var(--muted); }
 .banner { margin: 16px 36px 0; border: 1px solid; border-radius: 8px; padding: 10px 13px; font-size: 13px; }
 .banner.error, .error { border-color: #5c302f; background: #271616; color: #ffaaa5; }

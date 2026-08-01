@@ -17,7 +17,7 @@ type FleetItem = {
     session: { backend: string; reachability: string; readiness: string; evidence: string; pendingPermissionId?: string };
     monitor: { health: string };
     restart: { circuit: string };
-    problems: Array<{ detail: string }>;
+    problems: Array<{ detail: string; source?: string }>;
   };
   capabilities: Record<string, unknown>;
 };
@@ -164,7 +164,9 @@ export function App() {
                   <i aria-hidden="true" />{isInactive(item) ? 'Inactive' : statusLabel(item.status.overall)}</span>
                   <span><strong>{item.role.id}</strong><small className="mission-summary"
                     title={item.role.config?.mission}>{item.role.config?.mission || 'No mission summary'}</small></span>
-                  <em>{item.role.lifetime}</em></span>
+                  <span className="role-pills"><em>{item.role.lifetime}</em>
+                    {item.status.problems.some(problem => problem.source === 'watchdog') && <em>watchdog</em>}</span>
+                </span>
                 <span><strong>{item.role.config?.harness ?? 'unknown'}</strong><small>{item.status.session.backend} · {item.role.config?.model ?? 'default model'}</small></span>
                 <span><strong>{sessionLabel(item.status.session)}</strong>
                   <small>{serviceLabel(item.status.supervisor.liveness)} · {item.status.session.evidence}</small></span>

@@ -22,7 +22,8 @@ import { acquireWebServerLock } from './lock.js';
 import { TrustedDeviceStore } from './device-store.js';
 import { WebAuth } from './auth.js';
 import { startWebControlServer, type WebControlServer } from './control.js';
-import { WatchdogQueryService } from '../watchdog/query.js';
+import { buildWatchdogFindings, WatchdogQueryService } from '../watchdog/query.js';
+import { latestReport } from '../watchdog/store.js';
 
 const CONFIG_CACHE_TTL_MS = 5_000;
 
@@ -83,11 +84,30 @@ export async function startWebConsole(options: StartWebOptions): Promise<Running
   const audit = new AuditSink();
   const terminals = new TerminalBridgeManager({ repository, audit, tmux });
   const terminalAvailable = await terminals.available();
+  const watchdogConfigProvider = cachedConfigProvider(options.configPath);
+  const log = options.log ?? (() => {});
+  let loggedWatchdogFindingsError = false;
   const query = new FleetQueryService({
     repository, supervisor: backend, tmux,
     capabilityContext: { terminalPtyAvailable: terminalAvailable },
+    // Needs-attention integration (Task 19): worst per-role watchdog finding,
+    // rebuilt from stored reports on every status() call. A store hiccup
+    // (corrupt state, unreadable report) must never break the fleet list, so
+    // it degrades to an empty map and logs once rather than repeating on
+    // every poll.
+    watchdogFindings: () => {
+      try {
+        return buildWatchdogFindings(watchdogConfigProvider(), latestReport);
+      } catch (error) {
+        if (!loggedWatchdogFindingsError) {
+          loggedWatchdogFindingsError = true;
+          log(`watchdog findings unavailable: ${(error as Error).message}`);
+        }
+        return new Map();
+      }
+    },
   });
-  const ops = { backend, binPath: options.binPath, log: options.log ?? (() => {}) };
+  const ops = { backend, binPath: options.binPath, log };
   const creation = new RoleCreationService({
     configPath: options.configPath, ops, binPath: options.binPath,
     allowedCwdRoots: [realpathSync(home()), realpathSync(process.cwd())],
@@ -116,7 +136,7 @@ export async function startWebConsole(options: StartWebOptions): Promise<Running
     },
   });
   const logs = new StructuredLogService(backend, realExec);
-  const watchdogs = new WatchdogQueryService(cachedConfigProvider(options.configPath));
+  const watchdogs = new WatchdogQueryService(watchdogConfigProvider);
   let server: WebServer;
   try {
     server = await buildWebServer({
