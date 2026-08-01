@@ -1,11 +1,12 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { spawnSync } from 'node:child_process';
-import { chmodSync, mkdirSync, mkdtempSync, readdirSync, rmSync, writeFileSync, statSync } from 'node:fs';
+import { chmodSync, mkdirSync, mkdtempSync, readdirSync, rmSync, writeFileSync, statSync, utimesSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
   formatRunId, writeReport, listRuns, readReport, latestReport, pruneReports,
   watchdogDir, reportsDir, acquireRunLock, releaseRunLock, readRunLockOwner, reclaimStaleRunLock,
+  RUN_LOCK_OWNER_GRACE_MS,
 } from '../src/watchdog/store.js';
 import { errorReport } from '../src/watchdog/report.js';
 
@@ -104,8 +105,18 @@ describe('watchdog store', () => {
       releaseRunLock('w');
     });
 
-    it('reclaimStaleRunLock removes a legacy lock dir with no owner.json', () => {
+    it('reclaimStaleRunLock leaves a fresh ownerless lock alone during the acquisition grace window', () => {
       mkdirSync(join(watchdogDir('w'), '.run-lock'));
+      expect(reclaimStaleRunLock('w')).toBe(false);
+      expect(acquireRunLock('w')).toBe(false);
+      releaseRunLock('w');
+    });
+
+    it('reclaimStaleRunLock removes an old legacy lock dir with no owner.json', () => {
+      const lockDir = join(watchdogDir('w'), '.run-lock');
+      mkdirSync(lockDir);
+      const old = new Date(Date.now() - RUN_LOCK_OWNER_GRACE_MS - 1_000);
+      utimesSync(lockDir, old, old);
       expect(reclaimStaleRunLock('w')).toBe(true);
       expect(acquireRunLock('w')).toBe(true);
       releaseRunLock('w');

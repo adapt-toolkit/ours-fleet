@@ -1,13 +1,15 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { spawnSync } from 'node:child_process';
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync, utimesSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
   watchdogBackoffMs, runWatchdogLoop, readSchedulerState, resetSchedulerState, writeSchedulerState,
   runScheduler,
 } from '../src/watchdog/scheduler.js';
-import { listRuns, acquireRunLock, releaseRunLock, formatRunId, watchdogDir } from '../src/watchdog/store.js';
+import {
+  listRuns, acquireRunLock, releaseRunLock, formatRunId, watchdogDir, RUN_LOCK_OWNER_GRACE_MS,
+} from '../src/watchdog/store.js';
 import { errorReport } from '../src/watchdog/report.js';
 import { readLedger, writeLedger } from '../src/watchdog/alerts.js';
 import { loadConfig } from '../src/config.js';
@@ -280,7 +282,10 @@ describe('runScheduler recovers a run lock at startup, but only when it is demon
 
   it('reclaims a legacy lock dir with no owner.json (pre-finding-#2 locks)', async () => {
     writeCfg();
-    mkdirSync(join(watchdogDir('nightwatch'), '.run-lock'), { recursive: true });
+    const lockDir = join(watchdogDir('nightwatch'), '.run-lock');
+    mkdirSync(lockDir, { recursive: true });
+    const old = new Date(Date.now() - RUN_LOCK_OWNER_GRACE_MS - 1_000);
+    utimesSync(lockDir, old, old);
     const deps = {
       now: () => new Date(), sleep: async () => {}, log: () => {}, binPath: '/bin/false',
       shouldStop: () => true,

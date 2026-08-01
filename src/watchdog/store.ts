@@ -1,5 +1,5 @@
 import {
-  chmodSync, existsSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, unlinkSync, writeFileSync,
+  chmodSync, existsSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, statSync, unlinkSync, writeFileSync,
 } from 'node:fs';
 import { join } from 'node:path';
 import { watchdogsRoot } from '../paths.js';
@@ -11,6 +11,13 @@ import type { WatchdogReport, WatchdogReportStatus } from './report.js';
 
 const RUN_ID_RE = /^\d{8}T\d{6}Z$/;
 const REPORT_FILE_RE = /^\d{8}T\d{6}Z\.json$/;
+/**
+ * A lock directory briefly exists before acquireRunLock can rename its
+ * prewritten owner.json into it. Missing/corrupt owner metadata is therefore
+ * reclaimable only after this grace period, never while that acquisition
+ * window may still be in progress.
+ */
+export const RUN_LOCK_OWNER_GRACE_MS = 10_000;
 
 /**
  * mkdirSync's `mode` is masked by the process umask and ignored outright when
@@ -57,21 +64,19 @@ export interface RunLockOwner { pid: number; at: string }
  *
  * Stamps `owner.json` with our pid (finding #2): ownership metadata is what
  * lets a later `reclaimStaleRunLock` tell a lock abandoned by a dead process
- * apart from one genuinely held by a live run. Narrow TOCTOU close (review
- * polish): a naive "mkdir, then writeFileSync(owner.json)" leaves a window —
+ * apart from one genuinely held by a live run. A naive "mkdir, then
+ * writeFileSync(owner.json)" leaves an unnecessarily wide window —
  * between the mkdir succeeding and the write landing — where the lock dir
  * exists but owner.json doesn't yet. A `reclaimStaleRunLock` call from
  * another process landing in exactly that window would see a lock with no
  * (or corrupt) owner metadata and treat a genuinely live lock as a legacy
- * one, reclaiming it out from under us. Closed by doing all the slow work
- * (building the JSON, writing it, chmod) to a per-pid temp file BEFORE the
- * mkdir even runs, so the only thing that happens between "the lock dir
- * exists" and "owner.json exists in it" is a single `renameSync` — a rename
- * within the same directory is atomic at the filesystem level, so there is
- * no observable instant where the lock dir exists without its owner file.
- * The temp file is unique per-pid (this function is synchronous, so there's
- * no same-process concurrent-call hazard either) and is cleaned up if the
- * mkdir loses the race.
+ * one, reclaiming it out from under us. Do all slow work (building the JSON,
+ * writing it, chmod) to a per-pid temp file BEFORE mkdir, then publish it with
+ * one rename. There is still an unavoidable interval between those two
+ * syscalls; reclaimStaleRunLock protects it by treating a fresh ownerless lock
+ * as held for RUN_LOCK_OWNER_GRACE_MS. The temp file is unique per-pid (this
+ * function is synchronous, so there's no same-process concurrent-call hazard
+ * either) and is cleaned up if mkdir loses the race.
  */
 export function acquireRunLock(name: string): boolean {
   const dir = watchdogDir(name);
@@ -104,7 +109,7 @@ export function releaseRunLock(name: string): void {
   }
 }
 
-/** Reads a run lock's owner metadata; missing or corrupt yields undefined (treated as stale). */
+/** Reads a run lock's owner metadata; missing or corrupt yields undefined. */
 export function readRunLockOwner(name: string): RunLockOwner | undefined {
   try {
     const raw = JSON.parse(readFileSync(runLockOwnerPath(name), 'utf8')) as Partial<RunLockOwner>;
@@ -127,19 +132,32 @@ function pidAlive(pid: number): boolean {
 
 /**
  * Owner-mandated (finding #2): only a DEMONSTRABLY stale run lock may be
- * reclaimed — a lock is stale iff it isn't held at all, its owner metadata is
- * missing/corrupt (a legacy lock, or one whose owner.json write never
- * happened), or the owning pid is no longer alive. A live owner (a foreground
- * `watchdog-run`, another scheduler instance, an in-progress run) is left
- * strictly alone: reclaiming it would let two runs share the same temp dir.
+ * reclaimed — a lock is stale iff it isn't held at all, its owner metadata
+ * names a dead pid, or its owner metadata is missing/corrupt AND the lock dir
+ * is older than RUN_LOCK_OWNER_GRACE_MS. The age gate closes the interprocess
+ * interval between acquireRunLock's mkdir and owner.json rename: a concurrent
+ * scheduler sees a fresh ownerless lock as held, not stale. A live owner (a
+ * foreground `watchdog-run`, another scheduler instance, an in-progress run)
+ * is left strictly alone: reclaiming it would let two runs share the same temp
+ * dir.
  * Returns true when the lock is (now) not held — whether because it was
  * already absent or because a stale lock was just removed; false when a live
  * lock was found and deliberately left in place.
  */
 export function reclaimStaleRunLock(name: string): boolean {
-  if (!existsSync(runLockPath(name))) return true;
+  const path = runLockPath(name);
+  if (!existsSync(path)) return true;
   const owner = readRunLockOwner(name);
   if (owner !== undefined && pidAlive(owner.pid)) return false;
+  if (owner === undefined) {
+    try {
+      if (Date.now() - statSync(path).mtimeMs < RUN_LOCK_OWNER_GRACE_MS) return false;
+    } catch (e) {
+      // The holder may have released between existsSync and statSync.
+      if ((e as NodeJS.ErrnoException).code === 'ENOENT') return true;
+      throw e;
+    }
+  }
   releaseRunLock(name);
   return true;
 }
