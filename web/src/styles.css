@@ -50,6 +50,20 @@ button.secondary:hover, .actions button:hover { border-color: #526064; }
 .toolbar > div { display: flex; align-items: center; gap: 10px; }
 .toolbar button { padding: 7px 10px; }
 .role-row.inactive { opacity: .72; }
+.role-row.active { background: #141a1b; border-left: 2px solid var(--mint); }
+.watchdog-detail-layout { display: grid; gap: 18px; }
+.watchdog-report-head { display: flex; align-items: center; gap: 12px; }
+.watchdog-report-head h2 { flex: 1; }
+.watchdog-roles { display: grid; gap: 10px; margin-top: 12px; }
+.watchdog-role { border: 1px solid var(--line); border-radius: 8px; padding: 12px 14px; background: #0d1213; }
+.watchdog-role-head { display: flex; align-items: center; gap: 10px; }
+.watchdog-role-head strong { text-transform: capitalize; }
+.watchdog-role-detail, .watchdog-role-note { margin: 8px 0 0; font-size: 12px; color: var(--muted); }
+.watchdog-role-note { color: var(--amber); }
+.watchdog-role details { margin-top: 8px; font-size: 12px; }
+.watchdog-role summary { cursor: pointer; color: var(--muted); }
+.watchdog-role details ul { margin: 8px 0 0; padding-left: 18px; color: #c9d1d3; }
+.watchdog-role details li { margin-bottom: 4px; }
 .status-guide { display: flex; flex-wrap: wrap; gap: 7px; align-items: center; margin-bottom: 15px; color: var(--muted); font-size: 11px; }
 .status-guide > span, .status-chip { display: inline-flex; align-items: center; gap: 5px; border: 1px solid #30393b; border-radius: 12px; padding: 3px 7px; white-space: nowrap; }
 .status-guide b { color: white; font-size: 11px; }

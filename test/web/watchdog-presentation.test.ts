@@ -1,5 +1,8 @@
 import { describe, expect, it } from 'vitest';
-import { nextRunLabel, watchdogChip, watchdogLine, type WatchdogSummaryView } from '../../web/src/watchdog-presentation.js';
+import {
+  alertNote, nextRunLabel, runDuration, watchdogChip, watchdogLine,
+  type WatchdogReportView, type WatchdogSummaryView,
+} from '../../web/src/watchdog-presentation.js';
 
 const base = (overrides: Partial<WatchdogSummaryView> = {}): WatchdogSummaryView => ({
   name: 'nightwatch', enabled: true, heldDown: false, heldSince: null,
@@ -125,5 +128,70 @@ describe('nextRunLabel', () => {
 
   it('is overdue when the scheduled time has passed', () => {
     expect(nextRunLabel(base({ nextRunAt: '2026-07-31T11:00:00Z' }), now)).toBe('overdue');
+  });
+});
+
+describe('runDuration', () => {
+  it('renders plain seconds under a minute', () => {
+    expect(runDuration({ startedAt: '2026-07-31T12:00:00Z', finishedAt: '2026-07-31T12:00:45Z' })).toBe('45s');
+  });
+
+  it('renders minutes and seconds compound form over a minute', () => {
+    expect(runDuration({ startedAt: '2026-07-31T12:00:00Z', finishedAt: '2026-07-31T12:01:12Z' })).toBe('1m 12s');
+  });
+
+  it('omits the seconds part on an exact minute boundary', () => {
+    expect(runDuration({ startedAt: '2026-07-31T12:00:00Z', finishedAt: '2026-07-31T12:02:00Z' })).toBe('2m');
+  });
+
+  it('is a dash when startedAt is unparseable', () => {
+    expect(runDuration({ startedAt: 'not-a-date', finishedAt: '2026-07-31T12:00:00Z' })).toBe('-');
+  });
+
+  it('is a dash when finishedAt is unparseable', () => {
+    expect(runDuration({ startedAt: '2026-07-31T12:00:00Z', finishedAt: '' })).toBe('-');
+  });
+
+  it('clamps a negative span (clock skew) to zero rather than going negative', () => {
+    expect(runDuration({ startedAt: '2026-07-31T12:00:10Z', finishedAt: '2026-07-31T12:00:00Z' })).toBe('0s');
+  });
+});
+
+describe('alertNote', () => {
+  const report = (overrides: Partial<WatchdogReportView> = {}): WatchdogReportView => ({
+    schema_version: 1, watchdog: 'nightwatch', run_id: '20260731T115000Z',
+    started_at: '2026-07-31T11:50:00Z', finished_at: '2026-07-31T11:51:12Z', status: 'anomalies',
+    summary: { checked: 2, healthy: 1, idle: 0, anomalies: 1 },
+    roles: [], alerts: [{ role: 'Alice', code: 'blocked', coordinator: 'FleetCoordinator', sent_at: '2026-07-31T11:51:10Z' }],
+    error: null,
+    ...overrides,
+  });
+
+  it('is empty for a healthy finding', () => {
+    expect(alertNote({ role: 'Docs', status: 'healthy' }, report())).toBe('');
+  });
+
+  it('is empty for an idle finding', () => {
+    expect(alertNote({ role: 'Docs', status: 'idle' }, report())).toBe('');
+  });
+
+  it('reports the coordinator and time when alerted with a matching alerts[] entry', () => {
+    expect(alertNote({ role: 'Alice', status: 'blocked', reason: 'stuck', alerted: true }, report()))
+      .toBe('alerted -> FleetCoordinator at 2026-07-31T11:51:10Z');
+  });
+
+  it('reports suppressed when a non-healthy finding was not alerted (cooldown)', () => {
+    expect(alertNote({ role: 'Alice', status: 'blocked', reason: 'stuck', alerted: false }, report()))
+      .toBe('suppressed (open finding within cooldown)');
+  });
+
+  it('reports suppressed when alerted is absent entirely', () => {
+    expect(alertNote({ role: 'Alice', status: 'blocked', reason: 'stuck' }, report()))
+      .toBe('suppressed (open finding within cooldown)');
+  });
+
+  it('degrades gracefully when alerted is true but no matching alerts[] entry exists', () => {
+    expect(alertNote({ role: 'Bob', status: 'stale', reason: 'no heartbeat', alerted: true }, report()))
+      .toBe('alerted -> unknown at unknown time');
   });
 });

@@ -57,8 +57,71 @@ const inactiveStatus = {
     backend: 'acp', reachability: 'offline', readiness: 'failed', evidence: 'authoritative',
   },
 };
+// Two stored runs for the 'nightwatch' watchdog: an older healthy run and the
+// current (newest) run with one blocked finding — reason, evidence, and a
+// matching alerts[] entry, so the detail view's evidence <details> and
+// alert-note derivation both have something real to render.
+const watchdogRuns = {
+  nightwatch: [
+    {
+      runId: '20260731T120000Z', status: 'anomalies',
+      startedAt: '2026-07-31T12:00:00Z', finishedAt: '2026-07-31T12:01:12Z',
+      summary: { checked: 2, healthy: 1, idle: 0, anomalies: 1 }, error: null,
+    },
+    {
+      runId: '20260731T110000Z', status: 'ok',
+      startedAt: '2026-07-31T11:00:00Z', finishedAt: '2026-07-31T11:00:45Z',
+      summary: { checked: 2, healthy: 2, idle: 0, anomalies: 0 }, error: null,
+    },
+  ],
+};
+const watchdogReports = {
+  nightwatch: {
+    '20260731T120000Z': {
+      schema_version: 1, watchdog: 'nightwatch', run_id: '20260731T120000Z',
+      started_at: '2026-07-31T12:00:00Z', finished_at: '2026-07-31T12:01:12Z', status: 'anomalies',
+      summary: { checked: 2, healthy: 1, idle: 0, anomalies: 1 },
+      roles: [
+        {
+          role: 'Alice', status: 'blocked', reason: 'Waiting on a trust dialog.',
+          evidence: [{ source: 'status', detail: 'readiness=awaiting_permission', observed_at: '2026-07-31T12:00:31Z' }],
+          alerted: true,
+        },
+        { role: 'Docs', status: 'healthy' },
+      ],
+      alerts: [{ role: 'Alice', code: 'blocked', coordinator: 'FleetCoordinator', sent_at: '2026-07-31T12:01:10Z' }],
+      error: null,
+    },
+    '20260731T110000Z': {
+      schema_version: 1, watchdog: 'nightwatch', run_id: '20260731T110000Z',
+      started_at: '2026-07-31T11:00:00Z', finished_at: '2026-07-31T11:00:45Z', status: 'ok',
+      summary: { checked: 2, healthy: 2, idle: 0, anomalies: 0 },
+      roles: [{ role: 'Alice', status: 'healthy' }, { role: 'Docs', status: 'healthy' }],
+      alerts: [], error: null,
+    },
+  },
+};
+const watchdogsService = {
+  async list() {
+    return {
+      watchdogs: [{
+        name: 'nightwatch', enabled: true, heldDown: false, heldSince: null,
+        intervalMs: 600_000, coordinator: 'FleetCoordinator', watch: ['Alice', 'Docs'],
+        lastRunAt: '2026-07-31T12:00:00Z', nextRunAt: '2026-07-31T12:10:00Z',
+        latest: {
+          runId: '20260731T120000Z', status: 'anomalies',
+          startedAt: '2026-07-31T12:00:00Z', finishedAt: '2026-07-31T12:01:12Z',
+          summary: { checked: 2, healthy: 1, idle: 0, anomalies: 1 }, error: null,
+        },
+      }],
+    };
+  },
+  async reports(name) { return { runs: watchdogRuns[name] ?? [] }; },
+  async report(name, runId) { return watchdogReports[name]?.[runId]; },
+};
 const actions = new Map();
 const services = {
+  watchdogs: watchdogsService,
   query: {
     async list() { return [
       { role, status: { ...status, observedAt: new Date().toISOString() }, capabilities },

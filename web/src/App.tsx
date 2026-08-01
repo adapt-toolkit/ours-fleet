@@ -3,7 +3,7 @@ import { api, idempotencyKey } from './api';
 import { CreateRole } from './CreateRole';
 import { RoleWorkspace } from './RoleWorkspace';
 import { isInactive, needsAttention, presentFleet } from './fleet-presentation';
-import { WatchdogsView } from './Watchdogs';
+import { WatchdogDetail, WatchdogsView } from './Watchdogs';
 
 type FleetItem = {
   role: {
@@ -136,11 +136,7 @@ export function App() {
           ? <AuditView />
           : view === 'watchdogs'
             ? (selectedWatchdog
-              ? <div className="content">
-                <button className="back" onClick={() => setSelectedWatchdog('')}>← Back to watchdogs</button>
-                <h2>{selectedWatchdog}</h2>
-                <p className="muted">Watchdog detail view coming soon.</p>
-              </div>
+              ? <WatchdogDetail api={api} name={selectedWatchdog} onBack={() => setSelectedWatchdog('')} />
               : <WatchdogsView api={api} onSelect={setSelectedWatchdog} />)
             : <div className="content">
             <div className="status-guide" aria-label="Fleet status meanings">
