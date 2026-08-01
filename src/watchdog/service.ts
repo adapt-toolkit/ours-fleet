@@ -61,12 +61,40 @@ export class WatchdogServiceManager {
 
   async stop(): Promise<void> {
     if (this.platform === 'linux') {
-      await this.must('systemctl', ['--user', 'stop', WATCHDOG_SYSTEMD_UNIT]);
+      // Tolerate "not loaded" (systemctl exit 5) the same way the launchd
+      // branch below tolerates "could not find service": a watchdog-less
+      // fleet's `up`/`down` calls stop() defensively even when the unit was
+      // never installed, and that must not surface as an error (final
+      // review #3).
+      const result = await this.exec('systemctl', ['--user', 'stop', WATCHDOG_SYSTEMD_UNIT]);
+      if (result.code !== 0 && result.code !== 5 && !/not loaded/i.test(`${result.stdout}\n${result.stderr}`))
+        throw new FleetError('control_unavailable',
+          `systemctl --user stop ${WATCHDOG_SYSTEMD_UNIT} failed: ${result.stderr.trim() || `exit ${result.code}`}`);
       return;
     }
     const result = await this.exec('launchctl', ['bootout', `gui/${uid()}/${WATCHDOG_LAUNCHD_LABEL}`]);
     if (result.code !== 0 && !/could not find service|no such process/i.test(`${result.stdout}\n${result.stderr}`))
       throw new FleetError('control_unavailable', `launchctl bootout failed: ${result.stderr.trim()}`);
+  }
+
+  /**
+   * `start()` is a no-op on an already-active unit — systemctl start against
+   * a running service just returns 0 without reloading anything, and
+   * launchctl kickstart (without -k) behaves the same way. That means a
+   * config change (new/changed watchdogs) never reaches a live scheduler
+   * process via reconcileWatchdogScheduler's `install` + `start` pair (final
+   * review #4). `restart()` mirrors WebServiceManager.restart: an
+   * unconditional restart on Linux, and `kickstart -k` (force-restart) on
+   * macOS, falling back to stop+start if the kickstart itself fails.
+   */
+  async restart(): Promise<void> {
+    this.requireInstalled();
+    if (this.platform === 'linux') {
+      await this.must('systemctl', ['--user', 'restart', WATCHDOG_SYSTEMD_UNIT]);
+      return;
+    }
+    const result = await this.exec('launchctl', ['kickstart', '-k', `gui/${uid()}/${WATCHDOG_LAUNCHD_LABEL}`]);
+    if (result.code !== 0) { await this.stop(); await this.start(); }
   }
 
   async status(): Promise<string> {

@@ -102,16 +102,21 @@ export function normalizeWatchdogReport(r: WatchdogReport, ctx: { watchdog: stri
   copy.watchdog = ctx.watchdog;
   copy.run_id = ctx.run_id;
   copy.roles = copy.roles.map(role => {
-    const next: WatchdogFinding = { ...role };
-    if (next.reason !== undefined) next.reason = cleanEvidence(next.reason);
-    if (next.evidence !== undefined) {
-      next.evidence = next.evidence.slice(0, 3).map(ev => ({
+    // Rebuilt from ONLY the known fields (final review #6a) — the old
+    // `{ ...role }` spread let any unknown per-finding key (e.g. an agent
+    // dumping a huge `pane_dump`) ride unbounded into the store. Report-level
+    // extras (tail/isolation) are untouched here and stay tolerated; this is
+    // a per-finding allowlist only.
+    const next: WatchdogFinding = { role: role.role, status: role.status };
+    if (role.reason !== undefined) next.reason = cleanEvidence(role.reason);
+    if (role.evidence !== undefined) {
+      next.evidence = role.evidence.slice(0, 3).map(ev => ({
         source: cleanEvidence(ev.source),
         detail: cleanEvidence(ev.detail),
         observed_at: cleanEvidence(ev.observed_at),
       }));
     }
-    if (next.alerted !== undefined) next.alerted = Boolean(next.alerted);
+    if (role.alerted !== undefined) next.alerted = Boolean(role.alerted);
     return next;
   });
   return copy;
@@ -130,7 +135,11 @@ export function errorReport(ctx: {
     summary: { checked: 0, healthy: 0, idle: 0, anomalies: 0 },
     roles: [],
     alerts: [],
-    error: ctx.error,
+    // Scheduler-built error strings can embed raw agent-controlled bytes
+    // (JSON.parse messages, validator interpolations of agent-supplied
+    // values) and are stored+printed as-is elsewhere — clean them the same
+    // way finding-level text is cleaned (final review #6b).
+    error: cleanEvidence(ctx.error),
     ...(ctx.tail !== undefined ? { tail: ctx.tail.slice(-4096) } : {}),
   };
 }

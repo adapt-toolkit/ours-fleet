@@ -1,13 +1,15 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
   watchdogBackoffMs, runWatchdogLoop, readSchedulerState, resetSchedulerState, writeSchedulerState,
+  runScheduler,
 } from '../src/watchdog/scheduler.js';
 import { listRuns, acquireRunLock, releaseRunLock, formatRunId } from '../src/watchdog/store.js';
 import { errorReport } from '../src/watchdog/report.js';
 import { readLedger, writeLedger } from '../src/watchdog/alerts.js';
+import { loadConfig } from '../src/config.js';
 
 let dir: string;
 beforeEach(() => {
@@ -188,5 +190,86 @@ describe('watchdog scheduler', () => {
     expect(calls).toHaveLength(1);
     expect(calls[0].name).toBe('nightwatch');
     expect(calls[0].text).toMatch(/held down after 3/);
+  });
+});
+
+describe('runScheduler threads its loaded cfg through to run + notifier deps (final review #1)', () => {
+  const cfgPath = () => join(dir, 'fleet.yaml');
+  const writeCfgFile = () => writeFileSync(cfgPath(),
+    'roles:\n  Alice: {}\nwatchdogs:\n  nightwatch: { coordinator: FleetCoordinator }\n');
+
+  it('passes the scheduler-loaded cfg into runOnceFor\'s deps, not the default loadConfig() fallback', async () => {
+    writeCfgFile();
+    const expectedCfg = loadConfig(cfgPath());
+    let seenCfg: unknown;
+    let calls = 0;
+    const deps = {
+      now: () => new Date(), sleep: async () => {}, log: () => {}, binPath: '/bin/false',
+      shouldStop: () => calls >= 1,
+      runOnceFor: async (w: { name: string }, runDeps: { cfg?: unknown }) => {
+        calls++;
+        seenCfg = runDeps.cfg;
+        return {
+          report: errorReport({
+            watchdog: w.name, run_id: formatRunId(new Date()),
+            started_at: 'a', finished_at: 'b', error: 'x',
+          }),
+          storedPath: '',
+        };
+      },
+    };
+    await runScheduler(cfgPath(), deps as never);
+    expect(seenCfg).toEqual(expectedCfg);
+  });
+
+  it('passes the scheduler-loaded cfg into the default onSchedulerAlert/notifierRun path', async () => {
+    writeCfgFile();
+    const expectedCfg = loadConfig(cfgPath());
+    let seenCfg: unknown;
+    let notifierCalled = false;
+    const deps = {
+      now: () => new Date(), sleep: async () => {}, log: () => {}, binPath: '/bin/false',
+      shouldStop: () => notifierCalled,
+      runOnceFor: async (w: { name: string }) => ({
+        report: {
+          ...errorReport({
+            watchdog: w.name, run_id: formatRunId(new Date()),
+            started_at: 'a', finished_at: 'b', error: 'boom',
+          }),
+          status: 'error',
+        },
+        storedPath: '',
+      }),
+      notifierRun: async (_w: unknown, _text: string, runDeps: { cfg?: unknown }) => {
+        seenCfg = runDeps.cfg;
+        notifierCalled = true;
+      },
+    };
+    await runScheduler(cfgPath(), deps as never);
+    expect(seenCfg).toEqual(expectedCfg);
+  });
+});
+
+describe('runScheduler recovers a stale run lock at startup (final review #2a)', () => {
+  it('clears each enabled watchdog\'s run lock before looping, so a SIGKILLed prior run does not wedge scheduling forever', async () => {
+    writeFileSync(join(dir, 'fleet.yaml'),
+      'roles:\n  Alice: {}\nwatchdogs:\n  nightwatch: { coordinator: FleetCoordinator }\n');
+    acquireRunLock('nightwatch'); // simulate a stale lock left by a SIGKILLed prior run
+    const deps = {
+      now: () => new Date(), sleep: async () => {}, log: () => {}, binPath: '/bin/false',
+      shouldStop: () => true, // never actually tick — only prove the startup sweep ran
+    };
+    await runScheduler(join(dir, 'fleet.yaml'), deps as never);
+    expect(acquireRunLock('nightwatch')).toBe(true); // lock was released; re-acquirable
+    releaseRunLock('nightwatch');
+  });
+});
+
+describe('resetSchedulerState releases the run lock too (final review #2b)', () => {
+  it('an operator restart of a held-down watchdog clears a stale lock, not just the failure/hold-down state', () => {
+    acquireRunLock('nightwatch');
+    resetSchedulerState('nightwatch');
+    expect(acquireRunLock('nightwatch')).toBe(true);
+    releaseRunLock('nightwatch');
   });
 });

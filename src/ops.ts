@@ -33,6 +33,8 @@ export interface OpsDeps {
     install(binPath: string, configPath?: string): Promise<void>;
     start(): Promise<void>;
     stop(): Promise<void>;
+    /** Bounces an already-running scheduler so a config change actually reaches it — `start()` is a no-op on an active unit. */
+    restart(): Promise<void>;
     supervised(): boolean;
   };
 }
@@ -128,13 +130,24 @@ async function reconcileWatchdogScheduler(cfg: FleetConfig, deps: OpsDeps, confi
   if (!svc) return;
   const enabled = cfg.watchdogs.filter(w => w.enabled);
   try {
-    if (!enabled.length) { await svc.stop(); return; }
+    // Check supervised() before any stop (final review #3): on an
+    // unsupervised platform/config, the scheduler was never installed, so
+    // stopping it is not just a no-op — on Linux, stop() throws for a unit
+    // that was never loaded. A watchdog-less fleet must not see that
+    // failure surface as a spurious "! watchdogs scheduler: ..." warning.
+    if (!enabled.length) {
+      if (svc.supervised()) await svc.stop();
+      return;
+    }
     if (!svc.supervised()) {
       deps.log("! watchdogs configured but OURS_FLEET_SUPERVISOR=none — run 'ours-fleet _run-watchdogs' in the foreground");
       return;
     }
     await svc.install(deps.binPath, configPath);
-    await svc.start();
+    // restart(), not start(): start() is a no-op on an already-active unit,
+    // so a config change (new/changed watchdogs) would never reach a
+    // scheduler that's already running (final review #4).
+    await svc.restart();
     deps.log(`↑ watchdogs scheduler (${enabled.map(w => w.name).join(', ')})`);
   } catch (e) {
     deps.log(`  ! watchdogs scheduler: ${e instanceof Error ? e.message : String(e)}`);
@@ -153,7 +166,10 @@ export async function down(cfg: FleetConfig, names: string[], deps: OpsDeps): Pr
   // Only a whole-fleet `down` (no names) stops the scheduler — stopping one
   // named role is not a decision to stop watching the others (tolerate
   // absence/errors: a never-installed scheduler must not fail `down`).
-  if (names.length === 0 && deps.watchdogService) {
+  // supervised() gates the call itself (final review #3): on an
+  // unsupervised platform/config there is nothing installed to stop, and
+  // Linux's stop() throws for a unit that was never loaded.
+  if (names.length === 0 && deps.watchdogService?.supervised()) {
     try { await deps.watchdogService.stop(); }
     catch (e) {
       deps.log(`  ! could not stop watchdogs scheduler: ${e instanceof Error ? e.message : String(e)}`);

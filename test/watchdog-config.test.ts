@@ -59,6 +59,14 @@ describe('watchdogs config', () => {
     base(TWO_ROLES + 'watchdogs:\n  w: { coordinator: C, identity: Alice }\n');
     expect(() => loadConfig()).toThrowError(/watchdog 'w'.*identity 'Alice' collides/);
   });
+  it('rejects two watchdogs sharing an explicit identity (final review #5: unchecked collision -> shared temp dir + tmux session + locks)', () => {
+    base(TWO_ROLES + 'watchdogs:\n  w1: { coordinator: C, identity: Shared }\n  w2: { coordinator: C, identity: Shared }\n');
+    expect(() => loadConfig()).toThrowError(/watchdog 'w2': identity 'Shared' collides with watchdog 'w1'/);
+  });
+  it('rejects an implicit default identity colliding with another watchdog\'s explicit identity', () => {
+    base(TWO_ROLES + 'watchdogs:\n  nightwatch: { coordinator: C, identity: Watchdog-other }\n  other: { coordinator: C }\n');
+    expect(() => loadConfig()).toThrowError(/watchdog 'other': identity 'Watchdog-other' collides with watchdog 'nightwatch'/);
+  });
   it('enforces the 1m interval minimum and duration syntax', () => {
     base(TWO_ROLES + 'watchdogs:\n  w: { coordinator: C, interval: 30s }\n');
     expect(() => loadConfig()).toThrowError(/interval.*minimum.*1m/);

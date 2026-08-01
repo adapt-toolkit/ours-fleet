@@ -45,6 +45,11 @@ export function resolveWatchdogs(
     throw new ConfigError(`${baseFile}: watchdogs: must be a map`);
   const roleNames = new Set(roles.map(r => r.name));
   const roleIdentities = new Set(roles.map(r => r.identity));
+  // Tracks identity -> owning watchdog name across entries (final review #5):
+  // two watchdogs declaring the same identity would otherwise share a temp
+  // dir, tmux session, and run lock with no error until they collide at
+  // runtime.
+  const watchdogIdentities = new Map<string, string>();
   const out: ResolvedWatchdog[] = [];
   for (const [name, rawEntry] of Object.entries(block as Record<string, unknown>)) {
     const where = `${baseFile}: watchdog '${name}'`;
@@ -66,6 +71,10 @@ export function resolveWatchdogs(
     const identity = w.identity ?? `Watchdog-${name}`;
     if (roleNames.has(identity) || roleIdentities.has(identity))
       throw new ConfigError(`${where}: identity '${identity}' collides with a role name or identity`);
+    const collidingWatchdog = watchdogIdentities.get(identity);
+    if (collidingWatchdog !== undefined)
+      throw new ConfigError(`${where}: identity '${identity}' collides with watchdog '${collidingWatchdog}'`);
+    watchdogIdentities.set(identity, name);
     const harness = w.harness ?? (defaults.harness as string | undefined) ?? 'claude-code';
     const sessionRaw = w.session ?? (defaults.session as string | undefined) ?? 'tmux';
     if (sessionRaw !== 'tmux' && sessionRaw !== 'acp')

@@ -86,6 +86,25 @@ describe('normalizeWatchdogReport', () => {
     expect(n.roles[0].evidence![0].detail).not.toContain('\x07');
     expect(n.roles[0].evidence![0].detail.length).toBeLessThanOrEqual(280);
   });
+
+  it('drops unknown per-finding keys (e.g. a huge pane_dump) instead of storing them unbounded (final review #6a)', () => {
+    const r = good();
+    (r.roles[0] as unknown as Record<string, unknown>).pane_dump = 'x'.repeat(100_000);
+    (r.roles[1] as unknown as Record<string, unknown>).extra_junk = { nested: true };
+    const n = normalizeWatchdogReport(r as never, { watchdog: 'nightwatch', run_id: '20260731T115000Z' });
+    expect((n.roles[0] as unknown as Record<string, unknown>).pane_dump).toBeUndefined();
+    expect((n.roles[1] as unknown as Record<string, unknown>).extra_junk).toBeUndefined();
+    // known fields still survive the rebuild
+    expect(n.roles[0]).toMatchObject({ role: 'Alice', status: 'blocked' });
+    expect(n.roles[1]).toMatchObject({ role: 'Docs', status: 'healthy' });
+  });
+
+  it('tolerates report-level extra keys (e.g. tail/isolation) — only per-finding keys are pruned', () => {
+    const r = { ...good(), tail: 'diagnostic tail', isolation: 'degraded' };
+    const n = normalizeWatchdogReport(r as never, { watchdog: 'nightwatch', run_id: '20260731T115000Z' });
+    expect((n as unknown as Record<string, unknown>).tail).toBe('diagnostic tail');
+    expect((n as unknown as Record<string, unknown>).isolation).toBe('degraded');
+  });
 });
 
 describe('errorReport', () => {
@@ -100,5 +119,14 @@ describe('errorReport', () => {
     expect(r.summary).toEqual({ checked: 0, healthy: 0, idle: 0, anomalies: 0 });
     expect((r as { tail?: string }).tail === undefined
       || (r as { tail?: string }).tail!.length <= 4096).toBe(true);
+  });
+
+  it('cleans the error string: strips control chars and caps at 280 (final review #6b, e.g. raw JSON.parse/validator-interpolated agent bytes)', () => {
+    const dirty = `invalid report: Unexpected token \x07 in JSON at position 12: ${'z'.repeat(500)}`;
+    const r = errorReport({
+      watchdog: 'w', run_id: '20260731T115000Z', started_at: 'a', finished_at: 'b', error: dirty,
+    });
+    expect(r.error).not.toContain('\x07');
+    expect(r.error!.length).toBeLessThanOrEqual(280);
   });
 });

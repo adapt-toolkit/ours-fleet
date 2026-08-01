@@ -1,6 +1,7 @@
 import { readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { loadConfig } from '../config.js';
+import type { FleetConfig } from '../config.js';
 import type { ResolvedWatchdog } from './config.js';
 import { errorReport } from './report.js';
 import { executeNotifierRun, executeWatchdogRun, type WatchdogRunOutcome } from './run.js';
@@ -41,11 +42,21 @@ export function writeSchedulerState(name: string, s: WatchdogSchedulerState): vo
  * once per hold-down" durable across scheduler restarts (it lives in
  * alerts.json, not state.json), so a release must reset it too or a
  * subsequent hold-down would silently alert zero times.
+ *
+ * Also releases the run lock (final review #2): a watchdog SIGKILLed mid-run
+ * (e.g. systemd's TimeoutStopSec on a fleet-wide stop) leaves `.run-lock`
+ * behind forever — the loop's `finally` that would normally release it never
+ * runs. Without this, every future tick sees the lock held and reports
+ * `skipped_overlap` indefinitely, and skips never alert. `ours-fleet restart
+ * <watchdog>` is the documented recovery, so it must clear the lock too, not
+ * just the failure/hold-down bookkeeping. Best-effort: a release failure here
+ * must not turn an operator's recovery action into a crash.
  */
 export function resetSchedulerState(name: string): void {
   writeSchedulerState(name, cleanState());
   const ledger = readLedger(name);
   if (ledger.heldDownAlerted) writeLedger(name, { ...ledger, heldDownAlerted: false });
+  try { releaseRunLock(name); } catch { /* best effort */ }
 }
 
 export const WATCHDOG_HOLD_THRESHOLD = 3;
@@ -62,6 +73,15 @@ export interface SchedulerDeps {
   sleep(ms: number): Promise<void>;
   log(line: string): void;
   binPath: string;
+  /**
+   * The fleet config `runScheduler` loaded from the `-c FILE`/default path
+   * (final review #1). Threaded into both `runOnceFor`'s and the notifier's
+   * deps so a run under a non-default config doesn't silently fall back to
+   * `loadConfig()`'s default `~/fleet.yaml`. `runWatchdogLoop` callers that
+   * bypass `runScheduler` (tests) may omit it — the run/notifier machinery
+   * falls back to `loadConfig()` itself when `cfg` is undefined.
+   */
+  cfg?: FleetConfig;
   /** Injectable for tests. */
   runOnceFor?: typeof executeWatchdogRun;
   /** Loop exit for tests + SIGTERM (wired by the CLI, not here). */
@@ -105,7 +125,7 @@ export async function runWatchdogLoop(wd: ResolvedWatchdog, deps: SchedulerDeps)
   const shouldStop = deps.shouldStop ?? (() => false);
   const notifierRun = deps.notifierRun ?? executeNotifierRun;
   const onSchedulerAlert = deps.onSchedulerAlert ?? ((wd, text) => notifierRun(wd, text, {
-    binPath: deps.binPath, log: deps.log, now: deps.now, sleep: deps.sleep,
+    binPath: deps.binPath, log: deps.log, now: deps.now, sleep: deps.sleep, cfg: deps.cfg,
   }));
   const heldPollMs = deps.heldPollMs ?? 5_000;
   const locks = deps.locks ?? { acquire: acquireRunLock, release: releaseRunLock };
@@ -215,7 +235,7 @@ export async function runWatchdogLoop(wd: ResolvedWatchdog, deps: SchedulerDeps)
     let tickError: string | undefined;
     try {
       outcome = await runOnceFor(wd, {
-        binPath: deps.binPath, log: deps.log, now: deps.now, sleep: deps.sleep,
+        binPath: deps.binPath, log: deps.log, now: deps.now, sleep: deps.sleep, cfg: deps.cfg,
       });
     } catch (e) {
       tickError = e instanceof Error ? e.message : String(e);
@@ -251,5 +271,16 @@ export async function runWatchdogLoop(wd: ResolvedWatchdog, deps: SchedulerDeps)
 export async function runScheduler(configPath: string | undefined, deps: SchedulerDeps): Promise<void> {
   const cfg = loadConfig(configPath);
   const watchdogs = cfg.watchdogs.filter(w => w.enabled);
-  await Promise.all(watchdogs.map(wd => runWatchdogLoop(wd, deps)));
+  const locks = deps.locks ?? { acquire: acquireRunLock, release: releaseRunLock };
+  // Recover from a SIGKILLed prior run (final review #2a): a scheduler
+  // restart is proof no scheduler-owned run is in flight for any of these
+  // watchdogs, so any `.run-lock` still on disk is stale — left behind by a
+  // process that never reached its `finally`. Without this sweep the lock
+  // survives forever and every future tick reports `skipped_overlap`, which
+  // never alerts and never counts as a failure either. Best-effort: a
+  // release failure here must not prevent the scheduler from starting.
+  for (const wd of watchdogs) {
+    try { locks.release(wd.name); } catch { /* best effort */ }
+  }
+  await Promise.all(watchdogs.map(wd => runWatchdogLoop(wd, { ...deps, cfg })));
 }

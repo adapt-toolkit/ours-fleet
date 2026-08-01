@@ -99,4 +99,42 @@ describe('WatchdogServiceManager', () => {
     const { manager } = fixture('win32' as 'linux');
     expect(manager.supervised()).toBe(false);
   });
+
+  it('stop() tolerates "not loaded" (exit 5) on linux, mirroring launchd\'s tolerance (final review #3)', async () => {
+    const exec: Exec = async (command, args) => {
+      if (command === 'systemctl' && args.includes('stop'))
+        return { code: 5, stdout: '', stderr: 'Unit ours-fleet-watchdogs.service not loaded.' };
+      return { code: 0, stdout: '', stderr: '' };
+    };
+    const manager = new WatchdogServiceManager(exec, 'linux');
+    await expect(manager.stop()).resolves.toBeUndefined();
+  });
+
+  it('stop() still throws on a real systemctl failure (not the not-loaded case)', async () => {
+    const exec: Exec = async (command, args) => {
+      if (command === 'systemctl' && args.includes('stop'))
+        return { code: 1, stdout: '', stderr: 'Failed to connect to bus' };
+      return { code: 0, stdout: '', stderr: '' };
+    };
+    const manager = new WatchdogServiceManager(exec, 'linux');
+    await expect(manager.stop()).rejects.toThrow(/Failed to connect to bus/);
+  });
+
+  it('restart() invokes systemctl --user restart on linux (final review #4)', async () => {
+    const { calls, manager } = fixture('linux');
+    const binPath = join(home, 'cli.js');
+    writeFileSync(binPath, '');
+    await manager.install(binPath);
+    await manager.restart();
+    expect(calls).toContainEqual(['systemctl', ['--user', 'restart', WATCHDOG_SYSTEMD_UNIT]]);
+  });
+
+  it('restart() kickstarts on darwin', async () => {
+    const { calls, manager } = fixture('darwin');
+    const binPath = join(home, 'cli.js');
+    writeFileSync(binPath, '');
+    await manager.install(binPath);
+    await manager.restart();
+    expect(calls.some(([cmd, args]) => cmd === 'launchctl' && args[0] === 'kickstart' && args.includes('-k'))).toBe(true);
+  });
 });

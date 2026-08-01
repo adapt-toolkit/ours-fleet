@@ -79,6 +79,7 @@ function fakeWatchdogService(opts: { supervised?: boolean } = {}) {
     async install(binPath, configPath) { calls.push(`install:${binPath}:${configPath ?? ''}`); },
     async start() { calls.push('start'); },
     async stop() { calls.push('stop'); },
+    async restart() { calls.push('restart'); },
     supervised: () => opts.supervised ?? true,
   };
   return { calls, svc };
@@ -211,13 +212,13 @@ describe('up/down reconcile the supervised watchdog scheduler', () => {
   const withWatchdog = (extra = '') =>
     writeFileSync(join(dir, 'fleet.yaml'), `roles:\n  A: {}\nwatchdogs:\n  w: { coordinator: A${extra} }\n`);
 
-  it('up with an enabled watchdog installs + starts the scheduler when supervised', async () => {
+  it('up with an enabled watchdog installs + restarts the scheduler when supervised (final review #4: `start` is a no-op on an already-active unit, so config changes never reach it)', async () => {
     withWatchdog();
     const { backend } = fakeBackend();
     const { calls, svc } = fakeWatchdogService();
     const { d, logs } = deps(backend, svc);
     await up(loadConfig(), [], d);
-    expect(calls).toEqual(['install:/bin/ours-fleet:', 'start']);
+    expect(calls).toEqual(['install:/bin/ours-fleet:', 'restart']);
     expect(logs.join('\n')).toMatch(/↑ watchdogs scheduler.*w/);
   });
 
@@ -240,6 +241,15 @@ describe('up/down reconcile the supervised watchdog scheduler', () => {
     expect(calls).toEqual(['stop']);
   });
 
+  it('up with no watchdogs and an unsupervised service never calls stop (final review #3: spurious stop on watchdog-less fleets)', async () => {
+    writeCfg({ A: { harness: 'fake' } });
+    const { backend } = fakeBackend();
+    const { calls, svc } = fakeWatchdogService({ supervised: false });
+    const { d } = deps(backend, svc);
+    await up(loadConfig(), [], d);
+    expect(calls).not.toContain('stop');
+  });
+
   it('up logs the foreground hint when watchdogs are enabled but unsupervised', async () => {
     withWatchdog();
     const { backend } = fakeBackend();
@@ -256,7 +266,7 @@ describe('up/down reconcile the supervised watchdog scheduler', () => {
     const { calls, svc } = fakeWatchdogService();
     const { d } = deps(backend, svc);
     await up(loadConfig(), ['A'], d);
-    expect(calls).toEqual(['install:/bin/ours-fleet:', 'start']);
+    expect(calls).toEqual(['install:/bin/ours-fleet:', 'restart']);
   });
 
   it('up never fails when the scheduler service throws', async () => {
@@ -266,6 +276,7 @@ describe('up/down reconcile the supervised watchdog scheduler', () => {
       async install() { throw new Error('boom'); },
       async start() { throw new Error('boom'); },
       async stop() { throw new Error('boom'); },
+      async restart() { throw new Error('boom'); },
       supervised: () => true,
     };
     const { d, logs } = deps(backend, svc);
@@ -287,6 +298,15 @@ describe('up/down reconcile the supervised watchdog scheduler', () => {
     const { d } = deps(backend, svc);
     await down(loadConfig(), [], d);
     expect(calls).toEqual(['stop']);
+  });
+
+  it('a whole-fleet down never calls stop when the service reports unsupervised (final review #3)', async () => {
+    withWatchdog();
+    const { backend } = fakeBackend();
+    const { calls, svc } = fakeWatchdogService({ supervised: false });
+    const { d } = deps(backend, svc);
+    await down(loadConfig(), [], d);
+    expect(calls).not.toContain('stop');
   });
 
   it('a named `down <Role>` does NOT stop the scheduler', async () => {
