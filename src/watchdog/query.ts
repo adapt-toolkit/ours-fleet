@@ -20,13 +20,20 @@ export interface WatchdogRoleFinding { watchdog: string; status: WatchdogRoleSta
  * ties keep whichever watchdog was seen first. Takes `latestReport` as a
  * parameter (rather than importing store.ts directly) so it stays a pure,
  * disk-free function for unit testing; runtime.ts wires the real store.
+ *
+ * Skips disabled watchdogs (finding #5): a watchdog turned off in config
+ * still has its last stored report sitting on disk, and without this check
+ * that stale report's findings would pin roles in "Needs attention" forever
+ * — an operator disabling a noisy/broken watchdog has no way to make the
+ * findings it already produced go away.
  */
 export function buildWatchdogFindings(
-  cfg: { watchdogs: Array<{ name: string }> },
+  cfg: { watchdogs: Array<{ name: string; enabled: boolean }> },
   latestReport: (name: string) => WatchdogReport | undefined,
 ): Map<string, WatchdogRoleFinding> {
   const findings = new Map<string, WatchdogRoleFinding>();
   for (const wd of cfg.watchdogs) {
+    if (!wd.enabled) continue;
     const report = latestReport(wd.name);
     if (!report || report.status === 'error') continue;
     for (const finding of report.roles) {

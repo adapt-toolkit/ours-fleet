@@ -21,12 +21,12 @@ describe('buildWatchdogFindings', () => {
         roles: [{ role: 'Alice', status: 'blocked', reason: 'unreachable' }],
       }),
     };
-    const findings = buildWatchdogFindings({ watchdogs: [{ name: 'nightwatch' }] }, name => reports[name]);
+    const findings = buildWatchdogFindings({ watchdogs: [{ name: 'nightwatch', enabled: true }] }, name => reports[name]);
     expect(findings.size).toBe(0);
   });
 
   it('skips watchdogs with no stored report', () => {
-    const findings = buildWatchdogFindings({ watchdogs: [{ name: 'ghost' }] }, () => undefined);
+    const findings = buildWatchdogFindings({ watchdogs: [{ name: 'ghost', enabled: true }] }, () => undefined);
     expect(findings.size).toBe(0);
   });
 
@@ -37,7 +37,7 @@ describe('buildWatchdogFindings', () => {
         roles: [{ role: 'Alice', status: 'healthy' }, { role: 'Bob', status: 'idle' }],
       }),
     };
-    const findings = buildWatchdogFindings({ watchdogs: [{ name: 'nightwatch' }] }, name => reports[name]);
+    const findings = buildWatchdogFindings({ watchdogs: [{ name: 'nightwatch', enabled: true }] }, name => reports[name]);
     expect(findings.size).toBe(0);
   });
 
@@ -60,7 +60,9 @@ describe('buildWatchdogFindings', () => {
       }),
     };
     const findings = buildWatchdogFindings(
-      { watchdogs: [{ name: 'dayshift' }, { name: 'nightwatch' }, { name: 'brokenwatch' }] },
+      { watchdogs: [
+        { name: 'dayshift', enabled: true }, { name: 'nightwatch', enabled: true }, { name: 'brokenwatch', enabled: true },
+      ] },
       name => reports[name],
     );
     // stale (rank 2) < blocked (rank 3): nightwatch's finding wins.
@@ -68,6 +70,24 @@ describe('buildWatchdogFindings', () => {
     expect(findings.has('Bob')).toBe(false);
     expect(findings.has('Carol')).toBe(false);
     expect(findings.size).toBe(1);
+  });
+
+  it('skips a disabled watchdog entirely, even though its last stored report still has a blocked finding (finding #5)', () => {
+    const reports: Record<string, WatchdogReport | undefined> = {
+      nightwatch: report({
+        watchdog: 'nightwatch', status: 'anomalies',
+        roles: [{ role: 'Alice', status: 'blocked', reason: 'permission pending' }],
+      }),
+    };
+    const disabled = buildWatchdogFindings(
+      { watchdogs: [{ name: 'nightwatch', enabled: false }] }, name => reports[name],
+    );
+    expect(disabled.size).toBe(0);
+
+    const enabled = buildWatchdogFindings(
+      { watchdogs: [{ name: 'nightwatch', enabled: true }] }, name => reports[name],
+    );
+    expect(enabled.get('Alice')).toEqual({ watchdog: 'nightwatch', status: 'blocked', reason: 'permission pending' });
   });
 });
 
