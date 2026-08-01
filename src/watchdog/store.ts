@@ -1,5 +1,5 @@
 import {
-  chmodSync, existsSync, mkdirSync, readFileSync, readdirSync, rmSync, unlinkSync, writeFileSync,
+  chmodSync, existsSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, unlinkSync, writeFileSync,
 } from 'node:fs';
 import { join } from 'node:path';
 import { watchdogsRoot } from '../paths.js';
@@ -55,20 +55,38 @@ export interface RunLockOwner { pid: number; at: string }
  * would work too, but a directory needs no cleanup of file contents and
  * can't be partially written). EEXIST means another run holds it.
  *
- * After the mkdir succeeds, stamps `owner.json` with our pid (finding #2):
- * ownership metadata is what lets a later `reclaimStaleRunLock` tell a lock
- * abandoned by a dead process apart from one genuinely held by a live run.
+ * Stamps `owner.json` with our pid (finding #2): ownership metadata is what
+ * lets a later `reclaimStaleRunLock` tell a lock abandoned by a dead process
+ * apart from one genuinely held by a live run. Narrow TOCTOU close (review
+ * polish): a naive "mkdir, then writeFileSync(owner.json)" leaves a window —
+ * between the mkdir succeeding and the write landing — where the lock dir
+ * exists but owner.json doesn't yet. A `reclaimStaleRunLock` call from
+ * another process landing in exactly that window would see a lock with no
+ * (or corrupt) owner metadata and treat a genuinely live lock as a legacy
+ * one, reclaiming it out from under us. Closed by doing all the slow work
+ * (building the JSON, writing it, chmod) to a per-pid temp file BEFORE the
+ * mkdir even runs, so the only thing that happens between "the lock dir
+ * exists" and "owner.json exists in it" is a single `renameSync` — a rename
+ * within the same directory is atomic at the filesystem level, so there is
+ * no observable instant where the lock dir exists without its owner file.
+ * The temp file is unique per-pid (this function is synchronous, so there's
+ * no same-process concurrent-call hazard either) and is cleaned up if the
+ * mkdir loses the race.
  */
 export function acquireRunLock(name: string): boolean {
+  const dir = watchdogDir(name);
+  const owner: RunLockOwner = { pid: process.pid, at: new Date().toISOString() };
+  const tempOwnerPath = join(dir, `.owner.${process.pid}.tmp`);
+  writeFileSync(tempOwnerPath, JSON.stringify(owner), { mode: 0o600 });
+  chmodSync(tempOwnerPath, 0o600);
   try {
     mkdirSync(runLockPath(name));
   } catch (e) {
+    try { unlinkSync(tempOwnerPath); } catch { /* best effort cleanup */ }
     if ((e as NodeJS.ErrnoException).code === 'EEXIST') return false;
     throw e;
   }
-  const owner: RunLockOwner = { pid: process.pid, at: new Date().toISOString() };
-  writeFileSync(runLockOwnerPath(name), JSON.stringify(owner), { mode: 0o600 });
-  chmodSync(runLockOwnerPath(name), 0o600);
+  renameSync(tempOwnerPath, runLockOwnerPath(name));
   return true;
 }
 

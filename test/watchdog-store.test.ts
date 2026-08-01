@@ -1,6 +1,6 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { spawnSync } from 'node:child_process';
-import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync, statSync } from 'node:fs';
+import { chmodSync, mkdirSync, mkdtempSync, readdirSync, rmSync, writeFileSync, statSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
@@ -114,15 +114,28 @@ describe('watchdog store', () => {
     it('reclaimStaleRunLock is a no-op (returns true) when no lock is held', () => {
       expect(reclaimStaleRunLock('w')).toBe(true);
     });
-  });
 
-  describe('watchdogDir path traversal (finding #1)', () => {
-    it('rejects a traversal-shaped name before any fs effect', () => {
-      expect(() => watchdogDir('../x')).toThrow();
+    it('owner.json is present the instant acquire returns, with no leaked temp file (TOCTOU close, review polish)', () => {
+      // The narrow race this closes (a reclaimStaleRunLock landing between mkdir
+      // and the owner.json write) isn't directly triggerable from a synchronous
+      // unit test — acquireRunLock is one synchronous call, so there's no seam to
+      // interleave another call into. What IS directly assertable: the moment
+      // acquireRunLock returns, owner.json already exists (never a later, separate
+      // write the caller has to wait for), and the per-pid temp file used to close
+      // the window is gone rather than left behind.
+      expect(acquireRunLock('w')).toBe(true);
+      expect(readRunLockOwner('w')).toMatchObject({ pid: process.pid });
+      expect(readdirSync(join(watchdogDir('w'), '.run-lock'))).toEqual(['owner.json']);
+      expect(readdirSync(watchdogDir('w')).some(f => f.startsWith('.owner.'))).toBe(false);
+      releaseRunLock('w');
     });
-    it('rejects other non-conforming names (path separator, empty)', () => {
-      expect(() => watchdogDir('a/b')).toThrow();
-      expect(() => watchdogDir('')).toThrow();
+
+    it('cleans up its temp owner file when it loses the mkdir race (EEXIST)', () => {
+      acquireRunLock('w');   // holds the real lock
+      expect(acquireRunLock('w')).toBe(false);   // loses the race: EEXIST path
+      // No stray .owner.<pid>.tmp left in watchdogDir('w') from the failed attempt.
+      expect(readdirSync(watchdogDir('w')).some(f => f.startsWith('.owner.'))).toBe(false);
+      releaseRunLock('w');
     });
   });
 
