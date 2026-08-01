@@ -1,9 +1,12 @@
-import { existsSync, mkdirSync, readFileSync, writeFileSync, rmSync, unlinkSync } from 'node:fs';
+import {
+  chmodSync, existsSync, mkdirSync, readFileSync, writeFileSync, rmSync, unlinkSync,
+} from 'node:fs';
 import { join } from 'node:path';
-import { randomUUID } from 'node:crypto';
-import { agentDir, fleetDDir } from './paths.js';
+import { randomUUID, createHash } from 'node:crypto';
+import { agentDir, fleetDDir, watchdogsRoot } from './paths.js';
 import type { FleetConfig, ResolvedRole } from './config.js';
 import { findRole } from './config.js';
+import type { ResolvedWatchdog } from './watchdog/config.js';
 import { getAdapter } from './harness/registry.js';
 import { generateBriefing } from './briefing.js';
 import { resetRestartLedger } from './runner.js';
@@ -30,7 +33,8 @@ export interface OpsDeps {
    * just because this hook is missing.
    */
   watchdogService?: {
-    install(binPath: string, configPath?: string): Promise<void>;
+    /** `changed` is true when the unit/plist content itself differs from what's on disk (or was absent). */
+    install(binPath: string, configPath?: string): Promise<{ changed: boolean }>;
     start(): Promise<void>;
     stop(): Promise<void>;
     /** Bounces an already-running scheduler so a config change actually reaches it — `start()` is a no-op on an active unit. */
@@ -117,6 +121,39 @@ export async function up(
   return outcomes;
 }
 
+const WATCHDOG_FINGERPRINT_FILE = '.config-fingerprint';
+
+/** Deterministic JSON: object keys sorted recursively, so key-insertion order never affects the hash. */
+function stableStringify(value: unknown): string {
+  return JSON.stringify(value, (_key, v: unknown) => {
+    if (v !== null && typeof v === 'object' && !Array.isArray(v)) {
+      return Object.keys(v as Record<string, unknown>).sort()
+        .reduce<Record<string, unknown>>((acc, k) => { acc[k] = (v as Record<string, unknown>)[k]; return acc; }, {});
+    }
+    return v;
+  });
+}
+
+/** sha256 over the resolved enabled-watchdog set, stable regardless of config source order (finding #4). */
+function watchdogFingerprint(enabled: ResolvedWatchdog[]): string {
+  const sorted = [...enabled].sort((a, b) => a.name.localeCompare(b.name));
+  return createHash('sha256').update(stableStringify(sorted)).digest('hex');
+}
+
+function fingerprintPath(): string {
+  return join(watchdogsRoot(), WATCHDOG_FINGERPRINT_FILE);
+}
+
+function readStoredFingerprint(): string | undefined {
+  try { return readFileSync(fingerprintPath(), 'utf8').trim(); } catch { return undefined; }
+}
+
+function writeFingerprint(fingerprint: string): void {
+  mkdirSync(watchdogsRoot(), { recursive: true, mode: 0o700 });
+  writeFileSync(fingerprintPath(), fingerprint + '\n', { mode: 0o600 });
+  chmodSync(fingerprintPath(), 0o600);   // mkdirSync/writeFileSync's mode is masked by umask; force it
+}
+
 /**
  * Install/start (or stop) the single supervised watchdog-scheduler process
  * (Task 10) to match the config's enabled watchdogs. Runs on every `up`,
@@ -124,6 +161,19 @@ export async function up(
  * (only reconciling on a whole-fleet `up`) would leave a newly-enabled
  * watchdog unscheduled until the next bare `up`. Never throws: a scheduler
  * hiccup must not fail the role installs that already succeeded.
+ *
+ * Restarts ONLY when something the scheduler actually needs to pick up
+ * changed (finding #4): an unconditional `restart()` on every `up` —
+ * including a named `up <SomeUnrelatedRole>` — interrupted whatever the
+ * scheduler was mid-run (a 15s stop timeout can kill a long check without a
+ * report). Two independent signals decide: `svc.install()`'s own `changed`
+ * (the unit/plist content — binPath/configPath — differs), and a config
+ * fingerprint over the resolved enabled-watchdog set (sha256, stored at
+ * `<watchdogsRoot>/.config-fingerprint`) — needed because interval/watch/etc.
+ * never appear in the unit content itself (the unit just re-execs `-c
+ * <configPath>`), so `install()` alone can never see them change. Either
+ * signal true -> restart(); neither -> the idempotent start() (a no-op if
+ * already active, otherwise brings up a stopped unit).
  */
 async function reconcileWatchdogScheduler(cfg: FleetConfig, deps: OpsDeps, configPath?: string): Promise<void> {
   const svc = deps.watchdogService;
@@ -143,12 +193,21 @@ async function reconcileWatchdogScheduler(cfg: FleetConfig, deps: OpsDeps, confi
       deps.log("! watchdogs configured but OURS_FLEET_SUPERVISOR=none — run 'ours-fleet _run-watchdogs' in the foreground");
       return;
     }
-    await svc.install(deps.binPath, configPath);
-    // restart(), not start(): start() is a no-op on an already-active unit,
-    // so a config change (new/changed watchdogs) would never reach a
-    // scheduler that's already running (final review #4).
-    await svc.restart();
-    deps.log(`↑ watchdogs scheduler (${enabled.map(w => w.name).join(', ')})`);
+    const { changed: unitChanged } = await svc.install(deps.binPath, configPath);
+    const fingerprint = watchdogFingerprint(enabled);
+    const fingerprintChanged = readStoredFingerprint() !== fingerprint;
+    if (unitChanged || fingerprintChanged) {
+      // restart(), not start(): start() is a no-op on an already-active unit,
+      // so a config change (new/changed watchdogs) would never reach a
+      // scheduler that's already running (final review #4).
+      await svc.restart();
+      deps.log(`↑ watchdogs scheduler (${enabled.map(w => w.name).join(', ')})`);
+    } else {
+      // Idempotent: a no-op on an already-active unit, but still brings up a
+      // stopped one (e.g. the scheduler crashed and systemd gave up retrying).
+      await svc.start();
+    }
+    writeFingerprint(fingerprint);
   } catch (e) {
     deps.log(`  ! watchdogs scheduler: ${e instanceof Error ? e.message : String(e)}`);
   }

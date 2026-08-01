@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
-import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync, rmSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync, rmSync, statSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { stringify } from 'yaml';
@@ -73,10 +73,20 @@ function deps(backend: SupervisorBackend, watchdogService?: OpsDeps['watchdogSer
   return { d, logs };
 }
 
-function fakeWatchdogService(opts: { supervised?: boolean } = {}) {
+/**
+ * `installChanged` simulates WatchdogServiceManager.install()'s own changed-detection
+ * (finding #4): defaults to true, matching a first-ever install (no unit file yet).
+ * Tests that need to prove the config-fingerprint gate on its own set it false —
+ * a real install() would too, since binPath/configPath (the only inputs the real
+ * unit content depends on) are unchanged between those calls.
+ */
+function fakeWatchdogService(opts: { supervised?: boolean; installChanged?: boolean } = {}) {
   const calls: string[] = [];
   const svc: NonNullable<OpsDeps['watchdogService']> = {
-    async install(binPath, configPath) { calls.push(`install:${binPath}:${configPath ?? ''}`); },
+    async install(binPath, configPath) {
+      calls.push(`install:${binPath}:${configPath ?? ''}`);
+      return { changed: opts.installChanged ?? true };
+    },
     async start() { calls.push('start'); },
     async stop() { calls.push('stop'); },
     async restart() { calls.push('restart'); },
@@ -220,6 +230,44 @@ describe('up/down reconcile the supervised watchdog scheduler', () => {
     await up(loadConfig(), [], d);
     expect(calls).toEqual(['install:/bin/ours-fleet:', 'restart']);
     expect(logs.join('\n')).toMatch(/↑ watchdogs scheduler.*w/);
+  });
+
+  describe('restart is gated on an actual change, not fired on every up (finding #4)', () => {
+    it('a second reconcile of the SAME config calls start, not restart — an unrelated `up` must not interrupt an in-flight check', async () => {
+      withWatchdog();
+      const { backend } = fakeBackend();
+      // installChanged: false on every call — a real install() would report exactly this
+      // across two calls with the same binPath/configPath, since neither changed.
+      const first = fakeWatchdogService({ installChanged: false });
+      await up(loadConfig(), [], deps(backend, first.svc).d);   // no stored fingerprint yet -> restart
+
+      const second = fakeWatchdogService({ installChanged: false });
+      await up(loadConfig(), [], deps(backend, second.svc).d);   // same config -> fingerprint unchanged too
+      expect(second.calls).toEqual(['install:/bin/ours-fleet:', 'start']);
+    });
+
+    it('a changed watchdog interval triggers restart even though the unit/plist content itself is unaffected by it', async () => {
+      withWatchdog(', interval: 5m');
+      const { backend } = fakeBackend();
+      const first = fakeWatchdogService({ installChanged: false });
+      await up(loadConfig(), [], deps(backend, first.svc).d);   // establishes the fingerprint for interval: 5m
+
+      withWatchdog(', interval: 15m');   // only the interval changed; unit content (binPath/-c) did not
+      const second = fakeWatchdogService({ installChanged: false });   // a real install() would report false too
+      await up(loadConfig(), [], deps(backend, second.svc).d);
+      expect(second.calls).toEqual(['install:/bin/ours-fleet:', 'restart']);
+    });
+
+    it('writes the config fingerprint file (0600) after a successful reconcile', async () => {
+      withWatchdog();
+      const { backend } = fakeBackend();
+      const { svc } = fakeWatchdogService();
+      const { d } = deps(backend, svc);
+      await up(loadConfig(), [], d);
+      const fpPath = join(dir, '.ours-fleet', 'watchdogs', '.config-fingerprint');
+      expect(existsSync(fpPath)).toBe(true);
+      expect((statSync(fpPath).mode & 0o777)).toBe(0o600);
+    });
   });
 
   it('up with only a disabled watchdog does not install the scheduler', async () => {

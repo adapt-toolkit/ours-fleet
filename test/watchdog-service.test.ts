@@ -43,6 +43,18 @@ describe('WatchdogServiceManager', () => {
     expect(calls).toContainEqual(['systemctl', ['--user', 'enable', WATCHDOG_SYSTEMD_UNIT]]);
   });
 
+  it('install() reports changed:true on a first install and changed:false when re-installing identical content (finding #4)', async () => {
+    const { manager } = fixture('linux');
+    const binPath = join(home, 'cli.js');
+    writeFileSync(binPath, '');
+    const first = await manager.install(binPath, '/tmp/fleet.yaml');
+    expect(first.changed).toBe(true);
+    const second = await manager.install(binPath, '/tmp/fleet.yaml');
+    expect(second.changed).toBe(false);
+    const third = await manager.install(binPath, '/tmp/other.yaml');   // different -c: content differs
+    expect(third.changed).toBe(true);
+  });
+
   it('installs a launchd plist whose ProgramArguments run the hidden scheduler command', async () => {
     const { manager } = fixture('darwin');
     const binPath = join(home, 'cli.js');

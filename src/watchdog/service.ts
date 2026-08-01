@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, realpathSync, rmSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, realpathSync, rmSync } from 'node:fs';
 import { dirname, isAbsolute, join, resolve } from 'node:path';
 import { replaceFileAtomically } from '../atomic-file.js';
 import { FleetError } from '../application/errors.js';
@@ -32,19 +32,32 @@ export class WatchdogServiceManager {
     return this.platform === 'linux' || this.platform === 'darwin';
   }
 
-  async install(binPath: string, configPath?: string): Promise<void> {
+  /**
+   * Writes the unit/plist and returns whether its content actually changed
+   * (finding #4): `binPath`/`configPath` are the only inputs that ever
+   * change this content, and neither reflects a watchdog's `interval:` or
+   * any other config value inside `watchdogs:` — so `changed` here can never
+   * by itself justify a restart on every config edit. It's one of the two
+   * signals reconcileWatchdogScheduler (ops.ts) combines with a config
+   * fingerprint before deciding restart vs. the idempotent start.
+   */
+  async install(binPath: string, configPath?: string): Promise<{ changed: boolean }> {
     const resolvedScript = resolveExecutable(binPath, 'ours-fleet CLI script');
     const runtime = resolveExecutable(process.execPath, 'Node runtime');
     const config = configPath ? resolve(configPath) : undefined;
+    const content = this.platform === 'linux'
+      ? watchdogSystemdUnit(runtime, resolvedScript, config)
+      : watchdogLaunchdPlist(runtime, resolvedScript, config);
+    let previous: string | undefined;
+    try { previous = readFileSync(this.definitionPath, 'utf8'); } catch { /* absent: definitely changed */ }
+    const changed = previous !== content;
     mkdirSync(dirname(this.definitionPath), { recursive: true, mode: 0o700 });
-    replaceFileAtomically(this.definitionPath,
-      this.platform === 'linux'
-        ? watchdogSystemdUnit(runtime, resolvedScript, config)
-        : watchdogLaunchdPlist(runtime, resolvedScript, config), 0o600);
+    replaceFileAtomically(this.definitionPath, content, 0o600);
     if (this.platform === 'linux') {
       await this.must('systemctl', ['--user', 'daemon-reload']);
       await this.must('systemctl', ['--user', 'enable', WATCHDOG_SYSTEMD_UNIT]);
     }
+    return { changed };
   }
 
   async start(): Promise<void> {
