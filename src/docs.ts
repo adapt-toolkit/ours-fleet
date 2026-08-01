@@ -167,7 +167,7 @@ watchdogs:
     # everything below is optional
     enabled: true                   # default true; false = configured but never scheduled
     interval: 10m                   # default 10m; 30s | 10m | 2h, minimum 1m
-    watch: [Alice, CodexReviewer]   # default: every role in the merged config
+    watch: [Alice, CodexReviewer]   # explicit lists are exact; omit for configured + live temp roles
     harness: claude-code            # default: defaults.harness
     model: claude-fable-5           # default: same resolution rule roles use (resolveRoleModel)
     session: acp                    # default: defaults.session
@@ -176,12 +176,22 @@ watchdogs:
     keep_reports: 50                # default 50 reports retained per watchdog
     alert_cooldown: 60m             # default 60m before the same finding alerts again
     prompt_file: /abs/extra.md      # optional extra focus, APPENDED to the fixed contract
+    isolation:                      # optional; omitted means no OS sandbox, like an ordinary role
+      backend: bubblewrap           # when present, the ordinary role isolation schema applies
+      network: broker
+      fs: { read: [/opt/watch-data] }
 \`\`\`
 
 A watchdog observes and reports; it never restarts, stops, spawns, or removes a
 role, answers a pending permission, edits a workspace, or approves anything on
 the owner's behalf. \`watchdogs:\` may appear only in the base config
 (\`~/fleet.yaml\` or \`-c FILE\`), not in \`~/fleet.d/*.yaml\` drop-ins.
+Watchdogs are not isolated by default. An explicit watchdog \`isolation:\` block
+uses the same policy schema as a role and is applied unchanged; declare every
+extra filesystem access required by a custom prompt there.
+When \`watch:\` is omitted, each run watches the configured roles plus temporary
+fleet roles that are live when the run starts. An explicit \`watch:\` list is
+never augmented.
 
 Role values override defaults. \`\${name}\` substitutes entries from \`vars\`.
 Other role fields include \`max_tokens\`, \`autocompact_pct\`, and \`isolation\`.

@@ -192,6 +192,7 @@ cOpt(program.command('config').description('validate + print the merged plan (no
           console.log(`  identity: ${w.identity}`);
           console.log(`  watch:    ${w.watch.join(', ')}`);
           if (w.promptFile) console.log(`  focus:    ${w.promptFile}`);
+          if (w.isolation) console.log(`  isolation: ${JSON.stringify(w.isolation)}`);
         }
       }
     } catch (e) { die(e); }

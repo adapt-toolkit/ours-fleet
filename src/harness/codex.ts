@@ -61,6 +61,15 @@ function sandboxMode(role: ResolvedRole): string | undefined {
   return s;
 }
 
+/** codex-acp exposes the same sandbox postures as named ACP agent modes. */
+function acpAgentMode(role: ResolvedRole): string | undefined {
+  const sandbox = sandboxMode(role);
+  if (sandbox === 'read-only') return 'read-only';
+  if (sandbox === 'workspace-write') return 'agent';
+  if (sandbox === 'danger-full-access') return 'agent-full-access';
+  return undefined;
+}
+
 /** Resolve & validate the per-role approval policy, throwing on an unknown value. */
 function approvalPolicy(role: ResolvedRole): string | undefined {
   const o = role.harness_options as CodexOptions | undefined;
@@ -230,7 +239,11 @@ export function makeCodexAdapter(exec: Exec = realExec): HarnessAdapter {
           ? ['sh', '-c', configured]
           : bundledAcpAgent(
               '@agentclientprotocol/codex-acp', 'codex-acp', 'codex-acp');
-      return { argv, env: prep.env };
+      const initialMode = acpAgentMode(role);
+      return {
+        argv,
+        env: initialMode ? { ...prep.env, INITIAL_AGENT_MODE: initialMode } : prep.env,
+      };
     },
 
     isolationPaths(role: ResolvedRole, _dirs: RoleDirs) {

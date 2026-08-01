@@ -25,6 +25,8 @@ describe('watchdogs config', () => {
       timeoutMs: 300_000, keepReports: 50, alertCooldownMs: 3_600_000,
     });
     expect(wd.promptFile).toBeUndefined();
+    expect(wd.isolation).toBeUndefined();
+    expect(wd.watchExplicit).toBe(false);
   });
   it('returns [] when no watchdogs block exists', () => {
     base(TWO_ROLES);
@@ -42,9 +44,22 @@ describe('watchdogs config', () => {
       + 'watchdogs:\n  w: { coordinator: "${coord}" }\n');
     expect(loadConfig().watchdogs[0].coordinator).toBe('FleetCoordinator');
   });
+  it('records that an explicit watch list must remain exact at run time', () => {
+    base(TWO_ROLES + 'watchdogs:\n  w: { coordinator: C, watch: [Docs] }\n');
+    expect(loadConfig().watchdogs[0]).toMatchObject({ watch: ['Docs'], watchExplicit: true });
+  });
   it('rejects an unknown key so a typo cannot silently disarm', () => {
     base(TWO_ROLES + 'watchdogs:\n  w: { coordinator: C, intervall: 5m }\n');
     expect(() => loadConfig()).toThrowError(/watchdog 'w' has unknown key\(s\) intervall/);
+  });
+  it('parses watchdog isolation only when explicitly configured', () => {
+    base(TWO_ROLES + 'watchdogs:\n  w:\n    coordinator: C\n    isolation:\n      backend: bubblewrap\n      network: deny\n      fs: { read: [/opt/tools] }\n');
+    expect(loadConfig().watchdogs[0].isolation).toEqual({
+      backend: 'bubblewrap', network: 'deny', fs: { read: ['/opt/tools'] },
+    });
+
+    base(TWO_ROLES + 'watchdogs:\n  w: { coordinator: C, isolation: { network: typo } }\n');
+    expect(() => loadConfig()).toThrowError(/watchdog 'w'.*isolation.network: invalid value 'typo'/);
   });
   it('requires coordinator', () => {
     base(TWO_ROLES + 'watchdogs:\n  w: { interval: 10m }\n');

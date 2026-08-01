@@ -149,11 +149,12 @@ describe('ours-fleet CLI', () => {
     writeFileSync(join(dir, 'fleet.yaml'),
       'roles:\n  Alice: {}\n  Docs: {}\n'
       + 'watchdogs:\n'
-      + '  nightwatch: { coordinator: FleetCoordinator }\n'
+      + '  nightwatch: { coordinator: FleetCoordinator, isolation: { network: deny } }\n'
       + '  slowlane: { coordinator: Owner, interval: 2h, watch: [Docs], enabled: false }\n');
     const human = await run(['config']);
     expect(human.stdout).toContain('watchdogs:');
     expect(human.stdout).toMatch(/nightwatch.*every 10m.*-> FleetCoordinator/s);
+    expect(human.stdout).toContain('isolation: {"network":"deny"}');
     expect(human.stdout).toMatch(/slowlane.*disabled/s);
     const json = await run(['config', '--json']);
     const plan = JSON.parse(json.stdout);
@@ -162,6 +163,7 @@ describe('ours-fleet CLI', () => {
       name: 'nightwatch', enabled: true, intervalMs: 600000,
       coordinator: 'FleetCoordinator', watch: ['Alice', 'Docs'],
       identity: 'Watchdog-nightwatch', model: null, promptFile: null,
+      isolation: { network: 'deny' },
     });
   });
 

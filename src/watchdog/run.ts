@@ -1,5 +1,5 @@
 import {
-  closeSync, existsSync, openSync, readFileSync, rmSync, statSync, writeFileSync,
+  closeSync, existsSync, openSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync,
 } from 'node:fs';
 import { spawn as spawnChild, execFile } from 'node:child_process';
 import { join } from 'node:path';
@@ -16,12 +16,15 @@ import {
   daemonIdentityProvisioner, ensureIdentity, type IdentityProvisioner,
 } from '../creation.js';
 import { runOnce, START_STAGGER_FILE } from '../runner.js';
-import { agentDir } from '../paths.js';
+import { agentDir, tmpRoot } from '../paths.js';
 import {
-  loadConfig, resolveMonitorConfig, resolveWorklogPolicy, type FleetConfig, type ResolvedRole,
+  loadConfig, resolveMonitorConfig, resolveWorklogPolicy, ROLE_NAME_RE,
+  type FleetConfig, type ResolvedRole,
 } from '../config.js';
 import { getAdapter } from '../harness/registry.js';
 import { redactLogLine } from '../application/log-service.js';
+import { controlRequest, controlSocketPath } from '../session/control.js';
+import { Tmux } from '../tmux.js';
 
 const execFileAsync = promisify(execFile);
 
@@ -95,6 +98,8 @@ export interface WatchdogRunDeps {
   launchChild?(binPath: string, roleName: string, runDir: string): WatchdogChildHandle;
   /** Pre-loaded config (defaults inheritance). Falls back to `loadConfig()`. */
   cfg?: FleetConfig;
+  /** Live temporary-role discovery override for focused tests. */
+  discoverLiveTemporaryRoles?(): Promise<string[]>;
 }
 
 export interface WatchdogRunOutcome { report: WatchdogReport; storedPath: string }
@@ -132,32 +137,46 @@ function readTail(runDir: string): string | undefined {
   } catch { return undefined; }
 }
 
-/**
- * The temp role every watchdog-family run (inspection and notifier alike) launches under.
- * `network: 'broker'` keeps ours messaging available; no write binds beyond stateDir/cwd, which
- * resolveIsolation adds itself. ~/fleet.yaml and fleet.d are deliberately NOT bound — they're on
- * the isolation blocklist, and everything either run flavor needs is written into its own dir.
- *
- * Read access is scoped to exactly `wd.watch` (finding #3): a watchdog configured to watch one
- * role must not be able to read every other role's state dir just because they all live under
- * the same agents root. `wd.watch` defaults to every role (watchdog/config.ts's
- * resolveWatchdogs), so a watchdog that watches everything still sees everything — this only
- * narrows visibility for a watchdog scoped to fewer roles. A watched role whose state dir doesn't
- * exist (e.g. a role removed after the watchdog was configured) is simply absent from the
- * bwrap ro-bind-try set — the agent reports it unreachable from status evidence, same as any
- * other missing state dir.
- */
+/** The temp role every watchdog-family run launches under. Isolation is opt-in. */
 function buildWatchdogRole(wd: ResolvedWatchdog, cfg: FleetConfig): ResolvedRole {
   return {
     name: wd.identity, sourceFile: '(watchdog)',
     harness: wd.harness, session: wd.session,
     identity: wd.identity, model: wd.model,
-    permissions: { approval: 'allow', filesystem: 'workspace', unattended: 'deny' },
+    // Watchdogs are observe-only by contract, but their sanctioned status commands
+    // must reach host control sockets. Keep approvals/unattended escalation denied
+    // while disabling the harness's native filesystem/network sandbox.
+    permissions: { approval: 'deny', filesystem: 'unrestricted', unattended: 'deny' },
     permissionsDeclared: true,
     monitor: resolveMonitorConfig(cfg.defaults.monitor, undefined),
     worklog: resolveWorklogPolicy(cfg.defaults.worklog, undefined),
-    isolation: { fs: { read: wd.watch.map(r => agentDir(r)) }, network: 'broker' },
+    isolation: wd.isolation,
   };
+}
+
+/** Discover temporary sessions that are live now, not merely stale dirs on disk. */
+async function discoverLiveTemporaryRoles(): Promise<string[]> {
+  let names: string[];
+  try {
+    names = readdirSync(tmpRoot(), { withFileTypes: true })
+      .filter(entry => entry.isDirectory() && !entry.isSymbolicLink() && ROLE_NAME_RE.test(entry.name))
+      .map(entry => entry.name);
+  } catch { return []; }
+  const tmux = new Tmux();
+  const live = await Promise.all(names.map(async name => {
+    const dir = agentDir(name, true);
+    const [acpAlive, tmuxAlive] = await Promise.all([
+      existsSync(controlSocketPath(dir))
+        ? controlRequest(dir, { command: 'status' }, 2_000)
+            .then(response => response.ok
+              && (response.result as { alive?: boolean } | undefined)?.alive === true)
+            .catch(() => false)
+        : Promise.resolve(false),
+      tmux.has(name).catch(() => false),
+    ]);
+    return acpAlive || tmuxAlive ? name : undefined;
+  }));
+  return live.filter((name): name is string => name !== undefined);
 }
 
 /**
@@ -193,7 +212,13 @@ export async function executeWatchdogRun(
       wd.identity, {}, deps.identityProvisioner ?? daemonIdentityProvisioner(), deps.log);
 
     const cfg = deps.cfg ?? loadConfig();
-    const role = buildWatchdogRole(wd, cfg);
+    const discovered = wd.watchExplicit
+      ? []
+      : await (deps.discoverLiveTemporaryRoles ?? discoverLiveTemporaryRoles)();
+    const watch = [...new Set([...wd.watch, ...discovered])]
+      .filter(name => name !== wd.identity);
+    const runWd = { ...wd, watch };
+    const role = buildWatchdogRole(runWd, cfg);
 
     const dir = applyRole(role, { temp: true, identityGuarantee: guarantee.state });
     const reportPath = join(dir, 'report.json');
@@ -202,7 +227,7 @@ export async function executeWatchdogRun(
     const promptFocus = wd.promptFile ? readFileSync(wd.promptFile, 'utf8') : undefined;
     // applyRole wrote the generic role briefing; the watchdog contract replaces it.
     writeFileSync(join(dir, 'briefing.md'), generateWatchdogBriefing({
-      wd, manifestPath, reportPath,
+      wd: runWd, manifestPath, reportPath,
       vocabulary: getAdapter(wd.harness).vocabulary,
       identityGuarantee: guarantee.state,
       promptFocus,
@@ -211,7 +236,10 @@ export async function executeWatchdogRun(
     writeFileSync(join(dir, 'role.yaml'), stringify(role));
     const manifest: WatchManifest = {
       watchdog: wd.name, run_id: runId, coordinator: wd.coordinator, started_at: startedAt,
-      roles: wd.watch.map(r => ({ name: r, stateDir: agentDir(r) })),
+      roles: runWd.watch.map(r => ({
+        name: r,
+        stateDir: wd.watch.includes(r) ? agentDir(r) : agentDir(r, true),
+      })),
       digest: computeDigest(ledger, wd.alertCooldownMs, now()),
     };
     writeFileSync(manifestPath, JSON.stringify(manifest, null, 2) + '\n');

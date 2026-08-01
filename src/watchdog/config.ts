@@ -3,22 +3,25 @@ import { isAbsolute } from 'node:path';
 import { parseDuration } from '../duration.js';
 import { ConfigError, ROLE_NAME_RE, resolveRoleModel } from '../config.js';
 import type { FleetConfig, ResolvedRole, SessionBackendId } from '../config.js';
+import { validateIsolationConfig } from '../isolation/policy.js';
+import type { IsolationConfig } from '../isolation/types.js';
 
 export interface WatchdogConfig {
   coordinator?: string; enabled?: boolean; interval?: string; watch?: string[];
   harness?: string; model?: string | null; session?: string; identity?: string;
   timeout?: string; keep_reports?: number; alert_cooldown?: string; prompt_file?: string;
+  isolation?: IsolationConfig;
 }
 export interface ResolvedWatchdog {
   name: string; coordinator: string; enabled: boolean; intervalMs: number;
-  watch: string[]; harness: string; session: SessionBackendId; model?: string;
+  watch: string[]; watchExplicit: boolean; harness: string; session: SessionBackendId; model?: string;
   identity: string; timeoutMs: number; keepReports: number; alertCooldownMs: number;
-  promptFile?: string; sourceFile: string;
+  promptFile?: string; isolation?: IsolationConfig; sourceFile: string;
 }
 
 const WATCHDOG_KEYS = [
   'coordinator', 'enabled', 'interval', 'watch', 'harness', 'model', 'session',
-  'identity', 'timeout', 'keep_reports', 'alert_cooldown', 'prompt_file',
+  'identity', 'timeout', 'keep_reports', 'alert_cooldown', 'prompt_file', 'isolation',
 ];
 export const WATCHDOG_DEFAULT_INTERVAL_MS = 600_000;
 export const WATCHDOG_MIN_INTERVAL_MS = 60_000;
@@ -85,6 +88,10 @@ export function resolveWatchdogs(
       if (!existsSync(w.prompt_file))
         throw new ConfigError(`${where}: prompt_file not found: ${w.prompt_file}`);
     }
+    if (w.isolation !== undefined) {
+      const problems = validateIsolationConfig(w.isolation);
+      if (problems.length) throw new ConfigError(`${where} ${problems.join('; ')}`);
+    }
     const dur = (v: string | undefined, key: string, fallback: number, minMs?: number) => {
       if (v === undefined) return fallback;
       try { return parseDuration(v, { name: key, minMs }); }
@@ -99,13 +106,13 @@ export function resolveWatchdogs(
       name, coordinator: w.coordinator.trim(),
       enabled: w.enabled ?? true,
       intervalMs: dur(w.interval, 'interval', WATCHDOG_DEFAULT_INTERVAL_MS, WATCHDOG_MIN_INTERVAL_MS),
-      watch, harness, session: sessionRaw,
+      watch, watchExplicit: w.watch !== undefined, harness, session: sessionRaw,
       model: resolveRoleModel(w.model, w.harness, defaults),
       identity,
       timeoutMs: dur(w.timeout, 'timeout', WATCHDOG_DEFAULT_TIMEOUT_MS),
       keepReports,
       alertCooldownMs: dur(w.alert_cooldown, 'alert_cooldown', WATCHDOG_DEFAULT_COOLDOWN_MS),
-      promptFile: w.prompt_file, sourceFile: baseFile,
+      promptFile: w.prompt_file, isolation: w.isolation, sourceFile: baseFile,
     });
   }
   return out;

@@ -159,6 +159,13 @@ describe('buildAcpLaunch', () => {
     );
     expect(launch.argv).toEqual(['custom-codex-acp', '--flag']);
   });
+
+  it('maps unrestricted role permissions to codex-acp full-access mode', () => {
+    const launch = makeCodexAdapter(okExec).buildAcpLaunch!(role({
+      permissions: { approval: 'deny', filesystem: 'unrestricted', unattended: 'deny' },
+    }), { argv: [], env: { KEEP: 'yes' } });
+    expect(launch.env).toEqual({ KEEP: 'yes', INITIAL_AGENT_MODE: 'agent-full-access' });
+  });
 });
 
 describe('vocabulary.monitorInstruction', () => {

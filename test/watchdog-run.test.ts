@@ -1,6 +1,6 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import {
-  existsSync, writeFileSync, readFileSync, utimesSync, rmSync, mkdtempSync,
+  existsSync, writeFileSync, readFileSync, utimesSync, rmSync, mkdtempSync, mkdirSync,
 } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -9,10 +9,11 @@ import { acquireRunLock, listRuns, releaseRunLock, writeReport } from '../src/wa
 import { errorReport } from '../src/watchdog/report.js';
 import { readLedger, writeLedger } from '../src/watchdog/alerts.js';
 import type { WatchManifest } from '../src/watchdog/briefing.js';
-import { agentDir, agentsRoot } from '../src/paths.js';
+import { agentDir } from '../src/paths.js';
 import { START_STAGGER_FILE } from '../src/runner.js';
 import '../src/harness/claude-code.js';
 import { parse } from 'yaml';
+import { RoleControlServer } from '../src/session/control.js';
 
 let dir: string;
 beforeEach(() => {
@@ -26,7 +27,8 @@ afterEach(() => {
 
 const wd = {
   name: 'nightwatch', coordinator: 'FleetCoordinator', enabled: true,
-  intervalMs: 600_000, watch: ['Alice'], harness: 'claude-code', session: 'tmux' as const,
+  intervalMs: 600_000, watch: ['Alice'], watchExplicit: false,
+  harness: 'claude-code', session: 'tmux' as const,
   identity: 'Watchdog-nightwatch', timeoutMs: 300_000, keepReports: 50,
   alertCooldownMs: 3_600_000, sourceFile: 'f',
 };
@@ -79,17 +81,89 @@ describe('executeWatchdogRun', () => {
     expect(existsSync(agentDir('Watchdog-nightwatch', true))).toBe(false);   // cleaned up
   });
 
-  it('scopes isolation.fs.read to wd.watch role dirs, not the whole agents root (finding #3)', async () => {
+  it('launches without isolation when the watchdog omits it', async () => {
     let roleYaml = '';
     const launch = fakeChild(async runDir => {
       roleYaml = readFileSync(join(runDir, 'role.yaml'), 'utf8');
       writeGoodReport(runDir);
     });
-    // wd.watch is ['Alice'] (the module fixture above) — a watchdog scoped to one role.
     await executeWatchdogRun(wd as never, baseDeps(launch) as never);
-    const role = parse(roleYaml) as { isolation?: { fs?: { read?: string[] } } };
-    expect(role.isolation?.fs?.read).toEqual([agentDir('Alice')]);
-    expect(role.isolation?.fs?.read).not.toContain(agentsRoot());
+    const role = parse(roleYaml) as { isolation?: unknown; permissions?: unknown };
+    expect(role.isolation).toBeUndefined();
+    expect(role.permissions).toEqual({
+      approval: 'deny', filesystem: 'unrestricted', unattended: 'deny',
+    });
+  });
+
+  it('applies an explicitly configured watchdog isolation policy unchanged', async () => {
+    let roleYaml = '';
+    const launch = fakeChild(async runDir => {
+      roleYaml = readFileSync(join(runDir, 'role.yaml'), 'utf8');
+      writeGoodReport(runDir);
+    });
+    const isolated = {
+      ...wd,
+      isolation: { backend: 'bubblewrap', network: 'deny', fs: { read: ['/opt/tools'] } },
+    };
+    await executeWatchdogRun(isolated as never, baseDeps(launch) as never);
+    const role = parse(roleYaml) as { isolation?: unknown };
+    expect(role.isolation).toEqual(isolated.isolation);
+  });
+
+  it('adds a live temporary role to an omitted watch default and skips stale temp dirs', async () => {
+    let manifest: WatchManifest | undefined;
+    const liveDir = agentDir('Developer-1', true);
+    mkdirSync(liveDir, { recursive: true });
+    mkdirSync(agentDir('Stale-temp', true), { recursive: true });
+    const control = new RoleControlServer(liveDir, {
+      snapshot: () => ({ backend: 'acp', alive: true, readiness: 'running' }),
+    } as never, () => {});
+    await control.start();
+    const launch = fakeChild(async runDir => {
+      manifest = JSON.parse(readFileSync(join(runDir, 'watch.json'), 'utf8'));
+      writeGoodReport(runDir);
+    });
+    try {
+      await executeWatchdogRun(wd as never, baseDeps(launch) as never);
+      expect(manifest!.roles).toEqual([
+        { name: 'Alice', stateDir: agentDir('Alice') },
+        { name: 'Developer-1', stateDir: agentDir('Developer-1', true) },
+      ]);
+    } finally {
+      await control.close();
+    }
+  });
+
+  it('deduplicates implicit live roles and excludes the watchdog execution identity', async () => {
+    let manifest: WatchManifest | undefined;
+    const launch = fakeChild(async runDir => {
+      manifest = JSON.parse(readFileSync(join(runDir, 'watch.json'), 'utf8'));
+      writeGoodReport(runDir);
+    });
+    await executeWatchdogRun(wd as never, {
+      ...baseDeps(launch),
+      discoverLiveTemporaryRoles: async () => [
+        'Developer-1', 'Alice', 'Watchdog-nightwatch', 'Developer-1',
+      ],
+    } as never);
+    expect(manifest!.roles.map(role => role.name)).toEqual(['Alice', 'Developer-1']);
+  });
+
+  it('keeps an explicit watch list exact and skips live temporary-role discovery', async () => {
+    let manifest: WatchManifest | undefined;
+    const launch = fakeChild(async runDir => {
+      manifest = JSON.parse(readFileSync(join(runDir, 'watch.json'), 'utf8'));
+      writeGoodReport(runDir);
+    });
+    const explicit = { ...wd, watchExplicit: true };
+    const deps = {
+      ...baseDeps(launch),
+      discoverLiveTemporaryRoles: async (): Promise<string[]> => {
+        throw new Error('explicit watch must not discover temporary roles');
+      },
+    };
+    await executeWatchdogRun(explicit as never, deps as never);
+    expect(manifest!.roles).toEqual([{ name: 'Alice', stateDir: agentDir('Alice') }]);
   });
 
   it('stores status error with tail when the agent writes invalid JSON (acceptance 9)', async () => {

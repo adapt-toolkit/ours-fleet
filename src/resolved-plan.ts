@@ -29,6 +29,7 @@ export function resolvedPlan(cfg: FleetConfig): Record<string, unknown> {
       harness: w.harness, session: w.session, model: w.model ?? null,
       identity: w.identity, timeoutMs: w.timeoutMs, keepReports: w.keepReports,
       alertCooldownMs: w.alertCooldownMs, promptFile: w.promptFile ?? null,
+      isolation: w.isolation ?? null,
     })),
   };
 }
