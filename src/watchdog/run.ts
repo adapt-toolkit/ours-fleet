@@ -16,7 +16,7 @@ import {
   daemonIdentityProvisioner, ensureIdentity, type IdentityProvisioner,
 } from '../creation.js';
 import { runOnce, START_STAGGER_FILE } from '../runner.js';
-import { agentDir, agentsRoot } from '../paths.js';
+import { agentDir } from '../paths.js';
 import {
   loadConfig, resolveMonitorConfig, resolveWorklogPolicy, type FleetConfig, type ResolvedRole,
 } from '../config.js';
@@ -137,6 +137,15 @@ function readTail(runDir: string): string | undefined {
  * `network: 'broker'` keeps ours messaging available; no write binds beyond stateDir/cwd, which
  * resolveIsolation adds itself. ~/fleet.yaml and fleet.d are deliberately NOT bound — they're on
  * the isolation blocklist, and everything either run flavor needs is written into its own dir.
+ *
+ * Read access is scoped to exactly `wd.watch` (finding #3): a watchdog configured to watch one
+ * role must not be able to read every other role's state dir just because they all live under
+ * the same agents root. `wd.watch` defaults to every role (watchdog/config.ts's
+ * resolveWatchdogs), so a watchdog that watches everything still sees everything — this only
+ * narrows visibility for a watchdog scoped to fewer roles. A watched role whose state dir doesn't
+ * exist (e.g. a role removed after the watchdog was configured) is simply absent from the
+ * bwrap ro-bind-try set — the agent reports it unreachable from status evidence, same as any
+ * other missing state dir.
  */
 function buildWatchdogRole(wd: ResolvedWatchdog, cfg: FleetConfig): ResolvedRole {
   return {
@@ -147,7 +156,7 @@ function buildWatchdogRole(wd: ResolvedWatchdog, cfg: FleetConfig): ResolvedRole
     permissionsDeclared: true,
     monitor: resolveMonitorConfig(cfg.defaults.monitor, undefined),
     worklog: resolveWorklogPolicy(cfg.defaults.worklog, undefined),
-    isolation: { fs: { read: [agentsRoot()] }, network: 'broker' },
+    isolation: { fs: { read: wd.watch.map(r => agentDir(r)) }, network: 'broker' },
   };
 }
 

@@ -9,9 +9,10 @@ import { acquireRunLock, listRuns, releaseRunLock, writeReport } from '../src/wa
 import { errorReport } from '../src/watchdog/report.js';
 import { readLedger, writeLedger } from '../src/watchdog/alerts.js';
 import type { WatchManifest } from '../src/watchdog/briefing.js';
-import { agentDir } from '../src/paths.js';
+import { agentDir, agentsRoot } from '../src/paths.js';
 import { START_STAGGER_FILE } from '../src/runner.js';
 import '../src/harness/claude-code.js';
+import { parse } from 'yaml';
 
 let dir: string;
 beforeEach(() => {
@@ -76,6 +77,19 @@ describe('executeWatchdogRun', () => {
     expect(report.watchdog).toBe('nightwatch');            // normalizer overrode agent value
     expect(listRuns('nightwatch')).toHaveLength(1);
     expect(existsSync(agentDir('Watchdog-nightwatch', true))).toBe(false);   // cleaned up
+  });
+
+  it('scopes isolation.fs.read to wd.watch role dirs, not the whole agents root (finding #3)', async () => {
+    let roleYaml = '';
+    const launch = fakeChild(async runDir => {
+      roleYaml = readFileSync(join(runDir, 'role.yaml'), 'utf8');
+      writeGoodReport(runDir);
+    });
+    // wd.watch is ['Alice'] (the module fixture above) — a watchdog scoped to one role.
+    await executeWatchdogRun(wd as never, baseDeps(launch) as never);
+    const role = parse(roleYaml) as { isolation?: { fs?: { read?: string[] } } };
+    expect(role.isolation?.fs?.read).toEqual([agentDir('Alice')]);
+    expect(role.isolation?.fs?.read).not.toContain(agentsRoot());
   });
 
   it('stores status error with tail when the agent writes invalid JSON (acceptance 9)', async () => {
