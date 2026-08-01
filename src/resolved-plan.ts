@@ -23,6 +23,13 @@ export function resolvedPlan(cfg: FleetConfig): Record<string, unknown> {
     startStaggerMs: cfg.startStaggerMs,
     diagnostics: cfg.diagnostics.map(diagnostic => ({ ...diagnostic })),
     roles: cfg.roles.map(resolvedRolePlan),
+    watchdogs: cfg.watchdogs.map(w => sortedObject({
+      name: w.name, sourceFile: w.sourceFile, enabled: w.enabled,
+      intervalMs: w.intervalMs, coordinator: w.coordinator, watch: [...w.watch],
+      harness: w.harness, session: w.session, model: w.model ?? null,
+      identity: w.identity, timeoutMs: w.timeoutMs, keepReports: w.keepReports,
+      alertCooldownMs: w.alertCooldownMs, promptFile: w.promptFile ?? null,
+    })),
   };
 }
 

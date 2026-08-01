@@ -6,14 +6,23 @@ import { join as joinPath } from 'node:path';
 import { createInterface } from 'node:readline';
 import { Command } from 'commander';
 import { VERSION } from './version.js';
-import { agentDir, agentsRoot, tmpRoot, logsRoot, deriveXdgRuntimeDir } from './paths.js';
-import { loadConfig } from './config.js';
+import { agentDir, agentsRoot, tmpRoot, logsRoot, deriveXdgRuntimeDir, watchdogsRoot } from './paths.js';
+import { loadConfig, ROLE_NAME_RE } from './config.js';
 import type { YamlMode } from './config-yaml.js';
+import { formatDuration } from './duration.js';
 import { resolvedPlan } from './resolved-plan.js';
 import { Tmux, tmuxArgs } from './tmux.js';
 import { pickBackend } from './supervisor/index.js';
 import { up, down, restartRoles, rmRole, type OpsDeps } from './ops.js';
 import { readRestartLedger, runSupervised, runTemp } from './runner.js';
+import { executeWatchdogRun, runWatchdogAgent } from './watchdog/run.js';
+import { readSchedulerState, resetSchedulerState, runScheduler, type WatchdogSchedulerState } from './watchdog/scheduler.js';
+import { partitionRestartNames } from './watchdog/config.js';
+import { WatchdogServiceManager } from './watchdog/service.js';
+import {
+  acquireRunLock, latestReport, listRuns, readReport, releaseRunLock, reportsDir, type RunListEntry,
+} from './watchdog/store.js';
+import type { WatchdogReport } from './watchdog/report.js';
 import {
   lastProvenance, spawnDryRun, spawnPermanent, spawnTemp, type SpawnOpts,
 } from './spawn.js';
@@ -44,6 +53,7 @@ const deps = (): OpsDeps => ({
   backend: pickBackend(),
   binPath,
   log: l => console.log(l),
+  watchdogService: new WatchdogServiceManager(),
 });
 
 const die = (e: unknown): never => { console.error(String(e instanceof Error ? e.message : e)); process.exit(1); };
@@ -172,6 +182,18 @@ cOpt(program.command('config').description('validate + print the merged plan (no
         }
         for (const w of perms ? allWarnings(perms) : []) console.log(`    warning:     ${w}`);
       }
+      if (cfg.watchdogs.length) {
+        console.log('watchdogs:');
+        for (const w of cfg.watchdogs) {
+          console.log(`● ${w.name}${w.enabled ? '' : '  (disabled)'}`
+            + `${readSchedulerState(w.name).heldDown ? '  (held down)' : ''}`);
+          console.log(`  every ${formatDuration(w.intervalMs)} -> ${w.coordinator}`);
+          console.log(`  harness:  ${w.harness} (${w.session})${w.model ? `, model: ${w.model}` : ''}`);
+          console.log(`  identity: ${w.identity}`);
+          console.log(`  watch:    ${w.watch.join(', ')}`);
+          if (w.promptFile) console.log(`  focus:    ${w.promptFile}`);
+        }
+      }
     } catch (e) { die(e); }
   });
 
@@ -186,8 +208,24 @@ cOpt(program.command('down [names...]').description('stop roles'))
   });
 
 cOpt(program.command('restart [names...]').description('re-sync config + bounce, RESUMING context'))
-  .action(async (names, opts) => {
-    try { await restartRoles(loadConfig(opts.configuration), names, deps(), 'keep', opts.configuration); } catch (e) { die(e); }
+  .action(async (names: string[], opts) => {
+    try {
+      const cfg = loadConfig(opts.configuration);
+      // Watchdog names can't collide with role names (config validation
+      // guarantees dispatch is unambiguous), so a name matching a configured
+      // watchdog is always a release, never a role restart. Release each
+      // named watchdog directly instead of handing it to restartRoles, which
+      // only knows about roles and would reject it as unknown (3.2 release path).
+      const { watchdogNames, roleNames } = partitionRestartNames(cfg, names);
+      for (const wn of watchdogNames) {
+        resetSchedulerState(wn);
+        console.log(`released watchdog '${wn}' — scheduler resumes on its next poll`);
+      }
+      // Bare `restart` (no names) restarts every role — that meaning must
+      // survive even though filtering an empty array also yields [].
+      if (names.length === 0 || roleNames.length > 0)
+        await restartRoles(cfg, roleNames, deps(), 'keep', opts.configuration);
+    } catch (e) { die(e); }
   });
 
 cOpt(program.command('force-restart [names...]').description('re-sync + bounce FRESH (context wiped)'))
@@ -346,6 +384,136 @@ program.command('status <name>').description('unit/agent state')
         if (response.ok) console.log(`session: ${JSON.stringify(response.result)}`);
       } catch { console.log('session: acp control unavailable'); }
     }
+  });
+
+/**
+ * A watchdog is addressable if it's still configured, or its store dir survives
+ * config removal. The name-shape check runs BEFORE any filesystem lookup
+ * (finding #1): a hostile `name` (path separators, '..', etc.) must never
+ * reach `join(watchdogsRoot(), name)` — treated as simply unknown, same as
+ * store.ts's own `watchdogDir` choke-point guard (defense in depth).
+ */
+function watchdogKnown(name: string, configPath?: string): boolean {
+  try {
+    if (loadConfig(configPath).watchdogs.some(w => w.name === name)) return true;
+  } catch { /* config missing/broken: fall through to the store check */ }
+  return ROLE_NAME_RE.test(name) && existsSync(joinPath(watchdogsRoot(), name));
+}
+
+function renderHeldDownLine(state: WatchdogSchedulerState): string | undefined {
+  if (!state.heldDown) return undefined;
+  return `HELD DOWN since ${state.heldSince ?? 'unknown'} after ${state.consecutiveFailures} `
+    + `consecutive failures: ${state.lastError ?? 'unknown error'}`;
+}
+
+/** errorReport() rides a bounded diagnostic tail as an extra key outside WatchdogReport proper (spec: acceptance 9). */
+type ReportWithTail = WatchdogReport & { tail?: string };
+
+/** Full human rendering of one report: header, held-down warning, counts, then non-healthy roles + evidence. */
+function renderReport(report: WatchdogReport, heldState: WatchdogSchedulerState): string {
+  const lines: string[] = [`● ${report.watchdog} — run ${report.run_id} (${report.status})`];
+  const held = renderHeldDownLine(heldState);
+  if (held) lines.push(held);
+  const s = report.summary;
+  lines.push(`  checked=${s.checked} healthy=${s.healthy} idle=${s.idle} anomalies=${s.anomalies}`);
+  if (report.error) lines.push(`  error: ${report.error}`);
+  for (const role of report.roles) {
+    if (role.status === 'healthy') continue;
+    lines.push(`  ${role.role}  ${role.status}  ${role.reason ?? ''}`.trimEnd());
+    for (const ev of role.evidence ?? []) lines.push(`    - [${ev.source}] ${ev.detail} (${ev.observed_at})`);
+    if (role.alerted) {
+      const alert = report.alerts.find(a => a.role === role.role);
+      lines.push(`    alerted -> ${alert?.coordinator ?? '?'}`);
+    }
+  }
+  const tail = (report as ReportWithTail).tail;
+  if (report.status === 'error' && tail) {
+    lines.push('  --- output tail ---');
+    for (const l of tail.split('\n')) lines.push(`  ${l}`);
+  }
+  return lines.join('\n');
+}
+
+function renderRunDuration(startedAt: string, finishedAt: string): string {
+  const started = Date.parse(startedAt);
+  const finished = Date.parse(finishedAt);
+  return Number.isFinite(started) && Number.isFinite(finished)
+    ? formatDuration(Math.max(0, finished - started)) : '-';
+}
+
+/** `--list` table: run-id, started, duration, status, checked/healthy/idle/anomalies, [error]. */
+function renderRunList(entries: RunListEntry[]): string {
+  const header = ['run-id'.padEnd(18), 'started'.padEnd(22), 'duration'.padEnd(8),
+    'status'.padEnd(10), 'checked/healthy/idle/anomalies', 'error'].join('  ');
+  const rows = entries.map(e => {
+    const s = e.summary;
+    const cols = [
+      e.runId.padEnd(18), (e.startedAt || '-').padEnd(22),
+      renderRunDuration(e.startedAt, e.finishedAt).padEnd(8), e.status.padEnd(10),
+      `${s.checked}/${s.healthy}/${s.idle}/${s.anomalies}`.padEnd(31),
+    ];
+    if (e.error) cols.push(e.error);
+    return cols.join('  ').trimEnd();
+  });
+  return [header, ...rows].join('\n');
+}
+
+cOpt(program.command('watchdog-run <name>')
+  .description('run one watchdog check now, foreground, same storage as the scheduler'))
+  .action(async (name: string, opts: { configuration?: string }) => {
+    try {
+      const cfg = loadConfig(opts.configuration);
+      const wd = cfg.watchdogs.find(w => w.name === name);
+      if (!wd) throw new Error(`unknown watchdog '${name}'`);
+      if (!acquireRunLock(name)) throw new Error(`watchdog '${name}' is already running (run lock held)`);
+      try {
+        const { report, storedPath } = await executeWatchdogRun(wd, {
+          binPath, log: l => console.log(l), cfg,
+        });
+        console.log(`stored: ${storedPath}`);
+        console.log(renderReport(report, readSchedulerState(name)));
+      } finally { releaseRunLock(name); }
+    } catch (e) { die(e); }
+  });
+
+cOpt(program.command('watchdog-report <name> [runId]')
+  .description('show a watchdog run report: latest by default, a specific run by id, --list, or --json'))
+  .option('--list', 'list runs instead of showing one')
+  .option('--json', 'print the stored report file bytes unmodified')
+  .action((name: string, runId: string | undefined, opts: { configuration?: string; list?: boolean; json?: boolean }) => {
+    try {
+      if (!watchdogKnown(name, opts.configuration)) throw new Error(`unknown watchdog '${name}'`);
+
+      if (opts.list) {
+        // --list has no single stored file to echo byte-for-byte, so --json here can't
+        // mean "raw stored bytes" the way it does for a single report. Contract: emit
+        // machine-readable run metadata instead (JSON.stringify of listRuns()'s
+        // RunListEntry[], wrapped in { runs }) — the single-report --json path below is
+        // unaffected and still prints the exact stored bytes.
+        if (opts.json) {
+          console.log(JSON.stringify({ runs: listRuns(name) }, null, 2));
+          return;
+        }
+        const held = renderHeldDownLine(readSchedulerState(name));
+        if (held) console.log(held);
+        console.log(renderRunList(listRuns(name)));
+        return;
+      }
+
+      const report = runId !== undefined ? readReport(name, runId) : latestReport(name);
+      if (!report) {
+        throw new Error(runId !== undefined
+          ? `watchdog '${name}': no such run '${runId}'`
+          : `watchdog '${name}' has no reports`);
+      }
+
+      if (opts.json) {
+        console.log(readFileSync(joinPath(reportsDir(name), `${runId ?? report.run_id}.json`), 'utf8'));
+        return;
+      }
+
+      console.log(renderReport(report, readSchedulerState(name)));
+    } catch (e) { die(e); }
   });
 
 cOpt(program.command('rm <name>').description('stop + delete state dir (+ its fleet.d file if spawned)'))
@@ -573,6 +741,25 @@ program.command('_run <name>', { hidden: true }).description('internal: supervis
 program.command('_run-temp <name>', { hidden: true }).description('internal: temp-agent entrypoint')
   .action(async name => {
     try { await runTemp(name); } catch (e) { die(e); }
+  });
+
+program.command('_run-watchdog <name>', { hidden: true })
+  .description('internal: one watchdog agent run (no cleanup — parent harvests)')
+  .action(async name => {
+    try { await runWatchdogAgent(name); } catch (e) { die(e); }
+  });
+
+cOpt(program.command('_run-watchdogs', { hidden: true }))
+  .description('internal: the watchdog scheduler process')
+  .action(async (opts: { configuration?: string }) => {
+    try {
+      let stop = false;
+      process.on('SIGTERM', () => { stop = true; });
+      await runScheduler(opts.configuration, {
+        now: () => new Date(), sleep: ms => new Promise(r => setTimeout(r, ms)),
+        log: l => console.log(l), binPath, shouldStop: () => stop,
+      });
+    } catch (e) { die(e); }
   });
 
 program.parseAsync(process.argv);

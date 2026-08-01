@@ -3,6 +3,7 @@ import { api, idempotencyKey } from './api';
 import { CreateRole } from './CreateRole';
 import { RoleWorkspace } from './RoleWorkspace';
 import { isInactive, needsAttention, presentFleet } from './fleet-presentation';
+import { WatchdogDetail, WatchdogsView } from './Watchdogs';
 
 type FleetItem = {
   role: {
@@ -16,7 +17,7 @@ type FleetItem = {
     session: { backend: string; reachability: string; readiness: string; evidence: string; pendingPermissionId?: string };
     monitor: { health: string };
     restart: { circuit: string };
-    problems: Array<{ detail: string }>;
+    problems: Array<{ detail: string; source?: string }>;
   };
   capabilities: Record<string, unknown>;
 };
@@ -28,7 +29,8 @@ export function App() {
   const [selected, setSelected] = useState('');
   const [filter, setFilter] = useState('');
   const [showInactive, setShowInactive] = useState(false);
-  const [view, setView] = useState<'fleet' | 'attention' | 'audit'>('fleet');
+  const [view, setView] = useState<'fleet' | 'attention' | 'watchdogs' | 'audit'>('fleet');
+  const [selectedWatchdog, setSelectedWatchdog] = useState('');
   const [creating, setCreating] = useState(false);
   const [installPrompt, setInstallPrompt] = useState<InstallPromptEvent>();
   const [connection, setConnection] = useState<'connecting' | 'live' | 'polling'>('connecting');
@@ -98,12 +100,12 @@ export function App() {
     <aside>
       <div className="brand"><span className="brand-wordmark">Ours</span><div><small>fleet console</small></div></div>
       <nav aria-label="Primary">
-        {(['fleet', 'attention', 'audit'] as const).map(name =>
+        {(['fleet', 'attention', 'watchdogs', 'audit'] as const).map(name =>
           <button className={view === name ? 'active' : ''} key={name} onClick={() => {
-            setView(name); setSelected('');
+            setView(name); setSelected(''); setSelectedWatchdog('');
           }}>
-            <span aria-hidden="true">{name === 'fleet' ? '◫' : name === 'attention' ? '△' : '≡'}</span>
-            {name === 'fleet' ? 'All roles' : name === 'attention' ? 'Needs attention' : 'Audit trail'}
+            <span aria-hidden="true">{name === 'fleet' ? '◫' : name === 'attention' ? '△' : name === 'watchdogs' ? '◉' : '≡'}</span>
+            {name === 'fleet' ? 'All roles' : name === 'attention' ? 'Needs attention' : name === 'watchdogs' ? 'Watchdogs' : 'Audit trail'}
             {name === 'attention' && <b>{attentionCount}</b>}
           </button>)}
       </nav>
@@ -113,8 +115,9 @@ export function App() {
     <section className="main">
       <header>
         <div>
-          <span className="eyebrow">{selected ? 'role workspace' : view}</span>
-          <h1>{selected || (view === 'attention' ? 'Needs attention' : view === 'audit' ? 'Audit trail' : 'All roles')}</h1>
+          <span className="eyebrow">{selected ? 'role workspace' : selectedWatchdog ? 'watchdog' : view}</span>
+          <h1>{selected || selectedWatchdog || (view === 'attention' ? 'Needs attention'
+            : view === 'watchdogs' ? 'Watchdogs' : view === 'audit' ? 'Audit trail' : 'All roles')}</h1>
         </div>
         <div className="header-actions">
           {installPrompt && <button className="secondary" onClick={() => {
@@ -131,7 +134,11 @@ export function App() {
         ? <RoleWorkspace roleId={selected} onBack={() => setSelected('')} />
         : view === 'audit'
           ? <AuditView />
-          : <div className="content">
+          : view === 'watchdogs'
+            ? (selectedWatchdog
+              ? <WatchdogDetail api={api} name={selectedWatchdog} onBack={() => setSelectedWatchdog('')} />
+              : <WatchdogsView api={api} onSelect={setSelectedWatchdog} />)
+            : <div className="content">
             <div className="status-guide" aria-label="Fleet status meanings">
               <span className="ready"><b>Ready</b> live and idle</span>
               <span className="busy"><b>Busy</b> active turn or permission</span>
@@ -157,7 +164,9 @@ export function App() {
                   <i aria-hidden="true" />{isInactive(item) ? 'Inactive' : statusLabel(item.status.overall)}</span>
                   <span><strong>{item.role.id}</strong><small className="mission-summary"
                     title={item.role.config?.mission}>{item.role.config?.mission || 'No mission summary'}</small></span>
-                  <em>{item.role.lifetime}</em></span>
+                  <span className="role-pills"><em>{item.role.lifetime}</em>
+                    {item.status.problems.some(problem => problem.source === 'watchdog') && <em>watchdog</em>}</span>
+                </span>
                 <span><strong>{item.role.config?.harness ?? 'unknown'}</strong><small>{item.status.session.backend} · {item.role.config?.model ?? 'default model'}</small></span>
                 <span><strong>{sessionLabel(item.status.session)}</strong>
                   <small>{serviceLabel(item.status.supervisor.liveness)} · {item.status.session.evidence}</small></span>

@@ -57,7 +57,8 @@ function sessionOverall(
   isolation: RoleStatus['isolation'], problems: Problem[],
 ): RoleStatus['overall'] {
   if (restart.circuit === 'open' || monitor.health === 'failed' || monitor.health === 'degraded'
-      || isolation.degraded || problems.some(problem => problem.severity === 'error')
+      || isolation.degraded
+      || problems.some(problem => problem.severity === 'error' || problem.source === 'watchdog')
       || session.readiness === 'failed') return 'attention';
   // A reachable ACP/tmux session is the user's live interaction surface. Its
   // evidence remains authoritative even when a service manager no longer owns
@@ -78,6 +79,13 @@ export interface FleetQueryOptions {
   tmux?: Tmux;
   control?: typeof controlRequest;
   capabilityContext?: CapabilityContext;
+  /**
+   * Watchdog anomalies feeding into Needs Attention (Task 19): roleId -> worst
+   * current finding across all watchdogs. Optional and absent by default so
+   * every pre-existing caller (and its tests) is unaffected; runtime.ts wires
+   * the real provider, built from watchdog reports on disk.
+   */
+  watchdogFindings?: () => Map<string, { watchdog: string; status: string; reason: string }>;
 }
 
 export class FleetQueryService {
@@ -129,6 +137,13 @@ export class FleetQueryService {
       problems.push({
         code: 'session_supervisor_disagreement', severity: 'warning',
         detail: 'session is live while its permanent supervisor service is inactive',
+      });
+    const watchdogFinding = this.options.watchdogFindings?.().get(role.id);
+    if (watchdogFinding)
+      problems.push({
+        code: 'watchdog_finding', severity: 'warning',
+        detail: `${watchdogFinding.watchdog}: ${watchdogFinding.status} — ${watchdogFinding.reason}`,
+        source: 'watchdog',
       });
     const supervisor = {
       backend: this.options.supervisor.id, liveness: live.state,

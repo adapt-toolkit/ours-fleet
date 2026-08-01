@@ -28,7 +28,10 @@ function role(problems: Problem[] = []): RoleRecord {
   };
 }
 
-async function status(readiness: SessionReadiness, problems: Problem[] = []) {
+async function status(
+  readiness: SessionReadiness, problems: Problem[] = [],
+  watchdogFindings?: () => Map<string, { watchdog: string; status: string; reason: string }>,
+) {
   const stateDir = mkdtempSync(join(tmpdir(), 'fleet-query-live-acp-'));
   const repository = { stateDir: () => stateDir };
   const query = new FleetQueryService({
@@ -38,6 +41,7 @@ async function status(readiness: SessionReadiness, problems: Problem[] = []) {
       ok: true,
       result: { backend: 'acp', alive: true, readiness, sessionId: 'live-session' },
     }) as never,
+    watchdogFindings,
   });
   return query.status(role(problems));
 }
@@ -67,6 +71,29 @@ describe('authoritative session liveness precedence', () => {
       code: 'fixture_error', severity: 'error', detail: 'operator attention required',
     }]);
     expect(result.overall).toBe('attention');
+  });
+
+  it('flags overall attention and appends a source: watchdog problem when the injected map has this role', async () => {
+    const result = await status('idle', [], () => new Map([
+      ['DetachedAcp', { watchdog: 'nightwatch', status: 'blocked', reason: 'no heartbeat' }],
+    ]));
+    expect(result.overall).toBe('attention');
+    expect(result.problems).toContainEqual({
+      code: 'watchdog_finding', severity: 'warning',
+      detail: 'nightwatch: blocked — no heartbeat', source: 'watchdog',
+    });
+  });
+
+  it('leaves status unchanged when no watchdogFindings provider is injected', async () => {
+    const result = await status('idle');
+    expect(result.overall).toBe('ready');
+    expect(result.problems.some(p => p.source === 'watchdog')).toBe(false);
+  });
+
+  it('leaves status unchanged when the injected map does not contain this role', async () => {
+    const result = await status('idle', [], () => new Map());
+    expect(result.overall).toBe('ready');
+    expect(result.problems.some(p => p.source === 'watchdog')).toBe(false);
   });
 
   it('offers only start lifecycle control for an inactive permanent role', async () => {

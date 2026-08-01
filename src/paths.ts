@@ -29,6 +29,7 @@ export const stateRoot = () => join(home(), '.ours-fleet');
 export const agentsRoot = () => join(stateRoot(), 'agents');
 export const tmpRoot = () => join(stateRoot(), 'tmp');
 export const logsRoot = () => join(stateRoot(), 'logs');
+export const watchdogsRoot = () => join(stateRoot(), 'watchdogs');
 export const agentDir = (name: string, temp = false) => join(temp ? tmpRoot() : agentsRoot(), name);
 export const defaultConfigPath = () => join(home(), 'fleet.yaml');
 export const fleetDDir = () => join(home(), 'fleet.d');

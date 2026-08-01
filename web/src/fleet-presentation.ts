@@ -4,6 +4,7 @@ export interface PresentableFleetItem {
     overall: string;
     supervisor: { liveness: string };
     session: { reachability: string };
+    problems?: Array<{ source?: string }>;
   };
 }
 
@@ -17,6 +18,10 @@ export function needsAttention(item: PresentableFleetItem): boolean {
   return !isInactive(item) && ['attention', 'unknown'].includes(item.status.overall);
 }
 
+function hasWatchdogFinding(item: PresentableFleetItem): boolean {
+  return (item.status.problems ?? []).some(problem => problem.source === 'watchdog');
+}
+
 export function presentFleet<T extends PresentableFleetItem>(
   items: T[], options: { filter: string; showInactive: boolean; attentionOnly: boolean },
 ): T[] {
@@ -24,7 +29,8 @@ export function presentFleet<T extends PresentableFleetItem>(
   return items.filter(item => {
     if (isInactive(item) && !options.showInactive) return false;
     if (options.attentionOnly && !needsAttention(item)) return false;
-    return `${item.role.id} ${item.role.config?.mission ?? ''} ${item.status.overall}`
+    const watchdogTag = hasWatchdogFinding(item) ? ' watchdog' : '';
+    return `${item.role.id} ${item.role.config?.mission ?? ''} ${item.status.overall}${watchdogTag}`
       .toLowerCase().includes(filter);
   }).sort((a, b) => Number(!needsAttention(a)) - Number(!needsAttention(b))
     || a.role.id.localeCompare(b.role.id));

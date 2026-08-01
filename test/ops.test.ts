@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
-import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync, rmSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync, rmSync, statSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { stringify } from 'yaml';
@@ -63,13 +63,36 @@ function systemdSaying(activeState: string, subState: string) {
   };
   return makeSystemdBackend(exec);
 }
-function deps(backend: SupervisorBackend) {
+function deps(backend: SupervisorBackend, watchdogService?: OpsDeps['watchdogService']) {
   const logs: string[] = [];
   const d: OpsDeps = {
     backend, binPath: '/bin/ours-fleet',
     log: l => logs.push(l),
+    ...(watchdogService ? { watchdogService } : {}),
   };
   return { d, logs };
+}
+
+/**
+ * `installChanged` simulates WatchdogServiceManager.install()'s own changed-detection
+ * (finding #4): defaults to true, matching a first-ever install (no unit file yet).
+ * Tests that need to prove the config-fingerprint gate on its own set it false —
+ * a real install() would too, since binPath/configPath (the only inputs the real
+ * unit content depends on) are unchanged between those calls.
+ */
+function fakeWatchdogService(opts: { supervised?: boolean; installChanged?: boolean } = {}) {
+  const calls: string[] = [];
+  const svc: NonNullable<OpsDeps['watchdogService']> = {
+    async install(binPath, configPath) {
+      calls.push(`install:${binPath}:${configPath ?? ''}`);
+      return { changed: opts.installChanged ?? true };
+    },
+    async start() { calls.push('start'); },
+    async stop() { calls.push('stop'); },
+    async restart() { calls.push('restart'); },
+    supervised: () => opts.supervised ?? true,
+  };
+  return { calls, svc };
 }
 const writeCfg = (roles: Record<string, object>) =>
   writeFileSync(join(dir, 'fleet.yaml'), stringify({ roles }));
@@ -192,6 +215,162 @@ describe('up / down / restart', () => {
     const { d } = deps(backend);
     await restartRoles(loadConfig(join(dir, 'fleet.yaml')), ['A'], d, 'keep', join(dir, 'fleet.yaml'));
     expect(readFileSync(join(agentDir('A'), '.config-path'), 'utf8')).toBe(`${join(dir, 'fleet.yaml')}\n`);
+  });
+});
+
+describe('up/down reconcile the supervised watchdog scheduler', () => {
+  const withWatchdog = (extra = '') =>
+    writeFileSync(join(dir, 'fleet.yaml'), `roles:\n  A: {}\nwatchdogs:\n  w: { coordinator: A${extra} }\n`);
+
+  it('up with an enabled watchdog installs + restarts the scheduler when supervised (final review #4: `start` is a no-op on an already-active unit, so config changes never reach it)', async () => {
+    withWatchdog();
+    const { backend } = fakeBackend();
+    const { calls, svc } = fakeWatchdogService();
+    const { d, logs } = deps(backend, svc);
+    await up(loadConfig(), [], d);
+    expect(calls).toEqual(['install:/bin/ours-fleet:', 'restart']);
+    expect(logs.join('\n')).toMatch(/↑ watchdogs scheduler.*w/);
+  });
+
+  describe('restart is gated on an actual change, not fired on every up (finding #4)', () => {
+    it('a second reconcile of the SAME config calls start, not restart — an unrelated `up` must not interrupt an in-flight check', async () => {
+      withWatchdog();
+      const { backend } = fakeBackend();
+      // installChanged: false on every call — a real install() would report exactly this
+      // across two calls with the same binPath/configPath, since neither changed.
+      const first = fakeWatchdogService({ installChanged: false });
+      await up(loadConfig(), [], deps(backend, first.svc).d);   // no stored fingerprint yet -> restart
+
+      const second = fakeWatchdogService({ installChanged: false });
+      await up(loadConfig(), [], deps(backend, second.svc).d);   // same config -> fingerprint unchanged too
+      expect(second.calls).toEqual(['install:/bin/ours-fleet:', 'start']);
+    });
+
+    it('a changed watchdog interval triggers restart even though the unit/plist content itself is unaffected by it', async () => {
+      withWatchdog(', interval: 5m');
+      const { backend } = fakeBackend();
+      const first = fakeWatchdogService({ installChanged: false });
+      await up(loadConfig(), [], deps(backend, first.svc).d);   // establishes the fingerprint for interval: 5m
+
+      withWatchdog(', interval: 15m');   // only the interval changed; unit content (binPath/-c) did not
+      const second = fakeWatchdogService({ installChanged: false });   // a real install() would report false too
+      await up(loadConfig(), [], deps(backend, second.svc).d);
+      expect(second.calls).toEqual(['install:/bin/ours-fleet:', 'restart']);
+    });
+
+    it('writes the config fingerprint file (0600) after a successful reconcile', async () => {
+      withWatchdog();
+      const { backend } = fakeBackend();
+      const { svc } = fakeWatchdogService();
+      const { d } = deps(backend, svc);
+      await up(loadConfig(), [], d);
+      const fpPath = join(dir, '.ours-fleet', 'watchdogs', '.config-fingerprint');
+      expect(existsSync(fpPath)).toBe(true);
+      expect((statSync(fpPath).mode & 0o777)).toBe(0o600);
+    });
+  });
+
+  it('up with only a disabled watchdog does not install the scheduler', async () => {
+    withWatchdog(', enabled: false');
+    const { backend } = fakeBackend();
+    const { calls, svc } = fakeWatchdogService();
+    const { d } = deps(backend, svc);
+    await up(loadConfig(), [], d);
+    expect(calls).not.toContain('install:/bin/ours-fleet:');
+    expect(calls.some(c => c.startsWith('install'))).toBe(false);
+  });
+
+  it('up with no watchdogs at all stops the scheduler, tolerating absence', async () => {
+    writeCfg({ A: { harness: 'fake' } });
+    const { backend } = fakeBackend();
+    const { calls, svc } = fakeWatchdogService();
+    const { d } = deps(backend, svc);
+    await up(loadConfig(), [], d);
+    expect(calls).toEqual(['stop']);
+  });
+
+  it('up with no watchdogs and an unsupervised service never calls stop (final review #3: spurious stop on watchdog-less fleets)', async () => {
+    writeCfg({ A: { harness: 'fake' } });
+    const { backend } = fakeBackend();
+    const { calls, svc } = fakeWatchdogService({ supervised: false });
+    const { d } = deps(backend, svc);
+    await up(loadConfig(), [], d);
+    expect(calls).not.toContain('stop');
+  });
+
+  it('up logs the foreground hint when watchdogs are enabled but unsupervised', async () => {
+    withWatchdog();
+    const { backend } = fakeBackend();
+    const { calls, svc } = fakeWatchdogService({ supervised: false });
+    const { d, logs } = deps(backend, svc);
+    await up(loadConfig(), [], d);
+    expect(calls).toEqual([]);
+    expect(logs.join('\n')).toContain("OURS_FLEET_SUPERVISOR=none — run 'ours-fleet _run-watchdogs' in the foreground");
+  });
+
+  it('a named `up <Role>` still reconciles the scheduler', async () => {
+    withWatchdog();
+    const { backend } = fakeBackend();
+    const { calls, svc } = fakeWatchdogService();
+    const { d } = deps(backend, svc);
+    await up(loadConfig(), ['A'], d);
+    expect(calls).toEqual(['install:/bin/ours-fleet:', 'restart']);
+  });
+
+  it('up never fails when the scheduler service throws', async () => {
+    withWatchdog();
+    const { backend } = fakeBackend();
+    const svc: NonNullable<OpsDeps['watchdogService']> = {
+      async install() { throw new Error('boom'); },
+      async start() { throw new Error('boom'); },
+      async stop() { throw new Error('boom'); },
+      async restart() { throw new Error('boom'); },
+      supervised: () => true,
+    };
+    const { d, logs } = deps(backend, svc);
+    await expect(up(loadConfig(), [], d)).resolves.not.toThrow();
+    expect(logs.join('\n')).toContain('boom');
+  });
+
+  it('up without a watchdogService (old callers) does not throw', async () => {
+    withWatchdog();
+    const { backend } = fakeBackend();
+    const { d } = deps(backend);
+    await expect(up(loadConfig(), [], d)).resolves.not.toThrow();
+  });
+
+  it('a whole-fleet down (no names) stops the scheduler', async () => {
+    withWatchdog();
+    const { backend } = fakeBackend();
+    const { calls, svc } = fakeWatchdogService();
+    const { d } = deps(backend, svc);
+    await down(loadConfig(), [], d);
+    expect(calls).toEqual(['stop']);
+  });
+
+  it('a whole-fleet down never calls stop when the service reports unsupervised (final review #3)', async () => {
+    withWatchdog();
+    const { backend } = fakeBackend();
+    const { calls, svc } = fakeWatchdogService({ supervised: false });
+    const { d } = deps(backend, svc);
+    await down(loadConfig(), [], d);
+    expect(calls).not.toContain('stop');
+  });
+
+  it('a named `down <Role>` does NOT stop the scheduler', async () => {
+    withWatchdog();
+    const { backend } = fakeBackend();
+    const { calls, svc } = fakeWatchdogService();
+    const { d } = deps(backend, svc);
+    await down(loadConfig(), ['A'], d);
+    expect(calls).toEqual([]);
+  });
+
+  it('down without a watchdogService (old callers) does not throw', async () => {
+    withWatchdog();
+    const { backend } = fakeBackend();
+    const { d } = deps(backend);
+    await expect(down(loadConfig(), [], d)).resolves.not.toThrow();
   });
 });
 

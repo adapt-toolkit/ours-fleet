@@ -1,18 +1,15 @@
-import { describe, it, expect, beforeAll, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { execFile } from 'node:child_process';
 import { mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
-import { realExec } from '../src/exec.js';
 import { replaceFileAtomically, withFileLock } from '../src/atomic-file.js';
 
+// dist/cli.js et al are built once by vitest's globalSetup
+// (test/global-setup.ts), before any test file runs — the pretrust-child.mjs
+// fixture below imports compiled modules straight out of dist/.
 const DIST = resolve('dist');
 const CHILD = resolve('test/fixtures/pretrust-child.mjs');
-
-beforeAll(async () => {
-  const r = await realExec('npm', ['run', 'build']);
-  if (r.code !== 0) throw new Error(`build failed: ${r.stderr}`);
-}, 180_000);
 
 let home: string;
 beforeEach(() => { home = mkdtempSync(join(tmpdir(), 'ours-fleet-atomic-')); });

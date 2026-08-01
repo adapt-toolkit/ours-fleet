@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeAll, beforeEach, afterEach } from 'vitest';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, rmSync } from 'node:fs';
 import { spawn } from 'node:child_process';
 import { once } from 'node:events';
 import { tmpdir } from 'node:os';
@@ -10,10 +10,12 @@ import { UNATTENDED_FLOOR } from '../src/permissions.js';
 const CLI = resolve('dist/cli.js');
 let dir: string;
 
-beforeAll(async () => {
-  const r = await realExec('npm', ['run', 'build']);
-  if (r.code !== 0) throw new Error(`build failed: ${r.stderr}`);
-}, 120_000);
+beforeAll(() => {
+  // dist/cli.js is built once by vitest's globalSetup (test/global-setup.ts),
+  // before any test file runs — this is just a cheap guard against that
+  // invariant breaking.
+  if (!existsSync(CLI)) throw new Error('dist/cli.js missing — global setup should have built it');
+});
 
 beforeEach(() => { dir = mkdtempSync(join(tmpdir(), 'ours-fleet-cli-')); });
 afterEach(() => rmSync(dir, { recursive: true, force: true }));
@@ -140,6 +142,164 @@ describe('ours-fleet CLI', () => {
     const r = await run(['config', '-c', join(dir, 'missing.yaml')]);
     expect(r.code).toBe(1);
     expect(r.stderr).toContain('config not found');
+  });
+
+  it('config shows watchdogs and --json includes them in the plan (acceptance 1)', async () => {
+    const { writeFileSync } = await import('node:fs');
+    writeFileSync(join(dir, 'fleet.yaml'),
+      'roles:\n  Alice: {}\n  Docs: {}\n'
+      + 'watchdogs:\n'
+      + '  nightwatch: { coordinator: FleetCoordinator }\n'
+      + '  slowlane: { coordinator: Owner, interval: 2h, watch: [Docs], enabled: false }\n');
+    const human = await run(['config']);
+    expect(human.stdout).toContain('watchdogs:');
+    expect(human.stdout).toMatch(/nightwatch.*every 10m.*-> FleetCoordinator/s);
+    expect(human.stdout).toMatch(/slowlane.*disabled/s);
+    const json = await run(['config', '--json']);
+    const plan = JSON.parse(json.stdout);
+    expect(plan.watchdogs).toHaveLength(2);
+    expect(plan.watchdogs[0]).toMatchObject({
+      name: 'nightwatch', enabled: true, intervalMs: 600000,
+      coordinator: 'FleetCoordinator', watch: ['Alice', 'Docs'],
+      identity: 'Watchdog-nightwatch', model: null, promptFile: null,
+    });
+  });
+
+  it('config fails on a watchdog with an unknown key (acceptance 1)', async () => {
+    const { writeFileSync } = await import('node:fs');
+    writeFileSync(join(dir, 'fleet.yaml'),
+      'roles:\n  A: {}\nwatchdogs:\n  w: { coordinator: C, intervall: 5m }\n');
+    const r = await run(['config']);
+    expect(r.code).toBe(1);
+    expect(r.stderr + r.stdout).toMatch(/unknown key\(s\) intervall/);
+  });
+
+  it('watchdog-run refuses an unknown watchdog and respects the run lock', async () => {
+    const { writeFileSync } = await import('node:fs');
+    writeFileSync(join(dir, 'fleet.yaml'), 'roles:\n  A: {}\nwatchdogs:\n  w: { coordinator: C }\n');
+    const r = await run(['watchdog-run', 'ghost']);
+    expect(r.code).toBe(1);
+    expect(r.stderr + r.stdout).toMatch(/unknown watchdog 'ghost'/);
+    mkdirSync(join(dir, '.ours-fleet', 'watchdogs', 'w', '.run-lock'), { recursive: true });
+    const r2 = await run(['watchdog-run', 'w']);
+    expect(r2.code).toBe(1);
+    expect(r2.stderr + r2.stdout).toMatch(/already running/);
+  });
+
+  it('watchdog-report shows latest, --list, run-id and --json (acceptance 7)', async () => {
+    const { writeFileSync, readFileSync } = await import('node:fs');
+    writeFileSync(join(dir, 'fleet.yaml'), 'roles:\n  A: {}\nwatchdogs:\n  w: { coordinator: C }\n');
+    const reportsDir = join(dir, '.ours-fleet', 'watchdogs', 'w', 'reports');
+    mkdirSync(reportsDir, { recursive: true });
+    const fixture = JSON.parse(
+      readFileSync(resolve('test/fixtures/watchdog-good-report.json'), 'utf8'),
+    ) as Record<string, unknown>;
+    const report = { ...fixture, watchdog: 'w', run_id: '20260731T115000Z' };
+    writeFileSync(join(reportsDir, '20260731T115000Z.json'), JSON.stringify(report));
+
+    const latest = await run(['watchdog-report', 'w']);
+    expect(latest.code).toBe(0);
+    expect(latest.stdout).toMatch(/w.*20260731T115000Z/s);
+    expect(latest.stdout).toMatch(/Alice\s+blocked/);
+    expect(latest.stdout).toContain('Waiting on a trust dialog');
+
+    const list = await run(['watchdog-report', 'w', '--list']);
+    expect(list.code).toBe(0);
+    expect(list.stdout).toMatch(/20260731T115000Z\s+.*anomalies/);
+
+    const one = await run(['watchdog-report', 'w', '20260731T115000Z', '--json']);
+    expect(one.code).toBe(0);
+    expect(JSON.parse(one.stdout).run_id).toBe('20260731T115000Z');
+    expect(one.stdout).toBe(JSON.stringify(report) + '\n'); // stored JSON, unmodified
+
+    const missing = await run(['watchdog-report', 'w', '29990101T000000Z']);
+    expect(missing.code).toBe(1);
+
+    const unknown = await run(['watchdog-report', 'ghost']);
+    expect(unknown.code).toBe(1);
+  });
+
+  it('watchdog-report refuses a path-traversal-shaped name and touches nothing outside watchdogsRoot (finding #1)', async () => {
+    const { writeFileSync, mkdirSync: mkdir, statSync } = await import('node:fs');
+    writeFileSync(join(dir, 'fleet.yaml'), 'roles:\n  A: {}\nwatchdogs:\n  w: { coordinator: C }\n');
+    // watchdogsRoot() is `<dir>/.ours-fleet/watchdogs`; join(watchdogsRoot(), '../../evil')
+    // lands at `<dir>/evil` — two levels up from `watchdogs`. Pre-create that as an unrelated
+    // "victim" directory (0755, no reports/) so the traversal target actually exists: without
+    // that, `watchdogKnown`'s pre-fix existsSync check legitimately returns false regardless of
+    // any guard, and the test would pass vacuously.
+    const victim = join(dir, 'evil');
+    mkdir(victim, { recursive: true, mode: 0o755 });
+    const before = statSync(victim).mode & 0o777;
+
+    const r = await run(['watchdog-report', '../../evil', '--list']);
+    expect(r.code).toBe(1);
+    expect(r.stderr + r.stdout).toMatch(/unknown watchdog '\.\.\/\.\.\/evil'/);
+    // Pre-fix, watchdogKnown resolves this traversal to an existing dir, so listRuns() proceeds
+    // into store.ts's ensureDir, which chmods the target 0700 and mkdirs a reports/ inside it —
+    // an unrelated directory outside watchdogsRoot mutated by an unvalidated CLI arg.
+    expect(statSync(victim).mode & 0o777).toBe(before);
+    expect(existsSync(join(victim, 'reports'))).toBe(false);
+  });
+
+  it('watchdog-report --list --json emits machine-readable run metadata, not the human table', async () => {
+    const { writeFileSync, readFileSync } = await import('node:fs');
+    writeFileSync(join(dir, 'fleet.yaml'), 'roles:\n  A: {}\nwatchdogs:\n  w: { coordinator: C }\n');
+    const reportsDir = join(dir, '.ours-fleet', 'watchdogs', 'w', 'reports');
+    mkdirSync(reportsDir, { recursive: true });
+    const fixture = JSON.parse(
+      readFileSync(resolve('test/fixtures/watchdog-good-report.json'), 'utf8'),
+    ) as Record<string, unknown>;
+    const report = { ...fixture, watchdog: 'w', run_id: '20260731T115000Z' };
+    writeFileSync(join(reportsDir, '20260731T115000Z.json'), JSON.stringify(report));
+
+    const r = await run(['watchdog-report', 'w', '--list', '--json']);
+    expect(r.code).toBe(0);
+    const parsed = JSON.parse(r.stdout);
+    expect(parsed.runs[0].runId).toBe('20260731T115000Z');
+  });
+
+  it('watchdog-report surfaces an error report\'s diagnostic tail (acceptance 9)', async () => {
+    const { writeFileSync } = await import('node:fs');
+    writeFileSync(join(dir, 'fleet.yaml'), 'roles:\n  A: {}\nwatchdogs:\n  w: { coordinator: C }\n');
+    const reportsDir = join(dir, '.ours-fleet', 'watchdogs', 'w', 'reports');
+    mkdirSync(reportsDir, { recursive: true });
+    const report = {
+      schema_version: 1, watchdog: 'w', run_id: '20260731T115000Z',
+      started_at: '2026-07-31T11:50:00Z', finished_at: '2026-07-31T11:51:12Z',
+      status: 'error', summary: { checked: 0, healthy: 0, idle: 0, anomalies: 0 },
+      roles: [], alerts: [], error: 'timeout', tail: 'boom line',
+    };
+    writeFileSync(join(reportsDir, '20260731T115000Z.json'), JSON.stringify(report));
+
+    const r = await run(['watchdog-report', 'w']);
+    expect(r.code).toBe(0);
+    expect(r.stdout).toContain('output tail');
+    expect(r.stdout).toContain('boom line');
+  });
+
+  it('restart <watchdog> releases a held-down watchdog (spec §3, Task 15)', async () => {
+    const { writeFileSync, readFileSync } = await import('node:fs');
+    writeFileSync(join(dir, 'fleet.yaml'), 'roles:\n  A: {}\nwatchdogs:\n  w: { coordinator: C }\n');
+    const sdir = join(dir, '.ours-fleet', 'watchdogs', 'w');
+    mkdirSync(sdir, { recursive: true });
+    writeFileSync(join(sdir, 'state.json'), JSON.stringify({
+      version: 1, consecutiveFailures: 3, heldDown: true, heldSince: '2026-07-31T10:00:00Z',
+    }));
+
+    const cfgOut = await run(['config']);
+    expect(cfgOut.stdout).toContain('● w  (held down)');
+
+    const rep = await run(['watchdog-report', 'w', '--list']);
+    expect(rep.stdout).toMatch(/HELD DOWN/);
+
+    const r = await run(['restart', 'w']);
+    expect(r.code).toBe(0);
+    expect(r.stdout).toMatch(/released watchdog 'w'/);
+    expect(JSON.parse(readFileSync(join(sdir, 'state.json'), 'utf8')).heldDown).toBe(false);
+
+    // the config chip clears too, once the watchdog is no longer held down
+    const cfgAfter = await run(['config']);
+    expect(cfgAfter.stdout).not.toContain('(held down)');
   });
 
   it('spawn --help lists model and Codex controls', async () => {
