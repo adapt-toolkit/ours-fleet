@@ -5,7 +5,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import { OwnerChannel } from '../src/owner-channel/channel.js';
 import type { OursToolClient } from '../src/owner-channel/mcp.js';
-import type { SessionHandle } from '../src/session/types.js';
+import type { SessionHandle, TurnResult } from '../src/session/types.js';
 
 class FakeClient implements OursToolClient {
   calls: Array<{ name: string; args?: Record<string, unknown> }> = [];
@@ -24,6 +24,12 @@ afterEach(() => {
   vi.restoreAllMocks();
   for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true });
 });
+
+function deferredTurn() {
+  let resolve!: (result: TurnResult) => void;
+  const completion = new Promise<TurnResult>(done => { resolve = done; });
+  return { completion, resolve };
+}
 
 function setup(messages: unknown[], result = {
   accepted: true, outcome: 'completed' as const, succeeded: true, output: 'Agent answer',
@@ -127,6 +133,74 @@ describe('OwnerChannel', () => {
       contact: 'owner-cid', text: "[fleet] Interrupted Coordinator's active turn.",
       reply_to_wire_id: 'wire-stop',
     });
+  });
+
+  it('handles /interrupt while an earlier owner request is still running', async () => {
+    const running = deferredTurn();
+    const first = {
+      msg_id: 14, wire_id: 'wire-running', from: { id: 'owner-cid' }, text: 'Long task',
+    };
+    const { channel, client, queuePrompt, interrupt } = setup([first], undefined, { interrupt: true });
+    queuePrompt.mockResolvedValueOnce({
+      promptId: 'prompt-running', queuedBehind: 0, completion: running.completion,
+    });
+
+    await channel.drain();
+    expect(queuePrompt).toHaveBeenCalledOnce();
+
+    client.batches.push([{
+      msg_id: 15, wire_id: 'wire-interrupt-running', from: { id: 'owner-cid' }, text: '/interrupt',
+    }], []);
+    await channel.drain();
+
+    expect(interrupt).toHaveBeenCalledOnce();
+    expect(queuePrompt).toHaveBeenCalledOnce();
+    expect(client.calls).toContainEqual({
+      name: 'send_message',
+      args: {
+        contact: 'owner-cid', text: "[fleet] Interrupted Coordinator's active turn.",
+        reply_to_wire_id: 'wire-interrupt-running',
+      },
+    });
+
+    running.resolve({ accepted: true, outcome: 'cancelled', succeeded: false });
+    await vi.waitFor(() => expect(client.calls).toContainEqual({
+      name: 'send_message',
+      args: {
+        contact: 'owner-cid', text: '[fleet] The request ended cancelled.',
+        reply_to_wire_id: 'wire-running',
+      },
+    }));
+  });
+
+  it('delivers a later interrupting owner message while the prior one is unresolved', async () => {
+    const firstTurn = deferredTurn();
+    const secondTurn = deferredTurn();
+    const first = {
+      msg_id: 16, wire_id: 'wire-first-active', from: { id: 'owner-cid' }, text: 'First task',
+    };
+    const second = {
+      msg_id: 17, wire_id: 'wire-second-active', from: { id: 'owner-cid' }, text: 'New priority',
+    };
+    const { channel, client, queuePrompt } = setup([first], undefined, { interrupt: true });
+    queuePrompt
+      .mockResolvedValueOnce({ promptId: 'prompt-first', queuedBehind: 0, completion: firstTurn.completion })
+      .mockResolvedValueOnce({ promptId: 'prompt-second', queuedBehind: 0, completion: secondTurn.completion });
+
+    await channel.drain();
+    client.batches.push([first, second], []);
+    await channel.drain();
+
+    expect(queuePrompt).toHaveBeenCalledTimes(2);
+    expect(queuePrompt.mock.calls[1][0]).toContain('New priority');
+    expect(queuePrompt.mock.calls[1][1]).toEqual({ interrupt: true });
+
+    firstTurn.resolve({ accepted: true, outcome: 'cancelled', succeeded: false });
+    secondTurn.resolve({ accepted: true, outcome: 'completed', succeeded: true, output: 'New answer' });
+    await vi.waitFor(() => expect(client.calls).toContainEqual({
+      name: 'send_message',
+      args: { contact: 'owner-cid', text: 'New answer', reply_to_wire_id: 'wire-second-active' },
+    }));
   });
 
   it('deduplicates by wire ID and persists no message or reply plaintext', async () => {

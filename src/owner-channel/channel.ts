@@ -47,6 +47,9 @@ export class OwnerChannel implements OwnerChannelHandle {
   private watchProcess?: ChildProcessWithoutNullStreams;
   private watchTask?: Promise<void>;
   private drainTask?: Promise<void>;
+  private drainRequested = false;
+  private readonly inFlight = new Set<string>();
+  private readonly completionTasks = new Set<Promise<void>>();
 
   constructor(private readonly options: OwnerChannelOptions) {
     this.client = options.client ?? new OursMcpClient(
@@ -64,8 +67,14 @@ export class OwnerChannel implements OwnerChannelHandle {
   }
 
   drain(): Promise<void> {
+    this.drainRequested = true;
     if (this.drainTask) return this.drainTask;
-    this.drainTask = this.drainAll().finally(() => { this.drainTask = undefined; });
+    this.drainTask = (async () => {
+      while (this.drainRequested && !this.stopping) {
+        this.drainRequested = false;
+        await this.drainAll();
+      }
+    })().finally(() => { this.drainTask = undefined; });
     return this.drainTask;
   }
 
@@ -98,14 +107,21 @@ export class OwnerChannel implements OwnerChannelHandle {
       if (deferred.length)
         await this.client.callTool('defer_messages', { msg_ids: deferred });
 
-      for (const message of messages) await this.handle(message);
+      let advanced = false;
+      for (const message of messages)
+        advanced = await this.handle(message) || advanced;
+
+      // Deferred in-flight messages are intentionally visible again until
+      // their correlated response is delivered. Do not spin on those replay
+      // copies; a new watch event or completion-triggered drain will resume.
+      if (!advanced) return;
     }
     this.options.log(`[${this.options.role}] owner channel drain capped at 100 batches`);
   }
 
-  private async handle(message: InboundMessage): Promise<void> {
+  private async handle(message: InboundMessage): Promise<boolean> {
     const wireId = this.wireId(message);
-    if (!wireId || this.state.has(wireId)) return;
+    if (!wireId || this.state.has(wireId) || this.inFlight.has(wireId)) return false;
     const sender = this.sender(message);
     if (!this.options.config.owners.includes(sender.id)) {
       // Do not answer an unauthorized sender and thereby disclose that this is
@@ -114,7 +130,7 @@ export class OwnerChannel implements OwnerChannelHandle {
       this.options.log(
         `[${this.options.role}] owner channel ignored unauthorized sender ${sender.id || '<unknown>'}`);
       this.state.remember(wireId);
-      return;
+      return true;
     }
 
     const text = String(message.text ?? '').trim();
@@ -124,13 +140,13 @@ export class OwnerChannel implements OwnerChannelHandle {
         `[fleet] ${this.options.role}: ${snapshot.readiness}; `
         + `${snapshot.alive ? 'session alive' : 'session offline'}.`, wireId);
       this.state.remember(wireId);
-      return;
+      return true;
     }
     if (text.toLowerCase() === '/interrupt') {
       await this.options.session.interrupt();
       await this.send(sender.id, `[fleet] Interrupted ${this.options.role}'s active turn.`, wireId);
       this.state.remember(wireId);
-      return;
+      return true;
     }
 
     let queued;
@@ -142,7 +158,7 @@ export class OwnerChannel implements OwnerChannelHandle {
       await this.send(sender.id,
         `[fleet] Could not deliver this request: ${this.errorText(error)}.`, wireId);
       this.state.remember(wireId);
-      return;
+      return true;
     }
 
     const accepted = this.options.config.interrupt
@@ -155,24 +171,43 @@ export class OwnerChannel implements OwnerChannelHandle {
           + 'The response will arrive in this channel when ready.'
         : 'ℹ️ Message received. The agent has started working on this request now. '
           + 'The response will arrive in this channel when ready.';
-    await this.send(sender.id, accepted, wireId);
+    this.inFlight.add(wireId);
+    const task = this.complete(sender.id, wireId, accepted, queued.completion)
+      .catch(error => this.logError(`request ${wireId} completion failed`, error))
+      .finally(() => {
+        this.inFlight.delete(wireId);
+        this.completionTasks.delete(task);
+        if (!this.stopping)
+          void this.drain().catch(error => this.logError('completion drain failed', error));
+      });
+    this.completionTasks.add(task);
+    return true;
+  }
+
+  private async complete(
+    contact: string, wireId: string, accepted: string, completion: Promise<TurnResult>,
+  ): Promise<void> {
+    // Notice delivery and turn completion happen outside the inbox drain. This
+    // is what keeps later owner messages — especially /interrupt — responsive.
+    try { await this.send(contact, accepted, wireId); }
+    catch (error) { this.logError(`request ${wireId} acceptance notice failed`, error); }
 
     const progressMs = this.options.config.progress_interval_ms;
     const timer = progressMs > 0 ? setInterval(() => {
-      void this.send(sender.id, `[fleet] ${this.options.role} is still working.`, wireId)
+      void this.send(contact, `[fleet] ${this.options.role} is still working.`, wireId)
         .catch(error => this.logError('progress notice failed', error));
     }, progressMs) : undefined;
     timer?.unref();
 
     let result: TurnResult;
-    try { result = await queued.completion; }
+    try { result = await completion; }
     finally { if (timer) clearInterval(timer); }
 
     const output = result.output?.trim();
-    if (result.succeeded && output) await this.sendFinal(sender.id, output, wireId);
-    else if (result.succeeded) await this.send(sender.id,
+    if (result.succeeded && output) await this.sendFinal(contact, output, wireId);
+    else if (result.succeeded) await this.send(contact,
       '[fleet] The agent completed the turn without a textual answer.', wireId);
-    else await this.send(sender.id,
+    else await this.send(contact,
       `[fleet] The request ended ${result.outcome}${result.detail ? `: ${result.detail}` : '.'}`, wireId);
     this.state.remember(wireId);
   }
