@@ -69,6 +69,7 @@ export class AcpSession implements SessionHandle {
   private steeringSupported = false;
   private capabilities?: acp.AgentCapabilities;
   private controllerCount = 0;
+  private activeTurn?: { id: string; output: string };
 
   private constructor(
     private readonly options: AcpSessionOptions,
@@ -201,6 +202,7 @@ export class AcpSession implements SessionHandle {
     this.pendingPermissions.delete(permissionId);
     pending.resolve({ outcome: { outcome: 'selected', optionId } });
     this.events.emit('permission', {
+      turnId: this.activeTurn?.id,
       permissionId,
       status: 'completed',
       decision: chosen.kind.startsWith('reject') ? 'denied' : 'allowed',
@@ -287,6 +289,7 @@ export class AcpSession implements SessionHandle {
     if (!this.sessionId || !this.isAlive())
       return turnResult(false, 'failed', this.lastError ?? 'ACP session is offline');
     this.readiness = 'running';
+    this.activeTurn = { id: turnId, output: '' };
     this.events.emit('state', { turnId, status: 'running' });
     try {
       const response = await this.connection.agent.request(acp.methods.agent.session.prompt, {
@@ -298,13 +301,19 @@ export class AcpSession implements SessionHandle {
       this.events.emit('state', { status: 'idle' });
       // The prompt was accepted either way — the agent answered. Whether the
       // turn SUCCEEDED is a separate question, and only `stopReason` answers it.
-      return turnResult(true, classifyStopReason(response.stopReason), response.stopReason);
+      return turnResult(
+        true, classifyStopReason(response.stopReason), response.stopReason,
+        this.activeTurn?.id === turnId ? this.activeTurn.output : undefined);
     } catch (error) {
       this.lastError = (error as Error)?.message ?? String(error);
       this.readiness = this.isAlive() ? 'idle' : 'failed';
       this.events.emit('error', { turnId, text: this.lastError });
       if (this.isAlive()) this.events.emit('state', { status: 'idle' });
-      return turnResult(false, 'failed', this.lastError);
+      return turnResult(
+        false, 'failed', this.lastError,
+        this.activeTurn?.id === turnId ? this.activeTurn.output : undefined);
+    } finally {
+      if (this.activeTurn?.id === turnId) this.activeTurn = undefined;
     }
   }
 
@@ -364,6 +373,7 @@ export class AcpSession implements SessionHandle {
     const permissionId = randomUUID();
     this.readiness = 'awaiting_permission';
     this.events.emit('permission', {
+      turnId: this.activeTurn?.id,
       permissionId,
       toolCallId: params.toolCall.toolCallId,
       title: params.toolCall.title ?? 'Permission requested',
@@ -391,6 +401,7 @@ export class AcpSession implements SessionHandle {
   ): acp.RequestPermissionResponse {
     const settled: PermissionDecision = option ? decision : 'cancelled';
     this.events.emit('permission', {
+      turnId: this.activeTurn?.id,
       permissionId: randomUUID(),
       toolCallId: params.toolCall.toolCallId,
       title: params.toolCall.title ?? 'Permission requested',
@@ -424,17 +435,22 @@ export class AcpSession implements SessionHandle {
   private recordUpdate(update: acp.SessionUpdate): void {
     switch (update.sessionUpdate) {
       case 'agent_message_chunk':
+        if (this.activeTurn && update.content.type === 'text')
+          this.activeTurn.output += update.content.text;
         this.events.emit('agent_text', {
+          turnId: this.activeTurn?.id,
           text: update.content.type === 'text' ? update.content.text : `[${update.content.type}]`,
         });
         break;
       case 'agent_thought_chunk':
         this.events.emit('thought', {
+          turnId: this.activeTurn?.id,
           text: update.content.type === 'text' ? update.content.text : `[${update.content.type}]`,
         });
         break;
       case 'tool_call':
         this.events.emit('tool_call', {
+          turnId: this.activeTurn?.id,
           toolCallId: update.toolCallId,
           title: update.title,
           status: update.status,
@@ -442,6 +458,7 @@ export class AcpSession implements SessionHandle {
         break;
       case 'tool_call_update':
         this.events.emit('tool_update', {
+          turnId: this.activeTurn?.id,
           toolCallId: update.toolCallId,
           title: update.title ?? undefined,
           status: update.status ?? undefined,

@@ -339,6 +339,33 @@ selection.
 Inspect \`ours-fleet status Name\`, \`peek Name\`, role logs, and
 \`~/.ours-fleet/agents/Name/.monitor-status\` when diagnosing delivery.
 
+## Trusted owner channel
+
+An ACP role may declare a separate, existing ours identity which fleet — never
+the agent — binds:
+
+\`\`\`yaml
+owner_channel:
+  identity: Coordinator Owner Channel
+  owners: [authenticated-owner-contact-cid]
+  interrupt: false
+  progress_interval_ms: 30000
+\`\`\`
+
+This does not replace the role identity. Normal identity mail remains untrusted
+peer input: the agent reads it through \`get_messages\` and replies through
+\`send_message\`. Only mail arriving on the dedicated channel from a CID in
+\`owners\` is injected as a direct \`[fleet-owner]\` prompt. Fleet itself sends
+accepted/queued/progress/interrupted/failure notices and routes the ACP turn's
+final assistant text back to the authenticated sender with its source wire ID.
+Exact \`/status\` and \`/interrupt\` commands bypass the model.
+
+The channel identity must be unique and must not be a role identity. The bridge
+persists bounded wire IDs only, never message/reply plaintext, and requeues input
+before starting its turn for at-least-once crash recovery. It currently requires
+\`session: acp\`: tmux has no structured, turn-correlated final answer, and pane
+scraping cannot provide the same reliable reply guarantee.
+
 ## Stable config and YAML migration
 
 \`ours-fleet config --json\` emits schemaVersion 1 resolved plans. Environment

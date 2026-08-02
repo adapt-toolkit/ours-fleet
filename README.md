@@ -67,6 +67,7 @@ The state dir contract:
 | `ROUTINES.md` | operator / agent | **optional** recurring-work instructions; re-read at the start of every wake, hot-editable **without a restart**; absence means "no routines" |
 | `.identity`, `.cwd`, `.session-id`, `.booted`, `.exit-status`, `.config-path` | supervisor | dot-marker state — session resume and boot bookkeeping |
 | `.monitor-state.json`, `.monitor-status` | supervisor monitor | atomic body-free cursor/pending state and health |
+| `.owner-channel-state.json` | owner-channel bridge | bounded wire-ID dedupe only; never message/reply plaintext |
 | `.session-events.jsonl`, `.control.sock`, `.control-token` | ACP backend | bounded typed console projection and private attachment control |
 
 ## Prerequisites
@@ -279,6 +280,11 @@ roles:
         - file_received                 #   local_contact_request, pending_message)
       batch_ms: 2000                    # coalesce a burst into one line (default 2000)
       inject: notification              # notification (default) | full (bodies inline; roadmap)
+    owner_channel:                      # optional trusted owner ingress; requires session: acp
+      identity: "Name Owner Channel"     # existing, dedicated ours identity bound only by fleet
+      owners: [owner-contact-cid]        # authenticated ours contact IDs, never display names
+      interrupt: false                  # false queues; true cancels current work first
+      progress_interval_ms: 30000        # fleet-generated progress notices; 0 disables
     model: claude-fable-5               # launch on a specific model (pass-through id; default: launcher default)
     mission: one line
     persona: |                          # operating contract (published as persona)
@@ -476,6 +482,41 @@ ACP stdio remains private to the persistent runner. `send`, `peek`, and the basi
 ACP `attach` console use a private, authenticated per-role control socket with
 typed replayable events. This is also the stable extension boundary for a richer
 console later; no terminal UI is part of the monitor or session backend.
+
+### Trusted owner channel
+
+`owner_channel` adds a second ours identity to a role without changing the
+role's normal identity. Create that dedicated identity in ours first, connect it
+to each owner/controller identity, and put the owners' immutable contact CIDs in
+`owners`. The channel identity must not be any role identity or another role's
+channel identity. Add it to the control plane just like another contact, then
+message it directly.
+
+The two paths are deliberately simultaneous and have different authority:
+
+- Mail to the role's normal `identity` remains peer mail. The content-blind
+  `[fleet-monitor]` wake asks the agent to call `get_messages`; the agent sees
+  provenance and replies with `send_message`. A colleague's agent cannot become
+  an owner by writing instruction-like text.
+- Mail to `owner_channel.identity` is accepted only when its authenticated
+  sender CID is in `owners`. Fleet injects it as `[fleet-owner]`, sends
+  acceptance/queue/interruption/progress/failure notices itself, captures the
+  ACP turn's final assistant text, and sends that text back to the exact sender
+  with `reply_to_wire_id`. Recipient choice and final delivery do not depend on
+  the model calling a tool.
+
+Exact `/status` and `/interrupt` messages are supervisor commands and never
+enter the model. Processed wire IDs are durably bounded for deduplication, while
+message and response bodies stay out of fleet state. Delivery is at-least-once
+across a crash (the bridge requeues fetched input before starting a turn); true
+exactly-once processing would require a leased claim/idempotency primitive in
+ours-mcp.
+
+Owner channels currently require `session: acp`. Fleet needs structured,
+turn-correlated assistant output for automatic replies; scraping a tmux pane
+cannot reliably distinguish the final answer from thoughts, tool output, or
+unrelated concurrent work. The config rejects tmux instead of silently offering
+weaker semantics.
 
 ## Codex roles
 

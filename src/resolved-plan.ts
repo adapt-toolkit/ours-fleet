@@ -64,6 +64,7 @@ export function resolvedRolePlan(role: ResolvedRole): Record<string, unknown> {
       ],
     },
     monitor: role.monitor,
+    ownerChannel: role.owner_channel ?? null,
     isolation: role.isolation ?? null,
     worklog: role.worklog ?? null,
     authProxy: role.auth_proxy ?? null,

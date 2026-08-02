@@ -2,6 +2,7 @@ export { loadConfig, findRole, resolvePermissions, ConfigError } from './config.
 export type {
   FleetConfig, ResolvedRole, RoleConfig, OverseeEntry, SessionBackendId,
   CommonPermissions, SessionOptions,
+  OwnerChannelConfig,
 } from './config.js';
 export type {
   HarnessAdapter, BriefingVocab, ExitPolicy, PrereqReport, PrereqCheck,
@@ -11,6 +12,7 @@ export type {
   SessionHandle, SessionSnapshot, SessionEvent, TurnResult,
 } from './session/types.js';
 export { AcpSession } from './session/acp.js';
+export { OwnerChannel } from './owner-channel/channel.js';
 export { TmuxSession } from './session/tmux.js';
 export { registerAdapter, getAdapter, knownAdapters } from './harness/registry.js';
 export { claudeCodeAdapter, makeClaudeCodeAdapter } from './harness/claude-code.js';

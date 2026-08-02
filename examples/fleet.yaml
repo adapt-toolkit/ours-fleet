@@ -54,6 +54,14 @@ defaults:
 roles:
 
   FleetCoordinator:
+    # A reliable owner channel requires ACP so fleet can capture the correlated
+    # final answer. Create this dedicated ours identity/contact before enabling.
+    # session: acp
+    # owner_channel:
+    #   identity: FleetCoordinator Owner Channel
+    #   owners: [replace-with-your-owner-contact-cid]
+    #   interrupt: false
+    #   progress_interval_ms: 30000
     identity: FleetCoordinator
     cwd: ${work_root}
     persona: |

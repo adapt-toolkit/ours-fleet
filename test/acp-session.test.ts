@@ -40,7 +40,11 @@ describe('AcpSession', () => {
     const result = await session.submitPrompt('hello');
     expect(result).toMatchObject({
       accepted: true, outcome: 'completed', succeeded: true, detail: 'end_turn',
+      output: 'echo:hello',
     });
+    const turnEvents = session.eventsSince(0).filter(event =>
+      ['agent_text', 'turn_stop'].includes(event.kind));
+    expect(turnEvents.every(event => event.turnId === turnEvents[0].turnId)).toBe(true);
     expect(session.eventsSince(0).some(event =>
       event.kind === 'agent_text' && event.text === 'echo:hello')).toBe(true);
     await session.close();
@@ -176,8 +180,10 @@ describe('AcpSession', () => {
     expect(elapsed).toBeLessThan(500);                       // …and did not wait for it
     expect(session.snapshot().alive).toBe(true);
 
-    expect((await busy).succeeded).toBe(true);
-    expect((await queued.completion).succeeded).toBe(true);  // it does run, afterwards
+    const busyResult = await busy;
+    const queuedResult = await queued.completion;
+    expect(busyResult).toMatchObject({ succeeded: true, output: 'echo:block 1500' });
+    expect(queuedResult).toMatchObject({ succeeded: true, output: 'echo:second' });
     await session.close();
   });
 

@@ -74,6 +74,18 @@ export interface MonitorConfig {
   turn_fail_threshold?: number;
 }
 
+/** A trusted, fleet-owned ours mailbox which is never bound inside the agent. */
+export interface OwnerChannelConfig {
+  /** Existing ours identity exclusively bound by the fleet supervisor. */
+  identity: string;
+  /** Authenticated ours contact IDs allowed to issue owner instructions. */
+  owners: string[];
+  /** Cancel active work before each owner request instead of queueing it. */
+  interrupt: boolean;
+  /** Deterministic in-progress notice interval; 0 disables progress notices. */
+  progress_interval_ms: number;
+}
+
 /** Default wake sources when a role does not list its own (design §2). */
 export const DEFAULT_WAKE_SOURCES: NotifyEventType[] =
   ['message_received', 'file_received', 'local_contact_request', 'pending_message'];
@@ -149,11 +161,12 @@ export interface RoleConfig {
   harness_options?: Record<string, unknown>;
   isolation?: IsolationConfig;
   monitor?: Partial<MonitorConfig>;
+  owner_channel?: Partial<OwnerChannelConfig>;
   worklog?: WorklogPolicy;
   auth_proxy?: Partial<AuthProxyConfig>;
 }
 
-export interface ResolvedRole extends Omit<RoleConfig, 'model'> {
+export interface ResolvedRole extends Omit<RoleConfig, 'model' | 'owner_channel'> {
   name: string;
   harness: string;
   session: SessionBackendId;
@@ -169,6 +182,7 @@ export interface ResolvedRole extends Omit<RoleConfig, 'model'> {
   model?: string;
   sourceFile: string;
   monitor: MonitorConfig;
+  owner_channel?: OwnerChannelConfig;
   worklog?: WorklogPolicy;
   auth_proxy?: AuthProxyConfig;
 }
@@ -232,7 +246,7 @@ export const ROLE_NAME_RE = /^[A-Za-z0-9_-]+$/;
 const ROLE_KEYS = [
   'harness', 'session', 'session_options', 'permissions', 'identity', 'cwd', 'coordinator', 'mission', 'persona', 'bio',
   'briefing_file', 'model', 'model_chain', 'max_tokens', 'autocompact_pct', 'env', 'oversee', 'harness_options',
-  'isolation', 'monitor', 'worklog', 'auth_proxy',
+  'isolation', 'monitor', 'owner_channel', 'worklog', 'auth_proxy',
 ];
 
 function deepSub(v: unknown, vars: Record<string, string>): unknown {
@@ -316,6 +330,8 @@ export function loadConfig(
           throw new ConfigError(`${file}: role '${name}' ${problems.join('; ')}`);
       }
       const monitor = resolveMonitorConfig(defaults.monitor, r.monitor, { base, file, name });
+      const ownerChannel = resolveOwnerChannelConfig(
+        defaults.owner_channel, r.owner_channel, session, file, name);
       const worklog = resolveWorklogPolicy(defaults.worklog, r.worklog, file, name);
       const authProxy = resolveAuthProxy(defaults.auth_proxy, r.auth_proxy, file, name);
       const harness = r.harness ?? (defaults.harness as string | undefined) ?? 'claude-code';
@@ -353,6 +369,7 @@ export function loadConfig(
         harness_options: harnessOptions,
         isolation,
         monitor,
+        owner_channel: ownerChannel,
         worklog,
         auth_proxy: authProxy,
         env: Object.keys(env).length ? env : undefined,
@@ -368,8 +385,70 @@ export function loadConfig(
       }
     }
   }
+  validateOwnerChannelIdentities(roles);
   const watchdogs = resolveWatchdogs(baseDoc, base, roles, vars, defaults);
   return { roles, vars, defaults, files, startStaggerMs, diagnostics, watchdogs };
+}
+
+export function resolveOwnerChannelConfig(
+  defaults: unknown, role: Partial<OwnerChannelConfig> | undefined,
+  session: SessionBackendId, file = 'config', name = 'role',
+): OwnerChannelConfig | undefined {
+  if (defaults === undefined && role === undefined) return undefined;
+  if (defaults !== undefined && !isPlainObject(defaults))
+    throw new ConfigError(`${file}: defaults.owner_channel must be a map`);
+  if (role !== undefined && !isPlainObject(role))
+    throw new ConfigError(`${file}: role '${name}' owner_channel must be a map`);
+  const merged = {
+    ...((defaults ?? {}) as Partial<OwnerChannelConfig>),
+    ...(role ?? {}),
+  };
+  const allowed = ['identity', 'owners', 'interrupt', 'progress_interval_ms'];
+  const bad = Object.keys(merged).filter(key => !allowed.includes(key));
+  if (bad.length)
+    throw new ConfigError(`${file}: role '${name}' owner_channel: unknown key(s) ${bad.join(', ')}`);
+  if (typeof merged.identity !== 'string' || !merged.identity.trim())
+    throw new ConfigError(`${file}: role '${name}' owner_channel.identity must be a non-blank string`);
+  if (!Array.isArray(merged.owners) || merged.owners.length === 0
+      || merged.owners.some(owner => typeof owner !== 'string' || !owner.trim()))
+    throw new ConfigError(`${file}: role '${name}' owner_channel.owners must be a non-empty list of contact IDs`);
+  const owners = merged.owners.map(owner => owner.trim());
+  if (new Set(owners).size !== owners.length)
+    throw new ConfigError(`${file}: role '${name}' owner_channel.owners must not contain duplicates`);
+  if (merged.interrupt !== undefined && typeof merged.interrupt !== 'boolean')
+    throw new ConfigError(`${file}: role '${name}' owner_channel.interrupt must be true or false`);
+  if (merged.progress_interval_ms !== undefined
+      && (typeof merged.progress_interval_ms !== 'number'
+        || !Number.isFinite(merged.progress_interval_ms) || merged.progress_interval_ms < 0))
+    throw new ConfigError(
+      `${file}: role '${name}' owner_channel.progress_interval_ms must be a non-negative number`);
+  if (session !== 'acp')
+    throw new ConfigError(
+      `${file}: role '${name}' owner_channel requires session: acp for correlated final replies`);
+  return {
+    identity: merged.identity.trim(),
+    owners,
+    interrupt: merged.interrupt ?? false,
+    progress_interval_ms: merged.progress_interval_ms ?? 30_000,
+  };
+}
+
+function validateOwnerChannelIdentities(roles: ResolvedRole[]): void {
+  const roleIdentities = new Map(roles.map(role => [role.identity, role.name]));
+  const channels = new Map<string, string>();
+  for (const role of roles) {
+    const identity = role.owner_channel?.identity;
+    if (!identity) continue;
+    const roleOwner = roleIdentities.get(identity);
+    if (roleOwner)
+      throw new ConfigError(
+        `${role.sourceFile}: role '${role.name}' owner_channel.identity '${identity}' conflicts with role '${roleOwner}' identity`);
+    const channelOwner = channels.get(identity);
+    if (channelOwner)
+      throw new ConfigError(
+        `${role.sourceFile}: owner_channel.identity '${identity}' is shared by roles '${channelOwner}' and '${role.name}'`);
+    channels.set(identity, role.name);
+  }
 }
 
 export function resolveModelChain(

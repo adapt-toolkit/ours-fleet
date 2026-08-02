@@ -157,6 +157,10 @@ cOpt(program.command('config').description('validate + print the merged plan (no
         console.log(`    monitor:     ${r.monitor.mode}`
           + (r.monitor.mode === 'fleet' ? ` (interrupt=${r.monitor.interrupt})` : ''));
         console.log(`    identity:    ${r.identity}`);
+        if (r.owner_channel)
+          console.log(`    owner ch:    ${r.owner_channel.identity} `
+            + `(${r.owner_channel.owners.length} authorized sender(s), `
+            + `interrupt=${r.owner_channel.interrupt})`);
         console.log(`    permissions: approval=${r.permissions.approval} `
           + `filesystem=${r.permissions.filesystem} unattended=${r.permissions.unattended}`);
         if (perms?.supported)

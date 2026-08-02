@@ -21,6 +21,42 @@ const dropin = (name: string, s: string) => {
 };
 
 describe('loadConfig', () => {
+  it('resolves a trusted owner channel only for ACP', () => {
+    base([
+      'roles:',
+      '  Coordinator:',
+      '    session: acp',
+      '    identity: Coordinator',
+      '    owner_channel:',
+      '      identity: Coordinator-owner',
+      '      owners: [cid-one, cid-two]',
+      '',
+    ].join('\n'));
+    expect(findRole(loadConfig(), 'Coordinator').owner_channel).toEqual({
+      identity: 'Coordinator-owner', owners: ['cid-one', 'cid-two'],
+      interrupt: false, progress_interval_ms: 30_000,
+    });
+    base('roles:\n  A:\n    owner_channel: { identity: A-owner, owners: [cid] }\n');
+    expect(() => loadConfig()).toThrow(/requires session: acp/);
+  });
+
+  it('keeps owner channel identities exclusive from role and channel identities', () => {
+    base([
+      'roles:',
+      '  A: { session: acp, identity: shared, owner_channel: { identity: B, owners: [cid] } }',
+      '  B: { session: acp, identity: B }',
+      '',
+    ].join('\n'));
+    expect(() => loadConfig()).toThrow(/owner_channel.identity 'B'.*conflicts with role 'B'/);
+    base([
+      'roles:',
+      '  A: { session: acp, owner_channel: { identity: shared, owners: [cid] } }',
+      '  B: { session: acp, owner_channel: { identity: shared, owners: [cid] } }',
+      '',
+    ].join('\n'));
+    expect(() => loadConfig()).toThrow(/shared by roles 'A' and 'B'/);
+  });
+
   it('always rejects duplicate mapping keys with a source position', () => {
     base('roles:\n  A:\n    model: first\n    model: second\n');
     expect(() => loadConfig()).toThrow(/fleet\.yaml:.*Map keys must be unique.*line 4/i);

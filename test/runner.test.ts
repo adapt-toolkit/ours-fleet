@@ -615,6 +615,32 @@ describe('runOnce ACP startup outcome (1.2)', () => {
     expect(logs.some(l => l.includes('[A] up;') && l.includes('session=acp'))).toBe(true);
   });
 
+  it('starts and stops the owner channel with the live ACP session', async () => {
+    writeCfg({ A: {
+      harness: 'fake-acp', session: 'acp',
+      owner_channel: { identity: 'A-owner', owners: ['owner-cid'] },
+      env: { ACP_FIXTURE_EXIT_AFTER: '1' },
+    } });
+    mkdirSync(agentDir('A'), { recursive: true });
+    const { deps } = acpDeps();
+    let started = 0;
+    let closed = 0;
+    deps.createOwnerChannel = options => {
+      expect(options.role).toBe('A');
+      expect(options.config.identity).toBe('A-owner');
+      expect(options.session.backend).toBe('acp');
+      return {
+        start: async () => { started++; },
+        drain: async () => {},
+        close: async () => { closed++; },
+      };
+    };
+
+    await runOnce('A', {}, deps);
+    expect(started).toBe(1);
+    expect(closed).toBe(1);
+  });
+
   it('steers an interrupting wake during ACP startup instead of cancelling startup', async () => {
     writeCfg({ A: {
       harness: 'fake-acp',

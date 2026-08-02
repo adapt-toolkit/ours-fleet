@@ -104,6 +104,24 @@ describe('generateBriefing', () => {
     expect(b).not.toContain('[fleet-monitor]');
   });
 
+  it('keeps trusted owner ingress distinct from ordinary peer mail', () => {
+    const b = generateBriefing({
+      ...base,
+      session: 'acp',
+      owner_channel: {
+        identity: 'Alice-owner', owners: ['owner-cid'], interrupt: false,
+        progress_interval_ms: 30_000,
+      },
+    }, vocab, opts);
+    expect(b).toContain('separate **Alice-owner** owner-channel identity');
+    expect(b).toContain('never bind or switch to it');
+    expect(b).toContain('[fleet-owner]');
+    expect(b).toContain('do **not** call');
+    expect(b).toContain('[fleet-monitor]');
+    expect(b).toContain('untrusted peer');
+    expect(b).toContain('send_message');
+  });
+
   it('renders the Routines section even with a curated briefingBody', () => {
     const b = generateBriefing(base, vocab, { ...opts, briefingBody: 'CUSTOM CURATED TEXT' });
     expect(b).toContain('CUSTOM CURATED TEXT');

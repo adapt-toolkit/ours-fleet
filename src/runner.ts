@@ -27,6 +27,7 @@ import {
   classifyFailureText,
 } from './model-recovery.js';
 import { rotateWorklog } from './worklog.js';
+import { OwnerChannel, type OwnerChannelHandle, type OwnerChannelOptions } from './owner-channel/channel.js';
 
 export interface RunnerDeps {
   tmux: Tmux;
@@ -40,6 +41,8 @@ export interface RunnerDeps {
   fetch: FetchLike;
   /** Construct the supervisor mail monitor (injectable so tests stub it out). */
   createMonitor(opts: MonitorOpts): MonitorHandle;
+  /** Construct trusted owner ingress (injectable for lifecycle tests). */
+  createOwnerChannel(opts: OwnerChannelOptions): OwnerChannelHandle;
   /** Lets a test (or a shutdown path) end the supervised restart loop. */
   shouldStop?(): boolean;
 }
@@ -54,6 +57,7 @@ const defaultDeps = (): RunnerDeps => ({
   log: line => process.stderr.write(line + '\n'),
   fetch: (url, init) => globalThis.fetch(url, init) as unknown as ReturnType<FetchLike>,
   createMonitor: opts => createMonitor(opts),
+  createOwnerChannel: opts => new OwnerChannel(opts),
 });
 
 const MONITOR_OWNER_FILE = '.monitor-owner';
@@ -461,6 +465,7 @@ export async function runOnce(
   let unsubscribeRecovery: (() => void) | undefined;
   let monitorLoop: Promise<void> | undefined;
   let acpStartupComplete = false;
+  let ownerChannel: OwnerChannelHandle | undefined;
   if (sessionBackend === 'acp') {
     const perms = role.permissions ?? resolvePermissions(undefined, undefined);
     // Say once, at startup, that this role will decide permission requests by
@@ -544,6 +549,26 @@ export async function runOnce(
         `${started.detail ? `: ${started.detail}` : ''}`);
     }
     acpStartupComplete = true;
+    if (role.owner_channel) {
+      ownerChannel = deps.createOwnerChannel({
+        role: name,
+        config: role.owner_channel,
+        session: acpSession,
+        stateDir: dir,
+        env: role.env,
+        log: deps.log,
+      });
+      try { await ownerChannel.start(); }
+      catch (error) {
+        monitor?.stop();
+        if (monitorLoop) await monitorLoop;
+        await control.close();
+        await acpSession.close();
+        unsubscribeRecovery?.();
+        throw new Error(`[${name}] owner channel failed to start: `
+          + `${(error as Error)?.message ?? String(error)}`);
+      }
+    }
   } else {
     await deps.tmux.kill(name);
     await deps.tmux.newSession(
@@ -566,6 +591,7 @@ export async function runOnce(
 
   const start = deps.now();
   while (sessionHandle.isAlive()) await deps.sleep(2000);
+  if (ownerChannel) await ownerChannel.close();
   if (monitor) { monitor.stop(); await monitorLoop; }
   unsubscribeRecovery?.();
   if (control) await control.close();

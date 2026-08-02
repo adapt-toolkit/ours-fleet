@@ -27,6 +27,8 @@ export interface TurnResult {
   outcome: TurnOutcome;
   succeeded: boolean;
   detail?: string;
+  /** Final assistant text captured structurally by a backend, when available. */
+  output?: string;
 }
 
 /**
@@ -121,9 +123,9 @@ export const isTerminalSuccess = (outcome: TurnOutcome): boolean => outcome === 
 
 /** Build a TurnResult with `succeeded` always consistent with `outcome`. */
 export function turnResult(
-  accepted: boolean, outcome: TurnOutcome, detail?: string,
+  accepted: boolean, outcome: TurnOutcome, detail?: string, output?: string,
 ): TurnResult {
-  return { accepted, outcome, succeeded: isTerminalSuccess(outcome), detail };
+  return { accepted, outcome, succeeded: isTerminalSuccess(outcome), detail, output };
 }
 
 export interface SubmitPromptOptions {
