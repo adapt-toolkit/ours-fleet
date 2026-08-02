@@ -358,6 +358,11 @@ peer input: the agent reads it through \`get_messages\` and replies through
 \`owners\` is injected as a direct \`[fleet-owner]\` prompt. Fleet itself sends
 accepted/queued/progress/interrupted/failure notices and routes the ACP turn's
 final assistant text back to the authenticated sender with its source wire ID.
+For file replies, fleet injects a request-specific outbox path into the owner
+prompt. The agent copies completed artifacts there; fleet sends every regular
+file from the channel identity with the same source wire ID and removes the
+temporary outbox only after successful delivery. The agent never chooses a
+recipient or calls ours \`send_file\` for an owner-channel response.
 Exact \`/status\` and \`/interrupt\` commands bypass the model.
 
 The channel identity must be unique and must not be a role identity. The bridge

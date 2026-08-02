@@ -1,4 +1,6 @@
-import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import {
+  existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync,
+} from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
@@ -10,11 +12,13 @@ import type { SessionHandle, TurnResult } from '../src/session/types.js';
 class FakeClient implements OursToolClient {
   calls: Array<{ name: string; args?: Record<string, unknown> }> = [];
   batches: unknown[][] = [];
+  failTools = new Set<string>();
   async start() {}
   async close() {}
   async callTool(name: string, args?: Record<string, unknown>): Promise<unknown> {
     this.calls.push({ name, args });
     if (name === 'get_messages') return { messages: this.batches.shift() ?? [] };
+    if (this.failTools.has(name)) throw new Error(`${name} failed`);
     return {};
   }
 }
@@ -210,6 +214,7 @@ describe('OwnerChannel', () => {
     const { channel, queuePrompt, dir } = setup([message, message]);
     await channel.drain();
     expect(queuePrompt).toHaveBeenCalledOnce();
+    await vi.waitFor(() => expect(existsSync(join(dir, '.owner-channel-state.json'))).toBe(true));
     const state = readFileSync(join(dir, '.owner-channel-state.json'), 'utf8');
     expect(state).toContain('wire-once');
     expect(state).not.toContain('private instruction');
@@ -228,5 +233,68 @@ describe('OwnerChannel', () => {
       '[2/2] x',
     ]);
     expect(finals.every(call => call.args?.reply_to_wire_id === 'wire-long')).toBe(true);
+  });
+
+  it('routes regular files from the per-request outbox through the channel identity', async () => {
+    const { channel, client, queuePrompt } = setup([{
+      msg_id: 18, wire_id: 'wire-files', from: { id: 'owner-cid' }, text: 'Send the artifacts',
+    }]);
+    let outbox = '';
+    queuePrompt.mockImplementationOnce(async (prompt: string) => {
+      const lines = prompt.split('\n');
+      outbox = lines[lines.indexOf('To attach files to your response, copy each finished file directly into this fleet outbox:') + 1];
+      mkdirSync(outbox, { recursive: true });
+      writeFileSync(join(outbox, 'report.txt'), 'report');
+      writeFileSync(join(outbox, 'data.json'), '{}');
+      mkdirSync(join(outbox, 'ignored-directory'));
+      return {
+        promptId: 'prompt-files', queuedBehind: 0,
+        completion: Promise.resolve({
+          accepted: true, outcome: 'completed', succeeded: true, output: 'Attached.',
+        }),
+      };
+    });
+
+    await channel.drain();
+    await vi.waitFor(() => {
+      expect(client.calls.filter(call => call.name === 'send_file')).toHaveLength(2);
+      expect(existsSync(outbox)).toBe(false);
+    });
+
+    expect(client.calls.filter(call => call.name === 'send_file').map(call => call.args)).toEqual([
+      {
+        contact: 'owner-cid', path: join(outbox, 'data.json'), filename: 'data.json',
+        reply_to_wire_id: 'wire-files',
+      },
+      {
+        contact: 'owner-cid', path: join(outbox, 'report.txt'), filename: 'report.txt',
+        reply_to_wire_id: 'wire-files',
+      },
+    ]);
+  });
+
+  it('retains the outbox and leaves the wire replayable when file delivery fails', async () => {
+    const { channel, client, queuePrompt, dir } = setup([{
+      msg_id: 19, wire_id: 'wire-file-retry', from: { id: 'owner-cid' }, text: 'Send it',
+    }]);
+    let outbox = '';
+    client.failTools.add('send_file');
+    queuePrompt.mockImplementationOnce(async (prompt: string) => {
+      const lines = prompt.split('\n');
+      outbox = lines[lines.indexOf('To attach files to your response, copy each finished file directly into this fleet outbox:') + 1];
+      writeFileSync(join(outbox, 'retry.txt'), 'retry');
+      return {
+        promptId: 'prompt-file-retry', queuedBehind: 0,
+        completion: Promise.resolve({
+          accepted: true, outcome: 'completed', succeeded: true, output: 'Attached.',
+        }),
+      };
+    });
+
+    await channel.drain();
+    await vi.waitFor(() => expect(client.calls.some(call => call.name === 'send_file')).toBe(true));
+    expect(existsSync(join(outbox, 'retry.txt'))).toBe(true);
+    const statePath = join(dir, '.owner-channel-state.json');
+    expect(!existsSync(statePath) || !readFileSync(statePath, 'utf8').includes('wire-file-retry')).toBe(true);
   });
 });

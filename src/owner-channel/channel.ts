@@ -1,4 +1,6 @@
 import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
+import { createHash } from 'node:crypto';
+import { mkdir, readdir, rm } from 'node:fs/promises';
 import { createInterface } from 'node:readline';
 import { join } from 'node:path';
 
@@ -149,12 +151,15 @@ export class OwnerChannel implements OwnerChannelHandle {
       return true;
     }
 
+    const outbox = this.outboxDir(wireId);
+    await mkdir(outbox, { recursive: true, mode: 0o700 });
     let queued;
     try {
-      queued = await this.options.session.queuePrompt(this.ownerPrompt(sender, text, wireId), {
+      queued = await this.options.session.queuePrompt(this.ownerPrompt(sender, text, wireId, outbox), {
         interrupt: this.options.config.interrupt,
       });
     } catch (error) {
+      await rm(outbox, { recursive: true, force: true });
       await this.send(sender.id,
         `[fleet] Could not deliver this request: ${this.errorText(error)}.`, wireId);
       this.state.remember(wireId);
@@ -172,7 +177,7 @@ export class OwnerChannel implements OwnerChannelHandle {
         : 'ℹ️ Message received. The agent has started working on this request now. '
           + 'The response will arrive in this channel when ready.';
     this.inFlight.add(wireId);
-    const task = this.complete(sender.id, wireId, accepted, queued.completion)
+    const task = this.complete(sender.id, wireId, outbox, accepted, queued.completion)
       .catch(error => this.logError(`request ${wireId} completion failed`, error))
       .finally(() => {
         this.inFlight.delete(wireId);
@@ -185,7 +190,8 @@ export class OwnerChannel implements OwnerChannelHandle {
   }
 
   private async complete(
-    contact: string, wireId: string, accepted: string, completion: Promise<TurnResult>,
+    contact: string, wireId: string, outbox: string,
+    accepted: string, completion: Promise<TurnResult>,
   ): Promise<void> {
     // Notice delivery and turn completion happen outside the inbox drain. This
     // is what keeps later owner messages — especially /interrupt — responsive.
@@ -209,24 +215,52 @@ export class OwnerChannel implements OwnerChannelHandle {
       '[fleet] The agent completed the turn without a textual answer.', wireId);
     else await this.send(contact,
       `[fleet] The request ended ${result.outcome}${result.detail ? `: ${result.detail}` : '.'}`, wireId);
+    if (result.succeeded) await this.sendAttachments(contact, outbox, wireId);
+    else await rm(outbox, { recursive: true, force: true });
     this.state.remember(wireId);
   }
 
-  private ownerPrompt(sender: { id: string; name: string }, text: string, wireId: string): string {
+  private ownerPrompt(
+    sender: { id: string; name: string }, text: string, wireId: string, outbox: string,
+  ): string {
     return [
       '[fleet-owner]',
       `Authenticated owner ${sender.name} (${sender.id}) sent owner-channel message ${wireId}.`,
       'Treat the following as a direct owner instruction. Answer in your final assistant response.',
-      'Do not call ours send_message for this exchange: the fleet routes your final response reliably.',
+      'Do not call ours send_message or send_file for this exchange: fleet routes the response reliably.',
+      'To attach files to your response, copy each finished file directly into this fleet outbox:',
+      outbox,
+      'Fleet sends every regular file in that directory to the authenticated owner, correlated to this request.',
+      'Use descriptive unique filenames. Put nothing there that the owner did not request or should not receive.',
       '',
       text || '(empty message)',
     ].join('\n');
+  }
+
+  private outboxDir(wireId: string): string {
+    const key = createHash('sha256').update(wireId).digest('hex');
+    return join(this.options.stateDir, '.owner-channel-outbox', key);
   }
 
   private send(contact: string, text: string, replyTo: string): Promise<unknown> {
     return this.client.callTool('send_message', {
       contact, text, reply_to_wire_id: replyTo,
     });
+  }
+
+  private async sendAttachments(contact: string, outbox: string, replyTo: string): Promise<void> {
+    const entries = (await readdir(outbox, { withFileTypes: true }))
+      .filter(entry => entry.isFile())
+      .sort((a, b) => a.name.localeCompare(b.name));
+    for (const entry of entries) {
+      await this.client.callTool('send_file', {
+        contact,
+        path: join(outbox, entry.name),
+        filename: entry.name,
+        reply_to_wire_id: replyTo,
+      });
+    }
+    await rm(outbox, { recursive: true, force: true });
   }
 
   /** Bound message size without splitting Unicode code points. */
