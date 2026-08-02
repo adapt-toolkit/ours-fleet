@@ -146,10 +146,15 @@ export class OwnerChannel implements OwnerChannelHandle {
     }
 
     const accepted = this.options.config.interrupt
-      ? '[fleet] Accepted; interrupted current work for this owner request.'
+      ? "ℹ️ Message received. The agent's previous task was interrupted to prioritize "
+        + 'this request, and it is now working on a response. '
+        + 'The response will arrive in this channel when ready.'
       : queued.queuedBehind > 0
-        ? `[fleet] Accepted; queued behind ${queued.queuedBehind} active request(s).`
-        : '[fleet] Accepted; work started.';
+        ? `ℹ️ Message received. The agent is finishing ${queued.queuedBehind} earlier `
+          + 'request(s) first; this request will start as soon as they complete. '
+          + 'The response will arrive in this channel when ready.'
+        : 'ℹ️ Message received. The agent has started working on this request now. '
+          + 'The response will arrive in this channel when ready.';
     await this.send(sender.id, accepted, wireId);
 
     const progressMs = this.options.config.progress_interval_ms;

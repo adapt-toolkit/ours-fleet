@@ -27,13 +27,14 @@ afterEach(() => {
 
 function setup(messages: unknown[], result = {
   accepted: true, outcome: 'completed' as const, succeeded: true, output: 'Agent answer',
-}) {
+}, options: { interrupt?: boolean; queuedBehind?: number } = {}) {
   const dir = mkdtempSync(join(tmpdir(), 'ours-owner-channel-'));
   dirs.push(dir);
   const client = new FakeClient();
   client.batches.push(messages, []);
   const queuePrompt = vi.fn(async () => ({
-    promptId: 'prompt-1', queuedBehind: 0, completion: Promise.resolve(result),
+    promptId: 'prompt-1', queuedBehind: options.queuedBehind ?? 0,
+    completion: Promise.resolve(result),
   }));
   const interrupt = vi.fn(async () => undefined);
   const session = {
@@ -45,7 +46,7 @@ function setup(messages: unknown[], result = {
     role: 'Coordinator',
     config: {
       identity: 'Coordinator-owner', owners: ['owner-cid'],
-      interrupt: false, progress_interval_ms: 0,
+      interrupt: options.interrupt ?? false, progress_interval_ms: 0,
     },
     session, stateDir: dir, client, log: () => undefined,
   });
@@ -66,9 +67,43 @@ describe('OwnerChannel', () => {
     expect(client.calls).toContainEqual({ name: 'defer_messages', args: { msg_ids: [7] } });
     const sent = client.calls.filter(call => call.name === 'send_message');
     expect(sent.map(call => call.args)).toEqual([
-      { contact: 'owner-cid', text: '[fleet] Accepted; work started.', reply_to_wire_id: 'wire-owner' },
+      {
+        contact: 'owner-cid',
+        text: 'ℹ️ Message received. The agent has started working on this request now. '
+          + 'The response will arrive in this channel when ready.',
+        reply_to_wire_id: 'wire-owner',
+      },
       { contact: 'owner-cid', text: 'Agent answer', reply_to_wire_id: 'wire-owner' },
     ]);
+  });
+
+  it('acknowledges a queued request with how many requests run first', async () => {
+    const { channel, client } = setup([{
+      msg_id: 12, wire_id: 'wire-queued', from: { id: 'owner-cid' }, text: 'After those',
+    }], undefined, { queuedBehind: 2 });
+    await channel.drain();
+    expect(client.calls.find(call => call.name === 'send_message')?.args).toEqual({
+      contact: 'owner-cid',
+      text: 'ℹ️ Message received. The agent is finishing 2 earlier request(s) first; '
+        + 'this request will start as soon as they complete. '
+        + 'The response will arrive in this channel when ready.',
+      reply_to_wire_id: 'wire-queued',
+    });
+  });
+
+  it('acknowledges an interrupting request by explaining the previous task was interrupted', async () => {
+    const { channel, client, queuePrompt } = setup([{
+      msg_id: 13, wire_id: 'wire-preempt', from: { id: 'owner-cid' }, text: 'Right now please',
+    }], undefined, { interrupt: true });
+    await channel.drain();
+    expect(queuePrompt.mock.calls[0][1]).toEqual({ interrupt: true });
+    expect(client.calls.find(call => call.name === 'send_message')?.args).toEqual({
+      contact: 'owner-cid',
+      text: "ℹ️ Message received. The agent's previous task was interrupted to prioritize "
+        + 'this request, and it is now working on a response. '
+        + 'The response will arrive in this channel when ready.',
+      reply_to_wire_id: 'wire-preempt',
+    });
   });
 
   it('does not elevate a peer message merely because it reached the channel', async () => {
