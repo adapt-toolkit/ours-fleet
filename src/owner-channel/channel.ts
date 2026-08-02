@@ -5,8 +5,9 @@ import { createInterface } from 'node:readline';
 import { join } from 'node:path';
 
 import type { OwnerChannelConfig } from '../config.js';
-import type { SessionHandle, TurnResult } from '../session/types.js';
+import type { QueuedPrompt, SessionEvent, SessionHandle, TurnResult } from '../session/types.js';
 import { OursMcpClient, type OursToolClient } from './mcp.js';
+import { ownerNotices, type OwnerProgressPhase } from './notices.js';
 import { OwnerChannelState } from './state.js';
 
 interface InboundMessage {
@@ -138,15 +139,20 @@ export class OwnerChannel implements OwnerChannelHandle {
     const text = String(message.text ?? '').trim();
     if (text.toLowerCase() === '/status') {
       const snapshot = this.options.session.snapshot();
-      await this.send(sender.id,
-        `[fleet] ${this.options.role}: ${snapshot.readiness}; `
-        + `${snapshot.alive ? 'session alive' : 'session offline'}.`, wireId);
+      await this.send(sender.id, ownerNotices.status(this.options.role, snapshot), wireId);
       this.state.remember(wireId);
       return true;
     }
     if (text.toLowerCase() === '/interrupt') {
-      await this.options.session.interrupt();
-      await this.send(sender.id, `[fleet] Interrupted ${this.options.role}'s active turn.`, wireId);
+      try {
+        await this.options.session.interrupt();
+      } catch (error) {
+        this.logError('interrupt failed', error);
+        await this.send(sender.id, ownerNotices.interruptFailed(this.options.role), wireId);
+        this.state.remember(wireId);
+        return true;
+      }
+      await this.send(sender.id, ownerNotices.interrupted(this.options.role), wireId);
       this.state.remember(wireId);
       return true;
     }
@@ -154,30 +160,26 @@ export class OwnerChannel implements OwnerChannelHandle {
     const outbox = this.outboxDir(wireId);
     await mkdir(outbox, { recursive: true, mode: 0o700 });
     let queued;
+    const activityCursor = this.latestEventSeq(this.options.session.eventsSince(0));
     try {
       queued = await this.options.session.queuePrompt(this.ownerPrompt(sender, text, wireId, outbox), {
         interrupt: this.options.config.interrupt,
       });
     } catch (error) {
       await rm(outbox, { recursive: true, force: true });
-      await this.send(sender.id,
-        `[fleet] Could not deliver this request: ${this.errorText(error)}.`, wireId);
+      this.logError('request delivery failed', error);
+      await this.send(sender.id, ownerNotices.deliveryFailed(this.options.role), wireId);
       this.state.remember(wireId);
       return true;
     }
 
     const accepted = this.options.config.interrupt
-      ? "ℹ️ Message received. The agent's previous task was interrupted to prioritize "
-        + 'this request, and it is now working on a response. '
-        + 'The response will arrive in this channel when ready.'
+      ? ownerNotices.receivedInterrupting()
       : queued.queuedBehind > 0
-        ? `ℹ️ Message received. The agent is finishing ${queued.queuedBehind} earlier `
-          + 'request(s) first; this request will start as soon as they complete. '
-          + 'The response will arrive in this channel when ready.'
-        : 'ℹ️ Message received. The agent has started working on this request now. '
-          + 'The response will arrive in this channel when ready.';
+        ? ownerNotices.receivedQueued(queued.queuedBehind)
+        : ownerNotices.receivedStarted();
     this.inFlight.add(wireId);
-    const task = this.complete(sender.id, wireId, outbox, accepted, queued.completion)
+    const task = this.complete(sender.id, wireId, outbox, accepted, queued, activityCursor)
       .catch(error => this.logError(`request ${wireId} completion failed`, error))
       .finally(() => {
         this.inFlight.delete(wireId);
@@ -191,7 +193,7 @@ export class OwnerChannel implements OwnerChannelHandle {
 
   private async complete(
     contact: string, wireId: string, outbox: string,
-    accepted: string, completion: Promise<TurnResult>,
+    accepted: string, queued: QueuedPrompt, activityCursor: number,
   ): Promise<void> {
     // Notice delivery and turn completion happen outside the inbox drain. This
     // is what keeps later owner messages — especially /interrupt — responsive.
@@ -199,22 +201,40 @@ export class OwnerChannel implements OwnerChannelHandle {
     catch (error) { this.logError(`request ${wireId} acceptance notice failed`, error); }
 
     const progressMs = this.options.config.progress_interval_ms;
+    const startedAt = Date.now();
+    let lastSeq = activityCursor;
+    let phase: OwnerProgressPhase = queued.queuedBehind > 0
+      ? 'waiting behind earlier requests' : 'starting request';
+    let progressTail = Promise.resolve();
     const timer = progressMs > 0 ? setInterval(() => {
-      void this.send(contact, `[fleet] ${this.options.role} is still working.`, wireId)
+      const events = this.options.session.eventsSince(lastSeq);
+      lastSeq = Math.max(lastSeq, this.latestEventSeq(events));
+      const activity = events.filter(event => event.turnId === queued.promptId);
+      phase = this.progressPhase(activity) ?? phase;
+      const started = activity.filter(event => event.kind === 'tool_call').length;
+      const completed = activity.filter(event =>
+        event.kind === 'tool_update' && event.status === 'completed').length;
+      const activityUpdates = activity.filter(event => event.kind !== 'tool_call'
+        && !(event.kind === 'tool_update' && event.status === 'completed')
+        && event.kind !== 'turn_stop').length;
+      const notice = ownerNotices.progress(
+        Date.now() - startedAt, phase, started, completed, activityUpdates);
+      // Preserve wire ordering if a progress send overlaps turn completion.
+      progressTail = progressTail.then(async () => { await this.send(contact, notice, wireId); })
         .catch(error => this.logError('progress notice failed', error));
     }, progressMs) : undefined;
     timer?.unref();
 
     let result: TurnResult;
-    try { result = await completion; }
+    try { result = await queued.completion; }
     finally { if (timer) clearInterval(timer); }
+    await progressTail;
 
     const output = result.output?.trim();
     if (result.succeeded && output) await this.sendFinal(contact, output, wireId);
     else if (result.succeeded) await this.send(contact,
-      '[fleet] The agent completed the turn without a textual answer.', wireId);
-    else await this.send(contact,
-      `[fleet] The request ended ${result.outcome}${result.detail ? `: ${result.detail}` : '.'}`, wireId);
+      ownerNotices.completedWithoutText(), wireId);
+    else await this.send(contact, ownerNotices.terminal(result.outcome), wireId);
     if (result.succeeded) await this.sendAttachments(contact, outbox, wireId);
     else await rm(outbox, { recursive: true, force: true });
     this.state.remember(wireId);
@@ -270,7 +290,7 @@ export class OwnerChannel implements OwnerChannelHandle {
     for (let offset = 0; offset < points.length; offset += 8_000)
       chunks.push(points.slice(offset, offset + 8_000).join(''));
     for (let i = 0; i < chunks.length; i++) {
-      const prefix = chunks.length > 1 ? `[${i + 1}/${chunks.length}] ` : '';
+      const prefix = chunks.length > 1 ? ownerNotices.chunk(i + 1, chunks.length) : '';
       await this.send(contact, prefix + chunks[i], replyTo);
     }
   }
@@ -284,6 +304,33 @@ export class OwnerChannel implements OwnerChannelHandle {
     if (typeof source === 'string') return { id: source, name: source };
     const id = String(source?.id ?? message.sender_id ?? '');
     return { id, name: String(source?.name ?? message.sender_name ?? id) };
+  }
+
+  private latestEventSeq(events: SessionEvent[]): number {
+    return events.reduce((latest, event) => Math.max(latest, event.seq), 0);
+  }
+
+  /** Map only event shape and allowlisted status to owner-safe phase text. */
+  private progressPhase(events: SessionEvent[]): OwnerProgressPhase | undefined {
+    for (let i = events.length - 1; i >= 0; i--) {
+      const event = events[i];
+      switch (event.kind) {
+        case 'tool_call': return 'using tools';
+        case 'tool_update':
+          return event.status === 'completed' ? 'reviewing tool results' : 'using tools';
+        case 'permission':
+          return event.status === 'pending'
+            ? 'waiting for approval' : 'resuming after permission decision';
+        case 'agent_text': return 'drafting response';
+        case 'thought': return 'planning next step';
+        case 'error': return 'recovering from session error';
+        case 'state':
+          if (event.status === 'running') return 'working on request';
+          break;
+        case 'turn_stop': break;
+      }
+    }
+    return undefined;
   }
 
   private async watchLoop(): Promise<void> {

@@ -7,7 +7,8 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import { OwnerChannel } from '../src/owner-channel/channel.js';
 import type { OursToolClient } from '../src/owner-channel/mcp.js';
-import type { SessionHandle, TurnResult } from '../src/session/types.js';
+import { ownerNotices } from '../src/owner-channel/notices.js';
+import type { SessionEvent, SessionHandle, TurnResult } from '../src/session/types.js';
 
 class FakeClient implements OursToolClient {
   calls: Array<{ name: string; args?: Record<string, unknown> }> = [];
@@ -25,6 +26,7 @@ class FakeClient implements OursToolClient {
 
 const dirs: string[] = [];
 afterEach(() => {
+  vi.useRealTimers();
   vi.restoreAllMocks();
   for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true });
 });
@@ -50,7 +52,7 @@ function setup(messages: unknown[], result = {
   const session = {
     backend: 'acp', pid: 1, isAlive: () => true,
     snapshot: () => ({ backend: 'acp', alive: true, readiness: 'running' }),
-    queuePrompt, interrupt,
+    queuePrompt, interrupt, eventsSince: () => [],
   } as unknown as SessionHandle;
   const channel = new OwnerChannel({
     role: 'Coordinator',
@@ -62,6 +64,50 @@ function setup(messages: unknown[], result = {
   });
   return { channel, client, queuePrompt, interrupt, dir };
 }
+
+function liveSetup(options: { interrupt?: boolean; progressIntervalMs?: number } = {}) {
+  const dir = mkdtempSync(join(tmpdir(), 'ours-owner-channel-'));
+  dirs.push(dir);
+  const client = new FakeClient();
+  const completions: Array<(result: TurnResult) => void> = [];
+  const events: SessionEvent[] = [];
+  let running = 0;
+  const interrupt = vi.fn(async () => undefined);
+  const queuePrompt = vi.fn(async (_text: string, opts?: { interrupt?: boolean }) => {
+    if (opts?.interrupt) await interrupt();
+    const queuedBehind = running++;
+    const completion = new Promise<TurnResult>(resolve => {
+      completions.push((result: TurnResult) => { running--; resolve(result); });
+    });
+    return { promptId: `prompt-${completions.length}`, queuedBehind, completion };
+  });
+  const session = {
+    backend: 'acp', pid: 1, isAlive: () => true,
+    snapshot: () => ({ backend: 'acp', alive: true, readiness: 'running' }),
+    queuePrompt, interrupt,
+    eventsSince: (seq: number) => events.filter(event => event.seq > seq),
+  } as unknown as SessionHandle;
+  const channel = new OwnerChannel({
+    role: 'Coordinator',
+    config: {
+      identity: 'Coordinator-owner', owners: ['owner-cid'],
+      interrupt: options.interrupt ?? true,
+      progress_interval_ms: options.progressIntervalMs ?? 0,
+    },
+    session, stateDir: dir, client, log: () => undefined,
+  });
+  const emit = (event: Omit<SessionEvent, 'version' | 'seq' | 'at'>) => events.push({
+    version: 1, seq: events.length + 1, at: new Date().toISOString(), ...event,
+  });
+  return { channel, client, queuePrompt, interrupt, completions, emit, dir };
+}
+
+const ownerMessage = (msgId: number, wireId: string, text: string) => ({
+  msg_id: msgId, wire_id: wireId, from: { id: 'owner-cid', name: 'Owner' }, text,
+});
+
+const done = (output: string): TurnResult =>
+  ({ accepted: true, outcome: 'completed', succeeded: true, output });
 
 describe('OwnerChannel', () => {
   it('injects only an authenticated owner and routes notices and final output itself', async () => {
@@ -134,9 +180,52 @@ describe('OwnerChannel', () => {
     expect(interrupt).toHaveBeenCalledOnce();
     expect(queuePrompt).not.toHaveBeenCalled();
     expect(client.calls.find(call => call.name === 'send_message')?.args).toEqual({
-      contact: 'owner-cid', text: "[fleet] Interrupted Coordinator's active turn.",
+      contact: 'owner-cid', text: "🛑 Interrupt sent to Coordinator's active turn.",
       reply_to_wire_id: 'wire-stop',
     });
+  });
+
+  it('reports status and command failures without exposing internal error details', async () => {
+    const status = setup([ownerMessage(24, 'wire-status', '/status')]);
+    await status.channel.drain();
+    expect(status.client.calls.find(call => call.name === 'send_message')?.args?.text).toBe(
+      '📊 Coordinator status: running; session is online.');
+
+    const interrupt = setup([ownerMessage(25, 'wire-interrupt-failed', '/interrupt')]);
+    interrupt.interrupt.mockRejectedValueOnce(new Error('secret interrupt transport detail'));
+    await interrupt.channel.drain();
+    expect(interrupt.client.calls.find(call => call.name === 'send_message')?.args?.text).toBe(
+      "⚠️ Could not interrupt Coordinator's active turn.");
+
+    const delivery = setup([ownerMessage(26, 'wire-delivery-failed', 'Please work')]);
+    delivery.queuePrompt.mockRejectedValueOnce(new Error('credential=secret delivery detail'));
+    await delivery.channel.drain();
+    expect(delivery.client.calls.find(call => call.name === 'send_message')?.args?.text).toBe(
+      '⚠️ Could not deliver this request to Coordinator.');
+    expect(delivery.client.calls.filter(call => call.name === 'send_message')
+      .every(call => !String(call.args?.text).includes('secret'))).toBe(true);
+  });
+
+  it('uses precise, redacted terminal notices for every non-text outcome', async () => {
+    const cases: Array<[TurnResult, string]> = [
+      [{ accepted: true, outcome: 'completed', succeeded: true, output: '   ' },
+        '✅ Request completed, but the agent returned no text.'],
+      [{ accepted: true, outcome: 'cancelled', succeeded: false, detail: 'private cancel detail' },
+        '🛑 Request was cancelled before completion.'],
+      [{ accepted: true, outcome: 'refused', succeeded: false, detail: 'private refusal detail' },
+        '⚠️ The agent declined this request.'],
+      [{ accepted: false, outcome: 'failed', succeeded: false, detail: 'TOKEN=private' },
+        '⚠️ Request failed before completion.'],
+      [{ accepted: true, outcome: 'inconclusive', succeeded: false, detail: 'private ambiguity' },
+        '⚠️ Request ended without a confirmed completion.'],
+    ];
+    for (let i = 0; i < cases.length; i++) {
+      const [result, expected] = cases[i];
+      const { channel, client } = setup([ownerMessage(30 + i, `wire-terminal-${i}`, 'Run')], result);
+      await channel.drain();
+      await vi.waitFor(() => expect(client.calls.filter(call => call.name === 'send_message').at(-1)?.args?.text)
+        .toBe(expected));
+    }
   });
 
   it('handles /interrupt while an earlier owner request is still running', async () => {
@@ -162,7 +251,7 @@ describe('OwnerChannel', () => {
     expect(client.calls).toContainEqual({
       name: 'send_message',
       args: {
-        contact: 'owner-cid', text: "[fleet] Interrupted Coordinator's active turn.",
+        contact: 'owner-cid', text: "🛑 Interrupt sent to Coordinator's active turn.",
         reply_to_wire_id: 'wire-interrupt-running',
       },
     });
@@ -171,7 +260,7 @@ describe('OwnerChannel', () => {
     await vi.waitFor(() => expect(client.calls).toContainEqual({
       name: 'send_message',
       args: {
-        contact: 'owner-cid', text: '[fleet] The request ended cancelled.',
+        contact: 'owner-cid', text: '🛑 Request was cancelled before completion.',
         reply_to_wire_id: 'wire-running',
       },
     }));
@@ -229,8 +318,8 @@ describe('OwnerChannel', () => {
     await channel.drain();
     const finals = client.calls.filter(call => call.name === 'send_message').slice(1);
     expect(finals.map(call => call.args?.text)).toEqual([
-      `[1/2] ${'x'.repeat(8_000)}`,
-      '[2/2] x',
+      `ℹ️ Response part 1 of 2:\n${'x'.repeat(8_000)}`,
+      'ℹ️ Response part 2 of 2:\nx',
     ]);
     expect(finals.every(call => call.args?.reply_to_wire_id === 'wire-long')).toBe(true);
   });
@@ -296,5 +385,80 @@ describe('OwnerChannel', () => {
     expect(existsSync(join(outbox, 'retry.txt'))).toBe(true);
     const statePath = join(dir, '.owner-channel-state.json');
     expect(!existsSync(statePath) || !readFileSync(statePath, 'utf8').includes('wire-file-retry')).toBe(true);
+  });
+});
+
+describe('OwnerChannel notice presentation', () => {
+  it('centralizes every fleet-authored outward notice with an emoji and no presentation prefix', () => {
+    const notices = [
+      ownerNotices.receivedStarted(), ownerNotices.receivedQueued(2),
+      ownerNotices.receivedInterrupting(),
+      ownerNotices.status('Coordinator', { backend: 'acp', alive: true, readiness: 'running' }),
+      ownerNotices.interrupted('Coordinator'), ownerNotices.interruptFailed('Coordinator'),
+      ownerNotices.deliveryFailed('Coordinator'),
+      ownerNotices.progress(90_000, 'using tools', 4, 2, 1),
+      ownerNotices.progress(120_000, 'using tools', 0, 0),
+      ownerNotices.completedWithoutText(), ownerNotices.terminal('completed'),
+      ownerNotices.terminal('cancelled'), ownerNotices.terminal('refused'),
+      ownerNotices.terminal('failed'), ownerNotices.terminal('inconclusive'),
+      ownerNotices.chunk(1, 2),
+    ];
+    expect(notices.every(text => /^(?:ℹ️|⏳|✅|🛑|⚠️|📊) /.test(text))).toBe(true);
+    expect(notices.every(text => !text.includes('[fleet]'))).toBe(true);
+  });
+
+  it('reports only structured activity for the matching turn across multiple intervals', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date('2026-08-02T00:00:00Z'));
+    const { channel, client, completions, emit } = liveSetup({ progressIntervalMs: 30_000 });
+    client.batches.push([ownerMessage(1, 'wire-progress', 'Work safely')]);
+    await channel.drain();
+
+    emit({ kind: 'tool_call', turnId: 'another-turn', toolCallId: 'foreign',
+      title: 'send SECRET_TOKEN=leak', status: 'in_progress' });
+    emit({ kind: 'thought', turnId: 'prompt-1', text: 'private chain of thought' });
+    emit({ kind: 'tool_call', turnId: 'prompt-1', toolCallId: 'ours',
+      title: 'run curl https://user:password@example.test', status: 'in_progress' });
+    await vi.advanceTimersByTimeAsync(30_000);
+
+    const first = String(client.calls.filter(call => call.name === 'send_message').at(-1)?.args?.text);
+    expect(first).toBe('⏳ Working for 30s · using tools · 1 tool action started and '
+      + '1 additional activity update observed since the last update.');
+    expect(first).not.toMatch(/SECRET_TOKEN|password|curl|chain of thought|another-turn/);
+
+    await vi.advanceTimersByTimeAsync(30_000);
+    expect(client.calls.filter(call => call.name === 'send_message').at(-1)?.args?.text).toBe(
+      '⏳ Working for 1m · using tools · no new reportable activity since the last update.');
+
+    completions[0](done('Finished'));
+    await vi.advanceTimersByTimeAsync(0);
+    const sentBefore = client.calls.filter(call => call.name === 'send_message').length;
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(client.calls.filter(call => call.name === 'send_message')).toHaveLength(sentBefore);
+  });
+
+  it('keeps concurrent request progress isolated and correlated', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date('2026-08-02T00:00:00Z'));
+    const { channel, client, completions, emit } = liveSetup({
+      interrupt: false, progressIntervalMs: 20_000,
+    });
+    client.batches.push([ownerMessage(1, 'wire-first-progress', 'First')]);
+    await channel.drain();
+    client.batches.push([ownerMessage(2, 'wire-second-progress', 'Second')]);
+    await channel.drain();
+
+    emit({ kind: 'tool_call', turnId: 'prompt-1', toolCallId: 'first-tool',
+      title: 'private first-turn command', status: 'in_progress' });
+    await vi.advanceTimersByTimeAsync(20_000);
+    const secondProgress = client.calls.filter(call => call.name === 'send_message'
+      && call.args?.reply_to_wire_id === 'wire-second-progress').at(-1);
+    expect(secondProgress?.args?.text).toBe(
+      '⏳ Working for 20s · waiting behind earlier requests · '
+      + 'no new reportable activity since the last update.');
+
+    completions[0](done('First done'));
+    completions[1](done('Second done'));
+    await vi.advanceTimersByTimeAsync(0);
   });
 });
