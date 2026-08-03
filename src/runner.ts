@@ -568,6 +568,7 @@ export async function runOnce(
         throw new Error(`[${name}] owner channel failed to start: `
           + `${(error as Error)?.message ?? String(error)}`);
       }
+      control.setOwnerChannel(ownerChannel);
     }
   } else {
     await deps.tmux.kill(name);
@@ -591,7 +592,10 @@ export async function runOnce(
 
   const start = deps.now();
   while (sessionHandle.isAlive()) await deps.sleep(2000);
-  if (ownerChannel) await ownerChannel.close();
+  if (ownerChannel) {
+    control?.setOwnerChannel(undefined);
+    await ownerChannel.close();
+  }
   if (monitor) { monitor.stop(); await monitorLoop; }
   unsubscribeRecovery?.();
   if (control) await control.close();

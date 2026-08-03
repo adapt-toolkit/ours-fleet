@@ -633,6 +633,7 @@ describe('runOnce ACP startup outcome (1.2)', () => {
         start: async () => { started++; },
         drain: async () => {},
         close: async () => { closed++; },
+        manage: async () => { throw new Error('not used'); },
       };
     };
 

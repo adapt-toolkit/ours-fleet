@@ -371,6 +371,40 @@ before starting its turn for at-least-once crash recovery. It currently requires
 \`session: acp\`: tmux has no structured, turn-correlated final answer, and pane
 scraping cannot provide the same reliable reply guarantee.
 
+### Live contact and owner administration
+
+The supervisor which is already running the ACP role remains the sole binder of
+\`owner_channel.identity\`. The CLI reaches that exact live \`OwnerChannel\`
+through the role's token-authenticated, mode-0600 Unix control socket; it never
+starts another ours client and never force-binds:
+
+\`\`\`sh
+ours-fleet owner-channel contact list <Role>
+ours-fleet owner-channel contact invite <Role> [--name <label>]
+ours-fleet owner-channel contact add <Role> (--invite-file <path> | --invite-stdin) [--name <label>]
+ours-fleet owner-channel owner list <Role>
+ours-fleet owner-channel owner authorize <Role> <exact-64-hex-contact-cid>
+ours-fleet owner-channel owner revoke <Role> <exact-64-hex-contact-cid>
+\`\`\`
+
+Contact establishment and owner authorization are separate security steps.
+\`contact add\` never authorizes: invite redemption is pending until the peer
+verifies it. Once \`contact list\` reports the established contact, authorize
+its exact immutable CID explicitly. Invite creation emits invite material only
+on stdout; acceptance reads it from a file or stdin, not argv.
+
+Configured \`owners\` remain the baseline. Live authorizations/revocations are
+an immediately effective, restart-persistent overlay. \`owner list\` labels
+baseline versus dynamic entries and effective status. The atomic mode-0600 file
+contains bounded CIDs and audit actions only. Corruption disables all effective
+owners and refuses mutation rather than resurrecting authority; revoking the
+last effective owner is always refused.
+
+A missing/stopped role, tmux session, role without \`owner_channel\`, unavailable
+MCP client, or a role entering shutdown returns an actionable error with no
+side effects. Management uses no network listener and never logs or persists
+invite material.
+
 ## Stable config and YAML migration
 
 \`ours-fleet config --json\` emits schemaVersion 1 resolved plans. Environment

@@ -5,6 +5,9 @@ import { join } from 'node:path';
 
 import { SessionControlError } from './types.js';
 import type { ControlFailureKind, SessionHandle } from './types.js';
+import type {
+  OwnerChannelHandle, OwnerChannelManagementRequest,
+} from '../owner-channel/channel.js';
 
 const MAX_LINE_BYTES = 64 * 1024;
 
@@ -12,13 +15,14 @@ export interface ControlRequest {
   version: 1 | 2;
   id: string;
   token: string;
-  command: 'status' | 'snapshot' | 'submit_prompt' | 'respond_permission' | 'interrupt' | 'follow' | 'events_since';
+  command: 'status' | 'snapshot' | 'submit_prompt' | 'respond_permission' | 'interrupt' | 'follow' | 'events_since' | 'owner_channel_manage';
   text?: string;
   permissionId?: string;
   optionId?: string;
   since?: number;
   /** Existing clients omit this and remain interactive controllers. */
   controller?: boolean;
+  ownerChannel?: OwnerChannelManagementRequest;
 }
 
 export interface ControlResponse {
@@ -151,6 +155,7 @@ export class RoleControlServer {
   private readonly socketPath: string;
   private readonly token: string;
   private readonly sockets = new Set<Socket>();
+  private ownerChannel?: OwnerChannelHandle;
 
   constructor(
     stateDir: string,
@@ -183,6 +188,11 @@ export class RoleControlServer {
     for (const socket of this.sockets) socket.destroy();
     await new Promise<void>(resolve => this.server.close(() => resolve()));
     rmSync(this.socketPath, { force: true });
+  }
+
+  /** Attach only the already-started supervisor-owned channel client. */
+  setOwnerChannel(ownerChannel: OwnerChannelHandle | undefined): void {
+    this.ownerChannel = ownerChannel;
   }
 
   private accept(socket: Socket): void {
@@ -282,6 +292,15 @@ export class RoleControlServer {
           await this.session.interrupt();
           this.write(socket, { version: 1, id: request.id, ok: true });
           return;
+        case 'owner_channel_manage': {
+          if (!request.ownerChannel || typeof request.ownerChannel.action !== 'string')
+            throw new SessionControlError('rejected', 'owner-channel management action is required');
+          if (!this.ownerChannel)
+            throw new SessionControlError('rejected', 'owner channel is disabled or unavailable for this role');
+          const result = await this.ownerChannel.manage(request.ownerChannel);
+          this.write(socket, { version: 1, id: request.id, ok: true, result });
+          return;
+        }
         case 'events_since': {
           const since = Number.isFinite(request.since) ? Number(request.since) : 0;
           const events = this.session.eventsSince(since);

@@ -8,7 +8,7 @@ import type { OwnerChannelConfig } from '../config.js';
 import type { QueuedPrompt, SessionEvent, SessionHandle, TurnResult } from '../session/types.js';
 import { OursMcpClient, type OursToolClient } from './mcp.js';
 import { ownerNotices, type OwnerProgressPhase } from './notices.js';
-import { OwnerChannelState } from './state.js';
+import { OwnerAuthorizationState, OwnerChannelState, type OwnerEntry } from './state.js';
 
 interface InboundMessage {
   msg_id?: number;
@@ -37,6 +37,30 @@ export interface OwnerChannelHandle {
   start(): Promise<void>;
   drain(): Promise<void>;
   close(): Promise<void>;
+  manage(request: OwnerChannelManagementRequest): Promise<OwnerChannelManagementResult>;
+}
+
+export type OwnerChannelManagementRequest =
+  | { action: 'contact_list' }
+  | { action: 'contact_invite'; name?: string }
+  | { action: 'contact_add'; invite: string; name?: string }
+  | { action: 'owner_list' }
+  | { action: 'owner_authorize'; cid: string }
+  | { action: 'owner_revoke'; cid: string };
+
+export type OwnerChannelManagementResult =
+  | { action: 'contact_list'; contacts: OwnerContact[] }
+  | { action: 'contact_invite'; invite: string }
+  | { action: 'contact_add'; status: 'pending'; contact?: OwnerContact }
+  | { action: 'owner_list'; integrity: { ok: boolean; error?: string }; owners: OwnerEntry[] }
+  | { action: 'owner_authorize' | 'owner_revoke'; owner: OwnerEntry };
+
+export interface OwnerContact {
+  cid: string;
+  name: string;
+  status: string;
+  kind?: string;
+  human?: { cid?: string; name?: string };
 }
 
 /**
@@ -46,24 +70,37 @@ export interface OwnerChannelHandle {
 export class OwnerChannel implements OwnerChannelHandle {
   private readonly client: OursToolClient;
   private readonly state: OwnerChannelState;
+  private readonly authorizations: OwnerAuthorizationState;
+  /**
+   * Wire IDs whose turn is still running. They stay OUT of the durable state
+   * (a crash must replay them) but must not be queued twice while live.
+   */
+  private readonly inFlight = new Set<string>();
   private stopping = false;
   private watchProcess?: ChildProcessWithoutNullStreams;
   private watchTask?: Promise<void>;
   private drainTask?: Promise<void>;
   private drainRequested = false;
-  private readonly inFlight = new Set<string>();
   private readonly completionTasks = new Set<Promise<void>>();
+  private managementTail: Promise<unknown> = Promise.resolve();
+  private ready = false;
 
   constructor(private readonly options: OwnerChannelOptions) {
     this.client = options.client ?? new OursMcpClient(
       options.command, options.env, line => options.log(`[${options.role}] owner channel ${line}`));
     this.state = new OwnerChannelState(join(options.stateDir, '.owner-channel-state.json'));
+    this.authorizations = new OwnerAuthorizationState(
+      join(options.stateDir, '.owner-channel-owners.json'), options.config.owners);
+    const integrity = this.authorizations.integrity();
+    if (!integrity.ok)
+      options.log(`[${options.role}] owner authorization state corrupt; all owner mail disabled`);
   }
 
   async start(): Promise<void> {
     this.stopping = false;
     await this.client.start();
     await this.client.callTool('choose_identity', { name: this.options.config.identity });
+    this.ready = true;
     this.watchTask = this.watchLoop();
     // Do not make role startup wait for an old owner request to finish a turn.
     void this.drain().catch(error => this.logError('initial drain failed', error));
@@ -83,10 +120,117 @@ export class OwnerChannel implements OwnerChannelHandle {
 
   async close(): Promise<void> {
     this.stopping = true;
+    this.ready = false;
     const watch = this.watchProcess;
     this.watchProcess = undefined;
     if (watch && watch.exitCode === null) watch.kill('SIGTERM');
+    await this.managementTail;
     await this.client.close();
+  }
+
+  manage(request: OwnerChannelManagementRequest): Promise<OwnerChannelManagementResult> {
+    const run = this.managementTail.then(() => this.manageNow(request));
+    this.managementTail = run.then(() => undefined, () => undefined);
+    return run;
+  }
+
+  private async manageNow(
+    request: OwnerChannelManagementRequest,
+  ): Promise<OwnerChannelManagementResult> {
+    if (!this.ready || this.stopping) throw new Error('owner-channel MCP client is unavailable');
+    switch (request.action) {
+      case 'contact_list':
+        return { action: request.action, contacts: await this.contacts() };
+      case 'contact_invite': {
+        this.assertLabel(request.name);
+        const raw = await this.client.callTool('generate_invite', request.name ? { name: request.name } : {});
+        const invite = typeof raw === 'string' ? raw : String((raw as { invite?: unknown })?.invite ?? '');
+        if (!invite) throw new Error('ours-mcp returned no invite');
+        return { action: request.action, invite };
+      }
+      case 'contact_add': {
+        if (typeof request.invite !== 'string' || !request.invite)
+          throw new Error('invite is required');
+        if (Buffer.byteLength(request.invite) > 48 * 1024)
+          throw new Error('invite exceeds 49152 bytes');
+        this.assertLabel(request.name);
+        let raw: unknown;
+        try {
+          raw = await this.client.callTool('add_contact', {
+            invite: request.invite, ...(request.name ? { name: request.name } : {}),
+          });
+        } catch {
+          // Daemon errors are not allowed to reflect invite material through
+          // the control response, CLI stderr, or supervisor logs.
+          throw new Error('ours-mcp could not accept the contact invite');
+        }
+        return { action: request.action, status: 'pending', contact: this.contact(raw) };
+      }
+      case 'owner_list':
+        return {
+          action: request.action, integrity: this.authorizations.integrity(),
+          owners: this.authorizations.entries(),
+        };
+      case 'owner_authorize': {
+        this.assertCid(request.cid);
+        if (this.authorizations.effective().has(request.cid))
+          throw new Error(`owner '${request.cid}' is already authorized`);
+        const contacts = await this.contacts();
+        if (!contacts.some(contact => contact.cid === request.cid
+          && ['established', 'active', 'connected'].includes(contact.status.toLowerCase())))
+          throw new Error(`cannot authorize unknown or pending contact CID '${request.cid}'`);
+        return { action: request.action, owner: this.authorizations.authorize(request.cid) };
+      }
+      case 'owner_revoke':
+        this.assertCid(request.cid);
+        return { action: request.action, owner: this.authorizations.revoke(request.cid) };
+      default:
+        throw new Error('unknown owner-channel management action');
+    }
+  }
+
+  private async contacts(): Promise<OwnerContact[]> {
+    const raw = await this.client.callTool('list_contacts');
+    const values = Array.isArray(raw) ? raw : (raw as { contacts?: unknown })?.contacts;
+    if (!Array.isArray(values)) return [];
+    return values.map(value => this.contact(value)).filter((v): v is OwnerContact => Boolean(v))
+      .sort((a, b) => a.cid.localeCompare(b.cid));
+  }
+
+  private contact(raw: unknown): OwnerContact | undefined {
+    if (!raw || typeof raw !== 'object') return undefined;
+    const value = raw as Record<string, unknown>;
+    const cid = String(value.cid ?? value.id ?? value.container_id ?? value.containerId ?? '');
+    if (!/^[A-Fa-f0-9]{64}$/.test(cid)) return undefined;
+    const humanRaw = value.human ?? value.root;
+    const human = humanRaw && typeof humanRaw === 'object' ? humanRaw as Record<string, unknown> : undefined;
+    return {
+      cid,
+      name: this.safeMetadata(value.name ?? value.display_name ?? cid),
+      status: this.safeMetadata(value.status ?? 'established'),
+      ...(typeof value.kind === 'string' ? { kind: this.safeMetadata(value.kind) } : {}),
+      ...(human ? { human: {
+        ...(typeof (human.cid ?? human.id) === 'string'
+          && /^[A-Fa-f0-9]{64}$/.test(String(human.cid ?? human.id))
+          ? { cid: String(human.cid ?? human.id) } : {}),
+        ...(human.name ? { name: this.safeMetadata(human.name) } : {}),
+      } } : {}),
+    };
+  }
+
+  private assertCid(cid: string): void {
+    if (typeof cid !== 'string' || !/^[A-Fa-f0-9]{64}$/.test(cid))
+      throw new Error('contact CID must be exactly 64 hexadecimal characters');
+  }
+
+  private assertLabel(label: string | undefined): void {
+    if (label !== undefined && (typeof label !== 'string' || !label.trim() || label.length > 200
+      || /[\u0000-\u001f\u007f]/.test(label)))
+      throw new Error('contact label must be 1-200 characters without control characters');
+  }
+
+  private safeMetadata(value: unknown): string {
+    return String(value).replace(/[\u0000-\u001f\u007f]/g, ' ').slice(0, 200);
   }
 
   private async drainAll(): Promise<void> {
@@ -104,7 +248,7 @@ export class OwnerChannel implements OwnerChannelHandle {
       const deferred = messages.filter(message => {
         const wireId = this.wireId(message);
         return wireId && !this.state.has(wireId)
-          && this.options.config.owners.includes(this.sender(message).id)
+          && this.authorizations.effective().has(this.sender(message).id)
           && Number.isInteger(message.msg_id);
       }).map(message => message.msg_id!);
       if (deferred.length)
@@ -126,7 +270,7 @@ export class OwnerChannel implements OwnerChannelHandle {
     const wireId = this.wireId(message);
     if (!wireId || this.state.has(wireId) || this.inFlight.has(wireId)) return false;
     const sender = this.sender(message);
-    if (!this.options.config.owners.includes(sender.id)) {
+    if (!this.authorizations.effective().has(sender.id)) {
       // Do not answer an unauthorized sender and thereby disclose that this is
       // a privileged control address. Authenticated CID, never display name or
       // message wording, is the authority boundary.

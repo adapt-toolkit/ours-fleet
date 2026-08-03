@@ -492,6 +492,40 @@ to each owner/controller identity, and put the owners' immutable contact CIDs in
 channel identity. Add it to the control plane just like another contact, then
 message it directly.
 
+The running supervisor remains the only process which binds that identity.
+Operators manage it through the role's authenticated Unix control socket:
+
+```sh
+ours-fleet owner-channel contact list Coordinator
+ours-fleet owner-channel contact invite Coordinator --name Mobile
+ours-fleet owner-channel contact add Coordinator --invite-file ./invite.txt --name Mobile
+# Or keep invite material out of both argv and a file:
+ours-fleet owner-channel contact add Coordinator --invite-stdin
+
+ours-fleet owner-channel owner list Coordinator
+ours-fleet owner-channel owner authorize Coordinator <exact-64-hex-contact-cid>
+ours-fleet owner-channel owner revoke Coordinator <exact-64-hex-contact-cid>
+```
+
+Pairing is deliberately two-step. `contact add` accepts an invite and reports a
+pending contact handshake; it never grants authority. After peer verification,
+use `contact list` to obtain the immutable CID, then explicitly `owner authorize`
+that exact CID. Invite generation prints the invite only to stdout. Acceptance
+reads it from stdin or a file, never a process argument.
+
+Configured `owners` are the declared baseline. Authorize/revoke operations add
+a bounded dynamic overlay stored beside the role state in mode 0600 and applied
+immediately by the already-bound channel. `owner list` shows each CID's
+`baseline`/`dynamic` source and whether it is effective. The overlay survives
+session/supervisor restart; it stores only CIDs and a bounded action audit—never
+invites, message bodies, credentials, or keys. A corrupt overlay fails closed
+(no effective owners and no mutation), and the last effective owner cannot be
+revoked.
+
+These commands require a running ACP role with `owner_channel` enabled. Missing,
+stopped, tmux, disabled, draining, and unavailable-MCP targets fail without
+starting a second client, binding an identity, or opening a network listener.
+
 The two paths are deliberately simultaneous and have different authority:
 
 - Mail to the role's normal `identity` remains peer mail. The content-blind

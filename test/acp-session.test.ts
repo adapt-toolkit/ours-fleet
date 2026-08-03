@@ -3,7 +3,7 @@ import { createServer, type Socket } from 'node:net';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import { AcpSession } from '../src/session/acp.js';
 import {
@@ -208,6 +208,42 @@ describe('AcpSession', () => {
     expect(prompt.result).toMatchObject({ state: 'queued' });
     await control.close();
     await session.close();
+  });
+
+  it('scopes owner-channel management to the authenticated role socket and attached live handle', async () => {
+    const session = await start();
+    const stateDir = dirs.at(-1)!;
+    const control = new RoleControlServer(stateDir, session, () => {});
+    await control.start();
+    try {
+      const unavailable = await controlRequest(stateDir, {
+        command: 'owner_channel_manage', ownerChannel: { action: 'owner_list' },
+      });
+      expect(unavailable).toMatchObject({ ok: false, kind: 'rejected' });
+      expect(unavailable.error).toMatch(/disabled or unavailable/);
+
+      const manage = vi.fn(async () => ({
+        action: 'owner_list' as const, integrity: { ok: true },
+        owners: [{ cid: 'A'.repeat(64), source: 'baseline' as const, effective: true }],
+      }));
+      control.setOwnerChannel({
+        start: async () => {}, drain: async () => {}, close: async () => {}, manage,
+      });
+      const response = await controlRequest(stateDir, {
+        command: 'owner_channel_manage', ownerChannel: { action: 'owner_list' },
+      });
+      expect(response.ok).toBe(true);
+      expect(manage).toHaveBeenCalledWith({ action: 'owner_list' });
+
+      control.setOwnerChannel(undefined);
+      const draining = await controlRequest(stateDir, {
+        command: 'owner_channel_manage', ownerChannel: { action: 'contact_list' },
+      });
+      expect(draining).toMatchObject({ ok: false, kind: 'rejected' });
+    } finally {
+      await control.close();
+      await session.close();
+    }
   });
 
   it('steers a live prompt instead of waiting behind it', async () => {

@@ -7,7 +7,7 @@ import { createInterface } from 'node:readline';
 import { Command } from 'commander';
 import { VERSION } from './version.js';
 import { agentDir, agentsRoot, tmpRoot, logsRoot, deriveXdgRuntimeDir, watchdogsRoot } from './paths.js';
-import { loadConfig, ROLE_NAME_RE } from './config.js';
+import { findRole, loadConfig, ROLE_NAME_RE } from './config.js';
 import type { YamlMode } from './config-yaml.js';
 import { formatDuration } from './duration.js';
 import { resolvedPlan } from './resolved-plan.js';
@@ -37,6 +37,9 @@ import {
 } from './session/control.js';
 import { SessionControlError } from './session/types.js';
 import type { SessionEvent } from './session/types.js';
+import type {
+  OwnerChannelManagementRequest, OwnerChannelManagementResult,
+} from './owner-channel/channel.js';
 import { startWebConsole } from './web/runtime.js';
 import { requestWebControl } from './web/control.js';
 import { WebServiceManager } from './web/service.js';
@@ -86,6 +89,36 @@ function acpStateDir(name: string): string | undefined {
   const temp = agentDir(name, true);
   if (existsSync(controlSocketPath(temp))) return temp;
   return undefined;
+}
+
+const CONTACT_CID_RE = /^[A-Fa-f0-9]{64}$/;
+const MAX_INVITE_BYTES = 48 * 1024;
+
+function ownerChannelStateDir(roleName: string, configuration?: string): string {
+  const role = findRole(loadConfig(configuration), roleName);
+  if (role.session !== 'acp')
+    throw new Error(`role '${roleName}' uses session '${role.session}', but owner-channel management requires ACP`);
+  if (!role.owner_channel)
+    throw new Error(`role '${roleName}' has no owner_channel configured`);
+  const stateDir = acpStateDir(roleName);
+  if (!stateDir)
+    throw new Error(`role '${roleName}' is stopped or its authenticated ACP control socket is unavailable`);
+  return stateDir;
+}
+
+async function manageOwnerChannel(
+  role: string, configuration: string | undefined,
+  ownerChannel: OwnerChannelManagementRequest,
+): Promise<OwnerChannelManagementResult> {
+  const response = await controlRequest(
+    ownerChannelStateDir(role, configuration), { command: 'owner_channel_manage', ownerChannel });
+  if (!response.ok)
+    throw new SessionControlError(response.kind ?? 'backend', response.error ?? 'owner-channel request failed');
+  return response.result as OwnerChannelManagementResult;
+}
+
+function assertContactCid(cid: string): void {
+  if (!CONTACT_CID_RE.test(cid)) throw new Error('contact CID must be exactly 64 hexadecimal characters');
 }
 
 function renderSessionEvent(event: SessionEvent): void {
@@ -389,6 +422,104 @@ program.command('status <name>').description('unit/agent state')
         if (response.ok) console.log(`session: ${JSON.stringify(response.result)}`);
       } catch { console.log('session: acp control unavailable'); }
     }
+  });
+
+const ownerChannelCommand = program.command('owner-channel')
+  .description('manage contacts and authorized owner CIDs through a running role supervisor')
+  .addHelpText('after', '\nPairing is two-step: establish a contact first, then explicitly authorize its exact CID.');
+const ownerContactCommand = ownerChannelCommand.command('contact')
+  .description('establish contacts without granting owner authority');
+const ownerAuthorizationCommand = ownerChannelCommand.command('owner')
+  .description('manage the effective owner CID set (separate from contacts)');
+
+cOpt(ownerContactCommand.command('list <Role>')
+  .description('list established/pending contacts using safe identity metadata only'))
+  .action(async (role, opts) => {
+    try {
+      const result = await manageOwnerChannel(role, opts.configuration, { action: 'contact_list' });
+      if (result.action !== 'contact_list') throw new Error('unexpected owner-channel response');
+      if (!result.contacts.length) { console.log('(no contacts)'); return; }
+      console.log('CID\tNAME\tSTATUS\tKIND\tHUMAN');
+      for (const contact of result.contacts) console.log([
+        contact.cid, contact.name, contact.status, contact.kind ?? '', contact.human?.name ?? '',
+      ].join('\t'));
+    } catch (e) { die(e); }
+  });
+
+cOpt(ownerContactCommand.command('invite <Role>')
+  .description('generate an invite on the already-bound owner channel')
+  .option('--name <label>', 'optional contact label'))
+  .action(async (role, opts) => {
+    try {
+      const result = await manageOwnerChannel(role, opts.configuration, {
+        action: 'contact_invite', ...(opts.name ? { name: String(opts.name) } : {}),
+      });
+      if (result.action !== 'contact_invite') throw new Error('unexpected owner-channel response');
+      // Invite material is intentionally the only stdout content.
+      process.stdout.write(result.invite + '\n');
+    } catch (e) { die(e); }
+  });
+
+cOpt(ownerContactCommand.command('add <Role>')
+  .description('accept an invite without granting owner authority')
+  .option('--invite-file <path>', 'read invite material from a file')
+  .option('--invite-stdin', 'read invite material from stdin')
+  .option('--name <label>', 'optional contact label'))
+  .action(async (role, opts) => {
+    try {
+      if (Boolean(opts.inviteFile) === Boolean(opts.inviteStdin))
+        throw new Error('choose exactly one of --invite-file <path> or --invite-stdin');
+      const invite = readFileSync(opts.inviteStdin ? 0 : String(opts.inviteFile), 'utf8').trim();
+      if (!invite) throw new Error('invite input is empty');
+      if (Buffer.byteLength(invite) > MAX_INVITE_BYTES)
+        throw new Error(`invite input exceeds ${MAX_INVITE_BYTES} bytes`);
+      const result = await manageOwnerChannel(role, opts.configuration, {
+        action: 'contact_add', invite, ...(opts.name ? { name: String(opts.name) } : {}),
+      });
+      if (result.action !== 'contact_add') throw new Error('unexpected owner-channel response');
+      console.log('Invite accepted; contact establishment is pending peer verification.');
+      console.log('No owner authority was granted. After the contact is established, authorize its exact CID separately.');
+    } catch (e) { die(e); }
+  });
+
+cOpt(ownerAuthorizationCommand.command('list <Role>')
+  .description('show baseline/dynamic source and effective authorization state'))
+  .action(async (role, opts) => {
+    try {
+      const result = await manageOwnerChannel(role, opts.configuration, { action: 'owner_list' });
+      if (result.action !== 'owner_list') throw new Error('unexpected owner-channel response');
+      if (!result.integrity.ok)
+        console.error('warning: owner authorization overlay is corrupt; effective authorization is fail-closed');
+      console.log('CID\tSOURCE\tEFFECTIVE');
+      for (const owner of result.owners)
+        console.log(`${owner.cid}\t${owner.source}\t${owner.effective ? 'yes' : 'no'}`);
+    } catch (e) { die(e); }
+  });
+
+cOpt(ownerAuthorizationCommand.command('authorize <Role> <contact-cid>')
+  .description('authorize an exact CID which is already an established contact'))
+  .action(async (role, cid, opts) => {
+    try {
+      assertContactCid(cid);
+      const result = await manageOwnerChannel(role, opts.configuration, {
+        action: 'owner_authorize', cid,
+      });
+      if (result.action !== 'owner_authorize') throw new Error('unexpected owner-channel response');
+      console.log(`Authorized owner ${result.owner.cid} (${result.owner.source}).`);
+    } catch (e) { die(e); }
+  });
+
+cOpt(ownerAuthorizationCommand.command('revoke <Role> <contact-cid>')
+  .description('revoke an exact effective owner CID; the last owner is protected'))
+  .action(async (role, cid, opts) => {
+    try {
+      assertContactCid(cid);
+      const result = await manageOwnerChannel(role, opts.configuration, {
+        action: 'owner_revoke', cid,
+      });
+      if (result.action !== 'owner_revoke') throw new Error('unexpected owner-channel response');
+      console.log(`Revoked owner ${result.owner.cid} (${result.owner.source}).`);
+    } catch (e) { die(e); }
   });
 
 /**
