@@ -8,6 +8,7 @@ export type SessionReadiness =
   | 'failed';
 
 export type TurnOutcome = 'completed' | 'refused' | 'cancelled' | 'failed' | 'inconclusive';
+export type TurnCancellationSource = 'user' | 'fleet-monitor';
 
 /**
  * Two independent facts about one turn, deliberately kept apart:
@@ -27,6 +28,8 @@ export interface TurnResult {
   outcome: TurnOutcome;
   succeeded: boolean;
   detail?: string;
+  /** Present only when fleet can prove what initiated a cancelled turn. */
+  cancellationSource?: TurnCancellationSource;
   /** Final assistant text captured structurally by a backend, when available. */
   output?: string;
 }
@@ -124,13 +127,19 @@ export const isTerminalSuccess = (outcome: TurnOutcome): boolean => outcome === 
 /** Build a TurnResult with `succeeded` always consistent with `outcome`. */
 export function turnResult(
   accepted: boolean, outcome: TurnOutcome, detail?: string, output?: string,
+  cancellationSource?: TurnCancellationSource,
 ): TurnResult {
-  return { accepted, outcome, succeeded: isTerminalSuccess(outcome), detail, output };
+  return {
+    accepted, outcome, succeeded: isTerminalSuccess(outcome), detail, output,
+    ...(outcome === 'cancelled' && cancellationSource ? { cancellationSource } : {}),
+  };
 }
 
 export interface SubmitPromptOptions {
   /** Cancel active work before delivering this prompt. */
   interrupt?: boolean;
+  /** Internal provenance; ordinary callers must leave this unset. */
+  interruptSource?: 'fleet-monitor';
   /** Use the ACP steering extension when available; ignored by other backends. */
   steer?: boolean;
 }

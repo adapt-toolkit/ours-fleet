@@ -275,7 +275,7 @@ describe('AcpSession', () => {
     expect(session.eventsSince(0).some(event =>
       event.kind === 'agent_text' && event.text === 'steer:important message')).toBe(true);
     await session.interrupt();
-    expect((await active).outcome).toBe('cancelled');
+    expect(await active).toMatchObject({ outcome: 'cancelled', cancellationSource: 'user' });
     session.setControllerAttached(false);
     await session.close();
   });
@@ -288,6 +288,25 @@ describe('AcpSession', () => {
       await new Promise(resolve => setTimeout(resolve, 10));
     const delivered = session.submitPrompt('wake', { interrupt: true, steer: true });
     expect((await active).outcome).toBe('cancelled');
+    expect(await delivered).toMatchObject({
+      accepted: true, outcome: 'inconclusive', detail: 'startedNewTurn',
+    });
+    session.setControllerAttached(false);
+    await session.close();
+  });
+
+  it('marks only a fleet-monitor interruption with internal provenance', async () => {
+    const session = await start('ask');
+    session.setControllerAttached(true);
+    const active = session.submitPrompt('permission');
+    for (let i = 0; i < 20 && session.snapshot().readiness !== 'awaiting_permission'; i++)
+      await new Promise(resolve => setTimeout(resolve, 10));
+    const delivered = session.submitPrompt('wake', {
+      interrupt: true, steer: true, interruptSource: 'fleet-monitor',
+    });
+    expect(await active).toMatchObject({
+      outcome: 'cancelled', cancellationSource: 'fleet-monitor',
+    });
     expect(await delivered).toMatchObject({
       accepted: true, outcome: 'inconclusive', detail: 'startedNewTurn',
     });

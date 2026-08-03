@@ -11,7 +11,7 @@ import { SessionEvents } from './events.js';
 import { SessionControlError, classifyChildExit, turnResult } from './types.js';
 import type {
   ExitRecord, PermissionDecision, QueuedPrompt, SessionEvent, SessionHandle, SessionSnapshot,
-  SubmitPromptOptions, TurnOutcome, TurnResult,
+  SubmitPromptOptions, TurnCancellationSource, TurnOutcome, TurnResult,
 } from './types.js';
 
 interface PendingPermission {
@@ -69,7 +69,7 @@ export class AcpSession implements SessionHandle {
   private steeringSupported = false;
   private capabilities?: acp.AgentCapabilities;
   private controllerCount = 0;
-  private activeTurn?: { id: string; output: string };
+  private activeTurn?: { id: string; output: string; cancellationSource?: TurnCancellationSource };
 
   private constructor(
     private readonly options: AcpSessionOptions,
@@ -155,7 +155,7 @@ export class AcpSession implements SessionHandle {
   async queuePrompt(text: string, options: SubmitPromptOptions = {}): Promise<QueuedPrompt> {
     if (!this.sessionId || !this.isAlive())
       throw new SessionControlError('offline', this.lastError ?? 'ACP session is offline');
-    if (options.interrupt) await this.interrupt();
+    if (options.interrupt) await this.cancelActive(options.interruptSource ?? 'user');
     // Interrupting delivery must still use steering when supported. With no
     // live turn, the extension starts one and acknowledges `startedNewTurn`
     // immediately; a normal session/prompt would keep the monitor blocked until
@@ -188,8 +188,22 @@ export class AcpSession implements SessionHandle {
   }
 
   async interrupt(): Promise<void> {
+    await this.cancelActive('user');
+  }
+
+  private async cancelActive(source: TurnCancellationSource): Promise<void> {
     if (!this.sessionId) return;
-    await this.connection.agent.notify(acp.methods.agent.session.cancel, { sessionId: this.sessionId });
+    const active = this.activeTurn;
+    const previousSource = active?.cancellationSource;
+    if (active && (source === 'user' || !previousSource)) active.cancellationSource = source;
+    try {
+      await this.connection.agent.notify(
+        acp.methods.agent.session.cancel, { sessionId: this.sessionId });
+    } catch (error) {
+      if (this.activeTurn === active && active?.cancellationSource === source)
+        active.cancellationSource = previousSource;
+      throw error;
+    }
     for (const pending of this.pendingPermissions.values())
       pending.resolve({ outcome: { outcome: 'cancelled' } });
     this.pendingPermissions.clear();
@@ -303,7 +317,8 @@ export class AcpSession implements SessionHandle {
       // turn SUCCEEDED is a separate question, and only `stopReason` answers it.
       return turnResult(
         true, classifyStopReason(response.stopReason), response.stopReason,
-        this.activeTurn?.id === turnId ? this.activeTurn.output : undefined);
+        this.activeTurn?.id === turnId ? this.activeTurn.output : undefined,
+        this.activeTurn?.id === turnId ? this.activeTurn.cancellationSource : undefined);
     } catch (error) {
       this.lastError = (error as Error)?.message ?? String(error);
       this.readiness = this.isAlive() ? 'idle' : 'failed';

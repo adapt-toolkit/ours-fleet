@@ -504,7 +504,10 @@ export async function runOnce(
         // steer into the live turn instead; after it completes, honor the
         // configured interrupt policy normally.
         const interrupt = options?.interrupt === true && acpStartupComplete;
-        const result = await acpSession!.submitPrompt(text, { ...options, interrupt, steer: true });
+        const result = await acpSession!.submitPrompt(text, {
+          ...options, interrupt, steer: true,
+          ...(interrupt ? { interruptSource: 'fleet-monitor' as const } : {}),
+        });
         const steered = result.accepted
           && (result.detail === 'injected' || result.detail === 'startedNewTurn');
         return {

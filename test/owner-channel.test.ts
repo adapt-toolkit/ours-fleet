@@ -228,6 +228,39 @@ describe('OwnerChannel', () => {
     }
   });
 
+  it('distinguishes fleet-monitor interruption from authenticated owner cancellation', async () => {
+    const { channel, client, dir } = setup([
+      ownerMessage(39, 'wire-monitor-cancelled', 'Continue the owner task'),
+    ], {
+      accepted: true, outcome: 'cancelled', succeeded: false,
+      cancellationSource: 'fleet-monitor', detail: 'private internal wake detail',
+    });
+    await channel.drain();
+    await vi.waitFor(() => expect(readFileSync(join(dir, '.owner-channel-state.json'), 'utf8'))
+      .toContain('wire-monitor-cancelled'));
+    const sends = client.calls.filter(call => call.name === 'send_message');
+    expect(sends).toHaveLength(1);
+    expect(sends[0].args).toMatchObject({
+      contact: 'owner-cid', reply_to_wire_id: 'wire-monitor-cancelled',
+    });
+    expect(client.calls.some(call => String(call.args?.text).includes('cancelled'))).toBe(false);
+
+    const owner = setup([
+      ownerMessage(40, 'wire-owner-cancelled', 'Cancel this owner task'),
+    ], {
+      accepted: true, outcome: 'cancelled', succeeded: false,
+      cancellationSource: 'user', detail: 'private user cancel detail',
+    });
+    await owner.channel.drain();
+    await vi.waitFor(() => expect(owner.client.calls).toContainEqual({
+      name: 'send_message',
+      args: {
+        contact: 'owner-cid', reply_to_wire_id: 'wire-owner-cancelled',
+        text: '🛑 Request was cancelled before completion.',
+      },
+    }));
+  });
+
   it('handles /interrupt while an earlier owner request is still running', async () => {
     const running = deferredTurn();
     const first = {

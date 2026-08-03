@@ -554,6 +554,9 @@ export class OwnerChannel implements OwnerChannelHandle {
     if (result.succeeded && output) await this.sendFinal(active.contact, output, active.wireId);
     else if (result.succeeded) await this.send(active.contact,
       ownerNotices.completedWithoutText(), active.wireId);
+    else if (result.outcome === 'cancelled' && result.cancellationSource === 'fleet-monitor')
+      this.options.log(`[${this.options.role}] owner request ${active.requestId.slice(0, 12)} `
+        + 'interrupted by fleet monitor; owner cancellation notice suppressed');
     else await this.send(active.contact, ownerNotices.terminal(result.outcome), active.wireId);
     if (result.succeeded) await this.sendAttachments(active.contact, outbox, active.wireId);
     else await rm(outbox, { recursive: true, force: true });
