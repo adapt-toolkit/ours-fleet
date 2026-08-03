@@ -1,5 +1,5 @@
 import { mkdirSync, writeFileSync } from 'node:fs';
-import { join } from 'node:path';
+import { delimiter, dirname, join } from 'node:path';
 import { userInfo } from 'node:os';
 import { home } from '../paths.js';
 import { realExec, type Exec, type ExecResult } from '../exec.js';
@@ -19,6 +19,10 @@ export const busHint = (stderr: string): string =>
       `\n      (if linger is already on: export XDG_RUNTIME_DIR=/run/user/$(id -u))`
     : '';
 export const unitFor = (name: string) => `ours-fleet-agent@${name}.service`;
+
+/** Quote a systemd unit argument and escape its specifier marker. */
+const unitArg = (value: string): string =>
+  `"${value.replace(/\\/g, '\\\\').replace(/"/g, '\\"').replace(/%/g, '%%')}"`;
 
 /**
  * systemd's own ActiveState vocabulary, classified. `activating` covers
@@ -65,6 +69,13 @@ export function makeSystemdBackend(exec: Exec = realExec): SupervisorBackend {
     async init(binPath: string) {
       const msgs: string[] = [];
       const unitDir = join(home(), '.config', 'systemd', 'user');
+      // Lingering user units often start before a login shell imports its PATH.
+      // Pin the Node runtime and persist the install-time PATH so the runner and
+      // children such as `ours-mcp proxy` resolve the same tools after reboot.
+      const servicePath = [...new Set([
+        dirname(process.execPath),
+        ...(process.env.PATH ?? '').split(delimiter),
+      ].filter(Boolean))].join(delimiter);
       mkdirSync(unitDir, { recursive: true });
       writeFileSync(join(unitDir, UNIT_TEMPLATE), `[Unit]
 Description=ours-fleet agent %i
@@ -72,7 +83,8 @@ After=default.target
 
 [Service]
 Type=simple
-ExecStart=${binPath} _run %i
+Environment="PATH=${servicePath.replace(/\\/g, '\\\\').replace(/"/g, '\\"').replace(/%/g, '%%')}"
+ExecStart=${unitArg(process.execPath)} ${unitArg(binPath)} _run %i
 # The RUNNER owns the child-session restart loop, with a counted, backed-off
 # circuit breaker (3.2). systemd must only recover the runner PROCESS crashing —
 # Restart=always here would resume the uncounted two-second relaunch loop, and

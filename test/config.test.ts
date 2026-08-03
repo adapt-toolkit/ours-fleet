@@ -2,7 +2,9 @@ import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { loadConfig, findRole, ConfigError } from '../src/config.js';
+import {
+  loadConfig, findRole, ConfigError, DEFAULT_OWNER_ATTACHMENT_MIME,
+} from '../src/config.js';
 
 let dir: string;
 beforeEach(() => {
@@ -35,6 +37,11 @@ describe('loadConfig', () => {
     expect(findRole(loadConfig(), 'Coordinator').owner_channel).toEqual({
       identity: 'Coordinator-owner', owners: ['cid-one', 'cid-two'],
       interrupt: false, progress_interval_ms: 30_000,
+      attachments: {
+        enabled: true, max_files_per_request: 4, max_file_bytes: 10 * 1024 * 1024,
+        max_request_bytes: 20 * 1024 * 1024, retention_ms: 24 * 60 * 60 * 1_000,
+        allowed_mime: [...DEFAULT_OWNER_ATTACHMENT_MIME],
+      },
     });
     base('roles:\n  A:\n    owner_channel: { identity: A-owner, owners: [cid] }\n');
     expect(() => loadConfig()).toThrow(/requires session: acp/);
@@ -55,6 +62,39 @@ describe('loadConfig', () => {
       '',
     ].join('\n'));
     expect(() => loadConfig()).toThrow(/shared by roles 'A' and 'B'/);
+  });
+
+  it('deep-merges and validates owner attachment policy', () => {
+    base([
+      'defaults:',
+      '  owner_channel:',
+      '    attachments: { max_file_bytes: 100, max_request_bytes: 200 }',
+      'roles:',
+      '  A:',
+      '    session: acp',
+      '    owner_channel:',
+      '      identity: A-owner',
+      '      owners: [cid]',
+      '      attachments:',
+      '        max_files_per_request: 2',
+      '        allowed_mime: [text/plain, image/png]',
+      '',
+    ].join('\n'));
+    expect(findRole(loadConfig(), 'A').owner_channel?.attachments).toMatchObject({
+      enabled: true, max_files_per_request: 2, max_file_bytes: 100,
+      max_request_bytes: 200, allowed_mime: ['text/plain', 'image/png'],
+    });
+    for (const policy of [
+      'max_files_per_request: 0',
+      'max_file_bytes: 200, max_request_bytes: 100',
+      'retention_ms: 100',
+      'allowed_mime: [Text/Plain]',
+      'allowed_mime: [text/plain, text/plain]',
+      'unknown: true',
+    ]) {
+      base(`roles:\n  A:\n    session: acp\n    owner_channel:\n      identity: A-owner\n      owners: [cid]\n      attachments: { ${policy} }\n`);
+      expect(() => loadConfig()).toThrow(/owner_channel\.attachments/);
+    }
   });
 
   it('always rejects duplicate mapping keys with a source position', () => {

@@ -1,7 +1,7 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import { makeSystemdBackend, makeLaunchdBackend, makeNoneBackend, pickBackend, unitFor, labelFor } from '../src/supervisor/index.js';
 import { classifyStart } from '../src/supervisor/launchd.js';
 import type { Exec, ExecResult } from '../src/exec.js';
@@ -33,7 +33,9 @@ describe('systemd backend', () => {
     const unit = readFileSync(join(dir, '.config/systemd/user/ours-fleet-agent@.service'), 'utf8');
     // Anchored: this file now carries `#` comments, and a substring match can be
     // satisfied by one of them rather than by the directive itself.
-    expect(unit).toMatch(/^ExecStart=\/usr\/local\/bin\/ours-fleet _run %i$/m);
+    expect(unit).toContain(`ExecStart="${process.execPath}" "/usr/local/bin/ours-fleet" _run %i`);
+    expect(unit).toContain(`Environment="PATH=${dirname(process.execPath)}`);
+    expect(unit).toContain('/usr/local/bin');
     expect(unit).toMatch(/^Restart=on-failure$/m);   // the runner owns the retry loop (3.2)
     expect(calls).toContainEqual(['systemctl', '--user', 'daemon-reload']);
     expect(calls.some(c => c[0] === 'loginctl' && c[1] === 'enable-linger')).toBe(true);

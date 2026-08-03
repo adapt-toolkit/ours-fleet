@@ -236,6 +236,9 @@ ours-fleet config [-c FILE]         validate + print merged plan
 ours-fleet ls | attach | peek | logs [-f] | status <Name>
 ours-fleet send <Name> "text" | --key <K>
 ours-fleet spawn [--temp] <Name> [--harness --session --mission --model --approval ...]
+ours-fleet loops validate|list|status
+ours-fleet loops reload <Role>
+ours-fleet loops run-now|disable|enable <Role> <Loop>
 ours-fleet rm <Name>
 ours-fleet doctor [--harness H]
 ours-fleet init
@@ -285,6 +288,13 @@ roles:
       owners: [owner-contact-cid]        # authenticated ours contact IDs, never display names
       interrupt: false                  # false queues; true cancels current work first
       progress_interval_ms: 30000        # fleet-generated progress notices; 0 disables
+      attachments:                      # secure inbound documents, images, and voice
+        enabled: true
+        max_files_per_request: 4         # 1..32; rejected from metadata before retrieval
+        max_file_bytes: 10485760         # 10 MiB
+        max_request_bytes: 20971520      # 20 MiB total, and >= max_file_bytes
+        retention_ms: 86400000           # stale crash cleanup; 1 minute..30 days
+        allowed_mime: [application/pdf, text/plain, image/png, audio/ogg]
     model: claude-fable-5               # launch on a specific model (pass-through id; default: launcher default)
     mission: one line
     persona: |                          # operating contract (published as persona)
@@ -316,6 +326,17 @@ roles:
       fs: { read: [/opt/toolchains], write: [] }   # extra binds (state dir + cwd always included)
       resources: { mem: 2G, cpu: "1.5", pids: 512 }
       secrets: ["/host/tok:/run/secrets/tok"]      # host:container, mounted read-only
+
+loops:                                    # trusted local scheduled ACP turns
+  coordinator_pass:
+    roles: [FleetCoordinator]             # or ["*"] for permanent roles only
+    interval: 10m                         # 1m..30d
+    initial_delay: 10m                    # default: one full interval; explicit 0s is immediate
+    jitter: 30s                           # default 0; less than interval and at most 1h
+    enabled: true
+    prompt: |
+      Review current fleet state once. Unstick only actionable work.
+      If nothing material changed, complete silently without an owner report.
 ```
 
 Merge order: `fleet.yaml` ← `fleet.d/*.yaml`; a duplicate role name is a hard
@@ -326,6 +347,36 @@ contract. `defaults.harness_options` is shallow-merged with each
 role's `harness_options`, so a fleet can set common Codex permission/profile defaults
 and override individual keys per role. `monitor` merges the same way — a role block
 overrides `defaults.monitor` key-by-key.
+
+### Scheduled agent loops
+
+Top-level `loops` schedule literal prompts from trusted local YAML. Enabled targets
+must use `session: acp`; temporary roles never inherit loops, including `roles:
+["*"]`. Fleet rejects an enabled loop when its explicitly selected base config is
+a symlink, is owned by another user, or is group/world writable. Prompts are
+bounded and normalized at validation time, but only their size and SHA-256 appear
+in `config`, `list`, logs, or durable state.
+
+Each occurrence is idle-only. An owner, console, monitor, or earlier turn already
+using the role causes that occurrence to be recorded as `skipped_busy` and
+discarded. Missed ticks, races, and failures are likewise recorded once: there is
+no backlog, coalescing, catch-up turn, retry-on-idle, or cadence drift. The default
+first run is one full interval after startup; set `initial_delay: 0s` explicitly
+for an immediate first attempt. Restart recovery marks an in-flight run abandoned,
+skips overdue ticks, and resumes the fixed nominal cadence.
+
+Operational state is a mode-0600 `.scheduled-loops.json` in the permanent role's
+state directory. `disable` persists across restarts; `enable` cannot override
+`enabled: false` in YAML. `reload` re-reads the remembered trusted config through
+the authenticated private control socket. Prompt-only edits retain cadence;
+schedule or selector changes reset that loop to its configured initial delay.
+`run-now` still obeys idle-only admission and returns exit 3 when busy; an
+unavailable or uncertain control plane returns exit 2 and is never retried.
+
+A scheduled turn has typed internal provenance and no owner authority. It cannot
+cancel owner work and its ordinary completion is local only. Material proactive
+owner reporting remains possible solely through an already-open authenticated
+owner-channel task route; a no-op Coordinator pass should complete silently.
 
 ### Never-prompt failure
 
@@ -457,6 +508,12 @@ Set `monitor.interrupt: true` on roles where every configured wake should cancel
 the active turn before the notification is delivered. This is intentionally
 content-blind: the supervisor cannot inspect encrypted message bodies, so all
 events selected by `wake_sources` receive the same interrupt policy.
+The default is `false`: a role that must begin a post-readiness mission
+immediately, including second-and-later mail received while it is working, must
+set `monitor.mode: fleet` and `monitor.interrupt: true` explicitly. Readiness and
+mission delivery still use ordinary ours mail: the role announces readiness,
+waits for a body-free `[fleet-monitor]` wake, then calls `get_messages`; fleet
+does not inject the mission body through ACP.
 It primes the notification cursor *before* the session launches
 (no missed arrivals), cannot be orphaned or left deaf-but-armed, and writes its
 health to `<agentDir>/.monitor-status` (`armed | degraded | failed`), surfaced in
@@ -492,6 +549,105 @@ to each owner/controller identity, and put the owners' immutable contact CIDs in
 channel identity. Add it to the control plane just like another contact, then
 message it directly.
 
+The running supervisor remains the only process which binds that identity.
+Operators manage it, and an active agent turn emits bounded updates, through the
+role's authenticated Unix control socket:
+
+```sh
+ours-fleet owner-channel contact list Coordinator
+ours-fleet owner-channel contact invite Coordinator --name Mobile
+ours-fleet owner-channel contact add Coordinator --invite-file ./invite.txt --name Mobile
+# Or keep invite material out of both argv and a file:
+ours-fleet owner-channel contact add Coordinator --invite-stdin
+
+ours-fleet owner-channel owner list Coordinator
+ours-fleet owner-channel owner authorize Coordinator <exact-64-hex-contact-cid>
+ours-fleet owner-channel owner revoke Coordinator <exact-64-hex-contact-cid>
+
+# Used only from the active [fleet-owner] turn; body is stdin, never argv:
+ours-fleet owner-channel update Coordinator <request-id> --phase working --message-stdin
+
+# Register background work while that request is active, then report after its final:
+ours-fleet owner-channel task open Coordinator <active-request-id>
+ours-fleet owner-channel task report Coordinator <task-id> --phase done --message-stdin
+```
+
+Pairing is deliberately two-step. `contact add` accepts an invite and reports a
+pending contact handshake; it never grants authority. After peer verification,
+use `contact list` to obtain the immutable CID, then explicitly `owner authorize`
+that exact CID. Invite generation prints the invite only to stdout. Acceptance
+reads it from stdin or a file, never a process argument.
+
+Configured `owners` are the declared baseline. Authorize/revoke operations add
+a bounded dynamic overlay stored beside the role state in mode 0600 and applied
+immediately by the already-bound channel. `owner list` shows each CID's
+`baseline`/`dynamic` source and whether it is effective. The overlay survives
+session/supervisor restart; it stores only CIDs and a bounded action audit—never
+invites, message bodies, credentials, or keys. A corrupt overlay fails closed
+(no effective owners and no mutation), and the last effective owner cannot be
+revoked.
+
+These commands require a running ACP role with `owner_channel` enabled. Missing,
+stopped, tmux, disabled, draining, and unavailable-MCP targets fail without
+starting a second client, binding an identity, or opening a network listener.
+
+An owner request follows one ordered lifecycle on its authenticated source wire:
+
+1. Fleet sends an immediate receipt describing started, queued, or interrupting state.
+2. Periodic fleet-generated summaries may report allowlisted ACP activity shapes.
+3. The agent may explicitly send multiple high-level updates with the per-request
+   ID injected into its prompt. Phases are `working`, `approval`, and `blocked`,
+   rendered as precise `🔄`, `🔐`, and `🚧` notices. The one-line body is limited
+   to 280 characters/1024 bytes, deduplicated, capped at 20, and rate-limited to
+   one every five seconds. Reasoning, secret-like material, raw logs/tool output,
+   control characters, and late or unknown request IDs are rejected.
+4. Fleet waits for accepted intermediate sends, then emits exactly one final ACP
+   response (or a sanitized terminal outcome). Successful turns send regular files
+   from the request outbox afterward, correlated to the same source wire.
+
+Fleet chooses the stored authenticated sender for every update; neither the CLI
+caller nor model supplies a recipient. Update audit logs contain only the hashed
+request ID prefix, phase, character count, sequence, and delivery result. Bodies
+remain memory-only and never enter the wire-ID state, authorization overlay, or
+logs. A crash therefore replays the deferred owner request instead of persisting
+an unfinished update body. `/interrupt` remains responsive and makes later
+updates for the cancelled request fail closed.
+
+Background work must not keep an ACP turn open. During the active authenticated
+request, `task open` accepts only its injected request ID and emits no owner
+message. Fleet creates a random opaque task ID and durably stores only the exact
+originating CID/wire route, expiry, counters, and content hashes. The agent may
+then tell the owner that a specialist is working, finalize, and idle. After a
+later fleet-mail wake it verifies the result and uses `task report` with
+`progress`, `done`, or `blocked`; fleet sends a new proactive follow-up from the
+already-bound channel identity, correlated to the original wire. The CLI has no
+recipient option and never broadcasts. `done` and `blocked` close the task only
+after a successful send.
+
+Tasks expire after seven days and are capped at 32 open tasks per role and eight
+per originating owner. Each allows at most 20 reports, one every five seconds.
+Reports reuse the one-sentence 280-character/1024-byte safety checks and body
+deduplication. Authorization is rechecked at send time; revocation deletes that
+owner's pending routes. The mode-0600 task file is bounded and contains no
+message/report bodies. Corruption fails closed. A durable `sending` marker is
+written before transport: if delivery fails, the response is lost, or the
+supervisor crashes mid-send, the task becomes `uncertain` and refuses automatic
+retry or later reordering. This at-most-once retry policy avoids double delivery
+when ours-mcp cannot prove whether a send crossed the boundary; an operator must
+resolve an uncertain task out of band.
+
+Coordinator workflow: spawn the specialist, run `task open` before the active
+owner turn ends, tell the owner work is continuing and finalize, then idle. On
+the fleet-monitor wake, inspect and verify the specialist's result before using
+`task report ... --phase done|blocked`; do not keep the ACP turn alive or poll.
+
+For mobile onboarding, create or accept the contact first, wait until `contact
+list` reports it established, then authorize that exact CID. Authorization and
+revocation take effect immediately and the bounded mode-0600 CID overlay survives
+role/supervisor restarts; update bodies do not. After restart, the supervisor is
+still the sole channel binder and deferred unfinished requests retain the normal
+at-least-once replay contract.
+
 The two paths are deliberately simultaneous and have different authority:
 
 - Mail to the role's normal `identity` remains peer mail. The content-blind
@@ -511,6 +667,34 @@ message and response bodies stay out of fleet state. Delivery is at-least-once
 across a crash (the bridge requeues fetched input before starting a turn); true
 exactly-once processing would require a leased claim/idempotency primitive in
 ours-mcp.
+
+Inbound owner attachments use the same authenticated-CID and exact-wire routing
+boundary. Fleet first calls the metadata-only `list_incoming_files`, groups a
+file-only wake or a same-sender reply-linked text caption, and checks the enabled,
+count, declared MIME, per-file size, and total-size policy before retrieving any
+bytes. It then calls selective `get_files` only for the admitted wire IDs. An
+unauthorized sender is ignored without retrieval or reply. A rejected authorized
+request receives a bounded reason correlated to its file wire.
+
+Retrieved files must be regular, non-symlink paths whose byte count and SHA-256
+match ours-mcp metadata. Fleet additionally checks content signatures against the
+declared MIME, sanitizes traversal/control characters from names, and copies each
+file into a random request-scoped directory at mode 0700 with files at mode 0600.
+The `[fleet-owner]` turn receives only bounded metadata, the private local paths,
+and an explicit daemon transcription result for voice messages. Successful
+transcripts are included; `failed` and `unavailable` states are stated plainly so
+the agent must use the audio path rather than inventing text.
+
+Request files are removed after final delivery and stale directories are removed
+after `retention_ms`. A bounded mode-0600 recovery journal stores only owner CID
+and wire routing metadata—never filenames, paths, captions, transcripts, or file
+bytes. If ours-mcp already marked a selected file processed when fleet restarts,
+fleet resumes only that journaled wire with `save_file`; recovered voice is
+explicitly marked transcript-unavailable. Corrupt recovery state disables
+attachment admission. The host must run an ours-mcp version whose
+`list_incoming_files`, selective `get_files`, and `save_file` schemas support
+these guarantees; `ours-mcp voice-status --json` reports whether transcription
+is currently configured.
 
 Owner channels currently require `session: acp`. Fleet needs structured,
 turn-correlated assistant output for automatic replies; scraping a tmux pane

@@ -7,7 +7,7 @@ import { createInterface } from 'node:readline';
 import { Command } from 'commander';
 import { VERSION } from './version.js';
 import { agentDir, agentsRoot, tmpRoot, logsRoot, deriveXdgRuntimeDir, watchdogsRoot } from './paths.js';
-import { loadConfig, ROLE_NAME_RE } from './config.js';
+import { findRole, loadConfig, ROLE_NAME_RE } from './config.js';
 import type { YamlMode } from './config-yaml.js';
 import { formatDuration } from './duration.js';
 import { resolvedPlan } from './resolved-plan.js';
@@ -37,6 +37,11 @@ import {
 } from './session/control.js';
 import { SessionControlError } from './session/types.js';
 import type { SessionEvent } from './session/types.js';
+import { readScheduledLoops } from './loops/state.js';
+import type { LoopActionResult } from './loops/manager.js';
+import type {
+  OwnerChannelManagementRequest, OwnerChannelManagementResult,
+} from './owner-channel/channel.js';
 import { startWebConsole } from './web/runtime.js';
 import { requestWebControl } from './web/control.js';
 import { WebServiceManager } from './web/service.js';
@@ -86,6 +91,38 @@ function acpStateDir(name: string): string | undefined {
   const temp = agentDir(name, true);
   if (existsSync(controlSocketPath(temp))) return temp;
   return undefined;
+}
+
+const CONTACT_CID_RE = /^[A-Fa-f0-9]{64}$/;
+const OWNER_REQUEST_ID_RE = /^[a-f0-9]{64}$/;
+const MAX_INVITE_BYTES = 48 * 1024;
+const MAX_OWNER_UPDATE_BYTES = 1_024;
+
+function ownerChannelStateDir(roleName: string, configuration?: string): string {
+  const role = findRole(loadConfig(configuration), roleName);
+  if (role.session !== 'acp')
+    throw new Error(`role '${roleName}' uses session '${role.session}', but owner-channel management requires ACP`);
+  if (!role.owner_channel)
+    throw new Error(`role '${roleName}' has no owner_channel configured`);
+  const stateDir = acpStateDir(roleName);
+  if (!stateDir)
+    throw new Error(`role '${roleName}' is stopped or its authenticated ACP control socket is unavailable`);
+  return stateDir;
+}
+
+async function manageOwnerChannel(
+  role: string, configuration: string | undefined,
+  ownerChannel: OwnerChannelManagementRequest,
+): Promise<OwnerChannelManagementResult> {
+  const response = await controlRequest(
+    ownerChannelStateDir(role, configuration), { command: 'owner_channel_manage', ownerChannel });
+  if (!response.ok)
+    throw new SessionControlError(response.kind ?? 'backend', response.error ?? 'owner-channel request failed');
+  return response.result as OwnerChannelManagementResult;
+}
+
+function assertContactCid(cid: string): void {
+  if (!CONTACT_CID_RE.test(cid)) throw new Error('contact CID must be exactly 64 hexadecimal characters');
 }
 
 function renderSessionEvent(event: SessionEvent): void {
@@ -197,6 +234,15 @@ cOpt(program.command('config').description('validate + print the merged plan (no
           console.log(`  watch:    ${w.watch.join(', ')}`);
           if (w.promptFile) console.log(`  focus:    ${w.promptFile}`);
           if (w.isolation) console.log(`  isolation: ${JSON.stringify(w.isolation)}`);
+        }
+      }
+      if (cfg.loops.length) {
+        console.log('loops:');
+        for (const loop of cfg.loops) {
+          console.log(`● ${loop.name}${loop.enabled ? '' : '  (disabled)'}`);
+          console.log(`  every ${formatDuration(loop.intervalMs)} initial=${formatDuration(loop.initialDelayMs)} jitter=${formatDuration(loop.jitterMs)}`);
+          console.log(`  roles: ${loop.roleNames.join(', ')}`);
+          console.log(`  prompt: ${loop.promptBytes} bytes sha256=${loop.promptHash.slice(0, 12)}`);
         }
       }
     } catch (e) { die(e); }
@@ -389,6 +435,323 @@ program.command('status <name>').description('unit/agent state')
         if (response.ok) console.log(`session: ${JSON.stringify(response.result)}`);
       } catch { console.log('session: acp control unavailable'); }
     }
+    const loopState = readScheduledLoops(agentDir(name));
+    if (loopState) {
+      const values = Object.values(loopState.loops);
+      const enabled = values.filter(loop => loop.enabled && !loop.operatorDisabled).length;
+      const next = values.filter(loop => loop.enabled && !loop.operatorDisabled)
+        .map(loop => Date.parse(loop.nextDueAt)).filter(Number.isFinite).sort((a, b) => a - b)[0];
+      console.log(`loops: ${enabled} enabled${next ? `, next ${formatDuration(Math.max(0, next - Date.now()))}` : ''}, ${loopState.health}`);
+    }
+  });
+
+const loopsCommand = program.command('loops')
+  .description('validate, inspect, and control strict idle-only scheduled agent loops');
+
+function loopFailure(error: unknown, json: boolean, code = 1): void {
+  const err = error instanceof SessionControlError ? error : undefined;
+  const message = error instanceof Error ? error.message : String(error);
+  if (json) console.log(JSON.stringify({
+    schemaVersion: 1, ok: false,
+    error: { kind: err?.kind ?? 'invalid', message, retrySafe: err?.kind !== 'timeout' },
+  }));
+  else console.error(message);
+  process.exitCode = code;
+}
+
+function permanentLoopControlDir(role: string): string | undefined {
+  const dir = agentDir(role);
+  return existsSync(controlSocketPath(dir)) ? dir : undefined;
+}
+
+cOpt(loopsCommand.command('validate').description('validate loop config and expanded ACP targets'))
+  .option('--json', 'emit stable JSON')
+  .action(opts => {
+    try {
+      const cfg = loadConfig(opts.configuration);
+      const result = { schemaVersion: 1, ok: true, loops: cfg.loops.length,
+        pairs: cfg.roles.reduce((sum, role) => sum + (role.loops?.length ?? 0), 0) };
+      if (opts.json) console.log(JSON.stringify(result));
+      else console.log(`valid: ${result.loops} loop(s), ${result.pairs} resolved role pair(s)`);
+    } catch (error) { loopFailure(error, opts.json === true); }
+  });
+
+cOpt(loopsCommand.command('list').description('list redacted resolved loop definitions'))
+  .option('--role <role>', 'filter to one permanent role')
+  .option('--json', 'emit stable JSON')
+  .action(opts => {
+    try {
+      const cfg = loadConfig(opts.configuration);
+      if (opts.role) findRole(cfg, opts.role);
+      const values = cfg.loops.filter(loop => !opts.role || loop.roleNames.includes(opts.role)).map(loop => ({
+        name: loop.name, selectors: loop.selectors, roles: loop.roleNames,
+        enabled: loop.enabled, intervalMs: loop.intervalMs, initialDelayMs: loop.initialDelayMs,
+        jitterMs: loop.jitterMs, prompt: { bytes: loop.promptBytes, sha256: loop.promptHash },
+        sourceFile: loop.sourceFile,
+      }));
+      if (opts.json) console.log(JSON.stringify({ schemaVersion: 1, loops: values }));
+      else for (const loop of values)
+        console.log(`${loop.name} ${loop.enabled ? 'enabled' : 'disabled'} every=${formatDuration(loop.intervalMs)} roles=${loop.roles.join(',')} prompt=${loop.prompt.bytes}B/${loop.prompt.sha256.slice(0, 12)}`);
+    } catch (error) { loopFailure(error, opts.json === true); }
+  });
+
+function selectLoopConfig(configuration: string | undefined, roleName: string, loopName?: string) {
+  const cfg = loadConfig(configuration);
+  const role = findRole(cfg, roleName);
+  const definitions = role.loops ?? [];
+  if (loopName && !definitions.some(loop => loop.name === loopName))
+    throw new Error(`role '${roleName}' has no scheduled loop '${loopName}'`);
+  return { role, definitions };
+}
+
+function renderLoopRows(role: string, state: ReturnType<typeof readScheduledLoops>, loop?: string): string[] {
+  if (!state) return [];
+  return Object.entries(state.loops).filter(([name]) => !loop || name === loop).map(([name, item]) =>
+    `${role}/${name} ${item.enabled && !item.operatorDisabled ? 'enabled' : 'disabled'} `
+      + `${item.activeRunId ? 'running' : 'idle'} next=${item.nextDueAt} last=${item.lastOutcome ?? 'never'} `
+      + `counts=${item.counts.started}/${item.counts.completed}/${item.counts.failed} `
+      + `skip=${item.counts.skipped}(busy=${item.counts.skippedBusy},missed=${item.counts.skippedMissed})`);
+}
+
+cOpt(loopsCommand.command('status [role] [loop]').description('show live or stored loop state'))
+  .option('--json', 'emit stable JSON')
+  .action(async (roleName, loopName, opts) => {
+    try {
+      const cfg = loadConfig(opts.configuration);
+      const roles = roleName ? [findRole(cfg, roleName)] : cfg.roles.filter(role => role.loops?.length);
+      if (roleName && loopName) selectLoopConfig(opts.configuration, roleName, loopName);
+      const results = [];
+      for (const role of roles) {
+        let state = readScheduledLoops(agentDir(role.name));
+        let evidence = 'stored';
+        const live = permanentLoopControlDir(role.name);
+        if (live) try {
+          const response = await controlRequest(live, { command: 'loop_status' }, 2_000);
+          if (response.ok) { state = response.result as typeof state; evidence = 'live'; }
+        } catch { /* stored evidence remains honest; timeout is not offline */ }
+        results.push({ role: role.name, evidence, state });
+      }
+      if (opts.json) console.log(JSON.stringify({ schemaVersion: 1, roles: results }));
+      else {
+        const rows = results.flatMap(result => renderLoopRows(result.role, result.state, loopName)
+          .map(row => `${row} evidence=${result.evidence}`));
+        console.log(rows.join('\n') || '(no scheduled loop state)');
+      }
+    } catch (error) { loopFailure(error, opts.json === true); }
+  });
+
+cOpt(loopsCommand.command('reload <role>').description('reload trusted scheduled-loop config in a live ACP role'))
+  .option('--json', 'emit stable JSON')
+  .action(async (roleName, opts) => {
+    try {
+      const { role } = selectLoopConfig(opts.configuration, roleName);
+      if (role.session !== 'acp') throw new Error(`role '${roleName}' is not ACP-compatible`);
+      const stateDir = permanentLoopControlDir(roleName);
+      if (!stateDir) throw new SessionControlError('control-unavailable',
+        `role '${roleName}' has no live authenticated ACP control socket`);
+      const response = await controlRequest(stateDir, { command: 'reload_config' });
+      if (!response.ok)
+        throw new SessionControlError(response.kind ?? 'backend', response.error ?? 'config reload failed');
+      const result = response.result as { changed: boolean; loops: number };
+      if (opts.json) console.log(JSON.stringify({ schemaVersion: 1, ok: true, role: roleName, ...result }));
+      else console.log(`${roleName}: ${result.changed ? 'reloaded' : 'unchanged'} (${result.loops} loops)`);
+    } catch (error) {
+      loopFailure(error, opts.json === true,
+        error instanceof SessionControlError
+          && ['timeout', 'control-unavailable'].includes(error.kind) ? 2 : 1);
+    }
+  });
+
+for (const command of ['run-now', 'disable', 'enable'] as const) {
+  cOpt(loopsCommand.command(`${command} <role> <loop>`)
+    .description(`${command} one trusted configured loop through the live private control socket`))
+    .option('--json', 'emit stable JSON')
+    .action(async (roleName, loopName, opts) => {
+      try {
+        const { role, definitions } = selectLoopConfig(opts.configuration, roleName, loopName);
+        if (role.session !== 'acp') throw new Error(`role '${roleName}' is not ACP-compatible`);
+        const definition = definitions.find(loop => loop.name === loopName)!;
+        if (command === 'enable' && !definition.enabled)
+          throw new Error(`loop '${loopName}' is disabled in YAML; edit the config before enabling it`);
+        const stateDir = permanentLoopControlDir(roleName);
+        if (!stateDir) throw new SessionControlError('control-unavailable',
+          `role '${roleName}' has no live authenticated ACP control socket`);
+        const response = await controlRequest(stateDir, {
+          command: command === 'run-now' ? 'loop_run_now'
+            : command === 'disable' ? 'loop_disable' : 'loop_enable',
+          loop: loopName,
+        });
+        if (!response.ok)
+          throw new SessionControlError(response.kind ?? 'backend', response.error ?? 'loop control failed');
+        const result = response.result as LoopActionResult;
+        if (opts.json) console.log(JSON.stringify({ schemaVersion: 1, ok: true, role: roleName, loop: loopName, ...result }));
+        else console.log(`${roleName}/${loopName}: ${result.state}${result.runId ? ` ${result.runId}` : ''}`);
+        if (command === 'run-now' && result.state !== 'started') process.exitCode = 3;
+      } catch (error) {
+        loopFailure(error, opts.json === true,
+          error instanceof SessionControlError
+            && ['timeout', 'control-unavailable'].includes(error.kind) ? 2 : 1);
+      }
+    });
+}
+
+const ownerChannelCommand = program.command('owner-channel')
+  .description('manage owner routing and task-correlated reports through a running role supervisor')
+  .addHelpText('after', '\nPairing is two-step: establish a contact first, then explicitly authorize its exact CID.');
+const ownerContactCommand = ownerChannelCommand.command('contact')
+  .description('establish contacts without granting owner authority');
+const ownerAuthorizationCommand = ownerChannelCommand.command('owner')
+  .description('manage the effective owner CID set (separate from contacts)');
+const ownerTaskCommand = ownerChannelCommand.command('task')
+  .description('register and report bounded follow-up work correlated to an authenticated owner request');
+
+cOpt(ownerTaskCommand.command('open <Role> <active-request-id>')
+  .description('register a durable follow-up task during the exact active owner request'))
+  .action(async (role, requestId, opts) => {
+    try {
+      if (!OWNER_REQUEST_ID_RE.test(requestId))
+        throw new Error('owner task request ID must be exactly 64 lowercase hexadecimal characters');
+      const result = await manageOwnerChannel(role, opts.configuration, {
+        action: 'task_open', requestId,
+      });
+      if (result.action !== 'task_open') throw new Error('unexpected owner-channel response');
+      console.log(`Owner task ${result.taskId} opened; expires ${result.expiresAt}.`);
+    } catch (e) { die(e); }
+  });
+
+cOpt(ownerTaskCommand.command('report <Role> <task-id>')
+  .description('send a proactive follow-up to the task\'s stored authenticated origin')
+  .requiredOption('--phase <phase>', 'progress, done, or blocked')
+  .requiredOption('--message-stdin', 'read the one-line report body from stdin'))
+  .action(async (role, taskId, opts) => {
+    try {
+      if (!OWNER_REQUEST_ID_RE.test(taskId))
+        throw new Error('owner task ID must be exactly 64 lowercase hexadecimal characters');
+      const phase = String(opts.phase);
+      if (!['progress', 'done', 'blocked'].includes(phase))
+        throw new Error('owner task report phase must be progress, done, or blocked');
+      const message = readFileSync(0, 'utf8');
+      if (Buffer.byteLength(message) > MAX_OWNER_UPDATE_BYTES)
+        throw new Error(`owner task report input exceeds ${MAX_OWNER_UPDATE_BYTES} bytes`);
+      const result = await manageOwnerChannel(role, opts.configuration, {
+        action: 'task_report', taskId, phase: phase as 'progress' | 'done' | 'blocked', message,
+      });
+      if (result.action !== 'task_report') throw new Error('unexpected owner-channel response');
+      console.log(`Owner task report ${result.sequence} delivered; task ${result.state}.`);
+    } catch (e) { die(e); }
+  });
+
+cOpt(ownerChannelCommand.command('update <Role> <request-id>')
+  .description('send one bounded agent-authored update for an active owner request')
+  .requiredOption('--phase <phase>', 'working, approval, or blocked')
+  .requiredOption('--message-stdin', 'read the one-line update body from stdin'))
+  .action(async (role, requestId, opts) => {
+    try {
+      if (!OWNER_REQUEST_ID_RE.test(requestId))
+        throw new Error('owner update request ID must be exactly 64 lowercase hexadecimal characters');
+      const phase = String(opts.phase);
+      if (!['working', 'approval', 'blocked'].includes(phase))
+        throw new Error('owner update phase must be working, approval, or blocked');
+      const message = readFileSync(0, 'utf8');
+      if (Buffer.byteLength(message) > MAX_OWNER_UPDATE_BYTES)
+        throw new Error(`owner update input exceeds ${MAX_OWNER_UPDATE_BYTES} bytes`);
+      const result = await manageOwnerChannel(role, opts.configuration, {
+        action: 'request_update', requestId,
+        phase: phase as 'working' | 'approval' | 'blocked', message,
+      });
+      if (result.action !== 'request_update') throw new Error('unexpected owner-channel response');
+      console.log(`Owner update ${result.sequence} delivered.`);
+    } catch (e) { die(e); }
+  });
+
+cOpt(ownerContactCommand.command('list <Role>')
+  .description('list established/pending contacts using safe identity metadata only'))
+  .action(async (role, opts) => {
+    try {
+      const result = await manageOwnerChannel(role, opts.configuration, { action: 'contact_list' });
+      if (result.action !== 'contact_list') throw new Error('unexpected owner-channel response');
+      if (!result.contacts.length) { console.log('(no contacts)'); return; }
+      console.log('CID\tNAME\tSTATUS\tKIND\tHUMAN');
+      for (const contact of result.contacts) console.log([
+        contact.cid, contact.name, contact.status, contact.kind ?? '', contact.human?.name ?? '',
+      ].join('\t'));
+    } catch (e) { die(e); }
+  });
+
+cOpt(ownerContactCommand.command('invite <Role>')
+  .description('generate an invite on the already-bound owner channel')
+  .option('--name <label>', 'optional contact label'))
+  .action(async (role, opts) => {
+    try {
+      const result = await manageOwnerChannel(role, opts.configuration, {
+        action: 'contact_invite', ...(opts.name ? { name: String(opts.name) } : {}),
+      });
+      if (result.action !== 'contact_invite') throw new Error('unexpected owner-channel response');
+      // Invite material is intentionally the only stdout content.
+      process.stdout.write(result.invite + '\n');
+    } catch (e) { die(e); }
+  });
+
+cOpt(ownerContactCommand.command('add <Role>')
+  .description('accept an invite without granting owner authority')
+  .option('--invite-file <path>', 'read invite material from a file')
+  .option('--invite-stdin', 'read invite material from stdin')
+  .option('--name <label>', 'optional contact label'))
+  .action(async (role, opts) => {
+    try {
+      if (Boolean(opts.inviteFile) === Boolean(opts.inviteStdin))
+        throw new Error('choose exactly one of --invite-file <path> or --invite-stdin');
+      const invite = readFileSync(opts.inviteStdin ? 0 : String(opts.inviteFile), 'utf8').trim();
+      if (!invite) throw new Error('invite input is empty');
+      if (Buffer.byteLength(invite) > MAX_INVITE_BYTES)
+        throw new Error(`invite input exceeds ${MAX_INVITE_BYTES} bytes`);
+      const result = await manageOwnerChannel(role, opts.configuration, {
+        action: 'contact_add', invite, ...(opts.name ? { name: String(opts.name) } : {}),
+      });
+      if (result.action !== 'contact_add') throw new Error('unexpected owner-channel response');
+      console.log('Invite accepted; contact establishment is pending peer verification.');
+      console.log('No owner authority was granted. After the contact is established, authorize its exact CID separately.');
+    } catch (e) { die(e); }
+  });
+
+cOpt(ownerAuthorizationCommand.command('list <Role>')
+  .description('show baseline/dynamic source and effective authorization state'))
+  .action(async (role, opts) => {
+    try {
+      const result = await manageOwnerChannel(role, opts.configuration, { action: 'owner_list' });
+      if (result.action !== 'owner_list') throw new Error('unexpected owner-channel response');
+      if (!result.integrity.ok)
+        console.error('warning: owner authorization overlay is corrupt; effective authorization is fail-closed');
+      console.log('CID\tSOURCE\tEFFECTIVE');
+      for (const owner of result.owners)
+        console.log(`${owner.cid}\t${owner.source}\t${owner.effective ? 'yes' : 'no'}`);
+    } catch (e) { die(e); }
+  });
+
+cOpt(ownerAuthorizationCommand.command('authorize <Role> <contact-cid>')
+  .description('authorize an exact CID which is already an established contact'))
+  .action(async (role, cid, opts) => {
+    try {
+      assertContactCid(cid);
+      const result = await manageOwnerChannel(role, opts.configuration, {
+        action: 'owner_authorize', cid,
+      });
+      if (result.action !== 'owner_authorize') throw new Error('unexpected owner-channel response');
+      console.log(`Authorized owner ${result.owner.cid} (${result.owner.source}).`);
+    } catch (e) { die(e); }
+  });
+
+cOpt(ownerAuthorizationCommand.command('revoke <Role> <contact-cid>')
+  .description('revoke an exact effective owner CID; the last owner is protected'))
+  .action(async (role, cid, opts) => {
+    try {
+      assertContactCid(cid);
+      const result = await manageOwnerChannel(role, opts.configuration, {
+        action: 'owner_revoke', cid,
+      });
+      if (result.action !== 'owner_revoke') throw new Error('unexpected owner-channel response');
+      console.log(`Revoked owner ${result.owner.cid} (${result.owner.source}).`);
+    } catch (e) { die(e); }
   });
 
 /**

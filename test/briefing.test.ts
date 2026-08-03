@@ -94,6 +94,25 @@ describe('generateBriefing', () => {
     expect(b).not.toContain('ours-mcp watch');   // legacy watch dropped from both step 6 and restart
   });
 
+  it('keeps post-bind mission delivery on ordinary ours mail', () => {
+    const role = {
+      ...base,
+      coordinator: 'Architect',
+      monitor: {
+        mode: 'fleet', enabled: true, wake_sources: ['message_received'], batch_ms: 0,
+        inject: 'notification' as const, interrupt: true, turn_fail_threshold: 3,
+      },
+    } as ResolvedRole;
+    const b = generateBriefing(role, vocab, opts);
+    const announce = b.indexOf('ANNOUNCE yourself');
+    const awaitMail = b.indexOf('Await messages');
+    expect(announce).toBeGreaterThanOrEqual(0);
+    expect(awaitMail).toBeGreaterThan(announce);
+    expect(b).toContain('When the monitor wakes you');
+    expect(b).toContain('call **get_messages**');
+    expect(b).not.toContain('direct ACP');
+  });
+
   it('uses the native harness watch instruction for monitor.mode=native', () => {
     const native = {
       ...base,

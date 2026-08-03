@@ -633,6 +633,7 @@ describe('runOnce ACP startup outcome (1.2)', () => {
         start: async () => { started++; },
         drain: async () => {},
         close: async () => { closed++; },
+        manage: async () => { throw new Error('not used'); },
       };
     };
 
@@ -640,6 +641,27 @@ describe('runOnce ACP startup outcome (1.2)', () => {
     expect(started).toBe(1);
     expect(closed).toBe(1);
   });
+
+  it('starts scheduled loops only after ACP startup and stops them before teardown', async () => {
+    writeFileSync(join(dir, 'fleet.yaml'), stringify({
+      roles: { A: {
+        harness: 'fake-acp', session: 'acp',
+        env: { ACP_FIXTURE_EXIT_AFTER: '2' },
+      } },
+      loops: { health: {
+        roles: ['A'], interval: '1m', initial_delay: '0s', prompt: 'bounded health pass',
+      } },
+    }), { mode: 0o600 });
+    const stateDir = agentDir('A');
+    mkdirSync(stateDir, { recursive: true });
+    const { deps, logs } = acpDeps();
+    await runOnce('A', {}, deps);
+    const state = JSON.parse(readFileSync(join(stateDir, '.scheduled-loops.json'), 'utf8'));
+    expect(state.loops.health.counts).toMatchObject({ started: 1, completed: 1 });
+    expect(state.loops.health.activeRunId).toBeNull();
+    expect(logs.some(line => line.includes('loop health started'))).toBe(true);
+    expect(JSON.stringify(state)).not.toContain('bounded health pass');
+  }, 20_000);
 
   it('steers an interrupting wake during ACP startup instead of cancelling startup', async () => {
     writeCfg({ A: {

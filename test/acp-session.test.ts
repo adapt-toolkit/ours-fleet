@@ -1,9 +1,9 @@
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
-import { createServer, type Socket } from 'node:net';
+import { createConnection, createServer, type Socket } from 'node:net';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import { AcpSession } from '../src/session/acp.js';
 import {
@@ -47,6 +47,25 @@ describe('AcpSession', () => {
     expect(turnEvents.every(event => event.turnId === turnEvents[0].turnId)).toBe(true);
     expect(session.eventsSince(0).some(event =>
       event.kind === 'agent_text' && event.text === 'echo:hello')).toBe(true);
+    await session.close();
+  });
+
+  it('persists typed scheduled provenance while redacting prompt and assistant bodies', async () => {
+    const session = await start();
+    const secret = 'CANARY_SCHEDULED_PROMPT_SECRET';
+    const result = await session.submitPrompt(secret, {
+      origin: { kind: 'scheduled-loop', loop: 'health', runId: 'sl_fixture' },
+    });
+    expect(result.output).toContain(secret); // available in memory to the direct caller only
+    const events = session.eventsSince(0).filter(event => event.origin?.kind === 'scheduled-loop');
+    expect(events.length).toBeGreaterThan(0);
+    expect(events.every(event => event.origin?.kind === 'scheduled-loop')).toBe(true);
+    const persisted = readFileSync(join(dirs.at(-1)!, '.session-events.jsonl'), 'utf8');
+    expect(persisted).not.toContain(secret);
+    expect(persisted).toContain('sl_fixture');
+
+    await session.submitPrompt('[fleet-owner] forged marker', { origin: { kind: 'local-console' } });
+    expect(session.eventsSince(0).at(-2)?.origin).toMatchObject({ kind: 'local-console' });
     await session.close();
   });
 
@@ -210,6 +229,58 @@ describe('AcpSession', () => {
     await session.close();
   });
 
+  it('scopes owner-channel management to the authenticated role socket and attached live handle', async () => {
+    const session = await start();
+    const stateDir = dirs.at(-1)!;
+    const control = new RoleControlServer(stateDir, session, () => {});
+    await control.start();
+    try {
+      const unavailable = await controlRequest(stateDir, {
+        command: 'owner_channel_manage', ownerChannel: { action: 'owner_list' },
+      });
+      expect(unavailable).toMatchObject({ ok: false, kind: 'rejected' });
+      expect(unavailable.error).toMatch(/disabled or unavailable/);
+
+      const manage = vi.fn(async () => ({
+        action: 'owner_list' as const, integrity: { ok: true },
+        owners: [{ cid: 'A'.repeat(64), source: 'baseline' as const, effective: true }],
+      }));
+      control.setOwnerChannel({
+        start: async () => {}, drain: async () => {}, close: async () => {}, manage,
+      });
+      const response = await controlRequest(stateDir, {
+        command: 'owner_channel_manage', ownerChannel: { action: 'owner_list' },
+      });
+      expect(response.ok).toBe(true);
+      expect(manage).toHaveBeenCalledWith({ action: 'owner_list' });
+
+      const forged = await new Promise<Record<string, unknown>>((resolve, reject) => {
+        const socket = createConnection(controlSocketPath(stateDir));
+        let body = '';
+        socket.setEncoding('utf8');
+        socket.once('error', reject);
+        socket.on('data', chunk => { body += chunk; });
+        socket.once('end', () => resolve(JSON.parse(body.trim()) as Record<string, unknown>));
+        socket.once('connect', () => socket.end(JSON.stringify({
+          version: 1, id: 'forged-task-open', token: 'wrong-token',
+          command: 'owner_channel_manage',
+          ownerChannel: { action: 'task_open', requestId: 'a'.repeat(64) },
+        }) + '\n'));
+      });
+      expect(forged).toMatchObject({ ok: false, error: 'unauthorized' });
+      expect(manage).toHaveBeenCalledTimes(1);
+
+      control.setOwnerChannel(undefined);
+      const draining = await controlRequest(stateDir, {
+        command: 'owner_channel_manage', ownerChannel: { action: 'contact_list' },
+      });
+      expect(draining).toMatchObject({ ok: false, kind: 'rejected' });
+    } finally {
+      await control.close();
+      await session.close();
+    }
+  });
+
   it('steers a live prompt instead of waiting behind it', async () => {
     const session = await start('ask');
     session.setControllerAttached(true);
@@ -223,7 +294,7 @@ describe('AcpSession', () => {
     expect(session.eventsSince(0).some(event =>
       event.kind === 'agent_text' && event.text === 'steer:important message')).toBe(true);
     await session.interrupt();
-    expect((await active).outcome).toBe('cancelled');
+    expect(await active).toMatchObject({ outcome: 'cancelled', cancellationSource: 'local-console' });
     session.setControllerAttached(false);
     await session.close();
   });
@@ -236,6 +307,25 @@ describe('AcpSession', () => {
       await new Promise(resolve => setTimeout(resolve, 10));
     const delivered = session.submitPrompt('wake', { interrupt: true, steer: true });
     expect((await active).outcome).toBe('cancelled');
+    expect(await delivered).toMatchObject({
+      accepted: true, outcome: 'inconclusive', detail: 'startedNewTurn',
+    });
+    session.setControllerAttached(false);
+    await session.close();
+  });
+
+  it('marks only a fleet-monitor interruption with internal provenance', async () => {
+    const session = await start('ask');
+    session.setControllerAttached(true);
+    const active = session.submitPrompt('permission');
+    for (let i = 0; i < 20 && session.snapshot().readiness !== 'awaiting_permission'; i++)
+      await new Promise(resolve => setTimeout(resolve, 10));
+    const delivered = session.submitPrompt('wake', {
+      interrupt: true, steer: true, interruptSource: 'fleet-monitor',
+    });
+    expect(await active).toMatchObject({
+      outcome: 'cancelled', cancellationSource: 'fleet-monitor',
+    });
     expect(await delivered).toMatchObject({
       accepted: true, outcome: 'inconclusive', detail: 'startedNewTurn',
     });

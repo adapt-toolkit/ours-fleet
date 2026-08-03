@@ -28,6 +28,10 @@ import {
 } from './model-recovery.js';
 import { rotateWorklog } from './worklog.js';
 import { OwnerChannel, type OwnerChannelHandle, type OwnerChannelOptions } from './owner-channel/channel.js';
+import { RoleTurnArbiter } from './session/arbiter.js';
+import {
+  ScheduledLoopManager, type ScheduledLoopManagerHandle,
+} from './loops/manager.js';
 
 export interface RunnerDeps {
   tmux: Tmux;
@@ -466,6 +470,12 @@ export async function runOnce(
   let monitorLoop: Promise<void> | undefined;
   let acpStartupComplete = false;
   let ownerChannel: OwnerChannelHandle | undefined;
+  let loopManager: ScheduledLoopManagerHandle | undefined;
+  let arbiter: RoleTurnArbiter | undefined;
+  let reloadLoopConfig: (() => Promise<{ changed: boolean; loops: number }>) | undefined;
+  let loopGeneration = JSON.stringify((role.loops ?? []).map(loop => [
+    loop.name, loop.definitionHash, loop.promptHash,
+  ]));
   if (sessionBackend === 'acp') {
     const perms = role.permissions ?? resolvePermissions(undefined, undefined);
     // Say once, at startup, that this role will decide permission requests by
@@ -485,14 +495,15 @@ export async function runOnce(
       log: deps.log,
     });
     pid = acpSession.pid;
-    sessionHandle = acpSession;
+    arbiter = new RoleTurnArbiter(acpSession);
+    sessionHandle = arbiter;
     unsubscribeRecovery = acpSession.subscribe(event => {
       if (event.kind !== 'error' || !event.text) return;
       const evidence = classifyFailureText(
         event.text, 'acp', new Date(deps.now()).toISOString());
       if (evidence) resolvedMonitorDeps.onFailureEvidence?.(evidence);
     });
-    control = new RoleControlServer(dir, acpSession, deps.log);
+    control = new RoleControlServer(dir, arbiter, deps.log);
     await control.start();
     resolvedMonitorDeps.delivery = {
       // A wake is only delivered when its turn TERMINATES successfully. A
@@ -504,7 +515,11 @@ export async function runOnce(
         // steer into the live turn instead; after it completes, honor the
         // configured interrupt policy normally.
         const interrupt = options?.interrupt === true && acpStartupComplete;
-        const result = await acpSession!.submitPrompt(text, { ...options, interrupt, steer: true });
+        const result = await arbiter!.submitPrompt(text, {
+          ...options, interrupt, steer: true,
+          ...(interrupt ? { interruptSource: 'fleet-monitor' as const } : {}),
+          origin: { kind: 'fleet-monitor' },
+        });
         const steered = result.accepted
           && (result.detail === 'injected' || result.detail === 'startedNewTurn');
         return {
@@ -520,7 +535,7 @@ export async function runOnce(
     // Wait for the first turn's TERMINAL result. An agent that accepts the
     // startup prompt and then refuses it has not started; logging the role as
     // up would hide a role that never read its briefing.
-    const starting = acpSession.submitPrompt(firstPrompt);
+    const starting = arbiter.submitPrompt(firstPrompt, { origin: { kind: 'startup' } });
     // Monitoring starts immediately. The delivery adapter above downgrades
     // interruption to steering until this startup turn reaches a terminal
     // success, so there is neither a deaf gap nor a boot-cancellation loop.
@@ -553,7 +568,7 @@ export async function runOnce(
       ownerChannel = deps.createOwnerChannel({
         role: name,
         config: role.owner_channel,
-        session: acpSession,
+        session: arbiter,
         stateDir: dir,
         env: role.env,
         log: deps.log,
@@ -567,6 +582,46 @@ export async function runOnce(
         unsubscribeRecovery?.();
         throw new Error(`[${name}] owner channel failed to start: `
           + `${(error as Error)?.message ?? String(error)}`);
+      }
+      control.setOwnerChannel(ownerChannel);
+    }
+    reloadLoopConfig = async (): Promise<{ changed: boolean; loops: number }> => {
+      const nextRole = findRole(loadConfig(configPath), name);
+      const definitions = nextRole.loops ?? [];
+      const generation = JSON.stringify(definitions.map(loop => [
+        loop.name, loop.definitionHash, loop.promptHash,
+      ]));
+      if (generation === loopGeneration && (loopManager || !definitions.length))
+        return { changed: false, loops: definitions.length };
+      if (!loopManager && definitions.length) {
+        loopManager = new ScheduledLoopManager(name, definitions, dir, arbiter!, {
+          now: deps.now,
+          setTimer: (callback, ms) => setTimeout(callback, ms),
+          clearTimer: timer => clearTimeout(timer as ReturnType<typeof setTimeout>),
+          log: deps.log,
+        });
+        control!.setLoopManager(loopManager);
+        loopManager.start();
+      } else {
+        loopManager?.reconcile(definitions);
+      }
+      loopGeneration = generation;
+      deps.log(`[${name}] scheduled loops reloaded (${definitions.length} definitions)`);
+      return { changed: true, loops: definitions.length };
+    };
+    control.setConfigReloader(reloadLoopConfig);
+    if (role.loops?.length) {
+      try {
+        loopManager = new ScheduledLoopManager(name, role.loops, dir, arbiter, {
+          now: deps.now,
+          setTimer: (callback, ms) => setTimeout(callback, ms),
+          clearTimer: timer => clearTimeout(timer as ReturnType<typeof setTimeout>),
+          log: deps.log,
+        });
+        control.setLoopManager(loopManager);
+        loopManager.start();
+      } catch (error) {
+        deps.log(`[${name}] scheduled loop manager unavailable: ${(error as Error)?.name ?? 'Error'}`);
       }
     }
   } else {
@@ -590,8 +645,33 @@ export async function runOnce(
   monitorLoop ??= monitor?.run(pid);
 
   const start = deps.now();
-  while (sessionHandle.isAlive()) await deps.sleep(2000);
-  if (ownerChannel) await ownerChannel.close();
+  let nextLoopReloadAt = deps.now() + 30_000;
+  let lastReloadError = '';
+  while (sessionHandle.isAlive()) {
+    await deps.sleep(2000);
+    const now = deps.now();
+    if (reloadLoopConfig && now >= nextLoopReloadAt) {
+      nextLoopReloadAt = now + 30_000;
+      try {
+        await reloadLoopConfig();
+        lastReloadError = '';
+      } catch (error) {
+        const message = (error as Error)?.message ?? String(error);
+        if (message !== lastReloadError)
+          deps.log(`[${name}] scheduled loop config reload rejected: ${message}`);
+        lastReloadError = message;
+      }
+    }
+  }
+  if (loopManager) {
+    control?.setLoopManager(undefined);
+    await loopManager.stop();
+  }
+  control?.setConfigReloader(undefined);
+  if (ownerChannel) {
+    control?.setOwnerChannel(undefined);
+    await ownerChannel.close();
+  }
   if (monitor) { monitor.stop(); await monitorLoop; }
   unsubscribeRecovery?.();
   if (control) await control.close();

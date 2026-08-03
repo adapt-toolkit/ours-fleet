@@ -62,6 +62,13 @@ roles:
     #   owners: [replace-with-your-owner-contact-cid]
     #   interrupt: false
     #   progress_interval_ms: 30000
+    #   attachments:
+    #     enabled: true
+    #     max_files_per_request: 4
+    #     max_file_bytes: 10485760
+    #     max_request_bytes: 20971520
+    #     retention_ms: 86400000
+    #     allowed_mime: [application/pdf, text/plain, image/png, audio/ogg]
     identity: FleetCoordinator
     cwd: ${work_root}
     persona: |
@@ -117,3 +124,17 @@ roles:
   #     sandbox: read-only
   #     approval: on-request
   #     monitor: true
+
+# Scheduled internal turns are ACP-only, idle-only, and never build a backlog.
+# The base file must be owned by you and not group/world writable when an enabled
+# loop is present. A wildcard targets permanent roles only; temp roles do not inherit.
+# loops:
+#   coordinator_pass:
+#     roles: [FleetCoordinator]
+#     interval: 10m
+#     initial_delay: 10m       # omitted = one full interval; use 0s explicitly for immediate
+#     jitter: 30s
+#     enabled: true
+#     prompt: |
+#       Review current fleet state once and unstick only actionable work.
+#       If nothing material changed, complete silently without an owner report.
