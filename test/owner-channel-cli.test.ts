@@ -13,6 +13,10 @@ const A = 'A'.repeat(64);
 const B = 'B'.repeat(64);
 const REQUEST = 'c'.repeat(64);
 const TASK = 'd'.repeat(64);
+// These cases intentionally launch 10+ separate CLI processes. Under a
+// contended 2-core CI runner they can exceed Vitest's generic 5s unit-test
+// budget even though every command completes normally.
+const CLI_INTEGRATION_TIMEOUT_MS = 20_000;
 let homeDir: string;
 let control: RoleControlServer | undefined;
 
@@ -175,7 +179,7 @@ describe('owner-channel CLI', () => {
       action: 'task_report', taskId: TASK, phase: 'done',
       message: 'Specialist verification passed.\n',
     });
-  });
+  }, CLI_INTEGRATION_TIMEOUT_MS);
 
   it('rejects invalid targets, invalid CIDs, conflicting invite sources, and unavailable channels', async () => {
     config('roles:\n  Wrong: { session: tmux }\n  Plain: { session: acp }\n  PhoneRole:\n    session: acp\n    owner_channel:\n      identity: PhoneRole-owner\n      owners: [' + A + ']\n');
@@ -204,5 +208,5 @@ describe('owner-channel CLI', () => {
     ], 'NEVER_LOG_ME');
     expect(conflicting.stderr).toContain('exactly one');
     expect(conflicting.stdout + conflicting.stderr).not.toContain('NEVER_LOG_ME');
-  });
+  }, CLI_INTEGRATION_TIMEOUT_MS);
 });
