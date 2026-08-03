@@ -83,6 +83,16 @@ export function generateBriefing(role: ResolvedRole, v: BriefingVocab, opts: Bri
     L.push(`  appropriate, and reply explicitly with **${v.sendTool}** to that peer.`);
     L.push('System acceptance, queue, progress, interruption, failure, and final-delivery notices');
     L.push('on the owner channel are fleet-generated; do not imitate or resend them.');
+    L.push('', '### Background specialist follow-ups');
+    L.push('If an authenticated owner request starts work that will finish after your current turn:');
+    L.push(`1. During that active turn run \`ours-fleet owner-channel task open ${role.name} <active-request-id>\`.`);
+    L.push('2. Keep the returned opaque task ID, tell the owner the specialist is working, and');
+    L.push('   finalize normally. Do not hold the ACP turn open and do not poll.');
+    L.push('3. When fleet mail later wakes you, verify the specialist result, then run');
+    L.push(`   \`ours-fleet owner-channel task report ${role.name} <task-id> `
+      + '--phase <progress|done|blocked> --message-stdin`.');
+    L.push('Fleet sends the bounded follow-up only to the exact authenticated originating owner;');
+    L.push('`done` and `blocked` close the task. Never supply or infer a recipient yourself.');
   }
   if (role.coordinator) {
     L.push(`7. ANNOUNCE yourself: call **${v.sendTool}** to contact "${role.coordinator}" with text:`);

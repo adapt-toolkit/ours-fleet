@@ -1,5 +1,5 @@
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
-import { createServer, type Socket } from 'node:net';
+import { createConnection, createServer, type Socket } from 'node:net';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -234,6 +234,22 @@ describe('AcpSession', () => {
       });
       expect(response.ok).toBe(true);
       expect(manage).toHaveBeenCalledWith({ action: 'owner_list' });
+
+      const forged = await new Promise<Record<string, unknown>>((resolve, reject) => {
+        const socket = createConnection(controlSocketPath(stateDir));
+        let body = '';
+        socket.setEncoding('utf8');
+        socket.once('error', reject);
+        socket.on('data', chunk => { body += chunk; });
+        socket.once('end', () => resolve(JSON.parse(body.trim()) as Record<string, unknown>));
+        socket.once('connect', () => socket.end(JSON.stringify({
+          version: 1, id: 'forged-task-open', token: 'wrong-token',
+          command: 'owner_channel_manage',
+          ownerChannel: { action: 'task_open', requestId: 'a'.repeat(64) },
+        }) + '\n'));
+      });
+      expect(forged).toMatchObject({ ok: false, error: 'unauthorized' });
+      expect(manage).toHaveBeenCalledTimes(1);
 
       control.setOwnerChannel(undefined);
       const draining = await controlRequest(stateDir, {

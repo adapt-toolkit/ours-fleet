@@ -1,4 +1,5 @@
 import type { SessionSnapshot, TurnOutcome } from '../session/types.js';
+import type { OwnerTaskPhase } from './tasks.js';
 
 export type OwnerUpdatePhase = 'working' | 'approval' | 'blocked';
 
@@ -72,6 +73,14 @@ export const ownerNotices = {
       case 'working': return `🔄 Update: ${message}`;
       case 'approval': return `🔐 Approval needed: ${message}`;
       case 'blocked': return `🚧 Blocked: ${message}`;
+    }
+  },
+
+  taskReport: (phase: OwnerTaskPhase, message: string) => {
+    switch (phase) {
+      case 'progress': return `🔄 Follow-up: ${message}`;
+      case 'done': return `✅ Follow-up complete: ${message}`;
+      case 'blocked': return `🚧 Follow-up blocked: ${message}`;
     }
   },
 

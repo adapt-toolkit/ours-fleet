@@ -515,6 +515,10 @@ ours-fleet owner-channel owner revoke Coordinator <exact-64-hex-contact-cid>
 
 # Used only from the active [fleet-owner] turn; body is stdin, never argv:
 ours-fleet owner-channel update Coordinator <request-id> --phase working --message-stdin
+
+# Register background work while that request is active, then report after its final:
+ours-fleet owner-channel task open Coordinator <active-request-id>
+ours-fleet owner-channel task report Coordinator <task-id> --phase done --message-stdin
 ```
 
 Pairing is deliberately two-step. `contact add` accepts an invite and reports a
@@ -557,6 +561,34 @@ remain memory-only and never enter the wire-ID state, authorization overlay, or
 logs. A crash therefore replays the deferred owner request instead of persisting
 an unfinished update body. `/interrupt` remains responsive and makes later
 updates for the cancelled request fail closed.
+
+Background work must not keep an ACP turn open. During the active authenticated
+request, `task open` accepts only its injected request ID and emits no owner
+message. Fleet creates a random opaque task ID and durably stores only the exact
+originating CID/wire route, expiry, counters, and content hashes. The agent may
+then tell the owner that a specialist is working, finalize, and idle. After a
+later fleet-mail wake it verifies the result and uses `task report` with
+`progress`, `done`, or `blocked`; fleet sends a new proactive follow-up from the
+already-bound channel identity, correlated to the original wire. The CLI has no
+recipient option and never broadcasts. `done` and `blocked` close the task only
+after a successful send.
+
+Tasks expire after seven days and are capped at 32 open tasks per role and eight
+per originating owner. Each allows at most 20 reports, one every five seconds.
+Reports reuse the one-sentence 280-character/1024-byte safety checks and body
+deduplication. Authorization is rechecked at send time; revocation deletes that
+owner's pending routes. The mode-0600 task file is bounded and contains no
+message/report bodies. Corruption fails closed. A durable `sending` marker is
+written before transport: if delivery fails, the response is lost, or the
+supervisor crashes mid-send, the task becomes `uncertain` and refuses automatic
+retry or later reordering. This at-most-once retry policy avoids double delivery
+when ours-mcp cannot prove whether a send crossed the boundary; an operator must
+resolve an uncertain task out of band.
+
+Coordinator workflow: spawn the specialist, run `task open` before the active
+owner turn ends, tell the owner work is continuing and finalize, then idle. On
+the fleet-monitor wake, inspect and verify the specialist's result before using
+`task report ... --phase done|blocked`; do not keep the ACP turn alive or poll.
 
 For mobile onboarding, create or accept the contact first, wait until `contact
 list` reports it established, then authorize that exact CID. Authorization and

@@ -7,6 +7,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import { OwnerChannel } from '../src/owner-channel/channel.js';
 import type { OursToolClient } from '../src/owner-channel/mcp.js';
+import { OWNER_TASK_MAX_PER_OWNER, OWNER_TASK_TTL_MS } from '../src/owner-channel/tasks.js';
 import type { SessionHandle } from '../src/session/types.js';
 
 const OWNER = 'A'.repeat(64);
@@ -252,6 +253,193 @@ describe('OwnerChannel live management', () => {
     expect(updates.map(call => [call.args?.contact, call.args?.reply_to_wire_id])).toEqual([
       [OWNER, wires[0]], [CONTACT, wires[1]],
     ]);
+    await channel.close();
+  });
+
+  it('opens only during the exact active request and routes a later report to that origin', async () => {
+    const { channel, client, queuePrompt } = setup();
+    const completed = (output: string) => ({
+      accepted: true as const, outcome: 'completed' as const, succeeded: true, output,
+    });
+    let finishA!: (result: ReturnType<typeof completed>) => void;
+    let finishB!: (result: ReturnType<typeof completed>) => void;
+    queuePrompt
+      .mockResolvedValueOnce({ promptId: 'owner-a', queuedBehind: 0,
+        completion: new Promise(resolve => { finishA = resolve; }) })
+      .mockResolvedValueOnce({ promptId: 'owner-b', queuedBehind: 1,
+        completion: new Promise(resolve => { finishB = resolve; }) });
+    await channel.start();
+    await channel.manage({ action: 'owner_authorize', cid: CONTACT });
+    const wireA = 'task-wire-owner-a';
+    const wireB = 'task-wire-owner-b';
+    client.batches.push([
+      { msg_id: 30, wire_id: wireA, from: { id: OWNER }, text: 'Delegate A' },
+      { msg_id: 31, wire_id: wireB, from: { id: CONTACT }, text: 'Delegate B' },
+    ], []);
+    await channel.drain();
+    const requestA = createHash('sha256').update(wireA).digest('hex');
+    const requestB = createHash('sha256').update(wireB).digest('hex');
+    const openedA = await channel.manage({ action: 'task_open', requestId: requestA });
+    const openedB = await channel.manage({ action: 'task_open', requestId: requestB });
+    if (openedA.action !== 'task_open' || openedB.action !== 'task_open') throw new Error('bad task result');
+    await expect(channel.manage({ action: 'task_report', taskId: openedA.taskId,
+      phase: 'progress', message: 'This is too early.' })).rejects.toThrow(/only after.*finalized/);
+
+    finishA(completed('Original final A'));
+    finishB(completed('Original final B'));
+    await vi.waitFor(() => expect(client.calls.filter(call => call.name === 'send_message'
+      && String(call.args?.text).startsWith('Original final'))).toHaveLength(2));
+    await channel.manage({ action: 'task_report', taskId: openedB.taskId,
+      phase: 'done', message: 'The second specialist finished.' });
+    await channel.manage({ action: 'task_report', taskId: openedA.taskId,
+      phase: 'blocked', message: 'The first specialist needs an external dependency.' });
+    const reports = client.calls.filter(call => call.name === 'send_message'
+      && String(call.args?.text).includes('Follow-up'));
+    expect(reports.map(call => call.args)).toEqual([
+      { contact: CONTACT, reply_to_wire_id: wireB,
+        text: '✅ Follow-up complete: The second specialist finished.' },
+      { contact: OWNER, reply_to_wire_id: wireA,
+        text: '🚧 Follow-up blocked: The first specialist needs an external dependency.' },
+    ]);
+    await channel.close();
+  });
+
+  it('persists the route across restart without persisting bodies and closes terminal tasks', async () => {
+    const { channel, client, queuePrompt, dir } = setup();
+    let finish!: (result: { accepted: true; outcome: 'completed'; succeeded: true; output: string }) => void;
+    queuePrompt.mockResolvedValueOnce({ promptId: 'restart-task', queuedBehind: 0,
+      completion: new Promise(resolve => { finish = resolve; }) });
+    await channel.start();
+    const wire = 'restart-task-wire';
+    const requestId = createHash('sha256').update(wire).digest('hex');
+    client.batches.push([{ msg_id: 32, wire_id: wire, from: { id: OWNER }, text: 'Delegate' }], []);
+    await channel.drain();
+    const opened = await channel.manage({ action: 'task_open', requestId });
+    if (opened.action !== 'task_open') throw new Error('bad task result');
+    finish({ accepted: true, outcome: 'completed', succeeded: true, output: 'Original final' });
+    await vi.waitFor(() => expect(client.calls.some(call => call.args?.text === 'Original final')).toBe(true));
+    await channel.close();
+
+    const restartedClient = new ManagementClient();
+    const restarted = new OwnerChannel({
+      role: 'Role', config: { identity: 'Role-owner', owners: [OWNER], interrupt: false,
+        progress_interval_ms: 0 },
+      session: { backend: 'acp', pid: 2, isAlive: () => true,
+        snapshot: () => ({ backend: 'acp', alive: true, readiness: 'idle' }),
+        queuePrompt: vi.fn(), interrupt: vi.fn(), eventsSince: () => [] } as unknown as SessionHandle,
+      stateDir: dir, client: restartedClient, log: () => undefined,
+      watch: () => ({ pid: 2, exitCode: null, stdout: new PassThrough(), stderr: new PassThrough(),
+        once: (_event: string, callback: () => void) => { callback(); }, kill: () => true }) as never,
+    });
+    await restarted.start();
+    await restarted.manage({ action: 'task_report', taskId: opened.taskId,
+      phase: 'done', message: 'Restarted supervisor delivered the verified result.' });
+    expect(restartedClient.calls).toContainEqual({ name: 'send_message', args: {
+      contact: OWNER, reply_to_wire_id: wire,
+      text: '✅ Follow-up complete: Restarted supervisor delivered the verified result.',
+    } });
+    const state = readFileSync(join(dir, '.owner-channel-tasks.json'), 'utf8');
+    expect(state).not.toContain('Restarted supervisor delivered');
+    expect(state).not.toContain('Original final');
+    await expect(restarted.manage({ action: 'task_report', taskId: opened.taskId,
+      phase: 'done', message: 'Do not deliver twice.' })).rejects.toThrow(/closed/);
+    await restarted.close();
+  });
+
+  it('revocation and expiry invalidate persisted task routes', async () => {
+    vi.spyOn(Date, 'now').mockReturnValue(100_000);
+    const { channel, client, queuePrompt } = setup();
+    let finish!: (result: { accepted: true; outcome: 'completed'; succeeded: true; output: string }) => void;
+    queuePrompt.mockResolvedValue({ promptId: 'task-policy', queuedBehind: 0,
+      completion: new Promise(resolve => { finish = resolve; }) });
+    await channel.start();
+    await channel.manage({ action: 'owner_authorize', cid: CONTACT });
+    const wire = 'revoked-task-wire';
+    const requestId = createHash('sha256').update(wire).digest('hex');
+    client.batches.push([{ msg_id: 33, wire_id: wire, from: { id: OWNER }, text: 'Delegate' }], []);
+    await channel.drain();
+    const revoked = await channel.manage({ action: 'task_open', requestId });
+    if (revoked.action !== 'task_open') throw new Error('bad task result');
+    finish({ accepted: true, outcome: 'completed', succeeded: true, output: 'Final' });
+    await vi.waitFor(() => expect(client.calls.some(call => call.args?.text === 'Final')).toBe(true));
+    await channel.manage({ action: 'owner_revoke', cid: OWNER });
+    await expect(channel.manage({ action: 'task_report', taskId: revoked.taskId,
+      phase: 'done', message: 'Must not route after revoke.' })).rejects.toThrow(/revoked/);
+
+    // A different authorized owner can open a task which then expires.
+    let finish2!: (result: { accepted: true; outcome: 'completed'; succeeded: true; output: string }) => void;
+    queuePrompt.mockResolvedValueOnce({ promptId: 'task-expiry', queuedBehind: 0,
+      completion: new Promise(resolve => { finish2 = resolve; }) });
+    const expiryWire = 'expired-task-wire';
+    const expiryRequest = createHash('sha256').update(expiryWire).digest('hex');
+    client.batches.push([{ msg_id: 34, wire_id: expiryWire,
+      from: { id: CONTACT }, text: 'Delegate later' }], []);
+    await channel.drain();
+    const expired = await channel.manage({ action: 'task_open', requestId: expiryRequest });
+    if (expired.action !== 'task_open') throw new Error('bad task result');
+    finish2({ accepted: true, outcome: 'completed', succeeded: true, output: 'Final 2' });
+    await vi.waitFor(() => expect(client.calls.some(call => call.args?.text === 'Final 2')).toBe(true));
+    vi.mocked(Date.now).mockReturnValue(100_000 + OWNER_TASK_TTL_MS + 1);
+    await expect(channel.manage({ action: 'task_report', taskId: expired.taskId,
+      phase: 'done', message: 'Must not route after expiry.' })).rejects.toThrow(/expired/);
+    await channel.close();
+  });
+
+  it('fails closed on duplicate, unsafe, over-cap, and uncertain reports', async () => {
+    vi.spyOn(Date, 'now').mockReturnValue(200_000);
+    const { channel, client, queuePrompt } = setup();
+    let finish!: (result: { accepted: true; outcome: 'completed'; succeeded: true; output: string }) => void;
+    queuePrompt.mockResolvedValue({ promptId: 'task-limits', queuedBehind: 0,
+      completion: new Promise(resolve => { finish = resolve; }) });
+    await channel.start();
+    const wire = 'task-limits-wire';
+    const requestId = createHash('sha256').update(wire).digest('hex');
+    client.batches.push([{ msg_id: 35, wire_id: wire, from: { id: OWNER }, text: 'Delegate' }], []);
+    await channel.drain();
+    const opened = [];
+    for (let i = 0; i < OWNER_TASK_MAX_PER_OWNER; i++) {
+      const result = await channel.manage({ action: 'task_open', requestId });
+      if (result.action === 'task_open') opened.push(result.taskId);
+    }
+    await expect(channel.manage({ action: 'task_open', requestId })).rejects.toThrow(/open tasks per role/);
+    finish({ accepted: true, outcome: 'completed', succeeded: true, output: 'Original final' });
+    await vi.waitFor(() => expect(client.calls.some(call => call.args?.text === 'Original final')).toBe(true));
+    await expect(channel.manage({ action: 'task_report', taskId: opened[0], phase: 'progress',
+      message: 'password=TOP_SECRET' })).rejects.toThrow(/unsafe/);
+    await expect(channel.manage({ action: 'task_report', taskId: opened[0], phase: 'progress',
+      message: 'First sentence. Second sentence.' })).rejects.toThrow(/one plain-text sentence/);
+    await channel.manage({ action: 'task_report', taskId: opened[0], phase: 'progress',
+      message: 'Specialist tests are running.' });
+    vi.mocked(Date.now).mockReturnValue(206_000);
+    await expect(channel.manage({ action: 'task_report', taskId: opened[0], phase: 'progress',
+      message: 'Specialist tests are running.' })).rejects.toThrow(/duplicate/);
+
+    const raced = await Promise.allSettled([
+      channel.manage({ action: 'task_report', taskId: opened[2], phase: 'progress',
+        message: 'The first concurrent report won.' }),
+      channel.manage({ action: 'task_report', taskId: opened[2], phase: 'progress',
+        message: 'The second concurrent report lost.' }),
+    ]);
+    expect(raced.filter(result => result.status === 'fulfilled')).toHaveLength(1);
+    expect(raced.filter(result => result.status === 'rejected')).toHaveLength(1);
+
+    const originalCall = client.callTool.bind(client);
+    let attempted = 0;
+    client.callTool = async (name, args) => {
+      if (name === 'send_message' && String(args?.text).includes('Follow-up complete')) {
+        attempted++;
+        throw new Error('ambiguous transport failure with secret details');
+      }
+      return originalCall(name, args);
+    };
+    await expect(channel.manage({ action: 'task_report', taskId: opened[1], phase: 'done',
+      message: 'Specialist completed the assigned review.' })).rejects.toThrow(/outcome is uncertain/);
+    vi.mocked(Date.now).mockReturnValue(212_000);
+    await expect(channel.manage({ action: 'task_report', taskId: opened[1], phase: 'done',
+      message: 'Specialist completed the assigned review.' })).rejects.toThrow(/outcome is uncertain/);
+    expect(attempted).toBe(1);
+    await expect(channel.manage({ action: 'task_report', taskId: 'f'.repeat(64), phase: 'done',
+      message: 'Unknown tasks fail closed.' })).rejects.toThrow(/unknown/);
     await channel.close();
   });
 });

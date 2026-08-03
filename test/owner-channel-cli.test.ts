@@ -12,6 +12,7 @@ const CLI = resolve('dist/cli.js');
 const A = 'A'.repeat(64);
 const B = 'B'.repeat(64);
 const REQUEST = 'c'.repeat(64);
+const TASK = 'd'.repeat(64);
 let homeDir: string;
 let control: RoleControlServer | undefined;
 
@@ -76,6 +77,7 @@ describe('owner-channel CLI', () => {
     expect(help.stdout).toContain('contact');
     expect(help.stdout).toContain('owner');
     expect(help.stdout).toContain('update');
+    expect(help.stdout).toContain('task');
     expect(help.stdout).toContain('two-step');
   });
 
@@ -102,6 +104,13 @@ describe('owner-channel CLI', () => {
         };
         case 'request_update': return {
           action: request.action, requestId: request.requestId, sequence: 1,
+        };
+        case 'task_open': return {
+          action: request.action, taskId: TASK, expiresAt: '2026-08-10T00:00:00.000Z',
+        };
+        case 'task_report': return {
+          action: request.action, taskId: request.taskId, phase: request.phase,
+          sequence: 2, state: request.phase === 'progress' ? 'open' : 'closed',
         };
       }
     });
@@ -139,6 +148,18 @@ describe('owner-channel CLI', () => {
       'owner-channel', 'update', 'PhoneRole', REQUEST, '--phase', 'working', '--message-stdin',
     ], 'Focused verification is running.\n');
     expect(update).toEqual({ code: 0, stdout: 'Owner update 1 delivered.\n', stderr: '' });
+    const opened = await run(['owner-channel', 'task', 'open', 'PhoneRole', REQUEST]);
+    expect(opened).toEqual({
+      code: 0,
+      stdout: `Owner task ${TASK} opened; expires 2026-08-10T00:00:00.000Z.\n`, stderr: '',
+    });
+    const reported = await runStdin([
+      'owner-channel', 'task', 'report', 'PhoneRole', TASK,
+      '--phase', 'done', '--message-stdin',
+    ], 'Specialist verification passed.\n');
+    expect(reported).toEqual({
+      code: 0, stdout: 'Owner task report 2 delivered; task closed.\n', stderr: '',
+    });
     expect(calls.filter(call => call.action === 'contact_add')).toEqual([
       { action: 'contact_add', invite: 'MOCK_FILE_INVITE', name: 'Mobile' },
       { action: 'contact_add', invite: 'MOCK_STDIN_INVITE' },
@@ -146,6 +167,13 @@ describe('owner-channel CLI', () => {
     expect(calls.find(call => call.action === 'request_update')).toEqual({
       action: 'request_update', requestId: REQUEST, phase: 'working',
       message: 'Focused verification is running.\n',
+    });
+    expect(calls.find(call => call.action === 'task_open')).toEqual({
+      action: 'task_open', requestId: REQUEST,
+    });
+    expect(calls.find(call => call.action === 'task_report')).toEqual({
+      action: 'task_report', taskId: TASK, phase: 'done',
+      message: 'Specialist verification passed.\n',
     });
   });
 
@@ -160,6 +188,12 @@ describe('owner-channel CLI', () => {
     expect((await runStdin([
       'owner-channel', 'update', 'PhoneRole', 'bad', '--phase', 'working', '--message-stdin',
     ], 'safe update')).stderr).toMatch(/64 lowercase/);
+    expect((await run(['owner-channel', 'task', 'open', 'PhoneRole', 'bad'])).stderr)
+      .toMatch(/64 lowercase/);
+    expect((await runStdin([
+      'owner-channel', 'task', 'report', 'PhoneRole', TASK,
+      '--phase', 'wrong', '--message-stdin',
+    ], 'safe report')).stderr).toMatch(/progress, done, or blocked/);
 
     await startControl(async () => { throw new Error('owner-channel MCP client is unavailable'); });
     const unavailable = await run(['owner-channel', 'owner', 'list', 'PhoneRole']);

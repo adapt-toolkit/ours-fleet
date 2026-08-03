@@ -394,6 +394,8 @@ ours-fleet owner-channel owner list <Role>
 ours-fleet owner-channel owner authorize <Role> <exact-64-hex-contact-cid>
 ours-fleet owner-channel owner revoke <Role> <exact-64-hex-contact-cid>
 ours-fleet owner-channel update <Role> <request-id> --phase <working|approval|blocked> --message-stdin
+ours-fleet owner-channel task open <Role> <active-request-id>
+ours-fleet owner-channel task report <Role> <task-id> --phase <progress|done|blocked> --message-stdin
 \`\`\`
 
 Contact establishment and owner authorization are separate security steps.
@@ -413,6 +415,25 @@ A missing/stopped role, tmux session, role without \`owner_channel\`, unavailabl
 MCP client, or a role entering shutdown returns an actionable error with no
 side effects. Management uses no network listener and never logs or persists
 invite material.
+
+For work delegated beyond the current owner turn, call \`task open\` while its
+authenticated request ID is still active. It emits no message and returns a
+random opaque task ID whose mode-0600 durable record contains only the exact
+originating CID/wire route, expiry, counters, delivery state, and body hashes.
+Finalize the ACP turn normally and idle; never keep it open or poll. After fleet
+mail wakes the coordinator, verify the specialist result and call \`task report\`.
+Fleet rechecks authorization and sends the proactive follow-up only to the
+stored origin, correlated to the original wire. There is no recipient argument.
+\`done\` and \`blocked\` are terminal after successful delivery; \`progress\`
+keeps the task open.
+
+Tasks expire after seven days and are limited to 32 per role, eight per owner,
+20 reports each, and one report per five seconds. Reports use the same one-line
+280-character/1024-byte secret/reasoning/log rejection as active updates. The
+state contains no body plaintext and corruption fails closed. Fleet persists a
+pre-send marker; an ambiguous transport result becomes \`uncertain\` and is not
+retried or reordered, preventing duplicate delivery when the transport cannot
+prove whether the first send succeeded.
 
 The full request lifecycle is ordered on the original authenticated source wire:
 immediate receipt; optional allowlisted periodic activity; zero or more explicit

@@ -427,12 +427,50 @@ program.command('status <name>').description('unit/agent state')
   });
 
 const ownerChannelCommand = program.command('owner-channel')
-  .description('manage contacts and authorized owner CIDs through a running role supervisor')
+  .description('manage owner routing and task-correlated reports through a running role supervisor')
   .addHelpText('after', '\nPairing is two-step: establish a contact first, then explicitly authorize its exact CID.');
 const ownerContactCommand = ownerChannelCommand.command('contact')
   .description('establish contacts without granting owner authority');
 const ownerAuthorizationCommand = ownerChannelCommand.command('owner')
   .description('manage the effective owner CID set (separate from contacts)');
+const ownerTaskCommand = ownerChannelCommand.command('task')
+  .description('register and report bounded follow-up work correlated to an authenticated owner request');
+
+cOpt(ownerTaskCommand.command('open <Role> <active-request-id>')
+  .description('register a durable follow-up task during the exact active owner request'))
+  .action(async (role, requestId, opts) => {
+    try {
+      if (!OWNER_REQUEST_ID_RE.test(requestId))
+        throw new Error('owner task request ID must be exactly 64 lowercase hexadecimal characters');
+      const result = await manageOwnerChannel(role, opts.configuration, {
+        action: 'task_open', requestId,
+      });
+      if (result.action !== 'task_open') throw new Error('unexpected owner-channel response');
+      console.log(`Owner task ${result.taskId} opened; expires ${result.expiresAt}.`);
+    } catch (e) { die(e); }
+  });
+
+cOpt(ownerTaskCommand.command('report <Role> <task-id>')
+  .description('send a proactive follow-up to the task\'s stored authenticated origin')
+  .requiredOption('--phase <phase>', 'progress, done, or blocked')
+  .requiredOption('--message-stdin', 'read the one-line report body from stdin'))
+  .action(async (role, taskId, opts) => {
+    try {
+      if (!OWNER_REQUEST_ID_RE.test(taskId))
+        throw new Error('owner task ID must be exactly 64 lowercase hexadecimal characters');
+      const phase = String(opts.phase);
+      if (!['progress', 'done', 'blocked'].includes(phase))
+        throw new Error('owner task report phase must be progress, done, or blocked');
+      const message = readFileSync(0, 'utf8');
+      if (Buffer.byteLength(message) > MAX_OWNER_UPDATE_BYTES)
+        throw new Error(`owner task report input exceeds ${MAX_OWNER_UPDATE_BYTES} bytes`);
+      const result = await manageOwnerChannel(role, opts.configuration, {
+        action: 'task_report', taskId, phase: phase as 'progress' | 'done' | 'blocked', message,
+      });
+      if (result.action !== 'task_report') throw new Error('unexpected owner-channel response');
+      console.log(`Owner task report ${result.sequence} delivered; task ${result.state}.`);
+    } catch (e) { die(e); }
+  });
 
 cOpt(ownerChannelCommand.command('update <Role> <request-id>')
   .description('send one bounded agent-authored update for an active owner request')

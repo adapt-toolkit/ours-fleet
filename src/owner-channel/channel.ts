@@ -9,6 +9,9 @@ import type { QueuedPrompt, SessionEvent, SessionHandle, TurnResult } from '../s
 import { OursMcpClient, type OursToolClient } from './mcp.js';
 import { ownerNotices, type OwnerProgressPhase, type OwnerUpdatePhase } from './notices.js';
 import { OwnerAuthorizationState, OwnerChannelState, type OwnerEntry } from './state.js';
+import {
+  OwnerTaskState, ownerTaskAuditId, ownerTaskDigest, type OwnerTaskPhase,
+} from './tasks.js';
 
 interface InboundMessage {
   msg_id?: number;
@@ -47,7 +50,9 @@ export type OwnerChannelManagementRequest =
   | { action: 'owner_list' }
   | { action: 'owner_authorize'; cid: string }
   | { action: 'owner_revoke'; cid: string }
-  | { action: 'request_update'; requestId: string; phase: OwnerUpdatePhase; message: string };
+  | { action: 'request_update'; requestId: string; phase: OwnerUpdatePhase; message: string }
+  | { action: 'task_open'; requestId: string }
+  | { action: 'task_report'; taskId: string; phase: OwnerTaskPhase; message: string };
 
 export type OwnerChannelManagementResult =
   | { action: 'contact_list'; contacts: OwnerContact[] }
@@ -55,7 +60,9 @@ export type OwnerChannelManagementResult =
   | { action: 'contact_add'; status: 'pending'; contact?: OwnerContact }
   | { action: 'owner_list'; integrity: { ok: boolean; error?: string }; owners: OwnerEntry[] }
   | { action: 'owner_authorize' | 'owner_revoke'; owner: OwnerEntry }
-  | { action: 'request_update'; requestId: string; sequence: number };
+  | { action: 'request_update'; requestId: string; sequence: number }
+  | { action: 'task_open'; taskId: string; expiresAt: string }
+  | { action: 'task_report'; taskId: string; phase: OwnerTaskPhase; sequence: number; state: 'open' | 'closed' };
 
 export type { OwnerUpdatePhase } from './notices.js';
 
@@ -91,6 +98,7 @@ export class OwnerChannel implements OwnerChannelHandle {
   private readonly client: OursToolClient;
   private readonly state: OwnerChannelState;
   private readonly authorizations: OwnerAuthorizationState;
+  private readonly tasks: OwnerTaskState;
   /**
    * Wire IDs whose turn is still running. They stay OUT of the durable state
    * (a crash must replay them) but must not be queued twice while live.
@@ -112,15 +120,20 @@ export class OwnerChannel implements OwnerChannelHandle {
     this.state = new OwnerChannelState(join(options.stateDir, '.owner-channel-state.json'));
     this.authorizations = new OwnerAuthorizationState(
       join(options.stateDir, '.owner-channel-owners.json'), options.config.owners);
+    this.tasks = new OwnerTaskState(join(options.stateDir, '.owner-channel-tasks.json'));
     const integrity = this.authorizations.integrity();
     if (!integrity.ok)
       options.log(`[${options.role}] owner authorization state corrupt; all owner mail disabled`);
+    if (!this.tasks.integrity().ok)
+      options.log(`[${options.role}] owner task state corrupt; proactive reports disabled`);
   }
 
   async start(): Promise<void> {
     this.stopping = false;
     await this.client.start();
     await this.client.callTool('choose_identity', { name: this.options.config.identity });
+    if (this.authorizations.integrity().ok && this.tasks.integrity().ok)
+      this.tasks.cleanup(Date.now(), this.authorizations.effective());
     this.ready = true;
     this.watchTask = this.watchLoop();
     // Do not make role startup wait for an old owner request to finish a turn.
@@ -204,9 +217,21 @@ export class OwnerChannel implements OwnerChannelHandle {
       }
       case 'owner_revoke':
         this.assertCid(request.cid);
-        return { action: request.action, owner: this.authorizations.revoke(request.cid) };
+        {
+          const owner = this.authorizations.revoke(request.cid);
+          let revokedTasks = 0;
+          try { revokedTasks = this.tasks.revoke(request.cid); }
+          catch (error) { this.logError('owner task revocation cleanup failed', error); }
+          if (revokedTasks)
+            this.options.log(`[${this.options.role}] owner tasks revoked count=${revokedTasks}`);
+          return { action: request.action, owner };
+        }
       case 'request_update':
         return this.sendOwnerUpdate(request);
+      case 'task_open':
+        return this.openOwnerTask(request.requestId);
+      case 'task_report':
+        return this.sendOwnerTaskReport(request);
       default:
         throw new Error('unknown owner-channel management action');
     }
@@ -292,6 +317,71 @@ export class OwnerChannel implements OwnerChannelHandle {
     return { action: request.action, requestId: request.requestId, sequence };
   }
 
+  private openOwnerTask(requestId: string): OwnerChannelManagementResult {
+    if (!/^[a-f0-9]{64}$/.test(requestId))
+      throw new Error('owner task request ID must be exactly 64 lowercase hexadecimal characters');
+    const active = this.activeRequests.get(requestId);
+    if (!active || active.finalizing)
+      throw new Error('owner task can be opened only for a currently active owner request');
+    if (!this.authorizations.effective().has(active.contact))
+      throw new Error('originating owner is no longer authorized');
+    const task = this.tasks.open({
+      requestId, contact: active.contact, wireId: active.wireId,
+    });
+    this.options.log(`[${this.options.role}] owner task ${ownerTaskAuditId(task.id)} opened `
+      + `request=${ownerTaskAuditId(requestId)} expires=${new Date(task.expiresAt).toISOString()}`);
+    return { action: 'task_open', taskId: task.id, expiresAt: new Date(task.expiresAt).toISOString() };
+  }
+
+  private async sendOwnerTaskReport(
+    request: Extract<OwnerChannelManagementRequest, { action: 'task_report' }>,
+  ): Promise<OwnerChannelManagementResult> {
+    if (!['progress', 'done', 'blocked'].includes(request.phase))
+      throw new Error('owner task report phase must be progress, done, or blocked');
+    const message = this.safeTaskReport(request.message);
+    const now = Date.now();
+    const task = this.tasks.route(request.taskId, now);
+    if (this.activeRequests.has(task.requestId))
+      throw new Error('owner task reports are allowed only after the originating request has finalized');
+    if (!this.authorizations.integrity().ok)
+      throw new Error('owner authorization state is corrupt; proactive reports are disabled');
+    if (!this.authorizations.effective().has(task.contact)) {
+      this.tasks.revoke(task.contact, now);
+      throw new Error('originating owner is no longer authorized; task revoked');
+    }
+    const chars = Array.from(message).length;
+    const bytes = Buffer.byteLength(message);
+    const digest = ownerTaskDigest(request.phase, message);
+    const sending = this.tasks.beginReport(
+      request.taskId, request.phase, digest, chars, bytes, now);
+    const taskAudit = ownerTaskAuditId(request.taskId);
+    const sequence = sending.sequence + 1;
+    this.options.log(`[${this.options.role}] owner task ${taskAudit} report phase=${request.phase} `
+      + `chars=${chars} bytes=${bytes} sequence=${sequence} sending`);
+    try {
+      await this.send(task.contact, ownerNotices.taskReport(request.phase, message), task.wireId);
+    } catch {
+      try { this.tasks.uncertain(request.taskId, digest); }
+      catch (stateError) { this.logError(`owner task ${taskAudit} uncertainty persist failed`, stateError); }
+      this.options.log(`[${this.options.role}] owner task ${taskAudit} report phase=${request.phase} `
+        + `chars=${chars} bytes=${bytes} sequence=${sequence} result=uncertain`);
+      throw new Error('owner task report delivery outcome is uncertain; it was not retried');
+    }
+    const terminal = request.phase !== 'progress';
+    let deliveredSequence: number;
+    try { deliveredSequence = this.tasks.delivered(request.taskId, digest, terminal, Date.now()); }
+    catch (error) {
+      this.logError(`owner task ${taskAudit} delivery commit failed`, error);
+      throw new Error('owner task report was sent but its durable delivery result is uncertain; do not retry');
+    }
+    this.options.log(`[${this.options.role}] owner task ${taskAudit} report phase=${request.phase} `
+      + `chars=${chars} bytes=${bytes} sequence=${deliveredSequence} result=delivered`);
+    return {
+      action: 'task_report', taskId: request.taskId, phase: request.phase,
+      sequence: deliveredSequence, state: terminal ? 'closed' : 'open',
+    };
+  }
+
   private safeOwnerUpdate(value: unknown): string {
     if (typeof value !== 'string') throw new Error('owner update message must be text');
     const message = value.trim().normalize('NFC');
@@ -303,6 +393,13 @@ export class OwnerChannel implements OwnerChannelHandle {
       throw new Error('owner update must be one line without control or direction-override characters');
     if (/```|-----BEGIN [A-Z ]*PRIVATE KEY-----|(?:api[_ -]?key|access[_ -]?token|authorization|password|secret)\s*[:=]|(?:chain of thought|private reasoning|internal reasoning)|^(?:stdout|stderr|tool (?:output|result)|command):/iu.test(message))
       throw new Error('owner update appears to contain unsafe reasoning, secret, or raw tool content');
+    return message;
+  }
+
+  private safeTaskReport(value: unknown): string {
+    const message = this.safeOwnerUpdate(value);
+    if (/[.!?](?:["')\]]*)\s+\S/u.test(message))
+      throw new Error('owner task report must contain exactly one plain-text sentence');
     return message;
   }
 
@@ -476,6 +573,12 @@ export class OwnerChannel implements OwnerChannelHandle {
       `ours-fleet owner-channel update ${this.options.role} ${requestId} --phase <working|approval|blocked> --message-stdin`,
       'Write only the update body to stdin. Use one plain-text sentence; never include reasoning, secrets, logs, commands, or raw tool output.',
       'Distinct updates are allowed at most once every 5 seconds. Fleet preserves receipt/update/final ordering and chooses the authenticated recipient.',
+      'If you delegate work that will finish after this turn, register it before finalizing:',
+      `ours-fleet owner-channel task open ${this.options.role} ${requestId}`,
+      'Keep the returned opaque task ID. Finalize normally; do not hold this turn open or poll.',
+      'After a later fleet-mail wake, verify the result and report through:',
+      `ours-fleet owner-channel task report ${this.options.role} <task-id> --phase <progress|done|blocked> --message-stdin`,
+      'Fleet routes that proactive follow-up only to this authenticated owner and closes done/blocked tasks.',
       'To attach files to your response, copy each finished file directly into this fleet outbox:',
       outbox,
       'Fleet sends every regular file in that directory to the authenticated owner, correlated to this request.',
