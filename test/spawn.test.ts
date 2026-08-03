@@ -695,6 +695,19 @@ describe('creation provenance (6.6)', () => {
     expect(provenanceOf('Scout', true).lifetime).toBe('temporary');
   });
 
+  it('records an explicit --permission-mode, and omits it when unset', async () => {
+    const { d } = fakeDeps();
+    await spawnPermanent({
+      name: 'Moded', harness: 'claude-code', permissionMode: 'dontAsk',
+    }, d);
+    expect(provenanceOf('Moded').settings.permission_mode)
+      .toEqual({ value: 'dontAsk', source: 'cli' });
+
+    await spawnPermanent({ name: 'Unmoded' }, d);
+    expect(provenanceOf('Unmoded').settings.permission_mode.value).toBeUndefined();
+    expect(formatProvenance(provenanceOf('Unmoded')).join('\n')).not.toContain('permission_mode');
+  });
+
   it('NEVER records secrets, env, bio or persona', async () => {
     writeFileSync(join(dir, 'bio.txt'), 'PUBLIC-CARD-TEXT');
     writeFileSync(join(dir, 'persona.txt'), 'PERSONA-CONTRACT-TEXT');
