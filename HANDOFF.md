@@ -525,3 +525,51 @@ Each of these was run by breaking the fix and confirming the tests go red:
   fails with entries missing.
 - 5.1 loud skip: forced `sandbox.ok = false` — the banner prints and vitest reports
   `6 skipped`, never `6 passed`.
+
+---
+
+# HANDOFF — ACP permission-mode fix (fix/acp-permission-mode)
+
+Appended 2026-08-03 by Developer-1 (ours identity OH-Developer-01) at host-shutdown
+checkpoint. Worktree off origin/main (1b9775c, v0.12.0). Successor: full mission is
+CoordinatorClaude's ours msg #5 to OH-Developer-01; see also
+~/.ours-fleet/tmp/Developer-1/WORKLOG.md. Main checkout's dirty prerelease branch is
+untouched — keep it that way. Remove THIS appended section before opening the PR.
+
+## Done (commit dc020f0)
+- TDD RED phase verified: 8 new tests fail for the right reasons; all 188
+  pre-existing tests in the four touched files pass.
+  - test/claude-code.test.ts describe('acpPermissionModeId'): allow→'bypassPermissions',
+    deny→'plan', ask→undefined; harness_options.permission_mode override; invalid throws.
+  - test/acp-session.test.ts: set_mode after session/new (fixture echoes 'mode:<id>'
+    agent_text); skipped when no modeId; after session/load too; failed set_mode logs
+    ("set_mode" + "agent default") and session stays usable. start() helper takes
+    {modeId, env, log}.
+  - test/runner.test.ts: adapter with acpPermissionModeId → 'acceptEdits' reaches the
+    session (via .session-events.jsonl).
+  - test/spawn.test.ts: provenance records permission_mode (cli) / omits when unset.
+- test/fixtures/acp-agent.mjs: handles session/set_mode (echo + result;
+  ACP_FIXTURE_SET_MODE_FAIL=1 → error), session/load, ACP_FIXTURE_LOAD_SESSION=1.
+
+## Remains (GREEN + delivery)
+1. src/harness/types.ts — HarnessAdapter: add
+   `acpPermissionModeId?(role: ResolvedRole): string | undefined;`
+2. src/harness/claude-code.ts — adapter object: `acpPermissionModeId(role) { return
+   permissionMode(role); }` (reuses private permissionMode(); single source with tmux
+   buildLaunch; keep main's allow→bypassPermissions mapping — delivery fix only).
+3. src/session/acp.ts — AcpSessionOptions gets `modeId?: string`; in initialize(),
+   after sessionId is set by ANY branch (new/resume/load), if modeId: request
+   acp.methods.agent.session.setMode ('session/set_mode') {sessionId, modeId} in
+   try/catch; on failure log `[name] acp: session/set_mode "<modeId>" failed (<err>) —
+   session runs at the agent's default permission mode`; never throw.
+4. src/runner.ts (~477, AcpSession.start call): `modeId: adapter.acpPermissionModeId?.(role),`
+5. src/spawn.ts provenanceSettings(): add
+   `permission_mode: provenanceOf(o.permissionMode, undefined, undefined),`
+6. Verify: `npx vitest run` full suite + `npm run build`. Commit, push, `gh pr create`
+   against main (PR: fixes ACP sessions ignoring approval intent AND spawn
+   --permission-mode; mapping unchanged). Report PR URL/branch/base/tests to
+   CoordinatorClaude. No merge, no force-push.
+
+## Next concrete step
+Item 1 (types.ts hook), then 2–5, then re-run the four touched test files expecting
+all green (196/196).
