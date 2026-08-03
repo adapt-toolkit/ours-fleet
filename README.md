@@ -457,6 +457,12 @@ Set `monitor.interrupt: true` on roles where every configured wake should cancel
 the active turn before the notification is delivered. This is intentionally
 content-blind: the supervisor cannot inspect encrypted message bodies, so all
 events selected by `wake_sources` receive the same interrupt policy.
+The default is `false`: a role that must begin a post-readiness mission
+immediately, including second-and-later mail received while it is working, must
+set `monitor.mode: fleet` and `monitor.interrupt: true` explicitly. Readiness and
+mission delivery still use ordinary ours mail: the role announces readiness,
+waits for a body-free `[fleet-monitor]` wake, then calls `get_messages`; fleet
+does not inject the mission body through ACP.
 It primes the notification cursor *before* the session launches
 (no missed arrivals), cannot be orphaned or left deaf-but-armed, and writes its
 health to `<agentDir>/.monitor-status` (`armed | degraded | failed`), surfaced in

@@ -661,6 +661,77 @@ describe('Monitor.run — delivery', () => {
     }]);
   });
 
+  it('interrupts for second-and-later ACP wakes while earlier wake work is active', async () => {
+    const submitted: Array<{ text: string; interrupt?: boolean }> = [];
+    const { fetch } = scriptedFetch([
+      { cursor: 1, events: [] },
+      { cursor: 2, events: [{ event: 'message_received', from: 'Architect', msg_id: 10 }] },
+      { cursor: 3, events: [{ event: 'message_received', from: 'Verifier', msg_id: 11 }] },
+    ]);
+    const deps = makeDeps(fetch, fakeTmux(), {
+      delivery: {
+        // ACP steering acknowledges immediately while the triggered agent turn
+        // continues, so the second poll represents mail arriving during work.
+        submit: async (text, options) => {
+          submitted.push({ text, interrupt: options?.interrupt });
+          if (submitted.length === 2) mon.stop();
+          return { succeeded: true, outcome: 'startedNewTurn', detail: 'startedNewTurn' };
+        },
+      },
+    });
+    let mon: ReturnType<typeof createMonitor>;
+    mon = createMonitor({
+      name: 'A', agentDir: dir, cfg: CFG({ batch_ms: 0, interrupt: true }), deps,
+    });
+
+    await mon.prime();
+    await mon.run(1);
+
+    expect(submitted).toEqual([
+      {
+        text: '[fleet-monitor] 1 new message from Architect (#10) — run get_messages',
+        interrupt: true,
+      },
+      {
+        text: '[fleet-monitor] 1 new message from Verifier (#11) — run get_messages',
+        interrupt: true,
+      },
+    ]);
+    expect(readFileSync(join(dir, '.notify-cursor'), 'utf8').trim()).toBe('3');
+  });
+
+  it('coalesces a multi-sender burst without repeating an overlapping notification ID', async () => {
+    const delivered: string[] = [];
+    const duplicate = { event: 'message_received', from: 'Architect', msg_id: 20 };
+    const { fetch } = scriptedFetch([
+      { cursor: 1, events: [] },
+      { cursor: 2, events: [duplicate] },
+      { cursor: 3, events: [
+        duplicate,
+        { event: 'message_received', from: 'Developer', msg_id: 21 },
+      ] },
+    ]);
+    const deps = makeDeps(fetch, fakeTmux(), {
+      delivery: {
+        submit: async text => {
+          delivered.push(text);
+          mon.stop();
+          return { succeeded: true, outcome: 'completed' };
+        },
+      },
+    });
+    let mon: ReturnType<typeof createMonitor>;
+    mon = createMonitor({ name: 'A', agentDir: dir, cfg: CFG({ batch_ms: 1 }), deps });
+
+    await mon.prime();
+    await mon.run(1);
+
+    expect(delivered).toEqual([
+      '[fleet-monitor] 2 new messages from Architect, Developer (#20, #21) — run get_messages',
+    ]);
+    expect(readFileSync(join(dir, '.notify-cursor'), 'utf8').trim()).toBe('3');
+  });
+
   it('presses C-c before tmux wake delivery when monitor.interrupt is enabled', async () => {
     const tmux = fakeTmux();
     const keys: string[] = [];

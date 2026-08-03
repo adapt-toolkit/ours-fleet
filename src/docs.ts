@@ -332,6 +332,13 @@ configured wake. The policy is content-blind because the supervisor cannot
 inspect encrypted message bodies. Message bodies are released only when the
 role calls the ours \`get_messages\` tool.
 
+The default is \`false\`. For a temporary role whose mission intentionally arrives
+after its readiness announcement, set \`mode: fleet\` and \`interrupt: true\`
+explicitly. The readiness announcement does not change the transport: the
+mission remains ordinary ours mail, fleet injects only the body-free wake, and
+the role calls \`get_messages\` before acting. Every later configured wake uses
+the same interruption policy.
+
 Legacy \`monitor.enabled: true|false\` remains accepted as an alias for
 \`mode: fleet|native\`; use \`mode\` in new configuration. Codex's separate
 \`harness_options.monitor: true\` is native-monitor consent, not monitor-owner

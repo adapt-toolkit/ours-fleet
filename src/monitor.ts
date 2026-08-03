@@ -218,6 +218,29 @@ export function filterEvents(events: NotifyEvent[], wakeSources: string[]): Noti
   return events.filter(e => e.event !== undefined && set.has(e.event));
 }
 
+/**
+ * A reconnect or the short coalescing poll may overlap the preceding daemon
+ * page. Collapse only events with a stable notification ID; ID-less events are
+ * retained because two otherwise-identical introductions may be distinct.
+ * The key deliberately contains only fields already allowed in the body-free
+ * notification contract.
+ */
+function notificationKey(event: NotifyEvent): string | undefined {
+  const id = event.event === 'file_received' ? event.file_id : event.msg_id;
+  if (id === undefined) return undefined;
+  return `${event.event ?? ''}\u0000${event.from ?? ''}\u0000${String(id)}`;
+}
+
+function appendUniqueEvents(target: NotifyEvent[], additions: NotifyEvent[]): void {
+  const seen = new Set(target.map(notificationKey).filter((key): key is string => key !== undefined));
+  for (const event of additions) {
+    const key = notificationKey(event);
+    if (key !== undefined && seen.has(key)) continue;
+    target.push(event);
+    if (key !== undefined) seen.add(key);
+  }
+}
+
 const uniq = (xs: string[]): string[] => [...new Set(xs)];
 const plural = (n: number, one: string, many = one + 's') => (n === 1 ? one : many);
 
@@ -503,7 +526,7 @@ export class Monitor {
       }
       this.advance(body.cursor, false);
       const batch = filterEvents(body.events ?? [], this.cfg.wake_sources);
-      pending.push(...batch);
+      appendUniqueEvents(pending, batch);
       if (pending.length === 0) {
         this.persistCursor();
         continue;
@@ -547,7 +570,7 @@ export class Monitor {
     try {
       const more = await this.doFetch(String(this.cursor ?? 0), COALESCE_HOLD_MS);
       this.advance(more.cursor, false);
-      batch.push(...filterEvents(more.events ?? [], this.cfg.wake_sources));
+      appendUniqueEvents(batch, filterEvents(more.events ?? [], this.cfg.wake_sources));
     } catch { /* no stragglers / abort — deliver what we have */ }
   }
 
