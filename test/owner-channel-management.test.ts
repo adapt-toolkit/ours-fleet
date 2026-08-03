@@ -1,4 +1,5 @@
-import { mkdtempSync, rmSync } from 'node:fs';
+import { createHash } from 'node:crypto';
+import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { PassThrough } from 'node:stream';
@@ -34,6 +35,7 @@ function setup() {
   const dir = mkdtempSync(join(tmpdir(), 'ours-owner-management-'));
   dirs.push(dir);
   const client = new ManagementClient();
+  const logs: string[] = [];
   const queuePrompt = vi.fn(async () => ({
     promptId: 'managed-prompt', queuedBehind: 0,
     completion: Promise.resolve({
@@ -48,7 +50,7 @@ function setup() {
   const channel = new OwnerChannel({
     role: 'Role', config: {
       identity: 'Role-owner', owners: [OWNER], interrupt: false, progress_interval_ms: 0,
-    }, session, stateDir: dir, client, log: () => undefined,
+    }, session, stateDir: dir, client, log: line => logs.push(line),
     watch: () => {
       const stdout = new PassThrough();
       const stderr = new PassThrough();
@@ -59,7 +61,7 @@ function setup() {
       } as never;
     },
   });
-  return { channel, client, queuePrompt };
+  return { channel, client, queuePrompt, logs, dir };
 }
 
 afterEach(() => {
@@ -143,6 +145,113 @@ describe('OwnerChannel live management', () => {
     await channel.drain();
     await new Promise<void>(resolve => setImmediate(resolve));
     expect(queuePrompt).toHaveBeenCalledOnce();
+    await channel.close();
+  });
+
+  it('routes multiple authored updates to the originating sender in receipt/update/final order', async () => {
+    vi.spyOn(Date, 'now').mockReturnValue(1_000);
+    const { channel, client, queuePrompt, logs, dir } = setup();
+    let finish!: (result: { accepted: true; outcome: 'completed'; succeeded: true; output: string }) => void;
+    queuePrompt.mockResolvedValueOnce({
+      promptId: 'long-turn', queuedBehind: 0,
+      completion: new Promise(resolve => { finish = resolve; }),
+    });
+    await channel.start();
+    const wireId = 'wire-authored-progress';
+    const requestId = createHash('sha256').update(wireId).digest('hex');
+    client.batches.push([{
+      msg_id: 10, wire_id: wireId, from: { id: OWNER, name: 'Owner' }, text: 'Long task',
+    }], []);
+    await channel.drain();
+
+    expect(queuePrompt.mock.calls[0][0]).toContain(requestId);
+    expect(await channel.manage({
+      action: 'request_update', requestId, phase: 'working',
+      message: 'The implementation is complete and focused verification is running.',
+    })).toMatchObject({ action: 'request_update', requestId, sequence: 1 });
+    vi.mocked(Date.now).mockReturnValue(7_000);
+    expect(await channel.manage({
+      action: 'request_update', requestId, phase: 'approval',
+      message: 'Approval is needed before the dependency download can continue.',
+    })).toMatchObject({ sequence: 2 });
+
+    finish({ accepted: true, outcome: 'completed', succeeded: true, output: 'Final answer' });
+    await vi.waitFor(() => expect(client.calls.filter(call => call.name === 'send_message')
+      .map(call => call.args?.text)).toEqual([
+      'ℹ️ Message received. The agent has started working on this request now. '
+        + 'The response will arrive in this channel when ready.',
+      '🔄 Update: The implementation is complete and focused verification is running.',
+      '🔐 Approval needed: Approval is needed before the dependency download can continue.',
+      'Final answer',
+    ]));
+    expect(client.calls.filter(call => call.name === 'send_message')
+      .every(call => call.args?.contact === OWNER && call.args?.reply_to_wire_id === wireId)).toBe(true);
+    expect(logs.join('\n')).not.toMatch(/implementation is complete|dependency download/);
+    const state = readFileSync(join(dir, '.owner-channel-state.json'), 'utf8');
+    expect(state).toContain(wireId);
+    expect(state).not.toMatch(/implementation is complete|dependency download|Final answer/);
+    await expect(channel.manage({
+      action: 'request_update', requestId, phase: 'working', message: 'This update is too late.',
+    })).rejects.toThrow(/not active|finalizing/);
+    await channel.close();
+  });
+
+  it('dedupes, rate-limits, bounds, and rejects unsafe authored updates without sending them', async () => {
+    vi.spyOn(Date, 'now').mockReturnValue(10_000);
+    const { channel, client, queuePrompt } = setup();
+    queuePrompt.mockResolvedValueOnce({
+      promptId: 'pending', queuedBehind: 0, completion: new Promise(() => {}),
+    });
+    await channel.start();
+    const wireId = 'wire-update-validation';
+    const requestId = createHash('sha256').update(wireId).digest('hex');
+    client.batches.push([{
+      msg_id: 11, wire_id: wireId, from: { id: OWNER }, text: 'Keep me posted',
+    }], []);
+    await channel.drain();
+    const first = {
+      action: 'request_update' as const, requestId, phase: 'working' as const,
+      message: 'Focused tests are running.',
+    };
+    await channel.manage(first);
+    await expect(channel.manage(first)).rejects.toThrow(/duplicate/);
+    await expect(channel.manage({ ...first, message: 'The build is running.' }))
+      .rejects.toThrow(/rate-limited/);
+    vi.mocked(Date.now).mockReturnValue(16_000);
+    for (const message of ['', 'x'.repeat(281), 'password=TOP_SECRET',
+      'private reasoning: I think this will work', 'stdout: raw tool response', 'line one\nline two']) {
+      await expect(channel.manage({ ...first, message })).rejects.toThrow();
+    }
+    await expect(channel.manage({ ...first, requestId: 'bad' })).rejects.toThrow(/64 lowercase/);
+    expect(client.calls.filter(call => call.name === 'send_message')).toHaveLength(2);
+    await channel.close();
+  });
+
+  it('isolates authored updates between concurrent authenticated senders', async () => {
+    vi.spyOn(Date, 'now').mockReturnValue(20_000);
+    const { channel, client, queuePrompt } = setup();
+    await channel.start();
+    await channel.manage({ action: 'owner_authorize', cid: CONTACT });
+    queuePrompt.mockImplementation(async () => ({
+      promptId: `pending-${queuePrompt.mock.calls.length}`, queuedBehind: 0,
+      completion: new Promise(() => {}),
+    }));
+    const wires = ['wire-owner-a', 'wire-owner-b'];
+    client.batches.push([
+      { msg_id: 12, wire_id: wires[0], from: { id: OWNER }, text: 'A' },
+      { msg_id: 13, wire_id: wires[1], from: { id: CONTACT }, text: 'B' },
+    ], []);
+    await channel.drain();
+    const requestIds = wires.map(wire => createHash('sha256').update(wire).digest('hex'));
+    await channel.manage({ action: 'request_update', requestId: requestIds[0],
+      phase: 'working', message: 'First request remains in progress.' });
+    await channel.manage({ action: 'request_update', requestId: requestIds[1],
+      phase: 'blocked', message: 'Second request is waiting for an external dependency.' });
+    const updates = client.calls.filter(call => call.name === 'send_message'
+      && String(call.args?.text).match(/^(?:🔄|🚧)/));
+    expect(updates.map(call => [call.args?.contact, call.args?.reply_to_wire_id])).toEqual([
+      [OWNER, wires[0]], [CONTACT, wires[1]],
+    ]);
     await channel.close();
   });
 });

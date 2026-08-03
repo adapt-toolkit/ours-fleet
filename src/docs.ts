@@ -383,7 +383,8 @@ scraping cannot provide the same reliable reply guarantee.
 The supervisor which is already running the ACP role remains the sole binder of
 \`owner_channel.identity\`. The CLI reaches that exact live \`OwnerChannel\`
 through the role's token-authenticated, mode-0600 Unix control socket; it never
-starts another ours client and never force-binds:
+starts another ours client and never force-binds. An active owner turn uses the
+same control plane for explicit bounded updates:
 
 \`\`\`sh
 ours-fleet owner-channel contact list <Role>
@@ -392,6 +393,7 @@ ours-fleet owner-channel contact add <Role> (--invite-file <path> | --invite-std
 ours-fleet owner-channel owner list <Role>
 ours-fleet owner-channel owner authorize <Role> <exact-64-hex-contact-cid>
 ours-fleet owner-channel owner revoke <Role> <exact-64-hex-contact-cid>
+ours-fleet owner-channel update <Role> <request-id> --phase <working|approval|blocked> --message-stdin
 \`\`\`
 
 Contact establishment and owner authorization are separate security steps.
@@ -411,6 +413,28 @@ A missing/stopped role, tmux session, role without \`owner_channel\`, unavailabl
 MCP client, or a role entering shutdown returns an actionable error with no
 side effects. Management uses no network listener and never logs or persists
 invite material.
+
+The full request lifecycle is ordered on the original authenticated source wire:
+immediate receipt; optional allowlisted periodic activity; zero or more explicit
+agent-authored updates; an optional \`🔐\` approval or \`🚧\` blocked update; one
+final ACP response or sanitized terminal outcome; then successful-turn files from
+the request outbox. Updates use the request ID injected into the owner prompt,
+never choose a recipient, and never create another channel binding.
+
+Authored update bodies come from stdin rather than argv and must be a single
+plain-text sentence (280 characters/1024 bytes maximum). Fleet rejects empty,
+oversized, control-character, reasoning, secret-like, log/tool-output, duplicate,
+unknown, late, and over-rate content. Distinct updates are limited to 20 per
+request and one every five seconds. The audit line retains only a hashed request
+prefix, phase, character count, sequence, and result—not the body. The final ACP
+contract remains exactly one response, ordered after every accepted update.
+
+For a mobile owner, establish the contact first, wait for peer verification,
+authorize its exact CID, and revoke that same CID when access ends. The bounded
+mode-0600 CID overlay survives supervisor restart and remains fail-closed on
+corruption. Update bodies remain memory-only. After a crash/restart, unfinished
+deferred owner input follows the existing at-least-once replay path; the restarted
+supervisor remains the sole binder.
 
 ## Stable config and YAML migration
 

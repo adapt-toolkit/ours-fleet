@@ -11,6 +11,7 @@ import type { SessionHandle } from '../src/session/types.js';
 const CLI = resolve('dist/cli.js');
 const A = 'A'.repeat(64);
 const B = 'B'.repeat(64);
+const REQUEST = 'c'.repeat(64);
 let homeDir: string;
 let control: RoleControlServer | undefined;
 
@@ -74,6 +75,7 @@ describe('owner-channel CLI', () => {
     const help = await run(['owner-channel', '--help']);
     expect(help.stdout).toContain('contact');
     expect(help.stdout).toContain('owner');
+    expect(help.stdout).toContain('update');
     expect(help.stdout).toContain('two-step');
   });
 
@@ -97,6 +99,9 @@ describe('owner-channel CLI', () => {
         };
         case 'owner_revoke': return {
           action: request.action, owner: { cid: request.cid, source: 'dynamic', effective: false },
+        };
+        case 'request_update': return {
+          action: request.action, requestId: request.requestId, sequence: 1,
         };
       }
     });
@@ -130,20 +135,31 @@ describe('owner-channel CLI', () => {
       .toContain(`Authorized owner ${B}`);
     expect((await run(['owner-channel', 'owner', 'revoke', 'PhoneRole', B])).stdout)
       .toContain(`Revoked owner ${B}`);
+    const update = await runStdin([
+      'owner-channel', 'update', 'PhoneRole', REQUEST, '--phase', 'working', '--message-stdin',
+    ], 'Focused verification is running.\n');
+    expect(update).toEqual({ code: 0, stdout: 'Owner update 1 delivered.\n', stderr: '' });
     expect(calls.filter(call => call.action === 'contact_add')).toEqual([
       { action: 'contact_add', invite: 'MOCK_FILE_INVITE', name: 'Mobile' },
       { action: 'contact_add', invite: 'MOCK_STDIN_INVITE' },
     ]);
+    expect(calls.find(call => call.action === 'request_update')).toEqual({
+      action: 'request_update', requestId: REQUEST, phase: 'working',
+      message: 'Focused verification is running.\n',
+    });
   });
 
   it('rejects invalid targets, invalid CIDs, conflicting invite sources, and unavailable channels', async () => {
     config('roles:\n  Wrong: { session: tmux }\n  Plain: { session: acp }\n  PhoneRole:\n    session: acp\n    owner_channel:\n      identity: PhoneRole-owner\n      owners: [' + A + ']\n');
-    expect((await run(['owner-channel', 'contact', 'list', 'Missing'])).stderr).toMatch(/unknown role/);
+    expect((await run(['owner-channel', 'contact', 'list', 'Missing'])).stderr).toMatch(/no such role/);
     expect((await run(['owner-channel', 'contact', 'list', 'Wrong'])).stderr).toMatch(/requires ACP/);
     expect((await run(['owner-channel', 'contact', 'list', 'Plain'])).stderr).toMatch(/no owner_channel/);
     expect((await run(['owner-channel', 'contact', 'list', 'PhoneRole'])).stderr).toMatch(/stopped.*control socket/);
     expect((await run(['owner-channel', 'owner', 'authorize', 'PhoneRole', 'not-a-cid'])).stderr)
       .toMatch(/64 hexadecimal/);
+    expect((await runStdin([
+      'owner-channel', 'update', 'PhoneRole', 'bad', '--phase', 'working', '--message-stdin',
+    ], 'safe update')).stderr).toMatch(/64 lowercase/);
 
     await startControl(async () => { throw new Error('owner-channel MCP client is unavailable'); });
     const unavailable = await run(['owner-channel', 'owner', 'list', 'PhoneRole']);

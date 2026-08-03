@@ -7,7 +7,7 @@ import { join } from 'node:path';
 import type { OwnerChannelConfig } from '../config.js';
 import type { QueuedPrompt, SessionEvent, SessionHandle, TurnResult } from '../session/types.js';
 import { OursMcpClient, type OursToolClient } from './mcp.js';
-import { ownerNotices, type OwnerProgressPhase } from './notices.js';
+import { ownerNotices, type OwnerProgressPhase, type OwnerUpdatePhase } from './notices.js';
 import { OwnerAuthorizationState, OwnerChannelState, type OwnerEntry } from './state.js';
 
 interface InboundMessage {
@@ -46,14 +46,18 @@ export type OwnerChannelManagementRequest =
   | { action: 'contact_add'; invite: string; name?: string }
   | { action: 'owner_list' }
   | { action: 'owner_authorize'; cid: string }
-  | { action: 'owner_revoke'; cid: string };
+  | { action: 'owner_revoke'; cid: string }
+  | { action: 'request_update'; requestId: string; phase: OwnerUpdatePhase; message: string };
 
 export type OwnerChannelManagementResult =
   | { action: 'contact_list'; contacts: OwnerContact[] }
   | { action: 'contact_invite'; invite: string }
   | { action: 'contact_add'; status: 'pending'; contact?: OwnerContact }
   | { action: 'owner_list'; integrity: { ok: boolean; error?: string }; owners: OwnerEntry[] }
-  | { action: 'owner_authorize' | 'owner_revoke'; owner: OwnerEntry };
+  | { action: 'owner_authorize' | 'owner_revoke'; owner: OwnerEntry }
+  | { action: 'request_update'; requestId: string; sequence: number };
+
+export type { OwnerUpdatePhase } from './notices.js';
 
 export interface OwnerContact {
   cid: string;
@@ -62,6 +66,22 @@ export interface OwnerContact {
   kind?: string;
   human?: { cid?: string; name?: string };
 }
+
+interface ActiveOwnerRequest {
+  contact: string;
+  wireId: string;
+  requestId: string;
+  outboundTail: Promise<void>;
+  finalizing: boolean;
+  lastUpdateAt?: number;
+  updateCount: number;
+  updateDigests: Set<string>;
+}
+
+const OWNER_UPDATE_MIN_INTERVAL_MS = 5_000;
+const OWNER_UPDATE_MAX_COUNT = 20;
+const OWNER_UPDATE_MAX_CHARS = 280;
+const OWNER_UPDATE_MAX_BYTES = 1_024;
 
 /**
  * Fleet-owned trusted ingress. The agent never binds this identity and never
@@ -82,6 +102,7 @@ export class OwnerChannel implements OwnerChannelHandle {
   private drainTask?: Promise<void>;
   private drainRequested = false;
   private readonly completionTasks = new Set<Promise<void>>();
+  private readonly activeRequests = new Map<string, ActiveOwnerRequest>();
   private managementTail: Promise<unknown> = Promise.resolve();
   private ready = false;
 
@@ -184,6 +205,8 @@ export class OwnerChannel implements OwnerChannelHandle {
       case 'owner_revoke':
         this.assertCid(request.cid);
         return { action: request.action, owner: this.authorizations.revoke(request.cid) };
+      case 'request_update':
+        return this.sendOwnerUpdate(request);
       default:
         throw new Error('unknown owner-channel management action');
     }
@@ -231,6 +254,56 @@ export class OwnerChannel implements OwnerChannelHandle {
 
   private safeMetadata(value: unknown): string {
     return String(value).replace(/[\u0000-\u001f\u007f]/g, ' ').slice(0, 200);
+  }
+
+  private async sendOwnerUpdate(
+    request: Extract<OwnerChannelManagementRequest, { action: 'request_update' }>,
+  ): Promise<OwnerChannelManagementResult> {
+    if (!/^[a-f0-9]{64}$/.test(request.requestId))
+      throw new Error('owner update request ID must be exactly 64 lowercase hexadecimal characters');
+    if (!['working', 'approval', 'blocked'].includes(request.phase))
+      throw new Error('owner update phase must be working, approval, or blocked');
+    const active = this.activeRequests.get(request.requestId);
+    if (!active || active.finalizing)
+      throw new Error('owner request is not active or is already finalizing');
+    const message = this.safeOwnerUpdate(request.message);
+    const digest = createHash('sha256').update(`${request.phase}\0${message}`).digest('hex');
+    if (active.updateDigests.has(digest)) throw new Error('duplicate owner update refused');
+    if (active.updateCount >= OWNER_UPDATE_MAX_COUNT)
+      throw new Error(`owner request is limited to ${OWNER_UPDATE_MAX_COUNT} authored updates`);
+    const now = Date.now();
+    if (active.lastUpdateAt !== undefined && now - active.lastUpdateAt < OWNER_UPDATE_MIN_INTERVAL_MS)
+      throw new Error(`owner updates are rate-limited to one every ${OWNER_UPDATE_MIN_INTERVAL_MS}ms`);
+
+    active.updateDigests.add(digest);
+    active.updateCount++;
+    active.lastUpdateAt = now;
+    const sequence = active.updateCount;
+    const notice = ownerNotices.authoredUpdate(request.phase, message);
+    const send = active.outboundTail.then(async () => {
+      await this.send(active.contact, notice, active.wireId);
+      this.options.log(`[${this.options.role}] owner update ${active.requestId.slice(0, 12)} `
+        + `phase=${request.phase} chars=${Array.from(message).length} sequence=${sequence} sent`);
+    });
+    active.outboundTail = send.catch(error => {
+      this.logError(`owner update ${active.requestId.slice(0, 12)} delivery failed`, error);
+    });
+    await send;
+    return { action: request.action, requestId: request.requestId, sequence };
+  }
+
+  private safeOwnerUpdate(value: unknown): string {
+    if (typeof value !== 'string') throw new Error('owner update message must be text');
+    const message = value.trim().normalize('NFC');
+    if (!message) throw new Error('owner update message is empty');
+    if (Array.from(message).length > OWNER_UPDATE_MAX_CHARS
+        || Buffer.byteLength(message) > OWNER_UPDATE_MAX_BYTES)
+      throw new Error(`owner update exceeds ${OWNER_UPDATE_MAX_CHARS} characters or ${OWNER_UPDATE_MAX_BYTES} bytes`);
+    if (/[\u0000-\u001f\u007f-\u009f\u202a-\u202e\u2066-\u2069]/u.test(message))
+      throw new Error('owner update must be one line without control or direction-override characters');
+    if (/```|-----BEGIN [A-Z ]*PRIVATE KEY-----|(?:api[_ -]?key|access[_ -]?token|authorization|password|secret)\s*[:=]|(?:chain of thought|private reasoning|internal reasoning)|^(?:stdout|stderr|tool (?:output|result)|command):/iu.test(message))
+      throw new Error('owner update appears to contain unsafe reasoning, secret, or raw tool content');
+    return message;
   }
 
   private async drainAll(): Promise<void> {
@@ -301,12 +374,14 @@ export class OwnerChannel implements OwnerChannelHandle {
       return true;
     }
 
+    const requestId = this.requestId(wireId);
     const outbox = this.outboxDir(wireId);
     await mkdir(outbox, { recursive: true, mode: 0o700 });
     let queued;
     const activityCursor = this.latestEventSeq(this.options.session.eventsSince(0));
     try {
-      queued = await this.options.session.queuePrompt(this.ownerPrompt(sender, text, wireId, outbox), {
+      queued = await this.options.session.queuePrompt(
+        this.ownerPrompt(sender, text, wireId, requestId, outbox), {
         interrupt: this.options.config.interrupt,
       });
     } catch (error) {
@@ -323,10 +398,19 @@ export class OwnerChannel implements OwnerChannelHandle {
         ? ownerNotices.receivedQueued(queued.queuedBehind)
         : ownerNotices.receivedStarted();
     this.inFlight.add(wireId);
-    const task = this.complete(sender.id, wireId, outbox, accepted, queued, activityCursor)
+    const receipt = this.send(sender.id, accepted, wireId).then(() => undefined).catch(error => {
+      this.logError(`request ${requestId.slice(0, 12)} acceptance notice failed`, error);
+    });
+    const active: ActiveOwnerRequest = {
+      contact: sender.id, wireId, requestId, outboundTail: receipt, finalizing: false,
+      updateCount: 0, updateDigests: new Set(),
+    };
+    this.activeRequests.set(requestId, active);
+    const task = this.complete(active, outbox, queued, activityCursor)
       .catch(error => this.logError(`request ${wireId} completion failed`, error))
       .finally(() => {
         this.inFlight.delete(wireId);
+        this.activeRequests.delete(requestId);
         this.completionTasks.delete(task);
         if (!this.stopping)
           void this.drain().catch(error => this.logError('completion drain failed', error));
@@ -336,20 +420,13 @@ export class OwnerChannel implements OwnerChannelHandle {
   }
 
   private async complete(
-    contact: string, wireId: string, outbox: string,
-    accepted: string, queued: QueuedPrompt, activityCursor: number,
+    active: ActiveOwnerRequest, outbox: string, queued: QueuedPrompt, activityCursor: number,
   ): Promise<void> {
-    // Notice delivery and turn completion happen outside the inbox drain. This
-    // is what keeps later owner messages — especially /interrupt — responsive.
-    try { await this.send(contact, accepted, wireId); }
-    catch (error) { this.logError(`request ${wireId} acceptance notice failed`, error); }
-
     const progressMs = this.options.config.progress_interval_ms;
     const startedAt = Date.now();
     let lastSeq = activityCursor;
     let phase: OwnerProgressPhase = queued.queuedBehind > 0
       ? 'waiting behind earlier requests' : 'starting request';
-    let progressTail = Promise.resolve();
     const timer = progressMs > 0 ? setInterval(() => {
       const events = this.options.session.eventsSince(lastSeq);
       lastSeq = Math.max(lastSeq, this.latestEventSeq(events));
@@ -364,7 +441,8 @@ export class OwnerChannel implements OwnerChannelHandle {
       const notice = ownerNotices.progress(
         Date.now() - startedAt, phase, started, completed, activityUpdates);
       // Preserve wire ordering if a progress send overlaps turn completion.
-      progressTail = progressTail.then(async () => { await this.send(contact, notice, wireId); })
+      active.outboundTail = active.outboundTail
+        .then(async () => { await this.send(active.contact, notice, active.wireId); })
         .catch(error => this.logError('progress notice failed', error));
     }, progressMs) : undefined;
     timer?.unref();
@@ -372,26 +450,32 @@ export class OwnerChannel implements OwnerChannelHandle {
     let result: TurnResult;
     try { result = await queued.completion; }
     finally { if (timer) clearInterval(timer); }
-    await progressTail;
+    active.finalizing = true;
+    await active.outboundTail;
 
     const output = result.output?.trim();
-    if (result.succeeded && output) await this.sendFinal(contact, output, wireId);
-    else if (result.succeeded) await this.send(contact,
-      ownerNotices.completedWithoutText(), wireId);
-    else await this.send(contact, ownerNotices.terminal(result.outcome), wireId);
-    if (result.succeeded) await this.sendAttachments(contact, outbox, wireId);
+    if (result.succeeded && output) await this.sendFinal(active.contact, output, active.wireId);
+    else if (result.succeeded) await this.send(active.contact,
+      ownerNotices.completedWithoutText(), active.wireId);
+    else await this.send(active.contact, ownerNotices.terminal(result.outcome), active.wireId);
+    if (result.succeeded) await this.sendAttachments(active.contact, outbox, active.wireId);
     else await rm(outbox, { recursive: true, force: true });
-    this.state.remember(wireId);
+    this.state.remember(active.wireId);
   }
 
   private ownerPrompt(
-    sender: { id: string; name: string }, text: string, wireId: string, outbox: string,
+    sender: { id: string; name: string }, text: string, wireId: string,
+    requestId: string, outbox: string,
   ): string {
     return [
       '[fleet-owner]',
       `Authenticated owner ${sender.name} (${sender.id}) sent owner-channel message ${wireId}.`,
       'Treat the following as a direct owner instruction. Answer in your final assistant response.',
       'Do not call ours send_message or send_file for this exchange: fleet routes the response reliably.',
+      'You may send a concise, high-level intermediate update through the bounded local primitive:',
+      `ours-fleet owner-channel update ${this.options.role} ${requestId} --phase <working|approval|blocked> --message-stdin`,
+      'Write only the update body to stdin. Use one plain-text sentence; never include reasoning, secrets, logs, commands, or raw tool output.',
+      'Distinct updates are allowed at most once every 5 seconds. Fleet preserves receipt/update/final ordering and chooses the authenticated recipient.',
       'To attach files to your response, copy each finished file directly into this fleet outbox:',
       outbox,
       'Fleet sends every regular file in that directory to the authenticated owner, correlated to this request.',
@@ -402,8 +486,12 @@ export class OwnerChannel implements OwnerChannelHandle {
   }
 
   private outboxDir(wireId: string): string {
-    const key = createHash('sha256').update(wireId).digest('hex');
+    const key = this.requestId(wireId);
     return join(this.options.stateDir, '.owner-channel-outbox', key);
+  }
+
+  private requestId(wireId: string): string {
+    return createHash('sha256').update(wireId).digest('hex');
   }
 
   private send(contact: string, text: string, replyTo: string): Promise<unknown> {

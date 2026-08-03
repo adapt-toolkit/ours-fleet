@@ -92,7 +92,9 @@ function acpStateDir(name: string): string | undefined {
 }
 
 const CONTACT_CID_RE = /^[A-Fa-f0-9]{64}$/;
+const OWNER_REQUEST_ID_RE = /^[a-f0-9]{64}$/;
 const MAX_INVITE_BYTES = 48 * 1024;
+const MAX_OWNER_UPDATE_BYTES = 1_024;
 
 function ownerChannelStateDir(roleName: string, configuration?: string): string {
   const role = findRole(loadConfig(configuration), roleName);
@@ -431,6 +433,29 @@ const ownerContactCommand = ownerChannelCommand.command('contact')
   .description('establish contacts without granting owner authority');
 const ownerAuthorizationCommand = ownerChannelCommand.command('owner')
   .description('manage the effective owner CID set (separate from contacts)');
+
+cOpt(ownerChannelCommand.command('update <Role> <request-id>')
+  .description('send one bounded agent-authored update for an active owner request')
+  .requiredOption('--phase <phase>', 'working, approval, or blocked')
+  .requiredOption('--message-stdin', 'read the one-line update body from stdin'))
+  .action(async (role, requestId, opts) => {
+    try {
+      if (!OWNER_REQUEST_ID_RE.test(requestId))
+        throw new Error('owner update request ID must be exactly 64 lowercase hexadecimal characters');
+      const phase = String(opts.phase);
+      if (!['working', 'approval', 'blocked'].includes(phase))
+        throw new Error('owner update phase must be working, approval, or blocked');
+      const message = readFileSync(0, 'utf8');
+      if (Buffer.byteLength(message) > MAX_OWNER_UPDATE_BYTES)
+        throw new Error(`owner update input exceeds ${MAX_OWNER_UPDATE_BYTES} bytes`);
+      const result = await manageOwnerChannel(role, opts.configuration, {
+        action: 'request_update', requestId,
+        phase: phase as 'working' | 'approval' | 'blocked', message,
+      });
+      if (result.action !== 'request_update') throw new Error('unexpected owner-channel response');
+      console.log(`Owner update ${result.sequence} delivered.`);
+    } catch (e) { die(e); }
+  });
 
 cOpt(ownerContactCommand.command('list <Role>')
   .description('list established/pending contacts using safe identity metadata only'))

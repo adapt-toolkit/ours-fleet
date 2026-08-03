@@ -398,12 +398,15 @@ describe('OwnerChannel notice presentation', () => {
       ownerNotices.deliveryFailed('Coordinator'),
       ownerNotices.progress(90_000, 'using tools', 4, 2, 1),
       ownerNotices.progress(120_000, 'using tools', 0, 0),
+      ownerNotices.authoredUpdate('working', 'Focused verification is running.'),
+      ownerNotices.authoredUpdate('approval', 'Permission is required to continue.'),
+      ownerNotices.authoredUpdate('blocked', 'An external dependency is unavailable.'),
       ownerNotices.completedWithoutText(), ownerNotices.terminal('completed'),
       ownerNotices.terminal('cancelled'), ownerNotices.terminal('refused'),
       ownerNotices.terminal('failed'), ownerNotices.terminal('inconclusive'),
       ownerNotices.chunk(1, 2),
     ];
-    expect(notices.every(text => /^(?:ℹ️|⏳|✅|🛑|⚠️|📊) /.test(text))).toBe(true);
+    expect(notices.every(text => /^(?:ℹ️|⏳|🔄|🔐|🚧|✅|🛑|⚠️|📊) /.test(text))).toBe(true);
     expect(notices.every(text => !text.includes('[fleet]'))).toBe(true);
   });
 

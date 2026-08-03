@@ -1,5 +1,7 @@
 import type { SessionSnapshot, TurnOutcome } from '../session/types.js';
 
+export type OwnerUpdatePhase = 'working' | 'approval' | 'blocked';
+
 export type OwnerProgressPhase =
   | 'starting request'
   | 'waiting behind earlier requests'
@@ -63,6 +65,14 @@ export const ownerNotices = {
       ? `${joinCounts(counts)} since the last update.`
       : 'no new reportable activity since the last update.';
     return `⏳ Working for ${duration(elapsedMs)} · ${phase} · ${activity}`;
+  },
+
+  authoredUpdate: (phase: OwnerUpdatePhase, message: string) => {
+    switch (phase) {
+      case 'working': return `🔄 Update: ${message}`;
+      case 'approval': return `🔐 Approval needed: ${message}`;
+      case 'blocked': return `🚧 Blocked: ${message}`;
+    }
   },
 
   completedWithoutText: () => '✅ Request completed, but the agent returned no text.',

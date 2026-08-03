@@ -499,7 +499,8 @@ channel identity. Add it to the control plane just like another contact, then
 message it directly.
 
 The running supervisor remains the only process which binds that identity.
-Operators manage it through the role's authenticated Unix control socket:
+Operators manage it, and an active agent turn emits bounded updates, through the
+role's authenticated Unix control socket:
 
 ```sh
 ours-fleet owner-channel contact list Coordinator
@@ -511,6 +512,9 @@ ours-fleet owner-channel contact add Coordinator --invite-stdin
 ours-fleet owner-channel owner list Coordinator
 ours-fleet owner-channel owner authorize Coordinator <exact-64-hex-contact-cid>
 ours-fleet owner-channel owner revoke Coordinator <exact-64-hex-contact-cid>
+
+# Used only from the active [fleet-owner] turn; body is stdin, never argv:
+ours-fleet owner-channel update Coordinator <request-id> --phase working --message-stdin
 ```
 
 Pairing is deliberately two-step. `contact add` accepts an invite and reports a
@@ -531,6 +535,35 @@ revoked.
 These commands require a running ACP role with `owner_channel` enabled. Missing,
 stopped, tmux, disabled, draining, and unavailable-MCP targets fail without
 starting a second client, binding an identity, or opening a network listener.
+
+An owner request follows one ordered lifecycle on its authenticated source wire:
+
+1. Fleet sends an immediate receipt describing started, queued, or interrupting state.
+2. Periodic fleet-generated summaries may report allowlisted ACP activity shapes.
+3. The agent may explicitly send multiple high-level updates with the per-request
+   ID injected into its prompt. Phases are `working`, `approval`, and `blocked`,
+   rendered as precise `🔄`, `🔐`, and `🚧` notices. The one-line body is limited
+   to 280 characters/1024 bytes, deduplicated, capped at 20, and rate-limited to
+   one every five seconds. Reasoning, secret-like material, raw logs/tool output,
+   control characters, and late or unknown request IDs are rejected.
+4. Fleet waits for accepted intermediate sends, then emits exactly one final ACP
+   response (or a sanitized terminal outcome). Successful turns send regular files
+   from the request outbox afterward, correlated to the same source wire.
+
+Fleet chooses the stored authenticated sender for every update; neither the CLI
+caller nor model supplies a recipient. Update audit logs contain only the hashed
+request ID prefix, phase, character count, sequence, and delivery result. Bodies
+remain memory-only and never enter the wire-ID state, authorization overlay, or
+logs. A crash therefore replays the deferred owner request instead of persisting
+an unfinished update body. `/interrupt` remains responsive and makes later
+updates for the cancelled request fail closed.
+
+For mobile onboarding, create or accept the contact first, wait until `contact
+list` reports it established, then authorize that exact CID. Authorization and
+revocation take effect immediately and the bounded mode-0600 CID overlay survives
+role/supervisor restarts; update bodies do not. After restart, the supervisor is
+still the sole channel binder and deferred unfinished requests retain the normal
+at-least-once replay contract.
 
 The two paths are deliberately simultaneous and have different authority:
 
