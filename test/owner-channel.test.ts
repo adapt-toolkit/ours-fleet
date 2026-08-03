@@ -119,7 +119,9 @@ describe('OwnerChannel', () => {
     expect(queuePrompt).toHaveBeenCalledOnce();
     expect(queuePrompt.mock.calls[0][0]).toContain('[fleet-owner]');
     expect(queuePrompt.mock.calls[0][0]).toContain('Ship it');
-    expect(queuePrompt.mock.calls[0][1]).toEqual({ interrupt: false });
+    expect(queuePrompt.mock.calls[0][1]).toMatchObject({
+      interrupt: false, origin: { kind: 'owner' },
+    });
     expect(client.calls).toContainEqual({ name: 'defer_messages', args: { msg_ids: [7] } });
     const sent = client.calls.filter(call => call.name === 'send_message');
     expect(sent.map(call => call.args)).toEqual([
@@ -152,7 +154,9 @@ describe('OwnerChannel', () => {
       msg_id: 13, wire_id: 'wire-preempt', from: { id: 'owner-cid' }, text: 'Right now please',
     }], undefined, { interrupt: true });
     await channel.drain();
-    expect(queuePrompt.mock.calls[0][1]).toEqual({ interrupt: true });
+    expect(queuePrompt.mock.calls[0][1]).toMatchObject({
+      interrupt: true, interruptSource: 'owner', origin: { kind: 'owner' },
+    });
     expect(client.calls.find(call => call.name === 'send_message')?.args).toEqual({
       contact: 'owner-cid',
       text: "ℹ️ Message received. The agent's previous task was interrupted to prioritize "
@@ -228,28 +232,29 @@ describe('OwnerChannel', () => {
     }
   });
 
-  it('distinguishes fleet-monitor interruption from authenticated owner cancellation', async () => {
-    const { channel, client, dir } = setup([
-      ownerMessage(39, 'wire-monitor-cancelled', 'Continue the owner task'),
-    ], {
-      accepted: true, outcome: 'cancelled', succeeded: false,
-      cancellationSource: 'fleet-monitor', detail: 'private internal wake detail',
-    });
-    await channel.drain();
-    await vi.waitFor(() => expect(readFileSync(join(dir, '.owner-channel-state.json'), 'utf8'))
-      .toContain('wire-monitor-cancelled'));
-    const sends = client.calls.filter(call => call.name === 'send_message');
-    expect(sends).toHaveLength(1);
-    expect(sends[0].args).toMatchObject({
-      contact: 'owner-cid', reply_to_wire_id: 'wire-monitor-cancelled',
-    });
-    expect(client.calls.some(call => String(call.args?.text).includes('cancelled'))).toBe(false);
+  it('distinguishes internal interruption from authenticated owner cancellation', async () => {
+    for (const [i, cancellationSource] of ['fleet-monitor', 'scheduled-loop', 'shutdown'].entries()) {
+      const wire = `wire-internal-cancelled-${i}`;
+      const { channel, client, dir } = setup([
+        ownerMessage(39 + i, wire, 'Continue the owner task'),
+      ], {
+        accepted: true, outcome: 'cancelled', succeeded: false,
+        cancellationSource, detail: 'private internal wake detail',
+      } as TurnResult);
+      await channel.drain();
+      await vi.waitFor(() => expect(readFileSync(join(dir, '.owner-channel-state.json'), 'utf8'))
+        .toContain(wire));
+      const sends = client.calls.filter(call => call.name === 'send_message');
+      expect(sends).toHaveLength(1);
+      expect(sends[0].args).toMatchObject({ contact: 'owner-cid', reply_to_wire_id: wire });
+      expect(client.calls.some(call => String(call.args?.text).includes('cancelled'))).toBe(false);
+    }
 
     const owner = setup([
-      ownerMessage(40, 'wire-owner-cancelled', 'Cancel this owner task'),
+      ownerMessage(45, 'wire-owner-cancelled', 'Cancel this owner task'),
     ], {
       accepted: true, outcome: 'cancelled', succeeded: false,
-      cancellationSource: 'user', detail: 'private user cancel detail',
+      cancellationSource: 'local-console', detail: 'private user cancel detail',
     });
     await owner.channel.drain();
     await vi.waitFor(() => expect(owner.client.calls).toContainEqual({
@@ -319,7 +324,9 @@ describe('OwnerChannel', () => {
 
     expect(queuePrompt).toHaveBeenCalledTimes(2);
     expect(queuePrompt.mock.calls[1][0]).toContain('New priority');
-    expect(queuePrompt.mock.calls[1][1]).toEqual({ interrupt: true });
+    expect(queuePrompt.mock.calls[1][1]).toMatchObject({
+      interrupt: true, interruptSource: 'owner', origin: { kind: 'owner' },
+    });
 
     firstTurn.resolve({ accepted: true, outcome: 'cancelled', succeeded: false });
     secondTurn.resolve({ accepted: true, outcome: 'completed', succeeded: true, output: 'New answer' });

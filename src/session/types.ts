@@ -8,7 +8,14 @@ export type SessionReadiness =
   | 'failed';
 
 export type TurnOutcome = 'completed' | 'refused' | 'cancelled' | 'failed' | 'inconclusive';
-export type TurnCancellationSource = 'user' | 'fleet-monitor';
+export type TurnCancellationSource =
+  | 'owner' | 'local-console' | 'fleet-monitor' | 'scheduled-loop' | 'shutdown';
+export type PromptOrigin =
+  | { kind: 'startup' }
+  | { kind: 'local-console' }
+  | { kind: 'owner'; requestId: string }
+  | { kind: 'fleet-monitor' }
+  | { kind: 'scheduled-loop'; loop: string; runId: string };
 
 /**
  * Two independent facts about one turn, deliberately kept apart:
@@ -62,6 +69,7 @@ export interface QueuedPrompt {
   promptId: string;
   /** Turns already queued ahead of this one. 0 means it starts immediately. */
   queuedBehind: number;
+  origin?: PromptOrigin;
   /** The turn's terminal result. Never rejects. */
   completion: Promise<TurnResult>;
 }
@@ -139,7 +147,9 @@ export interface SubmitPromptOptions {
   /** Cancel active work before delivering this prompt. */
   interrupt?: boolean;
   /** Internal provenance; ordinary callers must leave this unset. */
-  interruptSource?: 'fleet-monitor';
+  interruptSource?: TurnCancellationSource;
+  /** Typed in-process provenance. Text markers never grant this origin. */
+  origin?: PromptOrigin;
   /** Use the ACP steering extension when available; ignored by other backends. */
   steer?: boolean;
 }
@@ -178,6 +188,8 @@ export interface SessionEvent {
   title?: string;
   status?: string;
   stopReason?: string;
+  origin?: PromptOrigin;
+  cancellationSource?: TurnCancellationSource;
   options?: Array<{ optionId: string; name: string; kind: string }>;
   // ── settled permission events (status: 'completed') ────────────────────────
   /** What was decided. */
@@ -204,7 +216,7 @@ export interface SessionHandle {
   queuePrompt(text: string, options?: SubmitPromptOptions): Promise<QueuedPrompt>;
   /** Queue a prompt and wait for its terminal result. */
   submitPrompt(text: string, options?: SubmitPromptOptions): Promise<TurnResult>;
-  interrupt(): Promise<void>;
+  interrupt(source?: TurnCancellationSource): Promise<void>;
   respondPermission(permissionId: string, optionId: string): boolean;
   eventsSince(seq: number): SessionEvent[];
   subscribe(listener: (event: SessionEvent) => void): () => void;

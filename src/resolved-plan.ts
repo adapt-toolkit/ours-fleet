@@ -23,6 +23,12 @@ export function resolvedPlan(cfg: FleetConfig): Record<string, unknown> {
     startStaggerMs: cfg.startStaggerMs,
     diagnostics: cfg.diagnostics.map(diagnostic => ({ ...diagnostic })),
     roles: cfg.roles.map(resolvedRolePlan),
+    loops: cfg.loops.map(loop => sortedObject({
+      name: loop.name, selectors: [...loop.selectors], roles: [...loop.roleNames],
+      intervalMs: loop.intervalMs, initialDelayMs: loop.initialDelayMs, jitterMs: loop.jitterMs,
+      enabled: loop.enabled, sourceFile: loop.sourceFile,
+      prompt: { bytes: loop.promptBytes, sha256: loop.promptHash },
+    })),
     watchdogs: cfg.watchdogs.map(w => sortedObject({
       name: w.name, sourceFile: w.sourceFile, enabled: w.enabled,
       intervalMs: w.intervalMs, coordinator: w.coordinator, watch: [...w.watch],
@@ -65,6 +71,11 @@ export function resolvedRolePlan(role: ResolvedRole): Record<string, unknown> {
     },
     monitor: role.monitor,
     ownerChannel: role.owner_channel ?? null,
+    loops: (role.loops ?? []).map(loop => ({
+      name: loop.name, enabled: loop.enabled, intervalMs: loop.intervalMs,
+      initialDelayMs: loop.initialDelayMs, jitterMs: loop.jitterMs,
+      definitionHash: loop.definitionHash, prompt: { bytes: loop.promptBytes, sha256: loop.promptHash },
+    })),
     isolation: role.isolation ?? null,
     worklog: role.worklog ?? null,
     authProxy: role.auth_proxy ?? null,

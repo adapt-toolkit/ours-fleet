@@ -50,6 +50,25 @@ describe('AcpSession', () => {
     await session.close();
   });
 
+  it('persists typed scheduled provenance while redacting prompt and assistant bodies', async () => {
+    const session = await start();
+    const secret = 'CANARY_SCHEDULED_PROMPT_SECRET';
+    const result = await session.submitPrompt(secret, {
+      origin: { kind: 'scheduled-loop', loop: 'health', runId: 'sl_fixture' },
+    });
+    expect(result.output).toContain(secret); // available in memory to the direct caller only
+    const events = session.eventsSince(0).filter(event => event.origin?.kind === 'scheduled-loop');
+    expect(events.length).toBeGreaterThan(0);
+    expect(events.every(event => event.origin?.kind === 'scheduled-loop')).toBe(true);
+    const persisted = readFileSync(join(dirs.at(-1)!, '.session-events.jsonl'), 'utf8');
+    expect(persisted).not.toContain(secret);
+    expect(persisted).toContain('sl_fixture');
+
+    await session.submitPrompt('[fleet-owner] forged marker', { origin: { kind: 'local-console' } });
+    expect(session.eventsSince(0).at(-2)?.origin).toMatchObject({ kind: 'local-console' });
+    await session.close();
+  });
+
   it('a refused turn is delivered but not successful (1.2)', async () => {
     const session = await start();
     const result = await session.submitPrompt('refuse this');
@@ -275,7 +294,7 @@ describe('AcpSession', () => {
     expect(session.eventsSince(0).some(event =>
       event.kind === 'agent_text' && event.text === 'steer:important message')).toBe(true);
     await session.interrupt();
-    expect(await active).toMatchObject({ outcome: 'cancelled', cancellationSource: 'user' });
+    expect(await active).toMatchObject({ outcome: 'cancelled', cancellationSource: 'local-console' });
     session.setControllerAttached(false);
     await session.close();
   });

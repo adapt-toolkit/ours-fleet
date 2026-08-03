@@ -236,6 +236,9 @@ ours-fleet config [-c FILE]         validate + print merged plan
 ours-fleet ls | attach | peek | logs [-f] | status <Name>
 ours-fleet send <Name> "text" | --key <K>
 ours-fleet spawn [--temp] <Name> [--harness --session --mission --model --approval ...]
+ours-fleet loops validate|list|status
+ours-fleet loops reload <Role>
+ours-fleet loops run-now|disable|enable <Role> <Loop>
 ours-fleet rm <Name>
 ours-fleet doctor [--harness H]
 ours-fleet init
@@ -323,6 +326,17 @@ roles:
       fs: { read: [/opt/toolchains], write: [] }   # extra binds (state dir + cwd always included)
       resources: { mem: 2G, cpu: "1.5", pids: 512 }
       secrets: ["/host/tok:/run/secrets/tok"]      # host:container, mounted read-only
+
+loops:                                    # trusted local scheduled ACP turns
+  coordinator_pass:
+    roles: [FleetCoordinator]             # or ["*"] for permanent roles only
+    interval: 10m                         # 1m..30d
+    initial_delay: 10m                    # default: one full interval; explicit 0s is immediate
+    jitter: 30s                           # default 0; less than interval and at most 1h
+    enabled: true
+    prompt: |
+      Review current fleet state once. Unstick only actionable work.
+      If nothing material changed, complete silently without an owner report.
 ```
 
 Merge order: `fleet.yaml` ← `fleet.d/*.yaml`; a duplicate role name is a hard
@@ -333,6 +347,36 @@ contract. `defaults.harness_options` is shallow-merged with each
 role's `harness_options`, so a fleet can set common Codex permission/profile defaults
 and override individual keys per role. `monitor` merges the same way — a role block
 overrides `defaults.monitor` key-by-key.
+
+### Scheduled agent loops
+
+Top-level `loops` schedule literal prompts from trusted local YAML. Enabled targets
+must use `session: acp`; temporary roles never inherit loops, including `roles:
+["*"]`. Fleet rejects an enabled loop when its explicitly selected base config is
+a symlink, is owned by another user, or is group/world writable. Prompts are
+bounded and normalized at validation time, but only their size and SHA-256 appear
+in `config`, `list`, logs, or durable state.
+
+Each occurrence is idle-only. An owner, console, monitor, or earlier turn already
+using the role causes that occurrence to be recorded as `skipped_busy` and
+discarded. Missed ticks, races, and failures are likewise recorded once: there is
+no backlog, coalescing, catch-up turn, retry-on-idle, or cadence drift. The default
+first run is one full interval after startup; set `initial_delay: 0s` explicitly
+for an immediate first attempt. Restart recovery marks an in-flight run abandoned,
+skips overdue ticks, and resumes the fixed nominal cadence.
+
+Operational state is a mode-0600 `.scheduled-loops.json` in the permanent role's
+state directory. `disable` persists across restarts; `enable` cannot override
+`enabled: false` in YAML. `reload` re-reads the remembered trusted config through
+the authenticated private control socket. Prompt-only edits retain cadence;
+schedule or selector changes reset that loop to its configured initial delay.
+`run-now` still obeys idle-only admission and returns exit 3 when busy; an
+unavailable or uncertain control plane returns exit 2 and is never retried.
+
+A scheduled turn has typed internal provenance and no owner authority. It cannot
+cancel owner work and its ordinary completion is local only. Material proactive
+owner reporting remains possible solely through an already-open authenticated
+owner-channel task route; a no-op Coordinator pass should complete silently.
 
 ### Never-prompt failure
 

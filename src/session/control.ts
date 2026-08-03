@@ -8,6 +8,7 @@ import type { ControlFailureKind, SessionHandle } from './types.js';
 import type {
   OwnerChannelHandle, OwnerChannelManagementRequest,
 } from '../owner-channel/channel.js';
+import type { ScheduledLoopManagerHandle } from '../loops/manager.js';
 
 const MAX_LINE_BYTES = 64 * 1024;
 
@@ -15,7 +16,8 @@ export interface ControlRequest {
   version: 1 | 2;
   id: string;
   token: string;
-  command: 'status' | 'snapshot' | 'submit_prompt' | 'respond_permission' | 'interrupt' | 'follow' | 'events_since' | 'owner_channel_manage';
+  command: 'status' | 'snapshot' | 'submit_prompt' | 'respond_permission' | 'interrupt' | 'follow' | 'events_since' | 'owner_channel_manage'
+    | 'loop_status' | 'loop_run_now' | 'loop_disable' | 'loop_enable' | 'reload_config';
   text?: string;
   permissionId?: string;
   optionId?: string;
@@ -23,6 +25,7 @@ export interface ControlRequest {
   /** Existing clients omit this and remain interactive controllers. */
   controller?: boolean;
   ownerChannel?: OwnerChannelManagementRequest;
+  loop?: string;
 }
 
 export interface ControlResponse {
@@ -156,6 +159,8 @@ export class RoleControlServer {
   private readonly token: string;
   private readonly sockets = new Set<Socket>();
   private ownerChannel?: OwnerChannelHandle;
+  private loopManager?: ScheduledLoopManagerHandle;
+  private reloadConfig?: () => Promise<unknown>;
 
   constructor(
     stateDir: string,
@@ -193,6 +198,14 @@ export class RoleControlServer {
   /** Attach only the already-started supervisor-owned channel client. */
   setOwnerChannel(ownerChannel: OwnerChannelHandle | undefined): void {
     this.ownerChannel = ownerChannel;
+  }
+
+  setLoopManager(loopManager: ScheduledLoopManagerHandle | undefined): void {
+    this.loopManager = loopManager;
+  }
+
+  setConfigReloader(reloadConfig: (() => Promise<unknown>) | undefined): void {
+    this.reloadConfig = reloadConfig;
   }
 
   private accept(socket: Socket): void {
@@ -267,7 +280,9 @@ export class RoleControlServer {
           // Answer on QUEUE ACCEPTANCE, not on turn completion. A turn can run
           // for minutes; blocking here made every `send` into a busy agent time
           // out, and the timeout was then reported as a dead agent.
-          const queued = await this.session.queuePrompt(request.text);
+          const queued = await this.session.queuePrompt(request.text, {
+            origin: { kind: 'local-console' },
+          });
           this.write(socket, {
             version: 1, id: request.id, ok: true,
             result: {
@@ -289,9 +304,38 @@ export class RoleControlServer {
           return;
         }
         case 'interrupt':
-          await this.session.interrupt();
+          await this.session.interrupt('local-console');
           this.write(socket, { version: 1, id: request.id, ok: true });
           return;
+        case 'loop_status': {
+          if (!this.loopManager)
+            throw new SessionControlError('rejected', 'scheduled loops are unavailable for this role');
+          this.write(socket, { version: 1, id: request.id, ok: true, result: this.loopManager.status() });
+          return;
+        }
+        case 'loop_run_now':
+        case 'loop_disable':
+        case 'loop_enable': {
+          if (request.version !== 2 || !request.loop)
+            throw new SessionControlError('rejected', 'version 2 and loop name are required');
+          if (!this.loopManager)
+            throw new SessionControlError('rejected', 'scheduled loops are unavailable for this role');
+          const result = request.command === 'loop_run_now'
+            ? await this.loopManager.runNow(request.loop)
+            : request.command === 'loop_disable'
+              ? this.loopManager.disable(request.loop)
+              : this.loopManager.enable(request.loop);
+          this.write(socket, { version: 1, id: request.id, ok: true, result });
+          return;
+        }
+        case 'reload_config': {
+          if (request.version !== 2 || !this.reloadConfig)
+            throw new SessionControlError('rejected', 'config reload is unavailable for this role');
+          this.write(socket, {
+            version: 1, id: request.id, ok: true, result: await this.reloadConfig(),
+          });
+          return;
+        }
         case 'owner_channel_manage': {
           if (!request.ownerChannel || typeof request.ownerChannel.action !== 'string')
             throw new SessionControlError('rejected', 'owner-channel management action is required');
@@ -399,7 +443,7 @@ export async function controlRequest(
       socket.end();
     });
     socket.once('connect', () => socket.write(JSON.stringify({
-      version: 1, id, token, ...request,
+      version: 2, id, token, ...request,
     }) + '\n'));
   });
 }

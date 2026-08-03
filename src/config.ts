@@ -11,6 +11,8 @@ import { getAdapter } from './harness/registry.js';
 import type { IsolationConfig, WrapContext } from './isolation/types.js';
 import { resolveWatchdogs } from './watchdog/config.js';
 import type { ResolvedWatchdog } from './watchdog/config.js';
+import { resolveLoops } from './loops/config.js';
+import type { ResolvedLoop, ResolvedRoleLoop } from './loops/config.js';
 
 export interface OverseeEntry { role: string; interval: string }
 export interface WorklogPolicy {
@@ -209,6 +211,7 @@ export interface ResolvedRole extends Omit<RoleConfig, 'model' | 'owner_channel'
   owner_channel?: OwnerChannelConfig;
   worklog?: WorklogPolicy;
   auth_proxy?: AuthProxyConfig;
+  loops?: ResolvedRoleLoop[];
 }
 
 export interface FleetConfig {
@@ -221,6 +224,7 @@ export interface FleetConfig {
   /** Warning-first non-plain YAML migration diagnostics, in source order. */
   diagnostics: ConfigDiagnostic[];
   watchdogs: ResolvedWatchdog[];
+  loops: ResolvedLoop[];
 }
 
 export class ConfigError extends Error {}
@@ -397,6 +401,7 @@ export function loadConfig(
         worklog,
         auth_proxy: authProxy,
         env: Object.keys(env).length ? env : undefined,
+        loops: [],
       });
       // Forbidden-path enforcement (5.2): a mount that would breach the policy
       // is a configuration error, caught by `config` rather than at launch.
@@ -411,7 +416,12 @@ export function loadConfig(
   }
   validateOwnerChannelIdentities(roles);
   const watchdogs = resolveWatchdogs(baseDoc, base, roles, vars, defaults);
-  return { roles, vars, defaults, files, startStaggerMs, diagnostics, watchdogs };
+  const resolvedLoops = resolveLoops(baseDoc.loops, base, roles, vars);
+  for (const role of roles) role.loops = resolvedLoops.byRole.get(role.name) ?? [];
+  return {
+    roles, vars, defaults, files, startStaggerMs, diagnostics, watchdogs,
+    loops: resolvedLoops.loops,
+  };
 }
 
 export function resolveOwnerChannelConfig(

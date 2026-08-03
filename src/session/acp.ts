@@ -69,7 +69,10 @@ export class AcpSession implements SessionHandle {
   private steeringSupported = false;
   private capabilities?: acp.AgentCapabilities;
   private controllerCount = 0;
-  private activeTurn?: { id: string; output: string; cancellationSource?: TurnCancellationSource };
+  private activeTurn?: {
+    id: string; output: string; origin?: SubmitPromptOptions['origin'];
+    cancellationSource?: TurnCancellationSource;
+  };
 
   private constructor(
     private readonly options: AcpSessionOptions,
@@ -155,18 +158,18 @@ export class AcpSession implements SessionHandle {
   async queuePrompt(text: string, options: SubmitPromptOptions = {}): Promise<QueuedPrompt> {
     if (!this.sessionId || !this.isAlive())
       throw new SessionControlError('offline', this.lastError ?? 'ACP session is offline');
-    if (options.interrupt) await this.cancelActive(options.interruptSource ?? 'user');
+    if (options.interrupt) await this.cancelActive(options.interruptSource ?? 'local-console');
     // Interrupting delivery must still use steering when supported. With no
     // live turn, the extension starts one and acknowledges `startedNewTurn`
     // immediately; a normal session/prompt would keep the monitor blocked until
     // the entire wake-triggered turn terminated.
     if (options.steer && this.steeringSupported) {
       const promptId = randomUUID();
-      return { promptId, queuedBehind: 0, completion: this.steerPrompt(text) };
+      return { promptId, queuedBehind: 0, completion: this.steerPrompt(text), origin: options.origin };
     }
     const promptId = randomUUID();
     const queuedBehind = this.queueDepth++;
-    const run = this.promptTail.then(() => this.runPrompt(text, promptId));
+    const run = this.promptTail.then(() => this.runPrompt(text, promptId, options.origin));
     this.promptTail = run.then(() => undefined, () => undefined);
     const completion = run.then(
       result => { this.queueDepth = Math.max(0, this.queueDepth - 1); return result; },
@@ -175,7 +178,7 @@ export class AcpSession implements SessionHandle {
         return turnResult(false, 'failed', (error as Error)?.message ?? String(error));
       },
     );
-    return { promptId, queuedBehind, completion };
+    return { promptId, queuedBehind, completion, origin: options.origin };
   }
 
   async submitPrompt(text: string, options: SubmitPromptOptions = {}): Promise<TurnResult> {
@@ -187,15 +190,16 @@ export class AcpSession implements SessionHandle {
     }
   }
 
-  async interrupt(): Promise<void> {
-    await this.cancelActive('user');
+  async interrupt(source: TurnCancellationSource = 'local-console'): Promise<void> {
+    await this.cancelActive(source);
   }
 
   private async cancelActive(source: TurnCancellationSource): Promise<void> {
     if (!this.sessionId) return;
     const active = this.activeTurn;
     const previousSource = active?.cancellationSource;
-    if (active && (source === 'user' || !previousSource)) active.cancellationSource = source;
+    if (active && (source === 'owner' || source === 'local-console' || !previousSource))
+      active.cancellationSource = source;
     try {
       await this.connection.agent.notify(
         acp.methods.agent.session.cancel, { sessionId: this.sessionId });
@@ -217,6 +221,7 @@ export class AcpSession implements SessionHandle {
     pending.resolve({ outcome: { outcome: 'selected', optionId } });
     this.events.emit('permission', {
       turnId: this.activeTurn?.id,
+      origin: this.activeTurn?.origin,
       permissionId,
       status: 'completed',
       decision: chosen.kind.startsWith('reject') ? 'denied' : 'allowed',
@@ -299,19 +304,25 @@ export class AcpSession implements SessionHandle {
     this.events.emit('state', { status: 'idle', text: `ACP session ${this.sessionId}` });
   }
 
-  private async runPrompt(text: string, turnId: string = randomUUID()): Promise<TurnResult> {
+  private async runPrompt(
+    text: string, turnId: string = randomUUID(), origin?: SubmitPromptOptions['origin'],
+  ): Promise<TurnResult> {
     if (!this.sessionId || !this.isAlive())
       return turnResult(false, 'failed', this.lastError ?? 'ACP session is offline');
     this.readiness = 'running';
-    this.activeTurn = { id: turnId, output: '' };
-    this.events.emit('state', { turnId, status: 'running' });
+    this.activeTurn = { id: turnId, output: '', origin };
+    this.events.emit('state', { turnId, status: 'running', origin });
     try {
       const response = await this.connection.agent.request(acp.methods.agent.session.prompt, {
         sessionId: this.sessionId,
         prompt: [{ type: 'text', text }],
       });
       this.readiness = 'idle';
-      this.events.emit('turn_stop', { turnId, stopReason: response.stopReason });
+      this.events.emit('turn_stop', {
+        turnId, stopReason: response.stopReason, origin,
+        cancellationSource: this.activeTurn?.id === turnId
+          ? this.activeTurn.cancellationSource : undefined,
+      });
       this.events.emit('state', { status: 'idle' });
       // The prompt was accepted either way — the agent answered. Whether the
       // turn SUCCEEDED is a separate question, and only `stopReason` answers it.
@@ -320,9 +331,13 @@ export class AcpSession implements SessionHandle {
         this.activeTurn?.id === turnId ? this.activeTurn.output : undefined,
         this.activeTurn?.id === turnId ? this.activeTurn.cancellationSource : undefined);
     } catch (error) {
-      this.lastError = (error as Error)?.message ?? String(error);
+      const detail = (error as Error)?.message ?? String(error);
+      this.lastError = origin?.kind === 'scheduled-loop' ? 'scheduled-loop turn failed' : detail;
       this.readiness = this.isAlive() ? 'idle' : 'failed';
-      this.events.emit('error', { turnId, text: this.lastError });
+      this.events.emit('error', {
+        turnId, origin,
+        text: origin?.kind === 'scheduled-loop' ? 'scheduled-loop turn failed' : this.lastError,
+      });
       if (this.isAlive()) this.events.emit('state', { status: 'idle' });
       return turnResult(
         false, 'failed', this.lastError,
@@ -389,12 +404,17 @@ export class AcpSession implements SessionHandle {
     this.readiness = 'awaiting_permission';
     this.events.emit('permission', {
       turnId: this.activeTurn?.id,
+      origin: this.activeTurn?.origin,
       permissionId,
-      toolCallId: params.toolCall.toolCallId,
-      title: params.toolCall.title ?? 'Permission requested',
+      toolCallId: this.activeTurn?.origin?.kind === 'scheduled-loop'
+        ? 'scheduled-loop-tool' : params.toolCall.toolCallId,
+      title: this.activeTurn?.origin?.kind === 'scheduled-loop'
+        ? 'Scheduled-loop permission requested' : params.toolCall.title ?? 'Permission requested',
       status: 'pending',
       options: params.options.map(option => ({
-        optionId: option.optionId, name: option.name, kind: option.kind,
+        optionId: option.optionId,
+        name: this.activeTurn?.origin?.kind === 'scheduled-loop' ? option.kind : option.name,
+        kind: option.kind,
       })),
     });
     return new Promise(resolve => {
@@ -417,16 +437,23 @@ export class AcpSession implements SessionHandle {
     const settled: PermissionDecision = option ? decision : 'cancelled';
     this.events.emit('permission', {
       turnId: this.activeTurn?.id,
+      origin: this.activeTurn?.origin,
       permissionId: randomUUID(),
-      toolCallId: params.toolCall.toolCallId,
-      title: params.toolCall.title ?? 'Permission requested',
+      toolCallId: this.activeTurn?.origin?.kind === 'scheduled-loop'
+        ? 'scheduled-loop-tool' : params.toolCall.toolCallId,
       status: 'completed',
       decision: settled,
       decisionSource: 'automatic',
       policy,
       reason: option ? reason : `${reason}, but the agent offered no matching option`,
       optionId: option?.optionId,
-      options: params.options.map(o => ({ optionId: o.optionId, name: o.name, kind: o.kind })),
+      title: this.activeTurn?.origin?.kind === 'scheduled-loop'
+        ? 'Scheduled-loop permission requested' : params.toolCall.title ?? 'Permission requested',
+      options: params.options.map(o => ({
+        optionId: o.optionId,
+        name: this.activeTurn?.origin?.kind === 'scheduled-loop' ? o.kind : o.name,
+        kind: o.kind,
+      })),
     });
     return option
       ? { outcome: { outcome: 'selected', optionId: option.optionId } }
@@ -448,34 +475,41 @@ export class AcpSession implements SessionHandle {
   }
 
   private recordUpdate(update: acp.SessionUpdate): void {
+    const scheduled = this.activeTurn?.origin?.kind === 'scheduled-loop';
     switch (update.sessionUpdate) {
       case 'agent_message_chunk':
         if (this.activeTurn && update.content.type === 'text')
           this.activeTurn.output += update.content.text;
         this.events.emit('agent_text', {
           turnId: this.activeTurn?.id,
-          text: update.content.type === 'text' ? update.content.text : `[${update.content.type}]`,
+          origin: this.activeTurn?.origin,
+          text: scheduled ? '[scheduled-loop output redacted]'
+            : update.content.type === 'text' ? update.content.text : `[${update.content.type}]`,
         });
         break;
       case 'agent_thought_chunk':
         this.events.emit('thought', {
           turnId: this.activeTurn?.id,
-          text: update.content.type === 'text' ? update.content.text : `[${update.content.type}]`,
+          origin: this.activeTurn?.origin,
+          text: scheduled ? '[scheduled-loop thought redacted]'
+            : update.content.type === 'text' ? update.content.text : `[${update.content.type}]`,
         });
         break;
       case 'tool_call':
         this.events.emit('tool_call', {
           turnId: this.activeTurn?.id,
-          toolCallId: update.toolCallId,
-          title: update.title,
+          origin: this.activeTurn?.origin,
+          toolCallId: scheduled ? 'scheduled-loop-tool' : update.toolCallId,
+          title: scheduled ? 'scheduled-loop tool' : update.title,
           status: update.status,
         });
         break;
       case 'tool_call_update':
         this.events.emit('tool_update', {
           turnId: this.activeTurn?.id,
-          toolCallId: update.toolCallId,
-          title: update.title ?? undefined,
+          origin: this.activeTurn?.origin,
+          toolCallId: scheduled ? 'scheduled-loop-tool' : update.toolCallId,
+          title: scheduled ? 'scheduled-loop tool' : update.title ?? undefined,
           status: update.status ?? undefined,
         });
         break;

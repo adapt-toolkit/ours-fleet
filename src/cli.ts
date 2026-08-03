@@ -37,6 +37,8 @@ import {
 } from './session/control.js';
 import { SessionControlError } from './session/types.js';
 import type { SessionEvent } from './session/types.js';
+import { readScheduledLoops } from './loops/state.js';
+import type { LoopActionResult } from './loops/manager.js';
 import type {
   OwnerChannelManagementRequest, OwnerChannelManagementResult,
 } from './owner-channel/channel.js';
@@ -234,6 +236,15 @@ cOpt(program.command('config').description('validate + print the merged plan (no
           if (w.isolation) console.log(`  isolation: ${JSON.stringify(w.isolation)}`);
         }
       }
+      if (cfg.loops.length) {
+        console.log('loops:');
+        for (const loop of cfg.loops) {
+          console.log(`● ${loop.name}${loop.enabled ? '' : '  (disabled)'}`);
+          console.log(`  every ${formatDuration(loop.intervalMs)} initial=${formatDuration(loop.initialDelayMs)} jitter=${formatDuration(loop.jitterMs)}`);
+          console.log(`  roles: ${loop.roleNames.join(', ')}`);
+          console.log(`  prompt: ${loop.promptBytes} bytes sha256=${loop.promptHash.slice(0, 12)}`);
+        }
+      }
     } catch (e) { die(e); }
   });
 
@@ -424,7 +435,165 @@ program.command('status <name>').description('unit/agent state')
         if (response.ok) console.log(`session: ${JSON.stringify(response.result)}`);
       } catch { console.log('session: acp control unavailable'); }
     }
+    const loopState = readScheduledLoops(agentDir(name));
+    if (loopState) {
+      const values = Object.values(loopState.loops);
+      const enabled = values.filter(loop => loop.enabled && !loop.operatorDisabled).length;
+      const next = values.filter(loop => loop.enabled && !loop.operatorDisabled)
+        .map(loop => Date.parse(loop.nextDueAt)).filter(Number.isFinite).sort((a, b) => a - b)[0];
+      console.log(`loops: ${enabled} enabled${next ? `, next ${formatDuration(Math.max(0, next - Date.now()))}` : ''}, ${loopState.health}`);
+    }
   });
+
+const loopsCommand = program.command('loops')
+  .description('validate, inspect, and control strict idle-only scheduled agent loops');
+
+function loopFailure(error: unknown, json: boolean, code = 1): void {
+  const err = error instanceof SessionControlError ? error : undefined;
+  const message = error instanceof Error ? error.message : String(error);
+  if (json) console.log(JSON.stringify({
+    schemaVersion: 1, ok: false,
+    error: { kind: err?.kind ?? 'invalid', message, retrySafe: err?.kind !== 'timeout' },
+  }));
+  else console.error(message);
+  process.exitCode = code;
+}
+
+function permanentLoopControlDir(role: string): string | undefined {
+  const dir = agentDir(role);
+  return existsSync(controlSocketPath(dir)) ? dir : undefined;
+}
+
+cOpt(loopsCommand.command('validate').description('validate loop config and expanded ACP targets'))
+  .option('--json', 'emit stable JSON')
+  .action(opts => {
+    try {
+      const cfg = loadConfig(opts.configuration);
+      const result = { schemaVersion: 1, ok: true, loops: cfg.loops.length,
+        pairs: cfg.roles.reduce((sum, role) => sum + (role.loops?.length ?? 0), 0) };
+      if (opts.json) console.log(JSON.stringify(result));
+      else console.log(`valid: ${result.loops} loop(s), ${result.pairs} resolved role pair(s)`);
+    } catch (error) { loopFailure(error, opts.json === true); }
+  });
+
+cOpt(loopsCommand.command('list').description('list redacted resolved loop definitions'))
+  .option('--role <role>', 'filter to one permanent role')
+  .option('--json', 'emit stable JSON')
+  .action(opts => {
+    try {
+      const cfg = loadConfig(opts.configuration);
+      if (opts.role) findRole(cfg, opts.role);
+      const values = cfg.loops.filter(loop => !opts.role || loop.roleNames.includes(opts.role)).map(loop => ({
+        name: loop.name, selectors: loop.selectors, roles: loop.roleNames,
+        enabled: loop.enabled, intervalMs: loop.intervalMs, initialDelayMs: loop.initialDelayMs,
+        jitterMs: loop.jitterMs, prompt: { bytes: loop.promptBytes, sha256: loop.promptHash },
+        sourceFile: loop.sourceFile,
+      }));
+      if (opts.json) console.log(JSON.stringify({ schemaVersion: 1, loops: values }));
+      else for (const loop of values)
+        console.log(`${loop.name} ${loop.enabled ? 'enabled' : 'disabled'} every=${formatDuration(loop.intervalMs)} roles=${loop.roles.join(',')} prompt=${loop.prompt.bytes}B/${loop.prompt.sha256.slice(0, 12)}`);
+    } catch (error) { loopFailure(error, opts.json === true); }
+  });
+
+function selectLoopConfig(configuration: string | undefined, roleName: string, loopName?: string) {
+  const cfg = loadConfig(configuration);
+  const role = findRole(cfg, roleName);
+  const definitions = role.loops ?? [];
+  if (loopName && !definitions.some(loop => loop.name === loopName))
+    throw new Error(`role '${roleName}' has no scheduled loop '${loopName}'`);
+  return { role, definitions };
+}
+
+function renderLoopRows(role: string, state: ReturnType<typeof readScheduledLoops>, loop?: string): string[] {
+  if (!state) return [];
+  return Object.entries(state.loops).filter(([name]) => !loop || name === loop).map(([name, item]) =>
+    `${role}/${name} ${item.enabled && !item.operatorDisabled ? 'enabled' : 'disabled'} `
+      + `${item.activeRunId ? 'running' : 'idle'} next=${item.nextDueAt} last=${item.lastOutcome ?? 'never'} `
+      + `counts=${item.counts.started}/${item.counts.completed}/${item.counts.failed} `
+      + `skip=${item.counts.skipped}(busy=${item.counts.skippedBusy},missed=${item.counts.skippedMissed})`);
+}
+
+cOpt(loopsCommand.command('status [role] [loop]').description('show live or stored loop state'))
+  .option('--json', 'emit stable JSON')
+  .action(async (roleName, loopName, opts) => {
+    try {
+      const cfg = loadConfig(opts.configuration);
+      const roles = roleName ? [findRole(cfg, roleName)] : cfg.roles.filter(role => role.loops?.length);
+      if (roleName && loopName) selectLoopConfig(opts.configuration, roleName, loopName);
+      const results = [];
+      for (const role of roles) {
+        let state = readScheduledLoops(agentDir(role.name));
+        let evidence = 'stored';
+        const live = permanentLoopControlDir(role.name);
+        if (live) try {
+          const response = await controlRequest(live, { command: 'loop_status' }, 2_000);
+          if (response.ok) { state = response.result as typeof state; evidence = 'live'; }
+        } catch { /* stored evidence remains honest; timeout is not offline */ }
+        results.push({ role: role.name, evidence, state });
+      }
+      if (opts.json) console.log(JSON.stringify({ schemaVersion: 1, roles: results }));
+      else {
+        const rows = results.flatMap(result => renderLoopRows(result.role, result.state, loopName)
+          .map(row => `${row} evidence=${result.evidence}`));
+        console.log(rows.join('\n') || '(no scheduled loop state)');
+      }
+    } catch (error) { loopFailure(error, opts.json === true); }
+  });
+
+cOpt(loopsCommand.command('reload <role>').description('reload trusted scheduled-loop config in a live ACP role'))
+  .option('--json', 'emit stable JSON')
+  .action(async (roleName, opts) => {
+    try {
+      const { role } = selectLoopConfig(opts.configuration, roleName);
+      if (role.session !== 'acp') throw new Error(`role '${roleName}' is not ACP-compatible`);
+      const stateDir = permanentLoopControlDir(roleName);
+      if (!stateDir) throw new SessionControlError('control-unavailable',
+        `role '${roleName}' has no live authenticated ACP control socket`);
+      const response = await controlRequest(stateDir, { command: 'reload_config' });
+      if (!response.ok)
+        throw new SessionControlError(response.kind ?? 'backend', response.error ?? 'config reload failed');
+      const result = response.result as { changed: boolean; loops: number };
+      if (opts.json) console.log(JSON.stringify({ schemaVersion: 1, ok: true, role: roleName, ...result }));
+      else console.log(`${roleName}: ${result.changed ? 'reloaded' : 'unchanged'} (${result.loops} loops)`);
+    } catch (error) {
+      loopFailure(error, opts.json === true,
+        error instanceof SessionControlError
+          && ['timeout', 'control-unavailable'].includes(error.kind) ? 2 : 1);
+    }
+  });
+
+for (const command of ['run-now', 'disable', 'enable'] as const) {
+  cOpt(loopsCommand.command(`${command} <role> <loop>`)
+    .description(`${command} one trusted configured loop through the live private control socket`))
+    .option('--json', 'emit stable JSON')
+    .action(async (roleName, loopName, opts) => {
+      try {
+        const { role, definitions } = selectLoopConfig(opts.configuration, roleName, loopName);
+        if (role.session !== 'acp') throw new Error(`role '${roleName}' is not ACP-compatible`);
+        const definition = definitions.find(loop => loop.name === loopName)!;
+        if (command === 'enable' && !definition.enabled)
+          throw new Error(`loop '${loopName}' is disabled in YAML; edit the config before enabling it`);
+        const stateDir = permanentLoopControlDir(roleName);
+        if (!stateDir) throw new SessionControlError('control-unavailable',
+          `role '${roleName}' has no live authenticated ACP control socket`);
+        const response = await controlRequest(stateDir, {
+          command: command === 'run-now' ? 'loop_run_now'
+            : command === 'disable' ? 'loop_disable' : 'loop_enable',
+          loop: loopName,
+        });
+        if (!response.ok)
+          throw new SessionControlError(response.kind ?? 'backend', response.error ?? 'loop control failed');
+        const result = response.result as LoopActionResult;
+        if (opts.json) console.log(JSON.stringify({ schemaVersion: 1, ok: true, role: roleName, loop: loopName, ...result }));
+        else console.log(`${roleName}/${loopName}: ${result.state}${result.runId ? ` ${result.runId}` : ''}`);
+        if (command === 'run-now' && result.state !== 'started') process.exitCode = 3;
+      } catch (error) {
+        loopFailure(error, opts.json === true,
+          error instanceof SessionControlError
+            && ['timeout', 'control-unavailable'].includes(error.kind) ? 2 : 1);
+      }
+    });
+}
 
 const ownerChannelCommand = program.command('owner-channel')
   .description('manage owner routing and task-correlated reports through a running role supervisor')

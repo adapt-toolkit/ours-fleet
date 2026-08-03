@@ -589,7 +589,11 @@ export class OwnerChannel implements OwnerChannelHandle {
       const activityCursor = this.latestEventSeq(this.options.session.eventsSince(0));
       const queued = await this.options.session.queuePrompt(
         this.ownerAttachmentPrompt(sender, originWireId, requestId, outbox, admitted, group.caption),
-        { interrupt: this.options.config.interrupt });
+        {
+          interrupt: this.options.config.interrupt,
+          ...(this.options.config.interrupt ? { interruptSource: 'owner' as const } : {}),
+          origin: { kind: 'owner', requestId },
+        });
       const accepted = this.options.config.interrupt
         ? ownerNotices.receivedInterrupting()
         : queued.queuedBehind > 0
@@ -658,7 +662,7 @@ export class OwnerChannel implements OwnerChannelHandle {
     }
     if (text.toLowerCase() === '/interrupt') {
       try {
-        await this.options.session.interrupt();
+        await this.options.session.interrupt('owner');
       } catch (error) {
         this.logError('interrupt failed', error);
         await this.send(sender.id, ownerNotices.interruptFailed(this.options.role), wireId);
@@ -679,6 +683,8 @@ export class OwnerChannel implements OwnerChannelHandle {
       queued = await this.options.session.queuePrompt(
         this.ownerPrompt(sender, text, wireId, requestId, outbox), {
         interrupt: this.options.config.interrupt,
+        ...(this.options.config.interrupt ? { interruptSource: 'owner' as const } : {}),
+        origin: { kind: 'owner', requestId },
       });
     } catch (error) {
       await rm(outbox, { recursive: true, force: true });
@@ -753,9 +759,10 @@ export class OwnerChannel implements OwnerChannelHandle {
     if (result.succeeded && output) await this.sendFinal(active.contact, output, active.wireId);
     else if (result.succeeded) await this.send(active.contact,
       ownerNotices.completedWithoutText(), active.wireId);
-    else if (result.outcome === 'cancelled' && result.cancellationSource === 'fleet-monitor')
+    else if (result.outcome === 'cancelled'
+        && ['fleet-monitor', 'scheduled-loop', 'shutdown'].includes(result.cancellationSource ?? ''))
       this.options.log(`[${this.options.role}] owner request ${active.requestId.slice(0, 12)} `
-        + 'interrupted by fleet monitor; owner cancellation notice suppressed');
+        + `interrupted internally (${result.cancellationSource}); owner cancellation notice suppressed`);
     else await this.send(active.contact, ownerNotices.terminal(result.outcome), active.wireId);
     if (result.succeeded) await this.sendAttachments(active.contact, outbox, active.wireId);
     else await rm(outbox, { recursive: true, force: true });
