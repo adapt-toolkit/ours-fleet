@@ -84,7 +84,31 @@ export interface OwnerChannelConfig {
   interrupt: boolean;
   /** Deterministic in-progress notice interval; 0 disables progress notices. */
   progress_interval_ms: number;
+  attachments: OwnerAttachmentConfig;
 }
+
+export interface OwnerAttachmentConfig {
+  enabled: boolean;
+  max_files_per_request: number;
+  max_file_bytes: number;
+  max_request_bytes: number;
+  retention_ms: number;
+  allowed_mime: string[];
+}
+
+export type OwnerChannelConfigInput = Omit<Partial<OwnerChannelConfig>, 'attachments'> & {
+  attachments?: Partial<OwnerAttachmentConfig>;
+};
+
+export const DEFAULT_OWNER_ATTACHMENT_MIME = [
+  'application/pdf', 'application/json', 'text/plain',
+  'image/png', 'image/jpeg', 'image/gif', 'image/webp',
+  'audio/ogg', 'audio/mpeg', 'audio/wav', 'audio/x-wav', 'audio/mp4', 'audio/webm',
+  'application/msword', 'application/vnd.ms-excel', 'application/vnd.ms-powerpoint',
+  'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+  'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+  'application/vnd.openxmlformats-officedocument.presentationml.presentation',
+] as const;
 
 /** Default wake sources when a role does not list its own (design §2). */
 export const DEFAULT_WAKE_SOURCES: NotifyEventType[] =
@@ -161,7 +185,7 @@ export interface RoleConfig {
   harness_options?: Record<string, unknown>;
   isolation?: IsolationConfig;
   monitor?: Partial<MonitorConfig>;
-  owner_channel?: Partial<OwnerChannelConfig>;
+  owner_channel?: OwnerChannelConfigInput;
   worklog?: WorklogPolicy;
   auth_proxy?: Partial<AuthProxyConfig>;
 }
@@ -391,7 +415,7 @@ export function loadConfig(
 }
 
 export function resolveOwnerChannelConfig(
-  defaults: unknown, role: Partial<OwnerChannelConfig> | undefined,
+  defaults: unknown, role: OwnerChannelConfigInput | undefined,
   session: SessionBackendId, file = 'config', name = 'role',
 ): OwnerChannelConfig | undefined {
   if (defaults === undefined && role === undefined) return undefined;
@@ -399,11 +423,12 @@ export function resolveOwnerChannelConfig(
     throw new ConfigError(`${file}: defaults.owner_channel must be a map`);
   if (role !== undefined && !isPlainObject(role))
     throw new ConfigError(`${file}: role '${name}' owner_channel must be a map`);
+  const defaultInput = (defaults ?? {}) as OwnerChannelConfigInput;
   const merged = {
-    ...((defaults ?? {}) as Partial<OwnerChannelConfig>),
+    ...defaultInput,
     ...(role ?? {}),
   };
-  const allowed = ['identity', 'owners', 'interrupt', 'progress_interval_ms'];
+  const allowed = ['identity', 'owners', 'interrupt', 'progress_interval_ms', 'attachments'];
   const bad = Object.keys(merged).filter(key => !allowed.includes(key));
   if (bad.length)
     throw new ConfigError(`${file}: role '${name}' owner_channel: unknown key(s) ${bad.join(', ')}`);
@@ -422,6 +447,49 @@ export function resolveOwnerChannelConfig(
         || !Number.isFinite(merged.progress_interval_ms) || merged.progress_interval_ms < 0))
     throw new ConfigError(
       `${file}: role '${name}' owner_channel.progress_interval_ms must be a non-negative number`);
+  if (defaultInput.attachments !== undefined && !isPlainObject(defaultInput.attachments))
+    throw new ConfigError(`${file}: defaults.owner_channel.attachments must be a map`);
+  if (role?.attachments !== undefined && !isPlainObject(role.attachments))
+    throw new ConfigError(`${file}: role '${name}' owner_channel.attachments must be a map`);
+  const attachments = {
+    ...(defaultInput.attachments ?? {}), ...(role?.attachments ?? {}),
+  } as Partial<OwnerAttachmentConfig>;
+  const attachmentKeys = [
+    'enabled', 'max_files_per_request', 'max_file_bytes', 'max_request_bytes',
+    'retention_ms', 'allowed_mime',
+  ];
+  const badAttachmentKeys = Object.keys(attachments)
+    .filter(key => !attachmentKeys.includes(key));
+  if (badAttachmentKeys.length)
+    throw new ConfigError(
+      `${file}: role '${name}' owner_channel.attachments: unknown key(s) ${badAttachmentKeys.join(', ')}`);
+  if (attachments.enabled !== undefined && typeof attachments.enabled !== 'boolean')
+    throw new ConfigError(`${file}: role '${name}' owner_channel.attachments.enabled must be true or false`);
+  const boundedInteger = (key: keyof OwnerAttachmentConfig, min: number, max: number) => {
+    const value = attachments[key];
+    if (value !== undefined && (typeof value !== 'number' || !Number.isSafeInteger(value)
+        || value < min || value > max))
+      throw new ConfigError(
+        `${file}: role '${name}' owner_channel.attachments.${key} must be an integer from ${min} to ${max}`);
+  };
+  boundedInteger('max_files_per_request', 1, 32);
+  boundedInteger('max_file_bytes', 1, 100 * 1024 * 1024);
+  boundedInteger('max_request_bytes', 1, 256 * 1024 * 1024);
+  boundedInteger('retention_ms', 60_000, 30 * 24 * 60 * 60 * 1_000);
+  const maxFileBytes = attachments.max_file_bytes ?? 10 * 1024 * 1024;
+  const maxRequestBytes = attachments.max_request_bytes ?? 20 * 1024 * 1024;
+  if (maxRequestBytes < maxFileBytes)
+    throw new ConfigError(
+      `${file}: role '${name}' owner_channel.attachments.max_request_bytes must be at least max_file_bytes`);
+  const allowedMime = attachments.allowed_mime ?? [...DEFAULT_OWNER_ATTACHMENT_MIME];
+  if (!Array.isArray(allowedMime) || allowedMime.length < 1 || allowedMime.length > 64
+      || allowedMime.some(mime => typeof mime !== 'string'
+        || !/^[a-z0-9][a-z0-9!#$&^_.+-]*\/[a-z0-9][a-z0-9!#$&^_.+-]*$/.test(mime)))
+    throw new ConfigError(
+      `${file}: role '${name}' owner_channel.attachments.allowed_mime must contain 1-64 lowercase MIME types`);
+  if (new Set(allowedMime).size !== allowedMime.length)
+    throw new ConfigError(
+      `${file}: role '${name}' owner_channel.attachments.allowed_mime must not contain duplicates`);
   if (session !== 'acp')
     throw new ConfigError(
       `${file}: role '${name}' owner_channel requires session: acp for correlated final replies`);
@@ -430,6 +498,14 @@ export function resolveOwnerChannelConfig(
     owners,
     interrupt: merged.interrupt ?? false,
     progress_interval_ms: merged.progress_interval_ms ?? 30_000,
+    attachments: {
+      enabled: attachments.enabled ?? true,
+      max_files_per_request: attachments.max_files_per_request ?? 4,
+      max_file_bytes: maxFileBytes,
+      max_request_bytes: maxRequestBytes,
+      retention_ms: attachments.retention_ms ?? 24 * 60 * 60 * 1_000,
+      allowed_mime: [...allowedMime],
+    },
   };
 }
 

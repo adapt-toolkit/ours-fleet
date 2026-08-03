@@ -51,6 +51,8 @@ export const ownerNotices = {
 
   interrupted: (role: string) => `🛑 Interrupt sent to ${role}'s active turn.`,
   interruptFailed: (role: string) => `⚠️ Could not interrupt ${role}'s active turn.`,
+  attachmentRejected: (reason: string) => `⚠️ Attachment rejected: ${reason}.`,
+  attachmentFailed: () => '⚠️ Could not securely retrieve or admit this attachment request.',
   deliveryFailed: (role: string) => `⚠️ Could not deliver this request to ${role}.`,
 
   progress: (

@@ -357,6 +357,13 @@ owner_channel:
   owners: [authenticated-owner-contact-cid]
   interrupt: false
   progress_interval_ms: 30000
+  attachments:
+    enabled: true
+    max_files_per_request: 4
+    max_file_bytes: 10485760
+    max_request_bytes: 20971520
+    retention_ms: 86400000
+    allowed_mime: [application/pdf, text/plain, image/png, audio/ogg]
 \`\`\`
 
 This does not replace the role identity. Normal identity mail remains untrusted
@@ -371,6 +378,24 @@ file from the channel identity with the same source wire ID and removes the
 temporary outbox only after successful delivery. The agent never chooses a
 recipient or calls ours \`send_file\` for an owner-channel response.
 Exact \`/status\` and \`/interrupt\` commands bypass the model.
+
+Owner documents, images, and voice messages use the same authenticated sender
+and source-wire boundary. Fleet inspects body-free metadata first and rejects
+disabled, over-count, over-size, or disallowed-MIME requests before selective
+retrieval. Unauthorized CIDs are never retrieved or answered. Reply-linked text
+and files from the same sender become one ordered request; a file-only wake also
+starts a turn. Retrieved bytes must match their structured size and SHA-256,
+their content signature must match the declared MIME, and symlinks or non-regular
+paths fail closed. Sanitized copies live only in a mode-0700 request directory as
+mode-0600 files and are removed after completion or bounded stale retention.
+
+Voice prompts include a bounded transcript only when ours-mcp reports success.
+Failure or unavailability is explicit and preserves the private audio path as the
+fallback. Run \`ours-mcp voice-status --json\` to inspect the host configuration.
+A mode-0600 crash journal contains only authenticated CID and wire routing data;
+it never stores captions, filenames, paths, transcript text, or bytes. Journaled
+post-retrieval files resume selectively through \`save_file\`; corrupt state
+disables attachment admission rather than weakening provenance checks.
 
 The channel identity must be unique and must not be a role identity. The bridge
 persists bounded wire IDs only, never message/reply plaintext, and requeues input

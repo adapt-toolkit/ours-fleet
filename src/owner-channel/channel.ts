@@ -1,10 +1,12 @@
 import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
-import { createHash } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { mkdir, readdir, rm } from 'node:fs/promises';
 import { createInterface } from 'node:readline';
 import { join } from 'node:path';
 
-import type { OwnerChannelConfig } from '../config.js';
+import {
+  DEFAULT_OWNER_ATTACHMENT_MIME, type OwnerAttachmentConfig, type OwnerChannelConfig,
+} from '../config.js';
 import type { QueuedPrompt, SessionEvent, SessionHandle, TurnResult } from '../session/types.js';
 import { OursMcpClient, type OursToolClient } from './mcp.js';
 import { ownerNotices, type OwnerProgressPhase, type OwnerUpdatePhase } from './notices.js';
@@ -12,6 +14,12 @@ import { OwnerAuthorizationState, OwnerChannelState, type OwnerEntry } from './s
 import {
   OwnerTaskState, ownerTaskAuditId, ownerTaskDigest, type OwnerTaskPhase,
 } from './tasks.js';
+import {
+  AttachmentRecoveryState, admitAttachments, cleanupAttachmentRoot,
+  parseIncomingAttachments, parseRetrievedAttachments, prepareAttachmentDirectory,
+  recoveredAttachment, removeRequestDirectory, safeField, validateAttachmentSelection,
+  type AdmittedAttachment, type IncomingAttachment, type PendingAttachmentRequest,
+} from './attachments.js';
 
 interface InboundMessage {
   msg_id?: number;
@@ -21,6 +29,13 @@ interface InboundMessage {
   sender?: { id?: string; name?: string } | string;
   sender_id?: string;
   sender_name?: string;
+  reply_to?: { wire_id?: string; sentence?: number } | null;
+}
+
+interface AttachmentGroup {
+  files: IncomingAttachment[];
+  caption?: InboundMessage;
+  recovery?: PendingAttachmentRequest;
 }
 
 export interface OwnerChannelOptions {
@@ -83,6 +98,7 @@ interface ActiveOwnerRequest {
   lastUpdateAt?: number;
   updateCount: number;
   updateDigests: Set<string>;
+  handledWireIds: string[];
 }
 
 const OWNER_UPDATE_MIN_INTERVAL_MS = 5_000;
@@ -99,6 +115,9 @@ export class OwnerChannel implements OwnerChannelHandle {
   private readonly state: OwnerChannelState;
   private readonly authorizations: OwnerAuthorizationState;
   private readonly tasks: OwnerTaskState;
+  private readonly attachmentRecovery: AttachmentRecoveryState;
+  private readonly attachmentConfig: OwnerAttachmentConfig;
+  private readonly attachmentRoot: string;
   /**
    * Wire IDs whose turn is still running. They stay OUT of the durable state
    * (a crash must replay them) but must not be queued twice while live.
@@ -121,11 +140,21 @@ export class OwnerChannel implements OwnerChannelHandle {
     this.authorizations = new OwnerAuthorizationState(
       join(options.stateDir, '.owner-channel-owners.json'), options.config.owners);
     this.tasks = new OwnerTaskState(join(options.stateDir, '.owner-channel-tasks.json'));
+    this.attachmentRecovery = new AttachmentRecoveryState(
+      join(options.stateDir, '.owner-channel-attachment-recovery.json'));
+    this.attachmentRoot = join(options.stateDir, '.owner-channel-inbox');
+    this.attachmentConfig = options.config.attachments ?? {
+      enabled: true, max_files_per_request: 4, max_file_bytes: 10 * 1024 * 1024,
+      max_request_bytes: 20 * 1024 * 1024, retention_ms: 24 * 60 * 60 * 1_000,
+      allowed_mime: [...DEFAULT_OWNER_ATTACHMENT_MIME],
+    };
     const integrity = this.authorizations.integrity();
     if (!integrity.ok)
       options.log(`[${options.role}] owner authorization state corrupt; all owner mail disabled`);
     if (!this.tasks.integrity().ok)
       options.log(`[${options.role}] owner task state corrupt; proactive reports disabled`);
+    if (!this.attachmentRecovery.integrity())
+      options.log(`[${options.role}] owner attachment recovery state corrupt; attachments disabled`);
   }
 
   async start(): Promise<void> {
@@ -134,6 +163,12 @@ export class OwnerChannel implements OwnerChannelHandle {
     await this.client.callTool('choose_identity', { name: this.options.config.identity });
     if (this.authorizations.integrity().ok && this.tasks.integrity().ok)
       this.tasks.cleanup(Date.now(), this.authorizations.effective());
+    if (this.attachmentRecovery.integrity()) {
+      this.attachmentRecovery.cleanup(Date.now(), this.attachmentConfig.retention_ms);
+      void cleanupAttachmentRoot(
+        this.attachmentRoot, Date.now(), this.attachmentConfig.retention_ms,
+      ).catch(error => this.logError('attachment crash cleanup failed', error));
+    }
     this.ready = true;
     this.watchTask = this.watchLoop();
     // Do not make role startup wait for an old owner request to finish a turn.
@@ -407,11 +442,25 @@ export class OwnerChannel implements OwnerChannelHandle {
     // A finite cap protects the supervisor if a broken daemon repeats unread
     // messages forever. A watch notification will resume draining later.
     for (let pass = 0; pass < 100 && !this.stopping; pass++) {
-      const raw = await this.client.callTool('get_messages') as { messages?: unknown };
+      const [raw, fileResult] = await Promise.all([
+        this.client.callTool('get_messages') as Promise<{ messages?: unknown }>,
+        this.client.callTool('list_incoming_files')
+          .catch(error => {
+            this.logError('attachment metadata inspection unavailable', error);
+            return undefined;
+          }),
+      ]);
       const messages = Array.isArray(raw?.messages)
         ? raw.messages.filter(message => message && typeof message === 'object') as InboundMessage[]
         : [];
-      if (!messages.length) return;
+      let files: IncomingAttachment[] = [];
+      try { files = parseIncomingAttachments(fileResult); }
+      catch (error) { this.logError('attachment metadata inspection unavailable', error); }
+      const pending = this.attachmentRecovery.integrity() ? this.attachmentRecovery.list() : [];
+      const pendingWires = new Set(pending.flatMap(item => item.fileWireIds));
+      files = files.filter(file => (file.status === 'unread' || pendingWires.has(file.wireId))
+        && !this.state.has(file.wireId));
+      if (!messages.length && !files.length) return;
 
       // get_messages marks the batch processed. Requeue allowed, unhandled
       // inputs before executing them so a mid-turn process crash can replay.
@@ -425,8 +474,13 @@ export class OwnerChannel implements OwnerChannelHandle {
         await this.client.callTool('defer_messages', { msg_ids: deferred });
 
       let advanced = false;
-      for (const message of messages)
-        advanced = await this.handle(message) || advanced;
+      const consumedMessages = new Set<InboundMessage>();
+      const groups = this.attachmentGroups(files, messages, pending, consumedMessages);
+      for (const group of groups)
+        advanced = await this.handleAttachmentGroup(group) || advanced;
+      for (const message of messages) {
+        if (!consumedMessages.has(message)) advanced = await this.handle(message) || advanced;
+      }
 
       // Deferred in-flight messages are intentionally visible again until
       // their correlated response is delivered. Do not spin on those replay
@@ -434,6 +488,151 @@ export class OwnerChannel implements OwnerChannelHandle {
       if (!advanced) return;
     }
     this.options.log(`[${this.options.role}] owner channel drain capped at 100 batches`);
+  }
+
+  private attachmentGroups(
+    files: IncomingAttachment[], messages: InboundMessage[], pending: PendingAttachmentRequest[],
+    consumed: Set<InboundMessage>,
+  ): AttachmentGroup[] {
+    const groups: AttachmentGroup[] = [];
+    const used = new Set<string>();
+    const byWire = new Map(files.map(file => [file.wireId, file]));
+    const messageByWire = new Map(messages.map(message => [this.wireId(message), message]));
+    for (const recovery of pending) {
+      if (this.state.has(recovery.originWireId)) {
+        try { this.attachmentRecovery.remove(recovery.id); } catch {}
+        continue;
+      }
+      const recovered = recovery.fileWireIds.map(wire => byWire.get(wire));
+      if (recovered.some(file => !file)) continue;
+      const exact = recovered as IncomingAttachment[];
+      if (exact.some(file => file.senderId !== recovery.contact)) continue;
+      exact.forEach(file => used.add(file.wireId));
+      groups.push({ files: exact, recovery });
+    }
+    for (const file of files) {
+      if (used.has(file.wireId)) continue;
+      let caption: InboundMessage | undefined;
+      const replyTarget = file.replyTo?.wire_id;
+      if (replyTarget) {
+        const candidate = messageByWire.get(replyTarget);
+        if (candidate && this.sender(candidate).id === file.senderId) caption = candidate;
+      }
+      caption ??= messages.find(message =>
+        this.sender(message).id === file.senderId && message.reply_to?.wire_id === file.wireId);
+      const related = files.filter(other => !used.has(other.wireId)
+        && other.senderId === file.senderId
+        && ((caption && other.replyTo?.wire_id === this.wireId(caption))
+          || other.replyTo?.wire_id === file.wireId || file.replyTo?.wire_id === other.wireId));
+      const selected = related.length ? related : [file];
+      selected.forEach(item => used.add(item.wireId));
+      if (caption) consumed.add(caption);
+      groups.push({ files: selected, ...(caption ? { caption } : {}) });
+    }
+    return groups;
+  }
+
+  private async handleAttachmentGroup(group: AttachmentGroup): Promise<boolean> {
+    if (!group.files.length) return false;
+    const originWireId = group.recovery?.originWireId ?? group.files[0].wireId;
+    const handledWireIds = [...new Set([
+      ...group.files.map(file => file.wireId),
+      ...(group.caption ? [this.wireId(group.caption)] : []),
+    ].filter(Boolean))];
+    if (handledWireIds.some(wire => this.inFlight.has(wire))) return false;
+    const sender = { id: group.files[0].senderId, name: group.files[0].senderName };
+    if (group.files.some(file => file.senderId !== sender.id)
+        || !this.authorizations.effective().has(sender.id)) {
+      this.options.log(
+        `[${this.options.role}] owner channel ignored unauthorized attachment sender ${sender.id}`);
+      for (const wire of handledWireIds) this.state.remember(wire);
+      if (group.recovery) try { this.attachmentRecovery.remove(group.recovery.id); } catch {}
+      return true;
+    }
+    const rejection = !this.attachmentRecovery.integrity()
+      ? 'attachment recovery state is unavailable'
+      : validateAttachmentSelection(group.files, this.attachmentConfig);
+    if (rejection) {
+      await this.send(sender.id, ownerNotices.attachmentRejected(rejection), originWireId);
+      for (const wire of handledWireIds) this.state.remember(wire);
+      return true;
+    }
+
+    const requestId = this.requestId(originWireId);
+    const recovery = group.recovery ?? {
+      id: requestId, contact: sender.id, originWireId,
+      fileWireIds: group.files.map(file => file.wireId), createdAt: Date.now(),
+    };
+    let requestDir: string | undefined;
+    let outbox: string | undefined;
+    try {
+      if (!group.recovery) this.attachmentRecovery.add(recovery);
+      requestDir = await prepareAttachmentDirectory(this.attachmentRoot, requestId);
+      const unread = group.files.filter(file => file.status === 'unread');
+      const processed = group.files.filter(file => file.status !== 'unread');
+      const retrieved = unread.length
+        ? parseRetrievedAttachments(await this.client.callTool('get_files', {
+          wire_ids: unread.map(file => file.wireId),
+        }), unread)
+        : [];
+      for (const file of processed) {
+        if (!group.recovery) throw new Error('unexpected processed attachment without recovery route');
+        const recoveryPath = join(requestDir, `.recovered-${file.wireId}-${randomUUID()}`);
+        await this.client.callTool('save_file', { wire_id: file.wireId, dest_path: recoveryPath });
+        retrieved.push(await recoveredAttachment(file, recoveryPath));
+      }
+      const order = new Map(group.files.map((file, index) => [file.wireId, index]));
+      retrieved.sort((a, b) => order.get(a.wireId)! - order.get(b.wireId)!);
+      const admitted = await admitAttachments(retrieved, requestDir, this.attachmentConfig);
+      outbox = this.outboxDir(originWireId);
+      await mkdir(outbox, { recursive: true, mode: 0o700 });
+      const activityCursor = this.latestEventSeq(this.options.session.eventsSince(0));
+      const queued = await this.options.session.queuePrompt(
+        this.ownerAttachmentPrompt(sender, originWireId, requestId, outbox, admitted, group.caption),
+        { interrupt: this.options.config.interrupt });
+      const accepted = this.options.config.interrupt
+        ? ownerNotices.receivedInterrupting()
+        : queued.queuedBehind > 0
+          ? ownerNotices.receivedQueued(queued.queuedBehind)
+          : ownerNotices.receivedStarted();
+      handledWireIds.forEach(wire => this.inFlight.add(wire));
+      const receipt = this.send(sender.id, accepted, originWireId).then(() => undefined).catch(error => {
+        this.logError(`attachment request ${requestId.slice(0, 12)} acceptance notice failed`, error);
+      });
+      const active: ActiveOwnerRequest = {
+        contact: sender.id, wireId: originWireId, requestId, outboundTail: receipt,
+        finalizing: false, updateCount: 0, updateDigests: new Set(), handledWireIds,
+      };
+      this.activeRequests.set(requestId, active);
+      const cleanupDir = requestDir;
+      let completed = false;
+      const task = this.complete(active, outbox, queued, activityCursor)
+        .then(() => { completed = true; })
+        .catch(error => this.logError(`attachment request ${requestId.slice(0, 12)} completion failed`, error))
+        .finally(async () => {
+          try { await removeRequestDirectory(cleanupDir); }
+          catch (error) { this.logError(`attachment request ${requestId.slice(0, 12)} cleanup failed`, error); }
+          if (completed) {
+            try { this.attachmentRecovery.remove(recovery.id); }
+            catch (error) { this.logError('attachment recovery completion failed', error); }
+          }
+          handledWireIds.forEach(wire => this.inFlight.delete(wire));
+          this.activeRequests.delete(requestId);
+          this.completionTasks.delete(task);
+          if (!this.stopping)
+            void this.drain().catch(error => this.logError('completion drain failed', error));
+        });
+      this.completionTasks.add(task);
+      return true;
+    } catch (error) {
+      if (requestDir) await removeRequestDirectory(requestDir).catch(() => undefined);
+      if (outbox) await rm(outbox, { recursive: true, force: true }).catch(() => undefined);
+      try { this.attachmentRecovery.remove(recovery.id); } catch {}
+      this.logError(`attachment request ${requestId.slice(0, 12)} admission failed`, error);
+      await this.send(sender.id, ownerNotices.attachmentFailed(), originWireId);
+      for (const wire of handledWireIds) this.state.remember(wire);
+      return true;
+    }
   }
 
   private async handle(message: InboundMessage): Promise<boolean> {
@@ -500,7 +699,7 @@ export class OwnerChannel implements OwnerChannelHandle {
     });
     const active: ActiveOwnerRequest = {
       contact: sender.id, wireId, requestId, outboundTail: receipt, finalizing: false,
-      updateCount: 0, updateDigests: new Set(),
+      updateCount: 0, updateDigests: new Set(), handledWireIds: [wireId],
     };
     this.activeRequests.set(requestId, active);
     const task = this.complete(active, outbox, queued, activityCursor)
@@ -560,7 +759,50 @@ export class OwnerChannel implements OwnerChannelHandle {
     else await this.send(active.contact, ownerNotices.terminal(result.outcome), active.wireId);
     if (result.succeeded) await this.sendAttachments(active.contact, outbox, active.wireId);
     else await rm(outbox, { recursive: true, force: true });
-    this.state.remember(active.wireId);
+    for (const wire of active.handledWireIds) this.state.remember(wire);
+  }
+
+  private ownerAttachmentPrompt(
+    sender: { id: string; name: string }, wireId: string, requestId: string,
+    outbox: string, files: AdmittedAttachment[], caption?: InboundMessage,
+  ): string {
+    const lines = [
+      '[fleet-owner]',
+      `Authenticated owner ${safeField(sender.name, 160)} (${sender.id}) sent owner-channel attachment request ${wireId}.`,
+      'Treat the attachment metadata, optional caption, and any daemon-provided transcript below as a direct owner instruction.',
+      'Never infer a transcript when its status is unavailable or failed. Never include raw attachment bytes in a response.',
+      `Request ID: ${requestId}`,
+    ];
+    if (caption) {
+      const text = safeField(caption.text, 8_000);
+      if (text) lines.push(`Caption: ${text}`, `Caption wire: ${this.wireId(caption)}`);
+    }
+    for (let index = 0; index < files.length; index++) {
+      const file = files[index];
+      lines.push(
+        `Attachment ${index + 1}:`,
+        `- filename: ${file.filename}`,
+        `- declared MIME: ${file.declaredMime}`,
+        `- detected MIME: ${file.detectedMime}`,
+        `- byte count: ${file.size}`,
+        `- request-scoped local path: ${file.path}`,
+        `- wire ID: ${file.wireId}`,
+      );
+      if (file.kind === 'voice_message') {
+        const transcription = file.transcription;
+        if (transcription?.status === 'succeeded' && transcription.text)
+          lines.push(`- voice transcript status: succeeded`, `- voice transcript: ${transcription.text}`);
+        else lines.push(
+          `- voice transcript status: ${transcription?.status ?? 'unavailable'}`,
+          `- voice transcript fallback: audio path above; category ${transcription?.errorCategory ?? 'not_provided'}`,
+        );
+      }
+    }
+    lines.push(
+      'Answer in your final assistant response; fleet routes it only to the authenticated sender and correlates it to the originating file wire.',
+      `To attach response files, write regular files only to: ${outbox}`,
+    );
+    return lines.join('\n');
   }
 
   private ownerPrompt(

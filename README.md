@@ -285,6 +285,13 @@ roles:
       owners: [owner-contact-cid]        # authenticated ours contact IDs, never display names
       interrupt: false                  # false queues; true cancels current work first
       progress_interval_ms: 30000        # fleet-generated progress notices; 0 disables
+      attachments:                      # secure inbound documents, images, and voice
+        enabled: true
+        max_files_per_request: 4         # 1..32; rejected from metadata before retrieval
+        max_file_bytes: 10485760         # 10 MiB
+        max_request_bytes: 20971520      # 20 MiB total, and >= max_file_bytes
+        retention_ms: 86400000           # stale crash cleanup; 1 minute..30 days
+        allowed_mime: [application/pdf, text/plain, image/png, audio/ogg]
     model: claude-fable-5               # launch on a specific model (pass-through id; default: launcher default)
     mission: one line
     persona: |                          # operating contract (published as persona)
@@ -616,6 +623,34 @@ message and response bodies stay out of fleet state. Delivery is at-least-once
 across a crash (the bridge requeues fetched input before starting a turn); true
 exactly-once processing would require a leased claim/idempotency primitive in
 ours-mcp.
+
+Inbound owner attachments use the same authenticated-CID and exact-wire routing
+boundary. Fleet first calls the metadata-only `list_incoming_files`, groups a
+file-only wake or a same-sender reply-linked text caption, and checks the enabled,
+count, declared MIME, per-file size, and total-size policy before retrieving any
+bytes. It then calls selective `get_files` only for the admitted wire IDs. An
+unauthorized sender is ignored without retrieval or reply. A rejected authorized
+request receives a bounded reason correlated to its file wire.
+
+Retrieved files must be regular, non-symlink paths whose byte count and SHA-256
+match ours-mcp metadata. Fleet additionally checks content signatures against the
+declared MIME, sanitizes traversal/control characters from names, and copies each
+file into a random request-scoped directory at mode 0700 with files at mode 0600.
+The `[fleet-owner]` turn receives only bounded metadata, the private local paths,
+and an explicit daemon transcription result for voice messages. Successful
+transcripts are included; `failed` and `unavailable` states are stated plainly so
+the agent must use the audio path rather than inventing text.
+
+Request files are removed after final delivery and stale directories are removed
+after `retention_ms`. A bounded mode-0600 recovery journal stores only owner CID
+and wire routing metadata—never filenames, paths, captions, transcripts, or file
+bytes. If ours-mcp already marked a selected file processed when fleet restarts,
+fleet resumes only that journaled wire with `save_file`; recovered voice is
+explicitly marked transcript-unavailable. Corrupt recovery state disables
+attachment admission. The host must run an ours-mcp version whose
+`list_incoming_files`, selective `get_files`, and `save_file` schemas support
+these guarantees; `ours-mcp voice-status --json` reports whether transcription
+is currently configured.
 
 Owner channels currently require `session: acp`. Fleet needs structured,
 turn-correlated assistant output for automatic replies; scraping a tmux pane

@@ -62,6 +62,13 @@ roles:
     #   owners: [replace-with-your-owner-contact-cid]
     #   interrupt: false
     #   progress_interval_ms: 30000
+    #   attachments:
+    #     enabled: true
+    #     max_files_per_request: 4
+    #     max_file_bytes: 10485760
+    #     max_request_bytes: 20971520
+    #     retention_ms: 86400000
+    #     allowed_mime: [application/pdf, text/plain, image/png, audio/ogg]
     identity: FleetCoordinator
     cwd: ${work_root}
     persona: |
