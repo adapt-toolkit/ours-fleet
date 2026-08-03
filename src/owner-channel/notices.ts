@@ -51,6 +51,26 @@ export const ownerNotices = {
 
   interrupted: (role: string) => `🛑 Interrupt sent to ${role}'s active turn.`,
   interruptFailed: (role: string) => `⚠️ Could not interrupt ${role}'s active turn.`,
+
+  commandStarted: (command: string) =>
+    `⏳ Running ${command} — the result will follow in this channel.`,
+
+  commandOutcome: (command: string, outcome: TurnOutcome, output?: string) => {
+    switch (outcome) {
+      case 'completed': return `✅ ${command} completed.${output ? `\n${output}` : ''}`;
+      case 'cancelled': return `🛑 ${command} was cancelled before completion.`;
+      case 'refused': return `⚠️ ${command} was declined by the agent harness.`;
+      case 'failed': return `⚠️ ${command} failed before completion.`;
+      case 'inconclusive': return `⚠️ ${command} ended without a confirmed completion.`;
+    }
+  },
+
+  commandFailed: (command: string) => `⚠️ ${command} could not be executed.`,
+
+  restarting: (role: string, command: string, mode: 'keep' | 'fresh') =>
+    `ℹ️ ${command} accepted — restarting ${role} ${mode === 'fresh'
+      ? 'FRESH (context wiped)' : '(context resumes)'}. `
+    + 'The channel goes quiet during the restart and resumes when the agent is back.',
   attachmentRejected: (reason: string) => `⚠️ Attachment rejected: ${reason}.`,
   attachmentFailed: () => '⚠️ Could not securely retrieve or admit this attachment request.',
   deliveryFailed: (role: string) => `⚠️ Could not deliver this request to ${role}.`,

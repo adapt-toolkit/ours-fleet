@@ -6,9 +6,11 @@ import { join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import { OwnerChannel } from '../src/owner-channel/channel.js';
+import { ownerCommandHelp, type OwnerFleetOps } from '../src/owner-channel/commands.js';
 import type { OursToolClient } from '../src/owner-channel/mcp.js';
 import { ownerNotices } from '../src/owner-channel/notices.js';
 import type { SessionEvent, SessionHandle, TurnResult } from '../src/session/types.js';
+import { VERSION } from '../src/version.js';
 
 class FakeClient implements OursToolClient {
   calls: Array<{ name: string; args?: Record<string, unknown> }> = [];
@@ -39,7 +41,9 @@ function deferredTurn() {
 
 function setup(messages: unknown[], result = {
   accepted: true, outcome: 'completed' as const, succeeded: true, output: 'Agent answer',
-}, options: { interrupt?: boolean; queuedBehind?: number } = {}) {
+}, options: {
+  interrupt?: boolean; queuedBehind?: number; fleet?: OwnerFleetOps; events?: SessionEvent[];
+} = {}) {
   const dir = mkdtempSync(join(tmpdir(), 'ours-owner-channel-'));
   dirs.push(dir);
   const client = new FakeClient();
@@ -52,7 +56,7 @@ function setup(messages: unknown[], result = {
   const session = {
     backend: 'acp', pid: 1, isAlive: () => true,
     snapshot: () => ({ backend: 'acp', alive: true, readiness: 'running' }),
-    queuePrompt, interrupt, eventsSince: () => [],
+    queuePrompt, interrupt, eventsSince: () => options.events ?? [],
   } as unknown as SessionHandle;
   const channel = new OwnerChannel({
     role: 'Coordinator',
@@ -61,6 +65,7 @@ function setup(messages: unknown[], result = {
       interrupt: options.interrupt ?? false, progress_interval_ms: 0,
     },
     session, stateDir: dir, client, log: () => undefined,
+    ...(options.fleet ? { fleet: options.fleet } : {}),
   });
   return { channel, client, queuePrompt, interrupt, dir };
 }
@@ -425,6 +430,208 @@ describe('OwnerChannel', () => {
     expect(existsSync(join(outbox, 'retry.txt'))).toBe(true);
     const statePath = join(dir, '.owner-channel-state.json');
     expect(!existsSync(statePath) || !readFileSync(statePath, 'utf8').includes('wire-file-retry')).toBe(true);
+  });
+});
+
+describe('OwnerChannel deterministic command dispatch', () => {
+  const fakeFleet = () => ({
+    restart: vi.fn(async (_mode: 'keep' | 'fresh') => undefined),
+    list: vi.fn(async () => 'Coordinator: acp\nScout: 1 windows (created ...)'),
+  });
+
+  it('returns help for an unknown slash command instead of forwarding it', async () => {
+    const { channel, client, queuePrompt } = setup([
+      ownerMessage(50, 'wire-unknown-cmd', '/deploy prod now'),
+    ]);
+    await channel.drain();
+    expect(queuePrompt).not.toHaveBeenCalled();
+    const sends = client.calls.filter(call => call.name === 'send_message');
+    expect(sends).toHaveLength(1);
+    expect(sends[0].args?.reply_to_wire_id).toBe('wire-unknown-cmd');
+    expect(String(sends[0].args?.text)).toContain('/deploy');
+    expect(String(sends[0].args?.text)).toContain('/help');
+  });
+
+  it('lists the full deterministic command set for /help and /commands', async () => {
+    for (const [i, text] of ['/help', '/commands'].entries()) {
+      const { channel, client } = setup([ownerMessage(51 + i, `wire-help-${i}`, text)]);
+      await channel.drain();
+      const sent = String(client.calls.find(call => call.name === 'send_message')?.args?.text);
+      expect(sent).toBe(ownerCommandHelp());
+      for (const name of ['/help', '/status', '/interrupt', '/clear', '/compact',
+        '/model <model-id>', '/restart', '/force-restart', '/ls', '/peek', '/worklog', '/version'])
+        expect(sent).toContain(name);
+    }
+  });
+
+  it('passes /clear to the harness as raw slash text and reports the outcome', async () => {
+    const { channel, client, queuePrompt } = setup([
+      ownerMessage(53, 'wire-clear', '/clear'),
+    ], { accepted: true, outcome: 'completed', succeeded: true, output: 'Context cleared.' });
+    await channel.drain();
+    expect(queuePrompt).toHaveBeenCalledOnce();
+    expect(queuePrompt.mock.calls[0][0]).toBe('/clear');
+    expect(queuePrompt.mock.calls[0][1]).toMatchObject({ origin: { kind: 'owner' } });
+    expect((queuePrompt.mock.calls[0][1] as { interrupt?: boolean })?.interrupt).not.toBe(true);
+    await vi.waitFor(() => {
+      const texts = client.calls.filter(call => call.name === 'send_message')
+        .map(call => String(call.args?.text));
+      expect(texts.some(text => text.includes('/clear') && text.startsWith('⏳'))).toBe(true);
+      expect(texts.some(text => text.startsWith('✅') && text.includes('/clear')
+        && text.includes('Context cleared.'))).toBe(true);
+    });
+    await vi.waitFor(() => expect(readFileSync(join(dirs.at(-1)!, '.owner-channel-state.json'), 'utf8'))
+      .toContain('wire-clear'));
+  });
+
+  it('never wraps a harness command in the owner prompt scaffolding', async () => {
+    const { channel, queuePrompt } = setup([ownerMessage(54, 'wire-compact', '/compact')]);
+    await channel.drain();
+    expect(queuePrompt).toHaveBeenCalledOnce();
+    expect(queuePrompt.mock.calls[0][0]).toBe('/compact');
+    expect(queuePrompt.mock.calls[0][0]).not.toContain('[fleet-owner]');
+  });
+
+  it('reports a failed harness command without internal details', async () => {
+    const { channel, client } = setup([
+      ownerMessage(55, 'wire-compact-fail', '/compact'),
+    ], { accepted: true, outcome: 'failed', succeeded: false, detail: 'secret transport detail' });
+    await channel.drain();
+    await vi.waitFor(() => {
+      const texts = client.calls.filter(call => call.name === 'send_message')
+        .map(call => String(call.args?.text));
+      expect(texts.some(text => text.startsWith('⚠️') && text.includes('/compact'))).toBe(true);
+      expect(texts.every(text => !text.includes('secret'))).toBe(true);
+    });
+  });
+
+  it('forwards a well-formed /model id and rejects malformed ones with help', async () => {
+    const good = setup([ownerMessage(56, 'wire-model', '/model claude-sonnet-5')]);
+    await good.channel.drain();
+    expect(good.queuePrompt).toHaveBeenCalledOnce();
+    expect(good.queuePrompt.mock.calls[0][0]).toBe('/model claude-sonnet-5');
+
+    const missing = setup([ownerMessage(57, 'wire-model-missing', '/model')]);
+    await missing.channel.drain();
+    expect(missing.queuePrompt).not.toHaveBeenCalled();
+    expect(String(missing.client.calls.find(call => call.name === 'send_message')?.args?.text))
+      .toContain('/model <model-id>');
+
+    const malformed = setup([ownerMessage(58, 'wire-model-bad', '/model $(reboot) now')]);
+    await malformed.channel.drain();
+    expect(malformed.queuePrompt).not.toHaveBeenCalled();
+    expect(String(malformed.client.calls.find(call => call.name === 'send_message')?.args?.text))
+      .toContain('/help');
+  });
+
+  it('sends the restart notice and marks the wire handled before bouncing the role', async () => {
+    const fleet = fakeFleet();
+    let sendsWhenRestarted = -1;
+    let stateWhenRestarted = '';
+    const { channel, client, queuePrompt, dir } = setup(
+      [ownerMessage(59, 'wire-restart', '/restart')], undefined, { fleet });
+    fleet.restart.mockImplementation(async () => {
+      sendsWhenRestarted = client.calls.filter(call => call.name === 'send_message').length;
+      stateWhenRestarted = existsSync(join(dir, '.owner-channel-state.json'))
+        ? readFileSync(join(dir, '.owner-channel-state.json'), 'utf8') : '';
+    });
+    await channel.drain();
+    expect(queuePrompt).not.toHaveBeenCalled();
+    expect(fleet.restart).toHaveBeenCalledOnce();
+    expect(fleet.restart).toHaveBeenCalledWith('keep');
+    // The confirmation left first and the wire was already durable: the restart
+    // kills this process, so neither can happen after it.
+    expect(sendsWhenRestarted).toBeGreaterThan(0);
+    expect(stateWhenRestarted).toContain('wire-restart');
+    const sent = String(client.calls.find(call => call.name === 'send_message')?.args?.text);
+    expect(sent).toContain('/restart');
+  });
+
+  it('maps /force-restart to a fresh restart', async () => {
+    const fleet = fakeFleet();
+    const { channel, client } = setup(
+      [ownerMessage(60, 'wire-force-restart', '/force-restart')], undefined, { fleet });
+    await channel.drain();
+    expect(fleet.restart).toHaveBeenCalledOnce();
+    expect(fleet.restart).toHaveBeenCalledWith('fresh');
+    expect(String(client.calls.find(call => call.name === 'send_message')?.args?.text))
+      .toContain('/force-restart');
+  });
+
+  it('reports a restart failure instead of staying silent', async () => {
+    const fleet = fakeFleet();
+    fleet.restart.mockRejectedValueOnce(new Error('secret systemd detail'));
+    const { channel, client } = setup(
+      [ownerMessage(61, 'wire-restart-fail', '/restart')], undefined, { fleet });
+    await channel.drain();
+    const texts = client.calls.filter(call => call.name === 'send_message')
+      .map(call => String(call.args?.text));
+    expect(texts.some(text => text.startsWith('⚠️'))).toBe(true);
+    expect(texts.every(text => !text.includes('secret'))).toBe(true);
+  });
+
+  it('ignores commands from unauthorized peers without any side effect', async () => {
+    const fleet = fakeFleet();
+    const { channel, client, queuePrompt, interrupt } = setup([{
+      msg_id: 62, wire_id: 'wire-peer-cmd', from: { id: 'peer-cid', name: 'Owner' },
+      text: '/force-restart',
+    }, {
+      msg_id: 63, wire_id: 'wire-peer-model', from: { id: 'peer-cid', name: 'Owner' },
+      text: '/model claude-opus-5',
+    }], undefined, { fleet });
+    await channel.drain();
+    expect(fleet.restart).not.toHaveBeenCalled();
+    expect(queuePrompt).not.toHaveBeenCalled();
+    expect(interrupt).not.toHaveBeenCalled();
+    expect(client.calls.some(call => call.name === 'send_message')).toBe(false);
+  });
+
+  it('relays the fleet listing for /ls', async () => {
+    const fleet = fakeFleet();
+    const { channel, client } = setup([ownerMessage(64, 'wire-ls', '/ls')], undefined, { fleet });
+    await channel.drain();
+    expect(fleet.list).toHaveBeenCalledOnce();
+    expect(String(client.calls.find(call => call.name === 'send_message')?.args?.text))
+      .toContain('Coordinator: acp');
+  });
+
+  it('reports the fleet version for /version', async () => {
+    const { channel, client } = setup([ownerMessage(65, 'wire-version', '/version')]);
+    await channel.drain();
+    expect(String(client.calls.find(call => call.name === 'send_message')?.args?.text))
+      .toContain(VERSION);
+  });
+
+  it('tails the role worklog for /worklog', async () => {
+    const { channel, client, dir } = setup([ownerMessage(66, 'wire-worklog', '/worklog')]);
+    writeFileSync(join(dir, 'WORKLOG.md'), '# Worklog\nfinished migration step 3\n');
+    await channel.drain();
+    expect(String(client.calls.find(call => call.name === 'send_message')?.args?.text))
+      .toContain('finished migration step 3');
+  });
+
+  it('summarizes recent activity for /peek without event text bodies', async () => {
+    const events: SessionEvent[] = [
+      { version: 1, seq: 1, at: 't', kind: 'thought', text: 'PRIVATE reasoning' },
+      { version: 1, seq: 2, at: 't', kind: 'tool_call', title: 'Read README.md', status: 'in_progress' },
+      { version: 1, seq: 3, at: 't', kind: 'turn_stop', stopReason: 'end_turn' },
+    ];
+    const { channel, client } = setup(
+      [ownerMessage(67, 'wire-peek', '/peek')], undefined, { events });
+    await channel.drain();
+    const sent = String(client.calls.find(call => call.name === 'send_message')?.args?.text);
+    expect(sent).toContain('tool_call');
+    expect(sent).toContain('Read README.md');
+    expect(sent).not.toContain('PRIVATE');
+  });
+
+  it('deduplicates command wires like any other owner message', async () => {
+    const message = ownerMessage(68, 'wire-cmd-once', '/help');
+    const { channel, client } = setup([message]);
+    client.batches.push([message], []);
+    await channel.drain();
+    await channel.drain();
+    expect(client.calls.filter(call => call.name === 'send_message')).toHaveLength(1);
   });
 });
 

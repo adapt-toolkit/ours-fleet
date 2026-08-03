@@ -572,6 +572,7 @@ export async function runOnce(
         stateDir: dir,
         env: role.env,
         log: deps.log,
+        ...(configPath ? { configPath } : {}),
       });
       try { await ownerChannel.start(); }
       catch (error) {
