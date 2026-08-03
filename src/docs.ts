@@ -377,7 +377,12 @@ prompt. The agent copies completed artifacts there; fleet sends every regular
 file from the channel identity with the same source wire ID and removes the
 temporary outbox only after successful delivery. The agent never chooses a
 recipient or calls ours \`send_file\` for an owner-channel response.
-Exact \`/status\` and \`/interrupt\` commands bypass the model.
+Owner messages whose trimmed text starts with \`/\` are deterministic
+supervisor commands and never enter the model: \`/help\` (alias \`/commands\`),
+\`/status\`, \`/interrupt\`, \`/clear\`, \`/compact\`, \`/model <model-id>\`,
+\`/restart\`, \`/force-restart\`, \`/ls\`, \`/peek\`, \`/worklog\`, and
+\`/version\`. Unknown or malformed commands answer with the help text instead of
+being forwarded; plain messages reach the agent unchanged.
 
 Owner documents, images, and voice messages use the same authenticated sender
 and source-wire boundary. Fleet inspects body-free metadata first and rejects
