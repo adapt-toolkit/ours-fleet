@@ -1,6 +1,7 @@
 import { spawn } from 'node:child_process';
 import { existsSync, realpathSync } from 'node:fs';
 import { resolve } from 'node:path';
+import { loadConfig, type FleetConfig } from '../config.js';
 import { RoleRepository } from '../application/role-repository.js';
 import { FleetQueryService } from '../application/fleet-query-service.js';
 import { AcpRoleSessionAdapter, TmuxRoleSessionAdapter } from '../application/session-control.js';
@@ -22,6 +23,25 @@ import { TrustedDeviceStore } from './device-store.js';
 import { WebAuth } from './auth.js';
 import { startWebControlServer, type WebControlServer } from './control.js';
 import { WebAccessStore, validatePublicOrigin, type WebAccessConfig } from './access.js';
+import { buildWatchdogFindings, cachedWatchdogFindingsProvider, WatchdogQueryService } from '../watchdog/query.js';
+import { latestReport } from '../watchdog/store.js';
+
+const CONFIG_CACHE_TTL_MS = 5_000;
+
+/**
+ * loadConfig re-parses YAML from disk on every call; the watchdog list/reports
+ * routes get polled by the console UI, so cache the resolved config for a
+ * short TTL rather than re-parsing per request. Runtime-only concern (not the
+ * scheduler's), so a plain Date.now() clock is fine.
+ */
+function cachedConfigProvider(configPath: string | undefined): () => FleetConfig {
+  let cached: { at: number; cfg: FleetConfig } | undefined;
+  return () => {
+    const now = Date.now();
+    if (!cached || now - cached.at >= CONFIG_CACHE_TTL_MS) cached = { at: now, cfg: loadConfig(configPath) };
+    return cached.cfg;
+  };
+}
 
 export interface StartWebOptions {
   configPath?: string;
@@ -77,11 +97,34 @@ export async function startWebConsole(options: StartWebOptions): Promise<Running
   const audit = new AuditSink();
   const terminals = new TerminalBridgeManager({ repository, audit, tmux });
   const terminalAvailable = await terminals.available();
+  const watchdogConfigProvider = cachedConfigProvider(options.configPath);
+  const log = options.log ?? (() => {});
+  let loggedWatchdogFindingsError = false;
+  // Needs-attention integration (Task 19): worst per-role watchdog finding,
+  // rebuilt from stored reports. A store hiccup (corrupt state, unreadable
+  // report) must never break the fleet list, so it degrades to an empty map
+  // and logs once rather than repeating on every poll. status() calls this
+  // once per role, so list()'s O(roles) sweep would otherwise cost
+  // O(roles x watchdogs) disk reads every 1-3s of console polling —
+  // cachedWatchdogFindingsProvider memoizes the whole build behind the same
+  // TTL as the config cache above.
+  const watchdogFindings = cachedWatchdogFindingsProvider(() => {
+    try {
+      return buildWatchdogFindings(watchdogConfigProvider(), latestReport);
+    } catch (error) {
+      if (!loggedWatchdogFindingsError) {
+        loggedWatchdogFindingsError = true;
+        log(`watchdog findings unavailable: ${(error as Error).message}`);
+      }
+      return new Map();
+    }
+  }, CONFIG_CACHE_TTL_MS);
   const query = new FleetQueryService({
     repository, supervisor: backend, tmux,
     capabilityContext: { terminalPtyAvailable: terminalAvailable },
+    watchdogFindings,
   });
-  const ops = { backend, binPath: options.binPath, log: options.log ?? (() => {}) };
+  const ops = { backend, binPath: options.binPath, log };
   const creation = new RoleCreationService({
     configPath: options.configPath, ops, binPath: options.binPath,
     allowedCwdRoots: [realpathSync(home()), realpathSync(process.cwd())],
@@ -110,10 +153,11 @@ export async function startWebConsole(options: StartWebOptions): Promise<Running
     },
   });
   const logs = new StructuredLogService(backend, realExec);
+  const watchdogs = new WatchdogQueryService(watchdogConfigProvider);
   let server: WebServer;
   try {
     server = await buildWebServer({
-    query, repository, logs, commands, creation, audit, events,
+    query, repository, logs, commands, creation, audit, events, watchdogs,
     terminalUpgrade: terminalAvailable
       ? async (socket, _request, roleId, _ticket, hello) => terminals.connect(socket, roleId, hello)
       : undefined,

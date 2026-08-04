@@ -6,7 +6,8 @@ import { agentDir, fleetDDir } from './paths.js';
 import { validateIsolationConfig } from './isolation/policy.js';
 import type { IsolationConfig } from './isolation/types.js';
 import {
-  loadConfig, resolveAuthProxy, resolveModelChain, resolveMonitorConfig, resolvePermissions,
+  loadConfig, resolveAuthProxy, resolveModelChain, resolveMonitorConfig, resolveOwnerChannelConfig,
+  resolvePermissions,
   resolveRoleModel, resolveWorklogPolicy, validateMonitorConfig,
   type ApprovalMode, type FilesystemMode, type ResolvedRole, type RoleConfig,
   type CommonPermissions, type MonitorConfig, type SessionBackendId, type UnattendedMode,
@@ -228,12 +229,13 @@ export function spawnDryRun(o: SpawnOpts): SpawnDryRun {
   const defaultHarness = (cfg.defaults.harness as string | undefined) ?? 'claude-code';
   const inheritsModelDefaults = harness === defaultHarness && raw.model !== null;
   const model = resolveRoleModel(raw.model, raw.harness, cfg.defaults);
+  const session = raw.session ?? (cfg.defaults.session as SessionBackendId | undefined) ?? 'tmux';
   const resolvedRole: ResolvedRole = {
     ...raw,
     name: o.name,
     sourceFile: o.temp ? '(temp dry-run)' : join(fleetDDir(), `${o.name}.yaml`),
     harness,
-    session: raw.session ?? (cfg.defaults.session as SessionBackendId | undefined) ?? 'tmux',
+    session,
     session_options: raw.session_options,
     permissions: resolvePermissions(cfg.defaults.permissions, raw.permissions),
     permissionsDeclared: raw.permissions !== undefined || cfg.defaults.permissions !== undefined,
@@ -248,6 +250,8 @@ export function spawnDryRun(o: SpawnOpts): SpawnDryRun {
     harness_options: Object.keys(harnessOptions).length ? harnessOptions : undefined,
     isolation: raw.isolation ?? (cfg.defaults.isolation as IsolationConfig | undefined),
     monitor: resolveMonitorConfig(cfg.defaults.monitor, raw.monitor),
+    owner_channel: resolveOwnerChannelConfig(
+      cfg.defaults.owner_channel, raw.owner_channel, session),
     worklog: resolveWorklogPolicy(cfg.defaults.worklog, raw.worklog),
     auth_proxy: resolveAuthProxy(cfg.defaults.auth_proxy, raw.auth_proxy),
   };
@@ -299,6 +303,7 @@ function provenanceSettings(
         ? { value: explicitModel, source: 'cli' }
         : { value: inheritedModel, source: inheritedModel ? 'fleet-default' : 'built-in' },
     coordinator: provenanceOf(o.coordinator, undefined, undefined),
+    permission_mode: provenanceOf(o.permissionMode, undefined, undefined),
     approval: provenanceOf(o.approval, perms.approval, 'ask'),
     filesystem: provenanceOf(o.filesystem, perms.filesystem, 'workspace'),
     unattended: provenanceOf(o.unattended, perms.unattended, 'deny'),
@@ -456,11 +461,12 @@ async function spawnTempInner(
   const harness = o.harness ?? defaultHarness ?? 'claude-code';
   const inheritsModelDefaults = harness === (defaultHarness ?? 'claude-code') && o.model !== null;
   const model = resolveRoleModel(o.model, o.harness, cfg.defaults);
+  const session = o.session ?? (cfg.defaults.session as SessionBackendId | undefined) ?? 'tmux';
   const role: ResolvedRole = {
     ...fromOpts,          // includes `isolation` when --isolation-file was given
     name: o.name,
     harness,
-    session: o.session ?? (cfg.defaults.session as SessionBackendId | undefined) ?? 'tmux',
+    session,
     identity: o.identity ?? o.name,
     model,
     model_chain: resolveModelChain(
@@ -475,6 +481,8 @@ async function spawnTempInner(
       fromOpts.permissions !== undefined || cfg.defaults.permissions !== undefined,
     // Temp agents inherit the fleet-wide monitor defaults via the snapshot (design §2).
     monitor: resolveMonitorConfig(cfg.defaults.monitor, fromOpts.monitor),
+    owner_channel: resolveOwnerChannelConfig(
+      cfg.defaults.owner_channel, fromOpts.owner_channel, session),
     worklog: resolveWorklogPolicy(cfg.defaults.worklog, fromOpts.worklog),
     auth_proxy: resolveAuthProxy(cfg.defaults.auth_proxy, fromOpts.auth_proxy),
     sourceFile: '(temp)',

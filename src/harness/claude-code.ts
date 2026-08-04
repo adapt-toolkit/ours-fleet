@@ -231,6 +231,12 @@ export function makeClaudeCodeAdapter(exec: Exec = realExec): HarnessAdapter {
       return { argv, env: prep.env };
     },
 
+    // Same source as buildLaunch's --permission-mode flag, so the tmux and ACP
+    // backends cannot disagree about what a role's permissions translate to.
+    acpPermissionModeId(role: ResolvedRole): string | undefined {
+      return permissionMode(role);
+    },
+
     isolationPaths(_role: ResolvedRole, _dirs: RoleDirs) {
       const claudeHome = join(home(), '.claude');
       return {

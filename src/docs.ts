@@ -39,6 +39,8 @@ ours-fleet logs -f Name
 ours-fleet send Name "prompt"
 ours-fleet send Name --key Enter        # tmux only
 ours-fleet rm Name
+ours-fleet watchdog-report <name> [run-id] [--list] [--json]
+ours-fleet watchdog-run <name>
 \`\`\`
 
 \`peek\`, \`attach\`, and text \`send\` work with tmux and ACP. ACP attachment
@@ -176,7 +178,37 @@ roles:
       KEY: value
     oversee:
       - { role: Worker, interval: 5m }
+watchdogs:
+  nightwatch:                       # [A-Za-z0-9_-], must not collide with a role name
+    coordinator: FleetCoordinator   # required — where alerts go
+    # everything below is optional
+    enabled: true                   # default true; false = configured but never scheduled
+    interval: 10m                   # default 10m; 30s | 10m | 2h, minimum 1m
+    watch: [Alice, CodexReviewer]   # explicit lists are exact; omit for configured + live temp roles
+    harness: claude-code            # default: defaults.harness
+    model: claude-fable-5           # default: same resolution rule roles use (resolveRoleModel)
+    session: acp                    # default: defaults.session
+    identity: Watchdog-nightwatch   # default: Watchdog-<name>
+    timeout: 5m                     # default 5m; a run past this is killed and recorded as error
+    keep_reports: 50                # default 50 reports retained per watchdog
+    alert_cooldown: 60m             # default 60m before the same finding alerts again
+    prompt_file: /abs/extra.md      # optional extra focus, APPENDED to the fixed contract
+    isolation:                      # optional; omitted means no OS sandbox, like an ordinary role
+      backend: bubblewrap           # when present, the ordinary role isolation schema applies
+      network: broker
+      fs: { read: [/opt/watch-data] }
 \`\`\`
+
+A watchdog observes and reports; it never restarts, stops, spawns, or removes a
+role, answers a pending permission, edits a workspace, or approves anything on
+the owner's behalf. \`watchdogs:\` may appear only in the base config
+(\`~/fleet.yaml\` or \`-c FILE\`), not in \`~/fleet.d/*.yaml\` drop-ins.
+Watchdogs are not isolated by default. An explicit watchdog \`isolation:\` block
+uses the same policy schema as a role and is applied unchanged; declare every
+extra filesystem access required by a custom prompt there.
+When \`watch:\` is omitted, each run watches the configured roles plus temporary
+fleet roles that are live when the run starts. An explicit \`watch:\` list is
+never augmented.
 
 Role values override defaults. \`\${name}\` substitutes entries from \`vars\`.
 Other role fields include \`max_tokens\`, \`autocompact_pct\`, and \`isolation\`.
@@ -317,12 +349,145 @@ configured wake. The policy is content-blind because the supervisor cannot
 inspect encrypted message bodies. Message bodies are released only when the
 role calls the ours \`get_messages\` tool.
 
+The default is \`false\`. For a temporary role whose mission intentionally arrives
+after its readiness announcement, set \`mode: fleet\` and \`interrupt: true\`
+explicitly. The readiness announcement does not change the transport: the
+mission remains ordinary ours mail, fleet injects only the body-free wake, and
+the role calls \`get_messages\` before acting. Every later configured wake uses
+the same interruption policy.
+
 Legacy \`monitor.enabled: true|false\` remains accepted as an alias for
 \`mode: fleet|native\`; use \`mode\` in new configuration. Codex's separate
 \`harness_options.monitor: true\` is native-monitor consent, not monitor-owner
 selection.
 Inspect \`ours-fleet status Name\`, \`peek Name\`, role logs, and
 \`~/.ours-fleet/agents/Name/.monitor-status\` when diagnosing delivery.
+
+## Trusted owner channel
+
+An ACP role may declare a separate, existing ours identity which fleet — never
+the agent — binds:
+
+\`\`\`yaml
+owner_channel:
+  identity: Coordinator Owner Channel
+  owners: [authenticated-owner-contact-cid]
+  agent: authenticated-managed-agent-cid
+  interrupt: false
+  progress_interval_ms: 30000
+  attachments:
+    enabled: true
+    max_files_per_request: 4
+    max_file_bytes: 10485760
+    max_request_bytes: 20971520
+    retention_ms: 86400000
+    allowed_mime: [application/pdf, text/plain, image/png, audio/ogg]
+\`\`\`
+
+This does not replace the role identity. Normal identity mail remains untrusted
+peer input: the agent reads it through \`get_messages\` and replies through
+\`send_message\`. Mail arriving on the dedicated channel from a CID in \`owners\`
+is injected as a direct \`[fleet-owner]\` prompt. Mail from the exact \`agent\`
+CID is forwarded as a new message to the latest authenticated owner conversation.
+Every other CID is rejected and warned about without reflecting its body. Fleet sends
+accepted/queued/progress/interrupted/failure notices and routes the ACP turn's
+final assistant text back to the authenticated sender with its source wire ID.
+For file replies, fleet injects a request-specific outbox path into the owner
+prompt. The agent copies completed artifacts there; fleet sends every regular
+file from the channel identity with the same source wire ID and removes the
+temporary outbox only after successful delivery. The agent never chooses an owner
+recipient or calls ours \`send_file\` for an owner-channel response.
+Owner messages whose trimmed text starts with \`/\` are deterministic
+supervisor commands and never enter the model: \`/help\` (alias \`/commands\`),
+\`/status\`, \`/interrupt\`, \`/clear\`, \`/compact\`, \`/model <model-id>\`,
+\`/restart\`, \`/force-restart\`, \`/ls\`, \`/peek\`, \`/worklog\`, and
+\`/version\`. Unknown or malformed commands answer with the help text instead of
+being forwarded; plain messages reach the agent unchanged. \`/clear\`,
+\`/compact\`, and \`/model\` are forwarded only when the role's bundled ACP
+adapter executes them locally (claude-code: all three; codex: \`/compact\`
+only) and are otherwise refused with a notice, so slash text never reaches the
+model as a prompt.
+
+Owner documents, images, and voice messages use the same authenticated sender
+and source-wire boundary. Fleet inspects body-free metadata first and rejects
+disabled, over-count, over-size, or disallowed-MIME requests before selective
+retrieval. Unauthorized CIDs are never retrieved or answered. Reply-linked text
+and files from the same sender become one ordered request; a file-only wake also
+starts a turn. Retrieved bytes must match their structured size and SHA-256,
+their content signature must match the declared MIME, and symlinks or non-regular
+paths fail closed. Sanitized copies live only in a mode-0700 request directory as
+mode-0600 files and are removed after completion or bounded stale retention.
+
+Voice prompts include a bounded transcript only when ours-mcp reports success.
+Failure or unavailability is explicit and preserves the private audio path as the
+fallback. Run \`ours-mcp voice-status --json\` to inspect the host configuration.
+A mode-0600 crash journal contains only authenticated CID and wire routing data;
+it never stores captions, filenames, paths, transcript text, or bytes. Journaled
+post-retrieval files resume selectively through \`save_file\`; corrupt state
+disables attachment admission rather than weakening provenance checks.
+
+The channel identity must be unique and must not be a role identity. The bridge
+persists bounded wire IDs only, never message/reply plaintext, and requeues input
+before starting its turn for at-least-once crash recovery. It currently requires
+\`session: acp\`: tmux has no structured, turn-correlated final answer, and pane
+scraping cannot provide the same reliable reply guarantee.
+
+### Live contact and owner administration
+
+The supervisor which is already running the ACP role remains the sole binder of
+\`owner_channel.identity\`. The CLI reaches that exact live \`OwnerChannel\`
+through the role's token-authenticated, mode-0600 Unix control socket for contact
+inspection and setup; it never starts another ours client and never force-binds:
+
+\`\`\`sh
+ours-fleet owner-channel contact list <Role>
+ours-fleet owner-channel contact invite <Role> [--name <label>]
+ours-fleet owner-channel contact add <Role> (--invite-file <path> | --invite-stdin) [--name <label>]
+ours-fleet owner-channel owner list <Role>
+ours-fleet owner-channel owner authorize <Role> <exact-64-hex-contact-cid>
+ours-fleet owner-channel owner revoke <Role> <exact-64-hex-contact-cid>
+\`\`\`
+
+Contact establishment and owner authorization are separate security steps.
+\`contact add\` never authorizes: invite redemption is pending until the peer
+verifies it. Once \`contact list\` reports the established contact, authorize
+its exact immutable CID explicitly. Invite creation emits invite material only
+on stdout; acceptance reads it from a file or stdin, not argv.
+
+Configured \`owners\` remain the baseline. On legacy channels without \`agent\`,
+live authorizations/revocations are an immediately effective, restart-persistent
+overlay. Managed-agent CID gating makes fleet configuration authoritative and
+disables live owner mutation and direct control-socket sends. \`owner list\` labels
+baseline versus dynamic entries and effective status. The atomic mode-0600 file
+contains bounded CIDs and audit actions only. Corruption disables all effective
+owners and refuses mutation rather than resurrecting authority; revoking the
+last effective owner is always refused.
+
+A missing/stopped role, tmux session, role without \`owner_channel\`, unavailable
+MCP client, or a role entering shutdown returns an actionable error with no
+side effects. Management uses no network listener and never logs or persists
+invite material.
+
+For any non-final message—progress, blocker, suggestion, or later proactive note—
+the managed agent calls ordinary ours \`send_message\` to the channel identity.
+Fleet checks only that the authenticated sender CID exactly equals \`agent\`, then
+forwards the text as a new message. There is no task/request/update type, phase,
+reply correlation, or owner recipient argument. A sole owner is the safe fallback;
+with multiple owners and no inbound route history the relay fails closed. Devices
+sharing one identity share its CID; separate owner identities hand off the route
+when either sends channel mail. The ACP final is separate: fleet extracts it from
+the completed turn and deterministically replies to the initiating owner wire.
+
+The bounded mode-0600 route state stores CIDs, wire IDs, timestamps, delivery state,
+and hashes but never message plaintext. Unauthorized attempts produce a bounded
+CID-only owner warning; attempted bodies are neither reflected nor persisted.
+
+For a mobile owner, establish the contact first, wait for peer verification,
+authorize its exact CID, and revoke that same CID when access ends. The bounded
+mode-0600 CID overlay survives supervisor restart and remains fail-closed on
+corruption. Update bodies remain memory-only. After a crash/restart, unfinished
+deferred owner input follows the existing at-least-once replay path; the restarted
+supervisor remains the sole binder.
 
 ## Stable config and YAML migration
 

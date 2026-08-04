@@ -158,6 +158,27 @@ describe('runOnce isolation', () => {
     expect(paneCommands[0]).toContain('__ofs=$?');           // exit capture preserved
   });
 
+  it('resolves and read-only binds a home-scoped tmux launcher', async () => {
+    const binDir = join(dir, '.local', 'bin');
+    const launcher = join(binDir, 'home-launcher');
+    mkdirSync(binDir, { recursive: true });
+    writeFileSync(launcher, '#!/bin/sh\nexit 0\n', { mode: 0o755 });
+    registerAdapter({
+      ...fakeAdapter,
+      id: 'home-runtime',
+      buildLaunch: (_role, _mode, _state, prep) => ({ argv: ['home-launcher'], env: prep.env }),
+    });
+    writeCfg({ A: { harness: 'home-runtime', isolation: {} } });
+    const d = agentDir('A'); mkdirSync(d, { recursive: true });
+    const { deps, paneCommands } = fakeWorld({ exitCode: '0', exitFile: join(d, '.exit-status') });
+    const oldPath = process.env.PATH;
+    process.env.PATH = `${binDir}:${oldPath ?? ''}`;
+    try { await runOnce('A', {}, deps); }
+    finally { process.env.PATH = oldPath; }
+    expect(paneCommands[0]).toContain(`'--ro-bind-try' '${launcher}' '${launcher}'`);
+    expect(paneCommands[0]).toMatch(new RegExp(`'--'.*'${launcher}'`));
+  });
+
   it('does not wrap when the role has no isolation block', async () => {
     writeCfg({ A: { harness: 'fake' } });
     const d = agentDir('A'); mkdirSync(d, { recursive: true });
@@ -507,6 +528,21 @@ describe('runOnce ACP startup outcome (1.2)', () => {
     expect(logs.some(l => l.includes('[A] up;'))).toBe(false);
   });
 
+  it('delivers the adapter-computed permission mode to the ACP session', async () => {
+    registerAdapter({ ...acpAdapter, id: 'fake-acp-mode', acpPermissionModeId: () => 'acceptEdits' });
+    writeCfg({ A: {
+      harness: 'fake-acp-mode', session: 'acp',
+      env: { ACP_FIXTURE_EXIT_AFTER: '1' },
+    } });
+    mkdirSync(agentDir('A'), { recursive: true });
+    const { deps } = acpDeps();
+
+    await runOnce('A', {}, deps);
+    const events = readFileSync(join(agentDir('A'), '.session-events.jsonl'), 'utf8')
+      .trim().split('\n').map(line => JSON.parse(line) as { kind: string; text?: string });
+    expect(events.some(e => e.kind === 'agent_text' && e.text === 'mode:acceptEdits')).toBe(true);
+  });
+
   it('warns once at startup that an unattended role auto-denies (1.3)', async () => {
     writeCfg({ A: {
       harness: 'fake-acp', session: 'acp',
@@ -593,6 +629,54 @@ describe('runOnce ACP startup outcome (1.2)', () => {
     await runOnce('A', {}, deps);
     expect(logs.some(l => l.includes('[A] up;') && l.includes('session=acp'))).toBe(true);
   });
+
+  it('starts and stops the owner channel with the live ACP session', async () => {
+    writeCfg({ A: {
+      harness: 'fake-acp', session: 'acp',
+      owner_channel: { identity: 'A-owner', owners: ['owner-cid'] },
+      env: { ACP_FIXTURE_EXIT_AFTER: '1' },
+    } });
+    mkdirSync(agentDir('A'), { recursive: true });
+    const { deps } = acpDeps();
+    let started = 0;
+    let closed = 0;
+    deps.createOwnerChannel = options => {
+      expect(options.role).toBe('A');
+      expect(options.config.identity).toBe('A-owner');
+      expect(options.session.backend).toBe('acp');
+      return {
+        start: async () => { started++; },
+        drain: async () => {},
+        close: async () => { closed++; },
+        manage: async () => { throw new Error('not used'); },
+      };
+    };
+
+    await runOnce('A', {}, deps);
+    expect(started).toBe(1);
+    expect(closed).toBe(1);
+  });
+
+  it('starts scheduled loops only after ACP startup and stops them before teardown', async () => {
+    writeFileSync(join(dir, 'fleet.yaml'), stringify({
+      roles: { A: {
+        harness: 'fake-acp', session: 'acp',
+        env: { ACP_FIXTURE_EXIT_AFTER: '2' },
+      } },
+      loops: { health: {
+        roles: ['A'], interval: '1m', initial_delay: '0s', prompt: 'bounded health pass',
+      } },
+    }), { mode: 0o600 });
+    const stateDir = agentDir('A');
+    mkdirSync(stateDir, { recursive: true });
+    const { deps, logs } = acpDeps();
+    await runOnce('A', {}, deps);
+    const state = JSON.parse(readFileSync(join(stateDir, '.scheduled-loops.json'), 'utf8'));
+    expect(state.loops.health.counts).toMatchObject({ started: 1, completed: 1 });
+    expect(state.loops.health.activeRunId).toBeNull();
+    expect(logs.some(line => line.includes('loop health started'))).toBe(true);
+    expect(JSON.stringify(state)).not.toContain('bounded health pass');
+  }, 20_000);
 
   it('steers an interrupting wake during ACP startup instead of cancelling startup', async () => {
     writeCfg({ A: {

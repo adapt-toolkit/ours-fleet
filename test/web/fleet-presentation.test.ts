@@ -1,9 +1,12 @@
 import { describe, expect, it } from 'vitest';
 import { isInactive, needsAttention, presentFleet } from '../../web/src/fleet-presentation.js';
 
-const item = (id: string, overall: string, liveness = 'running', reachability = 'online') => ({
+const item = (
+  id: string, overall: string, liveness = 'running', reachability = 'online',
+  problems: Array<{ source?: string }> = [],
+) => ({
   role: { id, config: { mission: `${id} mission` } },
-  status: { overall, supervisor: { liveness }, session: { reachability } },
+  status: { overall, supervisor: { liveness }, session: { reachability }, problems },
 });
 
 describe('active-first fleet presentation', () => {
@@ -30,5 +33,12 @@ describe('active-first fleet presentation', () => {
     expect(presentFleet([warning, unknown, stopped], {
       filter: '', showInactive: true, attentionOnly: true,
     }).map(value => value.role.id)).toEqual(['Unknown', 'Warning']);
+  });
+
+  it('matches filter text "watchdog" for items carrying a source: watchdog problem', () => {
+    const flagged = item('Flagged', 'attention', 'running', 'online', [{ source: 'watchdog' }]);
+    const plain = item('Plain', 'attention');
+    expect(presentFleet([flagged, plain], { filter: 'watchdog', showInactive: true, attentionOnly: false })
+      .map(value => value.role.id)).toEqual(['Flagged']);
   });
 });

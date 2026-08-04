@@ -26,6 +26,65 @@ test('bootstrap, inventory, live navigation, send, create, and security boundari
   await expect(page.getByRole('button', { name: 'Start' })).toBeVisible();
   await expect(page.getByRole('button', { name: 'Stop' })).toHaveCount(0);
   await expect(page.getByRole('button', { name: 'Restart & resume' })).toHaveCount(0);
+
+  await page.getByRole('button', { name: 'Watchdogs' }).click();
+  await expect(page.getByRole('heading', { name: 'Watchdogs' })).toBeVisible();
+  await expect(page.getByRole('button', { name: /nightwatch/ })).toBeVisible();
+  await expect(page.locator('.status-chip.attention').first()).toContainText('Attention');
+  await page.getByRole('button', { name: /nightwatch/ }).click();
+  await expect(page.getByRole('heading', { name: 'nightwatch' })).toBeVisible();
+  await expect(page.getByText('20260731T120000Z')).toBeVisible();
+  await expect(page.getByText('20260731T110000Z')).toBeVisible();
+  await expect(page.getByText('20260731T100000Z')).toBeVisible();
+  const aliceRow = page.locator('.watchdog-role', { hasText: 'Alice' });
+  await expect(aliceRow).toContainText('blocked');
+  await expect(aliceRow).toContainText('Waiting on a trust dialog.');
+  await expect(aliceRow).toContainText('expected: healthy — observed: blocked: Waiting on a trust dialog.');
+  await expect(aliceRow).toContainText('alerted -> FleetCoordinator at');
+  // <details> content is present in the DOM (and would satisfy toContainText)
+  // even while collapsed, so the only real proof the toggle works is visibility.
+  const evidenceItem = aliceRow.getByText('[status] readiness=awaiting_permission');
+  await expect(evidenceItem).not.toBeVisible();
+  await aliceRow.getByText('Evidence (1)').click();
+  await expect(evidenceItem).toBeVisible();
+  const watchdogView = page.locator('.watchdog-detail');
+  await expect(watchdogView.getByRole('button', { name: /restart|stop|send/i })).toHaveCount(0);
+  // Stub writeText instead of exercising the real OS clipboard (no clipboard-write
+  // permission is granted to this context, and readText additionally needs
+  // clipboard-read) — this still proves the button calls the Clipboard API with
+  // the exact JSON.stringify(report, null, 2) payload the CLI's --json prints.
+  await page.evaluate(() => {
+    (window as unknown as { __copiedJson: string }).__copiedJson = '';
+    navigator.clipboard.writeText = async text => {
+      (window as unknown as { __copiedJson: string }).__copiedJson = text;
+    };
+  });
+  await page.getByRole('button', { name: 'Copy JSON' }).click();
+  await expect(page.getByRole('button', { name: 'Copied!' })).toBeVisible();
+  const copiedJson = await page.evaluate(() => (window as unknown as { __copiedJson: string }).__copiedJson);
+  expect(JSON.parse(copiedJson)).toMatchObject({ watchdog: 'nightwatch', run_id: '20260731T120000Z', status: 'anomalies' });
+
+  // Run-switching: selecting the older (all-healthy) run must replace the
+  // panel, not just append to it — the newest run's blocked finding should
+  // be gone entirely, and Alice should read as a plain healthy row.
+  await page.getByRole('button', { name: /20260731T110000Z/ }).click();
+  await expect(aliceRow).toContainText('healthy');
+  await expect(page.getByText('blocked')).toHaveCount(0);
+  await expect(page.getByText('Waiting on a trust dialog.')).toHaveCount(0);
+  await expect(page.getByText(/expected: healthy — observed:/)).toHaveCount(0);
+  await expect(page.getByText(/alerted ->/)).toHaveCount(0);
+  await expect(page.getByText('suppressed (open finding within cooldown)')).toHaveCount(0);
+
+  // Error report: the per-role table is replaced entirely by the error
+  // message and diagnostic tail.
+  await page.getByRole('button', { name: /20260731T100000Z/ }).click();
+  await expect(page.getByText('timeout')).toBeVisible();
+  await expect(page.locator('pre')).toContainText('connection refused');
+  await expect(page.locator('.watchdog-role')).toHaveCount(0);
+
+  await page.getByRole('button', { name: '← Back to watchdogs' }).click();
+  await expect(page.getByRole('heading', { name: 'Watchdogs' })).toBeVisible();
+
   await page.getByRole('button', { name: 'All roles' }).click();
   const manifest = await request.get('/manifest.webmanifest');
   expect(manifest.status()).toBe(200);

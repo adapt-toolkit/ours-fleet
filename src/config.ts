@@ -9,6 +9,10 @@ import {
 } from './isolation/policy.js';
 import { getAdapter } from './harness/registry.js';
 import type { IsolationConfig, WrapContext } from './isolation/types.js';
+import { resolveWatchdogs } from './watchdog/config.js';
+import type { ResolvedWatchdog } from './watchdog/config.js';
+import { resolveLoops } from './loops/config.js';
+import type { ResolvedLoop, ResolvedRoleLoop } from './loops/config.js';
 
 export interface OverseeEntry { role: string; interval: string }
 export interface WorklogPolicy {
@@ -71,6 +75,44 @@ export interface MonitorConfig {
    */
   turn_fail_threshold?: number;
 }
+
+/** A trusted, fleet-owned ours mailbox which is never bound inside the agent. */
+export interface OwnerChannelConfig {
+  /** Existing ours identity exclusively bound by the fleet supervisor. */
+  identity: string;
+  /** Authenticated ours contact IDs allowed to issue owner instructions. */
+  owners: string[];
+  /** Exact managed-agent CID whose messages may be relayed outward. */
+  agent?: string;
+  /** Cancel active work before each owner request instead of queueing it. */
+  interrupt: boolean;
+  /** Deterministic in-progress notice interval; 0 disables progress notices. */
+  progress_interval_ms: number;
+  attachments: OwnerAttachmentConfig;
+}
+
+export interface OwnerAttachmentConfig {
+  enabled: boolean;
+  max_files_per_request: number;
+  max_file_bytes: number;
+  max_request_bytes: number;
+  retention_ms: number;
+  allowed_mime: string[];
+}
+
+export type OwnerChannelConfigInput = Omit<Partial<OwnerChannelConfig>, 'attachments'> & {
+  attachments?: Partial<OwnerAttachmentConfig>;
+};
+
+export const DEFAULT_OWNER_ATTACHMENT_MIME = [
+  'application/pdf', 'application/json', 'text/plain',
+  'image/png', 'image/jpeg', 'image/gif', 'image/webp',
+  'audio/ogg', 'audio/mpeg', 'audio/wav', 'audio/x-wav', 'audio/mp4', 'audio/webm',
+  'application/msword', 'application/vnd.ms-excel', 'application/vnd.ms-powerpoint',
+  'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+  'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+  'application/vnd.openxmlformats-officedocument.presentationml.presentation',
+] as const;
 
 /** Default wake sources when a role does not list its own (design §2). */
 export const DEFAULT_WAKE_SOURCES: NotifyEventType[] =
@@ -147,11 +189,12 @@ export interface RoleConfig {
   harness_options?: Record<string, unknown>;
   isolation?: IsolationConfig;
   monitor?: Partial<MonitorConfig>;
+  owner_channel?: OwnerChannelConfigInput;
   worklog?: WorklogPolicy;
   auth_proxy?: Partial<AuthProxyConfig>;
 }
 
-export interface ResolvedRole extends Omit<RoleConfig, 'model'> {
+export interface ResolvedRole extends Omit<RoleConfig, 'model' | 'owner_channel'> {
   name: string;
   harness: string;
   session: SessionBackendId;
@@ -167,8 +210,10 @@ export interface ResolvedRole extends Omit<RoleConfig, 'model'> {
   model?: string;
   sourceFile: string;
   monitor: MonitorConfig;
+  owner_channel?: OwnerChannelConfig;
   worklog?: WorklogPolicy;
   auth_proxy?: AuthProxyConfig;
+  loops?: ResolvedRoleLoop[];
 }
 
 export interface FleetConfig {
@@ -180,6 +225,8 @@ export interface FleetConfig {
   startStaggerMs: number;
   /** Warning-first non-plain YAML migration diagnostics, in source order. */
   diagnostics: ConfigDiagnostic[];
+  watchdogs: ResolvedWatchdog[];
+  loops: ResolvedLoop[];
 }
 
 export class ConfigError extends Error {}
@@ -229,7 +276,7 @@ export const ROLE_NAME_RE = /^[A-Za-z0-9_-]+$/;
 const ROLE_KEYS = [
   'harness', 'session', 'session_options', 'permissions', 'identity', 'cwd', 'coordinator', 'mission', 'persona', 'bio',
   'briefing_file', 'model', 'model_chain', 'max_tokens', 'autocompact_pct', 'env', 'oversee', 'harness_options',
-  'isolation', 'monitor', 'worklog', 'auth_proxy',
+  'isolation', 'monitor', 'owner_channel', 'worklog', 'auth_proxy',
 ];
 
 function deepSub(v: unknown, vars: Record<string, string>): unknown {
@@ -313,6 +360,8 @@ export function loadConfig(
           throw new ConfigError(`${file}: role '${name}' ${problems.join('; ')}`);
       }
       const monitor = resolveMonitorConfig(defaults.monitor, r.monitor, { base, file, name });
+      const ownerChannel = resolveOwnerChannelConfig(
+        defaults.owner_channel, r.owner_channel, session, file, name);
       const worklog = resolveWorklogPolicy(defaults.worklog, r.worklog, file, name);
       const authProxy = resolveAuthProxy(defaults.auth_proxy, r.auth_proxy, file, name);
       const harness = r.harness ?? (defaults.harness as string | undefined) ?? 'claude-code';
@@ -350,9 +399,11 @@ export function loadConfig(
         harness_options: harnessOptions,
         isolation,
         monitor,
+        owner_channel: ownerChannel,
         worklog,
         auth_proxy: authProxy,
         env: Object.keys(env).length ? env : undefined,
+        loops: [],
       });
       // Forbidden-path enforcement (5.2): a mount that would breach the policy
       // is a configuration error, caught by `config` rather than at launch.
@@ -365,7 +416,150 @@ export function loadConfig(
       }
     }
   }
-  return { roles, vars, defaults, files, startStaggerMs, diagnostics };
+  validateOwnerChannelIdentities(roles);
+  const watchdogs = resolveWatchdogs(baseDoc, base, roles, vars, defaults);
+  const resolvedLoops = resolveLoops(baseDoc.loops, base, roles, vars);
+  for (const role of roles) role.loops = resolvedLoops.byRole.get(role.name) ?? [];
+  return {
+    roles, vars, defaults, files, startStaggerMs, diagnostics, watchdogs,
+    loops: resolvedLoops.loops,
+  };
+}
+
+/**
+ * Canonical form of a 64-hex container ID for authorization decisions. Hex
+ * case is not identity: two casings of one CID are the same peer, so every
+ * comparison must use this form. Addressing is the opposite — the daemon's
+ * contact resolution is case-exact, so daemon-delivered forms must be sent
+ * back verbatim and never rewritten to canonical case.
+ */
+export function canonicalCid(value: string): string {
+  return /^[A-Fa-f0-9]{64}$/.test(value) ? value.toLowerCase() : value;
+}
+
+export function resolveOwnerChannelConfig(
+  defaults: unknown, role: OwnerChannelConfigInput | undefined,
+  session: SessionBackendId, file = 'config', name = 'role',
+): OwnerChannelConfig | undefined {
+  if (defaults === undefined && role === undefined) return undefined;
+  if (defaults !== undefined && !isPlainObject(defaults))
+    throw new ConfigError(`${file}: defaults.owner_channel must be a map`);
+  if (role !== undefined && !isPlainObject(role))
+    throw new ConfigError(`${file}: role '${name}' owner_channel must be a map`);
+  const defaultInput = (defaults ?? {}) as OwnerChannelConfigInput;
+  const merged = {
+    ...defaultInput,
+    ...(role ?? {}),
+  };
+  const allowed = ['identity', 'owners', 'agent', 'interrupt', 'progress_interval_ms', 'attachments'];
+  const bad = Object.keys(merged).filter(key => !allowed.includes(key));
+  if (bad.length)
+    throw new ConfigError(`${file}: role '${name}' owner_channel: unknown key(s) ${bad.join(', ')}`);
+  if (typeof merged.identity !== 'string' || !merged.identity.trim())
+    throw new ConfigError(`${file}: role '${name}' owner_channel.identity must be a non-blank string`);
+  if (!Array.isArray(merged.owners) || merged.owners.length === 0
+      || merged.owners.some(owner => typeof owner !== 'string' || !owner.trim()))
+    throw new ConfigError(`${file}: role '${name}' owner_channel.owners must be a non-empty list of contact IDs`);
+  const owners = merged.owners.map(owner => canonicalCid(owner.trim()));
+  if (new Set(owners).size !== owners.length)
+    throw new ConfigError(`${file}: role '${name}' owner_channel.owners must not contain duplicates`);
+  if (merged.agent !== undefined
+      && (typeof merged.agent !== 'string' || !/^[A-Fa-f0-9]{64}$/.test(merged.agent)))
+    throw new ConfigError(
+      `${file}: role '${name}' owner_channel.agent must be exactly 64 hexadecimal characters`);
+  const agent = merged.agent === undefined ? undefined : canonicalCid(merged.agent.trim());
+  if (agent && owners.includes(agent))
+    throw new ConfigError(
+      `${file}: role '${name}' owner_channel.agent must not also be an owner CID`);
+  if (agent && owners.some(owner => !/^[A-Fa-f0-9]{64}$/.test(owner)))
+    throw new ConfigError(
+      `${file}: role '${name}' owner_channel.owners must contain exact 64-hex CIDs when agent relay is configured`);
+  if (merged.interrupt !== undefined && typeof merged.interrupt !== 'boolean')
+    throw new ConfigError(`${file}: role '${name}' owner_channel.interrupt must be true or false`);
+  if (merged.progress_interval_ms !== undefined
+      && (typeof merged.progress_interval_ms !== 'number'
+        || !Number.isFinite(merged.progress_interval_ms) || merged.progress_interval_ms < 0))
+    throw new ConfigError(
+      `${file}: role '${name}' owner_channel.progress_interval_ms must be a non-negative number`);
+  if (defaultInput.attachments !== undefined && !isPlainObject(defaultInput.attachments))
+    throw new ConfigError(`${file}: defaults.owner_channel.attachments must be a map`);
+  if (role?.attachments !== undefined && !isPlainObject(role.attachments))
+    throw new ConfigError(`${file}: role '${name}' owner_channel.attachments must be a map`);
+  const attachments = {
+    ...(defaultInput.attachments ?? {}), ...(role?.attachments ?? {}),
+  } as Partial<OwnerAttachmentConfig>;
+  const attachmentKeys = [
+    'enabled', 'max_files_per_request', 'max_file_bytes', 'max_request_bytes',
+    'retention_ms', 'allowed_mime',
+  ];
+  const badAttachmentKeys = Object.keys(attachments)
+    .filter(key => !attachmentKeys.includes(key));
+  if (badAttachmentKeys.length)
+    throw new ConfigError(
+      `${file}: role '${name}' owner_channel.attachments: unknown key(s) ${badAttachmentKeys.join(', ')}`);
+  if (attachments.enabled !== undefined && typeof attachments.enabled !== 'boolean')
+    throw new ConfigError(`${file}: role '${name}' owner_channel.attachments.enabled must be true or false`);
+  const boundedInteger = (key: keyof OwnerAttachmentConfig, min: number, max: number) => {
+    const value = attachments[key];
+    if (value !== undefined && (typeof value !== 'number' || !Number.isSafeInteger(value)
+        || value < min || value > max))
+      throw new ConfigError(
+        `${file}: role '${name}' owner_channel.attachments.${key} must be an integer from ${min} to ${max}`);
+  };
+  boundedInteger('max_files_per_request', 1, 32);
+  boundedInteger('max_file_bytes', 1, 100 * 1024 * 1024);
+  boundedInteger('max_request_bytes', 1, 256 * 1024 * 1024);
+  boundedInteger('retention_ms', 60_000, 30 * 24 * 60 * 60 * 1_000);
+  const maxFileBytes = attachments.max_file_bytes ?? 10 * 1024 * 1024;
+  const maxRequestBytes = attachments.max_request_bytes ?? 20 * 1024 * 1024;
+  if (maxRequestBytes < maxFileBytes)
+    throw new ConfigError(
+      `${file}: role '${name}' owner_channel.attachments.max_request_bytes must be at least max_file_bytes`);
+  const allowedMime = attachments.allowed_mime ?? [...DEFAULT_OWNER_ATTACHMENT_MIME];
+  if (!Array.isArray(allowedMime) || allowedMime.length < 1 || allowedMime.length > 64
+      || allowedMime.some(mime => typeof mime !== 'string'
+        || !/^[a-z0-9][a-z0-9!#$&^_.+-]*\/[a-z0-9][a-z0-9!#$&^_.+-]*$/.test(mime)))
+    throw new ConfigError(
+      `${file}: role '${name}' owner_channel.attachments.allowed_mime must contain 1-64 lowercase MIME types`);
+  if (new Set(allowedMime).size !== allowedMime.length)
+    throw new ConfigError(
+      `${file}: role '${name}' owner_channel.attachments.allowed_mime must not contain duplicates`);
+  if (session !== 'acp')
+    throw new ConfigError(
+      `${file}: role '${name}' owner_channel requires session: acp for correlated final replies`);
+  return {
+    identity: merged.identity.trim(),
+    owners,
+    ...(agent ? { agent } : {}),
+    interrupt: merged.interrupt ?? false,
+    progress_interval_ms: merged.progress_interval_ms ?? 30_000,
+    attachments: {
+      enabled: attachments.enabled ?? true,
+      max_files_per_request: attachments.max_files_per_request ?? 4,
+      max_file_bytes: maxFileBytes,
+      max_request_bytes: maxRequestBytes,
+      retention_ms: attachments.retention_ms ?? 24 * 60 * 60 * 1_000,
+      allowed_mime: [...allowedMime],
+    },
+  };
+}
+
+function validateOwnerChannelIdentities(roles: ResolvedRole[]): void {
+  const roleIdentities = new Map(roles.map(role => [role.identity, role.name]));
+  const channels = new Map<string, string>();
+  for (const role of roles) {
+    const identity = role.owner_channel?.identity;
+    if (!identity) continue;
+    const roleOwner = roleIdentities.get(identity);
+    if (roleOwner)
+      throw new ConfigError(
+        `${role.sourceFile}: role '${role.name}' owner_channel.identity '${identity}' conflicts with role '${roleOwner}' identity`);
+    const channelOwner = channels.get(identity);
+    if (channelOwner)
+      throw new ConfigError(
+        `${role.sourceFile}: owner_channel.identity '${identity}' is shared by roles '${channelOwner}' and '${role.name}'`);
+    channels.set(identity, role.name);
+  }
 }
 
 export function resolveModelChain(

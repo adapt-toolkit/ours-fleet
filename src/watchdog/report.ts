@@ -1,0 +1,145 @@
+export const WATCHDOG_ROLE_STATUSES = ['healthy', 'idle', 'stale', 'blocked', 'off_briefing', 'unreachable', 'unknown'] as const;
+export type WatchdogRoleStatus = typeof WATCHDOG_ROLE_STATUSES[number];
+
+export interface WatchdogEvidence { source: string; detail: string; observed_at: string }
+export interface WatchdogFinding {
+  role: string; status: WatchdogRoleStatus; reason?: string;
+  evidence?: WatchdogEvidence[]; alerted?: boolean;
+}
+export interface WatchdogAlert { role: string; code: string; coordinator: string; sent_at: string }
+export type WatchdogReportStatus = 'ok' | 'anomalies' | 'error';
+export interface WatchdogReport {
+  schema_version: 1; watchdog: string; run_id: string;
+  started_at: string; finished_at: string; status: WatchdogReportStatus;
+  summary: { checked: number; healthy: number; idle: number; anomalies: number };
+  roles: WatchdogFinding[]; alerts: WatchdogAlert[]; error: string | null;
+}
+
+const SUMMARY_KEYS = ['checked', 'healthy', 'idle', 'anomalies'] as const;
+
+function isPlainObject(v: unknown): v is Record<string, unknown> {
+  return typeof v === 'object' && v !== null && !Array.isArray(v);
+}
+
+export function validateWatchdogReport(v: unknown): string[] {
+  const errors: string[] = [];
+  if (!isPlainObject(v)) {
+    errors.push('report: expected an object');
+    return errors;
+  }
+  const r = v;
+
+  if (r.schema_version !== 1) errors.push('schema_version: expected 1');
+
+  for (const key of ['watchdog', 'run_id', 'started_at', 'finished_at'] as const)
+    if (typeof r[key] !== 'string') errors.push(`${key}: expected a string`);
+
+  if (r.status !== 'ok' && r.status !== 'anomalies' && r.status !== 'error')
+    errors.push(`status: expected ok|anomalies|error, got '${String(r.status)}'`);
+
+  if (!isPlainObject(r.summary)) {
+    errors.push('summary: expected an object');
+  } else {
+    for (const key of SUMMARY_KEYS)
+      if (typeof r.summary[key] !== 'number') errors.push(`summary.${key}: expected a number`);
+  }
+
+  if (!Array.isArray(r.roles)) {
+    errors.push('roles: expected an array');
+  } else {
+    r.roles.forEach((role, i) => {
+      if (!isPlainObject(role)) {
+        errors.push(`roles[${i}]: expected an object`);
+        return;
+      }
+      if (typeof role.role !== 'string') errors.push(`roles[${i}].role: expected a string`);
+      if (!(WATCHDOG_ROLE_STATUSES as readonly string[]).includes(role.status as string))
+        errors.push(`roles[${i}].status: expected one of ${WATCHDOG_ROLE_STATUSES.join('|')}, got '${String(role.status)}'`);
+      if (role.status !== 'healthy' && role.status !== 'idle' && !role.reason)
+        errors.push(`roles[${i}]: non-healthy finding requires a reason`);
+      if (role.reason !== undefined && typeof role.reason !== 'string')
+        errors.push(`roles[${i}].reason: expected a string`);
+      if (role.evidence !== undefined) {
+        if (!Array.isArray(role.evidence)) {
+          errors.push(`roles[${i}].evidence: expected an array`);
+        } else {
+          role.evidence.forEach((ev, j) => {
+            if (!isPlainObject(ev)) {
+              errors.push(`roles[${i}].evidence[${j}]: expected an object`);
+              return;
+            }
+            for (const key of ['source', 'detail', 'observed_at'] as const)
+              if (typeof ev[key] !== 'string') errors.push(`roles[${i}].evidence[${j}].${key}: expected a string`);
+          });
+        }
+      }
+    });
+  }
+
+  if (!Array.isArray(r.alerts)) {
+    errors.push('alerts: expected an array');
+  } else {
+    r.alerts.forEach((alert, i) => {
+      if (!isPlainObject(alert)) {
+        errors.push(`alerts[${i}]: expected an object`);
+        return;
+      }
+      for (const key of ['role', 'code', 'coordinator', 'sent_at'] as const)
+        if (typeof alert[key] !== 'string') errors.push(`alerts[${i}].${key}: expected a string`);
+    });
+  }
+
+  if (r.error !== null && typeof r.error !== 'string') errors.push('error: expected string or null');
+
+  return errors;
+}
+
+const cleanEvidence = (value: string, max = 280) =>
+  value.replace(/[\0-\x08\x0b\x0c\x0e-\x1f\x7f]/g, '').trim().slice(0, max);
+
+export function normalizeWatchdogReport(r: WatchdogReport, ctx: { watchdog: string; run_id: string }): WatchdogReport {
+  const copy: WatchdogReport = JSON.parse(JSON.stringify(r));
+  copy.watchdog = ctx.watchdog;
+  copy.run_id = ctx.run_id;
+  copy.roles = copy.roles.map(role => {
+    // Rebuilt from ONLY the known fields (final review #6a) — the old
+    // `{ ...role }` spread let any unknown per-finding key (e.g. an agent
+    // dumping a huge `pane_dump`) ride unbounded into the store. Report-level
+    // extras (tail/isolation) are untouched here and stay tolerated; this is
+    // a per-finding allowlist only.
+    const next: WatchdogFinding = { role: role.role, status: role.status };
+    if (role.reason !== undefined) next.reason = cleanEvidence(role.reason);
+    if (role.evidence !== undefined) {
+      next.evidence = role.evidence.slice(0, 3).map(ev => ({
+        source: cleanEvidence(ev.source),
+        detail: cleanEvidence(ev.detail),
+        observed_at: cleanEvidence(ev.observed_at),
+      }));
+    }
+    if (role.alerted !== undefined) next.alerted = Boolean(role.alerted);
+    return next;
+  });
+  return copy;
+}
+
+export function errorReport(ctx: {
+  watchdog: string; run_id: string; started_at: string; finished_at: string; error: string; tail?: string;
+}): WatchdogReport & { tail?: string } {
+  return {
+    schema_version: 1,
+    watchdog: ctx.watchdog,
+    run_id: ctx.run_id,
+    started_at: ctx.started_at,
+    finished_at: ctx.finished_at,
+    status: 'error',
+    summary: { checked: 0, healthy: 0, idle: 0, anomalies: 0 },
+    roles: [],
+    alerts: [],
+    // Scheduler-built error strings can embed raw agent-controlled bytes
+    // (JSON.parse messages, validator interpolations of agent-supplied
+    // values) and are stored+printed as-is elsewhere — clean them the same
+    // way finding-level text is cleaned (final review #6b).
+    error: cleanEvidence(ctx.error),
+    ...(ctx.tail !== undefined ? { tail: ctx.tail.slice(-4096) } : {}),
+  };
+}

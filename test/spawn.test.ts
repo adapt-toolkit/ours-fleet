@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
-import { mkdtempSync, writeFileSync, readFileSync, readdirSync, existsSync, rmSync } from 'node:fs';
+import { chmodSync, mkdtempSync, writeFileSync, readFileSync, readdirSync, existsSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { parse, stringify } from 'yaml';
@@ -248,6 +248,18 @@ describe('spawnTemp', () => {
     const snap = parse(readFileSync(join(d, 'role.yaml'), 'utf8'));
     expect(snap.harness).toBe('codex');
     expect(snap.session).toBe('acp');
+  });
+
+  it('never inherits wildcard scheduled loops into a temporary role', async () => {
+    writeFileSync(join(dir, 'fleet.yaml'), stringify({
+      defaults: { harness: 'fake', session: 'acp' },
+      roles: { Permanent: { session: 'acp' } },
+      loops: { pass: { roles: ['*'], interval: '5m', prompt: 'permanent-only pass' } },
+    }), { mode: 0o600 });
+    chmodSync(join(dir, 'fleet.yaml'), 0o600);
+    const d = await spawnTemp({ name: 'TempLoop', session: 'acp' }, '/b/ours-fleet', () => {});
+    const snap = parse(readFileSync(join(d, 'role.yaml'), 'utf8'));
+    expect(snap.loops).toBeUndefined();
   });
 });
 
@@ -693,6 +705,19 @@ describe('creation provenance (6.6)', () => {
     const d = await spawnTemp({ name: 'Scout', mission: 'recon' }, '/b/ours-fleet', () => {});
     void d;
     expect(provenanceOf('Scout', true).lifetime).toBe('temporary');
+  });
+
+  it('records an explicit --permission-mode, and omits it when unset', async () => {
+    const { d } = fakeDeps();
+    await spawnPermanent({
+      name: 'Moded', harness: 'claude-code', permissionMode: 'dontAsk',
+    }, d);
+    expect(provenanceOf('Moded').settings.permission_mode)
+      .toEqual({ value: 'dontAsk', source: 'cli' });
+
+    await spawnPermanent({ name: 'Unmoded' }, d);
+    expect(provenanceOf('Unmoded').settings.permission_mode.value).toBeUndefined();
+    expect(formatProvenance(provenanceOf('Unmoded')).join('\n')).not.toContain('permission_mode');
   });
 
   it('NEVER records secrets, env, bio or persona', async () => {

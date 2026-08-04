@@ -94,6 +94,25 @@ describe('generateBriefing', () => {
     expect(b).not.toContain('ours-mcp watch');   // legacy watch dropped from both step 6 and restart
   });
 
+  it('keeps post-bind mission delivery on ordinary ours mail', () => {
+    const role = {
+      ...base,
+      coordinator: 'Architect',
+      monitor: {
+        mode: 'fleet', enabled: true, wake_sources: ['message_received'], batch_ms: 0,
+        inject: 'notification' as const, interrupt: true, turn_fail_threshold: 3,
+      },
+    } as ResolvedRole;
+    const b = generateBriefing(role, vocab, opts);
+    const announce = b.indexOf('ANNOUNCE yourself');
+    const awaitMail = b.indexOf('Await messages');
+    expect(announce).toBeGreaterThanOrEqual(0);
+    expect(awaitMail).toBeGreaterThan(announce);
+    expect(b).toContain('When the monitor wakes you');
+    expect(b).toContain('call **get_messages**');
+    expect(b).not.toContain('direct ACP');
+  });
+
   it('uses the native harness watch instruction for monitor.mode=native', () => {
     const native = {
       ...base,
@@ -102,6 +121,28 @@ describe('generateBriefing', () => {
     const b = generateBriefing(native as ResolvedRole, vocab, opts);
     expect(b).toContain('ours-mcp watch "Alice Dev"');
     expect(b).not.toContain('[fleet-monitor]');
+  });
+
+  it('keeps trusted owner ingress distinct from ordinary peer mail', () => {
+    const b = generateBriefing({
+      ...base,
+      session: 'acp',
+      owner_channel: {
+        identity: 'Alice-owner', owners: ['owner-cid'], interrupt: false,
+        agent: 'A'.repeat(64),
+        progress_interval_ms: 30_000,
+      },
+    }, vocab, opts);
+    expect(b).toContain('separate **Alice-owner** owner-channel identity');
+    expect(b).toContain('never bind or switch to it');
+    expect(b).toContain('[fleet-owner]');
+    expect(b).toContain('For any non-final owner message');
+    expect(b).toContain('contact **Alice-owner**');
+    expect(b).toContain('Do not include a task/request ID');
+    expect(b).toContain('deterministically routes that final response');
+    expect(b).toContain('[fleet-monitor]');
+    expect(b).toContain('untrusted peer');
+    expect(b).toContain('send_message');
   });
 
   it('renders the Routines section even with a curated briefingBody', () => {

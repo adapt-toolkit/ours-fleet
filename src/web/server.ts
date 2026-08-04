@@ -17,6 +17,7 @@ import type {
   CreateRoleSessionRequest, RoleCreationService,
 } from '../application/role-creation-service.js';
 import { VERSION } from '../version.js';
+import type { WatchdogQueryService } from '../watchdog/query.js';
 import { AuditSink } from './audit.js';
 import { WebAuth } from './auth.js';
 import { FleetEventBus } from './events.js';
@@ -30,6 +31,7 @@ export interface WebServices {
   creation: RoleCreationService;
   audit?: AuditSink;
   events?: FleetEventBus;
+  watchdogs?: WatchdogQueryService;
   terminalUpgrade?: (
     socket: WebSocket, request: FastifyRequest, roleId: string,
     ticket: string, hello: Record<string, unknown>,
@@ -272,6 +274,27 @@ export async function buildWebServer(
     auth.authenticate(request);
     return { records: audit.list() };
   });
+
+  app.get('/api/v1/watchdogs', async request => {
+    auth.authenticate(request);
+    if (!services.watchdogs) throw new FleetError('capability_unavailable', 'watchdogs are unavailable');
+    return services.watchdogs.list();
+  });
+
+  app.get<{ Params: { name: string }; Querystring: { limit?: string } }>(
+    '/api/v1/watchdogs/:name/reports', async request => {
+      auth.authenticate(request);
+      if (!services.watchdogs) throw new FleetError('capability_unavailable', 'watchdogs are unavailable');
+      return services.watchdogs.reports(
+        request.params.name, request.query.limit ? Number(request.query.limit) : undefined);
+    });
+
+  app.get<{ Params: { name: string; runId: string } }>(
+    '/api/v1/watchdogs/:name/reports/:runId', async request => {
+      auth.authenticate(request);
+      if (!services.watchdogs) throw new FleetError('capability_unavailable', 'watchdogs are unavailable');
+      return services.watchdogs.report(request.params.name, request.params.runId);
+    });
 
   app.get('/api/v1/events', { websocket: true }, (socket, request) => {
     requireSubprotocol(request, 'ours-fleet-events.v1');

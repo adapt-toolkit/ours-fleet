@@ -2,7 +2,9 @@ import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { loadConfig, findRole, ConfigError } from '../src/config.js';
+import {
+  loadConfig, findRole, ConfigError, DEFAULT_OWNER_ATTACHMENT_MIME,
+} from '../src/config.js';
 
 let dir: string;
 beforeEach(() => {
@@ -21,6 +23,121 @@ const dropin = (name: string, s: string) => {
 };
 
 describe('loadConfig', () => {
+  it('resolves a trusted owner channel only for ACP', () => {
+    const agent = 'A'.repeat(64);
+    const ownerOne = 'B'.repeat(64);
+    const ownerTwo = 'C'.repeat(64);
+    base([
+      'roles:',
+      '  Coordinator:',
+      '    session: acp',
+      '    identity: Coordinator',
+      '    owner_channel:',
+      '      identity: Coordinator-owner',
+      `      owners: [${ownerOne}, ${ownerTwo}]`,
+      `      agent: ${agent}`,
+      '',
+    ].join('\n'));
+    expect(findRole(loadConfig(), 'Coordinator').owner_channel).toEqual({
+      // CIDs resolve to their canonical (lowercase) hex form.
+      identity: 'Coordinator-owner', owners: [ownerOne.toLowerCase(), ownerTwo.toLowerCase()],
+      agent: agent.toLowerCase(),
+      interrupt: false, progress_interval_ms: 30_000,
+      attachments: {
+        enabled: true, max_files_per_request: 4, max_file_bytes: 10 * 1024 * 1024,
+        max_request_bytes: 20 * 1024 * 1024, retention_ms: 24 * 60 * 60 * 1_000,
+        allowed_mime: [...DEFAULT_OWNER_ATTACHMENT_MIME],
+      },
+    });
+    base('roles:\n  A:\n    owner_channel: { identity: A-owner, owners: [cid] }\n');
+    expect(() => loadConfig()).toThrow(/requires session: acp/);
+  });
+
+  it('requires an exact managed-agent CID distinct from owner authority', () => {
+    const cid = 'A'.repeat(64);
+    base(`roles:\n  A:\n    session: acp\n    owner_channel: { identity: A-owner, owners: [owner], agent: short }\n`);
+    expect(() => loadConfig()).toThrow(/owner_channel\.agent must be exactly 64 hexadecimal/);
+    base(`roles:\n  A:\n    session: acp\n    owner_channel: { identity: A-owner, owners: [${cid}], agent: ${cid} }\n`);
+    expect(() => loadConfig()).toThrow(/agent must not also be an owner CID/);
+  });
+
+  it('canonicalizes mixed-case owner and agent CIDs to lowercase at resolution', () => {
+    const agent = 'AbCdEf12'.repeat(8);
+    const owner = 'F0e1D2c3'.repeat(8);
+    base([
+      'roles:',
+      '  A:',
+      '    session: acp',
+      '    owner_channel:',
+      '      identity: A-owner',
+      `      owners: [${owner}]`,
+      `      agent: ${agent}`,
+      '',
+    ].join('\n'));
+    const channel = findRole(loadConfig(), 'A').owner_channel!;
+    expect(channel.owners).toEqual([owner.toLowerCase()]);
+    expect(channel.agent).toBe(agent.toLowerCase());
+  });
+
+  it('rejects owner duplicates and agent overlap that differ only by hex case', () => {
+    const lower = 'b'.repeat(64);
+    const upper = 'B'.repeat(64);
+    base(`roles:\n  A:\n    session: acp\n    owner_channel: { identity: A-owner, owners: [${lower}, ${upper}] }\n`);
+    expect(() => loadConfig()).toThrow(/owners must not contain duplicates/);
+    base(`roles:\n  A:\n    session: acp\n    owner_channel: { identity: A-owner, owners: [${lower}], agent: ${upper} }\n`);
+    expect(() => loadConfig()).toThrow(/agent must not also be an owner CID/);
+  });
+
+  it('keeps owner channel identities exclusive from role and channel identities', () => {
+    base([
+      'roles:',
+      '  A: { session: acp, identity: shared, owner_channel: { identity: B, owners: [cid] } }',
+      '  B: { session: acp, identity: B }',
+      '',
+    ].join('\n'));
+    expect(() => loadConfig()).toThrow(/owner_channel.identity 'B'.*conflicts with role 'B'/);
+    base([
+      'roles:',
+      '  A: { session: acp, owner_channel: { identity: shared, owners: [cid] } }',
+      '  B: { session: acp, owner_channel: { identity: shared, owners: [cid] } }',
+      '',
+    ].join('\n'));
+    expect(() => loadConfig()).toThrow(/shared by roles 'A' and 'B'/);
+  });
+
+  it('deep-merges and validates owner attachment policy', () => {
+    base([
+      'defaults:',
+      '  owner_channel:',
+      '    attachments: { max_file_bytes: 100, max_request_bytes: 200 }',
+      'roles:',
+      '  A:',
+      '    session: acp',
+      '    owner_channel:',
+      '      identity: A-owner',
+      '      owners: [cid]',
+      '      attachments:',
+      '        max_files_per_request: 2',
+      '        allowed_mime: [text/plain, image/png]',
+      '',
+    ].join('\n'));
+    expect(findRole(loadConfig(), 'A').owner_channel?.attachments).toMatchObject({
+      enabled: true, max_files_per_request: 2, max_file_bytes: 100,
+      max_request_bytes: 200, allowed_mime: ['text/plain', 'image/png'],
+    });
+    for (const policy of [
+      'max_files_per_request: 0',
+      'max_file_bytes: 200, max_request_bytes: 100',
+      'retention_ms: 100',
+      'allowed_mime: [Text/Plain]',
+      'allowed_mime: [text/plain, text/plain]',
+      'unknown: true',
+    ]) {
+      base(`roles:\n  A:\n    session: acp\n    owner_channel:\n      identity: A-owner\n      owners: [cid]\n      attachments: { ${policy} }\n`);
+      expect(() => loadConfig()).toThrow(/owner_channel\.attachments/);
+    }
+  });
+
   it('always rejects duplicate mapping keys with a source position', () => {
     base('roles:\n  A:\n    model: first\n    model: second\n');
     expect(() => loadConfig()).toThrow(/fleet\.yaml:.*Map keys must be unique.*line 4/i);

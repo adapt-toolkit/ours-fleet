@@ -6,14 +6,23 @@ import { join as joinPath } from 'node:path';
 import { createInterface } from 'node:readline';
 import { Command } from 'commander';
 import { VERSION } from './version.js';
-import { agentDir, agentsRoot, tmpRoot, logsRoot, deriveXdgRuntimeDir } from './paths.js';
-import { loadConfig } from './config.js';
+import { agentDir, agentsRoot, tmpRoot, logsRoot, deriveXdgRuntimeDir, watchdogsRoot } from './paths.js';
+import { findRole, loadConfig, ROLE_NAME_RE } from './config.js';
 import type { YamlMode } from './config-yaml.js';
+import { formatDuration } from './duration.js';
 import { resolvedPlan } from './resolved-plan.js';
 import { Tmux, tmuxArgs } from './tmux.js';
 import { pickBackend } from './supervisor/index.js';
 import { up, down, restartRoles, rmRole, type OpsDeps } from './ops.js';
 import { readRestartLedger, runSupervised, runTemp } from './runner.js';
+import { executeWatchdogRun, runWatchdogAgent } from './watchdog/run.js';
+import { readSchedulerState, resetSchedulerState, runScheduler, type WatchdogSchedulerState } from './watchdog/scheduler.js';
+import { partitionRestartNames } from './watchdog/config.js';
+import { WatchdogServiceManager } from './watchdog/service.js';
+import {
+  acquireRunLock, latestReport, listRuns, readReport, releaseRunLock, reportsDir, type RunListEntry,
+} from './watchdog/store.js';
+import type { WatchdogReport } from './watchdog/report.js';
 import {
   lastProvenance, spawnDryRun, spawnPermanent, spawnTemp, type SpawnOpts,
 } from './spawn.js';
@@ -28,6 +37,11 @@ import {
 } from './session/control.js';
 import { SessionControlError } from './session/types.js';
 import type { SessionEvent } from './session/types.js';
+import { readScheduledLoops } from './loops/state.js';
+import type { LoopActionResult } from './loops/manager.js';
+import type {
+  OwnerChannelManagementRequest, OwnerChannelManagementResult,
+} from './owner-channel/channel.js';
 import { startWebConsole } from './web/runtime.js';
 import { requestWebControl } from './web/control.js';
 import { WebServiceManager } from './web/service.js';
@@ -45,6 +59,7 @@ const deps = (): OpsDeps => ({
   backend: pickBackend(),
   binPath,
   log: l => console.log(l),
+  watchdogService: new WatchdogServiceManager(),
 });
 
 const die = (e: unknown): never => { console.error(String(e instanceof Error ? e.message : e)); process.exit(1); };
@@ -77,6 +92,38 @@ function acpStateDir(name: string): string | undefined {
   const temp = agentDir(name, true);
   if (existsSync(controlSocketPath(temp))) return temp;
   return undefined;
+}
+
+const CONTACT_CID_RE = /^[A-Fa-f0-9]{64}$/;
+const OWNER_REQUEST_ID_RE = /^[a-f0-9]{64}$/;
+const MAX_INVITE_BYTES = 48 * 1024;
+const MAX_OWNER_UPDATE_BYTES = 1_024;
+
+function ownerChannelStateDir(roleName: string, configuration?: string): string {
+  const role = findRole(loadConfig(configuration), roleName);
+  if (role.session !== 'acp')
+    throw new Error(`role '${roleName}' uses session '${role.session}', but owner-channel management requires ACP`);
+  if (!role.owner_channel)
+    throw new Error(`role '${roleName}' has no owner_channel configured`);
+  const stateDir = acpStateDir(roleName);
+  if (!stateDir)
+    throw new Error(`role '${roleName}' is stopped or its authenticated ACP control socket is unavailable`);
+  return stateDir;
+}
+
+async function manageOwnerChannel(
+  role: string, configuration: string | undefined,
+  ownerChannel: OwnerChannelManagementRequest,
+): Promise<OwnerChannelManagementResult> {
+  const response = await controlRequest(
+    ownerChannelStateDir(role, configuration), { command: 'owner_channel_manage', ownerChannel });
+  if (!response.ok)
+    throw new SessionControlError(response.kind ?? 'backend', response.error ?? 'owner-channel request failed');
+  return response.result as OwnerChannelManagementResult;
+}
+
+function assertContactCid(cid: string): void {
+  if (!CONTACT_CID_RE.test(cid)) throw new Error('contact CID must be exactly 64 hexadecimal characters');
 }
 
 function renderSessionEvent(event: SessionEvent): void {
@@ -148,6 +195,10 @@ cOpt(program.command('config').description('validate + print the merged plan (no
         console.log(`    monitor:     ${r.monitor.mode}`
           + (r.monitor.mode === 'fleet' ? ` (interrupt=${r.monitor.interrupt})` : ''));
         console.log(`    identity:    ${r.identity}`);
+        if (r.owner_channel)
+          console.log(`    owner ch:    ${r.owner_channel.identity} `
+            + `(${r.owner_channel.owners.length} authorized sender(s), `
+            + `interrupt=${r.owner_channel.interrupt})`);
         console.log(`    permissions: approval=${r.permissions.approval} `
           + `filesystem=${r.permissions.filesystem} unattended=${r.permissions.unattended}`);
         if (perms?.supported)
@@ -173,6 +224,28 @@ cOpt(program.command('config').description('validate + print the merged plan (no
         }
         for (const w of perms ? allWarnings(perms) : []) console.log(`    warning:     ${w}`);
       }
+      if (cfg.watchdogs.length) {
+        console.log('watchdogs:');
+        for (const w of cfg.watchdogs) {
+          console.log(`● ${w.name}${w.enabled ? '' : '  (disabled)'}`
+            + `${readSchedulerState(w.name).heldDown ? '  (held down)' : ''}`);
+          console.log(`  every ${formatDuration(w.intervalMs)} -> ${w.coordinator}`);
+          console.log(`  harness:  ${w.harness} (${w.session})${w.model ? `, model: ${w.model}` : ''}`);
+          console.log(`  identity: ${w.identity}`);
+          console.log(`  watch:    ${w.watch.join(', ')}`);
+          if (w.promptFile) console.log(`  focus:    ${w.promptFile}`);
+          if (w.isolation) console.log(`  isolation: ${JSON.stringify(w.isolation)}`);
+        }
+      }
+      if (cfg.loops.length) {
+        console.log('loops:');
+        for (const loop of cfg.loops) {
+          console.log(`● ${loop.name}${loop.enabled ? '' : '  (disabled)'}`);
+          console.log(`  every ${formatDuration(loop.intervalMs)} initial=${formatDuration(loop.initialDelayMs)} jitter=${formatDuration(loop.jitterMs)}`);
+          console.log(`  roles: ${loop.roleNames.join(', ')}`);
+          console.log(`  prompt: ${loop.promptBytes} bytes sha256=${loop.promptHash.slice(0, 12)}`);
+        }
+      }
     } catch (e) { die(e); }
   });
 
@@ -187,8 +260,24 @@ cOpt(program.command('down [names...]').description('stop roles'))
   });
 
 cOpt(program.command('restart [names...]').description('re-sync config + bounce, RESUMING context'))
-  .action(async (names, opts) => {
-    try { await restartRoles(loadConfig(opts.configuration), names, deps(), 'keep', opts.configuration); } catch (e) { die(e); }
+  .action(async (names: string[], opts) => {
+    try {
+      const cfg = loadConfig(opts.configuration);
+      // Watchdog names can't collide with role names (config validation
+      // guarantees dispatch is unambiguous), so a name matching a configured
+      // watchdog is always a release, never a role restart. Release each
+      // named watchdog directly instead of handing it to restartRoles, which
+      // only knows about roles and would reject it as unknown (3.2 release path).
+      const { watchdogNames, roleNames } = partitionRestartNames(cfg, names);
+      for (const wn of watchdogNames) {
+        resetSchedulerState(wn);
+        console.log(`released watchdog '${wn}' — scheduler resumes on its next poll`);
+      }
+      // Bare `restart` (no names) restarts every role — that meaning must
+      // survive even though filtering an empty array also yields [].
+      if (names.length === 0 || roleNames.length > 0)
+        await restartRoles(cfg, roleNames, deps(), 'keep', opts.configuration);
+    } catch (e) { die(e); }
   });
 
 cOpt(program.command('force-restart [names...]').description('re-sync + bounce FRESH (context wiped)'))
@@ -347,6 +436,453 @@ program.command('status <name>').description('unit/agent state')
         if (response.ok) console.log(`session: ${JSON.stringify(response.result)}`);
       } catch { console.log('session: acp control unavailable'); }
     }
+    const loopState = readScheduledLoops(agentDir(name));
+    if (loopState) {
+      const values = Object.values(loopState.loops);
+      const enabled = values.filter(loop => loop.enabled && !loop.operatorDisabled).length;
+      const next = values.filter(loop => loop.enabled && !loop.operatorDisabled)
+        .map(loop => Date.parse(loop.nextDueAt)).filter(Number.isFinite).sort((a, b) => a - b)[0];
+      console.log(`loops: ${enabled} enabled${next ? `, next ${formatDuration(Math.max(0, next - Date.now()))}` : ''}, ${loopState.health}`);
+    }
+  });
+
+const loopsCommand = program.command('loops')
+  .description('validate, inspect, and control strict idle-only scheduled agent loops');
+
+function loopFailure(error: unknown, json: boolean, code = 1): void {
+  const err = error instanceof SessionControlError ? error : undefined;
+  const message = error instanceof Error ? error.message : String(error);
+  if (json) console.log(JSON.stringify({
+    schemaVersion: 1, ok: false,
+    error: { kind: err?.kind ?? 'invalid', message, retrySafe: err?.kind !== 'timeout' },
+  }));
+  else console.error(message);
+  process.exitCode = code;
+}
+
+function permanentLoopControlDir(role: string): string | undefined {
+  const dir = agentDir(role);
+  return existsSync(controlSocketPath(dir)) ? dir : undefined;
+}
+
+cOpt(loopsCommand.command('validate').description('validate loop config and expanded ACP targets'))
+  .option('--json', 'emit stable JSON')
+  .action(opts => {
+    try {
+      const cfg = loadConfig(opts.configuration);
+      const result = { schemaVersion: 1, ok: true, loops: cfg.loops.length,
+        pairs: cfg.roles.reduce((sum, role) => sum + (role.loops?.length ?? 0), 0) };
+      if (opts.json) console.log(JSON.stringify(result));
+      else console.log(`valid: ${result.loops} loop(s), ${result.pairs} resolved role pair(s)`);
+    } catch (error) { loopFailure(error, opts.json === true); }
+  });
+
+cOpt(loopsCommand.command('list').description('list redacted resolved loop definitions'))
+  .option('--role <role>', 'filter to one permanent role')
+  .option('--json', 'emit stable JSON')
+  .action(opts => {
+    try {
+      const cfg = loadConfig(opts.configuration);
+      if (opts.role) findRole(cfg, opts.role);
+      const values = cfg.loops.filter(loop => !opts.role || loop.roleNames.includes(opts.role)).map(loop => ({
+        name: loop.name, selectors: loop.selectors, roles: loop.roleNames,
+        enabled: loop.enabled, intervalMs: loop.intervalMs, initialDelayMs: loop.initialDelayMs,
+        jitterMs: loop.jitterMs, prompt: { bytes: loop.promptBytes, sha256: loop.promptHash },
+        sourceFile: loop.sourceFile,
+      }));
+      if (opts.json) console.log(JSON.stringify({ schemaVersion: 1, loops: values }));
+      else for (const loop of values)
+        console.log(`${loop.name} ${loop.enabled ? 'enabled' : 'disabled'} every=${formatDuration(loop.intervalMs)} roles=${loop.roles.join(',')} prompt=${loop.prompt.bytes}B/${loop.prompt.sha256.slice(0, 12)}`);
+    } catch (error) { loopFailure(error, opts.json === true); }
+  });
+
+function selectLoopConfig(configuration: string | undefined, roleName: string, loopName?: string) {
+  const cfg = loadConfig(configuration);
+  const role = findRole(cfg, roleName);
+  const definitions = role.loops ?? [];
+  if (loopName && !definitions.some(loop => loop.name === loopName))
+    throw new Error(`role '${roleName}' has no scheduled loop '${loopName}'`);
+  return { role, definitions };
+}
+
+function renderLoopRows(role: string, state: ReturnType<typeof readScheduledLoops>, loop?: string): string[] {
+  if (!state) return [];
+  return Object.entries(state.loops).filter(([name]) => !loop || name === loop).map(([name, item]) =>
+    `${role}/${name} ${item.enabled && !item.operatorDisabled ? 'enabled' : 'disabled'} `
+      + `${item.activeRunId ? 'running' : 'idle'} next=${item.nextDueAt} last=${item.lastOutcome ?? 'never'} `
+      + `counts=${item.counts.started}/${item.counts.completed}/${item.counts.failed} `
+      + `skip=${item.counts.skipped}(busy=${item.counts.skippedBusy},missed=${item.counts.skippedMissed})`);
+}
+
+cOpt(loopsCommand.command('status [role] [loop]').description('show live or stored loop state'))
+  .option('--json', 'emit stable JSON')
+  .action(async (roleName, loopName, opts) => {
+    try {
+      const cfg = loadConfig(opts.configuration);
+      const roles = roleName ? [findRole(cfg, roleName)] : cfg.roles.filter(role => role.loops?.length);
+      if (roleName && loopName) selectLoopConfig(opts.configuration, roleName, loopName);
+      const results = [];
+      for (const role of roles) {
+        let state = readScheduledLoops(agentDir(role.name));
+        let evidence = 'stored';
+        const live = permanentLoopControlDir(role.name);
+        if (live) try {
+          const response = await controlRequest(live, { command: 'loop_status' }, 2_000);
+          if (response.ok) { state = response.result as typeof state; evidence = 'live'; }
+        } catch { /* stored evidence remains honest; timeout is not offline */ }
+        results.push({ role: role.name, evidence, state });
+      }
+      if (opts.json) console.log(JSON.stringify({ schemaVersion: 1, roles: results }));
+      else {
+        const rows = results.flatMap(result => renderLoopRows(result.role, result.state, loopName)
+          .map(row => `${row} evidence=${result.evidence}`));
+        console.log(rows.join('\n') || '(no scheduled loop state)');
+      }
+    } catch (error) { loopFailure(error, opts.json === true); }
+  });
+
+cOpt(loopsCommand.command('reload <role>').description('reload trusted scheduled-loop config in a live ACP role'))
+  .option('--json', 'emit stable JSON')
+  .action(async (roleName, opts) => {
+    try {
+      const { role } = selectLoopConfig(opts.configuration, roleName);
+      if (role.session !== 'acp') throw new Error(`role '${roleName}' is not ACP-compatible`);
+      const stateDir = permanentLoopControlDir(roleName);
+      if (!stateDir) throw new SessionControlError('control-unavailable',
+        `role '${roleName}' has no live authenticated ACP control socket`);
+      const response = await controlRequest(stateDir, { command: 'reload_config' });
+      if (!response.ok)
+        throw new SessionControlError(response.kind ?? 'backend', response.error ?? 'config reload failed');
+      const result = response.result as { changed: boolean; loops: number };
+      if (opts.json) console.log(JSON.stringify({ schemaVersion: 1, ok: true, role: roleName, ...result }));
+      else console.log(`${roleName}: ${result.changed ? 'reloaded' : 'unchanged'} (${result.loops} loops)`);
+    } catch (error) {
+      loopFailure(error, opts.json === true,
+        error instanceof SessionControlError
+          && ['timeout', 'control-unavailable'].includes(error.kind) ? 2 : 1);
+    }
+  });
+
+for (const command of ['run-now', 'disable', 'enable'] as const) {
+  cOpt(loopsCommand.command(`${command} <role> <loop>`)
+    .description(`${command} one trusted configured loop through the live private control socket`))
+    .option('--json', 'emit stable JSON')
+    .action(async (roleName, loopName, opts) => {
+      try {
+        const { role, definitions } = selectLoopConfig(opts.configuration, roleName, loopName);
+        if (role.session !== 'acp') throw new Error(`role '${roleName}' is not ACP-compatible`);
+        const definition = definitions.find(loop => loop.name === loopName)!;
+        if (command === 'enable' && !definition.enabled)
+          throw new Error(`loop '${loopName}' is disabled in YAML; edit the config before enabling it`);
+        const stateDir = permanentLoopControlDir(roleName);
+        if (!stateDir) throw new SessionControlError('control-unavailable',
+          `role '${roleName}' has no live authenticated ACP control socket`);
+        const response = await controlRequest(stateDir, {
+          command: command === 'run-now' ? 'loop_run_now'
+            : command === 'disable' ? 'loop_disable' : 'loop_enable',
+          loop: loopName,
+        });
+        if (!response.ok)
+          throw new SessionControlError(response.kind ?? 'backend', response.error ?? 'loop control failed');
+        const result = response.result as LoopActionResult;
+        if (opts.json) console.log(JSON.stringify({ schemaVersion: 1, ok: true, role: roleName, loop: loopName, ...result }));
+        else console.log(`${roleName}/${loopName}: ${result.state}${result.runId ? ` ${result.runId}` : ''}`);
+        if (command === 'run-now' && result.state !== 'started') process.exitCode = 3;
+      } catch (error) {
+        loopFailure(error, opts.json === true,
+          error instanceof SessionControlError
+            && ['timeout', 'control-unavailable'].includes(error.kind) ? 2 : 1);
+      }
+    });
+}
+
+const ownerChannelCommand = program.command('owner-channel')
+  .description('manage owner routing and task-correlated reports through a running role supervisor')
+  .addHelpText('after', '\nPairing is two-step: establish a contact first, then explicitly authorize its exact CID.');
+const ownerContactCommand = ownerChannelCommand.command('contact')
+  .description('establish contacts without granting owner authority');
+const ownerAuthorizationCommand = ownerChannelCommand.command('owner')
+  .description('manage the effective owner CID set (separate from contacts)');
+const ownerTaskCommand = ownerChannelCommand.command('task')
+  .description('register and report bounded follow-up work correlated to an authenticated owner request');
+
+cOpt(ownerTaskCommand.command('open <Role> <active-request-id>')
+  .description('register a durable follow-up task during the exact active owner request'))
+  .action(async (role, requestId, opts) => {
+    try {
+      if (!OWNER_REQUEST_ID_RE.test(requestId))
+        throw new Error('owner task request ID must be exactly 64 lowercase hexadecimal characters');
+      const result = await manageOwnerChannel(role, opts.configuration, {
+        action: 'task_open', requestId,
+      });
+      if (result.action !== 'task_open') throw new Error('unexpected owner-channel response');
+      console.log(`Owner task ${result.taskId} opened; expires ${result.expiresAt}.`);
+    } catch (e) { die(e); }
+  });
+
+cOpt(ownerTaskCommand.command('report <Role> <task-id>')
+  .description('send a proactive follow-up to the task\'s stored authenticated origin')
+  .requiredOption('--phase <phase>', 'progress, done, or blocked')
+  .requiredOption('--message-stdin', 'read the one-line report body from stdin'))
+  .action(async (role, taskId, opts) => {
+    try {
+      if (!OWNER_REQUEST_ID_RE.test(taskId))
+        throw new Error('owner task ID must be exactly 64 lowercase hexadecimal characters');
+      const phase = String(opts.phase);
+      if (!['progress', 'done', 'blocked'].includes(phase))
+        throw new Error('owner task report phase must be progress, done, or blocked');
+      const message = readFileSync(0, 'utf8');
+      if (Buffer.byteLength(message) > MAX_OWNER_UPDATE_BYTES)
+        throw new Error(`owner task report input exceeds ${MAX_OWNER_UPDATE_BYTES} bytes`);
+      const result = await manageOwnerChannel(role, opts.configuration, {
+        action: 'task_report', taskId, phase: phase as 'progress' | 'done' | 'blocked', message,
+      });
+      if (result.action !== 'task_report') throw new Error('unexpected owner-channel response');
+      console.log(`Owner task report ${result.sequence} delivered; task ${result.state}.`);
+    } catch (e) { die(e); }
+  });
+
+cOpt(ownerChannelCommand.command('update <Role> <request-id>')
+  .description('send one bounded agent-authored update for an active owner request')
+  .requiredOption('--phase <phase>', 'working, approval, or blocked')
+  .requiredOption('--message-stdin', 'read the one-line update body from stdin'))
+  .action(async (role, requestId, opts) => {
+    try {
+      if (!OWNER_REQUEST_ID_RE.test(requestId))
+        throw new Error('owner update request ID must be exactly 64 lowercase hexadecimal characters');
+      const phase = String(opts.phase);
+      if (!['working', 'approval', 'blocked'].includes(phase))
+        throw new Error('owner update phase must be working, approval, or blocked');
+      const message = readFileSync(0, 'utf8');
+      if (Buffer.byteLength(message) > MAX_OWNER_UPDATE_BYTES)
+        throw new Error(`owner update input exceeds ${MAX_OWNER_UPDATE_BYTES} bytes`);
+      const result = await manageOwnerChannel(role, opts.configuration, {
+        action: 'request_update', requestId,
+        phase: phase as 'working' | 'approval' | 'blocked', message,
+      });
+      if (result.action !== 'request_update') throw new Error('unexpected owner-channel response');
+      console.log(`Owner update ${result.sequence} delivered.`);
+    } catch (e) { die(e); }
+  });
+
+cOpt(ownerContactCommand.command('list <Role>')
+  .description('list established/pending contacts using safe identity metadata only'))
+  .action(async (role, opts) => {
+    try {
+      const result = await manageOwnerChannel(role, opts.configuration, { action: 'contact_list' });
+      if (result.action !== 'contact_list') throw new Error('unexpected owner-channel response');
+      if (!result.contacts.length) { console.log('(no contacts)'); return; }
+      console.log('CID\tNAME\tSTATUS\tKIND\tHUMAN');
+      for (const contact of result.contacts) console.log([
+        contact.cid, contact.name, contact.status, contact.kind ?? '', contact.human?.name ?? '',
+      ].join('\t'));
+    } catch (e) { die(e); }
+  });
+
+cOpt(ownerContactCommand.command('invite <Role>')
+  .description('generate an invite on the already-bound owner channel')
+  .option('--name <label>', 'optional contact label'))
+  .action(async (role, opts) => {
+    try {
+      const result = await manageOwnerChannel(role, opts.configuration, {
+        action: 'contact_invite', ...(opts.name ? { name: String(opts.name) } : {}),
+      });
+      if (result.action !== 'contact_invite') throw new Error('unexpected owner-channel response');
+      // Invite material is intentionally the only stdout content.
+      process.stdout.write(result.invite + '\n');
+    } catch (e) { die(e); }
+  });
+
+cOpt(ownerContactCommand.command('add <Role>')
+  .description('accept an invite without granting owner authority')
+  .option('--invite-file <path>', 'read invite material from a file')
+  .option('--invite-stdin', 'read invite material from stdin')
+  .option('--name <label>', 'optional contact label'))
+  .action(async (role, opts) => {
+    try {
+      if (Boolean(opts.inviteFile) === Boolean(opts.inviteStdin))
+        throw new Error('choose exactly one of --invite-file <path> or --invite-stdin');
+      const invite = readFileSync(opts.inviteStdin ? 0 : String(opts.inviteFile), 'utf8').trim();
+      if (!invite) throw new Error('invite input is empty');
+      if (Buffer.byteLength(invite) > MAX_INVITE_BYTES)
+        throw new Error(`invite input exceeds ${MAX_INVITE_BYTES} bytes`);
+      const result = await manageOwnerChannel(role, opts.configuration, {
+        action: 'contact_add', invite, ...(opts.name ? { name: String(opts.name) } : {}),
+      });
+      if (result.action !== 'contact_add') throw new Error('unexpected owner-channel response');
+      console.log('Invite accepted; contact establishment is pending peer verification.');
+      console.log('No owner authority was granted. After the contact is established, authorize its exact CID separately.');
+    } catch (e) { die(e); }
+  });
+
+cOpt(ownerAuthorizationCommand.command('list <Role>')
+  .description('show baseline/dynamic source and effective authorization state'))
+  .action(async (role, opts) => {
+    try {
+      const result = await manageOwnerChannel(role, opts.configuration, { action: 'owner_list' });
+      if (result.action !== 'owner_list') throw new Error('unexpected owner-channel response');
+      if (!result.integrity.ok)
+        console.error('warning: owner authorization overlay is corrupt; effective authorization is fail-closed');
+      console.log('CID\tSOURCE\tEFFECTIVE');
+      for (const owner of result.owners)
+        console.log(`${owner.cid}\t${owner.source}\t${owner.effective ? 'yes' : 'no'}`);
+    } catch (e) { die(e); }
+  });
+
+cOpt(ownerAuthorizationCommand.command('authorize <Role> <contact-cid>')
+  .description('authorize an exact CID which is already an established contact'))
+  .action(async (role, cid, opts) => {
+    try {
+      assertContactCid(cid);
+      const result = await manageOwnerChannel(role, opts.configuration, {
+        action: 'owner_authorize', cid,
+      });
+      if (result.action !== 'owner_authorize') throw new Error('unexpected owner-channel response');
+      console.log(`Authorized owner ${result.owner.cid} (${result.owner.source}).`);
+    } catch (e) { die(e); }
+  });
+
+cOpt(ownerAuthorizationCommand.command('revoke <Role> <contact-cid>')
+  .description('revoke an exact effective owner CID; the last owner is protected'))
+  .action(async (role, cid, opts) => {
+    try {
+      assertContactCid(cid);
+      const result = await manageOwnerChannel(role, opts.configuration, {
+        action: 'owner_revoke', cid,
+      });
+      if (result.action !== 'owner_revoke') throw new Error('unexpected owner-channel response');
+      console.log(`Revoked owner ${result.owner.cid} (${result.owner.source}).`);
+    } catch (e) { die(e); }
+  });
+
+/**
+ * A watchdog is addressable if it's still configured, or its store dir survives
+ * config removal. The name-shape check runs BEFORE any filesystem lookup
+ * (finding #1): a hostile `name` (path separators, '..', etc.) must never
+ * reach `join(watchdogsRoot(), name)` — treated as simply unknown, same as
+ * store.ts's own `watchdogDir` choke-point guard (defense in depth).
+ */
+function watchdogKnown(name: string, configPath?: string): boolean {
+  try {
+    if (loadConfig(configPath).watchdogs.some(w => w.name === name)) return true;
+  } catch { /* config missing/broken: fall through to the store check */ }
+  return ROLE_NAME_RE.test(name) && existsSync(joinPath(watchdogsRoot(), name));
+}
+
+function renderHeldDownLine(state: WatchdogSchedulerState): string | undefined {
+  if (!state.heldDown) return undefined;
+  return `HELD DOWN since ${state.heldSince ?? 'unknown'} after ${state.consecutiveFailures} `
+    + `consecutive failures: ${state.lastError ?? 'unknown error'}`;
+}
+
+/** errorReport() rides a bounded diagnostic tail as an extra key outside WatchdogReport proper (spec: acceptance 9). */
+type ReportWithTail = WatchdogReport & { tail?: string };
+
+/** Full human rendering of one report: header, held-down warning, counts, then non-healthy roles + evidence. */
+function renderReport(report: WatchdogReport, heldState: WatchdogSchedulerState): string {
+  const lines: string[] = [`● ${report.watchdog} — run ${report.run_id} (${report.status})`];
+  const held = renderHeldDownLine(heldState);
+  if (held) lines.push(held);
+  const s = report.summary;
+  lines.push(`  checked=${s.checked} healthy=${s.healthy} idle=${s.idle} anomalies=${s.anomalies}`);
+  if (report.error) lines.push(`  error: ${report.error}`);
+  for (const role of report.roles) {
+    if (role.status === 'healthy') continue;
+    lines.push(`  ${role.role}  ${role.status}  ${role.reason ?? ''}`.trimEnd());
+    for (const ev of role.evidence ?? []) lines.push(`    - [${ev.source}] ${ev.detail} (${ev.observed_at})`);
+    if (role.alerted) {
+      const alert = report.alerts.find(a => a.role === role.role);
+      lines.push(`    alerted -> ${alert?.coordinator ?? '?'}`);
+    }
+  }
+  const tail = (report as ReportWithTail).tail;
+  if (report.status === 'error' && tail) {
+    lines.push('  --- output tail ---');
+    for (const l of tail.split('\n')) lines.push(`  ${l}`);
+  }
+  return lines.join('\n');
+}
+
+function renderRunDuration(startedAt: string, finishedAt: string): string {
+  const started = Date.parse(startedAt);
+  const finished = Date.parse(finishedAt);
+  return Number.isFinite(started) && Number.isFinite(finished)
+    ? formatDuration(Math.max(0, finished - started)) : '-';
+}
+
+/** `--list` table: run-id, started, duration, status, checked/healthy/idle/anomalies, [error]. */
+function renderRunList(entries: RunListEntry[]): string {
+  const header = ['run-id'.padEnd(18), 'started'.padEnd(22), 'duration'.padEnd(8),
+    'status'.padEnd(10), 'checked/healthy/idle/anomalies', 'error'].join('  ');
+  const rows = entries.map(e => {
+    const s = e.summary;
+    const cols = [
+      e.runId.padEnd(18), (e.startedAt || '-').padEnd(22),
+      renderRunDuration(e.startedAt, e.finishedAt).padEnd(8), e.status.padEnd(10),
+      `${s.checked}/${s.healthy}/${s.idle}/${s.anomalies}`.padEnd(31),
+    ];
+    if (e.error) cols.push(e.error);
+    return cols.join('  ').trimEnd();
+  });
+  return [header, ...rows].join('\n');
+}
+
+cOpt(program.command('watchdog-run <name>')
+  .description('run one watchdog check now, foreground, same storage as the scheduler'))
+  .action(async (name: string, opts: { configuration?: string }) => {
+    try {
+      const cfg = loadConfig(opts.configuration);
+      const wd = cfg.watchdogs.find(w => w.name === name);
+      if (!wd) throw new Error(`unknown watchdog '${name}'`);
+      if (!acquireRunLock(name)) throw new Error(`watchdog '${name}' is already running (run lock held)`);
+      try {
+        const { report, storedPath } = await executeWatchdogRun(wd, {
+          binPath, log: l => console.log(l), cfg,
+        });
+        console.log(`stored: ${storedPath}`);
+        console.log(renderReport(report, readSchedulerState(name)));
+      } finally { releaseRunLock(name); }
+    } catch (e) { die(e); }
+  });
+
+cOpt(program.command('watchdog-report <name> [runId]')
+  .description('show a watchdog run report: latest by default, a specific run by id, --list, or --json'))
+  .option('--list', 'list runs instead of showing one')
+  .option('--json', 'print the stored report file bytes unmodified')
+  .action((name: string, runId: string | undefined, opts: { configuration?: string; list?: boolean; json?: boolean }) => {
+    try {
+      if (!watchdogKnown(name, opts.configuration)) throw new Error(`unknown watchdog '${name}'`);
+
+      if (opts.list) {
+        // --list has no single stored file to echo byte-for-byte, so --json here can't
+        // mean "raw stored bytes" the way it does for a single report. Contract: emit
+        // machine-readable run metadata instead (JSON.stringify of listRuns()'s
+        // RunListEntry[], wrapped in { runs }) — the single-report --json path below is
+        // unaffected and still prints the exact stored bytes.
+        if (opts.json) {
+          console.log(JSON.stringify({ runs: listRuns(name) }, null, 2));
+          return;
+        }
+        const held = renderHeldDownLine(readSchedulerState(name));
+        if (held) console.log(held);
+        console.log(renderRunList(listRuns(name)));
+        return;
+      }
+
+      const report = runId !== undefined ? readReport(name, runId) : latestReport(name);
+      if (!report) {
+        throw new Error(runId !== undefined
+          ? `watchdog '${name}': no such run '${runId}'`
+          : `watchdog '${name}' has no reports`);
+      }
+
+      if (opts.json) {
+        console.log(readFileSync(joinPath(reportsDir(name), `${runId ?? report.run_id}.json`), 'utf8'));
+        return;
+      }
+
+      console.log(renderReport(report, readSchedulerState(name)));
+    } catch (e) { die(e); }
   });
 
 cOpt(program.command('rm <name>').description('stop + delete state dir (+ its fleet.d file if spawned)'))
@@ -626,6 +1162,25 @@ program.command('_run <name>', { hidden: true }).description('internal: supervis
 program.command('_run-temp <name>', { hidden: true }).description('internal: temp-agent entrypoint')
   .action(async name => {
     try { await runTemp(name); } catch (e) { die(e); }
+  });
+
+program.command('_run-watchdog <name>', { hidden: true })
+  .description('internal: one watchdog agent run (no cleanup — parent harvests)')
+  .action(async name => {
+    try { await runWatchdogAgent(name); } catch (e) { die(e); }
+  });
+
+cOpt(program.command('_run-watchdogs', { hidden: true }))
+  .description('internal: the watchdog scheduler process')
+  .action(async (opts: { configuration?: string }) => {
+    try {
+      let stop = false;
+      process.on('SIGTERM', () => { stop = true; });
+      await runScheduler(opts.configuration, {
+        now: () => new Date(), sleep: ms => new Promise(r => setTimeout(r, ms)),
+        log: l => console.log(l), binPath, shouldStop: () => stop,
+      });
+    } catch (e) { die(e); }
   });
 
 program.parseAsync(process.argv);

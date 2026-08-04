@@ -63,6 +63,12 @@ describe('resolveIsolation durable mount set', () => {
     expect(mount(r, '/data/shared')?.mode).toBe('rw');
   });
 
+  it('mounts the selected launch runtime closure read-only', () => {
+    const runtime = ['/home/fleet/.hermes/node/bin/node', '/home/fleet/.local/lib/node_modules/adapter'];
+    const r = resolveIsolation({}, ctx({ runtimeReadPaths: runtime }));
+    for (const path of runtime) expect(mount(r, path)?.mode).toBe('ro');
+  });
+
   it('does not duplicate cwd when it equals the state dir (cwd fallback)', () => {
     const sd = '/home/fleet/.ours-fleet/agents/Dev';
     const r = resolveIsolation({}, ctx({ runCwd: sd }));
@@ -172,6 +178,12 @@ describe('forbidden-path enforcement (5.2)', () => {
 
   it('refuses a Codex add_dirs entry the same way', () => {
     const e = refuse({}, { harness: 'codex', additionalWriteDirs: [join(home, '.ours')] });
+    expect(e).toBeInstanceOf(IsolationPolicyError);
+    expect(e!.message).toContain('.ours');
+  });
+
+  it('refuses a runtime path that collides with the sensitive blocklist', () => {
+    const e = refuse({}, { runtimeReadPaths: [join(home, '.ours', 'bin', 'node')] });
     expect(e).toBeInstanceOf(IsolationPolicyError);
     expect(e!.message).toContain('.ours');
   });
