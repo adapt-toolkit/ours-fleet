@@ -1,5 +1,6 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useState } from 'react';
 import { api, idempotencyKey } from './api';
+import { useLivePoll } from './use-live-poll';
 
 type Form = {
   name: string; harness: 'codex' | 'claude-code'; model: string;
@@ -38,7 +39,9 @@ export function CreateRole({ onClose, onCreated }: {
     codex: [], 'claude-code': [],
   });
   useEffect(() => {
-    void api.get<any>('/api/v1/creation-capabilities').then(capabilities => {
+    const controller = new AbortController();
+    void api.get<any>('/api/v1/creation-capabilities', controller.signal).then(capabilities => {
+      if (controller.signal.aborted) return;
       setModelChoices(Object.fromEntries((capabilities.harnesses ?? []).map((harness: any) =>
         [harness.id, harness.models ?? []])) as Record<Form['harness'], string[]>);
       const defaults = capabilities.monitor?.defaults;
@@ -52,7 +55,21 @@ export function CreateRole({ onClose, onCreated }: {
         monitorInject: 'notification',
       }));
     }).catch(() => undefined);
+    return () => controller.abort();
   }, []);
+  const refreshAction = useCallback(async (signal: AbortSignal) => {
+    if (!action?.actionId) return;
+    const latest: any = await api.get(`/api/v1/creation-actions/${action.actionId}`, signal);
+    if (signal.aborted) return;
+    setAction(latest);
+    if (['session_reachable', 'attention', 'launched_unconfirmed'].includes(latest.state))
+      onCreated(latest.roleId, latest.openPath);
+    else if (['failed', 'rollback_incomplete'].includes(latest.state)) setBusy(false);
+  }, [action?.actionId, onCreated]);
+  const actionPending = Boolean(action?.actionId
+    && !['session_reachable', 'attention', 'launched_unconfirmed', 'failed', 'rollback_incomplete']
+      .includes(action.state));
+  useLivePoll(refreshAction, reason => { setError((reason as Error).message); setBusy(false); }, actionPending);
   const request = useMemo(() => ({
     name: form.name, harness: form.harness,
     model: form.model.trim() || null, session: form.session, cwd: form.cwd || undefined,
@@ -87,15 +104,9 @@ export function CreateRole({ onClose, onCreated }: {
         { request, previewHash: preview.previewHash },
         { 'Idempotency-Key': idempotencyKey() });
       setAction(next);
-      const poll = async () => {
-        const latest: any = await api.get(`/api/v1/creation-actions/${next.actionId}`);
-        setAction(latest);
-        if (['session_reachable', 'attention', 'launched_unconfirmed'].includes(latest.state))
-          onCreated(latest.roleId, latest.openPath);
-        else if (!['failed', 'rollback_incomplete'].includes(latest.state))
-          setTimeout(() => void poll(), 400);
-      };
-      setTimeout(() => void poll(), 300);
+      if (['session_reachable', 'attention', 'launched_unconfirmed'].includes(next.state))
+        onCreated(next.roleId, next.openPath);
+      else if (['failed', 'rollback_incomplete'].includes(next.state)) setBusy(false);
     } catch (reason) { setError((reason as Error).message); setBusy(false); }
   };
   return <div className="modal-backdrop" role="presentation">

@@ -131,14 +131,18 @@ ours-fleet spawn Coder --harness codex --model gpt-5.4 \
 
 ## Local web console
 
-The interactive console is packaged with `@ours.network/fleet` and runs only on
-IPv4 loopback:
+The interactive console is packaged with `@ours.network/fleet` and binds to
+IPv4 loopback by default. Remote or proxy exposure is always explicit:
 
 ```sh
 npm run build
 ours-fleet web
 # choose a free port for an isolated test:
 ours-fleet web serve --port 0 --no-open
+# nginx/TLS terminates at the declared browser origin; fleet remains loopback-bound
+ours-fleet web install --public-origin https://fleet.example.com --password-file /secure/fleet-password
+# Intentional no-password mode, for example when nginx already authenticates:
+ours-fleet web install --public-origin https://fleet.example.com --no-password
 ```
 
 The normal `ours-fleet web` command installs or updates an owner-level native
@@ -163,8 +167,25 @@ Only a domain-separated SHA-256 device-secret hash and bounded timestamps are
 stored in the owner-private fleet state directory (`0700` directory, `0600`
 atomic file). The re-pair and revoke controls use an owner-private Unix socket;
 local processes running as the same OS user are therefore inside the trust
-boundary. Keep the console local: it has no `--host`, proxy, TLS, or
-remote-access mode.
+boundary.
+
+On first setup, the CLI requires an explicit access choice: `--password-file`
+or `--pairing` for protected access, or `--no-password` for intentional
+unprotected access. `--password-file` stores only a salted scrypt verifier in
+the owner-private web state; the source file remains operator-managed. New
+browsers sign in and then receive the same rotating HttpOnly trusted-device
+credential. `--no-password` is deliberately named and prints a warning: anyone
+who can reach that origin can control the fleet.
+
+For nginx on a VPS, keep the default loopback bind and set the exact external
+`--public-origin` (scheme, hostname, optional port). nginx should proxy HTTP and
+WebSocket upgrades to `127.0.0.1:49271` and provide TLS; rewriting the upstream
+Host is not required because the declared browser Origin remains authoritative. To listen beyond
+loopback, add an explicit `--bind`; fleet refuses a non-loopback bind without a
+public origin. Host and Origin validation use that declaration rather than
+trusting forwarded headers. `localhost` and `127.0.0.1` both work in normal
+local mode; an unconfigured hostname gets a self-describing HTML page instead
+of raw internal Host-header JSON.
 
 The console is installable as a standalone PWA. Its service worker caches only
 the data-free offline page and successful content-hashed JavaScript/CSS assets.
@@ -187,8 +208,8 @@ diagnostic.
 
 Security boundaries:
 
-- exact runtime `Host` and `Origin`, CSRF, one-time WebSocket tickets, and
-  loopback binding are enforced server-side;
+- configured `Host` and `Origin`, CSRF, one-time WebSocket tickets, and explicit
+  bind/origin policy are enforced server-side;
 - cwd values must resolve beneath configured local roots;
 - terminal bytes are intentionally unredacted and are never copied into audit
   records; normal logs are bounded and redacted;

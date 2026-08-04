@@ -1,6 +1,6 @@
 import { test, expect } from '@playwright/test';
 
-test('bootstrap, inventory, navigation, send, create, and security boundaries', async ({ page, request }) => {
+test('bootstrap, inventory, live navigation, send, create, and security boundaries', async ({ page, request }) => {
   const bootstrap = (await (await request.post('/__test/bootstrap')).json()).url as string;
   await page.goto(bootstrap);
   await expect(page.getByRole('heading', { name: 'All roles' })).toBeVisible();
@@ -110,8 +110,13 @@ test('bootstrap, inventory, navigation, send, create, and security boundaries', 
   await expect(page.getByText('Validate the secure console')).toBeVisible();
   await page.getByText('Alpha', { exact: true }).first().click();
   await expect(page.getByText('authoritative')).toBeVisible();
+  await page.bringToFront();
+  expect(await page.evaluate(() => document.visibilityState)).toBe('visible');
   await page.getByRole('button', { name: 'activity' }).click();
   await expect(page.getByText('Fixture agent is ready.')).toBeVisible();
+  await page.waitForTimeout(6_000);
+  expect((await (await request.get('/__test/metrics')).json()).outputCalls).toBeGreaterThanOrEqual(2);
+  await expect(page.getByText('Live refresh arrived.')).toBeVisible();
   await expect(page.getByText(/#1–3 · agent text/)).toBeVisible();
   await expect(page.getByText('2 low-level updates hidden')).toBeVisible();
   await expect(page.getByText(/#4 · tool update/)).toHaveCount(0);
@@ -196,4 +201,19 @@ test('bootstrap, inventory, navigation, send, create, and security boundaries', 
   await expect(page.getByText(/ours-fleet web open/)).toBeVisible();
   expect((await page.context().cookies()).filter(cookie =>
     ['ofs_session', 'ofs_device'].includes(cookie.name))).toHaveLength(0);
+});
+
+test('password and intentional unprotected access are clear in Chromium', async ({ page }) => {
+  await page.goto('http://127.0.0.1:49373/');
+  await expect(page.getByLabel('Control-panel password')).toBeVisible();
+  await page.getByLabel('Control-panel password').fill('wrong password');
+  await page.getByRole('button', { name: 'Sign in' }).click();
+  await expect(page.getByText('invalid control-panel password')).toBeVisible();
+  await page.getByLabel('Control-panel password').fill('correct horse battery staple');
+  await page.getByRole('button', { name: 'Sign in' }).click();
+  await expect(page.getByRole('heading', { name: 'All roles' })).toBeVisible();
+
+  await page.goto('http://127.0.0.1:49372/');
+  await expect(page.getByRole('heading', { name: 'All roles' })).toBeVisible();
+  await expect(page.getByText(/Unprotected mode: anyone who can reach/)).toBeVisible();
 });
