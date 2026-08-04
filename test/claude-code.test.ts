@@ -285,6 +285,32 @@ describe('buildLaunch', () => {
   });
 });
 
+describe('acpPermissionModeId', () => {
+  const a = makeClaudeCodeAdapter(okExec);
+  const perms = (approval: 'allow' | 'ask' | 'deny') =>
+    ({ approval, filesystem: 'workspace', unattended: 'deny' } as const);
+
+  it('single-sources the ACP mode from the same mapping as the tmux launch', () => {
+    expect(a.acpPermissionModeId!(role({ permissions: perms('allow') }))).toBe('bypassPermissions');
+    expect(a.acpPermissionModeId!(role({ permissions: perms('deny') }))).toBe('plan');
+    expect(a.acpPermissionModeId!(role({ permissions: perms('ask') }))).toBeUndefined();
+  });
+
+  it('honors an explicit harness_options.permission_mode override', () => {
+    const r = role({
+      permissions: perms('allow'), harness_options: { permission_mode: 'acceptEdits' },
+    });
+    expect(a.acpPermissionModeId!(r)).toBe('acceptEdits');
+  });
+
+  it('rejects a bad override with the same clear error as the tmux launch', () => {
+    const r = role({ harness_options: { permission_mode: 'yolo' } });
+    expect(() => a.acpPermissionModeId!(r)).toThrow(/permission_mode/);
+    expect(() => a.acpPermissionModeId!(r))
+      .toThrow(/default, acceptEdits, plan, dontAsk, bypassPermissions/);
+  });
+});
+
 describe('validateOptions / prereqs', () => {
   it('rejects unknown option keys', () => {
     const a = makeClaudeCodeAdapter(okExec);

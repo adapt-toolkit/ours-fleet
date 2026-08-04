@@ -99,7 +99,7 @@ createInterface({ input: process.stdin }).on('line', line => {
         result: {
           protocolVersion: 1,
           agentCapabilities: {
-            loadSession: false,
+            loadSession: process.env.ACP_FIXTURE_LOAD_SESSION === '1',
             sessionCapabilities: { close: {} },
           },
           _meta: { steering: { supported: true } },
@@ -109,7 +109,31 @@ createInterface({ input: process.stdin }).on('line', line => {
     case 'session/new':
       send({ jsonrpc: '2.0', id: message.id, result: { sessionId } });
       break;
+    case 'session/load':
+      send({ jsonrpc: '2.0', id: message.id, result: {} });
+      break;
     case 'session/close':
+      send({ jsonrpc: '2.0', id: message.id, result: {} });
+      break;
+    // Echo the mode as an update BEFORE answering, so a test can observe which
+    // modeId actually arrived. ACP_FIXTURE_SET_MODE_FAIL=1 refuses instead.
+    case 'session/set_mode':
+      if (process.env.ACP_FIXTURE_SET_MODE_FAIL === '1') {
+        send({ jsonrpc: '2.0', id: message.id,
+          error: { code: -32602, message: 'mode unavailable' } });
+        break;
+      }
+      send({
+        jsonrpc: '2.0',
+        method: 'session/update',
+        params: {
+          sessionId,
+          update: {
+            sessionUpdate: 'agent_message_chunk',
+            content: { type: 'text', text: `mode:${message.params.modeId}` },
+          },
+        },
+      });
       send({ jsonrpc: '2.0', id: message.id, result: {} });
       break;
     case 'session/prompt': {

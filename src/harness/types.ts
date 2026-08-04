@@ -88,6 +88,12 @@ export interface HarnessAdapter {
   buildLaunch(role: ResolvedRole, mode: 'fresh' | 'resume', s: SessionState, prep: SessionPrep): Launch;
   buildAcpLaunch?(role: ResolvedRole, prep: SessionPrep): AcpLaunch;
   /**
+   * The native permission-mode id an ACP session should run at, from the same
+   * translation `buildLaunch` uses for its CLI flag. `undefined` keeps the
+   * agent's default. Omit for a harness whose ACP agent has no modes.
+   */
+  acpPermissionModeId?(role: ResolvedRole): string | undefined;
+  /**
    * REQUIRED. Every adapter must either translate neutral permissions or
    * explicitly declare that it cannot. Enforced at registration.
    */
