@@ -115,6 +115,14 @@ Permanent spawn writes \`~/fleet.d/Name.yaml\` and starts a supervised role.
 \`--temp\` writes ephemeral state, starts a detached supervisor, and removes the
 role after exit/reboot. Both lifetimes support \`--session acp\`.
 
+Temporary-role identity bootstrap is capability-based. The generated briefing
+first tries to bind the exact assigned identity and preserves it when it already
+exists. If missing, it uses ours MCP \`create_temporary_identity\` when that tool
+is exposed, tying a newly-created identity to the connector session lifecycle;
+older servers fall back to \`create_identity\`. Collisions and creation errors
+stop safely without force-adopting or deleting identity state. Permanent roles
+retain normal \`create_identity\` behavior.
+
 Codex-specific spawn flags: \`--sandbox\`, \`--permission-mode\`, \`--launcher\`,
 \`--profile\`, \`--search\`, repeatable \`--codex-config key=value\`, repeatable
 \`--add-dir\`, and legacy \`--monitor\` (consent for the native Codex monitor,
