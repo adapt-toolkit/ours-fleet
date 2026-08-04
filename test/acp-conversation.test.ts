@@ -139,6 +139,32 @@ describe('AcpSession conversation ledger', () => {
     expect((completed.payload as TurnCompletedPayload).outcome).toBe('cancelled');
   });
 
+  it('interrupt cancels only the active turn; the queued prompt still runs', async () => {
+    const { session } = await start();
+    const active = await session.queuePrompt('block 60000');
+    await session.submitPromptBrowser({
+      commandId: 'cmd-q', text: 'queued survivor',
+      source: 'browser', actorBrowserSession: 'digest',
+    });
+    await new Promise(resolve => setTimeout(resolve, 100));
+    await session.interrupt('owner');
+    expect((await active.completion).outcome).toBe('cancelled');
+    // The queued prompt starts only after cancellation confirmation, and runs.
+    for (let i = 0; i < 300 && !events(session).some(e =>
+      e.kind === 'turn.completed'
+      && (e.payload as TurnCompletedPayload).outcome === 'completed'); i++)
+      await new Promise(resolve => setTimeout(resolve, 10));
+    const all = events(session);
+    const survivor = all.find(e => e.kind === 'prompt.admitted' && e.commandId === 'cmd-q')!;
+    const completed = all.find(e =>
+      e.kind === 'turn.completed' && e.promptId === survivor.promptId)!;
+    expect((completed.payload as TurnCompletedPayload).outcome).toBe('completed');
+    const cancelled = all.find(e =>
+      e.kind === 'turn.completed'
+      && (e.payload as TurnCompletedPayload).outcome === 'cancelled')!;
+    expect(cancelled.seq).toBeLessThan(completed.seq);
+  });
+
   it('records automatic permission decisions with their policy', async () => {
     const { session } = await start('allow');
     await session.submitPrompt('permission please');

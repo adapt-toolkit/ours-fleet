@@ -1,5 +1,6 @@
-import { lazy, Suspense, useCallback, useEffect, useState } from 'react';
+import { lazy, Suspense, useCallback, useEffect, useRef, useState } from 'react';
 import { api, idempotencyKey } from './api';
+import { ConversationView } from './ConversationView';
 import { isInactive } from './fleet-presentation';
 import { partitionActivity } from './activity-presentation';
 import { useLivePoll } from './use-live-poll';
@@ -8,7 +9,9 @@ const TerminalView = lazy(() => import('./TerminalView').then(module => ({ defau
 
 export function RoleWorkspace({ roleId, onBack }: { roleId: string; onBack(): void }) {
   const [detail, setDetail] = useState<any>();
-  const [tab, setTab] = useState<'overview' | 'activity' | 'terminal' | 'logs' | 'diagnostics'>('overview');
+  const [tab, setTab] = useState<'overview' | 'conversation' | 'activity' | 'terminal' | 'logs' | 'diagnostics'>('overview');
+  // ACP roles land on the structured Conversation view; picked once per role.
+  const defaultTabPicked = useRef(false);
   const [output, setOutput] = useState<any>();
   const [logs, setLogs] = useState<any>();
   const [text, setText] = useState('');
@@ -33,6 +36,11 @@ export function RoleWorkspace({ roleId, onBack }: { roleId: string; onBack(): vo
     if (!signal.aborted) setLogs(value);
   }, [roleId]);
   useLivePoll(refreshLogs, reason => setRefreshError((reason as Error).message), tab === 'logs');
+  useEffect(() => {
+    if (!detail || defaultTabPicked.current) return;
+    defaultTabPicked.current = true;
+    if (detail.status?.session?.backend === 'acp') setTab('conversation');
+  }, [detail]);
   if (!detail) return <div className="content">Loading role evidence…</div>;
   const { role, status, capabilities } = detail;
   const inactive = isInactive({ role, status });
@@ -60,12 +68,17 @@ export function RoleWorkspace({ roleId, onBack }: { roleId: string; onBack(): vo
       <span>{role.lifetime}</span><span>{role.config?.harness}</span><span>{status.session.backend}</span>
       <small>observed {new Date(status.observedAt).toLocaleTimeString()}</small></div>
     <div className="tabs" role="tablist">
-      {(['overview', 'activity', 'terminal', 'logs', 'diagnostics'] as const).map(name =>
+      {([
+        'overview',
+        ...(status.session.backend === 'acp' ? ['conversation'] as const : []),
+        'activity', 'terminal', 'logs', 'diagnostics',
+      ] as const).map(name =>
         <button key={name} className={tab === name ? 'active' : ''} disabled={name === 'terminal' && !capabilities.terminal.available}
-          onClick={() => setTab(name)}>{name}{name === 'terminal' && !capabilities.terminal.available ? ' · unavailable' : ''}</button>)}
+          onClick={() => setTab(name)}>{name === 'terminal' ? 'PTY terminal' : name}{name === 'terminal' && !capabilities.terminal.available ? ' · unavailable' : ''}</button>)}
     </div>
     {refreshError && <div className="banner error">Live refresh failed: {refreshError}</div>}
     {notice && <div className="banner info">{notice}</div>}
+    {tab === 'conversation' && <ConversationView roleId={roleId} />}
     {tab === 'overview' && <div className="dashboard-grid">
       <Evidence title="Supervisor" state={status.supervisor.liveness} rows={{ backend: status.supervisor.backend, evidence: status.supervisor.detail }} />
       <Evidence title="Session" state={status.session.readiness} rows={{ reachability: status.session.reachability, evidence: status.session.evidence, error: status.session.lastError }} />

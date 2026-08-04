@@ -146,7 +146,9 @@ export async function buildWebServer(
     auth.authenticate(request);
     return {
       version: VERSION, api: { major: 1, minor: 0 },
-      websocketProtocols: ['ours-fleet-events.v1', 'ours-fleet-terminal.v1'],
+      websocketProtocols: [
+        'ours-fleet-events.v1', 'ours-fleet-terminal.v1', 'ours-fleet-conversation.v1',
+      ],
       auditDegraded: audit.degraded,
     };
   });
@@ -195,10 +197,42 @@ export async function buildWebServer(
       });
     });
 
-  app.post<{ Params: { id: string } }>('/api/v1/roles/:id/input', async request => {
+  app.get<{ Params: { id: string }; Querystring: { after?: string; limit?: string } }>(
+    '/api/v1/roles/:id/conversation', async request => {
+      auth.authenticate(request);
+      const control = await services.session(request.params.id);
+      if (!control.conversationPage)
+        throw new FleetError('capability_unavailable', 'this role has no conversation ledger');
+      return control.conversationPage({
+        after: request.query.after,
+        limit: request.query.limit ? Number(request.query.limit) : undefined,
+      });
+    });
+
+  app.post<{ Params: { id: string } }>('/api/v1/roles/:id/input', async (request, reply) => {
     const session = auth.authenticate(request, true);
-    const text = String((request.body as { text?: unknown })?.text ?? '');
+    const body = request.body as { text?: unknown; commandId?: unknown };
+    const text = String(body?.text ?? '');
+    const commandId = typeof body?.commandId === 'string' && body.commandId.trim()
+      ? body.commandId : undefined;
     const control = await services.session(request.params.id);
+    // The idempotent, durably admitted path — used whenever the caller sends a
+    // command id and the role has a conversation ledger. The legacy path stays
+    // for old clients and tmux roles.
+    if (commandId && control.submitPromptV2) {
+      const receipt = await control.submitPromptV2({
+        commandId, text,
+        actorBrowserSession: createHmac('sha256', digestKey).update(session.id).digest('hex').slice(0, 24),
+      });
+      await audit.record({
+        requestId: request.id, browser: session.id, roleId: request.params.id,
+        action: 'session.submit_prompt', result: receipt.state,
+        bytes: Buffer.byteLength(text),
+        digest: createHmac('sha256', digestKey).update(text).digest('hex').slice(0, 24),
+      });
+      reply.code(202);
+      return receipt;
+    }
     const receipt = await control.sendText(text);
     await audit.record({
       requestId: request.id, browser: session.id, roleId: request.params.id,
@@ -209,9 +243,21 @@ export async function buildWebServer(
     return receipt;
   });
 
-  app.post<{ Params: { id: string } }>('/api/v1/roles/:id/interrupt', async request => {
-    auth.authenticate(request, true);
+  app.post<{ Params: { id: string } }>('/api/v1/roles/:id/interrupt', async (request, reply) => {
+    const session = auth.authenticate(request, true);
+    const body = request.body as { commandId?: unknown } | undefined;
+    const commandId = typeof body?.commandId === 'string' && body.commandId.trim()
+      ? body.commandId : undefined;
     const control = await services.session(request.params.id);
+    if (commandId && control.interruptV2) {
+      const receipt = await control.interruptV2(commandId);
+      await audit.record({
+        requestId: request.id, browser: session.id, roleId: request.params.id,
+        action: 'session.interrupt', result: 'accepted',
+      });
+      reply.code(202);
+      return receipt;
+    }
     if (!control.interrupt) throw new FleetError('capability_unavailable', 'interrupt is unavailable');
     return control.interrupt();
   });
@@ -264,9 +310,13 @@ export async function buildWebServer(
   });
 
   app.post('/api/v1/ws-tickets', async request => {
-    const body = request.body as { purpose?: 'events' | 'terminal'; roleId?: string };
-    if (!body?.purpose || !['events', 'terminal'].includes(body.purpose))
+    const body = request.body as {
+      purpose?: 'events' | 'terminal' | 'conversation'; roleId?: string;
+    };
+    if (!body?.purpose || !['events', 'terminal', 'conversation'].includes(body.purpose))
       throw new FleetError('invalid_request', 'ticket purpose is required');
+    if (body.purpose === 'conversation' && !body.roleId)
+      throw new FleetError('invalid_request', 'a conversation ticket must be bound to a role');
     return auth.mintTicket(request, body.purpose, body.roleId);
   });
 
@@ -306,6 +356,63 @@ export async function buildWebServer(
       socket.send(JSON.stringify({ kind: 'ready', at: new Date().toISOString() }));
     });
   });
+
+  app.get<{ Params: { id: string } }>(
+    '/api/v1/roles/:id/conversation-stream', { websocket: true }, (socket, request) => {
+      requireSubprotocol(request, 'ours-fleet-conversation.v1');
+      authorizeSocket(socket, request, async hello => {
+        const session = auth.consumeTicket(
+          request, String(hello.ticket ?? ''), 'conversation', request.params.id);
+        auth.bindSocket(session.id, socket);
+        const control = await services.session(request.params.id);
+        if (!control.followConversation)
+          throw new FleetError('capability_unavailable', 'this role has no conversation ledger');
+        const after = typeof hello.after === 'string' && hello.after ? hello.after : undefined;
+
+        // Backpressure discipline (spec §5.5): a browser that cannot keep up
+        // gets an explicit resync signal, then a close — durable events are
+        // never dropped silently, the store remains the recovery source.
+        let resyncSent = false;
+        const guardedSend = (payload: unknown): void => {
+          if (socket.readyState !== socket.OPEN) return;
+          if (socket.bufferedAmount > 4 * 1024 * 1024) {
+            socket.close(4408, 'slow consumer');
+            return;
+          }
+          if (socket.bufferedAmount > 1 * 1024 * 1024) {
+            if (!resyncSent) {
+              resyncSent = true;
+              socket.send(JSON.stringify({ type: 'resync.required' }));
+            }
+            return;
+          }
+          socket.send(JSON.stringify(payload));
+        };
+
+        const follow = await control.followConversation({
+          after,
+          onPage: page => {
+            guardedSend({
+              type: 'ready',
+              snapshot: page.snapshot,
+              firstAvailableCursor: page.firstAvailableCursor,
+              lastCursor: page.nextCursor ?? after,
+            });
+            if (page.events.length) guardedSend({ type: 'events', events: page.events });
+            if (page.hasMore) guardedSend({ type: 'resync.required' });
+          },
+          onEvent: event => guardedSend({ type: 'events', events: [event] }),
+          onClose: reason => {
+            if (socket.readyState === socket.OPEN)
+              socket.close(4409, (reason ?? 'conversation stream ended').slice(0, 120));
+          },
+        });
+        const heartbeat = setInterval(() => {
+          if (socket.readyState === socket.OPEN) socket.ping();
+        }, 30_000);
+        socket.on('close', () => { clearInterval(heartbeat); follow.close(); });
+      });
+    });
 
   app.get<{ Params: { id: string } }>(
     '/api/v1/roles/:id/terminal', { websocket: true }, (socket, request) => {
