@@ -1,6 +1,4 @@
-import {
-  existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync,
-} from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
@@ -381,68 +379,6 @@ describe('OwnerChannel', () => {
     expect(finals.every(call => call.args?.reply_to_wire_id === 'wire-long')).toBe(true);
   });
 
-  it('routes regular files from the per-request outbox through the channel identity', async () => {
-    const { channel, client, queuePrompt } = setup([{
-      msg_id: 18, wire_id: 'wire-files', from: { id: OWNER_CID }, text: 'Send the artifacts',
-    }]);
-    let outbox = '';
-    queuePrompt.mockImplementationOnce(async (prompt: string) => {
-      const lines = prompt.split('\n');
-      outbox = lines[lines.indexOf('To attach files to your response, copy each finished file directly into this fleet outbox:') + 1];
-      mkdirSync(outbox, { recursive: true });
-      writeFileSync(join(outbox, 'report.txt'), 'report');
-      writeFileSync(join(outbox, 'data.json'), '{}');
-      mkdirSync(join(outbox, 'ignored-directory'));
-      return {
-        promptId: 'prompt-files', queuedBehind: 0,
-        completion: Promise.resolve({
-          accepted: true, outcome: 'completed', succeeded: true, output: 'Attached.',
-        }),
-      };
-    });
-
-    await channel.drain();
-    await vi.waitFor(() => {
-      expect(client.calls.filter(call => call.name === 'send_file')).toHaveLength(2);
-      expect(existsSync(outbox)).toBe(false);
-    });
-
-    expect(client.calls.filter(call => call.name === 'send_file').map(call => call.args)).toEqual([
-      {
-        contact: OWNER_CID, path: join(outbox, 'data.json'), filename: 'data.json',
-        reply_to_wire_id: 'wire-files',
-      },
-      {
-        contact: OWNER_CID, path: join(outbox, 'report.txt'), filename: 'report.txt',
-        reply_to_wire_id: 'wire-files',
-      },
-    ]);
-  });
-
-  it('retains the outbox and leaves the wire replayable when file delivery fails', async () => {
-    const { channel, client, queuePrompt, dir } = setup([{
-      msg_id: 19, wire_id: 'wire-file-retry', from: { id: OWNER_CID }, text: 'Send it',
-    }]);
-    let outbox = '';
-    client.failTools.add('send_file');
-    queuePrompt.mockImplementationOnce(async (prompt: string) => {
-      const lines = prompt.split('\n');
-      outbox = lines[lines.indexOf('To attach files to your response, copy each finished file directly into this fleet outbox:') + 1];
-      writeFileSync(join(outbox, 'retry.txt'), 'retry');
-      return {
-        promptId: 'prompt-file-retry', queuedBehind: 0,
-        completion: Promise.resolve({
-          accepted: true, outcome: 'completed', succeeded: true, output: 'Attached.',
-        }),
-      };
-    });
-
-    await channel.drain();
-    await vi.waitFor(() => expect(client.calls.some(call => call.name === 'send_file')).toBe(true));
-    expect(existsSync(join(outbox, 'retry.txt'))).toBe(true);
-    const statePath = join(dir, '.owner-channel-state.json');
-    expect(!existsSync(statePath) || !readFileSync(statePath, 'utf8').includes('wire-file-retry')).toBe(true);
-  });
 });
 
 describe('OwnerChannel notice presentation', () => {

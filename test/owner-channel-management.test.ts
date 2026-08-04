@@ -106,6 +106,21 @@ describe('OwnerChannel live management', () => {
     await channel.close();
   });
 
+  it('instructs a managed agent to send request files directly through the channel', async () => {
+    const { channel, client, queuePrompt } = setup({ agent: AGENT });
+    await channel.start();
+    client.batches.push([{
+      msg_id: 20, wire_id: 'owner-file-request', from: { id: OWNER }, text: 'Send the report',
+    }], []);
+    await channel.drain();
+    const prompt = String(queuePrompt.mock.calls[0][0]);
+    expect(prompt).toContain('call ours send_file');
+    expect(prompt).toContain('contact: Role-owner');
+    expect(prompt).toContain('reply_to_wire_id: owner-file-request');
+    expect(prompt).not.toContain('fleet outbox');
+    await channel.close();
+  });
+
   it('warns the owner without reflecting the body when another agent tries the relay', async () => {
     const { channel, client, queuePrompt } = setup({ agent: AGENT });
     await channel.start();

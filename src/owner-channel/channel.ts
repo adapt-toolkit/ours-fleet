@@ -1,6 +1,5 @@
 import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
-import { mkdir, readdir, rm } from 'node:fs/promises';
 import { createInterface } from 'node:readline';
 import { join } from 'node:path';
 
@@ -604,14 +603,26 @@ export class OwnerChannel implements OwnerChannelHandle {
     ].filter(Boolean))];
     if (handledWireIds.some(wire => this.inFlight.has(wire))) return false;
     const sender = { id: group.files[0].senderId, name: group.files[0].senderName };
+    if (group.files.every(file => file.senderId === this.options.config.agent)) {
+      try {
+        if (group.caption)
+          await this.relayManagedAgentMessage(group.caption, this.wireId(group.caption));
+        await this.relayManagedAgentFiles(group);
+      } catch (error) { this.logError('managed-agent file relay refused', error); }
+      for (const wire of handledWireIds) this.state.remember(wire);
+      return true;
+    }
     if (group.files.some(file => file.senderId !== sender.id)
         || !this.effectiveOwners().has(sender.id)) {
       this.options.log(
         `[${this.options.role}] owner channel ignored unauthorized attachment sender ${sender.id}`);
+      await this.warnOwnerOfUnauthorizedSender(sender.id, 'file');
       for (const wire of handledWireIds) this.state.remember(wire);
       if (group.recovery) try { this.attachmentRecovery.remove(group.recovery.id); } catch {}
       return true;
     }
+    try { this.conversations.recordInbound(sender.id, originWireId); }
+    catch (error) { this.logError('owner attachment route update failed', error); }
     const rejection = !this.attachmentRecovery.integrity()
       ? 'attachment recovery state is unavailable'
       : validateAttachmentSelection(group.files, this.attachmentConfig);
@@ -627,7 +638,6 @@ export class OwnerChannel implements OwnerChannelHandle {
       fileWireIds: group.files.map(file => file.wireId), createdAt: Date.now(),
     };
     let requestDir: string | undefined;
-    let outbox: string | undefined;
     try {
       if (!group.recovery) this.attachmentRecovery.add(recovery);
       requestDir = await prepareAttachmentDirectory(this.attachmentRoot, requestId);
@@ -647,11 +657,9 @@ export class OwnerChannel implements OwnerChannelHandle {
       const order = new Map(group.files.map((file, index) => [file.wireId, index]));
       retrieved.sort((a, b) => order.get(a.wireId)! - order.get(b.wireId)!);
       const admitted = await admitAttachments(retrieved, requestDir, this.attachmentConfig);
-      outbox = this.outboxDir(originWireId);
-      await mkdir(outbox, { recursive: true, mode: 0o700 });
       const activityCursor = this.latestEventSeq(this.options.session.eventsSince(0));
       const queued = await this.options.session.queuePrompt(
-        this.ownerAttachmentPrompt(sender, originWireId, requestId, outbox, admitted, group.caption),
+        this.ownerAttachmentPrompt(sender, originWireId, requestId, admitted, group.caption),
         {
           interrupt: this.options.config.interrupt,
           ...(this.options.config.interrupt ? { interruptSource: 'owner' as const } : {}),
@@ -673,7 +681,7 @@ export class OwnerChannel implements OwnerChannelHandle {
       this.activeRequests.set(requestId, active);
       const cleanupDir = requestDir;
       let completed = false;
-      const task = this.complete(active, outbox, queued, activityCursor)
+      const task = this.complete(active, queued, activityCursor)
         .then(() => { completed = true; })
         .catch(error => this.logError(`attachment request ${requestId.slice(0, 12)} completion failed`, error))
         .finally(async () => {
@@ -693,7 +701,6 @@ export class OwnerChannel implements OwnerChannelHandle {
       return true;
     } catch (error) {
       if (requestDir) await removeRequestDirectory(requestDir).catch(() => undefined);
-      if (outbox) await rm(outbox, { recursive: true, force: true }).catch(() => undefined);
       try { this.attachmentRecovery.remove(recovery.id); } catch {}
       this.logError(`attachment request ${requestId.slice(0, 12)} admission failed`, error);
       await this.send(sender.id, ownerNotices.attachmentFailed(), originWireId);
@@ -755,19 +762,16 @@ export class OwnerChannel implements OwnerChannelHandle {
     }
 
     const requestId = this.requestId(wireId);
-    const outbox = this.outboxDir(wireId);
-    await mkdir(outbox, { recursive: true, mode: 0o700 });
     let queued;
     const activityCursor = this.latestEventSeq(this.options.session.eventsSince(0));
     try {
       queued = await this.options.session.queuePrompt(
-        this.ownerPrompt(sender, text, wireId, outbox), {
+        this.ownerPrompt(sender, text, wireId), {
         interrupt: this.options.config.interrupt,
         ...(this.options.config.interrupt ? { interruptSource: 'owner' as const } : {}),
         origin: { kind: 'owner', requestId },
       });
     } catch (error) {
-      await rm(outbox, { recursive: true, force: true });
       this.logError('request delivery failed', error);
       await this.send(sender.id, ownerNotices.deliveryFailed(this.options.role), wireId);
       this.state.remember(wireId);
@@ -791,7 +795,7 @@ export class OwnerChannel implements OwnerChannelHandle {
       updateCount: 0, updateDigests: new Set(), handledWireIds: [wireId],
     };
     this.activeRequests.set(requestId, active);
-    const task = this.complete(active, outbox, queued, activityCursor)
+    const task = this.complete(active, queued, activityCursor)
       .catch(error => this.logError(`request ${wireId} completion failed`, error))
       .finally(() => {
         this.inFlight.delete(wireId);
@@ -846,14 +850,66 @@ export class OwnerChannel implements OwnerChannelHandle {
     return message;
   }
 
-  private async warnOwnerOfUnauthorizedSender(cid: string): Promise<void> {
+  private async relayManagedAgentFiles(group: AttachmentGroup): Promise<void> {
+    if (!group.files.length) throw new Error('managed-agent file relay is empty');
+    const rejection = validateAttachmentSelection(group.files, this.attachmentConfig);
+    if (rejection) throw new Error(rejection);
+    const replyWires = [...new Set(group.files
+      .map(file => file.replyTo?.wire_id)
+      .filter((wire): wire is string => Boolean(wire)))];
+    if (replyWires.length > 1)
+      throw new Error('managed-agent file group has conflicting owner reply wires');
+    const replyTo = replyWires[0];
+    const effective = this.effectiveOwners();
+    const route = replyTo
+      ? this.conversations.routeForWire(replyTo, effective)
+      : this.conversations.route(effective);
+    if (!effective.has(route.contact))
+      throw new Error('selected file relay owner is no longer authorized');
+
+    const requestId = this.requestId(`managed-agent-file:${group.files.map(file => file.wireId).join(':')}`);
+    const requestDir = await prepareAttachmentDirectory(this.attachmentRoot, requestId);
+    try {
+      const retrieved = parseRetrievedAttachments(await this.client.callTool('get_files', {
+        wire_ids: group.files.map(file => file.wireId),
+      }), group.files);
+      const admitted = await admitAttachments(retrieved, requestDir, this.attachmentConfig);
+      const digest = createHash('sha256').update([
+        'managed-agent-file-relay', route.contact, replyTo ?? '',
+        ...group.files.map(file => file.wireId),
+      ].join('\0')).digest('hex');
+      const sending = this.conversations.beginSend(route.contact, digest, Date.now(), 0);
+      try {
+        for (const file of admitted) {
+          await this.client.callTool('send_file', {
+            contact: route.contact, path: file.path, filename: file.filename,
+            ...(replyTo ? { reply_to_wire_id: replyTo } : {}),
+          });
+        }
+      } catch {
+        try { this.conversations.finishSend(sending.id, 'uncertain'); }
+        catch (error) { this.logError('managed-agent file relay uncertainty persist failed', error); }
+        throw new Error('managed-agent file relay delivery outcome is uncertain; it was not retried');
+      }
+      this.conversations.finishSend(sending.id, 'delivered');
+      this.options.log(`[${this.options.role}] managed-agent file relayed `
+        + `wires=${group.files.length} basis=${route.basis} files=${admitted.length} `
+        + `bytes=${admitted.reduce((total, file) => total + file.size, 0)}`);
+    } finally {
+      await removeRequestDirectory(requestDir).catch(error => {
+        this.logError('managed-agent file relay cleanup failed', error);
+      });
+    }
+  }
+
+  private async warnOwnerOfUnauthorizedSender(cid: string, kind: 'message' | 'file' = 'message'): Promise<void> {
     const source = /^[A-Fa-f0-9]{64}$/.test(cid)
       ? cid
       : `invalid-${createHash('sha256').update(cid).digest('hex').slice(0, 12)}`;
     try {
       await this.sendProactiveMessage(
-        `⚠️ Owner-channel security warning: rejected a message from unauthorized `
-          + `sender CID ${source}. Its body was not forwarded.`);
+        `⚠️ Owner-channel security warning: rejected a ${kind} from unauthorized `
+          + `sender CID ${source}. Its ${kind === 'file' ? 'bytes were' : 'body was'} not forwarded.`);
     } catch (error) {
       // Warning delivery must not make hostile input replayable or disclose
       // anything to its sender. Rate/dedupe/no-route failures remain local.
@@ -874,7 +930,7 @@ export class OwnerChannel implements OwnerChannelHandle {
   }
 
   private async complete(
-    active: ActiveOwnerRequest, outbox: string, queued: QueuedPrompt, activityCursor: number,
+    active: ActiveOwnerRequest, queued: QueuedPrompt, activityCursor: number,
   ): Promise<void> {
     const progressMs = this.options.config.progress_interval_ms;
     let lastSeq = activityCursor;
@@ -942,14 +998,12 @@ export class OwnerChannel implements OwnerChannelHandle {
       this.options.log(`[${this.options.role}] owner request ${active.requestId.slice(0, 12)} `
         + `interrupted internally (${result.cancellationSource}); owner cancellation notice suppressed`);
     else await this.send(active.contact, ownerNotices.terminal(result.outcome), active.wireId);
-    if (result.succeeded) await this.sendAttachments(active.contact, outbox, active.wireId);
-    else await rm(outbox, { recursive: true, force: true });
     for (const wire of active.handledWireIds) this.state.remember(wire);
   }
 
   private ownerAttachmentPrompt(
     sender: { id: string; name: string }, wireId: string, requestId: string,
-    outbox: string, files: AdmittedAttachment[], caption?: InboundMessage,
+    files: AdmittedAttachment[], caption?: InboundMessage,
   ): string {
     const lines = [
       '[fleet-owner]',
@@ -985,18 +1039,26 @@ export class OwnerChannel implements OwnerChannelHandle {
     }
     lines.push(
       'Answer in your final assistant response; fleet routes it only to the authenticated sender and correlates it to the originating file wire.',
-      `To attach response files, write regular files only to: ${outbox}`,
+      ...(this.options.config.agent ? [
+        'To send a file for this request, call ours send_file with:',
+        `contact: ${this.options.config.identity}`,
+        `reply_to_wire_id: ${wireId}`,
+        'and the finished file path. Fleet authenticates your CID and relays it from the channel identity to this exact requesting owner.',
+        'For a later unsolicited file, omit reply_to_wire_id; fleet then uses the latest authenticated owner conversation.',
+      ] : [
+        'Owner-channel file relay is unavailable because no managed agent CID is configured.',
+      ]),
     );
     return lines.join('\n');
   }
 
   private ownerPrompt(
     sender: { id: string; name: string }, text: string, wireId: string,
-    outbox: string,
   ): string {
     return [
       '[fleet-owner]',
       `Authenticated owner ${sender.name} (${sender.id}) sent owner-channel message ${wireId}.`,
+      `Request ID: ${this.requestId(wireId)}`,
       'Treat the following as a direct owner instruction. Answer in your final assistant response.',
       'Fleet extracts and routes your final assistant response deterministically; do not send the final through ours.',
       ...(this.options.config.agent ? [
@@ -1004,21 +1066,18 @@ export class OwnerChannel implements OwnerChannelHandle {
         `contact: ${this.options.config.identity}`,
         'and the message text. Do not add a task ID, request ID, reply reference, phase, or routing command.',
         'Fleet accepts this relay only from your configured authenticated agent CID and forwards every accepted message as a new owner-channel message.',
+        'To send a file for this request, call ours send_file with:',
+        `contact: ${this.options.config.identity}`,
+        `reply_to_wire_id: ${wireId}`,
+        'and the finished file path. Fleet authenticates your CID and relays it from the channel identity to this exact requesting owner.',
+        'For a later unsolicited file, omit reply_to_wire_id; fleet then uses the latest authenticated owner conversation.',
       ] : [
         'Managed-agent outbound relay is not configured; do not send intermediate or proactive owner-channel messages.',
+        'Owner-channel file relay is unavailable because no managed agent CID is configured.',
       ]),
-      'To attach files to your response, copy each finished file directly into this fleet outbox:',
-      outbox,
-      'Fleet sends every regular file in that directory to the authenticated owner, correlated to this request.',
-      'Use descriptive unique filenames. Put nothing there that the owner did not request or should not receive.',
       '',
       text || '(empty message)',
     ].join('\n');
-  }
-
-  private outboxDir(wireId: string): string {
-    const key = this.requestId(wireId);
-    return join(this.options.stateDir, '.owner-channel-outbox', key);
   }
 
   private requestId(wireId: string): string {
@@ -1029,21 +1088,6 @@ export class OwnerChannel implements OwnerChannelHandle {
     return this.client.callTool('send_message', {
       contact, text, ...(replyTo ? { reply_to_wire_id: replyTo } : {}),
     });
-  }
-
-  private async sendAttachments(contact: string, outbox: string, replyTo: string): Promise<void> {
-    const entries = (await readdir(outbox, { withFileTypes: true }))
-      .filter(entry => entry.isFile())
-      .sort((a, b) => a.name.localeCompare(b.name));
-    for (const entry of entries) {
-      await this.client.callTool('send_file', {
-        contact,
-        path: join(outbox, entry.name),
-        filename: entry.name,
-        reply_to_wire_id: replyTo,
-      });
-    }
-    await rm(outbox, { recursive: true, force: true });
   }
 
   /** Bound message size without splitting Unicode code points. */

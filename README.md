@@ -609,9 +609,13 @@ An owner request follows one ordered lifecycle on its authenticated source wire:
 3. The agent may send any non-final message to the channel identity through its
    ordinary ours MCP tool. CID authentication is the message gate; no task ID,
    request ID, phase, reply reference, or routing command is used.
-4. Fleet independently emits exactly one final ACP
-   response (or a sanitized terminal outcome). Successful turns send regular files
-   from the request outbox afterward, correlated to the same source wire.
+4. For a requested file, the agent calls `send_file` to the channel identity with
+   the request's `reply_to_wire_id`. Fleet authenticates the agent CID, validates
+   the selected bytes, resolves that wire to its owner, and relays the file from
+   the channel identity. An unsolicited file omits the reply reference and uses
+   the latest authenticated owner route. There is no filesystem outbox protocol.
+5. Fleet independently emits exactly one final ACP response (or a sanitized
+   terminal outcome).
 
 Fleet chooses the stored latest authenticated owner for every managed-agent
 message; the model supplies only text and the channel contact. Relay audit logs

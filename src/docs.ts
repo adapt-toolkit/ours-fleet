@@ -375,11 +375,14 @@ CID is forwarded as a new message to the latest authenticated owner conversation
 Every other CID is rejected and warned about without reflecting its body. Fleet sends
 accepted/queued/progress/interrupted/failure notices and routes the ACP turn's
 final assistant text back to the authenticated sender with its source wire ID.
-For file replies, fleet injects a request-specific outbox path into the owner
-prompt. The agent copies completed artifacts there; fleet sends every regular
-file from the channel identity with the same source wire ID and removes the
-temporary outbox only after successful delivery. The agent never chooses an owner
-recipient or calls ours \`send_file\` for an owner-channel response.
+For file replies, the managed agent calls ours \`send_file\` to the channel
+identity with the owner request's \`reply_to_wire_id\`. Fleet accepts files only
+from the exact configured \`agent\` CID, selectively retrieves and validates the
+bytes, resolves the source wire to its authenticated owner route, and resends the
+file from the channel identity with the same reply reference. An unknown reply
+wire fails closed rather than falling back to another owner. A file without a
+reply reference is proactive and uses the latest authenticated owner conversation.
+There is no filesystem outbox protocol.
 Exact \`/status\` and \`/interrupt\` commands bypass the model.
 
 Owner documents, images, and voice messages use the same authenticated sender

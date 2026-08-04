@@ -1,6 +1,7 @@
 import { createHash } from 'node:crypto';
 import {
-  chmodSync, copyFileSync, lstatSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync,
+  chmodSync, copyFileSync, existsSync, lstatSync, mkdtempSync, readFileSync, rmSync, symlinkSync,
+  writeFileSync,
 } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -18,6 +19,7 @@ import type { QueuedPrompt, SessionHandle, TurnResult } from '../src/session/typ
 
 const OWNER = 'A'.repeat(64);
 const OTHER = 'B'.repeat(64);
+const AGENT = 'D'.repeat(64);
 const FILE_WIRE = '1'.repeat(64);
 const CAPTION_WIRE = '2'.repeat(64);
 const dirs: string[] = [];
@@ -79,7 +81,7 @@ function deferredPrompt() {
   return { queued, finish };
 }
 
-async function setup(owners = [OWNER], recover = false) {
+async function setup(owners = [OWNER], recover = false, agent?: string) {
   const dir = mkdtempSync(join(tmpdir(), 'ours-owner-attachments-'));
   dirs.push(dir);
   const client = new AttachmentClient();
@@ -92,6 +94,7 @@ async function setup(owners = [OWNER], recover = false) {
   } as unknown as SessionHandle;
   const config: OwnerChannelConfig = {
     identity: 'Role-owner', owners, interrupt: false, progress_interval_ms: 0,
+    ...(agent ? { agent } : {}),
     attachments: attachmentConfig,
   };
   if (recover) new AttachmentRecoveryState(join(dir, '.owner-channel-attachment-recovery.json')).add({
@@ -183,7 +186,11 @@ describe('owner-channel attachment ingress', () => {
     unauthorized.client.files = [listed({ from: { id: OTHER, name: 'Impostor' } })];
     await unauthorized.channel.drain();
     expect(unauthorized.client.calls.some(call => call.name === 'get_files')).toBe(false);
-    expect(unauthorized.client.calls.some(call => call.name === 'send_message')).toBe(false);
+    expect(unauthorized.client.calls.find(call => call.name === 'send_message')?.args).toEqual({
+      contact: OWNER,
+      text: `⚠️ Owner-channel security warning: rejected a file from unauthorized sender CID `
+        + `${OTHER}. Its bytes were not forwarded.`,
+    });
     await unauthorized.channel.close();
 
     for (const overrides of [{ size: 2_000 }, { mime: 'application/x-executable' }]) {
@@ -209,6 +216,85 @@ describe('owner-channel attachment ingress', () => {
     expect(overCount.client.calls.find(call => call.name === 'send_message')?.args?.text)
       .toContain('4-file limit');
     await overCount.channel.close();
+  });
+
+  it('relays a managed-agent file to the exact owner request through the channel identity', async () => {
+    const status = await setup([OWNER, OTHER], false, AGENT);
+    const ownerWire = '9'.repeat(64);
+    status.client.batches.push([{
+      msg_id: 12, wire_id: ownerWire, from: { id: OWNER, name: 'Phone' }, text: '/status',
+    }], [{
+      msg_id: 13, wire_id: '8'.repeat(64), from: { id: OTHER, name: 'Laptop' }, text: '/status',
+    }], []);
+    await status.channel.drain();
+
+    const bytes = Buffer.from('direct report');
+    const source = join(status.dir, 'agent-report');
+    writeFileSync(source, bytes);
+    status.client.files = [listed({
+      from: { id: AGENT, name: 'Coordinator' }, size: bytes.length,
+      filename: 'report.txt', reply_to: { wire_id: ownerWire },
+    })];
+    status.client.retrieved.set(FILE_WIRE, retrieved(source, bytes, {
+      from: { id: AGENT, name: 'Coordinator' }, filename: 'report.txt',
+      reply_to: { wire_id: ownerWire },
+    }));
+    await status.channel.drain();
+
+    expect(status.queuePrompt).not.toHaveBeenCalled();
+    expect(status.client.calls).toContainEqual({
+      name: 'get_files', args: { wire_ids: [FILE_WIRE] },
+    });
+    const sent = status.client.calls.find(call => call.name === 'send_file');
+    expect(sent?.args).toMatchObject({
+      contact: OWNER, filename: 'report.txt', reply_to_wire_id: ownerWire,
+    });
+    expect(sent?.args?.contact).not.toBe(OTHER);
+    expect(existsSync(String(sent?.args?.path))).toBe(false);
+    await status.channel.close();
+  });
+
+  it('routes an uncorrelated managed-agent file to the latest authenticated owner', async () => {
+    const status = await setup([OWNER, OTHER], false, AGENT);
+    const ownerWire = '9'.repeat(64);
+    status.client.batches.push([{
+      msg_id: 14, wire_id: ownerWire, from: { id: OTHER, name: 'Laptop' }, text: '/status',
+    }], []);
+    await status.channel.drain();
+    const bytes = Buffer.from('proactive report');
+    const source = join(status.dir, 'proactive-report');
+    writeFileSync(source, bytes);
+    status.client.files = [listed({
+      from: { id: AGENT, name: 'Coordinator' }, size: bytes.length, filename: 'idea.txt',
+    })];
+    status.client.retrieved.set(FILE_WIRE, retrieved(source, bytes, {
+      from: { id: AGENT, name: 'Coordinator' }, filename: 'idea.txt',
+    }));
+    await status.channel.drain();
+
+    expect(status.client.calls.find(call => call.name === 'send_file')?.args).toMatchObject({
+      contact: OTHER, filename: 'idea.txt',
+    });
+    expect(status.client.calls.find(call => call.name === 'send_file')?.args)
+      .not.toHaveProperty('reply_to_wire_id');
+    await status.channel.close();
+  });
+
+  it('refuses an unknown correlated wire instead of guessing an owner route', async () => {
+    const status = await setup([OWNER, OTHER], false, AGENT);
+    status.client.batches.push([{
+      msg_id: 15, wire_id: '9'.repeat(64), from: { id: OTHER }, text: '/status',
+    }], []);
+    await status.channel.drain();
+    status.client.files = [listed({
+      from: { id: AGENT, name: 'Coordinator' }, reply_to: { wire_id: '7'.repeat(64) },
+    })];
+    await status.channel.drain();
+
+    expect(status.client.calls.some(call => call.name === 'get_files')).toBe(false);
+    expect(status.client.calls.some(call => call.name === 'send_file')).toBe(false);
+    expect(status.logs.join('\n')).toContain('no authenticated owner route matches the source wire');
+    await status.channel.close();
   });
 
   it('routes simultaneous authenticated owners independently and suppresses replayed wires', async () => {
