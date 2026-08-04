@@ -20,6 +20,16 @@ function fakeSession(agent: FakeAgent, overrides: Record<string, unknown> = {}):
     steeringSupported: true,
     pendingPermissions: new Map(),
     events: { emit: () => {} },
+    sessionGeneration: 'gen-test',
+    conversation: {
+      append: (draft: unknown) => draft,
+      appendSafe: () => undefined,
+      receiptFor: () => undefined,
+      recordReceipt: () => undefined,
+      lastCursor: () => undefined,
+      openPrompts: () => [],
+      degraded: false,
+    },
     ...overrides,
   });
   return session;

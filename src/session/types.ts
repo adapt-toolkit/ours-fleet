@@ -1,4 +1,7 @@
 import type { SessionBackendId } from '../config.js';
+import type {
+  ConversationEventV1, ConversationSnapshot, PromptReceipt, SubmitPromptCommand,
+} from './conversation-types.js';
 
 export type SessionReadiness =
   | 'starting'
@@ -15,7 +18,8 @@ export type PromptOrigin =
   | { kind: 'local-console' }
   | { kind: 'owner'; requestId: string }
   | { kind: 'fleet-monitor' }
-  | { kind: 'scheduled-loop'; loop: string; runId: string };
+  | { kind: 'scheduled-loop'; loop: string; runId: string }
+  | { kind: 'browser'; commandId: string };
 
 /**
  * Two independent facts about one turn, deliberately kept apart:
@@ -152,6 +156,8 @@ export interface SubmitPromptOptions {
   origin?: PromptOrigin;
   /** Use the ACP steering extension when available; ignored by other backends. */
   steer?: boolean;
+  /** Audit-grade actor detail persisted with the conversation admission record. */
+  actor?: { browserSession?: string };
 }
 
 export interface SessionSnapshot {
@@ -204,11 +210,25 @@ export interface SessionEvent {
   optionId?: string;
 }
 
+export interface ConversationHandlePage {
+  events: ConversationEventV1[];
+  firstAvailableCursor?: string;
+  nextCursor?: string;
+  hasMore: boolean;
+  snapshot: ConversationSnapshot;
+}
+
 export interface SessionHandle {
   readonly backend: SessionBackendId;
   readonly pid: number;
   isAlive(): boolean;
   snapshot(): SessionSnapshot;
+  // ── durable conversation ledger (ACP sessions only) ────────────────────────
+  conversationPage?(request: { after?: string; limit?: number }): ConversationHandlePage;
+  conversationSnapshot?(): ConversationSnapshot;
+  subscribeConversation?(listener: (event: ConversationEventV1) => void): () => void;
+  /** Durably admit an idempotent browser prompt; resolves on admission. */
+  submitPromptBrowser?(command: SubmitPromptCommand): Promise<PromptReceipt>;
   /**
    * Hand the session a prompt and return as soon as it has accepted
    * responsibility for it. Throws `SessionControlError` if it cannot.

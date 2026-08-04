@@ -251,6 +251,11 @@ export interface ConversationEventV1 {
   messageId?: string;
   toolCallId?: string;
   permissionId?: string;
+  /**
+   * The idempotency key of the command that produced this record. Persisted so
+   * the command-id index can be rebuilt from segments alone on recovery.
+   */
+  commandId?: string;
   source?: ConversationSource;
   actor?: { browserSession?: string; externalSenderDigest?: string };
   payload: ConversationPayload;
