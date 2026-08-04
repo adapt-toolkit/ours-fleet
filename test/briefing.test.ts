@@ -193,6 +193,52 @@ describe('the briefing states only what was verified about the identity (7.3)', 
   });
 });
 
+describe('temporary-role identity compatibility', () => {
+  const temporary = (extra: Partial<Parameters<typeof generateBriefing>[2]> = {}) =>
+    generateBriefing(base, vocab, { ...opts, temporaryIdentity: true, ...extra });
+
+  it('capability-detects session-scoped creation and names the older-server fallback', () => {
+    const b = temporary();
+    expect(b).toContain('available/deferred ours MCP tools');
+    expect(b).toContain('create_temporary_identity');
+    expect(b).toContain('If exposed');
+    expect(b).toContain('If that tool is absent (an older server)');
+    expect(b).toContain('create_identity');
+    expect(b).toContain('name "Alice Dev"');
+  });
+
+  it('preserves an existing or explicitly supplied identity instead of converting it', () => {
+    const b = temporary({ identityGuarantee: 'verified' });
+    expect(b).toContain('pre-existing identity: preserve it as user-owned');
+    expect(b).toContain('Never close, remove, replace, or otherwise convert it');
+    expect(b).toContain('without force');
+    expect(b).toContain('do not evict it');
+  });
+
+  it('states the MCP-owned lifecycle and recreates through the capability path on restart', () => {
+    const b = temporary();
+    expect(b).toContain('connector owns its cleanup when this session lifecycle ends');
+    expect(b).toContain('previous session-owned temporary');
+    expect(b).toContain('when exposed, otherwise fall back');
+  });
+
+  it('fails safely on collisions and creation errors without deleting identity state', () => {
+    const b = temporary();
+    expect(b).toContain('collision or any other error, STOP and report it');
+    expect(b).toContain('do not force-bind');
+    expect(b).toContain('remove an identity');
+    expect(b).not.toContain('remove_identity');
+  });
+
+  it('leaves permanent-role creation unchanged', () => {
+    const b = generateBriefing(base, vocab, opts);
+    expect(b).toContain('persistent agent');
+    expect(b).toContain('create_identity');
+    expect(b).not.toContain('create_temporary_identity');
+    expect(b).not.toContain('session-owned temporary');
+  });
+});
+
 /**
  * An overseer only knows what its generated instructions told it. Before 1.5
  * every `peek`/`send` failure printed "is not running", and the guidance told

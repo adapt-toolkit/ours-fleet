@@ -27,7 +27,8 @@ export const fakeAdapter: HarnessAdapter = {
     return { argv: ['fakebin', ...prep.argv, mode === 'fresh' ? '--sid' : '--resume', s.sessionId, 'go'], env: prep.env };
   },
   vocabulary: {
-    bindTool: 'choose_identity', createTool: 'create_identity', setBioTool: 'set_bio',
+    bindTool: 'choose_identity', createTool: 'create_identity',
+    temporaryCreateTool: 'create_temporary_identity', setBioTool: 'set_bio',
     setPersonaTool: 'set_persona', currentIdentityTool: 'current_identity',
     sendTool: 'send_message', getMessagesTool: 'get_messages',
     watchCommand: id => `ours-mcp watch "${id}"`,

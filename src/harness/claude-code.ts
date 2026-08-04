@@ -287,6 +287,7 @@ export function makeClaudeCodeAdapter(exec: Exec = realExec): HarnessAdapter {
     vocabulary: {
       bindTool: 'choose_identity',
       createTool: 'create_identity',
+      temporaryCreateTool: 'create_temporary_identity',
       setBioTool: 'set_bio',
       setPersonaTool: 'set_persona',
       currentIdentityTool: 'current_identity',

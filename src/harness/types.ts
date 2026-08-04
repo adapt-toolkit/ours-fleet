@@ -52,6 +52,8 @@ export type PermissionTranslation =
 export interface BriefingVocab {
   bindTool: string;
   createTool: string;
+  /** Session-scoped identity creation, capability-detected by temporary roles. */
+  temporaryCreateTool: string;
   setBioTool: string;
   setPersonaTool: string;
   currentIdentityTool: string;

@@ -202,6 +202,16 @@ authenticated identity existence check and reports verified, missing, or
 unknown evidence; a newly launched harness follows its generated first-boot
 instructions to choose or create and bind the identity. The console never
 claims that the host created an identity and never deletes one.
+
+For a temporary role, those first-boot instructions preserve and bind an
+existing identity when one is present. If the assigned identity is missing,
+the role capability-detects the ours MCP `create_temporary_identity` tool and
+uses it when available, so the newly created identity is owned and cleaned up
+by that connector session lifecycle. Older ours servers remain compatible via
+`create_identity`. A collision or creation error stops for operator review;
+fleet never force-adopts or deletes identity state. Permanent roles continue to
+use normal `create_identity` bootstrap behavior.
+
 `node-pty` is optional: if its native module cannot load, ACP and all
 non-terminal features remain available and tmux Terminal is disabled with a
 diagnostic.

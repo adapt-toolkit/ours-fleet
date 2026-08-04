@@ -78,6 +78,7 @@ export function applyRole(
     stateDir: dir, worklogPath: join(dir, 'WORKLOG.md'),
     routinesPath: join(dir, 'ROUTINES.md'), briefingBody,
     identityGuarantee: opts.identityGuarantee,
+    temporaryIdentity: opts.temp === true,
   }));
   if (opts.fresh)
     for (const f of ['.booted', '.session-id', '.exit-status']) rmSync(join(dir, f), { force: true });

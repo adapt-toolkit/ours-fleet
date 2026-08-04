@@ -15,6 +15,20 @@ export interface BriefingOpts {
    * knowledge must not claim one.
    */
   identityGuarantee?: 'verified' | 'created' | 'unverified';
+  /** Temporary spawn whose newly-created identity should share the session lifecycle. */
+  temporaryIdentity?: boolean;
+}
+
+function temporaryIdentityFallback(id: string, v: BriefingVocab): string[] {
+  return [
+    `     First inspect the available/deferred ours MCP tools for **${v.temporaryCreateTool}**.`,
+    `     If exposed, call **${v.temporaryCreateTool}** with name "${id}". It binds`,
+    '     automatically and the ours connector owns its cleanup when this session lifecycle ends.',
+    `     If that tool is absent (an older server), fall back to **${v.createTool}** with`,
+    `     name "${id}" so startup remains compatible. If either creation call reports a`,
+    '     collision or any other error, STOP and report it; do not force-bind, retry under a',
+    '     different name, remove an identity, or delete identity state.',
+  ];
 }
 
 /** Render a role's briefing.md: narrative (or curated body) + mechanical boot steps. */
@@ -23,7 +37,8 @@ export function generateBriefing(role: ResolvedRole, v: BriefingVocab, opts: Bri
   const id = role.identity;
   const hostUser = userInfo().username;
   L.push(`# ${role.name} — Role Briefing`, '');
-  L.push(`You are **${role.name}** (ours identity: **${id}**), a persistent agent on this`);
+  const lifetime = opts.temporaryIdentity ? 'temporary' : 'persistent';
+  L.push(`You are **${role.name}** (ours identity: **${id}**), a ${lifetime} agent on this`);
   L.push(`host, running as the \`${hostUser}\` user.`);
 
   if (opts.briefingBody) {
@@ -41,7 +56,22 @@ export function generateBriefing(role: ResolvedRole, v: BriefingVocab, opts: Bri
   // "predefined" identity that nobody checked is how an agent ends up improvising
   // its own infrastructure on first boot.
   const guarantee = opts.identityGuarantee ?? 'unverified';
-  if (guarantee === 'unverified') {
+  if (opts.temporaryIdentity) {
+    L.push(`2. BIND the exact ours identity assigned to this role: call **${v.bindTool}** with`);
+    L.push(`   name "${id}" without force (search the deferred tool registry first if needed).`);
+    L.push('   If another live session owns it, STOP and report the collision; do not evict it.');
+    L.push('   - If binding succeeds, it is a pre-existing identity: preserve it as user-owned.');
+    L.push('     Never close, remove, replace, or otherwise convert it to a temporary identity.');
+    if (guarantee === 'unverified') {
+      L.push('   - This identity was NOT verified when your role was created. If and only if binding');
+      L.push('     reports that no such identity exists:');
+    } else {
+      L.push(`   - It was ${guarantee === 'created' ? 'created' : 'verified to exist'} when your role`);
+      L.push('     was created. If it unexpectedly reports that no such identity exists, report the');
+      L.push('     discrepancy, then use this compatibility path:');
+    }
+    L.push(...temporaryIdentityFallback(id, v));
+  } else if (guarantee === 'unverified') {
     L.push(`2. BIND your ours identity: call the **${v.bindTool}** tool with`);
     L.push(`   name "${id}" force=true (search the deferred tool registry first if needed).`);
     L.push(`   - This identity was NOT verified when your role was created, so it may not exist.`);
@@ -148,7 +178,16 @@ export function generateBriefing(role: ResolvedRole, v: BriefingVocab, opts: Bri
   L.push('on messages, timers, or prompts — and follow it for recurring or scheduled work. It may');
   L.push('change between wakes without a restart; treat the file, not your memory of it, as current.');
   L.push('', '## On restart (you run under a supervised launcher)');
-  L.push(`On restart, WITHOUT asking: re-bind (**${v.bindTool}** name "${id}" force=true), then`);
+  if (opts.temporaryIdentity) {
+    L.push(`On restart, WITHOUT asking: try to re-bind (**${v.bindTool}** name "${id}", no force).`);
+    L.push('If it no longer exists, that is expected when the previous session-owned temporary');
+    L.push('identity was cleaned up. Re-run the same capability check from step 2: use');
+    L.push(`**${v.temporaryCreateTool}** with name "${id}" when exposed, otherwise fall back to`);
+    L.push(`**${v.createTool}** for an older server. On collision or any other creation error, STOP`);
+    L.push('and report it without deleting or force-adopting anything. Then');
+  } else {
+    L.push(`On restart, WITHOUT asking: re-bind (**${v.bindTool}** name "${id}" force=true), then`);
+  }
   L.push(`${wakeNote} Then continue from your WORKLOG.`);
   L.push('Do not blindly re-run whatever may have crashed you.');
   L.push('', '## House rules');
