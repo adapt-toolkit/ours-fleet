@@ -1,6 +1,6 @@
 import { test, expect } from '@playwright/test';
 
-test('bootstrap, inventory, live navigation, send, create, and security boundaries', async ({ page, request }) => {
+test('bootstrap, inventory, live navigation, send, create, and security boundaries', async ({ page, request, browserName }) => {
   const bootstrap = (await (await request.post('/__test/bootstrap')).json()).url as string;
   await page.goto(bootstrap);
   await expect(page.getByRole('heading', { name: 'All roles' })).toBeVisible();
@@ -33,7 +33,7 @@ test('bootstrap, inventory, live navigation, send, create, and security boundari
   await expect(page.locator('.status-chip.attention').first()).toContainText('Attention');
   await page.getByRole('button', { name: /nightwatch/ }).click();
   await expect(page.getByRole('heading', { name: 'nightwatch' })).toBeVisible();
-  await expect(page.getByText('20260731T120000Z')).toBeVisible();
+  await expect(page.getByText('20260731T120000Z').first()).toBeVisible();
   await expect(page.getByText('20260731T110000Z')).toBeVisible();
   await expect(page.getByText('20260731T100000Z')).toBeVisible();
   const aliceRow = page.locator('.watchdog-role', { hasText: 'Alice' });
@@ -90,11 +90,13 @@ test('bootstrap, inventory, live navigation, send, create, and security boundari
   expect(manifest.status()).toBe(200);
   expect(manifest.headers()['content-type']).toMatch(/manifest|json/);
   expect((await manifest.json()).display).toBe('standalone');
-  const cdp = await page.context().newCDPSession(page);
-  const installErrors = (await cdp.send('Page.getInstallabilityErrors')).installabilityErrors;
-  // Playwright's temporary browser context is incognito by construction; no
-  // manifest/icon/worker installability error is allowed beyond that fixture constraint.
-  expect(installErrors.filter(error => error.errorId !== 'in-incognito')).toEqual([]);
+  if (browserName === 'chromium') {
+    const cdp = await page.context().newCDPSession(page);
+    const installErrors = (await cdp.send('Page.getInstallabilityErrors')).installabilityErrors;
+    // Playwright's temporary browser context is incognito by construction; no
+    // manifest/icon/worker installability error is allowed beyond that fixture constraint.
+    expect(installErrors.filter(error => error.errorId !== 'in-incognito')).toEqual([]);
+  }
   await request.post('/__test/restart-auth');
   await page.reload();
   await expect(page.getByRole('heading', { name: 'All roles' })).toBeVisible();
@@ -109,6 +111,16 @@ test('bootstrap, inventory, live navigation, send, create, and security boundari
   await page.getByLabel('Filter roles').fill('validate');
   await expect(page.getByText('Validate the secure console')).toBeVisible();
   await page.getByText('Alpha', { exact: true }).first().click();
+  await expect(page.getByText('Inspect the fixture')).toBeVisible();
+  await expect(page.getByText('Plan', { exact: true })).toBeVisible();
+  await expect(page.getByText('Inspect input')).toBeVisible();
+  await expect(page.getByText('Edit fixture.ts')).toBeVisible();
+  await expect(page.locator('.usage-badge')).toContainText('context 42%');
+  await page.getByText('Edit fixture.ts').click();
+  await expect(page.getByText('/workspace/fixture.ts:7')).toBeVisible();
+  await expect(page.getByText('new value')).toBeVisible();
+  await expect(page.getByText(/"path": "fixture.ts"/)).toBeVisible();
+  await page.getByRole('button', { name: 'overview' }).click();
   await expect(page.getByText('authoritative')).toBeVisible();
   await page.bringToFront();
   expect(await page.evaluate(() => document.visibilityState)).toBe('visible');
@@ -183,20 +195,24 @@ test('bootstrap, inventory, live navigation, send, create, and security boundari
   expect(hostile.status()).toBe(403);
 
   await page.screenshot({ path: 'test-results/web-console-overview.png', fullPage: true });
-  await page.evaluate(() => navigator.serviceWorker.ready.then(() => undefined));
-  await page.waitForFunction(() => navigator.serviceWorker.controller !== null);
-  await page.context().setOffline(true);
-  await page.goto('http://127.0.0.1:49371/offline-check');
-  await expect(page.getByRole('heading', { name: 'Local daemon unavailable' })).toBeVisible();
-  await expect(page.getByText('Alpha', { exact: true })).toHaveCount(0);
-  await page.context().setOffline(false);
-  await page.goto('http://127.0.0.1:49371/');
-  await expect(page.getByRole('heading', { name: 'All roles' })).toBeVisible();
-  const cached = await page.evaluate(async () => (await Promise.all(
-    (await caches.keys()).map(async key => (await caches.open(key)).keys()),
-  )).flat().map(request => new URL(request.url).pathname));
-  expect(cached).toContain('/offline.html');
-  expect(cached.every(path => path === '/offline.html' || path.startsWith('/assets/'))).toBe(true);
+  // Firefox's private Playwright context does not expose a usable service
+  // worker; Chromium is the deterministic PWA/cache oracle for this suite.
+  if (browserName === 'chromium') {
+    await page.evaluate(() => navigator.serviceWorker.ready.then(() => undefined));
+    await page.waitForFunction(() => navigator.serviceWorker.controller !== null);
+    await page.context().setOffline(true);
+    await page.goto('http://127.0.0.1:49371/offline-check');
+    await expect(page.getByRole('heading', { name: 'Local daemon unavailable' })).toBeVisible();
+    await expect(page.getByText('Alpha', { exact: true })).toHaveCount(0);
+    await page.context().setOffline(false);
+    await page.goto('http://127.0.0.1:49371/');
+    await expect(page.getByRole('heading', { name: 'All roles' })).toBeVisible();
+    const cached = await page.evaluate(async () => (await Promise.all(
+      (await caches.keys()).map(async key => (await caches.open(key)).keys()),
+    )).flat().map(request => new URL(request.url).pathname));
+    expect(cached).toContain('/offline.html');
+    expect(cached.every(path => path === '/offline.html' || path.startsWith('/assets/'))).toBe(true);
+  }
   await page.getByRole('button', { name: 'Sign out' }).click();
   await expect(page.getByText(/ours-fleet web open/)).toBeVisible();
   expect((await page.context().cookies()).filter(cookie =>

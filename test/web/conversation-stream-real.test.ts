@@ -118,7 +118,7 @@ describe('conversation stream over the real stack', () => {
     // Admit a prompt over idempotent HTTP and let the turn complete.
     const submitted = await fetch(`${origin}/api/v1/roles/Alpha/input`, {
       method: 'POST', headers: jsonHeaders,
-      body: JSON.stringify({ text: 'first prompt', commandId: 'cmd-real-1' }),
+      body: JSON.stringify({ text: 'rich first prompt', commandId: 'cmd-real-1' }),
     });
     expect(submitted.status).toBe(202);
     const receipt = await submitted.json() as { promptId: string };
@@ -136,6 +136,16 @@ describe('conversation stream over the real stack', () => {
     const admitted = history.events.find(e => e.kind === 'prompt.admitted')!;
     expect(admitted.commandId).toBe('cmd-real-1');
     expect(admitted.source).toBe('browser');
+    expect(history.events.map(event => event.kind)).toEqual(expect.arrayContaining([
+      'plan.replace', 'tool.upsert', 'usage.updated',
+    ]));
+    const richTool = history.events.find(event => event.kind === 'tool.upsert'
+      && event.toolCallId === 'rich-tool');
+    expect(richTool?.payload).toMatchObject({
+      title: 'Apply fixture edit', kind: 'edit',
+      locations: [{ path: expect.stringContaining('a.txt'), line: 3 }],
+      rawInput: { json: { path: 'a.txt' } },
+    });
 
     // Open the live stream: ready + full replay, then a live second turn.
     const mint = await fetch(`${origin}/api/v1/ws-tickets`, {

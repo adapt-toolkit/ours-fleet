@@ -124,16 +124,64 @@ function normalizeContentBlock(block: unknown, redact?: string): NormalizedConte
   }
 }
 
+const SENSITIVE_JSON_KEYS = new Set([
+  'auth', 'authorization', 'cookie', 'password', 'passwd', 'secret', 'token',
+  'apikey', 'accesskey', 'privatekey',
+]);
+
+function redactSensitiveJson(value: unknown): { value: unknown; redacted: boolean } {
+  const seen = new WeakSet<object>();
+  let redacted = false;
+  const visit = (current: unknown, depth: number): unknown => {
+    if (depth > 32) return '[depth capped]';
+    if (Array.isArray(current)) {
+      if (seen.has(current)) throw new TypeError('circular JSON');
+      seen.add(current);
+      return current.map(item => visit(item, depth + 1));
+    }
+    if (!isRecord(current)) return current;
+    if (seen.has(current)) throw new TypeError('circular JSON');
+    seen.add(current);
+    const output: Record<string, unknown> = {};
+    for (const [key, nested] of Object.entries(current)) {
+      const compact = key.replace(/[^a-z0-9]/gi, '').toLowerCase();
+      if (compact === 'env' || compact === 'environment') {
+        redacted = true;
+        output[key] = isRecord(nested)
+          ? Object.fromEntries(Object.keys(nested).map(name => [name, '<redacted>']))
+          : '<redacted>';
+      } else if (SENSITIVE_JSON_KEYS.has(compact)
+          || [...SENSITIVE_JSON_KEYS].some(sensitive => compact.endsWith(sensitive))) {
+        redacted = true;
+        output[key] = '<redacted>';
+      } else output[key] = visit(nested, depth + 1);
+    }
+    return output;
+  };
+  return { value: visit(value, 0), redacted };
+}
+
 function boundedJson(value: unknown): BoundedJson {
   let serialized: string;
-  try { serialized = JSON.stringify(value) ?? 'null'; }
+  let safe: unknown;
+  let redacted = false;
+  try {
+    const result = redactSensitiveJson(value);
+    safe = result.value;
+    redacted = result.redacted;
+    serialized = JSON.stringify(safe) ?? 'null';
+  }
   catch {
     // Circular or otherwise unserializable: keep the fact, drop the value.
     return { bytes: 0, truncated: true };
   }
   const bytes = Buffer.byteLength(serialized);
-  if (bytes <= MAX_RAW_JSON_BYTES) return { json: value, bytes };
-  return { bytes, truncated: true, digest: digest24(serialized) };
+  if (bytes <= MAX_RAW_JSON_BYTES)
+    return { json: safe, bytes, ...(redacted ? { redacted: true as const } : {}) };
+  return {
+    bytes, truncated: true, digest: digest24(serialized),
+    ...(redacted ? { redacted: true as const } : {}),
+  };
 }
 
 function quarantineMeta(meta: unknown): AdapterMeta[] | undefined {

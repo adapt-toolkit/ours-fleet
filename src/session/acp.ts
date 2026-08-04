@@ -23,6 +23,8 @@ import type {
 interface PendingPermission {
   options: Array<{ optionId: string; kind: string }>;
   resolve(response: acp.RequestPermissionResponse): void;
+  toolCallId?: string;
+  expiry?: ReturnType<typeof setTimeout>;
 }
 
 interface SteeringResponse {
@@ -30,6 +32,10 @@ interface SteeringResponse {
 }
 
 const CANCEL_SETTLE_GRACE_MS = 15_000;
+/** A permission no human answered is eventually a decision nobody made. */
+const PERMISSION_TIMEOUT_MS = 10 * 60_000;
+/** Spec §4.3: 10-15 s before a vanished controller triggers the unattended policy. */
+const CONTROLLER_GRACE_MS = 12_000;
 
 const SCHEDULED_LOOP_REDACTION = '[scheduled-loop content redacted]';
 
@@ -70,6 +76,10 @@ export interface AcpSessionOptions {
   log(line: string): void;
   /** Test seam for the cancel-escalation grace period; production uses the default. */
   cancelGraceMs?: number;
+  /** How long a pending permission may wait for a human before it expires. */
+  permissionTimeoutMs?: number;
+  /** Grace after the last controller detaches before the unattended policy applies. */
+  controllerGraceMs?: number;
 }
 
 /**
@@ -112,6 +122,8 @@ export class AcpSession implements SessionHandle {
   private steeringSupported = false;
   private capabilities?: acp.AgentCapabilities;
   private controllerCount = 0;
+  /** Armed when the last controller detaches; unattended policy applies on fire. */
+  private controllerGrace?: ReturnType<typeof setTimeout>;
   private cancelEscalation?: ReturnType<typeof setTimeout>;
   private activeTurn?: {
     id: string; output: string; origin?: SubmitPromptOptions['origin'];
@@ -373,9 +385,9 @@ export class AcpSession implements SessionHandle {
       }, this.options.cancelGraceMs ?? CANCEL_SETTLE_GRACE_MS);
       this.cancelEscalation.unref?.();
     }
-    for (const pending of this.pendingPermissions.values())
-      pending.resolve({ outcome: { outcome: 'cancelled' } });
-    this.pendingPermissions.clear();
+    for (const [permissionId, pending] of [...this.pendingPermissions])
+      this.settlePendingAutomatically(permissionId, pending, 'cancelled', undefined,
+        'the turn was cancelled while this request was pending');
   }
 
   respondPermission(permissionId: string, optionId: string): boolean {
@@ -383,6 +395,7 @@ export class AcpSession implements SessionHandle {
     const chosen = pending?.options.find(option => option.optionId === optionId);
     if (!pending || !chosen) return false;
     this.pendingPermissions.delete(permissionId);
+    if (pending.expiry) clearTimeout(pending.expiry);
     pending.resolve({ outcome: { outcome: 'selected', optionId } });
     const decision = chosen.kind.startsWith('reject') ? 'denied' : 'allowed';
     this.events.emit('permission', {
@@ -405,6 +418,18 @@ export class AcpSession implements SessionHandle {
     return true;
   }
 
+  /**
+   * A v2 decision binds to the session generation it was shown under. A stale
+   * generation, an already-settled request, or an unknown option are all the
+   * same answer: someone else's decision (or a restart) got there first.
+   */
+  respondPermissionV2(
+    permissionId: string, optionId: string, sessionGeneration: string,
+  ): 'accepted' | 'stale' {
+    if (sessionGeneration !== this.sessionGeneration) return 'stale';
+    return this.respondPermission(permissionId, optionId) ? 'accepted' : 'stale';
+  }
+
   eventsSince(seq: number): SessionEvent[] {
     return this.events.since(seq);
   }
@@ -414,7 +439,78 @@ export class AcpSession implements SessionHandle {
   }
 
   setControllerAttached(attached: boolean): void {
+    const before = this.controllerCount;
     this.controllerCount = Math.max(0, this.controllerCount + (attached ? 1 : -1));
+    if (attached) {
+      if (this.controllerGrace) clearTimeout(this.controllerGrace);
+      this.controllerGrace = undefined;
+      return;
+    }
+    // The LAST controller just walked away with permissions possibly pending.
+    // Nothing is decided yet: a reconnect within the grace keeps everything
+    // alive; only its expiry hands the pendings to the unattended policy.
+    if (before > 0 && this.controllerCount === 0 && this.pendingPermissions.size > 0)
+      this.armControllerGrace();
+  }
+
+  private armControllerGrace(): void {
+    if (this.controllerGrace) clearTimeout(this.controllerGrace);
+    this.controllerGrace = setTimeout(() => {
+      this.controllerGrace = undefined;
+      if (this.controllerCount > 0 || this.options.permissions.unattended !== 'deny') return;
+      for (const [permissionId, pending] of [...this.pendingPermissions])
+        this.settlePendingAutomatically(permissionId, pending, 'denied',
+          'permissions.unattended=deny',
+          'the last attached controller disconnected and the grace period expired');
+    }, this.options.controllerGraceMs ?? CONTROLLER_GRACE_MS);
+    this.controllerGrace.unref?.();
+  }
+
+  /**
+   * Settle one pending request without a human decision — unattended policy,
+   * expiry, or cancellation — and leave the same durable evidence a manual
+   * decision would. A denial selects the agent's own one-shot reject option;
+   * everything else resolves as cancelled toward the agent.
+   */
+  private settlePendingAutomatically(
+    permissionId: string, pending: PendingPermission,
+    decision: 'denied' | 'cancelled' | 'expired', policy: string | undefined, reason: string,
+  ): void {
+    if (!this.pendingPermissions.delete(permissionId)) return;
+    if (pending.expiry) clearTimeout(pending.expiry);
+    const rejectOption = decision === 'denied'
+      ? pending.options.find(option => option.kind === 'reject_once')
+        ?? pending.options.find(option => option.kind === 'reject_always')
+      : undefined;
+    pending.resolve(rejectOption
+      ? { outcome: { outcome: 'selected', optionId: rejectOption.optionId } }
+      : { outcome: { outcome: 'cancelled' } });
+    const settled = decision === 'denied' && !rejectOption ? 'cancelled' : decision;
+    this.events.emit('permission', {
+      turnId: this.activeTurn?.id,
+      origin: this.activeTurn?.origin,
+      permissionId,
+      toolCallId: pending.toolCallId,
+      status: 'completed',
+      decision: settled === 'expired' ? 'cancelled' : settled,
+      decisionSource: 'automatic',
+      policy,
+      reason,
+      optionId: rejectOption?.optionId,
+    });
+    this.conversation.appendSafe({
+      kind: 'permission.resolved', sessionGeneration: this.sessionGeneration,
+      acpSessionId: this.sessionId, permissionId,
+      promptId: this.activeTurn?.id, turnId: this.activeTurn?.id,
+      toolCallId: pending.toolCallId,
+      payload: {
+        decision: settled, decisionSource: 'automatic',
+        ...(policy ? { policy } : {}), reason,
+        ...(rejectOption ? { optionId: rejectOption.optionId } : {}),
+      },
+    });
+    if (this.pendingPermissions.size === 0 && this.readiness === 'awaiting_permission')
+      this.readiness = 'running';
   }
 
   exitResult(): ExitRecord | null {
@@ -424,9 +520,11 @@ export class AcpSession implements SessionHandle {
   async close(): Promise<void> {
     if (this.cancelEscalation) clearTimeout(this.cancelEscalation);
     this.cancelEscalation = undefined;
-    for (const pending of this.pendingPermissions.values())
-      pending.resolve({ outcome: { outcome: 'cancelled' } });
-    this.pendingPermissions.clear();
+    if (this.controllerGrace) clearTimeout(this.controllerGrace);
+    this.controllerGrace = undefined;
+    for (const [permissionId, pending] of [...this.pendingPermissions])
+      this.settlePendingAutomatically(permissionId, pending, 'cancelled', undefined,
+        'the session closed while this request was pending');
     if (this.sessionId && this.capabilities?.sessionCapabilities?.close != null) {
       await this.connection.agent.request(
         acp.methods.agent.session.close, { sessionId: this.sessionId }).catch(() => undefined);
@@ -614,7 +712,10 @@ export class AcpSession implements SessionHandle {
         'permissions.approval=allow',
         `the request is inside the ${this.options.permissions.filesystem} boundary`));
     }
-    const unattended = this.controllerCount === 0 && this.options.permissions.unattended === 'deny';
+    // A live grace window still counts as attended: the controller may be
+    // mid-reconnect, and denying instantly is exactly what the grace prevents.
+    const unattended = this.controllerCount === 0 && !this.controllerGrace
+      && this.options.permissions.unattended === 'deny';
     if (this.options.permissions.approval === 'deny' || unattended) {
       // reject_once FIRST: `reject_always` teaches the agent a standing rule from
       // a decision no human made, so one unattended denial would silently disable
@@ -628,6 +729,8 @@ export class AcpSession implements SessionHandle {
     }
 
     const permissionId = randomUUID();
+    const timeoutMs = this.options.permissionTimeoutMs ?? PERMISSION_TIMEOUT_MS;
+    const expiresAt = new Date(Date.now() + timeoutMs).toISOString();
     this.readiness = 'awaiting_permission';
     this.events.emit('permission', {
       turnId: this.activeTurn?.id,
@@ -658,10 +761,21 @@ export class AcpSession implements SessionHandle {
           name: scheduledTurn(this.activeTurn) ? option.kind : option.name,
           kind: option.kind,
         })),
+        expiresAt,
       },
     });
     return new Promise(resolve => {
-      this.pendingPermissions.set(permissionId, { options: params.options, resolve });
+      const pending: PendingPermission = {
+        options: params.options, resolve,
+        toolCallId: scheduledTurn(this.activeTurn)
+          ? 'scheduled-loop-tool' : params.toolCall.toolCallId,
+      };
+      pending.expiry = setTimeout(() => {
+        this.settlePendingAutomatically(permissionId, pending, 'expired', undefined,
+          `no decision arrived within ${Math.round(timeoutMs / 1000)}s`);
+      }, timeoutMs);
+      pending.expiry.unref?.();
+      this.pendingPermissions.set(permissionId, pending);
     });
   }
 

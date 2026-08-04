@@ -80,6 +80,44 @@ describe('conversation browser model', () => {
     ]);
   });
 
+  it('retains rich tool disclosure fields across patches', () => {
+    const model = applyEvents(emptyModel(), [
+      event('tool.upsert', {
+        toolCallId: 't1', snapshot: true, title: 'Edit file', kind: 'edit',
+        locations: [{ path: '/repo/a.ts', line: 3 }],
+        rawInput: { json: { path: 'a.ts' }, bytes: 15 },
+        content: [{ type: 'diff', path: '/repo/a.ts',
+          oldText: { text: 'old', bytes: 3 }, newText: { text: 'new', bytes: 3 } }],
+      }, { promptId: 'p', toolCallId: 't1' }),
+      event('tool.upsert', {
+        toolCallId: 't1', snapshot: false, status: 'completed',
+        rawOutput: { json: { ok: true }, bytes: 11 },
+      }, { promptId: 'p', toolCallId: 't1' }),
+    ]);
+    expect(model.turns[0].tools[0]).toMatchObject({
+      status: 'completed', locations: [{ path: '/repo/a.ts', line: 3 }],
+      rawInput: { json: { path: 'a.ts' } }, rawOutput: { json: { ok: true } },
+      content: [{ type: 'diff', path: '/repo/a.ts' }],
+    });
+  });
+
+  it('replaces plan snapshots in place and correlates usage to the turn', () => {
+    const model = applyEvents(emptyModel(), [
+      event('plan.replace', { entries: [{
+        content: { text: 'inspect', bytes: 7 }, priority: 'high', status: 'pending',
+      }] }, { promptId: 'p' }),
+      event('plan.replace', { entries: [{
+        content: { text: 'inspect', bytes: 7 }, priority: 'high', status: 'completed',
+      }] }, { promptId: 'p' }),
+      event('usage.updated', { used: 1200, size: 200000,
+        cost: { amount: 0.02, currency: 'USD' } }, { promptId: 'p' }),
+    ]);
+    expect(model.turns[0].plans).toHaveLength(1);
+    expect(model.turns[0].plans[0].entries?.[0].status).toBe('completed');
+    expect(model.turns[0].usage).toMatchObject({ used: 1200, size: 200000 });
+    expect(model.usage?.cost).toEqual({ amount: 0.02, currency: 'USD' });
+  });
+
   it('marks external prompts without leaking a body', () => {
     const model = applyEvents(emptyModel(), [
       event('prompt.admitted', { external: { digest: 'd', bytes: 42 }, queuedBehind: 0 },
@@ -98,6 +136,7 @@ describe('conversation browser model', () => {
       event('turn.completed', { outcome: 'cancelled' }, { promptId: 'p' }),
     ]);
     const card = model.turns[0].permissions[0];
+    expect(card.sessionGeneration).toBe('gen-1');
     expect(card.status).toBe('resolved');
     expect(card.decision).toBe('cancelled');
     expect(model.turns[0].state).toBe('cancelled');

@@ -137,6 +137,44 @@ const watchdogsService = {
 };
 const actions = new Map();
 let outputCalls = 0;
+const conversationAt = new Date().toISOString();
+const conversationEvents = [
+  { schemaVersion: 1, roleId: 'Alpha', eventId: 'conv-1', seq: 1, at: conversationAt,
+    sessionGeneration: 'fixture-generation', kind: 'prompt.admitted', promptId: 'fixture-turn',
+    commandId: 'fixture-command', source: 'browser',
+    payload: { text: { type: 'text', text: 'Inspect the fixture', bytes: 19 }, queuedBehind: 0 } },
+  { schemaVersion: 1, roleId: 'Alpha', eventId: 'conv-2', seq: 2, at: conversationAt,
+    sessionGeneration: 'fixture-generation', kind: 'plan.replace', promptId: 'fixture-turn',
+    payload: { entries: [
+      { content: { text: 'Inspect input', bytes: 13 }, priority: 'high', status: 'completed' },
+      { content: { text: 'Render result', bytes: 13 }, priority: 'medium', status: 'in_progress' },
+    ] } },
+  { schemaVersion: 1, roleId: 'Alpha', eventId: 'conv-3', seq: 3, at: conversationAt,
+    sessionGeneration: 'fixture-generation', kind: 'tool.upsert', promptId: 'fixture-turn',
+    toolCallId: 'fixture-tool', payload: {
+      toolCallId: 'fixture-tool', snapshot: true, title: 'Edit fixture.ts', kind: 'edit',
+      status: 'completed', locations: [{ path: '/workspace/fixture.ts', line: 7 }],
+      rawInput: { json: { path: 'fixture.ts' }, bytes: 21 },
+      content: [{ type: 'diff', path: '/workspace/fixture.ts',
+        oldText: { text: 'old value', bytes: 9 }, newText: { text: 'new value', bytes: 9 } }],
+    } },
+  { schemaVersion: 1, roleId: 'Alpha', eventId: 'conv-4', seq: 4, at: conversationAt,
+    sessionGeneration: 'fixture-generation', kind: 'message.chunk', promptId: 'fixture-turn',
+    messageId: 'fixture-message', source: 'agent',
+    payload: { role: 'assistant', content: { type: 'text', text: 'Fixture result ready.', bytes: 21 } } },
+  { schemaVersion: 1, roleId: 'Alpha', eventId: 'conv-5', seq: 5, at: conversationAt,
+    sessionGeneration: 'fixture-generation', kind: 'usage.updated', promptId: 'fixture-turn',
+    payload: { used: 42000, size: 100000, cost: { amount: 0.01, currency: 'USD' } } },
+  { schemaVersion: 1, roleId: 'Alpha', eventId: 'conv-6', seq: 6, at: conversationAt,
+    sessionGeneration: 'fixture-generation', kind: 'turn.completed', promptId: 'fixture-turn',
+    payload: { outcome: 'completed', stopReason: 'end_turn' } },
+];
+const conversationPage = after => ({
+  events: conversationEvents.filter(event => event.seq > Number(after ?? 0)),
+  firstAvailableCursor: '1', nextCursor: '6', hasMore: false,
+  snapshot: { sessionGeneration: 'fixture-generation', readiness: 'idle',
+    queueDepth: 0, pendingPermissionIds: [] },
+});
 const services = {
   watchdogs: watchdogsService,
   query: {
@@ -162,7 +200,7 @@ const services = {
   repository: { async get(id) { return id === 'Dormant' ? inactiveRole : id === 'Terminal' ? terminalRole : role; } },
   async session() {
     return {
-      async describe() { return { backend: 'acp', protocolVersion: 2, features: [] }; },
+      async describe() { return { backend: 'acp', protocolVersion: 3, features: ['conversation_v3'] }; },
       async snapshot() { return { backend: 'acp', alive: true, readiness: 'idle' }; },
       async recentOutput(request = {}) {
         outputCalls++;
@@ -184,6 +222,17 @@ const services = {
       },
       async interrupt() { return { accepted: true }; },
       async respondPermission() { return { accepted: true }; },
+      async conversationPage(request = {}) { return conversationPage(request.after); },
+      async submitPromptV2(request) {
+        return { commandId: request.commandId, promptId: 'fixture-prompt-v2', state: 'starting',
+          queuedBehind: 0, acceptedAt: new Date().toISOString(), eventCursor: '6' };
+      },
+      async interruptV2(commandId) { return { accepted: true, commandId }; },
+      async respondPermissionV2(request) { return { accepted: true, commandId: request.commandId }; },
+      async followConversation(request) {
+        request.onPage(conversationPage(request.after));
+        return { close() {} };
+      },
     };
   },
   logs: {

@@ -6,6 +6,7 @@ import { fileURLToPath } from 'node:url';
 import { afterEach, describe, expect, it } from 'vitest';
 
 import { AcpSession } from '../src/session/acp.js';
+import { RoleTurnArbiter } from '../src/session/arbiter.js';
 import {
   RoleControlServer, controlRequest, controlSocketPath, controlTokenPath, followConversation,
 } from '../src/session/control.js';
@@ -21,13 +22,13 @@ afterEach(async () => {
   for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true });
 });
 
-async function startServer() {
+async function startServer(approval: 'ask' | 'allow' | 'deny' = 'allow') {
   const stateDir = mkdtempSync(join(tmpdir(), 'ours-conv-ctl-'));
   dirs.push(stateDir);
   const session = await AcpSession.start({
     name: 'A', argv: [process.execPath, fixture], cwd: stateDir, env: {},
     stateDir, mode: 'fresh',
-    permissions: { approval: 'allow', filesystem: 'workspace', unattended: 'deny' },
+    permissions: { approval, filesystem: 'workspace', unattended: 'deny' },
     log: () => {},
   });
   const server = new RoleControlServer(stateDir, session, () => {});
@@ -36,7 +37,37 @@ async function startServer() {
   return { stateDir, session, server };
 }
 
+async function startArbiterServer() {
+  const stateDir = mkdtempSync(join(tmpdir(), 'ours-conv-arbiter-'));
+  dirs.push(stateDir);
+  const session = await AcpSession.start({
+    name: 'A', argv: [process.execPath, fixture], cwd: stateDir, env: {},
+    stateDir, mode: 'fresh',
+    permissions: { approval: 'allow', filesystem: 'workspace', unattended: 'deny' },
+    log: () => {},
+  });
+  const server = new RoleControlServer(stateDir, new RoleTurnArbiter(session), () => {});
+  await server.start();
+  cleanups.push(async () => { await server.close(); await session.close(); });
+  return { stateDir };
+}
+
 describe('role-control conversation v3', () => {
+  it('forwards conversation v3 through the production turn arbiter', async () => {
+    const { stateDir } = await startArbiterServer();
+    const snapshot = await controlRequest(stateDir, { command: 'snapshot' });
+    expect(snapshot.result).toMatchObject({
+      protocolVersion: 3, features: expect.arrayContaining(['conversation_v3']),
+    });
+    const submitted = await controlRequest(stateDir, {
+      command: 'submit_prompt_v2', commandId: 'arbiter-cmd',
+      text: 'through arbiter', actor: 'browser-digest',
+    });
+    expect(submitted.ok).toBe(true);
+    const page = await controlRequest(stateDir, { command: 'conversation_page', limit: 100 });
+    expect((page.result as { events: ConversationEventV1[] }).events.some(
+      event => event.commandId === 'arbiter-cmd')).toBe(true);
+  });
   it('advertises conversation_v3 and protocol 3 in the snapshot', async () => {
     const { stateDir } = await startServer();
     const response = await controlRequest(stateDir, { command: 'snapshot' });
@@ -111,6 +142,39 @@ describe('role-control conversation v3', () => {
     expect(first.ok).toBe(true);
     const second = await controlRequest(stateDir, { command: 'interrupt_v2', commandId: 'int-1' });
     expect(second.result).toEqual(first.result);
+  });
+
+  it('binds v2 permission decisions to the session generation and first writer', async () => {
+    const { stateDir, session } = await startServer('ask');
+    session.setControllerAttached(true);
+    const queued = await session.queuePrompt('permission please');
+    for (let i = 0; i < 100 && !session.conversationPage({ limit: 100 }).events.some(
+      event => event.kind === 'permission.requested'); i++)
+      await new Promise(resolve => setTimeout(resolve, 10));
+    const requested = session.conversationPage({ limit: 100 }).events.find(
+      event => event.kind === 'permission.requested')!;
+    const staleGeneration = await controlRequest(stateDir, {
+      command: 'respond_permission_v2', commandId: 'perm-stale',
+      permissionId: requested.permissionId, optionId: 'allow',
+      sessionGeneration: 'old-generation',
+    });
+    expect(staleGeneration.ok).toBe(false);
+    expect(staleGeneration.error).toMatch(/stale_state/);
+
+    const accepted = await controlRequest(stateDir, {
+      command: 'respond_permission_v2', commandId: 'perm-win',
+      permissionId: requested.permissionId, optionId: 'allow',
+      sessionGeneration: requested.sessionGeneration,
+    });
+    expect(accepted).toMatchObject({ ok: true, result: { accepted: true, commandId: 'perm-win' } });
+    const loser = await controlRequest(stateDir, {
+      command: 'respond_permission_v2', commandId: 'perm-loser',
+      permissionId: requested.permissionId, optionId: 'reject',
+      sessionGeneration: requested.sessionGeneration,
+    });
+    expect(loser.ok).toBe(false);
+    expect(loser.error).toMatch(/stale_state/);
+    await queued.completion;
   });
 
   it('streams live conversation events and counts follow as controller presence', async () => {

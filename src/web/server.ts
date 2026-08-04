@@ -264,13 +264,33 @@ export async function buildWebServer(
 
   app.post<{ Params: { id: string; permissionId: string } }>(
     '/api/v1/roles/:id/permissions/:permissionId', async request => {
-      auth.authenticate(request, true);
+      const session = auth.authenticate(request, true);
       const control = await services.session(request.params.id);
+      const body = request.body as {
+        optionId?: unknown; commandId?: unknown; sessionGeneration?: unknown;
+      };
+      const commandId = typeof body?.commandId === 'string' ? body.commandId.trim() : '';
+      const sessionGeneration = typeof body?.sessionGeneration === 'string'
+        ? body.sessionGeneration.trim() : '';
+      const optionId = String(body?.optionId ?? '');
+      if (control.respondPermissionV2) {
+        if (!commandId || !sessionGeneration || !optionId)
+          throw new FleetError('invalid_request',
+            'commandId, sessionGeneration and optionId are required');
+        const receipt = await control.respondPermissionV2({
+          commandId, permissionId: request.params.permissionId, optionId, sessionGeneration,
+        });
+        await audit.record({
+          requestId: request.id, browser: session.id, roleId: request.params.id,
+          action: 'session.respond_permission', result: 'accepted',
+        });
+        return receipt;
+      }
       if (!control.respondPermission)
         throw new FleetError('capability_unavailable', 'permission response is unavailable');
       return control.respondPermission({
         permissionId: request.params.permissionId,
-        optionId: String((request.body as { optionId?: unknown })?.optionId ?? ''),
+        optionId,
       });
     });
 

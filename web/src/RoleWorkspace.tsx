@@ -39,7 +39,7 @@ export function RoleWorkspace({ roleId, onBack }: { roleId: string; onBack(): vo
   useEffect(() => {
     if (!detail || defaultTabPicked.current) return;
     defaultTabPicked.current = true;
-    if (detail.status?.session?.backend === 'acp') setTab('conversation');
+    if (detail.status?.session?.backend === 'acp' && !isInactive(detail)) setTab('conversation');
   }, [detail]);
   if (!detail) return <div className="content">Loading role evidence…</div>;
   const { role, status, capabilities } = detail;

@@ -35,6 +35,9 @@ export interface RoleSessionControl {
     commandId: string; text: string; actorBrowserSession: string;
   }): Promise<PromptReceipt>;
   interruptV2?(commandId: string): Promise<{ accepted: true; commandId: string }>;
+  respondPermissionV2?(request: {
+    commandId: string; permissionId: string; optionId: string; sessionGeneration: string;
+  }): Promise<{ accepted: true; commandId: string }>;
   /**
    * Open a live follow on the role's ledger. `onPage` receives the initial
    * replay page; `onEvent` every subsequent durable event; `onClose` fires
@@ -135,6 +138,22 @@ export class AcpRoleSessionAdapter implements RoleSessionControl {
 
   async interruptV2(commandId: string): Promise<{ accepted: true; commandId: string }> {
     return await this.call('interrupt_v2', { commandId }) as { accepted: true; commandId: string };
+  }
+
+  async respondPermissionV2(request: {
+    commandId: string; permissionId: string; optionId: string; sessionGeneration: string;
+  }): Promise<{ accepted: true; commandId: string }> {
+    try {
+      return await this.call('respond_permission_v2', request) as {
+        accepted: true; commandId: string;
+      };
+    } catch (error) {
+      const fleetError = normalizeError(error);
+      if (fleetError.message.includes('stale_state'))
+        throw new FleetError('stale_state',
+          'permission is settled, expired, invalid, or belongs to another session generation');
+      throw fleetError;
+    }
   }
 
   async followConversation(request: {

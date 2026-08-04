@@ -238,6 +238,10 @@ export interface SessionHandle {
   submitPrompt(text: string, options?: SubmitPromptOptions): Promise<TurnResult>;
   interrupt(source?: TurnCancellationSource): Promise<void>;
   respondPermission(permissionId: string, optionId: string): boolean;
+  /** Generation-bound browser decision; stale/settled/invalid all fail closed. */
+  respondPermissionV2?(
+    permissionId: string, optionId: string, sessionGeneration: string,
+  ): 'accepted' | 'stale';
   eventsSince(seq: number): SessionEvent[];
   subscribe(listener: (event: SessionEvent) => void): () => void;
   setControllerAttached(attached: boolean): void;

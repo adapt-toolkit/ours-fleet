@@ -288,4 +288,22 @@ describe('normalizeSessionUpdate', () => {
     expect(payload.rawInput?.truncated).toBe(true);
     expect(payload.rawInput?.json).toBeUndefined();
   });
+
+  it('redacts credentials and environment values before raw tool JSON is persisted', () => {
+    const result = normalizeSessionUpdate({
+      sessionUpdate: 'tool_call', toolCallId: 'secret-tool',
+      rawInput: {
+        command: 'deploy', token: 'must-not-persist',
+        nested: { apiKey: 'also-secret' }, env: { PUBLIC: 'visible?', SECRET: 'no' },
+      },
+    } as never);
+    const raw = (result.payload as ToolUpsertPayload).rawInput!;
+    expect(raw.redacted).toBe(true);
+    expect(raw.json).toEqual({
+      command: 'deploy', token: '<redacted>', nested: { apiKey: '<redacted>' },
+      env: { PUBLIC: '<redacted>', SECRET: '<redacted>' },
+    });
+    expect(JSON.stringify(raw)).not.toContain('must-not-persist');
+    expect(JSON.stringify(raw)).not.toContain('also-secret');
+  });
 });

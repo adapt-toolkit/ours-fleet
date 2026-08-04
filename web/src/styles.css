@@ -197,7 +197,20 @@ legend { margin-bottom: 13px; color: var(--mint); text-transform: uppercase; fon
 .streaming-hint { animation: pulse 1.4s ease-in-out infinite; }
 @media (prefers-reduced-motion: reduce) { .streaming-hint { animation: none; } }
 @keyframes pulse { 50% { opacity: .45; } }
-.tool-card { display: flex; gap: 10px; align-items: baseline; border: 1px solid var(--line); border-radius: 8px; padding: 7px 11px; margin: 6px 0; font-size: 13px; background: #101516; }
+.tool-card { border: 1px solid var(--line); border-radius: 8px; padding: 7px 11px; margin: 6px 0; font-size: 13px; background: #101516; }
+.tool-card summary { display: flex; gap: 10px; align-items: baseline; cursor: pointer; }
+.tool-detail { display: grid; gap: 9px; padding-top: 10px; }
+.tool-detail code { display: block; overflow-wrap: anywhere; color: var(--muted); margin-top: 4px; }
+.tool-content { border-top: 1px dashed var(--line); padding-top: 8px; min-width: 0; }
+.tool-content pre { max-height: 260px; overflow: auto; white-space: pre-wrap; word-break: break-word; margin: 5px 0 0; color: #d9e4e2; }
+.diff-old { color: #d99b96 !important; }
+.diff-new { color: #9ed8c4 !important; }
+.plan-card { border: 1px solid var(--line); border-radius: 8px; padding: 9px 12px; margin: 6px 0; font-size: 13px; }
+.plan-card ol { list-style: none; margin: 7px 0 0; padding: 0; display: grid; gap: 5px; }
+.plan-entry { display: grid; grid-template-columns: 18px 1fr auto; gap: 7px; color: var(--muted); }
+.plan-entry.in_progress { color: var(--amber); }
+.plan-entry.completed { color: var(--mint); }
+.usage-badge { margin-top: 10px; color: var(--muted); }
 .tool-status { text-transform: uppercase; font-size: 10px; letter-spacing: 1px; font-weight: 700; color: var(--muted); }
 .tool-status.in_progress { color: var(--amber); }
 .tool-status.completed { color: var(--mint); }

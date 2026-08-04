@@ -41,11 +41,29 @@ export interface ToolCard {
   title?: string;
   kind?: string;
   status?: string;
+  content?: Array<Record<string, unknown>>;
+  locations?: Array<{ path: string; line?: number }>;
+  rawInput?: { json?: unknown; bytes: number; truncated?: true; digest?: string; redacted?: true };
+  rawOutput?: { json?: unknown; bytes: number; truncated?: true; digest?: string; redacted?: true };
+}
+
+export interface PlanCard {
+  planId?: string;
+  entries?: Array<{
+    content: { text: string; bytes: number; truncated?: true; digest?: string };
+    priority: 'high' | 'medium' | 'low';
+    status: 'pending' | 'in_progress' | 'completed';
+  }>;
+  file?: { uri: string };
+  markdown?: { text: string; bytes: number; truncated?: true; digest?: string };
 }
 
 export interface PermissionCard {
   permissionId: string;
+  sessionGeneration: string;
   title?: string;
+  toolCallId?: string;
+  expiresAt?: string;
   status: 'pending' | 'resolved';
   options: Array<{ optionId: string; name: string; kind: string }>;
   decision?: string;
@@ -78,7 +96,9 @@ export interface TranscriptTurn {
   thoughtText: string;
   thoughtChunks: number;
   tools: ToolCard[];
+  plans: PlanCard[];
   permissions: PermissionCard[];
+  usage?: { used: number; size: number; cost?: { amount: number; currency: string } };
 }
 
 export interface ConversationModel {
@@ -103,7 +123,7 @@ const turnFor = (model: ConversationModel, event: ConversationEvent): Transcript
   if (!turn) {
     turn = {
       promptId, firstSeq: event.seq, state: 'running',
-      messages: [], thoughtText: '', thoughtChunks: 0, tools: [], permissions: [],
+      messages: [], thoughtText: '', thoughtChunks: 0, tools: [], plans: [], permissions: [],
     };
     model.turns.push(turn);
     model.turns.sort((a, b) => a.firstSeq - b.firstSeq);
@@ -193,13 +213,32 @@ function applyEvent(model: ConversationModel, event: ConversationEvent): void {
       if (payload.title !== undefined) tool.title = payload.title as string;
       if (payload.kind !== undefined) tool.kind = payload.kind as string;
       if (payload.status !== undefined) tool.status = payload.status as string;
+      if (payload.content !== undefined)
+        tool.content = payload.content as Array<Record<string, unknown>>;
+      if (payload.locations !== undefined)
+        tool.locations = payload.locations as ToolCard['locations'];
+      if (payload.rawInput !== undefined) tool.rawInput = payload.rawInput as ToolCard['rawInput'];
+      if (payload.rawOutput !== undefined) tool.rawOutput = payload.rawOutput as ToolCard['rawOutput'];
+      return;
+    }
+    case 'plan.replace': {
+      const turn = turnFor(model, event);
+      const incoming = payload as unknown as PlanCard & { removed?: boolean };
+      const index = turn.plans.findIndex(plan => plan.planId === incoming.planId);
+      if (incoming.removed) {
+        if (index >= 0) turn.plans.splice(index, 1);
+      } else if (index >= 0) turn.plans[index] = incoming;
+      else turn.plans.push(incoming);
       return;
     }
     case 'permission.requested': {
       const turn = turnFor(model, event);
       turn.permissions.push({
         permissionId: event.permissionId ?? '',
+        sessionGeneration: event.sessionGeneration,
         title: payload.title as string | undefined,
+        toolCallId: (payload.toolCallId as string | undefined) ?? event.toolCallId,
+        expiresAt: payload.expiresAt as string | undefined,
         status: 'pending',
         options: (payload.options as PermissionCard['options'] | undefined) ?? [],
       });
@@ -211,7 +250,8 @@ function applyEvent(model: ConversationModel, event: ConversationEvent): void {
         ? turn.permissions.find(card => card.permissionId === event.permissionId)
         : undefined;
       const card = pending ?? {
-        permissionId: event.permissionId ?? '', status: 'resolved' as const, options: [],
+        permissionId: event.permissionId ?? '', sessionGeneration: event.sessionGeneration,
+        status: 'resolved' as const, options: [],
       };
       if (!pending) turn.permissions.push(card);
       card.status = 'resolved';
@@ -239,9 +279,11 @@ function applyEvent(model: ConversationModel, event: ConversationEvent): void {
       }
       return;
     }
-    case 'usage.updated':
+    case 'usage.updated': {
       model.usage = payload as ConversationModel['usage'];
+      if (event.promptId) turnFor(model, event).usage = payload as TranscriptTurn['usage'];
       return;
+    }
     case 'session.info':
       if (payload.title !== undefined)
         model.sessionTitle = (payload.title as string | null) ?? undefined;
@@ -274,7 +316,15 @@ export function cloneModel(model: ConversationModel): ConversationModel {
     turns: model.turns.map(turn => ({
       ...turn,
       messages: turn.messages.map(message => ({ ...message })),
-      tools: turn.tools.map(tool => ({ ...tool })),
+      tools: turn.tools.map(tool => ({
+        ...tool,
+        content: tool.content?.map(item => ({ ...item })),
+        locations: tool.locations?.map(location => ({ ...location })),
+      })),
+      plans: turn.plans.map(plan => ({
+        ...plan,
+        entries: plan.entries?.map(entry => ({ ...entry, content: { ...entry.content } })),
+      })),
       permissions: turn.permissions.map(card => ({ ...card, options: [...card.options] })),
     })),
     seenEventIds: { ...model.seenEventIds },
@@ -293,7 +343,7 @@ export function addOptimisticPrompt(
     commandId,
     user: { text, source: 'browser', at: new Date().toISOString() },
     state: 'queued',
-    messages: [], thoughtText: '', thoughtChunks: 0, tools: [], permissions: [],
+    messages: [], thoughtText: '', thoughtChunks: 0, tools: [], plans: [], permissions: [],
   });
   return model;
 }

@@ -137,7 +137,10 @@ export function ConversationView({ roleId }: { roleId: string }) {
   const decide = async (card: PermissionCard, optionId: string) => {
     try {
       await api.post(`/api/v1/roles/${encodeURIComponent(roleId)}` +
-        `/permissions/${encodeURIComponent(card.permissionId)}`, { optionId });
+        `/permissions/${encodeURIComponent(card.permissionId)}`, {
+          commandId: idempotencyKey(), optionId,
+          sessionGeneration: card.sessionGeneration,
+        });
     } catch (reason) {
       setNotice(`Permission response failed: ${(reason as Error).message}`);
     }
@@ -211,6 +214,7 @@ function TurnBlock({ turn, onDecide }: {
           ({turn.user.externalBytes ?? '?'} bytes)</p>}
     </div>}
     {(turn.messages.length > 0 || turn.thoughtChunks > 0 || turn.tools.length > 0
+      || turn.plans.length > 0
       || turn.permissions.length > 0) &&
       <div className="bubble assistant">
         {!turn.user && <small>{state}</small>}
@@ -221,19 +225,81 @@ function TurnBlock({ turn, onDecide }: {
           </button>
           {showThoughts && <pre className="thought-text">{turn.thoughtText}</pre>}
         </div>}
-        {turn.tools.map(tool => <div className="tool-card" key={tool.toolCallId}>
-          <span className={`tool-status ${tool.status ?? 'pending'}`}>{tool.status ?? 'pending'}</span>
-          <span>{tool.title ?? tool.toolCallId}</span>
-          {tool.kind && <small className="muted">{tool.kind}</small>}
+        {turn.plans.map((plan, index) => <div className="plan-card" key={plan.planId ?? index}>
+          <strong>Plan</strong>
+          {plan.entries && <ol>
+            {plan.entries.map((entry, entryIndex) => <li
+              className={`plan-entry ${entry.status}`} key={entryIndex}>
+              <span aria-hidden="true">{entry.status === 'completed' ? '✓'
+                : entry.status === 'in_progress' ? '◐' : '○'}</span>
+              <span>{entry.content.text}</span>
+              <small>{entry.priority}</small>
+            </li>)}
+          </ol>}
+          {plan.markdown && <pre>{plan.markdown.text}</pre>}
+          {plan.file && <code>{plan.file.uri}</code>}
         </div>)}
+        {turn.tools.map(tool => <details className="tool-card" key={tool.toolCallId}>
+          <summary>
+            <span className={`tool-status ${tool.status ?? 'pending'}`}>{tool.status ?? 'pending'}</span>
+            <span>{tool.title ?? tool.toolCallId}</span>
+            {tool.kind && <small className="muted">{tool.kind}</small>}
+          </summary>
+          <div className="tool-detail">
+            {tool.locations?.length ? <div><strong>Locations</strong>
+              {tool.locations.map((location, index) => <code key={index}>
+                {location.path}{location.line ? `:${location.line}` : ''}
+              </code>)}</div> : null}
+            {tool.content?.map((content, index) => <ToolContent key={index} content={content} />)}
+            {tool.rawInput && <JsonDisclosure label="Input" value={tool.rawInput} />}
+            {tool.rawOutput && <JsonDisclosure label="Output" value={tool.rawOutput} />}
+          </div>
+        </details>)}
         {turn.permissions.map(card => <PermissionBlock key={card.permissionId}
           card={card} onDecide={onDecide} />)}
         {turn.messages.map(message =>
           <pre className="assistant-text" key={message.key}>{message.text}</pre>)}
+        {turn.usage && <small className="usage-badge">
+          context {Math.round(100 * turn.usage.used / Math.max(1, turn.usage.size))}%
+          {turn.usage.cost
+            ? ` · ${turn.usage.cost.amount.toFixed(2)} ${turn.usage.cost.currency}` : ''}
+          {' · agent-reported'}
+        </small>}
         {turn.state === 'running' && turn.messages.length === 0 &&
           <p className="muted streaming-hint">Working…</p>}
       </div>}
   </article>;
+}
+
+function ToolContent({ content }: { content: Record<string, unknown> }) {
+  if (content.type === 'diff') {
+    const oldText = content.oldText as { text?: string } | undefined;
+    const newText = content.newText as { text?: string } | undefined;
+    return <div className="tool-content"><strong>Diff · {String(content.path ?? '')}</strong>
+      {oldText && <pre className="diff-old">{oldText.text}</pre>}
+      <pre className="diff-new">{newText?.text}</pre>
+    </div>;
+  }
+  if (content.type === 'terminal')
+    return <div className="tool-content"><strong>Display terminal</strong>
+      <code>{String(content.terminalId ?? '')}</code></div>;
+  const block = content.content as { type?: string; text?: string; uri?: string } | undefined;
+  return <div className="tool-content"><strong>{block?.type ?? 'Content'}</strong>
+    <pre>{block?.text ?? block?.uri ?? `[${block?.type ?? 'content'}]`}</pre></div>;
+}
+
+function JsonDisclosure({ label, value }: {
+  label: string; value: {
+    json?: unknown; bytes: number; truncated?: true; digest?: string; redacted?: true;
+  };
+}) {
+  return <div className="tool-content"><strong>{label}</strong>
+    {value.redacted && <small className="muted">Sensitive fields redacted</small>}
+    {value.json !== undefined
+      ? <pre>{JSON.stringify(value.json, null, 2)}</pre>
+      : <p className="muted">Not retained · {value.bytes} bytes
+        {value.digest ? ` · digest ${value.digest}` : ''}</p>}
+  </div>;
 }
 
 function PermissionBlock({ card, onDecide }: {

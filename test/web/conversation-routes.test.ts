@@ -56,6 +56,13 @@ const conversationControl = () => {
       return receipt;
     },
     async interruptV2(commandId: string) { return { accepted: true, commandId }; },
+    async respondPermissionV2(request: {
+      commandId: string; permissionId: string; optionId: string; sessionGeneration: string;
+    }) {
+      if (request.sessionGeneration !== 'gen' || request.permissionId !== 'pending')
+        throw new FleetError('stale_state', 'permission no longer belongs to this session');
+      return { accepted: true as const, commandId: request.commandId };
+    },
   };
 };
 
@@ -183,6 +190,33 @@ describe('conversation web routes', () => {
     });
     expect(receipt.statusCode).toBe(202);
     expect(receipt.json()).toMatchObject({ accepted: true, commandId: 'int-1' });
+    await server.close();
+  });
+
+  it('authenticates generation-bound permission decisions and returns deterministic 409 stale_state', async () => {
+    const { server, cookie, csrf } = await authenticated();
+    const accepted = await server.app.inject({
+      method: 'POST', url: '/api/v1/roles/Alpha/permissions/pending',
+      headers: headers(cookie, csrf),
+      payload: { commandId: 'perm-1', sessionGeneration: 'gen', optionId: 'allow' },
+    });
+    expect(accepted.statusCode).toBe(200);
+    expect(accepted.json()).toMatchObject({ accepted: true, commandId: 'perm-1' });
+
+    const stale = await server.app.inject({
+      method: 'POST', url: '/api/v1/roles/Alpha/permissions/settled',
+      headers: headers(cookie, csrf),
+      payload: { commandId: 'perm-2', sessionGeneration: 'gen', optionId: 'allow' },
+    });
+    expect(stale.statusCode).toBe(409);
+    expect(stale.json().error.code).toBe('stale_state');
+
+    const incomplete = await server.app.inject({
+      method: 'POST', url: '/api/v1/roles/Alpha/permissions/pending',
+      headers: headers(cookie, csrf), payload: { optionId: 'allow' },
+    });
+    expect(incomplete.statusCode).toBe(400);
+    expect(incomplete.json().error.code).toBe('invalid_request');
     await server.close();
   });
 

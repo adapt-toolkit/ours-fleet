@@ -18,7 +18,8 @@ export interface ControlRequest {
   token: string;
   command: 'status' | 'snapshot' | 'submit_prompt' | 'respond_permission' | 'interrupt' | 'follow' | 'events_since' | 'owner_channel_manage'
     | 'loop_status' | 'loop_run_now' | 'loop_disable' | 'loop_enable' | 'reload_config'
-    | 'conversation_page' | 'conversation_follow' | 'submit_prompt_v2' | 'interrupt_v2';
+    | 'conversation_page' | 'conversation_follow' | 'submit_prompt_v2' | 'interrupt_v2'
+    | 'respond_permission_v2';
   text?: string;
   permissionId?: string;
   optionId?: string;
@@ -35,11 +36,14 @@ export interface ControlRequest {
   commandId?: string;
   /** Browser-session digest recorded as the acting principal. */
   actor?: string;
+  /** Runner generation shown with a permission card. */
+  sessionGeneration?: string;
 }
 
 /** Commands that require protocol version 3. */
 const V3_COMMANDS = new Set<ControlRequest['command']>([
   'conversation_page', 'conversation_follow', 'submit_prompt_v2', 'interrupt_v2',
+  'respond_permission_v2',
 ]);
 
 export interface ControlResponse {
@@ -461,6 +465,26 @@ export class RoleControlServer {
             this.interruptCommands.delete(oldest);
           }
           this.write(socket, { version: 1, id: request.id, ok: true, result: receipt });
+          return;
+        }
+        case 'respond_permission_v2': {
+          this.requireConversation(request);
+          if (!request.commandId?.trim() || !request.permissionId?.trim()
+              || !request.optionId?.trim() || !request.sessionGeneration?.trim())
+            throw new SessionControlError('rejected',
+              'commandId, permissionId, optionId and sessionGeneration are required');
+          if (!this.session.respondPermissionV2)
+            throw new SessionControlError('rejected',
+              'generation-bound permission responses are unavailable for this role');
+          const result = this.session.respondPermissionV2(
+            request.permissionId, request.optionId, request.sessionGeneration);
+          if (result === 'stale')
+            throw new SessionControlError('rejected',
+              'stale_state: permission is settled, expired, invalid, or belongs to another session generation');
+          this.write(socket, {
+            version: 1, id: request.id, ok: true,
+            result: { accepted: true, commandId: request.commandId },
+          });
           return;
         }
       }

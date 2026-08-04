@@ -219,6 +219,7 @@ export interface BoundedJson {
   bytes: number;
   truncated?: true;
   digest?: string;
+  redacted?: true;
 }
 
 export type ConversationPayload =
