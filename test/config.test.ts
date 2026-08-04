@@ -24,6 +24,9 @@ const dropin = (name: string, s: string) => {
 
 describe('loadConfig', () => {
   it('resolves a trusted owner channel only for ACP', () => {
+    const agent = 'A'.repeat(64);
+    const ownerOne = 'B'.repeat(64);
+    const ownerTwo = 'C'.repeat(64);
     base([
       'roles:',
       '  Coordinator:',
@@ -31,11 +34,13 @@ describe('loadConfig', () => {
       '    identity: Coordinator',
       '    owner_channel:',
       '      identity: Coordinator-owner',
-      '      owners: [cid-one, cid-two]',
+      `      owners: [${ownerOne}, ${ownerTwo}]`,
+      `      agent: ${agent}`,
       '',
     ].join('\n'));
     expect(findRole(loadConfig(), 'Coordinator').owner_channel).toEqual({
-      identity: 'Coordinator-owner', owners: ['cid-one', 'cid-two'],
+      identity: 'Coordinator-owner', owners: [ownerOne, ownerTwo],
+      agent,
       interrupt: false, progress_interval_ms: 30_000,
       attachments: {
         enabled: true, max_files_per_request: 4, max_file_bytes: 10 * 1024 * 1024,
@@ -45,6 +50,14 @@ describe('loadConfig', () => {
     });
     base('roles:\n  A:\n    owner_channel: { identity: A-owner, owners: [cid] }\n');
     expect(() => loadConfig()).toThrow(/requires session: acp/);
+  });
+
+  it('requires an exact managed-agent CID distinct from owner authority', () => {
+    const cid = 'A'.repeat(64);
+    base(`roles:\n  A:\n    session: acp\n    owner_channel: { identity: A-owner, owners: [owner], agent: short }\n`);
+    expect(() => loadConfig()).toThrow(/owner_channel\.agent must be exactly 64 hexadecimal/);
+    base(`roles:\n  A:\n    session: acp\n    owner_channel: { identity: A-owner, owners: [${cid}], agent: ${cid} }\n`);
+    expect(() => loadConfig()).toThrow(/agent must not also be an owner CID/);
   });
 
   it('keeps owner channel identities exclusive from role and channel identities', () => {

@@ -34,6 +34,7 @@ export class ScheduledLoopManager implements ScheduledLoopManagerHandle {
   private readonly definitions = new Map<string, ResolvedRoleLoop>();
   private readonly store: ScheduledLoopStateStore;
   private timer?: unknown;
+  private readonly runTimeouts = new Set<unknown>();
   private stopping = false;
 
   constructor(
@@ -54,6 +55,8 @@ export class ScheduledLoopManager implements ScheduledLoopManagerHandle {
     this.arbiter.stopScheduledAdmission();
     if (this.timer !== undefined) this.deps.clearTimer(this.timer);
     this.timer = undefined;
+    for (const timeout of this.runTimeouts) this.deps.clearTimer(timeout);
+    this.runTimeouts.clear();
     this.store.state.clock.lastWallMs = this.deps.now();
     this.store.persist();
   }
@@ -168,7 +171,24 @@ export class ScheduledLoopManager implements ScheduledLoopManagerHandle {
       return { state: 'unavailable', runId };
     }
     this.deps.log(`[${this.role}] loop ${definition.name} started run=${runId.slice(0, 11)} scheduled=${new Date(scheduledAt).toISOString()}`);
-    void result.queued.completion.then(turn => this.finish(definition, state, runId, turn));
+    // Maintenance is best-effort and must never monopolize a persistent role.
+    // A cancellation which the ACP adapter ignores is escalated by AcpSession
+    // into an adapter restart, preserving the session and deferred owner mail.
+    const timeoutMs = Math.max(60_000, Math.min(5 * 60_000, Math.floor(definition.intervalMs / 2)));
+    const timeout = this.deps.setTimer(() => {
+      this.runTimeouts.delete(timeout);
+      if (state.activeRunId !== runId || this.stopping) return;
+      this.deps.log(`[${this.role}] loop ${definition.name} timed out run=${runId.slice(0, 11)} after ${timeoutMs}ms; cancelling`);
+      void this.arbiter.interrupt('scheduled-loop').catch(error => {
+        this.deps.log(`[${this.role}] loop ${definition.name} timeout cancellation failed: ${(error as Error)?.name ?? 'Error'}`);
+      });
+    }, timeoutMs);
+    this.runTimeouts.add(timeout);
+    void result.queued.completion.then(turn => {
+      this.deps.clearTimer(timeout);
+      this.runTimeouts.delete(timeout);
+      this.finish(definition, state, runId, turn);
+    });
     return { state: 'started', runId };
   }
 

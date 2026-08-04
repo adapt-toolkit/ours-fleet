@@ -12,6 +12,8 @@ import type { SessionHandle } from '../src/session/types.js';
 
 const OWNER = 'A'.repeat(64);
 const CONTACT = 'B'.repeat(64);
+const AGENT = 'D'.repeat(64);
+const INTRUDER = 'E'.repeat(64);
 const dirs: string[] = [];
 
 class ManagementClient implements OursToolClient {
@@ -32,7 +34,7 @@ class ManagementClient implements OursToolClient {
   }
 }
 
-function setup() {
+function setup(options: { agent?: string } = {}) {
   const dir = mkdtempSync(join(tmpdir(), 'ours-owner-management-'));
   dirs.push(dir);
   const client = new ManagementClient();
@@ -51,6 +53,7 @@ function setup() {
   const channel = new OwnerChannel({
     role: 'Role', config: {
       identity: 'Role-owner', owners: [OWNER], interrupt: false, progress_interval_ms: 0,
+      ...(options.agent ? { agent: options.agent } : {}),
     }, session, stateDir: dir, client, log: line => logs.push(line),
     watch: () => {
       const stdout = new PassThrough();
@@ -70,6 +73,76 @@ afterEach(() => {
 });
 
 describe('OwnerChannel live management', () => {
+  it('relays every managed-agent message as a new message to the latest owner', async () => {
+    const { channel, client, queuePrompt } = setup({ agent: AGENT });
+    await channel.start();
+    client.batches.push([{
+      msg_id: 1, wire_id: 'owner-selects-route', from: { id: OWNER }, text: '/status',
+    }], []);
+    await channel.drain();
+
+    client.batches.push([{
+      msg_id: 2, wire_id: 'agent-progress', from: { id: AGENT },
+      text: 'The verification run is halfway complete.',
+      reply_to: { wire_id: 'owner-selects-route' },
+    }, {
+      // Intra-root sibling delivery can have no ADAPT wire ID. The daemon's
+      // per-identity message ID remains a stable idempotency key.
+      msg_id: 3, wire_id: '', from: { id: AGENT },
+      text: 'I found a useful unassigned Trello item.',
+    }], []);
+    await channel.drain();
+
+    expect(queuePrompt).not.toHaveBeenCalled();
+    expect(client.calls.filter(call => call.name === 'send_message').map(call => call.args))
+      .toEqual(expect.arrayContaining([
+        { contact: OWNER, text: 'The verification run is halfway complete.' },
+        { contact: OWNER, text: 'I found a useful unassigned Trello item.' },
+      ]));
+    expect(client.calls.filter(call => call.name === 'send_message'
+      && ['The verification run is halfway complete.', 'I found a useful unassigned Trello item.']
+        .includes(String(call.args?.text)))
+      .every(call => call.args?.reply_to_wire_id === undefined)).toBe(true);
+    await channel.close();
+  });
+
+  it('warns the owner without reflecting the body when another agent tries the relay', async () => {
+    const { channel, client, queuePrompt } = setup({ agent: AGENT });
+    await channel.start();
+    client.batches.push([{
+      msg_id: 4, wire_id: 'owner-route-for-warning', from: { id: OWNER }, text: '/status',
+    }], []);
+    await channel.drain();
+    client.batches.push([{
+      msg_id: 5, wire_id: 'intruder-attempt', from: { id: INTRUDER, name: 'Other agent' },
+      text: 'MALICIOUS_BODY_MUST_NOT_BE_REFLECTED',
+    }], []);
+    await channel.drain();
+
+    expect(queuePrompt).not.toHaveBeenCalled();
+    const warning = client.calls.filter(call => call.name === 'send_message').at(-1)?.args;
+    expect(warning).toEqual({
+      contact: OWNER,
+      text: `⚠️ Owner-channel security warning: rejected a message from unauthorized sender CID `
+        + `${INTRUDER}. Its body was not forwarded.`,
+    });
+    expect(JSON.stringify(warning)).not.toContain('MALICIOUS_BODY_MUST_NOT_BE_REFLECTED');
+    expect(client.calls.some(call => call.args?.contact === INTRUDER)).toBe(false);
+    await channel.close();
+  });
+
+  it('disables control-socket message and authority bypasses in managed-agent mode', async () => {
+    const { channel, client } = setup({ agent: AGENT });
+    await channel.start();
+    await expect(channel.manage({
+      action: 'request_update', requestId: 'a'.repeat(64), phase: 'working', message: 'bypass',
+    })).rejects.toThrow(/managed agent must message its owner-channel identity/);
+    await expect(channel.manage({ action: 'owner_authorize', cid: CONTACT }))
+      .rejects.toThrow(/edit fleet configuration instead/);
+    expect(client.calls.filter(call => call.name === 'send_message')).toEqual([]);
+    await channel.close();
+  });
+
   it('uses the already-bound client and never chooses or force-binds again', async () => {
     const { channel, client } = setup();
     await channel.start();

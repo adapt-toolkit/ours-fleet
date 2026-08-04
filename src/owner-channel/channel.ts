@@ -10,7 +10,10 @@ import {
 import type { QueuedPrompt, SessionEvent, SessionHandle, TurnResult } from '../session/types.js';
 import { OursMcpClient, type OursToolClient } from './mcp.js';
 import { ownerNotices, type OwnerProgressPhase, type OwnerUpdatePhase } from './notices.js';
-import { OwnerAuthorizationState, OwnerChannelState, type OwnerEntry } from './state.js';
+import {
+  OwnerAuthorizationState, OwnerChannelState, OwnerConversationState,
+  type OwnerEntry,
+} from './state.js';
 import {
   OwnerTaskState, ownerTaskAuditId, ownerTaskDigest, type OwnerTaskPhase,
 } from './tasks.js';
@@ -105,6 +108,8 @@ const OWNER_UPDATE_MIN_INTERVAL_MS = 5_000;
 const OWNER_UPDATE_MAX_COUNT = 20;
 const OWNER_UPDATE_MAX_CHARS = 280;
 const OWNER_UPDATE_MAX_BYTES = 1_024;
+const PROACTIVE_MESSAGE_MAX_CHARS = 4_000;
+const PROACTIVE_MESSAGE_MAX_BYTES = 16_384;
 
 /**
  * Fleet-owned trusted ingress. The agent never binds this identity and never
@@ -114,6 +119,7 @@ export class OwnerChannel implements OwnerChannelHandle {
   private readonly client: OursToolClient;
   private readonly state: OwnerChannelState;
   private readonly authorizations: OwnerAuthorizationState;
+  private readonly conversations: OwnerConversationState;
   private readonly tasks: OwnerTaskState;
   private readonly attachmentRecovery: AttachmentRecoveryState;
   private readonly attachmentConfig: OwnerAttachmentConfig;
@@ -139,6 +145,8 @@ export class OwnerChannel implements OwnerChannelHandle {
     this.state = new OwnerChannelState(join(options.stateDir, '.owner-channel-state.json'));
     this.authorizations = new OwnerAuthorizationState(
       join(options.stateDir, '.owner-channel-owners.json'), options.config.owners);
+    this.conversations = new OwnerConversationState(
+      join(options.stateDir, '.owner-channel-conversations.json'));
     this.tasks = new OwnerTaskState(join(options.stateDir, '.owner-channel-tasks.json'));
     this.attachmentRecovery = new AttachmentRecoveryState(
       join(options.stateDir, '.owner-channel-attachment-recovery.json'));
@@ -148,9 +156,11 @@ export class OwnerChannel implements OwnerChannelHandle {
       max_request_bytes: 20 * 1024 * 1024, retention_ms: 24 * 60 * 60 * 1_000,
       allowed_mime: [...DEFAULT_OWNER_ATTACHMENT_MIME],
     };
-    const integrity = this.authorizations.integrity();
+    const integrity = this.authorizationIntegrity();
     if (!integrity.ok)
       options.log(`[${options.role}] owner authorization state corrupt; all owner mail disabled`);
+    if (!this.conversations.integrity().ok)
+      options.log(`[${options.role}] owner conversation state corrupt; proactive messages disabled`);
     if (!this.tasks.integrity().ok)
       options.log(`[${options.role}] owner task state corrupt; proactive reports disabled`);
     if (!this.attachmentRecovery.integrity())
@@ -161,8 +171,8 @@ export class OwnerChannel implements OwnerChannelHandle {
     this.stopping = false;
     await this.client.start();
     await this.client.callTool('choose_identity', { name: this.options.config.identity });
-    if (this.authorizations.integrity().ok && this.tasks.integrity().ok)
-      this.tasks.cleanup(Date.now(), this.authorizations.effective());
+    if (this.authorizationIntegrity().ok && this.tasks.integrity().ok)
+      this.tasks.cleanup(Date.now(), this.effectiveOwners());
     if (this.attachmentRecovery.integrity()) {
       this.attachmentRecovery.cleanup(Date.now(), this.attachmentConfig.retention_ms);
       void cleanupAttachmentRoot(
@@ -237,11 +247,17 @@ export class OwnerChannel implements OwnerChannelHandle {
       }
       case 'owner_list':
         return {
-          action: request.action, integrity: this.authorizations.integrity(),
-          owners: this.authorizations.entries(),
+          action: request.action, integrity: this.authorizationIntegrity(),
+          owners: this.options.config.agent
+            ? this.options.config.owners.map(cid => ({ cid, source: 'baseline', effective: true }))
+            : this.authorizations.entries(),
         };
       case 'owner_authorize': {
+        if (this.options.config.agent)
+          throw new Error('live owner authorization is disabled when managed-agent CID gating is configured; edit fleet configuration instead');
         this.assertCid(request.cid);
+        if (request.cid === this.options.config.agent)
+          throw new Error('managed agent CID cannot also be authorized as an owner');
         if (this.authorizations.effective().has(request.cid))
           throw new Error(`owner '${request.cid}' is already authorized`);
         const contacts = await this.contacts();
@@ -251,9 +267,13 @@ export class OwnerChannel implements OwnerChannelHandle {
         return { action: request.action, owner: this.authorizations.authorize(request.cid) };
       }
       case 'owner_revoke':
+        if (this.options.config.agent)
+          throw new Error('live owner revocation is disabled when managed-agent CID gating is configured; edit fleet configuration instead');
         this.assertCid(request.cid);
         {
           const owner = this.authorizations.revoke(request.cid);
+          try { this.conversations.remove(request.cid); }
+          catch (error) { this.logError('owner conversation revocation cleanup failed', error); }
           let revokedTasks = 0;
           try { revokedTasks = this.tasks.revoke(request.cid); }
           catch (error) { this.logError('owner task revocation cleanup failed', error); }
@@ -262,10 +282,16 @@ export class OwnerChannel implements OwnerChannelHandle {
           return { action: request.action, owner };
         }
       case 'request_update':
+        if (this.options.config.agent)
+          throw new Error('direct owner updates are disabled; the managed agent must message its owner-channel identity');
         return this.sendOwnerUpdate(request);
       case 'task_open':
+        if (this.options.config.agent)
+          throw new Error('owner task routes are disabled; the managed agent must message its owner-channel identity');
         return this.openOwnerTask(request.requestId);
       case 'task_report':
+        if (this.options.config.agent)
+          throw new Error('direct task reports are disabled; the managed agent must message its owner-channel identity');
         return this.sendOwnerTaskReport(request);
       default:
         throw new Error('unknown owner-channel management action');
@@ -350,6 +376,28 @@ export class OwnerChannel implements OwnerChannelHandle {
     });
     await send;
     return { action: request.action, requestId: request.requestId, sequence };
+  }
+
+  private async sendProactiveMessage(messageValue: string): Promise<void> {
+    if (!this.authorizationIntegrity().ok)
+      throw new Error('owner authorization state is corrupt; proactive messages are disabled');
+    const message = this.safeProactiveMessage(messageValue);
+    const route = this.conversations.route(this.effectiveOwners());
+    const digest = createHash('sha256').update(message).digest('hex');
+    const sending = this.conversations.beginSend(route.contact, digest);
+    try {
+      if (!this.effectiveOwners().has(route.contact))
+        throw new Error('selected proactive owner is no longer authorized');
+      await this.send(route.contact, message);
+    } catch {
+      try { this.conversations.finishSend(sending.id, 'uncertain'); }
+      catch (error) { this.logError('proactive owner uncertainty persist failed', error); }
+      throw new Error('proactive owner message delivery outcome is uncertain; it was not retried');
+    }
+    this.conversations.finishSend(sending.id, 'delivered');
+    this.options.log(`[${this.options.role}] proactive owner message `
+      + `${createHash('sha256').update(sending.id).digest('hex').slice(0, 12)} `
+      + `basis=${route.basis} chars=${Array.from(message).length} bytes=${Buffer.byteLength(message)} delivered`);
   }
 
   private openOwnerTask(requestId: string): OwnerChannelManagementResult {
@@ -438,6 +486,21 @@ export class OwnerChannel implements OwnerChannelHandle {
     return message;
   }
 
+  private safeProactiveMessage(value: unknown): string {
+    if (typeof value !== 'string') throw new Error('proactive owner message must be text');
+    const message = value.trim().normalize('NFC');
+    if (!message) throw new Error('proactive owner message must not be empty');
+    if (Array.from(message).length > PROACTIVE_MESSAGE_MAX_CHARS
+        || Buffer.byteLength(message) > PROACTIVE_MESSAGE_MAX_BYTES)
+      throw new Error(`proactive owner message exceeds ${PROACTIVE_MESSAGE_MAX_CHARS} characters or `
+        + `${PROACTIVE_MESSAGE_MAX_BYTES} bytes`);
+    if (/\u0000|[\u202a-\u202e\u2066-\u2069]/u.test(message))
+      throw new Error('proactive owner message contains unsafe control characters');
+    if (/-----BEGIN [A-Z ]*PRIVATE KEY-----|(?:api[_ -]?key|access[_ -]?token|authorization|password|secret)\s*[:=]|(?:chain of thought|private reasoning|internal reasoning)|^(?:stdout|stderr|tool (?:output|result)|command):/imu.test(message))
+      throw new Error('proactive owner message appears to contain unsafe reasoning, secret, or raw tool content');
+    return message;
+  }
+
   private async drainAll(): Promise<void> {
     // A finite cap protects the supervisor if a broken daemon repeats unread
     // messages forever. A watch notification will resume draining later.
@@ -467,7 +530,7 @@ export class OwnerChannel implements OwnerChannelHandle {
       const deferred = messages.filter(message => {
         const wireId = this.wireId(message);
         return wireId && !this.state.has(wireId)
-          && this.authorizations.effective().has(this.sender(message).id)
+          && this.acceptedSender(this.sender(message).id)
           && Number.isInteger(message.msg_id);
       }).map(message => message.msg_id!);
       if (deferred.length)
@@ -542,7 +605,7 @@ export class OwnerChannel implements OwnerChannelHandle {
     if (handledWireIds.some(wire => this.inFlight.has(wire))) return false;
     const sender = { id: group.files[0].senderId, name: group.files[0].senderName };
     if (group.files.some(file => file.senderId !== sender.id)
-        || !this.authorizations.effective().has(sender.id)) {
+        || !this.effectiveOwners().has(sender.id)) {
       this.options.log(
         `[${this.options.role}] owner channel ignored unauthorized attachment sender ${sender.id}`);
       for (const wire of handledWireIds) this.state.remember(wire);
@@ -643,14 +706,31 @@ export class OwnerChannel implements OwnerChannelHandle {
     const wireId = this.wireId(message);
     if (!wireId || this.state.has(wireId) || this.inFlight.has(wireId)) return false;
     const sender = this.sender(message);
-    if (!this.authorizations.effective().has(sender.id)) {
-      // Do not answer an unauthorized sender and thereby disclose that this is
-      // a privileged control address. Authenticated CID, never display name or
-      // message wording, is the authority boundary.
-      this.options.log(
-        `[${this.options.role}] owner channel ignored unauthorized sender ${sender.id || '<unknown>'}`);
+    if (sender.id === this.options.config.agent) {
+      try { await this.relayManagedAgentMessage(message, wireId); }
+      catch (error) { this.logError('managed-agent message relay refused', error); }
       this.state.remember(wireId);
       return true;
+    }
+    if (!this.effectiveOwners().has(sender.id)) {
+      // Never answer the sender or reflect its body. Notify an owner through the
+      // bounded proactive route, then consume the attempt so it cannot replay.
+      this.options.log(
+        `[${this.options.role}] owner channel ignored unauthorized sender ${sender.id || '<unknown>'}`);
+      await this.warnOwnerOfUnauthorizedSender(sender.id);
+      this.state.remember(wireId);
+      return true;
+    }
+
+    // Accepted authenticated inbound traffic selects the destination for the
+    // next unscoped proactive message. Distinct devices/identities naturally
+    // hand off this route by being the most recent sender.
+    try {
+      this.conversations.recordInbound(sender.id, wireId);
+    } catch (error) {
+      // Proactive routing state is auxiliary. A corrupt/unwritable route file must
+      // never prevent an authenticated owner from using the ordinary channel.
+      this.logError('owner conversation route update failed', error);
     }
 
     const text = String(message.text ?? '').trim();
@@ -681,7 +761,7 @@ export class OwnerChannel implements OwnerChannelHandle {
     const activityCursor = this.latestEventSeq(this.options.session.eventsSince(0));
     try {
       queued = await this.options.session.queuePrompt(
-        this.ownerPrompt(sender, text, wireId, requestId, outbox), {
+        this.ownerPrompt(sender, text, wireId, outbox), {
         interrupt: this.options.config.interrupt,
         ...(this.options.config.interrupt ? { interruptSource: 'owner' as const } : {}),
         origin: { kind: 'owner', requestId },
@@ -694,10 +774,13 @@ export class OwnerChannel implements OwnerChannelHandle {
       return true;
     }
 
-    const accepted = this.options.config.interrupt
-      ? ownerNotices.receivedInterrupting()
-      : queued.queuedBehind > 0
-        ? ownerNotices.receivedQueued(queued.queuedBehind)
+    // Interrupting the live turn does not remove prompts which were already
+    // accepted into the ACP queue. Never claim this request is running while
+    // the session itself says earlier work remains ahead of it.
+    const accepted = queued.queuedBehind > 0
+      ? ownerNotices.receivedQueued(queued.queuedBehind)
+      : this.options.config.interrupt
+        ? ownerNotices.receivedInterrupting()
         : ownerNotices.receivedStarted();
     this.inFlight.add(wireId);
     const receipt = this.send(sender.id, accepted, wireId).then(() => undefined).catch(error => {
@@ -721,37 +804,132 @@ export class OwnerChannel implements OwnerChannelHandle {
     return true;
   }
 
+  private acceptedSender(cid: string): boolean {
+    return cid === this.options.config.agent || this.effectiveOwners().has(cid);
+  }
+
+  private async relayManagedAgentMessage(message: InboundMessage, wireId: string): Promise<void> {
+    if (!this.authorizationIntegrity().ok)
+      throw new Error('owner authorization state is corrupt; managed-agent relay is disabled');
+    const text = this.safeRelayMessage(message.text);
+    const route = this.conversations.route(this.effectiveOwners());
+    // The inbound wire—not its body—is the idempotency key. Repeating the same
+    // wording in two deliberate messages remains valid, while crash replay of
+    // one message cannot produce two owner deliveries.
+    const digest = createHash('sha256').update(`managed-agent-relay\0${wireId}`).digest('hex');
+    const sending = this.conversations.beginSend(route.contact, digest, Date.now(), 0);
+    try {
+      if (!this.effectiveOwners().has(route.contact))
+        throw new Error('selected relay owner is no longer authorized');
+      await this.send(route.contact, text);
+    } catch {
+      try { this.conversations.finishSend(sending.id, 'uncertain'); }
+      catch (error) { this.logError('managed-agent relay uncertainty persist failed', error); }
+      throw new Error('managed-agent relay delivery outcome is uncertain; it was not retried');
+    }
+    this.conversations.finishSend(sending.id, 'delivered');
+    this.options.log(`[${this.options.role}] managed-agent message relayed `
+      + `wire=${createHash('sha256').update(wireId).digest('hex').slice(0, 12)} `
+      + `basis=${route.basis} chars=${Array.from(text).length} bytes=${Buffer.byteLength(text)}`);
+  }
+
+  private safeRelayMessage(value: unknown): string {
+    if (typeof value !== 'string') throw new Error('managed-agent relay must be text');
+    const message = value.normalize('NFC');
+    if (!message.trim()) throw new Error('managed-agent relay must not be empty');
+    if (Array.from(message).length > PROACTIVE_MESSAGE_MAX_CHARS
+        || Buffer.byteLength(message) > PROACTIVE_MESSAGE_MAX_BYTES)
+      throw new Error(`managed-agent relay exceeds ${PROACTIVE_MESSAGE_MAX_CHARS} characters or `
+        + `${PROACTIVE_MESSAGE_MAX_BYTES} bytes`);
+    if (/\u0000|[\u202a-\u202e\u2066-\u2069]/u.test(message))
+      throw new Error('managed-agent relay contains unsafe control characters');
+    return message;
+  }
+
+  private async warnOwnerOfUnauthorizedSender(cid: string): Promise<void> {
+    const source = /^[A-Fa-f0-9]{64}$/.test(cid)
+      ? cid
+      : `invalid-${createHash('sha256').update(cid).digest('hex').slice(0, 12)}`;
+    try {
+      await this.sendProactiveMessage(
+        `⚠️ Owner-channel security warning: rejected a message from unauthorized `
+          + `sender CID ${source}. Its body was not forwarded.`);
+    } catch (error) {
+      // Warning delivery must not make hostile input replayable or disclose
+      // anything to its sender. Rate/dedupe/no-route failures remain local.
+      this.logError('unauthorized sender warning suppressed', error);
+    }
+  }
+
+  private effectiveOwners(): Set<string> {
+    // In managed-agent mode the checked-in fleet configuration is the complete
+    // authority boundary. Ignore any legacy dynamic overlay left on disk.
+    return this.options.config.agent
+      ? new Set(this.options.config.owners)
+      : this.authorizations.effective();
+  }
+
+  private authorizationIntegrity(): { ok: boolean; error?: string } {
+    return this.options.config.agent ? { ok: true } : this.authorizations.integrity();
+  }
+
   private async complete(
     active: ActiveOwnerRequest, outbox: string, queued: QueuedPrompt, activityCursor: number,
   ): Promise<void> {
     const progressMs = this.options.config.progress_interval_ms;
-    const startedAt = Date.now();
     let lastSeq = activityCursor;
-    let phase: OwnerProgressPhase = queued.queuedBehind > 0
-      ? 'waiting behind earlier requests' : 'starting request';
-    const timer = progressMs > 0 ? setInterval(() => {
+    let startedAt: number | undefined;
+    let phase: OwnerProgressPhase = 'starting request';
+    let timer: ReturnType<typeof setInterval> | undefined;
+
+    const reportProgress = () => {
       const events = this.options.session.eventsSince(lastSeq);
       lastSeq = Math.max(lastSeq, this.latestEventSeq(events));
       const activity = events.filter(event => event.turnId === queued.promptId);
+      if (!activity.length) return;
+      startedAt ??= Date.parse(activity[0].at) || Date.now();
       phase = this.progressPhase(activity) ?? phase;
       const started = activity.filter(event => event.kind === 'tool_call').length;
       const completed = activity.filter(event =>
         event.kind === 'tool_update' && event.status === 'completed').length;
-      const activityUpdates = activity.filter(event => event.kind !== 'tool_call'
-        && !(event.kind === 'tool_update' && event.status === 'completed')
-        && event.kind !== 'turn_stop').length;
+      // Token/thought chunks are transport activity, not evidence of progress.
+      // Permission transitions and errors are material even without a tool.
+      const activityUpdates = activity.filter(event =>
+        event.kind === 'permission' || event.kind === 'error').length;
+      if (!started && !completed && !activityUpdates) return;
       const notice = ownerNotices.progress(
         Date.now() - startedAt, phase, started, completed, activityUpdates);
       // Preserve wire ordering if a progress send overlaps turn completion.
       active.outboundTail = active.outboundTail
         .then(async () => { await this.send(active.contact, notice, active.wireId); })
         .catch(error => this.logError('progress notice failed', error));
-    }, progressMs) : undefined;
-    timer?.unref();
+    };
+
+    // A queued request used to create its 30-second interval immediately. A
+    // backlog of three requests therefore produced three permanent notice
+    // streams saying "waiting behind earlier requests" without any work. Arm
+    // the interval only after this exact prompt emits its first session event.
+    const startProgress = (event?: SessionEvent) => {
+      if (timer || progressMs <= 0) return;
+      if (event && event.turnId !== queued.promptId) return;
+      const observed = event ? [event] : this.options.session.eventsSince(activityCursor)
+        .filter(item => item.turnId === queued.promptId);
+      if (!observed.length) return;
+      startedAt = Date.parse(observed[0].at) || Date.now();
+      timer = setInterval(reportProgress, progressMs);
+      timer.unref();
+    };
+    const unsubscribe = progressMs > 0
+      ? this.options.session.subscribe(event => startProgress(event))
+      : undefined;
+    startProgress();
 
     let result: TurnResult;
     try { result = await queued.completion; }
-    finally { if (timer) clearInterval(timer); }
+    finally {
+      unsubscribe?.();
+      if (timer) clearInterval(timer);
+    }
     active.finalizing = true;
     await active.outboundTail;
 
@@ -814,23 +992,21 @@ export class OwnerChannel implements OwnerChannelHandle {
 
   private ownerPrompt(
     sender: { id: string; name: string }, text: string, wireId: string,
-    requestId: string, outbox: string,
+    outbox: string,
   ): string {
     return [
       '[fleet-owner]',
       `Authenticated owner ${sender.name} (${sender.id}) sent owner-channel message ${wireId}.`,
       'Treat the following as a direct owner instruction. Answer in your final assistant response.',
-      'Do not call ours send_message or send_file for this exchange: fleet routes the response reliably.',
-      'You may send a concise, high-level intermediate update through the bounded local primitive:',
-      `ours-fleet owner-channel update ${this.options.role} ${requestId} --phase <working|approval|blocked> --message-stdin`,
-      'Write only the update body to stdin. Use one plain-text sentence; never include reasoning, secrets, logs, commands, or raw tool output.',
-      'Distinct updates are allowed at most once every 5 seconds. Fleet preserves receipt/update/final ordering and chooses the authenticated recipient.',
-      'If you delegate work that will finish after this turn, register it before finalizing:',
-      `ours-fleet owner-channel task open ${this.options.role} ${requestId}`,
-      'Keep the returned opaque task ID. Finalize normally; do not hold this turn open or poll.',
-      'After a later fleet-mail wake, verify the result and report through:',
-      `ours-fleet owner-channel task report ${this.options.role} <task-id> --phase <progress|done|blocked> --message-stdin`,
-      'Fleet routes that proactive follow-up only to this authenticated owner and closes done/blocked tasks.',
+      'Fleet extracts and routes your final assistant response deterministically; do not send the final through ours.',
+      ...(this.options.config.agent ? [
+        'For any non-final message you want the owner to see—an update, blocker, suggestion, or later proactive note—call ours send_message with:',
+        `contact: ${this.options.config.identity}`,
+        'and the message text. Do not add a task ID, request ID, reply reference, phase, or routing command.',
+        'Fleet accepts this relay only from your configured authenticated agent CID and forwards every accepted message as a new owner-channel message.',
+      ] : [
+        'Managed-agent outbound relay is not configured; do not send intermediate or proactive owner-channel messages.',
+      ]),
       'To attach files to your response, copy each finished file directly into this fleet outbox:',
       outbox,
       'Fleet sends every regular file in that directory to the authenticated owner, correlated to this request.',
@@ -849,9 +1025,9 @@ export class OwnerChannel implements OwnerChannelHandle {
     return createHash('sha256').update(wireId).digest('hex');
   }
 
-  private send(contact: string, text: string, replyTo: string): Promise<unknown> {
+  private send(contact: string, text: string, replyTo?: string): Promise<unknown> {
     return this.client.callTool('send_message', {
-      contact, text, reply_to_wire_id: replyTo,
+      contact, text, ...(replyTo ? { reply_to_wire_id: replyTo } : {}),
     });
   }
 
@@ -883,7 +1059,9 @@ export class OwnerChannel implements OwnerChannelHandle {
   }
 
   private wireId(message: InboundMessage): string {
-    return String(message.wire_id ?? message.msg_id ?? '');
+    const wire = String(message.wire_id ?? '').trim();
+    if (wire) return wire;
+    return Number.isInteger(message.msg_id) ? `msg:${message.msg_id}` : '';
   }
 
   private sender(message: InboundMessage): { id: string; name: string } {
