@@ -130,6 +130,16 @@ ours-fleet spawn Coder --harness codex --model gpt-5.4 \
 # wake owner separately in fleet.yaml with monitor.mode: fleet|native.
 ```
 
+Inside a managed ACP role, `ours-fleet spawn` is transparently routed through
+that role's live supervisor. `ours-fleet spawn --role DeveloperX --temp` is the
+minimal form: omitted harness, session, cwd, coordinator, neutral permissions,
+fleet monitor policy, and same-harness model inherit from the caller. Explicit
+flags win; changing harness without a model lets the selected harness/fleet
+defaults choose one. After creation succeeds, fleet can deterministically notify
+the caller's owner channel with the caller and spawned-role details. This is an
+honest-actor convenience and attribution path, not a security boundary; tmux,
+host shells, and deliberately bypassed absolute binaries retain direct behavior.
+
 ## Local web console
 
 The interactive console is packaged with `@ours.network/fleet` and binds to
@@ -267,7 +277,7 @@ ours-fleet up|down|restart|force-restart [-c FILE] [Name...]
 ours-fleet config [-c FILE]         validate + print merged plan
 ours-fleet ls | attach | peek | logs [-f] | status <Name>
 ours-fleet send <Name> "text" | --key <K>
-ours-fleet spawn [--temp] <Name> [--harness --session --mission --model --approval ...]
+ours-fleet spawn [--temp] [<Name> | --role <Name>] [--harness --session --mission --model --approval ...]
 ours-fleet loops validate|list|status
 ours-fleet loops reload <Role>
 ours-fleet loops run-now|disable|enable <Role> <Loop>

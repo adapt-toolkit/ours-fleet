@@ -30,8 +30,11 @@ afterEach(async () => {
   rmSync(homeDir, { recursive: true, force: true });
 });
 
-const run = (args: string[]) => new Promise<{ code: number; stdout: string; stderr: string }>(resolveRun => {
-  execFile(process.execPath, [CLI, ...args], { env: { ...process.env, OURS_FLEET_HOME: homeDir } },
+const run = (args: string[], extraEnv: Record<string, string> = {}) =>
+  new Promise<{ code: number; stdout: string; stderr: string }>(resolveRun => {
+  execFile(process.execPath, [CLI, ...args], {
+    env: { ...process.env, OURS_FLEET_HOME: homeDir, ...extraEnv },
+  },
     (error, stdout, stderr) => resolveRun({
       code: typeof (error as NodeJS.ErrnoException | null)?.code === 'number'
         ? (error as NodeJS.ErrnoException).code as number : error ? 1 : 0,
@@ -179,6 +182,32 @@ describe('owner-channel CLI', () => {
       action: 'task_report', taskId: TASK, phase: 'done',
       message: 'Specialist verification passed.\n',
     });
+  }, CLI_INTEGRATION_TIMEOUT_MS);
+
+  it('prefers the managed role proxy for spawn and supports --role', async () => {
+    config();
+    await startControl(async () => { throw new Error('not used'); });
+    const stateDir = join(homeDir, '.ours-fleet', 'agents', 'PhoneRole');
+    const spawn = vi.fn(async options => ({
+      caller: 'PhoneRole', role: options.name, lifetime: options.temp ? 'temporary' as const : 'permanent' as const,
+      statePath: '/state/ProxyWorker', harness: options.harness ?? 'codex', session: 'acp' as const,
+      model: 'gpt-proxy', monitor: { mode: 'fleet' as const, interrupt: true },
+      inherited: ['session', 'model', 'monitorConfig'], creationActionId: 'proxy-action',
+    }));
+    control!.setFleetSpawner(spawn);
+
+    const result = await run([
+      'spawn', '--role', 'ProxyWorker', '--temp', '--harness', 'claude-code',
+    ], {
+      OURS_FLEET_PROXY_STATE_DIR: stateDir,
+      OURS_FLEET_PROXY_CALLER: 'PhoneRole',
+    });
+    expect(result).toMatchObject({ code: 0, stderr: '' });
+    expect(result.stdout).toContain("spawned temporary agent 'ProxyWorker' through PhoneRole's fleet proxy");
+    expect(result.stdout).toContain('claude-code/acp');
+    expect(spawn).toHaveBeenCalledWith(expect.objectContaining({
+      name: 'ProxyWorker', temp: true, harness: 'claude-code',
+    }));
   }, CLI_INTEGRATION_TIMEOUT_MS);
 
   it('rejects invalid targets, invalid CIDs, conflicting invite sources, and unavailable channels', async () => {

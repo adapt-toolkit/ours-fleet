@@ -101,7 +101,7 @@ harness's own default.
 ## Spawn
 
 \`\`\`sh
-ours-fleet spawn [--temp] Name \\
+ours-fleet spawn [--temp] [Name | --role Name] \\
   --harness codex|claude-code --session tmux|acp \\
   --mission "one line" --cwd /absolute/path --identity Identity \\
   --coordinator Coordinator --model MODEL \\
@@ -122,6 +122,22 @@ is exposed, tying a newly-created identity to the connector session lifecycle;
 older servers fall back to \`create_identity\`. Collisions and creation errors
 stop safely without force-adopting or deleting identity state. Permanent roles
 retain normal \`create_identity\` behavior.
+
+Inside a managed ACP role, the same CLI automatically routes a real \`spawn\`
+through that role's authenticated supervisor control socket. \`--role Name\` is
+accepted as an alternative to the positional name, so a minimal delegated call
+is \`ours-fleet spawn --role DeveloperX --temp\`. The supervisor records the
+calling role, performs creation, and only after success sends a structured
+spawn notice through the caller's owner channel when one is configured.
+
+Omitted harness, session, working directory, coordinator, neutral permissions,
+fleet monitor policy, and (when the harness is unchanged) model inherit from the
+calling role. Explicit options always win. Selecting a different harness without
+\`--model\` leaves model selection to that harness/fleet defaults rather than
+copying an incompatible caller model. This automatic proxy is a convenience and
+attribution mechanism, not an isolation boundary: an unrestricted role can still
+invoke another binary path directly. Tmux roles and host/operator shells keep the
+ordinary direct CLI behavior.
 
 Codex-specific spawn flags: \`--sandbox\`, \`--permission-mode\`, \`--launcher\`,
 \`--profile\`, \`--search\`, repeatable \`--codex-config key=value\`, repeatable

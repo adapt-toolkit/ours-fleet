@@ -324,7 +324,7 @@ export function writeRoleFile(tx: CreationTransaction, file: string, contents: s
 // ─── Creation provenance (6.6) ───────────────────────────────────────────────
 
 /** Where a setting's effective value came from. */
-export type ProvenanceSource = 'cli' | 'fleet-default' | 'built-in';
+export type ProvenanceSource = 'cli' | 'fleet-default' | 'caller-role' | 'built-in';
 
 export interface ProvenanceEntry {
   value: unknown;
@@ -340,8 +340,10 @@ export interface CreationProvenance {
   lifetime: 'permanent' | 'temporary';
   role: string;
   /** Additive correlation for non-CLI creation surfaces; never contains request data. */
-  surface?: 'cli' | 'web';
+  surface?: 'cli' | 'web' | 'agent';
   creationActionId?: string;
+  /** Managed role which requested creation through its supervisor proxy. */
+  callerRole?: string;
   /** Effective settings, each tagged with where its value came from. */
   settings: Record<string, ProvenanceEntry>;
 }
@@ -366,8 +368,9 @@ export function buildProvenance(o: {
   fleetVersion: string;
   now?: Date;
   settings: Record<string, ProvenanceEntry>;
-  surface?: 'cli' | 'web';
+  surface?: 'cli' | 'web' | 'agent';
   creationActionId?: string;
+  callerRole?: string;
 }): CreationProvenance {
   return {
     version: 1,
@@ -378,6 +381,7 @@ export function buildProvenance(o: {
     role: o.role,
     surface: o.surface ?? 'cli',
     creationActionId: o.creationActionId,
+    callerRole: o.callerRole,
     settings: o.settings,
   };
 }
@@ -389,7 +393,10 @@ export function writeProvenance(stateDir: string, p: CreationProvenance): void {
 
 /** One concise line per non-built-in setting, for the post-creation summary. */
 export function formatProvenance(p: CreationProvenance): string[] {
-  const mark = { cli: 'explicit', 'fleet-default': 'fleet default', 'built-in': 'built-in' } as const;
+  const mark = {
+    cli: 'explicit', 'fleet-default': 'fleet default', 'caller-role': 'caller role',
+    'built-in': 'built-in',
+  } as const;
   return Object.entries(p.settings)
     .filter(([, e]) => e.value !== undefined)
     .map(([k, e]) => `    ${k.padEnd(12)} ${String(e.value)}  (${mark[e.source]})`);

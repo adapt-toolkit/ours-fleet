@@ -288,6 +288,30 @@ describe('OwnerChannel live management', () => {
     await channel.close();
   });
 
+  it('deterministically reports a successful supervisor-proxied spawn to the owner', async () => {
+    const { channel, client } = setup({ agent: AGENT });
+    await channel.start();
+    client.batches.push([{
+      msg_id: 6, wire_id: 'owner-route-for-spawn', from: { id: OWNER }, text: '/status',
+    }], []);
+    await channel.drain();
+    await channel.notifyFleetSpawn({
+      caller: 'Coordinator', role: 'DeveloperX', lifetime: 'temporary',
+      statePath: '/private/state', harness: 'codex', session: 'acp', model: 'gpt-test',
+      monitor: { mode: 'fleet', interrupt: true },
+      inherited: ['harness', 'session', 'model'], creationActionId: 'spawn-action-1',
+    });
+
+    const notice = client.calls.filter(call => call.name === 'send_message').at(-1)?.args;
+    expect(notice?.contact).toBe(OWNER);
+    expect(notice?.reply_to_wire_id).toBeUndefined();
+    expect(notice?.text).toContain('Coordinator spawned temporary agent DeveloperX');
+    expect(notice?.text).toContain('codex/acp, model gpt-test');
+    expect(notice?.text).toContain('fleet monitor with interruption');
+    expect(notice?.text).not.toContain('/private/state');
+    await channel.close();
+  });
+
   it('disables control-socket message and authority bypasses in managed-agent mode', async () => {
     const { channel, client } = setup({ agent: AGENT });
     await channel.start();

@@ -9,6 +9,8 @@ import type {
   OwnerChannelHandle, OwnerChannelManagementRequest,
 } from '../owner-channel/channel.js';
 import type { ScheduledLoopManagerHandle } from '../loops/manager.js';
+import type { SpawnOpts } from '../spawn.js';
+import type { ManagedFleetSpawnResult } from '../fleet-proxy.js';
 
 const MAX_LINE_BYTES = 64 * 1024;
 
@@ -19,7 +21,7 @@ export interface ControlRequest {
   command: 'status' | 'snapshot' | 'submit_prompt' | 'respond_permission' | 'interrupt' | 'follow' | 'events_since' | 'owner_channel_manage'
     | 'loop_status' | 'loop_run_now' | 'loop_disable' | 'loop_enable' | 'reload_config'
     | 'conversation_page' | 'conversation_follow' | 'submit_prompt_v2' | 'interrupt_v2'
-    | 'respond_permission_v2';
+    | 'respond_permission_v2' | 'fleet_spawn';
   text?: string;
   permissionId?: string;
   optionId?: string;
@@ -40,6 +42,8 @@ export interface ControlRequest {
   source?: 'owner_admin_console';
   /** Runner generation shown with a permission card. */
   sessionGeneration?: string;
+  /** Typed managed-spawn request accepted only over the authenticated role control plane. */
+  spawn?: SpawnOpts;
 }
 
 /** Commands that require protocol version 3. */
@@ -183,6 +187,7 @@ export class RoleControlServer {
   private ownerChannel?: OwnerChannelHandle;
   private loopManager?: ScheduledLoopManagerHandle;
   private reloadConfig?: () => Promise<unknown>;
+  private fleetSpawner?: (options: SpawnOpts) => Promise<ManagedFleetSpawnResult>;
 
   constructor(
     stateDir: string,
@@ -228,6 +233,12 @@ export class RoleControlServer {
 
   setConfigReloader(reloadConfig: (() => Promise<unknown>) | undefined): void {
     this.reloadConfig = reloadConfig;
+  }
+
+  setFleetSpawner(
+    fleetSpawner: ((options: SpawnOpts) => Promise<ManagedFleetSpawnResult>) | undefined,
+  ): void {
+    this.fleetSpawner = fleetSpawner;
   }
 
   private accept(socket: Socket): void {
@@ -360,6 +371,15 @@ export class RoleControlServer {
           this.write(socket, {
             version: 1, id: request.id, ok: true, result: await this.reloadConfig(),
           });
+          return;
+        }
+        case 'fleet_spawn': {
+          if (request.version !== 2 || !request.spawn || typeof request.spawn.name !== 'string')
+            throw new SessionControlError('rejected', 'version 2 and typed spawn options are required');
+          if (!this.fleetSpawner)
+            throw new SessionControlError('rejected', 'managed fleet spawning is unavailable for this role');
+          const result = await this.fleetSpawner(request.spawn);
+          this.write(socket, { version: 1, id: request.id, ok: true, result });
           return;
         }
         case 'owner_channel_manage': {

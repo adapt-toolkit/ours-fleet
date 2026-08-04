@@ -1,4 +1,4 @@
-import { existsSync, readFileSync, writeFileSync, rmSync, mkdirSync } from 'node:fs';
+import { existsSync, readFileSync, writeFileSync, rmSync, mkdirSync, realpathSync } from 'node:fs';
 import { join } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { parse } from 'yaml';
@@ -35,6 +35,11 @@ import { RoleTurnArbiter } from './session/arbiter.js';
 import {
   ScheduledLoopManager, type ScheduledLoopManagerHandle,
 } from './loops/manager.js';
+import {
+  FLEET_PROXY_CALLER_ENV, FLEET_PROXY_STATE_DIR_ENV, inheritCallerSpawnDefaults,
+  type ManagedFleetSpawnResult,
+} from './fleet-proxy.js';
+import type { SpawnOpts } from './spawn.js';
 
 export interface RunnerDeps {
   tmux: Tmux;
@@ -85,6 +90,61 @@ const defaultDeps = (): RunnerDeps => ({
 });
 
 const MONITOR_OWNER_FILE = '.monitor-owner';
+
+/** Environment injected only into the managed harness process. */
+export function managedFleetProxyEnv(
+  role: ResolvedRole, stateDir: string,
+): Record<string, string> {
+  return {
+    ...(role.env ?? {}),
+    [FLEET_PROXY_STATE_DIR_ENV]: stateDir,
+    [FLEET_PROXY_CALLER_ENV]: role.name,
+  };
+}
+
+/**
+ * Execute a typed proxy request in the caller's supervisor. Dynamic imports
+ * avoid a runner↔spawn initialization cycle (spawn imports runner constants).
+ */
+async function executeManagedSpawn(
+  caller: ResolvedRole, configPath: string | undefined, requested: SpawnOpts,
+  log: (line: string) => void,
+): Promise<ManagedFleetSpawnResult> {
+  const { options, inherited } = inheritCallerSpawnDefaults(caller, requested, configPath);
+  const creationActionId = randomUUID();
+  options.creationActionId = creationActionId;
+  const spawnModule = await import('./spawn.js');
+  const preview = spawnModule.spawnDryRun(options).resolvedRole;
+  const runtimeBinPath = (() => {
+    try { return realpathSync(process.argv[1]); } catch { return process.argv[1]; }
+  })();
+  let statePath: string;
+  if (options.temp) {
+    statePath = await spawnModule.spawnTemp(options, runtimeBinPath);
+  } else {
+    const { pickBackend } = await import('./supervisor/index.js');
+    const { WatchdogServiceManager } = await import('./watchdog/service.js');
+    statePath = await spawnModule.spawnPermanent(options, {
+      backend: pickBackend(), binPath: runtimeBinPath, log,
+      watchdogService: new WatchdogServiceManager(),
+    });
+  }
+  const result: ManagedFleetSpawnResult = {
+    caller: caller.name,
+    role: options.name,
+    lifetime: options.temp ? 'temporary' : 'permanent',
+    statePath,
+    harness: preview.harness,
+    session: preview.session,
+    ...(preview.model ? { model: preview.model } : {}),
+    monitor: { mode: preview.monitor.mode, interrupt: preview.monitor.interrupt },
+    inherited,
+    creationActionId,
+  };
+  log(`[${caller.name}] managed fleet proxy spawned ${result.lifetime} role ${result.role} `
+    + `harness=${result.harness} session=${result.session}`);
+  return result;
+}
 
 /**
  * Record who owns wake delivery for this run. Returning true means a fleet
@@ -491,6 +551,7 @@ export async function runOnce(
   let acpStartupComplete = false;
   let ownerChannel: OwnerChannelHandle | undefined;
   let ownerBinder: OwnerBinderLease | undefined;
+  const pendingFleetSpawnNotices: ManagedFleetSpawnResult[] = [];
   let loopManager: ScheduledLoopManagerHandle | undefined;
   let arbiter: RoleTurnArbiter | undefined;
   let reloadLoopConfig: (() => Promise<{ changed: boolean; loops: number }>) | undefined;
@@ -509,7 +570,7 @@ export async function runOnce(
       name,
       argv: wrappedArgv,
       cwd: runCwd,
-      env: { ...launch.env, ...(role.env ?? {}) },
+      env: { ...launch.env, ...managedFleetProxyEnv(role, dir) },
       stateDir: dir,
       mode,
       permissions: perms,
@@ -553,6 +614,18 @@ export async function runOnce(
       unsubscribeRecovery?.();
       throw error;
     }
+    control.setFleetSpawner(async requested => {
+      const event = await executeManagedSpawn(role, configPath, requested, deps.log);
+      if (!role.owner_channel) return event;
+      if (ownerChannel?.notifyFleetSpawn) {
+        try { await ownerChannel.notifyFleetSpawn(event); }
+        catch (error) {
+          deps.log(`[${name}] spawned-agent owner notice failed: `
+            + `${(error as Error)?.message ?? String(error)}`);
+        }
+      } else pendingFleetSpawnNotices.push(event);
+      return event;
+    });
     resolvedMonitorDeps.delivery = {
       // A wake is only delivered when its turn TERMINATES successfully. A
       // refusal or a cancellation reached the agent and was not acted on, so
@@ -636,6 +709,13 @@ export async function runOnce(
         unsubscribeRecovery?.();
         throw new Error(`[${name}] owner channel failed to start: `
           + `${(error as Error)?.message ?? String(error)}`);
+      }
+      for (const event of pendingFleetSpawnNotices.splice(0)) {
+        try { await ownerChannel.notifyFleetSpawn?.(event); }
+        catch (error) {
+          deps.log(`[${name}] deferred spawned-agent owner notice failed: `
+            + `${(error as Error)?.message ?? String(error)}`);
+        }
       }
     }
     if (ownerChannel) control.setOwnerChannel(ownerChannel);

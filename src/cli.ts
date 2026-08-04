@@ -2,7 +2,7 @@
 import { spawn as spawnChild } from 'node:child_process';
 import { existsSync, mkdirSync, readFileSync, readdirSync, statSync } from 'node:fs';
 import { realpathSync } from 'node:fs';
-import { join as joinPath } from 'node:path';
+import { join as joinPath, resolve as resolvePath } from 'node:path';
 import { createInterface } from 'node:readline';
 import { Command } from 'commander';
 import { VERSION } from './version.js';
@@ -46,6 +46,9 @@ import { startWebConsole } from './web/runtime.js';
 import { requestWebControl } from './web/control.js';
 import { WebServiceManager } from './web/service.js';
 import { WebAccessStore, passwordAccess, validatePublicOrigin } from './web/access.js';
+import {
+  FLEET_PROXY_CALLER_ENV, FLEET_PROXY_STATE_DIR_ENV, type ManagedFleetSpawnResult,
+} from './fleet-proxy.js';
 import './harness/claude-code.js';   // registers the claude-code adapter
 import './harness/codex.js';         // registers the codex adapter
 
@@ -890,7 +893,8 @@ cOpt(program.command('rm <name>').description('stop + delete state dir (+ its fl
     try { await rmRole(loadConfig(opts.configuration), name, deps()); } catch (e) { die(e); }
   });
 
-cOpt(program.command('spawn <name>').description('spawn a new agent (permanent by default)'))
+cOpt(program.command('spawn [name]').description('spawn a new agent (permanent by default)'))
+  .option('--role <name>', 'role name (alternative to the positional name)')
   .option('--temp', 'temporary: detached supervisor, auto-cleaned, gone on reboot')
   .option('--harness <id>', 'harness adapter (default: defaults.harness)')
   .option('--session <backend>', 'session backend: tmux|acp (default: defaults.session or tmux)')
@@ -918,8 +922,12 @@ cOpt(program.command('spawn <name>').description('spawn a new agent (permanent b
   .option('--json', 'with --dry-run, emit a stable secret-safe JSON result')
   .action(async (name, opts) => {
     try {
+      const roleName = String(name ?? opts.role ?? '');
+      if (!roleName) throw new Error('role name is required (positional or --role)');
+      if (name && opts.role && name !== opts.role)
+        throw new Error(`positional role '${name}' conflicts with --role '${opts.role}'`);
       const o: SpawnOpts = {
-        name, temp: opts.temp, harness: opts.harness, session: opts.session, mission: opts.mission,
+        name: roleName, temp: opts.temp, harness: opts.harness, session: opts.session, mission: opts.mission,
         missionFile: opts.missionFile,
         identity: opts.identity, cwd: opts.cwd, coordinator: opts.coordinator,
         model: opts.model,
@@ -948,12 +956,37 @@ cOpt(program.command('spawn <name>').description('spawn a new agent (permanent b
         }
         return;
       }
+      const proxyStateDir = process.env[FLEET_PROXY_STATE_DIR_ENV];
+      if (proxyStateDir) {
+        // Paths entered in the agent shell belong to that shell's cwd, not the
+        // supervisor process. Normalize before crossing the control boundary.
+        for (const key of ['missionFile', 'bioFile', 'personaFile', 'isolationFile'] as const) {
+          if (o[key]) o[key] = resolvePath(o[key]!);
+        }
+        const response = await controlRequest(
+          proxyStateDir, { command: 'fleet_spawn', spawn: o }, 10 * 60_000);
+        if (!response.ok)
+          throw new SessionControlError(response.kind ?? 'backend', response.error ?? 'managed spawn failed');
+        const result = response.result as ManagedFleetSpawnResult;
+        const expectedCaller = process.env[FLEET_PROXY_CALLER_ENV];
+        if (expectedCaller && result.caller !== expectedCaller)
+          throw new Error(`fleet proxy caller mismatch: expected '${expectedCaller}', got '${result.caller}'`);
+        console.log(`spawned ${result.lifetime} agent '${result.role}' through `
+          + `${result.caller}'s fleet proxy (state: ${result.statePath})`);
+        console.log(`  ${result.harness}/${result.session}`
+          + `${result.model ? ` model=${result.model}` : ''}; `
+          + `monitor=${result.monitor.mode} interrupt=${result.monitor.interrupt}`);
+        if (result.inherited.length)
+          console.log(`  inherited omitted defaults from ${result.caller}: ${result.inherited.join(', ')}`);
+        console.log(`→ watch it: ours-fleet peek ${result.role}   |   attach: ours-fleet attach ${result.role}`);
+        return;
+      }
       if (o.temp) {
         const dir = await spawnTemp(o, binPath);
-        console.log(`spawned temp agent '${name}' (state: ${dir}; gone on exit/reboot)`);
+        console.log(`spawned temp agent '${roleName}' (state: ${dir}; gone on exit/reboot)`);
       } else {
         const file = await spawnPermanent(o, deps());
-        console.log(`spawned '${name}' (config: ${file})`);
+        console.log(`spawned '${roleName}' (config: ${file})`);
       }
       // The same provenance that was persisted, so what the operator reads now
       // and what a reviewer reads later cannot disagree (6.6).
@@ -962,7 +995,7 @@ cOpt(program.command('spawn <name>').description('spawn a new agent (permanent b
           + `at ${lastProvenance.createdAt} (${lastProvenance.lifetime})`);
         for (const line of formatProvenance(lastProvenance)) console.log(line);
       }
-      console.log(`→ watch it: ours-fleet peek ${name}   |   attach: ours-fleet attach ${name}`);
+      console.log(`→ watch it: ours-fleet peek ${roleName}   |   attach: ours-fleet attach ${roleName}`);
     } catch (e) { die(e); }
   });
 

@@ -14,6 +14,7 @@ import {
   dispatchOwnerCommand, fleetCliOps, isOwnerCommandText,
   type OwnerCommandContext, type OwnerFleetOps,
 } from './commands.js';
+import type { ManagedFleetSpawnResult } from '../fleet-proxy.js';
 import { OursMcpClient, type OursToolClient } from './mcp.js';
 import { ownerNotices, type OwnerProgressPhase, type OwnerUpdatePhase } from './notices.js';
 import {
@@ -79,6 +80,8 @@ export interface OwnerChannelHandle {
   drain(): Promise<void>;
   close(): Promise<void>;
   manage(request: OwnerChannelManagementRequest): Promise<OwnerChannelManagementResult>;
+  /** Fleet-owned deterministic lifecycle notice; absent on legacy test doubles. */
+  notifyFleetSpawn?(event: ManagedFleetSpawnResult): Promise<void>;
 }
 
 export type OwnerChannelManagementRequest =
@@ -277,6 +280,22 @@ export class OwnerChannel implements OwnerChannelHandle {
     return run;
   }
 
+  notifyFleetSpawn(event: ManagedFleetSpawnResult): Promise<void> {
+    const run = this.managementTail.then(async () => {
+      if (!this.ready || this.stopping) throw new Error('owner-channel MCP client is unavailable');
+      const model = event.model ? `, model ${event.model}` : '';
+      const monitor = `${event.monitor.mode} monitor${event.monitor.interrupt ? ' with interruption' : ''}`;
+      const inherited = event.inherited.length
+        ? ` Supervisor inherited omitted defaults: ${event.inherited.join(', ')}.` : '';
+      await this.sendProactiveMessage(
+        `🧑‍💻 ${event.caller} spawned ${event.lifetime} agent ${event.role} `
+          + `(${event.harness}/${event.session}${model}; ${monitor}).${inherited}`,
+        `fleet-spawn\0${event.creationActionId}`, 0);
+    });
+    this.managementTail = run.then(() => undefined, () => undefined);
+    return run;
+  }
+
   private async manageNow(
     request: OwnerChannelManagementRequest,
   ): Promise<OwnerChannelManagementResult> {
@@ -453,13 +472,17 @@ export class OwnerChannel implements OwnerChannelHandle {
     return { action: request.action, requestId: request.requestId, sequence };
   }
 
-  private async sendProactiveMessage(messageValue: string): Promise<void> {
+  private async sendProactiveMessage(
+    messageValue: string, digestValue = messageValue, minIntervalMs?: number,
+  ): Promise<void> {
     if (!this.authorizationIntegrity().ok)
       throw new Error('owner authorization state is corrupt; proactive messages are disabled');
     const message = this.safeProactiveMessage(messageValue);
     const route = this.conversations.route(this.effectiveOwners());
-    const digest = createHash('sha256').update(message).digest('hex');
-    const sending = this.conversations.beginSend(route.contact, digest);
+    const digest = createHash('sha256').update(digestValue).digest('hex');
+    const sending = minIntervalMs === undefined
+      ? this.conversations.beginSend(route.contact, digest)
+      : this.conversations.beginSend(route.contact, digest, Date.now(), minIntervalMs);
     try {
       if (!this.isEffectiveOwner(route.contact))
         throw new Error('selected proactive owner is no longer authorized');
