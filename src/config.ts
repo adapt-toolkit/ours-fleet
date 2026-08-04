@@ -82,6 +82,8 @@ export interface OwnerChannelConfig {
   identity: string;
   /** Authenticated ours contact IDs allowed to issue owner instructions. */
   owners: string[];
+  /** Exact managed-agent CID whose messages may be relayed outward. */
+  agent?: string;
   /** Cancel active work before each owner request instead of queueing it. */
   interrupt: boolean;
   /** Deterministic in-progress notice interval; 0 disables progress notices. */
@@ -424,6 +426,17 @@ export function loadConfig(
   };
 }
 
+/**
+ * Canonical form of a 64-hex container ID for authorization decisions. Hex
+ * case is not identity: two casings of one CID are the same peer, so every
+ * comparison must use this form. Addressing is the opposite — the daemon's
+ * contact resolution is case-exact, so daemon-delivered forms must be sent
+ * back verbatim and never rewritten to canonical case.
+ */
+export function canonicalCid(value: string): string {
+  return /^[A-Fa-f0-9]{64}$/.test(value) ? value.toLowerCase() : value;
+}
+
 export function resolveOwnerChannelConfig(
   defaults: unknown, role: OwnerChannelConfigInput | undefined,
   session: SessionBackendId, file = 'config', name = 'role',
@@ -438,7 +451,7 @@ export function resolveOwnerChannelConfig(
     ...defaultInput,
     ...(role ?? {}),
   };
-  const allowed = ['identity', 'owners', 'interrupt', 'progress_interval_ms', 'attachments'];
+  const allowed = ['identity', 'owners', 'agent', 'interrupt', 'progress_interval_ms', 'attachments'];
   const bad = Object.keys(merged).filter(key => !allowed.includes(key));
   if (bad.length)
     throw new ConfigError(`${file}: role '${name}' owner_channel: unknown key(s) ${bad.join(', ')}`);
@@ -447,9 +460,20 @@ export function resolveOwnerChannelConfig(
   if (!Array.isArray(merged.owners) || merged.owners.length === 0
       || merged.owners.some(owner => typeof owner !== 'string' || !owner.trim()))
     throw new ConfigError(`${file}: role '${name}' owner_channel.owners must be a non-empty list of contact IDs`);
-  const owners = merged.owners.map(owner => owner.trim());
+  const owners = merged.owners.map(owner => canonicalCid(owner.trim()));
   if (new Set(owners).size !== owners.length)
     throw new ConfigError(`${file}: role '${name}' owner_channel.owners must not contain duplicates`);
+  if (merged.agent !== undefined
+      && (typeof merged.agent !== 'string' || !/^[A-Fa-f0-9]{64}$/.test(merged.agent)))
+    throw new ConfigError(
+      `${file}: role '${name}' owner_channel.agent must be exactly 64 hexadecimal characters`);
+  const agent = merged.agent === undefined ? undefined : canonicalCid(merged.agent.trim());
+  if (agent && owners.includes(agent))
+    throw new ConfigError(
+      `${file}: role '${name}' owner_channel.agent must not also be an owner CID`);
+  if (agent && owners.some(owner => !/^[A-Fa-f0-9]{64}$/.test(owner)))
+    throw new ConfigError(
+      `${file}: role '${name}' owner_channel.owners must contain exact 64-hex CIDs when agent relay is configured`);
   if (merged.interrupt !== undefined && typeof merged.interrupt !== 'boolean')
     throw new ConfigError(`${file}: role '${name}' owner_channel.interrupt must be true or false`);
   if (merged.progress_interval_ms !== undefined
@@ -506,6 +530,7 @@ export function resolveOwnerChannelConfig(
   return {
     identity: merged.identity.trim(),
     owners,
+    ...(agent ? { agent } : {}),
     interrupt: merged.interrupt ?? false,
     progress_interval_ms: merged.progress_interval_ms ?? 30_000,
     attachments: {

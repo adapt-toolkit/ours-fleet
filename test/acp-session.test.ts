@@ -21,7 +21,10 @@ afterEach(() => {
 
 async function start(
   approval: 'ask' | 'allow' | 'deny' = 'allow',
-  extra: { modeId?: string; env?: Record<string, string>; log?(line: string): void } = {},
+  extra: {
+    modeId?: string; env?: Record<string, string>; log?(line: string): void;
+    cancelGraceMs?: number;
+  } = {},
 ) {
   const stateDir = mkdtempSync(join(tmpdir(), 'ours-fleet-acp-'));
   dirs.push(stateDir);
@@ -35,7 +38,14 @@ async function start(
     permissions: { approval, filesystem: 'workspace', unattended: 'deny' },
     modeId: extra.modeId,
     log: extra.log ?? (() => {}),
+    ...(extra.cancelGraceMs !== undefined ? { cancelGraceMs: extra.cancelGraceMs } : {}),
   });
+}
+
+async function waitForRunning(session: AcpSession): Promise<void> {
+  for (let i = 0; i < 50 && !session.eventsSince(0)
+    .some(event => event.kind === 'state' && event.status === 'running'); i++)
+    await new Promise(resolve => setTimeout(resolve, 10));
 }
 
 describe('AcpSession', () => {
@@ -362,6 +372,71 @@ describe('AcpSession', () => {
       accepted: true, outcome: 'inconclusive', detail: 'startedNewTurn',
     });
     session.setControllerAttached(false);
+    await session.close();
+  });
+
+  it('escalates an ignored cancellation by restarting the adapter, failing the turn exactly once', async () => {
+    const session = await start('allow', { cancelGraceMs: 200 });
+    const queued = await session.queuePrompt('stubborn block 60000');
+    await waitForRunning(session);
+    await session.interrupt('owner');
+
+    // The adapter never honors the cancel; after the grace period the session
+    // must recover by force instead of leaving the turn (and its owner) hung.
+    const result = await queued.completion;
+    expect(result).toMatchObject({ succeeded: false, outcome: 'failed' });
+    expect(session.isAlive()).toBe(false);
+    // SIGTERM delivery is asynchronous; wait for the adapter's exit record.
+    for (let i = 0; i < 100 && session.exitResult() === null; i++)
+      await new Promise(resolve => setTimeout(resolve, 10));
+    expect(session.exitResult()).not.toBeNull();
+
+    const events = session.eventsSince(0);
+    const escalations = events.filter(event =>
+      event.kind === 'error' && event.text?.includes('ignored cancellation'));
+    expect(escalations).toHaveLength(1);
+    // The escalated turn terminates through the failure path only: no
+    // turn_stop means no second, contradictory completion was produced.
+    expect(events.filter(event => event.kind === 'turn_stop')).toHaveLength(0);
+    await session.close();
+  });
+
+  it('never escalates a cancellation the adapter honors within the grace period', async () => {
+    const session = await start('allow', { cancelGraceMs: 200 });
+    const queued = await session.queuePrompt('block 60000');
+    await waitForRunning(session);
+    await session.interrupt('owner');
+    expect(await queued.completion).toMatchObject({
+      accepted: true, outcome: 'cancelled', succeeded: false, cancellationSource: 'owner',
+    });
+
+    // Well past the grace period the adapter must still be alive and undamaged.
+    await new Promise(resolve => setTimeout(resolve, 350));
+    expect(session.isAlive()).toBe(true);
+    expect(session.eventsSince(0).some(event =>
+      event.kind === 'error' && event.text?.includes('ignored cancellation'))).toBe(false);
+    // …and fully usable: the next turn completes normally.
+    expect(await session.submitPrompt('hello')).toMatchObject({
+      succeeded: true, output: 'echo:hello',
+    });
+    await session.close();
+  });
+
+  it('an escalation armed for one turn cannot fire into a later turn', async () => {
+    const session = await start('allow', { cancelGraceMs: 200 });
+    const first = await session.queuePrompt('block 60000');
+    await waitForRunning(session);
+    await session.interrupt('owner');
+    expect((await first.completion).outcome).toBe('cancelled');
+
+    // A new turn starts after the cancelled one; the old grace timer must not
+    // kill the adapter out from under it.
+    const second = session.submitPrompt('block 300');
+    await new Promise(resolve => setTimeout(resolve, 250));
+    expect(session.isAlive()).toBe(true);
+    expect(await second).toMatchObject({ succeeded: true });
+    expect(session.eventsSince(0).some(event =>
+      event.kind === 'error' && event.text?.includes('ignored cancellation'))).toBe(false);
     await session.close();
   });
 

@@ -129,13 +129,17 @@ describe('generateBriefing', () => {
       session: 'acp',
       owner_channel: {
         identity: 'Alice-owner', owners: ['owner-cid'], interrupt: false,
+        agent: 'A'.repeat(64),
         progress_interval_ms: 30_000,
       },
     }, vocab, opts);
     expect(b).toContain('separate **Alice-owner** owner-channel identity');
     expect(b).toContain('never bind or switch to it');
     expect(b).toContain('[fleet-owner]');
-    expect(b).toContain('do **not** call');
+    expect(b).toContain('For any non-final owner message');
+    expect(b).toContain('contact **Alice-owner**');
+    expect(b).toContain('Do not include a task/request ID');
+    expect(b).toContain('deterministically routes that final response');
     expect(b).toContain('[fleet-monitor]');
     expect(b).toContain('untrusted peer');
     expect(b).toContain('send_message');

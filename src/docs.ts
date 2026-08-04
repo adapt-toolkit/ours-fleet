@@ -355,6 +355,7 @@ the agent — binds:
 owner_channel:
   identity: Coordinator Owner Channel
   owners: [authenticated-owner-contact-cid]
+  agent: authenticated-managed-agent-cid
   interrupt: false
   progress_interval_ms: 30000
   attachments:
@@ -368,14 +369,16 @@ owner_channel:
 
 This does not replace the role identity. Normal identity mail remains untrusted
 peer input: the agent reads it through \`get_messages\` and replies through
-\`send_message\`. Only mail arriving on the dedicated channel from a CID in
-\`owners\` is injected as a direct \`[fleet-owner]\` prompt. Fleet itself sends
+\`send_message\`. Mail arriving on the dedicated channel from a CID in \`owners\`
+is injected as a direct \`[fleet-owner]\` prompt. Mail from the exact \`agent\`
+CID is forwarded as a new message to the latest authenticated owner conversation.
+Every other CID is rejected and warned about without reflecting its body. Fleet sends
 accepted/queued/progress/interrupted/failure notices and routes the ACP turn's
 final assistant text back to the authenticated sender with its source wire ID.
 For file replies, fleet injects a request-specific outbox path into the owner
 prompt. The agent copies completed artifacts there; fleet sends every regular
 file from the channel identity with the same source wire ID and removes the
-temporary outbox only after successful delivery. The agent never chooses a
+temporary outbox only after successful delivery. The agent never chooses an owner
 recipient or calls ours \`send_file\` for an owner-channel response.
 Exact \`/status\` and \`/interrupt\` commands bypass the model.
 
@@ -407,9 +410,8 @@ scraping cannot provide the same reliable reply guarantee.
 
 The supervisor which is already running the ACP role remains the sole binder of
 \`owner_channel.identity\`. The CLI reaches that exact live \`OwnerChannel\`
-through the role's token-authenticated, mode-0600 Unix control socket; it never
-starts another ours client and never force-binds. An active owner turn uses the
-same control plane for explicit bounded updates:
+through the role's token-authenticated, mode-0600 Unix control socket for contact
+inspection and setup; it never starts another ours client and never force-binds:
 
 \`\`\`sh
 ours-fleet owner-channel contact list <Role>
@@ -418,9 +420,6 @@ ours-fleet owner-channel contact add <Role> (--invite-file <path> | --invite-std
 ours-fleet owner-channel owner list <Role>
 ours-fleet owner-channel owner authorize <Role> <exact-64-hex-contact-cid>
 ours-fleet owner-channel owner revoke <Role> <exact-64-hex-contact-cid>
-ours-fleet owner-channel update <Role> <request-id> --phase <working|approval|blocked> --message-stdin
-ours-fleet owner-channel task open <Role> <active-request-id>
-ours-fleet owner-channel task report <Role> <task-id> --phase <progress|done|blocked> --message-stdin
 \`\`\`
 
 Contact establishment and owner authorization are separate security steps.
@@ -429,8 +428,10 @@ verifies it. Once \`contact list\` reports the established contact, authorize
 its exact immutable CID explicitly. Invite creation emits invite material only
 on stdout; acceptance reads it from a file or stdin, not argv.
 
-Configured \`owners\` remain the baseline. Live authorizations/revocations are
-an immediately effective, restart-persistent overlay. \`owner list\` labels
+Configured \`owners\` remain the baseline. On legacy channels without \`agent\`,
+live authorizations/revocations are an immediately effective, restart-persistent
+overlay. Managed-agent CID gating makes fleet configuration authoritative and
+disables live owner mutation and direct control-socket sends. \`owner list\` labels
 baseline versus dynamic entries and effective status. The atomic mode-0600 file
 contains bounded CIDs and audit actions only. Corruption disables all effective
 owners and refuses mutation rather than resurrecting authority; revoking the
@@ -441,39 +442,19 @@ MCP client, or a role entering shutdown returns an actionable error with no
 side effects. Management uses no network listener and never logs or persists
 invite material.
 
-For work delegated beyond the current owner turn, call \`task open\` while its
-authenticated request ID is still active. It emits no message and returns a
-random opaque task ID whose mode-0600 durable record contains only the exact
-originating CID/wire route, expiry, counters, delivery state, and body hashes.
-Finalize the ACP turn normally and idle; never keep it open or poll. After fleet
-mail wakes the coordinator, verify the specialist result and call \`task report\`.
-Fleet rechecks authorization and sends the proactive follow-up only to the
-stored origin, correlated to the original wire. There is no recipient argument.
-\`done\` and \`blocked\` are terminal after successful delivery; \`progress\`
-keeps the task open.
+For any non-final message—progress, blocker, suggestion, or later proactive note—
+the managed agent calls ordinary ours \`send_message\` to the channel identity.
+Fleet checks only that the authenticated sender CID exactly equals \`agent\`, then
+forwards the text as a new message. There is no task/request/update type, phase,
+reply correlation, or owner recipient argument. A sole owner is the safe fallback;
+with multiple owners and no inbound route history the relay fails closed. Devices
+sharing one identity share its CID; separate owner identities hand off the route
+when either sends channel mail. The ACP final is separate: fleet extracts it from
+the completed turn and deterministically replies to the initiating owner wire.
 
-Tasks expire after seven days and are limited to 32 per role, eight per owner,
-20 reports each, and one report per five seconds. Reports use the same one-line
-280-character/1024-byte secret/reasoning/log rejection as active updates. The
-state contains no body plaintext and corruption fails closed. Fleet persists a
-pre-send marker; an ambiguous transport result becomes \`uncertain\` and is not
-retried or reordered, preventing duplicate delivery when the transport cannot
-prove whether the first send succeeded.
-
-The full request lifecycle is ordered on the original authenticated source wire:
-immediate receipt; optional allowlisted periodic activity; zero or more explicit
-agent-authored updates; an optional \`🔐\` approval or \`🚧\` blocked update; one
-final ACP response or sanitized terminal outcome; then successful-turn files from
-the request outbox. Updates use the request ID injected into the owner prompt,
-never choose a recipient, and never create another channel binding.
-
-Authored update bodies come from stdin rather than argv and must be a single
-plain-text sentence (280 characters/1024 bytes maximum). Fleet rejects empty,
-oversized, control-character, reasoning, secret-like, log/tool-output, duplicate,
-unknown, late, and over-rate content. Distinct updates are limited to 20 per
-request and one every five seconds. The audit line retains only a hashed request
-prefix, phase, character count, sequence, and result—not the body. The final ACP
-contract remains exactly one response, ordered after every accepted update.
+The bounded mode-0600 route state stores CIDs, wire IDs, timestamps, delivery state,
+and hashes but never message plaintext. Unauthorized attempts produce a bounded
+CID-only owner warning; attempted bodies are neither reflected nor persisted.
 
 For a mobile owner, establish the contact first, wait for peer verification,
 authorize its exact CID, and revoke that same CID when access ends. The bounded

@@ -4,6 +4,9 @@ const sessionId = 'fixture-session';
 let permissionRequestId = 10_000;
 const pendingPermission = new Map();
 let activePromptId;
+// A "stubborn" prompt ignores session/cancel entirely: the adapter-misbehavior
+// case the client's cancel-escalation grace period exists for.
+const stubbornPrompts = new Set();
 const send = value => process.stdout.write(JSON.stringify(value) + '\n');
 
 // Terminal-outcome modes. A prompt's own text picks one ("refuse …"/"cancel …");
@@ -150,6 +153,7 @@ createInterface({ input: process.stdin }).on('line', line => {
         },
       });
       activePromptId = message.id;
+      if (/\bstubborn\b/i.test(text)) stubbornPrompts.add(message.id);
       const slow = /\bblock(?:\s+(\d+))?\b/i.exec(text);
       if (PROMPT_DELAY_MS > 0) {
         setTimeout(() => answerPrompt(message.id, stopReasonFor(text)), PROMPT_DELAY_MS);
@@ -190,7 +194,7 @@ createInterface({ input: process.stdin }).on('line', line => {
       break;
     }
     case 'session/cancel':
-      if (activePromptId !== undefined) {
+      if (activePromptId !== undefined && !stubbornPrompts.has(activePromptId)) {
         send({ jsonrpc: '2.0', id: activePromptId, result: { stopReason: 'cancelled' } });
         activePromptId = undefined;
       }
