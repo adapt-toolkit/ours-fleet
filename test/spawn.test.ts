@@ -465,6 +465,18 @@ describe('identity is established before launch (7.3)', () => {
       { identityProvisioner: provisioner(true) });
     expect(readFileSync(join(d, 'briefing.md'), 'utf8')).toContain('verified to exist');
   });
+
+  it('a temp spawn writes lifecycle-compatible identity bootstrap instructions', async () => {
+    const d = await spawnTemp(
+      { name: 'TempCompat', identity: 'ExplicitTempIdentity' },
+      '/b/ours-fleet', () => {}, { identityProvisioner: provisioner(false) });
+    const briefing = readFileSync(join(d, 'briefing.md'), 'utf8');
+    expect(briefing).toContain('a temporary agent');
+    expect(briefing).toContain('create_temporary_identity');
+    expect(briefing).toContain('name "ExplicitTempIdentity"');
+    expect(briefing).toContain('older server');
+    expect(briefing).toContain('connector owns its cleanup');
+  });
 });
 
 describe('every failed creation stage rolls back (6.2)', () => {
