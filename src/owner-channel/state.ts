@@ -2,6 +2,10 @@ import { chmodSync, existsSync, mkdirSync, readFileSync, renameSync, writeFileSy
 import { randomBytes } from 'node:crypto';
 import { dirname } from 'node:path';
 import { replaceFileAtomically } from '../atomic-file.js';
+import { canonicalCid } from '../config.js';
+
+/** A send whose (dedupe-scoped) digest was already recorded: it must not repeat. */
+export class DuplicateSendError extends Error {}
 
 interface ChannelState { version: 1; handled: string[] }
 
@@ -131,9 +135,11 @@ export class OwnerConversationState {
 
   remove(contact: string): void {
     this.assertHealthy();
-    if (!this.conversations.some(record => record.contact === contact)) return;
+    const canonical = canonicalCid(contact);
+    if (!this.conversations.some(record => canonicalCid(record.contact) === canonical)) return;
     this.mutate(() => {
-      this.conversations = this.conversations.filter(record => record.contact !== contact);
+      this.conversations = this.conversations.filter(
+        record => canonicalCid(record.contact) !== canonical);
     });
   }
 
@@ -141,27 +147,37 @@ export class OwnerConversationState {
     contact: string; basis: OwnerConversationRouteBasis;
   } {
     this.assertHealthy();
-    const candidates = this.conversations.filter(record => effective.has(record.contact))
+    // Membership is decided canonically (hex case is not identity); the
+    // returned contact keeps its stored form, which the daemon can route.
+    const canonical = new Set([...effective].map(canonicalCid));
+    const candidates = this.conversations
+      .filter(record => canonical.has(canonicalCid(record.contact)))
       .sort((a, b) => b.lastInboundAt - a.lastInboundAt);
     if (candidates.length) {
       if (candidates[1]?.lastInboundAt === candidates[0].lastInboundAt)
         throw new Error('proactive owner route is ambiguous');
       return { contact: candidates[0].contact, basis: 'last-inbound' };
     }
-    if (effective.size === 1)
+    if (canonical.size === 1)
       return { contact: [...effective][0], basis: 'sole-owner' };
     throw new Error('no authenticated owner conversation route is available yet');
   }
 
   beginSend(
     contact: string, digest: string, now = Date.now(), minIntervalMs = PROACTIVE_MIN_INTERVAL_MS,
+    dedupe: 'contact' | 'all' = 'contact',
   ): OwnerProactiveSend {
     this.assertHealthy();
     if (!CID.test(contact) || !HEX_64_LOWER.test(digest))
       throw new Error('proactive owner send metadata is invalid');
-    const recent = this.sends.filter(send => send.contact === contact).slice(-128);
-    if (recent.some(send => send.digest === digest))
-      throw new Error('duplicate proactive owner message refused');
+    const canonical = canonicalCid(contact);
+    const recent = this.sends.filter(
+      send => canonicalCid(send.contact) === canonical).slice(-128);
+    // 'all' scope serves wire-keyed idempotency: a crash replay must not
+    // deliver the same wire to a second owner after the route moved.
+    const scope = dedupe === 'all' ? this.sends.slice(-128) : recent;
+    if (scope.some(send => send.digest === digest))
+      throw new DuplicateSendError('duplicate proactive owner message refused');
     const last = recent.at(-1);
     if (last && now - last.at < minIntervalMs)
       throw new Error(`proactive owner messages are rate-limited to one every ${minIntervalMs}ms`);
@@ -272,9 +288,11 @@ export class OwnerAuthorizationState {
       this.added = new Set(raw.added);
       this.revoked = new Set(raw.revoked);
       this.audit = raw.audit as OwnerAuditEntry[];
-      if (this.added.size !== raw.added.length || this.revoked.size !== raw.revoked.length)
+      if (new Set(raw.added.map(canonicalCid)).size !== raw.added.length
+          || new Set(raw.revoked.map(canonicalCid)).size !== raw.revoked.length)
         throw new Error('duplicate overlay CID');
-      if ([...this.added].some(cid => this.revoked.has(cid)))
+      const revokedCanonical = new Set([...this.revoked].map(canonicalCid));
+      if ([...this.added].some(cid => revokedCanonical.has(canonicalCid(cid))))
         throw new Error('CID appears in both added and revoked overlays');
       chmodSync(path, 0o600);
     } catch {
@@ -292,48 +310,76 @@ export class OwnerAuthorizationState {
 
   effective(): Set<string> {
     if (this.corruptReason) return new Set();
+    // Stored forms stay verbatim (the daemon routes them case-exactly); the
+    // revocation check is canonical so a casing change can never resurrect a
+    // revoked owner.
+    const revoked = new Set([...this.revoked].map(canonicalCid));
     const effective = new Set([...this.baseline, ...this.added]);
-    for (const cid of this.revoked) effective.delete(cid);
+    for (const cid of [...effective])
+      if (revoked.has(canonicalCid(cid))) effective.delete(cid);
     return effective;
   }
 
   entries(): OwnerEntry[] {
-    const effective = this.effective();
-    return [...new Set([...this.baseline, ...this.added, ...this.revoked])]
-      .sort().map(cid => ({
-        cid,
-        source: this.baseline.has(cid) ? 'baseline' : 'dynamic',
-        effective: effective.has(cid),
-      }));
+    const effective = new Set([...this.effective()].map(canonicalCid));
+    const seen = new Set<string>();
+    const all: string[] = [];
+    for (const cid of [...this.baseline, ...this.added, ...this.revoked]) {
+      if (seen.has(canonicalCid(cid))) continue;
+      seen.add(canonicalCid(cid));
+      all.push(cid);
+    }
+    return all.sort().map(cid => ({
+      cid,
+      source: this.inBaseline(cid) ? 'baseline' : 'dynamic',
+      effective: effective.has(canonicalCid(cid)),
+    }));
   }
 
   authorize(cid: string): OwnerEntry {
     this.assertHealthy();
-    if (this.effective().has(cid)) throw new Error(`owner '${cid}' is already authorized`);
+    if (this.hasCanonical(this.effective(), cid))
+      throw new Error(`owner '${cid}' is already authorized`);
     const rollback = this.snapshot();
-    if (this.baseline.has(cid)) this.revoked.delete(cid);
+    if (this.inBaseline(cid)) this.deleteCanonical(this.revoked, cid);
     else {
       if (this.added.size + this.revoked.size >= MAX_OVERLAY_CIDS)
         throw new Error(`owner authorization overlay is limited to ${MAX_OVERLAY_CIDS} CIDs`);
       this.added.add(cid);
-      this.revoked.delete(cid);
+      this.deleteCanonical(this.revoked, cid);
     }
     this.record('authorize', cid);
     try { this.persist(); } catch (error) { this.restore(rollback); throw error; }
-    return { cid, source: this.baseline.has(cid) ? 'baseline' : 'dynamic', effective: true };
+    return { cid, source: this.inBaseline(cid) ? 'baseline' : 'dynamic', effective: true };
   }
 
   revoke(cid: string): OwnerEntry {
     this.assertHealthy();
     const effective = this.effective();
-    if (!effective.has(cid)) throw new Error(`owner '${cid}' is not authorized`);
-    if (effective.size === 1) throw new Error('refusing to revoke the last effective owner');
+    if (!this.hasCanonical(effective, cid)) throw new Error(`owner '${cid}' is not authorized`);
+    if (new Set([...effective].map(canonicalCid)).size === 1)
+      throw new Error('refusing to revoke the last effective owner');
     const rollback = this.snapshot();
-    if (this.baseline.has(cid)) this.revoked.add(cid);
-    else this.added.delete(cid);
+    if (this.inBaseline(cid)) this.revoked.add(cid);
+    else this.deleteCanonical(this.added, cid);
     this.record('revoke', cid);
     try { this.persist(); } catch (error) { this.restore(rollback); throw error; }
-    return { cid, source: this.baseline.has(cid) ? 'baseline' : 'dynamic', effective: false };
+    return { cid, source: this.inBaseline(cid) ? 'baseline' : 'dynamic', effective: false };
+  }
+
+  private inBaseline(cid: string): boolean {
+    return this.hasCanonical(this.baseline, cid);
+  }
+
+  private hasCanonical(set: Set<string>, cid: string): boolean {
+    const canonical = canonicalCid(cid);
+    for (const member of set) if (canonicalCid(member) === canonical) return true;
+    return false;
+  }
+
+  private deleteCanonical(set: Set<string>, cid: string): void {
+    const canonical = canonicalCid(cid);
+    for (const member of [...set]) if (canonicalCid(member) === canonical) set.delete(member);
   }
 
   private assertHealthy(): void {

@@ -49,6 +49,21 @@ describe('OwnerAuthorizationState', () => {
     expect(readFileSync(path, 'utf8')).not.toContain('invite');
   });
 
+  it('canonicalizes hex case in authorization decisions so casing cannot bypass revocation', () => {
+    const upper = 'AB'.repeat(32);
+    const lower = upper.toLowerCase();
+    const { path, state } = setup([lower, B]);
+    // A case variant of an effective owner is the same owner, not a new one.
+    expect(() => state.authorize(upper)).toThrow(/already authorized/);
+    // Revoking by a different casing must still revoke the canonical owner.
+    state.revoke(upper);
+    expect([...state.effective()].map(cid => cid.toLowerCase())).not.toContain(lower);
+    expect(() => state.revoke(lower)).toThrow(/not authorized/);
+    // A persisted revocation keeps applying when the configured casing changes.
+    const restarted = new OwnerAuthorizationState(path, [upper, B]);
+    expect([...restarted.effective()].map(cid => cid.toLowerCase())).not.toContain(lower);
+  });
+
   it('protects the last effective owner, including a dynamic-only owner', () => {
     const first = setup([A]).state;
     expect(() => first.revoke(A)).toThrow(/last effective owner/);

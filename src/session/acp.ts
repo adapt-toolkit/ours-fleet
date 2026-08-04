@@ -34,6 +34,8 @@ export interface AcpSessionOptions {
   mode: 'fresh' | 'resume';
   permissions: CommonPermissions;
   log(line: string): void;
+  /** Test seam for the cancel-escalation grace period; production uses the default. */
+  cancelGraceMs?: number;
 }
 
 /**
@@ -220,7 +222,7 @@ export class AcpSession implements SessionHandle {
         this.options.log(`[${this.options.name}] ${this.lastError}`);
         this.events.emit('error', { turnId, origin: active.origin, text: this.lastError });
         this.child.kill('SIGTERM');
-      }, CANCEL_SETTLE_GRACE_MS);
+      }, this.options.cancelGraceMs ?? CANCEL_SETTLE_GRACE_MS);
       this.cancelEscalation.unref?.();
     }
     for (const pending of this.pendingPermissions.values())

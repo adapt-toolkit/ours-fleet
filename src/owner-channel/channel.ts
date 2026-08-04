@@ -5,13 +5,14 @@ import { createInterface } from 'node:readline';
 import { join } from 'node:path';
 
 import {
-  DEFAULT_OWNER_ATTACHMENT_MIME, type OwnerAttachmentConfig, type OwnerChannelConfig,
+  DEFAULT_OWNER_ATTACHMENT_MIME, canonicalCid,
+  type OwnerAttachmentConfig, type OwnerChannelConfig,
 } from '../config.js';
 import type { QueuedPrompt, SessionEvent, SessionHandle, TurnResult } from '../session/types.js';
 import { OursMcpClient, type OursToolClient } from './mcp.js';
 import { ownerNotices, type OwnerProgressPhase, type OwnerUpdatePhase } from './notices.js';
 import {
-  OwnerAuthorizationState, OwnerChannelState, OwnerConversationState,
+  DuplicateSendError, OwnerAuthorizationState, OwnerChannelState, OwnerConversationState,
   type OwnerEntry,
 } from './state.js';
 import {
@@ -110,6 +111,10 @@ const OWNER_UPDATE_MAX_CHARS = 280;
 const OWNER_UPDATE_MAX_BYTES = 1_024;
 const PROACTIVE_MESSAGE_MAX_CHARS = 4_000;
 const PROACTIVE_MESSAGE_MAX_BYTES = 16_384;
+const RELAY_NACK_MEMORY = 512;
+
+/** A relay attempt that failed only because no owner route exists yet. */
+class RelayUnroutableError extends Error {}
 
 /**
  * Fleet-owned trusted ingress. The agent never binds this identity and never
@@ -129,6 +134,8 @@ export class OwnerChannel implements OwnerChannelHandle {
    * (a crash must replay them) but must not be queued twice while live.
    */
   private readonly inFlight = new Set<string>();
+  /** Wires already NACKed to the managed agent, so a deferred replay stays quiet. */
+  private readonly relayNacks = new Set<string>();
   private stopping = false;
   private watchProcess?: ChildProcessWithoutNullStreams;
   private watchTask?: Promise<void>;
@@ -261,7 +268,7 @@ export class OwnerChannel implements OwnerChannelHandle {
         if (this.authorizations.effective().has(request.cid))
           throw new Error(`owner '${request.cid}' is already authorized`);
         const contacts = await this.contacts();
-        if (!contacts.some(contact => contact.cid === request.cid
+        if (!contacts.some(contact => canonicalCid(contact.cid) === canonicalCid(request.cid)
           && ['established', 'active', 'connected'].includes(contact.status.toLowerCase())))
           throw new Error(`cannot authorize unknown or pending contact CID '${request.cid}'`);
         return { action: request.action, owner: this.authorizations.authorize(request.cid) };
@@ -386,9 +393,9 @@ export class OwnerChannel implements OwnerChannelHandle {
     const digest = createHash('sha256').update(message).digest('hex');
     const sending = this.conversations.beginSend(route.contact, digest);
     try {
-      if (!this.effectiveOwners().has(route.contact))
+      if (!this.isEffectiveOwner(route.contact))
         throw new Error('selected proactive owner is no longer authorized');
-      await this.send(route.contact, message);
+      await this.send(await this.routableContact(route), message);
     } catch {
       try { this.conversations.finishSend(sending.id, 'uncertain'); }
       catch (error) { this.logError('proactive owner uncertainty persist failed', error); }
@@ -406,7 +413,7 @@ export class OwnerChannel implements OwnerChannelHandle {
     const active = this.activeRequests.get(requestId);
     if (!active || active.finalizing)
       throw new Error('owner task can be opened only for a currently active owner request');
-    if (!this.authorizations.effective().has(active.contact))
+    if (!this.isEffectiveOwner(active.contact))
       throw new Error('originating owner is no longer authorized');
     const task = this.tasks.open({
       requestId, contact: active.contact, wireId: active.wireId,
@@ -428,7 +435,7 @@ export class OwnerChannel implements OwnerChannelHandle {
       throw new Error('owner task reports are allowed only after the originating request has finalized');
     if (!this.authorizations.integrity().ok)
       throw new Error('owner authorization state is corrupt; proactive reports are disabled');
-    if (!this.authorizations.effective().has(task.contact)) {
+    if (!this.isEffectiveOwner(task.contact)) {
       this.tasks.revoke(task.contact, now);
       throw new Error('originating owner is no longer authorized; task revoked');
     }
@@ -605,7 +612,7 @@ export class OwnerChannel implements OwnerChannelHandle {
     if (handledWireIds.some(wire => this.inFlight.has(wire))) return false;
     const sender = { id: group.files[0].senderId, name: group.files[0].senderName };
     if (group.files.some(file => file.senderId !== sender.id)
-        || !this.effectiveOwners().has(sender.id)) {
+        || !this.isEffectiveOwner(sender.id)) {
       this.options.log(
         `[${this.options.role}] owner channel ignored unauthorized attachment sender ${sender.id}`);
       for (const wire of handledWireIds) this.state.remember(wire);
@@ -706,13 +713,32 @@ export class OwnerChannel implements OwnerChannelHandle {
     const wireId = this.wireId(message);
     if (!wireId || this.state.has(wireId) || this.inFlight.has(wireId)) return false;
     const sender = this.sender(message);
-    if (sender.id === this.options.config.agent) {
-      try { await this.relayManagedAgentMessage(message, wireId); }
-      catch (error) { this.logError('managed-agent message relay refused', error); }
+    if (this.isAgentSender(sender.id)) {
+      try {
+        await this.relayManagedAgentMessage(message, wireId);
+      } catch (error) {
+        if (error instanceof DuplicateSendError) {
+          // A crash replay of a wire that already reached an owner. Consuming
+          // it silently IS the correct outcome; delivering again is the bug.
+          this.options.log(`[${this.options.role}] managed-agent relay replay of a delivered wire consumed`);
+        } else if (error instanceof RelayUnroutableError) {
+          // No owner route exists yet. Leave the wire deferred and unconsumed
+          // so the daemon replays it after the first owner contact, and tell
+          // the authenticated agent once so the wait is never silent.
+          this.options.log(`[${this.options.role}] owner channel managed-agent relay has no owner `
+            + `route yet; message stays queued: ${this.errorText(error)}`);
+          await this.nackManagedAgent(sender.id, message, wireId, ownerNotices.relayQueued());
+          return false;
+        } else {
+          this.logError('managed-agent message relay refused', error);
+          await this.nackManagedAgent(
+            sender.id, message, wireId, ownerNotices.relayRefused(this.errorText(error)));
+        }
+      }
       this.state.remember(wireId);
       return true;
     }
-    if (!this.effectiveOwners().has(sender.id)) {
+    if (!this.isEffectiveOwner(sender.id)) {
       // Never answer the sender or reflect its body. Notify an owner through the
       // bounded proactive route, then consume the attempt so it cannot replay.
       this.options.log(
@@ -805,23 +831,41 @@ export class OwnerChannel implements OwnerChannelHandle {
   }
 
   private acceptedSender(cid: string): boolean {
-    return cid === this.options.config.agent || this.effectiveOwners().has(cid);
+    return this.isAgentSender(cid) || this.isEffectiveOwner(cid);
+  }
+
+  private isAgentSender(cid: string): boolean {
+    const agent = this.options.config.agent;
+    return agent !== undefined && cid !== '' && canonicalCid(cid) === canonicalCid(agent);
+  }
+
+  private isEffectiveOwner(cid: string): boolean {
+    const canonical = canonicalCid(cid);
+    for (const owner of this.effectiveOwners())
+      if (canonicalCid(owner) === canonical) return true;
+    return false;
   }
 
   private async relayManagedAgentMessage(message: InboundMessage, wireId: string): Promise<void> {
     if (!this.authorizationIntegrity().ok)
       throw new Error('owner authorization state is corrupt; managed-agent relay is disabled');
     const text = this.safeRelayMessage(message.text);
-    const route = this.conversations.route(this.effectiveOwners());
+    let route: { contact: string; basis: string };
+    try {
+      route = this.conversations.route(this.effectiveOwners());
+    } catch (error) {
+      throw new RelayUnroutableError(this.errorText(error));
+    }
     // The inbound wire—not its body—is the idempotency key. Repeating the same
     // wording in two deliberate messages remains valid, while crash replay of
-    // one message cannot produce two owner deliveries.
+    // one message cannot produce two owner deliveries — to ANY owner, which is
+    // why the wire digest is checked across every recorded send.
     const digest = createHash('sha256').update(`managed-agent-relay\0${wireId}`).digest('hex');
-    const sending = this.conversations.beginSend(route.contact, digest, Date.now(), 0);
+    const sending = this.conversations.beginSend(route.contact, digest, Date.now(), 0, 'all');
     try {
-      if (!this.effectiveOwners().has(route.contact))
+      if (!this.isEffectiveOwner(route.contact))
         throw new Error('selected relay owner is no longer authorized');
-      await this.send(route.contact, text);
+      await this.send(await this.routableContact(route), text);
     } catch {
       try { this.conversations.finishSend(sending.id, 'uncertain'); }
       catch (error) { this.logError('managed-agent relay uncertainty persist failed', error); }
@@ -831,6 +875,41 @@ export class OwnerChannel implements OwnerChannelHandle {
     this.options.log(`[${this.options.role}] managed-agent message relayed `
       + `wire=${createHash('sha256').update(wireId).digest('hex').slice(0, 12)} `
       + `basis=${route.basis} chars=${Array.from(text).length} bytes=${Buffer.byteLength(text)}`);
+  }
+
+  /**
+   * One bounded NACK per wire: an unroutable or refused relay must be visible
+   * to the authenticated agent, while its deferred replays stay quiet. NACK
+   * delivery is best-effort — it must never make the failure worse.
+   */
+  private async nackManagedAgent(
+    contact: string, message: InboundMessage, wireId: string, notice: string,
+  ): Promise<void> {
+    if (this.relayNacks.has(wireId)) return;
+    this.relayNacks.add(wireId);
+    if (this.relayNacks.size > RELAY_NACK_MEMORY)
+      this.relayNacks.delete(this.relayNacks.values().next().value as string);
+    try {
+      await this.send(contact, notice, message.wire_id ? wireId : undefined);
+    } catch (error) {
+      this.logError('managed-agent relay NACK delivery failed', error);
+    }
+  }
+
+  /**
+   * Daemon contact resolution is case-exact, so a canonical config CID picked
+   * by the sole-owner fallback is translated to the daemon-known contact form
+   * when one exists. Last-inbound routes already carry the daemon form.
+   */
+  private async routableContact(route: { contact: string; basis: string }): Promise<string> {
+    if (route.basis !== 'sole-owner') return route.contact;
+    try {
+      const canonical = canonicalCid(route.contact);
+      const match = (await this.contacts()).find(entry => canonicalCid(entry.cid) === canonical);
+      return match?.cid ?? route.contact;
+    } catch {
+      return route.contact;
+    }
   }
 
   private safeRelayMessage(value: unknown): string {
