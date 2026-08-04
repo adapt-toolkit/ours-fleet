@@ -38,12 +38,18 @@ export class OwnerChannelState {
   }
 }
 
-export type OwnerConversationRouteBasis = 'last-inbound' | 'sole-owner';
+export type OwnerConversationRouteBasis = 'last-inbound' | 'sole-owner' | 'source-wire';
 
 interface OwnerConversationRecord {
   contact: string;
   lastInboundAt: number;
   lastInboundWireId: string;
+}
+
+interface OwnerWireRoute {
+  contact: string;
+  wireId: string;
+  at: number;
 }
 
 interface OwnerProactiveSend {
@@ -55,12 +61,14 @@ interface OwnerProactiveSend {
 }
 
 interface OwnerConversationFile {
-  version: 1;
+  version: 2;
   conversations: OwnerConversationRecord[];
+  routes: OwnerWireRoute[];
   sends: OwnerProactiveSend[];
 }
 
 const CONVERSATION_LIMIT = 64;
+const WIRE_ROUTE_LIMIT = 512;
 const PROACTIVE_SEND_LIMIT = 256;
 const PROACTIVE_MIN_INTERVAL_MS = 30_000;
 const HEX_64_LOWER = /^[a-f0-9]{64}$/;
@@ -74,25 +82,42 @@ const CID = /^[A-Fa-f0-9]{64}$/;
  */
 export class OwnerConversationState {
   private conversations: OwnerConversationRecord[] = [];
+  private routes: OwnerWireRoute[] = [];
   private sends: OwnerProactiveSend[] = [];
   private corruptReason?: string;
 
   constructor(private readonly path: string) {
     if (!existsSync(path)) return;
     try {
-      const raw = JSON.parse(readFileSync(path, 'utf8')) as Partial<OwnerConversationFile>;
-      if (raw.version !== 1 || !Array.isArray(raw.conversations) || !Array.isArray(raw.sends)
+      const raw = JSON.parse(readFileSync(path, 'utf8')) as {
+        version?: number;
+        conversations?: OwnerConversationRecord[];
+        routes?: OwnerWireRoute[];
+        sends?: OwnerProactiveSend[];
+      };
+      const legacy = raw.version === 1;
+      const routes = legacy
+        ? (raw.conversations ?? []).map(record => ({
+          contact: record.contact, wireId: record.lastInboundWireId, at: record.lastInboundAt,
+        }))
+        : raw.routes;
+      if (![1, 2].includes(raw.version ?? 0)
+          || !Array.isArray(raw.conversations) || !Array.isArray(routes) || !Array.isArray(raw.sends)
           || raw.conversations.length > CONVERSATION_LIMIT
+          || routes.length > WIRE_ROUTE_LIMIT
           || raw.sends.length > PROACTIVE_SEND_LIMIT
           || !raw.conversations.every(record => this.validConversation(record))
+          || !routes.every(route => this.validRoute(route))
           || !raw.sends.every(send => this.validSend(send)))
         throw new Error('invalid or unbounded conversation state');
       if (new Set(raw.conversations.map(record => record.contact)).size !== raw.conversations.length
+          || new Set(routes.map(route => route.wireId)).size !== routes.length
           || new Set(raw.sends.map(send => send.id)).size !== raw.sends.length)
         throw new Error('duplicate conversation state entry');
       this.conversations = raw.conversations.map(record => ({ ...record }));
+      this.routes = routes.map(route => ({ ...route }));
       this.sends = raw.sends.map(send => ({ ...send }));
-      let recovered = false;
+      let recovered = legacy;
       for (const send of this.sends) {
         if (send.status === 'sending') { send.status = 'uncertain'; recovered = true; }
       }
@@ -101,6 +126,7 @@ export class OwnerConversationState {
     } catch {
       this.corruptReason = 'invalid persisted owner conversation state';
       this.conversations = [];
+      this.routes = [];
       this.sends = [];
       try { chmodSync(path, 0o600); } catch { /* remain fail-closed */ }
     }
@@ -130,6 +156,9 @@ export class OwnerConversationState {
           throw new Error(`owner conversations are limited to ${CONVERSATION_LIMIT}`);
         this.conversations.push({ contact, lastInboundAt: acceptedAt, lastInboundWireId: wireId });
       }
+      this.routes = this.routes.filter(route => route.wireId !== wireId);
+      this.routes.push({ contact, wireId, at: acceptedAt });
+      this.routes = this.routes.slice(-WIRE_ROUTE_LIMIT);
     });
   }
 
@@ -140,6 +169,7 @@ export class OwnerConversationState {
     this.mutate(() => {
       this.conversations = this.conversations.filter(
         record => canonicalCid(record.contact) !== canonical);
+      this.routes = this.routes.filter(route => canonicalCid(route.contact) !== canonical);
     });
   }
 
@@ -161,6 +191,17 @@ export class OwnerConversationState {
     if (canonical.size === 1)
       return { contact: [...effective][0], basis: 'sole-owner' };
     throw new Error('no authenticated owner conversation route is available yet');
+  }
+
+  routeForWire(wireId: string, effective: Set<string>): {
+    contact: string; basis: OwnerConversationRouteBasis;
+  } {
+    this.assertHealthy();
+    const route = [...this.routes].reverse().find(item => item.wireId === wireId);
+    const allowed = new Set([...effective].map(canonicalCid));
+    if (!route || !allowed.has(canonicalCid(route.contact)))
+      throw new Error('no authenticated owner route matches the source wire');
+    return { contact: route.contact, basis: 'source-wire' };
   }
 
   beginSend(
@@ -200,14 +241,18 @@ export class OwnerConversationState {
   }
 
   private mutate(change: () => void): void {
-    const snapshot = JSON.stringify({ conversations: this.conversations, sends: this.sends });
+    const snapshot = JSON.stringify({
+      conversations: this.conversations, routes: this.routes, sends: this.sends,
+    });
     change();
     try { this.persist(); }
     catch (error) {
       const old = JSON.parse(snapshot) as {
-        conversations: OwnerConversationRecord[]; sends: OwnerProactiveSend[];
+        conversations: OwnerConversationRecord[]; routes: OwnerWireRoute[];
+        sends: OwnerProactiveSend[];
       };
       this.conversations = old.conversations;
+      this.routes = old.routes;
       this.sends = old.sends;
       throw error;
     }
@@ -215,7 +260,7 @@ export class OwnerConversationState {
 
   private persist(): void {
     replaceFileAtomically(this.path, JSON.stringify({
-      version: 1, conversations: this.conversations, sends: this.sends,
+      version: 2, conversations: this.conversations, routes: this.routes, sends: this.sends,
     } satisfies OwnerConversationFile) + '\n', 0o600);
     chmodSync(this.path, 0o600);
   }
@@ -231,6 +276,14 @@ export class OwnerConversationState {
     return CID.test(record.contact) && Number.isSafeInteger(record.lastInboundAt)
       && record.lastInboundAt >= 0 && typeof record.lastInboundWireId === 'string'
       && record.lastInboundWireId.length > 0 && record.lastInboundWireId.length <= 1_024;
+  }
+
+  private validRoute(value: unknown): value is OwnerWireRoute {
+    if (!value || typeof value !== 'object') return false;
+    const route = value as OwnerWireRoute;
+    return CID.test(route.contact) && typeof route.wireId === 'string'
+      && route.wireId.length > 0 && route.wireId.length <= 1_024
+      && Number.isSafeInteger(route.at) && route.at >= 0;
   }
 
   private validSend(value: unknown): value is OwnerProactiveSend {
