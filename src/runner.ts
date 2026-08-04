@@ -492,6 +492,7 @@ export async function runOnce(
       stateDir: dir,
       mode,
       permissions: perms,
+      modeId: adapter.acpPermissionModeId?.(role),
       log: deps.log,
     });
     pid = acpSession.pid;

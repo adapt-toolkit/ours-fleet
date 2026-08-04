@@ -286,6 +286,7 @@ roles:
     owner_channel:                      # optional trusted owner ingress; requires session: acp
       identity: "Name Owner Channel"     # existing, dedicated ours identity bound only by fleet
       owners: [owner-contact-cid]        # authenticated ours contact IDs, never display names
+      agent: managed-agent-cid           # exact role identity CID allowed to relay messages outward
       interrupt: false                  # false queues; true cancels current work first
       progress_interval_ms: 30000        # fleet-generated progress notices; 0 disables
       attachments:                      # secure inbound documents, images, and voice
@@ -544,8 +545,9 @@ console later; no terminal UI is part of the monitor or session backend.
 
 `owner_channel` adds a second ours identity to a role without changing the
 role's normal identity. Create that dedicated identity in ours first, connect it
-to each owner/controller identity, and put the owners' immutable contact CIDs in
-`owners`. The channel identity must not be any role identity or another role's
+to each owner/controller identity and the managed role identity, put the owners'
+immutable contact CIDs in `owners`, and put the managed role identity's exact CID
+in `agent`. The channel identity must not be any role identity or another role's
 channel identity. Add it to the control plane just like another contact, then
 message it directly.
 
@@ -563,13 +565,6 @@ ours-fleet owner-channel contact add Coordinator --invite-stdin
 ours-fleet owner-channel owner list Coordinator
 ours-fleet owner-channel owner authorize Coordinator <exact-64-hex-contact-cid>
 ours-fleet owner-channel owner revoke Coordinator <exact-64-hex-contact-cid>
-
-# Used only from the active [fleet-owner] turn; body is stdin, never argv:
-ours-fleet owner-channel update Coordinator <request-id> --phase working --message-stdin
-
-# Register background work while that request is active, then report after its final:
-ours-fleet owner-channel task open Coordinator <active-request-id>
-ours-fleet owner-channel task report Coordinator <task-id> --phase done --message-stdin
 ```
 
 Pairing is deliberately two-step. `contact add` accepts an invite and reports a
@@ -591,55 +586,43 @@ These commands require a running ACP role with `owner_channel` enabled. Missing,
 stopped, tmux, disabled, draining, and unavailable-MCP targets fail without
 starting a second client, binding an identity, or opening a network listener.
 
+The managed agent has one outbound rule: use its ordinary ours `send_message`
+tool to message the channel identity. Fleet checks that the authenticated sender
+CID exactly equals `agent`, then forwards the body as a new message to the owner
+CID that most recently sent inbound channel mail. This applies equally to progress,
+blockers, suggestions, and proactive notes: there is no task/request/update type.
+The agent never chooses an owner recipient. A single configured owner is the safe
+fallback; multiple owners without route history fail closed instead of guessing or
+broadcasting. Different devices sharing one ours identity share one CID, while
+separate authorized identities naturally hand off the route when either sends.
+
+Messages from CIDs which are neither an owner nor the configured agent are never
+injected or relayed. Fleet consumes the attempt, does not answer its sender, and
+sends the latest owner a bounded warning containing the authenticated sender CID
+but none of the attempted body. Repeated warnings use the existing dedupe/rate
+guard so hostile mail cannot become a notification amplifier.
+
 An owner request follows one ordered lifecycle on its authenticated source wire:
 
 1. Fleet sends an immediate receipt describing started, queued, or interrupting state.
 2. Periodic fleet-generated summaries may report allowlisted ACP activity shapes.
-3. The agent may explicitly send multiple high-level updates with the per-request
-   ID injected into its prompt. Phases are `working`, `approval`, and `blocked`,
-   rendered as precise `🔄`, `🔐`, and `🚧` notices. The one-line body is limited
-   to 280 characters/1024 bytes, deduplicated, capped at 20, and rate-limited to
-   one every five seconds. Reasoning, secret-like material, raw logs/tool output,
-   control characters, and late or unknown request IDs are rejected.
-4. Fleet waits for accepted intermediate sends, then emits exactly one final ACP
+3. The agent may send any non-final message to the channel identity through its
+   ordinary ours MCP tool. CID authentication is the message gate; no task ID,
+   request ID, phase, reply reference, or routing command is used.
+4. Fleet independently emits exactly one final ACP
    response (or a sanitized terminal outcome). Successful turns send regular files
    from the request outbox afterward, correlated to the same source wire.
 
-Fleet chooses the stored authenticated sender for every update; neither the CLI
-caller nor model supplies a recipient. Update audit logs contain only the hashed
-request ID prefix, phase, character count, sequence, and delivery result. Bodies
-remain memory-only and never enter the wire-ID state, authorization overlay, or
-logs. A crash therefore replays the deferred owner request instead of persisting
-an unfinished update body. `/interrupt` remains responsive and makes later
-updates for the cancelled request fail closed.
+Fleet chooses the stored latest authenticated owner for every managed-agent
+message; the model supplies only text and the channel contact. Relay audit logs
+contain hashed wire prefixes and sizes, never bodies. A durable pre-send marker
+prevents blind replay after an ambiguous transport outcome. `/interrupt` remains
+an owner-only supervisor command and does not change the outbound relay contract.
 
-Background work must not keep an ACP turn open. During the active authenticated
-request, `task open` accepts only its injected request ID and emits no owner
-message. Fleet creates a random opaque task ID and durably stores only the exact
-originating CID/wire route, expiry, counters, and content hashes. The agent may
-then tell the owner that a specialist is working, finalize, and idle. After a
-later fleet-mail wake it verifies the result and uses `task report` with
-`progress`, `done`, or `blocked`; fleet sends a new proactive follow-up from the
-already-bound channel identity, correlated to the original wire. The CLI has no
-recipient option and never broadcasts. `done` and `blocked` close the task only
-after a successful send.
-
-Tasks expire after seven days and are capped at 32 open tasks per role and eight
-per originating owner. Each allows at most 20 reports, one every five seconds.
-Reports reuse the one-sentence 280-character/1024-byte safety checks and body
-deduplication. Authorization is rechecked at send time; revocation deletes that
-owner's pending routes. The mode-0600 task file is bounded and contains no
-message/report bodies. Corruption fails closed. A durable `sending` marker is
-written before transport: if delivery fails, the response is lost, or the
-supervisor crashes mid-send, the task becomes `uncertain` and refuses automatic
-retry or later reordering. This at-most-once retry policy avoids double delivery
-when ours-mcp cannot prove whether a send crossed the boundary; an operator must
-resolve an uncertain task out of band.
-
-Coordinator workflow: spawn the specialist, run `task open` before the active
-owner turn ends, tell the owner work is continuing and finalize, then idle. On
-the fleet-monitor wake, inspect and verify the specialist's result before using
-`task report ... --phase done|blocked`; do not keep the ACP turn alive or poll.
+Background work must not keep an ACP turn open. The agent can finalize, return to
+idle, verify the later result on a future wake, and send the result to the same
+channel identity with ordinary `send_message`. Fleet applies the same CID gate and
+latest-owner routing as it does for an in-turn progress note.
 
 For mobile onboarding, create or accept the contact first, wait until `contact
 list` reports it established, then authorize that exact CID. Authorization and
@@ -654,12 +637,12 @@ The two paths are deliberately simultaneous and have different authority:
   `[fleet-monitor]` wake asks the agent to call `get_messages`; the agent sees
   provenance and replies with `send_message`. A colleague's agent cannot become
   an owner by writing instruction-like text.
-- Mail to `owner_channel.identity` is accepted only when its authenticated
-  sender CID is in `owners`. Fleet injects it as `[fleet-owner]`, sends
-  acceptance/queue/interruption/progress/failure notices itself, captures the
-  ACP turn's final assistant text, and sends that text back to the exact sender
-  with `reply_to_wire_id`. Recipient choice and final delivery do not depend on
-  the model calling a tool.
+- Mail to `owner_channel.identity` has two accepted origins. A CID in `owners`
+  becomes a `[fleet-owner]` instruction; the exact CID in `agent` becomes a new
+  outbound owner message. Every other CID is rejected and warned about without
+  reflecting its body. Fleet sends request notices itself, captures the ACP
+  turn's final assistant text, and sends that final back to the exact initiating
+  owner with `reply_to_wire_id`.
 
 #### Deterministic owner commands
 

@@ -111,6 +111,13 @@ export const ownerNotices = {
     }
   },
 
+  relayQueued: () =>
+    'ℹ️ No owner has contacted this channel yet, so this message cannot be routed. '
+    + 'It stays queued and will be relayed after the first owner message arrives.',
+
+  relayRefused: (reason: string) =>
+    `⚠️ This message was not relayed to an owner: ${reason}.`,
+
   completedWithoutText: () => '✅ Request completed, but the agent returned no text.',
 
   terminal: (outcome: TurnOutcome) => {

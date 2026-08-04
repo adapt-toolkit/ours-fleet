@@ -23,6 +23,8 @@ interface SteeringResponse {
   outcome: 'injected' | 'startedNewTurn' | 'failed';
 }
 
+const CANCEL_SETTLE_GRACE_MS = 15_000;
+
 export interface AcpSessionOptions {
   name: string;
   argv: string[];
@@ -31,7 +33,11 @@ export interface AcpSessionOptions {
   stateDir: string;
   mode: 'fresh' | 'resume';
   permissions: CommonPermissions;
+  /** Native permission-mode id to request via session/set_mode; undefined keeps the agent default. */
+  modeId?: string;
   log(line: string): void;
+  /** Test seam for the cancel-escalation grace period; production uses the default. */
+  cancelGraceMs?: number;
 }
 
 /**
@@ -69,6 +75,7 @@ export class AcpSession implements SessionHandle {
   private steeringSupported = false;
   private capabilities?: acp.AgentCapabilities;
   private controllerCount = 0;
+  private cancelEscalation?: ReturnType<typeof setTimeout>;
   private activeTurn?: {
     id: string; output: string; origin?: SubmitPromptOptions['origin'];
     cancellationSource?: TurnCancellationSource;
@@ -208,6 +215,18 @@ export class AcpSession implements SessionHandle {
         active.cancellationSource = previousSource;
       throw error;
     }
+    if (active) {
+      if (this.cancelEscalation) clearTimeout(this.cancelEscalation);
+      const turnId = active.id;
+      this.cancelEscalation = setTimeout(() => {
+        if (this.activeTurn?.id !== turnId || !this.isAlive()) return;
+        this.lastError = 'ACP turn ignored cancellation; restarting adapter';
+        this.options.log(`[${this.options.name}] ${this.lastError}`);
+        this.events.emit('error', { turnId, origin: active.origin, text: this.lastError });
+        this.child.kill('SIGTERM');
+      }, this.options.cancelGraceMs ?? CANCEL_SETTLE_GRACE_MS);
+      this.cancelEscalation.unref?.();
+    }
     for (const pending of this.pendingPermissions.values())
       pending.resolve({ outcome: { outcome: 'cancelled' } });
     this.pendingPermissions.clear();
@@ -250,6 +269,8 @@ export class AcpSession implements SessionHandle {
   }
 
   async close(): Promise<void> {
+    if (this.cancelEscalation) clearTimeout(this.cancelEscalation);
+    this.cancelEscalation = undefined;
     for (const pending of this.pendingPermissions.values())
       pending.resolve({ outcome: { outcome: 'cancelled' } });
     this.pendingPermissions.clear();
@@ -300,6 +321,22 @@ export class AcpSession implements SessionHandle {
       this.sessionId = created.sessionId;
     }
     writeFileSync(this.sessionFile, this.sessionId + '\n', { mode: 0o600 });
+    // Deliver the configured permission mode whichever way the session came up
+    // (new, resume or load) — the launch flag never reaches an ACP agent. A
+    // refusal is loud but never fatal: the session then simply runs at the
+    // agent's own default.
+    if (this.options.modeId) {
+      try {
+        await this.connection.agent.request(acp.methods.agent.session.setMode, {
+          sessionId: this.sessionId,
+          modeId: this.options.modeId,
+        });
+      } catch (e) {
+        this.options.log(
+          `[${this.options.name}] acp: session/set_mode "${this.options.modeId}" failed ` +
+          `(${e instanceof Error ? e.message : String(e)}) — session runs at the agent default permission mode`);
+      }
+    }
     this.readiness = 'idle';
     this.events.emit('state', { status: 'idle', text: `ACP session ${this.sessionId}` });
   }
@@ -343,7 +380,11 @@ export class AcpSession implements SessionHandle {
         false, 'failed', this.lastError,
         this.activeTurn?.id === turnId ? this.activeTurn.output : undefined);
     } finally {
-      if (this.activeTurn?.id === turnId) this.activeTurn = undefined;
+      if (this.activeTurn?.id === turnId) {
+        if (this.cancelEscalation) clearTimeout(this.cancelEscalation);
+        this.cancelEscalation = undefined;
+        this.activeTurn = undefined;
+      }
     }
   }
 

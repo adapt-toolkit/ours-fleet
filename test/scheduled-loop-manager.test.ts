@@ -20,6 +20,7 @@ class FakeSession implements SessionHandle {
   prompts: Array<{ text: string; options?: SubmitPromptOptions }> = [];
   pending: Array<(result: TurnResult) => void> = [];
   rejectQueue = false;
+  interrupts: TurnCancellationSource[] = [];
   isAlive() { return true; }
   snapshot(): SessionSnapshot { return { backend: 'acp', alive: true, readiness: this.readiness }; }
   async queuePrompt(text: string, options?: SubmitPromptOptions): Promise<QueuedPrompt> {
@@ -35,7 +36,7 @@ class FakeSession implements SessionHandle {
   async submitPrompt(text: string, options?: SubmitPromptOptions) {
     return (await this.queuePrompt(text, options)).completion;
   }
-  async interrupt(_source?: TurnCancellationSource) {}
+  async interrupt(source: TurnCancellationSource = 'local-console') { this.interrupts.push(source); }
   respondPermission() { return false; }
   eventsSince(): SessionEvent[] { return []; }
   subscribe() { return () => undefined; }
@@ -100,6 +101,28 @@ describe('ScheduledLoopManager strict cadence', () => {
     const persisted = readFileSync(join(immediate.dir, '.scheduled-loops.json'), 'utf8');
     expect(persisted).not.toContain('CANARY_LITERAL_PROMPT');
     expect(immediate.logs.join('\n')).not.toContain('CANARY_LITERAL_PROMPT');
+  });
+
+  it('cancels a scheduled turn at a bounded deadline so it cannot monopolize the role', async () => {
+    const status = setup([definition('health', { intervalMs: 10 * 60_000 })]);
+    status.manager.start();
+    status.setNow(60_000);
+    await status.manager.runNow('health');
+    const deadline = status.timers.find(timer => timer.ms === 5 * 60_000 && !timer.cleared);
+    expect(deadline).toBeDefined();
+    deadline!.callback();
+    await Promise.resolve();
+    expect(status.session.interrupts).toEqual(['scheduled-loop']);
+    expect(status.logs.join('\n')).toContain('timed out');
+  });
+
+  it('clears an active scheduled-turn deadline when the manager stops', async () => {
+    const status = setup([definition('health', { intervalMs: 10 * 60_000 })]);
+    await status.manager.runNow('health');
+    const deadline = status.timers.find(timer => timer.ms === 5 * 60_000 && !timer.cleared);
+    expect(deadline).toBeDefined();
+    await status.manager.stop();
+    expect(deadline!.cleared).toBe(true);
   });
 
   it('skips a busy owner/manual turn once with no backlog or retry-on-idle', async () => {
