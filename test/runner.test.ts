@@ -528,6 +528,21 @@ describe('runOnce ACP startup outcome (1.2)', () => {
     expect(logs.some(l => l.includes('[A] up;'))).toBe(false);
   });
 
+  it('delivers the adapter-computed permission mode to the ACP session', async () => {
+    registerAdapter({ ...acpAdapter, id: 'fake-acp-mode', acpPermissionModeId: () => 'acceptEdits' });
+    writeCfg({ A: {
+      harness: 'fake-acp-mode', session: 'acp',
+      env: { ACP_FIXTURE_EXIT_AFTER: '1' },
+    } });
+    mkdirSync(agentDir('A'), { recursive: true });
+    const { deps } = acpDeps();
+
+    await runOnce('A', {}, deps);
+    const events = readFileSync(join(agentDir('A'), '.session-events.jsonl'), 'utf8')
+      .trim().split('\n').map(line => JSON.parse(line) as { kind: string; text?: string });
+    expect(events.some(e => e.kind === 'agent_text' && e.text === 'mode:acceptEdits')).toBe(true);
+  });
+
   it('warns once at startup that an unattended role auto-denies (1.3)', async () => {
     writeCfg({ A: {
       harness: 'fake-acp', session: 'acp',

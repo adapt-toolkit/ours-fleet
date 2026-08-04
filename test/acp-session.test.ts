@@ -21,7 +21,10 @@ afterEach(() => {
 
 async function start(
   approval: 'ask' | 'allow' | 'deny' = 'allow',
-  options: { cancelGraceMs?: number } = {},
+  extra: {
+    modeId?: string; env?: Record<string, string>; log?(line: string): void;
+    cancelGraceMs?: number;
+  } = {},
 ) {
   const stateDir = mkdtempSync(join(tmpdir(), 'ours-fleet-acp-'));
   dirs.push(stateDir);
@@ -29,12 +32,13 @@ async function start(
     name: 'A',
     argv: [process.execPath, fixture],
     cwd: stateDir,
-    env: {},
+    env: extra.env ?? {},
     stateDir,
     mode: 'fresh',
     permissions: { approval, filesystem: 'workspace', unattended: 'deny' },
-    log: () => {},
-    ...(options.cancelGraceMs !== undefined ? { cancelGraceMs: options.cancelGraceMs } : {}),
+    modeId: extra.modeId,
+    log: extra.log ?? (() => {}),
+    ...(extra.cancelGraceMs !== undefined ? { cancelGraceMs: extra.cancelGraceMs } : {}),
   });
 }
 
@@ -192,6 +196,53 @@ describe('AcpSession', () => {
     expect(session.respondPermission(permission!.permissionId!, 'allow')).toBe(true);
     expect((await prompt).accepted).toBe(true);
     session.setControllerAttached(false);
+    await session.close();
+  });
+
+  it('delivers the configured permission mode via session/set_mode after session/new', async () => {
+    const session = await start('allow', { modeId: 'bypassPermissions' });
+    expect(session.eventsSince(0).some(event =>
+      event.kind === 'agent_text' && event.text === 'mode:bypassPermissions')).toBe(true);
+    await session.close();
+  });
+
+  it('issues no session/set_mode when no mode is configured', async () => {
+    const session = await start('allow');
+    expect(session.eventsSince(0).some(event =>
+      event.kind === 'agent_text' && event.text?.startsWith('mode:'))).toBe(false);
+    await session.close();
+  });
+
+  it('delivers the permission mode after loading a persisted session too', async () => {
+    const stateDir = mkdtempSync(join(tmpdir(), 'ours-fleet-acp-'));
+    dirs.push(stateDir);
+    writeFileSync(join(stateDir, '.acp-session-id'), 'fixture-session\n');
+    const session = await AcpSession.start({
+      name: 'A',
+      argv: [process.execPath, fixture],
+      cwd: stateDir,
+      env: { ACP_FIXTURE_LOAD_SESSION: '1' },
+      stateDir,
+      mode: 'resume',
+      permissions: { approval: 'allow', filesystem: 'workspace', unattended: 'deny' },
+      modeId: 'plan',
+      log: () => {},
+    });
+    expect(session.eventsSince(0).some(event =>
+      event.kind === 'agent_text' && event.text === 'mode:plan')).toBe(true);
+    await session.close();
+  });
+
+  it('a failed session/set_mode logs loudly but leaves the session usable', async () => {
+    const logs: string[] = [];
+    const session = await start('allow', {
+      modeId: 'bypassPermissions',
+      env: { ACP_FIXTURE_SET_MODE_FAIL: '1' },
+      log: line => logs.push(line),
+    });
+    expect(logs.some(l => l.includes('set_mode') && l.includes('agent default'))).toBe(true);
+    const result = await session.submitPrompt('hello');
+    expect(result).toMatchObject({ succeeded: true, output: 'echo:hello' });
     await session.close();
   });
 

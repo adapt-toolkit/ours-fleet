@@ -33,6 +33,8 @@ export interface AcpSessionOptions {
   stateDir: string;
   mode: 'fresh' | 'resume';
   permissions: CommonPermissions;
+  /** Native permission-mode id to request via session/set_mode; undefined keeps the agent default. */
+  modeId?: string;
   log(line: string): void;
   /** Test seam for the cancel-escalation grace period; production uses the default. */
   cancelGraceMs?: number;
@@ -319,6 +321,22 @@ export class AcpSession implements SessionHandle {
       this.sessionId = created.sessionId;
     }
     writeFileSync(this.sessionFile, this.sessionId + '\n', { mode: 0o600 });
+    // Deliver the configured permission mode whichever way the session came up
+    // (new, resume or load) — the launch flag never reaches an ACP agent. A
+    // refusal is loud but never fatal: the session then simply runs at the
+    // agent's own default.
+    if (this.options.modeId) {
+      try {
+        await this.connection.agent.request(acp.methods.agent.session.setMode, {
+          sessionId: this.sessionId,
+          modeId: this.options.modeId,
+        });
+      } catch (e) {
+        this.options.log(
+          `[${this.options.name}] acp: session/set_mode "${this.options.modeId}" failed ` +
+          `(${e instanceof Error ? e.message : String(e)}) — session runs at the agent default permission mode`);
+      }
+    }
     this.readiness = 'idle';
     this.events.emit('state', { status: 'idle', text: `ACP session ${this.sessionId}` });
   }

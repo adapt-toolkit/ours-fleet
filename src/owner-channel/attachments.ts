@@ -137,6 +137,18 @@ function parseTranscription(value: unknown, wireId: string): { transcription?: V
   } };
 }
 
+// Voice notes ride "<base>; x-ours-kind=voice-message" verbatim end to end
+// (the recorder's real container varies: audio/webm Chrome/Android, audio/mp4
+// iOS Safari, audio/ogg fallback), so policy for voice messages applies to the
+// base container type. Ordinary files keep exact allowlist matching.
+function baseMime(mime: string): string {
+  return mime.split(';')[0].trim();
+}
+
+function policyMime(file: Pick<IncomingAttachment, 'mime' | 'kind'>): string {
+  return file.kind === 'voice_message' ? baseMime(file.mime) : file.mime;
+}
+
 export function validateAttachmentSelection(
   files: IncomingAttachment[], config: OwnerAttachmentConfig,
 ): string | undefined {
@@ -145,7 +157,10 @@ export function validateAttachmentSelection(
     return `the request exceeds the ${config.max_files_per_request}-file limit`;
   let total = 0;
   for (const file of files) {
-    if (!config.allowed_mime.includes(file.mime)) return `MIME type ${file.mime || '(missing)'} is not allowed`;
+    const mime = policyMime(file);
+    if (file.kind === 'voice_message' && !mime.startsWith('audio/'))
+      return `voice-message MIME type ${file.mime || '(missing)'} is not an audio container`;
+    if (!config.allowed_mime.includes(mime)) return `MIME type ${file.mime || '(missing)'} is not allowed`;
     if (file.size > config.max_file_bytes)
       return `a file exceeds the ${config.max_file_bytes}-byte limit`;
     total += file.size;
@@ -194,9 +209,10 @@ export async function admitAttachments(
       throw new Error('retrieved attachment size or hash mismatched structured metadata');
     total += bytes.length;
     if (total > config.max_request_bytes) throw new Error('retrieved attachments exceed the request size limit');
-    const detectedMime = detectMime(bytes, file.mime);
-    if (!mimeCompatible(file.mime, detectedMime))
-      throw new Error(`retrieved attachment content does not match declared MIME ${file.mime}`);
+    const declaredMime = policyMime(file);
+    const detectedMime = detectMime(bytes, declaredMime);
+    if (!mimeCompatible(declaredMime, detectedMime))
+      throw new Error(`retrieved attachment content does not match declared MIME ${declaredMime}`);
     const filename = sanitizeFilename(file.filename);
     const finalPath = join(dir, `${index + 1}-${file.wireId.slice(0, 12)}-${filename}`);
     const tmp = join(dir, `.${basename(finalPath)}.${randomUUID()}.tmp`);
@@ -209,7 +225,7 @@ export async function admitAttachments(
     await rm(tmp, { force: true });
     await chmod(finalPath, 0o600);
     admitted.push({
-      wireId: file.wireId, filename, path: finalPath, declaredMime: file.mime,
+      wireId: file.wireId, filename, path: finalPath, declaredMime,
       detectedMime, size: bytes.length, sha256: digest, kind: file.kind,
       ...(file.transcription ? { transcription: {
         configured: file.transcription.configured, attempted: file.transcription.attempted,
