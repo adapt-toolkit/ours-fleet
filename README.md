@@ -644,8 +644,58 @@ The two paths are deliberately simultaneous and have different authority:
   turn's final assistant text, and sends that final back to the exact initiating
   owner with `reply_to_wire_id`.
 
-Exact `/status` and `/interrupt` messages are supervisor commands and never
-enter the model. Processed wire IDs are durably bounded for deduplication, while
+#### Deterministic owner commands
+
+Any owner message whose trimmed text starts with `/` is a command attempt: it is
+handled by the fleet supervisor itself and never becomes an agent prompt.
+Unknown or malformed commands (wrong arguments included) answer with the help
+text instead of being forwarded; messages without a leading `/` reach the agent
+unchanged. The registry in `src/owner-channel/commands.ts` is the single source
+of truth — `/help` renders exactly that table, so adding an entry there is the
+whole registration step for a new command.
+
+| Command | Effect |
+| --- | --- |
+| `/help` (alias `/commands`) | list all deterministic owner-channel commands |
+| `/status` | report the agent's session state |
+| `/interrupt` | cancel the agent's active turn |
+| `/clear` | clear the agent's session context |
+| `/compact` | compact the agent's session context |
+| `/model <model-id>` | switch the model the agent runs on |
+| `/restart` | restart the agent, resuming its context |
+| `/force-restart` | restart the agent FRESH (context wiped) |
+| `/ls` | list running fleet sessions |
+| `/peek` | summarize recent session activity (event shapes only, no content) |
+| `/worklog` | tail the agent's worklog |
+| `/version` | report the fleet version |
+
+Implementation strategies differ but every command is deterministic:
+
+- `/help`, `/status`, `/interrupt`, `/peek`, `/worklog`, and `/version` are
+  answered by the supervisor directly. `/peek` deliberately reports event
+  *shapes* (kind, tool title, status) and never thought, agent-text, or tool
+  output bodies.
+- `/clear`, `/compact`, and `/model` deliver the raw slash text to the agent
+  harness, but only when the bundled ACP adapter for the role's harness
+  verifiably executes that command locally (pinned per harness in
+  `HARNESS_LOCAL_COMMANDS`): `claude-code` runs all three as Claude SDK
+  builtins; `codex` runs only `/compact` — `/clear` and `/model` are not
+  codex-acp builtins and would fall through to the model as an ordinary
+  prompt, so they answer with a truthful refusal instead of being forwarded.
+  When forwarded, fleet sends a `⏳` acceptance notice and reports the turn's
+  outcome on the same wire.
+- `/restart` and `/force-restart` confirm to the owner and durably mark the
+  message handled FIRST, then invoke the detached `ours-fleet restart` /
+  `force-restart` CLI — a successful bounce kills the supervisor process, so
+  nothing can be sent afterwards. `/ls` captures the CLI listing.
+
+Commands act only on the role whose channel received them (the restart target
+and session are fixed by the channel, never by message content), and the entire
+command path sits behind the authenticated owner-CID check: a non-owner sending
+`/force-restart` or `/model` is silently ignored exactly like any other
+unauthorized mail.
+
+Processed wire IDs are durably bounded for deduplication, while
 message and response bodies stay out of fleet state. Delivery is at-least-once
 across a crash (the bridge requeues fetched input before starting a turn); true
 exactly-once processing would require a leased claim/idempotency primitive in

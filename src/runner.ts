@@ -568,11 +568,13 @@ export async function runOnce(
     if (role.owner_channel) {
       ownerChannel = deps.createOwnerChannel({
         role: name,
+        harness: role.harness,
         config: role.owner_channel,
         session: arbiter,
         stateDir: dir,
         env: role.env,
         log: deps.log,
+        ...(configPath ? { configPath } : {}),
       });
       try { await ownerChannel.start(); }
       catch (error) {

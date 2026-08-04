@@ -1,6 +1,6 @@
 import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
-import { mkdir, readdir, rm } from 'node:fs/promises';
+import { mkdir, readFile, readdir, rm } from 'node:fs/promises';
 import { createInterface } from 'node:readline';
 import { join } from 'node:path';
 
@@ -9,6 +9,11 @@ import {
   type OwnerAttachmentConfig, type OwnerChannelConfig,
 } from '../config.js';
 import type { QueuedPrompt, SessionEvent, SessionHandle, TurnResult } from '../session/types.js';
+import { VERSION } from '../version.js';
+import {
+  dispatchOwnerCommand, fleetCliOps, isOwnerCommandText,
+  type OwnerCommandContext, type OwnerFleetOps,
+} from './commands.js';
 import { OursMcpClient, type OursToolClient } from './mcp.js';
 import { ownerNotices, type OwnerProgressPhase, type OwnerUpdatePhase } from './notices.js';
 import {
@@ -44,6 +49,8 @@ interface AttachmentGroup {
 
 export interface OwnerChannelOptions {
   role: string;
+  /** Harness id of the role (e.g. 'claude-code', 'codex'); gates which slash commands may be forwarded. */
+  harness: string;
   config: OwnerChannelConfig;
   session: SessionHandle;
   stateDir: string;
@@ -53,6 +60,10 @@ export interface OwnerChannelOptions {
   client?: OursToolClient;
   /** Test seam; production uses `ours-mcp watch <identity>`. */
   watch?: (identity: string) => ChildProcessWithoutNullStreams;
+  /** Test seam; production uses the detached ours-fleet CLI (`fleetCliOps`). */
+  fleet?: OwnerFleetOps;
+  /** Forwarded to fleet CLI invocations spawned for owner commands. */
+  configPath?: string;
 }
 
 export interface OwnerChannelHandle {
@@ -146,9 +157,12 @@ export class OwnerChannel implements OwnerChannelHandle {
   private managementTail: Promise<unknown> = Promise.resolve();
   private ready = false;
 
+  private readonly fleetOps: OwnerFleetOps;
+
   constructor(private readonly options: OwnerChannelOptions) {
     this.client = options.client ?? new OursMcpClient(
       options.command, options.env, line => options.log(`[${options.role}] owner channel ${line}`));
+    this.fleetOps = options.fleet ?? fleetCliOps(options.role, options.configPath);
     this.state = new OwnerChannelState(join(options.stateDir, '.owner-channel-state.json'));
     this.authorizations = new OwnerAuthorizationState(
       join(options.stateDir, '.owner-channel-owners.json'), options.config.owners);
@@ -760,23 +774,8 @@ export class OwnerChannel implements OwnerChannelHandle {
     }
 
     const text = String(message.text ?? '').trim();
-    if (text.toLowerCase() === '/status') {
-      const snapshot = this.options.session.snapshot();
-      await this.send(sender.id, ownerNotices.status(this.options.role, snapshot), wireId);
-      this.state.remember(wireId);
-      return true;
-    }
-    if (text.toLowerCase() === '/interrupt') {
-      try {
-        await this.options.session.interrupt('owner');
-      } catch (error) {
-        this.logError('interrupt failed', error);
-        await this.send(sender.id, ownerNotices.interruptFailed(this.options.role), wireId);
-        this.state.remember(wireId);
-        return true;
-      }
-      await this.send(sender.id, ownerNotices.interrupted(this.options.role), wireId);
-      this.state.remember(wireId);
+    if (isOwnerCommandText(text)) {
+      await this.handleCommand(sender, text, wireId);
       return true;
     }
 
@@ -828,6 +827,103 @@ export class OwnerChannel implements OwnerChannelHandle {
       });
     this.completionTasks.add(task);
     return true;
+  }
+
+  /**
+   * Deterministic command path: the message never becomes an agent prompt.
+   * Authorization already happened — the managed-agent relay branch and the
+   * owner-CID check in handle() both run before dispatch, so only an
+   * authenticated owner reaches this: neither ordinary peers nor the managed
+   * agent itself can execute /force-restart, /model, or any other command.
+   */
+  private async handleCommand(
+    sender: { id: string; name: string }, text: string, wireId: string,
+  ): Promise<void> {
+    const ctx: OwnerCommandContext = {
+      role: this.options.role,
+      harness: this.options.harness,
+      version: VERSION,
+      snapshot: () => this.options.session.snapshot(),
+      interrupt: () => this.options.session.interrupt('owner'),
+      runHarnessCommand: command => this.runHarnessCommand(sender, command, wireId),
+      restart: mode => this.restartSelf(sender, mode, wireId),
+      fleetList: () => this.fleetOps.list(),
+      recentEvents: limit => this.options.session.eventsSince(0).slice(-limit),
+      readWorklogTail: maxChars => this.readWorklogTail(maxChars),
+      reply: async replyText => { await this.send(sender.id, replyText, wireId); },
+    };
+    try {
+      await dispatchOwnerCommand(text, ctx);
+    } catch (error) {
+      this.logError(`owner command failed (${text.split(/\s+/, 1)[0]})`, error);
+    }
+    // Harness commands own their wire until the queued turn settles; everything
+    // else is complete now and must never replay.
+    if (!this.inFlight.has(wireId)) this.state.remember(wireId);
+  }
+
+  /** Queue raw slash text to the harness and report the turn's outcome. */
+  private async runHarnessCommand(
+    sender: { id: string; name: string }, command: string, wireId: string,
+  ): Promise<void> {
+    const requestId = this.requestId(wireId);
+    const queued = await this.options.session.queuePrompt(command, {
+      origin: { kind: 'owner', requestId },
+    });
+    this.inFlight.add(wireId);
+    const receipt = this.send(sender.id, ownerNotices.commandStarted(command), wireId)
+      .then(() => undefined)
+      .catch(error => this.logError(`command ${command} acceptance notice failed`, error));
+    const task = queued.completion.then(async result => {
+      await receipt;
+      const output = result.succeeded ? this.commandOutput(result.output) : undefined;
+      await this.send(sender.id,
+        ownerNotices.commandOutcome(command, result.outcome, output), wireId);
+      this.state.remember(wireId);
+    }).catch(error => this.logError(`command ${command} completion failed`, error))
+      .finally(() => {
+        this.inFlight.delete(wireId);
+        this.completionTasks.delete(task);
+        if (!this.stopping)
+          void this.drain().catch(error => this.logError('completion drain failed', error));
+      });
+    this.completionTasks.add(task);
+  }
+
+  /**
+   * Confirmation and the durable wire record must both land BEFORE the fleet
+   * CLI is asked to bounce this very process; neither can happen afterwards.
+   */
+  private async restartSelf(
+    sender: { id: string; name: string }, mode: 'keep' | 'fresh', wireId: string,
+  ): Promise<void> {
+    const command = mode === 'fresh' ? '/force-restart' : '/restart';
+    await this.send(sender.id,
+      ownerNotices.restarting(this.options.role, command, mode), wireId);
+    this.state.remember(wireId);
+    this.options.log(`[${this.options.role}] owner requested ${command}`);
+    await this.fleetOps.restart(mode);
+  }
+
+  /** Code-point-safe tail of the worklog, or undefined when there is none. */
+  private async readWorklogTail(maxChars: number): Promise<string | undefined> {
+    try {
+      const content = (await readFile(
+        join(this.options.stateDir, 'WORKLOG.md'), 'utf8')).trim();
+      if (!content) return undefined;
+      const points = Array.from(content);
+      return points.length <= maxChars ? content : `…${points.slice(-maxChars).join('')}`;
+    } catch {
+      return undefined;
+    }
+  }
+
+  /** Bound harness-command output to a single outbound message. */
+  private commandOutput(output: string | undefined): string | undefined {
+    const trimmed = output?.trim();
+    if (!trimmed) return undefined;
+    const points = Array.from(trimmed);
+    return points.length <= 7_000 ? trimmed : `${points.slice(0, 7_000).join('')}…`;
   }
 
   private acceptedSender(cid: string): boolean {
