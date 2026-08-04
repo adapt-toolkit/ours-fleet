@@ -79,4 +79,28 @@ describe('native supervised web service', () => {
     expect(plist).toContain('/tmp/a&lt;&amp;');
     expect(plist).toContain('/tmp/&quot;config&quot;');
   });
+
+  it('persists explicit reverse-proxy bind/origin arguments without credentials', async () => {
+    const { executable, manager } = fixture('linux');
+    await manager.install(executable, 49_271, undefined, {
+      bind: '127.0.0.1', publicOrigin: 'https://fleet.example.com',
+    });
+    const unit = readFileSync(manager.definitionPath, 'utf8');
+    const metadata = readFileSync(manager.metadataPath, 'utf8');
+    expect(unit).toContain('--bind "127.0.0.1"');
+    expect(unit).toContain('--public-origin "https://fleet.example.com"');
+    expect(JSON.parse(metadata)).toMatchObject({
+      version: 3, bind: '127.0.0.1', publicOrigin: 'https://fleet.example.com',
+    });
+    expect(metadata).not.toMatch(/password|secret|credential/i);
+  });
+
+  it('accepts version-2 local metadata as the safe pairing migration', async () => {
+    const { executable, manager } = fixture('linux');
+    await manager.install(executable);
+    const metadata = JSON.parse(readFileSync(manager.metadataPath, 'utf8'));
+    writeFileSync(manager.metadataPath, JSON.stringify({ ...metadata, version: 2 }));
+    expect(manager.readMetadata()).toMatchObject({ version: 3, port: 49_271 });
+    await expect(manager.start()).resolves.toBeUndefined();
+  });
 });

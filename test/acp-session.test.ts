@@ -19,19 +19,33 @@ afterEach(() => {
   for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true });
 });
 
-async function start(approval: 'ask' | 'allow' | 'deny' = 'allow') {
+async function start(
+  approval: 'ask' | 'allow' | 'deny' = 'allow',
+  extra: {
+    modeId?: string; env?: Record<string, string>; log?(line: string): void;
+    cancelGraceMs?: number;
+  } = {},
+) {
   const stateDir = mkdtempSync(join(tmpdir(), 'ours-fleet-acp-'));
   dirs.push(stateDir);
   return AcpSession.start({
     name: 'A',
     argv: [process.execPath, fixture],
     cwd: stateDir,
-    env: {},
+    env: extra.env ?? {},
     stateDir,
     mode: 'fresh',
     permissions: { approval, filesystem: 'workspace', unattended: 'deny' },
-    log: () => {},
+    modeId: extra.modeId,
+    log: extra.log ?? (() => {}),
+    ...(extra.cancelGraceMs !== undefined ? { cancelGraceMs: extra.cancelGraceMs } : {}),
   });
+}
+
+async function waitForRunning(session: AcpSession): Promise<void> {
+  for (let i = 0; i < 50 && !session.eventsSince(0)
+    .some(event => event.kind === 'state' && event.status === 'running'); i++)
+    await new Promise(resolve => setTimeout(resolve, 10));
 }
 
 describe('AcpSession', () => {
@@ -185,6 +199,53 @@ describe('AcpSession', () => {
     await session.close();
   });
 
+  it('delivers the configured permission mode via session/set_mode after session/new', async () => {
+    const session = await start('allow', { modeId: 'bypassPermissions' });
+    expect(session.eventsSince(0).some(event =>
+      event.kind === 'agent_text' && event.text === 'mode:bypassPermissions')).toBe(true);
+    await session.close();
+  });
+
+  it('issues no session/set_mode when no mode is configured', async () => {
+    const session = await start('allow');
+    expect(session.eventsSince(0).some(event =>
+      event.kind === 'agent_text' && event.text?.startsWith('mode:'))).toBe(false);
+    await session.close();
+  });
+
+  it('delivers the permission mode after loading a persisted session too', async () => {
+    const stateDir = mkdtempSync(join(tmpdir(), 'ours-fleet-acp-'));
+    dirs.push(stateDir);
+    writeFileSync(join(stateDir, '.acp-session-id'), 'fixture-session\n');
+    const session = await AcpSession.start({
+      name: 'A',
+      argv: [process.execPath, fixture],
+      cwd: stateDir,
+      env: { ACP_FIXTURE_LOAD_SESSION: '1' },
+      stateDir,
+      mode: 'resume',
+      permissions: { approval: 'allow', filesystem: 'workspace', unattended: 'deny' },
+      modeId: 'plan',
+      log: () => {},
+    });
+    expect(session.eventsSince(0).some(event =>
+      event.kind === 'agent_text' && event.text === 'mode:plan')).toBe(true);
+    await session.close();
+  });
+
+  it('a failed session/set_mode logs loudly but leaves the session usable', async () => {
+    const logs: string[] = [];
+    const session = await start('allow', {
+      modeId: 'bypassPermissions',
+      env: { ACP_FIXTURE_SET_MODE_FAIL: '1' },
+      log: line => logs.push(line),
+    });
+    expect(logs.some(l => l.includes('set_mode') && l.includes('agent default'))).toBe(true);
+    const result = await session.submitPrompt('hello');
+    expect(result).toMatchObject({ succeeded: true, output: 'echo:hello' });
+    await session.close();
+  });
+
   it('queues a prompt behind a running turn instead of waiting for it (1.5)', async () => {
     const session = await start();
     const busy = session.submitPrompt('block 1500');        // a turn that runs for 1.5s
@@ -311,6 +372,71 @@ describe('AcpSession', () => {
       accepted: true, outcome: 'inconclusive', detail: 'startedNewTurn',
     });
     session.setControllerAttached(false);
+    await session.close();
+  });
+
+  it('escalates an ignored cancellation by restarting the adapter, failing the turn exactly once', async () => {
+    const session = await start('allow', { cancelGraceMs: 200 });
+    const queued = await session.queuePrompt('stubborn block 60000');
+    await waitForRunning(session);
+    await session.interrupt('owner');
+
+    // The adapter never honors the cancel; after the grace period the session
+    // must recover by force instead of leaving the turn (and its owner) hung.
+    const result = await queued.completion;
+    expect(result).toMatchObject({ succeeded: false, outcome: 'failed' });
+    expect(session.isAlive()).toBe(false);
+    // SIGTERM delivery is asynchronous; wait for the adapter's exit record.
+    for (let i = 0; i < 100 && session.exitResult() === null; i++)
+      await new Promise(resolve => setTimeout(resolve, 10));
+    expect(session.exitResult()).not.toBeNull();
+
+    const events = session.eventsSince(0);
+    const escalations = events.filter(event =>
+      event.kind === 'error' && event.text?.includes('ignored cancellation'));
+    expect(escalations).toHaveLength(1);
+    // The escalated turn terminates through the failure path only: no
+    // turn_stop means no second, contradictory completion was produced.
+    expect(events.filter(event => event.kind === 'turn_stop')).toHaveLength(0);
+    await session.close();
+  });
+
+  it('never escalates a cancellation the adapter honors within the grace period', async () => {
+    const session = await start('allow', { cancelGraceMs: 200 });
+    const queued = await session.queuePrompt('block 60000');
+    await waitForRunning(session);
+    await session.interrupt('owner');
+    expect(await queued.completion).toMatchObject({
+      accepted: true, outcome: 'cancelled', succeeded: false, cancellationSource: 'owner',
+    });
+
+    // Well past the grace period the adapter must still be alive and undamaged.
+    await new Promise(resolve => setTimeout(resolve, 350));
+    expect(session.isAlive()).toBe(true);
+    expect(session.eventsSince(0).some(event =>
+      event.kind === 'error' && event.text?.includes('ignored cancellation'))).toBe(false);
+    // …and fully usable: the next turn completes normally.
+    expect(await session.submitPrompt('hello')).toMatchObject({
+      succeeded: true, output: 'echo:hello',
+    });
+    await session.close();
+  });
+
+  it('an escalation armed for one turn cannot fire into a later turn', async () => {
+    const session = await start('allow', { cancelGraceMs: 200 });
+    const first = await session.queuePrompt('block 60000');
+    await waitForRunning(session);
+    await session.interrupt('owner');
+    expect((await first.completion).outcome).toBe('cancelled');
+
+    // A new turn starts after the cancelled one; the old grace timer must not
+    // kill the adapter out from under it.
+    const second = session.submitPrompt('block 300');
+    await new Promise(resolve => setTimeout(resolve, 250));
+    expect(session.isAlive()).toBe(true);
+    expect(await second).toMatchObject({ succeeded: true });
+    expect(session.eventsSince(0).some(event =>
+      event.kind === 'error' && event.text?.includes('ignored cancellation'))).toBe(false);
     await session.close();
   });
 

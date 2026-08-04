@@ -1,7 +1,6 @@
 import { createHash } from 'node:crypto';
 import {
-  chmodSync, copyFileSync, existsSync, lstatSync, mkdtempSync, readFileSync, rmSync, symlinkSync,
-  writeFileSync,
+  chmodSync, copyFileSync, lstatSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync,
 } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -11,7 +10,8 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { OwnerAttachmentConfig, OwnerChannelConfig } from '../src/config.js';
 import {
   AttachmentRecoveryState, admitAttachments, cleanupAttachmentRoot, prepareAttachmentDirectory,
-  parseRetrievedAttachments, sanitizeFilename, type IncomingAttachment, type RetrievedAttachment,
+  parseRetrievedAttachments, sanitizeFilename, validateAttachmentSelection,
+  type IncomingAttachment, type RetrievedAttachment,
 } from '../src/owner-channel/attachments.js';
 import { OwnerChannel } from '../src/owner-channel/channel.js';
 import type { OursToolClient } from '../src/owner-channel/mcp.js';
@@ -19,7 +19,6 @@ import type { QueuedPrompt, SessionHandle, TurnResult } from '../src/session/typ
 
 const OWNER = 'A'.repeat(64);
 const OTHER = 'B'.repeat(64);
-const AGENT = 'D'.repeat(64);
 const FILE_WIRE = '1'.repeat(64);
 const CAPTION_WIRE = '2'.repeat(64);
 const dirs: string[] = [];
@@ -81,7 +80,7 @@ function deferredPrompt() {
   return { queued, finish };
 }
 
-async function setup(owners = [OWNER], recover = false, agent?: string) {
+async function setup(owners = [OWNER], recover = false, attachments = attachmentConfig) {
   const dir = mkdtempSync(join(tmpdir(), 'ours-owner-attachments-'));
   dirs.push(dir);
   const client = new AttachmentClient();
@@ -94,8 +93,7 @@ async function setup(owners = [OWNER], recover = false, agent?: string) {
   } as unknown as SessionHandle;
   const config: OwnerChannelConfig = {
     identity: 'Role-owner', owners, interrupt: false, progress_interval_ms: 0,
-    ...(agent ? { agent } : {}),
-    attachments: attachmentConfig,
+    attachments,
   };
   if (recover) new AttachmentRecoveryState(join(dir, '.owner-channel-attachment-recovery.json')).add({
     id: createHash('sha256').update(FILE_WIRE).digest('hex'), contact: OWNER,
@@ -103,7 +101,7 @@ async function setup(owners = [OWNER], recover = false, agent?: string) {
   });
   const logs: string[] = [];
   const channel = new OwnerChannel({
-    role: 'Role', config, session, stateDir: dir, client, log: line => logs.push(line),
+    role: 'Role', harness: 'claude-code', config, session, stateDir: dir, client, log: line => logs.push(line),
     watch: () => ({
       pid: 1, exitCode: null, stdout: new PassThrough(), stderr: new PassThrough(),
       once: () => undefined, kill: () => true,
@@ -186,11 +184,7 @@ describe('owner-channel attachment ingress', () => {
     unauthorized.client.files = [listed({ from: { id: OTHER, name: 'Impostor' } })];
     await unauthorized.channel.drain();
     expect(unauthorized.client.calls.some(call => call.name === 'get_files')).toBe(false);
-    expect(unauthorized.client.calls.find(call => call.name === 'send_message')?.args).toEqual({
-      contact: OWNER,
-      text: `⚠️ Owner-channel security warning: rejected a file from unauthorized sender CID `
-        + `${OTHER}. Its bytes were not forwarded.`,
-    });
+    expect(unauthorized.client.calls.some(call => call.name === 'send_message')).toBe(false);
     await unauthorized.channel.close();
 
     for (const overrides of [{ size: 2_000 }, { mime: 'application/x-executable' }]) {
@@ -216,85 +210,6 @@ describe('owner-channel attachment ingress', () => {
     expect(overCount.client.calls.find(call => call.name === 'send_message')?.args?.text)
       .toContain('4-file limit');
     await overCount.channel.close();
-  });
-
-  it('relays a managed-agent file to the exact owner request through the channel identity', async () => {
-    const status = await setup([OWNER, OTHER], false, AGENT);
-    const ownerWire = '9'.repeat(64);
-    status.client.batches.push([{
-      msg_id: 12, wire_id: ownerWire, from: { id: OWNER, name: 'Phone' }, text: '/status',
-    }], [{
-      msg_id: 13, wire_id: '8'.repeat(64), from: { id: OTHER, name: 'Laptop' }, text: '/status',
-    }], []);
-    await status.channel.drain();
-
-    const bytes = Buffer.from('direct report');
-    const source = join(status.dir, 'agent-report');
-    writeFileSync(source, bytes);
-    status.client.files = [listed({
-      from: { id: AGENT, name: 'Coordinator' }, size: bytes.length,
-      filename: 'report.txt', reply_to: { wire_id: ownerWire },
-    })];
-    status.client.retrieved.set(FILE_WIRE, retrieved(source, bytes, {
-      from: { id: AGENT, name: 'Coordinator' }, filename: 'report.txt',
-      reply_to: { wire_id: ownerWire },
-    }));
-    await status.channel.drain();
-
-    expect(status.queuePrompt).not.toHaveBeenCalled();
-    expect(status.client.calls).toContainEqual({
-      name: 'get_files', args: { wire_ids: [FILE_WIRE] },
-    });
-    const sent = status.client.calls.find(call => call.name === 'send_file');
-    expect(sent?.args).toMatchObject({
-      contact: OWNER, filename: 'report.txt', reply_to_wire_id: ownerWire,
-    });
-    expect(sent?.args?.contact).not.toBe(OTHER);
-    expect(existsSync(String(sent?.args?.path))).toBe(false);
-    await status.channel.close();
-  });
-
-  it('routes an uncorrelated managed-agent file to the latest authenticated owner', async () => {
-    const status = await setup([OWNER, OTHER], false, AGENT);
-    const ownerWire = '9'.repeat(64);
-    status.client.batches.push([{
-      msg_id: 14, wire_id: ownerWire, from: { id: OTHER, name: 'Laptop' }, text: '/status',
-    }], []);
-    await status.channel.drain();
-    const bytes = Buffer.from('proactive report');
-    const source = join(status.dir, 'proactive-report');
-    writeFileSync(source, bytes);
-    status.client.files = [listed({
-      from: { id: AGENT, name: 'Coordinator' }, size: bytes.length, filename: 'idea.txt',
-    })];
-    status.client.retrieved.set(FILE_WIRE, retrieved(source, bytes, {
-      from: { id: AGENT, name: 'Coordinator' }, filename: 'idea.txt',
-    }));
-    await status.channel.drain();
-
-    expect(status.client.calls.find(call => call.name === 'send_file')?.args).toMatchObject({
-      contact: OTHER, filename: 'idea.txt',
-    });
-    expect(status.client.calls.find(call => call.name === 'send_file')?.args)
-      .not.toHaveProperty('reply_to_wire_id');
-    await status.channel.close();
-  });
-
-  it('refuses an unknown correlated wire instead of guessing an owner route', async () => {
-    const status = await setup([OWNER, OTHER], false, AGENT);
-    status.client.batches.push([{
-      msg_id: 15, wire_id: '9'.repeat(64), from: { id: OTHER }, text: '/status',
-    }], []);
-    await status.channel.drain();
-    status.client.files = [listed({
-      from: { id: AGENT, name: 'Coordinator' }, reply_to: { wire_id: '7'.repeat(64) },
-    })];
-    await status.channel.drain();
-
-    expect(status.client.calls.some(call => call.name === 'get_files')).toBe(false);
-    expect(status.client.calls.some(call => call.name === 'send_file')).toBe(false);
-    expect(status.logs.join('\n')).toContain('no authenticated owner route matches the source wire');
-    await status.channel.close();
   });
 
   it('routes simultaneous authenticated owners independently and suppresses replayed wires', async () => {
@@ -445,5 +360,121 @@ describe('attachment admission and recovery primitives', () => {
     utimesSync(old, past, past);
     expect(await cleanupAttachmentRoot(inbox, 10_000, 100)).toBe(1);
     expect(() => lstatSync(old)).toThrow();
+  });
+});
+
+describe('voice-message MIME admission', () => {
+  // Voice notes ride "<base>; x-ours-kind=voice-message" verbatim end to end
+  // (base varies by recorder: audio/webm Chrome/Android, audio/mp4 iOS Safari,
+  // audio/ogg fallback). Policy applies to the base container type for voice
+  // messages only; ordinary files keep exact allowlist matching.
+  const VOICE_PARAM = 'x-ours-kind=voice-message';
+  const voiceConfig: OwnerAttachmentConfig = {
+    ...attachmentConfig,
+    allowed_mime: [...attachmentConfig.allowed_mime, 'audio/webm', 'audio/mp4'],
+  };
+  const WEBM = Buffer.concat([Buffer.from([0x1a, 0x45, 0xdf, 0xa3]), Buffer.from('webm-voice')]);
+  const M4A = Buffer.concat([Buffer.from([0, 0, 0, 0x18]), Buffer.from('ftypM4A voice')]);
+
+  function incoming(mime: string, kind: 'file' | 'voice_message' = 'voice_message',
+    overrides: Partial<IncomingAttachment> = {}): IncomingAttachment {
+    return {
+      fileId: 7, wireId: FILE_WIRE, senderId: OWNER, senderName: 'Phone',
+      filename: 'voice-message-20260804.webm', mime, size: 20, status: 'unread',
+      date: '2026-08-04T12:00:00Z', kind, replyTo: null, ...overrides,
+    };
+  }
+
+  it('accepts every recorder base container carrying the voice marker', () => {
+    for (const base of ['audio/webm', 'audio/mp4', 'audio/ogg']) {
+      expect(validateAttachmentSelection(
+        [incoming(`${base}; ${VOICE_PARAM}`)], voiceConfig)).toBeUndefined();
+    }
+  });
+
+  it('keeps voice admission fail-closed outside the allowlisted audio bases', () => {
+    // Base container absent from the allowlist: still rejected.
+    expect(validateAttachmentSelection(
+      [incoming(`audio/webm; ${VOICE_PARAM}`)], attachmentConfig)).toMatch(/not allowed/);
+    // Forged voice marker on a non-audio type: rejected even though the base is allowlisted.
+    expect(validateAttachmentSelection(
+      [incoming(`application/pdf; ${VOICE_PARAM}`)], voiceConfig)).toBeTruthy();
+    // Voice-kind limits unchanged: oversize voice files still fail.
+    expect(validateAttachmentSelection(
+      [incoming(`audio/webm; ${VOICE_PARAM}`, 'voice_message', { size: 2_000 })],
+      voiceConfig)).toMatch(/byte limit/);
+  });
+
+  it('leaves ordinary-file policy byte-identical: parameters never match the allowlist', () => {
+    expect(validateAttachmentSelection(
+      [incoming('audio/webm; codecs=opus', 'file')], voiceConfig)).toMatch(/not allowed/);
+    expect(validateAttachmentSelection(
+      [incoming(`audio/webm; ${VOICE_PARAM}`, 'file')], voiceConfig)).toMatch(/not allowed/);
+    expect(validateAttachmentSelection(
+      [incoming('audio/webm', 'file')], voiceConfig)).toBeUndefined();
+  });
+
+  it('admits WebM/Opus and iOS mp4 voice bytes under the parameterized declared MIME', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'ours-voice-admission-'));
+    dirs.push(root);
+    const dir = await prepareAttachmentDirectory(join(root, 'inbox'), 'request');
+    const cases: Array<[string, Buffer, string, string]> = [
+      [`audio/webm; ${VOICE_PARAM}`, WEBM, 'audio/webm', 'voice-message-20260804.webm'],
+      [`audio/mp4; ${VOICE_PARAM}`, M4A, 'audio/mp4', 'voice-message-20260804.m4a'],
+    ];
+    const files: RetrievedAttachment[] = cases.map(([mime, bytes, , filename], index) => {
+      const source = join(root, `source-${index}`);
+      writeFileSync(source, bytes);
+      return {
+        ...incoming(mime, 'voice_message', {
+          wireId: String(index + 5).repeat(64), filename, size: bytes.length,
+        }),
+        path: source, sha256: createHash('sha256').update(bytes).digest('hex'),
+      };
+    });
+    const admitted = await admitAttachments(files, dir, voiceConfig);
+    expect(admitted.map(file => file.detectedMime)).toEqual(['audio/webm', 'audio/mp4']);
+    expect(admitted.map(file => file.declaredMime)).toEqual(['audio/webm', 'audio/mp4']);
+    expect(admitted.map(file => file.kind)).toEqual(['voice_message', 'voice_message']);
+  });
+
+  it('still rejects voice bytes whose content contradicts the declared base container', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'ours-voice-forged-'));
+    dirs.push(root);
+    const dir = await prepareAttachmentDirectory(join(root, 'inbox'), 'request');
+    const bytes = Buffer.from('%PDF-1.7 not audio');
+    const source = join(root, 'forged');
+    writeFileSync(source, bytes);
+    const file: RetrievedAttachment = {
+      ...incoming(`audio/webm; ${VOICE_PARAM}`, 'voice_message', { size: bytes.length }),
+      path: source, sha256: createHash('sha256').update(bytes).digest('hex'),
+    };
+    await expect(admitAttachments([file], dir, voiceConfig))
+      .rejects.toThrow(/does not match declared MIME/);
+  });
+
+  it('routes an authenticated WebM voice message end to end with its transcript', async () => {
+    const status = await setup([OWNER], false, voiceConfig);
+    const mime = `audio/webm; ${VOICE_PARAM}`;
+    const source = join(status.dir, 'voice.webm');
+    writeFileSync(source, WEBM);
+    status.client.files = [listed({
+      filename: 'voice-message-20260804.webm', mime, size: WEBM.length, kind: 'voice_message',
+    })];
+    status.client.retrieved.set(FILE_WIRE, retrieved(source, WEBM, {
+      filename: 'voice-message-20260804.webm', mime, kind: 'voice_message',
+      transcription: {
+        configured: true, attempted: true, status: 'succeeded', provider: 'fixture',
+        text: 'Deploy the fix.', error_category: null, audio_path: source, file_wire_id: FILE_WIRE,
+      },
+    }));
+    await status.channel.drain();
+    expect(status.queuePrompt).toHaveBeenCalledOnce();
+    const prompt = String(status.queuePrompt.mock.calls[0][0]);
+    expect(prompt).toContain('detected MIME: audio/webm');
+    expect(prompt).toContain('voice transcript: Deploy the fix.');
+    status.finish({ accepted: true, outcome: 'completed', succeeded: true, output: 'Heard.' });
+    await vi.waitFor(() => expect(status.client.calls.some(call => call.args?.text === 'Heard.')).toBe(true));
+    await status.channel.close();
   });
 });

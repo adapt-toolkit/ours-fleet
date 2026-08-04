@@ -303,6 +303,7 @@ function provenanceSettings(
         ? { value: explicitModel, source: 'cli' }
         : { value: inheritedModel, source: inheritedModel ? 'fleet-default' : 'built-in' },
     coordinator: provenanceOf(o.coordinator, undefined, undefined),
+    permission_mode: provenanceOf(o.permissionMode, undefined, undefined),
     approval: provenanceOf(o.approval, perms.approval, 'ask'),
     filesystem: provenanceOf(o.filesystem, perms.filesystem, 'workspace'),
     unattended: provenanceOf(o.unattended, perms.unattended, 'deny'),

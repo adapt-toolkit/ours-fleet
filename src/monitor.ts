@@ -69,7 +69,12 @@ export interface MonitorDeps {
 
 // Code constants (not config — YAGNI, design §2).
 const DEFAULT_PORT = 3050;
-const LONGPOLL_TIMEOUT_MS = 35_000;   // > the daemon's 25s hold
+// The daemon normally holds for 25s, but that value is operator-configurable
+// and synchronous daemon work can delay the response. The former 35s timer
+// repeatedly cancelled a healthy local stream and then reported its own abort
+// as a connectivity failure. Keep a generous stall detector so a genuinely
+// wedged connection is still visible, with an explicit diagnostic.
+const LONGPOLL_STALL_MS = 120_000;
 const COALESCE_HOLD_MS = 500;         // straggler poll must not block
 const BOOT_GRACE_MS = 15_000;         // hold injection until the TUI is up
 const POST_VERIFY_MS = 1_000;
@@ -487,7 +492,7 @@ export class Monitor {
       return;
     }
     try {
-      const body = await this.doFetch('tip', LONGPOLL_TIMEOUT_MS);
+      const body = await this.doFetch('tip', LONGPOLL_STALL_MS, 'stall');
       this.cursor = typeof body.cursor === 'number' ? body.cursor : 0;
       this.persistCursor();
       this.writeStatus();
@@ -512,7 +517,7 @@ export class Monitor {
       if (!this.deps.isAlive(pid)) { this.degrade('offline', 'session offline'); return; }
       let body: { cursor?: number; events?: NotifyEvent[] };
       try {
-        body = await this.doFetch(String(this.cursor ?? 0), LONGPOLL_TIMEOUT_MS);
+        body = await this.doFetch(String(this.cursor ?? 0), LONGPOLL_STALL_MS, 'stall');
         backoff = 0;
         // A poll that worked proves the stream is healthy — and only that.
         this.recover('connectivity');
@@ -568,7 +573,7 @@ export class Monitor {
     await this.deps.sleep(this.cfg.batch_ms);
     if (this.stopped) return;
     try {
-      const more = await this.doFetch(String(this.cursor ?? 0), COALESCE_HOLD_MS);
+      const more = await this.doFetch(String(this.cursor ?? 0), COALESCE_HOLD_MS, 'coalesce');
       this.advance(more.cursor, false);
       appendUniqueEvents(batch, filterEvents(more.events ?? [], this.cfg.wake_sources));
     } catch { /* no stragglers / abort — deliver what we have */ }
@@ -718,14 +723,23 @@ export class Monitor {
     }
   }
 
-  private async doFetch(since: string, holdMs: number): Promise<{ cursor?: number; events?: NotifyEvent[] }> {
+  private async doFetch(
+    since: string,
+    timeoutMs: number,
+    timeoutKind: 'stall' | 'coalesce',
+  ): Promise<{ cursor?: number; events?: NotifyEvent[] }> {
     const ctrl = new AbortController();
     this.currentAbort = ctrl;
-    const timer = this.deps.timers.set(() => ctrl.abort(), holdMs);
+    let timedOut = false;
+    const timer = this.deps.timers.set(() => { timedOut = true; ctrl.abort(); }, timeoutMs);
     let resp: FetchResponse;
     try {
       resp = await this.deps.fetch(`${this.ep.url(this.identity)}?since=${since}`,
         { headers: this.ep.headers, signal: ctrl.signal });
+    } catch (error) {
+      if (timedOut && timeoutKind === 'stall')
+        throw new Error(`notification stream stalled for ${Math.round(timeoutMs / 1000)}s`);
+      throw error;
     } finally {
       this.deps.timers.clear(timer);
       this.currentAbort = null;

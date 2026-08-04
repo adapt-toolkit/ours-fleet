@@ -5,6 +5,7 @@ import { buildWebServer } from '../../../dist/web/server.js';
 import { WebAuth } from '../../../dist/web/auth.js';
 import { TrustedDeviceStore } from '../../../dist/web/device-store.js';
 import { AuditSink } from '../../../dist/web/audit.js';
+import { passwordAccess } from '../../../dist/web/access.js';
 
 const status = {
   roleId: 'Alpha', observedAt: new Date().toISOString(), overall: 'ready',
@@ -135,6 +136,7 @@ const watchdogsService = {
   async report(name, runId) { return watchdogReports[name]?.[runId]; },
 };
 const actions = new Map();
+let outputCalls = 0;
 const services = {
   watchdogs: watchdogsService,
   query: {
@@ -162,17 +164,20 @@ const services = {
     return {
       async describe() { return { backend: 'acp', protocolVersion: 2, features: [] }; },
       async snapshot() { return { backend: 'acp', alive: true, readiness: 'idle' }; },
-      async recentOutput() {
-        return {
-          events: [
+      async recentOutput(request = {}) {
+        outputCalls++;
+        const events = [
             { version: 1, seq: 1, at: new Date().toISOString(), kind: 'agent_text', text: 'Fixture' },
             { version: 1, seq: 2, at: new Date().toISOString(), kind: 'agent_text', text: ' agent' },
             { version: 1, seq: 3, at: new Date().toISOString(), kind: 'agent_text', text: ' is ready.' },
             { version: 1, seq: 4, at: new Date().toISOString(), kind: 'tool_update', status: 'streaming' },
             { version: 1, seq: 5, at: new Date().toISOString(), kind: 'tool_update', status: 'complete' },
-          ],
-          firstSeq: 1, lastSeq: 5, truncated: false,
-        };
+            ...(outputCalls >= 2 ? [{ version: 1, seq: 6, at: new Date().toISOString(),
+              kind: 'agent_text', text: 'Live refresh arrived.' }] : []),
+          ];
+        const page = events.filter(event => event.seq > (request.since ?? 0));
+        return { events: page, firstSeq: page[0]?.seq, lastSeq: events.at(-1)?.seq,
+          nextCursor: String(events.at(-1)?.seq ?? 0), truncated: false };
       },
       async sendText() {
         return { accepted: true, promptId: 'fixture-prompt', queuedBehind: 0, terminalOutcomeKnown: false, detail: 'accepted; turn may still be running' };
@@ -263,7 +268,22 @@ server.app.post('/__test/restart-auth', async () => {
   server.auth.clearSessions();
   return { ok: true };
 });
+server.app.get('/__test/metrics', async () => ({ outputCalls }));
 await server.app.listen({ host: '127.0.0.1', port: 49371 });
+const noneBoundary = { origin: 'http://127.0.0.1:49372', host: '127.0.0.1:49372' };
+const noneDir = mkdtempSync(join(tmpdir(), 'ours-fleet-e2e-none-'));
+const noneServer = await buildWebServer({ ...services, audit: new AuditSink(join(noneDir, 'audit')) }, noneBoundary, {
+  auth: new WebAuth(noneBoundary.origin, noneBoundary.host, Date.now,
+    new TrustedDeviceStore(noneDir), { version: 1, mode: 'none' }),
+});
+await noneServer.app.listen({ host: '127.0.0.1', port: 49372 });
+const passwordBoundary = { origin: 'http://127.0.0.1:49373', host: '127.0.0.1:49373' };
+const passwordDir = mkdtempSync(join(tmpdir(), 'ours-fleet-e2e-password-'));
+const passwordServer = await buildWebServer({ ...services, audit: new AuditSink(join(passwordDir, 'audit')) }, passwordBoundary, {
+  auth: new WebAuth(passwordBoundary.origin, passwordBoundary.host, Date.now,
+    new TrustedDeviceStore(passwordDir), passwordAccess('correct horse battery staple')),
+});
+await passwordServer.app.listen({ host: '127.0.0.1', port: 49373 });
 for (const signal of ['SIGINT', 'SIGTERM']) process.once(signal, async () => {
-  await server.close(); process.exit(0);
+  await Promise.all([server.close(), noneServer.close(), passwordServer.close()]); process.exit(0);
 });

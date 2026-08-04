@@ -96,6 +96,23 @@ async function authenticated(overrides: Record<string, unknown> = {}) {
 }
 
 describe('secure local web host', () => {
+  it('accepts localhost and explains an unconfigured browser host as HTML', async () => {
+    const server = await testServer();
+    server.auth.setBoundary(boundary.origin, boundary.host, {
+      hosts: ['localhost:49271'], origins: ['http://localhost:49271'],
+    });
+    const localhost = await server.app.inject({ method: 'GET', url: '/api/v1/auth/mode',
+      headers: { host: 'localhost:49271' } });
+    expect(localhost.statusCode).toBe(200);
+    const wrong = await server.app.inject({ method: 'GET', url: '/',
+      headers: { host: 'vps.invalid' } });
+    expect(wrong.statusCode).toBe(421);
+    expect(wrong.headers['content-type']).toContain('text/html');
+    expect(wrong.body).toContain('not configured');
+    expect(wrong.body).not.toContain('invalid Host header');
+    await server.close();
+  });
+
   it('requires exact Host and Origin for bootstrap and consumes the secret once', async () => {
     const server = await testServer();
     const wrong = await server.app.inject({

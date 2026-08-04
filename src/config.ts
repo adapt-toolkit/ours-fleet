@@ -426,6 +426,17 @@ export function loadConfig(
   };
 }
 
+/**
+ * Canonical form of a 64-hex container ID for authorization decisions. Hex
+ * case is not identity: two casings of one CID are the same peer, so every
+ * comparison must use this form. Addressing is the opposite — the daemon's
+ * contact resolution is case-exact, so daemon-delivered forms must be sent
+ * back verbatim and never rewritten to canonical case.
+ */
+export function canonicalCid(value: string): string {
+  return /^[A-Fa-f0-9]{64}$/.test(value) ? value.toLowerCase() : value;
+}
+
 export function resolveOwnerChannelConfig(
   defaults: unknown, role: OwnerChannelConfigInput | undefined,
   session: SessionBackendId, file = 'config', name = 'role',
@@ -449,14 +460,14 @@ export function resolveOwnerChannelConfig(
   if (!Array.isArray(merged.owners) || merged.owners.length === 0
       || merged.owners.some(owner => typeof owner !== 'string' || !owner.trim()))
     throw new ConfigError(`${file}: role '${name}' owner_channel.owners must be a non-empty list of contact IDs`);
-  const owners = merged.owners.map(owner => owner.trim());
+  const owners = merged.owners.map(owner => canonicalCid(owner.trim()));
   if (new Set(owners).size !== owners.length)
     throw new ConfigError(`${file}: role '${name}' owner_channel.owners must not contain duplicates`);
   if (merged.agent !== undefined
       && (typeof merged.agent !== 'string' || !/^[A-Fa-f0-9]{64}$/.test(merged.agent)))
     throw new ConfigError(
       `${file}: role '${name}' owner_channel.agent must be exactly 64 hexadecimal characters`);
-  const agent = merged.agent?.trim();
+  const agent = merged.agent === undefined ? undefined : canonicalCid(merged.agent.trim());
   if (agent && owners.includes(agent))
     throw new ConfigError(
       `${file}: role '${name}' owner_channel.agent must not also be an owner CID`);

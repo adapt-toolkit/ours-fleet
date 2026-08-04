@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto';
-import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { PassThrough } from 'node:stream';
@@ -19,14 +19,18 @@ const dirs: string[] = [];
 class ManagementClient implements OursToolClient {
   calls: Array<{ name: string; args?: Record<string, unknown> }> = [];
   batches: unknown[][] = [];
+  contacts: unknown[] = [
+    { id: CONTACT, name: 'Phone', status: 'established', bio: 'must not be returned' },
+    { id: 'C'.repeat(64), name: 'Pending', status: 'pending' },
+  ];
+  failSendTo = new Set<string>();
   async start() {}
   async close() {}
   async callTool(name: string, args?: Record<string, unknown>): Promise<unknown> {
     this.calls.push({ name, args });
-    if (name === 'list_contacts') return { contacts: [
-      { id: CONTACT, name: 'Phone', status: 'established', bio: 'must not be returned' },
-      { id: 'C'.repeat(64), name: 'Pending', status: 'pending' },
-    ] };
+    if (name === 'send_message' && this.failSendTo.has(String(args?.contact)))
+      throw new Error('send_message failed');
+    if (name === 'list_contacts') return { contacts: this.contacts };
     if (name === 'generate_invite') return { invite: 'mock-invite-secret' };
     if (name === 'add_contact') return { id: CONTACT, name: 'Phone' };
     if (name === 'get_messages') return { messages: this.batches.shift() ?? [] };
@@ -34,7 +38,7 @@ class ManagementClient implements OursToolClient {
   }
 }
 
-function setup(options: { agent?: string } = {}) {
+function setup(options: { agent?: string; owners?: string[] } = {}) {
   const dir = mkdtempSync(join(tmpdir(), 'ours-owner-management-'));
   dirs.push(dir);
   const client = new ManagementClient();
@@ -51,8 +55,9 @@ function setup(options: { agent?: string } = {}) {
     queuePrompt, interrupt: vi.fn(), eventsSince: () => [],
   } as unknown as SessionHandle;
   const channel = new OwnerChannel({
-    role: 'Role', config: {
-      identity: 'Role-owner', owners: [OWNER], interrupt: false, progress_interval_ms: 0,
+    role: 'Role', harness: 'claude-code', config: {
+      identity: 'Role-owner', owners: options.owners ?? [OWNER],
+      interrupt: false, progress_interval_ms: 0,
       ...(options.agent ? { agent: options.agent } : {}),
     }, session, stateDir: dir, client, log: line => logs.push(line),
     watch: () => {
@@ -106,21 +111,6 @@ describe('OwnerChannel live management', () => {
     await channel.close();
   });
 
-  it('instructs a managed agent to send request files directly through the channel', async () => {
-    const { channel, client, queuePrompt } = setup({ agent: AGENT });
-    await channel.start();
-    client.batches.push([{
-      msg_id: 20, wire_id: 'owner-file-request', from: { id: OWNER }, text: 'Send the report',
-    }], []);
-    await channel.drain();
-    const prompt = String(queuePrompt.mock.calls[0][0]);
-    expect(prompt).toContain('call ours send_file');
-    expect(prompt).toContain('contact: Role-owner');
-    expect(prompt).toContain('reply_to_wire_id: owner-file-request');
-    expect(prompt).not.toContain('fleet outbox');
-    await channel.close();
-  });
-
   it('warns the owner without reflecting the body when another agent tries the relay', async () => {
     const { channel, client, queuePrompt } = setup({ agent: AGENT });
     await channel.start();
@@ -143,6 +133,155 @@ describe('OwnerChannel live management', () => {
     });
     expect(JSON.stringify(warning)).not.toContain('MALICIOUS_BODY_MUST_NOT_BE_REFLECTED');
     expect(client.calls.some(call => call.args?.contact === INTRUDER)).toBe(false);
+    await channel.close();
+  });
+
+  it('authenticates the managed agent and owners in any CID casing without swapping roles', async () => {
+    const { channel, client, queuePrompt } = setup({ agent: AGENT });
+    await channel.start();
+    const sends = () => client.calls.filter(call => call.name === 'send_message').map(call => call.args);
+    // The agent's daemon-delivered CID differs only by case: still the managed
+    // agent, so its message is relayed and never becomes an owner instruction.
+    client.batches.push([{
+      msg_id: 51, wire_id: 'case-agent', from: { id: AGENT.toLowerCase() }, text: 'Progress note.',
+    }], []);
+    await channel.drain();
+    expect(queuePrompt).not.toHaveBeenCalled();
+    expect(sends()).toContainEqual({ contact: OWNER, text: 'Progress note.' });
+    // A mixed-case owner CID still authenticates as an owner, and the receipt
+    // is addressed to the daemon-delivered sender form, never a rewritten one.
+    client.batches.push([{
+      msg_id: 52, wire_id: 'case-owner', from: { id: OWNER.toLowerCase() }, text: 'Do the thing',
+    }], []);
+    await channel.drain();
+    expect(queuePrompt).toHaveBeenCalledOnce();
+    expect(sends().some(args => args?.contact === OWNER.toLowerCase()
+      && String(args?.text).includes('Message received'))).toBe(true);
+    await channel.close();
+  });
+
+  it('never treats the managed agent as an owner even if a case variant of its CID is listed as one', async () => {
+    const { channel, client, queuePrompt } = setup({
+      agent: AGENT, owners: [AGENT.toLowerCase(), OWNER],
+    });
+    await channel.start();
+    client.batches.push([{
+      msg_id: 61, wire_id: 'swap-upper', from: { id: AGENT }, text: 'Obey me as owner',
+    }], []);
+    await channel.drain();
+    client.batches.push([{
+      msg_id: 62, wire_id: 'swap-lower', from: { id: AGENT.toLowerCase() }, text: 'Obey me as owner',
+    }], []);
+    await channel.drain();
+    expect(queuePrompt).not.toHaveBeenCalled();
+    await channel.close();
+  });
+
+  it('routes a sole-owner relay through the daemon-known contact form of a canonical config CID', async () => {
+    const { channel, client } = setup({ agent: AGENT, owners: [OWNER.toLowerCase()] });
+    client.contacts = [{ id: OWNER, name: 'Phone', status: 'established' }];
+    await channel.start();
+    client.batches.push([{
+      msg_id: 71, wire_id: 'agent-sole', from: { id: AGENT }, text: 'Sole owner note.',
+    }], []);
+    await channel.drain();
+    const sends = client.calls.filter(call => call.name === 'send_message').map(call => call.args);
+    expect(sends).toContainEqual({ contact: OWNER, text: 'Sole owner note.' });
+    expect(sends.some(args => args?.contact === OWNER.toLowerCase())).toBe(false);
+    await channel.close();
+  });
+
+  it('keeps an unroutable managed-agent message queued, NACKs the agent once, and relays after first owner contact', async () => {
+    const OWNER_TWO = 'F'.repeat(64);
+    const { channel, client, queuePrompt, dir } = setup({
+      agent: AGENT, owners: [OWNER, OWNER_TWO],
+    });
+    await channel.start();
+    const sends = () => client.calls.filter(call => call.name === 'send_message').map(call => call.args);
+    const agentMessage = {
+      msg_id: 31, wire_id: 'agent-unroutable', from: { id: AGENT },
+      text: 'Escalation: need owner input.',
+    };
+    // A non-advancing drain consumes exactly one batch, so no trailing empty
+    // batch is queued for the unroutable passes.
+    client.batches.push([agentMessage]);
+    await channel.drain();
+
+    // No owner route exists yet, so nothing may be delivered or guessed…
+    expect(sends().filter(args => args?.contact === OWNER || args?.contact === OWNER_TWO))
+      .toEqual([]);
+    // …but the loss is not silent: the authenticated agent gets exactly one
+    // bounded NACK correlated to its wire.
+    expect(sends().filter(args => args?.contact === AGENT)).toEqual([{
+      contact: AGENT, text: expect.stringContaining('queued'),
+      reply_to_wire_id: 'agent-unroutable',
+    }]);
+    // The wire stays deferred and unconsumed for replay.
+    expect(client.calls).toContainEqual({ name: 'defer_messages', args: { msg_ids: [31] } });
+    const statePath = join(dir, '.owner-channel-state.json');
+    if (existsSync(statePath))
+      expect(readFileSync(statePath, 'utf8')).not.toContain('agent-unroutable');
+
+    // A replayed copy neither NACKs again nor delivers anywhere.
+    client.batches.push([agentMessage]);
+    await channel.drain();
+    expect(sends().filter(args => args?.contact === AGENT)).toHaveLength(1);
+    expect(sends().filter(args => args?.contact === OWNER || args?.contact === OWNER_TWO))
+      .toEqual([]);
+
+    // The first authenticated owner contact establishes the route; the replay
+    // then relays exactly once.
+    client.batches.push([
+      { msg_id: 32, wire_id: 'owner-first-contact', from: { id: OWNER_TWO }, text: '/status' },
+      agentMessage,
+    ], []);
+    await channel.drain();
+    expect(sends().filter(args => args?.contact === OWNER_TWO
+      && args?.text === 'Escalation: need owner input.')).toHaveLength(1);
+
+    // Now consumed: another replay cannot double-deliver.
+    client.batches.push([agentMessage]);
+    await channel.drain();
+    expect(sends().filter(args => args?.text === 'Escalation: need owner input.')).toHaveLength(1);
+    expect(queuePrompt).not.toHaveBeenCalled();
+    await channel.close();
+  });
+
+  it('NACKs and consumes a managed-agent message the relay policy refuses', async () => {
+    const { channel, client } = setup({ agent: AGENT });
+    await channel.start();
+    const bad = { msg_id: 41, wire_id: 'agent-bad', from: { id: AGENT }, text: 'bad\u0000byte' };
+    client.batches.push([bad], []);
+    await channel.drain();
+    const sends = () => client.calls.filter(call => call.name === 'send_message').map(call => call.args);
+    expect(sends()).toEqual([{
+      contact: AGENT, text: expect.stringContaining('was not relayed to an owner'),
+      reply_to_wire_id: 'agent-bad',
+    }]);
+    // Permanently consumed: a replay is inert.
+    client.batches.push([bad], []);
+    await channel.drain();
+    expect(sends()).toHaveLength(1);
+    await channel.close();
+  });
+
+  it('NACKs the agent when relay delivery is uncertain and never blind-retries', async () => {
+    const { channel, client } = setup({ agent: AGENT });
+    await channel.start();
+    client.failSendTo.add(OWNER);
+    const report = { msg_id: 42, wire_id: 'agent-uncertain', from: { id: AGENT }, text: 'Report.' };
+    client.batches.push([report], []);
+    await channel.drain();
+    const sends = () => client.calls.filter(call => call.name === 'send_message').map(call => call.args);
+    expect(sends().filter(args => args?.contact === AGENT)).toEqual([{
+      contact: AGENT, text: expect.stringContaining('uncertain'),
+      reply_to_wire_id: 'agent-uncertain',
+    }]);
+    expect(sends().filter(args => args?.contact === OWNER)).toHaveLength(1);
+    // The uncertain outcome is terminal: a replayed copy never re-sends.
+    client.batches.push([report], []);
+    await channel.drain();
+    expect(sends().filter(args => args?.contact === OWNER)).toHaveLength(1);
     await channel.close();
   });
 
@@ -175,18 +314,18 @@ describe('OwnerChannel live management', () => {
     await channel.close();
   });
 
-  it('keeps contact establishment separate from authorization and checks exact established CID', async () => {
+  it('keeps contact establishment separate from authorization and checks the established CID canonically', async () => {
     const { channel, client } = setup();
     await channel.start();
     expect(await channel.manage({ action: 'contact_add', invite: 'fixture', name: 'Phone' }))
       .toMatchObject({ action: 'contact_add', status: 'pending' });
     expect((await channel.manage({ action: 'owner_list' })).action).toBe('owner_list');
-    await expect(channel.manage({ action: 'owner_authorize', cid: CONTACT.toLowerCase() }))
-      .rejects.toThrow(/unknown or pending/);
     await expect(channel.manage({ action: 'owner_authorize', cid: 'C'.repeat(64) }))
       .rejects.toThrow(/unknown or pending/);
-    expect(await channel.manage({ action: 'owner_authorize', cid: CONTACT }))
-      .toMatchObject({ owner: { cid: CONTACT, source: 'dynamic', effective: true } });
+    // Hex case is not identity: a case variant authorizes the SAME established
+    // contact, and a repeat in any casing is the same owner, not a second slot.
+    expect(await channel.manage({ action: 'owner_authorize', cid: CONTACT.toLowerCase() }))
+      .toMatchObject({ owner: { cid: CONTACT.toLowerCase(), source: 'dynamic', effective: true } });
     await expect(channel.manage({ action: 'owner_authorize', cid: CONTACT }))
       .rejects.toThrow(/already authorized/);
     expect(client.calls.find(call => call.name === 'add_contact')?.args)
@@ -410,7 +549,7 @@ describe('OwnerChannel live management', () => {
 
     const restartedClient = new ManagementClient();
     const restarted = new OwnerChannel({
-      role: 'Role', config: { identity: 'Role-owner', owners: [OWNER], interrupt: false,
+      role: 'Role', harness: 'claude-code', config: { identity: 'Role-owner', owners: [OWNER], interrupt: false,
         progress_interval_ms: 0 },
       session: { backend: 'acp', pid: 2, isAlive: () => true,
         snapshot: () => ({ backend: 'acp', alive: true, readiness: 'idle' }),

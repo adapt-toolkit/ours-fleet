@@ -39,8 +39,9 @@ describe('loadConfig', () => {
       '',
     ].join('\n'));
     expect(findRole(loadConfig(), 'Coordinator').owner_channel).toEqual({
-      identity: 'Coordinator-owner', owners: [ownerOne, ownerTwo],
-      agent,
+      // CIDs resolve to their canonical (lowercase) hex form.
+      identity: 'Coordinator-owner', owners: [ownerOne.toLowerCase(), ownerTwo.toLowerCase()],
+      agent: agent.toLowerCase(),
       interrupt: false, progress_interval_ms: 30_000,
       attachments: {
         enabled: true, max_files_per_request: 4, max_file_bytes: 10 * 1024 * 1024,
@@ -57,6 +58,33 @@ describe('loadConfig', () => {
     base(`roles:\n  A:\n    session: acp\n    owner_channel: { identity: A-owner, owners: [owner], agent: short }\n`);
     expect(() => loadConfig()).toThrow(/owner_channel\.agent must be exactly 64 hexadecimal/);
     base(`roles:\n  A:\n    session: acp\n    owner_channel: { identity: A-owner, owners: [${cid}], agent: ${cid} }\n`);
+    expect(() => loadConfig()).toThrow(/agent must not also be an owner CID/);
+  });
+
+  it('canonicalizes mixed-case owner and agent CIDs to lowercase at resolution', () => {
+    const agent = 'AbCdEf12'.repeat(8);
+    const owner = 'F0e1D2c3'.repeat(8);
+    base([
+      'roles:',
+      '  A:',
+      '    session: acp',
+      '    owner_channel:',
+      '      identity: A-owner',
+      `      owners: [${owner}]`,
+      `      agent: ${agent}`,
+      '',
+    ].join('\n'));
+    const channel = findRole(loadConfig(), 'A').owner_channel!;
+    expect(channel.owners).toEqual([owner.toLowerCase()]);
+    expect(channel.agent).toBe(agent.toLowerCase());
+  });
+
+  it('rejects owner duplicates and agent overlap that differ only by hex case', () => {
+    const lower = 'b'.repeat(64);
+    const upper = 'B'.repeat(64);
+    base(`roles:\n  A:\n    session: acp\n    owner_channel: { identity: A-owner, owners: [${lower}, ${upper}] }\n`);
+    expect(() => loadConfig()).toThrow(/owners must not contain duplicates/);
+    base(`roles:\n  A:\n    session: acp\n    owner_channel: { identity: A-owner, owners: [${lower}], agent: ${upper} }\n`);
     expect(() => loadConfig()).toThrow(/agent must not also be an owner CID/);
   });
 

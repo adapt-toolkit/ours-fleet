@@ -131,14 +131,18 @@ ours-fleet spawn Coder --harness codex --model gpt-5.4 \
 
 ## Local web console
 
-The interactive console is packaged with `@ours.network/fleet` and runs only on
-IPv4 loopback:
+The interactive console is packaged with `@ours.network/fleet` and binds to
+IPv4 loopback by default. Remote or proxy exposure is always explicit:
 
 ```sh
 npm run build
 ours-fleet web
 # choose a free port for an isolated test:
 ours-fleet web serve --port 0 --no-open
+# nginx/TLS terminates at the declared browser origin; fleet remains loopback-bound
+ours-fleet web install --public-origin https://fleet.example.com --password-file /secure/fleet-password
+# Intentional no-password mode, for example when nginx already authenticates:
+ours-fleet web install --public-origin https://fleet.example.com --no-password
 ```
 
 The normal `ours-fleet web` command installs or updates an owner-level native
@@ -163,8 +167,25 @@ Only a domain-separated SHA-256 device-secret hash and bounded timestamps are
 stored in the owner-private fleet state directory (`0700` directory, `0600`
 atomic file). The re-pair and revoke controls use an owner-private Unix socket;
 local processes running as the same OS user are therefore inside the trust
-boundary. Keep the console local: it has no `--host`, proxy, TLS, or
-remote-access mode.
+boundary.
+
+On first setup, the CLI requires an explicit access choice: `--password-file`
+or `--pairing` for protected access, or `--no-password` for intentional
+unprotected access. `--password-file` stores only a salted scrypt verifier in
+the owner-private web state; the source file remains operator-managed. New
+browsers sign in and then receive the same rotating HttpOnly trusted-device
+credential. `--no-password` is deliberately named and prints a warning: anyone
+who can reach that origin can control the fleet.
+
+For nginx on a VPS, keep the default loopback bind and set the exact external
+`--public-origin` (scheme, hostname, optional port). nginx should proxy HTTP and
+WebSocket upgrades to `127.0.0.1:49271` and provide TLS; rewriting the upstream
+Host is not required because the declared browser Origin remains authoritative. To listen beyond
+loopback, add an explicit `--bind`; fleet refuses a non-loopback bind without a
+public origin. Host and Origin validation use that declaration rather than
+trusting forwarded headers. `localhost` and `127.0.0.1` both work in normal
+local mode; an unconfigured hostname gets a self-describing HTML page instead
+of raw internal Host-header JSON.
 
 The console is installable as a standalone PWA. Its service worker caches only
 the data-free offline page and successful content-hashed JavaScript/CSS assets.
@@ -187,8 +208,8 @@ diagnostic.
 
 Security boundaries:
 
-- exact runtime `Host` and `Origin`, CSRF, one-time WebSocket tickets, and
-  loopback binding are enforced server-side;
+- configured `Host` and `Origin`, CSRF, one-time WebSocket tickets, and explicit
+  bind/origin policy are enforced server-side;
 - cwd values must resolve beneath configured local roots;
 - terminal bytes are intentionally unredacted and are never copied into audit
   records; normal logs are bounded and redacted;
@@ -609,13 +630,9 @@ An owner request follows one ordered lifecycle on its authenticated source wire:
 3. The agent may send any non-final message to the channel identity through its
    ordinary ours MCP tool. CID authentication is the message gate; no task ID,
    request ID, phase, reply reference, or routing command is used.
-4. For a requested file, the agent calls `send_file` to the channel identity with
-   the request's `reply_to_wire_id`. Fleet authenticates the agent CID, validates
-   the selected bytes, resolves that wire to its owner, and relays the file from
-   the channel identity. An unsolicited file omits the reply reference and uses
-   the latest authenticated owner route. There is no filesystem outbox protocol.
-5. Fleet independently emits exactly one final ACP response (or a sanitized
-   terminal outcome).
+4. Fleet independently emits exactly one final ACP
+   response (or a sanitized terminal outcome). Successful turns send regular files
+   from the request outbox afterward, correlated to the same source wire.
 
 Fleet chooses the stored latest authenticated owner for every managed-agent
 message; the model supplies only text and the channel contact. Relay audit logs
@@ -648,8 +665,58 @@ The two paths are deliberately simultaneous and have different authority:
   turn's final assistant text, and sends that final back to the exact initiating
   owner with `reply_to_wire_id`.
 
-Exact `/status` and `/interrupt` messages are supervisor commands and never
-enter the model. Processed wire IDs are durably bounded for deduplication, while
+#### Deterministic owner commands
+
+Any owner message whose trimmed text starts with `/` is a command attempt: it is
+handled by the fleet supervisor itself and never becomes an agent prompt.
+Unknown or malformed commands (wrong arguments included) answer with the help
+text instead of being forwarded; messages without a leading `/` reach the agent
+unchanged. The registry in `src/owner-channel/commands.ts` is the single source
+of truth — `/help` renders exactly that table, so adding an entry there is the
+whole registration step for a new command.
+
+| Command | Effect |
+| --- | --- |
+| `/help` (alias `/commands`) | list all deterministic owner-channel commands |
+| `/status` | report the agent's session state |
+| `/interrupt` | cancel the agent's active turn |
+| `/clear` | clear the agent's session context |
+| `/compact` | compact the agent's session context |
+| `/model <model-id>` | switch the model the agent runs on |
+| `/restart` | restart the agent, resuming its context |
+| `/force-restart` | restart the agent FRESH (context wiped) |
+| `/ls` | list running fleet sessions |
+| `/peek` | summarize recent session activity (event shapes only, no content) |
+| `/worklog` | tail the agent's worklog |
+| `/version` | report the fleet version |
+
+Implementation strategies differ but every command is deterministic:
+
+- `/help`, `/status`, `/interrupt`, `/peek`, `/worklog`, and `/version` are
+  answered by the supervisor directly. `/peek` deliberately reports event
+  *shapes* (kind, tool title, status) and never thought, agent-text, or tool
+  output bodies.
+- `/clear`, `/compact`, and `/model` deliver the raw slash text to the agent
+  harness, but only when the bundled ACP adapter for the role's harness
+  verifiably executes that command locally (pinned per harness in
+  `HARNESS_LOCAL_COMMANDS`): `claude-code` runs all three as Claude SDK
+  builtins; `codex` runs only `/compact` — `/clear` and `/model` are not
+  codex-acp builtins and would fall through to the model as an ordinary
+  prompt, so they answer with a truthful refusal instead of being forwarded.
+  When forwarded, fleet sends a `⏳` acceptance notice and reports the turn's
+  outcome on the same wire.
+- `/restart` and `/force-restart` confirm to the owner and durably mark the
+  message handled FIRST, then invoke the detached `ours-fleet restart` /
+  `force-restart` CLI — a successful bounce kills the supervisor process, so
+  nothing can be sent afterwards. `/ls` captures the CLI listing.
+
+Commands act only on the role whose channel received them (the restart target
+and session are fixed by the channel, never by message content), and the entire
+command path sits behind the authenticated owner-CID check: a non-owner sending
+`/force-restart` or `/model` is silently ignored exactly like any other
+unauthorized mail.
+
+Processed wire IDs are durably bounded for deduplication, while
 message and response bodies stay out of fleet state. Delivery is at-least-once
 across a crash (the bridge requeues fetched input before starting a turn); true
 exactly-once processing would require a leased claim/idempotency primitive in

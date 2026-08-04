@@ -3,6 +3,7 @@ import type { FastifyRequest } from 'fastify';
 import type { WebSocket } from 'ws';
 import { FleetError } from '../application/errors.js';
 import { TrustedDeviceStore, type TrustedDeviceIssue } from './device-store.js';
+import { verifyPassword, type WebAccessConfig } from './access.js';
 
 export interface BrowserSession {
   id: string;
@@ -47,13 +48,20 @@ export class WebAuth {
     private _host: string,
     private readonly now: () => number = Date.now,
     private readonly devices = new TrustedDeviceStore(),
+    private readonly access: WebAccessConfig = { version: 1, mode: 'pairing' },
   ) {}
   get bootstrapSecret(): string { return this._bootstrapSecret; }
   get origin(): string { return this._origin; }
   get host(): string { return this._host; }
-  setBoundary(origin: string, host: string): void {
+  get mode(): WebAccessConfig['mode'] { return this.access.mode; }
+  get secureCookies(): boolean { return this._origin.startsWith('https:'); }
+  private allowedOrigins = new Set<string>();
+  private allowedHosts = new Set<string>();
+  setBoundary(origin: string, host: string, aliases: { origins?: string[]; hosts?: string[] } = {}): void {
     this._origin = origin;
     this._host = host;
+    this.allowedOrigins = new Set([origin, ...(aliases.origins ?? [])]);
+    this.allowedHosts = new Set([host, ...(aliases.hosts ?? [])]);
   }
   /** Mint a replacement for an operator-triggered reauthentication ceremony. */
   mintBootstrap(): string {
@@ -65,9 +73,12 @@ export class WebAuth {
 
   validateBoundary(request: FastifyRequest, requireOrigin: boolean): void {
     const host = request.headers.host;
-    if (host !== this.host) throw new FleetError('forbidden', 'invalid Host header');
-    if (requireOrigin && request.headers.origin !== this.origin)
-      throw new FleetError('forbidden', 'invalid Origin header');
+    const hosts = this.allowedHosts.size ? this.allowedHosts : new Set([this.host]);
+    const origins = this.allowedOrigins.size ? this.allowedOrigins : new Set([this.origin]);
+    if (!host || !hosts.has(host)) throw new FleetError('forbidden',
+      `This address is not configured for the fleet console. Open ${this.origin} or set --public-origin.`);
+    if (requireOrigin && (!request.headers.origin || !origins.has(request.headers.origin)))
+      throw new FleetError('forbidden', 'request Origin does not match the configured control-panel origin');
     const fetchSite = request.headers['sec-fetch-site'];
     if (fetchSite && !['same-origin', 'none'].includes(String(fetchSite)))
       throw new FleetError('forbidden', 'cross-site request rejected');
@@ -75,6 +86,8 @@ export class WebAuth {
 
   exchange(request: FastifyRequest): AuthResult {
     this.validateBoundary(request, true);
+    if (this.access.mode !== 'pairing')
+      throw new FleetError('forbidden', 'one-time pairing is disabled for this access mode');
     this.consumeRate('bootstrap', 10, 60_000);
     const authorization = request.headers.authorization ?? '';
     const supplied = authorization.startsWith('Bootstrap ') ? authorization.slice(10) : '';
@@ -85,8 +98,24 @@ export class WebAuth {
     return { session: this.createSession(device.id), device };
   }
 
+  login(request: FastifyRequest, password: string): AuthResult {
+    this.validateBoundary(request, true);
+    this.consumeRate('password-login', 10, 60_000);
+    if (!verifyPassword(this.access, password))
+      throw new FleetError('unauthorized', 'invalid control-panel password');
+    const device = this.devices.issue();
+    return { session: this.createSession(device.id), device };
+  }
+
+  anonymous(request: FastifyRequest): BrowserSession {
+    this.validateBoundary(request, true);
+    if (this.access.mode !== 'none') throw new FleetError('forbidden', 'unprotected access is disabled');
+    return this.createSession('unprotected');
+  }
+
   resume(request: FastifyRequest): AuthResult {
     this.validateBoundary(request, true);
+    if (this.access.mode === 'none') throw new FleetError('forbidden', 'trusted devices are disabled');
     this.consumeRate('device-resume', 30, 60_000);
     const current = parseCookies(request.headers.cookie ?? '').ofs_device;
     const device = current ? this.devices.rotate(current) : undefined;
@@ -115,7 +144,7 @@ export class WebAuth {
   logout(request: FastifyRequest): void {
     const session = this.authenticate(request, true);
     const deviceId = this.sessionDevices.get(session.id);
-    if (deviceId) this.devices.revokeId(deviceId);
+    if (deviceId && deviceId !== 'unprotected') this.devices.revokeId(deviceId);
     this.removeSession(session.id);
   }
 

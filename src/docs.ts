@@ -74,10 +74,27 @@ ours-fleet web uninstall
 ours-fleet web serve --port 0 --no-open # isolated foreground/testing mode
 \`\`\`
 
-The console is intentionally IPv4-loopback-only. It has no LAN/Internet host,
-proxy, TLS, or remote-access mode. Do not expose port 49271 through a reverse
-proxy. Browser credentials are HttpOnly/SameSite, and \`revoke-all\` invalidates
-all trusted devices. Role creation offers harness-scoped known-model choices
+The console is IPv4-loopback-only by default. Both \`localhost\` and
+\`127.0.0.1\` are accepted locally. For an nginx/TLS reverse proxy, keep the
+default bind and declare the exact browser origin:
+
+\`ours-fleet web install --public-origin https://fleet.example.com --password-file /secure/fleet-password\`
+
+Fleet reads the password file during setup and persists only a salted scrypt
+verifier. New browsers authenticate and retain rotating HttpOnly/SameSite
+trusted-device credentials. If nginx already authenticates, the operator may
+deliberately select \`--no-password\`; the CLI and browser warn that anyone
+reaching the origin can control the fleet. First setup requires an explicit
+choice: \`--password-file\` or \`--pairing\` for protected access, or
+\`--no-password\` for intentional unprotected access.
+
+Use \`--bind ADDRESS\` only for an intentional direct listen. A non-loopback
+bind is rejected unless \`--public-origin\` is also present. Host/Origin checks
+use the declaration and do not trust forwarded headers. Configure nginx to
+proxy HTTP and WebSocket upgrades to \`127.0.0.1:49271\` and terminate TLS;
+fleet accepts nginx's loopback upstream Host, so no Host rewrite is required.
+Browser credentials add Secure for HTTPS, and \`revoke-all\` invalidates all
+trusted devices. Role creation offers harness-scoped known-model choices
 while still accepting a typed model ID; blank explicitly uses the selected
 harness's own default.
 
@@ -375,15 +392,21 @@ CID is forwarded as a new message to the latest authenticated owner conversation
 Every other CID is rejected and warned about without reflecting its body. Fleet sends
 accepted/queued/progress/interrupted/failure notices and routes the ACP turn's
 final assistant text back to the authenticated sender with its source wire ID.
-For file replies, the managed agent calls ours \`send_file\` to the channel
-identity with the owner request's \`reply_to_wire_id\`. Fleet accepts files only
-from the exact configured \`agent\` CID, selectively retrieves and validates the
-bytes, resolves the source wire to its authenticated owner route, and resends the
-file from the channel identity with the same reply reference. An unknown reply
-wire fails closed rather than falling back to another owner. A file without a
-reply reference is proactive and uses the latest authenticated owner conversation.
-There is no filesystem outbox protocol.
-Exact \`/status\` and \`/interrupt\` commands bypass the model.
+For file replies, fleet injects a request-specific outbox path into the owner
+prompt. The agent copies completed artifacts there; fleet sends every regular
+file from the channel identity with the same source wire ID and removes the
+temporary outbox only after successful delivery. The agent never chooses an owner
+recipient or calls ours \`send_file\` for an owner-channel response.
+Owner messages whose trimmed text starts with \`/\` are deterministic
+supervisor commands and never enter the model: \`/help\` (alias \`/commands\`),
+\`/status\`, \`/interrupt\`, \`/clear\`, \`/compact\`, \`/model <model-id>\`,
+\`/restart\`, \`/force-restart\`, \`/ls\`, \`/peek\`, \`/worklog\`, and
+\`/version\`. Unknown or malformed commands answer with the help text instead of
+being forwarded; plain messages reach the agent unchanged. \`/clear\`,
+\`/compact\`, and \`/model\` are forwarded only when the role's bundled ACP
+adapter executes them locally (claude-code: all three; codex: \`/compact\`
+only) and are otherwise refused with a notice, so slash text never reaches the
+model as a prompt.
 
 Owner documents, images, and voice messages use the same authenticated sender
 and source-wire boundary. Fleet inspects body-free metadata first and rejects

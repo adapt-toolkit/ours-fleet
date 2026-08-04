@@ -4,6 +4,7 @@ import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import { WebAuth } from '../../src/web/auth.js';
 import { TrustedDeviceStore } from '../../src/web/device-store.js';
+import { passwordAccess } from '../../src/web/access.js';
 
 const origin = 'http://127.0.0.1:49271';
 const host = '127.0.0.1:49271';
@@ -13,6 +14,32 @@ const temporaryStore = (now: () => number = Date.now, ttl?: number) => {
 };
 
 describe('browser auth and trusted devices', () => {
+  it('supports password and intentional unprotected modes without weakening pairing', () => {
+    const { store } = temporaryStore();
+    const protectedAuth = new WebAuth(origin, host, Date.now, store,
+      passwordAccess('correct horse battery staple'));
+    expect(protectedAuth.login(request({ host, origin }), 'correct horse battery staple').session.id)
+      .toHaveLength(43);
+    expect(() => protectedAuth.login(request({ host, origin }), 'wrong password')).toThrow(/invalid/);
+    expect(() => protectedAuth.exchange(pairingRequest(protectedAuth))).toThrow(/disabled/);
+
+    const anonymous = new WebAuth(origin, host, Date.now, store, { version: 1, mode: 'none' });
+    expect(anonymous.anonymous(request({ host, origin })).id).toHaveLength(43);
+    expect(() => anonymous.resume(deviceRequest('missing.token'))).toThrow(/disabled/);
+  });
+
+  it('allows a declared proxy to keep its loopback upstream Host while enforcing browser Origin', () => {
+    const { store } = temporaryStore();
+    const config = passwordAccess('correct horse battery staple');
+    const auth = new WebAuth('https://fleet.example.com', 'fleet.example.com', Date.now, store, config);
+    auth.setBoundary('https://fleet.example.com', 'fleet.example.com', { hosts: [host] });
+    expect(auth.login(request({ host, origin: 'https://fleet.example.com' }),
+      'correct horse battery staple').session.id).toHaveLength(43);
+    expect(() => auth.login(request({ host, origin: 'http://evil.invalid' }),
+      'correct horse battery staple')).toThrow(/Origin/);
+  });
+
+
   it('binds a purpose/role ticket to one use', () => {
     const { store } = temporaryStore();
     const auth = new WebAuth(origin, host, Date.now, store);

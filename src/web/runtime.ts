@@ -22,6 +22,7 @@ import { acquireWebServerLock } from './lock.js';
 import { TrustedDeviceStore } from './device-store.js';
 import { WebAuth } from './auth.js';
 import { startWebControlServer, type WebControlServer } from './control.js';
+import { WebAccessStore, validatePublicOrigin, type WebAccessConfig } from './access.js';
 import { buildWatchdogFindings, cachedWatchdogFindingsProvider, WatchdogQueryService } from '../watchdog/query.js';
 import { latestReport } from '../watchdog/store.js';
 
@@ -48,6 +49,9 @@ export interface StartWebOptions {
   open?: boolean;
   binPath: string;
   log?(line: string): void;
+  bind?: string;
+  publicOrigin?: string;
+  access?: WebAccessConfig;
 }
 
 export interface RunningWebConsole extends WebServer {
@@ -60,9 +64,18 @@ export async function startWebConsole(options: StartWebOptions): Promise<Running
     throw new FleetError('invalid_request', 'port must be between 0 and 65535');
   const lock = acquireWebServerLock();
   const webDir = resolve(stateRoot(), 'web');
+  const bind = options.bind ?? '127.0.0.1';
+  const publicOrigin = options.publicOrigin ? validatePublicOrigin(options.publicOrigin) : undefined;
+  if (!isLoopback(bind) && !publicOrigin) {
+    lock.release();
+    throw new FleetError('forbidden', 'a non-loopback bind requires an explicit --public-origin');
+  }
+  const access = options.access ?? new WebAccessStore(webDir).read();
   const auth = new WebAuth(
-    `http://127.0.0.1:${requestedPort}`, `127.0.0.1:${requestedPort}`,
+    publicOrigin?.origin ?? `http://127.0.0.1:${requestedPort}`,
+    publicOrigin?.host ?? `127.0.0.1:${requestedPort}`,
     Date.now, new TrustedDeviceStore(webDir),
+    access,
   );
   const tmux = new Tmux();
   const backend = pickBackend();
@@ -166,22 +179,27 @@ export async function startWebConsole(options: StartWebOptions): Promise<Running
     throw error;
   }
   let address: string;
-  try { address = await server.app.listen({ host: '127.0.0.1', port: requestedPort }); }
+  try { address = await server.app.listen({ host: bind, port: requestedPort }); }
   catch (error) { await server.close(); lock.release(); throw error; }
   const actual = new URL(address);
-  if (actual.hostname !== '127.0.0.1') {
-    await server.close();
-    lock.release();
-    throw new FleetError('forbidden', 'web console refused a non-loopback bind');
-  }
-  const host = `127.0.0.1:${actual.port}`;
-  server.auth.setBoundary(`http://${host}`, host);
+  const localHost = `127.0.0.1:${actual.port}`;
+  const browserOrigin = publicOrigin?.origin ?? `http://${localHost}`;
+  const browserHost = publicOrigin?.host ?? localHost;
+  server.auth.setBoundary(browserOrigin, browserHost, publicOrigin ? {
+    // nginx's safe default uses the loopback upstream as Host. The declared
+    // browser Origin remains mandatory for auth/mutations and WebSocket hello,
+    // so operators do not need a fragile Host-rewrite incantation.
+    hosts: [localHost, `localhost:${actual.port}`],
+  } : {
+    hosts: [`localhost:${actual.port}`], origins: [`http://localhost:${actual.port}`],
+  });
   let control: WebControlServer;
   try {
     control = await startWebControlServer({
       dir: webDir,
       onOpen() {
-        const url = `http://${host}/#bootstrap=${server.auth.mintBootstrap()}`;
+        const url = access.mode === 'pairing'
+          ? `${browserOrigin}/#bootstrap=${server.auth.mintBootstrap()}` : `${browserOrigin}/`;
         openBrowser(url);
       },
       onRevokeAll() { server.auth.revokeAllTrustedDevices(); },
@@ -191,15 +209,19 @@ export async function startWebConsole(options: StartWebOptions): Promise<Running
     lock.release();
     throw error;
   }
-  if (options.open !== false)
-    openBrowser(`http://${host}/#bootstrap=${server.auth.bootstrapSecret}`);
+  if (options.open !== false) openBrowser(access.mode === 'pairing'
+    ? `${browserOrigin}/#bootstrap=${server.auth.bootstrapSecret}` : `${browserOrigin}/`);
   return {
-    ...server, address: `http://${host}`,
+    ...server, address: browserOrigin,
     async close() {
       try { await control.close(); await terminals.close(); await server.close(); }
       finally { lock.release(); }
     },
   };
+}
+
+function isLoopback(host: string): boolean {
+  return ['127.0.0.1', 'localhost', '::1'].includes(host);
 }
 
 function openBrowser(url: string): void {

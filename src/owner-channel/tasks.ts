@@ -2,6 +2,7 @@ import { createHash, randomBytes } from 'node:crypto';
 import { chmodSync, existsSync, readFileSync } from 'node:fs';
 
 import { replaceFileAtomically } from '../atomic-file.js';
+import { canonicalCid } from '../config.js';
 
 export type OwnerTaskPhase = 'progress' | 'done' | 'blocked';
 export type OwnerTaskTerminalState = 'closed' | 'expired' | 'revoked';
@@ -103,7 +104,8 @@ export class OwnerTaskState {
     this.cleanup(now);
     if (this.tasks.length >= OWNER_TASK_MAX_OPEN)
       throw new Error(`owner channel is limited to ${OWNER_TASK_MAX_OPEN} open tasks`);
-    if (this.tasks.filter(task => task.contact === route.contact).length >= OWNER_TASK_MAX_PER_OWNER)
+    if (this.tasks.filter(task => canonicalCid(task.contact) === canonicalCid(route.contact))
+      .length >= OWNER_TASK_MAX_PER_OWNER)
       throw new Error(`an owner is limited to ${OWNER_TASK_MAX_PER_OWNER} open tasks per role`);
     let id: string;
     do { id = randomBytes(32).toString('hex'); }
@@ -175,7 +177,8 @@ export class OwnerTaskState {
 
   revoke(contact: string, now = Date.now()): number {
     this.assertHealthy();
-    const revoked = this.tasks.filter(task => task.contact === contact);
+    const revoked = this.tasks.filter(
+      task => canonicalCid(task.contact) === canonicalCid(contact));
     if (!revoked.length) return 0;
     this.mutate(() => { for (const task of revoked) this.remove(task, 'revoked', now); });
     return revoked.length;
@@ -184,8 +187,10 @@ export class OwnerTaskState {
   cleanup(now = Date.now(), effectiveOwners?: Set<string>): number {
     this.assertHealthy();
     const expired = this.tasks.filter(task => task.expiresAt <= now);
-    const revoked = effectiveOwners
-      ? this.tasks.filter(task => !effectiveOwners.has(task.contact) && !expired.includes(task)) : [];
+    const canonicalOwners = effectiveOwners && new Set([...effectiveOwners].map(canonicalCid));
+    const revoked = canonicalOwners
+      ? this.tasks.filter(task =>
+        !canonicalOwners.has(canonicalCid(task.contact)) && !expired.includes(task)) : [];
     const oldTombstones = this.tombstones.filter(item => now - item.at > TOMBSTONE_TTL_MS);
     if (!expired.length && !revoked.length && !oldTombstones.length) return 0;
     this.mutate(() => {

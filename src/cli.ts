@@ -45,6 +45,7 @@ import type {
 import { startWebConsole } from './web/runtime.js';
 import { requestWebControl } from './web/control.js';
 import { WebServiceManager } from './web/service.js';
+import { WebAccessStore, passwordAccess, validatePublicOrigin } from './web/access.js';
 import './harness/claude-code.js';   // registers the claude-code adapter
 import './harness/codex.js';         // registers the codex adapter
 
@@ -995,15 +996,24 @@ const webCommand = cOpt(program.command('web').description('start or open the se
     return port;
   })
   .option('--no-open', 'do not open a browser automatically')
+  .option('--bind <address>', 'explicit listen address (default: 127.0.0.1)')
+  .option('--public-origin <url>', 'browser origin served by an explicit reverse proxy')
+  .option('--password-file <path>', 'configure password protection from an owner-readable file')
+  .option('--no-password', 'intentionally configure an unprotected control panel')
+  .option('--pairing', 'configure trusted-browser pairing mode')
   .action(async opts => {
     try {
+      const accessNotice = configureWebAccess(opts);
       const manager = new WebServiceManager();
-      for (const line of await manager.install(binPath, opts.port ?? 49_271, opts.configuration))
+      for (const line of await manager.install(binPath, opts.port ?? 49_271, opts.configuration, {
+        bind: opts.bind, publicOrigin: opts.publicOrigin,
+      }))
         process.stdout.write(line + '\n');
+      if (accessNotice) process.stdout.write(accessNotice + '\n');
       await manager.start();
       if (opts.open !== false) {
         await requestWebControlWhenReady('open');
-        process.stdout.write('Trusted-browser pairing opened locally.\n');
+        process.stdout.write('Control-panel authentication opened in the browser.\n');
       } else process.stdout.write('Web service started; run `ours-fleet web open` to pair a browser.\n');
     } catch (e) { die(e); }
   });
@@ -1024,17 +1034,24 @@ const webServe = cOpt(webCommand.command('serve').description('run the web conso
 
 webServe
   .option('--no-open', 'do not open a browser automatically')
+  .option('--bind <address>', 'explicit listen address (default: 127.0.0.1)')
+  .option('--public-origin <url>', 'browser origin served by an explicit reverse proxy')
+  .option('--password-file <path>', 'configure password protection from an owner-readable file')
+  .option('--no-password', 'intentionally configure an unprotected control panel')
+  .option('--pairing', 'configure trusted-browser pairing mode')
   .action(async opts => {
     try {
+      const accessNotice = configureWebAccess(opts);
       const consoleServer = await startWebConsole({
         configPath: opts.configuration, port: opts.port,
-        open: opts.open !== false, binPath,
+        open: opts.open !== false, binPath, bind: opts.bind, publicOrigin: opts.publicOrigin,
         log: line => process.stderr.write(line + '\n'),
       });
+      if (accessNotice) process.stdout.write(accessNotice + '\n');
       process.stdout.write(`ours-fleet web listening on ${consoleServer.address}\n`);
       process.stdout.write(opts.open !== false
-        ? 'Trusted-browser pairing opened locally.\n'
-        : 'Run `ours-fleet web open` on this computer to pair a browser.\n');
+        ? 'Control-panel authentication opened in the browser.\n'
+        : 'Run `ours-fleet web open` to authenticate a browser.\n');
       const shutdown = async () => { await consoleServer.close(); process.exit(0); };
       process.once('SIGINT', () => { void shutdown(); });
       process.once('SIGTERM', () => { void shutdown(); });
@@ -1042,10 +1059,18 @@ webServe
   });
 
 webPort(webCommand.command('install').description('install or update the owner web service'))
+  .option('--bind <address>', 'explicit listen address (default: 127.0.0.1)')
+  .option('--public-origin <url>', 'browser origin served by an explicit reverse proxy')
+  .option('--password-file <path>', 'configure password protection from an owner-readable file')
+  .option('--no-password', 'intentionally configure an unprotected control panel')
+  .option('--pairing', 'configure trusted-browser pairing mode')
   .action(async opts => {
     try {
+      const accessNotice = configureWebAccess(opts);
       for (const line of await new WebServiceManager().install(
-        binPath, opts.port ?? 49_271, opts.configuration)) process.stdout.write(line + '\n');
+        binPath, opts.port ?? 49_271, opts.configuration,
+        { bind: opts.bind, publicOrigin: opts.publicOrigin })) process.stdout.write(line + '\n');
+      if (accessNotice) process.stdout.write(accessNotice + '\n');
     } catch (e) { die(e); }
   });
 
@@ -1077,7 +1102,7 @@ webCommand.command('open').description('securely open or re-pair a browser with 
   .action(async () => {
     try {
       await requestWebControl('open');
-      process.stdout.write('Trusted-browser pairing opened locally.\n');
+      process.stdout.write('Control-panel authentication opened in the browser.\n');
     } catch (e) { die(e); }
   });
 
@@ -1096,6 +1121,34 @@ async function requestWebControlWhenReady(command: 'open' | 'revoke-all'): Promi
     catch (error) { last = error; await new Promise(resolve => setTimeout(resolve, 125)); }
   }
   throw last;
+}
+
+function configureWebAccess(opts: {
+  passwordFile?: string; password?: boolean; pairing?: boolean; publicOrigin?: string;
+}): string | undefined {
+  if (opts.publicOrigin) validatePublicOrigin(opts.publicOrigin);
+  const noPassword = opts.password === false;
+  const choices = [Boolean(opts.passwordFile), noPassword, Boolean(opts.pairing)].filter(Boolean).length;
+  if (choices > 1) throw new Error('choose only one of --password-file, --no-password, or --pairing');
+  const store = new WebAccessStore();
+  if (opts.passwordFile) {
+    const password = readFileSync(realpathSync(opts.passwordFile), 'utf8').replace(/[\r\n]+$/, '');
+    store.write(passwordAccess(password));
+    return 'Access mode: password protected (only a salted scrypt verifier is stored).';
+  }
+  if (noPassword) {
+    store.write({ version: 1, mode: 'none' });
+    return 'WARNING: unprotected mode enabled; anyone who can reach the configured origin can control the fleet.';
+  }
+  if (opts.pairing) {
+    store.write({ version: 1, mode: 'pairing' });
+    return 'Access mode: trusted-browser pairing.';
+  }
+  if (!existsSync(store.path)) throw new Error(
+    'first web setup requires an explicit access choice: use --password-file <path> '
+    + 'or --pairing for protection, or --no-password only for intentional unprotected access',
+  );
+  return undefined;
 }
 
 program.command('_run <name>', { hidden: true }).description('internal: supervisor entrypoint')

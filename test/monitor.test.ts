@@ -380,6 +380,25 @@ describe('looksApiError / looksRunning (issue #19 turn-outcome heuristics)', () 
 });
 
 describe('Monitor.prime', () => {
+  it('reports its stall detector explicitly instead of mislabeling its own abort', async () => {
+    let timeout: (() => void) | undefined;
+    const fetch: MonitorDeps['fetch'] = async (_url, init) => new Promise((_resolve, reject) => {
+      init?.signal?.addEventListener('abort', () => reject(new Error('This operation was aborted')));
+    });
+    const deps = makeDeps(fetch, fakeTmux(), {
+      timers: {
+        set: callback => { timeout = callback; return 1 as unknown as ReturnType<typeof setTimeout>; },
+        clear: () => undefined,
+      },
+    });
+    const mon = createMonitor({ name: 'A', agentDir: dir, cfg: CFG(), deps });
+    const priming = mon.prime();
+    timeout?.();
+    await priming;
+    expect(readFileSync(join(dir, '.monitor-status'), 'utf8'))
+      .toContain('prime failed (notification stream stalled for 120s)');
+  });
+
   it('primes at tip, records the cursor, and marks armed', async () => {
     const { fetch, calls } = scriptedFetch([{ cursor: 128, events: [] }]);
     const tmux = fakeTmux();
