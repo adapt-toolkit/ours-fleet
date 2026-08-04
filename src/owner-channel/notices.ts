@@ -76,6 +76,11 @@ export const ownerNotices = {
     `ℹ️ ${command} accepted — restarting ${role} ${mode === 'fresh'
       ? 'FRESH (context wiped)' : '(context resumes)'}. `
     + 'The channel goes quiet during the restart and resumes when the agent is back.',
+
+  startupHandoffFailed: (role: string, identity: string) =>
+    `⚠️ ${role} owner channel could not take over '${identity}' from its previous supervisor. `
+    + `Recovery: send /restart to retry the supervised handoff; if this repeats, inspect the web `
+    + `console or run ours-fleet logs ${role}.`,
   attachmentRejected: (reason: string) => `⚠️ Attachment rejected: ${reason}.`,
   attachmentFailed: () => '⚠️ Could not securely retrieve or admit this attachment request.',
   deliveryFailed: (role: string) => `⚠️ Could not deliver this request to ${role}.`,

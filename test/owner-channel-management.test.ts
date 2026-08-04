@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto';
-import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { PassThrough } from 'node:stream';
@@ -24,10 +24,13 @@ class ManagementClient implements OursToolClient {
     { id: 'C'.repeat(64), name: 'Pending', status: 'pending' },
   ];
   failSendTo = new Set<string>();
+  chooseFailures = 0;
   async start() {}
   async close() {}
   async callTool(name: string, args?: Record<string, unknown>): Promise<unknown> {
     this.calls.push({ name, args });
+    if (name === 'choose_identity' && this.chooseFailures-- > 0)
+      throw new Error('choose_identity declined: identity is currently bound to another live session');
     if (name === 'send_message' && this.failSendTo.has(String(args?.contact)))
       throw new Error('send_message failed');
     if (name === 'list_contacts') return { contacts: this.contacts };
@@ -311,6 +314,76 @@ describe('OwnerChannel live management', () => {
       { name: 'choose_identity', args: { name: 'Role-owner' } },
     ]);
     expect(client.calls.some(call => call.args?.force !== undefined)).toBe(false);
+    await channel.close();
+  });
+
+  it('retries a daemon lease only after evidence of its own released predecessor', async () => {
+    const { channel, client, dir } = setup();
+    writeFileSync(join(dir, '.owner-channel-binder.json'), JSON.stringify({
+      version: 1, role: 'Role', identity: 'Role-owner', releasedAt: Date.now(),
+    }));
+    client.chooseFailures = 2;
+    await channel.start();
+    expect(client.calls.filter(call => call.name === 'choose_identity')).toEqual([
+      { name: 'choose_identity', args: { name: 'Role-owner' } },
+      { name: 'choose_identity', args: { name: 'Role-owner' } },
+      { name: 'choose_identity', args: { name: 'Role-owner' } },
+    ]);
+    expect(client.calls.some(call => call.args?.force !== undefined)).toBe(false);
+    await channel.close();
+  });
+
+  it('does not retry or force-bind a live daemon holder without owned-handoff evidence', async () => {
+    const { channel, client, dir } = setup();
+    client.chooseFailures = 100;
+    await expect(channel.start()).rejects.toThrow(/another live session/);
+    expect(client.calls.filter(call => call.name === 'choose_identity')).toHaveLength(1);
+    expect(client.calls.some(call => call.args?.force !== undefined)).toBe(false);
+    expect(existsSync(join(dir, '.owner-channel-binder.lock'))).toBe(false);
+  });
+
+  it('delivers one fixed startup recovery notice over a safe owner route without persisting plaintext', async () => {
+    const { channel, client, dir } = setup();
+    await channel.start();
+    expect(await channel.manage({ action: 'startup_failure' }))
+      .toEqual({ action: 'startup_failure', status: 'delivered' });
+    expect(await channel.manage({ action: 'startup_failure' }))
+      .toEqual({ action: 'startup_failure', status: 'duplicate' });
+    const notices = client.calls.filter(call => call.name === 'send_message'
+      && String(call.args?.text).includes('could not take over'));
+    expect(notices).toEqual([{ name: 'send_message', args: {
+      contact: OWNER,
+      text: `⚠️ Role owner channel could not take over 'Role-owner' from its previous supervisor. `
+        + `Recovery: send /restart to retry the supervised handoff; if this repeats, inspect the web `
+        + `console or run ours-fleet logs Role.`,
+    } }]);
+    const state = readFileSync(join(dir, '.owner-channel-conversations.json'), 'utf8');
+    expect(state).not.toContain('could not take over');
+    expect(state).not.toContain('Recovery:');
+    await channel.close();
+  });
+
+  it('keeps startup recovery local when no deterministic owner route exists', async () => {
+    const { channel, client } = setup({ owners: [OWNER, 'F'.repeat(64)] });
+    await channel.start();
+    await expect(channel.manage({ action: 'startup_failure' }))
+      .rejects.toThrow(/no authenticated owner conversation route/);
+    expect(client.calls.filter(call => call.name === 'send_message')).toEqual([]);
+    await channel.close();
+  });
+
+  it('never blind-retries an uncertain startup recovery delivery', async () => {
+    const { channel, client, dir } = setup();
+    await channel.start();
+    client.failSendTo.add(OWNER);
+    await expect(channel.manage({ action: 'startup_failure' }))
+      .rejects.toThrow(/delivery outcome is uncertain/);
+    expect(await channel.manage({ action: 'startup_failure' }))
+      .toEqual({ action: 'startup_failure', status: 'duplicate' });
+    expect(client.calls.filter(call => call.name === 'send_message'
+      && String(call.args?.text).includes('could not take over'))).toHaveLength(1);
+    expect(readFileSync(join(dir, '.owner-channel-conversations.json'), 'utf8'))
+      .not.toContain('could not take over');
     await channel.close();
   });
 

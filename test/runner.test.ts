@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
@@ -18,6 +18,9 @@ import { fakeAdapter } from './registry.test.js';
 import type { Exec } from '../src/exec.js';
 import type { HarnessAdapter } from '../src/harness/types.js';
 import type { MonitorOpts } from '../src/monitor.js';
+import {
+  OwnerBinderConflictError, OwnerBinderHandoffTimeoutError,
+} from '../src/owner-channel/binder.js';
 
 let dir: string;
 beforeEach(() => {
@@ -647,7 +650,10 @@ describe('runOnce ACP startup outcome (1.2)', () => {
       return {
         start: async () => { started++; },
         drain: async () => {},
-        close: async () => { closed++; },
+        close: async () => {
+          expect(existsSync(join(agentDir('A'), '.control.sock'))).toBe(false);
+          closed++;
+        },
         manage: async () => { throw new Error('not used'); },
       };
     };
@@ -655,6 +661,48 @@ describe('runOnce ACP startup outcome (1.2)', () => {
     await runOnce('A', {}, deps);
     expect(started).toBe(1);
     expect(closed).toBe(1);
+  });
+
+  it('asks only an owned predecessor control route to report a bounded handoff timeout', async () => {
+    writeCfg({ A: {
+      harness: 'fake-acp', session: 'acp',
+      owner_channel: { identity: 'A-owner', owners: ['owner-cid'] },
+      env: { ACP_FIXTURE_EXIT_AFTER: '1' },
+    } });
+    mkdirSync(agentDir('A'), { recursive: true });
+    writeFileSync(join(agentDir('A'), '.control.sock'), 'predecessor-route');
+    const { deps, logs } = acpDeps();
+    const report = vi.fn(async () => {
+      expect(readFileSync(join(agentDir('A'), '.control.sock'), 'utf8')).toBe('predecessor-route');
+      return 'delivered' as const;
+    });
+    deps.reportOwnerStartupFailure = report;
+    deps.acquireOwnerBinder = async () => {
+      throw new OwnerBinderHandoffTimeoutError('owned overlap');
+    };
+
+    await expect(runOnce('A', {}, deps)).rejects.toThrow(/owner channel failed to start.*owned overlap/);
+    expect(report).toHaveBeenCalledOnce();
+    expect(report).toHaveBeenCalledWith(agentDir('A'));
+    expect(logs).toContain('[A] owner channel startup recovery notice delivered by authenticated predecessor');
+  });
+
+  it('does not guess a recovery route for a foreign owner-channel bind failure', async () => {
+    writeCfg({ A: {
+      harness: 'fake-acp', session: 'acp',
+      owner_channel: { identity: 'A-owner', owners: ['owner-cid'] },
+      env: { ACP_FIXTURE_EXIT_AFTER: '1' },
+    } });
+    mkdirSync(agentDir('A'), { recursive: true });
+    const { deps } = acpDeps();
+    const report = vi.fn(async () => 'delivered' as const);
+    deps.reportOwnerStartupFailure = report;
+    deps.acquireOwnerBinder = async () => {
+      throw new OwnerBinderConflictError('identity is held by a foreign live session');
+    };
+
+    await expect(runOnce('A', {}, deps)).rejects.toThrow(/foreign live session/);
+    expect(report).not.toHaveBeenCalled();
   });
 
   it('starts scheduled loops only after ACP startup and stops them before teardown', async () => {

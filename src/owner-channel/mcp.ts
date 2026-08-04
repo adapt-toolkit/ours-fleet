@@ -71,6 +71,15 @@ export class OursMcpClient implements OursToolClient {
     const child = this.child;
     this.child = undefined;
     if (!child || child.exitCode !== null) return;
+    // EOF lets the proxy close its HTTP MCP transport and release the daemon
+    // lease explicitly. SIGTERM used to leave that release racing the next
+    // supervised start, which is the owner-channel collision this path guards.
+    child.stdin.end();
+    const exited = await new Promise<boolean>(resolve => {
+      const timer = setTimeout(() => resolve(false), 1_000);
+      child.once('exit', () => { clearTimeout(timer); resolve(true); });
+    });
+    if (exited || child.exitCode !== null) return;
     child.kill('SIGTERM');
     await new Promise<void>(resolve => {
       const timer = setTimeout(() => { child.kill('SIGKILL'); resolve(); }, 5_000);
