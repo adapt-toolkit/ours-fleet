@@ -1,6 +1,7 @@
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { fork, type ChildProcess } from 'node:child_process';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { join, resolve } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 
 import {
@@ -9,6 +10,8 @@ import {
 } from '../src/owner-channel/binder.js';
 
 const dirs: string[] = [];
+const DIST = resolve('dist');
+const RECLAIMER = resolve('test/fixtures/owner-binder-reclaimer.mjs');
 const makeDir = () => {
   const dir = mkdtempSync(join(tmpdir(), 'ours-owner-binder-'));
   dirs.push(dir);
@@ -73,6 +76,47 @@ describe('owner-channel binder handoff', () => {
     expect(readFileSync(join(lock, 'owner.json'), 'utf8')).not.toContain('old-instance');
     lease.release();
   });
+
+  it('keeps at most one returned lease owned across 24 simultaneous stale reclaimer processes', async () => {
+    const dir = makeDir();
+    const lock = join(dir, '.owner-channel-binder.lock');
+    mkdirSync(lock);
+    writeFileSync(join(lock, 'owner.json'), JSON.stringify({
+      version: 1, role: 'Coordinator', identity: 'Coordinator-Channel', pid: 424242,
+      marker: 'old-start', instance: 'old-instance', acquiredAt: 1,
+    }));
+
+    const children = Array.from({ length: 24 }, () =>
+      fork(RECLAIMER, [DIST, dir], { stdio: ['ignore', 'ignore', 'inherit', 'ipc'] }));
+    const message = (child: ChildProcess) => new Promise<Record<string, unknown>>((resolveMessage, reject) => {
+      const timer = setTimeout(() => reject(new Error('reclaimer process timed out')), 10_000);
+      child.once('message', value => {
+        clearTimeout(timer);
+        resolveMessage(value as Record<string, unknown>);
+      });
+    });
+
+    try {
+      expect(await Promise.all(children.map(message)))
+        .toEqual(Array.from({ length: 24 }, () => ({ kind: 'observed' })));
+      const outcomes = children.map(message);
+      for (const child of children) child.send({ kind: 'claim' });
+      const settled = await Promise.all(outcomes);
+      const acquired = children.filter((_, index) => settled[index]?.kind === 'acquired');
+
+      expect(acquired).toHaveLength(1);
+      const ownership = acquired.map(message);
+      for (const child of acquired) child.send({ kind: 'check' });
+      expect(await Promise.all(ownership)).toEqual([{ kind: 'owned', owned: true }]);
+
+      const exits = acquired.map(child => new Promise<void>(resolveExit => child.once('exit', () => resolveExit())));
+      for (const child of acquired) child.send({ kind: 'release' });
+      await Promise.all(exits);
+      expect(existsSync(lock)).toBe(false);
+    } finally {
+      for (const child of children) if (child.exitCode === null) child.kill();
+    }
+  }, 30_000);
 
   it('refuses a foreign holder and unverifiable ownership fail-closed', async () => {
     const foreignDir = makeDir();

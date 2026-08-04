@@ -1,4 +1,4 @@
-import { mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { randomUUID } from 'node:crypto';
 
@@ -7,6 +7,7 @@ import { replaceFileAtomically } from '../atomic-file.js';
 export const OWNER_BIND_HANDOFF_TIMEOUT_MS = 5_000;
 const OWNER_BIND_POLL_MS = 50;
 const LOCK_DIR = '.owner-channel-binder.lock';
+const RECLAIM_DIR = '.owner-channel-binder.reclaim.lock';
 const LAST_OWNER_FILE = '.owner-channel-binder.json';
 
 interface BinderOwner {
@@ -28,6 +29,8 @@ export interface OwnerBinderDeps {
   sleep?(ms: number): Promise<void>;
   alive?(pid: number): boolean;
   processMarker?(pid: number): string | undefined;
+  /** Test seam for synchronizing contenders after stale-owner validation. */
+  beforeReclaim?(): Promise<void>;
 }
 
 export interface OwnerBinderLease {
@@ -87,6 +90,7 @@ export async function acquireOwnerBinderLease(
   const alive = deps.alive ?? defaultAlive;
   const processMarker = deps.processMarker ?? defaultProcessMarker;
   const lockDir = join(stateDir, LOCK_DIR);
+  const reclaimDir = join(stateDir, RECLAIM_DIR);
   const ownerPath = join(lockDir, 'owner.json');
   const releasedPath = join(stateDir, LAST_OWNER_FILE);
   const startedAt = now();
@@ -102,13 +106,21 @@ export async function acquireOwnerBinderLease(
     try {
       mkdirSync(lockDir, { mode: 0o700 });
       writeFileSync(ownerPath, JSON.stringify(ours) + '\n', { mode: 0o600 });
-      try {
-        const released = JSON.parse(readFileSync(releasedPath, 'utf8')) as Partial<ReleasedBinder>;
-        if (released.version === 1 && released.role === role && released.identity === identity
-            && Number.isFinite(released.releasedAt)
-            && now() - Number(released.releasedAt) <= timeoutMs * 2)
-          inherited = true;
-      } catch { /* absence/corruption cannot grant recovery authority */ }
+      // A reclaimer may have installed its gate after our mkdir. It will
+      // re-check the canonical owner before claiming, while we withdraw our
+      // own raced acquisition before returning.
+      if (existsSync(reclaimDir)) {
+        const check = parseOwner(ownerPath);
+        if (!sameOwner(check, ours))
+          throw new OwnerBinderConflictError(
+            'owner-channel binder ownership changed during acquisition');
+        rmSync(lockDir, { recursive: true, force: true });
+        if (now() - startedAt >= timeoutMs)
+          throw new OwnerBinderHandoffTimeoutError(
+            `owner-channel binder reclaim did not complete within ${timeoutMs}ms`);
+        await sleep(Math.min(OWNER_BIND_POLL_MS, Math.max(1, timeoutMs - (now() - startedAt))));
+        continue;
+      }
       break;
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
@@ -131,9 +143,65 @@ export async function acquireOwnerBinderLease(
       const stale = !alive(current.pid)
         || Boolean(current.marker && currentMarker && current.marker !== currentMarker);
       if (stale) {
-        // Re-read before removal so a just-replaced lock is never deleted.
-        const check = parseOwner(ownerPath);
-        if (sameOwner(current, check)) rmSync(lockDir, { recursive: true, force: true });
+        await deps.beforeReclaim?.();
+        try { mkdirSync(reclaimDir, { mode: 0o700 }); }
+        catch (gateError) {
+          if ((gateError as NodeJS.ErrnoException).code === 'EEXIST') {
+            await sleep(OWNER_BIND_POLL_MS);
+            continue;
+          }
+          throw gateError;
+        }
+
+        const tombstone = `${lockDir}.reclaim-${ours.instance}`;
+        let acquiredFromClaim = false;
+        try {
+          const check = parseOwner(ownerPath);
+          if (!sameOwner(current, check)) continue;
+          try { renameSync(lockDir, tombstone); }
+          catch (claimError) {
+            if ((claimError as NodeJS.ErrnoException).code === 'ENOENT') continue;
+            throw claimError;
+          }
+
+          let claimed: BinderOwner;
+          try { claimed = parseOwner(join(tombstone, 'owner.json')); }
+          catch (claimError) {
+            // Preserve an unverifiable claim. Restore it only if nobody has
+            // already acquired the canonical path; otherwise fail closed.
+            try { renameSync(tombstone, lockDir); } catch { /* keep the claim quarantined */ }
+            throw claimError;
+          }
+          if (!sameOwner(current, claimed)) {
+            // Never delete a replacement: put it back when possible, otherwise
+            // retain the unique tombstone as the fail-closed claimed record.
+            try { renameSync(tombstone, lockDir); } catch { /* keep the claim quarantined */ }
+            throw new OwnerBinderConflictError(
+              'owner-channel binder changed while stale ownership was being claimed');
+          }
+          rmSync(tombstone, { recursive: true, force: true });
+
+          // Keep the gate until our replacement is durable. Any acquisition
+          // that raced the rename observes the gate and withdraws itself.
+          for (;;) {
+            try {
+              mkdirSync(lockDir, { mode: 0o700 });
+              writeFileSync(ownerPath, JSON.stringify(ours) + '\n', { mode: 0o600 });
+              acquiredFromClaim = true;
+              break;
+            } catch (replacementError) {
+              if ((replacementError as NodeJS.ErrnoException).code !== 'EEXIST')
+                throw replacementError;
+              if (now() - startedAt >= timeoutMs)
+                throw new OwnerBinderHandoffTimeoutError(
+                  `could not complete stale owner-channel binder claim within ${timeoutMs}ms`);
+              await sleep(1);
+            }
+          }
+        } finally {
+          rmSync(reclaimDir, { recursive: true, force: true });
+        }
+        if (acquiredFromClaim) break;
         continue;
       }
       if (now() - startedAt >= timeoutMs)
@@ -143,6 +211,14 @@ export async function acquireOwnerBinderLease(
       await sleep(Math.min(OWNER_BIND_POLL_MS, Math.max(1, timeoutMs - (now() - startedAt))));
     }
   }
+
+  try {
+    const released = JSON.parse(readFileSync(releasedPath, 'utf8')) as Partial<ReleasedBinder>;
+    if (released.version === 1 && released.role === role && released.identity === identity
+        && Number.isFinite(released.releasedAt)
+        && now() - Number(released.releasedAt) <= timeoutMs * 2)
+      inherited = true;
+  } catch { /* absence/corruption cannot grant recovery authority */ }
 
   let released = false;
   return {
