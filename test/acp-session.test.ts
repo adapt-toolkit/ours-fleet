@@ -290,6 +290,37 @@ describe('AcpSession', () => {
     await session.close();
   });
 
+  it('routes typed spawn requests only through the attached live role spawner', async () => {
+    const session = await start();
+    const stateDir = dirs.at(-1)!;
+    const control = new RoleControlServer(stateDir, session, () => {});
+    await control.start();
+    try {
+      const unavailable = await controlRequest(stateDir, {
+        command: 'fleet_spawn', spawn: { name: 'Worker' },
+      });
+      expect(unavailable).toMatchObject({ ok: false, kind: 'rejected' });
+
+      const spawn = vi.fn(async options => ({
+        caller: 'Coordinator', role: options.name, lifetime: 'temporary' as const,
+        statePath: '/state/Worker', harness: 'codex', session: 'acp' as const,
+        model: 'gpt-test', monitor: { mode: 'fleet' as const, interrupt: true },
+        inherited: ['harness', 'session'], creationActionId: 'action-1',
+      }));
+      control.setFleetSpawner(spawn);
+      const response = await controlRequest(stateDir, {
+        command: 'fleet_spawn', spawn: { name: 'Worker', temp: true },
+      });
+      expect(response).toMatchObject({
+        ok: true, result: { caller: 'Coordinator', role: 'Worker', lifetime: 'temporary' },
+      });
+      expect(spawn).toHaveBeenCalledWith({ name: 'Worker', temp: true });
+    } finally {
+      await control.close();
+      await session.close();
+    }
+  });
+
   it('scopes owner-channel management to the authenticated role socket and attached live handle', async () => {
     const session = await start();
     const stateDir = dirs.at(-1)!;
