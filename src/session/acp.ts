@@ -39,6 +39,7 @@ const PERMISSION_TIMEOUT_MS = 10 * 60_000;
 const CONTROLLER_GRACE_MS = 12_000;
 
 const SCHEDULED_LOOP_REDACTION = '[scheduled-loop content redacted]';
+const OWNER_COMMENTARY_REDACTION = '[assistant commentary redacted]';
 
 const scheduledTurn = (turn: { origin?: PromptOrigin } | undefined): boolean =>
   turn?.origin?.kind === 'scheduled-loop';
@@ -887,20 +888,29 @@ export class AcpSession implements SessionHandle {
 
   private recordUpdate(update: acp.SessionUpdate): void {
     const scheduled = this.activeTurn?.origin?.kind === 'scheduled-loop';
-    this.recordConversationUpdate(update, scheduled);
+    const messagePhase = update.sessionUpdate === 'agent_message_chunk'
+      ? this.codexMessagePhase(update) : undefined;
+    this.recordConversationUpdate(update, scheduled, messagePhase === 'commentary');
     if (update.sessionUpdate === 'config_option_update')
       this.captureRuntimeMetadata(update.configOptions);
     switch (update.sessionUpdate) {
-      case 'agent_message_chunk':
-        if (this.activeTurn && update.content.type === 'text')
+      case 'agent_message_chunk': {
+        const phase = messagePhase;
+        if (this.activeTurn && update.content.type === 'text'
+            && phase !== 'commentary' && phase !== 'ambiguous')
           this.activeTurn.output += update.content.text;
         this.events.emit('agent_text', {
           turnId: this.activeTurn?.id,
           origin: this.activeTurn?.origin,
           text: scheduled ? '[scheduled-loop output redacted]'
             : update.content.type === 'text' ? update.content.text : `[${update.content.type}]`,
+          ...(phase === 'commentary' || phase === 'final_answer'
+            ? { messagePhase: phase } : {}),
+          ...(typeof update.messageId === 'string' ? { messageId: update.messageId } : {}),
+          ...(this.replaying ? { replayed: true } : {}),
         });
         break;
+      }
       case 'agent_thought_chunk':
         this.events.emit('thought', {
           turnId: this.activeTurn?.id,
@@ -932,10 +942,29 @@ export class AcpSession implements SessionHandle {
     }
   }
 
+  /**
+   * Codex ACP's phase extension is the only currently supported visibility
+   * signal. Never infer commentary from text, message order, or unknown meta.
+   */
+  private codexMessagePhase(
+    update: acp.SessionUpdate,
+  ): 'commentary' | 'final_answer' | 'ambiguous' | undefined {
+    const meta = (update as unknown as { _meta?: unknown })._meta;
+    if (!meta || typeof meta !== 'object' || Array.isArray(meta)) return undefined;
+    const codex = (meta as Record<string, unknown>).codex;
+    if (!codex || typeof codex !== 'object' || Array.isArray(codex)) return undefined;
+    const phase = (codex as Record<string, unknown>).phase;
+    if (phase === undefined) return undefined;
+    return phase === 'commentary' || phase === 'final_answer' ? phase : 'ambiguous';
+  }
+
   /** Normalize every ACP update losslessly into the durable ledger. */
-  private recordConversationUpdate(update: acp.SessionUpdate, scheduled: boolean): void {
+  private recordConversationUpdate(
+    update: acp.SessionUpdate, scheduled: boolean, commentary = false,
+  ): void {
     const normalized = normalizeSessionUpdate(update,
-      scheduled ? { redactText: SCHEDULED_LOOP_REDACTION } : {});
+      scheduled ? { redactText: SCHEDULED_LOOP_REDACTION }
+        : commentary ? { redactText: OWNER_COMMENTARY_REDACTION } : {});
     this.conversation.appendSafe({
       kind: normalized.kind,
       sessionGeneration: this.sessionGeneration,

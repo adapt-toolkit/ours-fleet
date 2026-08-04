@@ -27,7 +27,12 @@ export class SessionEvents {
     if (this.events.length > MAX_EVENTS) this.events.shift();
     try {
       this.rotateIfNeeded();
-      appendFileSync(this.path, JSON.stringify(event) + '\n', { mode: 0o600 });
+      // Owner-visible commentary remains live/in-memory for the authenticated
+      // bridge, but its plaintext must not become diagnostic state on disk.
+      const persisted = event.kind === 'agent_text' && event.messagePhase === 'commentary'
+        ? { ...event, text: '[assistant commentary redacted]' }
+        : event;
+      appendFileSync(this.path, JSON.stringify(persisted) + '\n', { mode: 0o600 });
     } catch { /* diagnostics must never terminate a role */ }
     for (const listener of this.listeners) listener(event);
     return event;

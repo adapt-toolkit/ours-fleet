@@ -1,6 +1,7 @@
 import {
   existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync,
 } from 'node:fs';
+import { createHash } from 'node:crypto';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
@@ -13,6 +14,7 @@ import type { SessionEvent, SessionHandle, TurnResult } from '../src/session/typ
 import { VERSION } from '../src/version.js';
 
 const OWNER_CID = 'A'.repeat(64);
+const OTHER_OWNER_CID = 'B'.repeat(64);
 
 class FakeClient implements OursToolClient {
   calls: Array<{ name: string; args?: Record<string, unknown> }> = [];
@@ -73,7 +75,9 @@ function setup(messages: unknown[], result = {
   return { channel, client, queuePrompt, interrupt, dir };
 }
 
-function liveSetup(options: { interrupt?: boolean; progressIntervalMs?: number } = {}) {
+function liveSetup(options: {
+  interrupt?: boolean; progressIntervalMs?: number; owners?: string[];
+} = {}) {
   const dir = mkdtempSync(join(tmpdir(), 'ours-owner-channel-'));
   dirs.push(dir);
   const client = new FakeClient();
@@ -104,7 +108,7 @@ function liveSetup(options: { interrupt?: boolean; progressIntervalMs?: number }
     role: 'Coordinator',
     harness: 'claude-code',
     config: {
-      identity: 'Coordinator-owner', owners: [OWNER_CID],
+      identity: 'Coordinator-owner', owners: options.owners ?? [OWNER_CID],
       interrupt: options.interrupt ?? true,
       progress_interval_ms: options.progressIntervalMs ?? 0,
     },
@@ -685,6 +689,81 @@ describe('OwnerChannel notice presentation', () => {
     ];
     expect(notices.every(text => /^(?:ℹ️|⏳|🔄|🔐|🚧|✅|🛑|⚠️|📊) /.test(text))).toBe(true);
     expect(notices.every(text => !text.includes('[fleet]'))).toBe(true);
+  });
+
+  it('batches only correlated Codex commentary before the final and dedupes replay', async () => {
+    vi.useFakeTimers();
+    const { channel, client, completions, emit, dir } = liveSetup();
+    client.batches.push([ownerMessage(1, 'wire-commentary', 'Implement it')]);
+    await channel.drain();
+    const requestId = createHash('sha256').update('wire-commentary').digest('hex');
+    const origin = { kind: 'owner' as const, requestId };
+
+    emit({ kind: 'thought', turnId: 'prompt-1', origin, text: 'private reasoning' });
+    emit({ kind: 'tool_update', turnId: 'prompt-1', origin,
+      toolCallId: 'tool-1', title: 'SECRET=raw-arg', status: 'completed' });
+    emit({ kind: 'agent_text', turnId: 'prompt-1', origin,
+      messagePhase: 'commentary', messageId: 'message-1', text: 'Inspecting ' });
+    emit({ kind: 'agent_text', turnId: 'prompt-1', origin,
+      messagePhase: 'commentary', messageId: 'message-1', text: 'safely.' });
+    emit({ kind: 'agent_text', turnId: 'prompt-1', origin,
+      messagePhase: 'commentary', messageId: 'message-1', text: 'safely.', replayed: true });
+    emit({ kind: 'agent_text', turnId: 'prompt-1', origin,
+      messagePhase: 'final_answer', messageId: 'final-1', text: 'Final answer' });
+    emit({ kind: 'agent_text', turnId: 'prompt-1', origin,
+      messageId: 'legacy-ambiguous', text: 'Legacy adapter text' });
+    emit({ kind: 'agent_text', turnId: 'another-turn', origin,
+      messagePhase: 'commentary', messageId: 'foreign', text: 'Wrong turn' });
+    await vi.advanceTimersByTimeAsync(750);
+    // A reconnect may assign a new local event sequence/message id while
+    // replaying the same visible batch. Durable wire+batch digest wins.
+    emit({ kind: 'agent_text', turnId: 'prompt-1', origin,
+      messagePhase: 'commentary', messageId: 'message-reconnected',
+      text: 'Inspecting safely.' });
+    await vi.advanceTimersByTimeAsync(750);
+    completions[0](done('Final answer'));
+    await vi.advanceTimersByTimeAsync(0);
+
+    const sends = client.calls.filter(call => call.name === 'send_message');
+    const commentary = sends.find(call => call.args?.text === 'Inspecting safely.');
+    const final = sends.find(call => call.args?.text === 'Final answer');
+    expect(commentary?.args).toMatchObject({
+      contact: OWNER_CID, reply_to_wire_id: 'wire-commentary',
+    });
+    expect(sends.indexOf(commentary!)).toBeLessThan(sends.indexOf(final!));
+    expect(sends.map(call => call.args?.text)).not.toEqual(expect.arrayContaining([
+      'private reasoning', 'Wrong turn', 'SECRET=raw-arg',
+      'Legacy adapter text',
+    ]));
+    expect(sends.filter(call => call.args?.text === 'Final answer')).toHaveLength(1);
+    expect(sends.filter(call => call.args?.text === 'Inspecting safely.')).toHaveLength(1);
+    const routeState = readFileSync(join(dir, '.owner-channel-conversations.json'), 'utf8');
+    expect(routeState).not.toContain('Inspecting safely.');
+  });
+
+  it('pins commentary to the initiating owner when the latest route changes mid-turn', async () => {
+    vi.useFakeTimers();
+    const { channel, client, completions, emit } = liveSetup({
+      interrupt: false, owners: [OWNER_CID, OTHER_OWNER_CID],
+    });
+    client.batches.push([ownerMessage(1, 'wire-owner-a', 'First owner')]);
+    await channel.drain();
+    client.batches.push([{
+      msg_id: 2, wire_id: 'wire-owner-b', from: { id: OTHER_OWNER_CID }, text: 'Second owner',
+    }]);
+    await channel.drain();
+    const origin = {
+      kind: 'owner' as const,
+      requestId: createHash('sha256').update('wire-owner-a').digest('hex'),
+    };
+    emit({ kind: 'agent_text', turnId: 'prompt-1', origin,
+      messagePhase: 'commentary', messageId: 'a-comment', text: 'Still for A.' });
+    await vi.advanceTimersByTimeAsync(750);
+    const sent = client.calls.find(call => call.args?.text === 'Still for A.');
+    expect(sent?.args).toMatchObject({ contact: OWNER_CID, reply_to_wire_id: 'wire-owner-a' });
+    completions[0](done('A final'));
+    completions[1](done('B final'));
+    await vi.advanceTimersByTimeAsync(0);
   });
 
   it('reports only structured activity for the matching turn across multiple intervals', async () => {

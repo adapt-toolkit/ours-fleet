@@ -28,6 +28,7 @@ import {
   AttachmentRecoveryState, admitAttachments, cleanupAttachmentRoot,
   parseIncomingAttachments, parseRetrievedAttachments, prepareAttachmentDirectory,
   recoveredAttachment, removeRequestDirectory, safeField, validateAttachmentSelection,
+  validateAttachmentRelaySelection,
   type AdmittedAttachment, type IncomingAttachment, type PendingAttachmentRequest,
 } from './attachments.js';
 import {
@@ -127,6 +128,11 @@ interface ActiveOwnerRequest {
   updateCount: number;
   updateDigests: Set<string>;
   handledWireIds: string[];
+  commentaryBuffer: string;
+  commentaryCount: number;
+  commentaryKeys: Set<string>;
+  commentaryTimer?: ReturnType<typeof setTimeout>;
+  commentaryDisabled: boolean;
 }
 
 const OWNER_UPDATE_MIN_INTERVAL_MS = 5_000;
@@ -136,6 +142,11 @@ const OWNER_UPDATE_MAX_BYTES = 1_024;
 const PROACTIVE_MESSAGE_MAX_CHARS = 4_000;
 const PROACTIVE_MESSAGE_MAX_BYTES = 16_384;
 const RELAY_NACK_MEMORY = 512;
+const COMMENTARY_FLUSH_MS = 750;
+const COMMENTARY_MAX_CHARS = 1_600;
+const COMMENTARY_MAX_BYTES = 6_400;
+const COMMENTARY_MAX_UPDATES = 32;
+const COMMENTARY_DEDUPE_LIMIT = 512;
 
 /** A relay attempt that failed only because no owner route exists yet. */
 class RelayUnroutableError extends Error {}
@@ -783,6 +794,8 @@ export class OwnerChannel implements OwnerChannelHandle {
       const active: ActiveOwnerRequest = {
         contact: sender.id, wireId: originWireId, requestId, outboundTail: receipt,
         finalizing: false, updateCount: 0, updateDigests: new Set(), handledWireIds,
+        commentaryBuffer: '', commentaryCount: 0, commentaryKeys: new Set(),
+        commentaryDisabled: false,
       };
       this.activeRequests.set(requestId, active);
       const cleanupDir = requestDir;
@@ -907,6 +920,8 @@ export class OwnerChannel implements OwnerChannelHandle {
     const active: ActiveOwnerRequest = {
       contact: sender.id, wireId, requestId, outboundTail: receipt, finalizing: false,
       updateCount: 0, updateDigests: new Set(), handledWireIds: [wireId],
+      commentaryBuffer: '', commentaryCount: 0, commentaryKeys: new Set(),
+      commentaryDisabled: false,
     };
     this.activeRequests.set(requestId, active);
     const task = this.complete(active, outbox, queued, activityCursor)
@@ -1099,7 +1114,7 @@ export class OwnerChannel implements OwnerChannelHandle {
       const contact = await this.routableContact(route);
       const rejection = !this.attachmentRecovery.integrity()
         ? 'attachment recovery state is unavailable'
-        : validateAttachmentSelection(group.files, this.attachmentConfig);
+        : validateAttachmentRelaySelection(group.files, this.attachmentConfig);
       if (rejection) throw new Error(rejection);
 
       const transactionId = this.requestId(
@@ -1125,7 +1140,8 @@ export class OwnerChannel implements OwnerChannelHandle {
       }
       const order = new Map(group.files.map((file, index) => [file.wireId, index]));
       retrieved.sort((a, b) => order.get(a.wireId)! - order.get(b.wireId)!);
-      const admitted = await admitAttachments(retrieved, requestDir, this.attachmentConfig);
+      const admitted = await admitAttachments(
+        retrieved, requestDir, this.attachmentConfig, { mimePolicy: 'report-only' });
 
       const digest = createHash('sha256').update(
         `managed-agent-attachment\0${handledWireIds.slice().sort().join('\0')}`,
@@ -1279,6 +1295,87 @@ export class OwnerChannel implements OwnerChannelHandle {
     let phase: OwnerProgressPhase = 'starting request';
     let timer: ReturnType<typeof setInterval> | undefined;
 
+    const flushCommentary = () => {
+      if (active.commentaryTimer) clearTimeout(active.commentaryTimer);
+      active.commentaryTimer = undefined;
+      const text = active.commentaryBuffer.trim();
+      active.commentaryBuffer = '';
+      if (!text || active.commentaryDisabled || active.finalizing) return;
+      if (active.commentaryCount >= COMMENTARY_MAX_UPDATES) {
+        active.commentaryDisabled = true;
+        return;
+      }
+      let safe: string;
+      try { safe = this.safeCommentary(text); }
+      catch (error) {
+        active.commentaryDisabled = true;
+        this.logError('ACP commentary forwarding disabled for unsafe content', error);
+        return;
+      }
+      const digest = createHash('sha256')
+        .update(`owner-commentary\0${active.wireId}\0${safe}`).digest('hex');
+      let sending: { id: string };
+      try {
+        sending = this.conversations.beginSend(active.contact, digest, Date.now(), 0, 'all');
+      } catch (error) {
+        if (error instanceof DuplicateSendError) return;
+        active.commentaryDisabled = true;
+        this.logError('ACP commentary forwarding disabled by dedupe state', error);
+        return;
+      }
+      active.commentaryCount++;
+      active.outboundTail = active.outboundTail
+        .then(async () => {
+          try {
+            if (!this.isEffectiveOwner(active.contact))
+              throw new Error('initiating owner is no longer authorized');
+            await this.send(active.contact, safe, active.wireId);
+          } catch {
+            this.conversations.finishSend(sending.id, 'uncertain');
+            throw new Error('ACP commentary delivery outcome is uncertain');
+          }
+          this.conversations.finishSend(sending.id, 'delivered');
+        })
+        .catch(error => this.logError('ACP commentary delivery failed', error));
+    };
+
+    const acceptCommentary = (event: SessionEvent) => {
+      if (active.commentaryDisabled || active.finalizing || event.turnId !== queued.promptId
+          || event.kind !== 'agent_text' || event.messagePhase !== 'commentary'
+          || event.replayed || event.origin?.kind !== 'owner'
+          || event.origin.requestId !== active.requestId
+          || typeof event.messageId !== 'string' || !event.messageId
+          || typeof event.text !== 'string' || !event.text) return;
+      const key = createHash('sha256')
+        .update(`${event.messageId}\0${event.text}`).digest('hex');
+      if (active.commentaryKeys.has(key)) return;
+      active.commentaryKeys.add(key);
+      if (active.commentaryKeys.size > COMMENTARY_DEDUPE_LIMIT)
+        active.commentaryKeys.delete(active.commentaryKeys.values().next().value as string);
+      let chars = Array.from(active.commentaryBuffer).length;
+      let bytes = Buffer.byteLength(active.commentaryBuffer);
+      for (const point of event.text) {
+        const pointBytes = Buffer.byteLength(point);
+        if (chars >= COMMENTARY_MAX_CHARS || bytes + pointBytes > COMMENTARY_MAX_BYTES) {
+          flushCommentary();
+          if (active.commentaryDisabled) return;
+          chars = 0;
+          bytes = 0;
+        }
+        active.commentaryBuffer += point;
+        chars++;
+        bytes += pointBytes;
+      }
+      if (/\n\s*\n$/u.test(active.commentaryBuffer)) {
+        flushCommentary();
+        return;
+      }
+      if (!active.commentaryTimer) {
+        active.commentaryTimer = setTimeout(flushCommentary, COMMENTARY_FLUSH_MS);
+        active.commentaryTimer.unref?.();
+      }
+    };
+
     const reportProgress = () => {
       const events = this.options.session.eventsSince(lastSeq);
       lastSeq = Math.max(lastSeq, this.latestEventSeq(events));
@@ -1316,17 +1413,24 @@ export class OwnerChannel implements OwnerChannelHandle {
       timer = setInterval(reportProgress, progressMs);
       timer.unref();
     };
-    const unsubscribe = progressMs > 0
-      ? this.options.session.subscribe(event => startProgress(event))
-      : undefined;
+    const unsubscribe = typeof this.options.session.subscribe === 'function'
+      ? this.options.session.subscribe(event => {
+        startProgress(event);
+        // Automatic commentary is an ACP phase extension. Other backends and
+        // older adapters retain their established final-only behavior.
+        if (this.options.session.backend === 'acp') acceptCommentary(event);
+      })
+      : () => undefined;
     startProgress();
 
     let result: TurnResult;
     try { result = await queued.completion; }
     finally {
-      unsubscribe?.();
+      unsubscribe();
       if (timer) clearInterval(timer);
+      if (active.commentaryTimer) clearTimeout(active.commentaryTimer);
     }
+    flushCommentary();
     active.finalizing = true;
     await active.outboundTail;
 
@@ -1342,6 +1446,20 @@ export class OwnerChannel implements OwnerChannelHandle {
     if (result.succeeded) await this.sendAttachments(active.contact, outbox, active.wireId);
     else await rm(outbox, { recursive: true, force: true });
     for (const wire of active.handledWireIds) this.state.remember(wire);
+  }
+
+  /** Model-authored commentary only; raw protocol/tool data never reaches here. */
+  private safeCommentary(value: string): string {
+    const message = value.trim().normalize('NFC');
+    if (!message) throw new Error('commentary is empty');
+    if (Array.from(message).length > COMMENTARY_MAX_CHARS
+        || Buffer.byteLength(message) > COMMENTARY_MAX_BYTES)
+      throw new Error('commentary batch exceeds its bounded size');
+    if (/\u0000|[\u202a-\u202e\u2066-\u2069]/u.test(message))
+      throw new Error('commentary contains unsafe control characters');
+    if (/-----BEGIN [A-Z ]*PRIVATE KEY-----|(?:api[_ -]?key|access[_ -]?token|authorization|password|secret)\s*[:=]|(?:chain of thought|private reasoning|internal reasoning)|^(?:stdout|stderr|tool (?:output|result)|command):/imu.test(message))
+      throw new Error('commentary appears to contain secret, reasoning, or raw tool content');
+    return message;
   }
 
   private ownerAttachmentPrompt(

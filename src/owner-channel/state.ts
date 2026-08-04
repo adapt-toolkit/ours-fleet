@@ -69,7 +69,7 @@ interface OwnerConversationFile {
 
 const CONVERSATION_LIMIT = 64;
 const WIRE_ROUTE_LIMIT = 512;
-const PROACTIVE_SEND_LIMIT = 256;
+const PROACTIVE_SEND_LIMIT = 2_048;
 const PROACTIVE_MIN_INTERVAL_MS = 30_000;
 const HEX_64_LOWER = /^[a-f0-9]{64}$/;
 const CID = /^[A-Fa-f0-9]{64}$/;
@@ -174,7 +174,7 @@ export class OwnerConversationState {
   }
 
   route(effective: Set<string>): {
-    contact: string; basis: OwnerConversationRouteBasis;
+    contact: string; basis: OwnerConversationRouteBasis; replyToWireId?: string;
   } {
     this.assertHealthy();
     // Membership is decided canonically (hex case is not identity); the
@@ -186,7 +186,10 @@ export class OwnerConversationState {
     if (candidates.length) {
       if (candidates[1]?.lastInboundAt === candidates[0].lastInboundAt)
         throw new Error('proactive owner route is ambiguous');
-      return { contact: candidates[0].contact, basis: 'last-inbound' };
+      return {
+        contact: candidates[0].contact, basis: 'last-inbound',
+        replyToWireId: candidates[0].lastInboundWireId,
+      };
     }
     if (canonical.size === 1)
       return { contact: [...effective][0], basis: 'sole-owner' };
@@ -216,7 +219,7 @@ export class OwnerConversationState {
       send => canonicalCid(send.contact) === canonical).slice(-128);
     // 'all' scope serves wire-keyed idempotency: a crash replay must not
     // deliver the same wire to a second owner after the route moved.
-    const scope = dedupe === 'all' ? this.sends.slice(-128) : recent;
+    const scope = dedupe === 'all' ? this.sends : recent;
     if (scope.some(send => send.digest === digest))
       throw new DuplicateSendError('duplicate proactive owner message refused');
     const last = recent.at(-1);
@@ -293,6 +296,7 @@ export class OwnerConversationState {
       && Number.isSafeInteger(send.at) && send.at >= 0
       && ['sending', 'delivered', 'uncertain'].includes(send.status);
   }
+
 }
 
 export type OwnerSource = 'baseline' | 'dynamic';
