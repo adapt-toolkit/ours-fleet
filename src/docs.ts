@@ -382,7 +382,11 @@ supervisor commands and never enter the model: \`/help\` (alias \`/commands\`),
 \`/status\`, \`/interrupt\`, \`/clear\`, \`/compact\`, \`/model <model-id>\`,
 \`/restart\`, \`/force-restart\`, \`/ls\`, \`/peek\`, \`/worklog\`, and
 \`/version\`. Unknown or malformed commands answer with the help text instead of
-being forwarded; plain messages reach the agent unchanged.
+being forwarded; plain messages reach the agent unchanged. \`/clear\`,
+\`/compact\`, and \`/model\` are forwarded only when the role's bundled ACP
+adapter executes them locally (claude-code: all three; codex: \`/compact\`
+only) and are otherwise refused with a notice, so slash text never reaches the
+model as a prompt.
 
 Owner documents, images, and voice messages use the same authenticated sender
 and source-wire boundary. Fleet inspects body-free metadata first and rejects

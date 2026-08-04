@@ -60,6 +60,7 @@ function setup(messages: unknown[], result = {
   } as unknown as SessionHandle;
   const channel = new OwnerChannel({
     role: 'Coordinator',
+    harness: 'claude-code',
     config: {
       identity: 'Coordinator-owner', owners: ['owner-cid'],
       interrupt: options.interrupt ?? false, progress_interval_ms: 0,
@@ -94,6 +95,7 @@ function liveSetup(options: { interrupt?: boolean; progressIntervalMs?: number }
   } as unknown as SessionHandle;
   const channel = new OwnerChannel({
     role: 'Coordinator',
+    harness: 'claude-code',
     config: {
       identity: 'Coordinator-owner', owners: ['owner-cid'],
       interrupt: options.interrupt ?? true,

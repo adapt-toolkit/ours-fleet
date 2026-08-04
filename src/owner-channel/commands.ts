@@ -22,13 +22,17 @@ export interface OwnerFleetOps {
  */
 export interface OwnerCommandContext {
   role: string;
+  /** Harness id of the role (e.g. 'claude-code', 'codex'); gates forwarding. */
+  harness: string;
   version: string;
   snapshot(): SessionSnapshot;
   interrupt(): Promise<void>;
   /**
-   * Deliver raw slash text to the agent harness, which executes it as a local
-   * command (the ACP adapters intercept "/"-prefixed prompts deterministically).
-   * The channel sends the acceptance and outcome notices itself.
+   * Deliver raw slash text to the agent harness. Only commands the bundled
+   * ACP adapter for `harness` verifiably executes locally may be forwarded
+   * (see HARNESS_LOCAL_COMMANDS); anything else would reach the model as an
+   * ordinary prompt. The channel sends the acceptance and outcome notices
+   * itself.
    */
   runHarnessCommand(command: string): Promise<void>;
   restart(mode: 'keep' | 'fresh'): Promise<void>;
@@ -57,6 +61,36 @@ const REPLY_MAX_CHARS = 3_500;
 
 const strip = (value: unknown, max: number): string =>
   String(value).replace(/[\u0000-\u001f\u007f]/g, ' ').slice(0, max);
+
+/** Like `strip`, but keeps newlines so multi-line listings stay readable. */
+const stripMultiline = (value: unknown, max: number): string =>
+  String(value).replace(/[\u0000-\u0009\u000b-\u001f\u007f]/g, ' ').slice(0, max);
+
+/**
+ * Commands each harness's bundled ACP adapter verifiably executes locally,
+ * pinned by test/acp-adapter-commands.test.ts against the shipped adapter
+ * artifacts. claude-agent-acp routes slash commands into the Claude SDK,
+ * which runs its builtins (/clear, /compact, /model) without a model turn;
+ * codex-acp intercepts only /compact — /clear and /model are not builtins
+ * and would fall through into sendPrompt, i.e. reach the model as an
+ * ordinary prompt. Unlisted harnesses forward nothing.
+ */
+export const HARNESS_LOCAL_COMMANDS: Record<string, readonly string[]> = {
+  'claude-code': ['clear', 'compact', 'model'],
+  codex: ['compact'],
+};
+
+/**
+ * Forward raw slash text to the harness only when the bundled adapter for
+ * this role's harness verifiably executes it locally; otherwise answer with
+ * a truthful refusal so the text can never reach the model as a prompt.
+ */
+const forwardHarnessCommand = (ctx: OwnerCommandContext, raw: string): Promise<void> => {
+  const name = raw.slice(1).split(/\s+/, 1)[0];
+  if (!(HARNESS_LOCAL_COMMANDS[ctx.harness] ?? []).includes(name))
+    return ctx.reply(ownerNotices.commandUnsupported(`/${name}`, ctx.harness));
+  return ctx.runHarnessCommand(raw);
+};
 
 /** Keep the LAST characters — tails are more useful than heads for logs. */
 const tail = (value: string, max: number): string => {
@@ -96,11 +130,11 @@ export const ownerCommands: OwnerCommand[] = [
   },
   {
     name: 'clear', summary: "clear the agent's session context",
-    execute: noArgs('/clear', ctx => ctx.runHarnessCommand('/clear')),
+    execute: noArgs('/clear', ctx => forwardHarnessCommand(ctx, '/clear')),
   },
   {
     name: 'compact', summary: "compact the agent's session context",
-    execute: noArgs('/compact', ctx => ctx.runHarnessCommand('/compact')),
+    execute: noArgs('/compact', ctx => forwardHarnessCommand(ctx, '/compact')),
   },
   {
     name: 'model', usage: '/model <model-id>',
@@ -109,7 +143,7 @@ export const ownerCommands: OwnerCommand[] = [
       if (!args) throw new OwnerCommandUsageError('usage: /model <model-id>');
       if (!MODEL_ID.test(args))
         throw new OwnerCommandUsageError('model id must be alphanumeric with . _ : - only');
-      await ctx.runHarnessCommand(`/model ${args}`);
+      await forwardHarnessCommand(ctx, `/model ${args}`);
     },
   },
   {
@@ -123,7 +157,7 @@ export const ownerCommands: OwnerCommand[] = [
   {
     name: 'ls', summary: 'list running fleet sessions',
     execute: noArgs('/ls', async ctx =>
-      ctx.reply(`📊 Fleet sessions:\n${tail(strip(await ctx.fleetList(), 10_000), REPLY_MAX_CHARS)}`)),
+      ctx.reply(`📊 Fleet sessions:\n${tail(stripMultiline(await ctx.fleetList(), 10_000), REPLY_MAX_CHARS)}`)),
   },
   {
     name: 'peek', summary: 'summarize recent session activity (event shapes only, no content)',

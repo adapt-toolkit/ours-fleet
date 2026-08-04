@@ -45,6 +45,8 @@ interface AttachmentGroup {
 
 export interface OwnerChannelOptions {
   role: string;
+  /** Harness id of the role (e.g. 'claude-code', 'codex'); gates which slash commands may be forwarded. */
+  harness: string;
   config: OwnerChannelConfig;
   session: SessionHandle;
   stateDir: string;
@@ -729,6 +731,7 @@ export class OwnerChannel implements OwnerChannelHandle {
   ): Promise<void> {
     const ctx: OwnerCommandContext = {
       role: this.options.role,
+      harness: this.options.harness,
       version: VERSION,
       snapshot: () => this.options.session.snapshot(),
       interrupt: () => this.options.session.interrupt('owner'),

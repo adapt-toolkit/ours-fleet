@@ -67,6 +67,11 @@ export const ownerNotices = {
 
   commandFailed: (command: string) => `⚠️ ${command} could not be executed.`,
 
+  commandUnsupported: (command: string, harness: string) =>
+    `⚠️ ${command} is not supported on the '${harness}' harness: its bundled ACP `
+    + 'adapter does not execute it locally, so forwarding it would deliver the '
+    + 'text to the model as an ordinary prompt. Nothing was forwarded.',
+
   restarting: (role: string, command: string, mode: 'keep' | 'fresh') =>
     `ℹ️ ${command} accepted — restarting ${role} ${mode === 'fresh'
       ? 'FRESH (context wiped)' : '(context resumes)'}. `

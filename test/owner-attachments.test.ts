@@ -100,7 +100,7 @@ async function setup(owners = [OWNER], recover = false) {
   });
   const logs: string[] = [];
   const channel = new OwnerChannel({
-    role: 'Role', config, session, stateDir: dir, client, log: line => logs.push(line),
+    role: 'Role', harness: 'claude-code', config, session, stateDir: dir, client, log: line => logs.push(line),
     watch: () => ({
       pid: 1, exitCode: null, stdout: new PassThrough(), stderr: new PassThrough(),
       once: () => undefined, kill: () => true,

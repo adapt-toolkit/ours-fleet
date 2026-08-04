@@ -49,7 +49,7 @@ function setup() {
     queuePrompt, interrupt: vi.fn(), eventsSince: () => [],
   } as unknown as SessionHandle;
   const channel = new OwnerChannel({
-    role: 'Role', config: {
+    role: 'Role', harness: 'claude-code', config: {
       identity: 'Role-owner', owners: [OWNER], interrupt: false, progress_interval_ms: 0,
     }, session, stateDir: dir, client, log: line => logs.push(line),
     watch: () => {
@@ -322,7 +322,7 @@ describe('OwnerChannel live management', () => {
 
     const restartedClient = new ManagementClient();
     const restarted = new OwnerChannel({
-      role: 'Role', config: { identity: 'Role-owner', owners: [OWNER], interrupt: false,
+      role: 'Role', harness: 'claude-code', config: { identity: 'Role-owner', owners: [OWNER], interrupt: false,
         progress_interval_ms: 0 },
       session: { backend: 'acp', pid: 2, isAlive: () => true,
         snapshot: () => ({ backend: 'acp', alive: true, readiness: 'idle' }),

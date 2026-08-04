@@ -693,9 +693,14 @@ Implementation strategies differ but every command is deterministic:
   *shapes* (kind, tool title, status) and never thought, agent-text, or tool
   output bodies.
 - `/clear`, `/compact`, and `/model` deliver the raw slash text to the agent
-  harness, which executes it as a local command without invoking the model (both
-  bundled ACP adapters intercept `/`-prefixed prompts). Fleet sends a `⏳`
-  acceptance notice and reports the turn's outcome on the same wire.
+  harness, but only when the bundled ACP adapter for the role's harness
+  verifiably executes that command locally (pinned per harness in
+  `HARNESS_LOCAL_COMMANDS`): `claude-code` runs all three as Claude SDK
+  builtins; `codex` runs only `/compact` — `/clear` and `/model` are not
+  codex-acp builtins and would fall through to the model as an ordinary
+  prompt, so they answer with a truthful refusal instead of being forwarded.
+  When forwarded, fleet sends a `⏳` acceptance notice and reports the turn's
+  outcome on the same wire.
 - `/restart` and `/force-restart` confirm to the owner and durably mark the
   message handled FIRST, then invoke the detached `ours-fleet restart` /
   `force-restart` CLI — a successful bounce kills the supervisor process, so

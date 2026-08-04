@@ -15,6 +15,7 @@ function context(overrides: Partial<OwnerCommandContext> = {}): OwnerCommandCont
   return {
     replies,
     role: 'Coordinator',
+    harness: 'claude-code',
     version: '9.9.9-test',
     snapshot: () => snapshot,
     interrupt: vi.fn(async () => undefined),
@@ -110,6 +111,37 @@ describe('owner command registry', () => {
     expect(ctx.runHarnessCommand).toHaveBeenCalledWith('/model claude-sonnet-5');
   });
 
+  // codex-acp 1.1.7 executes only /compact locally; /clear and /model are not
+  // builtins and would fall through tryHandleCommand into sendPrompt, i.e.
+  // reach the model as an ordinary prompt. The registry must therefore refuse
+  // to forward them on the codex harness instead of pretending they work.
+  it('forwards only /compact on the codex harness', async () => {
+    const ctx = context({ harness: 'codex' });
+    await dispatchOwnerCommand('/compact', ctx);
+    expect(ctx.runHarnessCommand).toHaveBeenCalledOnce();
+    expect(ctx.runHarnessCommand).toHaveBeenCalledWith('/compact');
+  });
+
+  it('refuses /clear and /model on the codex harness with a truthful notice', async () => {
+    for (const text of ['/clear', '/model claude-sonnet-5']) {
+      const ctx = context({ harness: 'codex' });
+      await dispatchOwnerCommand(text, ctx);
+      expect(ctx.runHarnessCommand).not.toHaveBeenCalled();
+      expect(ctx.replies).toEqual(
+        [ownerNotices.commandUnsupported(text.split(' ', 1)[0], 'codex')]);
+    }
+  });
+
+  it('refuses all harness-forwarded commands on an unverified harness', async () => {
+    for (const text of ['/clear', '/compact', '/model claude-sonnet-5']) {
+      const ctx = context({ harness: 'mystery-harness' });
+      await dispatchOwnerCommand(text, ctx);
+      expect(ctx.runHarnessCommand).not.toHaveBeenCalled();
+      expect(ctx.replies).toHaveLength(1);
+      expect(ctx.replies[0]).toContain('not supported');
+    }
+  });
+
   it('returns help for /model without an argument', async () => {
     const ctx = context();
     await dispatchOwnerCommand('/model', ctx);
@@ -153,6 +185,20 @@ describe('owner command registry', () => {
     expect(ctx.fleetList).toHaveBeenCalledOnce();
     expect(ctx.replies).toHaveLength(1);
     expect(ctx.replies[0]).toContain('Coordinator: acp');
+  });
+
+  it('preserves the multi-line fleet listing for /ls exactly', async () => {
+    const listing = 'Coordinator: acp (running)\nDeveloper-1: acp (running)\nWatchdog: tmux (idle)';
+    const ctx = context({ fleetList: vi.fn(async () => listing) });
+    await dispatchOwnerCommand('/ls', ctx);
+    expect(ctx.replies).toEqual([`📊 Fleet sessions:\n${listing}`]);
+  });
+
+  it('sanitizes non-newline control characters in /ls output', async () => {
+    const listing = ['a', String.fromCharCode(7), 'b\r\nc', String.fromCharCode(0), 'd'].join('');
+    const ctx = context({ fleetList: vi.fn(async () => listing) });
+    await dispatchOwnerCommand('/ls', ctx);
+    expect(ctx.replies).toEqual(['📊 Fleet sessions:\na b \nc d']);
   });
 
   it('reports the fleet version for /version', async () => {
