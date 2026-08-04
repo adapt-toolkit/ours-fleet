@@ -62,8 +62,12 @@ export interface SpawnOpts {
   bio?: string;
   persona?: string;
   /** Internal, non-sensitive provenance correlation for typed presentation layers. */
-  surface?: 'cli' | 'web';
+  surface?: 'cli' | 'web' | 'agent';
   creationActionId?: string;
+  /** Set only by a live role supervisor after a role-scoped proxy request. */
+  callerRole?: string;
+  /** Internal provenance labels for values filled by the caller's supervisor. */
+  inheritedFromCaller?: string[];
   /**
    * Path to a file holding exactly the existing `isolation:` mapping — the same
    * schema fleet.yaml uses, not a second policy language. The ONE new operator
@@ -288,29 +292,32 @@ function provenanceSettings(
   o: SpawnOpts, defaults: Record<string, unknown>,
 ): Record<string, ProvenanceEntry> {
   const perms = (defaults.permissions ?? {}) as Partial<CommonPermissions>;
+  const callerDefaults = new Set(o.inheritedFromCaller ?? []);
+  const tagged = (key: string, entry: ProvenanceEntry): ProvenanceEntry =>
+    callerDefaults.has(key) ? { ...entry, source: 'caller-role' } : entry;
   const explicitModel = typeof o.model === 'string' ? o.model.trim() : undefined;
   const inheritedModel = resolveRoleModel(undefined, o.harness, defaults);
   return {
-    harness: provenanceOf(o.harness, defaults.harness, 'claude-code'),
-    session: provenanceOf(o.session, defaults.session, 'tmux'),
+    harness: tagged('harness', provenanceOf(o.harness, defaults.harness, 'claude-code')),
+    session: tagged('session', provenanceOf(o.session, defaults.session, 'tmux')),
     identity: o.identity
       ? { value: o.identity, source: 'cli' }
       : { value: o.name, source: 'built-in' },     // defaults to the role name
-    cwd: provenanceOf(o.cwd, undefined, undefined),
-    model: o.model === null
+    cwd: tagged('cwd', provenanceOf(o.cwd, undefined, undefined)),
+    model: tagged('model', o.model === null
       ? { value: undefined, source: 'cli' }
       : explicitModel
         ? { value: explicitModel, source: 'cli' }
-        : { value: inheritedModel, source: inheritedModel ? 'fleet-default' : 'built-in' },
-    coordinator: provenanceOf(o.coordinator, undefined, undefined),
+        : { value: inheritedModel, source: inheritedModel ? 'fleet-default' : 'built-in' }),
+    coordinator: tagged('coordinator', provenanceOf(o.coordinator, undefined, undefined)),
     permission_mode: provenanceOf(o.permissionMode, undefined, undefined),
-    approval: provenanceOf(o.approval, perms.approval, 'ask'),
-    filesystem: provenanceOf(o.filesystem, perms.filesystem, 'workspace'),
-    unattended: provenanceOf(o.unattended, perms.unattended, 'deny'),
+    approval: tagged('approval', provenanceOf(o.approval, perms.approval, 'ask')),
+    filesystem: tagged('filesystem', provenanceOf(o.filesystem, perms.filesystem, 'workspace')),
+    unattended: tagged('unattended', provenanceOf(o.unattended, perms.unattended, 'deny')),
     isolation: o.isolationFile
       ? { value: 'declared via --isolation-file', source: 'cli' }
       : { value: defaults.isolation ? 'from fleet defaults' : undefined, source: defaults.isolation ? 'fleet-default' : 'built-in' },
-    monitor: provenanceOf(o.monitorConfig, defaults.monitor, { mode: 'fleet' }),
+    monitor: tagged('monitorConfig', provenanceOf(o.monitorConfig, defaults.monitor, { mode: 'fleet' })),
   };
 }
 
@@ -379,7 +386,7 @@ export async function spawnPermanent(
       const provenance = buildProvenance({
         role: o.name, lifetime: 'permanent', fleetVersion: VERSION,
         settings: provenanceSettings(o, cfg.defaults),
-        surface: o.surface, creationActionId: o.creationActionId,
+        surface: o.surface, creationActionId: o.creationActionId, callerRole: o.callerRole,
       });
       mkdirSync(agentDir(o.name), { recursive: true });
       writeProvenance(agentDir(o.name), provenance);
@@ -499,7 +506,7 @@ async function spawnTempInner(
   const provenance = buildProvenance({
     role: o.name, lifetime: 'temporary', fleetVersion: VERSION,
     settings: provenanceSettings(o, cfg.defaults),
-    surface: o.surface, creationActionId: o.creationActionId,
+    surface: o.surface, creationActionId: o.creationActionId, callerRole: o.callerRole,
   });
   writeProvenance(dir, provenance);
   lastProvenance = provenance;
