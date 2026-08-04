@@ -29,6 +29,10 @@ import {
   recoveredAttachment, removeRequestDirectory, safeField, validateAttachmentSelection,
   type AdmittedAttachment, type IncomingAttachment, type PendingAttachmentRequest,
 } from './attachments.js';
+import {
+  acquireOwnerBinderLease, OWNER_BIND_HANDOFF_TIMEOUT_MS,
+  type OwnerBinderDeps, type OwnerBinderLease,
+} from './binder.js';
 
 interface InboundMessage {
   msg_id?: number;
@@ -64,6 +68,10 @@ export interface OwnerChannelOptions {
   fleet?: OwnerFleetOps;
   /** Forwarded to fleet CLI invocations spawned for owner commands. */
   configPath?: string;
+  /** Deterministic clock/process seams for binder handoff tests. */
+  binderDeps?: OwnerBinderDeps;
+  /** Pre-acquired by the runner so the predecessor control socket remains reachable while waiting. */
+  binderLease?: OwnerBinderLease;
 }
 
 export interface OwnerChannelHandle {
@@ -82,7 +90,8 @@ export type OwnerChannelManagementRequest =
   | { action: 'owner_revoke'; cid: string }
   | { action: 'request_update'; requestId: string; phase: OwnerUpdatePhase; message: string }
   | { action: 'task_open'; requestId: string }
-  | { action: 'task_report'; taskId: string; phase: OwnerTaskPhase; message: string };
+  | { action: 'task_report'; taskId: string; phase: OwnerTaskPhase; message: string }
+  | { action: 'startup_failure' };
 
 export type OwnerChannelManagementResult =
   | { action: 'contact_list'; contacts: OwnerContact[] }
@@ -92,7 +101,8 @@ export type OwnerChannelManagementResult =
   | { action: 'owner_authorize' | 'owner_revoke'; owner: OwnerEntry }
   | { action: 'request_update'; requestId: string; sequence: number }
   | { action: 'task_open'; taskId: string; expiresAt: string }
-  | { action: 'task_report'; taskId: string; phase: OwnerTaskPhase; sequence: number; state: 'open' | 'closed' };
+  | { action: 'task_report'; taskId: string; phase: OwnerTaskPhase; sequence: number; state: 'open' | 'closed' }
+  | { action: 'startup_failure'; status: 'delivered' | 'duplicate' };
 
 export type { OwnerUpdatePhase } from './notices.js';
 
@@ -156,6 +166,8 @@ export class OwnerChannel implements OwnerChannelHandle {
   private readonly activeRequests = new Map<string, ActiveOwnerRequest>();
   private managementTail: Promise<unknown> = Promise.resolve();
   private ready = false;
+  private binder?: OwnerBinderLease;
+  private binderOwnedInternally = false;
 
   private readonly fleetOps: OwnerFleetOps;
 
@@ -190,8 +202,35 @@ export class OwnerChannel implements OwnerChannelHandle {
 
   async start(): Promise<void> {
     this.stopping = false;
-    await this.client.start();
-    await this.client.callTool('choose_identity', { name: this.options.config.identity });
+    this.binderOwnedInternally = !this.options.binderLease;
+    this.binder = this.options.binderLease ?? await acquireOwnerBinderLease(
+      this.options.stateDir, this.options.role, this.options.config.identity, this.options.binderDeps);
+    try {
+      await this.client.start();
+      const now = this.options.binderDeps?.now ?? (() => Date.now());
+      const sleep = this.options.binderDeps?.sleep
+        ?? (ms => new Promise<void>(resolve => setTimeout(resolve, ms)));
+      const bindStartedAt = now();
+      for (;;) {
+        try {
+          await this.client.callTool('choose_identity', { name: this.options.config.identity });
+          break;
+        } catch (error) {
+          const message = (error as Error)?.message ?? String(error);
+          const liveConflict = /currently bound to another live session/i.test(message);
+          if (!this.binder.inherited || !liveConflict
+              || now() - bindStartedAt >= OWNER_BIND_HANDOFF_TIMEOUT_MS)
+            throw error;
+          await sleep(Math.min(50, Math.max(
+            1, OWNER_BIND_HANDOFF_TIMEOUT_MS - (now() - bindStartedAt))));
+        }
+      }
+    } catch (error) {
+      await this.client.close().catch(closeError => this.logError('startup client close failed', closeError));
+      if (this.binderOwnedInternally) this.binder.release();
+      this.binder = undefined;
+      throw error;
+    }
     if (this.authorizationIntegrity().ok && this.tasks.integrity().ok)
       this.tasks.cleanup(Date.now(), this.effectiveOwners());
     if (this.attachmentRecovery.integrity()) {
@@ -225,7 +264,11 @@ export class OwnerChannel implements OwnerChannelHandle {
     this.watchProcess = undefined;
     if (watch && watch.exitCode === null) watch.kill('SIGTERM');
     await this.managementTail;
-    await this.client.close();
+    try { await this.client.close(); }
+    finally {
+      if (this.binderOwnedInternally) this.binder?.release();
+      this.binder = undefined;
+    }
   }
 
   manage(request: OwnerChannelManagementRequest): Promise<OwnerChannelManagementResult> {
@@ -314,6 +357,17 @@ export class OwnerChannel implements OwnerChannelHandle {
         if (this.options.config.agent)
           throw new Error('direct task reports are disabled; the managed agent must message its owner-channel identity');
         return this.sendOwnerTaskReport(request);
+      case 'startup_failure': {
+        const message = ownerNotices.startupHandoffFailed(
+          this.options.role, this.options.config.identity);
+        try { await this.sendProactiveMessage(message); }
+        catch (error) {
+          if (error instanceof DuplicateSendError)
+            return { action: request.action, status: 'duplicate' };
+          throw error;
+        }
+        return { action: request.action, status: 'delivered' };
+      }
       default:
         throw new Error('unknown owner-channel management action');
     }

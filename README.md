@@ -68,6 +68,7 @@ The state dir contract:
 | `.identity`, `.cwd`, `.session-id`, `.booted`, `.exit-status`, `.config-path` | supervisor | dot-marker state — session resume and boot bookkeeping |
 | `.monitor-state.json`, `.monitor-status` | supervisor monitor | atomic body-free cursor/pending state and health |
 | `.owner-channel-state.json` | owner-channel bridge | bounded wire-ID dedupe only; never message/reply plaintext |
+| `.owner-channel-binder.lock/`, `.owner-channel-binder.json` | owner-channel supervisor | mode-0600 role/identity + PID/start-marker ownership and release metadata; never mail plaintext or credentials |
 | `.session-events.jsonl`, `.control.sock`, `.control-token` | ACP backend | bounded typed console projection and private attachment control |
 
 ## Prerequisites
@@ -573,6 +574,22 @@ channel identity. Add it to the control plane just like another contact, then
 message it directly.
 
 The running supervisor remains the only process which binds that identity.
+Rapid supervised restart uses a role-scoped single-binder lease. The old
+supervisor closes its MCP proxy and authenticated control socket before
+releasing the lease; the replacement waits a bounded five seconds and retries a
+daemon bind only when the lease proves that holder was the same role and channel
+identity. A foreign, live, or unverifiable holder remains fail-closed and is
+never evicted with `force=true`.
+
+If the matching predecessor does not release within that bound, the replacement
+asks the predecessor's still-authenticated control socket to emit one fixed
+recovery notice. The predecessor uses only its existing latest-owner route (or
+the sole configured owner), deduplicates the notice durably by digest, and stores
+no notice plaintext. When no unambiguous authenticated owner route exists, no
+recipient is guessed: the failure remains in the web console and role logs. The
+remote recovery action is `/restart`; repeated failures should be inspected with
+`ours-fleet logs <Role>` or the web console.
+
 Operators manage it, and an active agent turn emits bounded updates, through the
 role's authenticated Unix control socket:
 

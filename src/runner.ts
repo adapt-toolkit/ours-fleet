@@ -18,7 +18,7 @@ import { resourceArgs, cpuControllerDelegated } from './isolation/resources.js';
 import type { WrapContext } from './isolation/types.js';
 import { resolveLaunchRuntime } from './isolation/runtime.js';
 import { AcpSession } from './session/acp.js';
-import { RoleControlServer } from './session/control.js';
+import { controlRequest, RoleControlServer } from './session/control.js';
 import { TmuxSession } from './session/tmux.js';
 import { classifyShellStatus } from './session/types.js';
 import type { ExitRecord, SessionHandle } from './session/types.js';
@@ -28,6 +28,9 @@ import {
 } from './model-recovery.js';
 import { rotateWorklog } from './worklog.js';
 import { OwnerChannel, type OwnerChannelHandle, type OwnerChannelOptions } from './owner-channel/channel.js';
+import {
+  acquireOwnerBinderLease, OwnerBinderHandoffTimeoutError, type OwnerBinderLease,
+} from './owner-channel/binder.js';
 import { RoleTurnArbiter } from './session/arbiter.js';
 import {
   ScheduledLoopManager, type ScheduledLoopManagerHandle,
@@ -47,6 +50,10 @@ export interface RunnerDeps {
   createMonitor(opts: MonitorOpts): MonitorHandle;
   /** Construct trusted owner ingress (injectable for lifecycle tests). */
   createOwnerChannel(opts: OwnerChannelOptions): OwnerChannelHandle;
+  /** Acquire the cross-process owner-channel binder lease before replacing the control socket. */
+  acquireOwnerBinder(stateDir: string, role: string, identity: string): Promise<OwnerBinderLease>;
+  /** Ask the still-authenticated predecessor to emit the fixed recovery notice. */
+  reportOwnerStartupFailure(stateDir: string): Promise<'delivered' | 'duplicate'>;
   /** Lets a test (or a shutdown path) end the supervised restart loop. */
   shouldStop?(): boolean;
 }
@@ -62,6 +69,19 @@ const defaultDeps = (): RunnerDeps => ({
   fetch: (url, init) => globalThis.fetch(url, init) as unknown as ReturnType<FetchLike>,
   createMonitor: opts => createMonitor(opts),
   createOwnerChannel: opts => new OwnerChannel(opts),
+  acquireOwnerBinder: (stateDir, role, identity) => acquireOwnerBinderLease(
+    stateDir, role, identity),
+  reportOwnerStartupFailure: async stateDir => {
+    const response = await controlRequest(stateDir, {
+      command: 'owner_channel_manage', ownerChannel: { action: 'startup_failure' },
+    }, 2_000);
+    if (!response.ok) throw new Error(response.error ?? 'prior owner channel refused startup notice');
+    const result = response.result as { action?: string; status?: string } | undefined;
+    if (result?.action !== 'startup_failure'
+        || (result.status !== 'delivered' && result.status !== 'duplicate'))
+      throw new Error('prior owner channel returned an invalid startup notice result');
+    return result.status;
+  },
 });
 
 const MONITOR_OWNER_FILE = '.monitor-owner';
@@ -470,6 +490,7 @@ export async function runOnce(
   let monitorLoop: Promise<void> | undefined;
   let acpStartupComplete = false;
   let ownerChannel: OwnerChannelHandle | undefined;
+  let ownerBinder: OwnerBinderLease | undefined;
   let loopManager: ScheduledLoopManagerHandle | undefined;
   let arbiter: RoleTurnArbiter | undefined;
   let reloadLoopConfig: (() => Promise<{ changed: boolean; loops: number }>) | undefined;
@@ -504,8 +525,34 @@ export async function runOnce(
         event.text, 'acp', new Date(deps.now()).toISOString());
       if (evidence) resolvedMonitorDeps.onFailureEvidence?.(evidence);
     });
+    if (role.owner_channel) {
+      try {
+        ownerBinder = await deps.acquireOwnerBinder(
+          dir, name, role.owner_channel.identity);
+      } catch (error) {
+        if (error instanceof OwnerBinderHandoffTimeoutError) {
+          try {
+            const status = await deps.reportOwnerStartupFailure(dir);
+            deps.log(`[${name}] owner channel startup recovery notice ${status} by authenticated predecessor`);
+          } catch (notifyError) {
+            deps.log(`[${name}] owner channel startup recovery notice unavailable: `
+              + `${(notifyError as Error)?.message ?? String(notifyError)}`);
+          }
+        }
+        await acpSession.close();
+        unsubscribeRecovery?.();
+        throw new Error(`[${name}] owner channel failed to start: `
+          + `${(error as Error)?.message ?? String(error)}`);
+      }
+    }
     control = new RoleControlServer(dir, arbiter, deps.log);
-    await control.start();
+    try { await control.start(); }
+    catch (error) {
+      ownerBinder?.release();
+      await acpSession.close();
+      unsubscribeRecovery?.();
+      throw error;
+    }
     resolvedMonitorDeps.delivery = {
       // A wake is only delivered when its turn TERMINATES successfully. A
       // refusal or a cancellation reached the agent and was not acted on, so
@@ -545,6 +592,7 @@ export async function runOnce(
     if (!started.succeeded) {
       monitor?.stop();
       await control.close();
+      ownerBinder?.release();
       await acpSession.close();
       unsubscribeRecovery?.();
       if (modelRecovery) {
@@ -574,20 +622,23 @@ export async function runOnce(
         stateDir: dir,
         env: role.env,
         log: deps.log,
+        ...(ownerBinder ? { binderLease: ownerBinder } : {}),
         ...(configPath ? { configPath } : {}),
       });
       try { await ownerChannel.start(); }
       catch (error) {
         monitor?.stop();
         if (monitorLoop) await monitorLoop;
+        await ownerChannel.close().catch(() => undefined);
         await control.close();
+        ownerBinder?.release();
         await acpSession.close();
         unsubscribeRecovery?.();
         throw new Error(`[${name}] owner channel failed to start: `
           + `${(error as Error)?.message ?? String(error)}`);
       }
-      control.setOwnerChannel(ownerChannel);
     }
+    if (ownerChannel) control.setOwnerChannel(ownerChannel);
     reloadLoopConfig = async (): Promise<{ changed: boolean; loops: number }> => {
       const nextRole = findRole(loadConfig(configPath), name);
       const definitions = nextRole.loops ?? [];
@@ -671,13 +722,17 @@ export async function runOnce(
     await loopManager.stop();
   }
   control?.setConfigReloader(undefined);
-  if (ownerChannel) {
-    control?.setOwnerChannel(undefined);
-    await ownerChannel.close();
+  // Close the authenticated control route before releasing the binder lease;
+  // otherwise the predecessor can unlink the replacement's new socket.
+  if (control) {
+    control.setOwnerChannel(undefined);
+    await control.close();
+    control = undefined;
   }
+  if (ownerChannel) await ownerChannel.close();
+  ownerBinder?.release();
   if (monitor) { monitor.stop(); await monitorLoop; }
   unsubscribeRecovery?.();
-  if (control) await control.close();
   if (acpSession) await acpSession.close();
   const elapsed = (deps.now() - start) / 1000;
   // Establish what actually happened before deciding anything. Absence of a

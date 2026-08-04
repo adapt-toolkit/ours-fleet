@@ -439,6 +439,21 @@ The supervisor which is already running the ACP role remains the sole binder of
 through the role's token-authenticated, mode-0600 Unix control socket for contact
 inspection and setup; it never starts another ours client and never force-binds:
 
+Rapid supervised restart is serialized by a role-scoped single-binder lease.
+The predecessor closes its authenticated control socket and MCP proxy before
+releasing ownership. The replacement waits at most five seconds and retries the
+daemon bind only when PID/start-marker metadata proves the holder was the same
+role and owner-channel identity. Foreign, live, corrupt, or otherwise
+unverifiable ownership remains fail-closed; fleet never uses \`force=true\`.
+
+If that matching predecessor misses the bound, its still-authenticated control
+route may send one fixed, digest-deduplicated recovery notice through the latest
+authenticated owner conversation (or the sole configured owner). Notice
+plaintext is never persisted. With no safe deterministic route fleet guesses no
+recipient and leaves the actionable failure in the web console and role logs.
+The remote recovery action is \`/restart\`; inspect repeated failures with
+\`ours-fleet logs <Role>\` or the web console.
+
 \`\`\`sh
 ours-fleet owner-channel contact list <Role>
 ours-fleet owner-channel contact invite <Role> [--name <label>]
