@@ -37,7 +37,7 @@ const FIELDS: Record<NodeKind, Array<{ key: string; label: string; hint?: string
     { key: 'interval', label: 'Interval', hint: 'Default 10m, minimum 1m.' },
   ],
   loop: [
-    { key: 'prompt', label: 'Prompt', hint: 'What this interval delivers.', long: true },
+    { key: 'prompt', label: 'Prompt', hint: 'What this loop delivers on every tick.', long: true },
     { key: 'interval', label: 'Interval', hint: 'Default 10m, minimum 1m.' },
   ],
 };
@@ -267,7 +267,7 @@ export function TopologyEditor({ topology, onRefresh, onOpenAgent, onOpenWatchdo
     <div className="topology-toolbar" role="toolbar" aria-label="Add to the canvas">
       <button className="secondary" onClick={() => create('agent')} disabled={!writable}>＋ Agent</button>
       <button className="secondary" onClick={() => create('watchdog')} disabled={!writable}>＋ Watchdog</button>
-      <button className="secondary" onClick={() => create('loop')} disabled={!writable}>＋ Interval</button>
+      <button className="secondary" onClick={() => create('loop')} disabled={!writable}>＋ Loop</button>
       <span className="spacer" />
       {drafted.length > 0 && <span className="draft-count">{drafted.length} sketched · not in the fleet</span>}
       {readyToAdd.length > 0 && <button onClick={() => void promote(readyToAdd.map(node => node.id))} disabled={busy}>
@@ -335,7 +335,7 @@ export function TopologyEditor({ topology, onRefresh, onOpenAgent, onOpenWatchdo
       connecting={connecting}
       onConnectFrom={() => { setConnecting(selectedNode.id); setNotice(''); }}
       onWatchThis={() => create('watchdog', { to: selectedNode.id })}
-      onIntervalFor={() => create('loop', { to: selectedNode.id })}
+      onLoopFor={() => create('loop', { to: selectedNode.id })}
       onConfigure={onConfigure}
       onRemove={() => {
         if (selectedNode.origin === 'draft') {
@@ -407,7 +407,7 @@ function Tutorial({ step, onDismiss }: { step: number; onDismiss(): void }) {
  *
  * The actions live on the node rather than only in the inspector because that
  * is where the owner is looking: an agent is one press away from a watchdog, an
- * interval, oversight of another agent, and its own configuration. None of them
+ * loop, oversight of another agent, and its own configuration. None of them
  * starts anything — the two that write configuration go through review first.
  */
 function NodeCard({
@@ -457,7 +457,7 @@ function NodeCard({
         <button className="node-action" onClick={onAddWatchdog}
           aria-label={`Add a watchdog for ${node.label}`}>+ Watchdog</button>
         <button className="node-action" onClick={onAddLoop}
-          aria-label={`Add an interval for ${node.label}`}>+ Interval</button>
+          aria-label={`Add a loop for ${node.label}`}>+ Loop</button>
         <button className="node-action" onClick={onOversee}
           aria-label={`Have ${node.label} oversee another agent`}>Oversee</button>
       </>}
@@ -485,13 +485,13 @@ function NodeList({ nodes, selected, onSelect, topology }: {
 
 function Inspector({
   node, topology, draft, writable, busy, connecting,
-  onClose, onField, onRename, onConnectFrom, onWatchThis, onIntervalFor, onConfigure,
+  onClose, onField, onRename, onConnectFrom, onWatchThis, onLoopFor, onConfigure,
   onRemove, onPromote, onOpen,
 }: {
   node: TopologyNode; topology: Topology; draft: TopologyDraft; writable: boolean; busy: boolean;
   connecting: string;
   onClose(): void; onField(key: string, value: string): void; onRename(name: string): void;
-  onConnectFrom(): void; onWatchThis(): void; onIntervalFor(): void; onConfigure(): void;
+  onConnectFrom(): void; onWatchThis(): void; onLoopFor(): void; onConfigure(): void;
   onRemove(): void; onPromote(): void; onOpen(): void;
 }) {
   const isDraft = node.origin === 'draft';
@@ -529,7 +529,7 @@ function Inspector({
     <div className="inspector-actions">
       {node.kind === 'agent' && writable && <>
         <button className="secondary" onClick={onWatchThis}>＋ Watchdog for this agent</button>
-        <button className="secondary" onClick={onIntervalFor}>＋ Interval for this agent</button>
+        <button className="secondary" onClick={onLoopFor}>＋ Loop for this agent</button>
         <button className="secondary" onClick={onConnectFrom} aria-pressed={connecting === node.id}
           aria-label={`Have ${node.label} oversee another agent`}>◎ Oversee an agent…</button>
       </>}

@@ -30,7 +30,7 @@ describe('every agent node carries its own actions', () => {
   it('offers add-watchdog, add-interval and oversee on the node itself', () => {
     for (const label of [
       /aria-label=\{`Add a watchdog for \$\{node\.label\}`\}/,
-      /aria-label=\{`Add an interval for \$\{node\.label\}`\}/,
+      /aria-label=\{`Add a loop for \$\{node\.label\}`\}/,
       /aria-label=\{`Have \$\{node\.label\} oversee another agent`\}/,
     ]) expect(editor).toMatch(label);
   });
@@ -108,7 +108,7 @@ describe('connection legality', () => {
     expect(connect(draft, 'agent:Alice', 'agent:Ghost', context))
       .toEqual({ error: 'That node is no longer on the canvas.' });
     expect(connect(draft, 'watchdog:health', 'loop:nightly', context))
-      .toEqual({ error: 'A watchdog cannot connect to a interval. Connections always point at an agent.' });
+      .toEqual({ error: 'A watchdog cannot connect to a loop. Connections always point at an agent.' });
   });
 
   it('refuses to draw from configured state, pointing at the reviewed editor', () => {
@@ -150,7 +150,7 @@ describe('sketching nodes', () => {
     expect(nextName('agent', ['agent:Agent1', 'agent:Agent2'])).toBe('Agent3');
     // A configured agent occupies the name too.
     expect(nextName('watchdog', ['watchdog:Watchdog1'])).toBe('Watchdog2');
-    expect(nextName('loop', [])).toBe('Interval1');
+    expect(nextName('loop', [])).toBe('Loop1');
   });
 
   it('adds a node at a position, and ignores a duplicate id', () => {

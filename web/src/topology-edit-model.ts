@@ -32,7 +32,7 @@ export const NAME_RE = /^[A-Za-z0-9_-]+$/;
 export const MAX_COORDINATE = 100_000;
 
 export const KIND_LABEL: Record<NodeKind, string> = {
-  agent: 'agent', watchdog: 'watchdog', loop: 'interval',
+  agent: 'agent', watchdog: 'watchdog', loop: 'loop',
 };
 
 export const emptyDraft = (): TopologyDraft => ({
@@ -46,7 +46,7 @@ export const nodeKind = (id: string): NodeKind => id.slice(0, id.indexOf(':')) a
 /**
  * Which edge a connection would create, or why it cannot be made.
  *
- * Every connection points AT an agent: a watchdog watches agents, an interval
+ * Every connection points AT an agent: a watchdog watches agents, a loop
  * delivers to agents, an agent oversees agents. `spawned` is runtime provenance
  * and is never drawn by hand.
  */
@@ -142,7 +142,7 @@ export function disconnect(draft: TopologyDraft, edge: DraftEdge): TopologyDraft
 
 /** First free `Agent1`, `Agent2`, … that collides with nothing already on the canvas. */
 export function nextName(kind: NodeKind, taken: Iterable<string>): string {
-  const stem = kind === 'agent' ? 'Agent' : kind === 'watchdog' ? 'Watchdog' : 'Interval';
+  const stem = kind === 'agent' ? 'Agent' : kind === 'watchdog' ? 'Watchdog' : 'Loop';
   const used = new Set(taken);
   for (let index = 1; ; index += 1) {
     const candidate = `${stem}${index}`;

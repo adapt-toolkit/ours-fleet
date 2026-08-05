@@ -38,6 +38,15 @@ const inactiveRole = {
   ...role, id: 'Dormant',
   config: { ...role.config, name: 'Dormant', identity: 'Dormant', mission: 'Stopped historical role' },
 };
+/*
+ * In the inventory only because its state directory outlived it: not in
+ * fleet.yaml, not running, and deliberately absent from the topology below —
+ * the console must list it apart and never draw it.
+ */
+const pastRole = {
+  ...role, id: 'tmp-9f2c1a', lifetime: 'temporary', configured: false,
+  config: { ...role.config, name: 'tmp-9f2c1a', identity: 'tmp-9f2c1a', mission: 'Finished spawn' },
+};
 const capabilities = {
   protocolVersion: 2, inventory: true, status: true,
   output: { recent: true, stream: true, structured: true, replayCursor: true },
@@ -217,6 +226,8 @@ const services = {
   query: {
     async list() { return [
       { role, status: { ...status, observedAt: new Date().toISOString() }, capabilities },
+      { role: pastRole, status: { ...inactiveStatus, roleId: 'tmp-9f2c1a', observedAt: new Date().toISOString() },
+        capabilities: inactiveCapabilities },
       { role: terminalRole, status: { ...status, roleId: 'Terminal', observedAt: new Date().toISOString(),
         session: { ...status.session, backend: 'tmux' } }, capabilities: terminalCapabilities },
       { role: inactiveRole, status: { ...inactiveStatus, observedAt: new Date().toISOString() },
@@ -234,7 +245,7 @@ const services = {
       };
     },
   },
-  repository: { async get(id) { return id === 'Dormant' ? inactiveRole : id === 'Terminal' ? terminalRole : role; } },
+  repository: { async get(id) { return id === 'Dormant' ? inactiveRole : id === 'Terminal' ? terminalRole : id === 'tmp-9f2c1a' ? pastRole : role; } },
   async session() {
     return {
       async describe() { return { backend: 'acp', protocolVersion: 3, features: ['conversation_v3'] }; },

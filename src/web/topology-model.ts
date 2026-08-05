@@ -75,13 +75,13 @@ const WATCHDOG_COORDINATOR: MissingRequirement = {
 };
 const LOOP_PROMPT: MissingRequirement = {
   field: 'prompt',
-  why: 'An interval delivers a prompt on a schedule; there is nothing to deliver yet.',
-  fix: 'Write the prompt this interval should send.',
+  why: 'A loop delivers a prompt on a schedule; there is nothing to deliver yet.',
+  fix: 'Write the prompt this loop should send.',
 };
 const LOOP_TARGET: MissingRequirement = {
   field: 'roles',
-  why: 'An interval needs at least one agent to deliver its prompt to.',
-  fix: 'Connect this interval to an agent.',
+  why: 'A loop needs at least one agent to deliver its prompt to.',
+  fix: 'Connect this loop to an agent.',
 };
 
 /**
@@ -210,7 +210,7 @@ function draftNode(
     if (!outgoing.some(edge => edge.kind === 'targets')) missing.push(LOOP_TARGET);
     if (!nonBlank(node.fields.prompt)) missing.push(LOOP_PROMPT);
     pushPendingTargets(missing, 'roles', stillDraft('targets'),
-      'An interval may only deliver to agents that are already in the fleet.');
+      'A loop may only deliver to agents that are already in the fleet.');
   }
 
   return {
