@@ -5,7 +5,7 @@ import { describe, expect, it } from 'vitest';
 import {
   type NodeKind, type TopologyDraft,
   addNode, connect, disconnect, edgeFor, emptyDraft, isRefusal, moveNode, nextName,
-  prunePositions, removeNode, renameNode, setField,
+  planConnection, prunePositions, removeNode, renameNode, setField,
 } from '../../web/src/topology-edit-model.js';
 
 const KINDS: NodeKind[] = ['agent', 'watchdog', 'loop'];
@@ -21,28 +21,68 @@ const canvas = (draft: TopologyDraft, configured: Record<string, NodeKind> = {})
 const sketch = (...nodes: Array<[NodeKind, string]>) =>
   nodes.reduce((draft, [kind, name]) => addNode(draft, kind, name), emptyDraft());
 
-describe('agent oversight is deferred out of this phase', () => {
+describe('every agent node carries its own actions', () => {
   // There is no DOM test environment here, so the contract is pinned at the
-  // source, the same way the no-viewBox overlay contract is.
+  // source, the same way the no-viewBox overlay contract is; the gestures
+  // themselves are exercised in the browser suite.
   const editor = readFileSync(resolve('web/src/TopologyEditor.tsx'), 'utf8');
 
-  it('offers no gesture for drawing agent oversight', () => {
-    expect(editor).not.toMatch(/Agent this one oversees/);
-    expect(editor).not.toMatch(/onAddLinked/);
-    // Connect mode is offered only from a watchdog or interval, never an agent.
-    expect(editor).toMatch(/isDraft && node\.kind !== 'agent' && writable\s*\n\s*&& <button[^>]*onClick=\{onConnectFrom\}/);
+  it('offers add-watchdog, add-interval and oversee on the node itself', () => {
+    for (const label of [
+      /aria-label=\{`Add a watchdog for \$\{node\.label\}`\}/,
+      /aria-label=\{`Add an interval for \$\{node\.label\}`\}/,
+      /aria-label=\{`Have \$\{node\.label\} oversee another agent`\}/,
+    ]) expect(editor).toMatch(label);
   });
 
-  it('explains where oversight is configured instead of failing silently', () => {
-    expect(editor).toMatch(/deferred-note/);
-    expect(editor).toMatch(/Agent oversight/);
-    expect(editor).toMatch(/not configured from the/);
-    expect(editor).toMatch(/configuration editor/);
+  it('offers a configure affordance on every node, drafted or configured', () => {
+    expect(editor).toMatch(/aria-label=\{`Configure \$\{node\.kind\} \$\{node\.label\}`\}/);
+    // The stand-in for the withdrawn gesture is gone; oversight is drawn now.
+    expect(editor).not.toMatch(/deferred-note/);
+    expect(editor).not.toMatch(/is not configured from the/);
   });
 
   it('keeps the underlying rule intact, so nothing about the model changed', () => {
-    // The legality rule survives; only the UI gesture is withdrawn.
     expect(edgeFor('agent', 'agent')).toBe('oversees');
+  });
+});
+
+describe('planning a connection', () => {
+  const fleet = { 'agent:Alice': 'agent' as const, 'agent:Bob': 'agent' as const, 'watchdog:health': 'watchdog' as const };
+
+  it('edits the sidecar when the source is a sketch', () => {
+    const draft = sketch(['watchdog', 'W']);
+    const plan = planConnection(draft, 'watchdog:W', 'agent:Alice', canvas(draft, fleet));
+    expect(plan).toMatchObject({ action: 'draft' });
+    expect((plan as { draft: TopologyDraft }).draft.drafts.edges)
+      .toEqual([{ kind: 'watches', from: 'watchdog:W', to: 'agent:Alice' }]);
+  });
+
+  it('writes configuration when both agents are already in the fleet', () => {
+    expect(planConnection(emptyDraft(), 'agent:Alice', 'agent:Bob', canvas(emptyDraft(), fleet)))
+      .toEqual({ action: 'oversee', from: 'Alice', to: 'Bob' });
+  });
+
+  it('refuses self-oversight in the words the owner needs', () => {
+    expect(planConnection(emptyDraft(), 'agent:Alice', 'agent:Alice', canvas(emptyDraft(), fleet)))
+      .toEqual({ error: 'Alice cannot oversee itself. Choose a different agent.' });
+  });
+
+  it('refuses a target that is not an agent, is gone, or is only a sketch', () => {
+    const draft = sketch(['agent', 'Sketch']);
+    const context = canvas(draft, fleet);
+
+    expect(planConnection(draft, 'agent:Alice', 'watchdog:health', context))
+      .toEqual({ error: 'Oversight points at an agent. Choose an agent for Alice to oversee.' });
+    expect(planConnection(draft, 'agent:Alice', 'agent:Ghost', context))
+      .toEqual({ error: 'That node is no longer on the canvas.' });
+    expect(planConnection(draft, 'agent:Alice', 'agent:Sketch', context))
+      .toMatchObject({ error: expect.stringContaining('still a sketch') });
+  });
+
+  it('still sends a configured watchdog to the configuration editor', () => {
+    expect(planConnection(emptyDraft(), 'watchdog:health', 'agent:Alice', canvas(emptyDraft(), fleet)))
+      .toEqual({ error: 'health is already part of the fleet. Edit its connections in the configuration editor.' });
   });
 });
 

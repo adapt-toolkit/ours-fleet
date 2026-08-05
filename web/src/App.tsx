@@ -199,6 +199,7 @@ export function App() {
               onRefresh={requestRefresh}
               onOpenAgent={setSelected}
               onOpenWatchdog={name => { setSelectedWatchdog(name); setView('watchdogs'); }}
+              onConfigure={() => setView('configuration')}
               onRemoveAgent={name => void confirmAndRemoveRole(name).then(result => {
                 if (result) { alert(`Removed ${name}. Recovery archive: ${result.recoveryPath}`); requestRefresh(); }
               }).catch(reason => setError((reason as Error).message))} />}
