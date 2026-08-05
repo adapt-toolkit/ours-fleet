@@ -1,3 +1,5 @@
+import { readFileSync } from 'node:fs';
+import { resolve } from 'node:path';
 import { describe, expect, it } from 'vitest';
 
 import {
@@ -18,6 +20,31 @@ const canvas = (draft: TopologyDraft, configured: Record<string, NodeKind> = {})
 
 const sketch = (...nodes: Array<[NodeKind, string]>) =>
   nodes.reduce((draft, [kind, name]) => addNode(draft, kind, name), emptyDraft());
+
+describe('agent oversight is deferred out of this phase', () => {
+  // There is no DOM test environment here, so the contract is pinned at the
+  // source, the same way the no-viewBox overlay contract is.
+  const editor = readFileSync(resolve('web/src/TopologyEditor.tsx'), 'utf8');
+
+  it('offers no gesture for drawing agent oversight', () => {
+    expect(editor).not.toMatch(/Agent this one oversees/);
+    expect(editor).not.toMatch(/onAddLinked/);
+    // Connect mode is offered only from a watchdog or interval, never an agent.
+    expect(editor).toMatch(/isDraft && node\.kind !== 'agent' && writable\s*\n\s*&& <button[^>]*onClick=\{onConnectFrom\}/);
+  });
+
+  it('explains where oversight is configured instead of failing silently', () => {
+    expect(editor).toMatch(/deferred-note/);
+    expect(editor).toMatch(/Agent oversight/);
+    expect(editor).toMatch(/not configured from the/);
+    expect(editor).toMatch(/configuration editor/);
+  });
+
+  it('keeps the underlying rule intact, so nothing about the model changed', () => {
+    // The legality rule survives; only the UI gesture is withdrawn.
+    expect(edgeFor('agent', 'agent')).toBe('oversees');
+  });
+});
 
 describe('connection legality', () => {
   it('allows exactly the three connections that point at an agent', () => {

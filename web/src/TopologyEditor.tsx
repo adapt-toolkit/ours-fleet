@@ -259,7 +259,6 @@ export function TopologyEditor({ topology, onRefresh, onOpenAgent, onOpenWatchdo
         void save(result);
       }}
       onConnectFrom={() => { setConnecting(selectedNode.id); setNotice(''); }}
-      onAddLinked={kind => create(kind, { to: selectedNode.id })}
       onWatchThis={() => create('watchdog', { to: selectedNode.id })}
       onIntervalFor={() => create('loop', { to: selectedNode.id })}
       onRemove={() => {
@@ -371,12 +370,12 @@ function NodeList({ nodes, selected, onSelect, topology }: {
 
 function Inspector({
   node, topology, draft, writable, busy,
-  onClose, onField, onRename, onConnectFrom, onWatchThis, onIntervalFor, onAddLinked,
+  onClose, onField, onRename, onConnectFrom, onWatchThis, onIntervalFor,
   onRemove, onPromote, onOpen,
 }: {
   node: TopologyNode; topology: Topology; draft: TopologyDraft; writable: boolean; busy: boolean;
   onClose(): void; onField(key: string, value: string): void; onRename(name: string): void;
-  onConnectFrom(): void; onWatchThis(): void; onIntervalFor(): void; onAddLinked(kind: NodeKind): void;
+  onConnectFrom(): void; onWatchThis(): void; onIntervalFor(): void;
   onRemove(): void; onPromote(): void; onOpen(): void;
 }) {
   const isDraft = node.origin === 'draft';
@@ -410,11 +409,22 @@ function Inspector({
       This is live configuration. Edit its details in the configuration editor; the graph edits sketches.
     </p>}
 
+    {/*
+      No "agent this one oversees" gesture in this phase. Promotion writes role
+      fields but does not materialise an `oversee:` list, so drawing oversight
+      here would sketch a relationship that could never reach configuration.
+      Say that plainly rather than shipping a control that does nothing.
+    */}
+    {node.kind === 'agent' && <p className="muted deferred-note">
+      Agent oversight — which agent checks on which — is not configured from the
+      graph yet. It arrives in a later phase; until then, set <code>oversee:</code>
+      in the configuration editor.
+    </p>}
+
     <div className="inspector-actions">
       {node.kind === 'agent' && writable && <>
         <button className="secondary" onClick={onWatchThis}>＋ Watchdog for this agent</button>
         <button className="secondary" onClick={onIntervalFor}>＋ Interval for this agent</button>
-        <button className="secondary" onClick={() => onAddLinked('agent')}>＋ Agent this one oversees</button>
       </>}
       {isDraft && node.kind !== 'agent' && writable
         && <button className="secondary" onClick={onConnectFrom}>Connect to an agent…</button>}

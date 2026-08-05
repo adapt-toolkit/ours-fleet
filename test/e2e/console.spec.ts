@@ -334,6 +334,13 @@ test('sketch, connect and add to the fleet from an empty console without launchi
   await page.getByLabel('Agent1 details').getByLabel('Mission').blur();
   await expect(page.locator('[data-node-id="agent:Agent1"]')).toContainText('ready to add');
 
+  // Agent oversight is deferred out of this phase: no inert control, and the
+  // inspector says where it is configured instead.
+  await expect(page.getByRole('button', { name: /oversees/i })).toHaveCount(0);
+  await expect(page.getByLabel('Agent1 details')).toContainText('Agent oversight');
+  await expect(page.getByLabel('Agent1 details')).toContainText('not configured from the graph yet');
+  await expect(page.getByLabel('Agent1 details')).toContainText('configuration editor');
+
   // Connect: a watchdog created from the agent is scoped to that agent.
   await page.getByRole('button', { name: '＋ Watchdog for this agent' }).click();
   await expect(page.locator('[data-node-id="watchdog:Watchdog1"]')).toBeVisible();
