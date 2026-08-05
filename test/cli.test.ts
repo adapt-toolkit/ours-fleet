@@ -161,7 +161,7 @@ describe('ours-fleet CLI', () => {
       expect(r.code).toBe(0);
       expect(r.stdout).toContain('# ours-fleet reference');
       expect(r.stdout).toContain('Both lifetimes support `--session acp`');
-      expect(r.stdout).toContain('approval: ask|allow|deny');
+      expect(r.stdout).toContain('approval: ask|auto|allow');
       expect(r.stdout).toContain('@agentclientprotocol/codex-acp');
       expect(r.stdout).toContain('bundled automatically');
       expect(r.stdout).toContain('Reliable mail wake');

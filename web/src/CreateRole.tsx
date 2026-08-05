@@ -3,29 +3,31 @@ import { api, idempotencyKey } from './api';
 import { useLivePoll } from './use-live-poll';
 
 type Form = {
-  name: string; harness: 'codex' | 'claude-code'; model: string;
+  name: string; harness: 'codex' | 'claude-code'; model: string; reasoningEffort: string;
   session: 'acp' | 'tmux'; cwd: string; lifetime: 'permanent' | 'temporary';
-  mission: string; coordinator: string; approval: 'ask' | 'allow' | 'deny';
+  mission: string; coordinator: string; approval: 'ask' | 'auto' | 'allow';
   filesystem: 'read-only' | 'workspace' | 'unrestricted'; unattended: 'deny' | 'wait';
   bio: string; persona: string; highRiskAcknowledged: boolean; openAfterCreate: boolean;
   reuseExistingIdentityAcknowledged: boolean; unverifiedIdentityAcknowledged: boolean;
   monitorMode: 'fleet' | 'native'; monitorInterrupt: boolean;
-  monitorWakeSources: string[]; monitorBatchMs: string; monitorInject: 'notification';
+  monitorWakeSources: string[]; monitorBatchMs: string; monitorInject: 'notification'; advanced: boolean;
 };
 const WAKE_SOURCES = [
   'message_received', 'file_received', 'sibling_contact_added', 'local_contact_request',
   'pending_message', 'contact_restored', 'inbound_error', 'state_import_failed',
 ] as const;
 const initial: Form = {
-  name: '', harness: 'codex', model: '', session: 'acp', cwd: '',
+  name: '', harness: 'codex', model: '', reasoningEffort: '', session: 'acp', cwd: '',
   lifetime: 'permanent', mission: '', coordinator: '', approval: 'ask',
   filesystem: 'workspace', unattended: 'deny', bio: '', persona: '',
   highRiskAcknowledged: false, openAfterCreate: true,
   reuseExistingIdentityAcknowledged: false, unverifiedIdentityAcknowledged: false,
   monitorMode: 'fleet', monitorInterrupt: false,
   monitorWakeSources: ['message_received', 'file_received', 'local_contact_request', 'pending_message'],
-  monitorBatchMs: '2000', monitorInject: 'notification',
+  monitorBatchMs: '2000', monitorInject: 'notification', advanced: false,
 };
+
+type ModelOption = { id: string; label: string; reasoningEfforts: string[]; defaultReasoningEffort?: string; source: string };
 
 export function CreateRole({ onClose, onCreated }: {
   onClose(): void; onCreated(role: string, path?: string): void;
@@ -35,7 +37,7 @@ export function CreateRole({ onClose, onCreated }: {
   const [action, setAction] = useState<any>();
   const [error, setError] = useState('');
   const [busy, setBusy] = useState(false);
-  const [modelChoices, setModelChoices] = useState<Record<Form['harness'], string[]>>({
+  const [modelChoices, setModelChoices] = useState<Record<Form['harness'], ModelOption[]>>({
     codex: [], 'claude-code': [],
   });
   useEffect(() => {
@@ -43,7 +45,7 @@ export function CreateRole({ onClose, onCreated }: {
     void api.get<any>('/api/v1/creation-capabilities', controller.signal).then(capabilities => {
       if (controller.signal.aborted) return;
       setModelChoices(Object.fromEntries((capabilities.harnesses ?? []).map((harness: any) =>
-        [harness.id, harness.models ?? []])) as Record<Form['harness'], string[]>);
+        [harness.id, harness.modelOptions ?? []])) as Record<Form['harness'], ModelOption[]>);
       const defaults = capabilities.monitor?.defaults;
       if (!defaults) return;
       setForm(current => ({
@@ -72,7 +74,8 @@ export function CreateRole({ onClose, onCreated }: {
   useLivePoll(refreshAction, reason => { setError((reason as Error).message); setBusy(false); }, actionPending);
   const request = useMemo(() => ({
     name: form.name, harness: form.harness,
-    model: form.model.trim() || null, session: form.session, cwd: form.cwd || undefined,
+    model: form.model.trim() || null, reasoningEffort: form.reasoningEffort || null,
+    session: form.session, cwd: form.cwd || undefined,
     lifetime: form.lifetime, mission: form.mission || undefined,
     coordinator: form.coordinator || undefined,
     permissions: { approval: form.approval, filesystem: form.filesystem, unattended: form.unattended },
@@ -114,6 +117,11 @@ export function CreateRole({ onClose, onCreated }: {
       <div className="modal-head"><div><span className="eyebrow">transactional workflow</span><h2 id="create-title">Create role session</h2></div>
         <button className="icon" onClick={onClose} aria-label="Close">×</button></div>
       {!action ? <div className="wizard">
+        <div className="mode-switch" role="group" aria-label="Setup detail level">
+          <button className={!form.advanced ? 'active' : 'secondary'} onClick={() => change('advanced', false)}>Basic</button>
+          <button className={form.advanced ? 'active' : 'secondary'} onClick={() => change('advanced', true)}>Advanced</button>
+          <span>Basic shows the safe decisions needed to launch. Advanced reveals custom IDs, permissions, monitoring, and profile controls.</span>
+        </div>
         <fieldset><legend>Identity</legend><div className="form-grid">
           <label>Role / session name<input value={form.name} onChange={e => change('name', e.target.value)} placeholder="Researcher" /></label>
           <label>Derived identity <small>fixed to role name</small><input value={form.name} readOnly aria-readonly="true" placeholder="Researcher" /></label>
@@ -123,19 +131,23 @@ export function CreateRole({ onClose, onCreated }: {
         <fieldset><legend>Runtime</legend><div className="form-grid">
           <label>Harness<select value={form.harness} onChange={e => change('harness', e.target.value as Form['harness'])}><option value="codex">Codex</option><option value="claude-code">Claude Code</option></select></label>
           <label>Session<select value={form.session} onChange={e => change('session', e.target.value as Form['session'])}><option value="acp">ACP activity</option><option value="tmux">tmux terminal</option></select></label>
-          <label>Known model<select aria-label="Known model" value={modelChoices[form.harness].includes(form.model) ? form.model : ''}
-            onChange={e => change('model', e.target.value)}>
-            <option value="">Harness default / custom ID</option>
-            {modelChoices[form.harness].map(model => <option value={model} key={model}>{model}</option>)}
+          <label>Model<select aria-label="Known model" value={modelChoices[form.harness].some(model => model.id === form.model) ? form.model : ''}
+            onChange={e => { const selected = modelChoices[form.harness].find(model => model.id === e.target.value); change('model', e.target.value); change('reasoningEffort', selected?.defaultReasoningEffort ?? ''); }}>
+            <option value="">Use harness default (resolved after launch)</option>
+            {modelChoices[form.harness].map(model => <option value={model.id} key={model.id}>{model.label} — {model.id}</option>)}
           </select></label>
-          <label>Model ID <small>type any ID; blank uses harness default</small>
+          <label>Reasoning effort<select aria-label="Reasoning effort" value={form.reasoningEffort} onChange={e => change('reasoningEffort', e.target.value)}>
+            <option value="">Model default</option>
+            {(modelChoices[form.harness].find(model => model.id === form.model)?.reasoningEfforts ?? []).map(effort => <option key={effort}>{effort}</option>)}
+          </select></label>
+          {form.advanced && <label>Custom model ID <small>exact ID; validated by the harness at launch</small>
             <input aria-label="Model" value={form.model}
-              onChange={e => change('model', e.target.value)} placeholder="harness default" />
-          </label>
+              onChange={e => { change('model', e.target.value); change('reasoningEffort', ''); }} placeholder="vendor model ID" />
+          </label>}
           <label>Lifetime<select value={form.lifetime} onChange={e => change('lifetime', e.target.value as Form['lifetime'])}><option value="permanent">Permanent</option><option value="temporary">Temporary — gone on exit/reboot</option></select></label>
           <label className="wide">Working directory <small>blank uses private role state</small><input value={form.cwd} onChange={e => change('cwd', e.target.value)} placeholder="/absolute/existing/path" /></label>
         </div></fieldset>
-        <fieldset><legend>Monitoring</legend><div className="form-grid">
+        {form.advanced && <fieldset><legend>Monitoring</legend><div className="form-grid">
           <label>Wake owner<select aria-label="Monitor mode" value={form.monitorMode}
             onChange={e => change('monitorMode', e.target.value as Form['monitorMode'])}>
             <option value="fleet">Fleet monitor</option><option value="native">Native harness monitor</option>
@@ -161,18 +173,18 @@ export function CreateRole({ onClose, onCreated }: {
           </>}
         </div>{form.monitorMode === 'native' &&
           <p className="muted">The harness owns wake delivery; fleet batching and injection are disabled.</p>}
-        </fieldset>
-        <fieldset><legend>Neutral permissions</legend><div className="form-grid three">
-          <label>Approval<select value={form.approval} onChange={e => change('approval', e.target.value as Form['approval'])}><option>ask</option><option>deny</option><option>allow</option></select></label>
+        </fieldset>}
+        {form.advanced && <fieldset><legend>Neutral permissions</legend><div className="form-grid three">
+          <label>Permission<select value={form.approval} onChange={e => change('approval', e.target.value as Form['approval'])}><option>ask</option><option>auto</option><option>allow</option></select></label>
           <label>Filesystem<select value={form.filesystem} onChange={e => change('filesystem', e.target.value as Form['filesystem'])}><option>workspace</option><option>read-only</option><option>unrestricted</option></select></label>
           <label>Unattended<select value={form.unattended} onChange={e => change('unattended', e.target.value as Form['unattended'])}><option>deny</option><option>wait</option></select></label>
         </div>{(form.approval === 'allow' || form.filesystem === 'unrestricted') &&
           <label className="risk"><input type="checkbox" checked={form.highRiskAcknowledged} onChange={e => change('highRiskAcknowledged', e.target.checked)} />
-            I understand the adapter’s elevated native permission translation.</label>}</fieldset>
-        <fieldset><legend>Profile</legend><div className="form-grid">
+            I understand the adapter’s elevated native permission translation.</label>}</fieldset>}
+        {form.advanced && <fieldset><legend>Profile</legend><div className="form-grid">
           <label>Public bio<textarea value={form.bio} onChange={e => change('bio', e.target.value)} /></label>
           <label>Local persona<textarea value={form.persona} onChange={e => change('persona', e.target.value)} /></label>
-        </div></fieldset>
+        </div></fieldset>}
         {preview && <div className="review"><h3>Effective plan</h3>
           <dl>{Object.entries(preview.effective).map(([key, value]) => <div key={key}><dt>{key}</dt><dd>{key === 'model' && value == null
             ? 'harness default'

@@ -192,6 +192,61 @@ describe('secure local web host', () => {
     await server.close();
   });
 
+  it('exposes one authenticated contract for config read, preview, save, and topology', async () => {
+    const calls: string[] = [];
+    const configuration = {
+      read() { calls.push('read'); return { firstRun: false, revision: 'r1', model: { roles: {} } }; },
+      async preview(revision: string) { calls.push(`preview:${revision}`); return { valid: true, revision }; },
+      async write(revision: string) { calls.push(`write:${revision}`); return { saved: true, newRevision: 'r2' }; },
+    };
+    const topology = async () => ({ nodes: [], edges: [], unknownLineage: [] });
+    const { server, cookie, csrf } = await authenticated({ configuration, topology });
+    const read = await server.app.inject({
+      method: 'GET', url: '/api/v1/configuration', headers: { host: boundary.host, cookie },
+    });
+    expect(read.statusCode).toBe(200);
+    const graph = await server.app.inject({
+      method: 'GET', url: '/api/v1/topology', headers: { host: boundary.host, cookie },
+    });
+    expect(graph.json()).toEqual({ nodes: [], edges: [], unknownLineage: [] });
+    const preview = await server.app.inject({
+      method: 'POST', url: '/api/v1/configuration/preview',
+      headers: { host: boundary.host, origin: boundary.origin, cookie, 'x-csrf-token': csrf },
+      payload: { revision: 'r1', model: { roles: {} } },
+    });
+    expect(preview.statusCode).toBe(200);
+    const save = await server.app.inject({
+      method: 'POST', url: '/api/v1/configuration/save',
+      headers: { host: boundary.host, origin: boundary.origin, cookie, 'x-csrf-token': csrf },
+      payload: { revision: 'r1', model: { roles: {} } },
+    });
+    expect(save.json()).toMatchObject({ saved: true, newRevision: 'r2' });
+    expect(calls).toEqual(['read', 'preview:r1', 'write:r1']);
+    await server.close();
+  });
+
+  it('guards role removal with authentication, CSRF, exact path handling, and typed service input', async () => {
+    const calls: unknown[] = [];
+    const removal = {
+      preview(role: string) { calls.push(['preview', role]); return { role, confirmation: 'typed-role-name' }; },
+      async remove(input: unknown) { calls.push(['remove', input]); return { ...(input as object), removed: true, recoveryPath: '/archive' }; },
+    };
+    const { server, cookie, csrf } = await authenticated({ removal });
+    const unauthenticated = await server.app.inject({ method: 'GET', url: '/api/v1/roles/Alpha/removal-preview', headers: { host: boundary.host } });
+    expect(unauthenticated.statusCode).toBe(401);
+    const traversal = await server.app.inject({ method: 'GET', url: '/api/v1/roles/%2e%2e%2fAlpha/removal-preview', headers: { host: boundary.host, cookie } });
+    expect(traversal.statusCode).toBe(400);
+    const noCsrf = await server.app.inject({ method: 'POST', url: '/api/v1/roles/Alpha/remove',
+      headers: { host: boundary.host, origin: boundary.origin, cookie }, payload: { confirmation: 'Alpha' } });
+    expect(noCsrf.statusCode).toBe(403);
+    const removed = await server.app.inject({ method: 'POST', url: '/api/v1/roles/Alpha/remove',
+      headers: { host: boundary.host, origin: boundary.origin, cookie, 'x-csrf-token': csrf },
+      payload: { confirmation: 'Alpha' } });
+    expect(removed.statusCode).toBe(200);
+    expect(calls).toEqual([['remove', { role: 'Alpha', confirmation: 'Alpha' }]]);
+    await server.close();
+  });
+
   it('resumes only at the exact boundary, rotates the device, and logout revokes it', async () => {
     const { server, cookies, csrf } = await authenticated();
     const device = cookies.find(value => value.startsWith('ofs_device='))!;

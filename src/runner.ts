@@ -40,6 +40,7 @@ import {
   type ManagedFleetSpawnResult,
 } from './fleet-proxy.js';
 import type { SpawnOpts } from './spawn.js';
+import { effectivePermissionMode } from './permissions.js';
 
 export interface RunnerDeps {
   tmux: Tmux;
@@ -575,6 +576,7 @@ export async function runOnce(
       mode,
       permissions: perms,
       modeId: adapter.acpPermissionModeId?.(role),
+      permissionMode: effectivePermissionMode(role),
       log: deps.log,
     });
     pid = acpSession.pid;

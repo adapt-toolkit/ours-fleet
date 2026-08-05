@@ -204,6 +204,7 @@ roles:
       ops: { backend, binPath: '/bin/true', log() {} }, binPath: '/bin/true',
       identityProvisioner: { async exists() { return false; } },
       journalDir: join(root, '.ours-fleet', 'web-actions'),
+      modelCatalogs: { codex: () => ({ models: [], warnings: ['Codex runtime model catalog unavailable: fixture.'] }) },
     });
     const base = {
       name: 'MonitorPreview', harness: 'codex' as const, session: 'acp' as const,
@@ -221,9 +222,13 @@ roles:
       defaults: { mode: 'native', batch_ms: 5000 },
     });
     expect(creationCapabilities.harnesses.find(harness => harness.id === 'codex')?.models)
-      .toEqual(expect.arrayContaining(['fleet-codex', 'gpt-5.6', 'gpt-5.4']));
+      .toEqual(['fleet-codex']);
+    expect(creationCapabilities.harnesses.find(harness => harness.id === 'codex')?.warnings[0])
+      .toMatch(/runtime model catalog unavailable/);
     expect(creationCapabilities.harnesses.find(harness => harness.id === 'claude-code')?.models)
-      .toEqual(expect.arrayContaining(['fleet-sonnet', 'sonnet', 'opus', 'haiku']));
+      .toEqual(expect.arrayContaining([
+        'fleet-sonnet', 'claude-fable-5', 'claude-opus-5', 'claude-sonnet-5',
+      ]));
     const explicit = await service.preview({
       ...base,
       monitor: {

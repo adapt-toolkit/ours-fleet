@@ -1,13 +1,28 @@
 import { test, expect } from '@playwright/test';
 
-test('bootstrap, inventory, live navigation, send, create, and security boundaries', async ({ page, request }) => {
+test('bootstrap, inventory, live navigation, send, create, and security boundaries', async ({ page, request, browserName }) => {
   const bootstrap = (await (await request.post('/__test/bootstrap')).json()).url as string;
   await page.goto(bootstrap);
-  await expect(page.getByRole('heading', { name: 'All roles' })).toBeVisible();
+  await expect(page.getByRole('heading', { name: 'Fleet topology' })).toBeVisible();
   await expect(page.getByText('Ours', { exact: true }).first()).toBeVisible();
   await expect(page).toHaveURL('http://127.0.0.1:49371/');
   await expect(page.getByText('Alpha', { exact: true }).first()).toBeVisible();
   await expect(page.getByText('Terminal', { exact: true }).first()).toBeVisible();
+  await expect(page.getByLabel('Interactive fleet topology')).toBeVisible();
+  await expect(page.getByLabel('Topology connection legend')).toContainText('Oversight');
+  await expect(page.getByLabel('Topology connection legend')).toContainText('Temporary spawn');
+  await page.getByRole('button', { name: 'Configure' }).click();
+  await expect(page.getByRole('heading', { name: '1. Choose how agents run' })).toBeVisible();
+  await expect(page.getByLabel('Configuration detail level')).toContainText('Basic');
+  await page.getByLabel('Fleet model').selectOption('gpt-5.6-sol');
+  await expect(page.getByLabel('Fleet reasoning effort')).toHaveValue('low');
+  await page.getByLabel('Fleet reasoning effort').selectOption('ultra');
+  await page.getByLabel('Configuration detail level').getByRole('button', { name: 'Advanced' }).click();
+  await expect(page.getByPlaceholder('exact vendor model ID')).toHaveValue('gpt-5.6-sol');
+  await page.getByRole('button', { name: 'Continue' }).click();
+  await expect(page.getByRole('heading', { name: '2. Name the agents and give each a job' })).toBeVisible();
+  await page.getByRole('button', { name: 'Topology' }).click();
+  await expect(page.getByRole('button', { name: 'agent Alpha, ready' })).toBeVisible();
   await expect(page.getByText('Dormant', { exact: true })).toHaveCount(0);
   await expect(page.getByRole('button', { name: 'Needs attention 0' })).toBeVisible();
   await expect(page.getByRole('button', { name: 'Show inactive (1)' })).toBeVisible();
@@ -19,7 +34,7 @@ test('bootstrap, inventory, live navigation, send, create, and security boundari
   );
   await expect(page.locator('.status-chip.ready').first()).toHaveText(/Ready/);
   await page.getByRole('button', { name: 'Show inactive (1)' }).click();
-  await expect(page.getByText('Dormant', { exact: true })).toBeVisible();
+  await expect(page.getByText('Dormant', { exact: true }).first()).toBeVisible();
   await expect(page.getByRole('button', { name: /Inactive Dormant/ })).toBeVisible();
   await page.getByRole('button', { name: /Inactive Dormant/ }).click();
   await expect(page.getByText('Inactive — start is the only applicable lifecycle action.')).toBeVisible();
@@ -33,7 +48,7 @@ test('bootstrap, inventory, live navigation, send, create, and security boundari
   await expect(page.locator('.status-chip.attention').first()).toContainText('Attention');
   await page.getByRole('button', { name: /nightwatch/ }).click();
   await expect(page.getByRole('heading', { name: 'nightwatch' })).toBeVisible();
-  await expect(page.getByText('20260731T120000Z')).toBeVisible();
+  await expect(page.getByText('20260731T120000Z').first()).toBeVisible();
   await expect(page.getByText('20260731T110000Z')).toBeVisible();
   await expect(page.getByText('20260731T100000Z')).toBeVisible();
   const aliceRow = page.locator('.watchdog-role', { hasText: 'Alice' });
@@ -85,19 +100,21 @@ test('bootstrap, inventory, live navigation, send, create, and security boundari
   await page.getByRole('button', { name: '← Back to watchdogs' }).click();
   await expect(page.getByRole('heading', { name: 'Watchdogs' })).toBeVisible();
 
-  await page.getByRole('button', { name: 'All roles' }).click();
+  await page.getByRole('button', { name: 'Topology' }).click();
   const manifest = await request.get('/manifest.webmanifest');
   expect(manifest.status()).toBe(200);
   expect(manifest.headers()['content-type']).toMatch(/manifest|json/);
   expect((await manifest.json()).display).toBe('standalone');
-  const cdp = await page.context().newCDPSession(page);
-  const installErrors = (await cdp.send('Page.getInstallabilityErrors')).installabilityErrors;
-  // Playwright's temporary browser context is incognito by construction; no
-  // manifest/icon/worker installability error is allowed beyond that fixture constraint.
-  expect(installErrors.filter(error => error.errorId !== 'in-incognito')).toEqual([]);
+  if (browserName === 'chromium') {
+    const cdp = await page.context().newCDPSession(page);
+    const installErrors = (await cdp.send('Page.getInstallabilityErrors')).installabilityErrors;
+    // Playwright's temporary browser context is incognito by construction; no
+    // manifest/icon/worker installability error is allowed beyond that fixture constraint.
+    expect(installErrors.filter(error => error.errorId !== 'in-incognito')).toEqual([]);
+  }
   await request.post('/__test/restart-auth');
   await page.reload();
-  await expect(page.getByRole('heading', { name: 'All roles' })).toBeVisible();
+  await expect(page.getByRole('heading', { name: 'Fleet topology' })).toBeVisible();
   await expect(page).toHaveURL('http://127.0.0.1:49371/');
   const mission = page.locator('.mission-summary').first();
   await expect(mission).toHaveAttribute('title', /intentionally long mission/);
@@ -109,6 +126,17 @@ test('bootstrap, inventory, live navigation, send, create, and security boundari
   await page.getByLabel('Filter roles').fill('validate');
   await expect(page.getByText('Validate the secure console')).toBeVisible();
   await page.getByText('Alpha', { exact: true }).first().click();
+  await expect(page.getByText('Inspect the fixture')).toBeVisible();
+  await expect(page.getByText('Plan', { exact: true })).toBeVisible();
+  await expect(page.getByText('Inspect input')).toBeVisible();
+  await expect(page.getByText('Edit fixture.ts')).toBeVisible();
+  await expect(page.locator('.usage-badge')).toContainText('context 42%');
+  await page.getByText('Edit fixture.ts').click();
+  await expect(page.getByText('/workspace/fixture.ts:7')).toBeVisible();
+  await expect(page.getByText('new value')).toBeVisible();
+  await expect(page.getByText(/"path": "fixture.ts"/)).toBeVisible();
+  await page.getByRole('button', { name: 'overview' }).click();
+  await expect(page.getByRole('button', { name: 'Remove role…' })).toBeVisible();
   await expect(page.getByText('authoritative')).toBeVisible();
   await page.bringToFront();
   expect(await page.evaluate(() => document.visibilityState)).toBe('visible');
@@ -128,14 +156,16 @@ test('bootstrap, inventory, live navigation, send, create, and security boundari
   await expect(page.getByText('accepted; turn may still be running')).toBeVisible();
   await page.getByRole('button', { name: /Create role/ }).click();
   await page.getByLabel('Role / session name').fill('Researcher');
-  await expect(page.getByText('type any ID; blank uses harness default')).toBeVisible();
+  await expect(page.getByLabel('Setup detail level')).toContainText('Basic');
   await expect(page.getByLabel('Known model').locator('option')).toHaveText([
-    'Harness default / custom ID', 'gpt-5.6', 'gpt-5.4',
+    'Use harness default (resolved after launch)', 'GPT-5.6-Sol — gpt-5.6-sol', 'GPT-5.6-Terra — gpt-5.6-terra',
   ]);
-  await page.getByLabel('Known model').selectOption('gpt-5.6');
+  await page.getByLabel('Known model').selectOption('gpt-5.6-sol');
+  await expect(page.getByLabel('Reasoning effort')).toHaveValue('low');
+  await page.getByLabel('Reasoning effort').selectOption('ultra');
+  await page.getByRole('button', { name: 'Advanced' }).click();
   const modelId = page.getByRole('textbox', { name: 'Model', exact: true });
-  await expect(modelId).toHaveValue('gpt-5.6');
-  await modelId.fill('');
+  await expect(modelId).toHaveValue('gpt-5.6-sol');
   await page.getByLabel('Monitor mode').selectOption('native');
   await expect(page.getByLabel('Monitor wake sources')).toHaveCount(0);
   await page.getByLabel('Monitor mode').selectOption('fleet');
@@ -147,16 +177,16 @@ test('bootstrap, inventory, live navigation, send, create, and security boundari
   await page.getByRole('button', { name: 'Review effective plan' }).click();
   const effectivePlan = page.locator('.review');
   await expect(effectivePlan.getByText('Effective plan')).toBeVisible();
-  await expect(effectivePlan.getByText('harness default', { exact: true })).toBeVisible();
-  await expect(effectivePlan.getByText('gpt-5.6')).toHaveCount(0);
+  await expect(effectivePlan.getByText('gpt-5.6-sol', { exact: true })).toBeVisible();
+  await expect(effectivePlan.getByText('ultra', { exact: true })).toBeVisible();
   await expect(page.getByText(/"batch_ms":750/)).toBeVisible();
   await expect(page.getByText(/"inbound_error"/)).toBeVisible();
   await page.getByRole('button', { name: 'Create atomically' }).click();
   await expect(page.getByRole('heading', { name: 'Researcher' })).toBeVisible();
 
-  await page.getByRole('button', { name: 'All roles' }).click();
+  await page.getByRole('button', { name: 'Topology' }).click();
   await page.getByLabel('Filter roles').fill('');
-  await page.getByRole('button', { name: /Terminal/ }).click();
+  await page.getByRole('button', { name: 'agent Terminal, ready' }).click();
   await page.getByRole('button', { name: 'terminal' }).click();
   await expect(page.locator('.terminal-host .xterm')).toBeVisible();
   await expect(page.locator('.terminal-host')).toContainText('ANSI BOLD');
@@ -183,20 +213,33 @@ test('bootstrap, inventory, live navigation, send, create, and security boundari
   expect(hostile.status()).toBe(403);
 
   await page.screenshot({ path: 'test-results/web-console-overview.png', fullPage: true });
-  await page.evaluate(() => navigator.serviceWorker.ready.then(() => undefined));
-  await page.waitForFunction(() => navigator.serviceWorker.controller !== null);
-  await page.context().setOffline(true);
-  await page.goto('http://127.0.0.1:49371/offline-check');
-  await expect(page.getByRole('heading', { name: 'Local daemon unavailable' })).toBeVisible();
-  await expect(page.getByText('Alpha', { exact: true })).toHaveCount(0);
-  await page.context().setOffline(false);
-  await page.goto('http://127.0.0.1:49371/');
-  await expect(page.getByRole('heading', { name: 'All roles' })).toBeVisible();
-  const cached = await page.evaluate(async () => (await Promise.all(
-    (await caches.keys()).map(async key => (await caches.open(key)).keys()),
-  )).flat().map(request => new URL(request.url).pathname));
-  expect(cached).toContain('/offline.html');
-  expect(cached.every(path => path === '/offline.html' || path.startsWith('/assets/'))).toBe(true);
+  // Firefox's private Playwright context does not expose a usable service
+  // worker; Chromium is the deterministic PWA/cache oracle for this suite.
+  if (browserName === 'chromium') {
+    await page.evaluate(() => navigator.serviceWorker.ready.then(() => undefined));
+    await page.waitForFunction(() => navigator.serviceWorker.controller !== null);
+    await page.context().setOffline(true);
+    await page.goto('http://127.0.0.1:49371/offline-check');
+    await expect(page.getByRole('heading', { name: 'Local daemon unavailable' })).toBeVisible();
+    await expect(page.getByText('Alpha', { exact: true })).toHaveCount(0);
+    await page.context().setOffline(false);
+    await page.goto('http://127.0.0.1:49371/');
+    await expect(page.getByRole('heading', { name: 'Fleet topology' })).toBeVisible();
+    const cached = await page.evaluate(async () => (await Promise.all(
+      (await caches.keys()).map(async key => (await caches.open(key)).keys()),
+    )).flat().map(request => new URL(request.url).pathname));
+    expect(cached).toContain('/offline.html');
+    expect(cached.every(path => path === '/offline.html' || path.startsWith('/assets/'))).toBe(true);
+  }
+  const removalDialogs: string[] = [];
+  page.on('dialog', async dialog => {
+    removalDialogs.push(dialog.message());
+    await dialog.accept(dialog.type() === 'prompt' ? 'Alpha' : undefined);
+  });
+  await page.getByRole('button', { name: 'Remove Alpha' }).click();
+  await expect.poll(() => removalDialogs.length).toBeGreaterThanOrEqual(3);
+  expect(removalDialogs.join('\n')).toContain("Stop and uninstall the exact backend registration for 'Alpha'.");
+  expect(removalDialogs.join('\n')).toContain('/fixture/recovery/Alpha');
   await page.getByRole('button', { name: 'Sign out' }).click();
   await expect(page.getByText(/ours-fleet web open/)).toBeVisible();
   expect((await page.context().cookies()).filter(cookie =>
@@ -211,9 +254,9 @@ test('password and intentional unprotected access are clear in Chromium', async 
   await expect(page.getByText('invalid control-panel password')).toBeVisible();
   await page.getByLabel('Control-panel password').fill('correct horse battery staple');
   await page.getByRole('button', { name: 'Sign in' }).click();
-  await expect(page.getByRole('heading', { name: 'All roles' })).toBeVisible();
+  await expect(page.getByRole('heading', { name: 'Fleet topology' })).toBeVisible();
 
   await page.goto('http://127.0.0.1:49372/');
-  await expect(page.getByRole('heading', { name: 'All roles' })).toBeVisible();
+  await expect(page.getByRole('heading', { name: 'Fleet topology' })).toBeVisible();
   await expect(page.getByText(/Unprotected mode: anyone who can reach/)).toBeVisible();
 });

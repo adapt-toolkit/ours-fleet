@@ -105,7 +105,7 @@ ours-fleet spawn [--temp] [Name | --role Name] \\
   --harness codex|claude-code --session tmux|acp \\
   --mission "one line" --cwd /absolute/path --identity Identity \\
   --coordinator Coordinator --model MODEL \\
-  --approval ask|allow|deny \\
+  --approval ask|auto|allow \\
   --filesystem read-only|workspace|unrestricted \\
   --unattended deny|wait \\
   --bio-file /path/bio.md --persona-file /path/persona.md
@@ -242,7 +242,8 @@ Use README.md for the complete isolation policy and resource-cap schema.
 
 Prefer the harness-neutral \`permissions\` block:
 
-- \`approval: ask|allow|deny\`: whether actions may request or receive approval
+- \`approval: ask|auto|allow\`: portable permission policy. \`deny\` remains a
+  deprecated, fail-closed compatibility alias for existing fleet files.
 - \`filesystem: read-only|workspace|unrestricted\`: filesystem intent
 - \`unattended: deny|wait\`: what ACP does when no console can answer a request
 
@@ -322,13 +323,21 @@ permissions through its harness and check the result against a fixed floor:
 deny those requests with nobody to see it; with \`unattended: wait\` it warns,
 because a human can still attach and answer.
 
-Security meaning: \`approval: allow\` maps to Claude's \`bypassPermissions\`,
+Security meaning: \`ask\` maps to Codex \`untrusted\` and Claude \`default\`;
+\`auto\` maps to Codex \`on-request\` and Claude \`acceptEdits\`; and
+\`approval: allow\` maps to Codex \`never\` and Claude \`bypassPermissions\`,
 which genuinely permits the actions the role was authorized to take —
 \`dontAsk\` only suppresses the prompt while still refusing the action. Nothing
-other than an explicit \`allow\` is elevated: \`ask\` stays on Claude's default
-mode and \`deny\` maps to \`plan\`. \`allow\` is therefore a real grant and
+other than an explicit \`allow\` becomes non-interactive. Legacy \`deny\` keeps
+its conservative Codex \`on-request\` / Claude \`plan\` translation. \`allow\` is therefore a real grant and
 requires explicit authorization; per-role \`isolation:\` remains the outer
 boundary that a permission mode cannot cross.
+
+ACP carries agent-advertised session mode IDs and \`session/set_mode\`, but those
+IDs are agent-specific and ACP defines no portable permission-policy capability.
+Fleet therefore uses the ACP primitive where an adapter exposes a matching mode
+and otherwise performs the harness translation above. The live session reports
+both its effective normalized mode and exact harness-native mode.
 
 See also: \`spawn --approval/--filesystem/--unattended\` set this intent at
 creation, and \`ours-fleet config\` prints each role's neutral settings, their

@@ -484,6 +484,11 @@ describe('runOnce ACP startup outcome (1.2)', () => {
     ...fakeAdapter,
     id: 'fake-acp',
     buildAcpLaunch: () => ({ argv: [process.execPath, acpFixture], env: {} }),
+    effectivePermissionMode: role => ({
+      fleetMode: role.permissions.approval === 'allow' ? 'allow'
+        : role.permissions.approval === 'auto' ? 'auto' : 'ask',
+      nativeMode: role.permissions.approval === 'allow' ? 'fixture-allow' : 'fixture-ask',
+    }),
   };
 
   /** Real-clock deps: an ACP session is a real child process, not a fake pane. */

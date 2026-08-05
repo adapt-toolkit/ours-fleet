@@ -1,4 +1,4 @@
-import type { CommonPermissions, ResolvedRole } from '../config.js';
+import type { CommonPermissions, FleetPermissionMode, ResolvedRole } from '../config.js';
 
 export interface PrereqCheck { name: string; ok: boolean; detail: string }
 export interface PrereqReport { ok: boolean; checks: PrereqCheck[] }
@@ -95,6 +95,11 @@ export interface HarnessAdapter {
    * agent's default. Omit for a harness whose ACP agent has no modes.
    */
   acpPermissionModeId?(role: ResolvedRole): string | undefined;
+  /** Effective portable policy and harness-native approval mode after native overrides win. */
+  effectivePermissionMode?(role: ResolvedRole): {
+    fleetMode: FleetPermissionMode;
+    nativeMode: string;
+  };
   /**
    * REQUIRED. Every adapter must either translate neutral permissions or
    * explicitly declare that it cannot. Enforced at registration.

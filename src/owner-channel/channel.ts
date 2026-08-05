@@ -768,7 +768,8 @@ export class OwnerChannel implements OwnerChannelHandle {
         {
           interrupt: this.options.config.interrupt,
           ...(this.options.config.interrupt ? { interruptSource: 'owner' as const } : {}),
-          origin: { kind: 'owner', requestId },
+          origin: { kind: 'owner', requestId,
+            ...(group.caption ? { displayText: String(group.caption.text ?? '') } : {}) },
         });
       const accepted = this.options.config.interrupt
         ? ownerNotices.receivedInterrupting()
@@ -865,9 +866,9 @@ export class OwnerChannel implements OwnerChannelHandle {
       this.logError('owner conversation route update failed', error);
     }
 
-    const text = String(message.text ?? '').trim();
-    if (isOwnerCommandText(text)) {
-      await this.handleCommand(sender, text, wireId);
+    const text = String(message.text ?? '');
+    if (isOwnerCommandText(text.trim())) {
+      await this.handleCommand(sender, text.trim(), wireId);
       return true;
     }
 
@@ -881,7 +882,7 @@ export class OwnerChannel implements OwnerChannelHandle {
         this.ownerPrompt(sender, text, wireId, outbox), {
         interrupt: this.options.config.interrupt,
         ...(this.options.config.interrupt ? { interruptSource: 'owner' as const } : {}),
-        origin: { kind: 'owner', requestId },
+        origin: { kind: 'owner', requestId, displayText: text },
       });
     } catch (error) {
       await rm(outbox, { recursive: true, force: true });

@@ -8,6 +8,7 @@ import { AcpRoleSessionAdapter, TmuxRoleSessionAdapter } from '../application/se
 import { StructuredLogService } from '../application/log-service.js';
 import { RoleCommandService } from '../application/role-command-service.js';
 import { RoleCreationService } from '../application/role-creation-service.js';
+import { RoleRemovalService } from '../application/role-removal-service.js';
 import { FleetError } from '../application/errors.js';
 import { controlRequest, controlSocketPath } from '../session/control.js';
 import { Tmux } from '../tmux.js';
@@ -17,6 +18,9 @@ import { home, stateRoot } from '../paths.js';
 import { AuditSink } from './audit.js';
 import { FleetEventBus } from './events.js';
 import { buildWebServer, type WebServer } from './server.js';
+import { FleetConfigService } from './fleet-config-service.js';
+import { deriveTopology } from './topology.js';
+import { doctor } from '../doctor.js';
 import { TerminalBridgeManager } from './terminal/bridge.js';
 import { acquireWebServerLock } from './lock.js';
 import { TrustedDeviceStore } from './device-store.js';
@@ -141,6 +145,10 @@ export async function startWebConsole(options: StartWebOptions): Promise<Running
       });
     },
   });
+  const removal = new RoleRemovalService({
+    configPath: options.configPath, ops,
+    currentControlRole: process.env.OURS_FLEET_PROXY_CALLER,
+  });
   const commands = new RoleCommandService({
     repository, ops, configPath: options.configPath,
     status: async roleId => (await query.detail(roleId)).status,
@@ -154,10 +162,15 @@ export async function startWebConsole(options: StartWebOptions): Promise<Running
   });
   const logs = new StructuredLogService(backend, realExec);
   const watchdogs = new WatchdogQueryService(watchdogConfigProvider);
+  const configuration = new FleetConfigService({
+    configPath: options.configPath,
+    preflight: path => doctor({ configPath: path, yamlMode: 'strict' }),
+  });
   let server: WebServer;
   try {
     server = await buildWebServer({
-    query, repository, logs, commands, creation, audit, events, watchdogs,
+    query, repository, logs, commands, creation, removal, audit, events, watchdogs, configuration,
+    topology: async () => deriveTopology(loadConfig(options.configPath), await query.list()),
     terminalUpgrade: terminalAvailable
       ? async (socket, _request, roleId, _ticket, hello) => terminals.connect(socket, roleId, hello)
       : undefined,

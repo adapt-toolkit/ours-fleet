@@ -3,6 +3,8 @@ import { describe, expect, it } from 'vitest';
 import { inheritCallerSpawnDefaults } from '../src/fleet-proxy.js';
 import { managedFleetProxyEnv } from '../src/runner.js';
 import type { ResolvedRole } from '../src/config.js';
+import '../src/harness/codex.js';
+import '../src/harness/claude-code.js';
 
 const caller = {
   name: 'Coordinator', harness: 'codex', session: 'acp', identity: 'Coordinator',
@@ -63,5 +65,24 @@ describe('managed fleet spawn defaults', () => {
       caller, { name: 'ClaudeDefault', harness: 'claude-code' }, undefined);
     expect(harnessOnly.options.model).toBeUndefined();
     expect(harnessOnly.inherited).not.toContain('model');
+  });
+
+  it('inherits the caller effective mode after a native override, not its creation default', () => {
+    const overridden = {
+      ...caller,
+      permissions: { ...caller.permissions, approval: 'ask' as const },
+      harness_options: { approval: 'never' },
+    } satisfies ResolvedRole;
+    expect(inheritCallerSpawnDefaults(overridden, { name: 'Child' }, undefined)
+      .options.approval).toBe('allow');
+  });
+
+  it('fails closed when omitted inheritance cannot be normalized', () => {
+    const unsupported = { ...caller, harness: 'missing-adapter' } satisfies ResolvedRole;
+    expect(() => inheritCallerSpawnDefaults(unsupported, { name: 'Child' }, undefined))
+      .toThrow(/unknown harness/);
+    // An explicit policy does not need an unsupported caller mapping.
+    expect(inheritCallerSpawnDefaults(
+      unsupported, { name: 'Child', approval: 'ask' }, undefined).options.approval).toBe('ask');
   });
 });

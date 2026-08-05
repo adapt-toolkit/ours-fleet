@@ -1,0 +1,15 @@
+{"sessionUpdate":"session_info_update","title":"claude session"}
+{"sessionUpdate":"available_commands_update","availableCommands":[{"name":"compact","description":"Compact the conversation","input":{"hint":"focus"}}]}
+{"sessionUpdate":"current_mode_update","currentModeId":"acceptEdits"}
+{"sessionUpdate":"user_message_chunk","content":{"type":"text","text":"Please fix the flaky retry test."},"messageId":"user_msg_1"}
+{"sessionUpdate":"agent_thought_chunk","content":{"type":"text","text":"The retry loop lacks jitter."},"messageId":"thought_1"}
+{"sessionUpdate":"plan","entries":[{"content":"Read retry.ts","priority":"high","status":"completed"},{"content":"Add jitter","priority":"high","status":"in_progress"},{"content":"Re-run suite","priority":"medium","status":"pending"}],"_meta":{"claudeCode":{"toolUseId":"todo_1"}}}
+{"sessionUpdate":"tool_call","toolCallId":"toolu_1","title":"Read retry.ts","kind":"read","status":"in_progress","locations":[{"path":"/repo/src/retry.ts"}],"rawInput":{"file_path":"/repo/src/retry.ts"},"_meta":{"claudeCode":{"toolName":"Read"}}}
+{"sessionUpdate":"tool_call_update","toolCallId":"toolu_1","status":"completed","content":[{"type":"content","content":{"type":"text","text":"export const retry = …"}}]}
+{"sessionUpdate":"tool_call","toolCallId":"toolu_2","title":"Edit retry.ts","kind":"edit","status":"in_progress","locations":[{"path":"/repo/src/retry.ts","line":18}],"content":[{"type":"diff","path":"/repo/src/retry.ts","oldText":"await sleep(delay);","newText":"await sleep(delay + jitter());"}],"_meta":{"claudeCode":{"toolName":"Edit"}}}
+{"sessionUpdate":"tool_call_update","toolCallId":"toolu_2","status":"completed"}
+{"sessionUpdate":"tool_call","toolCallId":"toolu_3","title":"Bash: npm test","kind":"execute","status":"in_progress","rawInput":{"command":"npm test"},"_meta":{"claudeCode":{"toolName":"Bash","backgroundTaskId":"bash_1"}}}
+{"sessionUpdate":"tool_call_update","toolCallId":"toolu_3","status":"completed","content":[{"type":"content","content":{"type":"text","text":"Tests: 214 passed"}}]}
+{"sessionUpdate":"tool_call","toolCallId":"toolu_4","title":"Task: verify edge cases","kind":"other","status":"completed","_meta":{"claudeCode":{"toolName":"Task","parentToolUseId":"toolu_3"}}}
+{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"Added jitter to the retry delay; the suite is green."},"messageId":"msg_1"}
+{"sessionUpdate":"usage_update","used":68000,"size":200000,"cost":{"amount":0.41,"currency":"USD"}}

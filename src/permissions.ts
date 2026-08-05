@@ -85,6 +85,18 @@ export interface PermissionConflict {
   warning: string;
 }
 
+/** Resolve the effective portable policy after harness-native overrides win. */
+export function effectivePermissionMode(role: ResolvedRole): {
+  fleetMode: import('./config.js').FleetPermissionMode;
+  nativeMode: string;
+} {
+  const adapter = getAdapter(role.harness);
+  if (!adapter.effectivePermissionMode)
+    throw new Error(
+      `harness '${role.harness}' cannot report an effective ask|auto|allow permission mode`);
+  return adapter.effectivePermissionMode(role);
+}
+
 /**
  * Find native settings that contradict the neutral block. Only fires when the
  * operator wrote BOTH — a role that states its intent once, neutrally or

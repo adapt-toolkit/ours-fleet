@@ -1,7 +1,11 @@
 import type {
-  ExitRecord, PromptOrigin, QueuedPrompt, SessionEvent, SessionHandle, SessionSnapshot,
+  ConversationHandlePage, ExitRecord, PromptOrigin, QueuedPrompt, SessionEvent, SessionHandle, SessionSnapshot,
   SubmitPromptOptions, TurnCancellationSource, TurnResult,
 } from './types.js';
+import type {
+  ConversationEventV1, ConversationSnapshot, PromptReceipt,
+  SubmitPromptCommand,
+} from './conversation-types.js';
 
 export type ScheduledAttempt =
   | { state: 'started'; queued: QueuedPrompt }
@@ -73,11 +77,38 @@ export class RoleTurnArbiter implements SessionHandle {
   stopScheduledAdmission(): void { this.stopping = true; }
   isAlive(): boolean { return this.session.isAlive(); }
   snapshot(): SessionSnapshot { return this.session.snapshot(); }
+  conversationPage(request: { after?: string; limit?: number } = {}): ConversationHandlePage {
+    if (!this.session.conversationPage)
+      throw new Error('conversation ledger is unavailable');
+    return this.session.conversationPage(request);
+  }
+  conversationSnapshot(): ConversationSnapshot {
+    if (!this.session.conversationSnapshot)
+      throw new Error('conversation snapshot is unavailable');
+    return this.session.conversationSnapshot();
+  }
+  subscribeConversation(listener: (event: ConversationEventV1) => void): () => void {
+    if (!this.session.subscribeConversation)
+      throw new Error('conversation subscription is unavailable');
+    return this.session.subscribeConversation(listener);
+  }
+  submitPromptBrowser(command: SubmitPromptCommand): Promise<PromptReceipt> {
+    if (!this.session.submitPromptBrowser)
+      return Promise.reject(new Error('browser prompt admission is unavailable'));
+    return this.exclusive(() => this.session.submitPromptBrowser!(command));
+  }
   interrupt(source: TurnCancellationSource = 'local-console'): Promise<void> {
     return this.exclusive(() => this.session.interrupt(source));
   }
   respondPermission(permissionId: string, optionId: string): boolean {
     return this.session.respondPermission(permissionId, optionId);
+  }
+
+  respondPermissionV2(
+    permissionId: string, optionId: string, sessionGeneration: string,
+  ): 'accepted' | 'stale' {
+    return this.session.respondPermissionV2?.(permissionId, optionId, sessionGeneration)
+      ?? 'stale';
   }
   eventsSince(seq: number): SessionEvent[] { return this.session.eventsSince(seq); }
   subscribe(listener: (event: SessionEvent) => void): () => void { return this.session.subscribe(listener); }

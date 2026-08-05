@@ -287,11 +287,12 @@ describe('buildLaunch', () => {
 
 describe('acpPermissionModeId', () => {
   const a = makeClaudeCodeAdapter(okExec);
-  const perms = (approval: 'allow' | 'ask' | 'deny') =>
+  const perms = (approval: 'allow' | 'auto' | 'ask' | 'deny') =>
     ({ approval, filesystem: 'workspace', unattended: 'deny' } as const);
 
   it('single-sources the ACP mode from the same mapping as the tmux launch', () => {
     expect(a.acpPermissionModeId!(role({ permissions: perms('allow') }))).toBe('bypassPermissions');
+    expect(a.acpPermissionModeId!(role({ permissions: perms('auto') }))).toBe('acceptEdits');
     expect(a.acpPermissionModeId!(role({ permissions: perms('deny') }))).toBe('plan');
     expect(a.acpPermissionModeId!(role({ permissions: perms('ask') }))).toBeUndefined();
   });
@@ -354,7 +355,7 @@ describe('buildAcpLaunch', () => {
 
 describe('neutral permission mapping and the unattended floor (2.1)', () => {
   const a = makeClaudeCodeAdapter(okExec);
-  const APPROVALS = ['ask', 'allow', 'deny'] as const;
+  const APPROVALS = ['ask', 'auto', 'allow', 'deny'] as const;
   const FILESYSTEMS = ['read-only', 'workspace', 'unrestricted'] as const;
   const UNATTENDED = ['deny', 'wait'] as const;
 
@@ -367,11 +368,12 @@ describe('neutral permission mapping and the unattended floor (2.1)', () => {
   });
 
   it('elevates nothing but an explicit allow', () => {
-    const mode = (approval: 'ask' | 'allow' | 'deny') => {
+    const mode = (approval: 'ask' | 'auto' | 'allow' | 'deny') => {
       const t = a.translatePermissions({ approval, filesystem: 'workspace', unattended: 'deny' });
       return (t as { native: Record<string, unknown> }).native.permission_mode;
     };
     expect(mode('ask')).toBe('default');
+    expect(mode('auto')).toBe('acceptEdits');
     expect(mode('deny')).toBe('plan');
   });
 

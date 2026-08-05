@@ -14,6 +14,8 @@ export interface ResolvedRoleView {
   model?: string;
   cwd?: string;
   permissions: CommonPermissions;
+  nativeRuntime?: { approval?: string; permissionMode?: string; sandbox?: string };
+  oversee?: Array<{ role: string; interval: string }>;
 }
 
 export interface RoleRecord {
@@ -27,6 +29,7 @@ export interface RoleRecord {
   detectedBackend: DetectedBackend;
   compatibility: { compatible: boolean; detail?: string };
   problems: Problem[];
+  lineage?: { parentRole: string; source: 'creation-provenance' };
 }
 
 export interface Problem {
@@ -54,6 +57,11 @@ export interface RoleStatus {
     sessionId?: string;
     lastError?: string;
     pendingPermissionId?: string;
+    protocolVersion?: number;
+    features?: string[];
+    runtimeModel?: SessionSnapshot['runtimeModel'];
+    reasoningEffort?: SessionSnapshot['reasoningEffort'];
+    permissionMode?: SessionSnapshot['permissionMode'];
   };
   restart: {
     circuit: 'closed' | 'open';

@@ -52,6 +52,7 @@ export interface SpawnOpts {
   launcher?: string;
   search?: boolean;
   codexConfig?: Record<string, string | number | boolean>;
+  reasoningEffort?: string | null;
   addDirs?: string[];
   monitor?: boolean;
   /** Typed external monitor configuration used by trusted creation surfaces. */
@@ -112,7 +113,10 @@ export function buildRoleConfig(o: SpawnOpts, defaultHarness?: string): RoleConf
   if (o.profile) harnessOptions.profile = o.profile;
   if (o.launcher) harnessOptions.launcher = o.launcher;
   if (o.search === true) harnessOptions.search = true;
-  if (o.codexConfig && Object.keys(o.codexConfig).length) harnessOptions.config = o.codexConfig;
+  const codexConfig = { ...(o.codexConfig ?? {}) };
+  if (o.reasoningEffort && harness === 'codex') codexConfig.model_reasoning_effort = o.reasoningEffort;
+  if (Object.keys(codexConfig).length) harnessOptions.config = codexConfig;
+  if (o.reasoningEffort && harness === 'claude-code') harnessOptions.effort = o.reasoningEffort;
   if (o.addDirs?.length) harnessOptions.add_dirs = o.addDirs;
   if (o.monitor === true) harnessOptions.monitor = true;
   if (Object.keys(harnessOptions).length) r.harness_options = harnessOptions;
@@ -159,8 +163,9 @@ export function validateSpawnOpts(o: SpawnOpts): void {
     throw new Error('--mission and --mission-file are mutually exclusive');
   if (o.session && !['tmux', 'acp'].includes(o.session))
     throw new Error(`invalid --session '${o.session}'; allowed: tmux, acp`);
-  if (o.approval && !['ask', 'allow', 'deny'].includes(o.approval))
-    throw new Error(`invalid --approval '${o.approval}'; allowed: ask, allow, deny`);
+  if (o.approval && !['ask', 'auto', 'allow', 'deny'].includes(o.approval))
+    throw new Error(
+      `invalid --approval '${o.approval}'; allowed: ask, auto, allow (deprecated alias: deny)`);
   if (o.filesystem && !['read-only', 'workspace', 'unrestricted'].includes(o.filesystem))
     throw new Error(
       `invalid --filesystem '${o.filesystem}'; allowed: read-only, workspace, unrestricted`);

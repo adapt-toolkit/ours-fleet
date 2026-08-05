@@ -24,6 +24,7 @@ async function start(
   extra: {
     modeId?: string; env?: Record<string, string>; log?(line: string): void;
     cancelGraceMs?: number;
+    permissionMode?: { fleetMode: 'ask' | 'auto' | 'allow'; nativeMode: string };
   } = {},
 ) {
   const stateDir = mkdtempSync(join(tmpdir(), 'ours-fleet-acp-'));
@@ -37,6 +38,7 @@ async function start(
     mode: 'fresh',
     permissions: { approval, filesystem: 'workspace', unattended: 'deny' },
     modeId: extra.modeId,
+    permissionMode: extra.permissionMode,
     log: extra.log ?? (() => {}),
     ...(extra.cancelGraceMs !== undefined ? { cancelGraceMs: extra.cancelGraceMs } : {}),
   });
@@ -203,6 +205,13 @@ describe('AcpSession', () => {
     const session = await start('allow', { modeId: 'bypassPermissions' });
     expect(session.eventsSince(0).some(event =>
       event.kind === 'agent_text' && event.text === 'mode:bypassPermissions')).toBe(true);
+    await session.close();
+  });
+
+  it('reports adapter-resolved effective and native modes in the live snapshot', async () => {
+    const permissionMode = { fleetMode: 'allow' as const, nativeMode: 'bypassPermissions' };
+    const session = await start('allow', { permissionMode });
+    expect(session.snapshot().permissionMode).toEqual(permissionMode);
     await session.close();
   });
 

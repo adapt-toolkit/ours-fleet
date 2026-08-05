@@ -21,7 +21,7 @@ export interface AuthResult {
 interface Ticket {
   value: string;
   sessionId: string;
-  purpose: 'events' | 'terminal';
+  purpose: 'events' | 'terminal' | 'conversation';
   roleId?: string;
   expiresAt: number;
 }

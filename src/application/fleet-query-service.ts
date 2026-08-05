@@ -172,12 +172,17 @@ export class FleetQueryService {
       try {
         const response = await this.control(dir, { command: 'snapshot' }, 2_000);
         if (!response.ok) throw new SessionControlError(response.kind ?? 'backend', response.error ?? 'snapshot failed');
-        const snapshot = response.result as SessionSnapshot;
+        const snapshot = response.result as SessionSnapshot & {
+          protocolVersion?: number; features?: string[];
+        };
         return {
           backend: 'acp', reachability: snapshot.alive ? 'online' : 'offline',
           readiness: snapshot.readiness, evidence: 'authoritative',
           sessionId: snapshot.sessionId, lastError: snapshot.lastError,
           pendingPermissionId: snapshot.pendingPermissionId,
+          protocolVersion: snapshot.protocolVersion, features: snapshot.features,
+          runtimeModel: snapshot.runtimeModel, reasoningEffort: snapshot.reasoningEffort,
+          permissionMode: snapshot.permissionMode,
         };
       } catch (error) {
         const failure = error instanceof SessionControlError ? error.kind : 'backend';

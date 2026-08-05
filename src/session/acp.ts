@@ -7,16 +7,25 @@ import { Readable, Writable } from 'node:stream';
 import * as acp from '@agentclientprotocol/sdk';
 
 import type { CommonPermissions } from '../config.js';
+import { normalizeSessionUpdate } from './conversation-normalizer.js';
+import { ConversationEventStore, IdempotencyConflictError } from './conversation-store.js';
+import type {
+  ConversationSnapshot, ConversationSource, PromptOrigin, PromptReceipt, SubmitPromptCommand,
+} from './conversation-types.js';
 import { SessionEvents } from './events.js';
 import { SessionControlError, classifyChildExit, turnResult } from './types.js';
 import type {
-  ExitRecord, PermissionDecision, QueuedPrompt, SessionEvent, SessionHandle, SessionSnapshot,
-  SubmitPromptOptions, TurnCancellationSource, TurnOutcome, TurnResult,
+  ConversationHandlePage, ExitRecord, PermissionDecision, QueuedPrompt, SessionEvent,
+  RuntimeSelectorMetadata, SessionHandle, SessionSnapshot, SubmitPromptOptions,
+  TurnCancellationSource, TurnOutcome,
+  TurnResult,
 } from './types.js';
 
 interface PendingPermission {
   options: Array<{ optionId: string; kind: string }>;
   resolve(response: acp.RequestPermissionResponse): void;
+  toolCallId?: string;
+  expiry?: ReturnType<typeof setTimeout>;
 }
 
 interface SteeringResponse {
@@ -24,6 +33,59 @@ interface SteeringResponse {
 }
 
 const CANCEL_SETTLE_GRACE_MS = 15_000;
+/** A permission no human answered is eventually a decision nobody made. */
+const PERMISSION_TIMEOUT_MS = 10 * 60_000;
+/** Spec §4.3: 10-15 s before a vanished controller triggers the unattended policy. */
+const CONTROLLER_GRACE_MS = 12_000;
+
+const SCHEDULED_LOOP_REDACTION = '[scheduled-loop content redacted]';
+
+const scheduledTurn = (turn: { origin?: PromptOrigin } | undefined): boolean =>
+  turn?.origin?.kind === 'scheduled-loop';
+
+/**
+ * Map typed prompt provenance to the conversation ledger's source vocabulary.
+ * Only operator-authored local sources may persist prompt bodies; external
+ * E2E bodies (owner channel, monitor wakes) and scheduled-loop content are
+ * recorded as digest/size placeholders (spec §8.3).
+ */
+function conversationSource(origin: PromptOrigin | undefined): {
+  source: ConversationSource; persistBody: boolean;
+} {
+  switch (origin?.kind) {
+    case 'owner-admin-console': return { source: 'owner_admin_console', persistBody: true };
+    case 'startup': return { source: 'startup', persistBody: true };
+    case 'owner': return { source: 'owner_channel', persistBody: false };
+    case 'fleet-monitor': return { source: 'fleet_monitor', persistBody: false };
+    case 'scheduled-loop': return { source: 'scheduled_loop', persistBody: false };
+    case 'local-console':
+    default:
+      return { source: 'local_console', persistBody: true };
+  }
+}
+
+/** Server-generated typed provenance followed by the exact human-authored body. */
+export function promptContentBlocks(text: string, origin?: PromptOrigin): acp.ContentBlock[] {
+  if (origin?.kind !== 'owner-admin-console') return [{ type: 'text', text }];
+  return [{
+    type: 'resource_link',
+    uri: 'ours-fleet://prompt-provenance?source=owner_admin_console',
+    name: 'Direct owner admin console',
+    description: 'Server-authenticated paired console provenance; accompanying text is direct owner input.',
+    mimeType: 'application/vnd.ours-fleet.prompt-provenance+json',
+  }, { type: 'text', text }];
+}
+
+export function runtimeSelector(
+  options: acp.SessionConfigOption[] | null | undefined, category: string,
+): RuntimeSelectorMetadata | undefined {
+  const option = options?.find(candidate => candidate.category === category);
+  if (!option || typeof option.currentValue !== 'string') return undefined;
+  const choices = Array.isArray(option.options) ? option.options.flatMap(choice =>
+    'options' in choice ? choice.options : [choice]) : [];
+  const selected = choices.find(choice => choice.value === option.currentValue);
+  return { value: option.currentValue, ...(selected?.name ? { label: selected.name } : {}) };
+}
 
 export interface AcpSessionOptions {
   name: string;
@@ -35,9 +97,15 @@ export interface AcpSessionOptions {
   permissions: CommonPermissions;
   /** Native permission-mode id to request via session/set_mode; undefined keeps the agent default. */
   modeId?: string;
+  /** Adapter-resolved live permission policy; separate from ACP agent-specific session modes. */
+  permissionMode?: NonNullable<SessionSnapshot['permissionMode']>;
   log(line: string): void;
   /** Test seam for the cancel-escalation grace period; production uses the default. */
   cancelGraceMs?: number;
+  /** How long a pending permission may wait for a human before it expires. */
+  permissionTimeoutMs?: number;
+  /** Grace after the last controller detaches before the unattended policy applies. */
+  controllerGraceMs?: number;
 }
 
 /**
@@ -63,6 +131,11 @@ export class AcpSession implements SessionHandle {
 
   private readonly child: ChildProcessWithoutNullStreams;
   private readonly events: SessionEvents;
+  private readonly conversation: ConversationEventStore;
+  /** New on every runner start; permission/turn IDs from prior generations are stale. */
+  private readonly sessionGeneration = randomUUID();
+  /** True while `session/load` replays history as ordinary updates. */
+  private replaying = false;
   private readonly sessionFile: string;
   private readonly pendingPermissions = new Map<string, PendingPermission>();
   private connection: acp.ClientConnection;
@@ -74,7 +147,11 @@ export class AcpSession implements SessionHandle {
   private exit: ExitRecord | null = null;
   private steeringSupported = false;
   private capabilities?: acp.AgentCapabilities;
+  private runtimeModel?: RuntimeSelectorMetadata;
+  private reasoningEffort?: RuntimeSelectorMetadata;
   private controllerCount = 0;
+  /** Armed when the last controller detaches; unattended policy applies on fire. */
+  private controllerGrace?: ReturnType<typeof setTimeout>;
   private cancelEscalation?: ReturnType<typeof setTimeout>;
   private activeTurn?: {
     id: string; output: string; origin?: SubmitPromptOptions['origin'];
@@ -90,6 +167,9 @@ export class AcpSession implements SessionHandle {
     this.connection = connection;
     this.pid = child.pid ?? -1;
     this.events = new SessionEvents(join(options.stateDir, '.session-events.jsonl'));
+    this.conversation = new ConversationEventStore(join(options.stateDir, '.conversation'), {
+      roleId: options.name, log: line => options.log(`[${options.name}] ${line}`),
+    });
     this.sessionFile = join(options.stateDir, '.acp-session-id');
     child.stderr.on('data', chunk => options.log(`[${options.name}] acp: ${String(chunk).trimEnd()}`));
     child.once('exit', (code, signal) => {
@@ -102,6 +182,11 @@ export class AcpSession implements SessionHandle {
         this.lastError = `ACP agent ${this.exit.detail}`;
       }
       this.events.emit('state', { status: 'failed', text: this.lastError });
+      this.conversation.appendSafe({
+        kind: 'session.state', sessionGeneration: this.sessionGeneration,
+        acpSessionId: this.sessionId,
+        payload: { status: 'failed', detail: this.lastError },
+      });
     });
   }
 
@@ -134,11 +219,48 @@ export class AcpSession implements SessionHandle {
     instance = new AcpSession(options, child, connection);
     try {
       await instance.initialize();
+      instance.recoverOpenPrompts();
       return instance;
     } catch (error) {
       instance.fail(error);
       await instance.close();
       throw error;
+    }
+  }
+
+  /**
+   * Honest restart recovery (spec §5.3): a prompt that was admitted but never
+   * started is safe to dispatch again; a turn that had already started may
+   * have caused side effects, so it is closed as `unknown_after_restart` —
+   * never silently replayed.
+   */
+  private recoverOpenPrompts(): void {
+    for (const open of this.conversation.openPrompts()) {
+      if (open.sessionGeneration === this.sessionGeneration) continue;
+      if (open.state === 'started') {
+        this.conversation.appendSafe({
+          kind: 'turn.completed', sessionGeneration: this.sessionGeneration,
+          promptId: open.promptId, turnId: open.promptId,
+          payload: { outcome: 'unknown_after_restart' },
+        });
+        continue;
+      }
+      if (open.text === undefined) {
+        // Admitted, never started, and the body was deliberately not retained
+        // (external E2E source): there is nothing faithful left to dispatch.
+        this.conversation.appendSafe({
+          kind: 'turn.completed', sessionGeneration: this.sessionGeneration,
+          promptId: open.promptId, turnId: open.promptId,
+          payload: { outcome: 'failed', stopReason: 'prompt-body-not-retained' },
+        });
+        continue;
+      }
+      const text = open.text;
+      const promptId = open.promptId;
+      this.queueDepth++;
+      const run = this.promptTail.then(() => this.runPrompt(text, promptId));
+      this.promptTail = run.then(() => undefined, () => undefined);
+      void run.finally(() => { this.queueDepth = Math.max(0, this.queueDepth - 1); });
     }
   }
 
@@ -154,6 +276,9 @@ export class AcpSession implements SessionHandle {
       sessionId: this.sessionId,
       lastError: this.lastError,
       pendingPermissionId: this.pendingPermissions.keys().next().value as string | undefined,
+      runtimeModel: this.runtimeModel,
+      reasoningEffort: this.reasoningEffort,
+      permissionMode: this.options.permissionMode,
     };
   }
 
@@ -175,7 +300,9 @@ export class AcpSession implements SessionHandle {
       return { promptId, queuedBehind: 0, completion: this.steerPrompt(text), origin: options.origin };
     }
     const promptId = randomUUID();
-    const queuedBehind = this.queueDepth++;
+    const queuedBehind = this.queueDepth;
+    this.admitToLedger(promptId, text, queuedBehind, options);
+    this.queueDepth++;
     const run = this.promptTail.then(() => this.runPrompt(text, promptId, options.origin));
     this.promptTail = run.then(() => undefined, () => undefined);
     const completion = run.then(
@@ -186,6 +313,67 @@ export class AcpSession implements SessionHandle {
       },
     );
     return { promptId, queuedBehind, completion, origin: options.origin };
+  }
+
+  /**
+   * Durably record a prompt admission BEFORE acceptance is returned. Browser
+   * admissions are transactional — a prompt the ledger cannot hold is refused,
+   * because an acknowledged-then-lost prompt is worse than an error. Every
+   * other source degrades to best-effort so the agent keeps working (§5.3).
+   */
+  private admitToLedger(
+    promptId: string, text: string, queuedBehind: number, options: SubmitPromptOptions,
+  ): void {
+    const { source, persistBody } = conversationSource(options.origin);
+    const bytes = Buffer.byteLength(text);
+    const draft = {
+      kind: 'prompt.admitted' as const,
+      sessionGeneration: this.sessionGeneration,
+      acpSessionId: this.sessionId,
+      promptId, turnId: promptId, source,
+      ...(options.origin?.kind === 'owner-admin-console' ? { commandId: options.origin.commandId } : {}),
+      ...(options.actor ? { actor: options.actor } : {}),
+      payload: {
+        queuedBehind,
+        ...(options.origin?.kind === 'owner' && options.origin.displayText !== undefined
+          ? { displayText: { type: 'text' as const, text: options.origin.displayText,
+              bytes: Buffer.byteLength(options.origin.displayText) } }
+          : {}),
+        ...(persistBody
+          ? { text: { type: 'text' as const, text, bytes } }
+          : { external: { digest: ConversationEventStore.bodyDigest(text), bytes } }),
+      },
+    };
+    if (source === 'owner_admin_console') {
+      try { this.conversation.append(draft); }
+      catch (error) {
+        throw new SessionControlError('backend',
+          `conversation store cannot record the prompt: ${(error as Error).message}`);
+      }
+    } else {
+      this.conversation.appendSafe(draft);
+    }
+  }
+
+  /** Idempotent browser prompt admission (control v3 `submit_prompt_v2`). */
+  async submitPromptBrowser(command: SubmitPromptCommand): Promise<PromptReceipt> {
+    const bodyDigest = ConversationEventStore.bodyDigest(command.text);
+    const existing = this.conversation.receiptFor(command.commandId, bodyDigest);
+    if (existing) return existing;
+    const queued = await this.queuePrompt(command.text, {
+      origin: { kind: 'owner-admin-console', commandId: command.commandId },
+      actor: { browserSession: command.actorBrowserSession },
+    });
+    const receipt: PromptReceipt = {
+      commandId: command.commandId,
+      promptId: queued.promptId,
+      state: queued.queuedBehind > 0 ? 'queued' : 'starting',
+      queuedBehind: queued.queuedBehind,
+      acceptedAt: new Date().toISOString(),
+      eventCursor: this.conversation.lastCursor() ?? '0',
+    };
+    this.conversation.recordReceipt(command.commandId, receipt, bodyDigest);
+    return receipt;
   }
 
   async submitPrompt(text: string, options: SubmitPromptOptions = {}): Promise<TurnResult> {
@@ -216,6 +404,11 @@ export class AcpSession implements SessionHandle {
       throw error;
     }
     if (active) {
+      this.conversation.appendSafe({
+        kind: 'prompt.interrupt_requested', sessionGeneration: this.sessionGeneration,
+        acpSessionId: this.sessionId, promptId: active.id, turnId: active.id,
+        payload: { cancellationSource: source },
+      });
       if (this.cancelEscalation) clearTimeout(this.cancelEscalation);
       const turnId = active.id;
       this.cancelEscalation = setTimeout(() => {
@@ -227,9 +420,9 @@ export class AcpSession implements SessionHandle {
       }, this.options.cancelGraceMs ?? CANCEL_SETTLE_GRACE_MS);
       this.cancelEscalation.unref?.();
     }
-    for (const pending of this.pendingPermissions.values())
-      pending.resolve({ outcome: { outcome: 'cancelled' } });
-    this.pendingPermissions.clear();
+    for (const [permissionId, pending] of [...this.pendingPermissions])
+      this.settlePendingAutomatically(permissionId, pending, 'cancelled', undefined,
+        'the turn was cancelled while this request was pending');
   }
 
   respondPermission(permissionId: string, optionId: string): boolean {
@@ -237,19 +430,39 @@ export class AcpSession implements SessionHandle {
     const chosen = pending?.options.find(option => option.optionId === optionId);
     if (!pending || !chosen) return false;
     this.pendingPermissions.delete(permissionId);
+    if (pending.expiry) clearTimeout(pending.expiry);
     pending.resolve({ outcome: { outcome: 'selected', optionId } });
+    const decision = chosen.kind.startsWith('reject') ? 'denied' : 'allowed';
     this.events.emit('permission', {
       turnId: this.activeTurn?.id,
       origin: this.activeTurn?.origin,
       permissionId,
       status: 'completed',
-      decision: chosen.kind.startsWith('reject') ? 'denied' : 'allowed',
+      decision,
       decisionSource: 'manual',
       reason: `answered from an attached controller (${chosen.kind})`,
       optionId,
     });
+    this.conversation.appendSafe({
+      kind: 'permission.resolved', sessionGeneration: this.sessionGeneration,
+      acpSessionId: this.sessionId, permissionId,
+      promptId: this.activeTurn?.id, turnId: this.activeTurn?.id,
+      payload: { decision, decisionSource: 'manual', optionId },
+    });
     this.readiness = 'running';
     return true;
+  }
+
+  /**
+   * A v2 decision binds to the session generation it was shown under. A stale
+   * generation, an already-settled request, or an unknown option are all the
+   * same answer: someone else's decision (or a restart) got there first.
+   */
+  respondPermissionV2(
+    permissionId: string, optionId: string, sessionGeneration: string,
+  ): 'accepted' | 'stale' {
+    if (sessionGeneration !== this.sessionGeneration) return 'stale';
+    return this.respondPermission(permissionId, optionId) ? 'accepted' : 'stale';
   }
 
   eventsSince(seq: number): SessionEvent[] {
@@ -261,7 +474,78 @@ export class AcpSession implements SessionHandle {
   }
 
   setControllerAttached(attached: boolean): void {
+    const before = this.controllerCount;
     this.controllerCount = Math.max(0, this.controllerCount + (attached ? 1 : -1));
+    if (attached) {
+      if (this.controllerGrace) clearTimeout(this.controllerGrace);
+      this.controllerGrace = undefined;
+      return;
+    }
+    // The LAST controller just walked away with permissions possibly pending.
+    // Nothing is decided yet: a reconnect within the grace keeps everything
+    // alive; only its expiry hands the pendings to the unattended policy.
+    if (before > 0 && this.controllerCount === 0 && this.pendingPermissions.size > 0)
+      this.armControllerGrace();
+  }
+
+  private armControllerGrace(): void {
+    if (this.controllerGrace) clearTimeout(this.controllerGrace);
+    this.controllerGrace = setTimeout(() => {
+      this.controllerGrace = undefined;
+      if (this.controllerCount > 0 || this.options.permissions.unattended !== 'deny') return;
+      for (const [permissionId, pending] of [...this.pendingPermissions])
+        this.settlePendingAutomatically(permissionId, pending, 'denied',
+          'permissions.unattended=deny',
+          'the last attached controller disconnected and the grace period expired');
+    }, this.options.controllerGraceMs ?? CONTROLLER_GRACE_MS);
+    this.controllerGrace.unref?.();
+  }
+
+  /**
+   * Settle one pending request without a human decision — unattended policy,
+   * expiry, or cancellation — and leave the same durable evidence a manual
+   * decision would. A denial selects the agent's own one-shot reject option;
+   * everything else resolves as cancelled toward the agent.
+   */
+  private settlePendingAutomatically(
+    permissionId: string, pending: PendingPermission,
+    decision: 'denied' | 'cancelled' | 'expired', policy: string | undefined, reason: string,
+  ): void {
+    if (!this.pendingPermissions.delete(permissionId)) return;
+    if (pending.expiry) clearTimeout(pending.expiry);
+    const rejectOption = decision === 'denied'
+      ? pending.options.find(option => option.kind === 'reject_once')
+        ?? pending.options.find(option => option.kind === 'reject_always')
+      : undefined;
+    pending.resolve(rejectOption
+      ? { outcome: { outcome: 'selected', optionId: rejectOption.optionId } }
+      : { outcome: { outcome: 'cancelled' } });
+    const settled = decision === 'denied' && !rejectOption ? 'cancelled' : decision;
+    this.events.emit('permission', {
+      turnId: this.activeTurn?.id,
+      origin: this.activeTurn?.origin,
+      permissionId,
+      toolCallId: pending.toolCallId,
+      status: 'completed',
+      decision: settled === 'expired' ? 'cancelled' : settled,
+      decisionSource: 'automatic',
+      policy,
+      reason,
+      optionId: rejectOption?.optionId,
+    });
+    this.conversation.appendSafe({
+      kind: 'permission.resolved', sessionGeneration: this.sessionGeneration,
+      acpSessionId: this.sessionId, permissionId,
+      promptId: this.activeTurn?.id, turnId: this.activeTurn?.id,
+      toolCallId: pending.toolCallId,
+      payload: {
+        decision: settled, decisionSource: 'automatic',
+        ...(policy ? { policy } : {}), reason,
+        ...(rejectOption ? { optionId: rejectOption.optionId } : {}),
+      },
+    });
+    if (this.pendingPermissions.size === 0 && this.readiness === 'awaiting_permission')
+      this.readiness = 'running';
   }
 
   exitResult(): ExitRecord | null {
@@ -271,15 +555,22 @@ export class AcpSession implements SessionHandle {
   async close(): Promise<void> {
     if (this.cancelEscalation) clearTimeout(this.cancelEscalation);
     this.cancelEscalation = undefined;
-    for (const pending of this.pendingPermissions.values())
-      pending.resolve({ outcome: { outcome: 'cancelled' } });
-    this.pendingPermissions.clear();
+    if (this.controllerGrace) clearTimeout(this.controllerGrace);
+    this.controllerGrace = undefined;
+    for (const [permissionId, pending] of [...this.pendingPermissions])
+      this.settlePendingAutomatically(permissionId, pending, 'cancelled', undefined,
+        'the session closed while this request was pending');
     if (this.sessionId && this.capabilities?.sessionCapabilities?.close != null) {
       await this.connection.agent.request(
         acp.methods.agent.session.close, { sessionId: this.sessionId }).catch(() => undefined);
     }
     this.connection.close();
     if (this.isAlive()) this.child.kill('SIGTERM');
+    this.conversation.appendSafe({
+      kind: 'session.state', sessionGeneration: this.sessionGeneration,
+      acpSessionId: this.sessionId, payload: { status: 'offline' },
+    });
+    this.conversation.close();
   }
 
   private async initialize(): Promise<void> {
@@ -300,18 +591,25 @@ export class AcpSession implements SessionHandle {
       ? readFileSync(this.sessionFile, 'utf8').trim()
       : '';
     if (persisted && this.capabilities?.sessionCapabilities?.resume != null) {
-      await this.connection.agent.request(acp.methods.agent.session.resume, {
+      const resumed = await this.connection.agent.request(acp.methods.agent.session.resume, {
         sessionId: persisted,
         cwd: this.options.cwd,
         mcpServers: [],
       });
+      this.captureRuntimeMetadata(resumed.configOptions);
       this.sessionId = persisted;
     } else if (persisted && this.capabilities?.loadSession) {
-      await this.connection.agent.request(acp.methods.agent.session.load, {
-        sessionId: persisted,
-        cwd: this.options.cwd,
-        mcpServers: [],
-      });
+      // `session/load` replays prior history as ordinary updates before the
+      // response; those records carry `agent_replay` provenance, never `agent`.
+      this.replaying = true;
+      try {
+        const loaded = await this.connection.agent.request(acp.methods.agent.session.load, {
+          sessionId: persisted,
+          cwd: this.options.cwd,
+          mcpServers: [],
+        });
+        this.captureRuntimeMetadata(loaded.configOptions);
+      } finally { this.replaying = false; }
       this.sessionId = persisted;
     } else {
       const created = await this.connection.agent.request(acp.methods.agent.session.new, {
@@ -319,6 +617,7 @@ export class AcpSession implements SessionHandle {
         mcpServers: [],
       });
       this.sessionId = created.sessionId;
+      this.captureRuntimeMetadata(created.configOptions);
     }
     writeFileSync(this.sessionFile, this.sessionId + '\n', { mode: 0o600 });
     // Deliver the configured permission mode whichever way the session came up
@@ -339,6 +638,15 @@ export class AcpSession implements SessionHandle {
     }
     this.readiness = 'idle';
     this.events.emit('state', { status: 'idle', text: `ACP session ${this.sessionId}` });
+    this.conversation.appendSafe({
+      kind: 'session.state', sessionGeneration: this.sessionGeneration,
+      acpSessionId: this.sessionId, payload: { status: 'idle' },
+    });
+  }
+
+  private captureRuntimeMetadata(options: acp.SessionConfigOption[] | null | undefined): void {
+    this.runtimeModel = runtimeSelector(options, 'model');
+    this.reasoningEffort = runtimeSelector(options, 'thought_level');
   }
 
   private async runPrompt(
@@ -349,18 +657,32 @@ export class AcpSession implements SessionHandle {
     this.readiness = 'running';
     this.activeTurn = { id: turnId, output: '', origin };
     this.events.emit('state', { turnId, status: 'running', origin });
+    this.conversation.appendSafe({
+      kind: 'prompt.started', sessionGeneration: this.sessionGeneration,
+      acpSessionId: this.sessionId, promptId: turnId, turnId,
+      source: conversationSource(origin).source, payload: {},
+    });
     try {
       const response = await this.connection.agent.request(acp.methods.agent.session.prompt, {
         sessionId: this.sessionId,
-        prompt: [{ type: 'text', text }],
+        prompt: promptContentBlocks(text, origin),
       });
       this.readiness = 'idle';
+      const cancellationSource = this.activeTurn?.id === turnId
+        ? this.activeTurn.cancellationSource : undefined;
       this.events.emit('turn_stop', {
-        turnId, stopReason: response.stopReason, origin,
-        cancellationSource: this.activeTurn?.id === turnId
-          ? this.activeTurn.cancellationSource : undefined,
+        turnId, stopReason: response.stopReason, origin, cancellationSource,
       });
       this.events.emit('state', { status: 'idle' });
+      this.conversation.appendSafe({
+        kind: 'turn.completed', sessionGeneration: this.sessionGeneration,
+        acpSessionId: this.sessionId, promptId: turnId, turnId,
+        payload: {
+          outcome: classifyStopReason(response.stopReason),
+          stopReason: response.stopReason,
+          ...(cancellationSource ? { cancellationSource } : {}),
+        },
+      });
       // The prompt was accepted either way — the agent answered. Whether the
       // turn SUCCEEDED is a separate question, and only `stopReason` answers it.
       return turnResult(
@@ -376,6 +698,11 @@ export class AcpSession implements SessionHandle {
         text: origin?.kind === 'scheduled-loop' ? 'scheduled-loop turn failed' : this.lastError,
       });
       if (this.isAlive()) this.events.emit('state', { status: 'idle' });
+      this.conversation.appendSafe({
+        kind: 'turn.completed', sessionGeneration: this.sessionGeneration,
+        acpSessionId: this.sessionId, promptId: turnId, turnId,
+        payload: { outcome: 'failed', stopReason: this.lastError },
+      });
       return turnResult(
         false, 'failed', this.lastError,
         this.activeTurn?.id === turnId ? this.activeTurn.output : undefined);
@@ -428,7 +755,10 @@ export class AcpSession implements SessionHandle {
         'permissions.approval=allow',
         `the request is inside the ${this.options.permissions.filesystem} boundary`));
     }
-    const unattended = this.controllerCount === 0 && this.options.permissions.unattended === 'deny';
+    // A live grace window still counts as attended: the controller may be
+    // mid-reconnect, and denying instantly is exactly what the grace prevents.
+    const unattended = this.controllerCount === 0 && !this.controllerGrace
+      && this.options.permissions.unattended === 'deny';
     if (this.options.permissions.approval === 'deny' || unattended) {
       // reject_once FIRST: `reject_always` teaches the agent a standing rule from
       // a decision no human made, so one unattended denial would silently disable
@@ -442,6 +772,8 @@ export class AcpSession implements SessionHandle {
     }
 
     const permissionId = randomUUID();
+    const timeoutMs = this.options.permissionTimeoutMs ?? PERMISSION_TIMEOUT_MS;
+    const expiresAt = new Date(Date.now() + timeoutMs).toISOString();
     this.readiness = 'awaiting_permission';
     this.events.emit('permission', {
       turnId: this.activeTurn?.id,
@@ -458,8 +790,35 @@ export class AcpSession implements SessionHandle {
         kind: option.kind,
       })),
     });
+    this.conversation.appendSafe({
+      kind: 'permission.requested', sessionGeneration: this.sessionGeneration,
+      acpSessionId: this.sessionId, permissionId,
+      promptId: this.activeTurn?.id, turnId: this.activeTurn?.id,
+      toolCallId: scheduledTurn(this.activeTurn) ? 'scheduled-loop-tool' : params.toolCall.toolCallId,
+      payload: {
+        toolCallId: scheduledTurn(this.activeTurn) ? 'scheduled-loop-tool' : params.toolCall.toolCallId,
+        title: scheduledTurn(this.activeTurn)
+          ? 'Scheduled-loop permission requested' : params.toolCall.title ?? 'Permission requested',
+        options: params.options.map(option => ({
+          optionId: option.optionId,
+          name: scheduledTurn(this.activeTurn) ? option.kind : option.name,
+          kind: option.kind,
+        })),
+        expiresAt,
+      },
+    });
     return new Promise(resolve => {
-      this.pendingPermissions.set(permissionId, { options: params.options, resolve });
+      const pending: PendingPermission = {
+        options: params.options, resolve,
+        toolCallId: scheduledTurn(this.activeTurn)
+          ? 'scheduled-loop-tool' : params.toolCall.toolCallId,
+      };
+      pending.expiry = setTimeout(() => {
+        this.settlePendingAutomatically(permissionId, pending, 'expired', undefined,
+          `no decision arrived within ${Math.round(timeoutMs / 1000)}s`);
+      }, timeoutMs);
+      pending.expiry.unref?.();
+      this.pendingPermissions.set(permissionId, pending);
     });
   }
 
@@ -496,6 +855,17 @@ export class AcpSession implements SessionHandle {
         kind: o.kind,
       })),
     });
+    this.conversation.appendSafe({
+      kind: 'permission.resolved', sessionGeneration: this.sessionGeneration,
+      acpSessionId: this.sessionId, permissionId: randomUUID(),
+      promptId: this.activeTurn?.id, turnId: this.activeTurn?.id,
+      toolCallId: scheduledTurn(this.activeTurn) ? 'scheduled-loop-tool' : params.toolCall.toolCallId,
+      payload: {
+        decision: settled,
+        decisionSource: 'automatic', policy, reason,
+        ...(option ? { optionId: option.optionId } : {}),
+      },
+    });
     return option
       ? { outcome: { outcome: 'selected', optionId: option.optionId } }
       : { outcome: { outcome: 'cancelled' } };
@@ -517,6 +887,9 @@ export class AcpSession implements SessionHandle {
 
   private recordUpdate(update: acp.SessionUpdate): void {
     const scheduled = this.activeTurn?.origin?.kind === 'scheduled-loop';
+    this.recordConversationUpdate(update, scheduled);
+    if (update.sessionUpdate === 'config_option_update')
+      this.captureRuntimeMetadata(update.configOptions);
     switch (update.sessionUpdate) {
       case 'agent_message_chunk':
         if (this.activeTurn && update.content.type === 'text')
@@ -557,6 +930,43 @@ export class AcpSession implements SessionHandle {
       default:
         break;
     }
+  }
+
+  /** Normalize every ACP update losslessly into the durable ledger. */
+  private recordConversationUpdate(update: acp.SessionUpdate, scheduled: boolean): void {
+    const normalized = normalizeSessionUpdate(update,
+      scheduled ? { redactText: SCHEDULED_LOOP_REDACTION } : {});
+    this.conversation.appendSafe({
+      kind: normalized.kind,
+      sessionGeneration: this.sessionGeneration,
+      acpSessionId: this.sessionId,
+      ...(this.activeTurn ? { promptId: this.activeTurn.id, turnId: this.activeTurn.id } : {}),
+      ...(normalized.messageId ? { messageId: normalized.messageId } : {}),
+      ...(normalized.toolCallId ? { toolCallId: normalized.toolCallId } : {}),
+      source: this.replaying ? 'agent_replay' : 'agent',
+      payload: normalized.payload,
+      ...(normalized.adapterMeta ? { adapterMeta: normalized.adapterMeta } : {}),
+    });
+  }
+
+  // ── conversation ledger access (SessionHandle) ─────────────────────────────
+
+  conversationPage(request: { after?: string; limit?: number } = {}): ConversationHandlePage {
+    return { ...this.conversation.page(request), snapshot: this.conversationSnapshot() };
+  }
+
+  conversationSnapshot(): ConversationSnapshot {
+    return {
+      sessionGeneration: this.sessionGeneration,
+      readiness: this.isAlive() ? this.readiness : 'offline',
+      queueDepth: this.queueDepth,
+      pendingPermissionIds: [...this.pendingPermissions.keys()],
+      ...(this.conversation.degraded ? { historyDegraded: true } : {}),
+    };
+  }
+
+  subscribeConversation(listener: Parameters<ConversationEventStore['subscribe']>[0]): () => void {
+    return this.conversation.subscribe(listener);
   }
 
   private fail(error: unknown): void {

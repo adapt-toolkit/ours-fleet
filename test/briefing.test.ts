@@ -136,6 +136,8 @@ describe('generateBriefing', () => {
     expect(b).toContain('separate **Alice-owner** owner-channel identity');
     expect(b).toContain('never bind or switch to it');
     expect(b).toContain('[fleet-owner]');
+    expect(b).toContain('source=owner_admin_console');
+    expect(b).toContain('literal prompt text');
     expect(b).toContain('For any non-final owner message');
     expect(b).toContain('contact **Alice-owner**');
     expect(b).toContain('Do not include a task/request ID');

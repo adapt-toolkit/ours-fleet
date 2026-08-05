@@ -905,7 +905,7 @@ cOpt(program.command('spawn [name]').description('spawn a new agent (permanent b
   .option('--coordinator <name>', 'announce target')
   .option('--model <id>', 'model id to launch on (e.g. claude-fable-5); default: launcher default')
   .option('--permission-mode <mode>', 'harness permission mode (Codex: untrusted|on-request|never; Claude: native values)')
-  .option('--approval <mode>', 'common approval intent: ask|allow|deny')
+  .option('--approval <mode>', 'fleet permission mode: ask|auto|allow (deny is deprecated)')
   .option('--filesystem <mode>', 'common filesystem intent: read-only|workspace|unrestricted')
   .option('--unattended <mode>', 'permission behavior without a console: deny|wait')
   .option('--sandbox <mode>', 'Codex sandbox: read-only|workspace-write|danger-full-access')

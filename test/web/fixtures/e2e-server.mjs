@@ -137,7 +137,77 @@ const watchdogsService = {
 };
 const actions = new Map();
 let outputCalls = 0;
+const conversationAt = new Date().toISOString();
+const conversationEvents = [
+  { schemaVersion: 1, roleId: 'Alpha', eventId: 'conv-1', seq: 1, at: conversationAt,
+    sessionGeneration: 'fixture-generation', kind: 'prompt.admitted', promptId: 'fixture-turn',
+    commandId: 'fixture-command', source: 'owner_admin_console',
+    payload: { text: { type: 'text', text: 'Inspect the fixture', bytes: 19 }, queuedBehind: 0 } },
+  { schemaVersion: 1, roleId: 'Alpha', eventId: 'conv-2', seq: 2, at: conversationAt,
+    sessionGeneration: 'fixture-generation', kind: 'plan.replace', promptId: 'fixture-turn',
+    payload: { entries: [
+      { content: { text: 'Inspect input', bytes: 13 }, priority: 'high', status: 'completed' },
+      { content: { text: 'Render result', bytes: 13 }, priority: 'medium', status: 'in_progress' },
+    ] } },
+  { schemaVersion: 1, roleId: 'Alpha', eventId: 'conv-3', seq: 3, at: conversationAt,
+    sessionGeneration: 'fixture-generation', kind: 'tool.upsert', promptId: 'fixture-turn',
+    toolCallId: 'fixture-tool', payload: {
+      toolCallId: 'fixture-tool', snapshot: true, title: 'Edit fixture.ts', kind: 'edit',
+      status: 'completed', locations: [{ path: '/workspace/fixture.ts', line: 7 }],
+      rawInput: { json: { path: 'fixture.ts' }, bytes: 21 },
+      content: [{ type: 'diff', path: '/workspace/fixture.ts',
+        oldText: { text: 'old value', bytes: 9 }, newText: { text: 'new value', bytes: 9 } }],
+    } },
+  { schemaVersion: 1, roleId: 'Alpha', eventId: 'conv-4', seq: 4, at: conversationAt,
+    sessionGeneration: 'fixture-generation', kind: 'message.chunk', promptId: 'fixture-turn',
+    messageId: 'fixture-message', source: 'agent',
+    payload: { role: 'assistant', content: { type: 'text', text: 'Fixture result ready.', bytes: 21 } } },
+  { schemaVersion: 1, roleId: 'Alpha', eventId: 'conv-5', seq: 5, at: conversationAt,
+    sessionGeneration: 'fixture-generation', kind: 'usage.updated', promptId: 'fixture-turn',
+    payload: { used: 42000, size: 100000, cost: { amount: 0.01, currency: 'USD' } } },
+  { schemaVersion: 1, roleId: 'Alpha', eventId: 'conv-6', seq: 6, at: conversationAt,
+    sessionGeneration: 'fixture-generation', kind: 'turn.completed', promptId: 'fixture-turn',
+    payload: { outcome: 'completed', stopReason: 'end_turn' } },
+];
+const conversationPage = after => ({
+  events: conversationEvents.filter(event => event.seq > Number(after ?? 0)),
+  firstAvailableCursor: '1', nextCursor: '6', hasMore: false,
+  snapshot: { sessionGeneration: 'fixture-generation', readiness: 'idle',
+    queueDepth: 0, pendingPermissionIds: [] },
+});
 const services = {
+  configuration: {
+    read() {
+      return {
+        path: 'fleet.yaml', exists: true, firstRun: false, revision: 'fixture-revision',
+        model: { defaults: { harness: 'codex', session: 'acp' }, roles: { Alpha: { mission: role.config.mission }, Terminal: {}, Dormant: {} } },
+        redactions: [],
+      };
+    },
+    async preview(revision, model) {
+      return {
+        valid: true, revision, normalizedModel: model, diff: '--- fleet.yaml (current)\n+++ fleet.yaml (proposed)\n', redactions: [],
+        impact: { required: false, roles: [], watchdogScheduler: false, scheduledLoops: false, summary: 'No running process needs a restart.' },
+        preflight: { ok: true, checks: [{ name: 'config', ok: true, detail: 'valid' }] },
+      };
+    },
+    async write(revision, model) {
+      const preview = await this.preview(revision, model);
+      return { ...preview, saved: true, newRevision: 'fixture-revision-2', backup: 'fleet.yaml.backup-fixture' };
+    },
+  },
+  async topology() {
+    return {
+      nodes: [
+        { id: 'agent:Alpha', kind: 'agent', label: 'Alpha', status: 'ready', lifetime: 'permanent', detail: role.config.mission },
+        { id: 'agent:Terminal', kind: 'agent', label: 'Terminal', status: 'ready', lifetime: 'permanent' },
+        { id: 'agent:Dormant', kind: 'agent', label: 'Dormant', status: 'offline', lifetime: 'permanent' },
+        { id: 'watchdog:nightwatch', kind: 'watchdog', label: 'nightwatch', status: 'active' },
+      ],
+      edges: [{ id: 'watch', kind: 'watches', from: 'watchdog:nightwatch', to: 'agent:Alpha', label: 'watches' }],
+      unknownLineage: [],
+    };
+  },
   watchdogs: watchdogsService,
   query: {
     async list() { return [
@@ -162,7 +232,7 @@ const services = {
   repository: { async get(id) { return id === 'Dormant' ? inactiveRole : id === 'Terminal' ? terminalRole : role; } },
   async session() {
     return {
-      async describe() { return { backend: 'acp', protocolVersion: 2, features: [] }; },
+      async describe() { return { backend: 'acp', protocolVersion: 3, features: ['conversation_v3'] }; },
       async snapshot() { return { backend: 'acp', alive: true, readiness: 'idle' }; },
       async recentOutput(request = {}) {
         outputCalls++;
@@ -184,6 +254,17 @@ const services = {
       },
       async interrupt() { return { accepted: true }; },
       async respondPermission() { return { accepted: true }; },
+      async conversationPage(request = {}) { return conversationPage(request.after); },
+      async submitPromptV2(request) {
+        return { commandId: request.commandId, promptId: 'fixture-prompt-v2', state: 'starting',
+          queuedBehind: 0, acceptedAt: new Date().toISOString(), eventCursor: '6' };
+      },
+      async interruptV2(commandId) { return { accepted: true, commandId }; },
+      async respondPermissionV2(request) { return { accepted: true, commandId: request.commandId }; },
+      async followConversation(request) {
+        request.onPage(conversationPage(request.after));
+        return { close() {} };
+      },
     };
   },
   logs: {
@@ -204,8 +285,16 @@ const services = {
       return {
         available: true, reasons: [],
         harnesses: [
-          { id: 'codex', available: true, sessions: ['acp', 'tmux'], models: ['gpt-5.6', 'gpt-5.4'], warnings: [] },
-          { id: 'claude-code', available: true, sessions: ['acp', 'tmux'], models: ['sonnet', 'opus', 'haiku'], warnings: [] },
+          { id: 'codex', available: true, sessions: ['acp', 'tmux'], models: ['gpt-5.6-sol', 'gpt-5.6-terra'],
+            modelOptions: [
+              { id: 'gpt-5.6-sol', label: 'GPT-5.6-Sol', reasoningEfforts: ['low', 'medium', 'high', 'xhigh', 'max', 'ultra'], defaultReasoningEffort: 'low', source: 'codex-runtime-catalog' },
+              { id: 'gpt-5.6-terra', label: 'GPT-5.6-Terra', reasoningEfforts: ['low', 'medium', 'high'], defaultReasoningEffort: 'medium', source: 'codex-runtime-catalog' },
+            ], catalogSource: 'codex-runtime-catalog', customModelAllowed: true, warnings: [] },
+          { id: 'claude-code', available: true, sessions: ['acp', 'tmux'], models: ['claude-fable-5', 'claude-opus-5'],
+            modelOptions: [
+              { id: 'claude-fable-5', label: 'Claude Fable 5', reasoningEfforts: ['low', 'medium', 'high', 'xhigh', 'max'], source: 'claude-adapter-2.1' },
+              { id: 'claude-opus-5', label: 'Claude Opus 5', reasoningEfforts: ['low', 'medium', 'high', 'xhigh', 'max'], source: 'claude-adapter-2.1' },
+            ], catalogSource: 'claude-adapter-2.1', customModelAllowed: true, warnings: [] },
         ],
         lifetimes: ['permanent', 'temporary'],
         identityBootstrap: {
@@ -244,6 +333,15 @@ const services = {
       actions.set(action.actionId, action); return action;
     },
     get(id) { return actions.get(id); },
+  },
+  removal: {
+    preview(role) {
+      return { role, configured: true, lifetime: 'permanent', confirmation: 'typed-role-name',
+        coordinatorProtection: false, selfProtected: false,
+        effects: [`Stop and uninstall the exact backend registration for '${role}'.`, `/fixture/state/${role}`],
+        recovery: { available: true, detail: 'Fixture recovery archive is available.' } };
+    },
+    async remove(input) { return { ...this.preview(input.role), removed: true, recoveryPath: `/fixture/recovery/${input.role}` }; },
   },
   async terminalUpgrade(socket) {
     socket.send(JSON.stringify({

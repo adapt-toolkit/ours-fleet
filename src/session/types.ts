@@ -1,4 +1,7 @@
 import type { SessionBackendId } from '../config.js';
+import type {
+  ConversationEventV1, ConversationSnapshot, PromptReceipt, SubmitPromptCommand,
+} from './conversation-types.js';
 
 export type SessionReadiness =
   | 'starting'
@@ -13,9 +16,17 @@ export type TurnCancellationSource =
 export type PromptOrigin =
   | { kind: 'startup' }
   | { kind: 'local-console' }
-  | { kind: 'owner'; requestId: string }
+  | { kind: 'owner'; requestId: string; displayText?: string }
   | { kind: 'fleet-monitor' }
-  | { kind: 'scheduled-loop'; loop: string; runId: string };
+  | { kind: 'scheduled-loop'; loop: string; runId: string }
+  | { kind: 'owner-admin-console'; commandId: string };
+
+export interface RuntimeSelectorMetadata {
+  /** Exact provider/model identifier reported by the live ACP session. */
+  value: string;
+  /** Complete provider-supplied label for that exact value, when available. */
+  label?: string;
+}
 
 /**
  * Two independent facts about one turn, deliberately kept apart:
@@ -152,6 +163,8 @@ export interface SubmitPromptOptions {
   origin?: PromptOrigin;
   /** Use the ACP steering extension when available; ignored by other backends. */
   steer?: boolean;
+  /** Audit-grade actor detail persisted with the conversation admission record. */
+  actor?: { browserSession?: string };
 }
 
 export interface SessionSnapshot {
@@ -161,6 +174,14 @@ export interface SessionSnapshot {
   sessionId?: string;
   lastError?: string;
   pendingPermissionId?: string;
+  runtimeModel?: RuntimeSelectorMetadata;
+  reasoningEffort?: RuntimeSelectorMetadata;
+  permissionMode?: {
+    /** Effective harness-neutral policy after native overrides. */
+    fleetMode: import('../config.js').FleetPermissionMode;
+    /** Exact harness-native approval/permission mode used by this runner. */
+    nativeMode: string;
+  };
 }
 
 export type SessionEventKind =
@@ -204,11 +225,25 @@ export interface SessionEvent {
   optionId?: string;
 }
 
+export interface ConversationHandlePage {
+  events: ConversationEventV1[];
+  firstAvailableCursor?: string;
+  nextCursor?: string;
+  hasMore: boolean;
+  snapshot: ConversationSnapshot;
+}
+
 export interface SessionHandle {
   readonly backend: SessionBackendId;
   readonly pid: number;
   isAlive(): boolean;
   snapshot(): SessionSnapshot;
+  // ── durable conversation ledger (ACP sessions only) ────────────────────────
+  conversationPage?(request: { after?: string; limit?: number }): ConversationHandlePage;
+  conversationSnapshot?(): ConversationSnapshot;
+  subscribeConversation?(listener: (event: ConversationEventV1) => void): () => void;
+  /** Durably admit an idempotent browser prompt; resolves on admission. */
+  submitPromptBrowser?(command: SubmitPromptCommand): Promise<PromptReceipt>;
   /**
    * Hand the session a prompt and return as soon as it has accepted
    * responsibility for it. Throws `SessionControlError` if it cannot.
@@ -218,6 +253,10 @@ export interface SessionHandle {
   submitPrompt(text: string, options?: SubmitPromptOptions): Promise<TurnResult>;
   interrupt(source?: TurnCancellationSource): Promise<void>;
   respondPermission(permissionId: string, optionId: string): boolean;
+  /** Generation-bound browser decision; stale/settled/invalid all fail closed. */
+  respondPermissionV2?(
+    permissionId: string, optionId: string, sessionGeneration: string,
+  ): 'accepted' | 'stale';
   eventsSince(seq: number): SessionEvent[];
   subscribe(listener: (event: SessionEvent) => void): () => void;
   setControllerAttached(attached: boolean): void;

@@ -1,14 +1,20 @@
-import { lazy, Suspense, useCallback, useEffect, useState } from 'react';
+import { lazy, Suspense, useCallback, useEffect, useRef, useState } from 'react';
 import { api, idempotencyKey } from './api';
+import { ConversationView } from './ConversationView';
 import { isInactive } from './fleet-presentation';
 import { partitionActivity } from './activity-presentation';
 import { useLivePoll } from './use-live-poll';
+import { runtimeMetadata } from './runtime-metadata';
+import { promptReceiptNotice } from './prompt-receipt';
+import { confirmAndRemoveRole } from './remove-role';
 
 const TerminalView = lazy(() => import('./TerminalView').then(module => ({ default: module.TerminalView })));
 
-export function RoleWorkspace({ roleId, onBack }: { roleId: string; onBack(): void }) {
+export function RoleWorkspace({ roleId, onBack, onRemoved }: { roleId: string; onBack(): void; onRemoved?(): void }) {
   const [detail, setDetail] = useState<any>();
-  const [tab, setTab] = useState<'overview' | 'activity' | 'terminal' | 'logs' | 'diagnostics'>('overview');
+  const [tab, setTab] = useState<'overview' | 'conversation' | 'activity' | 'terminal' | 'logs' | 'diagnostics'>('overview');
+  // ACP roles land on the structured Conversation view; picked once per role.
+  const defaultTabPicked = useRef(false);
   const [output, setOutput] = useState<any>();
   const [logs, setLogs] = useState<any>();
   const [text, setText] = useState('');
@@ -33,6 +39,11 @@ export function RoleWorkspace({ roleId, onBack }: { roleId: string; onBack(): vo
     if (!signal.aborted) setLogs(value);
   }, [roleId]);
   useLivePoll(refreshLogs, reason => setRefreshError((reason as Error).message), tab === 'logs');
+  useEffect(() => {
+    if (!detail || defaultTabPicked.current) return;
+    defaultTabPicked.current = true;
+    if (detail.status?.session?.backend === 'acp' && !isInactive(detail)) setTab('conversation');
+  }, [detail]);
   if (!detail) return <div className="content">Loading role evidence…</div>;
   const { role, status, capabilities } = detail;
   const inactive = isInactive({ role, status });
@@ -50,22 +61,30 @@ export function RoleWorkspace({ roleId, onBack }: { roleId: string; onBack(): vo
   const send = async () => {
     try {
       const receipt: any = await api.post(`/api/v1/roles/${roleId}/input`, { text });
-      setNotice(receipt.detail); setText('');
+      setNotice(promptReceiptNotice(receipt)); setText('');
       requestActivityRefresh();
     } catch (reason) { setNotice((reason as Error).message); }
   };
   return <div className="workspace">
     <button className="back" onClick={onBack}>← Fleet</button>
     <div className="workspace-summary"><span className={`hero-state ${inactive ? 'offline' : status.overall}`}><i />{inactive ? 'inactive' : status.overall}</span>
-      <span>{role.lifetime}</span><span>{role.config?.harness}</span><span>{status.session.backend}</span>
+      <span>{role.lifetime}</span>
+      {runtimeMetadata(detail).map(item => <span key={item.label} title={item.label}>
+        <small>{item.label}</small> {item.value}
+      </span>)}
       <small>observed {new Date(status.observedAt).toLocaleTimeString()}</small></div>
     <div className="tabs" role="tablist">
-      {(['overview', 'activity', 'terminal', 'logs', 'diagnostics'] as const).map(name =>
+      {([
+        'overview',
+        ...(status.session.backend === 'acp' ? ['conversation'] as const : []),
+        'activity', 'terminal', 'logs', 'diagnostics',
+      ] as const).map(name =>
         <button key={name} className={tab === name ? 'active' : ''} disabled={name === 'terminal' && !capabilities.terminal.available}
-          onClick={() => setTab(name)}>{name}{name === 'terminal' && !capabilities.terminal.available ? ' · unavailable' : ''}</button>)}
+          onClick={() => setTab(name)}>{name === 'terminal' ? 'PTY terminal' : name}{name === 'terminal' && !capabilities.terminal.available ? ' · unavailable' : ''}</button>)}
     </div>
     {refreshError && <div className="banner error">Live refresh failed: {refreshError}</div>}
     {notice && <div className="banner info">{notice}</div>}
+    {tab === 'conversation' && <ConversationView roleId={roleId} />}
     {tab === 'overview' && <div className="dashboard-grid">
       <Evidence title="Supervisor" state={status.supervisor.liveness} rows={{ backend: status.supervisor.backend, evidence: status.supervisor.detail }} />
       <Evidence title="Session" state={status.session.readiness} rows={{ reachability: status.session.reachability, evidence: status.session.evidence, error: status.session.lastError }} />
@@ -77,6 +96,9 @@ export function RoleWorkspace({ roleId, onBack }: { roleId: string; onBack(): vo
         {!inactive && capabilities.lifecycle.restartResume && <button onClick={() => void action('restart_resume')}>Restart & resume</button>}
         {!inactive && capabilities.lifecycle.restartFresh && <button className="danger" onClick={() => void action('restart_fresh')}>Fresh restart…</button>}
         {inactive && <span className="muted">Inactive — start is the only applicable lifecycle action.</span>}
+        <button className="danger" onClick={() => void confirmAndRemoveRole(roleId).then(result => {
+          if (!result) return; alert(`Removed ${roleId}. Recovery archive: ${result.recoveryPath}`); onRemoved?.();
+        }).catch(reason => setNotice((reason as Error).message))}>Remove role…</button>
       </div></div>
     </div>}
     {tab === 'activity' && <div className="activity-layout"><div className="activity panel">

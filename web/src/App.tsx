@@ -5,6 +5,10 @@ import { RoleWorkspace } from './RoleWorkspace';
 import { isInactive, needsAttention, presentFleet } from './fleet-presentation';
 import { useLivePoll } from './use-live-poll';
 import { WatchdogDetail, WatchdogsView } from './Watchdogs';
+import { FleetTopology } from './FleetTopology';
+import { FleetSetup, type ConfigRead } from './FleetSetup';
+import type { Topology } from './topology-presentation';
+import { confirmAndRemoveRole } from './remove-role';
 
 type FleetItem = {
   role: {
@@ -29,10 +33,12 @@ export function App() {
   const [password, setPassword] = useState('');
   const [error, setError] = useState('');
   const [items, setItems] = useState<FleetItem[]>([]);
+  const [topology, setTopology] = useState<Topology>({ nodes: [], edges: [], unknownLineage: [] });
+  const [configuration, setConfiguration] = useState<ConfigRead>();
   const [selected, setSelected] = useState('');
   const [filter, setFilter] = useState('');
   const [showInactive, setShowInactive] = useState(false);
-  const [view, setView] = useState<'fleet' | 'attention' | 'watchdogs' | 'audit'>('fleet');
+  const [view, setView] = useState<'fleet' | 'attention' | 'watchdogs' | 'configuration' | 'audit'>('fleet');
   const [selectedWatchdog, setSelectedWatchdog] = useState('');
   const [creating, setCreating] = useState(false);
   const [installPrompt, setInstallPrompt] = useState<InstallPromptEvent>();
@@ -40,13 +46,18 @@ export function App() {
   const [meta, setMeta] = useState<{ version?: string; auditDegraded?: string }>();
 
   const refresh = useCallback(async (signal: AbortSignal) => {
-    const [fleet, serverMeta] = await Promise.all([
+    const [fleet, serverMeta, graph, config] = await Promise.all([
       api.get<{ roles: FleetItem[] }>('/api/v1/roles', signal),
       api.get<{ version: string; auditDegraded?: string }>('/api/v1/meta', signal),
+      api.get<Topology>('/api/v1/topology', signal),
+      api.get<ConfigRead>('/api/v1/configuration', signal),
     ]);
     if (signal.aborted) return;
     setItems(fleet.roles);
     setMeta(serverMeta);
+    setTopology(graph);
+    setConfiguration(config);
+    if (config.firstRun) setView('configuration');
     setError('');
   }, []);
 
@@ -93,6 +104,15 @@ export function App() {
   const shown = useMemo(() => presentFleet(items, {
     filter, showInactive: view === 'fleet' && showInactive, attentionOnly: view === 'attention',
   }), [filter, items, showInactive, view]);
+  const visibleTopology = useMemo(() => {
+    const visibleAgents = new Set(shown.map(item => `agent:${item.role.id}`));
+    const nodes = topology.nodes.filter(node => node.kind !== 'agent' || visibleAgents.has(node.id));
+    const ids = new Set(nodes.map(node => node.id));
+    return {
+      nodes, edges: topology.edges.filter(edge => ids.has(edge.from) && ids.has(edge.to)),
+      unknownLineage: topology.unknownLineage.filter(name => visibleAgents.has(`agent:${name}`)),
+    };
+  }, [shown, topology]);
 
   if (!ready) return <main className="auth-screen">
     <div className="brand-wordmark">Ours</div>
@@ -113,12 +133,12 @@ export function App() {
     <aside>
       <div className="brand"><span className="brand-wordmark">Ours</span><div><small>fleet console</small></div></div>
       <nav aria-label="Primary">
-        {(['fleet', 'attention', 'watchdogs', 'audit'] as const).map(name =>
+        {(['fleet', 'attention', 'watchdogs', 'configuration', 'audit'] as const).map(name =>
           <button className={view === name ? 'active' : ''} key={name} onClick={() => {
             setView(name); setSelected(''); setSelectedWatchdog('');
           }}>
-            <span aria-hidden="true">{name === 'fleet' ? '◫' : name === 'attention' ? '△' : name === 'watchdogs' ? '◉' : '≡'}</span>
-            {name === 'fleet' ? 'All roles' : name === 'attention' ? 'Needs attention' : name === 'watchdogs' ? 'Watchdogs' : 'Audit trail'}
+            <span aria-hidden="true">{name === 'fleet' ? '⌘' : name === 'attention' ? '△' : name === 'watchdogs' ? '◉' : name === 'configuration' ? '⚙' : '≡'}</span>
+            {name === 'fleet' ? 'Topology' : name === 'attention' ? 'Needs attention' : name === 'watchdogs' ? 'Watchdogs' : name === 'configuration' ? 'Configure' : 'Audit trail'}
             {name === 'attention' && <b>{attentionCount}</b>}
           </button>)}
       </nav>
@@ -130,7 +150,7 @@ export function App() {
         <div>
           <span className="eyebrow">{selected ? 'role workspace' : selectedWatchdog ? 'watchdog' : view}</span>
           <h1>{selected || selectedWatchdog || (view === 'attention' ? 'Needs attention'
-            : view === 'watchdogs' ? 'Watchdogs' : view === 'audit' ? 'Audit trail' : 'All roles')}</h1>
+            : view === 'watchdogs' ? 'Watchdogs' : view === 'configuration' ? 'Fleet setup' : view === 'audit' ? 'Audit trail' : 'Fleet topology')}</h1>
         </div>
         <div className="header-actions">
           {installPrompt && <button className="secondary" onClick={() => {
@@ -146,7 +166,13 @@ export function App() {
       {api.accessWarning && <div className="banner warning">{api.accessWarning}</div>}
       {error && <div className="banner error">{error}</div>}
       {selected
-        ? <RoleWorkspace roleId={selected} onBack={() => setSelected('')} />
+        ? <RoleWorkspace roleId={selected} onBack={() => setSelected('')} onRemoved={() => { setSelected(''); requestRefresh(); }} />
+        : view === 'configuration'
+          ? configuration
+            ? <FleetSetup key={configuration.revision} initial={configuration} onSaved={next => {
+              setConfiguration(next); setView('fleet'); requestRefresh();
+            }} />
+            : <div className="content"><div className="empty">Loading configuration…</div></div>
         : view === 'audit'
           ? <AuditView />
           : view === 'watchdogs'
@@ -170,6 +196,11 @@ export function App() {
                   {showInactive ? 'Hide inactive' : 'Show inactive'} ({inactiveCount})
                 </button>}</div>
             </div>
+            {view === 'fleet' && !filter && <FleetTopology topology={visibleTopology}
+              onAgent={setSelected} onWatchdog={name => { setSelectedWatchdog(name); setView('watchdogs'); }}
+              onRemove={name => void confirmAndRemoveRole(name).then(result => {
+                if (result) { alert(`Removed ${name}. Recovery archive: ${result.recoveryPath}`); requestRefresh(); }
+              }).catch(reason => setError((reason as Error).message))} />}
             <div className="role-table">
               <div className="role-row heading">
                 <span>Role</span><span>Runtime</span><span>Evidence</span><span>Monitor</span><span>Observed</span>
@@ -182,7 +213,7 @@ export function App() {
                   <span className="role-pills"><em>{item.role.lifetime}</em>
                     {item.status.problems.some(problem => problem.source === 'watchdog') && <em>watchdog</em>}</span>
                 </span>
-                <span><strong>{item.role.config?.harness ?? 'unknown'}</strong><small>{item.status.session.backend} · {item.role.config?.model ?? 'default model'}</small></span>
+                <span><strong>{item.role.config?.harness ?? 'unknown'}</strong><small>{item.status.session.backend} · {item.role.config?.model ?? 'runtime model not reported'}</small></span>
                 <span><strong>{sessionLabel(item.status.session)}</strong>
                   <small>{serviceLabel(item.status.supervisor.liveness)} · {item.status.session.evidence}</small></span>
                 <span><strong>{item.status.monitor.health}</strong><small>{item.status.restart.circuit === 'open' ? 'circuit open' : 'circuit closed'}</small></span>

@@ -1,5 +1,6 @@
 import type { MonitorConfig, ResolvedRole } from './config.js';
 import type { SpawnOpts } from './spawn.js';
+import { effectivePermissionMode } from './permissions.js';
 
 /** Present only inside a managed role process. The CLI treats it as a routing hint, not authority. */
 export const FLEET_PROXY_STATE_DIR_ENV = 'OURS_FLEET_PROXY_STATE_DIR';
@@ -38,7 +39,8 @@ export function inheritCallerSpawnDefaults(
   take('session', caller.session);
   take('cwd', caller.cwd);
   take('coordinator', caller.name);
-  take('approval', caller.permissions.approval);
+  if (options.approval === undefined)
+    take('approval', effectivePermissionMode(caller).fleetMode);
   take('filesystem', caller.permissions.filesystem);
   take('unattended', caller.permissions.unattended);
   take('monitorConfig', structuredClone(caller.monitor));

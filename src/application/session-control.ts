@@ -1,11 +1,26 @@
 import { randomUUID } from 'node:crypto';
-import { controlRequest } from '../session/control.js';
+import { controlRequest, followConversation } from '../session/control.js';
+import type {
+  ConversationEventV1, ConversationSnapshot, PromptReceipt,
+} from '../session/conversation-types.js';
 import type { SessionEvent, SessionSnapshot } from '../session/types.js';
 import { Tmux } from '../tmux.js';
 import { FleetError, normalizeError } from './errors.js';
 import type {
   OutputPage, SendReceipt, SessionDescriptor,
 } from './types.js';
+
+export interface ConversationPageView {
+  events: ConversationEventV1[];
+  firstAvailableCursor?: string;
+  nextCursor?: string;
+  hasMore: boolean;
+  snapshot: ConversationSnapshot;
+}
+
+export interface ConversationFollowHandle {
+  close(): void;
+}
 
 export interface RoleSessionControl {
   describe(): Promise<SessionDescriptor>;
@@ -14,6 +29,27 @@ export interface RoleSessionControl {
   sendText(text: string): Promise<SendReceipt>;
   interrupt?(): Promise<{ accepted: true }>;
   respondPermission?(request: { permissionId: string; optionId: string }): Promise<{ accepted: true }>;
+  // ── conversation v3 (ACP roles that persist a ledger) ──────────────────────
+  conversationPage?(request: { after?: string; limit?: number }): Promise<ConversationPageView>;
+  submitPromptV2?(request: {
+    commandId: string; text: string; actorBrowserSession: string;
+    source: 'owner_admin_console';
+  }): Promise<PromptReceipt>;
+  interruptV2?(commandId: string): Promise<{ accepted: true; commandId: string }>;
+  respondPermissionV2?(request: {
+    commandId: string; permissionId: string; optionId: string; sessionGeneration: string;
+  }): Promise<{ accepted: true; commandId: string }>;
+  /**
+   * Open a live follow on the role's ledger. `onPage` receives the initial
+   * replay page; `onEvent` every subsequent durable event; `onClose` fires
+   * exactly once when the underlying control stream ends.
+   */
+  followConversation?(request: {
+    after?: string;
+    onPage(page: ConversationPageView): void;
+    onEvent(event: ConversationEventV1): void;
+    onClose(reason?: string): void;
+  }): Promise<ConversationFollowHandle>;
 }
 
 const visibleEvents = (events: SessionEvent[]) => events.filter(event => event.kind !== 'thought');
@@ -74,6 +110,86 @@ export class AcpRoleSessionAdapter implements RoleSessionControl {
   async interrupt(): Promise<{ accepted: true }> {
     await this.call('interrupt');
     return { accepted: true };
+  }
+
+  async conversationPage(request: { after?: string; limit?: number } = {}): Promise<ConversationPageView> {
+    return await this.call('conversation_page', {
+      after: request.after, limit: request.limit,
+    }) as ConversationPageView;
+  }
+
+  async submitPromptV2(request: {
+    commandId: string; text: string; actorBrowserSession: string;
+    source: 'owner_admin_console';
+  }): Promise<PromptReceipt> {
+    if (!request.text.trim()) throw new FleetError('invalid_request', 'text is required');
+    if (Buffer.byteLength(request.text) > 32 * 1024)
+      throw new FleetError('invalid_request', 'text exceeds 32 KiB');
+    try {
+      return await this.call('submit_prompt_v2', {
+        commandId: request.commandId, text: request.text, actor: request.actorBrowserSession,
+        source: request.source,
+      }) as PromptReceipt;
+    } catch (error) {
+      const fleetError = normalizeError(error);
+      if (fleetError.message.includes('idempotency_conflict'))
+        throw new FleetError('idempotency_conflict',
+          'this command id was already used with a different prompt body');
+      throw fleetError;
+    }
+  }
+
+  async interruptV2(commandId: string): Promise<{ accepted: true; commandId: string }> {
+    return await this.call('interrupt_v2', { commandId }) as { accepted: true; commandId: string };
+  }
+
+  async respondPermissionV2(request: {
+    commandId: string; permissionId: string; optionId: string; sessionGeneration: string;
+  }): Promise<{ accepted: true; commandId: string }> {
+    try {
+      return await this.call('respond_permission_v2', request) as {
+        accepted: true; commandId: string;
+      };
+    } catch (error) {
+      const fleetError = normalizeError(error);
+      if (fleetError.message.includes('stale_state'))
+        throw new FleetError('stale_state',
+          'permission is settled, expired, invalid, or belongs to another session generation');
+      throw fleetError;
+    }
+  }
+
+  async followConversation(request: {
+    after?: string;
+    onPage(page: ConversationPageView): void;
+    onEvent(event: ConversationEventV1): void;
+    onClose(reason?: string): void;
+  }): Promise<ConversationFollowHandle> {
+    let sawPage = false;
+    let closed = false;
+    const finish = (reason?: string) => {
+      if (closed) return;
+      closed = true;
+      request.onClose(reason);
+    };
+    const follow = await followConversation(this.stateDir, request.after, message => {
+      if (message.conversationEvent) {
+        request.onEvent(message.conversationEvent as ConversationEventV1);
+        return;
+      }
+      if (!sawPage) {
+        sawPage = true;
+        if (message.ok === false) {
+          finish(String(message.error ?? 'conversation follow refused'));
+          follow.close();
+          return;
+        }
+        request.onPage(message.result as ConversationPageView);
+      }
+    });
+    follow.socket.once('close', () => finish());
+    follow.socket.once('error', error => finish((error as Error).message));
+    return { close: () => { follow.close(); finish(); } };
   }
 
   async respondPermission(request: {

@@ -15,12 +15,13 @@ import type { ManagedFleetSpawnResult } from '../fleet-proxy.js';
 const MAX_LINE_BYTES = 64 * 1024;
 
 export interface ControlRequest {
-  version: 1 | 2;
+  version: 1 | 2 | 3;
   id: string;
   token: string;
   command: 'status' | 'snapshot' | 'submit_prompt' | 'respond_permission' | 'interrupt' | 'follow' | 'events_since' | 'owner_channel_manage'
     | 'loop_status' | 'loop_run_now' | 'loop_disable' | 'loop_enable' | 'reload_config'
-    | 'fleet_spawn';
+    | 'conversation_page' | 'conversation_follow' | 'submit_prompt_v2' | 'interrupt_v2'
+    | 'respond_permission_v2' | 'fleet_spawn';
   text?: string;
   permissionId?: string;
   optionId?: string;
@@ -29,8 +30,27 @@ export interface ControlRequest {
   controller?: boolean;
   ownerChannel?: OwnerChannelManagementRequest;
   loop?: string;
+  // ── conversation v3 fields ──────────────────────────────────────────────────
+  /** Conversation cursor: replay strictly after this durable seq. */
+  after?: string;
+  limit?: number;
+  /** Idempotency key for v3 mutations. */
+  commandId?: string;
+  /** Browser-session digest recorded as the acting principal. */
+  actor?: string;
+  /** Server-stamped provenance. User-controlled text cannot set this field. */
+  source?: 'owner_admin_console';
+  /** Runner generation shown with a permission card. */
+  sessionGeneration?: string;
+  /** Typed managed-spawn request accepted only over the authenticated role control plane. */
   spawn?: SpawnOpts;
 }
+
+/** Commands that require protocol version 3. */
+const V3_COMMANDS = new Set<ControlRequest['command']>([
+  'conversation_page', 'conversation_follow', 'submit_prompt_v2', 'interrupt_v2',
+  'respond_permission_v2',
+]);
 
 export interface ControlResponse {
   version: 1;
@@ -162,6 +182,8 @@ export class RoleControlServer {
   private readonly socketPath: string;
   private readonly token: string;
   private readonly sockets = new Set<Socket>();
+  /** Interrupt idempotency: same command id returns the first receipt. */
+  private readonly interruptCommands = new Map<string, unknown>();
   private ownerChannel?: OwnerChannelHandle;
   private loopManager?: ScheduledLoopManagerHandle;
   private reloadConfig?: () => Promise<unknown>;
@@ -268,7 +290,7 @@ export class RoleControlServer {
       this.write(socket, { version: 1, id: '?', ok: false, error: 'invalid JSON' });
       return;
     }
-    if ((request.version !== 1 && request.version !== 2) || typeof request.id !== 'string'
+    if (![1, 2, 3].includes(request.version) || typeof request.id !== 'string'
         || !sameToken(this.token, request.token ?? '')) {
       this.write(socket, { version: 1, id: request.id ?? '?', ok: false, error: 'unauthorized' });
       return;
@@ -280,8 +302,12 @@ export class RoleControlServer {
           this.write(socket, {
             version: 1, id: request.id, ok: true,
             result: {
-              ...this.session.snapshot(), protocolVersion: 2,
-              features: ['events_since', 'observer_follow', 'retained_range'],
+              ...this.session.snapshot(),
+              protocolVersion: this.session.conversationPage ? 3 : 2,
+              features: [
+                'events_since', 'observer_follow', 'retained_range',
+                ...(this.session.conversationPage ? ['conversation_v3'] : []),
+              ],
             },
           });
           return;
@@ -397,6 +423,94 @@ export class RoleControlServer {
             if (!socket.destroyed) socket.write(JSON.stringify({ version: 1, event }) + '\n');
           }) };
         }
+        case 'conversation_page': {
+          this.requireConversation(request);
+          this.write(socket, {
+            version: 1, id: request.id, ok: true,
+            result: this.session.conversationPage!({
+              after: request.after, limit: request.limit,
+            }),
+          });
+          return;
+        }
+        case 'conversation_follow': {
+          this.requireConversation(request);
+          this.write(socket, {
+            version: 1, id: request.id, ok: true,
+            result: this.session.conversationPage!({
+              after: request.after, limit: request.limit,
+            }),
+          });
+          // A live conversation view is an attached controller: permission
+          // requests must reach it instead of the unattended policy.
+          const controller = request.controller !== false;
+          if (controller) this.session.setControllerAttached(true);
+          return { controller, stop: this.session.subscribeConversation!(event => {
+            if (!socket.destroyed)
+              socket.write(JSON.stringify({ version: 1, conversationEvent: event }) + '\n');
+          }) };
+        }
+        case 'submit_prompt_v2': {
+          this.requireConversation(request);
+          if (!request.commandId?.trim() || !request.text?.trim() || !request.actor?.trim()
+              || request.source !== 'owner_admin_console')
+            throw new SessionControlError('rejected',
+              'commandId, text, actor and authenticated source are required');
+          if (!this.session.submitPromptBrowser)
+            throw new SessionControlError('rejected', 'browser prompt admission is unavailable for this role');
+          try {
+            const receipt = await this.session.submitPromptBrowser({
+              commandId: request.commandId, text: request.text,
+              source: 'owner_admin_console', actorBrowserSession: request.actor,
+            });
+            this.write(socket, { version: 1, id: request.id, ok: true, result: receipt });
+          } catch (error) {
+            if ((error as Error).name === 'IdempotencyConflictError')
+              throw new SessionControlError('rejected',
+                'idempotency_conflict: this command id was used with a different prompt body');
+            throw error;
+          }
+          return;
+        }
+        case 'interrupt_v2': {
+          this.requireConversation(request);
+          if (!request.commandId?.trim())
+            throw new SessionControlError('rejected', 'commandId is required');
+          const existing = this.interruptCommands.get(request.commandId);
+          if (existing) {
+            this.write(socket, { version: 1, id: request.id, ok: true, result: existing });
+            return;
+          }
+          await this.session.interrupt('local-console');
+          const receipt = { accepted: true, commandId: request.commandId, at: new Date().toISOString() };
+          this.interruptCommands.set(request.commandId, receipt);
+          if (this.interruptCommands.size > 200) {
+            const oldest = this.interruptCommands.keys().next().value as string;
+            this.interruptCommands.delete(oldest);
+          }
+          this.write(socket, { version: 1, id: request.id, ok: true, result: receipt });
+          return;
+        }
+        case 'respond_permission_v2': {
+          this.requireConversation(request);
+          if (!request.commandId?.trim() || !request.permissionId?.trim()
+              || !request.optionId?.trim() || !request.sessionGeneration?.trim())
+            throw new SessionControlError('rejected',
+              'commandId, permissionId, optionId and sessionGeneration are required');
+          if (!this.session.respondPermissionV2)
+            throw new SessionControlError('rejected',
+              'generation-bound permission responses are unavailable for this role');
+          const result = this.session.respondPermissionV2(
+            request.permissionId, request.optionId, request.sessionGeneration);
+          if (result === 'stale')
+            throw new SessionControlError('rejected',
+              'stale_state: permission is settled, expired, invalid, or belongs to another session generation');
+          this.write(socket, {
+            version: 1, id: request.id, ok: true,
+            result: { accepted: true, commandId: request.commandId },
+          });
+          return;
+        }
       }
     } catch (error) {
       // Carry the session's own classification to the caller. Losing it here is
@@ -409,6 +523,14 @@ export class RoleControlServer {
         kind: error instanceof SessionControlError ? error.kind : 'backend',
       });
     }
+  }
+
+  /** Version and capability gate shared by every conversation v3 command. */
+  private requireConversation(request: ControlRequest): void {
+    if (request.version !== 3)
+      throw new SessionControlError('rejected', 'protocol version 3 is required for conversation commands');
+    if (!this.session.conversationPage || !this.session.subscribeConversation)
+      throw new SessionControlError('rejected', 'this role has no conversation ledger');
   }
 
   private write(socket: Socket, response: ControlResponse): void {
@@ -463,7 +585,7 @@ export async function controlRequest(
       socket.end();
     });
     socket.once('connect', () => socket.write(JSON.stringify({
-      version: 2, id, token, ...request,
+      version: V3_COMMANDS.has(request.command) ? 3 : 2, id, token, ...request,
     }) + '\n'));
   });
 }
@@ -491,7 +613,46 @@ export async function followControl(
     socket.once('error', reject);
   });
   const send = (request: Omit<ControlRequest, 'version' | 'id' | 'token'>) =>
-    socket.write(JSON.stringify({ version: 1, id: randomUUID(), token, ...request }) + '\n');
+    socket.write(JSON.stringify({
+      version: V3_COMMANDS.has(request.command) ? 3 : 1, id: randomUUID(), token, ...request,
+    }) + '\n');
   send({ command: 'follow', since: 0 });
   return { socket, send };
+}
+
+/**
+ * Open a live conversation follow on the role's private control socket. The
+ * first message is the initial page + snapshot; every subsequent message is
+ * `{ version, conversationEvent }`. Closing the socket detaches the
+ * controller-presence this connection contributed.
+ */
+export async function followConversation(
+  stateDir: string,
+  after: string | undefined,
+  onMessage: (message: Record<string, unknown>) => void,
+): Promise<{ socket: Socket; close(): void }> {
+  const token = readFileSync(controlTokenPath(stateDir), 'utf8').trim();
+  const socket = createConnection(controlSocketPath(stateDir));
+  socket.setEncoding('utf8');
+  let buffer = '';
+  socket.on('data', chunk => {
+    buffer += chunk;
+    for (;;) {
+      const newline = buffer.indexOf('\n');
+      if (newline < 0) break;
+      const line = buffer.slice(0, newline);
+      buffer = buffer.slice(newline + 1);
+      if (!line.trim()) continue;
+      try { onMessage(JSON.parse(line) as Record<string, unknown>); }
+      catch { /* a torn frame ends this stream; the client resyncs over HTTP */ }
+    }
+  });
+  await new Promise<void>((resolve, reject) => {
+    socket.once('connect', resolve);
+    socket.once('error', reject);
+  });
+  socket.write(JSON.stringify({
+    version: 3, id: randomUUID(), token, command: 'conversation_follow', after,
+  }) + '\n');
+  return { socket, close: () => socket.destroy() };
 }
