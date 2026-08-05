@@ -197,6 +197,18 @@ export class WebAuth {
     return count;
   }
 
+  /**
+   * Drop the request-rate counters.
+   *
+   * For a harness that drives many independent browser sessions against ONE
+   * long-lived server: the buckets are per-instance and per-minute, so a suite
+   * that bootstraps once per test eventually exhausts a limit that no real
+   * browser would come near, and the failure lands on whichever test happened
+   * to run eleventh. No HTTP route reaches this — `buildWebServer` never calls
+   * it, so a running console cannot have its limits cleared from outside.
+   */
+  clearRateLimits(): void { this.rates.clear(); }
+
   shutdown(): void { this.clearSessions(); }
 
   private createSession(deviceId: string): BrowserSession {

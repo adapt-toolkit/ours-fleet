@@ -86,6 +86,39 @@ describe('merged topology read model', () => {
   });
 });
 
+describe('graph membership', () => {
+  /** In the inventory only because its state directory outlived it. */
+  const departed = (id: string): RuntimeRoleItem => {
+    const item = roleItem(id, 'temporary');
+    return {
+      role: { ...item.role, configured: false },
+      status: {
+        ...item.status, overall: 'offline',
+        supervisor: { ...item.status.supervisor, liveness: 'stopped' },
+        session: { ...item.status.session, reachability: 'offline', readiness: 'failed' },
+      },
+    } as unknown as RuntimeRoleItem;
+  };
+
+  it('draws the fleet agents plus sketches, and no other identity', () => {
+    const inventory = [
+      roleItem('Alice', 'permanent', 'Ship safely'),
+      roleItem('LiveTemp', 'temporary'),
+      departed('tmp-1a2b3c'), departed('OldReviewer'),
+    ];
+    const merged = mergeTopology(fleet({ roles: [role('Alice', 'Ship safely')] }), inventory, drafted({
+      drafts: { nodes: [{ id: 'agent:Sketch', kind: 'agent', fields: { mission: 'Try things' } }], edges: [] },
+    } as Partial<TopologyDraft>));
+
+    expect(merged.nodes.map(node => node.id))
+      .toEqual(['agent:Alice', 'agent:LiveTemp', 'agent:Sketch']);
+    // The drafts are the only nodes the role inventory does not carry.
+    const inventoryIds = new Set(inventory.map(item => item.role.id));
+    for (const node of merged.nodes.filter(candidate => candidate.kind === 'agent'))
+      expect(node.origin === 'draft' || inventoryIds.has(node.label)).toBe(true);
+  });
+});
+
 describe('draft completeness', () => {
   const withDrafts = (nodes: unknown[], edges: unknown[] = [], config = fleet()) =>
     mergeTopology(config, [], drafted({ drafts: { nodes, edges } as TopologyDraft['drafts'] }));
