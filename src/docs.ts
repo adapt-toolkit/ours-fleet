@@ -33,9 +33,13 @@ configuration editor may create, change or remove any top-level block, including
 file may hold \`defaults:\`, \`watchdogs:\` and \`loops:\`; a fleet.d drop-in may
 declare \`roles:\` and nothing else. Unrecognised top-level keys are round-tripped
 untouched. Console edits are applied as surgical splices against the file's exact
-bytes, so unchanged lines keep their comments and spacing and an unchanged save is
-a byte-for-byte no-op; each save is revision-guarded, reviewed as a diff of the
-real file, validated by the real loader, and backed up next to the file first.
+bytes, so an unchanged save is byte-identical and lines outside the edit keep their
+comments and spacing. One exception: changing the length of a block sequence
+(\`watch:\`, \`oversee:\`, \`roles:\`, \`wake_sources:\`) may replace that collection
+wholesale and drop inline comments written on its items; lines outside that
+collection remain byte-preserved. Each save is revision-guarded, reviewed as a diff
+of the real file before anything is written, validated by the real loader, and
+backed up next to the file first.
 
 ## Lifecycle and console commands
 
