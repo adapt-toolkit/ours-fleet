@@ -5,7 +5,7 @@ import { RoleWorkspace } from './RoleWorkspace';
 import { isInactive, needsAttention, presentFleet } from './fleet-presentation';
 import { useLivePoll } from './use-live-poll';
 import { WatchdogDetail, WatchdogsView } from './Watchdogs';
-import { FleetTopology } from './FleetTopology';
+import { TopologyEditor } from './TopologyEditor';
 import { FleetSetup, type ConfigRead } from './FleetSetup';
 import type { Topology } from './topology-presentation';
 import { confirmAndRemoveRole } from './remove-role';
@@ -57,7 +57,9 @@ export function App() {
     setMeta(serverMeta);
     setTopology(graph);
     setConfiguration(config);
-    if (config.firstRun) setView('configuration');
+    // The graph is the primary configuration surface, including on an empty
+    // fleet; the step-by-step form stays available under Configure.
+
     setError('');
   }, []);
 
@@ -104,15 +106,6 @@ export function App() {
   const shown = useMemo(() => presentFleet(items, {
     filter, showInactive: view === 'fleet' && showInactive, attentionOnly: view === 'attention',
   }), [filter, items, showInactive, view]);
-  const visibleTopology = useMemo(() => {
-    const visibleAgents = new Set(shown.map(item => `agent:${item.role.id}`));
-    const nodes = topology.nodes.filter(node => node.kind !== 'agent' || visibleAgents.has(node.id));
-    const ids = new Set(nodes.map(node => node.id));
-    return {
-      nodes, edges: topology.edges.filter(edge => ids.has(edge.from) && ids.has(edge.to)),
-      unknownLineage: topology.unknownLineage.filter(name => visibleAgents.has(`agent:${name}`)),
-    };
-  }, [shown, topology]);
 
   if (!ready) return <main className="auth-screen">
     <div className="brand-wordmark">Ours</div>
@@ -196,9 +189,17 @@ export function App() {
                   {showInactive ? 'Hide inactive' : 'Show inactive'} ({inactiveCount})
                 </button>}</div>
             </div>
-            {view === 'fleet' && !filter && <FleetTopology topology={visibleTopology}
-              onAgent={setSelected} onWatchdog={name => { setSelectedWatchdog(name); setView('watchdogs'); }}
-              onRemove={name => void confirmAndRemoveRole(name).then(result => {
+            {/*
+              The graph is the fleet's configuration surface, so it shows the whole
+              configuration. "Show inactive" filters the role table below it: a role
+              that is configured but has never been started reads as inactive, and
+              hiding it here would make an agent disappear the moment it was added.
+            */}
+            {view === 'fleet' && !filter && <TopologyEditor topology={topology}
+              onRefresh={requestRefresh}
+              onOpenAgent={setSelected}
+              onOpenWatchdog={name => { setSelectedWatchdog(name); setView('watchdogs'); }}
+              onRemoveAgent={name => void confirmAndRemoveRole(name).then(result => {
                 if (result) { alert(`Removed ${name}. Recovery archive: ${result.recoveryPath}`); requestRefresh(); }
               }).catch(reason => setError((reason as Error).message))} />}
             <div className="role-table">

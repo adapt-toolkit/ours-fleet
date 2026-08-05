@@ -1,12 +1,62 @@
+export type MissingRequirement = { field: string; why: string; fix: string };
+
 export type TopologyNode = {
   id: string; kind: 'agent' | 'watchdog' | 'loop'; label: string; status: string;
   lifetime?: string; href?: string; detail?: string;
+  /** Present once the server serves the merged draft/config model. */
+  origin?: 'draft' | 'config';
+  valid?: boolean;
+  complete?: boolean;
+  launchable?: boolean;
+  missing?: MissingRequirement[];
+  position?: { x: number; y: number };
+  enabled?: boolean;
+  fields?: Record<string, string | number | boolean>;
 };
 export type TopologyEdge = {
   id: string; kind: 'oversees' | 'watches' | 'targets' | 'spawned';
   from: string; to: string; label: string;
+  origin?: 'draft' | 'config';
+  implicit?: boolean;
+  dangling?: boolean;
 };
-export type Topology = { nodes: TopologyNode[]; edges: TopologyEdge[]; unknownLineage: string[] };
+export type Topology = {
+  nodes: TopologyNode[]; edges: TopologyEdge[]; unknownLineage: string[];
+  problems?: Array<{ code: string; severity: string; detail: string }>;
+  draftRevision?: string;
+  draftWritable?: boolean;
+};
+
+/**
+ * What the node's badge says. Sketching is free, adding to the fleet is a
+ * reviewed write, and starting a process is a third, explicit action — the badge
+ * has to make which one is available obvious at a glance.
+ */
+export type NodeBadge = {
+  tone: 'draft-incomplete' | 'draft-ready' | 'configured' | 'running';
+  text: string;
+  detail: string;
+};
+
+export function badgeFor(node: TopologyNode): NodeBadge {
+  const missing = node.missing ?? [];
+  const detail = missing.map(item => `${item.why} ${item.fix}`).join(' ');
+  if (node.origin === 'draft') {
+    return missing.length
+      ? { tone: 'draft-incomplete', text: `Draft · needs ${missing.map(item => item.field).join(', ')}`, detail }
+      : { tone: 'draft-ready', text: 'Draft · ready to add', detail: 'Nothing runs until you add it to the fleet.' };
+  }
+  if (missing.length)
+    return { tone: 'draft-incomplete', text: `Configured · needs ${missing.map(item => item.field).join(', ')}`, detail };
+  if (node.status === 'ready' || node.status === 'active')
+    return { tone: 'running', text: node.status, detail: 'Running.' };
+  return { tone: 'configured', text: `Configured · ${node.status}`, detail: 'In the fleet configuration.' };
+}
+
+/** A sketch is never launchable, and neither is anything still missing a field. */
+export const canLaunch = (node: TopologyNode): boolean => node.launchable === true;
+export const canPromote = (node: TopologyNode): boolean =>
+  node.origin === 'draft' && node.complete === true && node.valid !== false;
 
 export const EDGE_LEGEND: Array<{ kind: TopologyEdge['kind']; label: string; description: string }> = [
   { kind: 'oversees', label: 'Oversight', description: 'A coordinator is responsible for checking this agent.' },
@@ -51,6 +101,24 @@ export function layoutTopology(topology: Topology): { nodes: PositionedNode[]; h
     ...node, x, y: 62 + index * ((height - 110) / Math.max(values.length, 1)),
   }));
   return { nodes: [...place(watchdogs, 80), ...place(orderedAgents, 410), ...place(loops, 750)], height };
+}
+
+/**
+ * The derived three-column layout, with any position the owner dragged winning.
+ *
+ * Falling back to the derived slot means a fleet that has never been arranged
+ * still renders as a readable graph rather than a pile at the origin, so
+ * dragging stays optional.
+ */
+export function layoutInteractive(topology: Topology): { nodes: PositionedNode[]; height: number } {
+  const derived = layoutTopology(topology);
+  let lowest = derived.height;
+  const nodes = derived.nodes.map(node => {
+    if (!node.position) return node;
+    lowest = Math.max(lowest, node.position.y + NODE_HEIGHT);
+    return { ...node, x: node.position.x, y: node.position.y };
+  });
+  return { nodes, height: Math.max(derived.height, lowest + 40) };
 }
 
 /** Card box in CSS pixels — mirrors `.topology-node` width/min-height in styles.css. */
