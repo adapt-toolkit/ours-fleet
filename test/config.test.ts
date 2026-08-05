@@ -42,7 +42,7 @@ describe('loadConfig', () => {
       // CIDs resolve to their canonical (lowercase) hex form.
       identity: 'Coordinator-owner', owners: [ownerOne.toLowerCase(), ownerTwo.toLowerCase()],
       agent: agent.toLowerCase(),
-      interrupt: false, progress_interval_ms: 30_000,
+      interrupt: false, progress_interval_ms: 30_000, comments: true,
       attachments: {
         enabled: true, max_files_per_request: 4, max_file_bytes: 10 * 1024 * 1024,
         max_request_bytes: 20 * 1024 * 1024, retention_ms: 24 * 60 * 60 * 1_000,
@@ -103,6 +103,36 @@ describe('loadConfig', () => {
       '',
     ].join('\n'));
     expect(() => loadConfig()).toThrow(/shared by roles 'A' and 'B'/);
+  });
+
+  it('defaults live ACP comments on, merges a defaults-level value, and validates the type', () => {
+    // Backward compatibility: an existing owner_channel with no `comments` key
+    // must keep relaying live commentary exactly as it did before the setting.
+    base('roles:\n  A:\n    session: acp\n    owner_channel: { identity: A-owner, owners: [cid] }\n');
+    expect(findRole(loadConfig(), 'A').owner_channel?.comments).toBe(true);
+
+    base('roles:\n  A:\n    session: acp\n    owner_channel: { identity: A-owner, owners: [cid], comments: false }\n');
+    expect(findRole(loadConfig(), 'A').owner_channel?.comments).toBe(false);
+
+    // defaults.owner_channel supplies the baseline; the role overrides it.
+    base([
+      'defaults:',
+      '  owner_channel:',
+      '    comments: false',
+      'roles:',
+      '  A: { session: acp, owner_channel: { identity: A-owner, owners: [cid] } }',
+      '  B: { session: acp, owner_channel: { identity: B-owner, owners: [cid], comments: true } }',
+      '',
+    ].join('\n'));
+    expect(findRole(loadConfig(), 'A').owner_channel?.comments).toBe(false);
+    expect(findRole(loadConfig(), 'B').owner_channel?.comments).toBe(true);
+
+    for (const bad of ['comments: yes', 'comments: 1', 'comments: "true"', 'comments: null']) {
+      base(`roles:\n  A:\n    session: acp\n    owner_channel: { identity: A-owner, owners: [cid], ${bad} }\n`);
+      expect(() => loadConfig()).toThrow(/owner_channel\.comments must be true or false/);
+    }
+    base('roles:\n  A:\n    session: acp\n    owner_channel: { identity: A-owner, owners: [cid], comment: false }\n');
+    expect(() => loadConfig()).toThrow(/unknown key\(s\) comment/);
   });
 
   it('deep-merges and validates owner attachment policy', () => {

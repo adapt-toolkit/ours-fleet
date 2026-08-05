@@ -62,6 +62,8 @@ roles:
     #   owners: [replace-with-your-owner-contact-cid]
     #   interrupt: false
     #   progress_interval_ms: 30000
+    #   comments: true          # relay live "🟡 Live update:" ACP commentary;
+    #                           # restart baseline for the /comments command
     #   attachments:
     #     enabled: true
     #     max_files_per_request: 4

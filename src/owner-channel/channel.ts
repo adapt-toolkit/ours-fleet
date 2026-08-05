@@ -16,7 +16,10 @@ import {
 } from './commands.js';
 import type { ManagedFleetSpawnResult } from '../fleet-proxy.js';
 import { OursMcpClient, type OursToolClient } from './mcp.js';
-import { ownerNotices, type OwnerProgressPhase, type OwnerUpdatePhase } from './notices.js';
+import {
+  ownerNotices,
+  type OwnerCommentsState, type OwnerProgressPhase, type OwnerUpdatePhase,
+} from './notices.js';
 import {
   DuplicateSendError, OwnerAuthorizationState, OwnerChannelState, OwnerConversationState,
   type OwnerEntry,
@@ -171,6 +174,14 @@ export class OwnerChannel implements OwnerChannelHandle {
   private readonly inFlight = new Set<string>();
   /** Wires already NACKed to the managed agent, so a deferred replay stays quiet. */
   private readonly relayNacks = new Set<string>();
+  /**
+   * fleet.yaml declares the restart baseline; `/comments on|off` changes only
+   * this process's effective value. The override is deliberately memory-only: a
+   * restart must return to the reviewed, checked-in configuration rather than to
+   * an unreviewable file that could silently keep an owner's channel quiet.
+   */
+  private readonly commentsBaseline: boolean;
+  private commentsEnabled: boolean;
   private stopping = false;
   private watchProcess?: ChildProcessWithoutNullStreams;
   private watchTask?: Promise<void>;
@@ -198,6 +209,10 @@ export class OwnerChannel implements OwnerChannelHandle {
     this.attachmentRecovery = new AttachmentRecoveryState(
       join(options.stateDir, '.owner-channel-attachment-recovery.json'));
     this.attachmentRoot = join(options.stateDir, '.owner-channel-inbox');
+    // An absent key is a pre-`comments` configuration, which relayed live
+    // commentary; only an explicit `false` turns it off.
+    this.commentsBaseline = options.config.comments !== false;
+    this.commentsEnabled = this.commentsBaseline;
     this.attachmentConfig = options.config.attachments ?? {
       enabled: true, max_files_per_request: 4, max_file_bytes: 10 * 1024 * 1024,
       max_request_bytes: 20 * 1024 * 1024, retention_ms: 24 * 60 * 60 * 1_000,
@@ -955,6 +970,14 @@ export class OwnerChannel implements OwnerChannelHandle {
       interrupt: () => this.options.session.interrupt('owner'),
       runHarnessCommand: command => this.runHarnessCommand(sender, command, wireId),
       restart: mode => this.restartSelf(sender, mode, wireId),
+      comments: () => this.commentsState(),
+      setComments: enabled => {
+        this.commentsEnabled = enabled;
+        this.options.log(`[${this.options.role}] owner channel live comments `
+          + `${enabled ? 'enabled' : 'disabled'} by owner command `
+          + `(fleet.yaml baseline ${this.commentsBaseline ? 'on' : 'off'})`);
+        return this.commentsState();
+      },
       fleetList: () => this.fleetOps.list(),
       recentEvents: limit => this.options.session.eventsSince(0).slice(-limit),
       readWorklogTail: maxChars => this.readWorklogTail(maxChars),
@@ -1300,7 +1323,9 @@ export class OwnerChannel implements OwnerChannelHandle {
       active.commentaryTimer = undefined;
       const text = active.commentaryBuffer.trim();
       active.commentaryBuffer = '';
-      if (!text || active.commentaryDisabled || active.finalizing) return;
+      // Re-checked at flush time so `/comments off` mid-turn also discards a
+      // batch that was buffered while relaying was still on.
+      if (!text || !this.commentsEnabled || active.commentaryDisabled || active.finalizing) return;
       if (active.commentaryCount >= COMMENTARY_MAX_UPDATES) {
         active.commentaryDisabled = true;
         return;
@@ -1329,7 +1354,7 @@ export class OwnerChannel implements OwnerChannelHandle {
           try {
             if (!this.isEffectiveOwner(active.contact))
               throw new Error('initiating owner is no longer authorized');
-            await this.send(active.contact, safe, active.wireId);
+            await this.send(active.contact, ownerNotices.comment(safe), active.wireId);
           } catch {
             this.conversations.finishSend(sending.id, 'uncertain');
             throw new Error('ACP commentary delivery outcome is uncertain');
@@ -1340,7 +1365,8 @@ export class OwnerChannel implements OwnerChannelHandle {
     };
 
     const acceptCommentary = (event: SessionEvent) => {
-      if (active.commentaryDisabled || active.finalizing || event.turnId !== queued.promptId
+      if (!this.commentsEnabled
+          || active.commentaryDisabled || active.finalizing || event.turnId !== queued.promptId
           || event.kind !== 'agent_text' || event.messagePhase !== 'commentary'
           || event.replayed || event.origin?.kind !== 'owner'
           || event.origin.requestId !== active.requestId
@@ -1446,6 +1472,15 @@ export class OwnerChannel implements OwnerChannelHandle {
     if (result.succeeded) await this.sendAttachments(active.contact, outbox, active.wireId);
     else await rm(outbox, { recursive: true, force: true });
     for (const wire of active.handledWireIds) this.state.remember(wire);
+  }
+
+  private commentsState(): OwnerCommentsState {
+    return {
+      enabled: this.commentsEnabled,
+      baseline: this.commentsBaseline,
+      // Only the ACP backend emits the phase marker commentary relaying needs.
+      supported: this.options.session.backend === 'acp',
+    };
   }
 
   /** Model-authored commentary only; raw protocol/tool data never reaches here. */

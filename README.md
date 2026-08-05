@@ -331,6 +331,8 @@ roles:
       agent: managed-agent-cid           # exact role CID allowed to relay messages/files outward
       interrupt: false                  # false queues; true cancels current work first
       progress_interval_ms: 30000        # fleet-generated progress notices; 0 disables
+      comments: true                    # relay live "🟡 Live update:" ACP commentary (default true);
+                                        #   restart baseline for /comments on|off
       attachments:                      # secure inbound documents, images, and voice
         enabled: true
         max_files_per_request: 4         # 1..32; rejected from metadata before retrieval
@@ -674,7 +676,8 @@ An owner request follows one ordered lifecycle on its authenticated source wire:
 2. Periodic fleet-generated summaries may report allowlisted ACP activity shapes.
 3. On maintained Codex ACP adapters, assistant chunks carrying the exact
    `_meta.codex.phase = "commentary"` marker are automatically batched and forwarded
-   on this request's fixed owner CID/source wire. Unknown or absent phases are never
+   on this request's fixed owner CID/source wire, each prefixed with the single
+   stable label `🟡 Live update:`. Unknown or absent phases are never
    inferred as commentary; thoughts, tools, permissions, prompts, and raw events are
    excluded by event kind. Older adapters therefore retain final-only behavior.
 4. The agent may also send any non-final or out-of-turn message through its
@@ -697,6 +700,19 @@ fail closed. Commentary plaintext buffers and fragment keys are memory-only; bou
 wire-and-batch digests plus sending/delivered/uncertain status are persisted before
 transport. Thus reconnect replay and crash recovery never blindly resend the same
 batch, while an uncertain in-flight update may be omitted rather than duplicated.
+The `🟡 Live update:` label is fleet-authored and applied after those safety
+checks, so model content can never remove or forge it, and it is presentation
+only — dedupe still keys on the unlabeled batch.
+
+Live comments are configurable. `owner_channel.comments` (default `true`, so an
+existing channel keeps relaying exactly as before) is the **restart baseline**.
+The deterministic `/comments [status|on|off]` command changes only the running
+session's effective value and is deliberately **not** persisted: a restart
+returns to the checked-in configuration rather than to an unreviewable state
+file that could silently keep an owner's channel quiet. `/comments status`
+reports the live value, the baseline, and whether this session's backend emits
+live comments at all. Turning comments off suppresses only the labeled messages
+— receipts, progress notices, attachments, and the final answer are unaffected.
 
 Fleet chooses the stored latest authenticated owner for every managed-agent
 message; the model supplies only text and the channel contact. Relay audit logs
@@ -753,6 +769,7 @@ whole registration step for a new command.
 | --- | --- |
 | `/help` (alias `/commands`) | list all deterministic owner-channel commands |
 | `/status` | report the agent's session state |
+| `/comments [status\|on\|off]` | report or change relaying of the agent's live `🟡 Live update:` messages for this session (fleet.yaml is the restart baseline) |
 | `/interrupt` | cancel the agent's active turn |
 | `/clear` | clear the agent's session context |
 | `/compact` | compact the agent's session context |
@@ -766,10 +783,11 @@ whole registration step for a new command.
 
 Implementation strategies differ but every command is deterministic:
 
-- `/help`, `/status`, `/interrupt`, `/peek`, `/worklog`, and `/version` are
-  answered by the supervisor directly. `/peek` deliberately reports event
-  *shapes* (kind, tool title, status) and never thought, agent-text, or tool
-  output bodies.
+- `/help`, `/status`, `/comments`, `/interrupt`, `/peek`, `/worklog`, and
+  `/version` are answered by the supervisor directly. `/peek` deliberately
+  reports event *shapes* (kind, tool title, status) and never thought,
+  agent-text, or tool output bodies. `/comments` changes only this running
+  session; `owner_channel.comments` stays the restart baseline.
 - `/clear`, `/compact`, and `/model` deliver the raw slash text to the agent
   harness, but only when the bundled ACP adapter for the role's harness
   verifiably executes that command locally (pinned per harness in

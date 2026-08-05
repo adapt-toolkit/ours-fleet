@@ -3,6 +3,24 @@ import type { OwnerTaskPhase } from './tasks.js';
 
 export type OwnerUpdatePhase = 'working' | 'approval' | 'blocked';
 
+/**
+ * The one conspicuous, stable prefix every relayed ACP live comment carries, so
+ * an owner can tell at a glance exactly which messages `/comments` controls.
+ * It is fleet-authored and applied after the commentary safety checks, so it can
+ * never be spoofed away by model content.
+ */
+export const OWNER_COMMENT_LABEL = '🟡 Live update:';
+
+/** Effective live-comment relay state of one running owner channel. */
+export interface OwnerCommentsState {
+  /** Live effective value for this running session. */
+  enabled: boolean;
+  /** The fleet.yaml `owner_channel.comments` value, restored on every restart. */
+  baseline: boolean;
+  /** False when this session's backend never emits ACP commentary at all. */
+  supported: boolean;
+}
+
 export type OwnerProgressPhase =
   | 'starting request'
   | 'waiting behind earlier requests'
@@ -99,6 +117,18 @@ export const ownerNotices = {
       : 'no new reportable activity since the last update.';
     return `⏳ Working for ${duration(elapsedMs)} · ${phase} · ${activity}`;
   },
+
+  /** The labeled form of one relayed ACP live comment. */
+  comment: (message: string) => `${OWNER_COMMENT_LABEL} ${message}`,
+
+  comments: (state: OwnerCommentsState) =>
+    `🟡 Live updates are ${state.enabled ? 'ON' : 'OFF'} for this session `
+    + `(fleet.yaml baseline: ${state.baseline ? 'on' : 'off'}`
+    + `${state.enabled === state.baseline ? '' : ', changed by /comments'}). `
+    + (state.supported
+      ? `They are the "${OWNER_COMMENT_LABEL}" messages sent while a request runs; `
+      : 'This session never emits them, so the setting has no effect here; ')
+    + 'the final answer is always delivered. A restart returns to the baseline.',
 
   authoredUpdate: (phase: OwnerUpdatePhase, message: string) => {
     switch (phase) {
