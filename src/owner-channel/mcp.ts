@@ -24,7 +24,17 @@ export class OursMcpClient implements OursToolClient {
 
   async start(): Promise<void> {
     if (this.child && this.child.exitCode === null) return;
-    const child = spawn(this.command, ['proxy'], {
+    // ours-mcp normally records the long-lived client PID so an identity lease
+    // survives connector churn. An owner-channel connector has the opposite
+    // lifecycle: each supervised attempt owns a fresh connector and must make
+    // its lease reclaimable when that connector exits, even though the fleet
+    // supervisor itself remains alive. POSIX exec preserves the shell PID as
+    // the proxy PID, giving the daemon an exact process-lifetime fence without
+    // interpolating the command path into shell text.
+    const child = spawn('/bin/sh', [
+      '-c', 'OURS_CLIENT_PID=$$; export OURS_CLIENT_PID; exec "$1" "$2"',
+      'ours-fleet-owner-proxy', this.command, 'proxy',
+    ], {
       env: {
         ...process.env,
         ...this.env,
@@ -39,6 +49,9 @@ export class OursMcpClient implements OursToolClient {
       child.once('error', reject);
     });
     this.child = child;
+    child.once('exit', (code, signal) => {
+      this.log(`ours-mcp proxy launcher exited (${code ?? signal ?? 'unknown'})`);
+    });
     child.stdin.on('error', error => this.log(`ours-mcp stdin: ${error.message}`));
     createInterface({ input: child.stderr }).on('line', line => this.log(`ours-mcp: ${line}`));
     try {
@@ -71,9 +84,8 @@ export class OursMcpClient implements OursToolClient {
     const child = this.child;
     this.child = undefined;
     if (!child || child.exitCode !== null) return;
-    // EOF lets the proxy close its HTTP MCP transport and release the daemon
-    // lease explicitly. SIGTERM used to leave that release racing the next
-    // supervised start, which is the owner-channel collision this path guards.
+    // EOF asks the proxy to close normally. Once this exact process exits, the
+    // daemon can reclaim its lease even while the supervisor stays alive.
     child.stdin.end();
     const exited = await new Promise<boolean>(resolve => {
       const timer = setTimeout(() => resolve(false), 1_000);
