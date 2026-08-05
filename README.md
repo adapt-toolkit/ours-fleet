@@ -674,15 +674,30 @@ An owner request follows one ordered lifecycle on its authenticated source wire:
 3. The agent may send any non-final message to the channel identity through its
    ordinary ours MCP tool. CID authentication is the message gate; no task ID,
    request ID, phase, reply reference, or routing command is used.
-4. Fleet independently emits exactly one final ACP
-   response (or a sanitized terminal outcome). Successful turns send regular files
-   from the request outbox afterward, correlated to the same source wire.
+4. The agent may send a caption and one or more files to the channel identity.
+   A reply reference selects the authenticated owner of that exact source wire;
+   an uncorrelated group uses the latest authenticated owner (or the sole-owner
+   fallback). Fleet resolves that route once, admits every file before emitting
+   any part, then sends the caption and files to the same owner on the same route.
+5. Fleet independently emits exactly one final ACP response (or a sanitized
+   terminal outcome). Successful owner-request turns send regular files from the
+   request outbox afterward, correlated to the same source wire.
 
 Fleet chooses the stored latest authenticated owner for every managed-agent
 message; the model supplies only text and the channel contact. Relay audit logs
 contain hashed wire prefixes and sizes, never bodies. A durable pre-send marker
 prevents blind replay after an ambiguous transport outcome. `/interrupt` remains
 an owner-only supervisor command and does not change the outbound relay contract.
+
+Managed-agent caption/file groups have one admission and delivery boundary.
+Fleet authenticates every group member, fixes one owner route before retrieval,
+and validates all selected bytes before sending the caption or any file. A
+correlated source wire never falls back to a different owner. Missing routes stay
+queued without byte retrieval and produce at most one bounded correlated notice
+per running bridge. Policy or admission rejection consumes the entire group and
+sends one correlated NACK. Once outbound emission starts, any transport error is
+recorded as terminal uncertain delivery: the whole group is consumed and never
+blind-retried, because some parts may already have reached the owner.
 
 Background work must not keep an ACP turn open. The agent can finalize, return to
 idle, verify the later result on a future wake, and send the result to the same
@@ -787,9 +802,13 @@ Request files are removed after final delivery and stale directories are removed
 after `retention_ms`. A bounded mode-0600 recovery journal stores only owner CID
 and wire routing metadata—never filenames, paths, captions, transcripts, or file
 bytes. If ours-mcp already marked a selected file processed when fleet restarts,
-fleet resumes only that journaled wire with `save_file`; recovered voice is
-explicitly marked transcript-unavailable. Corrupt recovery state disables
-attachment admission. The host must run an ours-mcp version whose
+fleet resumes only that journaled wire with `save_file`; a deferred managed-agent
+caption is replayed with its journaled processed files before the group is
+admitted or relayed. Conversation route state migrates from v1 to a bounded v2
+source-wire index so a correlated group keeps the authenticated owner selected by
+its original request even after later owner traffic. Recovered voice is explicitly
+marked transcript-unavailable. Corrupt recovery state disables attachment
+admission. The host must run an ours-mcp version whose
 `list_incoming_files`, selective `get_files`, and `save_file` schemas support
 these guarantees; `ours-mcp voice-status --json` reports whether transcription
 is currently configured.

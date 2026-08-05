@@ -15,6 +15,7 @@ import {
 } from '../src/owner-channel/attachments.js';
 import { OwnerChannel } from '../src/owner-channel/channel.js';
 import type { OursToolClient } from '../src/owner-channel/mcp.js';
+import { OwnerConversationState } from '../src/owner-channel/state.js';
 import type { QueuedPrompt, SessionHandle, TurnResult } from '../src/session/types.js';
 
 const OWNER = 'A'.repeat(64);
@@ -34,6 +35,7 @@ class AttachmentClient implements OursToolClient {
   files: unknown[] = [];
   retrieved = new Map<string, Record<string, unknown>>();
   failText?: string;
+  failFile = false;
   async start() {}
   async close() {}
   async callTool(name: string, args?: Record<string, unknown>): Promise<unknown> {
@@ -50,6 +52,7 @@ class AttachmentClient implements OursToolClient {
       return { saved: true };
     }
     if (name === 'send_message' && args?.text === this.failText) throw new Error('transport unavailable');
+    if (name === 'send_file' && this.failFile) throw new Error('file transport unavailable');
     return {};
   }
 }
@@ -80,9 +83,12 @@ function deferredPrompt() {
   return { queued, finish };
 }
 
-async function setup(owners = [OWNER], recover = false, attachments = attachmentConfig) {
-  const dir = mkdtempSync(join(tmpdir(), 'ours-owner-attachments-'));
-  dirs.push(dir);
+async function setup(
+  owners = [OWNER], recover = false, attachments = attachmentConfig, agent?: string,
+  existingDir?: string,
+) {
+  const dir = existingDir ?? mkdtempSync(join(tmpdir(), 'ours-owner-attachments-'));
+  if (!existingDir) dirs.push(dir);
   const client = new AttachmentClient();
   const pending = deferredPrompt();
   const queuePrompt = vi.fn(async () => pending.queued);
@@ -93,7 +99,7 @@ async function setup(owners = [OWNER], recover = false, attachments = attachment
   } as unknown as SessionHandle;
   const config: OwnerChannelConfig = {
     identity: 'Role-owner', owners, interrupt: false, progress_interval_ms: 0,
-    attachments,
+    attachments, ...(agent ? { agent } : {}),
   };
   if (recover) new AttachmentRecoveryState(join(dir, '.owner-channel-attachment-recovery.json')).add({
     id: createHash('sha256').update(FILE_WIRE).digest('hex'), contact: OWNER,
@@ -212,6 +218,275 @@ describe('owner-channel attachment ingress', () => {
     await overCount.channel.close();
   });
 
+  it('uses one source-wire owner route for a managed-agent caption and its file', async () => {
+    const AGENT = 'C'.repeat(64);
+    const status = await setup([OWNER, OTHER], false, attachmentConfig, AGENT);
+    const ownerWire = '9'.repeat(64);
+    const laterWire = '8'.repeat(64);
+    status.client.batches.push([{
+      msg_id: 12, wire_id: ownerWire, from: { id: OWNER, name: 'Phone' }, text: '/status',
+    }], [{
+      msg_id: 13, wire_id: laterWire, from: { id: OTHER, name: 'Laptop' }, text: '/status',
+    }], []);
+    await status.channel.drain();
+
+    const bytes = Buffer.from('correlated report');
+    const source = join(status.dir, 'agent-report');
+    writeFileSync(source, bytes);
+    const caption = {
+      msg_id: 14, wire_id: CAPTION_WIRE, from: { id: AGENT, name: 'Role' },
+      text: 'Attached report.', reply_to: { wire_id: ownerWire },
+    };
+    status.client.batches.push([caption], []);
+    status.client.files = [listed({
+      from: { id: AGENT, name: 'Role' }, filename: 'report.txt', size: bytes.length,
+      reply_to: { wire_id: CAPTION_WIRE },
+    })];
+    status.client.retrieved.set(FILE_WIRE, retrieved(source, bytes, {
+      from: { id: AGENT, name: 'Role' }, filename: 'report.txt',
+      reply_to: { wire_id: CAPTION_WIRE },
+    }));
+
+    await status.channel.drain();
+
+    expect(status.queuePrompt).not.toHaveBeenCalled();
+    expect(status.client.calls).toContainEqual({ name: 'send_message', args: {
+      contact: OWNER, text: 'Attached report.', reply_to_wire_id: ownerWire,
+    } });
+    expect(status.client.calls).toContainEqual({ name: 'send_file', args: {
+      contact: OWNER, path: expect.any(String), filename: 'report.txt',
+      reply_to_wire_id: ownerWire,
+    } });
+    expect(status.client.calls.filter(call =>
+      call.args?.text === 'Attached report.' || call.name === 'send_file')
+      .every(call => call.args?.contact === OWNER)).toBe(true);
+    await status.channel.close();
+  });
+
+  it('records an owner attachment wire as the route for a later managed-agent file reply', async () => {
+    const AGENT = 'C'.repeat(64);
+    const status = await setup([OWNER, OTHER], false, attachmentConfig, AGENT);
+    const ownerBytes = Buffer.from('owner request');
+    const ownerSource = join(status.dir, 'owner-request');
+    writeFileSync(ownerSource, ownerBytes);
+    status.client.files = [listed({ size: ownerBytes.length, filename: 'request.txt' })];
+    status.client.retrieved.set(FILE_WIRE, retrieved(ownerSource, ownerBytes, {
+      filename: 'request.txt',
+    }));
+    await status.channel.drain();
+    status.finish({ accepted: true, outcome: 'completed', succeeded: true, output: 'Working.' });
+    await vi.waitFor(() => expect(status.client.calls.some(call => call.args?.text === 'Working.'))
+      .toBe(true));
+
+    status.client.files = [];
+    status.client.batches.push([{
+      msg_id: 21, wire_id: '8'.repeat(64), from: { id: OTHER, name: 'Laptop' }, text: '/status',
+    }], []);
+    await status.channel.drain();
+
+    const agentWire = '6'.repeat(64);
+    const agentBytes = Buffer.from('agent response');
+    const agentSource = join(status.dir, 'agent-response');
+    writeFileSync(agentSource, agentBytes);
+    status.client.files = [listed({
+      file_id: 9, wire_id: agentWire, from: { id: AGENT, name: 'Role' },
+      size: agentBytes.length, filename: 'response.txt', reply_to: { wire_id: FILE_WIRE },
+    })];
+    status.client.retrieved.set(agentWire, retrieved(agentSource, agentBytes, {
+      file_id: 9, wire_id: agentWire, from: { id: AGENT, name: 'Role' },
+      filename: 'response.txt', reply_to: { wire_id: FILE_WIRE },
+    }));
+
+    await status.channel.drain();
+
+    expect(status.client.calls.find(call => call.name === 'send_file')?.args).toMatchObject({
+      contact: OWNER, filename: 'response.txt', reply_to_wire_id: FILE_WIRE,
+    });
+    await status.channel.close();
+  });
+
+  it('routes an uncorrelated managed-agent file to the latest authenticated owner', async () => {
+    const AGENT = 'C'.repeat(64);
+    const status = await setup([OWNER, OTHER], false, attachmentConfig, AGENT);
+    status.client.batches.push([{
+      msg_id: 18, wire_id: '9'.repeat(64), from: { id: OTHER, name: 'Laptop' }, text: '/status',
+    }], []);
+    await status.channel.drain();
+    const bytes = Buffer.from('proactive report');
+    const source = join(status.dir, 'proactive-report');
+    writeFileSync(source, bytes);
+    status.client.files = [listed({
+      from: { id: AGENT, name: 'Role' }, size: bytes.length, filename: 'idea.txt',
+    })];
+    status.client.retrieved.set(FILE_WIRE, retrieved(source, bytes, {
+      from: { id: AGENT, name: 'Role' }, filename: 'idea.txt',
+    }));
+
+    await status.channel.drain();
+
+    expect(status.client.calls.find(call => call.name === 'send_file')?.args).toMatchObject({
+      contact: OTHER, filename: 'idea.txt',
+    });
+    expect(status.client.calls.find(call => call.name === 'send_file')?.args)
+      .not.toHaveProperty('reply_to_wire_id');
+    await status.channel.close();
+  });
+
+  it('keeps an unknown correlated agent file queued and emits only one correlated NACK', async () => {
+    const AGENT = 'C'.repeat(64);
+    const status = await setup([OWNER, OTHER], false, attachmentConfig, AGENT);
+    const unknownWire = '7'.repeat(64);
+    status.client.files = [listed({
+      from: { id: AGENT, name: 'Role' }, reply_to: { wire_id: unknownWire },
+    })];
+
+    await status.channel.drain();
+    await status.channel.drain();
+
+    expect(status.client.calls.some(call => call.name === 'get_files')).toBe(false);
+    expect(status.client.calls.some(call => call.name === 'send_file')).toBe(false);
+    expect(status.client.calls.filter(call => call.name === 'send_message')).toEqual([{
+      name: 'send_message', args: {
+        contact: AGENT, text: expect.stringContaining('queued'), reply_to_wire_id: FILE_WIRE,
+      },
+    }]);
+    expect(status.logs.join('\n')).toContain('no authenticated owner route matches the source wire');
+    await status.channel.close();
+  });
+
+  it('admits a managed-agent file before emitting its caption and NACKs the whole rejection', async () => {
+    const AGENT = 'C'.repeat(64);
+    const status = await setup([OWNER], false, attachmentConfig, AGENT);
+    const ownerWire = '9'.repeat(64);
+    status.client.batches.push([{
+      msg_id: 15, wire_id: ownerWire, from: { id: OWNER, name: 'Phone' }, text: '/status',
+    }], []);
+    await status.channel.drain();
+
+    const bytes = Buffer.from('not the declared bytes');
+    const source = join(status.dir, 'agent-bad-report');
+    writeFileSync(source, bytes);
+    const caption = {
+      msg_id: 16, wire_id: CAPTION_WIRE, from: { id: AGENT, name: 'Role' },
+      text: 'Do not emit me alone.', reply_to: { wire_id: ownerWire },
+    };
+    status.client.batches.push([caption], []);
+    status.client.files = [listed({
+      from: { id: AGENT, name: 'Role' }, filename: 'report.txt', size: bytes.length,
+      reply_to: { wire_id: CAPTION_WIRE },
+    })];
+    status.client.retrieved.set(FILE_WIRE, {
+      ...retrieved(source, bytes, {
+        from: { id: AGENT, name: 'Role' }, filename: 'report.txt',
+        reply_to: { wire_id: CAPTION_WIRE },
+      }),
+      sha256: '0'.repeat(64),
+    });
+
+    await status.channel.drain();
+
+    expect(status.client.calls.some(call => call.args?.text === 'Do not emit me alone.')).toBe(false);
+    expect(status.client.calls.some(call => call.name === 'send_file')).toBe(false);
+    expect(status.client.calls).toContainEqual({ name: 'send_message', args: {
+      contact: AGENT, text: expect.stringContaining('not relayed'),
+      reply_to_wire_id: CAPTION_WIRE,
+    } });
+    status.client.batches.push([caption], []);
+    await status.channel.drain();
+    expect(status.client.calls.filter(call => call.args?.contact === AGENT
+      && String(call.args?.text).includes('not relayed'))).toHaveLength(1);
+    expect(status.client.calls.some(call => call.args?.text === 'Do not emit me alone.')).toBe(false);
+    await status.channel.close();
+  });
+
+  it('replays a deferred caption with a journaled processed managed-agent file after restart', async () => {
+    const AGENT = 'C'.repeat(64);
+    const ownerWire = '9'.repeat(64);
+    const dir = mkdtempSync(join(tmpdir(), 'ours-owner-agent-recovery-'));
+    dirs.push(dir);
+    new OwnerConversationState(join(dir, '.owner-channel-conversations.json'))
+      .recordInbound(OWNER, ownerWire, 100);
+    new AttachmentRecoveryState(join(dir, '.owner-channel-attachment-recovery.json')).add({
+      id: '7'.repeat(64), contact: AGENT, originWireId: CAPTION_WIRE,
+      fileWireIds: [FILE_WIRE], createdAt: Date.now(),
+    });
+    const bytes = Buffer.from('recovered report');
+    const source = join(dir, 'processed-agent-report');
+    writeFileSync(source, bytes);
+
+    const status = await setup([OWNER], false, attachmentConfig, AGENT, dir);
+    status.client.batches.push([{
+      msg_id: 17, wire_id: CAPTION_WIRE, from: { id: AGENT, name: 'Role' },
+      text: 'Recovered caption.', reply_to: { wire_id: ownerWire },
+    }], []);
+    status.client.files = [listed({
+      from: { id: AGENT, name: 'Role' }, filename: 'recovered.txt', size: bytes.length,
+      status: 'processed', reply_to: { wire_id: CAPTION_WIRE },
+    })];
+    status.client.retrieved.set(FILE_WIRE, retrieved(source, bytes, {
+      from: { id: AGENT, name: 'Role' }, filename: 'recovered.txt',
+      status: 'processed', reply_to: { wire_id: CAPTION_WIRE },
+    }));
+
+    await status.channel.drain();
+
+    expect(status.client.calls).toContainEqual({
+      name: 'save_file', args: { wire_id: FILE_WIRE, dest_path: expect.any(String) },
+    });
+    expect(status.client.calls).toContainEqual({ name: 'send_message', args: {
+      contact: OWNER, text: 'Recovered caption.', reply_to_wire_id: ownerWire,
+    } });
+    expect(status.client.calls.find(call => call.name === 'send_file')?.args)
+      .toMatchObject({ contact: OWNER, filename: 'recovered.txt', reply_to_wire_id: ownerWire });
+    expect(JSON.parse(readFileSync(join(dir,
+      '.owner-channel-attachment-recovery.json'), 'utf8')).pending).toEqual([]);
+    await status.channel.close();
+  });
+
+  it('makes a partially emitted caption/file transaction terminal and suppresses replay', async () => {
+    const AGENT = 'C'.repeat(64);
+    const status = await setup([OWNER], false, attachmentConfig, AGENT);
+    const ownerWire = '9'.repeat(64);
+    status.client.batches.push([{
+      msg_id: 19, wire_id: ownerWire, from: { id: OWNER, name: 'Phone' }, text: '/status',
+    }], []);
+    await status.channel.drain();
+    const bytes = Buffer.from('uncertain report');
+    const source = join(status.dir, 'uncertain-report');
+    writeFileSync(source, bytes);
+    const caption = {
+      msg_id: 20, wire_id: CAPTION_WIRE, from: { id: AGENT, name: 'Role' },
+      text: 'May have been delivered.', reply_to: { wire_id: ownerWire },
+    };
+    status.client.batches.push([caption], []);
+    status.client.files = [listed({
+      from: { id: AGENT, name: 'Role' }, filename: 'uncertain.txt', size: bytes.length,
+      reply_to: { wire_id: CAPTION_WIRE },
+    })];
+    status.client.retrieved.set(FILE_WIRE, retrieved(source, bytes, {
+      from: { id: AGENT, name: 'Role' }, filename: 'uncertain.txt',
+      reply_to: { wire_id: CAPTION_WIRE },
+    }));
+    status.client.failFile = true;
+
+    await status.channel.drain();
+    status.client.batches.push([caption], []);
+    await status.channel.drain();
+
+    expect(status.client.calls.filter(call => call.args?.text === 'May have been delivered.'))
+      .toHaveLength(1);
+    expect(status.client.calls.filter(call => call.name === 'send_file')).toHaveLength(1);
+    expect(status.client.calls).toContainEqual({ name: 'send_message', args: {
+      contact: AGENT, text: expect.stringContaining('uncertain'), reply_to_wire_id: CAPTION_WIRE,
+    } });
+    const conversation = JSON.parse(readFileSync(join(status.dir,
+      '.owner-channel-conversations.json'), 'utf8'));
+    expect(conversation.sends).toMatchObject([expect.objectContaining({ status: 'uncertain' })]);
+    expect(JSON.parse(readFileSync(join(status.dir,
+      '.owner-channel-attachment-recovery.json'), 'utf8')).pending).toEqual([]);
+    await status.channel.close();
+  });
+
   it('routes simultaneous authenticated owners independently and suppresses replayed wires', async () => {
     const status = await setup([OWNER, OTHER]);
     const bytes = Buffer.from('hello');
@@ -292,6 +567,50 @@ describe('owner-channel attachment ingress', () => {
 });
 
 describe('attachment admission and recovery primitives', () => {
+  it('migrates v1 conversation state into bounded source-wire routes', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'ours-owner-route-migration-'));
+    dirs.push(dir);
+    const path = join(dir, 'conversations.json');
+    writeFileSync(path, JSON.stringify({
+      version: 1,
+      conversations: [{ contact: OWNER, lastInboundAt: 123, lastInboundWireId: FILE_WIRE }],
+      sends: [],
+    }));
+
+    const state = new OwnerConversationState(path);
+    expect(state.routeForWire(FILE_WIRE, new Set([OWNER.toLowerCase()])))
+      .toEqual({ contact: OWNER, basis: 'source-wire' });
+    const migrated = JSON.parse(readFileSync(path, 'utf8'));
+    expect(migrated).toMatchObject({
+      version: 2,
+      routes: [{ contact: OWNER, wireId: FILE_WIRE, at: 123 }],
+    });
+    expect(JSON.stringify(migrated)).not.toMatch(/body|filename|path|caption/);
+  });
+
+  it('bounds persisted source-wire routing history', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'ours-owner-route-bound-'));
+    dirs.push(dir);
+    const path = join(dir, 'conversations.json');
+    writeFileSync(path, JSON.stringify({
+      version: 2,
+      conversations: [{ contact: OWNER, lastInboundAt: 511, lastInboundWireId: 'wire-511' }],
+      routes: Array.from({ length: 512 }, (_, index) => ({
+        contact: OWNER, wireId: `wire-${index}`, at: index,
+      })),
+      sends: [],
+    }));
+    const state = new OwnerConversationState(path);
+    state.recordInbound(OWNER, 'wire-512', 512);
+
+    expect(() => state.routeForWire('wire-0', new Set([OWNER])))
+      .toThrow(/no authenticated owner route/);
+    expect(state.routeForWire('wire-512', new Set([OWNER])))
+      .toEqual({ contact: OWNER, basis: 'source-wire' });
+    const persisted = JSON.parse(readFileSync(path, 'utf8'));
+    expect(persisted.routes).toHaveLength(512);
+  });
+
   it('sanitizes traversal names and rejects symlinked or hash-mismatched daemon paths', async () => {
     const root = mkdtempSync(join(tmpdir(), 'ours-admission-'));
     dirs.push(root);

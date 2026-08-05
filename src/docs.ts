@@ -421,15 +421,18 @@ This does not replace the role identity. Normal identity mail remains untrusted
 peer input: the agent reads it through \`get_messages\` and replies through
 \`send_message\`. Mail arriving on the dedicated channel from a CID in \`owners\`
 is injected as a direct \`[fleet-owner]\` prompt. Mail from the exact \`agent\`
-CID is forwarded as a new message to the latest authenticated owner conversation.
+CID is forwarded as a new message to the latest authenticated owner conversation;
+its files may also be relayed through this channel. A reply reference selects the
+owner of that authenticated source wire instead of the latest conversation.
 Every other CID is rejected and warned about without reflecting its body. Fleet sends
 accepted/queued/progress/interrupted/failure notices and routes the ACP turn's
 final assistant text back to the authenticated sender with its source wire ID.
 For file replies, fleet injects a request-specific outbox path into the owner
 prompt. The agent copies completed artifacts there; fleet sends every regular
 file from the channel identity with the same source wire ID and removes the
-temporary outbox only after successful delivery. The agent never chooses an owner
-recipient or calls ours \`send_file\` for an owner-channel response.
+temporary outbox only after successful delivery. For proactive or in-turn agent
+attachments, the agent calls ours \`send_file\` to the channel identity and may
+pair it with a reply-linked caption; fleet, not the agent, chooses the owner.
 Owner messages whose trimmed text starts with \`/\` are deterministic
 supervisor commands and never enter the model: \`/help\` (alias \`/commands\`),
 \`/status\`, \`/interrupt\`, \`/clear\`, \`/compact\`, \`/model <model-id>\`,
@@ -456,8 +459,16 @@ Failure or unavailability is explicit and preserves the private audio path as th
 fallback. Run \`ours-mcp voice-status --json\` to inspect the host configuration.
 A mode-0600 crash journal contains only authenticated CID and wire routing data;
 it never stores captions, filenames, paths, transcript text, or bytes. Journaled
-post-retrieval files resume selectively through \`save_file\`; corrupt state
-disables attachment admission rather than weakening provenance checks.
+post-retrieval files resume selectively through \`save_file\`. A deferred agent
+caption is replayed with its processed files before the group is admitted. Fleet
+resolves one authenticated owner route before retrieving bytes, admits every file
+before emitting the caption or any file, and sends every part to that same route.
+Unknown correlated routes remain queued without retrieval and receive one bounded
+correlated notice. Admission rejection consumes the whole group with one NACK;
+once emission starts, a transport error becomes terminal uncertain delivery and
+the group is never blind-retried. Bounded v2 source-wire routing state is migrated
+from v1 on read. Corrupt state disables attachment admission rather than weakening
+provenance checks.
 
 The channel identity must be unique and must not be a role identity. The bridge
 persists bounded wire IDs only, never message/reply plaintext, and requeues input

@@ -669,7 +669,15 @@ export class OwnerChannel implements OwnerChannelHandle {
       const exact = recovered as IncomingAttachment[];
       if (exact.some(file => file.senderId !== recovery.contact)) continue;
       exact.forEach(file => used.add(file.wireId));
-      groups.push({ files: exact, recovery });
+      const caption = recovery.originWireId === recovery.fileWireIds[0]
+        ? undefined : messageByWire.get(recovery.originWireId);
+      if (caption && this.sender(caption).id !== recovery.contact) continue;
+      // A managed-agent caption is deferred before retrieval. If recovery sees
+      // the processed file before that body is replayed, keep the file reserved
+      // by the journal until both halves are present again.
+      if (!caption && !recovery.fileWireIds.includes(recovery.originWireId)) continue;
+      if (caption) consumed.add(caption);
+      groups.push({ files: exact, recovery, ...(caption ? { caption } : {}) });
     }
     for (const file of files) {
       if (used.has(file.wireId)) continue;
@@ -702,6 +710,9 @@ export class OwnerChannel implements OwnerChannelHandle {
     ].filter(Boolean))];
     if (handledWireIds.some(wire => this.inFlight.has(wire))) return false;
     const sender = { id: group.files[0].senderId, name: group.files[0].senderName };
+    if (group.files.every(file => this.isAgentSender(file.senderId))
+        && (!group.caption || this.isAgentSender(this.sender(group.caption).id)))
+      return this.handleManagedAgentAttachmentGroup(group, handledWireIds, sender.id);
     if (group.files.some(file => file.senderId !== sender.id)
         || !this.isEffectiveOwner(sender.id)) {
       this.options.log(
@@ -710,6 +721,10 @@ export class OwnerChannel implements OwnerChannelHandle {
       if (group.recovery) try { this.attachmentRecovery.remove(group.recovery.id); } catch {}
       return true;
     }
+    // Owner files are requests too: retain their authenticated source wire so
+    // a later managed-agent attachment reply cannot drift to a newer owner.
+    try { this.conversations.recordInbound(sender.id, originWireId); }
+    catch (error) { this.logError('owner attachment route update failed', error); }
     const rejection = !this.attachmentRecovery.integrity()
       ? 'attachment recovery state is unavailable'
       : validateAttachmentSelection(group.files, this.attachmentConfig);
@@ -1049,6 +1064,135 @@ export class OwnerChannel implements OwnerChannelHandle {
     this.options.log(`[${this.options.role}] managed-agent message relayed `
       + `wire=${createHash('sha256').update(wireId).digest('hex').slice(0, 12)} `
       + `basis=${route.basis} chars=${Array.from(text).length} bytes=${Buffer.byteLength(text)}`);
+  }
+
+  /**
+   * Caption and files are admitted as one relay transaction. The authenticated
+   * route and optional source wire are fixed before bytes are retrieved, and no
+   * outbound part is emitted until every file passes admission. A transport
+   * failure after emission starts is durably uncertain and never blind-retried;
+   * the managed agent receives one bounded NACK for the whole transaction.
+   */
+  private async handleManagedAgentAttachmentGroup(
+    group: AttachmentGroup, handledWireIds: string[], agent: string,
+  ): Promise<boolean> {
+    const captionWire = group.caption ? this.wireId(group.caption) : undefined;
+    const nackWire = captionWire ?? group.files[0].wireId;
+    const nackMessage = group.caption ?? { wire_id: nackWire };
+    let requestDir: string | undefined;
+    let recovery: PendingAttachmentRequest | undefined;
+    try {
+      if (!this.authorizationIntegrity().ok)
+        throw new Error('owner authorization state is corrupt; managed-agent relay is disabled');
+      const caption = group.caption ? this.safeRelayMessage(group.caption.text) : undefined;
+      const replyTo = this.managedAttachmentReplyWire(group, captionWire);
+      let route: { contact: string; basis: string };
+      try {
+        route = replyTo
+          ? this.conversations.routeForWire(replyTo, this.effectiveOwners())
+          : this.conversations.route(this.effectiveOwners());
+      } catch (error) {
+        throw new RelayUnroutableError(this.errorText(error));
+      }
+      if (!this.isEffectiveOwner(route.contact))
+        throw new Error('selected attachment relay owner is no longer authorized');
+      const contact = await this.routableContact(route);
+      const rejection = !this.attachmentRecovery.integrity()
+        ? 'attachment recovery state is unavailable'
+        : validateAttachmentSelection(group.files, this.attachmentConfig);
+      if (rejection) throw new Error(rejection);
+
+      const transactionId = this.requestId(
+        `managed-agent-attachment:${handledWireIds.slice().sort().join(':')}`);
+      recovery = group.recovery ?? {
+        id: transactionId, contact: agent, originWireId: captionWire ?? group.files[0].wireId,
+        fileWireIds: group.files.map(file => file.wireId), createdAt: Date.now(),
+      };
+      if (!group.recovery) this.attachmentRecovery.add(recovery);
+      requestDir = await prepareAttachmentDirectory(this.attachmentRoot, transactionId);
+      const unread = group.files.filter(file => file.status === 'unread');
+      const processed = group.files.filter(file => file.status !== 'unread');
+      const retrieved = unread.length
+        ? parseRetrievedAttachments(await this.client.callTool('get_files', {
+          wire_ids: unread.map(file => file.wireId),
+        }), unread)
+        : [];
+      for (const file of processed) {
+        if (!group.recovery) throw new Error('unexpected processed attachment without recovery route');
+        const recoveryPath = join(requestDir, `.recovered-${file.wireId}-${randomUUID()}`);
+        await this.client.callTool('save_file', { wire_id: file.wireId, dest_path: recoveryPath });
+        retrieved.push(await recoveredAttachment(file, recoveryPath));
+      }
+      const order = new Map(group.files.map((file, index) => [file.wireId, index]));
+      retrieved.sort((a, b) => order.get(a.wireId)! - order.get(b.wireId)!);
+      const admitted = await admitAttachments(retrieved, requestDir, this.attachmentConfig);
+
+      const digest = createHash('sha256').update(
+        `managed-agent-attachment\0${handledWireIds.slice().sort().join('\0')}`,
+      ).digest('hex');
+      const sending = this.conversations.beginSend(route.contact, digest, Date.now(), 0, 'all');
+      try {
+        if (caption) await this.send(contact, caption, replyTo);
+        for (const file of admitted) {
+          await this.client.callTool('send_file', {
+            contact, path: file.path, filename: file.filename,
+            ...(replyTo ? { reply_to_wire_id: replyTo } : {}),
+          });
+        }
+      } catch {
+        try { this.conversations.finishSend(sending.id, 'uncertain'); }
+        catch (error) { this.logError('managed-agent attachment uncertainty persist failed', error); }
+        throw new Error('caption/file relay delivery outcome is uncertain; it was not retried');
+      }
+      this.conversations.finishSend(sending.id, 'delivered');
+      for (const wire of handledWireIds) this.state.remember(wire);
+      this.attachmentRecovery.remove(recovery.id);
+      this.options.log(`[${this.options.role}] managed-agent attachment transaction relayed `
+        + `wires=${handledWireIds.length} basis=${route.basis} files=${admitted.length} `
+        + `bytes=${admitted.reduce((total, file) => total + file.size, 0)}`);
+      return true;
+    } catch (error) {
+      if (error instanceof DuplicateSendError) {
+        this.options.log(`[${this.options.role}] managed-agent attachment replay consumed`);
+        for (const wire of handledWireIds) this.state.remember(wire);
+        if (recovery) try { this.attachmentRecovery.remove(recovery.id); } catch {}
+        return true;
+      }
+      if (error instanceof RelayUnroutableError) {
+        this.options.log(`[${this.options.role}] managed-agent attachment has no owner route; `
+          + `transaction stays queued: ${this.errorText(error)}`);
+        await this.nackManagedAgent(agent, nackMessage, nackWire, ownerNotices.relayQueued());
+        return false;
+      }
+      this.logError('managed-agent caption/file relay refused', error);
+      await this.nackManagedAgent(
+        agent, nackMessage, nackWire, ownerNotices.relayRefused(this.errorText(error)));
+      // Rejection/admission failure and uncertain transport are terminal and
+      // visible. Consuming every correlated wire prevents a later partial replay.
+      for (const wire of handledWireIds) this.state.remember(wire);
+      if (recovery) try { this.attachmentRecovery.remove(recovery.id); } catch {}
+      return true;
+    } finally {
+      if (requestDir) await removeRequestDirectory(requestDir).catch(error => {
+        this.logError('managed-agent attachment cleanup failed', error);
+      });
+    }
+  }
+
+  private managedAttachmentReplyWire(
+    group: AttachmentGroup, captionWire: string | undefined,
+  ): string | undefined {
+    const captionReply = group.caption?.reply_to?.wire_id;
+    const candidates = new Set<string>();
+    if (captionReply) candidates.add(captionReply);
+    for (const file of group.files) {
+      const wire = file.replyTo?.wire_id;
+      if (!wire || wire === captionWire) continue;
+      candidates.add(wire);
+    }
+    if (candidates.size > 1)
+      throw new Error('managed-agent caption/file group has conflicting owner reply wires');
+    return candidates.values().next().value;
   }
 
   /**
