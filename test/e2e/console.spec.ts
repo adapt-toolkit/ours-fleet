@@ -361,4 +361,26 @@ test('sketch, connect and add to the fleet from an empty console without launchi
   // Still nothing started: promotion writes configuration and stops there.
   await expect(page.getByRole('button', { name: /^Launch/ })).toHaveCount(0);
   await expect(page.locator('[data-node-id="watchdog:Watchdog1"]')).toContainText('Draft');
+
+  // Promoting the agent first must NOT unscope the watchdog that was created
+  // from it: the scope edge belongs to the watchdog and is only written when the
+  // watchdog itself is added.
+  await expect(page.locator('[data-node-id="watchdog:Watchdog1"]')).toContainText('watchdog');
+  await page.locator('[data-node-id="watchdog:Watchdog1"]').click();
+  await expect(page.getByLabel('Watchdog1 details')).toContainText('Watchdog: outgoing to agent:Agent1');
+  await page.getByLabel('Watchdog1 details').getByLabel('Coordinator').fill('Agent1');
+  await page.getByLabel('Watchdog1 details').getByLabel('Coordinator').blur();
+  await page.getByLabel('Watchdog1 details').getByRole('button', { name: 'Add to fleet' }).click();
+  await expect(page.getByRole('dialog', { name: 'Review configuration change' })).toBeVisible();
+  await page.getByRole('dialog').getByRole('button', { name: 'Add to fleet' }).click();
+
+  await expect.poll(async () =>
+    (await (await request.get('http://127.0.0.1:49374/__test/fleet-yaml')).json()).text as string)
+    .toContain('watchdogs:');
+  const withWatchdog = (await (await request.get('http://127.0.0.1:49374/__test/fleet-yaml')).json()).text as string;
+  // Scoped to the agent it was created from — not a watch-everything watchdog.
+  expect(withWatchdog).toContain('    watch:');
+  expect(withWatchdog).toContain('      - Agent1');
+  expect(withWatchdog).toContain('    coordinator: Agent1');
+  await expect(page.getByRole('button', { name: /^Launch/ })).toHaveCount(0);
 });

@@ -184,6 +184,159 @@ describe('adding sketches to the fleet', () => {
     expect(loadConfig(file).loops[0].enabled).toBe(true);
   });
 
+  describe('promoting one end of a scoped relationship', () => {
+    /**
+     * The real workflow: sketch an agent, scope a watchdog to it, then add them
+     * one at a time. The scope edge is owned by the watchdog, so promoting the
+     * agent must not clear it — otherwise the watchdog reads as standalone and
+     * is written with no `watch:` key, silently watching the whole fleet.
+     */
+    const scoped = () => seed('roles: {}\n', {
+      ...emptyDraft(),
+      drafts: {
+        nodes: [
+          { id: 'agent:Alice', kind: 'agent', fields: { mission: 'Ship safely' } },
+          { id: 'watchdog:W', kind: 'watchdog', fields: { coordinator: 'Alice' } },
+        ],
+        edges: [{ kind: 'watches', from: 'watchdog:W', to: 'agent:Alice' }],
+      },
+    });
+
+    it('keeps the scope edge when the agent is promoted first', async () => {
+      await scoped();
+
+      await promote(['agent:Alice']);
+
+      expect(drafts.read().draft.drafts.edges)
+        .toEqual([{ kind: 'watches', from: 'watchdog:W', to: 'agent:Alice' }]);
+      expect(drafts.read().draft.drafts.nodes.map(node => node.id)).toEqual(['watchdog:W']);
+      // The survivor is still scoped, not standalone.
+      const watchdog = (await topology()).edges
+        .filter(edge => edge.kind === 'watches' && edge.from === 'watchdog:W');
+      expect(watchdog).toHaveLength(1);
+      expect(watchdog[0]).toMatchObject({ to: 'agent:Alice', implicit: false });
+    });
+
+    it('writes watch: [Alice] when the watchdog is promoted second, and never widens', async () => {
+      await scoped();
+      await promote(['agent:Alice']);
+
+      const preview = await service.preview({
+        ids: ['watchdog:W'], configRevision: configuration.read().revision,
+      });
+      expect(preview.diff).toContain('watch:');
+      await promote(['watchdog:W']);
+
+      const text = readFileSync(file, 'utf8');
+      expect(text).toContain('    watch:');
+      expect(text).toContain('      - Alice');
+      const [written] = loadConfig(file).watchdogs;
+      expect(written.watchExplicit).toBe(true);
+      expect(written.watch).toEqual(['Alice']);
+
+      // Adding another agent must not expand a scoped watchdog.
+      const opened = configuration.read();
+      (opened.model.roles as any).Bob = { mission: 'Review' };
+      await configuration.write(opened.revision, opened.model);
+      expect(loadConfig(file).watchdogs[0].watch).toEqual(['Alice']);
+      expect(drafts.read().draft.drafts.edges).toEqual([]);
+    });
+
+    it('keeps an interval targeted at an agent promoted before it', async () => {
+      await seed('roles: {}\n', {
+        ...emptyDraft(),
+        drafts: {
+          nodes: [
+            { id: 'agent:Alice', kind: 'agent', fields: { mission: 'Ship', session: 'acp' } },
+            { id: 'loop:nightly', kind: 'loop', fields: { prompt: 'Check in' } },
+          ],
+          edges: [{ kind: 'targets', from: 'loop:nightly', to: 'agent:Alice' }],
+        },
+      });
+
+      await promote(['agent:Alice']);
+      expect(drafts.read().draft.drafts.edges)
+        .toEqual([{ kind: 'targets', from: 'loop:nightly', to: 'agent:Alice' }]);
+
+      await promote(['loop:nightly']);
+      expect(loadConfig(file).loops[0].roleNames).toEqual(['Alice']);
+      expect(loadConfig(file).loops[0].enabled).toBe(true);
+    });
+
+    it('clears an edge once its own source is written', async () => {
+      await seed('roles:\n  Alice:\n    mission: Ship\n', {
+        ...emptyDraft(),
+        drafts: {
+          nodes: [{ id: 'watchdog:W', kind: 'watchdog', fields: { coordinator: 'Alice' } }],
+          edges: [{ kind: 'watches', from: 'watchdog:W', to: 'agent:Alice' }],
+        },
+      });
+
+      await promote(['watchdog:W']);
+
+      // The relationship now lives in `watch:`, so the sketch of it is redundant.
+      expect(drafts.read().draft.drafts.edges).toEqual([]);
+      expect(loadConfig(file).watchdogs[0].watch).toEqual(['Alice']);
+    });
+
+    it('still writes no watch: for a watchdog that was never scoped', async () => {
+      await seed('roles: {}\n', {
+        ...emptyDraft(),
+        drafts: {
+          nodes: [
+            { id: 'agent:Alice', kind: 'agent', fields: { mission: 'Ship' } },
+            { id: 'watchdog:all', kind: 'watchdog', fields: { coordinator: 'Alice' } },
+          ],
+          edges: [],
+        },
+      });
+
+      await promote(['agent:Alice']);
+      await promote(['watchdog:all']);
+
+      expect(readFileSync(file, 'utf8')).not.toContain('watch:');
+      expect(loadConfig(file).watchdogs[0].watchExplicit).toBe(false);
+      expect(loadConfig(file).watchdogs[0].watch).toEqual(['Alice']);
+
+      // The opposite of the scoped case: a standalone watchdog must keep
+      // covering agents added later with no edit of its own.
+      const opened = configuration.read();
+      (opened.model.roles as any).Bob = { mission: 'Review' };
+      await configuration.write(opened.revision, opened.model);
+      expect(loadConfig(file).watchdogs[0].watch).toEqual(['Alice', 'Bob']);
+      expect(readFileSync(file, 'utf8')).not.toContain('watch:');
+    });
+
+    it('retains only edges whose source is still a sketch, not every edge', async () => {
+      await seed('roles: {}\n', {
+        ...emptyDraft(),
+        drafts: {
+          nodes: [
+            { id: 'agent:Alice', kind: 'agent', fields: { mission: 'Ship' } },
+            { id: 'watchdog:Kept', kind: 'watchdog', fields: { coordinator: 'Alice' } },
+            { id: 'watchdog:Gone', kind: 'watchdog', fields: { coordinator: 'Alice' } },
+          ],
+          edges: [
+            { kind: 'watches', from: 'watchdog:Kept', to: 'agent:Alice' },
+            { kind: 'watches', from: 'watchdog:Gone', to: 'agent:Alice' },
+          ],
+        },
+      });
+
+      // The accepted two-write workflow: the shared target first, then one of
+      // the two watchdogs.
+      await promote(['agent:Alice']);
+      expect(drafts.read().draft.drafts.edges).toHaveLength(2);
+      await promote(['watchdog:Gone']);
+
+      // Gone's edge was written into its `watch:` list, so it is redundant.
+      // Kept's edge is still the only record of its scope, so it survives.
+      expect(drafts.read().draft.drafts.edges)
+        .toEqual([{ kind: 'watches', from: 'watchdog:Kept', to: 'agent:Alice' }]);
+      expect(loadConfig(file).watchdogs.find(item => item.name === 'Gone')?.watch).toEqual(['Alice']);
+    });
+  });
+
   it('refuses an incomplete sketch with the reason the console shows', async () => {
     await seed('roles:\n  Alice:\n    mission: Ship\n', {
       ...emptyDraft(),

@@ -80,14 +80,20 @@ export class TopologyPromoteService {
     const current = this.options.drafts.read();
     if (draftRevision !== undefined && draftRevision !== current.revision)
       return { ok: false, revision: current.revision };
-    const keep = new Set(promoted);
+    const promotedIds = new Set(promoted);
     const next = {
       ...current.draft,
       drafts: {
-        nodes: current.draft.drafts.nodes.filter(node => !keep.has(node.id)),
-        // A drawn edge belongs to the sketch that owns it; once both ends are
-        // real configuration the edge is derived from the config instead.
-        edges: current.draft.drafts.edges.filter(edge => !keep.has(edge.from) && !keep.has(edge.to)),
+        nodes: current.draft.drafts.nodes.filter(node => !promotedIds.has(node.id)),
+        /*
+         * A drawn edge is owned by its SOURCE — it becomes the source's `watch:`
+         * or `roles:` list — so it is materialised, and therefore redundant, only
+         * once the source itself is written. Clearing it because the TARGET was
+         * promoted silently rewrites the survivor's meaning: a watchdog scoped to
+         * one agent loses its only scope edge, reads as standalone, and is then
+         * written with no `watch:` key at all — that is, watching everything.
+         */
+        edges: current.draft.drafts.edges.filter(edge => !promotedIds.has(edge.from)),
       },
     };
     try {
