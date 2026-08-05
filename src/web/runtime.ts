@@ -8,6 +8,7 @@ import { AcpRoleSessionAdapter, TmuxRoleSessionAdapter } from '../application/se
 import { StructuredLogService } from '../application/log-service.js';
 import { RoleCommandService } from '../application/role-command-service.js';
 import { RoleCreationService } from '../application/role-creation-service.js';
+import { RoleRemovalService } from '../application/role-removal-service.js';
 import { FleetError } from '../application/errors.js';
 import { controlRequest, controlSocketPath } from '../session/control.js';
 import { Tmux } from '../tmux.js';
@@ -144,6 +145,10 @@ export async function startWebConsole(options: StartWebOptions): Promise<Running
       });
     },
   });
+  const removal = new RoleRemovalService({
+    configPath: options.configPath, ops,
+    currentControlRole: process.env.OURS_FLEET_PROXY_CALLER,
+  });
   const commands = new RoleCommandService({
     repository, ops, configPath: options.configPath,
     status: async roleId => (await query.detail(roleId)).status,
@@ -164,7 +169,7 @@ export async function startWebConsole(options: StartWebOptions): Promise<Running
   let server: WebServer;
   try {
     server = await buildWebServer({
-    query, repository, logs, commands, creation, audit, events, watchdogs, configuration,
+    query, repository, logs, commands, creation, removal, audit, events, watchdogs, configuration,
     topology: async () => deriveTopology(loadConfig(options.configPath), await query.list()),
     terminalUpgrade: terminalAvailable
       ? async (socket, _request, roleId, _ticket, hello) => terminals.connect(socket, roleId, hello)

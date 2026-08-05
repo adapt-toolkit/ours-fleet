@@ -6,10 +6,11 @@ import { partitionActivity } from './activity-presentation';
 import { useLivePoll } from './use-live-poll';
 import { runtimeMetadata } from './runtime-metadata';
 import { promptReceiptNotice } from './prompt-receipt';
+import { confirmAndRemoveRole } from './remove-role';
 
 const TerminalView = lazy(() => import('./TerminalView').then(module => ({ default: module.TerminalView })));
 
-export function RoleWorkspace({ roleId, onBack }: { roleId: string; onBack(): void }) {
+export function RoleWorkspace({ roleId, onBack, onRemoved }: { roleId: string; onBack(): void; onRemoved?(): void }) {
   const [detail, setDetail] = useState<any>();
   const [tab, setTab] = useState<'overview' | 'conversation' | 'activity' | 'terminal' | 'logs' | 'diagnostics'>('overview');
   // ACP roles land on the structured Conversation view; picked once per role.
@@ -95,6 +96,9 @@ export function RoleWorkspace({ roleId, onBack }: { roleId: string; onBack(): vo
         {!inactive && capabilities.lifecycle.restartResume && <button onClick={() => void action('restart_resume')}>Restart & resume</button>}
         {!inactive && capabilities.lifecycle.restartFresh && <button className="danger" onClick={() => void action('restart_fresh')}>Fresh restart…</button>}
         {inactive && <span className="muted">Inactive — start is the only applicable lifecycle action.</span>}
+        <button className="danger" onClick={() => void confirmAndRemoveRole(roleId).then(result => {
+          if (!result) return; alert(`Removed ${roleId}. Recovery archive: ${result.recoveryPath}`); onRemoved?.();
+        }).catch(reason => setNotice((reason as Error).message))}>Remove role…</button>
       </div></div>
     </div>}
     {tab === 'activity' && <div className="activity-layout"><div className="activity panel">

@@ -1,4 +1,4 @@
-import { useMemo, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import { api } from './api';
 
 type Model = Record<string, any>;
@@ -12,6 +12,8 @@ type Preview = {
 };
 
 const entries = (value: unknown) => Object.entries((value && typeof value === 'object' ? value : {}) as Model);
+type ModelOption = { id: string; label: string; reasoningEfforts: string[]; defaultReasoningEffort?: string; source: string };
+type Catalogs = Record<string, ModelOption[]>;
 
 export function FleetSetup({ initial, onSaved }: { initial: ConfigRead; onSaved(next: ConfigRead): void }) {
   const [model, setModel] = useState<Model>(() => structuredClone(initial.model));
@@ -19,6 +21,16 @@ export function FleetSetup({ initial, onSaved }: { initial: ConfigRead; onSaved(
   const [preview, setPreview] = useState<Preview>();
   const [error, setError] = useState('');
   const [busy, setBusy] = useState(false);
+  const [advanced, setAdvanced] = useState(false);
+  const [catalogs, setCatalogs] = useState<Catalogs>({});
+  useEffect(() => {
+    const controller = new AbortController();
+    void api.get<any>('/api/v1/creation-capabilities', controller.signal).then(value => {
+      if (!controller.signal.aborted) setCatalogs(Object.fromEntries(
+        (value.harnesses ?? []).map((harness: any) => [harness.id, harness.modelOptions ?? []])));
+    }).catch(() => undefined);
+    return () => controller.abort();
+  }, []);
   const roles = useMemo(() => entries(model.roles), [model]);
   const update = (fn: (draft: Model) => void) => setModel(value => {
     const draft = structuredClone(value); fn(draft); return draft;
@@ -50,11 +62,16 @@ export function FleetSetup({ initial, onSaved }: { initial: ConfigRead; onSaved(
       {['Defaults', 'Agents', 'Automation', 'Review'].map((name, index) =>
         <li key={name} className={step === index ? 'active' : step > index ? 'done' : ''}>{index + 1}<span>{name}</span></li>)}
     </ol>
+    <div className="mode-switch" role="group" aria-label="Configuration detail level">
+      <button className={!advanced ? 'active' : 'secondary'} onClick={() => setAdvanced(false)}>Basic</button>
+      <button className={advanced ? 'active' : 'secondary'} onClick={() => setAdvanced(true)}>Advanced</button>
+      <span>Basic asks one short decision at a time. Advanced reveals permission, override, and automation tuning.</span>
+    </div>
     {error && <div className="banner error">{error}</div>}
     <div className="panel setup-panel">
-      {step === 0 && <Defaults model={model} update={update} />}
-      {step === 1 && <Agents roles={roles} update={update} />}
-      {step === 2 && <Automation model={model} roles={roles.map(([name]) => name)} update={update} />}
+      {step === 0 && <Defaults model={model} catalogs={catalogs} advanced={advanced} update={update} />}
+      {step === 1 && <Agents roles={roles} advanced={advanced} update={update} />}
+      {step === 2 && <Automation model={model} roles={roles.map(([name]) => name)} advanced={advanced} update={update} />}
       {step === 3 && preview && <Review preview={preview} />}
       <div className="setup-actions">
         {step > 0 && <button className="secondary" onClick={() => setStep(value => value - 1)} disabled={busy}>Back</button>}
@@ -67,43 +84,61 @@ export function FleetSetup({ initial, onSaved }: { initial: ConfigRead; onSaved(
   </div>;
 }
 
-function Defaults({ model, update }: { model: Model; update(fn: (draft: Model) => void): void }) {
+function Defaults({ model, catalogs, advanced, update }: { model: Model; catalogs: Catalogs; advanced: boolean; update(fn: (draft: Model) => void): void }) {
   const defaults = model.defaults ?? {};
   const permissions = defaults.permissions ?? {};
   const field = (key: string, value: string) => update(draft => {
     draft.defaults ??= {}; if (value) draft.defaults[key] = value; else delete draft.defaults[key];
   });
-  return <><h3>Runtime defaults</h3><p className="muted">Every agent inherits these unless it declares an override.</p>
+  const harness = defaults.harness ?? 'claude-code';
+  const options = catalogs[harness] ?? [];
+  const selected = options.find(option => option.id === defaults.model);
+  const effort = harness === 'codex' ? defaults.harness_options?.config?.model_reasoning_effort : defaults.harness_options?.effort;
+  const setEffort = (value: string) => update(draft => {
+    draft.defaults ??= {}; draft.defaults.harness_options ??= {};
+    if (harness === 'codex') {
+      draft.defaults.harness_options.config ??= {};
+      if (value) draft.defaults.harness_options.config.model_reasoning_effort = value;
+      else delete draft.defaults.harness_options.config.model_reasoning_effort;
+    } else if (value) draft.defaults.harness_options.effort = value;
+    else delete draft.defaults.harness_options.effort;
+  });
+  return <><h3>1. Choose how agents run</h3><p className="muted">This becomes the starting point for every agent. Existing sessions are not restarted by saving.</p>
+    <div className="decision-note"><strong>Recommended default</strong><span>ACP gives structured activity; tmux gives a terminal. Pick an exact catalog model, or let the harness resolve its default when a new session launches.</span></div>
     <div className="form-grid three">
-      <label>Harness<select value={defaults.harness ?? 'claude-code'} onChange={event => field('harness', event.target.value)}><option value="codex">Codex</option><option value="claude-code">Claude Code</option></select></label>
+      <label>Harness<select value={harness} onChange={event => field('harness', event.target.value)}><option value="codex">Codex</option><option value="claude-code">Claude Code</option></select></label>
       <label>Session<select value={defaults.session ?? 'tmux'} onChange={event => field('session', event.target.value)}><option value="acp">ACP</option><option value="tmux">tmux</option></select></label>
-      <label>Model<input value={defaults.model ?? ''} placeholder="Harness default" onChange={event => field('model', event.target.value)} /></label>
-      {(['approval', 'filesystem', 'unattended'] as const).map(key => <label key={key}>{key}<select value={permissions[key] ?? (key === 'filesystem' ? 'workspace' : key === 'unattended' ? 'deny' : 'ask')} onChange={event => update(draft => {
+      <label>Model<select aria-label="Fleet model" value={selected?.id ?? ''} onChange={event => { field('model', event.target.value); const next = options.find(option => option.id === event.target.value); setEffort(next?.defaultReasoningEffort ?? ''); }}>
+        <option value="">Use harness default (resolved at launch)</option>{options.map(option => <option value={option.id} key={option.id}>{option.label} — {option.id}</option>)}</select></label>
+      <label>Reasoning effort<select aria-label="Fleet reasoning effort" value={effort ?? ''} onChange={event => setEffort(event.target.value)}><option value="">Model default</option>{(selected?.reasoningEfforts ?? []).map(value => <option key={value}>{value}</option>)}</select></label>
+      {advanced && <label>Custom model ID<input value={defaults.model ?? ''} placeholder="exact vendor model ID" onChange={event => field('model', event.target.value)} /></label>}
+      {advanced && (['approval', 'filesystem', 'unattended'] as const).map(key => <label key={key}>{key}<select value={permissions[key] ?? (key === 'filesystem' ? 'workspace' : key === 'unattended' ? 'deny' : 'ask')} onChange={event => update(draft => {
         draft.defaults ??= {}; draft.defaults.permissions ??= {}; draft.defaults.permissions[key] = event.target.value;
-      })}>{(key === 'approval' ? ['ask', 'allow', 'deny'] : key === 'filesystem' ? ['read-only', 'workspace', 'unrestricted'] : ['deny', 'wait']).map(value => <option key={value}>{value}</option>)}</select></label>)}
+      })}>{(key === 'approval' ? ['ask', 'auto', 'allow'] : key === 'filesystem' ? ['read-only', 'workspace', 'unrestricted'] : ['deny', 'wait']).map(value => <option key={value}>{value}</option>)}</select></label>)}
     </div></>;
 }
 
-function Agents({ roles, update }: { roles: Array<[string, any]>; update(fn: (draft: Model) => void): void }) {
+function Agents({ roles, advanced, update }: { roles: Array<[string, any]>; advanced: boolean; update(fn: (draft: Model) => void): void }) {
   const add = () => update(draft => { draft.roles ??= {}; let n = 1; while (draft.roles[`Agent${n}`]) n++; draft.roles[`Agent${n}`] = {}; });
-  return <><div className="section-title"><div><h3>Agents</h3><p className="muted">Define durable roles and explicit oversight.</p></div><button className="secondary" onClick={add}>＋ Add agent</button></div>
+  return <><div className="section-title"><div><h3>2. Name the agents and give each a job</h3><p className="muted">Example: Researcher — “Find primary sources and summarize evidence.” Saving adds configuration; it does not restart running agents.</p></div><button className="secondary" onClick={add}>＋ Add agent</button></div>
     <div className="entity-list">{roles.map(([name, role]) => <div className="entity-card" key={name}>
       <div className="form-grid three">
         <label>Name<input value={name} onChange={event => update(draft => { const next = event.target.value; if (!next || next === name) return; draft.roles[next] = draft.roles[name]; delete draft.roles[name]; })} /></label>
-        <label>Coordinator<input value={role.coordinator ?? ''} onChange={event => update(draft => { draft.roles[name].coordinator = event.target.value || undefined; })} /></label>
-        <label>Model override<input value={role.model ?? ''} placeholder="Inherit" onChange={event => update(draft => { if (event.target.value) draft.roles[name].model = event.target.value; else delete draft.roles[name].model; })} /></label>
+        {advanced && <label>Coordinator<input value={role.coordinator ?? ''} onChange={event => update(draft => { draft.roles[name].coordinator = event.target.value || undefined; })} /></label>}
+        {advanced && <label>Model override<input value={role.model ?? ''} placeholder="Inherit" onChange={event => update(draft => { if (event.target.value) draft.roles[name].model = event.target.value; else delete draft.roles[name].model; })} /></label>}
         <label className="wide">Mission<textarea value={role.mission ?? ''} onChange={event => update(draft => { draft.roles[name].mission = event.target.value; })} /></label>
-        <label>Oversee roles<input value={(role.oversee ?? []).map((item: any) => item.role).join(', ')} placeholder="Researcher, Reviewer" onChange={event => update(draft => { draft.roles[name].oversee = event.target.value.split(',').map((value: string) => value.trim()).filter(Boolean).map((target: string) => ({ role: target, interval: '5m' })); })} /></label>
+        {advanced && <label>Oversee roles<input value={(role.oversee ?? []).map((item: any) => item.role).join(', ')} placeholder="Researcher, Reviewer" onChange={event => update(draft => { draft.roles[name].oversee = event.target.value.split(',').map((value: string) => value.trim()).filter(Boolean).map((target: string) => ({ role: target, interval: '5m' })); })} /></label>}
       </div><button className="text-button danger" onClick={() => update(draft => { delete draft.roles[name]; })}>Remove</button>
     </div>)}</div>{!roles.length && <div className="empty compact">Add at least one agent to start a fleet.</div>}</>;
 }
 
-function Automation({ model, roles, update }: { model: Model; roles: string[]; update(fn: (draft: Model) => void): void }) {
+function Automation({ model, roles, advanced, update }: { model: Model; roles: string[]; advanced: boolean; update(fn: (draft: Model) => void): void }) {
   const addWatchdog = () => update(draft => { draft.watchdogs ??= {}; let n = 1; while (draft.watchdogs[`watch${n}`]) n++; draft.watchdogs[`watch${n}`] = { coordinator: roles[0] ?? '', watch: roles, interval: '10m' }; });
   const addLoop = () => update(draft => { draft.loops ??= {}; let n = 1; while (draft.loops[`loop${n}`]) n++; draft.loops[`loop${n}`] = { roles: roles.slice(0, 1), interval: '10m', prompt: 'Review current work and act on the next concrete step.' }; });
-  return <><div className="section-title"><div><h3>Watchdogs & loops</h3><p className="muted">These appear as first-class nodes in topology.</p></div><div><button className="secondary" onClick={addWatchdog}>＋ Watchdog</button> <button className="secondary" onClick={addLoop}>＋ Loop</button></div></div>
+  return <><div className="section-title"><div><h3>3. Add automation only if you need it</h3><p className="muted">Most first fleets can skip this. Watchdogs inspect health; loops send a recurring prompt. Both begin after the scheduler reloads the saved configuration.</p></div><div><button className="secondary" onClick={addWatchdog}>＋ Watchdog</button> <button className="secondary" onClick={addLoop}>＋ Loop</button></div></div>
     <div className="entity-list">{entries(model.watchdogs).map(([name, item]) => <AutomationCard key={`w-${name}`} kind="watchdog" name={name} item={item} update={update} />)}
       {entries(model.loops).map(([name, item]) => <AutomationCard key={`l-${name}`} kind="loop" name={name} item={item} update={update} />)}</div>
+    {!advanced && <p className="decision-note">Switch to Advanced to tune intervals, target lists, and prompts after adding automation.</p>}
     {!entries(model.watchdogs).length && !entries(model.loops).length && <div className="empty compact">Automation is optional. Continue to review when ready.</div>}</>;
 }
 

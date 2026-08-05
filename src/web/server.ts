@@ -23,6 +23,8 @@ import { WebAuth } from './auth.js';
 import { FleetEventBus } from './events.js';
 import type { FleetConfigService } from './fleet-config-service.js';
 import type { TopologySnapshot } from './topology.js';
+import type { RoleRemovalService } from '../application/role-removal-service.js';
+import { ROLE_NAME_RE } from '../config.js';
 
 export interface WebServices {
   query: FleetQueryService;
@@ -36,6 +38,7 @@ export interface WebServices {
   watchdogs?: WatchdogQueryService;
   configuration?: FleetConfigService;
   topology?: () => Promise<TopologySnapshot>;
+  removal?: RoleRemovalService;
   terminalUpgrade?: (
     socket: WebSocket, request: FastifyRequest, roleId: string,
     ticket: string, hello: Record<string, unknown>,
@@ -224,6 +227,24 @@ export async function buildWebServer(
   app.get<{ Params: { id: string } }>('/api/v1/roles/:id', async request => {
     auth.authenticate(request);
     return services.query.detail(request.params.id);
+  });
+
+  app.get<{ Params: { id: string } }>('/api/v1/roles/:id/removal-preview', async request => {
+    auth.authenticate(request);
+    if (!ROLE_NAME_RE.test(request.params.id)) throw new FleetError('invalid_request', 'invalid role name');
+    if (!services.removal) throw new FleetError('capability_unavailable', 'role removal is unavailable');
+    return services.removal.preview(request.params.id);
+  });
+
+  app.post<{ Params: { id: string } }>('/api/v1/roles/:id/remove', async request => {
+    const session = auth.authenticate(request, true);
+    if (!ROLE_NAME_RE.test(request.params.id)) throw new FleetError('invalid_request', 'invalid role name');
+    if (!services.removal) throw new FleetError('capability_unavailable', 'role removal is unavailable');
+    const body = request.body as { confirmation?: string; confirmed?: boolean; coordinatorAcknowledged?: boolean };
+    const result = await services.removal.remove({ role: request.params.id, ...body });
+    events.publish('role.removed', { role: result.role }, result.role);
+    await audit.record({ requestId: request.id, browser: session.id, roleId: result.role, action: 'role.remove', result: 'succeeded' });
+    return result;
   });
 
   app.get<{ Params: { id: string }; Querystring: { since?: string; limit?: string } }>(

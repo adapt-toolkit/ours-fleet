@@ -16,8 +16,10 @@ interface ClaudeOptions {
   mem_palace?: boolean;
   mem_palace_midsession_autosave?: boolean;
   permission_mode?: string;
+  effort?: string;
 }
-const OPTION_KEYS = ['plugins', 'mem_palace', 'mem_palace_midsession_autosave', 'permission_mode'];
+const OPTION_KEYS = ['plugins', 'mem_palace', 'mem_palace_midsession_autosave', 'permission_mode', 'effort'];
+const EFFORT_LEVELS = ['low', 'medium', 'high', 'xhigh', 'max'];
 
 /** Claude Code's accepted --permission-mode values. */
 const PERMISSION_MODES = ['default', 'acceptEdits', 'plan', 'dontAsk', 'bypassPermissions'];
@@ -170,9 +172,13 @@ export function makeClaudeCodeAdapter(exec: Exec = realExec): HarnessAdapter {
       if (opts == null) return [];
       if (typeof opts !== 'object' || Array.isArray(opts))
         return [{ path: 'harness_options', message: 'must be a map' }];
-      return Object.keys(opts)
+      const errors = Object.keys(opts)
         .filter(k => !OPTION_KEYS.includes(k))
         .map(k => ({ path: `harness_options.${k}`, message: `unknown option; allowed: ${OPTION_KEYS.join(', ')}` }));
+      const effort = (opts as ClaudeOptions).effort;
+      if (effort != null && !EFFORT_LEVELS.includes(effort))
+        errors.push({ path: 'harness_options.effort', message: `must be one of: ${EFFORT_LEVELS.join(', ')}` });
+      return errors;
     },
 
     async prepareSession(role: ResolvedRole, dirs: RoleDirs): Promise<SessionPrep> {
@@ -211,7 +217,9 @@ export function makeClaudeCodeAdapter(exec: Exec = realExec): HarnessAdapter {
     buildLaunch(role: ResolvedRole, mode: 'fresh' | 'resume', s: SessionState, prep: SessionPrep): Launch {
       const stateDir = roleStateDir(role);
       const pm = permissionMode(role);
+      const o = role.harness_options as ClaudeOptions | undefined;
       const base = ['claude', ...(role.model ? ['--model', role.model] : []),
+                    ...(o?.effort ? ['--effort', o.effort] : []),
                     ...(pm ? ['--permission-mode', pm] : []),
                     ...prep.argv, '--remote-control', role.name];
       const argv = mode === 'fresh'

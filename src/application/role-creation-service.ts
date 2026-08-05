@@ -18,12 +18,16 @@ import {
 } from '../spawn.js';
 import type { OpsDeps } from '../ops.js';
 import { FleetError, normalizeError } from './errors.js';
+import {
+  claudeModelCatalog, codexModelCatalog, type HarnessModelCatalog, type HarnessModelOption,
+} from './model-catalog.js';
 
 export interface CreateRoleSessionRequest {
   name: string;
   harness: 'codex' | 'claude-code';
   /** null means the selected harness's own default; web blank fields send null. */
   model?: string | null;
+  reasoningEffort?: string | null;
   session: 'acp' | 'tmux';
   cwd?: string;
   lifetime: 'permanent' | 'temporary';
@@ -51,7 +55,9 @@ export interface CreationCapabilities {
   reasons: string[];
   harnesses: Array<{
     id: 'codex' | 'claude-code'; available: boolean;
-    sessions: Array<'acp' | 'tmux'>; defaultModel?: string; models: string[]; warnings: string[];
+    sessions: Array<'acp' | 'tmux'>; defaultModel?: string; models: string[];
+    modelOptions: HarnessModelOption[]; catalogSource: string; customModelAllowed: true;
+    warnings: string[];
   }>;
   lifetimes: Array<'permanent' | 'temporary'>;
   identityBootstrap: {
@@ -75,7 +81,7 @@ export interface CreationPreview {
   request: CreateRoleSessionRequest;
   effective: {
     name: string; identity: string; harness: string; session: 'acp' | 'tmux';
-    model?: string; cwd?: string; lifetime: 'permanent' | 'temporary';
+    model?: string; reasoningEffort?: string; cwd?: string; lifetime: 'permanent' | 'temporary';
     permissions: CommonPermissions;
     monitor: MonitorConfig;
   };
@@ -127,6 +133,7 @@ export interface RoleCreationServiceOptions {
   journalDir?: string;
   probeReady?: (name: string, session: 'acp' | 'tmux') => Promise<'ready' | 'attention' | 'unknown'>;
   onProgress?: (action: CreationAction) => void;
+  modelCatalogs?: Partial<Record<'codex' | 'claude-code', () => HarnessModelCatalog>>;
 }
 
 const canonical = (value: unknown): string => {
@@ -168,13 +175,21 @@ export class RoleCreationService {
       roles = config.roles;
     }
     catch (error) { reasons.push(`configuration is invalid: ${(error as Error).message}`); }
-    const modelsFor = (harness: 'codex' | 'claude-code', suggested: string[]): string[] => {
+    const modelsFor = (harness: 'codex' | 'claude-code', catalog: HarnessModelCatalog) => {
       const configured = roles.filter(role => role.harness === harness)
         .flatMap(role => [role.model, ...(role.model_chain ?? [])])
         .filter((model): model is string => Boolean(model));
       const inherited = resolveRoleModel(undefined, harness, defaults);
-      return [...new Set([...(inherited ? [inherited] : []), ...configured, ...suggested])];
+      const configuredOptions: HarnessModelOption[] = [...new Set([...(inherited ? [inherited] : []), ...configured])]
+        .filter(id => !catalog.models.some(model => model.id === id))
+        .map(id => ({ id, label: `${id} (configured)`, reasoningEfforts: [], source: 'fleet-config' as const }));
+      const modelOptions = [...configuredOptions, ...catalog.models];
+      return { modelOptions, models: modelOptions.map(model => model.id) };
     };
+    const codexCatalog = this.options.modelCatalogs?.codex?.() ?? codexModelCatalog();
+    const claudeCatalog = this.options.modelCatalogs?.['claude-code']?.() ?? claudeModelCatalog();
+    const codexModels = modelsFor('codex', codexCatalog);
+    const claudeModels = modelsFor('claude-code', claudeCatalog);
     return {
       available: reasons.length === 0,
       reasons,
@@ -182,12 +197,14 @@ export class RoleCreationService {
         {
           id: 'codex', available: true, sessions: ['acp', 'tmux'],
           defaultModel: resolveRoleModel(undefined, 'codex', defaults),
-          models: modelsFor('codex', ['gpt-5.6', 'gpt-5.4']), warnings: [],
+          ...codexModels, catalogSource: 'codex-runtime-catalog', customModelAllowed: true,
+          warnings: codexCatalog.warnings,
         },
         {
           id: 'claude-code', available: true, sessions: ['acp', 'tmux'],
           defaultModel: resolveRoleModel(undefined, 'claude-code', defaults),
-          models: modelsFor('claude-code', ['sonnet', 'opus', 'haiku']), warnings: [],
+          ...claudeModels, catalogSource: 'claude-adapter-2.1', customModelAllowed: true,
+          warnings: claudeCatalog.warnings,
         },
       ],
       lifetimes: ['permanent', 'temporary'],
@@ -221,6 +238,7 @@ export class RoleCreationService {
       harness: request.harness ?? (defaults.harness as string | undefined) ?? 'claude-code',
       session: request.session ?? (defaults.session as 'acp' | 'tmux' | undefined) ?? 'tmux',
       model: resolveRoleModel(request.model, request.harness, defaults),
+      reasoningEffort: request.reasoningEffort ?? undefined,
       cwd, lifetime: request.lifetime,
       permissions: resolvePermissions(defaults.permissions, request.permissions),
       monitor: resolveMonitorConfig(defaults.monitor, request.monitor),
@@ -394,6 +412,9 @@ export class RoleCreationService {
     if (!['permanent', 'temporary'].includes(input.lifetime))
       throw new FleetError('invalid_request', 'unsupported lifetime');
     bounded(input.model ?? undefined, 'model', 128);
+    bounded(input.reasoningEffort ?? undefined, 'reasoning effort', 16);
+    if (input.reasoningEffort != null && !['low', 'medium', 'high', 'xhigh', 'max', 'ultra'].includes(input.reasoningEffort))
+      throw new FleetError('invalid_request', 'unsupported reasoning effort');
     bounded(input.mission, 'mission', 4_096);
     bounded(input.coordinator, 'coordinator', 128);
     bounded(input.bio, 'bio', 8_192);
@@ -407,6 +428,7 @@ export class RoleCreationService {
     }
     return {
       ...input, model: input.model === null ? null : input.model?.trim() || undefined,
+      reasoningEffort: input.reasoningEffort === null ? null : input.reasoningEffort?.trim() || undefined,
       mission: input.mission?.trim() || undefined, coordinator: input.coordinator?.trim() || undefined,
       bio: input.bio?.trim() || undefined, persona: input.persona?.trim() || undefined,
       monitor: input.monitor ? structuredClone(input.monitor) : undefined,
@@ -434,6 +456,7 @@ export class RoleCreationService {
     return {
       name: request.name, identity: request.name, harness: request.harness,
       model: request.model, session: request.session, cwd: request.cwd,
+      reasoningEffort: request.reasoningEffort,
       mission: request.mission, coordinator: request.coordinator,
       approval: request.permissions.approval, filesystem: request.permissions.filesystem,
       unattended: request.permissions.unattended, bio: request.bio, persona: request.persona,

@@ -285,8 +285,16 @@ const services = {
       return {
         available: true, reasons: [],
         harnesses: [
-          { id: 'codex', available: true, sessions: ['acp', 'tmux'], models: ['gpt-5.6', 'gpt-5.4'], warnings: [] },
-          { id: 'claude-code', available: true, sessions: ['acp', 'tmux'], models: ['sonnet', 'opus', 'haiku'], warnings: [] },
+          { id: 'codex', available: true, sessions: ['acp', 'tmux'], models: ['gpt-5.6-sol', 'gpt-5.6-terra'],
+            modelOptions: [
+              { id: 'gpt-5.6-sol', label: 'GPT-5.6-Sol', reasoningEfforts: ['low', 'medium', 'high', 'xhigh', 'max', 'ultra'], defaultReasoningEffort: 'low', source: 'codex-runtime-catalog' },
+              { id: 'gpt-5.6-terra', label: 'GPT-5.6-Terra', reasoningEfforts: ['low', 'medium', 'high'], defaultReasoningEffort: 'medium', source: 'codex-runtime-catalog' },
+            ], catalogSource: 'codex-runtime-catalog', customModelAllowed: true, warnings: [] },
+          { id: 'claude-code', available: true, sessions: ['acp', 'tmux'], models: ['claude-fable-5', 'claude-opus-5'],
+            modelOptions: [
+              { id: 'claude-fable-5', label: 'Claude Fable 5', reasoningEfforts: ['low', 'medium', 'high', 'xhigh', 'max'], source: 'claude-adapter-2.1' },
+              { id: 'claude-opus-5', label: 'Claude Opus 5', reasoningEfforts: ['low', 'medium', 'high', 'xhigh', 'max'], source: 'claude-adapter-2.1' },
+            ], catalogSource: 'claude-adapter-2.1', customModelAllowed: true, warnings: [] },
         ],
         lifetimes: ['permanent', 'temporary'],
         identityBootstrap: {
@@ -325,6 +333,15 @@ const services = {
       actions.set(action.actionId, action); return action;
     },
     get(id) { return actions.get(id); },
+  },
+  removal: {
+    preview(role) {
+      return { role, configured: true, lifetime: 'permanent', confirmation: 'typed-role-name',
+        coordinatorProtection: false, selfProtected: false,
+        effects: [`Stop and uninstall the exact backend registration for '${role}'.`, `/fixture/state/${role}`],
+        recovery: { available: true, detail: 'Fixture recovery archive is available.' } };
+    },
+    async remove(input) { return { ...this.preview(input.role), removed: true, recoveryPath: `/fixture/recovery/${input.role}` }; },
   },
   async terminalUpgrade(socket) {
     socket.send(JSON.stringify({

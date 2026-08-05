@@ -8,6 +8,20 @@ export type TopologyEdge = {
 };
 export type Topology = { nodes: TopologyNode[]; edges: TopologyEdge[]; unknownLineage: string[] };
 
+export const EDGE_LEGEND: Array<{ kind: TopologyEdge['kind']; label: string; description: string }> = [
+  { kind: 'oversees', label: 'Oversight', description: 'A coordinator is responsible for checking this agent.' },
+  { kind: 'watches', label: 'Watchdog', description: 'A watchdog checks this agent on its configured interval.' },
+  { kind: 'targets', label: 'Scheduled loop', description: 'A scheduled loop sends recurring work to this agent.' },
+  { kind: 'spawned', label: 'Temporary spawn', description: 'This agent was created by another agent; dashed mint shows its runtime parent.' },
+];
+
+export function describeEdge(edge: TopologyEdge, nodeId?: string): string {
+  const legend = EDGE_LEGEND.find(item => item.kind === edge.kind)!;
+  const direction = nodeId === edge.to ? `incoming from ${edge.from}`
+    : nodeId === edge.from ? `outgoing to ${edge.to}` : `${edge.from} to ${edge.to}`;
+  return `${legend.label}: ${direction}. ${legend.description}`;
+}
+
 export interface PositionedNode extends TopologyNode { x: number; y: number }
 
 export function layoutTopology(topology: Topology): { nodes: PositionedNode[]; height: number } {

@@ -1,9 +1,10 @@
-import { layoutTopology, nodeDestination, type Topology, type TopologyNode } from './topology-presentation';
+import { describeEdge, EDGE_LEGEND, layoutTopology, nodeDestination, type Topology, type TopologyNode } from './topology-presentation';
 
-export function FleetTopology({ topology, onAgent, onWatchdog }: {
+export function FleetTopology({ topology, onAgent, onWatchdog, onRemove }: {
   topology: Topology;
   onAgent(id: string): void;
   onWatchdog(id: string): void;
+  onRemove?(id: string): void;
 }) {
   const layout = layoutTopology(topology);
   const byId = new Map(layout.nodes.map(node => [node.id, node]));
@@ -13,6 +14,12 @@ export function FleetTopology({ topology, onAgent, onWatchdog }: {
     if (destination?.kind === 'watchdog') onWatchdog(destination.id);
   };
   return <>
+    <section className="topology-legend" aria-label="Topology connection legend">
+      <strong>Connections</strong>
+      <ul>{EDGE_LEGEND.map(item => <li key={item.kind} tabIndex={0} aria-label={`${item.label}. ${item.description}`} title={item.description}>
+        <span className={`legend-line ${item.kind}`} aria-hidden="true" /><span><b>{item.label}</b><small>{item.description}</small></span>
+      </li>)}</ul>
+    </section>
     <div className="topology" aria-label="Interactive fleet topology">
       <div className="topology-canvas" style={{ height: layout.height }}>
         <svg aria-hidden="true" viewBox={`0 0 1000 ${layout.height}`} preserveAspectRatio="none">
@@ -24,13 +31,16 @@ export function FleetTopology({ topology, onAgent, onWatchdog }: {
             </g> : null;
           })}
         </svg>
-        {layout.nodes.map(node => <button key={node.id}
+        {layout.nodes.map(node => <div key={node.id}
           className={`topology-node ${node.kind} ${node.status} ${node.lifetime ?? ''}`}
-          style={{ left: node.x, top: node.y }} onClick={() => activate(node)}
-          disabled={!nodeDestination(node)} aria-label={`${node.kind} ${node.label}, ${node.status}`}>
-          <small>{node.kind}{node.lifetime ? ` · ${node.lifetime}` : ''}</small>
-          <strong>{node.label}</strong><span>{node.detail || node.status}</span>
-        </button>)}
+          style={{ left: node.x, top: node.y }}>
+          <button className="topology-open" onClick={() => activate(node)}
+            disabled={!nodeDestination(node)} aria-label={`${node.kind} ${node.label}, ${node.status}`}>
+            <small>{node.kind}{node.lifetime ? ` · ${node.lifetime}` : ''}</small>
+            <strong>{node.label}</strong><span>{node.detail || node.status}</span>
+          </button>
+          {node.kind === 'agent' && onRemove && <button className="topology-remove" aria-label={`Remove ${node.label}`} title={`Safely remove ${node.label}`} onClick={() => onRemove(node.label)}>×</button>}
+        </div>)}
       </div>
     </div>
     {topology.unknownLineage.length > 0 && <p className="lineage-note">
@@ -44,7 +54,7 @@ export function FleetTopology({ topology, onAgent, onWatchdog }: {
             ? <button className="text-button" onClick={() => activate(node)}>{node.label}</button>
             : node.label}</td><td>{node.status}</td>
           <td>{topology.edges.filter(edge => edge.from === node.id || edge.to === node.id)
-            .map(edge => edge.label).join(', ') || '—'}</td>
+            .map(edge => describeEdge(edge, node.id)).join(' ') || '—'}</td>
         </tr>)}</tbody></table>
       </details>
   </>;

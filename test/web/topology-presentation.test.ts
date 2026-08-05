@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { layoutTopology, nodeDestination, type Topology } from '../../web/src/topology-presentation.js';
+import { describeEdge, EDGE_LEGEND, layoutTopology, nodeDestination, type Topology } from '../../web/src/topology-presentation.js';
 
 describe('topology presentation', () => {
   const topology: Topology = {
@@ -27,5 +27,11 @@ describe('topology presentation', () => {
     expect(nodeDestination(topology.nodes[0])).toEqual({ kind: 'agent', id: 'Parent' });
     expect(nodeDestination(topology.nodes[3])).toEqual({ kind: 'watchdog', id: 'watch' });
     expect(nodeDestination(topology.nodes[4])).toBeUndefined();
+  });
+
+  it('defines an accessible explanation for every edge style and fallback direction', () => {
+    expect(EDGE_LEGEND.map(item => item.kind)).toEqual(['oversees', 'watches', 'targets', 'spawned']);
+    expect(describeEdge(topology.edges[0], 'agent:Child')).toContain('incoming from agent:Parent');
+    expect(EDGE_LEGEND.every(item => item.description.length > 20)).toBe(true);
   });
 });

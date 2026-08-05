@@ -9,6 +9,19 @@ test('bootstrap, inventory, live navigation, send, create, and security boundari
   await expect(page.getByText('Alpha', { exact: true }).first()).toBeVisible();
   await expect(page.getByText('Terminal', { exact: true }).first()).toBeVisible();
   await expect(page.getByLabel('Interactive fleet topology')).toBeVisible();
+  await expect(page.getByLabel('Topology connection legend')).toContainText('Oversight');
+  await expect(page.getByLabel('Topology connection legend')).toContainText('Temporary spawn');
+  await page.getByRole('button', { name: 'Configure' }).click();
+  await expect(page.getByRole('heading', { name: '1. Choose how agents run' })).toBeVisible();
+  await expect(page.getByLabel('Configuration detail level')).toContainText('Basic');
+  await page.getByLabel('Fleet model').selectOption('gpt-5.6-sol');
+  await expect(page.getByLabel('Fleet reasoning effort')).toHaveValue('low');
+  await page.getByLabel('Fleet reasoning effort').selectOption('ultra');
+  await page.getByLabel('Configuration detail level').getByRole('button', { name: 'Advanced' }).click();
+  await expect(page.getByPlaceholder('exact vendor model ID')).toHaveValue('gpt-5.6-sol');
+  await page.getByRole('button', { name: 'Continue' }).click();
+  await expect(page.getByRole('heading', { name: '2. Name the agents and give each a job' })).toBeVisible();
+  await page.getByRole('button', { name: 'Topology' }).click();
   await expect(page.getByRole('button', { name: 'agent Alpha, ready' })).toBeVisible();
   await expect(page.getByText('Dormant', { exact: true })).toHaveCount(0);
   await expect(page.getByRole('button', { name: 'Needs attention 0' })).toBeVisible();
@@ -123,6 +136,7 @@ test('bootstrap, inventory, live navigation, send, create, and security boundari
   await expect(page.getByText('new value')).toBeVisible();
   await expect(page.getByText(/"path": "fixture.ts"/)).toBeVisible();
   await page.getByRole('button', { name: 'overview' }).click();
+  await expect(page.getByRole('button', { name: 'Remove role…' })).toBeVisible();
   await expect(page.getByText('authoritative')).toBeVisible();
   await page.bringToFront();
   expect(await page.evaluate(() => document.visibilityState)).toBe('visible');
@@ -142,14 +156,16 @@ test('bootstrap, inventory, live navigation, send, create, and security boundari
   await expect(page.getByText('accepted; turn may still be running')).toBeVisible();
   await page.getByRole('button', { name: /Create role/ }).click();
   await page.getByLabel('Role / session name').fill('Researcher');
-  await expect(page.getByText('type any ID; blank uses harness default')).toBeVisible();
+  await expect(page.getByLabel('Setup detail level')).toContainText('Basic');
   await expect(page.getByLabel('Known model').locator('option')).toHaveText([
-    'Harness default / custom ID', 'gpt-5.6', 'gpt-5.4',
+    'Use harness default (resolved after launch)', 'GPT-5.6-Sol — gpt-5.6-sol', 'GPT-5.6-Terra — gpt-5.6-terra',
   ]);
-  await page.getByLabel('Known model').selectOption('gpt-5.6');
+  await page.getByLabel('Known model').selectOption('gpt-5.6-sol');
+  await expect(page.getByLabel('Reasoning effort')).toHaveValue('low');
+  await page.getByLabel('Reasoning effort').selectOption('ultra');
+  await page.getByRole('button', { name: 'Advanced' }).click();
   const modelId = page.getByRole('textbox', { name: 'Model', exact: true });
-  await expect(modelId).toHaveValue('gpt-5.6');
-  await modelId.fill('');
+  await expect(modelId).toHaveValue('gpt-5.6-sol');
   await page.getByLabel('Monitor mode').selectOption('native');
   await expect(page.getByLabel('Monitor wake sources')).toHaveCount(0);
   await page.getByLabel('Monitor mode').selectOption('fleet');
@@ -161,8 +177,8 @@ test('bootstrap, inventory, live navigation, send, create, and security boundari
   await page.getByRole('button', { name: 'Review effective plan' }).click();
   const effectivePlan = page.locator('.review');
   await expect(effectivePlan.getByText('Effective plan')).toBeVisible();
-  await expect(effectivePlan.getByText('harness default', { exact: true })).toBeVisible();
-  await expect(effectivePlan.getByText('gpt-5.6')).toHaveCount(0);
+  await expect(effectivePlan.getByText('gpt-5.6-sol', { exact: true })).toBeVisible();
+  await expect(effectivePlan.getByText('ultra', { exact: true })).toBeVisible();
   await expect(page.getByText(/"batch_ms":750/)).toBeVisible();
   await expect(page.getByText(/"inbound_error"/)).toBeVisible();
   await page.getByRole('button', { name: 'Create atomically' }).click();
@@ -215,6 +231,15 @@ test('bootstrap, inventory, live navigation, send, create, and security boundari
     expect(cached).toContain('/offline.html');
     expect(cached.every(path => path === '/offline.html' || path.startsWith('/assets/'))).toBe(true);
   }
+  const removalDialogs: string[] = [];
+  page.on('dialog', async dialog => {
+    removalDialogs.push(dialog.message());
+    await dialog.accept(dialog.type() === 'prompt' ? 'Alpha' : undefined);
+  });
+  await page.getByRole('button', { name: 'Remove Alpha' }).click();
+  await expect.poll(() => removalDialogs.length).toBeGreaterThanOrEqual(3);
+  expect(removalDialogs.join('\n')).toContain("Stop and uninstall the exact backend registration for 'Alpha'.");
+  expect(removalDialogs.join('\n')).toContain('/fixture/recovery/Alpha');
   await page.getByRole('button', { name: 'Sign out' }).click();
   await expect(page.getByText(/ours-fleet web open/)).toBeVisible();
   expect((await page.context().cookies()).filter(cookie =>

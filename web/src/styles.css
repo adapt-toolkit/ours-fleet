@@ -180,11 +180,24 @@ legend { margin-bottom: 13px; color: var(--mint); text-transform: uppercase; fon
 .topology svg { position: absolute; inset: 0; width: 100%; height: 100%; }
 .edge line { stroke: #405052; stroke-width: 1.5; vector-effect: non-scaling-stroke; }
 .edge.spawned line { stroke: var(--mint); stroke-dasharray: 5 4; }
-.edge.watches line { stroke: #d7ad58; }
-.edge.targets line { stroke: #729ed6; }
-.topology-node { position: absolute; width: 150px; min-height: 62px; display: grid; gap: 3px; z-index: 1; padding: 10px 12px; text-align: left; border: 1px solid #344044; border-radius: 10px; background: #111718; box-shadow: 0 8px 24px rgba(0,0,0,.28); cursor: pointer; transform: translateY(-50%); }
+.edge.watches line { stroke: #d7ad58; stroke-dasharray: 2 3; }
+.edge.targets line { stroke: #729ed6; stroke-dasharray: 9 3 2 3; }
+.topology-legend { display: grid; gap: 8px; margin: 0 0 12px; padding: 12px 14px; border: 1px solid var(--line); border-radius: 10px; background: #0c1112; }
+.topology-legend ul { display: grid; grid-template-columns: repeat(4, minmax(140px, 1fr)); gap: 8px; margin: 0; padding: 0; list-style: none; }
+.topology-legend li { display: flex; gap: 9px; align-items: start; padding: 7px; border-radius: 7px; }
+.topology-legend li:focus { outline: 2px solid var(--mint); outline-offset: 1px; }
+.topology-legend li > span:last-child { display: grid; gap: 2px; }
+.topology-legend small { color: var(--muted); line-height: 1.3; }
+.legend-line { width: 34px; margin-top: 7px; border-top: 2px solid #405052; flex: 0 0 auto; }
+.legend-line.spawned { border-color: var(--mint); border-top-style: dashed; }
+.legend-line.watches { border-color: #d7ad58; border-top-style: dotted; }
+.legend-line.targets { height: 5px; border-color: #729ed6; border-bottom: 1px dotted #729ed6; }
+.topology-node { position: absolute; width: 150px; min-height: 62px; display: grid; gap: 3px; z-index: 1; padding: 0; text-align: left; border: 1px solid #344044; border-radius: 10px; background: #111718; box-shadow: 0 8px 24px rgba(0,0,0,.28); transform: translateY(-50%); }
+.topology-open { display: grid; gap: 3px; min-width: 0; padding: 10px 28px 10px 12px; color: inherit; text-align: left; border: 0; background: transparent; cursor: pointer; }
+.topology-remove { position: absolute; top: 5px; right: 5px; width: 22px; height: 22px; padding: 0; color: var(--muted); border: 0; background: transparent; }
+.topology-remove:hover, .topology-remove:focus { color: #ff8e85; }
 .topology-node:hover { border-color: var(--mint); transform: translateY(-50%) translateY(-2px); }
-.topology-node:disabled { cursor: default; opacity: 1; }
+.topology-open:disabled { cursor: default; opacity: 1; }
 .topology-node small { color: var(--muted); text-transform: uppercase; font-size: 9px; letter-spacing: 1px; }
 .topology-node strong { overflow: hidden; text-overflow: ellipsis; }
 .topology-node span { color: var(--muted); overflow: hidden; white-space: nowrap; text-overflow: ellipsis; font-size: 10px; }
@@ -211,6 +224,11 @@ legend { margin-bottom: 13px; color: var(--mint); text-transform: uppercase; fon
 .setup-steps li.done { color: var(--mint); border-color: #315e4a; }
 .setup-panel { min-height: 360px; }
 .setup-panel h3 { margin-bottom: 6px; }
+.mode-switch { display: flex; gap: 8px; align-items: center; margin: 0 0 14px; padding: 8px; border: 1px solid var(--line); border-radius: 10px; }
+.mode-switch button.active { color: #07110d; background: var(--mint); border-color: var(--mint); }
+.mode-switch span { margin-left: 6px; color: var(--muted); font-size: 12px; }
+.decision-note { display: flex; gap: 10px; margin: 12px 0; padding: 11px; border-left: 3px solid var(--mint); background: #102019; color: var(--muted); }
+.decision-note strong { color: #dce6e2; white-space: nowrap; }
 .setup-actions { display: grid; grid-template-columns: auto 1fr auto; gap: 10px; margin-top: 22px; padding-top: 18px; border-top: 1px solid var(--line); }
 .section-title { display: flex; justify-content: space-between; align-items: start; gap: 20px; }
 .entity-list { display: grid; gap: 12px; }
@@ -223,6 +241,11 @@ legend { margin-bottom: 13px; color: var(--mint); text-transform: uppercase; fon
 .setup-panel details { margin-top: 14px; }
 .setup-panel summary { cursor: pointer; color: #cbd4d6; }
 .config-diff { max-height: 360px; padding: 14px; border-radius: 8px; background: #080b0c; }
+@media (max-width: 760px) {
+  .topology-legend ul { grid-template-columns: 1fr; }
+  .mode-switch { align-items: stretch; flex-wrap: wrap; }
+  .mode-switch span { flex-basis: 100%; margin-left: 0; }
+}
 .check-list { display: grid; gap: 7px; padding-left: 20px; font-size: 12px; }
 .check-list .ok::marker { color: var(--mint); }
 .check-list .failed::marker { color: var(--red); }

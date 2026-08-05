@@ -52,6 +52,7 @@ export interface SpawnOpts {
   launcher?: string;
   search?: boolean;
   codexConfig?: Record<string, string | number | boolean>;
+  reasoningEffort?: string | null;
   addDirs?: string[];
   monitor?: boolean;
   /** Typed external monitor configuration used by trusted creation surfaces. */
@@ -112,7 +113,10 @@ export function buildRoleConfig(o: SpawnOpts, defaultHarness?: string): RoleConf
   if (o.profile) harnessOptions.profile = o.profile;
   if (o.launcher) harnessOptions.launcher = o.launcher;
   if (o.search === true) harnessOptions.search = true;
-  if (o.codexConfig && Object.keys(o.codexConfig).length) harnessOptions.config = o.codexConfig;
+  const codexConfig = { ...(o.codexConfig ?? {}) };
+  if (o.reasoningEffort && harness === 'codex') codexConfig.model_reasoning_effort = o.reasoningEffort;
+  if (Object.keys(codexConfig).length) harnessOptions.config = codexConfig;
+  if (o.reasoningEffort && harness === 'claude-code') harnessOptions.effort = o.reasoningEffort;
   if (o.addDirs?.length) harnessOptions.add_dirs = o.addDirs;
   if (o.monitor === true) harnessOptions.monitor = true;
   if (Object.keys(harnessOptions).length) r.harness_options = harnessOptions;
