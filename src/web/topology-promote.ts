@@ -129,8 +129,8 @@ export class TopologyPromoteService {
     assertConfiguredAgent(merged, roles, to, 'be overseen');
 
     const entry = mapping(from, roles[from]);
-    const existing = Array.isArray(entry.oversee) ? entry.oversee : [];
-    if (existing.some(item => (item as { role?: unknown } | null)?.role === to))
+    const existing = existingOversight(from, entry.oversee);
+    if (existing.some(item => item.role === to))
       throw new FleetError('conflict', `${from} already oversees ${to}`);
     entry.oversee = [...existing, { role: to, interval }];
     roles[from] = entry;
@@ -293,6 +293,46 @@ function assertConfiguredAgent(
     throw new FleetError('invalid_request', `${name} is still a sketch — add it to the fleet before it can ${action}`);
   if (roles[name] === undefined)
     throw new FleetError('invalid_request', `${name} is not in fleet.yaml, so it cannot ${action}`);
+}
+
+/**
+ * The `oversee:` already written for this role, or a refusal.
+ *
+ * Appending is only safe when every existing entry can be carried across
+ * unchanged AND compared against, so this accepts exactly the shape the fleet
+ * reads — a sequence of mappings with a `role` — and refuses everything else by
+ * name instead of overwriting it. The shapes that matter are real: `oversee:` as
+ * a mapping or a scalar would be *replaced* by a list, silently discarding it,
+ * and a bare-string entry (`- Worker`) would slip past a duplicate check that
+ * only looks at `.role`, so the same ward would be added twice.
+ *
+ * Entries are returned as they were found, extra keys and all: the write adds
+ * one entry, it does not normalise the operator's.
+ */
+function existingOversight(name: string, value: unknown): Array<Record<string, unknown>> {
+  if (value === undefined || value === null) return [];
+  const fix = 'Fix it in the configuration editor first.';
+  if (!Array.isArray(value))
+    throw new FleetError('invalid_request',
+      `${name}'s oversee: is ${describeShape(value)}, not a list of entries. ${fix}`);
+  return value.map(item => {
+    if (!item || typeof item !== 'object' || Array.isArray(item))
+      throw new FleetError('invalid_request',
+        `${name}'s oversee: has an entry that is ${describeShape(item)}; every entry must be a mapping with a role. ${fix}`);
+    const entry = item as Record<string, unknown>;
+    if (typeof entry.role !== 'string' || entry.role === '')
+      throw new FleetError('invalid_request',
+        `${name}'s oversee: has an entry with no role. ${fix}`);
+    return entry;
+  });
+}
+
+function describeShape(value: unknown): string {
+  if (value === null || value === undefined) return 'empty';
+  if (Array.isArray(value)) return 'a list';
+  if (typeof value === 'object') return 'a mapping';
+  if (typeof value === 'string') return `the text "${value.slice(0, 40)}"`;
+  return `the ${typeof value} ${String(value)}`;
 }
 
 /**

@@ -45,6 +45,20 @@ describe('fleet topology derivation', () => {
     expect(topology.unknownLineage).toEqual([]);
   });
 
+  it('draws what it can read when oversee: was hand-edited into a shape the loader allows', () => {
+    // The loader passes `oversee:` through unchecked, so a mapping, a scalar or
+    // a bare-string entry reaches the graph. None of them may take it down —
+    // the console would be unusable exactly when it is needed to fix them.
+    for (const oversee of [{ role: 'Worker' }, 'Worker', ['Worker'], [{ interval: '5m' }], null]) {
+      const config = {
+        roles: [{ name: 'Coordinator', oversee }, { name: 'Worker' }], watchdogs: [], loops: [],
+      } as unknown as FleetConfig;
+      const topology = deriveTopology(config, [roleItem('Coordinator'), roleItem('Worker')]);
+      expect(topology.nodes.map(node => node.id)).toEqual(['agent:Coordinator', 'agent:Worker']);
+      expect(topology.edges).toEqual([]);
+    }
+  });
+
   it('does not invent lineage when provenance is absent or names a missing parent', () => {
     const topology = deriveTopology({ roles: [], watchdogs: [], loops: [] } as unknown as FleetConfig, [
       roleItem('Unattributed', 'temporary'), roleItem('Orphaned', 'temporary', 'Missing'),

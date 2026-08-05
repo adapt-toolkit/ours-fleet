@@ -7,7 +7,7 @@ import {
 } from './topology-edit-model';
 import {
   type Topology, type TopologyNode,
-  EDGE_LEGEND, badgeFor, canLaunch, canPromote, describeEdge,
+  EDGE_LEGEND, badgeFor, canLaunch, canOversee, canPromote, describeEdge,
   layoutEdges, layoutInteractive, nodeDestination,
 } from './topology-presentation';
 
@@ -85,6 +85,8 @@ export function TopologyEditor({ topology, onRefresh, onOpenAgent, onOpenWatchdo
   const revisionRef = useRef('');
   const writes = useRef<Promise<void>>(Promise.resolve());
   const queued = useRef(0);
+  /** The node whose control should get the keyboard back when a gesture ends. */
+  const restoreFocus = useRef('');
 
   useEffect(() => {
     const query = matchMedia('(max-width: 760px)');
@@ -101,9 +103,27 @@ export function TopologyEditor({ topology, onRefresh, onOpenAgent, onOpenWatchdo
    */
   useEffect(() => {
     if (!connecting) return;
-    const cancel = (event: KeyboardEvent) => { if (event.key === 'Escape') setConnecting(''); };
+    const cancel = (event: KeyboardEvent) => { if (event.key === 'Escape') stopConnecting(); };
     window.addEventListener('keydown', cancel);
     return () => window.removeEventListener('keydown', cancel);
+  }, [connecting]);
+
+  /**
+   * Give the keyboard back what it started from.
+   *
+   * The gesture takes focus away to the banner and unmounts the control that
+   * began it, so cancelling, escaping or being refused would otherwise drop
+   * focus onto the document body — the owner would have to tab in from the top
+   * of the page to try again. The control is remounted by this render, so it is
+   * found by id rather than kept as a stale element reference.
+   */
+  useEffect(() => {
+    const id = restoreFocus.current;
+    if (connecting || !id) return;
+    restoreFocus.current = '';
+    const card = document.querySelector(`[data-node-id="${id}"]`);
+    const control = card?.querySelector('[data-action="oversee"]') ?? card?.querySelector('.topology-open');
+    (control as HTMLElement | undefined)?.focus();
   }, [connecting]);
 
   const load = useCallback(async () => {
@@ -177,6 +197,10 @@ export function TopologyEditor({ topology, onRefresh, onOpenAgent, onOpenWatchdo
     void save(next);
   };
 
+  const startConnecting = (id: string) => { setConnecting(id); setNotice(''); };
+  /** End the gesture and hand the keyboard back to the control that began it. */
+  const stopConnecting = () => { restoreFocus.current = connecting; setConnecting(''); };
+
   /**
    * Finish a pending connection. A sketch owns its edges, so that stays local;
    * oversight between two agents in the fleet is a configuration write and goes
@@ -185,8 +209,10 @@ export function TopologyEditor({ topology, onRefresh, onOpenAgent, onOpenWatchdo
    */
   const attempt = (from: string, to: string) => {
     const plan = planConnection(draft, from, to, context);
+    // A refusal hands the keyboard back to where the gesture started; a plan
+    // that lands moves on to the sketch or the review dialog instead.
+    if (isRefusal(plan)) { stopConnecting(); setNotice(plan.error); return; }
     setConnecting('');
-    if (isRefusal(plan)) { setNotice(plan.error); return; }
     setNotice('');
     if (plan.action === 'draft') { void save(plan.draft); return; }
     void previewOversee(plan.from, plan.to);
@@ -236,7 +262,7 @@ export function TopologyEditor({ topology, onRefresh, onOpenAgent, onOpenWatchdo
 
   /** Alt+Arrow nudges the focused card 8px, Alt+Shift+Arrow 1px. */
   const onCanvasKey = (event: React.KeyboardEvent) => {
-    if (event.key === 'Escape') { setConnecting(''); setSelected(''); return; }
+    if (event.key === 'Escape') { stopConnecting(); setSelected(''); return; }
     if (!event.altKey) return;
     const step = event.shiftKey ? 1 : 8;
     const delta = { ArrowLeft: [-step, 0], ArrowRight: [step, 0], ArrowUp: [0, -step], ArrowDown: [0, step] }[event.key];
@@ -283,7 +309,7 @@ export function TopologyEditor({ topology, onRefresh, onOpenAgent, onOpenWatchdo
         ? <>Choose the agent <b>{nodeName(connecting)}</b> should oversee — every {OVERSEE_INTERVAL}.</>
         : <>Connecting from <b>{nodeName(connecting)}</b>. Choose an agent to connect to.</>}
       {' '}
-      <button className="text-button" autoFocus onClick={() => setConnecting('')}
+      <button className="text-button" autoFocus onClick={stopConnecting}
         aria-label={`Cancel connecting from ${nodeName(connecting)}`}>Cancel</button>
       {' '}or press Escape.
     </p>}
@@ -313,7 +339,7 @@ export function TopologyEditor({ topology, onRefresh, onOpenAgent, onOpenWatchdo
           writable={writable}
           onAddWatchdog={() => create('watchdog', { to: node.id })}
           onAddLoop={() => create('loop', { to: node.id })}
-          onOversee={() => { setConnecting(node.id); setNotice(''); }}
+          onOversee={() => startConnecting(node.id)}
         />)}
       </div>
     </div>}
@@ -333,7 +359,7 @@ export function TopologyEditor({ topology, onRefresh, onOpenAgent, onOpenWatchdo
         void save(result);
       }}
       connecting={connecting}
-      onConnectFrom={() => { setConnecting(selectedNode.id); setNotice(''); }}
+      onConnectFrom={() => startConnecting(selectedNode.id)}
       onWatchThis={() => create('watchdog', { to: selectedNode.id })}
       onLoopFor={() => create('loop', { to: selectedNode.id })}
       onConfigure={onConfigure}
@@ -458,9 +484,10 @@ function NodeCard({
           aria-label={`Add a watchdog for ${node.label}`}>+ Watchdog</button>
         <button className="node-action" onClick={onAddLoop}
           aria-label={`Add a loop for ${node.label}`}>+ Loop</button>
-        <button className="node-action" onClick={onOversee}
-          aria-label={`Have ${node.label} oversee another agent`}>Oversee</button>
       </>}
+      {node.kind === 'agent' && canOversee(node, writable) && <button
+        className="node-action" data-action="oversee" onClick={onOversee}
+        aria-label={`Have ${node.label} oversee another agent`}>Oversee</button>}
     </div>}
   </div>;
 }
@@ -530,9 +557,10 @@ function Inspector({
       {node.kind === 'agent' && writable && <>
         <button className="secondary" onClick={onWatchThis}>＋ Watchdog for this agent</button>
         <button className="secondary" onClick={onLoopFor}>＋ Loop for this agent</button>
-        <button className="secondary" onClick={onConnectFrom} aria-pressed={connecting === node.id}
-          aria-label={`Have ${node.label} oversee another agent`}>◎ Oversee an agent…</button>
       </>}
+      {node.kind === 'agent' && canOversee(node, writable) && <button
+        className="secondary" onClick={onConnectFrom} aria-pressed={connecting === node.id}
+        aria-label={`Have ${node.label} oversee another agent`}>◎ Oversee an agent…</button>}
       {isDraft && node.kind !== 'agent' && writable
         && <button className="secondary" onClick={onConnectFrom}>Connect to an agent…</button>}
       {canPromote(node) && <button onClick={onPromote} disabled={busy}>Add to fleet</button>}

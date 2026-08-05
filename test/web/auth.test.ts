@@ -109,6 +109,48 @@ describe('browser auth and trusted devices', () => {
     expect(() => auth.resume(deviceRequest(another.device.token))).toThrow(/revoked/);
   });
 
+  /**
+   * The limiter is production behaviour and stays exactly as strict. The reset
+   * exists for a harness that drives one long-lived server through many
+   * independent browser sessions; it clears counters and nothing else, and no
+   * HTTP route in `buildWebServer` reaches it.
+   */
+  it('rate-limits pairing and password attempts, and clears only the counters on reset', () => {
+    const { store } = temporaryStore();
+    const auth = new WebAuth(origin, host, Date.now, store);
+
+    for (let attempt = 0; attempt < 10; attempt += 1)
+      expect(() => auth.exchange(request({ host, origin, authorization: 'Bootstrap wrong' })))
+        .toThrow(/invalid or expired/);
+    // The eleventh in the window is refused before the credential is even read.
+    expect(() => auth.exchange(pairingRequest(auth))).toThrow(/rate limit exceeded/);
+
+    auth.clearRateLimits();
+    const paired = auth.exchange(request({ host, origin, authorization: `Bootstrap ${auth.mintBootstrap()}` }));
+    expect(paired.session.id).toHaveLength(43);
+    // The budget is restored, not removed: the limit still bites afterwards.
+    for (let attempt = 0; attempt < 10; attempt += 1)
+      expect(() => auth.exchange(request({ host, origin, authorization: 'Bootstrap wrong' }))).toThrow();
+    expect(() => auth.exchange(pairingRequest(auth))).toThrow(/rate limit exceeded/);
+
+    // Sessions, devices and the boundary are untouched by the reset.
+    auth.clearRateLimits();
+    expect(auth.authenticate(request({ host, cookie: `ofs_session=${paired.session.id}` })).id)
+      .toBe(paired.session.id);
+    expect(() => auth.exchange(request({ host, origin: 'http://evil.invalid', authorization: 'Bootstrap x' })))
+      .toThrow(/Origin/);
+
+    const password = new WebAuth(origin, host, Date.now, store,
+      passwordAccess('correct horse battery staple'));
+    for (let attempt = 0; attempt < 10; attempt += 1)
+      expect(() => password.login(request({ host, origin }), 'wrong password')).toThrow(/invalid/);
+    expect(() => password.login(request({ host, origin }), 'correct horse battery staple'))
+      .toThrow(/rate limit exceeded/);
+    password.clearRateLimits();
+    expect(password.login(request({ host, origin }), 'correct horse battery staple').session.id)
+      .toHaveLength(43);
+  });
+
   it('fails closed on corrupt content and replaces it only on explicit pairing', () => {
     const dir = mkdtempSync(join(tmpdir(), 'ours-fleet-device-corrupt-'));
     writeFileSync(join(dir, 'trusted-devices.json'), '{not-json', { mode: 0o666 });

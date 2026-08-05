@@ -375,9 +375,18 @@ const auth = new WebAuth(
   boundary.origin, boundary.host, Date.now, new TrustedDeviceStore(deviceDir),
 );
 const server = await buildWebServer(services, boundary, { auth });
-server.app.post('/__test/bootstrap', async () => ({
-  url: `http://127.0.0.1:49371/#bootstrap=${server.auth.mintBootstrap()}`,
-}));
+/*
+ * One fixture process serves every Playwright project, so the per-instance
+ * auth rate buckets are shared by every test in the whole run — a limit no
+ * single browser session would ever approach. Each test asks for a fresh
+ * bootstrap, so that is where the harness starts from clean auth state; the
+ * production limiter itself is untouched and is tested directly in
+ * test/web/auth.test.ts.
+ */
+server.app.post('/__test/bootstrap', async () => {
+  server.auth.clearRateLimits();
+  return { url: `http://127.0.0.1:49371/#bootstrap=${server.auth.mintBootstrap()}` };
+});
 server.app.post('/__test/restart-auth', async () => {
   server.auth.clearSessions();
   return { ok: true };
@@ -396,6 +405,11 @@ const passwordDir = mkdtempSync(join(tmpdir(), 'ours-fleet-e2e-password-'));
 const passwordServer = await buildWebServer({ ...services, audit: new AuditSink(join(passwordDir, 'audit')) }, passwordBoundary, {
   auth: new WebAuth(passwordBoundary.origin, passwordBoundary.host, Date.now,
     new TrustedDeviceStore(passwordDir), passwordAccess('correct horse battery staple')),
+});
+// The password console has no bootstrap route, so it gets the reset directly.
+passwordServer.app.post('/__test/auth-reset', async () => {
+  passwordServer.auth.clearRateLimits();
+  return { ok: true };
 });
 await passwordServer.app.listen({ host: '127.0.0.1', port: 49373 });
 /*
@@ -454,9 +468,10 @@ const editorServer = await buildWebServer({
 }, editorBoundary, {
   auth: new WebAuth(editorBoundary.origin, editorBoundary.host, Date.now, new TrustedDeviceStore(editorDir)),
 });
-editorServer.app.post('/__test/bootstrap', async () => ({
-  url: `http://127.0.0.1:49374/#bootstrap=${editorServer.auth.mintBootstrap()}`,
-}));
+editorServer.app.post('/__test/bootstrap', async () => {
+  editorServer.auth.clearRateLimits();
+  return { url: `http://127.0.0.1:49374/#bootstrap=${editorServer.auth.mintBootstrap()}` };
+});
 editorServer.app.get('/__test/fleet-yaml', async () => ({
   text: readFileSync(editorConfigPath, 'utf8'),
 }));

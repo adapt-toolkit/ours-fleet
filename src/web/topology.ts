@@ -66,9 +66,13 @@ export function deriveTopology(config: FleetConfig, inventory: RuntimeRoleItem[]
   const add = (kind: TopologyEdgeKind, from: string, to: string, label: string) =>
     edges.push({ id: `${kind}:${from}:${to}`, kind, from, to, label });
 
-  for (const role of config.roles) for (const entry of role.oversee ?? [])
-    if (agentIds.has(role.name) && agentIds.has(entry.role))
-      add('oversees', `agent:${role.name}`, `agent:${entry.role}`, `oversees · ${entry.interval}`);
+  // `oversee:` is passed through by the loader without a shape check, so a
+  // hand-edited mapping or scalar reaches here. Drawing what can be read beats
+  // throwing: a malformed entry must not take the whole graph down with it.
+  for (const role of config.roles)
+    for (const entry of Array.isArray(role.oversee) ? role.oversee : [])
+      if (typeof entry?.role === 'string' && agentIds.has(role.name) && agentIds.has(entry.role))
+        add('oversees', `agent:${role.name}`, `agent:${entry.role}`, `oversees · ${entry.interval}`);
 
   for (const watchdog of config.watchdogs) {
     const id = `watchdog:${watchdog.name}`;

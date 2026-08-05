@@ -58,6 +58,21 @@ export const canLaunch = (node: TopologyNode): boolean => node.launchable === tr
 export const canPromote = (node: TopologyNode): boolean =>
   node.origin === 'draft' && node.complete === true && node.valid !== false;
 
+/**
+ * Whether oversight can be drawn FROM this agent, given the draft sidecar's
+ * writability.
+ *
+ * An agent already in the fleet writes its oversight into `fleet.yaml`; the
+ * draft sidecar has nothing to do with it, so gating on the sidecar would hide
+ * an action that would have succeeded — and the sidecar is read-only exactly
+ * when a newer console wrote it, which says nothing about the configuration. A
+ * sketch's oversight IS the sidecar, so that one stays gated. Whether the
+ * configuration itself can be written is the server's answer, and it gives it
+ * with a reason.
+ */
+export const canOversee = (node: TopologyNode, draftWritable: boolean): boolean =>
+  node.origin !== 'draft' || draftWritable;
+
 export const EDGE_LEGEND: Array<{ kind: TopologyEdge['kind']; label: string; description: string }> = [
   { kind: 'oversees', label: 'Oversight', description: 'A coordinator is responsible for checking this agent.' },
   { kind: 'watches', label: 'Watchdog', description: 'A watchdog checks this agent on its configured interval.' },

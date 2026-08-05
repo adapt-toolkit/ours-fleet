@@ -1,4 +1,4 @@
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
@@ -577,6 +577,96 @@ describe('adding sketches to the fleet', () => {
         from: 'Coordinator', to: 'Worker', configRevision: 'stale',
       })).rejects.toThrow(/changed since it was opened/);
       expect(readFileSync(file, 'utf8')).toBe(before);
+    });
+
+    /**
+     * Appending to `oversee:` is only safe for the one shape the fleet reads.
+     * Every other shape is refused by name: a mapping or a scalar would be
+     * REPLACED by a list, and a bare-string entry would slip past a duplicate
+     * check that only looks at `.role`.
+     */
+    describe('an existing oversee: it cannot read losslessly', () => {
+      const backups = () => readdirSync(dir).filter(entry => entry.includes('.backup-'));
+
+      /**
+       * The other path that writes a role. Promotion builds a NEW entry and
+       * `addNode` refuses a name the configuration already has, so it can never
+       * overwrite an existing `oversee:` — but a promotion still rewrites the
+       * document, so a malformed one elsewhere in the file must come through
+       * byte-identical.
+       */
+      for (const [shape, yaml] of [
+        ['a mapping', '    oversee:\n      role: Worker\n      interval: 5m\n'],
+        ['a scalar', '    oversee: Worker\n'],
+        ['a bare-string entry', '    oversee:\n      - Worker\n'],
+        ['an entry with no role', '    oversee:\n      - interval: 5m\n'],
+      ] as const) {
+        it(`leaves ${shape} elsewhere in the file untouched when a sketch is promoted`, async () => {
+          const source = `roles:\n  Coordinator:\n    mission: Coordinate\n${yaml}`;
+          await seed(source, {
+            ...emptyDraft(),
+            drafts: {
+              nodes: [{ id: 'agent:Reviewer', kind: 'agent', fields: { mission: 'Review' } }],
+              edges: [],
+            },
+          });
+
+          await promote(['agent:Reviewer']);
+
+          const text = readFileSync(file, 'utf8');
+          expect(text).toContain(yaml.replace(/\n$/, ''));
+          expect(text).toContain('  Reviewer:\n    mission: Review\n');
+        });
+      }
+
+      it('refuses to promote onto a name the configuration already uses', async () => {
+        await seed('roles:\n  Coordinator:\n    mission: Coordinate\n    oversee: Worker\n', {
+          ...emptyDraft(),
+          drafts: {
+            nodes: [{ id: 'agent:Coordinator', kind: 'agent', fields: { mission: 'Different' } }],
+            edges: [],
+          },
+        });
+        const before = readFileSync(file, 'utf8');
+
+        // The merged model shadows it as a conflict; promotion refuses either
+        // way, so `agentEntry` never replaces a role that already exists.
+        await expect(promote(['agent:Coordinator'])).rejects.toThrow(/not ready to add|already/);
+        expect(readFileSync(file, 'utf8')).toBe(before);
+        expect(backups()).toEqual([]);
+      });
+
+      for (const [shape, yaml, reason] of [
+        ['a mapping', '    oversee:\n      role: Worker\n      interval: 5m\n', /oversee: is a mapping, not a list/],
+        ['a scalar', '    oversee: Worker\n', /oversee: is the text "Worker", not a list/],
+        ['a bare-string entry', '    oversee:\n      - Worker\n', /entry that is the text "Worker"/],
+        ['an entry with no role', '    oversee:\n      - interval: 5m\n', /entry with no role/],
+      ] as const) {
+        it(`refuses ${shape} and writes nothing at all`, async () => {
+          await seed(`roles:\n  Coordinator:\n    mission: Coordinate\n${yaml}  Worker:\n    mission: Work\n`, undefined);
+          const before = readFileSync(file, 'utf8');
+
+          await expect(oversee('Coordinator', 'Worker')).rejects.toThrow(reason);
+          await expect(service.previewOversee({
+            from: 'Coordinator', to: 'Worker', configRevision: configuration.read().revision,
+          })).rejects.toThrow(reason);
+
+          expect(readFileSync(file, 'utf8')).toBe(before);
+          expect(backups()).toEqual([]);
+        });
+      }
+
+      it('carries a valid sequence across untouched, extra keys and all', async () => {
+        await seed('roles:\n  Coordinator:\n    mission: Coordinate\n    oversee:\n      - role: Worker\n        interval: 5m\n        note: keep me\n  Worker:\n    mission: Work\n  Other:\n    mission: Other\n', undefined);
+
+        await oversee('Coordinator', 'Other');
+
+        expect((loadConfig(file).roles.find(role => role.name === 'Coordinator')?.oversee as unknown))
+          .toEqual([
+            { role: 'Worker', interval: '5m', note: 'keep me' },
+            { role: 'Other', interval: '10m' },
+          ]);
+      });
     });
 
     // The loader refuses a role that is not a mapping long before the write, so

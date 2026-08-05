@@ -312,7 +312,10 @@ test('topology edges terminate on their cards on a viewport wider than the layou
   });
 });
 
-test('password and intentional unprotected access are clear in Chromium', async ({ page }) => {
+test('password and intentional unprotected access are clear in Chromium', async ({ page, request }) => {
+  // Every project shares one fixture process, so start from clean auth-rate
+  // state rather than spending this console's per-minute login budget.
+  await request.post('http://127.0.0.1:49373/__test/auth-reset');
   await page.goto('http://127.0.0.1:49373/');
   await expect(page.getByLabel('Control-panel password')).toBeVisible();
   await page.getByLabel('Control-panel password').fill('wrong password');
@@ -478,26 +481,35 @@ test('agent nodes carry their own watchdog, loop, configure and oversee actions'
   await overseeButton.click();
   const pending = page.getByRole('status');
   await expect(pending).toContainText('Choose the agent Coordinator should oversee');
+  // Ending the gesture hands the keyboard back to the control that began it —
+  // asserted on the focused element, not on an aria attribute. Without it the
+  // owner lands on the document body and has to tab in from the top to retry.
+  const focused = () => page.evaluate(() => document.activeElement?.getAttribute('aria-label') ?? '');
+
   // Cancelling leaves the graph exactly as it was.
   await page.getByRole('button', { name: 'Cancel connecting from Coordinator' }).click();
   await expect(pending).toHaveCount(0);
+  await expect.poll(focused).toBe('Have Coordinator oversee another agent');
   expect(await yaml()).not.toContain('oversee');
 
-  // Escape cancels too.
+  // Escape cancels too, from wherever the focus went.
   await overseeButton.click();
   await expect(pending).toContainText('Choose the agent Coordinator should oversee');
   await page.keyboard.press('Escape');
   await expect(pending).toHaveCount(0);
+  await expect.poll(focused).toBe('Have Coordinator oversee another agent');
 
   // An agent cannot oversee itself, and saying so does not end the gesture badly.
   await overseeButton.click();
   await page.locator('[data-node-id="agent:Coordinator"] .topology-open').click();
   await expect(page.getByRole('alert')).toContainText('Coordinator cannot oversee itself');
+  await expect.poll(focused).toBe('Have Coordinator oversee another agent');
 
   // A watchdog is not a valid ward either.
   await overseeButton.click();
   await page.locator('[data-node-id="watchdog:Watchdog1"] .topology-open').click();
   await expect(page.getByRole('alert')).toContainText('Oversight points at an agent');
+  await expect.poll(focused).toBe('Have Coordinator oversee another agent');
 
   // Source -> target writes the real relationship, after a review.
   await overseeButton.click();
@@ -541,6 +553,27 @@ test('agent nodes carry their own watchdog, loop, configure and oversee actions'
     'POST /api/v1/ws-tickets',
     'PUT /api/v1/topology/draft',
   ]);
+});
+
+/**
+ * One fixture process serves every browser project, so its per-minute auth rate
+ * buckets are shared by the entire run — a limit no single browser session
+ * would approach, but one that a growing suite crosses. Prove the harness
+ * starts each test from clean auth-rate state, with more pairings in one window
+ * than the production limit allows.
+ */
+test('bootstrapping every test in one window never exhausts the shared rate bucket', async ({ request }) => {
+  const headers = { Host: '127.0.0.1:49374', Origin: 'http://127.0.0.1:49374' };
+  for (let attempt = 0; attempt < 14; attempt += 1) {
+    const url = (await (await request.post('http://127.0.0.1:49374/__test/bootstrap')).json()).url as string;
+    const secret = new URLSearchParams(new URL(url).hash.slice(1)).get('bootstrap')!;
+    const exchange = await request.post('http://127.0.0.1:49374/api/v1/auth/exchange', {
+      headers: { ...headers, Authorization: `Bootstrap ${secret}` },
+    });
+    expect(exchange.status(), `pairing ${attempt + 1}`).toBe(200);
+  }
+  // The limiter itself is untouched: without the harness reset, the eleventh
+  // pairing in the window is refused (asserted directly in test/web/auth.test.ts).
 });
 
 /**
