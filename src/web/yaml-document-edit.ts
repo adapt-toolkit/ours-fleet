@@ -19,12 +19,21 @@ import {
  * by construction, which makes an unchanged save a true no-op and keeps a trailing
  * inline comment attached to the scalar it annotates.
  *
- * A model change that cannot be expressed as a splice falls back to re-rendering
- * the document. That path does reflow, which is why the caller diffs the real
- * before/after bytes: reflow must be visible in review, never silent.
+ * The contract is deliberately narrower than "nothing else ever changes":
  *
- * Deleting a mapping entry leaves any comment written above it in place. Removing
- * a value must not quietly remove the operator's prose about it.
+ * - A *scalar* edit replaces only the value's source range, so the trailing
+ *   comment beside it survives untouched.
+ * - Changing the *length* of a block sequence replaces that collection WHOLESALE,
+ *   because an index-shifting edit cannot be attributed to particular items. Inline
+ *   comments written on the individual items of that sequence are therefore LOST.
+ *   The loss is bounded to the one collection being edited — every other line in
+ *   the file keeps its bytes — and the caller diffs the real before/after text, so
+ *   it is visible in review before anything is written and the save can be declined.
+ * - A model change that cannot be expressed as a splice at all falls back to
+ *   re-rendering the whole document. That path does reflow, which is the other
+ *   reason the caller diffs real bytes: reflow must be visible, never silent.
+ * - Deleting a mapping entry leaves any comment written above it in place. Removing
+ *   a value must not quietly remove the operator's prose about it.
  */
 
 const PARSE_OPTIONS = { strict: true, uniqueKeys: true, prettyErrors: true } as const;

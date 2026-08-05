@@ -248,11 +248,16 @@ in the base file — a `~/fleet.d/*.yaml` drop-in may declare `roles:` and nothi
 else.) Top-level keys the console does not recognise are round-tripped untouched.
 
 Console edits are applied as surgical splices against the file's exact bytes, so
-every line you did not change keeps its comment, spacing and quoting, and an
-unchanged save is a byte-for-byte no-op. Each write is revision-guarded, reviewed
-as a diff of the real file, validated with the real loader, and preceded by a
-timestamped backup. Values under `env:` — and the `vars:` entries they
-interpolate — are masked in the diff and never leave the host.
+an unchanged save is a byte-for-byte no-op and lines outside the edit keep their
+comments, spacing and quoting. One bounded exception: changing the *length* of a
+block sequence — adding or removing an entry under `watch:`, `oversee:`, `roles:`
+or `wake_sources:` — rewrites that one collection as a whole, which drops inline
+comments written on its individual items. The loss is confined to the collection
+you edited, is shown in the diff before anything is written, and can be declined
+by not saving. Each write is revision-guarded, reviewed as a diff of the real
+file, validated with the real loader, and preceded by a timestamped backup.
+Values under `env:` — and the `vars:` entries they interpolate — are masked in
+the diff and never leave the host.
 
 From inside Claude Code, Codex, or Hermes with the core `ours` plugin installed,
 say **"spawn an ours agent …"**. The core skill checks for `ours-fleet`, installs
