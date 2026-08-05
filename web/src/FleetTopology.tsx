@@ -1,4 +1,4 @@
-import { describeEdge, EDGE_LEGEND, layoutTopology, nodeDestination, type Topology, type TopologyNode } from './topology-presentation';
+import { describeEdge, EDGE_LEGEND, layoutEdges, layoutTopology, nodeDestination, type Topology, type TopologyNode } from './topology-presentation';
 
 export function FleetTopology({ topology, onAgent, onWatchdog, onRemove }: {
   topology: Topology;
@@ -7,7 +7,7 @@ export function FleetTopology({ topology, onAgent, onWatchdog, onRemove }: {
   onRemove?(id: string): void;
 }) {
   const layout = layoutTopology(topology);
-  const byId = new Map(layout.nodes.map(node => [node.id, node]));
+  const edges = layoutEdges(topology.edges, layout.nodes);
   const activate = (node: TopologyNode) => {
     const destination = nodeDestination(node);
     if (destination?.kind === 'agent') onAgent(destination.id);
@@ -22,14 +22,14 @@ export function FleetTopology({ topology, onAgent, onWatchdog, onRemove }: {
     </section>
     <div className="topology" aria-label="Interactive fleet topology">
       <div className="topology-canvas" style={{ height: layout.height }}>
-        <svg aria-hidden="true" viewBox={`0 0 1000 ${layout.height}`} preserveAspectRatio="none">
-          {topology.edges.map(edge => {
-            const from = byId.get(edge.from); const to = byId.get(edge.to);
-            return from && to ? <g key={edge.id} className={`edge ${edge.kind}`}>
-              <line x1={from.x + 75} y1={from.y + 30} x2={to.x + 75} y2={to.y + 30} />
-              <title>{edge.label}</title>
-            </g> : null;
-          })}
+        {/* No viewBox: the overlay stretches to `.topology-canvas` (min-width:
+            100%), so a user-space of its own would rescale the x axis on a wide
+            viewport and drag every edge off the cards, which sit in raw CSS px. */}
+        <svg aria-hidden="true">
+          {edges.map(edge => <g key={edge.id} className={`edge ${edge.kind}`}>
+            <line x1={edge.x1} y1={edge.y1} x2={edge.x2} y2={edge.y2} />
+            <title>{edge.label}</title>
+          </g>)}
         </svg>
         {layout.nodes.map(node => <div key={node.id}
           className={`topology-node ${node.kind} ${node.status} ${node.lifetime ?? ''}`}

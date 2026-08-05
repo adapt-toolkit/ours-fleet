@@ -327,6 +327,43 @@ export function cloneModel(model: ConversationModel): ConversationModel {
   };
 }
 
+export interface ConversationPage {
+  events: ConversationEvent[]; nextCursor?: string; hasMore: boolean;
+}
+
+/**
+ * Page durable history to exhaustion and return it as ONE batch. Absorbing a
+ * page at a time makes a long transcript hydrate visibly — the reader watches
+ * it replay from the oldest page forward — so the caller commits once and the
+ * viewport only ever settles on the tail.
+ */
+export async function collectHistory(
+  fetchPage: (after: string | undefined) => Promise<ConversationPage>,
+  after?: string,
+): Promise<ConversationEvent[]> {
+  const events: ConversationEvent[] = [];
+  let cursor = after;
+  for (;;) {
+    const page = await fetchPage(cursor);
+    events.push(...page.events);
+    // A cursor that does not advance would page forever now that nothing is
+    // committed between iterations; treat it as exhausted.
+    if (!page.hasMore || !page.nextCursor || page.nextCursor === cursor) return events;
+    cursor = page.nextCursor;
+  }
+}
+
+/** Slack (px) within which the transcript still counts as parked at the tail. */
+export const TAIL_TOLERANCE = 40;
+
+/** Whether the reader is at the tail, i.e. new events should keep following. */
+export function isAtTail(viewport: {
+  scrollTop: number; clientHeight: number; scrollHeight: number;
+}): boolean {
+  return viewport.scrollTop + viewport.clientHeight
+    >= viewport.scrollHeight - TAIL_TOLERANCE;
+}
+
 export const describeTurnState = (turn: TranscriptTurn): string => {
   switch (turn.state) {
     case 'queued':

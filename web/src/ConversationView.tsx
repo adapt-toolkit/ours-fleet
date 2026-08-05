@@ -1,8 +1,10 @@
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react';
 import { api, idempotencyKey } from './api';
-import { applyEvents, cloneModel, describeTurnState, emptyModel } from './conversation-model';
+import {
+  applyEvents, cloneModel, collectHistory, describeTurnState, emptyModel, isAtTail,
+} from './conversation-model';
 import type {
-  ConversationEvent, ConversationModel, PermissionCard, TranscriptTurn,
+  ConversationEvent, ConversationModel, ConversationPage, PermissionCard, TranscriptTurn,
 } from './conversation-model';
 
 type StreamState = 'connecting' | 'live' | 'reconnecting' | 'offline';
@@ -29,19 +31,18 @@ export function ConversationView({ roleId }: { roleId: string }) {
     setModel(current => cloneModel(applyEvents(current, events)));
   }, []);
 
-  /** Page the durable history over HTTP until exhausted (gap recovery). */
+  /**
+   * Page the durable history over HTTP until exhausted (gap recovery), then
+   * commit it in a single render — a per-page commit is what made a long
+   * transcript hydrate visibly from its oldest page.
+   */
   const backfill = useCallback(async () => {
-    let after: string | undefined = modelRef.current.lastSeq
-      ? String(modelRef.current.lastSeq) : undefined;
-    for (;;) {
+    const events = await collectHistory(after => {
       const suffix = after ? `&after=${encodeURIComponent(after)}` : '';
-      const page: {
-        events: ConversationEvent[]; nextCursor?: string; hasMore: boolean;
-      } = await api.get(`/api/v1/roles/${encodeURIComponent(roleId)}/conversation?limit=500${suffix}`);
-      if (page.events.length) absorb(page.events);
-      if (!page.hasMore || !page.nextCursor) break;
-      after = page.nextCursor;
-    }
+      return api.get<ConversationPage>(
+        `/api/v1/roles/${encodeURIComponent(roleId)}/conversation?limit=500${suffix}`);
+    }, modelRef.current.lastSeq ? String(modelRef.current.lastSeq) : undefined);
+    if (events.length) absorb(events);
   }, [absorb, roleId]);
 
   const connect = useCallback(async () => {
@@ -103,7 +104,10 @@ export function ConversationView({ roleId }: { roleId: string }) {
   }, [connect]);
 
   // Follow the stream only while the reader is at the bottom (spec §7.1).
-  useEffect(() => {
+  // This has to land BEFORE paint: a post-paint scroll shows every commit at
+  // its previous offset first, which on a fresh hydration is the top of the
+  // history — the transcript then visibly scrolls down to the newest message.
+  useLayoutEffect(() => {
     if (atBottom) scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight });
   }, [model, atBottom]);
 
@@ -160,10 +164,7 @@ export function ConversationView({ roleId }: { roleId: string }) {
       </div>
       {notice && <div className="banner info">{notice}</div>}
       <div className="transcript" ref={scrollRef}
-        onScroll={event => {
-          const target = event.currentTarget;
-          setAtBottom(target.scrollTop + target.clientHeight >= target.scrollHeight - 40);
-        }}>
+        onScroll={event => setAtBottom(isAtTail(event.currentTarget))}>
         {model.turns.length === 0 &&
           <p className="muted">No conversation yet. Prompt the live ACP session below.</p>}
         {model.turns.map(turn => <TurnBlock key={turn.promptId} turn={turn} onDecide={decide} />)}
