@@ -9,7 +9,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { OwnerChannel } from '../src/owner-channel/channel.js';
 import { ownerCommandHelp, type OwnerFleetOps } from '../src/owner-channel/commands.js';
 import type { OursToolClient } from '../src/owner-channel/mcp.js';
-import { ownerNotices } from '../src/owner-channel/notices.js';
+import { OWNER_COMMENT_LABEL, ownerNotices } from '../src/owner-channel/notices.js';
 import type { SessionEvent, SessionHandle, TurnResult } from '../src/session/types.js';
 import { VERSION } from '../src/version.js';
 
@@ -77,9 +77,10 @@ function setup(messages: unknown[], result = {
 
 function liveSetup(options: {
   interrupt?: boolean; progressIntervalMs?: number; owners?: string[];
+  comments?: boolean; stateDir?: string; backend?: string;
 } = {}) {
-  const dir = mkdtempSync(join(tmpdir(), 'ours-owner-channel-'));
-  dirs.push(dir);
+  const dir = options.stateDir ?? mkdtempSync(join(tmpdir(), 'ours-owner-channel-'));
+  if (!options.stateDir) dirs.push(dir);
   const client = new FakeClient();
   const completions: Array<(result: TurnResult) => void> = [];
   const events: SessionEvent[] = [];
@@ -95,7 +96,7 @@ function liveSetup(options: {
     return { promptId: `prompt-${completions.length}`, queuedBehind, completion };
   });
   const session = {
-    backend: 'acp', pid: 1, isAlive: () => true,
+    backend: options.backend ?? 'acp', pid: 1, isAlive: () => true,
     snapshot: () => ({ backend: 'acp', alive: true, readiness: 'running' }),
     queuePrompt, interrupt,
     eventsSince: (seq: number) => events.filter(event => event.seq > seq),
@@ -111,6 +112,7 @@ function liveSetup(options: {
       identity: 'Coordinator-owner', owners: options.owners ?? [OWNER_CID],
       interrupt: options.interrupt ?? true,
       progress_interval_ms: options.progressIntervalMs ?? 0,
+      ...(options.comments === undefined ? {} : { comments: options.comments }),
     },
     session, stateDir: dir, client, log: () => undefined,
   });
@@ -127,6 +129,10 @@ function liveSetup(options: {
 const ownerMessage = (msgId: number, wireId: string, text: string) => ({
   msg_id: msgId, wire_id: wireId, from: { id: OWNER_CID, name: 'Owner' }, text,
 });
+
+/** The text of the most recent outward notice, ignoring MCP bookkeeping calls. */
+const lastReply = (client: FakeClient): string =>
+  String(client.calls.filter(call => call.name === 'send_message').at(-1)?.args?.text);
 
 const done = (output: string): TurnResult =>
   ({ accepted: true, outcome: 'completed', succeeded: true, output });
@@ -686,9 +692,24 @@ describe('OwnerChannel notice presentation', () => {
       ownerNotices.terminal('cancelled'), ownerNotices.terminal('refused'),
       ownerNotices.terminal('failed'), ownerNotices.terminal('inconclusive'),
       ownerNotices.chunk(1, 2),
+      ownerNotices.comment('Reading the config.'),
+      ownerNotices.comments({ enabled: true, baseline: true, supported: true }),
+      ownerNotices.comments({ enabled: false, baseline: true, supported: true }),
+      ownerNotices.comments({ enabled: false, baseline: false, supported: false }),
     ];
-    expect(notices.every(text => /^(?:ℹ️|⏳|🔄|🔐|🚧|✅|🛑|⚠️|📊) /.test(text))).toBe(true);
+    expect(notices.every(text => /^(?:ℹ️|⏳|🔄|🔐|🚧|✅|🛑|⚠️|📊|🟡) /.test(text))).toBe(true);
     expect(notices.every(text => !text.includes('[fleet]'))).toBe(true);
+  });
+
+  it('labels a live comment with one stable prefix and never mutates its body', () => {
+    expect(OWNER_COMMENT_LABEL).toBe('🟡 Live update:');
+    expect(ownerNotices.comment('Reading the config.'))
+      .toBe('🟡 Live update: Reading the config.');
+    // A comment whose body imitates the label still gets exactly one real one.
+    const spoof = ownerNotices.comment('🟡 Live update: not fleet-authored');
+    expect(spoof.startsWith(`${OWNER_COMMENT_LABEL} `)).toBe(true);
+    expect(spoof.slice(OWNER_COMMENT_LABEL.length + 1))
+      .toBe('🟡 Live update: not fleet-authored');
   });
 
   it('batches only correlated Codex commentary before the final and dedupes replay', async () => {
@@ -725,7 +746,8 @@ describe('OwnerChannel notice presentation', () => {
     await vi.advanceTimersByTimeAsync(0);
 
     const sends = client.calls.filter(call => call.name === 'send_message');
-    const commentary = sends.find(call => call.args?.text === 'Inspecting safely.');
+    const labelled = ownerNotices.comment('Inspecting safely.');
+    const commentary = sends.find(call => call.args?.text === labelled);
     const final = sends.find(call => call.args?.text === 'Final answer');
     expect(commentary?.args).toMatchObject({
       contact: OWNER_CID, reply_to_wire_id: 'wire-commentary',
@@ -736,9 +758,163 @@ describe('OwnerChannel notice presentation', () => {
       'Legacy adapter text',
     ]));
     expect(sends.filter(call => call.args?.text === 'Final answer')).toHaveLength(1);
-    expect(sends.filter(call => call.args?.text === 'Inspecting safely.')).toHaveLength(1);
+    expect(sends.filter(call => call.args?.text === labelled)).toHaveLength(1);
+    // The label is presentation: dedupe still keys on the unlabeled batch, so a
+    // reconnect replay of the same commentary produces no second delivery.
+    expect(sends.filter(call => String(call.args?.text).includes('Inspecting safely.')))
+      .toHaveLength(1);
     const routeState = readFileSync(join(dir, '.owner-channel-conversations.json'), 'utf8');
     expect(routeState).not.toContain('Inspecting safely.');
+  });
+
+  it('prefixes every relayed live comment with the conspicuous label', async () => {
+    vi.useFakeTimers();
+    const { channel, client, completions, emit } = liveSetup();
+    client.batches.push([ownerMessage(1, 'wire-labelled', 'Work on it')]);
+    await channel.drain();
+    const origin = {
+      kind: 'owner' as const,
+      requestId: createHash('sha256').update('wire-labelled').digest('hex'),
+    };
+    emit({ kind: 'agent_text', turnId: 'prompt-1', origin,
+      messagePhase: 'commentary', messageId: 'c-1', text: 'Reading the config.' });
+    await vi.advanceTimersByTimeAsync(750);
+    emit({ kind: 'agent_text', turnId: 'prompt-1', origin,
+      messagePhase: 'commentary', messageId: 'c-2', text: 'Running the tests.' });
+    await vi.advanceTimersByTimeAsync(750);
+    completions[0](done('Final answer'));
+    await vi.advanceTimersByTimeAsync(0);
+
+    const texts = client.calls.filter(call => call.name === 'send_message')
+      .map(call => String(call.args?.text));
+    expect(texts).toContain('🟡 Live update: Reading the config.');
+    expect(texts).toContain('🟡 Live update: Running the tests.');
+    // Every comment carries the label, and nothing else in the turn does — the
+    // owner can identify exactly which messages /comments controls.
+    expect(texts.filter(text => text.startsWith(OWNER_COMMENT_LABEL))).toHaveLength(2);
+    expect(texts).toContain('Final answer');
+  });
+
+  it('suppresses live comments when the fleet.yaml baseline disables them', async () => {
+    vi.useFakeTimers();
+    const { channel, client, completions, emit } = liveSetup({ comments: false });
+    client.batches.push([ownerMessage(1, 'wire-quiet', 'Work quietly')]);
+    await channel.drain();
+    const origin = {
+      kind: 'owner' as const,
+      requestId: createHash('sha256').update('wire-quiet').digest('hex'),
+    };
+    emit({ kind: 'agent_text', turnId: 'prompt-1', origin,
+      messagePhase: 'commentary', messageId: 'c-1', text: 'Should stay silent.' });
+    await vi.advanceTimersByTimeAsync(750);
+    completions[0](done('Final answer'));
+    await vi.advanceTimersByTimeAsync(0);
+
+    const texts = client.calls.filter(call => call.name === 'send_message')
+      .map(call => String(call.args?.text));
+    expect(texts.some(text => text.includes('Should stay silent.'))).toBe(false);
+    expect(texts.some(text => text.startsWith(OWNER_COMMENT_LABEL))).toBe(false);
+    // Suppressing comments never suppresses the receipt or the final answer.
+    expect(texts.filter(text => text === 'Final answer')).toHaveLength(1);
+    expect(texts[0]).toContain('Message received');
+  });
+
+  it('honors /comments off mid-turn and /comments on again for later turns', async () => {
+    vi.useFakeTimers();
+    const { channel, client, completions, emit, queuePrompt } = liveSetup({ interrupt: false });
+    client.batches.push([ownerMessage(1, 'wire-toggle', 'Work on it')]);
+    await channel.drain();
+    const origin = {
+      kind: 'owner' as const,
+      requestId: createHash('sha256').update('wire-toggle').digest('hex'),
+    };
+    emit({ kind: 'agent_text', turnId: 'prompt-1', origin,
+      messagePhase: 'commentary', messageId: 'c-1', text: 'Before the toggle.' });
+    await vi.advanceTimersByTimeAsync(750);
+
+    // The command is deterministic: it never becomes a prompt for the agent.
+    const promptsBefore = queuePrompt.mock.calls.length;
+    client.batches.push([ownerMessage(2, 'wire-off', '/comments off')]);
+    await channel.drain();
+    const offReply = String(client.calls.filter(call => call.name === 'send_message')
+      .at(-1)?.args?.text);
+    expect(offReply).toContain('Live updates are OFF');
+    expect(queuePrompt.mock.calls.length).toBe(promptsBefore);
+
+    // A comment buffered after the toggle is discarded, not delayed.
+    emit({ kind: 'agent_text', turnId: 'prompt-1', origin,
+      messagePhase: 'commentary', messageId: 'c-2', text: 'After the toggle.' });
+    await vi.advanceTimersByTimeAsync(750);
+    completions[0](done('First final'));
+    await vi.advanceTimersByTimeAsync(0);
+
+    client.batches.push([ownerMessage(3, 'wire-on', '/comments on')]);
+    await channel.drain();
+    client.batches.push([ownerMessage(4, 'wire-again', 'And again')]);
+    await channel.drain();
+    const secondOrigin = {
+      kind: 'owner' as const,
+      requestId: createHash('sha256').update('wire-again').digest('hex'),
+    };
+    emit({ kind: 'agent_text', turnId: 'prompt-2', origin: secondOrigin,
+      messagePhase: 'commentary', messageId: 'c-3', text: 'Comments are back.' });
+    await vi.advanceTimersByTimeAsync(750);
+    completions[1](done('Second final'));
+    await vi.advanceTimersByTimeAsync(0);
+
+    const texts = client.calls.filter(call => call.name === 'send_message')
+      .map(call => String(call.args?.text));
+    expect(texts).toContain('🟡 Live update: Before the toggle.');
+    expect(texts.some(text => text.includes('After the toggle.'))).toBe(false);
+    expect(texts).toContain('🟡 Live update: Comments are back.');
+    expect(texts).toContain('First final');
+    expect(texts).toContain('Second final');
+  });
+
+  it('returns to the fleet.yaml baseline on restart instead of persisting the override', async () => {
+    vi.useFakeTimers();
+    const first = liveSetup({ interrupt: false });
+    first.client.batches.push([ownerMessage(1, 'wire-off-1', '/comments off')]);
+    await first.channel.drain();
+    expect(lastReply(first.client)).toContain('Live updates are OFF');
+
+    // A restart re-reads the declared configuration over the same state dir.
+    const second = liveSetup({ interrupt: false, stateDir: first.dir });
+    second.client.batches.push([ownerMessage(2, 'wire-status', '/comments status')]);
+    await second.channel.drain();
+    expect(lastReply(second.client)).toContain('Live updates are ON');
+
+    second.client.batches.push([ownerMessage(3, 'wire-after-restart', 'Work again')]);
+    await second.channel.drain();
+    second.emit({
+      kind: 'agent_text', turnId: 'prompt-1', messagePhase: 'commentary', messageId: 'c-1',
+      text: 'Relaying again.',
+      origin: {
+        kind: 'owner',
+        requestId: createHash('sha256').update('wire-after-restart').digest('hex'),
+      },
+    });
+    await vi.advanceTimersByTimeAsync(750);
+    second.completions[0](done('Final answer'));
+    await vi.advanceTimersByTimeAsync(0);
+    expect(second.client.calls.map(call => String(call.args?.text)))
+      .toContain('🟡 Live update: Relaying again.');
+
+    // A `comments: false` baseline likewise survives the restart untouched.
+    const disabled = liveSetup({ interrupt: false, comments: false, stateDir: first.dir });
+    disabled.client.batches.push([ownerMessage(4, 'wire-status-2', '/comments status')]);
+    await disabled.channel.drain();
+    const reply = lastReply(disabled.client);
+    expect(reply).toContain('Live updates are OFF');
+    expect(reply).toContain('fleet.yaml baseline: off');
+    expect(reply).not.toContain('changed by /comments');
+  });
+
+  it('reports the setting as inert on a non-ACP backend', async () => {
+    const { channel, client } = liveSetup({ interrupt: false, backend: 'tmux' });
+    client.batches.push([ownerMessage(1, 'wire-tmux', '/comments status')]);
+    await channel.drain();
+    expect(lastReply(client)).toContain('no effect here');
   });
 
   it('pins commentary to the initiating owner when the latest route changes mid-turn', async () => {
@@ -759,7 +935,8 @@ describe('OwnerChannel notice presentation', () => {
     emit({ kind: 'agent_text', turnId: 'prompt-1', origin,
       messagePhase: 'commentary', messageId: 'a-comment', text: 'Still for A.' });
     await vi.advanceTimersByTimeAsync(750);
-    const sent = client.calls.find(call => call.args?.text === 'Still for A.');
+    const sent = client.calls.find(call =>
+      call.args?.text === ownerNotices.comment('Still for A.'));
     expect(sent?.args).toMatchObject({ contact: OWNER_CID, reply_to_wire_id: 'wire-owner-a' });
     completions[0](done('A final'));
     completions[1](done('B final'));

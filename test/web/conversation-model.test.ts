@@ -1,7 +1,11 @@
+import { readFileSync } from 'node:fs';
+import { resolve } from 'node:path';
 import { describe, expect, it } from 'vitest';
 
-import { applyEvents, describeTurnState, emptyModel } from '../../web/src/conversation-model.js';
-import type { ConversationEvent } from '../../web/src/conversation-model.js';
+import {
+  applyEvents, collectHistory, describeTurnState, emptyModel, isAtTail,
+} from '../../web/src/conversation-model.js';
+import type { ConversationEvent, ConversationPage } from '../../web/src/conversation-model.js';
 
 let seq = 0;
 const event = (
@@ -170,5 +174,66 @@ describe('conversation browser model', () => {
     expect(model.usage).toMatchObject({ used: 100, size: 1_000 });
     expect(model.sessionTitle).toBe('My session');
     expect(model.currentModeId).toBe('plan');
+  });
+});
+
+describe('transcript hydration lands on the newest message', () => {
+  const page = (from: number, count: number, hasMore: boolean): ConversationPage => ({
+    events: Array.from({ length: count }, (_, index) =>
+      event('message.chunk', { role: 'assistant', content: { type: 'text', text: 'x' } },
+        { promptId: `p${from + index}`, messageId: `m${from + index}` })),
+    nextCursor: hasMore ? String(from + count) : undefined,
+    hasMore,
+  });
+
+  it('returns a paged history as one batch so nothing renders mid-replay', async () => {
+    const cursors: Array<string | undefined> = [];
+    const pages = [page(0, 500, true), page(500, 500, true), page(1_000, 7, false)];
+    const events = await collectHistory(async after => {
+      cursors.push(after);
+      return pages[cursors.length - 1];
+    });
+    // One batch for the caller to absorb: three commits would replay the
+    // transcript from its oldest page while the reader watches.
+    expect(events).toHaveLength(1_007);
+    expect(cursors).toEqual([undefined, '500', '1000']);
+  });
+
+  it('resumes paging from the last seen cursor and stops when exhausted', async () => {
+    const cursors: Array<string | undefined> = [];
+    const events = await collectHistory(async after => {
+      cursors.push(after);
+      return page(42, 3, false);
+    }, '41');
+    expect(cursors).toEqual(['41']);
+    expect(events).toHaveLength(3);
+  });
+
+  it('stops on a cursor that does not advance instead of paging forever', async () => {
+    let calls = 0;
+    const events = await collectHistory(async () => {
+      calls += 1;
+      return { ...page(0, 1, true), nextCursor: 'stuck' };
+    }, 'stuck');
+    expect(calls).toBe(1);
+    expect(events).toHaveLength(1);
+  });
+
+  it('follows only while the reader is parked at the tail', () => {
+    expect(isAtTail({ scrollTop: 940, clientHeight: 400, scrollHeight: 1_340 })).toBe(true);
+    expect(isAtTail({ scrollTop: 910, clientHeight: 400, scrollHeight: 1_340 })).toBe(true);
+    expect(isAtTail({ scrollTop: 0, clientHeight: 400, scrollHeight: 1_340 })).toBe(false);
+    expect(isAtTail({ scrollTop: 400, clientHeight: 400, scrollHeight: 1_340 })).toBe(false);
+  });
+
+  it('positions the transcript before paint, never after', () => {
+    // jsdom is not installed, so the component cannot be rendered here. A
+    // post-paint useEffect is exactly what made the console show the oldest
+    // message first and then scroll down, so pin it at the source.
+    const source = readFileSync(resolve('web/src/ConversationView.tsx'), 'utf8');
+    const positioning = source.slice(source.indexOf('scrollRef.current?.scrollTo') - 400,
+      source.indexOf('scrollRef.current?.scrollTo'));
+    expect(positioning).toContain('useLayoutEffect');
+    expect(positioning).not.toContain('useEffect(');
   });
 });

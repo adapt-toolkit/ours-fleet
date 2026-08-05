@@ -91,6 +91,12 @@ export interface OwnerChannelConfig {
   interrupt: boolean;
   /** Deterministic in-progress notice interval; 0 disables progress notices. */
   progress_interval_ms: number;
+  /**
+   * Relay the agent's live ACP commentary to the owner while a turn runs.
+   * This is the RESTART BASELINE only: `/comments on|off` changes the running
+   * session's effective value, and a restart returns to this one.
+   */
+  comments: boolean;
   attachments: OwnerAttachmentConfig;
 }
 
@@ -454,7 +460,9 @@ export function resolveOwnerChannelConfig(
     ...defaultInput,
     ...(role ?? {}),
   };
-  const allowed = ['identity', 'owners', 'agent', 'interrupt', 'progress_interval_ms', 'attachments'];
+  const allowed = [
+    'identity', 'owners', 'agent', 'interrupt', 'progress_interval_ms', 'comments', 'attachments',
+  ];
   const bad = Object.keys(merged).filter(key => !allowed.includes(key));
   if (bad.length)
     throw new ConfigError(`${file}: role '${name}' owner_channel: unknown key(s) ${bad.join(', ')}`);
@@ -484,6 +492,8 @@ export function resolveOwnerChannelConfig(
         || !Number.isFinite(merged.progress_interval_ms) || merged.progress_interval_ms < 0))
     throw new ConfigError(
       `${file}: role '${name}' owner_channel.progress_interval_ms must be a non-negative number`);
+  if (merged.comments !== undefined && typeof merged.comments !== 'boolean')
+    throw new ConfigError(`${file}: role '${name}' owner_channel.comments must be true or false`);
   if (defaultInput.attachments !== undefined && !isPlainObject(defaultInput.attachments))
     throw new ConfigError(`${file}: defaults.owner_channel.attachments must be a map`);
   if (role?.attachments !== undefined && !isPlainObject(role.attachments))
@@ -536,6 +546,9 @@ export function resolveOwnerChannelConfig(
     ...(agent ? { agent } : {}),
     interrupt: merged.interrupt ?? false,
     progress_interval_ms: merged.progress_interval_ms ?? 30_000,
+    // Default true preserves the established live-commentary behavior; an
+    // upgrade never silently goes quiet on an owner who relied on it.
+    comments: merged.comments ?? true,
     attachments: {
       enabled: attachments.enabled ?? true,
       max_files_per_request: attachments.max_files_per_request ?? 4,

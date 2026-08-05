@@ -246,6 +246,49 @@ test('bootstrap, inventory, live navigation, send, create, and security boundari
     ['ofs_session', 'ofs_device'].includes(cookie.name))).toHaveLength(0);
 });
 
+test('topology edges terminate on their cards on a viewport wider than the layout', async ({ page, request }) => {
+  const bootstrap = (await (await request.post('/__test/bootstrap')).json()).url as string;
+  // The reported geometry defect only appears once the canvas is wider than
+  // the fixed card layout, so reproduce the owner's console viewport exactly.
+  await page.setViewportSize({ width: 2048, height: 384 });
+  await page.goto(bootstrap);
+  await expect(page.getByLabel('Interactive fleet topology')).toBeVisible();
+  await expect(page.getByRole('button', { name: 'agent Alpha, ready' })).toBeVisible();
+
+  const edges = await page.evaluate(() => {
+    const card = (label: string) =>
+      document.querySelector(`[aria-label="${label}"]`)!.closest('.topology-node')!;
+    const covers = (element: Element, point: DOMPoint) => {
+      const box = element.getBoundingClientRect();
+      return point.x >= box.left && point.x <= box.right
+        && point.y >= box.top && point.y <= box.bottom;
+    };
+    // getScreenCTM folds in any SVG user-space scaling, so this measures where
+    // the edge is actually painted, not where its attributes claim it is.
+    return [...document.querySelectorAll('.edge line')].map(node => {
+      const line = node as SVGLineElement;
+      const matrix = line.getScreenCTM()!;
+      const start = new DOMPoint(line.x1.baseVal.value, line.y1.baseVal.value)
+        .matrixTransform(matrix);
+      const end = new DOMPoint(line.x2.baseVal.value, line.y2.baseVal.value)
+        .matrixTransform(matrix);
+      return {
+        label: line.parentElement!.querySelector('title')!.textContent,
+        startsOnWatchdog: covers(card('watchdog nightwatch, active'), start),
+        endsOnAgent: covers(card('agent Alpha, ready'), end),
+        canvasWidth: Math.round(
+          document.querySelector('.topology-canvas')!.getBoundingClientRect().width),
+      };
+    });
+  });
+
+  expect(edges).toHaveLength(1);
+  expect(edges[0].canvasWidth).toBeGreaterThan(1_000);
+  expect(edges[0]).toMatchObject({
+    label: 'watches', startsOnWatchdog: true, endsOnAgent: true,
+  });
+});
+
 test('password and intentional unprotected access are clear in Chromium', async ({ page }) => {
   await page.goto('http://127.0.0.1:49373/');
   await expect(page.getByLabel('Control-panel password')).toBeVisible();

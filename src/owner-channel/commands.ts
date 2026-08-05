@@ -1,7 +1,7 @@
 import { execFile, spawn } from 'node:child_process';
 
 import type { SessionEvent, SessionSnapshot } from '../session/types.js';
-import { ownerNotices } from './notices.js';
+import { OWNER_COMMENT_LABEL, ownerNotices, type OwnerCommentsState } from './notices.js';
 
 /**
  * Fleet-level effects a deterministic owner command may trigger. Production
@@ -36,6 +36,13 @@ export interface OwnerCommandContext {
    */
   runHarnessCommand(command: string): Promise<void>;
   restart(mode: 'keep' | 'fresh'): Promise<void>;
+  /** Effective ACP live-comment relay state of this running channel. */
+  comments(): OwnerCommentsState;
+  /**
+   * Change the RUNNING session's effective live-comment relaying. The fleet.yaml
+   * baseline is never rewritten, so a restart returns to the declared value.
+   */
+  setComments(enabled: boolean): OwnerCommentsState;
   fleetList(): Promise<string>;
   recentEvents(limit: number): SessionEvent[];
   readWorklogTail(maxChars: number): Promise<string | undefined>;
@@ -119,6 +126,18 @@ export const ownerCommands: OwnerCommand[] = [
     name: 'status', summary: "report the agent's session state",
     execute: noArgs('/status', async ctx =>
       ctx.reply(ownerNotices.status(ctx.role, ctx.snapshot()))),
+  },
+  {
+    name: 'comments', usage: '/comments [status|on|off]',
+    summary: `report or change relaying of the agent's live "${OWNER_COMMENT_LABEL}" `
+      + 'messages for this session (fleet.yaml is the restart baseline)',
+    execute: async (ctx, args) => {
+      const action = args.toLowerCase() || 'status';
+      if (!['status', 'on', 'off'].includes(action))
+        throw new OwnerCommandUsageError('usage: /comments [status|on|off]');
+      await ctx.reply(ownerNotices.comments(
+        action === 'status' ? ctx.comments() : ctx.setComments(action === 'on')));
+    },
   },
   {
     name: 'interrupt', summary: "cancel the agent's active turn",

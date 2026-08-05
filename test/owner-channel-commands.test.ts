@@ -4,7 +4,9 @@ import {
   dispatchOwnerCommand, isOwnerCommandText, ownerCommandHelp, ownerCommands,
   type OwnerCommandContext,
 } from '../src/owner-channel/commands.js';
-import { ownerNotices } from '../src/owner-channel/notices.js';
+import {
+  OWNER_COMMENT_LABEL, ownerNotices, type OwnerCommentsState,
+} from '../src/owner-channel/notices.js';
 import type { SessionEvent, SessionSnapshot } from '../src/session/types.js';
 
 function context(overrides: Partial<OwnerCommandContext> = {}): OwnerCommandContext & {
@@ -12,8 +14,14 @@ function context(overrides: Partial<OwnerCommandContext> = {}): OwnerCommandCont
 } {
   const replies: string[] = [];
   const snapshot: SessionSnapshot = { backend: 'acp', alive: true, readiness: 'idle' };
+  const comments: OwnerCommentsState = { enabled: true, baseline: true, supported: true };
   return {
     replies,
+    comments: () => comments,
+    setComments: vi.fn((enabled: boolean) => {
+      comments.enabled = enabled;
+      return { ...comments };
+    }),
     role: 'Coordinator',
     harness: 'claude-code',
     version: '9.9.9-test',
@@ -45,10 +53,17 @@ describe('owner command registry', () => {
       expect(help).toContain(command.summary);
     }
     // The registry is the single source of truth for the deterministic set.
-    for (const name of ['help', 'status', 'interrupt', 'clear', 'compact', 'model',
+    for (const name of ['help', 'status', 'comments', 'interrupt', 'clear', 'compact', 'model',
       'restart', 'force-restart', 'ls', 'peek', 'worklog', 'version'])
       expect(ownerCommands.some(command => command.name === name)).toBe(true);
     expect(help).toContain('/commands');
+  });
+
+  it('makes /comments discoverable in help with its label and baseline semantics', () => {
+    const help = ownerCommandHelp();
+    expect(help).toContain('/comments [status|on|off]');
+    expect(help).toContain(OWNER_COMMENT_LABEL);
+    expect(help).toContain('fleet.yaml is the restart baseline');
   });
 
   it('prepends a caller error to help output when given', () => {
@@ -80,6 +95,62 @@ describe('owner command registry', () => {
     await dispatchOwnerCommand('/status', ctx);
     expect(ctx.replies).toEqual([ownerNotices.status('Coordinator',
       { backend: 'acp', alive: true, readiness: 'idle' })]);
+  });
+
+  it('reports live-comment state for a bare /comments and for /comments status', async () => {
+    for (const text of ['/comments', '/comments status', '/comments STATUS']) {
+      const ctx = context();
+      await dispatchOwnerCommand(text, ctx);
+      expect(ctx.setComments).not.toHaveBeenCalled();
+      expect(ctx.replies).toEqual([ownerNotices.comments(
+        { enabled: true, baseline: true, supported: true })]);
+    }
+  });
+
+  it('turns live comments off and back on without rewriting the baseline', async () => {
+    const ctx = context();
+    await dispatchOwnerCommand('/comments off', ctx);
+    expect(ctx.setComments).toHaveBeenCalledWith(false);
+    expect(ctx.replies[0]).toContain('OFF');
+    // The reply must state the unchanged fleet.yaml baseline and the restart rule.
+    expect(ctx.replies[0]).toContain('fleet.yaml baseline: on, changed by /comments');
+    expect(ctx.replies[0]).toContain('A restart returns to the baseline.');
+
+    await dispatchOwnerCommand('/comments ON', ctx);
+    expect(ctx.setComments).toHaveBeenLastCalledWith(true);
+    expect(ctx.replies[1]).toContain('ON');
+    expect(ctx.replies[1]).not.toContain('changed by /comments');
+
+    // Status afterwards reflects the live value, not the baseline.
+    await dispatchOwnerCommand('/comments off', ctx);
+    await dispatchOwnerCommand('/comments status', ctx);
+    expect(ctx.replies[3]).toContain('OFF');
+  });
+
+  it('reports a baseline-off channel truthfully', async () => {
+    const ctx = context({ comments: () => ({ enabled: false, baseline: false, supported: true }) });
+    await dispatchOwnerCommand('/comments status', ctx);
+    expect(ctx.replies[0]).toContain('Live updates are OFF');
+    expect(ctx.replies[0]).toContain('fleet.yaml baseline: off');
+    expect(ctx.replies[0]).not.toContain('changed by /comments');
+  });
+
+  it('says the setting is inert when the backend never emits live comments', async () => {
+    const ctx = context({ comments: () => ({ enabled: true, baseline: true, supported: false }) });
+    await dispatchOwnerCommand('/comments status', ctx);
+    expect(ctx.replies[0]).toContain('no effect here');
+    expect(ctx.replies[0]).not.toContain(OWNER_COMMENT_LABEL);
+  });
+
+  it('returns help for a malformed /comments argument instead of guessing', async () => {
+    for (const bad of ['enable', 'true', 'on off', 'off please', '1', '--on']) {
+      const ctx = context();
+      await dispatchOwnerCommand(`/comments ${bad}`, ctx);
+      expect(ctx.setComments).not.toHaveBeenCalled();
+      expect(ctx.replies).toHaveLength(1);
+      expect(ctx.replies[0]).toContain('/comments [status|on|off]');
+      expect(ctx.replies[0]).toContain('/help');
+    }
   });
 
   it('interrupts the active turn and confirms', async () => {
