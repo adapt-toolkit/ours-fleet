@@ -337,6 +337,48 @@ describe('adding sketches to the fleet', () => {
     });
   });
 
+  it('writes the oversight drawn from a sketched agent when it is added', async () => {
+    await seed('roles:\n  Alice:\n    mission: Ship\n', {
+      ...emptyDraft(),
+      drafts: {
+        nodes: [{ id: 'agent:Coordinator', kind: 'agent', fields: { mission: 'Keep an eye on things' } }],
+        edges: [{ kind: 'oversees', from: 'agent:Coordinator', to: 'agent:Alice' }],
+      },
+    });
+
+    await promote(['agent:Coordinator']);
+
+    const text = readFileSync(file, 'utf8');
+    expect(text).toContain('    oversee:');
+    expect(text).toContain('      - role: Alice');
+    expect(loadConfig(file).roles.find(role => role.name === 'Coordinator')?.oversee)
+      .toEqual([{ role: 'Alice', interval: '10m' }]);
+    // The relationship lives in `oversee:` now, so the sketch of it is redundant.
+    expect(drafts.read().draft.drafts.edges).toEqual([]);
+  });
+
+  it('refuses to add an agent whose ward is still a sketch, and says why', async () => {
+    await seed('roles: {}\n', {
+      ...emptyDraft(),
+      drafts: {
+        nodes: [
+          { id: 'agent:Coordinator', kind: 'agent', fields: { mission: 'Watch' } },
+          { id: 'agent:Worker', kind: 'agent', fields: { mission: 'Work' } },
+        ],
+        edges: [{ kind: 'oversees', from: 'agent:Coordinator', to: 'agent:Worker' }],
+      },
+    });
+
+    await expect(promote(['agent:Coordinator'])).rejects.toThrow(/oversee.*Worker/s);
+    expect(readFileSync(file, 'utf8')).not.toContain('Coordinator');
+
+    // Add the ward first and the overseer becomes addable, with the edge intact.
+    await promote(['agent:Worker']);
+    await promote(['agent:Coordinator']);
+    expect(loadConfig(file).roles.find(role => role.name === 'Coordinator')?.oversee)
+      .toEqual([{ role: 'Worker', interval: '10m' }]);
+  });
+
   it('refuses an incomplete sketch with the reason the console shows', async () => {
     await seed('roles:\n  Alice:\n    mission: Ship\n', {
       ...emptyDraft(),
@@ -438,5 +480,103 @@ describe('adding sketches to the fleet', () => {
     expect(drafts.read().draft.drafts.nodes).toHaveLength(1);
     expect((await topology()).problems.map(problem => problem.code))
       .toContain('draft_conflicts_with_config');
+  });
+
+  /**
+   * The Oversee gesture between two agents that are already in the fleet. There
+   * is no sketch to promote here — the edge IS the change — so it goes through
+   * the same reviewed, revision-guarded, surgical write.
+   */
+  describe('drawing oversight between two agents in the fleet', () => {
+    const twoAgents = () => seed(
+      '# operator header\nroles:\n  Coordinator:\n    mission: Coordinate  # keep this note\n  Worker:\n    mission: Work\n',
+      undefined);
+    const oversee = (from: string, to: string, interval?: string) => service.connectOversee({
+      from, to, interval, configRevision: configuration.read().revision,
+    });
+
+    it('writes oversee: without touching the rest of the document', async () => {
+      await twoAgents();
+
+      const result = await oversee('Coordinator', 'Worker');
+      const text = readFileSync(file, 'utf8');
+
+      expect(result.saved).toBe(true);
+      expect(text).toContain('# operator header');
+      expect(text).toContain('mission: Coordinate  # keep this note');
+      expect(loadConfig(file).roles.find(role => role.name === 'Coordinator')?.oversee)
+        .toEqual([{ role: 'Worker', interval: '10m' }]);
+      expect(loadConfig(file).roles.find(role => role.name === 'Worker')?.oversee).toBeUndefined();
+    });
+
+    it('previews the diff without writing, and honours a chosen interval', async () => {
+      await twoAgents();
+      const before = readFileSync(file, 'utf8');
+
+      const preview = await service.previewOversee({
+        from: 'Coordinator', to: 'Worker', interval: '30m',
+        configRevision: configuration.read().revision,
+      });
+
+      expect(preview.diff).toContain('oversee:');
+      expect(preview.diff).toContain('30m');
+      expect(readFileSync(file, 'utf8')).toBe(before);
+
+      await oversee('Coordinator', 'Worker', '30m');
+      expect(loadConfig(file).roles.find(role => role.name === 'Coordinator')?.oversee)
+        .toEqual([{ role: 'Worker', interval: '30m' }]);
+    });
+
+    it('adds a second ward beside the first instead of replacing it', async () => {
+      await seed('roles:\n  Coordinator:\n    mission: Coordinate\n  Worker:\n    mission: Work\n  Other:\n    mission: Other\n', undefined);
+
+      await oversee('Coordinator', 'Worker');
+      await oversee('Coordinator', 'Other');
+
+      expect(loadConfig(file).roles.find(role => role.name === 'Coordinator')?.oversee)
+        .toEqual([{ role: 'Worker', interval: '10m' }, { role: 'Other', interval: '10m' }]);
+    });
+
+    it('refuses self-oversight, a duplicate, an unknown agent and a bad interval', async () => {
+      await twoAgents();
+
+      await expect(oversee('Coordinator', 'Coordinator')).rejects.toThrow(/cannot oversee itself/);
+      await expect(oversee('Coordinator', 'Nobody')).rejects.toThrow(/no agent called Nobody/);
+      await expect(oversee('Coordinator', 'Worker', '10s')).rejects.toThrow(/below the minimum/);
+      await expect(oversee('Coordinator', 'Worker', 'soon')).rejects.toThrow(/invalid duration/);
+      await expect(oversee('../escape', 'Worker')).rejects.toThrow(/not a valid agent name/);
+      expect(readFileSync(file, 'utf8')).not.toContain('oversee');
+
+      await oversee('Coordinator', 'Worker');
+      await expect(oversee('Coordinator', 'Worker')).rejects.toThrow(/already oversees Worker/);
+    });
+
+    it('refuses an end that is not in fleet.yaml, sketch or watchdog alike', async () => {
+      await seed('roles:\n  Coordinator:\n    mission: Coordinate\n', {
+        ...emptyDraft(),
+        drafts: {
+          nodes: [
+            { id: 'agent:Sketch', kind: 'agent', fields: { mission: 'Someday' } },
+            { id: 'watchdog:health', kind: 'watchdog', fields: { coordinator: 'Coordinator' } },
+          ],
+          edges: [],
+        },
+      });
+
+      await expect(oversee('Coordinator', 'Sketch')).rejects.toThrow(/still a sketch/);
+      await expect(oversee('Sketch', 'Coordinator')).rejects.toThrow(/still a sketch/);
+      await expect(oversee('Coordinator', 'health')).rejects.toThrow(/no agent called health/);
+      expect(readFileSync(file, 'utf8')).not.toContain('oversee');
+    });
+
+    it('refuses a stale configuration revision without writing', async () => {
+      await twoAgents();
+      const before = readFileSync(file, 'utf8');
+
+      await expect(service.connectOversee({
+        from: 'Coordinator', to: 'Worker', configRevision: 'stale',
+      })).rejects.toThrow(/changed since it was opened/);
+      expect(readFileSync(file, 'utf8')).toBe(before);
+    });
   });
 });

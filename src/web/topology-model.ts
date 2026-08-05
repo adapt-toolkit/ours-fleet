@@ -200,6 +200,8 @@ function draftNode(
 
   if (node.kind === 'agent') {
     if (!nonBlank(node.fields.mission)) missing.push(AGENT_MISSION);
+    pushPendingTargets(missing, 'oversee', stillDraft('oversees'),
+      'Oversight is written into fleet.yaml, which can only name agents that are in the fleet.');
   } else if (node.kind === 'watchdog') {
     if (!nonBlank(node.fields.coordinator)) missing.push(WATCHDOG_COORDINATOR);
     pushPendingTargets(missing, 'watch', stillDraft('watches'),

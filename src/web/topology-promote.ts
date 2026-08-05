@@ -1,4 +1,6 @@
 import { FleetError } from '../application/errors.js';
+import { ROLE_NAME_RE } from '../config.js';
+import { parseDuration } from '../duration.js';
 import type {
   ConfigPreviewResult, ConfigWriteResult, EditableFleetModel, FleetConfigService,
 } from './fleet-config-service.js';
@@ -22,6 +24,8 @@ import type { MergedTopology, MergedTopologyNode } from './topology-model.js';
 
 /** Loop interval when the sketch did not choose one (`resolveLoops` requires it). */
 const DEFAULT_LOOP_INTERVAL = '10m';
+/** How often an overseer checks a ward when the graph did not say. */
+export const DEFAULT_OVERSEE_INTERVAL = '10m';
 
 /** Scalar draft fields that are valid keys of a role mapping. */
 const ROLE_FIELDS = ['mission', 'bio', 'persona', 'coordinator', 'harness', 'session', 'model', 'identity', 'cwd'] as const;
@@ -53,6 +57,17 @@ export interface TopologyPromoteOptions {
   topology(): Promise<MergedTopology>;
 }
 
+/** One agent taking responsibility for checking on another, drawn on the graph. */
+export interface OverseeRequest {
+  from: string;
+  to: string;
+  interval?: string;
+  configRevision: string;
+}
+
+/** The minimum interval `parseDuration` accepts for a recurring fleet job. */
+const MIN_INTERVAL_MS = 60_000;
+
 export class TopologyPromoteService {
   constructor(private readonly options: TopologyPromoteOptions) {}
 
@@ -71,6 +86,55 @@ export class TopologyPromoteService {
     // which the merged model already reports, rather than losing the write.
     const cleared = await this.clearDrafts(promoted, request.draftRevision);
     return { ...written, promoted, draftsCleared: cleared.ok, draftRevision: cleared.revision };
+  }
+
+  /**
+   * What drawing an oversight edge between two agents already in the fleet
+   * would write. Same reviewed path as promotion: the caller sees the real diff
+   * before anything lands, and this call touches nothing.
+   */
+  async previewOversee(request: OverseeRequest): Promise<ConfigPreviewResult> {
+    return this.options.configuration.preview(request.configRevision, await this.buildOversee(request));
+  }
+
+  /**
+   * Write the oversight edge. Configuration only — an overseer reads its wards
+   * out of its briefing when it next starts, and nothing here starts anything.
+   */
+  async connectOversee(request: OverseeRequest): Promise<ConfigWriteResult> {
+    return this.options.configuration.write(request.configRevision, await this.buildOversee(request));
+  }
+
+  /** The configuration model that adding `from oversees to` produces. */
+  private async buildOversee(request: OverseeRequest): Promise<EditableFleetModel> {
+    const { from, to } = request;
+    for (const name of [from, to])
+      if (!ROLE_NAME_RE.test(name ?? ''))
+        throw new FleetError('invalid_request', `'${name}' is not a valid agent name`);
+    if (from === to)
+      throw new FleetError('invalid_request', `${from} cannot oversee itself — choose a different agent`);
+
+    const interval = request.interval ?? DEFAULT_OVERSEE_INTERVAL;
+    try { parseDuration(interval, { name: 'interval', minMs: MIN_INTERVAL_MS }); }
+    catch (error) { throw new FleetError('invalid_request', (error as Error).message); }
+
+    const merged = await this.options.topology();
+    const read = this.options.configuration.read();
+    if (read.revision !== request.configRevision)
+      throw new FleetError('stale_state', 'fleet.yaml changed since it was opened; reload before saving');
+
+    const model = structuredClone(read.model);
+    const roles = section(model, 'roles');
+    assertConfiguredAgent(merged, roles, from, 'oversee another agent');
+    assertConfiguredAgent(merged, roles, to, 'be overseen');
+
+    const entry = mapping(roles[from]);
+    const existing = Array.isArray(entry.oversee) ? entry.oversee : [];
+    if (existing.some(item => (item as { role?: unknown } | null)?.role === to))
+      throw new FleetError('conflict', `${from} already oversees ${to}`);
+    entry.oversee = [...existing, { role: to, interval }];
+    roles[from] = entry;
+    return model;
   }
 
   private async clearDrafts(
@@ -143,13 +207,26 @@ function addNode(model: EditableFleetModel, node: MergedTopologyNode, merged: Me
   const block = section(model, node.kind === 'agent' ? 'roles' : node.kind === 'watchdog' ? 'watchdogs' : 'loops');
   if (block[node.label] !== undefined)
     throw new FleetError('conflict', `${node.label} already exists in the configuration`);
-  block[node.label] = node.kind === 'agent' ? agentEntry(node)
+  block[node.label] = node.kind === 'agent' ? agentEntry(node, merged)
     : node.kind === 'watchdog' ? watchdogEntry(node, merged)
       : loopEntry(node, merged, model);
 }
 
-function agentEntry(node: MergedTopologyNode): Record<string, unknown> {
-  return pick(node, ROLE_FIELDS);
+/**
+ * An agent carries the oversight drawn from it, so a relationship sketched on
+ * the graph reaches configuration instead of evaporating at promotion. Only
+ * edges pointing at agents that are already in the fleet are written — a draft
+ * target is reported as a gap on the source instead, because `oversee:` cannot
+ * name a role that does not exist.
+ */
+function agentEntry(node: MergedTopologyNode, merged: MergedTopology): Record<string, unknown> {
+  const wards = linked(merged, node.id, 'oversees');
+  return {
+    ...pick(node, ROLE_FIELDS),
+    ...(wards.length
+      ? { oversee: wards.map(role => ({ role, interval: DEFAULT_OVERSEE_INTERVAL })) }
+      : {}),
+  };
 }
 
 /**
@@ -181,7 +258,7 @@ function loopEntry(
 }
 
 /** Names of the agents this node points at, from drawn edges and derived ones alike. */
-function linked(merged: MergedTopology, id: string, kind: 'watches' | 'targets'): string[] {
+function linked(merged: MergedTopology, id: string, kind: 'watches' | 'targets' | 'oversees'): string[] {
   return [...new Set(merged.edges
     .filter(edge => edge.kind === kind && edge.from === id && !edge.implicit && !edge.dangling)
     .map(edge => edge.to.slice('agent:'.length)))].sort();
@@ -191,6 +268,37 @@ function sessionOf(model: EditableFleetModel, role: string): string {
   const roles = model.roles as Record<string, Record<string, unknown> | null> | undefined;
   const defaults = model.defaults as Record<string, unknown> | undefined;
   return String(roles?.[role]?.session ?? defaults?.session ?? 'tmux');
+}
+
+/**
+ * Refuse an oversight edge that could not honestly be written, with the reason
+ * the owner needs rather than a YAML error.
+ *
+ * `oversee:` lives in `fleet.yaml` and names roles there, so both ends have to
+ * be in the file: a sketch is not configuration yet, and an agent the console
+ * only knows from its state directory (a live temporary spawn) has no entry to
+ * write into or to be named by.
+ */
+function assertConfiguredAgent(
+  merged: MergedTopology,
+  roles: Record<string, unknown>,
+  name: string,
+  action: string,
+): void {
+  const node = merged.nodes.find(candidate => candidate.id === `agent:${name}`);
+  if (!node) throw new FleetError('invalid_request', `there is no agent called ${name} on the graph`);
+  if (node.kind !== 'agent')
+    throw new FleetError('invalid_request', `${name} is a ${node.kind}; oversight connects two agents`);
+  if (node.origin === 'draft')
+    throw new FleetError('invalid_request', `${name} is still a sketch — add it to the fleet before it can ${action}`);
+  if (roles[name] === undefined)
+    throw new FleetError('invalid_request', `${name} is not in fleet.yaml, so it cannot ${action}`);
+}
+
+/** A role entry as an editable mapping — `Alice:` with no body parses as null. */
+function mapping(value: unknown): Record<string, unknown> {
+  return value && typeof value === 'object' && !Array.isArray(value)
+    ? value as Record<string, unknown> : {};
 }
 
 function section(model: EditableFleetModel, key: string): Record<string, unknown> {
