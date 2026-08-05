@@ -19,7 +19,9 @@ import { AuditSink } from './audit.js';
 import { FleetEventBus } from './events.js';
 import { buildWebServer, type WebServer } from './server.js';
 import { FleetConfigService } from './fleet-config-service.js';
-import { deriveTopology } from './topology.js';
+import { mergeTopology } from './topology-model.js';
+import { TopologyDraftStore } from './topology-draft-store.js';
+import { TopologyPromoteService } from './topology-promote.js';
 import { doctor } from '../doctor.js';
 import { TerminalBridgeManager } from './terminal/bridge.js';
 import { acquireWebServerLock } from './lock.js';
@@ -166,11 +168,17 @@ export async function startWebConsole(options: StartWebOptions): Promise<Running
     configPath: options.configPath,
     preflight: path => doctor({ configPath: path, yamlMode: 'strict' }),
   });
+  const topologyDrafts = new TopologyDraftStore({ dir: webDir });
+  const readTopology = async () => mergeTopology(
+    loadConfig(options.configPath), await query.list(), topologyDrafts.read());
+  const topologyPromote = new TopologyPromoteService({
+    drafts: topologyDrafts, configuration, topology: readTopology,
+  });
   let server: WebServer;
   try {
     server = await buildWebServer({
     query, repository, logs, commands, creation, removal, audit, events, watchdogs, configuration,
-    topology: async () => deriveTopology(loadConfig(options.configPath), await query.list()),
+    topology: readTopology, topologyDrafts, topologyPromote,
     terminalUpgrade: terminalAvailable
       ? async (socket, _request, roleId, _ticket, hello) => terminals.connect(socket, roleId, hello)
       : undefined,

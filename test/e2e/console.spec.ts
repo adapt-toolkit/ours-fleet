@@ -11,7 +11,7 @@ test('bootstrap, inventory, live navigation, send, create, and security boundari
   await expect(page.getByLabel('Interactive fleet topology')).toBeVisible();
   await expect(page.getByLabel('Topology connection legend')).toContainText('Oversight');
   await expect(page.getByLabel('Topology connection legend')).toContainText('Temporary spawn');
-  await page.getByRole('button', { name: 'Configure' }).click();
+  await page.getByRole('button', { name: 'Configure', exact: true }).click();
   await expect(page.getByRole('heading', { name: '1. Choose how agents run' })).toBeVisible();
   await expect(page.getByLabel('Configuration detail level')).toContainText('Basic');
   await page.getByLabel('Fleet model').selectOption('gpt-5.6-sol');
@@ -22,8 +22,10 @@ test('bootstrap, inventory, live navigation, send, create, and security boundari
   await page.getByRole('button', { name: 'Continue' }).click();
   await expect(page.getByRole('heading', { name: '2. Name the agents and give each a job' })).toBeVisible();
   await page.getByRole('button', { name: 'Topology' }).click();
-  await expect(page.getByRole('button', { name: 'agent Alpha, ready' })).toBeVisible();
-  await expect(page.getByText('Dormant', { exact: true })).toHaveCount(0);
+  await expect(page.locator('[data-node-id="agent:Alpha"]')).toBeVisible();
+  // Inactive roles stay hidden in the role table; the graph shows the whole
+  // configuration, including roles that are configured but not running.
+  await expect(page.locator('.role-table').getByText('Dormant', { exact: true })).toHaveCount(0);
   await expect(page.getByRole('button', { name: 'Needs attention 0' })).toBeVisible();
   await expect(page.getByRole('button', { name: 'Show inactive (1)' })).toBeVisible();
   await expect(page.getByText('live · idle').first()).toBeVisible();
@@ -186,7 +188,9 @@ test('bootstrap, inventory, live navigation, send, create, and security boundari
 
   await page.getByRole('button', { name: 'Topology' }).click();
   await page.getByLabel('Filter roles').fill('');
-  await page.getByRole('button', { name: 'agent Terminal, ready' }).click();
+  // Selecting a card now opens the inspector; opening the agent is explicit.
+  await page.locator('[data-node-id="agent:Terminal"]').click();
+  await page.getByRole('button', { name: 'Open', exact: true }).click();
   await page.getByRole('button', { name: 'terminal' }).click();
   await expect(page.locator('.terminal-host .xterm')).toBeVisible();
   await expect(page.locator('.terminal-host')).toContainText('ANSI BOLD');
@@ -236,6 +240,9 @@ test('bootstrap, inventory, live navigation, send, create, and security boundari
     removalDialogs.push(dialog.message());
     await dialog.accept(dialog.type() === 'prompt' ? 'Alpha' : undefined);
   });
+  // Removal moved from a per-card control into the node inspector; the removal
+  // contract it triggers is unchanged.
+  await page.locator('[data-node-id="agent:Alpha"]').click();
   await page.getByRole('button', { name: 'Remove Alpha' }).click();
   await expect.poll(() => removalDialogs.length).toBeGreaterThanOrEqual(3);
   expect(removalDialogs.join('\n')).toContain("Stop and uninstall the exact backend registration for 'Alpha'.");
@@ -253,11 +260,12 @@ test('topology edges terminate on their cards on a viewport wider than the layou
   await page.setViewportSize({ width: 2048, height: 384 });
   await page.goto(bootstrap);
   await expect(page.getByLabel('Interactive fleet topology')).toBeVisible();
-  await expect(page.getByRole('button', { name: 'agent Alpha, ready' })).toBeVisible();
+  await expect(page.locator('[data-node-id="agent:Alpha"]')).toBeVisible();
 
   const edges = await page.evaluate(() => {
-    const card = (label: string) =>
-      document.querySelector(`[aria-label="${label}"]`)!.closest('.topology-node')!;
+    // Located by stable id rather than by the card's accessible name, which now
+    // also carries the node's completeness badge.
+    const card = (id: string) => document.querySelector(`[data-node-id="${id}"]`)!;
     const covers = (element: Element, point: DOMPoint) => {
       const box = element.getBoundingClientRect();
       return point.x >= box.left && point.x <= box.right
@@ -274,8 +282,8 @@ test('topology edges terminate on their cards on a viewport wider than the layou
         .matrixTransform(matrix);
       return {
         label: line.parentElement!.querySelector('title')!.textContent,
-        startsOnWatchdog: covers(card('watchdog nightwatch, active'), start),
-        endsOnAgent: covers(card('agent Alpha, ready'), end),
+        startsOnWatchdog: covers(card('watchdog:nightwatch'), start),
+        endsOnAgent: covers(card('agent:Alpha'), end),
         canvasWidth: Math.round(
           document.querySelector('.topology-canvas')!.getBoundingClientRect().width),
       };
@@ -302,4 +310,88 @@ test('password and intentional unprotected access are clear in Chromium', async 
   await page.goto('http://127.0.0.1:49372/');
   await expect(page.getByRole('heading', { name: 'Fleet topology' })).toBeVisible();
   await expect(page.getByText(/Unprotected mode: anyone who can reach/)).toBeVisible();
+});
+
+test('sketch, connect and add to the fleet from an empty console without launching', async ({ page, request }) => {
+  await request.post('http://127.0.0.1:49374/__test/reset');
+  const bootstrap = (await (await request.post('http://127.0.0.1:49374/__test/bootstrap')).json()).url as string;
+  await page.goto(bootstrap);
+
+  // An empty fleet lands on the graph, not on a form.
+  await expect(page.getByRole('heading', { name: 'Sketch your fleet' })).toBeVisible();
+  await expect(page.getByText('Nothing runs until you say so.')).toBeVisible();
+
+  // Sketch an agent. It exists immediately, warns about what it still needs,
+  // and offers no way to start it.
+  await page.getByRole('button', { name: '＋ Add your first agent' }).click();
+  await expect(page.locator('[data-node-id="agent:Agent1"]')).toBeVisible();
+  await expect(page.getByLabel('Agent1 details')).toContainText('mission');
+  await expect(page.getByRole('button', { name: 'Add to fleet' })).toBeDisabled();
+  await expect(page.getByRole('button', { name: /^Launch/ })).toHaveCount(0);
+
+  // Complete it through the inspector.
+  await page.getByLabel('Agent1 details').getByLabel('Mission').fill('Review pull requests');
+  await page.getByLabel('Agent1 details').getByLabel('Mission').blur();
+  await expect(page.locator('[data-node-id="agent:Agent1"]')).toContainText('ready to add');
+
+  // Agent oversight is deferred out of this phase: no inert control, and the
+  // inspector says where it is configured instead.
+  await expect(page.getByRole('button', { name: /oversees/i })).toHaveCount(0);
+  // The whole rendered sentence, not fragments of it: JSX drops the newline that
+  // follows an element, so `<code>oversee:</code>` collides with the next word
+  // unless the space is explicit, and a fragment assertion still matches.
+  await expect(page.getByLabel('Agent1 details')).toContainText(
+    'Agent oversight — which agent checks on which — is not configured from the graph yet.'
+    + ' It arrives in a later phase; until then, set oversee: in the configuration editor.');
+  await expect(page.getByLabel('Agent1 details')).not.toContainText('oversee:in');
+
+  // Connect: a watchdog created from the agent is scoped to that agent.
+  await page.getByRole('button', { name: '＋ Watchdog for this agent' }).click();
+  await expect(page.locator('[data-node-id="watchdog:Watchdog1"]')).toBeVisible();
+  await expect(page.getByLabel('Watchdog1 details')).toContainText('coordinator');
+  await expect(page.getByLabel('Watchdog1 details')).toContainText('Watchdog: outgoing to agent:Agent1');
+
+  // Configure: adding to the fleet is a reviewed configuration write.
+  await page.locator('[data-node-id="agent:Agent1"]').click();
+  await page.getByLabel('Agent1 details').getByRole('button', { name: 'Add to fleet' }).click();
+  await expect(page.getByRole('dialog', { name: 'Review configuration change' })).toBeVisible();
+  await expect(page.getByText('This writes configuration only.')).toBeVisible();
+  await expect(page.locator('.config-diff')).toContainText('Agent1');
+  await page.getByRole('dialog').getByRole('button', { name: 'Add to fleet' }).click();
+
+  // The sketch became configuration, and the operator's comment survived.
+  await expect.poll(async () =>
+    (await (await request.get('http://127.0.0.1:49374/__test/fleet-yaml')).json()).text as string)
+    .toContain('Agent1');
+  await expect(page.locator('[data-node-id="agent:Agent1"]')).toContainText('Configured');
+  const yaml = (await (await request.get('http://127.0.0.1:49374/__test/fleet-yaml')).json()).text as string;
+  expect(yaml).toContain('# operator header — must survive every console write');
+  expect(yaml).toContain('  Agent1:');
+  expect(yaml).toContain('    mission: Review pull requests');
+
+  // Still nothing started: promotion writes configuration and stops there.
+  await expect(page.getByRole('button', { name: /^Launch/ })).toHaveCount(0);
+  await expect(page.locator('[data-node-id="watchdog:Watchdog1"]')).toContainText('Draft');
+
+  // Promoting the agent first must NOT unscope the watchdog that was created
+  // from it: the scope edge belongs to the watchdog and is only written when the
+  // watchdog itself is added.
+  await expect(page.locator('[data-node-id="watchdog:Watchdog1"]')).toContainText('watchdog');
+  await page.locator('[data-node-id="watchdog:Watchdog1"]').click();
+  await expect(page.getByLabel('Watchdog1 details')).toContainText('Watchdog: outgoing to agent:Agent1');
+  await page.getByLabel('Watchdog1 details').getByLabel('Coordinator').fill('Agent1');
+  await page.getByLabel('Watchdog1 details').getByLabel('Coordinator').blur();
+  await page.getByLabel('Watchdog1 details').getByRole('button', { name: 'Add to fleet' }).click();
+  await expect(page.getByRole('dialog', { name: 'Review configuration change' })).toBeVisible();
+  await page.getByRole('dialog').getByRole('button', { name: 'Add to fleet' }).click();
+
+  await expect.poll(async () =>
+    (await (await request.get('http://127.0.0.1:49374/__test/fleet-yaml')).json()).text as string)
+    .toContain('watchdogs:');
+  const withWatchdog = (await (await request.get('http://127.0.0.1:49374/__test/fleet-yaml')).json()).text as string;
+  // Scoped to the agent it was created from — not a watch-everything watchdog.
+  expect(withWatchdog).toContain('    watch:');
+  expect(withWatchdog).toContain('      - Agent1');
+  expect(withWatchdog).toContain('    coordinator: Agent1');
+  await expect(page.getByRole('button', { name: /^Launch/ })).toHaveCount(0);
 });

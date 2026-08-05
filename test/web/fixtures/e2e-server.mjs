@@ -1,4 +1,4 @@
-import { mkdtempSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { buildWebServer } from '../../../dist/web/server.js';
@@ -6,6 +6,11 @@ import { WebAuth } from '../../../dist/web/auth.js';
 import { TrustedDeviceStore } from '../../../dist/web/device-store.js';
 import { AuditSink } from '../../../dist/web/audit.js';
 import { passwordAccess } from '../../../dist/web/access.js';
+import { FleetConfigService } from '../../../dist/web/fleet-config-service.js';
+import { TopologyDraftStore } from '../../../dist/web/topology-draft-store.js';
+import { TopologyPromoteService } from '../../../dist/web/topology-promote.js';
+import { mergeTopology } from '../../../dist/web/topology-model.js';
+import { loadConfig } from '../../../dist/config.js';
 
 const status = {
   roleId: 'Alpha', observedAt: new Date().toISOString(), overall: 'ready',
@@ -382,6 +387,78 @@ const passwordServer = await buildWebServer({ ...services, audit: new AuditSink(
     new TrustedDeviceStore(passwordDir), passwordAccess('correct horse battery staple')),
 });
 await passwordServer.app.listen({ host: '127.0.0.1', port: 49373 });
+/*
+ * A fourth console on the REAL topology stack over an empty fleet: real
+ * FleetConfigService, real draft sidecar, real merged model, real promotion.
+ * The sketch -> connect -> add-to-fleet journey has to be exercised against the
+ * services that actually write configuration, not against a stub.
+ */
+const editorBoundary = { origin: 'http://127.0.0.1:49374', host: '127.0.0.1:49374' };
+const editorDir = mkdtempSync(join(tmpdir(), 'ours-fleet-e2e-editor-'));
+const editorConfigPath = join(editorDir, 'fleet.yaml');
+writeFileSync(editorConfigPath, '# operator header — must survive every console write\n', { mode: 0o600 });
+const editorConfiguration = new FleetConfigService({ configPath: editorConfigPath });
+const editorDrafts = new TopologyDraftStore({ dir: editorDir });
+const editorTopology = async () => mergeTopology(
+  loadConfig(editorConfigPath),
+  loadConfig(editorConfigPath).roles.map(configured => ({
+    role: {
+      id: configured.name, lifetime: 'permanent', configured: true, stateHealth: 'present',
+      configuredBackend: configured.session, detectedBackend: configured.session,
+      compatibility: { compatible: true }, problems: [], config: { mission: configured.mission },
+    },
+    status: {
+      roleId: configured.name, observedAt: new Date().toISOString(), overall: 'stopped',
+      supervisor: { backend: 'none', liveness: 'stopped', detail: 'not started' },
+      session: { backend: configured.session, reachability: 'offline', readiness: 'unknown', evidence: 'inferred' },
+      restart: { circuit: 'closed', consecutiveImmediateFailures: 0, nextDelayMs: 0 },
+      monitor: { mode: 'fleet', health: 'unknown', stale: true },
+      isolation: { degraded: false }, problems: [],
+    },
+    capabilities: {},
+  })),
+  editorDrafts.read());
+const editorServer = await buildWebServer({
+  ...services,
+  audit: new AuditSink(join(editorDir, 'audit')),
+  configuration: editorConfiguration,
+  topology: editorTopology,
+  topologyDrafts: editorDrafts,
+  topologyPromote: new TopologyPromoteService({
+    drafts: editorDrafts, configuration: editorConfiguration, topology: editorTopology,
+  }),
+  query: { async list() { return (await editorTopology()).nodes
+    .filter(node => node.kind === 'agent' && node.origin === 'config')
+    .map(node => ({
+      role: { id: node.label, lifetime: 'permanent', configured: true, stateHealth: 'present',
+        configuredBackend: 'tmux', detectedBackend: 'tmux', compatibility: { compatible: true }, problems: [] },
+      status: { roleId: node.label, observedAt: new Date().toISOString(), overall: 'stopped',
+        supervisor: { backend: 'none', liveness: 'stopped', detail: 'not started' },
+        session: { backend: 'tmux', reachability: 'offline', readiness: 'unknown', evidence: 'inferred' },
+        restart: { circuit: 'closed', consecutiveImmediateFailures: 0, nextDelayMs: 0 },
+        monitor: { mode: 'fleet', health: 'unknown', stale: true },
+        isolation: { degraded: false }, problems: [] },
+      capabilities: {},
+    })); } },
+}, editorBoundary, {
+  auth: new WebAuth(editorBoundary.origin, editorBoundary.host, Date.now, new TrustedDeviceStore(editorDir)),
+});
+editorServer.app.post('/__test/bootstrap', async () => ({
+  url: `http://127.0.0.1:49374/#bootstrap=${editorServer.auth.mintBootstrap()}`,
+}));
+editorServer.app.get('/__test/fleet-yaml', async () => ({
+  text: readFileSync(editorConfigPath, 'utf8'),
+}));
+// The fixture process is shared by every browser project, so the journey test
+// resets the fleet and the sketch pad before it runs.
+editorServer.app.post('/__test/reset', async () => {
+  writeFileSync(editorConfigPath, '# operator header — must survive every console write\n', { mode: 0o600 });
+  rmSync(editorDrafts.path, { force: true });
+  return { ok: true };
+});
+await editorServer.app.listen({ host: '127.0.0.1', port: 49374 });
+
 for (const signal of ['SIGINT', 'SIGTERM']) process.once(signal, async () => {
-  await Promise.all([server.close(), noneServer.close(), passwordServer.close()]); process.exit(0);
+  await Promise.all([server.close(), noneServer.close(), passwordServer.close(), editorServer.close()]);
+  process.exit(0);
 });

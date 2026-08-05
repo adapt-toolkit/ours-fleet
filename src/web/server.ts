@@ -22,7 +22,9 @@ import { AuditSink } from './audit.js';
 import { WebAuth } from './auth.js';
 import { FleetEventBus } from './events.js';
 import type { FleetConfigService } from './fleet-config-service.js';
-import type { TopologySnapshot } from './topology.js';
+import type { MergedTopology } from './topology-model.js';
+import type { TopologyDraftStore } from './topology-draft-store.js';
+import type { TopologyPromoteService } from './topology-promote.js';
 import type { RoleRemovalService } from '../application/role-removal-service.js';
 import { ROLE_NAME_RE } from '../config.js';
 
@@ -37,7 +39,9 @@ export interface WebServices {
   events?: FleetEventBus;
   watchdogs?: WatchdogQueryService;
   configuration?: FleetConfigService;
-  topology?: () => Promise<TopologySnapshot>;
+  topology?: () => Promise<MergedTopology>;
+  topologyDrafts?: TopologyDraftStore;
+  topologyPromote?: TopologyPromoteService;
   removal?: RoleRemovalService;
   terminalUpgrade?: (
     socket: WebSocket, request: FastifyRequest, roleId: string,
@@ -222,6 +226,52 @@ export async function buildWebServer(
     if (!services.topology)
       throw new FleetError('capability_unavailable', 'fleet topology is unavailable');
     return services.topology();
+  });
+
+  const drafts = () => {
+    if (!services.topologyDrafts)
+      throw new FleetError('capability_unavailable', 'topology sketching is unavailable');
+    return services.topologyDrafts;
+  };
+
+  app.get('/api/v1/topology/draft', async request => {
+    auth.authenticate(request);
+    return drafts().read();
+  });
+
+  app.put('/api/v1/topology/draft', async request => {
+    const session = auth.authenticate(request, true);
+    const body = request.body as { revision?: unknown; draft?: unknown };
+    const result = await drafts().write(String(body?.revision ?? ''), body?.draft);
+    events.publish('topology.draft.changed', { revision: result.revision });
+    await audit.record({
+      requestId: request.id, browser: session.id, action: 'topology.draft.save', result: 'succeeded',
+    });
+    return result;
+  });
+
+  const promotion = () => {
+    if (!services.topologyPromote)
+      throw new FleetError('capability_unavailable', 'adding sketches to the fleet is unavailable');
+    return services.topologyPromote;
+  };
+
+  app.post('/api/v1/topology/promote/preview', async request => {
+    auth.authenticate(request, true);
+    return promotion().preview(promoteRequest(request.body));
+  });
+
+  // Writes configuration only. Nothing here starts a process: `Launch` is a
+  // separate, explicit action, so adding to the fleet can never launch by surprise.
+  app.post('/api/v1/topology/promote', async request => {
+    const session = auth.authenticate(request, true);
+    const result = await promotion().promote(promoteRequest(request.body));
+    events.publish('configuration.changed', { revision: result.newRevision });
+    events.publish('topology.draft.changed', { revision: result.draftRevision });
+    await audit.record({
+      requestId: request.id, browser: session.id, action: 'topology.promote', result: 'succeeded',
+    });
+    return result;
   });
 
   app.get<{ Params: { id: string } }>('/api/v1/roles/:id', async request => {
@@ -544,6 +594,17 @@ function clearAuthCookies(reply: { header(name: string, value: string | string[]
     'ofs_session=; HttpOnly; SameSite=Strict; Path=/api; Max-Age=0',
     'ofs_device=; HttpOnly; SameSite=Strict; Path=/api; Max-Age=0',
   ]);
+}
+
+function promoteRequest(body: unknown): { ids: string[]; configRevision: string; draftRevision?: string } {
+  const value = (body ?? {}) as { ids?: unknown; configRevision?: unknown; draftRevision?: unknown };
+  if (!Array.isArray(value.ids) || value.ids.some(id => typeof id !== 'string'))
+    throw new FleetError('invalid_request', 'ids must be a list of sketch ids');
+  return {
+    ids: value.ids as string[],
+    configRevision: String(value.configRevision ?? ''),
+    draftRevision: typeof value.draftRevision === 'string' ? value.draftRevision : undefined,
+  };
 }
 
 function cryptoRandomId(): string { return randomBytes(12).toString('hex'); }

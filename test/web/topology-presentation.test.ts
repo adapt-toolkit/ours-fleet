@@ -108,7 +108,9 @@ describe('topology edge geometry', () => {
     // canvasWidth/viewBoxWidth and drags every edge off the cards on a wide
     // viewport. There is no DOM test environment here, so the contract is
     // pinned at the source.
-    const source = readFileSync(resolve('web/src/FleetTopology.tsx'), 'utf8');
+    // Pinned on the component that actually renders the overlay; the read-only
+    // FleetTopology it replaced is gone.
+    const source = readFileSync(resolve('web/src/TopologyEditor.tsx'), 'utf8');
     expect(source).toMatch(/<svg\b/);
     expect(source).not.toMatch(/viewBox=/);
     expect(source).not.toMatch(/preserveAspectRatio=/);

@@ -237,8 +237,27 @@ Security boundaries:
 - tests use temporary fleet homes, fake supervisors/identity providers, and
   isolated tmux sockets—never active role state.
 
-Permanent spawns are written to `~/fleet.d/<Name>.yaml` — your hand-written
-`~/fleet.yaml` is **never** machine-edited. `ours-fleet rm <Name>` unspawns.
+Permanent spawns are written to `~/fleet.d/<Name>.yaml`; the CLI never edits your
+hand-written `~/fleet.yaml`. `ours-fleet rm <Name>` unspawns.
+
+The web console is the one writer that can touch the base file, and it saves the
+file as a whole document: its setup wizard and configuration editor may create,
+change or remove any top-level block, including `vars:`, `defaults:`, `roles:`,
+`watchdogs:` and `loops:`. (`defaults:`, `watchdogs:` and `loops:` can only live
+in the base file — a `~/fleet.d/*.yaml` drop-in may declare `roles:` and nothing
+else.) Top-level keys the console does not recognise are round-tripped untouched.
+
+Console edits are applied as surgical splices against the file's exact bytes, so
+an unchanged save is a byte-for-byte no-op and lines outside the edit keep their
+comments, spacing and quoting. One bounded exception: changing the *length* of a
+block sequence — adding or removing an entry under `watch:`, `oversee:`, `roles:`
+or `wake_sources:` — rewrites that one collection as a whole, which drops inline
+comments written on its individual items. The loss is confined to the collection
+you edited, is shown in the diff before anything is written, and can be declined
+by not saving. Each write is revision-guarded, reviewed as a diff of the real
+file, validated with the real loader, and preceded by a timestamped backup.
+Values under `env:` — and the `vars:` entries they interpolate — are masked in
+the diff and never leave the host.
 
 From inside Claude Code, Codex, or Hermes with the core `ours` plugin installed,
 say **"spawn an ours agent …"**. The core skill checks for `ours-fleet`, installs
