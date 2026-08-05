@@ -3,7 +3,9 @@ import type { Problem } from '../application/types.js';
 import {
   type RuntimeRoleItem, type TopologyEdge, type TopologyNode, deriveTopology,
 } from './topology.js';
-import type { DraftNode, DraftPosition, TopologyDraftRead } from './topology-draft-store.js';
+import type {
+  DraftFieldValue, DraftNode, DraftPosition, TopologyDraftRead,
+} from './topology-draft-store.js';
 
 /**
  * The console's read model: authoritative configuration overlaid with the
@@ -38,6 +40,8 @@ export interface MergedTopologyNode extends TopologyNode {
   missing: MissingRequirement[];
   position?: DraftPosition;
   enabled?: boolean;
+  /** Sketched values, on draft nodes only — what promotion writes. */
+  fields?: Record<string, DraftFieldValue>;
 }
 
 export interface MergedTopologyEdge extends TopologyEdge {
@@ -218,6 +222,7 @@ function draftNode(
     complete: missing.length === 0,
     launchable: false,   // a draft is in no file the supervisor reads
     missing,
+    fields: node.fields,
     enabled: node.fields.enabled === undefined ? undefined : node.fields.enabled !== false,
   };
 }

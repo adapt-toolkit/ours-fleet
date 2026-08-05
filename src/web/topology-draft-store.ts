@@ -43,11 +43,16 @@ const EDGE_KINDS: readonly TopologyEdgeKind[] = ['oversees', 'watches', 'targets
  * Draft fields the console may persist. An allowlist rather than a denylist so
  * secret-bearing keys (`env`, `vars`, `harness_options`) are excluded by
  * construction; extend it deliberately when the inspector grows a field.
+ *
+ * Every entry is a plain scalar that promotion can write straight into a role,
+ * watchdog or loop mapping. Nested settings (`permissions:`, `harness_options:`,
+ * `isolation:`) are deliberately absent: they are edited through the reviewed
+ * configuration editor once the node is real, not sketched.
  */
 const FIELD_KEYS: readonly string[] = [
   'mission', 'bio', 'persona', 'coordinator', 'prompt',
   'interval', 'initial_delay', 'jitter', 'enabled',
-  'harness', 'session', 'model', 'reasoning_effort', 'cwd',
+  'harness', 'session', 'model', 'identity', 'cwd',
 ];
 
 export type DraftFieldValue = string | number | boolean;
