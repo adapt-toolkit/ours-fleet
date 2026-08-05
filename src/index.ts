@@ -1,7 +1,7 @@
 export { loadConfig, findRole, resolvePermissions, ConfigError } from './config.js';
 export type {
   FleetConfig, ResolvedRole, RoleConfig, OverseeEntry, SessionBackendId,
-  CommonPermissions, SessionOptions,
+  CommonPermissions, FleetPermissionMode, ApprovalMode, SessionOptions,
   OwnerChannelConfig,
 } from './config.js';
 export type {
@@ -18,6 +18,7 @@ export { registerAdapter, getAdapter, knownAdapters } from './harness/registry.j
 export { claudeCodeAdapter, makeClaudeCodeAdapter } from './harness/claude-code.js';
 export { codexAdapter, makeCodexAdapter } from './harness/codex.js';
 export { generateBriefing } from './briefing.js';
+export { effectivePermissionMode } from './permissions.js';
 export { pickBackend } from './supervisor/index.js';
 export type { SupervisorBackend } from './supervisor/types.js';
 export { up, down, restartRoles, rmRole, applyRole } from './ops.js';

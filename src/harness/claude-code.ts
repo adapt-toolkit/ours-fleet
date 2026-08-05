@@ -38,8 +38,9 @@ export function nativePermissionMode(
 ): string | undefined {
   switch (approval) {
     case 'allow': return 'bypassPermissions';
+    case 'auto': return 'acceptEdits';
     case 'deny': return 'plan';
-    default: return undefined;               // 'ask' → Claude's own default
+    default: return undefined;               // ask uses Claude's native default
   }
 }
 
@@ -282,6 +283,15 @@ export function makeClaudeCodeAdapter(exec: Exec = realExec): HarnessAdapter {
         native: { permission_mode: native },
         capabilities: claudeCapabilities(native, role.permissions.filesystem),
       };
+    },
+
+    effectivePermissionMode(role) {
+      const nativeMode = permissionMode(role) ?? 'default';
+      const fleetMode = nativeMode === 'bypassPermissions' ? 'allow'
+        : nativeMode === 'acceptEdits' || nativeMode === 'dontAsk' ? 'auto'
+          : nativeMode === 'default' || nativeMode === 'plan' ? 'ask' : undefined;
+      if (!fleetMode) throw new Error(`unsupported Claude permission mode '${nativeMode}'`);
+      return { fleetMode, nativeMode };
     },
 
     vocabulary: {

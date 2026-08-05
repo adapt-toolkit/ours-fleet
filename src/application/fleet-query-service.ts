@@ -182,6 +182,7 @@ export class FleetQueryService {
           pendingPermissionId: snapshot.pendingPermissionId,
           protocolVersion: snapshot.protocolVersion, features: snapshot.features,
           runtimeModel: snapshot.runtimeModel, reasoningEffort: snapshot.reasoningEffort,
+          permissionMode: snapshot.permissionMode,
         };
       } catch (error) {
         const failure = error instanceof SessionControlError ? error.kind : 'backend';

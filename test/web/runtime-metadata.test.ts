@@ -24,5 +24,16 @@ describe('runtime metadata presentation', () => {
     expect(shown.Model).toBe('Not reported');
     expect(shown.Reasoning).toBe('Not reported');
     expect(shown.Model).not.toBe('default');
+    expect(shown.Permission).toBe('Not reported');
+    expect(shown['Native mode']).toBe('Not reported');
+  });
+
+  it('shows effective live normalized and harness-native modes', () => {
+    const shown = values({ role: { config: { permissions: { approval: 'ask' },
+      nativeRuntime: { approval: 'untrusted' } } }, status: { session: {
+      permissionMode: { fleetMode: 'allow', nativeMode: 'never' },
+    } } });
+    expect(shown.Permission).toBe('allow');
+    expect(shown['Native mode']).toBe('never');
   });
 });

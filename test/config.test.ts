@@ -276,6 +276,11 @@ describe('loadConfig', () => {
     expect(role.session_options?.acp?.command).toEqual(['node', 'agent.mjs']);
   });
 
+  it('accepts the public auto mode', () => {
+    base('roles:\n  A:\n    permissions:\n      approval: auto\n');
+    expect(findRole(loadConfig(), 'A').permissions.approval).toBe('auto');
+  });
+
   it('rejects invalid session and common permission values', () => {
     base('roles:\n  A:\n    session: screen\n');
     expect(() => loadConfig()).toThrowError(/session.*tmux, acp/);

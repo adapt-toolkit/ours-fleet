@@ -80,6 +80,11 @@ describe('spawnPermanent', () => {
     expect(existsSync(agentDir('Preview'))).toBe(false);
   });
 
+  it('accepts the public auto permission mode on the direct spawn path', () => {
+    const result = spawnDryRun({ name: 'AutoWorker', approval: 'auto' });
+    expect(result.resolvedRole.permissions.approval).toBe('auto');
+  });
+
   it('writes fleet.d/<Name>.yaml from files and brings the role up', async () => {
     writeFileSync(join(dir, 'bio.txt'), 'A public card.');
     writeFileSync(join(dir, 'persona.txt'), 'An operating contract.');

@@ -36,7 +36,10 @@ export type NotifyEventType = (typeof NOTIFY_EVENT_TYPES)[number];
 export type InjectMode = 'notification' | 'full';
 export type MonitorMode = 'fleet' | 'native';
 export type SessionBackendId = 'tmux' | 'acp';
-export type ApprovalMode = 'ask' | 'allow' | 'deny';
+/** Public, harness-neutral permission policy. */
+export type FleetPermissionMode = 'ask' | 'auto' | 'allow';
+/** `deny` is a deprecated, fail-closed compatibility alias retained for old fleet files. */
+export type ApprovalMode = FleetPermissionMode | 'deny';
 export type FilesystemMode = 'read-only' | 'workspace' | 'unrestricted';
 export type UnattendedMode = 'deny' | 'wait';
 
@@ -722,8 +725,10 @@ export function resolvePermissions(
   const bad = Object.keys(merged).filter(k => !allowed.includes(k));
   if (bad.length)
     throw new ConfigError(`${file}: role '${name}' permissions: unknown key(s) ${bad.join(', ')}`);
-  if (merged.approval !== undefined && !['ask', 'allow', 'deny'].includes(merged.approval))
-    throw new ConfigError(`${file}: role '${name}' permissions.approval must be one of: ask, allow, deny`);
+  if (merged.approval !== undefined && !['ask', 'auto', 'allow', 'deny'].includes(merged.approval))
+    throw new ConfigError(
+      `${file}: role '${name}' permissions.approval must be one of: ask, auto, allow ` +
+      `(deprecated alias: deny)`);
   if (merged.filesystem !== undefined
       && !['read-only', 'workspace', 'unrestricted'].includes(merged.filesystem))
     throw new ConfigError(

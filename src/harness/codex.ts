@@ -77,7 +77,8 @@ function approvalPolicy(role: ResolvedRole): string | undefined {
   if (a == null) {
     const approval = role.permissions?.approval;
     if (approval === 'allow') return 'never';
-    if (approval === 'ask' || approval === 'deny') return 'on-request';
+    if (approval === 'auto' || approval === 'deny') return 'on-request';
+    if (approval === 'ask') return 'untrusted';
     return undefined;
   }
   if (!APPROVAL_POLICIES.includes(a))
@@ -275,7 +276,8 @@ export function makeCodexAdapter(exec: Exec = realExec): HarnessAdapter {
     },
 
     translatePermissions(permissions) {
-      const approval = permissions.approval === 'allow' ? 'never' : 'on-request';
+      const approval = permissions.approval === 'allow' ? 'never'
+        : permissions.approval === 'ask' ? 'untrusted' : 'on-request';
       const sandbox = permissions.filesystem === 'read-only'
         ? 'read-only'
         : permissions.filesystem === 'unrestricted'
@@ -300,6 +302,15 @@ export function makeCodexAdapter(exec: Exec = realExec): HarnessAdapter {
         native: { approval, sandbox },
         capabilities: codexCapabilities(approval, sandbox),
       };
+    },
+
+    effectivePermissionMode(role) {
+      const nativeMode = approvalPolicy(role) ?? 'untrusted';
+      const fleetMode = nativeMode === 'never' ? 'allow'
+        : nativeMode === 'on-request' ? 'auto'
+          : nativeMode === 'untrusted' ? 'ask' : undefined;
+      if (!fleetMode) throw new Error(`unsupported Codex approval policy '${nativeMode}'`);
+      return { fleetMode, nativeMode };
     },
 
     vocabulary: {

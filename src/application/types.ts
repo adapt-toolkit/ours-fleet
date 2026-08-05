@@ -61,6 +61,7 @@ export interface RoleStatus {
     features?: string[];
     runtimeModel?: SessionSnapshot['runtimeModel'];
     reasoningEffort?: SessionSnapshot['reasoningEffort'];
+    permissionMode?: SessionSnapshot['permissionMode'];
   };
   restart: {
     circuit: 'closed' | 'open';

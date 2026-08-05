@@ -259,7 +259,7 @@ describe('validateOptions / prereqs', () => {
 
 describe('Codex neutral permission mapping and the unattended floor (2.1)', () => {
   const a = makeCodexAdapter(okExec);
-  const APPROVALS = ['ask', 'allow', 'deny'] as const;
+  const APPROVALS = ['ask', 'auto', 'allow', 'deny'] as const;
   const FILESYSTEMS = ['read-only', 'workspace', 'unrestricted'] as const;
   const UNATTENDED = ['deny', 'wait'] as const;
 
@@ -268,6 +268,15 @@ describe('Codex neutral permission mapping and the unattended floor (2.1)', () =
       { approval: 'allow', filesystem: 'workspace', unattended: 'deny' });
     expect(t).toMatchObject({ supported: true, native: { approval: 'never', sandbox: 'workspace-write' } });
     expect(checkUnattendedFloor((t as { capabilities: never }).capabilities).meets).toBe(true);
+  });
+
+  it('maps public modes to Codex approval policies with sandbox kept separate', () => {
+    const native = (approval: 'ask' | 'auto' | 'allow') =>
+      (a.translatePermissions({ approval, filesystem: 'read-only', unattended: 'deny' }) as
+        { native: Record<string, unknown> }).native;
+    expect(native('ask')).toEqual({ approval: 'untrusted', sandbox: 'read-only' });
+    expect(native('auto').approval).toBe('on-request');
+    expect(native('allow').approval).toBe('never');
   });
 
   it('every neutral combination resolves, and only allow clears the floor', () => {

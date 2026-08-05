@@ -300,7 +300,7 @@ defaults:
   harness: claude-code                  # for roles that don't set one
   session: tmux                         # tmux (default) | acp
   permissions:                         # common intent, translated by each harness/backend
-    approval: ask                       # ask | allow | deny
+    approval: ask                       # ask | auto | allow (`deny` is a deprecated alias)
     filesystem: workspace               # read-only | workspace | unrestricted
     unattended: deny                    # deny | wait
   model: claude-fable-5                 # default model for roles that don't set one (per-role model / --model wins)
@@ -467,14 +467,21 @@ native settings actually grant, against a fixed floor:
 those requests with nobody to see it. With `unattended: wait` it **warns**,
 since a human can still attach a console and answer.
 
-**Security meaning.** `approval: allow` maps to Claude's `bypassPermissions`,
-the mode that actually permits the actions the role was authorized to take.
+**Security meaning.** `ask` maps to Codex `untrusted` / Claude `default`,
+`auto` to Codex `on-request` / Claude `acceptEdits`, and `allow` to Codex
+`never` / Claude `bypassPermissions`, the non-interactive modes that actually
+permit the actions the role was authorized to take.
 `dontAsk` suppresses only the *prompt*, not the denial, which is why an
-`allow` role previously ran unable to do its job. Nothing but an explicit
-`allow` is elevated: `ask` keeps Claude's default mode and `deny` maps to
-`plan`. `allow` is a real grant — give it deliberately, and keep per-role
+`allow` role previously ran unable to do its job. Legacy `deny` is accepted
+only for compatibility and retains its conservative Codex `on-request` /
+Claude `plan` translation. `allow` is a real grant — give it deliberately, and keep per-role
 [`isolation:`](#agent-isolation) as the outer boundary, which no permission
 mode can cross.
+
+ACP exposes agent-specific session mode IDs and `session/set_mode`, but no
+portable permission-policy capability. Fleet uses that primitive where an
+adapter has a corresponding mode and otherwise translates at the adapter;
+live session metadata reports both normalized and harness-native modes.
 
 ### Isolation at creation time
 

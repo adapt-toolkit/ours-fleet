@@ -97,6 +97,8 @@ export interface AcpSessionOptions {
   permissions: CommonPermissions;
   /** Native permission-mode id to request via session/set_mode; undefined keeps the agent default. */
   modeId?: string;
+  /** Adapter-resolved live permission policy; separate from ACP agent-specific session modes. */
+  permissionMode?: NonNullable<SessionSnapshot['permissionMode']>;
   log(line: string): void;
   /** Test seam for the cancel-escalation grace period; production uses the default. */
   cancelGraceMs?: number;
@@ -276,6 +278,7 @@ export class AcpSession implements SessionHandle {
       pendingPermissionId: this.pendingPermissions.keys().next().value as string | undefined,
       runtimeModel: this.runtimeModel,
       reasoningEffort: this.reasoningEffort,
+      permissionMode: this.options.permissionMode,
     };
   }
 

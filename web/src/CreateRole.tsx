@@ -5,7 +5,7 @@ import { useLivePoll } from './use-live-poll';
 type Form = {
   name: string; harness: 'codex' | 'claude-code'; model: string;
   session: 'acp' | 'tmux'; cwd: string; lifetime: 'permanent' | 'temporary';
-  mission: string; coordinator: string; approval: 'ask' | 'allow' | 'deny';
+  mission: string; coordinator: string; approval: 'ask' | 'auto' | 'allow';
   filesystem: 'read-only' | 'workspace' | 'unrestricted'; unattended: 'deny' | 'wait';
   bio: string; persona: string; highRiskAcknowledged: boolean; openAfterCreate: boolean;
   reuseExistingIdentityAcknowledged: boolean; unverifiedIdentityAcknowledged: boolean;
@@ -163,7 +163,7 @@ export function CreateRole({ onClose, onCreated }: {
           <p className="muted">The harness owns wake delivery; fleet batching and injection are disabled.</p>}
         </fieldset>
         <fieldset><legend>Neutral permissions</legend><div className="form-grid three">
-          <label>Approval<select value={form.approval} onChange={e => change('approval', e.target.value as Form['approval'])}><option>ask</option><option>deny</option><option>allow</option></select></label>
+          <label>Permission<select value={form.approval} onChange={e => change('approval', e.target.value as Form['approval'])}><option>ask</option><option>auto</option><option>allow</option></select></label>
           <label>Filesystem<select value={form.filesystem} onChange={e => change('filesystem', e.target.value as Form['filesystem'])}><option>workspace</option><option>read-only</option><option>unrestricted</option></select></label>
           <label>Unattended<select value={form.unattended} onChange={e => change('unattended', e.target.value as Form['unattended'])}><option>deny</option><option>wait</option></select></label>
         </div>{(form.approval === 'allow' || form.filesystem === 'unrestricted') &&

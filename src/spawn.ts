@@ -159,8 +159,9 @@ export function validateSpawnOpts(o: SpawnOpts): void {
     throw new Error('--mission and --mission-file are mutually exclusive');
   if (o.session && !['tmux', 'acp'].includes(o.session))
     throw new Error(`invalid --session '${o.session}'; allowed: tmux, acp`);
-  if (o.approval && !['ask', 'allow', 'deny'].includes(o.approval))
-    throw new Error(`invalid --approval '${o.approval}'; allowed: ask, allow, deny`);
+  if (o.approval && !['ask', 'auto', 'allow', 'deny'].includes(o.approval))
+    throw new Error(
+      `invalid --approval '${o.approval}'; allowed: ask, auto, allow (deprecated alias: deny)`);
   if (o.filesystem && !['read-only', 'workspace', 'unrestricted'].includes(o.filesystem))
     throw new Error(
       `invalid --filesystem '${o.filesystem}'; allowed: read-only, workspace, unrestricted`);

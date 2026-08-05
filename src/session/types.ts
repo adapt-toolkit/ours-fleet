@@ -176,6 +176,12 @@ export interface SessionSnapshot {
   pendingPermissionId?: string;
   runtimeModel?: RuntimeSelectorMetadata;
   reasoningEffort?: RuntimeSelectorMetadata;
+  permissionMode?: {
+    /** Effective harness-neutral policy after native overrides. */
+    fleetMode: import('../config.js').FleetPermissionMode;
+    /** Exact harness-native approval/permission mode used by this runner. */
+    nativeMode: string;
+  };
 }
 
 export type SessionEventKind =
