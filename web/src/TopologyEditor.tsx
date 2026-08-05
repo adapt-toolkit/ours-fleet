@@ -417,7 +417,7 @@ function Inspector({
     */}
     {node.kind === 'agent' && <p className="muted deferred-note">
       Agent oversight — which agent checks on which — is not configured from the
-      graph yet. It arrives in a later phase; until then, set <code>oversee:</code>
+      graph yet. It arrives in a later phase; until then, set <code>oversee:</code>{' '}
       in the configuration editor.
     </p>}
 

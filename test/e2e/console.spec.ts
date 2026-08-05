@@ -337,9 +337,13 @@ test('sketch, connect and add to the fleet from an empty console without launchi
   // Agent oversight is deferred out of this phase: no inert control, and the
   // inspector says where it is configured instead.
   await expect(page.getByRole('button', { name: /oversees/i })).toHaveCount(0);
-  await expect(page.getByLabel('Agent1 details')).toContainText('Agent oversight');
-  await expect(page.getByLabel('Agent1 details')).toContainText('not configured from the graph yet');
-  await expect(page.getByLabel('Agent1 details')).toContainText('configuration editor');
+  // The whole rendered sentence, not fragments of it: JSX drops the newline that
+  // follows an element, so `<code>oversee:</code>` collides with the next word
+  // unless the space is explicit, and a fragment assertion still matches.
+  await expect(page.getByLabel('Agent1 details')).toContainText(
+    'Agent oversight — which agent checks on which — is not configured from the graph yet.'
+    + ' It arrives in a later phase; until then, set oversee: in the configuration editor.');
+  await expect(page.getByLabel('Agent1 details')).not.toContainText('oversee:in');
 
   // Connect: a watchdog created from the agent is scoped to that agent.
   await page.getByRole('button', { name: '＋ Watchdog for this agent' }).click();
