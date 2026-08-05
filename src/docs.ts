@@ -27,11 +27,15 @@ drop-ins. An explicit \`-c FILE\` replaces \`~/fleet.yaml\`; fleet.d still adds
 roles. Validate with \`config\` and \`doctor\` before starting or restarting.
 
 The CLI never writes the base file: \`spawn\` writes \`~/fleet.d/Name.yaml\`. The
-web console may write the base file's \`defaults:\`, \`watchdogs:\` and \`loops:\`
-blocks, which fleet.d cannot hold. Those edits are applied to the parsed document
-in place, so comments, key order and formatting outside the change survive, and
-each save is revision-guarded, reviewed as a diff, validated by the real loader,
-and backed up next to the file first.
+web console does write it, as a whole document — its setup wizard and
+configuration editor may create, change or remove any top-level block, including
+\`vars:\`, \`defaults:\`, \`roles:\`, \`watchdogs:\` and \`loops:\`. Only the base
+file may hold \`defaults:\`, \`watchdogs:\` and \`loops:\`; a fleet.d drop-in may
+declare \`roles:\` and nothing else. Unrecognised top-level keys are round-tripped
+untouched. Console edits are applied as surgical splices against the file's exact
+bytes, so unchanged lines keep their comments and spacing and an unchanged save is
+a byte-for-byte no-op; each save is revision-guarded, reviewed as a diff of the
+real file, validated by the real loader, and backed up next to the file first.
 
 ## Lifecycle and console commands
 

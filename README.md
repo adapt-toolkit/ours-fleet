@@ -240,12 +240,19 @@ Security boundaries:
 Permanent spawns are written to `~/fleet.d/<Name>.yaml`; the CLI never edits your
 hand-written `~/fleet.yaml`. `ours-fleet rm <Name>` unspawns.
 
-The web console is the one writer that can touch the base file, and only for the
-`defaults:`, `watchdogs:` and `loops:` blocks, which `~/fleet.d/*.yaml` is not
-allowed to hold. It applies changes to the parsed document in place, so comments,
-key order, quoting and indentation outside the edit survive; every write is
-revision-guarded, reviewed as a diff, validated with the real loader, and
-preceded by a timestamped backup.
+The web console is the one writer that can touch the base file, and it saves the
+file as a whole document: its setup wizard and configuration editor may create,
+change or remove any top-level block, including `vars:`, `defaults:`, `roles:`,
+`watchdogs:` and `loops:`. (`defaults:`, `watchdogs:` and `loops:` can only live
+in the base file — a `~/fleet.d/*.yaml` drop-in may declare `roles:` and nothing
+else.) Top-level keys the console does not recognise are round-tripped untouched.
+
+Console edits are applied as surgical splices against the file's exact bytes, so
+every line you did not change keeps its comment, spacing and quoting, and an
+unchanged save is a byte-for-byte no-op. Each write is revision-guarded, reviewed
+as a diff of the real file, validated with the real loader, and preceded by a
+timestamped backup. Values under `env:` — and the `vars:` entries they
+interpolate — are masked in the diff and never leave the host.
 
 From inside Claude Code, Codex, or Hermes with the core `ours` plugin installed,
 say **"spawn an ours agent …"**. The core skill checks for `ours-fleet`, installs

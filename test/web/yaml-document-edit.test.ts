@@ -1,9 +1,17 @@
+import { readFileSync } from 'node:fs';
 import { describe, expect, it } from 'vitest';
 import { parse } from 'yaml';
 
 import {
   detectFormatting, redactSourceSecrets, renderModelOntoSource,
 } from '../../src/web/yaml-document-edit.js';
+import { parseFleetDocument } from '../../src/config-yaml.js';
+
+/** Lines of `after` that differ from `before` at the same index. */
+const changedLines = (before: string, after: string): string[] => {
+  const original = before.split('\n');
+  return after.split('\n').filter((line, index) => line !== original[index]);
+};
 
 const COMMENTED = [
   '# fleet.yaml — declarative fleet.',
@@ -155,7 +163,11 @@ describe('surgical fleet YAML document editing', () => {
 
   it('handles an absent-file first-run source and an empty model', () => {
     expect(renderModelOntoSource('roles: {}\n', { roles: { Alpha: {} } })).toContain('Alpha');
-    expect(parse(renderModelOntoSource('roles: {}\n', {}))).toEqual({});
+    // Removing the last top-level key empties the document; the fleet parser
+    // reads an empty file as an empty mapping, so this stays a valid config.
+    const emptied = renderModelOntoSource('roles: {}\n', {});
+    expect(emptied.trim()).toBe('');
+    expect(parseFleetDocument('fleet.yaml', emptied, 'strict').value).toEqual({});
   });
 
   it('preserves a null-bodied role and does not rewrite it', () => {
@@ -191,6 +203,72 @@ describe('surgical fleet YAML document editing', () => {
     const next = renderModelOntoSource('roles:\n  Alice: {}\n', JSON.parse('{"roles":{"Alice":{}},"__proto__":{"evil":true}}'));
     expect(({} as Record<string, unknown>).evil).toBeUndefined();
     expect(parse(next).roles).toEqual({ Alice: {} });
+  });
+});
+
+describe('fidelity against the shipped examples/fleet.yaml', () => {
+  const source = readFileSync('examples/fleet.yaml', 'utf8');
+
+  it('renders an unchanged model byte-for-byte identically', () => {
+    expect(renderModelOntoSource(source, parse(source))).toBe(source);
+  });
+
+  it('changes exactly one line when one scalar changes, keeping its inline comment', () => {
+    const model = parse(source) as Record<string, any>;
+    model.defaults.harness = 'codex';
+
+    const next = renderModelOntoSource(source, model);
+
+    expect(changedLines(source, next)).toEqual([
+      "  harness: codex        # adapter for roles that don't set their own",
+    ]);
+    expect(next.split('\n')).toHaveLength(source.split('\n').length);
+    expect(parse(next)).toEqual(model);
+  });
+
+  it('keeps an inline comment that sits on a block key, in place', () => {
+    const model = parse(source) as Record<string, any>;
+    model.defaults.permissions.approval = 'allow';
+
+    const next = renderModelOntoSource(source, model);
+
+    // The block key's own comment must not migrate onto the following line.
+    expect(next).toContain('  permissions:                # common intent translated to each harness/backend');
+    expect(changedLines(source, next)).toEqual([
+      '    approval: allow             # ask | allow | deny',
+    ]);
+  });
+
+  it('appends a new top-level block without touching a single existing line', () => {
+    const model = parse(source) as Record<string, any>;
+    model.watchdogs = { health: { coordinator: 'FleetCoordinator' } };
+
+    const next = renderModelOntoSource(source, model);
+
+    expect(next.startsWith(source.replace(/\n$/, ''))).toBe(true);
+    expect(changedLines(source, next).join('\n')).toContain('watchdogs:');
+    expect(parse(next)).toEqual(model);
+  });
+
+  it('removes a role without disturbing anything above it', () => {
+    const model = parse(source) as Record<string, any>;
+    delete model.roles.Alice;
+
+    const next = renderModelOntoSource(source, model);
+
+    expect(next).not.toContain('Own the alice repository end to end.');
+    expect(next).toContain('  FleetCoordinator:');
+    expect(next.split('\n').length).toBeLessThan(source.split('\n').length);
+    expect(parse(next)).toEqual(model);
+  });
+
+  it('masks secrets without altering any other byte', () => {
+    const redacted = redactSourceSecrets(source, 'MASK');
+
+    expect(changedLines(source, redacted)).toEqual([
+      '      EXAMPLE_FLAG: MASK             # extra env passed into the session',
+    ]);
+    expect(redacted.split('\n')).toHaveLength(source.split('\n').length);
   });
 });
 

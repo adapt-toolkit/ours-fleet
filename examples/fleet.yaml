@@ -6,12 +6,20 @@
 #   ours-fleet down          stop everything
 #   ours-fleet config        validate + print the merged plan
 #
-# This file is yours. The CLI never edits it: spawned roles land in
-# ~/fleet.d/<Name>.yaml (one machine-written file per role; delete = unspawn).
-# The web console may write the `defaults:`, `watchdogs:` and `loops:` blocks
-# here, because those cannot live in fleet.d. It edits the document in place —
-# your comments, key order and formatting are preserved — and only ever behind a
-# reviewed diff, with a timestamped backup beside this file.
+# The CLI never edits this file: spawned roles land in ~/fleet.d/<Name>.yaml
+# (one machine-written file per role; delete = unspawn).
+#
+# The web console CAN edit this file. Its setup wizard and configuration editor
+# save it as a whole document, so any top-level block may be created, changed or
+# removed — `vars:` (including values like work_root below), `defaults:`,
+# `roles:`, `watchdogs:` and `loops:` alike. `defaults:`, `watchdogs:` and
+# `loops:` can ONLY live here; fleet.d drop-ins may declare `roles:` and nothing
+# else. Keys the console does not know about are round-tripped untouched.
+#
+# Console edits are applied as surgical splices against these exact bytes, so
+# every line you did not change keeps its comment, spacing and quoting. Each
+# save is revision-guarded, reviewed as a diff of the real file, validated by
+# the real loader, and preceded by a timestamped backup beside this file.
 
 vars:
   work_root: /home/me/work
