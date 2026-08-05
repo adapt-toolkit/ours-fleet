@@ -113,6 +113,110 @@ describe('surgical fleet YAML document editing', () => {
     expect(parse(next)).toEqual(model);
   });
 
+  describe('block sequences that change length with content after them', () => {
+    // A block collection's range runs past its terminating newline, unlike a
+    // scalar's. Splicing over that newline once glued the following line on.
+    const source = [
+      'roles:', '  Alice:', '    oversee:', '      - Bob', '      - Carol',
+      '    mission: Ship', '  Bob:', '    mission: Review', '',
+    ].join('\n');
+
+    it('grows without gluing the following line', () => {
+      const model = parse(source) as Record<string, any>;
+      model.roles.Alice.oversee.push('Dave');
+
+      const next = renderModelOntoSource(source, model);
+
+      expect(next).toBe([
+        'roles:', '  Alice:', '    oversee:', '      - Bob', '      - Carol', '      - Dave',
+        '    mission: Ship', '  Bob:', '    mission: Review', '',
+      ].join('\n'));
+      expect(parse(next)).toEqual(model);
+    });
+
+    it('shrinks without gluing the following line', () => {
+      const model = parse(source) as Record<string, any>;
+      model.roles.Alice.oversee.pop();
+
+      const next = renderModelOntoSource(source, model);
+
+      expect(next).toBe([
+        'roles:', '  Alice:', '    oversee:', '      - Bob',
+        '    mission: Ship', '  Bob:', '    mission: Review', '',
+      ].join('\n'));
+      expect(parse(next)).toEqual(model);
+    });
+
+    it('empties onto the key rather than leaving a dangling block', () => {
+      const model = parse(source) as Record<string, any>;
+      model.roles.Alice.oversee = [];
+
+      const next = renderModelOntoSource(source, model);
+
+      expect(next).toBe([
+        'roles:', '  Alice:', '    oversee: []',
+        '    mission: Ship', '  Bob:', '    mission: Review', '',
+      ].join('\n'));
+      expect(parse(next)).toEqual(model);
+    });
+
+    it('keeps a flow sequence in flow style when it changes length', () => {
+      const flow = 'loops:\n  nightly:\n    roles: [Alice]\n    interval: 10m\n';
+      const model = parse(flow) as Record<string, any>;
+      model.loops.nightly.roles.push('Bob');
+
+      expect(renderModelOntoSource(flow, model))
+        .toBe('loops:\n  nightly:\n    roles: [ Alice, Bob ]\n    interval: 10m\n');
+    });
+
+    it('grows a sequence that ends the document', () => {
+      const tail = 'roles:\n  Alice:\n    oversee:\n      - Bob\n';
+      const model = parse(tail) as Record<string, any>;
+      model.roles.Alice.oversee.push('Carol');
+
+      expect(renderModelOntoSource(tail, model)).toBe('roles:\n  Alice:\n    oversee:\n      - Bob\n      - Carol\n');
+    });
+
+    it('changes wake_sources on the shipped example and still parses to the model', () => {
+      const example = readFileSync('examples/fleet.yaml', 'utf8');
+      for (const mutate of [
+        (list: string[]) => list.push('local_contact_request'),
+        (list: string[]) => list.pop(),
+      ]) {
+        const model = parse(example) as Record<string, any>;
+        mutate(model.roles.Alice.monitor.wake_sources);
+        const next = renderModelOntoSource(example, model);
+        expect(parse(next)).toEqual(model);
+        // The line that used to be glued on is still its own line.
+        expect(next).toContain('\n      batch_ms: 2000                # coalesce a burst into one console line (default 2000)');
+      }
+    });
+  });
+
+  describe('emptying a mapping', () => {
+    it('writes an empty mapping instead of a null value when the last entry goes', () => {
+      const source = 'roles:\n  A: {}\nwatchdogs:\n  health:\n    coordinator: A\nloops:\n  nightly:\n    roles: [A]\n';
+      const model = parse(source) as Record<string, any>;
+      model.watchdogs = {};
+
+      const next = renderModelOntoSource(source, model);
+
+      expect(next).toBe('roles:\n  A: {}\nwatchdogs: {}\nloops:\n  nightly:\n    roles: [A]\n');
+      expect(parse(next).watchdogs).toEqual({});
+    });
+
+    it('keeps a comment written beside the key it collapses', () => {
+      const source = 'watchdogs:   # automation lives here\n  health:\n    coordinator: A\n';
+      const model = parse(source) as Record<string, any>;
+      model.watchdogs = {};
+
+      const next = renderModelOntoSource(source, model);
+
+      expect(next).toContain('# automation lives here');
+      expect(parse(next)).toEqual({ watchdogs: {} });
+    });
+  });
+
   it('preserves quoting style and long lines of untouched scalars', () => {
     const long = 'x'.repeat(200);
     const source = ['roles:', '  Alice:', `    mission: "${long}"`, "    bio: 'single quoted'", ''].join('\n');

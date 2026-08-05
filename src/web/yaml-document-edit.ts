@@ -165,6 +165,10 @@ function planEdits(
   if (isPlainObject(current) && isPlainObject(next)) {
     const node = document.getIn(path, true);
     if (!isMap(node)) return false;
+    // Removing every entry one by one would leave `watchdogs:` with no value,
+    // which reads back as null rather than the empty mapping that was asked for.
+    if (path.length > 0 && Object.keys(next).length === 0 && Object.keys(current).length > 0)
+      return planReplace(document, source, formatting, path, next, plan);
     for (const key of Object.keys(current))
       if (!hasOwn(next, key) && !planDelete(node, source, key, plan)) return false;
     for (const key of Object.keys(next)) {
@@ -195,17 +199,51 @@ function planReplace(
   if (path.length === 0) return false;
   const node = document.getIn(path, true);
   if (!isNodeWithRange(node)) return false;
-  const [start, end] = node.range;
 
   // A block scalar's body cannot be swapped for an inline one by splicing.
   if (isScalar(node) && (node.type === 'BLOCK_LITERAL' || node.type === 'BLOCK_FOLDED')) return false;
 
-  const ownLine = source.lastIndexOf('\n', start - 1) >= 0
-    && source.slice(source.lastIndexOf('\n', start - 1) + 1, start).trim() === '';
-  const text = renderValue(next, formatting);
+  const start = node.range[0];
+  // A block collection's range runs past the newline that terminates it, while a
+  // scalar's stops at the value. Splicing over that newline would pull the next
+  // line up onto this one, so leave it where it is.
+  let end = node.range[1];
+  while (end > start && source[end - 1] === '\n') end -= 1;
+
+  const ownLine = source.slice(lineStart(source, start), start).trim() === '';
+  // `roles: [Alice]` must not come back as a block list just because it grew.
+  const flow = (isSeq(node) || isMap(node)) && node.flow === true;
+  const text = renderValue(next, formatting, flow);
+
+  // An emptied collection belongs beside its key, not alone on the next line.
+  if (ownLine && (text === '{}' || text === '[]')
+    && planCollapseOntoKey(document, source, path, start, end, text, plan)) return true;
+
   if (text.includes('\n') && !ownLine) return false;
 
   plan.push({ start, end, text: ownLine ? indentContinuation(text, columnOf(source, start)) : text });
+  return true;
+}
+
+/** Rewrite `key:\n  <block>` as `key: {}` when the block became empty. */
+function planCollapseOntoKey(
+  document: Document,
+  source: string,
+  path: Array<string | number>,
+  start: number,
+  end: number,
+  text: string,
+  plan: Splice[],
+): boolean {
+  const key = path[path.length - 1];
+  if (typeof key !== 'string') return false;
+  const parent = document.getIn(path.slice(0, -1), true);
+  const pair = parent === undefined ? undefined : findPair(parent as Node, key);
+  if (!pair || !isNodeWithRange(pair.key)) return false;
+  const colon = source.indexOf(':', pair.key.range[1]);
+  // Anything but whitespace between the key and its value is a comment; keep it.
+  if (colon < 0 || colon >= start || source.slice(colon + 1, start).trim() !== '') return false;
+  plan.push({ start: colon + 1, end, text: ` ${text}` });
   return true;
 }
 
@@ -351,8 +389,10 @@ function findPair(node: Node, key: string): Pair | undefined {
     isPair(item) && isScalar(item.key) && String(item.key.value) === key);
 }
 
-function renderValue(value: unknown, formatting: DocumentFormatting): string {
-  return new Document(value)
+function renderValue(value: unknown, formatting: DocumentFormatting, flow = false): string {
+  const document = new Document(value);
+  if (flow && (isSeq(document.contents) || isMap(document.contents))) document.contents.flow = true;
+  return document
     .toString({ lineWidth: 0, indent: formatting.indent, indentSeq: formatting.indentSeq })
     .replace(/\n$/, '');
 }

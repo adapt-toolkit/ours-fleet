@@ -257,6 +257,65 @@ describe('safe web fleet configuration service', () => {
     )).toBe(onDisk.replace('top-secret', REDACTED_ENV_VALUE).replace('${token}', REDACTED_ENV_VALUE));
   });
 
+  describe('list and automation edits through the real save path', () => {
+    const AUTOMATED = [
+      '# operator header', 'roles:', '  Alice:', '    session: acp', '    mission: Ship',
+      '    oversee:', '      - { role: Bob, interval: 5m }', '  Bob:', '    mission: Review',
+      'watchdogs:', '  health:', '    coordinator: Alice', '    watch:', '      - Alice',
+      '    interval: 10m', 'loops:', '  nightly:', '    roles: [Alice]', '    interval: 10m',
+      '    enabled: false', '    prompt: Check in.', '',
+    ].join('\n');
+
+    const save = async (mutate: (model: any) => void) => {
+      writeFileSync(file, AUTOMATED, { mode: 0o600 });
+      const service = new FleetConfigService({ configPath: file });
+      const opened = service.read();
+      mutate(opened.model);
+      // preview and write both run the real loader over the candidate; a config
+      // this rejects never reaches disk, so reaching here means it is valid.
+      const preview = await service.preview(opened.revision, opened.model);
+      const saved = await service.write(opened.revision, opened.model);
+      return { preview, saved, text: readFileSync(file, 'utf8') };
+    };
+
+    it('grows a watchdog watch list without gluing the following line', async () => {
+      const { text, preview, saved } = await save(model => { model.watchdogs.health.watch.push('Bob'); });
+
+      expect(text).toContain('    watch:\n      - Alice\n      - Bob\n    interval: 10m\n');
+      expect(text).toContain('# operator header');
+      expect(saved.diff).toBe(preview.diff);
+    });
+
+    it('shrinks an oversee list to empty and stays loadable', async () => {
+      const { text } = await save(model => { model.roles.Alice.oversee = []; });
+
+      expect(text).toContain('    oversee: []\n  Bob:\n    mission: Review\n');
+      expect(text).toContain('    mission: Ship');
+    });
+
+    it('retargets a loop role list', async () => {
+      const { text } = await save(model => { model.loops.nightly.roles = ['Alice', 'Bob']; });
+
+      expect(text).toContain('    roles: [ Alice, Bob ]\n    interval: 10m\n');
+    });
+
+    it('removes the last watchdog as an empty mapping, not a null block', async () => {
+      const { text } = await save(model => { delete model.watchdogs.health; });
+
+      expect(text).toContain('\nwatchdogs: {}\n');
+      expect(text).not.toContain('coordinator: Alice');
+      expect(text).toContain('loops:\n  nightly:');
+    });
+
+    it('removes the last loop as an empty mapping, not a null block', async () => {
+      const { text } = await save(model => { delete model.loops.nightly; });
+
+      expect(text).toContain('\nloops: {}\n');
+      expect(text).not.toContain('prompt: Check in.');
+      expect(text).toContain('watchdogs:\n  health:');
+    });
+  });
+
   it('provides a valid first-run model without writing stable configuration', () => {
     const opened = new FleetConfigService({ configPath: file }).read();
     expect(opened).toMatchObject({ exists: false, firstRun: true, model: { roles: {} } });
