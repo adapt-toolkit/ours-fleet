@@ -33,7 +33,29 @@ export interface TopologySnapshot {
 
 export interface RuntimeRoleItem { role: RoleRecord; status: RoleStatus }
 
-export function deriveTopology(config: FleetConfig, roles: RuntimeRoleItem[]): TopologySnapshot {
+/**
+ * Whether a role is part of the fleet the graph draws.
+ *
+ * The role inventory is the union of `fleet.yaml` and every state directory
+ * under the permanent and temporary roots, so it also carries every temporary
+ * agent this host has ever started: each one leaves its directory behind, and a
+ * graph that enumerated them would show a list of identities rather than a
+ * fleet. A node is drawn when it is persistent fleet configuration — configured
+ * but stopped still counts, or an agent would vanish the moment it was added —
+ * or when it is genuinely active right now.
+ *
+ * The inventory keeps carrying the rest: they remain listed, removable and
+ * inspectable under "Show inactive" in the role table. This decides what is
+ * *drawn*, never what exists.
+ */
+export function isFleetMember(item: RuntimeRoleItem): boolean {
+  return item.role.configured
+    || item.status.session.reachability === 'online'
+    || item.status.supervisor.liveness === 'running';
+}
+
+export function deriveTopology(config: FleetConfig, inventory: RuntimeRoleItem[]): TopologySnapshot {
+  const roles = inventory.filter(isFleetMember);
   const nodes: TopologyNode[] = roles.map(({ role, status }) => ({
     id: `agent:${role.id}`, kind: 'agent', label: role.id, status: status.overall,
     lifetime: role.lifetime, href: `/roles/${encodeURIComponent(role.id)}`,
