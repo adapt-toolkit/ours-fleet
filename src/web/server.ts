@@ -22,7 +22,7 @@ import { AuditSink } from './audit.js';
 import { WebAuth } from './auth.js';
 import { FleetEventBus } from './events.js';
 import type { FleetConfigService } from './fleet-config-service.js';
-import type { TopologySnapshot } from './topology.js';
+import type { MergedTopology } from './topology-model.js';
 import type { RoleRemovalService } from '../application/role-removal-service.js';
 import { ROLE_NAME_RE } from '../config.js';
 
@@ -37,7 +37,7 @@ export interface WebServices {
   events?: FleetEventBus;
   watchdogs?: WatchdogQueryService;
   configuration?: FleetConfigService;
-  topology?: () => Promise<TopologySnapshot>;
+  topology?: () => Promise<MergedTopology>;
   removal?: RoleRemovalService;
   terminalUpgrade?: (
     socket: WebSocket, request: FastifyRequest, roleId: string,
