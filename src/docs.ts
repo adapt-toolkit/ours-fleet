@@ -26,6 +26,13 @@ Default configuration is \`~/fleet.yaml\` plus sorted \`~/fleet.d/*.yaml\` role
 drop-ins. An explicit \`-c FILE\` replaces \`~/fleet.yaml\`; fleet.d still adds
 roles. Validate with \`config\` and \`doctor\` before starting or restarting.
 
+The CLI never writes the base file: \`spawn\` writes \`~/fleet.d/Name.yaml\`. The
+web console may write the base file's \`defaults:\`, \`watchdogs:\` and \`loops:\`
+blocks, which fleet.d cannot hold. Those edits are applied to the parsed document
+in place, so comments, key order and formatting outside the change survive, and
+each save is revision-guarded, reviewed as a diff, validated by the real loader,
+and backed up next to the file first.
+
 ## Lifecycle and console commands
 
 \`\`\`sh

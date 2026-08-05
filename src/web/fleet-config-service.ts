@@ -3,7 +3,6 @@ import {
   chmodSync, existsSync, lstatSync, readFileSync, rmSync,
 } from 'node:fs';
 import { basename, dirname, join } from 'node:path';
-import { stringify } from 'yaml';
 
 import { replaceFileAtomically, withFileLock } from '../atomic-file.js';
 import { loadConfig } from '../config.js';
@@ -11,9 +10,11 @@ import { parseFleetDocument } from '../config-yaml.js';
 import { defaultConfigPath } from '../paths.js';
 import type { PrereqReport } from '../harness/types.js';
 import { FleetError } from '../application/errors.js';
+import { redactSourceSecrets, renderModelOntoSource } from './yaml-document-edit.js';
 
 export const REDACTED_ENV_VALUE = '__OURS_FLEET_SECRET_REDACTED__';
 const MAX_CONFIG_BYTES = 256 * 1024;
+const DIFF_CONTEXT_LINES = 3;
 
 export type EditableFleetModel = Record<string, unknown>;
 
@@ -82,13 +83,13 @@ export class FleetConfigService {
     this.assertRevision(baseRevision, currentSource);
     const current = parseFleetDocument(this.path, currentSource, 'strict').value;
     const restored = restoreRedactions(assertModel(model), current);
-    const source = serialize(restored);
-    const candidate = this.validateCandidate(source);
-    const [redactedCurrent, redactedNext] = [redactModel(current), redactModel(restored)];
+    const nextSource = render(currentSource, restored);
+    const candidate = this.validateCandidate(nextSource);
+    const redactedNext = redactModel(restored);
     const preflight = await this.preflight(candidate.path).finally(candidate.remove);
     return {
       valid: true, revision: digest(currentSource), normalizedModel: redactedNext.model,
-      diff: exactDiff(serialize(redactedCurrent.model), serialize(redactedNext.model)),
+      diff: sourceDiff(currentSource, nextSource),
       redactions: redactedNext.paths,
       impact: restartImpact(current, restored), preflight,
     };
@@ -100,13 +101,12 @@ export class FleetConfigService {
       this.assertRevision(baseRevision, currentSource);
       const current = parseFleetDocument(this.path, currentSource, 'strict').value;
       const restored = restoreRedactions(assertModel(model), current);
-      const nextSource = serialize(restored);
+      const nextSource = render(currentSource, restored);
       const candidate = this.validateCandidate(nextSource);
       const preflight = await this.preflight(candidate.path).finally(candidate.remove);
       // The lock coordinates trusted web/agent writers. An operator's editor does
       // not take it, so re-check immediately before replacement as well.
       this.assertRevision(baseRevision, this.readSource());
-      const redactedCurrent = redactModel(current);
       const redactedNext = redactModel(restored);
       let backup: string | undefined;
       if (existsSync(this.path)) {
@@ -118,7 +118,7 @@ export class FleetConfigService {
       return {
         saved: true, valid: true, revision: digest(currentSource), newRevision: digest(nextSource),
         normalizedModel: redactedNext.model,
-        diff: exactDiff(serialize(redactedCurrent.model), serialize(redactedNext.model)),
+        diff: sourceDiff(currentSource, nextSource),
         redactions: redactedNext.paths, impact: restartImpact(current, restored), preflight,
         backup,
       };
@@ -163,8 +163,13 @@ function assertModel(value: unknown): EditableFleetModel {
   return structuredClone(value as EditableFleetModel);
 }
 
-function serialize(model: EditableFleetModel): string {
-  return stringify(model, { lineWidth: 0, sortMapEntries: false });
+/**
+ * Apply the edited model onto the user's own document rather than re-serializing
+ * it, so comments, key order and formatting outside the edit survive the save.
+ */
+function render(currentSource: string, model: EditableFleetModel): string {
+  try { return renderModelOntoSource(currentSource, model); }
+  catch (error) { throw new FleetError('invalid_request', (error as Error).message); }
 }
 
 function digest(source: string): string {
@@ -224,11 +229,38 @@ function restoreRedactions(next: EditableFleetModel, current: EditableFleetModel
   return next;
 }
 
-function exactDiff(before: string, after: string): string {
-  if (before === after) return '';
-  return ['--- fleet.yaml (current)', '+++ fleet.yaml (proposed)',
-    ...before.trimEnd().split('\n').map(line => `-${line}`),
-    ...after.trimEnd().split('\n').map(line => `+${line}`), ''].join('\n');
+/**
+ * Unified-style diff of the real file text with env secrets masked. Common
+ * leading/trailing lines are trimmed, so a surgical edit reviews as a small
+ * hunk instead of the whole configuration twice.
+ */
+function sourceDiff(beforeSource: string, afterSource: string): string {
+  const before = splitLines(redactSourceSecrets(beforeSource, REDACTED_ENV_VALUE));
+  const after = splitLines(redactSourceSecrets(afterSource, REDACTED_ENV_VALUE));
+  let head = 0;
+  while (head < before.length && head < after.length && before[head] === after[head]) head += 1;
+  let tail = 0;
+  while (tail < before.length - head && tail < after.length - head
+    && before[before.length - 1 - tail] === after[after.length - 1 - tail]) tail += 1;
+  if (head === before.length && head === after.length) return '';
+
+  const start = Math.max(0, head - DIFF_CONTEXT_LINES);
+  const trailing = Math.min(DIFF_CONTEXT_LINES, tail);
+  const beforeSpan = before.length - tail + trailing - start;
+  const afterSpan = after.length - tail + trailing - start;
+  return [
+    '--- fleet.yaml (current)', '+++ fleet.yaml (proposed)',
+    `@@ -${start + 1},${beforeSpan} +${start + 1},${afterSpan} @@`,
+    ...before.slice(start, head).map(line => ` ${line}`),
+    ...before.slice(head, before.length - tail).map(line => `-${line}`),
+    ...after.slice(head, after.length - tail).map(line => `+${line}`),
+    ...before.slice(before.length - tail, before.length - tail + trailing).map(line => ` ${line}`),
+    '',
+  ].join('\n');
+}
+
+function splitLines(source: string): string[] {
+  return source.replace(/\n$/, '').split('\n');
 }
 
 function objectKeys(value: unknown): string[] {

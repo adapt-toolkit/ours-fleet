@@ -6,8 +6,12 @@
 #   ours-fleet down          stop everything
 #   ours-fleet config        validate + print the merged plan
 #
-# This file is yours — ours-fleet never edits it. Spawned roles land in
+# This file is yours. The CLI never edits it: spawned roles land in
 # ~/fleet.d/<Name>.yaml (one machine-written file per role; delete = unspawn).
+# The web console may write the `defaults:`, `watchdogs:` and `loops:` blocks
+# here, because those cannot live in fleet.d. It edits the document in place —
+# your comments, key order and formatting are preserved — and only ever behind a
+# reviewed diff, with a timestamped backup beside this file.
 
 vars:
   work_root: /home/me/work

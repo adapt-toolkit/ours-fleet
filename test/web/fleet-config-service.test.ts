@@ -89,6 +89,90 @@ describe('safe web fleet configuration service', () => {
     expect(existsSync(`${file}.web-edit.lock`)).toBe(false);
   });
 
+  it('preserves comments, blank lines and formatting when saving an edited role', async () => {
+    const original = [
+      '# fleet.yaml — this header belongs to the operator.',
+      '#',
+      '#   ours-fleet up            create/start every role',
+      '',
+      'vars:',
+      '  work_root: /home/me/work',
+      '',
+      'defaults:',
+      '  harness: claude-code        # adapter for roles without their own',
+      '  session: tmux               # tmux (default) | acp',
+      '',
+      'roles:',
+      '',
+      '  # Coordinator routes work to the others.',
+      '  Alice:',
+      '    mission: Ship safely',
+      '    cwd: ${work_root}/alpha',
+      '',
+      '  Bob:',
+      '    mission: Review',
+      '',
+    ].join('\n');
+    writeFileSync(file, original, { mode: 0o600 });
+    const service = new FleetConfigService({ configPath: file });
+    const opened = service.read();
+    (opened.model.roles as any).Alice.mission = 'Ship even more safely';
+
+    await service.write(opened.revision, opened.model);
+    const saved = readFileSync(file, 'utf8');
+
+    expect(saved).toContain('# fleet.yaml — this header belongs to the operator.');
+    expect(saved).toContain('#   ours-fleet up            create/start every role');
+    expect(saved).toContain('  # Coordinator routes work to the others.');
+    expect(saved).toContain('  harness: claude-code        # adapter for roles without their own');
+    expect(saved).toContain('  session: tmux               # tmux (default) | acp');
+    expect(saved).toContain('    cwd: ${work_root}/alpha');
+    expect(saved).toContain('mission: Ship even more safely');
+    // Exactly one line changed anywhere in the file.
+    const before = original.split('\n');
+    const after = saved.split('\n');
+    expect(after.length).toBe(before.length);
+    expect(after.filter((line, index) => line !== before[index]))
+      .toEqual(['    mission: Ship even more safely']);
+  });
+
+  it('reviews changes as a bounded hunk of the real file rather than the whole model', async () => {
+    const lines = ['# operator header', 'roles:'];
+    for (let index = 0; index < 40; index += 1) lines.push(`  Role${index}:`, `    mission: m${index}`);
+    writeFileSync(file, `${lines.join('\n')}\n`, { mode: 0o600 });
+    const service = new FleetConfigService({ configPath: file });
+    const opened = service.read();
+    (opened.model.roles as any).Role20.mission = 'changed';
+
+    const preview = await service.preview(opened.revision, opened.model);
+
+    expect(preview.diff).toContain('--- fleet.yaml (current)');
+    expect(preview.diff).toMatch(/^@@ -\d+,\d+ \+\d+,\d+ @@$/m);
+    expect(preview.diff).toContain('-    mission: m20');
+    expect(preview.diff).toContain('+    mission: changed');
+    expect(preview.diff).not.toContain('m39');
+    expect(preview.diff.split('\n').length).toBeLessThan(15);
+  });
+
+  it('adds a watchdog block to a commented base file without rewriting it', async () => {
+    const original = [
+      '# Keep this note.', 'roles:', '  Alice:', '    mission: Ship', '',
+    ].join('\n');
+    writeFileSync(file, original, { mode: 0o600 });
+    const service = new FleetConfigService({ configPath: file });
+    const opened = service.read();
+    (opened.model as any).watchdogs = { health: { coordinator: 'Alice' } };
+
+    const saved = await service.write(opened.revision, opened.model);
+    const text = readFileSync(file, 'utf8');
+
+    expect(saved.impact.watchdogScheduler).toBe(true);
+    expect(text).toContain('# Keep this note.');
+    expect(text).toContain('watchdogs:');
+    expect(text).toContain('    coordinator: Alice');
+    expect(text.indexOf('roles:')).toBeLessThan(text.indexOf('watchdogs:'));
+  });
+
   it('provides a valid first-run model without writing stable configuration', () => {
     const opened = new FleetConfigService({ configPath: file }).read();
     expect(opened).toMatchObject({ exists: false, firstRun: true, model: { roles: {} } });
