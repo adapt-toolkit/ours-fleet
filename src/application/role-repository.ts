@@ -7,6 +7,7 @@ import {
 } from '../config.js';
 import { agentsRoot, tmpRoot } from '../paths.js';
 import type { RoleRecord, ResolvedRoleView, Problem } from './types.js';
+import { readSpawnLineage } from '../web/topology.js';
 
 const MAX_SNAPSHOT_BYTES = 256 * 1024;
 
@@ -41,6 +42,7 @@ function view(role: ResolvedRole): ResolvedRoleView {
       ...(typeof options?.permission_mode === 'string' ? { permissionMode: options.permission_mode } : {}),
       ...(typeof options?.sandbox === 'string' ? { sandbox: options.sandbox } : {}),
     },
+    oversee: role.oversee,
   };
 }
 
@@ -130,17 +132,21 @@ export class RoleRepository {
           code: 'backend_mismatch', severity: 'warning',
           detail: `configured ${intended}, detected ${detected}`,
         });
+      const stateRef = inTemporary ? { lifetime: 'temporary' as const }
+        : inPermanent ? { lifetime: 'permanent' as const } : undefined;
+      const tempStateDir = inTemporary ? join(temporaryRoot, name) : undefined;
       return {
         id: name,
         lifetime: config ? 'permanent' : inTemporary ? 'temporary' : 'orphan',
         configured: Boolean(config),
         config: config ? view(config) : tempRole ? view(tempRole) : undefined,
-        stateRef: inTemporary ? { lifetime: 'temporary' } : inPermanent ? { lifetime: 'permanent' } : undefined,
+        stateRef,
         stateHealth,
         configuredBackend: intended,
         detectedBackend: detected,
         compatibility: { compatible: true },
         problems,
+        lineage: tempStateDir ? readSpawnLineage(tempStateDir) : undefined,
       };
     });
   }

@@ -176,6 +176,38 @@ const conversationPage = after => ({
     queueDepth: 0, pendingPermissionIds: [] },
 });
 const services = {
+  configuration: {
+    read() {
+      return {
+        path: 'fleet.yaml', exists: true, firstRun: false, revision: 'fixture-revision',
+        model: { defaults: { harness: 'codex', session: 'acp' }, roles: { Alpha: { mission: role.config.mission }, Terminal: {}, Dormant: {} } },
+        redactions: [],
+      };
+    },
+    async preview(revision, model) {
+      return {
+        valid: true, revision, normalizedModel: model, diff: '--- fleet.yaml (current)\n+++ fleet.yaml (proposed)\n', redactions: [],
+        impact: { required: false, roles: [], watchdogScheduler: false, scheduledLoops: false, summary: 'No running process needs a restart.' },
+        preflight: { ok: true, checks: [{ name: 'config', ok: true, detail: 'valid' }] },
+      };
+    },
+    async write(revision, model) {
+      const preview = await this.preview(revision, model);
+      return { ...preview, saved: true, newRevision: 'fixture-revision-2', backup: 'fleet.yaml.backup-fixture' };
+    },
+  },
+  async topology() {
+    return {
+      nodes: [
+        { id: 'agent:Alpha', kind: 'agent', label: 'Alpha', status: 'ready', lifetime: 'permanent', detail: role.config.mission },
+        { id: 'agent:Terminal', kind: 'agent', label: 'Terminal', status: 'ready', lifetime: 'permanent' },
+        { id: 'agent:Dormant', kind: 'agent', label: 'Dormant', status: 'offline', lifetime: 'permanent' },
+        { id: 'watchdog:nightwatch', kind: 'watchdog', label: 'nightwatch', status: 'active' },
+      ],
+      edges: [{ id: 'watch', kind: 'watches', from: 'watchdog:nightwatch', to: 'agent:Alpha', label: 'watches' }],
+      unknownLineage: [],
+    };
+  },
   watchdogs: watchdogsService,
   query: {
     async list() { return [

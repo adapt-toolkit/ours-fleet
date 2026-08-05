@@ -17,6 +17,9 @@ import { home, stateRoot } from '../paths.js';
 import { AuditSink } from './audit.js';
 import { FleetEventBus } from './events.js';
 import { buildWebServer, type WebServer } from './server.js';
+import { FleetConfigService } from './fleet-config-service.js';
+import { deriveTopology } from './topology.js';
+import { doctor } from '../doctor.js';
 import { TerminalBridgeManager } from './terminal/bridge.js';
 import { acquireWebServerLock } from './lock.js';
 import { TrustedDeviceStore } from './device-store.js';
@@ -154,10 +157,15 @@ export async function startWebConsole(options: StartWebOptions): Promise<Running
   });
   const logs = new StructuredLogService(backend, realExec);
   const watchdogs = new WatchdogQueryService(watchdogConfigProvider);
+  const configuration = new FleetConfigService({
+    configPath: options.configPath,
+    preflight: path => doctor({ configPath: path, yamlMode: 'strict' }),
+  });
   let server: WebServer;
   try {
     server = await buildWebServer({
-    query, repository, logs, commands, creation, audit, events, watchdogs,
+    query, repository, logs, commands, creation, audit, events, watchdogs, configuration,
+    topology: async () => deriveTopology(loadConfig(options.configPath), await query.list()),
     terminalUpgrade: terminalAvailable
       ? async (socket, _request, roleId, _ticket, hello) => terminals.connect(socket, roleId, hello)
       : undefined,

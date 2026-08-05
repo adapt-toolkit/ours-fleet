@@ -21,6 +21,8 @@ import type { WatchdogQueryService } from '../watchdog/query.js';
 import { AuditSink } from './audit.js';
 import { WebAuth } from './auth.js';
 import { FleetEventBus } from './events.js';
+import type { FleetConfigService } from './fleet-config-service.js';
+import type { TopologySnapshot } from './topology.js';
 
 export interface WebServices {
   query: FleetQueryService;
@@ -32,6 +34,8 @@ export interface WebServices {
   audit?: AuditSink;
   events?: FleetEventBus;
   watchdogs?: WatchdogQueryService;
+  configuration?: FleetConfigService;
+  topology?: () => Promise<TopologySnapshot>;
   terminalUpgrade?: (
     socket: WebSocket, request: FastifyRequest, roleId: string,
     ticket: string, hello: Record<string, unknown>,
@@ -58,7 +62,7 @@ export async function buildWebServer(
   options: { auth?: WebAuth } = {},
 ): Promise<WebServer> {
   const app = Fastify({
-    trustProxy: false, bodyLimit: 64 * 1024, logger: false,
+    trustProxy: false, bodyLimit: 512 * 1024, logger: false,
     requestIdHeader: false, genReqId: () => cryptoRandomId(),
   });
   const auth = options.auth ?? new WebAuth(boundary.origin, boundary.host);
@@ -180,6 +184,41 @@ export async function buildWebServer(
   app.get('/api/v1/roles', async request => {
     auth.authenticate(request);
     return { roles: await services.query.list() };
+  });
+
+  app.get('/api/v1/configuration', async request => {
+    auth.authenticate(request);
+    if (!services.configuration)
+      throw new FleetError('capability_unavailable', 'fleet configuration editing is unavailable');
+    return services.configuration.read();
+  });
+
+  app.post('/api/v1/configuration/preview', async request => {
+    auth.authenticate(request, true);
+    if (!services.configuration)
+      throw new FleetError('capability_unavailable', 'fleet configuration editing is unavailable');
+    const body = request.body as { revision?: unknown; model?: unknown };
+    return services.configuration.preview(String(body?.revision ?? ''), body?.model);
+  });
+
+  app.post('/api/v1/configuration/save', async request => {
+    const session = auth.authenticate(request, true);
+    if (!services.configuration)
+      throw new FleetError('capability_unavailable', 'fleet configuration editing is unavailable');
+    const body = request.body as { revision?: unknown; model?: unknown };
+    const result = await services.configuration.write(String(body?.revision ?? ''), body?.model);
+    events.publish('configuration.changed', { revision: result.newRevision });
+    await audit.record({
+      requestId: request.id, browser: session.id, action: 'configuration.save', result: 'succeeded',
+    });
+    return result;
+  });
+
+  app.get('/api/v1/topology', async request => {
+    auth.authenticate(request);
+    if (!services.topology)
+      throw new FleetError('capability_unavailable', 'fleet topology is unavailable');
+    return services.topology();
   });
 
   app.get<{ Params: { id: string } }>('/api/v1/roles/:id', async request => {

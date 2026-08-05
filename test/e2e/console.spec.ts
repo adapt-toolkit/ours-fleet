@@ -3,11 +3,13 @@ import { test, expect } from '@playwright/test';
 test('bootstrap, inventory, live navigation, send, create, and security boundaries', async ({ page, request, browserName }) => {
   const bootstrap = (await (await request.post('/__test/bootstrap')).json()).url as string;
   await page.goto(bootstrap);
-  await expect(page.getByRole('heading', { name: 'All roles' })).toBeVisible();
+  await expect(page.getByRole('heading', { name: 'Fleet topology' })).toBeVisible();
   await expect(page.getByText('Ours', { exact: true }).first()).toBeVisible();
   await expect(page).toHaveURL('http://127.0.0.1:49371/');
   await expect(page.getByText('Alpha', { exact: true }).first()).toBeVisible();
   await expect(page.getByText('Terminal', { exact: true }).first()).toBeVisible();
+  await expect(page.getByLabel('Interactive fleet topology')).toBeVisible();
+  await expect(page.getByRole('button', { name: 'agent Alpha, ready' })).toBeVisible();
   await expect(page.getByText('Dormant', { exact: true })).toHaveCount(0);
   await expect(page.getByRole('button', { name: 'Needs attention 0' })).toBeVisible();
   await expect(page.getByRole('button', { name: 'Show inactive (1)' })).toBeVisible();
@@ -19,7 +21,7 @@ test('bootstrap, inventory, live navigation, send, create, and security boundari
   );
   await expect(page.locator('.status-chip.ready').first()).toHaveText(/Ready/);
   await page.getByRole('button', { name: 'Show inactive (1)' }).click();
-  await expect(page.getByText('Dormant', { exact: true })).toBeVisible();
+  await expect(page.getByText('Dormant', { exact: true }).first()).toBeVisible();
   await expect(page.getByRole('button', { name: /Inactive Dormant/ })).toBeVisible();
   await page.getByRole('button', { name: /Inactive Dormant/ }).click();
   await expect(page.getByText('Inactive — start is the only applicable lifecycle action.')).toBeVisible();
@@ -85,7 +87,7 @@ test('bootstrap, inventory, live navigation, send, create, and security boundari
   await page.getByRole('button', { name: '← Back to watchdogs' }).click();
   await expect(page.getByRole('heading', { name: 'Watchdogs' })).toBeVisible();
 
-  await page.getByRole('button', { name: 'All roles' }).click();
+  await page.getByRole('button', { name: 'Topology' }).click();
   const manifest = await request.get('/manifest.webmanifest');
   expect(manifest.status()).toBe(200);
   expect(manifest.headers()['content-type']).toMatch(/manifest|json/);
@@ -99,7 +101,7 @@ test('bootstrap, inventory, live navigation, send, create, and security boundari
   }
   await request.post('/__test/restart-auth');
   await page.reload();
-  await expect(page.getByRole('heading', { name: 'All roles' })).toBeVisible();
+  await expect(page.getByRole('heading', { name: 'Fleet topology' })).toBeVisible();
   await expect(page).toHaveURL('http://127.0.0.1:49371/');
   const mission = page.locator('.mission-summary').first();
   await expect(mission).toHaveAttribute('title', /intentionally long mission/);
@@ -166,9 +168,9 @@ test('bootstrap, inventory, live navigation, send, create, and security boundari
   await page.getByRole('button', { name: 'Create atomically' }).click();
   await expect(page.getByRole('heading', { name: 'Researcher' })).toBeVisible();
 
-  await page.getByRole('button', { name: 'All roles' }).click();
+  await page.getByRole('button', { name: 'Topology' }).click();
   await page.getByLabel('Filter roles').fill('');
-  await page.getByRole('button', { name: /Terminal/ }).click();
+  await page.getByRole('button', { name: 'agent Terminal, ready' }).click();
   await page.getByRole('button', { name: 'terminal' }).click();
   await expect(page.locator('.terminal-host .xterm')).toBeVisible();
   await expect(page.locator('.terminal-host')).toContainText('ANSI BOLD');
@@ -206,7 +208,7 @@ test('bootstrap, inventory, live navigation, send, create, and security boundari
     await expect(page.getByText('Alpha', { exact: true })).toHaveCount(0);
     await page.context().setOffline(false);
     await page.goto('http://127.0.0.1:49371/');
-    await expect(page.getByRole('heading', { name: 'All roles' })).toBeVisible();
+    await expect(page.getByRole('heading', { name: 'Fleet topology' })).toBeVisible();
     const cached = await page.evaluate(async () => (await Promise.all(
       (await caches.keys()).map(async key => (await caches.open(key)).keys()),
     )).flat().map(request => new URL(request.url).pathname));
@@ -227,9 +229,9 @@ test('password and intentional unprotected access are clear in Chromium', async 
   await expect(page.getByText('invalid control-panel password')).toBeVisible();
   await page.getByLabel('Control-panel password').fill('correct horse battery staple');
   await page.getByRole('button', { name: 'Sign in' }).click();
-  await expect(page.getByRole('heading', { name: 'All roles' })).toBeVisible();
+  await expect(page.getByRole('heading', { name: 'Fleet topology' })).toBeVisible();
 
   await page.goto('http://127.0.0.1:49372/');
-  await expect(page.getByRole('heading', { name: 'All roles' })).toBeVisible();
+  await expect(page.getByRole('heading', { name: 'Fleet topology' })).toBeVisible();
   await expect(page.getByText(/Unprotected mode: anyone who can reach/)).toBeVisible();
 });

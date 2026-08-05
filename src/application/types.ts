@@ -15,6 +15,7 @@ export interface ResolvedRoleView {
   cwd?: string;
   permissions: CommonPermissions;
   nativeRuntime?: { approval?: string; permissionMode?: string; sandbox?: string };
+  oversee?: Array<{ role: string; interval: string }>;
 }
 
 export interface RoleRecord {
@@ -28,6 +29,7 @@ export interface RoleRecord {
   detectedBackend: DetectedBackend;
   compatibility: { compatible: boolean; detail?: string };
   problems: Problem[];
+  lineage?: { parentRole: string; source: 'creation-provenance' };
 }
 
 export interface Problem {

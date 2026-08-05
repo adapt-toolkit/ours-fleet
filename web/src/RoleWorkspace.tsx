@@ -5,6 +5,7 @@ import { isInactive } from './fleet-presentation';
 import { partitionActivity } from './activity-presentation';
 import { useLivePoll } from './use-live-poll';
 import { runtimeMetadata } from './runtime-metadata';
+import { promptReceiptNotice } from './prompt-receipt';
 
 const TerminalView = lazy(() => import('./TerminalView').then(module => ({ default: module.TerminalView })));
 
@@ -59,7 +60,7 @@ export function RoleWorkspace({ roleId, onBack }: { roleId: string; onBack(): vo
   const send = async () => {
     try {
       const receipt: any = await api.post(`/api/v1/roles/${roleId}/input`, { text });
-      setNotice(receipt.detail); setText('');
+      setNotice(promptReceiptNotice(receipt)); setText('');
       requestActivityRefresh();
     } catch (reason) { setNotice((reason as Error).message); }
   };
