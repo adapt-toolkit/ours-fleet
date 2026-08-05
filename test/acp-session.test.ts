@@ -66,6 +66,37 @@ describe('AcpSession', () => {
     await session.close();
   });
 
+  it('promotes exact Codex phases and keeps commentary out of the final output', async () => {
+    const session = await start();
+    const result = await session.submitPrompt('phased response', {
+      origin: { kind: 'owner', requestId: 'request-1' },
+    });
+    expect(result.output).toBe('Implementation is ready.');
+    const text = session.eventsSince(0).filter(event => event.kind === 'agent_text');
+    expect(text).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        text: 'Checking the implementation.\n', messagePhase: 'commentary',
+        messageId: 'commentary-1', origin: { kind: 'owner', requestId: 'request-1' },
+      }),
+      expect.objectContaining({
+        text: 'Implementation is ready.', messagePhase: 'final_answer', messageId: 'final-1',
+      }),
+    ]));
+    await session.close();
+  });
+
+  it('fails closed when an adapter supplies an unknown assistant phase', async () => {
+    const session = await start();
+    const result = await session.submitPrompt('ambiguous phase');
+    expect(result.output).toBe('');
+    expect(session.eventsSince(0)).toContainEqual(expect.objectContaining({
+      kind: 'agent_text', text: 'Unclassified adapter output', messageId: 'ambiguous-1',
+    }));
+    expect(session.eventsSince(0).find(event => event.messageId === 'ambiguous-1')?.messagePhase)
+      .toBeUndefined();
+    await session.close();
+  });
+
   it('persists typed scheduled provenance while redacting prompt and assistant bodies', async () => {
     const session = await start();
     const secret = 'CANARY_SCHEDULED_PROMPT_SECRET';

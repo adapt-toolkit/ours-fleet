@@ -328,7 +328,7 @@ roles:
     owner_channel:                      # optional trusted owner ingress; requires session: acp
       identity: "Name Owner Channel"     # existing, dedicated ours identity bound only by fleet
       owners: [owner-contact-cid]        # authenticated ours contact IDs, never display names
-      agent: managed-agent-cid           # exact role identity CID allowed to relay messages outward
+      agent: managed-agent-cid           # exact role CID allowed to relay messages/files outward
       interrupt: false                  # false queues; true cancels current work first
       progress_interval_ms: 30000        # fleet-generated progress notices; 0 disables
       attachments:                      # secure inbound documents, images, and voice
@@ -651,15 +651,16 @@ These commands require a running ACP role with `owner_channel` enabled. Missing,
 stopped, tmux, disabled, draining, and unavailable-MCP targets fail without
 starting a second client, binding an identity, or opening a network listener.
 
-The managed agent has one outbound rule: use its ordinary ours `send_message`
-tool to message the channel identity. Fleet checks that the authenticated sender
-CID exactly equals `agent`, then forwards the body as a new message to the owner
-CID that most recently sent inbound channel mail. This applies equally to progress,
-blockers, suggestions, and proactive notes: there is no task/request/update type.
-The agent never chooses an owner recipient. A single configured owner is the safe
-fallback; multiple owners without route history fail closed instead of guessing or
-broadcasting. Different devices sharing one ours identity share one CID, while
-separate authorized identities naturally hand off the route when either sends.
+The managed agent can use its ordinary ours `send_message` or `send_file` tool to
+message the channel identity. Fleet checks that the authenticated sender CID
+exactly equals `agent`, then forwards the body/file to a resolved authenticated
+owner route. This applies equally to blockers, suggestions, proactive notes, and
+ordinary files: there is no model-selected owner recipient. An explicit reply wire
+pins a file to that wire's owner; otherwise the latest authenticated owner is used.
+A single configured owner is the safe fallback; multiple owners without route
+history fail closed instead of guessing or broadcasting. Different devices sharing
+one ours identity share one CID, while separate authorized identities naturally
+hand off the unscoped route when either sends.
 
 Messages from CIDs which are neither an owner nor the configured agent are never
 injected or relayed. Fleet consumes the attempt, does not answer its sender, and
@@ -671,17 +672,31 @@ An owner request follows one ordered lifecycle on its authenticated source wire:
 
 1. Fleet sends an immediate receipt describing started, queued, or interrupting state.
 2. Periodic fleet-generated summaries may report allowlisted ACP activity shapes.
-3. The agent may send any non-final message to the channel identity through its
+3. On maintained Codex ACP adapters, assistant chunks carrying the exact
+   `_meta.codex.phase = "commentary"` marker are automatically batched and forwarded
+   on this request's fixed owner CID/source wire. Unknown or absent phases are never
+   inferred as commentary; thoughts, tools, permissions, prompts, and raw events are
+   excluded by event kind. Older adapters therefore retain final-only behavior.
+4. The agent may also send any non-final or out-of-turn message through its
    ordinary ours MCP tool. CID authentication is the message gate; no task ID,
    request ID, phase, reply reference, or routing command is used.
-4. The agent may send a caption and one or more files to the channel identity.
+ 4. The agent may send a caption and one or more files to the channel identity.
    A reply reference selects the authenticated owner of that exact source wire;
    an uncorrelated group uses the latest authenticated owner (or the sole-owner
    fallback). Fleet resolves that route once, admits every file before emitting
    any part, then sends the caption and files to the same owner on the same route.
-5. Fleet independently emits exactly one final ACP response (or a sanitized
+ 5. Fleet independently emits exactly one final ACP response (or a sanitized
    terminal outcome). Successful owner-request turns send regular files from the
    request outbox afterward, correlated to the same source wire.
+
+Commentary uses a 750 ms latency flush plus paragraph and 1,600-character/6,400-byte
+boundaries, with at most 32 updates and 512 in-memory fragment dedupe keys per turn.
+The terminal boundary flushes commentary before the final. Replay-marked fragments,
+wrong turns, wrong typed origins, missing message IDs, and unsafe/ambiguous content
+fail closed. Commentary plaintext buffers and fragment keys are memory-only; bounded
+wire-and-batch digests plus sending/delivered/uncertain status are persisted before
+transport. Thus reconnect replay and crash recovery never blindly resend the same
+batch, while an uncertain in-flight update may be omitted rather than duplicated.
 
 Fleet chooses the stored latest authenticated owner for every managed-agent
 message; the model supplies only text and the channel contact. Relay audit logs
@@ -812,6 +827,19 @@ admission. The host must run an ours-mcp version whose
 `list_incoming_files`, selective `get_files`, and `save_file` schemas support
 these guarantees; `ours-mcp voice-status --json` reports whether transcription
 is currently configured.
+
+Managed-agent file egress is a separate trust direction. It retains the same
+metadata provenance checks, count/per-file/request byte caps, regular-file and
+no-symlink reads, actual byte-count/SHA-256 verification, filename sanitization,
+private staging, fixed owner routing, and bounded body-free recovery metadata.
+It deliberately does not consult `attachments.enabled` or `allowed_mime`; MIME is
+still detected during byte validation, but a declared-versus-detected mismatch is
+not an egress deny gate. Markdown, HTML, octet-stream, unknown extensions, and normal
+binaries are therefore routable only from the exact configured `agent` CID.
+Owner-to-agent admission above remains byte-for-byte strict. Each outbound file
+gets a durable pre-send marker: a failed/ambiguous send becomes `uncertain` and is
+not blindly retried, while files not yet attempted remain recoverable after restart.
+Logs contain counts and byte totals, never filenames or raw bytes.
 
 Owner channels currently require `session: acp`. Fleet needs structured,
 turn-correlated assistant output for automatic replies; scraping a tmux pane

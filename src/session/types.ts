@@ -206,6 +206,15 @@ export interface SessionEvent {
   toolCallId?: string;
   permissionId?: string;
   text?: string;
+  /**
+   * Adapter-authenticated presentation phase for assistant text. Only the
+   * exact Codex ACP marker is promoted; absence/unknown values stay unset.
+   */
+  messagePhase?: 'commentary' | 'final_answer';
+  /** Stable adapter message/item id when supplied. */
+  messageId?: string;
+  /** True when the adapter is replaying history rather than emitting live work. */
+  replayed?: boolean;
   title?: string;
   status?: string;
   stopReason?: string;

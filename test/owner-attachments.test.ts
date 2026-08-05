@@ -11,6 +11,7 @@ import type { OwnerAttachmentConfig, OwnerChannelConfig } from '../src/config.js
 import {
   AttachmentRecoveryState, admitAttachments, cleanupAttachmentRoot, prepareAttachmentDirectory,
   parseRetrievedAttachments, sanitizeFilename, validateAttachmentSelection,
+  validateAttachmentRelaySelection,
   type IncomingAttachment, type RetrievedAttachment,
 } from '../src/owner-channel/attachments.js';
 import { OwnerChannel } from '../src/owner-channel/channel.js';
@@ -20,6 +21,7 @@ import type { QueuedPrompt, SessionHandle, TurnResult } from '../src/session/typ
 
 const OWNER = 'A'.repeat(64);
 const OTHER = 'B'.repeat(64);
+const AGENT = 'C'.repeat(64);
 const FILE_WIRE = '1'.repeat(64);
 const CAPTION_WIRE = '2'.repeat(64);
 const dirs: string[] = [];
@@ -36,10 +38,12 @@ class AttachmentClient implements OursToolClient {
   retrieved = new Map<string, Record<string, unknown>>();
   failText?: string;
   failFile = false;
+  failTools = new Set<string>();
   async start() {}
   async close() {}
   async callTool(name: string, args?: Record<string, unknown>): Promise<unknown> {
     this.calls.push({ name, args });
+    if (this.failTools.has(name)) throw new Error(`${name} failed`);
     if (name === 'get_messages') return { messages: this.batches.shift() ?? [] };
     if (name === 'list_incoming_files') return { count: this.files.length, files: this.files };
     if (name === 'get_files') {
@@ -566,6 +570,139 @@ describe('owner-channel attachment ingress', () => {
   });
 });
 
+describe('managed-agent attachment egress', () => {
+  async function establishRoute(status: Awaited<ReturnType<typeof setup>>, wire = '9'.repeat(64)) {
+    status.client.batches.push([{
+      msg_id: 90, wire_id: wire, from: { id: OWNER, name: 'Owner' }, text: '/status',
+    }], []);
+    await status.channel.drain();
+    return wire;
+  }
+
+  it('relays markdown, HTML, and binary bytes from only the configured agent CID', async () => {
+    const status = await setup([OWNER], false, attachmentConfig, AGENT);
+    const ownerWire = await establishRoute(status);
+    await establishRoute(status, '8'.repeat(64)); // newer mail must not steal an explicit source wire
+    const captionWire = '7'.repeat(64);
+    status.client.batches.push([{
+      msg_id: 91, wire_id: captionWire, from: { id: AGENT, name: 'Role' },
+      text: 'Requested artifacts', reply_to: { wire_id: ownerWire },
+    }], []);
+    const cases = [
+      { wire: '3'.repeat(64), filename: 'notes.md', mime: 'text/markdown', bytes: Buffer.from('# Notes') },
+      { wire: '4'.repeat(64), filename: 'page.html', mime: 'text/html', bytes: Buffer.from('<h1>Hi</h1>') },
+      { wire: '5'.repeat(64), filename: '', mime: 'application/octet-stream', bytes: Buffer.from([0, 1, 2, 3]) },
+    ];
+    status.client.files = cases.map((item, index) => listed({
+      file_id: 20 + index, wire_id: item.wire, from: { id: AGENT, name: 'Role' },
+      filename: item.filename, mime: item.mime, size: item.bytes.length,
+      reply_to: { wire_id: captionWire },
+    }));
+    for (const [index, item] of cases.entries()) {
+      const source = join(status.dir, `agent-${index}`);
+      writeFileSync(source, item.bytes);
+      status.client.retrieved.set(item.wire, retrieved(source, item.bytes, {
+        file_id: 20 + index, wire_id: item.wire, from: { id: AGENT, name: 'Role' },
+        filename: item.filename, mime: item.mime, reply_to: { wire_id: captionWire },
+      }));
+    }
+
+    await status.channel.drain();
+    expect(status.queuePrompt).not.toHaveBeenCalled();
+    const sends = status.client.calls.filter(call => call.name === 'send_file');
+    expect(sends).toHaveLength(3);
+    expect(sends.map(call => call.args?.filename)).toEqual(['notes.md', 'page.html', 'attachment.bin']);
+    expect(sends.every(call => call.args?.contact === OWNER
+      && call.args?.reply_to_wire_id === ownerWire)).toBe(true);
+    expect(status.client.calls).toContainEqual({ name: 'send_message', args: {
+      contact: OWNER, text: 'Requested artifacts', reply_to_wire_id: ownerWire,
+    } });
+    expect(status.logs.join('\n')).not.toMatch(/# Notes|<h1>|notes\.md|page\.html/);
+    await status.channel.close();
+  });
+
+  it('does not weaken owner ingress MIME policy when agent egress is configured', async () => {
+    const status = await setup([OWNER], false, attachmentConfig, AGENT);
+    const bytes = Buffer.from('# owner markdown');
+    const source = join(status.dir, 'owner.md');
+    writeFileSync(source, bytes);
+    status.client.files = [listed({ filename: 'owner.md', mime: 'text/markdown', size: bytes.length })];
+    status.client.retrieved.set(FILE_WIRE, retrieved(source, bytes, {
+      filename: 'owner.md', mime: 'text/markdown',
+    }));
+    await status.channel.drain();
+    expect(status.client.calls.some(call => call.name === 'get_files')).toBe(false);
+    expect(status.client.calls.some(call => call.name === 'send_file')).toBe(false);
+    expect(status.client.calls.find(call => call.name === 'send_message')?.args?.text)
+      .toContain('MIME type text/markdown is not allowed');
+    await status.channel.close();
+  });
+
+  it('rejects unauthorized and oversized file senders before retrieving bytes', async () => {
+    for (const overrides of [
+      { from: { id: OTHER, name: 'Impostor' } },
+      { from: { id: AGENT, name: 'Role' }, size: 2_000 },
+    ]) {
+      const status = await setup([OWNER], false, attachmentConfig, AGENT);
+      await establishRoute(status);
+      status.client.files = [listed(overrides)];
+      await status.channel.drain();
+      expect(status.client.calls.some(call => call.name === 'get_files')).toBe(false);
+      expect(status.client.calls.some(call => call.name === 'send_file')).toBe(false);
+      await status.channel.close();
+    }
+  });
+
+  it('records uncertain delivery before replay and never blindly sends the same file twice', async () => {
+    const status = await setup([OWNER], false, attachmentConfig, AGENT);
+    await establishRoute(status);
+    const bytes = Buffer.from('artifact');
+    const source = join(status.dir, 'artifact');
+    writeFileSync(source, bytes);
+    status.client.files = [listed({
+      from: { id: AGENT, name: 'Role' }, size: bytes.length,
+      mime: 'application/octet-stream', filename: 'artifact.bin',
+    })];
+    status.client.retrieved.set(FILE_WIRE, retrieved(source, bytes, {
+      from: { id: AGENT, name: 'Role' }, mime: 'application/octet-stream', filename: 'artifact.bin',
+    }));
+    status.client.failTools.add('send_file');
+    await status.channel.drain();
+    expect(status.client.calls.filter(call => call.name === 'send_file')).toHaveLength(1);
+    const recoveryPath = join(status.dir, '.owner-channel-attachment-recovery.json');
+    expect(readFileSync(recoveryPath, 'utf8')).not.toMatch(/artifact\.bin|artifact/);
+
+    await status.channel.close();
+    status.client.failTools.delete('send_file');
+    status.client.files = [listed({
+      from: { id: AGENT, name: 'Role' }, size: bytes.length, status: 'processed',
+      mime: 'application/octet-stream', filename: 'artifact.bin',
+    })];
+    const restarted = new OwnerChannel({
+      role: 'Role', harness: 'claude-code',
+      config: {
+        identity: 'Role-owner', owners: [OWNER], agent: AGENT,
+        interrupt: false, progress_interval_ms: 0, attachments: attachmentConfig,
+      },
+      session: {
+        backend: 'acp', pid: 1, isAlive: () => true,
+        snapshot: () => ({ backend: 'acp', alive: true, readiness: 'running' }),
+        queuePrompt: status.queuePrompt, interrupt: vi.fn(), eventsSince: () => [],
+      } as unknown as SessionHandle,
+      stateDir: status.dir, client: status.client, log: line => status.logs.push(line),
+      watch: () => ({
+        pid: 1, exitCode: null, stdout: new PassThrough(), stderr: new PassThrough(),
+        once: () => undefined, kill: () => true,
+      }) as never,
+    });
+    await restarted.start();
+    await restarted.drain();
+    expect(status.client.calls.filter(call => call.name === 'send_file')).toHaveLength(1);
+    expect(JSON.parse(readFileSync(recoveryPath, 'utf8')).pending).toEqual([]);
+    await restarted.close();
+  });
+});
+
 describe('attachment admission and recovery primitives', () => {
   it('migrates v1 conversation state into bounded source-wire routes', () => {
     const dir = mkdtempSync(join(tmpdir(), 'ours-owner-route-migration-'));
@@ -652,6 +789,33 @@ describe('attachment admission and recovery primitives', () => {
       mime: 'application/pdf',
     }] };
     expect(() => parseRetrievedAttachments(raw, [expected])).toThrow(/provenance or integrity/);
+  });
+
+  it('keeps MIME strict for owner ingress but report-only for bounded agent egress', async () => {
+    const incoming = {
+      ...(listed({ mime: 'text/html' }) as unknown as IncomingAttachment),
+      fileId: 7, wireId: FILE_WIRE, senderId: AGENT, senderName: 'Agent',
+      filename: 'page.html', mime: 'text/html', size: 13, status: 'unread', date: '',
+      kind: 'file' as const, replyTo: null,
+    };
+    expect(validateAttachmentSelection([incoming], attachmentConfig)).toMatch(/not allowed/);
+    expect(validateAttachmentRelaySelection([incoming], attachmentConfig)).toBeUndefined();
+
+    const root = mkdtempSync(join(tmpdir(), 'ours-egress-mime-'));
+    dirs.push(root);
+    const bytes = Buffer.from('<h1>Hello</h1>');
+    const source = join(root, 'page.html');
+    writeFileSync(source, bytes);
+    const dir = await prepareAttachmentDirectory(join(root, 'inbox'), 'request');
+    const retrievedFile: RetrievedAttachment = {
+      ...incoming, size: bytes.length, path: source,
+      sha256: createHash('sha256').update(bytes).digest('hex'),
+    };
+    await expect(admitAttachments([retrievedFile], dir, attachmentConfig))
+      .rejects.toThrow(/does not match declared MIME/);
+    const staged = await admitAttachments(
+      [retrievedFile], dir, attachmentConfig, { mimePolicy: 'report-only' });
+    expect(staged[0]).toMatchObject({ declaredMime: 'text/html', detectedMime: 'text/plain' });
   });
 
   it('persists only bounded routing metadata at mode 0600 and expires recovery directories', async () => {

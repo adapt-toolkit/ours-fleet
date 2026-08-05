@@ -202,17 +202,29 @@ createInterface({ input: process.stdin }).on('line', line => {
       break;
     case 'session/prompt': {
       const text = message.params.prompt.find(block => block.type === 'text')?.text ?? '';
-      send({
-        jsonrpc: '2.0',
-        method: 'session/update',
-        params: {
-          sessionId,
-          update: {
-            sessionUpdate: 'agent_message_chunk',
-            content: { type: 'text', text: `echo:${text}` },
-          },
-        },
-      });
+      if (/\bambiguous phase\b/i.test(text)) {
+        update({
+          sessionUpdate: 'agent_message_chunk', messageId: 'ambiguous-1',
+          content: { type: 'text', text: 'Unclassified adapter output' },
+          _meta: { codex: { phase: 'future_phase' } },
+        });
+      } else if (/\bphased\b/i.test(text)) {
+        update({
+          sessionUpdate: 'agent_message_chunk', messageId: 'commentary-1',
+          content: { type: 'text', text: 'Checking the implementation.\n' },
+          _meta: { codex: { phase: 'commentary' } },
+        });
+        update({
+          sessionUpdate: 'agent_message_chunk', messageId: 'final-1',
+          content: { type: 'text', text: 'Implementation is ready.' },
+          _meta: { codex: { phase: 'final_answer' } },
+        });
+      } else {
+        update({
+          sessionUpdate: 'agent_message_chunk',
+          content: { type: 'text', text: `echo:${text}` },
+        });
+      }
       activePromptId = message.id;
       if (/\bstubborn\b/i.test(text)) stubbornPrompts.add(message.id);
       const slow = /\bblock(?:\s+(\d+))?\b/i.exec(text);

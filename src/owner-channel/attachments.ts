@@ -170,6 +170,26 @@ export function validateAttachmentSelection(
   return undefined;
 }
 
+/**
+ * Managed-agent -> owner egress limits. This intentionally does not consult
+ * `enabled` or `allowed_mime`: those are owner -> agent admission policy.
+ */
+export function validateAttachmentRelaySelection(
+  files: IncomingAttachment[], config: OwnerAttachmentConfig,
+): string | undefined {
+  if (files.length > config.max_files_per_request)
+    return `the relay exceeds the ${config.max_files_per_request}-file limit`;
+  let total = 0;
+  for (const file of files) {
+    if (file.size > config.max_file_bytes)
+      return `a relayed file exceeds the ${config.max_file_bytes}-byte limit`;
+    total += file.size;
+    if (!Number.isSafeInteger(total) || total > config.max_request_bytes)
+      return `the relay exceeds the ${config.max_request_bytes}-byte total limit`;
+  }
+  return undefined;
+}
+
 export async function prepareAttachmentDirectory(root: string, requestId: string): Promise<string> {
   mkdirSync(root, { recursive: true, mode: 0o700 });
   const rootStat = lstatSync(root);
@@ -187,6 +207,7 @@ export async function prepareAttachmentDirectory(root: string, requestId: string
 
 export async function admitAttachments(
   files: RetrievedAttachment[], dir: string, config: OwnerAttachmentConfig,
+  options: { mimePolicy?: 'strict' | 'report-only' } = {},
 ): Promise<AdmittedAttachment[]> {
   const admitted: AdmittedAttachment[] = [];
   let total = 0;
@@ -211,7 +232,8 @@ export async function admitAttachments(
     if (total > config.max_request_bytes) throw new Error('retrieved attachments exceed the request size limit');
     const declaredMime = policyMime(file);
     const detectedMime = detectMime(bytes, declaredMime);
-    if (!mimeCompatible(declaredMime, detectedMime))
+    if ((options.mimePolicy ?? 'strict') === 'strict'
+        && !mimeCompatible(declaredMime, detectedMime))
       throw new Error(`retrieved attachment content does not match declared MIME ${declaredMime}`);
     const filename = sanitizeFilename(file.filename);
     const finalPath = join(dir, `${index + 1}-${file.wireId.slice(0, 12)}-${filename}`);
@@ -289,6 +311,9 @@ export interface PendingAttachmentRequest {
   originWireId: string;
   fileWireIds: string[];
   createdAt: number;
+  /** Present only for exact-managed-agent -> owner relay recovery. */
+  relayContact?: string;
+  relayReplyTo?: string;
 }
 
 interface RecoveryFile { version: 1; pending: PendingAttachmentRequest[] }
@@ -345,7 +370,10 @@ function validPending(value: unknown): value is PendingAttachmentRequest {
     && Array.isArray(item.fileWireIds) && item.fileWireIds.length >= 1 && item.fileWireIds.length <= 32
     && item.fileWireIds.every(wire => WIRE.test(wire))
     && new Set(item.fileWireIds).size === item.fileWireIds.length
-    && Number.isSafeInteger(item.createdAt) && item.createdAt >= 0;
+    && Number.isSafeInteger(item.createdAt) && item.createdAt >= 0
+    && (item.relayContact === undefined || CID.test(item.relayContact))
+    && (item.relayReplyTo === undefined || WIRE.test(item.relayReplyTo))
+    && (item.relayReplyTo === undefined || item.relayContact !== undefined);
 }
 
 export function safeField(value: unknown, max: number): string {
