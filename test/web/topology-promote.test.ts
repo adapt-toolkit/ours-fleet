@@ -578,5 +578,35 @@ describe('adding sketches to the fleet', () => {
       })).rejects.toThrow(/changed since it was opened/);
       expect(readFileSync(file, 'utf8')).toBe(before);
     });
+
+    // The loader refuses a role that is not a mapping long before the write, so
+    // a document the console cannot reason about is never partially rewritten.
+    // (`mapping()` guards the same case a second time, for a caller that reads
+    // the topology from somewhere more permissive than `loadConfig`.)
+    it('writes nothing at all when fleet.yaml cannot be read as a fleet', async () => {
+      await seed('roles:\n  Coordinator:\n    - not\n    - a mapping\n  Worker:\n    mission: Work\n', undefined);
+      const before = readFileSync(file, 'utf8');
+
+      await expect(oversee('Coordinator', 'Worker')).rejects.toThrow(/unknown key/);
+      expect(readFileSync(file, 'utf8')).toBe(before);
+    });
+
+    /**
+     * The console never sees an env value — it reads a redaction marker — so a
+     * write built from what it read must restore the real one rather than
+     * writing the marker over the operator's secret.
+     */
+    it('never writes a redaction marker over a secret it was not shown', async () => {
+      await seed('roles:\n  Coordinator:\n    mission: Coordinate\n    env:\n      TOKEN: super-secret\n  Worker:\n    mission: Work\n', undefined);
+      expect(configuration.read().redactions).toEqual(['roles.Coordinator.env.TOKEN']);
+
+      await oversee('Coordinator', 'Worker');
+
+      const text = readFileSync(file, 'utf8');
+      expect(text).toContain('TOKEN: super-secret');
+      expect(text).not.toContain('REDACTED');
+      expect(loadConfig(file).roles.find(role => role.name === 'Coordinator')?.env)
+        .toEqual({ TOKEN: 'super-secret' });
+    });
   });
 });

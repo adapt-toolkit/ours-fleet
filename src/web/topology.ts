@@ -45,7 +45,7 @@ export interface RuntimeRoleItem { role: RoleRecord; status: RoleStatus }
  * or when it is genuinely active right now.
  *
  * The inventory keeps carrying the rest: they remain listed, removable and
- * inspectable under "Show inactive" in the role table. This decides what is
+ * inspectable under "Show past agents" in the role table. This decides what is
  * *drawn*, never what exists.
  */
 export function isFleetMember(item: RuntimeRoleItem): boolean {

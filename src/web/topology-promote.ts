@@ -128,7 +128,7 @@ export class TopologyPromoteService {
     assertConfiguredAgent(merged, roles, from, 'oversee another agent');
     assertConfiguredAgent(merged, roles, to, 'be overseen');
 
-    const entry = mapping(roles[from]);
+    const entry = mapping(from, roles[from]);
     const existing = Array.isArray(entry.oversee) ? entry.oversee : [];
     if (existing.some(item => (item as { role?: unknown } | null)?.role === to))
       throw new FleetError('conflict', `${from} already oversees ${to}`);
@@ -295,10 +295,18 @@ function assertConfiguredAgent(
     throw new FleetError('invalid_request', `${name} is not in fleet.yaml, so it cannot ${action}`);
 }
 
-/** A role entry as an editable mapping — `Alice:` with no body parses as null. */
-function mapping(value: unknown): Record<string, unknown> {
-  return value && typeof value === 'object' && !Array.isArray(value)
-    ? value as Record<string, unknown> : {};
+/**
+ * A role entry as an editable mapping — `Alice:` with no body parses as null,
+ * which is a legal empty role. Anything else is refused rather than replaced:
+ * quietly overwriting a value we do not understand would drop whatever the
+ * operator actually wrote there.
+ */
+function mapping(name: string, value: unknown): Record<string, unknown> {
+  if (value === null || value === undefined) return {};
+  if (typeof value !== 'object' || Array.isArray(value))
+    throw new FleetError('invalid_request',
+      `${name} is not a mapping in fleet.yaml; fix it in the configuration editor first`);
+  return value as Record<string, unknown>;
 }
 
 function section(model: EditableFleetModel, key: string): Record<string, unknown> {
