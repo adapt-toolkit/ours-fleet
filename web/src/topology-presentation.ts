@@ -131,9 +131,9 @@ export function layoutInteractive(topology: Topology): { nodes: PositionedNode[]
  * real card against this, so a style change cannot silently invalidate it.
  */
 export const NODE_WIDTH = 150;
-export const NODE_HEIGHT = 136;
+export const NODE_HEIGHT = 144;
 /** Vertical distance between two cards in a column, and the top margin. */
-export const ROW_PITCH = 160;
+export const ROW_PITCH = 168;
 export const FIRST_ROW_Y = 80;
 
 /**

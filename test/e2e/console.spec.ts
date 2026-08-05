@@ -458,7 +458,7 @@ test('agent nodes carry their own watchdog, interval, configure and oversee acti
     return { tallest: Math.max(...cards.map(card => Math.round(card.box.height))), overlaps };
   });
   expect(geometry.overlaps).toEqual([]);
-  expect(geometry.tallest).toBeLessThanOrEqual(136);   // NODE_HEIGHT
+  expect(geometry.tallest).toBeLessThanOrEqual(144);   // NODE_HEIGHT
 
   const overseeButton = page.locator('[data-node-id="agent:Coordinator"]')
     .getByRole('button', { name: 'Have Coordinator oversee another agent' });
