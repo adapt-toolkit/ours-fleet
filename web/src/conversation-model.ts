@@ -85,8 +85,6 @@ export interface TranscriptTurn {
     source?: string;
     at: string;
   };
-  /** Set for a locally submitted prompt the ledger has not confirmed yet. */
-  optimistic?: boolean;
   commandId?: string;
   queuedBehind?: number;
   state: TurnState;
@@ -127,6 +125,9 @@ const turnFor = (model: ConversationModel, event: ConversationEvent): Transcript
     };
     model.turns.push(turn);
     model.turns.sort((a, b) => a.firstSeq - b.firstSeq);
+  } else if (event.seq < turn.firstSeq) {
+    turn.firstSeq = event.seq;
+    model.turns.sort((a, b) => a.firstSeq - b.firstSeq);
   }
   return turn;
 };
@@ -145,14 +146,9 @@ function applyEvent(model: ConversationModel, event: ConversationEvent): void {
   const payload = event.payload ?? {};
   switch (event.kind) {
     case 'prompt.admitted': {
-      // Reconcile an optimistic local entry with the durable admission.
-      if (event.commandId) {
-        const optimistic = model.turns.find(turn =>
-          turn.optimistic && turn.commandId === event.commandId);
-        if (optimistic) model.turns.splice(model.turns.indexOf(optimistic), 1);
-      }
       const turn = turnFor(model, event);
-      const text = (payload.text as { text?: string } | undefined)?.text;
+      const text = (payload.displayText as { text?: string } | undefined)?.text
+        ?? (payload.text as { text?: string } | undefined)?.text;
       const external = payload.external as { bytes?: number } | undefined;
       turn.user = {
         ...(text !== undefined ? { text } : {}),
@@ -329,23 +325,6 @@ export function cloneModel(model: ConversationModel): ConversationModel {
     })),
     seenEventIds: { ...model.seenEventIds },
   };
-}
-
-/** Register a locally submitted prompt before the ledger confirms it. */
-export function addOptimisticPrompt(
-  model: ConversationModel, commandId: string, text: string,
-): ConversationModel {
-  if (model.turns.some(turn => turn.commandId === commandId)) return model;
-  model.turns.push({
-    promptId: `optimistic:${commandId}`,
-    firstSeq: Number.MAX_SAFE_INTEGER - model.turns.length,
-    optimistic: true,
-    commandId,
-    user: { text, source: 'browser', at: new Date().toISOString() },
-    state: 'queued',
-    messages: [], thoughtText: '', thoughtChunks: 0, tools: [], plans: [], permissions: [],
-  });
-  return model;
 }
 
 export const describeTurnState = (turn: TranscriptTurn): string => {

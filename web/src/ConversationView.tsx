@@ -1,8 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { api, idempotencyKey } from './api';
-import {
-  addOptimisticPrompt, applyEvents, cloneModel, describeTurnState, emptyModel,
-} from './conversation-model';
+import { applyEvents, cloneModel, describeTurnState, emptyModel } from './conversation-model';
 import type {
   ConversationEvent, ConversationModel, PermissionCard, TranscriptTurn,
 } from './conversation-model';
@@ -113,7 +111,6 @@ export function ConversationView({ roleId }: { roleId: string }) {
     const body = text;
     if (!body.trim()) return;
     const commandId = idempotencyKey();
-    setModel(current => cloneModel(addOptimisticPrompt(current, commandId, body)));
     setText('');
     try {
       await api.post(`/api/v1/roles/${encodeURIComponent(roleId)}/input`,
@@ -200,9 +197,11 @@ function TurnBlock({ turn, onDecide }: {
   const [showThoughts, setShowThoughts] = useState(false);
   const state = describeTurnState(turn);
   return <article className={`turn ${turn.state}`}>
-    {turn.user && <div className={`bubble user${turn.optimistic ? ' optimistic' : ''}`}>
+    {turn.user && <div className="bubble user">
       <small>
-        {turn.user.source === 'browser' || turn.user.source === 'local_console' ? 'You'
+        {turn.user.source === 'owner_admin_console' ? 'Direct owner admin console'
+          : turn.user.source === 'local_console' ? 'Local console'
+          : turn.user.source === 'owner_channel' ? 'Owner channel · end-to-end'
           : turn.user.source === 'startup' ? 'Startup briefing'
           : turn.user.source === 'agent_replay' ? 'Replayed prompt'
           : `External · ${turn.user.source ?? 'unknown'}`}
@@ -210,7 +209,7 @@ function TurnBlock({ turn, onDecide }: {
       </small>
       {turn.user.text !== undefined
         ? <pre className="prompt-text">{turn.user.text}</pre>
-        : <p className="muted">External end-to-end message · body not stored
+        : <p className="muted">Message content unavailable
           ({turn.user.externalBytes ?? '?'} bytes)</p>}
     </div>}
     {(turn.messages.length > 0 || turn.thoughtChunks > 0 || turn.tools.length > 0

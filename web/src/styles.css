@@ -101,9 +101,9 @@ button.role-row:hover { background: #141a1b; }
 .banner.info { border-color: #28463b; background: #10231c; color: #9be4bf; }
 .workspace > .banner { margin-inline: 0; }
 .back { border: 0; background: none; color: var(--muted); padding: 0 0 18px; cursor: pointer; }
-.workspace-summary { display: flex; align-items: center; gap: 9px; color: var(--muted); font-size: 12px; }
+.workspace-summary { display: flex; flex-wrap: wrap; align-items: center; gap: 7px; color: var(--muted); font-size: 12px; }
 .workspace-summary > span { border: 1px solid var(--line); border-radius: 12px; padding: 4px 8px; }
-.workspace-summary small { margin-left: auto; }
+.workspace-summary > small { margin-left: auto; }
 .hero-state { display: flex; gap: 7px; align-items: center; color: white; text-transform: capitalize; }
 .hero-state i { width: 7px; height: 7px; border-radius: 50%; background: #788; }
 .tabs { display: flex; gap: 22px; margin: 26px 0 22px; border-bottom: 1px solid var(--line); }
@@ -188,7 +188,6 @@ legend { margin-bottom: 13px; color: var(--mint); text-transform: uppercase; fon
 .bubble { border: 1px solid var(--line); border-radius: 10px; padding: 10px 14px; background: #0d1213; }
 .bubble small { color: var(--muted); display: block; margin-bottom: 6px; }
 .bubble.user { border-left: 2px solid var(--mint); margin-left: 8%; background: #10181a; }
-.bubble.user.optimistic { opacity: .65; border-style: dashed; }
 .bubble.assistant { margin-right: 8%; }
 .prompt-text, .assistant-text, .thought-text { margin: 0; white-space: pre-wrap; word-break: break-word; font-family: inherit; font-size: 14px; line-height: 1.5; }
 .assistant-text + .assistant-text { margin-top: 10px; padding-top: 10px; border-top: 1px dashed var(--line); }

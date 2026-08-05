@@ -16,7 +16,8 @@ import { SessionEvents } from './events.js';
 import { SessionControlError, classifyChildExit, turnResult } from './types.js';
 import type {
   ConversationHandlePage, ExitRecord, PermissionDecision, QueuedPrompt, SessionEvent,
-  SessionHandle, SessionSnapshot, SubmitPromptOptions, TurnCancellationSource, TurnOutcome,
+  RuntimeSelectorMetadata, SessionHandle, SessionSnapshot, SubmitPromptOptions,
+  TurnCancellationSource, TurnOutcome,
   TurnResult,
 } from './types.js';
 
@@ -52,7 +53,7 @@ function conversationSource(origin: PromptOrigin | undefined): {
   source: ConversationSource; persistBody: boolean;
 } {
   switch (origin?.kind) {
-    case 'browser': return { source: 'browser', persistBody: true };
+    case 'owner-admin-console': return { source: 'owner_admin_console', persistBody: true };
     case 'startup': return { source: 'startup', persistBody: true };
     case 'owner': return { source: 'owner_channel', persistBody: false };
     case 'fleet-monitor': return { source: 'fleet_monitor', persistBody: false };
@@ -61,6 +62,29 @@ function conversationSource(origin: PromptOrigin | undefined): {
     default:
       return { source: 'local_console', persistBody: true };
   }
+}
+
+/** Server-generated typed provenance followed by the exact human-authored body. */
+export function promptContentBlocks(text: string, origin?: PromptOrigin): acp.ContentBlock[] {
+  if (origin?.kind !== 'owner-admin-console') return [{ type: 'text', text }];
+  return [{
+    type: 'resource_link',
+    uri: 'ours-fleet://prompt-provenance?source=owner_admin_console',
+    name: 'Direct owner admin console',
+    description: 'Server-authenticated paired console provenance; accompanying text is direct owner input.',
+    mimeType: 'application/vnd.ours-fleet.prompt-provenance+json',
+  }, { type: 'text', text }];
+}
+
+export function runtimeSelector(
+  options: acp.SessionConfigOption[] | null | undefined, category: string,
+): RuntimeSelectorMetadata | undefined {
+  const option = options?.find(candidate => candidate.category === category);
+  if (!option || typeof option.currentValue !== 'string') return undefined;
+  const choices = Array.isArray(option.options) ? option.options.flatMap(choice =>
+    'options' in choice ? choice.options : [choice]) : [];
+  const selected = choices.find(choice => choice.value === option.currentValue);
+  return { value: option.currentValue, ...(selected?.name ? { label: selected.name } : {}) };
 }
 
 export interface AcpSessionOptions {
@@ -121,6 +145,8 @@ export class AcpSession implements SessionHandle {
   private exit: ExitRecord | null = null;
   private steeringSupported = false;
   private capabilities?: acp.AgentCapabilities;
+  private runtimeModel?: RuntimeSelectorMetadata;
+  private reasoningEffort?: RuntimeSelectorMetadata;
   private controllerCount = 0;
   /** Armed when the last controller detaches; unattended policy applies on fire. */
   private controllerGrace?: ReturnType<typeof setTimeout>;
@@ -248,6 +274,8 @@ export class AcpSession implements SessionHandle {
       sessionId: this.sessionId,
       lastError: this.lastError,
       pendingPermissionId: this.pendingPermissions.keys().next().value as string | undefined,
+      runtimeModel: this.runtimeModel,
+      reasoningEffort: this.reasoningEffort,
     };
   }
 
@@ -300,16 +328,20 @@ export class AcpSession implements SessionHandle {
       sessionGeneration: this.sessionGeneration,
       acpSessionId: this.sessionId,
       promptId, turnId: promptId, source,
-      ...(options.origin?.kind === 'browser' ? { commandId: options.origin.commandId } : {}),
+      ...(options.origin?.kind === 'owner-admin-console' ? { commandId: options.origin.commandId } : {}),
       ...(options.actor ? { actor: options.actor } : {}),
       payload: {
         queuedBehind,
+        ...(options.origin?.kind === 'owner' && options.origin.displayText !== undefined
+          ? { displayText: { type: 'text' as const, text: options.origin.displayText,
+              bytes: Buffer.byteLength(options.origin.displayText) } }
+          : {}),
         ...(persistBody
           ? { text: { type: 'text' as const, text, bytes } }
           : { external: { digest: ConversationEventStore.bodyDigest(text), bytes } }),
       },
     };
-    if (source === 'browser') {
+    if (source === 'owner_admin_console') {
       try { this.conversation.append(draft); }
       catch (error) {
         throw new SessionControlError('backend',
@@ -326,7 +358,7 @@ export class AcpSession implements SessionHandle {
     const existing = this.conversation.receiptFor(command.commandId, bodyDigest);
     if (existing) return existing;
     const queued = await this.queuePrompt(command.text, {
-      origin: { kind: 'browser', commandId: command.commandId },
+      origin: { kind: 'owner-admin-console', commandId: command.commandId },
       actor: { browserSession: command.actorBrowserSession },
     });
     const receipt: PromptReceipt = {
@@ -556,22 +588,24 @@ export class AcpSession implements SessionHandle {
       ? readFileSync(this.sessionFile, 'utf8').trim()
       : '';
     if (persisted && this.capabilities?.sessionCapabilities?.resume != null) {
-      await this.connection.agent.request(acp.methods.agent.session.resume, {
+      const resumed = await this.connection.agent.request(acp.methods.agent.session.resume, {
         sessionId: persisted,
         cwd: this.options.cwd,
         mcpServers: [],
       });
+      this.captureRuntimeMetadata(resumed.configOptions);
       this.sessionId = persisted;
     } else if (persisted && this.capabilities?.loadSession) {
       // `session/load` replays prior history as ordinary updates before the
       // response; those records carry `agent_replay` provenance, never `agent`.
       this.replaying = true;
       try {
-        await this.connection.agent.request(acp.methods.agent.session.load, {
+        const loaded = await this.connection.agent.request(acp.methods.agent.session.load, {
           sessionId: persisted,
           cwd: this.options.cwd,
           mcpServers: [],
         });
+        this.captureRuntimeMetadata(loaded.configOptions);
       } finally { this.replaying = false; }
       this.sessionId = persisted;
     } else {
@@ -580,6 +614,7 @@ export class AcpSession implements SessionHandle {
         mcpServers: [],
       });
       this.sessionId = created.sessionId;
+      this.captureRuntimeMetadata(created.configOptions);
     }
     writeFileSync(this.sessionFile, this.sessionId + '\n', { mode: 0o600 });
     // Deliver the configured permission mode whichever way the session came up
@@ -606,6 +641,11 @@ export class AcpSession implements SessionHandle {
     });
   }
 
+  private captureRuntimeMetadata(options: acp.SessionConfigOption[] | null | undefined): void {
+    this.runtimeModel = runtimeSelector(options, 'model');
+    this.reasoningEffort = runtimeSelector(options, 'thought_level');
+  }
+
   private async runPrompt(
     text: string, turnId: string = randomUUID(), origin?: SubmitPromptOptions['origin'],
   ): Promise<TurnResult> {
@@ -622,7 +662,7 @@ export class AcpSession implements SessionHandle {
     try {
       const response = await this.connection.agent.request(acp.methods.agent.session.prompt, {
         sessionId: this.sessionId,
-        prompt: [{ type: 'text', text }],
+        prompt: promptContentBlocks(text, origin),
       });
       this.readiness = 'idle';
       const cancellationSource = this.activeTurn?.id === turnId
@@ -845,6 +885,8 @@ export class AcpSession implements SessionHandle {
   private recordUpdate(update: acp.SessionUpdate): void {
     const scheduled = this.activeTurn?.origin?.kind === 'scheduled-loop';
     this.recordConversationUpdate(update, scheduled);
+    if (update.sessionUpdate === 'config_option_update')
+      this.captureRuntimeMetadata(update.configOptions);
     switch (update.sessionUpdate) {
       case 'agent_message_chunk':
         if (this.activeTurn && update.content.type === 'text')

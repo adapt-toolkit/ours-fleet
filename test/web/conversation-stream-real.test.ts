@@ -135,7 +135,7 @@ describe('conversation stream over the real stack', () => {
     }
     const admitted = history.events.find(e => e.kind === 'prompt.admitted')!;
     expect(admitted.commandId).toBe('cmd-real-1');
-    expect(admitted.source).toBe('browser');
+    expect(admitted.source).toBe('owner_admin_console');
     expect(history.events.map(event => event.kind)).toEqual(expect.arrayContaining([
       'plan.replace', 'tool.upsert', 'usage.updated',
     ]));

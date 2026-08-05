@@ -1,8 +1,6 @@
 import { describe, expect, it } from 'vitest';
 
-import {
-  addOptimisticPrompt, applyEvents, describeTurnState, emptyModel,
-} from '../../web/src/conversation-model.js';
+import { applyEvents, describeTurnState, emptyModel } from '../../web/src/conversation-model.js';
 import type { ConversationEvent } from '../../web/src/conversation-model.js';
 
 let seq = 0;
@@ -18,7 +16,7 @@ const event = (
 const turnEvents = (promptId: string) => [
   event('prompt.admitted', {
     text: { type: 'text', text: 'question', bytes: 8 }, queuedBehind: 0,
-  }, { promptId, commandId: `cmd-${promptId}`, source: 'browser' }),
+  }, { promptId, commandId: `cmd-${promptId}`, source: 'owner_admin_console' }),
   event('prompt.started', {}, { promptId }),
   event('message.chunk', { role: 'assistant', content: { type: 'text', text: 'ans' } },
     { promptId, messageId: 'm1' }),
@@ -45,6 +43,19 @@ describe('conversation browser model', () => {
     expect(model.turns[0].messages).toEqual([{ key: 'm1', text: 'answer' }]);
   });
 
+  it('keeps prompts in durable sequence when replay and live batches overlap', () => {
+    const first = event('prompt.admitted', {
+      text: { type: 'text', text: 'first', bytes: 5 }, queuedBehind: 0,
+    }, { promptId: 'p-first', commandId: 'c-first', source: 'owner_admin_console' });
+    const second = event('prompt.admitted', {
+      text: { type: 'text', text: 'second', bytes: 6 }, queuedBehind: 0,
+    }, { promptId: 'p-second', commandId: 'c-second', source: 'owner_admin_console' });
+    const model = applyEvents(emptyModel(), [second]);
+    applyEvents(model, [first, second]);
+    expect(model.turns.map(turn => turn.user?.text)).toEqual(['first', 'second']);
+    expect(model.turns).toHaveLength(2);
+  });
+
   it('starts a new assistant message when the messageId changes', () => {
     const model = applyEvents(emptyModel(), [
       event('message.chunk', { role: 'assistant', content: { type: 'text', text: 'one' } },
@@ -55,15 +66,6 @@ describe('conversation browser model', () => {
     expect(model.turns[0].messages).toEqual([
       { key: 'm1', text: 'one' }, { key: 'm2', text: 'two' },
     ]);
-  });
-
-  it('reconciles an optimistic prompt with its durable admission', () => {
-    const model = addOptimisticPrompt(emptyModel(), 'cmd-p1', 'question');
-    expect(model.turns[0].optimistic).toBe(true);
-    applyEvents(model, turnEvents('p1'));
-    expect(model.turns).toHaveLength(1);
-    expect(model.turns[0].optimistic).toBeUndefined();
-    expect(model.turns[0].promptId).toBe('p1');
   });
 
   it('tracks tool upserts by toolCallId with patch semantics', () => {
@@ -118,12 +120,15 @@ describe('conversation browser model', () => {
     expect(model.usage?.cost).toEqual({ amount: 0.02, currency: 'USD' });
   });
 
-  it('marks external prompts without leaking a body', () => {
+  it('renders the full available owner body while keeping dispatch text out of the model', () => {
     const model = applyEvents(emptyModel(), [
-      event('prompt.admitted', { external: { digest: 'd', bytes: 42 }, queuedBehind: 0 },
+      event('prompt.admitted', {
+        displayText: { type: 'text', text: '  complete owner body\nsecond line  ', bytes: 35 },
+        external: { digest: 'd', bytes: 42 }, queuedBehind: 0,
+      },
         { promptId: 'p', source: 'owner_channel' }),
     ]);
-    expect(model.turns[0].user?.text).toBeUndefined();
+    expect(model.turns[0].user?.text).toBe('  complete owner body\nsecond line  ');
     expect(model.turns[0].user?.externalBytes).toBe(42);
   });
 

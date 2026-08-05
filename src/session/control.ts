@@ -36,6 +36,8 @@ export interface ControlRequest {
   commandId?: string;
   /** Browser-session digest recorded as the acting principal. */
   actor?: string;
+  /** Server-stamped provenance. User-controlled text cannot set this field. */
+  source?: 'owner_admin_console';
   /** Runner generation shown with a permission card. */
   sessionGeneration?: string;
 }
@@ -430,14 +432,16 @@ export class RoleControlServer {
         }
         case 'submit_prompt_v2': {
           this.requireConversation(request);
-          if (!request.commandId?.trim() || !request.text?.trim() || !request.actor?.trim())
-            throw new SessionControlError('rejected', 'commandId, text and actor are required');
+          if (!request.commandId?.trim() || !request.text?.trim() || !request.actor?.trim()
+              || request.source !== 'owner_admin_console')
+            throw new SessionControlError('rejected',
+              'commandId, text, actor and authenticated source are required');
           if (!this.session.submitPromptBrowser)
             throw new SessionControlError('rejected', 'browser prompt admission is unavailable for this role');
           try {
             const receipt = await this.session.submitPromptBrowser({
               commandId: request.commandId, text: request.text,
-              source: 'browser', actorBrowserSession: request.actor,
+              source: 'owner_admin_console', actorBrowserSession: request.actor,
             });
             this.write(socket, { version: 1, id: request.id, ok: true, result: receipt });
           } catch (error) {

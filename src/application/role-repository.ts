@@ -30,11 +30,17 @@ function safeDirs(root: string): string[] {
 }
 
 function view(role: ResolvedRole): ResolvedRoleView {
+  const options = role.harness_options as Record<string, unknown> | undefined;
   return {
     name: role.name, harness: role.harness, session: role.session, identity: role.identity,
     mission: role.mission, coordinator: role.coordinator, model: role.model,
     cwd: role.cwd ? redactHome(role.cwd) : undefined,
     permissions: role.permissions,
+    nativeRuntime: {
+      ...(typeof options?.approval === 'string' ? { approval: options.approval } : {}),
+      ...(typeof options?.permission_mode === 'string' ? { permissionMode: options.permission_mode } : {}),
+      ...(typeof options?.sandbox === 'string' ? { sandbox: options.sandbox } : {}),
+    },
   };
 }
 

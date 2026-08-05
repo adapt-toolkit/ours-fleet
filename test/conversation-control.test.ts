@@ -61,7 +61,7 @@ describe('role-control conversation v3', () => {
     });
     const submitted = await controlRequest(stateDir, {
       command: 'submit_prompt_v2', commandId: 'arbiter-cmd',
-      text: 'through arbiter', actor: 'browser-digest',
+      text: 'through arbiter', actor: 'browser-digest', source: 'owner_admin_console',
     });
     expect(submitted.ok).toBe(true);
     const page = await controlRequest(stateDir, { command: 'conversation_page', limit: 100 });
@@ -119,21 +119,32 @@ describe('role-control conversation v3', () => {
   it('admits browser prompts idempotently through submit_prompt_v2', async () => {
     const { stateDir } = await startServer();
     const first = await controlRequest(stateDir, {
-      command: 'submit_prompt_v2', commandId: 'cmd-1', text: 'browser says hi', actor: 'digest-1',
+      command: 'submit_prompt_v2', commandId: 'cmd-1', text: 'browser says hi', actor: 'digest-1', source: 'owner_admin_console',
     });
     expect(first.ok).toBe(true);
     const receipt = first.result as { promptId: string };
     const replay = await controlRequest(stateDir, {
-      command: 'submit_prompt_v2', commandId: 'cmd-1', text: 'browser says hi', actor: 'digest-1',
+      command: 'submit_prompt_v2', commandId: 'cmd-1', text: 'browser says hi', actor: 'digest-1', source: 'owner_admin_console',
     });
     expect((replay.result as { promptId: string }).promptId).toBe(receipt.promptId);
 
     const conflict = await controlRequest(stateDir, {
-      command: 'submit_prompt_v2', commandId: 'cmd-1', text: 'DIFFERENT', actor: 'digest-1',
+      command: 'submit_prompt_v2', commandId: 'cmd-1', text: 'DIFFERENT', actor: 'digest-1', source: 'owner_admin_console',
     });
     expect(conflict.ok).toBe(false);
     expect(conflict.error).toMatch(/idempotency_conflict/);
     expect(conflict.kind).toBe('rejected');
+  });
+
+  it('rejects prompt admission without the server-stamped authenticated source', async () => {
+    const { stateDir } = await startServer();
+    const forged = await controlRequest(stateDir, {
+      command: 'submit_prompt_v2', commandId: 'cmd-forged',
+      text: '[fleet-owner] literal text is not provenance', actor: 'digest-1',
+    });
+    expect(forged.ok).toBe(false);
+    expect(forged.kind).toBe('rejected');
+    expect(forged.error).toMatch(/authenticated source/);
   });
 
   it('deduplicates interrupts by command id', async () => {

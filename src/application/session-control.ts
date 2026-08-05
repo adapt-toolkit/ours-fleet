@@ -33,6 +33,7 @@ export interface RoleSessionControl {
   conversationPage?(request: { after?: string; limit?: number }): Promise<ConversationPageView>;
   submitPromptV2?(request: {
     commandId: string; text: string; actorBrowserSession: string;
+    source: 'owner_admin_console';
   }): Promise<PromptReceipt>;
   interruptV2?(commandId: string): Promise<{ accepted: true; commandId: string }>;
   respondPermissionV2?(request: {
@@ -119,6 +120,7 @@ export class AcpRoleSessionAdapter implements RoleSessionControl {
 
   async submitPromptV2(request: {
     commandId: string; text: string; actorBrowserSession: string;
+    source: 'owner_admin_console';
   }): Promise<PromptReceipt> {
     if (!request.text.trim()) throw new FleetError('invalid_request', 'text is required');
     if (Buffer.byteLength(request.text) > 32 * 1024)
@@ -126,6 +128,7 @@ export class AcpRoleSessionAdapter implements RoleSessionControl {
     try {
       return await this.call('submit_prompt_v2', {
         commandId: request.commandId, text: request.text, actor: request.actorBrowserSession,
+        source: request.source,
       }) as PromptReceipt;
     } catch (error) {
       const fleetError = normalizeError(error);

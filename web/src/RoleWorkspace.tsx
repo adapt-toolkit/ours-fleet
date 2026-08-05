@@ -4,6 +4,7 @@ import { ConversationView } from './ConversationView';
 import { isInactive } from './fleet-presentation';
 import { partitionActivity } from './activity-presentation';
 import { useLivePoll } from './use-live-poll';
+import { runtimeMetadata } from './runtime-metadata';
 
 const TerminalView = lazy(() => import('./TerminalView').then(module => ({ default: module.TerminalView })));
 
@@ -65,7 +66,10 @@ export function RoleWorkspace({ roleId, onBack }: { roleId: string; onBack(): vo
   return <div className="workspace">
     <button className="back" onClick={onBack}>← Fleet</button>
     <div className="workspace-summary"><span className={`hero-state ${inactive ? 'offline' : status.overall}`}><i />{inactive ? 'inactive' : status.overall}</span>
-      <span>{role.lifetime}</span><span>{role.config?.harness}</span><span>{status.session.backend}</span>
+      <span>{role.lifetime}</span>
+      {runtimeMetadata(detail).map(item => <span key={item.label} title={item.label}>
+        <small>{item.label}</small> {item.value}
+      </span>)}
       <small>observed {new Date(status.observedAt).toLocaleTimeString()}</small></div>
     <div className="tabs" role="tablist">
       {([

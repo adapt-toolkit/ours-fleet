@@ -14,6 +14,7 @@ export interface ResolvedRoleView {
   model?: string;
   cwd?: string;
   permissions: CommonPermissions;
+  nativeRuntime?: { approval?: string; permissionMode?: string; sandbox?: string };
 }
 
 export interface RoleRecord {
@@ -54,6 +55,10 @@ export interface RoleStatus {
     sessionId?: string;
     lastError?: string;
     pendingPermissionId?: string;
+    protocolVersion?: number;
+    features?: string[];
+    runtimeModel?: SessionSnapshot['runtimeModel'];
+    reasoningEffort?: SessionSnapshot['reasoningEffort'];
   };
   restart: {
     circuit: 'closed' | 'open';

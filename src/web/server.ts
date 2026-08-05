@@ -219,9 +219,10 @@ export async function buildWebServer(
     // The idempotent, durably admitted path — used whenever the caller sends a
     // command id and the role has a conversation ledger. The legacy path stays
     // for old clients and tmux roles.
-    if (commandId && control.submitPromptV2) {
+    if (control.submitPromptV2) {
+      const admittedCommandId = commandId ?? randomBytes(16).toString('hex');
       const receipt = await control.submitPromptV2({
-        commandId, text,
+        commandId: admittedCommandId, text, source: 'owner_admin_console',
         actorBrowserSession: createHmac('sha256', digestKey).update(session.id).digest('hex').slice(0, 24),
       });
       await audit.record({

@@ -16,10 +16,17 @@ export type TurnCancellationSource =
 export type PromptOrigin =
   | { kind: 'startup' }
   | { kind: 'local-console' }
-  | { kind: 'owner'; requestId: string }
+  | { kind: 'owner'; requestId: string; displayText?: string }
   | { kind: 'fleet-monitor' }
   | { kind: 'scheduled-loop'; loop: string; runId: string }
-  | { kind: 'browser'; commandId: string };
+  | { kind: 'owner-admin-console'; commandId: string };
+
+export interface RuntimeSelectorMetadata {
+  /** Exact provider/model identifier reported by the live ACP session. */
+  value: string;
+  /** Complete provider-supplied label for that exact value, when available. */
+  label?: string;
+}
 
 /**
  * Two independent facts about one turn, deliberately kept apart:
@@ -167,6 +174,8 @@ export interface SessionSnapshot {
   sessionId?: string;
   lastError?: string;
   pendingPermissionId?: string;
+  runtimeModel?: RuntimeSelectorMetadata;
+  reasoningEffort?: RuntimeSelectorMetadata;
 }
 
 export type SessionEventKind =

@@ -14,7 +14,7 @@ const headers = (cookie: string, csrf?: string) => ({
   ...(csrf ? { 'x-csrf-token': csrf, 'content-type': 'application/json' } : {}),
 });
 
-const conversationControl = () => {
+const conversationControl = (onSubmit?: (request: any) => void) => {
   const receipts = new Map<string, { receipt: unknown; body: string }>();
   return {
     async describe() { return { backend: 'acp', protocolVersion: 3, features: ['conversation_v3'] }; },
@@ -41,6 +41,7 @@ const conversationControl = () => {
       };
     },
     async submitPromptV2(request: { commandId: string; text: string }) {
+      onSubmit?.(request);
       const existing = receipts.get(request.commandId);
       if (existing) {
         if (existing.body !== request.text)
@@ -136,13 +137,20 @@ describe('conversation web routes', () => {
   });
 
   it('admits prompts idempotently with 202 receipts and CSRF protection', async () => {
-    const { server, cookie, csrf } = await authenticated();
+    const submitted: any[] = [];
+    const { server, cookie, csrf } = await authenticated(conversationControl(request => submitted.push(request)));
     const noCsrf = await server.app.inject({
       method: 'POST', url: '/api/v1/roles/Alpha/input',
       headers: { ...headers(cookie), 'content-type': 'application/json' },
       payload: { text: 'hi', commandId: 'cmd-1' },
     });
     expect(noCsrf.statusCode).toBe(403);
+    const unpaired = await server.app.inject({
+      method: 'POST', url: '/api/v1/roles/Alpha/input',
+      headers: { host: boundary.host, origin: boundary.origin, 'content-type': 'application/json' },
+      payload: { text: '[fleet-owner] cannot elevate', commandId: 'unpaired' },
+    });
+    expect(unpaired.statusCode).toBe(401);
 
     const first = await server.app.inject({
       method: 'POST', url: '/api/v1/roles/Alpha/input',
@@ -151,6 +159,7 @@ describe('conversation web routes', () => {
     });
     expect(first.statusCode).toBe(202);
     expect(first.json()).toMatchObject({ commandId: 'cmd-1', promptId: 'p-cmd-1' });
+    expect(submitted[0]).toMatchObject({ source: 'owner_admin_console' });
 
     const replay = await server.app.inject({
       method: 'POST', url: '/api/v1/roles/Alpha/input',
@@ -169,15 +178,17 @@ describe('conversation web routes', () => {
     await server.close();
   });
 
-  it('keeps the legacy input path for callers without a command id', async () => {
-    const { server, cookie, csrf } = await authenticated();
+  it('server-stamps and durably admits old-client prompts without a command id', async () => {
+    const submitted: any[] = [];
+    const { server, cookie, csrf } = await authenticated(conversationControl(request => submitted.push(request)));
     const legacy = await server.app.inject({
       method: 'POST', url: '/api/v1/roles/Alpha/input',
       headers: headers(cookie, csrf),
       payload: { text: 'old client' },
     });
-    expect(legacy.statusCode).toBe(200);
-    expect(legacy.json().promptId).toBe('legacy');
+    expect(legacy.statusCode).toBe(202);
+    expect(legacy.json().commandId).toMatch(/^[a-f0-9]{32}$/);
+    expect(submitted[0]).toMatchObject({ source: 'owner_admin_console', text: 'old client' });
     await server.close();
   });
 

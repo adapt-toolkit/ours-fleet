@@ -25,7 +25,7 @@ export type ConversationEventKind =
 
 /** Where a conversation record came from. Typed provenance, never prompt text. */
 export type ConversationSource =
-  | 'browser' | 'owner_channel' | 'fleet_monitor' | 'scheduled_loop' | 'startup'
+  | 'owner_admin_console' | 'owner_channel' | 'fleet_monitor' | 'scheduled_loop' | 'startup'
   | 'local_console' | 'agent' | 'agent_replay';
 
 // ── Normalized content ────────────────────────────────────────────────────────
@@ -165,6 +165,8 @@ export interface UnsupportedPayload {
 
 export interface PromptAdmittedPayload {
   text?: NormalizedText;
+  /** Human-only display body; never used to recover or dispatch an external prompt. */
+  displayText?: NormalizedText;
   /** External E2E bodies stay out of fleet state: digest/size only. */
   external?: { digest: string; bytes: number };
   queuedBehind: number;
@@ -269,7 +271,7 @@ export interface SubmitPromptCommand {
   /** Idempotency-Key / clientRequestId. Reuse with a different body is a conflict. */
   commandId: string;
   text: string;
-  source: 'browser';
+  source: 'owner_admin_console';
   actorBrowserSession: string;
 }
 

@@ -141,7 +141,7 @@ const conversationAt = new Date().toISOString();
 const conversationEvents = [
   { schemaVersion: 1, roleId: 'Alpha', eventId: 'conv-1', seq: 1, at: conversationAt,
     sessionGeneration: 'fixture-generation', kind: 'prompt.admitted', promptId: 'fixture-turn',
-    commandId: 'fixture-command', source: 'browser',
+    commandId: 'fixture-command', source: 'owner_admin_console',
     payload: { text: { type: 'text', text: 'Inspect the fixture', bytes: 19 }, queuedBehind: 0 } },
   { schemaVersion: 1, roleId: 'Alpha', eventId: 'conv-2', seq: 2, at: conversationAt,
     sessionGeneration: 'fixture-generation', kind: 'plan.replace', promptId: 'fixture-turn',
