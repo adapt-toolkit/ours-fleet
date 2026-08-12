@@ -609,6 +609,39 @@ describe('AcpSession', () => {
     await session.close();
   });
 
+  it('redacts real scheduled-loop lifecycle IDs from events and the durable conversation', async () => {
+    const session = await start();
+    await session.submitPrompt('rich scheduled lifecycle', {
+      origin: { kind: 'scheduled-loop', loop: 'health', runId: 'scheduled_rich' },
+    });
+
+    const rawSessionEvents = readFileSync(join(dirs.at(-1)!, '.session-events.jsonl'), 'utf8');
+    const rawConversationEvents = readFileSync(
+      join(dirs.at(-1)!, '.conversation', 'events-000001.jsonl'), 'utf8');
+    const sessionToolEvents = rawSessionEvents.trim().split('\n').map(line => JSON.parse(line))
+      .filter(event => event.kind === 'tool_call' || event.kind === 'tool_update');
+    const conversationToolEvents = rawConversationEvents.trim().split('\n').map(line => JSON.parse(line))
+      .filter(event => event.kind === 'tool.upsert');
+
+    expect(sessionToolEvents).toHaveLength(2);
+    expect(sessionToolEvents.map(event => event.toolCallId)).toEqual([
+      'scheduled-loop-tool', 'scheduled-loop-tool',
+    ]);
+    expect(conversationToolEvents).toHaveLength(2);
+    expect(conversationToolEvents.map(event => event.toolCallId)).toEqual([
+      'scheduled-loop-tool', 'scheduled-loop-tool',
+    ]);
+    expect(conversationToolEvents.map(event => event.payload.toolCallId)).toEqual([
+      'scheduled-loop-tool', 'scheduled-loop-tool',
+    ]);
+    expect(rawSessionEvents).toContain('scheduled-loop-tool');
+    expect(rawConversationEvents).toContain('scheduled-loop-tool');
+    expect(rawSessionEvents).not.toContain('rich-tool');
+    expect(rawConversationEvents).not.toContain('rich-tool');
+
+    await session.close();
+  });
+
   it('queues multiple after_tool wakes on one tool boundary without cancellation', async () => {
     const session = await start();
     const active = session.submitPrompt('toolwait 100');

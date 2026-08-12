@@ -1138,7 +1138,10 @@ export class AcpSession implements SessionHandle {
     update: acp.SessionUpdate, scheduled: boolean, commentary = false,
   ): void {
     const normalized = normalizeSessionUpdate(update,
-      scheduled ? { redactText: SCHEDULED_LOOP_REDACTION }
+      scheduled ? {
+        redactText: SCHEDULED_LOOP_REDACTION,
+        redactToolCallId: 'scheduled-loop-tool',
+      }
         : commentary ? { redactText: OWNER_COMMENTARY_REDACTION } : {});
     this.conversation.appendSafe({
       kind: normalized.kind,

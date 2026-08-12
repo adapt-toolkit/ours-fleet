@@ -129,6 +129,17 @@ describe('normalizeSessionUpdate', () => {
     expect(payload.rawOutput?.json).toEqual({ ok: true });
   });
 
+  it('redacts a tool-call ID in both the correlation field and payload', () => {
+    for (const sessionUpdate of ['tool_call', 'tool_call_update'] as const) {
+      const result = normalizeSessionUpdate({
+        sessionUpdate, toolCallId: 'private-tool-id', status: 'in_progress',
+      }, { redactToolCallId: 'scheduled-loop-tool' });
+      expect(result.toolCallId).toBe('scheduled-loop-tool');
+      expect((result.payload as ToolUpsertPayload).toolCallId).toBe('scheduled-loop-tool');
+      expect(JSON.stringify(result)).not.toContain('private-tool-id');
+    }
+  });
+
   it('maps standard plans to whole-session plan.replace snapshots', () => {
     const result = normalizeSessionUpdate({
       sessionUpdate: 'plan',
