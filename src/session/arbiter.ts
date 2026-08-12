@@ -50,6 +50,15 @@ export class RoleTurnArbiter implements SessionHandle {
     return (await this.queuePrompt(text, options)).completion;
   }
 
+  /**
+   * Do not hold `exclusive` while ACP waits for a tool boundary: permission
+   * answers and explicit interrupts must remain able to pass immediately.
+   */
+  submitPromptAfterTool(text: string, options: SubmitPromptOptions = {}): Promise<TurnResult> {
+    return this.session.submitPromptAfterTool?.(text, options)
+      ?? this.session.submitPrompt(text, { ...options, interrupt: false, steer: false });
+  }
+
   async tryScheduled(
     text: string, origin: Extract<PromptOrigin, { kind: 'scheduled-loop' }>,
     beforeQueue?: () => void | Promise<void>,

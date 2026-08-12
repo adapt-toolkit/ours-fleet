@@ -9,7 +9,7 @@ type Form = {
   filesystem: 'read-only' | 'workspace' | 'unrestricted'; unattended: 'deny' | 'wait';
   bio: string; persona: string; highRiskAcknowledged: boolean; openAfterCreate: boolean;
   reuseExistingIdentityAcknowledged: boolean; unverifiedIdentityAcknowledged: boolean;
-  monitorMode: 'fleet' | 'native'; monitorInterrupt: boolean;
+  monitorMode: 'fleet' | 'native'; monitorInterrupt: boolean | 'after_tool';
   monitorWakeSources: string[]; monitorBatchMs: string; monitorInject: 'notification'; advanced: boolean;
 };
 const WAKE_SOURCES = [
@@ -159,8 +159,14 @@ export function CreateRole({ onClose, onCreated }: {
             </select></label>
             <label>Batch window (ms)<input aria-label="Monitor batch milliseconds" type="number" min="0"
               value={form.monitorBatchMs} onChange={e => change('monitorBatchMs', e.target.value)} /></label>
-            <label className="risk"><input type="checkbox" checked={form.monitorInterrupt}
-              onChange={e => change('monitorInterrupt', e.target.checked)} />Interrupt an active turn before wake delivery</label>
+            <label className="risk">Wake interruption<select aria-label="Monitor interruption"
+              value={String(form.monitorInterrupt)} onChange={e => change('monitorInterrupt',
+                e.target.value === 'true' ? true
+                  : e.target.value === 'after_tool' ? 'after_tool' : false)}>
+              <option value="false">Queue without cancellation</option>
+              <option value="after_tool">Steer after active tool</option>
+              <option value="true">Cancel immediately</option>
+            </select></label>
             <div className="wide wake-sources" role="group" aria-label="Monitor wake sources">
               <small>Wake sources</small>
               {WAKE_SOURCES.map(source => <label key={source}><input type="checkbox"

@@ -46,7 +46,7 @@ defaults:
   max_tokens: 500000          # session cap before auto-compact (harness-interpreted)
   monitor:
     mode: fleet               # fleet (default): ours-fleet supervisor; native: harness-owned monitor
-    interrupt: false          # true: cancel active work before every configured wake
+    interrupt: false          # false: queue; true: cancel; after_tool: steer at an ACP tool boundary
 
   # To make Codex the fleet default instead:
   # harness: codex

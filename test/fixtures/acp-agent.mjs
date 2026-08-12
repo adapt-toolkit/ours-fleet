@@ -32,6 +32,8 @@ const stopReasonFor = text =>
 
 /** promptId -> permission requests still awaiting a decision. */
 const outstanding = new Map();
+/** promptId -> delay after its last permission resolves, for boundary-race tests. */
+const permissionCompletionDelay = new Map();
 
 /** Ask for the same tool, offering both reject kinds so selection order matters. */
 const requestPermission = promptId => {
@@ -146,7 +148,11 @@ createInterface({ input: process.stdin }).on('line', line => {
     outstanding.set(pending.promptId, left);
     if (left > 0) return;
     outstanding.delete(pending.promptId);
-    answerPrompt(pending.promptId, FORCED_STOP_REASON ?? 'end_turn');
+    const delay = permissionCompletionDelay.get(pending.promptId) ?? 0;
+    permissionCompletionDelay.delete(pending.promptId);
+    if (delay > 0)
+      setTimeout(() => answerPrompt(pending.promptId, FORCED_STOP_REASON ?? 'end_turn'), delay);
+    else answerPrompt(pending.promptId, FORCED_STOP_REASON ?? 'end_turn');
     return;
   }
   switch (message.method) {
@@ -238,6 +244,16 @@ createInterface({ input: process.stdin }).on('line', line => {
       } else if (/\brich\b/i.test(text)) {
         emitRichTurn(text);
         answerPrompt(message.id, stopReasonFor(text));
+      } else if (/\btoolwait(?:\s+(\d+))?\b/i.test(text)) {
+        const delay = Number(/\btoolwait(?:\s+(\d+))?\b/i.exec(text)?.[1] ?? 100);
+        update({
+          sessionUpdate: 'tool_call', toolCallId: 'wait-tool', title: 'Wait fixture tool',
+          kind: 'execute', status: 'in_progress',
+        });
+        setTimeout(() => {
+          update({ sessionUpdate: 'tool_call_update', toolCallId: 'wait-tool', status: 'completed' });
+          setTimeout(() => answerPrompt(message.id, stopReasonFor(text)), 20);
+        }, delay);
       } else if (/\blate\b/i.test(text)) {
         // Start a tool, then wait: only session/cancel releases this prompt,
         // and the cancel path emits the late updates first.
@@ -247,6 +263,9 @@ createInterface({ input: process.stdin }).on('line', line => {
         // "twice" asks for the SAME tool two times in one turn, so a test can
         // check that each request is decided independently.
         const times = /\btwice\b/i.test(text) ? 2 : 1;
+        const completionDelay = /\bpermission linger(?:\s+(\d+))?/i.exec(text);
+        if (completionDelay)
+          permissionCompletionDelay.set(message.id, Number(completionDelay[1] ?? 100));
         outstanding.set(message.id, times);
         for (let i = 0; i < times; i++) requestPermission(message.id);
       } else {

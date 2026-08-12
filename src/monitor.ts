@@ -1,7 +1,7 @@
 import { existsSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
-import type { MonitorConfig, NotifyEventType } from './config.js';
+import type { MonitorConfig, MonitorInterrupt, NotifyEventType } from './config.js';
 import { classifyFailureText, type FailureEvidence } from './model-recovery.js';
 
 // ─── The supervisor-owned message monitor (DESIGN-external-monitor §1, §3, §4) ──
@@ -60,8 +60,11 @@ export interface MonitorDeps {
   delivery?: {
     submit(
       text: string,
-      options?: { interrupt?: boolean },
-    ): Promise<{ succeeded: boolean; outcome: string; detail?: string }>;
+      options?: { interrupt?: MonitorInterrupt },
+    ): Promise<{
+      succeeded: boolean; outcome: string; detail?: string;
+      safeBoundary?: 'direct' | 'after_tool' | 'timeout' | 'unsupported';
+    }>;
   };
   /** Body-free, typed evidence for runner-owned model recovery. */
   onFailureEvidence?(evidence: FailureEvidence): boolean;
@@ -118,6 +121,7 @@ export type StatusCause =
   | 'modal'           // the pane held a dialog         → cleared by a delivered wake
   | 'offline'         // the session is gone            → the run loop ends
   | 'turns-failing'   // delivered wakes keep dying     → cleared by a completed turn
+  | 'safe-boundary'   // after_tool fell back            → cleared by an exact/direct delivery
   | 'auth';           // the daemon rejected the token  → fatal
 
 interface StatusEntry {
@@ -590,12 +594,20 @@ export class Monitor {
         this.degrade('delivery', `wake ${result.outcome}${result.detail ? ` (${result.detail})` : ''}`);
         return false;
       }
+      if (result.safeBoundary === 'timeout' || result.safeBoundary === 'unsupported')
+        this.degrade('safe-boundary', result.detail ?? `after_tool ${result.safeBoundary}`);
+      else this.recover('safe-boundary');
       this.recover('delivery', 'modal');
-      if (result.detail !== 'injected' && result.detail !== 'startedNewTurn')
+      if (result.outcome !== 'injected' && result.outcome !== 'startedNewTurn')
         this.recordTurn('completed');
       return true;
     }
-    if (this.cfg.interrupt) await this.deps.tmux.sendKey(this.name, 'C-c');
+    // Tmux exposes no authenticated tool lifecycle. `after_tool` therefore
+    // degrades to the existing non-cancelling injection path; never guess a
+    // boundary from pane text and never send C-c for this mode.
+    if (this.cfg.interrupt === true) await this.deps.tmux.sendKey(this.name, 'C-c');
+    if (this.cfg.interrupt === 'after_tool')
+      this.degrade('safe-boundary', 'after_tool unsupported by tmux; using non-cancelling delivery');
     const state = await this.awaitInjectable(pid);
     if (state !== 'ready') {
       if (state === 'offline') this.degrade('offline', 'offline during delivery');

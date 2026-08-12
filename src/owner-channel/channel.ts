@@ -310,7 +310,10 @@ export class OwnerChannel implements OwnerChannelHandle {
     const run = this.managementTail.then(async () => {
       if (!this.ready || this.stopping) throw new Error('owner-channel MCP client is unavailable');
       const model = event.model ? `, model ${event.model}` : '';
-      const monitor = `${event.monitor.mode} monitor${event.monitor.interrupt ? ' with interruption' : ''}`;
+      const monitorPolicy = event.monitor.interrupt === true
+        ? ' with interruption'
+        : event.monitor.interrupt === 'after_tool' ? ' with after-tool steering' : '';
+      const monitor = `${event.monitor.mode} monitor${monitorPolicy}`;
       const inherited = event.inherited.length
         ? ` Supervisor inherited omitted defaults: ${event.inherited.join(', ')}.` : '';
       await this.sendProactiveMessage(

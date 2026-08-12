@@ -42,6 +42,8 @@ export type FleetPermissionMode = 'ask' | 'auto' | 'allow';
 export type ApprovalMode = FleetPermissionMode | 'deny';
 export type FilesystemMode = 'read-only' | 'workspace' | 'unrestricted';
 export type UnattendedMode = 'deny' | 'wait';
+/** Monitor wake policy: preserve legacy booleans and add one explicit safe boundary. */
+export type MonitorInterrupt = boolean | 'after_tool';
 
 export interface CommonPermissions {
   approval: ApprovalMode;
@@ -68,8 +70,8 @@ export interface MonitorConfig {
   wake_sources: string[];
   batch_ms: number;
   inject: InjectMode;
-  /** Cancel the active agent turn before delivering every configured wake. */
-  interrupt: boolean;
+  /** Immediate cancel, ordinary non-cancelling delivery, or ACP tool-boundary steering. */
+  interrupt: MonitorInterrupt;
   /**
    * Consecutive delivered wakes that must end in an `API Error:`-terminated turn
    * (with no completed turn in between) before `.monitor-status` degrades to
@@ -157,8 +159,9 @@ export function validateMonitorConfig(raw: unknown): string[] {
     problems.push('monitor.batch_ms: must be a non-negative number');
   if (m.inject !== undefined && !INJECT_MODES.includes(m.inject as InjectMode))
     problems.push(`monitor.inject: invalid value '${m.inject}'; allowed: ${INJECT_MODES.join(', ')}`);
-  if (m.interrupt !== undefined && typeof m.interrupt !== 'boolean')
-    problems.push('monitor.interrupt: must be true or false');
+  if (m.interrupt !== undefined
+      && typeof m.interrupt !== 'boolean' && m.interrupt !== 'after_tool')
+    problems.push("monitor.interrupt: must be true, false, or 'after_tool'");
   if (m.turn_fail_threshold !== undefined
       && (typeof m.turn_fail_threshold !== 'number' || !Number.isInteger(m.turn_fail_threshold)
           || m.turn_fail_threshold < 1))
@@ -808,7 +811,7 @@ export function resolveMonitorConfig(
     wake_sources: (merged.wake_sources as string[] | undefined) ?? [...DEFAULT_WAKE_SOURCES],
     batch_ms: (merged.batch_ms as number | undefined) ?? MONITOR_DEFAULT_BATCH_MS,
     inject: (merged.inject as InjectMode | undefined) ?? 'notification',
-    interrupt: (merged.interrupt as boolean | undefined) ?? false,
+    interrupt: (merged.interrupt as MonitorInterrupt | undefined) ?? false,
     turn_fail_threshold:
       (merged.turn_fail_threshold as number | undefined) ?? MONITOR_DEFAULT_TURN_FAIL_THRESHOLD,
   };

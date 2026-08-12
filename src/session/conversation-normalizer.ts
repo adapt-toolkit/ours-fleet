@@ -34,6 +34,12 @@ export interface NormalizeOptions {
    * digest. Used for scheduled-loop turns whose output must not be retained.
    */
   redactText?: string;
+  /**
+   * Replace ACP tool-call IDs in both the normalized event correlation field
+   * and payload. The caller may still use the original update for in-memory
+   * lifecycle tracking without persisting its private identifier.
+   */
+  redactToolCallId?: string;
 }
 
 export interface NormalizedUpdate {
@@ -229,9 +235,12 @@ function normalizeToolContent(raw: unknown, redact?: string): NormalizedToolCont
   });
 }
 
-function toolUpsert(update: Record<string, unknown>, snapshot: boolean, redact?: string): ToolUpsertPayload {
+function toolUpsert(
+  update: Record<string, unknown>, snapshot: boolean, options: NormalizeOptions,
+): ToolUpsertPayload {
+  const redact = options.redactText;
   const payload: ToolUpsertPayload = {
-    toolCallId: asString(update.toolCallId) ?? '',
+    toolCallId: options.redactToolCallId ?? asString(update.toolCallId) ?? '',
     snapshot,
   };
   if (asString(update.title) !== undefined) payload.title = redact ?? asString(update.title);
@@ -293,7 +302,7 @@ export function normalizeSessionUpdate(
     }
     case 'tool_call':
     case 'tool_call_update': {
-      const payload = toolUpsert(raw, raw.sessionUpdate === 'tool_call', redact);
+      const payload = toolUpsert(raw, raw.sessionUpdate === 'tool_call', options);
       return withMeta({
         kind: 'tool.upsert', payload,
         ...(payload.toolCallId ? { toolCallId: payload.toolCallId } : {}),

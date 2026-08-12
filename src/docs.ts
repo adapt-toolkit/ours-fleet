@@ -195,7 +195,7 @@ roles:
         boot_grace_ms: 10000
     monitor:
       mode: fleet                        # fleet supervisor | native harness monitor
-      interrupt: false                    # true cancels active work before every configured wake
+      interrupt: false                    # false queues; true cancels; after_tool steers at an ACP tool boundary
       wake_sources: [message_received, file_received, local_contact_request, pending_message]
       batch_ms: 2000
       inject: notification
@@ -393,9 +393,14 @@ ours-fleet falls back to a compatible globally installed \`codex-acp\` or
   instructs Claude Code or Codex to arm its harness-native wake mechanism.
 
 Set \`monitor.interrupt: true\` in fleet mode to cancel active work before every
-configured wake. The policy is content-blind because the supervisor cannot
-inspect encrypted message bodies. Message bodies are released only when the
-role calls the ours \`get_messages\` tool.
+configured wake. Set it to \`after_tool\` to preserve an active ACP tool (and any
+pending permission), then steer the wake at the first tool-terminal boundary
+without cancellation. A hung boundary is bounded at 120 seconds and falls back
+to non-cancelling steering/queueing; adapters without authenticated tool events
+use the same conservative fallback. Explicit human/control interrupts remain
+immediate. The policy is content-blind because the supervisor cannot inspect
+encrypted message bodies. Message bodies are released only when the role calls
+the ours \`get_messages\` tool.
 
 The default is \`false\`. For a temporary role whose mission intentionally arrives
 after its readiness announcement, set \`mode: fleet\` and \`interrupt: true\`

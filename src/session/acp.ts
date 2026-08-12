@@ -24,8 +24,18 @@ import type {
 interface PendingPermission {
   options: Array<{ optionId: string; kind: string }>;
   resolve(response: acp.RequestPermissionResponse): void;
+  /** Real ACP ID used only for lifecycle tracking; never emit this for scheduled loops. */
   toolCallId?: string;
+  /** Public/ledger ID, redacted for scheduled loops. */
+  eventToolCallId?: string;
   expiry?: ReturnType<typeof setTimeout>;
+}
+
+interface ActiveToolCall {
+  /** An authenticated non-terminal tool update has been observed. */
+  lifecycle: boolean;
+  /** Permission request ID -> whether its selected outcome allows the tool to proceed. */
+  permissions: Map<string, 'pending' | 'allowed'>;
 }
 
 interface SteeringResponse {
@@ -37,6 +47,9 @@ const CANCEL_SETTLE_GRACE_MS = 15_000;
 const PERMISSION_TIMEOUT_MS = 10 * 60_000;
 /** Spec §4.3: 10-15 s before a vanished controller triggers the unattended policy. */
 const CONTROLLER_GRACE_MS = 12_000;
+/** Bound safe-boundary waiting without turning a hung tool into cancellation. */
+export const AFTER_TOOL_BOUNDARY_TIMEOUT_MS = 120_000;
+const TERMINAL_TOOL_STATUSES = new Set(['completed', 'failed']);
 
 const SCHEDULED_LOOP_REDACTION = '[scheduled-loop content redacted]';
 const OWNER_COMMENTARY_REDACTION = '[assistant commentary redacted]';
@@ -107,6 +120,8 @@ export interface AcpSessionOptions {
   permissionTimeoutMs?: number;
   /** Grace after the last controller detaches before the unattended policy applies. */
   controllerGraceMs?: number;
+  /** Test seam; production uses AFTER_TOOL_BOUNDARY_TIMEOUT_MS. */
+  afterToolBoundaryTimeoutMs?: number;
 }
 
 /**
@@ -151,9 +166,13 @@ export class AcpSession implements SessionHandle {
   private runtimeModel?: RuntimeSelectorMetadata;
   private reasoningEffort?: RuntimeSelectorMetadata;
   private controllerCount = 0;
+  private closing = false;
   /** Armed when the last controller detaches; unattended policy applies on fire. */
   private controllerGrace?: ReturnType<typeof setTimeout>;
   private cancelEscalation?: ReturnType<typeof setTimeout>;
+  /** ACP-authenticated in-flight calls, including independently reserved permissions. */
+  private readonly activeToolCalls = new Map<string, ActiveToolCall>();
+  private readonly toolBoundaryWaiters = new Set<() => void>();
   private activeTurn?: {
     id: string; output: string; origin?: SubmitPromptOptions['origin'];
     cancellationSource?: TurnCancellationSource;
@@ -280,6 +299,143 @@ export class AcpSession implements SessionHandle {
       runtimeModel: this.runtimeModel,
       reasoningEffort: this.reasoningEffort,
       permissionMode: this.options.permissionMode,
+    };
+  }
+
+  private toolCall(toolCallId: string): ActiveToolCall {
+    const existing = this.activeToolCalls.get(toolCallId);
+    if (existing) return existing;
+    const created: ActiveToolCall = { lifecycle: false, permissions: new Map() };
+    this.activeToolCalls.set(toolCallId, created);
+    return created;
+  }
+
+  private reserveTool(toolCallId: string | undefined): void {
+    if (toolCallId) this.toolCall(toolCallId).lifecycle = true;
+  }
+
+  private reservePermission(toolCallId: string | undefined, permissionId: string): void {
+    if (toolCallId) this.toolCall(toolCallId).permissions.set(permissionId, 'pending');
+  }
+
+  private allowPermission(toolCallId: string | undefined, permissionId: string): void {
+    if (!toolCallId) return;
+    const permission = this.activeToolCalls.get(toolCallId)?.permissions;
+    if (permission?.has(permissionId)) permission.set(permissionId, 'allowed');
+  }
+
+  private releasePermission(toolCallId: string | undefined, permissionId: string): void {
+    const call = toolCallId && this.activeToolCalls.get(toolCallId);
+    if (!call || !call.permissions.delete(permissionId)) return;
+    this.releaseToolIfIdle(toolCallId, call);
+  }
+
+  private releaseTool(toolCallId: string | undefined): void {
+    const call = toolCallId && this.activeToolCalls.get(toolCallId);
+    if (!call) return;
+    call.lifecycle = false;
+    // Terminal tool evidence consumes permissions already granted for this
+    // call, but never a separate request that is still awaiting a decision.
+    for (const [permissionId, state] of call.permissions)
+      if (state === 'allowed') call.permissions.delete(permissionId);
+    this.releaseToolIfIdle(toolCallId, call);
+  }
+
+  private releaseToolIfIdle(toolCallId: string, call: ActiveToolCall): void {
+    if (call.lifecycle || call.permissions.size > 0) return;
+    if (!this.activeToolCalls.delete(toolCallId) || this.activeToolCalls.size > 0) return;
+    for (const notify of [...this.toolBoundaryWaiters]) notify();
+  }
+
+  private releaseAllTools(): void {
+    if (this.activeToolCalls.size === 0) return;
+    this.activeToolCalls.clear();
+    for (const notify of [...this.toolBoundaryWaiters]) notify();
+  }
+
+  private waitForToolBoundary(timeoutMs: number): Promise<boolean> {
+    if (this.activeToolCalls.size === 0) return Promise.resolve(true);
+    return new Promise(resolve => {
+      let settled = false;
+      const finish = (atBoundary: boolean) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        this.toolBoundaryWaiters.delete(check);
+        resolve(atBoundary);
+      };
+      const check = () => {
+        if (this.activeToolCalls.size === 0 || !this.isAlive())
+          finish(this.activeToolCalls.size === 0);
+      };
+      const timer = setTimeout(() => finish(false), Math.max(0, timeoutMs));
+      timer.unref?.();
+      this.toolBoundaryWaiters.add(check);
+      // Close the subscribe/check race without guessing about elapsed time.
+      check();
+    });
+  }
+
+  private recordAfterToolDelivery(
+    state: 'deferred' | 'direct' | 'after_tool' | 'timeout' | 'unsupported',
+    activeToolCount: number, waitedMs: number,
+  ): void {
+    this.events.emit('monitor_delivery', {
+      status: state, monitorPolicy: 'after_tool', activeToolCount, waitedMs,
+    });
+    this.conversation.appendSafe({
+      kind: 'monitor.delivery', sessionGeneration: this.sessionGeneration,
+      acpSessionId: this.sessionId, source: 'fleet_monitor',
+      payload: { policy: 'after_tool', state, activeToolCount, waitedMs },
+    });
+  }
+
+  /**
+   * Monitor-only safe-boundary delivery. Steering is the interruption: this
+   * path never calls session/cancel and never resolves a pending permission.
+   */
+  async submitPromptAfterTool(
+    text: string, options: SubmitPromptOptions = {},
+  ): Promise<TurnResult> {
+    if (this.closing || !this.isAlive())
+      return turnResult(false, 'failed', this.lastError ?? 'ACP session is closing');
+    const startedAt = Date.now();
+    const initialToolCount = this.activeToolCalls.size;
+    if (!this.steeringSupported) {
+      this.recordAfterToolDelivery('unsupported', initialToolCount, 0);
+      const result = await this.submitPrompt(text, { ...options, interrupt: false, steer: false });
+      return {
+        ...result,
+        safeBoundary: { state: 'unsupported', waitedMs: 0, activeToolCount: initialToolCount },
+      };
+    }
+    if (initialToolCount === 0) {
+      this.recordAfterToolDelivery('direct', 0, 0);
+      const result = await this.steerPrompt(text);
+      return { ...result, safeBoundary: { state: 'direct', waitedMs: 0, activeToolCount: 0 } };
+    }
+
+    this.recordAfterToolDelivery('deferred', initialToolCount, 0);
+    const timeoutMs = this.options.afterToolBoundaryTimeoutMs ?? AFTER_TOOL_BOUNDARY_TIMEOUT_MS;
+    const deadline = startedAt + timeoutMs;
+    let atBoundary = false;
+    // Re-check after every wake: another authenticated tool event may have
+    // arrived before this continuation ran. Only an empty tracked set is safe.
+    while (this.activeToolCalls.size > 0) {
+      const remaining = deadline - Date.now();
+      if (remaining <= 0 || !(await this.waitForToolBoundary(remaining))) break;
+    }
+    atBoundary = this.activeToolCalls.size === 0;
+    if (this.closing || !this.isAlive())
+      return turnResult(false, 'failed', this.lastError ?? 'ACP session closed during after_tool wait');
+    const waitedMs = Math.max(0, Date.now() - startedAt);
+    const state = atBoundary ? 'after_tool' : 'timeout';
+    const remainingToolCount = this.activeToolCalls.size;
+    this.recordAfterToolDelivery(state, remainingToolCount, waitedMs);
+    const result = await this.steerPrompt(text);
+    return {
+      ...result,
+      safeBoundary: { state, waitedMs, activeToolCount: remainingToolCount },
     };
   }
 
@@ -434,6 +590,8 @@ export class AcpSession implements SessionHandle {
     if (pending.expiry) clearTimeout(pending.expiry);
     pending.resolve({ outcome: { outcome: 'selected', optionId } });
     const decision = chosen.kind.startsWith('reject') ? 'denied' : 'allowed';
+    if (decision === 'allowed') this.allowPermission(pending.toolCallId, permissionId);
+    else this.releasePermission(pending.toolCallId, permissionId);
     this.events.emit('permission', {
       turnId: this.activeTurn?.id,
       origin: this.activeTurn?.origin,
@@ -450,7 +608,7 @@ export class AcpSession implements SessionHandle {
       promptId: this.activeTurn?.id, turnId: this.activeTurn?.id,
       payload: { decision, decisionSource: 'manual', optionId },
     });
-    this.readiness = 'running';
+    this.readiness = this.pendingPermissions.size > 0 ? 'awaiting_permission' : 'running';
     return true;
   }
 
@@ -522,11 +680,12 @@ export class AcpSession implements SessionHandle {
       ? { outcome: { outcome: 'selected', optionId: rejectOption.optionId } }
       : { outcome: { outcome: 'cancelled' } });
     const settled = decision === 'denied' && !rejectOption ? 'cancelled' : decision;
+    this.releasePermission(pending.toolCallId, permissionId);
     this.events.emit('permission', {
       turnId: this.activeTurn?.id,
       origin: this.activeTurn?.origin,
       permissionId,
-      toolCallId: pending.toolCallId,
+      toolCallId: pending.eventToolCallId,
       status: 'completed',
       decision: settled === 'expired' ? 'cancelled' : settled,
       decisionSource: 'automatic',
@@ -538,7 +697,7 @@ export class AcpSession implements SessionHandle {
       kind: 'permission.resolved', sessionGeneration: this.sessionGeneration,
       acpSessionId: this.sessionId, permissionId,
       promptId: this.activeTurn?.id, turnId: this.activeTurn?.id,
-      toolCallId: pending.toolCallId,
+      toolCallId: pending.eventToolCallId,
       payload: {
         decision: settled, decisionSource: 'automatic',
         ...(policy ? { policy } : {}), reason,
@@ -554,6 +713,7 @@ export class AcpSession implements SessionHandle {
   }
 
   async close(): Promise<void> {
+    this.closing = true;
     if (this.cancelEscalation) clearTimeout(this.cancelEscalation);
     this.cancelEscalation = undefined;
     if (this.controllerGrace) clearTimeout(this.controllerGrace);
@@ -561,6 +721,7 @@ export class AcpSession implements SessionHandle {
     for (const [permissionId, pending] of [...this.pendingPermissions])
       this.settlePendingAutomatically(permissionId, pending, 'cancelled', undefined,
         'the session closed while this request was pending');
+    this.releaseAllTools();
     if (this.sessionId && this.capabilities?.sessionCapabilities?.close != null) {
       await this.connection.agent.request(
         acp.methods.agent.session.close, { sessionId: this.sessionId }).catch(() => undefined);
@@ -708,6 +869,7 @@ export class AcpSession implements SessionHandle {
         false, 'failed', this.lastError,
         this.activeTurn?.id === turnId ? this.activeTurn.output : undefined);
     } finally {
+      this.releaseAllTools();
       if (this.activeTurn?.id === turnId) {
         if (this.cancelEscalation) clearTimeout(this.cancelEscalation);
         this.cancelEscalation = undefined;
@@ -750,11 +912,19 @@ export class AcpSession implements SessionHandle {
       }
       return undefined;
     };
+    const toolCallId = params.toolCall.toolCallId;
+    const permissionId = randomUUID();
+    // Permission is part of the tool lifecycle. Reserve before any policy or
+    // human decision so a monitor wake cannot slip between request and answer.
+    this.reservePermission(toolCallId, permissionId);
     if (this.options.permissions.approval === 'allow' && this.withinAutomaticBoundary(params)) {
       const option = choose(['allow_always', 'allow_once']);
-      return Promise.resolve(this.settleAutomatically(params, option, 'allowed',
+      const response = this.settleAutomatically(params, option, 'allowed',
         'permissions.approval=allow',
-        `the request is inside the ${this.options.permissions.filesystem} boundary`));
+        `the request is inside the ${this.options.permissions.filesystem} boundary`);
+      if (option) this.allowPermission(toolCallId, permissionId);
+      else this.releasePermission(toolCallId, permissionId);
+      return Promise.resolve(response);
     }
     // A live grace window still counts as attended: the controller may be
     // mid-reconnect, and denying instantly is exactly what the grace prevents.
@@ -765,14 +935,15 @@ export class AcpSession implements SessionHandle {
       // a decision no human made, so one unattended denial would silently disable
       // the tool for the rest of the session.
       const option = choose(['reject_once', 'reject_always']);
-      return Promise.resolve(this.settleAutomatically(params, option, 'denied',
+      const response = this.settleAutomatically(params, option, 'denied',
         unattended ? 'permissions.unattended=deny' : 'permissions.approval=deny',
         unattended
           ? 'no controller is attached, so the request cannot be shown to anyone'
-          : 'the role denies every permission request by policy'));
+          : 'the role denies every permission request by policy');
+      this.releasePermission(toolCallId, permissionId);
+      return Promise.resolve(response);
     }
 
-    const permissionId = randomUUID();
     const timeoutMs = this.options.permissionTimeoutMs ?? PERMISSION_TIMEOUT_MS;
     const expiresAt = new Date(Date.now() + timeoutMs).toISOString();
     this.readiness = 'awaiting_permission';
@@ -811,8 +982,8 @@ export class AcpSession implements SessionHandle {
     return new Promise(resolve => {
       const pending: PendingPermission = {
         options: params.options, resolve,
-        toolCallId: scheduledTurn(this.activeTurn)
-          ? 'scheduled-loop-tool' : params.toolCall.toolCallId,
+        toolCallId,
+        eventToolCallId: scheduledTurn(this.activeTurn) ? 'scheduled-loop-tool' : toolCallId,
       };
       pending.expiry = setTimeout(() => {
         this.settlePendingAutomatically(permissionId, pending, 'expired', undefined,
@@ -927,6 +1098,8 @@ export class AcpSession implements SessionHandle {
           title: scheduled ? 'scheduled-loop tool' : update.title,
           status: update.status,
         });
+        if (TERMINAL_TOOL_STATUSES.has(update.status ?? '')) this.releaseTool(update.toolCallId);
+        else this.reserveTool(update.toolCallId);
         break;
       case 'tool_call_update':
         this.events.emit('tool_update', {
@@ -936,6 +1109,8 @@ export class AcpSession implements SessionHandle {
           title: scheduled ? 'scheduled-loop tool' : update.title ?? undefined,
           status: update.status ?? undefined,
         });
+        if (TERMINAL_TOOL_STATUSES.has(update.status ?? '')) this.releaseTool(update.toolCallId);
+        else if (update.status !== undefined) this.reserveTool(update.toolCallId);
         break;
       default:
         break;
@@ -963,7 +1138,10 @@ export class AcpSession implements SessionHandle {
     update: acp.SessionUpdate, scheduled: boolean, commentary = false,
   ): void {
     const normalized = normalizeSessionUpdate(update,
-      scheduled ? { redactText: SCHEDULED_LOOP_REDACTION }
+      scheduled ? {
+        redactText: SCHEDULED_LOOP_REDACTION,
+        redactToolCallId: 'scheduled-loop-tool',
+      }
         : commentary ? { redactText: OWNER_COMMENTARY_REDACTION } : {});
     this.conversation.appendSafe({
       kind: normalized.kind,
