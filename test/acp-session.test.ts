@@ -24,6 +24,7 @@ async function start(
   extra: {
     modeId?: string; env?: Record<string, string>; log?(line: string): void;
     cancelGraceMs?: number;
+    afterToolBoundaryTimeoutMs?: number;
     permissionMode?: { fleetMode: 'ask' | 'auto' | 'allow'; nativeMode: string };
   } = {},
 ) {
@@ -41,6 +42,8 @@ async function start(
     permissionMode: extra.permissionMode,
     log: extra.log ?? (() => {}),
     ...(extra.cancelGraceMs !== undefined ? { cancelGraceMs: extra.cancelGraceMs } : {}),
+    ...(extra.afterToolBoundaryTimeoutMs !== undefined
+      ? { afterToolBoundaryTimeoutMs: extra.afterToolBoundaryTimeoutMs } : {}),
   });
 }
 
@@ -428,6 +431,170 @@ describe('AcpSession', () => {
     await session.interrupt();
     expect(await active).toMatchObject({ outcome: 'cancelled', cancellationSource: 'local-console' });
     session.setControllerAttached(false);
+    await session.close();
+  });
+
+  it('defers an after_tool wake until terminal ACP tool evidence, then steers without cancellation', async () => {
+    const session = await start();
+    const active = session.submitPrompt('toolwait 120');
+    for (let i = 0; i < 50 && !session.eventsSince(0)
+      .some(event => event.kind === 'tool_call' && event.status === 'in_progress'); i++)
+      await new Promise(resolve => setTimeout(resolve, 5));
+
+    const delivered = await session.submitPromptAfterTool('safe wake', {
+      origin: { kind: 'fleet-monitor' }, steer: true,
+    });
+    expect(delivered).toMatchObject({
+      accepted: true, detail: 'injected',
+      safeBoundary: { state: 'after_tool', activeToolCount: 0 },
+    });
+    expect(session.eventsSince(0).filter(event => event.kind === 'monitor_delivery')
+      .map(event => event.status)).toEqual(['deferred', 'after_tool']);
+    expect(session.eventsSince(0).some(event =>
+      event.kind === 'turn_stop' && event.cancellationSource === 'fleet-monitor')).toBe(false);
+    expect(await active).toMatchObject({ outcome: 'completed' });
+
+    const ledger = readFileSync(join(dirs.at(-1)!, '.conversation', 'events-000001.jsonl'), 'utf8')
+      .trim().split('\n').map(line => JSON.parse(line));
+    const toolCompleted = ledger.findIndex(event =>
+      event.kind === 'tool.upsert' && event.payload?.status === 'completed');
+    const boundary = ledger.findIndex(event =>
+      event.kind === 'monitor.delivery' && event.payload?.state === 'after_tool');
+    expect(toolCompleted).toBeGreaterThanOrEqual(0);
+    expect(boundary).toBeGreaterThan(toolCompleted);
+    expect(JSON.stringify(ledger.filter(event => event.kind === 'monitor.delivery')))
+      .not.toContain('safe wake');
+    await session.close();
+  });
+
+  it('steers an after_tool wake directly when no tool or permission is active', async () => {
+    const session = await start();
+    const result = await session.submitPromptAfterTool('idle wake', {
+      origin: { kind: 'fleet-monitor' }, steer: true,
+    });
+    expect(result).toMatchObject({
+      accepted: true, detail: 'startedNewTurn',
+      safeBoundary: { state: 'direct', waitedMs: 0, activeToolCount: 0 },
+    });
+    expect(session.eventsSince(0).some(event => event.kind === 'monitor_delivery'
+      && event.status === 'direct')).toBe(true);
+    await session.close();
+  });
+
+  it('never settles a pending permission for after_tool and waits through its reserved tool', async () => {
+    const session = await start('ask');
+    session.setControllerAttached(true);
+    const active = session.submitPrompt('permission');
+    for (let i = 0; i < 50 && session.snapshot().readiness !== 'awaiting_permission'; i++)
+      await new Promise(resolve => setTimeout(resolve, 5));
+    const permission = session.eventsSince(0).find(event =>
+      event.kind === 'permission' && event.status === 'pending')!;
+    let delivered = false;
+    const wake = session.submitPromptAfterTool('permission-safe wake', {
+      origin: { kind: 'fleet-monitor' }, steer: true,
+    }).then(result => { delivered = true; return result; });
+    await new Promise(resolve => setTimeout(resolve, 30));
+    expect(delivered).toBe(false);
+    expect(session.eventsSince(0).filter(event =>
+      event.kind === 'permission' && event.status === 'completed')).toHaveLength(0);
+    const allow = permission.options!.find(option => option.kind.startsWith('allow'))!;
+    expect(session.respondPermission(permission.permissionId!, allow.optionId)).toBe(true);
+    expect(await active).toMatchObject({ outcome: 'completed' });
+    expect(await wake).toMatchObject({ safeBoundary: { state: 'after_tool' } });
+    expect(session.eventsSince(0)).toContainEqual(expect.objectContaining({
+      kind: 'permission', status: 'completed', decision: 'allowed', decisionSource: 'manual',
+    }));
+    session.setControllerAttached(false);
+    await session.close();
+  });
+
+  it('releases a denied permission reservation and steers without adding an automatic decision', async () => {
+    const session = await start('ask');
+    session.setControllerAttached(true);
+    const active = session.submitPrompt('permission');
+    for (let i = 0; i < 50 && session.snapshot().readiness !== 'awaiting_permission'; i++)
+      await new Promise(resolve => setTimeout(resolve, 5));
+    const permission = session.eventsSince(0).find(event =>
+      event.kind === 'permission' && event.status === 'pending')!;
+    const wake = session.submitPromptAfterTool('denied-permission wake', {
+      origin: { kind: 'fleet-monitor' }, steer: true,
+    });
+    const reject = permission.options!.find(option => option.kind.startsWith('reject'))!;
+    expect(session.respondPermission(permission.permissionId!, reject.optionId)).toBe(true);
+    expect(await active).toMatchObject({ outcome: 'completed' });
+    expect(await wake).toMatchObject({ safeBoundary: { state: 'after_tool' } });
+    const settled = session.eventsSince(0).filter(event =>
+      event.kind === 'permission' && event.status === 'completed');
+    expect(settled).toEqual([expect.objectContaining({
+      decision: 'denied', decisionSource: 'manual',
+    })]);
+    session.setControllerAttached(false);
+    await session.close();
+  });
+
+  it('queues multiple after_tool wakes on one tool boundary without cancellation', async () => {
+    const session = await start();
+    const active = session.submitPrompt('toolwait 100');
+    for (let i = 0; i < 50 && !session.eventsSince(0)
+      .some(event => event.kind === 'tool_call' && event.status === 'in_progress'); i++)
+      await new Promise(resolve => setTimeout(resolve, 5));
+    const first = session.submitPromptAfterTool('first safe wake', {
+      origin: { kind: 'fleet-monitor' }, steer: true,
+    });
+    const second = session.submitPromptAfterTool('second safe wake', {
+      origin: { kind: 'fleet-monitor' }, steer: true,
+    });
+    const results = await Promise.all([first, second]);
+    expect(results).toEqual([
+      expect.objectContaining({ safeBoundary: expect.objectContaining({ state: 'after_tool' }) }),
+      expect.objectContaining({ safeBoundary: expect.objectContaining({ state: 'after_tool' }) }),
+    ]);
+    expect(session.eventsSince(0).filter(event => event.kind === 'agent_text'
+      && event.text?.startsWith('steer:')).map(event => event.text)).toEqual([
+      'steer:first safe wake', 'steer:second safe wake',
+    ]);
+    expect(session.eventsSince(0).some(event => event.cancellationSource === 'fleet-monitor')).toBe(false);
+    await active;
+    await session.close();
+  });
+
+  it('uses visible non-cancelling steering when an active tool exceeds the after_tool bound', async () => {
+    const session = await start('allow', { afterToolBoundaryTimeoutMs: 40 });
+    const active = session.submitPrompt('late');
+    for (let i = 0; i < 50 && !session.eventsSince(0)
+      .some(event => event.kind === 'tool_call' && event.status === 'in_progress'); i++)
+      await new Promise(resolve => setTimeout(resolve, 5));
+    const wake = await session.submitPromptAfterTool('timeout wake', {
+      origin: { kind: 'fleet-monitor' }, steer: true,
+    });
+    expect(wake).toMatchObject({
+      accepted: true, detail: 'injected',
+      safeBoundary: { state: 'timeout', activeToolCount: 1 },
+    });
+    expect(session.eventsSince(0)).toContainEqual(expect.objectContaining({
+      kind: 'monitor_delivery', status: 'timeout', activeToolCount: 1,
+    }));
+    expect(session.eventsSince(0).some(event => event.kind === 'permission'
+      && event.decisionSource === 'automatic')).toBe(false);
+    await session.interrupt('owner');
+    expect(await active).toMatchObject({ outcome: 'cancelled', cancellationSource: 'owner' });
+    await session.close();
+  });
+
+  it('lets an explicit human interrupt bypass an after_tool wait immediately', async () => {
+    const session = await start('allow', { afterToolBoundaryTimeoutMs: 2_000 });
+    const active = session.submitPrompt('late');
+    for (let i = 0; i < 50 && !session.eventsSince(0)
+      .some(event => event.kind === 'tool_call' && event.status === 'in_progress'); i++)
+      await new Promise(resolve => setTimeout(resolve, 5));
+    const wake = session.submitPromptAfterTool('wake after owner interrupt', {
+      origin: { kind: 'fleet-monitor' }, steer: true,
+    });
+    await session.interrupt('local-console');
+    expect(await active).toMatchObject({ outcome: 'cancelled', cancellationSource: 'local-console' });
+    expect(await wake).toMatchObject({ safeBoundary: { state: 'after_tool' } });
+    expect(session.eventsSince(0).filter(event => event.kind === 'turn_stop'
+      && event.cancellationSource === 'fleet-monitor')).toHaveLength(0);
     await session.close();
   });
 

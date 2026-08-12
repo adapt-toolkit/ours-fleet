@@ -637,18 +637,33 @@ export async function runOnce(
         // and closes the session before the wake turn can run. During startup,
         // steer into the live turn instead; after it completes, honor the
         // configured interrupt policy normally.
-        const interrupt = options?.interrupt === true && acpStartupComplete;
-        const result = await arbiter!.submitPrompt(text, {
-          ...options, interrupt, steer: true,
+        const policy = options?.interrupt;
+        const interrupt = policy === true && acpStartupComplete;
+        const promptOptions = {
+          interrupt, steer: true,
           ...(interrupt ? { interruptSource: 'fleet-monitor' as const } : {}),
-          origin: { kind: 'fleet-monitor' },
-        });
+          origin: { kind: 'fleet-monitor' as const },
+        };
+        // Startup is already a protected boundary: as with immediate mode,
+        // steer rather than waiting on/cancelling the runner-owned first turn.
+        const result = policy === 'after_tool' && acpStartupComplete
+          ? await arbiter!.submitPromptAfterTool(text, promptOptions)
+          : await arbiter!.submitPrompt(text, promptOptions);
         const steered = result.accepted
           && (result.detail === 'injected' || result.detail === 'startedNewTurn');
+        const boundary = result.safeBoundary;
+        const boundaryDetail = boundary
+          ? boundary.state === 'timeout'
+            ? `after_tool timed out after ${boundary.waitedMs}ms; steered without cancellation`
+            : boundary.state === 'unsupported'
+              ? 'after_tool unsupported; used non-cancelling queued delivery'
+              : `after_tool ${boundary.state} delivery after ${boundary.waitedMs}ms`
+          : result.detail;
         return {
           succeeded: result.succeeded || steered,
           outcome: steered ? result.detail! : result.outcome,
-          detail: result.detail,
+          detail: boundaryDetail,
+          ...(boundary ? { safeBoundary: boundary.state } : {}),
         };
       },
     };

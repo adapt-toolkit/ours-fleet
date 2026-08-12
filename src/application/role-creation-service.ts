@@ -4,7 +4,7 @@ import { isAbsolute, relative } from 'node:path';
 import {
   loadConfig, NOTIFY_EVENT_TYPES, resolveMonitorConfig, resolveRoleModel,
   resolvePermissions, ROLE_NAME_RE, validateMonitorConfig,
-  type CommonPermissions, type MonitorConfig, type NotifyEventType,
+  type CommonPermissions, type MonitorConfig, type MonitorInterrupt, type NotifyEventType,
 } from '../config.js';
 import {
   daemonIdentityProvisioner,
@@ -46,7 +46,7 @@ export interface CreateRoleSessionRequest {
 export type WebCreationMonitor =
   | { mode: 'native' }
   | {
-    mode: 'fleet'; interrupt: boolean; wake_sources: NotifyEventType[];
+    mode: 'fleet'; interrupt: MonitorInterrupt; wake_sources: NotifyEventType[];
     batch_ms: number; inject: 'notification';
   };
 

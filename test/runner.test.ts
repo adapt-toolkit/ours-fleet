@@ -761,6 +761,35 @@ describe('runOnce ACP startup outcome (1.2)', () => {
     expect(events).not.toContain('"stopReason":"cancelled"');
     expect(events).toContain('"kind":"turn_stop"');
   });
+
+  it('steers after_tool directly during ACP startup without waiting or cancelling', async () => {
+    writeCfg({ A: {
+      harness: 'fake-acp',
+      session: 'acp',
+      monitor: { mode: 'fleet', interrupt: 'after_tool' },
+      env: { ACP_FIXTURE_EXIT_AFTER: '1', ACP_FIXTURE_PROMPT_DELAY_MS: '100' },
+    } });
+    const d = agentDir('A');
+    mkdirSync(d, { recursive: true });
+    const { deps } = acpDeps();
+    let wakeOutcome: string | undefined;
+    deps.createMonitor = opts => ({
+      prime: async () => {},
+      run: async () => {
+        const result = await opts.deps.delivery!.submit(
+          'after_tool wake during startup', { interrupt: 'after_tool' });
+        wakeOutcome = result.outcome;
+      },
+      stop: () => {},
+    });
+
+    await runOnce('A', {}, deps);
+    expect(['injected', 'startedNewTurn']).toContain(wakeOutcome);
+    const events = readFileSync(join(d, '.session-events.jsonl'), 'utf8');
+    expect(events).not.toContain('"kind":"monitor_delivery"');
+    expect(events).not.toContain('"cancellationSource":"fleet-monitor"');
+    expect(events).not.toContain('"stopReason":"cancelled"');
+  });
 });
 
 describe('runOnce monitor integration', () => {

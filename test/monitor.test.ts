@@ -680,6 +680,66 @@ describe('Monitor.run — delivery', () => {
     }]);
   });
 
+  it('passes after_tool through ACP and commits the cursor only after safe delivery completes', async () => {
+    const tmux = fakeTmux();
+    const { fetch } = scriptedFetch([
+      { cursor: 1, events: [] },
+      { cursor: 2, events: [{ event: 'message_received', from: 'C', msg_id: 12 }] },
+    ]);
+    let completed = false;
+    const deps = makeDeps(fetch, tmux, {
+      delivery: {
+        submit: async (_text, options) => {
+          expect(options?.interrupt).toBe('after_tool');
+          expect(readFileSync(join(dir, '.notify-cursor'), 'utf8').trim()).toBe('1');
+          completed = true;
+          mon.stop();
+          return {
+            succeeded: true, outcome: 'injected',
+            detail: 'after_tool delivery after 25ms', safeBoundary: 'after_tool',
+          };
+        },
+      },
+    });
+    let mon: ReturnType<typeof createMonitor>;
+    mon = createMonitor({
+      name: 'A', agentDir: dir, cfg: CFG({ batch_ms: 0, interrupt: 'after_tool' }), deps,
+    });
+    await mon.prime();
+    await mon.run(1);
+    expect(completed).toBe(true);
+    expect(readFileSync(join(dir, '.notify-cursor'), 'utf8').trim()).toBe('2');
+    expect(readFileSync(join(dir, '.monitor-status'), 'utf8')).toMatch(/^armed/);
+  });
+
+  it('keeps timeout fallback visible after accepting the non-cancelling wake', async () => {
+    const { fetch } = scriptedFetch([
+      { cursor: 1, events: [] },
+      { cursor: 2, events: [{ event: 'message_received', from: 'C', msg_id: 13 }] },
+    ]);
+    const deps = makeDeps(fetch, fakeTmux(), {
+      delivery: {
+        submit: async () => {
+          mon.stop();
+          return {
+            succeeded: true, outcome: 'injected',
+            detail: 'after_tool timed out after 120000ms; steered without cancellation',
+            safeBoundary: 'timeout',
+          };
+        },
+      },
+    });
+    let mon: ReturnType<typeof createMonitor>;
+    mon = createMonitor({
+      name: 'A', agentDir: dir, cfg: CFG({ batch_ms: 0, interrupt: 'after_tool' }), deps,
+    });
+    await mon.prime();
+    await mon.run(1);
+    expect(readFileSync(join(dir, '.notify-cursor'), 'utf8').trim()).toBe('2');
+    expect(readFileSync(join(dir, '.monitor-status'), 'utf8'))
+      .toContain('degraded: safe-boundary');
+  });
+
   it('interrupts for second-and-later ACP wakes while earlier wake work is active', async () => {
     const submitted: Array<{ text: string; interrupt?: boolean }> = [];
     const { fetch } = scriptedFetch([
@@ -777,6 +837,36 @@ describe('Monitor.run — delivery', () => {
     await mon.run(1);
     expect(keys[0]).toBe('C-c');
     expect(tmux.sent).toHaveLength(1);
+  });
+
+  it('never sends C-c for after_tool on tmux and reports the conservative fallback', async () => {
+    const tmux = fakeTmux();
+    const keys: string[] = [];
+    const originalSendKey = tmux.sendKey;
+    tmux.sendKey = async (name, key) => {
+      keys.push(key);
+      await originalSendKey(name, key);
+    };
+    const { fetch } = scriptedFetch([
+      { cursor: 1, events: [] },
+      { cursor: 2, events: [{ event: 'message_received', from: 'C', msg_id: 14 }] },
+    ]);
+    const originalSendText = tmux.sendText;
+    tmux.sendText = async (name, text) => {
+      await originalSendText(name, text);
+      mon.stop();
+    };
+    let mon: ReturnType<typeof createMonitor>;
+    mon = createMonitor({
+      name: 'A', agentDir: dir, cfg: CFG({ batch_ms: 0, interrupt: 'after_tool' }),
+      deps: makeDeps(fetch, tmux),
+    });
+    await mon.prime();
+    await mon.run(1);
+    expect(keys).not.toContain('C-c');
+    expect(tmux.sent).toHaveLength(1);
+    expect(readFileSync(join(dir, '.monitor-status'), 'utf8'))
+      .toContain('after_tool unsupported by tmux');
   });
 
   it('injects one notification line for a filtered wake and advances the cursor', async () => {

@@ -238,6 +238,16 @@ createInterface({ input: process.stdin }).on('line', line => {
       } else if (/\brich\b/i.test(text)) {
         emitRichTurn(text);
         answerPrompt(message.id, stopReasonFor(text));
+      } else if (/\btoolwait(?:\s+(\d+))?\b/i.test(text)) {
+        const delay = Number(/\btoolwait(?:\s+(\d+))?\b/i.exec(text)?.[1] ?? 100);
+        update({
+          sessionUpdate: 'tool_call', toolCallId: 'wait-tool', title: 'Wait fixture tool',
+          kind: 'execute', status: 'in_progress',
+        });
+        setTimeout(() => {
+          update({ sessionUpdate: 'tool_call_update', toolCallId: 'wait-tool', status: 'completed' });
+          setTimeout(() => answerPrompt(message.id, stopReasonFor(text)), 20);
+        }, delay);
       } else if (/\blate\b/i.test(text)) {
         // Start a tool, then wait: only session/cancel releases this prompt,
         // and the cancel path emits the late updates first.

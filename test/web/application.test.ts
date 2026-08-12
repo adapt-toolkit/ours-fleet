@@ -240,6 +240,15 @@ roles:
       mode: 'fleet', batch_ms: 25, wake_sources: ['state_import_failed'],
     });
     expect(explicit.provenance.monitor).toBe('request');
+    const safeBoundary = await service.preview({
+      ...base,
+      monitor: {
+        mode: 'fleet', interrupt: 'after_tool', batch_ms: 25, inject: 'notification',
+        wake_sources: ['message_received'],
+      },
+    });
+    expect(safeBoundary.request.monitor).toMatchObject({ interrupt: 'after_tool' });
+    expect(safeBoundary.effective.monitor.interrupt).toBe('after_tool');
     await expect(service.preview({
       ...base, monitor: { mode: 'fleet', wake_sources: ['not_real'] },
     } as any)).rejects.toMatchObject({ code: 'invalid_request' });

@@ -50,6 +50,12 @@ export interface TurnResult {
   cancellationSource?: TurnCancellationSource;
   /** Final assistant text captured structurally by a backend, when available. */
   output?: string;
+  /** Body-free monitor safe-boundary disposition, when this was an after_tool wake. */
+  safeBoundary?: {
+    state: 'direct' | 'after_tool' | 'timeout' | 'unsupported';
+    waitedMs: number;
+    activeToolCount: number;
+  };
 }
 
 /**
@@ -191,6 +197,7 @@ export type SessionEventKind =
   | 'tool_call'
   | 'tool_update'
   | 'permission'
+  | 'monitor_delivery'
   | 'turn_stop'
   | 'error';
 
@@ -232,6 +239,10 @@ export interface SessionEvent {
   reason?: string;
   /** The option actually selected, when one was. */
   optionId?: string;
+  /** Body-free evidence for monitor safe-boundary delivery. */
+  monitorPolicy?: 'after_tool';
+  activeToolCount?: number;
+  waitedMs?: number;
 }
 
 export interface ConversationHandlePage {
@@ -260,6 +271,8 @@ export interface SessionHandle {
   queuePrompt(text: string, options?: SubmitPromptOptions): Promise<QueuedPrompt>;
   /** Queue a prompt and wait for its terminal result. */
   submitPrompt(text: string, options?: SubmitPromptOptions): Promise<TurnResult>;
+  /** Monitor-only ACP safe-boundary delivery. Never implies human/control cancellation. */
+  submitPromptAfterTool?(text: string, options?: SubmitPromptOptions): Promise<TurnResult>;
   interrupt(source?: TurnCancellationSource): Promise<void>;
   respondPermission(permissionId: string, optionId: string): boolean;
   /** Generation-bound browser decision; stale/settled/invalid all fail closed. */

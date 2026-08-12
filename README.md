@@ -338,7 +338,7 @@ roles:
     coordinator: FleetCoordinator       # announce target on boot
     monitor:
       mode: fleet                       # fleet = ours-fleet supervisor; native = harness monitor
-      interrupt: false                  # true cancels active work before every configured wake
+      interrupt: false                  # false queues; true cancels; after_tool steers at an ACP tool boundary
       wake_sources:                     # which daemon events wake the console (default:
         - message_received              #   message_received, file_received,
         - file_received                 #   local_contact_request, pending_message)
@@ -579,6 +579,13 @@ Set `monitor.interrupt: true` on roles where every configured wake should cancel
 the active turn before the notification is delivered. This is intentionally
 content-blind: the supervisor cannot inspect encrypted message bodies, so all
 events selected by `wake_sources` receive the same interrupt policy.
+Set `monitor.interrupt: after_tool` when a wake must preserve an in-flight ACP
+tool result or pending permission. Fleet waits for terminal ACP tool/update
+evidence, then steers the wake without calling `session.cancel`. If the tool is
+still active after 120 seconds, or the adapter cannot expose authenticated tool
+boundaries/steering, fleet visibly degrades to non-cancelling steering or queued
+delivery. Tmux never receives `C-c` for `after_tool`. Explicit human and control
+interrupts remain immediate.
 The default is `false`: a role that must begin a post-readiness mission
 immediately, including second-and-later mail received while it is working, must
 set `monitor.mode: fleet` and `monitor.interrupt: true` explicitly. Readiness and

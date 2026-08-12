@@ -16,6 +16,7 @@ export type ConversationEventKind =
   | 'plan.replace'
   | 'tool.upsert' | 'tool.content_chunk'
   | 'permission.requested' | 'permission.resolved'
+  | 'monitor.delivery'
   | 'usage.updated'
   | 'turn.state' | 'turn.completed'
   | 'session.state' | 'session.info' | 'capabilities.updated'
@@ -196,6 +197,14 @@ export interface PermissionResolvedPayload {
   reason?: string;
 }
 
+/** Body-free monitor evidence. Tool ids, titles, output, and wake text are never stored. */
+export interface MonitorDeliveryPayload {
+  policy: 'after_tool';
+  state: 'deferred' | 'direct' | 'after_tool' | 'timeout' | 'unsupported';
+  activeToolCount: number;
+  waitedMs: number;
+}
+
 export interface TurnStatePayload {
   state: 'queued' | 'running' | 'awaiting_permission' | 'interrupt_requested';
 }
@@ -230,6 +239,7 @@ export type ConversationPayload =
   | CapabilitiesUpdatedPayload | UnsupportedPayload | PromptAdmittedPayload
   | PromptStartedPayload | PromptInterruptRequestedPayload | PermissionRequestedPayload
   | PermissionResolvedPayload | TurnStatePayload | TurnCompletedPayload
+  | MonitorDeliveryPayload
   | SessionLifecyclePayload | ErrorPayload;
 
 // ── The durable event ────────────────────────────────────────────────────────

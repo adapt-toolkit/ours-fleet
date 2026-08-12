@@ -175,7 +175,7 @@ test('bootstrap, inventory, live navigation, send, create, and security boundari
   await expect(page.getByLabel('Monitor injection').locator('option')).toHaveText('Notification summary');
   await page.getByLabel('Monitor batch milliseconds').fill('750');
   await page.getByLabel('Monitor wake sources').getByText('inbound error').click();
-  await page.getByText('Interrupt an active turn before wake delivery').click();
+  await page.getByLabel('Monitor interruption').selectOption('true');
   await page.getByRole('button', { name: 'Review effective plan' }).click();
   const effectivePlan = page.locator('.review');
   await expect(effectivePlan.getByText('Effective plan')).toBeVisible();

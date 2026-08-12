@@ -10,7 +10,7 @@ interface FakeAgent {
 function fakeSession(agent: FakeAgent, overrides: Record<string, unknown> = {}): AcpSession {
   const session = Object.create(AcpSession.prototype) as AcpSession;
   Object.assign(session as unknown as Record<string, unknown>, {
-    options: { name: 'A' },
+    options: { name: 'A', afterToolBoundaryTimeoutMs: 20 },
     child: { exitCode: null, killed: false },
     connection: { agent },
     sessionId: 'session-1',
@@ -18,7 +18,10 @@ function fakeSession(agent: FakeAgent, overrides: Record<string, unknown> = {}):
     lastError: undefined,
     promptTail: Promise.resolve(),
     steeringSupported: true,
+    closing: false,
     pendingPermissions: new Map(),
+    activeToolCalls: new Set(),
+    toolBoundaryWaiters: new Set(),
     events: { emit: () => {} },
     sessionGeneration: 'gen-test',
     conversation: {
@@ -68,6 +71,27 @@ describe('AcpSession live delivery', () => {
 
     expect(result).toMatchObject({ accepted: true, outcome: 'completed' });
     expect(requests).toEqual(['session/prompt']);
+  });
+
+  it('degrades after_tool to non-cancelling queued delivery without steering support', async () => {
+    const calls: string[] = [];
+    const session = fakeSession({
+      request: async method => {
+        calls.push(method);
+        return { stopReason: 'end_turn' };
+      },
+      notify: async method => { calls.push(method); },
+    }, { steeringSupported: false });
+
+    const result = await session.submitPromptAfterTool('compatible wake', {
+      origin: { kind: 'fleet-monitor' }, steer: true,
+    });
+
+    expect(result).toMatchObject({
+      accepted: true, outcome: 'completed',
+      safeBoundary: { state: 'unsupported', activeToolCount: 0 },
+    });
+    expect(calls).toEqual(['session/prompt']);
   });
 
   it('cancels first, then acknowledges interrupting delivery when its turn starts', async () => {

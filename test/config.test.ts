@@ -561,9 +561,20 @@ describe('loadConfig monitor', () => {
     expect(findRole(cfg, 'B').monitor.interrupt).toBe(false);
   });
 
-  it('rejects a non-boolean monitor.interrupt', () => {
+  it('accepts and inherits monitor.interrupt after_tool without coercing legacy booleans', () => {
+    base(
+      'defaults:\n  monitor:\n    interrupt: after_tool\nroles:\n  A: {}\n  B:\n'
+      + '    monitor:\n      interrupt: true\n  C:\n    monitor:\n      interrupt: false\n',
+    );
+    const cfg = loadConfig();
+    expect(findRole(cfg, 'A').monitor.interrupt).toBe('after_tool');
+    expect(findRole(cfg, 'B').monitor.interrupt).toBe(true);
+    expect(findRole(cfg, 'C').monitor.interrupt).toBe(false);
+  });
+
+  it('rejects an unknown monitor.interrupt mode', () => {
     base('roles:\n  A:\n    monitor:\n      interrupt: always\n');
-    expect(() => loadConfig()).toThrowError(/monitor\.interrupt.*true or false/);
+    expect(() => loadConfig()).toThrowError(/monitor\.interrupt.*true.*false.*after_tool/);
   });
 
   it('accepts a role wake_sources subset', () => {
