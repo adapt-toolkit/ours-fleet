@@ -24,8 +24,18 @@ import type {
 interface PendingPermission {
   options: Array<{ optionId: string; kind: string }>;
   resolve(response: acp.RequestPermissionResponse): void;
+  /** Real ACP ID used only for lifecycle tracking; never emit this for scheduled loops. */
   toolCallId?: string;
+  /** Public/ledger ID, redacted for scheduled loops. */
+  eventToolCallId?: string;
   expiry?: ReturnType<typeof setTimeout>;
+}
+
+interface ActiveToolCall {
+  /** An authenticated non-terminal tool update has been observed. */
+  lifecycle: boolean;
+  /** Permission request ID -> whether its selected outcome allows the tool to proceed. */
+  permissions: Map<string, 'pending' | 'allowed'>;
 }
 
 interface SteeringResponse {
@@ -160,8 +170,8 @@ export class AcpSession implements SessionHandle {
   /** Armed when the last controller detaches; unattended policy applies on fire. */
   private controllerGrace?: ReturnType<typeof setTimeout>;
   private cancelEscalation?: ReturnType<typeof setTimeout>;
-  /** ACP-authenticated in-flight calls, including permission-reserved calls. */
-  private readonly activeToolCalls = new Set<string>();
+  /** ACP-authenticated in-flight calls, including independently reserved permissions. */
+  private readonly activeToolCalls = new Map<string, ActiveToolCall>();
   private readonly toolBoundaryWaiters = new Set<() => void>();
   private activeTurn?: {
     id: string; output: string; origin?: SubmitPromptOptions['origin'];
@@ -292,14 +302,49 @@ export class AcpSession implements SessionHandle {
     };
   }
 
+  private toolCall(toolCallId: string): ActiveToolCall {
+    const existing = this.activeToolCalls.get(toolCallId);
+    if (existing) return existing;
+    const created: ActiveToolCall = { lifecycle: false, permissions: new Map() };
+    this.activeToolCalls.set(toolCallId, created);
+    return created;
+  }
+
   private reserveTool(toolCallId: string | undefined): void {
-    if (toolCallId) this.activeToolCalls.add(toolCallId);
+    if (toolCallId) this.toolCall(toolCallId).lifecycle = true;
+  }
+
+  private reservePermission(toolCallId: string | undefined, permissionId: string): void {
+    if (toolCallId) this.toolCall(toolCallId).permissions.set(permissionId, 'pending');
+  }
+
+  private allowPermission(toolCallId: string | undefined, permissionId: string): void {
+    if (!toolCallId) return;
+    const permission = this.activeToolCalls.get(toolCallId)?.permissions;
+    if (permission?.has(permissionId)) permission.set(permissionId, 'allowed');
+  }
+
+  private releasePermission(toolCallId: string | undefined, permissionId: string): void {
+    const call = toolCallId && this.activeToolCalls.get(toolCallId);
+    if (!call || !call.permissions.delete(permissionId)) return;
+    this.releaseToolIfIdle(toolCallId, call);
   }
 
   private releaseTool(toolCallId: string | undefined): void {
-    if (!toolCallId || !this.activeToolCalls.delete(toolCallId)) return;
-    if (this.activeToolCalls.size === 0)
-      for (const notify of [...this.toolBoundaryWaiters]) notify();
+    const call = toolCallId && this.activeToolCalls.get(toolCallId);
+    if (!call) return;
+    call.lifecycle = false;
+    // Terminal tool evidence consumes permissions already granted for this
+    // call, but never a separate request that is still awaiting a decision.
+    for (const [permissionId, state] of call.permissions)
+      if (state === 'allowed') call.permissions.delete(permissionId);
+    this.releaseToolIfIdle(toolCallId, call);
+  }
+
+  private releaseToolIfIdle(toolCallId: string, call: ActiveToolCall): void {
+    if (call.lifecycle || call.permissions.size > 0) return;
+    if (!this.activeToolCalls.delete(toolCallId) || this.activeToolCalls.size > 0) return;
+    for (const notify of [...this.toolBoundaryWaiters]) notify();
   }
 
   private releaseAllTools(): void {
@@ -545,7 +590,8 @@ export class AcpSession implements SessionHandle {
     if (pending.expiry) clearTimeout(pending.expiry);
     pending.resolve({ outcome: { outcome: 'selected', optionId } });
     const decision = chosen.kind.startsWith('reject') ? 'denied' : 'allowed';
-    if (decision !== 'allowed') this.releaseTool(pending.toolCallId);
+    if (decision === 'allowed') this.allowPermission(pending.toolCallId, permissionId);
+    else this.releasePermission(pending.toolCallId, permissionId);
     this.events.emit('permission', {
       turnId: this.activeTurn?.id,
       origin: this.activeTurn?.origin,
@@ -562,7 +608,7 @@ export class AcpSession implements SessionHandle {
       promptId: this.activeTurn?.id, turnId: this.activeTurn?.id,
       payload: { decision, decisionSource: 'manual', optionId },
     });
-    this.readiness = 'running';
+    this.readiness = this.pendingPermissions.size > 0 ? 'awaiting_permission' : 'running';
     return true;
   }
 
@@ -634,12 +680,12 @@ export class AcpSession implements SessionHandle {
       ? { outcome: { outcome: 'selected', optionId: rejectOption.optionId } }
       : { outcome: { outcome: 'cancelled' } });
     const settled = decision === 'denied' && !rejectOption ? 'cancelled' : decision;
-    this.releaseTool(pending.toolCallId);
+    this.releasePermission(pending.toolCallId, permissionId);
     this.events.emit('permission', {
       turnId: this.activeTurn?.id,
       origin: this.activeTurn?.origin,
       permissionId,
-      toolCallId: pending.toolCallId,
+      toolCallId: pending.eventToolCallId,
       status: 'completed',
       decision: settled === 'expired' ? 'cancelled' : settled,
       decisionSource: 'automatic',
@@ -651,7 +697,7 @@ export class AcpSession implements SessionHandle {
       kind: 'permission.resolved', sessionGeneration: this.sessionGeneration,
       acpSessionId: this.sessionId, permissionId,
       promptId: this.activeTurn?.id, turnId: this.activeTurn?.id,
-      toolCallId: pending.toolCallId,
+      toolCallId: pending.eventToolCallId,
       payload: {
         decision: settled, decisionSource: 'automatic',
         ...(policy ? { policy } : {}), reason,
@@ -867,15 +913,17 @@ export class AcpSession implements SessionHandle {
       return undefined;
     };
     const toolCallId = params.toolCall.toolCallId;
+    const permissionId = randomUUID();
     // Permission is part of the tool lifecycle. Reserve before any policy or
     // human decision so a monitor wake cannot slip between request and answer.
-    this.reserveTool(toolCallId);
+    this.reservePermission(toolCallId, permissionId);
     if (this.options.permissions.approval === 'allow' && this.withinAutomaticBoundary(params)) {
       const option = choose(['allow_always', 'allow_once']);
       const response = this.settleAutomatically(params, option, 'allowed',
         'permissions.approval=allow',
         `the request is inside the ${this.options.permissions.filesystem} boundary`);
-      if (!option) this.releaseTool(toolCallId);
+      if (option) this.allowPermission(toolCallId, permissionId);
+      else this.releasePermission(toolCallId, permissionId);
       return Promise.resolve(response);
     }
     // A live grace window still counts as attended: the controller may be
@@ -892,11 +940,10 @@ export class AcpSession implements SessionHandle {
         unattended
           ? 'no controller is attached, so the request cannot be shown to anyone'
           : 'the role denies every permission request by policy');
-      this.releaseTool(toolCallId);
+      this.releasePermission(toolCallId, permissionId);
       return Promise.resolve(response);
     }
 
-    const permissionId = randomUUID();
     const timeoutMs = this.options.permissionTimeoutMs ?? PERMISSION_TIMEOUT_MS;
     const expiresAt = new Date(Date.now() + timeoutMs).toISOString();
     this.readiness = 'awaiting_permission';
@@ -935,8 +982,8 @@ export class AcpSession implements SessionHandle {
     return new Promise(resolve => {
       const pending: PendingPermission = {
         options: params.options, resolve,
-        toolCallId: scheduledTurn(this.activeTurn)
-          ? 'scheduled-loop-tool' : params.toolCall.toolCallId,
+        toolCallId,
+        eventToolCallId: scheduledTurn(this.activeTurn) ? 'scheduled-loop-tool' : toolCallId,
       };
       pending.expiry = setTimeout(() => {
         this.settlePendingAutomatically(permissionId, pending, 'expired', undefined,

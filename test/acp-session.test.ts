@@ -532,6 +532,83 @@ describe('AcpSession', () => {
     await session.close();
   });
 
+  it('keeps after_tool deferred until every duplicate permission reservation settles', async () => {
+    const session = await start('ask');
+    session.setControllerAttached(true);
+    const active = session.submitPrompt('permission twice');
+    for (let i = 0; i < 50 && session.eventsSince(0)
+      .filter(event => event.kind === 'permission' && event.status === 'pending').length < 2; i++)
+      await new Promise(resolve => setTimeout(resolve, 5));
+    const permissions = session.eventsSince(0).filter(event =>
+      event.kind === 'permission' && event.status === 'pending');
+    expect(permissions).toHaveLength(2);
+
+    let delivered = false;
+    const wake = session.submitPromptAfterTool('duplicate-permission-safe wake', {
+      origin: { kind: 'fleet-monitor' }, steer: true,
+    }).then(result => { delivered = true; return result; });
+    const firstReject = permissions[0].options!.find(option => option.kind === 'reject_once')!;
+    expect(session.respondPermission(permissions[0].permissionId!, firstReject.optionId)).toBe(true);
+    await new Promise(resolve => setTimeout(resolve, 40));
+    const deliveredAfterFirst = delivered;
+    const snapshotAfterFirst = session.snapshot();
+
+    const secondReject = permissions[1].options!.find(option => option.kind === 'reject_once')!;
+    expect(session.respondPermission(permissions[1].permissionId!, secondReject.optionId)).toBe(true);
+    const wakeResult = await wake;
+    const activeResult = await active;
+
+    expect(deliveredAfterFirst).toBe(false);
+    expect(snapshotAfterFirst).toMatchObject({
+      readiness: 'awaiting_permission', pendingPermissionId: permissions[1].permissionId,
+    });
+    expect(wakeResult).toMatchObject({
+      safeBoundary: { state: 'after_tool', activeToolCount: 0 },
+    });
+    expect(session.eventsSince(0).some(event =>
+      event.kind === 'agent_text' && event.text === 'steer:duplicate-permission-safe wake')).toBe(true);
+    expect(session.eventsSince(0).some(event => event.cancellationSource === 'fleet-monitor')).toBe(false);
+    expect(activeResult).toMatchObject({ outcome: 'completed' });
+    session.setControllerAttached(false);
+    await session.close();
+  });
+
+  it('uses real scheduled-loop reservation IDs internally while emitting only redacted IDs', async () => {
+    const session = await start('ask');
+    session.setControllerAttached(true);
+    let activeCompleted = false;
+    const active = session.submitPrompt('permission linger 150', {
+      origin: { kind: 'scheduled-loop', loop: 'health', runId: 'scheduled_permission' },
+    }).then(result => { activeCompleted = true; return result; });
+    for (let i = 0; i < 50 && session.snapshot().readiness !== 'awaiting_permission'; i++)
+      await new Promise(resolve => setTimeout(resolve, 5));
+    const permission = session.eventsSince(0).find(event =>
+      event.kind === 'permission' && event.status === 'pending')!;
+    expect(permission).toMatchObject({
+      toolCallId: 'scheduled-loop-tool', title: 'Scheduled-loop permission requested',
+    });
+
+    const wake = session.submitPromptAfterTool('scheduled permission wake', {
+      origin: { kind: 'fleet-monitor' }, steer: true,
+    });
+    const reject = permission.options!.find(option => option.kind === 'reject_once')!;
+    expect(session.respondPermission(permission.permissionId!, reject.optionId)).toBe(true);
+    expect(await wake).toMatchObject({ safeBoundary: { state: 'after_tool', activeToolCount: 0 } });
+    expect(activeCompleted).toBe(false);
+
+    const sessionEvents = readFileSync(join(dirs.at(-1)!, '.session-events.jsonl'), 'utf8');
+    const conversationEvents = readFileSync(
+      join(dirs.at(-1)!, '.conversation', 'events-000001.jsonl'), 'utf8');
+    expect(sessionEvents).toContain('scheduled-loop-tool');
+    expect(conversationEvents).toContain('scheduled-loop-tool');
+    expect(sessionEvents).not.toContain('fixture-tool');
+    expect(conversationEvents).not.toContain('fixture-tool');
+
+    expect(await active).toMatchObject({ outcome: 'completed' });
+    session.setControllerAttached(false);
+    await session.close();
+  });
+
   it('queues multiple after_tool wakes on one tool boundary without cancellation', async () => {
     const session = await start();
     const active = session.submitPrompt('toolwait 100');
