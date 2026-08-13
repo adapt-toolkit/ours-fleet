@@ -552,19 +552,17 @@ describe('doctor permission translation (2.3)', () => {
     expect(c.detail).toContain('sandbox=danger-full-access');
   });
 
-  it('reports the actual codex-acp agent preset for allow + workspace', async () => {
+  it('reports the enforced codex-acp allow + workspace runtime', async () => {
     writeCfg('roles:\n  A:\n    harness: codex\n    session: acp\n'
       + '    permissions:\n      approval: allow\n      filesystem: workspace\n'
       + '      unattended: deny\n');
     const rep = await run();
     const c = check(rep, 'A');
     expect(c.ok).toBe(true);
-    expect(c.detail).toContain('mode=agent approval=on-request sandbox=workspace-write');
-    expect(c.detail).toContain('codex-acp 1.1.7');
-    expect(c.detail).not.toContain('(exact)');
+    expect(c.detail).toContain('mode=agent approval=never sandbox=workspace-write');
+    expect(c.detail).toContain('(exact)');
     const floor = rep.checks.find(candidate => candidate.name === 'unattended floor: A')!;
-    expect(floor.ok).toBe(false);
-    expect(floor.detail).toContain('MISSING');
+    expect(floor.ok).toBe(true);
     expect(floor.detail).toContain('workspace-edit');
   });
 

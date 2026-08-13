@@ -533,8 +533,12 @@ mode can cross.
 
 ACP exposes agent-specific session mode IDs and `session/set_mode`, but no
 portable permission-policy capability. Fleet uses that primitive where an
-adapter has a corresponding mode and otherwise translates at the adapter;
-live session metadata reports both normalized and harness-native modes.
+adapter has a corresponding mode and otherwise translates at the adapter. The
+bundled Codex ACP adapter couples approval and sandboxing in its advertised
+mode IDs, so fleet preserves the selected sandbox preset and enforces approval
+independently on the app-server turn request. Thus `allow` + `workspace` is
+actually `never` + `workspace-write`, never `danger-full-access`. Live session
+metadata reports the normalized policy and the ACP sandbox-preset ID.
 
 ### Isolation at creation time
 
