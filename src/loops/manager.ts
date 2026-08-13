@@ -15,6 +15,8 @@ export interface LoopManagerDeps {
   log(line: string): void;
   /** Persistence seam; defaults to the atomic replace. Tests inject write faults here. */
   writeState?: StateWriter;
+  /** Test seam for the post-cancellation abandon bound; production uses the default. */
+  cancelAbandonMs?: number;
 }
 
 /** The manager never sleeps longer than this, so one poll per minute is the floor rate. */
@@ -29,6 +31,14 @@ export function backoffMs(consecutiveFailures: number): number {
   const exponent = Math.min(Math.max(consecutiveFailures, 1) - 1, 6);
   return Math.min(POLL_CEILING_MS, 1_000 * 2 ** exponent);
 }
+
+/**
+ * How long a cancelled run may stay `active` before the loop stops believing it
+ * will ever settle. Deliberately longer than the session layer's own escalation
+ * (cancel grace + SIGTERM->SIGKILL grace), so this fires only when that recovery
+ * did not, and never races a run that is about to report honestly.
+ */
+const LOOP_CANCEL_ABANDON_MS = 60_000;
 
 export interface LoopActionResult {
   state: 'started' | 'skipped_busy' | 'disabled' | 'unavailable';
@@ -205,9 +215,16 @@ export class ScheduledLoopManager implements ScheduledLoopManagerHandle {
       this.runTimeouts.delete(timeout);
       if (state.activeRunId !== runId || this.stopping) return;
       this.deps.log(`[${this.role}] loop ${definition.name} timed out run=${runId.slice(0, 11)} after ${timeoutMs}ms; cancelling`);
-      void this.arbiter.interrupt('scheduled-loop').catch(error => {
+      void this.arbiter.interrupt('scheduled-loop').then(outcome => {
+        // Forced recovery IS a successful cancellation; record how it ended
+        // rather than reporting the interrupt itself as a failure.
+        if (outcome?.state === 'forced')
+          this.deps.log(`[${this.role}] loop ${definition.name} cancellation enforced `
+            + `run=${runId.slice(0, 11)} reason=${outcome.reasonCode ?? 'forced'}`);
+      }).catch(error => {
         this.deps.log(`[${this.role}] loop ${definition.name} timeout cancellation failed: ${(error as Error)?.name ?? 'Error'}`);
       });
+      this.armAbandon(definition, state, runId);
     }, timeoutMs);
     this.runTimeouts.add(timeout);
     void result.queued.completion.then(turn => {
@@ -216,6 +233,33 @@ export class ScheduledLoopManager implements ScheduledLoopManagerHandle {
       this.finish(definition, state, runId, turn);
     });
     return { state: 'started', runId };
+  }
+
+  /**
+   * Last resort for a run whose cancellation never settles. Without it a single
+   * unsettled turn keeps `activeRunId` set for the life of the process, and
+   * every later tick reports `skipped_busy` forever — the loop looks scheduled
+   * while nothing has run since. Releasing the slot is honest, and it is safe
+   * because `finish` still refuses to double-report a run it no longer owns.
+   */
+  private armAbandon(
+    definition: ResolvedRoleLoop, state: LoopRuntimeState, runId: string,
+  ): void {
+    const abandon = this.deps.setTimer(() => {
+      this.runTimeouts.delete(abandon);
+      if (state.activeRunId !== runId || this.stopping) return;
+      state.activeRunId = null;
+      state.lastFinishedAt = new Date(this.deps.now()).toISOString();
+      state.counts.failed = increment(state.counts.failed);
+      state.lastOutcome = 'abandoned_unsettled';
+      state.lastError = { kind: 'abandoned_unsettled', at: state.lastFinishedAt };
+      this.store.state.health = 'degraded';
+      this.store.state.anomaly = 'abandoned_unsettled';
+      this.store.persist();
+      this.deps.log(`[${this.role}] loop ${definition.name} abandoned run=${runId.slice(0, 11)}: `
+        + 'cancellation never settled');
+    }, this.deps.cancelAbandonMs ?? LOOP_CANCEL_ABANDON_MS);
+    this.runTimeouts.add(abandon);
   }
 
   private finish(

@@ -10,7 +10,7 @@ import { storedLoopHealth } from '../src/loops/state.js';
 import type { ScheduledLoopsFile, StateWriter } from '../src/loops/state.js';
 import { RoleTurnArbiter } from '../src/session/arbiter.js';
 import type {
-  ExitRecord, QueuedPrompt, SessionEvent, SessionHandle, SessionSnapshot,
+  ExitRecord, InterruptOutcome, QueuedPrompt, SessionEvent, SessionHandle, SessionSnapshot,
   SubmitPromptOptions, TurnCancellationSource, TurnResult,
 } from '../src/session/types.js';
 
@@ -39,7 +39,16 @@ class FakeSession implements SessionHandle {
   async submitPrompt(text: string, options?: SubmitPromptOptions) {
     return (await this.queuePrompt(text, options)).completion;
   }
-  async interrupt(source: TurnCancellationSource = 'local-console') { this.interrupts.push(source); }
+  /** Set to model an ACP adapter whose recovery force-fails the running turn. */
+  forceRecoveryOnInterrupt = false;
+  async interrupt(source: TurnCancellationSource = 'local-console'): Promise<InterruptOutcome> {
+    this.interrupts.push(source);
+    if (!this.forceRecoveryOnInterrupt) return { state: 'settled' };
+    // What AcpSession does once its cancel deadline expires: the adapter is
+    // killed, so every in-flight turn settles as failed before it answers.
+    this.finish({ accepted: false, outcome: 'failed', succeeded: false, detail: 'forced recovery' });
+    return { state: 'forced', reasonCode: 'ACP_CANCEL_DEADLINE_EXCEEDED' };
+  }
   respondPermission() { return false; }
   eventsSince(): SessionEvent[] { return []; }
   subscribe() { return () => undefined; }
@@ -87,7 +96,10 @@ function faultyDisk() {
   };
 }
 
-function setup(definitions = [definition()], initialNow = 0, writeState?: StateWriter) {
+function setup(
+  definitions = [definition()], initialNow = 0,
+  writeState?: StateWriter, cancelAbandonMs?: number,
+) {
   const dir = mkdtempSync(join(tmpdir(), 'ours-loop-manager-'));
   dirs.push(dir);
   let now = initialNow;
@@ -109,6 +121,7 @@ function setup(definitions = [definition()], initialNow = 0, writeState?: StateW
     clearTimer: timer => { (timer as { cleared: boolean }).cleared = true; },
     log: line => logs.push(line),
     writeState,
+    ...(cancelAbandonMs !== undefined ? { cancelAbandonMs } : {}),
   });
   const live = () => timers.filter(timer => !timer.cleared);
   return {
@@ -166,6 +179,64 @@ describe('ScheduledLoopManager strict cadence', () => {
     await Promise.resolve();
     expect(status.session.interrupts).toEqual(['scheduled-loop']);
     expect(status.logs.join('\n')).toContain('timed out');
+  });
+
+  it('releases the loop slot after a forced cancellation so the next tick runs again', async () => {
+    const status = setup([definition('health', { intervalMs: 10 * 60_000 })]);
+    status.manager.start();
+    status.setNow(60_000);
+    await status.manager.poll();
+    expect(status.manager.status().loops.health.activeRunId).toMatch(/^sl_/);
+
+    // The adapter ignored the cancel, so the session forced recovery: the turn
+    // is over, and the loop must record that instead of owning the slot forever.
+    status.session.forceRecoveryOnInterrupt = true;
+    status.timers.find(timer => timer.ms === 5 * 60_000 && !timer.cleared)!.callback();
+    await new Promise(resolve => setImmediate(resolve));
+    await new Promise(resolve => setImmediate(resolve));
+
+    expect(status.manager.status().loops.health).toMatchObject({
+      activeRunId: null, lastOutcome: 'failed', counts: { failed: 1 },
+    });
+    expect(status.logs.join('\n')).toContain('cancellation enforced');
+
+    // The decisive part: the very next due occurrence starts, rather than
+    // reporting skipped_busy for the rest of the process's life.
+    status.setNow(660_000);
+    await status.manager.poll();
+    expect(status.session.prompts).toHaveLength(2);
+    expect(status.manager.status().loops.health.activeRunId).toMatch(/^sl_/);
+    expect(status.manager.status().loops.health.counts.skippedBusy ?? 0).toBe(0);
+  });
+
+  it('abandons a run whose cancellation never settles, without double-reporting it', async () => {
+    const status = setup([definition('health', { intervalMs: 10 * 60_000 })], 0, undefined, 30_000);
+    status.manager.start();
+    status.setNow(60_000);
+    await status.manager.poll();
+    const runId = status.manager.status().loops.health.activeRunId;
+
+    // Nothing settles: not the turn, not the cancellation, not the recovery.
+    status.timers.find(timer => timer.ms === 5 * 60_000 && !timer.cleared)!.callback();
+    await new Promise(resolve => setImmediate(resolve));
+    expect(status.manager.status().loops.health.activeRunId).toBe(runId);
+
+    status.setNow(90_000);
+    status.timers.find(timer => timer.ms === 30_000 && !timer.cleared)!.callback();
+    expect(status.manager.status().loops.health).toMatchObject({
+      activeRunId: null, lastOutcome: 'abandoned_unsettled', counts: { failed: 1 },
+      lastError: { kind: 'abandoned_unsettled' },
+    });
+    expect(status.manager.status()).toMatchObject({
+      health: 'degraded', anomaly: 'abandoned_unsettled',
+    });
+
+    // A late completion for a run the loop no longer owns changes nothing.
+    status.session.finish({ accepted: false, outcome: 'failed', succeeded: false });
+    await new Promise(resolve => setImmediate(resolve));
+    expect(status.manager.status().loops.health).toMatchObject({
+      activeRunId: null, lastOutcome: 'abandoned_unsettled', counts: { failed: 1 },
+    });
   });
 
   it('clears an active scheduled-turn deadline when the manager stops', async () => {

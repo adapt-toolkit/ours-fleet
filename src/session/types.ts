@@ -86,6 +86,19 @@ export class SessionControlError extends Error {
 }
 
 /**
+ * How an explicit cancellation ended. Forced recovery is a SUCCESS: the turn is
+ * over and the session is being reclaimed. Reporting it as a failed interrupt is
+ * what made owners, the control plane and the web console retry an operation
+ * that had already done exactly what was asked.
+ */
+export interface InterruptOutcome {
+  /** `settled` — the turn (or nothing) ended cooperatively. `forced` — the adapter ignored the cancel and was restarted. */
+  state: 'settled' | 'forced';
+  /** Stable body-free reason present only for a forced recovery. */
+  reasonCode?: string;
+}
+
+/**
  * A prompt the live session has taken responsibility for. Interactive callers
  * stop here: the session has the prompt, and waiting for the turn to finish is
  * a different question with a different, much longer, timescale.
@@ -281,7 +294,12 @@ export interface SessionHandle {
   submitPrompt(text: string, options?: SubmitPromptOptions): Promise<TurnResult>;
   /** Monitor-only ACP safe-boundary delivery. Never implies human/control cancellation. */
   submitPromptAfterTool?(text: string, options?: SubmitPromptOptions): Promise<TurnResult>;
-  interrupt(source?: TurnCancellationSource): Promise<void>;
+  /**
+   * Cancel the active turn. Resolves when the cancellation has taken effect —
+   * cooperatively (`settled`) or through bounded forced recovery (`forced`).
+   * It rejects only when the cancellation itself could not be delivered.
+   */
+  interrupt(source?: TurnCancellationSource): Promise<InterruptOutcome>;
   respondPermission(permissionId: string, optionId: string): boolean;
   /** Generation-bound browser decision; stale/settled/invalid all fail closed. */
   respondPermissionV2?(

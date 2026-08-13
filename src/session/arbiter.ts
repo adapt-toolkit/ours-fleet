@@ -1,5 +1,6 @@
 import type {
-  ConversationHandlePage, ExitRecord, PromptOrigin, QueuedPrompt, SessionEvent, SessionHandle, SessionSnapshot,
+  ConversationHandlePage, ExitRecord, InterruptOutcome, PromptOrigin, QueuedPrompt, SessionEvent,
+  SessionHandle, SessionSnapshot,
   SubmitPromptOptions, TurnCancellationSource, TurnResult,
 } from './types.js';
 import type {
@@ -75,7 +76,12 @@ export class RoleTurnArbiter implements SessionHandle {
       try {
         await beforeQueue?.();
         const queued = await this.session.queuePrompt(text, { interrupt: false, origin });
-        if (queued.queuedBehind > 0) return { state: 'unavailable', error: 'scheduled admission race' };
+        // The race is lost, but the prompt was admitted and WILL run. Keep the
+        // claim so idle accounting matches reality instead of under-counting.
+        if (queued.queuedBehind > 0) {
+          this.track(queued);
+          return { state: 'unavailable', error: 'scheduled admission race' };
+        }
         return { state: 'started', queued: this.track(queued) };
       } catch (error) {
         return { state: 'unavailable', error: (error as Error)?.message ?? String(error) };
@@ -106,7 +112,7 @@ export class RoleTurnArbiter implements SessionHandle {
       return Promise.reject(new Error('browser prompt admission is unavailable'));
     return this.exclusive(() => this.session.submitPromptBrowser!(command));
   }
-  interrupt(source: TurnCancellationSource = 'local-console'): Promise<void> {
+  interrupt(source: TurnCancellationSource = 'local-console'): Promise<InterruptOutcome> {
     return this.exclusive(() => this.session.interrupt(source));
   }
   respondPermission(permissionId: string, optionId: string): boolean {

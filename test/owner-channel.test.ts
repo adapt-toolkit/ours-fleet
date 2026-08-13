@@ -59,7 +59,7 @@ function setup(messages: unknown[], result = {
     promptId: 'prompt-1', queuedBehind: options.queuedBehind ?? 0,
     completion: Promise.resolve(result),
   }));
-  const interrupt = vi.fn(async () => undefined);
+  const interrupt = vi.fn(async () => ({ state: 'settled' as const }));
   const session = {
     backend: 'acp', pid: 1, isAlive: () => true,
     snapshot: () => ({ backend: 'acp', alive: true, readiness: 'running' }),
@@ -89,7 +89,7 @@ function liveSetup(options: {
   const events: SessionEvent[] = [];
   const listeners = new Set<(event: SessionEvent) => void>();
   let running = 0;
-  const interrupt = vi.fn(async () => undefined);
+  const interrupt = vi.fn(async () => ({ state: 'settled' as const }));
   const queuePrompt = vi.fn(async (_text: string, opts?: { interrupt?: boolean }) => {
     if (opts?.interrupt) await interrupt();
     const queuedBehind = running++;
@@ -224,6 +224,22 @@ describe('OwnerChannel', () => {
       contact: OWNER_CID, text: "🛑 Interrupt sent to Coordinator's active turn.",
       reply_to_wire_id: 'wire-stop',
     });
+  });
+
+  it('tells the owner a forced cancellation succeeded rather than failed', async () => {
+    const forced = setup([ownerMessage(28, 'wire-forced-stop', '/interrupt')]);
+    forced.interrupt.mockResolvedValueOnce({
+      state: 'forced', reasonCode: 'ACP_CANCEL_DEADLINE_EXCEEDED',
+    } as never);
+
+    await forced.channel.drain();
+
+    const reply = String(forced.client.calls.find(call => call.name === 'send_message')?.args?.text);
+    // The turn IS cancelled. An owner told "could not interrupt" retries an
+    // operation that already worked — and the reason code never leaves the host.
+    expect(reply).toContain('Interrupt enforced');
+    expect(reply).not.toContain('Could not interrupt');
+    expect(reply).not.toContain('ACP_CANCEL_DEADLINE_EXCEEDED');
   });
 
   it('reports status and command failures without exposing internal error details', async () => {

@@ -68,6 +68,10 @@ export const ownerNotices = {
     `📊 ${role} status: ${snapshot.readiness}; session is ${snapshot.alive ? 'online' : 'offline'}.`,
 
   interrupted: (role: string) => `🛑 Interrupt sent to ${role}'s active turn.`,
+  /** The turn IS cancelled — say how, without implying the owner must retry. */
+  interruptForced: (role: string) =>
+    `🛑 Interrupt enforced: ${role}'s turn ignored the cancellation, so the session `
+    + 'was stopped and is restarting. It resumes automatically.',
   interruptFailed: (role: string) => `⚠️ Could not interrupt ${role}'s active turn.`,
 
   commandStarted: (command: string) =>

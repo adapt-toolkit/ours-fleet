@@ -2,7 +2,8 @@ import type { Tmux } from '../tmux.js';
 import { randomUUID } from 'node:crypto';
 import { SessionControlError, turnResult } from './types.js';
 import type {
-  ExitRecord, QueuedPrompt, SessionEvent, SessionHandle, SessionSnapshot, SubmitPromptOptions,
+  ExitRecord, InterruptOutcome, QueuedPrompt, SessionEvent, SessionHandle, SessionSnapshot,
+  SubmitPromptOptions,
   TurnResult,
 } from './types.js';
 
@@ -55,8 +56,10 @@ export class TmuxSession implements SessionHandle {
     }
   }
 
-  async interrupt(): Promise<void> {
+  /** A keystroke is delivered or it throws; tmux offers no forced-recovery path. */
+  async interrupt(): Promise<InterruptOutcome> {
     await this.tmux.sendKey(this.name, 'C-c');
+    return { state: 'settled' };
   }
 
   respondPermission(): boolean {
