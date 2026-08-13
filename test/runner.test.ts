@@ -1,5 +1,7 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
-import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync, rmSync } from 'node:fs';
+import {
+  mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync, readdirSync, rmSync,
+} from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -8,6 +10,7 @@ import { stringify } from 'yaml';
 import {
   runOnce, runTemp, runSupervised, buildPaneCommand, reserveLaunchSlot, readExitRecord,
   readRestartLedger, resetRestartLedger, backoffFor, loadTempRole, RESTART_FAIL_THRESHOLD,
+  TEMP_IDENTITY_CLOSE_DEBOUNCE_MS, TEMP_IDENTITY_STARTUP_GRACE_MS,
   type AttemptResult, type RunnerDeps,
 } from '../src/runner.js';
 import { classifyChildExit, classifyShellStatus } from '../src/session/types.js';
@@ -66,6 +69,7 @@ function fakeWorld(opts: { exitCode?: string; lifeChecks?: number; exitDelayMs?:
   let clock = 0;
   let checks = 0;
   let sessionCreated = false;
+  let sessionKilled = false;
   const exec: Exec = async (cmd, args) => {
     if (cmd === 'bwrap') return { stdout: 'bubblewrap 0.11.1\n', stderr: '', code: opts.bwrap === 'missing' ? 127 : 0 };
     if (cmd === 'tmux') {
@@ -75,9 +79,13 @@ function fakeWorld(opts: { exitCode?: string; lifeChecks?: number; exitDelayMs?:
       if (args[0] !== '-L' || !args[1].startsWith('ours-fleet-'))
         return { stdout: '', stderr: 'no server running on the default socket', code: 1 };
       const sub = args[2];
-      if (sub === 'new-session') { paneCommands.push(args[args.length - 1]); sessionCreated = true; }
+      if (sub === 'new-session') {
+        paneCommands.push(args[args.length - 1]); sessionCreated = true; sessionKilled = false;
+      }
+      if (sub === 'kill-session' && sessionCreated) sessionKilled = true;
       if (sub === 'list-panes') return { stdout: '4242\n', stderr: '', code: 0 };
-      if (sub === 'has-session') return { stdout: '', stderr: '', code: opts.sessionGone ? 1 : 0 };
+      if (sub === 'has-session')
+        return { stdout: '', stderr: '', code: opts.sessionGone || sessionKilled ? 1 : 0 };
     }
     return { stdout: '', stderr: '', code: 0 };
   };
@@ -87,6 +95,7 @@ function fakeWorld(opts: { exitCode?: string; lifeChecks?: number; exitDelayMs?:
     exec,
     cpuDelegated: () => opts.cpuDelegated ?? true,
     isAlive: () => {
+      if (sessionKilled) return false;
       checks++;
       if (checks >= (opts.lifeChecks ?? 2)) {
         if (opts.exitFile) writeFileSync(opts.exitFile, opts.legacyExitFile
@@ -870,6 +879,67 @@ describe('runOnce monitor integration', () => {
   });
 });
 
+describe('temporary identity retirement', () => {
+  const writeTemp = (name: string) => {
+    const d = agentDir(name, true);
+    mkdirSync(d, { recursive: true });
+    writeFileSync(join(d, 'role.yaml'), stringify({
+      name, harness: 'fake', session: 'tmux', identity: name,
+      monitor: { mode: 'native' }, sourceFile: '(temp)',
+    }));
+    return d;
+  };
+
+  it('closes a live temp session only after a sustained absence of its observed identity', async () => {
+    const d = writeTemp('T');
+    const world = fakeWorld({ lifeChecks: 100, exitFile: join(d, '.exit-status') });
+    let probes = 0;
+    world.deps.fetch = async url => {
+      expect(url).toContain('/identities');
+      const identities = probes++ === 0 ? [{ name: 'T', temporary: true }] : [];
+      return { status: 200, ok: true, json: async () => ({ identities }) };
+    };
+
+    const result = await runOnce('T', { temp: true }, world.deps);
+
+    expect(result.retirementReason).toBe('identity-closed');
+    expect(result.elapsedSecs).toBeGreaterThanOrEqual(TEMP_IDENTITY_CLOSE_DEBOUNCE_MS / 1000);
+    expect(probes).toBeGreaterThan(2);
+    expect(world.paneCommands).toHaveLength(1);
+  });
+
+  it('allows a slow first bind before settling an identity absent from the first poll', async () => {
+    const d = writeTemp('T');
+    const world = fakeWorld({ lifeChecks: 100, exitCode: '0', exitFile: join(d, '.exit-status') });
+    let probes = 0;
+    world.deps.fetch = async () => ({
+      status: 200, ok: true, json: async () => { probes++; return { identities: [] }; },
+    });
+
+    const result = await runOnce('T', { temp: true }, world.deps);
+
+    expect(result.retirementReason).toBe('identity-closed');
+    expect(result.elapsedSecs).toBeGreaterThanOrEqual(TEMP_IDENTITY_STARTUP_GRACE_MS / 1000);
+    expect(probes).toBeGreaterThan(2);
+    expect(world.paneCommands).toHaveLength(1);
+  });
+
+  it('never probes or changes a permanent role lifecycle', async () => {
+    writeCfg({ A: { harness: 'fake', monitor: { mode: 'native' } } });
+    const d = agentDir('A'); mkdirSync(d, { recursive: true });
+    const world = fakeWorld({ exitCode: '0', exitFile: join(d, '.exit-status') });
+    let probes = 0;
+    world.deps.fetch = async () => {
+      probes++;
+      return { status: 200, ok: true, json: async () => ({ identities: [] }) };
+    };
+
+    await runOnce('A', {}, world.deps);
+
+    expect(probes).toBe(0);
+  });
+});
+
 describe('reserveLaunchSlot (start gate)', () => {
   const gateDeps = (clock: { t: number }) => ({
     now: () => clock.t,
@@ -964,7 +1034,7 @@ describe('runOnce config-path fallback', () => {
 });
 
 describe('runTemp', () => {
-  it('runs from the tmp snapshot and removes the dir afterwards', async () => {
+  it('runs from the tmp snapshot and archives evidence outside the live roster afterwards', async () => {
     const d = agentDir('T', true);
     mkdirSync(d, { recursive: true });
     writeFileSync(join(d, 'role.yaml'),
@@ -972,6 +1042,33 @@ describe('runTemp', () => {
     const { deps } = fakeWorld({ exitCode: '0', exitFile: join(d, '.exit-status') });
     await runTemp('T', deps);
     expect(existsSync(d)).toBe(false);
+    const archiveRoot = join(stateRoot(), 'recovery', 'temporary');
+    const archived = readdirSync(archiveRoot).find(name => name.includes('-T-'))!;
+    expect(readFileSync(join(archiveRoot, archived, 'termination.jsonl'), 'utf8'))
+      .toContain('"reason":"session-ended"');
+    expect(readFileSync(join(archiveRoot, 'terminations.jsonl'), 'utf8'))
+      .toContain('"role":"T"');
+  });
+
+  it('settles the supervisor and archives an explicit closed-identity retirement', async () => {
+    const d = agentDir('Closed', true);
+    mkdirSync(d, { recursive: true });
+    writeFileSync(join(d, 'role.yaml'), stringify({
+      name: 'Closed', harness: 'fake', identity: 'Closed', monitor: { mode: 'native' },
+      sourceFile: 'tmp',
+    }));
+    const { deps } = fakeWorld({ lifeChecks: 100, exitFile: join(d, '.exit-status') });
+    deps.fetch = async () => ({
+      status: 200, ok: true, json: async () => ({ identities: [] }),
+    });
+
+    await runTemp('Closed', deps);
+
+    expect(existsSync(d)).toBe(false);
+    const archiveRoot = join(stateRoot(), 'recovery', 'temporary');
+    const archived = readdirSync(archiveRoot).find(name => name.includes('-Closed-'))!;
+    expect(readFileSync(join(archiveRoot, archived, 'termination.jsonl'), 'utf8'))
+      .toContain('"reason":"identity-closed"');
   });
 });
 

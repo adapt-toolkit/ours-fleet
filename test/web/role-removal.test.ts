@@ -4,6 +4,7 @@ import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import { RoleRemovalService } from '../../src/application/role-removal-service.js';
 import { agentDir } from '../../src/paths.js';
+import { makeTempSupervisorLauncher, prepareTempSupervisor } from '../../src/temp-lifecycle.js';
 
 const previous = process.env.OURS_FLEET_HOME;
 afterEach(() => previous === undefined ? delete process.env.OURS_FLEET_HOME : process.env.OURS_FLEET_HOME = previous);
@@ -54,5 +55,27 @@ describe('safe web role removal', () => {
       .rejects.toMatchObject({ code: 'forbidden' });
     await expect(service.remove({ role: 'Coordinator', confirmation: 'Coordinator' }))
       .rejects.toMatchObject({ code: 'prerequisite_unavailable' });
+  });
+
+  it('stops and archives a state-backed temporary role through the exact temp lifecycle', async () => {
+    const { root, calls, service } = fixture('  Stable: {}\n');
+    const state = agentDir('Temp', true);
+    mkdirSync(state, { recursive: true });
+    writeFileSync(join(state, 'role.yaml'), 'name: Temp\nharness: codex\nsession: acp\n');
+    writeFileSync(join(state, 'WORKLOG.md'), 'temporary evidence');
+    prepareTempSupervisor(state, 'Temp');
+    await makeTempSupervisorLauncher({
+      platform: 'linux', supervisor: 'systemd',
+      exec: async () => ({ stdout: '', stderr: '', code: 0 }),
+    })('/bin/ours-fleet', ['_run-temp', 'Temp'], state);
+    (service as any).options.ops.exec = async () => ({ stdout: '', stderr: '', code: 0 });
+    (service as any).options.ops.sleep = async () => {};
+
+    const result = await service.remove({ role: 'Temp', confirmed: true });
+
+    expect(calls).toEqual([]); // permanent backend is not used for a temp supervisor
+    expect(existsSync(state)).toBe(false);
+    expect(existsSync(join(result.recoveryPath, 'state', 'WORKLOG.md'))).toBe(true);
+    expect(existsSync(join(root, '.ours-fleet', 'recovery', 'temporary'))).toBe(true);
   });
 });

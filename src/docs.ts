@@ -166,8 +166,23 @@ ours-fleet spawn [--temp] [Name | --role Name] \\
 \`\`\`
 
 Permanent spawn writes \`~/fleet.d/Name.yaml\` and starts a supervised role.
-\`--temp\` writes ephemeral state, starts a detached supervisor, and removes the
-role after exit/reboot. Both lifetimes support \`--session acp\`.
+\`--temp\` writes active state under \`~/.ours-fleet/tmp\` and starts an independent
+transient supervisor (a collected systemd unit or submitted launchd job). It is
+not enabled across reboot and does not die when the role that spawned it restarts.
+Both lifetimes support \`--session acp\`. When a temporary role's bound identity
+closes or its session ends, the supervisor, monitor and live roster entry retire
+together; state moves intact to \`~/.ours-fleet/recovery/temporary\` with a
+termination record. Failed launches use the same archive rather than deleting
+their briefing, provenance, logs or partial supervisor metadata.
+
+Named \`down\` and \`rm\` commands can target an exact state-backed temporary role
+even though it is absent from merged fleet YAML. The recorded transient unit/job
+is authoritative. Missing/incomplete ownership metadata is reconciled only from
+an exact \`_run-temp <role>\` process-table match: one match may be adopted, zero
+settles as stopped, and ambiguity or an unreadable table fails closed. Launching
+records receive a bounded grace so a not-yet-registered transient unit cannot be
+mistaken for a stopped one. Stale recorded supervisors are reclaimed in bounded
+batches by moving their state to the same recovery archive, never by blind deletion.
 
 Temporary-role identity bootstrap is capability-based. The generated briefing
 first tries to bind the exact assigned identity and preserves it when it already

@@ -1,5 +1,7 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
-import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync, rmSync, statSync } from 'node:fs';
+import {
+  mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync, readdirSync, rmSync, statSync,
+} from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { stringify } from 'yaml';
@@ -12,6 +14,7 @@ import { fakeAdapter } from './registry.test.js';
 import { makeSystemdBackend } from '../src/supervisor/systemd.js';
 import type { Exec } from '../src/exec.js';
 import type { Liveness, SupervisorBackend } from '../src/supervisor/types.js';
+import { makeTempSupervisorLauncher, prepareTempSupervisor, tempSystemdUnit } from '../src/temp-lifecycle.js';
 
 let dir: string;
 beforeEach(() => {
@@ -187,6 +190,30 @@ describe('up / down / restart', () => {
     await down(loadConfig(), ['A'], d);
     expect(logs.join('\n')).toContain('Job is in progress');
     expect(logs.join('\n')).not.toContain('maybe not running');   // the old guess
+  });
+
+  it('down targets an exact state-backed temporary role absent from merged YAML', async () => {
+    writeCfg({ A: { harness: 'fake' } });
+    const tempDir = agentDir('Temp', true);
+    mkdirSync(tempDir, { recursive: true });
+    prepareTempSupervisor(tempDir, 'Temp');
+    await makeTempSupervisorLauncher({
+      platform: 'linux', supervisor: 'systemd',
+      exec: async () => ({ stdout: '', stderr: '', code: 0 }),
+    })('/bin/ours-fleet', ['_run-temp', 'Temp'], tempDir);
+    const { calls, backend } = fakeBackend();
+    const commands: string[][] = [];
+    const { d, logs } = deps(backend);
+    d.exec = async (command, args) => {
+      commands.push([command, ...args]);
+      return { stdout: '', stderr: '', code: 0 };
+    };
+
+    await down(loadConfig(), ['Temp'], d);
+
+    expect(commands).toEqual([['systemctl', '--user', 'stop', tempSystemdUnit('Temp')]]);
+    expect(calls).toEqual([]); // no permanent backend was guessed
+    expect(logs.join('\n')).toContain('temporary role Temp');
   });
 
   it('restart fresh clears markers then bounces', async () => {
@@ -518,5 +545,51 @@ describe('rmRole', () => {
     const { d } = deps(backend);
     await rmRole(cfg, 'A', d);
     expect(existsSync(join(dir, 'fleet.yaml'))).toBe(true);
+  });
+
+  it('rm stops and archives an exact temporary role absent from merged YAML', async () => {
+    writeCfg({});
+    const tempDir = agentDir('Temp', true);
+    mkdirSync(tempDir, { recursive: true });
+    writeFileSync(join(tempDir, 'WORKLOG.md'), 'keep this\n');
+    prepareTempSupervisor(tempDir, 'Temp');
+    await makeTempSupervisorLauncher({
+      platform: 'linux', supervisor: 'systemd',
+      exec: async () => ({ stdout: '', stderr: '', code: 0 }),
+    })('/bin/ours-fleet', ['_run-temp', 'Temp'], tempDir);
+    const { calls, backend } = fakeBackend();
+    const { d, logs } = deps(backend);
+    d.exec = async () => ({ stdout: '', stderr: '', code: 0 });
+    d.sleep = async () => {};
+
+    await rmRole(loadConfig(), 'Temp', d);
+
+    expect(calls).toEqual([]);
+    expect(existsSync(tempDir)).toBe(false);
+    const recovery = join(dir, '.ours-fleet', 'recovery', 'temporary');
+    const archived = readdirSync(recovery).find(name => name.includes('-Temp-'))!;
+    expect(readFileSync(join(recovery, archived, 'WORKLOG.md'), 'utf8')).toContain('keep this');
+    expect(logs.join('\n')).toContain("removed temporary role 'Temp'");
+  });
+
+  it('rm archives a stopped temp role whose supervisor metadata is incomplete', async () => {
+    writeCfg({});
+    const tempDir = agentDir('Incomplete', true);
+    mkdirSync(tempDir, { recursive: true });
+    writeFileSync(join(tempDir, 'WORKLOG.md'), 'preserve incomplete launch evidence\n');
+    prepareTempSupervisor(tempDir, 'Incomplete');
+    const { calls, backend } = fakeBackend();
+    const { d } = deps(backend);
+    d.exec = async () => ({ stdout: '', stderr: '', code: 0 });
+    d.sleep = async () => {};
+
+    await rmRole(loadConfig(), 'Incomplete', d);
+
+    expect(calls).toEqual([]);
+    expect(existsSync(tempDir)).toBe(false);
+    const recovery = join(dir, '.ours-fleet', 'recovery', 'temporary');
+    const archived = readdirSync(recovery).find(name => name.includes('-Incomplete-'))!;
+    expect(readFileSync(join(recovery, archived, 'WORKLOG.md'), 'utf8'))
+      .toContain('preserve incomplete launch evidence');
   });
 });

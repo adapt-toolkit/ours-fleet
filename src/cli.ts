@@ -306,7 +306,7 @@ cOpt(program.command('up [names...]').description('create/start every role (or j
     try { await up(loadConfig(opts.configuration), names, deps(), opts.configuration); } catch (e) { die(e); }
   });
 
-cOpt(program.command('down [names...]').description('stop roles'))
+cOpt(program.command('down [names...]').description('stop configured roles or exact named temporary roles'))
   .action(async (names, opts) => {
     try { await down(loadConfig(opts.configuration), names, deps()); } catch (e) { die(e); }
   });
@@ -969,14 +969,14 @@ cOpt(program.command('watchdog-report <name> [runId]')
     } catch (e) { die(e); }
   });
 
-cOpt(program.command('rm <name>').description('stop + delete state dir (+ its fleet.d file if spawned)'))
+cOpt(program.command('rm <name>').description('stop + remove a role (temporary evidence is archived)'))
   .action(async (name, opts) => {
     try { await rmRole(loadConfig(opts.configuration), name, deps()); } catch (e) { die(e); }
   });
 
 cOpt(program.command('spawn [name]').description('spawn a new agent (permanent by default)'))
   .option('--role <name>', 'role name (alternative to the positional name)')
-  .option('--temp', 'temporary: detached supervisor, auto-cleaned, gone on reboot')
+  .option('--temp', 'temporary: independent transient supervisor, archived on retirement, gone on reboot')
   .option('--harness <id>', 'harness adapter (default: defaults.harness)')
   .option('--session <backend>', 'session backend: tmux|acp (default: defaults.session or tmux)')
   .option('--mission <text>', 'one-line mission')

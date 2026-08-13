@@ -7,7 +7,7 @@ import {
   spawnDryRun, spawnPermanent, spawnTemp, type SupervisorLauncher,
 } from '../src/spawn.js';
 import { creationBuildNote, formatProvenance, type CreationProvenance } from '../src/creation.js';
-import { agentDir } from '../src/paths.js';
+import { agentDir, stateRoot } from '../src/paths.js';
 import { buildInfo } from '../src/provenance.js';
 import { registerAdapter } from '../src/harness/registry.js';
 import { getAdapter } from '../src/harness/registry.js';
@@ -373,7 +373,7 @@ describe('atomic role + identity reservation (6.4)', () => {
     await expect(spawnPermanent({ name: 'Doomed' }, ok)).resolves.toContain('Doomed.yaml');
   });
 
-  it('a temp spawn uses the same boundary and rolls back its state dir', async () => {
+  it('a temp spawn rolls back its live state but preserves launch-failure evidence', async () => {
     const { d } = fakeDeps();
     void d;
     const failing: SupervisorLauncher = () => { throw new Error('could not detach'); };
@@ -381,6 +381,10 @@ describe('atomic role + identity reservation (6.4)', () => {
       .then(() => null, e => e as Error);
     expect(err!.message).toContain('could not detach');
     expect(existsSync(agentDir('TempFail', true))).toBe(false);
+    const recovery = join(stateRoot(), 'recovery', 'temporary');
+    const archived = readdirSync(recovery).find(name => name.includes('-TempFail-'))!;
+    expect(readFileSync(join(recovery, archived, 'termination.jsonl'), 'utf8'))
+      .toContain('"reason":"startup-failure"');
     // Name reusable straight away.
     await expect(spawnTemp({ name: 'TempFail' }, '/b/ours-fleet', () => {})).resolves.toBeTruthy();
   });

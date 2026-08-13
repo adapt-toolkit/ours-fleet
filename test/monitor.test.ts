@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
   resolveEndpoint, resolveApiToken, readDaemonConfig, filterEvents, formatNotificationLine,
-  looksModal, looksApiError, looksRunning, createMonitor,
+  looksModal, looksApiError, looksRunning, createMonitor, probeIdentityPresence,
   type NotifyEvent, type MonitorDeps, type FetchResponse,
 } from '../src/monitor.js';
 import type { MonitorConfig } from '../src/config.js';
@@ -103,6 +103,38 @@ describe('resolveEndpoint', () => {
   });
   it('url-encodes the identity name', () => {
     expect(resolveEndpoint(hermetic()).url('a b')).toContain('/identities/a%20b/');
+  });
+});
+
+describe('probeIdentityPresence', () => {
+  it('distinguishes an authoritative present identity from an authoritative absence', async () => {
+    const present = await probeIdentityPresence('Temp', async () => ({
+      status: 200, ok: true,
+      json: async () => ({ identities: [{ name: 'Temp', temporary: true, stale: false }] }),
+    }), hermetic());
+    const absent = await probeIdentityPresence('Gone', async () => ({
+      status: 200, ok: true,
+      json: async () => ({ identities: [{ name: 'Other' }] }),
+    }), hermetic());
+
+    expect(present).toEqual({ state: 'present', temporary: true, stale: false });
+    expect(absent).toEqual({ state: 'absent' });
+  });
+
+  it('fails open on transport, auth, and malformed-index errors', async () => {
+    const transport = await probeIdentityPresence('Temp', async () => {
+      throw new Error('daemon restart');
+    }, hermetic());
+    const auth = await probeIdentityPresence('Temp', async () => ({
+      status: 401, ok: false, json: async () => ({}),
+    }), hermetic());
+    const malformed = await probeIdentityPresence('Temp', async () => ({
+      status: 200, ok: true, json: async () => ({ cursor: 0 }),
+    }), hermetic());
+
+    expect(transport.state).toBe('unknown');
+    expect(auth.state).toBe('unknown');
+    expect(malformed.state).toBe('unknown');
   });
 });
 

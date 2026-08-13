@@ -26,7 +26,11 @@ export interface NotifyEvent {
 export interface FetchResponse {
   status: number;
   ok: boolean;
-  json(): Promise<{ cursor?: number; events?: NotifyEvent[] }>;
+  json(): Promise<{
+    cursor?: number;
+    events?: NotifyEvent[];
+    identities?: Array<{ name?: unknown; temporary?: unknown; stale?: unknown }>;
+  }>;
 }
 export type FetchLike = (
   url: string, init?: { headers?: Record<string, string>; signal?: AbortSignal },
@@ -196,6 +200,11 @@ export interface DaemonEndpoint {
   headers: Record<string, string>;
 }
 
+export type IdentityPresence =
+  | { state: 'present'; temporary: boolean; stale: boolean }
+  | { state: 'absent' }
+  | { state: 'unknown'; detail: string };
+
 /** Resolve the daemon endpoint + auth header from env → config → defaults. */
 export function resolveEndpoint(env: NodeJS.ProcessEnv): DaemonEndpoint {
   const file = readDaemonConfig(env);
@@ -212,6 +221,40 @@ export function resolveEndpoint(env: NodeJS.ProcessEnv): DaemonEndpoint {
     url: (name: string) => `${origin}/identities/${encodeURIComponent(name)}/notifications`,
     headers: token ? { 'x-ours-api-token': token } : {},
   };
+}
+
+/**
+ * Ask the daemon's authoritative identity index. The notifications endpoint is
+ * intentionally unsuitable for lifecycle: it serves an empty 200 page for a
+ * valid but missing identity, which made a closed temp identity look healthy.
+ */
+export async function probeIdentityPresence(
+  name: string, fetch: FetchLike, env: NodeJS.ProcessEnv,
+): Promise<IdentityPresence> {
+  const ep = resolveEndpoint(env);
+  let response: FetchResponse;
+  try {
+    response = await fetch(`${ep.origin}/identities`, { headers: ep.headers });
+  } catch (error) {
+    return { state: 'unknown', detail: `identity index unreachable (${msg(error)})` };
+  }
+  if (!response.ok) return {
+    state: 'unknown',
+    detail: response.status === 401
+      ? `daemon rejected the API token (401) — ${authResolutionHint(ep)}`
+      : `identity index returned HTTP ${response.status}`,
+  };
+  try {
+    const body = await response.json();
+    if (!Array.isArray(body.identities))
+      return { state: 'unknown', detail: 'identity index response is malformed' };
+    const found = body.identities.find(identity => identity?.name === name);
+    return found
+      ? { state: 'present', temporary: found.temporary === true, stale: found.stale === true }
+      : { state: 'absent' };
+  } catch (error) {
+    return { state: 'unknown', detail: `identity index response is unreadable (${msg(error)})` };
+  }
 }
 
 /** Actionable, secret-free description of every token source for this profile. */

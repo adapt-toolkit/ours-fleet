@@ -75,7 +75,8 @@ export class RoleRemovalService {
     if (existsSync(sourceState)) cpSync(sourceState, join(recoveryPath, 'state'), { recursive: true });
     if (role?.sourceFile.includes('/fleet.d/') && existsSync(role.sourceFile))
       cpSync(role.sourceFile, join(recoveryPath, basename(role.sourceFile)));
-    if (role) await rmRole(cfg, preview.role, this.options.ops);
+    if (role || preview.lifetime === 'temporary')
+      await rmRole(cfg, preview.role, this.options.ops);
     else {
       await this.options.ops.backend.uninstall(preview.role);
       if (existsSync(sourceState)) renameSync(sourceState, join(recoveryPath, 'orphan-state'));
