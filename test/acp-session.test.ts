@@ -9,7 +9,7 @@ import { AcpSession } from '../src/session/acp.js';
 import {
   RoleControlServer, controlRequest, controlSocketPath, controlTokenPath, livenessNote,
 } from '../src/session/control.js';
-import { SessionControlError } from '../src/session/types.js';
+import { ACP_CANCEL_DEADLINE_EXCEEDED, SessionControlError } from '../src/session/types.js';
 import type { SessionEvent } from '../src/session/types.js';
 
 const fixture = join(dirname(fileURLToPath(import.meta.url)), 'fixtures', 'acp-agent.mjs');
@@ -24,6 +24,7 @@ async function start(
   extra: {
     modeId?: string; env?: Record<string, string>; log?(line: string): void;
     cancelGraceMs?: number;
+    cancelTerminateGraceMs?: number;
     afterToolBoundaryTimeoutMs?: number;
     unattended?: 'deny' | 'wait';
     permissionMode?: { fleetMode: 'ask' | 'auto' | 'allow'; nativeMode: string };
@@ -45,6 +46,8 @@ async function start(
     permissionMode: extra.permissionMode,
     log: extra.log ?? (() => {}),
     ...(extra.cancelGraceMs !== undefined ? { cancelGraceMs: extra.cancelGraceMs } : {}),
+    ...(extra.cancelTerminateGraceMs !== undefined
+      ? { cancelTerminateGraceMs: extra.cancelTerminateGraceMs } : {}),
     ...(extra.afterToolBoundaryTimeoutMs !== undefined
       ? { afterToolBoundaryTimeoutMs: extra.afterToolBoundaryTimeoutMs } : {}),
   });
@@ -821,25 +824,52 @@ describe('AcpSession', () => {
     const session = await start('allow', { cancelGraceMs: 200 });
     const queued = await session.queuePrompt('stubborn block 60000');
     await waitForRunning(session);
-    await session.interrupt('owner');
+    await expect(session.interrupt('owner')).rejects.toMatchObject({
+      kind: 'control-unavailable', reasonCode: ACP_CANCEL_DEADLINE_EXCEEDED,
+    });
 
     // The adapter never honors the cancel; after the grace period the session
     // must recover by force instead of leaving the turn (and its owner) hung.
     const result = await queued.completion;
     expect(result).toMatchObject({ succeeded: false, outcome: 'failed' });
-    expect(session.isAlive()).toBe(false);
     // SIGTERM delivery is asynchronous; wait for the adapter's exit record.
     for (let i = 0; i < 100 && session.exitResult() === null; i++)
       await new Promise(resolve => setTimeout(resolve, 10));
+    expect(session.isAlive()).toBe(false);
     expect(session.exitResult()).not.toBeNull();
+    expect(session.exitResult()?.detail).toContain(ACP_CANCEL_DEADLINE_EXCEEDED);
+    await expect(session.queuePrompt('owner turn arriving during restart')).rejects.toMatchObject({
+      kind: 'control-unavailable', reasonCode: ACP_CANCEL_DEADLINE_EXCEEDED,
+    });
 
     const events = session.eventsSince(0);
     const escalations = events.filter(event =>
-      event.kind === 'error' && event.text?.includes('ignored cancellation'));
+      event.kind === 'error' && event.status === ACP_CANCEL_DEADLINE_EXCEEDED);
     expect(escalations).toHaveLength(1);
     // The escalated turn terminates through the failure path only: no
     // turn_stop means no second, contradictory completion was produced.
     expect(events.filter(event => event.kind === 'turn_stop')).toHaveLength(0);
+    await session.close();
+  });
+
+  it('hard-kills an adapter that ignores both cancellation and SIGTERM within a second bound', async () => {
+    const startedAt = Date.now();
+    const session = await start('allow', {
+      cancelGraceMs: 50, cancelTerminateGraceMs: 75,
+      env: { ACP_FIXTURE_IGNORE_SIGTERM: '1' },
+    });
+    const queued = await session.queuePrompt('stubborn block 60000');
+    await waitForRunning(session);
+    await expect(session.interrupt('owner')).rejects.toMatchObject({
+      reasonCode: ACP_CANCEL_DEADLINE_EXCEEDED,
+    });
+    expect(session.isAlive()).toBe(true);
+    for (let i = 0; i < 100 && session.isAlive(); i++)
+      await new Promise(resolve => setTimeout(resolve, 5));
+    expect(session.isAlive()).toBe(false);
+    expect(Date.now() - startedAt).toBeLessThan(1_000);
+    expect((await queued.completion).detail).toContain(ACP_CANCEL_DEADLINE_EXCEEDED);
+    expect(session.exitResult()).toMatchObject({ signal: 'SIGKILL' });
     await session.close();
   });
 

@@ -8,7 +8,10 @@ import {
   DEFAULT_OWNER_ATTACHMENT_MIME, canonicalCid,
   type OwnerAttachmentConfig, type OwnerChannelConfig,
 } from '../config.js';
-import type { QueuedPrompt, SessionEvent, SessionHandle, TurnResult } from '../session/types.js';
+import {
+  ACP_CANCEL_DEADLINE_EXCEEDED, SessionControlError,
+  type QueuedPrompt, type SessionEvent, type SessionHandle, type TurnResult,
+} from '../session/types.js';
 import { VERSION } from '../version.js';
 import {
   dispatchOwnerCommand, fleetCliOps, isOwnerCommandText,
@@ -917,6 +920,15 @@ export class OwnerChannel implements OwnerChannelHandle {
       });
     } catch (error) {
       await rm(outbox, { recursive: true, force: true });
+      if (error instanceof SessionControlError
+          && error.reasonCode === ACP_CANCEL_DEADLINE_EXCEEDED) {
+        // drainAll deferred this authenticated message before delivery. The
+        // adapter generation is terminating, so leave the wire unhandled and
+        // body-free: the resumed owner channel will replay it exactly once.
+        this.options.log(`[${this.options.role}] owner request ${requestId.slice(0, 12)} `
+          + `held for adapter resume reason=${ACP_CANCEL_DEADLINE_EXCEEDED}`);
+        return false;
+      }
       this.logError('request delivery failed', error);
       await this.send(sender.id, ownerNotices.deliveryFailed(this.options.role), wireId);
       this.state.remember(wireId);

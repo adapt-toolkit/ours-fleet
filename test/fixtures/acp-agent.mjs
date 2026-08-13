@@ -24,6 +24,7 @@ const EXIT_CODE = parseInt(process.env.ACP_FIXTURE_EXIT_CODE ?? '0', 10) || 0;
 // does not control (the runner's own startup prompt).
 const ALWAYS_PERMISSION = process.env.ACP_FIXTURE_ALWAYS_PERMISSION === '1';
 const PROMPT_DELAY_MS = parseInt(process.env.ACP_FIXTURE_PROMPT_DELAY_MS ?? '0', 10) || 0;
+if (process.env.ACP_FIXTURE_IGNORE_SIGTERM === '1') process.on('SIGTERM', () => {});
 let promptsAnswered = 0;
 
 const stopReasonFor = text =>

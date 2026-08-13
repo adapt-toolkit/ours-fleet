@@ -70,8 +70,16 @@ export type ControlFailureKind =
   | 'rejected'             // the session understood the request and refused it
   | 'backend';             // the transport itself failed
 
+/** Stable body-free reason shared by ACP recovery and durable ingress. */
+export const ACP_CANCEL_DEADLINE_EXCEEDED = 'ACP_CANCEL_DEADLINE_EXCEEDED';
+
 export class SessionControlError extends Error {
-  constructor(readonly kind: ControlFailureKind, message: string) {
+  constructor(
+    readonly kind: ControlFailureKind,
+    message: string,
+    /** Stable body-free machine reason for recovery/audit decisions. */
+    readonly reasonCode?: string,
+  ) {
     super(message);
     this.name = 'SessionControlError';
   }

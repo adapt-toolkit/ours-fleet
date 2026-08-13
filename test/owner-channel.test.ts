@@ -10,7 +10,10 @@ import { OwnerChannel } from '../src/owner-channel/channel.js';
 import { ownerCommandHelp, type OwnerFleetOps } from '../src/owner-channel/commands.js';
 import type { OursToolClient } from '../src/owner-channel/mcp.js';
 import { OWNER_COMMENT_LABEL, ownerNotices } from '../src/owner-channel/notices.js';
-import type { SessionEvent, SessionHandle, TurnResult } from '../src/session/types.js';
+import {
+  ACP_CANCEL_DEADLINE_EXCEEDED, SessionControlError,
+  type SessionEvent, type SessionHandle, type TurnResult,
+} from '../src/session/types.js';
 import { VERSION } from '../src/version.js';
 
 const OWNER_CID = 'A'.repeat(64);
@@ -242,6 +245,20 @@ describe('OwnerChannel', () => {
       '⚠️ Could not deliver this request to Coordinator.');
     expect(delivery.client.calls.filter(call => call.name === 'send_message')
       .every(call => !String(call.args?.text).includes('secret'))).toBe(true);
+  });
+
+  it('leaves the next owner wire replayable while an ignored-cancel adapter restarts', async () => {
+    const recovery = setup([ownerMessage(27, 'wire-after-stubborn-turn', 'next owner turn')]);
+    recovery.queuePrompt.mockRejectedValueOnce(new SessionControlError(
+      'control-unavailable', 'adapter restart detail', ACP_CANCEL_DEADLINE_EXCEEDED));
+
+    await recovery.channel.drain();
+
+    expect(recovery.client.calls).toContainEqual({
+      name: 'defer_messages', args: { msg_ids: [27] },
+    });
+    expect(recovery.client.calls.some(call => call.name === 'send_message')).toBe(false);
+    expect(existsSync(join(recovery.dir, '.owner-channel-state.json'))).toBe(false);
   });
 
   it('uses precise, redacted terminal notices for every non-text outcome', async () => {
