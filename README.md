@@ -437,6 +437,20 @@ schedule or selector changes reset that loop to its configured initial delay.
 `run-now` still obeys idle-only admission and returns exit 3 when busy; an
 unavailable or uncertain control plane returns exit 2 and is never retried.
 
+A failed state write — a full disk is the case seen in practice — never stops the
+manager. The failure is held in memory as `health: failed`, `anomaly:
+persist_failed`; the occurrence that could not be checkpointed is recorded as
+`skipped_unpersisted` rather than started, since a run that is not on disk is one
+a restart would submit twice; and the manager keeps a bounded retry armed (1s
+doubling to 60s) so it resumes on its own once writes land. Because that health
+flip is itself unwritable, readers do not trust a stored file that has stopped
+advancing: `status`, `loops status`, and `doctor` report `stale` — never the
+recorded health — once the checkpoint of a role that still has a loop to run is
+more than 5 minutes old. A role whose loops are all disabled stops checkpointing
+by design and is never called stale. `status` asks the live control socket
+whenever it is there, including when the first checkpoint never got written, and
+`doctor` fails a running role that has no stored loop state at all.
+
 A scheduled turn has typed internal provenance and no owner authority. It cannot
 cancel owner work and its ordinary completion is local only. Material proactive
 owner reporting remains possible solely through an already-open authenticated

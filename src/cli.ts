@@ -37,7 +37,7 @@ import {
 } from './session/control.js';
 import { SessionControlError } from './session/types.js';
 import type { SessionEvent } from './session/types.js';
-import { readScheduledLoops } from './loops/state.js';
+import { readScheduledLoops, storedLoopHealth } from './loops/state.js';
 import type { LoopActionResult } from './loops/manager.js';
 import type {
   OwnerChannelManagementRequest, OwnerChannelManagementResult,
@@ -439,13 +439,33 @@ program.command('status <name>').description('unit/agent state')
         if (response.ok) console.log(`session: ${JSON.stringify(response.result)}`);
       } catch { console.log('session: acp control unavailable'); }
     }
-    const loopState = readScheduledLoops(agentDir(name));
+    // Loop health is asked of the live manager first: when its state writes are
+    // failing it is the ONLY source that can say so — the stored file is frozen
+    // at whatever it last managed to record, which is why a role with every loop
+    // dead still reported `healthy` for 2h51m. The probe cannot be conditional on
+    // there being a stored file either: a manager whose very first checkpoint hit
+    // ENOSPC never wrote one, and it is precisely the one worth asking.
+    let loopState = readScheduledLoops(agentDir(name));
+    let loopEvidence = 'stored';
+    const loopControl = permanentLoopControlDir(name);
+    if (loopControl) {
+      try {
+        const response = await controlRequest(loopControl, { command: 'loop_status' }, 2_000);
+        if (response.ok) { loopState = response.result as typeof loopState; loopEvidence = 'live'; }
+      } catch { /* stored evidence stays honest */ }
+    }
     if (loopState) {
       const values = Object.values(loopState.loops);
       const enabled = values.filter(loop => loop.enabled && !loop.operatorDisabled).length;
       const next = values.filter(loop => loop.enabled && !loop.operatorDisabled)
         .map(loop => Date.parse(loop.nextDueAt)).filter(Number.isFinite).sort((a, b) => a - b)[0];
-      console.log(`loops: ${enabled} enabled${next ? `, next ${formatDuration(Math.max(0, next - Date.now()))}` : ''}, ${loopState.health}`);
+      const verdict = storedLoopHealth(loopState, Date.now());
+      const health = loopEvidence === 'live' ? loopState.health : verdict.health;
+      console.log(`loops: ${enabled} enabled${next ? `, next ${formatDuration(Math.max(0, next - Date.now()))}` : ''}, ${health}`
+        + (loopEvidence === 'stored' && verdict.stale
+          ? ` (no state update for ${formatDuration(verdict.ageMs)}; last recorded ${verdict.recorded})` : '')
+        + (loopState.anomaly ? ` anomaly=${loopState.anomaly}` : '')
+        + ` evidence=${loopEvidence}`);
     }
   });
 
@@ -533,12 +553,19 @@ cOpt(loopsCommand.command('status [role] [loop]').description('show live or stor
           const response = await controlRequest(live, { command: 'loop_status' }, 2_000);
           if (response.ok) { state = response.result as typeof state; evidence = 'live'; }
         } catch { /* stored evidence remains honest; timeout is not offline */ }
-        results.push({ role: role.name, evidence, state });
+        // Stored evidence is only as current as the last write that landed.
+        const verdict = state && evidence === 'stored' ? storedLoopHealth(state, Date.now()) : undefined;
+        results.push({
+          role: role.name, evidence, state,
+          health: verdict ? verdict.health : state?.health ?? null,
+          staleMs: verdict?.stale ? verdict.ageMs : null,
+        });
       }
       if (opts.json) console.log(JSON.stringify({ schemaVersion: 1, roles: results }));
       else {
         const rows = results.flatMap(result => renderLoopRows(result.role, result.state, loopName)
-          .map(row => `${row} evidence=${result.evidence}`));
+          .map(row => `${row} evidence=${result.evidence} health=${result.health}`
+            + (result.staleMs === null ? '' : ` stale=${formatDuration(result.staleMs)}`)));
         console.log(rows.join('\n') || '(no scheduled loop state)');
       }
     } catch (error) { loopFailure(error, opts.json === true); }

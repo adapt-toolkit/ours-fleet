@@ -1,5 +1,5 @@
 import { userInfo } from 'node:os';
-import { readFileSync } from 'node:fs';
+import { existsSync, readFileSync } from 'node:fs';
 import { realExec, type Exec } from './exec.js';
 import { isolationContextFor, loadConfig, type ResolvedRole } from './config.js';
 import type { ConfigDiagnostic, YamlMode } from './config-yaml.js';
@@ -13,6 +13,8 @@ import {
   authResolutionHint, resolveEndpoint,
   type DaemonEndpoint, type FetchLike,
 } from './monitor.js';
+import { readScheduledLoops, storedLoopHealth } from './loops/state.js';
+import { controlSocketPath } from './session/control.js';
 import type { PrereqCheck, PrereqReport } from './harness/types.js';
 
 /** Which cgroup-v2 controllers are delegated to this user manager (advisory). */
@@ -263,6 +265,50 @@ export async function doctor(
         `(start it: ours-mcp start) [${(e as Error)?.message ?? e}]`;
     }
     checks.push({ name: checkName, ok, detail });
+  }
+
+  // Scheduled loops fail silently by construction: the manager runs inside the
+  // role process, so when it stops there is nothing left to raise a hand. A
+  // checkpoint that has stopped advancing is the observable symptom, and it is
+  // the only one available when the reason it stopped is that writes fail.
+  for (const role of roles.filter(role => role.loops?.length)) {
+    const dir = agentDir(role.name);
+    const running = existsSync(controlSocketPath(dir));
+    const state = readScheduledLoops(dir);
+    const name = `loops: ${role.name}`;
+    if (!state) {
+      // No file at all is only innocent when nothing is running. A live role with
+      // loops writes its checkpoint before it schedules anything, so the absence
+      // means the very first write failed — the ENOSPC-at-startup case.
+      checks.push({
+        name, ok: !running,
+        detail: running
+          ? 'the role is running but has never written scheduled-loop state — its first checkpoint '
+            + 'failed (a full disk does this); if the role only just started, re-run doctor. '
+            + `Live state: ours-fleet loops status ${role.name}`
+          : 'no scheduled-loop state yet (role has not run)',
+      });
+      continue;
+    }
+    const verdict = storedLoopHealth(state, Date.now());
+    if (!running) {
+      checks.push({ name, ok: true, detail: `role not running; last recorded ${verdict.recorded}` });
+      continue;
+    }
+    checks.push({
+      name,
+      ok: !verdict.stale && verdict.recorded === 'healthy',
+      detail: verdict.stale
+        ? `state not updated for ${Math.round(verdict.ageMs / 1000)}s while the role is running — `
+          + `the loop manager is not checkpointing (last recorded ${verdict.recorded}); `
+          + `check the role log and free disk space, then: ours-fleet restart ${role.name}`
+        : verdict.recorded !== 'healthy'
+          ? `loop health ${verdict.recorded}${state.anomaly ? ` (${state.anomaly})` : ''} — `
+            + `inspect: ours-fleet loops status ${role.name}`
+          : verdict.scheduled
+            ? 'checkpoint current and healthy'
+            : 'healthy; no enabled loop to schedule, so the checkpoint stands still by design',
+    });
   }
 
   // A broken config resolves no roles and therefore no harnesses. Without a

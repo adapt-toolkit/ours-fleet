@@ -3,7 +3,7 @@ import { randomUUID } from 'node:crypto';
 import type { ResolvedRoleLoop } from './config.js';
 import {
   ScheduledLoopStateStore, deterministicJitter, increment, type LoopRuntimeState,
-  type ScheduledLoopsFile,
+  type ScheduledLoopsFile, type StateWriter,
 } from './state.js';
 import { RoleTurnArbiter } from '../session/arbiter.js';
 import type { TurnResult } from '../session/types.js';
@@ -13,6 +13,21 @@ export interface LoopManagerDeps {
   setTimer(callback: () => void, ms: number): unknown;
   clearTimer(timer: unknown): void;
   log(line: string): void;
+  /** Persistence seam; defaults to the atomic replace. Tests inject write faults here. */
+  writeState?: StateWriter;
+}
+
+/** The manager never sleeps longer than this, so one poll per minute is the floor rate. */
+const POLL_CEILING_MS = 60_000;
+
+/**
+ * Recovery delay for the nth consecutive failure: 1s doubling to the poll
+ * ceiling. Bounded at both ends — never a busy retry, never longer than the
+ * normal cadence, so recovery is noticed within a minute of the fault clearing.
+ */
+export function backoffMs(consecutiveFailures: number): number {
+  const exponent = Math.min(Math.max(consecutiveFailures, 1) - 1, 6);
+  return Math.min(POLL_CEILING_MS, 1_000 * 2 ** exponent);
 }
 
 export interface LoopActionResult {
@@ -36,13 +51,16 @@ export class ScheduledLoopManager implements ScheduledLoopManagerHandle {
   private timer?: unknown;
   private readonly runTimeouts = new Set<unknown>();
   private stopping = false;
+  /** Consecutive unforeseen poll failures; drives the recovery backoff. */
+  private pollFailures = 0;
 
   constructor(
     private readonly role: string, definitions: ResolvedRoleLoop[], stateDir: string,
     private readonly arbiter: RoleTurnArbiter, private readonly deps: LoopManagerDeps,
   ) {
     for (const definition of definitions) this.definitions.set(definition.name, definition);
-    this.store = new ScheduledLoopStateStore(stateDir, role, definitions, deps.now(), deps.log);
+    this.store = new ScheduledLoopStateStore(
+      stateDir, role, definitions, deps.now(), deps.log, deps.writeState);
   }
 
   start(): void {
@@ -126,10 +144,18 @@ export class ScheduledLoopManager implements ScheduledLoopManagerHandle {
       }
       const scheduledAt = Date.parse(state.nextScheduledAt);
       this.advance(definition, state);
-      this.store.persist();
+      // The claim has to be durable before the turn is submitted: a run that is
+      // not on disk is a run a restart cannot see, and the occurrence would be
+      // submitted a second time. At-most-once outranks running this occurrence.
+      if (!this.store.persist()) { this.skipUnpersisted(definition, state, now); continue; }
       await this.attempt(definition, state, scheduledAt);
     }
     this.store.state.clock.lastWallMs = now;
+    if (this.pollFailures) {
+      this.store.clearAnomaly('manager_task_failed');
+      this.deps.log(`[${this.role}] scheduled loop manager recovered after ${this.pollFailures} failed poll(s)`);
+      this.pollFailures = 0;
+    }
     this.store.persist();
     this.schedule();
   }
@@ -247,6 +273,20 @@ export class ScheduledLoopManager implements ScheduledLoopManagerHandle {
     }
   }
 
+  /**
+   * A run the store could not record is dropped, not retried: the cursor has
+   * already moved, so this can never become a busy loop, and the outage is
+   * visible as a skip with a failed health rather than as silence.
+   */
+  private skipUnpersisted(definition: ResolvedRoleLoop, state: LoopRuntimeState, now: number): void {
+    state.counts.skipped = increment(state.counts.skipped);
+    state.lastOutcome = 'skipped_unpersisted';
+    state.lastFinishedAt = new Date(now).toISOString();
+    state.lastError = { kind: 'persist_failed', at: state.lastFinishedAt };
+    this.deps.log(`[${this.role}] loop ${definition.name} skipped_unpersisted `
+      + `(${this.store.lastPersistError ?? 'state write failed'})`);
+  }
+
   private schedule(): void {
     if (this.timer !== undefined) this.deps.clearTimer(this.timer);
     this.timer = undefined;
@@ -255,14 +295,36 @@ export class ScheduledLoopManager implements ScheduledLoopManagerHandle {
       const state = this.store.state.loops[definition.name];
       return definition.enabled && !state.operatorDisabled;
     }).map(definition => Date.parse(this.store.state.loops[definition.name].nextDueAt));
-    if (!due.length) return;
-    const delay = Math.max(0, Math.min(...due) - this.deps.now());
-    this.timer = this.deps.setTimer(() => { void this.poll().catch(error => {
-      this.store.state.health = 'failed';
-      this.store.state.anomaly = 'manager_task_failed';
-      try { this.store.persist(); } catch {}
-      this.deps.log(`[${this.role}] scheduled loop manager failed: ${(error as Error)?.name ?? 'Error'}`);
-    }); }, Math.min(delay, 60_000));
+    // While writes are failing the manager keeps a bounded probe armed even with
+    // nothing due, so health stops lying the moment the disk comes back.
+    const probe = this.store.persistFailures ? backoffMs(this.store.persistFailures) : undefined;
+    if (!due.length && probe === undefined) return;
+    const delay = due.length ? Math.max(0, Math.min(...due) - this.deps.now()) : POLL_CEILING_MS;
+    this.arm(Math.min(delay, POLL_CEILING_MS, probe ?? POLL_CEILING_MS));
+  }
+
+  private arm(delayMs: number): void {
+    this.timer = this.deps.setTimer(
+      () => { void this.poll().catch(error => this.recover(error)); }, delayMs);
+  }
+
+  /**
+   * The residual safety net. Persistence failures are absorbed by the store, so
+   * reaching here means something unforeseen threw — and whatever it was, the
+   * manager must stay armed. The previous behaviour left no timer at all, which
+   * turned one transient ENOSPC into every loop on the role being silently gone
+   * until the process was restarted.
+   */
+  private recover(error: unknown): void {
+    this.pollFailures = increment(this.pollFailures);
+    this.store.state.health = 'failed';
+    this.store.state.anomaly = 'manager_task_failed';
+    this.store.persist();
+    this.deps.log(`[${this.role}] scheduled loop manager failed: ${(error as Error)?.name ?? 'Error'}`
+      + ` (attempt ${this.pollFailures}, retrying in ${backoffMs(this.pollFailures)}ms)`);
+    if (this.stopping) return;
+    if (this.timer !== undefined) this.deps.clearTimer(this.timer);
+    this.arm(backoffMs(this.pollFailures));
   }
 
   private envelope(definition: ResolvedRoleLoop, runId: string, scheduledAt: number): string {

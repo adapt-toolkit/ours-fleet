@@ -118,6 +118,91 @@ describe('doctor', () => {
   });
 });
 
+describe('doctor scheduled-loop checkpoint', () => {
+  const green = execWith({
+    'tmux -V': { stdout: 'tmux 3.6', stderr: '', code: 0 },
+    'ours-mcp --version': { stdout: '0.1.2', stderr: '', code: 0 },
+    'ours-mcp status': { stdout: 'running', stderr: '', code: 0 },
+    'loginctl show-user': { stdout: 'Linger=yes', stderr: '', code: 0 },
+  });
+
+  /** A role with one loop, plus whatever the agent directory should contain. */
+  function withLoopRole(opts: {
+    lastWallMs?: number; health?: string; running?: boolean; operatorDisabled?: boolean;
+  } = {}) {
+    registerAdapter(fakeAdapter);
+    writeFileSync(join(dir, 'fleet.yaml'), [
+      'roles:', '  Coordinator: { harness: fake, session: acp, monitor: { enabled: false } }',
+      'loops:', '  health:', '    roles: [Coordinator]', '    interval: 10m',
+      '    prompt: check in', '',
+    ].join('\n'), { mode: 0o600 });   // loop delivery refuses a group/world-writable config
+    const agent = join(dir, '.ours-fleet', 'agents', 'Coordinator');
+    mkdirSync(agent, { recursive: true });
+    if (opts.running) writeFileSync(join(agent, '.control.sock'), '');
+    if (opts.lastWallMs !== undefined) writeFileSync(join(agent, '.scheduled-loops.json'),
+      JSON.stringify({
+        version: 1, role: 'Coordinator', generation: 'g',
+        clock: { lastWallMs: opts.lastWallMs }, health: opts.health ?? 'healthy', anomaly: null,
+        loops: {
+          health: {
+            definitionHash: 'a'.repeat(64), promptHash: 'b'.repeat(64), enabled: true,
+            operatorDisabled: opts.operatorDisabled ?? false,
+            nextScheduledAt: '2026-08-13T00:00:00.000Z',
+            nextDueAt: '2026-08-13T00:00:00.000Z', lastScheduledAt: null, lastStartedAt: null,
+            lastFinishedAt: null, lastOutcome: null, lastCancellationSource: null,
+            lastRunId: null, activeRunId: null, lastError: null,
+            counts: { started: 0, completed: 0, failed: 0, cancelled: 0,
+              skipped: 0, skippedBusy: 0, skippedMissed: 0 },
+          },
+        },
+      }), { mode: 0o600 });
+    return agent;
+  }
+
+  it('fails a running role whose checkpoint stopped advancing, however healthy it claims to be', async () => {
+    withLoopRole({ lastWallMs: Date.now() - 2 * 60 * 60_000, health: 'healthy', running: true });
+    const check = (await doctor({}, green, 'linux')).checks.find(c => c.name === 'loops: Coordinator')!;
+    expect(check.ok).toBe(false);
+    expect(check.detail).toContain('not checkpointing');
+    expect(check.detail).toContain('last recorded healthy');
+  });
+
+  it('passes a running role whose checkpoint is current', async () => {
+    withLoopRole({ lastWallMs: Date.now() - 5_000, running: true });
+    const check = (await doctor({}, green, 'linux')).checks.find(c => c.name === 'loops: Coordinator')!;
+    expect(check.ok).toBe(true);
+  });
+
+  it('does not cry wolf over a role that is simply not running', async () => {
+    withLoopRole({ lastWallMs: Date.now() - 2 * 60 * 60_000 });
+    const check = (await doctor({}, green, 'linux')).checks.find(c => c.name === 'loops: Coordinator')!;
+    expect(check.ok).toBe(true);
+    expect(check.detail).toContain('not running');
+  });
+
+  it('does not call a running role healthy when it never managed to write state at all', async () => {
+    withLoopRole({ running: true });   // ENOSPC at startup: socket up, no checkpoint ever written
+    const check = (await doctor({}, green, 'linux')).checks.find(c => c.name === 'loops: Coordinator')!;
+    expect(check.ok).toBe(false);
+    expect(check.detail).toContain('never written scheduled-loop state');
+  });
+
+  it('leaves a role with no enabled loop alone however old its checkpoint is', async () => {
+    withLoopRole({ lastWallMs: Date.now() - 6 * 60 * 60_000, running: true, operatorDisabled: true });
+    const check = (await doctor({}, green, 'linux')).checks.find(c => c.name === 'loops: Coordinator')!;
+    expect(check.ok).toBe(true);
+    expect(check.detail).toContain('by design');
+    expect(check.detail).not.toContain('not checkpointing');
+  });
+
+  it('surfaces a recorded failure on a running role', async () => {
+    withLoopRole({ lastWallMs: Date.now() - 5_000, health: 'failed', running: true });
+    const check = (await doctor({}, green, 'linux')).checks.find(c => c.name === 'loops: Coordinator')!;
+    expect(check.ok).toBe(false);
+    expect(check.detail).toContain('ours-fleet loops status Coordinator');
+  });
+});
+
 describe('doctor isolation reporting', () => {
   const green = (over: Record<string, ExecResult> = {}): Exec => execWith({
     'tmux -V': { stdout: 'tmux 3.6', stderr: '', code: 0 },

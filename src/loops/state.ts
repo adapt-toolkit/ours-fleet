@@ -59,6 +59,36 @@ export function scheduledLoopsPath(stateDir: string): string {
   return join(stateDir, '.scheduled-loops.json');
 }
 
+/**
+ * A live manager rewrites the checkpoint at least once per poll ceiling (60s).
+ * Past this bound the recorded `health` describes a manager that is no longer
+ * updating it — a dead scheduler, or one whose writes are failing, which is
+ * exactly the case where the field still reads `healthy` because the flip to
+ * `failed` could not be written. Readers must not repeat a stale field as fact.
+ */
+export const STORED_STATE_STALE_MS = 5 * 60_000;
+
+export interface StoredLoopVerdict {
+  health: ScheduledLoopsFile['health'] | 'stale';
+  recorded: ScheduledLoopsFile['health'];
+  stale: boolean;
+  ageMs: number;
+  /** Whether any loop still owes a run — nothing is expected of the file if not. */
+  scheduled: boolean;
+}
+
+/** Truthful health for a reader that only has the stored file to go on. */
+export function storedLoopHealth(file: ScheduledLoopsFile, now: number): StoredLoopVerdict {
+  const ageMs = Math.max(0, now - file.clock.lastWallMs);
+  // A role with nothing left to schedule stops polling on purpose, so its
+  // checkpoint stops advancing on purpose too. Only a role that still owes
+  // someone a run can be stale; calling a deliberately idle one stale would
+  // teach operators to ignore the word.
+  const scheduled = Object.values(file.loops).some(loop => loop.enabled && !loop.operatorDisabled);
+  const stale = scheduled && ageMs > STORED_STATE_STALE_MS;
+  return { health: stale ? 'stale' : file.health, recorded: file.health, stale, ageMs, scheduled };
+}
+
 export function readScheduledLoops(stateDir: string): ScheduledLoopsFile | undefined {
   try {
     const path = scheduledLoopsPath(stateDir);
@@ -68,14 +98,23 @@ export function readScheduledLoops(stateDir: string): ScheduledLoopsFile | undef
   } catch { return undefined; }
 }
 
+/** Persistence seam. Production uses the atomic replace; faults are injected here. */
+export type StateWriter = (path: string, contents: string, mode: number) => void;
+
 export class ScheduledLoopStateStore {
   readonly path: string;
   readonly fresh: boolean;
   state: ScheduledLoopsFile;
+  /** Consecutive failed checkpoints; 0 whenever the stored file is current. */
+  persistFailures = 0;
+  lastPersistError: string | null = null;
+  /** Health displaced by the persist_failed marker, restored when a write lands. */
+  private suppressed: { health: ScheduledLoopsFile['health']; anomaly: string | null } | null = null;
 
   constructor(
     stateDir: string, role: string, definitions: ResolvedRoleLoop[], now: number,
     private readonly log: (line: string) => void,
+    private readonly write: StateWriter = replaceFileAtomically,
   ) {
     this.path = scheduledLoopsPath(stateDir);
     let restored: ScheduledLoopsFile | undefined;
@@ -149,9 +188,60 @@ export class ScheduledLoopStateStore {
     this.persist();
   }
 
-  persist(): void {
-    replaceFileAtomically(this.path, JSON.stringify(this.state, null, 2) + '\n', 0o600);
-    chmodSync(this.path, 0o600);
+  /**
+   * Drop a transient anomaly once its cause is over — including one currently
+   * displaced by `persist_failed`, which would otherwise come back the moment a
+   * write finally lands.
+   */
+  clearAnomaly(kind: string): void {
+    if (this.suppressed?.anomaly === kind) this.suppressed = { health: 'healthy', anomaly: null };
+    if (this.state.anomaly === kind) {
+      this.state.health = 'healthy';
+      this.state.anomaly = null;
+    }
+  }
+
+  /**
+   * Checkpoint the state. A write failure — ENOSPC is the one seen in the field —
+   * must never propagate: every caller sits under a timer callback, and an
+   * exception there kills the scheduling chain for the life of the process while
+   * the last-written file goes on claiming the loops are healthy. So the failure
+   * is recorded in memory instead, where `status()` and the live control socket
+   * report it immediately, and the caller decides what to do with `false`.
+   *
+   * The `failed` marker is applied optimistically-in-reverse: it is rolled back
+   * just before each attempt, so that the write which finally lands records the
+   * real health rather than the outage that is now over.
+   */
+  persist(): boolean {
+    if (this.suppressed && this.state.anomaly === 'persist_failed') {
+      this.state.health = this.suppressed.health;
+      this.state.anomaly = this.suppressed.anomaly;
+    }
+    try {
+      this.write(this.path, JSON.stringify(this.state, null, 2) + '\n', 0o600);
+      chmodSync(this.path, 0o600);
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException)?.code ?? (error as Error)?.name ?? 'Error';
+      if (this.state.anomaly !== 'persist_failed')
+        this.suppressed = { health: this.state.health, anomaly: this.state.anomaly };
+      this.state.health = 'failed';
+      this.state.anomaly = 'persist_failed';
+      this.lastPersistError = code;
+      this.persistFailures = increment(this.persistFailures);
+      if (this.persistFailures === 1)
+        this.log(`[${this.state.role}] scheduled loop state write failing (${code}); `
+          + 'cadence held and health reported failed until it lands');
+      return false;
+    }
+    if (this.persistFailures) {
+      this.log(`[${this.state.role}] scheduled loop persistence recovered after `
+        + `${this.persistFailures} failed write(s) (${this.lastPersistError})`);
+      this.persistFailures = 0;
+      this.lastPersistError = null;
+    }
+    this.suppressed = null;
+    return true;
   }
 }
 
