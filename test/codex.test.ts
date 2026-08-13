@@ -270,6 +270,57 @@ describe('Codex neutral permission mapping and the unattended floor (2.1)', () =
     expect(checkUnattendedFloor((t as { capabilities: never }).capabilities).meets).toBe(true);
   });
 
+  it('reports the actual codex-acp preset instead of the CLI flag translation', () => {
+    const workspace = a.effectivePermissions!(role({
+      session: 'acp',
+      permissions: { approval: 'allow', filesystem: 'workspace', unattended: 'deny' },
+    }));
+    expect(workspace).toMatchObject({
+      supported: true, exact: false,
+      native: { mode: 'agent', approval: 'on-request', sandbox: 'workspace-write' },
+      capabilities: ['read-state'],
+    });
+    expect((workspace as { warnings: string[] }).warnings.join('\n'))
+      .toContain('codex-acp 1.1.7');
+
+    const full = a.effectivePermissions!(role({
+      session: 'acp',
+      permissions: { approval: 'allow', filesystem: 'unrestricted', unattended: 'deny' },
+    }));
+    expect(full).toMatchObject({
+      supported: true, exact: true,
+      native: {
+        mode: 'agent-full-access', approval: 'never', sandbox: 'danger-full-access',
+      },
+    });
+    expect(checkUnattendedFloor((full as { capabilities: never }).capabilities).meets).toBe(true);
+
+    const reader = a.effectivePermissions!(role({
+      session: 'acp',
+      permissions: { approval: 'allow', filesystem: 'read-only', unattended: 'deny' },
+    }));
+    expect(reader).toMatchObject({
+      supported: true, exact: false,
+      native: { mode: 'read-only', approval: 'on-request', sandbox: 'read-only' },
+      capabilities: ['read-state'],
+    });
+  });
+
+  it('reports the live ACP preset as the effective permission mode', () => {
+    expect(a.effectivePermissionMode!(role({
+      session: 'acp',
+      permissions: { approval: 'allow', filesystem: 'workspace', unattended: 'deny' },
+    }))).toEqual({ fleetMode: 'auto', nativeMode: 'agent' });
+    expect(a.effectivePermissionMode!(role({
+      session: 'acp',
+      permissions: { approval: 'allow', filesystem: 'unrestricted', unattended: 'deny' },
+    }))).toEqual({ fleetMode: 'allow', nativeMode: 'agent-full-access' });
+    expect(a.effectivePermissionMode!(role({
+      session: 'tmux',
+      permissions: { approval: 'allow', filesystem: 'workspace', unattended: 'deny' },
+    }))).toEqual({ fleetMode: 'allow', nativeMode: 'never' });
+  });
+
   it('maps public modes to Codex approval policies with sandbox kept separate', () => {
     const native = (approval: 'ask' | 'auto' | 'allow') =>
       (a.translatePermissions({ approval, filesystem: 'read-only', unattended: 'deny' }) as

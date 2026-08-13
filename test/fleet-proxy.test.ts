@@ -77,6 +77,15 @@ describe('managed fleet spawn defaults', () => {
       .options.approval).toBe('allow');
   });
 
+  it('inherits configured ACP intent even when the live preset reports a narrower mode', () => {
+    const workspaceCaller = {
+      ...caller,
+      permissions: { ...caller.permissions, filesystem: 'workspace' as const },
+    } satisfies ResolvedRole;
+    expect(inheritCallerSpawnDefaults(workspaceCaller, { name: 'Child' }, undefined)
+      .options.approval).toBe('allow');
+  });
+
   it('fails closed when omitted inheritance cannot be normalized', () => {
     const unsupported = { ...caller, harness: 'missing-adapter' } satisfies ResolvedRole;
     expect(() => inheritCallerSpawnDefaults(unsupported, { name: 'Child' }, undefined))

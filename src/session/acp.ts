@@ -1,7 +1,9 @@
 import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
-import { existsSync, readFileSync, writeFileSync } from 'node:fs';
-import { isAbsolute, join, relative, resolve } from 'node:path';
+import {
+  existsSync, lstatSync, readFileSync, readlinkSync, realpathSync, writeFileSync,
+} from 'node:fs';
+import { basename, dirname, isAbsolute, join, relative, resolve } from 'node:path';
 import { Readable, Writable } from 'node:stream';
 
 import * as acp from '@agentclientprotocol/sdk';
@@ -53,9 +55,114 @@ const TERMINAL_TOOL_STATUSES = new Set(['completed', 'failed']);
 
 const SCHEDULED_LOOP_REDACTION = '[scheduled-loop content redacted]';
 const OWNER_COMMENTARY_REDACTION = '[assistant commentary redacted]';
+const MAX_CANONICAL_SYMLINK_DEPTH = 40;
 
 const scheduledTurn = (turn: { origin?: PromptOrigin } | undefined): boolean =>
   turn?.origin?.kind === 'scheduled-loop';
+
+/**
+ * Two matching realpath observations narrow the opportunity for a concurrent
+ * retarget, but are only an advisory consistency check: they do not lock the
+ * path. A mutation after the completed check remains an unavoidable TOCTOU
+ * window until ACP offers handle-based access.
+ */
+function stableRealpath(path: string): string | undefined {
+  const first = realpathSync.native(path);
+  const second = realpathSync.native(path);
+  return first === second ? first : undefined;
+}
+
+type MissingPathInspection =
+  | { kind: 'absent' }
+  | { kind: 'symlink'; target: string }
+  | { kind: 'unsafe' };
+
+/** Distinguish an absent component from a dangling symlink at that component. */
+function inspectMissingPath(path: string): MissingPathInspection {
+  try {
+    const stat = lstatSync(path);
+    // realpath said ENOENT but lstat found a non-link: the path changed while
+    // inspected, so there is no coherent canonical answer to trust.
+    if (!stat.isSymbolicLink()) return { kind: 'unsafe' };
+    try {
+      return { kind: 'symlink', target: resolve(dirname(path), readlinkSync(path)) };
+    } catch {
+      return { kind: 'unsafe' };
+    }
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === 'ENOENT'
+      ? { kind: 'absent' }
+      : { kind: 'unsafe' };
+  }
+}
+
+/**
+ * Canonicalize an existing path, or a not-yet-created target through its
+ * nearest existing ancestor. Dangling links are followed explicitly because
+ * realpath reports their absent target as ENOENT. Only genuine absence is
+ * recoverable; loops, permissions, races, and every other error fail closed.
+ */
+function canonicalTarget(path: string, symlinkDepth = 0): string | undefined {
+  let probe = resolve(path);
+  const missing: string[] = [];
+  while (true) {
+    try {
+      let canonical = stableRealpath(probe);
+      if (!canonical) return undefined;
+      // A component may have appeared while the ancestor search was in
+      // progress. Re-walk the suffix so a newly-created symlink is resolved,
+      // not treated as a lexical child of the old ancestor.
+      let logical = probe;
+      for (let i = 0; i < missing.length; i++) {
+        logical = resolve(logical, missing[i]);
+        try {
+          const appeared = stableRealpath(logical);
+          if (!appeared) return undefined;
+          canonical = appeared;
+        } catch (error) {
+          if ((error as NodeJS.ErrnoException).code !== 'ENOENT') return undefined;
+          const inspected = inspectMissingPath(logical);
+          if (inspected.kind === 'unsafe') return undefined;
+          if (inspected.kind === 'symlink') {
+            if (symlinkDepth >= MAX_CANONICAL_SYMLINK_DEPTH) return undefined;
+            return canonicalTarget(
+              resolve(inspected.target, ...missing.slice(i + 1)), symlinkDepth + 1);
+          }
+          return resolve(canonical, ...missing.slice(i));
+        }
+      }
+      return canonical;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') return undefined;
+      const inspected = inspectMissingPath(probe);
+      if (inspected.kind === 'unsafe') return undefined;
+      if (inspected.kind === 'symlink') {
+        if (symlinkDepth >= MAX_CANONICAL_SYMLINK_DEPTH) return undefined;
+        return canonicalTarget(resolve(inspected.target, ...missing), symlinkDepth + 1);
+      }
+      const parent = dirname(probe);
+      if (parent === probe) return undefined;
+      missing.unshift(basename(probe));
+      probe = parent;
+    }
+  }
+}
+
+function canonicallyWithin(root: string, candidates: string[]): boolean {
+  if (candidates.length === 0) return false;
+  try {
+    const firstRoot = realpathSync.native(root);
+    const paths = candidates.map(canonicalTarget);
+    const secondRoot = realpathSync.native(root);
+    if (firstRoot !== secondRoot || paths.some(path => path === undefined)) return false;
+    return paths.every(candidate => {
+      const rel = relative(firstRoot, candidate!);
+      return rel === '' || (!rel.startsWith('..') && !isAbsolute(rel));
+    });
+  } catch {
+    return false;
+  }
+}
 
 /**
  * Map typed prompt provenance to the conversation ledger's source vocabulary.
@@ -1050,11 +1157,7 @@ export class AcpSession implements SessionHandle {
     const locations = params.toolCall.locations ?? [];
     if (locations.length === 0) return false;
     const cwd = resolve(this.options.cwd);
-    return locations.every(location => {
-      const path = resolve(location.path);
-      const rel = relative(cwd, path);
-      return rel === '' || (!rel.startsWith('..') && !isAbsolute(rel));
-    });
+    return canonicallyWithin(cwd, locations.map(location => resolve(location.path)));
   }
 
   private recordUpdate(update: acp.SessionUpdate): void {

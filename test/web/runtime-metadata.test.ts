@@ -28,12 +28,14 @@ describe('runtime metadata presentation', () => {
     expect(shown['Native mode']).toBe('Not reported');
   });
 
-  it('shows effective live normalized and harness-native modes', () => {
-    const shown = values({ role: { config: { permissions: { approval: 'ask' },
-      nativeRuntime: { approval: 'untrusted' } } }, status: { session: {
-      permissionMode: { fleetMode: 'allow', nativeMode: 'never' },
+  it('shows the effective live ACP preset instead of the configured CLI translation', () => {
+    const shown = values({ role: { config: { permissions: { approval: 'allow' },
+      nativeRuntime: { approval: 'never' } } }, status: { session: {
+      permissionMode: { fleetMode: 'auto', nativeMode: 'agent' },
     } } });
-    expect(shown.Permission).toBe('allow');
-    expect(shown['Native mode']).toBe('never');
+    expect(shown.Permission).toBe('auto');
+    expect(shown['Native mode']).toBe('agent');
+    expect(shown.Permission).not.toBe('allow');
+    expect(shown['Native mode']).not.toBe('never');
   });
 });
