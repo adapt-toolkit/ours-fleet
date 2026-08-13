@@ -667,7 +667,12 @@ export async function runOnce(
         const steered = result.accepted
           && (result.detail === 'injected' || result.detail === 'startedNewTurn');
         const boundary = result.safeBoundary;
-        const boundaryDetail = boundary
+        const queuedAfterSteeringFailure = result.detail?.startsWith('steering rejected;') === true;
+        const boundaryDetail = boundary && queuedAfterSteeringFailure
+          ? boundary.state === 'timeout'
+            ? `after_tool timed out after ${boundary.waitedMs}ms; steering rejected, queued without cancellation`
+            : `after_tool ${boundary.state} boundary after ${boundary.waitedMs}ms; steering rejected, queued without cancellation`
+          : boundary
           ? boundary.state === 'timeout'
             ? `after_tool timed out after ${boundary.waitedMs}ms; steered without cancellation`
             : boundary.state === 'unsupported'
@@ -677,7 +682,9 @@ export async function runOnce(
         return {
           succeeded: result.succeeded || steered,
           outcome: steered ? result.detail! : result.outcome,
-          detail: boundaryDetail,
+          detail: result.succeeded || steered || !boundary
+            ? boundaryDetail
+            : [result.detail, boundaryDetail].filter(Boolean).join('; '),
           ...(boundary ? { safeBoundary: boundary.state } : {}),
         };
       },

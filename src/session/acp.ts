@@ -498,8 +498,30 @@ export class AcpSession implements SessionHandle {
   }
 
   /**
-   * Monitor-only safe-boundary delivery. Steering is the interruption: this
-   * path never calls session/cancel and never resolves a pending permission.
+   * Steering is an optional admission fast path, not the only safe way to
+   * deliver a wake. Codex can reject `_session/steering` while a long-running
+   * turn is between tools. Queue one ordinary, non-cancelling prompt in that
+   * case and wait for its terminal result. This keeps the monitor's cursor
+   * uncommitted until the wake really runs and, critically, keeps one rejected
+   * steering response from becoming a tight replay loop.
+   */
+  private async steerOrQueueWake(
+    text: string, options: SubmitPromptOptions,
+  ): Promise<TurnResult> {
+    const steered = await this.steerPrompt(text);
+    if (steered.accepted || steered.detail !== 'ACP steering failed'
+        || this.closing || !this.isAlive()) return steered;
+    const queued = await this.submitPrompt(text, { ...options, interrupt: false, steer: false });
+    return {
+      ...queued,
+      detail: `steering rejected; queued delivery ${queued.detail ?? queued.outcome}`,
+    };
+  }
+
+  /**
+   * Monitor-only safe-boundary delivery. Steering is the preferred live
+   * insertion and rejected steering is queued: this path never calls
+   * session/cancel and never resolves a pending permission.
    */
   async submitPromptAfterTool(
     text: string, options: SubmitPromptOptions = {},
@@ -518,7 +540,7 @@ export class AcpSession implements SessionHandle {
     }
     if (initialToolCount === 0) {
       this.recordAfterToolDelivery('direct', 0, 0);
-      const result = await this.steerPrompt(text);
+      const result = await this.steerOrQueueWake(text, options);
       return { ...result, safeBoundary: { state: 'direct', waitedMs: 0, activeToolCount: 0 } };
     }
 
@@ -539,7 +561,7 @@ export class AcpSession implements SessionHandle {
     const state = atBoundary ? 'after_tool' : 'timeout';
     const remainingToolCount = this.activeToolCalls.size;
     this.recordAfterToolDelivery(state, remainingToolCount, waitedMs);
-    const result = await this.steerPrompt(text);
+    const result = await this.steerOrQueueWake(text, options);
     return {
       ...result,
       safeBoundary: { state, waitedMs, activeToolCount: remainingToolCount },
