@@ -12,7 +12,7 @@ import {
 import { replaceFileAtomically } from '../atomic-file.js';
 import { resolveEndpoint, type FetchLike } from '../monitor.js';
 import {
-  ACP_CANCEL_DEADLINE_EXCEEDED, SessionControlError,
+  ACP_CANCEL_DEADLINE_EXCEEDED, SessionControlError, interruptOutcome,
   type QueuedPrompt, type SessionEvent, type SessionHandle, type TurnResult,
 } from '../session/types.js';
 import { VERSION } from '../version.js';
@@ -1016,7 +1016,7 @@ export class OwnerChannel implements OwnerChannelHandle {
       harness: this.options.harness,
       version: VERSION,
       snapshot: () => this.options.session.snapshot(),
-      interrupt: () => this.options.session.interrupt('owner'),
+      interrupt: async () => interruptOutcome(await this.options.session.interrupt('owner')),
       runHarnessCommand: command => this.runHarnessCommand(sender, command, wireId),
       restart: mode => this.restartSelf(sender, mode, wireId),
       comments: () => this.commentsState(),

@@ -241,6 +241,12 @@ export class ScheduledLoopManager implements ScheduledLoopManagerHandle {
    * every later tick reports `skipped_busy` forever — the loop looks scheduled
    * while nothing has run since. Releasing the slot is honest, and it is safe
    * because `finish` still refuses to double-report a run it no longer owns.
+   *
+   * Releasing the loop's own slot is only half of it. The cancellation that
+   * never settled is still holding the arbiter's admission boundary, so the
+   * generation it belongs to has to be retired in the same step — otherwise the
+   * loop believes it is free while every later producer, scheduled or owner,
+   * queues behind a promise that will never resolve.
    */
   private armAbandon(
     definition: ResolvedRoleLoop, state: LoopRuntimeState, runId: string,
@@ -256,8 +262,9 @@ export class ScheduledLoopManager implements ScheduledLoopManagerHandle {
       this.store.state.health = 'degraded';
       this.store.state.anomaly = 'abandoned_unsettled';
       this.store.persist();
+      this.arbiter.retireStalledAdmission();
       this.deps.log(`[${this.role}] loop ${definition.name} abandoned run=${runId.slice(0, 11)}: `
-        + 'cancellation never settled');
+        + 'cancellation never settled; admission released');
     }, this.deps.cancelAbandonMs ?? LOOP_CANCEL_ABANDON_MS);
     this.runTimeouts.add(abandon);
   }

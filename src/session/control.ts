@@ -3,7 +3,7 @@ import { chmodSync, existsSync, readFileSync, rmSync, writeFileSync } from 'node
 import { createConnection, createServer, type Server, type Socket } from 'node:net';
 import { join } from 'node:path';
 
-import { SessionControlError } from './types.js';
+import { SessionControlError, interruptOutcome } from './types.js';
 import type { ControlFailureKind, SessionHandle } from './types.js';
 import type {
   OwnerChannelHandle, OwnerChannelManagementRequest,
@@ -343,7 +343,7 @@ export class RoleControlServer {
         case 'interrupt': {
           // Forced recovery cancelled the turn just as surely as a cooperative
           // stop did. Report HOW, never as a failed operation.
-          const outcome = await this.session.interrupt('local-console');
+          const outcome = interruptOutcome(await this.session.interrupt('local-console'));
           this.write(socket, { version: 1, id: request.id, ok: true, result: outcome });
           return;
         }
@@ -484,7 +484,7 @@ export class RoleControlServer {
             this.write(socket, { version: 1, id: request.id, ok: true, result: existing });
             return;
           }
-          const outcome = await this.session.interrupt('local-console');
+          const outcome = interruptOutcome(await this.session.interrupt('local-console'));
           const receipt = {
             accepted: true, commandId: request.commandId, at: new Date().toISOString(),
             ...outcome,

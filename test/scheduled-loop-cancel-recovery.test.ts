@@ -154,6 +154,15 @@ describe('scheduled-loop cancellation recovery (D6)', () => {
     });
     expect(manager.status()).toMatchObject({ health: 'degraded', anomaly: 'abandoned_unsettled' });
 
+    // The slot is free, and so is admission itself: a later producer gets an
+    // answer from the arbiter instead of queueing behind the stuck cancellation
+    // for the life of the process. Without the retirement this never resolves.
+    const attempt = await arbiter.tryScheduled(
+      'later scheduled work', { kind: 'scheduled-loop', loop: 'health', runId: 'sl_probe' });
+    expect(['started', 'skipped_busy', 'unavailable']).toContain(attempt.state);
+    const [owner] = await Promise.allSettled([arbiter.queuePrompt('later owner prompt')]);
+    expect(owner.status).toMatch(/fulfilled|rejected/);
+
     await manager.stop();
     await session.close();
   });

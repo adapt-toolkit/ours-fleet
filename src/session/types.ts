@@ -99,6 +99,20 @@ export interface InterruptOutcome {
 }
 
 /**
+ * What a `SessionHandle.interrupt` implementation may resolve. Before 0.17.1 the
+ * contract was `Promise<void>`, and resolving at all meant the cancellation had
+ * taken effect cooperatively — so an implementation written against that
+ * contract stays valid and keeps its exact meaning. Only in-tree consumers read
+ * the richer outcome, and they normalize through `interruptOutcome` first.
+ */
+export type InterruptResult = InterruptOutcome | void;
+
+/** The one place the legacy `void` reply is given its meaning: `settled`. */
+export function interruptOutcome(result: InterruptResult): InterruptOutcome {
+  return result ?? { state: 'settled' };
+}
+
+/**
  * A prompt the live session has taken responsibility for. Interactive callers
  * stop here: the session has the prompt, and waiting for the turn to finish is
  * a different question with a different, much longer, timescale.
@@ -298,8 +312,12 @@ export interface SessionHandle {
    * Cancel the active turn. Resolves when the cancellation has taken effect —
    * cooperatively (`settled`) or through bounded forced recovery (`forced`).
    * It rejects only when the cancellation itself could not be delivered.
+   *
+   * The return type is widened to `InterruptResult` for one reason: an
+   * implementation written against the pre-0.17.1 `Promise<void>` contract must
+   * keep compiling. Read it through `interruptOutcome`, never directly.
    */
-  interrupt(source?: TurnCancellationSource): Promise<InterruptOutcome>;
+  interrupt(source?: TurnCancellationSource): Promise<InterruptResult>;
   respondPermission(permissionId: string, optionId: string): boolean;
   /** Generation-bound browser decision; stale/settled/invalid all fail closed. */
   respondPermissionV2?(
