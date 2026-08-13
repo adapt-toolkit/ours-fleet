@@ -36,7 +36,7 @@ const outstanding = new Map();
 const permissionCompletionDelay = new Map();
 
 /** Ask for the same tool, offering both reject kinds so selection order matters. */
-const requestPermission = promptId => {
+const requestPermission = (promptId, location = process.cwd()) => {
   const id = permissionRequestId++;
   pendingPermission.set(id, { promptId });
   send({
@@ -50,7 +50,7 @@ const requestPermission = promptId => {
         title: 'Fixture edit',
         kind: 'edit',
         status: 'pending',
-        locations: [{ path: process.cwd() }],
+        locations: [{ path: location }],
       },
       options: [
         { optionId: 'allow', name: 'Allow', kind: 'allow_once' },
@@ -267,7 +267,17 @@ createInterface({ input: process.stdin }).on('line', line => {
         if (completionDelay)
           permissionCompletionDelay.set(message.id, Number(completionDelay[1] ?? 100));
         outstanding.set(message.id, times);
-        for (let i = 0; i < times; i++) requestPermission(message.id);
+        const location = /\bpermission location dangling\b/i.test(text)
+          ? `${process.cwd()}/dangling.txt`
+          : /\bpermission location escape\b/i.test(text)
+          ? `${process.cwd()}/escape/new.txt`
+          : /\bpermission location missing\b/i.test(text)
+            ? `${process.cwd()}/new/deep/file.txt`
+            : /\bpermission location loop\b/i.test(text)
+              ? `${process.cwd()}/loop/file.txt`
+              : /\bpermission location swap\b/i.test(text)
+                ? `${process.cwd()}/swap/file.txt` : process.cwd();
+        for (let i = 0; i < times; i++) requestPermission(message.id, location);
       } else {
         answerPrompt(message.id, stopReasonFor(text));
       }

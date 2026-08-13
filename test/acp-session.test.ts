@@ -1,4 +1,4 @@
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { createConnection, createServer, type Socket } from 'node:net';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
@@ -25,6 +25,7 @@ async function start(
     modeId?: string; env?: Record<string, string>; log?(line: string): void;
     cancelGraceMs?: number;
     afterToolBoundaryTimeoutMs?: number;
+    unattended?: 'deny' | 'wait';
     permissionMode?: { fleetMode: 'ask' | 'auto' | 'allow'; nativeMode: string };
   } = {},
 ) {
@@ -37,7 +38,9 @@ async function start(
     env: extra.env ?? {},
     stateDir,
     mode: 'fresh',
-    permissions: { approval, filesystem: 'workspace', unattended: 'deny' },
+    permissions: {
+      approval, filesystem: 'workspace', unattended: extra.unattended ?? 'deny',
+    },
     modeId: extra.modeId,
     permissionMode: extra.permissionMode,
     log: extra.log ?? (() => {}),
@@ -151,6 +154,97 @@ describe('AcpSession', () => {
     expect(result.accepted).toBe(true);
     expect(session.eventsSince(0).filter(event => event.kind === 'agent_text').map(event => event.text))
       .toContain(':allow');
+    await session.close();
+  });
+
+  it('auto-allows a nonexistent edit target through its canonical in-workspace ancestor', async () => {
+    const session = await start('allow');
+    await session.submitPrompt('permission location missing');
+    expect(session.eventsSince(0)).toContainEqual(expect.objectContaining({
+      kind: 'permission', status: 'completed', decision: 'allowed',
+    }));
+    await session.close();
+  });
+
+  it('does not auto-allow a nonexistent target through a symlink escaping the workspace', async () => {
+    const session = await start('allow', { unattended: 'wait' });
+    const outside = mkdtempSync(join(tmpdir(), 'ours-fleet-acp-outside-'));
+    dirs.push(outside);
+    symlinkSync(outside, join(dirs.at(-2)!, 'escape'));
+    const queued = await session.queuePrompt('permission location escape');
+    for (let i = 0; i < 50 && !session.snapshot().pendingPermissionId; i++)
+      await new Promise(resolve => setTimeout(resolve, 10));
+    expect(session.eventsSince(0)).toContainEqual(expect.objectContaining({
+      kind: 'permission', status: 'pending', title: 'Fixture edit',
+    }));
+    expect(session.respondPermission(session.snapshot().pendingPermissionId!, 'reject')).toBe(true);
+    await queued.completion;
+    await session.close();
+  });
+
+  it('does not auto-allow an in-workspace dangling symlink to an absent outside target', async () => {
+    const session = await start('allow', { unattended: 'wait' });
+    const workspace = dirs.at(-1)!;
+    const outside = mkdtempSync(join(tmpdir(), 'ours-fleet-acp-dangling-outside-'));
+    dirs.push(outside);
+    symlinkSync(join(outside, 'created.txt'), join(workspace, 'dangling.txt'));
+
+    const queued = await session.queuePrompt('permission location dangling');
+    for (let i = 0; i < 50 && !session.snapshot().pendingPermissionId; i++)
+      await new Promise(resolve => setTimeout(resolve, 10));
+    expect(session.eventsSince(0)).toContainEqual(expect.objectContaining({
+      kind: 'permission', status: 'pending', title: 'Fixture edit',
+    }));
+    expect(session.respondPermission(session.snapshot().pendingPermissionId!, 'reject')).toBe(true);
+    await queued.completion;
+    await session.close();
+  });
+
+  it('auto-allows a dangling symlink whose absent target remains in the workspace', async () => {
+    const session = await start('allow');
+    const workspace = dirs.at(-1)!;
+    symlinkSync(join(workspace, 'not-created-yet.txt'), join(workspace, 'dangling.txt'));
+
+    await session.submitPrompt('permission location dangling');
+    expect(session.eventsSince(0)).toContainEqual(expect.objectContaining({
+      kind: 'permission', status: 'completed', decision: 'allowed',
+    }));
+    await session.close();
+  });
+
+  it('evaluates each request against the symlink target current for that request', async () => {
+    const session = await start('allow', { unattended: 'wait' });
+    const workspace = dirs.at(-1)!;
+    const inside = join(workspace, 'inside');
+    mkdirSync(inside);
+    symlinkSync(inside, join(workspace, 'swap'));
+    await session.submitPrompt('permission location swap');
+    expect(session.eventsSince(0)).toContainEqual(expect.objectContaining({
+      kind: 'permission', status: 'completed', decision: 'allowed',
+    }));
+
+    rmSync(join(workspace, 'swap'));
+    const outside = mkdtempSync(join(tmpdir(), 'ours-fleet-acp-swap-'));
+    dirs.push(outside);
+    symlinkSync(outside, join(workspace, 'swap'));
+    const queued = await session.queuePrompt('permission location swap');
+    for (let i = 0; i < 50 && !session.snapshot().pendingPermissionId; i++)
+      await new Promise(resolve => setTimeout(resolve, 10));
+    expect(session.snapshot().pendingPermissionId).toBeTruthy();
+    expect(session.respondPermission(session.snapshot().pendingPermissionId!, 'reject')).toBe(true);
+    await queued.completion;
+    await session.close();
+  });
+
+  it('fails closed on a symlink loop while canonicalizing a location', async () => {
+    const session = await start('allow', { unattended: 'wait' });
+    symlinkSync('loop', join(dirs.at(-1)!, 'loop'));
+    const queued = await session.queuePrompt('permission location loop');
+    for (let i = 0; i < 50 && !session.snapshot().pendingPermissionId; i++)
+      await new Promise(resolve => setTimeout(resolve, 10));
+    expect(session.snapshot().pendingPermissionId).toBeTruthy();
+    expect(session.respondPermission(session.snapshot().pendingPermissionId!, 'reject')).toBe(true);
+    await queued.completion;
     await session.close();
   });
 

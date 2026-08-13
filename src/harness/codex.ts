@@ -33,6 +33,7 @@ const LAUNCHERS = ['auto', 'ours-codex', 'codex'];
 const SANDBOX_MODES = ['read-only', 'workspace-write', 'danger-full-access'];
 /** Codex CLI's accepted `--ask-for-approval` values. */
 const APPROVAL_POLICIES = ['untrusted', 'on-request', 'never'];
+const BUNDLED_CODEX_ACP_VERSION = '1.1.7';
 
 /**
  * What an unattended role can actually do under Codex's native settings.
@@ -68,6 +69,22 @@ function acpAgentMode(role: ResolvedRole): string | undefined {
   if (sandbox === 'workspace-write') return 'agent';
   if (sandbox === 'danger-full-access') return 'agent-full-access';
   return undefined;
+}
+
+function acpModePermissions(mode: string | undefined): {
+  approval: string; sandbox: string;
+} {
+  if (mode === 'read-only') return { approval: 'on-request', sandbox: 'read-only' };
+  if (mode === 'agent-full-access')
+    return { approval: 'never', sandbox: 'danger-full-access' };
+  return { approval: 'on-request', sandbox: 'workspace-write' };
+}
+
+function fleetModeForApproval(nativeMode: string): 'ask' | 'auto' | 'allow' {
+  if (nativeMode === 'never') return 'allow';
+  if (nativeMode === 'on-request') return 'auto';
+  if (nativeMode === 'untrusted') return 'ask';
+  throw new Error(`unsupported Codex approval policy '${nativeMode}'`);
 }
 
 /** Resolve & validate the per-role approval policy, throwing on an unknown value. */
@@ -297,6 +314,22 @@ export function makeCodexAdapter(exec: Exec = realExec): HarnessAdapter {
       if (!translated.supported) return translated;
       const approval = approvalPolicy(role) ?? 'on-request';
       const sandbox = sandboxMode(role) ?? 'workspace-write';
+      if (role.session === 'acp') {
+        const mode = acpAgentMode(role) ?? 'agent';
+        const actual = acpModePermissions(mode);
+        const exact = actual.approval === approval && actual.sandbox === sandbox;
+        return {
+          ...translated,
+          native: { mode, ...actual },
+          exact,
+          warnings: exact ? [] : [
+            `bundled codex-acp ${BUNDLED_CODEX_ACP_VERSION} mode '${mode}' actually uses `
+              + `approval=${actual.approval} sandbox=${actual.sandbox}; this does not exactly `
+              + `represent approval=${approval} sandbox=${sandbox}`,
+          ],
+          capabilities: codexCapabilities(actual.approval, actual.sandbox),
+        };
+      }
       return {
         ...translated,
         native: { approval, sandbox },
@@ -305,12 +338,18 @@ export function makeCodexAdapter(exec: Exec = realExec): HarnessAdapter {
     },
 
     effectivePermissionMode(role) {
+      if (role.session === 'acp') {
+        const nativeMode = acpAgentMode(role) ?? 'agent';
+        return {
+          fleetMode: fleetModeForApproval(acpModePermissions(nativeMode).approval), nativeMode,
+        };
+      }
       const nativeMode = approvalPolicy(role) ?? 'untrusted';
-      const fleetMode = nativeMode === 'never' ? 'allow'
-        : nativeMode === 'on-request' ? 'auto'
-          : nativeMode === 'untrusted' ? 'ask' : undefined;
-      if (!fleetMode) throw new Error(`unsupported Codex approval policy '${nativeMode}'`);
-      return { fleetMode, nativeMode };
+      return { fleetMode: fleetModeForApproval(nativeMode), nativeMode };
+    },
+
+    inheritedPermissionMode(role) {
+      return fleetModeForApproval(approvalPolicy(role) ?? 'untrusted');
     },
 
     vocabulary: {

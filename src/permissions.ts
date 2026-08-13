@@ -97,6 +97,12 @@ export function effectivePermissionMode(role: ResolvedRole): {
   return adapter.effectivePermissionMode(role);
 }
 
+/** Preserve configured intent when a managed child inherits from its caller. */
+export function inheritedPermissionMode(role: ResolvedRole): import('./config.js').FleetPermissionMode {
+  const adapter = getAdapter(role.harness);
+  return adapter.inheritedPermissionMode?.(role) ?? effectivePermissionMode(role).fleetMode;
+}
+
 /**
  * Find native settings that contradict the neutral block. Only fires when the
  * operator wrote BOTH — a role that states its intent once, neutrally or

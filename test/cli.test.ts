@@ -389,7 +389,11 @@ describe('ours-fleet CLI', () => {
     writeFileSync(join(dir, 'fleet.yaml'),
       'roles:\n'
       + '  Lossy:\n    harness: claude-code\n    permissions:\n      approval: allow\n'
-      + '  Exact:\n    harness: codex\n    permissions:\n      approval: allow\n      filesystem: unrestricted\n');
+      + '  Exact:\n    harness: codex\n    permissions:\n      approval: allow\n      filesystem: unrestricted\n'
+      + '  AcpWorkspace:\n    harness: codex\n    session: acp\n'
+      + '    permissions:\n      approval: allow\n      filesystem: workspace\n      unattended: deny\n'
+      + '  AcpFull:\n    harness: codex\n    session: acp\n'
+      + '    permissions:\n      approval: allow\n      filesystem: unrestricted\n      unattended: deny\n');
 
     const cfg = await run(['config']);
     const doc = await run(['doctor']);
@@ -403,7 +407,16 @@ describe('ours-fleet CLI', () => {
     // The exact Codex combination stays quiet in both.
     expect(cfg.stdout).not.toContain("role 'Exact':");
     expect(doc.stdout).toMatch(/permissions: Exact.*\(exact\)/);
-  });
+
+    const ACP_WARNING = "role 'AcpWorkspace': bundled codex-acp 1.1.7 mode 'agent' actually "
+      + 'uses approval=on-request sandbox=workspace-write; this does not exactly represent '
+      + 'approval=never sandbox=workspace-write';
+    expect(cfg.stdout).toContain(ACP_WARNING);
+    expect(doc.stdout).toContain(ACP_WARNING);
+    expect(doc.stdout).toMatch(/unattended floor: AcpWorkspace.*MISSING.*workspace-edit/);
+    expect(cfg.stdout).not.toContain("role 'AcpFull':");
+    expect(doc.stdout).toMatch(/permissions: AcpFull.*mode=agent-full-access.*\(exact\)/);
+  }, 10_000);
 
   it('status names a held-down role, its reason and when (3.2)', async () => {
     const { mkdirSync, writeFileSync } = await import('node:fs');

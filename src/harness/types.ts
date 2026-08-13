@@ -100,6 +100,8 @@ export interface HarnessAdapter {
     fleetMode: FleetPermissionMode;
     nativeMode: string;
   };
+  /** Configured portable intent to inherit when a live runtime preset is narrower. */
+  inheritedPermissionMode?(role: ResolvedRole): FleetPermissionMode;
   /**
    * REQUIRED. Every adapter must either translate neutral permissions or
    * explicitly declare that it cannot. Enforced at registration.
