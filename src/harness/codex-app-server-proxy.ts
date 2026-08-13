@@ -90,23 +90,38 @@ export function runCodexAppServerProxy(): void {
   });
   child.stdout.pipe(process.stdout);
   child.stderr.pipe(process.stderr);
+  const input = createInterface({ input: process.stdin });
+  let finished = false;
+  const finish = (code: number) => {
+    if (finished) return;
+    finished = true;
+    process.exitCode = code;
+    input.close();
+  };
   child.once('error', error => {
     process.stderr.write(`ours-fleet Codex app-server proxy: ${error.message}\n`);
-    process.exitCode = 1;
+    finish(1);
   });
   child.once('exit', (code, signal) => {
-    process.exitCode = code ?? (signal ? 1 : 0);
+    finish(code ?? (signal ? 1 : 0));
   });
 
-  const input = createInterface({ input: process.stdin });
+  // A child can close its input before Node delivers its exit event. Its exit
+  // status is the authoritative failure; do not let the resulting EPIPE race it.
+  child.stdin.on('error', () => {});
   input.on('line', line => {
+    if (finished) return;
     const output = rewriteCodexAppServerRequest(line, approval, expectedSandbox) + '\n';
     if (!child.stdin.write(output)) {
       input.pause();
-      child.stdin.once('drain', () => input.resume());
+      child.stdin.once('drain', () => {
+        if (!finished) input.resume();
+      });
     }
   });
-  input.once('close', () => child.stdin.end());
+  input.once('close', () => {
+    if (!child.stdin.destroyed) child.stdin.end();
+  });
   for (const signal of ['SIGINT', 'SIGTERM'] as const)
     process.once(signal, () => child.kill(signal));
 }

@@ -18,6 +18,46 @@ const request = (sandboxPolicy: Record<string, unknown>, approvalPolicy = 'on-re
   params: { threadId: 'T', approvalPolicy, sandboxPolicy },
 });
 
+const PROXY_EXIT_TIMEOUT_MS = 2_000;
+const proxy = join(dirname(fileURLToPath(import.meta.url)), '../dist/harness',
+  'codex-app-server-proxy.js');
+
+async function runProxy(realCodexPath: string): Promise<{
+  code: number | null;
+  signal: NodeJS.Signals | null;
+  stderr: string;
+  elapsedMs: number;
+}> {
+  const started = Date.now();
+  const child = spawn(process.execPath, [proxy, 'app-server'], {
+    env: {
+      ...process.env,
+      OURS_FLEET_CODEX_APPROVAL: 'never',
+      OURS_FLEET_CODEX_SANDBOX: 'workspace-write',
+      OURS_FLEET_REAL_CODEX_PATH: realCodexPath,
+    },
+    stdio: ['pipe', 'pipe', 'pipe'],
+  });
+  let stderr = '';
+  child.stderr.setEncoding('utf8');
+  child.stderr.on('data', chunk => { stderr += chunk; });
+  return new Promise((resolve, reject) => {
+    const timeout = setTimeout(() => {
+      child.stdin.destroy();
+      child.kill('SIGKILL');
+      reject(new Error(`proxy did not exit within ${PROXY_EXIT_TIMEOUT_MS}ms`));
+    }, PROXY_EXIT_TIMEOUT_MS);
+    child.once('error', error => {
+      clearTimeout(timeout);
+      reject(error);
+    });
+    child.once('close', (code, signal) => {
+      clearTimeout(timeout);
+      resolve({ code, signal, stderr, elapsedMs: Date.now() - started });
+    });
+  });
+}
+
 describe('Codex app-server permission proxy', () => {
   it.each([
     ['untrusted', 'read-only', { type: 'readOnly', networkAccess: false }],
@@ -50,8 +90,6 @@ describe('Codex app-server permission proxy', () => {
       `#!/bin/sh\nexec '${process.execPath.replaceAll("'", "'\\''")}' ` +
       `'${echoAgent.replaceAll("'", "'\\''")}' "$@"\n`, { mode: 0o700 });
     chmodSync(echo, 0o700);
-    const proxy = join(dirname(fileURLToPath(import.meta.url)), '../dist/harness',
-      'codex-app-server-proxy.js');
     const child = spawn(process.execPath, [proxy, 'app-server'], {
       env: {
         ...process.env,
@@ -73,5 +111,37 @@ describe('Codex app-server permission proxy', () => {
       child.once('exit', code => code === 0 ? resolve() : reject(new Error(`proxy exited ${code}`)));
       child.once('error', reject);
     });
+  });
+
+  it('exits promptly with a real child nonzero status after forwarding its error', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'ours-codex-proxy-crash-'));
+    dirs.push(dir);
+    const failingCodex = join(dir, 'failing-codex');
+    writeFileSync(failingCodex,
+      '#!/usr/bin/env node\n' +
+      "process.stderr.write('fixture Codex child failed\\n', () => process.exit(23));\n",
+      { mode: 0o700 });
+
+    // Keep stdin open: the proxy must stop reading when its child exits.
+    const result = await runProxy(failingCodex);
+
+    expect(result).toMatchObject({ code: 23, signal: null });
+    expect(result.stderr).toContain('fixture Codex child failed');
+    expect(result.elapsedMs).toBeLessThan(PROXY_EXIT_TIMEOUT_MS);
+  });
+
+  it('exits promptly and reports ENOENT when the configured child is missing', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'ours-codex-proxy-missing-'));
+    dirs.push(dir);
+    const missingCodex = join(dir, 'missing-codex');
+
+    // Keep stdin open: a spawn failure must also release the proxy input loop.
+    const result = await runProxy(missingCodex);
+
+    expect(result).toMatchObject({ code: 1, signal: null });
+    expect(result.stderr).toContain('ours-fleet Codex app-server proxy:');
+    expect(result.stderr).toContain(missingCodex);
+    expect(result.stderr).toContain('ENOENT');
+    expect(result.elapsedMs).toBeLessThan(PROXY_EXIT_TIMEOUT_MS);
   });
 });
