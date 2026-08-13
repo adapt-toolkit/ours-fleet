@@ -1,8 +1,8 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
-import { doctor } from '../src/doctor.js';
+import { delimiter, join } from 'node:path';
+import { doctor as doctorImpl } from '../src/doctor.js';
 import { loadConfig } from '../src/config.js';
 import { registerAdapter } from '../src/harness/registry.js';
 import { fakeAdapter } from './registry.test.js';
@@ -10,6 +10,7 @@ import '../src/harness/claude-code.js';   // registers the production adapters
 import '../src/harness/codex.js';
 import type { Exec, ExecResult } from '../src/exec.js';
 import type { FetchLike } from '../src/monitor.js';
+import { cliPath, installPrefix, pkgRoot } from './install-fixtures.js';
 
 // A stub daemon-API for the monitor reachability probe (design §5).
 const stubFetch = (state: 'ok' | '401' | 'down' | 'notdaemon' = 'ok'): FetchLike => async (url) => {
@@ -41,6 +42,18 @@ afterEach(() => {
   }
   rmSync(dir, { recursive: true, force: true });
 });
+
+// Every generic doctor test must be blind to the ambient host PATH: a machine
+// that happens to have a second ours-fleet installed would otherwise change the
+// report and fail tests about tmux or linger. Provenance tests pass their own
+// installScan; nothing else may inherit the environment's.
+const ISOLATED_SCAN = { path: '', argv1: undefined };
+const doctor = (
+  opts: Parameters<typeof doctorImpl>[0] = {},
+  exec?: Parameters<typeof doctorImpl>[1],
+  platform?: Parameters<typeof doctorImpl>[2],
+  fetchImpl?: Parameters<typeof doctorImpl>[3],
+) => doctorImpl({ installScan: ISOLATED_SCAN, ...opts }, exec, platform, fetchImpl);
 
 const execWith = (table: Record<string, ExecResult>): Exec =>
   async (cmd, args) => table[[cmd, args[0] ?? ''].join(' ')] ?? { stdout: '', stderr: '', code: 0 };
@@ -718,5 +731,75 @@ describe('native overrides contradicting neutral intent (2.4)', () => {
     expect(detail).toContain('permission_mode=plan');            // the native value
     expect(detail).toContain('permission_mode=bypassPermissions'); // the neutral translation
     expect(detail).toMatch(/harness_options\.permission_mode=plan wins/);
+  });
+});
+
+describe('doctor install provenance', () => {
+  let prefixes: string;
+  let legacy: string;
+  let current: string;
+  beforeEach(() => {
+    prefixes = mkdtempSync(join(tmpdir(), 'ours-fleet-doc-inst-'));
+    legacy = installPrefix(prefixes, 'legacy');
+    current = installPrefix(prefixes, 'current');
+  });
+  afterEach(() => rmSync(prefixes, { recursive: true, force: true }));
+
+  const checks = async (scan: { path: string; argv1?: string }) =>
+    (await doctorImpl({ installScan: scan }, execWith({}), 'linux', stubFetch())).checks
+      .filter(c => c.name.startsWith('install'));
+
+  it('names the build serving this process', async () => {
+    const [summary, ...rest] = await checks({ path: join(current, 'bin'), argv1: cliPath(current) });
+    expect(rest).toEqual([]);
+    expect(summary.name).toBe('install');
+    expect(summary.ok).toBe(true);
+    expect(summary.detail).toContain('0.16.0+c0ffee123456');
+    expect(summary.detail).toContain(pkgRoot(current));
+  });
+
+  it('gives a same-semver build conflict its own failing row', async () => {
+    const rows = await checks({
+      path: [join(legacy, 'bin'), join(current, 'bin')].join(delimiter),
+      argv1: cliPath(current),
+    });
+    const conflict = rows.find(c => c.name === 'install: version-build-conflict');
+    expect(conflict?.ok).toBe(false);
+    expect(conflict?.detail).toContain('different builds');
+    expect(conflict?.detail).toContain('monitor.interrupt.after_tool');
+  });
+
+  it('reports the running build even when nothing is on PATH', async () => {
+    const [summary] = await checks({ path: join(prefixes, 'nowhere'), argv1: cliPath(current) });
+    expect(summary.detail).toContain('0.16.0+c0ffee123456');
+    expect(summary.detail).toContain('no ours-fleet on PATH');
+  });
+
+  it('notes a pre-provenance install without failing the report', async () => {
+    const rows = await checks({ path: join(legacy, 'bin'), argv1: cliPath(legacy) });
+    const note = rows.find(c => c.name === 'install: unknown-build-identity');
+    expect(note?.ok).toBe(true);
+    expect(note?.detail).toContain('predates build provenance');
+    expect(rows.every(c => c.ok)).toBe(true);
+  });
+});
+
+describe('doctor install scanning is not ambient', () => {
+  it('ignores the host PATH so an unrelated install cannot change the report', async () => {
+    const prefixes = mkdtempSync(join(tmpdir(), 'ours-fleet-doc-amb-'));
+    const legacy = installPrefix(prefixes, 'legacy');
+    const current = installPrefix(prefixes, 'current');
+    const savedPath = process.env.PATH;
+    process.env.PATH = [join(legacy, 'bin'), join(current, 'bin')].join(delimiter);
+    try {
+      const report = await doctor({}, execWith({}), 'linux', stubFetch());
+      const install = report.checks.filter(c => c.name.startsWith('install'));
+      expect(install.map(c => c.name)).toEqual(['install']);
+      expect(install[0].detail).toContain('no ours-fleet on PATH');
+    } finally {
+      if (savedPath === undefined) delete process.env.PATH;
+      else process.env.PATH = savedPath;
+      rmSync(prefixes, { recursive: true, force: true });
+    }
   });
 });

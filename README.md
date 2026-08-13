@@ -302,8 +302,26 @@ ours-fleet loops reload <Role>
 ours-fleet loops run-now|disable|enable <Role> <Loop>
 ours-fleet rm <Name>
 ours-fleet doctor [--harness H]
+ours-fleet version [--json]         build identity, capabilities, installs on PATH
 ours-fleet init
 ```
+
+### Which build am I running?
+
+`--version` prints a semver, and a semver does not identify an artifact: version
+bumps land in their own release commit, so a build cut between two releases
+carries the previous version while already containing new behaviour. Two installs
+on one host once both reported `0.16.0` while disagreeing about whether
+`monitor.interrupt: after_tool` was valid.
+
+Every build therefore stamps `dist/build-info.json` with a content-derived build
+id, its commit, and the capability tokens the shipped code declares.
+`ours-fleet version` prints that identity plus every `ours-fleet` it can see on
+`PATH`; `ours-fleet doctor` fails when two of them share a semver but are
+different builds, or when the executable on `PATH` is a different artifact from
+the one running. Two prefixes holding identical content are not a conflict.
+Installs predating the stamp are compared by hashing their `dist/`, so two of
+those are still told apart.
 
 A permanent role brought up via `-c custom.yaml` remembers that file (`.config-path`
 in its state dir) across supervisor-triggered restarts — systemd/launchd re-invoke the

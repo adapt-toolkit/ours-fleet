@@ -3,8 +3,9 @@ import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
-  loadConfig, findRole, ConfigError, DEFAULT_OWNER_ATTACHMENT_MIME,
+  loadConfig, findRole, validateMonitorConfig, ConfigError, DEFAULT_OWNER_ATTACHMENT_MIME,
 } from '../src/config.js';
+import { runningLabel } from '../src/provenance.js';
 
 let dir: string;
 beforeEach(() => {
@@ -638,5 +639,24 @@ describe('isolation forbidden-path errors surface at config time (5.2)', () => {
   it('a role with no isolation block is unaffected', () => {
     writeFileSync(join(dir, 'fleet.yaml'), 'roles:\n  Plain:\n    harness: claude-code\n');
     expect(loadConfig().roles).toHaveLength(1);
+  });
+});
+
+describe('validateMonitorConfig capability gating', () => {
+  it('accepts after_tool because this build declares the capability', () => {
+    expect(validateMonitorConfig({ mode: 'fleet', interrupt: 'after_tool' })).toEqual([]);
+  });
+
+  it('names the missing capability and this build when the running artifact lacks it', () => {
+    const [problem, ...rest] = validateMonitorConfig({ mode: 'fleet', interrupt: 'after_tool' }, []);
+    expect(rest).toEqual([]);
+    expect(problem).toContain('monitor.interrupt.after_tool');
+    expect(problem).toContain(runningLabel());
+    expect(problem).toContain('ours-fleet doctor');
+  });
+
+  it('still rejects a value no build ever supported', () => {
+    expect(validateMonitorConfig({ mode: 'fleet', interrupt: 'always' }, []))
+      .toEqual(["monitor.interrupt: must be true, false, or 'after_tool'"]);
   });
 });

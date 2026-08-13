@@ -6,6 +6,9 @@ import { join as joinPath, resolve as resolvePath } from 'node:path';
 import { createInterface } from 'node:readline';
 import { Command } from 'commander';
 import { VERSION } from './version.js';
+import {
+  analyzeInstalls, buildInfo, buildLabel, discoverInstalls, runningLabel,
+} from './provenance.js';
 import { agentDir, agentsRoot, tmpRoot, logsRoot, deriveXdgRuntimeDir, watchdogsRoot } from './paths.js';
 import { findRole, loadConfig, ROLE_NAME_RE } from './config.js';
 import type { YamlMode } from './config-yaml.js';
@@ -28,7 +31,7 @@ import {
 } from './spawn.js';
 import { stringify } from 'yaml';
 import { resolvedRolePlan } from './resolved-plan.js';
-import { formatProvenance } from './creation.js';
+import { creationBuildNote, formatProvenance, readProvenance } from './creation.js';
 import { doctor } from './doctor.js';
 import { allWarnings, analyzeFleetPermissions, formatNative } from './permissions.js';
 import { AI_DOCS } from './docs.js';
@@ -88,6 +91,49 @@ program.command('docs')
   .alias('man')
   .description('print the complete AI-friendly command and configuration reference')
   .action(() => { process.stdout.write(AI_DOCS); });
+
+// `--version` prints the semver alone, because scripts parse it. Semver cannot
+// identify an artifact — two installs on one host once reported 0.16.0 and
+// disagreed about `monitor.interrupt: after_tool` — so the full identity of the
+// executable answering, and of every other install it can see, lives here.
+program.command('version')
+  .description('build identity, capabilities, and every ours-fleet install on this host')
+  .option('--json', 'emit the machine-readable build report')
+  .action(opts => {
+    const info = buildInfo();
+    const installs = discoverInstalls();
+    const running = installs.find(i => i.running);
+    const skew = analyzeInstalls(installs);
+    if (opts.json) {
+      process.stdout.write(`${JSON.stringify({
+        ...info,
+        packageRoot: running?.packageRoot,
+        executable: binPath,
+        node: process.versions.node,
+        platform: process.platform,
+        installs: installs.map(i => ({
+          packageRoot: i.packageRoot,
+          version: i.version,
+          buildId: i.build?.buildId ?? null,
+          capabilities: i.build?.capabilities ?? null,
+          bin: i.bin ?? null,
+          running: i.running,
+        })),
+        skew,
+      }, null, 2)}\n`);
+      return;
+    }
+    console.log(runningLabel());
+    if (info.commit) console.log(`  commit:       ${info.commit.slice(0, 12)}${info.dirty ? ' (dirty tree)' : ''}`);
+    if (info.builtAt) console.log(`  built:        ${info.builtAt}`);
+    console.log(`  executable:   ${binPath}`);
+    if (running) console.log(`  package root: ${running.packageRoot}`);
+    console.log(`  node:         v${process.versions.node} on ${process.platform}`);
+    console.log(`  capabilities: ${info.capabilities.join(', ') || '(none declared)'}`);
+    for (const i of installs.filter(i => i.pathIndex !== undefined))
+      console.log(`  on PATH:      ${i.bin} -> ${buildLabel(i)}`);
+    for (const s of skew) console.error(`${s.severity}: ${s.message}`);
+  });
 
 function acpStateDir(name: string): string | undefined {
   const permanent = agentDir(name);
@@ -187,6 +233,9 @@ cOpt(program.command('config').description('validate + print the merged plan (no
         process.stdout.write(`${JSON.stringify(resolvedPlan(cfg), null, 2)}\n`);
         return;
       }
+      // Which artifact resolved this plan. Two installs can share a semver and
+      // disagree about what fleet.yaml means; the plan below is only true of this one.
+      console.log(`build:  ${runningLabel()}`);
       console.log(`config: ${cfg.files.join(' + ') || '(none)'}`);
       for (const diagnostic of cfg.diagnostics) console.log(`warning: ${diagnostic.message}`);
       const analyses = analyzeFleetPermissions(cfg.roles);
@@ -410,6 +459,11 @@ program.command('logs <name>').description('show the role log').option('-f, --fo
 program.command('status <name>').description('unit/agent state')
   .action(async name => {
     console.log(await pickBackend().status(name));
+    // A role outlives the artifact that created it. If a different build is
+    // reporting now, its settings may resolve differently than at creation.
+    const created = readProvenance(agentDir(name));
+    const buildNote = created && creationBuildNote(created);
+    if (buildNote) console.log(`build: ${buildNote}`);
     // A held-down role looks like a healthy running unit from the outside — the
     // runner is alive on purpose. Say so, with the reason and when (3.2).
     const ledger = readRestartLedger(agentDir(name));
@@ -1018,7 +1072,8 @@ cOpt(program.command('spawn [name]').description('spawn a new agent (permanent b
       // The same provenance that was persisted, so what the operator reads now
       // and what a reviewer reads later cannot disagree (6.6).
       if (lastProvenance) {
-        console.log(`  created by ${lastProvenance.command} v${lastProvenance.fleetVersion} `
+        console.log(`  created by ${lastProvenance.command} `
+          + `v${lastProvenance.fleetVersion}+${lastProvenance.fleetBuild} `
           + `at ${lastProvenance.createdAt} (${lastProvenance.lifetime})`);
         for (const line of formatProvenance(lastProvenance)) console.log(line);
       }

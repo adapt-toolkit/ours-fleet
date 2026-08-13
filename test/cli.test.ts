@@ -602,3 +602,62 @@ describe('never-prompt failure and the capability floor are documented (7.4)', (
     expect(r.stdout).toContain('unattended floor: <Role>');
   });
 });
+
+describe('ours-fleet version', () => {
+  it('--version stays a bare semver for scripts', async () => {
+    const { stdout, code } = await run(['--version']);
+    expect(code).toBe(0);
+    expect(stdout.trim()).toMatch(/^\d+\.\d+\.\d+$/);
+  });
+
+  it('prints the build identity, capabilities and the executable serving it', async () => {
+    const { stdout, code } = await run(['version']);
+    expect(code).toBe(0);
+    expect(stdout).toMatch(/ours-fleet \d+\.\d+\.\d+\+[0-9a-f]{12}/);
+    expect(stdout).toContain('monitor.interrupt.after_tool');
+    expect(stdout).toContain(resolve('dist/cli.js'));
+  });
+
+  it('version --json is machine-readable and free of environment values', async () => {
+    const { stdout, code } = await run(['version', '--json']);
+    expect(code).toBe(0);
+    const report = JSON.parse(stdout);
+    expect(report.version).toMatch(/^\d+\.\d+\.\d+$/);
+    expect(report.buildId).toMatch(/^[0-9a-f]{12}$/);
+    expect(report.capabilities).toContain('monitor.interrupt.after_tool');
+    expect(report.packageRoot).toBe(resolve('.'));
+    expect(report.node).toBe(process.versions.node);
+    expect(JSON.stringify(report)).not.toContain('OURS_FLEET_HOME');
+  });
+
+  it('config prints the build that resolved the plan', async () => {
+    const file = join(dir, 'fleet.yaml');
+    const { writeFileSync } = await import('node:fs');
+    writeFileSync(file, 'roles:\n  A: {}\n');
+    const { stdout } = await run(['config', '-c', file]);
+    expect(stdout).toMatch(/build:\s+ours-fleet \d+\.\d+\.\d+\+[0-9a-f]{12}/);
+  });
+});
+
+describe('build provenance is documented (AI reference)', () => {
+  // `docs` is a pure dump of a constant — spawn the CLI once, not once per test.
+  let cached: string | undefined;
+  const docs = async () => (cached ??= (await run(['docs'])).stdout);
+
+  it('tells an agent that semver alone does not identify an artifact', async () => {
+    const text = await docs();
+    expect(text).toContain('ours-fleet version');
+    expect(text).toMatch(/same version[\s\S]{0,40}different build/i);
+  });
+
+  it('names the capability model and where to read a build id', async () => {
+    const text = await docs();
+    expect(text).toContain('monitor.interrupt.after_tool');
+    expect(text).toContain('dist/build-info.json');
+    expect(text).toContain('version --json');
+  });
+
+  it('points at the doctor install check for a divergent host', async () => {
+    expect(await docs()).toMatch(/doctor[\s\S]{0,400}install/i);
+  });
+});

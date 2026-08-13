@@ -20,6 +20,7 @@ ours-fleet docs                         # this complete reference (\`man\` is an
 ours-fleet help <command>               # exact flags for one command
 ours-fleet config [-c FILE]             # validate and print the merged plan; no changes
 ours-fleet doctor [-c FILE] [--harness codex|claude-code]
+ours-fleet version [--json]             # build identity, capabilities, every install on PATH
 \`\`\`
 
 Default configuration is \`~/fleet.yaml\` plus sorted \`~/fleet.d/*.yaml\` role
@@ -40,6 +41,44 @@ wholesale and drop inline comments written on its items; lines outside that
 collection remain byte-preserved. Each save is revision-guarded, reviewed as a diff
 of the real file before anything is written, validated by the real loader, and
 backed up next to the file first.
+
+## Build identity and install provenance
+
+\`--version\` prints a semver and nothing else, and a semver does NOT identify an
+artifact. Version bumps land in a release commit of their own, so every build cut
+between two releases carries the PREVIOUS version while already containing new
+behaviour. One host ran two installs that both reported 0.16.0 — same version,
+different build. One accepted \`monitor.interrupt: after_tool\`, the other
+rejected it as invalid. Their
+\`dist/cli.js\` were byte-identical — the divergence was in other modules.
+
+Every build therefore stamps \`dist/build-info.json\` with a build id (first 12 hex
+of a sha256 over the rest of \`dist/\`), the commit it was cut from, and the
+capability tokens the shipped code declares — for example
+\`monitor.interrupt.after_tool\`. Ask any executable what it is:
+
+\`\`\`sh
+ours-fleet version                      # ours-fleet 0.17.0+9f1c2a3b4d5e, capabilities, PATH installs
+ours-fleet version --json               # the same as machine-readable JSON, no environment values
+\`\`\`
+
+Read a capability, never a version number, to decide whether a setting is
+supported. When a build rejects a value it knows the name of, it says which
+capability is missing and which build rejected it, because another install on the
+same host may accept the identical file. \`config\` prints the build that resolved
+the plan; \`status <Name>\` says so when the build reporting on a role is not the
+one that created it (roles record their creating build in \`creation.json\`).
+
+\`ours-fleet doctor\` runs an \`install\` check that lists every \`ours-fleet\` on
+PATH plus the one executing, and FAILS when two installs share a semver but are
+different builds, or when the running artifact is a DIFFERENT artifact from the
+one PATH resolves to. A second prefix holding identical content is not a skew
+and is not reported. A PATH entry the shell would not execute — a directory, or
+a file without its execute bit — is not counted as an install at all.
+Installs built before this stamp existed report \`+unknown\`; they are compared by
+hashing their \`dist/\` instead, so two pre-provenance installs are still told
+apart. To fix a flagged host, remove or update the stale install — do not rely on
+PATH order.
 
 ## Lifecycle and console commands
 

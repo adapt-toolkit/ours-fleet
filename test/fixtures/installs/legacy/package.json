@@ -1,0 +1,6 @@
+{
+  "name": "@ours.network/fleet",
+  "version": "0.16.0",
+  "type": "module",
+  "bin": { "ours-fleet": "dist/cli.js" }
+}

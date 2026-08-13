@@ -3,6 +3,7 @@ import { join } from 'node:path';
 import { replaceFileAtomically, withFileLock, type LockDeps } from './atomic-file.js';
 import { stateRoot } from './paths.js';
 import { resolveEndpoint, type FetchLike } from './monitor.js';
+import { buildInfo, UNKNOWN_BUILD } from './provenance.js';
 
 /**
  * One creation transaction: role name and ours identity reserved together,
@@ -336,6 +337,12 @@ export interface CreationProvenance {
   /** The command that created the role, without its arguments. */
   command: string;
   fleetVersion: string;
+  /**
+   * Build id of the artifact that created the role. Two installs can report the
+   * same fleetVersion and resolve the same fleet.yaml differently, so the semver
+   * alone does not identify what actually ran. `unknown` for a pre-provenance build.
+   */
+  fleetBuild: string;
   createdAt: string;
   lifetime: 'permanent' | 'temporary';
   role: string;
@@ -376,6 +383,7 @@ export function buildProvenance(o: {
     version: 1,
     command: 'ours-fleet spawn',
     fleetVersion: o.fleetVersion,
+    fleetBuild: buildInfo().buildId,
     createdAt: (o.now ?? new Date()).toISOString(),
     lifetime: o.lifetime,
     role: o.role,
@@ -389,6 +397,30 @@ export function buildProvenance(o: {
 /** Write the provenance record atomically, before the role is started. */
 export function writeProvenance(stateDir: string, p: CreationProvenance): void {
   replaceFileAtomically(join(stateDir, CREATION_PROVENANCE_FILE), JSON.stringify(p, null, 2) + '\n', 0o600);
+}
+
+/** Read the provenance a role was created with, if it has one. */
+export function readProvenance(stateDir: string): CreationProvenance | undefined {
+  try {
+    return JSON.parse(readFileSync(join(stateDir, CREATION_PROVENANCE_FILE), 'utf8')) as CreationProvenance;
+  } catch { return undefined; }
+}
+
+/**
+ * One line when the artifact reporting on a role is not the one that created it.
+ *
+ * A role carries its creating build in creation.json. If a different build now
+ * manages it, the role's fleet.yaml may mean something different than it did at
+ * creation — and because both can report the same semver, nothing else says so.
+ */
+export function creationBuildNote(p: CreationProvenance): string | undefined {
+  const now = buildInfo();
+  const created = p.fleetBuild ?? UNKNOWN_BUILD;
+  if (created === now.buildId && p.fleetVersion === now.version) return undefined;
+  return `created by ours-fleet ${p.fleetVersion}+${created}, reported by ${now.version}+${now.buildId}`
+    + (created === UNKNOWN_BUILD
+      ? ' — the creating build predates build provenance and cannot be identified'
+      : ' — different artifact, so its resolved settings may differ');
 }
 
 /** One concise line per non-built-in setting, for the post-creation summary. */

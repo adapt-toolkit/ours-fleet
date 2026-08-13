@@ -6,8 +6,9 @@ import { parse, stringify } from 'yaml';
 import {
   spawnDryRun, spawnPermanent, spawnTemp, type SupervisorLauncher,
 } from '../src/spawn.js';
-import { formatProvenance } from '../src/creation.js';
+import { creationBuildNote, formatProvenance, type CreationProvenance } from '../src/creation.js';
 import { agentDir } from '../src/paths.js';
+import { buildInfo } from '../src/provenance.js';
 import { registerAdapter } from '../src/harness/registry.js';
 import { getAdapter } from '../src/harness/registry.js';
 import { findRole, loadConfig } from '../src/config.js';
@@ -688,6 +689,8 @@ describe('creation provenance (6.6)', () => {
     expect(p.lifetime).toBe('permanent');
     expect(p.command).toBe('ours-fleet spawn');
     expect(p.fleetVersion).toMatch(/\d+\.\d+\.\d+/);
+    // Semver alone cannot say which artifact spawned the role — record its build too.
+    expect(p.fleetBuild).toBe(buildInfo().buildId);
     expect(Number.isNaN(Date.parse(p.createdAt))).toBe(false);
     expect(p.settings.approval).toEqual({ value: 'ask', source: 'built-in' });
     expect(p.settings.harness).toEqual({ value: 'claude-code', source: 'built-in' });
@@ -769,5 +772,28 @@ describe('creation provenance (6.6)', () => {
     expect(lines.join('\n')).toContain('approval');
     expect(lines.join('\n')).toContain('(explicit)');
     expect(lines.join('\n')).toContain('(built-in)');
+  });
+});
+
+describe('creationBuildNote', () => {
+  const provenance = (over: Partial<CreationProvenance> = {}): CreationProvenance => ({
+    version: 1, command: 'ours-fleet spawn', fleetVersion: buildInfo().version,
+    fleetBuild: buildInfo().buildId, createdAt: '2026-08-13T00:00:00.000Z',
+    lifetime: 'permanent', role: 'R', settings: {}, ...over,
+  });
+
+  it('says nothing when the reporting build is the one that created the role', () => {
+    expect(creationBuildNote(provenance())).toBeUndefined();
+  });
+
+  it('flags a role created by a different build of the SAME version', () => {
+    const note = creationBuildNote(provenance({ fleetBuild: 'deadbeef0000' }));
+    expect(note).toContain('deadbeef0000');
+    expect(note).toContain(buildInfo().buildId);
+  });
+
+  it('flags a role whose creating build cannot be identified', () => {
+    const note = creationBuildNote(provenance({ fleetBuild: 'unknown' }));
+    expect(note).toContain('unknown');
   });
 });

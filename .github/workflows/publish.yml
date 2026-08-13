@@ -38,6 +38,10 @@ jobs:
       - run: npm ci
       - run: npm run build
       - run: npm test
+      # The root package is the only one whose bin target and build stamp come
+      # from a build step, so packing it is a gate in its own right. Sequential
+      # and separate: it runs tsc and Vite, which would starve the suite above.
+      - run: npm run test:pack
       - run: npm pack --dry-run
         working-directory: integrations/claude-code
       - run: npm pack --dry-run
