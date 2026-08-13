@@ -1,9 +1,9 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { execFile } from 'node:child_process';
-import { mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync, writeSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
-import { replaceFileAtomically, withFileLock } from '../src/atomic-file.js';
+import { replaceFileAtomically, withFileLock, type WriteDeps } from '../src/atomic-file.js';
 
 // dist/cli.js et al are built once by vitest's globalSetup
 // (test/global-setup.ts), before any test file runs — the pretrust-child.mjs
@@ -73,6 +73,118 @@ describe('replaceFileAtomically', () => {
     const seen = readFileSync(target, 'utf8');
     expect([a, b]).toContain(seen);
     expect(() => JSON.parse(seen)).not.toThrow();
+  });
+
+  it('finishes a write the kernel stopped short', () => {
+    const target = join(home, 'f.json');
+    writeFileSync(target, 'old');
+    let firstWrite = true;
+    const shortOnce: WriteDeps = {
+      writeSync(fd, buffer, offset, length) {
+        if (firstWrite) { firstWrite = false; return writeSync(fd, buffer, offset, Math.floor(length / 3)); }
+        return writeSync(fd, buffer, offset, length);
+      },
+    };
+
+    replaceFileAtomically(target, 'a complete replacement', 0o600, shortOnce);
+
+    expect(readFileSync(target, 'utf8')).toBe('a complete replacement');
+  });
+
+  it('keeps the previous contents when the disk fills mid-write', () => {
+    const target = join(home, 'f.json');
+    writeFileSync(target, 'the last good version');
+    const fills: WriteDeps = {
+      writeSync(fd, buffer, offset, length) {
+        writeSync(fd, buffer, offset, Math.floor(length / 3));
+        const error = new Error('ENOSPC: no space left on device, write') as NodeJS.ErrnoException;
+        error.code = 'ENOSPC';
+        throw error;
+      },
+    };
+
+    expect(() => replaceFileAtomically(target, 'a replacement that cannot fit', 0o600, fills)).toThrow(/ENOSPC/);
+
+    expect(readFileSync(target, 'utf8')).toBe('the last good version');
+  });
+
+  it('does not leave its temp file behind when the write fails', () => {
+    const target = join(home, 'f.json');
+    writeFileSync(target, 'old');
+    const fails: WriteDeps = {
+      writeSync() {
+        const error = new Error('ENOSPC: no space left on device, write') as NodeJS.ErrnoException;
+        error.code = 'ENOSPC';
+        throw error;
+      },
+    };
+
+    expect(() => replaceFileAtomically(target, 'new', 0o600, fails)).toThrow(/ENOSPC/);
+
+    expect(readdirSync(home).filter(f => f.includes('.tmp'))).toEqual([]);
+  });
+
+  it('fails a write that reports no progress instead of spinning on it', () => {
+    const target = join(home, 'f.json');
+    writeFileSync(target, 'the last good version');
+    const stalls: WriteDeps = { writeSync: () => 0 };
+
+    expect(() => replaceFileAtomically(target, 'new', 0o600, stalls)).toThrow(/no progress/);
+
+    expect(readFileSync(target, 'utf8')).toBe('the last good version');
+    expect(readdirSync(home).filter(f => f.includes('.tmp'))).toEqual([]);
+  });
+
+  it('does not publish a temp file it could not close', () => {
+    const target = join(home, 'f.json');
+    writeFileSync(target, 'the last good version');
+    const fails: WriteDeps = {
+      closeSync() {
+        const error = new Error('EIO: i/o error, close') as NodeJS.ErrnoException;
+        error.code = 'EIO';
+        throw error;
+      },
+    };
+
+    expect(() => replaceFileAtomically(target, 'new', 0o600, fails)).toThrow(/close/);
+
+    expect(readFileSync(target, 'utf8')).toBe('the last good version');
+    expect(readdirSync(home).filter(f => f.includes('.tmp'))).toEqual([]);
+  });
+
+  it('reports why the write failed even when the cleanup close also fails', () => {
+    const target = join(home, 'f.json');
+    writeFileSync(target, 'the last good version');
+    const fails: WriteDeps = {
+      writeSync() {
+        const error = new Error('ENOSPC: no space left on device, write') as NodeJS.ErrnoException;
+        error.code = 'ENOSPC';
+        throw error;
+      },
+      closeSync() { throw new Error('EIO: i/o error, close'); },
+    };
+
+    expect(() => replaceFileAtomically(target, 'new', 0o600, fails)).toThrow(/ENOSPC/);
+
+    expect(readFileSync(target, 'utf8')).toBe('the last good version');
+    expect(readdirSync(home).filter(f => f.includes('.tmp'))).toEqual([]);
+  });
+
+  it('does not publish a temp file it could not fsync', () => {
+    const target = join(home, 'f.json');
+    writeFileSync(target, 'the last good version');
+    const fails: WriteDeps = {
+      fsyncSync() {
+        const error = new Error('EIO: i/o error, fsync') as NodeJS.ErrnoException;
+        error.code = 'EIO';
+        throw error;
+      },
+    };
+
+    expect(() => replaceFileAtomically(target, 'new', 0o600, fails)).toThrow(/EIO/);
+
+    expect(readFileSync(target, 'utf8')).toBe('the last good version');
+    expect(readdirSync(home).filter(f => f.includes('.tmp'))).toEqual([]);
   });
 });
 
