@@ -559,7 +559,9 @@ describe('rmRole', () => {
     })('/bin/ours-fleet', ['_run-temp', 'Temp'], tempDir);
     const { calls, backend } = fakeBackend();
     const { d, logs } = deps(backend);
-    d.exec = async () => ({ stdout: '', stderr: '', code: 0 });
+    d.exec = async (_command, args) => ({
+      stdout: args.includes('show') ? 'inactive\n' : '', stderr: '', code: 0,
+    });
     d.sleep = async () => {};
 
     await rmRole(loadConfig(), 'Temp', d);
@@ -591,5 +593,31 @@ describe('rmRole', () => {
     const archived = readdirSync(recovery).find(name => name.includes('-Incomplete-'))!;
     expect(readFileSync(join(recovery, archived, 'WORKLOG.md'), 'utf8'))
       .toContain('preserve incomplete launch evidence');
+  });
+
+  it('refuses to archive a detached temp supervisor that remains live after SIGTERM', async () => {
+    writeCfg({});
+    const tempDir = agentDir('Lingering', true);
+    mkdirSync(tempDir, { recursive: true });
+    writeFileSync(join(tempDir, 'WORKLOG.md'), 'live process evidence\n');
+    prepareTempSupervisor(tempDir, 'Lingering');
+    await makeTempSupervisorLauncher({
+      supervisor: 'none', spawnDetached: () => 424242,
+    })('/bin/ours-fleet', ['_run-temp', 'Lingering'], tempDir);
+    const { backend } = fakeBackend();
+    const { d } = deps(backend);
+    const signals: Array<NodeJS.Signals | 0> = [];
+    d.kill = (_pid, signal) => { signals.push(signal); };
+    d.exec = async () => ({
+      stdout: '424242 node /bin/ours-fleet _run-temp Lingering\n', stderr: '', code: 0,
+    });
+    d.sleep = async () => {};
+
+    await expect(rmRole(loadConfig(), 'Lingering', d))
+      .rejects.toThrow(/supervisor is running; refusing to archive/);
+
+    expect(signals).toContain('SIGTERM');
+    expect(existsSync(tempDir)).toBe(true);
+    expect(readFileSync(join(tempDir, 'WORKLOG.md'), 'utf8')).toContain('live process evidence');
   });
 });

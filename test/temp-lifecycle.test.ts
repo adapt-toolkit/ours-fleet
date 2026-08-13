@@ -211,6 +211,27 @@ describe('exact operator targeting and evidence', () => {
       .toContain('"outcome":"retired"');
     expect(archiveTempState('Done', 'identity-closed', 'retired', 'duplicate')).toBeUndefined();
   });
+
+  it('preserves both archives when the same launch suffix already has a retiring directory', () => {
+    const dir = temp('Role');
+    writeFileSync(join(dir, 'WORKLOG.md'), 'new live evidence\n');
+    const suffix = readTempSupervisor(dir)!.launchId.slice(0, 8);
+    const recovery = join(stateRoot(), 'recovery', 'temporary');
+    mkdirSync(recovery, { recursive: true });
+    const stale = join(recovery, `.Role-${suffix}.retiring`);
+    mkdirSync(stale);
+    writeFileSync(join(stale, 'WORKLOG.md'), 'older interrupted evidence\n');
+
+    const archived = archiveTempState(
+      'Role', 'operator-stop', 'retired', 'same-suffix collision',
+      new Date('2026-08-13T10:00:00.000Z'),
+    )!;
+
+    expect(existsSync(dir)).toBe(false);
+    expect(readFileSync(join(stale, 'WORKLOG.md'), 'utf8')).toContain('older interrupted evidence');
+    expect(readFileSync(join(archived, 'WORKLOG.md'), 'utf8')).toContain('new live evidence');
+    expect(archived).toMatch(/-Role-[0-9a-f]{8}-2$/);
+  });
 });
 
 describe('bounded stale-state reclamation', () => {
@@ -262,6 +283,21 @@ describe('bounded stale-state reclamation', () => {
       .toContain('interrupted before its termination journal was durable');
     expect(readFileSync(join(recovery, 'terminations.jsonl'), 'utf8'))
       .toContain('"outcome":"reclaimed"');
+  });
+
+  it('preserves a hyphenated role name when synthesizing interrupted evidence', async () => {
+    const recovery = join(stateRoot(), 'recovery', 'temporary');
+    const retiring = join(recovery, '.Tester-2-deadbeef.retiring');
+    mkdirSync(retiring, { recursive: true });
+    writeFileSync(join(retiring, 'WORKLOG.md'), 'hyphenated evidence\n');
+
+    const archived = await reclaimStaleTempState({
+      now: () => Date.parse('2026-08-13T10:03:00.000Z'),
+    });
+
+    expect(archived).toHaveLength(1);
+    const line = readFileSync(join(recovery, 'terminations.jsonl'), 'utf8').trim();
+    expect(JSON.parse(line).role).toBe('Tester-2');
   });
 
   it('reclaims aged incomplete metadata only after proving no exact process exists', async () => {

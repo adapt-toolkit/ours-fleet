@@ -11,7 +11,9 @@ import { getAdapter } from './harness/registry.js';
 import { generateBriefing } from './briefing.js';
 import { resetRestartLedger } from './runner.js';
 import type { InstallOutcome as BackendInstallOutcome, SupervisorBackend } from './supervisor/types.js';
-import { archiveTempState, stopTempSupervisor } from './temp-lifecycle.js';
+import {
+  archiveTempState, stopTempSupervisor, tempSupervisorLiveness,
+} from './temp-lifecycle.js';
 import { realExec, type Exec } from './exec.js';
 
 /** An install outcome tagged with the role it belongs to. */
@@ -23,6 +25,8 @@ export interface OpsDeps {
   log(line: string): void;
   /** Process/service inspection for exact temporary-supervisor lifecycle commands. */
   exec?: Exec;
+  /** Test seam for exact detached-supervisor signaling/liveness. */
+  kill?(pid: number, signal: NodeJS.Signals | 0): void;
   sleep?(ms: number): Promise<void>;
   /**
    * Called the INSTANT a registration is created, before anything else can
@@ -275,14 +279,26 @@ export async function rmRole(cfg: FleetConfig, name: string, deps: OpsDeps): Pro
   const temporaryDir = /^[A-Za-z0-9_-]+$/.test(name) ? agentDir(name, true) : '';
   const configured = cfg.roles.find(role => role.name === name);
   if (!configured && temporaryDir && existsSync(temporaryDir)) {
-    await stopTempSupervisor(name, { exec: deps.exec ?? realExec });
+    const lifecycleDeps = { exec: deps.exec ?? realExec, ...(deps.kill ? { kill: deps.kill } : {}) };
+    const stopOutcome = await stopTempSupervisor(name, lifecycleDeps);
     const sleep = deps.sleep ?? ((ms: number) => new Promise<void>(resolve => setTimeout(resolve, ms)));
-    for (let i = 0; i < 50 && existsSync(temporaryDir); i++) await sleep(100);
+    let liveness: Awaited<ReturnType<typeof tempSupervisorLiveness>> =
+      stopOutcome === 'already-stopped' ? 'stopped' : 'unknown';
+    // The supervisor normally archives itself. A detached fallback may keep
+    // running after SIGTERM, so directory age or a fixed delay is never
+    // cleanup authority: poll exact ownership and archive only after a proven
+    // stop. Unknown and still-running both fail closed with evidence in place.
+    for (let i = 0; i < 50 && existsSync(temporaryDir) && liveness !== 'stopped'; i++) {
+      liveness = await tempSupervisorLiveness(temporaryDir, lifecycleDeps);
+      if (liveness === 'stopped') break;
+      if (i < 49) await sleep(100);
+    }
+    if (existsSync(temporaryDir) && liveness !== 'stopped')
+      throw new Error(
+        `temporary role '${name}' supervisor is ${liveness}; refusing to archive live or ambiguous state`);
     const archived = existsSync(temporaryDir)
-      ? archiveTempState(
-          name, 'operator-stop', 'retired',
-          'operator removal completed after the supervisor stopped; evidence preserved',
-        )
+      ? archiveTempState(name, 'operator-stop', 'retired',
+          'operator removal completed after supervisor liveness was proven stopped; evidence preserved')
       : undefined;
     deps.log(`removed temporary role '${name}'`
       + `${archived ? `; evidence archived at ${archived}` : '; supervisor archived its evidence'}`);

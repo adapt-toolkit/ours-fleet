@@ -29,7 +29,7 @@ export interface FetchResponse {
   json(): Promise<{
     cursor?: number;
     events?: NotifyEvent[];
-    identities?: Array<{ name?: unknown; temporary?: unknown; stale?: unknown }>;
+    identities?: Array<string | { name?: unknown; temporary?: unknown; stale?: unknown }>;
   }>;
 }
 export type FetchLike = (
@@ -248,10 +248,18 @@ export async function probeIdentityPresence(
     const body = await response.json();
     if (!Array.isArray(body.identities))
       return { state: 'unknown', detail: 'identity index response is malformed' };
-    const found = body.identities.find(identity => identity?.name === name);
-    return found
-      ? { state: 'present', temporary: found.temporary === true, stale: found.stale === true }
-      : { state: 'absent' };
+    // A healthy daemon normally has at least its Human identity. During daemon
+    // restart, however, the authenticated endpoint can briefly serve a valid
+    // but empty index while state is still loading. Empty is therefore not
+    // enough authority to retire a live temporary role.
+    if (body.identities.length === 0)
+      return { state: 'unknown', detail: 'identity index is temporarily empty' };
+    const found = body.identities.find(identity =>
+      (typeof identity === 'string' ? identity : identity?.name) === name);
+    if (!found) return { state: 'absent' };
+    return typeof found === 'string'
+      ? { state: 'present', temporary: false, stale: false }
+      : { state: 'present', temporary: found.temporary === true, stale: found.stale === true };
   } catch (error) {
     return { state: 'unknown', detail: `identity index response is unreadable (${msg(error)})` };
   }

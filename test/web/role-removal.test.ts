@@ -68,7 +68,9 @@ describe('safe web role removal', () => {
       platform: 'linux', supervisor: 'systemd',
       exec: async () => ({ stdout: '', stderr: '', code: 0 }),
     })('/bin/ours-fleet', ['_run-temp', 'Temp'], state);
-    (service as any).options.ops.exec = async () => ({ stdout: '', stderr: '', code: 0 });
+    (service as any).options.ops.exec = async (_command: string, args: string[]) => ({
+      stdout: args.includes('show') ? 'inactive\n' : '', stderr: '', code: 0,
+    });
     (service as any).options.ops.sleep = async () => {};
 
     const result = await service.remove({ role: 'Temp', confirmed: true });

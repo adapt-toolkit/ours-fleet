@@ -10,6 +10,7 @@ import { stateRoot, tmpRoot } from './paths.js';
 export const TEMP_SUPERVISOR_FILE = '.temp-supervisor.json';
 export const TEMP_TERMINATION_FILE = 'termination.jsonl';
 export const TEMP_STOP_REQUEST_FILE = '.temp-stop-request.json';
+const TEMP_GLOBAL_TERMINATION_MARKER = '.termination-globally-recorded';
 export const TEMP_RECLAIM_BATCH = 32;
 export const TEMP_LAUNCH_GRACE_MS = 60_000;
 
@@ -171,17 +172,43 @@ function archiveRoot(): string {
 function appendTermination(dir: string, record: TempTerminationRecord): void {
   const line = JSON.stringify(record) + '\n';
   appendFileSync(join(dir, TEMP_TERMINATION_FILE), line, { mode: 0o600 });
-  appendGlobalTerminationOnce(line);
+  appendGlobalTermination(line);
+  // Normal retirement no longer rereads the entire global journal. This
+  // durable per-archive marker tells crash recovery the append completed; only
+  // the narrow crash seam before this marker needs the legacy dedupe scan.
+  replaceFileAtomically(join(dir, TEMP_GLOBAL_TERMINATION_MARKER), line);
 }
 
-function appendGlobalTerminationOnce(line: string): void {
+function appendGlobalTermination(line: string, checkExisting = false): void {
   mkdirSync(archiveRoot(), { recursive: true, mode: 0o700 });
   const path = join(archiveRoot(), 'terminations.jsonl');
   // Recovery may revisit a .retiring directory after a crash between the
   // global append and final rename. Avoid duplicating that exact event.
-  try { if (readFileSync(path, 'utf8').split('\n').includes(line.trimEnd())) return; }
-  catch { /* the journal does not exist yet */ }
+  if (checkExisting) {
+    try { if (readFileSync(path, 'utf8').split('\n').includes(line.trimEnd())) return; }
+    catch { /* the journal does not exist yet */ }
+  }
   appendFileSync(path, line, { mode: 0o600 });
+}
+
+/** Pick a sibling path without overwriting evidence from an earlier attempt. */
+function collisionSafeArchivePaths(targetBase: string, retiringBase: string): {
+  target: string; retiring: string;
+} {
+  for (let attempt = 0; ; attempt++) {
+    const discriminator = attempt === 0 ? '' : `-${attempt + 1}`;
+    const target = `${targetBase}${discriminator}`;
+    const retiring = `${retiringBase}${discriminator}`;
+    if (!existsSync(target) && !existsSync(retiring)) return { target, retiring };
+  }
+}
+
+function roleFromRetiringName(name: string): string {
+  const stem = name.slice(1, -'.retiring'.length);
+  // Archive names end in the eight-hex launch discriminator, optionally plus
+  // a numeric collision discriminator. Strip from the RIGHT so role names such
+  // as Developer-3 and Tester-2 remain intact.
+  return /^(.*)-[0-9a-f]{8}(?:-\d+)?$/i.exec(stem)?.[1] ?? stem;
 }
 
 /** Move retired state out of the live roster without deleting any evidence. */
@@ -198,18 +225,20 @@ export function archiveTempState(
   mkdirSync(archiveRoot(), { recursive: true, mode: 0o700 });
   const stamp = now.toISOString().replaceAll(/[:.]/g, '-');
   const suffix = supervisor?.launchId.slice(0, 8) ?? randomUUID().slice(0, 8);
-  const target = join(archiveRoot(), `${stamp}-${role}-${suffix}`);
-  const retiring = join(archiveRoot(), `.${role}-${suffix}.retiring`);
+  const paths = collisionSafeArchivePaths(
+    join(archiveRoot(), `${stamp}-${role}-${suffix}`),
+    join(archiveRoot(), `.${role}-${suffix}.retiring`),
+  );
   // The rename is the idempotency boundary: only one concurrent retirement
   // owns the live directory. Everyone else sees it absent and does nothing.
-  try { renameSync(dir, retiring); }
+  try { renameSync(dir, paths.retiring); }
   catch (error) {
     if ((error as NodeJS.ErrnoException).code === 'ENOENT' && !existsSync(dir)) return undefined;
     throw error;
   }
-  try { appendTermination(retiring, record); }
-  finally { renameSync(retiring, target); }
-  return target;
+  try { appendTermination(paths.retiring, record); }
+  finally { renameSync(paths.retiring, paths.target); }
+  return paths.target;
 }
 
 /** Finish bounded archive renames interrupted by process or host termination. */
@@ -235,7 +264,7 @@ function recoverInterruptedArchives(now: Date): string[] {
     if (!line) {
       const record: TempTerminationRecord = {
         version: 1,
-        role: supervisor?.role ?? name.slice(1, -'.retiring'.length).split('-')[0],
+        role: supervisor?.role ?? roleFromRetiringName(name),
         launchId: supervisor?.launchId,
         at: now.toISOString(),
         reason: 'stale-supervisor',
@@ -245,11 +274,16 @@ function recoverInterruptedArchives(now: Date): string[] {
       line = JSON.stringify(record);
       appendFileSync(join(source, TEMP_TERMINATION_FILE), line + '\n', { mode: 0o600 });
     }
-    appendGlobalTerminationOnce(line + '\n');
+    if (!existsSync(join(source, TEMP_GLOBAL_TERMINATION_MARKER))) {
+      appendGlobalTermination(line + '\n', true);
+      replaceFileAtomically(join(source, TEMP_GLOBAL_TERMINATION_MARKER), line + '\n');
+    }
     const suffix = name.slice(1, -'.retiring'.length);
-    const target = join(
+    const targetBase = join(
       archiveRoot(), `${now.toISOString().replaceAll(/[:.]/g, '-')}-recovered-${suffix}`,
     );
+    let target = targetBase;
+    for (let attempt = 2; existsSync(target); attempt++) target = `${targetBase}-${attempt}`;
     renameSync(source, target);
     recovered.push(target);
   }

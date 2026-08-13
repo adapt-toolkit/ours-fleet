@@ -10,7 +10,7 @@ import { stringify } from 'yaml';
 import {
   runOnce, runTemp, runSupervised, buildPaneCommand, reserveLaunchSlot, readExitRecord,
   readRestartLedger, resetRestartLedger, backoffFor, loadTempRole, RESTART_FAIL_THRESHOLD,
-  TEMP_IDENTITY_CLOSE_DEBOUNCE_MS, TEMP_IDENTITY_STARTUP_GRACE_MS,
+  TEMP_IDENTITY_CLOSE_DEBOUNCE_MS, TEMP_IDENTITY_POLL_MS,
   type AttemptResult, type RunnerDeps,
 } from '../src/runner.js';
 import { classifyChildExit, classifyShellStatus } from '../src/session/types.js';
@@ -896,7 +896,8 @@ describe('temporary identity retirement', () => {
     let probes = 0;
     world.deps.fetch = async url => {
       expect(url).toContain('/identities');
-      const identities = probes++ === 0 ? [{ name: 'T', temporary: true }] : [];
+      const identities = probes++ === 0
+        ? [{ name: 'T', temporary: true }] : [{ name: 'Other' }];
       return { status: 200, ok: true, json: async () => ({ identities }) };
     };
 
@@ -908,20 +909,56 @@ describe('temporary identity retirement', () => {
     expect(world.paneCommands).toHaveLength(1);
   });
 
-  it('allows a slow first bind before settling an identity absent from the first poll', async () => {
+  it('uses first observed presence as readiness even when a cold bind exceeds the former 30s grace', async () => {
     const d = writeTemp('T');
-    const world = fakeWorld({ lifeChecks: 100, exitCode: '0', exitFile: join(d, '.exit-status') });
+    const world = fakeWorld({ lifeChecks: 200, exitCode: '0', exitFile: join(d, '.exit-status') });
     let probes = 0;
-    world.deps.fetch = async () => ({
-      status: 200, ok: true, json: async () => { probes++; return { identities: [] }; },
-    });
+    world.deps.fetch = async () => {
+      const probe = probes++;
+      const identities = probe < 20
+        ? [{ name: 'Other' }]
+        : probe === 20 ? [{ name: 'T', temporary: true }] : [{ name: 'Other' }];
+      return { status: 200, ok: true, json: async () => ({ identities }) };
+    };
 
     const result = await runOnce('T', { temp: true }, world.deps);
 
     expect(result.retirementReason).toBe('identity-closed');
-    expect(result.elapsedSecs).toBeGreaterThanOrEqual(TEMP_IDENTITY_STARTUP_GRACE_MS / 1000);
-    expect(probes).toBeGreaterThan(2);
+    expect(result.elapsedSecs).toBeGreaterThan(40);
+    expect(probes).toBeGreaterThan(20);
     expect(world.paneCommands).toHaveLength(1);
+  });
+
+  it('does not retire before the identity readiness gate is reached', async () => {
+    const d = writeTemp('T');
+    const world = fakeWorld({ lifeChecks: 100, exitCode: '0', exitFile: join(d, '.exit-status') });
+    let probes = 0;
+    world.deps.fetch = async () => {
+      probes++;
+      return { status: 200, ok: true, json: async () => ({ identities: [{ name: 'Other' }] }) };
+    };
+
+    const result = await runOnce('T', { temp: true }, world.deps);
+
+    expect(result.retirementReason).toBeUndefined();
+    expect(result.elapsedSecs).toBeGreaterThan(30);
+    expect(probes).toBeLessThan(result.elapsedSecs * 2); // no former 2 requests/second hot loop
+  });
+
+  it('does not false-retire from a valid-but-empty daemon index after readiness', async () => {
+    const d = writeTemp('T');
+    const world = fakeWorld({ lifeChecks: 40, exitCode: '0', exitFile: join(d, '.exit-status') });
+    let probes = 0;
+    world.deps.fetch = async () => {
+      const identities = probes++ === 0 ? [{ name: 'T', temporary: true }] : [];
+      return { status: 200, ok: true, json: async () => ({ identities }) };
+    };
+
+    const result = await runOnce('T', { temp: true }, world.deps);
+
+    expect(result.retirementReason).toBeUndefined();
+    expect(result.elapsedSecs).toBeGreaterThan(TEMP_IDENTITY_CLOSE_DEBOUNCE_MS / 1000);
+    expect(probes).toBeLessThanOrEqual(Math.ceil(result.elapsedSecs * 1000 / TEMP_IDENTITY_POLL_MS) + 1);
   });
 
   it('never probes or changes a permanent role lifecycle', async () => {
@@ -1058,8 +1095,11 @@ describe('runTemp', () => {
       sourceFile: 'tmp',
     }));
     const { deps } = fakeWorld({ lifeChecks: 100, exitFile: join(d, '.exit-status') });
+    let probes = 0;
     deps.fetch = async () => ({
-      status: 200, ok: true, json: async () => ({ identities: [] }),
+      status: 200, ok: true,
+      json: async () => ({ identities: probes++ === 0
+        ? [{ name: 'Closed', temporary: true }] : [{ name: 'Other' }] }),
     });
 
     await runTemp('Closed', deps);

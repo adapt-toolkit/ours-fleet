@@ -121,6 +121,18 @@ describe('probeIdentityPresence', () => {
     expect(absent).toEqual({ state: 'absent' });
   });
 
+  it('accepts the daemon string-index form and treats an empty restart index as ambiguous', async () => {
+    const present = await probeIdentityPresence('Temp', async () => ({
+      status: 200, ok: true, json: async () => ({ identities: ['Temp'] }),
+    }), hermetic());
+    const empty = await probeIdentityPresence('Temp', async () => ({
+      status: 200, ok: true, json: async () => ({ identities: [] }),
+    }), hermetic());
+
+    expect(present).toEqual({ state: 'present', temporary: false, stale: false });
+    expect(empty).toEqual({ state: 'unknown', detail: 'identity index is temporarily empty' });
+  });
+
   it('fails open on transport, auth, and malformed-index errors', async () => {
     const transport = await probeIdentityPresence('Temp', async () => {
       throw new Error('daemon restart');

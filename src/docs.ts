@@ -192,6 +192,13 @@ older servers fall back to \`create_identity\`. Collisions and creation errors
 stop safely without force-adopting or deleting identity state. Permanent roles
 retain normal \`create_identity\` behavior.
 
+The temporary supervisor treats its first positive identity observation as the
+lifecycle readiness gate: a cold harness may take as long as needed to read its
+briefing and bind, without a fixed first-bind retirement timer. After readiness,
+only sustained authoritative absence closes the role. Unreachable, malformed, or
+valid-but-empty daemon indexes are ambiguous and reset closure debounce rather
+than becoming cleanup authority.
+
 Inside a managed ACP role, the same CLI automatically routes a real \`spawn\`
 through that role's authenticated supervisor control socket. \`--role Name\` is
 accepted as an alternative to the positional name, so a minimal delegated call

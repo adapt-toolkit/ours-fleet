@@ -412,8 +412,8 @@ export interface AttemptResult {
 
 /** Continuous authoritative absence required after an identity was observed. */
 export const TEMP_IDENTITY_CLOSE_DEBOUNCE_MS = 5_000;
-/** Slower first-bind allowance when the identity has not appeared yet. */
-export const TEMP_IDENTITY_STARTUP_GRACE_MS = 30_000;
+/** Lifecycle polling is deliberately slower than the 500ms stop-signal loop. */
+export const TEMP_IDENTITY_POLL_MS = 2_000;
 
 /** One session lifecycle. `runSupervised` (or a one-shot caller) drives it. */
 export async function runOnce(
@@ -819,6 +819,7 @@ export async function runOnce(
 
   const start = deps.now();
   let nextLoopReloadAt = deps.now() + 30_000;
+  let nextIdentityPollAt = deps.now();
   let lastReloadError = '';
   let identityObserved = false;
   let identityAbsentSince: number | undefined;
@@ -833,28 +834,28 @@ export async function runOnce(
       sessionClosed = true;
       break;
     }
-    if (temp) {
+    if (temp && now >= nextIdentityPollAt) {
+      nextIdentityPollAt = now + TEMP_IDENTITY_POLL_MS;
       const presence = await probeIdentityPresence(
         role.identity, deps.fetch, resolvedMonitorDeps.env);
       if (presence.state === 'present') {
         identityObserved = true;
         identityAbsentSince = undefined;
-      } else if (presence.state === 'absent') {
+      } else if (presence.state === 'absent' && identityObserved) {
         identityAbsentSince ??= now;
-        const debounceMs = identityObserved
-          ? TEMP_IDENTITY_CLOSE_DEBOUNCE_MS : TEMP_IDENTITY_STARTUP_GRACE_MS;
         // Require a continuous, time-bounded run of authoritative absence.
-        // Before first observation allow a slow identity bind; after a known
-        // identity closes, settle the child and supervisor promptly but never
-        // from the old pair of 500ms snapshots.
-        if (now - identityAbsentSince >= debounceMs) {
+        // The first positive observation is the readiness gate: cold tmux
+        // starts may spend minutes loading the harness and briefing before the
+        // agent creates/binds its identity, and absence before then is not a
+        // close event. After readiness, debounce a real disappearance.
+        if (now - identityAbsentSince >= TEMP_IDENTITY_CLOSE_DEBOUNCE_MS) {
           retirementReason = 'identity-closed';
           deps.log(`[${name}] temporary identity '${role.identity}' closed; retiring session and supervisor`);
           await sessionHandle.close();
           sessionClosed = true;
           break;
         }
-      } else identityAbsentSince = undefined;
+      } else if (presence.state === 'unknown') identityAbsentSince = undefined;
     }
     if (reloadLoopConfig && now >= nextLoopReloadAt) {
       nextLoopReloadAt = now + 30_000;
