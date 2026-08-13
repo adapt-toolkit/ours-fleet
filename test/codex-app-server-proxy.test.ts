@@ -22,7 +22,7 @@ const PROXY_EXIT_TIMEOUT_MS = 2_000;
 const proxy = join(dirname(fileURLToPath(import.meta.url)), '../dist/harness',
   'codex-app-server-proxy.js');
 
-async function runProxy(realCodexPath: string): Promise<{
+async function runProxy(realCodexPath: string, pendingInput?: string): Promise<{
   code: number | null;
   signal: NodeJS.Signals | null;
   stderr: string;
@@ -41,6 +41,8 @@ async function runProxy(realCodexPath: string): Promise<{
   let stderr = '';
   child.stderr.setEncoding('utf8');
   child.stderr.on('data', chunk => { stderr += chunk; });
+  child.stdin.on('error', () => {});
+  if (pendingInput !== undefined) child.stdin.write(pendingInput);
   return new Promise((resolve, reject) => {
     const timeout = setTimeout(() => {
       child.stdin.destroy();
@@ -127,6 +129,25 @@ describe('Codex app-server permission proxy', () => {
 
     expect(result).toMatchObject({ code: 23, signal: null });
     expect(result.stderr).toContain('fixture Codex child failed');
+    expect(result.elapsedMs).toBeLessThan(PROXY_EXIT_TIMEOUT_MS);
+  });
+
+  it('exits after child death while a 512 KiB input line is backpressured', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'ours-codex-proxy-backpressure-'));
+    dirs.push(dir);
+    const failingCodex = join(dir, 'failing-codex');
+    writeFileSync(failingCodex,
+      '#!/usr/bin/env node\n' +
+      "setTimeout(() => process.stderr.write('fixture Codex child failed under backpressure\\n', " +
+      '() => process.exit(23)), 250);\n',
+      { mode: 0o700 });
+
+    // The child never reads stdin. One complete line larger than the pipe capacity
+    // makes the proxy pause its readline input before the child exits.
+    const result = await runProxy(failingCodex, 'x'.repeat(512 * 1024) + '\n');
+
+    expect(result).toMatchObject({ code: 23, signal: null });
+    expect(result.stderr).toContain('fixture Codex child failed under backpressure');
     expect(result.elapsedMs).toBeLessThan(PROXY_EXIT_TIMEOUT_MS);
   });
 

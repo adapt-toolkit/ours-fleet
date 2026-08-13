@@ -97,6 +97,7 @@ export function runCodexAppServerProxy(): void {
     finished = true;
     process.exitCode = code;
     input.close();
+    process.stdin.destroy();
   };
   child.once('error', error => {
     process.stderr.write(`ours-fleet Codex app-server proxy: ${error.message}\n`);
