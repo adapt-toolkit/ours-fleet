@@ -81,6 +81,66 @@ afterEach(() => {
 });
 
 describe('OwnerChannel live management', () => {
+  it('reconnects the direct watch from its durable cursor without duplicating an owner turn', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'ours-owner-watch-'));
+    dirs.push(dir);
+    writeFileSync(join(dir, '.owner-channel-watch.json'), JSON.stringify({
+      version: 1, cursor: 41, reconnects: 0, consecutiveFailures: 0,
+      reason: 'OWNER_WATCH_CONNECTED', updatedAt: new Date(0).toISOString(),
+    }) + '\n');
+    const client = new ManagementClient();
+    const secretBody = 'OWNER_BODY_MUST_NOT_ENTER_WATCH_STATE';
+    client.batches.push([{
+      msg_id: 90, wire_id: 'watch-continuity-wire', from: { id: OWNER }, text: secretBody,
+    }], []);
+    const queuePrompt = vi.fn(async () => ({
+      promptId: 'watch-prompt', queuedBehind: 0,
+      completion: Promise.resolve({
+        accepted: true, outcome: 'completed' as const, succeeded: true, output: 'done',
+      }),
+    }));
+    const session = {
+      backend: 'acp', pid: 1, isAlive: () => true,
+      snapshot: () => ({ backend: 'acp', alive: true, readiness: 'idle' }),
+      queuePrompt, interrupt: vi.fn(), eventsSince: () => [],
+    } as unknown as SessionHandle;
+    const urls: string[] = [];
+    let attempt = 0;
+    const watchFetch = vi.fn(async (url: string, init?: { signal?: AbortSignal }) => {
+      urls.push(url);
+      if (attempt++ === 0) throw new Error('simulated two-hour socket abort');
+      if (attempt === 2) return {
+        status: 200, ok: true,
+        json: async () => ({ cursor: 42, events: [{ event: 'message_received', msg_id: 90 }] }),
+      };
+      return new Promise<never>((_resolve, reject) => {
+        init?.signal?.addEventListener('abort', () => reject(new Error('closed')), { once: true });
+      });
+    });
+    const delays: number[] = [];
+    const logs: string[] = [];
+    const channel = new OwnerChannel({
+      role: 'Role', harness: 'claude-code',
+      config: { identity: 'Role-owner', owners: [OWNER], interrupt: false, progress_interval_ms: 0 },
+      session, stateDir: dir, client, watchFetch, log: line => logs.push(line),
+      binderDeps: { now: () => 1_000, sleep: async ms => { delays.push(ms); } },
+    });
+
+    await channel.start();
+    await vi.waitFor(() => expect(queuePrompt).toHaveBeenCalledOnce());
+    await vi.waitFor(() => expect(JSON.parse(readFileSync(
+      join(dir, '.owner-channel-watch.json'), 'utf8')).cursor).toBe(42));
+    await channel.close();
+
+    expect(urls.slice(0, 2).every(url => url.endsWith('?since=41'))).toBe(true);
+    expect(delays[0]).toBe(1_000);
+    expect(logs.some(line => line.includes('reason=OWNER_WATCH_STREAM_ERROR'))).toBe(true);
+    const state = readFileSync(join(dir, '.owner-channel-watch.json'), 'utf8');
+    expect(state).toContain('"reconnects":1');
+    expect(state).not.toContain(secretBody);
+    expect(queuePrompt.mock.calls[0][0]).toContain(secretBody);
+  });
+
   it('relays every managed-agent message as a new message to the latest owner', async () => {
     const { channel, client, queuePrompt } = setup({ agent: AGENT });
     await channel.start();
