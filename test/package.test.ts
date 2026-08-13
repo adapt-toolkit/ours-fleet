@@ -14,9 +14,15 @@ describe('packed root package', () => {
     try {
       mkdirSync(packDir);
       mkdirSync(consumerDir);
-      const packed = JSON.parse(execFileSync('npm', [
+      const packOutput = execFileSync('npm', [
         'pack', '--json', '--pack-destination', packDir,
-      ], { encoding: 'utf8' }))[0] as { filename: string };
+      ], {
+        encoding: 'utf8',
+        env: { ...process.env, npm_config_foreground_scripts: 'true' },
+      });
+      // Foreground lifecycle scripts can prefix npm's JSON (with ANSI color in CI).
+      const packJson = packOutput.slice(packOutput.lastIndexOf('\n[') + 1);
+      const packed = JSON.parse(packJson)[0] as { filename: string };
       const tarball = join(packDir, packed.filename);
 
       writeFileSync(join(consumerDir, 'package.json'), JSON.stringify({
