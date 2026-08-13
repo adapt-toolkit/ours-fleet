@@ -3,7 +3,7 @@ import { randomUUID } from 'node:crypto';
 import type { ResolvedRoleLoop } from './config.js';
 import {
   ScheduledLoopStateStore, deterministicJitter, increment, type LoopRuntimeState,
-  type ScheduledLoopsFile,
+  type ScheduledLoopsFile, type StateWriter,
 } from './state.js';
 import { RoleTurnArbiter } from '../session/arbiter.js';
 import type { TurnResult } from '../session/types.js';
@@ -13,7 +13,32 @@ export interface LoopManagerDeps {
   setTimer(callback: () => void, ms: number): unknown;
   clearTimer(timer: unknown): void;
   log(line: string): void;
+  /** Persistence seam; defaults to the atomic replace. Tests inject write faults here. */
+  writeState?: StateWriter;
+  /** Test seam for the post-cancellation abandon bound; production uses the default. */
+  cancelAbandonMs?: number;
 }
+
+/** The manager never sleeps longer than this, so one poll per minute is the floor rate. */
+const POLL_CEILING_MS = 60_000;
+
+/**
+ * Recovery delay for the nth consecutive failure: 1s doubling to the poll
+ * ceiling. Bounded at both ends — never a busy retry, never longer than the
+ * normal cadence, so recovery is noticed within a minute of the fault clearing.
+ */
+export function backoffMs(consecutiveFailures: number): number {
+  const exponent = Math.min(Math.max(consecutiveFailures, 1) - 1, 6);
+  return Math.min(POLL_CEILING_MS, 1_000 * 2 ** exponent);
+}
+
+/**
+ * How long a cancelled run may stay `active` before the loop stops believing it
+ * will ever settle. Deliberately longer than the session layer's own escalation
+ * (cancel grace + SIGTERM->SIGKILL grace), so this fires only when that recovery
+ * did not, and never races a run that is about to report honestly.
+ */
+const LOOP_CANCEL_ABANDON_MS = 60_000;
 
 export interface LoopActionResult {
   state: 'started' | 'skipped_busy' | 'disabled' | 'unavailable';
@@ -36,13 +61,16 @@ export class ScheduledLoopManager implements ScheduledLoopManagerHandle {
   private timer?: unknown;
   private readonly runTimeouts = new Set<unknown>();
   private stopping = false;
+  /** Consecutive unforeseen poll failures; drives the recovery backoff. */
+  private pollFailures = 0;
 
   constructor(
     private readonly role: string, definitions: ResolvedRoleLoop[], stateDir: string,
     private readonly arbiter: RoleTurnArbiter, private readonly deps: LoopManagerDeps,
   ) {
     for (const definition of definitions) this.definitions.set(definition.name, definition);
-    this.store = new ScheduledLoopStateStore(stateDir, role, definitions, deps.now(), deps.log);
+    this.store = new ScheduledLoopStateStore(
+      stateDir, role, definitions, deps.now(), deps.log, deps.writeState);
   }
 
   start(): void {
@@ -126,10 +154,18 @@ export class ScheduledLoopManager implements ScheduledLoopManagerHandle {
       }
       const scheduledAt = Date.parse(state.nextScheduledAt);
       this.advance(definition, state);
-      this.store.persist();
+      // The claim has to be durable before the turn is submitted: a run that is
+      // not on disk is a run a restart cannot see, and the occurrence would be
+      // submitted a second time. At-most-once outranks running this occurrence.
+      if (!this.store.persist()) { this.skipUnpersisted(definition, state, now); continue; }
       await this.attempt(definition, state, scheduledAt);
     }
     this.store.state.clock.lastWallMs = now;
+    if (this.pollFailures) {
+      this.store.clearAnomaly('manager_task_failed');
+      this.deps.log(`[${this.role}] scheduled loop manager recovered after ${this.pollFailures} failed poll(s)`);
+      this.pollFailures = 0;
+    }
     this.store.persist();
     this.schedule();
   }
@@ -179,9 +215,16 @@ export class ScheduledLoopManager implements ScheduledLoopManagerHandle {
       this.runTimeouts.delete(timeout);
       if (state.activeRunId !== runId || this.stopping) return;
       this.deps.log(`[${this.role}] loop ${definition.name} timed out run=${runId.slice(0, 11)} after ${timeoutMs}ms; cancelling`);
-      void this.arbiter.interrupt('scheduled-loop').catch(error => {
+      void this.arbiter.interrupt('scheduled-loop').then(outcome => {
+        // Forced recovery IS a successful cancellation; record how it ended
+        // rather than reporting the interrupt itself as a failure.
+        if (outcome?.state === 'forced')
+          this.deps.log(`[${this.role}] loop ${definition.name} cancellation enforced `
+            + `run=${runId.slice(0, 11)} reason=${outcome.reasonCode ?? 'forced'}`);
+      }).catch(error => {
         this.deps.log(`[${this.role}] loop ${definition.name} timeout cancellation failed: ${(error as Error)?.name ?? 'Error'}`);
       });
+      this.armAbandon(definition, state, runId);
     }, timeoutMs);
     this.runTimeouts.add(timeout);
     void result.queued.completion.then(turn => {
@@ -190,6 +233,40 @@ export class ScheduledLoopManager implements ScheduledLoopManagerHandle {
       this.finish(definition, state, runId, turn);
     });
     return { state: 'started', runId };
+  }
+
+  /**
+   * Last resort for a run whose cancellation never settles. Without it a single
+   * unsettled turn keeps `activeRunId` set for the life of the process, and
+   * every later tick reports `skipped_busy` forever — the loop looks scheduled
+   * while nothing has run since. Releasing the slot is honest, and it is safe
+   * because `finish` still refuses to double-report a run it no longer owns.
+   *
+   * Releasing the loop's own slot is only half of it. The cancellation that
+   * never settled is still holding the arbiter's admission boundary, so the
+   * generation it belongs to has to be retired in the same step — otherwise the
+   * loop believes it is free while every later producer, scheduled or owner,
+   * queues behind a promise that will never resolve.
+   */
+  private armAbandon(
+    definition: ResolvedRoleLoop, state: LoopRuntimeState, runId: string,
+  ): void {
+    const abandon = this.deps.setTimer(() => {
+      this.runTimeouts.delete(abandon);
+      if (state.activeRunId !== runId || this.stopping) return;
+      state.activeRunId = null;
+      state.lastFinishedAt = new Date(this.deps.now()).toISOString();
+      state.counts.failed = increment(state.counts.failed);
+      state.lastOutcome = 'abandoned_unsettled';
+      state.lastError = { kind: 'abandoned_unsettled', at: state.lastFinishedAt };
+      this.store.state.health = 'degraded';
+      this.store.state.anomaly = 'abandoned_unsettled';
+      this.store.persist();
+      this.arbiter.retireStalledAdmission();
+      this.deps.log(`[${this.role}] loop ${definition.name} abandoned run=${runId.slice(0, 11)}: `
+        + 'cancellation never settled; admission released');
+    }, this.deps.cancelAbandonMs ?? LOOP_CANCEL_ABANDON_MS);
+    this.runTimeouts.add(abandon);
   }
 
   private finish(
@@ -247,6 +324,20 @@ export class ScheduledLoopManager implements ScheduledLoopManagerHandle {
     }
   }
 
+  /**
+   * A run the store could not record is dropped, not retried: the cursor has
+   * already moved, so this can never become a busy loop, and the outage is
+   * visible as a skip with a failed health rather than as silence.
+   */
+  private skipUnpersisted(definition: ResolvedRoleLoop, state: LoopRuntimeState, now: number): void {
+    state.counts.skipped = increment(state.counts.skipped);
+    state.lastOutcome = 'skipped_unpersisted';
+    state.lastFinishedAt = new Date(now).toISOString();
+    state.lastError = { kind: 'persist_failed', at: state.lastFinishedAt };
+    this.deps.log(`[${this.role}] loop ${definition.name} skipped_unpersisted `
+      + `(${this.store.lastPersistError ?? 'state write failed'})`);
+  }
+
   private schedule(): void {
     if (this.timer !== undefined) this.deps.clearTimer(this.timer);
     this.timer = undefined;
@@ -255,14 +346,36 @@ export class ScheduledLoopManager implements ScheduledLoopManagerHandle {
       const state = this.store.state.loops[definition.name];
       return definition.enabled && !state.operatorDisabled;
     }).map(definition => Date.parse(this.store.state.loops[definition.name].nextDueAt));
-    if (!due.length) return;
-    const delay = Math.max(0, Math.min(...due) - this.deps.now());
-    this.timer = this.deps.setTimer(() => { void this.poll().catch(error => {
-      this.store.state.health = 'failed';
-      this.store.state.anomaly = 'manager_task_failed';
-      try { this.store.persist(); } catch {}
-      this.deps.log(`[${this.role}] scheduled loop manager failed: ${(error as Error)?.name ?? 'Error'}`);
-    }); }, Math.min(delay, 60_000));
+    // While writes are failing the manager keeps a bounded probe armed even with
+    // nothing due, so health stops lying the moment the disk comes back.
+    const probe = this.store.persistFailures ? backoffMs(this.store.persistFailures) : undefined;
+    if (!due.length && probe === undefined) return;
+    const delay = due.length ? Math.max(0, Math.min(...due) - this.deps.now()) : POLL_CEILING_MS;
+    this.arm(Math.min(delay, POLL_CEILING_MS, probe ?? POLL_CEILING_MS));
+  }
+
+  private arm(delayMs: number): void {
+    this.timer = this.deps.setTimer(
+      () => { void this.poll().catch(error => this.recover(error)); }, delayMs);
+  }
+
+  /**
+   * The residual safety net. Persistence failures are absorbed by the store, so
+   * reaching here means something unforeseen threw — and whatever it was, the
+   * manager must stay armed. The previous behaviour left no timer at all, which
+   * turned one transient ENOSPC into every loop on the role being silently gone
+   * until the process was restarted.
+   */
+  private recover(error: unknown): void {
+    this.pollFailures = increment(this.pollFailures);
+    this.store.state.health = 'failed';
+    this.store.state.anomaly = 'manager_task_failed';
+    this.store.persist();
+    this.deps.log(`[${this.role}] scheduled loop manager failed: ${(error as Error)?.name ?? 'Error'}`
+      + ` (attempt ${this.pollFailures}, retrying in ${backoffMs(this.pollFailures)}ms)`);
+    if (this.stopping) return;
+    if (this.timer !== undefined) this.deps.clearTimer(this.timer);
+    this.arm(backoffMs(this.pollFailures));
   }
 
   private envelope(definition: ResolvedRoleLoop, runId: string, scheduledAt: number): string {

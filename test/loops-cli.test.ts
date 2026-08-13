@@ -97,6 +97,58 @@ describe('scheduled loops CLI', () => {
     expect(calls).toEqual(['run:health', 'disable:health', 'enable:health']);
   });
 
+  it('asks the live manager even when no checkpoint was ever written', async () => {
+    config();
+    // ENOSPC on the very first write: the manager is up and failed, and there is
+    // no stored file to read — so the live socket is the only source there is.
+    const failed = {
+      ...state(), health: 'failed' as const, anomaly: 'persist_failed',
+      clock: { lastWallMs: Date.now() },
+    };
+    await startControl({
+      start: () => undefined, stop: async () => undefined, status: () => failed,
+      runNow: async () => ({ state: 'started' as const }), disable: () => ({ state: 'disabled' as const }),
+      enable: () => ({ state: 'started' as const }), reconcile: () => undefined,
+    });
+    expect(existsSync(join(homeDir, '.ours-fleet', 'agents', 'Coordinator', '.scheduled-loops.json')))
+      .toBe(false);
+
+    const status = await run(['status', 'Coordinator']);
+    expect(status.stdout).toContain('evidence=live');
+    expect(status.stdout).toContain('failed');
+    expect(status.stdout).toContain('anomaly=persist_failed');
+  });
+
+  /** The ENOSPC signature: the manager is gone, the last write it managed still
+   *  says healthy, and nothing has advanced the clock for hours. */
+  function storeCheckpoint(ageMs: number) {
+    const dir = join(homeDir, '.ours-fleet', 'agents', 'Coordinator');
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(join(dir, '.scheduled-loops.json'),
+      JSON.stringify({ ...state(), clock: { lastWallMs: Date.now() - ageMs } }), { mode: 0o600 });
+  }
+
+  it('will not repeat a frozen checkpoint\'s health as fact', async () => {
+    config();
+    storeCheckpoint(2 * 60 * 60_000);
+
+    const stale = await run(['loops', 'status', 'Coordinator']);
+    expect(stale.stdout).toContain('evidence=stored');
+    expect(stale.stdout).toContain('health=stale');
+    expect(stale.stdout).toMatch(/stale=7[12]\d\ds/);
+    expect(stale.stdout).not.toContain('health=healthy');
+    expect(JSON.parse((await run(['loops', 'status', 'Coordinator', '--json'])).stdout).roles[0])
+      .toMatchObject({ evidence: 'stored', health: 'stale' });
+  });
+
+  it('reports a current checkpoint as healthy, with no stale annotation', async () => {
+    config();
+    storeCheckpoint(1_000);
+    const current = await run(['loops', 'status', 'Coordinator']);
+    expect(current.stdout).toContain('health=healthy');
+    expect(current.stdout).not.toContain('stale=');
+  });
+
   it('classifies busy as exit 3 and unavailable control as exit 2 without retry', async () => {
     config();
     const manager: ScheduledLoopManagerHandle = {

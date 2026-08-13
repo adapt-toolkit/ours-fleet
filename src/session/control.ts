@@ -3,7 +3,7 @@ import { chmodSync, existsSync, readFileSync, rmSync, writeFileSync } from 'node
 import { createConnection, createServer, type Server, type Socket } from 'node:net';
 import { join } from 'node:path';
 
-import { SessionControlError } from './types.js';
+import { SessionControlError, interruptOutcome } from './types.js';
 import type { ControlFailureKind, SessionHandle } from './types.js';
 import type {
   OwnerChannelHandle, OwnerChannelManagementRequest,
@@ -340,10 +340,13 @@ export class RoleControlServer {
           });
           return;
         }
-        case 'interrupt':
-          await this.session.interrupt('local-console');
-          this.write(socket, { version: 1, id: request.id, ok: true });
+        case 'interrupt': {
+          // Forced recovery cancelled the turn just as surely as a cooperative
+          // stop did. Report HOW, never as a failed operation.
+          const outcome = interruptOutcome(await this.session.interrupt('local-console'));
+          this.write(socket, { version: 1, id: request.id, ok: true, result: outcome });
           return;
+        }
         case 'loop_status': {
           if (!this.loopManager)
             throw new SessionControlError('rejected', 'scheduled loops are unavailable for this role');
@@ -481,8 +484,11 @@ export class RoleControlServer {
             this.write(socket, { version: 1, id: request.id, ok: true, result: existing });
             return;
           }
-          await this.session.interrupt('local-console');
-          const receipt = { accepted: true, commandId: request.commandId, at: new Date().toISOString() };
+          const outcome = interruptOutcome(await this.session.interrupt('local-console'));
+          const receipt = {
+            accepted: true, commandId: request.commandId, at: new Date().toISOString(),
+            ...outcome,
+          };
           this.interruptCommands.set(request.commandId, receipt);
           if (this.interruptCommands.size > 200) {
             const oldest = this.interruptCommands.keys().next().value as string;

@@ -1,5 +1,5 @@
 import { userInfo } from 'node:os';
-import { readFileSync } from 'node:fs';
+import { existsSync, readFileSync } from 'node:fs';
 import { realExec, type Exec } from './exec.js';
 import { isolationContextFor, loadConfig, type ResolvedRole } from './config.js';
 import type { ConfigDiagnostic, YamlMode } from './config-yaml.js';
@@ -13,7 +13,12 @@ import {
   authResolutionHint, resolveEndpoint,
   type DaemonEndpoint, type FetchLike,
 } from './monitor.js';
+import { readScheduledLoops, storedLoopHealth } from './loops/state.js';
+import { controlSocketPath } from './session/control.js';
 import type { PrereqCheck, PrereqReport } from './harness/types.js';
+import {
+  analyzeInstalls, buildInfo, buildLabel, discoverInstalls, BIN_NAME,
+} from './provenance.js';
 
 /** Which cgroup-v2 controllers are delegated to this user manager (advisory). */
 function cgroupDelegationDetail(): string {
@@ -46,14 +51,61 @@ function resolveMonitorProfiles(roles: ResolvedRole[]): MonitorProfile[] {
   return profiles;
 }
 
+/**
+ * Which @ours.network/fleet artifacts this host has, and which one is talking.
+ *
+ * Fails only on an error-severity skew: two installs sharing a semver with
+ * different builds, or a runtime that is not what PATH resolves to. A lone
+ * pre-provenance install is reported but does not fail the report — an operator
+ * cannot act on it beyond upgrading, and it is the common case mid-rollout.
+ */
+function installChecks(scan?: { path?: string; argv1?: string }): PrereqCheck[] {
+  const installs = discoverInstalls(scan ?? {});
+  const running = installs.find(i => i.running);
+  const info = buildInfo();
+  const onPath = installs.filter(i => i.pathIndex !== undefined);
+  return [
+    {
+      name: 'install',
+      ok: true,
+      detail: [
+        running
+          ? `running ${buildLabel(running)} at ${running.packageRoot}`
+          : `running ${buildLabel({ version: info.version, build: info })} (install root not resolvable)`,
+        onPath.length
+          ? `on PATH: ${onPath.map(i => `${i.bin} -> ${buildLabel(i)}`).join(', ')}`
+          : `no ${BIN_NAME} on PATH`,
+      ].join('; '),
+    },
+    // One row per conflict rather than one long line: each is a separate thing
+    // to fix, and the report is read a line at a time.
+    ...analyzeInstalls(installs).map(s => ({
+      name: `install: ${s.kind}`,
+      ok: s.severity !== 'error',
+      detail: s.message,
+    })),
+  ];
+}
+
 /** Host-level + per-harness prerequisite report with actionable messages. */
 export async function doctor(
-  opts: { harness?: string; configPath?: string; yamlMode?: YamlMode } = {},
+  opts: {
+    harness?: string;
+    configPath?: string;
+    yamlMode?: YamlMode;
+    /** Override PATH / running executable when scanning for installs (tests). */
+    installScan?: { path?: string; argv1?: string };
+  } = {},
   exec: Exec = realExec,
   platform: NodeJS.Platform = process.platform,
   fetchImpl: FetchLike = (u, i) => globalThis.fetch(u, i) as unknown as ReturnType<FetchLike>,
 ): Promise<PrereqReport> {
   const checks: PrereqCheck[] = [];
+
+  // First: which artifact is producing this report. Everything below is only as
+  // trustworthy as the answer, and a second install with the same semver and
+  // different behaviour is invisible to `--version`.
+  checks.push(...installChecks(opts.installScan));
 
   const major = Number(process.versions.node.split('.')[0]);
   checks.push({
@@ -263,6 +315,50 @@ export async function doctor(
         `(start it: ours-mcp start) [${(e as Error)?.message ?? e}]`;
     }
     checks.push({ name: checkName, ok, detail });
+  }
+
+  // Scheduled loops fail silently by construction: the manager runs inside the
+  // role process, so when it stops there is nothing left to raise a hand. A
+  // checkpoint that has stopped advancing is the observable symptom, and it is
+  // the only one available when the reason it stopped is that writes fail.
+  for (const role of roles.filter(role => role.loops?.length)) {
+    const dir = agentDir(role.name);
+    const running = existsSync(controlSocketPath(dir));
+    const state = readScheduledLoops(dir);
+    const name = `loops: ${role.name}`;
+    if (!state) {
+      // No file at all is only innocent when nothing is running. A live role with
+      // loops writes its checkpoint before it schedules anything, so the absence
+      // means the very first write failed — the ENOSPC-at-startup case.
+      checks.push({
+        name, ok: !running,
+        detail: running
+          ? 'the role is running but has never written scheduled-loop state — its first checkpoint '
+            + 'failed (a full disk does this); if the role only just started, re-run doctor. '
+            + `Live state: ours-fleet loops status ${role.name}`
+          : 'no scheduled-loop state yet (role has not run)',
+      });
+      continue;
+    }
+    const verdict = storedLoopHealth(state, Date.now());
+    if (!running) {
+      checks.push({ name, ok: true, detail: `role not running; last recorded ${verdict.recorded}` });
+      continue;
+    }
+    checks.push({
+      name,
+      ok: !verdict.stale && verdict.recorded === 'healthy',
+      detail: verdict.stale
+        ? `state not updated for ${Math.round(verdict.ageMs / 1000)}s while the role is running — `
+          + `the loop manager is not checkpointing (last recorded ${verdict.recorded}); `
+          + `check the role log and free disk space, then: ours-fleet restart ${role.name}`
+        : verdict.recorded !== 'healthy'
+          ? `loop health ${verdict.recorded}${state.anomaly ? ` (${state.anomaly})` : ''} — `
+            + `inspect: ours-fleet loops status ${role.name}`
+          : verdict.scheduled
+            ? 'checkpoint current and healthy'
+            : 'healthy; no enabled loop to schedule, so the checkpoint stands still by design',
+    });
   }
 
   // A broken config resolves no roles and therefore no harnesses. Without a

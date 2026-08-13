@@ -1,5 +1,6 @@
-import { mkdirSync } from 'node:fs';
-import { join } from 'node:path';
+import { chmodSync, existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { dirname, join, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { agentDir, home } from '../paths.js';
 import { realExec, type Exec } from '../exec.js';
 import type { ResolvedRole } from '../config.js';
@@ -9,7 +10,7 @@ import type {
 } from './types.js';
 import { registerAdapter } from './registry.js';
 import { harnessRuntimeDir } from '../isolation/policy.js';
-import { bundledAcpAgent } from './acp-agent.js';
+import { bundledAcpAgent, resolveBundledAcpAgent } from './acp-agent.js';
 
 interface CodexOptions {
   launcher?: string;
@@ -34,6 +35,11 @@ const SANDBOX_MODES = ['read-only', 'workspace-write', 'danger-full-access'];
 /** Codex CLI's accepted `--ask-for-approval` values. */
 const APPROVAL_POLICIES = ['untrusted', 'on-request', 'never'];
 const BUNDLED_CODEX_ACP_VERSION = '1.1.7';
+const CODEX_ACP_PACKAGE = '@agentclientprotocol/codex-acp';
+const CODEX_PROXY_APPROVAL_ENV = 'OURS_FLEET_CODEX_APPROVAL';
+const CODEX_PROXY_SANDBOX_ENV = 'OURS_FLEET_CODEX_SANDBOX';
+const CODEX_PROXY_REAL_PATH_ENV = 'OURS_FLEET_REAL_CODEX_PATH';
+const CODEX_PROXY_MANIFEST_ENV = 'OURS_FLEET_CODEX_ACP_MANIFEST';
 
 /**
  * What an unattended role can actually do under Codex's native settings.
@@ -105,6 +111,60 @@ function approvalPolicy(role: ResolvedRole): string | undefined {
 
 function launcherMode(role: ResolvedRole): string {
   return (role.harness_options as CodexOptions | undefined)?.launcher ?? 'auto';
+}
+
+function bundledCodexAcp() {
+  return resolveBundledAcpAgent(CODEX_ACP_PACKAGE, 'codex-acp', 'codex-acp');
+}
+
+function canOverrideBundledAcpApproval(): boolean {
+  const resolution = bundledCodexAcp();
+  return resolution.bundled && resolution.version === BUNDLED_CODEX_ACP_VERSION
+    && resolution.manifestPath !== undefined && compiledProxyModule() !== undefined;
+}
+
+function compiledProxyModule(): string | undefined {
+  const adjacent = fileURLToPath(new URL('./codex-app-server-proxy.js', import.meta.url));
+  if (existsSync(adjacent)) return adjacent;
+  // Vitest imports src/ directly; globalSetup builds the executable module in dist/.
+  const fromSource = resolve(dirname(fileURLToPath(import.meta.url)), '../../dist/harness',
+    'codex-app-server-proxy.js');
+  if (existsSync(fromSource)) return fromSource;
+  return undefined;
+}
+
+const shellQuote = (value: string): string => `'${value.replaceAll("'", "'\\''")}'`;
+
+/**
+ * Materialize the tiny CODEX_PATH executable inside the role's own state dir.
+ * Keeping it there makes the proxy available under both ordinary and isolated
+ * launches without adding another host path to the filesystem boundary.
+ */
+function codexAcpEnvironment(role: ResolvedRole, dirs: RoleDirs): Record<string, string> {
+  if (role.session !== 'acp' || role.session_options?.acp?.command != null) return {};
+  const resolution = bundledCodexAcp();
+  if (!resolution.bundled || resolution.version !== BUNDLED_CODEX_ACP_VERSION
+      || !resolution.manifestPath) return {};
+  const runtimeDir = harnessRuntimeDir(dirs.stateDir, 'codex');
+  mkdirSync(runtimeDir, { recursive: true });
+  const proxyModule = join(runtimeDir, 'app-server-proxy.mjs');
+  const source = compiledProxyModule();
+  if (!source) throw new Error('Codex app-server proxy is missing; rebuild ours-fleet');
+  writeFileSync(proxyModule, readFileSync(source, 'utf8'), { mode: 0o600 });
+  const windows = process.platform === 'win32';
+  const command = join(runtimeDir, windows ? 'codex-app-server-proxy.cmd' : 'codex-app-server-proxy');
+  const script = windows
+    ? `@echo off\r\n"${process.execPath.replaceAll('"', '""')}" "${proxyModule.replaceAll('"', '""')}" %*\r\n`
+    : `#!/bin/sh\nexec ${shellQuote(process.execPath)} ${shellQuote(proxyModule)} "$@"\n`;
+  writeFileSync(command, script, { mode: 0o700 });
+  chmodSync(command, 0o700);
+  return {
+    CODEX_PATH: command,
+    [CODEX_PROXY_APPROVAL_ENV]: approvalPolicy(role) ?? 'on-request',
+    [CODEX_PROXY_SANDBOX_ENV]: sandboxMode(role) ?? 'workspace-write',
+    [CODEX_PROXY_MANIFEST_ENV]: resolution.manifestPath,
+    ...(process.env.CODEX_PATH ? { [CODEX_PROXY_REAL_PATH_ENV]: process.env.CODEX_PATH } : {}),
+  };
 }
 
 function encodeTomlValue(value: unknown): string {
@@ -235,7 +295,7 @@ export function makeCodexAdapter(exec: Exec = realExec): HarnessAdapter {
       if (requested === 'ours-codex' && !hasOursCodex)
         throw new Error('harness_options.launcher is ours-codex, but ours-codex is not on PATH; install @ours.network/codex or use launcher: auto');
       const command = requested === 'codex' ? 'codex' : hasOursCodex ? 'ours-codex' : 'codex';
-      return { argv: [], env: {}, command };
+      return { argv: [], env: codexAcpEnvironment(role, dirs), command };
     },
 
     buildLaunch(role: ResolvedRole, mode: 'fresh' | 'resume', _s: SessionState, prep: SessionPrep): Launch {
@@ -256,7 +316,7 @@ export function makeCodexAdapter(exec: Exec = realExec): HarnessAdapter {
         : typeof configured === 'string'
           ? ['sh', '-c', configured]
           : bundledAcpAgent(
-              '@agentclientprotocol/codex-acp', 'codex-acp', 'codex-acp');
+              CODEX_ACP_PACKAGE, 'codex-acp', 'codex-acp');
       const initialMode = acpAgentMode(role);
       return {
         argv,
@@ -316,17 +376,22 @@ export function makeCodexAdapter(exec: Exec = realExec): HarnessAdapter {
       const sandbox = sandboxMode(role) ?? 'workspace-write';
       if (role.session === 'acp') {
         const mode = acpAgentMode(role) ?? 'agent';
-        const actual = acpModePermissions(mode);
+        const configured = role.session_options?.acp?.command;
+        const overrideAvailable = configured == null && canOverrideBundledAcpApproval();
+        const actual = overrideAvailable ? { approval, sandbox } : acpModePermissions(mode);
         const exact = actual.approval === approval && actual.sandbox === sandbox;
         return {
           ...translated,
           native: { mode, ...actual },
           exact,
-          warnings: exact ? [] : [
-            `bundled codex-acp ${BUNDLED_CODEX_ACP_VERSION} mode '${mode}' actually uses `
-              + `approval=${actual.approval} sandbox=${actual.sandbox}; this does not exactly `
-              + `represent approval=${approval} sandbox=${sandbox}`,
-          ],
+          warnings: exact ? [] : [configured != null
+            ? `custom ACP command cannot be verified against approval=${approval} sandbox=${sandbox}; `
+              + `its '${mode}' mode is conservatively treated as approval=${actual.approval} `
+              + `sandbox=${actual.sandbox}`
+            : `codex-acp mode '${mode}' actually uses approval=${actual.approval} `
+              + `sandbox=${actual.sandbox}, and the bundled ${BUNDLED_CODEX_ACP_VERSION} `
+              + `app-server override is unavailable; this does not exactly represent `
+              + `approval=${approval} sandbox=${sandbox}`],
           capabilities: codexCapabilities(actual.approval, actual.sandbox),
         };
       }
@@ -340,6 +405,10 @@ export function makeCodexAdapter(exec: Exec = realExec): HarnessAdapter {
     effectivePermissionMode(role) {
       if (role.session === 'acp') {
         const nativeMode = acpAgentMode(role) ?? 'agent';
+        if (role.session_options?.acp?.command == null && canOverrideBundledAcpApproval()) {
+          const approval = approvalPolicy(role) ?? 'on-request';
+          return { fleetMode: fleetModeForApproval(approval), nativeMode };
+        }
         return {
           fleetMode: fleetModeForApproval(acpModePermissions(nativeMode).approval), nativeMode,
         };

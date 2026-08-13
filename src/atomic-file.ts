@@ -20,6 +20,13 @@ export interface LockDeps {
   sleep?(ms: number): Promise<void>;
 }
 
+/** The syscalls a replace depends on, injectable so faults can be forced deterministically. */
+export interface WriteDeps {
+  writeSync?(fd: number, buffer: Buffer, offset: number, length: number): number;
+  fsyncSync?(fd: number): void;
+  closeSync?(fd: number): void;
+}
+
 const DEFAULT_STALE_MS = 10_000;
 const POLL_MS = 25;
 
@@ -77,16 +84,35 @@ export async function withFileLock<T>(
  * half-written one — and an interrupted write leaves the previous contents
  * intact.
  */
-export function replaceFileAtomically(path: string, contents: string, mode = 0o600): void {
+export function replaceFileAtomically(path: string, contents: string, mode = 0o600, deps: WriteDeps = {}): void {
+  const write = deps.writeSync ?? writeSync;
+  const fsync = deps.fsyncSync ?? fsyncSync;
+  const close = deps.closeSync ?? closeSync;
   const dir = dirname(path);
   mkdirSync(dir, { recursive: true });
   const tmp = join(dir, `.${basename(path)}.${process.pid}.${randomUUID()}.tmp`);
   const fd = openSync(tmp, 'w', mode);
+  let closed = false;
   try {
-    writeSync(fd, contents);
-    fsyncSync(fd);            // the bytes are on disk before anything points at them
-  } finally {
-    closeSync(fd);
+    const buffer = Buffer.from(contents, 'utf8');
+    // A single writeSync is not a guarantee: the kernel may stop short, and a
+    // truncated temp renamed over the target is silent data loss.
+    for (let written = 0; written < buffer.length;) {
+      const advanced = write(fd, buffer, written, buffer.length - written);
+      // A write that accepts nothing would spin forever; fail instead.
+      if (advanced <= 0) throw new Error(`write made no progress at byte ${written} of ${buffer.length}`);
+      written += advanced;
+    }
+    fsync(fd);                // the bytes are on disk before anything points at them
+    close(fd);                // a temp we could not close cleanly is not publishable
+    closed = true;
+  } catch (e) {
+    // Cleanup must not mask why we are here: the original failure is what the
+    // caller needs, and a temp we could not finish must never be renamed over
+    // the last good file nor left occupying space on a disk that may be full.
+    if (!closed) { try { close(fd); } catch { /* already failing */ } }
+    try { rmSync(tmp, { force: true }); } catch { /* best effort */ }
+    throw e;
   }
   try {
     renameSync(tmp, path);

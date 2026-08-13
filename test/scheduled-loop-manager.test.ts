@@ -3,11 +3,14 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 
+import { replaceFileAtomically } from '../src/atomic-file.js';
 import type { ResolvedRoleLoop } from '../src/loops/config.js';
 import { ScheduledLoopManager } from '../src/loops/manager.js';
+import { storedLoopHealth } from '../src/loops/state.js';
+import type { ScheduledLoopsFile, StateWriter } from '../src/loops/state.js';
 import { RoleTurnArbiter } from '../src/session/arbiter.js';
 import type {
-  ExitRecord, QueuedPrompt, SessionEvent, SessionHandle, SessionSnapshot,
+  ExitRecord, InterruptOutcome, QueuedPrompt, SessionEvent, SessionHandle, SessionSnapshot,
   SubmitPromptOptions, TurnCancellationSource, TurnResult,
 } from '../src/session/types.js';
 
@@ -36,7 +39,19 @@ class FakeSession implements SessionHandle {
   async submitPrompt(text: string, options?: SubmitPromptOptions) {
     return (await this.queuePrompt(text, options)).completion;
   }
-  async interrupt(source: TurnCancellationSource = 'local-console') { this.interrupts.push(source); }
+  /** Set to model an ACP adapter whose recovery force-fails the running turn. */
+  forceRecoveryOnInterrupt = false;
+  /** Set to model a cancellation whose own recovery never returns. */
+  interruptNeverSettles = false;
+  async interrupt(source: TurnCancellationSource = 'local-console'): Promise<InterruptOutcome> {
+    this.interrupts.push(source);
+    if (this.interruptNeverSettles) return new Promise<InterruptOutcome>(() => {});
+    if (!this.forceRecoveryOnInterrupt) return { state: 'settled' };
+    // What AcpSession does once its cancel deadline expires: the adapter is
+    // killed, so every in-flight turn settles as failed before it answers.
+    this.finish({ accepted: false, outcome: 'failed', succeeded: false, detail: 'forced recovery' });
+    return { state: 'forced', reasonCode: 'ACP_CANCEL_DEADLINE_EXCEEDED' };
+  }
   respondPermission() { return false; }
   eventsSince(): SessionEvent[] { return []; }
   subscribe() { return () => undefined; }
@@ -56,7 +71,38 @@ function definition(name = 'health', overrides: Partial<ResolvedRoleLoop> = {}):
   };
 }
 
-function setup(definitions = [definition()], initialNow = 0) {
+/**
+ * A disk that can be made full on demand. `writes` counts only the writes that
+ * actually landed, so a test can prove a failed persist left the stored file
+ * exactly as it was.
+ */
+function faultyDisk() {
+  let full = false;
+  let writes = 0;
+  const writer: StateWriter = (path, contents, mode) => {
+    if (full) {
+      const error = new Error(
+        `ENOSPC: no space left on device, write '${path}'`) as NodeJS.ErrnoException;
+      error.code = 'ENOSPC';
+      error.errno = -28;
+      error.syscall = 'write';
+      throw error;
+    }
+    writes++;
+    replaceFileAtomically(path, contents, mode);
+  };
+  return {
+    writer,
+    fill: () => { full = true; },
+    free: () => { full = false; },
+    writes: () => writes,
+  };
+}
+
+function setup(
+  definitions = [definition()], initialNow = 0,
+  writeState?: StateWriter, cancelAbandonMs?: number,
+) {
   const dir = mkdtempSync(join(tmpdir(), 'ours-loop-manager-'));
   dirs.push(dir);
   let now = initialNow;
@@ -64,8 +110,12 @@ function setup(definitions = [definition()], initialNow = 0) {
   const logs: string[] = [];
   const session = new FakeSession();
   const arbiter = new RoleTurnArbiter(session);
+  let nowFault: Error | undefined;
   const manager = new ScheduledLoopManager('Coordinator', definitions, dir, arbiter, {
-    now: () => now,
+    now: () => {
+      if (nowFault) { const error = nowFault; nowFault = undefined; throw error; }
+      return now;
+    },
     setTimer: (callback, ms) => {
       const timer = { callback, ms, cleared: false };
       timers.push(timer);
@@ -73,8 +123,26 @@ function setup(definitions = [definition()], initialNow = 0) {
     },
     clearTimer: timer => { (timer as { cleared: boolean }).cleared = true; },
     log: line => logs.push(line),
+    writeState,
+    ...(cancelAbandonMs !== undefined ? { cancelAbandonMs } : {}),
   });
-  return { dir, manager, session, arbiter, timers, logs, now: () => now, setNow: (value: number) => { now = value; } };
+  const live = () => timers.filter(timer => !timer.cleared);
+  return {
+    dir, manager, session, arbiter, timers, logs, live,
+    now: () => now,
+    setNow: (value: number) => { now = value; },
+    /** Make the next clock read throw, standing in for any unforeseen poll fault. */
+    breakNow: (error: Error) => { nowFault = error; },
+    stored: () => JSON.parse(readFileSync(join(dir, '.scheduled-loops.json'), 'utf8')) as ScheduledLoopsFile,
+    /** Fire the pending schedule timer exactly as the runtime would, then drain microtasks. */
+    tick: async () => {
+      const timer = live().at(-1);
+      if (!timer) throw new Error('no live timer: the manager stopped scheduling itself');
+      timer.cleared = true;
+      timer.callback();
+      await new Promise(resolve => setImmediate(resolve));
+    },
+  };
 }
 
 afterEach(() => {
@@ -111,9 +179,152 @@ describe('ScheduledLoopManager strict cadence', () => {
     const deadline = status.timers.find(timer => timer.ms === 5 * 60_000 && !timer.cleared);
     expect(deadline).toBeDefined();
     deadline!.callback();
-    await Promise.resolve();
+    await new Promise(resolve => setImmediate(resolve));
     expect(status.session.interrupts).toEqual(['scheduled-loop']);
     expect(status.logs.join('\n')).toContain('timed out');
+  });
+
+  it('releases the loop slot after a forced cancellation so the next tick runs again', async () => {
+    const status = setup([definition('health', { intervalMs: 10 * 60_000 })]);
+    status.manager.start();
+    status.setNow(60_000);
+    await status.manager.poll();
+    expect(status.manager.status().loops.health.activeRunId).toMatch(/^sl_/);
+
+    // The adapter ignored the cancel, so the session forced recovery: the turn
+    // is over, and the loop must record that instead of owning the slot forever.
+    status.session.forceRecoveryOnInterrupt = true;
+    status.timers.find(timer => timer.ms === 5 * 60_000 && !timer.cleared)!.callback();
+    await new Promise(resolve => setImmediate(resolve));
+    await new Promise(resolve => setImmediate(resolve));
+
+    expect(status.manager.status().loops.health).toMatchObject({
+      activeRunId: null, lastOutcome: 'failed', counts: { failed: 1 },
+    });
+    expect(status.logs.join('\n')).toContain('cancellation enforced');
+
+    // The decisive part: the very next due occurrence starts, rather than
+    // reporting skipped_busy for the rest of the process's life.
+    status.setNow(660_000);
+    await status.manager.poll();
+    expect(status.session.prompts).toHaveLength(2);
+    expect(status.manager.status().loops.health.activeRunId).toMatch(/^sl_/);
+    expect(status.manager.status().loops.health.counts.skippedBusy ?? 0).toBe(0);
+  });
+
+  it('abandons a run whose cancellation never settles, without double-reporting it', async () => {
+    const status = setup([definition('health', { intervalMs: 10 * 60_000 })], 0, undefined, 30_000);
+    status.manager.start();
+    status.setNow(60_000);
+    await status.manager.poll();
+    const runId = status.manager.status().loops.health.activeRunId;
+
+    // Nothing settles: not the turn, not the cancellation, not the recovery.
+    status.timers.find(timer => timer.ms === 5 * 60_000 && !timer.cleared)!.callback();
+    await new Promise(resolve => setImmediate(resolve));
+    expect(status.manager.status().loops.health.activeRunId).toBe(runId);
+
+    status.setNow(90_000);
+    status.timers.find(timer => timer.ms === 30_000 && !timer.cleared)!.callback();
+    expect(status.manager.status().loops.health).toMatchObject({
+      activeRunId: null, lastOutcome: 'abandoned_unsettled', counts: { failed: 1 },
+      lastError: { kind: 'abandoned_unsettled' },
+    });
+    expect(status.manager.status()).toMatchObject({
+      health: 'degraded', anomaly: 'abandoned_unsettled',
+    });
+
+    // A late completion for a run the loop no longer owns changes nothing.
+    status.session.finish({ accepted: false, outcome: 'failed', succeeded: false });
+    await new Promise(resolve => setImmediate(resolve));
+    expect(status.manager.status().loops.health).toMatchObject({
+      activeRunId: null, lastOutcome: 'abandoned_unsettled', counts: { failed: 1 },
+    });
+  });
+
+  it('releases arbiter admission when it abandons a cancellation that never settles', async () => {
+    const status = setup([definition('health', { intervalMs: 10 * 60_000 })], 0, undefined, 30_000);
+    status.manager.start();
+    status.setNow(60_000);
+    await status.manager.poll();
+    const runId = status.manager.status().loops.health.activeRunId;
+    expect(runId).toMatch(/^sl_/);
+
+    // The turn ignores its cancellation AND the cancellation itself never
+    // returns, so it owns the arbiter's exclusive tail indefinitely.
+    status.session.interruptNeverSettles = true;
+    status.timers.find(timer => timer.ms === 5 * 60_000 && !timer.cleared)!.callback();
+    await new Promise(resolve => setImmediate(resolve));
+
+    // The shape of the reported failure: an owner prompt queued behind the
+    // stuck cancellation has nothing that will ever settle it.
+    let queuedBehindStall: 'pending' | 'admitted' | Error = 'pending';
+    const blocked = status.arbiter.queuePrompt('owner prompt queued behind the stall').then(
+      () => { queuedBehindStall = 'admitted'; }, error => { queuedBehindStall = error as Error; });
+    await new Promise(resolve => setImmediate(resolve));
+    expect(queuedBehindStall).toBe('pending');
+
+    status.setNow(90_000);
+    status.timers.find(timer => timer.ms === 30_000 && !timer.cleared)!.callback();
+    await blocked;
+    expect(status.manager.status().loops.health).toMatchObject({
+      activeRunId: null, lastOutcome: 'abandoned_unsettled',
+    });
+    // Truthful, and replayable: it says the prompt was never delivered.
+    expect(queuedBehindStall).toMatchObject({
+      name: 'SessionControlError', kind: 'control-unavailable',
+      reasonCode: 'ACP_CANCEL_DEADLINE_EXCEEDED',
+    });
+    expect(status.session.prompts).toHaveLength(1);
+
+    // The adapter is reclaimed, so the abandoned turn finally fails.
+    status.session.finish({ accepted: false, outcome: 'failed', succeeded: false });
+    await new Promise(resolve => setImmediate(resolve));
+
+    // A later owner prompt is admitted and settles.
+    const owner = await status.arbiter.queuePrompt('later owner prompt');
+    expect(status.session.prompts).toHaveLength(2);
+    status.session.finish({ accepted: true, outcome: 'completed', succeeded: true });
+    expect(await owner.completion).toMatchObject({ outcome: 'completed' });
+
+    // And so is the next scheduled slot — promptly, at its own occurrence,
+    // neither skipped_busy nor silently suspended without a verdict.
+    status.setNow(660_000);
+    await status.manager.poll();
+    expect(status.session.prompts).toHaveLength(3);
+    expect(status.manager.status().loops.health).toMatchObject({
+      activeRunId: expect.stringMatching(/^sl_/), lastOutcome: 'running',
+    });
+    expect(status.manager.status().loops.health.counts.skippedBusy ?? 0).toBe(0);
+    expect(status.timers.some(timer => !timer.cleared)).toBe(true);
+  });
+
+  it('settles a scheduled attempt already waiting behind a stalled cancellation', async () => {
+    const status = setup([definition('health', { intervalMs: 10 * 60_000 })], 0, undefined, 30_000);
+    status.manager.start();
+    status.setNow(60_000);
+    await status.manager.poll();
+
+    status.session.interruptNeverSettles = true;
+    status.timers.find(timer => timer.ms === 5 * 60_000 && !timer.cleared)!.callback();
+    await new Promise(resolve => setImmediate(resolve));
+
+    // The production shape: the next occurrence's poll blocks inside the
+    // arbiter, so the loop is never rescheduled and reports no verdict at all.
+    status.setNow(660_000);
+    let polled = false;
+    const poll = status.manager.poll().then(() => { polled = true; });
+    await new Promise(resolve => setImmediate(resolve));
+    await new Promise(resolve => setImmediate(resolve));
+    expect(polled).toBe(false);
+
+    status.timers.find(timer => timer.ms === 30_000 && !timer.cleared)!.callback();
+    await poll;
+    expect(polled).toBe(true);
+    // The attempt was never submitted, and it says so rather than hanging.
+    expect(status.session.prompts).toHaveLength(1);
+    expect(status.manager.status().loops.health.lastOutcome).toBe('unavailable');
+    expect(status.manager.status().loops.health.counts.skippedBusy ?? 0).toBe(0);
   });
 
   it('clears an active scheduled-turn deadline when the manager stops', async () => {
@@ -271,6 +482,158 @@ describe('ScheduledLoopManager strict cadence', () => {
       health: 'degraded', anomaly: 'clock_regression', clock: { lastWallMs: 0 },
     });
     expect(status.logs.join('\n')).toContain('backward clock jump');
+  });
+
+  it('keeps scheduling itself through an ENOSPC burst and resumes when the disk frees', async () => {
+    const disk = faultyDisk();
+    const enospc = setup([definition('health', { initialDelayMs: 0 })], 0, disk.writer);
+    enospc.manager.start();
+    const before = enospc.stored();
+    const landed = disk.writes();
+
+    disk.fill();
+    await enospc.tick();
+
+    // The occurrence could not be checkpointed, so it must not have been claimed.
+    expect(enospc.session.prompts).toHaveLength(0);
+    // I1: a transient write failure must never end the scheduling chain.
+    expect(enospc.live()).toHaveLength(1);
+    // I2: the retry is delayed, never a busy spin.
+    expect(enospc.live()[0].ms).toBeGreaterThanOrEqual(1_000);
+    expect(enospc.live()[0].ms).toBeLessThanOrEqual(60_000);
+    // I4: in-memory health is truthful the moment the first write fails.
+    expect(enospc.manager.status()).toMatchObject({ health: 'failed', anomaly: 'persist_failed' });
+    // I3: nothing landed on the full disk, and the last good file is untouched.
+    expect(disk.writes()).toBe(landed);
+    expect(enospc.stored()).toEqual(before);
+    expect(enospc.logs.join('\n')).toContain('ENOSPC');
+
+    disk.free();
+    enospc.setNow(100_000);
+    await enospc.tick();
+
+    // I6: the loop runs again and both views agree it recovered.
+    expect(enospc.session.prompts).toHaveLength(1);
+    expect(enospc.manager.status()).toMatchObject({ health: 'healthy', anomaly: null });
+    expect(enospc.stored()).toMatchObject({ health: 'healthy', anomaly: null });
+    expect(disk.writes()).toBeGreaterThan(landed);
+    expect(enospc.logs.join('\n')).toContain('scheduled loop persistence recovered');
+  });
+
+  it('backs off within bounds and logs once while the disk stays full', async () => {
+    const disk = faultyDisk();
+    const repeated = setup([definition('health', { initialDelayMs: 0 })], 0, disk.writer);
+    repeated.manager.start();
+    disk.fill();
+
+    const delays: number[] = [];
+    for (let attempt = 0; attempt < 12; attempt++) {
+      await repeated.tick();
+      expect(repeated.live()).toHaveLength(1);
+      delays.push(repeated.live()[0].ms);
+      repeated.setNow(repeated.now() + delays[attempt]);
+    }
+
+    expect(delays[0]).toBeGreaterThanOrEqual(1_000);
+    for (let i = 1; i < delays.length; i++) expect(delays[i]).toBeGreaterThanOrEqual(delays[i - 1]);
+    expect(Math.max(...delays)).toBe(60_000);
+    expect(repeated.session.prompts).toHaveLength(0);
+    // One line per transition, not one per attempt: a full disk must not also flood the log.
+    expect(repeated.logs.filter(line => line.includes('scheduled loop state write failing'))).toHaveLength(1);
+  });
+
+  it('stays armed and recovers when a poll throws for a reason the store cannot absorb', async () => {
+    const flaky = setup([definition('health', { initialDelayMs: 0 })]);
+    flaky.manager.start();
+    flaky.breakNow(new Error('CANARY_UNFORESEEN'));
+    await flaky.tick();
+
+    expect(flaky.logs.join('\n')).toContain('scheduled loop manager failed: Error');
+    expect(flaky.live()).toHaveLength(1);
+    expect(flaky.live()[0].ms).toBe(1_000);
+    expect(flaky.manager.status()).toMatchObject({ health: 'failed', anomaly: 'manager_task_failed' });
+
+    await flaky.tick();
+    expect(flaky.session.prompts).toHaveLength(1);
+    expect(flaky.manager.status()).toMatchObject({ health: 'healthy', anomaly: null });
+    expect(flaky.logs.join('\n')).toContain('scheduled loop manager recovered');
+  });
+
+  it('does not resurrect a cleared anomaly when the blocked write finally lands', async () => {
+    const disk = faultyDisk();
+    const both = setup([definition('health', { initialDelayMs: 0 })], 0, disk.writer);
+    both.manager.start();
+    disk.fill();
+    both.breakNow(new Error('CANARY_UNFORESEEN'));
+    await both.tick();
+    // Both faults at once: the write failure is the reported one, and the poll
+    // failure it displaced is what must not come back.
+    expect(both.logs.join('\n')).toContain('scheduled loop manager failed: Error');
+    expect(both.manager.status()).toMatchObject({ health: 'failed', anomaly: 'persist_failed' });
+
+    both.setNow(30_000);
+    await both.tick();   // polls cleanly again, but the disk is still full
+    expect(both.manager.status()).toMatchObject({ health: 'failed', anomaly: 'persist_failed' });
+
+    disk.free();
+    both.setNow(60_000);
+    await both.tick();
+    expect(both.stored()).toMatchObject({ health: 'healthy', anomaly: null });
+  });
+
+  it('resumes from the stale checkpoint after a restart without replaying missed occurrences', async () => {
+    const disk = faultyDisk();
+    const crashed = setup([definition('health', { initialDelayMs: 0 })], 0, disk.writer);
+    crashed.manager.start();
+    disk.fill();
+    for (let attempt = 0; attempt < 3; attempt++) {
+      crashed.setNow(crashed.now() + 60_000);
+      await crashed.tick();
+    }
+    const stale = crashed.stored();
+    expect(stale.health).toBe('healthy');   // the flip could not be written; only staleness shows it
+
+    // Restart against the same directory, an hour later, with the disk still full.
+    const session = new FakeSession();
+    const logs: string[] = [];
+    const timers: Array<{ callback: () => void; ms: number; cleared: boolean }> = [];
+    const restarted = new ScheduledLoopManager(
+      'Coordinator', [definition('health', { initialDelayMs: 0 })], crashed.dir,
+      new RoleTurnArbiter(session), {
+        now: () => 3_600_000,
+        setTimer: (callback, ms) => { const timer = { callback, ms, cleared: false }; timers.push(timer); return timer; },
+        clearTimer: timer => { (timer as { cleared: boolean }).cleared = true; },
+        log: line => logs.push(line),
+        writeState: disk.writer,
+      });
+    restarted.start();
+
+    // I5: the cursor is preserved and the backlog is skipped, never submitted.
+    expect(session.prompts).toHaveLength(0);
+    const state = restarted.status().loops.health;
+    expect(state.counts.skippedMissed).toBeGreaterThan(0);
+    expect(state.counts.started).toBe(0);
+    expect(Date.parse(state.nextDueAt)).toBeGreaterThan(3_600_000);
+    expect(timers.filter(timer => !timer.cleared)).toHaveLength(1);
+    expect(restarted.status()).toMatchObject({ health: 'failed', anomaly: 'persist_failed' });
+  });
+
+  it('reports a stored file as stale only while a loop still owes a run', () => {
+    const disabled = setup([definition('health')]);
+    disabled.manager.start();
+    disabled.manager.disable('health');
+    const idle = disabled.stored();
+
+    // Nothing is scheduled, so nothing is expected to advance the checkpoint.
+    expect(storedLoopHealth(idle, 6 * 60 * 60_000)).toMatchObject({
+      health: 'healthy', stale: false, scheduled: false,
+    });
+
+    const owing = { ...idle, loops: { health: { ...idle.loops.health, operatorDisabled: false } } };
+    expect(storedLoopHealth(owing, 6 * 60 * 60_000)).toMatchObject({
+      health: 'stale', recorded: 'healthy', stale: true, scheduled: true,
+    });
+    expect(storedLoopHealth(owing, 60_000)).toMatchObject({ health: 'healthy', stale: false });
   });
 
   it('quarantines corrupt state without exposing it and reinitializes delayed cadence', () => {

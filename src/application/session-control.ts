@@ -22,12 +22,23 @@ export interface ConversationFollowHandle {
   close(): void;
 }
 
+/**
+ * An interrupt that reached the session. `state` says whether the turn stopped
+ * cooperatively or through bounded forced recovery — both are accepted, so no
+ * consumer may render `forced` as a failed interrupt.
+ */
+export interface InterruptReceipt {
+  accepted: true;
+  state: 'settled' | 'forced';
+  reasonCode?: string;
+}
+
 export interface RoleSessionControl {
   describe(): Promise<SessionDescriptor>;
   snapshot(): Promise<SessionSnapshot>;
   recentOutput(request?: { since?: number; limit?: number }): Promise<OutputPage>;
   sendText(text: string): Promise<SendReceipt>;
-  interrupt?(): Promise<{ accepted: true }>;
+  interrupt?(): Promise<InterruptReceipt>;
   respondPermission?(request: { permissionId: string; optionId: string }): Promise<{ accepted: true }>;
   // ── conversation v3 (ACP roles that persist a ledger) ──────────────────────
   conversationPage?(request: { after?: string; limit?: number }): Promise<ConversationPageView>;
@@ -35,7 +46,7 @@ export interface RoleSessionControl {
     commandId: string; text: string; actorBrowserSession: string;
     source: 'owner_admin_console';
   }): Promise<PromptReceipt>;
-  interruptV2?(commandId: string): Promise<{ accepted: true; commandId: string }>;
+  interruptV2?(commandId: string): Promise<InterruptReceipt & { commandId: string }>;
   respondPermissionV2?(request: {
     commandId: string; permissionId: string; optionId: string; sessionGeneration: string;
   }): Promise<{ accepted: true; commandId: string }>;
@@ -107,9 +118,14 @@ export class AcpRoleSessionAdapter implements RoleSessionControl {
     };
   }
 
-  async interrupt(): Promise<{ accepted: true }> {
-    await this.call('interrupt');
-    return { accepted: true };
+  async interrupt(): Promise<InterruptReceipt> {
+    const result = await this.call('interrupt') as { state?: unknown; reasonCode?: unknown } | undefined;
+    // A pre-0.17.1 role control server answers `interrupt` with no result body.
+    return {
+      accepted: true,
+      state: result?.state === 'forced' ? 'forced' : 'settled',
+      ...(typeof result?.reasonCode === 'string' ? { reasonCode: result.reasonCode } : {}),
+    };
   }
 
   async conversationPage(request: { after?: string; limit?: number } = {}): Promise<ConversationPageView> {
@@ -139,8 +155,15 @@ export class AcpRoleSessionAdapter implements RoleSessionControl {
     }
   }
 
-  async interruptV2(commandId: string): Promise<{ accepted: true; commandId: string }> {
-    return await this.call('interrupt_v2', { commandId }) as { accepted: true; commandId: string };
+  async interruptV2(commandId: string): Promise<InterruptReceipt & { commandId: string }> {
+    const receipt = await this.call('interrupt_v2', { commandId }) as
+      Record<string, unknown> & { commandId: string };
+    return {
+      ...receipt,
+      accepted: true,
+      state: receipt.state === 'forced' ? 'forced' : 'settled',
+      ...(typeof receipt.reasonCode === 'string' ? { reasonCode: receipt.reasonCode } : {}),
+    };
   }
 
   async respondPermissionV2(request: {

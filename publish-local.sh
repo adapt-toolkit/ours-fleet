@@ -44,6 +44,7 @@ else
   npm ci
   npm run build
   npm test
+  npm run test:pack
   npm publish --access public "$@"
   echo "✓ ${name}@${ver}"
 fi

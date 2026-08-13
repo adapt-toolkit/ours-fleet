@@ -15,9 +15,12 @@ import type {
   ConversationSnapshot, ConversationSource, PromptOrigin, PromptReceipt, SubmitPromptCommand,
 } from './conversation-types.js';
 import { SessionEvents } from './events.js';
-import { SessionControlError, classifyChildExit, turnResult } from './types.js';
+import {
+  ACP_CANCEL_DEADLINE_EXCEEDED, SessionControlError, classifyChildExit, turnResult,
+} from './types.js';
 import type {
-  ConversationHandlePage, ExitRecord, PermissionDecision, QueuedPrompt, SessionEvent,
+  ConversationHandlePage, ExitRecord, InterruptOutcome, PermissionDecision, QueuedPrompt,
+  SessionEvent,
   RuntimeSelectorMetadata, SessionHandle, SessionSnapshot, SubmitPromptOptions,
   TurnCancellationSource, TurnOutcome,
   TurnResult,
@@ -45,6 +48,7 @@ interface SteeringResponse {
 }
 
 const CANCEL_SETTLE_GRACE_MS = 15_000;
+const CANCEL_TERMINATE_GRACE_MS = 5_000;
 /** A permission no human answered is eventually a decision nobody made. */
 const PERMISSION_TIMEOUT_MS = 10 * 60_000;
 /** Spec §4.3: 10-15 s before a vanished controller triggers the unattended policy. */
@@ -223,6 +227,8 @@ export interface AcpSessionOptions {
   log(line: string): void;
   /** Test seam for the cancel-escalation grace period; production uses the default. */
   cancelGraceMs?: number;
+  /** Test seam for SIGTERM -> SIGKILL escalation after an ignored cancellation. */
+  cancelTerminateGraceMs?: number;
   /** How long a pending permission may wait for a human before it expires. */
   permissionTimeoutMs?: number;
   /** Grace after the last controller detaches before the unattended policy applies. */
@@ -277,12 +283,25 @@ export class AcpSession implements SessionHandle {
   /** Armed when the last controller detaches; unattended policy applies on fire. */
   private controllerGrace?: ReturnType<typeof setTimeout>;
   private cancelEscalation?: ReturnType<typeof setTimeout>;
+  private cancelForceKill?: ReturnType<typeof setTimeout>;
+  private cancelRecoveryReason?: string;
+  /**
+   * Rejects the moment the adapter process is gone. Every in-flight ACP request
+   * races it, so a dead adapter can never leave a turn — and therefore a
+   * scheduled run's `activeRunId` or an admission claim — unsettled forever.
+   */
+  private readonly terminated: Promise<never>;
+  private terminate!: (error: Error) => void;
   /** ACP-authenticated in-flight calls, including independently reserved permissions. */
   private readonly activeToolCalls = new Map<string, ActiveToolCall>();
   private readonly toolBoundaryWaiters = new Set<() => void>();
   private activeTurn?: {
     id: string; output: string; origin?: SubmitPromptOptions['origin'];
     cancellationSource?: TurnCancellationSource;
+    cancellationWait?: Promise<void>;
+    cancellationDeadlineExceeded?: boolean;
+    settled: Promise<void>;
+    settle(): void;
   };
 
   private constructor(
@@ -298,16 +317,28 @@ export class AcpSession implements SessionHandle {
       roleId: options.name, log: line => options.log(`[${options.name}] ${line}`),
     });
     this.sessionFile = join(options.stateDir, '.acp-session-id');
+    this.terminated = new Promise<never>((_resolve, reject) => { this.terminate = reject; });
+    // Nothing awaits this promise until a request races it; an unobserved
+    // rejection here must never take the whole runner down.
+    this.terminated.catch(() => undefined);
     child.stderr.on('data', chunk => options.log(`[${options.name}] acp: ${String(chunk).trimEnd()}`));
     child.once('exit', (code, signal) => {
+      if (this.cancelForceKill) clearTimeout(this.cancelForceKill);
+      this.cancelForceKill = undefined;
       // Record the child's real exit code/signal. The tmux path can only see a
       // shell's `$?`; here the truth is available, so keep it.
-      this.exit = classifyChildExit(code, signal);
+      const classified = classifyChildExit(code, signal);
+      this.exit = this.cancelRecoveryReason
+        ? { ...classified, detail: `${this.cancelRecoveryReason}; ${classified.detail}` }
+        : classified;
       options.log(`[${options.name}] acp: agent exited (${code ?? signal ?? 'unknown'})`);
       if (this.readiness !== 'failed') {
         this.readiness = 'failed';
         this.lastError = `ACP agent ${this.exit.detail}`;
       }
+      // A request whose peer no longer exists will never answer. Fail it here
+      // rather than trusting the transport to notice the closed stream.
+      this.terminate(new SessionControlError('offline', `ACP agent ${this.exit.detail}`));
       this.events.emit('state', { status: 'failed', text: this.lastError });
       this.conversation.appendSafe({
         kind: 'session.state', sessionGeneration: this.sessionGeneration,
@@ -392,7 +423,10 @@ export class AcpSession implements SessionHandle {
   }
 
   isAlive(): boolean {
-    return this.child.exitCode === null && !this.child.killed;
+    // child.killed only means kill() successfully SENT a signal. A process may
+    // ignore SIGTERM and remain alive. exitCode or signalCode is the actual
+    // terminal fact (signal exits deliberately leave exitCode null).
+    return this.child.exitCode === null && (this.child.signalCode ?? null) === null;
   }
 
   snapshot(): SessionSnapshot {
@@ -498,8 +532,30 @@ export class AcpSession implements SessionHandle {
   }
 
   /**
-   * Monitor-only safe-boundary delivery. Steering is the interruption: this
-   * path never calls session/cancel and never resolves a pending permission.
+   * Steering is an optional admission fast path, not the only safe way to
+   * deliver a wake. Codex can reject `_session/steering` while a long-running
+   * turn is between tools. Queue one ordinary, non-cancelling prompt in that
+   * case and wait for its terminal result. This keeps the monitor's cursor
+   * uncommitted until the wake really runs and, critically, keeps one rejected
+   * steering response from becoming a tight replay loop.
+   */
+  private async steerOrQueueWake(
+    text: string, options: SubmitPromptOptions,
+  ): Promise<TurnResult> {
+    const steered = await this.steerPrompt(text);
+    if (steered.accepted || steered.detail !== 'ACP steering failed'
+        || this.closing || !this.isAlive()) return steered;
+    const queued = await this.submitPrompt(text, { ...options, interrupt: false, steer: false });
+    return {
+      ...queued,
+      detail: `steering rejected; queued delivery ${queued.detail ?? queued.outcome}`,
+    };
+  }
+
+  /**
+   * Monitor-only safe-boundary delivery. Steering is the preferred live
+   * insertion and rejected steering is queued: this path never calls
+   * session/cancel and never resolves a pending permission.
    */
   async submitPromptAfterTool(
     text: string, options: SubmitPromptOptions = {},
@@ -518,7 +574,7 @@ export class AcpSession implements SessionHandle {
     }
     if (initialToolCount === 0) {
       this.recordAfterToolDelivery('direct', 0, 0);
-      const result = await this.steerPrompt(text);
+      const result = await this.steerOrQueueWake(text, options);
       return { ...result, safeBoundary: { state: 'direct', waitedMs: 0, activeToolCount: 0 } };
     }
 
@@ -539,7 +595,7 @@ export class AcpSession implements SessionHandle {
     const state = atBoundary ? 'after_tool' : 'timeout';
     const remainingToolCount = this.activeToolCalls.size;
     this.recordAfterToolDelivery(state, remainingToolCount, waitedMs);
-    const result = await this.steerPrompt(text);
+    const result = await this.steerOrQueueWake(text, options);
     return {
       ...result,
       safeBoundary: { state, waitedMs, activeToolCount: remainingToolCount },
@@ -552,7 +608,13 @@ export class AcpSession implements SessionHandle {
    * for it is what turned a busy agent into a timeout and then into "dead".
    */
   async queuePrompt(text: string, options: SubmitPromptOptions = {}): Promise<QueuedPrompt> {
-    if (!this.sessionId || !this.isAlive())
+    if (this.cancelRecoveryReason)
+      throw new SessionControlError(
+        'control-unavailable',
+        'ACP adapter restart is in progress after the cancellation deadline',
+        ACP_CANCEL_DEADLINE_EXCEEDED,
+      );
+    if (this.closing || !this.sessionId || !this.isAlive())
       throw new SessionControlError('offline', this.lastError ?? 'ACP session is offline');
     if (options.interrupt) await this.cancelActive(options.interruptSource ?? 'local-console');
     // Interrupting delivery must still use steering when supported. With no
@@ -649,8 +711,23 @@ export class AcpSession implements SessionHandle {
     }
   }
 
-  async interrupt(source: TurnCancellationSource = 'local-console'): Promise<void> {
-    await this.cancelActive(source);
+  /**
+   * Explicit cancellation on behalf of a human or an operator. Forced recovery
+   * is reported as an outcome, never as a thrown failure: by the time this
+   * resolves the turn is over either way, and only the durable-ingress path
+   * (`queuePrompt({ interrupt: true })`) needs the typed error, because only it
+   * still owes an undelivered message a replay.
+   */
+  async interrupt(source: TurnCancellationSource = 'local-console'): Promise<InterruptOutcome> {
+    try {
+      await this.cancelActive(source);
+      return { state: 'settled' };
+    } catch (error) {
+      if (error instanceof SessionControlError
+          && error.reasonCode === ACP_CANCEL_DEADLINE_EXCEEDED)
+        return { state: 'forced', reasonCode: ACP_CANCEL_DEADLINE_EXCEEDED };
+      throw error;
+    }
   }
 
   private async cancelActive(source: TurnCancellationSource): Promise<void> {
@@ -673,20 +750,66 @@ export class AcpSession implements SessionHandle {
         acpSessionId: this.sessionId, promptId: active.id, turnId: active.id,
         payload: { cancellationSource: source },
       });
-      if (this.cancelEscalation) clearTimeout(this.cancelEscalation);
-      const turnId = active.id;
-      this.cancelEscalation = setTimeout(() => {
-        if (this.activeTurn?.id !== turnId || !this.isAlive()) return;
-        this.lastError = 'ACP turn ignored cancellation; restarting adapter';
-        this.options.log(`[${this.options.name}] ${this.lastError}`);
-        this.events.emit('error', { turnId, origin: active.origin, text: this.lastError });
-        this.child.kill('SIGTERM');
-      }, this.options.cancelGraceMs ?? CANCEL_SETTLE_GRACE_MS);
-      this.cancelEscalation.unref?.();
     }
     for (const [permissionId, pending] of [...this.pendingPermissions])
       this.settlePendingAutomatically(permissionId, pending, 'cancelled', undefined,
         'the turn was cancelled while this request was pending');
+    if (active && this.activeTurn === active) {
+      active.cancellationWait ??= this.awaitCancellationSettlement(active);
+      await active.cancellationWait;
+    }
+  }
+
+  /**
+   * Do not admit work behind a turn whose adapter may already require restart.
+   * A cooperative adapter settles this promise immediately through runPrompt's
+   * finally block. A stubborn adapter receives SIGTERM at the deadline and
+   * SIGKILL after one more bounded grace; callers get a typed recovery error so
+   * durable ingress can leave the next request replayable for the resumed run.
+   */
+  private awaitCancellationSettlement(active: NonNullable<AcpSession['activeTurn']>): Promise<void> {
+    const settleMs = this.options.cancelGraceMs ?? CANCEL_SETTLE_GRACE_MS;
+    const deadline = new Promise<void>((resolve, reject) => {
+      this.cancelEscalation = setTimeout(() => {
+        // Both bail-outs must SETTLE the race. Returning silently once left the
+        // caller — and the arbiter's exclusive tail behind it — awaiting a
+        // promise nothing would ever resolve.
+        if (this.activeTurn !== active) { resolve(); return; }
+        if (!this.isAlive()) { resolve(); return; }
+        active.cancellationDeadlineExceeded = true;
+        this.cancelRecoveryReason = ACP_CANCEL_DEADLINE_EXCEEDED;
+        this.readiness = 'failed';
+        this.lastError = `${ACP_CANCEL_DEADLINE_EXCEEDED}: ACP turn did not settle within ${settleMs}ms`;
+        this.options.log(`[${this.options.name}] ${this.lastError}; restarting adapter with resume`);
+        this.events.emit('error', {
+          turnId: active.id, origin: active.origin, status: ACP_CANCEL_DEADLINE_EXCEEDED,
+          text: this.lastError,
+        });
+        this.conversation.appendSafe({
+          kind: 'session.state', sessionGeneration: this.sessionGeneration,
+          acpSessionId: this.sessionId,
+          promptId: active.id, turnId: active.id,
+          payload: { status: 'failed', detail: this.lastError },
+        });
+        this.child.kill('SIGTERM');
+        const terminateMs = this.options.cancelTerminateGraceMs ?? CANCEL_TERMINATE_GRACE_MS;
+        this.cancelForceKill = setTimeout(() => {
+          if (this.child.exitCode === null) {
+            this.options.log(`[${this.options.name}] ${ACP_CANCEL_DEADLINE_EXCEEDED}: `
+              + `adapter ignored SIGTERM for ${terminateMs}ms; sending SIGKILL`);
+            this.child.kill('SIGKILL');
+          }
+        }, terminateMs);
+        this.cancelForceKill.unref?.();
+        reject(new SessionControlError(
+          'control-unavailable',
+          'ACP adapter restart is in progress after the cancellation deadline',
+          ACP_CANCEL_DEADLINE_EXCEEDED,
+        ));
+      }, settleMs);
+      this.cancelEscalation.unref?.();
+    });
+    return Promise.race([active.settled, deadline]);
   }
 
   respondPermission(permissionId: string, optionId: string): boolean {
@@ -823,6 +946,8 @@ export class AcpSession implements SessionHandle {
     this.closing = true;
     if (this.cancelEscalation) clearTimeout(this.cancelEscalation);
     this.cancelEscalation = undefined;
+    if (this.cancelForceKill) clearTimeout(this.cancelForceKill);
+    this.cancelForceKill = undefined;
     if (this.controllerGrace) clearTimeout(this.controllerGrace);
     this.controllerGrace = undefined;
     for (const [permissionId, pending] of [...this.pendingPermissions])
@@ -835,6 +960,8 @@ export class AcpSession implements SessionHandle {
     }
     this.connection.close();
     if (this.isAlive()) this.child.kill('SIGTERM');
+    // The transport is gone: nothing still awaiting an ACP answer can get one.
+    this.terminate(new SessionControlError('offline', 'the ACP session was closed'));
     this.conversation.appendSafe({
       kind: 'session.state', sessionGeneration: this.sessionGeneration,
       acpSessionId: this.sessionId, payload: { status: 'offline' },
@@ -924,7 +1051,9 @@ export class AcpSession implements SessionHandle {
     if (!this.sessionId || !this.isAlive())
       return turnResult(false, 'failed', this.lastError ?? 'ACP session is offline');
     this.readiness = 'running';
-    this.activeTurn = { id: turnId, output: '', origin };
+    let settle!: () => void;
+    const settled = new Promise<void>(resolve => { settle = resolve; });
+    this.activeTurn = { id: turnId, output: '', origin, settled, settle };
     this.events.emit('state', { turnId, status: 'running', origin });
     this.conversation.appendSafe({
       kind: 'prompt.started', sessionGeneration: this.sessionGeneration,
@@ -932,10 +1061,13 @@ export class AcpSession implements SessionHandle {
       source: conversationSource(origin).source, payload: {},
     });
     try {
-      const response = await this.connection.agent.request(acp.methods.agent.session.prompt, {
-        sessionId: this.sessionId,
-        prompt: promptContentBlocks(text, origin),
-      });
+      const response = await Promise.race([
+        this.connection.agent.request(acp.methods.agent.session.prompt, {
+          sessionId: this.sessionId,
+          prompt: promptContentBlocks(text, origin),
+        }),
+        this.terminated,
+      ]);
       this.readiness = 'idle';
       const cancellationSource = this.activeTurn?.id === turnId
         ? this.activeTurn.cancellationSource : undefined;
@@ -959,7 +1091,11 @@ export class AcpSession implements SessionHandle {
         this.activeTurn?.id === turnId ? this.activeTurn.output : undefined,
         this.activeTurn?.id === turnId ? this.activeTurn.cancellationSource : undefined);
     } catch (error) {
-      const detail = (error as Error)?.message ?? String(error);
+      const escalated = this.activeTurn?.id === turnId
+        && this.activeTurn.cancellationDeadlineExceeded;
+      const detail = escalated
+        ? this.lastError ?? ACP_CANCEL_DEADLINE_EXCEEDED
+        : (error as Error)?.message ?? String(error);
       this.lastError = origin?.kind === 'scheduled-loop' ? 'scheduled-loop turn failed' : detail;
       this.readiness = this.isAlive() ? 'idle' : 'failed';
       this.events.emit('error', {
@@ -978,6 +1114,7 @@ export class AcpSession implements SessionHandle {
     } finally {
       this.releaseAllTools();
       if (this.activeTurn?.id === turnId) {
+        this.activeTurn.settle();
         if (this.cancelEscalation) clearTimeout(this.cancelEscalation);
         this.cancelEscalation = undefined;
         this.activeTurn = undefined;
@@ -989,13 +1126,16 @@ export class AcpSession implements SessionHandle {
     if (!this.sessionId || !this.isAlive())
       return turnResult(false, 'failed', this.lastError ?? 'ACP session is offline');
     try {
-      const response = await this.connection.agent.request<SteeringResponse, {
-        sessionId: string;
-        prompt: Array<{ type: 'text'; text: string }>;
-      }>('_session/steering', {
-        sessionId: this.sessionId,
-        prompt: [{ type: 'text', text }],
-      });
+      const response = await Promise.race([
+        this.connection.agent.request<SteeringResponse, {
+          sessionId: string;
+          prompt: Array<{ type: 'text'; text: string }>;
+        }>('_session/steering', {
+          sessionId: this.sessionId,
+          prompt: [{ type: 'text', text }],
+        }),
+        this.terminated,
+      ]);
       if (response.outcome === 'failed')
         return turnResult(false, 'failed', 'ACP steering failed');
       return turnResult(true, 'inconclusive', response.outcome);

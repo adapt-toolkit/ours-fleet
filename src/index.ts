@@ -10,7 +10,9 @@ export type {
 } from './harness/types.js';
 export type {
   SessionHandle, SessionSnapshot, SessionEvent, TurnResult,
+  InterruptOutcome, InterruptResult, TurnCancellationSource, QueuedPrompt, ExitRecord,
 } from './session/types.js';
+export { interruptOutcome } from './session/types.js';
 export { AcpSession } from './session/acp.js';
 export { OwnerChannel } from './owner-channel/channel.js';
 export { TmuxSession } from './session/tmux.js';

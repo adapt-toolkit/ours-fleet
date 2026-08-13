@@ -17,10 +17,11 @@ function fakeSession(agent: FakeAgent, overrides: Record<string, unknown> = {}):
     readiness: 'running',
     lastError: undefined,
     promptTail: Promise.resolve(),
+    queueDepth: 0,
     steeringSupported: true,
     closing: false,
     pendingPermissions: new Map(),
-    activeToolCalls: new Set(),
+    activeToolCalls: new Map(),
     toolBoundaryWaiters: new Set(),
     events: { emit: () => {} },
     sessionGeneration: 'gen-test',
@@ -92,6 +93,105 @@ describe('AcpSession live delivery', () => {
       safeBoundary: { state: 'unsupported', activeToolCount: 0 },
     });
     expect(calls).toEqual(['session/prompt']);
+  });
+
+  it('queues one direct after_tool wake when the advertised steering path rejects it', async () => {
+    const calls: string[] = [];
+    let finishActive!: () => void;
+    const active = new Promise<void>(resolve => { finishActive = resolve; });
+    const session = fakeSession({
+      request: async method => {
+        calls.push(method);
+        return method === '_session/steering'
+          ? { outcome: 'failed' }
+          : { stopReason: 'end_turn' };
+      },
+      notify: async () => {},
+    }, { promptTail: active, queueDepth: 1 });
+
+    const wake = session.submitPromptAfterTool('direct fallback', {
+      origin: { kind: 'fleet-monitor' }, steer: true,
+    });
+    await new Promise(resolve => setTimeout(resolve, 0));
+
+    // One failed steering request waits behind the active turn; it does not
+    // spin and resubmit the same monitor cursor.
+    expect(calls).toEqual(['_session/steering']);
+    finishActive();
+    const result = await wake;
+
+    expect(result).toMatchObject({
+      accepted: true, outcome: 'completed',
+      detail: 'steering rejected; queued delivery end_turn',
+      safeBoundary: { state: 'direct', activeToolCount: 0 },
+    });
+    expect(calls).toEqual(['_session/steering', 'session/prompt']);
+  });
+
+  it('queues one wake after a real tool boundary when steering then rejects it', async () => {
+    const calls: string[] = [];
+    const statuses: string[] = [];
+    let finishActive!: () => void;
+    const active = new Promise<void>(resolve => { finishActive = resolve; });
+    const session = fakeSession({
+      request: async method => {
+        calls.push(method);
+        return method === '_session/steering'
+          ? { outcome: 'failed' }
+          : { stopReason: 'end_turn' };
+      },
+      notify: async () => {},
+    }, {
+      activeToolCalls: new Map([['tool-1', { lifecycle: true, permissions: new Map() }]]),
+      promptTail: active,
+      queueDepth: 1,
+      events: { emit: (kind: string, event: { status?: string }) => {
+        if (kind === 'monitor_delivery' && event.status) statuses.push(event.status);
+      } },
+    });
+    const wake = session.submitPromptAfterTool('boundary fallback', {
+      origin: { kind: 'fleet-monitor' }, steer: true,
+    });
+    setTimeout(() => {
+      (session as unknown as { releaseTool(id: string): void }).releaseTool('tool-1');
+    }, 0);
+    await new Promise(resolve => setTimeout(resolve, 5));
+
+    expect(statuses).toEqual(['deferred', 'after_tool']);
+    expect(calls).toEqual(['_session/steering']);
+    finishActive();
+
+    const result = await wake;
+
+    expect(result).toMatchObject({
+      accepted: true, outcome: 'completed',
+      detail: 'steering rejected; queued delivery end_turn',
+      safeBoundary: { state: 'after_tool', activeToolCount: 0 },
+    });
+    expect(calls).toEqual(['_session/steering', 'session/prompt']);
+  });
+
+  it('keeps a rejected queued wake unsuccessful so its monitor cursor can retry', async () => {
+    const calls: string[] = [];
+    const session = fakeSession({
+      request: async method => {
+        calls.push(method);
+        return method === '_session/steering'
+          ? { outcome: 'failed' }
+          : { stopReason: 'refusal' };
+      },
+      notify: async () => {},
+    });
+
+    const result = await session.submitPromptAfterTool('refused fallback', {
+      origin: { kind: 'fleet-monitor' }, steer: true,
+    });
+
+    expect(result).toMatchObject({
+      accepted: true, succeeded: false, outcome: 'refused',
+      detail: 'steering rejected; queued delivery refusal',
+    });
+    expect(calls).toEqual(['_session/steering', 'session/prompt']);
   });
 
   it('cancels first, then acknowledges interrupting delivery when its turn starts', async () => {

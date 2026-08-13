@@ -13,6 +13,8 @@ import { resolveWatchdogs } from './watchdog/config.js';
 import type { ResolvedWatchdog } from './watchdog/config.js';
 import { resolveLoops } from './loops/config.js';
 import type { ResolvedLoop, ResolvedRoleLoop } from './loops/config.js';
+import { CAPABILITIES, CAP_MONITOR_INTERRUPT_AFTER_TOOL } from './capabilities.js';
+import { runningLabel } from './provenance.js';
 
 export interface OverseeEntry { role: string; interval: string }
 export interface WorklogPolicy {
@@ -139,8 +141,18 @@ const MONITOR_DEFAULT_TURN_FAIL_THRESHOLD = 3;
 const isPlainObject = (v: unknown): v is Record<string, unknown> =>
   v !== null && typeof v === 'object' && !Array.isArray(v);
 
-/** Validate a raw (role-level or merged) `monitor:` block; returns human-readable problems. */
-export function validateMonitorConfig(raw: unknown): string[] {
+/**
+ * Validate a raw (role-level or merged) `monitor:` block; returns human-readable problems.
+ *
+ * `capabilities` defaults to what this build declares. A value is rejected in two
+ * distinct ways: unknown to every build (a typo), or known but absent from the
+ * artifact doing the validating — the second names the capability and the build,
+ * because the same fleet.yaml may well be accepted by another install on the host.
+ */
+export function validateMonitorConfig(
+  raw: unknown,
+  capabilities: readonly string[] = CAPABILITIES,
+): string[] {
   const problems: string[] = [];
   if (!isPlainObject(raw)) return ['monitor: must be a mapping'];
   const m = raw;
@@ -162,6 +174,12 @@ export function validateMonitorConfig(raw: unknown): string[] {
   if (m.interrupt !== undefined
       && typeof m.interrupt !== 'boolean' && m.interrupt !== 'after_tool')
     problems.push("monitor.interrupt: must be true, false, or 'after_tool'");
+  else if (m.interrupt === 'after_tool' && !capabilities.includes(CAP_MONITOR_INTERRUPT_AFTER_TOOL))
+    problems.push(
+      `monitor.interrupt: 'after_tool' needs capability ${CAP_MONITOR_INTERRUPT_AFTER_TOOL}, `
+      + `which the build validating this config (${runningLabel()}) does not declare. `
+      + 'Another install on this host may accept the same file — run `ours-fleet doctor` '
+      + 'to see which artifact serves which path.');
   if (m.turn_fail_threshold !== undefined
       && (typeof m.turn_fail_threshold !== 'number' || !Number.isInteger(m.turn_fail_threshold)
           || m.turn_fail_threshold < 1))

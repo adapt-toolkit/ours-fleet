@@ -10,7 +10,10 @@ import { OwnerChannel } from '../src/owner-channel/channel.js';
 import { ownerCommandHelp, type OwnerFleetOps } from '../src/owner-channel/commands.js';
 import type { OursToolClient } from '../src/owner-channel/mcp.js';
 import { OWNER_COMMENT_LABEL, ownerNotices } from '../src/owner-channel/notices.js';
-import type { SessionEvent, SessionHandle, TurnResult } from '../src/session/types.js';
+import {
+  ACP_CANCEL_DEADLINE_EXCEEDED, SessionControlError,
+  type SessionEvent, type SessionHandle, type TurnResult,
+} from '../src/session/types.js';
 import { VERSION } from '../src/version.js';
 
 const OWNER_CID = 'A'.repeat(64);
@@ -56,7 +59,7 @@ function setup(messages: unknown[], result = {
     promptId: 'prompt-1', queuedBehind: options.queuedBehind ?? 0,
     completion: Promise.resolve(result),
   }));
-  const interrupt = vi.fn(async () => undefined);
+  const interrupt = vi.fn(async () => ({ state: 'settled' as const }));
   const session = {
     backend: 'acp', pid: 1, isAlive: () => true,
     snapshot: () => ({ backend: 'acp', alive: true, readiness: 'running' }),
@@ -86,7 +89,7 @@ function liveSetup(options: {
   const events: SessionEvent[] = [];
   const listeners = new Set<(event: SessionEvent) => void>();
   let running = 0;
-  const interrupt = vi.fn(async () => undefined);
+  const interrupt = vi.fn(async () => ({ state: 'settled' as const }));
   const queuePrompt = vi.fn(async (_text: string, opts?: { interrupt?: boolean }) => {
     if (opts?.interrupt) await interrupt();
     const queuedBehind = running++;
@@ -223,6 +226,22 @@ describe('OwnerChannel', () => {
     });
   });
 
+  it('tells the owner a forced cancellation succeeded rather than failed', async () => {
+    const forced = setup([ownerMessage(28, 'wire-forced-stop', '/interrupt')]);
+    forced.interrupt.mockResolvedValueOnce({
+      state: 'forced', reasonCode: 'ACP_CANCEL_DEADLINE_EXCEEDED',
+    } as never);
+
+    await forced.channel.drain();
+
+    const reply = String(forced.client.calls.find(call => call.name === 'send_message')?.args?.text);
+    // The turn IS cancelled. An owner told "could not interrupt" retries an
+    // operation that already worked — and the reason code never leaves the host.
+    expect(reply).toContain('Interrupt enforced');
+    expect(reply).not.toContain('Could not interrupt');
+    expect(reply).not.toContain('ACP_CANCEL_DEADLINE_EXCEEDED');
+  });
+
   it('reports status and command failures without exposing internal error details', async () => {
     const status = setup([ownerMessage(24, 'wire-status', '/status')]);
     await status.channel.drain();
@@ -242,6 +261,20 @@ describe('OwnerChannel', () => {
       '⚠️ Could not deliver this request to Coordinator.');
     expect(delivery.client.calls.filter(call => call.name === 'send_message')
       .every(call => !String(call.args?.text).includes('secret'))).toBe(true);
+  });
+
+  it('leaves the next owner wire replayable while an ignored-cancel adapter restarts', async () => {
+    const recovery = setup([ownerMessage(27, 'wire-after-stubborn-turn', 'next owner turn')]);
+    recovery.queuePrompt.mockRejectedValueOnce(new SessionControlError(
+      'control-unavailable', 'adapter restart detail', ACP_CANCEL_DEADLINE_EXCEEDED));
+
+    await recovery.channel.drain();
+
+    expect(recovery.client.calls).toContainEqual({
+      name: 'defer_messages', args: { msg_ids: [27] },
+    });
+    expect(recovery.client.calls.some(call => call.name === 'send_message')).toBe(false);
+    expect(existsSync(join(recovery.dir, '.owner-channel-state.json'))).toBe(false);
   });
 
   it('uses precise, redacted terminal notices for every non-text outcome', async () => {

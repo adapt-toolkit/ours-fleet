@@ -9,7 +9,7 @@ import { AcpSession } from '../src/session/acp.js';
 import {
   RoleControlServer, controlRequest, controlSocketPath, controlTokenPath, livenessNote,
 } from '../src/session/control.js';
-import { SessionControlError } from '../src/session/types.js';
+import { ACP_CANCEL_DEADLINE_EXCEEDED, SessionControlError } from '../src/session/types.js';
 import type { SessionEvent } from '../src/session/types.js';
 
 const fixture = join(dirname(fileURLToPath(import.meta.url)), 'fixtures', 'acp-agent.mjs');
@@ -24,6 +24,7 @@ async function start(
   extra: {
     modeId?: string; env?: Record<string, string>; log?(line: string): void;
     cancelGraceMs?: number;
+    cancelTerminateGraceMs?: number;
     afterToolBoundaryTimeoutMs?: number;
     unattended?: 'deny' | 'wait';
     permissionMode?: { fleetMode: 'ask' | 'auto' | 'allow'; nativeMode: string };
@@ -45,6 +46,8 @@ async function start(
     permissionMode: extra.permissionMode,
     log: extra.log ?? (() => {}),
     ...(extra.cancelGraceMs !== undefined ? { cancelGraceMs: extra.cancelGraceMs } : {}),
+    ...(extra.cancelTerminateGraceMs !== undefined
+      ? { cancelTerminateGraceMs: extra.cancelTerminateGraceMs } : {}),
     ...(extra.afterToolBoundaryTimeoutMs !== undefined
       ? { afterToolBoundaryTimeoutMs: extra.afterToolBoundaryTimeoutMs } : {}),
   });
@@ -821,25 +824,92 @@ describe('AcpSession', () => {
     const session = await start('allow', { cancelGraceMs: 200 });
     const queued = await session.queuePrompt('stubborn block 60000');
     await waitForRunning(session);
-    await session.interrupt('owner');
+    // An explicit interrupt that had to force recovery still SUCCEEDED: the
+    // turn is over. Only the outcome says how, so no consumer reports a failure.
+    await expect(session.interrupt('owner')).resolves.toEqual({
+      state: 'forced', reasonCode: ACP_CANCEL_DEADLINE_EXCEEDED,
+    });
 
     // The adapter never honors the cancel; after the grace period the session
     // must recover by force instead of leaving the turn (and its owner) hung.
     const result = await queued.completion;
     expect(result).toMatchObject({ succeeded: false, outcome: 'failed' });
-    expect(session.isAlive()).toBe(false);
     // SIGTERM delivery is asynchronous; wait for the adapter's exit record.
     for (let i = 0; i < 100 && session.exitResult() === null; i++)
       await new Promise(resolve => setTimeout(resolve, 10));
+    expect(session.isAlive()).toBe(false);
     expect(session.exitResult()).not.toBeNull();
+    expect(session.exitResult()?.detail).toContain(ACP_CANCEL_DEADLINE_EXCEEDED);
+    await expect(session.queuePrompt('owner turn arriving during restart')).rejects.toMatchObject({
+      kind: 'control-unavailable', reasonCode: ACP_CANCEL_DEADLINE_EXCEEDED,
+    });
 
     const events = session.eventsSince(0);
     const escalations = events.filter(event =>
-      event.kind === 'error' && event.text?.includes('ignored cancellation'));
+      event.kind === 'error' && event.status === ACP_CANCEL_DEADLINE_EXCEEDED);
     expect(escalations).toHaveLength(1);
     // The escalated turn terminates through the failure path only: no
     // turn_stop means no second, contradictory completion was produced.
     expect(events.filter(event => event.kind === 'turn_stop')).toHaveLength(0);
+    await session.close();
+  });
+
+  it('hard-kills an adapter that ignores both cancellation and SIGTERM within a second bound', async () => {
+    const startedAt = Date.now();
+    const session = await start('allow', {
+      cancelGraceMs: 50, cancelTerminateGraceMs: 75,
+      env: { ACP_FIXTURE_IGNORE_SIGTERM: '1' },
+    });
+    const queued = await session.queuePrompt('stubborn block 60000');
+    await waitForRunning(session);
+    await expect(session.interrupt('owner')).resolves.toMatchObject({
+      state: 'forced', reasonCode: ACP_CANCEL_DEADLINE_EXCEEDED,
+    });
+    expect(session.isAlive()).toBe(true);
+    for (let i = 0; i < 100 && session.isAlive(); i++)
+      await new Promise(resolve => setTimeout(resolve, 5));
+    expect(session.isAlive()).toBe(false);
+    expect(Date.now() - startedAt).toBeLessThan(1_000);
+    expect((await queued.completion).detail).toContain(ACP_CANCEL_DEADLINE_EXCEEDED);
+    expect(session.exitResult()).toMatchObject({ signal: 'SIGKILL' });
+    await session.close();
+  });
+
+  it('settles an in-flight turn when the adapter dies without ever answering', async () => {
+    const session = await start('allow');
+    const queued = await session.queuePrompt('block 60000');
+    await waitForRunning(session);
+
+    // The adapter is gone mid-turn. Nothing will ever answer that request, so
+    // the turn must terminate here: a completion that never settles is what
+    // held a scheduled run `active` — and every later tick skipped_busy —
+    // for the rest of the process's life.
+    process.kill(session.pid, 'SIGKILL');
+    const result = await Promise.race([
+      queued.completion,
+      new Promise(resolve => setTimeout(() => resolve('NEVER_SETTLED'), 3_000)),
+    ]);
+    expect(result).toMatchObject({ succeeded: false, outcome: 'failed' });
+    for (let i = 0; i < 100 && session.exitResult() === null; i++)
+      await new Promise(resolve => setTimeout(resolve, 10));
+    expect(session.isAlive()).toBe(false);
+    await session.close();
+  });
+
+  it('does not leave a cancellation waiting when the adapter dies inside the grace', async () => {
+    const session = await start('allow', { cancelGraceMs: 2_000 });
+    const queued = await session.queuePrompt('stubborn block 60000');
+    await waitForRunning(session);
+
+    const interrupted = session.interrupt('owner');
+    // Killed by something else entirely while the cancel was still in grace.
+    setTimeout(() => process.kill(session.pid, 'SIGKILL'), 50);
+    const outcome = await Promise.race([
+      interrupted,
+      new Promise(resolve => setTimeout(() => resolve('NEVER_SETTLED'), 3_000)),
+    ]);
+    expect(outcome).toEqual({ state: 'settled' });
+    expect((await queued.completion).succeeded).toBe(false);
     await session.close();
   });
 
@@ -903,6 +973,77 @@ describe('AcpSession', () => {
 });
 
 describe('role control failures are typed (1.5)', () => {
+  it('reports a forced cancellation to the control plane as accepted, not failed', async () => {
+    const session = await start('allow', { cancelGraceMs: 120 });
+    const stateDir = dirs.at(-1)!;
+    const control = new RoleControlServer(stateDir, session, () => {});
+    await control.start();
+    try {
+      const queued = await session.queuePrompt('stubborn block 60000');
+      await waitForRunning(session);
+
+      // The adapter ignores the cancel, so recovery is forced. The turn IS
+      // cancelled, so `interrupt` must not reach the operator as an error —
+      // that is what made commands, control and web report a failed stop.
+      const response = await controlRequest(stateDir, { command: 'interrupt' }, 5_000);
+      expect(response.ok).toBe(true);
+      expect(response.error).toBeUndefined();
+      expect(response.result).toEqual({
+        state: 'forced', reasonCode: ACP_CANCEL_DEADLINE_EXCEEDED,
+      });
+
+      expect((await queued.completion).succeeded).toBe(false);
+    } finally {
+      await control.close();
+      await session.close();
+    }
+  });
+
+  it('carries the forced outcome into an idempotent interrupt_v2 receipt', async () => {
+    const session = await start('allow', { cancelGraceMs: 120 });
+    const stateDir = dirs.at(-1)!;
+    const control = new RoleControlServer(stateDir, session, () => {});
+    await control.start();
+    try {
+      const queued = await session.queuePrompt('stubborn block 60000');
+      await waitForRunning(session);
+      const receipt = await controlRequest(
+        stateDir, { command: 'interrupt_v2', version: 3, commandId: 'cmd-forced' }, 5_000);
+      expect(receipt.ok).toBe(true);
+      expect(receipt.result).toMatchObject({
+        accepted: true, commandId: 'cmd-forced',
+        state: 'forced', reasonCode: ACP_CANCEL_DEADLINE_EXCEEDED,
+      });
+      // A replay of the same command id returns the recorded receipt verbatim
+      // rather than re-cancelling a session that is already being reclaimed.
+      const replay = await controlRequest(
+        stateDir, { command: 'interrupt_v2', version: 3, commandId: 'cmd-forced' }, 5_000);
+      expect(replay.result).toEqual(receipt.result);
+      expect((await queued.completion).succeeded).toBe(false);
+    } finally {
+      await control.close();
+      await session.close();
+    }
+  });
+
+  it('reports a cooperative cancellation as settled', async () => {
+    const session = await start('allow', { cancelGraceMs: 2_000 });
+    const stateDir = dirs.at(-1)!;
+    const control = new RoleControlServer(stateDir, session, () => {});
+    await control.start();
+    try {
+      const queued = await session.queuePrompt('block 60000');
+      await waitForRunning(session);
+      const response = await controlRequest(stateDir, { command: 'interrupt' }, 5_000);
+      expect(response.ok).toBe(true);
+      expect(response.result).toEqual({ state: 'settled' });
+      expect((await queued.completion).outcome).toBe('cancelled');
+    } finally {
+      await control.close();
+      await session.close();
+    }
+  });
+
   it('accepts a prompt into a busy session promptly, and says how deep the queue is', async () => {
     const session = await start();
     const stateDir = dirs.at(-1)!;

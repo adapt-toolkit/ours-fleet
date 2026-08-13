@@ -70,11 +70,46 @@ export type ControlFailureKind =
   | 'rejected'             // the session understood the request and refused it
   | 'backend';             // the transport itself failed
 
+/** Stable body-free reason shared by ACP recovery and durable ingress. */
+export const ACP_CANCEL_DEADLINE_EXCEEDED = 'ACP_CANCEL_DEADLINE_EXCEEDED';
+
 export class SessionControlError extends Error {
-  constructor(readonly kind: ControlFailureKind, message: string) {
+  constructor(
+    readonly kind: ControlFailureKind,
+    message: string,
+    /** Stable body-free machine reason for recovery/audit decisions. */
+    readonly reasonCode?: string,
+  ) {
     super(message);
     this.name = 'SessionControlError';
   }
+}
+
+/**
+ * How an explicit cancellation ended. Forced recovery is a SUCCESS: the turn is
+ * over and the session is being reclaimed. Reporting it as a failed interrupt is
+ * what made owners, the control plane and the web console retry an operation
+ * that had already done exactly what was asked.
+ */
+export interface InterruptOutcome {
+  /** `settled` — the turn (or nothing) ended cooperatively. `forced` — the adapter ignored the cancel and was restarted. */
+  state: 'settled' | 'forced';
+  /** Stable body-free reason present only for a forced recovery. */
+  reasonCode?: string;
+}
+
+/**
+ * What a `SessionHandle.interrupt` implementation may resolve. Before 0.17.1 the
+ * contract was `Promise<void>`, and resolving at all meant the cancellation had
+ * taken effect cooperatively — so an implementation written against that
+ * contract stays valid and keeps its exact meaning. Only in-tree consumers read
+ * the richer outcome, and they normalize through `interruptOutcome` first.
+ */
+export type InterruptResult = InterruptOutcome | void;
+
+/** The one place the legacy `void` reply is given its meaning: `settled`. */
+export function interruptOutcome(result: InterruptResult): InterruptOutcome {
+  return result ?? { state: 'settled' };
 }
 
 /**
@@ -273,7 +308,16 @@ export interface SessionHandle {
   submitPrompt(text: string, options?: SubmitPromptOptions): Promise<TurnResult>;
   /** Monitor-only ACP safe-boundary delivery. Never implies human/control cancellation. */
   submitPromptAfterTool?(text: string, options?: SubmitPromptOptions): Promise<TurnResult>;
-  interrupt(source?: TurnCancellationSource): Promise<void>;
+  /**
+   * Cancel the active turn. Resolves when the cancellation has taken effect —
+   * cooperatively (`settled`) or through bounded forced recovery (`forced`).
+   * It rejects only when the cancellation itself could not be delivered.
+   *
+   * The return type is widened to `InterruptResult` for one reason: an
+   * implementation written against the pre-0.17.1 `Promise<void>` contract must
+   * keep compiling. Read it through `interruptOutcome`, never directly.
+   */
+  interrupt(source?: TurnCancellationSource): Promise<InterruptResult>;
   respondPermission(permissionId: string, optionId: string): boolean;
   /** Generation-bound browser decision; stale/settled/invalid all fail closed. */
   respondPermissionV2?(

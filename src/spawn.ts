@@ -1,5 +1,5 @@
 import { spawn as spawnChild } from 'node:child_process';
-import { existsSync, mkdirSync, openSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { closeSync, existsSync, mkdirSync, openSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { parse, stringify } from 'yaml';
 import { agentDir, fleetDDir } from './paths.js';
@@ -24,6 +24,10 @@ import { VERSION } from './version.js';
 import './harness/claude-code.js';
 import './harness/codex.js';
 import { getAdapter } from './harness/registry.js';
+import {
+  archiveTempState, makeTempSupervisorLauncher, prepareTempSupervisor, reclaimStaleTempState,
+  type SupervisorLauncher,
+} from './temp-lifecycle.js';
 
 /**
  * The provenance record written by the most recent spawn in this process, so
@@ -407,29 +411,39 @@ export async function spawnPermanent(
   );
 }
 
-/** Launches the detached temp supervisor (`_run-temp <name>`). Injectable for tests. */
-export type SupervisorLauncher = (binPath: string, args: string[], dir: string) => void;
-
-const detachedSupervisor: SupervisorLauncher = (binPath, args, dir) => {
-  // Log to the temp dir; the fd stays valid even after runTemp removes the dir.
+/** Fallback used only when service-manager supervision is explicitly disabled. */
+const spawnDetached = (binPath: string, args: string[], dir: string): number => {
+  // Log to the temp dir; the child fd stays valid when retirement moves the
+  // directory into the evidence archive.
   const out = openSync(join(dir, 'supervisor.log'), 'a');
-  const child = spawnChild(process.execPath, [binPath, ...args], {
-    detached: true,
-    stdio: ['ignore', out, out],
-  });
+  let child: ReturnType<typeof spawnChild>;
+  try {
+    child = spawnChild(process.execPath, [binPath, ...args], {
+      detached: true,
+      stdio: ['ignore', out, out],
+    });
+  } finally { closeSync(out); }
   child.unref();
+  if (!child.pid) throw new Error('detached temporary supervisor did not report a pid');
+  return child.pid;
 };
 
-/** Temp spawn: state under ~/.ours-fleet/tmp, plain tmux, auto-clean on exit. */
+const independentSupervisor = makeTempSupervisorLauncher({ spawnDetached });
+export type { SupervisorLauncher } from './temp-lifecycle.js';
+
+/** Temp spawn: live state under ~/.ours-fleet/tmp, independent transient supervision. */
 export async function spawnTemp(
   o: SpawnOpts,
   binPath: string,
-  launch: SupervisorLauncher = detachedSupervisor,
+  launch: SupervisorLauncher = independentSupervisor,
   creation: CreationDeps = {},
 ): Promise<string> {
   validateSpawnOpts(o);
   if (o.isolationFile) readIsolationFile(o.isolationFile);   // fail before reserving
   if (o.missionFile) readMissionFile(o.missionFile);         // fail before reserving
+  // Retire only supervisors whose recorded owner is definitively stopped. This
+  // bounded pass keeps the active roster clean without deleting old evidence.
+  await reclaimStaleTempState();
   // Temporary roles go through the SAME reservation boundary as permanent ones
   // (6.4): a temp agent competes for the same names.
   creation.onStage?.('reserving');
@@ -515,19 +529,32 @@ async function spawnTempInner(
   });
   writeProvenance(dir, provenance);
   lastProvenance = provenance;
-  tx.record({ stage: `temp state dir ${dir}`, undo: () => rmSync(dir, { recursive: true, force: true }) });
+  tx.record({
+    stage: `temp state dir ${dir}`,
+    undo: () => {
+      // A failed launch is still lifecycle evidence: briefing, provenance,
+      // metadata and supervisor output explain what happened. Remove it from
+      // the live roster by atomic archive, never recursive deletion.
+      archiveTempState(
+        o.name, 'startup-failure', 'failed',
+        'temporary creation rolled back after launch/setup failure; evidence preserved',
+      );
+    },
+  });
   writeFileSync(join(dir, 'role.yaml'), stringify(role));
   // Snapshot the fleet start-stagger so the detached temp supervisor (no config path
   // threaded through it) honors the same launch gate — a burst of temp spawns spaces
   // out; a lone temp spawn still waits zero (time-based gate).
   if (cfg.startStaggerMs > 0)
     writeFileSync(join(dir, START_STAGGER_FILE), String(cfg.startStaggerMs));
-  // Run the supervisor DETACHED — NOT inside a tmux session named <name>.
+  prepareTempSupervisor(dir, o.name);
+  // Run the supervisor independently — NOT inside a tmux session named <name>.
   // `_run-temp` -> runOnce() creates AND kills the tmux session <name> for the
   // agent itself; a supervisor sharing that session name would SIGHUP its own
-  // process before the agent ever launches. Detaching mirrors how systemd hosts
-  // the supervisor for permanent roles, leaving runOnce to own the <name> session.
+  // process before the agent ever launches. On a service-managed host the temp
+  // runner gets its own transient unit/job, so stopping the coordinator's unit
+  // cannot kill a live worker in the coordinator's cgroup.
   onStage?.('starting_temp');
-  launch(binPath, ['_run-temp', o.name], dir);
+  await launch(binPath, ['_run-temp', o.name], dir);
   return dir;
 }

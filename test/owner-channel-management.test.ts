@@ -81,6 +81,210 @@ afterEach(() => {
 });
 
 describe('OwnerChannel live management', () => {
+  it('reconnects the direct watch from its durable cursor without duplicating an owner turn', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'ours-owner-watch-'));
+    dirs.push(dir);
+    writeFileSync(join(dir, '.owner-channel-watch.json'), JSON.stringify({
+      version: 1, cursor: 41, reconnects: 0, consecutiveFailures: 0,
+      reason: 'OWNER_WATCH_CONNECTED', updatedAt: new Date(0).toISOString(),
+    }) + '\n');
+    const client = new ManagementClient();
+    const secretBody = 'OWNER_BODY_MUST_NOT_ENTER_WATCH_STATE';
+    client.batches.push([{
+      msg_id: 90, wire_id: 'watch-continuity-wire', from: { id: OWNER }, text: secretBody,
+    }], []);
+    const queuePrompt = vi.fn(async () => ({
+      promptId: 'watch-prompt', queuedBehind: 0,
+      completion: Promise.resolve({
+        accepted: true, outcome: 'completed' as const, succeeded: true, output: 'done',
+      }),
+    }));
+    const session = {
+      backend: 'acp', pid: 1, isAlive: () => true,
+      snapshot: () => ({ backend: 'acp', alive: true, readiness: 'idle' }),
+      queuePrompt, interrupt: vi.fn(), eventsSince: () => [],
+    } as unknown as SessionHandle;
+    const urls: string[] = [];
+    let attempt = 0;
+    const watchFetch = vi.fn(async (url: string, init?: { signal?: AbortSignal }) => {
+      urls.push(url);
+      if (attempt++ === 0) throw new Error('simulated two-hour socket abort');
+      if (attempt === 2) return {
+        status: 200, ok: true,
+        json: async () => ({ cursor: 42, events: [{ event: 'message_received', msg_id: 90 }] }),
+      };
+      return new Promise<never>((_resolve, reject) => {
+        init?.signal?.addEventListener('abort', () => reject(new Error('closed')), { once: true });
+      });
+    });
+    const delays: number[] = [];
+    const logs: string[] = [];
+    const channel = new OwnerChannel({
+      role: 'Role', harness: 'claude-code',
+      config: { identity: 'Role-owner', owners: [OWNER], interrupt: false, progress_interval_ms: 0 },
+      session, stateDir: dir, client, watchFetch, log: line => logs.push(line),
+      binderDeps: { now: () => 1_000, sleep: async ms => { delays.push(ms); } },
+    });
+
+    await channel.start();
+    await vi.waitFor(() => expect(queuePrompt).toHaveBeenCalledOnce());
+    await vi.waitFor(() => expect(JSON.parse(readFileSync(
+      join(dir, '.owner-channel-watch.json'), 'utf8')).cursor).toBe(42));
+    await channel.close();
+
+    expect(urls.slice(0, 2).every(url => url.endsWith('?since=41'))).toBe(true);
+    expect(delays[0]).toBe(1_000);
+    expect(logs.some(line => line.includes('reason=OWNER_WATCH_STREAM_ERROR'))).toBe(true);
+    const state = readFileSync(join(dir, '.owner-channel-watch.json'), 'utf8');
+    expect(state).toContain('"reconnects":1');
+    expect(state).not.toContain(secretBody);
+    expect(queuePrompt.mock.calls[0][0]).toContain(secretBody);
+  });
+
+  /**
+   * One direct-watch harness for the D11 reliability cases: a caller-supplied
+   * fetch script, a deterministic sleep, and no real timers.
+   */
+  function watchSetup(
+    fetchImpl: (url: string, init?: { signal?: AbortSignal }) => Promise<unknown>,
+    options: { watchState?: string; batches?: unknown[][]; watchStallMs?: number } = {},
+  ) {
+    const dir = mkdtempSync(join(tmpdir(), 'ours-owner-watch-'));
+    dirs.push(dir);
+    if (options.watchState !== undefined)
+      writeFileSync(join(dir, '.owner-channel-watch.json'), options.watchState);
+    const client = new ManagementClient();
+    for (const batch of options.batches ?? []) client.batches.push(batch);
+    const queuePrompt = vi.fn(async () => ({
+      promptId: 'watch-prompt', queuedBehind: 0,
+      completion: Promise.resolve({
+        accepted: true, outcome: 'completed' as const, succeeded: true, output: 'done',
+      }),
+    }));
+    const session = {
+      backend: 'acp', pid: 1, isAlive: () => true,
+      snapshot: () => ({ backend: 'acp', alive: true, readiness: 'idle' }),
+      queuePrompt, interrupt: vi.fn(), eventsSince: () => [],
+    } as unknown as SessionHandle;
+    const delays: number[] = [];
+    const logs: string[] = [];
+    const channel = new OwnerChannel({
+      role: 'Role', harness: 'claude-code',
+      config: { identity: 'Role-owner', owners: [OWNER], interrupt: false, progress_interval_ms: 0 },
+      session, stateDir: dir, client, watchFetch: fetchImpl as never,
+      log: line => logs.push(line),
+      ...(options.watchStallMs !== undefined ? { watchStallMs: options.watchStallMs } : {}),
+      binderDeps: { now: () => 1_000, sleep: async ms => { delays.push(ms); } },
+    });
+    const readState = () => JSON.parse(
+      readFileSync(join(dir, '.owner-channel-watch.json'), 'utf8')) as Record<string, unknown>;
+    return { channel, client, queuePrompt, logs, delays, dir, readState };
+  }
+
+  it('reports OWNER_WATCH_CURSOR_RECOVERED and drains the inbox after an unreadable cursor', async () => {
+    let attempt = 0;
+    const watch = watchSetup(async (_url, init) => {
+      if (attempt++ === 0) return { status: 200, ok: true, json: async () => ({ cursor: 7, events: [] }) };
+      return new Promise<never>((_resolve, reject) => {
+        init?.signal?.addEventListener('abort', () => reject(new Error('closed')), { once: true });
+      });
+    }, {
+      watchState: '{"version":1,"cursor":"corrupted-not-a-number"}\n',
+      batches: [[{
+        msg_id: 61, wire_id: 'recovered-cursor-wire', from: { id: OWNER }, text: 'still in the inbox',
+      }], []],
+    });
+
+    await watch.channel.start();
+    await vi.waitFor(() => expect(watch.readState().reason).toBe('OWNER_WATCH_CURSOR_RECOVERED'));
+    await watch.channel.close();
+
+    // The lost cursor is only safe to replace with the tip because the inbox —
+    // the authority — was drained first; the owner's pending message still ran.
+    expect(watch.queuePrompt).toHaveBeenCalledOnce();
+    expect(watch.queuePrompt.mock.calls[0][0]).toContain('still in the inbox');
+    expect(watch.logs.some(line =>
+      line.includes('reason=OWNER_WATCH_CURSOR_RECOVERED invalid cursor state'))).toBe(true);
+    expect(watch.readState()).toMatchObject({ cursor: 7, consecutiveFailures: 0 });
+  });
+
+  it('never reports a recovered cursor when a valid durable cursor was restored', async () => {
+    let attempt = 0;
+    const watch = watchSetup(async (_url, init) => {
+      if (attempt++ === 0) return { status: 200, ok: true, json: async () => ({ cursor: 12, events: [] }) };
+      return new Promise<never>((_resolve, reject) => {
+        init?.signal?.addEventListener('abort', () => reject(new Error('closed')), { once: true });
+      });
+    }, {
+      watchState: JSON.stringify({
+        version: 1, cursor: 11, reconnects: 0, consecutiveFailures: 0,
+        reason: 'OWNER_WATCH_CONNECTED', updatedAt: new Date(0).toISOString(),
+      }) + '\n',
+    });
+
+    await watch.channel.start();
+    await vi.waitFor(() => expect(watch.readState().cursor).toBe(12));
+    await watch.channel.close();
+
+    expect(watch.readState().reason).toBe('OWNER_WATCH_CONNECTED');
+  });
+
+  it('lets a later stall write state and count failures after an earlier auth rejection', async () => {
+    let attempt = 0;
+    const watch = watchSetup(async (_url, init) => {
+      if (attempt++ === 0) return { status: 401, ok: false, json: async () => ({}) };
+      // Never answers: the stall bound must abort it and be recorded, even
+      // though the previous attempt left OWNER_WATCH_AUTH_FAILED on disk.
+      return new Promise<never>((_resolve, reject) => {
+        init?.signal?.addEventListener('abort', () => reject(new Error('aborted')), { once: true });
+      });
+    }, {
+      watchState: JSON.stringify({
+        version: 1, cursor: 5, reconnects: 0, consecutiveFailures: 0,
+        reason: 'OWNER_WATCH_CONNECTED', updatedAt: new Date(0).toISOString(),
+      }) + '\n',
+      watchStallMs: 20,
+    });
+
+    await watch.channel.start();
+    await vi.waitFor(() => expect(watch.readState().reason).toBe('OWNER_WATCH_STALLED'));
+    const stalled = watch.readState();
+    await watch.channel.close();
+
+    // The write happened at all, and the counter kept moving past the auth
+    // rejection instead of being frozen at 1 by the sticky reason.
+    expect(stalled).toMatchObject({ reason: 'OWNER_WATCH_STALLED', cursor: 5 });
+    expect(stalled.consecutiveFailures as number).toBeGreaterThanOrEqual(2);
+    expect(watch.logs.some(line => line.includes('reason=OWNER_WATCH_AUTH_FAILED'))).toBe(true);
+    expect(watch.logs.some(line => line.includes('reason=OWNER_WATCH_STALLED'))).toBe(true);
+  });
+
+  it('stops a permanently rejected watch as fatal instead of retrying forever', async () => {
+    let attempts = 0;
+    const watch = watchSetup(async () => {
+      attempts++;
+      return { status: 401, ok: false, json: async () => ({}) };
+    }, {
+      watchState: JSON.stringify({
+        version: 1, cursor: 3, reconnects: 0, consecutiveFailures: 0,
+        reason: 'OWNER_WATCH_CONNECTED', updatedAt: new Date(0).toISOString(),
+      }) + '\n',
+    });
+
+    await watch.channel.start();
+    await vi.waitFor(() => expect(watch.readState().reason).toBe('OWNER_WATCH_AUTH_FATAL'));
+    const settled = attempts;
+    // A stopped loop stays stopped: no further attempt arrives after the bound.
+    await new Promise(resolve => setTimeout(resolve, 20));
+    await watch.channel.close();
+
+    expect(attempts).toBe(5);
+    expect(settled).toBe(5);
+    expect(watch.readState()).toMatchObject({ cursor: 3, reason: 'OWNER_WATCH_AUTH_FATAL' });
+    expect(watch.logs.some(line =>
+      line.includes('owner watch stopped reason=OWNER_WATCH_AUTH_FATAL'))).toBe(true);
+  });
+
   it('relays every managed-agent message as a new message to the latest owner', async () => {
     const { channel, client, queuePrompt } = setup({ agent: AGENT });
     await channel.start();

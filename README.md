@@ -302,8 +302,26 @@ ours-fleet loops reload <Role>
 ours-fleet loops run-now|disable|enable <Role> <Loop>
 ours-fleet rm <Name>
 ours-fleet doctor [--harness H]
+ours-fleet version [--json]         build identity, capabilities, installs on PATH
 ours-fleet init
 ```
+
+### Which build am I running?
+
+`--version` prints a semver, and a semver does not identify an artifact: version
+bumps land in their own release commit, so a build cut between two releases
+carries the previous version while already containing new behaviour. Two installs
+on one host once both reported `0.16.0` while disagreeing about whether
+`monitor.interrupt: after_tool` was valid.
+
+Every build therefore stamps `dist/build-info.json` with a content-derived build
+id, its commit, and the capability tokens the shipped code declares.
+`ours-fleet version` prints that identity plus every `ours-fleet` it can see on
+`PATH`; `ours-fleet doctor` fails when two of them share a semver but are
+different builds, or when the executable on `PATH` is a different artifact from
+the one running. Two prefixes holding identical content are not a conflict.
+Installs predating the stamp are compared by hashing their `dist/`, so two of
+those are still told apart.
 
 A permanent role brought up via `-c custom.yaml` remembers that file (`.config-path`
 in its state dir) across supervisor-triggered restarts — systemd/launchd re-invoke the
@@ -437,6 +455,20 @@ schedule or selector changes reset that loop to its configured initial delay.
 `run-now` still obeys idle-only admission and returns exit 3 when busy; an
 unavailable or uncertain control plane returns exit 2 and is never retried.
 
+A failed state write — a full disk is the case seen in practice — never stops the
+manager. The failure is held in memory as `health: failed`, `anomaly:
+persist_failed`; the occurrence that could not be checkpointed is recorded as
+`skipped_unpersisted` rather than started, since a run that is not on disk is one
+a restart would submit twice; and the manager keeps a bounded retry armed (1s
+doubling to 60s) so it resumes on its own once writes land. Because that health
+flip is itself unwritable, readers do not trust a stored file that has stopped
+advancing: `status`, `loops status`, and `doctor` report `stale` — never the
+recorded health — once the checkpoint of a role that still has a loop to run is
+more than 5 minutes old. A role whose loops are all disabled stops checkpointing
+by design and is never called stale. `status` asks the live control socket
+whenever it is there, including when the first checkpoint never got written, and
+`doctor` fails a running role that has no stored loop state at all.
+
 A scheduled turn has typed internal provenance and no owner authority. It cannot
 cancel owner work and its ordinary completion is local only. Material proactive
 owner reporting remains possible solely through an already-open authenticated
@@ -501,8 +533,12 @@ mode can cross.
 
 ACP exposes agent-specific session mode IDs and `session/set_mode`, but no
 portable permission-policy capability. Fleet uses that primitive where an
-adapter has a corresponding mode and otherwise translates at the adapter;
-live session metadata reports both normalized and harness-native modes.
+adapter has a corresponding mode and otherwise translates at the adapter. The
+bundled Codex ACP adapter couples approval and sandboxing in its advertised
+mode IDs, so fleet preserves the selected sandbox preset and enforces approval
+independently on the app-server turn request. Thus `allow` + `workspace` is
+actually `never` + `workspace-write`, never `danger-full-access`. Live session
+metadata reports the normalized policy and the ACP sandbox-preset ID.
 
 ### Isolation at creation time
 

@@ -1,6 +1,6 @@
 import { execFile, spawn } from 'node:child_process';
 
-import type { SessionEvent, SessionSnapshot } from '../session/types.js';
+import type { InterruptOutcome, SessionEvent, SessionSnapshot } from '../session/types.js';
 import { OWNER_COMMENT_LABEL, ownerNotices, type OwnerCommentsState } from './notices.js';
 
 /**
@@ -26,7 +26,7 @@ export interface OwnerCommandContext {
   harness: string;
   version: string;
   snapshot(): SessionSnapshot;
-  interrupt(): Promise<void>;
+  interrupt(): Promise<InterruptOutcome>;
   /**
    * Deliver raw slash text to the agent harness. Only commands the bundled
    * ACP adapter for `harness` verifiably executes locally may be forwarded
@@ -142,9 +142,14 @@ export const ownerCommands: OwnerCommand[] = [
   {
     name: 'interrupt', summary: "cancel the agent's active turn",
     execute: noArgs('/interrupt', async ctx => {
-      try { await ctx.interrupt(); }
+      let outcome: InterruptOutcome;
+      // Only a cancellation that never reached the session is a failure. A
+      // forced recovery stopped the turn: say so, and say it plainly.
+      try { outcome = await ctx.interrupt(); }
       catch { return ctx.reply(ownerNotices.interruptFailed(ctx.role)); }
-      await ctx.reply(ownerNotices.interrupted(ctx.role));
+      await ctx.reply(outcome?.state === 'forced'
+        ? ownerNotices.interruptForced(ctx.role)
+        : ownerNotices.interrupted(ctx.role));
     }),
   },
   {

@@ -10,7 +10,10 @@ import {
 import { getAdapter } from './harness/registry.js';
 import type { Launch } from './harness/types.js';
 import { Tmux } from './tmux.js';
-import { createMonitor, type MonitorDeps, type MonitorHandle, type MonitorOpts, type FetchLike } from './monitor.js';
+import {
+  createMonitor, probeIdentityPresence,
+  type MonitorDeps, type MonitorHandle, type MonitorOpts, type FetchLike,
+} from './monitor.js';
 import { realExec, shq, type Exec } from './exec.js';
 import { resolveIsolation } from './isolation/policy.js';
 import { selectIsolationBackend } from './isolation/registry.js';
@@ -41,6 +44,10 @@ import {
 } from './fleet-proxy.js';
 import type { SpawnOpts } from './spawn.js';
 import { effectivePermissionMode } from './permissions.js';
+import {
+  archiveTempState, markTempSupervisorActive, requestedTempStopReason,
+  type TempTerminationReason,
+} from './temp-lifecycle.js';
 
 export interface RunnerDeps {
   tmux: Tmux;
@@ -399,7 +406,14 @@ export interface AttemptResult {
   rotated: boolean;
   mode: 'fresh' | 'resume';
   modelRecovery?: 'advance' | 'hold';
+  /** Present only when a temporary-role lifecycle signal ended the session. */
+  retirementReason?: 'identity-closed' | 'operator-stop' | 'supervisor-signal';
 }
+
+/** Continuous authoritative absence required after an identity was observed. */
+export const TEMP_IDENTITY_CLOSE_DEBOUNCE_MS = 5_000;
+/** Lifecycle polling is deliberately slower than the 500ms stop-signal loop. */
+export const TEMP_IDENTITY_POLL_MS = 2_000;
 
 /** One session lifecycle. `runSupervised` (or a one-shot caller) drives it. */
 export async function runOnce(
@@ -550,6 +564,7 @@ export async function runOnce(
   let unsubscribeRecovery: (() => void) | undefined;
   let monitorLoop: Promise<void> | undefined;
   let acpStartupComplete = false;
+  let sessionClosed = false;
   let ownerChannel: OwnerChannelHandle | undefined;
   let ownerBinder: OwnerBinderLease | undefined;
   const pendingFleetSpawnNotices: ManagedFleetSpawnResult[] = [];
@@ -652,7 +667,12 @@ export async function runOnce(
         const steered = result.accepted
           && (result.detail === 'injected' || result.detail === 'startedNewTurn');
         const boundary = result.safeBoundary;
-        const boundaryDetail = boundary
+        const queuedAfterSteeringFailure = result.detail?.startsWith('steering rejected;') === true;
+        const boundaryDetail = boundary && queuedAfterSteeringFailure
+          ? boundary.state === 'timeout'
+            ? `after_tool timed out after ${boundary.waitedMs}ms; steering rejected, queued without cancellation`
+            : `after_tool ${boundary.state} boundary after ${boundary.waitedMs}ms; steering rejected, queued without cancellation`
+          : boundary
           ? boundary.state === 'timeout'
             ? `after_tool timed out after ${boundary.waitedMs}ms; steered without cancellation`
             : boundary.state === 'unsupported'
@@ -662,7 +682,9 @@ export async function runOnce(
         return {
           succeeded: result.succeeded || steered,
           outcome: steered ? result.detail! : result.outcome,
-          detail: boundaryDetail,
+          detail: result.succeeded || steered || !boundary
+            ? boundaryDetail
+            : [result.detail, boundaryDetail].filter(Boolean).join('; '),
           ...(boundary ? { safeBoundary: boundary.state } : {}),
         };
       },
@@ -797,10 +819,44 @@ export async function runOnce(
 
   const start = deps.now();
   let nextLoopReloadAt = deps.now() + 30_000;
+  let nextIdentityPollAt = deps.now();
   let lastReloadError = '';
+  let identityObserved = false;
+  let identityAbsentSince: number | undefined;
+  let retirementReason: AttemptResult['retirementReason'];
   while (sessionHandle.isAlive()) {
-    await deps.sleep(2000);
+    await deps.sleep(temp ? 500 : 2000);
     const now = deps.now();
+    if (temp && deps.shouldStop?.()) {
+      retirementReason = requestedTempStopReason(dir) ?? 'supervisor-signal';
+      deps.log(`[${name}] temporary supervisor retirement requested (${retirementReason})`);
+      await sessionHandle.close();
+      sessionClosed = true;
+      break;
+    }
+    if (temp && now >= nextIdentityPollAt) {
+      nextIdentityPollAt = now + TEMP_IDENTITY_POLL_MS;
+      const presence = await probeIdentityPresence(
+        role.identity, deps.fetch, resolvedMonitorDeps.env);
+      if (presence.state === 'present') {
+        identityObserved = true;
+        identityAbsentSince = undefined;
+      } else if (presence.state === 'absent' && identityObserved) {
+        identityAbsentSince ??= now;
+        // Require a continuous, time-bounded run of authoritative absence.
+        // The first positive observation is the readiness gate: cold tmux
+        // starts may spend minutes loading the harness and briefing before the
+        // agent creates/binds its identity, and absence before then is not a
+        // close event. After readiness, debounce a real disappearance.
+        if (now - identityAbsentSince >= TEMP_IDENTITY_CLOSE_DEBOUNCE_MS) {
+          retirementReason = 'identity-closed';
+          deps.log(`[${name}] temporary identity '${role.identity}' closed; retiring session and supervisor`);
+          await sessionHandle.close();
+          sessionClosed = true;
+          break;
+        }
+      } else if (presence.state === 'unknown') identityAbsentSince = undefined;
+    }
     if (reloadLoopConfig && now >= nextLoopReloadAt) {
       nextLoopReloadAt = now + 30_000;
       try {
@@ -830,7 +886,7 @@ export async function runOnce(
   ownerBinder?.release();
   if (monitor) { monitor.stop(); await monitorLoop; }
   unsubscribeRecovery?.();
-  if (acpSession) await acpSession.close();
+  if (acpSession && !sessionClosed) await acpSession.close();
   const elapsed = (deps.now() - start) / 1000;
   // Establish what actually happened before deciding anything. Absence of a
   // record is `unknown` — except when the console itself is gone, which is a
@@ -870,7 +926,10 @@ export async function runOnce(
   } else deps.log(
     `[${name}] ${exitRecord.detail} (${elapsed.toFixed(0)}s) -> next start RESUMES context`);
 
-  return { elapsedSecs: elapsed, exit: exitRecord, rotated, mode, modelRecovery };
+  return {
+    elapsedSecs: elapsed, exit: exitRecord, rotated, mode, modelRecovery,
+    ...(retirementReason ? { retirementReason } : {}),
+  };
 }
 
 /**
@@ -1000,11 +1059,43 @@ function fastFailSecsFor(name: string, configPath?: string): number {
   } catch { return 20; }
 }
 
-/** Temp-agent entrypoint: run one session, then remove the temp dir. */
+/** Temp-agent entrypoint: run once, journal why it ended, then archive its evidence. */
 export async function runTemp(name: string, deps: Partial<RunnerDeps> = {}): Promise<void> {
+  const dir = agentDir(name, true);
+  await markTempSupervisorActive(dir);
+  let signal: NodeJS.Signals | undefined;
+  const onTerm = () => { signal = 'SIGTERM'; };
+  const onInt = () => { signal = 'SIGINT'; };
+  process.on('SIGTERM', onTerm);
+  process.on('SIGINT', onInt);
+  let result: AttemptResult | undefined;
+  let failure: unknown;
   try {
-    await runOnce(name, { temp: true }, deps);
+    result = await runOnce(name, { temp: true }, {
+      ...deps,
+      shouldStop: () => Boolean(signal) || (deps.shouldStop?.() ?? false),
+    });
+  } catch (error) {
+    failure = error;
   } finally {
-    rmSync(agentDir(name, true), { recursive: true, force: true });
+    process.off('SIGTERM', onTerm);
+    process.off('SIGINT', onInt);
+    const requested = requestedTempStopReason(dir);
+    const reason: TempTerminationReason = requested
+      ?? result?.retirementReason
+      ?? (signal ? 'supervisor-signal' : failure ? 'startup-failure' : 'session-ended');
+    // A service-manager stop can make the child connection close before the
+    // runner reaches its normal loop. That is still a successful requested
+    // retirement, not a startup failure.
+    const outcome = failure && !requested && !signal ? 'failed' : 'retired';
+    const detail = failure
+      ? (failure instanceof Error ? failure.message : String(failure))
+      : result
+        ? `${result.exit.detail}; elapsed=${result.elapsedSecs.toFixed(1)}s`
+        : 'temporary supervisor ended without an attempt result';
+    const archived = archiveTempState(name, reason, outcome, detail);
+    deps.log?.(`[${name}] temporary lifecycle ${outcome}: ${reason}`
+      + `${archived ? `; evidence archived at ${archived}` : '; state already archived'}`);
   }
+  if (failure) throw failure;
 }

@@ -20,6 +20,7 @@ ours-fleet docs                         # this complete reference (\`man\` is an
 ours-fleet help <command>               # exact flags for one command
 ours-fleet config [-c FILE]             # validate and print the merged plan; no changes
 ours-fleet doctor [-c FILE] [--harness codex|claude-code]
+ours-fleet version [--json]             # build identity, capabilities, every install on PATH
 \`\`\`
 
 Default configuration is \`~/fleet.yaml\` plus sorted \`~/fleet.d/*.yaml\` role
@@ -40,6 +41,44 @@ wholesale and drop inline comments written on its items; lines outside that
 collection remain byte-preserved. Each save is revision-guarded, reviewed as a diff
 of the real file before anything is written, validated by the real loader, and
 backed up next to the file first.
+
+## Build identity and install provenance
+
+\`--version\` prints a semver and nothing else, and a semver does NOT identify an
+artifact. Version bumps land in a release commit of their own, so every build cut
+between two releases carries the PREVIOUS version while already containing new
+behaviour. One host ran two installs that both reported 0.16.0 — same version,
+different build. One accepted \`monitor.interrupt: after_tool\`, the other
+rejected it as invalid. Their
+\`dist/cli.js\` were byte-identical — the divergence was in other modules.
+
+Every build therefore stamps \`dist/build-info.json\` with a build id (first 12 hex
+of a sha256 over the rest of \`dist/\`), the commit it was cut from, and the
+capability tokens the shipped code declares — for example
+\`monitor.interrupt.after_tool\`. Ask any executable what it is:
+
+\`\`\`sh
+ours-fleet version                      # ours-fleet 0.17.0+9f1c2a3b4d5e, capabilities, PATH installs
+ours-fleet version --json               # the same as machine-readable JSON, no environment values
+\`\`\`
+
+Read a capability, never a version number, to decide whether a setting is
+supported. When a build rejects a value it knows the name of, it says which
+capability is missing and which build rejected it, because another install on the
+same host may accept the identical file. \`config\` prints the build that resolved
+the plan; \`status <Name>\` says so when the build reporting on a role is not the
+one that created it (roles record their creating build in \`creation.json\`).
+
+\`ours-fleet doctor\` runs an \`install\` check that lists every \`ours-fleet\` on
+PATH plus the one executing, and FAILS when two installs share a semver but are
+different builds, or when the running artifact is a DIFFERENT artifact from the
+one PATH resolves to. A second prefix holding identical content is not a skew
+and is not reported. A PATH entry the shell would not execute — a directory, or
+a file without its execute bit — is not counted as an install at all.
+Installs built before this stamp existed report \`+unknown\`; they are compared by
+hashing their \`dist/\` instead, so two pre-provenance installs are still told
+apart. To fix a flagged host, remove or update the stale install — do not rely on
+PATH order.
 
 ## Lifecycle and console commands
 
@@ -127,8 +166,23 @@ ours-fleet spawn [--temp] [Name | --role Name] \\
 \`\`\`
 
 Permanent spawn writes \`~/fleet.d/Name.yaml\` and starts a supervised role.
-\`--temp\` writes ephemeral state, starts a detached supervisor, and removes the
-role after exit/reboot. Both lifetimes support \`--session acp\`.
+\`--temp\` writes active state under \`~/.ours-fleet/tmp\` and starts an independent
+transient supervisor (a collected systemd unit or submitted launchd job). It is
+not enabled across reboot and does not die when the role that spawned it restarts.
+Both lifetimes support \`--session acp\`. When a temporary role's bound identity
+closes or its session ends, the supervisor, monitor and live roster entry retire
+together; state moves intact to \`~/.ours-fleet/recovery/temporary\` with a
+termination record. Failed launches use the same archive rather than deleting
+their briefing, provenance, logs or partial supervisor metadata.
+
+Named \`down\` and \`rm\` commands can target an exact state-backed temporary role
+even though it is absent from merged fleet YAML. The recorded transient unit/job
+is authoritative. Missing/incomplete ownership metadata is reconciled only from
+an exact \`_run-temp <role>\` process-table match: one match may be adopted, zero
+settles as stopped, and ambiguity or an unreadable table fails closed. Launching
+records receive a bounded grace so a not-yet-registered transient unit cannot be
+mistaken for a stopped one. Stale recorded supervisors are reclaimed in bounded
+batches by moving their state to the same recovery archive, never by blind deletion.
 
 Temporary-role identity bootstrap is capability-based. The generated briefing
 first tries to bind the exact assigned identity and preserves it when it already
@@ -137,6 +191,13 @@ is exposed, tying a newly-created identity to the connector session lifecycle;
 older servers fall back to \`create_identity\`. Collisions and creation errors
 stop safely without force-adopting or deleting identity state. Permanent roles
 retain normal \`create_identity\` behavior.
+
+The temporary supervisor treats its first positive identity observation as the
+lifecycle readiness gate: a cold harness may take as long as needed to read its
+briefing and bind, without a fixed first-bind retirement timer. After readiness,
+only sustained authoritative absence closes the role. Unreachable, malformed, or
+valid-but-empty daemon indexes are ambiguous and reset closure debounce rather
+than becoming cleanup authority.
 
 Inside a managed ACP role, the same CLI automatically routes a real \`spawn\`
 through that role's authenticated supervisor control socket. \`--role Name\` is
@@ -351,8 +412,13 @@ boundary that a permission mode cannot cross.
 ACP carries agent-advertised session mode IDs and \`session/set_mode\`, but those
 IDs are agent-specific and ACP defines no portable permission-policy capability.
 Fleet therefore uses the ACP primitive where an adapter exposes a matching mode
-and otherwise performs the harness translation above. The live session reports
-both its effective normalized mode and exact harness-native mode.
+and otherwise performs the harness translation above. The bundled Codex ACP
+adapter couples approval and sandboxing in its advertised mode IDs, so fleet
+keeps the selected sandbox preset and enforces the independently translated
+approval policy on the app-server turn request. For example, \`allow\` plus
+\`workspace\` is really \`approval=never sandbox=workspace-write\`; it is never
+widened to \`danger-full-access\`. The live session reports both its effective
+normalized mode and the ACP sandbox-preset ID.
 
 See also: \`spawn --approval/--filesystem/--unattended\` set this intent at
 creation, and \`ours-fleet config\` prints each role's neutral settings, their

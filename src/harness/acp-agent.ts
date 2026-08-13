@@ -12,6 +12,9 @@ const require = createRequire(import.meta.url);
 export interface AcpAgentResolution {
   argv: string[];
   bundled: boolean;
+  /** Package manifest used to resolve the adapter's own runtime dependencies. */
+  manifestPath?: string;
+  version?: string;
 }
 
 export function resolveBundledAcpAgent(
@@ -23,6 +26,7 @@ export function resolveBundledAcpAgent(
     const manifestPath = require.resolve(`${packageName}/package.json`);
     const manifest = JSON.parse(readFileSync(manifestPath, 'utf8')) as {
       bin?: string | Record<string, string>;
+      version?: string;
     };
     const relative = typeof manifest.bin === 'string'
       ? manifest.bin
@@ -30,7 +34,10 @@ export function resolveBundledAcpAgent(
     if (!relative) return { argv: [fallbackCommand], bundled: false };
     const entrypoint = resolve(dirname(manifestPath), relative);
     if (!existsSync(entrypoint)) return { argv: [fallbackCommand], bundled: false };
-    return { argv: [process.execPath, entrypoint], bundled: true };
+    return {
+      argv: [process.execPath, entrypoint], bundled: true, manifestPath,
+      ...(typeof manifest.version === 'string' ? { version: manifest.version } : {}),
+    };
   } catch {
     // Supports development installs that intentionally omit optional
     // dependencies and existing hosts with a globally installed adapter.

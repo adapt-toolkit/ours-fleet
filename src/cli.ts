@@ -6,6 +6,9 @@ import { join as joinPath, resolve as resolvePath } from 'node:path';
 import { createInterface } from 'node:readline';
 import { Command } from 'commander';
 import { VERSION } from './version.js';
+import {
+  analyzeInstalls, buildInfo, buildLabel, discoverInstalls, runningLabel,
+} from './provenance.js';
 import { agentDir, agentsRoot, tmpRoot, logsRoot, deriveXdgRuntimeDir, watchdogsRoot } from './paths.js';
 import { findRole, loadConfig, ROLE_NAME_RE } from './config.js';
 import type { YamlMode } from './config-yaml.js';
@@ -28,7 +31,7 @@ import {
 } from './spawn.js';
 import { stringify } from 'yaml';
 import { resolvedRolePlan } from './resolved-plan.js';
-import { formatProvenance } from './creation.js';
+import { creationBuildNote, formatProvenance, readProvenance } from './creation.js';
 import { doctor } from './doctor.js';
 import { allWarnings, analyzeFleetPermissions, formatNative } from './permissions.js';
 import { AI_DOCS } from './docs.js';
@@ -37,7 +40,7 @@ import {
 } from './session/control.js';
 import { SessionControlError } from './session/types.js';
 import type { SessionEvent } from './session/types.js';
-import { readScheduledLoops } from './loops/state.js';
+import { readScheduledLoops, storedLoopHealth } from './loops/state.js';
 import type { LoopActionResult } from './loops/manager.js';
 import type {
   OwnerChannelManagementRequest, OwnerChannelManagementResult,
@@ -88,6 +91,49 @@ program.command('docs')
   .alias('man')
   .description('print the complete AI-friendly command and configuration reference')
   .action(() => { process.stdout.write(AI_DOCS); });
+
+// `--version` prints the semver alone, because scripts parse it. Semver cannot
+// identify an artifact — two installs on one host once reported 0.16.0 and
+// disagreed about `monitor.interrupt: after_tool` — so the full identity of the
+// executable answering, and of every other install it can see, lives here.
+program.command('version')
+  .description('build identity, capabilities, and every ours-fleet install on this host')
+  .option('--json', 'emit the machine-readable build report')
+  .action(opts => {
+    const info = buildInfo();
+    const installs = discoverInstalls();
+    const running = installs.find(i => i.running);
+    const skew = analyzeInstalls(installs);
+    if (opts.json) {
+      process.stdout.write(`${JSON.stringify({
+        ...info,
+        packageRoot: running?.packageRoot,
+        executable: binPath,
+        node: process.versions.node,
+        platform: process.platform,
+        installs: installs.map(i => ({
+          packageRoot: i.packageRoot,
+          version: i.version,
+          buildId: i.build?.buildId ?? null,
+          capabilities: i.build?.capabilities ?? null,
+          bin: i.bin ?? null,
+          running: i.running,
+        })),
+        skew,
+      }, null, 2)}\n`);
+      return;
+    }
+    console.log(runningLabel());
+    if (info.commit) console.log(`  commit:       ${info.commit.slice(0, 12)}${info.dirty ? ' (dirty tree)' : ''}`);
+    if (info.builtAt) console.log(`  built:        ${info.builtAt}`);
+    console.log(`  executable:   ${binPath}`);
+    if (running) console.log(`  package root: ${running.packageRoot}`);
+    console.log(`  node:         v${process.versions.node} on ${process.platform}`);
+    console.log(`  capabilities: ${info.capabilities.join(', ') || '(none declared)'}`);
+    for (const i of installs.filter(i => i.pathIndex !== undefined))
+      console.log(`  on PATH:      ${i.bin} -> ${buildLabel(i)}`);
+    for (const s of skew) console.error(`${s.severity}: ${s.message}`);
+  });
 
 function acpStateDir(name: string): string | undefined {
   const permanent = agentDir(name);
@@ -187,6 +233,9 @@ cOpt(program.command('config').description('validate + print the merged plan (no
         process.stdout.write(`${JSON.stringify(resolvedPlan(cfg), null, 2)}\n`);
         return;
       }
+      // Which artifact resolved this plan. Two installs can share a semver and
+      // disagree about what fleet.yaml means; the plan below is only true of this one.
+      console.log(`build:  ${runningLabel()}`);
       console.log(`config: ${cfg.files.join(' + ') || '(none)'}`);
       for (const diagnostic of cfg.diagnostics) console.log(`warning: ${diagnostic.message}`);
       const analyses = analyzeFleetPermissions(cfg.roles);
@@ -257,7 +306,7 @@ cOpt(program.command('up [names...]').description('create/start every role (or j
     try { await up(loadConfig(opts.configuration), names, deps(), opts.configuration); } catch (e) { die(e); }
   });
 
-cOpt(program.command('down [names...]').description('stop roles'))
+cOpt(program.command('down [names...]').description('stop configured roles or exact named temporary roles'))
   .action(async (names, opts) => {
     try { await down(loadConfig(opts.configuration), names, deps()); } catch (e) { die(e); }
   });
@@ -410,6 +459,11 @@ program.command('logs <name>').description('show the role log').option('-f, --fo
 program.command('status <name>').description('unit/agent state')
   .action(async name => {
     console.log(await pickBackend().status(name));
+    // A role outlives the artifact that created it. If a different build is
+    // reporting now, its settings may resolve differently than at creation.
+    const created = readProvenance(agentDir(name));
+    const buildNote = created && creationBuildNote(created);
+    if (buildNote) console.log(`build: ${buildNote}`);
     // A held-down role looks like a healthy running unit from the outside — the
     // runner is alive on purpose. Say so, with the reason and when (3.2).
     const ledger = readRestartLedger(agentDir(name));
@@ -439,13 +493,33 @@ program.command('status <name>').description('unit/agent state')
         if (response.ok) console.log(`session: ${JSON.stringify(response.result)}`);
       } catch { console.log('session: acp control unavailable'); }
     }
-    const loopState = readScheduledLoops(agentDir(name));
+    // Loop health is asked of the live manager first: when its state writes are
+    // failing it is the ONLY source that can say so — the stored file is frozen
+    // at whatever it last managed to record, which is why a role with every loop
+    // dead still reported `healthy` for 2h51m. The probe cannot be conditional on
+    // there being a stored file either: a manager whose very first checkpoint hit
+    // ENOSPC never wrote one, and it is precisely the one worth asking.
+    let loopState = readScheduledLoops(agentDir(name));
+    let loopEvidence = 'stored';
+    const loopControl = permanentLoopControlDir(name);
+    if (loopControl) {
+      try {
+        const response = await controlRequest(loopControl, { command: 'loop_status' }, 2_000);
+        if (response.ok) { loopState = response.result as typeof loopState; loopEvidence = 'live'; }
+      } catch { /* stored evidence stays honest */ }
+    }
     if (loopState) {
       const values = Object.values(loopState.loops);
       const enabled = values.filter(loop => loop.enabled && !loop.operatorDisabled).length;
       const next = values.filter(loop => loop.enabled && !loop.operatorDisabled)
         .map(loop => Date.parse(loop.nextDueAt)).filter(Number.isFinite).sort((a, b) => a - b)[0];
-      console.log(`loops: ${enabled} enabled${next ? `, next ${formatDuration(Math.max(0, next - Date.now()))}` : ''}, ${loopState.health}`);
+      const verdict = storedLoopHealth(loopState, Date.now());
+      const health = loopEvidence === 'live' ? loopState.health : verdict.health;
+      console.log(`loops: ${enabled} enabled${next ? `, next ${formatDuration(Math.max(0, next - Date.now()))}` : ''}, ${health}`
+        + (loopEvidence === 'stored' && verdict.stale
+          ? ` (no state update for ${formatDuration(verdict.ageMs)}; last recorded ${verdict.recorded})` : '')
+        + (loopState.anomaly ? ` anomaly=${loopState.anomaly}` : '')
+        + ` evidence=${loopEvidence}`);
     }
   });
 
@@ -533,12 +607,19 @@ cOpt(loopsCommand.command('status [role] [loop]').description('show live or stor
           const response = await controlRequest(live, { command: 'loop_status' }, 2_000);
           if (response.ok) { state = response.result as typeof state; evidence = 'live'; }
         } catch { /* stored evidence remains honest; timeout is not offline */ }
-        results.push({ role: role.name, evidence, state });
+        // Stored evidence is only as current as the last write that landed.
+        const verdict = state && evidence === 'stored' ? storedLoopHealth(state, Date.now()) : undefined;
+        results.push({
+          role: role.name, evidence, state,
+          health: verdict ? verdict.health : state?.health ?? null,
+          staleMs: verdict?.stale ? verdict.ageMs : null,
+        });
       }
       if (opts.json) console.log(JSON.stringify({ schemaVersion: 1, roles: results }));
       else {
         const rows = results.flatMap(result => renderLoopRows(result.role, result.state, loopName)
-          .map(row => `${row} evidence=${result.evidence}`));
+          .map(row => `${row} evidence=${result.evidence} health=${result.health}`
+            + (result.staleMs === null ? '' : ` stale=${formatDuration(result.staleMs)}`)));
         console.log(rows.join('\n') || '(no scheduled loop state)');
       }
     } catch (error) { loopFailure(error, opts.json === true); }
@@ -888,14 +969,14 @@ cOpt(program.command('watchdog-report <name> [runId]')
     } catch (e) { die(e); }
   });
 
-cOpt(program.command('rm <name>').description('stop + delete state dir (+ its fleet.d file if spawned)'))
+cOpt(program.command('rm <name>').description('stop + remove a role (temporary evidence is archived)'))
   .action(async (name, opts) => {
     try { await rmRole(loadConfig(opts.configuration), name, deps()); } catch (e) { die(e); }
   });
 
 cOpt(program.command('spawn [name]').description('spawn a new agent (permanent by default)'))
   .option('--role <name>', 'role name (alternative to the positional name)')
-  .option('--temp', 'temporary: detached supervisor, auto-cleaned, gone on reboot')
+  .option('--temp', 'temporary: independent transient supervisor, archived on retirement, gone on reboot')
   .option('--harness <id>', 'harness adapter (default: defaults.harness)')
   .option('--session <backend>', 'session backend: tmux|acp (default: defaults.session or tmux)')
   .option('--mission <text>', 'one-line mission')
@@ -991,7 +1072,8 @@ cOpt(program.command('spawn [name]').description('spawn a new agent (permanent b
       // The same provenance that was persisted, so what the operator reads now
       // and what a reviewer reads later cannot disagree (6.6).
       if (lastProvenance) {
-        console.log(`  created by ${lastProvenance.command} v${lastProvenance.fleetVersion} `
+        console.log(`  created by ${lastProvenance.command} `
+          + `v${lastProvenance.fleetVersion}+${lastProvenance.fleetBuild} `
           + `at ${lastProvenance.createdAt} (${lastProvenance.lifetime})`);
         for (const line of formatProvenance(lastProvenance)) console.log(line);
       }
