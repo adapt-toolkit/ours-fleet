@@ -77,6 +77,8 @@ export interface OwnerChannelOptions {
   watch?: (identity: string) => ChildProcessWithoutNullStreams;
   /** Test seam for the production direct notification long-poll. */
   watchFetch?: FetchLike;
+  /** Test seam for the long-poll stall bound; production uses OWNER_WATCH_STALL_MS. */
+  watchStallMs?: number;
   /** Test seam; production uses the detached ours-fleet CLI (`fleetCliOps`). */
   fleet?: OwnerFleetOps;
   /** Forwarded to fleet CLI invocations spawned for owner commands. */
@@ -160,9 +162,17 @@ const COMMENTARY_MAX_UPDATES = 32;
 const COMMENTARY_DEDUPE_LIMIT = 512;
 const OWNER_WATCH_STALL_MS = 120_000;
 const OWNER_WATCH_BACKOFF_MAX_MS = 30_000;
+/**
+ * Credentials that are wrong now are wrong on the next attempt too. Retrying a
+ * permanent 401 forever burns the daemon and hides the real fault behind an
+ * endless reconnect log, so the watch stops after this many consecutive auth
+ * rejections and records a terminal reason instead.
+ */
+const OWNER_WATCH_AUTH_FATAL_ATTEMPTS = 5;
 
 type OwnerWatchReason = 'OWNER_WATCH_CONNECTED' | 'OWNER_WATCH_STREAM_ERROR'
-  | 'OWNER_WATCH_STALLED' | 'OWNER_WATCH_AUTH_FAILED' | 'OWNER_WATCH_CURSOR_RECOVERED';
+  | 'OWNER_WATCH_STALLED' | 'OWNER_WATCH_AUTH_FAILED' | 'OWNER_WATCH_AUTH_FATAL'
+  | 'OWNER_WATCH_CURSOR_RECOVERED';
 
 interface OwnerWatchState {
   version: 1;
@@ -1694,14 +1704,23 @@ export class OwnerChannel implements OwnerChannelHandle {
         globalThis.fetch(url, init) as unknown as ReturnType<FetchLike>);
     const sleep = this.options.binderDeps?.sleep
       ?? (ms => new Promise<void>(resolve => setTimeout(resolve, ms)));
-    let state = this.readWatchState();
+    const restored = this.readWatchState();
+    let state = restored.state;
+    // An unreadable cursor is the ONLY reason to restart at the tip. Say so on
+    // the next successful connect, and drain first: everything the lost cursor
+    // would have pointed at is still in the inbox, which is the authority.
+    let recovering = restored.recovered;
     let cursor: number | 'tip' = state?.cursor ?? 'tip';
     let delayMs = 1_000;
+    let authFailures = 0;
+    if (recovering) await this.drain().catch(error => this.logError('cursor recovery drain failed', error));
     while (!this.stopping) {
       const ctrl = new AbortController();
       this.watchAbort = ctrl;
       let stalled = false;
-      const timer = setTimeout(() => { stalled = true; ctrl.abort(); }, OWNER_WATCH_STALL_MS);
+      let authRejected = false;
+      const timer = setTimeout(() => { stalled = true; ctrl.abort(); },
+        this.options.watchStallMs ?? OWNER_WATCH_STALL_MS);
       timer.unref?.();
       try {
         const response = await fetch(
@@ -1709,8 +1728,17 @@ export class OwnerChannel implements OwnerChannelHandle {
           { headers: endpoint.headers, signal: ctrl.signal },
         );
         if (response.status === 401) {
-          state = this.writeWatchState(state, cursor === 'tip' ? 0 : cursor,
-            'OWNER_WATCH_AUTH_FAILED', true);
+          authRejected = true;
+          authFailures++;
+          const at = cursor === 'tip' ? state?.cursor ?? 0 : cursor;
+          if (authFailures >= OWNER_WATCH_AUTH_FATAL_ATTEMPTS) {
+            state = this.writeWatchState(state, at, 'OWNER_WATCH_AUTH_FATAL', true);
+            this.options.log(`[${this.options.role}] owner watch stopped `
+              + `reason=OWNER_WATCH_AUTH_FATAL after ${authFailures} consecutive HTTP 401 responses; `
+              + 'owner notifications require re-authorization and will not be retried');
+            return;
+          }
+          state = this.writeWatchState(state, at, 'OWNER_WATCH_AUTH_FAILED', true);
           throw new Error('OWNER_WATCH_AUTH_FAILED: daemon rejected notification credentials');
         }
         if (!response.ok) throw new Error(`daemon returned HTTP ${response.status}`);
@@ -1718,8 +1746,10 @@ export class OwnerChannel implements OwnerChannelHandle {
         const next = typeof body.cursor === 'number' ? body.cursor : cursor === 'tip' ? 0 : cursor;
         const reconnect = (state?.consecutiveFailures ?? 0) > 0;
         state = this.writeWatchState(state, next,
-          cursor === 'tip' && state ? 'OWNER_WATCH_CURSOR_RECOVERED' : 'OWNER_WATCH_CONNECTED',
+          recovering ? 'OWNER_WATCH_CURSOR_RECOVERED' : 'OWNER_WATCH_CONNECTED',
           false, reconnect);
+        recovering = false;
+        authFailures = 0;
         cursor = next;
         delayMs = 1_000;
         // Notification events are content-free hints. The inbox remains the
@@ -1731,11 +1761,13 @@ export class OwnerChannel implements OwnerChannelHandle {
           ? 'OWNER_WATCH_STALLED' : 'OWNER_WATCH_STREAM_ERROR';
         const current = cursor === 'tip' ? state?.cursor ?? 0 : cursor;
         cursor = current;
-        // Preserve the more specific auth reason already written above.
-        if (state?.reason !== 'OWNER_WATCH_AUTH_FAILED')
-          state = this.writeWatchState(state, current, reason, true);
+        // Only THIS iteration's auth rejection is already written. A stale
+        // AUTH_FAILED from an earlier attempt must never suppress the cursor,
+        // the failure counter, or a later STALLED transition.
+        if (!authRejected) state = this.writeWatchState(state, current, reason, true);
         this.options.log(`[${this.options.role}] owner watch reconnect `
-          + `reason=${state?.reason ?? reason} delay_ms=${delayMs} cursor=${current}`);
+          + `reason=${authRejected ? 'OWNER_WATCH_AUTH_FAILED' : reason} `
+          + `delay_ms=${delayMs} cursor=${current}`);
         await sleep(delayMs);
         delayMs = Math.min(delayMs * 2, OWNER_WATCH_BACKOFF_MAX_MS);
       } finally {
@@ -1745,20 +1777,26 @@ export class OwnerChannel implements OwnerChannelHandle {
     }
   }
 
-  private readWatchState(): OwnerWatchState | undefined {
+  /**
+   * `recovered` distinguishes a first-ever start (no state, nothing lost) from a
+   * cursor we HAD and can no longer read. Only the latter is a recovery, and the
+   * caller needs to know because the reason it reports is the only evidence a
+   * durable cursor was ever lost.
+   */
+  private readWatchState(): { state?: OwnerWatchState; recovered: boolean } {
     const path = join(this.options.stateDir, '.owner-channel-watch.json');
+    if (!existsSync(path)) return { recovered: false };
     try {
-      if (!existsSync(path)) return undefined;
       const value = JSON.parse(readFileSync(path, 'utf8')) as Partial<OwnerWatchState>;
       if (value.version !== 1 || !Number.isSafeInteger(value.cursor) || value.cursor! < 0
           || !Number.isSafeInteger(value.reconnects) || value.reconnects! < 0
           || !Number.isSafeInteger(value.consecutiveFailures) || value.consecutiveFailures! < 0)
         throw new Error('invalid owner watch state');
-      return value as OwnerWatchState;
+      return { state: value as OwnerWatchState, recovered: false };
     } catch {
       this.options.log(`[${this.options.role}] owner watch `
         + 'reason=OWNER_WATCH_CURSOR_RECOVERED invalid cursor state; draining inbox and starting at tip');
-      return undefined;
+      return { recovered: true };
     }
   }
 
