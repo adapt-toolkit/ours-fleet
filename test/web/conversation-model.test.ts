@@ -40,6 +40,22 @@ describe('conversation browser model', () => {
     expect(describeTurnState(turn)).toBe('completed');
   });
 
+  it('renders one durable marker for a streamed redacted commentary message', () => {
+    const marker = '[assistant commentary redacted]';
+    const model = applyEvents(emptyModel(), [
+      event('message.chunk', {
+        role: 'assistant', content: { type: 'text', text: marker, redacted: true },
+      }, { promptId: 'p', messageId: 'commentary-1' }),
+      event('message.chunk', {
+        role: 'assistant', content: { type: 'text', text: marker, redacted: true },
+      }, { promptId: 'p', messageId: 'commentary-1' }),
+      event('message.chunk', {
+        role: 'assistant', content: { type: 'text', text: marker, redacted: true },
+      }, { promptId: 'p', messageId: 'commentary-1' }),
+    ]);
+    expect(model.turns[0].messages).toEqual([{ key: 'commentary-1', text: marker }]);
+  });
+
   it('is idempotent: replayed events do not duplicate anything', () => {
     const events = turnEvents('p1');
     const model = applyEvents(emptyModel(), [...events, ...events]);
