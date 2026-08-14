@@ -23,7 +23,7 @@ import { resolveLaunchRuntime } from './isolation/runtime.js';
 import { AcpSession } from './session/acp.js';
 import { controlRequest, RoleControlServer } from './session/control.js';
 import { TmuxSession } from './session/tmux.js';
-import { classifyShellStatus } from './session/types.js';
+import { ACP_CANCEL_DEADLINE_EXCEEDED, classifyShellStatus } from './session/types.js';
 import type { ExitRecord, SessionHandle } from './session/types.js';
 import {
   effectiveModelForRole, modelRecoveryHeld, reconcileModelRecovery, recordModelFailure,
@@ -909,7 +909,14 @@ export async function runOnce(
     rotated = true;
     deps.log(`[${name}] ${why} -> rotated session-id; next start is FRESH`);
   };
-  if (exitRecord.class === 'clean' && adapter.exitPolicy.cleanExitIsFresh)
+  if (exitRecord.detail.includes(ACP_CANCEL_DEADLINE_EXCEEDED))
+    // This is a deliberate adapter reclamation, not evidence that resume state
+    // is poisoned. Preserve the context even when the resumed generation hits
+    // the same bound immediately; runSupervised still counts the fast exit and
+    // opens its circuit after the configured number of consecutive failures.
+    deps.log(`[${name}] forced cancellation recovery (${elapsed.toFixed(0)}s, ${exitRecord.detail}) ` +
+      `-> next start RESUMES context`);
+  else if (exitRecord.class === 'clean' && adapter.exitPolicy.cleanExitIsFresh)
     rotate(`clean exit (code 0)`);
   else if (exitRecord.class === 'session-destroyed')
     // Someone tore the console down; the agent did not fail. Rotating here

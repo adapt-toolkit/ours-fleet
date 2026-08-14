@@ -13,7 +13,9 @@ import {
   TEMP_IDENTITY_CLOSE_DEBOUNCE_MS, TEMP_IDENTITY_POLL_MS,
   type AttemptResult, type RunnerDeps,
 } from '../src/runner.js';
-import { classifyChildExit, classifyShellStatus } from '../src/session/types.js';
+import {
+  ACP_CANCEL_DEADLINE_EXCEEDED, classifyChildExit, classifyShellStatus,
+} from '../src/session/types.js';
 import { registerAdapter } from '../src/harness/registry.js';
 import { agentDir, stateRoot } from '../src/paths.js';
 import { Tmux } from '../src/tmux.js';
@@ -64,7 +66,7 @@ function monitorRecorder(sessionCreated: () => boolean) {
 
 /** Fake tmux whose pane "process" dies after `lifeChecks` liveness polls,
  *  writing `.exit-status` (like the pane shell would) at the moment of death. */
-function fakeWorld(opts: { exitCode?: string; lifeChecks?: number; exitDelayMs?: number; exitFile?: string; bwrap?: 'ok' | 'missing'; cpuDelegated?: boolean; legacyExitFile?: boolean; sessionGone?: boolean } = {}) {
+function fakeWorld(opts: { exitCode?: string; lifeChecks?: number; exitDelayMs?: number; exitFile?: string; rawExitRecord?: string; bwrap?: 'ok' | 'missing'; cpuDelegated?: boolean; legacyExitFile?: boolean; sessionGone?: boolean } = {}) {
   const paneCommands: string[] = [];
   let clock = 0;
   let checks = 0;
@@ -98,9 +100,9 @@ function fakeWorld(opts: { exitCode?: string; lifeChecks?: number; exitDelayMs?:
       if (sessionKilled) return false;
       checks++;
       if (checks >= (opts.lifeChecks ?? 2)) {
-        if (opts.exitFile) writeFileSync(opts.exitFile, opts.legacyExitFile
+        if (opts.exitFile) writeFileSync(opts.exitFile, opts.rawExitRecord ?? (opts.legacyExitFile
           ? (opts.exitCode ?? '0') + '\n'                       // pre-upgrade `echo $?`
-          : JSON.stringify({ version: 1, backend: 'tmux', status: Number(opts.exitCode ?? '0') }));
+          : JSON.stringify({ version: 1, backend: 'tmux', status: Number(opts.exitCode ?? '0') })));
         return false;
       }
       return true;
@@ -337,6 +339,28 @@ describe('runOnce', () => {
     expect(paneCommands[0]).toContain('--resume');
     expect(readFileSync(join(d, '.session-id'), 'utf8').trim()).not.toBe('OLD');
     expect(existsSync(join(d, '.booted'))).toBe(false);
+  });
+
+  it('keeps resume state when a resumed cancellation recovery fails fast again', async () => {
+    writeCfg({ A: { harness: 'fake' } });
+    const d = agentDir('A'); mkdirSync(d, { recursive: true });
+    writeFileSync(join(d, '.session-id'), 'KEEP\n');
+    writeFileSync(join(d, '.booted'), '');
+    const { deps } = fakeWorld({
+      exitDelayMs: 100,
+      exitFile: join(d, '.exit-status'),
+      // AcpSession supplies this typed reason directly in its ExitRecord. The
+      // malformed tmux record is only a deterministic seam for giving runOnce
+      // the same detail without a real adapter or a cancellation timer.
+      rawExitRecord: ACP_CANCEL_DEADLINE_EXCEEDED,
+    });
+
+    const result = await runOnce('A', {}, deps);
+
+    expect(result).toMatchObject({ mode: 'resume', rotated: false });
+    expect(result.exit.detail).toContain(ACP_CANCEL_DEADLINE_EXCEEDED);
+    expect(readFileSync(join(d, '.session-id'), 'utf8').trim()).toBe('KEEP');
+    expect(existsSync(join(d, '.booted'))).toBe(true);
   });
 
   it('slow crash keeps resume state', async () => {
