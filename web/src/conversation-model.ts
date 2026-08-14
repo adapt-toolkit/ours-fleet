@@ -176,6 +176,7 @@ function applyEvent(model: ConversationModel, event: ConversationEvent): void {
       const role = payload.role as string | undefined;
       const turn = turnFor(model, event);
       const text = asText(payload.content);
+      const redacted = (payload.content as { redacted?: true } | undefined)?.redacted === true;
       if (role === 'user') {
         // Replayed/user-echoed chunks: keep them as the turn's user text when
         // the fleet admission did not carry one.
@@ -188,6 +189,11 @@ function applyEvent(model: ConversationModel, event: ConversationEvent): void {
       }
       const key = event.messageId ?? `turn:${turn.promptId}`;
       const last = turn.messages.at(-1);
+      // Commentary is intentionally redacted before it reaches the durable
+      // conversation ledger. ACP streams one event per chunk, so every chunk
+      // carries the same safe marker. Keep one marker per logical message
+      // instead of rendering a wall of repeated "commentary redacted" text.
+      if (last && last.key === key && redacted && last.text === text) return;
       if (last && last.key === key) last.text += text;
       else turn.messages.push({ key, text });
       return;
