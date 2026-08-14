@@ -11,10 +11,12 @@ import {
   runOnce, runTemp, runSupervised, buildPaneCommand, reserveLaunchSlot, readExitRecord,
   readRestartLedger, resetRestartLedger, backoffFor, loadTempRole, RESTART_FAIL_THRESHOLD,
   TEMP_IDENTITY_CLOSE_DEBOUNCE_MS, TEMP_IDENTITY_POLL_MS,
+  isRecoverableTempStartupCancellation,
   type AttemptResult, type RunnerDeps,
 } from '../src/runner.js';
 import {
-  ACP_CANCEL_DEADLINE_EXCEEDED, classifyChildExit, classifyShellStatus,
+  ACP_CANCEL_DEADLINE_EXCEEDED, classifyChildExit, classifyShellStatus, turnResult,
+  type SessionHandle, type TurnResult,
 } from '../src/session/types.js';
 import { registerAdapter } from '../src/harness/registry.js';
 import { agentDir, stateRoot } from '../src/paths.js';
@@ -26,6 +28,7 @@ import type { MonitorOpts } from '../src/monitor.js';
 import {
   OwnerBinderConflictError, OwnerBinderHandoffTimeoutError,
 } from '../src/owner-channel/binder.js';
+import { prepareTempSupervisor } from '../src/temp-lifecycle.js';
 
 let dir: string;
 beforeEach(() => {
@@ -568,6 +571,120 @@ describe('runOnce ACP startup outcome (1.2)', () => {
     await expect(runOnce('A', {}, deps)).rejects.toThrow(/startup prompt cancelled/);
     expect(logs.some(l => l.includes('[A] up;'))).toBe(false);
   });
+
+  it('keeps only typed temp wake cancellations nonterminal at startup', () => {
+    const cancelled = (source?: Parameters<typeof turnResult>[4]) =>
+      turnResult(true, 'cancelled', 'cancelled', undefined, source);
+    expect(isRecoverableTempStartupCancellation(true, cancelled('local-console'))).toBe(true);
+    expect(isRecoverableTempStartupCancellation(true, cancelled('fleet-monitor'))).toBe(true);
+    expect(isRecoverableTempStartupCancellation(false, cancelled('local-console'))).toBe(false);
+    expect(isRecoverableTempStartupCancellation(true, cancelled())).toBe(false);
+    expect(isRecoverableTempStartupCancellation(true, cancelled('owner'))).toBe(false);
+    expect(isRecoverableTempStartupCancellation(true, cancelled('shutdown'))).toBe(false);
+    expect(isRecoverableTempStartupCancellation(
+      true, turnResult(true, 'refused', 'refusal'))).toBe(false);
+    expect(isRecoverableTempStartupCancellation(
+      true, turnResult(false, 'failed', 'adapter failed'))).toBe(false);
+  });
+
+  it('keeps a temp supervisor alive when a manual interrupt cancels startup for a queued wake', async () => {
+    const d = agentDir('T', true);
+    mkdirSync(d, { recursive: true });
+    writeFileSync(join(d, 'role.yaml'), stringify({
+      name: 'T', harness: 'fake-acp', session: 'acp', identity: 'T',
+      monitor: { mode: 'fleet', interrupt: true },
+      permissions: { approval: 'ask', filesystem: 'workspace', unattended: 'deny' },
+      sourceFile: '(temp)',
+    }));
+    writeFileSync(join(d, 'identity-contact-state'), 'must survive the interrupted turn\n');
+    prepareTempSupervisor(d, 'T');
+    const { deps, logs } = acpDeps();
+    const runnerDeps: Partial<RunnerDeps> = deps;
+    let stopSupervisor = false;
+    let wakeSucceeded = false;
+    let controlSession: SessionHandle | undefined;
+    let alive = true;
+    let startupQueued = false;
+    let settleStartup!: (result: TurnResult) => void;
+    const queuePrompt: SessionHandle['queuePrompt'] = async (text, options = {}) => {
+      if (!startupQueued) {
+        startupQueued = true;
+        return {
+          promptId: 'startup', queuedBehind: 0, origin: options.origin,
+          completion: new Promise<TurnResult>(resolve => { settleStartup = resolve; }),
+        };
+      }
+      expect(text).toBe('queued wake after interrupt');
+      return {
+        promptId: 'wake', queuedBehind: 0, origin: options.origin,
+        completion: Promise.resolve(turnResult(true, 'completed', 'end_turn')),
+      };
+    };
+    const fakeAcp: SessionHandle = {
+      backend: 'acp', pid: 4242,
+      isAlive: () => alive,
+      snapshot: () => ({ backend: 'acp', alive, readiness: startupQueued ? 'running' : 'idle' }),
+      queuePrompt,
+      submitPrompt: async (text, options) => (await queuePrompt(text, options)).completion,
+      interrupt: async (source = 'local-console') => {
+        settleStartup(turnResult(true, 'cancelled', 'cancelled', undefined, source));
+        return { state: 'settled' };
+      },
+      respondPermission: () => false,
+      eventsSince: () => [],
+      subscribe: () => () => {},
+      setControllerAttached: () => {},
+      exitResult: () => ({ version: 1, class: 'clean', code: 0, detail: 'test stop' }),
+      close: async () => { alive = false; },
+    };
+    runnerDeps.startAcpSession = async () => fakeAcp;
+    runnerDeps.createControlServer = (_stateDir, session) => {
+      controlSession = session;
+      return {
+        start: async () => {}, close: async () => {},
+        setFleetSpawner: () => {}, setOwnerChannel: () => {},
+        setConfigReloader: () => {}, setLoopManager: () => {},
+      };
+    };
+    runnerDeps.shouldStop = () => stopSupervisor;
+    runnerDeps.fetch = async () => ({
+      status: 200, ok: true,
+      json: async () => ({ identities: [{ name: 'T', temporary: true }] }),
+    });
+    runnerDeps.createMonitor = opts => ({
+      prime: async () => {},
+      run: async () => {
+        // The daemon notification remains pending while the independent
+        // control interrupt settles the startup turn. Delivery must still be
+        // possible through the same live session immediately afterwards.
+        const interrupted = await controlSession!.interrupt('local-console');
+        expect(interrupted).toMatchObject({ state: 'settled' });
+        for (let i = 0; i < 100; i++) {
+          if (logs.some(line => line.includes('keeping temporary supervisor alive'))) break;
+          await new Promise<void>(resolve => setTimeout(resolve, 5));
+        }
+        const delivered = await opts.deps.delivery!.submit(
+          'queued wake after interrupt', { interrupt: true });
+        wakeSucceeded = delivered.succeeded;
+        expect(delivered).toMatchObject({ succeeded: true, outcome: 'completed' });
+        expect(readFileSync(join(d, 'identity-contact-state'), 'utf8'))
+          .toBe('must survive the interrupted turn\n');
+        stopSupervisor = true;
+      },
+      stop: () => {},
+    });
+
+    await expect(runTemp('T', runnerDeps)).resolves.toBeUndefined();
+
+    expect(wakeSucceeded).toBe(true);
+    expect(logs).toContain('[T] ACP startup prompt cancelled by local-console; keeping temporary supervisor alive');
+    const recovery = join(stateRoot(), 'recovery', 'temporary');
+    const archived = readdirSync(recovery).find(name => name.includes('-T-'))!;
+    expect(readFileSync(join(recovery, archived, 'identity-contact-state'), 'utf8'))
+      .toBe('must survive the interrupted turn\n');
+    expect(readFileSync(join(recovery, archived, 'termination.jsonl'), 'utf8'))
+      .toContain('"reason":"supervisor-signal"');
+  }, 20_000);
 
   it('delivers the adapter-computed permission mode to the ACP session', async () => {
     registerAdapter({ ...acpAdapter, id: 'fake-acp-mode', acpPermissionModeId: () => 'acceptEdits' });

@@ -20,11 +20,11 @@ import { selectIsolationBackend } from './isolation/registry.js';
 import { resourceArgs, cpuControllerDelegated } from './isolation/resources.js';
 import type { WrapContext } from './isolation/types.js';
 import { resolveLaunchRuntime } from './isolation/runtime.js';
-import { AcpSession } from './session/acp.js';
+import { AcpSession, type AcpSessionOptions } from './session/acp.js';
 import { controlRequest, RoleControlServer } from './session/control.js';
 import { TmuxSession } from './session/tmux.js';
 import { ACP_CANCEL_DEADLINE_EXCEEDED, classifyShellStatus } from './session/types.js';
-import type { ExitRecord, SessionHandle } from './session/types.js';
+import type { ExitRecord, SessionHandle, TurnResult } from './session/types.js';
 import {
   effectiveModelForRole, modelRecoveryHeld, reconcileModelRecovery, recordModelFailure,
   classifyFailureText,
@@ -63,6 +63,13 @@ export interface RunnerDeps {
   createMonitor(opts: MonitorOpts): MonitorHandle;
   /** Construct trusted owner ingress (injectable for lifecycle tests). */
   createOwnerChannel(opts: OwnerChannelOptions): OwnerChannelHandle;
+  /** Start the ACP transport (injectable for deterministic runner lifecycle tests). */
+  startAcpSession(opts: AcpSessionOptions): Promise<SessionHandle>;
+  /** Construct the authenticated role control route (injectable where sockets are unavailable). */
+  createControlServer(
+    stateDir: string, session: SessionHandle, log: (line: string) => void,
+  ): Pick<RoleControlServer,
+    'start' | 'close' | 'setFleetSpawner' | 'setOwnerChannel' | 'setConfigReloader' | 'setLoopManager'>;
   /** Acquire the cross-process owner-channel binder lease before replacing the control socket. */
   acquireOwnerBinder(stateDir: string, role: string, identity: string): Promise<OwnerBinderLease>;
   /** Ask the still-authenticated predecessor to emit the fixed recovery notice. */
@@ -82,6 +89,8 @@ const defaultDeps = (): RunnerDeps => ({
   fetch: (url, init) => globalThis.fetch(url, init) as unknown as ReturnType<FetchLike>,
   createMonitor: opts => createMonitor(opts),
   createOwnerChannel: opts => new OwnerChannel(opts),
+  startAcpSession: opts => AcpSession.start(opts),
+  createControlServer: (stateDir, session, log) => new RoleControlServer(stateDir, session, log),
   acquireOwnerBinder: (stateDir, role, identity) => acquireOwnerBinderLease(
     stateDir, role, identity),
   reportOwnerStartupFailure: async stateDir => {
@@ -415,6 +424,15 @@ export const TEMP_IDENTITY_CLOSE_DEBOUNCE_MS = 5_000;
 /** Lifecycle polling is deliberately slower than the 500ms stop-signal loop. */
 export const TEMP_IDENTITY_POLL_MS = 2_000;
 
+/** Only authenticated wake interrupts may turn a temp startup cancellation into readiness. */
+export function isRecoverableTempStartupCancellation(
+  temp: boolean, result: TurnResult,
+): boolean {
+  return temp && result.accepted && result.outcome === 'cancelled'
+    && (result.cancellationSource === 'local-console'
+      || result.cancellationSource === 'fleet-monitor');
+}
+
 /** One session lifecycle. `runSupervised` (or a one-shot caller) drives it. */
 export async function runOnce(
   name: string,
@@ -559,8 +577,8 @@ export async function runOnce(
 
   rmSync(exitFile, { force: true });
   let pid: number;
-  let acpSession: AcpSession | undefined;
-  let control: RoleControlServer | undefined;
+  let acpSession: SessionHandle | undefined;
+  let control: ReturnType<RunnerDeps['createControlServer']> | undefined;
   let unsubscribeRecovery: (() => void) | undefined;
   let monitorLoop: Promise<void> | undefined;
   let acpStartupComplete = false;
@@ -582,7 +600,7 @@ export async function runOnce(
     if (perms.unattended === 'deny')
       deps.log(`[${name}] permission policy: unattended=deny — with no console attached, ` +
         `permission requests are automatically denied once each (reject_once) and the turn continues`);
-    acpSession = await AcpSession.start({
+    acpSession = await deps.startAcpSession({
       name,
       argv: wrappedArgv,
       cwd: runCwd,
@@ -623,7 +641,7 @@ export async function runOnce(
           + `${(error as Error)?.message ?? String(error)}`);
       }
     }
-    control = new RoleControlServer(dir, arbiter, deps.log);
+    control = deps.createControlServer(dir, arbiter, deps.log);
     try { await control.start(); }
     catch (error) {
       ownerBinder?.release();
@@ -701,7 +719,14 @@ export async function runOnce(
     // success, so there is neither a deaf gap nor a boot-cancellation loop.
     monitorLoop = monitor?.run(pid);
     const started = await starting;
-    if (!started.succeeded) {
+    // A temporary role's first turn can be the active turn when an ours wake
+    // needs immediate attention. A typed console/monitor cancellation ends
+    // only that turn: the already-live ACP session and any queued wake remain
+    // valid. Keep every unproven cancellation, refusal, shutdown, and genuine
+    // failure terminal so a role that never accepted its briefing is not
+    // silently reported as healthy.
+    const interruptedForWake = isRecoverableTempStartupCancellation(temp, started);
+    if (!started.succeeded && !interruptedForWake) {
       monitor?.stop();
       await control.close();
       ownerBinder?.release();
@@ -724,6 +749,9 @@ export async function runOnce(
       throw new Error(`[${name}] ACP startup prompt ${started.outcome}` +
         `${started.detail ? `: ${started.detail}` : ''}`);
     }
+    if (interruptedForWake)
+      deps.log(`[${name}] ACP startup prompt cancelled by ${started.cancellationSource}; `
+        + 'keeping temporary supervisor alive');
     acpStartupComplete = true;
     if (role.owner_channel) {
       ownerChannel = deps.createOwnerChannel({
