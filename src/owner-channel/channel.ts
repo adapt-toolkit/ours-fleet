@@ -1,5 +1,5 @@
 import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
-import { createHash, randomUUID } from 'node:crypto';
+import { createHash } from 'node:crypto';
 import { existsSync, readFileSync } from 'node:fs';
 import { mkdir, readFile, readdir, rm } from 'node:fs/promises';
 import { createInterface } from 'node:readline';
@@ -21,7 +21,10 @@ import {
   type OwnerCommandContext, type OwnerFleetOps,
 } from './commands.js';
 import type { ManagedFleetSpawnResult } from '../fleet-proxy.js';
-import { OursMcpClient, type OursToolClient } from './mcp.js';
+import {
+  OURS_BOUND_ELSEWHERE, OursSdkClient, oursErrorCode,
+  type OursContactsView, type OursInboundMessage, type OursOps,
+} from './ours-client.js';
 import {
   ownerNotices,
   type OwnerCommentsState, type OwnerProgressPhase, type OwnerUpdatePhase,
@@ -37,7 +40,7 @@ import {
   AttachmentRecoveryState, admitAttachments, cleanupAttachmentRoot,
   parseIncomingAttachments, parseRetrievedAttachments, prepareAttachmentDirectory,
   recoveredAttachment, removeRequestDirectory, safeField, validateAttachmentSelection,
-  validateAttachmentRelaySelection,
+  validateAttachmentRelaySelection, writeRecoveredAttachment,
   type AdmittedAttachment, type IncomingAttachment, type PendingAttachmentRequest,
 } from './attachments.js';
 import {
@@ -45,16 +48,12 @@ import {
   type OwnerBinderDeps, type OwnerBinderLease,
 } from './binder.js';
 
-interface InboundMessage {
-  msg_id?: number;
-  wire_id?: string;
-  text?: string;
-  from?: { id?: string; name?: string } | string;
-  sender?: { id?: string; name?: string } | string;
-  sender_id?: string;
-  sender_name?: string;
-  reply_to?: { wire_id?: string; sentence?: number } | null;
-}
+/**
+ * The daemon's own inbound message shape. It used to be a hand-written union of
+ * every field name ours-mcp might have rendered, because the transport returned
+ * whatever text the tool produced; the typed client removes the guesswork.
+ */
+type InboundMessage = OursInboundMessage;
 
 interface AttachmentGroup {
   files: IncomingAttachment[];
@@ -70,9 +69,13 @@ export interface OwnerChannelOptions {
   session: SessionHandle;
   stateDir: string;
   env?: Record<string, string>;
+  /**
+   * `ours-mcp` binary for the legacy `watch` child process only. Daemon
+   * operations no longer go through it; they use the ours SDK client.
+   */
   command?: string;
   log(line: string): void;
-  client?: OursToolClient;
+  client?: OursOps;
   /** Legacy child-process test seam; production uses the direct notification API. */
   watch?: (identity: string) => ChildProcessWithoutNullStreams;
   /** Test seam for the production direct notification long-poll. */
@@ -126,7 +129,13 @@ export type { OwnerUpdatePhase } from './notices.js';
 export interface OwnerContact {
   cid: string;
   name: string;
+  /** Structural, from which daemon collection the row came: established or pending. */
   status: string;
+  /**
+   * Retained for the `ours-fleet owner contact list` column. The daemon's typed
+   * contact view has no such field, so it is always absent; it is not inferred
+   * from anything a contact controls.
+   */
   kind?: string;
   human?: { cid?: string; name?: string };
 }
@@ -191,7 +200,7 @@ class RelayUnroutableError extends Error {}
  * chooses its reply recipient; both are fixed from authenticated message data.
  */
 export class OwnerChannel implements OwnerChannelHandle {
-  private readonly client: OursToolClient;
+  private readonly client: OursOps;
   private readonly state: OwnerChannelState;
   private readonly authorizations: OwnerAuthorizationState;
   private readonly conversations: OwnerConversationState;
@@ -230,8 +239,8 @@ export class OwnerChannel implements OwnerChannelHandle {
   private readonly fleetOps: OwnerFleetOps;
 
   constructor(private readonly options: OwnerChannelOptions) {
-    this.client = options.client ?? new OursMcpClient(
-      options.command, options.env, line => options.log(`[${options.role}] owner channel ${line}`));
+    this.client = options.client ?? new OursSdkClient(
+      options.env, line => options.log(`[${options.role}] owner channel ${line}`));
     this.fleetOps = options.fleet ?? fleetCliOps(options.role, options.configPath);
     this.state = new OwnerChannelState(join(options.stateDir, '.owner-channel-state.json'));
     this.authorizations = new OwnerAuthorizationState(
@@ -275,11 +284,15 @@ export class OwnerChannel implements OwnerChannelHandle {
       const bindStartedAt = now();
       for (;;) {
         try {
-          await this.client.callTool('choose_identity', { name: this.options.config.identity });
+          await this.client.bindIdentity(this.options.config.identity);
           break;
         } catch (error) {
-          const message = (error as Error)?.message ?? String(error);
-          const liveConflict = /currently bound to another live session/i.test(message);
+          // The predecessor's lease may still be in flight. Only the daemon's
+          // own typed verdict may extend the handoff window: matching the
+          // wording of an error message would let any other failure whose text
+          // happens to say "bound to another live session" — including one
+          // relayed from a peer — spin here for the whole timeout.
+          const liveConflict = oursErrorCode(error) === OURS_BOUND_ELSEWHERE;
           if (!this.binder.inherited || !liveConflict
               || now() - bindStartedAt >= OWNER_BIND_HANDOFF_TIMEOUT_MS)
             throw error;
@@ -371,10 +384,14 @@ export class OwnerChannel implements OwnerChannelHandle {
         return { action: request.action, contacts: await this.contacts() };
       case 'contact_invite': {
         this.assertLabel(request.name);
-        const raw = await this.client.callTool('generate_invite', request.name ? { name: request.name } : {});
-        const invite = typeof raw === 'string' ? raw : String((raw as { invite?: unknown })?.invite ?? '');
-        if (!invite) throw new Error('ours-mcp returned no invite');
-        return { action: request.action, invite };
+        // The invite is the blob field, not a sentence containing it. The MCP
+        // surface answered with "One-time invite for X created (invite_id …).
+        // Share this blob out-of-band …:\n<blob>" and the whole sentence was
+        // handed out as the invite, so any rewording changed the payload.
+        const { blob } = await this.client.generateInvite(request.name);
+        if (typeof blob !== 'string' || !blob)
+          throw new Error('the ours daemon returned no invite blob');
+        return { action: request.action, invite: blob };
       }
       case 'contact_add': {
         if (typeof request.invite !== 'string' || !request.invite)
@@ -382,17 +399,18 @@ export class OwnerChannel implements OwnerChannelHandle {
         if (Buffer.byteLength(request.invite) > 48 * 1024)
           throw new Error('invite exceeds 49152 bytes');
         this.assertLabel(request.name);
-        let raw: unknown;
+        let added: { display: string; cid: string };
         try {
-          raw = await this.client.callTool('add_contact', {
+          added = await this.client.addContact({
             invite: request.invite, ...(request.name ? { name: request.name } : {}),
           });
         } catch {
           // Daemon errors are not allowed to reflect invite material through
           // the control response, CLI stderr, or supervisor logs.
-          throw new Error('ours-mcp could not accept the contact invite');
+          throw new Error('the ours daemon could not accept the contact invite');
         }
-        return { action: request.action, status: 'pending', contact: this.contact(raw) };
+        const contact = this.contact(added.cid, added.display, 'pending');
+        return { action: request.action, status: 'pending', ...(contact ? { contact } : {}) };
       }
       case 'owner_list':
         return {
@@ -458,31 +476,39 @@ export class OwnerChannel implements OwnerChannelHandle {
     }
   }
 
+  /**
+   * The daemon reports established contacts and pending introductions as two
+   * separate collections, so the status is structural rather than a word parsed
+   * out of a rendered line. Nothing here can be spoofed by a contact's own
+   * display name.
+   */
   private async contacts(): Promise<OwnerContact[]> {
-    const raw = await this.client.callTool('list_contacts');
-    const values = Array.isArray(raw) ? raw : (raw as { contacts?: unknown })?.contacts;
-    if (!Array.isArray(values)) return [];
-    return values.map(value => this.contact(value)).filter((v): v is OwnerContact => Boolean(v))
+    const view = await this.client.listContacts();
+    const rows = [
+      ...(Array.isArray(view?.contacts) ? view.contacts : [])
+        .map(row => this.contact(row?.container_id, row?.name, 'established', view)),
+      ...(Array.isArray(view?.pending) ? view.pending : [])
+        .map(row => this.contact(row?.container_id, row?.name, 'pending', view)),
+    ];
+    return rows.filter((row): row is OwnerContact => Boolean(row))
       .sort((a, b) => a.cid.localeCompare(b.cid));
   }
 
-  private contact(raw: unknown): OwnerContact | undefined {
-    if (!raw || typeof raw !== 'object') return undefined;
-    const value = raw as Record<string, unknown>;
-    const cid = String(value.cid ?? value.id ?? value.container_id ?? value.containerId ?? '');
+  private contact(
+    cidValue: unknown, nameValue: unknown, status: 'established' | 'pending',
+    view?: OursContactsView,
+  ): OwnerContact | undefined {
+    const cid = String(cidValue ?? '');
     if (!/^[A-Fa-f0-9]{64}$/.test(cid)) return undefined;
-    const humanRaw = value.human ?? value.root;
-    const human = humanRaw && typeof humanRaw === 'object' ? humanRaw as Record<string, unknown> : undefined;
+    const root = view?.roots?.[cid];
+    const rootCid = String(root?.root_cid ?? '');
     return {
       cid,
-      name: this.safeMetadata(value.name ?? value.display_name ?? cid),
-      status: this.safeMetadata(value.status ?? 'established'),
-      ...(typeof value.kind === 'string' ? { kind: this.safeMetadata(value.kind) } : {}),
-      ...(human ? { human: {
-        ...(typeof (human.cid ?? human.id) === 'string'
-          && /^[A-Fa-f0-9]{64}$/.test(String(human.cid ?? human.id))
-          ? { cid: String(human.cid ?? human.id) } : {}),
-        ...(human.name ? { name: this.safeMetadata(human.name) } : {}),
+      name: this.safeMetadata(nameValue ?? cid),
+      status,
+      ...(root ? { human: {
+        ...(/^[A-Fa-f0-9]{64}$/.test(rootCid) ? { cid: rootCid } : {}),
+        ...(root.root_name ? { name: this.safeMetadata(root.root_name) } : {}),
       } } : {}),
     };
   }
@@ -669,16 +695,16 @@ export class OwnerChannel implements OwnerChannelHandle {
     // A finite cap protects the supervisor if a broken daemon repeats unread
     // messages forever. A watch notification will resume draining later.
     for (let pass = 0; pass < 100 && !this.stopping; pass++) {
-      const [raw, fileResult] = await Promise.all([
-        this.client.callTool('get_messages') as Promise<{ messages?: unknown }>,
-        this.client.callTool('list_incoming_files')
+      const [payload, fileResult] = await Promise.all([
+        this.client.getMessages(),
+        this.client.listIncomingFiles()
           .catch(error => {
             this.logError('attachment metadata inspection unavailable', error);
             return undefined;
           }),
       ]);
-      const messages = Array.isArray(raw?.messages)
-        ? raw.messages.filter(message => message && typeof message === 'object') as InboundMessage[]
+      const messages = Array.isArray(payload?.messages)
+        ? payload.messages.filter(message => message && typeof message === 'object')
         : [];
       let files: IncomingAttachment[] = [];
       try { files = parseIncomingAttachments(fileResult); }
@@ -696,9 +722,8 @@ export class OwnerChannel implements OwnerChannelHandle {
         return wireId && !this.state.has(wireId)
           && this.acceptedSender(this.sender(message).id)
           && Number.isInteger(message.msg_id);
-      }).map(message => message.msg_id!);
-      if (deferred.length)
-        await this.client.callTool('defer_messages', { msg_ids: deferred });
+      }).map(message => message.msg_id);
+      if (deferred.length) await this.client.deferMessages(deferred);
 
       let advanced = false;
       const consumedMessages = new Set<InboundMessage>();
@@ -813,14 +838,13 @@ export class OwnerChannel implements OwnerChannelHandle {
       const unread = group.files.filter(file => file.status === 'unread');
       const processed = group.files.filter(file => file.status !== 'unread');
       const retrieved = unread.length
-        ? parseRetrievedAttachments(await this.client.callTool('get_files', {
-          wire_ids: unread.map(file => file.wireId),
-        }), unread)
+        ? parseRetrievedAttachments(
+          await this.client.getFiles(unread.map(file => file.wireId)), unread)
         : [];
       for (const file of processed) {
         if (!group.recovery) throw new Error('unexpected processed attachment without recovery route');
-        const recoveryPath = join(requestDir, `.recovered-${file.wireId}-${randomUUID()}`);
-        await this.client.callTool('save_file', { wire_id: file.wireId, dest_path: recoveryPath });
+        const recoveryPath = await writeRecoveredAttachment(
+          requestDir, file.wireId, await this.client.fetchFile(file.wireId));
         retrieved.push(await recoveredAttachment(file, recoveryPath));
       }
       const order = new Map(group.files.map((file, index) => [file.wireId, index]));
@@ -902,12 +926,13 @@ export class OwnerChannel implements OwnerChannelHandle {
           // the authenticated agent once so the wait is never silent.
           this.options.log(`[${this.options.role}] owner channel managed-agent relay has no owner `
             + `route yet; message stays queued: ${this.errorText(error)}`);
-          await this.nackManagedAgent(sender.id, message, wireId, ownerNotices.relayQueued());
+          await this.nackManagedAgent(
+            sender.id, message.wire_id ? wireId : undefined, wireId, ownerNotices.relayQueued());
           return false;
         } else {
           this.logError('managed-agent message relay refused', error);
-          await this.nackManagedAgent(
-            sender.id, message, wireId, ownerNotices.relayRefused(this.errorText(error)));
+          await this.nackManagedAgent(sender.id, message.wire_id ? wireId : undefined, wireId,
+            ownerNotices.relayRefused(this.errorText(error)));
         }
       }
       this.state.remember(wireId);
@@ -1165,7 +1190,9 @@ export class OwnerChannel implements OwnerChannelHandle {
   ): Promise<boolean> {
     const captionWire = group.caption ? this.wireId(group.caption) : undefined;
     const nackWire = captionWire ?? group.files[0].wireId;
-    const nackMessage = group.caption ?? { wire_id: nackWire };
+    // A caption whose own wire id is synthetic (msg_id only) must not be echoed
+    // back as a reply reference; a file wire always is a real one.
+    const nackReplyTo = (group.caption ? group.caption.wire_id : nackWire) ? nackWire : undefined;
     let requestDir: string | undefined;
     let recovery: PendingAttachmentRequest | undefined;
     try {
@@ -1200,14 +1227,13 @@ export class OwnerChannel implements OwnerChannelHandle {
       const unread = group.files.filter(file => file.status === 'unread');
       const processed = group.files.filter(file => file.status !== 'unread');
       const retrieved = unread.length
-        ? parseRetrievedAttachments(await this.client.callTool('get_files', {
-          wire_ids: unread.map(file => file.wireId),
-        }), unread)
+        ? parseRetrievedAttachments(
+          await this.client.getFiles(unread.map(file => file.wireId)), unread)
         : [];
       for (const file of processed) {
         if (!group.recovery) throw new Error('unexpected processed attachment without recovery route');
-        const recoveryPath = join(requestDir, `.recovered-${file.wireId}-${randomUUID()}`);
-        await this.client.callTool('save_file', { wire_id: file.wireId, dest_path: recoveryPath });
+        const recoveryPath = await writeRecoveredAttachment(
+          requestDir, file.wireId, await this.client.fetchFile(file.wireId));
         retrieved.push(await recoveredAttachment(file, recoveryPath));
       }
       const order = new Map(group.files.map((file, index) => [file.wireId, index]));
@@ -1222,9 +1248,9 @@ export class OwnerChannel implements OwnerChannelHandle {
       try {
         if (caption) await this.send(contact, caption, replyTo);
         for (const file of admitted) {
-          await this.client.callTool('send_file', {
+          await this.client.sendFile({
             contact, path: file.path, filename: file.filename,
-            ...(replyTo ? { reply_to_wire_id: replyTo } : {}),
+            ...(replyTo ? { replyToWireId: replyTo } : {}),
           });
         }
       } catch {
@@ -1249,12 +1275,12 @@ export class OwnerChannel implements OwnerChannelHandle {
       if (error instanceof RelayUnroutableError) {
         this.options.log(`[${this.options.role}] managed-agent attachment has no owner route; `
           + `transaction stays queued: ${this.errorText(error)}`);
-        await this.nackManagedAgent(agent, nackMessage, nackWire, ownerNotices.relayQueued());
+        await this.nackManagedAgent(agent, nackReplyTo, nackWire, ownerNotices.relayQueued());
         return false;
       }
       this.logError('managed-agent caption/file relay refused', error);
       await this.nackManagedAgent(
-        agent, nackMessage, nackWire, ownerNotices.relayRefused(this.errorText(error)));
+        agent, nackReplyTo, nackWire, ownerNotices.relayRefused(this.errorText(error)));
       // Rejection/admission failure and uncertain transport are terminal and
       // visible. Consuming every correlated wire prevents a later partial replay.
       for (const wire of handledWireIds) this.state.remember(wire);
@@ -1289,14 +1315,14 @@ export class OwnerChannel implements OwnerChannelHandle {
    * delivery is best-effort — it must never make the failure worse.
    */
   private async nackManagedAgent(
-    contact: string, message: InboundMessage, wireId: string, notice: string,
+    contact: string, replyTo: string | undefined, wireId: string, notice: string,
   ): Promise<void> {
     if (this.relayNacks.has(wireId)) return;
     this.relayNacks.add(wireId);
     if (this.relayNacks.size > RELAY_NACK_MEMORY)
       this.relayNacks.delete(this.relayNacks.values().next().value as string);
     try {
-      await this.send(contact, notice, message.wire_id ? wireId : undefined);
+      await this.send(contact, notice, replyTo);
     } catch (error) {
       this.logError('managed-agent relay NACK delivery failed', error);
     }
@@ -1624,9 +1650,9 @@ export class OwnerChannel implements OwnerChannelHandle {
     return createHash('sha256').update(wireId).digest('hex');
   }
 
-  private send(contact: string, text: string, replyTo?: string): Promise<unknown> {
-    return this.client.callTool('send_message', {
-      contact, text, ...(replyTo ? { reply_to_wire_id: replyTo } : {}),
+  private send(contact: string, text: string, replyTo?: string): Promise<void> {
+    return this.client.sendMessage({
+      contact, text, ...(replyTo ? { replyToWireId: replyTo } : {}),
     });
   }
 
@@ -1635,11 +1661,11 @@ export class OwnerChannel implements OwnerChannelHandle {
       .filter(entry => entry.isFile())
       .sort((a, b) => a.name.localeCompare(b.name));
     for (const entry of entries) {
-      await this.client.callTool('send_file', {
+      await this.client.sendFile({
         contact,
         path: join(outbox, entry.name),
         filename: entry.name,
-        reply_to_wire_id: replyTo,
+        replyToWireId: replyTo,
       });
     }
     await rm(outbox, { recursive: true, force: true });
@@ -1664,10 +1690,11 @@ export class OwnerChannel implements OwnerChannelHandle {
   }
 
   private sender(message: InboundMessage): { id: string; name: string } {
-    const source = message.from ?? message.sender;
-    if (typeof source === 'string') return { id: source, name: source };
-    const id = String(source?.id ?? message.sender_id ?? '');
-    return { id, name: String(source?.name ?? message.sender_name ?? id) };
+    // Authenticated routing data, straight from the daemon's typed envelope.
+    // The id still goes through the CID checks in acceptedSender/isEffectiveOwner.
+    const source = message.from as { id?: unknown; name?: unknown } | undefined;
+    const id = String(source?.id ?? '');
+    return { id, name: String(source?.name ?? id) };
   }
 
   private latestEventSeq(events: SessionEvent[]): number {
