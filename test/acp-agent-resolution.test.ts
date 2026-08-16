@@ -1,6 +1,6 @@
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 
 import { resolveBundledAcpAgent } from '../src/harness/acp-agent.js';
@@ -12,8 +12,10 @@ afterEach(() => {
 });
 
 function packageRoot(): string {
-  const root = mkdtempSync(join(tmpdir(), 'ours-acp-resolution-'));
-  roots.push(root);
+  const sandbox = mkdtempSync(join(tmpdir(), 'ours-acp-resolution-'));
+  roots.push(sandbox);
+  const root = join(sandbox, 'package');
+  mkdirSync(root);
   return root;
 }
 
@@ -39,6 +41,54 @@ describe('resolveBundledAcpAgent', () => {
 
   it('fails closed when the declared adapter entrypoint is absent', () => {
     const root = packageRoot();
+    writeFileSync(join(root, 'package.json'), JSON.stringify({
+      version: '1.1.7', bin: { 'codex-acp': 'dist/index.js' },
+    }));
+    expect(resolveBundledAcpAgent(root, 'codex-acp', 'codex-acp')).toEqual({
+      argv: ['codex-acp'], bundled: false,
+    });
+  });
+
+  it('fails closed when the declared adapter entrypoint traverses outside the package', () => {
+    const root = packageRoot();
+    writeFileSync(join(dirname(root), 'outside-agent.js'), '');
+    writeFileSync(join(root, 'package.json'), JSON.stringify({
+      version: '1.1.7', bin: { 'codex-acp': '../outside-agent.js' },
+    }));
+    expect(resolveBundledAcpAgent(root, 'codex-acp', 'codex-acp')).toEqual({
+      argv: ['codex-acp'], bundled: false,
+    });
+  });
+
+  it('fails closed when the declared adapter entrypoint is an absolute path outside the package', () => {
+    const root = packageRoot();
+    const outside = join(dirname(root), 'absolute-agent.js');
+    writeFileSync(outside, '');
+    writeFileSync(join(root, 'package.json'), JSON.stringify({
+      version: '1.1.7', bin: { 'codex-acp': outside },
+    }));
+    expect(resolveBundledAcpAgent(root, 'codex-acp', 'codex-acp')).toEqual({
+      argv: ['codex-acp'], bundled: false,
+    });
+  });
+
+  it('fails closed when the declared adapter entrypoint is a directory', () => {
+    const root = packageRoot();
+    mkdirSync(join(root, 'dist'));
+    writeFileSync(join(root, 'package.json'), JSON.stringify({
+      version: '1.1.7', bin: { 'codex-acp': 'dist' },
+    }));
+    expect(resolveBundledAcpAgent(root, 'codex-acp', 'codex-acp')).toEqual({
+      argv: ['codex-acp'], bundled: false,
+    });
+  });
+
+  it('fails closed when the declared adapter entrypoint is a symlink outside the package', () => {
+    const root = packageRoot();
+    const outside = join(dirname(root), 'symlinked-agent.js');
+    writeFileSync(outside, '');
+    mkdirSync(join(root, 'dist'));
+    symlinkSync(outside, join(root, 'dist', 'index.js'));
     writeFileSync(join(root, 'package.json'), JSON.stringify({
       version: '1.1.7', bin: { 'codex-acp': 'dist/index.js' },
     }));
