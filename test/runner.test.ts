@@ -11,7 +11,7 @@ import {
   runOnce, runTemp, runSupervised, buildPaneCommand, reserveLaunchSlot, readExitRecord,
   readRestartLedger, resetRestartLedger, backoffFor, loadTempRole, RESTART_FAIL_THRESHOLD,
   TEMP_IDENTITY_CLOSE_DEBOUNCE_MS, TEMP_IDENTITY_POLL_MS,
-  isRecoverableTempStartupCancellation,
+  isRecoverableTempStartupCancellation, managedFleetProxyEnv,
   type AttemptResult, type RunnerDeps,
 } from '../src/runner.js';
 import {
@@ -29,6 +29,7 @@ import {
   OwnerBinderConflictError, OwnerBinderHandoffTimeoutError,
 } from '../src/owner-channel/binder.js';
 import { prepareTempSupervisor } from '../src/temp-lifecycle.js';
+import type { ResolvedRole } from '../src/config.js';
 
 let dir: string;
 beforeEach(() => {
@@ -161,6 +162,31 @@ describe('buildPaneCommand', () => {
     expect(execFileSync('sh', ['-c', explicit], {
       env: { ...process.env, NO_COLOR: 'parent' }, encoding: 'utf8',
     })).toBe('1|legacy');
+  });
+
+  it('makes every supervised tmux harness a daemon client, never a daemon starter', () => {
+    const cmd = buildPaneCommand(
+      { argv: ['agent'], env: { OURS_AUTOSTART: '1' } },
+      { OURS_AUTOSTART: '1' }, '/tmp/es');
+    expect(cmd).toContain(`OURS_AUTOSTART='0'`);
+    expect(cmd).not.toContain(`OURS_AUTOSTART='1'`);
+  });
+});
+
+describe('managed fleet child environment', () => {
+  it('makes every supervised ACP harness a daemon client, never a daemon starter', () => {
+    const role = {
+      name: 'A', harness: 'fake', session: 'acp', identity: 'A', sourceFile: 'x',
+      permissions: { approval: 'ask', filesystem: 'workspace', unattended: 'deny' },
+      permissionsDeclared: false,
+      monitor: {
+        mode: 'fleet', enabled: true, wake_sources: [], batch_ms: 2_000,
+        inject: 'notification', interrupt: false, turn_fail_threshold: 3,
+      },
+      env: { OURS_AUTOSTART: '1' },
+    } satisfies ResolvedRole;
+    const env = managedFleetProxyEnv(role, '/state');
+    expect(env.OURS_AUTOSTART).toBe('0');
   });
 });
 
