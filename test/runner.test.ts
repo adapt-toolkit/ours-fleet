@@ -1382,6 +1382,40 @@ describe('restart-loop containment (3.2)', () => {
     expect(readRestartLedger(d).consecutiveImmediateFailures).toBe(2);
   });
 
+  it('does not let near-threshold failures reset an active restart streak', async () => {
+    const d = setup();
+    // FleetCoordinator's 2026-08-16 loop crossed the adapter's 20s immediate
+    // boundary by small amounts between faster deaths. Each crossing used to
+    // erase the durable count, so this sequence could repeat forever at 1/5 or
+    // 2/5 despite never sustaining a useful session.
+    const w = supervisorWorld(d, {
+      durations: [17.3, 19.5, 20.3, 40.7, 32.3],
+      stopAfter: RESTART_FAIL_THRESHOLD,
+    });
+
+    const ledger = await runSupervised('A', {}, w.deps, w.attempt);
+
+    expect(w.attempts).toHaveLength(RESTART_FAIL_THRESHOLD);
+    expect(ledger.circuit).toBe('open');
+    expect(ledger.consecutiveImmediateFailures).toBe(RESTART_FAIL_THRESHOLD);
+    expect(w.sleeps).toEqual([2_000, 4_000, 8_000, 16_000]);
+  });
+
+  it('closes an active streak after the full recovery window', async () => {
+    const d = setup();
+    // fake's 20s fast-fail threshold × five tolerated attempts = 100s.
+    const w = supervisorWorld(d, {
+      durations: [17, 100, 17], rotatesAt: [0], stopAfter: 3,
+    });
+
+    await runSupervised('A', {}, w.deps, w.attempt);
+
+    expect(readRestartLedger(d)).toMatchObject({
+      circuit: 'closed', consecutiveImmediateFailures: 1, resumeDiscarded: false,
+    });
+    expect(w.attempts.map(a => a.allowResumeRotation)).toEqual([true, false, true]);
+  });
+
   it('discards resume state at most once in a failure sequence', async () => {
     const d = setup();
     const w = supervisorWorld(d, { durations: [0.1], rotatesAt: [0] });

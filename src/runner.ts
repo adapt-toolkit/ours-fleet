@@ -1043,9 +1043,17 @@ export async function runSupervised(
       continue;
     }
     const fastFailSecs = fastFailSecsFor(name, opts.configPath);
-    const immediate = result.elapsedSecs < fastFailSecs;
+    // The fast-fail boundary starts a recovery episode; it must not also be
+    // the boundary that declares recovery successful. Otherwise alternating
+    // 19s and 20s deaths erase one another forever. Require the configured
+    // number of fast-fail windows to survive before closing an active streak.
+    // This hysteresis stays adapter-relative (100s for the current 20s/5-attempt
+    // policy) and still lets a genuinely sustained session reset the breaker.
+    const stableRecoverySecs = fastFailSecs * RESTART_FAIL_THRESHOLD;
+    const recoveryFailed = result.elapsedSecs < fastFailSecs
+      || (ledger.consecutiveImmediateFailures > 0 && result.elapsedSecs < stableRecoverySecs);
 
-    if (!immediate) {
+    if (!recoveryFailed) {
       // A session that ran for a while is not a restart loop, whatever ended it.
       writeRestartLedger(dir, {
         ...emptyLedger(),
