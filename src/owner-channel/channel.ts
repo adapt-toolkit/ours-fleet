@@ -351,11 +351,14 @@ export class OwnerChannel implements OwnerChannelHandle {
         ? ' with interruption'
         : event.monitor.interrupt === 'after_tool' ? ' with after-tool steering' : '';
       const monitor = `${event.monitor.mode} monitor${monitorPolicy}`;
+      const permission = event.permissionMode
+        ? `; permission ${event.permissionMode.fleetMode}, native ${event.permissionMode.nativeMode}`
+        : '';
       const inherited = event.inherited.length
         ? ` Supervisor inherited omitted defaults: ${event.inherited.join(', ')}.` : '';
       await this.sendProactiveMessage(
         `🧑‍💻 ${event.caller} spawned ${event.lifetime} agent ${event.role} `
-          + `(${event.harness}/${event.session}${model}; ${monitor}).${inherited}`,
+          + `(${event.harness}/${event.session}${model}; ${monitor}${permission}).${inherited}`,
         `fleet-spawn\0${event.creationActionId}`, 0);
     });
     this.managementTail = run.then(() => undefined, () => undefined);

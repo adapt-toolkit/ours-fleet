@@ -155,11 +155,14 @@ async function executeManagedSpawn(
     session: preview.session,
     ...(preview.model ? { model: preview.model } : {}),
     monitor: { mode: preview.monitor.mode, interrupt: preview.monitor.interrupt },
+    permissionMode: effectivePermissionMode(preview),
     inherited,
     creationActionId,
   };
   log(`[${caller.name}] managed fleet proxy spawned ${result.lifetime} role ${result.role} `
-    + `harness=${result.harness} session=${result.session}`);
+    + `harness=${result.harness} session=${result.session} `
+    + `permission=${result.permissionMode!.fleetMode} `
+    + `native=${result.permissionMode!.nativeMode}`);
   return result;
 }
 

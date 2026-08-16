@@ -399,10 +399,14 @@ permissions through its harness and check the result against a fixed floor:
 deny those requests with nobody to see it; with \`unattended: wait\` it warns,
 because a human can still attach and answer.
 
-Security meaning: \`ask\` maps to Codex \`untrusted\` and Claude \`default\`;
-\`auto\` maps to Codex \`on-request\` and Claude \`acceptEdits\`; and
-\`approval: allow\` maps to Codex \`never\` and Claude \`bypassPermissions\`,
-which genuinely permits the actions the role was authorized to take —
+Security meaning: \`ask\` maps to Codex \`untrusted\` and Claude \`default\`.
+\`auto\` selects Codex ACP \`agent\` (\`on-request\` + \`workspace-write\`) and
+Claude \`acceptEdits\`. \`approval: allow\` selects Codex ACP's fully
+non-interactive yolo mode, reported as \`agent-full-access\` (\`never\` +
+\`danger-full-access\`), and Claude \`bypassPermissions\`. Codex tmux retains
+independent approval and sandbox flags: \`auto\` is \`on-request\`, \`allow\`
+is \`never\`, and \`filesystem\` still selects the sandbox. These modes genuinely
+permit the actions the role was authorized to take —
 \`dontAsk\` only suppresses the prompt while still refusing the action. Nothing
 other than an explicit \`allow\` becomes non-interactive. Legacy \`deny\` keeps
 its conservative Codex \`on-request\` / Claude \`plan\` translation. \`allow\` is therefore a real grant and
@@ -413,12 +417,15 @@ ACP carries agent-advertised session mode IDs and \`session/set_mode\`, but thos
 IDs are agent-specific and ACP defines no portable permission-policy capability.
 Fleet therefore uses the ACP primitive where an adapter exposes a matching mode
 and otherwise performs the harness translation above. The bundled Codex ACP
-adapter couples approval and sandboxing in its advertised mode IDs, so fleet
-keeps the selected sandbox preset and enforces the independently translated
-approval policy on the app-server turn request. For example, \`allow\` plus
-\`workspace\` is really \`approval=never sandbox=workspace-write\`; it is never
-widened to \`danger-full-access\`. The live session reports both its effective
-normalized mode and the ACP sandbox-preset ID.
+adapter couples approval and sandboxing in its advertised mode IDs. Neutral
+\`allow\` therefore selects \`agent-full-access\` and widens \`filesystem:
+workspace\` or \`read-only\` to \`danger-full-access\`; neutral \`auto\` selects
+\`agent\` and \`workspace-write\` even when the neutral filesystem value differs.
+An explicit \`harness_options.sandbox\` selects its corresponding ACP preset and
+still wins, as does an explicit native approval override. \`config\` and
+\`doctor\` report a coupled-mode mismatch as approximate. Use per-role
+\`isolation:\` as the outer boundary for an \`allow\` ACP role. The live session
+reports both its effective normalized mode and the exact native mode selected.
 
 See also: \`spawn --approval/--filesystem/--unattended\` set this intent at
 creation, and \`ours-fleet config\` prints each role's neutral settings, their

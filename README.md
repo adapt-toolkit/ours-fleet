@@ -520,10 +520,13 @@ native settings actually grant, against a fixed floor:
 those requests with nobody to see it. With `unattended: wait` it **warns**,
 since a human can still attach a console and answer.
 
-**Security meaning.** `ask` maps to Codex `untrusted` / Claude `default`,
-`auto` to Codex `on-request` / Claude `acceptEdits`, and `allow` to Codex
-`never` / Claude `bypassPermissions`, the non-interactive modes that actually
-permit the actions the role was authorized to take.
+**Security meaning.** `ask` maps to Codex `untrusted` / Claude `default`.
+`auto` selects Codex ACP `agent` (`on-request` + `workspace-write`) / Claude
+`acceptEdits`. `allow` selects Codex ACP's fully non-interactive yolo mode,
+reported by the adapter as `agent-full-access` (`never` +
+`danger-full-access`); Claude uses `bypassPermissions`. For Codex tmux, where the
+approval and sandbox flags remain independent, `auto` is `on-request` and
+`allow` is `never` while `filesystem` still chooses the sandbox.
 `dontAsk` suppresses only the *prompt*, not the denial, which is why an
 `allow` role previously ran unable to do its job. Legacy `deny` is accepted
 only for compatibility and retains its conservative Codex `on-request` /
@@ -535,10 +538,14 @@ ACP exposes agent-specific session mode IDs and `session/set_mode`, but no
 portable permission-policy capability. Fleet uses that primitive where an
 adapter has a corresponding mode and otherwise translates at the adapter. The
 bundled Codex ACP adapter couples approval and sandboxing in its advertised
-mode IDs, so fleet preserves the selected sandbox preset and enforces approval
-independently on the app-server turn request. Thus `allow` + `workspace` is
-actually `never` + `workspace-write`, never `danger-full-access`. Live session
-metadata reports the normalized policy and the ACP sandbox-preset ID.
+mode IDs. Consequently, neutral `allow` selects `agent-full-access` and widens
+`filesystem: workspace` or `read-only` to `danger-full-access`; neutral `auto`
+selects `agent` and uses `workspace-write` even when the neutral filesystem
+value differs. An explicit `harness_options.sandbox` still wins and selects its
+corresponding ACP preset; explicit native approval overrides also win. Fleet
+reports a coupled-mode mismatch as approximate in `config`/`doctor`, and
+per-role `isolation:` remains the boundary for an `allow` ACP role. Live session
+metadata reports the normalized policy and the exact native mode selected.
 
 ### Isolation at creation time
 

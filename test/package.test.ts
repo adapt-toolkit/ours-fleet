@@ -7,7 +7,7 @@ import { describe, expect, it } from 'vitest';
 const CODEX_ACP_VERSION = '1.1.7';
 
 describe('packed root package', () => {
-  it('fresh-installs the gated codex-acp and reports the exact allow + workspace policy', () => {
+  it('fresh-installs the gated codex-acp and reports coupled allow full access', () => {
     const root = mkdtempSync(join(tmpdir(), 'ours-fleet-packed-'));
     const packDir = join(root, 'pack');
     const consumerDir = join(root, 'consumer');
@@ -88,15 +88,18 @@ describe('packed root package', () => {
       expect(result.version).toBe(CODEX_ACP_VERSION);
       expect(result.claim).toMatchObject({
         supported: true,
-        exact: true,
-        native: { mode: 'agent', approval: 'never', sandbox: 'workspace-write' },
+        exact: false,
+        native: {
+          mode: 'agent-full-access', approval: 'never', sandbox: 'danger-full-access',
+        },
       });
-      expect(result.claim.warnings).toEqual([]);
+      expect(result.claim.warnings.join('\n'))
+        .toContain("mode 'agent-full-access' couples approval and filesystem");
       expect(result.prepared).toEqual({
         codeXPathExists: true,
         approval: 'never',
-        sandbox: 'workspace-write',
-        initialAgentMode: 'agent',
+        sandbox: 'danger-full-access',
+        initialAgentMode: 'agent-full-access',
       });
     } finally {
       rmSync(root, { recursive: true, force: true });

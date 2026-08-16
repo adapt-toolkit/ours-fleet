@@ -28,13 +28,13 @@ describe('runtime metadata presentation', () => {
     expect(shown['Native mode']).toBe('Not reported');
   });
 
-  it('shows the effective policy separately from the ACP sandbox-preset id', () => {
+  it('shows the effective policy with the selected ACP native mode', () => {
     const shown = values({ role: { config: { permissions: { approval: 'allow' },
       nativeRuntime: { approval: 'never' } } }, status: { session: {
-      permissionMode: { fleetMode: 'allow', nativeMode: 'agent' },
+      permissionMode: { fleetMode: 'allow', nativeMode: 'agent-full-access' },
     } } });
     expect(shown.Permission).toBe('allow');
-    expect(shown['Native mode']).toBe('agent');
+    expect(shown['Native mode']).toBe('agent-full-access');
     expect(shown['Native mode']).not.toBe('never');
   });
 });
