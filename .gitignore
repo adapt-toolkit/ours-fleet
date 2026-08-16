@@ -1,5 +1,10 @@
 node_modules/
 dist/
+# ...but the divergent-install fixtures ARE the test data (see test/fixtures/installs).
+!test/fixtures/installs/*/dist/
+.e2e-bootstrap
+test-results/
+playwright-report/
 *.tgz
 docs/superpowers/
 .env

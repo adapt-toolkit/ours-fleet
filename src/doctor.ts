@@ -1,8 +1,10 @@
 import { userInfo } from 'node:os';
-import { readFileSync } from 'node:fs';
+import { existsSync, readFileSync } from 'node:fs';
 import { realExec, type Exec } from './exec.js';
-import { loadConfig, type ResolvedRole } from './config.js';
-import { getAdapter } from './harness/registry.js';
+import { isolationContextFor, loadConfig, type ResolvedRole } from './config.js';
+import type { ConfigDiagnostic, YamlMode } from './config-yaml.js';
+import { getAdapter, productionAdapters } from './harness/registry.js';
+import { analyzeFleetPermissions, formatNative } from './permissions.js';
 import { resolveBundledAcpAgent } from './harness/acp-agent.js';
 import { agentDir, home, deriveXdgRuntimeDir } from './paths.js';
 import { resolveIsolation } from './isolation/policy.js';
@@ -11,7 +13,12 @@ import {
   authResolutionHint, resolveEndpoint,
   type DaemonEndpoint, type FetchLike,
 } from './monitor.js';
+import { readScheduledLoops, storedLoopHealth } from './loops/state.js';
+import { controlSocketPath } from './session/control.js';
 import type { PrereqCheck, PrereqReport } from './harness/types.js';
+import {
+  analyzeInstalls, buildInfo, buildLabel, discoverInstalls, BIN_NAME,
+} from './provenance.js';
 
 /** Which cgroup-v2 controllers are delegated to this user manager (advisory). */
 function cgroupDelegationDetail(): string {
@@ -32,7 +39,7 @@ interface MonitorProfile {
 /** Resolve and deduplicate the effective daemon profiles used by monitored roles. */
 function resolveMonitorProfiles(roles: ResolvedRole[]): MonitorProfile[] {
   const profiles: MonitorProfile[] = [];
-  for (const role of roles.filter(r => r.monitor?.enabled)) {
+  for (const role of roles.filter(r => r.monitor?.mode === 'fleet')) {
     const endpoint = resolveEndpoint({ ...process.env, ...(role.env ?? {}) });
     const token = endpoint.headers['x-ours-api-token'];
     const existing = profiles.find(p =>
@@ -44,14 +51,61 @@ function resolveMonitorProfiles(roles: ResolvedRole[]): MonitorProfile[] {
   return profiles;
 }
 
+/**
+ * Which @ours.network/fleet artifacts this host has, and which one is talking.
+ *
+ * Fails only on an error-severity skew: two installs sharing a semver with
+ * different builds, or a runtime that is not what PATH resolves to. A lone
+ * pre-provenance install is reported but does not fail the report — an operator
+ * cannot act on it beyond upgrading, and it is the common case mid-rollout.
+ */
+function installChecks(scan?: { path?: string; argv1?: string }): PrereqCheck[] {
+  const installs = discoverInstalls(scan ?? {});
+  const running = installs.find(i => i.running);
+  const info = buildInfo();
+  const onPath = installs.filter(i => i.pathIndex !== undefined);
+  return [
+    {
+      name: 'install',
+      ok: true,
+      detail: [
+        running
+          ? `running ${buildLabel(running)} at ${running.packageRoot}`
+          : `running ${buildLabel({ version: info.version, build: info })} (install root not resolvable)`,
+        onPath.length
+          ? `on PATH: ${onPath.map(i => `${i.bin} -> ${buildLabel(i)}`).join(', ')}`
+          : `no ${BIN_NAME} on PATH`,
+      ].join('; '),
+    },
+    // One row per conflict rather than one long line: each is a separate thing
+    // to fix, and the report is read a line at a time.
+    ...analyzeInstalls(installs).map(s => ({
+      name: `install: ${s.kind}`,
+      ok: s.severity !== 'error',
+      detail: s.message,
+    })),
+  ];
+}
+
 /** Host-level + per-harness prerequisite report with actionable messages. */
 export async function doctor(
-  opts: { harness?: string; configPath?: string } = {},
+  opts: {
+    harness?: string;
+    configPath?: string;
+    yamlMode?: YamlMode;
+    /** Override PATH / running executable when scanning for installs (tests). */
+    installScan?: { path?: string; argv1?: string };
+  } = {},
   exec: Exec = realExec,
   platform: NodeJS.Platform = process.platform,
   fetchImpl: FetchLike = (u, i) => globalThis.fetch(u, i) as unknown as ReturnType<FetchLike>,
 ): Promise<PrereqReport> {
   const checks: PrereqCheck[] = [];
+
+  // First: which artifact is producing this report. Everything below is only as
+  // trustworthy as the answer, and a second install with the same semver and
+  // different behaviour is invisible to `--version`.
+  checks.push(...installChecks(opts.installScan));
 
   const major = Number(process.versions.node.split('.')[0]);
   checks.push({
@@ -59,7 +113,23 @@ export async function doctor(
     detail: major >= 20 ? `v${process.versions.node}` : `v${process.versions.node} — need >= 20`,
   });
 
-  const roles = loadConfigSafe(opts.configPath);
+  // The configuration is a checked prerequisite in its own right. A config the
+  // `config` command rejects must fail here too, with the same cause — while the
+  // host checks below still run, because they are what the operator needs next.
+  const loaded = loadConfigResult(opts.configPath, opts.yamlMode);
+  const roles = loaded.ok ? loaded.roles : [];
+  checks.push(loaded.ok
+    ? { name: 'config', ok: true, detail: loaded.files.join(' + ') || '(none — no fleet.yaml or fleet.d)' }
+    : { name: 'config', ok: false, detail: loaded.error });
+  checks.push(loaded.ok
+    ? { name: 'roles', ok: true, detail: `${roles.length} configured` }
+    : { name: 'roles', ok: false, detail: 'unknown — the configuration did not load' });
+  if (loaded.ok) for (const diagnostic of loaded.diagnostics) checks.push({
+    name: `yaml: ${diagnostic.kind}`,
+    ok: true,
+    detail: `warning: ${diagnostic.message}`,
+  });
+
   if (roles.length === 0 || roles.some(role => (role.session ?? 'tmux') === 'tmux')) {
     const tmux = await exec('tmux', ['-V']);
     checks.push({
@@ -103,6 +173,80 @@ export async function doctor(
     });
   }
 
+  // Per-role permission translation (2.3). Rendered from the same analysis the
+  // `config` command prints, so the two commands cannot disagree.
+  for (const analysis of analyzeFleetPermissions(roles)) {
+    if (!analysis.supported) {
+      checks.push({
+        name: `permissions: ${analysis.role}`, ok: false,
+        detail: analysis.warnings.join('; '),
+      });
+      continue;
+    }
+    const p = analysis.permissions;
+    const summary = `approval=${p.approval} filesystem=${p.filesystem} unattended=${p.unattended}`
+      + ` -> ${formatNative(analysis.native)}`;
+    checks.push({
+      name: `permissions: ${analysis.role}`, ok: true,
+      detail: analysis.warnings.length
+        ? `${summary} — ${analysis.warnings.join('; ')}`
+        : `${summary} (exact)`,
+    });
+
+    // A role that states its permission intent twice, in two disagreeing places
+    // (2.4). Quiet when there is a single source of intent.
+    for (const conflict of analysis.conflicts ?? [])
+      checks.push({
+        name: `permission conflict: ${analysis.role}`, ok: true, detail: conflict.warning,
+      });
+
+    // The floor is checked BEFORE start (2.1): an under-permissioned unattended
+    // role never reports its own failure, because the denial happens inside the
+    // harness with nobody attached to see it.
+    const floor = analysis.floor!;
+    checks.push({
+      name: `unattended floor: ${analysis.role}`,
+      ok: floor.meets || analysis.floorSeverity !== 'fail',
+      detail: floor.meets
+        ? `grants ${analysis.capabilities!.join(', ')}`
+        : `MISSING ${floor.missing.join(', ')} — with unattended=${p.unattended} these requests will `
+          + `${p.unattended === 'deny' ? 'be denied silently' : 'block the turn'}; `
+          + `grants only ${analysis.capabilities!.join(', ') || '(nothing)'}`,
+    });
+  }
+
+  for (const role of roles.filter(candidate => candidate.auth_proxy !== undefined)) {
+    const proxy = role.auth_proxy!;
+    const credentialKeys = Object.keys(role.env ?? {}).filter(key =>
+      /^(ANTHROPIC_API_KEY|ANTHROPIC_AUTH_TOKEN|AUTHORIZATION)$/i.test(key)
+      || /authorization/i.test(key));
+    checks.push({
+      name: `auth proxy secrets: ${role.name}`,
+      ok: credentialKeys.length === 0,
+      detail: credentialKeys.length
+        ? `proxy-enabled role also exposes credential env key(s): ${credentialKeys.join(', ')}`
+        : 'credential-free role environment',
+    });
+    let ok = false;
+    let detail: string;
+    try {
+      const response = await fetchImpl(proxy.health_url, {
+        signal: AbortSignal.timeout(2_000),
+      });
+      ok = response.ok;
+      detail = response.ok
+        ? `reachable (${proxy.health_url})`
+        : `HTTP ${response.status} from ${proxy.health_url}`;
+    } catch (e) {
+      detail = `unreachable (${proxy.health_url}): ${(e as Error).message}`;
+    }
+    checks.push({
+      name: `auth proxy: ${role.name}`,
+      ok: ok || !proxy.required,
+      detail: `${detail}${proxy.required ? ' [required]' : ' [optional]'}`,
+    });
+  }
+
   // Isolation reporting (AC-9). Backend availability is advisory — isolation is
   // opt-in per role (OQ-1), so a missing bwrap must not fail doctor for fleets that
   // don't use it. Only a role that DECLARES isolation and cannot get it under
@@ -117,13 +261,13 @@ export async function doctor(
   if (platform === 'linux')
     checks.push({ name: 'isolation: cgroup delegation', ok: true, detail: cgroupDelegationDetail() });
   for (const r of roles.filter(r => r.isolation)) {
-    const stateDir = agentDir(r.name);
-    const policy = resolveIsolation(r.isolation!, {
-      stateDir, runCwd: r.cwd ?? stateDir, home: home(), harness: r.harness,
-      additionalWriteDirs: r.harness === 'codex'
-        ? ((r.harness_options as { add_dirs?: string[] } | undefined)?.add_dirs ?? [])
-        : [],
-    });
+    // A refused mount is a launch-blocking policy error (5.2), not a warning.
+    let policy;
+    try { policy = resolveIsolation(r.isolation!, isolationContextFor(r)); }
+    catch (e) {
+      checks.push({ name: `isolation: ${r.name}`, ok: false, detail: (e as Error).message });
+      continue;
+    }
     const caps = [
       policy.resources.mem && `mem=${policy.resources.mem}`,
       policy.resources.cpu && `cpu=${policy.resources.cpu}`,
@@ -173,9 +317,58 @@ export async function doctor(
     checks.push({ name: checkName, ok, detail });
   }
 
+  // Scheduled loops fail silently by construction: the manager runs inside the
+  // role process, so when it stops there is nothing left to raise a hand. A
+  // checkpoint that has stopped advancing is the observable symptom, and it is
+  // the only one available when the reason it stopped is that writes fail.
+  for (const role of roles.filter(role => role.loops?.length)) {
+    const dir = agentDir(role.name);
+    const running = existsSync(controlSocketPath(dir));
+    const state = readScheduledLoops(dir);
+    const name = `loops: ${role.name}`;
+    if (!state) {
+      // No file at all is only innocent when nothing is running. A live role with
+      // loops writes its checkpoint before it schedules anything, so the absence
+      // means the very first write failed — the ENOSPC-at-startup case.
+      checks.push({
+        name, ok: !running,
+        detail: running
+          ? 'the role is running but has never written scheduled-loop state — its first checkpoint '
+            + 'failed (a full disk does this); if the role only just started, re-run doctor. '
+            + `Live state: ours-fleet loops status ${role.name}`
+          : 'no scheduled-loop state yet (role has not run)',
+      });
+      continue;
+    }
+    const verdict = storedLoopHealth(state, Date.now());
+    if (!running) {
+      checks.push({ name, ok: true, detail: `role not running; last recorded ${verdict.recorded}` });
+      continue;
+    }
+    checks.push({
+      name,
+      ok: !verdict.stale && verdict.recorded === 'healthy',
+      detail: verdict.stale
+        ? `state not updated for ${Math.round(verdict.ageMs / 1000)}s while the role is running — `
+          + `the loop manager is not checkpointing (last recorded ${verdict.recorded}); `
+          + `check the role log and free disk space, then: ours-fleet restart ${role.name}`
+        : verdict.recorded !== 'healthy'
+          ? `loop health ${verdict.recorded}${state.anomaly ? ` (${state.anomaly})` : ''} — `
+            + `inspect: ours-fleet loops status ${role.name}`
+          : verdict.scheduled
+            ? 'checkpoint current and healthy'
+            : 'healthy; no enabled loop to schedule, so the checkpoint stands still by design',
+    });
+  }
+
+  // A broken config resolves no roles and therefore no harnesses. Without a
+  // fallback the AI CLI prerequisites would simply vanish from the report at
+  // exactly the moment the operator is trying to work out what is wrong.
   const harnesses = opts.harness
     ? [opts.harness]
-    : [...new Set(roles.map(r => r.harness))];
+    : loaded.ok
+      ? [...new Set(roles.map(r => r.harness))]
+      : productionAdapters();
   for (const h of harnesses) {
     try {
       const rep = await getAdapter(h).checkPrereqs();
@@ -231,6 +424,21 @@ export async function doctor(
   return { ok: checks.every(c => c.ok), checks };
 }
 
-function loadConfigSafe(configPath?: string) {
-  try { return loadConfig(configPath).roles; } catch { return []; }
+/**
+ * Loading the configuration either works or fails for a stated reason. The old
+ * `loadConfigSafe()` swallowed the reason and returned `[]`, which is
+ * indistinguishable from a valid fleet with no roles — so doctor reported a
+ * clean bill of health for a configuration `ours-fleet config` refuses outright.
+ */
+type ConfigLoad =
+  | { ok: true; roles: ResolvedRole[]; files: string[]; diagnostics: ConfigDiagnostic[] }
+  | { ok: false; error: string };
+
+function loadConfigResult(configPath?: string, yamlMode?: YamlMode): ConfigLoad {
+  try {
+    const cfg = loadConfig(configPath, { yamlMode });
+    return { ok: true, roles: cfg.roles, files: cfg.files, diagnostics: cfg.diagnostics };
+  } catch (e) {
+    return { ok: false, error: e instanceof Error ? e.message : String(e) };
+  }
 }

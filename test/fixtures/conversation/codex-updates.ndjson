@@ -1,0 +1,14 @@
+{"sessionUpdate":"session_info_update","title":"codex session","updatedAt":"2026-08-02T10:00:00Z"}
+{"sessionUpdate":"available_commands_update","availableCommands":[{"name":"review","description":"Review the current diff"}]}
+{"sessionUpdate":"current_mode_update","currentModeId":"auto"}
+{"sessionUpdate":"config_option_update","configOptions":[{"id":"model","name":"Model","value":"gpt-5.2-codex"}]}
+{"sessionUpdate":"agent_thought_chunk","content":{"type":"text","text":"Considering the failing test first."}}
+{"sessionUpdate":"plan","entries":[{"content":"Reproduce the failure","priority":"high","status":"in_progress"},{"content":"Fix and re-run","priority":"medium","status":"pending"}]}
+{"sessionUpdate":"tool_call","toolCallId":"call_1","title":"npm test","kind":"execute","status":"in_progress","rawInput":{"command":["npm","test"],"cwd":"/workspace"},"_meta":{"codex":{"callType":"exec"}}}
+{"sessionUpdate":"tool_call_update","toolCallId":"call_1","status":"in_progress","content":[{"type":"terminal","terminalId":"term_1"}]}
+{"sessionUpdate":"tool_call_update","toolCallId":"call_1","status":"completed","rawOutput":{"exitCode":0,"durationMs":8123}}
+{"sessionUpdate":"tool_call","toolCallId":"call_2","title":"Edit src/index.ts","kind":"edit","status":"completed","locations":[{"path":"/workspace/src/index.ts","line":42}],"content":[{"type":"diff","path":"/workspace/src/index.ts","oldText":"return a;","newText":"return a + b;"}]}
+{"sessionUpdate":"tool_call","toolCallId":"call_3","title":"Search the web","kind":"fetch","status":"completed","rawOutput":{"results":3},"_meta":{"codex":{"callType":"web_search"}}}
+{"sessionUpdate":"tool_call","toolCallId":"call_4","title":"Delegate to subagent","kind":"other","status":"completed","_meta":{"codex":{"subagent":{"name":"reviewer"}}}}
+{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"The fix adds the missing operand."}}
+{"sessionUpdate":"usage_update","used":52000,"size":272000}

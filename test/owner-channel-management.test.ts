@@ -1,0 +1,1082 @@
+import { createHash } from 'node:crypto';
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { PassThrough } from 'node:stream';
+import { afterEach, describe, expect, it, vi } from 'vitest';
+
+import { errBoundElsewhere } from '@ours.network/sdk/client';
+
+import { OwnerChannel } from '../src/owner-channel/channel.js';
+import type {
+  OursContactsView, OursInboundMessage, OursOps,
+} from '../src/owner-channel/ours-client.js';
+import { OWNER_TASK_MAX_PER_OWNER, OWNER_TASK_TTL_MS } from '../src/owner-channel/tasks.js';
+import type { SessionHandle } from '../src/session/types.js';
+
+const OWNER = 'A'.repeat(64);
+const CONTACT = 'B'.repeat(64);
+const AGENT = 'D'.repeat(64);
+const INTRUDER = 'E'.repeat(64);
+const dirs: string[] = [];
+
+class ManagementClient implements OursOps {
+  calls: Array<{ name: string; args?: Record<string, unknown> }> = [];
+  batches: unknown[][] = [];
+  /**
+   * Established contacts and pending introductions are separate daemon
+   * collections, and neither carries a bio or any other free text.
+   */
+  view: OursContactsView = {
+    contacts: [{ name: 'Phone', container_id: CONTACT }],
+    pending: [{ name: 'Pending', container_id: 'C'.repeat(64), queued: 1 }],
+    roots: {}, degraded: [], renames: {},
+  };
+  failSendTo = new Set<string>();
+  /** How many binds must fail, and with which error. */
+  bindFailures = 0;
+  bindError: () => Error = () => errBoundElsewhere('Coordinator-owner');
+  async start() {}
+  async close() {}
+  async bindIdentity(name: string) {
+    this.calls.push({ name: 'bindIdentity', args: { name } });
+    if (this.bindFailures-- > 0) throw this.bindError();
+  }
+  async listContacts() {
+    this.calls.push({ name: 'listContacts', args: undefined });
+    return this.view;
+  }
+  async generateInvite(name?: string) {
+    this.calls.push({ name: 'generateInvite', args: { name } });
+    return { blob: 'mock-invite-blob', inviteId: 'invite-1', mode: 'one_time' as const };
+  }
+  async addContact(a: { invite: string; name?: string }) {
+    this.calls.push({ name: 'addContact', args: { ...a } });
+    return { display: a.name ?? 'Phone', cid: CONTACT };
+  }
+  async getMessages() {
+    this.calls.push({ name: 'getMessages', args: undefined });
+    const messages = (this.batches.shift() ?? []) as OursInboundMessage[];
+    return { count: messages.length, messages };
+  }
+  async deferMessages(msgIds: number[]) {
+    this.calls.push({ name: 'deferMessages', args: { msgIds } });
+  }
+  async listIncomingFiles() {
+    this.calls.push({ name: 'listIncomingFiles', args: undefined });
+    return [];
+  }
+  async getFiles(wireIds: string[]) {
+    this.calls.push({ name: 'getFiles', args: { wireIds } });
+    return { files: [], text: '', mode: 'selected' as const, requested: wireIds };
+  }
+  async fetchFile(wireId: string) {
+    this.calls.push({ name: 'fetchFile', args: { wireId } });
+    return new Uint8Array();
+  }
+  async sendMessage(a: { contact: string; text: string; replyToWireId?: string }) {
+    this.calls.push({ name: 'sendMessage', args: { ...a } });
+    if (this.failSendTo.has(a.contact)) throw new Error('sendMessage failed');
+  }
+  async sendFile(a: { contact: string; path: string; filename: string; replyToWireId?: string }) {
+    this.calls.push({ name: 'sendFile', args: { ...a } });
+  }
+}
+
+function setup(options: { agent?: string; owners?: string[] } = {}) {
+  const dir = mkdtempSync(join(tmpdir(), 'ours-owner-management-'));
+  dirs.push(dir);
+  const client = new ManagementClient();
+  const logs: string[] = [];
+  const queuePrompt = vi.fn(async () => ({
+    promptId: 'managed-prompt', queuedBehind: 0,
+    completion: Promise.resolve({
+      accepted: true, outcome: 'completed' as const, succeeded: true, output: 'done',
+    }),
+  }));
+  const session = {
+    backend: 'acp', pid: 1, isAlive: () => true,
+    snapshot: () => ({ backend: 'acp', alive: true, readiness: 'running' }),
+    queuePrompt, interrupt: vi.fn(), eventsSince: () => [],
+  } as unknown as SessionHandle;
+  const channel = new OwnerChannel({
+    role: 'Role', harness: 'claude-code', config: {
+      identity: 'Role-owner', owners: options.owners ?? [OWNER],
+      interrupt: false, progress_interval_ms: 0,
+      ...(options.agent ? { agent: options.agent } : {}),
+    }, session, stateDir: dir, client, log: line => logs.push(line),
+    watch: () => {
+      const stdout = new PassThrough();
+      const stderr = new PassThrough();
+      return {
+        pid: 1, exitCode: null, stdout, stderr,
+        once: (_event: string, callback: () => void) => { callback(); },
+        kill: () => { stdout.end(); stderr.end(); return true; },
+      } as never;
+    },
+  });
+  return { channel, client, queuePrompt, logs, dir };
+}
+
+afterEach(() => {
+  for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true });
+});
+
+describe('OwnerChannel live management', () => {
+  it('reconnects the direct watch from its durable cursor without duplicating an owner turn', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'ours-owner-watch-'));
+    dirs.push(dir);
+    writeFileSync(join(dir, '.owner-channel-watch.json'), JSON.stringify({
+      version: 1, cursor: 41, reconnects: 0, consecutiveFailures: 0,
+      reason: 'OWNER_WATCH_CONNECTED', updatedAt: new Date(0).toISOString(),
+    }) + '\n');
+    const client = new ManagementClient();
+    const secretBody = 'OWNER_BODY_MUST_NOT_ENTER_WATCH_STATE';
+    client.batches.push([{
+      msg_id: 90, wire_id: 'watch-continuity-wire', from: { id: OWNER }, text: secretBody,
+    }], []);
+    const queuePrompt = vi.fn(async () => ({
+      promptId: 'watch-prompt', queuedBehind: 0,
+      completion: Promise.resolve({
+        accepted: true, outcome: 'completed' as const, succeeded: true, output: 'done',
+      }),
+    }));
+    const session = {
+      backend: 'acp', pid: 1, isAlive: () => true,
+      snapshot: () => ({ backend: 'acp', alive: true, readiness: 'idle' }),
+      queuePrompt, interrupt: vi.fn(), eventsSince: () => [],
+    } as unknown as SessionHandle;
+    const urls: string[] = [];
+    let attempt = 0;
+    const watchFetch = vi.fn(async (url: string, init?: { signal?: AbortSignal }) => {
+      urls.push(url);
+      if (attempt++ === 0) throw new Error('simulated two-hour socket abort');
+      if (attempt === 2) return {
+        status: 200, ok: true,
+        json: async () => ({ cursor: 42, events: [{ event: 'message_received', msg_id: 90 }] }),
+      };
+      return new Promise<never>((_resolve, reject) => {
+        init?.signal?.addEventListener('abort', () => reject(new Error('closed')), { once: true });
+      });
+    });
+    const delays: number[] = [];
+    const logs: string[] = [];
+    const channel = new OwnerChannel({
+      role: 'Role', harness: 'claude-code',
+      config: { identity: 'Role-owner', owners: [OWNER], interrupt: false, progress_interval_ms: 0 },
+      session, stateDir: dir, client, watchFetch, log: line => logs.push(line),
+      binderDeps: { now: () => 1_000, sleep: async ms => { delays.push(ms); } },
+    });
+
+    await channel.start();
+    await vi.waitFor(() => expect(queuePrompt).toHaveBeenCalledOnce());
+    await vi.waitFor(() => expect(JSON.parse(readFileSync(
+      join(dir, '.owner-channel-watch.json'), 'utf8')).cursor).toBe(42));
+    await channel.close();
+
+    expect(urls.slice(0, 2).every(url => url.endsWith('?since=41'))).toBe(true);
+    expect(delays[0]).toBe(1_000);
+    expect(logs.some(line => line.includes('reason=OWNER_WATCH_STREAM_ERROR'))).toBe(true);
+    const state = readFileSync(join(dir, '.owner-channel-watch.json'), 'utf8');
+    expect(state).toContain('"reconnects":1');
+    expect(state).not.toContain(secretBody);
+    expect(queuePrompt.mock.calls[0][0]).toContain(secretBody);
+  });
+
+  /**
+   * One direct-watch harness for the D11 reliability cases: a caller-supplied
+   * fetch script, a deterministic sleep, and no real timers.
+   */
+  function watchSetup(
+    fetchImpl: (url: string, init?: { signal?: AbortSignal }) => Promise<unknown>,
+    options: { watchState?: string; batches?: unknown[][]; watchStallMs?: number } = {},
+  ) {
+    const dir = mkdtempSync(join(tmpdir(), 'ours-owner-watch-'));
+    dirs.push(dir);
+    if (options.watchState !== undefined)
+      writeFileSync(join(dir, '.owner-channel-watch.json'), options.watchState);
+    const client = new ManagementClient();
+    for (const batch of options.batches ?? []) client.batches.push(batch);
+    const queuePrompt = vi.fn(async () => ({
+      promptId: 'watch-prompt', queuedBehind: 0,
+      completion: Promise.resolve({
+        accepted: true, outcome: 'completed' as const, succeeded: true, output: 'done',
+      }),
+    }));
+    const session = {
+      backend: 'acp', pid: 1, isAlive: () => true,
+      snapshot: () => ({ backend: 'acp', alive: true, readiness: 'idle' }),
+      queuePrompt, interrupt: vi.fn(), eventsSince: () => [],
+    } as unknown as SessionHandle;
+    const delays: number[] = [];
+    const logs: string[] = [];
+    const channel = new OwnerChannel({
+      role: 'Role', harness: 'claude-code',
+      config: { identity: 'Role-owner', owners: [OWNER], interrupt: false, progress_interval_ms: 0 },
+      session, stateDir: dir, client, watchFetch: fetchImpl as never,
+      log: line => logs.push(line),
+      ...(options.watchStallMs !== undefined ? { watchStallMs: options.watchStallMs } : {}),
+      binderDeps: { now: () => 1_000, sleep: async ms => { delays.push(ms); } },
+    });
+    const readState = () => JSON.parse(
+      readFileSync(join(dir, '.owner-channel-watch.json'), 'utf8')) as Record<string, unknown>;
+    return { channel, client, queuePrompt, logs, delays, dir, readState };
+  }
+
+  it('reports OWNER_WATCH_CURSOR_RECOVERED and drains the inbox after an unreadable cursor', async () => {
+    let attempt = 0;
+    const watch = watchSetup(async (_url, init) => {
+      if (attempt++ === 0) return { status: 200, ok: true, json: async () => ({ cursor: 7, events: [] }) };
+      return new Promise<never>((_resolve, reject) => {
+        init?.signal?.addEventListener('abort', () => reject(new Error('closed')), { once: true });
+      });
+    }, {
+      watchState: '{"version":1,"cursor":"corrupted-not-a-number"}\n',
+      batches: [[{
+        msg_id: 61, wire_id: 'recovered-cursor-wire', from: { id: OWNER }, text: 'still in the inbox',
+      }], []],
+    });
+
+    await watch.channel.start();
+    await vi.waitFor(() => expect(watch.readState().reason).toBe('OWNER_WATCH_CURSOR_RECOVERED'));
+    await watch.channel.close();
+
+    // The lost cursor is only safe to replace with the tip because the inbox —
+    // the authority — was drained first; the owner's pending message still ran.
+    expect(watch.queuePrompt).toHaveBeenCalledOnce();
+    expect(watch.queuePrompt.mock.calls[0][0]).toContain('still in the inbox');
+    expect(watch.logs.some(line =>
+      line.includes('reason=OWNER_WATCH_CURSOR_RECOVERED invalid cursor state'))).toBe(true);
+    expect(watch.readState()).toMatchObject({ cursor: 7, consecutiveFailures: 0 });
+  });
+
+  it('never reports a recovered cursor when a valid durable cursor was restored', async () => {
+    let attempt = 0;
+    const watch = watchSetup(async (_url, init) => {
+      if (attempt++ === 0) return { status: 200, ok: true, json: async () => ({ cursor: 12, events: [] }) };
+      return new Promise<never>((_resolve, reject) => {
+        init?.signal?.addEventListener('abort', () => reject(new Error('closed')), { once: true });
+      });
+    }, {
+      watchState: JSON.stringify({
+        version: 1, cursor: 11, reconnects: 0, consecutiveFailures: 0,
+        reason: 'OWNER_WATCH_CONNECTED', updatedAt: new Date(0).toISOString(),
+      }) + '\n',
+    });
+
+    await watch.channel.start();
+    await vi.waitFor(() => expect(watch.readState().cursor).toBe(12));
+    await watch.channel.close();
+
+    expect(watch.readState().reason).toBe('OWNER_WATCH_CONNECTED');
+  });
+
+  it('lets a later stall write state and count failures after an earlier auth rejection', async () => {
+    let attempt = 0;
+    const watch = watchSetup(async (_url, init) => {
+      if (attempt++ === 0) return { status: 401, ok: false, json: async () => ({}) };
+      // Never answers: the stall bound must abort it and be recorded, even
+      // though the previous attempt left OWNER_WATCH_AUTH_FAILED on disk.
+      return new Promise<never>((_resolve, reject) => {
+        init?.signal?.addEventListener('abort', () => reject(new Error('aborted')), { once: true });
+      });
+    }, {
+      watchState: JSON.stringify({
+        version: 1, cursor: 5, reconnects: 0, consecutiveFailures: 0,
+        reason: 'OWNER_WATCH_CONNECTED', updatedAt: new Date(0).toISOString(),
+      }) + '\n',
+      watchStallMs: 20,
+    });
+
+    await watch.channel.start();
+    await vi.waitFor(() => expect(watch.readState().reason).toBe('OWNER_WATCH_STALLED'));
+    const stalled = watch.readState();
+    await watch.channel.close();
+
+    // The write happened at all, and the counter kept moving past the auth
+    // rejection instead of being frozen at 1 by the sticky reason.
+    expect(stalled).toMatchObject({ reason: 'OWNER_WATCH_STALLED', cursor: 5 });
+    expect(stalled.consecutiveFailures as number).toBeGreaterThanOrEqual(2);
+    expect(watch.logs.some(line => line.includes('reason=OWNER_WATCH_AUTH_FAILED'))).toBe(true);
+    expect(watch.logs.some(line => line.includes('reason=OWNER_WATCH_STALLED'))).toBe(true);
+  });
+
+  it('stops a permanently rejected watch as fatal instead of retrying forever', async () => {
+    let attempts = 0;
+    const watch = watchSetup(async () => {
+      attempts++;
+      return { status: 401, ok: false, json: async () => ({}) };
+    }, {
+      watchState: JSON.stringify({
+        version: 1, cursor: 3, reconnects: 0, consecutiveFailures: 0,
+        reason: 'OWNER_WATCH_CONNECTED', updatedAt: new Date(0).toISOString(),
+      }) + '\n',
+    });
+
+    await watch.channel.start();
+    await vi.waitFor(() => expect(watch.readState().reason).toBe('OWNER_WATCH_AUTH_FATAL'));
+    const settled = attempts;
+    // A stopped loop stays stopped: no further attempt arrives after the bound.
+    await new Promise(resolve => setTimeout(resolve, 20));
+    await watch.channel.close();
+
+    expect(attempts).toBe(5);
+    expect(settled).toBe(5);
+    expect(watch.readState()).toMatchObject({ cursor: 3, reason: 'OWNER_WATCH_AUTH_FATAL' });
+    expect(watch.logs.some(line =>
+      line.includes('owner watch stopped reason=OWNER_WATCH_AUTH_FATAL'))).toBe(true);
+  });
+
+  it('relays every managed-agent message as a new message to the latest owner', async () => {
+    const { channel, client, queuePrompt } = setup({ agent: AGENT });
+    await channel.start();
+    client.batches.push([{
+      msg_id: 1, wire_id: 'owner-selects-route', from: { id: OWNER }, text: '/status',
+    }], []);
+    await channel.drain();
+
+    client.batches.push([{
+      msg_id: 2, wire_id: 'agent-progress', from: { id: AGENT },
+      text: 'The verification run is halfway complete.',
+      reply_to: { wire_id: 'owner-selects-route' },
+    }, {
+      // Intra-root sibling delivery can have no ADAPT wire ID. The daemon's
+      // per-identity message ID remains a stable idempotency key.
+      msg_id: 3, wire_id: '', from: { id: AGENT },
+      text: 'I found a useful unassigned Trello item.',
+    }], []);
+    await channel.drain();
+
+    expect(queuePrompt).not.toHaveBeenCalled();
+    expect(client.calls.filter(call => call.name === 'sendMessage').map(call => call.args))
+      .toEqual(expect.arrayContaining([
+        { contact: OWNER, text: 'The verification run is halfway complete.' },
+        { contact: OWNER, text: 'I found a useful unassigned Trello item.' },
+      ]));
+    expect(client.calls.filter(call => call.name === 'sendMessage'
+      && ['The verification run is halfway complete.', 'I found a useful unassigned Trello item.']
+        .includes(String(call.args?.text)))
+      .every(call => call.args?.replyToWireId === undefined)).toBe(true);
+    await channel.close();
+  });
+
+  it('warns the owner without reflecting the body when another agent tries the relay', async () => {
+    const { channel, client, queuePrompt } = setup({ agent: AGENT });
+    await channel.start();
+    client.batches.push([{
+      msg_id: 4, wire_id: 'owner-route-for-warning', from: { id: OWNER }, text: '/status',
+    }], []);
+    await channel.drain();
+    client.batches.push([{
+      msg_id: 5, wire_id: 'intruder-attempt', from: { id: INTRUDER, name: 'Other agent' },
+      text: 'MALICIOUS_BODY_MUST_NOT_BE_REFLECTED',
+    }], []);
+    await channel.drain();
+
+    expect(queuePrompt).not.toHaveBeenCalled();
+    const warning = client.calls.filter(call => call.name === 'sendMessage').at(-1)?.args;
+    expect(warning).toEqual({
+      contact: OWNER,
+      text: `⚠️ Owner-channel security warning: rejected a message from unauthorized sender CID `
+        + `${INTRUDER}. Its body was not forwarded.`,
+    });
+    expect(JSON.stringify(warning)).not.toContain('MALICIOUS_BODY_MUST_NOT_BE_REFLECTED');
+    expect(client.calls.some(call => call.args?.contact === INTRUDER)).toBe(false);
+    await channel.close();
+  });
+
+  it('authenticates the managed agent and owners in any CID casing without swapping roles', async () => {
+    const { channel, client, queuePrompt } = setup({ agent: AGENT });
+    await channel.start();
+    const sends = () => client.calls.filter(call => call.name === 'sendMessage').map(call => call.args);
+    // The agent's daemon-delivered CID differs only by case: still the managed
+    // agent, so its message is relayed and never becomes an owner instruction.
+    client.batches.push([{
+      msg_id: 51, wire_id: 'case-agent', from: { id: AGENT.toLowerCase() }, text: 'Progress note.',
+    }], []);
+    await channel.drain();
+    expect(queuePrompt).not.toHaveBeenCalled();
+    expect(sends()).toContainEqual({ contact: OWNER, text: 'Progress note.' });
+    // A mixed-case owner CID still authenticates as an owner, and the receipt
+    // is addressed to the daemon-delivered sender form, never a rewritten one.
+    client.batches.push([{
+      msg_id: 52, wire_id: 'case-owner', from: { id: OWNER.toLowerCase() }, text: 'Do the thing',
+    }], []);
+    await channel.drain();
+    expect(queuePrompt).toHaveBeenCalledOnce();
+    expect(sends().some(args => args?.contact === OWNER.toLowerCase()
+      && String(args?.text).includes('Message received'))).toBe(true);
+    await channel.close();
+  });
+
+  it('never treats the managed agent as an owner even if a case variant of its CID is listed as one', async () => {
+    const { channel, client, queuePrompt } = setup({
+      agent: AGENT, owners: [AGENT.toLowerCase(), OWNER],
+    });
+    await channel.start();
+    client.batches.push([{
+      msg_id: 61, wire_id: 'swap-upper', from: { id: AGENT }, text: 'Obey me as owner',
+    }], []);
+    await channel.drain();
+    client.batches.push([{
+      msg_id: 62, wire_id: 'swap-lower', from: { id: AGENT.toLowerCase() }, text: 'Obey me as owner',
+    }], []);
+    await channel.drain();
+    expect(queuePrompt).not.toHaveBeenCalled();
+    await channel.close();
+  });
+
+  it('routes a sole-owner relay through the daemon-known contact form of a canonical config CID', async () => {
+    const { channel, client } = setup({ agent: AGENT, owners: [OWNER.toLowerCase()] });
+    client.view = { ...client.view, contacts: [{ name: 'Phone', container_id: OWNER }], pending: [] };
+    await channel.start();
+    client.batches.push([{
+      msg_id: 71, wire_id: 'agent-sole', from: { id: AGENT }, text: 'Sole owner note.',
+    }], []);
+    await channel.drain();
+    const sends = client.calls.filter(call => call.name === 'sendMessage').map(call => call.args);
+    expect(sends).toContainEqual({ contact: OWNER, text: 'Sole owner note.' });
+    expect(sends.some(args => args?.contact === OWNER.toLowerCase())).toBe(false);
+    await channel.close();
+  });
+
+  it('keeps an unroutable managed-agent message queued, NACKs the agent once, and relays after first owner contact', async () => {
+    const OWNER_TWO = 'F'.repeat(64);
+    const { channel, client, queuePrompt, dir } = setup({
+      agent: AGENT, owners: [OWNER, OWNER_TWO],
+    });
+    await channel.start();
+    const sends = () => client.calls.filter(call => call.name === 'sendMessage').map(call => call.args);
+    const agentMessage = {
+      msg_id: 31, wire_id: 'agent-unroutable', from: { id: AGENT },
+      text: 'Escalation: need owner input.',
+    };
+    // A non-advancing drain consumes exactly one batch, so no trailing empty
+    // batch is queued for the unroutable passes.
+    client.batches.push([agentMessage]);
+    await channel.drain();
+
+    // No owner route exists yet, so nothing may be delivered or guessed…
+    expect(sends().filter(args => args?.contact === OWNER || args?.contact === OWNER_TWO))
+      .toEqual([]);
+    // …but the loss is not silent: the authenticated agent gets exactly one
+    // bounded NACK correlated to its wire.
+    expect(sends().filter(args => args?.contact === AGENT)).toEqual([{
+      contact: AGENT, text: expect.stringContaining('queued'),
+      replyToWireId: 'agent-unroutable',
+    }]);
+    // The wire stays deferred and unconsumed for replay.
+    expect(client.calls).toContainEqual({ name: 'deferMessages', args: { msgIds: [31] } });
+    const statePath = join(dir, '.owner-channel-state.json');
+    if (existsSync(statePath))
+      expect(readFileSync(statePath, 'utf8')).not.toContain('agent-unroutable');
+
+    // A replayed copy neither NACKs again nor delivers anywhere.
+    client.batches.push([agentMessage]);
+    await channel.drain();
+    expect(sends().filter(args => args?.contact === AGENT)).toHaveLength(1);
+    expect(sends().filter(args => args?.contact === OWNER || args?.contact === OWNER_TWO))
+      .toEqual([]);
+
+    // The first authenticated owner contact establishes the route; the replay
+    // then relays exactly once.
+    client.batches.push([
+      { msg_id: 32, wire_id: 'owner-first-contact', from: { id: OWNER_TWO }, text: '/status' },
+      agentMessage,
+    ], []);
+    await channel.drain();
+    expect(sends().filter(args => args?.contact === OWNER_TWO
+      && args?.text === 'Escalation: need owner input.')).toHaveLength(1);
+
+    // Now consumed: another replay cannot double-deliver.
+    client.batches.push([agentMessage]);
+    await channel.drain();
+    expect(sends().filter(args => args?.text === 'Escalation: need owner input.')).toHaveLength(1);
+    expect(queuePrompt).not.toHaveBeenCalled();
+    await channel.close();
+  });
+
+  it('NACKs and consumes a managed-agent message the relay policy refuses', async () => {
+    const { channel, client } = setup({ agent: AGENT });
+    await channel.start();
+    const bad = { msg_id: 41, wire_id: 'agent-bad', from: { id: AGENT }, text: 'bad\u0000byte' };
+    client.batches.push([bad], []);
+    await channel.drain();
+    const sends = () => client.calls.filter(call => call.name === 'sendMessage').map(call => call.args);
+    expect(sends()).toEqual([{
+      contact: AGENT, text: expect.stringContaining('was not relayed to an owner'),
+      replyToWireId: 'agent-bad',
+    }]);
+    // Permanently consumed: a replay is inert.
+    client.batches.push([bad], []);
+    await channel.drain();
+    expect(sends()).toHaveLength(1);
+    await channel.close();
+  });
+
+  it('NACKs the agent when relay delivery is uncertain and never blind-retries', async () => {
+    const { channel, client } = setup({ agent: AGENT });
+    await channel.start();
+    client.failSendTo.add(OWNER);
+    const report = { msg_id: 42, wire_id: 'agent-uncertain', from: { id: AGENT }, text: 'Report.' };
+    client.batches.push([report], []);
+    await channel.drain();
+    const sends = () => client.calls.filter(call => call.name === 'sendMessage').map(call => call.args);
+    expect(sends().filter(args => args?.contact === AGENT)).toEqual([{
+      contact: AGENT, text: expect.stringContaining('uncertain'),
+      replyToWireId: 'agent-uncertain',
+    }]);
+    expect(sends().filter(args => args?.contact === OWNER)).toHaveLength(1);
+    // The uncertain outcome is terminal: a replayed copy never re-sends.
+    client.batches.push([report], []);
+    await channel.drain();
+    expect(sends().filter(args => args?.contact === OWNER)).toHaveLength(1);
+    await channel.close();
+  });
+
+  it('deterministically reports a successful supervisor-proxied spawn to the owner', async () => {
+    const { channel, client } = setup({ agent: AGENT });
+    await channel.start();
+    client.batches.push([{
+      msg_id: 6, wire_id: 'owner-route-for-spawn', from: { id: OWNER }, text: '/status',
+    }], []);
+    await channel.drain();
+    await channel.notifyFleetSpawn({
+      caller: 'Coordinator', role: 'DeveloperX', lifetime: 'temporary',
+      statePath: '/private/state', harness: 'codex', session: 'acp', model: 'gpt-test',
+      monitor: { mode: 'fleet', interrupt: true },
+      inherited: ['harness', 'session', 'model'], creationActionId: 'spawn-action-1',
+    });
+
+    const notice = client.calls.filter(call => call.name === 'sendMessage').at(-1)?.args;
+    expect(notice?.contact).toBe(OWNER);
+    expect(notice?.replyToWireId).toBeUndefined();
+    expect(notice?.text).toContain('Coordinator spawned temporary agent DeveloperX');
+    expect(notice?.text).toContain('codex/acp, model gpt-test');
+    expect(notice?.text).toContain('fleet monitor with interruption');
+    expect(notice?.text).not.toContain('/private/state');
+    await channel.close();
+  });
+
+  it('disables control-socket message and authority bypasses in managed-agent mode', async () => {
+    const { channel, client } = setup({ agent: AGENT });
+    await channel.start();
+    await expect(channel.manage({
+      action: 'request_update', requestId: 'a'.repeat(64), phase: 'working', message: 'bypass',
+    })).rejects.toThrow(/managed agent must message its owner-channel identity/);
+    await expect(channel.manage({ action: 'owner_authorize', cid: CONTACT }))
+      .rejects.toThrow(/edit fleet configuration instead/);
+    expect(client.calls.filter(call => call.name === 'sendMessage')).toEqual([]);
+    await channel.close();
+  });
+
+  // ours-mcp answered generate_invite with "One-time invite for X created
+  // (invite_id …). Share this blob out-of-band …:\n<blob>" and no
+  // structuredContent, so the transport returned that sentence and the whole
+  // sentence was handed out as the invite. Rewording the daemon's prose changed
+  // the payload; the blob field cannot.
+  it('hands out the invite blob alone, never a sentence containing it', async () => {
+    const { channel, client } = setup();
+    await channel.start();
+    client.generateInvite = async name => {
+      client.calls.push({ name: 'generateInvite', args: { name } });
+      return {
+        blob: 'BLOB-ONLY-PAYLOAD',
+        inviteId: 'invite-9',
+        mode: 'one_time' as const,
+      };
+    };
+    const invite = await channel.manage({ action: 'contact_invite', name: 'Mobile' });
+    if (invite.action !== 'contact_invite') throw new Error('bad test response');
+    expect(invite.invite).toBe('BLOB-ONLY-PAYLOAD');
+    expect(invite.invite).not.toMatch(/invite_id|Share this blob|out-of-band/);
+    await channel.close();
+  });
+
+  // list_contacts was prose too, so the JSON parse failed and the channel saw
+  // an empty list: contact_list was always empty and owner_authorize could
+  // never accept any CID. Both are structural now.
+  it('lists and authorizes an established contact from the typed daemon view', async () => {
+    const { channel, client } = setup();
+    await channel.start();
+    client.view = {
+      contacts: [{ name: 'Phone', container_id: CONTACT }],
+      pending: [{ name: 'Laptop', container_id: 'C'.repeat(64), queued: 2 }],
+      roots: { [CONTACT]: { root_cid: 'D'.repeat(64), root_name: 'Human', role_id: 'r1' } },
+      degraded: [], renames: {},
+    };
+    const listed = await channel.manage({ action: 'contact_list' });
+    if (listed.action !== 'contact_list') throw new Error('bad test response');
+    expect(listed.contacts).toEqual([
+      {
+        cid: CONTACT, name: 'Phone', status: 'established',
+        human: { cid: 'D'.repeat(64), name: 'Human' },
+      },
+      { cid: 'C'.repeat(64), name: 'Laptop', status: 'pending' },
+    ]);
+
+    const authorized = await channel.manage({ action: 'owner_authorize', cid: CONTACT });
+    if (authorized.action !== 'owner_authorize') throw new Error('bad test response');
+    expect(authorized.owner.cid).toBe(CONTACT);
+    // A pending introduction is still not an owner.
+    await expect(channel.manage({ action: 'owner_authorize', cid: 'C'.repeat(64) }))
+      .rejects.toThrow(/unknown or pending contact/);
+    await channel.close();
+  });
+
+  // The handoff window used to open for any error whose text matched
+  // /currently bound to another live session/i, so a relayed or wrapped message
+  // carrying that wording could hold startup for the whole timeout.
+  it('extends the bind handoff only for the daemon\'s own typed conflict code', async () => {
+    const { channel, client, dir } = setup();
+    writeFileSync(join(dir, '.owner-channel-binder.json'), JSON.stringify({
+      version: 1, role: 'Role', identity: 'Role-owner', releasedAt: Date.now(),
+    }));
+    client.bindFailures = 1;
+    client.bindError = () =>
+      new Error('relayed: identity is currently bound to another live session');
+    await expect(channel.start())
+      .rejects.toThrow(/relayed: identity is currently bound to another live session/);
+    expect(client.calls.filter(call => call.name === 'bindIdentity')).toHaveLength(1);
+  });
+
+  it('uses the already-bound client and never chooses or force-binds again', async () => {
+    const { channel, client } = setup();
+    await channel.start();
+    const listed = await channel.manage({ action: 'contact_list' });
+    expect(listed.action).toBe('contact_list');
+    if (listed.action !== 'contact_list') throw new Error('bad test response');
+    expect(listed.contacts[0]).toMatchObject({ cid: CONTACT, name: 'Phone', status: 'established' });
+    expect(listed.contacts[0]).not.toHaveProperty('bio');
+    expect(listed.contacts.map(contact => contact.status)).toEqual(['established', 'pending']);
+    const invite = await channel.manage({ action: 'contact_invite', name: 'Mobile' });
+    expect(invite).toEqual({ action: 'contact_invite', invite: 'mock-invite-blob' });
+    expect(client.calls.filter(call => call.name === 'bindIdentity')).toEqual([
+      { name: 'bindIdentity', args: { name: 'Role-owner' } },
+    ]);
+    expect(client.calls.some(call => call.args?.force !== undefined)).toBe(false);
+    await channel.close();
+  });
+
+  it('retries a daemon lease only after evidence of its own released predecessor', async () => {
+    const { channel, client, dir } = setup();
+    writeFileSync(join(dir, '.owner-channel-binder.json'), JSON.stringify({
+      version: 1, role: 'Role', identity: 'Role-owner', releasedAt: Date.now(),
+    }));
+    client.bindFailures = 2;
+    await channel.start();
+    expect(client.calls.filter(call => call.name === 'bindIdentity')).toEqual([
+      { name: 'bindIdentity', args: { name: 'Role-owner' } },
+      { name: 'bindIdentity', args: { name: 'Role-owner' } },
+      { name: 'bindIdentity', args: { name: 'Role-owner' } },
+    ]);
+    expect(client.calls.some(call => call.args?.force !== undefined)).toBe(false);
+    await channel.close();
+  });
+
+  it('does not retry or force-bind a live daemon holder without owned-handoff evidence', async () => {
+    const { channel, client, dir } = setup();
+    client.bindFailures = 100;
+    await expect(channel.start()).rejects.toThrow(/currently bound to another live session/);
+    expect(client.calls.filter(call => call.name === 'bindIdentity')).toHaveLength(1);
+    expect(client.calls.some(call => call.args?.force !== undefined)).toBe(false);
+    expect(existsSync(join(dir, '.owner-channel-binder.lock'))).toBe(false);
+  });
+
+  it('delivers one fixed startup recovery notice over a safe owner route without persisting plaintext', async () => {
+    const { channel, client, dir } = setup();
+    await channel.start();
+    expect(await channel.manage({ action: 'startup_failure' }))
+      .toEqual({ action: 'startup_failure', status: 'delivered' });
+    expect(await channel.manage({ action: 'startup_failure' }))
+      .toEqual({ action: 'startup_failure', status: 'duplicate' });
+    const notices = client.calls.filter(call => call.name === 'sendMessage'
+      && String(call.args?.text).includes('could not take over'));
+    expect(notices).toEqual([{ name: 'sendMessage', args: {
+      contact: OWNER,
+      text: `⚠️ Role owner channel could not take over 'Role-owner' from its previous supervisor. `
+        + `Recovery: send /restart to retry the supervised handoff; if this repeats, inspect the web `
+        + `console or run ours-fleet logs Role.`,
+    } }]);
+    const state = readFileSync(join(dir, '.owner-channel-conversations.json'), 'utf8');
+    expect(state).not.toContain('could not take over');
+    expect(state).not.toContain('Recovery:');
+    await channel.close();
+  });
+
+  it('keeps startup recovery local when no deterministic owner route exists', async () => {
+    const { channel, client } = setup({ owners: [OWNER, 'F'.repeat(64)] });
+    await channel.start();
+    await expect(channel.manage({ action: 'startup_failure' }))
+      .rejects.toThrow(/no authenticated owner conversation route/);
+    expect(client.calls.filter(call => call.name === 'sendMessage')).toEqual([]);
+    await channel.close();
+  });
+
+  it('never blind-retries an uncertain startup recovery delivery', async () => {
+    const { channel, client, dir } = setup();
+    await channel.start();
+    client.failSendTo.add(OWNER);
+    await expect(channel.manage({ action: 'startup_failure' }))
+      .rejects.toThrow(/delivery outcome is uncertain/);
+    expect(await channel.manage({ action: 'startup_failure' }))
+      .toEqual({ action: 'startup_failure', status: 'duplicate' });
+    expect(client.calls.filter(call => call.name === 'sendMessage'
+      && String(call.args?.text).includes('could not take over'))).toHaveLength(1);
+    expect(readFileSync(join(dir, '.owner-channel-conversations.json'), 'utf8'))
+      .not.toContain('could not take over');
+    await channel.close();
+  });
+
+  it('keeps contact establishment separate from authorization and checks the established CID canonically', async () => {
+    const { channel, client } = setup();
+    await channel.start();
+    expect(await channel.manage({ action: 'contact_add', invite: 'fixture', name: 'Phone' }))
+      .toMatchObject({ action: 'contact_add', status: 'pending' });
+    expect((await channel.manage({ action: 'owner_list' })).action).toBe('owner_list');
+    await expect(channel.manage({ action: 'owner_authorize', cid: 'C'.repeat(64) }))
+      .rejects.toThrow(/unknown or pending/);
+    // Hex case is not identity: a case variant authorizes the SAME established
+    // contact, and a repeat in any casing is the same owner, not a second slot.
+    expect(await channel.manage({ action: 'owner_authorize', cid: CONTACT.toLowerCase() }))
+      .toMatchObject({ owner: { cid: CONTACT.toLowerCase(), source: 'dynamic', effective: true } });
+    await expect(channel.manage({ action: 'owner_authorize', cid: CONTACT }))
+      .rejects.toThrow(/already authorized/);
+    expect(client.calls.find(call => call.name === 'addContact')?.args)
+      .toEqual({ invite: 'fixture', name: 'Phone' });
+    await channel.close();
+  });
+
+  it('rejects management deterministically before start and during shutdown', async () => {
+    const { channel } = setup();
+    await expect(channel.manage({ action: 'owner_list' })).rejects.toThrow(/unavailable/);
+    await channel.start();
+    await channel.close();
+    await expect(channel.manage({ action: 'contact_list' })).rejects.toThrow(/unavailable/);
+  });
+
+  it('does not reflect invite material when the daemon rejects acceptance', async () => {
+    const { channel, client } = setup();
+    await channel.start();
+    client.addContact = async () => { throw new Error('daemon echoed TOP_SECRET_INVITE'); };
+    await expect(channel.manage({ action: 'contact_add', invite: 'TOP_SECRET_INVITE' }))
+      .rejects.toThrow('the ours daemon could not accept the contact invite');
+    await expect(channel.manage({ action: 'contact_add', invite: 'TOP_SECRET_INVITE' }))
+      .rejects.not.toThrow(/TOP_SECRET_INVITE/);
+    await channel.close();
+  });
+
+  it('serializes concurrent mutations and applies the resulting owner set immediately to routing', async () => {
+    const { channel, client, queuePrompt } = setup();
+    await channel.start();
+    await Promise.all([
+      channel.manage({ action: 'owner_authorize', cid: CONTACT }),
+      channel.manage({ action: 'owner_revoke', cid: OWNER }),
+    ]);
+    const owners = await channel.manage({ action: 'owner_list' });
+    expect(owners).toMatchObject({ owners: [
+      { cid: OWNER, effective: false }, { cid: CONTACT, effective: true },
+    ] });
+    client.batches.push([{
+      msg_id: 4, wire_id: 'dynamic-owner-wire', from: { id: CONTACT, name: 'Mobile' }, text: 'go',
+    }], []);
+    await channel.drain();
+    await new Promise<void>(resolve => setImmediate(resolve));
+    expect(queuePrompt).toHaveBeenCalledOnce();
+    await channel.close();
+  });
+
+  it('routes multiple authored updates to the originating sender in receipt/update/final order', async () => {
+    vi.spyOn(Date, 'now').mockReturnValue(1_000);
+    const { channel, client, queuePrompt, logs, dir } = setup();
+    let finish!: (result: { accepted: true; outcome: 'completed'; succeeded: true; output: string }) => void;
+    queuePrompt.mockResolvedValueOnce({
+      promptId: 'long-turn', queuedBehind: 0,
+      completion: new Promise(resolve => { finish = resolve; }),
+    });
+    await channel.start();
+    const wireId = 'wire-authored-progress';
+    const requestId = createHash('sha256').update(wireId).digest('hex');
+    client.batches.push([{
+      msg_id: 10, wire_id: wireId, from: { id: OWNER, name: 'Owner' }, text: 'Long task',
+    }], []);
+    await channel.drain();
+
+    expect(queuePrompt.mock.calls[0][0]).toContain(requestId);
+    expect(await channel.manage({
+      action: 'request_update', requestId, phase: 'working',
+      message: 'The implementation is complete and focused verification is running.',
+    })).toMatchObject({ action: 'request_update', requestId, sequence: 1 });
+    vi.mocked(Date.now).mockReturnValue(7_000);
+    expect(await channel.manage({
+      action: 'request_update', requestId, phase: 'approval',
+      message: 'Approval is needed before the dependency download can continue.',
+    })).toMatchObject({ sequence: 2 });
+
+    finish({ accepted: true, outcome: 'completed', succeeded: true, output: 'Final answer' });
+    await vi.waitFor(() => expect(client.calls.filter(call => call.name === 'sendMessage')
+      .map(call => call.args?.text)).toEqual([
+      'ℹ️ Message received. The agent has started working on this request now. '
+        + 'The response will arrive in this channel when ready.',
+      '🔄 Update: The implementation is complete and focused verification is running.',
+      '🔐 Approval needed: Approval is needed before the dependency download can continue.',
+      'Final answer',
+    ]));
+    expect(client.calls.filter(call => call.name === 'sendMessage')
+      .every(call => call.args?.contact === OWNER && call.args?.replyToWireId === wireId)).toBe(true);
+    expect(logs.join('\n')).not.toMatch(/implementation is complete|dependency download/);
+    const state = readFileSync(join(dir, '.owner-channel-state.json'), 'utf8');
+    expect(state).toContain(wireId);
+    expect(state).not.toMatch(/implementation is complete|dependency download|Final answer/);
+    await expect(channel.manage({
+      action: 'request_update', requestId, phase: 'working', message: 'This update is too late.',
+    })).rejects.toThrow(/not active|finalizing/);
+    await channel.close();
+  });
+
+  it('dedupes, rate-limits, bounds, and rejects unsafe authored updates without sending them', async () => {
+    vi.spyOn(Date, 'now').mockReturnValue(10_000);
+    const { channel, client, queuePrompt } = setup();
+    queuePrompt.mockResolvedValueOnce({
+      promptId: 'pending', queuedBehind: 0, completion: new Promise(() => {}),
+    });
+    await channel.start();
+    const wireId = 'wire-update-validation';
+    const requestId = createHash('sha256').update(wireId).digest('hex');
+    client.batches.push([{
+      msg_id: 11, wire_id: wireId, from: { id: OWNER }, text: 'Keep me posted',
+    }], []);
+    await channel.drain();
+    const first = {
+      action: 'request_update' as const, requestId, phase: 'working' as const,
+      message: 'Focused tests are running.',
+    };
+    await channel.manage(first);
+    await expect(channel.manage(first)).rejects.toThrow(/duplicate/);
+    await expect(channel.manage({ ...first, message: 'The build is running.' }))
+      .rejects.toThrow(/rate-limited/);
+    vi.mocked(Date.now).mockReturnValue(16_000);
+    for (const message of ['', 'x'.repeat(281), 'password=TOP_SECRET',
+      'private reasoning: I think this will work', 'stdout: raw tool response', 'line one\nline two']) {
+      await expect(channel.manage({ ...first, message })).rejects.toThrow();
+    }
+    await expect(channel.manage({ ...first, requestId: 'bad' })).rejects.toThrow(/64 lowercase/);
+    expect(client.calls.filter(call => call.name === 'sendMessage')).toHaveLength(2);
+    await channel.close();
+  });
+
+  it('isolates authored updates between concurrent authenticated senders', async () => {
+    vi.spyOn(Date, 'now').mockReturnValue(20_000);
+    const { channel, client, queuePrompt } = setup();
+    await channel.start();
+    await channel.manage({ action: 'owner_authorize', cid: CONTACT });
+    queuePrompt.mockImplementation(async () => ({
+      promptId: `pending-${queuePrompt.mock.calls.length}`, queuedBehind: 0,
+      completion: new Promise(() => {}),
+    }));
+    const wires = ['wire-owner-a', 'wire-owner-b'];
+    client.batches.push([
+      { msg_id: 12, wire_id: wires[0], from: { id: OWNER }, text: 'A' },
+      { msg_id: 13, wire_id: wires[1], from: { id: CONTACT }, text: 'B' },
+    ], []);
+    await channel.drain();
+    const requestIds = wires.map(wire => createHash('sha256').update(wire).digest('hex'));
+    await channel.manage({ action: 'request_update', requestId: requestIds[0],
+      phase: 'working', message: 'First request remains in progress.' });
+    await channel.manage({ action: 'request_update', requestId: requestIds[1],
+      phase: 'blocked', message: 'Second request is waiting for an external dependency.' });
+    const updates = client.calls.filter(call => call.name === 'sendMessage'
+      && String(call.args?.text).match(/^(?:🔄|🚧)/));
+    expect(updates.map(call => [call.args?.contact, call.args?.replyToWireId])).toEqual([
+      [OWNER, wires[0]], [CONTACT, wires[1]],
+    ]);
+    await channel.close();
+  });
+
+  it('opens only during the exact active request and routes a later report to that origin', async () => {
+    const { channel, client, queuePrompt } = setup();
+    const completed = (output: string) => ({
+      accepted: true as const, outcome: 'completed' as const, succeeded: true, output,
+    });
+    let finishA!: (result: ReturnType<typeof completed>) => void;
+    let finishB!: (result: ReturnType<typeof completed>) => void;
+    queuePrompt
+      .mockResolvedValueOnce({ promptId: 'owner-a', queuedBehind: 0,
+        completion: new Promise(resolve => { finishA = resolve; }) })
+      .mockResolvedValueOnce({ promptId: 'owner-b', queuedBehind: 1,
+        completion: new Promise(resolve => { finishB = resolve; }) });
+    await channel.start();
+    await channel.manage({ action: 'owner_authorize', cid: CONTACT });
+    const wireA = 'task-wire-owner-a';
+    const wireB = 'task-wire-owner-b';
+    client.batches.push([
+      { msg_id: 30, wire_id: wireA, from: { id: OWNER }, text: 'Delegate A' },
+      { msg_id: 31, wire_id: wireB, from: { id: CONTACT }, text: 'Delegate B' },
+    ], []);
+    await channel.drain();
+    const requestA = createHash('sha256').update(wireA).digest('hex');
+    const requestB = createHash('sha256').update(wireB).digest('hex');
+    const openedA = await channel.manage({ action: 'task_open', requestId: requestA });
+    const openedB = await channel.manage({ action: 'task_open', requestId: requestB });
+    if (openedA.action !== 'task_open' || openedB.action !== 'task_open') throw new Error('bad task result');
+    await expect(channel.manage({ action: 'task_report', taskId: openedA.taskId,
+      phase: 'progress', message: 'This is too early.' })).rejects.toThrow(/only after.*finalized/);
+
+    finishA(completed('Original final A'));
+    finishB(completed('Original final B'));
+    await vi.waitFor(() => expect(client.calls.filter(call => call.name === 'sendMessage'
+      && String(call.args?.text).startsWith('Original final'))).toHaveLength(2));
+    await channel.manage({ action: 'task_report', taskId: openedB.taskId,
+      phase: 'done', message: 'The second specialist finished.' });
+    await channel.manage({ action: 'task_report', taskId: openedA.taskId,
+      phase: 'blocked', message: 'The first specialist needs an external dependency.' });
+    const reports = client.calls.filter(call => call.name === 'sendMessage'
+      && String(call.args?.text).includes('Follow-up'));
+    expect(reports.map(call => call.args)).toEqual([
+      { contact: CONTACT, replyToWireId: wireB,
+        text: '✅ Follow-up complete: The second specialist finished.' },
+      { contact: OWNER, replyToWireId: wireA,
+        text: '🚧 Follow-up blocked: The first specialist needs an external dependency.' },
+    ]);
+    await channel.close();
+  });
+
+  it('persists the route across restart without persisting bodies and closes terminal tasks', async () => {
+    const { channel, client, queuePrompt, dir } = setup();
+    let finish!: (result: { accepted: true; outcome: 'completed'; succeeded: true; output: string }) => void;
+    queuePrompt.mockResolvedValueOnce({ promptId: 'restart-task', queuedBehind: 0,
+      completion: new Promise(resolve => { finish = resolve; }) });
+    await channel.start();
+    const wire = 'restart-task-wire';
+    const requestId = createHash('sha256').update(wire).digest('hex');
+    client.batches.push([{ msg_id: 32, wire_id: wire, from: { id: OWNER }, text: 'Delegate' }], []);
+    await channel.drain();
+    const opened = await channel.manage({ action: 'task_open', requestId });
+    if (opened.action !== 'task_open') throw new Error('bad task result');
+    finish({ accepted: true, outcome: 'completed', succeeded: true, output: 'Original final' });
+    await vi.waitFor(() => expect(client.calls.some(call => call.args?.text === 'Original final')).toBe(true));
+    await channel.close();
+
+    const restartedClient = new ManagementClient();
+    const restarted = new OwnerChannel({
+      role: 'Role', harness: 'claude-code', config: { identity: 'Role-owner', owners: [OWNER], interrupt: false,
+        progress_interval_ms: 0 },
+      session: { backend: 'acp', pid: 2, isAlive: () => true,
+        snapshot: () => ({ backend: 'acp', alive: true, readiness: 'idle' }),
+        queuePrompt: vi.fn(), interrupt: vi.fn(), eventsSince: () => [] } as unknown as SessionHandle,
+      stateDir: dir, client: restartedClient, log: () => undefined,
+      watch: () => ({ pid: 2, exitCode: null, stdout: new PassThrough(), stderr: new PassThrough(),
+        once: (_event: string, callback: () => void) => { callback(); }, kill: () => true }) as never,
+    });
+    await restarted.start();
+    await restarted.manage({ action: 'task_report', taskId: opened.taskId,
+      phase: 'done', message: 'Restarted supervisor delivered the verified result.' });
+    expect(restartedClient.calls).toContainEqual({ name: 'sendMessage', args: {
+      contact: OWNER, replyToWireId: wire,
+      text: '✅ Follow-up complete: Restarted supervisor delivered the verified result.',
+    } });
+    const state = readFileSync(join(dir, '.owner-channel-tasks.json'), 'utf8');
+    expect(state).not.toContain('Restarted supervisor delivered');
+    expect(state).not.toContain('Original final');
+    await expect(restarted.manage({ action: 'task_report', taskId: opened.taskId,
+      phase: 'done', message: 'Do not deliver twice.' })).rejects.toThrow(/closed/);
+    await restarted.close();
+  });
+
+  it('revocation and expiry invalidate persisted task routes', async () => {
+    vi.spyOn(Date, 'now').mockReturnValue(100_000);
+    const { channel, client, queuePrompt } = setup();
+    let finish!: (result: { accepted: true; outcome: 'completed'; succeeded: true; output: string }) => void;
+    queuePrompt.mockResolvedValue({ promptId: 'task-policy', queuedBehind: 0,
+      completion: new Promise(resolve => { finish = resolve; }) });
+    await channel.start();
+    await channel.manage({ action: 'owner_authorize', cid: CONTACT });
+    const wire = 'revoked-task-wire';
+    const requestId = createHash('sha256').update(wire).digest('hex');
+    client.batches.push([{ msg_id: 33, wire_id: wire, from: { id: OWNER }, text: 'Delegate' }], []);
+    await channel.drain();
+    const revoked = await channel.manage({ action: 'task_open', requestId });
+    if (revoked.action !== 'task_open') throw new Error('bad task result');
+    finish({ accepted: true, outcome: 'completed', succeeded: true, output: 'Final' });
+    await vi.waitFor(() => expect(client.calls.some(call => call.args?.text === 'Final')).toBe(true));
+    await channel.manage({ action: 'owner_revoke', cid: OWNER });
+    await expect(channel.manage({ action: 'task_report', taskId: revoked.taskId,
+      phase: 'done', message: 'Must not route after revoke.' })).rejects.toThrow(/revoked/);
+
+    // A different authorized owner can open a task which then expires.
+    let finish2!: (result: { accepted: true; outcome: 'completed'; succeeded: true; output: string }) => void;
+    queuePrompt.mockResolvedValueOnce({ promptId: 'task-expiry', queuedBehind: 0,
+      completion: new Promise(resolve => { finish2 = resolve; }) });
+    const expiryWire = 'expired-task-wire';
+    const expiryRequest = createHash('sha256').update(expiryWire).digest('hex');
+    client.batches.push([{ msg_id: 34, wire_id: expiryWire,
+      from: { id: CONTACT }, text: 'Delegate later' }], []);
+    await channel.drain();
+    const expired = await channel.manage({ action: 'task_open', requestId: expiryRequest });
+    if (expired.action !== 'task_open') throw new Error('bad task result');
+    finish2({ accepted: true, outcome: 'completed', succeeded: true, output: 'Final 2' });
+    await vi.waitFor(() => expect(client.calls.some(call => call.args?.text === 'Final 2')).toBe(true));
+    vi.mocked(Date.now).mockReturnValue(100_000 + OWNER_TASK_TTL_MS + 1);
+    await expect(channel.manage({ action: 'task_report', taskId: expired.taskId,
+      phase: 'done', message: 'Must not route after expiry.' })).rejects.toThrow(/expired/);
+    await channel.close();
+  });
+
+  it('fails closed on duplicate, unsafe, over-cap, and uncertain reports', async () => {
+    vi.spyOn(Date, 'now').mockReturnValue(200_000);
+    const { channel, client, queuePrompt } = setup();
+    let finish!: (result: { accepted: true; outcome: 'completed'; succeeded: true; output: string }) => void;
+    queuePrompt.mockResolvedValue({ promptId: 'task-limits', queuedBehind: 0,
+      completion: new Promise(resolve => { finish = resolve; }) });
+    await channel.start();
+    const wire = 'task-limits-wire';
+    const requestId = createHash('sha256').update(wire).digest('hex');
+    client.batches.push([{ msg_id: 35, wire_id: wire, from: { id: OWNER }, text: 'Delegate' }], []);
+    await channel.drain();
+    const opened = [];
+    for (let i = 0; i < OWNER_TASK_MAX_PER_OWNER; i++) {
+      const result = await channel.manage({ action: 'task_open', requestId });
+      if (result.action === 'task_open') opened.push(result.taskId);
+    }
+    await expect(channel.manage({ action: 'task_open', requestId })).rejects.toThrow(/open tasks per role/);
+    finish({ accepted: true, outcome: 'completed', succeeded: true, output: 'Original final' });
+    await vi.waitFor(() => expect(client.calls.some(call => call.args?.text === 'Original final')).toBe(true));
+    await expect(channel.manage({ action: 'task_report', taskId: opened[0], phase: 'progress',
+      message: 'password=TOP_SECRET' })).rejects.toThrow(/unsafe/);
+    await expect(channel.manage({ action: 'task_report', taskId: opened[0], phase: 'progress',
+      message: 'First sentence. Second sentence.' })).rejects.toThrow(/one plain-text sentence/);
+    await channel.manage({ action: 'task_report', taskId: opened[0], phase: 'progress',
+      message: 'Specialist tests are running.' });
+    vi.mocked(Date.now).mockReturnValue(206_000);
+    await expect(channel.manage({ action: 'task_report', taskId: opened[0], phase: 'progress',
+      message: 'Specialist tests are running.' })).rejects.toThrow(/duplicate/);
+
+    const raced = await Promise.allSettled([
+      channel.manage({ action: 'task_report', taskId: opened[2], phase: 'progress',
+        message: 'The first concurrent report won.' }),
+      channel.manage({ action: 'task_report', taskId: opened[2], phase: 'progress',
+        message: 'The second concurrent report lost.' }),
+    ]);
+    expect(raced.filter(result => result.status === 'fulfilled')).toHaveLength(1);
+    expect(raced.filter(result => result.status === 'rejected')).toHaveLength(1);
+
+    const originalSend = client.sendMessage.bind(client);
+    let attempted = 0;
+    client.sendMessage = async a => {
+      if (a.text.includes('Follow-up complete')) {
+        attempted++;
+        throw new Error('ambiguous transport failure with secret details');
+      }
+      return originalSend(a);
+    };
+    await expect(channel.manage({ action: 'task_report', taskId: opened[1], phase: 'done',
+      message: 'Specialist completed the assigned review.' })).rejects.toThrow(/outcome is uncertain/);
+    vi.mocked(Date.now).mockReturnValue(212_000);
+    await expect(channel.manage({ action: 'task_report', taskId: opened[1], phase: 'done',
+      message: 'Specialist completed the assigned review.' })).rejects.toThrow(/outcome is uncertain/);
+    expect(attempted).toBe(1);
+    await expect(channel.manage({ action: 'task_report', taskId: 'f'.repeat(64), phase: 'done',
+      message: 'Unknown tasks fail closed.' })).rejects.toThrow(/unknown/);
+    await channel.close();
+  });
+});

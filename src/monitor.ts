@@ -1,7 +1,8 @@
 import { existsSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
-import type { MonitorConfig, NotifyEventType } from './config.js';
+import type { MonitorConfig, MonitorInterrupt, NotifyEventType } from './config.js';
+import { classifyFailureText, type FailureEvidence } from './model-recovery.js';
 
 // ─── The supervisor-owned message monitor (DESIGN-external-monitor §1, §3, §4) ──
 //
@@ -25,7 +26,11 @@ export interface NotifyEvent {
 export interface FetchResponse {
   status: number;
   ok: boolean;
-  json(): Promise<{ cursor?: number; events?: NotifyEvent[] }>;
+  json(): Promise<{
+    cursor?: number;
+    events?: NotifyEvent[];
+    identities?: Array<string | { name?: unknown; temporary?: unknown; stale?: unknown }>;
+  }>;
 }
 export type FetchLike = (
   url: string, init?: { headers?: Record<string, string>; signal?: AbortSignal },
@@ -50,15 +55,33 @@ export interface MonitorDeps {
     set(fn: () => void, ms: number): ReturnType<typeof setTimeout>;
     clear(t: ReturnType<typeof setTimeout>): void;
   };
-  /** Structured prompt delivery used by ACP sessions. Tmux remains the fallback. */
+  /**
+   * Structured prompt delivery used by ACP sessions. Tmux remains the fallback.
+   * `succeeded` is the turn's TERMINAL result, not merely that the session took
+   * the prompt: a refused or cancelled wake was seen and not acted on, and must
+   * not commit the cursor.
+   */
   delivery?: {
-    submit(text: string): Promise<{ accepted: boolean; detail?: string }>;
+    submit(
+      text: string,
+      options?: { interrupt?: MonitorInterrupt },
+    ): Promise<{
+      succeeded: boolean; outcome: string; detail?: string;
+      safeBoundary?: 'direct' | 'after_tool' | 'timeout' | 'unsupported';
+    }>;
   };
+  /** Body-free, typed evidence for runner-owned model recovery. */
+  onFailureEvidence?(evidence: FailureEvidence): boolean;
 }
 
 // Code constants (not config — YAGNI, design §2).
 const DEFAULT_PORT = 3050;
-const LONGPOLL_TIMEOUT_MS = 35_000;   // > the daemon's 25s hold
+// The daemon normally holds for 25s, but that value is operator-configurable
+// and synchronous daemon work can delay the response. The former 35s timer
+// repeatedly cancelled a healthy local stream and then reported its own abort
+// as a connectivity failure. Keep a generous stall detector so a genuinely
+// wedged connection is still visible, with an explicit diagnostic.
+const LONGPOLL_STALL_MS = 120_000;
 const COALESCE_HOLD_MS = 500;         // straggler poll must not block
 const BOOT_GRACE_MS = 15_000;         // hold injection until the TUI is up
 const POST_VERIFY_MS = 1_000;
@@ -89,6 +112,27 @@ const TURN_OBSERVE_INTERVAL_MS = 1_500;
 const DEFAULT_TURN_FAIL_THRESHOLD = 3; // fallback when the resolved config omits it
 
 class AuthError extends Error {}
+
+/**
+ * Why the monitor is not healthy. Each cause clears on its OWN recovery signal
+ * and nothing else — a successful poll proves the stream works, and proves
+ * nothing whatsoever about whether wakes are being delivered or whether the
+ * turns they trigger keep dying.
+ */
+export type StatusCause =
+  | 'connectivity'    // prime/poll/stream failure      → cleared by a successful poll
+  | 'delivery'        // the wake could not be injected → cleared by a delivered wake
+  | 'modal'           // the pane held a dialog         → cleared by a delivered wake
+  | 'offline'         // the session is gone            → the run loop ends
+  | 'turns-failing'   // delivered wakes keep dying     → cleared by a completed turn
+  | 'safe-boundary'   // after_tool fell back            → cleared by an exact/direct delivery
+  | 'auth';           // the daemon rejected the token  → fatal
+
+interface StatusEntry {
+  level: 'degraded' | 'failed';
+  detail: string;
+  at: string;
+}
 
 /** Best-effort daemon config (issue #17): the fields the MCP client reads. */
 interface DaemonConfig {
@@ -156,6 +200,11 @@ export interface DaemonEndpoint {
   headers: Record<string, string>;
 }
 
+export type IdentityPresence =
+  | { state: 'present'; temporary: boolean; stale: boolean }
+  | { state: 'absent' }
+  | { state: 'unknown'; detail: string };
+
 /** Resolve the daemon endpoint + auth header from env → config → defaults. */
 export function resolveEndpoint(env: NodeJS.ProcessEnv): DaemonEndpoint {
   const file = readDaemonConfig(env);
@@ -174,6 +223,48 @@ export function resolveEndpoint(env: NodeJS.ProcessEnv): DaemonEndpoint {
   };
 }
 
+/**
+ * Ask the daemon's authoritative identity index. The notifications endpoint is
+ * intentionally unsuitable for lifecycle: it serves an empty 200 page for a
+ * valid but missing identity, which made a closed temp identity look healthy.
+ */
+export async function probeIdentityPresence(
+  name: string, fetch: FetchLike, env: NodeJS.ProcessEnv,
+): Promise<IdentityPresence> {
+  const ep = resolveEndpoint(env);
+  let response: FetchResponse;
+  try {
+    response = await fetch(`${ep.origin}/identities`, { headers: ep.headers });
+  } catch (error) {
+    return { state: 'unknown', detail: `identity index unreachable (${msg(error)})` };
+  }
+  if (!response.ok) return {
+    state: 'unknown',
+    detail: response.status === 401
+      ? `daemon rejected the API token (401) — ${authResolutionHint(ep)}`
+      : `identity index returned HTTP ${response.status}`,
+  };
+  try {
+    const body = await response.json();
+    if (!Array.isArray(body.identities))
+      return { state: 'unknown', detail: 'identity index response is malformed' };
+    // A healthy daemon normally has at least its Human identity. During daemon
+    // restart, however, the authenticated endpoint can briefly serve a valid
+    // but empty index while state is still loading. Empty is therefore not
+    // enough authority to retire a live temporary role.
+    if (body.identities.length === 0)
+      return { state: 'unknown', detail: 'identity index is temporarily empty' };
+    const found = body.identities.find(identity =>
+      (typeof identity === 'string' ? identity : identity?.name) === name);
+    if (!found) return { state: 'absent' };
+    return typeof found === 'string'
+      ? { state: 'present', temporary: false, stale: false }
+      : { state: 'present', temporary: found.temporary === true, stale: found.stale === true };
+  } catch (error) {
+    return { state: 'unknown', detail: `identity index response is unreadable (${msg(error)})` };
+  }
+}
+
 /** Actionable, secret-free description of every token source for this profile. */
 export function authResolutionHint(ep: DaemonEndpoint): string {
   const tokenPath = join(ep.stateDir, 'daemon-token');
@@ -185,6 +276,29 @@ export function authResolutionHint(ep: DaemonEndpoint): string {
 export function filterEvents(events: NotifyEvent[], wakeSources: string[]): NotifyEvent[] {
   const set = new Set(wakeSources);
   return events.filter(e => e.event !== undefined && set.has(e.event));
+}
+
+/**
+ * A reconnect or the short coalescing poll may overlap the preceding daemon
+ * page. Collapse only events with a stable notification ID; ID-less events are
+ * retained because two otherwise-identical introductions may be distinct.
+ * The key deliberately contains only fields already allowed in the body-free
+ * notification contract.
+ */
+function notificationKey(event: NotifyEvent): string | undefined {
+  const id = event.event === 'file_received' ? event.file_id : event.msg_id;
+  if (id === undefined) return undefined;
+  return `${event.event ?? ''}\u0000${event.from ?? ''}\u0000${String(id)}`;
+}
+
+function appendUniqueEvents(target: NotifyEvent[], additions: NotifyEvent[]): void {
+  const seen = new Set(target.map(notificationKey).filter((key): key is string => key !== undefined));
+  for (const event of additions) {
+    const key = notificationKey(event);
+    if (key !== undefined && seen.has(key)) continue;
+    target.push(event);
+    if (key !== undefined) seen.add(key);
+  }
 }
 
 const uniq = (xs: string[]): string[] => [...new Set(xs)];
@@ -306,11 +420,65 @@ export function looksRunning(pane: string): boolean {
   return false;
 }
 
-/** Is the injected line still sitting unsubmitted in the composer (bottom of pane)? */
+const COMPOSER_TOP = /^[^\S\n]*[╭┌][─━]/;
+const COMPOSER_BOTTOM = /^[^\S\n]*[╰└][─━]/;
+const COMPOSER_PROMPT = /^[^\S\n]*(?:[│┃|][^\S\n]*)?[❯›>][^\S\n]*$/;
+
+/**
+ * Remove wrapping-only whitespace and box chrome from composer rows. Notification
+ * lines contain no meaningful whitespace distinction, so this lets a fragment
+ * cross an arbitrary terminal wrap without matching unrelated transcript text.
+ */
+function normalizeComposerRows(rows: string[]): string {
+  return rows.map((raw, i) => {
+    let row = raw;
+    if (i > 0) row = row.replace(/^[^\S\n]*(?:[│┃|][^\S\n]*)?/, '');
+    row = row.replace(/[^\S\n]*(?:[│┃|])?[^\S\n]*$/, '');
+    return row;
+  }).join('').replace(/\s+/g, '');
+}
+
+/**
+ * Is the injected line still sitting unsubmitted in the composer?
+ *
+ * The footer has variable height and the line may wrap across any number of
+ * rows, so a fixed tail window cannot identify the composer. Prefer the final
+ * bordered composer region; for a borderless/truncated capture, require the
+ * notification prefix to follow a composer prompt. This keeps old submitted
+ * wake lines in the transcript from causing stray Enters.
+ */
 function stillInComposer(pane: string, line: string): boolean {
-  const frag = line.slice(0, 48);
-  const tail = pane.split('\n').slice(-4).join('\n');
-  return tail.includes(frag);
+  if (!pane) return false; // dead pane: do not waste Enters
+  const lines = pane.split('\n');
+
+  let bottom = -1;
+  for (let i = lines.length - 1; i >= 0; i--) {
+    if (COMPOSER_BOTTOM.test(lines[i])) { bottom = i; break; }
+  }
+  let top = -1;
+  if (bottom >= 0) {
+    for (let i = bottom - 1; i >= 0; i--) {
+      if (COMPOSER_TOP.test(lines[i])) { top = i; break; }
+    }
+  }
+
+  const from = top >= 0 ? top + 1 : 0;
+  const to = bottom >= 0 ? bottom : lines.length;
+  let wakeRow = -1;
+  let wakeColumn = -1;
+  for (let i = to - 1; i >= from; i--) {
+    const column = lines[i].lastIndexOf(PREFIX);
+    if (column >= 0) { wakeRow = i; wakeColumn = column; break; }
+  }
+  if (wakeRow < 0) return false;
+
+  // Without both box boundaries, only trust text visibly in a composer prompt.
+  // This is the safe fallback for borderless TUIs and truncated captures.
+  if (top < 0 && !COMPOSER_PROMPT.test(lines[wakeRow].slice(0, wakeColumn))) return false;
+
+  const rows = lines.slice(wakeRow, to);
+  rows[0] = rows[0].slice(wakeColumn);
+  return normalizeComposerRows(rows).includes(line.replace(/\s+/g, ''));
 }
 
 export interface MonitorOpts {
@@ -324,7 +492,7 @@ export interface MonitorOpts {
 
 /** The lifecycle surface the runner drives: prime pre-launch, run, stop on pid death. */
 export interface MonitorHandle {
-  prime(): Promise<void>;
+  prime(options?: { resetCursor?: boolean }): Promise<void>;
   run(pid: number): Promise<void>;
   stop(): void;
 }
@@ -349,6 +517,8 @@ export class Monitor {
   // ended in an API error with no completed turn in between.
   private apiErrorStreak = 0;
   private readonly turnFailThreshold: number;
+  /** Active degradations, keyed by cause. Empty means armed. */
+  private readonly causes = new Map<StatusCause, StatusEntry>();
 
   constructor(o: MonitorOpts) {
     this.name = o.name;
@@ -363,27 +533,31 @@ export class Monitor {
     this.turnFailThreshold = typeof n === 'number' && n >= 1 ? n : DEFAULT_TURN_FAIL_THRESHOLD;
   }
 
-  /** Resume the last delivered cursor; only a brand-new monitor primes at stream tip. */
-  async prime(): Promise<void> {
-    const persisted = this.readPersistedCursor();
+  /**
+   * Resume the last delivered cursor during ordinary fleet-owned restarts.
+   * A native→fleet ownership transition resets at stream tip because the native
+   * owner was responsible for arrivals while the supervisor was inactive.
+   */
+  async prime(options: { resetCursor?: boolean } = {}): Promise<void> {
+    const persisted = options.resetCursor ? null : this.readPersistedCursor();
     if (persisted !== null) {
       this.cursor = persisted;
       this.deliveredCursor = persisted;
-      this.setStatus('armed');
+      this.writeStatus();
       return;
     }
     try {
-      const body = await this.doFetch('tip', LONGPOLL_TIMEOUT_MS);
+      const body = await this.doFetch('tip', LONGPOLL_STALL_MS, 'stall');
       this.cursor = typeof body.cursor === 'number' ? body.cursor : 0;
       this.persistCursor();
-      this.setStatus('armed');
+      this.writeStatus();
     } catch (e) {
       if (e instanceof AuthError) {
         this.fatal = true;
-        this.setStatus(`failed: ${e.message}`);
+        this.degrade('auth', e.message, 'failed');
       } else {
         this.cursor = null;
-        this.setStatus(`degraded: prime failed (${msg(e)})`);
+        this.degrade('connectivity', `prime failed (${msg(e)})`);
       }
     }
   }
@@ -395,22 +569,24 @@ export class Monitor {
     let backoff = 0;
     const pending: NotifyEvent[] = [];
     while (!this.stopped) {
-      if (!this.deps.isAlive(pid)) { this.setStatus('degraded: session offline'); return; }
+      if (!this.deps.isAlive(pid)) { this.degrade('offline', 'session offline'); return; }
       let body: { cursor?: number; events?: NotifyEvent[] };
       try {
-        body = await this.doFetch(String(this.cursor ?? 0), LONGPOLL_TIMEOUT_MS);
+        body = await this.doFetch(String(this.cursor ?? 0), LONGPOLL_STALL_MS, 'stall');
         backoff = 0;
+        // A poll that worked proves the stream is healthy — and only that.
+        this.recover('connectivity');
       } catch (e) {
         if (this.stopped) return;
-        if (e instanceof AuthError) { this.fatal = true; this.setStatus(`failed: ${e.message}`); return; }
+        if (e instanceof AuthError) { this.fatal = true; this.degrade('auth', e.message, 'failed'); return; }
         backoff = Math.min(backoff + BACKOFF_STEP_MS, BACKOFF_MAX_MS);
-        this.setStatus(`degraded: stream hiccup (${msg(e)})`);
+        this.degrade('connectivity', `stream hiccup (${msg(e)})`);
         await this.deps.sleep(backoff);
         continue;
       }
       this.advance(body.cursor, false);
       const batch = filterEvents(body.events ?? [], this.cfg.wake_sources);
-      pending.push(...batch);
+      appendUniqueEvents(pending, batch);
       if (pending.length === 0) {
         this.persistCursor();
         continue;
@@ -429,7 +605,7 @@ export class Monitor {
       try {
         accepted = await this.deliver(pid, pending);
       } catch (e) {
-        this.setStatus(`degraded: delivery failed (${msg(e)})`);
+        this.degrade('delivery', `delivery failed (${msg(e)})`);
       }
       if (accepted) {
         pending.length = 0;
@@ -452,28 +628,42 @@ export class Monitor {
     await this.deps.sleep(this.cfg.batch_ms);
     if (this.stopped) return;
     try {
-      const more = await this.doFetch(String(this.cursor ?? 0), COALESCE_HOLD_MS);
+      const more = await this.doFetch(String(this.cursor ?? 0), COALESCE_HOLD_MS, 'coalesce');
       this.advance(more.cursor, false);
-      batch.push(...filterEvents(more.events ?? [], this.cfg.wake_sources));
+      appendUniqueEvents(batch, filterEvents(more.events ?? [], this.cfg.wake_sources));
     } catch { /* no stragglers / abort — deliver what we have */ }
   }
 
   private async deliver(pid: number, batch: NotifyEvent[]): Promise<boolean> {
     const line = formatNotificationLine(batch);
     if (this.deps.delivery) {
-      const result = await this.deps.delivery.submit(line);
-      if (!result.accepted) {
-        this.setStatus(`degraded: ACP prompt not accepted${result.detail ? ` (${result.detail})` : ''}`);
+      const result = await this.deps.delivery.submit(line, { interrupt: this.cfg.interrupt });
+      if (!result.succeeded) {
+        // Name the reason: "refused" and "cancelled" are the agent's answer,
+        // not a transport problem, and an operator has to be able to tell them
+        // apart from a dead socket.
+        this.degrade('delivery', `wake ${result.outcome}${result.detail ? ` (${result.detail})` : ''}`);
         return false;
       }
-      this.recordTurn('completed');
+      if (result.safeBoundary === 'timeout' || result.safeBoundary === 'unsupported')
+        this.degrade('safe-boundary', result.detail ?? `after_tool ${result.safeBoundary}`);
+      else this.recover('safe-boundary');
+      this.recover('delivery', 'modal');
+      if (result.outcome !== 'injected' && result.outcome !== 'startedNewTurn')
+        this.recordTurn('completed');
       return true;
     }
+    // Tmux exposes no authenticated tool lifecycle. `after_tool` therefore
+    // degrades to the existing non-cancelling injection path; never guess a
+    // boundary from pane text and never send C-c for this mode.
+    if (this.cfg.interrupt === true) await this.deps.tmux.sendKey(this.name, 'C-c');
+    if (this.cfg.interrupt === 'after_tool')
+      this.degrade('safe-boundary', 'after_tool unsupported by tmux; using non-cancelling delivery');
     const state = await this.awaitInjectable(pid);
     if (state !== 'ready') {
-      if (state === 'offline') this.setStatus('degraded: offline during delivery');
+      if (state === 'offline') this.degrade('offline', 'offline during delivery');
       else if (state === 'modal')
-        this.setStatus(`degraded: modal wedge — pane held a dialog for ` +
+        this.degrade('modal', `modal wedge — pane held a dialog for ` +
           `${MODAL_GIVE_UP_MS / 1000}s, wake not injected`);
       return false;
     }
@@ -483,22 +673,37 @@ export class Monitor {
     // Verify submission for THIS line even if stop() arrives mid-flight: the text
     // is already in the composer and we want it submitted (at-least-once). A truly
     // dead pane makes safeCapture return '' ⇒ not-in-composer ⇒ breaks, no wasted Enter.
-    for (let i = 0; i < MAX_ENTER_RETRIES; i++) {
+    for (let i = 0; i < MAX_ENTER_RETRIES;) {
       await this.deps.sleep(POST_VERIFY_MS);
       const capture = await safeCapture(this.deps.tmux, this.name);
       if (!capture.ok) {
-        this.setStatus('degraded: capture failed during injection verification');
+        this.degrade('delivery', 'capture failed during injection verification');
+        return false;
+      }
+      // A dialog can appear after the initial send. Never let a verification
+      // retry confirm it. Wait under the same bounded modal policy as initial
+      // injection, then re-capture immediately before considering Enter.
+      if (looksModal(capture.pane)) {
+        const state = await this.awaitInjectable(pid);
+        if (state === 'ready') continue;
+        if (state === 'offline')
+          this.degrade('offline', 'offline during injection verification');
+        else if (state === 'modal')
+          this.degrade('modal', `modal wedge during injection verification — ` +
+            `no Enter sent for ${MODAL_GIVE_UP_MS / 1000}s`);
         return false;
       }
       if (!stillInComposer(capture.pane, line)) { delivered = true; break; }
       await this.deps.tmux.sendKey(this.name, 'Enter');
+      i++;
     }
-    if (!delivered) { this.setStatus('degraded: injection unverified'); return false; }
+    if (!delivered) { this.degrade('delivery', 'injection unverified'); return false; }
+    this.recover('delivery', 'modal');
     // The wake landed and a turn started; observe how that turn terminates so a
     // refusal-wedge (every turn dies with `API Error:` while delivery stays green)
     // becomes visible in `.monitor-status` instead of masquerading as armed (#19).
-    await this.observeTurnOutcome(pid);
-    return true;
+    const recoveryTriggered = await this.observeTurnOutcome(pid);
+    return !recoveryTriggered;
   }
 
   /**
@@ -508,30 +713,40 @@ export class Monitor {
    * grows it. Once the streak reaches the threshold the status degrades; a later
    * completed turn flips it back to armed. Detection only — no remediation (#19).
    */
-  private async observeTurnOutcome(pid: number): Promise<void> {
+  private async observeTurnOutcome(pid: number): Promise<boolean> {
     for (let i = 0; i < TURN_OBSERVE_POLLS; i++) {
-      if (this.stopped) return;                                  // shutting down — leave status
-      if (!this.deps.isAlive(pid) || !(await this.deps.tmux.has(this.name))) return; // loop marks offline
+      if (this.stopped) return false;                                  // shutting down — leave status
+      if (!this.deps.isAlive(pid) || !(await this.deps.tmux.has(this.name))) return false; // loop marks offline
       const capture = await safeCapture(this.deps.tmux, this.name);
       if (!capture.ok) {
-        this.setStatus('degraded: capture failed during turn observation');
-        return;
+        this.degrade('delivery', 'capture failed during turn observation');
+        return false;
       }
-      if (looksApiError(capture.pane)) { this.recordTurn('api-error'); return; }
-      if (!looksRunning(capture.pane)) { this.recordTurn('completed'); return; }
+      if (looksApiError(capture.pane)) {
+        const evidence = classifyFailureText(capture.pane);
+        const recoveryTriggered = evidence
+          ? this.deps.onFailureEvidence?.(evidence) === true
+          : false;
+        this.recordTurn('api-error');
+        return recoveryTriggered;
+      }
+      if (!looksRunning(capture.pane)) { this.recordTurn('completed'); return false; }
       await this.deps.sleep(TURN_OBSERVE_INTERVAL_MS);
     }
     this.recordTurn('inconclusive');   // still running at give-up: hold the streak, don't re-arm
+    return false;
   }
 
   /** Update the consecutive-API-error streak and derive `.monitor-status` from it. */
   private recordTurn(outcome: 'api-error' | 'completed' | 'inconclusive'): void {
+    if (outcome === 'inconclusive') return;   // no evidence either way; leave the streak
     if (outcome === 'api-error') this.apiErrorStreak++;
-    else if (outcome === 'completed') this.apiErrorStreak = 0;
-    // 'inconclusive' leaves the streak (and therefore the status) unchanged.
-    this.setStatus(this.apiErrorStreak >= this.turnFailThreshold
-      ? 'degraded: turns failing (api error)'
-      : 'armed');
+    else this.apiErrorStreak = 0;
+    if (this.apiErrorStreak >= this.turnFailThreshold)
+      this.degrade('turns-failing', 'turns failing (api error)');
+    else if (outcome === 'completed')
+      // A turn that ran to the end is the ONLY thing that clears this.
+      this.recover('turns-failing');
   }
 
   /**
@@ -561,7 +776,7 @@ export class Monitor {
       if (now < this.bootDeadline) { await this.deps.sleep(this.bootDeadline - now); continue; }
       const capture = await safeCapture(this.deps.tmux, this.name);
       if (!capture.ok) {
-        this.setStatus('degraded: capture failed while checking session readiness');
+        this.degrade('delivery', 'capture failed while checking session readiness');
         await this.deps.sleep(MODAL_RETRY_MS);
         continue;
       }
@@ -571,14 +786,23 @@ export class Monitor {
     }
   }
 
-  private async doFetch(since: string, holdMs: number): Promise<{ cursor?: number; events?: NotifyEvent[] }> {
+  private async doFetch(
+    since: string,
+    timeoutMs: number,
+    timeoutKind: 'stall' | 'coalesce',
+  ): Promise<{ cursor?: number; events?: NotifyEvent[] }> {
     const ctrl = new AbortController();
     this.currentAbort = ctrl;
-    const timer = this.deps.timers.set(() => ctrl.abort(), holdMs);
+    let timedOut = false;
+    const timer = this.deps.timers.set(() => { timedOut = true; ctrl.abort(); }, timeoutMs);
     let resp: FetchResponse;
     try {
       resp = await this.deps.fetch(`${this.ep.url(this.identity)}?since=${since}`,
         { headers: this.ep.headers, signal: ctrl.signal });
+    } catch (error) {
+      if (timedOut && timeoutKind === 'stall')
+        throw new Error(`notification stream stalled for ${Math.round(timeoutMs / 1000)}s`);
+      throw error;
     } finally {
       this.deps.timers.clear(timer);
       this.currentAbort = null;
@@ -649,10 +873,36 @@ export class Monitor {
     }
   }
 
-  private setStatus(s: string): void {
-    try { writeFileSync(this.statusPath, `${s}\n`); }
+  /** Record a degradation under its own cause and republish the status. */
+  private degrade(cause: StatusCause, detail: string, level: StatusEntry['level'] = 'degraded'): void {
+    const previous = this.causes.get(cause);
+    this.causes.set(cause, { level, detail, at: new Date(this.deps.now()).toISOString() });
+    this.writeStatus();
+    if (previous?.detail !== detail) this.deps.log(`[${this.name}] monitor ${level}: ${cause} — ${detail}`);
+  }
+
+  /**
+   * Clear exactly the causes this recovery signal speaks to. Anything else
+   * stays: one successful poll must never be able to erase `turns failing`.
+   */
+  private recover(...causes: StatusCause[]): void {
+    let changed = false;
+    for (const cause of causes) changed = this.causes.delete(cause) || changed;
+    if (changed) this.deps.log(`[${this.name}] monitor recovered: ${causes.join(', ')}`);
+    this.writeStatus();
+  }
+
+  /**
+   * One line per active cause, each dated; `armed` when there are none. Every
+   * line carries an ISO timestamp so an operator can tell a live status from a
+   * stale one left behind by a monitor that stopped writing.
+   */
+  private writeStatus(): void {
+    const lines = this.causes.size
+      ? [...this.causes.entries()].map(([cause, e]) => `${e.level}: ${cause} at ${e.at} — ${e.detail}`)
+      : [`armed at ${new Date(this.deps.now()).toISOString()}`];
+    try { writeFileSync(this.statusPath, lines.join('\n') + '\n'); }
     catch (e) { this.deps.log(`[${this.name}] monitor: failed to write status: ${msg(e)}`); }
-    if (!s.startsWith('armed')) this.deps.log(`[${this.name}] monitor ${s}`);
   }
 }
 

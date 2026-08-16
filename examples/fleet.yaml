@@ -6,8 +6,24 @@
 #   ours-fleet down          stop everything
 #   ours-fleet config        validate + print the merged plan
 #
-# This file is yours — ours-fleet never edits it. Spawned roles land in
-# ~/fleet.d/<Name>.yaml (one machine-written file per role; delete = unspawn).
+# The CLI never edits this file: spawned roles land in ~/fleet.d/<Name>.yaml
+# (one machine-written file per role; delete = unspawn).
+#
+# The web console CAN edit this file. Its setup wizard and configuration editor
+# save it as a whole document, so any top-level block may be created, changed or
+# removed — `vars:` (including values like work_root below), `defaults:`,
+# `roles:`, `watchdogs:` and `loops:` alike. `defaults:`, `watchdogs:` and
+# `loops:` can ONLY live here; fleet.d drop-ins may declare `roles:` and nothing
+# else. Keys the console does not know about are round-tripped untouched.
+#
+# Console edits are applied as surgical splices against these exact bytes, so an
+# unchanged save is byte-identical and lines outside the edit keep their comment,
+# spacing and quoting. One exception: adding or removing an entry in a block list
+# (`watch:`, `oversee:`, `roles:`, `wake_sources:`) may rewrite that one list as a
+# whole, dropping inline comments written on its items; lines outside that list
+# are still byte-preserved. Each save is revision-guarded, reviewed as a diff of
+# the real file before anything is written, validated by the real loader, and
+# preceded by a timestamped backup beside this file.
 
 vars:
   work_root: /home/me/work
@@ -28,9 +44,9 @@ defaults:
     unattended: deny          # deny | wait when no ACP console is attached
   # model: claude-fable-5       # default model for roles without their own (per-role model / --model wins)
   max_tokens: 500000          # session cap before auto-compact (harness-interpreted)
-  monitor:                    # supervisor-owned mail wake (fleet-wide default)
-    enabled: true             # true (default): supervisor injects [fleet-monitor] console lines;
-    #                         #   false: legacy — the agent arms its own `ours-mcp watch`
+  monitor:
+    mode: fleet               # fleet (default): ours-fleet supervisor; native: harness-owned monitor
+    interrupt: false          # false: queue; true: cancel; after_tool: steer at an ACP tool boundary
 
   # To make Codex the fleet default instead:
   # harness: codex
@@ -40,7 +56,7 @@ defaults:
   #   profile: fleet          # ~/.codex/fleet.config.toml (or $CODEX_HOME equivalent)
   #   sandbox: workspace-write
   #   approval: on-request
-  #   monitor: true             # explicit persistent consent for unattended wake
+  #   monitor: true             # consent for Codex's native monitor; not monitor.mode
   #   search: true
   #   config:
   #     model_reasoning_effort: high
@@ -54,6 +70,23 @@ defaults:
 roles:
 
   FleetCoordinator:
+    # A reliable owner channel requires ACP so fleet can capture the correlated
+    # final answer. Create this dedicated ours identity/contact before enabling.
+    # session: acp
+    # owner_channel:
+    #   identity: FleetCoordinator Owner Channel
+    #   owners: [replace-with-your-owner-contact-cid]
+    #   interrupt: false
+    #   progress_interval_ms: 30000
+    #   comments: true          # relay live "🟡 Live update:" ACP commentary;
+    #                           # restart baseline for the /comments command
+    #   attachments:
+    #     enabled: true
+    #     max_files_per_request: 4
+    #     max_file_bytes: 10485760
+    #     max_request_bytes: 20971520
+    #     retention_ms: 86400000
+    #     allowed_mime: [application/pdf, text/plain, image/png, audio/ogg]
     identity: FleetCoordinator
     cwd: ${work_root}
     persona: |
@@ -80,7 +113,8 @@ roles:
         - message_received          #          local_contact_request, pending_message
         - file_received
       batch_ms: 2000                # coalesce a burst into one console line (default 2000)
-      # enabled: false              # opt this role out: it arms its own `ours-mcp watch`
+      # interrupt: true             # cancel active work so this role handles every wake immediately
+      # mode: native                # use this harness's native monitor instead of ours-fleet
     isolation:                      # OS-level sandbox (additive — omit for today's behavior)
       network: broker               # broker (default): ours messaging works, general egress denied
       resources:                    # per-agent cgroup caps at the pane
@@ -108,3 +142,17 @@ roles:
   #     sandbox: read-only
   #     approval: on-request
   #     monitor: true
+
+# Scheduled internal turns are ACP-only, idle-only, and never build a backlog.
+# The base file must be owned by you and not group/world writable when an enabled
+# loop is present. A wildcard targets permanent roles only; temp roles do not inherit.
+# loops:
+#   coordinator_pass:
+#     roles: [FleetCoordinator]
+#     interval: 10m
+#     initial_delay: 10m       # omitted = one full interval; use 0s explicitly for immediate
+#     jitter: 30s
+#     enabled: true
+#     prompt: |
+#       Review current fleet state once and unstick only actionable work.
+#       If nothing material changed, complete silently without an owner report.

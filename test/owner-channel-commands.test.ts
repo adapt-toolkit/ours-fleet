@@ -1,0 +1,324 @@
+import { describe, expect, it, vi } from 'vitest';
+
+import {
+  dispatchOwnerCommand, isOwnerCommandText, ownerCommandHelp, ownerCommands,
+  type OwnerCommandContext,
+} from '../src/owner-channel/commands.js';
+import {
+  OWNER_COMMENT_LABEL, ownerNotices, type OwnerCommentsState,
+} from '../src/owner-channel/notices.js';
+import type { SessionEvent, SessionSnapshot } from '../src/session/types.js';
+
+function context(overrides: Partial<OwnerCommandContext> = {}): OwnerCommandContext & {
+  replies: string[];
+} {
+  const replies: string[] = [];
+  const snapshot: SessionSnapshot = { backend: 'acp', alive: true, readiness: 'idle' };
+  const comments: OwnerCommentsState = { enabled: true, baseline: true, supported: true };
+  return {
+    replies,
+    comments: () => comments,
+    setComments: vi.fn((enabled: boolean) => {
+      comments.enabled = enabled;
+      return { ...comments };
+    }),
+    role: 'Coordinator',
+    harness: 'claude-code',
+    version: '9.9.9-test',
+    snapshot: () => snapshot,
+    interrupt: vi.fn(async () => undefined),
+    runHarnessCommand: vi.fn(async () => undefined),
+    restart: vi.fn(async () => undefined),
+    fleetList: vi.fn(async () => 'Coordinator: acp'),
+    recentEvents: () => [],
+    readWorklogTail: vi.fn(async () => undefined),
+    reply: async text => { replies.push(text); },
+    ...overrides,
+  };
+}
+
+describe('owner command registry', () => {
+  it('recognizes only trimmed slash-prefixed text as a command attempt', () => {
+    expect(isOwnerCommandText('/help')).toBe(true);
+    expect(isOwnerCommandText('  /help  ')).toBe(true);
+    expect(isOwnerCommandText('help')).toBe(false);
+    expect(isOwnerCommandText('please run /compact')).toBe(false);
+    expect(isOwnerCommandText('')).toBe(false);
+  });
+
+  it('renders every registered command with usage and description in help', () => {
+    const help = ownerCommandHelp();
+    for (const command of ownerCommands) {
+      expect(help).toContain(command.usage ?? `/${command.name}`);
+      expect(help).toContain(command.summary);
+    }
+    // The registry is the single source of truth for the deterministic set.
+    for (const name of ['help', 'status', 'comments', 'interrupt', 'clear', 'compact', 'model',
+      'restart', 'force-restart', 'ls', 'peek', 'worklog', 'version'])
+      expect(ownerCommands.some(command => command.name === name)).toBe(true);
+    expect(help).toContain('/commands');
+  });
+
+  it('makes /comments discoverable in help with its label and baseline semantics', () => {
+    const help = ownerCommandHelp();
+    expect(help).toContain('/comments [status|on|off]');
+    expect(help).toContain(OWNER_COMMENT_LABEL);
+    expect(help).toContain('fleet.yaml is the restart baseline');
+  });
+
+  it('prepends a caller error to help output when given', () => {
+    const help = ownerCommandHelp('unknown command /deploy');
+    expect(help).toContain('unknown command /deploy');
+    expect(help).toContain('/help');
+  });
+
+  it('replies with help for /help and its /commands alias, case-insensitively', async () => {
+    for (const text of ['/help', '/commands', '/HELP']) {
+      const ctx = context();
+      await dispatchOwnerCommand(text, ctx);
+      expect(ctx.replies).toEqual([ownerCommandHelp()]);
+    }
+  });
+
+  it('replies with help for an unknown command instead of forwarding', async () => {
+    const ctx = context();
+    await dispatchOwnerCommand('/deploy prod now', ctx);
+    expect(ctx.replies).toHaveLength(1);
+    expect(ctx.replies[0]).toContain('/deploy');
+    expect(ctx.replies[0]).toContain('/help');
+    expect(ctx.runHarnessCommand).not.toHaveBeenCalled();
+    expect(ctx.restart).not.toHaveBeenCalled();
+  });
+
+  it('reports status from the session snapshot', async () => {
+    const ctx = context();
+    await dispatchOwnerCommand('/status', ctx);
+    expect(ctx.replies).toEqual([ownerNotices.status('Coordinator',
+      { backend: 'acp', alive: true, readiness: 'idle' })]);
+  });
+
+  it('reports live-comment state for a bare /comments and for /comments status', async () => {
+    for (const text of ['/comments', '/comments status', '/comments STATUS']) {
+      const ctx = context();
+      await dispatchOwnerCommand(text, ctx);
+      expect(ctx.setComments).not.toHaveBeenCalled();
+      expect(ctx.replies).toEqual([ownerNotices.comments(
+        { enabled: true, baseline: true, supported: true })]);
+    }
+  });
+
+  it('turns live comments off and back on without rewriting the baseline', async () => {
+    const ctx = context();
+    await dispatchOwnerCommand('/comments off', ctx);
+    expect(ctx.setComments).toHaveBeenCalledWith(false);
+    expect(ctx.replies[0]).toContain('OFF');
+    // The reply must state the unchanged fleet.yaml baseline and the restart rule.
+    expect(ctx.replies[0]).toContain('fleet.yaml baseline: on, changed by /comments');
+    expect(ctx.replies[0]).toContain('A restart returns to the baseline.');
+
+    await dispatchOwnerCommand('/comments ON', ctx);
+    expect(ctx.setComments).toHaveBeenLastCalledWith(true);
+    expect(ctx.replies[1]).toContain('ON');
+    expect(ctx.replies[1]).not.toContain('changed by /comments');
+
+    // Status afterwards reflects the live value, not the baseline.
+    await dispatchOwnerCommand('/comments off', ctx);
+    await dispatchOwnerCommand('/comments status', ctx);
+    expect(ctx.replies[3]).toContain('OFF');
+  });
+
+  it('reports a baseline-off channel truthfully', async () => {
+    const ctx = context({ comments: () => ({ enabled: false, baseline: false, supported: true }) });
+    await dispatchOwnerCommand('/comments status', ctx);
+    expect(ctx.replies[0]).toContain('Live updates are OFF');
+    expect(ctx.replies[0]).toContain('fleet.yaml baseline: off');
+    expect(ctx.replies[0]).not.toContain('changed by /comments');
+  });
+
+  it('says the setting is inert when the backend never emits live comments', async () => {
+    const ctx = context({ comments: () => ({ enabled: true, baseline: true, supported: false }) });
+    await dispatchOwnerCommand('/comments status', ctx);
+    expect(ctx.replies[0]).toContain('no effect here');
+    expect(ctx.replies[0]).not.toContain(OWNER_COMMENT_LABEL);
+  });
+
+  it('returns help for a malformed /comments argument instead of guessing', async () => {
+    for (const bad of ['enable', 'true', 'on off', 'off please', '1', '--on']) {
+      const ctx = context();
+      await dispatchOwnerCommand(`/comments ${bad}`, ctx);
+      expect(ctx.setComments).not.toHaveBeenCalled();
+      expect(ctx.replies).toHaveLength(1);
+      expect(ctx.replies[0]).toContain('/comments [status|on|off]');
+      expect(ctx.replies[0]).toContain('/help');
+    }
+  });
+
+  it('interrupts the active turn and confirms', async () => {
+    const ctx = context();
+    await dispatchOwnerCommand('/interrupt', ctx);
+    expect(ctx.interrupt).toHaveBeenCalledOnce();
+    expect(ctx.replies).toEqual([ownerNotices.interrupted('Coordinator')]);
+  });
+
+  it('reports an interrupt failure without throwing', async () => {
+    const ctx = context({ interrupt: vi.fn(async () => { throw new Error('boom'); }) });
+    await dispatchOwnerCommand('/interrupt', ctx);
+    expect(ctx.replies).toEqual([ownerNotices.interruptFailed('Coordinator')]);
+  });
+
+  it('passes /clear and /compact to the harness as raw slash text', async () => {
+    for (const name of ['clear', 'compact']) {
+      const ctx = context();
+      await dispatchOwnerCommand(`/${name}`, ctx);
+      expect(ctx.runHarnessCommand).toHaveBeenCalledOnce();
+    expect(ctx.runHarnessCommand).toHaveBeenCalledWith(`/${name}`);
+    }
+  });
+
+  it('passes /model with a valid id to the harness', async () => {
+    const ctx = context();
+    await dispatchOwnerCommand('/model claude-sonnet-5', ctx);
+    expect(ctx.runHarnessCommand).toHaveBeenCalledOnce();
+    expect(ctx.runHarnessCommand).toHaveBeenCalledWith('/model claude-sonnet-5');
+  });
+
+  // codex-acp 1.1.7 executes only /compact locally; /clear and /model are not
+  // builtins and would fall through tryHandleCommand into sendPrompt, i.e.
+  // reach the model as an ordinary prompt. The registry must therefore refuse
+  // to forward them on the codex harness instead of pretending they work.
+  it('forwards only /compact on the codex harness', async () => {
+    const ctx = context({ harness: 'codex' });
+    await dispatchOwnerCommand('/compact', ctx);
+    expect(ctx.runHarnessCommand).toHaveBeenCalledOnce();
+    expect(ctx.runHarnessCommand).toHaveBeenCalledWith('/compact');
+  });
+
+  it('refuses /clear and /model on the codex harness with a truthful notice', async () => {
+    for (const text of ['/clear', '/model claude-sonnet-5']) {
+      const ctx = context({ harness: 'codex' });
+      await dispatchOwnerCommand(text, ctx);
+      expect(ctx.runHarnessCommand).not.toHaveBeenCalled();
+      expect(ctx.replies).toEqual(
+        [ownerNotices.commandUnsupported(text.split(' ', 1)[0], 'codex')]);
+    }
+  });
+
+  it('refuses all harness-forwarded commands on an unverified harness', async () => {
+    for (const text of ['/clear', '/compact', '/model claude-sonnet-5']) {
+      const ctx = context({ harness: 'mystery-harness' });
+      await dispatchOwnerCommand(text, ctx);
+      expect(ctx.runHarnessCommand).not.toHaveBeenCalled();
+      expect(ctx.replies).toHaveLength(1);
+      expect(ctx.replies[0]).toContain('not supported');
+    }
+  });
+
+  it('returns help for /model without an argument', async () => {
+    const ctx = context();
+    await dispatchOwnerCommand('/model', ctx);
+    expect(ctx.runHarnessCommand).not.toHaveBeenCalled();
+    expect(ctx.replies).toHaveLength(1);
+    expect(ctx.replies[0]).toContain('/model <model-id>');
+  });
+
+  it('returns help for a malformed /model argument', async () => {
+    for (const bad of ['claude sonnet', 'x'.repeat(200), 'a\nb', '$(rm -rf /)', '--flag']) {
+      const ctx = context();
+      await dispatchOwnerCommand(`/model ${bad}`, ctx);
+      expect(ctx.runHarnessCommand).not.toHaveBeenCalled();
+      expect(ctx.replies).toHaveLength(1);
+      expect(ctx.replies[0]).toContain('/help');
+    }
+  });
+
+  it('returns help when a no-argument command is given arguments', async () => {
+    const ctx = context();
+    await dispatchOwnerCommand('/clear everything', ctx);
+    expect(ctx.runHarnessCommand).not.toHaveBeenCalled();
+    expect(ctx.replies).toHaveLength(1);
+    expect(ctx.replies[0]).toContain('/help');
+  });
+
+  it('maps /restart and /force-restart to the fleet restart modes', async () => {
+    const keep = context();
+    await dispatchOwnerCommand('/restart', keep);
+    expect(keep.restart).toHaveBeenCalledOnce();
+    expect(keep.restart).toHaveBeenCalledWith('keep');
+    const fresh = context();
+    await dispatchOwnerCommand('/force-restart', fresh);
+    expect(fresh.restart).toHaveBeenCalledOnce();
+    expect(fresh.restart).toHaveBeenCalledWith('fresh');
+  });
+
+  it('relays the fleet listing for /ls', async () => {
+    const ctx = context();
+    await dispatchOwnerCommand('/ls', ctx);
+    expect(ctx.fleetList).toHaveBeenCalledOnce();
+    expect(ctx.replies).toHaveLength(1);
+    expect(ctx.replies[0]).toContain('Coordinator: acp');
+  });
+
+  it('preserves the multi-line fleet listing for /ls exactly', async () => {
+    const listing = 'Coordinator: acp (running)\nDeveloper-1: acp (running)\nWatchdog: tmux (idle)';
+    const ctx = context({ fleetList: vi.fn(async () => listing) });
+    await dispatchOwnerCommand('/ls', ctx);
+    expect(ctx.replies).toEqual([`📊 Fleet sessions:\n${listing}`]);
+  });
+
+  it('sanitizes non-newline control characters in /ls output', async () => {
+    const listing = ['a', String.fromCharCode(7), 'b\r\nc', String.fromCharCode(0), 'd'].join('');
+    const ctx = context({ fleetList: vi.fn(async () => listing) });
+    await dispatchOwnerCommand('/ls', ctx);
+    expect(ctx.replies).toEqual(['📊 Fleet sessions:\na b \nc d']);
+  });
+
+  it('reports the fleet version for /version', async () => {
+    const ctx = context();
+    await dispatchOwnerCommand('/version', ctx);
+    expect(ctx.replies).toHaveLength(1);
+    expect(ctx.replies[0]).toContain('9.9.9-test');
+  });
+
+  it('tails the worklog for /worklog and reports when it is missing', async () => {
+    const present = context({ readWorklogTail: vi.fn(async () => 'did a thing\ndid another') });
+    await dispatchOwnerCommand('/worklog', present);
+    expect(present.replies).toHaveLength(1);
+    expect(present.replies[0]).toContain('did another');
+    const missing = context();
+    await dispatchOwnerCommand('/worklog', missing);
+    expect(missing.replies).toHaveLength(1);
+    expect(missing.replies[0].toLowerCase()).toContain('no worklog');
+  });
+
+  it('summarizes recent activity shapes for /peek without leaking text bodies', async () => {
+    const events: SessionEvent[] = [
+      { version: 1, seq: 1, at: 't', kind: 'thought', text: 'SECRET private reasoning' },
+      { version: 1, seq: 2, at: 't', kind: 'tool_call', title: 'Read README.md' },
+      { version: 1, seq: 3, at: 't', kind: 'tool_update', status: 'completed' },
+      { version: 1, seq: 4, at: 't', kind: 'agent_text', text: 'SECRET draft answer' },
+      { version: 1, seq: 5, at: 't', kind: 'turn_stop', stopReason: 'end_turn' },
+    ];
+    const ctx = context({ recentEvents: () => events });
+    await dispatchOwnerCommand('/peek', ctx);
+    expect(ctx.replies).toHaveLength(1);
+    expect(ctx.replies[0]).toContain('tool_call');
+    expect(ctx.replies[0]).toContain('Read README.md');
+    expect(ctx.replies[0]).toContain('turn_stop');
+    expect(ctx.replies[0]).not.toContain('SECRET');
+  });
+
+  it('reports an empty /peek when there is no recent activity', async () => {
+    const ctx = context();
+    await dispatchOwnerCommand('/peek', ctx);
+    expect(ctx.replies).toHaveLength(1);
+  });
+
+  it('replies with a failure notice when a command effect throws', async () => {
+    const ctx = context({ fleetList: vi.fn(async () => { throw new Error('spawn failed'); }) });
+    // The dispatcher rethrows after the notice so the channel can log the cause.
+    await expect(dispatchOwnerCommand('/ls', ctx)).rejects.toThrow('spawn failed');
+    expect(ctx.replies).toHaveLength(1);
+    expect(ctx.replies[0]).toContain('⚠️');
+    expect(ctx.replies[0]).not.toContain('spawn failed');
+  });
+});

@@ -1,12 +1,16 @@
-import { join } from 'node:path';
-import { agentDir } from '../paths.js';
+import { chmodSync, existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { dirname, join, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { agentDir, home } from '../paths.js';
 import { realExec, type Exec } from '../exec.js';
 import type { ResolvedRole } from '../config.js';
 import type {
   HarnessAdapter, RoleDirs, SessionPrep, SessionState, Launch, ValidationError,
+  UnattendedCapability,
 } from './types.js';
 import { registerAdapter } from './registry.js';
-import { bundledAcpAgent } from './acp-agent.js';
+import { harnessRuntimeDir } from '../isolation/policy.js';
+import { bundledAcpAgent, resolveBundledAcpAgent } from './acp-agent.js';
 
 interface CodexOptions {
   launcher?: string;
@@ -30,6 +34,24 @@ const LAUNCHERS = ['auto', 'ours-codex', 'codex'];
 const SANDBOX_MODES = ['read-only', 'workspace-write', 'danger-full-access'];
 /** Codex CLI's accepted `--ask-for-approval` values. */
 const APPROVAL_POLICIES = ['untrusted', 'on-request', 'never'];
+const BUNDLED_CODEX_ACP_VERSION = '1.1.7';
+const CODEX_ACP_PACKAGE = '@agentclientprotocol/codex-acp';
+const CODEX_PROXY_APPROVAL_ENV = 'OURS_FLEET_CODEX_APPROVAL';
+const CODEX_PROXY_SANDBOX_ENV = 'OURS_FLEET_CODEX_SANDBOX';
+const CODEX_PROXY_REAL_PATH_ENV = 'OURS_FLEET_REAL_CODEX_PATH';
+const CODEX_PROXY_MANIFEST_ENV = 'OURS_FLEET_CODEX_ACP_MANIFEST';
+
+/**
+ * What an unattended role can actually do under Codex's native settings.
+ * `on-request` and `untrusted` stop to ask, and with no console attached that
+ * request is refused rather than answered — so the role can only read.
+ */
+export function codexCapabilities(approval: string, sandbox: string): UnattendedCapability[] {
+  if (approval !== 'never') return ['read-state'];
+  const caps: UnattendedCapability[] = ['read-state', 'messaging', 'monitor', 'status-commands'];
+  if (sandbox !== 'read-only') caps.push('write-state', 'workspace-edit');
+  return caps;
+}
 
 /** Resolve & validate the per-role sandbox mode, throwing on an unknown value. */
 function sandboxMode(role: ResolvedRole): string | undefined {
@@ -46,6 +68,31 @@ function sandboxMode(role: ResolvedRole): string | undefined {
   return s;
 }
 
+/** codex-acp exposes the same sandbox postures as named ACP agent modes. */
+function acpAgentMode(role: ResolvedRole): string | undefined {
+  const sandbox = sandboxMode(role);
+  if (sandbox === 'read-only') return 'read-only';
+  if (sandbox === 'workspace-write') return 'agent';
+  if (sandbox === 'danger-full-access') return 'agent-full-access';
+  return undefined;
+}
+
+function acpModePermissions(mode: string | undefined): {
+  approval: string; sandbox: string;
+} {
+  if (mode === 'read-only') return { approval: 'on-request', sandbox: 'read-only' };
+  if (mode === 'agent-full-access')
+    return { approval: 'never', sandbox: 'danger-full-access' };
+  return { approval: 'on-request', sandbox: 'workspace-write' };
+}
+
+function fleetModeForApproval(nativeMode: string): 'ask' | 'auto' | 'allow' {
+  if (nativeMode === 'never') return 'allow';
+  if (nativeMode === 'on-request') return 'auto';
+  if (nativeMode === 'untrusted') return 'ask';
+  throw new Error(`unsupported Codex approval policy '${nativeMode}'`);
+}
+
 /** Resolve & validate the per-role approval policy, throwing on an unknown value. */
 function approvalPolicy(role: ResolvedRole): string | undefined {
   const o = role.harness_options as CodexOptions | undefined;
@@ -53,7 +100,8 @@ function approvalPolicy(role: ResolvedRole): string | undefined {
   if (a == null) {
     const approval = role.permissions?.approval;
     if (approval === 'allow') return 'never';
-    if (approval === 'ask' || approval === 'deny') return 'on-request';
+    if (approval === 'auto' || approval === 'deny') return 'on-request';
+    if (approval === 'ask') return 'untrusted';
     return undefined;
   }
   if (!APPROVAL_POLICIES.includes(a))
@@ -63,6 +111,60 @@ function approvalPolicy(role: ResolvedRole): string | undefined {
 
 function launcherMode(role: ResolvedRole): string {
   return (role.harness_options as CodexOptions | undefined)?.launcher ?? 'auto';
+}
+
+function bundledCodexAcp() {
+  return resolveBundledAcpAgent(CODEX_ACP_PACKAGE, 'codex-acp', 'codex-acp');
+}
+
+function canOverrideBundledAcpApproval(): boolean {
+  const resolution = bundledCodexAcp();
+  return resolution.bundled && resolution.version === BUNDLED_CODEX_ACP_VERSION
+    && resolution.manifestPath !== undefined && compiledProxyModule() !== undefined;
+}
+
+function compiledProxyModule(): string | undefined {
+  const adjacent = fileURLToPath(new URL('./codex-app-server-proxy.js', import.meta.url));
+  if (existsSync(adjacent)) return adjacent;
+  // Vitest imports src/ directly; globalSetup builds the executable module in dist/.
+  const fromSource = resolve(dirname(fileURLToPath(import.meta.url)), '../../dist/harness',
+    'codex-app-server-proxy.js');
+  if (existsSync(fromSource)) return fromSource;
+  return undefined;
+}
+
+const shellQuote = (value: string): string => `'${value.replaceAll("'", "'\\''")}'`;
+
+/**
+ * Materialize the tiny CODEX_PATH executable inside the role's own state dir.
+ * Keeping it there makes the proxy available under both ordinary and isolated
+ * launches without adding another host path to the filesystem boundary.
+ */
+function codexAcpEnvironment(role: ResolvedRole, dirs: RoleDirs): Record<string, string> {
+  if (role.session !== 'acp' || role.session_options?.acp?.command != null) return {};
+  const resolution = bundledCodexAcp();
+  if (!resolution.bundled || resolution.version !== BUNDLED_CODEX_ACP_VERSION
+      || !resolution.manifestPath) return {};
+  const runtimeDir = harnessRuntimeDir(dirs.stateDir, 'codex');
+  mkdirSync(runtimeDir, { recursive: true });
+  const proxyModule = join(runtimeDir, 'app-server-proxy.mjs');
+  const source = compiledProxyModule();
+  if (!source) throw new Error('Codex app-server proxy is missing; rebuild ours-fleet');
+  writeFileSync(proxyModule, readFileSync(source, 'utf8'), { mode: 0o600 });
+  const windows = process.platform === 'win32';
+  const command = join(runtimeDir, windows ? 'codex-app-server-proxy.cmd' : 'codex-app-server-proxy');
+  const script = windows
+    ? `@echo off\r\n"${process.execPath.replaceAll('"', '""')}" "${proxyModule.replaceAll('"', '""')}" %*\r\n`
+    : `#!/bin/sh\nexec ${shellQuote(process.execPath)} ${shellQuote(proxyModule)} "$@"\n`;
+  writeFileSync(command, script, { mode: 0o700 });
+  chmodSync(command, 0o700);
+  return {
+    CODEX_PATH: command,
+    [CODEX_PROXY_APPROVAL_ENV]: approvalPolicy(role) ?? 'on-request',
+    [CODEX_PROXY_SANDBOX_ENV]: sandboxMode(role) ?? 'workspace-write',
+    [CODEX_PROXY_MANIFEST_ENV]: resolution.manifestPath,
+    ...(process.env.CODEX_PATH ? { [CODEX_PROXY_REAL_PATH_ENV]: process.env.CODEX_PATH } : {}),
+  };
 }
 
 function encodeTomlValue(value: unknown): string {
@@ -183,13 +285,17 @@ export function makeCodexAdapter(exec: Exec = realExec): HarnessAdapter {
       return errs;
     },
 
-    async prepareSession(role: ResolvedRole, _dirs: RoleDirs): Promise<SessionPrep> {
+    async prepareSession(role: ResolvedRole, dirs: RoleDirs): Promise<SessionPrep> {
+      // Per-role harness runtime home (5.1); harmless for un-isolated roles.
+      // Only a role that declares `isolation:` gets a sandbox, and only a
+      // sandbox needs this directory to exist before entry.
+      if (role.isolation) mkdirSync(harnessRuntimeDir(dirs.stateDir, 'codex'), { recursive: true });
       const requested = launcherMode(role);
       const hasOursCodex = await commandAvailable('ours-codex', exec);
       if (requested === 'ours-codex' && !hasOursCodex)
         throw new Error('harness_options.launcher is ours-codex, but ours-codex is not on PATH; install @ours.network/codex or use launcher: auto');
       const command = requested === 'codex' ? 'codex' : hasOursCodex ? 'ours-codex' : 'codex';
-      return { argv: [], env: {}, command };
+      return { argv: [], env: codexAcpEnvironment(role, dirs), command };
     },
 
     buildLaunch(role: ResolvedRole, mode: 'fresh' | 'resume', _s: SessionState, prep: SessionPrep): Launch {
@@ -210,28 +316,115 @@ export function makeCodexAdapter(exec: Exec = realExec): HarnessAdapter {
         : typeof configured === 'string'
           ? ['sh', '-c', configured]
           : bundledAcpAgent(
-              '@agentclientprotocol/codex-acp', 'codex-acp', 'codex-acp');
-      return { argv, env: prep.env };
+              CODEX_ACP_PACKAGE, 'codex-acp', 'codex-acp');
+      const initialMode = acpAgentMode(role);
+      return {
+        argv,
+        env: initialMode ? { ...prep.env, INITIAL_AGENT_MODE: initialMode } : prep.env,
+      };
+    },
+
+    isolationPaths(role: ResolvedRole, _dirs: RoleDirs) {
+      const codexHome = join(home(), '.codex');
+      const profile = (role.harness_options as CodexOptions | undefined)?.profile;
+      return {
+        home: codexHome,
+        // Credentials, shared config, shared instructions, and the role's own
+        // profile file if it names one. Sessions, history, caches and the local
+        // sqlite stores are runtime state and stay per-role.
+        shared: [
+          join(codexHome, 'auth.json'),
+          join(codexHome, 'config.toml'),
+          join(codexHome, 'AGENTS.md'),
+          join(codexHome, 'plugins'),
+          ...(profile ? [join(codexHome, `${profile}.config.toml`)] : []),
+          join(home(), '.agents'),
+        ],
+      };
+    },
+
+    nativePermissionOverrides(options: unknown): Record<string, unknown> {
+      const o = options as CodexOptions | undefined;
+      const approval = o?.approval ?? o?.permission_mode;   // permission_mode is the alias
+      return {
+        ...(approval == null ? {} : { approval }),
+        ...(o?.sandbox == null ? {} : { sandbox: o.sandbox }),
+      };
     },
 
     translatePermissions(permissions) {
+      const approval = permissions.approval === 'allow' ? 'never'
+        : permissions.approval === 'ask' ? 'untrusted' : 'on-request';
+      const sandbox = permissions.filesystem === 'read-only'
+        ? 'read-only'
+        : permissions.filesystem === 'unrestricted'
+          ? 'danger-full-access'
+          : 'workspace-write';
       return {
-        native: {
-          approval: permissions.approval === 'allow' ? 'never' : 'on-request',
-          sandbox: permissions.filesystem === 'read-only'
-            ? 'read-only'
-            : permissions.filesystem === 'unrestricted'
-              ? 'danger-full-access'
-              : 'workspace-write',
-        },
+        supported: true,
+        native: { approval, sandbox },
         exact: true,
         warnings: [],
+        capabilities: codexCapabilities(approval, sandbox),
       };
+    },
+
+    effectivePermissions(role) {
+      const translated = this.translatePermissions(role.permissions);
+      if (!translated.supported) return translated;
+      const approval = approvalPolicy(role) ?? 'on-request';
+      const sandbox = sandboxMode(role) ?? 'workspace-write';
+      if (role.session === 'acp') {
+        const mode = acpAgentMode(role) ?? 'agent';
+        const configured = role.session_options?.acp?.command;
+        const overrideAvailable = configured == null && canOverrideBundledAcpApproval();
+        const actual = overrideAvailable ? { approval, sandbox } : acpModePermissions(mode);
+        const exact = actual.approval === approval && actual.sandbox === sandbox;
+        return {
+          ...translated,
+          native: { mode, ...actual },
+          exact,
+          warnings: exact ? [] : [configured != null
+            ? `custom ACP command cannot be verified against approval=${approval} sandbox=${sandbox}; `
+              + `its '${mode}' mode is conservatively treated as approval=${actual.approval} `
+              + `sandbox=${actual.sandbox}`
+            : `codex-acp mode '${mode}' actually uses approval=${actual.approval} `
+              + `sandbox=${actual.sandbox}, and the bundled ${BUNDLED_CODEX_ACP_VERSION} `
+              + `app-server override is unavailable; this does not exactly represent `
+              + `approval=${approval} sandbox=${sandbox}`],
+          capabilities: codexCapabilities(actual.approval, actual.sandbox),
+        };
+      }
+      return {
+        ...translated,
+        native: { approval, sandbox },
+        capabilities: codexCapabilities(approval, sandbox),
+      };
+    },
+
+    effectivePermissionMode(role) {
+      if (role.session === 'acp') {
+        const nativeMode = acpAgentMode(role) ?? 'agent';
+        if (role.session_options?.acp?.command == null && canOverrideBundledAcpApproval()) {
+          const approval = approvalPolicy(role) ?? 'on-request';
+          return { fleetMode: fleetModeForApproval(approval), nativeMode };
+        }
+        return {
+          fleetMode: fleetModeForApproval(acpModePermissions(nativeMode).approval), nativeMode,
+        };
+      }
+      const nativeMode = approvalPolicy(role) ?? 'untrusted';
+      return { fleetMode: fleetModeForApproval(nativeMode), nativeMode };
+    },
+
+    inheritedPermissionMode(role) {
+      return fleetModeForApproval(approvalPolicy(role) ?? 'untrusted');
     },
 
     vocabulary: {
       bindTool: 'choose_identity',
       createTool: 'create_identity',
+      temporaryCreateTool: 'create_temporary_identity',
       setBioTool: 'set_bio',
       setPersonaTool: 'set_persona',
       currentIdentityTool: 'current_identity',
@@ -259,7 +452,7 @@ export function makeCodexAdapter(exec: Exec = realExec): HarnessAdapter {
         'appears, call **get_messages**, handle the mail, and reply with send_message.',
       launchNote: name => `You were launched as the fleet role \`${name}\` under a Codex session. Confirm you are running.`,
       restartPrompt: (id, worklog, configuredRole) => {
-        if (configuredRole?.monitor?.enabled)
+        if (configuredRole?.monitor?.mode === 'fleet')
           return `Session restarted. Re-bind your ours identity now (choose_identity name "${id}" force=true); ` +
             'your mail wakes are delivered by the fleet supervisor as `[fleet-monitor]` console lines, so do ' +
             `NOT arm arm_monitor/foreground_monitor. Continue from ${worklog}. Do not re-run whatever crashed you.`;

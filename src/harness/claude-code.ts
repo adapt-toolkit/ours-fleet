@@ -1,12 +1,14 @@
-import { existsSync, readFileSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { home } from '../paths.js';
 import { realExec, type Exec } from '../exec.js';
 import type { ResolvedRole } from '../config.js';
 import type {
-  HarnessAdapter, RoleDirs, SessionPrep, SessionState, Launch, ValidationError,
+  HarnessAdapter, RoleDirs, SessionPrep, SessionState, Launch, UnattendedCapability, ValidationError,
 } from './types.js';
 import { registerAdapter } from './registry.js';
+import { replaceFileAtomically, withFileLock, type LockDeps } from '../atomic-file.js';
+import { harnessRuntimeDir } from '../isolation/policy.js';
 import { bundledAcpAgent } from './acp-agent.js';
 
 interface ClaudeOptions {
@@ -14,20 +16,58 @@ interface ClaudeOptions {
   mem_palace?: boolean;
   mem_palace_midsession_autosave?: boolean;
   permission_mode?: string;
+  effort?: string;
 }
-const OPTION_KEYS = ['plugins', 'mem_palace', 'mem_palace_midsession_autosave', 'permission_mode'];
+const OPTION_KEYS = ['plugins', 'mem_palace', 'mem_palace_midsession_autosave', 'permission_mode', 'effort'];
+const EFFORT_LEVELS = ['low', 'medium', 'high', 'xhigh', 'max'];
 
 /** Claude Code's accepted --permission-mode values. */
 const PERMISSION_MODES = ['default', 'acceptEdits', 'plan', 'dontAsk', 'bypassPermissions'];
 
+/**
+ * Neutral approval → native Claude mode. The ONE definition, shared by launch
+ * and by translation so the two can never disagree about what a role will run
+ * with.
+ *
+ * `allow` maps to `bypassPermissions`, not `dontAsk`. `dontAsk` suppresses the
+ * PROMPT, not the denial: an unattended role configured with the operator's
+ * explicit `approval: allow` was silently refused the actions it was told to
+ * take, with no prompt and no error to show for it. Only an explicit `allow`
+ * gets this; `ask` and `deny` are never elevated.
+ */
+export function nativePermissionMode(
+  approval: ResolvedRole['permissions']['approval'],
+): string | undefined {
+  switch (approval) {
+    case 'allow': return 'bypassPermissions';
+    case 'auto': return 'acceptEdits';
+    case 'deny': return 'plan';
+    default: return undefined;               // ask uses Claude's native default
+  }
+}
+
+/**
+ * What an unattended role can actually do under a native mode. Derived from the
+ * NATIVE mode, so an operator's explicit `harness_options.permission_mode`
+ * override is judged on what it really grants.
+ */
+export function claudeCapabilities(
+  mode: string | undefined, filesystem: ResolvedRole['permissions']['filesystem'],
+): UnattendedCapability[] {
+  // `plan` may not act at all; `default` and `acceptEdits` still stop to ask,
+  // and with no console attached that request is refused rather than answered.
+  if (mode !== 'bypassPermissions' && mode !== 'dontAsk') return ['read-state'];
+  // `dontAsk` reaches the tools but is refused the actions behind them.
+  if (mode === 'dontAsk') return ['read-state', 'status-commands'];
+  const caps: UnattendedCapability[] = ['read-state', 'messaging', 'monitor', 'status-commands'];
+  if (filesystem !== 'read-only') caps.push('write-state', 'workspace-edit');
+  return caps;
+}
+
 /** Resolve & validate the per-role permission mode, throwing on an unknown value. */
 function permissionMode(role: ResolvedRole): string | undefined {
   const pm = (role.harness_options as ClaudeOptions | undefined)?.permission_mode;
-  if (pm == null) {
-    if (role.permissions?.approval === 'allow') return 'dontAsk';
-    if (role.permissions?.approval === 'deny') return 'plan';
-    return undefined;
-  }
+  if (pm == null) return nativePermissionMode(role.permissions?.approval);
   if (!PERMISSION_MODES.includes(pm))
     throw new Error(
       `invalid harness_options.permission_mode "${pm}"; allowed: ${PERMISSION_MODES.join(', ')}`);
@@ -45,16 +85,58 @@ export function autocompactPct(role: ResolvedRole): number {
   return Math.max(1, Math.min(100, pct));
 }
 
-/** Pre-trust a dir in ~/.claude.json so the first launch never blocks on the trust dialog. */
-export function pretrust(dir: string): void {
+/**
+ * Pre-trust a dir in ~/.claude.json so the first launch never blocks on the
+ * trust dialog.
+ *
+ * `~/.claude.json` is SHARED by every role and by the operator's own Claude
+ * Code. The previous read-modify-write held nothing while it worked, so two
+ * roles starting together interleaved and one silently lost its trust entry —
+ * and that role then blocked on the dialog it was supposed to be spared,
+ * unattended, with nobody to answer it. A crash mid-write truncated the file
+ * for everyone.
+ *
+ * Now: take a cross-process lock, re-read inside it, merge ONLY this project's
+ * entry so unrelated operator state survives untouched, and replace the file
+ * atomically. Never fatal — a role that cannot be pre-trusted still launches.
+ */
+export async function pretrust(
+  dir: string,
+  deps: { log?(line: string): void; lock?: LockDeps } = {},
+): Promise<void> {
   const p = join(home(), '.claude.json');
-  const d = existsSync(p) ? JSON.parse(readFileSync(p, 'utf8')) : {};
-  const projects = (d.projects ??= {});
-  const e = (projects[dir] ??= {});
-  e.hasTrustDialogAccepted = true;
-  e.hasCompletedProjectOnboarding = true;
-  e.projectOnboardingSeenCount = Math.max(e.projectOnboardingSeenCount ?? 0, 1);
-  writeFileSync(p, JSON.stringify(d, null, 2));
+  const log = deps.log ?? (() => {});
+  try {
+    await withFileLock(`${p}.lock`, () => {
+      let doc: Record<string, unknown>;
+      if (!existsSync(p)) doc = {};
+      else {
+        const raw = readFileSync(p, 'utf8');
+        try {
+          doc = JSON.parse(raw) as Record<string, unknown>;
+        } catch (e) {
+          // Someone else's file, and it is already broken. Overwriting it would
+          // destroy operator state we cannot read; refusing to launch would take
+          // the role down for a file it does not own.
+          log(`pretrust: ${p} is not valid JSON (${(e as Error).message}) — skipping pre-trust; `
+            + `the role may block on Claude's trust dialog until the file is repaired`);
+          return;
+        }
+        if (doc === null || typeof doc !== 'object' || Array.isArray(doc)) {
+          log(`pretrust: ${p} does not contain a JSON object — skipping pre-trust`);
+          return;
+        }
+      }
+      const projects = (doc.projects ??= {}) as Record<string, Record<string, unknown>>;
+      const e = (projects[dir] ??= {});
+      e.hasTrustDialogAccepted = true;
+      e.hasCompletedProjectOnboarding = true;
+      e.projectOnboardingSeenCount = Math.max((e.projectOnboardingSeenCount as number) ?? 0, 1);
+      replaceFileAtomically(p, JSON.stringify(doc, null, 2));
+    }, deps.lock);
+  } catch (e) {
+    log(`pretrust: could not update ${p} (${(e as Error).message}) — continuing without pre-trust`);
+  }
 }
 
 /**
@@ -90,14 +172,21 @@ export function makeClaudeCodeAdapter(exec: Exec = realExec): HarnessAdapter {
       if (opts == null) return [];
       if (typeof opts !== 'object' || Array.isArray(opts))
         return [{ path: 'harness_options', message: 'must be a map' }];
-      return Object.keys(opts)
+      const errors = Object.keys(opts)
         .filter(k => !OPTION_KEYS.includes(k))
         .map(k => ({ path: `harness_options.${k}`, message: `unknown option; allowed: ${OPTION_KEYS.join(', ')}` }));
+      const effort = (opts as ClaudeOptions).effort;
+      if (effort != null && !EFFORT_LEVELS.includes(effort))
+        errors.push({ path: 'harness_options.effort', message: `must be one of: ${EFFORT_LEVELS.join(', ')}` });
+      return errors;
     },
 
     async prepareSession(role: ResolvedRole, dirs: RoleDirs): Promise<SessionPrep> {
-      pretrust(dirs.stateDir);
-      if (dirs.runCwd && dirs.runCwd !== dirs.stateDir) pretrust(dirs.runCwd);
+      // Pre-trust stays a HOST-side step: inside the sandbox ~/.claude.json is
+      // read-only, and it is the fleet's job to trust the role's dirs, not the
+      // agent's (5.1, 6.1).
+      await pretrust(dirs.stateDir);
+      if (dirs.runCwd && dirs.runCwd !== dirs.stateDir) await pretrust(dirs.runCwd);
       const o = (role.harness_options ?? {}) as ClaudeOptions;
       const memPalace = o.mem_palace !== false;
       const enabledPlugins: Record<string, boolean> = { ...(o.plugins ?? {}) };
@@ -109,6 +198,12 @@ export function makeClaudeCodeAdapter(exec: Exec = realExec): HarnessAdapter {
         MEMPALACE_MIDSESSION_AUTOSAVE: o.mem_palace_midsession_autosave ? 'true' : 'false',
       };
       if (!memPalace) env.MEMPALACE_DISABLED = 'true';
+
+      // Per-role harness runtime home (5.1). Created before sandbox entry so the
+      // bind has something to mount; harmless for un-isolated roles.
+      // Only a role that declares `isolation:` gets a sandbox, and only a
+      // sandbox needs this directory to exist before entry.
+      if (role.isolation) mkdirSync(harnessRuntimeDir(dirs.stateDir, 'claude'), { recursive: true });
 
       const argv: string[] = [];
       if (Object.keys(enabledPlugins).length) {
@@ -122,7 +217,9 @@ export function makeClaudeCodeAdapter(exec: Exec = realExec): HarnessAdapter {
     buildLaunch(role: ResolvedRole, mode: 'fresh' | 'resume', s: SessionState, prep: SessionPrep): Launch {
       const stateDir = roleStateDir(role);
       const pm = permissionMode(role);
+      const o = role.harness_options as ClaudeOptions | undefined;
       const base = ['claude', ...(role.model ? ['--model', role.model] : []),
+                    ...(o?.effort ? ['--effort', o.effort] : []),
                     ...(pm ? ['--permission-mode', pm] : []),
                     ...prep.argv, '--remote-control', role.name];
       const argv = mode === 'fresh'
@@ -143,25 +240,72 @@ export function makeClaudeCodeAdapter(exec: Exec = realExec): HarnessAdapter {
       return { argv, env: prep.env };
     },
 
+    // Same source as buildLaunch's --permission-mode flag, so the tmux and ACP
+    // backends cannot disagree about what a role's permissions translate to.
+    acpPermissionModeId(role: ResolvedRole): string | undefined {
+      return permissionMode(role);
+    },
+
+    isolationPaths(_role: ResolvedRole, _dirs: RoleDirs) {
+      const claudeHome = join(home(), '.claude');
+      return {
+        home: claudeHome,
+        // Credentials and project trust (~/.claude.json), the global
+        // instructions every role shares, and the shared settings. Everything
+        // else under ~/.claude — sessions, projects, caches, history — is
+        // runtime state and belongs to the role, not to the fleet.
+        shared: [
+          join(home(), '.claude.json'),
+          join(claudeHome, 'CLAUDE.md'),
+          join(claudeHome, 'settings.json'),
+          join(claudeHome, 'plugins'),
+        ],
+      };
+    },
+
+    nativePermissionOverrides(options: unknown): Record<string, unknown> {
+      const pm = (options as ClaudeOptions | undefined)?.permission_mode;
+      return pm == null ? {} : { permission_mode: pm };
+    },
+
     translatePermissions(permissions) {
-      const native = permissions.approval === 'allow'
-        ? 'dontAsk'
-        : permissions.approval === 'deny'
-          ? 'plan'
-          : 'default';
+      const native = nativePermissionMode(permissions.approval) ?? 'default';
       const exact = permissions.filesystem === 'workspace' && permissions.approval === 'ask';
       return {
+        supported: true,
         native: { permission_mode: native },
         exact,
         warnings: exact ? [] : [
           'Claude permission modes do not exactly represent independent approval and filesystem intent; fleet isolation remains the outer boundary',
         ],
+        capabilities: claudeCapabilities(native, permissions.filesystem),
       };
+    },
+
+    effectivePermissions(role) {
+      const translated = this.translatePermissions(role.permissions);
+      if (!translated.supported) return translated;
+      const native = permissionMode(role) ?? 'default';
+      return {
+        ...translated,
+        native: { permission_mode: native },
+        capabilities: claudeCapabilities(native, role.permissions.filesystem),
+      };
+    },
+
+    effectivePermissionMode(role) {
+      const nativeMode = permissionMode(role) ?? 'default';
+      const fleetMode = nativeMode === 'bypassPermissions' ? 'allow'
+        : nativeMode === 'acceptEdits' || nativeMode === 'dontAsk' ? 'auto'
+          : nativeMode === 'default' || nativeMode === 'plan' ? 'ask' : undefined;
+      if (!fleetMode) throw new Error(`unsupported Claude permission mode '${nativeMode}'`);
+      return { fleetMode, nativeMode };
     },
 
     vocabulary: {
       bindTool: 'choose_identity',
       createTool: 'create_identity',
+      temporaryCreateTool: 'create_temporary_identity',
       setBioTool: 'set_bio',
       setPersonaTool: 'set_persona',
       currentIdentityTool: 'current_identity',
@@ -179,11 +323,11 @@ export function makeClaudeCodeAdapter(exec: Exec = realExec): HarnessAdapter {
       launchNote: name => `You were launched with \`--remote-control ${name}\`. Confirm you are running.`,
       restartPrompt: (id, worklog, role) =>
         `Session restarted. Re-bind your ours identity now (choose_identity name "${id}" force=true), ` +
-        (role?.monitor?.enabled
+        (role?.monitor?.mode === 'fleet'
           ? 'then continue from '
           : `then ${armMonitor(id)}, then continue from `) +
         `${worklog}. Do not re-run whatever crashed you.` +
-        (role?.monitor?.enabled
+        (role?.monitor?.mode === 'fleet'
           ? ' Your mail wakes arrive as `[fleet-monitor]` console lines from the supervisor — ' +
             'do NOT arm an in-session Monitor.'
           : ''),

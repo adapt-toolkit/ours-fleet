@@ -52,6 +52,21 @@ export interface WrapContext {
   harness?: string;
   /** Harness-declared writable roots (for example Codex --add-dir). */
   additionalWriteDirs?: string[];
+  /**
+   * The harness's home directory on the host (`~/.claude`, `~/.codex`). Mounted
+   * from `harnessRuntimeDir` so the agent's own runtime state is per-role (5.1).
+   */
+  harnessHome?: string;
+  /** Per-role writable directory backing `harnessHome` inside the sandbox. */
+  harnessRuntimeDir?: string;
+  /**
+   * Shared credentials, global instructions and configuration. Mounted READ-ONLY
+   * on top of the per-role home, so an agent can read them and cannot rewrite
+   * them for itself or for its peers.
+   */
+  harnessSharedPaths?: string[];
+  /** Exact launcher/interpreter/module closure required by the selected command. */
+  runtimeReadPaths?: string[];
   brokerEndpoint?: string;
 }
 
@@ -71,7 +86,12 @@ export interface ResolvedIsolation {
   system: string[];
   /** ephemeral scratch tmpfs mounts (/tmp, ~/.cache). */
   tmpfs: string[];
-  /** sensitive host paths guaranteed absent from the sandbox (observability). */
+  /**
+   * Sensitive host paths that are ENFORCED absent from the sandbox: any mount
+   * that is, sits inside, or would expose one of these is refused by
+   * `resolveIsolation` before a backend argv is built. Retained on the resolved
+   * policy for diagnostics — doctor and `config` report what is being enforced.
+   */
   blocklist: string[];
 }
 

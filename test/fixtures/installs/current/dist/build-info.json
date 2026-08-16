@@ -1,0 +1,10 @@
+{
+  "version": "0.16.0",
+  "buildId": "c0ffee123456",
+  "commit": "a86c4e9000000000000000000000000000000000",
+  "dirty": false,
+  "builtAt": "2026-08-12T23:10:00.000Z",
+  "capabilities": [
+    "monitor.interrupt.after_tool"
+  ]
+}

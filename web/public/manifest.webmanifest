@@ -1,0 +1,15 @@
+{
+  "id": "/",
+  "name": "ours fleet console",
+  "short_name": "ours fleet",
+  "description": "Secure localhost console for the ours agent fleet",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "background_color": "#111318",
+  "theme_color": "#111318",
+  "icons": [
+    { "src": "/icons/ours-fleet.svg", "sizes": "192x192", "type": "image/svg+xml", "purpose": "any" },
+    { "src": "/icons/ours-fleet-maskable.svg", "sizes": "512x512", "type": "image/svg+xml", "purpose": "maskable" }
+  ]
+}
