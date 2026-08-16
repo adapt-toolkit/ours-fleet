@@ -146,11 +146,21 @@ jobs:
           cache: npm
           registry-url: https://registry.npmjs.org
       - run: npm ci
+      # Gate the COMMITTED version, before the ephemeral rewrite below. The CLI
+      # reports whatever version its package.json carries, and the suite asserts
+      # that a released `ours-fleet --version` is a bare X.Y.Z that scripts can
+      # parse. Running these after the rewrite tested `0.X.0-nightly.N` against
+      # that release-only contract and failed the publish on a version this job
+      # had just injected itself.
+      - run: npm run build
+      - run: npm test
       - name: Compute ephemeral lockstep nightly version
         id: nightly
         run: bash .github/workflows/scripts/set-nightly-versions.sh
+      # Rebuild so the shipped artifacts and their build stamp carry the nightly
+      # version. Same shape as the stable publish job: gate the source, then
+      # build exactly what is published.
       - run: npm run build
-      - run: npm test
       - name: Publish @ours.network/fleet (nightly)
         run: bash .github/workflows/scripts/publish-nightly.sh .
         env:
