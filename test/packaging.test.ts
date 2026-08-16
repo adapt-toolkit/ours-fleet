@@ -12,6 +12,7 @@
 import { describe, it, expect } from 'vitest';
 import { readFileSync } from 'node:fs';
 import { join, resolve } from 'node:path';
+import { parse } from 'yaml';
 
 const REPO = resolve('.');
 const manifest = () => JSON.parse(readFileSync(join(REPO, 'package.json'), 'utf8'));
@@ -43,6 +44,76 @@ describe('the pack contract is declared, not incidental', () => {
     // test/integration, so `npm test` cannot pick it up by accident.
     expect(read('vitest.config.ts')).toContain("include: ['test/**/*.test.ts']");
     expect(read('vitest.integration.config.ts')).toContain('fileParallelism: false');
+  });
+});
+
+/**
+ * The nightly publish path, which no pull request can exercise.
+ *
+ * `nightly-publish` only runs on a push to `prerelease`, so a green PR proves
+ * nothing about it and both of its failures were found in production. What
+ * broke twice is the same collision: the job injects an ephemeral
+ * `X.Y.0-nightly.N` version, and the suite asserts that a released
+ * `ours-fleet --version` is a bare X.Y.Z. First the job's own `npm test` ran
+ * after the rewrite; then `npm publish` reran the suite again through the root
+ * package's `prepublishOnly`. These lock both doors.
+ */
+describe('the nightly publish path gates the committed version only', () => {
+  const steps = () => (parse(read('.github/workflows/publish.yml')) as {
+    jobs: Record<string, { steps: Array<{ name?: string; run?: string; uses?: string }> }>;
+  }).jobs['nightly-publish'].steps;
+  const indexOf = (match: (step: { name?: string; run?: string }) => boolean) =>
+    steps().findIndex(match);
+  const rewriteAt = () => indexOf(step => (step.run ?? '').includes('set-nightly-versions.sh'));
+  const runsSuite = (step: { run?: string }) => /(^|\s|&&)npm test(\s|$)/.test(step.run ?? '');
+  const builds = (step: { run?: string }) => (step.run ?? '').trim() === 'npm run build';
+
+  it('runs the full suite before the version rewrite', () => {
+    const suite = indexOf(runsSuite);
+    expect(suite).toBeGreaterThanOrEqual(0);
+    expect(rewriteAt()).toBeGreaterThan(suite);
+  });
+
+  it('never reruns the suite against the injected version', () => {
+    expect(steps().slice(rewriteAt() + 1).filter(runsSuite)).toEqual([]);
+  });
+
+  it('rebuilds after the rewrite, so the shipped stamp carries the nightly version', () => {
+    const publishAt = indexOf(step => (step.run ?? '').includes('publish-nightly.sh'));
+    const rebuild = steps().findIndex((step, i) => i > rewriteAt() && builds(step));
+    expect(rebuild).toBeGreaterThan(rewriteAt());
+    expect(publishAt).toBeGreaterThan(rebuild);
+  });
+
+  it('keeps the tag verification last, after every publish', () => {
+    const verify = indexOf(step => (step.run ?? '').includes('verify-nightly-tags.sh'));
+    const publishes = steps()
+      .map((step, i) => ({ i, publish: (step.run ?? '').includes('publish-nightly.sh') }))
+      .filter(entry => entry.publish);
+    expect(publishes).toHaveLength(3);
+    expect(verify).toBeGreaterThan(publishes.at(-1)!.i);
+  });
+
+  it('publishes the already-built root artifact without re-entering its lifecycle', () => {
+    const script = read('.github/workflows/scripts/publish-nightly.sh');
+    // The guard is what makes a stray publish impossible; it must stay ahead of
+    // every branch below it.
+    expect(script.indexOf('publish-guard.sh nightly'))
+      .toBeLessThan(script.indexOf('npm publish'));
+    expect(script).toMatch(
+      /if \[\[ "\$dir" == "\." \]\]; then\s+npm publish \. --tag nightly --access public --ignore-scripts\s+else\s+npm publish \. --tag nightly --access public\s+fi/);
+  });
+
+  it('scopes that skip to the only package with a publish lifecycle', () => {
+    // --ignore-scripts is applied to the root alone because the root alone has
+    // scripts to skip. If an integration ever gains one, widen the skip rather
+    // than let npm rerun a release-only suite against a nightly version.
+    expect(manifest().scripts.prepublishOnly).toBe('npm run build && npm test');
+    for (const dir of ['integrations/claude-code', 'integrations/codex/ours-fleet']) {
+      const scripts = JSON.parse(read(`${dir}/package.json`)).scripts ?? {};
+      expect(scripts.prepublishOnly).toBeUndefined();
+      expect(scripts.prepack).toBeUndefined();
+    }
   });
 });
 
