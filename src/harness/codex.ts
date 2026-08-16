@@ -5,12 +5,14 @@ import { agentDir, home } from '../paths.js';
 import { realExec, type Exec } from '../exec.js';
 import type { ResolvedRole } from '../config.js';
 import type {
-  HarnessAdapter, RoleDirs, SessionPrep, SessionState, Launch, ValidationError,
+  AcpLaunch, HarnessAdapter, RoleDirs, SessionPrep, SessionState, Launch, ValidationError,
   UnattendedCapability,
 } from './types.js';
 import { registerAdapter } from './registry.js';
 import { harnessRuntimeDir } from '../isolation/policy.js';
-import { bundledAcpAgent, resolveBundledAcpAgent } from './acp-agent.js';
+import {
+  resolveBundledAcpAgent, type AcpAgentResolution,
+} from './acp-agent.js';
 
 interface CodexOptions {
   launcher?: string;
@@ -136,6 +138,21 @@ function launcherMode(role: ResolvedRole): string {
 
 function bundledCodexAcp() {
   return resolveBundledAcpAgent(CODEX_ACP_PACKAGE, 'codex-acp', 'codex-acp');
+}
+
+/** Bind launch argv and metadata provenance to one already-completed resolution. */
+export function codexAcpLaunchForResolution(
+  resolution: AcpAgentResolution,
+): Pick<AcpLaunch, 'argv' | 'permissionMetadataSource'> {
+  const permissionMetadataSource = resolution.bundled
+    && resolution.version === BUNDLED_CODEX_ACP_VERSION
+    && resolution.manifestPath !== undefined
+    ? 'codex-acp' as const
+    : undefined;
+  return {
+    argv: [...resolution.argv],
+    ...(permissionMetadataSource ? { permissionMetadataSource } : {}),
+  };
 }
 
 function canOverrideBundledAcpApproval(): boolean {
@@ -330,18 +347,25 @@ export function makeCodexAdapter(exec: Exec = realExec): HarnessAdapter {
       return { argv, env: prep.env };
     },
 
-    buildAcpLaunch(role: ResolvedRole, prep: SessionPrep): Launch {
+    buildAcpLaunch(role: ResolvedRole, prep: SessionPrep): AcpLaunch {
       const configured = role.session_options?.acp?.command;
+      // Resolve once: both argv and permission-metadata provenance must describe
+      // the same artifact. A bare PATH fallback is launchable for compatibility,
+      // but is never authenticated for protected-MCP auto-approval.
+      const resolved = configured == null
+        ? codexAcpLaunchForResolution(bundledCodexAcp())
+        : undefined;
       const argv = Array.isArray(configured)
         ? [...configured]
         : typeof configured === 'string'
           ? ['sh', '-c', configured]
-          : bundledAcpAgent(
-              CODEX_ACP_PACKAGE, 'codex-acp', 'codex-acp');
+          : resolved!.argv;
       const initialMode = acpAgentMode(role);
       return {
         argv,
         env: initialMode ? { ...prep.env, INITIAL_AGENT_MODE: initialMode } : prep.env,
+        ...(resolved?.permissionMetadataSource
+          ? { permissionMetadataSource: resolved.permissionMetadataSource } : {}),
       };
     },
 
@@ -349,12 +373,6 @@ export function makeCodexAdapter(exec: Exec = realExec): HarnessAdapter {
     // keeps resumed/loaded sessions and live status on the identical mode.
     acpPermissionModeId(role: ResolvedRole): string | undefined {
       return acpAgentMode(role);
-    },
-
-    acpPermissionMetadataSource(role: ResolvedRole): 'codex-acp' | undefined {
-      // The adapter controls the default launch and pins its protocol version.
-      // A configured command can be any ACP agent, so its `_meta` stays untrusted.
-      return role.session_options?.acp?.command == null ? 'codex-acp' : undefined;
     },
 
     isolationPaths(role: ResolvedRole, _dirs: RoleDirs) {

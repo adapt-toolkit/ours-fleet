@@ -2,7 +2,9 @@ import { describe, it, expect } from 'vitest';
 import { existsSync, mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { makeCodexAdapter, codexCapabilities } from '../src/harness/codex.js';
+import {
+  codexAcpLaunchForResolution, makeCodexAdapter, codexCapabilities,
+} from '../src/harness/codex.js';
 import { checkUnattendedFloor } from '../src/permissions.js';
 import { agentDir } from '../src/paths.js';
 import type { ResolvedRole } from '../src/config.js';
@@ -189,22 +191,46 @@ describe('buildAcpLaunch', () => {
     expect(launch.argv[0]).toBe(process.execPath);
     expect(launch.argv[1]).toMatch(
       /@agentclientprotocol[/\\]codex-acp[/\\]dist[/\\]index\.js$/);
+    expect(launch.permissionMetadataSource).toBe('codex-acp');
   });
 
-  it('preserves an explicit ACP command override', () => {
-    const launch = makeCodexAdapter(okExec).buildAcpLaunch!(
-      role({ session_options: { acp: { command: ['custom-codex-acp', '--flag'] } } }),
-      { argv: [], env: {} },
-    );
-    expect(launch.argv).toEqual(['custom-codex-acp', '--flag']);
+  it.each([
+    [['custom-codex-acp', '--flag'], ['custom-codex-acp', '--flag']],
+    ['custom-codex-acp --flag', ['sh', '-c', 'custom-codex-acp --flag']],
+  ] as const)('preserves explicit ACP command override %j without metadata trust',
+    (command, expected) => {
+      const launch = makeCodexAdapter(okExec).buildAcpLaunch!(
+        role({ session_options: { acp: { command } } }), { argv: [], env: {} });
+      expect(launch.argv).toEqual(expected);
+      expect(launch.permissionMetadataSource).toBeUndefined();
+    });
+
+  it('binds protected-MCP metadata trust to the exact bundled Codex ACP launch', () => {
+    const launch = codexAcpLaunchForResolution({
+      argv: [process.execPath, '/fleet/codex-acp/dist/index.js'], bundled: true,
+      manifestPath: '/fleet/codex-acp/package.json', version: '1.1.7',
+    });
+    expect(launch.argv).toEqual([process.execPath, '/fleet/codex-acp/dist/index.js']);
+    expect(launch.permissionMetadataSource).toBe('codex-acp');
   });
 
-  it('authenticates protected-MCP metadata only for its adapter-controlled launch', () => {
-    const adapter = makeCodexAdapter(okExec);
-    expect(adapter.acpPermissionMetadataSource!(role({ session: 'acp' }))).toBe('codex-acp');
-    expect(adapter.acpPermissionMetadataSource!(role({
-      session: 'acp', session_options: { acp: { command: ['custom-codex-acp'] } },
-    }))).toBeUndefined();
+  it.each([
+    ['bare PATH fallback', { argv: ['codex-acp'], bundled: false }],
+    ['missing manifest provenance', {
+      argv: [process.execPath, '/corrupt/codex-acp.js'], bundled: true, version: '1.1.7',
+    }],
+    ['missing version', {
+      argv: [process.execPath, '/corrupt/codex-acp.js'], bundled: true,
+      manifestPath: '/corrupt/package.json',
+    }],
+    ['version skew', {
+      argv: [process.execPath, '/skewed/codex-acp.js'], bundled: true,
+      manifestPath: '/skewed/package.json', version: '1.1.8',
+    }],
+  ] as const)('keeps %s launch metadata untrusted', (_label, resolution) => {
+    const launch = codexAcpLaunchForResolution(resolution);
+    expect(launch.argv).toEqual(resolution.argv);
+    expect(launch.permissionMetadataSource).toBeUndefined();
   });
 
   it.each([

@@ -548,6 +548,60 @@ describe('runOnce ACP startup outcome (1.2)', () => {
 
   beforeEach(() => { registerAdapter(acpAdapter); });
 
+  it('passes only provenance attached to the exact ACP launch into the session', async () => {
+    registerAdapter({
+      ...acpAdapter,
+      id: 'fake-acp-provenance',
+      buildAcpLaunch: () => ({
+        argv: ['fixture-acp'], env: {}, permissionMetadataSource: 'codex-acp',
+      }),
+    });
+    writeCfg({ A: {
+      harness: 'fake-acp-provenance', session: 'acp',
+      permissions: { approval: 'allow', filesystem: 'workspace', unattended: 'wait' },
+    } });
+    mkdirSync(agentDir('A'), { recursive: true });
+    const { deps } = acpDeps();
+    let observedSource: string | undefined;
+    let alive = true;
+    const fakeAcp: SessionHandle = {
+      backend: 'acp', pid: 4242,
+      isAlive: () => alive,
+      snapshot: () => ({ backend: 'acp', alive, readiness: 'idle' }),
+      queuePrompt: async (_text, options) => {
+        alive = false;
+        return {
+          promptId: 'startup', queuedBehind: 0, origin: options?.origin,
+          completion: Promise.resolve(turnResult(true, 'completed', 'end_turn')),
+        };
+      },
+      submitPrompt: async (text, options) =>
+        (await fakeAcp.queuePrompt(text, options)).completion,
+      interrupt: async () => ({ state: 'settled' }),
+      respondPermission: () => false,
+      eventsSince: () => [],
+      subscribe: () => () => {},
+      setControllerAttached: () => {},
+      exitResult: () => ({ version: 1, class: 'clean', code: 0, detail: 'test complete' }),
+      close: async () => { alive = false; },
+    };
+    const runnerDeps: Partial<RunnerDeps> = {
+      ...deps,
+      startAcpSession: async options => {
+        observedSource = options.permissionMetadataSource;
+        return fakeAcp;
+      },
+      createControlServer: () => ({
+        start: async () => {}, close: async () => {},
+        setFleetSpawner: () => {}, setOwnerChannel: () => {},
+        setConfigReloader: () => {}, setLoopManager: () => {},
+      }),
+    };
+
+    await runOnce('A', {}, runnerDeps);
+    expect(observedSource).toBe('codex-acp');
+  });
+
   it('a refused startup prompt fails the role instead of logging it up', async () => {
     writeCfg({ A: {
       harness: 'fake-acp', session: 'acp',

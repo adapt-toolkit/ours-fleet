@@ -14,7 +14,10 @@ export interface SessionPrep {
   command?: string;
 }
 export interface Launch { argv: string[]; env: Record<string, string> }
-export interface AcpLaunch { argv: string[]; env: Record<string, string> }
+export interface AcpLaunch extends Launch {
+  /** Metadata vocabulary authenticated by the exact ACP artifact in argv. */
+  permissionMetadataSource?: 'codex-acp';
+}
 /**
  * The result of expressing neutral `permissions:` in a harness's own terms.
  *
@@ -95,11 +98,6 @@ export interface HarnessAdapter {
    * agent's default. Omit for a harness whose ACP agent has no modes.
    */
   acpPermissionModeId?(role: ResolvedRole): string | undefined;
-  /**
-   * Adapter-authenticated vocabulary for ACP permission metadata. Omit when a
-   * custom/unverified agent command owns the transport or no metadata is trusted.
-   */
-  acpPermissionMetadataSource?(role: ResolvedRole): 'codex-acp' | undefined;
   /** Effective portable policy and harness-native approval mode after native overrides win. */
   effectivePermissionMode?(role: ResolvedRole): {
     fleetMode: FleetPermissionMode;
