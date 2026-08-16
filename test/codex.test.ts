@@ -199,6 +199,14 @@ describe('buildAcpLaunch', () => {
     expect(launch.argv).toEqual(['custom-codex-acp', '--flag']);
   });
 
+  it('authenticates protected-MCP metadata only for its adapter-controlled launch', () => {
+    const adapter = makeCodexAdapter(okExec);
+    expect(adapter.acpPermissionMetadataSource!(role({ session: 'acp' }))).toBe('codex-acp');
+    expect(adapter.acpPermissionMetadataSource!(role({
+      session: 'acp', session_options: { acp: { command: ['custom-codex-acp'] } },
+    }))).toBeUndefined();
+  });
+
   it.each([
     ['allow', 'read-only', 'agent-full-access'],
     ['allow', 'workspace', 'agent-full-access'],

@@ -351,6 +351,12 @@ export function makeCodexAdapter(exec: Exec = realExec): HarnessAdapter {
       return acpAgentMode(role);
     },
 
+    acpPermissionMetadataSource(role: ResolvedRole): 'codex-acp' | undefined {
+      // The adapter controls the default launch and pins its protocol version.
+      // A configured command can be any ACP agent, so its `_meta` stays untrusted.
+      return role.session_options?.acp?.command == null ? 'codex-acp' : undefined;
+    },
+
     isolationPaths(role: ResolvedRole, _dirs: RoleDirs) {
       const codexHome = join(home(), '.codex');
       const profile = (role.harness_options as CodexOptions | undefined)?.profile;

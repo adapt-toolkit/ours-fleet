@@ -224,6 +224,8 @@ export interface AcpSessionOptions {
   modeId?: string;
   /** Adapter-resolved live permission policy; separate from ACP agent-specific session modes. */
   permissionMode?: NonNullable<SessionSnapshot['permissionMode']>;
+  /** Adapter-authenticated request-metadata vocabulary; never inferred from ACP `_meta`. */
+  permissionMetadataSource?: 'codex-acp';
   log(line: string): void;
   /** Test seam for the cancel-escalation grace period; production uses the default. */
   cancelGraceMs?: number;
@@ -1164,6 +1166,17 @@ export class AcpSession implements SessionHandle {
     // Permission is part of the tool lifecycle. Reserve before any policy or
     // human decision so a monitor wake cannot slip between request and answer.
     this.reservePermission(toolCallId, permissionId);
+    if (this.isEffectiveCodexProtectedMcpApproval(params)) {
+      // Protected MCP approval is already the tool's narrow gate. Never turn
+      // this one decision into an adapter-wide standing grant.
+      const option = choose(['allow_once']);
+      const response = this.settleAutomatically(params, option, 'allowed',
+        'permissionMode.fleetMode=allow',
+        'the trusted Codex adapter authenticated a protected MCP approval request');
+      if (option) this.allowPermission(toolCallId, permissionId);
+      else this.releasePermission(toolCallId, permissionId);
+      return Promise.resolve(response);
+    }
     if (this.options.permissions.approval === 'allow' && this.withinAutomaticBoundary(params)) {
       const option = choose(['allow_always', 'allow_once']);
       const response = this.settleAutomatically(params, option, 'allowed',
@@ -1298,6 +1311,30 @@ export class AcpSession implements SessionHandle {
     if (locations.length === 0) return false;
     const cwd = resolve(this.options.cwd);
     return canonicallyWithin(cwd, locations.map(location => resolve(location.path)));
+  }
+
+  /**
+   * Codex ACP 1.1.7 marks its protected MCP elicitation bridge on a locationless
+   * execute request. The marker is meaningful only together with the runner's
+   * independently supplied, adapter-authenticated metadata vocabulary and effective
+   * mode: an arbitrary ACP process cannot gain this path by copying `_meta` alone.
+   * Exact option ids/kinds bind recognition to the protected-MCP shape and keep
+   * malformed requests on the ordinary fail-closed path.
+   */
+  private isEffectiveCodexProtectedMcpApproval(
+    params: acp.RequestPermissionRequest,
+  ): boolean {
+    const locations = params.toolCall.locations ?? [];
+    return this.options.permissionMetadataSource === 'codex-acp'
+      && this.options.permissionMode?.fleetMode === 'allow'
+      && params.toolCall.kind === 'execute'
+      && params.toolCall.status === 'pending'
+      && locations.length === 0
+      && params._meta?.is_mcp_tool_approval === true
+      && params.options.some(option =>
+        option.optionId === 'allow_once' && option.kind === 'allow_once')
+      && params.options.some(option =>
+        option.optionId === 'decline' && option.kind === 'reject_once');
   }
 
   private recordUpdate(update: acp.SessionUpdate): void {

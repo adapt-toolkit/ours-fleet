@@ -613,6 +613,7 @@ export async function runOnce(
       permissions: perms,
       modeId: adapter.acpPermissionModeId?.(role),
       permissionMode: effectivePermissionMode(role),
+      permissionMetadataSource: adapter.acpPermissionMetadataSource?.(role),
       log: deps.log,
     });
     pid = acpSession.pid;
