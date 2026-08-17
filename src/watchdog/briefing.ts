@@ -118,6 +118,13 @@ export function generateWatchdogBriefing(opts: WatchdogBriefingOpts): string {
   L.push('- `healthy` — alive, on-briefing, recent progress.');
   L.push('- `idle` — alive, nothing assigned or nothing to do. Not an anomaly.');
   L.push('- `stale` = no worklog append and no console progress for ≥ 3 intervals.');
+  L.push('');
+  L.push('`session.readiness` from `ours-fleet status` is TURN OCCUPANCY, not activity: a mail');
+  L.push('wake delivered by ACP steering runs an entire turn while readiness stays `idle`. Never');
+  L.push('report `idle` or `stale` from `readiness=idle` alone — corroborate with the');
+  L.push('`activity:` line of the same `status` output (`active` means the agent is working),');
+  L.push('the worklog, or `ours-fleet peek`. `activity: unobservable` is missing evidence, not');
+  L.push('an idle agent.');
   L.push('- `blocked` = waiting on a permission/prompt/modal longer than one interval.');
   L.push('- `off_briefing` — activity contradicts the briefing (wrong repo, out-of-scope work,');
   L.push('  ignored routine).');

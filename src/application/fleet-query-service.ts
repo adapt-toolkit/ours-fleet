@@ -1,6 +1,7 @@
 import { lstatSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import type { SupervisorBackend } from '../supervisor/types.js';
+import { classifyActivity } from '../session/activity.js';
 import { controlRequest } from '../session/control.js';
 import { SessionControlError, type SessionSnapshot } from '../session/types.js';
 import { readExitRecord, readRestartLedger } from '../runner.js';
@@ -66,6 +67,9 @@ function sessionOverall(
   if (session.reachability === 'online'
       && (session.readiness === 'running' || session.readiness === 'awaiting_permission'))
     return 'busy';
+  // `readiness: idle` alone never justifies `ready`. A steered wake turn is
+  // invisible to readiness (FLEET-002), so observed activity outranks it.
+  if (session.reachability === 'online' && session.activity.state === 'active') return 'busy';
   if (session.reachability === 'online' && session.readiness === 'idle') return 'ready';
   if (session.reachability === 'offline'
       && (session.evidence === 'authoritative' || supervisor.liveness === 'stopped'))
@@ -183,6 +187,7 @@ export class FleetQueryService {
           protocolVersion: snapshot.protocolVersion, features: snapshot.features,
           runtimeModel: snapshot.runtimeModel, reasoningEffort: snapshot.reasoningEffort,
           permissionMode: snapshot.permissionMode,
+          activity: classifyActivity(snapshot.activity),
         };
       } catch (error) {
         const failure = error instanceof SessionControlError ? error.kind : 'backend';
@@ -193,6 +198,7 @@ export class FleetQueryService {
             : failure === 'control-unavailable' ? 'unavailable' : 'unknown',
           readiness: offline ? 'failed' : 'unknown',
           evidence: 'authoritative', lastError: clean((error as Error).message),
+          activity: { state: 'unobservable' },
         };
       }
     }
@@ -203,17 +209,22 @@ export class FleetQueryService {
           backend: 'tmux', reachability: has ? 'online' : supervisor === 'stopped' ? 'offline' : 'unknown',
           readiness: has ? 'idle' : supervisor === 'running' ? 'starting' : 'failed',
           evidence: 'inferred',
+          // tmux exposes no agent-side evidence at all, and `readiness: idle`
+          // here is a pane-liveness inference, not an activity claim.
+          activity: { state: 'unobservable' },
         };
       } catch (error) {
         return {
           backend: 'tmux', reachability: 'unknown', readiness: 'unknown',
           evidence: 'inferred', lastError: clean((error as Error).message),
+          activity: { state: 'unobservable' },
         };
       }
     }
     return {
       backend: 'unknown', reachability: supervisor === 'stopped' ? 'offline' : 'unknown',
       readiness: supervisor === 'stopped' ? 'failed' : 'unknown', evidence: 'inferred',
+      activity: { state: 'unobservable' },
     };
   }
 }

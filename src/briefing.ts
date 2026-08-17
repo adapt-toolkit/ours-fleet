@@ -179,7 +179,12 @@ export function generateBriefing(role: ResolvedRole, v: BriefingVocab, opts: Bri
     L.push('Never translate any other failure into "dead". A busy agent, an unanswered control');
     L.push('plane and a confirmed stop look identical if you only look at one command.');
     L.push('');
-    L.push('Then judge the console content: stuck on a prompt/menu/trust dialog → answer it directly');
+    L.push('`ours-fleet status` reports `session.readiness`, which is TURN OCCUPANCY only: a mail');
+  L.push('wake delivered by steering runs a whole turn with readiness pinned at `idle`. Read the');
+  L.push('`activity:` line beside it — `active` means the role is working — and never call a role');
+  L.push('idle or stalled from `readiness=idle` alone.');
+  L.push('');
+  L.push('Then judge the console content: stuck on a prompt/menu/trust dialog → answer it directly');
     L.push('with `ours-fleet send <Name> "<text>"` (or `--key <K>` for raw keys); idle with work');
     L.push('assigned → nudge; actively working → do nothing, and do not mistake a long turn for a');
     L.push('stall. Escalate over ours messaging only when you cannot resolve it yourself.');

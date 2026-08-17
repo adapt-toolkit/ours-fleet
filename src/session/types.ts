@@ -3,6 +3,17 @@ import type {
   ConversationEventV1, ConversationSnapshot, PromptReceipt, SubmitPromptCommand,
 } from './conversation-types.js';
 
+/**
+ * TURN OCCUPANCY, and nothing else: `idle` means no fleet-tracked turn is in
+ * flight, which is exactly the question `arbiter.tryScheduled` asks before it
+ * admits a prompt. It is NOT a claim that the agent is doing nothing — a wake
+ * delivered through the `_session/steering` extension answers `startedNewTurn`
+ * and runs a whole turn that fleet never gets a `session/prompt` response for
+ * (ACP has no turn-end session update), so `readiness` stays `idle` for its
+ * entire duration. Anything reporting activity or liveness to a human must
+ * corroborate with `SessionSnapshot.activity` instead of reading `idle` here as
+ * "not working".
+ */
 export type SessionReadiness =
   | 'starting'
   | 'idle'
@@ -223,6 +234,20 @@ export interface SessionSnapshot {
     /** Exact harness-native approval/permission mode used by this runner. */
     nativeMode: string;
   };
+  /**
+   * Observed agent activity, independent of turn occupancy: the evidence a
+   * human-facing surface needs before calling a role idle. Absent on backends
+   * that cannot observe the agent at all (tmux), which is itself honest — no
+   * evidence is not evidence of inactivity.
+   */
+  activity?: SessionActivity;
+}
+
+export interface SessionActivity {
+  /** ACP tool calls currently reserved (lifecycle open or permission pending). */
+  activeToolCalls: number;
+  /** When the agent last sent ANY session update, replay excluded. */
+  lastUpdateAt?: string;
 }
 
 export type SessionEventKind =
