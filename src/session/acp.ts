@@ -56,13 +56,6 @@ const PERMISSION_TIMEOUT_MS = 10 * 60_000;
 const CONTROLLER_GRACE_MS = 12_000;
 /** Bound safe-boundary waiting without turning a hung tool into cancellation. */
 export const AFTER_TOOL_BOUNDARY_TIMEOUT_MS = 120_000;
-/**
- * How long an interrupting delivery waits for a tool boundary before giving up
- * on cancelling and simply queueing. Shorter than the after-tool wake budget:
- * this one runs inside the arbiter's admission boundary, and the caller has an
- * honest "queued" answer available the moment it expires.
- */
-export const INTERRUPT_BOUNDARY_TIMEOUT_MS = 30_000;
 const TERMINAL_TOOL_STATUSES = new Set(['completed', 'failed']);
 
 const SCHEDULED_LOOP_REDACTION = '[scheduled-loop content redacted]';
@@ -245,8 +238,6 @@ export interface AcpSessionOptions {
   controllerGraceMs?: number;
   /** Test seam; production uses AFTER_TOOL_BOUNDARY_TIMEOUT_MS. */
   afterToolBoundaryTimeoutMs?: number;
-  /** Test seam; production uses INTERRUPT_BOUNDARY_TIMEOUT_MS. */
-  interruptBoundaryTimeoutMs?: number;
 }
 
 /**
@@ -686,16 +677,14 @@ export class AcpSession implements SessionHandle {
     source: TurnCancellationSource,
   ): Promise<PromptDelivery> {
     if (!this.sessionId) return 'started';
-    const busy = this.activeToolCalls.size > 0;
-    if (busy) await this.waitForToolBoundary(
-      this.options.interruptBoundaryTimeoutMs ?? INTERRUPT_BOUNDARY_TIMEOUT_MS);
-    // A tool that outlived the boundary budget: cancelling now is exactly the
-    // orphaned `tool_use` this method exists to prevent.
-    if (this.activeToolCalls.size > 0) return 'deferred';
-    // No fleet-tracked turn to await. Either the session is idle (cancelling it
-    // corrupts the transcript for no gain) or the adapter is running a turn we
-    // never started (cancelling it is unawaitable). Queue in both cases.
-    if (!this.activeTurn) return busy ? 'deferred' : 'started';
+    // No fleet-tracked turn to await. Either the session is idle — cancelling it
+    // corrupts the transcript for no gain — or the adapter is running a turn
+    // fleet never started, whose settlement nothing here can wait for. Queue in
+    // both cases: the ACP queue already orders this correctly.
+    if (!this.activeTurn) return this.activeToolCalls.size > 0 ? 'deferred' : 'started';
+    // A tracked turn IS safe to cancel: cancelActive settles pending permissions
+    // and awaits the turn's own settlement before this returns, so the prompt
+    // below cannot race the adapter's transcript repair.
     await this.cancelActive(source);
     return 'interrupted';
   }

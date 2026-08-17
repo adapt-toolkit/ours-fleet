@@ -264,7 +264,6 @@ describe('AcpSession interrupting delivery never orphans a tool_use', () => {
       },
     }, {
       steeringSupported: false,
-      options: { name: 'A', interruptBoundaryTimeoutMs: 10 },
       activeToolCalls: new Map([['tool-1', { lifecycle: true, permissions: new Map() }]]),
     });
 
@@ -278,9 +277,8 @@ describe('AcpSession interrupting delivery never orphans a tool_use', () => {
     expect(calls).toEqual(['session/prompt']);
   });
 
-  it('waits for the tool boundary before cancelling a tracked turn', async () => {
+  it('still cancels a fleet-tracked turn, whose settlement it can await', async () => {
     const calls: string[] = [];
-    const activeToolCalls = new Map([['tool-1', { lifecycle: true, permissions: new Map() }]]);
     const session = fakeSession({
       notify: async method => { calls.push(method); },
       request: async method => {
@@ -289,23 +287,16 @@ describe('AcpSession interrupting delivery never orphans a tool_use', () => {
       },
     }, {
       steeringSupported: false,
-      options: { name: 'A', interruptBoundaryTimeoutMs: 1_000 },
-      activeToolCalls,
+      activeToolCalls: new Map([['tool-1', { lifecycle: true, permissions: new Map() }]]),
       activeTurn: trackedTurn(),
     });
 
-    const admission = session.queuePrompt('owner request', {
+    const queued = await session.queuePrompt('owner request', {
       interrupt: true, interruptSource: 'owner', origin: { kind: 'owner', requestId: 'r1' },
     });
-    await new Promise(resolve => setTimeout(resolve, 5));
-    // The cancel must not have gone out while the tool was still unresolved.
-    expect(calls).toEqual([]);
-
-    (session as unknown as { releaseTool(id: string): void }).releaseTool('tool-1');
-    const queued = await admission;
 
     expect(queued.delivery).toBe('interrupted');
-    expect(calls[0]).toBe('session/cancel');
+    expect(calls).toEqual(['session/cancel', 'session/prompt']);
   });
 
   it('does not cancel an idle session', async () => {
@@ -326,26 +317,4 @@ describe('AcpSession interrupting delivery never orphans a tool_use', () => {
     expect(queued.delivery).toBe('started');
   });
 
-  it('queues rather than cancelling when the tool outlives the boundary budget', async () => {
-    const calls: string[] = [];
-    const session = fakeSession({
-      notify: async method => { calls.push(method); },
-      request: async method => {
-        calls.push(method);
-        return { stopReason: 'end_turn' };
-      },
-    }, {
-      steeringSupported: false,
-      options: { name: 'A', interruptBoundaryTimeoutMs: 10 },
-      activeToolCalls: new Map([['stuck', { lifecycle: true, permissions: new Map() }]]),
-      activeTurn: trackedTurn(),
-    });
-
-    const queued = await session.queuePrompt('owner request', {
-      interrupt: true, interruptSource: 'owner', origin: { kind: 'owner', requestId: 'r1' },
-    });
-
-    expect(calls).not.toContain('session/cancel');
-    expect(queued.delivery).toBe('deferred');
-  });
 });
