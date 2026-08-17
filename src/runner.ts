@@ -107,6 +107,8 @@ const defaultDeps = (): RunnerDeps => ({
 });
 
 const MONITOR_OWNER_FILE = '.monitor-owner';
+/** Fleet roles consume the operator-owned daemon; a role session never starts it. */
+const FLEET_OURS_AUTOSTART = '0';
 
 /** Environment injected only into the managed harness process. */
 export function managedFleetProxyEnv(
@@ -114,6 +116,9 @@ export function managedFleetProxyEnv(
 ): Record<string, string> {
   return {
     ...(role.env ?? {}),
+    // This must win over both inherited/configured auto-start. ACP agents run
+    // directly rather than through ours-codex, so the runner owns this fence.
+    OURS_AUTOSTART: FLEET_OURS_AUTOSTART,
     [FLEET_PROXY_STATE_DIR_ENV]: stateDir,
     [FLEET_PROXY_CALLER_ENV]: role.name,
   };
@@ -195,6 +200,10 @@ export function buildPaneCommand(
 ): string {
   const env = {
     PATH: process.env.PATH ?? '', COLORTERM: 'truecolor', ...launch.env, ...(roleEnv ?? {}),
+    // Tmux roles have the same daemon-client boundary as ACP roles. Keep this
+    // last so neither harness preparation nor a role env block can take over
+    // the shared daemon lifecycle.
+    OURS_AUTOSTART: FLEET_OURS_AUTOSTART,
   };
   // Interactive panes should advertise colour even when the supervisor itself
   // was launched with NO_COLOR. A role may still deliberately opt back in to
