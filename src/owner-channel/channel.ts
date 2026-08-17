@@ -840,11 +840,7 @@ export class OwnerChannel implements OwnerChannelHandle {
           origin: { kind: 'owner', requestId,
             ...(group.caption ? { displayText: String(group.caption.text ?? '') } : {}) },
         });
-      const accepted = this.options.config.interrupt
-        ? ownerNotices.receivedInterrupting()
-        : queued.queuedBehind > 0
-          ? ownerNotices.receivedQueued(queued.queuedBehind)
-          : ownerNotices.receivedStarted();
+      const accepted = this.acceptanceNotice(queued);
       handledWireIds.forEach(wire => this.inFlight.add(wire));
       const receipt = this.send(sender.id, accepted, originWireId).then(() => undefined).catch(error => {
         this.logError(`attachment request ${requestId.slice(0, 12)} acceptance notice failed`, error);
@@ -972,14 +968,7 @@ export class OwnerChannel implements OwnerChannelHandle {
       return true;
     }
 
-    // Interrupting the live turn does not remove prompts which were already
-    // accepted into the ACP queue. Never claim this request is running while
-    // the session itself says earlier work remains ahead of it.
-    const accepted = queued.queuedBehind > 0
-      ? ownerNotices.receivedQueued(queued.queuedBehind)
-      : this.options.config.interrupt
-        ? ownerNotices.receivedInterrupting()
-        : ownerNotices.receivedStarted();
+    const accepted = this.acceptanceNotice(queued);
     this.inFlight.add(wireId);
     const receipt = this.send(sender.id, accepted, wireId).then(() => undefined).catch(error => {
       this.logError(`request ${requestId.slice(0, 12)} acceptance notice failed`, error);
@@ -1359,6 +1348,33 @@ export class OwnerChannel implements OwnerChannelHandle {
 
   private authorizationIntegrity(): { ok: boolean; error?: string } {
     return this.options.config.agent ? { ok: true } : this.authorizations.integrity();
+  }
+
+  /**
+   * Report what the session actually did with the prompt, not what the config
+   * asked for. `interrupt: true` used to be reported as "your request
+   * interrupted the previous task" unconditionally; the session now answers
+   * whether anything was cancelled, whether the request is queued behind
+   * earlier prompts, or whether it is held until the current task reaches a
+   * safe stopping point. Backends that report no delivery state keep the old
+   * queuedBehind-based wording.
+   */
+  private acceptanceNotice(queued: QueuedPrompt): string {
+    switch (queued.delivery) {
+      case 'interrupted': return ownerNotices.receivedInterrupting();
+      case 'deferred': return ownerNotices.receivedDeferred();
+      case 'queued': return ownerNotices.receivedQueued(Math.max(1, queued.queuedBehind));
+      case 'started': return ownerNotices.receivedStarted();
+      default:
+        // Interrupting the live turn does not remove prompts which were already
+        // accepted into the ACP queue. Never claim this request is running while
+        // the session itself says earlier work remains ahead of it.
+        return queued.queuedBehind > 0
+          ? ownerNotices.receivedQueued(queued.queuedBehind)
+          : this.options.config.interrupt
+            ? ownerNotices.receivedInterrupting()
+            : ownerNotices.receivedStarted();
+    }
   }
 
   private async complete(

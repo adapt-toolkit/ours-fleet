@@ -19,7 +19,8 @@ import {
   ACP_CANCEL_DEADLINE_EXCEEDED, SessionControlError, classifyChildExit, turnResult,
 } from './types.js';
 import type {
-  ConversationHandlePage, ExitRecord, InterruptOutcome, PermissionDecision, QueuedPrompt,
+  ConversationHandlePage, ExitRecord, InterruptOutcome, PermissionDecision, PromptDelivery,
+  QueuedPrompt,
   SessionEvent,
   RuntimeSelectorMetadata, SessionHandle, SessionSnapshot, SubmitPromptOptions,
   TurnCancellationSource, TurnOutcome,
@@ -55,6 +56,13 @@ const PERMISSION_TIMEOUT_MS = 10 * 60_000;
 const CONTROLLER_GRACE_MS = 12_000;
 /** Bound safe-boundary waiting without turning a hung tool into cancellation. */
 export const AFTER_TOOL_BOUNDARY_TIMEOUT_MS = 120_000;
+/**
+ * How long an interrupting delivery waits for a tool boundary before giving up
+ * on cancelling and simply queueing. Shorter than the after-tool wake budget:
+ * this one runs inside the arbiter's admission boundary, and the caller has an
+ * honest "queued" answer available the moment it expires.
+ */
+export const INTERRUPT_BOUNDARY_TIMEOUT_MS = 30_000;
 const TERMINAL_TOOL_STATUSES = new Set(['completed', 'failed']);
 
 const SCHEDULED_LOOP_REDACTION = '[scheduled-loop content redacted]';
@@ -237,6 +245,8 @@ export interface AcpSessionOptions {
   controllerGraceMs?: number;
   /** Test seam; production uses AFTER_TOOL_BOUNDARY_TIMEOUT_MS. */
   afterToolBoundaryTimeoutMs?: number;
+  /** Test seam; production uses INTERRUPT_BOUNDARY_TIMEOUT_MS. */
+  interruptBoundaryTimeoutMs?: number;
 }
 
 /**
@@ -618,14 +628,19 @@ export class AcpSession implements SessionHandle {
       );
     if (this.closing || !this.sessionId || !this.isAlive())
       throw new SessionControlError('offline', this.lastError ?? 'ACP session is offline');
-    if (options.interrupt) await this.cancelActive(options.interruptSource ?? 'local-console');
+    const delivery = options.interrupt
+      ? await this.prepareInterruptingDelivery(options.interruptSource ?? 'local-console')
+      : undefined;
     // Interrupting delivery must still use steering when supported. With no
     // live turn, the extension starts one and acknowledges `startedNewTurn`
     // immediately; a normal session/prompt would keep the monitor blocked until
     // the entire wake-triggered turn terminated.
     if (options.steer && this.steeringSupported) {
       const promptId = randomUUID();
-      return { promptId, queuedBehind: 0, completion: this.steerPrompt(text), origin: options.origin };
+      return {
+        promptId, queuedBehind: 0, completion: this.steerPrompt(text), origin: options.origin,
+        ...(delivery ? { delivery } : {}),
+      };
     }
     const promptId = randomUUID();
     const queuedBehind = this.queueDepth;
@@ -640,7 +655,49 @@ export class AcpSession implements SessionHandle {
         return turnResult(false, 'failed', (error as Error)?.message ?? String(error));
       },
     );
-    return { promptId, queuedBehind, completion, origin: options.origin };
+    return {
+      promptId, queuedBehind, completion, origin: options.origin,
+      delivery: delivery ?? (queuedBehind > 0 ? 'queued' : 'started'),
+    };
+  }
+
+  /**
+   * Prepare the session for a prompt that asked to pre-empt current work.
+   *
+   * The old behaviour was one unconditional `session/cancel` notification
+   * followed immediately by `session/prompt`. That is what produced the owner's
+   * "request failed before completion":
+   *
+   *  - `cancelActive` only awaits settlement when `this.activeTurn` is set, and
+   *    a turn the ADAPTER started (steering's `startedNewTurn`) is never tracked
+   *    here. So the cancel raced the adapter's own transcript repair and the new
+   *    prompt landed while the last assistant message still held an unresolved
+   *    `tool_use` — rejected with `stop_reason=tool_use`.
+   *  - With nothing running at all, it still sent the cancel, and the prompt
+   *    landed on a bare interrupted user message — rejected with
+   *    `stop_reason=null`.
+   *
+   * So: never cancel across a tool boundary, and never cancel something whose
+   * settlement cannot be awaited. Everything else is queued, which the ACP queue
+   * already does correctly. The returned state is what the caller may claim to a
+   * human — `interrupted` only when a turn really was cancelled.
+   */
+  private async prepareInterruptingDelivery(
+    source: TurnCancellationSource,
+  ): Promise<PromptDelivery> {
+    if (!this.sessionId) return 'started';
+    const busy = this.activeToolCalls.size > 0;
+    if (busy) await this.waitForToolBoundary(
+      this.options.interruptBoundaryTimeoutMs ?? INTERRUPT_BOUNDARY_TIMEOUT_MS);
+    // A tool that outlived the boundary budget: cancelling now is exactly the
+    // orphaned `tool_use` this method exists to prevent.
+    if (this.activeToolCalls.size > 0) return 'deferred';
+    // No fleet-tracked turn to await. Either the session is idle (cancelling it
+    // corrupts the transcript for no gain) or the adapter is running a turn we
+    // never started (cancelling it is unawaitable). Queue in both cases.
+    if (!this.activeTurn) return busy ? 'deferred' : 'started';
+    await this.cancelActive(source);
+    return 'interrupted';
   }
 
   /**
