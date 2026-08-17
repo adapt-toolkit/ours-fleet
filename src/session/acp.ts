@@ -55,6 +55,21 @@ const PERMISSION_TIMEOUT_MS = 10 * 60_000;
 const CONTROLLER_GRACE_MS = 12_000;
 /** Bound safe-boundary waiting without turning a hung tool into cancellation. */
 export const AFTER_TOOL_BOUNDARY_TIMEOUT_MS = 120_000;
+/**
+ * How long a steering-started turn is presumed to still own the adapter after
+ * its last update. Such a turn has no prompt id, so it never reports a
+ * stopReason and there is no exact end to observe — silence is the only signal
+ * available, and this is the bound that turns it into a decision.
+ *
+ * Sized from the fleet's own scheduled-run history: across 1513 completed
+ * scheduled runs the longest silence WITHIN a working turn was 120.2 s (p99
+ * 41.0 s; 5 runs above 60 s). A shorter grace would release the lease while the
+ * adapter is still working and re-admit a prompt into a busy turn, which is the
+ * FLEET-003 failure itself. The costs are deliberately asymmetric: holding too
+ * long skips one best-effort maintenance tick, releasing too early SIGTERMs a
+ * live role.
+ */
+export const STEERING_OCCUPANCY_IDLE_MS = 150_000;
 const TERMINAL_TOOL_STATUSES = new Set(['completed', 'failed']);
 
 const SCHEDULED_LOOP_REDACTION = '[scheduled-loop content redacted]';
@@ -237,6 +252,8 @@ export interface AcpSessionOptions {
   controllerGraceMs?: number;
   /** Test seam; production uses AFTER_TOOL_BOUNDARY_TIMEOUT_MS. */
   afterToolBoundaryTimeoutMs?: number;
+  /** Test seam; production uses STEERING_OCCUPANCY_IDLE_MS. */
+  steeringOccupancyIdleMs?: number;
 }
 
 /**
@@ -294,6 +311,13 @@ export class AcpSession implements SessionHandle {
   private cancelForceKill?: ReturnType<typeof setTimeout>;
   private cancelRecoveryReason?: string;
   /**
+   * Held while a steering-started turn is believed to own the adapter. It is a
+   * lease, not a latch: `steeringRelease` always fires, so the role can never be
+   * stranded busy by a wake whose turn ended without telling anyone.
+   */
+  private steeringOccupied = false;
+  private steeringRelease?: ReturnType<typeof setTimeout>;
+  /**
    * Rejects the moment the adapter process is gone. Every in-flight ACP request
    * races it, so a dead adapter can never leave a turn — and therefore a
    * scheduled run's `activeRunId` or an admission claim — unsettled forever.
@@ -333,6 +357,7 @@ export class AcpSession implements SessionHandle {
     child.once('exit', (code, signal) => {
       if (this.cancelForceKill) clearTimeout(this.cancelForceKill);
       this.cancelForceKill = undefined;
+      this.releaseSteeringOccupancy('adapter exited');
       // Record the child's real exit code/signal. The tmux path can only see a
       // shell's `$?`; here the truth is available, so keep it.
       const classified = classifyChildExit(code, signal);
@@ -437,11 +462,51 @@ export class AcpSession implements SessionHandle {
     return this.child.exitCode === null && (this.child.signalCode ?? null) === null;
   }
 
+  /**
+   * Take the occupancy lease for a turn the adapter started on its own behalf.
+   * Refreshed by every adapter update, so it tracks work actually happening
+   * rather than a fixed guess at how long a wake takes.
+   */
+  private holdSteeringOccupancy(): void {
+    if (this.closing || !this.isAlive()) return;
+    this.steeringOccupied = true;
+    this.refreshSteeringOccupancy();
+  }
+
+  private refreshSteeringOccupancy(): void {
+    if (!this.steeringOccupied) return;
+    if (this.steeringRelease) clearTimeout(this.steeringRelease);
+    this.steeringRelease = setTimeout(
+      () => this.releaseSteeringOccupancy('adapter silent'),
+      this.options.steeringOccupancyIdleMs ?? STEERING_OCCUPANCY_IDLE_MS);
+    this.steeringRelease.unref?.();
+  }
+
+  /**
+   * Every exit from occupancy comes through here, including the ones that are
+   * not the timer: a real turn boundary, close, and adapter exit. A lease that
+   * can leak is worse than the bug it fixes — it would leave the role reporting
+   * `running` forever and starve scheduled admission permanently.
+   */
+  private releaseSteeringOccupancy(reason: string): void {
+    if (this.steeringRelease) clearTimeout(this.steeringRelease);
+    this.steeringRelease = undefined;
+    if (!this.steeringOccupied) return;
+    this.steeringOccupied = false;
+    this.options.log(
+      `[${this.options.name}] steering-started turn no longer holds the adapter (${reason})`);
+  }
+
   snapshot(): SessionSnapshot {
     return {
       backend: 'acp',
       alive: this.isAlive(),
-      readiness: this.readiness,
+      // A steering-started turn is real work with no prompt id. Reporting the
+      // session idle while it runs is what let the arbiter admit a scheduled
+      // prompt into a busy adapter, whose `session/prompt` then never returned
+      // a stopReason and ended in a cancellation deadline and a SIGTERM.
+      readiness: this.readiness === 'idle' && this.steeringOccupied
+        ? 'running' : this.readiness,
       sessionId: this.sessionId,
       lastError: this.lastError,
       pendingPermissionId: this.pendingPermissions.keys().next().value as string | undefined,
@@ -962,6 +1027,7 @@ export class AcpSession implements SessionHandle {
     this.cancelForceKill = undefined;
     if (this.controllerGrace) clearTimeout(this.controllerGrace);
     this.controllerGrace = undefined;
+    this.releaseSteeringOccupancy('session closed');
     for (const [permissionId, pending] of [...this.pendingPermissions])
       this.settlePendingAutomatically(permissionId, pending, 'cancelled', undefined,
         'the session closed while this request was pending');
@@ -1125,6 +1191,10 @@ export class AcpSession implements SessionHandle {
         this.activeTurn?.id === turnId ? this.activeTurn.output : undefined);
     } finally {
       this.releaseAllTools();
+      // A turn this client owned has ended, so the adapter has reported a
+      // boundary: whatever a steering call started before it is over too. This
+      // is the release path that does not depend on the silence timer.
+      this.releaseSteeringOccupancy('turn boundary');
       if (this.activeTurn?.id === turnId) {
         this.activeTurn.settle();
         if (this.cancelEscalation) clearTimeout(this.cancelEscalation);
@@ -1150,6 +1220,11 @@ export class AcpSession implements SessionHandle {
       ]);
       if (response.outcome === 'failed')
         return turnResult(false, 'failed', 'ACP steering failed');
+      // `injected` joined a turn this client already owns and will settle.
+      // `startedNewTurn` created one nobody owns: the adapter is working and
+      // will never answer for it, so admission has to learn about it here or
+      // not at all.
+      if (response.outcome === 'startedNewTurn') this.holdSteeringOccupancy();
       return turnResult(true, 'inconclusive', response.outcome);
     } catch (error) {
       const detail = (error as Error)?.message ?? String(error);
@@ -1349,8 +1424,13 @@ export class AcpSession implements SessionHandle {
 
   private recordUpdate(update: acp.SessionUpdate): void {
     // Replayed history is not current activity: `session/load` would otherwise
-    // make a cold session look like it had just been working.
-    if (!this.replaying) this.lastUpdateAt = new Date().toISOString();
+    // make a cold session look like it had just been working. The same reason
+    // keeps it from extending the steering lease, which is evidence the adapter
+    // is working right now — for a steering-started turn, the only evidence.
+    if (!this.replaying) {
+      this.lastUpdateAt = new Date().toISOString();
+      this.refreshSteeringOccupancy();
+    }
     const scheduled = this.activeTurn?.origin?.kind === 'scheduled-loop';
     const messagePhase = update.sessionUpdate === 'agent_message_chunk'
       ? this.codexMessagePhase(update) : undefined;

@@ -26,6 +26,12 @@ const ALWAYS_PERMISSION = process.env.ACP_FIXTURE_ALWAYS_PERMISSION === '1';
 const PROMPT_DELAY_MS = parseInt(process.env.ACP_FIXTURE_PROMPT_DELAY_MS ?? '0', 10) || 0;
 if (process.env.ACP_FIXTURE_IGNORE_SIGTERM === '1') process.on('SIGTERM', () => {});
 let promptsAnswered = 0;
+// FLEET-003: model the extension behaviour where `_session/steering` with no
+// live turn STARTS one. That turn owns the adapter, is not addressable by a
+// JSON-RPC id, and swallows any prompt that arrives while it runs.
+const STEERING_OCCUPIES = process.env.ACP_FIXTURE_STEERING_OCCUPIES === '1';
+const STEERING_TURN_MS = parseInt(process.env.ACP_FIXTURE_STEERING_TURN_MS ?? '400', 10) || 400;
+let steeringTurnActive = false;
 
 const stopReasonFor = text =>
   FORCED_STOP_REASON ??
@@ -218,6 +224,17 @@ createInterface({ input: process.stdin }).on('line', line => {
       break;
     case 'session/prompt': {
       const text = message.params.prompt.find(block => block.type === 'text')?.text ?? '';
+      // FLEET-003 wire shape: while a steering-started turn owns the adapter,
+      // an arriving prompt is folded into that turn. It produces updates but
+      // NEVER receives a stopReason of its own — the observed production
+      // signature of a scheduled run that hangs to its 300 s deadline.
+      if (STEERING_OCCUPIES && steeringTurnActive) {
+        update({
+          sessionUpdate: 'agent_message_chunk',
+          content: { type: 'text', text: `absorbed:${text}` },
+        });
+        break;
+      }
       if (/\bambiguous phase\b/i.test(text)) {
         update({
           sessionUpdate: 'agent_message_chunk', messageId: 'ambiguous-1',
@@ -321,14 +338,35 @@ createInterface({ input: process.stdin }).on('line', line => {
           },
         },
       });
+      const startedNewTurn = !activePromptId;
+      // A steering call that starts a turn really occupies the adapter, and
+      // that turn has no JSON-RPC id, so its end is never reported as a
+      // stopReason. It keeps emitting updates until it finishes on its own.
+      if (STEERING_OCCUPIES && startedNewTurn) {
+        steeringTurnActive = true;
+        const beat = setInterval(() => update({
+          sessionUpdate: 'agent_message_chunk',
+          content: { type: 'text', text: 'steer-work' },
+        }), Math.max(10, Math.floor(STEERING_TURN_MS / 4)));
+        beat.unref?.();
+        setTimeout(() => { clearInterval(beat); steeringTurnActive = false; }, STEERING_TURN_MS)
+          .unref?.();
+      }
       send({
         jsonrpc: '2.0',
         id: message.id,
-        result: { outcome: activePromptId ? 'injected' : 'startedNewTurn' },
+        result: { outcome: startedNewTurn ? 'startedNewTurn' : 'injected' },
       });
       break;
     }
     case 'session/cancel':
+      // Cancelling reaches the steering-started turn. The absorbed prompt has
+      // no turn of its own to end, so it stays unanswered — this is why the
+      // client's settlement deadline expires and escalates to SIGTERM.
+      if (STEERING_OCCUPIES && steeringTurnActive) {
+        steeringTurnActive = false;
+        break;
+      }
       if (activePromptId !== undefined && !stubbornPrompts.has(activePromptId)) {
         // A "late" prompt keeps producing valid updates between the cancel
         // notification and the terminal response — ACP requires clients to
