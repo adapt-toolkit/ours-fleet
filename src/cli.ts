@@ -608,7 +608,10 @@ function renderLoopRows(role: string, state: ReturnType<typeof readScheduledLoop
     `${role}/${name} ${item.enabled && !item.operatorDisabled ? 'enabled' : 'disabled'} `
       + `${item.activeRunId ? 'running' : 'idle'} next=${item.nextDueAt} last=${item.lastOutcome ?? 'never'} `
       + `counts=${item.counts.started}/${item.counts.completed}/${item.counts.failed} `
-      + `skip=${item.counts.skipped}(busy=${item.counts.skippedBusy},missed=${item.counts.skippedMissed})`);
+      + `skip=${item.counts.skipped}(busy=${item.counts.skippedBusy},missed=${item.counts.skippedMissed})`
+      + (item.missedGap
+        ? ` gap=${item.missedGap.count}@${item.missedGap.fromAt}..${item.missedGap.throughAt}`
+        : ''));
 }
 
 cOpt(loopsCommand.command('status [role] [loop]').description('show live or stored loop state'))
