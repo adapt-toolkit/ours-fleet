@@ -37,6 +37,8 @@ import {
   allWarnings, analyzeFleetPermissions, effectivePermissionMode, formatNative,
 } from './permissions.js';
 import { AI_DOCS } from './docs.js';
+import { classifyActivity, describeSessionState } from './session/activity.js';
+import type { SessionActivity } from './session/types.js';
 import {
   controlRequest, controlSocketPath, followControl, livenessNote,
 } from './session/control.js';
@@ -353,8 +355,15 @@ program.command('ls').description('list running fleet sessions')
         if (!existsSync(controlSocketPath(stateDir))) continue;
         try {
           const response = await controlRequest(stateDir, { command: 'status' }, 2_000);
-          if (response.ok && (response.result as { alive?: boolean } | undefined)?.alive)
-            acp.push(`${name}: acp`);
+          const result = response.result as
+            { alive?: boolean; activity?: SessionActivity } | undefined;
+          if (response.ok && result?.alive) {
+            // Activity, not readiness: an idle-readiness role may be running a
+            // steered wake turn (FLEET-002), so `ls` reports what was observed.
+            const observed = classifyActivity(result.activity);
+            acp.push(`${name}: acp${observed.state === 'active' ? ' (working)'
+              : observed.state === 'quiet' ? ' (no recent agent activity)' : ''}`);
+          }
         } catch { /* ignore stale sockets */ }
       }
     }
@@ -492,7 +501,16 @@ program.command('status <name>').description('unit/agent state')
     if (stateDir) {
       try {
         const response = await controlRequest(stateDir, { command: 'status' }, 2_000);
-        if (response.ok) console.log(`session: ${JSON.stringify(response.result)}`);
+        if (response.ok) {
+          const snapshot = response.result as {
+            readiness?: string; activity?: SessionActivity;
+          };
+          console.log(`session: ${JSON.stringify(response.result)}`);
+          // `readiness` is turn occupancy, never an activity claim: a steered
+          // wake turn runs to completion with readiness pinned at `idle`
+          // (FLEET-002). Say which question each field answers.
+          console.log(describeSessionState(snapshot.readiness, snapshot.activity));
+        }
       } catch { console.log('session: acp control unavailable'); }
     }
     // Loop health is asked of the live manager first: when its state writes are

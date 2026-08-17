@@ -272,6 +272,12 @@ export class AcpSession implements SessionHandle {
   private connection: acp.ClientConnection;
   private sessionId?: string;
   private readiness: SessionSnapshot['readiness'] = 'starting';
+  /**
+   * Last non-replayed session update from the agent. `readiness` cannot answer
+   * "is this agent working" for a steered turn (FLEET-002), and this is the
+   * evidence that can.
+   */
+  private lastUpdateAt?: string;
   private lastError?: string;
   private promptTail: Promise<unknown> = Promise.resolve();
   private queueDepth = 0;
@@ -442,6 +448,10 @@ export class AcpSession implements SessionHandle {
       runtimeModel: this.runtimeModel,
       reasoningEffort: this.reasoningEffort,
       permissionMode: this.options.permissionMode,
+      activity: {
+        activeToolCalls: this.activeToolCalls.size,
+        ...(this.lastUpdateAt ? { lastUpdateAt: this.lastUpdateAt } : {}),
+      },
     };
   }
 
@@ -1338,6 +1348,9 @@ export class AcpSession implements SessionHandle {
   }
 
   private recordUpdate(update: acp.SessionUpdate): void {
+    // Replayed history is not current activity: `session/load` would otherwise
+    // make a cold session look like it had just been working.
+    if (!this.replaying) this.lastUpdateAt = new Date().toISOString();
     const scheduled = this.activeTurn?.origin?.kind === 'scheduled-loop';
     const messagePhase = update.sessionUpdate === 'agent_message_chunk'
       ? this.codexMessagePhase(update) : undefined;

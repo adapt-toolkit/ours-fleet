@@ -302,6 +302,14 @@ createInterface({ input: process.stdin }).on('line', line => {
     }
     case '_session/steering': {
       const text = message.params.prompt.find(block => block.type === 'text')?.text ?? '';
+      // A steered wake that starts its own turn and runs a tool in it. Fleet
+      // never gets a session/prompt response for this turn, so `readiness`
+      // cannot see it (FLEET-002) — only the tool/update stream can.
+      if (/\bsteer tool\b/i.test(text))
+        update({
+          sessionUpdate: 'tool_call', toolCallId: 'steer-tool', title: 'Steered fixture tool',
+          kind: 'execute', status: 'in_progress',
+        });
       send({
         jsonrpc: '2.0',
         method: 'session/update',
