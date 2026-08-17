@@ -1,3 +1,8 @@
+/**
+ * Packing runs the prepack build, which cleans this checkout's dist/. Keep this
+ * subprocess-heavy install probe in the serial package gate so the ordinary
+ * suite can safely use the dist built by its global setup.
+ */
 import { execFileSync } from 'node:child_process';
 import {
   existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync,
