@@ -76,6 +76,32 @@ export function makeSystemdBackend(exec: Exec = realExec): SupervisorBackend {
         dirname(process.execPath),
         ...(process.env.PATH ?? '').split(delimiter),
       ].filter(Boolean))].join(delimiter);
+      // Same reason as PATH, for the other thing a lingering unit cannot inherit:
+      // WHICH ours daemon this fleet was set up against.
+      //
+      // ours-fleet resolves its daemon from OURS_CONFIG / OURS_PORT / OURS_STATE_DIR
+      // and otherwise falls back to ~/.ours and port 3050 (src/monitor.ts). A host
+      // set up against a non-default daemon — the installer's multi-daemon profiles
+      // do exactly this — passes that selection to `ours-fleet init` in the
+      // environment, and it died there: nothing persisted it, so every runner
+      // systemd started at boot resolved the default daemon again, and on a host
+      // where only the non-default daemon exists that is a daemon that is not there.
+      //
+      // ONLY OURS_CONFIG is baked, deliberately. It names which daemon, and leaves
+      // that daemon's own config file authoritative for port and state directory, so
+      // a later edit to it still wins. Baking OURS_PORT/OURS_STATE_DIR would freeze
+      // those into a unit file that outranks the config for ever after — the failure
+      // mode @ours.network/cli avoids for the same reason (packages/cli/src/
+      // service.ts: "The port is deliberately NOT baked").
+      //
+      // Absent from init's environment ⇒ no line, and the unit is byte-for-byte what
+      // it has always been. This teaches fleet nothing about installer profiles; it
+      // persists the selection fleet was initialised with.
+      const unitEnv = ['PATH=' + servicePath];
+      if (process.env.OURS_CONFIG) unitEnv.push('OURS_CONFIG=' + process.env.OURS_CONFIG);
+      const environmentLines = unitEnv
+        .map(value => `Environment="${value.replace(/\\/g, '\\\\').replace(/"/g, '\\"').replace(/%/g, '%%')}"`)
+        .join('\n');
       mkdirSync(unitDir, { recursive: true });
       writeFileSync(join(unitDir, UNIT_TEMPLATE), `[Unit]
 Description=ours-fleet agent %i
@@ -83,7 +109,7 @@ After=default.target
 
 [Service]
 Type=simple
-Environment="PATH=${servicePath.replace(/\\/g, '\\\\').replace(/"/g, '\\"').replace(/%/g, '%%')}"
+${environmentLines}
 ExecStart=${unitArg(process.execPath)} ${unitArg(binPath)} _run %i
 # The RUNNER owns the child-session restart loop, with a counted, backed-off
 # circuit breaker (3.2). systemd must only recover the runner PROCESS crashing —
