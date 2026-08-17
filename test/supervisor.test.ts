@@ -42,6 +42,45 @@ describe('systemd backend', () => {
     expect(msgs.join('\n')).toContain('linger');
   });
 
+  // A lingering user unit inherits nothing from the shell that ran `init`, which is
+  // why PATH is baked. The daemon SELECTION is the other thing it cannot inherit:
+  // ours-fleet resolves its daemon from OURS_CONFIG/OURS_PORT/OURS_STATE_DIR and
+  // otherwise falls back to ~/.ours and 3050, so a fleet set up against a non-default
+  // daemon used to resolve the DEFAULT one in every runner systemd started at boot.
+  it('init persists the daemon selection it was given, so boot-started runners keep it', async () => {
+    const { exec } = recorder();
+    const configPath = join(dir, '.ours-work', 'config.json');
+    process.env.OURS_CONFIG = configPath;
+    try {
+      await makeSystemdBackend(exec).init('/usr/local/bin/ours-fleet');
+      const unit = readFileSync(join(dir, '.config/systemd/user/ours-fleet-agent@.service'), 'utf8');
+      expect(unit).toContain(`Environment="OURS_CONFIG=${configPath}"`);
+      // The port and state directory are deliberately NOT frozen into the unit: the
+      // selected daemon's own config file stays authoritative for those, so editing
+      // it later still works. Baking them would outrank that file for ever after.
+      expect(unit).not.toContain('OURS_PORT');
+      expect(unit).not.toContain('OURS_STATE_DIR');
+    } finally {
+      delete process.env.OURS_CONFIG;
+    }
+  });
+
+  // Backwards compatibility, and it is the whole safety argument: an init with no
+  // daemon selection writes exactly the unit it always wrote.
+  it('init with no daemon selection writes no OURS_ line at all', async () => {
+    const { exec } = recorder();
+    const before = process.env.OURS_CONFIG;
+    delete process.env.OURS_CONFIG;
+    try {
+      await makeSystemdBackend(exec).init('/usr/local/bin/ours-fleet');
+      const unit = readFileSync(join(dir, '.config/systemd/user/ours-fleet-agent@.service'), 'utf8');
+      expect(unit).not.toContain('OURS_');
+      expect(unit).toContain(`Environment="PATH=${dirname(process.execPath)}`);
+    } finally {
+      if (before !== undefined) process.env.OURS_CONFIG = before;
+    }
+  });
+
   it('install enables the instance unit', async () => {
     const { calls, exec } = recorder();
     await makeSystemdBackend(exec).install('A', '/b');
