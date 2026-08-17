@@ -5,12 +5,14 @@ import { agentDir, home } from '../paths.js';
 import { realExec, type Exec } from '../exec.js';
 import type { ResolvedRole } from '../config.js';
 import type {
-  HarnessAdapter, RoleDirs, SessionPrep, SessionState, Launch, ValidationError,
+  AcpLaunch, HarnessAdapter, RoleDirs, SessionPrep, SessionState, Launch, ValidationError,
   UnattendedCapability,
 } from './types.js';
 import { registerAdapter } from './registry.js';
 import { harnessRuntimeDir } from '../isolation/policy.js';
-import { bundledAcpAgent, resolveBundledAcpAgent } from './acp-agent.js';
+import {
+  resolveBundledAcpAgent, type AcpAgentResolution,
+} from './acp-agent.js';
 
 interface CodexOptions {
   launcher?: string;
@@ -68,13 +70,29 @@ function sandboxMode(role: ResolvedRole): string | undefined {
   return s;
 }
 
-/** codex-acp exposes the same sandbox postures as named ACP agent modes. */
-function acpAgentMode(role: ResolvedRole): string | undefined {
-  const sandbox = sandboxMode(role);
+function modeForSandbox(sandbox: string | undefined): string | undefined {
   if (sandbox === 'read-only') return 'read-only';
   if (sandbox === 'workspace-write') return 'agent';
   if (sandbox === 'danger-full-access') return 'agent-full-access';
   return undefined;
+}
+
+/**
+ * Resolve the coupled Codex ACP mode.
+ *
+ * The portable approval contract owns the default mode selection: `allow`
+ * means the adapter's fully non-interactive yolo preset and `auto` means its
+ * ordinary agent preset. This intentionally means that Codex ACP cannot retain
+ * an independent neutral filesystem posture for those two modes. An explicit
+ * native sandbox remains authoritative and selects its corresponding preset.
+ */
+function acpAgentMode(role: ResolvedRole): string | undefined {
+  const explicitSandbox = (role.harness_options as CodexOptions | undefined)?.sandbox;
+  if (explicitSandbox != null) return modeForSandbox(sandboxMode(role));
+  if (role.permissions?.approval === 'allow') return 'agent-full-access';
+  if (role.permissions?.approval === 'auto') return 'agent';
+  const sandbox = sandboxMode(role);
+  return modeForSandbox(sandbox);
 }
 
 function acpModePermissions(mode: string | undefined): {
@@ -84,6 +102,11 @@ function acpModePermissions(mode: string | undefined): {
   if (mode === 'agent-full-access')
     return { approval: 'never', sandbox: 'danger-full-access' };
   return { approval: 'on-request', sandbox: 'workspace-write' };
+}
+
+/** The sandbox Codex will actually receive from the selected coupled ACP mode. */
+function acpRuntimeSandbox(role: ResolvedRole): string {
+  return acpModePermissions(acpAgentMode(role)).sandbox;
 }
 
 function fleetModeForApproval(nativeMode: string): 'ask' | 'auto' | 'allow' {
@@ -115,6 +138,21 @@ function launcherMode(role: ResolvedRole): string {
 
 function bundledCodexAcp() {
   return resolveBundledAcpAgent(CODEX_ACP_PACKAGE, 'codex-acp', 'codex-acp');
+}
+
+/** Bind launch argv and metadata provenance to one already-completed resolution. */
+export function codexAcpLaunchForResolution(
+  resolution: AcpAgentResolution,
+): Pick<AcpLaunch, 'argv' | 'permissionMetadataSource'> {
+  const permissionMetadataSource = resolution.bundled
+    && resolution.version === BUNDLED_CODEX_ACP_VERSION
+    && resolution.manifestPath !== undefined
+    ? 'codex-acp' as const
+    : undefined;
+  return {
+    argv: [...resolution.argv],
+    ...(permissionMetadataSource ? { permissionMetadataSource } : {}),
+  };
 }
 
 function canOverrideBundledAcpApproval(): boolean {
@@ -161,7 +199,7 @@ function codexAcpEnvironment(role: ResolvedRole, dirs: RoleDirs): Record<string,
   return {
     CODEX_PATH: command,
     [CODEX_PROXY_APPROVAL_ENV]: approvalPolicy(role) ?? 'on-request',
-    [CODEX_PROXY_SANDBOX_ENV]: sandboxMode(role) ?? 'workspace-write',
+    [CODEX_PROXY_SANDBOX_ENV]: acpRuntimeSandbox(role),
     [CODEX_PROXY_MANIFEST_ENV]: resolution.manifestPath,
     ...(process.env.CODEX_PATH ? { [CODEX_PROXY_REAL_PATH_ENV]: process.env.CODEX_PATH } : {}),
   };
@@ -309,19 +347,32 @@ export function makeCodexAdapter(exec: Exec = realExec): HarnessAdapter {
       return { argv, env: prep.env };
     },
 
-    buildAcpLaunch(role: ResolvedRole, prep: SessionPrep): Launch {
+    buildAcpLaunch(role: ResolvedRole, prep: SessionPrep): AcpLaunch {
       const configured = role.session_options?.acp?.command;
+      // Resolve once: both argv and permission-metadata provenance must describe
+      // the same artifact. A bare PATH fallback is launchable for compatibility,
+      // but is never authenticated for protected-MCP auto-approval.
+      const resolved = configured == null
+        ? codexAcpLaunchForResolution(bundledCodexAcp())
+        : undefined;
       const argv = Array.isArray(configured)
         ? [...configured]
         : typeof configured === 'string'
           ? ['sh', '-c', configured]
-          : bundledAcpAgent(
-              CODEX_ACP_PACKAGE, 'codex-acp', 'codex-acp');
+          : resolved!.argv;
       const initialMode = acpAgentMode(role);
       return {
         argv,
         env: initialMode ? { ...prep.env, INITIAL_AGENT_MODE: initialMode } : prep.env,
+        ...(resolved?.permissionMetadataSource
+          ? { permissionMetadataSource: resolved.permissionMetadataSource } : {}),
       };
+    },
+
+    // INITIAL_AGENT_MODE covers session/new in codex-acp; session/set_mode
+    // keeps resumed/loaded sessions and live status on the identical mode.
+    acpPermissionModeId(role: ResolvedRole): string | undefined {
+      return acpAgentMode(role);
     },
 
     isolationPaths(role: ResolvedRole, _dirs: RoleDirs) {
@@ -378,7 +429,9 @@ export function makeCodexAdapter(exec: Exec = realExec): HarnessAdapter {
         const mode = acpAgentMode(role) ?? 'agent';
         const configured = role.session_options?.acp?.command;
         const overrideAvailable = configured == null && canOverrideBundledAcpApproval();
-        const actual = overrideAvailable ? { approval, sandbox } : acpModePermissions(mode);
+        const actual = overrideAvailable
+          ? { approval, sandbox: acpRuntimeSandbox(role) }
+          : acpModePermissions(mode);
         const exact = actual.approval === approval && actual.sandbox === sandbox;
         return {
           ...translated,
@@ -388,10 +441,9 @@ export function makeCodexAdapter(exec: Exec = realExec): HarnessAdapter {
             ? `custom ACP command cannot be verified against approval=${approval} sandbox=${sandbox}; `
               + `its '${mode}' mode is conservatively treated as approval=${actual.approval} `
               + `sandbox=${actual.sandbox}`
-            : `codex-acp mode '${mode}' actually uses approval=${actual.approval} `
-              + `sandbox=${actual.sandbox}, and the bundled ${BUNDLED_CODEX_ACP_VERSION} `
-              + `app-server override is unavailable; this does not exactly represent `
-              + `approval=${approval} sandbox=${sandbox}`],
+            : `Codex ACP mode '${mode}' couples approval and filesystem as `
+              + `approval=${actual.approval} sandbox=${actual.sandbox}; this does not exactly `
+              + `represent approval=${approval} sandbox=${sandbox}`],
           capabilities: codexCapabilities(actual.approval, actual.sandbox),
         };
       }

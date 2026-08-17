@@ -33,7 +33,9 @@ import { stringify } from 'yaml';
 import { resolvedRolePlan } from './resolved-plan.js';
 import { creationBuildNote, formatProvenance, readProvenance } from './creation.js';
 import { doctor } from './doctor.js';
-import { allWarnings, analyzeFleetPermissions, formatNative } from './permissions.js';
+import {
+  allWarnings, analyzeFleetPermissions, effectivePermissionMode, formatNative,
+} from './permissions.js';
 import { AI_DOCS } from './docs.js';
 import {
   controlRequest, controlSocketPath, followControl, livenessNote,
@@ -986,7 +988,7 @@ cOpt(program.command('spawn [name]').description('spawn a new agent (permanent b
   .option('--coordinator <name>', 'announce target')
   .option('--model <id>', 'model id to launch on (e.g. claude-fable-5); default: launcher default')
   .option('--permission-mode <mode>', 'harness permission mode (Codex: untrusted|on-request|never; Claude: native values)')
-  .option('--approval <mode>', 'fleet permission mode: ask|auto|allow (deny is deprecated)')
+  .option('--approval <mode>', 'fleet permission mode: ask|auto|allow (Codex ACP allow selects agent-full-access; deny is deprecated)')
   .option('--filesystem <mode>', 'common filesystem intent: read-only|workspace|unrestricted')
   .option('--unattended <mode>', 'permission behavior without a console: deny|wait')
   .option('--sandbox <mode>', 'Codex sandbox: read-only|workspace-write|danger-full-access')
@@ -1055,13 +1057,17 @@ cOpt(program.command('spawn [name]').description('spawn a new agent (permanent b
         console.log(`spawned ${result.lifetime} agent '${result.role}' through `
           + `${result.caller}'s fleet proxy (state: ${result.statePath})`);
         console.log(`  ${result.harness}/${result.session}`
-          + `${result.model ? ` model=${result.model}` : ''}; `
+          + `${result.model ? ` model=${result.model}` : ''}`
+          + (result.permissionMode
+            ? `; permission=${result.permissionMode.fleetMode} native=${result.permissionMode.nativeMode}`
+            : '') + '; '
           + `monitor=${result.monitor.mode} interrupt=${result.monitor.interrupt}`);
         if (result.inherited.length)
           console.log(`  inherited omitted defaults from ${result.caller}: ${result.inherited.join(', ')}`);
         console.log(`→ watch it: ours-fleet peek ${result.role}   |   attach: ours-fleet attach ${result.role}`);
         return;
       }
+      const plannedPermissionMode = effectivePermissionMode(spawnDryRun(o).resolvedRole);
       if (o.temp) {
         const dir = await spawnTemp(o, binPath);
         console.log(`spawned temp agent '${roleName}' (state: ${dir}; gone on exit/reboot)`);
@@ -1077,6 +1083,8 @@ cOpt(program.command('spawn [name]').description('spawn a new agent (permanent b
           + `at ${lastProvenance.createdAt} (${lastProvenance.lifetime})`);
         for (const line of formatProvenance(lastProvenance)) console.log(line);
       }
+      console.log(`  permission=${plannedPermissionMode.fleetMode} `
+        + `native=${plannedPermissionMode.nativeMode}`);
       console.log(`→ watch it: ours-fleet peek ${roleName}   |   attach: ours-fleet attach ${roleName}`);
     } catch (e) { die(e); }
   });

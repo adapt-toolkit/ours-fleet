@@ -95,6 +95,26 @@ describe('shipped spawn skills are written from one source of truth (7.1)', () =
       expect(AI_DOCS, `AI_DOCS is missing ${term}`).toContain(term);
     for (const capability of UNATTENDED_FLOOR) expect(AI_DOCS).toContain(capability);
   });
+
+  it.each([
+    ['codex', 'codex', 'auto', 'agent'],
+    ['codex', 'codex', 'allow', 'agent-full-access'],
+    ['claude-code', 'claude-code', 'auto', 'acceptEdits'],
+    ['claude-code', 'claude-code', 'allow', 'bypassPermissions'],
+  ] as const)('%s: %s approval=%s maps to native %s',
+    (variantId, harness, approval, nativeMode) => {
+      const variant = VARIANTS.find(candidate => candidate.id === variantId)!;
+      const role = roleWith(harness, {
+        approval, filesystem: 'workspace', unattended: 'deny',
+      });
+      role.session = harness === 'codex' ? 'acp' : 'tmux';
+      expect(getAdapter(harness).effectivePermissionMode!(role)).toMatchObject({
+        fleetMode: approval,
+        nativeMode,
+      });
+      expect(skill(variant.path, 'spawn-ours-agent')).toContain(nativeMode);
+      expect(AI_DOCS).toContain(nativeMode);
+    });
 });
 
 describe('following only the shipped skill produces a role doctor accepts (7.1)', () => {

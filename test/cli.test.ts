@@ -408,9 +408,10 @@ describe('ours-fleet CLI', () => {
     expect(cfg.stdout).not.toContain("role 'Exact':");
     expect(doc.stdout).toMatch(/permissions: Exact.*\(exact\)/);
 
-    expect(cfg.stdout).not.toContain("role 'AcpWorkspace':");
+    expect(cfg.stdout).toContain(
+      "role 'AcpWorkspace': Codex ACP mode 'agent-full-access' couples approval and filesystem");
     expect(doc.stdout).toMatch(
-      /permissions: AcpWorkspace.*mode=agent approval=never sandbox=workspace-write.*\(exact\)/);
+      /permissions: AcpWorkspace.*mode=agent-full-access approval=never sandbox=danger-full-access.*couples approval and filesystem/);
     expect(doc.stdout).toMatch(/unattended floor: AcpWorkspace.*workspace-edit/);
     expect(cfg.stdout).not.toContain("role 'AcpFull':");
     expect(doc.stdout).toMatch(/permissions: AcpFull.*mode=agent-full-access.*\(exact\)/);

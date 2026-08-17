@@ -335,6 +335,7 @@ describe('buildAcpLaunch', () => {
   it('uses the bundled Claude ACP adapter when supported and preserves the Node 20 fallback', () => {
     const launch = makeClaudeCodeAdapter(okExec).buildAcpLaunch!(
       role(), { argv: [], env: {} });
+    expect(launch.permissionMetadataSource).toBeUndefined();
     if (Number(process.versions.node.split('.')[0]) >= 22) {
       expect(launch.argv[0]).toBe(process.execPath);
       expect(launch.argv[1]).toMatch(

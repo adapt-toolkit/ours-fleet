@@ -245,7 +245,9 @@ export class RoleCreationService {
     };
     const warnings: string[] = [];
     if (request.permissions.approval === 'allow')
-      warnings.push('approval=allow maps to an elevated native permission mode');
+      warnings.push(effective.harness === 'codex' && effective.session === 'acp'
+        ? 'approval=allow maps to elevated Codex ACP agent-full-access and widens the native sandbox to danger-full-access'
+        : 'approval=allow maps to an elevated native permission mode');
     if (request.permissions.filesystem === 'unrestricted')
       warnings.push('filesystem=unrestricted grants access outside the workspace');
     if (request.permissions.unattended === 'wait')

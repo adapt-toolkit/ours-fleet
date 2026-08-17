@@ -14,7 +14,10 @@ export interface SessionPrep {
   command?: string;
 }
 export interface Launch { argv: string[]; env: Record<string, string> }
-export interface AcpLaunch { argv: string[]; env: Record<string, string> }
+export interface AcpLaunch extends Launch {
+  /** Metadata vocabulary authenticated by the exact ACP artifact in argv. */
+  permissionMetadataSource?: 'codex-acp';
+}
 /**
  * The result of expressing neutral `permissions:` in a harness's own terms.
  *

@@ -1,6 +1,6 @@
 import { createRequire } from 'node:module';
-import { existsSync, readFileSync } from 'node:fs';
-import { dirname, resolve } from 'node:path';
+import { readFileSync, realpathSync, statSync } from 'node:fs';
+import { dirname, isAbsolute, relative, resolve, sep } from 'node:path';
 
 const require = createRequire(import.meta.url);
 
@@ -28,12 +28,19 @@ export function resolveBundledAcpAgent(
       bin?: string | Record<string, string>;
       version?: string;
     };
-    const relative = typeof manifest.bin === 'string'
+    const declaredEntrypoint = typeof manifest.bin === 'string'
       ? manifest.bin
       : manifest.bin?.[binName];
-    if (!relative) return { argv: [fallbackCommand], bundled: false };
-    const entrypoint = resolve(dirname(manifestPath), relative);
-    if (!existsSync(entrypoint)) return { argv: [fallbackCommand], bundled: false };
+    if (!declaredEntrypoint) return { argv: [fallbackCommand], bundled: false };
+    const packageRoot = realpathSync(dirname(manifestPath));
+    const entrypoint = realpathSync(resolve(packageRoot, declaredEntrypoint));
+    const entrypointFromRoot = relative(packageRoot, entrypoint);
+    if (
+      entrypointFromRoot === '..'
+      || entrypointFromRoot.startsWith(`..${sep}`)
+      || isAbsolute(entrypointFromRoot)
+      || !statSync(entrypoint).isFile()
+    ) return { argv: [fallbackCommand], bundled: false };
     return {
       argv: [process.execPath, entrypoint], bundled: true, manifestPath,
       ...(typeof manifest.version === 'string' ? { version: manifest.version } : {}),

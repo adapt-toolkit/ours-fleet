@@ -37,9 +37,10 @@ const outstanding = new Map();
 const permissionCompletionDelay = new Map();
 
 /** Ask for the same tool, offering both reject kinds so selection order matters. */
-const requestPermission = (promptId, location = process.cwd()) => {
+const requestPermission = (promptId, location = process.cwd(), shape = 'located-edit') => {
   const id = permissionRequestId++;
   pendingPermission.set(id, { promptId });
+  const locationlessExecute = shape !== 'located-edit';
   send({
     jsonrpc: '2.0',
     id,
@@ -48,16 +49,24 @@ const requestPermission = (promptId, location = process.cwd()) => {
       sessionId,
       toolCall: {
         toolCallId: 'fixture-tool',
-        title: 'Fixture edit',
-        kind: 'edit',
+        title: locationlessExecute ? 'Protected MCP approval' : 'Fixture edit',
+        kind: locationlessExecute ? 'execute' : 'edit',
         status: 'pending',
-        locations: [{ path: location }],
+        ...(locationlessExecute ? {} : { locations: [{ path: location }] }),
       },
-      options: [
+      options: locationlessExecute ? [
+        { optionId: 'allow_once', name: 'Allow', kind: 'allow_once' },
+        { optionId: 'decline', name: 'Decline', kind: 'reject_once' },
+      ] : [
         { optionId: 'allow', name: 'Allow', kind: 'allow_once' },
         { optionId: 'reject-always', name: 'Reject always', kind: 'reject_always' },
         { optionId: 'reject', name: 'Reject once', kind: 'reject_once' },
       ],
+      ...(shape === 'protected-mcp'
+        ? { _meta: { is_mcp_tool_approval: true } }
+        : shape === 'malformed-protected-mcp'
+          ? { _meta: { is_mcp_tool_approval: 'true' } }
+          : {}),
     },
   });
 };
@@ -278,7 +287,14 @@ createInterface({ input: process.stdin }).on('line', line => {
               ? `${process.cwd()}/loop/file.txt`
               : /\bpermission location swap\b/i.test(text)
                 ? `${process.cwd()}/swap/file.txt` : process.cwd();
-        for (let i = 0; i < times; i++) requestPermission(message.id, location);
+        const shape = /\bpermission protected mcp malformed\b/i.test(text)
+          ? 'malformed-protected-mcp'
+          : /\bpermission protected mcp\b/i.test(text)
+            ? 'protected-mcp'
+            : /\bpermission locationless execute\b/i.test(text)
+              ? 'locationless-execute'
+              : 'located-edit';
+        for (let i = 0; i < times; i++) requestPermission(message.id, location, shape);
       } else {
         answerPrompt(message.id, stopReasonFor(text));
       }

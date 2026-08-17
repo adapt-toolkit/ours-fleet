@@ -8,7 +8,7 @@ import {
   type ResolvedRole,
 } from './config.js';
 import { getAdapter } from './harness/registry.js';
-import type { Launch } from './harness/types.js';
+import type { AcpLaunch, Launch } from './harness/types.js';
 import { Tmux } from './tmux.js';
 import {
   createMonitor, probeIdentityPresence,
@@ -155,11 +155,14 @@ async function executeManagedSpawn(
     session: preview.session,
     ...(preview.model ? { model: preview.model } : {}),
     monitor: { mode: preview.monitor.mode, interrupt: preview.monitor.interrupt },
+    permissionMode: effectivePermissionMode(preview),
     inherited,
     creationActionId,
   };
   log(`[${caller.name}] managed fleet proxy spawned ${result.lifetime} role ${result.role} `
-    + `harness=${result.harness} session=${result.session}`);
+    + `harness=${result.harness} session=${result.session} `
+    + `permission=${result.permissionMode!.fleetMode} `
+    + `native=${result.permissionMode!.nativeMode}`);
   return result;
 }
 
@@ -610,6 +613,10 @@ export async function runOnce(
       permissions: perms,
       modeId: adapter.acpPermissionModeId?.(role),
       permissionMode: effectivePermissionMode(role),
+      // Provenance travels with the exact ACP launch. Keeping it out of a
+      // role-only adapter hook prevents a PATH fallback or resolver skew from
+      // claiming metadata trust for an argv it did not authenticate.
+      permissionMetadataSource: (launch as AcpLaunch).permissionMetadataSource,
       log: deps.log,
     });
     pid = acpSession.pid;

@@ -503,6 +503,7 @@ describe('OwnerChannel live management', () => {
       caller: 'Coordinator', role: 'DeveloperX', lifetime: 'temporary',
       statePath: '/private/state', harness: 'codex', session: 'acp', model: 'gpt-test',
       monitor: { mode: 'fleet', interrupt: true },
+      permissionMode: { fleetMode: 'allow', nativeMode: 'agent-full-access' },
       inherited: ['harness', 'session', 'model'], creationActionId: 'spawn-action-1',
     });
 
@@ -512,6 +513,7 @@ describe('OwnerChannel live management', () => {
     expect(notice?.text).toContain('Coordinator spawned temporary agent DeveloperX');
     expect(notice?.text).toContain('codex/acp, model gpt-test');
     expect(notice?.text).toContain('fleet monitor with interruption');
+    expect(notice?.text).toContain('permission allow, native agent-full-access');
     expect(notice?.text).not.toContain('/private/state');
     await channel.close();
   });

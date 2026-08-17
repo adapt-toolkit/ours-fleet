@@ -21,6 +21,9 @@ afterEach(async () => {
 async function start(extra: {
   permissionTimeoutMs?: number; controllerGraceMs?: number;
   unattended?: 'deny' | 'wait';
+  approval?: 'ask' | 'auto' | 'allow' | 'deny';
+  permissionMode?: { fleetMode: 'ask' | 'auto' | 'allow'; nativeMode: string };
+  permissionMetadataSource?: 'codex-acp';
 } = {}) {
   const stateDir = mkdtempSync(join(tmpdir(), 'ours-acp-perm-'));
   dirs.push(stateDir);
@@ -28,9 +31,11 @@ async function start(extra: {
     name: 'A', argv: [process.execPath, fixture], cwd: stateDir, env: {},
     stateDir, mode: 'fresh',
     permissions: {
-      approval: 'ask', filesystem: 'workspace',
+      approval: extra.approval ?? 'ask', filesystem: 'workspace',
       unattended: extra.unattended ?? 'deny',
     },
+    permissionMode: extra.permissionMode,
+    permissionMetadataSource: extra.permissionMetadataSource,
     log: () => {},
     ...(extra.permissionTimeoutMs !== undefined
       ? { permissionTimeoutMs: extra.permissionTimeoutMs } : {}),
@@ -51,6 +56,109 @@ async function waitForPending(session: AcpSession): Promise<ConversationEventV1>
 }
 
 describe('permission lifecycle', () => {
+  it('auto-allows a Codex 1.1.7 protected-MCP request under effective allow', async () => {
+    const session = await start({
+      approval: 'allow', unattended: 'wait',
+      permissionMode: { fleetMode: 'allow', nativeMode: 'agent-full-access' },
+      permissionMetadataSource: 'codex-acp',
+    });
+    const queued = await session.queuePrompt('permission protected mcp');
+    for (let i = 0; i < 200 && !events(session).some(e =>
+      e.kind === 'permission.resolved'); i++)
+      await new Promise(resolve => setTimeout(resolve, 10));
+    const resolved = events(session).find(e => e.kind === 'permission.resolved');
+    expect(resolved?.payload as PermissionResolvedPayload).toMatchObject({
+      decision: 'allowed', decisionSource: 'automatic', optionId: 'allow_once',
+      policy: 'permissionMode.fleetMode=allow',
+    });
+    expect(session.snapshot().readiness).not.toBe('awaiting_permission');
+    expect(session.snapshot().pendingPermissionId).toBeUndefined();
+    expect((await queued.completion).succeeded).toBe(true);
+  });
+
+  it.each([
+    ['ask', 'ask'],
+    ['auto', 'auto'],
+  ] as const)('keeps protected MCP pending under effective %s', async (approval, fleetMode) => {
+    const session = await start({
+      approval, unattended: 'wait', permissionMetadataSource: 'codex-acp',
+      permissionMode: { fleetMode, nativeMode: fleetMode === 'ask' ? 'read-only' : 'agent' },
+    });
+    session.setControllerAttached(true);
+    const queued = await session.queuePrompt('permission protected mcp');
+    const requested = await waitForPending(session);
+    expect(session.snapshot().readiness).toBe('awaiting_permission');
+    expect(session.respondPermission(requested.permissionId!, 'decline')).toBe(true);
+    await queued.completion;
+  });
+
+  it('denies protected MCP once under deny instead of granting it', async () => {
+    const session = await start({
+      approval: 'deny', unattended: 'wait', permissionMetadataSource: 'codex-acp',
+      permissionMode: { fleetMode: 'auto', nativeMode: 'agent' },
+    });
+    const result = await session.submitPrompt('permission protected mcp');
+    const resolved = events(session).find(e => e.kind === 'permission.resolved');
+    expect(resolved?.payload as PermissionResolvedPayload).toMatchObject({
+      decision: 'denied', decisionSource: 'automatic',
+      policy: 'permissions.approval=deny', optionId: 'decline',
+    });
+    expect(session.snapshot().pendingPermissionId).toBeUndefined();
+    expect(result.succeeded).toBe(true);
+  });
+
+  it.each([
+    ['generic locationless execute', 'permission locationless execute'],
+    ['malformed protected marker', 'permission protected mcp malformed'],
+  ])('keeps %s fail-closed under Codex allow', async (_label, prompt) => {
+    const session = await start({
+      approval: 'allow', unattended: 'wait', permissionMetadataSource: 'codex-acp',
+      permissionMode: { fleetMode: 'allow', nativeMode: 'agent-full-access' },
+    });
+    session.setControllerAttached(true);
+    const queued = await session.queuePrompt(prompt);
+    const requested = await waitForPending(session);
+    expect(session.snapshot().readiness).toBe('awaiting_permission');
+    expect(session.respondPermission(requested.permissionId!, 'decline')).toBe(true);
+    await queued.completion;
+  });
+
+  it('does not trust the protected marker without an authenticated Codex source', async () => {
+    const session = await start({
+      approval: 'allow', unattended: 'wait',
+      permissionMode: { fleetMode: 'allow', nativeMode: 'agent-full-access' },
+    });
+    session.setControllerAttached(true);
+    const queued = await session.queuePrompt('permission protected mcp');
+    const requested = await waitForPending(session);
+    expect(session.snapshot().readiness).toBe('awaiting_permission');
+    expect(session.respondPermission(requested.permissionId!, 'decline')).toBe(true);
+    await queued.completion;
+  });
+
+  it('honors an explicit native allow override over neutral ask', async () => {
+    const session = await start({
+      approval: 'ask', unattended: 'wait', permissionMetadataSource: 'codex-acp',
+      permissionMode: { fleetMode: 'allow', nativeMode: 'agent' },
+    });
+    const result = await session.submitPrompt('permission protected mcp');
+    expect(events(session).find(e => e.kind === 'permission.resolved')?.payload)
+      .toMatchObject({ decision: 'allowed', optionId: 'allow_once' });
+    expect(result.succeeded).toBe(true);
+  });
+
+  it('honors an explicit native prompt override over neutral allow', async () => {
+    const session = await start({
+      approval: 'allow', unattended: 'wait', permissionMetadataSource: 'codex-acp',
+      permissionMode: { fleetMode: 'auto', nativeMode: 'agent' },
+    });
+    session.setControllerAttached(true);
+    const queued = await session.queuePrompt('permission protected mcp');
+    const requested = await waitForPending(session);
+    expect(session.respondPermission(requested.permissionId!, 'decline')).toBe(true);
+    await queued.completion;
+  });
+
   it('stamps pending permissions with generation and expiry', async () => {
     const session = await start({ permissionTimeoutMs: 60_000 });
     session.setControllerAttached(true);
