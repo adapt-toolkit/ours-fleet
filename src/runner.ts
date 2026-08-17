@@ -274,6 +274,24 @@ const RESTART_BACKOFF_MAX_MS = 60_000;
 /** How often a held-down runner re-reads its ledger, so `up` can release it. */
 const HELD_DOWN_POLL_MS = 5_000;
 
+/**
+ * How the previous supervisor process ended.
+ *
+ * `abrupt` is the case the ledger used to miss entirely: an OOM-kill or any
+ * other external signal takes the supervisor down before it can write anything,
+ * the service manager restarts the unit, and every durable indicator still
+ * describes the run that died. A health check reading them reported "no
+ * restarts" for a role that had died and come back.
+ */
+export interface TerminationRecord {
+  class: 'clean' | 'abrupt' | 'unknown';
+  detail: string;
+  /** When the SURVIVING process observed it, not when it happened. */
+  observedAt: string;
+  /** Start time of the run that ended, when it was recorded. */
+  runStartedAt?: string;
+}
+
 export interface RestartLedger {
   version: 1;
   consecutiveImmediateFailures: number;
@@ -285,6 +303,12 @@ export interface RestartLedger {
   updatedAt: string;
   /** When the circuit opened, for the held-down status line. */
   openedAt?: string;
+  /** How the previous supervisor process ended, including abnormal exits. */
+  lastTermination?: TerminationRecord;
+  /** Supervisor processes that died without closing their run marker. */
+  abruptTerminations?: number;
+  /** Start of the supervisor run that owns this state directory now. */
+  supervisorStartedAt?: string;
 }
 
 const emptyLedger = (): RestartLedger => ({
@@ -295,6 +319,69 @@ const emptyLedger = (): RestartLedger => ({
   resumeDiscarded: false,
   circuit: 'closed',
   updatedAt: new Date(0).toISOString(),
+});
+
+/**
+ * Carried across a supervisor process's life so its successor can tell an
+ * orderly exit from a kill. Present on disk == "a supervisor believed it was
+ * running"; the next start finding one that is not its own is proof the
+ * previous process died without getting to write anything.
+ */
+export const RUN_MARKER_FILE = '.supervisor-run.json';
+
+interface RunMarker { version: 1; pid: number; startedAt: string; unit?: string }
+
+function readRunMarker(dir: string): RunMarker | undefined {
+  try {
+    const raw = JSON.parse(readFileSync(join(dir, RUN_MARKER_FILE), 'utf8')) as Partial<RunMarker>;
+    return raw.version === 1 && typeof raw.pid === 'number' && typeof raw.startedAt === 'string'
+      ? raw as RunMarker : undefined;
+  } catch { return undefined; }
+}
+
+/**
+ * Claim this state directory for the current supervisor process and report how
+ * the previous one ended. Runs BEFORE the first attempt, which is the whole
+ * point: after an abrupt kill nothing else writes until an attempt finishes,
+ * and an attempt can take minutes.
+ */
+export function claimSupervisorRun(
+  dir: string, startedAt: string, pid = process.pid,
+): TerminationRecord {
+  const previous = readRunMarker(dir);
+  const termination: TerminationRecord = previous && previous.pid !== pid
+    ? {
+      class: 'abrupt',
+      detail: `supervisor pid ${previous.pid} left an open run marker; `
+        + 'it was terminated without an orderly exit (signal, OOM-kill, or host reset)',
+      observedAt: startedAt,
+      runStartedAt: previous.startedAt,
+    }
+    : previous
+      ? { class: 'unknown', detail: 'run marker belongs to this process', observedAt: startedAt }
+      : { class: 'clean', detail: 'no previous run marker', observedAt: startedAt };
+  try {
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(join(dir, RUN_MARKER_FILE),
+      JSON.stringify({ version: 1, pid, startedAt } satisfies RunMarker, null, 2) + '\n');
+  } catch { /* diagnostics must never take the role down */ }
+  return termination;
+}
+
+/** Orderly exit: the successor must not read this run as a kill. */
+export function releaseSupervisorRun(dir: string): void {
+  try { rmSync(join(dir, RUN_MARKER_FILE), { force: true }); } catch { /* best effort */ }
+}
+
+/**
+ * Fields that describe THIS process's history rather than the current failure
+ * streak. Clearing the streak (recovery, an operator `up`, an approved model
+ * transition) must not erase the record that the role died and came back.
+ */
+const carriedForward = (previous: RestartLedger): Partial<RestartLedger> => ({
+  ...(previous.lastTermination ? { lastTermination: previous.lastTermination } : {}),
+  ...(previous.abruptTerminations ? { abruptTerminations: previous.abruptTerminations } : {}),
+  ...(previous.supervisorStartedAt ? { supervisorStartedAt: previous.supervisorStartedAt } : {}),
 });
 
 /** Bounded exponential backoff for the nth consecutive immediate failure. */
@@ -328,7 +415,10 @@ export function writeRestartLedger(dir: string, ledger: RestartLedger): void {
  */
 export function resetRestartLedger(dir: string): void {
   if (!existsSync(dir)) return;
-  writeRestartLedger(dir, { ...emptyLedger(), updatedAt: new Date().toISOString() });
+  const previous = readRestartLedger(dir);
+  writeRestartLedger(dir, {
+    ...emptyLedger(), ...carriedForward(previous), updatedAt: new Date().toISOString(),
+  });
 }
 
 /** Filename spawnTemp writes into a temp agent dir to carry the fleet start-stagger. */
@@ -490,7 +580,12 @@ export async function runOnce(
   const exitFile = join(dir, '.exit-status');
   const booted = existsSync(bootedFile);
   const mode: 'fresh' | 'resume' = booted && adapter.supportsResume ? 'resume' : 'fresh';
-  if (mode === 'fresh') writeFileSync(bootedFile, '');
+  // Stamp EVERY attempt, not just the first. `.booted` used to be written only
+  // on the fresh path, so after a restart — including one the supervisor never
+  // saw, like an OOM-kill — its mtime still read the original boot and any
+  // health check reading it reported "no restarts". The existence test above
+  // already ran, so rewriting cannot change the fresh/resume decision.
+  writeFileSync(bootedFile, `${new Date(deps.now()).toISOString()} ${mode}\n`);
 
   const runCwd = role.cwd && existsSync(role.cwd) ? role.cwd : dir;
   const prep = await adapter.prepareSession(role, { stateDir: dir, runCwd });
@@ -1007,6 +1102,28 @@ export async function runSupervised(
   const shouldStop = deps.shouldStop ?? (() => false);
   const stamp = () => new Date(deps.now()).toISOString();
 
+  // Record how the PREVIOUS supervisor process ended before doing anything
+  // else. An external kill writes nothing itself, and the next ledger write is
+  // an attempt away — which is why an OOM-kill used to leave every durable
+  // indicator describing the run that died.
+  const startedAt = stamp();
+  const termination = claimSupervisorRun(dir, startedAt);
+  {
+    const previous = readRestartLedger(dir);
+    const abrupt = (previous.abruptTerminations ?? 0) + (termination.class === 'abrupt' ? 1 : 0);
+    writeRestartLedger(dir, {
+      ...previous,
+      lastTermination: termination,
+      abruptTerminations: abrupt,
+      supervisorStartedAt: startedAt,
+      updatedAt: startedAt,
+    });
+    if (termination.class === 'abrupt')
+      deps.log(`[${name}] previous supervisor run (started ${termination.runStartedAt}) `
+        + `ended abruptly: ${termination.detail}; abrupt terminations recorded: ${abrupt}`);
+  }
+
+  try {
   while (!shouldStop()) {
     let ledger = readRestartLedger(dir);
     try {
@@ -1049,6 +1166,7 @@ export async function runSupervised(
     if (result.modelRecovery === 'advance') {
       writeRestartLedger(dir, {
         ...emptyLedger(),
+        ...carriedForward(ledger),
         lastReason: 'approved model-chain transition',
         updatedAt: stamp(),
       });
@@ -1073,6 +1191,7 @@ export async function runSupervised(
       // A session that ran for a while is not a restart loop, whatever ended it.
       writeRestartLedger(dir, {
         ...emptyLedger(),
+        ...carriedForward(ledger),
         lastReason: result.exit.detail,
         updatedAt: stamp(),
       });
@@ -1083,6 +1202,7 @@ export async function runSupervised(
     const reason = `${result.exit.detail} after ${result.elapsedSecs.toFixed(1)}s`;
     const next: RestartLedger = {
       version: 1,
+      ...carriedForward(ledger),
       consecutiveImmediateFailures: failures,
       lastReason: reason,
       nextDelayMs: backoffFor(failures),
@@ -1104,6 +1224,11 @@ export async function runSupervised(
     await deps.sleep(next.nextDelayMs);
   }
   return readRestartLedger(dir);
+  } finally {
+    // Only an orderly return through this loop clears the marker; a signal or
+    // an OOM-kill leaves it, which is exactly how the successor detects them.
+    releaseSupervisorRun(dir);
+  }
 }
 
 /**

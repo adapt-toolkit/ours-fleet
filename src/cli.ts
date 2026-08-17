@@ -476,6 +476,14 @@ program.command('status <name>').description('unit/agent state')
     else if (ledger.consecutiveImmediateFailures > 0)
       console.log(`restarts: ${ledger.consecutiveImmediateFailures} consecutive immediate `
         + `failures, next delay ${ledger.nextDelayMs}ms (${ledger.lastReason})`);
+    // A kill the supervisor never saw leaves no other trace here. Say it out
+    // loud rather than letting the absence of a failure streak read as "fine".
+    if (ledger.lastTermination?.class === 'abrupt')
+      console.log(`last termination: ABRUPT — the previous supervisor run (started `
+        + `${ledger.lastTermination.runStartedAt ?? 'unknown'}) died without an orderly exit; `
+        + `observed ${ledger.lastTermination.observedAt}`
+        + `\n  abrupt terminations recorded: ${ledger.abruptTerminations ?? 1}`
+        + `\n  cause (signal / OOM-kill): journalctl --user -u ours-fleet-agent@${name}.service`);
     const modelStatus = joinPath(agentDir(name), '.model-status');
     if (existsSync(modelStatus)) {
       try {
