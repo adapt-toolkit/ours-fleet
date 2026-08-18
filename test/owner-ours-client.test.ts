@@ -158,8 +158,8 @@ describe('owner-channel daemon dependency surface', () => {
   it('is pinned to the reviewed SDK version exactly', () => {
     const pkg = JSON.parse(readFileSync(join(REPO, 'package.json'), 'utf8'));
     const lock = JSON.parse(readFileSync(join(REPO, 'package-lock.json'), 'utf8'));
-    expect(pkg.dependencies['@ours.network/sdk']).toBe('1.3.1');
-    expect(lock.packages['node_modules/@ours.network/sdk'].version).toBe('1.3.1');
+    expect(pkg.dependencies['@ours.network/sdk']).toBe('1.5.2');
+    expect(lock.packages['node_modules/@ours.network/sdk'].version).toBe('1.5.2');
   });
 
   it('imports only the documented client subpath, never daemon-side SDK code', async () => {
