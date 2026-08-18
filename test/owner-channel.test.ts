@@ -432,13 +432,16 @@ describe('OwnerChannel', () => {
   });
 
   it('routes regular files from the per-request outbox through the channel identity', async () => {
-    const { channel, client, queuePrompt } = setup([{
+    const { channel, client, queuePrompt, dir } = setup([{
       msg_id: 18, wire_id: 'wire-files', from: { id: OWNER_CID }, text: 'Send the artifacts',
     }]);
     let outbox = '';
     queuePrompt.mockImplementationOnce(async (prompt: string) => {
       const lines = prompt.split('\n');
-      outbox = lines[lines.indexOf('To attach files to your response, copy each finished file directly into this fleet outbox:') + 1];
+      // Derived the way fleet derives it, not scraped from the prompt: the prompt
+      // no longer names an outbox, and a test that reads the prompt to find the
+      // path is coupled to documentation rather than to the behaviour it covers.
+      outbox = join(dir, '.owner-channel-outbox', createHash('sha256').update('wire-files').digest('hex'));
       mkdirSync(outbox, { recursive: true });
       writeFileSync(join(outbox, 'report.txt'), 'report');
       writeFileSync(join(outbox, 'data.json'), '{}');
@@ -477,7 +480,10 @@ describe('OwnerChannel', () => {
     client.failTools.add('send_file');
     queuePrompt.mockImplementationOnce(async (prompt: string) => {
       const lines = prompt.split('\n');
-      outbox = lines[lines.indexOf('To attach files to your response, copy each finished file directly into this fleet outbox:') + 1];
+      // Derived the way fleet derives it, not scraped from the prompt: the prompt
+      // no longer names an outbox, and a test that reads the prompt to find the
+      // path is coupled to documentation rather than to the behaviour it covers.
+      outbox = join(dir, '.owner-channel-outbox', createHash('sha256').update('wire-file-retry').digest('hex'));
       writeFileSync(join(outbox, 'retry.txt'), 'retry');
       return {
         promptId: 'prompt-file-retry', queuedBehind: 0,

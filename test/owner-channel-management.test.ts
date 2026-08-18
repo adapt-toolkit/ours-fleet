@@ -695,7 +695,11 @@ describe('OwnerChannel live management', () => {
     }], []);
     await channel.drain();
 
-    expect(queuePrompt.mock.calls[0][0]).toContain(requestId);
+    // The prompt contained this hash only incidentally, as the last segment of the
+    // outbox path it named. Agents are told not to send a request ID back, so the
+    // prompt never owed them one. This test is about receipt/update/final ORDER;
+    // manage() below still keys on the requestId, derived here rather than scraped.
+    expect(queuePrompt.mock.calls[0][0]).toContain(wireId);
     expect(await channel.manage({
       action: 'request_update', requestId, phase: 'working',
       message: 'The implementation is complete and focused verification is running.',

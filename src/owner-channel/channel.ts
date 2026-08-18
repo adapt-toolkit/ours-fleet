@@ -833,7 +833,7 @@ export class OwnerChannel implements OwnerChannelHandle {
       await mkdir(outbox, { recursive: true, mode: 0o700 });
       const activityCursor = this.latestEventSeq(this.options.session.eventsSince(0));
       const queued = await this.options.session.queuePrompt(
-        this.ownerAttachmentPrompt(sender, originWireId, requestId, outbox, admitted, group.caption),
+        this.ownerAttachmentPrompt(sender, originWireId, requestId, admitted, group.caption),
         {
           interrupt: this.options.config.interrupt,
           ...(this.options.config.interrupt ? { interruptSource: 'owner' as const } : {}),
@@ -950,7 +950,7 @@ export class OwnerChannel implements OwnerChannelHandle {
     const activityCursor = this.latestEventSeq(this.options.session.eventsSince(0));
     try {
       queued = await this.options.session.queuePrompt(
-        this.ownerPrompt(sender, text, wireId, outbox), {
+        this.ownerPrompt(sender, text, wireId), {
         interrupt: this.options.config.interrupt,
         ...(this.options.config.interrupt ? { interruptSource: 'owner' as const } : {}),
         origin: { kind: 'owner', requestId, displayText: text },
@@ -1551,7 +1551,7 @@ export class OwnerChannel implements OwnerChannelHandle {
 
   private ownerAttachmentPrompt(
     sender: { id: string; name: string }, wireId: string, requestId: string,
-    outbox: string, files: AdmittedAttachment[], caption?: InboundMessage,
+    files: AdmittedAttachment[], caption?: InboundMessage,
   ): string {
     const lines = [
       '[fleet-owner]',
@@ -1587,14 +1587,19 @@ export class OwnerChannel implements OwnerChannelHandle {
     }
     lines.push(
       'Answer in your final assistant response; fleet routes it only to the authenticated sender and correlates it to the originating file wire.',
-      `To attach response files, write regular files only to: ${outbox}`,
+      // send_file is the only delivery route an agent is given: a tool call either
+      // delivers or reports an error, where a file written to disk does neither.
+      'To send the owner a file — now or later in this turn — call ours `send_file`:',
+      `contact: ${this.options.config.identity}`,
+      'and the path of the finished file. Fleet routes it to the authenticated owner.',
+      'A file written anywhere else is not delivered and nothing will report that it was not.',
+      'Use descriptive unique filenames. Send nothing the owner did not request or should not receive.',
     );
     return lines.join('\n');
   }
 
   private ownerPrompt(
     sender: { id: string; name: string }, text: string, wireId: string,
-    outbox: string,
   ): string {
     return [
       '[fleet-owner]',
@@ -1609,10 +1614,13 @@ export class OwnerChannel implements OwnerChannelHandle {
       ] : [
         'Managed-agent outbound relay is not configured; do not send intermediate or proactive owner-channel messages.',
       ]),
-      'To attach files to your response, copy each finished file directly into this fleet outbox:',
-      outbox,
-      'Fleet sends every regular file in that directory to the authenticated owner, correlated to this request.',
-      'Use descriptive unique filenames. Put nothing there that the owner did not request or should not receive.',
+      // send_file is the only delivery route an agent is given: a tool call either
+      // delivers or reports an error, where a file written to disk does neither.
+      'To send the owner a file — now or later in this turn — call ours `send_file`:',
+      `contact: ${this.options.config.identity}`,
+      'and the path of the finished file. Fleet routes it to the authenticated owner.',
+      'A file written anywhere else is not delivered and nothing will report that it was not.',
+      'Use descriptive unique filenames. Send nothing the owner did not request or should not receive.',
       '',
       text || '(empty message)',
     ].join('\n');
