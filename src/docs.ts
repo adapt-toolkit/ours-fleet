@@ -526,12 +526,11 @@ owner of that authenticated source wire instead of the latest conversation.
 Every other CID is rejected and warned about without reflecting its body. Fleet sends
 accepted/queued/progress/interrupted/failure notices and routes the ACP turn's
 final assistant text back to the authenticated sender with its source wire ID.
-For file replies, fleet injects a request-specific outbox path into the owner
-prompt. The agent copies completed artifacts there; fleet sends every regular
-file from the channel identity with the same source wire ID and removes the
-temporary outbox only after successful delivery. For proactive or in-turn agent
-attachments, the agent calls ours \`send_file\` to the channel identity and may
-pair it with a reply-linked caption; fleet, not the agent, chooses the owner.
+For file replies of every kind — a response artifact, a proactive note, or an
+in-turn attachment — the agent calls ours \`send_file\` to the channel identity
+and may pair it with a reply-linked caption; fleet, not the agent, chooses the
+owner. That is the only delivery route an agent is given: a tool call either
+delivers or reports an error, where a file written to disk does neither.
 Owner messages whose trimmed text starts with \`/\` are deterministic
 supervisor commands and never enter the model: \`/help\` (alias \`/commands\`),
 \`/status\`, \`/comments [status|on|off]\`, \`/interrupt\`, \`/clear\`,
