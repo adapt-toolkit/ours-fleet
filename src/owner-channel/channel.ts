@@ -1587,12 +1587,8 @@ export class OwnerChannel implements OwnerChannelHandle {
     }
     lines.push(
       'Answer in your final assistant response; fleet routes it only to the authenticated sender and correlates it to the originating file wire.',
-      // FILES GO THROUGH send_file, AND THAT IS THE ONLY ROUTE (owner ruling,
-      // 2026-08-18). Six documents were lost in August 2026 to a copy-into-a-
-      // directory convention: the copy succeeded, nothing read it, and the success
-      // of a copy carries no information about delivery. A tool call either
-      // delivers or reports an error, which is the whole reason this is the only
-      // instruction we give.
+      // send_file is the only delivery route an agent is given: a tool call either
+      // delivers or reports an error, where a file written to disk does neither.
       'To send the owner a file — now or later in this turn — call ours `send_file`:',
       `contact: ${this.options.config.identity}`,
       'and the path of the finished file. Fleet routes it to the authenticated owner.',
@@ -1618,12 +1614,8 @@ export class OwnerChannel implements OwnerChannelHandle {
       ] : [
         'Managed-agent outbound relay is not configured; do not send intermediate or proactive owner-channel messages.',
       ]),
-      // FILES GO THROUGH send_file, AND THAT IS THE ONLY ROUTE (owner ruling,
-      // 2026-08-18). Six documents were lost in August 2026 to a copy-into-a-
-      // directory convention: the copy succeeded, nothing read it, and the success
-      // of a copy carries no information about delivery. A tool call either
-      // delivers or reports an error, which is the whole reason this is the only
-      // instruction we give.
+      // send_file is the only delivery route an agent is given: a tool call either
+      // delivers or reports an error, where a file written to disk does neither.
       'To send the owner a file — now or later in this turn — call ours `send_file`:',
       `contact: ${this.options.config.identity}`,
       'and the path of the finished file. Fleet routes it to the authenticated owner.',

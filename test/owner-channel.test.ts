@@ -438,11 +438,9 @@ describe('OwnerChannel', () => {
     let outbox = '';
     queuePrompt.mockImplementationOnce(async (prompt: string) => {
       const lines = prompt.split('\n');
-      // The path is DERIVED the way fleet derives it, not scraped from the prompt.
-      // The prompt no longer names an outbox — files go through `send_file` now
-      // (owner ruling 2026-08-18) — but the sweep machinery is unchanged and still
-      // under test here, so the test computes what it is testing instead of reading
-      // it back from instructions to an agent.
+      // Derived the way fleet derives it, not scraped from the prompt: the prompt
+      // no longer names an outbox, and a test that reads the prompt to find the
+      // path is coupled to documentation rather than to the behaviour it covers.
       outbox = join(dir, '.owner-channel-outbox', createHash('sha256').update('wire-files').digest('hex'));
       mkdirSync(outbox, { recursive: true });
       writeFileSync(join(outbox, 'report.txt'), 'report');
@@ -482,11 +480,9 @@ describe('OwnerChannel', () => {
     client.failTools.add('send_file');
     queuePrompt.mockImplementationOnce(async (prompt: string) => {
       const lines = prompt.split('\n');
-      // The path is DERIVED the way fleet derives it, not scraped from the prompt.
-      // The prompt no longer names an outbox — files go through `send_file` now
-      // (owner ruling 2026-08-18) — but the sweep machinery is unchanged and still
-      // under test here, so the test computes what it is testing instead of reading
-      // it back from instructions to an agent.
+      // Derived the way fleet derives it, not scraped from the prompt: the prompt
+      // no longer names an outbox, and a test that reads the prompt to find the
+      // path is coupled to documentation rather than to the behaviour it covers.
       outbox = join(dir, '.owner-channel-outbox', createHash('sha256').update('wire-file-retry').digest('hex'));
       writeFileSync(join(outbox, 'retry.txt'), 'retry');
       return {

@@ -446,8 +446,7 @@ export class ScheduledLoopManager implements ScheduledLoopManagerHandle {
       'This is a scheduled internal maintenance turn, not an owner message and not ordinary ours mail.',
       'Perform one bounded pass. Do not wait for the next tick. Do not report to an owner unless your',
       'configured policy and an existing authenticated proactive-report route authorize a material report.',
-      // Same single route as the owner prompt, and for the same reason: a tool call
-      // either delivers or errors, where a file written to disk does neither.
+      // Same single route as the owner-request prompt, and for the same reason.
       'To send a file, call ours `send_file` with the recipient and the path — to your owner-channel',
       'identity if this role has one, otherwise directly to the contact who should receive it.',
       'A file written anywhere else is not delivered and nothing will report that it was not.',
