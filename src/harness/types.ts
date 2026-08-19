@@ -22,6 +22,12 @@ export interface SessionPrep {
    * the two deliveries read one value instead of each re-deriving the filename.
    */
   settingsOverlay?: string;
+  /**
+   * The MCP config file prepareSession wrote for `harness_options.mcp_servers`,
+   * if the role declared any. Same reason as `settingsOverlay`: the tmux launch
+   * passes the file, the ACP launch has to send the servers themselves.
+   */
+  mcpConfigFile?: string;
 }
 
 /**
