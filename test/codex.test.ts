@@ -29,13 +29,15 @@ describe('prepareSession', () => {
   it('prefers ours-codex when installed', async () => {
     const a = makeCodexAdapter(execWith(true));
     const prep = await a.prepareSession(role(), { stateDir: '/s', runCwd: '/s' });
-    expect(prep).toEqual({ argv: [], env: {}, command: 'ours-codex' });
+    expect(prep).toEqual({
+      argv: [], env: { OURS_BIND_IDENTITY: 'Alice Dev' }, command: 'ours-codex' });
   });
 
   it('falls back to native codex when ours-codex is absent', async () => {
     const a = makeCodexAdapter(execWith(false));
     const prep = await a.prepareSession(role(), { stateDir: '/s', runCwd: '/s' });
-    expect(prep).toEqual({ argv: [], env: {}, command: 'codex' });
+    expect(prep).toEqual({
+      argv: [], env: { OURS_BIND_IDENTITY: 'Alice Dev' }, command: 'codex' });
   });
 
   it('fails clearly when ours-codex was explicitly required', async () => {
@@ -76,8 +78,18 @@ describe('prepareSession', () => {
       permissions: { approval: 'allow', filesystem: 'workspace', unattended: 'deny' },
     });
     const prep = await makeCodexAdapter(okExec).prepareSession(r, { stateDir: '/s', runCwd: '/s' });
-    expect(prep.env).toEqual({});
+    expect(prep.env).toEqual({ OURS_BIND_IDENTITY: 'Alice Dev' });
     expect(makeCodexAdapter(okExec).effectivePermissions!(r)).toMatchObject({ exact: false });
+  });
+
+  it('seeds OURS_BIND_IDENTITY onto both launches', async () => {
+    const r = role();
+    const prep = await makeCodexAdapter(okExec).prepareSession(r, { stateDir: '/s', runCwd: '/s' });
+    expect(prep.env.OURS_BIND_IDENTITY).toBe('Alice Dev');
+    expect(makeCodexAdapter(okExec).buildLaunch(r, 'fresh', { sessionId: 's' }, prep)
+      .env.OURS_BIND_IDENTITY).toBe('Alice Dev');
+    expect(makeCodexAdapter(okExec).buildAcpLaunch!(r, prep).env.OURS_BIND_IDENTITY)
+      .toBe('Alice Dev');
   });
 });
 

@@ -1146,3 +1146,46 @@ describe('role control failures are typed (1.5)', () => {
     expect(livenessNote('timeout', 'A')).toContain('busy agent looks exactly like this');
   });
 });
+
+// ── defect 3: what a role declares has to reach session/new ─────────────────
+//
+// `mcpServers` was hard-coded to `[]` on new, resume and load, and `_meta` was
+// never sent at all — so a role's own MCP servers had no route to an ACP session,
+// and the `--settings` overlay that carries `harness_options.plugins` had none
+// either (buildAcpLaunch cannot carry `prep.argv`). These assert the wire, not
+// the adapter: the fixture echoes back the params it was actually given.
+describe('session/new carries the role\'s declared servers and agent options', () => {
+  const params = async (over: Partial<Parameters<typeof AcpSession.start>[0]> = {}) => {
+    const stateDir = mkdtempSync(join(tmpdir(), 'ours-fleet-acp-'));
+    dirs.push(stateDir);
+    const session = await AcpSession.start({
+      name: 'A',
+      argv: [process.execPath, fixture],
+      cwd: stateDir,
+      env: { ACP_FIXTURE_ECHO_SESSION_PARAMS: '1' },
+      stateDir,
+      mode: 'fresh',
+      permissions: { approval: 'allow', filesystem: 'workspace', unattended: 'deny' },
+      log: () => {},
+      ...over,
+    });
+    const echoed = session.eventsSince(0)
+      .find(e => e.kind === 'agent_text' && e.text?.startsWith('new-params:'));
+    await session.close();
+    return JSON.parse((echoed as { text: string }).text.slice('new-params:'.length));
+  };
+
+  it('sends the declared servers and the agent _meta options', async () => {
+    expect(await params({
+      mcpServers: [{ name: 'ours', command: 'ours-mcp', args: ['proxy'], env: [] }],
+      sessionMeta: { claudeCode: { options: { strictMcpConfig: true } } },
+    })).toEqual({
+      mcpServers: [{ name: 'ours', command: 'ours-mcp', args: ['proxy'], env: [] }],
+      _meta: { claudeCode: { options: { strictMcpConfig: true } } },
+    });
+  });
+
+  it('sends [] and no _meta when the role declared nothing — the old behaviour', async () => {
+    expect(await params()).toEqual({ mcpServers: [], _meta: null });
+  });
+});

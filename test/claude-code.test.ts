@@ -181,6 +181,24 @@ describe('prepareSession', () => {
     expect(prep.env.MEMPALACE_DISABLED).toBeUndefined();
   });
 
+  it('seeds OURS_BIND_IDENTITY so the connector binds without the model doing it', async () => {
+    const a = makeClaudeCodeAdapter(okExec);
+    const stateDir = join(dir, 'bind'); mkdirSync(stateDir, { recursive: true });
+    const prep = await a.prepareSession(
+      role({ identity: 'Alice Dev' }), { stateDir, runCwd: stateDir });
+    expect(prep.env.OURS_BIND_IDENTITY).toBe('Alice Dev');
+  });
+
+  it('carries the bind seed onto BOTH launches, since only prep.env reaches ACP', async () => {
+    const a = makeClaudeCodeAdapter(okExec);
+    const stateDir = join(dir, 'bind2'); mkdirSync(stateDir, { recursive: true });
+    const r = role({ identity: 'Alice Dev' });
+    const prep = await a.prepareSession(r, { stateDir, runCwd: stateDir });
+    expect(a.buildLaunch(r, 'fresh', { sessionId: 's' }, prep).env.OURS_BIND_IDENTITY)
+      .toBe('Alice Dev');
+    expect(a.buildAcpLaunch!(r, prep).env.OURS_BIND_IDENTITY).toBe('Alice Dev');
+  });
+
   it('pre-trusts state dir and cwd', async () => {
     const a = makeClaudeCodeAdapter(okExec);
     const stateDir = join(dir, 's3'); mkdirSync(stateDir, { recursive: true });
@@ -434,5 +452,134 @@ describe('neutral permission mapping and the unattended floor (2.1)', () => {
       (effective as { capabilities: never[] }).capabilities,
       ['read-state', 'write-state', 'messaging', 'workspace-edit', 'status-commands'],
     ).meets).toBe(false);
+  });
+});
+
+// ── defect 3: harness_options that used to be silently dropped on ACP ────────
+//
+// `buildAcpLaunch` builds its own argv and cannot carry `prep.argv`, so the
+// `--settings` overlay `plugins` writes was produced and then thrown away for
+// every `session: acp` role, with no warning. The mem-palace toggle rode
+// `prep.env` and survived, which is what made the failure silent AND selective.
+describe('ACP delivery of flag-shaped harness options', () => {
+  const acpRole = (harness_options?: Record<string, unknown>): ResolvedRole =>
+    role({ session: 'acp', ...(harness_options ? { harness_options } : {}) });
+
+  it('sends the plugins overlay through the bundled agent _meta, not argv', async () => {
+    const a = makeClaudeCodeAdapter(okExec);
+    const stateDir = join(dir, 'acp-plugins'); mkdirSync(stateDir, { recursive: true });
+    const r = acpRole({ plugins: { 'x@m': true } });
+    const prep = await a.prepareSession(r, { stateDir, runCwd: stateDir });
+    const overlay = join(stateDir, '.settings-overlay.json');
+    expect(prep.settingsOverlay).toBe(overlay);
+    // The ACP launch still carries no argv — that is the constraint, not the bug.
+    expect(a.buildAcpLaunch!(r, prep).argv).not.toContain('--settings');
+    expect(a.acpSessionMeta!(r, prep)).toEqual({ claudeCode: { options: { settings: overlay } } });
+  });
+
+  it('sends nothing when the role configured nothing', async () => {
+    const a = makeClaudeCodeAdapter(okExec);
+    const stateDir = join(dir, 'acp-bare'); mkdirSync(stateDir, { recursive: true });
+    const r = acpRole();
+    const prep = await a.prepareSession(r, { stateDir, runCwd: stateDir });
+    expect(a.acpSessionMeta!(r, prep)).toBeUndefined();
+    expect(a.acpMcpServers!(r)).toEqual([]);
+  });
+
+  it('sends nothing to an ACP agent fleet did not choose', async () => {
+    const a = makeClaudeCodeAdapter(okExec);
+    const stateDir = join(dir, 'acp-custom'); mkdirSync(stateDir, { recursive: true });
+    const r = role({
+      session: 'acp',
+      session_options: { acp: { command: ['some-other-acp'] } },
+      harness_options: { plugins: { 'x@m': true } },
+    });
+    const prep = await a.prepareSession(r, { stateDir, runCwd: stateDir });
+    expect(a.acpSessionMeta!(r, prep)).toBeUndefined();
+    // …and it is refused rather than quietly ignored.
+    expect(a.validateOptions(r.harness_options, r).map(e => e.path))
+      .toContain('harness_options.plugins');
+  });
+});
+
+describe('harness_options.mcp_servers', () => {
+  const servers = {
+    ours: { command: 'ours-mcp', args: ['proxy'] },
+    trello: { type: 'http', url: 'https://mcp.trello.com/v1' },
+  };
+
+  it('writes a config file and adds --mcp-config on the tmux launch', async () => {
+    const a = makeClaudeCodeAdapter(okExec);
+    const stateDir = join(dir, 'mcp-tmux'); mkdirSync(stateDir, { recursive: true });
+    const r = role({ harness_options: { mcp_servers: servers } });
+    const prep = await a.prepareSession(r, { stateDir, runCwd: stateDir });
+    const file = join(stateDir, '.mcp-config.json');
+    expect(prep.mcpConfigFile).toBe(file);
+    expect(prep.argv).toEqual(['--mcp-config', file]);
+    expect(JSON.parse(readFileSync(file, 'utf8'))).toEqual({ mcpServers: servers });
+    // Additive by default: exclusivity is a separate, explicit opt-in.
+    expect(prep.argv).not.toContain('--strict-mcp-config');
+    expect(a.buildLaunch(r, 'fresh', { sessionId: 's' }, prep).argv)
+      .toEqual(expect.arrayContaining(['--mcp-config', file]));
+  });
+
+  it('adds --strict-mcp-config only when mcp_servers_only is set', async () => {
+    const a = makeClaudeCodeAdapter(okExec);
+    const stateDir = join(dir, 'mcp-strict'); mkdirSync(stateDir, { recursive: true });
+    const prep = await a.prepareSession(
+      role({ harness_options: { mcp_servers: servers, mcp_servers_only: true } }),
+      { stateDir, runCwd: stateDir });
+    expect(prep.argv).toContain('--strict-mcp-config');
+  });
+
+  it('delivers the same set, and the same exclusivity, over ACP', () => {
+    const a = makeClaudeCodeAdapter(okExec);
+    const r = role({
+      session: 'acp', harness_options: { mcp_servers: servers, mcp_servers_only: true },
+    });
+    // Stdio entries carry NO `type`; that is how ACP discriminates the variant.
+    expect(a.acpMcpServers!(r)).toEqual([
+      { name: 'ours', command: 'ours-mcp', args: ['proxy'], env: [] },
+      { name: 'trello', type: 'http', url: 'https://mcp.trello.com/v1', headers: [] },
+    ]);
+    expect(a.acpSessionMeta!(r, { argv: [], env: {} }))
+      .toEqual({ claudeCode: { options: { strictMcpConfig: true } } });
+  });
+
+  it('refuses a strict role that would lose the ours connector and go mute', () => {
+    const a = makeClaudeCodeAdapter(okExec);
+    const errs = a.validateOptions({
+      mcp_servers: { trello: { type: 'http', url: 'https://mcp.trello.com/v1' } },
+      mcp_servers_only: true,
+    });
+    expect(errs).toHaveLength(1);
+    expect(errs[0].path).toBe('harness_options.mcp_servers');
+    expect(errs[0].message).toContain('ours-mcp');
+  });
+
+  it('accepts a strict role that declares the ours connector', () => {
+    expect(makeClaudeCodeAdapter(okExec)
+      .validateOptions({ mcp_servers: servers, mcp_servers_only: true })).toEqual([]);
+  });
+
+  it('refuses mcp_servers_only on its own', () => {
+    const errs = makeClaudeCodeAdapter(okExec).validateOptions({ mcp_servers_only: true });
+    expect(errs.map(e => e.path)).toContain('harness_options.mcp_servers_only');
+  });
+
+  it('reports shape errors per server, by path', () => {
+    const errs = makeClaudeCodeAdapter(okExec).validateOptions({
+      mcp_servers: {
+        nocommand: { args: ['x'] },
+        remote: { type: 'http' },
+        'bad name': { command: 'x' },
+        badtype: { type: 'grpc', command: 'x' },
+      },
+    });
+    const paths = errs.map(e => e.path);
+    expect(paths).toContain('harness_options.mcp_servers.nocommand.command');
+    expect(paths).toContain('harness_options.mcp_servers.remote.url');
+    expect(paths).toContain('harness_options.mcp_servers.bad name');
+    expect(paths).toContain('harness_options.mcp_servers.badtype.type');
   });
 });

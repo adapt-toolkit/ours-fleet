@@ -9,6 +9,7 @@ import { Readable, Writable } from 'node:stream';
 import * as acp from '@agentclientprotocol/sdk';
 
 import type { CommonPermissions } from '../config.js';
+import type { AcpMcpServer } from '../harness/types.js';
 import { normalizeSessionUpdate } from './conversation-normalizer.js';
 import { ConversationEventStore, IdempotencyConflictError } from './conversation-store.js';
 import type {
@@ -241,6 +242,20 @@ export interface AcpSessionOptions {
   permissionMode?: NonNullable<SessionSnapshot['permissionMode']>;
   /** Adapter-authenticated request-metadata vocabulary; never inferred from ACP `_meta`. */
   permissionMetadataSource?: 'codex-acp';
+  /**
+   * MCP servers the ROLE declares, for every session/new, resume and load. Empty
+   * or omitted sends `[]`, which is what fleet has always sent and leaves the
+   * agent's own configuration untouched.
+   */
+  mcpServers?: AcpMcpServer[];
+  /**
+   * Adapter-supplied `_meta` for session/new — the only route by which a
+   * capability the CLI takes as a flag reaches an agent that accepts none.
+   * Per-agent vocabulary, so the ADAPTER decides whether there is anything to
+   * send; this layer only forwards it. Never sent on resume or load: it carries
+   * session-creation options the agent has already applied.
+   */
+  sessionMeta?: Record<string, unknown>;
   log(line: string): void;
   /** Test seam for the cancel-escalation grace period; production uses the default. */
   cancelGraceMs?: number;
@@ -1047,6 +1062,18 @@ export class AcpSession implements SessionHandle {
     this.conversation.close();
   }
 
+  /**
+   * The role's declared MCP servers, or `[]`.
+   *
+   * Sent on resume and load as well as on new: the agent builds its server set
+   * once per session, so a resumed session that omitted them would come back
+   * without the tools the role's config declares — which is exactly the shape of
+   * silent drop this plumbing exists to end.
+   */
+  private declaredMcpServers(): AcpMcpServer[] {
+    return this.options.mcpServers ?? [];
+  }
+
   private async initialize(): Promise<void> {
     const initialized = await this.connection.agent.request(acp.methods.agent.initialize, {
       protocolVersion: acp.PROTOCOL_VERSION,
@@ -1068,7 +1095,7 @@ export class AcpSession implements SessionHandle {
       const resumed = await this.connection.agent.request(acp.methods.agent.session.resume, {
         sessionId: persisted,
         cwd: this.options.cwd,
-        mcpServers: [],
+        mcpServers: this.declaredMcpServers(),
       });
       this.captureRuntimeMetadata(resumed.configOptions);
       this.sessionId = persisted;
@@ -1080,7 +1107,7 @@ export class AcpSession implements SessionHandle {
         const loaded = await this.connection.agent.request(acp.methods.agent.session.load, {
           sessionId: persisted,
           cwd: this.options.cwd,
-          mcpServers: [],
+          mcpServers: this.declaredMcpServers(),
         });
         this.captureRuntimeMetadata(loaded.configOptions);
       } finally { this.replaying = false; }
@@ -1088,7 +1115,8 @@ export class AcpSession implements SessionHandle {
     } else {
       const created = await this.connection.agent.request(acp.methods.agent.session.new, {
         cwd: this.options.cwd,
-        mcpServers: [],
+        mcpServers: this.declaredMcpServers(),
+        ...(this.options.sessionMeta ? { _meta: this.options.sessionMeta } : {}),
       });
       this.sessionId = created.sessionId;
       this.captureRuntimeMetadata(created.configOptions);

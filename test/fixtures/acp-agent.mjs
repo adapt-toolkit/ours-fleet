@@ -187,6 +187,22 @@ createInterface({ input: process.stdin }).on('line', line => {
       });
       break;
     case 'session/new':
+      // Echo back what the CLIENT actually declared, so a test can assert that
+      // per-role MCP servers and the agent-specific `_meta` options reached the
+      // wire instead of being dropped on the way to the ACP launch.
+      if (process.env.ACP_FIXTURE_ECHO_SESSION_PARAMS === '1') {
+        update({
+          sessionUpdate: 'agent_message_chunk',
+          content: {
+            type: 'text',
+            text: `new-params:${JSON.stringify({
+              mcpServers: message.params?.mcpServers ?? null,
+              _meta: message.params?._meta ?? null,
+            })}`,
+          },
+          messageId: 'new-params-1',
+        });
+      }
       send({ jsonrpc: '2.0', id: message.id, result: { sessionId } });
       break;
     case 'session/load':

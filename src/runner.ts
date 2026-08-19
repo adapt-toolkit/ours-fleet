@@ -621,6 +621,13 @@ export async function runOnce(
       mode,
       permissions: perms,
       modeId: adapter.acpPermissionModeId?.(role),
+      // The role's declared MCP servers, and the bundled agent's `_meta`
+      // vocabulary for the options it takes no flag for. Both come from the
+      // ADAPTER and from `prep`: the ACP launch cannot carry `prep.argv`, so this
+      // is the route by which harness_options that used to be silently dropped
+      // for an ACP role actually reach the session.
+      mcpServers: adapter.acpMcpServers?.(role),
+      sessionMeta: adapter.acpSessionMeta?.(role, prep),
       permissionMode: effectivePermissionMode(role),
       // Provenance travels with the exact ACP launch. Keeping it out of a
       // role-only adapter hook prevents a PATH fallback or resolver skew from

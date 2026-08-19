@@ -270,6 +270,9 @@ roles:
       add_dirs: [/data/shared]
       config:
         model_reasoning_effort: high
+      mcp_servers:                       # claude-code: per-role MCP servers, additive by default
+        ours: { command: ours-mcp, args: [proxy] }
+      mcp_servers_only: false            # true = ONLY these; drops user/project/plugin servers
     bio: Public role card and when peers should engage it.
     persona: Local operating contract, boundaries, and escalation policy.
     briefing_file: /absolute/custom-briefing.md
@@ -437,8 +440,30 @@ creation, and \`ours-fleet config\` prints each role's neutral settings, their
 native translation, and any warning — the same text \`doctor\` reports.
 
 Claude \`harness_options\`: \`permission_mode\` (default, acceptEdits, plan,
-dontAsk, bypassPermissions), \`plugins\`, \`mem_palace\`, and
-\`mem_palace_midsession_autosave\`.
+dontAsk, bypassPermissions), \`plugins\`, \`mem_palace\`,
+\`mem_palace_midsession_autosave\`, \`mcp_servers\` and \`mcp_servers_only\`.
+
+\`mcp_servers\` declares MCP servers for the role, in \`.mcp.json\`'s own shape
+(a map of name to \`{ command, args, env }\`, or \`{ type: http|sse, url,
+headers }\`). By default they are ADDED to whatever the OS user running the role
+already has configured, on both session types: tmux passes \`--mcp-config\`, and
+ACP sends them in \`session/new\`.
+
+\`mcp_servers_only: true\` makes the declared set EXCLUSIVE — \`--strict-mcp-config\`
+on tmux, \`strictMcpConfig\` on ACP. It is all-or-nothing and it ignores every
+other MCP configuration: project \`.mcp.json\`, user settings, and **plugins**.
+The ours connector is normally installed as a plugin, so a strict role that does
+not re-declare it has no \`send_message\` and no \`get_messages\` — it cannot even
+report that it has gone mute. Fleet therefore refuses a strict role whose
+\`mcp_servers\` does not name the connector; declare it explicitly, e.g.
+\`ours: { command: ours-mcp, args: [proxy] }\`.
+
+Both options, and \`plugins\`, reach an ACP session through the bundled Claude ACP
+agent's \`_meta\` vocabulary. A role that sets \`session_options.acp.command\` runs
+an agent fleet did not choose and cannot be promised them, so that combination is
+refused at validation rather than accepted and dropped. This narrows a role's
+tool surface; it does not stop the harness deferring tool schemas, which is the
+harness's own decision.
 
 Codex \`harness_options\`: \`launcher\` (auto, ours-codex, codex), \`sandbox\`
 (read-only, workspace-write, danger-full-access), \`approval\` or

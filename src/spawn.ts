@@ -278,7 +278,7 @@ export function spawnDryRun(o: SpawnOpts): SpawnDryRun {
   const adapter = getAdapter(resolvedRole.harness);
   if (resolvedRole.auth_proxy && resolvedRole.harness !== 'claude-code')
     throw new Error('auth_proxy is supported only by claude-code');
-  const optionProblems = adapter.validateOptions(resolvedRole.harness_options);
+  const optionProblems = adapter.validateOptions(resolvedRole.harness_options, resolvedRole);
   if (optionProblems.length)
     throw new Error(optionProblems.map(problem => `${problem.path}: ${problem.message}`).join('; '));
   return {

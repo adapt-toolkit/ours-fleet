@@ -67,7 +67,7 @@ export function applyRole(
   } = {},
 ): string {
   const adapter = getAdapter(role.harness);
-  const errs = adapter.validateOptions(role.harness_options);
+  const errs = adapter.validateOptions(role.harness_options, role);
   if (errs.length)
     throw new Error(`role '${role.name}': ` + errs.map(e => `${e.path}: ${e.message}`).join('; '));
   const dir = agentDir(role.name, opts.temp === true);
