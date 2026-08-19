@@ -44,10 +44,14 @@ describe('ours-fleet CLI', () => {
     expect(first.stdout).not.toContain('canary-must-not-leak');
     const plan = JSON.parse(first.stdout);
     expect(plan.schemaVersion).toBe(1);
+    // ANTHROPIC_MODEL is present because the role declares a model: the pin the
+    // harness actually reads is derived from `model:`, not left to be inherited.
     expect(plan.roles[0].env).toEqual({
       redacted: true,
-      keys: ['A_PUBLIC', 'Z_SECRET'],
-      values: { A_PUBLIC: '<redacted>', Z_SECRET: '<redacted>' },
+      keys: ['ANTHROPIC_MODEL', 'A_PUBLIC', 'Z_SECRET'],
+      values: {
+        ANTHROPIC_MODEL: '<redacted>', A_PUBLIC: '<redacted>', Z_SECRET: '<redacted>',
+      },
     });
   });
 

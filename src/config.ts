@@ -8,6 +8,7 @@ import {
   harnessRuntimeDir, resolveIsolation, validateIsolationConfig,
 } from './isolation/policy.js';
 import { getAdapter } from './harness/registry.js';
+import { resolveRoleModelEnv } from './model-env.js';
 import type { IsolationConfig, WrapContext } from './isolation/types.js';
 import { resolveWatchdogs } from './watchdog/config.js';
 import type { ResolvedWatchdog } from './watchdog/config.js';
@@ -397,7 +398,20 @@ export function loadConfig(
       const harness = r.harness ?? (defaults.harness as string | undefined) ?? 'claude-code';
       const defaultHarness = (defaults.harness as string | undefined) ?? 'claude-code';
       const inheritsModelDefaults = harness === defaultHarness && r.model !== null;
-      const model = resolveRoleModel(r.model, r.harness, defaults);
+      if (authProxy && harness !== 'claude-code')
+        throw new ConfigError(`${file}: role '${name}' auth_proxy is supported only by claude-code`);
+      // Environment and runtime model are resolved together so `model:` and the
+      // harness's model pin can never disagree (see src/model-env.ts).
+      const modelEnv = resolveRoleModelEnv({
+        harness,
+        model: resolveRoleModel(r.model, r.harness, defaults),
+        modelWasExplicit: r.model !== undefined,
+        defaultsEnv: (defaults.env ?? {}) as Record<string, string>,
+        roleEnv: r.env,
+        ...(authProxy ? { authProxyBaseUrl: authProxy.base_url } : {}),
+      }, message => new ConfigError(`${file}: role '${name}' ${message}`));
+      const env = modelEnv.env;
+      const model = modelEnv.model;
       const modelChain = resolveModelChain(
         model,
         r.model_chain ?? (inheritsModelDefaults
@@ -406,13 +420,6 @@ export function loadConfig(
         file,
         name,
       );
-      if (authProxy && harness !== 'claude-code')
-        throw new ConfigError(`${file}: role '${name}' auth_proxy is supported only by claude-code`);
-      const env = {
-        ...((defaults.env ?? {}) as Record<string, string>),
-        ...(r.env ?? {}),
-        ...(authProxy ? { ANTHROPIC_BASE_URL: authProxy.base_url } : {}),
-      };
       roles.push({
         ...r,
         name,

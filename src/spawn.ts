@@ -12,6 +12,7 @@ import {
   type ApprovalMode, type FilesystemMode, type ResolvedRole, type RoleConfig,
   type CommonPermissions, type MonitorConfig, type SessionBackendId, type UnattendedMode,
 } from './config.js';
+import { resolveRoleModelEnv } from './model-env.js';
 import { applyRole, up, type OpsDeps } from './ops.js';
 import { START_STAGGER_FILE } from './runner.js';
 import {
@@ -241,7 +242,17 @@ export function spawnDryRun(o: SpawnOpts): SpawnDryRun {
   const harness = raw.harness ?? (cfg.defaults.harness as string | undefined) ?? 'claude-code';
   const defaultHarness = (cfg.defaults.harness as string | undefined) ?? 'claude-code';
   const inheritsModelDefaults = harness === defaultHarness && raw.model !== null;
-  const model = resolveRoleModel(raw.model, raw.harness, cfg.defaults);
+  const authProxy = resolveAuthProxy(cfg.defaults.auth_proxy, raw.auth_proxy);
+  // One resolution for the environment and the model it pins (src/model-env.ts).
+  const modelEnv = resolveRoleModelEnv({
+    harness,
+    model: resolveRoleModel(raw.model, raw.harness, cfg.defaults),
+    modelWasExplicit: raw.model !== undefined,
+    defaultsEnv: (cfg.defaults.env ?? {}) as Record<string, string>,
+    roleEnv: raw.env,
+    ...(authProxy ? { authProxyBaseUrl: authProxy.base_url } : {}),
+  });
+  const model = modelEnv.model;
   const session = raw.session ?? (cfg.defaults.session as SessionBackendId | undefined) ?? 'tmux';
   const resolvedRole: ResolvedRole = {
     ...raw,
@@ -266,15 +277,9 @@ export function spawnDryRun(o: SpawnOpts): SpawnDryRun {
     owner_channel: resolveOwnerChannelConfig(
       cfg.defaults.owner_channel, raw.owner_channel, session),
     worklog: resolveWorklogPolicy(cfg.defaults.worklog, raw.worklog),
-    auth_proxy: resolveAuthProxy(cfg.defaults.auth_proxy, raw.auth_proxy),
+    auth_proxy: authProxy,
   };
-  resolvedRole.env = {
-    ...((cfg.defaults.env ?? {}) as Record<string, string>),
-    ...(raw.env ?? {}),
-    ...(resolvedRole.auth_proxy
-      ? { ANTHROPIC_BASE_URL: resolvedRole.auth_proxy.base_url }
-      : {}),
-  };
+  resolvedRole.env = modelEnv.env;
   const adapter = getAdapter(resolvedRole.harness);
   if (resolvedRole.auth_proxy && resolvedRole.harness !== 'claude-code')
     throw new Error('auth_proxy is supported only by claude-code');
@@ -486,7 +491,18 @@ async function spawnTempInner(
   };
   const harness = o.harness ?? defaultHarness ?? 'claude-code';
   const inheritsModelDefaults = harness === (defaultHarness ?? 'claude-code') && o.model !== null;
-  const model = resolveRoleModel(o.model, o.harness, cfg.defaults);
+  const tempAuthProxy = resolveAuthProxy(cfg.defaults.auth_proxy, fromOpts.auth_proxy);
+  // An explicitly requested --model must reach the child, not just the banner
+  // (src/model-env.ts).
+  const modelEnv = resolveRoleModelEnv({
+    harness,
+    model: resolveRoleModel(o.model, o.harness, cfg.defaults),
+    modelWasExplicit: o.model !== undefined,
+    defaultsEnv: (cfg.defaults.env ?? {}) as Record<string, string>,
+    roleEnv: fromOpts.env,
+    ...(tempAuthProxy ? { authProxyBaseUrl: tempAuthProxy.base_url } : {}),
+  });
+  const model = modelEnv.model;
   const session = o.session ?? (cfg.defaults.session as SessionBackendId | undefined) ?? 'tmux';
   const role: ResolvedRole = {
     ...fromOpts,          // includes `isolation` when --isolation-file was given
@@ -510,14 +526,10 @@ async function spawnTempInner(
     owner_channel: resolveOwnerChannelConfig(
       cfg.defaults.owner_channel, fromOpts.owner_channel, session),
     worklog: resolveWorklogPolicy(cfg.defaults.worklog, fromOpts.worklog),
-    auth_proxy: resolveAuthProxy(cfg.defaults.auth_proxy, fromOpts.auth_proxy),
+    auth_proxy: tempAuthProxy,
     sourceFile: '(temp)',
   };
-  role.env = {
-    ...((cfg.defaults.env ?? {}) as Record<string, string>),
-    ...(fromOpts.env ?? {}),
-    ...(role.auth_proxy ? { ANTHROPIC_BASE_URL: role.auth_proxy.base_url } : {}),
-  };
+  role.env = modelEnv.env;
   if (role.auth_proxy && role.harness !== 'claude-code')
     throw new Error('auth_proxy is supported only by claude-code');
   onStage?.('writing_role');

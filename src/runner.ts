@@ -44,6 +44,7 @@ import {
 } from './fleet-proxy.js';
 import type { SpawnOpts } from './spawn.js';
 import { effectivePermissionMode } from './permissions.js';
+import { assertModelPinReachesChild, effectiveRoleModel, repinModelEnv } from './model-env.js';
 import {
   archiveTempState, markTempSupervisorActive, requestedTempStopReason,
   type TempTerminationReason,
@@ -125,6 +126,22 @@ export function managedFleetProxyEnv(
 }
 
 /**
+ * The environment a managed harness child actually receives, checked at the one
+ * point where it is composed. `role.env` deliberately wins over harness prep,
+ * which is exactly how a stale fleet-wide model pin used to outrank the model
+ * the role was spawned with — so the model pin is verified here rather than
+ * trusted, and a disagreement stops the launch instead of being reported as a
+ * success (see src/model-env.ts).
+ */
+export function harnessChildEnv(
+  role: ResolvedRole, launchEnv: Record<string, string> | undefined, stateDir: string,
+): Record<string, string> {
+  const env = { ...(launchEnv ?? {}), ...managedFleetProxyEnv(role, stateDir) };
+  assertModelPinReachesChild(role, env);
+  return env;
+}
+
+/**
  * Execute a typed proxy request in the caller's supervisor. Dynamic imports
  * avoid a runner↔spawn initialization cycle (spawn imports runner constants).
  */
@@ -158,7 +175,9 @@ async function executeManagedSpawn(
     statePath,
     harness: preview.harness,
     session: preview.session,
-    ...(preview.model ? { model: preview.model } : {}),
+    // Read back from the resolved environment, not from the request: the banner
+    // must name the model the child will run, not the one that was asked for.
+    ...(effectiveRoleModel(preview) ? { model: effectiveRoleModel(preview)! } : {}),
     monitor: { mode: preview.monitor.mode, interrupt: preview.monitor.interrupt },
     permissionMode: effectivePermissionMode(preview),
     inherited,
@@ -166,6 +185,7 @@ async function executeManagedSpawn(
   };
   log(`[${caller.name}] managed fleet proxy spawned ${result.lifetime} role ${result.role} `
     + `harness=${result.harness} session=${result.session} `
+    + `model=${result.model ?? '(harness default)'} `
     + `permission=${result.permissionMode!.fleetMode} `
     + `native=${result.permissionMode!.nativeMode}`);
   return result;
@@ -561,11 +581,18 @@ export async function runOnce(
   const effectiveModel = effectiveModelForRole(dir, role);
   if (effectiveModel !== role.model) {
     deps.log(`[${name}] model recovery drift: declared=${role.model ?? '(none)'} effective=${effectiveModel}`);
-    role = { ...role, model: effectiveModel };
+    // The env pin has to move with it. A down-shift that changed only
+    // `role.model` was reported as a model change while the child kept running
+    // the model that had just failed, because the pin is what the harness reads.
+    role = { ...role, model: effectiveModel, env: repinModelEnv(role, effectiveModel) };
   }
   if (modelRecoveryHeld(dir))
     throw new Error(`[${name}] model chain exhausted — held down until config changes or recovery reset`);
   const adapter = getAdapter(role.harness);
+  // Say the running model out loud, once, from the resolved environment. The
+  // spawn banner is a claim made before the process exists; this is the log line
+  // that can be checked against the session afterwards.
+  deps.log(`[${name}] model: ${effectiveRoleModel(role) ?? '(harness default)'}`);
   mkdirSync(dir, { recursive: true });
   const rotation = rotateWorklog(join(dir, 'WORKLOG.md'), role.worklog);
   if (rotation.deferred)
@@ -711,7 +738,7 @@ export async function runOnce(
       name,
       argv: wrappedArgv,
       cwd: runCwd,
-      env: { ...launch.env, ...managedFleetProxyEnv(role, dir) },
+      env: harnessChildEnv(role, launch.env, dir),
       stateDir: dir,
       mode,
       permissions: perms,
