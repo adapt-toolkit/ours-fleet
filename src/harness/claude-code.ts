@@ -196,6 +196,15 @@ export function makeClaudeCodeAdapter(exec: Exec = realExec): HarnessAdapter {
         CLAUDE_AUTOCOMPACT_PCT_OVERRIDE: String(autocompactPct(role)),
         MEMPALACE_HOOKS_AUTO_SAVE: 'false',
         MEMPALACE_MIDSESSION_AUTOSAVE: o.mem_palace_midsession_autosave ? 'true' : 'false',
+        // The role's identity, for the ours connector to bind at startup instead of
+        // the briefing telling the MODEL to call choose_identity. Both launches
+        // return `prep.env`, so this one line covers tmux and ACP alike.
+        //
+        // The bind the connector performs is PLAIN and fail-closed: it can never
+        // evict a live session, and a role whose identity does not exist yet simply
+        // boots unbound and falls through to the briefing's create-if-missing step.
+        // Nothing here may ever grow a force flag.
+        OURS_BIND_IDENTITY: role.identity,
       };
       if (!memPalace) env.MEMPALACE_DISABLED = 'true';
 

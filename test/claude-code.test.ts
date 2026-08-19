@@ -181,6 +181,24 @@ describe('prepareSession', () => {
     expect(prep.env.MEMPALACE_DISABLED).toBeUndefined();
   });
 
+  it('seeds OURS_BIND_IDENTITY so the connector binds without the model doing it', async () => {
+    const a = makeClaudeCodeAdapter(okExec);
+    const stateDir = join(dir, 'bind'); mkdirSync(stateDir, { recursive: true });
+    const prep = await a.prepareSession(
+      role({ identity: 'Alice Dev' }), { stateDir, runCwd: stateDir });
+    expect(prep.env.OURS_BIND_IDENTITY).toBe('Alice Dev');
+  });
+
+  it('carries the bind seed onto BOTH launches, since only prep.env reaches ACP', async () => {
+    const a = makeClaudeCodeAdapter(okExec);
+    const stateDir = join(dir, 'bind2'); mkdirSync(stateDir, { recursive: true });
+    const r = role({ identity: 'Alice Dev' });
+    const prep = await a.prepareSession(r, { stateDir, runCwd: stateDir });
+    expect(a.buildLaunch(r, 'fresh', { sessionId: 's' }, prep).env.OURS_BIND_IDENTITY)
+      .toBe('Alice Dev');
+    expect(a.buildAcpLaunch!(r, prep).env.OURS_BIND_IDENTITY).toBe('Alice Dev');
+  });
+
   it('pre-trusts state dir and cwd', async () => {
     const a = makeClaudeCodeAdapter(okExec);
     const stateDir = join(dir, 's3'); mkdirSync(stateDir, { recursive: true });

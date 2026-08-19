@@ -333,7 +333,16 @@ export function makeCodexAdapter(exec: Exec = realExec): HarnessAdapter {
       if (requested === 'ours-codex' && !hasOursCodex)
         throw new Error('harness_options.launcher is ours-codex, but ours-codex is not on PATH; install @ours.network/codex or use launcher: auto');
       const command = requested === 'codex' ? 'codex' : hasOursCodex ? 'ours-codex' : 'codex';
-      return { argv: [], env: codexAcpEnvironment(role, dirs), command };
+      return {
+        argv: [],
+        // OURS_BIND_IDENTITY is the connector's startup bind seed — see the note in
+        // claude-code.ts's prepareSession. It belongs on EVERY harness that runs a
+        // role with an ours identity, not just claude-code: a seed that works on one
+        // harness and silently does nothing on the other is the same class of defect
+        // as a config key that only works on one session type.
+        env: { OURS_BIND_IDENTITY: role.identity, ...codexAcpEnvironment(role, dirs) },
+        command,
+      };
     },
 
     buildLaunch(role: ResolvedRole, mode: 'fresh' | 'resume', _s: SessionState, prep: SessionPrep): Launch {
