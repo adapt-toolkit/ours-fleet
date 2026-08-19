@@ -2,11 +2,12 @@ import { createHash, randomUUID } from 'node:crypto';
 import {
   chmodSync, constants, existsSync, lstatSync, mkdirSync, readFileSync,
 } from 'node:fs';
-import { chmod, link, lstat, mkdir, open, readdir, rm } from 'node:fs/promises';
+import { chmod, link, lstat, mkdir, open, readdir, rm, type FileHandle } from 'node:fs/promises';
 import { basename, join } from 'node:path';
 
 import { replaceFileAtomically } from '../atomic-file.js';
 import type { OwnerAttachmentConfig } from '../config.js';
+import type { OursIncomingFile, OursRetrievedFiles } from './ours-client.js';
 
 const WIRE = /^[A-Fa-f0-9]{64}$/;
 const CID = /^[A-Fa-f0-9]{64}$/;
@@ -57,8 +58,14 @@ export interface AdmittedAttachment {
   transcription?: Omit<VoiceTranscription, 'audioPath'>;
 }
 
-export function parseIncomingAttachments(raw: unknown): IncomingAttachment[] {
-  const values = (raw as { files?: unknown })?.files;
+/**
+ * Admit the daemon's file listing. The rows are typed now, but every field is
+ * still re-validated here: sender CID, wire id, sizes and ids all cross the
+ * trust boundary and decide routing, so a daemon-side shape change must drop a
+ * row rather than produce a half-built attachment.
+ */
+export function parseIncomingAttachments(raw: OursIncomingFile[] | undefined): IncomingAttachment[] {
+  const values: unknown = raw;
   if (!Array.isArray(values)) return [];
   const out: IncomingAttachment[] = [];
   for (const value of values) {
@@ -87,15 +94,15 @@ export function parseIncomingAttachments(raw: unknown): IncomingAttachment[] {
 }
 
 export function parseRetrievedAttachments(
-  raw: unknown, expected: IncomingAttachment[], recovered = false,
+  raw: OursRetrievedFiles | undefined, expected: IncomingAttachment[], recovered = false,
 ): RetrievedAttachment[] {
-  const values = (raw as { files?: unknown })?.files;
+  const values: unknown = raw?.files;
   if (!Array.isArray(values) || values.length !== expected.length)
-    throw new Error('ours-mcp returned an incomplete selected attachment set');
+    throw new Error('the ours daemon returned an incomplete selected attachment set');
   const byWire = new Map(expected.map(file => [file.wireId, file]));
   const out: RetrievedAttachment[] = [];
   for (const value of values) {
-    if (!value || typeof value !== 'object') throw new Error('ours-mcp returned invalid attachment metadata');
+    if (!value || typeof value !== 'object') throw new Error('the ours daemon returned invalid attachment metadata');
     const file = value as Record<string, unknown>;
     const wireId = String(file.wire_id ?? '');
     const listed = byWire.get(wireId);
@@ -108,14 +115,14 @@ export function parseRetrievedAttachments(
         || !Number.isSafeInteger(size) || size !== listed.size || mime !== listed.mime
         || kind !== listed.kind || !/^[a-f0-9]{64}$/.test(sha256)
         || typeof file.path !== 'string' || !file.path)
-      throw new Error('ours-mcp selected attachment provenance or integrity metadata mismatched');
+      throw new Error('selected attachment provenance or integrity metadata mismatched');
     out.push({
       ...listed, filename: safeField(file.filename, 255), mime, size, path: file.path, sha256, kind,
       ...(recovered ? {} : parseTranscription(file.transcription, wireId)),
     });
     byWire.delete(wireId);
   }
-  if (byWire.size) throw new Error('ours-mcp omitted a selected attachment');
+  if (byWire.size) throw new Error('the ours daemon omitted a selected attachment');
   return out;
 }
 
@@ -258,6 +265,57 @@ export async function admitAttachments(
     });
   }
   return admitted;
+}
+
+/** Injectable short-write seam, so partial writes are provably handled. */
+export interface AttachmentWriteDeps {
+  write?(handle: FileHandle, bytes: Uint8Array, offset: number): Promise<number>;
+}
+
+/**
+ * Land crash-recovered file bytes inside an already-prepared request directory.
+ *
+ * The MCP path handed the daemon a `dest_path` and let its connector write the
+ * file. Nothing writes on our behalf any more, so this owns both halves of that
+ * contract: the destination is DERIVED from a validated wire id inside `dir`
+ * rather than accepted from a caller, and the file is published by link-after-
+ * fsync, so a crash or a short write can never leave a partial file where the
+ * admission step would read it as complete.
+ */
+export async function writeRecoveredAttachment(
+  dir: string, wireId: string, bytes: Uint8Array, deps: AttachmentWriteDeps = {},
+): Promise<string> {
+  if (!WIRE.test(wireId)) throw new Error('recovered attachment wire id is not a 64-hex value');
+  const dirStat = await lstat(dir);
+  if (!dirStat.isDirectory() || dirStat.isSymbolicLink())
+    throw new Error('recovered attachment directory is not a safe directory');
+  const write = deps.write
+    ?? ((handle, buffer, offset) => handle.write(buffer, offset, buffer.length - offset)
+      .then(result => result.bytesWritten));
+  const finalPath = join(dir, `.recovered-${wireId}-${randomUUID()}`);
+  const tmp = join(dir, `.${basename(finalPath)}.${randomUUID()}.tmp`);
+  const handle = await open(tmp, 'wx', 0o600);
+  try {
+    for (let written = 0; written < bytes.length;) {
+      const advanced = await write(handle, bytes, written);
+      if (advanced <= 0)
+        throw new Error(`recovered attachment write made no progress at byte ${written}`);
+      written += advanced;
+    }
+    await handle.sync();
+  } catch (error) {
+    await handle.close().catch(() => undefined);
+    await rm(tmp, { force: true });
+    throw error;
+  }
+  await handle.close();
+  // link publishes the finished bytes under a name that never existed in a
+  // partial state; the temp is only ever removed after it succeeded.
+  try { await link(tmp, finalPath); }
+  catch (error) { await rm(tmp, { force: true }); throw error; }
+  await rm(tmp, { force: true });
+  await chmod(finalPath, 0o600);
+  return finalPath;
 }
 
 export async function recoveredAttachment(

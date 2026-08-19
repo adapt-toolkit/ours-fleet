@@ -5,8 +5,12 @@ import { join } from 'node:path';
 import { PassThrough } from 'node:stream';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
+import { errBoundElsewhere } from '@ours.network/sdk/client';
+
 import { OwnerChannel } from '../src/owner-channel/channel.js';
-import type { OursToolClient } from '../src/owner-channel/mcp.js';
+import type {
+  OursContactsView, OursInboundMessage, OursOps,
+} from '../src/owner-channel/ours-client.js';
 import { OWNER_TASK_MAX_PER_OWNER, OWNER_TASK_TTL_MS } from '../src/owner-channel/tasks.js';
 import type { SessionHandle } from '../src/session/types.js';
 
@@ -16,28 +20,66 @@ const AGENT = 'D'.repeat(64);
 const INTRUDER = 'E'.repeat(64);
 const dirs: string[] = [];
 
-class ManagementClient implements OursToolClient {
+class ManagementClient implements OursOps {
   calls: Array<{ name: string; args?: Record<string, unknown> }> = [];
   batches: unknown[][] = [];
-  contacts: unknown[] = [
-    { id: CONTACT, name: 'Phone', status: 'established', bio: 'must not be returned' },
-    { id: 'C'.repeat(64), name: 'Pending', status: 'pending' },
-  ];
+  /**
+   * Established contacts and pending introductions are separate daemon
+   * collections, and neither carries a bio or any other free text.
+   */
+  view: OursContactsView = {
+    contacts: [{ name: 'Phone', container_id: CONTACT }],
+    pending: [{ name: 'Pending', container_id: 'C'.repeat(64), queued: 1 }],
+    roots: {}, degraded: [], renames: {},
+  };
   failSendTo = new Set<string>();
-  chooseFailures = 0;
+  /** How many binds must fail, and with which error. */
+  bindFailures = 0;
+  bindError: () => Error = () => errBoundElsewhere('Coordinator-owner');
   async start() {}
   async close() {}
-  async callTool(name: string, args?: Record<string, unknown>): Promise<unknown> {
-    this.calls.push({ name, args });
-    if (name === 'choose_identity' && this.chooseFailures-- > 0)
-      throw new Error('choose_identity declined: identity is currently bound to another live session');
-    if (name === 'send_message' && this.failSendTo.has(String(args?.contact)))
-      throw new Error('send_message failed');
-    if (name === 'list_contacts') return { contacts: this.contacts };
-    if (name === 'generate_invite') return { invite: 'mock-invite-secret' };
-    if (name === 'add_contact') return { id: CONTACT, name: 'Phone' };
-    if (name === 'get_messages') return { messages: this.batches.shift() ?? [] };
-    return {};
+  async bindIdentity(name: string) {
+    this.calls.push({ name: 'bindIdentity', args: { name } });
+    if (this.bindFailures-- > 0) throw this.bindError();
+  }
+  async listContacts() {
+    this.calls.push({ name: 'listContacts', args: undefined });
+    return this.view;
+  }
+  async generateInvite(name?: string) {
+    this.calls.push({ name: 'generateInvite', args: { name } });
+    return { blob: 'mock-invite-blob', inviteId: 'invite-1', mode: 'one_time' as const };
+  }
+  async addContact(a: { invite: string; name?: string }) {
+    this.calls.push({ name: 'addContact', args: { ...a } });
+    return { display: a.name ?? 'Phone', cid: CONTACT };
+  }
+  async getMessages() {
+    this.calls.push({ name: 'getMessages', args: undefined });
+    const messages = (this.batches.shift() ?? []) as OursInboundMessage[];
+    return { count: messages.length, messages };
+  }
+  async deferMessages(msgIds: number[]) {
+    this.calls.push({ name: 'deferMessages', args: { msgIds } });
+  }
+  async listIncomingFiles() {
+    this.calls.push({ name: 'listIncomingFiles', args: undefined });
+    return [];
+  }
+  async getFiles(wireIds: string[]) {
+    this.calls.push({ name: 'getFiles', args: { wireIds } });
+    return { files: [], text: '', mode: 'selected' as const, requested: wireIds };
+  }
+  async fetchFile(wireId: string) {
+    this.calls.push({ name: 'fetchFile', args: { wireId } });
+    return new Uint8Array();
+  }
+  async sendMessage(a: { contact: string; text: string; replyToWireId?: string }) {
+    this.calls.push({ name: 'sendMessage', args: { ...a } });
+    if (this.failSendTo.has(a.contact)) throw new Error('sendMessage failed');
+  }
+  async sendFile(a: { contact: string; path: string; filename: string; replyToWireId?: string }) {
+    this.calls.push({ name: 'sendFile', args: { ...a } });
   }
 }
 
@@ -306,15 +348,15 @@ describe('OwnerChannel live management', () => {
     await channel.drain();
 
     expect(queuePrompt).not.toHaveBeenCalled();
-    expect(client.calls.filter(call => call.name === 'send_message').map(call => call.args))
+    expect(client.calls.filter(call => call.name === 'sendMessage').map(call => call.args))
       .toEqual(expect.arrayContaining([
         { contact: OWNER, text: 'The verification run is halfway complete.' },
         { contact: OWNER, text: 'I found a useful unassigned Trello item.' },
       ]));
-    expect(client.calls.filter(call => call.name === 'send_message'
+    expect(client.calls.filter(call => call.name === 'sendMessage'
       && ['The verification run is halfway complete.', 'I found a useful unassigned Trello item.']
         .includes(String(call.args?.text)))
-      .every(call => call.args?.reply_to_wire_id === undefined)).toBe(true);
+      .every(call => call.args?.replyToWireId === undefined)).toBe(true);
     await channel.close();
   });
 
@@ -332,7 +374,7 @@ describe('OwnerChannel live management', () => {
     await channel.drain();
 
     expect(queuePrompt).not.toHaveBeenCalled();
-    const warning = client.calls.filter(call => call.name === 'send_message').at(-1)?.args;
+    const warning = client.calls.filter(call => call.name === 'sendMessage').at(-1)?.args;
     expect(warning).toEqual({
       contact: OWNER,
       text: `⚠️ Owner-channel security warning: rejected a message from unauthorized sender CID `
@@ -346,7 +388,7 @@ describe('OwnerChannel live management', () => {
   it('authenticates the managed agent and owners in any CID casing without swapping roles', async () => {
     const { channel, client, queuePrompt } = setup({ agent: AGENT });
     await channel.start();
-    const sends = () => client.calls.filter(call => call.name === 'send_message').map(call => call.args);
+    const sends = () => client.calls.filter(call => call.name === 'sendMessage').map(call => call.args);
     // The agent's daemon-delivered CID differs only by case: still the managed
     // agent, so its message is relayed and never becomes an owner instruction.
     client.batches.push([{
@@ -386,13 +428,13 @@ describe('OwnerChannel live management', () => {
 
   it('routes a sole-owner relay through the daemon-known contact form of a canonical config CID', async () => {
     const { channel, client } = setup({ agent: AGENT, owners: [OWNER.toLowerCase()] });
-    client.contacts = [{ id: OWNER, name: 'Phone', status: 'established' }];
+    client.view = { ...client.view, contacts: [{ name: 'Phone', container_id: OWNER }], pending: [] };
     await channel.start();
     client.batches.push([{
       msg_id: 71, wire_id: 'agent-sole', from: { id: AGENT }, text: 'Sole owner note.',
     }], []);
     await channel.drain();
-    const sends = client.calls.filter(call => call.name === 'send_message').map(call => call.args);
+    const sends = client.calls.filter(call => call.name === 'sendMessage').map(call => call.args);
     expect(sends).toContainEqual({ contact: OWNER, text: 'Sole owner note.' });
     expect(sends.some(args => args?.contact === OWNER.toLowerCase())).toBe(false);
     await channel.close();
@@ -404,7 +446,7 @@ describe('OwnerChannel live management', () => {
       agent: AGENT, owners: [OWNER, OWNER_TWO],
     });
     await channel.start();
-    const sends = () => client.calls.filter(call => call.name === 'send_message').map(call => call.args);
+    const sends = () => client.calls.filter(call => call.name === 'sendMessage').map(call => call.args);
     const agentMessage = {
       msg_id: 31, wire_id: 'agent-unroutable', from: { id: AGENT },
       text: 'Escalation: need owner input.',
@@ -421,10 +463,10 @@ describe('OwnerChannel live management', () => {
     // bounded NACK correlated to its wire.
     expect(sends().filter(args => args?.contact === AGENT)).toEqual([{
       contact: AGENT, text: expect.stringContaining('queued'),
-      reply_to_wire_id: 'agent-unroutable',
+      replyToWireId: 'agent-unroutable',
     }]);
     // The wire stays deferred and unconsumed for replay.
-    expect(client.calls).toContainEqual({ name: 'defer_messages', args: { msg_ids: [31] } });
+    expect(client.calls).toContainEqual({ name: 'deferMessages', args: { msgIds: [31] } });
     const statePath = join(dir, '.owner-channel-state.json');
     if (existsSync(statePath))
       expect(readFileSync(statePath, 'utf8')).not.toContain('agent-unroutable');
@@ -460,10 +502,10 @@ describe('OwnerChannel live management', () => {
     const bad = { msg_id: 41, wire_id: 'agent-bad', from: { id: AGENT }, text: 'bad\u0000byte' };
     client.batches.push([bad], []);
     await channel.drain();
-    const sends = () => client.calls.filter(call => call.name === 'send_message').map(call => call.args);
+    const sends = () => client.calls.filter(call => call.name === 'sendMessage').map(call => call.args);
     expect(sends()).toEqual([{
       contact: AGENT, text: expect.stringContaining('was not relayed to an owner'),
-      reply_to_wire_id: 'agent-bad',
+      replyToWireId: 'agent-bad',
     }]);
     // Permanently consumed: a replay is inert.
     client.batches.push([bad], []);
@@ -479,10 +521,10 @@ describe('OwnerChannel live management', () => {
     const report = { msg_id: 42, wire_id: 'agent-uncertain', from: { id: AGENT }, text: 'Report.' };
     client.batches.push([report], []);
     await channel.drain();
-    const sends = () => client.calls.filter(call => call.name === 'send_message').map(call => call.args);
+    const sends = () => client.calls.filter(call => call.name === 'sendMessage').map(call => call.args);
     expect(sends().filter(args => args?.contact === AGENT)).toEqual([{
       contact: AGENT, text: expect.stringContaining('uncertain'),
-      reply_to_wire_id: 'agent-uncertain',
+      replyToWireId: 'agent-uncertain',
     }]);
     expect(sends().filter(args => args?.contact === OWNER)).toHaveLength(1);
     // The uncertain outcome is terminal: a replayed copy never re-sends.
@@ -507,9 +549,9 @@ describe('OwnerChannel live management', () => {
       inherited: ['harness', 'session', 'model'], creationActionId: 'spawn-action-1',
     });
 
-    const notice = client.calls.filter(call => call.name === 'send_message').at(-1)?.args;
+    const notice = client.calls.filter(call => call.name === 'sendMessage').at(-1)?.args;
     expect(notice?.contact).toBe(OWNER);
-    expect(notice?.reply_to_wire_id).toBeUndefined();
+    expect(notice?.replyToWireId).toBeUndefined();
     expect(notice?.text).toContain('Coordinator spawned temporary agent DeveloperX');
     expect(notice?.text).toContain('codex/acp, model gpt-test');
     expect(notice?.text).toContain('fleet monitor with interruption');
@@ -526,8 +568,78 @@ describe('OwnerChannel live management', () => {
     })).rejects.toThrow(/managed agent must message its owner-channel identity/);
     await expect(channel.manage({ action: 'owner_authorize', cid: CONTACT }))
       .rejects.toThrow(/edit fleet configuration instead/);
-    expect(client.calls.filter(call => call.name === 'send_message')).toEqual([]);
+    expect(client.calls.filter(call => call.name === 'sendMessage')).toEqual([]);
     await channel.close();
+  });
+
+  // ours-mcp answered generate_invite with "One-time invite for X created
+  // (invite_id …). Share this blob out-of-band …:\n<blob>" and no
+  // structuredContent, so the transport returned that sentence and the whole
+  // sentence was handed out as the invite. Rewording the daemon's prose changed
+  // the payload; the blob field cannot.
+  it('hands out the invite blob alone, never a sentence containing it', async () => {
+    const { channel, client } = setup();
+    await channel.start();
+    client.generateInvite = async name => {
+      client.calls.push({ name: 'generateInvite', args: { name } });
+      return {
+        blob: 'BLOB-ONLY-PAYLOAD',
+        inviteId: 'invite-9',
+        mode: 'one_time' as const,
+      };
+    };
+    const invite = await channel.manage({ action: 'contact_invite', name: 'Mobile' });
+    if (invite.action !== 'contact_invite') throw new Error('bad test response');
+    expect(invite.invite).toBe('BLOB-ONLY-PAYLOAD');
+    expect(invite.invite).not.toMatch(/invite_id|Share this blob|out-of-band/);
+    await channel.close();
+  });
+
+  // list_contacts was prose too, so the JSON parse failed and the channel saw
+  // an empty list: contact_list was always empty and owner_authorize could
+  // never accept any CID. Both are structural now.
+  it('lists and authorizes an established contact from the typed daemon view', async () => {
+    const { channel, client } = setup();
+    await channel.start();
+    client.view = {
+      contacts: [{ name: 'Phone', container_id: CONTACT }],
+      pending: [{ name: 'Laptop', container_id: 'C'.repeat(64), queued: 2 }],
+      roots: { [CONTACT]: { root_cid: 'D'.repeat(64), root_name: 'Human', role_id: 'r1' } },
+      degraded: [], renames: {},
+    };
+    const listed = await channel.manage({ action: 'contact_list' });
+    if (listed.action !== 'contact_list') throw new Error('bad test response');
+    expect(listed.contacts).toEqual([
+      {
+        cid: CONTACT, name: 'Phone', status: 'established',
+        human: { cid: 'D'.repeat(64), name: 'Human' },
+      },
+      { cid: 'C'.repeat(64), name: 'Laptop', status: 'pending' },
+    ]);
+
+    const authorized = await channel.manage({ action: 'owner_authorize', cid: CONTACT });
+    if (authorized.action !== 'owner_authorize') throw new Error('bad test response');
+    expect(authorized.owner.cid).toBe(CONTACT);
+    // A pending introduction is still not an owner.
+    await expect(channel.manage({ action: 'owner_authorize', cid: 'C'.repeat(64) }))
+      .rejects.toThrow(/unknown or pending contact/);
+    await channel.close();
+  });
+
+  // The handoff window used to open for any error whose text matched
+  // /currently bound to another live session/i, so a relayed or wrapped message
+  // carrying that wording could hold startup for the whole timeout.
+  it('extends the bind handoff only for the daemon\'s own typed conflict code', async () => {
+    const { channel, client, dir } = setup();
+    writeFileSync(join(dir, '.owner-channel-binder.json'), JSON.stringify({
+      version: 1, role: 'Role', identity: 'Role-owner', releasedAt: Date.now(),
+    }));
+    client.bindFailures = 1;
+    client.bindError = () =>
+      new Error('relayed: identity is currently bound to another live session');
+    await expect(channel.start())
+      .rejects.toThrow(/relayed: identity is currently bound to another live session/);
+    expect(client.calls.filter(call => call.name === 'bindIdentity')).toHaveLength(1);
   });
 
   it('uses the already-bound client and never chooses or force-binds again', async () => {
@@ -538,10 +650,11 @@ describe('OwnerChannel live management', () => {
     if (listed.action !== 'contact_list') throw new Error('bad test response');
     expect(listed.contacts[0]).toMatchObject({ cid: CONTACT, name: 'Phone', status: 'established' });
     expect(listed.contacts[0]).not.toHaveProperty('bio');
+    expect(listed.contacts.map(contact => contact.status)).toEqual(['established', 'pending']);
     const invite = await channel.manage({ action: 'contact_invite', name: 'Mobile' });
-    expect(invite).toEqual({ action: 'contact_invite', invite: 'mock-invite-secret' });
-    expect(client.calls.filter(call => call.name === 'choose_identity')).toEqual([
-      { name: 'choose_identity', args: { name: 'Role-owner' } },
+    expect(invite).toEqual({ action: 'contact_invite', invite: 'mock-invite-blob' });
+    expect(client.calls.filter(call => call.name === 'bindIdentity')).toEqual([
+      { name: 'bindIdentity', args: { name: 'Role-owner' } },
     ]);
     expect(client.calls.some(call => call.args?.force !== undefined)).toBe(false);
     await channel.close();
@@ -552,12 +665,12 @@ describe('OwnerChannel live management', () => {
     writeFileSync(join(dir, '.owner-channel-binder.json'), JSON.stringify({
       version: 1, role: 'Role', identity: 'Role-owner', releasedAt: Date.now(),
     }));
-    client.chooseFailures = 2;
+    client.bindFailures = 2;
     await channel.start();
-    expect(client.calls.filter(call => call.name === 'choose_identity')).toEqual([
-      { name: 'choose_identity', args: { name: 'Role-owner' } },
-      { name: 'choose_identity', args: { name: 'Role-owner' } },
-      { name: 'choose_identity', args: { name: 'Role-owner' } },
+    expect(client.calls.filter(call => call.name === 'bindIdentity')).toEqual([
+      { name: 'bindIdentity', args: { name: 'Role-owner' } },
+      { name: 'bindIdentity', args: { name: 'Role-owner' } },
+      { name: 'bindIdentity', args: { name: 'Role-owner' } },
     ]);
     expect(client.calls.some(call => call.args?.force !== undefined)).toBe(false);
     await channel.close();
@@ -565,9 +678,9 @@ describe('OwnerChannel live management', () => {
 
   it('does not retry or force-bind a live daemon holder without owned-handoff evidence', async () => {
     const { channel, client, dir } = setup();
-    client.chooseFailures = 100;
-    await expect(channel.start()).rejects.toThrow(/another live session/);
-    expect(client.calls.filter(call => call.name === 'choose_identity')).toHaveLength(1);
+    client.bindFailures = 100;
+    await expect(channel.start()).rejects.toThrow(/currently bound to another live session/);
+    expect(client.calls.filter(call => call.name === 'bindIdentity')).toHaveLength(1);
     expect(client.calls.some(call => call.args?.force !== undefined)).toBe(false);
     expect(existsSync(join(dir, '.owner-channel-binder.lock'))).toBe(false);
   });
@@ -579,9 +692,9 @@ describe('OwnerChannel live management', () => {
       .toEqual({ action: 'startup_failure', status: 'delivered' });
     expect(await channel.manage({ action: 'startup_failure' }))
       .toEqual({ action: 'startup_failure', status: 'duplicate' });
-    const notices = client.calls.filter(call => call.name === 'send_message'
+    const notices = client.calls.filter(call => call.name === 'sendMessage'
       && String(call.args?.text).includes('could not take over'));
-    expect(notices).toEqual([{ name: 'send_message', args: {
+    expect(notices).toEqual([{ name: 'sendMessage', args: {
       contact: OWNER,
       text: `⚠️ Role owner channel could not take over 'Role-owner' from its previous supervisor. `
         + `Recovery: send /restart to retry the supervised handoff; if this repeats, inspect the web `
@@ -598,7 +711,7 @@ describe('OwnerChannel live management', () => {
     await channel.start();
     await expect(channel.manage({ action: 'startup_failure' }))
       .rejects.toThrow(/no authenticated owner conversation route/);
-    expect(client.calls.filter(call => call.name === 'send_message')).toEqual([]);
+    expect(client.calls.filter(call => call.name === 'sendMessage')).toEqual([]);
     await channel.close();
   });
 
@@ -610,7 +723,7 @@ describe('OwnerChannel live management', () => {
       .rejects.toThrow(/delivery outcome is uncertain/);
     expect(await channel.manage({ action: 'startup_failure' }))
       .toEqual({ action: 'startup_failure', status: 'duplicate' });
-    expect(client.calls.filter(call => call.name === 'send_message'
+    expect(client.calls.filter(call => call.name === 'sendMessage'
       && String(call.args?.text).includes('could not take over'))).toHaveLength(1);
     expect(readFileSync(join(dir, '.owner-channel-conversations.json'), 'utf8'))
       .not.toContain('could not take over');
@@ -631,7 +744,7 @@ describe('OwnerChannel live management', () => {
       .toMatchObject({ owner: { cid: CONTACT.toLowerCase(), source: 'dynamic', effective: true } });
     await expect(channel.manage({ action: 'owner_authorize', cid: CONTACT }))
       .rejects.toThrow(/already authorized/);
-    expect(client.calls.find(call => call.name === 'add_contact')?.args)
+    expect(client.calls.find(call => call.name === 'addContact')?.args)
       .toEqual({ invite: 'fixture', name: 'Phone' });
     await channel.close();
   });
@@ -644,16 +757,12 @@ describe('OwnerChannel live management', () => {
     await expect(channel.manage({ action: 'contact_list' })).rejects.toThrow(/unavailable/);
   });
 
-  it('does not reflect invite material when ours-mcp rejects acceptance', async () => {
+  it('does not reflect invite material when the daemon rejects acceptance', async () => {
     const { channel, client } = setup();
     await channel.start();
-    client.callTool = async (name: string) => {
-      if (name === 'add_contact') throw new Error('daemon echoed TOP_SECRET_INVITE');
-      if (name === 'get_messages') return { messages: [] };
-      return {};
-    };
+    client.addContact = async () => { throw new Error('daemon echoed TOP_SECRET_INVITE'); };
     await expect(channel.manage({ action: 'contact_add', invite: 'TOP_SECRET_INVITE' }))
-      .rejects.toThrow('ours-mcp could not accept the contact invite');
+      .rejects.toThrow('the ours daemon could not accept the contact invite');
     await expect(channel.manage({ action: 'contact_add', invite: 'TOP_SECRET_INVITE' }))
       .rejects.not.toThrow(/TOP_SECRET_INVITE/);
     await channel.close();
@@ -711,7 +820,7 @@ describe('OwnerChannel live management', () => {
     })).toMatchObject({ sequence: 2 });
 
     finish({ accepted: true, outcome: 'completed', succeeded: true, output: 'Final answer' });
-    await vi.waitFor(() => expect(client.calls.filter(call => call.name === 'send_message')
+    await vi.waitFor(() => expect(client.calls.filter(call => call.name === 'sendMessage')
       .map(call => call.args?.text)).toEqual([
       'ℹ️ Message received. The agent has started working on this request now. '
         + 'The response will arrive in this channel when ready.',
@@ -719,8 +828,8 @@ describe('OwnerChannel live management', () => {
       '🔐 Approval needed: Approval is needed before the dependency download can continue.',
       'Final answer',
     ]));
-    expect(client.calls.filter(call => call.name === 'send_message')
-      .every(call => call.args?.contact === OWNER && call.args?.reply_to_wire_id === wireId)).toBe(true);
+    expect(client.calls.filter(call => call.name === 'sendMessage')
+      .every(call => call.args?.contact === OWNER && call.args?.replyToWireId === wireId)).toBe(true);
     expect(logs.join('\n')).not.toMatch(/implementation is complete|dependency download/);
     const state = readFileSync(join(dir, '.owner-channel-state.json'), 'utf8');
     expect(state).toContain(wireId);
@@ -758,7 +867,7 @@ describe('OwnerChannel live management', () => {
       await expect(channel.manage({ ...first, message })).rejects.toThrow();
     }
     await expect(channel.manage({ ...first, requestId: 'bad' })).rejects.toThrow(/64 lowercase/);
-    expect(client.calls.filter(call => call.name === 'send_message')).toHaveLength(2);
+    expect(client.calls.filter(call => call.name === 'sendMessage')).toHaveLength(2);
     await channel.close();
   });
 
@@ -782,9 +891,9 @@ describe('OwnerChannel live management', () => {
       phase: 'working', message: 'First request remains in progress.' });
     await channel.manage({ action: 'request_update', requestId: requestIds[1],
       phase: 'blocked', message: 'Second request is waiting for an external dependency.' });
-    const updates = client.calls.filter(call => call.name === 'send_message'
+    const updates = client.calls.filter(call => call.name === 'sendMessage'
       && String(call.args?.text).match(/^(?:🔄|🚧)/));
-    expect(updates.map(call => [call.args?.contact, call.args?.reply_to_wire_id])).toEqual([
+    expect(updates.map(call => [call.args?.contact, call.args?.replyToWireId])).toEqual([
       [OWNER, wires[0]], [CONTACT, wires[1]],
     ]);
     await channel.close();
@@ -821,18 +930,18 @@ describe('OwnerChannel live management', () => {
 
     finishA(completed('Original final A'));
     finishB(completed('Original final B'));
-    await vi.waitFor(() => expect(client.calls.filter(call => call.name === 'send_message'
+    await vi.waitFor(() => expect(client.calls.filter(call => call.name === 'sendMessage'
       && String(call.args?.text).startsWith('Original final'))).toHaveLength(2));
     await channel.manage({ action: 'task_report', taskId: openedB.taskId,
       phase: 'done', message: 'The second specialist finished.' });
     await channel.manage({ action: 'task_report', taskId: openedA.taskId,
       phase: 'blocked', message: 'The first specialist needs an external dependency.' });
-    const reports = client.calls.filter(call => call.name === 'send_message'
+    const reports = client.calls.filter(call => call.name === 'sendMessage'
       && String(call.args?.text).includes('Follow-up'));
     expect(reports.map(call => call.args)).toEqual([
-      { contact: CONTACT, reply_to_wire_id: wireB,
+      { contact: CONTACT, replyToWireId: wireB,
         text: '✅ Follow-up complete: The second specialist finished.' },
-      { contact: OWNER, reply_to_wire_id: wireA,
+      { contact: OWNER, replyToWireId: wireA,
         text: '🚧 Follow-up blocked: The first specialist needs an external dependency.' },
     ]);
     await channel.close();
@@ -868,8 +977,8 @@ describe('OwnerChannel live management', () => {
     await restarted.start();
     await restarted.manage({ action: 'task_report', taskId: opened.taskId,
       phase: 'done', message: 'Restarted supervisor delivered the verified result.' });
-    expect(restartedClient.calls).toContainEqual({ name: 'send_message', args: {
-      contact: OWNER, reply_to_wire_id: wire,
+    expect(restartedClient.calls).toContainEqual({ name: 'sendMessage', args: {
+      contact: OWNER, replyToWireId: wire,
       text: '✅ Follow-up complete: Restarted supervisor delivered the verified result.',
     } });
     const state = readFileSync(join(dir, '.owner-channel-tasks.json'), 'utf8');
@@ -957,14 +1066,14 @@ describe('OwnerChannel live management', () => {
     expect(raced.filter(result => result.status === 'fulfilled')).toHaveLength(1);
     expect(raced.filter(result => result.status === 'rejected')).toHaveLength(1);
 
-    const originalCall = client.callTool.bind(client);
+    const originalSend = client.sendMessage.bind(client);
     let attempted = 0;
-    client.callTool = async (name, args) => {
-      if (name === 'send_message' && String(args?.text).includes('Follow-up complete')) {
+    client.sendMessage = async a => {
+      if (a.text.includes('Follow-up complete')) {
         attempted++;
         throw new Error('ambiguous transport failure with secret details');
       }
-      return originalCall(name, args);
+      return originalSend(a);
     };
     await expect(channel.manage({ action: 'task_report', taskId: opened[1], phase: 'done',
       message: 'Specialist completed the assigned review.' })).rejects.toThrow(/outcome is uncertain/);
