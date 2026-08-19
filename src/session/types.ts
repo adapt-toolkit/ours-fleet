@@ -128,6 +128,16 @@ export function interruptOutcome(result: InterruptResult): InterruptOutcome {
  * stop here: the session has the prompt, and waiting for the turn to finish is
  * a different question with a different, much longer, timescale.
  */
+/**
+ * What actually happened to an admitted prompt, so a caller reporting to a
+ * human can be accurate instead of repeating what it asked for.
+ *
+ * `interrupted` is only ever returned when a turn was really cancelled for this
+ * prompt. `deferred` says the session is busy with work this prompt could not
+ * safely pre-empt — the prompt is admitted and will run, just not yet.
+ */
+export type PromptDelivery = 'started' | 'queued' | 'interrupted' | 'deferred';
+
 export interface QueuedPrompt {
   promptId: string;
   /** Turns already queued ahead of this one. 0 means it starts immediately. */
@@ -135,6 +145,8 @@ export interface QueuedPrompt {
   origin?: PromptOrigin;
   /** The turn's terminal result. Never rejects. */
   completion: Promise<TurnResult>;
+  /** Observed admission outcome. Absent on backends that do not report it. */
+  delivery?: PromptDelivery;
 }
 
 /**

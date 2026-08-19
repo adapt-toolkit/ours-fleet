@@ -64,6 +64,17 @@ export const ownerNotices = {
     + 'this request, and it is now working on a response. '
     + 'The response will arrive in this channel when ready.',
 
+  /**
+   * The honest answer when the agent is mid-task and pre-empting it would have
+   * corrupted the conversation. Says "not started yet" rather than borrowing
+   * `receivedInterrupting`'s claim that something was cancelled for this
+   * request.
+   */
+  receivedDeferred: () =>
+    'ℹ️ Message received and held. The agent is in the middle of a task that '
+    + 'cannot be interrupted safely; this request starts as soon as that work '
+    + 'reaches a stopping point. The response will arrive in this channel when ready.',
+
   status: (role: string, snapshot: SessionSnapshot) =>
     `📊 ${role} status: ${snapshot.readiness}; session is ${snapshot.alive ? 'online' : 'offline'}.`,
 

@@ -9,7 +9,8 @@ import { execFileSync } from 'node:child_process';
 import { stringify } from 'yaml';
 import {
   runOnce, runTemp, runSupervised, buildPaneCommand, reserveLaunchSlot, readExitRecord,
-  readRestartLedger, resetRestartLedger, backoffFor, loadTempRole, RESTART_FAIL_THRESHOLD,
+  readRestartLedger, resetRestartLedger, writeRestartLedger, backoffFor, loadTempRole,
+  RESTART_FAIL_THRESHOLD, RUN_MARKER_FILE,
   TEMP_IDENTITY_CLOSE_DEBOUNCE_MS, TEMP_IDENTITY_POLL_MS,
   isRecoverableTempStartupCancellation, managedFleetProxyEnv,
   type AttemptResult, type RunnerDeps,
@@ -402,6 +403,25 @@ describe('runOnce', () => {
     await runOnce('A', {}, deps);
     expect(readFileSync(join(d, '.session-id'), 'utf8').trim()).toBe('KEEP');
     expect(existsSync(join(d, '.booted'))).toBe(true);
+  });
+
+  /**
+   * FleetRetrospector's `.booted` still read 07:05:43 after its 07:35:57
+   * restart, because `.booted` was only written on the fresh path. Any health
+   * check reading it reported the original boot for a role that had restarted.
+   */
+  it('stamps .booted on a resume attempt, not just the first boot', async () => {
+    writeCfg({ A: { harness: 'fake' } });
+    const d = agentDir('A'); mkdirSync(d, { recursive: true });
+    writeFileSync(join(d, '.session-id'), 'KEEP\n');
+    writeFileSync(join(d, '.booted'), '');            // an earlier boot's marker
+    const { deps } = fakeWorld({ exitCode: '137', lifeChecks: 30, exitFile: join(d, '.exit-status') });
+
+    const result = await runOnce('A', {}, deps);
+
+    expect(result.mode).toBe('resume');               // existence semantics preserved
+    const stamped = readFileSync(join(d, '.booted'), 'utf8').trim();
+    expect(stamped).toMatch(/^\d{4}-\d{2}-\d{2}T[\d:.]+Z resume$/);
   });
 });
 
@@ -1479,6 +1499,70 @@ describe('restart-loop containment (3.2)', () => {
     expect(ledger.circuit).toBe('open');
     expect(ledger.consecutiveImmediateFailures).toBe(RESTART_FAIL_THRESHOLD);
     expect(w.sleeps).toEqual([2_000, 4_000, 8_000, 16_000]);
+  });
+
+  /**
+   * FleetRetrospector was OOM-killed at 07:35:49 on 2026-08-17 and restarted by
+   * systemd at 07:35:57. `.booted` still read 07:05:43 and the ledger still read
+   * `consecutiveImmediateFailures: 0, updatedAt: 07:05:40` — both indicators
+   * described the run that had died, because both are only written at attempt
+   * boundaries inside a living supervisor process.
+   */
+  it('records an abrupt termination the previous supervisor never survived to write', async () => {
+    const d = setup();
+    // A supervisor that was killed: its run marker is still on disk, owned by a
+    // pid that is not ours.
+    writeFileSync(join(d, RUN_MARKER_FILE), JSON.stringify({
+      version: 1, pid: process.pid + 1, startedAt: '2026-08-17T07:05:40.000Z',
+    }) + '\n');
+    writeRestartLedger(d, {
+      version: 1, consecutiveImmediateFailures: 0, lastReason: '', nextDelayMs: 0,
+      resumeDiscarded: false, circuit: 'closed', updatedAt: '2026-08-17T07:05:40.293Z',
+    });
+
+    const w = supervisorWorld(d, { durations: [100], stopAfter: 1 });
+    await runSupervised('A', {}, w.deps, w.attempt);
+
+    const ledger = readRestartLedger(d);
+    expect(ledger.lastTermination?.class).toBe('abrupt');
+    expect(ledger.lastTermination?.runStartedAt).toBe('2026-08-17T07:05:40.000Z');
+    expect(ledger.abruptTerminations).toBe(1);
+    expect(ledger.updatedAt).not.toBe('2026-08-17T07:05:40.293Z');
+    expect(w.logs.some(l => l.includes('ended abruptly'))).toBe(true);
+    // A long, healthy attempt clears the failure streak — and must not erase
+    // the fact that the role died and came back.
+    expect(ledger.consecutiveImmediateFailures).toBe(0);
+    expect(existsSync(join(d, RUN_MARKER_FILE))).toBe(false);   // orderly exit released it
+  });
+
+  it('reports a clean previous run when no marker was left behind', async () => {
+    const d = setup();
+    const w = supervisorWorld(d, { durations: [100], stopAfter: 1 });
+    await runSupervised('A', {}, w.deps, w.attempt);
+
+    const ledger = readRestartLedger(d);
+    expect(ledger.lastTermination?.class).toBe('clean');
+    expect(ledger.abruptTerminations ?? 0).toBe(0);
+  });
+
+  it('keeps the abrupt-termination record across an operator ledger reset', () => {
+    const d = setup();
+    writeRestartLedger(d, {
+      version: 1, consecutiveImmediateFailures: 3, lastReason: 'boom', nextDelayMs: 8_000,
+      resumeDiscarded: false, circuit: 'open', updatedAt: '2026-08-17T07:35:57.000Z',
+      abruptTerminations: 2,
+      lastTermination: {
+        class: 'abrupt', detail: 'killed', observedAt: '2026-08-17T07:35:57.000Z',
+      },
+    });
+
+    resetRestartLedger(d);
+
+    const ledger = readRestartLedger(d);
+    expect(ledger.circuit).toBe('closed');
+    expect(ledger.consecutiveImmediateFailures).toBe(0);
+    expect(ledger.abruptTerminations).toBe(2);
+    expect(ledger.lastTermination?.class).toBe('abrupt');
   });
 
   it('closes an active streak after the full recovery window', async () => {
