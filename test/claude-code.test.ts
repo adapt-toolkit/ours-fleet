@@ -454,3 +454,49 @@ describe('neutral permission mapping and the unattended floor (2.1)', () => {
     ).meets).toBe(false);
   });
 });
+
+// ── defect 3: harness_options that used to be silently dropped on ACP ────────
+//
+// `buildAcpLaunch` builds its own argv and cannot carry `prep.argv`, so the
+// `--settings` overlay `plugins` writes was produced and then thrown away for
+// every `session: acp` role, with no warning. The mem-palace toggle rode
+// `prep.env` and survived, which is what made the failure silent AND selective.
+describe('ACP delivery of flag-shaped harness options', () => {
+  const acpRole = (harness_options?: Record<string, unknown>): ResolvedRole =>
+    role({ session: 'acp', ...(harness_options ? { harness_options } : {}) });
+
+  it('sends the plugins overlay through the bundled agent _meta, not argv', async () => {
+    const a = makeClaudeCodeAdapter(okExec);
+    const stateDir = join(dir, 'acp-plugins'); mkdirSync(stateDir, { recursive: true });
+    const r = acpRole({ plugins: { 'x@m': true } });
+    const prep = await a.prepareSession(r, { stateDir, runCwd: stateDir });
+    const overlay = join(stateDir, '.settings-overlay.json');
+    expect(prep.settingsOverlay).toBe(overlay);
+    // The ACP launch still carries no argv — that is the constraint, not the bug.
+    expect(a.buildAcpLaunch!(r, prep).argv).not.toContain('--settings');
+    expect(a.acpSessionMeta!(r, prep)).toEqual({ claudeCode: { options: { settings: overlay } } });
+  });
+
+  it('sends nothing when the role configured nothing', async () => {
+    const a = makeClaudeCodeAdapter(okExec);
+    const stateDir = join(dir, 'acp-bare'); mkdirSync(stateDir, { recursive: true });
+    const r = acpRole();
+    const prep = await a.prepareSession(r, { stateDir, runCwd: stateDir });
+    expect(a.acpSessionMeta!(r, prep)).toBeUndefined();
+  });
+
+  it('sends nothing to an ACP agent fleet did not choose', async () => {
+    const a = makeClaudeCodeAdapter(okExec);
+    const stateDir = join(dir, 'acp-custom'); mkdirSync(stateDir, { recursive: true });
+    const r = role({
+      session: 'acp',
+      session_options: { acp: { command: ['some-other-acp'] } },
+      harness_options: { plugins: { 'x@m': true } },
+    });
+    const prep = await a.prepareSession(r, { stateDir, runCwd: stateDir });
+    expect(a.acpSessionMeta!(r, prep)).toBeUndefined();
+    // …and it is refused rather than quietly ignored.
+    expect(a.validateOptions(r.harness_options, r).map(e => e.path))
+      .toContain('harness_options.plugins');
+  });
+});

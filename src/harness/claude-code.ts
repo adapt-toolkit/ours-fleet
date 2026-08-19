@@ -21,6 +21,11 @@ interface ClaudeOptions {
 const OPTION_KEYS = ['plugins', 'mem_palace', 'mem_palace_midsession_autosave', 'permission_mode', 'effort'];
 const EFFORT_LEVELS = ['low', 'medium', 'high', 'xhigh', 'max'];
 
+/** A role that names its own ACP command runs a process fleet did not choose. */
+const customAcpCommand = (role: ResolvedRole): boolean =>
+  role.session === 'acp' && role.session_options?.acp?.command != null;
+
+
 /** Claude Code's accepted --permission-mode values. */
 const PERMISSION_MODES = ['default', 'acceptEdits', 'plan', 'dontAsk', 'bypassPermissions'];
 
@@ -168,16 +173,28 @@ export function makeClaudeCodeAdapter(exec: Exec = realExec): HarnessAdapter {
       };
     },
 
-    validateOptions(opts: unknown): ValidationError[] {
+    validateOptions(opts: unknown, role?: ResolvedRole): ValidationError[] {
       if (opts == null) return [];
       if (typeof opts !== 'object' || Array.isArray(opts))
         return [{ path: 'harness_options', message: 'must be a map' }];
       const errors = Object.keys(opts)
         .filter(k => !OPTION_KEYS.includes(k))
         .map(k => ({ path: `harness_options.${k}`, message: `unknown option; allowed: ${OPTION_KEYS.join(', ')}` }));
-      const effort = (opts as ClaudeOptions).effort;
+      const o = opts as ClaudeOptions;
+      const effort = o.effort;
       if (effort != null && !EFFORT_LEVELS.includes(effort))
         errors.push({ path: 'harness_options.effort', message: `must be one of: ${EFFORT_LEVELS.join(', ')}` });
+      // Session-aware refusal. `plugins` reaches an ACP session through the
+      // bundled agent's `_meta` vocabulary, so a role that launches a DIFFERENT
+      // ACP agent cannot be promised it. Refuse rather than send it and hope:
+      // silently dropping the config is the defect being fixed here.
+      if (role && customAcpCommand(role) && o.plugins != null)
+        errors.push({
+          path: 'harness_options.plugins',
+          message: 'cannot be honoured with session_options.acp.command: it is delivered through the bundled '
+            + 'Claude ACP agent\'s _meta vocabulary, which another agent has no reason to read. Drop the '
+            + 'custom ACP command, or drop this option',
+        });
       return errors;
     },
 
@@ -215,12 +232,17 @@ export function makeClaudeCodeAdapter(exec: Exec = realExec): HarnessAdapter {
       if (role.isolation) mkdirSync(harnessRuntimeDir(dirs.stateDir, 'claude'), { recursive: true });
 
       const argv: string[] = [];
+      let settingsOverlay: string | undefined;
       if (Object.keys(enabledPlugins).length) {
-        const overlay = join(dirs.stateDir, '.settings-overlay.json');
-        writeFileSync(overlay, JSON.stringify({ enabledPlugins }, null, 2));
-        argv.push('--settings', overlay);
+        settingsOverlay = join(dirs.stateDir, '.settings-overlay.json');
+        writeFileSync(settingsOverlay, JSON.stringify({ enabledPlugins }, null, 2));
+        argv.push('--settings', settingsOverlay);
       }
-      return { argv, env };
+
+      return {
+        argv, env,
+        ...(settingsOverlay ? { settingsOverlay } : {}),
+      };
     },
 
     buildLaunch(role: ResolvedRole, mode: 'fresh' | 'resume', s: SessionState, prep: SessionPrep): Launch {
@@ -253,6 +275,34 @@ export function makeClaudeCodeAdapter(exec: Exec = realExec): HarnessAdapter {
     // backends cannot disagree about what a role's permissions translate to.
     acpPermissionModeId(role: ResolvedRole): string | undefined {
       return permissionMode(role);
+    },
+
+    /**
+     * Deliver, over ACP, the two things the tmux launch delivers as flags.
+     *
+     * `buildAcpLaunch` builds its own argv and cannot carry `prep.argv`: the
+     * process it launches is the ACP agent, not `claude`, and it takes none of
+     * claude's flags. That is why `harness_options.plugins` did nothing at all on
+     * an ACP role — the overlay was written and then dropped, and the mem-palace
+     * toggle rode `prep.env` and survived, so the failure was silent AND
+     * selective.
+     *
+     * `_meta.claudeCode.options` is the bundled agent's own passthrough into the
+     * Claude Agent SDK (@agentclientprotocol/claude-agent-acp, acp-agent.js:4092
+     * → the `options` object at :4144). `settings` takes the same overlay path
+     * `--settings` takes, and is spread BEFORE the fields the agent forces, so it
+     * is not overwritten.
+     *
+     * ⚠ RETURNS NOTHING FOR A ROLE THAT NAMES ITS OWN ACP COMMAND. That process
+     * is not the bundled agent and has no reason to read this vocabulary; sending
+     * it anyway would be the silent drop again, one level down. `validateOptions`
+     * refuses those roles instead.
+     */
+    acpSessionMeta(role: ResolvedRole, prep: SessionPrep): Record<string, unknown> | undefined {
+      if (customAcpCommand(role)) return undefined;
+      const options: Record<string, unknown> = {};
+      if (prep.settingsOverlay) options.settings = prep.settingsOverlay;
+      return Object.keys(options).length ? { claudeCode: { options } } : undefined;
     },
 
     isolationPaths(_role: ResolvedRole, _dirs: RoleDirs) {
