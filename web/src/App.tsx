@@ -2,7 +2,7 @@ import { useCallback, useEffect, useMemo, useState } from 'react';
 import { api, idempotencyKey } from './api';
 import { CreateRole } from './CreateRole';
 import { RoleWorkspace } from './RoleWorkspace';
-import { isInactive, needsAttention, presentFleet } from './fleet-presentation';
+import { fleetAgents, isInactive, isPastAgent, needsAttention, presentFleet } from './fleet-presentation';
 import { useLivePoll } from './use-live-poll';
 import { WatchdogDetail, WatchdogsView } from './Watchdogs';
 import { TopologyEditor } from './TopologyEditor';
@@ -37,7 +37,7 @@ export function App() {
   const [configuration, setConfiguration] = useState<ConfigRead>();
   const [selected, setSelected] = useState('');
   const [filter, setFilter] = useState('');
-  const [showInactive, setShowInactive] = useState(false);
+  const [showPast, setShowPast] = useState(false);
   const [view, setView] = useState<'fleet' | 'attention' | 'watchdogs' | 'configuration' | 'audit'>('fleet');
   const [selectedWatchdog, setSelectedWatchdog] = useState('');
   const [creating, setCreating] = useState(false);
@@ -46,14 +46,14 @@ export function App() {
   const [meta, setMeta] = useState<{ version?: string; auditDegraded?: string }>();
 
   const refresh = useCallback(async (signal: AbortSignal) => {
-    const [fleet, serverMeta, graph, config] = await Promise.all([
+    const [inventory, serverMeta, graph, config] = await Promise.all([
       api.get<{ roles: FleetItem[] }>('/api/v1/roles', signal),
       api.get<{ version: string; auditDegraded?: string }>('/api/v1/meta', signal),
       api.get<Topology>('/api/v1/topology', signal),
       api.get<ConfigRead>('/api/v1/configuration', signal),
     ]);
     if (signal.aborted) return;
-    setItems(fleet.roles);
+    setItems(inventory.roles);
     setMeta(serverMeta);
     setTopology(graph);
     setConfiguration(config);
@@ -101,11 +101,13 @@ export function App() {
     return () => window.removeEventListener('beforeinstallprompt', capture);
   }, []);
 
-  const inactiveCount = items.filter(isInactive).length;
-  const attentionCount = items.filter(needsAttention).length;
+  // One collection, defined once: the table lists the agents the graph draws.
+  const fleet = useMemo(() => fleetAgents(topology), [topology]);
+  const pastCount = items.filter(item => isPastAgent(item, fleet)).length;
+  const attentionCount = items.filter(item => !isPastAgent(item, fleet) && needsAttention(item)).length;
   const shown = useMemo(() => presentFleet(items, {
-    filter, showInactive: view === 'fleet' && showInactive, attentionOnly: view === 'attention',
-  }), [filter, items, showInactive, view]);
+    filter, fleet, showPast: view === 'fleet' && showPast, attentionOnly: view === 'attention',
+  }), [filter, fleet, items, showPast, view]);
 
   if (!ready) return <main className="auth-screen">
     <div className="brand-wordmark">Ours</div>
@@ -178,27 +180,31 @@ export function App() {
               <span className="busy"><b>Busy</b> active turn or permission</span>
               <span className="attention"><b>Attention</b> warning or unknown evidence</span>
               <span className="offline"><b>Offline</b> authoritative session stop</span>
-              <small>Needs attention includes active attention and unknown roles. Inactive roles are shown separately.</small>
+              <small>Needs attention includes active attention and unknown roles. Agents the fleet no longer contains are listed separately.</small>
             </div>
             <div className="toolbar">
               <input aria-label="Filter roles" placeholder="Filter roles, missions, state…" value={filter}
                 onChange={event => setFilter(event.target.value)} />
-              <div><span>{shown.length} roles</span>{view === 'fleet' && inactiveCount > 0 &&
-                <button className="secondary" aria-pressed={showInactive}
-                  onClick={() => setShowInactive(value => !value)}>
-                  {showInactive ? 'Hide inactive' : 'Show inactive'} ({inactiveCount})
+              <div><span>{shown.length} roles</span>{view === 'fleet' && pastCount > 0 &&
+                <button className="secondary" aria-pressed={showPast}
+                  onClick={() => setShowPast(value => !value)}>
+                  {showPast ? 'Hide past agents' : 'Show past agents'} ({pastCount})
                 </button>}</div>
             </div>
             {/*
-              The graph is the fleet's configuration surface, so it shows the whole
-              configuration. "Show inactive" filters the role table below it: a role
-              that is configured but has never been started reads as inactive, and
-              hiding it here would make an agent disappear the moment it was added.
+              The graph and this table show the SAME collection: `fleet` is read
+              off the graph, so an agent cannot appear in one and be missing from
+              the other. A configured agent that has never been started is in it —
+              hiding it would make an agent disappear the moment it was added.
+              "Show past agents" reveals the rest of the inventory: state
+              directories that outlived the agent that owned them, still listed so
+              they can be inspected and removed.
             */}
             {view === 'fleet' && !filter && <TopologyEditor topology={topology}
               onRefresh={requestRefresh}
               onOpenAgent={setSelected}
               onOpenWatchdog={name => { setSelectedWatchdog(name); setView('watchdogs'); }}
+              onConfigure={() => setView('configuration')}
               onRemoveAgent={name => void confirmAndRemoveRole(name).then(result => {
                 if (result) { alert(`Removed ${name}. Recovery archive: ${result.recoveryPath}`); requestRefresh(); }
               }).catch(reason => setError((reason as Error).message))} />}

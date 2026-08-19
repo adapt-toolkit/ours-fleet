@@ -1,7 +1,7 @@
 import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { describe, expect, it } from 'vitest';
-import { describeEdge, EDGE_LEGEND, layoutEdges, layoutTopology, nodeBox, nodeDestination, type Topology } from '../../web/src/topology-presentation.js';
+import { canOversee, describeEdge, EDGE_LEGEND, layoutEdges, layoutTopology, nodeBox, nodeDestination, type Topology } from '../../web/src/topology-presentation.js';
 
 describe('topology presentation', () => {
   const topology: Topology = {
@@ -23,6 +23,18 @@ describe('topology presentation', () => {
     const agents = layoutTopology(topology).nodes.filter(node => node.kind === 'agent');
     expect(agents.map(node => node.label)).toEqual(['Parent', 'Child', 'Grandchild']);
     expect(agents[1].y).toBeGreaterThan(agents[0].y);
+  });
+
+  it('offers oversight from a fleet agent even when the sketch pad is read-only', () => {
+    // A read-only sidecar means a newer console wrote it; it says nothing about
+    // whether fleet.yaml can be written, and `oversee:` goes to fleet.yaml.
+    const configured = { ...topology.nodes[0], origin: 'config' as const };
+    const sketch = { ...topology.nodes[0], origin: 'draft' as const };
+    expect(canOversee(configured, false)).toBe(true);
+    expect(canOversee(configured, true)).toBe(true);
+    // A sketch's oversight IS the sidecar, so it stays gated on it.
+    expect(canOversee(sketch, false)).toBe(false);
+    expect(canOversee(sketch, true)).toBe(true);
   });
 
   it('navigates agents and watchdogs but keeps loops informational', () => {

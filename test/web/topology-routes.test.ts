@@ -91,6 +91,8 @@ describe('topology draft and promote routes', () => {
       ['PUT', '/api/v1/topology/draft'],
       ['POST', '/api/v1/topology/promote'],
       ['POST', '/api/v1/topology/promote/preview'],
+      ['POST', '/api/v1/topology/oversee'],
+      ['POST', '/api/v1/topology/oversee/preview'],
     ] as const) {
       // Same-origin is proven separately below; send it here so this asserts the
       // session guard rather than the boundary check.
@@ -215,6 +217,62 @@ describe('topology draft and promote routes', () => {
       payload: { ids: ['agent:Reviewer'], configRevision: 'stale' },
     });
     expect(stale.statusCode).toBe(409);
+  });
+
+  it('draws oversight between two fleet agents without launching anything', async () => {
+    writeFileSync(file, '# operator header\nroles:\n  Alice:\n    session: acp\n    mission: Ship\n  Bob:\n    session: acp\n    mission: Review\n', { mode: 0o600 });
+    const { server, cookie, csrf } = await authenticated();
+    const headers = { host: boundary.host, origin: boundary.origin, cookie, 'x-csrf-token': csrf };
+    const body = () => ({ from: 'Alice', to: 'Bob', configRevision: configuration.read().revision });
+
+    const preview = await server.app.inject({
+      method: 'POST', url: '/api/v1/topology/oversee/preview', headers, payload: body(),
+    });
+    expect(preview.statusCode).toBe(200);
+    expect(preview.json().diff).toContain('oversee:');
+    expect(readFileSync(file, 'utf8')).not.toContain('oversee');
+
+    const written = await server.app.inject({
+      method: 'POST', url: '/api/v1/topology/oversee', headers, payload: body(),
+    });
+    expect(written.statusCode).toBe(200);
+    expect(written.json().saved).toBe(true);
+    // Configuration only — the overseer reads its wards from its next briefing.
+    expect(written.json().impact.summary).toMatch(/apply\/restart .* separately/);
+    expect(readFileSync(file, 'utf8')).toContain('# operator header');
+    expect(loadConfig(file).roles.find(role => role.name === 'Alice')?.oversee)
+      .toEqual([{ role: 'Bob', interval: '10m' }]);
+
+    const graph = await server.app.inject({
+      method: 'GET', url: '/api/v1/topology', headers: { host: boundary.host, cookie },
+    });
+    expect(graph.json().edges.map((edge: { id: string }) => edge.id))
+      .toContain('oversees:agent:Alice:agent:Bob');
+  });
+
+  it('rejects a malformed, self-targeted or stale oversee request', async () => {
+    const { server, cookie, csrf } = await authenticated();
+    const headers = { host: boundary.host, origin: boundary.origin, cookie, 'x-csrf-token': csrf };
+
+    const malformed = await server.app.inject({
+      method: 'POST', url: '/api/v1/topology/oversee', headers, payload: { from: 'Alice' },
+    });
+    expect(malformed.statusCode).toBe(400);
+    expect(malformed.json().error.message).toMatch(/from and to must name two agents/);
+
+    const itself = await server.app.inject({
+      method: 'POST', url: '/api/v1/topology/oversee', headers,
+      payload: { from: 'Alice', to: 'Alice', configRevision: configuration.read().revision },
+    });
+    expect(itself.statusCode).toBe(400);
+    expect(itself.json().error.message).toMatch(/cannot oversee itself/);
+
+    const stale = await server.app.inject({
+      method: 'POST', url: '/api/v1/topology/oversee', headers,
+      payload: { from: 'Alice', to: 'Bob', configRevision: 'stale' },
+    });
+    expect(stale.statusCode).toBe(409);
+    expect(readFileSync(file, 'utf8')).not.toContain('oversee');
   });
 
   it('serves the merged graph with completeness on the read route', async () => {

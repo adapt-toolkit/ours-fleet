@@ -32,7 +32,7 @@ export const NAME_RE = /^[A-Za-z0-9_-]+$/;
 export const MAX_COORDINATE = 100_000;
 
 export const KIND_LABEL: Record<NodeKind, string> = {
-  agent: 'agent', watchdog: 'watchdog', loop: 'interval',
+  agent: 'agent', watchdog: 'watchdog', loop: 'loop',
 };
 
 export const emptyDraft = (): TopologyDraft => ({
@@ -46,7 +46,7 @@ export const nodeKind = (id: string): NodeKind => id.slice(0, id.indexOf(':')) a
 /**
  * Which edge a connection would create, or why it cannot be made.
  *
- * Every connection points AT an agent: a watchdog watches agents, an interval
+ * Every connection points AT an agent: a watchdog watches agents, a loop
  * delivers to agents, an agent oversees agents. `spawned` is runtime provenance
  * and is never drawn by hand.
  */
@@ -90,6 +90,45 @@ export function connect(
   return { ...draft, drafts: { ...draft.drafts, edges: [...draft.drafts.edges, { kind, from, to }] } };
 }
 
+/**
+ * What connecting two nodes should actually do, or why it cannot be done.
+ *
+ * Two different writes hide behind one gesture. A sketch owns its own edges, so
+ * connecting from one is a local change to the sidecar. An agent that is already
+ * in the fleet owns nothing local: the only place its oversight can live is
+ * `oversee:` in fleet.yaml, so that gesture is a reviewed configuration write
+ * and is named as such here rather than being guessed at in the component.
+ */
+export type ConnectionPlan =
+  | { action: 'draft'; draft: TopologyDraft }
+  | { action: 'oversee'; from: string; to: string }
+  | ConnectRefusal;
+
+export function planConnection(
+  draft: TopologyDraft, from: string, to: string, context: ConnectContext,
+): ConnectionPlan {
+  const fromKind = context.kinds.get(from);
+  const toKind = context.kinds.get(to);
+  if (!fromKind || !toKind) return refuse('That node is no longer on the canvas.');
+  if (from === to)
+    return refuse(fromKind === 'agent'
+      ? `${nodeName(from)} cannot oversee itself. Choose a different agent.`
+      : 'A node cannot connect to itself.');
+
+  if (context.draftIds.has(from)) {
+    const result = connect(draft, from, to, context);
+    return isRefusal(result) ? result : { action: 'draft', draft: result };
+  }
+
+  if (fromKind !== 'agent')
+    return refuse(`${nodeName(from)} is already part of the fleet. Edit its connections in the configuration editor.`);
+  if (toKind !== 'agent')
+    return refuse(`Oversight points at an agent. Choose an agent for ${nodeName(from)} to oversee.`);
+  if (context.draftIds.has(to))
+    return refuse(`${nodeName(to)} is still a sketch. Add it to the fleet first — oversight is written into fleet.yaml, which cannot name a sketch.`);
+  return { action: 'oversee', from: nodeName(from), to: nodeName(to) };
+}
+
 export function disconnect(draft: TopologyDraft, edge: DraftEdge): TopologyDraft {
   return {
     ...draft,
@@ -103,7 +142,7 @@ export function disconnect(draft: TopologyDraft, edge: DraftEdge): TopologyDraft
 
 /** First free `Agent1`, `Agent2`, … that collides with nothing already on the canvas. */
 export function nextName(kind: NodeKind, taken: Iterable<string>): string {
-  const stem = kind === 'agent' ? 'Agent' : kind === 'watchdog' ? 'Watchdog' : 'Interval';
+  const stem = kind === 'agent' ? 'Agent' : kind === 'watchdog' ? 'Watchdog' : 'Loop';
   const used = new Set(taken);
   for (let index = 1; ; index += 1) {
     const candidate = `${stem}${index}`;

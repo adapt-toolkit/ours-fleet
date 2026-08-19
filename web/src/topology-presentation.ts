@@ -58,6 +58,21 @@ export const canLaunch = (node: TopologyNode): boolean => node.launchable === tr
 export const canPromote = (node: TopologyNode): boolean =>
   node.origin === 'draft' && node.complete === true && node.valid !== false;
 
+/**
+ * Whether oversight can be drawn FROM this agent, given the draft sidecar's
+ * writability.
+ *
+ * An agent already in the fleet writes its oversight into `fleet.yaml`; the
+ * draft sidecar has nothing to do with it, so gating on the sidecar would hide
+ * an action that would have succeeded — and the sidecar is read-only exactly
+ * when a newer console wrote it, which says nothing about the configuration. A
+ * sketch's oversight IS the sidecar, so that one stays gated. Whether the
+ * configuration itself can be written is the server's answer, and it gives it
+ * with a reason.
+ */
+export const canOversee = (node: TopologyNode, draftWritable: boolean): boolean =>
+  node.origin !== 'draft' || draftWritable;
+
 export const EDGE_LEGEND: Array<{ kind: TopologyEdge['kind']; label: string; description: string }> = [
   { kind: 'oversees', label: 'Oversight', description: 'A coordinator is responsible for checking this agent.' },
   { kind: 'watches', label: 'Watchdog', description: 'A watchdog checks this agent on its configured interval.' },
@@ -96,9 +111,12 @@ export function layoutTopology(topology: Topology): { nodes: PositionedNode[]; h
   // A corrupt/cyclic provenance chain cannot hide a node from the fallback.
   for (const node of agents) visit(node);
   const rows = Math.max(orderedAgents.length, watchdogs.length, loops.length, 1);
-  const height = Math.max(360, rows * 112 + 70);
+  // A fixed pitch, not a share of the canvas: the pitch has to clear a whole
+  // card — actions included — in every column, or the card below covers the
+  // controls of the one above it and they cannot be pressed at all.
+  const height = Math.max(420, rows * ROW_PITCH + 80);
   const place = (values: TopologyNode[], x: number): PositionedNode[] => values.map((node, index) => ({
-    ...node, x, y: 62 + index * ((height - 110) / Math.max(values.length, 1)),
+    ...node, x, y: FIRST_ROW_Y + index * ROW_PITCH,
   }));
   return { nodes: [...place(watchdogs, 80), ...place(orderedAgents, 410), ...place(loops, 750)], height };
 }
@@ -121,9 +139,17 @@ export function layoutInteractive(topology: Topology): { nodes: PositionedNode[]
   return { nodes, height: Math.max(derived.height, lowest + 40) };
 }
 
-/** Card box in CSS pixels — mirrors `.topology-node` width/min-height in styles.css. */
+/**
+ * Card box in CSS pixels — mirrors `.topology-node` in styles.css, including the
+ * per-node action row, which is part of the card the owner has to be able to
+ * press without another card sitting on top of it. A browser test measures the
+ * real card against this, so a style change cannot silently invalidate it.
+ */
 export const NODE_WIDTH = 150;
-export const NODE_HEIGHT = 62;
+export const NODE_HEIGHT = 144;
+/** Vertical distance between two cards in a column, and the top margin. */
+export const ROW_PITCH = 168;
+export const FIRST_ROW_Y = 80;
 
 /**
  * Where an edge must terminate, in the SAME CSS-pixel space the cards are
