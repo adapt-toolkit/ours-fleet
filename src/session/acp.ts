@@ -13,7 +13,8 @@ import type { AcpMcpServer } from '../harness/types.js';
 import { normalizeSessionUpdate } from './conversation-normalizer.js';
 import { ConversationEventStore, IdempotencyConflictError } from './conversation-store.js';
 import type {
-  ConversationSnapshot, ConversationSource, PromptOrigin, PromptReceipt, SubmitPromptCommand,
+  ConversationEventV1, ConversationSnapshot, ConversationSource, PromptOrigin, PromptReceipt,
+  SubmitPromptCommand,
 } from './conversation-types.js';
 import { SessionEvents } from './events.js';
 import {
@@ -296,6 +297,8 @@ export class AcpSession implements SessionHandle {
   private readonly child: ChildProcessWithoutNullStreams;
   private readonly events: SessionEvents;
   private readonly conversation: ConversationEventStore;
+  /** Cursor before this runner generation began; older durable events stay off the live console. */
+  private readonly conversationStartCursor?: string;
   /** New on every runner start; permission/turn IDs from prior generations are stale. */
   private readonly sessionGeneration = randomUUID();
   /** True while `session/load` replays history as ordinary updates. */
@@ -364,6 +367,7 @@ export class AcpSession implements SessionHandle {
     this.conversation = new ConversationEventStore(join(options.stateDir, '.conversation'), {
       roleId: options.name, log: line => options.log(`[${options.name}] ${line}`),
     });
+    this.conversationStartCursor = this.conversation.lastCursor();
     this.sessionFile = join(options.stateDir, '.acp-session-id');
     this.terminated = new Promise<never>((_resolve, reject) => { this.terminate = reject; });
     // Nothing awaits this promise until a request races it; an unobserved
@@ -1606,7 +1610,28 @@ export class AcpSession implements SessionHandle {
   // ── conversation ledger access (SessionHandle) ─────────────────────────────
 
   conversationPage(request: { after?: string; limit?: number } = {}): ConversationHandlePage {
-    return { ...this.conversation.page(request), snapshot: this.conversationSnapshot() };
+    const floor = Number(this.conversationStartCursor ?? 0);
+    const requested = Number(request.after ?? 0);
+    let after = String(Math.max(
+      Number.isSafeInteger(floor) ? floor : 0,
+      Number.isSafeInteger(requested) ? requested : 0,
+    ));
+    const limit = Math.min(Math.max(request.limit ?? 200, 1), 1_000);
+    let page = this.conversation.page({ after, limit });
+    let visible = page.events.filter(event => this.isCurrentConversationEvent(event));
+    // A resumed adapter may replay a page made entirely of prior session/load
+    // history. Advance over it without exposing it or making the browser stop
+    // before later current-session records.
+    while (!visible.length && page.hasMore && page.nextCursor && page.nextCursor !== after) {
+      after = page.nextCursor;
+      page = this.conversation.page({ after, limit });
+      visible = page.events.filter(event => this.isCurrentConversationEvent(event));
+    }
+    return {
+      ...page,
+      events: visible,
+      snapshot: this.conversationSnapshot(),
+    };
   }
 
   conversationSnapshot(): ConversationSnapshot {
@@ -1620,7 +1645,13 @@ export class AcpSession implements SessionHandle {
   }
 
   subscribeConversation(listener: Parameters<ConversationEventStore['subscribe']>[0]): () => void {
-    return this.conversation.subscribe(listener);
+    return this.conversation.subscribe(event => {
+      if (this.isCurrentConversationEvent(event)) listener(event);
+    });
+  }
+
+  private isCurrentConversationEvent(event: ConversationEventV1): boolean {
+    return event.sessionGeneration === this.sessionGeneration && event.source !== 'agent_replay';
   }
 
   private fail(error: unknown): void {

@@ -1,9 +1,10 @@
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import {
   appendFileSync, chmodSync, existsSync, lstatSync, mkdtempSync, readdirSync,
-  readFileSync, rmSync, statSync, symlinkSync, unlinkSync, writeFileSync,
+  readFileSync, rmSync, statSync, symlinkSync, writeFileSync,
 } from 'node:fs';
 import { fork } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
@@ -41,6 +42,12 @@ describe('worklog rotation', () => {
     expect(Buffer.byteLength(tail)).toBeLessThanOrEqual(1024);
     expect(() => Buffer.from(tail, 'utf8').toString('utf8')).not.toThrow();
     expect(statSync(path).mode & 0o777).toBe(0o640);
+    const status = JSON.parse(readFileSync(join(dir, '.worklog-rotation.json'), 'utf8'));
+    expect(status).toMatchObject({
+      archiveBytes: Buffer.byteLength(original),
+      archiveSha256: createHash('sha256').update(original).digest('hex'),
+      liveSha256: createHash('sha256').update(tail).digest('hex'),
+    });
   });
 
   it('records when one overlong logical line requires a bounded mid-line live tail', () => {
@@ -129,26 +136,6 @@ describe('worklog rotation', () => {
     }
   });
 
-  it('fails before live replacement if WORKLOG.md becomes a symlink after archive publication', () => {
-    const original = 'RACE-SAFE-HISTORY\n' + 'line\n'.repeat(1_000);
-    const outside = join(dir, 'race-target.md');
-    writeFileSync(path, original);
-    writeFileSync(outside, 'OUTSIDE-UNCHANGED\n');
-
-    expect(() => rotateWorklog(path, policy, {
-      now: () => new Date('2026-08-20T10:00:00.000Z'),
-      afterArchiveRename: () => {
-        unlinkSync(path);
-        symlinkSync(outside, path);
-      },
-    })).toThrow(/WORKLOG\.md is a symbolic link/);
-
-    expect(lstatSync(path).isSymbolicLink()).toBe(true);
-    expect(readFileSync(outside, 'utf8')).toBe('OUTSIDE-UNCHANGED\n');
-    expect(readFileSync(join(dir, 'WORKLOG.2026-08-20T10-00-00.000Z.md'), 'utf8')).toBe(original);
-    expect(existsSync(join(dir, '.worklog-rotation.json'))).toBe(false);
-  });
-
   it('preserves an append after archive publication without a missing-live-file window', () => {
     const original = 'old\n'.repeat(1000);
     writeFileSync(path, original);
@@ -213,7 +200,7 @@ describe('worklog rotation', () => {
     });
   });
 
-  it('leaves the complete live file and published archive recoverable on commit error', () => {
+  it('best-effort removes a duplicate published archive on a detected pre-replacement error', () => {
     const original = 'ERROR-SAFE\n' + 'line\n'.repeat(1_000);
     writeFileSync(path, original);
     expect(() => rotateWorklog(path, policy, {
@@ -222,7 +209,7 @@ describe('worklog rotation', () => {
     })).toThrow(/simulated crash boundary/);
     expect(readFileSync(path, 'utf8')).toBe(original);
     const archive = join(dir, 'WORKLOG.2026-08-20T10-00-00.000Z.md');
-    expect(readFileSync(archive, 'utf8')).toBe(original);
+    expect(existsSync(archive)).toBe(false);
     expect(existsSync(join(dir, '.worklog-rotation.json'))).toBe(false);
     expect(readdirSync(dir).some(name => name.endsWith('.rotate'))).toBe(false);
   });

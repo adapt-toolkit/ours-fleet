@@ -3,6 +3,7 @@ import {
   openSync, readdirSync, readFileSync, unlinkSync,
 } from 'node:fs';
 import type { Stats } from 'node:fs';
+import { createHash } from 'node:crypto';
 import { basename, dirname, join } from 'node:path';
 import { replaceFileAtomically } from './atomic-file.js';
 import type { WorklogPolicy } from './config.js';
@@ -50,6 +51,19 @@ const sameInode = (left: FileStat, right: FileStat): boolean =>
 const sameSnapshot = (left: FileStat, right: FileStat): boolean =>
   sameInode(left, right) && left.size === right.size
   && left.mtimeMs === right.mtimeMs && left.ctimeMs === right.ctimeMs;
+
+const sha256 = (content: Buffer): string =>
+  createHash('sha256').update(content).digest('hex');
+
+/** Remove a newly published duplicate only while the source inode is still available. */
+const cleanupDuplicateLink = (source: string, target: string, expected: FileStat): void => {
+  try {
+    const sourceStat = entryStat(source);
+    const targetStat = entryStat(target);
+    if (sourceStat && targetStat && sameInode(expected, sourceStat) && sameInode(expected, targetStat))
+      unlinkSync(target);
+  } catch { /* cleanup is best-effort; preserve the primary failure */ }
+};
 
 const validateArchiveBoundary = (path: string): FileStat | undefined => {
   const archiveDir = join(dirname(path), WORKLOG_ARCHIVE_DIR);
@@ -140,6 +154,7 @@ export function pruneWorklogArchives(path: string, maxArchives: number): void {
           collision++;
           continue;
         }
+        cleanupDuplicateLink(source, target, sourceBefore);
         throw error;
       }
     }
@@ -217,20 +232,34 @@ export function rotateWorklog(
       throw error;
     }
   }
-  deps.afterArchiveRename?.();
-  const liveBeforeReplace = requireRegularFile(path, 'WORKLOG.md');
-  if (!sameInode(before, liveBeforeReplace))
-    throw new Error('refusing worklog rotation: WORKLOG.md changed after archive publication');
-  // The helper writes and fsyncs a same-directory temp, atomically renames it
-  // over the live path, then fsyncs the directory. WORKLOG.md is never absent.
-  replaceFileAtomically(path, tail.toString('utf8'), before.mode & 0o777);
-  const liveBytes = existsSync(path) ? requireRegularFile(path, 'WORKLOG.md').size : 0;
+  try {
+    deps.afterArchiveRename?.();
+    const liveBeforeReplace = requireRegularFile(path, 'WORKLOG.md');
+    if (!sameInode(before, liveBeforeReplace))
+      throw new Error('refusing worklog rotation: WORKLOG.md changed after archive publication');
+    // The helper writes and fsyncs a same-directory temp, atomically renames it
+    // over the live path, then fsyncs the directory. WORKLOG.md is never absent.
+    replaceFileAtomically(path, tail.toString('utf8'), before.mode & 0o777);
+  } catch (error) {
+    // If the inspected inode is still the live file, the archive is only a
+    // duplicate artifact. Remove it best-effort and preserve the real error.
+    // If the live path changed, retain the archive because it may be the only
+    // remaining link to the inspected history.
+    cleanupDuplicateLink(path, archivePath, before);
+    throw error;
+  }
+  const archiveContent = readFileSync(archivePath);
+  const liveContent = existsSync(path) ? readFileSync(path) : Buffer.alloc(0);
+  const liveBytes = liveContent.length;
   const status = {
     schemaVersion: 1,
     rotatedAt: rotatedAt.toISOString(),
     beforeBytes: before.size,
     afterBytes: liveBytes,
     archive: basename(archivePath),
+    archiveBytes: archiveContent.length,
+    archiveSha256: sha256(archiveContent),
+    liveSha256: sha256(liveContent),
     archiveContainsFullSnapshot: true,
     tailOmittedPrefixBytes: start,
     ...(tailStartsMidLine ? { tailStartsMidLine: true } : {}),

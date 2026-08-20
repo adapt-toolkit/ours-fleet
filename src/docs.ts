@@ -710,7 +710,12 @@ collision-safe UTC archive name, and
 recent archives beside WORKLOG.md; older complete archives move to
 \`WORKLOG.archives/\` without deletion. All archives share the role's sensitive
 state boundary. Fleet refuses a symlinked/non-regular live log or a symlinked
-cold-archive boundary before replacing the live path.
+cold-archive boundary before replacing the live path and best-effort removes a
+duplicate publication left by a detected failure while the original inode is
+still available. The manifest records SHA-256 digests for the archive and live
+bytes observed when it is written. These checks address ordinary path hazards,
+not intentional path mutation by a malicious concurrent process with the same
+Unix authority; that is outside the threat model and requires OS-level isolation.
 
 ACP tool diffs are bounded before entering web conversation events. Existing
 small before/after diffs are unchanged. Oversized whole-file snapshots are
@@ -721,6 +726,9 @@ overlong single line keeps its newest suffix and explicitly records a mid-line
 start. Paths retain at most a 4 KiB suffix with byte count, digest, and omitted
 prefix metadata; the complete normalized update is capped at 320 KiB. A large
 append therefore retains current appended content, not the historical prefix.
+The live web-console transcript includes only the current runner generation and
+excludes adapter session/load replay. Replayed events remain durable with
+agent_replay provenance for diagnosis and recovery.
 
 \`auth_proxy: { kind: anthropic, base_url, required, health_url }\` is Claude-only
 and loopback-only. Fleet injects only ANTHROPIC_BASE_URL and doctor rejects

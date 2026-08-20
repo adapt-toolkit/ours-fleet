@@ -247,10 +247,8 @@ function TurnBlock({ turn, onDecide }: {
           </summary>
           <div className="tool-detail">
             {tool.locations?.length ? <div><strong>Locations</strong>
-              {tool.locations.map((location, index) => <code key={index}>
-                {location.path}{location.line ? `:${location.line}` : ''}
-                {location.pathTruncated ? ` [path tail; ${location.pathBytes} bytes total]` : ''}
-              </code>)}</div> : null}
+              {tool.locations.map((location, index) =>
+                <ToolLocation key={index} location={location} />)}</div> : null}
             {tool.content?.map((content, index) => <ToolContent key={index} content={content} />)}
             {tool.rawInput && <JsonDisclosure label="Input" value={tool.rawInput} />}
             {tool.rawOutput && <JsonDisclosure label="Output" value={tool.rawOutput} />}
@@ -272,16 +270,43 @@ function TurnBlock({ turn, onDecide }: {
   </article>;
 }
 
-function ToolContent({ content }: { content: Record<string, unknown> }) {
+export function ToolLocation({ location }: {
+  location: {
+    path: string; line?: number; pathBytes?: number; pathTruncated?: true;
+    pathDigest?: string; pathOmittedPrefixBytes?: number;
+  };
+}) {
+  return <div className="tool-content"><code>
+    {location.path}{location.line ? `:${location.line}` : ''}
+  </code>{location.pathTruncated && <small className="muted">
+    Path tail only · {location.pathBytes ?? '?'} bytes total
+    {typeof location.pathOmittedPrefixBytes === 'number'
+      ? ` · ${location.pathOmittedPrefixBytes} leading bytes omitted` : ''}
+    {location.pathDigest ? ` · digest ${location.pathDigest}` : ''}
+  </small>}</div>;
+}
+
+type DiffTextView = {
+  text?: string; bytes?: number; truncated?: true; digest?: string;
+  omittedPrefixBytes?: number; startsMidLine?: true;
+};
+
+function DiffTextProvenance({ label, value }: { label: string; value?: DiffTextView }) {
+  if (!value) return null;
+  return <small className="muted">{label}
+    {typeof value.bytes === 'number' ? ` · ${value.bytes} bytes` : ''}
+    {value.truncated ? ' · retained bounded tail' : ''}
+    {typeof value.omittedPrefixBytes === 'number'
+      ? ` · ${value.omittedPrefixBytes} leading bytes omitted` : ''}
+    {value.startsMidLine ? ' · retained tail starts mid-line' : ''}
+    {value.digest ? ` · digest ${value.digest}` : ''}
+  </small>;
+}
+
+export function ToolContent({ content }: { content: Record<string, unknown> }) {
   if (content.type === 'diff') {
-    const oldText = content.oldText as {
-      text?: string; bytes?: number; truncated?: true; omittedPrefixBytes?: number;
-      startsMidLine?: true;
-    } | undefined;
-    const newText = content.newText as {
-      text?: string; bytes?: number; truncated?: true; omittedPrefixBytes?: number;
-      startsMidLine?: true;
-    } | undefined;
+    const oldText = content.oldText as DiffTextView | undefined;
+    const newText = content.newText as DiffTextView | undefined;
     const operation = typeof content.operation === 'string' ? content.operation : 'diff';
     const bounded = content.bounded === true;
     return <div className="tool-content"><strong>{operation === 'diff' ? 'Diff' : operation} · {String(content.path ?? '')}</strong>
@@ -295,15 +320,15 @@ function ToolContent({ content }: { content: Record<string, unknown> }) {
           ? ` · file ${content.beforeBytes} → ${content.afterBytes} bytes` : ''}
         {typeof content.commonPrefixBytes === 'number'
           ? ` · ${content.commonPrefixBytes} unchanged prefix bytes omitted` : ''}
+        {typeof content.commonSuffixBytes === 'number'
+          ? ` · ${content.commonSuffixBytes} unchanged suffix bytes omitted` : ''}
       </small>}
       {oldText && <pre className="diff-old">{oldText.text}</pre>}
       <pre className="diff-new">{newText?.text}</pre>
-      {(oldText?.truncated || newText?.truncated) && <small className="muted">
-        Retained bounded tail
-        {newText?.bytes !== undefined ? ` · current side ${newText.bytes} bytes` : ''}
-        {newText?.omittedPrefixBytes ? ` · ${newText.omittedPrefixBytes} leading bytes omitted` : ''}
-        {newText?.startsMidLine ? ' · retained tail starts mid-line' : ''}
-      </small>}
+      {(bounded || oldText?.truncated || oldText?.digest) &&
+        <DiffTextProvenance label="Prior side" value={oldText} />}
+      {(bounded || newText?.truncated || newText?.digest) &&
+        <DiffTextProvenance label="Current side" value={newText} />}
     </div>;
   }
   if (content.type === 'terminal')

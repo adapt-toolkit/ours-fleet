@@ -224,7 +224,11 @@ describe('normalizeSessionUpdate', () => {
       }],
     });
     expect((replacement.payload as ToolUpsertPayload).content?.[0])
-      .toMatchObject({ type: 'diff', operation: 'replace', bounded: true });
+      .toMatchObject({
+        type: 'diff', operation: 'replace', bounded: true,
+        oldText: { truncated: true, digest: expect.stringMatching(/^[0-9a-f]{24}$/) },
+        newText: { truncated: true, digest: expect.stringMatching(/^[0-9a-f]{24}$/) },
+      });
   });
 
   it('bounds attacker-controlled diff and location paths with explicit provenance', () => {

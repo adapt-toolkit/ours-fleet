@@ -225,7 +225,10 @@ UTF-8-safe suffix and records that it starts mid-line, together with omitted-byt
 count and digest. Paths retain at most a 4 KiB suffix with the same explicit
 size/digest/omission provenance, and a 320 KiB cap covers the complete normalized
 update. An append therefore cannot replay a large historical file while hiding
-the current appended text.
+the current appended text. The live web-console transcript projects only events
+from the current runner generation and excludes adapter `session/load` replay;
+those replay events remain in the durable ledger with `agent_replay` provenance
+for diagnosis and recovery rather than appearing as current work.
 
 For a temporary role, those first-boot instructions preserve and bind an
 existing identity when one is present. If the assigned identity is missing,
@@ -1151,12 +1154,19 @@ a later fleet lifecycle point. The active log retains a bounded UTF-8 tail,
 advancing to a line boundary when a complete line fits. If one logical line
 alone exceeds the tail budget, its newest suffix remains and
 `.worklog-rotation.json` explicitly records the mid-line start and omitted byte
-count. The complete prior inode is published under a collision-safe UTC name.
+count. It also records SHA-256 digests for the archive and retained live bytes
+observed when the manifest is written. The complete prior inode is published
+under a collision-safe UTC name.
 `max_archives` bounds recent archives beside `WORKLOG.md`; older complete
 archives move to `WORKLOG.archives/` and are never deleted. Use `worklog: false` on a role or in
 `defaults` to opt out. Archives may contain the same sensitive material as
 `WORKLOG.md`. Rotation refuses a symlinked/non-regular live log or a symlinked
-cold-archive boundary before replacing the live path.
+cold-archive boundary before replacing the live path, and best-effort removes a
+duplicate link left by a detected failure while the original inode is still
+available. These are ordinary path/error safeguards, not a security boundary
+against a malicious concurrent process with the same Unix authority: intentional
+symlink swaps or archive-directory renames between checks are outside the threat
+model and require OS-level isolation from that process.
 
 Claude roles can use a credential-free loopback proxy:
 
