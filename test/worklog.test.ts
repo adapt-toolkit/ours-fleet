@@ -1,13 +1,13 @@
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import {
-  appendFileSync, chmodSync, existsSync, mkdtempSync, readdirSync, readFileSync, rmSync,
-  statSync, writeFileSync,
+  appendFileSync, chmodSync, existsSync, lstatSync, mkdtempSync, readdirSync,
+  readFileSync, rmSync, statSync, symlinkSync, unlinkSync, writeFileSync,
 } from 'node:fs';
 import { fork } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
-  inspectWorklog, rotateWorklog, WORKLOG_ARCHIVE_DIR,
+  inspectWorklog, pruneWorklogArchives, rotateWorklog, WORKLOG_ARCHIVE_DIR,
 } from '../src/worklog.js';
 
 let dir: string;
@@ -43,6 +43,21 @@ describe('worklog rotation', () => {
     expect(statSync(path).mode & 0o777).toBe(0o640);
   });
 
+  it('records when one overlong logical line requires a bounded mid-line live tail', () => {
+    const original = 'L'.repeat(3_000) + '\n';
+    writeFileSync(path, original);
+    const result = rotateWorklog(path, policy, {
+      now: () => new Date('2026-08-20T10:00:00.000Z'),
+    });
+    expect(readFileSync(result.archivePath!, 'utf8')).toBe(original);
+    expect(Buffer.byteLength(readFileSync(path))).toBe(1_024);
+    const status = JSON.parse(readFileSync(join(dir, '.worklog-rotation.json'), 'utf8'));
+    expect(status).toMatchObject({
+      tailOmittedPrefixBytes: Buffer.byteLength(original) - 1_024,
+      tailStartsMidLine: true,
+    });
+  });
+
   it('defers without truncation when an append races the stable-snapshot check', () => {
     const original = 'line\n'.repeat(1000);
     writeFileSync(path, original);
@@ -51,6 +66,87 @@ describe('worklog rotation', () => {
     });
     expect(result).toMatchObject({ rotated: false, deferred: true });
     expect(readFileSync(path, 'utf8')).toBe(`${original}concurrent\n`);
+  });
+
+  it('fails closed before mutating a symlinked live worklog or claiming an archive', () => {
+    const outsideDir = mkdtempSync(join(tmpdir(), 'ours-fleet-external-worklog-'));
+    const outside = join(outsideDir, 'external-target.md');
+    const original = 'HISTORICAL-HEAD\n' + 'line\n'.repeat(1_000);
+    try {
+      writeFileSync(outside, original);
+      symlinkSync(outside, path);
+
+      expect(() => rotateWorklog(path, policy, {
+        now: () => new Date('2026-08-20T10:00:00.000Z'),
+      })).toThrow(/WORKLOG\.md is a symbolic link/);
+
+      expect(lstatSync(path).isSymbolicLink()).toBe(true);
+      expect(readFileSync(outside, 'utf8')).toBe(original);
+      expect(readdirSync(dir).filter(name => /^WORKLOG\..*\.md$/.test(name))).toEqual([]);
+      expect(existsSync(join(dir, '.worklog-rotation.json'))).toBe(false);
+    } finally {
+      rmSync(outsideDir, { recursive: true, force: true });
+    }
+  });
+
+  it('does not follow a pre-existing WORKLOG.archives symlink or unlink source history', () => {
+    const outside = mkdtempSync(join(tmpdir(), 'ours-fleet-outside-boundary-'));
+    const older = 'WORKLOG.2026-08-20T09-00-00.000Z.md';
+    const newer = 'WORKLOG.2026-08-20T10-00-00.000Z.md';
+    try {
+      writeFileSync(join(dir, older), 'OLDER-SENSITIVE-HISTORY\n');
+      writeFileSync(join(dir, newer), 'NEWER-SENSITIVE-HISTORY\n');
+      symlinkSync(outside, join(dir, WORKLOG_ARCHIVE_DIR), 'dir');
+
+      expect(() => pruneWorklogArchives(path, 1))
+        .toThrow(/WORKLOG\.archives is a symbolic link/);
+      expect(readFileSync(join(dir, older), 'utf8')).toBe('OLDER-SENSITIVE-HISTORY\n');
+      expect(readFileSync(join(dir, newer), 'utf8')).toBe('NEWER-SENSITIVE-HISTORY\n');
+      expect(readdirSync(outside)).toEqual([]);
+    } finally {
+      rmSync(outside, { recursive: true, force: true });
+    }
+  });
+
+  it('rejects a symlinked cold boundary before rotating the live worklog', () => {
+    const outside = mkdtempSync(join(tmpdir(), 'ours-fleet-outside-boundary-'));
+    const original = 'LIVE-HISTORY\n' + 'line\n'.repeat(1_000);
+    try {
+      writeFileSync(path, original);
+      writeFileSync(join(dir, 'WORKLOG.2026-08-20T09-00-00.000Z.md'), 'RECENT-HISTORY\n');
+      symlinkSync(outside, join(dir, WORKLOG_ARCHIVE_DIR), 'dir');
+
+      expect(() => rotateWorklog(path, { ...policy, max_archives: 1 }, {
+        now: () => new Date('2026-08-20T10:00:00.000Z'),
+      })).toThrow(/WORKLOG\.archives is a symbolic link/);
+      expect(readFileSync(path, 'utf8')).toBe(original);
+      expect(readdirSync(outside)).toEqual([]);
+      expect(existsSync(join(dir, '.worklog-rotation.json'))).toBe(false);
+      expect(readdirSync(dir).filter(name => /^WORKLOG\..*\.md$/.test(name)))
+        .toEqual(['WORKLOG.2026-08-20T09-00-00.000Z.md']);
+    } finally {
+      rmSync(outside, { recursive: true, force: true });
+    }
+  });
+
+  it('fails before live replacement if WORKLOG.md becomes a symlink after archive publication', () => {
+    const original = 'RACE-SAFE-HISTORY\n' + 'line\n'.repeat(1_000);
+    const outside = join(dir, 'race-target.md');
+    writeFileSync(path, original);
+    writeFileSync(outside, 'OUTSIDE-UNCHANGED\n');
+
+    expect(() => rotateWorklog(path, policy, {
+      now: () => new Date('2026-08-20T10:00:00.000Z'),
+      afterArchiveRename: () => {
+        unlinkSync(path);
+        symlinkSync(outside, path);
+      },
+    })).toThrow(/WORKLOG\.md is a symbolic link/);
+
+    expect(lstatSync(path).isSymbolicLink()).toBe(true);
+    expect(readFileSync(outside, 'utf8')).toBe('OUTSIDE-UNCHANGED\n');
+    expect(readFileSync(join(dir, 'WORKLOG.2026-08-20T10-00-00.000Z.md'), 'utf8')).toBe(original);
+    expect(existsSync(join(dir, '.worklog-rotation.json'))).toBe(false);
   });
 
   it('preserves an append after archive publication without a missing-live-file window', () => {

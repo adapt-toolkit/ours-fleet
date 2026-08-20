@@ -219,7 +219,12 @@ ledger. Small diffs retain their existing before/after representation. When an
 adapter reports an oversized whole-file snapshot, fleet stores only the changed
 region with path, operation, original byte counts, digest, and boundedness
 metadata. Each retained changed side is capped at 64 KiB as a UTF-8-safe,
-whole-line tail, so an append cannot replay a large historical file while hiding
+newest-content tail. The tail advances to a line boundary when a complete line
+fits. If one logical line alone exceeds the cap, fleet retains its newest
+UTF-8-safe suffix and records that it starts mid-line, together with omitted-byte
+count and digest. Paths retain at most a 4 KiB suffix with the same explicit
+size/digest/omission provenance, and a 320 KiB cap covers the complete normalized
+update. An append therefore cannot replay a large historical file while hiding
 the current appended text.
 
 For a temporary role, those first-boot instructions preserve and bind an
@@ -354,7 +359,7 @@ defaults:
     mode: fleet                         # fleet (default) | native
   worklog:                              # built-ins shown; set false to opt out
     max_kb: 1024                        # rotate only above this active-log size
-    keep_tail_kb: 256                   # UTF-8 whole-line restart tail
+    keep_tail_kb: 256                   # UTF-8 tail; line-aligned when one fits
     max_archives: 12                    # recent beside log; older preserved cold
 roles:
   Name:                                 # [A-Za-z0-9_-]+
@@ -1142,13 +1147,16 @@ worklog:
 ```
 
 Rotation is conservative: a concurrent change aborts the attempt and retries at
-a later fleet lifecycle point. The active log retains a UTF-8 whole-line tail,
-the complete prior inode is published under a collision-safe UTC name, and
-`.worklog-rotation.json` records restart provenance. `max_archives` bounds the
-recent archives beside `WORKLOG.md`; older complete archives move to
-`WORKLOG.archives/` and are never deleted. Use `worklog: false` on a role or in
+a later fleet lifecycle point. The active log retains a bounded UTF-8 tail,
+advancing to a line boundary when a complete line fits. If one logical line
+alone exceeds the tail budget, its newest suffix remains and
+`.worklog-rotation.json` explicitly records the mid-line start and omitted byte
+count. The complete prior inode is published under a collision-safe UTC name.
+`max_archives` bounds recent archives beside `WORKLOG.md`; older complete
+archives move to `WORKLOG.archives/` and are never deleted. Use `worklog: false` on a role or in
 `defaults` to opt out. Archives may contain the same sensitive material as
-`WORKLOG.md`.
+`WORKLOG.md`. Rotation refuses a symlinked/non-regular live log or a symlinked
+cold-archive boundary before replacing the live path.
 
 Claude roles can use a credential-free loopback proxy:
 

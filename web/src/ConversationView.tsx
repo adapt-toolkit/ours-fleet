@@ -249,6 +249,7 @@ function TurnBlock({ turn, onDecide }: {
             {tool.locations?.length ? <div><strong>Locations</strong>
               {tool.locations.map((location, index) => <code key={index}>
                 {location.path}{location.line ? `:${location.line}` : ''}
+                {location.pathTruncated ? ` [path tail; ${location.pathBytes} bytes total]` : ''}
               </code>)}</div> : null}
             {tool.content?.map((content, index) => <ToolContent key={index} content={content} />)}
             {tool.rawInput && <JsonDisclosure label="Input" value={tool.rawInput} />}
@@ -275,13 +276,20 @@ function ToolContent({ content }: { content: Record<string, unknown> }) {
   if (content.type === 'diff') {
     const oldText = content.oldText as {
       text?: string; bytes?: number; truncated?: true; omittedPrefixBytes?: number;
+      startsMidLine?: true;
     } | undefined;
     const newText = content.newText as {
       text?: string; bytes?: number; truncated?: true; omittedPrefixBytes?: number;
+      startsMidLine?: true;
     } | undefined;
     const operation = typeof content.operation === 'string' ? content.operation : 'diff';
     const bounded = content.bounded === true;
     return <div className="tool-content"><strong>{operation === 'diff' ? 'Diff' : operation} · {String(content.path ?? '')}</strong>
+      {content.pathTruncated === true && <small className="muted">
+        Path tail only · {String(content.pathBytes ?? '?')} bytes total
+        {content.pathOmittedPrefixBytes ? ` · ${content.pathOmittedPrefixBytes} leading bytes omitted` : ''}
+        {content.pathDigest ? ` · digest ${String(content.pathDigest)}` : ''}
+      </small>}
       {bounded && <small className="muted">Current change only
         {typeof content.beforeBytes === 'number' && typeof content.afterBytes === 'number'
           ? ` · file ${content.beforeBytes} → ${content.afterBytes} bytes` : ''}
@@ -294,6 +302,7 @@ function ToolContent({ content }: { content: Record<string, unknown> }) {
         Retained bounded tail
         {newText?.bytes !== undefined ? ` · current side ${newText.bytes} bytes` : ''}
         {newText?.omittedPrefixBytes ? ` · ${newText.omittedPrefixBytes} leading bytes omitted` : ''}
+        {newText?.startsMidLine ? ' · retained tail starts mid-line' : ''}
       </small>}
     </div>;
   }

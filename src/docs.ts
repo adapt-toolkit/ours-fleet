@@ -701,19 +701,26 @@ WORKLOG rotation is enabled by default with
 \`worklog: { max_kb: 1024, keep_tail_kb: 256, max_archives: 12 }\`. Maps may
 override individual values; \`worklog: false\` on a role or in defaults opts out.
 Fleet rotates only at that role's launch/resume lifecycle boundary. Concurrent
-changes defer rotation. The active file keeps a UTF-8 whole-line tail, the
-complete prior inode receives a collision-safe UTC archive name, and
+changes defer rotation. The active file keeps a bounded UTF-8 tail and advances
+to a line boundary when a complete line fits. If one logical line alone exceeds
+the budget, its newest suffix remains and the rotation manifest records the
+mid-line start and omitted byte count. The complete prior inode receives a
+collision-safe UTC archive name, and
 \`.worklog-rotation.json\` records restart provenance. \`max_archives\` bounds
 recent archives beside WORKLOG.md; older complete archives move to
 \`WORKLOG.archives/\` without deletion. All archives share the role's sensitive
-state boundary.
+state boundary. Fleet refuses a symlinked/non-regular live log or a symlinked
+cold-archive boundary before replacing the live path.
 
 ACP tool diffs are bounded before entering web conversation events. Existing
 small before/after diffs are unchanged. Oversized whole-file snapshots are
 reduced to the actual changed region plus path, operation, original byte counts,
-digest, and omission metadata; each retained side is a UTF-8/whole-line tail of
-at most 64 KiB. A large append therefore retains current appended content, not
-the historical prefix.
+digest, and omission metadata. Each retained side is a newest-content UTF-8 tail
+of at most 64 KiB, advanced to a line boundary when a complete line fits. An
+overlong single line keeps its newest suffix and explicitly records a mid-line
+start. Paths retain at most a 4 KiB suffix with byte count, digest, and omitted
+prefix metadata; the complete normalized update is capped at 320 KiB. A large
+append therefore retains current appended content, not the historical prefix.
 
 \`auth_proxy: { kind: anthropic, base_url, required, health_url }\` is Claude-only
 and loopback-only. Fleet injects only ANTHROPIC_BASE_URL and doctor rejects

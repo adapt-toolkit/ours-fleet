@@ -3,8 +3,8 @@ import { createHash } from 'node:crypto';
 import type * as acp from '@agentclientprotocol/sdk';
 
 import type {
-  AdapterMeta, BoundedJson, CapabilitiesUpdatedPayload, CappedText, ConversationEventKind,
-  ConversationPayload, MessageChunkPayload, NormalizedContentBlock, NormalizedText,
+  AdapterMeta, BoundedJson, BoundedPath, CapabilitiesUpdatedPayload, CappedText,
+  ConversationEventKind, ConversationPayload, MessageChunkPayload, NormalizedContentBlock, NormalizedText,
   NormalizedToolContent, PlanEntryPayload, PlanReplacePayload, ToolUpsertPayload,
   UnsupportedPayload,
 } from './conversation-types.js';
@@ -23,6 +23,10 @@ import type {
 export const MAX_TEXT_BYTES = 256 * 1024;
 /** Cap for each retained side of an oversized snapshot-style file diff. */
 export const MAX_DIFF_TEXT_BYTES = 64 * 1024;
+/** Cap for attacker-controlled filesystem paths while retaining their useful basename tail. */
+export const MAX_PATH_BYTES = 4 * 1024;
+/** Hard cap for the complete normalized update before the durable event envelope is added. */
+export const MAX_NORMALIZED_UPDATE_BYTES = 320 * 1024;
 /** Cap for one adapter `_meta` namespace value. */
 export const MAX_META_BYTES = 16 * 1024;
 /** Cap for serialized raw tool input/output retained as structured JSON. */
@@ -71,6 +75,28 @@ function truncateUtf8(text: string, maxBytes: number): string {
   return buffer.toString('utf8').replace(/�+$/u, '');
 }
 
+/** Keep a UTF-8-safe suffix. Paths and identifiers have no line semantics. */
+function truncateUtf8Tail(text: string, maxBytes: number): { text: string; omittedPrefixBytes: number } {
+  const buffer = Buffer.from(text);
+  let start = Math.max(0, buffer.length - maxBytes);
+  while (start < buffer.length && (buffer[start] & 0xc0) === 0x80) start++;
+  return { text: buffer.subarray(start).toString('utf8'), omittedPrefixBytes: start };
+}
+
+function boundedPath(raw: unknown): BoundedPath {
+  const path = asString(raw) ?? '';
+  const pathBytes = Buffer.byteLength(path);
+  if (pathBytes <= MAX_PATH_BYTES) return { path };
+  const retained = truncateUtf8Tail(path, MAX_PATH_BYTES);
+  return {
+    path: retained.text,
+    pathBytes,
+    pathTruncated: true,
+    pathDigest: digest24(path),
+    pathOmittedPrefixBytes: retained.omittedPrefixBytes,
+  };
+}
+
 function cappedText(raw: unknown, redact?: string): CappedText {
   const text = asString(raw) ?? '';
   const bytes = Buffer.byteLength(text);
@@ -83,18 +109,25 @@ function cappedText(raw: unknown, redact?: string): CappedText {
   };
 }
 
-/** Keep the newest complete UTF-8/line-aligned tail inside a byte budget. */
+/** Keep the newest UTF-8 tail, aligning to a whole line whenever one fits. */
 function cappedTextTail(text: string, maxBytes: number): CappedText {
   const buffer = Buffer.from(text);
   const bytes = buffer.length;
   if (bytes <= maxBytes) return { text, bytes };
   let start = bytes - maxBytes;
   while (start < bytes && (buffer[start] & 0xc0) === 0x80) start++;
-  const newline = buffer.indexOf(0x0a, start);
-  if (newline >= 0 && newline + 1 < bytes) start = newline + 1;
+  let startsMidLine = start > 0 && buffer[start - 1] !== 0x0a;
+  if (startsMidLine) {
+    const newline = buffer.indexOf(0x0a, start);
+    if (newline >= 0 && newline + 1 < bytes) {
+      start = newline + 1;
+      startsMidLine = false;
+    }
+  }
   return {
     text: buffer.subarray(start).toString('utf8'), bytes,
     truncated: true, digest: digest24(text), omittedPrefixBytes: start,
+    ...(startsMidLine ? { startsMidLine: true as const } : {}),
   };
 }
 
@@ -126,7 +159,7 @@ function commonEdges(oldText: string, newText: string): { prefix: number; suffix
 function normalizedDiff(
   item: Record<string, unknown>, redact?: string,
 ): Extract<NormalizedToolContent, { type: 'diff' }> {
-  const path = asString(item.path) ?? '';
+  const path = boundedPath(item.path);
   const oldText = asString(item.oldText);
   const newText = asString(item.newText) ?? '';
   // Preserve the established small-diff contract exactly. Redacted turns also
@@ -135,7 +168,7 @@ function normalizedDiff(
       || (Buffer.byteLength(oldText) <= MAX_TEXT_BYTES
         && Buffer.byteLength(newText) <= MAX_TEXT_BYTES)) {
     return {
-      type: 'diff', path,
+      type: 'diff', ...path,
       newText: cappedText(newText, redact),
       ...(oldText !== undefined ? { oldText: cappedText(oldText, redact) } : {}),
     };
@@ -153,11 +186,15 @@ function normalizedDiff(
   const afterBytes = Buffer.byteLength(newText);
   const commonPrefixBytes = Buffer.byteLength(oldText.slice(0, prefix));
   const commonSuffixBytes = Buffer.byteLength(oldText.slice(oldEnd));
-  const operation = oldDelta.length === 0 && prefix === oldText.length
-    ? 'append' as const
-    : newDelta.length === 0 ? 'delete' as const : 'edit' as const;
+  const operation = oldDelta.length === 0 && newDelta.length === 0
+    ? 'noop' as const
+    : oldDelta.length === 0 && prefix === oldText.length
+      ? 'append' as const
+      : newDelta.length === 0
+        ? 'delete' as const
+        : prefix === 0 && suffix === 0 ? 'replace' as const : 'edit' as const;
   return {
-    type: 'diff', path, operation, beforeBytes, afterBytes,
+    type: 'diff', ...path, operation, beforeBytes, afterBytes,
     commonPrefixBytes, commonSuffixBytes, bounded: true,
     newText: cappedTextTail(newDelta, MAX_DIFF_TEXT_BYTES),
     ...(oldDelta.length > 0
@@ -329,7 +366,7 @@ function toolUpsert(
   if (content) payload.content = content;
   if (Array.isArray(update.locations)) {
     payload.locations = update.locations.filter(isRecord).map(location => ({
-      path: asString(location.path) ?? '',
+      ...boundedPath(location.path),
       ...(asFiniteNumber(location.line) !== undefined ? { line: asFiniteNumber(location.line) } : {}),
     }));
   }
@@ -344,9 +381,37 @@ function unsupported(update: unknown): UnsupportedPayload {
   catch { serialized = '[unserializable update]'; }
   const kind = isRecord(update) ? asString(update.sessionUpdate) : undefined;
   return {
-    sessionUpdate: kind ?? 'unknown',
+    sessionUpdate: truncateUtf8(kind ?? 'unknown', 256),
     bytes: Buffer.byteLength(serialized),
     preview: serialized.slice(0, MAX_UNSUPPORTED_PREVIEW_CHARS),
+    ...(Buffer.byteLength(serialized) > Buffer.byteLength(serialized.slice(0, MAX_UNSUPPORTED_PREVIEW_CHARS))
+      ? { digest: digest24(serialized) } : {}),
+  };
+}
+
+function capNormalizedUpdate(result: NormalizedUpdate, sessionUpdate: string): NormalizedUpdate {
+  let serialized: string;
+  try { serialized = JSON.stringify(result); }
+  catch {
+    return {
+      kind: 'unsupported',
+      payload: {
+        sessionUpdate: truncateUtf8(sessionUpdate, 256),
+        bytes: 0,
+        preview: '[normalized update was not serializable]',
+      },
+    };
+  }
+  const bytes = Buffer.byteLength(serialized);
+  if (bytes <= MAX_NORMALIZED_UPDATE_BYTES) return result;
+  return {
+    kind: 'unsupported',
+    payload: {
+      sessionUpdate: truncateUtf8(sessionUpdate, 256),
+      bytes,
+      digest: digest24(serialized),
+      preview: `[normalized update exceeded ${MAX_NORMALIZED_UPDATE_BYTES}-byte durable-event cap]`,
+    },
   };
 }
 
@@ -356,10 +421,11 @@ export function normalizeSessionUpdate(
   const redact = options.redactText;
   const raw: unknown = update;
   if (!isRecord(raw) || typeof raw.sessionUpdate !== 'string')
-    return { kind: 'unsupported', payload: unsupported(raw) };
+    return capNormalizedUpdate({ kind: 'unsupported', payload: unsupported(raw) }, 'unknown');
+  const sessionUpdate = raw.sessionUpdate;
   const adapterMeta = quarantineMeta(raw._meta);
   const withMeta = (result: Omit<NormalizedUpdate, 'adapterMeta'>): NormalizedUpdate =>
-    adapterMeta ? { ...result, adapterMeta } : result;
+    capNormalizedUpdate(adapterMeta ? { ...result, adapterMeta } : result, sessionUpdate);
 
   switch (raw.sessionUpdate) {
     case 'user_message_chunk':
