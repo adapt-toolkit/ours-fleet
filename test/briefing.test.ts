@@ -83,6 +83,17 @@ describe('generateBriefing', () => {
     expect(b.indexOf('## Routines')).toBeGreaterThan(b.indexOf('## Durable log'));
   });
 
+  it('documents bounded active worklog continuity and lossless archive provenance', () => {
+    const b = generateBriefing({
+      ...base, worklog: { max_kb: 1024, keep_tail_kb: 256, max_archives: 12 },
+    }, vocab, opts);
+    expect(b).toContain('Fleet rotates it above 1024 KiB');
+    expect(b).toContain('newest 256 KiB');
+    expect(b).toContain('12 recent archives');
+    expect(b).toContain('WORKLOG.archives');
+    expect(b).toContain('.worklog-rotation.json');
+  });
+
   it('tells a fleet-monitored role NOT to arm its native watch', () => {
     const fleet = {
       ...base,

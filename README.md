@@ -214,6 +214,22 @@ unknown evidence; a newly launched harness follows its generated first-boot
 instructions to choose or create and bind the identity. The console never
 claims that the host created an identity and never deletes one.
 
+ACP tool diffs are normalized before they enter the durable conversation
+ledger. Small diffs retain their existing before/after representation. When an
+adapter reports an oversized whole-file snapshot, fleet stores only the changed
+region with path, operation, original byte counts, digest, and boundedness
+metadata. Each retained changed side is capped at 64 KiB as a UTF-8-safe,
+newest-content tail. The tail advances to a line boundary when a complete line
+fits. If one logical line alone exceeds the cap, fleet retains its newest
+UTF-8-safe suffix and records that it starts mid-line, together with omitted-byte
+count and digest. Paths retain at most a 4 KiB suffix with the same explicit
+size/digest/omission provenance, and a 320 KiB cap covers the complete normalized
+update. An append therefore cannot replay a large historical file while hiding
+the current appended text. The live web-console transcript projects only events
+from the current runner generation and excludes adapter `session/load` replay;
+those replay events remain in the durable ledger with `agent_replay` provenance
+for diagnosis and recovery rather than appearing as current work.
+
 For a temporary role, those first-boot instructions preserve and bind an
 existing identity when one is present. If the assigned identity is missing,
 the role capability-detects the ours MCP `create_temporary_identity` tool and
@@ -344,6 +360,10 @@ defaults:
   max_tokens: 500000                    # session cap (harness-interpreted)
   monitor:
     mode: fleet                         # fleet (default) | native
+  worklog:                              # built-ins shown; set false to opt out
+    max_kb: 1024                        # rotate only above this active-log size
+    keep_tail_kb: 256                   # UTF-8 tail; line-aligned when one fits
+    max_archives: 12                    # recent beside log; older preserved cold
 roles:
   Name:                                 # [A-Za-z0-9_-]+
     harness: claude-code
@@ -1120,7 +1140,7 @@ rollout, anchors, aliases, explicit tags, non-scalar keys, and multiple document
 produce source-positioned warnings; opt into enforcement with
 `--yaml-mode strict`. Strict mode will become the next-major default.
 
-Long-running roles may opt into bounded durable logs:
+WORKLOG rotation is enabled for roles by default with conservative built-ins:
 
 ```yaml
 worklog:
@@ -1130,8 +1150,23 @@ worklog:
 ```
 
 Rotation is conservative: a concurrent change aborts the attempt and retries at
-a later fleet lifecycle point. Archives remain in the role state directory and
-may contain the same sensitive material as `WORKLOG.md`.
+a later fleet lifecycle point. The active log retains a bounded UTF-8 tail,
+advancing to a line boundary when a complete line fits. If one logical line
+alone exceeds the tail budget, its newest suffix remains and
+`.worklog-rotation.json` explicitly records the mid-line start and omitted byte
+count. It also records SHA-256 digests for the archive and retained live bytes
+observed when the manifest is written. The complete prior inode is published
+under a collision-safe UTC name.
+`max_archives` bounds recent archives beside `WORKLOG.md`; older complete
+archives move to `WORKLOG.archives/` and are never deleted. Use `worklog: false` on a role or in
+`defaults` to opt out. Archives may contain the same sensitive material as
+`WORKLOG.md`. Rotation refuses a symlinked/non-regular live log or a symlinked
+cold-archive boundary before replacing the live path, and best-effort removes a
+duplicate link left by a detected failure while the original inode is still
+available. These are ordinary path/error safeguards, not a security boundary
+against a malicious concurrent process with the same Unix authority: intentional
+symlink swaps or archive-directory renames between checks are outside the threat
+model and require OS-level isolation from that process.
 
 Claude roles can use a credential-free loopback proxy:
 

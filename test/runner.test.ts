@@ -313,6 +313,30 @@ describe('runOnce isolation', () => {
 });
 
 describe('runOnce', () => {
+  it('applies default lossless worklog rotation before launching the role', async () => {
+    writeCfg({ A: { harness: 'fake' } });
+    const d = agentDir('A');
+    mkdirSync(d, { recursive: true });
+    const original = 'HISTORICAL-START\n' + 'old line\n'.repeat(140_000)
+      + 'RESTART-CONTINUITY ž 🧪\n';
+    writeFileSync(join(d, 'WORKLOG.md'), original);
+    const { deps } = fakeWorld({ exitCode: '0', exitFile: join(d, '.exit-status') });
+
+    await runOnce('A', {}, deps);
+
+    const active = readFileSync(join(d, 'WORKLOG.md'), 'utf8');
+    expect(Buffer.byteLength(active)).toBeLessThanOrEqual(256 * 1024);
+    expect(active).toContain('RESTART-CONTINUITY ž 🧪');
+    const archive = readdirSync(d).find(name => /^WORKLOG\..+\.md$/.test(name));
+    expect(archive).toBeDefined();
+    expect(readFileSync(join(d, archive!), 'utf8')).toBe(original);
+    const provenance = JSON.parse(readFileSync(join(d, '.worklog-rotation.json'), 'utf8'));
+    expect(provenance).toMatchObject({
+      archive, archiveContainsFullSnapshot: true,
+      olderArchives: 'WORKLOG.archives', recentArchiveLimit: 12,
+    });
+  });
+
   it('upgrades legacy temp snapshots to explicit monitor ownership', () => {
     const d = agentDir('OldTemp', true);
     mkdirSync(d, { recursive: true });

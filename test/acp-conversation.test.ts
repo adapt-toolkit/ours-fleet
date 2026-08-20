@@ -1,4 +1,4 @@
-import { mkdtempSync, readdirSync, rmSync, statSync } from 'node:fs';
+import { mkdtempSync, readFileSync, readdirSync, rmSync, statSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -8,8 +8,9 @@ import { AcpSession, promptContentBlocks, runtimeSelector } from '../src/session
 import { ConversationEventStore } from '../src/session/conversation-store.js';
 import type {
   ConversationEventV1, MessageChunkPayload, PermissionResolvedPayload,
-  PromptAdmittedPayload, TurnCompletedPayload,
+  PromptAdmittedPayload, ToolUpsertPayload, TurnCompletedPayload,
 } from '../src/session/conversation-types.js';
+import { MAX_DIFF_TEXT_BYTES } from '../src/session/conversation-normalizer.js';
 
 const fixture = join(dirname(fileURLToPath(import.meta.url)), 'fixtures', 'acp-agent.mjs');
 const dirs: string[] = [];
@@ -124,6 +125,24 @@ describe('AcpSession conversation ledger', () => {
       && (event.payload as MessageChunkPayload).role === 'user'
       && event.messageId === 'user-1');
     expect(userChunk?.source).toBe('agent');
+  });
+
+  it('persists only the bounded current delta from a multi-megabyte WORKLOG append', async () => {
+    const { session } = await start();
+    await session.submitPrompt('large worklog append');
+    const event = events(session).find(candidate =>
+      candidate.kind === 'tool.upsert' && candidate.toolCallId === 'large-worklog-edit');
+    expect(event).toBeDefined();
+    const payload = event!.payload as ToolUpsertPayload;
+    const diff = payload.content?.[0];
+    expect(diff).toMatchObject({
+      type: 'diff', operation: 'append', bounded: true,
+      newText: { text: expect.stringContaining('CURRENT_SESSION_APPEND') },
+    });
+    const serialized = JSON.stringify(event);
+    expect(Buffer.byteLength(serialized)).toBeLessThan(MAX_DIFF_TEXT_BYTES + 4_096);
+    expect(serialized).not.toContain('ours-mcp start');
+    expect(serialized).not.toContain('historical-line');
   });
 
   it('accepts browser prompts idempotently and durably before acknowledging', async () => {
@@ -251,7 +270,7 @@ describe('AcpSession conversation ledger', () => {
     expect(payload.external?.digest).toBeDefined();
   });
 
-  it('marks replayed session/load history with agent_replay provenance', async () => {
+  it('keeps session/load replay durable with provenance but out of the current console page', async () => {
     const { session, stateDir } = await start('allow', {
       env: { ACP_FIXTURE_LOAD_SESSION: '1', ACP_FIXTURE_REPLAY: '1' },
     });
@@ -261,9 +280,34 @@ describe('AcpSession conversation ledger', () => {
       stateDir, mode: 'resume',
       env: { ACP_FIXTURE_LOAD_SESSION: '1', ACP_FIXTURE_REPLAY: '1' },
     });
-    const replayed = events(resumed).filter(event => event.source === 'agent_replay');
+    expect(events(resumed).filter(event => event.source === 'agent_replay')).toEqual([]);
+    const replayed = readdirSync(join(stateDir, '.conversation'))
+      .filter(name => /^events-.*\.jsonl$/.test(name))
+      .flatMap(name => readFileSync(join(stateDir, '.conversation', name), 'utf8')
+        .trim().split('\n').filter(Boolean).map(line => JSON.parse(line) as ConversationEventV1))
+      .filter(event => event.source === 'agent_replay');
     expect(replayed.length).toBe(2);
     expect((replayed[0].payload as MessageChunkPayload).role).toBe('user');
+  });
+
+  it('pages only this runner generation while preserving older durable records', async () => {
+    const stateDir = mkdtempSync(join(tmpdir(), 'ours-acp-conv-'));
+    dirs.push(stateDir);
+    const store = new ConversationEventStore(join(stateDir, '.conversation'), { roleId: 'A' });
+    for (let i = 0; i < 1_050; i++) store.append({
+      kind: 'message.chunk', sessionGeneration: 'old-generation', source: 'agent',
+      payload: { role: 'assistant', content: { type: 'text', text: `old-${i}`, bytes: 5 } },
+    });
+    store.close();
+
+    const { session } = await start('allow', { stateDir });
+    await session.submitPrompt('current');
+    const page = session.conversationPage({ limit: 1_000 });
+    expect(page.events.length).toBeGreaterThan(0);
+    expect(page.events.every(event => event.sessionGeneration === page.snapshot.sessionGeneration))
+      .toBe(true);
+    expect(JSON.stringify(page.events)).toContain('echo:current');
+    expect(JSON.stringify(page.events)).not.toContain('old-');
   });
 
   it('recovers never-started prompts and marks in-flight turns unknown after restart', async () => {
@@ -298,8 +342,12 @@ describe('AcpSession conversation ledger', () => {
     const unknown = all.find(e =>
       e.kind === 'turn.completed' && e.promptId === 'p-started')!;
     expect((unknown.payload as TurnCompletedPayload).outcome).toBe('unknown_after_restart');
-    // The never-started prompt ran for real — no new admission, one start, one end.
+    // The never-started prompt ran for real — its prior-generation admission
+    // stays durable but outside the current console page; one new start and end
+    // describe the recovery work in this generation.
     expect(all.filter(e => e.kind === 'prompt.admitted' && e.promptId === 'p-queued'))
+      .toHaveLength(0);
+    expect(all.filter(e => e.kind === 'prompt.started' && e.promptId === 'p-queued'))
       .toHaveLength(1);
     const completed = all.find(e =>
       e.kind === 'turn.completed' && e.promptId === 'p-queued')!;

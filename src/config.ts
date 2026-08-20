@@ -23,6 +23,13 @@ export interface WorklogPolicy {
   keep_tail_kb: number;
   max_archives: number;
 }
+export type WorklogPolicyInput = Partial<WorklogPolicy> | false;
+/** Conservative built-in policy; `worklog: false` is the explicit opt-out. */
+export const DEFAULT_WORKLOG_POLICY: Readonly<WorklogPolicy> = Object.freeze({
+  max_kb: 1024,
+  keep_tail_kb: 256,
+  max_archives: 12,
+});
 export interface AuthProxyConfig {
   kind: 'anthropic';
   base_url: string;
@@ -221,11 +228,11 @@ export interface RoleConfig {
   isolation?: IsolationConfig;
   monitor?: Partial<MonitorConfig>;
   owner_channel?: OwnerChannelConfigInput;
-  worklog?: WorklogPolicy;
+  worklog?: WorklogPolicyInput;
   auth_proxy?: Partial<AuthProxyConfig>;
 }
 
-export interface ResolvedRole extends Omit<RoleConfig, 'model' | 'owner_channel'> {
+export interface ResolvedRole extends Omit<RoleConfig, 'model' | 'owner_channel' | 'worklog'> {
   name: string;
   harness: string;
   session: SessionBackendId;
@@ -670,16 +677,17 @@ export function resolveAuthProxy(
 }
 
 export function resolveWorklogPolicy(
-  defaults: unknown, role: WorklogPolicy | undefined, file = 'config', name = 'role',
+  defaults: unknown, role: WorklogPolicyInput | undefined, file = 'config', name = 'role',
 ): WorklogPolicy | undefined {
-  if (defaults === undefined && role === undefined) return undefined;
-  if (defaults !== undefined && !isPlainObject(defaults))
-    throw new ConfigError(`${file}: defaults.worklog must be a map`);
+  if (role === false || (role === undefined && defaults === false)) return undefined;
+  if (defaults !== undefined && defaults !== false && !isPlainObject(defaults))
+    throw new ConfigError(`${file}: defaults.worklog must be a map or false`);
   if (role !== undefined && !isPlainObject(role))
-    throw new ConfigError(`${file}: role '${name}' worklog must be a map`);
+    throw new ConfigError(`${file}: role '${name}' worklog must be a map or false`);
   const merged = {
-    ...((defaults ?? {}) as Partial<WorklogPolicy>),
-    ...(role ?? {}),
+    ...DEFAULT_WORKLOG_POLICY,
+    ...((defaults === false || defaults === undefined ? {} : defaults) as Partial<WorklogPolicy>),
+    ...(role === undefined ? {} : role),
   };
   const bad = Object.keys(merged).filter(key =>
     !['max_kb', 'keep_tail_kb', 'max_archives'].includes(key));
