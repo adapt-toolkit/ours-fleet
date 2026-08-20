@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 
 import {
-  MAX_TEXT_BYTES, normalizeSessionUpdate,
+  MAX_DIFF_TEXT_BYTES, MAX_TEXT_BYTES, normalizeSessionUpdate,
 } from '../src/session/conversation-normalizer.js';
 import type {
   CapabilitiesUpdatedPayload, MessageChunkPayload, NormalizedText, PlanReplacePayload,
@@ -115,6 +115,71 @@ describe('normalizeSessionUpdate', () => {
       oldText: { text: 'old' }, newText: { text: 'new' },
     });
     expect(payload.content?.[2]).toEqual({ type: 'terminal', terminalId: 'term-1' });
+  });
+
+  it('reduces a multi-megabyte append snapshot to only the bounded current delta', () => {
+    const historicalMarker = 'HISTORICAL_MARKER ours-mcp start\n';
+    const oldText = historicalMarker + 'historical-line\n'.repeat(220_000);
+    const appended = 'CURRENT_SESSION_APPEND žluťoučký kůň 🧪\nsecond-current-line\n';
+    const result = normalizeSessionUpdate({
+      sessionUpdate: 'tool_call_update', toolCallId: 'worklog-edit', status: 'completed',
+      content: [{
+        type: 'diff', path: '/role/WORKLOG.md', oldText, newText: oldText + appended,
+      }],
+    });
+    const payload = result.payload as ToolUpsertPayload;
+    const diff = payload.content?.[0];
+    expect(diff).toMatchObject({
+      type: 'diff', path: '/role/WORKLOG.md', operation: 'append', bounded: true,
+      beforeBytes: Buffer.byteLength(oldText),
+      afterBytes: Buffer.byteLength(oldText + appended),
+      commonPrefixBytes: Buffer.byteLength(oldText),
+      newText: { text: appended, bytes: Buffer.byteLength(appended) },
+    });
+    if (diff?.type !== 'diff') throw new Error('expected normalized diff');
+    expect(diff.oldText).toBeUndefined();
+    const serialized = JSON.stringify(result);
+    expect(Buffer.byteLength(serialized)).toBeLessThan(MAX_DIFF_TEXT_BYTES + 2_048);
+    expect(serialized).toContain('CURRENT_SESSION_APPEND');
+    expect(serialized).not.toContain('ours-mcp start');
+  });
+
+  it('keeps a valid whole-line Unicode tail when the current append exceeds its cap', () => {
+    const oldText = 'historical marker\n' + 'old 🧪 line\n'.repeat(30_000);
+    const appended = Array.from({ length: 12_000 }, (_, i) => `current-${i}-žluťoučký 🧪\n`).join('')
+      + 'LATEST-CURRENT-LINE 🧪\n';
+    const result = normalizeSessionUpdate({
+      sessionUpdate: 'tool_call_update', toolCallId: 'large-append',
+      content: [{ type: 'diff', path: '/role/WORKLOG.md', oldText, newText: oldText + appended }],
+    });
+    const diff = (result.payload as ToolUpsertPayload).content?.[0];
+    if (diff?.type !== 'diff') throw new Error('expected normalized diff');
+    expect(diff.newText.truncated).toBe(true);
+    expect(diff.newText.omittedPrefixBytes).toBeGreaterThan(0);
+    expect(Buffer.byteLength(diff.newText.text)).toBeLessThanOrEqual(MAX_DIFF_TEXT_BYTES);
+    expect(diff.newText.text).toMatch(/^current-\d+-žluťoučký 🧪\n/);
+    expect(diff.newText.text).toContain('LATEST-CURRENT-LINE 🧪');
+    expect(diff.newText.text).not.toContain('�');
+  });
+
+  it('removes unchanged historical edges from oversized replacement snapshots', () => {
+    const prefix = 'HISTORICAL_PREFIX\n' + 'unchanged\n'.repeat(30_000);
+    const suffix = 'unchanged suffix 🧪\n'.repeat(30_000);
+    const result = normalizeSessionUpdate({
+      sessionUpdate: 'tool_call_update', toolCallId: 'large-edit',
+      content: [{
+        type: 'diff', path: '/role/WORKLOG.md',
+        oldText: `${prefix}OLD CURRENT REGION\n${suffix}`,
+        newText: `${prefix}NEW CURRENT REGION ž\n${suffix}`,
+      }],
+    });
+    const diff = (result.payload as ToolUpsertPayload).content?.[0];
+    expect(diff).toMatchObject({
+      type: 'diff', operation: 'edit', bounded: true,
+      oldText: { text: 'OLD CURRENT REGION' }, newText: { text: 'NEW CURRENT REGION ž' },
+    });
+    expect(JSON.stringify(diff)).not.toContain('HISTORICAL_PREFIX');
+    expect(JSON.stringify(diff)).not.toContain('unchanged suffix');
   });
 
   it('maps a tool_call_update to a patch upsert carrying only present fields', () => {

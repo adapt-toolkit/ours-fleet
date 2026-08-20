@@ -218,6 +218,23 @@ describe('loadConfig', () => {
     expect(() => loadConfig()).toThrow(/loopback-only/);
   });
 
+  it('enables conservative worklog bounds by default with partial overrides and opt-out', () => {
+    base('roles:\n  A: {}\n');
+    expect(findRole(loadConfig(), 'A').worklog).toEqual({
+      max_kb: 1024, keep_tail_kb: 256, max_archives: 12,
+    });
+    base('defaults:\n  worklog: { max_kb: 2048 }\nroles:\n  A:\n    worklog: { keep_tail_kb: 128 }\n  B:\n    worklog: false\n');
+    expect(findRole(loadConfig(), 'A').worklog).toEqual({
+      max_kb: 2048, keep_tail_kb: 128, max_archives: 12,
+    });
+    expect(findRole(loadConfig(), 'B').worklog).toBeUndefined();
+    base('defaults:\n  worklog: false\nroles:\n  A: {}\n  B:\n    worklog: { max_kb: 512, keep_tail_kb: 64 }\n');
+    expect(findRole(loadConfig(), 'A').worklog).toBeUndefined();
+    expect(findRole(loadConfig(), 'B').worklog).toEqual({
+      max_kb: 512, keep_tail_kb: 64, max_archives: 12,
+    });
+  });
+
   it('keeps model and recovery-chain defaults scoped to their harness', () => {
     base([
       'defaults:',

@@ -75,11 +75,25 @@ export interface CappedText {
   bytes: number;
   truncated?: true;
   digest?: string;
+  /** Bytes omitted from the front when the retained fragment is a tail. */
+  omittedPrefixBytes?: number;
 }
 
 export type NormalizedToolContent =
   | { type: 'content'; content: NormalizedContentBlock }
-  | { type: 'diff'; path: string; newText: CappedText; oldText?: CappedText }
+  | {
+      type: 'diff';
+      path: string;
+      newText: CappedText;
+      oldText?: CappedText;
+      /** Additive provenance for oversized snapshot diffs reduced to their changed region. */
+      operation?: 'append' | 'edit' | 'delete';
+      beforeBytes?: number;
+      afterBytes?: number;
+      commonPrefixBytes?: number;
+      commonSuffixBytes?: number;
+      bounded?: true;
+    }
   /** A tool-owned display terminal reference — never a PTY attachment. */
   | { type: 'terminal'; terminalId: string };
 

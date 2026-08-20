@@ -21,6 +21,8 @@ import type {
 
 /** Cap for any single normalized text payload (spec §5.3). */
 export const MAX_TEXT_BYTES = 256 * 1024;
+/** Cap for each retained side of an oversized snapshot-style file diff. */
+export const MAX_DIFF_TEXT_BYTES = 64 * 1024;
 /** Cap for one adapter `_meta` namespace value. */
 export const MAX_META_BYTES = 16 * 1024;
 /** Cap for serialized raw tool input/output retained as structured JSON. */
@@ -78,6 +80,88 @@ function cappedText(raw: unknown, redact?: string): CappedText {
   return {
     text: truncateUtf8(text, MAX_TEXT_BYTES), bytes,
     truncated: true, digest: digest24(text),
+  };
+}
+
+/** Keep the newest complete UTF-8/line-aligned tail inside a byte budget. */
+function cappedTextTail(text: string, maxBytes: number): CappedText {
+  const buffer = Buffer.from(text);
+  const bytes = buffer.length;
+  if (bytes <= maxBytes) return { text, bytes };
+  let start = bytes - maxBytes;
+  while (start < bytes && (buffer[start] & 0xc0) === 0x80) start++;
+  const newline = buffer.indexOf(0x0a, start);
+  if (newline >= 0 && newline + 1 < bytes) start = newline + 1;
+  return {
+    text: buffer.subarray(start).toString('utf8'), bytes,
+    truncated: true, digest: digest24(text), omittedPrefixBytes: start,
+  };
+}
+
+/** Common unchanged edges in UTF-16 indices, adjusted away from split surrogates. */
+function commonEdges(oldText: string, newText: string): { prefix: number; suffix: number } {
+  const limit = Math.min(oldText.length, newText.length);
+  let prefix = 0;
+  while (prefix < limit && oldText.charCodeAt(prefix) === newText.charCodeAt(prefix)) prefix++;
+  if (prefix > 0 && prefix < limit
+      && oldText.charCodeAt(prefix) >= 0xdc00 && oldText.charCodeAt(prefix) <= 0xdfff)
+    prefix--;
+
+  let oldEnd = oldText.length;
+  let newEnd = newText.length;
+  while (oldEnd > prefix && newEnd > prefix
+      && oldText.charCodeAt(oldEnd - 1) === newText.charCodeAt(newEnd - 1)) {
+    oldEnd--;
+    newEnd--;
+  }
+  // A suffix must never begin at the low half of a surrogate pair.
+  if (oldEnd < oldText.length && oldText.charCodeAt(oldEnd) >= 0xdc00
+      && oldText.charCodeAt(oldEnd) <= 0xdfff) {
+    oldEnd++;
+    newEnd++;
+  }
+  return { prefix, suffix: oldText.length - oldEnd };
+}
+
+function normalizedDiff(
+  item: Record<string, unknown>, redact?: string,
+): Extract<NormalizedToolContent, { type: 'diff' }> {
+  const path = asString(item.path) ?? '';
+  const oldText = asString(item.oldText);
+  const newText = asString(item.newText) ?? '';
+  // Preserve the established small-diff contract exactly. Redacted turns also
+  // retain their established placeholder shape and never derive private text.
+  if (redact !== undefined || oldText === undefined
+      || (Buffer.byteLength(oldText) <= MAX_TEXT_BYTES
+        && Buffer.byteLength(newText) <= MAX_TEXT_BYTES)) {
+    return {
+      type: 'diff', path,
+      newText: cappedText(newText, redact),
+      ...(oldText !== undefined ? { oldText: cappedText(oldText, redact) } : {}),
+    };
+  }
+
+  // ACP adapters may describe an append by sending two complete file snapshots.
+  // Persist only the changed region: otherwise a multi-megabyte historical file
+  // contributes its prefix twice while the current append disappears past the cap.
+  const { prefix, suffix } = commonEdges(oldText, newText);
+  const oldEnd = oldText.length - suffix;
+  const newEnd = newText.length - suffix;
+  const oldDelta = oldText.slice(prefix, oldEnd);
+  const newDelta = newText.slice(prefix, newEnd);
+  const beforeBytes = Buffer.byteLength(oldText);
+  const afterBytes = Buffer.byteLength(newText);
+  const commonPrefixBytes = Buffer.byteLength(oldText.slice(0, prefix));
+  const commonSuffixBytes = Buffer.byteLength(oldText.slice(oldEnd));
+  const operation = oldDelta.length === 0 && prefix === oldText.length
+    ? 'append' as const
+    : newDelta.length === 0 ? 'delete' as const : 'edit' as const;
+  return {
+    type: 'diff', path, operation, beforeBytes, afterBytes,
+    commonPrefixBytes, commonSuffixBytes, bounded: true,
+    newText: cappedTextTail(newDelta, MAX_DIFF_TEXT_BYTES),
+    ...(oldDelta.length > 0
+      ? { oldText: cappedTextTail(oldDelta, MAX_DIFF_TEXT_BYTES) } : {}),
   };
 }
 
@@ -220,12 +304,7 @@ function normalizeToolContent(raw: unknown, redact?: string): NormalizedToolCont
   return raw.filter(isRecord).map((item): NormalizedToolContent => {
     switch (item.type) {
       case 'diff':
-        return {
-          type: 'diff',
-          path: asString(item.path) ?? '',
-          newText: cappedText(item.newText, redact),
-          ...(item.oldText != null ? { oldText: cappedText(item.oldText, redact) } : {}),
-        };
+        return normalizedDiff(item, redact);
       case 'terminal':
         return { type: 'terminal', terminalId: asString(item.terminalId) ?? '' };
       case 'content':

@@ -8,8 +8,9 @@ import { AcpSession, promptContentBlocks, runtimeSelector } from '../src/session
 import { ConversationEventStore } from '../src/session/conversation-store.js';
 import type {
   ConversationEventV1, MessageChunkPayload, PermissionResolvedPayload,
-  PromptAdmittedPayload, TurnCompletedPayload,
+  PromptAdmittedPayload, ToolUpsertPayload, TurnCompletedPayload,
 } from '../src/session/conversation-types.js';
+import { MAX_DIFF_TEXT_BYTES } from '../src/session/conversation-normalizer.js';
 
 const fixture = join(dirname(fileURLToPath(import.meta.url)), 'fixtures', 'acp-agent.mjs');
 const dirs: string[] = [];
@@ -124,6 +125,24 @@ describe('AcpSession conversation ledger', () => {
       && (event.payload as MessageChunkPayload).role === 'user'
       && event.messageId === 'user-1');
     expect(userChunk?.source).toBe('agent');
+  });
+
+  it('persists only the bounded current delta from a multi-megabyte WORKLOG append', async () => {
+    const { session } = await start();
+    await session.submitPrompt('large worklog append');
+    const event = events(session).find(candidate =>
+      candidate.kind === 'tool.upsert' && candidate.toolCallId === 'large-worklog-edit');
+    expect(event).toBeDefined();
+    const payload = event!.payload as ToolUpsertPayload;
+    const diff = payload.content?.[0];
+    expect(diff).toMatchObject({
+      type: 'diff', operation: 'append', bounded: true,
+      newText: { text: expect.stringContaining('CURRENT_SESSION_APPEND') },
+    });
+    const serialized = JSON.stringify(event);
+    expect(Buffer.byteLength(serialized)).toBeLessThan(MAX_DIFF_TEXT_BYTES + 4_096);
+    expect(serialized).not.toContain('ours-mcp start');
+    expect(serialized).not.toContain('historical-line');
   });
 
   it('accepts browser prompts idempotently and durably before acknowledging', async () => {

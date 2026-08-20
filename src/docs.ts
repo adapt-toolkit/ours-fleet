@@ -697,10 +697,23 @@ escape hatch.
 
 ## Bounded worklogs, auth proxy, and model recovery
 
-An optional \`worklog: { max_kb, keep_tail_kb, max_archives }\` policy rotates a
-stable snapshot at fleet-owned lifecycle points. Concurrent changes defer
-rotation. Archives remain beside WORKLOG.md with the same sensitive-state
-boundary; retention deletes only recognized fleet archive names.
+WORKLOG rotation is enabled by default with
+\`worklog: { max_kb: 1024, keep_tail_kb: 256, max_archives: 12 }\`. Maps may
+override individual values; \`worklog: false\` on a role or in defaults opts out.
+Fleet rotates only at that role's launch/resume lifecycle boundary. Concurrent
+changes defer rotation. The active file keeps a UTF-8 whole-line tail, the
+complete prior inode receives a collision-safe UTC archive name, and
+\`.worklog-rotation.json\` records restart provenance. \`max_archives\` bounds
+recent archives beside WORKLOG.md; older complete archives move to
+\`WORKLOG.archives/\` without deletion. All archives share the role's sensitive
+state boundary.
+
+ACP tool diffs are bounded before entering web conversation events. Existing
+small before/after diffs are unchanged. Oversized whole-file snapshots are
+reduced to the actual changed region plus path, operation, original byte counts,
+digest, and omission metadata; each retained side is a UTF-8/whole-line tail of
+at most 64 KiB. A large append therefore retains current appended content, not
+the historical prefix.
 
 \`auth_proxy: { kind: anthropic, base_url, required, health_url }\` is Claude-only
 and loopback-only. Fleet injects only ANTHROPIC_BASE_URL and doctor rejects

@@ -136,6 +136,27 @@ const emitRichTurn = text => {
   ] });
 };
 
+// Production-shaped Codex edit event: adapters commonly report an append as
+// complete before/after file snapshots. Keep the fixture multi-megabyte so the
+// durable ACP path, not only the pure normalizer, proves the historical prefix
+// cannot reach web conversation events.
+const emitLargeWorklogAppend = () => {
+  const oldText = 'HISTORICAL_MARKER ours-mcp start\n' + 'historical-line\n'.repeat(220_000);
+  const appended = 'CURRENT_SESSION_APPEND žluťoučký kůň 🧪\nsecond-current-line\n';
+  update({
+    sessionUpdate: 'tool_call_update',
+    toolCallId: 'large-worklog-edit',
+    title: 'Edit WORKLOG.md',
+    kind: 'edit',
+    status: 'completed',
+    locations: [{ path: `${process.cwd()}/WORKLOG.md` }],
+    content: [{
+      type: 'diff', path: `${process.cwd()}/WORKLOG.md`,
+      oldText, newText: oldText + appended,
+    }],
+  });
+};
+
 createInterface({ input: process.stdin }).on('line', line => {
   const message = JSON.parse(line);
   if ('result' in message || 'error' in message) {
@@ -284,6 +305,9 @@ createInterface({ input: process.stdin }).on('line', line => {
         // releases itself so the test never depends on a second prompt getting
         // through — prompts are serialized, so one never could.
         setTimeout(() => answerPrompt(message.id, 'end_turn'), Number(slow[1] ?? 800));
+      } else if (/\blarge worklog append\b/i.test(text)) {
+        emitLargeWorklogAppend();
+        answerPrompt(message.id, stopReasonFor(text));
       } else if (/\brich\b/i.test(text)) {
         emitRichTurn(text);
         answerPrompt(message.id, stopReasonFor(text));

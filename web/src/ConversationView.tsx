@@ -273,11 +273,28 @@ function TurnBlock({ turn, onDecide }: {
 
 function ToolContent({ content }: { content: Record<string, unknown> }) {
   if (content.type === 'diff') {
-    const oldText = content.oldText as { text?: string } | undefined;
-    const newText = content.newText as { text?: string } | undefined;
-    return <div className="tool-content"><strong>Diff · {String(content.path ?? '')}</strong>
+    const oldText = content.oldText as {
+      text?: string; bytes?: number; truncated?: true; omittedPrefixBytes?: number;
+    } | undefined;
+    const newText = content.newText as {
+      text?: string; bytes?: number; truncated?: true; omittedPrefixBytes?: number;
+    } | undefined;
+    const operation = typeof content.operation === 'string' ? content.operation : 'diff';
+    const bounded = content.bounded === true;
+    return <div className="tool-content"><strong>{operation === 'diff' ? 'Diff' : operation} · {String(content.path ?? '')}</strong>
+      {bounded && <small className="muted">Current change only
+        {typeof content.beforeBytes === 'number' && typeof content.afterBytes === 'number'
+          ? ` · file ${content.beforeBytes} → ${content.afterBytes} bytes` : ''}
+        {typeof content.commonPrefixBytes === 'number'
+          ? ` · ${content.commonPrefixBytes} unchanged prefix bytes omitted` : ''}
+      </small>}
       {oldText && <pre className="diff-old">{oldText.text}</pre>}
       <pre className="diff-new">{newText?.text}</pre>
+      {(oldText?.truncated || newText?.truncated) && <small className="muted">
+        Retained bounded tail
+        {newText?.bytes !== undefined ? ` · current side ${newText.bytes} bytes` : ''}
+        {newText?.omittedPrefixBytes ? ` · ${newText.omittedPrefixBytes} leading bytes omitted` : ''}
+      </small>}
     </div>;
   }
   if (content.type === 'terminal')

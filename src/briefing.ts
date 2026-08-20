@@ -195,8 +195,10 @@ export function generateBriefing(role: ResolvedRole, v: BriefingVocab, opts: Bri
   L.push('it survives restarts.');
   if (role.worklog) {
     L.push(`Fleet rotates it above ${role.worklog.max_kb} KiB, keeps approximately the newest ` +
-      `${role.worklog.keep_tail_kb} KiB here, and retains ${role.worklog.max_archives} archives ` +
-      'beside it. Continue writing only WORKLOG.md.');
+      `${role.worklog.keep_tail_kb} KiB here, and keeps ${role.worklog.max_archives} recent archives ` +
+      'beside it. Older complete archives move to WORKLOG.archives without deletion; ' +
+      '.worklog-rotation.json identifies the latest archive for restart provenance. ' +
+      'Continue writing only WORKLOG.md.');
   }
   L.push('', '## Routines');
   L.push(`If \`${opts.routinesPath}\` exists, re-read it at the START of every wake — before acting`);

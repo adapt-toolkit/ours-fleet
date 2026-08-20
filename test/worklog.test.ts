@@ -1,11 +1,14 @@
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import {
-  appendFileSync, chmodSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync,
+  appendFileSync, chmodSync, existsSync, mkdtempSync, readdirSync, readFileSync, rmSync,
+  statSync, writeFileSync,
 } from 'node:fs';
 import { fork } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { inspectWorklog, rotateWorklog } from '../src/worklog.js';
+import {
+  inspectWorklog, rotateWorklog, WORKLOG_ARCHIVE_DIR,
+} from '../src/worklog.js';
 
 let dir: string;
 let path: string;
@@ -50,7 +53,7 @@ describe('worklog rotation', () => {
     expect(readFileSync(path, 'utf8')).toBe(`${original}concurrent\n`);
   });
 
-  it('never overwrites an append in the true rename-to-publish commit window', () => {
+  it('preserves an append after archive publication without a missing-live-file window', () => {
     const original = 'old\n'.repeat(1000);
     writeFileSync(path, original);
     const result = rotateWorklog(path, policy, {
@@ -60,7 +63,72 @@ describe('worklog rotation', () => {
     const retained = readFileSync(result.archivePath!, 'utf8') + readFileSync(path, 'utf8');
     expect(retained).toContain(original);
     expect(retained).toContain('commit-window-ack\n');
-    expect(readFileSync(path, 'utf8')).toBe('commit-window-ack\n');
+    expect(readFileSync(result.archivePath!, 'utf8')).toContain('commit-window-ack\n');
+    expect(readFileSync(path, 'utf8').length).toBeLessThanOrEqual(1024);
+  });
+
+  it('rotates only above the threshold and remains bounded on repeated rotations', () => {
+    writeFileSync(path, 'x'.repeat(policy.max_kb * 1024));
+    expect(rotateWorklog(path, policy).rotated).toBe(false);
+    appendFileSync(path, 'x');
+    expect(rotateWorklog(path, policy, {
+      now: () => new Date('2026-08-20T10:00:00.000Z'),
+    }).rotated).toBe(true);
+    expect(statSync(path).size).toBeLessThanOrEqual(policy.keep_tail_kb * 1024);
+    appendFileSync(path, '\n' + 'y'.repeat(policy.max_kb * 1024));
+    expect(rotateWorklog(path, policy, {
+      now: () => new Date('2026-08-20T10:00:00.000Z'),
+    }).rotated).toBe(true);
+    expect(statSync(path).size).toBeLessThanOrEqual(policy.keep_tail_kb * 1024);
+    const archives = readdirSync(dir).filter(name => /^WORKLOG\..*\.md$/.test(name));
+    expect(archives).toEqual(expect.arrayContaining([
+      'WORKLOG.2026-08-20T10-00-00.000Z.md',
+      'WORKLOG.2026-08-20T10-00-00.000Z.1.md',
+    ]));
+  });
+
+  it('moves excess recent archives to lossless cold storage instead of deleting them', () => {
+    const oneRecent = { ...policy, max_archives: 1 };
+    const first = 'FIRST-COMPLETE-SNAPSHOT\n' + 'a\n'.repeat(2_000);
+    writeFileSync(path, first);
+    const firstRotation = rotateWorklog(path, oneRecent, {
+      now: () => new Date('2026-08-20T10:00:00.000Z'),
+    });
+    appendFileSync(path, 'SECOND-CURRENT-SNAPSHOT\n' + 'b\n'.repeat(2_000));
+    const secondRotation = rotateWorklog(path, oneRecent, {
+      now: () => new Date('2026-08-20T10:00:00.000Z'),
+    });
+    expect(firstRotation.rotated && secondRotation.rotated).toBe(true);
+    const recent = readdirSync(dir).filter(name => /^WORKLOG\..*\.md$/.test(name));
+    expect(recent).toHaveLength(1);
+    expect(recent[0]).toContain('.1.md');
+    const coldDir = join(dir, WORKLOG_ARCHIVE_DIR);
+    const cold = readdirSync(coldDir);
+    expect(cold).toHaveLength(1);
+    expect(readFileSync(join(coldDir, cold[0]), 'utf8')).toBe(first);
+    expect(readFileSync(secondRotation.archivePath!, 'utf8'))
+      .toContain('SECOND-CURRENT-SNAPSHOT');
+    const status = JSON.parse(readFileSync(join(dir, '.worklog-rotation.json'), 'utf8'));
+    expect(status).toMatchObject({
+      archive: 'WORKLOG.2026-08-20T10-00-00.000Z.1.md',
+      olderArchives: WORKLOG_ARCHIVE_DIR,
+      recentArchiveLimit: 1,
+      archiveContainsFullSnapshot: true,
+    });
+  });
+
+  it('leaves the complete live file and published archive recoverable on commit error', () => {
+    const original = 'ERROR-SAFE\n' + 'line\n'.repeat(1_000);
+    writeFileSync(path, original);
+    expect(() => rotateWorklog(path, policy, {
+      now: () => new Date('2026-08-20T10:00:00.000Z'),
+      afterArchiveRename: () => { throw new Error('simulated crash boundary'); },
+    })).toThrow(/simulated crash boundary/);
+    expect(readFileSync(path, 'utf8')).toBe(original);
+    const archive = join(dir, 'WORKLOG.2026-08-20T10-00-00.000Z.md');
+    expect(readFileSync(archive, 'utf8')).toBe(original);
+    expect(existsSync(join(dir, '.worklog-rotation.json'))).toBe(false);
+    expect(readdirSync(dir).some(name => name.endsWith('.rotate'))).toBe(false);
   });
 
   it('retains every acknowledged cross-process append across rotation', async () => {
