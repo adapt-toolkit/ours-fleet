@@ -572,6 +572,19 @@ describe('runOnce ACP startup outcome (1.2)', () => {
     expect(logs.some(l => l.includes('[A] up;'))).toBe(false);
   });
 
+  it('fails a startup turn that never reaches a terminal result', async () => {
+    writeCfg({ A: {
+      harness: 'fake-acp', session: 'acp',
+      env: { ACP_FIXTURE_PROMPT_DELAY_MS: '1000' },
+    } });
+    mkdirSync(agentDir('A'), { recursive: true });
+    const { deps, logs } = acpDeps();
+
+    await expect(runOnce('A', {}, { ...deps, acpStartupTimeoutMs: 10 }))
+      .rejects.toThrow(/startup prompt did not finish within 10ms/);
+    expect(logs.some(l => l.includes('[A] up;'))).toBe(false);
+  });
+
   it('keeps only typed temp wake cancellations nonterminal at startup', () => {
     const cancelled = (source?: Parameters<typeof turnResult>[4]) =>
       turnResult(true, 'cancelled', 'cancelled', undefined, source);

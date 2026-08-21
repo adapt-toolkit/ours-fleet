@@ -144,6 +144,15 @@ describe('doctor', () => {
         stderr: '',
         code: 0,
       },
+      'codex mcp': {
+        stdout: JSON.stringify([{ name: 'ours', enabled: true, transport: {
+          type: 'stdio', command: 'node', args: ['bin/proxy.mjs'], cwd: '/plugin',
+        } }]),
+        stderr: '', code: 0,
+      },
+      'node bin/proxy.mjs': {
+        stdout: '', stderr: 'ours: MCP server v0.18.0 ready (transport=stdio)', code: 0,
+      },
       'sh -c': { stdout: '', stderr: '', code: 1 },
     }), 'darwin');
     const acp = rep.checks.find(c => c.name === 'acp: Coder')!;

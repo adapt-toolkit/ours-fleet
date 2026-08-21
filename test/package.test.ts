@@ -54,9 +54,19 @@ describe('packed root package', () => {
         const { makeCodexAdapter } = await import(
           pathToFileURL(join(fleetRoot, 'dist', 'harness', 'codex.js')).href
         );
-        const adapter = makeCodexAdapter(async cmd => ({
-          code: cmd === 'sh' ? 1 : 0, stdout: '', stderr: '',
-        }));
+        const adapter = makeCodexAdapter(async (cmd, args) => {
+          if (cmd === 'codex' && args[0] === 'mcp') return {
+            code: 0, stderr: '', stdout: JSON.stringify([{
+              name: 'ours', enabled: true, transport: {
+                type: 'stdio', command: 'node', args: ['bin/proxy.mjs'], cwd: '/plugin',
+              },
+            }]),
+          };
+          if (cmd === 'node') return {
+            code: 0, stdout: '', stderr: 'ours: MCP server v0.18.0 ready (transport=stdio)',
+          };
+          return { code: cmd === 'sh' ? 1 : 0, stdout: '', stderr: '' };
+        });
         const role = {
           name: 'PackedConsumer',
           harness: 'codex',
