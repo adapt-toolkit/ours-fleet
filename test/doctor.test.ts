@@ -10,6 +10,7 @@ import '../src/harness/claude-code.js';   // registers the production adapters
 import '../src/harness/codex.js';
 import type { Exec, ExecResult } from '../src/exec.js';
 import type { FetchLike } from '../src/monitor.js';
+import type { AttachOursClientOptions, OursClient } from '@ours.network/sdk/client';
 import { cliPath, installPrefix, pkgRoot } from './install-fixtures.js';
 
 // A stub daemon-API for the monitor reachability probe (design §5).
@@ -48,12 +49,20 @@ afterEach(() => {
 // report and fail tests about tmux or linger. Provenance tests pass their own
 // installScan; nothing else may inherit the environment's.
 const ISOLATED_SCAN = { path: '', argv1: undefined };
+const HEALTHY_DAEMON_INFO = {
+  name: 'ours', version: '2.0.1', compat: 2, protocol: 1, pid: 1234, stateDir: '/s',
+};
+type DoctorDaemonClient = Pick<OursClient, 'version'>;
+const healthyDaemon = async (_options: AttachOursClientOptions): Promise<DoctorDaemonClient> => ({
+  version: async () => HEALTHY_DAEMON_INFO,
+});
 const doctor = (
   opts: Parameters<typeof doctorImpl>[0] = {},
   exec?: Parameters<typeof doctorImpl>[1],
   platform?: Parameters<typeof doctorImpl>[2],
   fetchImpl?: Parameters<typeof doctorImpl>[3],
-) => doctorImpl({ installScan: ISOLATED_SCAN, ...opts }, exec, platform, fetchImpl);
+  attachDaemon: Parameters<typeof doctorImpl>[4] = healthyDaemon,
+) => doctorImpl({ installScan: ISOLATED_SCAN, ...opts }, exec, platform, fetchImpl, attachDaemon);
 
 const execWith = (table: Record<string, ExecResult>): Exec =>
   async (cmd, args) => table[[cmd, args[0] ?? ''].join(' ')] ?? { stdout: '', stderr: '', code: 0 };
@@ -78,28 +87,22 @@ describe('doctor', () => {
       'ours version': { stdout: JSON.stringify({ name: '@ours.network/cli', version: '1.0.1' }), stderr: '', code: 0 },
       'ours daemon': { stdout: JSON.stringify({ state: 'stopped' }), stderr: '', code: 3 },
       'loginctl show-user': { stdout: 'Linger=yes', stderr: '', code: 0 },
-    }), 'linux');
+    }), 'linux', undefined, async () => { throw new TypeError('fetch failed'); });
     const d = rep.checks.find(c => c.name === 'ours daemon')!;
     expect(d.ok).toBe(false);
     expect(d.detail).toContain('ours daemon start');
   });
 
-  it('refuses to infer CLI or daemon status from English output', async () => {
-    const cliProse = await doctor({}, execWith({
-      'tmux -V': { stdout: 'tmux 3.6', stderr: '', code: 0 },
-      'ours version': { stdout: 'ours 1.0.1', stderr: '', code: 0 },
-    }), 'darwin');
-    expect(cliProse.checks.find(c => c.name === 'ours CLI')).toMatchObject({ ok: false });
-    expect(cliProse.checks.some(c => c.name === 'ours daemon')).toBe(false);
-
-    const daemonProse = await doctor({}, execWith({
-      'tmux -V': { stdout: 'tmux 3.6', stderr: '', code: 0 },
-      'ours version': {
-        stdout: JSON.stringify({ name: '@ours.network/cli', version: '1.0.1' }), stderr: '', code: 0,
-      },
-      'ours daemon': { stdout: 'running', stderr: '', code: 0 },
-    }), 'darwin');
-    expect(daemonProse.checks.find(c => c.name === 'ours daemon')).toMatchObject({ ok: false });
+  it('checks the daemon through the SDK without executing the ours CLI', async () => {
+    const commands: string[] = [];
+    const rep = await doctor({}, async (cmd, args) => {
+      commands.push([cmd, ...args].join(' '));
+      return { stdout: '', stderr: '', code: 0 };
+    }, 'darwin');
+    expect(rep.checks.find(c => c.name === 'ours daemon')).toMatchObject({
+      ok: true, detail: 'running (2.0.1)',
+    });
+    expect(commands.every(command => !command.startsWith('ours '))).toBe(true);
   });
 
   it('reports linger only on linux and passes when all green', async () => {
@@ -482,7 +485,7 @@ describe('doctor config validity (1.4)', () => {
   it('keeps running the host checks when the config is invalid', async () => {
     writeCfg('roles:\n  A:\n    harnes: fake\n');
     const rep = await run();
-    for (const name of ['node', 'tmux', 'ours CLI', 'ours daemon', 'linger', 'user bus'])
+    for (const name of ['node', 'tmux', 'ours daemon', 'linger', 'user bus'])
       expect(rep.checks.find(c => c.name === name), name).toBeDefined();
   });
 

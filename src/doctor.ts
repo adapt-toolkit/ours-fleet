@@ -1,5 +1,8 @@
 import { userInfo } from 'node:os';
 import { existsSync, readFileSync } from 'node:fs';
+import {
+  attachOursClient, type AttachOursClientOptions, type OursClient,
+} from '@ours.network/sdk/client';
 import { realExec, type Exec } from './exec.js';
 import { isolationContextFor, loadConfig, type ResolvedRole } from './config.js';
 import type { ConfigDiagnostic, YamlMode } from './config-yaml.js';
@@ -35,6 +38,11 @@ interface MonitorProfile {
   endpoint: DaemonEndpoint;
   roles: string[];
 }
+
+type DoctorDaemonClient = Pick<OursClient, 'version'>;
+type AttachDoctorDaemon = (
+  options: AttachOursClientOptions,
+) => Promise<DoctorDaemonClient>;
 
 /** Resolve and deduplicate the effective daemon profiles used by monitored roles. */
 function resolveMonitorProfiles(roles: ResolvedRole[]): MonitorProfile[] {
@@ -99,6 +107,7 @@ export async function doctor(
   exec: Exec = realExec,
   platform: NodeJS.Platform = process.platform,
   fetchImpl: FetchLike = (u, i) => globalThis.fetch(u, i) as unknown as ReturnType<FetchLike>,
+  attachDaemon: AttachDoctorDaemon = attachOursClient,
 ): Promise<PrereqReport> {
   const checks: PrereqCheck[] = [];
 
@@ -138,36 +147,21 @@ export async function doctor(
     });
   }
 
-  const ours = await exec('ours', ['version', '--json']);
-  let oursVersion: string | undefined;
-  if (ours.code === 0) {
-    try {
-      const value = JSON.parse(ours.stdout) as { name?: unknown; version?: unknown };
-      if (value.name === '@ours.network/cli' && typeof value.version === 'string')
-        oursVersion = value.version;
-    } catch { /* malformed structured output is a failed prerequisite below */ }
-  }
-  checks.push({
-    name: 'ours CLI', ok: oursVersion !== undefined,
-    detail: oursVersion
-      ? `@ours.network/cli ${oursVersion}`
-      : 'not found or invalid structured output — npm i -g @ours.network/cli',
-  });
-  if (oursVersion !== undefined) {
-    const st = await exec('ours', ['daemon', 'status', '--json']);
-    let state: string | undefined;
-    try {
-      const value = JSON.parse(st.stdout) as { state?: unknown };
-      if (typeof value.state === 'string') state = value.state;
-    } catch { /* malformed structured output fails closed */ }
-    const running = st.code === 0 && state === 'running';
+  try {
+    const client = await attachDaemon({
+      env: process.env,
+      leaseToken: `ours-fleet-doctor-${process.pid}`,
+      clientPid: process.pid,
+    });
+    const info = await client.version();
+    if (info.name !== 'ours' || typeof info.version !== 'string')
+      throw new Error('the selected endpoint did not return a valid ours daemon identity');
+    checks.push({ name: 'ours daemon', ok: true, detail: `running (${info.version})` });
+  } catch (error) {
     checks.push({
-      name: 'ours daemon', ok: running,
-      detail: running
-        ? 'running'
-        : state === 'stopped' || st.code === 3
-          ? 'not running — start it with: ours daemon start'
-          : 'status check returned invalid structured output — run: ours daemon status --json',
+      name: 'ours daemon', ok: false,
+      detail: `not reachable through the SDK — start it with: ours daemon start `
+        + `[${(error as Error)?.message ?? String(error)}]`,
     });
   }
 
