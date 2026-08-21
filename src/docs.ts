@@ -554,12 +554,16 @@ mode-0600 files and are removed after completion or bounded stale retention.
 
 Voice prompts include a bounded transcript only when typed daemon metadata reports success.
 Failure or unavailability is explicit and preserves the private audio path as the
-fallback. Run \`ours config show --json\` and inspect \`sttConfigured\` without
+input for direct review. Run \`ours config show --json\` and inspect \`sttConfigured\` without
 revealing provider credentials.
-A mode-0600 crash journal contains only authenticated CID and wire routing data;
-it never stores captions, filenames, paths, transcript text, or bytes. Journaled
-post-retrieval files resume selectively through \`save_file\`. A deferred agent
-caption is replayed with its processed files before the group is admitted. Fleet
+A mode-0600 message claim journal stores only wire ID, persistent-history
+sequence, and claim time. Fleet journals the exact body-free oldest-first slice
+before calling \`getMessages\` with that slice length, rejects a returned set
+mismatch, and loads a crash-recovered body only through \`getHistoryItem\`.
+The attachment crash journal contains only authenticated CID and wire routing
+data; it never stores captions, filenames, paths, transcript text, or bytes.
+Journaled read files resume through \`getFileInfo\` and \`fetchFile\`. A claimed
+agent caption is loaded from history and rejoined before the group is admitted. Fleet
 resolves one authenticated owner route before retrieving bytes, admits every file
 before emitting the caption or any file, and sends every part to that same route.
 Unknown correlated routes remain queued without retrieval and receive one bounded

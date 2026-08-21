@@ -12,6 +12,7 @@ import type {
 } from '../src/owner-channel/ours-client.js';
 import { OWNER_TASK_MAX_PER_OWNER, OWNER_TASK_TTL_MS } from '../src/owner-channel/tasks.js';
 import type { SessionHandle } from '../src/session/types.js';
+import { historyMessage, incomingMessage } from './owner-history-fixtures.js';
 
 const OWNER = 'A'.repeat(64);
 const CONTACT = 'B'.repeat(64);
@@ -22,6 +23,7 @@ const dirs: string[] = [];
 class ManagementClient implements OursOps {
   calls: Array<{ name: string; args?: Record<string, unknown> }> = [];
   batches: unknown[][] = [];
+  history = new Map<string, OursInboundMessage>();
   /**
    * Established contacts and pending introductions are separate daemon
    * collections, and neither carries a bio or any other free text.
@@ -57,13 +59,27 @@ class ManagementClient implements OursOps {
     this.calls.push({ name: 'addContact', args: { ...a } });
     return { display: a.name ?? 'Phone', cid: CONTACT };
   }
-  async getMessages() {
-    this.calls.push({ name: 'getMessages', args: undefined });
-    const messages = (this.batches.shift() ?? []) as OursInboundMessage[];
-    return { count: messages.length, messages };
+  async listIncomingMessages() {
+    this.calls.push({ name: 'listIncomingMessages', args: undefined });
+    const batch = this.batches[0] ?? [];
+    if (!batch.length) this.batches.shift();
+    return batch.map((item, index) => {
+      const persistent = historyMessage(item, index + 1);
+      this.history.set(persistent.wire_id, persistent);
+      return incomingMessage(item, index + 1);
+    });
   }
-  async deferMessages(msgIds: number[]) {
-    this.calls.push({ name: 'deferMessages', args: { msgIds } });
+  async getMessages(limit: number) {
+    this.calls.push({ name: 'getMessages', args: { limit } });
+    const batch = this.batches.shift() ?? [];
+    const messages = batch.slice(0, limit).map((item, index) => historyMessage(item, index + 1));
+    for (const message of messages) this.history.set(message.wire_id, message);
+    if (batch.length > limit) this.batches.unshift(batch.slice(limit));
+    return { count: messages.length, messages, remaining: Math.max(0, batch.length - limit) };
+  }
+  async getHistoryItem(wireId: string) {
+    this.calls.push({ name: 'getHistoryItem', args: { wireId } });
+    return this.history.get(wireId) ?? null;
   }
   watchNotifications(
     identity: string, options?: { since?: number | 'tip'; signal?: AbortSignal },
@@ -81,6 +97,10 @@ class ManagementClient implements OursOps {
   async listIncomingFiles() {
     this.calls.push({ name: 'listIncomingFiles', args: undefined });
     return [];
+  }
+  async getFileInfo(wireId: string) {
+    this.calls.push({ name: 'getFileInfo', args: { wireId } });
+    return null;
   }
   async getFiles(wireIds: string[]) {
     this.calls.push({ name: 'getFiles', args: { wireIds } });
@@ -257,7 +277,7 @@ describe('OwnerChannel live management', () => {
     await vi.waitFor(() => expect(watch.readState().reason).toBe('OWNER_WATCH_CONNECTED'));
     await watch.channel.close();
     expect(watch.logs.some(line => line.includes('OWNER_WATCH_STATE_RECOVERED'))).toBe(true);
-    expect(watch.client.calls[1]?.name).toBe('getMessages');
+    expect(watch.client.calls[1]?.name).toBe('listIncomingMessages');
     expect(watch.client.watchCalls[0]?.since).toBe(0);
   });
 
@@ -274,9 +294,8 @@ describe('OwnerChannel live management', () => {
       text: 'The verification run is halfway complete.',
       reply_to: { wire_id: 'owner-selects-route' },
     }, {
-      // Intra-root sibling delivery can have no ADAPT wire ID. The daemon's
-      // per-identity message ID remains a stable idempotency key.
-      msg_id: 3, wire_id: '', from: { id: AGENT },
+      // Persistent history supplies the stable wire and sequence idempotency key.
+      msg_id: 3, wire_id: 'agent-sibling-wire', from: { id: AGENT },
       text: 'I found a useful unassigned Trello item.',
     }], []);
     await channel.drain();
@@ -399,8 +418,9 @@ describe('OwnerChannel live management', () => {
       contact: AGENT, text: expect.stringContaining('queued'),
       replyToWireId: 'agent-unroutable',
     }]);
-    // The wire stays deferred and unconsumed for replay.
-    expect(client.calls).toContainEqual({ name: 'deferMessages', args: { msgIds: [31] } });
+    // The body-free claim stays journaled and history-recoverable for replay.
+    expect(readFileSync(join(dir, '.owner-channel-message-recovery.json'), 'utf8'))
+      .toContain('agent-unroutable');
     const statePath = join(dir, '.owner-channel-state.json');
     if (existsSync(statePath))
       expect(readFileSync(statePath, 'utf8')).not.toContain('agent-unroutable');

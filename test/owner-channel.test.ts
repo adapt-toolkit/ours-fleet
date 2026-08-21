@@ -12,11 +12,13 @@ import type {
   OursContactsView, OursInboundMessage, OursOps,
 } from '../src/owner-channel/ours-client.js';
 import { OWNER_COMMENT_LABEL, ownerNotices } from '../src/owner-channel/notices.js';
+import { MessageRecoveryState } from '../src/owner-channel/message-recovery.js';
 import {
   ACP_CANCEL_DEADLINE_EXCEEDED, SessionControlError,
   type SessionEvent, type SessionHandle, type TurnResult,
 } from '../src/session/types.js';
 import { VERSION } from '../src/version.js';
+import { historyMessage, incomingMessage } from './owner-history-fixtures.js';
 
 const OWNER_CID = 'A'.repeat(64);
 const OTHER_OWNER_CID = 'B'.repeat(64);
@@ -34,6 +36,7 @@ class FakeClient implements OursOps {
   batches: unknown[][] = [];
   /** Operation names (the `OursOps` methods) that must reject. */
   failTools = new Set<string>();
+  history = new Map<string, OursInboundMessage>();
   async start() {}
   async close() {}
   async bindIdentity(name: string) { this.record('bindIdentity', { name }); }
@@ -46,14 +49,28 @@ class FakeClient implements OursOps {
     this.record('addContact', { ...a });
     return { display: a.name ?? 'Peer', cid: 'F'.repeat(64) };
   }
-  async getMessages() {
-    // Deliberately ahead of the failure check, matching the daemon call the
-    // drain loop cannot proceed without.
-    this.calls.push({ name: 'getMessages', args: undefined });
-    const messages = (this.batches.shift() ?? []) as OursInboundMessage[];
-    return { count: messages.length, messages };
+  async listIncomingMessages() {
+    this.record('listIncomingMessages');
+    const batch = this.batches[0] ?? [];
+    if (!batch.length) this.batches.shift();
+    return batch.map((item, index) => {
+      const persistent = historyMessage(item, index + 1);
+      this.history.set(persistent.wire_id, persistent);
+      return incomingMessage(item, index + 1);
+    });
   }
-  async deferMessages(msgIds: number[]) { this.record('deferMessages', { msgIds }); }
+  async getMessages(limit: number) {
+    this.record('getMessages', { limit });
+    const batch = this.batches.shift() ?? [];
+    const messages = batch.slice(0, limit).map((item, index) => historyMessage(item, index + 1));
+    for (const message of messages) this.history.set(message.wire_id, message);
+    if (batch.length > limit) this.batches.unshift(batch.slice(limit));
+    return { count: messages.length, messages, remaining: Math.max(0, batch.length - limit) };
+  }
+  async getHistoryItem(wireId: string) {
+    this.record('getHistoryItem', { wireId });
+    return this.history.get(wireId) ?? null;
+  }
   async *watchNotifications(
     _identity: string, options?: { since?: number | 'tip'; signal?: AbortSignal },
   ) {
@@ -63,6 +80,7 @@ class FakeClient implements OursOps {
     });
   }
   async listIncomingFiles() { this.record('listIncomingFiles'); return []; }
+  async getFileInfo(wireId: string) { this.record('getFileInfo', { wireId }); return null; }
   async getFiles(wireIds: string[]) {
     this.record('getFiles', { wireIds });
     return { files: [], text: '', mode: 'selected' as const, requested: wireIds };
@@ -191,6 +209,58 @@ const done = (output: string): TurnResult =>
   ({ accepted: true, outcome: 'completed', succeeded: true, output });
 
 describe('OwnerChannel', () => {
+  it('does not call getMessages when the body-free preflight is empty', async () => {
+    const { channel, client } = setup([]);
+    await channel.drain();
+    expect(client.calls.some(call => call.name === 'listIncomingMessages')).toBe(true);
+    expect(client.calls.some(call => call.name === 'getMessages')).toBe(false);
+  });
+
+  it('fails closed when the claimed wire and sequence set differs from the journaled slice', async () => {
+    const expected = ownerMessage(10, 'wire-expected', '/status');
+    const { channel, client, queuePrompt, dir } = setup([expected]);
+    client.getMessages = async limit => {
+      client.calls.push({ name: 'getMessages', args: { limit } });
+      return {
+        count: 1, remaining: 0,
+        messages: [historyMessage(ownerMessage(11, 'wire-different', '/status'))],
+      };
+    };
+    await expect(channel.drain()).rejects.toThrow(/different message batch/);
+    expect(queuePrompt).not.toHaveBeenCalled();
+    expect(readFileSync(join(dir, '.owner-channel-message-recovery.json'), 'utf8'))
+      .toContain('wire-expected');
+  });
+
+  it('fails closed before claiming duplicate preflight metadata', async () => {
+    const duplicate = ownerMessage(10, 'wire-duplicate', '/status');
+    const { channel, client, queuePrompt, dir } = setup([duplicate, duplicate]);
+    await expect(channel.drain()).rejects.toThrow(/duplicate unread message metadata/);
+    expect(queuePrompt).not.toHaveBeenCalled();
+    expect(client.calls.some(call => call.name === 'getMessages')).toBe(false);
+    expect(existsSync(join(dir, '.owner-channel-message-recovery.json'))).toBe(false);
+  });
+
+  it('fails closed when a journaled message is absent from persistent history', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'ours-owner-channel-'));
+    dirs.push(dir);
+    new MessageRecoveryState(join(dir, '.owner-channel-message-recovery.json')).claim([{
+      wireId: 'missing-history-wire', seq: 12, claimedAt: 1_000,
+    }]);
+    const { channel, queuePrompt } = liveSetup({ stateDir: dir });
+    await expect(channel.drain()).rejects.toThrow(/missing from persistent history/);
+    expect(queuePrompt).not.toHaveBeenCalled();
+  });
+
+  it('claims at most 200 oldest metadata rows per SDK transaction', async () => {
+    const messages = Array.from({ length: 201 }, (_, index) =>
+      ownerMessage(index + 1, `wire-batch-${index + 1}`, '/status'));
+    const { channel, client } = setup(messages);
+    await channel.drain();
+    expect(client.calls.filter(call => call.name === 'getMessages').map(call => call.args?.limit))
+      .toEqual([200, 1]);
+  });
+
   // A daemon hiccup must not consume the batch. The inbox stays the authority,
   // so the next drain sees the same message and runs it exactly once.
   it('loses nothing when a transient daemon read fails, and replays on the next drain', async () => {
@@ -198,17 +268,17 @@ describe('OwnerChannel', () => {
     const { channel, client, queuePrompt } = setup([]);
     await channel.start();
     await channel.drain();
+    client.batches.push([message], []);
+    const getMessages = client.getMessages.bind(client);
     client.getMessages = async () => { throw new Error('daemon unreachable'); };
     await expect(channel.drain()).rejects.toThrow(/daemon unreachable/);
     expect(queuePrompt).not.toHaveBeenCalled();
 
-    const remaining = [[message], []];
-    client.getMessages = async () => {
-      const batch = remaining.shift() ?? [];
-      client.calls.push({ name: 'getMessages', args: undefined });
-      return { count: batch.length, messages: batch as never };
-    };
+    client.getMessages = getMessages;
     await channel.drain();
+    expect(client.calls).toContainEqual({
+      name: 'getHistoryItem', args: { wireId: 'wire-transient' },
+    });
     expect(queuePrompt).toHaveBeenCalledOnce();
     expect(String(queuePrompt.mock.calls[0][0])).toContain('Ship it');
     await channel.close();
@@ -226,7 +296,7 @@ describe('OwnerChannel', () => {
     expect(queuePrompt.mock.calls[0][1]).toMatchObject({
       interrupt: false, origin: { kind: 'owner' },
     });
-    expect(client.calls).toContainEqual({ name: 'deferMessages', args: { msgIds: [7] } });
+    expect(client.calls).toContainEqual({ name: 'getMessages', args: { limit: 1 } });
     const sent = client.calls.filter(call => call.name === 'sendMessage');
     expect(sent.map(call => call.args)).toEqual([
       {
@@ -343,9 +413,8 @@ describe('OwnerChannel', () => {
 
     await recovery.channel.drain();
 
-    expect(recovery.client.calls).toContainEqual({
-      name: 'deferMessages', args: { msgIds: [27] },
-    });
+    expect(readFileSync(join(recovery.dir, '.owner-channel-message-recovery.json'), 'utf8'))
+      .toContain('wire-after-stubborn-turn');
     expect(recovery.client.calls.some(call => call.name === 'sendMessage')).toBe(false);
     expect(existsSync(join(recovery.dir, '.owner-channel-state.json'))).toBe(false);
   });
@@ -480,7 +549,9 @@ describe('OwnerChannel', () => {
     const message = {
       msg_id: 10, wire_id: 'wire-once', from: { id: OWNER_CID }, text: 'private instruction',
     };
-    const { channel, queuePrompt, dir } = setup([message, message]);
+    const { channel, client, queuePrompt, dir } = setup([message]);
+    await channel.drain();
+    client.batches.push([message], []);
     await channel.drain();
     expect(queuePrompt).toHaveBeenCalledOnce();
     await vi.waitFor(() => expect(existsSync(join(dir, '.owner-channel-state.json'))).toBe(true));
@@ -1008,6 +1079,7 @@ describe('OwnerChannel notice presentation', () => {
 
     // A `comments: false` baseline likewise survives the restart untouched.
     const disabled = liveSetup({ interrupt: false, comments: false, stateDir: first.dir });
+    disabled.client.history = new Map(second.client.history);
     disabled.client.batches.push([ownerMessage(4, 'wire-status-2', '/comments status')]);
     await disabled.channel.drain();
     const reply = lastReply(disabled.client);
