@@ -138,16 +138,36 @@ export async function doctor(
     });
   }
 
-  const mcp = await exec('ours-mcp', ['--version']);
+  const ours = await exec('ours', ['version', '--json']);
+  let oursVersion: string | undefined;
+  if (ours.code === 0) {
+    try {
+      const value = JSON.parse(ours.stdout) as { name?: unknown; version?: unknown };
+      if (value.name === '@ours.network/cli' && typeof value.version === 'string')
+        oursVersion = value.version;
+    } catch { /* malformed structured output is a failed prerequisite below */ }
+  }
   checks.push({
-    name: 'ours-mcp', ok: mcp.code === 0,
-    detail: mcp.code === 0 ? mcp.stdout.trim() : 'not found — npm i -g @ours.network/mcp',
+    name: 'ours CLI', ok: oursVersion !== undefined,
+    detail: oursVersion
+      ? `@ours.network/cli ${oursVersion}`
+      : 'not found or invalid structured output — npm i -g @ours.network/cli',
   });
-  if (mcp.code === 0) {
-    const st = await exec('ours-mcp', ['status']);
+  if (oursVersion !== undefined) {
+    const st = await exec('ours', ['daemon', 'status', '--json']);
+    let state: string | undefined;
+    try {
+      const value = JSON.parse(st.stdout) as { state?: unknown };
+      if (typeof value.state === 'string') state = value.state;
+    } catch { /* malformed structured output fails closed */ }
+    const running = st.code === 0 && state === 'running';
     checks.push({
-      name: 'ours-mcp daemon', ok: st.code === 0,
-      detail: st.code === 0 ? 'running' : 'not running — start it with: ours-mcp start',
+      name: 'ours daemon', ok: running,
+      detail: running
+        ? 'running'
+        : state === 'stopped' || st.code === 3
+          ? 'not running — start it with: ours daemon start'
+          : 'status check returned invalid structured output — run: ours daemon status --json',
     });
   }
 
@@ -312,7 +332,7 @@ export async function doctor(
       }
     } catch (e) {
       detail = `unreachable on :${endpoint.port} — monitored roles run degraded until it is up ` +
-        `(start it: ours-mcp start) [${(e as Error)?.message ?? e}]`;
+        `(start it: ours daemon start) [${(e as Error)?.message ?? e}]`;
     }
     checks.push({ name: checkName, ok, detail });
   }

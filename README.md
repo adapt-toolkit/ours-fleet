@@ -79,7 +79,7 @@ The state dir contract:
 | tmux | roles using `session: tmux` (the default) | `apt install tmux` / `brew install tmux` |
 | Node ≥ 22 | Claude roles using `session: acp` | required by the maintained Claude ACP adapter |
 | a harness CLI, logged in | the agent itself | e.g. Claude Code (`claude`) or Codex CLI (`codex`) |
-| `ours-mcp` daemon | identity + agent-to-agent messaging | `npm i -g @ours.network/mcp && ours-mcp start` |
+| `ours` CLI + shared daemon | identity + agent-to-agent messaging | `npm i -g @ours.network/cli && ours daemon start` |
 
 Linux only: `ours-fleet init` enables *linger* so roles run without a login session
 and survive reboots. macOS: launchd agents start **at login** (no linger
@@ -640,13 +640,14 @@ agent's briefing tells it **not** to arm a native harness Monitor.
 
 With `monitor.mode: native`, ours-fleet does not start its supervisor monitor;
 the generated briefing instead instructs the harness to arm its own wake
-mechanism (`ours-mcp watch` for Claude Code, or the Codex
+mechanism (the structured `ours api watch-notifications` JSONL stream for Claude Code,
+or the Codex
 `arm_monitor`/`foreground_monitor` flow). The old `monitor.enabled: true|false`
 form remains accepted as a compatibility alias for `fleet|native`, respectively,
 but new configuration should use `mode`.
 
 `inject: full` (pushing message bodies
-inline) is on the roadmap and needs two new ours-mcp daemon endpoints; today all
+inline) is on the roadmap and needs two new daemon endpoints; today all
 roles deliver `notification` lines and drain via `get_messages`.
 
 ACP stdio remains private to the persistent runner. `send`, `peek`, and the basic
@@ -874,7 +875,7 @@ Processed wire IDs are durably bounded for deduplication, while
 message and response bodies stay out of fleet state. Delivery is at-least-once
 across a crash (the bridge requeues fetched input before starting a turn); true
 exactly-once processing would require a leased claim/idempotency primitive in
-ours-mcp.
+the ours daemon.
 
 Inbound owner attachments use the same authenticated-CID and exact-wire routing
 boundary. Fleet first calls the metadata-only `list_incoming_files`, groups a
@@ -885,7 +886,7 @@ unauthorized sender is ignored without retrieval or reply. A rejected authorized
 request receives a bounded reason correlated to its file wire.
 
 Retrieved files must be regular, non-symlink paths whose byte count and SHA-256
-match ours-mcp metadata. Fleet additionally checks content signatures against the
+match typed SDK metadata. Fleet additionally checks content signatures against the
 declared MIME, sanitizes traversal/control characters from names, and copies each
 file into a random request-scoped directory at mode 0700 with files at mode 0600.
 The `[fleet-owner]` turn receives only bounded metadata, the private local paths,
@@ -896,17 +897,17 @@ the agent must use the audio path rather than inventing text.
 Request files are removed after final delivery and stale directories are removed
 after `retention_ms`. A bounded mode-0600 recovery journal stores only owner CID
 and wire routing metadata—never filenames, paths, captions, transcripts, or file
-bytes. If ours-mcp already marked a selected file processed when fleet restarts,
-fleet resumes only that journaled wire with `save_file`; a deferred managed-agent
+bytes. If the daemon already marked a selected file processed when fleet restarts,
+fleet resumes only that journaled wire with the SDK file-fetch operation; a deferred managed-agent
 caption is replayed with its journaled processed files before the group is
 admitted or relayed. Conversation route state migrates from v1 to a bounded v2
 source-wire index so a correlated group keeps the authenticated owner selected by
 its original request even after later owner traffic. Recovered voice is explicitly
 marked transcript-unavailable. Corrupt recovery state disables attachment
-admission. The host must run an ours-mcp version whose
-`list_incoming_files`, selective `get_files`, and `save_file` schemas support
-these guarantees; `ours-mcp voice-status --json` reports whether transcription
-is currently configured.
+admission. The host must run an ours daemon compatible with SDK 2.0.1 whose
+typed incoming-file, selective retrieval, and file-fetch operations support
+these guarantees; `ours config show --json` reports `sttConfigured` without
+revealing provider credentials.
 
 Managed-agent file egress is a separate trust direction. It retains the same
 metadata provenance checks, count/per-file/request byte caps, regular-file and
@@ -952,7 +953,7 @@ pass the legacy `ours-fleet spawn --monitor` flag) to record explicit persistent
 for the harness-native monitor, including supervised restarts. This does not choose the
 wake owner; use `monitor.mode: fleet|native` for that. In the standard-Codex fallback, the agent separately surfaces the
 `ours-codex` recommendation before asking to enter `foreground_monitor`. It never backgrounds
-`ours-mcp watch`, because a detached watch cannot wake a Codex turn. The foreground
+the structured CLI watcher, because a detached process cannot wake a Codex turn. The foreground
 wait is re-entered after each handled message; `ours-codex` instead wakes the idle
 session through its App Server integration.
 
@@ -1036,7 +1037,7 @@ picks the most recently active session **in the role's `cwd`**. This works
 cleanly as long as each role has its own `cwd` (the common case); two roles
 sharing an identical `cwd` could have their resumes cross — give them distinct
 working directories if that matters. MCP and monitor wiring is provided by
-[`@ours.network/codex`](https://github.com/adapt-toolkit/ours-mcp/tree/main/packages/codex);
+[`@ours.network/codex`](https://www.npmjs.com/package/@ours.network/codex);
 the core ours skill discovers fleet behavior through `ours-fleet docs`.
 `ours-fleet doctor --harness codex` verifies the CLI, ours plugin, and enhanced launcher/fallback.
 

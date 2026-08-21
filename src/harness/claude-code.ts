@@ -145,9 +145,14 @@ export async function pretrust(
  * it must be the Monitor TOOL, not a background Bash task (which never wakes the
  * agent on output → an armed-looking but deaf monitor).
  */
+const shellQuote = (value: string): string => `'${value.replace(/'/g, `'"'"'`)}'`;
+const watchCommand = (id: string): string =>
+  'ours api watch-notifications --input '
+  + shellQuote(JSON.stringify({ identity: id, since: 'tip' })) + ' --json';
+
 const armMonitor = (id: string): string =>
   'arm a **persistent Monitor** (the Monitor TOOL — NOT a background Bash command; a ' +
-  `background Bash task never wakes you on output) running \`ours-mcp watch "${id}"\` ` +
+  `background Bash task never wakes you on output) running \`${watchCommand(id)}\` ` +
   'so inbound ours mail wakes you';
 
 export function makeClaudeCodeAdapter(exec: Exec = realExec): HarnessAdapter {
@@ -311,7 +316,6 @@ export function makeClaudeCodeAdapter(exec: Exec = realExec): HarnessAdapter {
       currentIdentityTool: 'current_identity',
       sendTool: 'send_message',
       getMessagesTool: 'get_messages',
-      watchCommand: id => `ours-mcp watch "${id}"`,
       monitorInstruction: id => {
         const m = armMonitor(id);
         return `${m.charAt(0).toUpperCase()}${m.slice(1)}.`;

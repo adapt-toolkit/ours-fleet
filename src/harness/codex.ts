@@ -430,7 +430,6 @@ export function makeCodexAdapter(exec: Exec = realExec): HarnessAdapter {
       currentIdentityTool: 'current_identity',
       sendTool: 'send_message',
       getMessagesTool: 'get_messages',
-      watchCommand: id => `ours-mcp watch "${id}"`,
       monitorInstruction: (id, configuredRole) => {
         const consented = (configuredRole?.harness_options as CodexOptions | undefined)?.monitor === true;
         const consent = consented

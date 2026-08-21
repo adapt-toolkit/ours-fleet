@@ -145,7 +145,7 @@ interface DaemonConfig {
 const daemonConfigPath = (env: NodeJS.ProcessEnv): string =>
   env.OURS_CONFIG ?? join(homedir(), '.ours', 'config.json');
 
-/** Match ours-mcp's env integer semantics: parseInt, invalid → absent. */
+/** Preserve the daemon's legacy env integer semantics: parseInt, invalid → absent. */
 function envInt(env: NodeJS.ProcessEnv, name: string): number | undefined {
   const raw = env[name];
   if (raw === undefined) return undefined;

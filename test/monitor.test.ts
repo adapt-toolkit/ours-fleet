@@ -228,7 +228,7 @@ describe('token resolution (issue #17)', () => {
     expect(resolveEndpoint(baseEnv()).url('A')).toContain(':3050/');
   });
 
-  it('matches ours-mcp parseInt + nullish port semantics', () => {
+  it('matches the daemon parseInt + nullish port semantics', () => {
     writeCfg({ port: 4100 });
     expect(resolveEndpoint(baseEnv({ OURS_PORT: '4200suffix' })).port).toBe(4200);
     expect(resolveEndpoint(baseEnv({ OURS_PORT: 'not-a-port' })).port).toBe(4100);

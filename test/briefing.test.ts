@@ -27,7 +27,7 @@ describe('generateBriefing', () => {
     expect(b).toContain('current_identity');
     expect(b).toContain('set_bio');
     expect(b).toContain('set_persona');
-    expect(b).toContain('ours-mcp watch "Alice Dev"');
+    expect(b).toContain('ours api watch-notifications');
     expect(b).toContain('## Charter');
     expect(b).toContain('Own the Alice codebase.');
     expect(b).toContain('## Mission');
@@ -91,7 +91,7 @@ describe('generateBriefing', () => {
     const b = generateBriefing(fleet as ResolvedRole, vocab, opts);
     expect(b).toContain('[fleet-monitor]');
     expect(b).toContain('do NOT arm');
-    expect(b).not.toContain('ours-mcp watch');   // legacy watch dropped from both step 6 and restart
+    expect(b).not.toContain('ours api watch-notifications');   // legacy watch dropped from both step 6 and restart
   });
 
   it('keeps post-bind mission delivery on ordinary ours mail', () => {
@@ -119,7 +119,7 @@ describe('generateBriefing', () => {
       monitor: { mode: 'native', enabled: false, wake_sources: [], batch_ms: 2000, inject: 'notification' as const },
     };
     const b = generateBriefing(native as ResolvedRole, vocab, opts);
-    expect(b).toContain('ours-mcp watch "Alice Dev"');
+    expect(b).toContain('ours api watch-notifications');
     expect(b).not.toContain('[fleet-monitor]');
   });
 
