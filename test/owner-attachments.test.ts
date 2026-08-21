@@ -5,7 +5,6 @@ import {
 } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { PassThrough } from 'node:stream';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import type { OwnerAttachmentConfig, OwnerChannelConfig } from '../src/config.js';
@@ -64,6 +63,14 @@ class AttachmentClient implements OursOps {
     return { count: messages.length, messages };
   }
   async deferMessages(msgIds: number[]) { this.record('deferMessages', { msgIds }); }
+  async *watchNotifications(
+    _identity: string, options?: { since?: number | 'tip'; signal?: AbortSignal },
+  ) {
+    await new Promise<void>(resolve => {
+      if (options?.signal?.aborted) resolve();
+      else options?.signal?.addEventListener('abort', () => resolve(), { once: true });
+    });
+  }
   async listIncomingFiles() {
     this.record('listIncomingFiles');
     return this.files as OursIncomingFile[];
@@ -144,10 +151,6 @@ async function setup(
   const logs: string[] = [];
   const channel = new OwnerChannel({
     role: 'Role', harness: 'claude-code', config, session, stateDir: dir, client, log: line => logs.push(line),
-    watch: () => ({
-      pid: 1, exitCode: null, stdout: new PassThrough(), stderr: new PassThrough(),
-      once: () => undefined, kill: () => true,
-    }) as never,
   });
   await channel.start();
   await channel.drain();
@@ -720,10 +723,6 @@ describe('managed-agent attachment egress', () => {
         queuePrompt: status.queuePrompt, interrupt: vi.fn(), eventsSince: () => [],
       } as unknown as SessionHandle,
       stateDir: status.dir, client: status.client, log: line => status.logs.push(line),
-      watch: () => ({
-        pid: 1, exitCode: null, stdout: new PassThrough(), stderr: new PassThrough(),
-        once: () => undefined, kill: () => true,
-      }) as never,
     });
     await restarted.start();
     await restarted.drain();

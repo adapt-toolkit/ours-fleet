@@ -54,6 +54,14 @@ class FakeClient implements OursOps {
     return { count: messages.length, messages };
   }
   async deferMessages(msgIds: number[]) { this.record('deferMessages', { msgIds }); }
+  async *watchNotifications(
+    _identity: string, options?: { since?: number | 'tip'; signal?: AbortSignal },
+  ) {
+    await new Promise<void>(resolve => {
+      if (options?.signal?.aborted) resolve();
+      else options?.signal?.addEventListener('abort', () => resolve(), { once: true });
+    });
+  }
   async listIncomingFiles() { this.record('listIncomingFiles'); return []; }
   async getFiles(wireIds: string[]) {
     this.record('getFiles', { wireIds });

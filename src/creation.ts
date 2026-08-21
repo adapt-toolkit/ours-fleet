@@ -1,8 +1,10 @@
 import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
+import {
+  attachOursClient, type AttachOursClientOptions, type OursClient,
+} from '@ours.network/sdk/client';
 import { replaceFileAtomically, withFileLock, type LockDeps } from './atomic-file.js';
 import { stateRoot } from './paths.js';
-import { resolveEndpoint, type FetchLike } from './monitor.js';
 import { buildInfo, UNKNOWN_BUILD } from './provenance.js';
 
 /**
@@ -206,11 +208,10 @@ function readdirSyncSafe(dir: string): string[] {
  * Identity provisioning (7.3). The fleet must know — before the harness starts
  * — whether the role's identity exists, and create it when it does not.
  *
- * `exists()` is answerable today: the daemon's authenticated `/identities`
- * endpoint is already used by doctor. `create()` is NOT: `ours-mcp` exposes only
- * `create-root`, and role identities are minted through the MCP `create_identity`
- * tool inside an agent session. So creation is a seam, injected by whoever can
- * satisfy it, and its absence is reported rather than papered over.
+ * `exists()` is answered through the typed SDK daemon inventory. `create()` is
+ * intentionally still a seam: fleet preserves application-owned identity
+ * creation/binding, especially the session-owned lifetime of temporary roles.
+ * Its absence is reported rather than papered over.
  */
 export interface IdentityProvisioner {
   /** Does this identity exist? `unknown` when the daemon could not be asked. */
@@ -285,27 +286,35 @@ export async function ensureIdentity(
 }
 
 /**
- * Ask the running ours daemon whether an identity exists, over the same
- * authenticated endpoint doctor already probes. Answers `unknown` rather than
- * guessing when the daemon cannot be reached — an unreachable daemon is not
- * evidence that the identity is missing.
+ * Ask the running ours daemon whether an identity exists through SDK 2's
+ * coherence-checking attach path. Answers `unknown` rather than guessing when
+ * the daemon cannot be reached — an unreachable daemon is not evidence that
+ * the identity is missing.
  *
- * It deliberately has no `create()`: role identities are minted through the MCP
- * `create_identity` tool, and inventing a daemon endpoint we cannot test is the
- * failure mode this release exists to stop.
+ * It deliberately has no `create()`: roles still own identity selection and
+ * binding inside their application session, and temporary identities must stay
+ * owned by that session so daemon cleanup semantics remain intact.
  */
+type IdentityInventoryClient = Pick<OursClient, 'identities'>;
+
 export function daemonIdentityProvisioner(
   env: NodeJS.ProcessEnv = process.env,
-  fetchImpl: FetchLike = (u, i) => globalThis.fetch(u, i) as unknown as ReturnType<FetchLike>,
+  attachClient: (
+    options: AttachOursClientOptions,
+  ) => Promise<IdentityInventoryClient> = attachOursClient,
 ): IdentityProvisioner {
   return {
     async exists(name: string) {
-      const ep = resolveEndpoint(env);
-      const resp = await fetchImpl(`${ep.origin}/identities`, { headers: ep.headers });
-      if (!resp.ok) return 'unknown';
-      const body = await resp.json() as { identities?: Array<string | { name?: string }> };
-      if (!Array.isArray(body.identities)) return 'unknown';
-      return body.identities.some(i => (typeof i === 'string' ? i : i?.name) === name);
+      try {
+        const client = await attachClient({
+          env, leaseToken: `ours-fleet-identity-preflight-${process.pid}`, clientPid: process.pid,
+        });
+        const identities = await client.identities();
+        if (!Array.isArray(identities)) return 'unknown';
+        return identities.some(identity => identity.name === name);
+      } catch {
+        return 'unknown';
+      }
     },
   };
 }

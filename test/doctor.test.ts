@@ -62,8 +62,8 @@ describe('doctor', () => {
   it('flags missing tmux with an install hint', async () => {
     const rep = await doctor({}, execWith({
       'tmux -V': { stdout: '', stderr: '', code: 127 },
-      'ours-mcp --version': { stdout: '0.1.2', stderr: '', code: 0 },
-      'ours-mcp status': { stdout: 'running', stderr: '', code: 0 },
+      'ours version': { stdout: JSON.stringify({ name: '@ours.network/cli', version: '1.0.1' }), stderr: '', code: 0 },
+      'ours daemon': { stdout: JSON.stringify({ state: 'running' }), stderr: '', code: 0 },
       'loginctl show-user': { stdout: 'Linger=yes', stderr: '', code: 0 },
     }), 'linux');
     const t = rep.checks.find(c => c.name === 'tmux')!;
@@ -72,23 +72,41 @@ describe('doctor', () => {
     expect(rep.ok).toBe(false);
   });
 
-  it('flags a stopped ours-mcp daemon', async () => {
+  it('flags a stopped ours daemon', async () => {
     const rep = await doctor({}, execWith({
       'tmux -V': { stdout: 'tmux 3.6', stderr: '', code: 0 },
-      'ours-mcp --version': { stdout: '0.1.2', stderr: '', code: 0 },
-      'ours-mcp status': { stdout: '', stderr: 'stopped', code: 1 },
+      'ours version': { stdout: JSON.stringify({ name: '@ours.network/cli', version: '1.0.1' }), stderr: '', code: 0 },
+      'ours daemon': { stdout: JSON.stringify({ state: 'stopped' }), stderr: '', code: 3 },
       'loginctl show-user': { stdout: 'Linger=yes', stderr: '', code: 0 },
     }), 'linux');
-    const d = rep.checks.find(c => c.name === 'ours-mcp daemon')!;
+    const d = rep.checks.find(c => c.name === 'ours daemon')!;
     expect(d.ok).toBe(false);
-    expect(d.detail).toContain('ours-mcp start');
+    expect(d.detail).toContain('ours daemon start');
+  });
+
+  it('refuses to infer CLI or daemon status from English output', async () => {
+    const cliProse = await doctor({}, execWith({
+      'tmux -V': { stdout: 'tmux 3.6', stderr: '', code: 0 },
+      'ours version': { stdout: 'ours 1.0.1', stderr: '', code: 0 },
+    }), 'darwin');
+    expect(cliProse.checks.find(c => c.name === 'ours CLI')).toMatchObject({ ok: false });
+    expect(cliProse.checks.some(c => c.name === 'ours daemon')).toBe(false);
+
+    const daemonProse = await doctor({}, execWith({
+      'tmux -V': { stdout: 'tmux 3.6', stderr: '', code: 0 },
+      'ours version': {
+        stdout: JSON.stringify({ name: '@ours.network/cli', version: '1.0.1' }), stderr: '', code: 0,
+      },
+      'ours daemon': { stdout: 'running', stderr: '', code: 0 },
+    }), 'darwin');
+    expect(daemonProse.checks.find(c => c.name === 'ours daemon')).toMatchObject({ ok: false });
   });
 
   it('reports linger only on linux and passes when all green', async () => {
     const green = execWith({
       'tmux -V': { stdout: 'tmux 3.6', stderr: '', code: 0 },
-      'ours-mcp --version': { stdout: '0.1.2', stderr: '', code: 0 },
-      'ours-mcp status': { stdout: 'running', stderr: '', code: 0 },
+      'ours version': { stdout: JSON.stringify({ name: '@ours.network/cli', version: '1.0.1' }), stderr: '', code: 0 },
+      'ours daemon': { stdout: JSON.stringify({ state: 'running' }), stderr: '', code: 0 },
       'loginctl show-user': { stdout: 'Linger=yes', stderr: '', code: 0 },
     });
     const linux = await doctor({}, green, 'linux');
@@ -101,8 +119,8 @@ describe('doctor', () => {
   it('unknown --harness surfaces as a failed check, not a crash', async () => {
     const rep = await doctor({ harness: 'nope' }, execWith({
       'tmux -V': { stdout: 'tmux 3.6', stderr: '', code: 0 },
-      'ours-mcp --version': { stdout: '0.1.2', stderr: '', code: 0 },
-      'ours-mcp status': { stdout: 'running', stderr: '', code: 0 },
+      'ours version': { stdout: JSON.stringify({ name: '@ours.network/cli', version: '1.0.1' }), stderr: '', code: 0 },
+      'ours daemon': { stdout: JSON.stringify({ state: 'running' }), stderr: '', code: 0 },
     }), 'darwin');
     const h = rep.checks.find(c => c.name === 'nope')!;
     expect(h.ok).toBe(false);
@@ -113,8 +131,8 @@ describe('doctor', () => {
     writeFileSync(join(dir, 'fleet.yaml'),
       'roles:\n  Coder:\n    harness: codex\n    session: acp\n    monitor:\n      enabled: false\n');
     const rep = await doctor({}, execWith({
-      'ours-mcp --version': { stdout: '0.1.2', stderr: '', code: 0 },
-      'ours-mcp status': { stdout: 'running', stderr: '', code: 0 },
+      'ours version': { stdout: JSON.stringify({ name: '@ours.network/cli', version: '1.0.1' }), stderr: '', code: 0 },
+      'ours daemon': { stdout: JSON.stringify({ state: 'running' }), stderr: '', code: 0 },
       'codex --version': { stdout: 'codex-cli 1.0.0', stderr: '', code: 0 },
       'codex plugin': {
         stdout: JSON.stringify({ installed: [{
@@ -134,8 +152,8 @@ describe('doctor', () => {
 describe('doctor scheduled-loop checkpoint', () => {
   const green = execWith({
     'tmux -V': { stdout: 'tmux 3.6', stderr: '', code: 0 },
-    'ours-mcp --version': { stdout: '0.1.2', stderr: '', code: 0 },
-    'ours-mcp status': { stdout: 'running', stderr: '', code: 0 },
+    'ours version': { stdout: JSON.stringify({ name: '@ours.network/cli', version: '1.0.1' }), stderr: '', code: 0 },
+    'ours daemon': { stdout: JSON.stringify({ state: 'running' }), stderr: '', code: 0 },
     'loginctl show-user': { stdout: 'Linger=yes', stderr: '', code: 0 },
   });
 
@@ -219,8 +237,8 @@ describe('doctor scheduled-loop checkpoint', () => {
 describe('doctor isolation reporting', () => {
   const green = (over: Record<string, ExecResult> = {}): Exec => execWith({
     'tmux -V': { stdout: 'tmux 3.6', stderr: '', code: 0 },
-    'ours-mcp --version': { stdout: '0.1.2', stderr: '', code: 0 },
-    'ours-mcp status': { stdout: 'running', stderr: '', code: 0 },
+    'ours version': { stdout: JSON.stringify({ name: '@ours.network/cli', version: '1.0.1' }), stderr: '', code: 0 },
+    'ours daemon': { stdout: JSON.stringify({ state: 'running' }), stderr: '', code: 0 },
     'loginctl show-user': { stdout: 'Linger=yes', stderr: '', code: 0 },
     'bwrap --version': { stdout: 'bubblewrap 0.11.1', stderr: '', code: 0 },
     'bwrap --ro-bind': { stdout: '', stderr: '', code: 0 },
@@ -270,8 +288,8 @@ describe('doctor isolation reporting', () => {
 describe('doctor monitor probe (§5)', () => {
   const green = (over: Record<string, ExecResult> = {}): Exec => execWith({
     'tmux -V': { stdout: 'tmux 3.6', stderr: '', code: 0 },
-    'ours-mcp --version': { stdout: '0.1.2', stderr: '', code: 0 },
-    'ours-mcp status': { stdout: 'running', stderr: '', code: 0 },
+    'ours version': { stdout: JSON.stringify({ name: '@ours.network/cli', version: '1.0.1' }), stderr: '', code: 0 },
+    'ours daemon': { stdout: JSON.stringify({ state: 'running' }), stderr: '', code: 0 },
     'loginctl show-user': { stdout: 'Linger=yes', stderr: '', code: 0 },
     ...over,
   });
@@ -304,7 +322,7 @@ describe('doctor monitor probe (§5)', () => {
     const rep = await doctor({}, green(), 'linux', stubFetch('down'));
     const m = rep.checks.find(c => c.name === 'monitor: daemon API')!;
     expect(m.ok).toBe(false);
-    expect(m.detail).toMatch(/ours-mcp start/);
+    expect(m.detail).toMatch(/ours daemon start/);
   });
 
   it('uses config port and apiToken for the same profile as the runtime monitor', async () => {
@@ -401,8 +419,8 @@ describe('user bus check (#9)', () => {
     process.env.XDG_RUNTIME_DIR = '/run/user/424242';
     const rep = await doctor({}, execWith({
       'tmux -V': { stdout: 'tmux 3.4', stderr: '', code: 0 },
-      'ours-mcp --version': { stdout: '0.1.2', stderr: '', code: 0 },
-      'ours-mcp status': { stdout: 'running', stderr: '', code: 0 },
+      'ours version': { stdout: JSON.stringify({ name: '@ours.network/cli', version: '1.0.1' }), stderr: '', code: 0 },
+      'ours daemon': { stdout: JSON.stringify({ state: 'running' }), stderr: '', code: 0 },
       'loginctl show-user': { stdout: 'Linger=yes', stderr: '', code: 0 },
     }), 'linux');
     const bus = rep.checks.find(c => c.name === 'user bus');
@@ -413,8 +431,8 @@ describe('user bus check (#9)', () => {
   it('is a linux-only check', async () => {
     const rep = await doctor({}, execWith({
       'tmux -V': { stdout: 'tmux 3.4', stderr: '', code: 0 },
-      'ours-mcp --version': { stdout: '0.1.2', stderr: '', code: 0 },
-      'ours-mcp status': { stdout: 'running', stderr: '', code: 0 },
+      'ours version': { stdout: JSON.stringify({ name: '@ours.network/cli', version: '1.0.1' }), stderr: '', code: 0 },
+      'ours daemon': { stdout: JSON.stringify({ state: 'running' }), stderr: '', code: 0 },
     }), 'darwin');
     expect(rep.checks.find(c => c.name === 'user bus')).toBeUndefined();
   });
@@ -423,8 +441,8 @@ describe('user bus check (#9)', () => {
 describe('doctor config validity (1.4)', () => {
   const HEALTHY_HOST = {
     'tmux -V': { stdout: 'tmux 3.4', stderr: '', code: 0 },
-    'ours-mcp --version': { stdout: '0.1.2', stderr: '', code: 0 },
-    'ours-mcp status': { stdout: 'running', stderr: '', code: 0 },
+    'ours version': { stdout: JSON.stringify({ name: '@ours.network/cli', version: '1.0.1' }), stderr: '', code: 0 },
+    'ours daemon': { stdout: JSON.stringify({ state: 'running' }), stderr: '', code: 0 },
     'loginctl show-user': { stdout: 'Linger=yes', stderr: '', code: 0 },
   };
   const run = (opts: Parameters<typeof doctor>[0] = {}) =>
@@ -464,7 +482,7 @@ describe('doctor config validity (1.4)', () => {
   it('keeps running the host checks when the config is invalid', async () => {
     writeCfg('roles:\n  A:\n    harnes: fake\n');
     const rep = await run();
-    for (const name of ['node', 'tmux', 'ours-mcp', 'ours-mcp daemon', 'linger', 'user bus'])
+    for (const name of ['node', 'tmux', 'ours CLI', 'ours daemon', 'linger', 'user bus'])
       expect(rep.checks.find(c => c.name === name), name).toBeDefined();
   });
 
@@ -517,8 +535,8 @@ describe('doctor config validity (1.4)', () => {
 describe('doctor permission translation (2.3)', () => {
   const HEALTHY = {
     'tmux -V': { stdout: 'tmux 3.4', stderr: '', code: 0 },
-    'ours-mcp --version': { stdout: '0.1.2', stderr: '', code: 0 },
-    'ours-mcp status': { stdout: 'running', stderr: '', code: 0 },
+    'ours version': { stdout: JSON.stringify({ name: '@ours.network/cli', version: '1.0.1' }), stderr: '', code: 0 },
+    'ours daemon': { stdout: JSON.stringify({ state: 'running' }), stderr: '', code: 0 },
     'loginctl show-user': { stdout: 'Linger=yes', stderr: '', code: 0 },
   };
   const run = () => doctor({}, execWith(HEALTHY), 'linux', stubFetch());
@@ -582,8 +600,8 @@ describe('doctor permission translation (2.3)', () => {
 describe('doctor unattended capability floor (2.1)', () => {
   const HEALTHY = {
     'tmux -V': { stdout: 'tmux 3.4', stderr: '', code: 0 },
-    'ours-mcp --version': { stdout: '0.1.2', stderr: '', code: 0 },
-    'ours-mcp status': { stdout: 'running', stderr: '', code: 0 },
+    'ours version': { stdout: JSON.stringify({ name: '@ours.network/cli', version: '1.0.1' }), stderr: '', code: 0 },
+    'ours daemon': { stdout: JSON.stringify({ state: 'running' }), stderr: '', code: 0 },
     'loginctl show-user': { stdout: 'Linger=yes', stderr: '', code: 0 },
   };
   const run = () => doctor({}, execWith(HEALTHY), 'linux', stubFetch());
@@ -648,8 +666,8 @@ describe('doctor unattended capability floor (2.1)', () => {
 describe('native overrides contradicting neutral intent (2.4)', () => {
   const HEALTHY = {
     'tmux -V': { stdout: 'tmux 3.4', stderr: '', code: 0 },
-    'ours-mcp --version': { stdout: '0.1.2', stderr: '', code: 0 },
-    'ours-mcp status': { stdout: 'running', stderr: '', code: 0 },
+    'ours version': { stdout: JSON.stringify({ name: '@ours.network/cli', version: '1.0.1' }), stderr: '', code: 0 },
+    'ours daemon': { stdout: JSON.stringify({ state: 'running' }), stderr: '', code: 0 },
     'loginctl show-user': { stdout: 'Linger=yes', stderr: '', code: 0 },
   };
   const run = () => doctor({}, execWith(HEALTHY), 'linux', stubFetch());

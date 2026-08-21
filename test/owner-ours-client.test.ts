@@ -2,14 +2,16 @@ import { readFileSync } from 'node:fs';
 import { readdir, readFile } from 'node:fs/promises';
 import { dirname, extname, join, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 
 import {
   OursClient, OursError, errBoundElsewhere, errNoSuchIdentity,
+  type AttachOursClientOptions,
 } from '@ours.network/sdk/client';
 
 import {
-  OURS_BOUND_ELSEWHERE, OursSdkClient, OursSendRefusedError, oursErrorCode,
+  OURS_BOUND_ELSEWHERE, OursSdkClient, OursSendRefusedError, OursWatchDeadlineError,
+  oursErrorCode,
 } from '../src/owner-channel/ours-client.js';
 
 const REPO = resolve(dirname(fileURLToPath(import.meta.url)), '..');
@@ -17,14 +19,18 @@ const REPO = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 /** A recording stand-in for the SDK client; only the methods under test exist. */
 function fakeSdkClient(overrides: Partial<Record<string, unknown>> = {}) {
   const calls: Array<{ name: string; args: unknown }> = [];
-  const record = (name: string, result: unknown) => (args?: unknown) => {
-    calls.push({ name, args });
+  const record = (name: string, result: unknown) => (...args: unknown[]) => {
+    calls.push({ name, args: args.length <= 1 ? args[0] : args });
     return Promise.resolve(result);
   };
   const client = {
     calls,
     chooseIdentity: record('chooseIdentity', { name: 'Role-owner', cid: 'x', switchedFrom: null }),
     sendMessage: record('sendMessage', { kind: 'sent', wireId: 'w' }),
+    uploadFile: record('uploadFile', {
+      upload_id: 'upload-1', filename: 'f', mime: 'application/octet-stream', size: 3,
+      sha256: 'hash', at: '2026-08-21T00:00:00Z',
+    }),
     sendFile: record('sendFile', { kind: 'sent', wireId: 'w', filename: 'f', bytes: 1, mime: 'text/plain' }),
     fetchFile: record('fetchFile', new Uint8Array([1, 2, 3])),
     releaseLease: record('releaseLease', { released: ['Role-owner'] }),
@@ -34,13 +40,15 @@ function fakeSdkClient(overrides: Partial<Record<string, unknown>> = {}) {
 }
 
 async function started(client: ReturnType<typeof fakeSdkClient>): Promise<OursSdkClient> {
-  const sdk = new OursSdkClient({}, () => undefined, { createClient: () => client });
+  const sdk = new OursSdkClient({}, () => undefined, {
+    attachClient: () => client, readFile: async () => new Uint8Array([1, 2, 3]),
+  });
   await sdk.start();
   return sdk;
 }
 
 describe('OursSdkClient send verdicts', () => {
-  // ours-mcp 0.16.0 turned exactly one message verdict into a tool error. The
+  // The legacy connector turned exactly one message verdict into a tool error. The
   // SDK returns every verdict instead, so an adapter that forgot to re-raise
   // would book a refusal as a delivered owner message.
   it('raises a refused message verdict and accepts every queued one', async () => {
@@ -81,6 +89,22 @@ describe('OursSdkClient send verdicts', () => {
     }
   });
 
+  it('stages outbound bytes through SDK 2 instead of exposing a fleet-private path to the daemon', async () => {
+    const client = fakeSdkClient();
+    const sdk = await started(client);
+    await sdk.sendFile({
+      contact: 'owner', path: '/fleet/private/outbox/report.txt', filename: 'report.txt',
+      replyToWireId: 'request-wire',
+    });
+    expect(client.calls.find(call => call.name === 'uploadFile')?.args)
+      .toEqual([expect.any(Uint8Array), { filename: 'report.txt', mime: 'text/plain' }]);
+    expect(client.calls).toContainEqual({ name: 'sendFile', args: {
+      contact: 'owner', upload_id: 'upload-1', filename: 'report.txt',
+      reply_to_wire_id: 'request-wire',
+    } });
+    expect(JSON.stringify(client.calls)).not.toContain('/fleet/private/outbox');
+  });
+
   it('never asks the daemon to force a binding, and hands the lease back on close', async () => {
     const client = fakeSdkClient();
     const sdk = await started(client);
@@ -99,7 +123,7 @@ describe('OursSdkClient send verdicts', () => {
     const client = fakeSdkClient({
       releaseLease: async () => { throw new Error('daemon unreachable'); },
     });
-    const sdk = new OursSdkClient({}, line => lines.push(line), { createClient: () => client });
+    const sdk = new OursSdkClient({}, line => lines.push(line), { attachClient: () => client });
     await sdk.start();
     await expect(sdk.close()).resolves.toBeUndefined();
     expect(lines.some(line => line.includes('lease release failed'))).toBe(true);
@@ -125,8 +149,40 @@ describe('OursSdkClient send verdicts', () => {
   });
 
   it('refuses to operate before start', async () => {
-    const sdk = new OursSdkClient({}, () => undefined, { createClient: () => fakeSdkClient() });
+    const sdk = new OursSdkClient({}, () => undefined, { attachClient: () => fakeSdkClient() });
     await expect(sdk.getMessages()).rejects.toThrow(/is not started/);
+  });
+
+  it('settles a half-open SDK notification request at the deadline even if fetch ignores abort', async () => {
+    vi.useFakeTimers();
+    try {
+      let attached: AttachOursClientOptions | undefined;
+      const hangingFetch = vi.fn((_input: RequestInfo | URL, _init?: RequestInit) =>
+        new Promise<Response>(() => undefined));
+      const sdk = new OursSdkClient({}, () => undefined, {
+        attachClient: options => { attached = options; return fakeSdkClient(); },
+        fetch: hangingFetch as typeof globalThis.fetch,
+        notificationRequestDeadlineMs: 50,
+      });
+      await sdk.start();
+      const request = attached!.fetch!(
+        'http://127.0.0.1:3050/identities/Role-owner/notifications?since=0');
+      const rejected = expect(request).rejects.toBeInstanceOf(OursWatchDeadlineError);
+      await vi.advanceTimersByTimeAsync(51);
+      await rejected;
+      expect(hangingFetch).toHaveBeenCalledOnce();
+
+      const upstream = new AbortController();
+      const shutdown = attached!.fetch!(
+        'http://127.0.0.1:3050/identities/Role-owner/notifications?since=0',
+        { signal: upstream.signal },
+      );
+      upstream.abort();
+      await expect(shutdown).rejects.toMatchObject({ name: 'AbortError' });
+      await sdk.close();
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });
 
@@ -158,8 +214,10 @@ describe('owner-channel daemon dependency surface', () => {
   it('is pinned to the reviewed SDK version exactly', () => {
     const pkg = JSON.parse(readFileSync(join(REPO, 'package.json'), 'utf8'));
     const lock = JSON.parse(readFileSync(join(REPO, 'package-lock.json'), 'utf8'));
-    expect(pkg.dependencies['@ours.network/sdk']).toBe('1.5.2');
-    expect(lock.packages['node_modules/@ours.network/sdk'].version).toBe('1.5.2');
+    expect(pkg.dependencies['@ours.network/sdk']).toBe('2.0.1');
+    expect(lock.packages['node_modules/@ours.network/sdk'].version).toBe('2.0.1');
+    expect(pkg.dependencies['@ours.network/cli']).toBe('1.0.1');
+    expect(lock.packages['node_modules/@ours.network/cli'].version).toBe('1.0.1');
   });
 
   it('imports only the documented client subpath, never daemon-side SDK code', async () => {

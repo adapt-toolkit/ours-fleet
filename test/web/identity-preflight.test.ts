@@ -1,42 +1,27 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { daemonIdentityProvisioner } from '../../src/creation.js';
 
-function response(status: number, body: unknown) {
-  return {
-    ok: status >= 200 && status < 300,
-    async json() { return body; },
-  };
-}
-
 describe('current daemon identity preflight', () => {
-  it('uses only the authenticated identities read endpoint', async () => {
-    const calls: Array<{ url: string; init?: { headers?: Record<string, string> } }> = [];
+  it('uses only the SDK identity inventory and keeps creation application-owned', async () => {
+    const identities = vi.fn(async () => [{ name: 'Existing' }]);
+    const attach = vi.fn(async () => ({ identities }));
     const provider = daemonIdentityProvisioner(
-      { OURS_PORT: '4444', OURS_API_TOKEN: 'test-token' },
-      async (url, init) => {
-        calls.push({ url, init: init as { headers?: Record<string, string> } });
-        return response(200, { identities: [{ name: 'Existing' }] }) as never;
-      },
+      { OURS_CONFIG: '/operator/ours.json' }, attach,
     );
     expect(await provider.exists('Existing')).toBe(true);
     expect(await provider.exists('Missing')).toBe(false);
     expect(provider.create).toBeUndefined();
     expect(provider.remove).toBeUndefined();
-    expect(calls.map(call => call.url)).toEqual([
-      'http://127.0.0.1:4444/identities',
-      'http://127.0.0.1:4444/identities',
-    ]);
-    expect(calls[0].init?.headers).toMatchObject({ 'x-ours-api-token': 'test-token' });
+    expect(identities).toHaveBeenCalledTimes(2);
+    expect(attach.mock.calls[0][0]).toMatchObject({
+      env: { OURS_CONFIG: '/operator/ours.json' }, clientPid: process.pid,
+    });
   });
 
-  it('returns unknown for an unavailable or malformed daemon response', async () => {
-    const unavailable = daemonIdentityProvisioner(
-      { OURS_PORT: '4444' },
-      async () => response(503, {}) as never,
-    );
+  it('returns unknown for an unavailable or malformed SDK inventory', async () => {
+    const unavailable = daemonIdentityProvisioner({}, async () => { throw new Error('offline'); });
     const malformed = daemonIdentityProvisioner(
-      { OURS_PORT: '4444' },
-      async () => response(200, { unexpected: true }) as never,
+      {}, async () => ({ identities: async () => ({ unexpected: true }) as never }),
     );
     expect(await unavailable.exists('Role')).toBe('unknown');
     expect(await malformed.exists('Role')).toBe('unknown');

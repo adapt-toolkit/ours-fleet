@@ -2,7 +2,6 @@ import { createHash } from 'node:crypto';
 import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { PassThrough } from 'node:stream';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import { errBoundElsewhere } from '@ours.network/sdk/client';
@@ -36,6 +35,10 @@ class ManagementClient implements OursOps {
   /** How many binds must fail, and with which error. */
   bindFailures = 0;
   bindError: () => Error = () => errBoundElsewhere('Coordinator-owner');
+  watchAttempts: Array<(
+    options?: { since?: number | 'tip'; signal?: AbortSignal },
+  ) => AsyncGenerator<Record<string, unknown>, void, undefined>> = [];
+  watchCalls: Array<{ identity: string; since?: number | 'tip' }> = [];
   async start() {}
   async close() {}
   async bindIdentity(name: string) {
@@ -61,6 +64,19 @@ class ManagementClient implements OursOps {
   }
   async deferMessages(msgIds: number[]) {
     this.calls.push({ name: 'deferMessages', args: { msgIds } });
+  }
+  watchNotifications(
+    identity: string, options?: { since?: number | 'tip'; signal?: AbortSignal },
+  ) {
+    this.watchCalls.push({ identity, since: options?.since });
+    const attempt = this.watchAttempts.shift();
+    if (attempt) return attempt(options);
+    return (async function* () {
+      await new Promise<void>(resolve => {
+        if (options?.signal?.aborted) resolve();
+        else options?.signal?.addEventListener('abort', () => resolve(), { once: true });
+      });
+    })();
   }
   async listIncomingFiles() {
     this.calls.push({ name: 'listIncomingFiles', args: undefined });
@@ -105,15 +121,6 @@ function setup(options: { agent?: string; owners?: string[] } = {}) {
       interrupt: false, progress_interval_ms: 0,
       ...(options.agent ? { agent: options.agent } : {}),
     }, session, stateDir: dir, client, log: line => logs.push(line),
-    watch: () => {
-      const stdout = new PassThrough();
-      const stderr = new PassThrough();
-      return {
-        pid: 1, exitCode: null, stdout, stderr,
-        once: (_event: string, callback: () => void) => { callback(); },
-        kill: () => { stdout.end(); stderr.end(); return true; },
-      } as never;
-    },
   });
   return { channel, client, queuePrompt, logs, dir };
 }
@@ -123,80 +130,21 @@ afterEach(() => {
 });
 
 describe('OwnerChannel live management', () => {
-  it('reconnects the direct watch from its durable cursor without duplicating an owner turn', async () => {
-    const dir = mkdtempSync(join(tmpdir(), 'ours-owner-watch-'));
-    dirs.push(dir);
-    writeFileSync(join(dir, '.owner-channel-watch.json'), JSON.stringify({
-      version: 1, cursor: 41, reconnects: 0, consecutiveFailures: 0,
-      reason: 'OWNER_WATCH_CONNECTED', updatedAt: new Date(0).toISOString(),
-    }) + '\n');
-    const client = new ManagementClient();
-    const secretBody = 'OWNER_BODY_MUST_NOT_ENTER_WATCH_STATE';
-    client.batches.push([{
-      msg_id: 90, wire_id: 'watch-continuity-wire', from: { id: OWNER }, text: secretBody,
-    }], []);
-    const queuePrompt = vi.fn(async () => ({
-      promptId: 'watch-prompt', queuedBehind: 0,
-      completion: Promise.resolve({
-        accepted: true, outcome: 'completed' as const, succeeded: true, output: 'done',
-      }),
-    }));
-    const session = {
-      backend: 'acp', pid: 1, isAlive: () => true,
-      snapshot: () => ({ backend: 'acp', alive: true, readiness: 'idle' }),
-      queuePrompt, interrupt: vi.fn(), eventsSince: () => [],
-    } as unknown as SessionHandle;
-    const urls: string[] = [];
-    let attempt = 0;
-    const watchFetch = vi.fn(async (url: string, init?: { signal?: AbortSignal }) => {
-      urls.push(url);
-      if (attempt++ === 0) throw new Error('simulated two-hour socket abort');
-      if (attempt === 2) return {
-        status: 200, ok: true,
-        json: async () => ({ cursor: 42, events: [{ event: 'message_received', msg_id: 90 }] }),
-      };
-      return new Promise<never>((_resolve, reject) => {
-        init?.signal?.addEventListener('abort', () => reject(new Error('closed')), { once: true });
-      });
-    });
-    const delays: number[] = [];
-    const logs: string[] = [];
-    const channel = new OwnerChannel({
-      role: 'Role', harness: 'claude-code',
-      config: { identity: 'Role-owner', owners: [OWNER], interrupt: false, progress_interval_ms: 0 },
-      session, stateDir: dir, client, watchFetch, log: line => logs.push(line),
-      binderDeps: { now: () => 1_000, sleep: async ms => { delays.push(ms); } },
-    });
-
-    await channel.start();
-    await vi.waitFor(() => expect(queuePrompt).toHaveBeenCalledOnce());
-    await vi.waitFor(() => expect(JSON.parse(readFileSync(
-      join(dir, '.owner-channel-watch.json'), 'utf8')).cursor).toBe(42));
-    await channel.close();
-
-    expect(urls.slice(0, 2).every(url => url.endsWith('?since=41'))).toBe(true);
-    expect(delays[0]).toBe(1_000);
-    expect(logs.some(line => line.includes('reason=OWNER_WATCH_STREAM_ERROR'))).toBe(true);
-    const state = readFileSync(join(dir, '.owner-channel-watch.json'), 'utf8');
-    expect(state).toContain('"reconnects":1');
-    expect(state).not.toContain(secretBody);
-    expect(queuePrompt.mock.calls[0][0]).toContain(secretBody);
-  });
-
-  /**
-   * One direct-watch harness for the D11 reliability cases: a caller-supplied
-   * fetch script, a deterministic sleep, and no real timers.
-   */
-  function watchSetup(
-    fetchImpl: (url: string, init?: { signal?: AbortSignal }) => Promise<unknown>,
-    options: { watchState?: string; batches?: unknown[][]; watchStallMs?: number } = {},
-  ) {
+  /** One SDK-watch harness with deterministic retry sleeps. */
+  function watchSetup(options: {
+    watchState?: string;
+    batches?: unknown[][];
+    attempts?: Array<(
+      options?: { since?: number | 'tip'; signal?: AbortSignal },
+    ) => AsyncGenerator<Record<string, unknown>, void, undefined>>;
+  } = {}) {
     const dir = mkdtempSync(join(tmpdir(), 'ours-owner-watch-'));
     dirs.push(dir);
     if (options.watchState !== undefined)
       writeFileSync(join(dir, '.owner-channel-watch.json'), options.watchState);
     const client = new ManagementClient();
     for (const batch of options.batches ?? []) client.batches.push(batch);
+    client.watchAttempts.push(...options.attempts ?? []);
     const queuePrompt = vi.fn(async () => ({
       promptId: 'watch-prompt', queuedBehind: 0,
       completion: Promise.resolve({
@@ -213,9 +161,8 @@ describe('OwnerChannel live management', () => {
     const channel = new OwnerChannel({
       role: 'Role', harness: 'claude-code',
       config: { identity: 'Role-owner', owners: [OWNER], interrupt: false, progress_interval_ms: 0 },
-      session, stateDir: dir, client, watchFetch: fetchImpl as never,
+      session, stateDir: dir, client,
       log: line => logs.push(line),
-      ...(options.watchStallMs !== undefined ? { watchStallMs: options.watchStallMs } : {}),
       binderDeps: { now: () => 1_000, sleep: async ms => { delays.push(ms); } },
     });
     const readState = () => JSON.parse(
@@ -223,108 +170,95 @@ describe('OwnerChannel live management', () => {
     return { channel, client, queuePrompt, logs, delays, dir, readState };
   }
 
-  it('reports OWNER_WATCH_CURSOR_RECOVERED and drains the inbox after an unreadable cursor', async () => {
-    let attempt = 0;
-    const watch = watchSetup(async (_url, init) => {
-      if (attempt++ === 0) return { status: 200, ok: true, json: async () => ({ cursor: 7, events: [] }) };
-      return new Promise<never>((_resolve, reject) => {
-        init?.signal?.addEventListener('abort', () => reject(new Error('closed')), { once: true });
-      });
-    }, {
-      watchState: '{"version":1,"cursor":"corrupted-not-a-number"}\n',
-      batches: [[{
-        msg_id: 61, wire_id: 'recovered-cursor-wire', from: { id: OWNER }, text: 'still in the inbox',
-      }], []],
+  it('drains mail that arrives while disconnected before re-establishing the SDK watch', async () => {
+    const secretBody = 'OWNER_BODY_MUST_NOT_ENTER_WATCH_STATE';
+    const pending = {
+      msg_id: 90, wire_id: 'watch-continuity-wire', from: { id: OWNER }, text: secretBody,
+    };
+    const fail = async function* () { throw new Error('socket disconnected'); };
+    const connected = async function* (options?: { signal?: AbortSignal }) {
+      yield { event: 'message_received', msg_id: '90' };
+      await new Promise<void>(resolve =>
+        options?.signal?.addEventListener('abort', () => resolve(), { once: true }));
+    };
+    const watch = watchSetup({
+      // Initial establishment drains empty. The message appears while the first
+      // watch is disconnected, so only the reconnect drain can recover it.
+      // Replaying the same inbox wire on the notification drain models an
+      // at-least-once recovery; durable wire dedupe must still dispatch once.
+      batches: [[], [pending], [pending], []],
+      attempts: [fail, connected],
     });
 
     await watch.channel.start();
-    await vi.waitFor(() => expect(watch.readState().reason).toBe('OWNER_WATCH_CURSOR_RECOVERED'));
+    await vi.waitFor(() => expect(watch.queuePrompt).toHaveBeenCalledOnce());
+    await vi.waitFor(() => expect(watch.client.watchCalls).toHaveLength(2));
     await watch.channel.close();
 
-    // The lost cursor is only safe to replace with the tip because the inbox —
-    // the authority — was drained first; the owner's pending message still ran.
-    expect(watch.queuePrompt).toHaveBeenCalledOnce();
-    expect(watch.queuePrompt.mock.calls[0][0]).toContain('still in the inbox');
-    expect(watch.logs.some(line =>
-      line.includes('reason=OWNER_WATCH_CURSOR_RECOVERED invalid cursor state'))).toBe(true);
-    expect(watch.readState()).toMatchObject({ cursor: 7, consecutiveFailures: 0 });
+    expect(watch.client.watchCalls).toEqual([
+      { identity: 'Role-owner', since: 0 }, { identity: 'Role-owner', since: 0 },
+    ]);
+    expect(watch.delays[0]).toBe(1_000);
+    expect(watch.logs.some(line => line.includes('reason=OWNER_WATCH_STREAM_ERROR'))).toBe(true);
+    expect(watch.readState()).toMatchObject({ version: 2, reconnects: 1, consecutiveFailures: 0 });
+    expect(JSON.stringify(watch.readState())).not.toContain(secretBody);
+    expect(watch.queuePrompt.mock.calls[0][0]).toContain(secretBody);
   });
 
-  it('never reports a recovered cursor when a valid durable cursor was restored', async () => {
-    let attempt = 0;
-    const watch = watchSetup(async (_url, init) => {
-      if (attempt++ === 0) return { status: 200, ok: true, json: async () => ({ cursor: 12, events: [] }) };
-      return new Promise<never>((_resolve, reject) => {
-        init?.signal?.addEventListener('abort', () => reject(new Error('closed')), { once: true });
-      });
-    }, {
+  it('migrates legacy cursor state but never persists or reuses the cursor', async () => {
+    const connected = async function* (options?: { signal?: AbortSignal }) {
+      yield { event: 'message_received' };
+      await new Promise<void>(resolve =>
+        options?.signal?.addEventListener('abort', () => resolve(), { once: true }));
+    };
+    const watch = watchSetup({
       watchState: JSON.stringify({
-        version: 1, cursor: 11, reconnects: 0, consecutiveFailures: 0,
+        version: 1, cursor: 41, reconnects: 4, consecutiveFailures: 2,
         reason: 'OWNER_WATCH_CONNECTED', updatedAt: new Date(0).toISOString(),
       }) + '\n',
+      batches: [[], []], attempts: [connected],
     });
-
     await watch.channel.start();
-    await vi.waitFor(() => expect(watch.readState().cursor).toBe(12));
+    await vi.waitFor(() => expect(watch.client.watchCalls).toHaveLength(1));
+    await vi.waitFor(() => expect(watch.readState().reason).toBe('OWNER_WATCH_CONNECTED'));
     await watch.channel.close();
-
-    expect(watch.readState().reason).toBe('OWNER_WATCH_CONNECTED');
+    expect(watch.client.watchCalls[0]).toEqual({ identity: 'Role-owner', since: 0 });
+    expect(watch.readState()).toMatchObject({ version: 2, reconnects: 4, consecutiveFailures: 0 });
+    expect(watch.readState()).not.toHaveProperty('cursor');
   });
 
-  it('lets a later stall write state and count failures after an earlier auth rejection', async () => {
-    let attempt = 0;
-    const watch = watchSetup(async (_url, init) => {
-      if (attempt++ === 0) return { status: 401, ok: false, json: async () => ({}) };
-      // Never answers: the stall bound must abort it and be recorded, even
-      // though the previous attempt left OWNER_WATCH_AUTH_FAILED on disk.
-      return new Promise<never>((_resolve, reject) => {
-        init?.signal?.addEventListener('abort', () => reject(new Error('aborted')), { once: true });
-      });
-    }, {
-      watchState: JSON.stringify({
-        version: 1, cursor: 5, reconnects: 0, consecutiveFailures: 0,
-        reason: 'OWNER_WATCH_CONNECTED', updatedAt: new Date(0).toISOString(),
-      }) + '\n',
-      watchStallMs: 20,
+  it('retries every SDK error cause forever with capped exponential backoff', async () => {
+    const failures = Array.from({ length: 8 }, (_, index) => async function* () {
+      throw new Error(index % 2 ? 'HTTP 401 in opaque SDK prose' : 'transport reset');
     });
-
+    const watch = watchSetup({ batches: Array.from({ length: 10 }, () => []), attempts: failures });
     await watch.channel.start();
-    await vi.waitFor(() => expect(watch.readState().reason).toBe('OWNER_WATCH_STALLED'));
-    const stalled = watch.readState();
+    await vi.waitFor(() => expect(watch.client.watchCalls.length).toBeGreaterThanOrEqual(9));
+    const state = watch.readState();
     await watch.channel.close();
 
-    // The write happened at all, and the counter kept moving past the auth
-    // rejection instead of being frozen at 1 by the sticky reason.
-    expect(stalled).toMatchObject({ reason: 'OWNER_WATCH_STALLED', cursor: 5 });
-    expect(stalled.consecutiveFailures as number).toBeGreaterThanOrEqual(2);
-    expect(watch.logs.some(line => line.includes('reason=OWNER_WATCH_AUTH_FAILED'))).toBe(true);
-    expect(watch.logs.some(line => line.includes('reason=OWNER_WATCH_STALLED'))).toBe(true);
+    expect(watch.delays.slice(0, 8)).toEqual([
+      1_000, 2_000, 4_000, 8_000, 16_000, 30_000, 30_000, 30_000,
+    ]);
+    expect(state).toMatchObject({ version: 2, reconnects: 8, consecutiveFailures: 8 });
+    expect(watch.logs.some(line => /AUTH_FAILED|AUTH_FATAL/.test(line))).toBe(false);
   });
 
-  it('stops a permanently rejected watch as fatal instead of retrying forever', async () => {
-    let attempts = 0;
-    const watch = watchSetup(async () => {
-      attempts++;
-      return { status: 401, ok: false, json: async () => ({}) };
-    }, {
-      watchState: JSON.stringify({
-        version: 1, cursor: 3, reconnects: 0, consecutiveFailures: 0,
-        reason: 'OWNER_WATCH_CONNECTED', updatedAt: new Date(0).toISOString(),
-      }) + '\n',
+  it('recovers invalid diagnostic state without weakening the drain-before-watch rule', async () => {
+    const watch = watchSetup({
+      watchState: '{"version":2,"reconnects":"broken"}\n', batches: [[], []],
+      attempts: [async function* (options?: { signal?: AbortSignal }) {
+        yield { event: 'message_received' };
+        await new Promise<void>(resolve =>
+          options?.signal?.addEventListener('abort', () => resolve(), { once: true }));
+      }],
     });
-
     await watch.channel.start();
-    await vi.waitFor(() => expect(watch.readState().reason).toBe('OWNER_WATCH_AUTH_FATAL'));
-    const settled = attempts;
-    // A stopped loop stays stopped: no further attempt arrives after the bound.
-    await new Promise(resolve => setTimeout(resolve, 20));
+    await vi.waitFor(() => expect(watch.readState().reason).toBe('OWNER_WATCH_CONNECTED'));
     await watch.channel.close();
-
-    expect(attempts).toBe(5);
-    expect(settled).toBe(5);
-    expect(watch.readState()).toMatchObject({ cursor: 3, reason: 'OWNER_WATCH_AUTH_FATAL' });
-    expect(watch.logs.some(line =>
-      line.includes('owner watch stopped reason=OWNER_WATCH_AUTH_FATAL'))).toBe(true);
+    expect(watch.logs.some(line => line.includes('OWNER_WATCH_STATE_RECOVERED'))).toBe(true);
+    expect(watch.client.calls[1]?.name).toBe('getMessages');
+    expect(watch.client.watchCalls[0]?.since).toBe(0);
   });
 
   it('relays every managed-agent message as a new message to the latest owner', async () => {
@@ -570,7 +504,7 @@ describe('OwnerChannel live management', () => {
     await channel.close();
   });
 
-  // ours-mcp answered generate_invite with "One-time invite for X created
+  // The legacy connector answered generate_invite with "One-time invite for X created
   // (invite_id …). Share this blob out-of-band …:\n<blob>" and no
   // structuredContent, so the transport returned that sentence and the whole
   // sentence was handed out as the invite. Rewording the daemon's prose changed
@@ -965,8 +899,6 @@ describe('OwnerChannel live management', () => {
         snapshot: () => ({ backend: 'acp', alive: true, readiness: 'idle' }),
         queuePrompt: vi.fn(), interrupt: vi.fn(), eventsSince: () => [] } as unknown as SessionHandle,
       stateDir: dir, client: restartedClient, log: () => undefined,
-      watch: () => ({ pid: 2, exitCode: null, stdout: new PassThrough(), stderr: new PassThrough(),
-        once: (_event: string, callback: () => void) => { callback(); }, kill: () => true }) as never,
     });
     await restarted.start();
     await restarted.manage({ action: 'task_report', taskId: opened.taskId,

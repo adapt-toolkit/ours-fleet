@@ -552,9 +552,10 @@ their content signature must match the declared MIME, and symlinks or non-regula
 paths fail closed. Sanitized copies live only in a mode-0700 request directory as
 mode-0600 files and are removed after completion or bounded stale retention.
 
-Voice prompts include a bounded transcript only when ours-mcp reports success.
+Voice prompts include a bounded transcript only when typed daemon metadata reports success.
 Failure or unavailability is explicit and preserves the private audio path as the
-fallback. Run \`ours-mcp voice-status --json\` to inspect the host configuration.
+fallback. Run \`ours config show --json\` and inspect \`sttConfigured\` without
+revealing provider credentials.
 A mode-0600 crash journal contains only authenticated CID and wire routing data;
 it never stores captions, filenames, paths, transcript text, or bytes. Journaled
 post-retrieval files resume selectively through \`save_file\`. A deferred agent

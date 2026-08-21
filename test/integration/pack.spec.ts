@@ -78,11 +78,12 @@ describe('npm pack from a checkout with no dist', () => {
     expect(entries).not.toContain('dist/owner-channel/mcp.js');
   });
 
-  it('declares the pinned ours SDK, so the shipped client can resolve it', async () => {
+  it('declares the pinned ours SDK and structured CLI', async () => {
     const shipped = await run('tar', ['-xzOf', packed, 'package/package.json'],
       { maxBuffer: 32 * 1024 * 1024 });
     const pkg = JSON.parse(shipped.stdout) as { dependencies: Record<string, string> };
-    expect(pkg.dependencies['@ours.network/sdk']).toBe('1.5.2');
+    expect(pkg.dependencies['@ours.network/sdk']).toBe('2.0.1');
+    expect(pkg.dependencies['@ours.network/cli']).toBe('1.0.1');
   });
 
   it('leaks no environment file, tarball, or node_modules into the package', () => {

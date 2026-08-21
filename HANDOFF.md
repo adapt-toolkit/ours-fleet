@@ -448,9 +448,9 @@ one.
 The spec says "verify the effective identity and create it when absent". Verification is
 implemented for real (the daemon's authenticated `/identities`, already used by doctor).
 **Creation is a seam** (`IdentityProvisioner.create`), and there is NO default implementation,
-because there is no supported way to create a ROLE identity from this repo: `ours-mcp` exposes
-only `create-root`, and role identities are minted through the MCP `create_identity` tool
-inside an agent session. Inventing a daemon endpoint is what Coordinator ruled out for 6.4.
+because fleet deliberately leaves role identity creation and binding to the application
+session, preserving session-owned temporary identity cleanup. The SDK can create identities,
+but moving that ownership into fleet would change lifecycle semantics beyond this iteration.
 
 So when the identity is absent and nothing can create it, the fleet does NOT hard-fail the
 spawn. It warns loudly, and the generated briefing tells the agent to mint it — which is what

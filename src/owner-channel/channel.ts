@@ -1,8 +1,6 @@
-import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { existsSync, readFileSync } from 'node:fs';
 import { mkdir, readFile, readdir, rm } from 'node:fs/promises';
-import { createInterface } from 'node:readline';
 import { join } from 'node:path';
 
 import {
@@ -10,7 +8,6 @@ import {
   type OwnerAttachmentConfig, type OwnerChannelConfig,
 } from '../config.js';
 import { replaceFileAtomically } from '../atomic-file.js';
-import { resolveEndpoint, type FetchLike } from '../monitor.js';
 import {
   ACP_CANCEL_DEADLINE_EXCEEDED, SessionControlError, interruptOutcome,
   type QueuedPrompt, type SessionEvent, type SessionHandle, type TurnResult,
@@ -50,8 +47,9 @@ import {
 
 /**
  * The daemon's own inbound message shape. It used to be a hand-written union of
- * every field name ours-mcp might have rendered, because the transport returned
- * whatever text the tool produced; the typed client removes the guesswork.
+ * every field name the legacy connector might have rendered, because the
+ * transport returned whatever text the tool produced; the typed client removes
+ * the guesswork.
  */
 type InboundMessage = OursInboundMessage;
 
@@ -69,19 +67,8 @@ export interface OwnerChannelOptions {
   session: SessionHandle;
   stateDir: string;
   env?: Record<string, string>;
-  /**
-   * `ours-mcp` binary for the legacy `watch` child process only. Daemon
-   * operations no longer go through it; they use the ours SDK client.
-   */
-  command?: string;
   log(line: string): void;
   client?: OursOps;
-  /** Legacy child-process test seam; production uses the direct notification API. */
-  watch?: (identity: string) => ChildProcessWithoutNullStreams;
-  /** Test seam for the production direct notification long-poll. */
-  watchFetch?: FetchLike;
-  /** Test seam for the long-poll stall bound; production uses OWNER_WATCH_STALL_MS. */
-  watchStallMs?: number;
   /** Test seam; production uses the detached ours-fleet CLI (`fleetCliOps`). */
   fleet?: OwnerFleetOps;
   /** Forwarded to fleet CLI invocations spawned for owner commands. */
@@ -169,23 +156,12 @@ const COMMENTARY_MAX_CHARS = 1_600;
 const COMMENTARY_MAX_BYTES = 6_400;
 const COMMENTARY_MAX_UPDATES = 32;
 const COMMENTARY_DEDUPE_LIMIT = 512;
-const OWNER_WATCH_STALL_MS = 120_000;
 const OWNER_WATCH_BACKOFF_MAX_MS = 30_000;
-/**
- * Credentials that are wrong now are wrong on the next attempt too. Retrying a
- * permanent 401 forever burns the daemon and hides the real fault behind an
- * endless reconnect log, so the watch stops after this many consecutive auth
- * rejections and records a terminal reason instead.
- */
-const OWNER_WATCH_AUTH_FATAL_ATTEMPTS = 5;
-
-type OwnerWatchReason = 'OWNER_WATCH_CONNECTED' | 'OWNER_WATCH_STREAM_ERROR'
-  | 'OWNER_WATCH_STALLED' | 'OWNER_WATCH_AUTH_FAILED' | 'OWNER_WATCH_AUTH_FATAL'
-  | 'OWNER_WATCH_CURSOR_RECOVERED';
+type OwnerWatchReason = 'OWNER_WATCH_CONNECTING' | 'OWNER_WATCH_CONNECTED'
+  | 'OWNER_WATCH_STREAM_ERROR' | 'OWNER_WATCH_STATE_RECOVERED';
 
 interface OwnerWatchState {
-  version: 1;
-  cursor: number;
+  version: 2;
   reconnects: number;
   consecutiveFailures: number;
   reason: OwnerWatchReason;
@@ -224,7 +200,6 @@ export class OwnerChannel implements OwnerChannelHandle {
   private readonly commentsBaseline: boolean;
   private commentsEnabled: boolean;
   private stopping = false;
-  private watchProcess?: ChildProcessWithoutNullStreams;
   private watchTask?: Promise<void>;
   private watchAbort?: AbortController;
   private drainTask?: Promise<void>;
@@ -315,9 +290,10 @@ export class OwnerChannel implements OwnerChannelHandle {
       ).catch(error => this.logError('attachment crash cleanup failed', error));
     }
     this.ready = true;
-    this.watchTask = this.options.watch ? this.legacyWatchLoop() : this.watchLoop();
     // Do not make role startup wait for an old owner request to finish a turn.
-    void this.drain().catch(error => this.logError('initial drain failed', error));
+    // watchLoop itself drains before every establishment, including this first
+    // one, so there is no drain-to-tip race.
+    this.watchTask = this.watchLoop();
   }
 
   drain(): Promise<void> {
@@ -335,12 +311,8 @@ export class OwnerChannel implements OwnerChannelHandle {
   async close(): Promise<void> {
     this.stopping = true;
     this.ready = false;
-    const watch = this.watchProcess;
-    this.watchProcess = undefined;
-    if (watch && watch.exitCode === null) watch.kill('SIGTERM');
     this.watchAbort?.abort();
-    if (!this.options.watch)
-      await this.watchTask?.catch(error => this.logError('watch shutdown failed', error));
+    await this.watchTask?.catch(error => this.logError('watch shutdown failed', error));
     this.watchTask = undefined;
     await this.managementTail;
     try { await this.client.close(); }
@@ -1725,164 +1697,116 @@ export class OwnerChannel implements OwnerChannelHandle {
   }
 
   private async watchLoop(): Promise<void> {
-    const endpoint = resolveEndpoint({ ...process.env, ...(this.options.env ?? {}) });
-    const fetch = this.options.watchFetch
-      ?? ((url: string, init?: { headers?: Record<string, string>; signal?: AbortSignal }) =>
-        globalThis.fetch(url, init) as unknown as ReturnType<FetchLike>);
     const sleep = this.options.binderDeps?.sleep
       ?? (ms => new Promise<void>(resolve => setTimeout(resolve, ms)));
     const restored = this.readWatchState();
     let state = restored.state;
-    // An unreadable cursor is the ONLY reason to restart at the tip. Say so on
-    // the next successful connect, and drain first: everything the lost cursor
-    // would have pointed at is still in the inbox, which is the authority.
-    let recovering = restored.recovered;
-    let cursor: number | 'tip' = state?.cursor ?? 'tip';
+    if (restored.recovered)
+      state = this.writeWatchState(state, 'OWNER_WATCH_STATE_RECOVERED');
     let delayMs = 1_000;
-    let authFailures = 0;
-    if (recovering) await this.drain().catch(error => this.logError('cursor recovery drain failed', error));
+    let attempts = 0;
     while (!this.stopping) {
       const ctrl = new AbortController();
       this.watchAbort = ctrl;
-      let stalled = false;
-      let authRejected = false;
-      const timer = setTimeout(() => { stalled = true; ctrl.abort(); },
-        this.options.watchStallMs ?? OWNER_WATCH_STALL_MS);
-      timer.unref?.();
       try {
-        const response = await fetch(
-          `${endpoint.url(this.options.config.identity)}?since=${cursor}`,
-          { headers: endpoint.headers, signal: ctrl.signal },
-        );
-        if (response.status === 401) {
-          authRejected = true;
-          authFailures++;
-          const at = cursor === 'tip' ? state?.cursor ?? 0 : cursor;
-          if (authFailures >= OWNER_WATCH_AUTH_FATAL_ATTEMPTS) {
-            state = this.writeWatchState(state, at, 'OWNER_WATCH_AUTH_FATAL', true);
-            this.options.log(`[${this.options.role}] owner watch stopped `
-              + `reason=OWNER_WATCH_AUTH_FATAL after ${authFailures} consecutive HTTP 401 responses; `
-              + 'owner notifications require re-authorization and will not be retried');
-            return;
-          }
-          state = this.writeWatchState(state, at, 'OWNER_WATCH_AUTH_FAILED', true);
-          throw new Error('OWNER_WATCH_AUTH_FAILED: daemon rejected notification credentials');
+        // This drain is unconditional at EVERY establishment. Starting the SDK
+        // stream at 0 then replays notification hints instead of tip-priming,
+        // so mail arriving after the drain but before the first request cannot
+        // fall into a gap. The inbox is authoritative and its durable wire-ID
+        // dedupe makes replayed hints harmless.
+        await this.drain();
+        if (this.stopping) return;
+        state = this.writeWatchState(
+          state, 'OWNER_WATCH_CONNECTING', { reconnected: attempts > 0 });
+        attempts++;
+        for await (const _event of this.client.watchNotifications(
+          this.options.config.identity, { since: 0, signal: ctrl.signal },
+        )) {
+          if (this.stopping) return;
+          state = this.writeWatchState(
+            state, 'OWNER_WATCH_CONNECTED', { resetFailures: true });
+          delayMs = 1_000;
+          // Notification events contain no bodies and are only wake hints.
+          // Draining is idempotent at the turn boundary because wire IDs are
+          // recorded before a managed request is dispatched.
+          await this.drain();
         }
-        if (!response.ok) throw new Error(`daemon returned HTTP ${response.status}`);
-        const body = await response.json();
-        const next = typeof body.cursor === 'number' ? body.cursor : cursor === 'tip' ? 0 : cursor;
-        const reconnect = (state?.consecutiveFailures ?? 0) > 0;
-        state = this.writeWatchState(state, next,
-          recovering ? 'OWNER_WATCH_CURSOR_RECOVERED' : 'OWNER_WATCH_CONNECTED',
-          false, reconnect);
-        recovering = false;
-        authFailures = 0;
-        cursor = next;
-        delayMs = 1_000;
-        // Notification events are content-free hints. The inbox remains the
-        // authority and its wire-level durable dedupe prevents duplicate turns.
-        if ((body.events?.length ?? 0) > 0) await this.drain();
+        if (!this.stopping) throw new Error('ours SDK notification stream ended');
       } catch (error) {
         if (this.stopping) return;
-        const reason: OwnerWatchReason = stalled
-          ? 'OWNER_WATCH_STALLED' : 'OWNER_WATCH_STREAM_ERROR';
-        const current = cursor === 'tip' ? state?.cursor ?? 0 : cursor;
-        cursor = current;
-        // Only THIS iteration's auth rejection is already written. A stale
-        // AUTH_FAILED from an earlier attempt must never suppress the cursor,
-        // the failure counter, or a later STALLED transition.
-        if (!authRejected) state = this.writeWatchState(state, current, reason, true);
+        // SDK 2 deliberately hides transport status behind its typed stream.
+        // Do not parse error prose to rediscover it: every failure follows the
+        // same capped retry path forever, and the pre-establishment drain makes
+        // that retry correctness-preserving.
+        state = this.writeWatchState(
+          state, 'OWNER_WATCH_STREAM_ERROR', { failed: true });
         this.options.log(`[${this.options.role}] owner watch reconnect `
-          + `reason=${authRejected ? 'OWNER_WATCH_AUTH_FAILED' : reason} `
-          + `delay_ms=${delayMs} cursor=${current}`);
+          + `reason=OWNER_WATCH_STREAM_ERROR delay_ms=${delayMs} `
+          + `failures=${state.consecutiveFailures}: ${this.errorText(error)}`);
         await sleep(delayMs);
         delayMs = Math.min(delayMs * 2, OWNER_WATCH_BACKOFF_MAX_MS);
       } finally {
-        clearTimeout(timer);
         if (this.watchAbort === ctrl) this.watchAbort = undefined;
       }
     }
   }
 
   /**
-   * `recovered` distinguishes a first-ever start (no state, nothing lost) from a
-   * cursor we HAD and can no longer read. Only the latter is a recovery, and the
-   * caller needs to know because the reason it reports is the only evidence a
-   * durable cursor was ever lost.
+   * `recovered` distinguishes a first-ever start from unreadable persisted
+   * diagnostics. Notification correctness does not depend on this state: every
+   * establishment drains and then replays SDK hints from offset zero.
    */
   private readWatchState(): { state?: OwnerWatchState; recovered: boolean } {
     const path = join(this.options.stateDir, '.owner-channel-watch.json');
     if (!existsSync(path)) return { recovered: false };
     try {
-      const value = JSON.parse(readFileSync(path, 'utf8')) as Partial<OwnerWatchState>;
-      if (value.version !== 1 || !Number.isSafeInteger(value.cursor) || value.cursor! < 0
+      const value = JSON.parse(readFileSync(path, 'utf8')) as {
+        version?: number;
+        reconnects?: number;
+        consecutiveFailures?: number;
+        reason?: string;
+        updatedAt?: string;
+      };
+      if ((value.version !== 1 && value.version !== 2)
           || !Number.isSafeInteger(value.reconnects) || value.reconnects! < 0
           || !Number.isSafeInteger(value.consecutiveFailures) || value.consecutiveFailures! < 0)
         throw new Error('invalid owner watch state');
-      return { state: value as OwnerWatchState, recovered: false };
+      const reasons = new Set<OwnerWatchReason>([
+        'OWNER_WATCH_CONNECTING', 'OWNER_WATCH_CONNECTED',
+        'OWNER_WATCH_STREAM_ERROR', 'OWNER_WATCH_STATE_RECOVERED',
+      ]);
+      return { state: {
+        version: 2,
+        reconnects: value.reconnects!,
+        consecutiveFailures: value.consecutiveFailures!,
+        reason: reasons.has(value.reason as OwnerWatchReason)
+          ? value.reason as OwnerWatchReason : 'OWNER_WATCH_CONNECTING',
+        updatedAt: typeof value.updatedAt === 'string'
+          ? value.updatedAt : new Date(this.options.binderDeps?.now?.() ?? Date.now()).toISOString(),
+      }, recovered: false };
     } catch {
       this.options.log(`[${this.options.role}] owner watch `
-        + 'reason=OWNER_WATCH_CURSOR_RECOVERED invalid cursor state; draining inbox and starting at tip');
+        + 'reason=OWNER_WATCH_STATE_RECOVERED invalid persisted counters; restarting safely');
       return { recovered: true };
     }
   }
 
   private writeWatchState(
-    previous: OwnerWatchState | undefined, cursor: number, reason: OwnerWatchReason,
-    failed: boolean, reconnected = false,
+    previous: OwnerWatchState | undefined, reason: OwnerWatchReason,
+    options: { failed?: boolean; resetFailures?: boolean; reconnected?: boolean } = {},
   ): OwnerWatchState {
     const state: OwnerWatchState = {
-      version: 1,
-      cursor,
-      reconnects: (previous?.reconnects ?? 0) + (reconnected ? 1 : 0),
-      consecutiveFailures: failed ? (previous?.consecutiveFailures ?? 0) + 1 : 0,
+      version: 2,
+      reconnects: (previous?.reconnects ?? 0) + (options.reconnected ? 1 : 0),
+      consecutiveFailures: options.failed
+        ? (previous?.consecutiveFailures ?? 0) + 1
+        : options.resetFailures ? 0 : previous?.consecutiveFailures ?? 0,
       reason,
       updatedAt: new Date(this.options.binderDeps?.now?.() ?? Date.now()).toISOString(),
     };
     replaceFileAtomically(
       join(this.options.stateDir, '.owner-channel-watch.json'), `${JSON.stringify(state)}\n`, 0o600);
     return state;
-  }
-
-  /** Compatibility path for injected child-process tests; production is direct. */
-  private async legacyWatchLoop(): Promise<void> {
-    let delayMs = 1_000;
-    while (!this.stopping) {
-      try {
-        const child = this.options.watch?.(this.options.config.identity) ?? spawn(
-          this.options.command ?? 'ours-mcp', ['watch', this.options.config.identity], {
-            env: { ...process.env, ...(this.options.env ?? {}) }, stdio: ['pipe', 'pipe', 'pipe'],
-          });
-        this.watchProcess = child;
-        await new Promise<void>((resolve, reject) => {
-          if (child.pid) { resolve(); return; }
-          child.once('spawn', resolve);
-          child.once('error', reject);
-        });
-        createInterface({ input: child.stderr }).on('line', line =>
-          this.options.log(`[${this.options.role}] owner watch: ${line}`));
-        delayMs = 1_000;
-        // Drain at every (re)attachment, not only after a future notification:
-        // a failed send/turn leaves the input deferred and may not emit another
-        // watch line by itself.
-        await this.drain();
-        for await (const _line of createInterface({ input: child.stdout })) {
-          if (this.stopping) break;
-          await this.drain();
-        }
-        if (!this.stopping) throw new Error('watch exited');
-      } catch (error) {
-        if (!this.stopping) {
-          this.logError('watch failed; retrying', error);
-          await new Promise(resolve => setTimeout(resolve, delayMs));
-          delayMs = Math.min(delayMs * 2, 30_000);
-        }
-      } finally {
-        const child = this.watchProcess;
-        this.watchProcess = undefined;
-        if (child && child.exitCode === null) child.kill('SIGTERM');
-      }
-    }
   }
 
   private errorText(error: unknown): string {

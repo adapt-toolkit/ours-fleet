@@ -71,7 +71,7 @@ export function makeSystemdBackend(exec: Exec = realExec): SupervisorBackend {
       const unitDir = join(home(), '.config', 'systemd', 'user');
       // Lingering user units often start before a login shell imports its PATH.
       // Pin the Node runtime and persist the install-time PATH so the runner and
-      // children such as `ours-mcp proxy` resolve the same tools after reboot.
+      // structured operator CLI resolve the same tools after reboot.
       const servicePath = [...new Set([
         dirname(process.execPath),
         ...(process.env.PATH ?? '').split(delimiter),

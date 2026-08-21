@@ -1,8 +1,11 @@
 import { randomUUID } from 'node:crypto';
+import { readFile } from 'node:fs/promises';
+import { extname } from 'node:path';
 
-import { OursClient, OursError, type OursClientOptions } from '@ours.network/sdk/client';
-
-import { resolveApiToken, resolveEndpoint } from '../monitor.js';
+import {
+  OursClient, OursError, attachOursClient, type AttachOursClientOptions,
+  type NotificationEvent,
+} from '@ours.network/sdk/client';
 
 /** Any failure of a daemon operation. Never carries a message body or a token. */
 export class OursDaemonError extends Error {}
@@ -26,12 +29,83 @@ export type OursInboundMessage = OursMessagesPayload['messages'][number];
 export type OursIncomingFile = Res<'listIncomingFiles'>[number];
 export type OursRetrievedFiles = Res<'getFiles'>;
 export type OursRetrievedFile = OursRetrievedFiles['files'][number];
+export type OursNotificationEvent = NotificationEvent;
+
+// The daemon normally returns a quiet long-poll within 25 seconds. Keep the
+// client-side fence comfortably above it so ordinary quiet periods do not
+// recycle a healthy stream, while a half-open socket still heals on its own.
+const NOTIFICATION_REQUEST_DEADLINE_MS = 120_000;
+
+// SDK sendFile({path}) inferred these common types before reading the path in
+// the daemon process. Staged uploads move that read into fleet, so preserve the
+// same advertised MIME rather than silently turning every attachment into an
+// octet stream. Importing the SDK root just for its helper would also pull the
+// daemon runtime into this client-only process.
+const FILE_MIME_BY_EXTENSION: Readonly<Record<string, string>> = {
+  '.png': 'image/png', '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.gif': 'image/gif',
+  '.webp': 'image/webp', '.svg': 'image/svg+xml', '.bmp': 'image/bmp', '.ico': 'image/x-icon',
+  '.pdf': 'application/pdf', '.txt': 'text/plain', '.md': 'text/markdown',
+  '.json': 'application/json', '.csv': 'text/csv', '.html': 'text/html',
+  '.xml': 'application/xml', '.zip': 'application/zip', '.gz': 'application/gzip',
+  '.tar': 'application/x-tar', '.mp3': 'audio/mpeg', '.wav': 'audio/wav',
+  '.mp4': 'video/mp4', '.mov': 'video/quicktime',
+};
+
+function mimeFromFilename(filename: string): string {
+  return FILE_MIME_BY_EXTENSION[extname(filename).toLowerCase()] ?? 'application/octet-stream';
+}
+
+export class OursWatchDeadlineError extends OursDaemonError {}
+
+function notificationRequest(input: Parameters<typeof globalThis.fetch>[0]): boolean {
+  const url = typeof input === 'string' || input instanceof URL ? String(input) : input.url;
+  return /\/identities\/[^/]+\/notifications(?:\?|$)/.test(url);
+}
+
+function notificationDeadlineFetch(
+  fetchImpl: typeof globalThis.fetch, deadlineMs: number,
+): typeof globalThis.fetch {
+  return async (input, init) => {
+    if (!notificationRequest(input)) return fetchImpl(input, init);
+    const ctrl = new AbortController();
+    const upstream = init?.signal;
+    let rejectFence!: (error: unknown) => void;
+    const fence = new Promise<never>((_resolve, reject) => { rejectFence = reject; });
+    const abortUpstream = () => {
+      const reason = upstream?.reason
+        ?? new DOMException('ours notification request aborted', 'AbortError');
+      ctrl.abort(reason);
+      // Shutdown must not wait for the deadline when a custom fetch ignores
+      // AbortSignal either.
+      rejectFence(reason);
+    };
+    if (upstream?.aborted) abortUpstream();
+    else upstream?.addEventListener('abort', abortUpstream, { once: true });
+    const timer = setTimeout(() => {
+      const error = new OursWatchDeadlineError('ours notification request deadline exceeded');
+      ctrl.abort(error);
+      // Do not rely on a custom or half-open fetch implementation to honor
+      // AbortSignal: the fence itself must always settle the request.
+      rejectFence(error);
+    }, deadlineMs);
+    timer.unref?.();
+    try {
+      return await Promise.race([
+        fetchImpl(input, { ...init, signal: ctrl.signal }),
+        fence,
+      ]);
+    } finally {
+      clearTimeout(timer);
+      upstream?.removeEventListener('abort', abortUpstream);
+    }
+  };
+}
 
 /**
  * The daemon operations the owner channel needs, one typed method each.
  *
  * This interface deliberately has no generic `callTool(name, args): unknown`
- * escape hatch. The MCP surface had one, and because ours-mcp answers every
+ * escape hatch. The legacy MCP connector answered every
  * tool with `{content:[{type:'text',...}]}` and no `structuredContent`, the
  * transport fell back to returning the daemon's English sentence — which the
  * channel then pattern-matched (an invite blob sliced out of a prose sentence,
@@ -48,6 +122,10 @@ export interface OursOps {
   addContact(a: { invite: string; name?: string }): Promise<OursAddContactResult>;
   getMessages(): Promise<OursMessagesPayload>;
   deferMessages(msgIds: number[]): Promise<void>;
+  watchNotifications(
+    identity: string,
+    options?: { since?: number | 'tip'; signal?: AbortSignal },
+  ): AsyncGenerator<OursNotificationEvent, void, undefined>;
   listIncomingFiles(): Promise<OursIncomingFile[]>;
   getFiles(wireIds: string[]): Promise<OursRetrievedFiles>;
   /**
@@ -83,8 +161,12 @@ export function oursErrorCode(error: unknown): string | undefined {
 export const OURS_BOUND_ELSEWHERE = 'BOUND_ELSEWHERE';
 
 export interface OursSdkClientDeps {
-  /** Test seam; production builds an `OursClient` from the resolved endpoint. */
-  createClient?(options: OursClientOptions): OursClient;
+  /** Test seam; production uses the SDK's coherence-checking application attach path. */
+  attachClient?(options: AttachOursClientOptions): OursClient | Promise<OursClient>;
+  /** Underlying transport and deadline seams for deterministic half-open tests. */
+  fetch?: typeof globalThis.fetch;
+  notificationRequestDeadlineMs?: number;
+  readFile?(path: string): Promise<Uint8Array>;
 }
 
 /**
@@ -92,7 +174,7 @@ export interface OursSdkClientDeps {
  * API, owning exactly one identity binding.
  *
  * Lease lifetime. The lease token IS the session, so each channel instance mints
- * its own and hands it back in `close()`. That replaces the `ours-mcp proxy`
+ * its own and hands it back in `close()`. That replaces the connector proxy's
  * shell-PID fence, which existed because a supervised attempt had to make its
  * lease reclaimable while the supervisor itself stayed alive: an explicit
  * release does that deterministically, and `clientPid` still covers the case
@@ -111,17 +193,19 @@ export class OursSdkClient implements OursOps {
   async start(): Promise<void> {
     if (this.client) return;
     const environment = { ...process.env, ...this.env };
-    // Reuse fleet's own daemon resolution so this client and the notification
-    // watch loop can never disagree about which daemon they are talking to.
-    const endpoint = resolveEndpoint(environment);
-    const apiToken = resolveApiToken(environment);
-    const options: OursClientOptions = {
-      url: endpoint.origin,
+    // SDK 2's supported application path resolves endpoint, state root, and
+    // token as one coherent selection, proves the daemon's state root before
+    // sending credentials, and only then constructs the client.
+    const options: AttachOursClientOptions = {
+      env: environment,
       leaseToken: this.leaseToken,
       clientPid: process.pid,
-      ...(apiToken ? { apiToken } : {}),
+      fetch: notificationDeadlineFetch(
+        this.deps.fetch ?? globalThis.fetch,
+        this.deps.notificationRequestDeadlineMs ?? NOTIFICATION_REQUEST_DEADLINE_MS,
+      ),
     };
-    this.client = this.deps.createClient?.(options) ?? new OursClient(options);
+    this.client = await (this.deps.attachClient?.(options) ?? attachOursClient(options));
   }
 
   async bindIdentity(name: string): Promise<void> {
@@ -150,6 +234,13 @@ export class OursSdkClient implements OursOps {
     await this.ops().deferMessages({ msg_ids: msgIds });
   }
 
+  watchNotifications(
+    identity: string,
+    options?: { since?: number | 'tip'; signal?: AbortSignal },
+  ): AsyncGenerator<OursNotificationEvent, void, undefined> {
+    return this.ops().watchNotifications(identity, options);
+  }
+
   async listIncomingFiles(): Promise<OursIncomingFile[]> {
     return this.ops().listIncomingFiles();
   }
@@ -171,7 +262,7 @@ export class OursSdkClient implements OursOps {
       contact: a.contact, text: a.text,
       ...(a.replyToWireId ? { reply_to_wire_id: a.replyToWireId } : {}),
     });
-    // Parity with ours-mcp 0.16.0: only `refused` was a tool error. `migrating`,
+    // Legacy parity: only `refused` was a tool error. `migrating`,
     // `deferred` and `e2e` are accepted-and-queued outcomes that it reported as
     // success, so they must not become failures here.
     if (verdict.kind === 'refused')
@@ -183,11 +274,18 @@ export class OursSdkClient implements OursOps {
   async sendFile(
     a: { contact: string; path: string; filename: string; replyToWireId?: string },
   ): Promise<void> {
+    // The shared daemon may be owned by a different OS process/user and must
+    // never be expected to open fleet-private outbox paths. SDK 2 stages bytes
+    // read by THIS process, then sends only the opaque upload receipt.
+    const bytes = await (this.deps.readFile?.(a.path) ?? readFile(a.path));
+    const staged = await this.ops().uploadFile(bytes, {
+      filename: a.filename, mime: mimeFromFilename(a.filename),
+    });
     const verdict = await this.ops().sendFile({
-      contact: a.contact, path: a.path, filename: a.filename,
+      contact: a.contact, upload_id: staged.upload_id, filename: a.filename,
       ...(a.replyToWireId ? { reply_to_wire_id: a.replyToWireId } : {}),
     });
-    // Parity with ours-mcp 0.16.0, which treated `migrating` as an error for
+    // Legacy parity treated `migrating` as an error for
     // files and as success for messages: files are not auto-queued behind a
     // migration, so "queued" would be a false delivery claim.
     if (verdict.kind === 'refused' || verdict.kind === 'migrating')
