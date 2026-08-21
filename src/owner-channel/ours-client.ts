@@ -24,11 +24,14 @@ type Res<M extends keyof OursClient> =
 export type OursContactsView = Res<'listContacts'>;
 export type OursInviteResult = Res<'generateInvite'>;
 export type OursAddContactResult = Res<'addContact'>;
+export type OursIncomingMessage = Res<'listIncomingMessages'>[number];
 export type OursMessagesPayload = Res<'getMessages'>;
 export type OursInboundMessage = OursMessagesPayload['messages'][number];
+export type OursHistoryMessage = NonNullable<Res<'getHistoryItem'>>;
 export type OursIncomingFile = Res<'listIncomingFiles'>[number];
 export type OursRetrievedFiles = Res<'getFiles'>;
 export type OursRetrievedFile = OursRetrievedFiles['files'][number];
+export type OursHistoryFile = NonNullable<Res<'getFileInfo'>>;
 export type OursNotificationEvent = NotificationEvent;
 
 // The daemon normally returns a quiet long-poll within 25 seconds. Keep the
@@ -120,13 +123,15 @@ export interface OursOps {
   listContacts(): Promise<OursContactsView>;
   generateInvite(name?: string): Promise<OursInviteResult>;
   addContact(a: { invite: string; name?: string }): Promise<OursAddContactResult>;
-  getMessages(): Promise<OursMessagesPayload>;
-  deferMessages(msgIds: number[]): Promise<void>;
+  listIncomingMessages(): Promise<OursIncomingMessage[]>;
+  getMessages(limit: number): Promise<OursMessagesPayload>;
+  getHistoryItem(wireId: string): Promise<OursHistoryMessage | null>;
   watchNotifications(
     identity: string,
     options?: { since?: number | 'tip'; signal?: AbortSignal },
   ): AsyncGenerator<OursNotificationEvent, void, undefined>;
   listIncomingFiles(): Promise<OursIncomingFile[]>;
+  getFileInfo(wireId: string): Promise<OursHistoryFile | null>;
   getFiles(wireIds: string[]): Promise<OursRetrievedFiles>;
   /**
    * The bytes of an already-retrieved file. Transport only — the caller owns
@@ -226,12 +231,16 @@ export class OursSdkClient implements OursOps {
     return this.ops().addContact({ invite: a.invite, ...(a.name ? { name: a.name } : {}) });
   }
 
-  async getMessages(): Promise<OursMessagesPayload> {
-    return this.ops().getMessages();
+  async listIncomingMessages(): Promise<OursIncomingMessage[]> {
+    return this.ops().listIncomingMessages();
   }
 
-  async deferMessages(msgIds: number[]): Promise<void> {
-    await this.ops().deferMessages({ msg_ids: msgIds });
+  async getMessages(limit: number): Promise<OursMessagesPayload> {
+    return this.ops().getMessages({ limit });
+  }
+
+  async getHistoryItem(wireId: string): Promise<OursHistoryMessage | null> {
+    return this.ops().getHistoryItem({ wire_id: wireId });
   }
 
   watchNotifications(
@@ -243,6 +252,10 @@ export class OursSdkClient implements OursOps {
 
   async listIncomingFiles(): Promise<OursIncomingFile[]> {
     return this.ops().listIncomingFiles();
+  }
+
+  async getFileInfo(wireId: string): Promise<OursHistoryFile | null> {
+    return this.ops().getFileInfo({ wire_id: wireId });
   }
 
   async getFiles(wireIds: string[]): Promise<OursRetrievedFiles> {

@@ -68,6 +68,8 @@ The state dir contract:
 | `.identity`, `.cwd`, `.session-id`, `.booted`, `.exit-status`, `.config-path` | supervisor | dot-marker state — session resume and boot bookkeeping |
 | `.monitor-state.json`, `.monitor-status` | supervisor monitor | atomic body-free cursor/pending state and health |
 | `.owner-channel-state.json` | owner-channel bridge | bounded wire-ID dedupe only; never message/reply plaintext |
+| `.owner-channel-message-recovery.json` | owner-channel bridge | mode-0600 body-free message claim journal: wire ID, history sequence, and claim time only |
+| `.owner-channel-attachment-recovery.json` | owner-channel bridge | mode-0600 attachment route journal; never filenames, paths, transcript text, or bytes |
 | `.owner-channel-binder.lock/`, `.owner-channel-binder.json` | owner-channel supervisor | mode-0600 role/identity + PID/start-marker ownership and release metadata; never mail plaintext or credentials |
 | `.session-events.jsonl`, `.control.sock`, `.control-token` | ACP backend | bounded typed console projection and private attachment control |
 
@@ -871,17 +873,21 @@ command path sits behind the authenticated owner-CID check: a non-owner sending
 `/force-restart` or `/model` is silently ignored exactly like any other
 unauthorized mail.
 
-Processed wire IDs are durably bounded for deduplication, while
-message and response bodies stay out of fleet state. Delivery is at-least-once
-across a crash (the bridge requeues fetched input before starting a turn); true
-exactly-once processing would require a leased claim/idempotency primitive in
-the ours daemon.
+Handled wire IDs are durably bounded for deduplication, while message and
+response bodies stay out of fleet state. Before consuming mail, fleet reads the
+body-free oldest-first metadata from `listIncomingMessages`, atomically journals
+the exact wire/sequence slice (at most 200), and calls `getMessages` with that
+exact length. A returned wire/sequence set mismatch fails closed. After a crash,
+journaled bodies are loaded only from persistent history with `getHistoryItem`;
+the journal is pruned only after the existing durable owner-channel state marks
+the wire handled. This provides at-least-once turn delivery without placing
+message plaintext in fleet state.
 
 Inbound owner attachments use the same authenticated-CID and exact-wire routing
-boundary. Fleet first calls the metadata-only `list_incoming_files`, groups a
+boundary. Fleet first calls the metadata-only `listIncomingFiles`, groups a
 file-only wake or a same-sender reply-linked text caption, and checks the enabled,
 count, declared MIME, per-file size, and total-size policy before retrieving any
-bytes. It then calls selective `get_files` only for the admitted wire IDs. An
+bytes. It then calls selective `getFiles` only for the admitted wire IDs. An
 unauthorized sender is ignored without retrieval or reply. A rejected authorized
 request receives a bounded reason correlated to its file wire.
 
@@ -897,13 +903,15 @@ the agent must use the audio path rather than inventing text.
 Request files are removed after final delivery and stale directories are removed
 after `retention_ms`. A bounded mode-0600 recovery journal stores only owner CID
 and wire routing metadata—never filenames, paths, captions, transcripts, or file
-bytes. If the daemon already marked a selected file processed when fleet restarts,
-fleet resumes only that journaled wire with the SDK file-fetch operation; a deferred managed-agent
-caption is replayed with its journaled processed files before the group is
-admitted or relayed. Conversation route state migrates from v1 to a bounded v2
+bytes. If a selected file is already read when fleet restarts, fleet resolves
+only that journaled wire with `getFileInfo` and retrieves its immutable blob with
+`fetchFile`; a claimed managed-agent caption is loaded from message history and
+rejoined with its journaled read files before the group is admitted or relayed.
+Recovered voice files remain transcript-unavailable and are never sent through
+a second transcription attempt. Conversation route state migrates from v1 to a
+bounded v2
 source-wire index so a correlated group keeps the authenticated owner selected by
-its original request even after later owner traffic. Recovered voice is explicitly
-marked transcript-unavailable. Corrupt recovery state disables attachment
+its original request even after later owner traffic. Corrupt recovery state disables attachment
 admission. The host must run an ours daemon compatible with SDK 2.0.1 whose
 typed incoming-file, selective retrieval, and file-fetch operations support
 these guarantees; `ours config show --json` reports `sttConfigured` without

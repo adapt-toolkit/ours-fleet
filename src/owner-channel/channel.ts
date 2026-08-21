@@ -20,7 +20,8 @@ import {
 import type { ManagedFleetSpawnResult } from '../fleet-proxy.js';
 import {
   OURS_BOUND_ELSEWHERE, OursSdkClient, oursErrorCode,
-  type OursContactsView, type OursInboundMessage, type OursOps,
+  type OursContactsView, type OursHistoryFile, type OursHistoryMessage,
+  type OursInboundMessage, type OursIncomingMessage, type OursOps,
 } from './ours-client.js';
 import {
   ownerNotices,
@@ -44,6 +45,7 @@ import {
   acquireOwnerBinderLease, OWNER_BIND_HANDOFF_TIMEOUT_MS,
   type OwnerBinderDeps, type OwnerBinderLease,
 } from './binder.js';
+import { MessageRecoveryState, type PendingMessageClaim } from './message-recovery.js';
 
 /**
  * The daemon's own inbound message shape. It used to be a hand-written union of
@@ -157,6 +159,7 @@ const COMMENTARY_MAX_BYTES = 6_400;
 const COMMENTARY_MAX_UPDATES = 32;
 const COMMENTARY_DEDUPE_LIMIT = 512;
 const OWNER_WATCH_BACKOFF_MAX_MS = 30_000;
+const OWNER_MESSAGE_BATCH_LIMIT = 200;
 type OwnerWatchReason = 'OWNER_WATCH_CONNECTING' | 'OWNER_WATCH_CONNECTED'
   | 'OWNER_WATCH_STREAM_ERROR' | 'OWNER_WATCH_STATE_RECOVERED';
 
@@ -181,6 +184,7 @@ export class OwnerChannel implements OwnerChannelHandle {
   private readonly authorizations: OwnerAuthorizationState;
   private readonly conversations: OwnerConversationState;
   private readonly tasks: OwnerTaskState;
+  private readonly messageRecovery: MessageRecoveryState;
   private readonly attachmentRecovery: AttachmentRecoveryState;
   private readonly attachmentConfig: OwnerAttachmentConfig;
   private readonly attachmentRoot: string;
@@ -189,7 +193,7 @@ export class OwnerChannel implements OwnerChannelHandle {
    * (a crash must replay them) but must not be queued twice while live.
    */
   private readonly inFlight = new Set<string>();
-  /** Wires already NACKed to the managed agent, so a deferred replay stays quiet. */
+  /** Wires already NACKed to the managed agent, so a history replay stays quiet. */
   private readonly relayNacks = new Set<string>();
   /**
    * fleet.yaml declares the restart baseline; `/comments on|off` changes only
@@ -223,6 +227,8 @@ export class OwnerChannel implements OwnerChannelHandle {
     this.conversations = new OwnerConversationState(
       join(options.stateDir, '.owner-channel-conversations.json'));
     this.tasks = new OwnerTaskState(join(options.stateDir, '.owner-channel-tasks.json'));
+    this.messageRecovery = new MessageRecoveryState(
+      join(options.stateDir, '.owner-channel-message-recovery.json'));
     this.attachmentRecovery = new AttachmentRecoveryState(
       join(options.stateDir, '.owner-channel-attachment-recovery.json'));
     this.attachmentRoot = join(options.stateDir, '.owner-channel-inbox');
@@ -242,6 +248,8 @@ export class OwnerChannel implements OwnerChannelHandle {
       options.log(`[${options.role}] owner conversation state corrupt; proactive messages disabled`);
     if (!this.tasks.integrity().ok)
       options.log(`[${options.role}] owner task state corrupt; proactive reports disabled`);
+    if (!this.messageRecovery.integrity())
+      options.log(`[${options.role}] owner message recovery state corrupt; message intake disabled`);
     if (!this.attachmentRecovery.integrity())
       options.log(`[${options.role}] owner attachment recovery state corrupt; attachments disabled`);
   }
@@ -664,54 +672,158 @@ export class OwnerChannel implements OwnerChannelHandle {
   }
 
   private async drainAll(): Promise<void> {
-    // A finite cap protects the supervisor if a broken daemon repeats unread
-    // messages forever. A watch notification will resume draining later.
+    // A finite cap protects the supervisor if a broken daemon never advances
+    // its oldest-first unread batch. A watch hint will resume draining later.
     for (let pass = 0; pass < 100 && !this.stopping; pass++) {
-      const [payload, fileResult] = await Promise.all([
-        this.client.getMessages(),
+      const [claimed, fileResult] = await Promise.all([
+        this.claimMessages(),
         this.client.listIncomingFiles()
           .catch(error => {
             this.logError('attachment metadata inspection unavailable', error);
             return undefined;
           }),
       ]);
-      const messages = Array.isArray(payload?.messages)
-        ? payload.messages.filter(message => message && typeof message === 'object')
-        : [];
-      let files: IncomingAttachment[] = [];
-      try { files = parseIncomingAttachments(fileResult); }
-      catch (error) { this.logError('attachment metadata inspection unavailable', error); }
       const pending = this.attachmentRecovery.integrity() ? this.attachmentRecovery.list() : [];
+      let files = await this.attachmentMetadata(fileResult, pending);
       const pendingWires = new Set(pending.flatMap(item => item.fileWireIds));
       files = files.filter(file => (file.status === 'unread' || pendingWires.has(file.wireId))
         && !this.state.has(file.wireId));
-      if (!messages.length && !files.length) return;
-
-      // get_messages marks the batch processed. Requeue allowed, unhandled
-      // inputs before executing them so a mid-turn process crash can replay.
-      const deferred = messages.filter(message => {
-        const wireId = this.wireId(message);
-        return wireId && !this.state.has(wireId)
-          && this.acceptedSender(this.sender(message).id)
-          && Number.isInteger(message.msg_id);
-      }).map(message => message.msg_id);
-      if (deferred.length) await this.client.deferMessages(deferred);
+      if (!claimed.messages.length && !files.length && claimed.remaining === 0) return;
 
       let advanced = false;
       const consumedMessages = new Set<InboundMessage>();
-      const groups = this.attachmentGroups(files, messages, pending, consumedMessages);
+      const groups = this.attachmentGroups(files, claimed.messages, pending, consumedMessages);
       for (const group of groups)
         advanced = await this.handleAttachmentGroup(group) || advanced;
-      for (const message of messages) {
+      for (const message of claimed.messages) {
         if (!consumedMessages.has(message)) advanced = await this.handle(message) || advanced;
       }
+      this.messageRecovery.pruneHandled(wireId => this.state.has(wireId));
 
-      // Deferred in-flight messages are intentionally visible again until
-      // their correlated response is delivered. Do not spin on those replay
-      // copies; a new watch event or completion-triggered drain will resume.
-      if (!advanced) return;
+      // Journaled in-flight messages remain history-recoverable until their
+      // correlated response is delivered. Do not spin on those copies once the
+      // unread SQLite queue itself is empty; completion triggers another drain.
+      if (!advanced && claimed.remaining === 0) return;
     }
     this.options.log(`[${this.options.role}] owner channel drain capped at 100 batches`);
+  }
+
+  /**
+   * Claim the exact oldest unread SQLite batch before marking it read.
+   * The journal contains only wire IDs and sequence numbers; bodies remain in
+   * the daemon's persistent history and are recovered with getHistoryItem.
+   */
+  private async claimMessages(): Promise<{
+    messages: InboundMessage[];
+    remaining: number;
+  }> {
+    if (!this.messageRecovery.integrity())
+      throw new Error('message recovery state is corrupt; refusing owner message intake');
+    this.messageRecovery.pruneHandled(wireId => this.state.has(wireId));
+
+    const recovered: InboundMessage[] = [];
+    for (const claim of this.messageRecovery.list()) {
+      const item = await this.client.getHistoryItem(claim.wireId);
+      if (!item)
+        throw new Error(`journaled owner message ${claim.wireId} is missing from persistent history`);
+      recovered.push(this.historyMessage(item, claim));
+    }
+
+    const listed = await this.client.listIncomingMessages();
+    if (!Array.isArray(listed)) throw new Error('the ours daemon returned invalid unread message metadata');
+    const preflight = listed.slice(0, OWNER_MESSAGE_BATCH_LIMIT);
+    const now = Date.now();
+    const claims = preflight.map(item => this.messageClaim(item, now));
+    const claimKeys = new Set(claims.map(item => `${item.seq}\0${item.wireId}`));
+    if (claimKeys.size !== claims.length)
+      throw new Error('the ours daemon returned duplicate unread message metadata');
+    this.messageRecovery.claim(claims);
+
+    let fresh: InboundMessage[] = [];
+    let remaining = 0;
+    // SDK batchLimit rejects zero. An empty preflight is a read-only drain.
+    if (claims.length) {
+      const payload = await this.client.getMessages(claims.length);
+      if (!payload || !Array.isArray(payload.messages)
+          || !Number.isSafeInteger(payload.remaining) || payload.remaining < 0)
+        throw new Error('the ours daemon returned an invalid claimed message batch');
+      fresh = payload.messages.map(message => this.historyMessage(message));
+      remaining = payload.remaining;
+      const expected = claimKeys;
+      const actual = new Set(fresh.map(item => `${item.seq}\0${item.wire_id}`));
+      if (fresh.length !== claims.length || actual.size !== fresh.length
+          || actual.size !== expected.size
+          || [...expected].some(item => !actual.has(item)))
+        throw new Error('the ours daemon claimed a different message batch than fleet journaled');
+    }
+
+    const merged = new Map<string, InboundMessage>();
+    for (const message of [...recovered, ...fresh]) {
+      const wireId = this.wireId(message);
+      const previous = merged.get(wireId);
+      if (previous && previous.seq !== message.seq)
+        throw new Error('persistent message history changed sequence during recovery');
+      merged.set(wireId, message);
+    }
+    return {
+      messages: [...merged.values()].sort((a, b) => a.seq - b.seq),
+      remaining,
+    };
+  }
+
+  private messageClaim(message: OursIncomingMessage, claimedAt: number): PendingMessageClaim {
+    const value = message as unknown as Record<string, unknown>;
+    const wireId = String(value.wire_id ?? '').trim();
+    const seq = Number(value.seq);
+    if (!wireId || !Number.isSafeInteger(seq) || seq < 1
+        || value.status !== 'unread' || value.inbox_state !== 'unread')
+      throw new Error('the ours daemon returned malformed unread message metadata');
+    return { wireId, seq, claimedAt };
+  }
+
+  private historyMessage(
+    message: OursHistoryMessage | OursInboundMessage,
+    claim?: PendingMessageClaim,
+  ): InboundMessage {
+    const value = message as unknown as Record<string, unknown>;
+    const wireId = String(value.wire_id ?? '').trim();
+    const seq = Number(value.seq);
+    const direction = String(value.direction ?? '');
+    if (!wireId || !Number.isSafeInteger(seq) || seq < 1 || direction !== 'in'
+        || (claim && (claim.wireId !== wireId || claim.seq !== seq)))
+      throw new Error('persistent owner message metadata mismatched its recovery claim');
+    return message as InboundMessage;
+  }
+
+  private async attachmentMetadata(
+    unread: OursHistoryFile[] | undefined,
+    pending: PendingAttachmentRequest[],
+  ): Promise<IncomingAttachment[]> {
+    const raw: OursHistoryFile[] = Array.isArray(unread) ? [...unread] : [];
+    const present = new Set(raw.map(file => String(file.wire_id ?? '')));
+    for (const recovery of pending) {
+      for (const wireId of recovery.fileWireIds) {
+        if (present.has(wireId)) continue;
+        const item = await this.client.getFileInfo(wireId);
+        if (!item)
+          throw new Error(`journaled owner file ${wireId} is missing from persistent history`);
+        if (item.wire_id !== wireId || item.direction !== 'in'
+            || item.inbox_state !== 'read' || item.status !== 'read')
+          throw new Error(`journaled owner file ${wireId} mismatched persistent history`);
+        raw.push(item);
+        present.add(wireId);
+      }
+    }
+    const files = parseIncomingAttachments(raw);
+    const byWire = new Map(files.map(file => [file.wireId, file]));
+    for (const recovery of pending) {
+      for (const wireId of recovery.fileWireIds) {
+        const file = byWire.get(wireId);
+        if (!file || file.senderId !== recovery.contact)
+          throw new Error(`journaled owner file ${wireId} failed recovery provenance validation`);
+      }
+    }
+    return files;
   }
 
   private attachmentGroups(
@@ -735,9 +847,9 @@ export class OwnerChannel implements OwnerChannelHandle {
       const caption = recovery.originWireId === recovery.fileWireIds[0]
         ? undefined : messageByWire.get(recovery.originWireId);
       if (caption && this.sender(caption).id !== recovery.contact) continue;
-      // A managed-agent caption is deferred before retrieval. If recovery sees
-      // the processed file before that body is replayed, keep the file reserved
-      // by the journal until both halves are present again.
+      // A managed-agent caption is claimed before its inbox row becomes read.
+      // If recovery sees a read file before that body is recovered from history,
+      // keep the file reserved by the journal until both halves are present.
       if (!caption && !recovery.fileWireIds.includes(recovery.originWireId)) continue;
       if (caption) consumed.add(caption);
       groups.push({ files: exact, recovery, ...(caption ? { caption } : {}) });
@@ -808,13 +920,13 @@ export class OwnerChannel implements OwnerChannelHandle {
       if (!group.recovery) this.attachmentRecovery.add(recovery);
       requestDir = await prepareAttachmentDirectory(this.attachmentRoot, requestId);
       const unread = group.files.filter(file => file.status === 'unread');
-      const processed = group.files.filter(file => file.status !== 'unread');
+      const historyRecovered = group.files.filter(file => file.status !== 'unread');
       const retrieved = unread.length
         ? parseRetrievedAttachments(
           await this.client.getFiles(unread.map(file => file.wireId)), unread)
         : [];
-      for (const file of processed) {
-        if (!group.recovery) throw new Error('unexpected processed attachment without recovery route');
+      for (const file of historyRecovered) {
+        if (!group.recovery) throw new Error('unexpected read attachment without recovery route');
         const recoveryPath = await writeRecoveredAttachment(
           requestDir, file.wireId, await this.client.fetchFile(file.wireId));
         retrieved.push(await recoveredAttachment(file, recoveryPath));
@@ -893,9 +1005,9 @@ export class OwnerChannel implements OwnerChannelHandle {
           // it silently IS the correct outcome; delivering again is the bug.
           this.options.log(`[${this.options.role}] managed-agent relay replay of a delivered wire consumed`);
         } else if (error instanceof RelayUnroutableError) {
-          // No owner route exists yet. Leave the wire deferred and unconsumed
-          // so the daemon replays it after the first owner contact, and tell
-          // the authenticated agent once so the wait is never silent.
+          // No owner route exists yet. Leave the wire journaled and unconsumed
+          // so persistent history replays it after the first owner contact, and
+          // tell the authenticated agent once so the wait is never silent.
           this.options.log(`[${this.options.role}] owner channel managed-agent relay has no owner `
             + `route yet; message stays queued: ${this.errorText(error)}`);
           await this.nackManagedAgent(
@@ -953,9 +1065,9 @@ export class OwnerChannel implements OwnerChannelHandle {
       await rm(outbox, { recursive: true, force: true });
       if (error instanceof SessionControlError
           && error.reasonCode === ACP_CANCEL_DEADLINE_EXCEEDED) {
-        // drainAll deferred this authenticated message before delivery. The
+        // drainAll journaled this authenticated message before delivery. The
         // adapter generation is terminating, so leave the wire unhandled and
-        // body-free: the resumed owner channel will replay it exactly once.
+        // body-free: the resumed owner channel recovers it exactly once.
         this.options.log(`[${this.options.role}] owner request ${requestId.slice(0, 12)} `
           + `held for adapter resume reason=${ACP_CANCEL_DEADLINE_EXCEEDED}`);
         return false;
@@ -1197,13 +1309,13 @@ export class OwnerChannel implements OwnerChannelHandle {
       if (!group.recovery) this.attachmentRecovery.add(recovery);
       requestDir = await prepareAttachmentDirectory(this.attachmentRoot, transactionId);
       const unread = group.files.filter(file => file.status === 'unread');
-      const processed = group.files.filter(file => file.status !== 'unread');
+      const historyRecovered = group.files.filter(file => file.status !== 'unread');
       const retrieved = unread.length
         ? parseRetrievedAttachments(
           await this.client.getFiles(unread.map(file => file.wireId)), unread)
         : [];
-      for (const file of processed) {
-        if (!group.recovery) throw new Error('unexpected processed attachment without recovery route');
+      for (const file of historyRecovered) {
+        if (!group.recovery) throw new Error('unexpected read attachment without recovery route');
         const recoveryPath = await writeRecoveredAttachment(
           requestDir, file.wireId, await this.client.fetchFile(file.wireId));
         retrieved.push(await recoveredAttachment(file, recoveryPath));
@@ -1283,7 +1395,7 @@ export class OwnerChannel implements OwnerChannelHandle {
 
   /**
    * One bounded NACK per wire: an unroutable or refused relay must be visible
-   * to the authenticated agent, while its deferred replays stay quiet. NACK
+   * to the authenticated agent, while its history replays stay quiet. NACK
    * delivery is best-effort — it must never make the failure worse.
    */
   private async nackManagedAgent(
@@ -1712,8 +1824,8 @@ export class OwnerChannel implements OwnerChannelHandle {
         // This drain is unconditional at EVERY establishment. Starting the SDK
         // stream at 0 then replays notification hints instead of tip-priming,
         // so mail arriving after the drain but before the first request cannot
-        // fall into a gap. The inbox is authoritative and its durable wire-ID
-        // dedupe makes replayed hints harmless.
+        // fall into a gap. Persistent history plus fleet's body-free claim
+        // journal is authoritative; durable wire-ID dedupe makes hints harmless.
         await this.drain();
         if (this.stopping) return;
         state = this.writeWatchState(

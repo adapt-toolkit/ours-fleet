@@ -26,6 +26,10 @@ function fakeSdkClient(overrides: Partial<Record<string, unknown>> = {}) {
   const client = {
     calls,
     chooseIdentity: record('chooseIdentity', { name: 'Role-owner', cid: 'x', switchedFrom: null }),
+    listIncomingMessages: record('listIncomingMessages', []),
+    getMessages: record('getMessages', { count: 0, messages: [], remaining: 0 }),
+    getHistoryItem: record('getHistoryItem', null),
+    getFileInfo: record('getFileInfo', null),
     sendMessage: record('sendMessage', { kind: 'sent', wireId: 'w' }),
     uploadFile: record('uploadFile', {
       upload_id: 'upload-1', filename: 'f', mime: 'application/octet-stream', size: 3,
@@ -150,7 +154,22 @@ describe('OursSdkClient send verdicts', () => {
 
   it('refuses to operate before start', async () => {
     const sdk = new OursSdkClient({}, () => undefined, { attachClient: () => fakeSdkClient() });
-    await expect(sdk.getMessages()).rejects.toThrow(/is not started/);
+    await expect(sdk.getMessages(1)).rejects.toThrow(/is not started/);
+  });
+
+  it('maps external-history operations directly to structured SDK calls', async () => {
+    const client = fakeSdkClient();
+    const sdk = await started(client);
+    await sdk.listIncomingMessages();
+    await sdk.getMessages(17);
+    await sdk.getHistoryItem('message-wire');
+    await sdk.getFileInfo('file-wire');
+    expect(client.calls).toEqual(expect.arrayContaining([
+      { name: 'listIncomingMessages', args: undefined },
+      { name: 'getMessages', args: { limit: 17 } },
+      { name: 'getHistoryItem', args: { wire_id: 'message-wire' } },
+      { name: 'getFileInfo', args: { wire_id: 'file-wire' } },
+    ]));
   });
 
   it('settles a half-open SDK notification request at the deadline even if fetch ignores abort', async () => {
