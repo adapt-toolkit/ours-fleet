@@ -233,8 +233,8 @@ describe('owner-channel daemon dependency surface', () => {
   it('is pinned to the reviewed SDK version exactly', () => {
     const pkg = JSON.parse(readFileSync(join(REPO, 'package.json'), 'utf8'));
     const lock = JSON.parse(readFileSync(join(REPO, 'package-lock.json'), 'utf8'));
-    expect(pkg.dependencies['@ours.network/sdk']).toBe('2.0.1');
-    expect(lock.packages['node_modules/@ours.network/sdk'].version).toBe('2.0.1');
+    expect(pkg.dependencies['@ours.network/sdk']).toBe('3.0.1');
+    expect(lock.packages['node_modules/@ours.network/sdk'].version).toBe('3.0.1');
     expect(pkg.dependencies['@ours.network/cli']).toBe('1.0.1');
     expect(lock.packages['node_modules/@ours.network/cli'].version).toBe('1.0.1');
   });
