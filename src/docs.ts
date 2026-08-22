@@ -27,34 +27,11 @@ Default configuration is \`~/fleet.yaml\` plus sorted \`~/fleet.d/*.yaml\` role
 drop-ins. An explicit \`-c FILE\` replaces \`~/fleet.yaml\`; fleet.d still adds
 roles. Validate with \`config\` and \`doctor\` before starting or restarting.
 
-## Deterministic harness plugins
-
-Harness plugin channels are configured independently and default to \`stable\`:
-
-\`\`\`yaml
-harnesses:
-  codex: { plugin_channel: nightly }
-  claude-code: { plugin_channel: stable }
-\`\`\`
-
-\`ours-fleet plugins install [codex|claude-code...]\` resolves an npm dist-tag
-once only when no same-channel lock exists. \`plugins update\` explicitly resolves
-again. Both persist the exact semver under
-\`~/.ours-fleet/harness-plugins/<harness>/plugin-lock.json\`, generate a local
-marketplace whose npm source contains that exact version, and install from that
-marketplace. \`plugins status\` reports the configured channel, exact lock, and
-channel mismatches. Stable resolves \`latest\` once and pins it; nightly resolves
-\`nightly\` once and requires a \`-nightly.N\` prerelease. Starts, restarts, and
-reconciliation only re-materialize the marketplace from the lock: they never
-query a dist-tag, run an installer, or advance a version.
-An explicit nightly role refuses to launch until that harness has a nightly lock;
-a configured/locked channel mismatch also fails with the exact update command.
-
 The CLI never writes the base file: \`spawn\` writes \`~/fleet.d/Name.yaml\`. The
 web console does write it, as a whole document — its setup wizard and
 configuration editor may create, change or remove any top-level block, including
-\`vars:\`, \`defaults:\`, \`harnesses:\`, \`roles:\`, \`watchdogs:\` and \`loops:\`. Only the base
-file may hold \`defaults:\`, \`harnesses:\`, \`watchdogs:\` and \`loops:\`; a fleet.d drop-in may
+\`vars:\`, \`defaults:\`, \`roles:\`, \`watchdogs:\` and \`loops:\`. Only the base
+file may hold \`defaults:\`, \`watchdogs:\` and \`loops:\`; a fleet.d drop-in may
 declare \`roles:\` and nothing else. Unrecognised top-level keys are round-tripped
 untouched. Console edits are applied as surgical splices against the file's exact
 bytes, so an unchanged save is byte-identical and lines outside the edit keep their

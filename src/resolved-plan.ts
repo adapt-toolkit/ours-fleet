@@ -21,7 +21,6 @@ export function resolvedPlan(cfg: FleetConfig): Record<string, unknown> {
     schemaVersion: RESOLVED_PLAN_SCHEMA_VERSION,
     sourceFiles: [...cfg.files],
     startStaggerMs: cfg.startStaggerMs,
-    harnesses: cfg.harnessPlugins,
     diagnostics: cfg.diagnostics.map(diagnostic => ({ ...diagnostic })),
     roles: cfg.roles.map(resolvedRolePlan),
     loops: cfg.loops.map(loop => sortedObject({

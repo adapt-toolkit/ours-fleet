@@ -13,7 +13,6 @@ import { harnessRuntimeDir } from '../isolation/policy.js';
 import {
   resolveBundledAcpAgent, type AcpAgentResolution,
 } from './acp-agent.js';
-import { restoreLockedHarnessMarketplace } from '../harness-plugins.js';
 
 interface CodexOptions {
   launcher?: string;
@@ -325,9 +324,6 @@ export function makeCodexAdapter(exec: Exec = realExec): HarnessAdapter {
     },
 
     async prepareSession(role: ResolvedRole, dirs: RoleDirs): Promise<SessionPrep> {
-      // Re-materialize only from the persisted exact lock. Ordinary launches
-      // never resolve npm tags or run an installer.
-      restoreLockedHarnessMarketplace('codex', role.harnessPluginChannel);
       // Per-role harness runtime home (5.1); harmless for un-isolated roles.
       // Only a role that declares `isolation:` gets a sandbox, and only a
       // sandbox needs this directory to exist before entry.

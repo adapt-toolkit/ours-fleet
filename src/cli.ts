@@ -56,9 +56,6 @@ import { WebAccessStore, passwordAccess, validatePublicOrigin } from './web/acce
 import {
   FLEET_PROXY_CALLER_ENV, FLEET_PROXY_STATE_DIR_ENV, type ManagedFleetSpawnResult,
 } from './fleet-proxy.js';
-import {
-  installHarnessPlugin, readHarnessPluginLock, selectedHarnessPluginIds,
-} from './harness-plugins.js';
 import './harness/claude-code.js';   // registers the claude-code adapter
 import './harness/codex.js';         // registers the codex adapter
 
@@ -93,51 +90,6 @@ const program = new Command()
 const cOpt = (cmd: Command) => cmd.option('-c, --configuration <file>', 'config file (default: ~/fleet.yaml + ~/fleet.d/)');
 
 const collect = (value: string, previous: string[]) => [...previous, value];
-
-const pluginsCommand = program.command('plugins')
-  .description('install exact, persisted stable/nightly harness plugins');
-
-const changeHarnessPlugins = (update: boolean) =>
-  async (names: string[], opts: { configuration?: string }) => {
-    try {
-      const cfg = loadConfig(opts.configuration);
-      for (const harness of selectedHarnessPluginIds(names)) {
-        const channel = cfg.harnessPlugins[harness].plugin_channel;
-        const result = await installHarnessPlugin(harness, channel, { update });
-        console.log(`${harness}: ${result.lock.package}@${result.lock.version} `
-          + `(${channel}, ${result.resolved ? 'resolved and locked' : 'reused lock'})`);
-        console.log(`  lock: ${result.lockPath}`);
-        console.log(`  marketplace: ${result.marketplacePath}`);
-      }
-    } catch (e) { die(e); }
-  };
-
-cOpt(pluginsCommand.command('install [harnesses...]')
-  .description('install from the configured channel; reuse an existing same-channel lock'))
-  .action(changeHarnessPlugins(false));
-
-cOpt(pluginsCommand.command('update [harnesses...]')
-  .description('resolve configured channels once, persist exact versions, and install them'))
-  .action(changeHarnessPlugins(true));
-
-cOpt(pluginsCommand.command('status [harnesses...]')
-  .description('show configured channels and persisted exact versions'))
-  .action((names: string[], opts: { configuration?: string }) => {
-    try {
-      const cfg = loadConfig(opts.configuration);
-      for (const harness of selectedHarnessPluginIds(names)) {
-        const configured = cfg.harnessPlugins[harness].plugin_channel;
-        const lock = readHarnessPluginLock(harness);
-        if (!lock) {
-          console.log(`${harness}: configured=${configured}, unlocked `
-            + `(run \`ours-fleet plugins install ${harness}\`)`);
-          continue;
-        }
-        const mismatch = lock.channel === configured ? '' : `, CONFIG MISMATCH (locked=${lock.channel})`;
-        console.log(`${harness}: configured=${configured}, ${lock.package}@${lock.version}${mismatch}`);
-      }
-    } catch (e) { die(e); }
-  });
 
 program.command('docs')
   .alias('man')

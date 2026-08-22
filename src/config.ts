@@ -16,10 +16,6 @@ import { resolveLoops } from './loops/config.js';
 import type { ResolvedLoop, ResolvedRoleLoop } from './loops/config.js';
 import { CAPABILITIES, CAP_MONITOR_INTERRUPT_AFTER_TOOL } from './capabilities.js';
 import { runningLabel } from './provenance.js';
-import {
-  HARNESS_PLUGIN_IDS, resolveHarnessPluginConfigs,
-  type HarnessPluginChannel, type HarnessPluginConfigs,
-} from './harness-plugins.js';
 
 export interface OverseeEntry { role: string; interval: string }
 export interface WorklogPolicy {
@@ -256,8 +252,6 @@ export interface ResolvedRole extends Omit<RoleConfig, 'model' | 'owner_channel'
   worklog?: WorklogPolicy;
   auth_proxy?: AuthProxyConfig;
   loops?: ResolvedRoleLoop[];
-  /** Configured channel for a managed first-party harness plugin. */
-  harnessPluginChannel?: HarnessPluginChannel;
 }
 
 export interface FleetConfig {
@@ -271,8 +265,6 @@ export interface FleetConfig {
   diagnostics: ConfigDiagnostic[];
   watchdogs: ResolvedWatchdog[];
   loops: ResolvedLoop[];
-  /** Per-harness plugin channel intent. Exact versions live in host-local locks. */
-  harnessPlugins: HarnessPluginConfigs;
 }
 
 export class ConfigError extends Error {}
@@ -369,9 +361,6 @@ export function loadConfig(
   const vars = (baseDoc.vars ?? {}) as Record<string, string>;
   const defaults = (baseDoc.defaults ?? {}) as Record<string, unknown>;
   const startStaggerMs = resolveStartStaggerMs(baseDoc.start_stagger_ms, base);
-  let harnessPlugins: HarnessPluginConfigs;
-  try { harnessPlugins = resolveHarnessPluginConfigs(baseDoc.harnesses, base); }
-  catch (error) { throw new ConfigError((error as Error).message); }
   const seen = new Map<string, string>();
   const roles: ResolvedRole[] = [];
   for (const { file, doc } of docs) {
@@ -443,9 +432,6 @@ export function loadConfig(
         name,
         sourceFile: file,
         harness,
-        harnessPluginChannel: HARNESS_PLUGIN_IDS.includes(harness as typeof HARNESS_PLUGIN_IDS[number])
-          ? harnessPlugins[harness as typeof HARNESS_PLUGIN_IDS[number]].plugin_channel
-          : undefined,
         session,
         session_options: sessionOptions,
         permissions,
@@ -479,7 +465,7 @@ export function loadConfig(
   const resolvedLoops = resolveLoops(baseDoc.loops, base, roles, vars);
   for (const role of roles) role.loops = resolvedLoops.byRole.get(role.name) ?? [];
   return {
-    roles, vars, defaults, files, startStaggerMs, diagnostics, watchdogs, harnessPlugins,
+    roles, vars, defaults, files, startStaggerMs, diagnostics, watchdogs,
     loops: resolvedLoops.loops,
   };
 }

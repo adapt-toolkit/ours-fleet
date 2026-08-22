@@ -14,12 +14,9 @@
  */
 /** `monitor.interrupt: after_tool` — cancel at the next tool boundary (#67). */
 export const CAP_MONITOR_INTERRUPT_AFTER_TOOL = 'monitor.interrupt.after_tool';
-/** Exact, persisted stable/nightly harness plugin resolution and local marketplaces. */
-export const CAP_HARNESS_PLUGIN_LOCK = 'harness.plugins.exact-lock';
 
 export const CAPABILITIES = [
   CAP_MONITOR_INTERRUPT_AFTER_TOOL,
-  CAP_HARNESS_PLUGIN_LOCK,
 ] as const;
 
 export type Capability = (typeof CAPABILITIES)[number];
