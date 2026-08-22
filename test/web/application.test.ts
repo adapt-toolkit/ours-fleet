@@ -103,7 +103,7 @@ identity: Temp
 
   for (const flow of [
     { lifetime: 'permanent', session: 'acp', harness: 'codex', check: false, probe: 'ready' },
-    { lifetime: 'permanent', session: 'tmux', harness: 'claude-code', check: 'unknown', probe: 'attention' },
+    { lifetime: 'permanent', session: 'tmux', harness: 'claude-code', check: false, probe: 'attention' },
     { lifetime: 'temporary', session: 'acp', harness: 'claude-code', check: false, probe: 'ready' },
     { lifetime: 'temporary', session: 'tmux', harness: 'codex', check: 'unknown', probe: 'attention' },
   ] as const) {
@@ -170,11 +170,16 @@ identity: Temp
       );
       const briefing = readFileSync(join(stateDir, 'briefing.md'), 'utf8');
       expect(briefing).toContain('choose_identity');
-      expect(briefing).toContain('create_identity');
+      if (flow.lifetime === 'permanent') {
+        expect(briefing).not.toContain('call **create_identity**');
+        expect(briefing).toContain('It was created when your role');
+      } else {
+        expect(briefing).toContain('create_temporary_identity');
+      }
       expect(service.get(first.actionId)?.stages.map(stage => stage.stage)).toContain(
         'identity_bootstrap_pending',
       );
-      expect(mutationCalls).toBe(0);
+      expect(mutationCalls).toBe(flow.lifetime === 'permanent' ? 1 : 0);
       const written = flow.lifetime === 'permanent'
         ? parse(readFileSync(join(root, 'fleet.d', `${request.name}.yaml`), 'utf8')).roles[request.name]
         : parse(readFileSync(join(stateDir, 'role.yaml'), 'utf8'));

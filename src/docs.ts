@@ -190,7 +190,8 @@ exists. If missing, it uses ours MCP \`create_temporary_identity\` when that too
 is exposed, tying a newly-created identity to the connector session lifecycle;
 older servers fall back to \`create_identity\`. Collisions and creation errors
 stop safely without force-adopting or deleting identity state. Permanent roles
-retain normal \`create_identity\` behavior.
+are provisioned by fleet before launch and never delegate normal identity
+creation to the harness.
 
 The temporary supervisor treats its first positive identity observation as the
 lifecycle readiness gate: a cold harness may take as long as needed to read its
@@ -484,8 +485,8 @@ Inspect \`ours-fleet status Name\`, \`peek Name\`, role logs, and
 
 ## Trusted owner channel
 
-An ACP role may declare a separate, existing ours identity which fleet — never
-the agent — binds:
+An ACP role may declare a separate ours identity which fleet — never the agent —
+creates when missing and binds:
 
 \`\`\`yaml
 owner_channel:
@@ -503,6 +504,13 @@ owner_channel:
     retention_ms: 86400000
     allowed_mime: [application/pdf, text/plain, image/png, audio/ogg]
 \`\`\`
+
+Permanent role identities are also reconciled before launch. Fleet creates a
+missing role identity with local exposure and local auto-accept enabled. A
+missing owner-channel identity uses the safer inverse policy: both are disabled.
+The short provisioning lease is released before the agent or channel binds.
+Temporary role identities remain connector-owned because their creating lease
+defines their cleanup lifetime.
 
 This does not replace the role identity. Normal identity mail remains untrusted
 peer input: the agent reads it through \`get_messages\` and replies through

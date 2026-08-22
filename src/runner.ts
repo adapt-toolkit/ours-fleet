@@ -30,6 +30,7 @@ import {
   classifyFailureText,
 } from './model-recovery.js';
 import { rotateWorklog } from './worklog.js';
+import { reconcilePermanentRoleIdentities } from './creation.js';
 import { OwnerChannel, type OwnerChannelHandle, type OwnerChannelOptions } from './owner-channel/channel.js';
 import {
   acquireOwnerBinderLease, OwnerBinderHandoffTimeoutError, type OwnerBinderLease,
@@ -1014,6 +1015,15 @@ export async function runSupervised(
 
     let result: AttemptResult;
     try {
+      // Service-manager boot and automatic retry bypass the operator-facing
+      // up/restart commands. Reconcile again immediately before every real
+      // permanent harness attempt; the operation is idempotent and releases its
+      // provisioning lease before the agent or owner channel binds.
+      if (attempt === runOnce) {
+        const configPath = resolveConfigPath(dir, opts.configPath);
+        const role = findRole(loadConfig(configPath), name);
+        await reconcilePermanentRoleIdentities(role, undefined, deps.log);
+      }
       result = await attempt(
         name, { configPath: opts.configPath, allowResumeRotation: !ledger.resumeDiscarded }, deps);
     } catch (e) {

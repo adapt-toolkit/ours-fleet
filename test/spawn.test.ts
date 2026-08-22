@@ -42,7 +42,10 @@ function fakeDeps() {
     async liveness() { return { state: 'stopped' as const, detail: 'inactive (dead)' }; },
     logsArgs: n => ({ cmd: 'true', args: [n] }),
   };
-  const d: OpsDeps = { backend, binPath: '/b/ours-fleet', sleep: async () => {}, log: () => {} };
+  const d: OpsDeps = {
+    backend, binPath: '/b/ours-fleet', sleep: async () => {}, log: () => {},
+    identityProvisioner: { exists: async () => true },
+  };
   return { d, calls };
 }
 
@@ -448,26 +451,26 @@ describe('identity is established before launch (7.3)', () => {
     expect(existsSync(agentDir('Broken'))).toBe(false);
   });
 
-  it('a host that cannot create says so, and the briefing does not claim a guarantee', async () => {
+  it('a host that cannot create refuses permanent launch before the harness starts', async () => {
     const logs: string[] = [];
-    const { d } = fakeDeps();
+    const { d, calls } = fakeDeps();
     d.log = l => logs.push(l);
-    await spawnPermanent({ name: 'Unchecked', identity: 'Unchecked' }, d,
-      { identityProvisioner: provisioner(false) });          // exists=false, no create()
+    await expect(spawnPermanent({ name: 'Unchecked', identity: 'Unchecked' }, d,
+      { identityProvisioner: provisioner(false) }))          // exists=false, no create()
+      .rejects.toThrow(/could not establish permanent ours identity/);
 
     expect(logs.join('\n')).toContain('cannot create one automatically');
-    expect(briefingOf('Unchecked')).toContain('was NOT verified');
-    expect(briefingOf('Unchecked')).toContain('create_identity');
+    expect(calls.some(call => call[0] === 'install')).toBe(false);
   });
 
-  it('an unreachable daemon is "unknown", never mistaken for absent', async () => {
-    const { d } = fakeDeps();
+  it('an unreachable daemon is never mistaken for absence or delegated to the agent', async () => {
+    const { d, calls } = fakeDeps();
     let createCalled = false;
-    await spawnPermanent({ name: 'Offline', identity: 'Offline' }, d, {
+    await expect(spawnPermanent({ name: 'Offline', identity: 'Offline' }, d, {
       identityProvisioner: provisioner('unknown', async () => { createCalled = true; }),
-    });
+    })).rejects.toThrow(/could not establish permanent ours identity/);
     expect(createCalled).toBe(false);       // do not create on no evidence
-    expect(briefingOf('Offline')).toContain('was NOT verified');
+    expect(calls.some(call => call[0] === 'install')).toBe(false);
   });
 
   it('a temp spawn gets the same guarantee in its briefing', async () => {

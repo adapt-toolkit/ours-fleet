@@ -15,6 +15,10 @@ import {
   archiveTempState, stopTempSupervisor, tempSupervisorLiveness,
 } from './temp-lifecycle.js';
 import { realExec, type Exec } from './exec.js';
+import {
+  daemonIdentityProvisioner, reconcilePermanentRoleIdentities,
+  type IdentityProvisioner,
+} from './creation.js';
 
 /** An install outcome tagged with the role it belongs to. */
 export interface InstallOutcome extends BackendInstallOutcome { role: string }
@@ -28,6 +32,8 @@ export interface OpsDeps {
   /** Test seam for exact detached-supervisor signaling/liveness. */
   kill?(pid: number, signal: NodeJS.Signals | 0): void;
   sleep?(ms: number): Promise<void>;
+  /** Permanent identity reconciliation seam; temporary roles never use this lifecycle. */
+  identityProvisioner?: IdentityProvisioner;
   /**
    * Called the INSTANT a registration is created, before anything else can
    * fail. A creation transaction that learns about registrations only from
@@ -105,7 +111,9 @@ export async function up(
 ): Promise<InstallOutcome[]> {
   const outcomes: InstallOutcome[] = [];
   for (const role of selectRoles(cfg, names)) {
-    const dir = applyRole(role, { configPath, identityGuarantee });
+    const guarantee = await reconcilePermanentRoleIdentities(
+      role, deps.identityProvisioner ?? daemonIdentityProvisioner(), deps.log, identityGuarantee);
+    const dir = applyRole(role, { configPath, identityGuarantee: guarantee });
     // Only a *definite* stop boots fresh so the role reads the briefing we just
     // wrote. A running, restarting, or unprobeable role keeps its context —
     // guessing "stopped" from an unanswered probe silently discards a live
@@ -265,7 +273,11 @@ export async function restartRoles(
   cfg: FleetConfig, names: string[], deps: OpsDeps, mode: 'keep' | 'fresh', configPath?: string,
 ): Promise<void> {
   for (const role of selectRoles(cfg, names)) {
-    const dir = applyRole(role, { fresh: mode === 'fresh', configPath });
+    const guarantee = await reconcilePermanentRoleIdentities(
+      role, deps.identityProvisioner ?? daemonIdentityProvisioner(), deps.log);
+    const dir = applyRole(role, {
+      fresh: mode === 'fresh', configPath, identityGuarantee: guarantee,
+    });
     resetRestartLedger(dir);                    // explicit restart closes the circuit
     await deps.backend.restart(role.name);
     deps.log(mode === 'fresh'

@@ -13,7 +13,7 @@ import { generateNotifierBriefing, generateWatchdogBriefing, type WatchManifest 
 import { computeDigest, reconcileLedger, readLedger, writeLedger } from './alerts.js';
 import { applyRole } from '../ops.js';
 import {
-  daemonIdentityProvisioner, ensureIdentity, type IdentityProvisioner,
+  daemonIdentityInventoryProvisioner, ensureIdentity, type IdentityProvisioner,
 } from '../creation.js';
 import { runOnce, START_STAGGER_FILE } from '../runner.js';
 import { agentDir, tmpRoot } from '../paths.js';
@@ -209,7 +209,7 @@ export async function executeWatchdogRun(
   let report: WatchdogReport;
   try {
     const guarantee = await ensureIdentity(
-      wd.identity, {}, deps.identityProvisioner ?? daemonIdentityProvisioner(), deps.log);
+      wd.identity, {}, deps.identityProvisioner ?? daemonIdentityInventoryProvisioner(), deps.log);
 
     const cfg = deps.cfg ?? loadConfig();
     const discovered = wd.watchExplicit
@@ -349,7 +349,7 @@ export async function executeNotifierRun(
     if (existsSync(runDir)) rmSync(runDir, { recursive: true, force: true });
 
     const guarantee = await ensureIdentity(
-      wd.identity, {}, deps.identityProvisioner ?? daemonIdentityProvisioner(), deps.log);
+      wd.identity, {}, deps.identityProvisioner ?? daemonIdentityInventoryProvisioner(), deps.log);
 
     const cfg = deps.cfg ?? loadConfig();
     const role = buildWatchdogRole(wd, cfg);
