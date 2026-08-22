@@ -35,12 +35,6 @@ vars:
 # (Replaces the retired FLEET_START_STAGGER env var — see README "Start staggering".)
 # start_stagger_ms: 4000
 
-# Harness plugins are independently pinned. Both channels default to stable.
-# `ours-fleet plugins install` resolves once; only `plugins update` advances a lock.
-# harnesses:
-#   codex: { plugin_channel: nightly }
-#   claude-code: { plugin_channel: stable }
-
 defaults:
   harness: claude-code        # adapter for roles that don't set their own
   session: tmux               # tmux (default) | acp; independent of harness

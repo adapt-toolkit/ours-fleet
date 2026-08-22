@@ -24,28 +24,6 @@ const dropin = (name: string, s: string) => {
 };
 
 describe('loadConfig', () => {
-  it('resolves independent harness plugin channels with stable migration defaults', () => {
-    base('roles:\n  A: {}\n');
-    expect(loadConfig().harnessPlugins).toEqual({
-      codex: { plugin_channel: 'stable' },
-      'claude-code': { plugin_channel: 'stable' },
-    });
-    base([
-      'harnesses:',
-      '  codex: { plugin_channel: nightly }',
-      '  claude-code: { plugin_channel: stable }',
-      'roles:',
-      '  A: {}',
-      '',
-    ].join('\n'));
-    const configured = loadConfig();
-    expect(configured.harnessPlugins.codex.plugin_channel).toBe('nightly');
-    expect(configured.harnessPlugins['claude-code'].plugin_channel).toBe('stable');
-    expect(findRole(configured, 'A').harnessPluginChannel).toBe('stable');
-    base('harnesses:\n  codex: { plugin_channel: latest }\nroles: {}\n');
-    expect(() => loadConfig()).toThrow(/plugin_channel must be one of: stable, nightly/);
-  });
-
   it('resolves a trusted owner channel only for ACP', () => {
     const agent = 'A'.repeat(64);
     const ownerOne = 'B'.repeat(64);

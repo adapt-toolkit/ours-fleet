@@ -959,36 +959,6 @@ cannot reliably distinguish the final answer from thoughts, tool output, or
 unrelated concurrent work. The config rejects tmux instead of silently offering
 weaker semantics.
 
-## Deterministic harness plugin channels
-
-Plugin channels are per harness and default to stable. Nightly must be selected
-explicitly in the base fleet file:
-
-```yaml
-harnesses:
-  codex:
-    plugin_channel: nightly
-  claude-code:
-    plugin_channel: stable
-```
-
-Install or repair from the existing lock with `ours-fleet plugins install`; move
-a lock deliberately with `ours-fleet plugins update`. Either command may take
-`codex`, `claude-code`, or both when omitted. `ours-fleet plugins status` shows
-the configured channel and exact version.
-
-Each explicit resolution reads the channel's npm dist-tag exactly once, validates
-the result, and persists it under
-`~/.ours-fleet/harness-plugins/<harness>/plugin-lock.json`. Fleet then generates
-a host-local marketplace containing the exact package semver and installs through
-that marketplace. Stable is pinned in exactly the same way as nightly: `latest`
-is never left in an install source. Normal starts, restarts, and reconciliation
-only regenerate marketplace files from the persisted lock; they never query npm,
-run an installer, or silently advance a version. A failed installation can be
-retried with `plugins install` and reuses the same lock.
-An explicitly nightly harness refuses to launch without a nightly lock, and a
-configured/locked channel mismatch fails with the exact `plugins update` command.
-
 ## Codex roles
 
 Install Codex, the native ours plugin, and the fleet CLI once on the fleet host:
