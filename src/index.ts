@@ -40,3 +40,11 @@ export { doctor } from './doctor.js';
 export { runOnce, runTemp } from './runner.js';
 export { Tmux } from './tmux.js';
 export { VERSION } from './version.js';
+export {
+  HARNESS_PLUGIN_IDS, installHarnessPlugin, readHarnessPluginLock,
+  restoreLockedHarnessMarketplace, resolveHarnessPluginConfigs,
+} from './harness-plugins.js';
+export type {
+  HarnessPluginId, HarnessPluginChannel, HarnessPluginConfig,
+  HarnessPluginConfigs, HarnessPluginLock, HarnessPluginInstallResult,
+} from './harness-plugins.js';

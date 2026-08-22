@@ -11,6 +11,7 @@ import { registerAdapter } from './registry.js';
 import { replaceFileAtomically, withFileLock, type LockDeps } from '../atomic-file.js';
 import { harnessRuntimeDir } from '../isolation/policy.js';
 import { bundledAcpAgent } from './acp-agent.js';
+import { restoreLockedHarnessMarketplace } from '../harness-plugins.js';
 
 /** One entry of `harness_options.mcp_servers`, in `.mcp.json`'s own shape. */
 interface McpServerSpec {
@@ -324,6 +325,9 @@ export function makeClaudeCodeAdapter(exec: Exec = realExec): HarnessAdapter {
     },
 
     async prepareSession(role: ResolvedRole, dirs: RoleDirs): Promise<SessionPrep> {
+      // Re-materialize only from the persisted exact lock. Ordinary launches
+      // never resolve npm tags or run an installer.
+      restoreLockedHarnessMarketplace('claude-code', role.harnessPluginChannel);
       // Pre-trust stays a HOST-side step: inside the sandbox ~/.claude.json is
       // read-only, and it is the fleet's job to trust the role's dirs, not the
       // agent's (5.1, 6.1).

@@ -83,8 +83,19 @@ describe('ours-fleet CLI', () => {
   it('--help lists the important commands', async () => {
     const r = await run(['--help']);
     expect(r.code).toBe(0);
-    for (const c of ['docs', 'up', 'down', 'spawn', 'send', 'peek', 'doctor', 'init'])
+    for (const c of ['docs', 'plugins', 'up', 'down', 'spawn', 'send', 'peek', 'doctor', 'init'])
       expect(r.stdout).toContain(c);
+  });
+
+  it('plugins status reports default locks and configured nightly intent without resolving npm', async () => {
+    const { writeFileSync } = await import('node:fs');
+    const file = join(dir, 'fleet.yaml');
+    writeFileSync(file, 'harnesses:\n  codex: { plugin_channel: nightly }\nroles: {}\n');
+    const r = await run(['plugins', 'status', '-c', file]);
+    expect(r.code).toBe(0);
+    expect(r.stderr).toBe('');
+    expect(r.stdout).toContain('codex: configured=nightly, unlocked');
+    expect(r.stdout).toContain('claude-code: configured=stable, unlocked');
   });
 
   it('web help exposes secure re-pair and revocation commands', async () => {
