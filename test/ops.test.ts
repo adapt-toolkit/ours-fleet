@@ -71,6 +71,7 @@ function deps(backend: SupervisorBackend, watchdogService?: OpsDeps['watchdogSer
   const d: OpsDeps = {
     backend, binPath: '/bin/ours-fleet',
     log: l => logs.push(l),
+    identityProvisioner: { exists: async () => true },
     ...(watchdogService ? { watchdogService } : {}),
   };
   return { d, logs };
@@ -164,6 +165,58 @@ describe('applyRole', () => {
 });
 
 describe('up / down / restart', () => {
+  it('creates permanent role and owner-channel identities before service installation', async () => {
+    writeCfg({ A: {
+      harness: 'fake', session: 'acp', identity: 'RoleIdentity', bio: 'Role bio',
+      persona: 'Role persona',
+      owner_channel: { identity: 'RoleOwner', owners: ['owner-cid'] },
+    } });
+    const present = new Set<string>();
+    const created: Array<{ name: string; profile: Record<string, unknown> }> = [];
+    const order: string[] = [];
+    const { calls, backend } = fakeBackend();
+    backend.install = async name => {
+      order.push(`install:${name}`);
+      calls.push(['install', name]);
+      return { created: true, detail: 'installed' };
+    };
+    const { d } = deps(backend);
+    d.identityProvisioner = {
+      exists: async name => present.has(name),
+      create: async (name, profile) => {
+        order.push(`identity:${name}`);
+        present.add(name);
+        created.push({ name, profile });
+      },
+    };
+
+    await up(loadConfig(), ['A'], d);
+
+    expect(order).toEqual(['identity:RoleIdentity', 'identity:RoleOwner', 'install:A']);
+    expect(created).toEqual([
+      { name: 'RoleIdentity', profile: {
+        bio: 'Role bio', persona: 'Role persona', exposeLocal: true, localAutoAccept: true,
+      } },
+      { name: 'RoleOwner', profile: {
+        bio: 'Authenticated owner channel for the ours-fleet A role.',
+        exposeLocal: false, localAutoAccept: false,
+      } },
+    ]);
+    const briefing = readFileSync(join(agentDir('A'), 'briefing.md'), 'utf8');
+    expect(briefing).toContain('It was created when your role');
+    expect(briefing).not.toContain('call **create_identity**');
+  });
+
+  it('refuses to start when permanent identity reconciliation is unavailable', async () => {
+    writeCfg({ A: { harness: 'fake' } });
+    const { calls, backend } = fakeBackend();
+    const { d } = deps(backend);
+    d.identityProvisioner = { exists: async () => 'unknown' };
+
+    await expect(up(loadConfig(), ['A'], d)).rejects.toThrow(/could not establish permanent ours identity/);
+    expect(calls.some(call => call[0] === 'install')).toBe(false);
+  });
+
   it('installs every role promptly (launch spacing is enforced by the start gate, not here)', async () => {
     writeCfg({ A: { harness: 'fake' }, B: { harness: 'fake' } });
     const { calls, backend } = fakeBackend();

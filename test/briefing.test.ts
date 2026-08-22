@@ -23,7 +23,7 @@ describe('generateBriefing', () => {
     expect(b).toContain('ours identity: **Alice Dev**');
     expect(b).toContain('choose_identity');
     expect(b).toContain('"Alice Dev"');
-    expect(b).toContain('create_identity');
+    expect(b).not.toContain('call **create_identity**');
     expect(b).toContain('current_identity');
     expect(b).toContain('set_bio');
     expect(b).toContain('set_persona');
@@ -167,14 +167,15 @@ describe('the briefing states only what was verified about the identity (7.3)', 
 
   it('an unverified identity is described as possibly absent, with the fallback', () => {
     const b = brief('unverified');
-    expect(b).toContain('was NOT verified when your role was created');
-    expect(b).toContain('create_identity');
+    expect(b).toContain('was NOT verified before launch');
+    expect(b).toContain('identity creation belongs to the fleet lifecycle');
+    expect(b).not.toContain('call **create_identity**');
   });
 
   it('a verified identity says binding should succeed, and to report it if not', () => {
     const b = brief('verified');
     expect(b).toContain('verified to exist');
-    expect(b).toContain('report the discrepancy');
+    expect(b).toContain('report the infrastructure race');
     expect(b).not.toContain('NOT verified');
   });
 
@@ -187,10 +188,11 @@ describe('the briefing states only what was verified about the identity (7.3)', 
     expect(brief()).toContain('was NOT verified');
   });
 
-  it('keeps a defensive bind-time check in every case', () => {
+  it('keeps a defensive bind-time check without delegating permanent creation', () => {
     for (const g of ['verified', 'created', 'unverified'] as const) {
       expect(brief(g), g).toContain('choose_identity');
-      expect(brief(g), g).toContain('create_identity');
+      expect(brief(g), g).not.toContain('call **create_identity**');
+      expect(brief(g), g).toMatch(/STOP/);
     }
   });
 });
@@ -232,10 +234,11 @@ describe('temporary-role identity compatibility', () => {
     expect(b).not.toContain('remove_identity');
   });
 
-  it('leaves permanent-role creation unchanged', () => {
+  it('keeps permanent-role creation in the fleet lifecycle', () => {
     const b = generateBriefing(base, vocab, opts);
     expect(b).toContain('persistent agent');
-    expect(b).toContain('create_identity');
+    expect(b).not.toContain('call **create_identity**');
+    expect(b).toContain('fleet lifecycle');
     expect(b).not.toContain('create_temporary_identity');
     expect(b).not.toContain('session-owned temporary');
   });

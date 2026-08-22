@@ -71,7 +71,7 @@ roles:
 
   FleetCoordinator:
     # A reliable owner channel requires ACP so fleet can capture the correlated
-    # final answer. Create this dedicated ours identity/contact before enabling.
+    # final answer. Fleet creates its dedicated identity with safe local defaults.
     # session: acp
     # owner_channel:
     #   identity: FleetCoordinator Owner Channel

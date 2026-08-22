@@ -15,7 +15,8 @@ import {
 import { applyRole, up, type OpsDeps } from './ops.js';
 import { START_STAGGER_FILE } from './runner.js';
 import {
-  buildProvenance, daemonIdentityProvisioner, ensureIdentity, provenanceOf,
+  buildProvenance, daemonIdentityInventoryProvisioner, daemonIdentityProvisioner,
+  ensureIdentity, provenanceOf,
   withCreationTransaction, writeProvenance, writeRoleFile,
   type CreationDeps, type CreationProvenance, type CreationTransaction,
   type IdentityGuarantee, type ProvenanceEntry,
@@ -351,7 +352,7 @@ export async function spawnPermanent(
       const guarantee = await ensureIdentity(
         effectiveIdentity(o),
         profileValues(o),
-        creation.identityProvisioner ?? daemonIdentityProvisioner(),
+        creation.identityProvisioner ?? deps.identityProvisioner ?? daemonIdentityProvisioner(),
         deps.log);
       creation.onStage?.('checking_identity', {
         result: guarantee.evidence, guarantee: guarantee.state,
@@ -402,7 +403,12 @@ export async function spawnPermanent(
       creation.onStage?.('registering_supervisor');
       await up(
         loadConfig(o.configPath), [o.name],
-        { ...deps, onInstalled: outcome => registered.push(outcome.role) },
+        {
+          ...deps,
+          ...(creation.identityProvisioner
+            ? { identityProvisioner: creation.identityProvisioner } : {}),
+          onInstalled: outcome => registered.push(outcome.role),
+        },
         o.configPath, guarantee.state);
       lastProvenance = provenance;
       return file;
@@ -455,7 +461,7 @@ export async function spawnTemp(
       const guarantee = await ensureIdentity(
         effectiveIdentity(o),
         profileValues(o),
-        creation.identityProvisioner ?? daemonIdentityProvisioner(),
+        creation.identityProvisioner ?? daemonIdentityInventoryProvisioner(),
         creation.log);
       creation.onStage?.('checking_identity', {
         result: guarantee.evidence, guarantee: guarantee.state,

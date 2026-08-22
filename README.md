@@ -210,11 +210,12 @@ offline shell and no stale fleet state.
 The console provides evidence-separated inventory and status, ACP activity and
 permission controls, redacted logs, typed text send, confirmed lifecycle
 actions, transactional permanent/temporary creation, and a shared tmux browser
-terminal. Identity is fixed to the role name. Creation uses the current
-authenticated identity existence check and reports verified, missing, or
-unknown evidence; a newly launched harness follows its generated first-boot
-instructions to choose or create and bind the identity. The console never
-claims that the host created an identity and never deletes one.
+terminal. Identity is fixed to the role name. Creation uses the authenticated
+daemon inventory and reports verified, missing, or unknown evidence. A missing
+permanent role identity is created deterministically before launch with local
+discovery and auto-accept enabled, then the provisioning lease is released so
+the harness only has to bind it. Fleet never silently replaces or force-adopts
+an existing identity.
 
 For a temporary role, those first-boot instructions preserve and bind an
 existing identity when one is present. If the assigned identity is missing,
@@ -222,8 +223,9 @@ the role capability-detects the ours MCP `create_temporary_identity` tool and
 uses it when available, so the newly created identity is owned and cleaned up
 by that connector session lifecycle. Older ours servers remain compatible via
 `create_identity`. A collision or creation error stops for operator review;
-fleet never force-adopts or deletes identity state. Permanent roles continue to
-use normal `create_identity` bootstrap behavior.
+fleet never force-adopts or deletes identity state. Permanent roles are
+provisioned by fleet before launch and never delegate normal identity creation
+to the harness.
 
 `node-pty` is optional: if its native module cannot load, ACP and all
 non-terminal features remain available and tmux Terminal is disabled with a
@@ -365,7 +367,7 @@ roles:
       batch_ms: 2000                    # coalesce a burst into one line (default 2000)
       inject: notification              # notification (default) | full (bodies inline; roadmap)
     owner_channel:                      # optional trusted owner ingress; requires session: acp
-      identity: "Name Owner Channel"     # existing, dedicated ours identity bound only by fleet
+      identity: "Name Owner Channel"     # dedicated identity; fleet creates it with safe local defaults
       owners: [owner-contact-cid]        # authenticated ours contact IDs, never display names
       agent: managed-agent-cid           # exact role CID allowed to relay messages/files outward
       interrupt: false                  # false queues; true cancels current work first
@@ -660,8 +662,10 @@ console later; no terminal UI is part of the monitor or session backend.
 ### Trusted owner channel
 
 `owner_channel` adds a second ours identity to a role without changing the
-role's normal identity. Create that dedicated identity in ours first, connect it
-to each owner/controller identity and the managed role identity, put the owners'
+role's normal identity. Fleet creates that dedicated permanent identity when it
+is missing, with local exposure and local auto-accept disabled, and releases the
+provisioning lease before the supervisor binds it. Connect it to each
+owner/controller identity and the managed role identity, put the owners'
 immutable contact CIDs in `owners`, and put the managed role identity's exact CID
 in `agent`. The channel identity must not be any role identity or another role's
 channel identity. Add it to the control plane just like another contact, then

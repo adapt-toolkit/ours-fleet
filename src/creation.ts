@@ -1,11 +1,13 @@
 import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
+import { randomUUID } from 'node:crypto';
 import {
   attachOursClient, type AttachOursClientOptions, type OursClient,
 } from '@ours.network/sdk/client';
 import { replaceFileAtomically, withFileLock, type LockDeps } from './atomic-file.js';
 import { stateRoot } from './paths.js';
 import { buildInfo, UNKNOWN_BUILD } from './provenance.js';
+import type { ResolvedRole } from './config.js';
 
 /**
  * One creation transaction: role name and ours identity reserved together,
@@ -217,7 +219,7 @@ export interface IdentityProvisioner {
   /** Does this identity exist? `unknown` when the daemon could not be asked. */
   exists(name: string): Promise<boolean | 'unknown'>;
   /** Create it, publishing bio/persona through the same path. Absent = cannot. */
-  create?(name: string, profile: { bio?: string; persona?: string }): Promise<void>;
+  create?(name: string, profile: IdentityProvisionProfile): Promise<void>;
   /**
    * Undo a `create` during rollback. Only ever called for an identity THIS
    * transaction created; absent means "cannot", and the orphan is reported.
@@ -225,10 +227,60 @@ export interface IdentityProvisioner {
   remove?(name: string): Promise<void>;
 }
 
+export interface IdentityProvisionProfile {
+  bio?: string;
+  persona?: string;
+  /** Permanent role identities are locally discoverable; control identities opt out. */
+  exposeLocal?: boolean;
+  /** Permanent role identities accept sibling introductions; control identities opt out. */
+  localAutoAccept?: boolean;
+}
+
 export type IdentityGuarantee =
   | { state: 'verified'; evidence: 'verified'; detail: string }
   | { state: 'created'; evidence: 'missing'; detail: string }
   | { state: 'unverified'; evidence: 'missing' | 'unknown'; detail: string };
+
+const requireGuaranteedIdentity = (
+  role: ResolvedRole, identity: string, result: IdentityGuarantee,
+): Exclude<IdentityGuarantee, { state: 'unverified' }> => {
+  if (result.state !== 'unverified') return result;
+  throw new Error(
+    `role '${role.name}': could not establish permanent ours identity '${identity}' before launch: ${result.detail}`);
+};
+
+/** Reconcile every permanent identity a role's supervisor owns before launch. */
+export async function reconcilePermanentRoleIdentities(
+  role: ResolvedRole,
+  provisioner: IdentityProvisioner = daemonIdentityProvisioner(),
+  log: (line: string) => void = () => {},
+  knownRoleGuarantee?: IdentityGuarantee['state'],
+): Promise<'verified' | 'created'> {
+  const roleResult = knownRoleGuarantee
+    ? {
+        state: knownRoleGuarantee,
+        evidence: knownRoleGuarantee === 'verified' ? 'verified' : 'missing',
+        detail: `identity was ${knownRoleGuarantee} by the creation transaction`,
+      } as IdentityGuarantee
+    : await ensureIdentity(role.identity, {
+        bio: role.bio,
+        persona: role.persona,
+        exposeLocal: true,
+        localAutoAccept: true,
+      }, provisioner, log);
+  const roleGuarantee = requireGuaranteedIdentity(role, role.identity, roleResult);
+
+  if (role.owner_channel) {
+    const channelIdentity = role.owner_channel.identity;
+    const channel = await ensureIdentity(channelIdentity, {
+      bio: `Authenticated owner channel for the ours-fleet ${role.name} role.`,
+      exposeLocal: false,
+      localAutoAccept: false,
+    }, provisioner, log);
+    requireGuaranteedIdentity(role, channelIdentity, channel);
+  }
+  return roleGuarantee.state;
+}
 
 /**
  * Establish the identity before the role's service is enabled.
@@ -240,7 +292,7 @@ export type IdentityGuarantee =
  */
 export async function ensureIdentity(
   name: string,
-  profile: { bio?: string; persona?: string },
+  profile: IdentityProvisionProfile,
   provisioner: IdentityProvisioner | undefined,
   log: (line: string) => void = () => {},
 ): Promise<IdentityGuarantee> {
@@ -269,10 +321,9 @@ export async function ensureIdentity(
     };
 
   if (!provisioner.create) {
-    // Loud, and named. The briefing will tell the agent to mint it — which is
-    // what actually happens today — but nobody is told it was "predefined".
-    log(`identity '${name}' does not exist and this host cannot create one automatically — `
-      + `the role will be told to mint it on first boot. Create it in advance to avoid that.`);
+    // Loud, and named. Permanent lifecycle callers fail closed here; temporary
+    // callers preserve connector-owned first-boot creation semantics.
+    log(`identity '${name}' does not exist and this provisioner cannot create one automatically`);
     return {
       state: 'unverified', evidence: 'missing',
       detail: 'it does not exist and cannot be created here',
@@ -291,19 +342,31 @@ export async function ensureIdentity(
  * the daemon cannot be reached — an unreachable daemon is not evidence that
  * the identity is missing.
  *
- * It deliberately has no `create()`: roles still own identity selection and
- * binding inside their application session, and temporary identities must stay
- * owned by that session so daemon cleanup semantics remain intact.
+ * Permanent identities can be created before a harness starts. Creation binds
+ * the provisioning lease, so it is always released before the role or channel
+ * takes ownership. Temporary callers disable creation: a temporary identity is
+ * owned and deleted by the exact connector lease that created it, and there is
+ * no safe lease-transfer operation in the current SDK.
  */
-type IdentityInventoryClient = Pick<OursClient, 'identities'>;
+type IdentityInventoryClient = Pick<OursClient, 'identities'>
+  & Partial<Pick<OursClient,
+    'listIdentities' | 'createIdentity' | 'setPersona' | 'releaseLease'>>;
+
+export interface DaemonIdentityProvisionerOptions {
+  /** False for temporary roles/watchdogs whose connector must own creation. */
+  createPermanent?: boolean;
+  /** True only for inventory checks performed by a temporary lifecycle. */
+  acceptTemporaryExisting?: boolean;
+}
 
 export function daemonIdentityProvisioner(
   env: NodeJS.ProcessEnv = process.env,
   attachClient: (
     options: AttachOursClientOptions,
   ) => Promise<IdentityInventoryClient> = attachOursClient,
+  options: DaemonIdentityProvisionerOptions = {},
 ): IdentityProvisioner {
-  return {
+  const provisioner: IdentityProvisioner = {
     async exists(name: string) {
       try {
         const client = await attachClient({
@@ -311,12 +374,78 @@ export function daemonIdentityProvisioner(
         });
         const identities = await client.identities();
         if (!Array.isArray(identities)) return 'unknown';
-        return identities.some(identity => identity.name === name);
+        const existing = identities.find(identity => identity.name === name);
+        if (!existing) return false;
+        // A session-owned temporary identity cannot satisfy a permanent role
+        // invariant. Report it as absent so create() can reject the collision
+        // explicitly after inspecting the authoritative identity tree.
+        if (existing.temporary && options.acceptTemporaryExisting !== true) return false;
+        return true;
       } catch {
         return 'unknown';
       }
     },
   };
+  if (options.createPermanent === false) return provisioner;
+
+  provisioner.create = async (name, profile) => {
+    const client = await attachClient({
+      env, leaseToken: `ours-fleet-identity-create-${process.pid}-${randomUUID()}`,
+      clientPid: process.pid,
+    });
+    if (!client.listIdentities || !client.createIdentity || !client.releaseLease)
+      throw new Error('the selected ours SDK client cannot create permanent identities');
+
+    try {
+      const before = await client.listIdentities();
+      const existing = before.find(identity => identity.name === name);
+      if (existing) {
+        if (existing.temp)
+          throw new Error(`identity '${name}' exists but is temporary; refusing to convert or adopt it`);
+        return; // another reconciler won the create race
+      }
+      if (!before.some(identity => identity.kind === 'root'))
+        throw new Error(
+          `cannot create role identity '${name}': this host has no Human identity; run ours onboarding first`);
+
+      let createdHere = false;
+      try {
+        await client.createIdentity({
+          name,
+          bio: profile.bio ?? '',
+          exposeLocal: profile.exposeLocal ?? true,
+          localAutoAccept: profile.localAutoAccept ?? true,
+        });
+        createdHere = true;
+      } catch (error) {
+        // Creation is daemon-atomic. If a concurrent reconciler won by name,
+        // accept only the compatible permanent identity now visible.
+        const after = await client.listIdentities();
+        const raced = after.find(identity => identity.name === name);
+        if (!raced || raced.temp) throw error;
+      }
+      if (createdHere && profile.persona && client.setPersona)
+        await client.setPersona({ persona: profile.persona });
+    } finally {
+      // createIdentity binds this lease. The managed role/channel is the next
+      // owner, so never leave the short-lived provisioning client holding it.
+      await client.releaseLease();
+    }
+  };
+  return provisioner;
+}
+
+/** Inventory-only variant for session-owned temporary identity lifecycles. */
+export function daemonIdentityInventoryProvisioner(
+  env: NodeJS.ProcessEnv = process.env,
+  attachClient: (
+    options: AttachOursClientOptions,
+  ) => Promise<IdentityInventoryClient> = attachOursClient,
+): IdentityProvisioner {
+  return daemonIdentityProvisioner(env, attachClient, {
+    createPermanent: false,
+    acceptTemporaryExisting: true,
+  });
 }
 
 /** Atomically write a role's fleet.d file, journalling it for rollback. */

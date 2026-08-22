@@ -343,9 +343,12 @@ export class RoleCreationService {
         );
       }
       const creation: CreationDeps = {
-        // Deliberately strip any mutation methods from the test seam. The web
-        // uses today's read-only daemon preflight; first-boot owns create/bind.
-        identityProvisioner: { exists: name => this.identityProvisioner.exists(name) },
+        // Permanent identity infrastructure is reconciled before launch. A
+        // temporary identity must still be created by its eventual connector
+        // session because that exact lease owns cleanup.
+        identityProvisioner: preview.effective.lifetime === 'permanent'
+          ? this.identityProvisioner
+          : { exists: name => this.identityProvisioner.exists(name) },
         onStage: (stage, evidence) => this.coreStage(action, stage, evidence),
       };
       if (preview.effective.lifetime === 'permanent') {
@@ -358,7 +361,9 @@ export class RoleCreationService {
       this.stage(action, 'launched', 'launch accepted; readiness not yet confirmed');
       this.stage(
         action, 'identity_bootstrap_pending',
-        'the harness must choose or create and bind its identity from the generated briefing',
+        preview.effective.lifetime === 'permanent'
+          ? 'fleet established the permanent identity; the harness must bind it from the generated briefing'
+          : 'the harness must choose or create and bind its session-owned temporary identity from the generated briefing',
       );
       this.stage(action, 'waiting_for_session');
       const ready = await this.waitForReady(action.roleId, action.session);
