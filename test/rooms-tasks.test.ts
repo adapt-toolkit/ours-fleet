@@ -61,6 +61,15 @@ describe('templates', () => {
       expect(resolveTemplate('team@99', {})).toBeUndefined();
     });
 
+    it('resolves the single builtin as a solo-agent template', () => {
+      const t = resolveTemplate('single', {});
+      expect(t).toBeDefined();
+      expect(t!.builtin).toBe(true);
+      expect(t!.members).toHaveLength(1);
+      expect(t!.members[0].count).toBe(1);
+      expect(resolveTemplate('single@1', {})).toBeDefined();
+    });
+
     it('returns undefined for unknown name', () => {
       expect(resolveTemplate('nonexistent', {})).toBeUndefined();
     });
@@ -95,6 +104,7 @@ describe('templates', () => {
       expect(list.length).toBe(BUILTIN_TEMPLATES.length);
       expect(list.map(t => t.name)).toContain('team');
       expect(list.map(t => t.name)).toContain('pair');
+      expect(list.map(t => t.name)).toContain('single');
     });
 
     it('merges custom with built-ins, sorted', () => {
