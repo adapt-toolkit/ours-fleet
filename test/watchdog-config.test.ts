@@ -107,7 +107,7 @@ describe('watchdogs config', () => {
     base(TWO_ROLES);
     mkdirSync(join(dir, 'fleet.d'), { recursive: true });
     writeFileSync(join(dir, 'fleet.d', 'w.yaml'), 'watchdogs:\n  w: { coordinator: C }\n');
-    expect(() => loadConfig()).toThrowError(/fleet.d files may only define roles:/);
+    expect(() => loadConfig()).toThrowError(/fleet.d files may only define roles/);
   });
 });
 

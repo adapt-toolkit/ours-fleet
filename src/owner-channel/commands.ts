@@ -209,6 +209,89 @@ export const ownerCommands: OwnerCommand[] = [
     name: 'version', summary: 'report the fleet version',
     execute: noArgs('/version', async ctx => ctx.reply(`ℹ️ ours-fleet ${ctx.version}`)),
   },
+  {
+    name: 'tasks', usage: '/tasks [state]',
+    summary: 'list tasks (optionally filter by state)',
+    execute: async (ctx, args) => {
+      const { listTasks } = await import('../rooms-tasks/task-state.js');
+      const stateFilter = args?.trim() || undefined;
+      const tasks = listTasks(stateFilter && stateFilter !== 'all' ? { state: stateFilter as any } : undefined);
+      if (!tasks.length) return ctx.reply('📋 No tasks.');
+      const lines = tasks.map(t => {
+        const blocked = t.blocked ? ` [BLOCKED: ${t.blocked.reason}]` : '';
+        return `${t.task_id}  ${t.state}${blocked}  ${t.title}`;
+      });
+      await ctx.reply(tail(`📋 Tasks:\n${lines.join('\n')}`, REPLY_MAX_CHARS));
+    },
+  },
+  {
+    name: 'task', usage: '/task <id>',
+    summary: 'show task details',
+    execute: async (ctx, args) => {
+      if (!args) throw new OwnerCommandUsageError('usage: /task <id>');
+      const { getTask } = await import('../rooms-tasks/task-state.js');
+      try {
+        const t = getTask(args.trim());
+        const lines = [
+          `📋 Task: ${t.task_id}`,
+          `Title: ${t.title}`,
+          `State: ${t.state}${t.blocked ? ` [BLOCKED: ${t.blocked.reason}]` : ''}`,
+          ...(t.template ? [`Template: ${t.template.name}@${t.template.version}`] : []),
+          ...(t.room_id ? [`Room: ${t.room_id}`] : []),
+          `Origin: ${t.origin.type}`,
+          `Created: ${t.created_at}`,
+        ];
+        await ctx.reply(lines.join('\n'));
+      } catch (e) {
+        await ctx.reply(`⚠️ ${e instanceof Error ? e.message : String(e)}`);
+      }
+    },
+  },
+  {
+    name: 'rooms', summary: 'list rooms',
+    execute: noArgs('/rooms', async ctx => {
+      const { listRoomRecords } = await import('../rooms-tasks/room-state.js');
+      const rooms = listRoomRecords();
+      if (!rooms.length) return ctx.reply('🏠 No rooms.');
+      const lines = rooms.map(r =>
+        `${r.room_id}  ${r.state}  ${r.room_name}${r.task_id ? ` (task: ${r.task_id})` : ''}`);
+      await ctx.reply(tail(`🏠 Rooms:\n${lines.join('\n')}`, REPLY_MAX_CHARS));
+    }),
+  },
+  {
+    name: 'room', usage: '/room <id>',
+    summary: 'show room details',
+    execute: async (ctx, args) => {
+      if (!args) throw new OwnerCommandUsageError('usage: /room <id>');
+      const { getRoomRecord } = await import('../rooms-tasks/room-state.js');
+      const r = getRoomRecord(args.trim());
+      if (!r) return ctx.reply(`⚠️ room not found: ${args.trim()}`);
+      const lines = [
+        `🏠 Room: ${r.room_id}`,
+        `Name: ${r.room_name}`,
+        `State: ${r.state}`,
+        `Saga: ${r.saga.phase} (step ${r.saga.step_index})`,
+        ...(r.task_id ? [`Task: ${r.task_id}`] : []),
+        ...(r.provisioning_detail ? [`Detail: ${r.provisioning_detail}`] : []),
+        ...(r.saga.error ? [`Error: ${r.saga.error}`] : []),
+        `Created: ${r.created_at}`,
+      ];
+      await ctx.reply(lines.join('\n'));
+    },
+  },
+  {
+    name: 'templates', summary: 'list available room templates',
+    execute: noArgs('/templates', async ctx => {
+      const { listTemplates } = await import('../rooms-tasks/templates.js');
+      const templates = listTemplates({});
+      if (!templates.length) return ctx.reply('📐 No templates.');
+      const lines = templates.map(t => {
+        const tag = t.builtin ? ' (built-in)' : '';
+        return `${t.name}@${t.version}${tag}  ${t.description}`;
+      });
+      await ctx.reply(`📐 Templates:\n${lines.join('\n')}`);
+    }),
+  },
 ];
 
 /** Trimmed slash-prefixed text is a command attempt and is never forwarded. */

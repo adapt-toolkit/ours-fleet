@@ -54,6 +54,7 @@ import {
 } from './fleet-proxy.js';
 import './harness/claude-code.js';   // registers the claude-code adapter
 import './harness/codex.js';         // registers the codex adapter
+import { registerTemplateCommands, registerTaskCommands, registerRoomCommands } from './rooms-tasks/cli.js';
 
 // sudo/su shells lack XDG_RUNTIME_DIR, breaking every systemctl/journalctl
 // --user child (supervisor commands, logs, doctor). Derive it before dispatch. (#9)
@@ -1265,6 +1266,11 @@ function configureWebAccess(opts: {
   );
   return undefined;
 }
+
+// ── rooms & tasks ──────────────────────────────────────────────────────────
+registerTemplateCommands(program, cOpt);
+registerTaskCommands(program, cOpt);
+registerRoomCommands(program, cOpt);
 
 program.command('_run <name>', { hidden: true }).description('internal: supervisor entrypoint')
   .option('-c, --configuration <file>')
