@@ -9,7 +9,7 @@ import {
 import {
   createTask, getTask, listTasks, startTask, activateTask,
   blockTask, unblockTask, reviewTask, completeTask, cancelTask,
-  updateTaskRoom, updateTaskMembers, failTask, TaskStateError,
+  updateTaskRoom, updateTaskTemplate, updateTaskMembers, failTask, TaskStateError,
 } from './task-state.js';
 import {
   createRoomRecord, getRoomRecord, listRoomRecords,
@@ -530,32 +530,36 @@ export function registerTaskCommands(parent: Command, cOpt: (cmd: Command) => Co
           return;
         }
 
-        if (t.state === 'backlog') {
-          t = startTask(id);
-        }
-
+        // Select and validate the template snapshot before any state change or
+        // provisioning. An explicit --template re-pins the task; a stored ref
+        // must still match its snapshot (same contract as `task start`).
         const templateName = opts.template
           ?? t.template?.name
           ?? cfg.tasks?.default_room_template
           ?? cfg.rooms?.defaults?.template
           ?? 'single';
-
+        const resolved = resolveTemplate(templateName, allTemplates(cfg));
+        if (!resolved) die(new Error(`template not found: ${templateName}`));
+        const snap = snapshotTemplate(resolved);
+        if (!opts.template && t.template && snap.content_hash !== t.template.content_hash)
+          die(new Error(`task template snapshot no longer matches ${t.template.name}@${t.template.version}`));
         let templateRef = t.template;
-        if (!templateRef || (opts.template && opts.template !== t.template?.name)) {
-          const resolved = resolveTemplate(templateName, allTemplates(cfg));
-          if (!resolved) die(new Error(`template not found: ${templateName}`));
-          const snap = snapshotTemplate(resolved);
+        if (!templateRef || templateRef.name !== snap.name || templateRef.content_hash !== snap.content_hash) {
           templateRef = { name: snap.name, version: snap.version, content_hash: snap.content_hash };
+          t = updateTaskTemplate(t.task_id, templateRef);
+        }
+
+        if (t.state === 'backlog') {
+          t = startTask(id);
         }
 
         if (!t.room_id) {
-          const template = resolveRoomTemplate(cfg, templateRef.name);
           try {
             await provisionRoom(cfg, {
               name: t.title,
               goal: t.title,
               brief: t.brief,
-              template,
+              template: snap,
               taskId: t.task_id,
               onCreated: room => {
                 t = updateTaskRoom(t.task_id, room.room_id, room.room_identity_cid!);
@@ -567,6 +571,34 @@ export function registerTaskCommands(parent: Command, cOpt: (cmd: Command) => Co
               blockTask(t.task_id, 'Cowork management socket is unavailable');
             }
             throw error;
+          }
+        } else if (t.state === 'provisioning') {
+          // The task already has a room mid-provisioning (e.g. seats were still
+          // pending on the last run). Resume it exactly as `task recover` does.
+          const room = getRoomRecord(t.room_id);
+          const resumable: import('./types.js').SagaPhase[] =
+            ['create_members', 'join_role_groups', 'wait_seats', 'launch_work', 'activate'];
+          if (room && resumable.includes(room.saga.phase)) {
+            try {
+              await provisionMembers({
+                cfg,
+                cowork: coworkFor(cfg),
+                roomId: room.room_id,
+                taskId: t.task_id,
+                template: snap,
+                binPath: getBinPath(),
+                brief: t.brief,
+                goal: t.title,
+              });
+            } catch (error) {
+              if (error instanceof CoworkUnavailableError) {
+                blockTask(t.task_id, 'Cowork management socket is unavailable');
+              }
+              throw error;
+            }
+            t = getTask(t.task_id);
+          } else {
+            die(new Error(`task ${id} has room ${t.room_id} in a non-resumable state — run 'task recover ${id}'`));
           }
         }
 

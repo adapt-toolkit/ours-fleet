@@ -38,7 +38,7 @@ vi.mock('../src/rooms-tasks/provision.js', async (importOriginal) => {
 
 import { registerTaskCommands } from '../src/rooms-tasks/cli.js';
 import { createTask, getTask, activateTask, reviewTask, cancelTask } from '../src/rooms-tasks/task-state.js';
-import { activateRoom, getRoomRecord } from '../src/rooms-tasks/room-state.js';
+import { activateRoom, getRoomRecord, advanceSaga } from '../src/rooms-tasks/room-state.js';
 import { CoworkUnavailableError } from '../src/rooms-tasks/cowork-adapter.js';
 
 const ROOM_ID = '01hzyk8m0000000000000000aa';
@@ -179,6 +179,68 @@ describe('task work', () => {
     await expect(run('work', t.task_id)).rejects.toThrow(ExitError);
     await run('work', t.task_id);
     expect(getTask(t.task_id).state).toBe('active');
+  });
+
+  it('persists the selected template snapshot on the task before provisioning', async () => {
+    const t = backlogTask();
+    await run('work', t.task_id);
+    const after = getTask(t.task_id);
+    expect(after.template?.name).toBe('single');
+    expect(after.template?.version).toBe(1);
+    expect(after.template?.content_hash).toMatch(/^[0-9a-f]{64}$/);
+  });
+
+  it('re-pins the task to an explicit --template override', async () => {
+    const t = backlogTask();
+    await run('work', t.task_id, '--template', 'team');
+    const after = getTask(t.task_id);
+    expect(after.template?.name).toBe('team');
+    expect(after.template?.content_hash).toMatch(/^[0-9a-f]{64}$/);
+  });
+
+  it('refuses a stored template whose snapshot has drifted, like task start', async () => {
+    const t = createTask({
+      title: 'Fix the parser',
+      origin: { type: 'cli' },
+      start: false,
+      template: { name: 'team', version: 1, content_hash: 'f'.repeat(64) },
+    });
+    await expect(run('work', t.task_id)).rejects.toThrow(ExitError);
+    expect(out.join('\n')).toContain('no longer matches team@1');
+    expect(getTask(t.task_id).state).toBe('backlog');
+    expect(mocks.createRoom).not.toHaveBeenCalled();
+  });
+
+  it('resumes a room stuck in waiting_seats: second work reaches active', async () => {
+    // First provisioning run ends with seats pending, exactly as the real
+    // provisionMembers does when getSeats reports inactive members.
+    mocks.provisionMembers.mockImplementationOnce(async ({ roomId }: { roomId: string }) => {
+      advanceSaga(roomId, 'wait_seats', 5, 'waiting_seats');
+      return getRoomRecord(roomId)!;
+    });
+    const t = backlogTask();
+    await run('work', t.task_id);
+    expect(getTask(t.task_id).state).toBe('provisioning');
+    expect(getRoomRecord(ROOM_ID)!.saga.phase).toBe('wait_seats');
+
+    await run('work', t.task_id);
+    expect(getTask(t.task_id).state).toBe('active');
+    expect(mocks.createRoom).toHaveBeenCalledTimes(1);
+    expect(mocks.provisionMembers).toHaveBeenCalledTimes(2);
+    expect(mocks.provisionMembers).toHaveBeenLastCalledWith(
+      expect.objectContaining({ roomId: ROOM_ID, taskId: t.task_id }));
+  });
+
+  it('reports a non-resumable room instead of silently stranding the task', async () => {
+    mocks.provisionMembers.mockImplementationOnce(async ({ roomId }: { roomId: string }) => {
+      advanceSaga(roomId, 'wait_seats', 5, 'waiting_seats');
+      return getRoomRecord(roomId)!;
+    });
+    const t = backlogTask();
+    await run('work', t.task_id);
+    advanceSaga(ROOM_ID, 'create_room', 1);
+    await expect(run('work', t.task_id)).rejects.toThrow(ExitError);
+    expect(out.join('\n')).toContain('task recover');
   });
 });
 

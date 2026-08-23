@@ -199,6 +199,13 @@ export function updateTaskRoom(
   return t;
 }
 
+export function updateTaskTemplate(id: string, template: TaskTemplateRef): TaskRecord {
+  const t = readTask(id);
+  t.template = template;
+  writeTask(t);
+  return t;
+}
+
 export function updateTaskMembers(id: string, members: TaskMemberRole[]): TaskRecord {
   const t = readTask(id);
   t.member_roles = members;
