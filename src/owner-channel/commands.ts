@@ -225,13 +225,18 @@ export const ownerCommands: OwnerCommand[] = [
     },
   },
   {
-    name: 'task', usage: '/task <id>',
-    summary: 'show task details',
+    name: 'task',
+    usage: '/task <show|start|block|unblock|review|done|cancel> <id> [...]',
+    summary: 'task subcommands (show, start, block, unblock, review, done, cancel)',
     execute: async (ctx, args) => {
-      if (!args) throw new OwnerCommandUsageError('usage: /task <id>');
-      const { getTask } = await import('../rooms-tasks/task-state.js');
-      try {
-        const t = getTask(args.trim());
+      if (!args) throw new OwnerCommandUsageError('usage: /task <subcommand> <id>');
+      const parts = args.trim().split(/\s+/);
+      const sub = parts[0];
+      const rest = parts.slice(1);
+
+      const showTask = async (id: string) => {
+        const { getTask } = await import('../rooms-tasks/task-state.js');
+        const t = getTask(id);
         const lines = [
           `📋 Task: ${t.task_id}`,
           `Title: ${t.title}`,
@@ -242,7 +247,66 @@ export const ownerCommands: OwnerCommand[] = [
           `Created: ${t.created_at}`,
         ];
         await ctx.reply(lines.join('\n'));
+      };
+
+      try {
+        switch (sub) {
+          case 'show': {
+            if (!rest[0]) throw new OwnerCommandUsageError('usage: /task show <id>');
+            await showTask(rest[0]);
+            break;
+          }
+          case 'start': {
+            if (!rest[0]) throw new OwnerCommandUsageError('usage: /task start <id>');
+            const { startTask } = await import('../rooms-tasks/task-state.js');
+            const t = startTask(rest[0]);
+            await ctx.reply(`✅ Task ${t.task_id} → provisioning`);
+            break;
+          }
+          case 'block': {
+            if (!rest[0] || !rest[1]) throw new OwnerCommandUsageError('usage: /task block <id> <reason>');
+            const { blockTask } = await import('../rooms-tasks/task-state.js');
+            const reason = rest.slice(1).join(' ');
+            const t = blockTask(rest[0], reason);
+            await ctx.reply(`🚧 Task ${t.task_id} blocked: ${reason}`);
+            break;
+          }
+          case 'unblock': {
+            if (!rest[0]) throw new OwnerCommandUsageError('usage: /task unblock <id>');
+            const { unblockTask } = await import('../rooms-tasks/task-state.js');
+            const t = unblockTask(rest[0]);
+            await ctx.reply(`✅ Task ${t.task_id} unblocked`);
+            break;
+          }
+          case 'review': {
+            if (!rest[0]) throw new OwnerCommandUsageError('usage: /task review <id>');
+            const { reviewTask } = await import('../rooms-tasks/task-state.js');
+            const t = reviewTask(rest[0]);
+            await ctx.reply(`📝 Task ${t.task_id} → review`);
+            break;
+          }
+          case 'done': {
+            if (!rest[0]) throw new OwnerCommandUsageError('usage: /task done <id> [summary]');
+            const { completeTask } = await import('../rooms-tasks/task-state.js');
+            const summary = rest.slice(1).join(' ') || undefined;
+            const t = completeTask(rest[0], summary ? { summary } : undefined);
+            await ctx.reply(`✅ Task ${t.task_id} → done`);
+            break;
+          }
+          case 'cancel': {
+            if (rest.length < 2 || rest[0] !== rest[1])
+              throw new OwnerCommandUsageError('destructive: /task cancel <id> <id> — provide the task ID twice');
+            const { cancelTask } = await import('../rooms-tasks/task-state.js');
+            const t = cancelTask(rest[0]);
+            await ctx.reply(`🗑️ Task ${t.task_id} → cancelled`);
+            break;
+          }
+          default:
+            // bare /task <id> → show
+            await showTask(sub);
+        }
       } catch (e) {
+        if (e instanceof OwnerCommandUsageError) throw e;
         await ctx.reply(`⚠️ ${e instanceof Error ? e.message : String(e)}`);
       }
     },
@@ -259,28 +323,60 @@ export const ownerCommands: OwnerCommand[] = [
     }),
   },
   {
-    name: 'room', usage: '/room <id>',
-    summary: 'show room details',
+    name: 'room',
+    usage: '/room <show|close> <id> [...]',
+    summary: 'room subcommands (show, close)',
     execute: async (ctx, args) => {
-      if (!args) throw new OwnerCommandUsageError('usage: /room <id>');
-      const { getRoomRecord } = await import('../rooms-tasks/room-state.js');
-      const r = getRoomRecord(args.trim());
-      if (!r) return ctx.reply(`⚠️ room not found: ${args.trim()}`);
-      const lines = [
-        `🏠 Room: ${r.room_id}`,
-        `Name: ${r.room_name}`,
-        `State: ${r.state}`,
-        `Saga: ${r.saga.phase} (step ${r.saga.step_index})`,
-        ...(r.task_id ? [`Task: ${r.task_id}`] : []),
-        ...(r.provisioning_detail ? [`Detail: ${r.provisioning_detail}`] : []),
-        ...(r.saga.error ? [`Error: ${r.saga.error}`] : []),
-        `Created: ${r.created_at}`,
-      ];
-      await ctx.reply(lines.join('\n'));
+      if (!args) throw new OwnerCommandUsageError('usage: /room <subcommand> <id>');
+      const parts = args.trim().split(/\s+/);
+      const sub = parts[0];
+      const rest = parts.slice(1);
+
+      const showRoom = async (id: string) => {
+        const { getRoomRecord } = await import('../rooms-tasks/room-state.js');
+        const r = getRoomRecord(id);
+        if (!r) return ctx.reply(`⚠️ room not found: ${id}`);
+        const lines = [
+          `🏠 Room: ${r.room_id}`,
+          `Name: ${r.room_name}`,
+          `State: ${r.state}`,
+          `Saga: ${r.saga.phase} (step ${r.saga.step_index})`,
+          ...(r.task_id ? [`Task: ${r.task_id}`] : []),
+          ...(r.provisioning_detail ? [`Detail: ${r.provisioning_detail}`] : []),
+          ...(r.saga.error ? [`Error: ${r.saga.error}`] : []),
+          `Created: ${r.created_at}`,
+        ];
+        await ctx.reply(lines.join('\n'));
+      };
+
+      try {
+        switch (sub) {
+          case 'show': {
+            if (!rest[0]) throw new OwnerCommandUsageError('usage: /room show <id>');
+            await showRoom(rest[0]);
+            break;
+          }
+          case 'close': {
+            if (rest.length < 2 || rest[0] !== rest[1])
+              throw new OwnerCommandUsageError('destructive: /room close <id> <id> — provide the room ID twice');
+            const { closeRoom } = await import('../rooms-tasks/room-state.js');
+            const r = closeRoom(rest[0]);
+            await ctx.reply(`🔒 Room ${r.room_id} → closed`);
+            break;
+          }
+          default:
+            // bare /room <id> → show
+            await showRoom(sub);
+        }
+      } catch (e) {
+        if (e instanceof OwnerCommandUsageError) throw e;
+        await ctx.reply(`⚠️ ${e instanceof Error ? e.message : String(e)}`);
+      }
     },
   },
   {
-    name: 'templates', summary: 'list available room templates',
+    name: 'templates', aliases: ['template-list'],
+    summary: 'list available room templates',
     execute: noArgs('/templates', async ctx => {
       const { listTemplates } = await import('../rooms-tasks/templates.js');
       const templates = listTemplates({});
@@ -291,6 +387,54 @@ export const ownerCommands: OwnerCommand[] = [
       });
       await ctx.reply(`📐 Templates:\n${lines.join('\n')}`);
     }),
+  },
+  {
+    name: 'template',
+    usage: '/template <show|list> <name[@version]>',
+    summary: 'template subcommands (show, list)',
+    execute: async (ctx, args) => {
+      if (!args) throw new OwnerCommandUsageError('usage: /template show <name[@version]>');
+      const parts = args.trim().split(/\s+/);
+      const sub = parts[0];
+
+      const showTemplate = async (nameStr: string) => {
+        const { resolveTemplate } = await import('../rooms-tasks/templates.js');
+        const t = resolveTemplate(nameStr, {});
+        if (!t) return ctx.reply(`⚠️ template not found: ${nameStr}`);
+        const lines = [
+          `📐 Template: ${t.name}@${t.version}`,
+          `Description: ${t.description}`,
+          ...(t.builtin ? ['Source: built-in'] : []),
+          ...(t.contract ? [`Contract: ${t.contract}`] : []),
+          'Members:',
+          ...t.members.map(m =>
+            `  ${m.slot} (${m.role}) ×${m.count} → role_ref: ${m.role_ref}`),
+        ];
+        await ctx.reply(lines.join('\n'));
+      };
+
+      switch (sub) {
+        case 'show': {
+          if (!parts[1]) throw new OwnerCommandUsageError('usage: /template show <name[@version]>');
+          await showTemplate(parts[1]);
+          break;
+        }
+        case 'list': {
+          const { listTemplates } = await import('../rooms-tasks/templates.js');
+          const templates = listTemplates({});
+          if (!templates.length) return ctx.reply('📐 No templates.');
+          const lines = templates.map(t => {
+            const tag = t.builtin ? ' (built-in)' : '';
+            return `${t.name}@${t.version}${tag}  ${t.description}`;
+          });
+          await ctx.reply(`📐 Templates:\n${lines.join('\n')}`);
+          break;
+        }
+        default:
+          // bare /template <name> → show
+          await showTemplate(sub);
+      }
+    },
   },
 ];
 
