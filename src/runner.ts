@@ -23,7 +23,7 @@ import { resolveLaunchRuntime } from './isolation/runtime.js';
 import { AcpSession, type AcpSessionOptions } from './session/acp.js';
 import { controlRequest, RoleControlServer } from './session/control.js';
 import { TmuxSession } from './session/tmux.js';
-import { ACP_CANCEL_DEADLINE_EXCEEDED, classifyShellStatus } from './session/types.js';
+import { ACP_CANCEL_DEADLINE_EXCEEDED, classifyShellStatus, turnResult } from './session/types.js';
 import type { ExitRecord, SessionHandle, TurnResult } from './session/types.js';
 import {
   effectiveModelForRole, modelRecoveryHeld, reconcileModelRecovery, recordModelFailure,
@@ -77,7 +77,12 @@ export interface RunnerDeps {
   reportOwnerStartupFailure(stateDir: string): Promise<'delivered' | 'duplicate'>;
   /** Lets a test (or a shutdown path) end the supervised restart loop. */
   shouldStop?(): boolean;
+  /** Bound the runner-owned first turn so a broken tool bridge cannot fake liveness forever. */
+  acpStartupTimeoutMs: number;
 }
+
+/** Long enough for a cold model start, finite enough for supervision to recover honestly. */
+export const ACP_STARTUP_TIMEOUT_MS = 5 * 60_000;
 
 const defaultDeps = (): RunnerDeps => ({
   tmux: new Tmux(),
@@ -105,6 +110,7 @@ const defaultDeps = (): RunnerDeps => ({
       throw new Error('prior owner channel returned an invalid startup notice result');
     return result.status;
   },
+  acpStartupTimeoutMs: ACP_STARTUP_TIMEOUT_MS,
 });
 
 const MONITOR_OWNER_FILE = '.monitor-owner';
@@ -719,7 +725,14 @@ export async function runOnce(
     // interruption to steering until this startup turn reaches a terminal
     // success, so there is neither a deaf gap nor a boot-cancellation loop.
     monitorLoop = monitor?.run(pid);
-    const started = await starting;
+    let startupTimer: ReturnType<typeof setTimeout> | undefined;
+    const startupTimeout = new Promise<TurnResult>(resolve => {
+      startupTimer = setTimeout(() => resolve(turnResult(
+        false, 'failed', `startup prompt did not finish within ${deps.acpStartupTimeoutMs}ms`,
+      )), deps.acpStartupTimeoutMs);
+    });
+    const started = await Promise.race([starting, startupTimeout]);
+    if (startupTimer) clearTimeout(startupTimer);
     // A temporary role's first turn can be the active turn when an ours wake
     // needs immediate attention. A typed console/monitor cancellation ends
     // only that turn: the already-live ACP session and any queued wake remain

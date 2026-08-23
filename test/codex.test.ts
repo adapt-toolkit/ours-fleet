@@ -18,6 +18,12 @@ const execWith = (oursCodex: boolean): Exec => async (cmd, args) => {
     return { stdout: JSON.stringify({ installed: [{
       pluginId: 'ours@ours-codex-marketplace', installed: true, enabled: true,
     }] }), stderr: '', code: 0 };
+  if (cmd === 'codex' && args[0] === 'mcp')
+    return { stdout: JSON.stringify([{ name: 'ours', enabled: true, transport: {
+      type: 'stdio', command: 'node', args: ['bin/proxy.mjs'], cwd: '/plugin',
+    } }]), stderr: '', code: 0 };
+  if (cmd === 'node' && args[0] === 'bin/proxy.mjs')
+    return { stdout: '', stderr: 'ours: MCP server v0.18.0 ready (transport=stdio)', code: 0 };
   if (cmd === 'sh') return { stdout: '', stderr: '', code: oursCodex ? 0 : 1 };
   return { stdout: '', stderr: '', code: 0 };
 };
@@ -40,6 +46,22 @@ describe('prepareSession', () => {
     const a = makeCodexAdapter(execWith(false));
     await expect(a.prepareSession(role({ harness_options: { launcher: 'ours-codex' } }),
       { stateDir: '/s', runCwd: '/s' })).rejects.toThrow(/not on PATH/);
+  });
+
+  it('refuses to launch when the configured ours MCP proxy exits silently', async () => {
+    const broken: Exec = async (cmd, args) => {
+      if (cmd === 'codex' && args[0] === 'mcp') return {
+        code: 0, stderr: '', stdout: JSON.stringify([{ name: 'ours', enabled: true, transport: {
+          type: 'stdio', command: 'node', args: ['bin/proxy.mjs'], cwd: '/stale-plugin',
+        } }]),
+      };
+      if (cmd === 'node') return { code: 0, stdout: '', stderr: '' };
+      if (cmd === 'sh') return { code: 1, stdout: '', stderr: '' };
+      return { code: 0, stdout: '', stderr: '' };
+    };
+    await expect(makeCodexAdapter(broken).prepareSession(role(), {
+      stateDir: '/s', runCwd: '/s',
+    })).rejects.toThrow(/exited before becoming ready/);
   });
 
   it('materializes the ACP app-server override inside the role state boundary', async () => {
@@ -294,6 +316,14 @@ describe('validateOptions / prereqs', () => {
         code: 0, stderr: '', stdout: JSON.stringify({ installed: [{
           pluginId: 'ours@ours-local-testing', name: 'ours', installed: true, enabled: true,
         }] }),
+      };
+      if (cmd === 'codex' && args[0] === 'mcp') return {
+        code: 0, stderr: '', stdout: JSON.stringify([{ name: 'ours', enabled: true, transport: {
+          type: 'stdio', command: 'node', args: ['bin/proxy.mjs'], cwd: '/plugin',
+        } }]),
+      };
+      if (cmd === 'node') return {
+        code: 0, stdout: '', stderr: 'ours: MCP server v0.18.0 ready (transport=stdio)',
       };
       return { code: 1, stdout: '', stderr: '' };
     };

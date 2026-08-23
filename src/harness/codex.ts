@@ -208,21 +208,69 @@ function hasInstalledOursPlugin(output: string): boolean {
   } catch { return false; }
 }
 
+interface CodexMcpTransport {
+  type: string;
+  command?: string;
+  args?: string[];
+  cwd?: string | null;
+}
+
+interface CodexMcpEntry {
+  name?: string;
+  enabled?: boolean;
+  transport?: CodexMcpTransport;
+}
+
+const OURS_MCP_PROBE_TIMEOUT_MS = 5_000;
+
+/**
+ * Probe the exact transport Codex will launch, not merely the plugin registry
+ * bit. A stale plugin cache can remain installed+enabled while its proxy exits
+ * before serving MCP; accepting that state leaves the first fleet turn free to
+ * spin forever trying to repair tools it can never receive.
+ */
+async function probeConfiguredOursMcp(exec: Exec): Promise<{ ok: boolean; detail: string }> {
+  const listed = await exec('codex', ['mcp', 'list', '--json']);
+  if (listed.code !== 0)
+    return { ok: false, detail: 'could not inspect Codex MCP transports' };
+  let entries: CodexMcpEntry[];
+  try { entries = JSON.parse(listed.stdout) as CodexMcpEntry[]; }
+  catch { return { ok: false, detail: 'Codex returned invalid MCP transport JSON' }; }
+  const ours = entries.find(entry => entry.name === 'ours' && entry.enabled === true);
+  if (!ours)
+    return { ok: false, detail: 'ours MCP transport is missing or disabled' };
+  const transport = ours.transport;
+  if (transport?.type !== 'stdio' || !transport.command || !Array.isArray(transport.args))
+    return { ok: false, detail: 'ours MCP transport is not a valid stdio command' };
+  const probe = await exec(transport.command, transport.args, {
+    ...(transport.cwd ? { cwd: transport.cwd } : {}),
+    timeoutMs: OURS_MCP_PROBE_TIMEOUT_MS,
+  });
+  const output = `${probe.stdout}\n${probe.stderr}`;
+  if (probe.code !== 0 || !/ours:\s+MCP server\b.*\bready\b/i.test(output))
+    return {
+      ok: false,
+      detail: 'configured ours MCP transport exited before becoming ready — refresh the Codex plugin with: ours-codex-install',
+    };
+  return { ok: true, detail: 'configured transport reached MCP readiness' };
+}
+
 export function makeCodexAdapter(exec: Exec = realExec): HarnessAdapter {
   return {
     id: 'codex',
     supportsResume: true,
 
     async checkPrereqs() {
-      const [r, hasOursCodex, plugins] = await Promise.all([
+      const [r, hasOursCodex, plugins, oursMcp] = await Promise.all([
         exec('codex', ['--version']),
         commandAvailable('ours-codex', exec),
         exec('codex', ['plugin', 'list', '--json']),
+        probeConfiguredOursMcp(exec),
       ]);
       const ok = r.code === 0;
       const hasOursPlugin = plugins.code === 0 && hasInstalledOursPlugin(plugins.stdout);
       return {
-        ok: ok && hasOursPlugin,
+        ok: ok && hasOursPlugin && oursMcp.ok,
         checks: [
           {
             name: 'codex',
@@ -244,6 +292,7 @@ export function makeCodexAdapter(exec: Exec = realExec): HarnessAdapter {
               ? 'installed and enabled — ours tools and monitor tools are available'
               : 'not installed — run: npm i -g @ours.network/codex && ours-codex-install',
           },
+          { name: 'ours MCP transport', ok: oursMcp.ok, detail: oursMcp.detail },
         ],
       };
     },
@@ -286,6 +335,8 @@ export function makeCodexAdapter(exec: Exec = realExec): HarnessAdapter {
     },
 
     async prepareSession(role: ResolvedRole, dirs: RoleDirs): Promise<SessionPrep> {
+      const oursMcp = await probeConfiguredOursMcp(exec);
+      if (!oursMcp.ok) throw new Error(`Codex ${oursMcp.detail}`);
       // Per-role harness runtime home (5.1); harmless for un-isolated roles.
       // Only a role that declares `isolation:` gets a sandbox, and only a
       // sandbox needs this directory to exist before entry.
