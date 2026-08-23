@@ -231,6 +231,23 @@ describe('task work', () => {
       expect.objectContaining({ roomId: ROOM_ID, taskId: t.task_id }));
   });
 
+  it('refuses to resume a waiting room under a different --template', async () => {
+    mocks.provisionMembers.mockImplementationOnce(async ({ roomId }: { roomId: string }) => {
+      advanceSaga(roomId, 'wait_seats', 5, 'waiting_seats');
+      return getRoomRecord(roomId)!;
+    });
+    const t = backlogTask();
+    await run('work', t.task_id);
+    expect(getTask(t.task_id).state).toBe('provisioning');
+
+    await expect(run('work', t.task_id, '--template', 'team')).rejects.toThrow(ExitError);
+    expect(out.join('\n')).toContain("does not match room");
+    expect(getTask(t.task_id).template?.name).toBe('single');
+
+    await run('work', t.task_id);
+    expect(getTask(t.task_id).state).toBe('active');
+  });
+
   it('reports a non-resumable room instead of silently stranding the task', async () => {
     mocks.provisionMembers.mockImplementationOnce(async ({ roomId }: { roomId: string }) => {
       advanceSaga(roomId, 'wait_seats', 5, 'waiting_seats');

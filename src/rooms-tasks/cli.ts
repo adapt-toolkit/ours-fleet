@@ -543,6 +543,13 @@ export function registerTaskCommands(parent: Command, cOpt: (cmd: Command) => Co
         const snap = snapshotTemplate(resolved);
         if (!opts.template && t.template && snap.content_hash !== t.template.content_hash)
           die(new Error(`task template snapshot no longer matches ${t.template.name}@${t.template.version}`));
+        // A provisioned room is pinned to its snapshot: never resume or re-pin
+        // an existing room under a different template.
+        if (t.room_id) {
+          const roomSnap = getRoomRecord(t.room_id)?.template_snapshot ?? t.template;
+          if (roomSnap && (roomSnap.name !== snap.name || roomSnap.content_hash !== snap.content_hash))
+            die(new Error(`template ${snap.name}@${snap.version} does not match room ${t.room_id}'s provisioned template ${roomSnap.name}@${roomSnap.version}`));
+        }
         let templateRef = t.template;
         if (!templateRef || templateRef.name !== snap.name || templateRef.content_hash !== snap.content_hash) {
           templateRef = { name: snap.name, version: snap.version, content_hash: snap.content_hash };

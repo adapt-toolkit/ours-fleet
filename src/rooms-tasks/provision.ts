@@ -138,77 +138,96 @@ export async function provisionMembers(
   const createdIdentities: string[] = [];
   const members: ExpandedMember[] = [];
 
-  // Phase 4: create_members
-  advanceSaga(roomId, 'create_members', 3);
-  try {
-    for (const planned of plan) {
-      const bio = `Fleet task member: ${planned.coworkRole} for ${taskId ?? roomId}`;
-      const { cid } = await createMemberIdentity(planned.name, bio);
-      createdIdentities.push(planned.name);
-      members.push({ ...planned, cid });
-    }
-  } catch (error) {
-    for (const name of createdIdentities) await removeMemberIdentity(name);
-    setSagaError(
-      roomId,
-      error instanceof Error ? error.message : String(error),
-      'Member identity creation failed. Retry with `task recover`.',
-      'member_failed',
-    );
-    if (taskId) failTask(taskId, error instanceof Error ? error.message : String(error));
-    throw error;
-  }
+  // A room that already reached wait_seats keeps its member identities, seats
+  // and accepted invitations; recreating them on a retry would collide. Resume
+  // from the persisted seats and re-check seat activity instead.
+  const existing = getRoomRecord(roomId);
+  const persistedSeats = existing?.member_seats ?? [];
+  const resuming = existing !== undefined
+    && ['wait_seats', 'launch_work', 'activate'].includes(existing.saga.phase)
+    && plan.length > 0
+    && plan.every(p => persistedSeats.some(s => s.role_name === p.name));
 
-  const seats: RoomMemberSeat[] = members.map(m => ({
-    role_name: m.name,
-    identity_cid: m.cid,
-    slot: m.slot,
-    cowork_role: m.coworkRole,
-    seat_state: 'pending' as const,
-  }));
-  updateMemberSeats(roomId, seats);
-  if (taskId) {
-    const taskMembers: TaskMemberRole[] = members.map(m => ({
-      name: m.name,
+  let seats: RoomMemberSeat[];
+  if (resuming) {
+    for (const planned of plan) {
+      const seat = persistedSeats.find(s => s.role_name === planned.name)!;
+      members.push({ ...planned, cid: seat.identity_cid });
+    }
+    seats = persistedSeats;
+  } else {
+    // Phase 4: create_members
+    advanceSaga(roomId, 'create_members', 3);
+    try {
+      for (const planned of plan) {
+        const bio = `Fleet task member: ${planned.coworkRole} for ${taskId ?? roomId}`;
+        const { cid } = await createMemberIdentity(planned.name, bio);
+        createdIdentities.push(planned.name);
+        members.push({ ...planned, cid });
+      }
+    } catch (error) {
+      for (const name of createdIdentities) await removeMemberIdentity(name);
+      setSagaError(
+        roomId,
+        error instanceof Error ? error.message : String(error),
+        'Member identity creation failed. Retry with `task recover`.',
+        'member_failed',
+      );
+      if (taskId) failTask(taskId, error instanceof Error ? error.message : String(error));
+      throw error;
+    }
+
+    seats = members.map(m => ({
+      role_name: m.name,
       identity_cid: m.cid,
       slot: m.slot,
       cowork_role: m.coworkRole,
+      seat_state: 'pending' as const,
     }));
-    updateTaskMembers(taskId, taskMembers);
-  }
-
-  // Phase 5: join_role_groups — serial by Cowork role
-  advanceSaga(roomId, 'join_role_groups', 4);
-  const roleGroups = new Map<string, ExpandedMember[]>();
-  for (const m of members) {
-    const group = roleGroups.get(m.coworkRole) ?? [];
-    group.push(m);
-    roleGroups.set(m.coworkRole, group);
-  }
-  try {
-    for (const [coworkRole, group] of roleGroups) {
-      const { invite } = await cowork.issueInvite(roomId, {
-        role: coworkRole,
-        min_accepts: group.length,
-      });
-      // invite is used in-memory only — NEVER persisted
-      for (const member of group) {
-        await cowork.acceptInvite(roomId, invite, {
-          role: coworkRole,
-          expected_cid: member.cid,
-        });
-      }
+    updateMemberSeats(roomId, seats);
+    if (taskId) {
+      const taskMembers: TaskMemberRole[] = members.map(m => ({
+        name: m.name,
+        identity_cid: m.cid,
+        slot: m.slot,
+        cowork_role: m.coworkRole,
+      }));
+      updateTaskMembers(taskId, taskMembers);
     }
-  } catch (error) {
-    for (const name of createdIdentities) await removeMemberIdentity(name);
-    setSagaError(
-      roomId,
-      error instanceof Error ? error.message : String(error),
-      'Role-group admission failed. Retry with `task recover`.',
-      'member_failed',
-    );
-    if (taskId) failTask(taskId, error instanceof Error ? error.message : String(error));
-    throw error;
+
+    // Phase 5: join_role_groups — serial by Cowork role
+    advanceSaga(roomId, 'join_role_groups', 4);
+    const roleGroups = new Map<string, ExpandedMember[]>();
+    for (const m of members) {
+      const group = roleGroups.get(m.coworkRole) ?? [];
+      group.push(m);
+      roleGroups.set(m.coworkRole, group);
+    }
+    try {
+      for (const [coworkRole, group] of roleGroups) {
+        const { invite } = await cowork.issueInvite(roomId, {
+          role: coworkRole,
+          min_accepts: group.length,
+        });
+        // invite is used in-memory only — NEVER persisted
+        for (const member of group) {
+          await cowork.acceptInvite(roomId, invite, {
+            role: coworkRole,
+            expected_cid: member.cid,
+          });
+        }
+      }
+    } catch (error) {
+      for (const name of createdIdentities) await removeMemberIdentity(name);
+      setSagaError(
+        roomId,
+        error instanceof Error ? error.message : String(error),
+        'Role-group admission failed. Retry with `task recover`.',
+        'member_failed',
+      );
+      if (taskId) failTask(taskId, error instanceof Error ? error.message : String(error));
+      throw error;
+    }
   }
 
   // Phase 6: wait_seats
