@@ -522,6 +522,16 @@ export function registerTaskCommands(parent: Command, cOpt: (cmd: Command) => Co
           die(new Error(`task ${id} is in terminal state '${t.state}'`));
 
         if (t.state === 'active' && t.room_id) {
+          // An explicit --template must agree with the room the task already
+          // runs in; a conflicting override is an error, not a silent no-op.
+          if (opts.template) {
+            const override = resolveTemplate(opts.template, allTemplates(cfg));
+            if (!override) die(new Error(`template not found: ${opts.template}`));
+            const overrideSnap = snapshotTemplate(override);
+            const roomSnap = getRoomRecord(t.room_id)?.template_snapshot ?? t.template;
+            if (roomSnap && (roomSnap.name !== overrideSnap.name || roomSnap.content_hash !== overrideSnap.content_hash))
+              die(new Error(`template ${overrideSnap.name}@${overrideSnap.version} does not match room ${t.room_id}'s provisioned template ${roomSnap.name}@${roomSnap.version}`));
+          }
           if (opts.json) {
             console.log(JSON.stringify({ schema_version: 1, task: t, status: 'already_active' }, null, 2));
             return;

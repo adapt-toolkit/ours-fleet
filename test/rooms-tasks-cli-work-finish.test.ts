@@ -248,6 +248,22 @@ describe('task work', () => {
     expect(getTask(t.task_id).state).toBe('active');
   });
 
+  it('rejects a conflicting --template against an already-active room', async () => {
+    const t = backlogTask();
+    await run('work', t.task_id);
+    expect(getTask(t.task_id).state).toBe('active');
+
+    await expect(run('work', t.task_id, '--template', 'team')).rejects.toThrow(ExitError);
+    expect(out.join('\n')).toContain('does not match room');
+    expect(getTask(t.task_id).template?.name).toBe('single');
+
+    out = [];
+    await run('work', t.task_id, '--template', 'single');
+    expect(out.join('\n')).toContain('already has an active room');
+    await run('work', t.task_id);
+    expect(out.join('\n')).toContain('already has an active room');
+  });
+
   it('reports a non-resumable room instead of silently stranding the task', async () => {
     mocks.provisionMembers.mockImplementationOnce(async ({ roomId }: { roomId: string }) => {
       advanceSaga(roomId, 'wait_seats', 5, 'waiting_seats');
