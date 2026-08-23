@@ -660,3 +660,95 @@ describe('validateMonitorConfig capability gating', () => {
       .toEqual(["monitor.interrupt: must be true, false, or 'after_tool'"]);
   });
 });
+
+describe('rooms-tasks split-config backward compat', () => {
+  it('loads a plain fleet.yaml with no rooms/tasks (existing configs unchanged)', () => {
+    base('roles:\n  A: {}\n');
+    const cfg = loadConfig();
+    expect(cfg.rooms).toBeUndefined();
+    expect(cfg.roomTemplates).toBeUndefined();
+    expect(cfg.tasks).toBeUndefined();
+    expect(cfg.ownerInviteFingerprint).toBeUndefined();
+    expect(cfg.roles).toHaveLength(1);
+  });
+
+  it('loads rooms config from fleet.yaml', () => {
+    const cid = 'a'.repeat(64);
+    base([
+      'roles:\n  A: {}',
+      'rooms:',
+      '  owner:',
+      `    expected_cid: ${cid}`,
+      '    public_invite: test-invite-string',
+      '  cowork:',
+      '    config: /tmp/cowork.toml',
+      '',
+    ].join('\n'));
+    const cfg = loadConfig();
+    expect(cfg.rooms).toBeDefined();
+    expect(cfg.rooms!.owner.expected_cid).toBe(cid);
+    expect(cfg.rooms!.owner.public_invite).toBe('[REDACTED]');
+    expect(cfg.ownerInviteFingerprint).toBeDefined();
+    expect(cfg.ownerInviteFingerprint).toHaveLength(64);
+  });
+
+  it('loads tasks config from fleet.yaml', () => {
+    base('roles:\n  A: {}\ntasks:\n  create_mode: start\n');
+    const cfg = loadConfig();
+    expect(cfg.tasks).toBeDefined();
+    expect(cfg.tasks!.create_mode).toBe('start');
+  });
+
+  it('loads room_templates from fleet.d drop-in', () => {
+    base('roles:\n  A: {}\n');
+    dropin('templates.yaml', [
+      'room_templates:',
+      '  my-team:',
+      '    version: 1',
+      '    description: custom team',
+      '    members:',
+      '      - slot: dev',
+      '        role: Developer',
+      '        count: 2',
+      '        role_ref: A',
+      '',
+    ].join('\n'));
+    const cfg = loadConfig();
+    expect(cfg.roomTemplates).toBeDefined();
+    expect(cfg.roomTemplates!['my-team']).toBeDefined();
+    expect(cfg.roomTemplates!['my-team'].description).toBe('custom team');
+  });
+
+  it('rejects rooms defined in multiple files', () => {
+    const cid = 'a'.repeat(64);
+    const roomsBlock = `rooms:\n  owner:\n    expected_cid: ${cid}\n    public_invite: inv\n  cowork:\n    config: /tmp/c.toml\n`;
+    base(`roles:\n  A: {}\n${roomsBlock}`);
+    dropin('rooms.yaml', roomsBlock);
+    expect(() => loadConfig()).toThrow(/rooms:.*defined in multiple files/);
+  });
+
+  it('merges room_templates from multiple fleet.d files by name', () => {
+    base('roles:\n  A: {}\n');
+    dropin('a.yaml', [
+      'room_templates:',
+      '  alpha:',
+      '    version: 1',
+      '    description: first',
+      '    members:',
+      '      - { slot: a, role: A, count: 1, role_ref: A }',
+      '',
+    ].join('\n'));
+    dropin('b.yaml', [
+      'room_templates:',
+      '  beta:',
+      '    version: 1',
+      '    description: second',
+      '    members:',
+      '      - { slot: b, role: B, count: 1, role_ref: A }',
+      '',
+    ].join('\n'));
+    const cfg = loadConfig();
+    expect(cfg.roomTemplates!['alpha']).toBeDefined();
+    expect(cfg.roomTemplates!['beta']).toBeDefined();
+  });
+});

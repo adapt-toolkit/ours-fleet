@@ -13,6 +13,10 @@ import { resolveWatchdogs } from './watchdog/config.js';
 import type { ResolvedWatchdog } from './watchdog/config.js';
 import { resolveLoops } from './loops/config.js';
 import type { ResolvedLoop, ResolvedRoleLoop } from './loops/config.js';
+import {
+  validateRoomsConfig, validateTasksConfig, validateRoomTemplatesConfig,
+} from './rooms-tasks/config.js';
+import type { RoomsConfig, RoomTemplatesConfig, TasksConfig } from './rooms-tasks/types.js';
 import { CAPABILITIES, CAP_MONITOR_INTERRUPT_AFTER_TOOL } from './capabilities.js';
 import { runningLabel } from './provenance.js';
 
@@ -257,6 +261,11 @@ export interface FleetConfig {
   diagnostics: ConfigDiagnostic[];
   watchdogs: ResolvedWatchdog[];
   loops: ResolvedLoop[];
+  rooms?: import('./rooms-tasks/types.js').RoomsConfig;
+  roomTemplates?: import('./rooms-tasks/types.js').RoomTemplatesConfig;
+  tasks?: import('./rooms-tasks/types.js').TasksConfig;
+  /** SHA-256 fingerprint of the resolved owner invite (never the invite itself). */
+  ownerInviteFingerprint?: string;
 }
 
 export class ConfigError extends Error {}
@@ -342,9 +351,10 @@ export function loadConfig(
       const parsed = parseFleetDocument(p, readFileSync(p, 'utf8'), options.yamlMode);
       const doc = parsed.value;
       diagnostics.push(...parsed.diagnostics);
-      const extra = Object.keys(doc).filter(k => k !== 'roles');
+      const FLEET_D_ALLOWED = ['roles', 'rooms', 'room_templates', 'tasks'];
+      const extra = Object.keys(doc).filter(k => !FLEET_D_ALLOWED.includes(k));
       if (extra.length)
-        throw new ConfigError(`${p}: fleet.d files may only define roles: (found: ${extra.join(', ')})`);
+        throw new ConfigError(`${p}: fleet.d files may only define ${FLEET_D_ALLOWED.join(', ')}: (found: ${extra.join(', ')})`);
       docs.push({ file: p, doc });
       files.push(p);
     }
@@ -450,9 +460,38 @@ export function loadConfig(
   const watchdogs = resolveWatchdogs(baseDoc, base, roles, vars, defaults);
   const resolvedLoops = resolveLoops(baseDoc.loops, base, roles, vars);
   for (const role of roles) role.loops = resolvedLoops.byRole.get(role.name) ?? [];
+
+  // ── Rooms, room_templates, tasks (split-config merge) ──────────────
+  // These sections may appear in the base fleet.yaml and/or in fleet.d files.
+  // Base provides defaults; fleet.d extends. Only one source may define rooms/tasks
+  // top-level (room_templates merge by name, last writer wins).
+  let rooms: RoomsConfig | undefined;
+  let ownerInviteFingerprint: string | undefined;
+  let roomTemplates: RoomTemplatesConfig | undefined;
+  let tasks: TasksConfig | undefined;
+
+  for (const { file, doc } of docs) {
+    if (doc.rooms !== undefined) {
+      if (rooms) throw new ConfigError(`rooms: defined in multiple files; last: ${file}`);
+      const validated = validateRoomsConfig(deepSub(doc.rooms, vars), vars, file);
+      ownerInviteFingerprint = validated._invite?.fingerprint;
+      const { _invite: _, ...clean } = validated;
+      rooms = clean;
+    }
+    if (doc.room_templates !== undefined) {
+      const validated = validateRoomTemplatesConfig(deepSub(doc.room_templates, vars), file);
+      roomTemplates = { ...(roomTemplates ?? {}), ...validated };
+    }
+    if (doc.tasks !== undefined) {
+      if (tasks) throw new ConfigError(`tasks: defined in multiple files; last: ${file}`);
+      tasks = validateTasksConfig(deepSub(doc.tasks, vars), file);
+    }
+  }
+
   return {
     roles, vars, defaults, files, startStaggerMs, diagnostics, watchdogs,
     loops: resolvedLoops.loops,
+    rooms, roomTemplates, tasks, ownerInviteFingerprint,
   };
 }
 
