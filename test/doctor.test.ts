@@ -901,6 +901,26 @@ describe('doctor rooms-tasks checks (§5.3)', () => {
     expect(stale!.detail).toContain('reference missing rooms');
   });
 
+  it('warns when cowork config path does not exist', async () => {
+    registerAdapter(fakeAdapter);
+    writeCfg(ROOMS_YAML(CID_64, '  cowork:\n    config: /nonexistent/cowork-config.json\n'));
+    const rep = await run();
+    const cfg = rep.checks.find(c => c.name === 'rooms: cowork config')!;
+    expect(cfg).toBeTruthy();
+    expect(cfg.ok).toBe(false);
+    expect(cfg.detail).toContain('not found');
+  });
+
+  it('emits capability check when rooms config is present', async () => {
+    registerAdapter(fakeAdapter);
+    writeCfg(ROOMS_YAML());
+    const rep = await run();
+    const cap = rep.checks.find(c => c.name === 'rooms: capability')!;
+    expect(cap).toBeTruthy();
+    // Cowork may or may not be running; we just verify the check is emitted
+    expect(cap.detail).toBeTruthy();
+  });
+
   it('skips rooms checks entirely when no rooms config is present', async () => {
     writeCfg('roles:\n  A:\n    harness: fake\n');
     registerAdapter(fakeAdapter);

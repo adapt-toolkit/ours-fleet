@@ -461,6 +461,77 @@ describe('owner-channel task subcommands', () => {
     expect(ctx.replies).toHaveLength(1);
     expect(ctx.replies[0]).toContain('⚠️');
   });
+
+  it('/task create creates a task in provisioning by default', async () => {
+    const ctx = context();
+    await dispatchOwnerCommand('/task create my new task', ctx);
+    expect(ctx.replies).toHaveLength(1);
+    expect(ctx.replies[0]).toContain('created');
+    expect(ctx.replies[0]).toContain('provisioning');
+  });
+
+  it('/task create --backlog creates a task in backlog', async () => {
+    const ctx = context();
+    await dispatchOwnerCommand('/task create --backlog backlog task', ctx);
+    expect(ctx.replies).toHaveLength(1);
+    expect(ctx.replies[0]).toContain('created');
+    expect(ctx.replies[0]).toContain('backlog');
+  });
+
+  it('/task create --template=dev includes template in reply', async () => {
+    const ctx = context();
+    await dispatchOwnerCommand('/task create --template=dev templated task', ctx);
+    expect(ctx.replies).toHaveLength(1);
+    expect(ctx.replies[0]).toContain('Template: dev');
+  });
+
+  it('/task create without title returns usage', async () => {
+    const ctx = context();
+    await dispatchOwnerCommand('/task create', ctx);
+    expect(ctx.replies).toHaveLength(1);
+    expect(ctx.replies[0]).toContain('usage');
+  });
+
+  it('/task list shows all tasks', async () => {
+    await createTestTask();
+    const ctx = context();
+    await dispatchOwnerCommand('/task list', ctx);
+    expect(ctx.replies).toHaveLength(1);
+    expect(ctx.replies[0]).toContain('test task');
+  });
+
+  it('/task list backlog filters to backlog state', async () => {
+    await createTestTask(); // backlog by default
+    const ctx = context();
+    await dispatchOwnerCommand('/task list backlog', ctx);
+    expect(ctx.replies).toHaveLength(1);
+    expect(ctx.replies[0]).toContain('backlog');
+    expect(ctx.replies[0]).toContain('test task');
+  });
+
+  it('/task list blocked shows no blocked tasks when none exist', async () => {
+    await createTestTask();
+    const ctx = context();
+    await dispatchOwnerCommand('/task list blocked', ctx);
+    expect(ctx.replies).toHaveLength(1);
+    expect(ctx.replies[0]).toContain('No blocked');
+  });
+
+  it('/task recover <id> shows task state', async () => {
+    const t = await createTestTask();
+    const ctx = context();
+    await dispatchOwnerCommand(`/task recover ${t.task_id}`, ctx);
+    expect(ctx.replies).toHaveLength(1);
+    expect(ctx.replies[0]).toContain(t.task_id);
+    expect(ctx.replies[0]).toContain('backlog');
+  });
+
+  it('/task recover without id returns usage', async () => {
+    const ctx = context();
+    await dispatchOwnerCommand('/task recover', ctx);
+    expect(ctx.replies).toHaveLength(1);
+    expect(ctx.replies[0]).toContain('usage');
+  });
 });
 
 describe('owner-channel room subcommands', () => {
@@ -478,11 +549,12 @@ describe('owner-channel room subcommands', () => {
     rmSync(dir, { recursive: true, force: true });
   });
 
-  async function createTestRoom() {
+  async function createTestRoom(id?: string) {
+    const { randomUUID } = await import('node:crypto');
     const { createRoomRecord } = await import('../src/rooms-tasks/room-state.js');
     return createRoomRecord({
+      room_id: id ?? randomUUID().replace(/-/g, '').slice(0, 16),
       room_name: 'test room',
-      template: { name: 'dev', version: 1, content_hash: 'abc', description: 'test', members: [] },
     });
   }
 
@@ -526,6 +598,62 @@ describe('owner-channel room subcommands', () => {
     await dispatchOwnerCommand('/room show nonexistent', ctx);
     expect(ctx.replies).toHaveLength(1);
     expect(ctx.replies[0]).toContain('⚠️');
+  });
+
+  it('/room create creates a room', async () => {
+    const ctx = context();
+    await dispatchOwnerCommand('/room create --template=dev my room', ctx);
+    expect(ctx.replies).toHaveLength(1);
+    expect(ctx.replies[0]).toContain('created');
+    expect(ctx.replies[0]).toContain('Template: dev');
+  });
+
+  it('/room create without name returns usage', async () => {
+    const ctx = context();
+    await dispatchOwnerCommand('/room create', ctx);
+    expect(ctx.replies).toHaveLength(1);
+    expect(ctx.replies[0]).toContain('usage');
+  });
+
+  it('/room list shows rooms', async () => {
+    await createTestRoom();
+    const ctx = context();
+    await dispatchOwnerCommand('/room list', ctx);
+    expect(ctx.replies).toHaveLength(1);
+    expect(ctx.replies[0]).toContain('test room');
+  });
+
+  it('/room list active filters to active rooms', async () => {
+    const r = await createTestRoom();
+    const { activateRoom } = await import('../src/rooms-tasks/room-state.js');
+    activateRoom(r.room_id);
+    const ctx = context();
+    await dispatchOwnerCommand('/room list active', ctx);
+    expect(ctx.replies).toHaveLength(1);
+    expect(ctx.replies[0]).toContain('test room');
+  });
+
+  it('/room recover <id> shows room saga state', async () => {
+    const r = await createTestRoom();
+    const ctx = context();
+    await dispatchOwnerCommand(`/room recover ${r.room_id}`, ctx);
+    expect(ctx.replies).toHaveLength(1);
+    expect(ctx.replies[0]).toContain(r.room_id);
+    expect(ctx.replies[0]).toContain('saga');
+  });
+
+  it('/room recover nonexistent returns not found', async () => {
+    const ctx = context();
+    await dispatchOwnerCommand('/room recover nonexistent', ctx);
+    expect(ctx.replies).toHaveLength(1);
+    expect(ctx.replies[0]).toContain('⚠️');
+  });
+
+  it('/room recover without id returns usage', async () => {
+    const ctx = context();
+    await dispatchOwnerCommand('/room recover', ctx);
+    expect(ctx.replies).toHaveLength(1);
+    expect(ctx.replies[0]).toContain('usage');
   });
 });
 

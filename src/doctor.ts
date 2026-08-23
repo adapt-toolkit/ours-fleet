@@ -210,6 +210,38 @@ export async function doctor(
       });
     }
 
+    // Shared-daemon selection coherence
+    if (rooms.cowork?.config) {
+      const { existsSync: exists } = await import('node:fs');
+      const configOk = exists(rooms.cowork.config);
+      checks.push({
+        name: 'rooms: cowork config', ok: configOk,
+        detail: configOk
+          ? `cowork config at ${rooms.cowork.config}`
+          : `cowork config not found: ${rooms.cowork.config}`,
+      });
+    }
+
+    // Hard prerelease capability check
+    try {
+      const { createCoworkAdapter } = await import('./rooms-tasks/cowork-adapter.js');
+      const adapter = createCoworkAdapter({ configPath: coworkConfig });
+      const roomList = await adapter.listRooms();
+      checks.push({
+        name: 'rooms: capability', ok: true,
+        detail: `cowork room management operational (${roomList.length} room(s))`,
+      });
+    } catch (e) {
+      const msg = (e as Error)?.message ?? String(e);
+      const isProto = msg.includes('protocol') || msg.includes('invalid');
+      checks.push({
+        name: 'rooms: capability', ok: false,
+        detail: isProto
+          ? `cowork does not support room management protocol — upgrade ours-cowork to prerelease`
+          : `room management check failed: ${msg}`,
+      });
+    }
+
     // Stale task/room warnings
     try {
       const { listTasks } = await import('./rooms-tasks/task-state.js');

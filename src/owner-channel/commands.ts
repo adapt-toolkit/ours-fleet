@@ -226,8 +226,8 @@ export const ownerCommands: OwnerCommand[] = [
   },
   {
     name: 'task',
-    usage: '/task <show|start|block|unblock|review|done|cancel> <id> [...]',
-    summary: 'task subcommands (show, start, block, unblock, review, done, cancel)',
+    usage: '/task <create|list|show|start|block|unblock|review|done|cancel|recover> ...',
+    summary: 'task lifecycle subcommands',
     execute: async (ctx, args) => {
       if (!args) throw new OwnerCommandUsageError('usage: /task <subcommand> <id>');
       const parts = args.trim().split(/\s+/);
@@ -251,6 +251,50 @@ export const ownerCommands: OwnerCommand[] = [
 
       try {
         switch (sub) {
+          case 'create': {
+            if (!rest[0]) throw new OwnerCommandUsageError('usage: /task create [--backlog] [--template=<name>] <title>');
+            const backlog = rest.includes('--backlog');
+            const tplFlag = rest.find(r => r.startsWith('--template='));
+            const template = tplFlag ? tplFlag.slice('--template='.length) : undefined;
+            const noRoom = rest.includes('--no-room');
+            const titleParts = rest.filter(r => r !== '--backlog' && !r.startsWith('--template=') && r !== '--no-room');
+            if (!titleParts.length) throw new OwnerCommandUsageError('usage: /task create [--backlog] [--template=<name>] <title>');
+            const { createTask } = await import('../rooms-tasks/task-state.js');
+            const t = createTask({
+              title: titleParts.join(' '),
+              origin: { type: 'owner_channel' as const },
+              start: !backlog,
+              ...(template ? { template: { name: template, version: 1, content_hash: '' } } : {}),
+            });
+            const lines = [`Task ${t.task_id} created · ${t.state}`];
+            if (template) lines.push(`Template: ${template}`);
+            await ctx.reply(lines.join('\n'));
+            break;
+          }
+          case 'list': {
+            const { listTasks } = await import('../rooms-tasks/task-state.js');
+            const filter = rest[0];
+            const stateMap: Record<string, string | string[]> = {
+              backlog: 'backlog', active: 'active', blocked: 'active',
+              done: 'done', all: ['backlog', 'provisioning', 'active', 'review', 'done', 'cancelled', 'failed'],
+            };
+            const stateFilter = filter && stateMap[filter]
+              ? { state: stateMap[filter] as any }
+              : undefined;
+            const tasks = listTasks(stateFilter);
+            if (filter === 'blocked') {
+              const blocked = tasks.filter(t => t.blocked);
+              if (!blocked.length) { await ctx.reply('📋 No blocked tasks.'); break; }
+              const lines = blocked.map(t => `${t.task_id}  ${t.state}  ${t.title}  [BLOCKED: ${t.blocked!.reason}]`);
+              await ctx.reply(tail(`📋 Blocked tasks:\n${lines.join('\n')}`, REPLY_MAX_CHARS));
+              break;
+            }
+            if (!tasks.length) { await ctx.reply('📋 No tasks.'); break; }
+            const lines = tasks.map(t =>
+              `${t.task_id}  ${t.state}  ${t.title}${t.blocked ? ` [BLOCKED]` : ''}`);
+            await ctx.reply(tail(`📋 Tasks:\n${lines.join('\n')}`, REPLY_MAX_CHARS));
+            break;
+          }
           case 'show': {
             if (!rest[0]) throw new OwnerCommandUsageError('usage: /task show <id>');
             await showTask(rest[0]);
@@ -301,6 +345,26 @@ export const ownerCommands: OwnerCommand[] = [
             await ctx.reply(`🗑️ Task ${t.task_id} → cancelled`);
             break;
           }
+          case 'recover': {
+            if (!rest[0]) throw new OwnerCommandUsageError('usage: /task recover <id>');
+            const { getTask } = await import('../rooms-tasks/task-state.js');
+            const { getRoomRecord } = await import('../rooms-tasks/room-state.js');
+            const t = getTask(rest[0]);
+            const room = t.room_id ? getRoomRecord(t.room_id) : undefined;
+            const hints: string[] = [];
+            if (t.state === 'provisioning' && room) {
+              if (room.provisioning_detail === 'waiting_cowork') hints.push('Cowork socket unreachable');
+              if (room.provisioning_detail === 'waiting_owner_invite') hints.push('Owner invite missing or invalid');
+              if (room.provisioning_detail === 'owner_cid_mismatch') hints.push('Owner CID mismatch');
+              if (room.provisioning_detail === 'member_failed') hints.push(`Member failed at step ${room.saga.step_index}`);
+            }
+            const lines = [`Task ${t.task_id} · ${t.state}`];
+            if (room) lines.push(`Room ${room.room_id} · ${room.state} · saga: ${room.saga.phase}`);
+            if (hints.length) lines.push(`Hints: ${hints.join('; ')}`);
+            else lines.push('No automated recovery actions available.');
+            await ctx.reply(lines.join('\n'));
+            break;
+          }
           default:
             // bare /task <id> → show
             await showTask(sub);
@@ -324,8 +388,8 @@ export const ownerCommands: OwnerCommand[] = [
   },
   {
     name: 'room',
-    usage: '/room <show|close> <id> [...]',
-    summary: 'room subcommands (show, close)',
+    usage: '/room <create|list|show|close|recover> ...',
+    summary: 'room lifecycle subcommands',
     execute: async (ctx, args) => {
       if (!args) throw new OwnerCommandUsageError('usage: /room <subcommand> <id>');
       const parts = args.trim().split(/\s+/);
@@ -351,6 +415,33 @@ export const ownerCommands: OwnerCommand[] = [
 
       try {
         switch (sub) {
+          case 'create': {
+            const tplFlag = rest.find(r => r.startsWith('--template='));
+            const template = tplFlag?.slice('--template='.length);
+            const nameParts = rest.filter(r => !r.startsWith('--'));
+            if (!nameParts.length) throw new OwnerCommandUsageError('usage: /room create --template=<name> <room name>');
+            const { randomUUID } = await import('node:crypto');
+            const { createRoomRecord } = await import('../rooms-tasks/room-state.js');
+            const r = createRoomRecord({
+              room_id: randomUUID().replace(/-/g, '').slice(0, 16),
+              room_name: nameParts.join(' '),
+            });
+            const lines = [`🏠 Room ${r.room_id} created · ${r.state}`];
+            if (template) lines.push(`Template: ${template}`);
+            await ctx.reply(lines.join('\n'));
+            break;
+          }
+          case 'list': {
+            const { listRoomRecords } = await import('../rooms-tasks/room-state.js');
+            const filter = rest[0];
+            let rooms = listRoomRecords();
+            if (filter === 'active') rooms = rooms.filter(r => r.state === 'active');
+            if (!rooms.length) { await ctx.reply('🏠 No rooms.'); break; }
+            const lines = rooms.map(r =>
+              `${r.room_id}  ${r.state}  ${r.room_name}${r.task_id ? ` (task: ${r.task_id})` : ''}`);
+            await ctx.reply(tail(`🏠 Rooms:\n${lines.join('\n')}`, REPLY_MAX_CHARS));
+            break;
+          }
           case 'show': {
             if (!rest[0]) throw new OwnerCommandUsageError('usage: /room show <id>');
             await showRoom(rest[0]);
@@ -362,6 +453,18 @@ export const ownerCommands: OwnerCommand[] = [
             const { closeRoom } = await import('../rooms-tasks/room-state.js');
             const r = closeRoom(rest[0]);
             await ctx.reply(`🔒 Room ${r.room_id} → closed`);
+            break;
+          }
+          case 'recover': {
+            if (!rest[0]) throw new OwnerCommandUsageError('usage: /room recover <id>');
+            const { getRoomRecord } = await import('../rooms-tasks/room-state.js');
+            const r = getRoomRecord(rest[0]);
+            if (!r) { await ctx.reply(`⚠️ room not found: ${rest[0]}`); break; }
+            const lines = [`🏠 Room ${r.room_id} · ${r.state} · saga: ${r.saga.phase}`];
+            if (r.saga.error) lines.push(`Error: ${r.saga.error}`);
+            if (r.provisioning_detail) lines.push(`Detail: ${r.provisioning_detail}`);
+            lines.push(r.saga.error ? 'Run `ours-fleet room recover` from CLI for full recovery.' : 'No recovery needed.');
+            await ctx.reply(lines.join('\n'));
             break;
           }
           default:
