@@ -8,13 +8,15 @@ import {
 import {
   createTask, getTask, listTasks, startTask, activateTask,
   blockTask, unblockTask, reviewTask, completeTask, cancelTask,
-  TaskStateError,
+  updateTaskRoom, TaskStateError,
 } from './task-state.js';
 import {
   createRoomRecord, getRoomRecord, listRoomRecords,
-  closeRoom as closeRoomRecord, RoomStateError,
+  closeRoom as closeRoomRecord, advanceSaga, setOwnerSeat,
+  setSagaError, RoomStateError,
 } from './room-state.js';
-import type { TaskOrigin, TemplateDefinition } from './types.js';
+import { createCoworkAdapter, CoworkProtocolError, CoworkUnavailableError } from './cowork-adapter.js';
+import type { RoomOrchestrationRecord, TaskOrigin, TemplateDefinition, TemplateSnapshot } from './types.js';
 
 function die(e: unknown): never {
   const msg = e instanceof Error ? e.message : String(e);
@@ -28,6 +30,81 @@ function loadCfg(opts: { configuration?: string }): FleetConfig {
 
 function allTemplates(cfg: FleetConfig): Record<string, TemplateDefinition> {
   return cfg.roomTemplates ?? {};
+}
+
+function coworkFor(cfg: FleetConfig) {
+  if (!cfg.rooms || cfg.rooms.provider !== 'cowork')
+    throw new ConfigError('rooms: configure provider: cowork before creating or querying rooms');
+  return createCoworkAdapter({ configPath: cfg.rooms.cowork?.config });
+}
+
+function resolveRoomTemplate(cfg: FleetConfig, name?: string): TemplateSnapshot | undefined {
+  if (!name) return undefined;
+  const template = resolveTemplate(name, allTemplates(cfg));
+  if (!template) throw new Error(`template not found: ${name}`);
+  return snapshotTemplate(template);
+}
+
+async function provisionRoom(cfg: FleetConfig, input: {
+  name: string;
+  goal?: string;
+  brief?: string;
+  template?: TemplateSnapshot;
+  taskId?: string;
+  onCreated?: (room: RoomOrchestrationRecord) => void;
+}): Promise<RoomOrchestrationRecord> {
+  const rooms = cfg.rooms;
+  if (!rooms) throw new ConfigError('rooms: configuration is required');
+  const attachOwner = rooms.defaults?.attach_owner !== false;
+  if (attachOwner && !cfg.ownerInvite)
+    throw new ConfigError('rooms.owner: public_invite or public_invite_file is required when attach_owner is enabled');
+
+  const cowork = coworkFor(cfg);
+  const goal = input.goal?.trim() || input.name;
+  const briefing = input.brief?.trim() || input.template?.contract?.trim() || goal;
+  const created = await cowork.createRoom({
+    room_name: input.name,
+    goal,
+    briefing,
+    quiet_membership: input.template?.room?.quiet_membership,
+    anonymous: input.template?.room?.anonymous,
+  });
+  let record = createRoomRecord({
+    room_id: created.room_id,
+    room_name: input.name,
+    room_identity_cid: created.identity_cid,
+    task_id: input.taskId,
+    template_snapshot: input.template,
+  });
+  input.onCreated?.(record);
+  record = advanceSaga(record.room_id, 'create_room', 1);
+
+  if (attachOwner) {
+    try {
+      record = advanceSaga(record.room_id, 'attach_owner', 2);
+      const accepted = await cowork.acceptInvite(record.room_id, cfg.ownerInvite!, {
+        role: rooms.owner.role,
+        expected_cid: rooms.owner.expected_cid,
+      });
+      record = setOwnerSeat(
+        record.room_id,
+        accepted.seat_cid,
+        cfg.ownerInviteFingerprint ?? '',
+      );
+    } catch (error) {
+      const mismatch = error instanceof CoworkProtocolError && /CID|expected/i.test(error.message);
+      setSagaError(
+        record.room_id,
+        error instanceof Error ? error.message : String(error),
+        mismatch
+          ? 'Verify rooms.owner.expected_cid and rotate the configured invite if necessary.'
+          : 'Rotate rooms.owner.public_invite or public_invite_file, then run room recover.',
+        mismatch ? 'owner_cid_mismatch' : 'waiting_owner_invite',
+      );
+      throw error;
+    }
+  }
+  return advanceSaga(record.room_id, 'create_members', 3);
 }
 
 export function registerTemplateCommands(parent: Command, cOpt: (cmd: Command) => Command): void {
@@ -116,7 +193,7 @@ export function registerTaskCommands(parent: Command, cOpt: (cmd: Command) => Co
     .option('--no-room', 'create task without a room')
     .option('--idempotency-key <key>', 'idempotency key')
     .option('--json', 'JSON output')
-    .action((opts: {
+    .action(async (opts: {
       configuration?: string; title: string; template?: string;
       brief?: string; briefFile?: string; backlog?: boolean;
       room?: boolean; idempotencyKey?: string; json?: boolean;
@@ -144,7 +221,7 @@ export function registerTaskCommands(parent: Command, cOpt: (cmd: Command) => Co
         }
 
         const origin: TaskOrigin = { type: 'cli' };
-        const record = createTask({
+        let record = createTask({
           title: opts.title,
           brief,
           brief_file: opts.briefFile,
@@ -153,6 +230,28 @@ export function registerTaskCommands(parent: Command, cOpt: (cmd: Command) => Co
           idempotency_key: opts.idempotencyKey,
           start: !opts.backlog,
         });
+
+        if (!opts.backlog && opts.room !== false && templateRef && !record.room_id) {
+          const template = resolveRoomTemplate(cfg, templateRef.name);
+          try {
+            await provisionRoom(cfg, {
+              name: opts.title,
+              goal: opts.title,
+              brief,
+              template,
+              taskId: record.task_id,
+              onCreated: room => {
+                record = updateTaskRoom(record.task_id, room.room_id, room.room_identity_cid!);
+              },
+            });
+            record = getTask(record.task_id);
+          } catch (error) {
+            if (error instanceof CoworkUnavailableError) {
+              blockTask(record.task_id, 'Cowork management socket is unavailable');
+            }
+            throw error;
+          }
+        }
 
         if (opts.json) {
           console.log(JSON.stringify({ schema_version: 1, task: record }, null, 2));
@@ -169,7 +268,7 @@ export function registerTaskCommands(parent: Command, cOpt: (cmd: Command) => Co
     .option('--json', 'JSON output')
     .action((opts: { configuration?: string; state?: string; json?: boolean }) => {
       try {
-        let stateFilter;
+        let stateFilter: import('./types.js').TaskState | undefined;
         if (opts.state && opts.state !== 'all') {
           stateFilter = opts.state as import('./types.js').TaskState;
         }
@@ -215,12 +314,29 @@ export function registerTaskCommands(parent: Command, cOpt: (cmd: Command) => Co
       } catch (e) { die(e); }
     });
 
-  taskCmd.command('start <id>')
+  cOpt(taskCmd.command('start <id>'))
     .description('start a backlog task')
     .option('--json', 'JSON output')
-    .action((id: string, opts: { json?: boolean }) => {
+    .action(async (id: string, opts: { configuration?: string; json?: boolean }) => {
       try {
-        const t = startTask(id);
+        const cfg = loadCfg(opts);
+        let t = startTask(id);
+        if (t.template && !t.room_id) {
+          const template = resolveRoomTemplate(cfg, t.template.name);
+          if (!template || template.content_hash !== t.template.content_hash)
+            throw new Error(`task template snapshot no longer matches ${t.template.name}@${t.template.version}`);
+          await provisionRoom(cfg, {
+            name: t.title,
+            goal: t.title,
+            brief: t.brief,
+            template,
+            taskId: t.task_id,
+            onCreated: room => {
+              t = updateTaskRoom(t.task_id, room.room_id, room.room_identity_cid!);
+            },
+          });
+          t = getTask(t.task_id);
+        }
         if (opts.json) { console.log(JSON.stringify({ schema_version: 1, task: t }, null, 2)); return; }
         console.log(`Task ${t.task_id} · provisioning`);
       } catch (e) { die(e); }
@@ -338,7 +454,7 @@ export function registerRoomCommands(parent: Command, cOpt: (cmd: Command) => Co
     .option('--brief <text>', 'room briefing')
     .option('--brief-file <path>', 'room briefing from file')
     .option('--json', 'JSON output')
-    .action((opts: {
+    .action(async (opts: {
       configuration?: string; name: string; template?: string;
       goal?: string; brief?: string; briefFile?: string; json?: boolean;
     }) => {
@@ -347,7 +463,6 @@ export function registerRoomCommands(parent: Command, cOpt: (cmd: Command) => Co
         let brief = opts.brief;
         if (opts.briefFile) brief = readFileSync(opts.briefFile, 'utf8');
 
-        const roomId = `room-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
         let templateSnapshot;
         if (opts.template) {
           const t = resolveTemplate(opts.template, allTemplates(cfg));
@@ -355,10 +470,11 @@ export function registerRoomCommands(parent: Command, cOpt: (cmd: Command) => Co
           templateSnapshot = snapshotTemplate(t);
         }
 
-        const record = createRoomRecord({
-          room_id: roomId,
-          room_name: opts.name,
-          template_snapshot: templateSnapshot,
+        const record = await provisionRoom(cfg, {
+          name: opts.name,
+          goal: opts.goal,
+          brief,
+          template: templateSnapshot,
         });
 
         if (opts.json) {
@@ -370,115 +486,145 @@ export function registerRoomCommands(parent: Command, cOpt: (cmd: Command) => Co
       } catch (e) { die(e); }
     });
 
-  roomCmd.command('list')
+  cOpt(roomCmd.command('list'))
     .description('list rooms')
     .option('--state <state>', 'filter by state (active|provisioning|closing|closed|all)')
     .option('--json', 'JSON output')
-    .action((opts: { state?: string; json?: boolean }) => {
+    .action(async (opts: { configuration?: string; state?: string; json?: boolean }) => {
       try {
-        let stateFilter;
+        const cfg = loadCfg(opts);
+        let stateFilter: import('./types.js').RoomOrchestrationState | undefined;
         if (opts.state && opts.state !== 'all') {
           stateFilter = opts.state as import('./types.js').RoomOrchestrationState;
         }
-        const rooms = listRoomRecords(stateFilter ? { state: stateFilter } : undefined);
+        const local = new Map(listRoomRecords().map(room => [room.room_id, room]));
+        const coworkRooms = await coworkFor(cfg).listRooms();
+        const rooms = coworkRooms
+          .filter(room => !stateFilter || room.state === stateFilter)
+          .map(room => ({ ...room, orchestration: local.get(room.room_id) ?? null }));
         if (opts.json) {
           console.log(JSON.stringify({ schema_version: 1, rooms }, null, 2));
           return;
         }
         if (!rooms.length) { console.log('No rooms.'); return; }
         for (const r of rooms)
-          console.log(`${r.room_id}  ${r.state}  ${r.room_name}${r.task_id ? ` (task: ${r.task_id})` : ''}`);
+          console.log(`${r.room_id}  ${r.state}  ${r.room_name}${r.orchestration?.task_id ? ` (task: ${r.orchestration.task_id})` : ''}`);
       } catch (e) { die(e); }
     });
 
-  roomCmd.command('show <id>')
+  cOpt(roomCmd.command('show <id>'))
     .description('show room details')
     .option('--json', 'JSON output')
-    .action((id: string, opts: { json?: boolean }) => {
+    .action(async (id: string, opts: { configuration?: string; json?: boolean }) => {
       try {
+        const cfg = loadCfg(opts);
+        const cowork = await coworkFor(cfg).getRoom(id);
+        if (!cowork) die(new Error(`room not found: ${id}`));
         const r = getRoomRecord(id);
-        if (!r) die(new Error(`room not found: ${id}`));
         if (opts.json) {
-          console.log(JSON.stringify({ schema_version: 1, room: r }, null, 2));
+          console.log(JSON.stringify({ schema_version: 1, room: cowork, orchestration: r ?? null }, null, 2));
           return;
         }
-        console.log(`Room: ${r.room_id}`);
-        console.log(`Name: ${r.room_name}`);
-        console.log(`State: ${r.state}`);
-        if (r.task_id) console.log(`Task: ${r.task_id}`);
-        if (r.room_identity_cid) console.log(`Identity CID: ${r.room_identity_cid}`);
-        console.log(`Saga: ${r.saga.phase} (step ${r.saga.step_index})`);
-        if (r.provisioning_detail) console.log(`Detail: ${r.provisioning_detail}`);
-        if (r.saga.error) console.log(`Error: ${r.saga.error}`);
-        if (r.member_seats.length) {
+        console.log(`Room: ${cowork.room_id}`);
+        console.log(`Name: ${cowork.room_name}`);
+        console.log(`State: ${cowork.state}`);
+        console.log(`Identity CID: ${cowork.identity_cid}`);
+        if (r?.task_id) console.log(`Task: ${r.task_id}`);
+        if (r) console.log(`Saga: ${r.saga.phase} (step ${r.saga.step_index})`);
+        if (r?.provisioning_detail) console.log(`Detail: ${r.provisioning_detail}`);
+        if (r?.saga.error) console.log(`Error: ${r.saga.error}`);
+        if (cowork.seats.length) {
           console.log('Members:');
-          for (const s of r.member_seats)
-            console.log(`  ${s.role_name} (${s.cowork_role}) ${s.seat_state}`);
+          for (const s of cowork.seats)
+            console.log(`  ${s.identity_cid} (${s.role}) ${s.seat_state}`);
         }
-        console.log(`Created: ${r.created_at}`);
-        if (r.activated_at) console.log(`Activated: ${r.activated_at}`);
-        if (r.closed_at) console.log(`Closed: ${r.closed_at}`);
+        if (r) console.log(`Tracked by Fleet since: ${r.created_at}`);
       } catch (e) { die(e); }
     });
 
-  roomCmd.command('members <id>')
+  cOpt(roomCmd.command('members <id>'))
     .description('show room members')
     .option('--json', 'JSON output')
-    .action((id: string, opts: { json?: boolean }) => {
+    .action(async (id: string, opts: { configuration?: string; json?: boolean }) => {
       try {
+        const cfg = loadCfg(opts);
         const r = getRoomRecord(id);
-        if (!r) die(new Error(`room not found: ${id}`));
+        const members = await coworkFor(cfg).getSeats(id);
         if (opts.json) {
           console.log(JSON.stringify({
             schema_version: 1,
-            room_id: r.room_id,
-            members: r.member_seats,
-            owner_seat_cid: r.owner_seat_cid ?? null,
+            room_id: id,
+            members,
+            owner_seat_cid: r?.owner_seat_cid ?? null,
           }, null, 2));
           return;
         }
-        console.log(`Room ${r.room_id} — ${r.room_name}`);
-        if (r.owner_seat_cid) console.log(`Owner: ${r.owner_seat_cid}`);
-        if (!r.member_seats.length) { console.log('No members.'); return; }
-        for (const s of r.member_seats)
-          console.log(`  ${s.role_name} (${s.cowork_role}) ${s.seat_state} ${s.identity_cid}`);
+        console.log(`Room ${id}${r ? ` — ${r.room_name}` : ''}`);
+        if (r?.owner_seat_cid) console.log(`Owner: ${r.owner_seat_cid}`);
+        if (!members.length) { console.log('No members.'); return; }
+        for (const s of members)
+          console.log(`  ${s.identity_cid} (${s.role}) ${s.seat_state}`);
       } catch (e) { die(e); }
     });
 
-  roomCmd.command('close <id> <confirm-id>')
+  cOpt(roomCmd.command('close <id> <confirm-id>'))
     .description('close a room (requires ID twice for confirmation)')
     .option('--json', 'JSON output')
-    .action((id: string, confirmId: string, opts: { json?: boolean }) => {
+    .action(async (id: string, confirmId: string, opts: { configuration?: string; json?: boolean }) => {
       try {
         if (id !== confirmId) die(new Error('confirmation ID must match room ID'));
-        const r = closeRoomRecord(id);
+        const cfg = loadCfg(opts);
+        await coworkFor(cfg).closeRoom(id);
+        const existing = getRoomRecord(id);
+        const r = existing ? closeRoomRecord(id) : undefined;
         if (opts.json) {
-          console.log(JSON.stringify({ schema_version: 1, room: r }, null, 2));
+          console.log(JSON.stringify({ schema_version: 1, room_id: id, state: 'closed', orchestration: r ?? null }, null, 2));
           return;
         }
-        console.log(`Room ${r.room_id} · closed`);
+        console.log(`Room ${id} · closed`);
       } catch (e) { die(e); }
     });
 
-  roomCmd.command('recover <id>')
+  cOpt(roomCmd.command('recover <id>'))
     .description('attempt to recover a stuck room')
     .option('--json', 'JSON output')
-    .action((id: string, opts: { json?: boolean }) => {
+    .action(async (id: string, opts: { configuration?: string; json?: boolean }) => {
       try {
-        const r = getRoomRecord(id);
-        if (!r) die(new Error(`room not found: ${id}`));
+        const cfg = loadCfg(opts);
+        const adapter = coworkFor(cfg);
+        const cowork = await adapter.recoverRoom(id);
+        let r = getRoomRecord(id);
+        if (r && !r.owner_seat_cid
+          && (r.provisioning_detail === 'waiting_owner_invite'
+            || r.provisioning_detail === 'owner_cid_mismatch')) {
+          const expected = cfg.rooms!.owner.expected_cid.toLowerCase();
+          const existing = (await adapter.getSeats(id))
+            .find(seat => seat.identity_cid.toLowerCase() === expected && seat.seat_state !== 'removed');
+          if (!existing && !cfg.ownerInvite)
+            throw new ConfigError('rooms.owner: configure public_invite or public_invite_file before recovery');
+          let acceptedCid = existing?.identity_cid;
+          if (!acceptedCid) {
+            const accepted = await adapter.acceptInvite(id, cfg.ownerInvite!, {
+              role: cfg.rooms!.owner.role,
+              expected_cid: cfg.rooms!.owner.expected_cid,
+            });
+            acceptedCid = accepted.seat_cid;
+          }
+          setOwnerSeat(id, acceptedCid, cfg.ownerInviteFingerprint ?? '');
+          r = advanceSaga(id, 'create_members', 3);
+        }
         const actions: string[] = [];
-        if (r.saga.error) actions.push(`Last error: ${r.saga.error}`);
-        if (r.saga.recovery_hint) actions.push(r.saga.recovery_hint);
-        if (r.provisioning_detail === 'waiting_cowork')
+        if (r?.saga.error) actions.push(`Last error: ${r.saga.error}`);
+        if (r?.saga.recovery_hint) actions.push(r.saga.recovery_hint);
+        if (r?.provisioning_detail === 'waiting_cowork')
           actions.push('Check ours-cowork service status');
-        if (r.provisioning_detail === 'waiting_owner_invite')
+        if (r?.provisioning_detail === 'waiting_owner_invite')
           actions.push('Rotate rooms.owner.public_invite in config, then re-run recover');
         if (opts.json) {
-          console.log(JSON.stringify({ schema_version: 1, room: r, recovery_actions: actions }, null, 2));
+          console.log(JSON.stringify({ schema_version: 1, room: cowork, orchestration: r ?? null, recovery_actions: actions }, null, 2));
           return;
         }
-        console.log(`Room ${r.room_id} · ${r.state} · saga: ${r.saga.phase}`);
+        console.log(`Room ${cowork.room_id} · ${cowork.state}${r ? ` · saga: ${r.saga.phase}` : ''}`);
         if (actions.length) {
           console.log('Recovery:');
           for (const a of actions) console.log(`  - ${a}`);
