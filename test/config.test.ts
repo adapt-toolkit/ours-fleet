@@ -690,6 +690,9 @@ describe('rooms-tasks split-config backward compat', () => {
     expect(cfg.rooms!.owner.public_invite).toBe('[REDACTED]');
     expect(cfg.ownerInviteFingerprint).toBeDefined();
     expect(cfg.ownerInviteFingerprint).toHaveLength(64);
+    expect(cfg.ownerInvite).toBe('test-invite-string');
+    expect(Object.keys(cfg)).not.toContain('ownerInvite');
+    expect(JSON.stringify(cfg)).not.toContain('test-invite-string');
   });
 
   it('loads tasks config from fleet.yaml', () => {

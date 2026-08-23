@@ -27,6 +27,7 @@ function writeRoom(record: RoomOrchestrationRecord): void {
 export interface CreateRoomInput {
   room_id: string;
   room_name: string;
+  room_identity_cid?: string;
   task_id?: string;
   template_snapshot?: import('./types.js').TemplateSnapshot;
 }
@@ -38,6 +39,7 @@ export function createRoomRecord(input: CreateRoomInput): RoomOrchestrationRecor
   const record: RoomOrchestrationRecord = {
     room_id: input.room_id,
     room_name: input.room_name,
+    room_identity_cid: input.room_identity_cid,
     task_id: input.task_id,
     template_snapshot: input.template_snapshot,
     saga: { phase: 'persist_intent', step_index: 0 },

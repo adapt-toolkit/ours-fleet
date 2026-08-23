@@ -266,6 +266,12 @@ export interface FleetConfig {
   tasks?: import('./rooms-tasks/types.js').TasksConfig;
   /** SHA-256 fingerprint of the resolved owner invite (never the invite itself). */
   ownerInviteFingerprint?: string;
+  /**
+   * Resolved owner invite for immediate private-IPC use only. This property is
+   * deliberately non-enumerable so config dumps and JSON output cannot expose
+   * the bearer credential.
+   */
+  ownerInvite?: string;
 }
 
 export class ConfigError extends Error {}
@@ -467,6 +473,7 @@ export function loadConfig(
   // top-level (room_templates merge by name, last writer wins).
   let rooms: RoomsConfig | undefined;
   let ownerInviteFingerprint: string | undefined;
+  let ownerInvite: string | undefined;
   let roomTemplates: RoomTemplatesConfig | undefined;
   let tasks: TasksConfig | undefined;
 
@@ -475,6 +482,7 @@ export function loadConfig(
       if (rooms) throw new ConfigError(`rooms: defined in multiple files; last: ${file}`);
       const validated = validateRoomsConfig(deepSub(doc.rooms, vars), vars, file);
       ownerInviteFingerprint = validated._invite?.fingerprint;
+      ownerInvite = validated._invite?.value;
       const { _invite: _, ...clean } = validated;
       rooms = clean;
     }
@@ -488,11 +496,20 @@ export function loadConfig(
     }
   }
 
-  return {
+  const result: FleetConfig = {
     roles, vars, defaults, files, startStaggerMs, diagnostics, watchdogs,
     loops: resolvedLoops.loops,
     rooms, roomTemplates, tasks, ownerInviteFingerprint,
   };
+  if (ownerInvite !== undefined) {
+    Object.defineProperty(result, 'ownerInvite', {
+      value: ownerInvite,
+      enumerable: false,
+      writable: false,
+      configurable: false,
+    });
+  }
+  return result;
 }
 
 /**
