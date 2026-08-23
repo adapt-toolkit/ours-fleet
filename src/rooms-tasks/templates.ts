@@ -1,8 +1,8 @@
 import { createHash } from 'node:crypto';
 import type { TemplateDefinition, TemplateSnapshot } from './types.js';
 
-const BRIEFING: TemplateDefinition = {
-  name: 'briefing',
+const TEAM: TemplateDefinition = {
+  name: 'team',
   version: 1,
   builtin: true,
   description: 'Phased task pipeline: Architect specifies, Developer implements, Tester verifies',
@@ -20,8 +20,8 @@ const BRIEFING: TemplateDefinition = {
   ],
 };
 
-const CONSILIUM: TemplateDefinition = {
-  name: 'consilium',
+const PAIR: TemplateDefinition = {
+  name: 'pair',
   version: 1,
   builtin: true,
   description: 'Deliberation pair: Secretary writes code, Critic reviews — every decision deliberated together',
@@ -38,7 +38,7 @@ const CONSILIUM: TemplateDefinition = {
   ],
 };
 
-export const BUILTIN_TEMPLATES: readonly TemplateDefinition[] = [BRIEFING, CONSILIUM];
+export const BUILTIN_TEMPLATES: readonly TemplateDefinition[] = [TEAM, PAIR];
 
 export function hashTemplate(t: TemplateDefinition): string {
   const canonical = JSON.stringify({
