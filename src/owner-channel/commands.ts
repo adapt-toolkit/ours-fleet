@@ -230,9 +230,11 @@ export const ownerCommands: OwnerCommand[] = [
     summary: 'task lifecycle subcommands',
     execute: async (ctx, args) => {
       if (!args) throw new OwnerCommandUsageError('usage: /task <subcommand> <id>');
-      const parts = args.trim().split(/\s+/);
-      const sub = parts[0];
-      const rest = parts.slice(1);
+      const argLines = args.trim().split('\n');
+      const firstLineTokens = argLines[0].trim().split(/\s+/);
+      const sub = firstLineTokens[0];
+      const rest = firstLineTokens.slice(1);
+      const trailingLines = argLines.slice(1).join('\n').trim() || undefined;
 
       const showTask = async (id: string) => {
         const { getTask } = await import('../rooms-tasks/task-state.js');
@@ -252,22 +254,25 @@ export const ownerCommands: OwnerCommand[] = [
       try {
         switch (sub) {
           case 'create': {
-            if (!rest[0]) throw new OwnerCommandUsageError('usage: /task create [--backlog] [--template=<name>] <title>');
+            if (!rest[0]) throw new OwnerCommandUsageError('usage: /task create [--backlog] [--template=<name>|--no-room] <title>');
             const backlog = rest.includes('--backlog');
             const tplFlag = rest.find(r => r.startsWith('--template='));
             const template = tplFlag ? tplFlag.slice('--template='.length) : undefined;
             const noRoom = rest.includes('--no-room');
             const titleParts = rest.filter(r => r !== '--backlog' && !r.startsWith('--template=') && r !== '--no-room');
-            if (!titleParts.length) throw new OwnerCommandUsageError('usage: /task create [--backlog] [--template=<name>] <title>');
+            if (!titleParts.length) throw new OwnerCommandUsageError('usage: /task create [--backlog] [--template=<name>|--no-room] <title>');
             const { createTask } = await import('../rooms-tasks/task-state.js');
             const t = createTask({
               title: titleParts.join(' '),
               origin: { type: 'owner_channel' as const },
               start: !backlog,
               ...(template ? { template: { name: template, version: 1, content_hash: '' } } : {}),
+              ...(noRoom ? { no_room: true } : {}),
+              ...(trailingLines ? { brief: trailingLines } : {}),
             });
             const lines = [`Task ${t.task_id} created · ${t.state}`];
             if (template) lines.push(`Template: ${template}`);
+            if (noRoom) lines.push('No room requested');
             await ctx.reply(lines.join('\n'));
             break;
           }
@@ -392,9 +397,11 @@ export const ownerCommands: OwnerCommand[] = [
     summary: 'room lifecycle subcommands',
     execute: async (ctx, args) => {
       if (!args) throw new OwnerCommandUsageError('usage: /room <subcommand> <id>');
-      const parts = args.trim().split(/\s+/);
-      const sub = parts[0];
-      const rest = parts.slice(1);
+      const argLines = args.trim().split('\n');
+      const firstLineTokens = argLines[0].trim().split(/\s+/);
+      const sub = firstLineTokens[0];
+      const rest = firstLineTokens.slice(1);
+      const roomTrailingLines = argLines.slice(1).join('\n').trim() || undefined;
 
       const showRoom = async (id: string) => {
         const { getRoomRecord } = await import('../rooms-tasks/room-state.js');
@@ -417,17 +424,26 @@ export const ownerCommands: OwnerCommand[] = [
         switch (sub) {
           case 'create': {
             const tplFlag = rest.find(r => r.startsWith('--template='));
-            const template = tplFlag?.slice('--template='.length);
+            const templateName = tplFlag?.slice('--template='.length);
             const nameParts = rest.filter(r => !r.startsWith('--'));
             if (!nameParts.length) throw new OwnerCommandUsageError('usage: /room create --template=<name> <room name>');
             const { randomUUID } = await import('node:crypto');
             const { createRoomRecord } = await import('../rooms-tasks/room-state.js');
+            const { resolveTemplate, snapshotTemplate } = await import('../rooms-tasks/templates.js');
+            let templateSnapshot: import('../rooms-tasks/types.js').TemplateSnapshot | undefined;
+            if (templateName) {
+              const tpl = resolveTemplate(templateName, {});
+              if (!tpl) throw new OwnerCommandUsageError(`unknown template: ${templateName}`);
+              templateSnapshot = snapshotTemplate(tpl);
+            }
             const r = createRoomRecord({
               room_id: randomUUID().replace(/-/g, '').slice(0, 16),
               room_name: nameParts.join(' '),
+              ...(templateSnapshot ? { template_snapshot: templateSnapshot } : {}),
+              ...(roomTrailingLines ? { goal: roomTrailingLines } : {}),
             });
             const lines = [`🏠 Room ${r.room_id} created · ${r.state}`];
-            if (template) lines.push(`Template: ${template}`);
+            if (templateName) lines.push(`Template: ${templateName}`);
             await ctx.reply(lines.join('\n'));
             break;
           }

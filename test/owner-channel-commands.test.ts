@@ -492,6 +492,45 @@ describe('owner-channel task subcommands', () => {
     expect(ctx.replies[0]).toContain('usage');
   });
 
+  it('/task create --no-room sets no_room on task record', async () => {
+    const ctx = context();
+    await dispatchOwnerCommand('/task create --no-room manual task', ctx);
+    expect(ctx.replies).toHaveLength(1);
+    expect(ctx.replies[0]).toContain('No room requested');
+    const { listTasks } = await import('../src/rooms-tasks/task-state.js');
+    const tasks = listTasks();
+    const t = tasks.find(t => t.title === 'manual task');
+    expect(t).toBeDefined();
+    expect(t!.no_room).toBe(true);
+  });
+
+  it('/task create with multi-line brief stores brief on task record', async () => {
+    const ctx = context();
+    await dispatchOwnerCommand('/task create Fix parser\nThis is the detailed brief.\nSecond line of brief.', ctx);
+    expect(ctx.replies).toHaveLength(1);
+    expect(ctx.replies[0]).toContain('created');
+    const { listTasks } = await import('../src/rooms-tasks/task-state.js');
+    const tasks = listTasks();
+    const t = tasks.find(t => t.title === 'Fix parser');
+    expect(t).toBeDefined();
+    expect(t!.brief).toBe('This is the detailed brief.\nSecond line of brief.');
+  });
+
+  it('/task create --no-room --backlog with multi-line brief stores all fields', async () => {
+    const ctx = context();
+    await dispatchOwnerCommand('/task create --no-room --backlog Complex task\nBrief line 1\nBrief line 2', ctx);
+    expect(ctx.replies).toHaveLength(1);
+    expect(ctx.replies[0]).toContain('backlog');
+    expect(ctx.replies[0]).toContain('No room requested');
+    const { listTasks } = await import('../src/rooms-tasks/task-state.js');
+    const tasks = listTasks();
+    const t = tasks.find(t => t.title === 'Complex task');
+    expect(t).toBeDefined();
+    expect(t!.no_room).toBe(true);
+    expect(t!.brief).toBe('Brief line 1\nBrief line 2');
+    expect(t!.state).toBe('backlog');
+  });
+
   it('/task list shows all tasks', async () => {
     await createTestTask();
     const ctx = context();
@@ -602,10 +641,10 @@ describe('owner-channel room subcommands', () => {
 
   it('/room create creates a room', async () => {
     const ctx = context();
-    await dispatchOwnerCommand('/room create --template=dev my room', ctx);
+    await dispatchOwnerCommand('/room create --template=development-team my room', ctx);
     expect(ctx.replies).toHaveLength(1);
     expect(ctx.replies[0]).toContain('created');
-    expect(ctx.replies[0]).toContain('Template: dev');
+    expect(ctx.replies[0]).toContain('Template: development-team');
   });
 
   it('/room create without name returns usage', async () => {
@@ -613,6 +652,41 @@ describe('owner-channel room subcommands', () => {
     await dispatchOwnerCommand('/room create', ctx);
     expect(ctx.replies).toHaveLength(1);
     expect(ctx.replies[0]).toContain('usage');
+  });
+
+  it('/room create --template=development-team persists template_snapshot', async () => {
+    const ctx = context();
+    await dispatchOwnerCommand('/room create --template=development-team My Dev Room', ctx);
+    expect(ctx.replies).toHaveLength(1);
+    expect(ctx.replies[0]).toContain('created');
+    expect(ctx.replies[0]).toContain('Template: development-team');
+    const { listRoomRecords } = await import('../src/rooms-tasks/room-state.js');
+    const rooms = listRoomRecords();
+    const r = rooms.find(r => r.room_name === 'My Dev Room');
+    expect(r).toBeDefined();
+    expect(r!.template_snapshot).toBeDefined();
+    expect(r!.template_snapshot!.name).toBe('development-team');
+    expect(r!.template_snapshot!.content_hash).toBeTruthy();
+  });
+
+  it('/room create with unknown template returns error', async () => {
+    const ctx = context();
+    await dispatchOwnerCommand('/room create --template=nonexistent My Room', ctx);
+    expect(ctx.replies).toHaveLength(1);
+    expect(ctx.replies[0]).toContain('unknown template');
+  });
+
+  it('/room create with multi-line goal stores goal on room record', async () => {
+    const ctx = context();
+    await dispatchOwnerCommand('/room create --template=development-team Goal Room\nFix the parser bug.\nSecond goal line.', ctx);
+    expect(ctx.replies).toHaveLength(1);
+    expect(ctx.replies[0]).toContain('created');
+    const { listRoomRecords } = await import('../src/rooms-tasks/room-state.js');
+    const rooms = listRoomRecords();
+    const r = rooms.find(r => r.room_name === 'Goal Room');
+    expect(r).toBeDefined();
+    expect(r!.goal).toBe('Fix the parser bug.\nSecond goal line.');
+    expect(r!.template_snapshot).toBeDefined();
   });
 
   it('/room list shows rooms', async () => {

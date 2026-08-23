@@ -56,6 +56,7 @@ export interface TaskRecord {
   state: TaskState;
   blocked?: TaskBlocked;
   template?: TaskTemplateRef;
+  no_room?: boolean;
   room_id?: string;
   room_identity_cid?: string;
   member_roles: TaskMemberRole[];
@@ -110,6 +111,7 @@ export interface RoomOrchestrationRecord {
   room_id: string;
   room_identity_cid?: string;
   room_name: string;
+  goal?: string;
   task_id?: string;
   template_snapshot?: TemplateSnapshot;
   saga: SagaCursor;
