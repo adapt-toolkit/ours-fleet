@@ -45,20 +45,20 @@ afterEach(() => {
 describe('templates', () => {
   describe('resolveTemplate', () => {
     it('resolves built-in by name', () => {
-      const t = resolveTemplate('development-team', {});
+      const t = resolveTemplate('briefing', {});
       expect(t).toBeDefined();
-      expect(t!.name).toBe('development-team');
+      expect(t!.name).toBe('briefing');
       expect(t!.builtin).toBe(true);
     });
 
     it('resolves built-in by name@version', () => {
-      const t = resolveTemplate('development-team@1', {});
+      const t = resolveTemplate('briefing@1', {});
       expect(t).toBeDefined();
       expect(t!.version).toBe(1);
     });
 
     it('returns undefined for wrong version', () => {
-      expect(resolveTemplate('development-team@99', {})).toBeUndefined();
+      expect(resolveTemplate('briefing@99', {})).toBeUndefined();
     });
 
     it('returns undefined for unknown name', () => {
@@ -67,12 +67,12 @@ describe('templates', () => {
 
     it('custom overrides built-in', () => {
       const custom: Record<string, TemplateDefinition> = {
-        'development-team': {
-          name: 'development-team', version: 2, description: 'custom dev',
+        'briefing': {
+          name: 'briefing', version: 2, description: 'custom dev',
           members: [{ slot: 'dev', role: 'Dev', count: 2, role_ref: 'Dev' }],
         },
       };
-      const t = resolveTemplate('development-team', custom);
+      const t = resolveTemplate('briefing', custom);
       expect(t!.version).toBe(2);
       expect(t!.description).toBe('custom dev');
     });
@@ -93,8 +93,8 @@ describe('templates', () => {
     it('returns built-ins when no custom templates', () => {
       const list = listTemplates({});
       expect(list.length).toBe(BUILTIN_TEMPLATES.length);
-      expect(list.map(t => t.name)).toContain('development-team');
-      expect(list.map(t => t.name)).toContain('research-decision');
+      expect(list.map(t => t.name)).toContain('briefing');
+      expect(list.map(t => t.name)).toContain('consilium');
     });
 
     it('merges custom with built-ins, sorted', () => {
@@ -111,13 +111,13 @@ describe('templates', () => {
 
     it('custom with same name as builtin replaces it', () => {
       const custom: Record<string, TemplateDefinition> = {
-        'development-team': {
-          name: 'development-team', version: 2, description: 'override',
+        'briefing': {
+          name: 'briefing', version: 2, description: 'override',
           members: [{ slot: 'a', role: 'A', count: 1, role_ref: 'A' }],
         },
       };
       const list = listTemplates(custom);
-      const dt = list.find(t => t.name === 'development-team')!;
+      const dt = list.find(t => t.name === 'briefing')!;
       expect(dt.version).toBe(2);
       expect(list.length).toBe(BUILTIN_TEMPLATES.length);
     });
@@ -627,9 +627,9 @@ describe('config validation', () => {
     it('accepts valid defaults section', () => {
       const cfg = validateRoomsConfig({
         owner: { expected_cid: CID_64 },
-        defaults: { template: 'development-team', attach_owner: true },
+        defaults: { template: 'briefing', attach_owner: true },
       }, vars, 'test');
-      expect(cfg.defaults!.template).toBe('development-team');
+      expect(cfg.defaults!.template).toBe('briefing');
       expect(cfg.defaults!.attach_owner).toBe(true);
     });
 
@@ -729,17 +729,17 @@ describe('config validation', () => {
 
     it('requires override_builtin for builtin name', () => {
       expect(() => validateRoomTemplatesConfig({
-        'development-team': { version: 2, description: 'override', members: validTemplate.members },
+        'briefing': { version: 2, description: 'override', members: validTemplate.members },
       }, 'test')).toThrow(/override_builtin/);
     });
 
     it('accepts builtin override with override_builtin: true', () => {
       const cfg = validateRoomTemplatesConfig({
-        'development-team': {
+        'briefing': {
           ...validTemplate, version: 2, override_builtin: true,
         },
       }, 'test');
-      expect(cfg['development-team'].version).toBe(2);
+      expect(cfg['briefing'].version).toBe(2);
     });
 
     it('rejects unknown keys in template', () => {

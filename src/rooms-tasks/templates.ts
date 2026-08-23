@@ -1,44 +1,44 @@
 import { createHash } from 'node:crypto';
 import type { TemplateDefinition, TemplateSnapshot } from './types.js';
 
-const DEVELOPMENT_TEAM: TemplateDefinition = {
-  name: 'development-team',
+const BRIEFING: TemplateDefinition = {
+  name: 'briefing',
   version: 1,
   builtin: true,
-  description: 'Four equal Developer peers: implement, review, test, and cross-validate',
+  description: 'Phased task pipeline: Architect specifies, Developer implements, Tester verifies',
   room: { quiet_membership: false, anonymous: false },
   contract: [
-    'Work in the room. Preserve evidence. Review independently before consensus.',
-    'Every material change needs independent review from another peer.',
-    'Peers reproduce, test, stress, criticize, and cross-validate each other\'s work.',
-    'Evidence and decisions are posted into the Room; detailed scratch work stays in role worklogs.',
-    'Completion requires the room\'s agreed acceptance criteria, not merely one agent declaring success.',
+    'Architect produces a spec and posts it to the room. Work pauses for owner approval.',
+    'Developer implements per approved spec.',
+    'Tester verifies spec conformance and test coverage.',
+    'Completion requires tester sign-off.',
   ].join('\n'),
   members: [
-    { slot: 'developer', role: 'Developer', count: 4, role_ref: 'Developer' },
+    { slot: 'architect', role: 'Architect', count: 1, role_ref: 'Architect' },
+    { slot: 'developer', role: 'Developer', count: 1, role_ref: 'Developer' },
+    { slot: 'tester', role: 'Tester', count: 1, role_ref: 'Tester' },
   ],
 };
 
-const RESEARCH_DECISION: TemplateDefinition = {
-  name: 'research-decision',
+const CONSILIUM: TemplateDefinition = {
+  name: 'consilium',
   version: 1,
   builtin: true,
-  description: 'Two Researchers, one Critic, one Synthesizer for evidence-based decisions',
+  description: 'Deliberation pair: Secretary writes code, Critic reviews — every decision deliberated together',
   room: { quiet_membership: false, anonymous: false },
   contract: [
-    'Researchers gather independent evidence. Critic attacks assumptions and missing cases.',
-    'Synthesizer produces the final decision record with cited evidence, alternatives, and recommendation.',
-    'No code mutation is implied by this template.',
-    'Completion requires cited evidence, alternatives considered, and an explicit recommendation.',
+    'Secretary and Critic deliberate every decision together before acting.',
+    'Secretary writes code; Critic reviews and challenges.',
+    'No material change lands without both agreeing.',
+    'Completion requires joint sign-off.',
   ].join('\n'),
   members: [
-    { slot: 'researcher', role: 'Researcher', count: 2, role_ref: 'Researcher' },
+    { slot: 'secretary', role: 'Secretary', count: 1, role_ref: 'Secretary' },
     { slot: 'critic', role: 'Critic', count: 1, role_ref: 'Critic' },
-    { slot: 'synthesizer', role: 'Synthesizer', count: 1, role_ref: 'Synthesizer' },
   ],
 };
 
-export const BUILTIN_TEMPLATES: readonly TemplateDefinition[] = [DEVELOPMENT_TEAM, RESEARCH_DECISION];
+export const BUILTIN_TEMPLATES: readonly TemplateDefinition[] = [BRIEFING, CONSILIUM];
 
 export function hashTemplate(t: TemplateDefinition): string {
   const canonical = JSON.stringify({
