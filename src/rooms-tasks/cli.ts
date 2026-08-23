@@ -225,7 +225,7 @@ export function registerTaskCommands(parent: Command, cOpt: (cmd: Command) => Co
           const snap = snapshotTemplate(t);
           templateRef = { name: snap.name, version: snap.version, content_hash: snap.content_hash };
         } else if (opts.room !== false) {
-          const defaultTpl = cfg.tasks?.default_room_template ?? cfg.rooms?.defaults?.template ?? 'briefing';
+          const defaultTpl = cfg.tasks?.default_room_template ?? cfg.rooms?.defaults?.template ?? 'team';
           const t = resolveTemplate(defaultTpl, allTemplates(cfg));
           if (t) {
             const snap = snapshotTemplate(t);

@@ -880,11 +880,11 @@ describe('doctor rooms-tasks checks (§5.3)', () => {
 
   it('passes default template when it resolves to a builtin', async () => {
     registerAdapter(fakeAdapter);
-    writeCfg(ROOMS_YAML(CID_64, '  defaults:\n    template: briefing\n'));
+    writeCfg(ROOMS_YAML(CID_64, '  defaults:\n    template: team\n'));
     const rep = await run();
     const dt = rep.checks.find(c => c.name === 'rooms: default template')!;
     expect(dt.ok).toBe(true);
-    expect(dt.detail).toContain('briefing@1');
+    expect(dt.detail).toContain('team@1');
   });
 
   it('warns on stale task-room cross-references', async () => {

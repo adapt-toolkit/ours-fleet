@@ -45,20 +45,20 @@ afterEach(() => {
 describe('templates', () => {
   describe('resolveTemplate', () => {
     it('resolves built-in by name', () => {
-      const t = resolveTemplate('briefing', {});
+      const t = resolveTemplate('team', {});
       expect(t).toBeDefined();
-      expect(t!.name).toBe('briefing');
+      expect(t!.name).toBe('team');
       expect(t!.builtin).toBe(true);
     });
 
     it('resolves built-in by name@version', () => {
-      const t = resolveTemplate('briefing@1', {});
+      const t = resolveTemplate('team@1', {});
       expect(t).toBeDefined();
       expect(t!.version).toBe(1);
     });
 
     it('returns undefined for wrong version', () => {
-      expect(resolveTemplate('briefing@99', {})).toBeUndefined();
+      expect(resolveTemplate('team@99', {})).toBeUndefined();
     });
 
     it('returns undefined for unknown name', () => {
@@ -67,12 +67,12 @@ describe('templates', () => {
 
     it('custom overrides built-in', () => {
       const custom: Record<string, TemplateDefinition> = {
-        'briefing': {
-          name: 'briefing', version: 2, description: 'custom dev',
+        'team': {
+          name: 'team', version: 2, description: 'custom dev',
           members: [{ slot: 'dev', role: 'Dev', count: 2, role_ref: 'Dev' }],
         },
       };
-      const t = resolveTemplate('briefing', custom);
+      const t = resolveTemplate('team', custom);
       expect(t!.version).toBe(2);
       expect(t!.description).toBe('custom dev');
     });
@@ -93,8 +93,8 @@ describe('templates', () => {
     it('returns built-ins when no custom templates', () => {
       const list = listTemplates({});
       expect(list.length).toBe(BUILTIN_TEMPLATES.length);
-      expect(list.map(t => t.name)).toContain('briefing');
-      expect(list.map(t => t.name)).toContain('consilium');
+      expect(list.map(t => t.name)).toContain('team');
+      expect(list.map(t => t.name)).toContain('pair');
     });
 
     it('merges custom with built-ins, sorted', () => {
@@ -111,13 +111,13 @@ describe('templates', () => {
 
     it('custom with same name as builtin replaces it', () => {
       const custom: Record<string, TemplateDefinition> = {
-        'briefing': {
-          name: 'briefing', version: 2, description: 'override',
+        'team': {
+          name: 'team', version: 2, description: 'override',
           members: [{ slot: 'a', role: 'A', count: 1, role_ref: 'A' }],
         },
       };
       const list = listTemplates(custom);
-      const dt = list.find(t => t.name === 'briefing')!;
+      const dt = list.find(t => t.name === 'team')!;
       expect(dt.version).toBe(2);
       expect(list.length).toBe(BUILTIN_TEMPLATES.length);
     });
@@ -627,9 +627,9 @@ describe('config validation', () => {
     it('accepts valid defaults section', () => {
       const cfg = validateRoomsConfig({
         owner: { expected_cid: CID_64 },
-        defaults: { template: 'briefing', attach_owner: true },
+        defaults: { template: 'team', attach_owner: true },
       }, vars, 'test');
-      expect(cfg.defaults!.template).toBe('briefing');
+      expect(cfg.defaults!.template).toBe('team');
       expect(cfg.defaults!.attach_owner).toBe(true);
     });
 
@@ -729,17 +729,17 @@ describe('config validation', () => {
 
     it('requires override_builtin for builtin name', () => {
       expect(() => validateRoomTemplatesConfig({
-        'briefing': { version: 2, description: 'override', members: validTemplate.members },
+        'team': { version: 2, description: 'override', members: validTemplate.members },
       }, 'test')).toThrow(/override_builtin/);
     });
 
     it('accepts builtin override with override_builtin: true', () => {
       const cfg = validateRoomTemplatesConfig({
-        'briefing': {
+        'team': {
           ...validTemplate, version: 2, override_builtin: true,
         },
       }, 'test');
-      expect(cfg['briefing'].version).toBe(2);
+      expect(cfg['team'].version).toBe(2);
     });
 
     it('rejects unknown keys in template', () => {
