@@ -641,10 +641,10 @@ describe('owner-channel room subcommands', () => {
 
   it('/room create creates a room', async () => {
     const ctx = context();
-    await dispatchOwnerCommand('/room create --template=development-team my room', ctx);
+    await dispatchOwnerCommand('/room create --template=briefing my room', ctx);
     expect(ctx.replies).toHaveLength(1);
     expect(ctx.replies[0]).toContain('created');
-    expect(ctx.replies[0]).toContain('Template: development-team');
+    expect(ctx.replies[0]).toContain('Template: briefing');
   });
 
   it('/room create without name returns usage', async () => {
@@ -654,18 +654,18 @@ describe('owner-channel room subcommands', () => {
     expect(ctx.replies[0]).toContain('usage');
   });
 
-  it('/room create --template=development-team persists template_snapshot', async () => {
+  it('/room create --template=briefing persists template_snapshot', async () => {
     const ctx = context();
-    await dispatchOwnerCommand('/room create --template=development-team My Dev Room', ctx);
+    await dispatchOwnerCommand('/room create --template=briefing My Dev Room', ctx);
     expect(ctx.replies).toHaveLength(1);
     expect(ctx.replies[0]).toContain('created');
-    expect(ctx.replies[0]).toContain('Template: development-team');
+    expect(ctx.replies[0]).toContain('Template: briefing');
     const { listRoomRecords } = await import('../src/rooms-tasks/room-state.js');
     const rooms = listRoomRecords();
     const r = rooms.find(r => r.room_name === 'My Dev Room');
     expect(r).toBeDefined();
     expect(r!.template_snapshot).toBeDefined();
-    expect(r!.template_snapshot!.name).toBe('development-team');
+    expect(r!.template_snapshot!.name).toBe('briefing');
     expect(r!.template_snapshot!.content_hash).toBeTruthy();
   });
 
@@ -678,7 +678,7 @@ describe('owner-channel room subcommands', () => {
 
   it('/room create with multi-line goal stores goal on room record', async () => {
     const ctx = context();
-    await dispatchOwnerCommand('/room create --template=development-team Goal Room\nFix the parser bug.\nSecond goal line.', ctx);
+    await dispatchOwnerCommand('/room create --template=briefing Goal Room\nFix the parser bug.\nSecond goal line.', ctx);
     expect(ctx.replies).toHaveLength(1);
     expect(ctx.replies[0]).toContain('created');
     const { listRoomRecords } = await import('../src/rooms-tasks/room-state.js');
@@ -734,25 +734,25 @@ describe('owner-channel room subcommands', () => {
 describe('owner-channel template subcommands', () => {
   it('/template show <name> shows template details', async () => {
     const ctx = context();
-    await dispatchOwnerCommand('/template show development-team', ctx);
+    await dispatchOwnerCommand('/template show briefing', ctx);
     expect(ctx.replies).toHaveLength(1);
-    expect(ctx.replies[0]).toContain('development-team');
+    expect(ctx.replies[0]).toContain('briefing');
     expect(ctx.replies[0]).toContain('Developer');
   });
 
   it('/template <name> shows template details (backward compat)', async () => {
     const ctx = context();
-    await dispatchOwnerCommand('/template development-team@1', ctx);
+    await dispatchOwnerCommand('/template briefing@1', ctx);
     expect(ctx.replies).toHaveLength(1);
-    expect(ctx.replies[0]).toContain('development-team');
+    expect(ctx.replies[0]).toContain('briefing');
   });
 
   it('/template list lists all templates', async () => {
     const ctx = context();
     await dispatchOwnerCommand('/template list', ctx);
     expect(ctx.replies).toHaveLength(1);
-    expect(ctx.replies[0]).toContain('development-team');
-    expect(ctx.replies[0]).toContain('research-decision');
+    expect(ctx.replies[0]).toContain('briefing');
+    expect(ctx.replies[0]).toContain('consilium');
   });
 
   it('/template show reports not found', async () => {
