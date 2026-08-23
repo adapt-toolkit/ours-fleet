@@ -330,6 +330,47 @@ describe('provision saga', () => {
       expect(result.saga.phase).toBe('wait_seats');
       expect(mocks.mockSpawnTemp).not.toHaveBeenCalled();
     });
+
+    it('resumes from wait_seats without recreating identities or reissuing invites', async () => {
+      const template = makeTemplate();
+      const task = createTask({ title: 'Resume', origin: { type: 'cli' } });
+      createRoomRecord({ room_id: 'room-resume', room_name: 'Resume', task_id: task.task_id });
+
+      const first = mockCoworkAdapter({ seatsActive: false });
+      const waiting = await provisionMembers({
+        cfg: minimalCfg(),
+        cowork: first,
+        roomId: 'room-resume',
+        taskId: task.task_id,
+        template,
+        binPath: '/usr/bin/ours-fleet',
+      });
+      expect(waiting.saga.phase).toBe('wait_seats');
+      expect(mocks.mockCreateIdentity).toHaveBeenCalledTimes(2);
+      const persisted = waiting.member_seats.map(s => s.identity_cid);
+
+      const second = mockCoworkAdapter();
+      const resumed = await provisionMembers({
+        cfg: minimalCfg(),
+        cowork: second,
+        roomId: 'room-resume',
+        taskId: task.task_id,
+        template,
+        binPath: '/usr/bin/ours-fleet',
+      });
+
+      expect(resumed.state).toBe('active');
+      expect(resumed.saga.phase).toBe('completed');
+      expect(resumed.member_seats.map(s => s.identity_cid)).toEqual(persisted);
+      expect(resumed.member_seats.every(s => s.seat_state === 'active')).toBe(true);
+      // The retained identities, seats and invitations are reused, not redone.
+      expect(mocks.mockCreateIdentity).toHaveBeenCalledTimes(2);
+      expect(second.issueInvite).not.toHaveBeenCalled();
+      expect(second.acceptInvite).not.toHaveBeenCalled();
+      // Agents launch exactly once, on the run that saw the seats go active.
+      expect(mocks.mockSpawnTemp).toHaveBeenCalledTimes(2);
+      expect(getTask(task.task_id).state).toBe('active');
+    });
   });
 
   describe('failure rollback', () => {

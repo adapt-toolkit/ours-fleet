@@ -9,7 +9,7 @@ import {
 import {
   createTask, getTask, listTasks, startTask, activateTask,
   blockTask, unblockTask, reviewTask, completeTask, cancelTask,
-  updateTaskRoom, updateTaskMembers, failTask, TaskStateError,
+  updateTaskRoom, updateTaskTemplate, updateTaskMembers, failTask, TaskStateError,
 } from './task-state.js';
 import {
   createRoomRecord, getRoomRecord, listRoomRecords,
@@ -17,6 +17,7 @@ import {
   setSagaError, activateRoom, updateMemberSeats, RoomStateError,
 } from './room-state.js';
 import { createCoworkAdapter, CoworkProtocolError, CoworkUnavailableError } from './cowork-adapter.js';
+import { TASK_TERMINAL_STATES } from './types.js';
 import type { RoomOrchestrationRecord, TaskOrigin, TemplateDefinition, TemplateSnapshot } from './types.js';
 
 function die(e: unknown): never {
@@ -505,6 +506,173 @@ export function registerTaskCommands(parent: Command, cOpt: (cmd: Command) => Co
         } else {
           console.log('No automated recovery actions available.');
         }
+      } catch (e) { die(e); }
+    });
+
+  cOpt(taskCmd.command('work <id>'))
+    .description('ensure a task has a room and agents running')
+    .option('--template <name>', 'room template')
+    .option('--json', 'JSON output')
+    .action(async (id: string, opts: { configuration?: string; template?: string; json?: boolean }) => {
+      try {
+        const cfg = loadCfg(opts);
+        let t = getTask(id);
+
+        if (TASK_TERMINAL_STATES.includes(t.state))
+          die(new Error(`task ${id} is in terminal state '${t.state}'`));
+
+        if (t.state === 'active' && t.room_id) {
+          // An explicit --template must agree with the room the task already
+          // runs in; a conflicting override is an error, not a silent no-op.
+          if (opts.template) {
+            const override = resolveTemplate(opts.template, allTemplates(cfg));
+            if (!override) die(new Error(`template not found: ${opts.template}`));
+            const overrideSnap = snapshotTemplate(override);
+            const roomSnap = getRoomRecord(t.room_id)?.template_snapshot ?? t.template;
+            if (roomSnap && (roomSnap.name !== overrideSnap.name || roomSnap.content_hash !== overrideSnap.content_hash))
+              die(new Error(`template ${overrideSnap.name}@${overrideSnap.version} does not match room ${t.room_id}'s provisioned template ${roomSnap.name}@${roomSnap.version}`));
+          }
+          if (opts.json) {
+            console.log(JSON.stringify({ schema_version: 1, task: t, status: 'already_active' }, null, 2));
+            return;
+          }
+          console.log('Task already has an active room');
+          return;
+        }
+
+        // Select and validate the template snapshot before any state change or
+        // provisioning. An explicit --template re-pins the task; a stored ref
+        // must still match its snapshot (same contract as `task start`).
+        const templateName = opts.template
+          ?? t.template?.name
+          ?? cfg.tasks?.default_room_template
+          ?? cfg.rooms?.defaults?.template
+          ?? 'single';
+        const resolved = resolveTemplate(templateName, allTemplates(cfg));
+        if (!resolved) die(new Error(`template not found: ${templateName}`));
+        const snap = snapshotTemplate(resolved);
+        if (!opts.template && t.template && snap.content_hash !== t.template.content_hash)
+          die(new Error(`task template snapshot no longer matches ${t.template.name}@${t.template.version}`));
+        // A provisioned room is pinned to its snapshot: never resume or re-pin
+        // an existing room under a different template.
+        if (t.room_id) {
+          const roomSnap = getRoomRecord(t.room_id)?.template_snapshot ?? t.template;
+          if (roomSnap && (roomSnap.name !== snap.name || roomSnap.content_hash !== snap.content_hash))
+            die(new Error(`template ${snap.name}@${snap.version} does not match room ${t.room_id}'s provisioned template ${roomSnap.name}@${roomSnap.version}`));
+        }
+        let templateRef = t.template;
+        if (!templateRef || templateRef.name !== snap.name || templateRef.content_hash !== snap.content_hash) {
+          templateRef = { name: snap.name, version: snap.version, content_hash: snap.content_hash };
+          t = updateTaskTemplate(t.task_id, templateRef);
+        }
+
+        if (t.state === 'backlog') {
+          t = startTask(id);
+        }
+
+        if (!t.room_id) {
+          try {
+            await provisionRoom(cfg, {
+              name: t.title,
+              goal: t.title,
+              brief: t.brief,
+              template: snap,
+              taskId: t.task_id,
+              onCreated: room => {
+                t = updateTaskRoom(t.task_id, room.room_id, room.room_identity_cid!);
+              },
+            });
+            t = getTask(t.task_id);
+          } catch (error) {
+            if (error instanceof CoworkUnavailableError) {
+              blockTask(t.task_id, 'Cowork management socket is unavailable');
+            }
+            throw error;
+          }
+        } else if (t.state === 'provisioning') {
+          // The task already has a room mid-provisioning (e.g. seats were still
+          // pending on the last run). Resume it exactly as `task recover` does.
+          const room = getRoomRecord(t.room_id);
+          const resumable: import('./types.js').SagaPhase[] =
+            ['create_members', 'join_role_groups', 'wait_seats', 'launch_work', 'activate'];
+          if (room && resumable.includes(room.saga.phase)) {
+            try {
+              await provisionMembers({
+                cfg,
+                cowork: coworkFor(cfg),
+                roomId: room.room_id,
+                taskId: t.task_id,
+                template: snap,
+                binPath: getBinPath(),
+                brief: t.brief,
+                goal: t.title,
+              });
+            } catch (error) {
+              if (error instanceof CoworkUnavailableError) {
+                blockTask(t.task_id, 'Cowork management socket is unavailable');
+              }
+              throw error;
+            }
+            t = getTask(t.task_id);
+          } else {
+            die(new Error(`task ${id} has room ${t.room_id} in a non-resumable state — run 'task recover ${id}'`));
+          }
+        }
+
+        if (opts.json) {
+          console.log(JSON.stringify({ schema_version: 1, task: t }, null, 2));
+          return;
+        }
+        console.log(`Task ${t.task_id} · ${t.state}`);
+        if (templateRef) console.log(`Template: ${templateRef.name}@${templateRef.version}`);
+        if (t.room_id) console.log(`Room: ${t.room_id}`);
+        if (t.member_roles.length) {
+          console.log('Agents:');
+          for (const m of t.member_roles)
+            console.log(`  ${m.name} (${m.cowork_role})`);
+        }
+      } catch (e) { die(e); }
+    });
+
+  cOpt(taskCmd.command('finish <id>'))
+    .description('finish a task: transition to done and close its room')
+    .option('--summary <text>', 'completion summary')
+    .option('--summary-file <path>', 'completion summary from file')
+    .option('--json', 'JSON output')
+    .action(async (id: string, opts: { configuration?: string; summary?: string; summaryFile?: string; json?: boolean }) => {
+      try {
+        let summary = opts.summary;
+        if (opts.summaryFile) summary = readFileSync(opts.summaryFile, 'utf8');
+        const outcome = summary ? { summary } : undefined;
+
+        let t = getTask(id);
+
+        if (TASK_TERMINAL_STATES.includes(t.state))
+          die(new Error(`task ${id} is already in terminal state '${t.state}'`));
+
+        if (t.state === 'active') {
+          reviewTask(id);
+        }
+
+        t = completeTask(id, outcome);
+
+        if (t.room_id) {
+          const cfg = loadCfg(opts);
+          try {
+            await cleanupMembers({
+              roomId: t.room_id,
+              taskId: id,
+              closeCoworkRoom: true,
+              cowork: coworkFor(cfg),
+            });
+          } catch { /* room cleanup is best-effort */ }
+        }
+
+        if (opts.json) {
+          console.log(JSON.stringify({ schema_version: 1, task: t }, null, 2));
+          return;
+        }
+        console.log(`Task ${t.task_id} · done`);
       } catch (e) { die(e); }
     });
 }

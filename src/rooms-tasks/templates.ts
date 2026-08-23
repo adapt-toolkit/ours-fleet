@@ -38,7 +38,22 @@ const PAIR: TemplateDefinition = {
   ],
 };
 
-export const BUILTIN_TEMPLATES: readonly TemplateDefinition[] = [TEAM, PAIR];
+const SINGLE: TemplateDefinition = {
+  name: 'single',
+  version: 1,
+  builtin: true,
+  description: 'Solo agent: one general-purpose agent works the task with owner oversight',
+  room: { quiet_membership: false, anonymous: false },
+  contract: [
+    'Agent works the task autonomously, consulting the owner when blocked.',
+    'Owner reviews and approves completion.',
+  ].join('\n'),
+  members: [
+    { slot: 'agent', role: 'Agent', count: 1, role_ref: 'Agent' },
+  ],
+};
+
+export const BUILTIN_TEMPLATES: readonly TemplateDefinition[] = [TEAM, PAIR, SINGLE];
 
 export function hashTemplate(t: TemplateDefinition): string {
   const canonical = JSON.stringify({
