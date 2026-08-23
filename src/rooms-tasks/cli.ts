@@ -1,6 +1,7 @@
 import type { Command } from 'commander';
 import { readFileSync } from 'node:fs';
-import { loadConfig, type FleetConfig, ConfigError } from '../config.js';
+import { loadConfig, type FleetConfig, ConfigError, findRole } from '../config.js';
+import { provisionMembers, cleanupMembers, getBinPath } from './provision.js';
 import {
   resolveTemplate, listTemplates, snapshotTemplate, hashTemplate,
   BUILTIN_TEMPLATES,
@@ -8,12 +9,12 @@ import {
 import {
   createTask, getTask, listTasks, startTask, activateTask,
   blockTask, unblockTask, reviewTask, completeTask, cancelTask,
-  updateTaskRoom, TaskStateError,
+  updateTaskRoom, updateTaskMembers, failTask, TaskStateError,
 } from './task-state.js';
 import {
   createRoomRecord, getRoomRecord, listRoomRecords,
   closeRoom as closeRoomRecord, advanceSaga, setOwnerSeat,
-  setSagaError, RoomStateError,
+  setSagaError, activateRoom, updateMemberSeats, RoomStateError,
 } from './room-state.js';
 import { createCoworkAdapter, CoworkProtocolError, CoworkUnavailableError } from './cowork-adapter.js';
 import type { RoomOrchestrationRecord, TaskOrigin, TemplateDefinition, TemplateSnapshot } from './types.js';
@@ -104,7 +105,24 @@ async function provisionRoom(cfg: FleetConfig, input: {
       throw error;
     }
   }
-  return advanceSaga(record.room_id, 'create_members', 3);
+  record = advanceSaga(record.room_id, 'create_members', 3);
+
+  if (input.template && input.template.members.length > 0) {
+    record = await provisionMembers({
+      cfg,
+      cowork,
+      roomId: record.room_id,
+      taskId: input.taskId,
+      template: input.template,
+      binPath: getBinPath(),
+      brief: input.brief,
+      goal: input.goal,
+    });
+  } else {
+    record = activateRoom(record.room_id);
+    if (input.taskId) activateTask(input.taskId);
+  }
+  return record;
 }
 
 export function registerTemplateCommands(parent: Command, cOpt: (cmd: Command) => Command): void {
@@ -376,40 +394,63 @@ export function registerTaskCommands(parent: Command, cOpt: (cmd: Command) => Co
       } catch (e) { die(e); }
     });
 
-  taskCmd.command('done <id>')
+  cOpt(taskCmd.command('done <id>'))
     .description('complete a task')
     .option('--summary <text>', 'completion summary')
     .option('--summary-file <path>', 'completion summary from file')
     .option('--json', 'JSON output')
-    .action((id: string, opts: { summary?: string; summaryFile?: string; json?: boolean }) => {
+    .action(async (id: string, opts: { configuration?: string; summary?: string; summaryFile?: string; json?: boolean }) => {
       try {
         let summary = opts.summary;
         if (opts.summaryFile) summary = readFileSync(opts.summaryFile, 'utf8');
         const outcome = summary ? { summary } : undefined;
         const t = completeTask(id, outcome);
+        if (t.room_id) {
+          const cfg = loadCfg(opts);
+          const shouldClose = cfg.tasks?.close_room_on_done
+            ?? cfg.rooms?.defaults?.close_when_task_done
+            ?? false;
+          if (shouldClose) {
+            try {
+              await coworkFor(cfg).closeRoom(t.room_id);
+              closeRoomRecord(t.room_id);
+            } catch { /* room close is best-effort on task done */ }
+            await cleanupMembers({ roomId: t.room_id, taskId: id }).catch(() => {});
+          }
+        }
         if (opts.json) { console.log(JSON.stringify({ schema_version: 1, task: t }, null, 2)); return; }
         console.log(`Task ${t.task_id} · done`);
       } catch (e) { die(e); }
     });
 
-  taskCmd.command('cancel <id> <confirm-id>')
+  cOpt(taskCmd.command('cancel <id> <confirm-id>'))
     .description('cancel a task (requires ID twice for confirmation)')
     .option('--json', 'JSON output')
-    .action((id: string, confirmId: string, opts: { json?: boolean }) => {
+    .action(async (id: string, confirmId: string, opts: { configuration?: string; json?: boolean }) => {
       try {
         if (id !== confirmId)
           die(new Error('confirmation ID must match task ID'));
         const t = cancelTask(id);
+        if (t.room_id) {
+          const cfg = loadCfg(opts);
+          await cleanupMembers({
+            roomId: t.room_id,
+            taskId: id,
+            closeCoworkRoom: true,
+            cowork: coworkFor(cfg),
+          }).catch(() => {});
+        }
         if (opts.json) { console.log(JSON.stringify({ schema_version: 1, task: t }, null, 2)); return; }
         console.log(`Task ${t.task_id} · cancelled`);
       } catch (e) { die(e); }
     });
 
-  taskCmd.command('recover <id>')
+  cOpt(taskCmd.command('recover <id>'))
     .description('attempt to recover a stuck task')
     .option('--json', 'JSON output')
-    .action((id: string, opts: { json?: boolean }) => {
+    .action(async (id: string, opts: { configuration?: string; json?: boolean }) => {
       try {
+        const cfg = loadCfg(opts);
         const t = getTask(id);
         const room = t.room_id ? getRoomRecord(t.room_id) : undefined;
         const result = {
@@ -426,6 +467,31 @@ export function registerTaskCommands(parent: Command, cOpt: (cmd: Command) => Co
             result.recovery_actions.push('Owner CID mismatch — verify rooms.owner.expected_cid matches Messenger identity');
           if (room.provisioning_detail === 'member_failed')
             result.recovery_actions.push(`Member creation failed at saga step ${room.saga.step_index} — inspect and retry`);
+
+          const resumable: import('./types.js').SagaPhase[] =
+            ['create_members', 'join_role_groups', 'wait_seats', 'launch_work', 'activate'];
+          if (resumable.includes(room.saga.phase)) {
+            const template = t.template ? resolveRoomTemplate(cfg, t.template.name) : undefined;
+            if (template) {
+              try {
+                await provisionMembers({
+                  cfg,
+                  cowork: coworkFor(cfg),
+                  roomId: room.room_id,
+                  taskId: t.task_id,
+                  template,
+                  binPath: getBinPath(),
+                  brief: t.brief,
+                  goal: t.title,
+                });
+                result.recovery_actions.push('Provisioning resumed successfully');
+              } catch (error) {
+                result.recovery_actions.push(
+                  `Resume failed: ${error instanceof Error ? error.message : String(error)}`,
+                );
+              }
+            }
+          }
         }
         if (opts.json) {
           console.log(JSON.stringify({ schema_version: 1, ...result }, null, 2));
@@ -542,6 +608,24 @@ export function registerRoomCommands(parent: Command, cOpt: (cmd: Command) => Co
       } catch (e) { die(e); }
     });
 
+  cOpt(roomCmd.command('open <id>'))
+    .description('open room in Cowork local console')
+    .option('--json', 'JSON output')
+    .action(async (id: string, opts: { configuration?: string; json?: boolean }) => {
+      try {
+        const cfg = loadCfg(opts);
+        const room = await coworkFor(cfg).getRoom(id);
+        if (!room) die(new Error(`room not found: ${id}`));
+        const url = `http://localhost:4460/room/${id}`;
+        if (opts.json) {
+          console.log(JSON.stringify({ schema_version: 1, room_id: id, url, room_name: room.room_name }, null, 2));
+          return;
+        }
+        console.log(`Room ${id} — ${room.room_name}`);
+        console.log(`Local console: ${url}`);
+      } catch (e) { die(e); }
+    });
+
   cOpt(roomCmd.command('members <id>'))
     .description('show room members')
     .option('--json', 'JSON output')
@@ -620,6 +704,32 @@ export function registerRoomCommands(parent: Command, cOpt: (cmd: Command) => Co
           actions.push('Check ours-cowork service status');
         if (r?.provisioning_detail === 'waiting_owner_invite')
           actions.push('Rotate rooms.owner.public_invite in config, then re-run recover');
+
+        if (r && r.state === 'provisioning') {
+          const resumable: import('./types.js').SagaPhase[] =
+            ['create_members', 'join_role_groups', 'wait_seats', 'launch_work', 'activate'];
+          if (resumable.includes(r.saga.phase) && r.template_snapshot) {
+            try {
+              const template = resolveRoomTemplate(cfg, r.template_snapshot.name);
+              if (template) {
+                await provisionMembers({
+                  cfg,
+                  cowork: adapter,
+                  roomId: r.room_id,
+                  taskId: r.task_id,
+                  template,
+                  binPath: getBinPath(),
+                  goal: r.room_name,
+                });
+                r = getRoomRecord(id);
+                actions.push('Provisioning resumed successfully');
+              }
+            } catch (error) {
+              actions.push(`Resume failed: ${error instanceof Error ? error.message : String(error)}`);
+            }
+          }
+        }
+
         if (opts.json) {
           console.log(JSON.stringify({ schema_version: 1, room: cowork, orchestration: r ?? null, recovery_actions: actions }, null, 2));
           return;
