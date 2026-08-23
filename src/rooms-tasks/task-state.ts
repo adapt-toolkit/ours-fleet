@@ -59,6 +59,7 @@ export interface CreateTaskInput {
   origin: TaskOrigin;
   idempotency_key?: string;
   start?: boolean;
+  no_room?: boolean;
   room_id?: string;
 }
 
@@ -75,6 +76,7 @@ export function createTask(input: CreateTaskInput): TaskRecord {
     brief_file: input.brief_file,
     state,
     template: input.template,
+    no_room: input.no_room || undefined,
     room_id: input.room_id,
     member_roles: [],
     origin: input.origin,

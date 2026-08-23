@@ -803,6 +803,133 @@ describe('doctor install provenance', () => {
   });
 });
 
+describe('doctor rooms-tasks checks (§5.3)', () => {
+  const HEALTHY_HOST = {
+    'tmux -V': { stdout: 'tmux 3.6', stderr: '', code: 0 },
+    'ours version': { stdout: JSON.stringify({ name: '@ours.network/cli', version: '1.0.1' }), stderr: '', code: 0 },
+    'ours daemon': { stdout: JSON.stringify({ state: 'running' }), stderr: '', code: 0 },
+    'loginctl show-user': { stdout: 'Linger=yes', stderr: '', code: 0 },
+  };
+  const CID_64 = 'a'.repeat(64);
+  const run = (opts: Parameters<typeof doctor>[0] = {}) =>
+    doctor(opts, execWith(HEALTHY_HOST), 'linux', stubFetch());
+  const writeCfg = (yaml: string) => writeFileSync(join(dir, 'fleet.yaml'), yaml);
+
+  const ROOMS_YAML = (cid = CID_64, extra = '') =>
+    `roles:\n  Developer:\n    harness: fake\n` +
+    `rooms:\n  provider: cowork\n  owner:\n    expected_cid: ${cid}\n${extra}`;
+
+  it('runs owner CID shape check on valid config', async () => {
+    registerAdapter(fakeAdapter);
+    writeCfg(ROOMS_YAML());
+    const rep = await run();
+    const cid = rep.checks.find(c => c.name === 'rooms: owner CID')!;
+    expect(cid).toBeTruthy();
+    expect(cid.ok).toBe(true);
+    expect(cid.detail).toContain('valid 64-hex CID');
+  });
+
+  it('checks invite presence (not configured)', async () => {
+    registerAdapter(fakeAdapter);
+    writeCfg(ROOMS_YAML());
+    const rep = await run();
+    const inv = rep.checks.find(c => c.name === 'rooms: owner invite')!;
+    expect(inv).toBeTruthy();
+    expect(inv.ok).toBe(false);
+    expect(inv.detail).toContain('not configured');
+    expect(inv.detail).not.toContain('SECRET');
+  });
+
+  it('checks invite presence when configured (shows fingerprint only)', async () => {
+    registerAdapter(fakeAdapter);
+    writeCfg(ROOMS_YAML(CID_64, '    public_invite: "ours://secret-invite-value"\n'));
+    const rep = await run();
+    const inv = rep.checks.find(c => c.name === 'rooms: owner invite')!;
+    expect(inv.ok).toBe(true);
+    expect(inv.detail).toContain('fingerprint:');
+    expect(inv.detail).not.toContain('secret-invite-value');
+  });
+
+  it('cowork check is emitted when rooms config is present', async () => {
+    registerAdapter(fakeAdapter);
+    writeCfg(ROOMS_YAML());
+    const rep = await run();
+    const cw = rep.checks.find(c => c.name === 'cowork')!;
+    expect(cw).toBeTruthy();
+    expect(cw.detail).toMatch(/management socket/);
+  });
+
+  it('warns on template role_ref referencing unknown role', async () => {
+    registerAdapter(fakeAdapter);
+    writeCfg(ROOMS_YAML() + `room_templates:\n  my-team:\n    version: 1\n    description: test\n    members:\n      - slot: dev\n        role: Dev\n        count: 1\n        role_ref: NonExistentRole\n`);
+    const rep = await run();
+    const tpl = rep.checks.find(c => c.name?.startsWith('template:') && c.detail?.includes('NonExistentRole'))!;
+    expect(tpl).toBeTruthy();
+    expect(tpl.detail).toContain('not found in configured roles');
+  });
+
+  it('validates default template when configured', async () => {
+    registerAdapter(fakeAdapter);
+    writeCfg(ROOMS_YAML(CID_64, '  defaults:\n    template: nonexistent-template\n'));
+    const rep = await run();
+    const dt = rep.checks.find(c => c.name === 'rooms: default template')!;
+    expect(dt).toBeTruthy();
+    expect(dt.ok).toBe(false);
+    expect(dt.detail).toContain('not found');
+  });
+
+  it('passes default template when it resolves to a builtin', async () => {
+    registerAdapter(fakeAdapter);
+    writeCfg(ROOMS_YAML(CID_64, '  defaults:\n    template: development-team\n'));
+    const rep = await run();
+    const dt = rep.checks.find(c => c.name === 'rooms: default template')!;
+    expect(dt.ok).toBe(true);
+    expect(dt.detail).toContain('development-team@1');
+  });
+
+  it('warns on stale task-room cross-references', async () => {
+    registerAdapter(fakeAdapter);
+    writeCfg(ROOMS_YAML());
+    const { createTask } = await import('../src/rooms-tasks/task-state.js');
+    createTask({
+      title: 'orphaned', origin: { type: 'cli' },
+      room_id: 'nonexistent-room-id',
+    });
+    const rep = await run();
+    const stale = rep.checks.find(c => c.name === 'rooms: stale tasks');
+    expect(stale).toBeTruthy();
+    expect(stale!.detail).toContain('reference missing rooms');
+  });
+
+  it('warns when cowork config path does not exist', async () => {
+    registerAdapter(fakeAdapter);
+    writeCfg(ROOMS_YAML(CID_64, '  cowork:\n    config: /nonexistent/cowork-config.json\n'));
+    const rep = await run();
+    const cfg = rep.checks.find(c => c.name === 'rooms: cowork config')!;
+    expect(cfg).toBeTruthy();
+    expect(cfg.ok).toBe(false);
+    expect(cfg.detail).toContain('not found');
+  });
+
+  it('emits capability check when rooms config is present', async () => {
+    registerAdapter(fakeAdapter);
+    writeCfg(ROOMS_YAML());
+    const rep = await run();
+    const cap = rep.checks.find(c => c.name === 'rooms: capability')!;
+    expect(cap).toBeTruthy();
+    // Cowork may or may not be running; we just verify the check is emitted
+    expect(cap.detail).toBeTruthy();
+  });
+
+  it('skips rooms checks entirely when no rooms config is present', async () => {
+    writeCfg('roles:\n  A:\n    harness: fake\n');
+    registerAdapter(fakeAdapter);
+    const rep = await run();
+    expect(rep.checks.find(c => c.name === 'rooms: owner CID')).toBeUndefined();
+    expect(rep.checks.find(c => c.name === 'cowork')).toBeUndefined();
+  });
+});
+
 describe('doctor install scanning is not ambient', () => {
   it('ignores the host PATH so an unrelated install cannot change the report', async () => {
     const prefixes = mkdtempSync(join(tmpdir(), 'ours-fleet-doc-amb-'));

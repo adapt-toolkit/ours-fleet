@@ -139,6 +139,134 @@ export async function doctor(
     detail: `warning: ${diagnostic.message}`,
   });
 
+  // ── Rooms/tasks checks (§5.3) ────────────────────────────────────────
+  if (loaded.ok && loaded.rooms) {
+    const rooms = loaded.rooms;
+
+    // Cowork socket reachability
+    const coworkConfig = rooms.cowork?.config;
+    try {
+      const { createCoworkAdapter } = await import('./rooms-tasks/cowork-adapter.js');
+      const adapter = createCoworkAdapter({ configPath: coworkConfig });
+      const reachable = await adapter.available();
+      checks.push({
+        name: 'cowork', ok: reachable,
+        detail: reachable
+          ? 'management socket reachable'
+          : `management socket unreachable${coworkConfig ? ` (config: ${coworkConfig})` : ''}`,
+      });
+    } catch (e) {
+      checks.push({
+        name: 'cowork', ok: false,
+        detail: `management socket error${coworkConfig ? ` (config: ${coworkConfig})` : ''}: ${(e as Error)?.message ?? e}`,
+      });
+    }
+
+    // Owner CID shape
+    const cidOk = /^[0-9a-fA-F]{64}$/.test(rooms.owner.expected_cid);
+    checks.push({
+      name: 'rooms: owner CID', ok: cidOk,
+      detail: cidOk ? 'valid 64-hex CID' : `invalid CID shape: ${rooms.owner.expected_cid.slice(0, 16)}...`,
+    });
+
+    // Invite presence (never content)
+    checks.push({
+      name: 'rooms: owner invite',
+      ok: !!loaded.ownerInviteFingerprint,
+      detail: loaded.ownerInviteFingerprint
+        ? `present (fingerprint: ${loaded.ownerInviteFingerprint.slice(0, 12)}...)`
+        : 'not configured — room owner attachment will use waiting_owner_invite',
+    });
+
+    // Template validity and referenced role validity
+    const { listTemplates, resolveTemplate } = await import('./rooms-tasks/templates.js');
+    const customs = loaded.roomTemplates ?? {};
+    const templates = listTemplates(customs);
+    const roleNames = new Set(roles.map(r => r.name));
+    for (const t of templates) {
+      const badRefs = t.members
+        .filter(m => m.role_ref && !roleNames.has(m.role_ref))
+        .map(m => m.role_ref);
+      if (badRefs.length) {
+        checks.push({
+          name: `template: ${t.name}@${t.version}`,
+          ok: true,
+          detail: `warning: role_ref(s) ${badRefs.join(', ')} not found in configured roles`,
+        });
+      }
+    }
+
+    // Default template validity
+    const defaultTemplate = loaded.rooms.defaults?.template
+      ?? loaded.tasks?.default_room_template;
+    if (defaultTemplate) {
+      const resolved = resolveTemplate(defaultTemplate, customs);
+      checks.push({
+        name: 'rooms: default template',
+        ok: !!resolved,
+        detail: resolved
+          ? `${resolved.name}@${resolved.version}`
+          : `template '${defaultTemplate}' not found`,
+      });
+    }
+
+    // Shared-daemon selection coherence
+    if (rooms.cowork?.config) {
+      const { existsSync: exists } = await import('node:fs');
+      const configOk = exists(rooms.cowork.config);
+      checks.push({
+        name: 'rooms: cowork config', ok: configOk,
+        detail: configOk
+          ? `cowork config at ${rooms.cowork.config}`
+          : `cowork config not found: ${rooms.cowork.config}`,
+      });
+    }
+
+    // Hard prerelease capability check
+    try {
+      const { createCoworkAdapter } = await import('./rooms-tasks/cowork-adapter.js');
+      const adapter = createCoworkAdapter({ configPath: coworkConfig });
+      const roomList = await adapter.listRooms();
+      checks.push({
+        name: 'rooms: capability', ok: true,
+        detail: `cowork room management operational (${roomList.length} room(s))`,
+      });
+    } catch (e) {
+      const msg = (e as Error)?.message ?? String(e);
+      const isProto = msg.includes('protocol') || msg.includes('invalid');
+      checks.push({
+        name: 'rooms: capability', ok: false,
+        detail: isProto
+          ? `cowork does not support room management protocol — upgrade ours-cowork to prerelease`
+          : `room management check failed: ${msg}`,
+      });
+    }
+
+    // Stale task/room warnings
+    try {
+      const { listTasks } = await import('./rooms-tasks/task-state.js');
+      const { listRoomRecords } = await import('./rooms-tasks/room-state.js');
+      const tasks = listTasks();
+      const roomRecords = listRoomRecords();
+      const roomIds = new Set(roomRecords.map(r => r.room_id));
+      const taskIds = new Set(tasks.map(t => t.task_id));
+
+      const orphanedTasks = tasks.filter(t => t.room_id && !roomIds.has(t.room_id));
+      const orphanedRooms = roomRecords.filter(r => r.task_id && !taskIds.has(r.task_id));
+
+      if (orphanedTasks.length)
+        checks.push({
+          name: 'rooms: stale tasks', ok: true,
+          detail: `warning: ${orphanedTasks.length} task(s) reference missing rooms: ${orphanedTasks.map(t => t.task_id).join(', ')}`,
+        });
+      if (orphanedRooms.length)
+        checks.push({
+          name: 'rooms: stale rooms', ok: true,
+          detail: `warning: ${orphanedRooms.length} room(s) reference missing tasks: ${orphanedRooms.map(r => r.room_id).join(', ')}`,
+        });
+    } catch { /* state dir may not exist yet */ }
+  }
+
   if (roles.length === 0 || roles.some(role => (role.session ?? 'tmux') === 'tmux')) {
     const tmux = await exec('tmux', ['-V']);
     checks.push({
@@ -445,13 +573,23 @@ export async function doctor(
  * clean bill of health for a configuration `ours-fleet config` refuses outright.
  */
 type ConfigLoad =
-  | { ok: true; roles: ResolvedRole[]; files: string[]; diagnostics: ConfigDiagnostic[] }
+  | {
+      ok: true; roles: ResolvedRole[]; files: string[]; diagnostics: ConfigDiagnostic[];
+      rooms?: import('./rooms-tasks/types.js').RoomsConfig;
+      roomTemplates?: import('./rooms-tasks/types.js').RoomTemplatesConfig;
+      tasks?: import('./rooms-tasks/types.js').TasksConfig;
+      ownerInviteFingerprint?: string;
+    }
   | { ok: false; error: string };
 
 function loadConfigResult(configPath?: string, yamlMode?: YamlMode): ConfigLoad {
   try {
     const cfg = loadConfig(configPath, { yamlMode });
-    return { ok: true, roles: cfg.roles, files: cfg.files, diagnostics: cfg.diagnostics };
+    return {
+      ok: true, roles: cfg.roles, files: cfg.files, diagnostics: cfg.diagnostics,
+      rooms: cfg.rooms, roomTemplates: cfg.roomTemplates, tasks: cfg.tasks,
+      ownerInviteFingerprint: cfg.ownerInviteFingerprint,
+    };
   } catch (e) {
     return { ok: false, error: e instanceof Error ? e.message : String(e) };
   }
