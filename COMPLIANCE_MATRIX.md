@@ -17,25 +17,25 @@ Ownership boundary: Fleet owns task lifecycle, template resolution, agent roles,
 | §6 (line 220) | Split config: rooms section with unknown-key rejection | Implemented + Tested | `src/rooms-tasks/config.ts:66` / `test/rooms-tasks.test.ts:613,636` | rejectUnknown() on all sections |
 | §6 (line 222) | Split config: tasks section | Implemented + Tested | `src/rooms-tasks/config.ts:66`, `types.ts:196-201` / `test/rooms-tasks.test.ts:675` | TASKS_KEYS enforced |
 | §6 (line 224) | Split config: room_templates section | Implemented + Tested | `src/rooms-tasks/config.ts:66`, `types.ts:203` / `test/rooms-tasks.test.ts:745` | TEMPLATE_KEYS enforced |
-| §7.1 (line 260) | TaskRecord: task_id, title, state, origin, created_at, idempotency_key | Implemented + Tested | `src/rooms-tasks/types.ts:51-69` / `test/rooms-tasks.test.ts:145+` | All required fields present |
+| §7.1 (line 260) | TaskRecord: task_id, title, state, origin, created_at, idempotency_key | Implemented + Tested | `src/rooms-tasks/types.ts:51-69` / `test/rooms-tasks.test.ts:157+` | All required fields present |
 | §7.1 (line 264) | TaskRecord: brief, brief_file | Implemented + Tested | `src/rooms-tasks/types.ts:54-55`, `task-state.ts:56-57,75-76` / `test/owner-channel-commands.test.ts:507` | Multi-line brief supported |
 | §7.1 (line 266) | TaskRecord: template (TaskTemplateRef) | Implemented + Tested | `src/rooms-tasks/types.ts:58`, `task-state.ts:58,78` / `test/rooms-tasks.test.ts:411` | name@version + content_hash |
 | §7.1 (line 268) | TaskRecord: no_room flag | Implemented + Tested | `src/rooms-tasks/types.ts:59`, `task-state.ts:62,79` / `test/owner-channel-commands.test.ts:495,519` | Skips room provisioning |
 | §7.1 (line 270) | TaskRecord: room_id, room_identity_cid | Implemented | `src/rooms-tasks/types.ts:60-61`, `task-state.ts:190-200` | Set post-provisioning |
 | §7.1 (line 272) | TaskRecord: member_roles | Implemented | `src/rooms-tasks/types.ts:62`, `task-state.ts:202-207` | TaskMemberRole[] |
-| §7.1 (line 274) | TaskRecord: blocked, outcome, timestamps | Implemented + Tested | `src/rooms-tasks/types.ts:57,68,65-67`, `task-state.ts:131-145` / `test/rooms-tasks.test.ts:250+` | block/unblock tested |
+| §7.1 (line 274) | TaskRecord: blocked, outcome, timestamps | Implemented + Tested | `src/rooms-tasks/types.ts:57,68,65-67`, `task-state.ts:131-145` / `test/rooms-tasks.test.ts:298+` | block/unblock tested |
 | §7.2 (line 280) | Task lifecycle: backlog → provisioning → active → review → done | Implemented + Tested | `src/rooms-tasks/task-state.ts:37-45` / `test/rooms-tasks.test.ts:210+` | VALID_TRANSITIONS enforced |
-| §7.2 (line 282) | Task lifecycle: cancelled from backlog/provisioning/active/review | Implemented + Tested | `src/rooms-tasks/task-state.ts:38-41`, `types.ts:21` / `test/rooms-tasks.test.ts:230+` | TASK_CANCELLABLE_STATES |
-| §7.2 (line 284) | Task lifecycle: failed from provisioning/active/review | Implemented + Tested | `src/rooms-tasks/task-state.ts:39-41` / `test/rooms-tasks.test.ts:240+` | With error message |
+| §7.2 (line 282) | Task lifecycle: cancelled from backlog/provisioning/active/review | Implemented + Tested | `src/rooms-tasks/task-state.ts:38-41`, `types.ts:21` / `test/rooms-tasks.test.ts:247+` | TASK_CANCELLABLE_STATES |
+| §7.2 (line 284) | Task lifecycle: failed from provisioning/active/review | Implemented + Tested | `src/rooms-tasks/task-state.ts:39-41` / `test/rooms-tasks.test.ts:263+` | With error message |
 | §7.2 (line 286) | Task lifecycle: start=false → backlog | Implemented + Tested | `src/rooms-tasks/task-state.ts:71` / `test/owner-channel-commands.test.ts:519` | --backlog flag |
 | §8 (line 300) | RoomOrchestrationRecord: room_id, room_name, state, saga, created_at | Implemented + Tested | `src/rooms-tasks/types.ts:110-126`, `room-state.ts:36-53` / `test/rooms-tasks.test.ts:411+` | Full saga cursor |
 | §8 (line 302) | RoomOrchestrationRecord: goal field | Implemented + Tested | `src/rooms-tasks/types.ts:114`, `room-state.ts:30,43` / `test/owner-channel-commands.test.ts:679` | Multi-line goal supported |
 | §8 (line 304) | RoomOrchestrationRecord: template_snapshot | Implemented + Tested | `src/rooms-tasks/types.ts:116`, `room-state.ts:33,46` / `test/owner-channel-commands.test.ts:657` | Frozen at creation time |
 | §8 (line 306) | Room saga phases | Implemented | `src/rooms-tasks/types.ts:76-85`, `room-state.ts:78-89` | persist_intent → … → completed/failed |
 | §8 (line 308) | Room provisioning_detail | Implemented | `src/rooms-tasks/types.ts:94-101,118` | waiting_cowork, owner_cid_mismatch, etc. |
-| §8 (line 310) | Room member seats | Implemented + Tested | `src/rooms-tasks/types.ts:102-108`, `room-state.ts:128-136` / `test/rooms-tasks.test.ts:485` | pending/active/removed |
+| §8 (line 310) | Room member seats | Implemented + Tested | `src/rooms-tasks/types.ts:102-108`, `room-state.ts:128-136` / `test/rooms-tasks.test.ts:492` | pending/active/removed |
 | §8 (line 312) | Room owner seat + invite fingerprint | Implemented + Tested | `src/rooms-tasks/room-state.ts:116-126` / `test/rooms-tasks.test.ts:485` | SHA-256 fingerprint only |
-| §8 (line 314) | Room close | Implemented + Tested | `src/rooms-tasks/room-state.ts:148-155` / `test/rooms-tasks.test.ts:470+` | Idempotent close |
+| §8 (line 314) | Room close | Implemented + Tested | `src/rooms-tasks/room-state.ts:148-155` / `test/rooms-tasks.test.ts:515+` | Idempotent close |
 | §9.1 (line 339) | CLI: `fleet template show <name>` | Implemented | `src/rooms-tasks/cli.ts:128+` | --json supported |
 | §9.1 (line 341) | CLI: `fleet template list` | Implemented | `src/rooms-tasks/cli.ts:128+` | Merged builtin + custom |
 | §9.2 (line 345) | CLI: `fleet task create` | Implemented + Tested | `src/rooms-tasks/cli.ts:201+` / `test/owner-channel-commands.test.ts:495+` | --brief, --brief-file, --template |
@@ -62,9 +62,9 @@ Ownership boundary: Fleet owns task lifecycle, template resolution, agent roles,
 | §12 (line 473) | Security: invite redacted in validated config | Implemented + Tested | `src/rooms-tasks/config.ts:102` / `test/rooms-tasks.test.ts:578` | `public_invite: '[REDACTED]'` |
 | §12 (line 475) | Security: owner CID pinning (exact 64-hex) | Implemented + Tested | `src/rooms-tasks/config.ts:91-94` / `test/rooms-tasks.test.ts:558-575` | Lowercase-normalized, rejects short/invalid |
 | §12 (line 477) | Security: unknown config keys rejected | Implemented + Tested | `src/rooms-tasks/config.ts:36` / `test/rooms-tasks.test.ts:613,636,675,745` | rejectUnknown() on all sections |
-| Templates | Built-in templates: development-team, research-decision | Implemented + Tested | `src/rooms-tasks/templates.ts:41` / `test/rooms-tasks.test.ts:60+` | name@version resolution |
-| Templates | Template snapshot with content_hash | Implemented + Tested | `src/rooms-tasks/templates.ts:51` / `test/rooms-tasks.test.ts:411` | Frozen at room creation |
-| Templates | Custom template override of builtins | Implemented + Tested | `src/rooms-tasks/templates.ts:55,77` / `test/rooms-tasks.test.ts:90+` | override_builtin flag |
+| Templates | Built-in templates: development-team, research-decision | Implemented + Tested | `src/rooms-tasks/templates.ts:41` / `test/rooms-tasks.test.ts:47+` | name@version resolution |
+| Templates | Template snapshot with content_hash | Implemented + Tested | `src/rooms-tasks/templates.ts:51` / `test/rooms-tasks.test.ts:144` | Frozen at room creation |
+| Templates | Custom template override of builtins | Implemented + Tested | `src/rooms-tasks/templates.ts:55,77` / `test/rooms-tasks.test.ts:68+` | override_builtin flag |
 
 ## Excluded (not ours-fleet-owned)
 
