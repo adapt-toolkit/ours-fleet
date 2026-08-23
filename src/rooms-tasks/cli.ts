@@ -17,6 +17,7 @@ import {
   setSagaError, activateRoom, updateMemberSeats, RoomStateError,
 } from './room-state.js';
 import { createCoworkAdapter, CoworkProtocolError, CoworkUnavailableError } from './cowork-adapter.js';
+import { TASK_TERMINAL_STATES } from './types.js';
 import type { RoomOrchestrationRecord, TaskOrigin, TemplateDefinition, TemplateSnapshot } from './types.js';
 
 function die(e: unknown): never {
@@ -505,6 +506,124 @@ export function registerTaskCommands(parent: Command, cOpt: (cmd: Command) => Co
         } else {
           console.log('No automated recovery actions available.');
         }
+      } catch (e) { die(e); }
+    });
+
+  cOpt(taskCmd.command('work <id>'))
+    .description('ensure a task has a room and agents running')
+    .option('--template <name>', 'room template')
+    .option('--json', 'JSON output')
+    .action(async (id: string, opts: { configuration?: string; template?: string; json?: boolean }) => {
+      try {
+        const cfg = loadCfg(opts);
+        let t = getTask(id);
+
+        if (TASK_TERMINAL_STATES.includes(t.state))
+          die(new Error(`task ${id} is in terminal state '${t.state}'`));
+
+        if (t.state === 'active' && t.room_id) {
+          if (opts.json) {
+            console.log(JSON.stringify({ schema_version: 1, task: t, status: 'already_active' }, null, 2));
+            return;
+          }
+          console.log('Task already has an active room');
+          return;
+        }
+
+        if (t.state === 'backlog') {
+          t = startTask(id);
+        }
+
+        const templateName = opts.template
+          ?? t.template?.name
+          ?? cfg.tasks?.default_room_template
+          ?? cfg.rooms?.defaults?.template
+          ?? 'single';
+
+        let templateRef = t.template;
+        if (!templateRef || (opts.template && opts.template !== t.template?.name)) {
+          const resolved = resolveTemplate(templateName, allTemplates(cfg));
+          if (!resolved) die(new Error(`template not found: ${templateName}`));
+          const snap = snapshotTemplate(resolved);
+          templateRef = { name: snap.name, version: snap.version, content_hash: snap.content_hash };
+        }
+
+        if (!t.room_id) {
+          const template = resolveRoomTemplate(cfg, templateRef.name);
+          try {
+            await provisionRoom(cfg, {
+              name: t.title,
+              goal: t.title,
+              brief: t.brief,
+              template,
+              taskId: t.task_id,
+              onCreated: room => {
+                t = updateTaskRoom(t.task_id, room.room_id, room.room_identity_cid!);
+              },
+            });
+            t = getTask(t.task_id);
+          } catch (error) {
+            if (error instanceof CoworkUnavailableError) {
+              blockTask(t.task_id, 'Cowork management socket is unavailable');
+            }
+            throw error;
+          }
+        }
+
+        if (opts.json) {
+          console.log(JSON.stringify({ schema_version: 1, task: t }, null, 2));
+          return;
+        }
+        console.log(`Task ${t.task_id} · ${t.state}`);
+        if (templateRef) console.log(`Template: ${templateRef.name}@${templateRef.version}`);
+        if (t.room_id) console.log(`Room: ${t.room_id}`);
+        if (t.member_roles.length) {
+          console.log('Agents:');
+          for (const m of t.member_roles)
+            console.log(`  ${m.name} (${m.cowork_role})`);
+        }
+      } catch (e) { die(e); }
+    });
+
+  cOpt(taskCmd.command('finish <id>'))
+    .description('finish a task: transition to done and close its room')
+    .option('--summary <text>', 'completion summary')
+    .option('--summary-file <path>', 'completion summary from file')
+    .option('--json', 'JSON output')
+    .action(async (id: string, opts: { configuration?: string; summary?: string; summaryFile?: string; json?: boolean }) => {
+      try {
+        let summary = opts.summary;
+        if (opts.summaryFile) summary = readFileSync(opts.summaryFile, 'utf8');
+        const outcome = summary ? { summary } : undefined;
+
+        let t = getTask(id);
+
+        if (TASK_TERMINAL_STATES.includes(t.state))
+          die(new Error(`task ${id} is already in terminal state '${t.state}'`));
+
+        if (t.state === 'active') {
+          reviewTask(id);
+        }
+
+        t = completeTask(id, outcome);
+
+        if (t.room_id) {
+          const cfg = loadCfg(opts);
+          try {
+            await cleanupMembers({
+              roomId: t.room_id,
+              taskId: id,
+              closeCoworkRoom: true,
+              cowork: coworkFor(cfg),
+            });
+          } catch { /* room cleanup is best-effort */ }
+        }
+
+        if (opts.json) {
+          console.log(JSON.stringify({ schema_version: 1, task: t }, null, 2));
+          return;
+        }
+        console.log(`Task ${t.task_id} · done`);
       } catch (e) { die(e); }
     });
 }
