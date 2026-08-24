@@ -51,9 +51,12 @@ vi.mock('../src/rooms-tasks/external-worker.js', () => ({
 // ── Imports (resolved after mock interception) ──────────────────────────
 
 import { registerRoomCommands, registerTaskCommands } from '../src/rooms-tasks/cli.js';
-import { createTask, getTask, activateTask, reviewTask, cancelTask } from '../src/rooms-tasks/task-state.js';
 import {
-  activateRoom, getRoomRecord, advanceSaga, updateMemberSeats, updateRoomRoleBriefing,
+  createTask, getTask, activateTask, reviewTask, completeTask, cancelTask, updateTaskRoom,
+} from '../src/rooms-tasks/task-state.js';
+import {
+  createRoomRecord, activateRoom, getRoomRecord, advanceSaga, updateMemberSeats,
+  updateRoomRoleBriefing,
 } from '../src/rooms-tasks/room-state.js';
 import { CoworkUnavailableError } from '../src/rooms-tasks/cowork-adapter.js';
 
@@ -523,5 +526,43 @@ describe('task finish', () => {
     await run('finish', t.task_id, '--json');
     const payload = JSON.parse(out.join('\n'));
     expect(payload.task.state).toBe('done');
+  });
+});
+
+// ── task delete ──────────────────────────────────────────────────────────
+
+describe('task delete', () => {
+  function doneTask() {
+    const t = createTask({ title: 'Completed work', origin: { type: 'cli' } });
+    updateTaskRoom(t.task_id, ROOM_ID, 'c'.repeat(64));
+    createRoomRecord({ room_id: ROOM_ID, room_name: 'Archived room', task_id: t.task_id });
+    activateTask(t.task_id);
+    reviewTask(t.task_id);
+    return completeTask(t.task_id);
+  }
+
+  it('requires the exact task ID twice before looking up the task', async () => {
+    await expect(run('delete', 'missing-task', 'different-id')).rejects.toThrow(ExitError);
+    expect(out.join('\n')).toContain('confirmation ID must match task ID');
+  });
+
+  it('deletes a done task without closing a room', async () => {
+    const t = doneTask();
+    await run('delete', t.task_id, t.task_id);
+    expect(() => getTask(t.task_id)).toThrow(/not found/);
+    expect(out.join('\n')).toContain(`Task ${t.task_id} · deleted from backlog`);
+    expect(mocks.closeManagedRoom).not.toHaveBeenCalled();
+    expect(mocks.closeRoom).not.toHaveBeenCalled();
+    expect(getRoomRecord(ROOM_ID)).toMatchObject({ task_id: t.task_id });
+  });
+
+  it('reports repeat deletion as an idempotent already-absent result', async () => {
+    const t = doneTask();
+    await run('delete', t.task_id, t.task_id);
+    out = [];
+    await run('delete', t.task_id, t.task_id, '--json');
+    expect(JSON.parse(out.join('\n'))).toEqual({
+      schema_version: 1, task_id: t.task_id, deleted: false,
+    });
   });
 });

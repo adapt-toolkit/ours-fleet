@@ -443,6 +443,40 @@ describe('owner-channel task subcommands', () => {
     expect(ctx.replies).toEqual([`terminal:${t.task_id}:cancelled`]);
   });
 
+  it('/task delete requires the exact task ID twice', async () => {
+    const t = await createTestTask();
+    const ctx = context();
+    await dispatchOwnerCommand(`/task delete ${t.task_id} different-id`, ctx);
+    expect(ctx.replies).toHaveLength(1);
+    expect(ctx.replies[0]).toContain('destructive');
+  });
+
+  it('/task delete rejects trailing confirmation tokens', async () => {
+    const t = await createTestTask();
+    const ctx = context();
+    await dispatchOwnerCommand(`/task delete ${t.task_id} ${t.task_id} extra`, ctx);
+    expect(ctx.replies).toHaveLength(1);
+    expect(ctx.replies[0]).toContain('destructive');
+  });
+
+  it('/task delete removes a done task and reports a repeat as already absent', async () => {
+    const t = await createTestTask(true);
+    const { activateTask, reviewTask, completeTask, getTask } =
+      await import('../src/rooms-tasks/task-state.js');
+    activateTask(t.task_id);
+    reviewTask(t.task_id);
+    completeTask(t.task_id);
+
+    const first = context();
+    await dispatchOwnerCommand(`/task delete ${t.task_id} ${t.task_id}`, first);
+    expect(first.replies).toEqual([`🗑️ Task ${t.task_id} deleted from backlog`]);
+    expect(() => getTask(t.task_id)).toThrow(/not found/);
+
+    const retry = context();
+    await dispatchOwnerCommand(`/task delete ${t.task_id} ${t.task_id}`, retry);
+    expect(retry.replies).toEqual([`🗑️ Task ${t.task_id} already absent`]);
+  });
+
   it('/task recover reschedules an accepted pending terminal intent', async () => {
     const t = await createTestTask();
     const {

@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync } from 'node:fs';
+import { existsSync, mkdirSync, readdirSync, readFileSync, unlinkSync } from 'node:fs';
 import { join } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { replaceFileAtomically } from '../atomic-file.js';
@@ -19,7 +19,22 @@ function generateTaskId(): string {
   return `${ts}${rand}`;
 }
 
+const TASK_ID_PATTERN = /^[0-9a-z]{9}[0-9a-f]{8}$/;
+
 export class TaskStateError extends Error {}
+
+function assertCanonicalTaskId(id: string): void {
+  if (!TASK_ID_PATTERN.test(id)) {
+    throw new TaskStateError(
+      'invalid task ID: expected the canonical 17-character lowercase ID',
+    );
+  }
+}
+
+function isNotFoundError(error: unknown): boolean {
+  return error instanceof Error && 'code' in error
+    && (error as NodeJS.ErrnoException).code === 'ENOENT';
+}
 
 function readTask(id: string): TaskRecord {
   const p = taskPath(id);
@@ -320,7 +335,27 @@ export function updateTaskMembers(id: string, members: TaskMemberRole[]): TaskRe
   return t;
 }
 
-export function deleteTask(id: string): void {
+/** Remove a completed task from Fleet's backlog. Missing tasks are an idempotent no-op. */
+export function deleteTask(id: string): boolean {
+  assertCanonicalTaskId(id);
   const p = taskPath(id);
-  if (existsSync(p)) rmSync(p);
+  let task: TaskRecord;
+  try {
+    task = JSON.parse(readFileSync(p, 'utf8')) as TaskRecord;
+  } catch (error) {
+    if (isNotFoundError(error)) return false;
+    throw error;
+  }
+  if (task.state !== 'done') {
+    throw new TaskStateError(
+      `cannot delete a '${task.state}' task; only 'done' tasks can be deleted`,
+    );
+  }
+  try {
+    unlinkSync(p);
+  } catch (error) {
+    if (isNotFoundError(error)) return false;
+    throw error;
+  }
+  return true;
 }

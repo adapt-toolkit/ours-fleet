@@ -16,7 +16,7 @@ import {
 import {
   createTask, getTask, listTasks, startTask, activateTask,
   blockTask, unblockTask, reviewTask,
-  updateTaskRoom, updateTaskTemplate, updateTaskMembers, failTask, TaskStateError,
+  updateTaskRoom, updateTaskTemplate, updateTaskMembers, failTask, deleteTask, TaskStateError,
 } from './task-state.js';
 import {
   createRoomRecord, getRoomRecord, listRoomRecords,
@@ -563,6 +563,23 @@ export function registerTaskCommands(parent: Command, cOpt: (cmd: Command) => Co
           return;
         }
         console.log(`Task ${t.task_id} · cancelled`);
+      } catch (e) { die(e); }
+    });
+
+  cOpt(taskCmd.command('delete <id> <confirm-id>'))
+    .description('delete a done task from the backlog (requires ID twice for confirmation)')
+    .option('--json', 'JSON output')
+    .action((id: string, confirmId: string, opts: { json?: boolean }) => {
+      try {
+        if (id !== confirmId) die(new Error('confirmation ID must match task ID'));
+        const deleted = deleteTask(id);
+        if (opts.json) {
+          console.log(JSON.stringify({ schema_version: 1, task_id: id, deleted }, null, 2));
+          return;
+        }
+        console.log(deleted
+          ? `Task ${id} · deleted from backlog`
+          : `Task ${id} · already absent`);
       } catch (e) { die(e); }
     });
 
