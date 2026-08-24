@@ -241,6 +241,76 @@ export function archiveTempState(
   return paths.target;
 }
 
+function isArchiveForLaunch(path: string, role: string, launchId: string): boolean {
+  const supervisor = readTempSupervisor(path);
+  if (supervisor?.role !== role || supervisor.launchId !== launchId) return false;
+  try {
+    return readFileSync(join(path, TEMP_TERMINATION_FILE), 'utf8')
+      .split('\n')
+      .filter(Boolean)
+      .some(line => {
+        const record = JSON.parse(line) as Partial<TempTerminationRecord>;
+        return record.version === 1 && record.role === role && record.launchId === launchId;
+      });
+  } catch { return false; }
+}
+
+/** Resolve only an exact role+launch archive; names and timestamps are never proof. */
+export function tempArchiveForLaunch(role: string, launchId: string): string | undefined {
+  let entries: string[];
+  try {
+    entries = readdirSync(archiveRoot(), { withFileTypes: true })
+      .filter(entry => entry.isDirectory() && !entry.isSymbolicLink() && !entry.name.startsWith('.'))
+      .map(entry => join(archiveRoot(), entry.name));
+  } catch { return undefined; }
+  const matches = entries.filter(path => isArchiveForLaunch(path, role, launchId));
+  if (matches.length > 1) {
+    throw new Error(
+      `temporary role '${role}' launch ${launchId} has ${matches.length} recovery archives; refusing ambiguity`,
+    );
+  }
+  return matches[0];
+}
+
+/**
+ * Preserve a definitively stopped launch as recovery evidence, or prove that
+ * its supervisor already did so. Never creates a second archive.
+ */
+export async function secureStoppedTempArchive(
+  role: string, launchId: string, deps: TempLifecycleDeps = {},
+): Promise<string> {
+  const dir = join(tmpRoot(), role);
+  if (existsSync(dir)) {
+    const supervisor = readTempSupervisor(dir);
+    if (!supervisor || supervisor.role !== role || supervisor.launchId !== launchId) {
+      throw new Error(
+        `temporary role '${role}' no longer matches recorded launch ${launchId}; refusing to archive`,
+      );
+    }
+    const live = await tempSupervisorLiveness(dir, deps);
+    if (live !== 'stopped') {
+      throw new Error(
+        `temporary role '${role}' supervisor is ${live}; refusing to archive before proven stop`,
+      );
+    }
+    const archived = archiveTempState(
+      role, 'operator-stop', 'retired',
+      'room close proved the supervisor stopped; full role evidence preserved',
+    );
+    if (!archived || !isArchiveForLaunch(archived, role, launchId)) {
+      throw new Error(`temporary role '${role}' archive could not be verified for launch ${launchId}`);
+    }
+    return archived;
+  }
+  const archived = tempArchiveForLaunch(role, launchId);
+  if (!archived) {
+    throw new Error(
+      `temporary role '${role}' live state disappeared without an exact recovery archive for launch ${launchId}`,
+    );
+  }
+  return archived;
+}
+
 /** Finish bounded archive renames interrupted by process or host termination. */
 function recoverInterruptedArchives(now: Date): string[] {
   let names: string[];
@@ -290,11 +360,12 @@ function recoverInterruptedArchives(now: Date): string[] {
   return recovered;
 }
 
-interface TempLifecycleDeps {
+export interface TempLifecycleDeps {
   exec?: Exec;
   now?(): number;
   kill?(pid: number, signal: NodeJS.Signals | 0): void;
   log?(line: string): void;
+  sleep?(ms: number): Promise<void>;
 }
 
 async function detachedProcessLiveness(

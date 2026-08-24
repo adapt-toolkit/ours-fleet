@@ -5,6 +5,7 @@ import { stateRoot } from '../paths.js';
 import type {
   RoomOrchestrationRecord, RoomOrchestrationState, SagaCursor, SagaPhase,
   RoomMemberSeat, ProvisioningDetail,
+  MemberRetirementPhase, RoomClosePhase,
 } from './types.js';
 
 export const roomsDir = () => join(stateRoot(), 'rooms');
@@ -150,6 +151,119 @@ export function closeRoom(id: string): RoomOrchestrationRecord {
   if (r.state === 'closed') return r;
   r.state = 'closed';
   r.closed_at = new Date().toISOString();
+  r.close = {
+    phase: 'completed',
+    accepted_at: r.close?.accepted_at ?? r.closed_at,
+    ...(r.close?.first_failure ? { first_failure: r.close.first_failure } : {}),
+    ...(r.close?.first_recovery_hint
+      ? { first_recovery_hint: r.close.first_recovery_hint }
+      : {}),
+  };
+  writeRoom(r);
+  return r;
+}
+
+export function beginRoomClose(id: string): RoomOrchestrationRecord {
+  const r = readRoom(id);
+  if (r.state === 'closed') return r;
+  const acceptedAt = r.close?.accepted_at ?? new Date().toISOString();
+  r.state = 'closing';
+  r.close = {
+    phase: r.close?.phase ?? 'retire_members',
+    accepted_at: acceptedAt,
+    ...(r.close?.error ? { error: r.close.error } : {}),
+    ...(r.close?.error_at ? { error_at: r.close.error_at } : {}),
+    ...(r.close?.recovery_hint ? { recovery_hint: r.close.recovery_hint } : {}),
+    ...(r.close?.first_failure ? { first_failure: r.close.first_failure } : {}),
+    ...(r.close?.first_recovery_hint
+      ? { first_recovery_hint: r.close.first_recovery_hint }
+      : {}),
+  };
+  writeRoom(r);
+  return r;
+}
+
+const RETIREMENT_ORDER: readonly MemberRetirementPhase[] = [
+  'stop_requested', 'liveness_absent', 'archive_secured', 'identity_absent',
+];
+
+export function advanceMemberRetirement(
+  id: string,
+  roleName: string,
+  phase: MemberRetirementPhase,
+  launchId: string,
+  archivePath?: string,
+): RoomOrchestrationRecord {
+  const r = readRoom(id);
+  if (r.state !== 'closing') throw new RoomStateError(`room ${id} is not closing`);
+  const seat = r.member_seats.find(candidate => candidate.role_name === roleName);
+  if (!seat) throw new RoomStateError(`room ${id} has no recorded member ${roleName}`);
+  const previous = seat.retirement;
+  if (previous && previous.launch_id !== launchId) {
+    throw new RoomStateError(
+      `room ${id} member ${roleName} launch changed from ${previous.launch_id} to ${launchId}`,
+    );
+  }
+  const nextIndex = RETIREMENT_ORDER.indexOf(phase);
+  const previousIndex = previous ? RETIREMENT_ORDER.indexOf(previous.phase) : -1;
+  if (nextIndex < previousIndex) {
+    throw new RoomStateError(
+      `room ${id} member ${roleName} retirement cannot move backward to ${phase}`,
+    );
+  }
+  seat.retirement = {
+    phase,
+    launch_id: launchId,
+    updated_at: new Date().toISOString(),
+    ...(archivePath ?? previous?.archive_path
+      ? { archive_path: archivePath ?? previous?.archive_path }
+      : {}),
+  };
+  if (phase === 'identity_absent') seat.seat_state = 'removed';
+  writeRoom(r);
+  return r;
+}
+
+export function advanceRoomClose(id: string, phase: RoomClosePhase): RoomOrchestrationRecord {
+  const r = readRoom(id);
+  if (r.state === 'closed') return r;
+  if (r.state !== 'closing' || !r.close) throw new RoomStateError(`room ${id} is not closing`);
+  const order: readonly RoomClosePhase[] = ['retire_members', 'close_cowork', 'completed'];
+  if (order.indexOf(phase) < order.indexOf(r.close.phase)) {
+    throw new RoomStateError(`room ${id} close cannot move backward to ${phase}`);
+  }
+  const progressed = order.indexOf(phase) > order.indexOf(r.close.phase);
+  r.close = {
+    phase,
+    accepted_at: r.close.accepted_at,
+    ...(!progressed && r.close.error ? { error: r.close.error } : {}),
+    ...(!progressed && r.close.error_at ? { error_at: r.close.error_at } : {}),
+    ...(!progressed && r.close.recovery_hint
+      ? { recovery_hint: r.close.recovery_hint }
+      : {}),
+    ...(r.close.first_failure ? { first_failure: r.close.first_failure } : {}),
+    ...(r.close.first_recovery_hint
+      ? { first_recovery_hint: r.close.first_recovery_hint }
+      : {}),
+  };
+  writeRoom(r);
+  return r;
+}
+
+export function setRoomCloseError(
+  id: string, error: string, recoveryHint: string,
+): RoomOrchestrationRecord {
+  const r = readRoom(id);
+  if (r.state === 'closed') return r;
+  if (r.state !== 'closing' || !r.close) throw new RoomStateError(`room ${id} is not closing`);
+  r.close.first_failure ??= error;
+  r.close.first_recovery_hint ??= recoveryHint;
+  r.close.error = error;
+  const previousErrorAt = Date.parse(r.close.error_at ?? '');
+  r.close.error_at = new Date(Math.max(
+    Date.now(), Number.isFinite(previousErrorAt) ? previousErrorAt + 1 : 0,
+  )).toISOString();
+  r.close.recovery_hint = recoveryHint;
   writeRoom(r);
   return r;
 }

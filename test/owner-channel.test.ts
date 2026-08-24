@@ -8,6 +8,10 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import { OwnerChannel } from '../src/owner-channel/channel.js';
 import { ownerCommandHelp, type OwnerFleetOps } from '../src/owner-channel/commands.js';
+import { activateRoom, createRoomRecord, getRoomRecord } from '../src/rooms-tasks/room-state.js';
+import {
+  activateTask, createTask, getTask, reviewTask, startTask,
+} from '../src/rooms-tasks/task-state.js';
 import type {
   OursContactsView, OursInboundMessage, OursOps,
 } from '../src/owner-channel/ours-client.js';
@@ -643,6 +647,8 @@ describe('OwnerChannel deterministic command dispatch', () => {
   const fakeFleet = () => ({
     restart: vi.fn(async (_mode: 'keep' | 'fresh') => undefined),
     list: vi.fn(async () => 'Coordinator: acp\nScout: 1 windows (created ...)'),
+    closeRoom: vi.fn(async () => undefined),
+    settleTask: vi.fn(async () => undefined),
   });
 
   it('returns help for an unknown slash command instead of forwarding it', async () => {
@@ -751,6 +757,134 @@ describe('OwnerChannel deterministic command dispatch', () => {
     expect(stateWhenRestarted).toContain('wire-restart');
     const sent = String(client.calls.find(call => call.name === 'sendMessage')?.args?.text);
     expect(sent).toContain('/restart');
+  });
+
+  it('persists and acknowledges room-close acceptance before launching the external worker', async () => {
+    const fleet = fakeFleet();
+    const fleetHome = mkdtempSync(join(tmpdir(), 'ours-owner-room-close-'));
+    dirs.push(fleetHome);
+    const previousHome = process.env.OURS_FLEET_HOME;
+    process.env.OURS_FLEET_HOME = fleetHome;
+    const roomId = '01hzyk8m0000000000000000aa';
+    createRoomRecord({ room_id: roomId, room_name: 'Owner close' });
+    activateRoom(roomId);
+    const { channel, client, queuePrompt, dir } = setup(
+      [ownerMessage(591, 'wire-room-close', `/room close ${roomId} ${roomId}`)],
+      undefined,
+      { fleet },
+    );
+    let stateWhenSpawned = '';
+    let wireWhenSpawned = '';
+    let sendsWhenSpawned = 0;
+    fleet.closeRoom.mockImplementation(async () => {
+      stateWhenSpawned = getRoomRecord(roomId)?.state ?? '';
+      wireWhenSpawned = readFileSync(join(dir, '.owner-channel-state.json'), 'utf8');
+      sendsWhenSpawned = client.calls.filter(call => call.name === 'sendMessage').length;
+    });
+    try {
+      await channel.drain();
+    } finally {
+      if (previousHome === undefined) delete process.env.OURS_FLEET_HOME;
+      else process.env.OURS_FLEET_HOME = previousHome;
+    }
+    expect(queuePrompt).not.toHaveBeenCalled();
+    expect(fleet.closeRoom).toHaveBeenCalledWith(roomId);
+    expect(stateWhenSpawned).toBe('closing');
+    expect(wireWhenSpawned).toContain('wire-room-close');
+    expect(sendsWhenSpawned).toBeGreaterThan(0);
+    expect(String(client.calls.find(call => call.name === 'sendMessage')?.args?.text))
+      .toContain('accepted/pending');
+  });
+
+  it('persists task terminal intent and the wire before launching its external worker', async () => {
+    const fleet = fakeFleet();
+    const fleetHome = mkdtempSync(join(tmpdir(), 'ours-owner-task-settle-'));
+    dirs.push(fleetHome);
+    const previousHome = process.env.OURS_FLEET_HOME;
+    process.env.OURS_FLEET_HOME = fleetHome;
+    const task = createTask({
+      title: 'Owner terminal', origin: { type: 'owner_channel' }, start: false,
+      room_id: '01hzyk8m0000000000000000ac',
+    });
+    startTask(task.task_id);
+    activateTask(task.task_id);
+    reviewTask(task.task_id);
+    createRoomRecord({
+      room_id: task.room_id!, room_name: 'Owner task room', task_id: task.task_id,
+    });
+    activateRoom(task.room_id!);
+    const { channel, client, dir } = setup(
+      [ownerMessage(592, 'wire-task-settle', `/task done ${task.task_id} shipped`)],
+      undefined,
+      { fleet },
+    );
+    let intentWhenSpawned = '';
+    let wireWhenSpawned = '';
+    let sendsWhenSpawned = 0;
+    fleet.settleTask.mockImplementation(async () => {
+      intentWhenSpawned = getTask(task.task_id).terminal_intent?.status ?? '';
+      wireWhenSpawned = readFileSync(join(dir, '.owner-channel-state.json'), 'utf8');
+      sendsWhenSpawned = client.calls.filter(call => call.name === 'sendMessage').length;
+    });
+    let persistedTask!: ReturnType<typeof getTask>;
+    try {
+      await channel.drain();
+      persistedTask = getTask(task.task_id);
+    } finally {
+      if (previousHome === undefined) delete process.env.OURS_FLEET_HOME;
+      else process.env.OURS_FLEET_HOME = previousHome;
+    }
+    expect(intentWhenSpawned).toBe('pending');
+    expect(wireWhenSpawned).toContain('wire-task-settle');
+    expect(sendsWhenSpawned).toBeGreaterThan(0);
+    expect(fleet.settleTask).toHaveBeenCalledWith(task.task_id);
+    const texts = client.calls.filter(call => call.name === 'sendMessage')
+      .map(call => String(call.args?.text));
+    expect(texts.some(text => text.includes('accepted/pending'))).toBe(true);
+    expect(texts.some(text => text.includes('worker scheduled'))).toBe(false);
+    expect(persistedTask).toMatchObject({
+      state: 'review',
+      terminal_intent: { kind: 'done', outcome: { summary: 'shipped' }, status: 'pending' },
+    });
+  });
+
+  it('persists external task-settle launch failure without reporting terminal success', async () => {
+    const fleet = fakeFleet();
+    fleet.settleTask.mockRejectedValueOnce(new Error('systemd launch failed'));
+    const fleetHome = mkdtempSync(join(tmpdir(), 'ours-owner-task-settle-fail-'));
+    dirs.push(fleetHome);
+    const previousHome = process.env.OURS_FLEET_HOME;
+    process.env.OURS_FLEET_HOME = fleetHome;
+    const task = createTask({
+      title: 'Owner cancel', origin: { type: 'owner_channel' }, start: false,
+      room_id: '01hzyk8m0000000000000000ad',
+    });
+    createRoomRecord({ room_id: task.room_id!, room_name: 'Cancel room', task_id: task.task_id });
+    activateRoom(task.room_id!);
+    const { channel, client } = setup(
+      [ownerMessage(593, 'wire-task-settle-fail', `/task cancel ${task.task_id} ${task.task_id}`)],
+      undefined,
+      { fleet },
+    );
+    let persistedTask!: ReturnType<typeof getTask>;
+    try {
+      await channel.drain();
+      persistedTask = getTask(task.task_id);
+    } finally {
+      if (previousHome === undefined) delete process.env.OURS_FLEET_HOME;
+      else process.env.OURS_FLEET_HOME = previousHome;
+    }
+    expect(persistedTask).toMatchObject({
+      state: 'backlog',
+      terminal_intent: {
+        kind: 'cancelled', status: 'pending', error: 'systemd launch failed',
+      },
+    });
+    const texts = client.calls.filter(call => call.name === 'sendMessage')
+      .map(call => String(call.args?.text));
+    expect(texts.some(text => text.includes('accepted/pending'))).toBe(true);
+    expect(texts.some(text => text.includes('worker scheduled'))).toBe(false);
+    expect(texts.some(text => text.includes('→ cancelled'))).toBe(false);
   });
 
   it('maps /force-restart to a fresh restart', async () => {

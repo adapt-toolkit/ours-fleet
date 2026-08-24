@@ -1,6 +1,8 @@
 import { execFile, spawn } from 'node:child_process';
 
 import type { InterruptOutcome, SessionEvent, SessionSnapshot } from '../session/types.js';
+import type { TaskOutcome, TaskTerminalIntent } from '../rooms-tasks/types.js';
+import { launchFleetWorker } from '../rooms-tasks/external-worker.js';
 import { OWNER_COMMENT_LABEL, ownerNotices, type OwnerCommentsState } from './notices.js';
 
 /**
@@ -13,6 +15,10 @@ export interface OwnerFleetOps {
   restart(mode: 'keep' | 'fresh'): Promise<void>;
   /** `ours-fleet ls` output. */
   list(): Promise<string>;
+  /** Start a room-close worker outside the caller role's supervisor lifecycle. */
+  closeRoom(roomId: string): Promise<void>;
+  /** Resume a task terminal intent outside the caller role's supervisor lifecycle. */
+  settleTask(taskId: string): Promise<void>;
 }
 
 /**
@@ -44,6 +50,10 @@ export interface OwnerCommandContext {
    */
   setComments(enabled: boolean): OwnerCommentsState;
   fleetList(): Promise<string>;
+  /** Persist acceptance, acknowledge it, then launch the external close worker. */
+  closeRoom(roomId: string): Promise<void>;
+  /** Persist terminal intent, acknowledge it, then launch the external settle worker. */
+  terminalTask(taskId: string, kind: TaskTerminalIntent['kind'], outcome?: TaskOutcome): Promise<void>;
   recentEvents(limit: number): SessionEvent[];
   readWorklogTail(maxChars: number): Promise<string | undefined>;
   reply(text: string): Promise<void>;
@@ -336,18 +346,14 @@ export const ownerCommands: OwnerCommand[] = [
           }
           case 'done': {
             if (!rest[0]) throw new OwnerCommandUsageError('usage: /task done <id> [summary]');
-            const { completeTask } = await import('../rooms-tasks/task-state.js');
             const summary = rest.slice(1).join(' ') || undefined;
-            const t = completeTask(rest[0], summary ? { summary } : undefined);
-            await ctx.reply(`✅ Task ${t.task_id} → done`);
+            await ctx.terminalTask(rest[0], 'done', summary ? { summary } : undefined);
             break;
           }
           case 'cancel': {
             if (rest.length < 2 || rest[0] !== rest[1])
               throw new OwnerCommandUsageError('destructive: /task cancel <id> <id> — provide the task ID twice');
-            const { cancelTask } = await import('../rooms-tasks/task-state.js');
-            const t = cancelTask(rest[0]);
-            await ctx.reply(`🗑️ Task ${t.task_id} → cancelled`);
+            await ctx.terminalTask(rest[0], 'cancelled');
             break;
           }
           case 'recover': {
@@ -355,6 +361,10 @@ export const ownerCommands: OwnerCommand[] = [
             const { getTask } = await import('../rooms-tasks/task-state.js');
             const { getRoomRecord } = await import('../rooms-tasks/room-state.js');
             const t = getTask(rest[0]);
+            if (t.terminal_intent?.status === 'pending') {
+              await ctx.terminalTask(t.task_id, t.terminal_intent.kind, t.terminal_intent.outcome);
+              break;
+            }
             const room = t.room_id ? getRoomRecord(t.room_id) : undefined;
             const hints: string[] = [];
             if (t.state === 'provisioning' && room) {
@@ -466,9 +476,7 @@ export const ownerCommands: OwnerCommand[] = [
           case 'close': {
             if (rest.length < 2 || rest[0] !== rest[1])
               throw new OwnerCommandUsageError('destructive: /room close <id> <id> — provide the room ID twice');
-            const { closeRoom } = await import('../rooms-tasks/room-state.js');
-            const r = closeRoom(rest[0]);
-            await ctx.reply(`🔒 Room ${r.room_id} → closed`);
+            await ctx.closeRoom(rest[0]);
             break;
           }
           case 'recover': {
@@ -476,6 +484,10 @@ export const ownerCommands: OwnerCommand[] = [
             const { getRoomRecord } = await import('../rooms-tasks/room-state.js');
             const r = getRoomRecord(rest[0]);
             if (!r) { await ctx.reply(`⚠️ room not found: ${rest[0]}`); break; }
+            if (r.state === 'closing') {
+              await ctx.closeRoom(r.room_id);
+              break;
+            }
             const lines = [`🏠 Room ${r.room_id} · ${r.state} · saga: ${r.saga.phase}`];
             if (r.saga.error) lines.push(`Error: ${r.saga.error}`);
             if (r.provisioning_detail) lines.push(`Detail: ${r.provisioning_detail}`);
@@ -618,5 +630,11 @@ export function fleetCliOps(role: string, configPath?: string): OwnerFleetOps {
         { timeout: 15_000, maxBuffer: 256 * 1024 },
         (error, stdout) => error ? reject(error) : resolve(String(stdout).trim()));
     }),
+    closeRoom: roomId => launchFleetWorker(
+      ['room', '_close', roomId], `room-close-${roomId}`, configPath,
+    ),
+    settleTask: taskId => launchFleetWorker(
+      ['task', '_settle', taskId], `task-settle-${taskId}`, configPath,
+    ),
   };
 }

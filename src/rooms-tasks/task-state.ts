@@ -5,7 +5,7 @@ import { replaceFileAtomically } from '../atomic-file.js';
 import { stateRoot } from '../paths.js';
 import type {
   TaskRecord, TaskState, TaskBlocked, TaskOrigin, TaskTemplateRef,
-  TaskOutcome, TaskMemberRole,
+  TaskOutcome, TaskMemberRole, TaskTerminalIntent,
 } from './types.js';
 import { TASK_TERMINAL_STATES, TASK_CANCELLABLE_STATES } from './types.js';
 
@@ -47,6 +47,14 @@ const VALID_TRANSITIONS: Record<TaskState, TaskState[]> = {
 function assertTransition(from: TaskState, to: TaskState): void {
   if (!VALID_TRANSITIONS[from].includes(to))
     throw new TaskStateError(`cannot transition from '${from}' to '${to}'`);
+}
+
+function assertNoPendingTerminalIntent(task: TaskRecord): void {
+  if (task.terminal_intent?.status === 'pending') {
+    throw new TaskStateError(
+      `task ${task.task_id} has a pending '${task.terminal_intent.kind}' terminal intent`,
+    );
+  }
 }
 
 // ── CRUD ────────────────────────────────────────────────────────────────
@@ -112,6 +120,7 @@ export function findByIdempotencyKey(key: string): TaskRecord | undefined {
 
 export function startTask(id: string): TaskRecord {
   const t = readTask(id);
+  assertNoPendingTerminalIntent(t);
   assertTransition(t.state, 'provisioning');
   t.state = 'provisioning';
   t.started_at = new Date().toISOString();
@@ -121,6 +130,7 @@ export function startTask(id: string): TaskRecord {
 
 export function activateTask(id: string): TaskRecord {
   const t = readTask(id);
+  assertNoPendingTerminalIntent(t);
   assertTransition(t.state, 'active');
   t.state = 'active';
   delete t.blocked;
@@ -130,6 +140,7 @@ export function activateTask(id: string): TaskRecord {
 
 export function blockTask(id: string, reason: string): TaskRecord {
   const t = readTask(id);
+  assertNoPendingTerminalIntent(t);
   if (TASK_TERMINAL_STATES.includes(t.state))
     throw new TaskStateError(`cannot block a '${t.state}' task`);
   t.blocked = { reason, at: new Date().toISOString() };
@@ -139,6 +150,7 @@ export function blockTask(id: string, reason: string): TaskRecord {
 
 export function unblockTask(id: string): TaskRecord {
   const t = readTask(id);
+  assertNoPendingTerminalIntent(t);
   if (!t.blocked) throw new TaskStateError('task is not blocked');
   delete t.blocked;
   writeTask(t);
@@ -147,6 +159,7 @@ export function unblockTask(id: string): TaskRecord {
 
 export function reviewTask(id: string): TaskRecord {
   const t = readTask(id);
+  assertNoPendingTerminalIntent(t);
   assertTransition(t.state, 'review');
   t.state = 'review';
   delete t.blocked;
@@ -156,6 +169,7 @@ export function reviewTask(id: string): TaskRecord {
 
 export function completeTask(id: string, outcome?: TaskOutcome): TaskRecord {
   const t = readTask(id);
+  assertNoPendingTerminalIntent(t);
   assertTransition(t.state, 'done');
   t.state = 'done';
   t.ended_at = new Date().toISOString();
@@ -167,6 +181,7 @@ export function completeTask(id: string, outcome?: TaskOutcome): TaskRecord {
 
 export function cancelTask(id: string): TaskRecord {
   const t = readTask(id);
+  assertNoPendingTerminalIntent(t);
   if (!TASK_CANCELLABLE_STATES.includes(t.state))
     throw new TaskStateError(`cannot cancel a '${t.state}' task`);
   t.state = 'cancelled';
@@ -176,8 +191,97 @@ export function cancelTask(id: string): TaskRecord {
   return t;
 }
 
+function sameOutcome(left: TaskOutcome | undefined, right: TaskOutcome | undefined): boolean {
+  return JSON.stringify(left) === JSON.stringify(right);
+}
+
+/** Persist the first terminal request. Callers serialize this with the task-operation lock. */
+export function beginTaskTerminalIntent(
+  id: string,
+  input: { kind: TaskTerminalIntent['kind']; roomId?: string; outcome?: TaskOutcome },
+): TaskRecord {
+  const t = readTask(id);
+  const existing = t.terminal_intent;
+  if (existing) {
+    if (existing.kind !== input.kind || existing.room_id !== input.roomId
+      || !sameOutcome(existing.outcome, input.outcome)) {
+      throw new TaskStateError(
+        `task ${id} already has a conflicting '${existing.kind}' terminal intent`,
+      );
+    }
+    return t;
+  }
+  if (TASK_TERMINAL_STATES.includes(t.state)) {
+    throw new TaskStateError(`task ${id} is already in terminal state '${t.state}'`);
+  }
+  if (input.kind === 'done' && t.state !== 'review') {
+    throw new TaskStateError(`cannot transition from '${t.state}' to 'done'`);
+  }
+  if (input.kind === 'cancelled' && !TASK_CANCELLABLE_STATES.includes(t.state)) {
+    throw new TaskStateError(`cannot cancel a '${t.state}' task`);
+  }
+  if (input.roomId !== undefined && t.room_id !== input.roomId) {
+    throw new TaskStateError(`task ${id} is not tied to room ${input.roomId}`);
+  }
+  t.terminal_intent = {
+    kind: input.kind,
+    status: 'pending',
+    room_id: input.roomId,
+    outcome: input.outcome,
+    accepted_at: new Date().toISOString(),
+  };
+  writeTask(t);
+  return t;
+}
+
+/** Record an actionable failure without claiming the requested terminal state. */
+export function setTaskTerminalIntentError(
+  id: string, error: string, recoveryHint: string,
+): TaskRecord {
+  const t = readTask(id);
+  if (!t.terminal_intent) throw new TaskStateError(`task ${id} has no terminal intent`);
+  if (t.terminal_intent.status === 'settled') return t;
+  t.terminal_intent.first_failure ??= error;
+  t.terminal_intent.first_recovery_hint ??= recoveryHint;
+  t.terminal_intent.error = error;
+  const previousErrorAt = Date.parse(t.terminal_intent.error_at ?? '');
+  t.terminal_intent.error_at = new Date(Math.max(
+    Date.now(), Number.isFinite(previousErrorAt) ? previousErrorAt + 1 : 0,
+  )).toISOString();
+  t.terminal_intent.recovery_hint = recoveryHint;
+  writeTask(t);
+  return t;
+}
+
+/** Atomically publish the task terminal state and settled audit cursor. */
+export function finishTaskTerminalIntent(id: string): TaskRecord {
+  const t = readTask(id);
+  const intent = t.terminal_intent;
+  if (!intent) throw new TaskStateError(`task ${id} has no terminal intent`);
+  if (intent.status === 'settled') return t;
+  if (TASK_TERMINAL_STATES.includes(t.state)) {
+    throw new TaskStateError(`task ${id} reached terminal state '${t.state}' outside its intent`);
+  }
+  if (intent.kind === 'done') assertTransition(t.state, 'done');
+  else if (!TASK_CANCELLABLE_STATES.includes(t.state)) {
+    throw new TaskStateError(`cannot cancel a '${t.state}' task`);
+  }
+  t.state = intent.kind;
+  t.ended_at = new Date().toISOString();
+  delete t.blocked;
+  if (intent.outcome) t.outcome = intent.outcome;
+  intent.status = 'settled';
+  intent.settled_at = t.ended_at;
+  delete intent.error;
+  delete intent.error_at;
+  delete intent.recovery_hint;
+  writeTask(t);
+  return t;
+}
+
 export function failTask(id: string, error: string): TaskRecord {
   const t = readTask(id);
+  assertNoPendingTerminalIntent(t);
   assertTransition(t.state, 'failed');
   t.state = 'failed';
   t.ended_at = new Date().toISOString();
@@ -193,6 +297,7 @@ export function updateTaskRoom(
   roomIdentityCid: string,
 ): TaskRecord {
   const t = readTask(id);
+  assertNoPendingTerminalIntent(t);
   t.room_id = roomId;
   t.room_identity_cid = roomIdentityCid;
   writeTask(t);
@@ -201,6 +306,7 @@ export function updateTaskRoom(
 
 export function updateTaskTemplate(id: string, template: TaskTemplateRef): TaskRecord {
   const t = readTask(id);
+  assertNoPendingTerminalIntent(t);
   t.template = template;
   writeTask(t);
   return t;
@@ -208,6 +314,7 @@ export function updateTaskTemplate(id: string, template: TaskTemplateRef): TaskR
 
 export function updateTaskMembers(id: string, members: TaskMemberRole[]): TaskRecord {
   const t = readTask(id);
+  assertNoPendingTerminalIntent(t);
   t.member_roles = members;
   writeTask(t);
   return t;

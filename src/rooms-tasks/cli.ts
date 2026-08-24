@@ -1,29 +1,96 @@
 import type { Command } from 'commander';
 import { readFileSync } from 'node:fs';
 import { loadConfig, type FleetConfig, ConfigError, findRole } from '../config.js';
-import { provisionMembers, cleanupMembers, getBinPath } from './provision.js';
+import { provisionMembers, getBinPath } from './provision.js';
+import {
+  acceptManagedRoomClose, closeManagedRoom, recordManagedRoomCloseError,
+} from './close.js';
+import {
+  acceptTaskTerminalIntent, recordTaskTerminalIntentError, settleTaskTerminalIntent,
+} from './terminal.js';
+import { launchFleetWorker } from './external-worker.js';
 import {
   resolveTemplate, listTemplates, snapshotTemplate, hashTemplate,
   BUILTIN_TEMPLATES,
 } from './templates.js';
 import {
   createTask, getTask, listTasks, startTask, activateTask,
-  blockTask, unblockTask, reviewTask, completeTask, cancelTask,
+  blockTask, unblockTask, reviewTask,
   updateTaskRoom, updateTaskTemplate, updateTaskMembers, failTask, TaskStateError,
 } from './task-state.js';
 import {
   createRoomRecord, getRoomRecord, listRoomRecords,
-  closeRoom as closeRoomRecord, advanceSaga, setOwnerSeat,
+  advanceSaga, setOwnerSeat,
   setSagaError, activateRoom, updateMemberSeats, RoomStateError,
 } from './room-state.js';
 import { createCoworkAdapter, CoworkProtocolError, CoworkUnavailableError } from './cowork-adapter.js';
-import { TASK_TERMINAL_STATES } from './types.js';
+import { TASK_CANCELLABLE_STATES, TASK_TERMINAL_STATES } from './types.js';
 import type { RoomOrchestrationRecord, TaskOrigin, TemplateDefinition, TemplateSnapshot } from './types.js';
 
 function die(e: unknown): never {
   const msg = e instanceof Error ? e.message : String(e);
   process.stderr.write(`error: ${msg}\n`);
   process.exit(1);
+}
+
+const PUBLIC_SETTLE_WAIT_MS = 60_000;
+const PUBLIC_SETTLE_POLL_MS = 100;
+
+const sleep = (ms: number): Promise<void> =>
+  new Promise(resolve => { setTimeout(resolve, ms); });
+
+function errorText(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
+async function launchTaskSettleWorker(
+  taskId: string, configPath?: string,
+): Promise<{ task: ReturnType<typeof getTask>; timedOut: boolean }> {
+  const previousErrorAt = getTask(taskId).terminal_intent?.error_at;
+  try {
+    await launchFleetWorker(['task', '_settle', taskId], `task-settle-${taskId}`, configPath);
+  } catch (error) {
+    await recordTaskTerminalIntentError(
+      taskId, errorText(error),
+      `External settle worker failed to start. Retry task recover ${taskId}.`,
+    );
+    throw error;
+  }
+  const deadline = Date.now() + PUBLIC_SETTLE_WAIT_MS;
+  while (Date.now() < deadline) {
+    const task = getTask(taskId);
+    if (task.terminal_intent?.status === 'settled') return { task, timedOut: false };
+    if (task.terminal_intent?.error_at !== previousErrorAt && task.terminal_intent?.error) {
+      throw new TaskStateError(task.terminal_intent.error);
+    }
+    await sleep(PUBLIC_SETTLE_POLL_MS);
+  }
+  return { task: getTask(taskId), timedOut: true };
+}
+
+async function launchRoomCloseWorker(
+  roomId: string, configPath?: string,
+): Promise<{ room: RoomOrchestrationRecord; timedOut: boolean }> {
+  const previousErrorAt = getRoomRecord(roomId)?.close?.error_at;
+  try {
+    await launchFleetWorker(['room', '_close', roomId], `room-close-${roomId}`, configPath);
+  } catch (error) {
+    await recordManagedRoomCloseError(
+      roomId, errorText(error),
+      `External close worker failed to start. Retry room recover ${roomId}.`,
+    );
+    throw error;
+  }
+  const deadline = Date.now() + PUBLIC_SETTLE_WAIT_MS;
+  while (Date.now() < deadline) {
+    const room = getRoomRecord(roomId)!;
+    if (room.state === 'closed') return { room, timedOut: false };
+    if (room.close?.error_at !== previousErrorAt && room.close?.error) {
+      throw new RoomStateError(room.close.error);
+    }
+    await sleep(PUBLIC_SETTLE_POLL_MS);
+  }
+  return { room: getRoomRecord(roomId)!, timedOut: true };
 }
 
 function loadCfg(opts: { configuration?: string }): FleetConfig {
@@ -405,21 +472,30 @@ export function registerTaskCommands(parent: Command, cOpt: (cmd: Command) => Co
         let summary = opts.summary;
         if (opts.summaryFile) summary = readFileSync(opts.summaryFile, 'utf8');
         const outcome = summary ? { summary } : undefined;
-        const t = completeTask(id, outcome);
-        if (t.room_id) {
-          const cfg = loadCfg(opts);
+        const current = getTask(id);
+        if (TASK_TERMINAL_STATES.includes(current.state))
+          throw new TaskStateError(`task ${id} is already in terminal state '${current.state}'`);
+        if (current.state !== 'review')
+          throw new TaskStateError(`cannot transition from '${current.state}' to 'done'`);
+        let roomId: string | undefined;
+        let cfg: FleetConfig | undefined;
+        if (current.room_id) {
+          cfg = loadCfg(opts);
           const shouldClose = cfg.tasks?.close_room_on_done
             ?? cfg.rooms?.defaults?.close_when_task_done
             ?? false;
-          if (shouldClose) {
-            try {
-              await coworkFor(cfg).closeRoom(t.room_id);
-              closeRoomRecord(t.room_id);
-            } catch { /* room close is best-effort on task done */ }
-            await cleanupMembers({ roomId: t.room_id, taskId: id }).catch(() => {});
-          }
+          if (shouldClose) roomId = current.room_id;
         }
+        await acceptTaskTerminalIntent({ taskId: id, kind: 'done', roomId, outcome });
+        const settled = roomId
+          ? await launchTaskSettleWorker(id, opts.configuration)
+          : { task: getTask(id), timedOut: false };
+        const t = settled.task;
         if (opts.json) { console.log(JSON.stringify({ schema_version: 1, task: t }, null, 2)); return; }
+        if (settled.timedOut) {
+          console.log(`Task ${t.task_id} · ${t.state} (terminal intent accepted/pending; run task recover ${id})`);
+          return;
+        }
         console.log(`Task ${t.task_id} · done`);
       } catch (e) { die(e); }
     });
@@ -431,17 +507,22 @@ export function registerTaskCommands(parent: Command, cOpt: (cmd: Command) => Co
       try {
         if (id !== confirmId)
           die(new Error('confirmation ID must match task ID'));
-        const t = cancelTask(id);
-        if (t.room_id) {
-          const cfg = loadCfg(opts);
-          await cleanupMembers({
-            roomId: t.room_id,
-            taskId: id,
-            closeCoworkRoom: true,
-            cowork: coworkFor(cfg),
-          }).catch(() => {});
-        }
+        const current = getTask(id);
+        if (!TASK_CANCELLABLE_STATES.includes(current.state))
+          throw new TaskStateError(`cannot cancel a '${current.state}' task`);
+        if (current.room_id) loadCfg(opts);
+        await acceptTaskTerminalIntent({
+          taskId: id, kind: 'cancelled', roomId: current.room_id,
+        });
+        const settled = current.room_id
+          ? await launchTaskSettleWorker(id, opts.configuration)
+          : { task: getTask(id), timedOut: false };
+        const t = settled.task;
         if (opts.json) { console.log(JSON.stringify({ schema_version: 1, task: t }, null, 2)); return; }
+        if (settled.timedOut) {
+          console.log(`Task ${t.task_id} · ${t.state} (terminal intent accepted/pending; run task recover ${id})`);
+          return;
+        }
         console.log(`Task ${t.task_id} · cancelled`);
       } catch (e) { die(e); }
     });
@@ -452,13 +533,22 @@ export function registerTaskCommands(parent: Command, cOpt: (cmd: Command) => Co
     .action(async (id: string, opts: { configuration?: string; json?: boolean }) => {
       try {
         const cfg = loadCfg(opts);
-        const t = getTask(id);
+        let t = getTask(id);
+        let terminalTimedOut = false;
+        if (t.terminal_intent?.status === 'pending') {
+          const settled = await launchTaskSettleWorker(id, opts.configuration);
+          t = settled.task;
+          terminalTimedOut = settled.timedOut;
+        }
         const room = t.room_id ? getRoomRecord(t.room_id) : undefined;
         const result = {
           task: t,
           room: room ?? null,
           recovery_actions: [] as string[],
         };
+        if (terminalTimedOut) {
+          result.recovery_actions.push(`Terminal intent remains pending — retry task recover ${id}`);
+        }
         if (t.state === 'provisioning' && room) {
           if (room.provisioning_detail === 'waiting_cowork')
             result.recovery_actions.push('Cowork management socket unreachable — check ours-cowork service');
@@ -507,6 +597,26 @@ export function registerTaskCommands(parent: Command, cOpt: (cmd: Command) => Co
           console.log('No automated recovery actions available.');
         }
       } catch (e) { die(e); }
+    });
+
+  cOpt(taskCmd.command('_settle <id>', { hidden: true }))
+    .description('internal: settle a previously accepted task terminal intent')
+    .option('--json', 'JSON output')
+    .action(async (id: string, opts: { configuration?: string; json?: boolean }) => {
+      try {
+        const cfg = loadCfg(opts);
+        const t = await settleTaskTerminalIntent({ taskId: id, cowork: coworkFor(cfg) });
+        if (opts.json) {
+          console.log(JSON.stringify({ schema_version: 1, task: t }, null, 2));
+          return;
+        }
+        console.log(`Task ${t.task_id} · ${t.state}`);
+      } catch (e) {
+        await recordTaskTerminalIntentError(
+          id, errorText(e), `External settle worker failed. Retry task recover ${id}.`,
+        ).catch(() => {});
+        die(e);
+      }
     });
 
   cOpt(taskCmd.command('work <id>'))
@@ -654,22 +764,19 @@ export function registerTaskCommands(parent: Command, cOpt: (cmd: Command) => Co
           reviewTask(id);
         }
 
-        t = completeTask(id, outcome);
-
-        if (t.room_id) {
-          const cfg = loadCfg(opts);
-          try {
-            await cleanupMembers({
-              roomId: t.room_id,
-              taskId: id,
-              closeCoworkRoom: true,
-              cowork: coworkFor(cfg),
-            });
-          } catch { /* room cleanup is best-effort */ }
-        }
+        if (t.room_id) loadCfg(opts); // validate configuration before durable acceptance
+        await acceptTaskTerminalIntent({ taskId: id, kind: 'done', roomId: t.room_id, outcome });
+        const settled = t.room_id
+          ? await launchTaskSettleWorker(id, opts.configuration)
+          : { task: getTask(id), timedOut: false };
+        t = settled.task;
 
         if (opts.json) {
           console.log(JSON.stringify({ schema_version: 1, task: t }, null, 2));
+          return;
+        }
+        if (settled.timedOut) {
+          console.log(`Task ${t.task_id} · ${t.state} (terminal intent accepted/pending; run task recover ${id})`);
           return;
         }
         console.log(`Task ${t.task_id} · done`);
@@ -825,12 +932,18 @@ export function registerRoomCommands(parent: Command, cOpt: (cmd: Command) => Co
     .action(async (id: string, confirmId: string, opts: { configuration?: string; json?: boolean }) => {
       try {
         if (id !== confirmId) die(new Error('confirmation ID must match room ID'));
-        const cfg = loadCfg(opts);
-        await coworkFor(cfg).closeRoom(id);
+        coworkFor(loadCfg(opts));
         const existing = getRoomRecord(id);
-        const r = existing ? closeRoomRecord(id) : undefined;
+        if (!existing) throw new Error(`room not found in Fleet orchestration: ${id}`);
+        await acceptManagedRoomClose(id);
+        const settled = await launchRoomCloseWorker(id, opts.configuration);
+        const r = settled.room;
         if (opts.json) {
-          console.log(JSON.stringify({ schema_version: 1, room_id: id, state: 'closed', orchestration: r ?? null }, null, 2));
+          console.log(JSON.stringify({ schema_version: 1, room_id: id, state: r.state, orchestration: r }, null, 2));
+          return;
+        }
+        if (settled.timedOut) {
+          console.log(`Room ${id} · closing (accepted/pending; run room recover ${id})`);
           return;
         }
         console.log(`Room ${id} · closed`);
@@ -844,8 +957,25 @@ export function registerRoomCommands(parent: Command, cOpt: (cmd: Command) => Co
       try {
         const cfg = loadCfg(opts);
         const adapter = coworkFor(cfg);
-        const cowork = await adapter.recoverRoom(id);
         let r = getRoomRecord(id);
+        if (r?.state === 'closing') {
+          const settled = await launchRoomCloseWorker(id, opts.configuration);
+          r = settled.room;
+          const cowork = r.state === 'closed' ? await adapter.getRoom(id) : undefined;
+          if (opts.json) {
+            console.log(JSON.stringify({
+              schema_version: 1, room: cowork ?? null, orchestration: r,
+              recovery_actions: [settled.timedOut
+                ? `Closing remains pending — retry room recover ${id}`
+                : 'Closing saga resumed successfully'],
+            }, null, 2));
+            return;
+          }
+          console.log(`Room ${id} · ${r.state} · close: ${r.close?.phase ?? 'unknown'}`);
+          return;
+        }
+        const cowork = await adapter.recoverRoom(id);
+        r = getRoomRecord(id);
         if (r && !r.owner_seat_cid
           && (r.provisioning_detail === 'waiting_owner_invite'
             || r.provisioning_detail === 'owner_cid_mismatch')) {
@@ -910,5 +1040,25 @@ export function registerRoomCommands(parent: Command, cOpt: (cmd: Command) => Co
           console.log('No recovery actions needed.');
         }
       } catch (e) { die(e); }
+    });
+
+  cOpt(roomCmd.command('_close <id>', { hidden: true }))
+    .description('internal: settle an accepted room close')
+    .option('--json', 'JSON output')
+    .action(async (id: string, opts: { configuration?: string; json?: boolean }) => {
+      try {
+        const cfg = loadCfg(opts);
+        const r = await closeManagedRoom({ roomId: id, cowork: coworkFor(cfg) });
+        if (opts.json) {
+          console.log(JSON.stringify({ schema_version: 1, room_id: id, state: r.state, orchestration: r }, null, 2));
+          return;
+        }
+        console.log(`Room ${id} · ${r.state}`);
+      } catch (e) {
+        await recordManagedRoomCloseError(
+          id, errorText(e), `External close worker failed. Retry room recover ${id}.`,
+        ).catch(() => {});
+        die(e);
+      }
     });
 }

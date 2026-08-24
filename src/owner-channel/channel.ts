@@ -1137,6 +1137,9 @@ export class OwnerChannel implements OwnerChannelHandle {
         return this.commentsState();
       },
       fleetList: () => this.fleetOps.list(),
+      closeRoom: roomId => this.closeRoomFromOwner(sender, roomId, wireId),
+      terminalTask: (taskId, kind, outcome) =>
+        this.terminalTaskFromOwner(sender, taskId, kind, outcome, wireId),
       recentEvents: limit => this.options.session.eventsSince(0).slice(-limit),
       readWorklogTail: maxChars => this.readWorklogTail(maxChars),
       reply: async replyText => { await this.send(sender.id, replyText, wireId); },
@@ -1192,6 +1195,70 @@ export class OwnerChannel implements OwnerChannelHandle {
     this.state.remember(wireId);
     this.options.log(`[${this.options.role}] owner requested ${command}`);
     await this.fleetOps.restart(mode);
+  }
+
+  /**
+   * The caller may itself be a room member. Persist and acknowledge acceptance
+   * before an external worker starts a saga that can retire this process.
+   */
+  private async closeRoomFromOwner(
+    sender: { id: string; name: string }, roomId: string, wireId: string,
+  ): Promise<void> {
+    const { acceptManagedRoomClose, recordManagedRoomCloseError } =
+      await import('../rooms-tasks/close.js');
+    const accepted = await acceptManagedRoomClose(roomId);
+    if (accepted.state === 'closed') {
+      await this.send(sender.id, `🔒 Room ${roomId} is already closed`, wireId);
+      this.state.remember(wireId);
+      return;
+    }
+    await this.send(sender.id, `🔒 Room ${roomId} close accepted/pending`, wireId);
+    this.state.remember(wireId);
+    try {
+      await this.fleetOps.closeRoom(roomId);
+    } catch (error) {
+      await recordManagedRoomCloseError(
+        roomId,
+        error instanceof Error ? error.message : String(error),
+        `External close worker failed to start. Retry /room close ${roomId} ${roomId}.`,
+      );
+      throw error;
+    }
+  }
+
+  /** Carry a task terminal request through a worker that survives this role. */
+  private async terminalTaskFromOwner(
+    sender: { id: string; name: string },
+    taskId: string,
+    kind: import('../rooms-tasks/types.js').TaskTerminalIntent['kind'],
+    outcome: import('../rooms-tasks/types.js').TaskOutcome | undefined,
+    wireId: string,
+  ): Promise<void> {
+    const { getTask } = await import('../rooms-tasks/task-state.js');
+    const {
+      acceptTaskTerminalIntent, recordTaskTerminalIntentError,
+    } = await import('../rooms-tasks/terminal.js');
+    const task = getTask(taskId);
+    const accepted = await acceptTaskTerminalIntent({
+      taskId, kind, roomId: task.room_id, outcome,
+    });
+    if (accepted.terminal_intent?.status === 'settled') {
+      await this.send(sender.id, `✅ Task ${taskId} → ${accepted.state}`, wireId);
+      this.state.remember(wireId);
+      return;
+    }
+    await this.send(sender.id, `⏳ Task ${taskId} terminal intent accepted/pending`, wireId);
+    this.state.remember(wireId);
+    try {
+      await this.fleetOps.settleTask(taskId);
+    } catch (error) {
+      await recordTaskTerminalIntentError(
+        taskId,
+        error instanceof Error ? error.message : String(error),
+        `External settle worker failed to start. Retry the identical task command or run task recover ${taskId}.`,
+      );
+      throw error;
+    }
   }
 
   /** Code-point-safe tail of the worklog, or undefined when there is none. */
