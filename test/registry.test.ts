@@ -31,6 +31,7 @@ export const fakeAdapter: HarnessAdapter = {
     temporaryCreateTool: 'create_temporary_identity', setBioTool: 'set_bio',
     setPersonaTool: 'set_persona', currentIdentityTool: 'current_identity',
     sendTool: 'send_message', getMessagesTool: 'get_messages',
+    listHistoryTool: 'list_history', getHistoryItemTool: 'get_history_item',
     monitorInstruction: id =>
       `Arm a persistent Monitor running \`ours api watch-notifications --input '{"identity":"${id}"}' --json\`.`,
     supervisedWakeNote: () => 'Wakes arrive as [fleet-monitor] lines — do NOT arm a Monitor. Run get_messages.',

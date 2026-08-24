@@ -59,6 +59,8 @@ export interface BriefingVocab {
   currentIdentityTool: string;
   sendTool: string;
   getMessagesTool: string;
+  listHistoryTool: string;
+  getHistoryItemTool: string;
   monitorInstruction(identity: string, role?: ResolvedRole): string;
   /** Wake-source wording for a role whose monitor is supervisor-owned (monitor.mode=fleet). */
   supervisedWakeNote(identity: string, role?: ResolvedRole): string;

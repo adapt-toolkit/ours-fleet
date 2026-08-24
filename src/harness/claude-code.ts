@@ -316,6 +316,8 @@ export function makeClaudeCodeAdapter(exec: Exec = realExec): HarnessAdapter {
       currentIdentityTool: 'current_identity',
       sendTool: 'send_message',
       getMessagesTool: 'get_messages',
+      listHistoryTool: 'list_history',
+      getHistoryItemTool: 'get_history_item',
       monitorInstruction: id => {
         const m = armMonitor(id);
         return `${m.charAt(0).toUpperCase()}${m.slice(1)}.`;
