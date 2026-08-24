@@ -91,7 +91,17 @@ export function markdownHeading(value: unknown): string {
 /** Escaped multiline prose. Intended line breaks remain line breaks. */
 export function markdownMultiline(value: unknown): string {
   const bounded = boundPlain(normalize(value, true).trim(), FIELD_MAX_CODE_POINTS, FIELD_MAX_BYTES);
-  return bounded.split('\n').map(line => line.replace(PROSE_PUNCTUATION, '\\$1')).join('\n');
+  return bounded.split('\n').map(line => {
+    const escaped = line.replace(PROSE_PUNCTUATION, '\\$1');
+    // A multiline value is commonly nested inside a block quote. Escape every
+    // still-active line-leading block marker so user text cannot create nested
+    // headings, lists, quotes, thematic breaks, or tilde fences.
+    return escaped
+      .replace(/^([ \t]*)(#{1,6}|[-+>])(?=[ \t]|$)/u, '$1\\$2')
+      .replace(/^([ \t]*)(\d{1,9})([.)])(?=[ \t]|$)/u, '$1$2\\$3')
+      .replace(/^([ \t]*)(-{3,})(?=[ \t]*$)/u, '$1\\$2')
+      .replace(/^([ \t]*)(~{3,})/u, '$1\\$2');
+  }).join('\n');
 }
 
 /** CommonMark code span with a delimiter longer than every run in the value. */

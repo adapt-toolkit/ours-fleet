@@ -28,15 +28,15 @@ exports[`task/room JSON presentation contract > pins every room --json serialize
           return;
         }",
   "if (opts.json) {
-          console.log(JSON.stringify({ schema_version: 1, room_id: id, state: r.state, orchestration: r }, null, 2));
+          console.log(JSON.stringify({ schema_version: 1, room_id: id, deleted: settled.deleted }, null, 2));
           return;
         }",
   "if (opts.json) {
             console.log(JSON.stringify({
-              schema_version: 1, room: cowork ?? null, orchestration: r,
+              schema_version: 1, room: null, orchestration: null,
               recovery_actions: [settled.timedOut
-                ? \`Closing remains pending — retry room recover \${id}\`
-                : 'Closing saga resumed successfully'],
+                ? \`Deletion remains pending — retry room delete \${id} \${id}\`
+                : 'Deletion completed successfully'],
             }, null, 2));
             return;
           }",
@@ -45,7 +45,7 @@ exports[`task/room JSON presentation contract > pins every room --json serialize
           return;
         }",
   "if (opts.json) {
-          console.log(JSON.stringify({ schema_version: 1, room_id: id, state: r.state, orchestration: r }, null, 2));
+          console.log(JSON.stringify({ schema_version: 1, ...result }, null, 2));
           return;
         }",
 ]

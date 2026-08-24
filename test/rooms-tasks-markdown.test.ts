@@ -25,6 +25,23 @@ describe('task/room Markdown primitives', () => {
     expect(markdownMultiline('first\r\n> quote\rsecond\u0000')).toBe('first\n\\> quote\nsecond�');
   });
 
+  it('keeps every line-leading CommonMark block construct literal, including CRLF input', () => {
+    const input = [
+      '# heading', '- item', '+ item', '* item', '1. ordered', '> quote',
+      '---', '***', '___', '``` fence', '~~~ fence', '  ## indented heading',
+    ].join('\r\n');
+    const expected = [
+      '\\# heading', '\\- item', '\\+ item', '\\* item', '1\\. ordered', '\\> quote',
+      '\\---', '\\*\\*\\*', '\\_\\_\\_', '\\`\\`\\` fence', '\\~~~ fence', '  \\## indented heading',
+    ].join('\n');
+    expect(markdownMultiline(input)).toBe(expected);
+    const rendered = renderMarkdownResult({
+      icon: '📋', title: 'Literal multiline',
+      fields: [{ label: 'Text', value: input, multiline: true }],
+    });
+    expect(rendered).toContain(expected.split('\n').map(line => `> ${line}`).join('\n'));
+  });
+
   it('uses a CommonMark-safe padded code fence for backticks and spaces', () => {
     expect(markdownCode('`id``')).toBe('``` `id`` ```');
     expect(markdownCode(' spaced ')).toBe('`  spaced  `');

@@ -457,6 +457,17 @@ describe('owner-channel task subcommands', () => {
     expect(ctx.replies).toEqual([`terminal:${t.task_id}:done`]);
   });
 
+  it('keeps arbitrary task effect errors generic and never exposes their text', async () => {
+    const secret = 'cannot connect using /secret/path token=canary-token';
+    const ctx = context({ terminalTask: vi.fn(async () => { throw new Error(secret); }) });
+    await dispatchOwnerCommand('/task done task-safe-id', ctx);
+    expect(ctx.replies).toHaveLength(1);
+    expect(ctx.replies[0]).toContain('Command failed');
+    expect(ctx.replies[0]).not.toContain('cannot connect');
+    expect(ctx.replies[0]).not.toContain('/secret/path');
+    expect(ctx.replies[0]).not.toContain('canary-token');
+  });
+
   it('/task cancel requires ID twice', async () => {
     const t = await createTestTask();
     const ctx = context();
@@ -719,6 +730,34 @@ describe('owner-channel room subcommands', () => {
     expect(ctx.replies[0]).toContain(r.room_id);
   });
 
+  it('/room show and recover redact stored saga diagnostics', async () => {
+    const r = await createTestRoom();
+    const secret = 'stack at /secret/path token=canary-token';
+    const { setSagaError } = await import('../src/rooms-tasks/room-state.js');
+    setSagaError(r.room_id, secret, secret, 'member_failed');
+    for (const command of [`/room show ${r.room_id}`, `/room recover ${r.room_id}`]) {
+      const ctx = context();
+      await dispatchOwnerCommand(command, ctx);
+      expect(ctx.replies).toHaveLength(1);
+      expect(ctx.replies[0]).toContain('inspect role logs');
+      expect(ctx.replies[0]).not.toContain('/secret/path');
+      expect(ctx.replies[0]).not.toContain('canary-token');
+    }
+  });
+
+  it('keeps arbitrary room effect errors generic and never exposes their text', async () => {
+    const r = await createTestRoom();
+    const { activateRoom } = await import('../src/rooms-tasks/room-state.js');
+    activateRoom(r.room_id);
+    const secret = 'cannot connect using /secret/path token=canary-token';
+    const ctx = context({ closeRoom: vi.fn(async () => { throw new Error(secret); }) });
+    await dispatchOwnerCommand(`/room close ${r.room_id} ${r.room_id}`, ctx);
+    expect(ctx.replies).toHaveLength(1);
+    expect(ctx.replies[0]).toContain('Command failed');
+    expect(ctx.replies[0]).not.toContain('/secret/path');
+    expect(ctx.replies[0]).not.toContain('canary-token');
+  });
+
   it('/room close requires ID twice', async () => {
     const r = await createTestRoom();
     const ctx = context();
@@ -838,10 +877,10 @@ describe('owner-channel room subcommands', () => {
     closeRoom(r.room_id);
     const listCtx = context();
     await dispatchOwnerCommand('/room list', listCtx);
-    expect(listCtx.replies).toEqual(['🏠 No rooms.']);
+    expect(listCtx.replies).toEqual(['## 🏠 Rooms\n\nNo rooms found.']);
     const showCtx = context();
     await dispatchOwnerCommand(`/room show ${r.room_id}`, showCtx);
-    expect(showCtx.replies[0]).toContain('room not found');
+    expect(showCtx.replies[0]).toContain('## ⚠️ Not found');
   });
 
   it('/room recover migrates a legacy closed record through deletion', async () => {

@@ -792,8 +792,10 @@ describe('OwnerChannel deterministic command dispatch', () => {
     expect(stateWhenSpawned).toBe('closing');
     expect(wireWhenSpawned).toContain('wire-room-close');
     expect(sendsWhenSpawned).toBeGreaterThan(0);
-    expect(String(client.calls.find(call => call.name === 'sendMessage')?.args?.text))
-      .toContain('accepted and is still being settled');
+    const acknowledgement = String(client.calls.find(call => call.name === 'sendMessage')?.args?.text);
+    expect(acknowledgement).toContain('deletion request was accepted and is still being settled');
+    expect(acknowledgement).toContain(`/room delete ${roomId} ${roomId}`);
+    expect(acknowledgement).not.toContain('Room closed');
   });
 
   it('persists task terminal intent and the wire before launching its external worker', async () => {

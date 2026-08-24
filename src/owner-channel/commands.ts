@@ -5,6 +5,8 @@ import type {
   RoomOrchestrationRecord, TaskOutcome, TaskRecord, TaskTerminalIntent,
 } from '../rooms-tasks/types.js';
 import { launchFleetWorker } from '../rooms-tasks/external-worker.js';
+import { RoomStateError } from '../rooms-tasks/room-state.js';
+import { TaskStateError } from '../rooms-tasks/task-state.js';
 import {
   markdownCode, markdownProse, renderMarkdownFailure, renderMarkdownList,
   renderMarkdownResult, roomStatus, taskStatus,
@@ -89,6 +91,69 @@ const taskListRecord = (task: TaskRecord): string =>
 const roomListRecord = (room: RoomOrchestrationRecord): string =>
   `${roomStatus(room.state)} ${markdownCode(room.room_id)} — ${markdownProse(room.room_name)}`
   + (room.task_id ? ` — Task ${markdownCode(room.task_id)}` : '');
+
+const TASK_STATE_WORD = '(?:backlog|provisioning|active|review|done|cancelled|failed)';
+const SAFE_ID_WORD = '[A-Za-z0-9_-]{1,128}';
+
+function isKnownOwnerTaskState(message: string): boolean {
+  return [
+    new RegExp(`^cannot transition from '${TASK_STATE_WORD}' to '${TASK_STATE_WORD}'$`, 'u'),
+    new RegExp(`^task ${SAFE_ID_WORD} has a pending '(?:done|cancelled)' terminal intent$`, 'u'),
+    new RegExp(`^cannot (?:block|cancel) a '${TASK_STATE_WORD}' task$`, 'u'),
+    /^task is not blocked$/u,
+    new RegExp(`^task ${SAFE_ID_WORD} already has a conflicting '(?:done|cancelled)' terminal intent$`, 'u'),
+    new RegExp(`^task ${SAFE_ID_WORD} is already in terminal state '${TASK_STATE_WORD}'$`, 'u'),
+    new RegExp(`^cannot delete a '${TASK_STATE_WORD}' task; only 'done' tasks can be deleted$`, 'u'),
+  ].some(pattern => pattern.test(message));
+}
+
+function isKnownOwnerRoomState(message: string): boolean {
+  return [
+    new RegExp(`^room ${SAFE_ID_WORD} is not closing$`, 'u'),
+    new RegExp(`^room ${SAFE_ID_WORD} has no recorded member .{1,128}$`, 'u'),
+    new RegExp(`^room ${SAFE_ID_WORD} close cannot move backward to [A-Za-z_]+$`, 'u'),
+  ].some(pattern => pattern.test(message));
+}
+
+function ownerTaskFailure(error: unknown): {
+  kind: 'not_found' | 'state' | 'unexpected'; detail?: string; action: string;
+} {
+  if (error instanceof TaskStateError) {
+    const missing = /^task not found: ([A-Za-z0-9_-]{1,128})$/u.exec(error.message);
+    if (missing) return {
+      kind: 'not_found', detail: `Task ${missing[1]} was not found.`,
+      action: 'Run /task list to find a valid task ID.',
+    };
+    if (isKnownOwnerTaskState(error.message)) return {
+      kind: 'state', detail: 'The current task state does not allow that action.',
+      action: 'Run /task show <id> to inspect the current task state.',
+    };
+  }
+  return {
+    kind: 'unexpected',
+    action: 'Retry once; if it repeats, inspect the role logs.',
+  };
+}
+
+function ownerRoomFailure(error: unknown): {
+  kind: 'not_found' | 'state' | 'unexpected'; detail?: string; action: string;
+} {
+  if (error instanceof RoomStateError) {
+    const missing = /^room not found: ([A-Za-z0-9_-]{1,128})$/u.exec(error.message);
+    if (missing) return {
+      kind: 'not_found', detail: `Room ${missing[1]} was not found.`,
+      action: 'Run /room list to find a valid room ID.',
+    };
+    if (isKnownOwnerRoomState(error.message)) return {
+      kind: 'state', detail: 'The current room state does not allow that action.',
+      action: 'Run /room show <id> to inspect the current room state.',
+    };
+  }
+  return {
+    kind: 'unexpected',
+    action: 'Retry once; if it repeats, inspect the role logs.',
+  };
+}
 
 const taskAction = (
   title: string, task: TaskRecord, fields: Parameters<typeof renderMarkdownResult>[0]['fields'] = [],
@@ -447,19 +512,12 @@ export const ownerCommands: OwnerCommand[] = [
         }
       } catch (e) {
         if (e instanceof OwnerCommandUsageError) throw e;
-        const detail = e instanceof Error ? e.message : String(e);
-        const notFound = /not found|already absent/i.test(detail);
-        const state = /cannot |terminal state|not blocked|pending/i.test(detail);
-        const validation = /invalid task ID|unknown template|template not found/i.test(detail);
-        const kind = notFound ? 'not_found' : state ? 'state' : validation ? 'usage' : 'unexpected';
+        const failure = ownerTaskFailure(e);
         await ctx.reply(renderMarkdownFailure({
-          kind,
+          kind: failure.kind,
           subject: `/task ${sub}`,
-          ...(kind === 'unexpected' ? {} : { detail }),
-          action: notFound ? 'Run /task list to find a valid task ID.'
-            : state ? 'Run /task show <id> to inspect the current task state.'
-              : validation ? 'Check the command arguments or run /help.'
-                : 'Retry once; if it repeats, inspect the role logs.',
+          ...(failure.detail ? { detail: failure.detail } : {}),
+          action: failure.action,
         }));
       }
     },
@@ -587,7 +645,7 @@ export const ownerCommands: OwnerCommand[] = [
                 { label: 'Room', value: r.room_id, kind: 'code' },
                 { label: 'Status', value: roomStatus(r.state), kind: 'markdown' },
                 { label: 'Saga', value: r.saga.phase, kind: 'code' },
-                ...(r.saga.error ? [{ label: 'Last error', value: r.saga.error }] : []),
+                ...(r.saga.error ? [{ label: 'Last error', value: 'Provisioning failure recorded; inspect role logs.' }] : []),
                 ...(r.provisioning_detail ? [{ label: 'Detail', value: r.provisioning_detail }] : []),
               ],
               sections: [{ heading: 'Next step', items: [r.saga.error
@@ -602,19 +660,12 @@ export const ownerCommands: OwnerCommand[] = [
         }
       } catch (e) {
         if (e instanceof OwnerCommandUsageError) throw e;
-        const detail = e instanceof Error ? e.message : String(e);
-        const notFound = /not found/i.test(detail);
-        const state = /cannot |not closing|already closed/i.test(detail);
-        const validation = /invalid room ID|unknown template/i.test(detail);
-        const kind = notFound ? 'not_found' : state ? 'state' : validation ? 'usage' : 'unexpected';
+        const failure = ownerRoomFailure(e);
         await ctx.reply(renderMarkdownFailure({
-          kind,
+          kind: failure.kind,
           subject: `/room ${sub}`,
-          ...(kind === 'unexpected' ? {} : { detail }),
-          action: notFound ? 'Run /room list to find a valid room ID.'
-            : state ? 'Run /room show <id> to inspect the current room state.'
-              : validation ? 'Check the command arguments or run /help.'
-                : 'Retry once; if it repeats, inspect the role logs.',
+          ...(failure.detail ? { detail: failure.detail } : {}),
+          action: failure.action,
         }));
       }
     },

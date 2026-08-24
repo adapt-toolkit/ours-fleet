@@ -14,7 +14,7 @@ import {
 } from '../session/types.js';
 import { VERSION } from '../version.js';
 import {
-  renderMarkdownFailure, renderMarkdownResult, roomStatus, taskStatus,
+  renderMarkdownFailure, renderMarkdownResult, taskStatus,
 } from '../rooms-tasks/markdown.js';
 import {
   dispatchOwnerCommand, fleetCliOps, isOwnerCommandText,

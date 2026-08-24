@@ -85,7 +85,7 @@ import {
 } from '../src/rooms-tasks/task-state.js';
 import {
   createRoomRecord, activateRoom, getRoomRecord, advanceSaga, updateMemberSeats,
-  updateRoomRoleBriefing,
+  updateRoomRoleBriefing, setSagaError,
 } from '../src/rooms-tasks/room-state.js';
 import { CoworkUnavailableError } from '../src/rooms-tasks/cowork-adapter.js';
 
@@ -230,7 +230,9 @@ describe('room delete', () => {
     await runRoom('delete', ROOM_ID, ROOM_ID);
     expect(getRoomRecord(ROOM_ID)).toBeUndefined();
     expect(mocks.deleteManagedRoom).toHaveBeenCalledWith(expect.objectContaining({ roomId: ROOM_ID }));
-    expect(out.join('\n')).toContain(`Room ${ROOM_ID} · deleted`);
+    expect(out.join('\n')).toContain('## 🗑️ Room deleted');
+    expect(out.join('\n')).toContain(`**ID:** \`${ROOM_ID}\``);
+    expect(out.join('\n')).not.toContain('closed');
   });
 
   it('keeps room close as a deprecated deletion alias', async () => {
@@ -264,6 +266,43 @@ describe('room delete', () => {
     expect(getRoomRecord(active.room_id)?.state).toBe('active');
     expect(out.join('\n')).toContain(active.room_id);
     expect(out.join('\n')).not.toContain(legacyId);
+  });
+});
+
+describe('public task/room failure presentation', () => {
+  function expectMarkdownFailure(text: string): void {
+    expect(text).toMatch(/^## ⚠️ /u);
+    expect(text).toContain('### Next step');
+    expect(text).not.toMatch(/^error:/mu);
+    expect(text).not.toContain('/secret/path');
+  }
+
+  it('formats task cancel and delete confirmation mismatches as actionable Markdown', async () => {
+    for (const command of ['cancel', 'delete']) {
+      out = [];
+      await expect(run(command, 'task-a', 'task-b')).rejects.toThrow(ExitError);
+      expectMarkdownFailure(out.join('\n'));
+      expect(out.join('\n')).toContain('Repeat the same task ID twice.');
+    }
+  });
+
+  it('formats room delete and deprecated close confirmation mismatches as actionable Markdown', async () => {
+    for (const command of ['delete', 'close']) {
+      out = [];
+      await expect(runRoom(command, 'room-a', 'room-b')).rejects.toThrow(ExitError);
+      expectMarkdownFailure(out.join('\n'));
+      expect(out.join('\n')).toContain('Repeat the same room ID twice.');
+    }
+  });
+
+  it('formats room show, open, and members not-found failures as actionable Markdown', async () => {
+    mocks.getRoom.mockResolvedValue(null);
+    for (const command of ['show', 'open', 'members']) {
+      out = [];
+      await expect(runRoom(command, 'missing-room')).rejects.toThrow(ExitError);
+      expectMarkdownFailure(out.join('\n'));
+      expect(out.join('\n')).toContain('Run ours-fleet room list');
+    }
   });
 });
 
@@ -358,24 +397,41 @@ describe('task work', () => {
     await runRoom('show', ROOM_ID);
     const text = out.join('\n');
     expect(text).toContain('launch launched, briefing relay\\_queued');
-    expect(text).toContain('rejected acknowledgement: owner\\_seat\\_cid mismatch');
+    expect(text).toContain('rejected acknowledgement recorded; inspect role logs');
+    expect(text).not.toContain('owner\\_seat\\_cid mismatch');
     expect(text).not.toContain('briefing_message=');
     expect(text).not.toContain('sha256:');
     expect(text).toContain('`Developer` — version `2` — configured');
+  });
+
+  it('redacts stored saga errors and recovery hints from local human output', async () => {
+    const t = backlogTask();
+    await run('work', t.task_id);
+    const secret = 'cannot connect using /secret/path token=canary-token';
+    setSagaError(ROOM_ID, secret, secret, 'member_failed');
+    out = [];
+    await runRoom('show', ROOM_ID);
+    await runRoom('recover', ROOM_ID);
+    const text = out.join('\n');
+    expect(text).toContain('inspect role logs');
+    expect(text).not.toContain('/secret/path');
+    expect(text).not.toContain('canary-token');
   });
 
   it('refuses a terminal-state task', async () => {
     const t = backlogTask();
     cancelTask(t.task_id);
     await expect(run('work', t.task_id)).rejects.toThrow(ExitError);
-    expect(out.join('\n')).toContain("terminal state 'cancelled'");
+    expect(out.join('\n')).toContain('## ⚠️ Action not allowed');
+    expect(out.join('\n')).toContain('already in a terminal state');
     expect(mocks.createRoom).not.toHaveBeenCalled();
   });
 
   it('errors on an unknown template', async () => {
     const t = backlogTask();
     await expect(run('work', t.task_id, '--template', 'nope')).rejects.toThrow(ExitError);
-    expect(out.join('\n')).toContain('template not found: nope');
+    expect(out.join('\n')).toContain('## ⚠️ Not found');
+    expect(out.join('\n')).toContain('ours-fleet template list');
   });
 
   it('blocks the task and errors when cowork is unavailable', async () => {
@@ -420,7 +476,7 @@ describe('task work', () => {
       template: { name: 'team', version: 1, content_hash: 'f'.repeat(64) },
     });
     await expect(run('work', t.task_id)).rejects.toThrow(ExitError);
-    expect(out.join('\n')).toContain('no longer matches team@1');
+    expect(out.join('\n')).toContain('template snapshot no longer matches the recorded template');
     expect(getTask(t.task_id).state).toBe('backlog');
     expect(mocks.createRoom).not.toHaveBeenCalled();
   });
@@ -513,7 +569,7 @@ describe('task work', () => {
     expect(getTask(t.task_id).state).toBe('provisioning');
 
     await expect(run('work', t.task_id, '--template', 'team')).rejects.toThrow(ExitError);
-    expect(out.join('\n')).toContain("does not match room");
+    expect(out.join('\n')).toContain('does not match the room’s provisioned template');
     expect(getTask(t.task_id).template?.name).toBe('single');
 
     await run('work', t.task_id);
@@ -526,7 +582,7 @@ describe('task work', () => {
     expect(getTask(t.task_id).state).toBe('active');
 
     await expect(run('work', t.task_id, '--template', 'team')).rejects.toThrow(ExitError);
-    expect(out.join('\n')).toContain('does not match room');
+    expect(out.join('\n')).toContain('does not match the room’s provisioned template');
     expect(getTask(t.task_id).template?.name).toBe('single');
 
     out = [];
@@ -591,7 +647,8 @@ describe('task finish', () => {
     const t = await activeTask();
     await run('finish', t.task_id);
     await expect(run('finish', t.task_id)).rejects.toThrow(ExitError);
-    expect(out.join('\n')).toContain("terminal state 'done'");
+    expect(out.join('\n')).toContain('## ⚠️ Action not allowed');
+    expect(out.join('\n')).toContain('already in a terminal state');
   });
 
   it('refuses a backlog task: nothing to finish', async () => {
@@ -675,7 +732,7 @@ describe('task delete', () => {
 
   it('requires the exact task ID twice before looking up the task', async () => {
     await expect(run('delete', 'missing-task', 'different-id')).rejects.toThrow(ExitError);
-    expect(out.join('\n')).toContain('confirmation ID must match task ID');
+    expect(out.join('\n')).toContain('The two task IDs must match.');
   });
 
   it('deletes a done task without closing a room', async () => {
