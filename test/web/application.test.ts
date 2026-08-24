@@ -39,7 +39,7 @@ const backend: SupervisorBackend = {
   logsArgs() { return { cmd: 'tmux', args: [] }; },
 };
 
-describe('Phase 0 application services', () => {
+describe('application services', () => {
   it('unions configured, permanent, temporary, orphan, and corrupt state without secrets', async () => {
     const root = fixture();
     writeFileSync(join(root, 'fleet.yaml'), `

@@ -54,7 +54,7 @@ const baseDeps = (launchChild: ReturnType<typeof fakeChild>) => ({
   },
 });
 
-/** Writes the fixture good report (Task 4's `good()`), with an mtime old enough
+/** Writes the fixture good report, with an mtime old enough
  *  to satisfy the write-complete heuristic. */
 function writeGoodReport(runDir: string): void {
   const good = readFileSync('test/fixtures/watchdog-good-report.json', 'utf8')
@@ -166,7 +166,7 @@ describe('executeWatchdogRun', () => {
     expect(manifest!.roles).toEqual([{ name: 'Alice', stateDir: agentDir('Alice') }]);
   });
 
-  it('stores status error with tail when the agent writes invalid JSON (acceptance 9)', async () => {
+  it('stores status error with tail when the agent writes invalid JSON', async () => {
     const launch = fakeChild(async runDir => {
       writeFileSync(join(runDir, 'run.log'), 'boom secret=hunter2');
       writeFileSync(join(runDir, 'report.json'), '{nope');
@@ -183,7 +183,7 @@ describe('executeWatchdogRun', () => {
     expect((report as { tail?: string }).tail).toContain('[REDACTED]');
   });
 
-  it('kills and stores error:timeout when the deadline passes (acceptance 9)', async () => {
+  it('kills and stores error:timeout when the deadline passes', async () => {
     let t = 0;
     const launch = fakeChild(() => new Promise(() => {}));   // never exits, never writes
     const deps = { ...baseDeps(launch), now: () => new Date(t += 120_000) };  // clock jumps past 5m
@@ -204,7 +204,7 @@ describe('executeWatchdogRun', () => {
     expect(listRuns('nightwatch')).toHaveLength(3);   // newest 3 kept, oldest pruned
   });
 
-  it('marks the report isolation: degraded when the run dir carries the marker (spec §7)', async () => {
+  it('marks the report isolation: degraded when the run dir carries the marker', async () => {
     const launch = fakeChild(async runDir => {
       writeFileSync(join(runDir, '.isolation-degraded'), '2026-07-31T11:50:00Z no bwrap\n');
       writeGoodReport(runDir);
@@ -213,7 +213,7 @@ describe('executeWatchdogRun', () => {
     expect((report as { isolation?: string }).isolation).toBe('degraded');
   });
 
-  it('snapshots start_stagger_ms into the run dir before launch (spec §3)', async () => {
+  it('snapshots start_stagger_ms into the run dir before launch', async () => {
     let seen = '';
     const launch = fakeChild(async runDir => {
       seen = readFileSync(join(runDir, START_STAGGER_FILE), 'utf8');
@@ -225,7 +225,7 @@ describe('executeWatchdogRun', () => {
     expect(seen).toBe('1234');
   });
 
-  it('injects the suppression digest into watch.json and reconciles the ledger after the run (acceptance 5/6)', async () => {
+  it('injects the suppression digest into watch.json and reconciles the ledger after the run', async () => {
     writeLedger('nightwatch', {
       version: 1, heldDownAlerted: false,
       open: { Alice: { role: 'Alice', status: 'stale', since: '2026-07-31T10:00:00Z', lastAlertedAt: '2026-07-31T10:00:00Z' } },
@@ -233,7 +233,7 @@ describe('executeWatchdogRun', () => {
     let manifest: WatchManifest | undefined;
     const launch = fakeChild(async runDir => {
       manifest = JSON.parse(readFileSync(join(runDir, 'watch.json'), 'utf8'));
-      writeGoodReport(runDir);   // Alice blocked, alerted:true, alerts:[Alice] (Task 7 fixture)
+      writeGoodReport(runDir);   // Alice blocked, alerted:true, alerts:[Alice]
     });
     // Freeze the run's clock to one deterministic instant (still close enough to real
     // wall-clock time that the write-stable heuristic against report.json's real mtime
@@ -252,7 +252,7 @@ describe('executeWatchdogRun', () => {
     expect(ledger.open.Alice.lastAlertedAt).toBe(runNow.toISOString());
   });
 
-  it('a healthy report closes the open finding (resolved path, acceptance 6)', async () => {
+  it('a healthy report closes the open finding', async () => {
     writeLedger('nightwatch', {
       version: 1, heldDownAlerted: false,
       open: { Alice: { role: 'Alice', status: 'blocked', since: '2026-07-31T10:00:00Z', lastAlertedAt: '2026-07-31T10:00:00Z' } },

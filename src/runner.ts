@@ -8,7 +8,7 @@ import {
   type ResolvedRole,
 } from './config.js';
 import { getAdapter } from './harness/registry.js';
-import type { Launch } from './harness/types.js';
+import type { AcpLaunch, Launch } from './harness/types.js';
 import { Tmux } from './tmux.js';
 import {
   createMonitor, probeIdentityPresence,
@@ -45,6 +45,7 @@ import {
 } from './fleet-proxy.js';
 import type { SpawnOpts } from './spawn.js';
 import { effectivePermissionMode } from './permissions.js';
+import { assertModelPinReachesChild, effectiveRoleModel, repinModelEnv } from './model-env.js';
 import {
   archiveTempState, markTempSupervisorActive, requestedTempStopReason,
   type TempTerminationReason,
@@ -108,6 +109,8 @@ const defaultDeps = (): RunnerDeps => ({
 });
 
 const MONITOR_OWNER_FILE = '.monitor-owner';
+/** Fleet roles consume the operator-owned daemon; a role session never starts it. */
+const FLEET_OURS_AUTOSTART = '0';
 
 /** Environment injected only into the managed harness process. */
 export function managedFleetProxyEnv(
@@ -115,9 +118,28 @@ export function managedFleetProxyEnv(
 ): Record<string, string> {
   return {
     ...(role.env ?? {}),
+    // This must win over both inherited/configured auto-start. ACP agents run
+    // directly rather than through ours-codex, so the runner owns this fence.
+    OURS_AUTOSTART: FLEET_OURS_AUTOSTART,
     [FLEET_PROXY_STATE_DIR_ENV]: stateDir,
     [FLEET_PROXY_CALLER_ENV]: role.name,
   };
+}
+
+/**
+ * The environment a managed harness child actually receives, checked at the one
+ * point where it is composed. `role.env` deliberately wins over harness prep,
+ * which is exactly how a stale fleet-wide model pin used to outrank the model
+ * the role was spawned with — so the model pin is verified here rather than
+ * trusted, and a disagreement stops the launch instead of being reported as a
+ * success (see src/model-env.ts).
+ */
+export function harnessChildEnv(
+  role: ResolvedRole, launchEnv: Record<string, string> | undefined, stateDir: string,
+): Record<string, string> {
+  const env = { ...(launchEnv ?? {}), ...managedFleetProxyEnv(role, stateDir) };
+  assertModelPinReachesChild(role, env);
+  return env;
 }
 
 /**
@@ -154,13 +176,19 @@ async function executeManagedSpawn(
     statePath,
     harness: preview.harness,
     session: preview.session,
-    ...(preview.model ? { model: preview.model } : {}),
+    // Read back from the resolved environment, not from the request: the banner
+    // must name the model the child will run, not the one that was asked for.
+    ...(effectiveRoleModel(preview) ? { model: effectiveRoleModel(preview)! } : {}),
     monitor: { mode: preview.monitor.mode, interrupt: preview.monitor.interrupt },
+    permissionMode: effectivePermissionMode(preview),
     inherited,
     creationActionId,
   };
   log(`[${caller.name}] managed fleet proxy spawned ${result.lifetime} role ${result.role} `
-    + `harness=${result.harness} session=${result.session}`);
+    + `harness=${result.harness} session=${result.session} `
+    + `model=${result.model ?? '(harness default)'} `
+    + `permission=${result.permissionMode!.fleetMode} `
+    + `native=${result.permissionMode!.nativeMode}`);
   return result;
 }
 
@@ -193,6 +221,10 @@ export function buildPaneCommand(
 ): string {
   const env = {
     PATH: process.env.PATH ?? '', COLORTERM: 'truecolor', ...launch.env, ...(roleEnv ?? {}),
+    // Tmux roles have the same daemon-client boundary as ACP roles. Keep this
+    // last so neither harness preparation nor a role env block can take over
+    // the shared daemon lifecycle.
+    OURS_AUTOSTART: FLEET_OURS_AUTOSTART,
   };
   // Interactive panes should advertise colour even when the supervisor itself
   // was launched with NO_COLOR. A role may still deliberately opt back in to
@@ -245,7 +277,7 @@ export function readExitRecord(path: string): ExitRecord | null {
   return { version: 1, class: 'unknown', detail: `unreadable exit record: ${raw.slice(0, 120)}` };
 }
 
-// ─── Restart-loop containment (3.2) ──────────────────────────────────────────
+// ─── Restart-loop containment ──────────────────────────────────────────
 //
 // The child-session restart loop used to BE the service manager: systemd's
 // `Restart=always RestartSec=2` and launchd's `KeepAlive`. Neither can count,
@@ -263,6 +295,24 @@ const RESTART_BACKOFF_MAX_MS = 60_000;
 /** How often a held-down runner re-reads its ledger, so `up` can release it. */
 const HELD_DOWN_POLL_MS = 5_000;
 
+/**
+ * How the previous supervisor process ended.
+ *
+ * `abrupt` is the case the ledger used to miss entirely: an OOM-kill or any
+ * other external signal takes the supervisor down before it can write anything,
+ * the service manager restarts the unit, and every durable indicator still
+ * describes the run that died. A health check reading them reported "no
+ * restarts" for a role that had died and come back.
+ */
+export interface TerminationRecord {
+  class: 'clean' | 'abrupt' | 'unknown';
+  detail: string;
+  /** When the SURVIVING process observed it, not when it happened. */
+  observedAt: string;
+  /** Start time of the run that ended, when it was recorded. */
+  runStartedAt?: string;
+}
+
 export interface RestartLedger {
   version: 1;
   consecutiveImmediateFailures: number;
@@ -274,6 +324,12 @@ export interface RestartLedger {
   updatedAt: string;
   /** When the circuit opened, for the held-down status line. */
   openedAt?: string;
+  /** How the previous supervisor process ended, including abnormal exits. */
+  lastTermination?: TerminationRecord;
+  /** Supervisor processes that died without closing their run marker. */
+  abruptTerminations?: number;
+  /** Start of the supervisor run that owns this state directory now. */
+  supervisorStartedAt?: string;
 }
 
 const emptyLedger = (): RestartLedger => ({
@@ -284,6 +340,69 @@ const emptyLedger = (): RestartLedger => ({
   resumeDiscarded: false,
   circuit: 'closed',
   updatedAt: new Date(0).toISOString(),
+});
+
+/**
+ * Carried across a supervisor process's life so its successor can tell an
+ * orderly exit from a kill. Present on disk == "a supervisor believed it was
+ * running"; the next start finding one that is not its own is proof the
+ * previous process died without getting to write anything.
+ */
+export const RUN_MARKER_FILE = '.supervisor-run.json';
+
+interface RunMarker { version: 1; pid: number; startedAt: string; unit?: string }
+
+function readRunMarker(dir: string): RunMarker | undefined {
+  try {
+    const raw = JSON.parse(readFileSync(join(dir, RUN_MARKER_FILE), 'utf8')) as Partial<RunMarker>;
+    return raw.version === 1 && typeof raw.pid === 'number' && typeof raw.startedAt === 'string'
+      ? raw as RunMarker : undefined;
+  } catch { return undefined; }
+}
+
+/**
+ * Claim this state directory for the current supervisor process and report how
+ * the previous one ended. Runs BEFORE the first attempt, which is the whole
+ * point: after an abrupt kill nothing else writes until an attempt finishes,
+ * and an attempt can take minutes.
+ */
+export function claimSupervisorRun(
+  dir: string, startedAt: string, pid = process.pid,
+): TerminationRecord {
+  const previous = readRunMarker(dir);
+  const termination: TerminationRecord = previous && previous.pid !== pid
+    ? {
+      class: 'abrupt',
+      detail: `supervisor pid ${previous.pid} left an open run marker; `
+        + 'it was terminated without an orderly exit (signal, OOM-kill, or host reset)',
+      observedAt: startedAt,
+      runStartedAt: previous.startedAt,
+    }
+    : previous
+      ? { class: 'unknown', detail: 'run marker belongs to this process', observedAt: startedAt }
+      : { class: 'clean', detail: 'no previous run marker', observedAt: startedAt };
+  try {
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(join(dir, RUN_MARKER_FILE),
+      JSON.stringify({ version: 1, pid, startedAt } satisfies RunMarker, null, 2) + '\n');
+  } catch { /* diagnostics must never take the role down */ }
+  return termination;
+}
+
+/** Orderly exit: the successor must not read this run as a kill. */
+export function releaseSupervisorRun(dir: string): void {
+  try { rmSync(join(dir, RUN_MARKER_FILE), { force: true }); } catch { /* best effort */ }
+}
+
+/**
+ * Fields that describe THIS process's history rather than the current failure
+ * streak. Clearing the streak (recovery, an operator `up`, an approved model
+ * transition) must not erase the record that the role died and came back.
+ */
+const carriedForward = (previous: RestartLedger): Partial<RestartLedger> => ({
+  ...(previous.lastTermination ? { lastTermination: previous.lastTermination } : {}),
+  ...(previous.abruptTerminations ? { abruptTerminations: previous.abruptTerminations } : {}),
+  ...(previous.supervisorStartedAt ? { supervisorStartedAt: previous.supervisorStartedAt } : {}),
 });
 
 /** Bounded exponential backoff for the nth consecutive immediate failure. */
@@ -317,7 +436,10 @@ export function writeRestartLedger(dir: string, ledger: RestartLedger): void {
  */
 export function resetRestartLedger(dir: string): void {
   if (!existsSync(dir)) return;
-  writeRestartLedger(dir, { ...emptyLedger(), updatedAt: new Date().toISOString() });
+  const previous = readRestartLedger(dir);
+  writeRestartLedger(dir, {
+    ...emptyLedger(), ...carriedForward(previous), updatedAt: new Date().toISOString(),
+  });
 }
 
 /** Filename spawnTemp writes into a temp agent dir to carry the fleet start-stagger. */
@@ -460,11 +582,18 @@ export async function runOnce(
   const effectiveModel = effectiveModelForRole(dir, role);
   if (effectiveModel !== role.model) {
     deps.log(`[${name}] model recovery drift: declared=${role.model ?? '(none)'} effective=${effectiveModel}`);
-    role = { ...role, model: effectiveModel };
+    // The env pin has to move with it. A down-shift that changed only
+    // `role.model` was reported as a model change while the child kept running
+    // the model that had just failed, because the pin is what the harness reads.
+    role = { ...role, model: effectiveModel, env: repinModelEnv(role, effectiveModel) };
   }
   if (modelRecoveryHeld(dir))
     throw new Error(`[${name}] model chain exhausted — held down until config changes or recovery reset`);
   const adapter = getAdapter(role.harness);
+  // Say the running model out loud, once, from the resolved environment. The
+  // spawn banner is a claim made before the process exists; this is the log line
+  // that can be checked against the session afterwards.
+  deps.log(`[${name}] model: ${effectiveRoleModel(role) ?? '(harness default)'}`);
   mkdirSync(dir, { recursive: true });
   const rotation = rotateWorklog(join(dir, 'WORKLOG.md'), role.worklog);
   if (rotation.deferred)
@@ -479,7 +608,12 @@ export async function runOnce(
   const exitFile = join(dir, '.exit-status');
   const booted = existsSync(bootedFile);
   const mode: 'fresh' | 'resume' = booted && adapter.supportsResume ? 'resume' : 'fresh';
-  if (mode === 'fresh') writeFileSync(bootedFile, '');
+  // Stamp EVERY attempt, not just the first. `.booted` used to be written only
+  // on the fresh path, so after a restart — including one the supervisor never
+  // saw, like an OOM-kill — its mtime still read the original boot and any
+  // health check reading it reported "no restarts". The existence test above
+  // already ran, so rewriting cannot change the fresh/resume decision.
+  writeFileSync(bootedFile, `${new Date(deps.now()).toISOString()} ${mode}\n`);
 
   const runCwd = role.cwd && existsSync(role.cwd) ? role.cwd : dir;
   const prep = await adapter.prepareSession(role, { stateDir: dir, runCwd });
@@ -493,11 +627,11 @@ export async function runOnce(
     : adapter.buildLaunch(role, mode, { sessionId }, prep);
 
   // Isolation is additive: only roles that declare `isolation:` are wrapped. The
-  // env prefix + exit capture in buildPaneCommand stay host-side (see §5.3).
+  // env prefix + exit capture in buildPaneCommand stay host-side.
   let wrappedArgv = launch.argv;
   if (role.isolation) {
-    // Start with the SAME durable context config validation and doctor judged
-    // (5.2), then add the selected launch's exact runtime closure. Those paths
+    // Start with the same durable context that config validation and doctor judged,
+    // then add the selected launch's exact runtime closure. Those paths
     // still pass through resolveIsolation's canonical blocklist enforcement.
     const runtime = resolveLaunchRuntime(launch.argv);
     launch = { ...launch, argv: runtime.argv };
@@ -517,8 +651,8 @@ export async function runOnce(
     }
     wrappedArgv = sel.backend.wrap(launch.argv, policy, ctx);
 
-    // Resource caps wrap the sandbox from OUTSIDE, at the pane's own cgroup scope
-    // (§5.4). Applies even when the sandbox degraded to none.
+    // Resource caps wrap the sandbox from outside, at the pane's own cgroup scope.
+    // This applies even when the sandbox degraded to none.
     const { argv: rprefix, warnings } = resourceArgs(policy.resources, deps.cpuDelegated());
     for (const w of warnings) deps.log(`[${name}] WARNING ${w}`);
     if (rprefix.length) wrappedArgv = [...rprefix, ...wrappedArgv];
@@ -539,7 +673,7 @@ export async function runOnce(
     }
   }
 
-  // Supervisor mail monitor (design §1): prime the notification cursor at the
+  // Prime the supervisor mail monitor's notification cursor at the
   // stream tip BEFORE the session launches so no arrival is missed during boot
   // (backlog before the tip is the SessionStart hook's job). Native-mode roles
   // leave wake ownership to the harness. Temp snapshots predating `monitor:` are
@@ -605,12 +739,23 @@ export async function runOnce(
       name,
       argv: wrappedArgv,
       cwd: runCwd,
-      env: { ...launch.env, ...managedFleetProxyEnv(role, dir) },
+      env: harnessChildEnv(role, launch.env, dir),
       stateDir: dir,
       mode,
       permissions: perms,
       modeId: adapter.acpPermissionModeId?.(role),
+      // The role's declared MCP servers, and the bundled agent's `_meta`
+      // vocabulary for the options it takes no flag for. Both come from the
+      // ADAPTER and from `prep`: the ACP launch cannot carry `prep.argv`, so this
+      // is the route by which harness_options that used to be silently dropped
+      // for an ACP role actually reach the session.
+      mcpServers: adapter.acpMcpServers?.(role),
+      sessionMeta: adapter.acpSessionMeta?.(role, prep),
       permissionMode: effectivePermissionMode(role),
+      // Provenance travels with the exact ACP launch. Keeping it out of a
+      // role-only adapter hook prevents a PATH fallback or resolver skew from
+      // claiming metadata trust for an argv it did not authenticate.
+      permissionMetadataSource: (launch as AcpLaunch).permissionMetadataSource,
       log: deps.log,
     });
     pid = acpSession.pid;
@@ -992,6 +1137,28 @@ export async function runSupervised(
   const shouldStop = deps.shouldStop ?? (() => false);
   const stamp = () => new Date(deps.now()).toISOString();
 
+  // Record how the PREVIOUS supervisor process ended before doing anything
+  // else. An external kill writes nothing itself, and the next ledger write is
+  // an attempt away — which is why an OOM-kill used to leave every durable
+  // indicator describing the run that died.
+  const startedAt = stamp();
+  const termination = claimSupervisorRun(dir, startedAt);
+  {
+    const previous = readRestartLedger(dir);
+    const abrupt = (previous.abruptTerminations ?? 0) + (termination.class === 'abrupt' ? 1 : 0);
+    writeRestartLedger(dir, {
+      ...previous,
+      lastTermination: termination,
+      abruptTerminations: abrupt,
+      supervisorStartedAt: startedAt,
+      updatedAt: startedAt,
+    });
+    if (termination.class === 'abrupt')
+      deps.log(`[${name}] previous supervisor run (started ${termination.runStartedAt}) `
+        + `ended abruptly: ${termination.detail}; abrupt terminations recorded: ${abrupt}`);
+  }
+
+  try {
   while (!shouldStop()) {
     let ledger = readRestartLedger(dir);
     try {
@@ -1043,6 +1210,7 @@ export async function runSupervised(
     if (result.modelRecovery === 'advance') {
       writeRestartLedger(dir, {
         ...emptyLedger(),
+        ...carriedForward(ledger),
         lastReason: 'approved model-chain transition',
         updatedAt: stamp(),
       });
@@ -1053,12 +1221,21 @@ export async function runSupervised(
       continue;
     }
     const fastFailSecs = fastFailSecsFor(name, opts.configPath);
-    const immediate = result.elapsedSecs < fastFailSecs;
+    // The fast-fail boundary starts a recovery episode; it must not also be
+    // the boundary that declares recovery successful. Otherwise alternating
+    // 19s and 20s deaths erase one another forever. Require the configured
+    // number of fast-fail windows to survive before closing an active streak.
+    // This hysteresis stays adapter-relative (100s for the current 20s/5-attempt
+    // policy) and still lets a genuinely sustained session reset the breaker.
+    const stableRecoverySecs = fastFailSecs * RESTART_FAIL_THRESHOLD;
+    const recoveryFailed = result.elapsedSecs < fastFailSecs
+      || (ledger.consecutiveImmediateFailures > 0 && result.elapsedSecs < stableRecoverySecs);
 
-    if (!immediate) {
+    if (!recoveryFailed) {
       // A session that ran for a while is not a restart loop, whatever ended it.
       writeRestartLedger(dir, {
         ...emptyLedger(),
+        ...carriedForward(ledger),
         lastReason: result.exit.detail,
         updatedAt: stamp(),
       });
@@ -1069,6 +1246,7 @@ export async function runSupervised(
     const reason = `${result.exit.detail} after ${result.elapsedSecs.toFixed(1)}s`;
     const next: RestartLedger = {
       version: 1,
+      ...carriedForward(ledger),
       consecutiveImmediateFailures: failures,
       lastReason: reason,
       nextDelayMs: backoffFor(failures),
@@ -1090,6 +1268,11 @@ export async function runSupervised(
     await deps.sleep(next.nextDelayMs);
   }
   return readRestartLedger(dir);
+  } finally {
+    // Only an orderly return through this loop clears the marker; a signal or
+    // an OOM-kill leaves it, which is exactly how the successor detects them.
+    releaseSupervisorRun(dir);
+  }
 }
 
 /**

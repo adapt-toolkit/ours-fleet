@@ -56,7 +56,7 @@ describe('harness registry', () => {
   });
 });
 
-describe('adapter permission-translation contract (2.3)', () => {
+describe('adapter permission-translation contract', () => {
   it('refuses to register an adapter that does not declare translatePermissions', () => {
     const { translatePermissions, ...silent } = fakeAdapter;
     expect(() => registerAdapter({ ...silent, id: 'silent' } as unknown as HarnessAdapter))

@@ -86,7 +86,7 @@ async function inSandbox(script: string) {
   return realExec(argv[0], argv.slice(1));
 }
 
-describe('shared harness credentials are read-only inside a real sandbox (5.1)', () => {
+describe('shared harness credentials are read-only inside a real sandbox', () => {
   it('refuses a write to the shared credential file', async ctx => {
     requireSandbox(ctx);
     const r = await inSandbox(`echo STOLEN > ${JSON.stringify(join(home, '.claude.json'))}`);

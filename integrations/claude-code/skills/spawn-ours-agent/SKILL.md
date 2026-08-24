@@ -55,6 +55,7 @@ What this means in practice, on this harness:
 | --- | --- | --- |
 | `--approval allow --filesystem workspace` | `bypassPermissions` | yes |
 | `--approval allow --filesystem read-only` | `bypassPermissions` | no — no `write-state`, no `workspace-edit` |
+| `--approval auto` | `acceptEdits` | no — `read-state` only |
 | `--approval ask` | Claude's default | no — `read-state` only |
 | `--approval deny` | `plan` | no — `read-state` only |
 | `harness_options.permission_mode: dontAsk` | `dontAsk` | no — `read-state`, `status-commands` |

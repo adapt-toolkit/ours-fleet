@@ -33,8 +33,12 @@ import { stringify } from 'yaml';
 import { resolvedRolePlan } from './resolved-plan.js';
 import { creationBuildNote, formatProvenance, readProvenance } from './creation.js';
 import { doctor } from './doctor.js';
-import { allWarnings, analyzeFleetPermissions, formatNative } from './permissions.js';
+import {
+  allWarnings, analyzeFleetPermissions, effectivePermissionMode, formatNative,
+} from './permissions.js';
 import { AI_DOCS } from './docs.js';
+import { classifyActivity, describeSessionState } from './session/activity.js';
+import type { SessionActivity } from './session/types.js';
 import {
   controlRequest, controlSocketPath, followControl, livenessNote,
 } from './session/control.js';
@@ -352,8 +356,15 @@ program.command('ls').description('list running fleet sessions')
         if (!existsSync(controlSocketPath(stateDir))) continue;
         try {
           const response = await controlRequest(stateDir, { command: 'status' }, 2_000);
-          if (response.ok && (response.result as { alive?: boolean } | undefined)?.alive)
-            acp.push(`${name}: acp`);
+          const result = response.result as
+            { alive?: boolean; activity?: SessionActivity } | undefined;
+          if (response.ok && result?.alive) {
+            // Activity, not readiness: an idle-readiness role may be running a
+            // steered wake turn (FLEET-002), so `ls` reports what was observed.
+            const observed = classifyActivity(result.activity);
+            acp.push(`${name}: acp${observed.state === 'active' ? ' (working)'
+              : observed.state === 'quiet' ? ' (no recent agent activity)' : ''}`);
+          }
         } catch { /* ignore stale sockets */ }
       }
     }
@@ -466,7 +477,7 @@ program.command('status <name>').description('unit/agent state')
     const buildNote = created && creationBuildNote(created);
     if (buildNote) console.log(`build: ${buildNote}`);
     // A held-down role looks like a healthy running unit from the outside — the
-    // runner is alive on purpose. Say so, with the reason and when (3.2).
+    // runner is alive on purpose. Say so, with the reason and when.
     const ledger = readRestartLedger(agentDir(name));
     if (ledger.circuit === 'open')
       console.log(`HELD DOWN since ${ledger.openedAt ?? ledger.updatedAt} after `
@@ -475,6 +486,14 @@ program.command('status <name>').description('unit/agent state')
     else if (ledger.consecutiveImmediateFailures > 0)
       console.log(`restarts: ${ledger.consecutiveImmediateFailures} consecutive immediate `
         + `failures, next delay ${ledger.nextDelayMs}ms (${ledger.lastReason})`);
+    // A kill the supervisor never saw leaves no other trace here. Say it out
+    // loud rather than letting the absence of a failure streak read as "fine".
+    if (ledger.lastTermination?.class === 'abrupt')
+      console.log(`last termination: ABRUPT — the previous supervisor run (started `
+        + `${ledger.lastTermination.runStartedAt ?? 'unknown'}) died without an orderly exit; `
+        + `observed ${ledger.lastTermination.observedAt}`
+        + `\n  abrupt terminations recorded: ${ledger.abruptTerminations ?? 1}`
+        + `\n  cause (signal / OOM-kill): journalctl --user -u ours-fleet-agent@${name}.service`);
     const modelStatus = joinPath(agentDir(name), '.model-status');
     if (existsSync(modelStatus)) {
       try {
@@ -491,7 +510,16 @@ program.command('status <name>').description('unit/agent state')
     if (stateDir) {
       try {
         const response = await controlRequest(stateDir, { command: 'status' }, 2_000);
-        if (response.ok) console.log(`session: ${JSON.stringify(response.result)}`);
+        if (response.ok) {
+          const snapshot = response.result as {
+            readiness?: string; activity?: SessionActivity;
+          };
+          console.log(`session: ${JSON.stringify(response.result)}`);
+          // `readiness` is turn occupancy, never an activity claim: a steered
+          // wake turn runs to completion with readiness pinned at `idle`
+          // (FLEET-002). Say which question each field answers.
+          console.log(describeSessionState(snapshot.readiness, snapshot.activity));
+        }
       } catch { console.log('session: acp control unavailable'); }
     }
     // Loop health is asked of the live manager first: when its state writes are
@@ -589,7 +617,10 @@ function renderLoopRows(role: string, state: ReturnType<typeof readScheduledLoop
     `${role}/${name} ${item.enabled && !item.operatorDisabled ? 'enabled' : 'disabled'} `
       + `${item.activeRunId ? 'running' : 'idle'} next=${item.nextDueAt} last=${item.lastOutcome ?? 'never'} `
       + `counts=${item.counts.started}/${item.counts.completed}/${item.counts.failed} `
-      + `skip=${item.counts.skipped}(busy=${item.counts.skippedBusy},missed=${item.counts.skippedMissed})`);
+      + `skip=${item.counts.skipped}(busy=${item.counts.skippedBusy},missed=${item.counts.skippedMissed})`
+      + (item.missedGap
+        ? ` gap=${item.missedGap.count}@${item.missedGap.fromAt}..${item.missedGap.throughAt}`
+        : ''));
 }
 
 cOpt(loopsCommand.command('status [role] [loop]').description('show live or stored loop state'))
@@ -843,7 +874,7 @@ cOpt(ownerAuthorizationCommand.command('revoke <Role> <contact-cid>')
 /**
  * A watchdog is addressable if it's still configured, or its store dir survives
  * config removal. The name-shape check runs BEFORE any filesystem lookup
- * (finding #1): a hostile `name` (path separators, '..', etc.) must never
+ * A hostile `name` (path separators, '..', etc.) must never
  * reach `join(watchdogsRoot(), name)` — treated as simply unknown, same as
  * store.ts's own `watchdogDir` choke-point guard (defense in depth).
  */
@@ -860,7 +891,7 @@ function renderHeldDownLine(state: WatchdogSchedulerState): string | undefined {
     + `consecutive failures: ${state.lastError ?? 'unknown error'}`;
 }
 
-/** errorReport() rides a bounded diagnostic tail as an extra key outside WatchdogReport proper (spec: acceptance 9). */
+/** errorReport() carries a bounded diagnostic tail as an extra key outside WatchdogReport proper. */
 type ReportWithTail = WatchdogReport & { tail?: string };
 
 /** Full human rendering of one report: header, held-down warning, counts, then non-healthy roles + evidence. */
@@ -987,7 +1018,7 @@ cOpt(program.command('spawn [name]').description('spawn a new agent (permanent b
   .option('--coordinator <name>', 'announce target')
   .option('--model <id>', 'model id to launch on (e.g. claude-fable-5); default: launcher default')
   .option('--permission-mode <mode>', 'harness permission mode (Codex: untrusted|on-request|never; Claude: native values)')
-  .option('--approval <mode>', 'fleet permission mode: ask|auto|allow (deny is deprecated)')
+  .option('--approval <mode>', 'fleet permission mode: ask|auto|allow (Codex ACP allow selects agent-full-access; deny is deprecated)')
   .option('--filesystem <mode>', 'common filesystem intent: read-only|workspace|unrestricted')
   .option('--unattended <mode>', 'permission behavior without a console: deny|wait')
   .option('--sandbox <mode>', 'Codex sandbox: read-only|workspace-write|danger-full-access')
@@ -1056,13 +1087,17 @@ cOpt(program.command('spawn [name]').description('spawn a new agent (permanent b
         console.log(`spawned ${result.lifetime} agent '${result.role}' through `
           + `${result.caller}'s fleet proxy (state: ${result.statePath})`);
         console.log(`  ${result.harness}/${result.session}`
-          + `${result.model ? ` model=${result.model}` : ''}; `
+          + `${result.model ? ` model=${result.model}` : ''}`
+          + (result.permissionMode
+            ? `; permission=${result.permissionMode.fleetMode} native=${result.permissionMode.nativeMode}`
+            : '') + '; '
           + `monitor=${result.monitor.mode} interrupt=${result.monitor.interrupt}`);
         if (result.inherited.length)
           console.log(`  inherited omitted defaults from ${result.caller}: ${result.inherited.join(', ')}`);
         console.log(`→ watch it: ours-fleet peek ${result.role}   |   attach: ours-fleet attach ${result.role}`);
         return;
       }
+      const plannedPermissionMode = effectivePermissionMode(spawnDryRun(o).resolvedRole);
       if (o.temp) {
         const dir = await spawnTemp(o, binPath);
         console.log(`spawned temp agent '${roleName}' (state: ${dir}; gone on exit/reboot)`);
@@ -1071,13 +1106,15 @@ cOpt(program.command('spawn [name]').description('spawn a new agent (permanent b
         console.log(`spawned '${roleName}' (config: ${file})`);
       }
       // The same provenance that was persisted, so what the operator reads now
-      // and what a reviewer reads later cannot disagree (6.6).
+      // and what a reviewer reads later cannot disagree.
       if (lastProvenance) {
         console.log(`  created by ${lastProvenance.command} `
           + `v${lastProvenance.fleetVersion}+${lastProvenance.fleetBuild} `
           + `at ${lastProvenance.createdAt} (${lastProvenance.lifetime})`);
         for (const line of formatProvenance(lastProvenance)) console.log(line);
       }
+      console.log(`  permission=${plannedPermissionMode.fleetMode} `
+        + `native=${plannedPermissionMode.nativeMode}`);
       console.log(`→ watch it: ours-fleet peek ${roleName}   |   attach: ours-fleet attach ${roleName}`);
     } catch (e) { die(e); }
   });
@@ -1276,7 +1313,7 @@ program.command('_run <name>', { hidden: true }).description('internal: supervis
   .option('-c, --configuration <file>')
   .action(async (name, opts) => {
     // The supervised loop, not a single session: restart policy lives here now,
-    // where it can count across attempts (3.2).
+    // where it can count across attempts.
     try { await runSupervised(name, { configPath: opts.configuration }); } catch (e) { die(e); }
   });
 

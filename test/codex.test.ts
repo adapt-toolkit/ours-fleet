@@ -2,7 +2,9 @@ import { describe, it, expect } from 'vitest';
 import { existsSync, mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { makeCodexAdapter, codexCapabilities } from '../src/harness/codex.js';
+import {
+  codexAcpLaunchForResolution, makeCodexAdapter, codexCapabilities,
+} from '../src/harness/codex.js';
 import { checkUnattendedFloor } from '../src/permissions.js';
 import { agentDir } from '../src/paths.js';
 import type { ResolvedRole } from '../src/config.js';
@@ -27,13 +29,15 @@ describe('prepareSession', () => {
   it('prefers ours-codex when installed', async () => {
     const a = makeCodexAdapter(execWith(true));
     const prep = await a.prepareSession(role(), { stateDir: '/s', runCwd: '/s' });
-    expect(prep).toEqual({ argv: [], env: {}, command: 'ours-codex' });
+    expect(prep).toEqual({
+      argv: [], env: { OURS_BIND_IDENTITY: 'Alice Dev' }, command: 'ours-codex' });
   });
 
   it('falls back to native codex when ours-codex is absent', async () => {
     const a = makeCodexAdapter(execWith(false));
     const prep = await a.prepareSession(role(), { stateDir: '/s', runCwd: '/s' });
-    expect(prep).toEqual({ argv: [], env: {}, command: 'codex' });
+    expect(prep).toEqual({
+      argv: [], env: { OURS_BIND_IDENTITY: 'Alice Dev' }, command: 'codex' });
   });
 
   it('fails clearly when ours-codex was explicitly required', async () => {
@@ -52,18 +56,17 @@ describe('prepareSession', () => {
       const prep = await makeCodexAdapter(okExec).prepareSession(r, { stateDir, runCwd: stateDir });
       expect(prep.env).toMatchObject({
         OURS_FLEET_CODEX_APPROVAL: 'never',
-        OURS_FLEET_CODEX_SANDBOX: 'workspace-write',
+        OURS_FLEET_CODEX_SANDBOX: 'danger-full-access',
       });
       expect(prep.env.CODEX_PATH.startsWith(stateDir)).toBe(true);
       expect(existsSync(prep.env.CODEX_PATH)).toBe(true);
       const launch = makeCodexAdapter(okExec).buildAcpLaunch!(r, prep);
       expect(launch.env).toMatchObject({
         CODEX_PATH: prep.env.CODEX_PATH,
-        INITIAL_AGENT_MODE: 'agent',
+        INITIAL_AGENT_MODE: 'agent-full-access',
         OURS_FLEET_CODEX_APPROVAL: 'never',
-        OURS_FLEET_CODEX_SANDBOX: 'workspace-write',
+        OURS_FLEET_CODEX_SANDBOX: 'danger-full-access',
       });
-      expect(launch.env.INITIAL_AGENT_MODE).not.toBe('agent-full-access');
     } finally {
       rmSync(stateDir, { recursive: true, force: true });
     }
@@ -75,8 +78,18 @@ describe('prepareSession', () => {
       permissions: { approval: 'allow', filesystem: 'workspace', unattended: 'deny' },
     });
     const prep = await makeCodexAdapter(okExec).prepareSession(r, { stateDir: '/s', runCwd: '/s' });
-    expect(prep.env).toEqual({});
+    expect(prep.env).toEqual({ OURS_BIND_IDENTITY: 'Alice Dev' });
     expect(makeCodexAdapter(okExec).effectivePermissions!(r)).toMatchObject({ exact: false });
+  });
+
+  it('seeds OURS_BIND_IDENTITY onto both launches', async () => {
+    const r = role();
+    const prep = await makeCodexAdapter(okExec).prepareSession(r, { stateDir: '/s', runCwd: '/s' });
+    expect(prep.env.OURS_BIND_IDENTITY).toBe('Alice Dev');
+    expect(makeCodexAdapter(okExec).buildLaunch(r, 'fresh', { sessionId: 's' }, prep)
+      .env.OURS_BIND_IDENTITY).toBe('Alice Dev');
+    expect(makeCodexAdapter(okExec).buildAcpLaunch!(r, prep).env.OURS_BIND_IDENTITY)
+      .toBe('Alice Dev');
   });
 });
 
@@ -190,26 +203,88 @@ describe('buildAcpLaunch', () => {
     expect(launch.argv[0]).toBe(process.execPath);
     expect(launch.argv[1]).toMatch(
       /@agentclientprotocol[/\\]codex-acp[/\\]dist[/\\]index\.js$/);
-  });
-
-  it('preserves an explicit ACP command override', () => {
-    const launch = makeCodexAdapter(okExec).buildAcpLaunch!(
-      role({ session_options: { acp: { command: ['custom-codex-acp', '--flag'] } } }),
-      { argv: [], env: {} },
-    );
-    expect(launch.argv).toEqual(['custom-codex-acp', '--flag']);
+    expect(launch.permissionMetadataSource).toBe('codex-acp');
   });
 
   it.each([
-    ['workspace', 'agent'],
-    ['read-only', 'read-only'],
-    ['unrestricted', 'agent-full-access'],
-  ] as const)('selects the ACP sandbox preset for filesystem=%s without widening it',
-    (filesystem, mode) => {
+    [['custom-codex-acp', '--flag'], ['custom-codex-acp', '--flag']],
+    ['custom-codex-acp --flag', ['sh', '-c', 'custom-codex-acp --flag']],
+  ] as const)('preserves explicit ACP command override %j without metadata trust',
+    (command, expected) => {
+      const launch = makeCodexAdapter(okExec).buildAcpLaunch!(
+        role({ session_options: { acp: { command } } }), { argv: [], env: {} });
+      expect(launch.argv).toEqual(expected);
+      expect(launch.permissionMetadataSource).toBeUndefined();
+    });
+
+  it('binds protected-MCP metadata trust to the exact bundled Codex ACP launch', () => {
+    const launch = codexAcpLaunchForResolution({
+      argv: [process.execPath, '/fleet/codex-acp/dist/index.js'], bundled: true,
+      manifestPath: '/fleet/codex-acp/package.json', version: '1.1.7',
+    });
+    expect(launch.argv).toEqual([process.execPath, '/fleet/codex-acp/dist/index.js']);
+    expect(launch.permissionMetadataSource).toBe('codex-acp');
+  });
+
+  it.each([
+    ['bare PATH fallback', { argv: ['codex-acp'], bundled: false }],
+    ['missing manifest provenance', {
+      argv: [process.execPath, '/corrupt/codex-acp.js'], bundled: true, version: '1.1.7',
+    }],
+    ['missing version', {
+      argv: [process.execPath, '/corrupt/codex-acp.js'], bundled: true,
+      manifestPath: '/corrupt/package.json',
+    }],
+    ['version skew', {
+      argv: [process.execPath, '/skewed/codex-acp.js'], bundled: true,
+      manifestPath: '/skewed/package.json', version: '1.1.8',
+    }],
+  ] as const)('keeps %s launch metadata untrusted', (_label, resolution) => {
+    const launch = codexAcpLaunchForResolution(resolution);
+    expect(launch.argv).toEqual(resolution.argv);
+    expect(launch.permissionMetadataSource).toBeUndefined();
+  });
+
+  it.each([
+    ['allow', 'read-only', 'agent-full-access'],
+    ['allow', 'workspace', 'agent-full-access'],
+    ['allow', 'unrestricted', 'agent-full-access'],
+    ['auto', 'read-only', 'agent'],
+    ['auto', 'workspace', 'agent'],
+    ['auto', 'unrestricted', 'agent'],
+  ] as const)('maps approval=%s + filesystem=%s to ACP mode %s',
+    (approval, filesystem, mode) => {
       const launch = makeCodexAdapter(okExec).buildAcpLaunch!(role({
-        permissions: { approval: 'allow', filesystem, unattended: 'deny' },
+        permissions: { approval, filesystem, unattended: 'deny' },
       }), { argv: [], env: { KEEP: 'yes' } });
       expect(launch.env).toEqual({ KEEP: 'yes', INITIAL_AGENT_MODE: mode });
+    });
+
+  it('uses the same owner-defined mode for ACP session/set_mode', () => {
+    const a = makeCodexAdapter(okExec);
+    expect(a.acpPermissionModeId!(role({
+      permissions: {
+        approval: 'allow', filesystem: 'workspace', unattended: 'deny',
+      },
+    }))).toBe('agent-full-access');
+    expect(a.acpPermissionModeId!(role({
+      permissions: {
+        approval: 'auto', filesystem: 'unrestricted', unattended: 'deny',
+      },
+    }))).toBe('agent');
+  });
+
+  it.each([
+    ['read-only', 'read-only'],
+    ['workspace-write', 'agent'],
+    ['danger-full-access', 'agent-full-access'],
+  ] as const)('preserves explicit sandbox=%s over the neutral ACP mode mapping',
+    (sandbox, mode) => {
+      const launch = makeCodexAdapter(okExec).buildAcpLaunch!(role({
+        permissions: { approval: 'allow', filesystem: 'workspace', unattended: 'deny' },
+        harness_options: { sandbox },
+      }), { argv: [], env: {} });
+      expect(launch.env.INITIAL_AGENT_MODE).toBe(mode);
     });
 });
 
@@ -302,7 +377,7 @@ describe('validateOptions / prereqs', () => {
   });
 });
 
-describe('Codex neutral permission mapping and the unattended floor (2.1)', () => {
+describe('Codex neutral permission mapping and the unattended floor', () => {
   const a = makeCodexAdapter(okExec);
   const APPROVALS = ['ask', 'auto', 'allow', 'deny'] as const;
   const FILESYSTEMS = ['read-only', 'workspace', 'unrestricted'] as const;
@@ -315,16 +390,19 @@ describe('Codex neutral permission mapping and the unattended floor (2.1)', () =
     expect(checkUnattendedFloor((t as { capabilities: never }).capabilities).meets).toBe(true);
   });
 
-  it('reports the actual bundled ACP launch after the app-server override', () => {
+  it('reports the owner-defined bundled ACP allow and auto modes', () => {
     const workspace = a.effectivePermissions!(role({
       session: 'acp',
       permissions: { approval: 'allow', filesystem: 'workspace', unattended: 'deny' },
     }));
     expect(workspace).toMatchObject({
-      supported: true, exact: true,
-      native: { mode: 'agent', approval: 'never', sandbox: 'workspace-write' },
+      supported: true, exact: false,
+      native: {
+        mode: 'agent-full-access', approval: 'never', sandbox: 'danger-full-access',
+      },
     });
-    expect((workspace as { warnings: string[] }).warnings).toEqual([]);
+    expect((workspace as { warnings: string[] }).warnings.join('\n'))
+      .toContain("mode 'agent-full-access' couples approval and filesystem");
     expect(checkUnattendedFloor((workspace as { capabilities: never }).capabilities).meets)
       .toBe(true);
 
@@ -340,27 +418,46 @@ describe('Codex neutral permission mapping and the unattended floor (2.1)', () =
     });
     expect(checkUnattendedFloor((full as { capabilities: never }).capabilities).meets).toBe(true);
 
-    const reader = a.effectivePermissions!(role({
+    const automatic = a.effectivePermissions!(role({
       session: 'acp',
-      permissions: { approval: 'allow', filesystem: 'read-only', unattended: 'deny' },
+      permissions: { approval: 'auto', filesystem: 'unrestricted', unattended: 'deny' },
     }));
-    expect(reader).toMatchObject({
-      supported: true, exact: true,
-      native: { mode: 'read-only', approval: 'never', sandbox: 'read-only' },
+    expect(automatic).toMatchObject({
+      supported: true, exact: false,
+      native: { mode: 'agent', approval: 'on-request', sandbox: 'workspace-write' },
     });
-    expect(checkUnattendedFloor((reader as { capabilities: never }).capabilities).missing)
-      .toEqual(['write-state', 'workspace-edit']);
   });
 
-  it('reports the effective policy separately from the live ACP sandbox preset id', () => {
+  it('preserves native overrides in ACP launch and effective reporting', () => {
+    const r = role({
+      session: 'acp',
+      permissions: { approval: 'allow', filesystem: 'workspace', unattended: 'deny' },
+      permissionsDeclared: true,
+      harness_options: { approval: 'on-request', sandbox: 'read-only' },
+    });
+    expect(a.buildAcpLaunch!(r, { argv: [], env: {} }).env.INITIAL_AGENT_MODE)
+      .toBe('read-only');
+    expect(a.effectivePermissions!(r)).toMatchObject({
+      native: { mode: 'read-only', approval: 'on-request', sandbox: 'read-only' },
+    });
+    expect(a.effectivePermissionMode!(r)).toEqual({
+      fleetMode: 'auto', nativeMode: 'read-only',
+    });
+  });
+
+  it('reports the effective policy with the exact live ACP mode id', () => {
     expect(a.effectivePermissionMode!(role({
       session: 'acp',
       permissions: { approval: 'allow', filesystem: 'workspace', unattended: 'deny' },
-    }))).toEqual({ fleetMode: 'allow', nativeMode: 'agent' });
+    }))).toEqual({ fleetMode: 'allow', nativeMode: 'agent-full-access' });
     expect(a.effectivePermissionMode!(role({
       session: 'acp',
       permissions: { approval: 'allow', filesystem: 'unrestricted', unattended: 'deny' },
     }))).toEqual({ fleetMode: 'allow', nativeMode: 'agent-full-access' });
+    expect(a.effectivePermissionMode!(role({
+      session: 'acp',
+      permissions: { approval: 'auto', filesystem: 'unrestricted', unattended: 'deny' },
+    }))).toEqual({ fleetMode: 'auto', nativeMode: 'agent' });
     expect(a.effectivePermissionMode!(role({
       session: 'tmux',
       permissions: { approval: 'allow', filesystem: 'workspace', unattended: 'deny' },
@@ -389,7 +486,7 @@ describe('Codex neutral permission mapping and the unattended floor (2.1)', () =
         }
   });
 
-  it('every ACP row enforces independent approval and sandbox settings', () => {
+  it('every ACP row reports the selected coupled mode honestly', () => {
     for (const approval of APPROVALS)
       for (const filesystem of FILESYSTEMS)
         for (const unattended of UNATTENDED) {
@@ -402,10 +499,19 @@ describe('Codex neutral permission mapping and the unattended floor (2.1)', () =
           }));
           expect(effective.supported, label).toBe(true);
           if (!effective.supported) continue;
-          expect(effective.exact, label).toBe(true);
-          expect(effective.native, label).toMatchObject(translated.native);
+          expect(effective.exact, label).toBe(
+            (approval !== 'allow' && approval !== 'auto')
+              || (approval === 'allow' && filesystem === 'unrestricted')
+              || (approval === 'auto' && filesystem === 'workspace'));
+          if (approval === 'allow') expect(effective.native, label).toMatchObject({
+            mode: 'agent-full-access', approval: 'never', sandbox: 'danger-full-access',
+          });
+          else if (approval === 'auto') expect(effective.native, label).toMatchObject({
+            mode: 'agent', approval: 'on-request', sandbox: 'workspace-write',
+          });
+          else expect(effective.native, label).toMatchObject(translated.native);
           expect(checkUnattendedFloor(effective.capabilities).meets, label)
-            .toBe(approval === 'allow' && filesystem !== 'read-only');
+            .toBe(approval === 'allow');
         }
   });
 

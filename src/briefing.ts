@@ -10,7 +10,7 @@ export interface BriefingOpts {
   /** Curated body (from briefing_file) replacing the narrative sections. */
   briefingBody?: string;
   /**
-   * What spawn actually established about the role's ours identity (7.3).
+   * What spawn actually established about the role's ours identity.
    * Defaults to `unverified`, because a briefing generated without that
    * knowledge must not claim one.
    */
@@ -135,7 +135,7 @@ export function generateBriefing(role: ResolvedRole, v: BriefingVocab, opts: Bri
 
   L.push('', '## Do these NOW, in order');
   L.push(`1. ${v.launchNote(role.name)}`);
-  // What this says depends on what spawn actually VERIFIED (7.3). Asserting a
+  // What this says depends on what spawn actually VERIFIED. Asserting a
   // "predefined" identity that nobody checked is how an agent ends up improvising
   // its own infrastructure on first boot.
   const guarantee = opts.identityGuarantee ?? 'unverified';
@@ -182,7 +182,7 @@ export function generateBriefing(role: ResolvedRole, v: BriefingVocab, opts: Bri
     L.push(`   **${v.setPersonaTool}** with the **${profileSource}** section above, verbatim. Skip if it matches.`);
   }
   // When the supervisor owns the monitor (monitor.mode=fleet), the agent must NOT arm
-  // its own in-session watch — wakes are injected as [fleet-monitor] lines (design §5).
+  // its own in-session watch — wakes are injected as [fleet-monitor] lines.
   const wakeNote = role.monitor?.mode === 'fleet'
     ? v.supervisedWakeNote(id, role)
     : v.monitorInstruction(id, role);
@@ -267,6 +267,11 @@ export function generateBriefing(role: ResolvedRole, v: BriefingVocab, opts: Bri
     L.push('Never translate any other failure into "dead". A busy agent, an unanswered control');
     L.push('plane and a confirmed stop look identical if you only look at one command.');
     L.push('');
+    L.push('`ours-fleet status` reports `session.readiness`, which is TURN OCCUPANCY only: a mail');
+    L.push('wake delivered by steering runs a whole turn with readiness pinned at `idle`. Read the');
+    L.push('`activity:` line beside it — `active` means the role is working — and never call a role');
+    L.push('idle or stalled from `readiness=idle` alone.');
+    L.push('');
     L.push('Then judge the console content: stuck on a prompt/menu/trust dialog → answer it directly');
     L.push('with `ours-fleet send <Name> "<text>"` (or `--key <K>` for raw keys); idle with work');
     L.push('assigned → nudge; actively working → do nothing, and do not mistake a long turn for a');
@@ -278,8 +283,10 @@ export function generateBriefing(role: ResolvedRole, v: BriefingVocab, opts: Bri
   L.push('it survives restarts.');
   if (role.worklog) {
     L.push(`Fleet rotates it above ${role.worklog.max_kb} KiB, keeps approximately the newest ` +
-      `${role.worklog.keep_tail_kb} KiB here, and retains ${role.worklog.max_archives} archives ` +
-      'beside it. Continue writing only WORKLOG.md.');
+      `${role.worklog.keep_tail_kb} KiB here, and keeps ${role.worklog.max_archives} recent archives ` +
+      'beside it. Older complete archives move to WORKLOG.archives without deletion; ' +
+      '.worklog-rotation.json identifies the latest archive for restart provenance. ' +
+      'Continue writing only WORKLOG.md.');
   }
   L.push('', '## Routines');
   L.push(`If \`${opts.routinesPath}\` exists, re-read it at the START of every wake — before acting`);

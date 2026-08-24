@@ -10,7 +10,7 @@
  * are the parts that rot silently, and they cost a file read to check.
  */
 import { describe, it, expect } from 'vitest';
-import { readFileSync } from 'node:fs';
+import { existsSync, readFileSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { parse } from 'yaml';
 
@@ -39,11 +39,14 @@ describe('the pack contract is declared, not incidental', () => {
       .toBe('vitest run --config vitest.integration.config.ts');
   });
 
-  it('keeps the integration gate out of the ordinary suite', () => {
+  it('keeps package lifecycle tests out of the ordinary parallel suite', () => {
     // vitest.config.ts collects test/**/*.test.ts; the gate is a .spec.ts under
-    // test/integration, so `npm test` cannot pick it up by accident.
+    // test/integration, so `npm test` cannot pick either package build up by accident.
     expect(read('vitest.config.ts')).toContain("include: ['test/**/*.test.ts']");
     expect(read('vitest.integration.config.ts')).toContain('fileParallelism: false');
+    expect(existsSync(join(REPO, 'test/integration/pack.spec.ts'))).toBe(true);
+    expect(existsSync(join(REPO, 'test/integration/package-install.spec.ts'))).toBe(true);
+    expect(existsSync(join(REPO, 'test/package.test.ts'))).toBe(false);
   });
 });
 

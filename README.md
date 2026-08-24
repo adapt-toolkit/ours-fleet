@@ -217,6 +217,22 @@ discovery and auto-accept enabled, then the provisioning lease is released so
 the harness only has to bind it. Fleet never silently replaces or force-adopts
 an existing identity.
 
+ACP tool diffs are normalized before they enter the durable conversation
+ledger. Small diffs retain their existing before/after representation. When an
+adapter reports an oversized whole-file snapshot, fleet stores only the changed
+region with path, operation, original byte counts, digest, and boundedness
+metadata. Each retained changed side is capped at 64 KiB as a UTF-8-safe,
+newest-content tail. The tail advances to a line boundary when a complete line
+fits. If one logical line alone exceeds the cap, fleet retains its newest
+UTF-8-safe suffix and records that it starts mid-line, together with omitted-byte
+count and digest. Paths retain at most a 4 KiB suffix with the same explicit
+size/digest/omission provenance, and a 320 KiB cap covers the complete normalized
+update. An append therefore cannot replay a large historical file while hiding
+the current appended text. The live web-console transcript projects only events
+from the current runner generation and excludes adapter `session/load` replay;
+those replay events remain in the durable ledger with `agent_replay` provenance
+for diagnosis and recovery rather than appearing as current work.
+
 For a temporary role, those first-boot instructions preserve and bind an
 existing identity when one is present. If the assigned identity is missing,
 the role capability-detects the ours MCP `create_temporary_identity` tool and
@@ -348,6 +364,10 @@ defaults:
   max_tokens: 500000                    # session cap (harness-interpreted)
   monitor:
     mode: fleet                         # fleet (default) | native
+  worklog:                              # built-ins shown; set false to opt out
+    max_kb: 1024                        # rotate only above this active-log size
+    keep_tail_kb: 256                   # UTF-8 tail; line-aligned when one fits
+    max_archives: 12                    # recent beside log; older preserved cold
 roles:
   Name:                                 # [A-Za-z0-9_-]+
     harness: claude-code
@@ -433,6 +453,11 @@ contract. `defaults.harness_options` is shallow-merged with each
 role's `harness_options`, so a fleet can set common Codex permission/profile defaults
 and override individual keys per role. `monitor` merges the same way — a role block
 overrides `defaults.monitor` key-by-key.
+
+Every supervised role is a client of the operator-configured ours daemon. Fleet
+forces `OURS_AUTOSTART=0` in both tmux and ACP harness processes, after role environment
+overlays, so `env.OURS_AUTOSTART` cannot transfer shared daemon lifecycle ownership to an
+agent. Operators and explicit installer/setup flows remain responsible for starting it.
 
 ### Rooms and tasks
 
@@ -562,10 +587,13 @@ native settings actually grant, against a fixed floor:
 those requests with nobody to see it. With `unattended: wait` it **warns**,
 since a human can still attach a console and answer.
 
-**Security meaning.** `ask` maps to Codex `untrusted` / Claude `default`,
-`auto` to Codex `on-request` / Claude `acceptEdits`, and `allow` to Codex
-`never` / Claude `bypassPermissions`, the non-interactive modes that actually
-permit the actions the role was authorized to take.
+**Security meaning.** `ask` maps to Codex `untrusted` / Claude `default`.
+`auto` selects Codex ACP `agent` (`on-request` + `workspace-write`) / Claude
+`acceptEdits`. `allow` selects Codex ACP's fully non-interactive yolo mode,
+reported by the adapter as `agent-full-access` (`never` +
+`danger-full-access`); Claude uses `bypassPermissions`. For Codex tmux, where the
+approval and sandbox flags remain independent, `auto` is `on-request` and
+`allow` is `never` while `filesystem` still chooses the sandbox.
 `dontAsk` suppresses only the *prompt*, not the denial, which is why an
 `allow` role previously ran unable to do its job. Legacy `deny` is accepted
 only for compatibility and retains its conservative Codex `on-request` /
@@ -577,10 +605,14 @@ ACP exposes agent-specific session mode IDs and `session/set_mode`, but no
 portable permission-policy capability. Fleet uses that primitive where an
 adapter has a corresponding mode and otherwise translates at the adapter. The
 bundled Codex ACP adapter couples approval and sandboxing in its advertised
-mode IDs, so fleet preserves the selected sandbox preset and enforces approval
-independently on the app-server turn request. Thus `allow` + `workspace` is
-actually `never` + `workspace-write`, never `danger-full-access`. Live session
-metadata reports the normalized policy and the ACP sandbox-preset ID.
+mode IDs. Consequently, neutral `allow` selects `agent-full-access` and widens
+`filesystem: workspace` or `read-only` to `danger-full-access`; neutral `auto`
+selects `agent` and uses `workspace-write` even when the neutral filesystem
+value differs. An explicit `harness_options.sandbox` still wins and selects its
+corresponding ACP preset; explicit native approval overrides also win. Fleet
+reports a coupled-mode mismatch as approximate in `config`/`doctor`, and
+per-role `isolation:` remains the boundary for an `allow` ACP role. Live session
+metadata reports the normalized policy and the exact native mode selected.
 
 ### Isolation at creation time
 
@@ -1159,7 +1191,7 @@ rollout, anchors, aliases, explicit tags, non-scalar keys, and multiple document
 produce source-positioned warnings; opt into enforcement with
 `--yaml-mode strict`. Strict mode will become the next-major default.
 
-Long-running roles may opt into bounded durable logs:
+WORKLOG rotation is enabled for roles by default with conservative built-ins:
 
 ```yaml
 worklog:
@@ -1169,8 +1201,23 @@ worklog:
 ```
 
 Rotation is conservative: a concurrent change aborts the attempt and retries at
-a later fleet lifecycle point. Archives remain in the role state directory and
-may contain the same sensitive material as `WORKLOG.md`.
+a later fleet lifecycle point. The active log retains a bounded UTF-8 tail,
+advancing to a line boundary when a complete line fits. If one logical line
+alone exceeds the tail budget, its newest suffix remains and
+`.worklog-rotation.json` explicitly records the mid-line start and omitted byte
+count. It also records SHA-256 digests for the archive and retained live bytes
+observed when the manifest is written. The complete prior inode is published
+under a collision-safe UTC name.
+`max_archives` bounds recent archives beside `WORKLOG.md`; older complete
+archives move to `WORKLOG.archives/` and are never deleted. Use `worklog: false` on a role or in
+`defaults` to opt out. Archives may contain the same sensitive material as
+`WORKLOG.md`. Rotation refuses a symlinked/non-regular live log or a symlinked
+cold-archive boundary before replacing the live path, and best-effort removes a
+duplicate link left by a detected failure while the original inode is still
+available. These are ordinary path/error safeguards, not a security boundary
+against a malicious concurrent process with the same Unix authority: intentional
+symlink swaps or archive-directory renames between checks are outside the threat
+model and require OS-level isolation from that process.
 
 Claude roles can use a credential-free loopback proxy:
 

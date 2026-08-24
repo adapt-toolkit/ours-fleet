@@ -10,11 +10,30 @@ export interface LoopCounts {
   skipped: number; skippedBusy: number; skippedMissed: number;
 }
 
+/**
+ * A coalesced run of occurrences that were never submitted, held until a run
+ * actually starts and can be told about it. Without it a dropped occurrence
+ * survives only as a counter, which says how many were lost but never when or
+ * for how long — and an oversight role cannot report an outage it cannot date.
+ */
+export interface LoopMissedGap {
+  /** Occurrences coalesced away, summed across every skip since the last run. */
+  count: number;
+  /** Nominal time of the earliest occurrence in the gap. */
+  fromAt: string;
+  /** Nominal time of the latest occurrence in the gap. */
+  throughAt: string;
+  /** When the manager noticed — the end of the outage, not of the last skip. */
+  detectedAt: string;
+}
+
 export interface LoopRuntimeState {
   definitionHash: string;
   promptHash: string;
   enabled: boolean;
   operatorDisabled: boolean;
+  /** Unreported gap, cleared by the first run that carries it. */
+  missedGap: LoopMissedGap | null;
   nextScheduledAt: string;
   nextDueAt: string;
   lastScheduledAt: string | null;
@@ -148,6 +167,9 @@ export class ScheduledLoopStateStore {
       if (old?.definitionHash === definition.definitionHash) {
         next[definition.name] = {
           ...old, promptHash: definition.promptHash, enabled: definition.enabled,
+          // A file written before this field existed restores as undefined; an
+          // unreported gap is absent, not lost, so normalize rather than trust.
+          missedGap: old.missedGap ?? null,
         };
       } else {
         const nominal = now + definition.initialDelayMs;
@@ -167,6 +189,7 @@ export class ScheduledLoopStateStore {
           activeRunId: old?.activeRunId ?? null,
           counts: old?.counts ?? zeroCounts(), lastError: old?.lastError ?? null,
           operatorDisabled: old?.operatorDisabled ?? false,
+          missedGap: old?.missedGap ?? null,
         };
       }
       if (recoverActive && next[definition.name].activeRunId) {

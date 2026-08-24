@@ -27,6 +27,12 @@ const ALWAYS_PERMISSION = process.env.ACP_FIXTURE_ALWAYS_PERMISSION === '1';
 const PROMPT_DELAY_MS = parseInt(process.env.ACP_FIXTURE_PROMPT_DELAY_MS ?? '0', 10) || 0;
 if (process.env.ACP_FIXTURE_IGNORE_SIGTERM === '1') process.on('SIGTERM', () => {});
 let promptsAnswered = 0;
+// FLEET-003: model the extension behaviour where `_session/steering` with no
+// live turn STARTS one. That turn owns the adapter, is not addressable by a
+// JSON-RPC id, and swallows any prompt that arrives while it runs.
+const STEERING_OCCUPIES = process.env.ACP_FIXTURE_STEERING_OCCUPIES === '1';
+const STEERING_TURN_MS = parseInt(process.env.ACP_FIXTURE_STEERING_TURN_MS ?? '400', 10) || 400;
+let steeringTurnActive = false;
 
 const stopReasonFor = text =>
   FORCED_STOP_REASON ??
@@ -38,9 +44,10 @@ const outstanding = new Map();
 const permissionCompletionDelay = new Map();
 
 /** Ask for the same tool, offering both reject kinds so selection order matters. */
-const requestPermission = (promptId, location = process.cwd()) => {
+const requestPermission = (promptId, location = process.cwd(), shape = 'located-edit') => {
   const id = permissionRequestId++;
   pendingPermission.set(id, { promptId });
+  const locationlessExecute = shape !== 'located-edit';
   send({
     jsonrpc: '2.0',
     id,
@@ -49,16 +56,24 @@ const requestPermission = (promptId, location = process.cwd()) => {
       sessionId,
       toolCall: {
         toolCallId: 'fixture-tool',
-        title: 'Fixture edit',
-        kind: 'edit',
+        title: locationlessExecute ? 'Protected MCP approval' : 'Fixture edit',
+        kind: locationlessExecute ? 'execute' : 'edit',
         status: 'pending',
-        locations: [{ path: location }],
+        ...(locationlessExecute ? {} : { locations: [{ path: location }] }),
       },
-      options: [
+      options: locationlessExecute ? [
+        { optionId: 'allow_once', name: 'Allow', kind: 'allow_once' },
+        { optionId: 'decline', name: 'Decline', kind: 'reject_once' },
+      ] : [
         { optionId: 'allow', name: 'Allow', kind: 'allow_once' },
         { optionId: 'reject-always', name: 'Reject always', kind: 'reject_always' },
         { optionId: 'reject', name: 'Reject once', kind: 'reject_once' },
       ],
+      ...(shape === 'protected-mcp'
+        ? { _meta: { is_mcp_tool_approval: true } }
+        : shape === 'malformed-protected-mcp'
+          ? { _meta: { is_mcp_tool_approval: 'true' } }
+          : {}),
     },
   });
 };
@@ -122,6 +137,27 @@ const emitRichTurn = text => {
   ] });
 };
 
+// Production-shaped Codex edit event: adapters commonly report an append as
+// complete before/after file snapshots. Keep the fixture multi-megabyte so the
+// durable ACP path, not only the pure normalizer, proves the historical prefix
+// cannot reach web conversation events.
+const emitLargeWorklogAppend = () => {
+  const oldText = 'HISTORICAL_MARKER ours-mcp start\n' + 'historical-line\n'.repeat(220_000);
+  const appended = 'CURRENT_SESSION_APPEND žluťoučký kůň 🧪\nsecond-current-line\n';
+  update({
+    sessionUpdate: 'tool_call_update',
+    toolCallId: 'large-worklog-edit',
+    title: 'Edit WORKLOG.md',
+    kind: 'edit',
+    status: 'completed',
+    locations: [{ path: `${process.cwd()}/WORKLOG.md` }],
+    content: [{
+      type: 'diff', path: `${process.cwd()}/WORKLOG.md`,
+      oldText, newText: oldText + appended,
+    }],
+  });
+};
+
 createInterface({ input: process.stdin }).on('line', line => {
   const message = JSON.parse(line);
   if ('result' in message || 'error' in message) {
@@ -173,6 +209,22 @@ createInterface({ input: process.stdin }).on('line', line => {
       });
       break;
     case 'session/new':
+      // Echo back what the CLIENT actually declared, so a test can assert that
+      // per-role MCP servers and the agent-specific `_meta` options reached the
+      // wire instead of being dropped on the way to the ACP launch.
+      if (process.env.ACP_FIXTURE_ECHO_SESSION_PARAMS === '1') {
+        update({
+          sessionUpdate: 'agent_message_chunk',
+          content: {
+            type: 'text',
+            text: `new-params:${JSON.stringify({
+              mcpServers: message.params?.mcpServers ?? null,
+              _meta: message.params?._meta ?? null,
+            })}`,
+          },
+          messageId: 'new-params-1',
+        });
+      }
       send({ jsonrpc: '2.0', id: message.id, result: { sessionId } });
       break;
     case 'session/load':
@@ -210,6 +262,17 @@ createInterface({ input: process.stdin }).on('line', line => {
       break;
     case 'session/prompt': {
       const text = message.params.prompt.find(block => block.type === 'text')?.text ?? '';
+      // FLEET-003 wire shape: while a steering-started turn owns the adapter,
+      // an arriving prompt is folded into that turn. It produces updates but
+      // NEVER receives a stopReason of its own — the observed production
+      // signature of a scheduled run that hangs to its 300 s deadline.
+      if (STEERING_OCCUPIES && steeringTurnActive) {
+        update({
+          sessionUpdate: 'agent_message_chunk',
+          content: { type: 'text', text: `absorbed:${text}` },
+        });
+        break;
+      }
       if (/\bambiguous phase\b/i.test(text)) {
         update({
           sessionUpdate: 'agent_message_chunk', messageId: 'ambiguous-1',
@@ -243,6 +306,9 @@ createInterface({ input: process.stdin }).on('line', line => {
         // releases itself so the test never depends on a second prompt getting
         // through — prompts are serialized, so one never could.
         setTimeout(() => answerPrompt(message.id, 'end_turn'), Number(slow[1] ?? 800));
+      } else if (/\blarge worklog append\b/i.test(text)) {
+        emitLargeWorklogAppend();
+        answerPrompt(message.id, stopReasonFor(text));
       } else if (/\brich\b/i.test(text)) {
         emitRichTurn(text);
         answerPrompt(message.id, stopReasonFor(text));
@@ -286,7 +352,14 @@ createInterface({ input: process.stdin }).on('line', line => {
               ? `${process.cwd()}/loop/file.txt`
               : /\bpermission location swap\b/i.test(text)
                 ? `${process.cwd()}/swap/file.txt` : process.cwd();
-        for (let i = 0; i < times; i++) requestPermission(message.id, location);
+        const shape = /\bpermission protected mcp malformed\b/i.test(text)
+          ? 'malformed-protected-mcp'
+          : /\bpermission protected mcp\b/i.test(text)
+            ? 'protected-mcp'
+            : /\bpermission locationless execute\b/i.test(text)
+              ? 'locationless-execute'
+              : 'located-edit';
+        for (let i = 0; i < times; i++) requestPermission(message.id, location, shape);
       } else {
         answerPrompt(message.id, stopReasonFor(text));
       }
@@ -294,6 +367,14 @@ createInterface({ input: process.stdin }).on('line', line => {
     }
     case '_session/steering': {
       const text = message.params.prompt.find(block => block.type === 'text')?.text ?? '';
+      // A steered wake that starts its own turn and runs a tool in it. Fleet
+      // never gets a session/prompt response for this turn, so `readiness`
+      // cannot see it (FLEET-002) — only the tool/update stream can.
+      if (/\bsteer tool\b/i.test(text))
+        update({
+          sessionUpdate: 'tool_call', toolCallId: 'steer-tool', title: 'Steered fixture tool',
+          kind: 'execute', status: 'in_progress',
+        });
       send({
         jsonrpc: '2.0',
         method: 'session/update',
@@ -305,10 +386,24 @@ createInterface({ input: process.stdin }).on('line', line => {
           },
         },
       });
+      const startedNewTurn = !activePromptId;
+      // A steering call that starts a turn really occupies the adapter, and
+      // that turn has no JSON-RPC id, so its end is never reported as a
+      // stopReason. It keeps emitting updates until it finishes on its own.
+      if (STEERING_OCCUPIES && startedNewTurn) {
+        steeringTurnActive = true;
+        const beat = setInterval(() => update({
+          sessionUpdate: 'agent_message_chunk',
+          content: { type: 'text', text: 'steer-work' },
+        }), Math.max(10, Math.floor(STEERING_TURN_MS / 4)));
+        beat.unref?.();
+        setTimeout(() => { clearInterval(beat); steeringTurnActive = false; }, STEERING_TURN_MS)
+          .unref?.();
+      }
       send({
         jsonrpc: '2.0',
         id: message.id,
-        result: { outcome: activePromptId ? 'injected' : 'startedNewTurn' },
+        result: { outcome: startedNewTurn ? 'startedNewTurn' : 'injected' },
       });
       if (pendingToolwaitAnswer) {
         const answer = pendingToolwaitAnswer;
@@ -318,6 +413,13 @@ createInterface({ input: process.stdin }).on('line', line => {
       break;
     }
     case 'session/cancel':
+      // Cancelling reaches the steering-started turn. The absorbed prompt has
+      // no turn of its own to end, so it stays unanswered — this is why the
+      // client's settlement deadline expires and escalates to SIGTERM.
+      if (STEERING_OCCUPIES && steeringTurnActive) {
+        steeringTurnActive = false;
+        break;
+      }
       if (activePromptId !== undefined && !stubbornPrompts.has(activePromptId)) {
         // A "late" prompt keeps producing valid updates between the cancel
         // notification and the terminal response — ACP requires clients to

@@ -102,7 +102,7 @@ export function normalizeWatchdogReport(r: WatchdogReport, ctx: { watchdog: stri
   copy.watchdog = ctx.watchdog;
   copy.run_id = ctx.run_id;
   copy.roles = copy.roles.map(role => {
-    // Rebuilt from ONLY the known fields (final review #6a) — the old
+    // Rebuilt from ONLY the known fields — the old
     // `{ ...role }` spread let any unknown per-finding key (e.g. an agent
     // dumping a huge `pane_dump`) ride unbounded into the store. Report-level
     // extras (tail/isolation) are untouched here and stay tolerated; this is
@@ -138,7 +138,7 @@ export function errorReport(ctx: {
     // Scheduler-built error strings can embed raw agent-controlled bytes
     // (JSON.parse messages, validator interpolations of agent-supplied
     // values) and are stored+printed as-is elsewhere — clean them the same
-    // way finding-level text is cleaned (final review #6b).
+    // way finding-level text is cleaned.
     error: cleanEvidence(ctx.error),
     ...(ctx.tail !== undefined ? { tail: ctx.tail.slice(-4096) } : {}),
   };

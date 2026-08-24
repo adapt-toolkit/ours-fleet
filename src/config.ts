@@ -8,6 +8,7 @@ import {
   harnessRuntimeDir, resolveIsolation, validateIsolationConfig,
 } from './isolation/policy.js';
 import { getAdapter } from './harness/registry.js';
+import { resolveRoleModelEnv } from './model-env.js';
 import type { IsolationConfig, WrapContext } from './isolation/types.js';
 import { resolveWatchdogs } from './watchdog/config.js';
 import type { ResolvedWatchdog } from './watchdog/config.js';
@@ -26,6 +27,13 @@ export interface WorklogPolicy {
   keep_tail_kb: number;
   max_archives: number;
 }
+export type WorklogPolicyInput = Partial<WorklogPolicy> | false;
+/** Conservative built-in policy; `worklog: false` is the explicit opt-out. */
+export const DEFAULT_WORKLOG_POLICY: Readonly<WorklogPolicy> = Object.freeze({
+  max_kb: 1024,
+  keep_tail_kb: 256,
+  max_archives: 12,
+});
 export interface AuthProxyConfig {
   kind: 'anthropic';
   base_url: string;
@@ -67,7 +75,7 @@ export interface SessionOptions {
   };
 }
 
-/** Resolved per-role supervisor-monitor config (see DESIGN-external-monitor §2). */
+/** Resolved per-role supervisor-monitor config. */
 export interface MonitorConfig {
   /** Who owns mail wake delivery: ours-fleet supervisor or the native harness. */
   mode: MonitorMode;
@@ -131,7 +139,7 @@ export const DEFAULT_OWNER_ATTACHMENT_MIME = [
   'application/vnd.openxmlformats-officedocument.presentationml.presentation',
 ] as const;
 
-/** Default wake sources when a role does not list its own (design §2). */
+/** Default wake sources when a role does not list its own. */
 export const DEFAULT_WAKE_SOURCES: NotifyEventType[] =
   ['message_received', 'file_received', 'local_contact_request', 'pending_message'];
 const MONITOR_KEYS = [
@@ -224,7 +232,7 @@ export interface RoleConfig {
   isolation?: IsolationConfig;
   monitor?: Partial<MonitorConfig>;
   owner_channel?: OwnerChannelConfigInput;
-  worklog?: WorklogPolicy;
+  worklog?: WorklogPolicyInput;
   auth_proxy?: Partial<AuthProxyConfig>;
 }
 
@@ -238,7 +246,7 @@ export interface RoomStartupGate {
   owner_seat_cid: string | null;
 }
 
-export interface ResolvedRole extends Omit<RoleConfig, 'model' | 'owner_channel'> {
+export interface ResolvedRole extends Omit<RoleConfig, 'model' | 'owner_channel' | 'worklog'> {
   name: string;
   harness: string;
   session: SessionBackendId;
@@ -247,7 +255,7 @@ export interface ResolvedRole extends Omit<RoleConfig, 'model' | 'owner_channel'
    * Whether `permissions:` was actually written by the operator (on the role or
    * in defaults), as opposed to resolved from built-in defaults. A role that
    * states its intent only once — neutrally OR natively — has nothing to
-   * contradict, and must not be warned at (2.4).
+   * contradict, and must not be warned at.
    */
   permissionsDeclared: boolean;
   identity: string;
@@ -310,7 +318,7 @@ export function resolveRoleModel(
 export function isolationContextFor(role: ResolvedRole): WrapContext {
   const stateDir = agentDir(role.name, (role as ResolvedRole & { __temp?: boolean }).__temp === true);
   const runCwd = role.cwd ?? stateDir;
-  // Ask the harness how its host state splits (5.1). An adapter that declares
+  // Ask the harness how its host state splits. An adapter that declares
   // none keeps the historical whole-home mount.
   let split: { home?: string; shared: string[] } | undefined;
   try { split = getAdapter(role.harness).isolationPaths?.(role, { stateDir, runCwd }); }
@@ -425,7 +433,20 @@ export function loadConfig(
       const harness = r.harness ?? (defaults.harness as string | undefined) ?? 'claude-code';
       const defaultHarness = (defaults.harness as string | undefined) ?? 'claude-code';
       const inheritsModelDefaults = harness === defaultHarness && r.model !== null;
-      const model = resolveRoleModel(r.model, r.harness, defaults);
+      if (authProxy && harness !== 'claude-code')
+        throw new ConfigError(`${file}: role '${name}' auth_proxy is supported only by claude-code`);
+      // Environment and runtime model are resolved together so `model:` and the
+      // harness's model pin can never disagree (see src/model-env.ts).
+      const modelEnv = resolveRoleModelEnv({
+        harness,
+        model: resolveRoleModel(r.model, r.harness, defaults),
+        modelWasExplicit: r.model !== undefined,
+        defaultsEnv: (defaults.env ?? {}) as Record<string, string>,
+        roleEnv: r.env,
+        ...(authProxy ? { authProxyBaseUrl: authProxy.base_url } : {}),
+      }, message => new ConfigError(`${file}: role '${name}' ${message}`));
+      const env = modelEnv.env;
+      const model = modelEnv.model;
       const modelChain = resolveModelChain(
         model,
         r.model_chain ?? (inheritsModelDefaults
@@ -434,13 +455,6 @@ export function loadConfig(
         file,
         name,
       );
-      if (authProxy && harness !== 'claude-code')
-        throw new ConfigError(`${file}: role '${name}' auth_proxy is supported only by claude-code`);
-      const env = {
-        ...((defaults.env ?? {}) as Record<string, string>),
-        ...(r.env ?? {}),
-        ...(authProxy ? { ANTHROPIC_BASE_URL: authProxy.base_url } : {}),
-      };
       roles.push({
         ...r,
         name,
@@ -463,7 +477,7 @@ export function loadConfig(
         env: Object.keys(env).length ? env : undefined,
         loops: [],
       });
-      // Forbidden-path enforcement (5.2): a mount that would breach the policy
+      // Forbidden-path enforcement: a mount that would breach the policy
       // is a configuration error, caught by `config` rather than at launch.
       if (isolation !== undefined) {
         const role = roles[roles.length - 1];
@@ -731,16 +745,17 @@ export function resolveAuthProxy(
 }
 
 export function resolveWorklogPolicy(
-  defaults: unknown, role: WorklogPolicy | undefined, file = 'config', name = 'role',
+  defaults: unknown, role: WorklogPolicyInput | undefined, file = 'config', name = 'role',
 ): WorklogPolicy | undefined {
-  if (defaults === undefined && role === undefined) return undefined;
-  if (defaults !== undefined && !isPlainObject(defaults))
-    throw new ConfigError(`${file}: defaults.worklog must be a map`);
+  if (role === false || (role === undefined && defaults === false)) return undefined;
+  if (defaults !== undefined && defaults !== false && !isPlainObject(defaults))
+    throw new ConfigError(`${file}: defaults.worklog must be a map or false`);
   if (role !== undefined && !isPlainObject(role))
-    throw new ConfigError(`${file}: role '${name}' worklog must be a map`);
+    throw new ConfigError(`${file}: role '${name}' worklog must be a map or false`);
   const merged = {
-    ...((defaults ?? {}) as Partial<WorklogPolicy>),
-    ...(role ?? {}),
+    ...DEFAULT_WORKLOG_POLICY,
+    ...((defaults === false || defaults === undefined ? {} : defaults) as Partial<WorklogPolicy>),
+    ...(role === undefined ? {} : role),
   };
   const bad = Object.keys(merged).filter(key =>
     !['max_kb', 'keep_tail_kb', 'max_archives'].includes(key));
@@ -855,7 +870,7 @@ function resolveStartStaggerMs(raw: unknown, base: string): number {
 
 /**
  * Merge `defaults.monitor` under the role's own `monitor:` key-by-key, validate the
- * result, and fill code-constant defaults (design §2). `monitor.mode` selects
+ * result, and fill code-constant defaults. `monitor.mode` selects
  * fleet-owned or native-harness monitoring; absent everywhere ⇒ fleet. The old
  * `enabled` boolean remains a compatibility alias. Throws ConfigError on a
  * malformed block so a typo fails loudly rather than silently disarming a monitor.

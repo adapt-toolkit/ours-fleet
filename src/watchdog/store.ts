@@ -33,7 +33,7 @@ function ensureDir(dir: string): string {
 /**
  * Choke point every other helper in this module goes through to reach a
  * watchdog's on-disk state. Validates `name` BEFORE any join/mkdir (defense
- * in depth, finding #1): a caller that forgets its own ROLE_NAME_RE guard
+ * in depth): a caller that forgets its own ROLE_NAME_RE guard
  * (as the CLI's `watchdogKnown` once did) must not be able to turn an
  * unvalidated `name` into `join(watchdogsRoot(), '../../victim')` and mkdir
  * an arbitrary path on disk.
@@ -62,7 +62,7 @@ export interface RunLockOwner { pid: number; at: string }
  * would work too, but a directory needs no cleanup of file contents and
  * can't be partially written). EEXIST means another run holds it.
  *
- * Stamps `owner.json` with our pid (finding #2): ownership metadata is what
+ * Stamps `owner.json` with our pid: ownership metadata is what
  * lets a later `reclaimStaleRunLock` tell a lock abandoned by a dead process
  * apart from one genuinely held by a live run. A naive "mkdir, then
  * writeFileSync(owner.json)" leaves an unnecessarily wide window —
@@ -98,7 +98,7 @@ export function acquireRunLock(name: string): boolean {
 /**
  * Release-tolerant of absence: a lock already gone (or never acquired) is not
  * an error. Recursive because the lock dir now holds `owner.json` alongside
- * the mkdir mutex itself (finding #2) — a plain rmdir would fail ENOTEMPTY.
+ * the mkdir mutex itself — a plain rmdir would fail ENOTEMPTY.
  */
 export function releaseRunLock(name: string): void {
   try {
@@ -131,7 +131,7 @@ function pidAlive(pid: number): boolean {
 }
 
 /**
- * Owner-mandated (finding #2): only a DEMONSTRABLY stale run lock may be
+ * Only a demonstrably stale run lock may be
  * reclaimed — a lock is stale iff it isn't held at all, its owner metadata
  * names a dead pid, or its owner metadata is missing/corrupt AND the lock dir
  * is older than RUN_LOCK_OWNER_GRACE_MS. The age gate closes the interprocess

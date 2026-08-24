@@ -143,6 +143,17 @@ describe('generateBriefing', () => {
     expect(b.indexOf('## Routines')).toBeGreaterThan(b.indexOf('## Durable log'));
   });
 
+  it('documents bounded active worklog continuity and lossless archive provenance', () => {
+    const b = generateBriefing({
+      ...base, worklog: { max_kb: 1024, keep_tail_kb: 256, max_archives: 12 },
+    }, vocab, opts);
+    expect(b).toContain('Fleet rotates it above 1024 KiB');
+    expect(b).toContain('newest 256 KiB');
+    expect(b).toContain('12 recent archives');
+    expect(b).toContain('WORKLOG.archives');
+    expect(b).toContain('.worklog-rotation.json');
+  });
+
   it('tells a fleet-monitored role NOT to arm its native watch', () => {
     const fleet = {
       ...base,
@@ -216,7 +227,7 @@ describe('generateBriefing', () => {
   });
 });
 
-describe('the briefing states only what was verified about the identity (7.3)', () => {
+describe('the briefing states only what was verified about the identity', () => {
   const brief = (guarantee?: 'verified' | 'created' | 'unverified') =>
     generateBriefing(base, vocab, { ...opts, identityGuarantee: guarantee });
 
@@ -310,7 +321,7 @@ describe('temporary-role identity compatibility', () => {
  * overseers to restart on it — so a busy agent, an unreachable control plane
  * and a genuinely dead role all led to the same intervention.
  */
-describe('the oversight procedure distinguishes busy from dead (7.2)', () => {
+describe('the oversight procedure distinguishes busy from dead', () => {
   const overseeing = generateBriefing(
     { ...base, oversee: [{ role: 'Bob', interval: '5m' }] }, vocab, opts);
 

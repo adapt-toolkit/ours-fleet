@@ -328,7 +328,7 @@ describe('owner command registry', () => {
   });
 });
 
-// ── Task/Room/Template subcommands (§10.2) ──────────────────────────────
+// ── Task/Room/Template subcommands ──────────────────────────────
 
 describe('owner-channel task subcommands', () => {
   let dir: string;

@@ -13,6 +13,6 @@ adapter emits, including namespaced `_meta`, so normalizer regressions surface
 as snapshot diffs.
 
 They are NOT captures of live adapter runs. The real-adapter acceptance matrix
-(spec §11) still has to be executed against the installed pinned binaries in an
+End-to-end compatibility still has to be exercised against the installed pinned binaries in an
 isolated workspace with test credentials before release; when that happens,
 scrubbed live captures should replace or extend these files.

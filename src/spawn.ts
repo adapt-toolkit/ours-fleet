@@ -13,6 +13,7 @@ import {
   type CommonPermissions, type MonitorConfig, type SessionBackendId, type UnattendedMode,
   type RoomStartupGate,
 } from './config.js';
+import { resolveRoleModelEnv } from './model-env.js';
 import { applyRole, up, type OpsDeps } from './ops.js';
 import { START_STAGGER_FILE } from './runner.js';
 import {
@@ -80,7 +81,7 @@ export interface SpawnOpts {
   /**
    * Path to a file holding exactly the existing `isolation:` mapping — the same
    * schema fleet.yaml uses, not a second policy language. The ONE new operator
-   * input in this release (6.3).
+   * input in this release.
    */
   isolationFile?: string;
   overseeInterval?: string;
@@ -245,7 +246,17 @@ export function spawnDryRun(o: SpawnOpts): SpawnDryRun {
   const harness = raw.harness ?? (cfg.defaults.harness as string | undefined) ?? 'claude-code';
   const defaultHarness = (cfg.defaults.harness as string | undefined) ?? 'claude-code';
   const inheritsModelDefaults = harness === defaultHarness && raw.model !== null;
-  const model = resolveRoleModel(raw.model, raw.harness, cfg.defaults);
+  const authProxy = resolveAuthProxy(cfg.defaults.auth_proxy, raw.auth_proxy);
+  // One resolution for the environment and the model it pins (src/model-env.ts).
+  const modelEnv = resolveRoleModelEnv({
+    harness,
+    model: resolveRoleModel(raw.model, raw.harness, cfg.defaults),
+    modelWasExplicit: raw.model !== undefined,
+    defaultsEnv: (cfg.defaults.env ?? {}) as Record<string, string>,
+    roleEnv: raw.env,
+    ...(authProxy ? { authProxyBaseUrl: authProxy.base_url } : {}),
+  });
+  const model = modelEnv.model;
   const session = raw.session ?? (cfg.defaults.session as SessionBackendId | undefined) ?? 'tmux';
   const resolvedRole: ResolvedRole = {
     ...raw,
@@ -270,19 +281,13 @@ export function spawnDryRun(o: SpawnOpts): SpawnDryRun {
     owner_channel: resolveOwnerChannelConfig(
       cfg.defaults.owner_channel, raw.owner_channel, session),
     worklog: resolveWorklogPolicy(cfg.defaults.worklog, raw.worklog),
-    auth_proxy: resolveAuthProxy(cfg.defaults.auth_proxy, raw.auth_proxy),
+    auth_proxy: authProxy,
   };
-  resolvedRole.env = {
-    ...((cfg.defaults.env ?? {}) as Record<string, string>),
-    ...(raw.env ?? {}),
-    ...(resolvedRole.auth_proxy
-      ? { ANTHROPIC_BASE_URL: resolvedRole.auth_proxy.base_url }
-      : {}),
-  };
+  resolvedRole.env = modelEnv.env;
   const adapter = getAdapter(resolvedRole.harness);
   if (resolvedRole.auth_proxy && resolvedRole.harness !== 'claude-code')
     throw new Error('auth_proxy is supported only by claude-code');
-  const optionProblems = adapter.validateOptions(resolvedRole.harness_options);
+  const optionProblems = adapter.validateOptions(resolvedRole.harness_options, resolvedRole);
   if (optionProblems.length)
     throw new Error(optionProblems.map(problem => `${problem.path}: ${problem.message}`).join('; '));
   return {
@@ -295,7 +300,7 @@ export function spawnDryRun(o: SpawnOpts): SpawnDryRun {
 
 /**
  * Which settings came from the operator, from fleet defaults, or from a
- * built-in (6.6). Built while the options are still separable — once they are
+ * built-in. Built while the options are still separable — once they are
  * merged into a ResolvedRole the distinction is gone.
  *
  * `env`, `bio`, `persona` and `harness_options` are deliberately absent: the
@@ -341,15 +346,15 @@ export async function spawnPermanent(
   validateSpawnOpts(o);
   if (o.isolationFile) readIsolationFile(o.isolationFile);   // fail before reserving
   if (o.missionFile) readMissionFile(o.missionFile);         // fail before reserving
-  // Name AND identity reserved together, before anything is written or started
-  // (6.4). A loser of the race creates no config, no state, no service.
+  // Reserve name and identity together before anything is written or started.
+  // A loser of the race creates no config, state, or service.
   creation.onStage?.('reserving');
   return withCreationTransaction(
     { role: o.name, identity: effectiveIdentity(o) },
     async tx => {
       assertNameFree(o);
       const cfg = loadConfig(o.configPath);
-      // Establish the identity BEFORE the service is enabled (7.3), and record
+      // Establish the identity BEFORE the service is enabled, and record
       // what was actually guaranteed so the briefing can say something true.
       creation.onStage?.('checking_identity');
       const guarantee = await ensureIdentity(
@@ -385,7 +390,7 @@ export async function spawnPermanent(
         undo: () => { if (!stateExisted) rmSync(stateDir, { recursive: true, force: true }); },
       });
       // Journal the service registration BEFORE it happens, and undo only the
-      // registrations this transaction actually created (6.2). `registered` is
+      // registrations this transaction actually created. `registered` is
       // filled by `up`'s onInstalled hook at the moment each registration is
       // made — not from its return value, which never arrives when `up` throws
       // after registering.
@@ -395,7 +400,7 @@ export async function spawnPermanent(
         undo: async () => { for (const n of registered) await deps.backend.uninstall(n); },
       });
       // Provenance is written BEFORE the role starts, so a role that fails to
-      // launch still records how it was asked for (6.6).
+      // launch still records how it was asked for.
       const provenance = buildProvenance({
         role: o.name, lifetime: 'permanent', fleetVersion: VERSION,
         settings: provenanceSettings(o, cfg.defaults),
@@ -453,8 +458,8 @@ export async function spawnTemp(
   // Retire only supervisors whose recorded owner is definitively stopped. This
   // bounded pass keeps the active roster clean without deleting old evidence.
   await reclaimStaleTempState();
-  // Temporary roles go through the SAME reservation boundary as permanent ones
-  // (6.4): a temp agent competes for the same names.
+  // Temporary roles go through the same reservation boundary as permanent ones:
+  // a temp agent competes for the same names.
   creation.onStage?.('reserving');
   return withCreationTransaction(
     { role: o.name, identity: effectiveIdentity(o) },
@@ -495,7 +500,18 @@ async function spawnTempInner(
   };
   const harness = o.harness ?? defaultHarness ?? 'claude-code';
   const inheritsModelDefaults = harness === (defaultHarness ?? 'claude-code') && o.model !== null;
-  const model = resolveRoleModel(o.model, o.harness, cfg.defaults);
+  const tempAuthProxy = resolveAuthProxy(cfg.defaults.auth_proxy, fromOpts.auth_proxy);
+  // An explicitly requested --model must reach the child, not just the banner
+  // (src/model-env.ts).
+  const modelEnv = resolveRoleModelEnv({
+    harness,
+    model: resolveRoleModel(o.model, o.harness, cfg.defaults),
+    modelWasExplicit: o.model !== undefined,
+    defaultsEnv: (cfg.defaults.env ?? {}) as Record<string, string>,
+    roleEnv: fromOpts.env,
+    ...(tempAuthProxy ? { authProxyBaseUrl: tempAuthProxy.base_url } : {}),
+  });
+  const model = modelEnv.model;
   const session = o.session ?? (cfg.defaults.session as SessionBackendId | undefined) ?? 'tmux';
   const role: ResolvedRole = {
     ...fromOpts,          // includes `isolation` when --isolation-file was given
@@ -514,20 +530,16 @@ async function spawnTempInner(
     permissions: resolvePermissions(cfg.defaults.permissions, fromOpts.permissions),
     permissionsDeclared:
       fromOpts.permissions !== undefined || cfg.defaults.permissions !== undefined,
-    // Temp agents inherit the fleet-wide monitor defaults via the snapshot (design §2).
+    // Temp agents inherit the fleet-wide monitor defaults via the snapshot.
     monitor: resolveMonitorConfig(cfg.defaults.monitor, fromOpts.monitor),
     owner_channel: resolveOwnerChannelConfig(
       cfg.defaults.owner_channel, fromOpts.owner_channel, session),
     worklog: resolveWorklogPolicy(cfg.defaults.worklog, fromOpts.worklog),
-    auth_proxy: resolveAuthProxy(cfg.defaults.auth_proxy, fromOpts.auth_proxy),
+    auth_proxy: tempAuthProxy,
     sourceFile: '(temp)',
     roomStartupGate: o.roomStartupGate,
   };
-  role.env = {
-    ...((cfg.defaults.env ?? {}) as Record<string, string>),
-    ...(fromOpts.env ?? {}),
-    ...(role.auth_proxy ? { ANTHROPIC_BASE_URL: role.auth_proxy.base_url } : {}),
-  };
+  role.env = modelEnv.env;
   if (role.auth_proxy && role.harness !== 'claude-code')
     throw new Error('auth_proxy is supported only by claude-code');
   onStage?.('writing_role');

@@ -112,7 +112,7 @@ Type=simple
 ${environmentLines}
 ExecStart=${unitArg(process.execPath)} ${unitArg(binPath)} _run %i
 # The RUNNER owns the child-session restart loop, with a counted, backed-off
-# circuit breaker (3.2). systemd must only recover the runner PROCESS crashing —
+# circuit breaker. systemd must only recover the runner PROCESS crashing —
 # Restart=always here would resume the uncounted two-second relaunch loop, and
 # would also restart a runner that is deliberately holding a failing agent down.
 Restart=on-failure
@@ -133,12 +133,12 @@ WantedBy=default.target
 
     async install(name) {
       // Ask FIRST whether this unit was already enabled, so a rollback can tell
-      // "we registered this" from "it was already here" (6.2).
+      // "we registered this" from "it was already here".
       const before = await ctl('is-enabled', unitFor(name));
       const alreadyEnabled = before.stdout.trim() === 'enabled';
       const r = await ctl('enable', '--now', unitFor(name));
       // Undo only what WE enabled. A unit that was already enabled belongs to
-      // whoever enabled it, and rollback may never remove that (6.2).
+      // whoever enabled it, and rollback may never remove that.
       const undo = async () => { if (!alreadyEnabled) await ctl('disable', '--now', unitFor(name)); };
       if (r.code !== 0) {
         // `enable --now` is enable THEN start, so a non-zero result can arrive
@@ -163,7 +163,7 @@ WantedBy=default.target
       // care whether this systemd propagates a start failure into the exit
       // code, so it is correct both on versions that do and versions that do
       // not. Only a DEFINITE stop counts. An unanswerable probe is `unknown`
-      // and must never be read as a failed start (1.1) — the unit may be
+      // and must never be read as a failed start — the unit may be
       // perfectly fine and the bus merely unreachable.
       const live = await probeLiveness(ctl, name);
       if (live.state === 'stopped') {

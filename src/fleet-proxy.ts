@@ -15,6 +15,8 @@ export interface ManagedFleetSpawnResult {
   session: 'tmux' | 'acp';
   model?: string;
   monitor: Pick<MonitorConfig, 'mode' | 'interrupt'>;
+  /** Adapter-resolved portable policy and exact native runtime mode. */
+  permissionMode?: { fleetMode: 'ask' | 'auto' | 'allow'; nativeMode: string };
   inherited: string[];
   creationActionId: string;
 }

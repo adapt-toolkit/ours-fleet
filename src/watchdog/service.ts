@@ -10,7 +10,7 @@ export const WATCHDOG_LAUNCHD_LABEL = 'network.ours.fleet.watchdogs';
 
 /**
  * Supervises the single long-running watchdog-scheduler process (the hidden
- * `_run-watchdogs` command, Task 9's `runScheduler`) the same way
+ * `_run-watchdogs` command and `runScheduler`) the same way
  * `WebServiceManager` (src/web/service.ts) supervises the web console: a
  * private systemd --user unit on Linux, a launchd LaunchAgent on macOS.
  */
@@ -34,7 +34,7 @@ export class WatchdogServiceManager {
 
   /**
    * Writes the unit/plist and returns whether its content actually changed
-   * (finding #4): `binPath`/`configPath` are the only inputs that ever
+   * `binPath`/`configPath` are the only inputs that ever
    * change this content, and neither reflects a watchdog's `interval:` or
    * any other config value inside `watchdogs:` — so `changed` here can never
    * by itself justify a restart on every config edit. It's one of the two
@@ -77,8 +77,7 @@ export class WatchdogServiceManager {
       // Tolerate "not loaded" (systemctl exit 5) the same way the launchd
       // branch below tolerates "could not find service": a watchdog-less
       // fleet's `up`/`down` calls stop() defensively even when the unit was
-      // never installed, and that must not surface as an error (final
-      // review #3).
+      // never installed, and that must not surface as an error.
       const result = await this.exec('systemctl', ['--user', 'stop', WATCHDOG_SYSTEMD_UNIT]);
       if (result.code !== 0 && result.code !== 5 && !/not loaded/i.test(`${result.stdout}\n${result.stderr}`))
         throw new FleetError('control_unavailable',
@@ -95,8 +94,8 @@ export class WatchdogServiceManager {
    * a running service just returns 0 without reloading anything, and
    * launchctl kickstart (without -k) behaves the same way. That means a
    * config change (new/changed watchdogs) never reaches a live scheduler
-   * process via reconcileWatchdogScheduler's `install` + `start` pair (final
-   * review #4). `restart()` mirrors WebServiceManager.restart: an
+   * process via reconcileWatchdogScheduler's `install` + `start` pair.
+   * `restart()` mirrors WebServiceManager.restart: an
    * unconditional restart on Linux, and `kickstart -k` (force-restart) on
    * macOS, falling back to stop+start if the kickstart itself fails.
    */

@@ -11,7 +11,7 @@ import { listRuns, readReport, type RunListEntry } from './store.js';
 export interface WatchdogRoleFinding { watchdog: string; status: WatchdogRoleStatus; reason: string }
 
 /**
- * Needs-attention integration (Task 19): worst current finding per role across
+ * Needs-attention integration: worst current finding per role across
  * every configured watchdog, for FleetQueryService.status() to fold into a
  * role's problems. An `error`-status report carries no role evidence (the run
  * itself failed) so it's skipped outright, matching alerts.ts's
@@ -21,7 +21,7 @@ export interface WatchdogRoleFinding { watchdog: string; status: WatchdogRoleSta
  * parameter (rather than importing store.ts directly) so it stays a pure,
  * disk-free function for unit testing; runtime.ts wires the real store.
  *
- * Skips disabled watchdogs (finding #5): a watchdog turned off in config
+ * Skips disabled watchdogs: a watchdog turned off in config
  * still has its last stored report sitting on disk, and without this check
  * that stale report's findings would pin roles in "Needs attention" forever
  * — an operator disabling a noisy/broken watchdog has no way to make the

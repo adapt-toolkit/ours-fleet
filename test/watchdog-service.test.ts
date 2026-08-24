@@ -43,7 +43,7 @@ describe('WatchdogServiceManager', () => {
     expect(calls).toContainEqual(['systemctl', ['--user', 'enable', WATCHDOG_SYSTEMD_UNIT]]);
   });
 
-  it('install() reports changed:true on a first install and changed:false when re-installing identical content (finding #4)', async () => {
+  it('install() reports changed:true first and changed:false for identical content', async () => {
     const { manager } = fixture('linux');
     const binPath = join(home, 'cli.js');
     writeFileSync(binPath, '');
@@ -112,7 +112,7 @@ describe('WatchdogServiceManager', () => {
     expect(manager.supervised()).toBe(false);
   });
 
-  it('stop() tolerates "not loaded" (exit 5) on linux, mirroring launchd\'s tolerance (final review #3)', async () => {
+  it('stop() tolerates "not loaded" (exit 5) on Linux, mirroring launchd', async () => {
     const exec: Exec = async (command, args) => {
       if (command === 'systemctl' && args.includes('stop'))
         return { code: 5, stdout: '', stderr: 'Unit ours-fleet-watchdogs.service not loaded.' };
@@ -132,7 +132,7 @@ describe('WatchdogServiceManager', () => {
     await expect(manager.stop()).rejects.toThrow(/Failed to connect to bus/);
   });
 
-  it('restart() invokes systemctl --user restart on linux (final review #4)', async () => {
+  it('restart() invokes systemctl --user restart on Linux', async () => {
     const { calls, manager } = fixture('linux');
     const binPath = join(home, 'cli.js');
     writeFileSync(binPath, '');

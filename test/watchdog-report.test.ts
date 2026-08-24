@@ -87,7 +87,7 @@ describe('normalizeWatchdogReport', () => {
     expect(n.roles[0].evidence![0].detail.length).toBeLessThanOrEqual(280);
   });
 
-  it('drops unknown per-finding keys (e.g. a huge pane_dump) instead of storing them unbounded (final review #6a)', () => {
+  it('drops unknown per-finding keys such as a huge pane_dump instead of storing them unbounded', () => {
     const r = good();
     (r.roles[0] as unknown as Record<string, unknown>).pane_dump = 'x'.repeat(100_000);
     (r.roles[1] as unknown as Record<string, unknown>).extra_junk = { nested: true };
@@ -121,7 +121,7 @@ describe('errorReport', () => {
       || (r as { tail?: string }).tail!.length <= 4096).toBe(true);
   });
 
-  it('cleans the error string: strips control chars and caps at 280 (final review #6b, e.g. raw JSON.parse/validator-interpolated agent bytes)', () => {
+  it('cleans the error string by stripping control chars and capping raw agent-derived text at 280', () => {
     const dirty = `invalid report: Unexpected token \x07 in JSON at position 12: ${'z'.repeat(500)}`;
     const r = errorReport({
       watchdog: 'w', run_id: '20260731T115000Z', started_at: 'a', finished_at: 'b', error: dirty,

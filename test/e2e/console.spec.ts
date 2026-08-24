@@ -235,6 +235,10 @@ test('bootstrap, inventory, live navigation, send, create, and security boundari
     expect(cached).toContain('/offline.html');
     expect(cached.every(path => path === '/offline.html' || path.startsWith('/assets/'))).toBe(true);
   }
+  if (!(await page.getByRole('heading', { name: 'Fleet topology' }).isVisible())) {
+    await page.getByRole('button', { name: '← Fleet' }).click();
+    await expect(page.getByRole('heading', { name: 'Fleet topology' })).toBeVisible();
+  }
   const removalDialogs: string[] = [];
   page.on('dialog', async dialog => {
     removalDialogs.push(dialog.message());

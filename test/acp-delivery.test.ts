@@ -39,6 +39,11 @@ function fakeSession(agent: FakeAgent, overrides: Record<string, unknown> = {}):
   return session;
 }
 
+/** A fleet-tracked turn: one whose settlement `cancelActive` can actually await. */
+function trackedTurn(): Record<string, unknown> {
+  return { id: 'turn-1', output: '', settled: Promise.resolve(), settle: () => {} };
+}
+
 describe('AcpSession live delivery', () => {
   it('uses advertised steering while a prompt is active', async () => {
     const requests: string[] = [];
@@ -194,7 +199,7 @@ describe('AcpSession live delivery', () => {
     expect(calls).toEqual(['_session/steering', 'session/prompt']);
   });
 
-  it('cancels first, then acknowledges interrupting delivery when its turn starts', async () => {
+  it('cancels the tracked turn first, then acknowledges interrupting delivery', async () => {
     const calls: string[] = [];
     const session = fakeSession({
       notify: async method => {
@@ -204,7 +209,7 @@ describe('AcpSession live delivery', () => {
         calls.push(method);
         return { outcome: 'startedNewTurn' };
       },
-    });
+    }, { activeTurn: trackedTurn() });
 
     const result = await session.submitPrompt(
       'interrupting mail', { interrupt: true, steer: true });
@@ -223,7 +228,7 @@ describe('AcpSession live delivery', () => {
         calls.push(method);
         return { outcome: 'startedNewTurn' };
       },
-    });
+    }, { activeTurn: trackedTurn() });
 
     const first = await session.submitPrompt('first wake', { interrupt: true, steer: true });
     const second = await session.submitPrompt('second wake', { interrupt: true, steer: true });
@@ -235,4 +240,81 @@ describe('AcpSession live delivery', () => {
       'session/cancel', '_session/steering',
     ]);
   });
+});
+
+/**
+ * Regression cover for the owner-visible "request failed before completion"
+ * (`[ede_diagnostic] ... stop_reason=tool_use` / `stop_reason=null`).
+ *
+ * An interrupting prompt used to send `session/cancel` unconditionally and then
+ * issue `session/prompt` immediately. When the running turn was one the ADAPTER
+ * started — steering's `startedNewTurn`, which fleet never tracks — there was no
+ * `activeTurn` to await, so the prompt raced the adapter's transcript repair and
+ * landed on an unresolved `tool_use`. With nothing running at all the cancel was
+ * still sent, and the prompt landed on a bare interrupted user message.
+ */
+describe('AcpSession interrupting delivery never orphans a tool_use', () => {
+  it('does not cancel an untracked adapter turn that is inside a tool call', async () => {
+    const calls: string[] = [];
+    const session = fakeSession({
+      notify: async method => { calls.push(method); },
+      request: async method => {
+        calls.push(method);
+        return { stopReason: 'end_turn' };
+      },
+    }, {
+      steeringSupported: false,
+      activeToolCalls: new Map([['tool-1', { lifecycle: true, permissions: new Map() }]]),
+    });
+
+    const queued = await session.queuePrompt('owner request', {
+      interrupt: true, interruptSource: 'owner', origin: { kind: 'owner', requestId: 'r1' },
+    });
+
+    expect(calls).not.toContain('session/cancel');
+    expect(queued.delivery).toBe('deferred');
+    await expect(queued.completion).resolves.toMatchObject({ outcome: 'completed' });
+    expect(calls).toEqual(['session/prompt']);
+  });
+
+  it('still cancels a fleet-tracked turn, whose settlement it can await', async () => {
+    const calls: string[] = [];
+    const session = fakeSession({
+      notify: async method => { calls.push(method); },
+      request: async method => {
+        calls.push(method);
+        return { stopReason: 'end_turn' };
+      },
+    }, {
+      steeringSupported: false,
+      activeToolCalls: new Map([['tool-1', { lifecycle: true, permissions: new Map() }]]),
+      activeTurn: trackedTurn(),
+    });
+
+    const queued = await session.queuePrompt('owner request', {
+      interrupt: true, interruptSource: 'owner', origin: { kind: 'owner', requestId: 'r1' },
+    });
+
+    expect(queued.delivery).toBe('interrupted');
+    expect(calls).toEqual(['session/cancel', 'session/prompt']);
+  });
+
+  it('does not cancel an idle session', async () => {
+    const calls: string[] = [];
+    const session = fakeSession({
+      notify: async method => { calls.push(method); },
+      request: async method => {
+        calls.push(method);
+        return { stopReason: 'end_turn' };
+      },
+    }, { steeringSupported: false });
+
+    const queued = await session.queuePrompt('owner request', {
+      interrupt: true, interruptSource: 'owner', origin: { kind: 'owner', requestId: 'r1' },
+    });
+
+    expect(calls).toEqual(['session/prompt']);
+    expect(queued.delivery).toBe('started');
+  });
+
 });

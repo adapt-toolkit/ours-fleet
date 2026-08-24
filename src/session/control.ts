@@ -86,7 +86,7 @@ export function livenessNote(kind: ControlFailureKind, name: string): string {
 }
 
 /**
- * The result taxonomy an overseer judges a role by (7.2).
+ * The result taxonomy an overseer judges a role by.
  *
  * One console command is not a liveness verdict. `peek` and `send` can fail for
  * five distinct reasons and succeed for one, and only ONE of the six says the

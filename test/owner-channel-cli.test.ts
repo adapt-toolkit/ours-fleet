@@ -192,6 +192,7 @@ describe('owner-channel CLI', () => {
       caller: 'PhoneRole', role: options.name, lifetime: options.temp ? 'temporary' as const : 'permanent' as const,
       statePath: '/state/ProxyWorker', harness: options.harness ?? 'codex', session: 'acp' as const,
       model: 'gpt-proxy', monitor: { mode: 'fleet' as const, interrupt: true },
+      permissionMode: { fleetMode: 'allow' as const, nativeMode: 'bypassPermissions' },
       inherited: ['session', 'model', 'monitorConfig'], creationActionId: 'proxy-action',
     }));
     control!.setFleetSpawner(spawn);
@@ -205,6 +206,7 @@ describe('owner-channel CLI', () => {
     expect(result).toMatchObject({ code: 0, stderr: '' });
     expect(result.stdout).toContain("spawned temporary agent 'ProxyWorker' through PhoneRole's fleet proxy");
     expect(result.stdout).toContain('claude-code/acp');
+    expect(result.stdout).toContain('permission=allow native=bypassPermissions');
     expect(spawn).toHaveBeenCalledWith(expect.objectContaining({
       name: 'ProxyWorker', temp: true, harness: 'claude-code',
     }));
