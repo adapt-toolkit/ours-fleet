@@ -110,8 +110,6 @@ function mockCoworkAdapter(opts?: {
   initialRoleBriefings?: Array<{ role: string; text: string; version: number }>;
   historyPrefixRawCount?: number;
   endlessRawBacklog?: boolean;
-  admissionProvenance?: 'exact_invite_id' | 'legacy_unattributed';
-  redemptionInviteId?: string;
   observedInviteId?: string;
 }): CoworkAdapter {
   invitesIssued = [];
@@ -129,9 +127,6 @@ function mockCoworkAdapter(opts?: {
     briefings.set(briefing.role, { text: briefing.text, version: briefing.version });
   return {
     available: vi.fn().mockResolvedValue(true),
-    getAdmissionCapabilities: vi.fn().mockResolvedValue({
-      admission_provenance: opts?.admissionProvenance ?? 'exact_invite_id',
-    }),
     createRoom: vi.fn().mockResolvedValue({
       room_id: 'room-test', identity_name: 'room-id', identity_cid: 'room-cid',
     }),
@@ -147,7 +142,7 @@ function mockCoworkAdapter(opts?: {
         const cid = mocks.identities.get(name) ?? 'cid-001';
         admitted.set(cid, metadata.role);
         admittedInvites.set(cid, opts?.observedInviteId ?? metadata.inviteId);
-        return opts?.redemptionInviteId ?? metadata.inviteId;
+        return metadata.inviteId;
       });
       return { invite, invite_id: inviteId, min_accepts: inviteOpts.min_accepts };
     }),
@@ -334,8 +329,8 @@ beforeEach(() => {
         return { name, cid: mocks.identities.get(name) ?? 'cid-001' };
       }),
       addContact: vi.fn(async ({ invite }: { invite: string }) => {
-        const inviteId = mocks.onRedeem(boundName, invite);
-        return { cid: 'room-cid', display: 'Room', inviteId };
+        mocks.onRedeem(boundName, invite);
+        return { cid: 'room-cid', display: 'Room' };
       }),
     };
   });
@@ -506,31 +501,6 @@ describe('provision saga', () => {
       expect(issues).toHaveLength(2);
       expect(issues[1]).toBeLessThan(redeems[0]);
       expect(cowork.recoverRoom).toHaveBeenCalledTimes(1);
-    });
-
-    it('fails closed before minting an invite when exact provenance is unavailable', async () => {
-      const cowork = mockCoworkAdapter({ admissionProvenance: 'legacy_unattributed' });
-      createProvisionRoom({ room_id: 'room-legacy', room_name: 'Legacy' });
-
-      await expect(provisionMembers({
-        cfg: minimalCfg(), cowork, roomId: 'room-legacy', template: makeTemplate(),
-        binPath: '/usr/bin/ours-fleet',
-      })).rejects.toThrow(/refusing ambiguous room admission/);
-
-      expect(cowork.issueInvite).not.toHaveBeenCalled();
-      expect(mocks.onRedeem).not.toHaveBeenCalled();
-    });
-
-    it('rejects a member redemption that does not echo the retained invite ID', async () => {
-      const cowork = mockCoworkAdapter({ redemptionInviteId: 'different-invite' });
-      createProvisionRoom({ room_id: 'room-redeem-mismatch', room_name: 'Mismatch' });
-
-      await expect(provisionMembers({
-        cfg: minimalCfg(), cowork, roomId: 'room-redeem-mismatch', template: makeTemplate(),
-        binPath: '/usr/bin/ours-fleet',
-      })).rejects.toThrow(/redeemed invite different-invite; expected invite-1/);
-
-      expect(cowork.recoverRoom).not.toHaveBeenCalled();
     });
 
     it('rejects Cowork observation whose authenticated origin is another invite', async () => {

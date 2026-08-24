@@ -40,10 +40,6 @@ export interface CoworkSeatInfo {
   invite_id?: string;
 }
 
-export interface CoworkAdmissionCapabilities {
-  admission_provenance: 'exact_invite_id' | 'legacy_unattributed';
-}
-
 export interface CoworkRoomInfo {
   room_id: string;
   identity_name: string;
@@ -71,7 +67,6 @@ export interface CoworkHistoryPage {
 
 export interface CoworkAdapter {
   available(): Promise<boolean>;
-  getAdmissionCapabilities(roomId: string): Promise<CoworkAdmissionCapabilities>;
   createRoom(opts: {
     room_name: string;
     goal: string;
@@ -397,18 +392,6 @@ export function createCoworkAdapter(options: CoworkAdapterOptions = {}): CoworkA
   return {
     async available() {
       try { await call('room.list', {}); return true; } catch { return false; }
-    },
-    async getAdmissionCapabilities(roomId) {
-      const result = object(await call('room.capabilities', {
-        room_id: roomId,
-      }), 'room.capabilities', 'capabilities');
-      if (result.admission_provenance !== 'exact_invite_id'
-          && result.admission_provenance !== 'legacy_unattributed') {
-        throw new CoworkProtocolError(
-          'room.capabilities', 'capabilities.admission_provenance is invalid',
-        );
-      }
-      return { admission_provenance: result.admission_provenance };
     },
     async createRoom(opts) {
       const result = projectRoom(await call('room.create', {

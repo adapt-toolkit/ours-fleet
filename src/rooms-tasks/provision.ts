@@ -128,7 +128,7 @@ async function removeMemberIdentity(name: string): Promise<void> {
 }
 
 async function redeemRoomInviteAsMember(
-  member: ExpandedMember, invite: string, inviteId: string, roomIdentityCid: string,
+  member: ExpandedMember, invite: string, roomIdentityCid: string,
 ): Promise<void> {
   const client = await attachOursClient({
     env: process.env,
@@ -142,17 +142,10 @@ async function redeemRoomInviteAsMember(
         `member ${member.name} identity CID mismatch: expected ${member.cid}, found ${bound.cid}`,
       );
     }
-    const added = await client.addContact({ invite }) as Awaited<
-      ReturnType<OursClient['addContact']>
-    > & { inviteId?: string };
+    const added = await client.addContact({ invite });
     if (added.cid.toLowerCase() !== roomIdentityCid.toLowerCase()) {
       throw new Error(
         `member ${member.name} invite resolved to ${added.cid}; expected room ${roomIdentityCid}`,
-      );
-    }
-    if (added.inviteId !== inviteId) {
-      throw new Error(
-        `member ${member.name} redeemed invite ${added.inviteId ?? 'without provenance'}; expected ${inviteId}`,
       );
     }
   } finally {
@@ -474,12 +467,6 @@ export async function provisionMembers(
   };
   advanceSaga(roomId, 'join_role_groups', 5);
   try {
-    const capabilities = await cowork.getAdmissionCapabilities(roomId);
-    if (capabilities.admission_provenance !== 'exact_invite_id') {
-      throw new Error(
-        'Cowork does not provide exact authenticated invite provenance; refusing ambiguous room admission',
-      );
-    }
     const observedSeats = await cowork.getSeats(roomId);
     for (const member of members) {
       const observed = observedSeats.find(seat => seat.identity_cid === member.cid
@@ -517,7 +504,7 @@ export async function provisionMembers(
     updateMemberSeats(roomId, seats);
     await Promise.all(admissions.flatMap(admission => admission.group.map(member =>
       redeemRoomInviteAsMember(
-        member, admission.invite, admission.invite_id, roomIdentityCid,
+        member, admission.invite, roomIdentityCid,
       ))));
     const admissionDeadline = policy.now() + policy.timeoutMs;
     let admissionDelay = policy.initialDelayMs;
