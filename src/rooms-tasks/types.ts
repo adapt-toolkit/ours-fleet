@@ -154,6 +154,7 @@ export interface RoomMemberBriefingState {
   rejected_ack_count: number;
   last_rejected_ack_reason?: string;
   last_rejected_ack_seq?: number;
+  last_processed_seq?: number;
 }
 
 export type RoomHistoryEvidence =
@@ -222,6 +223,7 @@ export interface RoomOrchestrationRecord {
   owner_seat_cid?: string;
   owner_invite_fingerprint?: string;
   role_briefings?: Record<string, RoomRoleBriefingDefinition>;
+  history_cursor?: number;
   member_seats: RoomMemberSeat[];
   state: RoomOrchestrationState;
   created_at: string;

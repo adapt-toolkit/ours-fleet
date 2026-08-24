@@ -1,6 +1,6 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import {
-  mkdirSync, mkdtempSync, rmSync, readdirSync, readFileSync, writeFileSync,
+  cpSync, mkdirSync, mkdtempSync, rmSync, readdirSync, readFileSync, writeFileSync,
 } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -20,6 +20,9 @@ const mocks = vi.hoisted(() => {
     releaseLease: mockReleaseLease,
   });
   const mockSpawnTemp = vi.fn();
+  const mockTempLiveness = vi.fn().mockResolvedValue('running');
+  const mockSecureArchive = vi.fn();
+  const mockArchiveForAction = vi.fn();
   return {
     cidCounter,
     mockAttachOursClient,
@@ -27,6 +30,9 @@ const mocks = vi.hoisted(() => {
     mockRemoveIdentity,
     mockReleaseLease,
     mockSpawnTemp,
+    mockTempLiveness,
+    mockSecureArchive,
+    mockArchiveForAction,
   };
 });
 
@@ -40,15 +46,16 @@ vi.mock('../src/spawn.js', () => ({
 
 vi.mock('../src/temp-lifecycle.js', async (importOriginal) => ({
   ...(await importOriginal<typeof import('../src/temp-lifecycle.js')>()),
-  tempSupervisorLiveness: vi.fn().mockResolvedValue('running'),
-  secureStoppedTempArchive: vi.fn().mockResolvedValue('/archive/mock'),
+  tempSupervisorLiveness: mocks.mockTempLiveness,
+  secureStoppedTempArchive: mocks.mockSecureArchive,
+  tempArchiveForCreationAction: mocks.mockArchiveForAction,
 }));
 
 // ── Imports (resolved after mock interception) ──────────────────────────
 
 import { provisionMembers, cleanupMembers } from '../src/rooms-tasks/provision.js';
 import {
-  createRoomRecord, getRoomRecord,
+  createRoomRecord, getRoomRecord, updateMemberSeats, updateRoomRoleBriefing,
 } from '../src/rooms-tasks/room-state.js';
 import {
   createTask, getTask,
@@ -56,7 +63,9 @@ import {
 import type { CoworkAdapter, CoworkSeatInfo } from '../src/rooms-tasks/cowork-adapter.js';
 import type { RoomHistoryEvidence, TemplateSnapshot } from '../src/rooms-tasks/types.js';
 import type { FleetConfig, ResolvedRole } from '../src/config.js';
-import { sha256Text } from '../src/rooms-tasks/member-startup.js';
+import {
+  buildRoomMemberCharter, sha256Text,
+} from '../src/rooms-tasks/member-startup.js';
 
 // ── Helpers ─────────────────────────────────────────────────────────────
 
@@ -100,6 +109,9 @@ function mockCoworkAdapter(opts?: {
   initialSeats?: Array<{ cid: string; role: string }>;
   relayStatus?: 'queued' | 'send_failed';
   setBriefingFail?: boolean;
+  initialRoleBriefings?: Array<{ role: string; text: string; version: number }>;
+  historyPrefixRawCount?: number;
+  endlessRawBacklog?: boolean;
 }): CoworkAdapter {
   invitesIssued = [];
   let inviteSeq = 0;
@@ -107,6 +119,8 @@ function mockCoworkAdapter(opts?: {
   const admitted = new Map<string, string>();
   for (const seat of opts?.initialSeats ?? []) admitted.set(seat.cid, seat.role);
   const briefings = new Map<string, { text: string; version: number }>();
+  for (const briefing of opts?.initialRoleBriefings ?? [])
+    briefings.set(briefing.role, { text: briefing.text, version: briefing.version });
   return {
     available: vi.fn().mockResolvedValue(true),
     createRoom: vi.fn().mockResolvedValue({
@@ -133,7 +147,9 @@ function mockCoworkAdapter(opts?: {
       };
     }),
     getHistory: vi.fn().mockImplementation(async (roomId, historyOpts) => {
-      if (opts?.seatsActive === false) return [];
+      if (opts?.seatsActive === false) return {
+        records: [], raw_count: 0, next_after: historyOpts?.after ?? 0,
+      };
       const records: RoomHistoryEvidence[] = [];
       let seq = 0;
       for (const [cid, role] of admitted) {
@@ -183,9 +199,41 @@ function mockCoworkAdapter(opts?: {
         }
       }
       const after = historyOpts?.after ?? 0;
-      return records.filter(record => record.seq > after).slice(0, historyOpts?.limit ?? 200);
+      if (opts?.endlessRawBacklog) return {
+        records: [], raw_count: 200, next_after: after + 200,
+      };
+      const prefix = opts?.historyPrefixRawCount ?? 0;
+      if (after < prefix) return {
+        records: [], raw_count: Math.min(historyOpts?.limit ?? 200, prefix - after),
+        next_after: prefix,
+      };
+      const shifted = records.map(record => ({ ...record, seq: record.seq + prefix }));
+      const page = shifted.filter(record => record.seq > after).slice(0, historyOpts?.limit ?? 200);
+      return {
+        records: page, raw_count: page.length,
+        next_after: page.at(-1)?.seq ?? after,
+      };
     }),
-    getRoom: vi.fn().mockResolvedValue(undefined),
+    getRoom: vi.fn().mockImplementation(async roomId => {
+      const persisted = getRoomRecord(roomId)?.role_briefings ?? {};
+      const roles = new Set([...briefings.keys(), ...Object.keys(persisted)]);
+      return {
+        room_id: roomId, identity_name: 'room-id', identity_cid: 'room-cid',
+        room_name: 'Test', state: 'active' as const,
+        seats: [...admitted].map(([identity_cid, role]) => ({
+          identity_cid, role, seat_state: 'active' as const,
+        })),
+        role_briefings: Object.fromEntries([...roles].flatMap(role => {
+          const briefing = briefings.get(role);
+          const local = persisted[role];
+          const version = briefing?.version ?? local?.version;
+          return version ? [[role, {
+            role, text: briefing?.text ?? local.text, version,
+            updated_at: '2026-08-24T00:00:00.000Z',
+          }]] : [];
+        })),
+      };
+    }),
     listRooms: vi.fn().mockResolvedValue([]),
     closeRoom: vi.fn().mockResolvedValue(undefined),
     getSeats: vi.fn().mockImplementation(async () => {
@@ -207,6 +255,15 @@ function stateDir(): string { return join(dir, 'state'); }
 
 function createProvisionRoom(input: Parameters<typeof createRoomRecord>[0]) {
   return createRoomRecord({ room_identity_cid: 'room-cid', ...input });
+}
+
+function archivedCopy(roleName: string): string {
+  const live = join(dir, '.ours-fleet', 'tmp', roleName);
+  const archive = join(dir, '.ours-fleet', 'archive', `archive-${roleName}`);
+  mkdirSync(join(dir, '.ours-fleet', 'archive'), { recursive: true });
+  cpSync(live, archive, { recursive: true });
+  rmSync(live, { recursive: true, force: true });
+  return archive;
 }
 
 function allStateFiles(): string[] {
@@ -257,6 +314,9 @@ beforeEach(() => {
     }));
     return roleDir;
   });
+  mocks.mockTempLiveness.mockResolvedValue('running');
+  mocks.mockSecureArchive.mockReset();
+  mocks.mockArchiveForAction.mockReset();
 });
 
 afterEach(() => {
@@ -474,6 +534,224 @@ describe('provision saga', () => {
   });
 
   describe('briefing readiness gate', () => {
+    it('advances through a fully filtered raw history page to later ACK evidence', async () => {
+      const template = makeTemplate([
+        { slot: 'dev', role: 'Developer', count: 1, role_ref: 'Dev' },
+      ]);
+      const cowork = mockCoworkAdapter({ historyPrefixRawCount: 200 });
+      createProvisionRoom({ room_id: 'room-paged', room_name: 'Paged' });
+      const result = await provisionMembers({
+        cfg: minimalCfg(), cowork, roomId: 'room-paged', template,
+        binPath: '/usr/bin/ours-fleet',
+      });
+      expect(result.state).toBe('active');
+      expect(result.history_cursor).toBeGreaterThan(200);
+    });
+
+    it('fails visibly while preserving cursor progress across an oversized raw backlog', async () => {
+      const template = makeTemplate([
+        { slot: 'dev', role: 'Developer', count: 1, role_ref: 'Dev' },
+      ]);
+      createProvisionRoom({ room_id: 'room-backlog', room_name: 'Backlog' });
+      await expect(provisionMembers({
+        cfg: minimalCfg(), cowork: mockCoworkAdapter({ endlessRawBacklog: true }),
+        roomId: 'room-backlog', template, binPath: '/usr/bin/ours-fleet',
+      })).rejects.toThrow('history backlog exceeded 20,000 raw records');
+      const room = getRoomRecord('room-backlog')!;
+      expect(room.history_cursor).toBe(20_000);
+      expect(room.provisioning_detail).toBe('uncertain');
+      expect(room.saga.error).toContain('cursor progress was preserved');
+    });
+
+    it('adopts an exact remote role definition after a crash before local version persist', async () => {
+      const template = makeTemplate([
+        { slot: 'dev', role: 'Developer', count: 1, role_ref: 'Dev' },
+      ]);
+      createProvisionRoom({ room_id: 'room-remote-adopt', room_name: 'Remote adopt' });
+      const text = buildRoomMemberCharter({
+        roomId: 'room-remote-adopt', roomIdentityCid: 'room-cid', ownerSeatCid: null,
+        contract: template.contract,
+        member: { role_name: 'room-room-rem-dev-1', cowork_role: 'Developer', identity_cid: 'cid-001' },
+        roster: [{ role_name: 'room-room-rem-dev-1', cowork_role: 'Developer', identity_cid: 'cid-001' }],
+      });
+      updateMemberSeats('room-remote-adopt', [{
+        role_name: 'room-room-rem-dev-1', identity_cid: 'cid-001', slot: 'dev',
+        cowork_role: 'Developer', seat_state: 'pending',
+      }]);
+      updateRoomRoleBriefing('room-remote-adopt', 'Developer', {
+        role: 'Developer', text, sha256: sha256Text(text), state: 'pending',
+        attempts: 1, updated_at: '2026-08-24T00:00:00.000Z',
+      });
+      const cowork = mockCoworkAdapter({
+        initialRoleBriefings: [{ role: 'Developer', text, version: 4 }],
+      });
+      const result = await provisionMembers({
+        cfg: minimalCfg(), cowork, roomId: 'room-remote-adopt', template,
+        binPath: '/usr/bin/ours-fleet',
+      });
+      expect(result.role_briefings?.Developer.version).toBe(4);
+      expect(cowork.setRoleBriefing).not.toHaveBeenCalled();
+    });
+
+    it('fails closed when current Cowork role briefing drifted externally', async () => {
+      const template = makeTemplate([
+        { slot: 'dev', role: 'Developer', count: 1, role_ref: 'Dev' },
+      ]);
+      createProvisionRoom({ room_id: 'room-drift', room_name: 'Drift' });
+      let clock = 0;
+      const waiting = await provisionMembers({
+        cfg: minimalCfg(), cowork: mockCoworkAdapter({ acknowledgeBriefings: false }),
+        roomId: 'room-drift', template, binPath: '/usr/bin/ours-fleet',
+        startupWait: {
+          timeoutMs: 1, initialDelayMs: 1, maxDelayMs: 1,
+          now: () => clock, sleep: async ms => { clock += ms; },
+        },
+      });
+      const cid = waiting.member_seats[0].identity_cid;
+      await expect(provisionMembers({
+        cfg: minimalCfg(), cowork: mockCoworkAdapter({
+          initialSeats: [{ cid, role: 'Developer' }],
+          initialRoleBriefings: [{ role: 'Developer', text: 'external drift', version: 2 }],
+        }),
+        roomId: 'room-drift', template, binPath: '/usr/bin/ours-fleet',
+      })).rejects.toThrow('Cowork current role briefing drift');
+    });
+
+    it('fails closed when an expected CID occupies the wrong Cowork role', async () => {
+      const template = makeTemplate([
+        { slot: 'dev', role: 'Developer', count: 1, role_ref: 'Dev' },
+      ]);
+      createProvisionRoom({ room_id: 'room-role-spoof', room_name: 'Role spoof' });
+      await expect(provisionMembers({
+        cfg: minimalCfg(), cowork: mockCoworkAdapter({
+          initialSeats: [{ cid: 'cid-001', role: 'Owner' }],
+        }),
+        roomId: 'room-role-spoof', template, binPath: '/usr/bin/ours-fleet',
+      })).rejects.toThrow(/has role Owner; expected Developer/);
+    });
+
+    it('requires and verifies an exact archive before replacing a disappeared launch', async () => {
+      const template = makeTemplate([
+        { slot: 'dev', role: 'Developer', count: 1, role_ref: 'Dev' },
+      ]);
+      createProvisionRoom({ room_id: 'room-launch-archive', room_name: 'Launch archive' });
+      let clock = 0;
+      const waiting = await provisionMembers({
+        cfg: minimalCfg(), cowork: mockCoworkAdapter({ acknowledgeBriefings: false }),
+        roomId: 'room-launch-archive', template, binPath: '/usr/bin/ours-fleet',
+        startupWait: {
+          timeoutMs: 1, initialDelayMs: 1, maxDelayMs: 1,
+          now: () => clock, sleep: async ms => { clock += ms; },
+        },
+      });
+      const seat = waiting.member_seats[0];
+      const archive = archivedCopy(seat.role_name);
+      mocks.mockSecureArchive.mockResolvedValueOnce(archive);
+      const recovered = await provisionMembers({
+        cfg: minimalCfg(), cowork: mockCoworkAdapter({
+          initialSeats: [{ cid: seat.identity_cid, role: seat.cowork_role }],
+          historyPrefixRawCount: waiting.history_cursor ?? 0,
+        }),
+        roomId: 'room-launch-archive', template, binPath: '/usr/bin/ours-fleet',
+      });
+      expect(recovered.state).toBe('active');
+      expect(mocks.mockSecureArchive).toHaveBeenCalledWith(
+        seat.role_name, seat.launch?.launch_id,
+      );
+      expect(mocks.mockSpawnTemp).toHaveBeenCalledTimes(2);
+      expect(recovered.member_seats[0].launch?.attempt).toBe(2);
+    });
+
+    it('fails closed on an intent whose live directory disappeared without exact archive proof', async () => {
+      const template = makeTemplate([
+        { slot: 'dev', role: 'Developer', count: 1, role_ref: 'Dev' },
+      ]);
+      createProvisionRoom({ room_id: 'room-intent-gap', room_name: 'Intent gap' });
+      const roleName = 'room-room-int-dev-1';
+      const text = buildRoomMemberCharter({
+        roomId: 'room-intent-gap', roomIdentityCid: 'room-cid', ownerSeatCid: null,
+        contract: template.contract,
+        member: { role_name: roleName, cowork_role: 'Developer', identity_cid: 'cid-001' },
+        roster: [{ role_name: roleName, cowork_role: 'Developer', identity_cid: 'cid-001' }],
+      });
+      updateMemberSeats('room-intent-gap', [{
+        role_name: roleName, identity_cid: 'cid-001', slot: 'dev',
+        cowork_role: 'Developer', seat_state: 'active',
+        launch: {
+          state: 'intent', attempt: 1, action_id: 'action-crash',
+          mission_sha256: '0'.repeat(64), updated_at: '2026-08-24T00:00:00.000Z',
+        },
+        briefing: { role: 'Developer', state: 'pending', rejected_ack_count: 0 },
+      }]);
+      updateRoomRoleBriefing('room-intent-gap', 'Developer', {
+        role: 'Developer', text, sha256: sha256Text(text), version: 1,
+        state: 'configured', attempts: 1, updated_at: '2026-08-24T00:00:00.000Z',
+      });
+      await expect(provisionMembers({
+        cfg: minimalCfg(), cowork: mockCoworkAdapter({
+          initialSeats: [{ cid: 'cid-001', role: 'Developer' }],
+          initialRoleBriefings: [{ role: 'Developer', text, version: 1 }],
+        }),
+        roomId: 'room-intent-gap', template, binPath: '/usr/bin/ours-fleet',
+      })).rejects.toThrow('no exact live or terminated archive evidence');
+      expect(mocks.mockArchiveForAction).toHaveBeenCalledWith(roleName, 'action-crash');
+      expect(mocks.mockSpawnTemp).not.toHaveBeenCalled();
+    });
+
+    it('recovers an intent from one exact terminated creation-action archive', async () => {
+      const template = makeTemplate([
+        { slot: 'dev', role: 'Developer', count: 1, role_ref: 'Dev' },
+      ]);
+      createProvisionRoom({ room_id: 'room-intent-archive', room_name: 'Intent archive' });
+      const roleName = 'room-room-int-dev-1';
+      const text = buildRoomMemberCharter({
+        roomId: 'room-intent-archive', roomIdentityCid: 'room-cid', ownerSeatCid: null,
+        contract: template.contract,
+        member: { role_name: roleName, cowork_role: 'Developer', identity_cid: 'cid-001' },
+        roster: [{ role_name: roleName, cowork_role: 'Developer', identity_cid: 'cid-001' }],
+      });
+      const gate = {
+        room_id: 'room-intent-archive', room_identity_cid: 'room-cid',
+        briefing_role: 'Developer', briefing_version: 1,
+        briefing_sha256: sha256Text(text), owner_seat_cid: null,
+      };
+      const mission = 'Complete the dedicated room startup gate in briefing.md before readiness. '
+        + `Expected room ${gate.room_id} (${gate.room_identity_cid}), role Developer, `
+        + `briefing version 1, sha256 ${gate.briefing_sha256}.`;
+      await mocks.mockSpawnTemp({
+        name: roleName, identity: roleName, mission, roomStartupGate: gate,
+        creationActionId: 'action-archived',
+      });
+      const archive = archivedCopy(roleName);
+      mocks.mockSpawnTemp.mockClear();
+      mocks.mockArchiveForAction.mockReturnValueOnce({ path: archive, launchId: `launch-${roleName}` });
+      updateMemberSeats('room-intent-archive', [{
+        role_name: roleName, identity_cid: 'cid-001', slot: 'dev',
+        cowork_role: 'Developer', seat_state: 'active',
+        launch: {
+          state: 'intent', attempt: 1, action_id: 'action-archived',
+          mission_sha256: sha256Text(mission), updated_at: '2026-08-24T00:00:00.000Z',
+        },
+        briefing: { role: 'Developer', state: 'pending', rejected_ack_count: 0 },
+      }]);
+      updateRoomRoleBriefing('room-intent-archive', 'Developer', {
+        role: 'Developer', text, sha256: sha256Text(text), version: 1,
+        state: 'configured', attempts: 1, updated_at: '2026-08-24T00:00:00.000Z',
+      });
+      const result = await provisionMembers({
+        cfg: minimalCfg(), cowork: mockCoworkAdapter({
+          initialSeats: [{ cid: 'cid-001', role: 'Developer' }],
+          initialRoleBriefings: [{ role: 'Developer', text, version: 1 }],
+        }),
+        roomId: 'room-intent-archive', template, binPath: '/usr/bin/ours-fleet',
+      });
+      expect(result.state).toBe('active');
+      expect(result.member_seats[0].launch?.attempt).toBe(2);
+      expect(mocks.mockSpawnTemp).toHaveBeenCalledTimes(1);
+      const retriedAction = mocks.mockSpawnTemp.mock.calls[0][0].creationActionId;
+      expect(retriedAction).not.toBe('action-archived');
+    });
+
     it('keeps a timed-out ACK wait nonterminal and resumes without relaunching', async () => {
       const template = makeTemplate([
         { slot: 'dev', role: 'Developer', count: 1, role_ref: 'Dev' },

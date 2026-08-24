@@ -104,6 +104,7 @@ export interface ExpectedBriefingAck {
 export interface BriefingReconciliation {
   briefing: RoomMemberBriefingState;
   validAck?: RoomHistoryEvidence & { kind: 'message' };
+  drift?: string;
 }
 
 function ackMismatch(ack: RoomBriefingAck, expected: ExpectedBriefingAck, messageId: string): string | undefined {
@@ -119,77 +120,70 @@ function ackMismatch(ack: RoomBriefingAck, expected: ExpectedBriefingAck, messag
 
 export function reconcileBriefingHistory(
   history: RoomHistoryEvidence[], expected: ExpectedBriefingAck,
+  previous?: RoomMemberBriefingState,
 ): BriefingReconciliation {
-  const briefing = history.find((record): record is RoomHistoryEvidence & { kind: 'message' } =>
-    record.kind === 'message'
-    && record.category === 'role_briefing'
-    && record.author.identity === expected.roomIdentityCid
-    && record.briefing_role === expected.role
-    && record.briefing_version === expected.version
-    && sha256Text(record.text) === expected.sha256
-    && record.recipient_identities.includes(expected.memberCid));
-  let state: RoomMemberBriefingState = {
+  const state: RoomMemberBriefingState = previous ? { ...previous } : {
     role: expected.role, state: 'pending', rejected_ack_count: 0,
-    checked_at: new Date().toISOString(),
   };
-  if (briefing) {
-    state.message_id = briefing.message_id;
-    const intent = history.find(record => record.kind === 'relay_intent'
-      && record.message_id === briefing.message_id
-      && record.recipient_identity === expected.memberCid);
-    if (intent?.kind === 'relay_intent') {
-      state.relay_intent_record_id = intent.record_id;
-      const result = history.find(record => record.kind === 'relay_result'
-        && record.intent_record_id === intent.record_id
-        && record.message_id === briefing.message_id
-        && record.recipient_identity === expected.memberCid);
-      if (result?.kind === 'relay_result') {
-        state.relay_result_record_id = result.record_id;
-        state.relay_wire_id = result.wire_id;
-        state.state = result.status === 'queued' ? 'relay_queued' : 'relay_failed';
-      }
-    }
-  }
-
+  state.checked_at = new Date().toISOString();
+  let drift: string | undefined;
   let validAck: (RoomHistoryEvidence & { kind: 'message' }) | undefined;
-  let rejected = 0;
-  let lastReason: string | undefined;
-  let lastSeq: number | undefined;
-  for (const message of history) {
-    if (message.kind !== 'message' || message.category !== 'chat'
-        || message.author.identity !== expected.memberCid) continue;
-    const looksLikeAck = message.text.includes('fleet_room_briefing_ack');
-    if (!looksLikeAck) continue;
-    const ack = parseRoomBriefingAck(message.text);
-    const mismatch = !ack ? 'invalid or non-canonical ACK JSON'
-      : !briefing ? 'no matching room role briefing'
-      : state.state !== 'relay_queued' ? 'briefing relay was not queued'
-      : ackMismatch(ack, expected, briefing.message_id);
-    if (mismatch) {
-      rejected++;
-      lastReason = mismatch;
-      lastSeq = message.seq;
+  const records = [...history]
+    .filter(record => record.seq > (previous?.last_processed_seq ?? 0))
+    .sort((a, b) => a.seq - b.seq);
+  for (const record of records) {
+    state.last_processed_seq = Math.max(state.last_processed_seq ?? 0, record.seq);
+    if (record.kind === 'message' && record.category === 'role_briefing'
+        && record.author.identity === expected.roomIdentityCid
+        && record.briefing_role === expected.role
+        && record.recipient_identities.includes(expected.memberCid)) {
+      const hash = sha256Text(record.text);
+      if ((record.briefing_version ?? 0) > expected.version
+          || (record.briefing_version === expected.version && hash !== expected.sha256)) {
+        drift = `room role briefing drift at history seq ${record.seq}`;
+        continue;
+      }
+      if (record.briefing_version === expected.version && hash === expected.sha256) {
+        if (state.message_id && state.message_id !== record.message_id)
+          drift = `multiple exact role briefing messages for ${expected.memberCid}`;
+        else state.message_id = record.message_id;
+      }
       continue;
     }
-    validAck ??= message;
+    if (record.kind === 'relay_intent' && state.message_id
+        && record.message_id === state.message_id
+        && record.recipient_identity === expected.memberCid) {
+      state.relay_intent_record_id = record.record_id;
+      continue;
+    }
+    if (record.kind === 'relay_result' && state.message_id && state.relay_intent_record_id
+        && record.intent_record_id === state.relay_intent_record_id
+        && record.message_id === state.message_id
+        && record.recipient_identity === expected.memberCid) {
+      state.relay_result_record_id = record.record_id;
+      state.relay_wire_id = record.wire_id;
+      state.state = record.status === 'queued' ? 'relay_queued' : 'relay_failed';
+      continue;
+    }
+    if (record.kind !== 'message' || record.category !== 'chat'
+        || record.author.identity !== expected.memberCid
+        || !record.text.includes('fleet_room_briefing_ack')) continue;
+    const ack = parseRoomBriefingAck(record.text);
+    const mismatch = !ack ? 'invalid or non-canonical ACK JSON'
+      : !state.message_id ? 'no matching room role briefing'
+      : state.state !== 'relay_queued' ? 'briefing relay was not queued'
+      : ackMismatch(ack, expected, state.message_id);
+    if (mismatch) {
+      state.rejected_ack_count++;
+      state.last_rejected_ack_reason = mismatch;
+      state.last_rejected_ack_seq = record.seq;
+    } else {
+      state.state = 'acknowledged';
+      state.acknowledged_at = record.at;
+      state.acknowledgement_message_id = record.message_id;
+      state.acknowledgement_seq = record.seq;
+      validAck ??= record;
+    }
   }
-  state.rejected_ack_count = rejected;
-  state.last_rejected_ack_reason = lastReason;
-  state.last_rejected_ack_seq = lastSeq;
-  if (validAck) {
-    state = {
-      ...state,
-      state: 'acknowledged',
-      acknowledged_at: validAck.at,
-      acknowledgement_message_id: validAck.message_id,
-      acknowledgement_seq: validAck.seq,
-    };
-  }
-  return { briefing: state, validAck };
-}
-
-export function classifyRoomAuthor(
-  authorCid: string, ownerSeatCid: string | null,
-): 'owner' | 'peer' {
-  return ownerSeatCid !== null && authorCid === ownerSeatCid ? 'owner' : 'peer';
+  return { briefing: state, validAck, drift };
 }

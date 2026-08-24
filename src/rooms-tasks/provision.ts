@@ -7,10 +7,10 @@ import {
 import type { CoworkAdapter } from './cowork-adapter.js';
 import {
   advanceSaga, setSagaError, updateMemberSeats, updateMemberStartup,
-  updateRoomRoleBriefing, activateRoom, getRoomRecord,
+  updateRoomRoleBriefing, updateRoomHistoryCursor, activateRoom, getRoomRecord,
 } from './room-state.js';
 import {
-  activateTask, updateTaskMembers, failTask, blockTask,
+  activateTask, updateTaskMembers, failTask, blockTask, unblockTask, getTask,
 } from './task-state.js';
 import type {
   RoomOrchestrationRecord, RoomMemberSeat, TaskMemberRole,
@@ -25,7 +25,8 @@ import {
 import { agentDir } from '../paths.js';
 import { readProvenance } from '../creation.js';
 import {
-  readTempSupervisor, secureStoppedTempArchive, tempSupervisorLiveness,
+  readTempSupervisor, secureStoppedTempArchive, tempArchiveForCreationAction,
+  tempSupervisorLiveness,
 } from '../temp-lifecycle.js';
 
 export function getBinPath(): string {
@@ -137,18 +138,36 @@ function settingsFor(member: ExpandedMember, cfg: FleetConfig): MemberSettings {
   };
 }
 
-async function roomHistory(cowork: CoworkAdapter, roomId: string): Promise<RoomHistoryEvidence[]> {
+async function roomHistory(cowork: CoworkAdapter, roomId: string): Promise<{
+  records: RoomHistoryEvidence[]; cursor: number; exhausted: boolean;
+}> {
   const records: RoomHistoryEvidence[] = [];
-  let after = 0;
+  let after = getRoomRecord(roomId)?.history_cursor ?? 0;
   for (let page = 0; page < 100; page++) {
     const next = await cowork.getHistory(roomId, { after, limit: 200 });
-    if (next.length === 0) return records;
-    records.push(...next);
-    const cursor = Math.max(...next.map(record => record.seq));
-    if (cursor <= after) throw new Error('Cowork room history cursor did not advance');
-    after = cursor;
+    records.push(...next.records);
+    if (next.raw_count === 0) return { records, cursor: after, exhausted: true };
+    if (next.next_after <= after) throw new Error('Cowork room history cursor did not advance');
+    after = next.next_after;
+    if (next.raw_count < 200) return { records, cursor: after, exhausted: true };
   }
-  throw new Error('Cowork room history exceeded 100 bounded pages');
+  return { records, cursor: after, exhausted: false };
+}
+
+async function assertCurrentRoleBriefings(
+  cowork: CoworkAdapter, roomId: string,
+  definitions: Map<string, { text: string; sha256: string; version?: number }>,
+): Promise<void> {
+  const room = await cowork.getRoom(roomId);
+  if (!room) throw new Error(`Cowork room ${roomId} is missing during briefing verification`);
+  for (const [role, expected] of definitions) {
+    const current = room.role_briefings[role];
+    if (!current || current.text !== expected.text
+        || sha256Text(current.text) !== expected.sha256
+        || (expected.version !== undefined && current.version !== expected.version)) {
+      throw new Error(`Cowork current role briefing drift for ${role}`);
+    }
+  }
 }
 
 function startupMission(gate: RoomStartupGate): string {
@@ -214,8 +233,28 @@ async function ensureLaunch(input: {
     seat = getRoomRecord(provision.roomId)!.member_seats
       .find(candidate => candidate.role_name === member.name)!;
   } else if (seat.launch?.state === 'launched' && !existsSync(dir)) {
+    if (!seat.launch.launch_id || !seat.launch.action_id)
+      throw new Error(`missing durable launch identity for disappeared ${member.name}`);
+    const archive = await secureStoppedTempArchive(member.name, seat.launch.launch_id);
+    if (!launchMatches(archive, member, seat.launch.action_id, missionSha, gate))
+      throw new Error(`archive for disappeared ${member.name} does not match its durable intent`);
     updateMemberStartup(provision.roomId, member.name, { launch: {
       ...seat.launch, state: 'stopped', updated_at: new Date().toISOString(),
+    } });
+    seat = getRoomRecord(provision.roomId)!.member_seats
+      .find(candidate => candidate.role_name === member.name)!;
+  } else if (seat.launch?.state === 'intent' && !existsSync(dir)) {
+    if (!seat.launch.action_id)
+      throw new Error(`missing action ID for disappeared launch intent ${member.name}`);
+    const archive = tempArchiveForCreationAction(member.name, seat.launch.action_id);
+    if (!archive || !launchMatches(
+      archive.path, member, seat.launch.action_id, missionSha, gate)) {
+      throw new Error(
+        `launch intent for ${member.name} has no exact live or terminated archive evidence`);
+    }
+    updateMemberStartup(provision.roomId, member.name, { launch: {
+      ...seat.launch, state: 'stopped', launch_id: archive.launchId,
+      updated_at: new Date().toISOString(),
     } });
     seat = getRoomRecord(provision.roomId)!.member_seats
       .find(candidate => candidate.role_name === member.name)!;
@@ -350,17 +389,26 @@ export async function provisionMembers(
   }
 
   advanceSaga(roomId, 'configure_briefings', 4);
+  const remoteRoom = await cowork.getRoom(roomId);
+  if (!remoteRoom) throw new Error(`Cowork room ${roomId} is missing during briefing configuration`);
   for (const [role, definition] of definitions) {
     const current = getRoomRecord(roomId)!.role_briefings?.[role];
-    if (current?.state === 'configured' && current.text === definition.text
-        && current.sha256 === definition.sha256 && current.version) continue;
     const attempt = (current?.attempts ?? 0) + 1;
     updateRoomRoleBriefing(roomId, role, {
-      role, ...definition, state: 'pending', attempts: attempt,
+      role, ...definition, ...(current?.version ? { version: current.version } : {}),
+      state: 'pending', attempts: attempt,
       updated_at: new Date().toISOString(),
     });
     try {
-      const configured = await cowork.setRoleBriefing(roomId, {
+      const remote = remoteRoom.role_briefings[role];
+      if (remote && (remote.text !== definition.text
+          || sha256Text(remote.text) !== definition.sha256
+          || (current?.version !== undefined && remote.version !== current.version))) {
+        throw new Error(`Cowork current role briefing drift for ${role}`);
+      }
+      if (!remote && current?.version !== undefined)
+        throw new Error(`Cowork current role briefing is missing for ${role}`);
+      const configured = remote ?? await cowork.setRoleBriefing(roomId, {
         role, text: definition.text,
       });
       if (configured.text !== definition.text)
@@ -371,7 +419,8 @@ export async function provisionMembers(
       });
     } catch (error) {
       updateRoomRoleBriefing(roomId, role, {
-        role, ...definition, state: 'failed', attempts: attempt,
+        role, ...definition, ...(current?.version ? { version: current.version } : {}),
+        state: 'failed', attempts: attempt,
         updated_at: new Date().toISOString(),
         last_error: error instanceof Error ? error.message : String(error),
       });
@@ -384,7 +433,14 @@ export async function provisionMembers(
 
   advanceSaga(roomId, 'join_role_groups', 5);
   try {
-    const admitted = new Set((await cowork.getSeats(roomId))
+    const observedSeats = await cowork.getSeats(roomId);
+    for (const member of members) {
+      const observed = observedSeats.find(seat => seat.identity_cid === member.cid
+        && seat.seat_state !== 'removed');
+      if (observed && observed.role !== member.coworkRole)
+        throw new Error(`Cowork seat ${member.cid} has role ${observed.role}; expected ${member.coworkRole}`);
+    }
+    const admitted = new Set(observedSeats
       .filter(seat => seat.seat_state !== 'removed').map(seat => seat.identity_cid));
     const roleGroups = new Map<string, ExpandedMember[]>();
     for (const member of members.filter(candidate => !admitted.has(candidate.cid))) {
@@ -408,12 +464,15 @@ export async function provisionMembers(
     if (taskId) blockTask(taskId, error instanceof Error ? error.message : String(error));
     throw error;
   }
+  if (taskId && getTask(taskId).blocked) unblockTask(taskId);
 
   advanceSaga(roomId, 'wait_seats', 6);
   const coworkSeats = await cowork.getSeats(roomId);
   const memberCids = new Set(members.map(m => m.cid));
   const allActive = [...memberCids].every(cid =>
-    coworkSeats.some(s => s.identity_cid === cid && s.seat_state === 'active'),
+    coworkSeats.some(s => s.identity_cid === cid
+      && s.role === members.find(member => member.cid === cid)?.coworkRole
+      && s.seat_state === 'active'),
   );
   if (!allActive) {
     advanceSaga(roomId, 'wait_seats', 6, 'waiting_seats');
@@ -462,16 +521,32 @@ export async function provisionMembers(
     let allAcknowledged = true;
     let relayFailed = false;
     for (const member of members) {
-      const definition = getRoomRecord(roomId)!.role_briefings![member.coworkRole];
-      const result = reconcileBriefingHistory(history, {
+      const currentRoom = getRoomRecord(roomId)!;
+      const definition = currentRoom.role_briefings![member.coworkRole];
+      const previous = currentRoom.member_seats
+        .find(seat => seat.role_name === member.name)!.briefing;
+      const result = reconcileBriefingHistory(history.records, {
         roomId, roomIdentityCid: existing.room_identity_cid,
         ownerSeatCid: existing.owner_seat_cid ?? null,
         memberCid: member.cid, role: member.coworkRole,
         version: definition.version!, sha256: definition.sha256,
-      });
+      }, previous);
+      if (result.drift) {
+        setSagaError(roomId, result.drift,
+          'Cowork role briefing history drifted; inspect current room briefing state.', 'uncertain');
+        if (taskId) blockTask(taskId, result.drift);
+        throw new Error(result.drift);
+      }
       updateMemberStartup(roomId, member.name, { briefing: result.briefing });
       allAcknowledged &&= result.briefing.state === 'acknowledged';
       relayFailed ||= result.briefing.state === 'relay_failed';
+    }
+    updateRoomHistoryCursor(roomId, history.cursor);
+    if (!history.exhausted) {
+      const reason = 'Cowork history backlog exceeded 20,000 raw records in one pass; '
+        + 'cursor progress was preserved, retry recovery to continue.';
+      setSagaError(roomId, reason, reason, 'uncertain');
+      throw new Error(reason);
     }
     if (relayFailed) {
       const reason = 'Cowork recorded terminal send_failed for a role briefing; '
@@ -491,6 +566,19 @@ export async function provisionMembers(
     delay = Math.min(policy.maxDelayMs, Math.max(delay + 1, delay * 2));
   }
 
+  const finalDefinitions = new Map([...definitions].map(([role, definition]) => {
+    const persisted = getRoomRecord(roomId)!.role_briefings![role];
+    return [role, { ...definition, version: persisted.version }];
+  }));
+  try {
+    await assertCurrentRoleBriefings(cowork, roomId, finalDefinitions);
+  } catch (error) {
+    const reason = error instanceof Error ? error.message : String(error);
+    setSagaError(roomId, reason,
+      'Cowork current role briefing drifted before activation; inspect room state.', 'uncertain');
+    if (taskId) blockTask(taskId, reason);
+    throw error;
+  }
   advanceSaga(roomId, 'activate', 9);
   const record = activateRoom(roomId);
   if (taskId) activateTask(taskId);

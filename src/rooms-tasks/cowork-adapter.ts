@@ -47,6 +47,7 @@ export interface CoworkRoomInfo {
   seats: CoworkSeatInfo[];
   goal?: string;
   briefing?: string;
+  role_briefings: Record<string, CoworkRoleBriefingInfo>;
 }
 
 export interface CoworkRoleBriefingInfo {
@@ -54,6 +55,12 @@ export interface CoworkRoleBriefingInfo {
   text: string;
   version: number;
   updated_at: string;
+}
+
+export interface CoworkHistoryPage {
+  records: RoomHistoryEvidence[];
+  raw_count: number;
+  next_after: number;
 }
 
 export interface CoworkAdapter {
@@ -80,7 +87,7 @@ export interface CoworkAdapter {
   getHistory(roomId: string, opts?: {
     after?: number;
     limit?: number;
-  }): Promise<RoomHistoryEvidence[]>;
+  }): Promise<CoworkHistoryPage>;
   getRoom(roomId: string): Promise<CoworkRoomInfo | undefined>;
   listRooms(): Promise<CoworkRoomInfo[]>;
   closeRoom(roomId: string): Promise<void>;
@@ -160,6 +167,20 @@ function projectRoom(value: unknown, operation: string): CoworkRoomInfo {
   const room = object(value, operation, 'room');
   if (!Array.isArray(room.seats)) throw new CoworkProtocolError(operation, 'room.seats must be an array');
   const mission = room.mission === undefined ? undefined : object(room.mission, operation, 'room.mission');
+  const roleBriefings = room.role_briefings === undefined ? {} : object(
+    room.role_briefings, operation, 'room.role_briefings');
+  const projectedBriefings: Record<string, CoworkRoleBriefingInfo> = {};
+  for (const [role, value] of Object.entries(roleBriefings)) {
+    const briefing = object(value, operation, `room.role_briefings.${role}`);
+    projectedBriefings[role] = {
+      role,
+      text: text(briefing.text, operation, `room.role_briefings.${role}.text`),
+      version: positiveInteger(
+        briefing.version, operation, `room.role_briefings.${role}.version`),
+      updated_at: string(
+        briefing.updated_at, operation, `room.role_briefings.${role}.updated_at`),
+    };
+  }
   return {
     room_id: string(room.room_id, operation, 'room.room_id'),
     identity_name: string(room.identity_name, operation, 'room.identity_name'),
@@ -169,6 +190,7 @@ function projectRoom(value: unknown, operation: string): CoworkRoomInfo {
     room_name: string(room.room_name, operation, 'room.room_name'),
     state: roomState(room.state, operation),
     seats: room.seats.map((seat) => projectSeat(seat, operation)),
+    role_briefings: projectedBriefings,
     ...(typeof mission?.goal === 'string' ? { goal: mission.goal } : {}),
     ...(typeof mission?.briefing === 'string' ? { briefing: mission.briefing } : {}),
   };
@@ -431,10 +453,14 @@ export function createCoworkAdapter(options: CoworkAdapterOptions = {}): CoworkA
       });
       if (!Array.isArray(result))
         throw new CoworkProtocolError('room.history', 'result must be an array');
-      return result.flatMap(record => {
+      const raw = result.map(record => object(record, 'room.history', 'record'));
+      const records = raw.flatMap(record => {
         const projected = projectHistoryRecord(record);
         return projected ? [projected] : [];
       });
+      const next_after = raw.length === 0 ? (opts.after ?? 0) : Math.max(...raw.map(record =>
+        positiveInteger(record.seq, 'room.history', 'record.seq')));
+      return { records, raw_count: raw.length, next_after };
     },
     async getRoom(roomId) {
       try { return projectRoom(await call('room.show', { room_id: roomId }), 'room.show'); }

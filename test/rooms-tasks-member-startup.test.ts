@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import {
-  buildRoomMemberCharter, classifyRoomAuthor, parseRoomBriefingAck,
+  buildRoomMemberCharter, parseRoomBriefingAck,
   reconcileBriefingHistory, sha256Text,
 } from '../src/rooms-tasks/member-startup.js';
 import type { RoomHistoryEvidence } from '../src/rooms-tasks/types.js';
@@ -95,6 +95,38 @@ describe('room member startup contract', () => {
     });
   });
 
+  it('keeps an exact authenticated ACK non-ready when relay result evidence is missing', () => {
+    const records = history().filter(record => record.kind !== 'relay_result');
+    const result = reconcileBriefingHistory(records, expected());
+    expect(result.briefing.state).toBe('pending');
+    expect(result.briefing.last_rejected_ack_reason).toBe('briefing relay was not queued');
+  });
+
+  it('increments from durable evidence without double-counting replayed ACKs', () => {
+    const first = reconcileBriefingHistory(history().slice(0, 3), expected());
+    const second = reconcileBriefingHistory(history(), expected(), first.briefing);
+    const replay = reconcileBriefingHistory(history(), expected(), second.briefing);
+    expect(second.briefing.state).toBe('acknowledged');
+    expect(replay.briefing.rejected_ack_count).toBe(0);
+    expect(replay.briefing.acknowledgement_seq).toBe(4);
+  });
+
+  it('reports a newer room-authored role briefing as source-of-truth drift', () => {
+    const records = history();
+    const originalAck = records.at(-1)!;
+    originalAck.seq = 5;
+    records.splice(3, 0, {
+      kind: 'message', seq: 4, record_id: 'room:4-new',
+      at: '2026-08-24T00:00:02.500Z', message_id: 'briefing-2',
+      category: 'role_briefing',
+      author: { identity: ROOM_CID, display_name: 'Room', role: 'room' },
+      text: 'new charter', recipient_identities: [MEMBER_CID],
+      briefing_role: 'Reviewer', briefing_version: 2,
+    });
+    expect(reconcileBriefingHistory(records, expected()).drift)
+      .toContain('role briefing drift');
+  });
+
   it.each([
     ['spoofed author CID', 'D'.repeat(64), ack()],
     ['wrong message id', MEMBER_CID, ack({ briefing_message_id: 'invented' })],
@@ -125,9 +157,4 @@ describe('room member startup contract', () => {
     expect(result.briefing).not.toHaveProperty('rejected_acks');
   });
 
-  it('classifies authority only by exact authenticated CID, never display role', () => {
-    expect(classifyRoomAuthor(OWNER_CID, OWNER_CID)).toBe('owner');
-    expect(classifyRoomAuthor('D'.repeat(64), OWNER_CID)).toBe('peer');
-    expect(classifyRoomAuthor(OWNER_CID, null)).toBe('peer');
-  });
 });

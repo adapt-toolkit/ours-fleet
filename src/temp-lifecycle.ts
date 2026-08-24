@@ -272,6 +272,36 @@ export function tempArchiveForLaunch(role: string, launchId: string): string | u
   return matches[0];
 }
 
+/** Resolve one terminated archive by exact role + durable creation action. */
+export function tempArchiveForCreationAction(
+  role: string, creationActionId: string,
+): { path: string; launchId: string } | undefined {
+  let entries: string[];
+  try {
+    entries = readdirSync(archiveRoot(), { withFileTypes: true })
+      .filter(entry => entry.isDirectory() && !entry.isSymbolicLink() && !entry.name.startsWith('.'))
+      .map(entry => join(archiveRoot(), entry.name));
+  } catch { return undefined; }
+  const matches = entries.flatMap(path => {
+    const supervisor = readTempSupervisor(path);
+    if (!supervisor || supervisor.role !== role || !isArchiveForLaunch(path, role, supervisor.launchId))
+      return [];
+    try {
+      const provenance = JSON.parse(readFileSync(join(path, 'creation.json'), 'utf8')) as {
+        role?: unknown; creationActionId?: unknown;
+      };
+      return provenance.role === role && provenance.creationActionId === creationActionId
+        ? [{ path, launchId: supervisor.launchId }] : [];
+    } catch { return []; }
+  });
+  if (matches.length > 1) {
+    throw new Error(
+      `temporary role '${role}' action ${creationActionId} has ${matches.length} recovery archives; refusing ambiguity`,
+    );
+  }
+  return matches[0];
+}
+
 /**
  * Preserve a definitively stopped launch as recovery evidence, or prove that
  * its supervisor already did so. Never creates a second archive.

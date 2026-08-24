@@ -136,7 +136,12 @@ describe('Cowork management-socket adapter', () => {
       methods.push(method);
       if (method === 'room.list') return [room({ state: 'active' })];
       if (method === 'room.participants') return [{ identity: 'C'.repeat(64), role: 'Developer', state: 'active' }];
-      if (method === 'room.show') return room({ state: 'active' });
+      if (method === 'room.show') return room({
+        state: 'active',
+        role_briefings: {
+          Reviewer: { text: 'Exact current charter', version: 4, updated_at: '2026-08-24T00:00:00Z' },
+        },
+      });
       if (method === 'room.close') return room({ state: 'closed' });
       throw new Error(`unexpected ${method}`);
     });
@@ -145,7 +150,12 @@ describe('Cowork management-socket adapter', () => {
     expect(await adapter.getSeats('01ABCDEF0123456789ABCDEFGH')).toEqual([
       { identity_cid: 'C'.repeat(64), role: 'Developer', seat_state: 'active' },
     ]);
-    expect((await adapter.recoverRoom('01ABCDEF0123456789ABCDEFGH')).state).toBe('active');
+    expect(await adapter.recoverRoom('01ABCDEF0123456789ABCDEFGH')).toMatchObject({
+      state: 'active',
+      role_briefings: {
+        Reviewer: { text: 'Exact current charter', version: 4 },
+      },
+    });
     await adapter.closeRoom('01ABCDEF0123456789ABCDEFGH');
     expect(methods).toEqual(['room.list', 'room.participants', 'room.show', 'room.close']);
   });
@@ -205,11 +215,31 @@ describe('Cowork management-socket adapter', () => {
     });
     await expect(createCoworkAdapter({ socketPath }).getHistory(
       '01ABCDEF0123456789ABCDEFGH', { after: 12, limit: 50 },
-    )).resolves.toEqual([
-      expect.objectContaining({ kind: 'message', message_id: 'message-1', briefing_version: 2 }),
-      expect.objectContaining({ kind: 'relay_intent', record_id: 'room:14' }),
-      expect.objectContaining({ kind: 'relay_result', status: 'queued', wire_id: 'wire-1' }),
+    )).resolves.toEqual({
+      raw_count: 4,
+      next_after: 16,
+      records: [
+        expect.objectContaining({ kind: 'message', message_id: 'message-1', briefing_version: 2 }),
+        expect.objectContaining({ kind: 'relay_intent', record_id: 'room:14' }),
+        expect.objectContaining({ kind: 'relay_result', status: 'queued', wire_id: 'wire-1' }),
+      ],
+    });
+  });
+
+  it('preserves raw pagination progress when every record is filtered out', async () => {
+    const socketPath = await rpcServer(() => [
+      {
+        kind: 'membership_intent', seq: 40, record_id: 'room:40',
+        at: '2026-08-24T00:00:00Z', action: 'remove',
+      },
+      {
+        kind: 'file', seq: 41, record_id: 'room:41',
+        at: '2026-08-24T00:00:01Z', file_id: 'file-1',
+      },
     ]);
+    await expect(createCoworkAdapter({ socketPath }).getHistory(
+      '01ABCDEF0123456789ABCDEFGH', { after: 39, limit: 2 },
+    )).resolves.toEqual({ records: [], raw_count: 2, next_after: 41 });
   });
 
   it('fails closed on malformed room history author provenance', async () => {

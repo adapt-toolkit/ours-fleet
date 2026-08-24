@@ -148,6 +148,15 @@ export function updateRoomRoleBriefing(
   return r;
 }
 
+export function updateRoomHistoryCursor(id: string, cursor: number): RoomOrchestrationRecord {
+  const r = readRoom(id);
+  if (!Number.isSafeInteger(cursor) || cursor < (r.history_cursor ?? 0))
+    throw new RoomStateError(`room ${id} history cursor cannot move backward`);
+  r.history_cursor = cursor;
+  writeRoom(r);
+  return r;
+}
+
 const LAUNCH_ORDER: readonly RoomMemberLaunchState['state'][] = [
   'pending', 'intent', 'launched', 'stopped', 'failed',
 ];
