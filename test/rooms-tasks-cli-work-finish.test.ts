@@ -315,6 +315,48 @@ afterEach(() => {
 
 // ── task work ────────────────────────────────────────────────────────────
 
+describe('task title to Cowork room naming', () => {
+  const unicodeTitle = 'Релиз 🚀 — 東京 / naïve café';
+
+  function expectExactRoomName(): void {
+    expect(mocks.createRoom).toHaveBeenCalledWith(expect.objectContaining({
+      room_name: unicodeTitle,
+    }));
+    expect(getRoomRecord(ROOM_ID)?.room_name).toBe(unicodeTitle);
+  }
+
+  it('preserves an immediate task create title exactly', async () => {
+    await run('create', '--title', unicodeTitle, '--json');
+
+    const payload = JSON.parse(out.join('\n'));
+    expect(payload.task.title).toBe(unicodeTitle);
+    expectExactRoomName();
+  });
+
+  it('preserves a backlog task title exactly when task start creates its room', async () => {
+    await run('create', '--title', unicodeTitle, '--backlog', '--json');
+    const taskId = JSON.parse(out.join('\n')).task.task_id as string;
+    out = [];
+    mocks.createRoom.mockClear();
+
+    await run('start', taskId, '--json');
+
+    expect(JSON.parse(out.join('\n')).task.title).toBe(unicodeTitle);
+    expectExactRoomName();
+  });
+
+  it('preserves a backlog task title exactly when task work creates its room', async () => {
+    const task = createTask({
+      title: unicodeTitle, origin: { type: 'cli' }, no_room: true, start: false,
+    });
+
+    await run('work', task.task_id, '--json');
+
+    expect(JSON.parse(out.join('\n')).task.title).toBe(unicodeTitle);
+    expectExactRoomName();
+  });
+});
+
 describe('task work', () => {
   it('takes a backlog task to active with a provisioned room', async () => {
     const t = backlogTask();
