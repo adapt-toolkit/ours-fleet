@@ -68,7 +68,10 @@ describe('durable task terminal intent', () => {
   it('leaves close failure visible and the task nonterminal', async () => {
     const task = reviewTaskWithRoom();
     await acceptTaskTerminalIntent({ taskId: task.task_id, kind: 'done', roomId: ROOM_ID });
-    const cowork = { closeRoom: vi.fn(async () => { throw new Error('cowork unavailable'); }) };
+    const cowork = {
+      closeRoom: vi.fn(async () => { throw new Error('cowork unavailable'); }),
+      deleteRoom: vi.fn(async () => undefined),
+    };
     await expect(settleTaskTerminalIntent({ taskId: task.task_id, cowork }))
       .rejects.toThrow('cowork unavailable');
     expect(getTask(task.task_id)).toMatchObject({
@@ -87,7 +90,9 @@ describe('durable task terminal intent', () => {
     });
     expect(accepted).toMatchObject({ state: 'review', terminal_intent: { status: 'pending' } });
 
-    const cowork = { closeRoom: vi.fn(async () => undefined) };
+    const cowork = {
+      closeRoom: vi.fn(async () => undefined), deleteRoom: vi.fn(async () => undefined),
+    };
     const settled = await settleTaskTerminalIntent({ taskId: task.task_id, cowork });
     expect(settled).toMatchObject({
       state: 'done', terminal_intent: { status: 'settled', room_id: ROOM_ID },
@@ -98,13 +103,15 @@ describe('durable task terminal intent', () => {
   it('recovers a crash after room close before the task write without repeating effects', async () => {
     const task = reviewTaskWithRoom();
     await acceptTaskTerminalIntent({ taskId: task.task_id, kind: 'done', roomId: ROOM_ID });
-    const cowork = { closeRoom: vi.fn(async () => undefined) };
+    const cowork = {
+      closeRoom: vi.fn(async () => undefined), deleteRoom: vi.fn(async () => undefined),
+    };
     await expect(settleTaskTerminalIntent({
       taskId: task.task_id,
       cowork,
       deps: { afterRoomClosed: () => { throw new Error('crash seam'); } },
     })).rejects.toThrow('crash seam');
-    expect(getRoomRecord(ROOM_ID)?.state).toBe('closed');
+    expect(getRoomRecord(ROOM_ID)).toBeUndefined();
     expect(getTask(task.task_id)).toMatchObject({
       state: 'review', terminal_intent: { status: 'pending', error: 'crash seam' },
     });
@@ -117,6 +124,7 @@ describe('durable task terminal intent', () => {
     });
     expect(settled.terminal_intent?.error).toBeUndefined();
     expect(cowork.closeRoom).toHaveBeenCalledTimes(1);
+    expect(cowork.deleteRoom).toHaveBeenCalledTimes(1);
 
     await settleTaskTerminalIntent({ taskId: task.task_id, cowork });
     expect(cowork.closeRoom).toHaveBeenCalledTimes(1);

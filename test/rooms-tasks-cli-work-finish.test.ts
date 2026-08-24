@@ -9,11 +9,14 @@ import { Command } from 'commander';
 const mocks = vi.hoisted(() => ({
   createRoom: vi.fn(),
   closeRoom: vi.fn().mockResolvedValue(undefined),
+  deleteRoom: vi.fn().mockResolvedValue(undefined),
   provisionMembers: vi.fn(),
-  closeManagedRoom: vi.fn().mockResolvedValue({ state: 'closed' }),
+  closeManagedRoom: vi.fn(),
+  deleteManagedRoom: vi.fn().mockResolvedValue({ room_id: 'room', deleted: true }),
   launchFleetWorker: vi.fn(),
   recoverRoom: vi.fn(),
   getRoom: vi.fn(),
+  listRooms: vi.fn(),
 }));
 
 vi.mock('../src/rooms-tasks/cowork-adapter.js', async (importOriginal) => {
@@ -23,8 +26,10 @@ vi.mock('../src/rooms-tasks/cowork-adapter.js', async (importOriginal) => {
     createCoworkAdapter: () => ({
       createRoom: mocks.createRoom,
       closeRoom: mocks.closeRoom,
+      deleteRoom: mocks.deleteRoom,
       recoverRoom: mocks.recoverRoom,
       getRoom: mocks.getRoom,
+      listRooms: mocks.listRooms,
       getSeats: vi.fn().mockResolvedValue([]),
     }),
   };
@@ -41,7 +46,11 @@ vi.mock('../src/rooms-tasks/provision.js', async (importOriginal) => {
 
 vi.mock('../src/rooms-tasks/close.js', async (importOriginal) => {
   const actual = await importOriginal<typeof import('../src/rooms-tasks/close.js')>();
-  return { ...actual, closeManagedRoom: mocks.closeManagedRoom };
+  return {
+    ...actual,
+    closeManagedRoom: mocks.closeManagedRoom,
+    deleteManagedRoom: mocks.deleteManagedRoom,
+  };
 });
 
 vi.mock('../src/rooms-tasks/external-worker.js', () => ({
@@ -136,16 +145,33 @@ beforeEach(() => {
     room_id: ROOM_ID, identity_name: 'room-id', identity_cid: 'c'.repeat(64),
     room_name: 'Fix the parser', state: 'active', seats: [], role_briefings: {},
   });
+  mocks.listRooms.mockReset().mockResolvedValue([]);
   mocks.closeRoom.mockReset().mockResolvedValue(undefined);
-  mocks.closeManagedRoom.mockReset().mockResolvedValue({ state: 'closed' });
+  mocks.deleteRoom.mockReset().mockResolvedValue(undefined);
+  mocks.closeManagedRoom.mockReset();
+  mocks.deleteManagedRoom.mockReset().mockImplementation(async ({ roomId }: { roomId: string }) => {
+    const { deleteRoomRecord } = await import('../src/rooms-tasks/room-state.js');
+    deleteRoomRecord(roomId);
+    return { room_id: roomId, deleted: true };
+  });
   mocks.launchFleetWorker.mockReset().mockImplementation(async (args: string[]) => {
+    if (args[0] === 'room' && args[1] === '_delete') {
+      const roomId = args[2];
+      setTimeout(() => {
+        void mocks.deleteManagedRoom({
+          roomId,
+          cowork: { closeRoom: mocks.closeRoom, deleteRoom: mocks.deleteRoom },
+        }).catch(() => undefined);
+      }, 0);
+      return;
+    }
     if (args[0] !== 'task' || args[1] !== '_settle') return;
     const taskId = args[2];
     setTimeout(() => {
       void import('../src/rooms-tasks/terminal.js').then(({ settleTaskTerminalIntent }) =>
         settleTaskTerminalIntent({
           taskId,
-          cowork: { closeRoom: mocks.closeRoom },
+          cowork: { closeRoom: mocks.closeRoom, deleteRoom: mocks.deleteRoom },
         }).catch(() => undefined));
     }, 0);
   });
@@ -155,6 +181,63 @@ beforeEach(() => {
     const record = activateRoom(roomId);
     if (taskId) activateTask(taskId);
     return record;
+  });
+});
+
+describe('room delete', () => {
+  async function activeRoom() {
+    const { createRoomRecord } = await import('../src/rooms-tasks/room-state.js');
+    const room = createRoomRecord({ room_id: ROOM_ID, room_name: 'Disposable room' });
+    activateRoom(room.room_id);
+    return room;
+  }
+
+  it('requires the room ID twice', async () => {
+    await activeRoom();
+    await expect(runRoom('delete', ROOM_ID)).rejects.toThrow("missing required argument 'confirm-id'");
+    expect(getRoomRecord(ROOM_ID)).toBeDefined();
+    expect(mocks.deleteManagedRoom).not.toHaveBeenCalled();
+  });
+
+  it('deletes the room and reports binary deletion', async () => {
+    await activeRoom();
+    await runRoom('delete', ROOM_ID, ROOM_ID);
+    expect(getRoomRecord(ROOM_ID)).toBeUndefined();
+    expect(mocks.deleteManagedRoom).toHaveBeenCalledWith(expect.objectContaining({ roomId: ROOM_ID }));
+    expect(out.join('\n')).toContain(`Room ${ROOM_ID} · deleted`);
+  });
+
+  it('keeps room close as a deprecated deletion alias', async () => {
+    await activeRoom();
+    await runRoom('close', ROOM_ID, ROOM_ID, '--json');
+    expect(getRoomRecord(ROOM_ID)).toBeUndefined();
+    expect(JSON.parse(out.join('\n'))).toMatchObject({ room_id: ROOM_ID, deleted: true });
+  });
+
+  it('room list migrates legacy closed state without touching an active room', async () => {
+    const active = await activeRoom();
+    const legacyId = '01hzyk8m0000000000000000bb';
+    const { createRoomRecord, closeRoom } = await import('../src/rooms-tasks/room-state.js');
+    createRoomRecord({ room_id: legacyId, room_name: 'Legacy closed room' });
+    closeRoom(legacyId);
+    mocks.listRooms.mockResolvedValue([
+      {
+        room_id: active.room_id, identity_name: 'active-room', identity_cid: 'c'.repeat(64),
+        room_name: active.room_name, state: 'active', seats: [], role_briefings: {},
+      },
+      {
+        room_id: legacyId, identity_name: 'legacy-room', identity_cid: 'd'.repeat(64),
+        room_name: 'Legacy closed room', state: 'closed', seats: [], role_briefings: {},
+      },
+    ]);
+
+    await runRoom('list');
+
+    expect(mocks.deleteRoom).toHaveBeenCalledWith(legacyId);
+    expect(getRoomRecord(legacyId)).toBeUndefined();
+    expect(getRoomRecord(active.room_id)?.state).toBe('active');
+    expect(out.join('\n')).toContain(active.room_id);
+    expect(out.join('\n')).not.toContain(legacyId);
   });
 });
 
@@ -434,11 +517,11 @@ describe('task finish', () => {
     return getTask(t.task_id);
   }
 
-  it('takes an active task through review to done and closes its room', async () => {
+  it('takes an active task through review to done and deletes its room', async () => {
     const t = await activeTask();
     await run('finish', t.task_id);
     expect(getTask(t.task_id).state).toBe('done');
-    expect(mocks.closeManagedRoom).toHaveBeenCalledWith(
+    expect(mocks.deleteManagedRoom).toHaveBeenCalledWith(
       expect.objectContaining({ roomId: ROOM_ID }));
   });
 
@@ -477,17 +560,17 @@ describe('task finish', () => {
   });
 
   it('does not report successful finish when deterministic room close fails', async () => {
-    mocks.closeManagedRoom.mockRejectedValue(new Error('room close failed'));
+    mocks.deleteManagedRoom.mockRejectedValue(new Error('room delete failed'));
     const t = await activeTask();
     await expect(run('finish', t.task_id)).rejects.toThrow(ExitError);
     expect(getTask(t.task_id)).toMatchObject({
-      state: 'review', terminal_intent: { status: 'pending', error: 'room close failed' },
+      state: 'review', terminal_intent: { status: 'pending', error: 'room delete failed' },
     });
-    expect(out.join('\n')).toContain('room close failed');
+    expect(out.join('\n')).toContain('room delete failed');
   });
 
   it('the hidden worker durably records failures after terminal acceptance', async () => {
-    mocks.closeManagedRoom.mockRejectedValue(new Error('hidden worker failed'));
+    mocks.deleteManagedRoom.mockRejectedValue(new Error('hidden worker failed'));
     const t = await activeTask();
     await expect(run('finish', t.task_id)).rejects.toThrow(ExitError);
     out = [];
@@ -505,15 +588,19 @@ describe('task finish', () => {
   });
 
   it('task recover resumes a pending terminal intent to convergence', async () => {
-    mocks.closeManagedRoom.mockRejectedValueOnce(new Error('room close failed'));
+    mocks.deleteManagedRoom.mockRejectedValueOnce(new Error('room delete failed'));
     const t = await activeTask();
     await expect(run('finish', t.task_id)).rejects.toThrow(ExitError);
-    mocks.closeManagedRoom.mockResolvedValue({ state: 'closed' });
+    mocks.deleteManagedRoom.mockImplementation(async ({ roomId }: { roomId: string }) => {
+      const { deleteRoomRecord } = await import('../src/rooms-tasks/room-state.js');
+      deleteRoomRecord(roomId);
+      return { room_id: roomId, deleted: true };
+    });
     out = [];
     await run('recover', t.task_id);
     expect(getTask(t.task_id)).toMatchObject({
       state: 'done', terminal_intent: {
-        status: 'settled', first_failure: 'room close failed',
+        status: 'settled', first_failure: 'room delete failed',
         first_recovery_hint: `Retry 'ours-fleet task recover ${t.task_id}'.`,
       },
     });

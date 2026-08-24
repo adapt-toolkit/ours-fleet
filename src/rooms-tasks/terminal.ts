@@ -2,12 +2,13 @@ import { join } from 'node:path';
 
 import { withFileLock } from '../atomic-file.js';
 import { stateRoot } from '../paths.js';
-import { closeManagedRoom, type RoomCloseDeps } from './close.js';
+import { deleteManagedRoom, type RoomCloseDeps } from './close.js';
 import type { CoworkAdapter } from './cowork-adapter.js';
 import {
   beginTaskTerminalIntent, finishTaskTerminalIntent, getTask,
   setTaskTerminalIntentError,
 } from './task-state.js';
+import { getRoomRecord } from './room-state.js';
 import type { TaskOutcome, TaskRecord, TaskTerminalIntent } from './types.js';
 
 const TASK_OPERATION_LOCK_STALE_MS = 10 * 60_000;
@@ -41,10 +42,10 @@ export interface SettleTaskTerminalDeps {
   afterRoomClosed?(): void | Promise<void>;
 }
 
-/** Close the recorded room, then atomically settle the persisted task intent. */
+/** Delete the recorded room, then atomically settle the persisted task intent. */
 export function settleTaskTerminalIntent(input: {
   taskId: string;
-  cowork: Pick<CoworkAdapter, 'closeRoom'>;
+  cowork: Pick<CoworkAdapter, 'closeRoom' | 'deleteRoom'>;
   deps?: SettleTaskTerminalDeps;
 }): Promise<TaskRecord> {
   return withFileLock(taskOperationLockPath(input.taskId), async () => {
@@ -54,12 +55,14 @@ export function settleTaskTerminalIntent(input: {
     if (intent.status === 'settled') return current;
     try {
       if (intent.room_id) {
-        const room = await closeManagedRoom({
-          roomId: intent.room_id,
-          cowork: input.cowork,
-          deps: input.deps?.roomClose,
-        });
-        if (room.state !== 'closed') throw new Error(`room ${intent.room_id} did not close`);
+        if (getRoomRecord(intent.room_id)) {
+          const deleted = await deleteManagedRoom({
+            roomId: intent.room_id,
+            cowork: input.cowork,
+            deps: input.deps?.roomClose,
+          });
+          if (!deleted.deleted) throw new Error(`room ${intent.room_id} was not deleted`);
+        }
         await input.deps?.afterRoomClosed?.();
       }
       return finishTaskTerminalIntent(input.taskId);

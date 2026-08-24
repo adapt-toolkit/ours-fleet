@@ -3,7 +3,8 @@ import { readFileSync } from 'node:fs';
 import { loadConfig, type FleetConfig, ConfigError, findRole } from '../config.js';
 import { provisionMembers, getBinPath } from './provision.js';
 import {
-  acceptManagedRoomClose, closeManagedRoom, recordManagedRoomCloseError,
+  acceptManagedRoomClose, deleteLegacyClosedRooms, deleteManagedRoom,
+  recordManagedRoomCloseError,
 } from './close.js';
 import {
   acceptTaskTerminalIntent, recordTaskTerminalIntentError, settleTaskTerminalIntent,
@@ -68,29 +69,29 @@ async function launchTaskSettleWorker(
   return { task: getTask(taskId), timedOut: true };
 }
 
-async function launchRoomCloseWorker(
+async function launchRoomDeleteWorker(
   roomId: string, configPath?: string,
-): Promise<{ room: RoomOrchestrationRecord; timedOut: boolean }> {
+): Promise<{ deleted: boolean; timedOut: boolean }> {
   const previousErrorAt = getRoomRecord(roomId)?.close?.error_at;
   try {
-    await launchFleetWorker(['room', '_close', roomId], `room-close-${roomId}`, configPath);
+    await launchFleetWorker(['room', '_delete', roomId], `room-delete-${roomId}`, configPath);
   } catch (error) {
     await recordManagedRoomCloseError(
       roomId, errorText(error),
-      `External close worker failed to start. Retry room recover ${roomId}.`,
+      `External delete worker failed to start. Retry room delete ${roomId} ${roomId}.`,
     );
     throw error;
   }
   const deadline = Date.now() + PUBLIC_SETTLE_WAIT_MS;
   while (Date.now() < deadline) {
-    const room = getRoomRecord(roomId)!;
-    if (room.state === 'closed') return { room, timedOut: false };
+    const room = getRoomRecord(roomId);
+    if (!room) return { deleted: true, timedOut: false };
     if (room.close?.error_at !== previousErrorAt && room.close?.error) {
       throw new RoomStateError(room.close.error);
     }
     await sleep(PUBLIC_SETTLE_POLL_MS);
   }
-  return { room: getRoomRecord(roomId)!, timedOut: true };
+  return { deleted: getRoomRecord(roomId) === undefined, timedOut: true };
 }
 
 function loadCfg(opts: { configuration?: string }): FleetConfig {
@@ -907,18 +908,25 @@ export function registerRoomCommands(parent: Command, cOpt: (cmd: Command) => Co
 
   cOpt(roomCmd.command('list'))
     .description('list rooms')
-    .option('--state <state>', 'filter by state (active|provisioning|closing|closed|all)')
+    .option('--state <state>', 'filter live rooms by state (active|provisioning|all)')
     .option('--json', 'JSON output')
     .action(async (opts: { configuration?: string; state?: string; json?: boolean }) => {
       try {
         const cfg = loadCfg(opts);
-        let stateFilter: import('./types.js').RoomOrchestrationState | undefined;
-        if (opts.state && opts.state !== 'all') {
-          stateFilter = opts.state as import('./types.js').RoomOrchestrationState;
-        }
+        if (opts.state && !['active', 'provisioning', 'all'].includes(opts.state))
+          throw new Error('room state filter must be active, provisioning, or all');
+        const stateFilter = opts.state === 'active' || opts.state === 'provisioning'
+          ? opts.state : undefined;
+        const adapter = coworkFor(cfg);
+        await deleteLegacyClosedRooms({ cowork: adapter });
         const local = new Map(listRoomRecords().map(room => [room.room_id, room]));
-        const coworkRooms = await coworkFor(cfg).listRooms();
+        const coworkRooms = await adapter.listRooms();
         const rooms = coworkRooms
+          .filter(room => room.state === 'active' || room.state === 'provisioning')
+          .filter(room => {
+            const tracked = local.get(room.room_id);
+            return !tracked || tracked.state === 'active' || tracked.state === 'provisioning';
+          })
           .filter(room => !stateFilter || room.state === stateFilter)
           .map(room => ({ ...room, orchestration: local.get(room.room_id) ?? null }));
         if (opts.json) {
@@ -937,9 +945,13 @@ export function registerRoomCommands(parent: Command, cOpt: (cmd: Command) => Co
     .action(async (id: string, opts: { configuration?: string; json?: boolean }) => {
       try {
         const cfg = loadCfg(opts);
+        const tracked = getRoomRecord(id);
+        if (tracked?.state === 'closing' || tracked?.state === 'closed')
+          die(new Error(`room not found: ${id}`));
         const cowork = await coworkFor(cfg).getRoom(id);
-        if (!cowork) die(new Error(`room not found: ${id}`));
-        const r = getRoomRecord(id);
+        if (!cowork || cowork.state === 'closing' || cowork.state === 'closed')
+          die(new Error(`room not found: ${id}`));
+        const r = tracked;
         if (opts.json) {
           console.log(JSON.stringify({ schema_version: 1, room: cowork, orchestration: r ?? null }, null, 2));
           return;
@@ -968,8 +980,12 @@ export function registerRoomCommands(parent: Command, cOpt: (cmd: Command) => Co
     .action(async (id: string, opts: { configuration?: string; json?: boolean }) => {
       try {
         const cfg = loadCfg(opts);
+        const tracked = getRoomRecord(id);
+        if (tracked?.state === 'closing' || tracked?.state === 'closed')
+          die(new Error(`room not found: ${id}`));
         const room = await coworkFor(cfg).getRoom(id);
-        if (!room) die(new Error(`room not found: ${id}`));
+        if (!room || room.state === 'closing' || room.state === 'closed')
+          die(new Error(`room not found: ${id}`));
         const url = `http://localhost:4460/room/${id}`;
         if (opts.json) {
           console.log(JSON.stringify({ schema_version: 1, room_id: id, url, room_name: room.room_name }, null, 2));
@@ -987,7 +1003,13 @@ export function registerRoomCommands(parent: Command, cOpt: (cmd: Command) => Co
       try {
         const cfg = loadCfg(opts);
         const r = getRoomRecord(id);
-        const members = await coworkFor(cfg).getSeats(id);
+        if (r?.state === 'closing' || r?.state === 'closed')
+          die(new Error(`room not found: ${id}`));
+        const adapter = coworkFor(cfg);
+        const room = await adapter.getRoom(id);
+        if (!room || room.state === 'closing' || room.state === 'closed')
+          die(new Error(`room not found: ${id}`));
+        const members = await adapter.getSeats(id);
         if (opts.json) {
           console.log(JSON.stringify({
             schema_version: 1,
@@ -1005,29 +1027,38 @@ export function registerRoomCommands(parent: Command, cOpt: (cmd: Command) => Co
       } catch (e) { die(e); }
     });
 
-  cOpt(roomCmd.command('close <id> <confirm-id>'))
-    .description('close a room (requires ID twice for confirmation)')
-    .option('--json', 'JSON output')
-    .action(async (id: string, confirmId: string, opts: { configuration?: string; json?: boolean }) => {
+  const deleteAction = async (
+    id: string, confirmId: string,
+    opts: { configuration?: string; json?: boolean },
+  ): Promise<void> => {
       try {
         if (id !== confirmId) die(new Error('confirmation ID must match room ID'));
         coworkFor(loadCfg(opts));
         const existing = getRoomRecord(id);
         if (!existing) throw new Error(`room not found in Fleet orchestration: ${id}`);
         await acceptManagedRoomClose(id);
-        const settled = await launchRoomCloseWorker(id, opts.configuration);
-        const r = settled.room;
+        const settled = await launchRoomDeleteWorker(id, opts.configuration);
         if (opts.json) {
-          console.log(JSON.stringify({ schema_version: 1, room_id: id, state: r.state, orchestration: r }, null, 2));
+          console.log(JSON.stringify({ schema_version: 1, room_id: id, deleted: settled.deleted }, null, 2));
           return;
         }
         if (settled.timedOut) {
-          console.log(`Room ${id} · closing (accepted/pending; run room recover ${id})`);
+          console.log(`Room ${id} · deletion accepted/pending; run room delete ${id} ${id}`);
           return;
         }
-        console.log(`Room ${id} · closed`);
+        console.log(`Room ${id} · deleted`);
       } catch (e) { die(e); }
-    });
+    };
+
+  cOpt(roomCmd.command('delete <id> <confirm-id>'))
+    .description('delete a room (requires ID twice for confirmation)')
+    .option('--json', 'JSON output')
+    .action(deleteAction);
+
+  cOpt(roomCmd.command('close <id> <confirm-id>'))
+    .description('deprecated alias for room delete (requires ID twice for confirmation)')
+    .option('--json', 'JSON output')
+    .action(deleteAction);
 
   cOpt(roomCmd.command('recover <id>'))
     .description('attempt to recover a stuck room')
@@ -1037,20 +1068,20 @@ export function registerRoomCommands(parent: Command, cOpt: (cmd: Command) => Co
         const cfg = loadCfg(opts);
         const adapter = coworkFor(cfg);
         let r = getRoomRecord(id);
-        if (r?.state === 'closing') {
-          const settled = await launchRoomCloseWorker(id, opts.configuration);
-          r = settled.room;
-          const cowork = r.state === 'closed' ? await adapter.getRoom(id) : undefined;
+        if (r?.state === 'closing' || r?.state === 'closed') {
+          const settled = await launchRoomDeleteWorker(id, opts.configuration);
           if (opts.json) {
             console.log(JSON.stringify({
-              schema_version: 1, room: cowork ?? null, orchestration: r,
+              schema_version: 1, room: null, orchestration: null,
               recovery_actions: [settled.timedOut
-                ? `Closing remains pending — retry room recover ${id}`
-                : 'Closing saga resumed successfully'],
+                ? `Deletion remains pending — retry room delete ${id} ${id}`
+                : 'Deletion completed successfully'],
             }, null, 2));
             return;
           }
-          console.log(`Room ${id} · ${r.state} · close: ${r.close?.phase ?? 'unknown'}`);
+          console.log(settled.timedOut
+            ? `Room ${id} · deletion pending`
+            : `Room ${id} · deleted`);
           return;
         }
         const cowork = await adapter.recoverRoom(id);
@@ -1128,23 +1159,32 @@ export function registerRoomCommands(parent: Command, cOpt: (cmd: Command) => Co
       } catch (e) { die(e); }
     });
 
-  cOpt(roomCmd.command('_close <id>', { hidden: true }))
-    .description('internal: settle an accepted room close')
-    .option('--json', 'JSON output')
-    .action(async (id: string, opts: { configuration?: string; json?: boolean }) => {
+  const internalDeleteAction = async (
+    id: string, opts: { configuration?: string; json?: boolean },
+  ): Promise<void> => {
       try {
         const cfg = loadCfg(opts);
-        const r = await closeManagedRoom({ roomId: id, cowork: coworkFor(cfg) });
+        const result = await deleteManagedRoom({ roomId: id, cowork: coworkFor(cfg) });
         if (opts.json) {
-          console.log(JSON.stringify({ schema_version: 1, room_id: id, state: r.state, orchestration: r }, null, 2));
+          console.log(JSON.stringify({ schema_version: 1, ...result }, null, 2));
           return;
         }
-        console.log(`Room ${id} · ${r.state}`);
+        console.log(`Room ${id} · deleted`);
       } catch (e) {
         await recordManagedRoomCloseError(
-          id, errorText(e), `External close worker failed. Retry room recover ${id}.`,
+          id, errorText(e), `External delete worker failed. Retry room delete ${id} ${id}.`,
         ).catch(() => {});
         die(e);
       }
-    });
+    };
+
+  cOpt(roomCmd.command('_delete <id>', { hidden: true }))
+    .description('internal: settle an accepted room deletion')
+    .option('--json', 'JSON output')
+    .action(internalDeleteAction);
+
+  cOpt(roomCmd.command('_close <id>', { hidden: true }))
+    .description('deprecated internal alias for room _delete')
+    .option('--json', 'JSON output')
+    .action(internalDeleteAction);
 }

@@ -13,7 +13,9 @@ vi.mock('@ours.network/sdk/client', () => ({
   attachOursClient: vi.fn(async () => sdk),
 }));
 
-import { closeManagedRoom, type RoomCloseDeps } from '../src/rooms-tasks/close.js';
+import {
+  closeManagedRoom, deleteManagedRoom, type RoomCloseDeps,
+} from '../src/rooms-tasks/close.js';
 import {
   activateRoom, createRoomRecord, getRoomRecord, updateMemberSeats,
 } from '../src/rooms-tasks/room-state.js';
@@ -62,6 +64,7 @@ function fixture() {
   };
   const cowork = {
     closeRoom: vi.fn(async (roomId: string) => { calls.push(`cowork:${roomId}`); }),
+    deleteRoom: vi.fn(async (roomId: string) => { calls.push(`delete:${roomId}`); }),
   };
   return { calls, deps, cowork };
 }
@@ -156,7 +159,7 @@ describe('deterministic managed room close', () => {
       error: 'later Cowork failure',
       first_failure: 'first liveness failure',
     });
-    expect(room.close?.first_recovery_hint).toContain('ours-fleet room close');
+    expect(room.close?.first_recovery_hint).toContain('ours-fleet room delete');
   });
 
   it('serializes concurrent duplicate close calls and performs effects once', async () => {
@@ -210,5 +213,30 @@ describe('deterministic managed room close', () => {
     expect(closed.state).toBe('closed');
     expect(sdk.removeIdentity).toHaveBeenCalledWith({ name: 'member-1' });
     expect(sdk.listIdentities).toHaveBeenCalledTimes(3);
+  });
+
+  it('deletes Cowork retained state and the Fleet live record after close', async () => {
+    const f = fixture();
+    await expect(deleteManagedRoom({ roomId: ROOM_ID, cowork: f.cowork, deps: f.deps }))
+      .resolves.toEqual({ room_id: ROOM_ID, deleted: true });
+    expect(f.calls.at(-2)).toBe(`cowork:${ROOM_ID}`);
+    expect(f.calls.at(-1)).toBe(`delete:${ROOM_ID}`);
+    expect(getRoomRecord(ROOM_ID)).toBeUndefined();
+  });
+
+  it('leaves a legacy closed record available for a direct delete retry', async () => {
+    const f = fixture();
+    await closeManagedRoom({ roomId: ROOM_ID, cowork: f.cowork, deps: f.deps });
+    f.cowork.deleteRoom.mockRejectedValueOnce(new Error('delete failed'));
+    await expect(deleteManagedRoom({ roomId: ROOM_ID, cowork: f.cowork, deps: f.deps }))
+      .rejects.toThrow('delete failed');
+    expect(getRoomRecord(ROOM_ID)).toMatchObject({
+      state: 'closed', close: { error: 'delete failed' },
+    });
+
+    await deleteManagedRoom({ roomId: ROOM_ID, cowork: f.cowork, deps: f.deps });
+    expect(getRoomRecord(ROOM_ID)).toBeUndefined();
+    expect(f.cowork.closeRoom).toHaveBeenCalledTimes(1);
+    expect(f.cowork.deleteRoom).toHaveBeenCalledTimes(2);
   });
 });

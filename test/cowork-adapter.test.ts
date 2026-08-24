@@ -129,7 +129,7 @@ describe('Cowork management-socket adapter', () => {
     )).resolves.toEqual({ seat_cid: 'B'.repeat(64), seat_state: 'pending' });
   });
 
-  it('uses Cowork as source of truth for list, participants, recovery, and close', async () => {
+  it('uses Cowork as source of truth for list, participants, recovery, close, and delete', async () => {
     const methods: string[] = [];
     const socketPath = await rpcServer(request => {
       const method = String(request.method);
@@ -143,6 +143,12 @@ describe('Cowork management-socket adapter', () => {
         },
       });
       if (method === 'room.close') return room({ state: 'closed' });
+      if (method === 'room.delete') {
+        expect(request.params).toEqual({
+          room_id: '01ABCDEF0123456789ABCDEFGH', confirm: true,
+        });
+        return { version: 1, room_id: '01ABCDEF0123456789ABCDEFGH', deleted: true };
+      }
       throw new Error(`unexpected ${method}`);
     });
     const adapter = createCoworkAdapter({ socketPath });
@@ -157,7 +163,10 @@ describe('Cowork management-socket adapter', () => {
       },
     });
     await adapter.closeRoom('01ABCDEF0123456789ABCDEFGH');
-    expect(methods).toEqual(['room.list', 'room.participants', 'room.show', 'room.close']);
+    await adapter.deleteRoom('01ABCDEF0123456789ABCDEFGH');
+    expect(methods).toEqual([
+      'room.list', 'room.participants', 'room.show', 'room.close', 'room.delete',
+    ]);
   });
 
   it('authors an exact role briefing and returns its durable version', async () => {

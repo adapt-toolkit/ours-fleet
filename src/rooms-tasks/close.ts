@@ -12,7 +12,7 @@ import {
 import type { CoworkAdapter } from './cowork-adapter.js';
 import {
   advanceMemberRetirement, advanceRoomClose, beginRoomClose, closeRoom,
-  getRoomRecord, setRoomCloseError,
+  deleteRoomRecord, getRoomRecord, listRoomRecords, setRoomCloseError,
 } from './room-state.js';
 import type { RoomMemberSeat, RoomOrchestrationRecord } from './types.js';
 
@@ -216,9 +216,48 @@ export async function closeManagedRoom(input: {
       setRoomCloseError(
         input.roomId,
         errorText(error),
-        `Retry 'ours-fleet room close ${input.roomId} ${input.roomId}' or run room recover.`,
+        `Retry 'ours-fleet room delete ${input.roomId} ${input.roomId}' or run room recover.`,
       );
       throw error;
     }
   }, {}, CLOSE_LOCK_STALE_MS);
+}
+
+export interface ManagedRoomDeleteResult {
+  room_id: string;
+  deleted: true;
+}
+
+/** Remove retained state written by prerelease builds that stopped at `closed`. */
+export async function deleteLegacyClosedRooms(input: {
+  cowork: Pick<CoworkAdapter, 'deleteRoom'>;
+}): Promise<string[]> {
+  const deleted: string[] = [];
+  for (const room of listRoomRecords({ state: 'closed' })) {
+    await input.cowork.deleteRoom(room.room_id);
+    deleteRoomRecord(room.room_id);
+    deleted.push(room.room_id);
+  }
+  return deleted;
+}
+
+/** Retire live resources through the existing cursor, then delete retained state. */
+export async function deleteManagedRoom(input: {
+  roomId: string;
+  cowork: Pick<CoworkAdapter, 'closeRoom' | 'deleteRoom'>;
+  deps?: RoomCloseDeps;
+}): Promise<ManagedRoomDeleteResult> {
+  await closeManagedRoom(input);
+  try {
+    await input.cowork.deleteRoom(input.roomId);
+  } catch (error) {
+    setRoomCloseError(
+      input.roomId,
+      errorText(error),
+      `Retry 'ours-fleet room delete ${input.roomId} ${input.roomId}' or run room recover.`,
+    );
+    throw error;
+  }
+  deleteRoomRecord(input.roomId);
+  return { room_id: input.roomId, deleted: true };
 }

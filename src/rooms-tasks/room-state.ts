@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, readdirSync, readFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
 import { replaceFileAtomically } from '../atomic-file.js';
 import { stateRoot } from '../paths.js';
@@ -57,6 +57,12 @@ export function createRoomRecord(input: CreateRoomInput): RoomOrchestrationRecor
 
 export function getRoomRecord(id: string): RoomOrchestrationRecord | undefined {
   try { return readRoom(id); } catch { return undefined; }
+}
+
+/** Remove a terminal orchestration record from the live room inventory. */
+export function deleteRoomRecord(id: string): void {
+  const path = roomPath(id);
+  if (existsSync(path)) rmSync(path);
 }
 
 export function listRoomRecords(filter?: {
@@ -314,8 +320,8 @@ export function setRoomCloseError(
   id: string, error: string, recoveryHint: string,
 ): RoomOrchestrationRecord {
   const r = readRoom(id);
-  if (r.state === 'closed') return r;
-  if (r.state !== 'closing' || !r.close) throw new RoomStateError(`room ${id} is not closing`);
+  if ((r.state !== 'closing' && r.state !== 'closed') || !r.close)
+    throw new RoomStateError(`room ${id} is not closing or awaiting deletion`);
   r.close.first_failure ??= error;
   r.close.first_recovery_hint ??= recoveryHint;
   r.close.error = error;

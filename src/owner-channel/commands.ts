@@ -404,7 +404,9 @@ export const ownerCommands: OwnerCommand[] = [
     name: 'rooms', summary: 'list rooms',
     execute: noArgs('/rooms', async ctx => {
       const { listRoomRecords } = await import('../rooms-tasks/room-state.js');
-      const rooms = listRoomRecords();
+      const rooms = listRoomRecords().filter(
+        room => room.state === 'active' || room.state === 'provisioning',
+      );
       if (!rooms.length) return ctx.reply('🏠 No rooms.');
       const lines = rooms.map(r =>
         `${r.room_id}  ${r.state}  ${r.room_name}${r.task_id ? ` (task: ${r.task_id})` : ''}`);
@@ -413,7 +415,7 @@ export const ownerCommands: OwnerCommand[] = [
   },
   {
     name: 'room',
-    usage: '/room <create|list|show|close|recover> ...',
+    usage: '/room <create|list|show|delete|close|recover> ...',
     summary: 'room lifecycle subcommands',
     execute: async (ctx, args) => {
       if (!args) throw new OwnerCommandUsageError('usage: /room <subcommand> <id>');
@@ -426,7 +428,8 @@ export const ownerCommands: OwnerCommand[] = [
       const showRoom = async (id: string) => {
         const { getRoomRecord } = await import('../rooms-tasks/room-state.js');
         const r = getRoomRecord(id);
-        if (!r) return ctx.reply(`⚠️ room not found: ${id}`);
+        if (!r || r.state === 'closing' || r.state === 'closed')
+          return ctx.reply(`⚠️ room not found: ${id}`);
         const lines = [
           `🏠 Room: ${r.room_id}`,
           `Name: ${r.room_name}`,
@@ -470,7 +473,9 @@ export const ownerCommands: OwnerCommand[] = [
           case 'list': {
             const { listRoomRecords } = await import('../rooms-tasks/room-state.js');
             const filter = rest[0];
-            let rooms = listRoomRecords();
+            let rooms = listRoomRecords().filter(
+              room => room.state === 'active' || room.state === 'provisioning',
+            );
             if (filter === 'active') rooms = rooms.filter(r => r.state === 'active');
             if (!rooms.length) { await ctx.reply('🏠 No rooms.'); break; }
             const lines = rooms.map(r =>
@@ -483,9 +488,12 @@ export const ownerCommands: OwnerCommand[] = [
             await showRoom(rest[0]);
             break;
           }
+          case 'delete':
           case 'close': {
             if (rest.length < 2 || rest[0] !== rest[1])
-              throw new OwnerCommandUsageError('destructive: /room close <id> <id> — provide the room ID twice');
+              throw new OwnerCommandUsageError(
+                `destructive: /room ${sub} <id> <id> — provide the room ID twice`,
+              );
             await ctx.closeRoom(rest[0]);
             break;
           }
@@ -494,7 +502,7 @@ export const ownerCommands: OwnerCommand[] = [
             const { getRoomRecord } = await import('../rooms-tasks/room-state.js');
             const r = getRoomRecord(rest[0]);
             if (!r) { await ctx.reply(`⚠️ room not found: ${rest[0]}`); break; }
-            if (r.state === 'closing') {
+            if (r.state === 'closing' || r.state === 'closed') {
               await ctx.closeRoom(r.room_id);
               break;
             }
@@ -641,7 +649,7 @@ export function fleetCliOps(role: string, configPath?: string): OwnerFleetOps {
         (error, stdout) => error ? reject(error) : resolve(String(stdout).trim()));
     }),
     closeRoom: roomId => launchFleetWorker(
-      ['room', '_close', roomId], `room-close-${roomId}`, configPath,
+      ['room', '_delete', roomId], `room-delete-${roomId}`, configPath,
     ),
     settleTask: taskId => launchFleetWorker(
       ['task', '_settle', taskId], `task-settle-${taskId}`, configPath,
