@@ -113,9 +113,11 @@ describe('generateBriefing', () => {
     const receive = b.indexOf('Call **get_messages**');
     const profile = b.indexOf('set the entire exact text as your persona');
     const ack = b.indexOf('fleet_room_briefing_ack');
+    const monitor = b.indexOf('Wakes arrive as [fleet-monitor]');
     expect(receive).toBeGreaterThan(0);
     expect(profile).toBeGreaterThan(receive);
     expect(ack).toBeGreaterThan(profile);
+    expect(monitor).toBeGreaterThan(ack);
   });
 
   it('makes owner_seat_cid=null mean no room participant has Owner authority', () => {

@@ -114,6 +114,41 @@ function resolveRoomTemplate(cfg: FleetConfig, name?: string): TemplateSnapshot 
   return snapshotTemplate(template);
 }
 
+function durableTaskRoomTemplate(
+  task: ReturnType<typeof getTask>, room: RoomOrchestrationRecord,
+): TemplateSnapshot {
+  const snapshot = room.template_snapshot;
+  if (!snapshot) throw new Error(`room ${room.room_id} has no durable template snapshot`);
+  const ref = task.template;
+  if (!ref || ref.name !== snapshot.name || ref.version !== snapshot.version
+      || ref.content_hash !== snapshot.content_hash) {
+    throw new Error(`task ${task.task_id} template reference does not match room ${room.room_id}'s durable snapshot`);
+  }
+  return snapshot;
+}
+
+function printRoomStartupEvidence(room: RoomOrchestrationRecord): void {
+  const definitions = Object.values(room.role_briefings ?? {});
+  if (definitions.length) {
+    console.log('Role briefings:');
+    for (const definition of definitions.sort((a, b) => a.role.localeCompare(b.role)))
+      console.log(`  ${definition.role} v${definition.version ?? '?'} ${definition.state} sha256:${definition.sha256}`);
+  }
+  if (room.member_seats.length) {
+    console.log('Fleet startup evidence:');
+    for (const seat of room.member_seats) {
+      const launch = seat.launch?.state ?? 'unrecorded';
+      const briefing = seat.briefing?.state ?? 'unrecorded';
+      console.log(`  ${seat.role_name} ${seat.identity_cid} role=${seat.cowork_role} seat=${seat.seat_state} launch=${launch} briefing=${briefing}`);
+      if (seat.briefing?.message_id)
+        console.log(`    briefing_message=${seat.briefing.message_id} relay=${seat.briefing.relay_result_record_id ?? 'pending'} ack=${seat.briefing.acknowledgement_message_id ?? 'pending'}`);
+      if (seat.briefing?.last_rejected_ack_reason)
+        console.log(`    rejected_ack_seq=${seat.briefing.last_rejected_ack_seq} reason=${seat.briefing.last_rejected_ack_reason}`);
+      if (seat.launch?.error) console.log(`    launch_error=${seat.launch.error}`);
+    }
+  }
+}
+
 async function provisionRoom(cfg: FleetConfig, input: {
   name: string;
   goal?: string;
@@ -377,8 +412,11 @@ export function registerTaskCommands(parent: Command, cOpt: (cmd: Command) => Co
     .action((id: string, opts: { json?: boolean }) => {
       try {
         const t = getTask(id);
+        const room = t.room_id ? getRoomRecord(t.room_id) : undefined;
         if (opts.json) {
-          console.log(JSON.stringify({ schema_version: 1, task: t }, null, 2));
+          console.log(JSON.stringify({
+            schema_version: 1, task: t, orchestration: room ?? null,
+          }, null, 2));
           return;
         }
         console.log(`Task: ${t.task_id}`);
@@ -392,6 +430,7 @@ export function registerTaskCommands(parent: Command, cOpt: (cmd: Command) => Co
           for (const m of t.member_roles)
             console.log(`  ${m.name} (${m.cowork_role}) ${m.identity_cid}`);
         }
+        if (room) printRoomStartupEvidence(room);
         console.log(`Origin: ${t.origin.type}`);
         console.log(`Created: ${t.created_at}`);
         if (t.started_at) console.log(`Started: ${t.started_at}`);
@@ -540,7 +579,7 @@ export function registerTaskCommands(parent: Command, cOpt: (cmd: Command) => Co
           t = settled.task;
           terminalTimedOut = settled.timedOut;
         }
-        const room = t.room_id ? getRoomRecord(t.room_id) : undefined;
+        let room = t.room_id ? getRoomRecord(t.room_id) : undefined;
         const result = {
           task: t,
           room: room ?? null,
@@ -567,7 +606,7 @@ export function registerTaskCommands(parent: Command, cOpt: (cmd: Command) => Co
             ['create_members', 'configure_briefings', 'join_role_groups', 'wait_seats',
               'launch_work', 'wait_briefing_acks', 'activate'];
           if (resumable.includes(room.saga.phase)) {
-            const template = t.template ? resolveRoomTemplate(cfg, t.template.name) : undefined;
+            const template = durableTaskRoomTemplate(t, room);
             if (template) {
               try {
                 await provisionMembers({
@@ -580,7 +619,11 @@ export function registerTaskCommands(parent: Command, cOpt: (cmd: Command) => Co
                   brief: t.brief,
                   goal: t.title,
                 });
-                result.recovery_actions.push('Provisioning resumed successfully');
+                t = getTask(t.task_id);
+                room = getRoomRecord(room.room_id);
+                result.task = t;
+                result.room = room ?? null;
+                result.recovery_actions = ['Provisioning resumed successfully'];
               } catch (error) {
                 result.recovery_actions.push(
                   `Resume failed: ${error instanceof Error ? error.message : String(error)}`,
@@ -658,20 +701,32 @@ export function registerTaskCommands(parent: Command, cOpt: (cmd: Command) => Co
         // Select and validate the template snapshot before any state change or
         // provisioning. An explicit --template re-pins the task; a stored ref
         // must still match its snapshot (same contract as `task start`).
+        const existingRoom = t.room_id ? getRoomRecord(t.room_id) : undefined;
+        const durableSnapshot = existingRoom ? durableTaskRoomTemplate(t, existingRoom) : undefined;
         const templateName = opts.template
+          ?? durableSnapshot?.name
           ?? t.template?.name
           ?? cfg.tasks?.default_room_template
           ?? cfg.rooms?.defaults?.template
           ?? 'single';
-        const resolved = resolveTemplate(templateName, allTemplates(cfg));
-        if (!resolved) die(new Error(`template not found: ${templateName}`));
-        const snap = snapshotTemplate(resolved);
+        const resolved = durableSnapshot && !opts.template
+          ? undefined : resolveTemplate(templateName, allTemplates(cfg));
+        if (!durableSnapshot && !resolved) die(new Error(`template not found: ${templateName}`));
+        if (opts.template && !resolved) die(new Error(`template not found: ${templateName}`));
+        if (durableSnapshot && resolved) {
+          const requested = snapshotTemplate(resolved);
+          if (requested.name !== durableSnapshot.name
+              || requested.content_hash !== durableSnapshot.content_hash) {
+            die(new Error(`template ${requested.name}@${requested.version} does not match room ${existingRoom!.room_id}'s provisioned template ${durableSnapshot.name}@${durableSnapshot.version}`));
+          }
+        }
+        const snap = durableSnapshot ?? snapshotTemplate(resolved!);
         if (!opts.template && t.template && snap.content_hash !== t.template.content_hash)
           die(new Error(`task template snapshot no longer matches ${t.template.name}@${t.template.version}`));
         // A provisioned room is pinned to its snapshot: never resume or re-pin
         // an existing room under a different template.
         if (t.room_id) {
-          const roomSnap = getRoomRecord(t.room_id)?.template_snapshot ?? t.template;
+          const roomSnap = getRoomRecord(t.room_id)?.template_snapshot;
           if (roomSnap && (roomSnap.name !== snap.name || roomSnap.content_hash !== snap.content_hash))
             die(new Error(`template ${snap.name}@${snap.version} does not match room ${t.room_id}'s provisioned template ${roomSnap.name}@${roomSnap.version}`));
         }
@@ -885,6 +940,7 @@ export function registerRoomCommands(parent: Command, cOpt: (cmd: Command) => Co
           for (const s of cowork.seats)
             console.log(`  ${s.identity_cid} (${s.role}) ${s.seat_state}`);
         }
+        if (r) printRoomStartupEvidence(r);
         if (r) console.log(`Tracked by Fleet since: ${r.created_at}`);
       } catch (e) { die(e); }
     });
@@ -1019,7 +1075,9 @@ export function registerRoomCommands(parent: Command, cOpt: (cmd: Command) => Co
               'launch_work', 'wait_briefing_acks', 'activate'];
           if (resumable.includes(r.saga.phase) && r.template_snapshot) {
             try {
-              const template = resolveRoomTemplate(cfg, r.template_snapshot.name);
+              const template = r.task_id
+                ? durableTaskRoomTemplate(getTask(r.task_id), r)
+                : r.template_snapshot;
               if (template) {
                 await provisionMembers({
                   cfg,
@@ -1031,7 +1089,7 @@ export function registerRoomCommands(parent: Command, cOpt: (cmd: Command) => Co
                   goal: r.room_name,
                 });
                 r = getRoomRecord(id);
-                actions.push('Provisioning resumed successfully');
+                actions.splice(0, actions.length, 'Provisioning resumed successfully');
               }
             } catch (error) {
               actions.push(`Resume failed: ${error instanceof Error ? error.message : String(error)}`);

@@ -12,6 +12,8 @@ const mocks = vi.hoisted(() => ({
   provisionMembers: vi.fn(),
   closeManagedRoom: vi.fn().mockResolvedValue({ state: 'closed' }),
   launchFleetWorker: vi.fn(),
+  recoverRoom: vi.fn(),
+  getRoom: vi.fn(),
 }));
 
 vi.mock('../src/rooms-tasks/cowork-adapter.js', async (importOriginal) => {
@@ -21,6 +23,9 @@ vi.mock('../src/rooms-tasks/cowork-adapter.js', async (importOriginal) => {
     createCoworkAdapter: () => ({
       createRoom: mocks.createRoom,
       closeRoom: mocks.closeRoom,
+      recoverRoom: mocks.recoverRoom,
+      getRoom: mocks.getRoom,
+      getSeats: vi.fn().mockResolvedValue([]),
     }),
   };
 });
@@ -45,9 +50,11 @@ vi.mock('../src/rooms-tasks/external-worker.js', () => ({
 
 // ── Imports (resolved after mock interception) ──────────────────────────
 
-import { registerTaskCommands } from '../src/rooms-tasks/cli.js';
+import { registerRoomCommands, registerTaskCommands } from '../src/rooms-tasks/cli.js';
 import { createTask, getTask, activateTask, reviewTask, cancelTask } from '../src/rooms-tasks/task-state.js';
-import { activateRoom, getRoomRecord, advanceSaga } from '../src/rooms-tasks/room-state.js';
+import {
+  activateRoom, getRoomRecord, advanceSaga, updateMemberSeats, updateRoomRoleBriefing,
+} from '../src/rooms-tasks/room-state.js';
 import { CoworkUnavailableError } from '../src/rooms-tasks/cowork-adapter.js';
 
 const ROOM_ID = '01hzyk8m0000000000000000aa';
@@ -65,11 +72,37 @@ function makeProgram(): Command {
   program.exitOverride();
   const cOpt = (cmd: Command) => cmd.option('-c, --configuration <file>', 'config file');
   registerTaskCommands(program, cOpt);
+  registerRoomCommands(program, cOpt);
   return program;
 }
 
 async function run(...args: string[]): Promise<void> {
   await makeProgram().parseAsync(['task', ...args, '-c', cfgPath], { from: 'user' });
+}
+
+async function runLocalTask(...args: string[]): Promise<void> {
+  await makeProgram().parseAsync(['task', ...args], { from: 'user' });
+}
+
+async function runRoom(...args: string[]): Promise<void> {
+  await makeProgram().parseAsync(['room', ...args, '-c', cfgPath], { from: 'user' });
+}
+
+function writeCustomTemplate(include = true): void {
+  writeFileSync(cfgPath,
+    'roles: {}\n'
+    + 'rooms:\n'
+    + '  owner:\n    expected_cid: ' + 'a'.repeat(64) + '\n'
+    + '  defaults:\n    attach_owner: false\n'
+    + (include ? [
+      'room_templates:',
+      '  durable:',
+      '    version: 7',
+      '    description: durable template',
+      '    members:',
+      '      - { slot: dev, role: Developer, count: 1, role_ref: Dev }',
+      '',
+    ].join('\n') : ''));
 }
 
 function backlogTask() {
@@ -92,6 +125,14 @@ beforeEach(() => {
   exitSpy = vi.spyOn(process, 'exit').mockImplementation((() => { throw new ExitError(); }) as never);
 
   mocks.createRoom.mockReset().mockResolvedValue({ room_id: ROOM_ID, identity_cid: 'c'.repeat(64) });
+  mocks.recoverRoom.mockReset().mockResolvedValue({
+    room_id: ROOM_ID, identity_name: 'room-id', identity_cid: 'c'.repeat(64),
+    room_name: 'Fix the parser', state: 'active', seats: [], role_briefings: {},
+  });
+  mocks.getRoom.mockReset().mockResolvedValue({
+    room_id: ROOM_ID, identity_name: 'room-id', identity_cid: 'c'.repeat(64),
+    room_name: 'Fix the parser', state: 'active', seats: [], role_briefings: {},
+  });
   mocks.closeRoom.mockReset().mockResolvedValue(undefined);
   mocks.closeManagedRoom.mockReset().mockResolvedValue({ state: 'closed' });
   mocks.launchFleetWorker.mockReset().mockImplementation(async (args: string[]) => {
@@ -168,6 +209,40 @@ describe('task work', () => {
     const payload = JSON.parse(out.join('\n'));
     expect(payload.status).toBe('already_active');
     expect(payload.task.task_id).toBe(t.task_id);
+  });
+
+  it('task and room show expose per-seat launch, relay, ACK, and rejection evidence', async () => {
+    const t = backlogTask();
+    await run('work', t.task_id);
+    updateRoomRoleBriefing(ROOM_ID, 'Developer', {
+      role: 'Developer', text: 'charter', sha256: 'f'.repeat(64), version: 2,
+      state: 'configured', attempts: 1, updated_at: '2026-08-24T00:00:00.000Z',
+    });
+    updateMemberSeats(ROOM_ID, [{
+      role_name: 'dev-1', identity_cid: 'd'.repeat(64), slot: 'dev',
+      cowork_role: 'Developer', seat_state: 'active',
+      launch: {
+        state: 'launched', attempt: 1, action_id: 'action-1', launch_id: 'launch-1',
+        mission_sha256: 'e'.repeat(64), updated_at: '2026-08-24T00:00:00.000Z',
+      },
+      briefing: {
+        role: 'Developer', state: 'relay_queued', message_id: 'briefing-2',
+        relay_result_record_id: 'relay-2', rejected_ack_count: 1,
+        last_rejected_ack_seq: 9, last_rejected_ack_reason: 'owner_seat_cid mismatch',
+      },
+    }]);
+    out = [];
+    await runLocalTask('show', t.task_id, '--json');
+    const taskPayload = JSON.parse(out.join('\n'));
+    expect(taskPayload.orchestration.member_seats[0].briefing.state).toBe('relay_queued');
+
+    out = [];
+    await runRoom('show', ROOM_ID);
+    const text = out.join('\n');
+    expect(text).toContain('launch=launched briefing=relay_queued');
+    expect(text).toContain('briefing_message=briefing-2 relay=relay-2 ack=pending');
+    expect(text).toContain('reason=owner_seat_cid mismatch');
+    expect(text).toContain(`Developer v2 configured sha256:${'f'.repeat(64)}`);
   });
 
   it('refuses a terminal-state task', async () => {
@@ -249,6 +324,56 @@ describe('task work', () => {
     expect(mocks.provisionMembers).toHaveBeenCalledTimes(2);
     expect(mocks.provisionMembers).toHaveBeenLastCalledWith(
       expect.objectContaining({ roomId: ROOM_ID, taskId: t.task_id }));
+  });
+
+  it('work recovery uses the durable room snapshot after config template removal', async () => {
+    writeCustomTemplate(true);
+    mocks.provisionMembers.mockImplementationOnce(async ({ roomId }: { roomId: string }) => {
+      advanceSaga(roomId, 'wait_briefing_acks', 8, 'waiting_briefing_acks');
+      return getRoomRecord(roomId)!;
+    });
+    const t = backlogTask();
+    await run('work', t.task_id, '--template', 'durable');
+    writeCustomTemplate(false);
+    await run('work', t.task_id);
+    expect(getTask(t.task_id).state).toBe('active');
+    expect(mocks.provisionMembers).toHaveBeenLastCalledWith(expect.objectContaining({
+      template: expect.objectContaining({ name: 'durable', version: 7 }),
+    }));
+  });
+
+  it('task recover refreshes output and uses the durable room snapshot after config drift', async () => {
+    writeCustomTemplate(true);
+    mocks.provisionMembers.mockImplementationOnce(async ({ roomId }: { roomId: string }) => {
+      advanceSaga(roomId, 'wait_briefing_acks', 8, 'waiting_briefing_acks');
+      return getRoomRecord(roomId)!;
+    });
+    const t = backlogTask();
+    await run('work', t.task_id, '--template', 'durable');
+    writeCustomTemplate(false);
+    out = [];
+    await run('recover', t.task_id, '--json');
+    const payload = JSON.parse(out.join('\n'));
+    expect(payload.task.state).toBe('active');
+    expect(payload.room.state).toBe('active');
+    expect(mocks.provisionMembers).toHaveBeenLastCalledWith(expect.objectContaining({
+      template: expect.objectContaining({ name: 'durable', version: 7 }),
+    }));
+  });
+
+  it('room recover uses the task-bound durable snapshot after config removal', async () => {
+    writeCustomTemplate(true);
+    mocks.provisionMembers.mockImplementationOnce(async ({ roomId }: { roomId: string }) => {
+      advanceSaga(roomId, 'wait_briefing_acks', 8, 'waiting_briefing_acks');
+      return getRoomRecord(roomId)!;
+    });
+    const t = backlogTask();
+    await run('work', t.task_id, '--template', 'durable');
+    writeCustomTemplate(false);
+    await runRoom('recover', ROOM_ID, '--json');
+    expect(mocks.provisionMembers).toHaveBeenLastCalledWith(expect.objectContaining({
+      template: expect.objectContaining({ name: 'durable', version: 7 }),
+    }));
   });
 
   it('refuses to resume a waiting room under a different --template', async () => {
