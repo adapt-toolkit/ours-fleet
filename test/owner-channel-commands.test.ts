@@ -681,6 +681,25 @@ describe('owner-channel room subcommands', () => {
     expect(ctx.replies[0]).toContain('destructive');
   });
 
+  it('/room delete requires ID twice', async () => {
+    const r = await createTestRoom();
+    const ctx = context();
+    await dispatchOwnerCommand(`/room delete ${r.room_id}`, ctx);
+    expect(ctx.replies).toHaveLength(1);
+    expect(ctx.replies[0]).toContain('destructive');
+  });
+
+  it('/room delete <id> <id> delegates to the durable external delete path', async () => {
+    const r = await createTestRoom();
+    const { activateRoom } = await import('../src/rooms-tasks/room-state.js');
+    activateRoom(r.room_id);
+    const ctx = context();
+    await dispatchOwnerCommand(`/room delete ${r.room_id} ${r.room_id}`, ctx);
+    expect(ctx.replies).toHaveLength(1);
+    expect(ctx.replies[0]).toBe(`scheduled:${r.room_id}`);
+    expect(ctx.closeRoom).toHaveBeenCalledWith(r.room_id);
+  });
+
   it('/room close <id> <id> delegates to the durable external close path', async () => {
     const r = await createTestRoom();
     const { activateRoom } = await import('../src/rooms-tasks/room-state.js');
@@ -765,6 +784,27 @@ describe('owner-channel room subcommands', () => {
     await dispatchOwnerCommand('/room list active', ctx);
     expect(ctx.replies).toHaveLength(1);
     expect(ctx.replies[0]).toContain('test room');
+  });
+
+  it('/room list and show hide legacy closed room records', async () => {
+    const r = await createTestRoom();
+    const { closeRoom } = await import('../src/rooms-tasks/room-state.js');
+    closeRoom(r.room_id);
+    const listCtx = context();
+    await dispatchOwnerCommand('/room list', listCtx);
+    expect(listCtx.replies).toEqual(['🏠 No rooms.']);
+    const showCtx = context();
+    await dispatchOwnerCommand(`/room show ${r.room_id}`, showCtx);
+    expect(showCtx.replies[0]).toContain('room not found');
+  });
+
+  it('/room recover migrates a legacy closed record through deletion', async () => {
+    const r = await createTestRoom();
+    const { closeRoom } = await import('../src/rooms-tasks/room-state.js');
+    closeRoom(r.room_id);
+    const ctx = context();
+    await dispatchOwnerCommand(`/room recover ${r.room_id}`, ctx);
+    expect(ctx.closeRoom).toHaveBeenCalledWith(r.room_id);
   });
 
   it('/room recover <id> shows room saga state', async () => {

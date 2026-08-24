@@ -1206,13 +1206,8 @@ export class OwnerChannel implements OwnerChannelHandle {
   ): Promise<void> {
     const { acceptManagedRoomClose, recordManagedRoomCloseError } =
       await import('../rooms-tasks/close.js');
-    const accepted = await acceptManagedRoomClose(roomId);
-    if (accepted.state === 'closed') {
-      await this.send(sender.id, `🔒 Room ${roomId} is already closed`, wireId);
-      this.state.remember(wireId);
-      return;
-    }
-    await this.send(sender.id, `🔒 Room ${roomId} close accepted/pending`, wireId);
+    await acceptManagedRoomClose(roomId);
+    await this.send(sender.id, `🗑️ Room ${roomId} deletion accepted/pending`, wireId);
     this.state.remember(wireId);
     try {
       await this.fleetOps.closeRoom(roomId);
@@ -1220,7 +1215,7 @@ export class OwnerChannel implements OwnerChannelHandle {
       await recordManagedRoomCloseError(
         roomId,
         error instanceof Error ? error.message : String(error),
-        `External close worker failed to start. Retry /room close ${roomId} ${roomId}.`,
+        `External delete worker failed to start. Retry /room delete ${roomId} ${roomId}.`,
       );
       throw error;
     }

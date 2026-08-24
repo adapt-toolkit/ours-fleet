@@ -91,6 +91,7 @@ export interface CoworkAdapter {
   getRoom(roomId: string): Promise<CoworkRoomInfo | undefined>;
   listRooms(): Promise<CoworkRoomInfo[]>;
   closeRoom(roomId: string): Promise<void>;
+  deleteRoom(roomId: string): Promise<void>;
   getSeats(roomId: string): Promise<CoworkSeatInfo[]>;
   recoverRoom(roomId: string): Promise<CoworkRoomInfo>;
 }
@@ -475,6 +476,9 @@ export function createCoworkAdapter(options: CoworkAdapterOptions = {}): CoworkA
       return result.map((room) => projectRoom(room, 'room.list'));
     },
     async closeRoom(roomId) { await call('room.close', { room_id: roomId }); },
+    async deleteRoom(roomId) {
+      await call('room.delete', { room_id: roomId, confirm: true });
+    },
     async getSeats(roomId) {
       const result = await call('room.participants', { room_id: roomId });
       if (!Array.isArray(result)) throw new CoworkProtocolError('room.participants', 'result must be an array');

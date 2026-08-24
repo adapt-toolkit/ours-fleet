@@ -372,6 +372,15 @@ describe('ours-fleet CLI', () => {
     expect(r.stdout).toContain('Creation-time isolation');
   });
 
+  it('docs describe binary room deletion and legacy config semantics', async () => {
+    const r = await run(['docs']);
+    expect(r.code).toBe(0);
+    expect(r.stdout).toContain('room delete <id> <id>');
+    expect(r.stdout).toContain('deprecated alias');
+    expect(r.stdout).toContain('close-then-delete behavior');
+    expect(r.stdout).toContain('not retained as an inspectable archive');
+  });
+
   it('config prints an isolation summary for a role that declares it', async () => {
     const { writeFileSync } = await import('node:fs');
     writeFileSync(join(dir, 'fleet.yaml'),

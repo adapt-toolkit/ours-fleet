@@ -346,13 +346,22 @@ error. The optional \`rooms.owner.provider\` setting is separate and defaults to
 Finish and Delete are distinct terminal task actions:
 
 \`ours-fleet task finish <id>\` moves an active or review task to \`done\` and
-closes its associated Cowork room. Cowork retains the room brief, messages,
-summaries, repository references, and attachments as an inspectable archive.
+deletes its associated Cowork room after retiring its members. The room then
+disappears from normal Fleet and Cowork views; its brief, messages, repository
+references, and attachments are not retained as an inspectable archive.
+The prerelease configuration names \`tasks.close_room_on_done\` and
+\`rooms.defaults.close_when_task_done\` are retained for compatibility, but
+\`true\` now means this close-then-delete behavior.
+
+\`ours-fleet room delete <id> <id>\` is the canonical destructive room command.
+\`room close <id> <id>\` remains a deprecated alias with identical deletion
+semantics. Older prerelease \`closed\` room records are deleted directly the next
+time \`room list\` reconciles Fleet with Cowork.
 
 \`ours-fleet task delete <id> <id>\` removes only a \`done\` task's Fleet backlog
 record. The exact task ID is required twice for confirmation. Delete rejects every
-other task state, never closes or deletes the Cowork room/archive, and reports an
-already-missing task as an idempotent no-op. The Owner-channel equivalent is
+other task state, never changes any room state, and reports an already-missing
+task as an idempotent no-op. The Owner-channel equivalent is
 \`/task delete <id> <id>\`.
 
 ## Permissions
