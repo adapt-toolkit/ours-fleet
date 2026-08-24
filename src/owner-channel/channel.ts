@@ -347,11 +347,14 @@ export class OwnerChannel implements OwnerChannelHandle {
         ? ' with interruption'
         : event.monitor.interrupt === 'after_tool' ? ' with after-tool steering' : '';
       const monitor = `${event.monitor.mode} monitor${monitorPolicy}`;
+      const permission = event.permissionMode
+        ? `; permission ${event.permissionMode.fleetMode}, native ${event.permissionMode.nativeMode}`
+        : '';
       const inherited = event.inherited.length
         ? ` Supervisor inherited omitted defaults: ${event.inherited.join(', ')}.` : '';
       await this.sendProactiveMessage(
         `🧑‍💻 ${event.caller} spawned ${event.lifetime} agent ${event.role} `
-          + `(${event.harness}/${event.session}${model}; ${monitor}).${inherited}`,
+          + `(${event.harness}/${event.session}${model}; ${monitor}${permission}).${inherited}`,
         `fleet-spawn\0${event.creationActionId}`, 0);
     });
     this.managementTail = run.then(() => undefined, () => undefined);
@@ -941,18 +944,14 @@ export class OwnerChannel implements OwnerChannelHandle {
       await mkdir(outbox, { recursive: true, mode: 0o700 });
       const activityCursor = this.latestEventSeq(this.options.session.eventsSince(0));
       const queued = await this.options.session.queuePrompt(
-        this.ownerAttachmentPrompt(sender, originWireId, requestId, outbox, admitted, group.caption),
+        this.ownerAttachmentPrompt(sender, originWireId, requestId, admitted, group.caption),
         {
           interrupt: this.options.config.interrupt,
           ...(this.options.config.interrupt ? { interruptSource: 'owner' as const } : {}),
           origin: { kind: 'owner', requestId,
             ...(group.caption ? { displayText: String(group.caption.text ?? '') } : {}) },
         });
-      const accepted = this.options.config.interrupt
-        ? ownerNotices.receivedInterrupting()
-        : queued.queuedBehind > 0
-          ? ownerNotices.receivedQueued(queued.queuedBehind)
-          : ownerNotices.receivedStarted();
+      const accepted = this.acceptanceNotice(queued);
       handledWireIds.forEach(wire => this.inFlight.add(wire));
       const receipt = this.send(sender.id, accepted, originWireId).then(() => undefined).catch(error => {
         this.logError(`attachment request ${requestId.slice(0, 12)} acceptance notice failed`, error);
@@ -1059,7 +1058,7 @@ export class OwnerChannel implements OwnerChannelHandle {
     const activityCursor = this.latestEventSeq(this.options.session.eventsSince(0));
     try {
       queued = await this.options.session.queuePrompt(
-        this.ownerPrompt(sender, text, wireId, outbox), {
+        this.ownerPrompt(sender, text, wireId), {
         interrupt: this.options.config.interrupt,
         ...(this.options.config.interrupt ? { interruptSource: 'owner' as const } : {}),
         origin: { kind: 'owner', requestId, displayText: text },
@@ -1081,14 +1080,7 @@ export class OwnerChannel implements OwnerChannelHandle {
       return true;
     }
 
-    // Interrupting the live turn does not remove prompts which were already
-    // accepted into the ACP queue. Never claim this request is running while
-    // the session itself says earlier work remains ahead of it.
-    const accepted = queued.queuedBehind > 0
-      ? ownerNotices.receivedQueued(queued.queuedBehind)
-      : this.options.config.interrupt
-        ? ownerNotices.receivedInterrupting()
-        : ownerNotices.receivedStarted();
+    const accepted = this.acceptanceNotice(queued);
     this.inFlight.add(wireId);
     const receipt = this.send(sender.id, accepted, wireId).then(() => undefined).catch(error => {
       this.logError(`request ${requestId.slice(0, 12)} acceptance notice failed`, error);
@@ -1547,6 +1539,33 @@ export class OwnerChannel implements OwnerChannelHandle {
     return this.options.config.agent ? { ok: true } : this.authorizations.integrity();
   }
 
+  /**
+   * Report what the session actually did with the prompt, not what the config
+   * asked for. `interrupt: true` used to be reported as "your request
+   * interrupted the previous task" unconditionally; the session now answers
+   * whether anything was cancelled, whether the request is queued behind
+   * earlier prompts, or whether it is held until the current task reaches a
+   * safe stopping point. Backends that report no delivery state keep the old
+   * queuedBehind-based wording.
+   */
+  private acceptanceNotice(queued: QueuedPrompt): string {
+    switch (queued.delivery) {
+      case 'interrupted': return ownerNotices.receivedInterrupting();
+      case 'deferred': return ownerNotices.receivedDeferred();
+      case 'queued': return ownerNotices.receivedQueued(Math.max(1, queued.queuedBehind));
+      case 'started': return ownerNotices.receivedStarted();
+      default:
+        // Interrupting the live turn does not remove prompts which were already
+        // accepted into the ACP queue. Never claim this request is running while
+        // the session itself says earlier work remains ahead of it.
+        return queued.queuedBehind > 0
+          ? ownerNotices.receivedQueued(queued.queuedBehind)
+          : this.options.config.interrupt
+            ? ownerNotices.receivedInterrupting()
+            : ownerNotices.receivedStarted();
+    }
+  }
+
   private async complete(
     active: ActiveOwnerRequest, outbox: string, queued: QueuedPrompt, activityCursor: number,
   ): Promise<void> {
@@ -1737,7 +1756,7 @@ export class OwnerChannel implements OwnerChannelHandle {
 
   private ownerAttachmentPrompt(
     sender: { id: string; name: string }, wireId: string, requestId: string,
-    outbox: string, files: AdmittedAttachment[], caption?: InboundMessage,
+    files: AdmittedAttachment[], caption?: InboundMessage,
   ): string {
     const lines = [
       '[fleet-owner]',
@@ -1773,14 +1792,19 @@ export class OwnerChannel implements OwnerChannelHandle {
     }
     lines.push(
       'Answer in your final assistant response; fleet routes it only to the authenticated sender and correlates it to the originating file wire.',
-      `To attach response files, write regular files only to: ${outbox}`,
+      // send_file is the only delivery route an agent is given: a tool call either
+      // delivers or reports an error, where a file written to disk does neither.
+      'To send the owner a file — now or later in this turn — call ours `send_file`:',
+      `contact: ${this.options.config.identity}`,
+      'and the path of the finished file. Fleet routes it to the authenticated owner.',
+      'A file written anywhere else is not delivered and nothing will report that it was not.',
+      'Use descriptive unique filenames. Send nothing the owner did not request or should not receive.',
     );
     return lines.join('\n');
   }
 
   private ownerPrompt(
     sender: { id: string; name: string }, text: string, wireId: string,
-    outbox: string,
   ): string {
     return [
       '[fleet-owner]',
@@ -1795,10 +1819,13 @@ export class OwnerChannel implements OwnerChannelHandle {
       ] : [
         'Managed-agent outbound relay is not configured; do not send intermediate or proactive owner-channel messages.',
       ]),
-      'To attach files to your response, copy each finished file directly into this fleet outbox:',
-      outbox,
-      'Fleet sends every regular file in that directory to the authenticated owner, correlated to this request.',
-      'Use descriptive unique filenames. Put nothing there that the owner did not request or should not receive.',
+      // send_file is the only delivery route an agent is given: a tool call either
+      // delivers or reports an error, where a file written to disk does neither.
+      'To send the owner a file — now or later in this turn — call ours `send_file`:',
+      `contact: ${this.options.config.identity}`,
+      'and the path of the finished file. Fleet routes it to the authenticated owner.',
+      'A file written anywhere else is not delivered and nothing will report that it was not.',
+      'Use descriptive unique filenames. Send nothing the owner did not request or should not receive.',
       '',
       text || '(empty message)',
     ].join('\n');

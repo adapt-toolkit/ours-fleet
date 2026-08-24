@@ -54,10 +54,16 @@ What this means in practice, on this harness:
 
 | Neutral intent | Native settings | Meets the floor? |
 | --- | --- | --- |
-| `--approval allow --filesystem workspace` | `approval=never sandbox=workspace-write` | yes |
-| `--approval allow --filesystem read-only` | `approval=never sandbox=read-only` | no — no `write-state`, no `workspace-edit` |
-| `--approval ask` | `approval=on-request` | no — `read-state` only |
-| `--approval deny` | `approval=on-request` | no — `read-state` only |
+| `--approval allow --filesystem workspace` | ACP: `agent-full-access` / `never` / `danger-full-access`; tmux: `never` / `workspace-write` | yes |
+| `--approval allow --filesystem read-only` | ACP: `agent-full-access` / `never` / `danger-full-access`; tmux: `never` / `read-only` | ACP yes; tmux no |
+| `--approval auto` | ACP: `agent` / `on-request` / `workspace-write` | no — `read-state` only |
+| `--approval ask` or legacy `deny` | conservative prompting mode | no — `read-state` only |
+
+Codex ACP mode IDs couple approval and filesystem. Neutral `allow` intentionally
+selects the yolo/`agent-full-access` preset, widening a neutral `workspace` or
+`read-only` filesystem value. Neutral `auto` selects `agent`. An explicit
+`--sandbox` override still wins. Use `--isolation-file` as the outer boundary
+for an ACP role that needs `allow`.
 
 ## 3. Choose permissions from the job, not from a default
 
@@ -77,7 +83,7 @@ user authorizes it, then pick:
   or get the authorization; do not paper over it with a mode that only hides
   the prompt.
 
-Never choose `--filesystem unrestricted`, `--sandbox danger-full-access`, or a
+Never choose an explicit `--filesystem unrestricted`, `--sandbox danger-full-access`, or a
 native `--permission-mode` override without the user asking for it by name and
 understanding what it grants. `harness_options` wins over the neutral block at
 launch, so stating intent in both places and disagreeing is how a role runs on

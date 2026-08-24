@@ -153,7 +153,7 @@ function agentEntry(node: MergedTopologyNode): Record<string, unknown> {
 }
 
 /**
- * D4, and the owner requirement it encodes: a watchdog drawn on its own carries
+ * A watchdog drawn on its own carries
  * NO `watch:` key, which the config layer reads as "every configured role" —
  * so an agent added tomorrow is covered with no edit at all. A watchdog created
  * from a specific agent carries that agent explicitly and stays scoped to it.

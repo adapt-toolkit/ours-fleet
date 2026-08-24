@@ -34,7 +34,7 @@ it('tells an unverified identity to mint on first run, a verified one to just bi
   expect(gen()).toMatch(/create_identity/);
   expect(gen({ identityGuarantee: 'verified' })).not.toMatch(/if binding reports no such identity/i);
 });
-it('appends prompt_file focus without touching the contract (owner decision 1)', () => {
+it('appends prompt_file focus without touching the contract', () => {
   const b = gen({ promptFocus: 'Pay attention to Docs drift.' });
   expect(b).toContain('## Extra focus (from prompt_file)');
   expect(b).toContain('Pay attention to Docs drift.');

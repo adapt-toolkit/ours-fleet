@@ -62,6 +62,17 @@ export interface RoleStatus {
     runtimeModel?: SessionSnapshot['runtimeModel'];
     reasoningEffort?: SessionSnapshot['reasoningEffort'];
     permissionMode?: SessionSnapshot['permissionMode'];
+    /**
+     * Activity evidence, kept separate from `readiness` on purpose: `readiness`
+     * answers "is a fleet-tracked turn in flight" (the prompt-admission gate),
+     * NOT "is this agent working". `state` is the only field a human-facing
+     * surface may use to call a role idle or stalled.
+     */
+    activity: {
+      state: 'active' | 'quiet' | 'unobservable';
+      activeToolCalls?: number;
+      lastUpdateAt?: string;
+    };
   };
   restart: {
     circuit: 'closed' | 'open';

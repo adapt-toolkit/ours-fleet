@@ -1,3 +1,5 @@
+import type { McpServer } from '@agentclientprotocol/sdk';
+
 import type { CommonPermissions, FleetPermissionMode, ResolvedRole } from '../config.js';
 
 export interface PrereqCheck { name: string; ok: boolean; detail: string }
@@ -12,9 +14,38 @@ export interface SessionPrep {
   env: Record<string, string>;
   /** Optional launcher selected after runtime prerequisite probing. */
   command?: string;
+  /**
+   * The settings overlay prepareSession wrote, if it wrote one.
+   *
+   * The tmux launch delivers this as `--settings <path>` in `argv`; an ACP agent
+   * takes no flags, so it needs the PATH rather than the flag. Recorded here so
+   * the two deliveries read one value instead of each re-deriving the filename.
+   */
+  settingsOverlay?: string;
+  /**
+   * The MCP config file prepareSession wrote for `harness_options.mcp_servers`,
+   * if the role declared any. Same reason as `settingsOverlay`: the tmux launch
+   * passes the file, the ACP launch has to send the servers themselves.
+   */
+  mcpConfigFile?: string;
 }
+
+/**
+ * One MCP server as ACP's `session/new` declares it.
+ *
+ * ⚠ THE PROTOCOL'S OWN TYPE, DELIBERATELY NOT A LOCAL RESTATEMENT. `mcpServers`
+ * goes onto the wire unchanged, so a hand-written near-copy would compile while
+ * being subtly wrong — `env` and `headers` are REQUIRED arrays, and the stdio
+ * variant is the one with no `type` field at all. Aliasing it also keeps
+ * `session/new`'s response type inferable, which a structural stand-in silently
+ * broke (every field of the result degraded to `unknown`).
+ */
+export type AcpMcpServer = McpServer;
 export interface Launch { argv: string[]; env: Record<string, string> }
-export interface AcpLaunch { argv: string[]; env: Record<string, string> }
+export interface AcpLaunch extends Launch {
+  /** Metadata vocabulary authenticated by the exact ACP artifact in argv. */
+  permissionMetadataSource?: 'codex-acp';
+}
 /**
  * The result of expressing neutral `permissions:` in a harness's own terms.
  *
@@ -69,7 +100,7 @@ export interface BriefingVocab {
 }
 
 /**
- * How a harness's host state splits for sandboxing (5.1). `home` is the
+ * How a harness's host state splits for sandboxing. `home` is the
  * directory the CLI treats as its own and whose RUNTIME state must be per-role;
  * `shared` are the credential, instruction and configuration paths that stay
  * shared and become read-only inside the sandbox.
@@ -86,7 +117,13 @@ export interface HarnessAdapter {
   id: string;
   supportsResume: boolean;
   checkPrereqs(): Promise<PrereqReport>;
-  validateOptions(opts: unknown): ValidationError[];
+  /**
+   * `role` is the SESSION-AWARE half: some harness options can only be honoured
+   * on some session types, and an option that is silently dropped is worse than
+   * one that is refused. Optional so an adapter that has nothing session-specific
+   * to say keeps its one-argument implementation.
+   */
+  validateOptions(opts: unknown, role?: ResolvedRole): ValidationError[];
   prepareSession(role: ResolvedRole, dirs: RoleDirs): Promise<SessionPrep>;
   buildLaunch(role: ResolvedRole, mode: 'fresh' | 'resume', s: SessionState, prep: SessionPrep): Launch;
   buildAcpLaunch?(role: ResolvedRole, prep: SessionPrep): AcpLaunch;
@@ -96,6 +133,23 @@ export interface HarnessAdapter {
    * agent's default. Omit for a harness whose ACP agent has no modes.
    */
   acpPermissionModeId?(role: ResolvedRole): string | undefined;
+  /**
+   * The MCP servers this role declares, for the `mcpServers` array of ACP's
+   * `session/new` / `resume` / `load`. Empty (or omitted) leaves the agent's own
+   * configuration alone, which is what fleet has always sent.
+   */
+  acpMcpServers?(role: ResolvedRole): AcpMcpServer[];
+  /**
+   * Agent-specific `_meta` for `session/new` — how a capability the CLI takes as
+   * a flag reaches an ACP agent that accepts no flags.
+   *
+   * ⚠ THIS IS A PER-AGENT VOCABULARY, NOT PROTOCOL. `_meta` is free-form in ACP,
+   * so what an adapter puts here is only honoured by the agent it was written
+   * for. An adapter must therefore return nothing for an ACP command it did not
+   * choose, and the options that depend on it must be refused at validation for
+   * such a role rather than sent and silently ignored.
+   */
+  acpSessionMeta?(role: ResolvedRole, prep: SessionPrep): Record<string, unknown> | undefined;
   /** Effective portable policy and harness-native approval mode after native overrides win. */
   effectivePermissionMode?(role: ResolvedRole): {
     fleetMode: FleetPermissionMode;
@@ -118,7 +172,7 @@ export interface HarnessAdapter {
   nativePermissionOverrides(options: unknown): Record<string, unknown>;
   /**
    * Host paths this harness needs inside a sandbox, split into a per-role
-   * writable home and shared read-only credentials/config (5.1). Omit for a
+   * writable home and shared read-only credentials/config. Omit for a
    * harness with no host state of its own.
    */
   isolationPaths?(role: ResolvedRole, dirs: RoleDirs): HarnessIsolationPaths;

@@ -1,7 +1,8 @@
 import { describe, expect, it } from 'vitest';
 
 import {
-  MAX_TEXT_BYTES, normalizeSessionUpdate,
+  MAX_DIFF_TEXT_BYTES, MAX_NORMALIZED_UPDATE_BYTES, MAX_PATH_BYTES, MAX_TEXT_BYTES,
+  normalizeSessionUpdate,
 } from '../src/session/conversation-normalizer.js';
 import type {
   CapabilitiesUpdatedPayload, MessageChunkPayload, NormalizedText, PlanReplacePayload,
@@ -115,6 +116,160 @@ describe('normalizeSessionUpdate', () => {
       oldText: { text: 'old' }, newText: { text: 'new' },
     });
     expect(payload.content?.[2]).toEqual({ type: 'terminal', terminalId: 'term-1' });
+  });
+
+  it('reduces a multi-megabyte append snapshot to only the bounded current delta', () => {
+    const historicalMarker = 'HISTORICAL_MARKER ours-mcp start\n';
+    const oldText = historicalMarker + 'historical-line\n'.repeat(220_000);
+    const appended = 'CURRENT_SESSION_APPEND žluťoučký kůň 🧪\nsecond-current-line\n';
+    const result = normalizeSessionUpdate({
+      sessionUpdate: 'tool_call_update', toolCallId: 'worklog-edit', status: 'completed',
+      content: [{
+        type: 'diff', path: '/role/WORKLOG.md', oldText, newText: oldText + appended,
+      }],
+    });
+    const payload = result.payload as ToolUpsertPayload;
+    const diff = payload.content?.[0];
+    expect(diff).toMatchObject({
+      type: 'diff', path: '/role/WORKLOG.md', operation: 'append', bounded: true,
+      beforeBytes: Buffer.byteLength(oldText),
+      afterBytes: Buffer.byteLength(oldText + appended),
+      commonPrefixBytes: Buffer.byteLength(oldText),
+      newText: { text: appended, bytes: Buffer.byteLength(appended) },
+    });
+    if (diff?.type !== 'diff') throw new Error('expected normalized diff');
+    expect(diff.oldText).toBeUndefined();
+    const serialized = JSON.stringify(result);
+    expect(Buffer.byteLength(serialized)).toBeLessThan(MAX_DIFF_TEXT_BYTES + 2_048);
+    expect(serialized).toContain('CURRENT_SESSION_APPEND');
+    expect(serialized).not.toContain('ours-mcp start');
+  });
+
+  it('keeps a valid whole-line Unicode tail when the current append exceeds its cap', () => {
+    const oldText = 'historical marker\n' + 'old 🧪 line\n'.repeat(30_000);
+    const appended = Array.from({ length: 12_000 }, (_, i) => `current-${i}-žluťoučký 🧪\n`).join('')
+      + 'LATEST-CURRENT-LINE 🧪\n';
+    const result = normalizeSessionUpdate({
+      sessionUpdate: 'tool_call_update', toolCallId: 'large-append',
+      content: [{ type: 'diff', path: '/role/WORKLOG.md', oldText, newText: oldText + appended }],
+    });
+    const diff = (result.payload as ToolUpsertPayload).content?.[0];
+    if (diff?.type !== 'diff') throw new Error('expected normalized diff');
+    expect(diff.newText.truncated).toBe(true);
+    expect(diff.newText.omittedPrefixBytes).toBeGreaterThan(0);
+    expect(Buffer.byteLength(diff.newText.text)).toBeLessThanOrEqual(MAX_DIFF_TEXT_BYTES);
+    expect(diff.newText.text).toMatch(/^current-\d+-žluťoučký 🧪\n/);
+    expect(diff.newText.text).toContain('LATEST-CURRENT-LINE 🧪');
+    expect(diff.newText.text).not.toContain('�');
+    expect(diff.newText.startsMidLine).toBeUndefined();
+  });
+
+  it('marks a UTF-8-safe mid-line tail when one logical line alone exceeds the cap', () => {
+    const oldText = 'h'.repeat(MAX_TEXT_BYTES + 1);
+    const appended = 'L'.repeat(69_642) + '\n';
+    const result = normalizeSessionUpdate({
+      sessionUpdate: 'tool_call_update', toolCallId: 'oversized-line',
+      content: [{ type: 'diff', path: '/role/WORKLOG.md', oldText, newText: oldText + appended }],
+    });
+    const diff = (result.payload as ToolUpsertPayload).content?.[0];
+    if (diff?.type !== 'diff') throw new Error('expected normalized diff');
+    expect(Buffer.byteLength(appended)).toBe(69_643);
+    expect(diff.newText).toMatchObject({
+      bytes: 69_643, truncated: true, startsMidLine: true,
+      omittedPrefixBytes: 69_643 - MAX_DIFF_TEXT_BYTES,
+    });
+    expect(Buffer.byteLength(diff.newText.text)).toBe(MAX_DIFF_TEXT_BYTES);
+    expect(diff.newText.text.endsWith('\n')).toBe(true);
+    expect(diff.newText.text).not.toContain('�');
+  });
+
+  it('removes unchanged historical edges from oversized replacement snapshots', () => {
+    const prefix = 'HISTORICAL_PREFIX\n' + 'unchanged\n'.repeat(30_000);
+    const suffix = 'unchanged suffix 🧪\n'.repeat(30_000);
+    const result = normalizeSessionUpdate({
+      sessionUpdate: 'tool_call_update', toolCallId: 'large-edit',
+      content: [{
+        type: 'diff', path: '/role/WORKLOG.md',
+        oldText: `${prefix}OLD CURRENT REGION\n${suffix}`,
+        newText: `${prefix}NEW CURRENT REGION ž\n${suffix}`,
+      }],
+    });
+    const diff = (result.payload as ToolUpsertPayload).content?.[0];
+    expect(diff).toMatchObject({
+      type: 'diff', operation: 'edit', bounded: true,
+      oldText: { text: 'OLD CURRENT REGION' }, newText: { text: 'NEW CURRENT REGION ž' },
+    });
+    expect(JSON.stringify(diff)).not.toContain('HISTORICAL_PREFIX');
+    expect(JSON.stringify(diff)).not.toContain('unchanged suffix');
+  });
+
+  it('classifies identical oversized snapshots as a no-op and full replacements as replace', () => {
+    const same = 'same'.repeat(80_000);
+    const noOp = normalizeSessionUpdate({
+      sessionUpdate: 'tool_call_update', toolCallId: 'same',
+      content: [{ type: 'diff', path: '/role/WORKLOG.md', oldText: same, newText: same }],
+    });
+    const noOpDiff = (noOp.payload as ToolUpsertPayload).content?.[0];
+    expect(noOpDiff).toMatchObject({
+      type: 'diff', operation: 'noop', bounded: true,
+      beforeBytes: Buffer.byteLength(same), afterBytes: Buffer.byteLength(same),
+      newText: { text: '', bytes: 0 },
+    });
+
+    const replacement = normalizeSessionUpdate({
+      sessionUpdate: 'tool_call_update', toolCallId: 'replace',
+      content: [{
+        type: 'diff', path: '/role/WORKLOG.md',
+        oldText: 'a'.repeat(300_000), newText: 'b'.repeat(300_000),
+      }],
+    });
+    expect((replacement.payload as ToolUpsertPayload).content?.[0])
+      .toMatchObject({
+        type: 'diff', operation: 'replace', bounded: true,
+        oldText: { truncated: true, digest: expect.stringMatching(/^[0-9a-f]{24}$/) },
+        newText: { truncated: true, digest: expect.stringMatching(/^[0-9a-f]{24}$/) },
+      });
+  });
+
+  it('bounds attacker-controlled diff and location paths with explicit provenance', () => {
+    const path = `${'p'.repeat(524_278)}/WORKLOG.md`;
+    expect(Buffer.byteLength(path)).toBe(524_289);
+    const oldText = 'h'.repeat(MAX_TEXT_BYTES + 1);
+    const result = normalizeSessionUpdate({
+      sessionUpdate: 'tool_call_update', toolCallId: 'bounded-path',
+      locations: [{ path, line: 7 }],
+      content: [{ type: 'diff', path, oldText, newText: `${oldText}current\n` }],
+    });
+    const payload = result.payload as ToolUpsertPayload;
+    const diff = payload.content?.[0];
+    if (diff?.type !== 'diff') throw new Error('expected normalized diff');
+    for (const bounded of [diff, payload.locations?.[0]]) {
+      expect(bounded).toMatchObject({
+        path: expect.stringMatching(/WORKLOG\.md$/),
+        pathBytes: Buffer.byteLength(path), pathTruncated: true,
+        pathDigest: expect.stringMatching(/^[0-9a-f]{24}$/),
+      });
+      expect(Buffer.byteLength(bounded?.path ?? '')).toBeLessThanOrEqual(MAX_PATH_BYTES);
+      expect(bounded?.pathOmittedPrefixBytes).toBeGreaterThan(0);
+    }
+    expect(Buffer.byteLength(JSON.stringify(result))).toBeLessThan(MAX_PATH_BYTES * 3);
+  });
+
+  it('enforces a hard cap on the complete normalized update', () => {
+    const result = normalizeSessionUpdate({
+      sessionUpdate: 'tool_call_update', toolCallId: 'many-blocks',
+      content: Array.from({ length: 8 }, () => ({
+        type: 'content', content: text('x'.repeat(MAX_TEXT_BYTES)),
+      })),
+    });
+    expect(result.kind).toBe('unsupported');
+    expect(result.payload as UnsupportedPayload).toMatchObject({
+      sessionUpdate: 'tool_call_update',
+      bytes: expect.any(Number),
+      digest: expect.stringMatching(/^[0-9a-f]{24}$/),
+      preview: expect.stringContaining('durable-event cap'),
+    });
+    expect(Buffer.byteLength(JSON.stringify(result))).toBeLessThan(MAX_NORMALIZED_UPDATE_BYTES);
   });
 
   it('maps a tool_call_update to a patch upsert carrying only present fields', () => {

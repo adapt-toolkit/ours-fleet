@@ -1,5 +1,12 @@
+/**
+ * Packing runs the prepack build, which cleans this checkout's dist/. Keep this
+ * subprocess-heavy install probe in the serial package gate so the ordinary
+ * suite can safely use the dist built by its global setup.
+ */
 import { execFileSync } from 'node:child_process';
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import {
+  existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync,
+} from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
@@ -7,13 +14,15 @@ import { describe, expect, it } from 'vitest';
 const CODEX_ACP_VERSION = '1.1.7';
 
 describe('packed root package', () => {
-  it('fresh-installs the gated codex-acp and reports the exact allow + workspace policy', () => {
+  it('fresh-installs the gated codex-acp and reports coupled allow full access', () => {
     const root = mkdtempSync(join(tmpdir(), 'ours-fleet-packed-'));
     const packDir = join(root, 'pack');
     const consumerDir = join(root, 'consumer');
+    const consumerWithoutOptionalDir = join(root, 'consumer-without-optional');
     try {
       mkdirSync(packDir);
       mkdirSync(consumerDir);
+      mkdirSync(consumerWithoutOptionalDir);
       const packOutput = execFileSync('npm', [
         'pack', '--json', '--pack-destination', packDir,
       ], {
@@ -73,6 +82,7 @@ describe('packed root package', () => {
         process.stdout.write(JSON.stringify({
           version: codex.version,
           claim,
+          permissionMetadataSource: launch.permissionMetadataSource,
           prepared: {
             codeXPathExists: existsSync(prep.env.CODEX_PATH),
             approval: prep.env.OURS_FLEET_CODEX_APPROVAL,
@@ -86,18 +96,74 @@ describe('packed root package', () => {
       ], { cwd: consumerDir, encoding: 'utf8' }));
 
       expect(result.version).toBe(CODEX_ACP_VERSION);
+      expect(result.permissionMetadataSource).toBe('codex-acp');
       expect(result.claim).toMatchObject({
         supported: true,
-        exact: true,
-        native: { mode: 'agent', approval: 'never', sandbox: 'workspace-write' },
+        exact: false,
+        native: {
+          mode: 'agent-full-access', approval: 'never', sandbox: 'danger-full-access',
+        },
       });
-      expect(result.claim.warnings).toEqual([]);
+      expect(result.claim.warnings.join('\n'))
+        .toContain("mode 'agent-full-access' couples approval and filesystem");
       expect(result.prepared).toEqual({
         codeXPathExists: true,
         approval: 'never',
-        sandbox: 'workspace-write',
-        initialAgentMode: 'agent',
+        sandbox: 'danger-full-access',
+        initialAgentMode: 'agent-full-access',
       });
+
+      writeFileSync(join(consumerWithoutOptionalDir, 'package.json'), JSON.stringify({
+        private: true,
+        dependencies: { '@ours.network/fleet': `file:${tarball}` },
+      }));
+      execFileSync('npm', [
+        'install', '--ignore-scripts', '--no-audit', '--no-fund', '--omit=optional',
+      ], {
+        cwd: consumerWithoutOptionalDir,
+        encoding: 'utf8',
+        env: { ...process.env, npm_config_update_notifier: 'false' },
+        timeout: 180_000,
+      });
+
+      const fallbackProbe = `
+        import { existsSync } from 'node:fs';
+        import { join } from 'node:path';
+        import { pathToFileURL } from 'node:url';
+        const modules = join(process.cwd(), 'node_modules');
+        const fleetRoot = join(modules, '@ours.network', 'fleet');
+        const codexRoot = join(modules, '@agentclientprotocol', 'codex-acp');
+        const { makeCodexAdapter } = await import(
+          pathToFileURL(join(fleetRoot, 'dist', 'harness', 'codex.js')).href
+        );
+        const adapter = makeCodexAdapter(async () => ({
+          code: 1, stdout: '', stderr: '',
+        }));
+        const role = {
+          name: 'PackedFallback',
+          harness: 'codex',
+          identity: 'PackedFallback',
+          sourceFile: 'fixture',
+          session: 'acp',
+          permissions: { approval: 'allow', filesystem: 'workspace', unattended: 'wait' },
+        };
+        const launch = adapter.buildAcpLaunch(role, { argv: [], env: {} });
+        process.stdout.write(JSON.stringify({
+          bundledPresent: existsSync(codexRoot),
+          argv: launch.argv,
+          permissionMetadataSource: launch.permissionMetadataSource,
+        }));
+      `;
+      const fallback = JSON.parse(execFileSync(process.execPath, [
+        '--input-type=module', '--eval', fallbackProbe,
+      ], { cwd: consumerWithoutOptionalDir, encoding: 'utf8' }));
+      expect(fallback).toEqual({
+        bundledPresent: false,
+        argv: ['codex-acp'],
+      });
+      expect(existsSync(join(
+        consumerWithoutOptionalDir, 'node_modules', '@agentclientprotocol', 'codex-acp',
+      ))).toBe(false);
     } finally {
       rmSync(root, { recursive: true, force: true });
     }

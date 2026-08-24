@@ -207,7 +207,7 @@ function readdirSyncSafe(dir: string): string[] {
 }
 
 /**
- * Identity provisioning (7.3). The fleet must know — before the harness starts
+ * Identity provisioning. The fleet must know — before the harness starts
  * — whether the role's identity exists, and create it when it does not.
  *
  * `exists()` is answered through the typed SDK daemon inventory. `create()` is
@@ -460,7 +460,7 @@ export function writeRoleFile(tx: CreationTransaction, file: string, contents: s
   });
 }
 
-// ─── Creation provenance (6.6) ───────────────────────────────────────────────
+// ─── Creation provenance ───────────────────────────────────────────────
 
 /** Where a setting's effective value came from. */
 export type ProvenanceSource = 'cli' | 'fleet-default' | 'caller-role' | 'built-in';

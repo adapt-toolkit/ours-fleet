@@ -59,7 +59,7 @@ function spawnExamples(text: string): Array<{ command: string; permissions: Comm
     }));
 }
 
-describe('shipped spawn skills are written from one source of truth (7.1)', () => {
+describe('shipped spawn skills are written from one source of truth', () => {
   for (const v of VARIANTS) {
     it(`${v.id}: states every required fact and none of the corrected ones`, () => {
       const text = flat(skill(v.path, 'spawn-ours-agent'));
@@ -95,9 +95,29 @@ describe('shipped spawn skills are written from one source of truth (7.1)', () =
       expect(AI_DOCS, `AI_DOCS is missing ${term}`).toContain(term);
     for (const capability of UNATTENDED_FLOOR) expect(AI_DOCS).toContain(capability);
   });
+
+  it.each([
+    ['codex', 'codex', 'auto', 'agent'],
+    ['codex', 'codex', 'allow', 'agent-full-access'],
+    ['claude-code', 'claude-code', 'auto', 'acceptEdits'],
+    ['claude-code', 'claude-code', 'allow', 'bypassPermissions'],
+  ] as const)('%s: %s approval=%s maps to native %s',
+    (variantId, harness, approval, nativeMode) => {
+      const variant = VARIANTS.find(candidate => candidate.id === variantId)!;
+      const role = roleWith(harness, {
+        approval, filesystem: 'workspace', unattended: 'deny',
+      });
+      role.session = harness === 'codex' ? 'acp' : 'tmux';
+      expect(getAdapter(harness).effectivePermissionMode!(role)).toMatchObject({
+        fleetMode: approval,
+        nativeMode,
+      });
+      expect(skill(variant.path, 'spawn-ours-agent')).toContain(nativeMode);
+      expect(AI_DOCS).toContain(nativeMode);
+    });
 });
 
-describe('following only the shipped skill produces a role doctor accepts (7.1)', () => {
+describe('following only the shipped skill produces a role doctor accepts', () => {
   for (const v of VARIANTS) {
     const examples = spawnExamples(skill(v.path, 'spawn-ours-agent'));
 
@@ -130,11 +150,11 @@ describe('following only the shipped skill produces a role doctor accepts (7.1)'
 });
 
 /**
- * The oversight half (7.2). An overseer reads its generated briefing OR this
+ * The oversight half. An overseer reads its generated briefing OR this
  * skill; if they disagree about what a `peek` failure proves, one of them is
  * telling it to restart a working agent.
  */
-describe('shipped oversee skills use the one result taxonomy (7.2)', () => {
+describe('shipped oversee skills use the one result taxonomy', () => {
   for (const v of VARIANTS) {
     const text = skill(v.path, 'oversee-agents');
 

@@ -317,7 +317,7 @@ export async function provisionMembers(
     }));
     updateMemberSeats(roomId, seats);
   } else {
-    // Phase 4: create_members
+    // create_members saga phase
     advanceSaga(roomId, 'create_members', 3);
     try {
       for (const planned of plan) {

@@ -79,7 +79,7 @@ function deps(backend: SupervisorBackend, watchdogService?: OpsDeps['watchdogSer
 
 /**
  * `installChanged` simulates WatchdogServiceManager.install()'s own changed-detection
- * (finding #4): defaults to true, matching a first-ever install (no unit file yet).
+ * Defaults to true, matching a first-ever install with no unit file yet.
  * Tests that need to prove the config-fingerprint gate on its own set it false —
  * a real install() would too, since binPath/configPath (the only inputs the real
  * unit content depends on) are unchanged between those calls.
@@ -233,7 +233,7 @@ describe('up / down / restart', () => {
     expect(calls).toEqual([['stop', 'B']]);
   });
 
-  it('down reports the backend\'s real stop failure (1.5)', async () => {
+  it('down reports the backend\'s real stop failure', async () => {
     writeCfg({ A: { harness: 'fake' } });
     const { backend } = fakeBackend();
     backend.stop = async () => {
@@ -302,7 +302,7 @@ describe('up/down reconcile the supervised watchdog scheduler', () => {
   const withWatchdog = (extra = '') =>
     writeFileSync(join(dir, 'fleet.yaml'), `roles:\n  A: {}\nwatchdogs:\n  w: { coordinator: A${extra} }\n`);
 
-  it('up with an enabled watchdog installs + restarts the scheduler when supervised (final review #4: `start` is a no-op on an already-active unit, so config changes never reach it)', async () => {
+  it('up with an enabled watchdog installs and restarts the supervised scheduler so config changes reach an active unit', async () => {
     withWatchdog();
     const { backend } = fakeBackend();
     const { calls, svc } = fakeWatchdogService();
@@ -312,7 +312,7 @@ describe('up/down reconcile the supervised watchdog scheduler', () => {
     expect(logs.join('\n')).toMatch(/↑ watchdogs scheduler.*w/);
   });
 
-  describe('restart is gated on an actual change, not fired on every up (finding #4)', () => {
+  describe('restart is gated on an actual change, not fired on every up', () => {
     it('a second reconcile of the SAME config calls start, not restart — an unrelated `up` must not interrupt an in-flight check', async () => {
       withWatchdog();
       const { backend } = fakeBackend();
@@ -369,7 +369,7 @@ describe('up/down reconcile the supervised watchdog scheduler', () => {
     expect(calls).toEqual(['stop']);
   });
 
-  it('up with no watchdogs and an unsupervised service never calls stop (final review #3: spurious stop on watchdog-less fleets)', async () => {
+  it('up with no watchdogs and an unsupervised service never calls stop', async () => {
     writeCfg({ A: { harness: 'fake' } });
     const { backend } = fakeBackend();
     const { calls, svc } = fakeWatchdogService({ supervised: false });
@@ -428,7 +428,7 @@ describe('up/down reconcile the supervised watchdog scheduler', () => {
     expect(calls).toEqual(['stop']);
   });
 
-  it('a whole-fleet down never calls stop when the service reports unsupervised (final review #3)', async () => {
+  it('a whole-fleet down never calls stop when the service reports unsupervised', async () => {
     withWatchdog();
     const { backend } = fakeBackend();
     const { calls, svc } = fakeWatchdogService({ supervised: false });
@@ -454,7 +454,7 @@ describe('up/down reconcile the supervised watchdog scheduler', () => {
   });
 });
 
-describe('up liveness (1.1) — only a definite stop discards session context', () => {
+describe('up liveness — only a definite stop discards session context', () => {
   /** label, systemd ActiveState, SubState, does `up` boot it fresh? */
   const SHAPES: Array<[string, string, string, boolean]> = [
     ['running', 'active', 'running', false],
@@ -533,7 +533,7 @@ describe('up liveness (1.1) — only a definite stop discards session context', 
   });
 });
 
-describe('explicit operator actions reset the restart circuit (3.2)', () => {
+describe('explicit operator actions reset the restart circuit', () => {
   const heldDown = () => {
     const stateDir = agentDir('A');
     mkdirSync(stateDir, { recursive: true });

@@ -290,7 +290,7 @@ describe('spawnTemp', () => {
   });
 });
 
-describe('atomic role + identity reservation (6.4)', () => {
+describe('atomic role + identity reservation', () => {
   /** A registry that records claims, so races are observable. */
   function fakeRegistry() {
     const held = new Set<string>();
@@ -418,7 +418,7 @@ describe('atomic role + identity reservation (6.4)', () => {
   });
 });
 
-describe('identity is established before launch (7.3)', () => {
+describe('identity is established before launch', () => {
   const provisioner = (
     exists: boolean | 'unknown',
     create?: (n: string, p: { bio?: string; persona?: string }) => Promise<void>,
@@ -510,7 +510,7 @@ describe('identity is established before launch (7.3)', () => {
   });
 });
 
-describe('every failed creation stage rolls back (6.2)', () => {
+describe('every failed creation stage rolls back', () => {
   const provisioner = (created: string[], removed: string[]) => ({
     async exists() { return false as const; },
     async create(n: string) { created.push(n); },
@@ -524,7 +524,7 @@ describe('every failed creation stage rolls back (6.2)', () => {
 
   /** Fault-inject at each stage in turn; each must leave nothing behind. */
   // `state` is not in this list on purpose: `up` tolerates a failing liveness
-  // probe by design (1.1), so it is not an injectable failure point. The
+  // probe by design, so it is not an injectable failure point. The
   // config-write stage is covered by the 6.4 rollback test above.
   const STAGES = ['identity', 'service'] as const;
 
@@ -567,7 +567,7 @@ describe('every failed creation stage rolls back (6.2)', () => {
    * The other half of the same defect — a backend `install` that throws AFTER
    * writing its artifact, where no caller can ever hear about it — is the
    * backend's own responsibility and is covered in test/supervisor.test.ts,
-   * "a failed registration leaves no artifact (6.2)".
+   * "a failed registration leaves no artifact".
    */
   it('a service registration this transaction created is uninstalled on failure', async () => {
     const { d, calls } = fakeDeps();
@@ -625,7 +625,7 @@ describe('every failed creation stage rolls back (6.2)', () => {
   });
 });
 
-describe('creation-time isolation (6.3)', () => {
+describe('creation-time isolation', () => {
   const policy = 'network: deny\nfs:\n  read:\n    - /opt/reference\nresources:\n  mem: 2G\n';
   const writePolicy = (body = policy) => {
     const p = join(dir, 'policy.yaml');
@@ -699,7 +699,7 @@ describe('creation-time isolation (6.3)', () => {
   });
 });
 
-describe('creation provenance (6.6)', () => {
+describe('creation provenance', () => {
   const provenanceOf = (name: string, temp = false) =>
     JSON.parse(readFileSync(join(agentDir(name, temp), 'creation.json'), 'utf8'));
 

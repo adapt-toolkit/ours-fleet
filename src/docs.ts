@@ -271,6 +271,9 @@ roles:
       add_dirs: [/data/shared]
       config:
         model_reasoning_effort: high
+      mcp_servers:                       # claude-code: per-role MCP servers, additive by default
+        ours: { command: ours-mcp, args: [proxy] }
+      mcp_servers_only: false            # true = ONLY these; drops user/project/plugin servers
     bio: Public role card and when peers should engage it.
     persona: Local operating contract, boundaries, and escalation policy.
     briefing_file: /absolute/custom-briefing.md
@@ -314,6 +317,11 @@ never augmented.
 Role values override defaults. \`\${name}\` substitutes entries from \`vars\`.
 Other role fields include \`max_tokens\`, \`autocompact_pct\`, and \`isolation\`.
 Use README.md for the complete isolation policy and resource-cap schema.
+
+Supervised roles connect to the operator-configured ours daemon; they do not own its
+lifecycle. Fleet forces \`OURS_AUTOSTART=0\` in tmux and ACP child processes after role
+environment overlays. Start the shared daemon only through an explicit operator or
+installer/setup flow.
 
 ## Rooms and tasks
 
@@ -457,10 +465,14 @@ permissions through its harness and check the result against a fixed floor:
 deny those requests with nobody to see it; with \`unattended: wait\` it warns,
 because a human can still attach and answer.
 
-Security meaning: \`ask\` maps to Codex \`untrusted\` and Claude \`default\`;
-\`auto\` maps to Codex \`on-request\` and Claude \`acceptEdits\`; and
-\`approval: allow\` maps to Codex \`never\` and Claude \`bypassPermissions\`,
-which genuinely permits the actions the role was authorized to take —
+Security meaning: \`ask\` maps to Codex \`untrusted\` and Claude \`default\`.
+\`auto\` selects Codex ACP \`agent\` (\`on-request\` + \`workspace-write\`) and
+Claude \`acceptEdits\`. \`approval: allow\` selects Codex ACP's fully
+non-interactive yolo mode, reported as \`agent-full-access\` (\`never\` +
+\`danger-full-access\`), and Claude \`bypassPermissions\`. Codex tmux retains
+independent approval and sandbox flags: \`auto\` is \`on-request\`, \`allow\`
+is \`never\`, and \`filesystem\` still selects the sandbox. These modes genuinely
+permit the actions the role was authorized to take —
 \`dontAsk\` only suppresses the prompt while still refusing the action. Nothing
 other than an explicit \`allow\` becomes non-interactive. Legacy \`deny\` keeps
 its conservative Codex \`on-request\` / Claude \`plan\` translation. \`allow\` is therefore a real grant and
@@ -471,20 +483,45 @@ ACP carries agent-advertised session mode IDs and \`session/set_mode\`, but thos
 IDs are agent-specific and ACP defines no portable permission-policy capability.
 Fleet therefore uses the ACP primitive where an adapter exposes a matching mode
 and otherwise performs the harness translation above. The bundled Codex ACP
-adapter couples approval and sandboxing in its advertised mode IDs, so fleet
-keeps the selected sandbox preset and enforces the independently translated
-approval policy on the app-server turn request. For example, \`allow\` plus
-\`workspace\` is really \`approval=never sandbox=workspace-write\`; it is never
-widened to \`danger-full-access\`. The live session reports both its effective
-normalized mode and the ACP sandbox-preset ID.
+adapter couples approval and sandboxing in its advertised mode IDs. Neutral
+\`allow\` therefore selects \`agent-full-access\` and widens \`filesystem:
+workspace\` or \`read-only\` to \`danger-full-access\`; neutral \`auto\` selects
+\`agent\` and \`workspace-write\` even when the neutral filesystem value differs.
+An explicit \`harness_options.sandbox\` selects its corresponding ACP preset and
+still wins, as does an explicit native approval override. \`config\` and
+\`doctor\` report a coupled-mode mismatch as approximate. Use per-role
+\`isolation:\` as the outer boundary for an \`allow\` ACP role. The live session
+reports both its effective normalized mode and the exact native mode selected.
 
 See also: \`spawn --approval/--filesystem/--unattended\` set this intent at
 creation, and \`ours-fleet config\` prints each role's neutral settings, their
 native translation, and any warning — the same text \`doctor\` reports.
 
 Claude \`harness_options\`: \`permission_mode\` (default, acceptEdits, plan,
-dontAsk, bypassPermissions), \`plugins\`, \`mem_palace\`, and
-\`mem_palace_midsession_autosave\`.
+dontAsk, bypassPermissions), \`plugins\`, \`mem_palace\`,
+\`mem_palace_midsession_autosave\`, \`mcp_servers\` and \`mcp_servers_only\`.
+
+\`mcp_servers\` declares MCP servers for the role, in \`.mcp.json\`'s own shape
+(a map of name to \`{ command, args, env }\`, or \`{ type: http|sse, url,
+headers }\`). By default they are ADDED to whatever the OS user running the role
+already has configured, on both session types: tmux passes \`--mcp-config\`, and
+ACP sends them in \`session/new\`.
+
+\`mcp_servers_only: true\` makes the declared set EXCLUSIVE — \`--strict-mcp-config\`
+on tmux, \`strictMcpConfig\` on ACP. It is all-or-nothing and it ignores every
+other MCP configuration: project \`.mcp.json\`, user settings, and **plugins**.
+The ours connector is normally installed as a plugin, so a strict role that does
+not re-declare it has no \`send_message\` and no \`get_messages\` — it cannot even
+report that it has gone mute. Fleet therefore refuses a strict role whose
+\`mcp_servers\` does not name the connector; declare it explicitly, e.g.
+\`ours: { command: ours-mcp, args: [proxy] }\`.
+
+Both options, and \`plugins\`, reach an ACP session through the bundled Claude ACP
+agent's \`_meta\` vocabulary. A role that sets \`session_options.acp.command\` runs
+an agent fleet did not choose and cannot be promised them, so that combination is
+refused at validation rather than accepted and dropped. This narrows a role's
+tool surface; it does not stop the harness deferring tool schemas, which is the
+harness's own decision.
 
 Codex \`harness_options\`: \`launcher\` (auto, ours-codex, codex), \`sandbox\`
 (read-only, workspace-write, danger-full-access), \`approval\` or
@@ -579,12 +616,11 @@ owner of that authenticated source wire instead of the latest conversation.
 Every other CID is rejected and warned about without reflecting its body. Fleet sends
 accepted/queued/progress/interrupted/failure notices and routes the ACP turn's
 final assistant text back to the authenticated sender with its source wire ID.
-For file replies, fleet injects a request-specific outbox path into the owner
-prompt. The agent copies completed artifacts there; fleet sends every regular
-file from the channel identity with the same source wire ID and removes the
-temporary outbox only after successful delivery. For proactive or in-turn agent
-attachments, the agent calls ours \`send_file\` to the channel identity and may
-pair it with a reply-linked caption; fleet, not the agent, chooses the owner.
+For file replies of every kind — a response artifact, a proactive note, or an
+in-turn attachment — the agent calls ours \`send_file\` to the channel identity
+and may pair it with a reply-linked caption; fleet, not the agent, chooses the
+owner. That is the only delivery route an agent is given: a tool call either
+delivers or reports an error, where a file written to disk does neither.
 Owner messages whose trimmed text starts with \`/\` are deterministic
 supervisor commands and never enter the model: \`/help\` (alias \`/commands\`),
 \`/status\`, \`/comments [status|on|off]\`, \`/interrupt\`, \`/clear\`,
@@ -731,10 +767,38 @@ escape hatch.
 
 ## Bounded worklogs, auth proxy, and model recovery
 
-An optional \`worklog: { max_kb, keep_tail_kb, max_archives }\` policy rotates a
-stable snapshot at fleet-owned lifecycle points. Concurrent changes defer
-rotation. Archives remain beside WORKLOG.md with the same sensitive-state
-boundary; retention deletes only recognized fleet archive names.
+WORKLOG rotation is enabled by default with
+\`worklog: { max_kb: 1024, keep_tail_kb: 256, max_archives: 12 }\`. Maps may
+override individual values; \`worklog: false\` on a role or in defaults opts out.
+Fleet rotates only at that role's launch/resume lifecycle boundary. Concurrent
+changes defer rotation. The active file keeps a bounded UTF-8 tail and advances
+to a line boundary when a complete line fits. If one logical line alone exceeds
+the budget, its newest suffix remains and the rotation manifest records the
+mid-line start and omitted byte count. The complete prior inode receives a
+collision-safe UTC archive name, and
+\`.worklog-rotation.json\` records restart provenance. \`max_archives\` bounds
+recent archives beside WORKLOG.md; older complete archives move to
+\`WORKLOG.archives/\` without deletion. All archives share the role's sensitive
+state boundary. Fleet refuses a symlinked/non-regular live log or a symlinked
+cold-archive boundary before replacing the live path and best-effort removes a
+duplicate publication left by a detected failure while the original inode is
+still available. The manifest records SHA-256 digests for the archive and live
+bytes observed when it is written. These checks address ordinary path hazards,
+not intentional path mutation by a malicious concurrent process with the same
+Unix authority; that is outside the threat model and requires OS-level isolation.
+
+ACP tool diffs are bounded before entering web conversation events. Existing
+small before/after diffs are unchanged. Oversized whole-file snapshots are
+reduced to the actual changed region plus path, operation, original byte counts,
+digest, and omission metadata. Each retained side is a newest-content UTF-8 tail
+of at most 64 KiB, advanced to a line boundary when a complete line fits. An
+overlong single line keeps its newest suffix and explicitly records a mid-line
+start. Paths retain at most a 4 KiB suffix with byte count, digest, and omitted
+prefix metadata; the complete normalized update is capped at 320 KiB. A large
+append therefore retains current appended content, not the historical prefix.
+The live web-console transcript includes only the current runner generation and
+excludes adapter session/load replay. Replayed events remain durable with
+agent_replay provenance for diagnosis and recovery.
 
 \`auth_proxy: { kind: anthropic, base_url, required, health_url }\` is Claude-only
 and loopback-only. Fleet injects only ANTHROPIC_BASE_URL and doctor rejects
@@ -752,7 +816,7 @@ reconcile explicitly; no chain preserves detection-only behavior.
 `;
 
 /**
- * What every shipped spawn-skill variant must say, and must not say (7.1).
+ * What every shipped spawn-skill variant must say, and must not say.
  *
  * The skills are separate markdown files in two published plugins, written for
  * two different harnesses, so they cannot literally be one file. This is the
@@ -782,7 +846,7 @@ export const SPAWN_SKILL_CONTRACT = {
     // The only intent that clears the floor, and the honest alternative.
     '--approval allow',
     '--unattended wait',
-    // Creation-time isolation (6.3) — the one new operator input this release adds.
+    // Creation-time isolation — the one new operator input this release adds.
     '--isolation-file',
   ],
   /**

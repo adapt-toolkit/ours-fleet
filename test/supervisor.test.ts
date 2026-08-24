@@ -36,7 +36,7 @@ describe('systemd backend', () => {
     expect(unit).toContain(`ExecStart="${process.execPath}" "/usr/local/bin/ours-fleet" _run %i`);
     expect(unit).toContain(`Environment="PATH=${dirname(process.execPath)}`);
     expect(unit).toContain('/usr/local/bin');
-    expect(unit).toMatch(/^Restart=on-failure$/m);   // the runner owns the retry loop (3.2)
+    expect(unit).toMatch(/^Restart=on-failure$/m);   // the runner owns the retry loop
     expect(calls).toContainEqual(['systemctl', '--user', 'daemon-reload']);
     expect(calls.some(c => c[0] === 'loginctl' && c[1] === 'enable-linger')).toBe(true);
     expect(msgs.join('\n')).toContain('linger');
@@ -115,7 +115,7 @@ describe('launchd backend', () => {
   });
 });
 
-describe('systemd liveness (1.1)', () => {
+describe('systemd liveness', () => {
   const showing = (stdout: string, stderr = '', code = 0): Exec => async () => ({ stdout, stderr, code });
 
   it('probes the machine-readable properties, not the status prose', async () => {
@@ -150,7 +150,7 @@ describe('systemd liveness (1.1)', () => {
   });
 });
 
-describe('launchd liveness (1.1)', () => {
+describe('launchd liveness', () => {
   const printing = (stdout: string, stderr = '', code = 0): Exec => async () => ({ stdout, stderr, code });
 
   it('a loaded service is running and reports its launchd state', async () => {
@@ -176,7 +176,7 @@ describe('launchd liveness (1.1)', () => {
   });
 });
 
-describe('none backend liveness (1.1)', () => {
+describe('none backend liveness', () => {
   const hasSession = (code: number, stderr = ''): Exec => async () => ({ stdout: '', stderr, code });
 
   it('reports the tmux probe directly', async () => {
@@ -262,7 +262,7 @@ describe('systemd bus-error hint (#9)', () => {
   });
 });
 
-describe('service managers no longer run the child-session loop (3.2)', () => {
+describe('service managers no longer run the child-session loop', () => {
   it('systemd restarts the runner only when it FAILS, not on every exit', async () => {
     const { exec } = recorder();
     await makeSystemdBackend(exec).init('/usr/local/bin/ours-fleet');
@@ -283,7 +283,7 @@ describe('service managers no longer run the child-session loop (3.2)', () => {
   });
 });
 
-describe('install/uninstall outcomes are explicit and idempotent (6.2)', () => {
+describe('install/uninstall outcomes are explicit and idempotent', () => {
   const answering = (table: Record<string, ExecResult>): Exec =>
     async (cmd, args) => table[[cmd, ...args].join(' ')] ?? { stdout: '', stderr: '', code: 0 };
 
@@ -340,7 +340,7 @@ describe('install/uninstall outcomes are explicit and idempotent (6.2)', () => {
  * already written therefore has to be cleaned up by the install itself, or a
  * failed spawn leaves a live launch artifact behind.
  */
-describe('a failed registration leaves no artifact (6.2)', () => {
+describe('a failed registration leaves no artifact', () => {
   const launchAgent = () => join(dir, 'Library/LaunchAgents/network.ours.fleet.A.plist');
 
   /** bootstrap fails; everything else succeeds. */
@@ -443,7 +443,7 @@ describe('a failed registration leaves no artifact (6.2)', () => {
       await expect(makeSystemdBackend(exec).install('A', '/b')).resolves.toMatchObject({ created: true });
     });
 
-    it('an UNANSWERABLE probe is never read as a failed start (1.1)', async () => {
+    it('an UNANSWERABLE probe is never read as a failed start', async () => {
       // The unit may be perfectly fine and the bus merely unreachable. Refusing
       // the install here would take down a healthy role for a failed probe.
       const calls: string[][] = [];
@@ -552,7 +552,7 @@ describe('a failed registration leaves no artifact (6.2)', () => {
         .resolves.toMatchObject({ created: true });
     });
 
-    it('an UNANSWERABLE probe is never read as a failed start (1.1)', async () => {
+    it('an UNANSWERABLE probe is never read as a failed start', async () => {
       // launchd may be perfectly fine and launchctl merely unable to answer.
       const { exec } = launchctl(0, { stderr: 'Bootstrap failed: 5: Input/output error', code: 5 });
       await expect(makeLaunchdBackend(exec, 501).install('A', '/b'))
@@ -586,7 +586,7 @@ describe('a failed registration leaves no artifact (6.2)', () => {
     it('classifyStart keeps liveness distinct: a loaded dead job is still LIVE for 1.1', async () => {
       // The two questions differ. `install` asks whether the job started;
       // `liveness` asks whether the role's context still exists, and a loaded
-      // job — even one between KeepAlive restarts — answers yes (1.1).
+      // job — even one between KeepAlive restarts — answers yes.
       const dead = '\tstate = not running\n\tlast exit code = 1\n';
       expect(classifyStart({ loaded: true, notFound: false, state: 'not running', lastExit: '1' }).started)
         .toBe('no');

@@ -42,7 +42,10 @@ export interface ToolCard {
   kind?: string;
   status?: string;
   content?: Array<Record<string, unknown>>;
-  locations?: Array<{ path: string; line?: number }>;
+  locations?: Array<{
+    path: string; line?: number; pathBytes?: number; pathTruncated?: true;
+    pathDigest?: string; pathOmittedPrefixBytes?: number;
+  }>;
   rawInput?: { json?: unknown; bytes: number; truncated?: true; digest?: string; redacted?: true };
   rawOutput?: { json?: unknown; bytes: number; truncated?: true; digest?: string; redacted?: true };
 }

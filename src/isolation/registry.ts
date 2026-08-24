@@ -16,12 +16,12 @@ export interface Selection {
 }
 
 /**
- * Pick the isolation backend for a resolved policy, honouring `auto` (bwrap-first,
- * rootless — OQ-5) and the `on_unavailable` degradation policy.
+ * Pick the isolation backend for a resolved policy, honouring rootless,
+ * bwrap-first `auto` and the `on_unavailable` degradation policy.
  *
  * - `none`         → the identity backend.
  * - `bubblewrap`   → bwrap if available, else degrade/refuse per on_unavailable.
- * - `podman`       → not implemented yet (Phase 6) ⇒ treated as unavailable.
+ * - `podman`       → not implemented ⇒ treated as unavailable.
  * - `auto`         → bwrap if available, else degrade/refuse.
  *
  * On `on_unavailable: strict` with nothing available, throws (fail closed).
@@ -35,10 +35,10 @@ export async function selectIsolationBackend(
   const candidates: IsolationBackend[] = [];
   if (policy.backend === 'auto' || policy.backend === 'bubblewrap')
     candidates.push(makeBubblewrapBackend(exec));
-  // podman: Phase 6 — no candidate yet, so it falls through to on_unavailable.
+  // podman has no candidate yet, so it falls through to on_unavailable.
 
   let lastDetail = policy.backend === 'podman'
-    ? 'podman backend not implemented yet (Phase 6)'
+    ? 'podman backend is not implemented'
     : 'no isolation backend available';
   for (const b of candidates) {
     const a = await b.available();

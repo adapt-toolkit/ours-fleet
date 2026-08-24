@@ -13,7 +13,7 @@ import type { FetchLike } from '../src/monitor.js';
 import type { AttachOursClientOptions, OursClient } from '@ours.network/sdk/client';
 import { cliPath, installPrefix, pkgRoot } from './install-fixtures.js';
 
-// A stub daemon-API for the monitor reachability probe (design §5).
+// A stub daemon API for the monitor reachability probe.
 const stubFetch = (state: 'ok' | '401' | 'down' | 'notdaemon' = 'ok'): FetchLike => async (url) => {
   if (state === 'down') throw new Error('ECONNREFUSED');
   if (url.includes('/state-dir'))
@@ -288,7 +288,7 @@ describe('doctor isolation reporting', () => {
   });
 });
 
-describe('doctor monitor probe (§5)', () => {
+describe('doctor monitor probe', () => {
   const green = (over: Record<string, ExecResult> = {}): Exec => execWith({
     'tmux -V': { stdout: 'tmux 3.6', stderr: '', code: 0 },
     'ours version': { stdout: JSON.stringify({ name: '@ours.network/cli', version: '1.0.1' }), stderr: '', code: 0 },
@@ -441,7 +441,7 @@ describe('user bus check (#9)', () => {
   });
 });
 
-describe('doctor config validity (1.4)', () => {
+describe('doctor config validity', () => {
   const HEALTHY_HOST = {
     'tmux -V': { stdout: 'tmux 3.4', stderr: '', code: 0 },
     'ours version': { stdout: JSON.stringify({ name: '@ours.network/cli', version: '1.0.1' }), stderr: '', code: 0 },
@@ -535,7 +535,7 @@ describe('doctor config validity (1.4)', () => {
   });
 });
 
-describe('doctor permission translation (2.3)', () => {
+describe('doctor permission translation', () => {
   const HEALTHY = {
     'tmux -V': { stdout: 'tmux 3.4', stderr: '', code: 0 },
     'ours version': { stdout: JSON.stringify({ name: '@ours.network/cli', version: '1.0.1' }), stderr: '', code: 0 },
@@ -573,15 +573,15 @@ describe('doctor permission translation (2.3)', () => {
     expect(c.detail).toContain('sandbox=danger-full-access');
   });
 
-  it('reports the enforced codex-acp allow + workspace runtime', async () => {
+  it('reports the enforced codex-acp allow full-access runtime', async () => {
     writeCfg('roles:\n  A:\n    harness: codex\n    session: acp\n'
       + '    permissions:\n      approval: allow\n      filesystem: workspace\n'
       + '      unattended: deny\n');
     const rep = await run();
     const c = check(rep, 'A');
     expect(c.ok).toBe(true);
-    expect(c.detail).toContain('mode=agent approval=never sandbox=workspace-write');
-    expect(c.detail).toContain('(exact)');
+    expect(c.detail).toContain('mode=agent-full-access approval=never sandbox=danger-full-access');
+    expect(c.detail).toContain("mode 'agent-full-access' couples approval and filesystem");
     const floor = rep.checks.find(candidate => candidate.name === 'unattended floor: A')!;
     expect(floor.ok).toBe(true);
     expect(floor.detail).toContain('workspace-edit');
@@ -600,7 +600,7 @@ describe('doctor permission translation (2.3)', () => {
   });
 });
 
-describe('doctor unattended capability floor (2.1)', () => {
+describe('doctor unattended capability floor', () => {
   const HEALTHY = {
     'tmux -V': { stdout: 'tmux 3.4', stderr: '', code: 0 },
     'ours version': { stdout: JSON.stringify({ name: '@ours.network/cli', version: '1.0.1' }), stderr: '', code: 0 },
@@ -666,7 +666,7 @@ describe('doctor unattended capability floor (2.1)', () => {
   });
 });
 
-describe('native overrides contradicting neutral intent (2.4)', () => {
+describe('native overrides contradicting neutral intent', () => {
   const HEALTHY = {
     'tmux -V': { stdout: 'tmux 3.4', stderr: '', code: 0 },
     'ours version': { stdout: JSON.stringify({ name: '@ours.network/cli', version: '1.0.1' }), stderr: '', code: 0 },
@@ -803,7 +803,7 @@ describe('doctor install provenance', () => {
   });
 });
 
-describe('doctor rooms-tasks checks (§5.3)', () => {
+describe('doctor rooms-tasks checks', () => {
   const HEALTHY_HOST = {
     'tmux -V': { stdout: 'tmux 3.6', stderr: '', code: 0 },
     'ours version': { stdout: JSON.stringify({ name: '@ours.network/cli', version: '1.0.1' }), stderr: '', code: 0 },

@@ -41,7 +41,7 @@ describe('watchdog store', () => {
       .toEqual(['20260731T120000Z', '20260731T115000Z', '20260731T110000Z']);
     expect(latestReport('w')!.run_id).toBe('20260731T120000Z');
   });
-  it('prunes to keep_reports, oldest first (acceptance 8)', () => {
+  it('prunes to keep_reports, oldest first', () => {
     for (let i = 0; i < 6; i++) writeReport('w', rpt(`20260731T11000${i}Z`));
     expect(pruneReports('w', 4)).toBe(2);
     expect(listRuns('w')).toHaveLength(4);
@@ -68,7 +68,7 @@ describe('watchdog store', () => {
   });
   it('releaseRunLock rethrows a non-ENOENT failure instead of masking it as "already gone"', () => {
     // Recursive rm now happily deletes a non-empty lock dir (it must, to clear
-    // owner.json alongside the mkdir mutex — finding #2), so ENOTEMPTY can no
+    // owner.json alongside the mkdir mutex), so ENOTEMPTY can no
     // longer be forced this way. Force a real permission failure instead: no
     // write permission on the lock dir means its child (owner.json) can't be
     // unlinked.
@@ -82,7 +82,7 @@ describe('watchdog store', () => {
     }
   });
 
-  describe('run lock ownership (finding #2)', () => {
+  describe('run lock ownership', () => {
     it('acquireRunLock stamps owner.json with our own pid', () => {
       acquireRunLock('w');
       expect(readRunLockOwner('w')).toMatchObject({ pid: process.pid });
@@ -150,7 +150,7 @@ describe('watchdog store', () => {
     });
   });
 
-  describe('watchdogDir path traversal (finding #1)', () => {
+  describe('watchdogDir path traversal', () => {
     it('rejects a traversal-shaped name before any fs effect', () => {
       expect(() => watchdogDir('../x')).toThrow();
     });

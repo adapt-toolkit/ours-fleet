@@ -139,7 +139,7 @@ export async function doctor(
     detail: `warning: ${diagnostic.message}`,
   });
 
-  // ── Rooms/tasks checks (§5.3) ────────────────────────────────────────
+  // ── Rooms/tasks checks ────────────────────────────────────────
   if (loaded.ok && loaded.rooms) {
     const rooms = loaded.rooms;
 
@@ -222,7 +222,7 @@ export async function doctor(
       });
     }
 
-    // Hard prerelease capability check
+    // Hard room-management capability check
     try {
       const { createCoworkAdapter } = await import('./rooms-tasks/cowork-adapter.js');
       const adapter = createCoworkAdapter({ configPath: coworkConfig });
@@ -237,7 +237,7 @@ export async function doctor(
       checks.push({
         name: 'rooms: capability', ok: false,
         detail: isProto
-          ? `cowork does not support room management protocol — upgrade ours-cowork to prerelease`
+          ? `cowork does not support room management protocol — upgrade ours-cowork to a version that supports the room management protocol`
           : `room management check failed: ${msg}`,
       });
     }
@@ -315,7 +315,7 @@ export async function doctor(
     });
   }
 
-  // Per-role permission translation (2.3). Rendered from the same analysis the
+  // Per-role permission translation. Rendered from the same analysis the
   // `config` command prints, so the two commands cannot disagree.
   for (const analysis of analyzeFleetPermissions(roles)) {
     if (!analysis.supported) {
@@ -335,14 +335,14 @@ export async function doctor(
         : `${summary} (exact)`,
     });
 
-    // A role that states its permission intent twice, in two disagreeing places
-    // (2.4). Quiet when there is a single source of intent.
+    // Report a role that states its permission intent twice in disagreeing places.
+    // Stay quiet when there is a single source of intent.
     for (const conflict of analysis.conflicts ?? [])
       checks.push({
         name: `permission conflict: ${analysis.role}`, ok: true, detail: conflict.warning,
       });
 
-    // The floor is checked BEFORE start (2.1): an under-permissioned unattended
+    // The floor is checked BEFORE start: an under-permissioned unattended
     // role never reports its own failure, because the denial happens inside the
     // harness with nobody attached to see it.
     const floor = analysis.floor!;
@@ -390,7 +390,7 @@ export async function doctor(
   }
 
   // Isolation reporting (AC-9). Backend availability is advisory — isolation is
-  // opt-in per role (OQ-1), so a missing bwrap must not fail doctor for fleets that
+  // opt-in per role, so a missing bwrap must not fail doctor for fleets that
   // don't use it. Only a role that DECLARES isolation and cannot get it under
   // `strict` is a hard failure.
   const bw = await makeBubblewrapBackend(exec).available();
@@ -403,7 +403,7 @@ export async function doctor(
   if (platform === 'linux')
     checks.push({ name: 'isolation: cgroup delegation', ok: true, detail: cgroupDelegationDetail() });
   for (const r of roles.filter(r => r.isolation)) {
-    // A refused mount is a launch-blocking policy error (5.2), not a warning.
+    // A refused mount is a launch-blocking policy error, not a warning.
     let policy;
     try { policy = resolveIsolation(r.isolation!, isolationContextFor(r)); }
     catch (e) {
@@ -426,7 +426,7 @@ export async function doctor(
     checks.push({ name: `isolation: ${r.name}`, ok, detail });
   }
 
-  // Monitor daemon-API reachability (design §5): only when a role is supervised.
+  // Probe monitor daemon-API reachability only when a role is supervised.
   // /state-dir is unauthenticated (liveness); /identities exercises the token so a
   // shared-mode misconfig (401) surfaces here rather than as a silent deaf monitor.
   const monitorProfiles = resolveMonitorProfiles(roles);

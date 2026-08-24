@@ -652,3 +652,169 @@ describe('ScheduledLoopManager strict cadence', () => {
     expect(readFileSync(join(dir, '.scheduled-loops.json'), 'utf8')).not.toContain('CANARY_CORRUPT_BODY');
   });
 });
+
+/**
+ * FLEET-005. Two paths dropped a due occurrence under different rules: `poll`
+ * ran a tick up to a full interval late, while the restart path dropped
+ * anything already due however recently. These pin the tolerance to one rule
+ * and pin the backlog to one run, not a burst.
+ */
+describe('ScheduledLoopManager missed occurrences', () => {
+  function restart(dir: string, now: number, definitions = [definition()]) {
+    const session = new FakeSession();
+    const timers: Array<{ callback: () => void; ms: number; cleared: boolean }> = [];
+    const logs: string[] = [];
+    let current = now;
+    const arbiter = new RoleTurnArbiter(session);
+    const manager = new ScheduledLoopManager('Coordinator', definitions, dir, arbiter, {
+      now: () => current,
+      setTimer: (callback, ms) => { const timer = { callback, ms, cleared: false }; timers.push(timer); return timer; },
+      clearTimer: timer => { (timer as { cleared: boolean }).cleared = true; },
+      log: line => logs.push(line),
+    });
+    return {
+      manager, session, arbiter, timers, logs,
+      setNow: (value: number) => { current = value; },
+      live: () => timers.filter(timer => !timer.cleared),
+    };
+  }
+
+  /** A role stopped at 0 with its first occurrence nominally due at 60s. */
+  function stoppedAtOrigin(definitions = [definition()]) {
+    const first = setup(definitions);
+    first.manager.start();
+    return first;
+  }
+
+  it('runs an occurrence that came due while the role was restarting', async () => {
+    const first = stoppedAtOrigin();
+    await first.manager.stop();
+
+    // Ten seconds late against a sixty-second interval: a manager that had
+    // stayed up would have run this, so a restart must not lose it.
+    const late = restart(first.dir, 70_000);
+    late.manager.start();
+    expect(late.manager.status().loops.health.counts.skippedMissed).toBe(0);
+    expect(late.live().at(-1)?.ms).toBe(0);
+
+    await late.manager.poll();
+    expect(late.session.prompts).toHaveLength(1);
+    expect(late.session.prompts[0].text).toContain('scheduled_at: 1970-01-01T00:01:00.000Z');
+    expect(late.session.prompts[0].text).toContain('started_late_by_ms: 10000');
+    expect(late.manager.status().loops.health).toMatchObject({
+      lastOutcome: 'running', counts: { started: 1, skipped: 0, skippedMissed: 0 },
+    });
+  });
+
+  it('keeps nominal cadence after running a restart-delayed occurrence late', async () => {
+    const first = stoppedAtOrigin();
+    await first.manager.stop();
+    const late = restart(first.dir, 70_000);
+    late.manager.start();
+    await late.manager.poll();
+    late.session.finish({ accepted: true, outcome: 'completed', succeeded: true });
+    await new Promise(resolve => setImmediate(resolve));
+
+    // The cursor advanced from the nominal time, not from when the late run
+    // happened, so lateness does not drag the phase forward.
+    expect(late.manager.status().loops.health.nextDueAt).toBe('1970-01-01T00:02:00.000Z');
+    late.setNow(120_000);
+    await late.manager.poll();
+    expect(late.session.prompts).toHaveLength(2);
+    expect(late.manager.status().loops.health.counts).toMatchObject({
+      started: 2, completed: 1, skipped: 0,
+    });
+  });
+
+  it('coalesces a long outage into one skip and one run, never a burst', async () => {
+    const first = stoppedAtOrigin();
+    await first.manager.stop();
+
+    // A hundred and one occurrences came and went while the role was down.
+    const outage = restart(first.dir, 6_060_000);
+    outage.manager.start();
+    expect(outage.session.prompts).toHaveLength(0);
+    expect(outage.manager.status().loops.health.counts).toMatchObject({
+      started: 0, skipped: 101, skippedMissed: 101,
+    });
+    expect(outage.manager.status().loops.health.nextDueAt).toBe('1970-01-01T01:42:00.000Z');
+
+    // The decisive assertion: the surviving occurrence is one run, and polling
+    // again immediately produces no second one.
+    outage.setNow(6_120_000);
+    await outage.manager.poll();
+    expect(outage.session.prompts).toHaveLength(1);
+    await outage.manager.poll();
+    expect(outage.session.prompts).toHaveLength(1);
+    expect(outage.manager.status().loops.health.counts.started).toBe(1);
+  });
+
+  it('tells the first run after an outage how long the gap was, then clears it', async () => {
+    const first = stoppedAtOrigin();
+    await first.manager.stop();
+    const outage = restart(first.dir, 6_060_000);
+    outage.manager.start();
+    expect(outage.manager.status().loops.health.missedGap).toMatchObject({
+      count: 101,
+      fromAt: '1970-01-01T00:01:00.000Z',
+      throughAt: '1970-01-01T01:41:00.000Z',
+      detectedAt: '1970-01-01T01:41:00.000Z',
+    });
+    expect(outage.logs.join('\n')).toContain('skipped_missed count=101');
+
+    outage.setNow(6_120_000);
+    await outage.manager.poll();
+    const text = outage.session.prompts[0].text;
+    expect(text).toContain('missed_occurrences: 101');
+    expect(text).toContain('missed_window: 1970-01-01T00:01:00.000Z..1970-01-01T01:41:00.000Z');
+    expect(text).toContain('missed_gap_ms: 6000000');
+
+    // Reported once: the next pass is not told about an outage it already knows.
+    expect(outage.manager.status().loops.health.missedGap).toBeNull();
+    outage.session.finish({ accepted: true, outcome: 'completed', succeeded: true });
+    await new Promise(resolve => setImmediate(resolve));
+    outage.setNow(6_180_000);
+    await outage.manager.poll();
+    expect(outage.session.prompts[1].text).not.toContain('missed_occurrences');
+  });
+
+  it('holds the gap when the run that would report it is skipped_busy', async () => {
+    const first = stoppedAtOrigin();
+    await first.manager.stop();
+    const outage = restart(first.dir, 6_060_000);
+    outage.manager.start();
+
+    // The role is working, so the catch-up is refused — correct behaviour, but
+    // it reported the outage to nobody, so the gap has to survive it.
+    await outage.arbiter.queuePrompt('owner', { origin: { kind: 'owner', requestId: 'r' } });
+    outage.setNow(6_120_000);
+    await outage.manager.poll();
+    expect(outage.manager.status().loops.health).toMatchObject({
+      lastOutcome: 'skipped_busy', counts: { skippedBusy: 1 },
+    });
+    expect(outage.manager.status().loops.health.missedGap).toMatchObject({ count: 101 });
+
+    outage.session.finish({ accepted: true, outcome: 'completed', succeeded: true });
+    await new Promise(resolve => setImmediate(resolve));
+    outage.setNow(6_180_000);
+    await outage.manager.poll();
+    expect(outage.session.prompts.at(-1)!.text).toContain('missed_occurrences: 101');
+  });
+
+  it('merges successive outages into one window rather than forgetting the earlier', async () => {
+    const first = stoppedAtOrigin();
+    await first.manager.stop();
+    const one = restart(first.dir, 180_000);
+    one.manager.start();
+    expect(one.manager.status().loops.health.missedGap).toMatchObject({
+      count: 3, fromAt: '1970-01-01T00:01:00.000Z', throughAt: '1970-01-01T00:03:00.000Z',
+    });
+    await one.manager.stop();
+
+    const two = restart(first.dir, 360_000);
+    two.manager.start();
+    expect(two.manager.status().loops.health.missedGap).toMatchObject({
+      count: 6, fromAt: '1970-01-01T00:01:00.000Z', throughAt: '1970-01-01T00:06:00.000Z',
+    });
+  });
+});

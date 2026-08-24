@@ -36,7 +36,7 @@ const wd = {
   alertCooldownMs: 3_600_000, sourceFile: 'f',
 };
 
-it('backs off 1x, 2x, 4x capped at 1h (spec §3)', () => {
+it('backs off 1x, 2x, 4x capped at 1h', () => {
   expect(watchdogBackoffMs(600_000, 0)).toBe(600_000);
   expect(watchdogBackoffMs(600_000, 1)).toBe(600_000);
   expect(watchdogBackoffMs(600_000, 2)).toBe(1_200_000);
@@ -77,7 +77,7 @@ describe('watchdog scheduler', () => {
     expect(readSchedulerState('nightwatch').consecutiveFailures).toBe(2);
   });
 
-  it('holds down after 3 consecutive failures and alerts once (spec §3, §5.5)', async () => {
+  it('holds down after 3 consecutive failures and alerts once', async () => {
     const deps = world({ results: ['error', 'error', 'error'] });
     await runWatchdogLoop(wd as never, deps as never);
     const s = readSchedulerState('nightwatch');
@@ -96,7 +96,7 @@ describe('watchdog scheduler', () => {
     expect(polls).toBeGreaterThanOrEqual(2);          // never invoked runOnceFor a 4th time
   });
 
-  it('a due tick with the lock held records skipped_overlap and does not count as failure (acceptance 4)', async () => {
+  it('a due tick with the lock held records skipped_overlap and does not count as failure', async () => {
     acquireRunLock('nightwatch');
     const deps = world({ results: ['ok'] });
     deps.shouldStop = () => listRuns('nightwatch').length >= 1;
@@ -120,7 +120,7 @@ describe('watchdog scheduler', () => {
     expect(readSchedulerState('nightwatch').heldDown).toBe(false);
   });
 
-  it('a lock-primitive throw (acquire) counts as a failed tick and the loop survives (review #1)', async () => {
+  it('a lock-primitive throw (acquire) counts as a failed tick and the loop survives', async () => {
     const deps = world({ results: ['ok', 'ok', 'ok'] });   // safety net only; should never be consumed
     let attempts = 0;
     (deps as unknown as { locks: { acquire(name: string): boolean; release(name: string): void } }).locks = {
@@ -137,13 +137,13 @@ describe('watchdog scheduler', () => {
     expect(s.lastError).toBe('EACCES: lock dir');
   });
 
-  it('the tick that transitions into hold-down sleeps heldPollMs, not the backoff delay (review #2)', async () => {
+  it('the tick that transitions into hold-down sleeps heldPollMs, not the backoff delay', async () => {
     const deps = world({ results: ['error', 'error', 'error'] });
     await runWatchdogLoop(wd as never, deps as never);
     expect(deps.sleeps[2]).toBe(5_000);   // would be 2_400_000 (4x backoff) pre-fix
   });
 
-  it('a skip tick during an active failure streak keeps the backoff cadence, not the raw interval (review #3, pinned deviation)', async () => {
+  it('a skip tick during an active failure streak keeps the backoff cadence, not the raw interval', async () => {
     writeSchedulerState('nightwatch', { version: 1, consecutiveFailures: 2, heldDown: false });
     acquireRunLock('nightwatch');
     const deps = world({ results: [] });
@@ -154,7 +154,7 @@ describe('watchdog scheduler', () => {
     expect(readSchedulerState('nightwatch').consecutiveFailures).toBe(2);
   });
 
-  it('three consecutive thrown runs also trip the hold-down circuit, proving throws count as failures (review #4)', async () => {
+  it('three consecutive thrown runs also trip the hold-down circuit, proving throws count as failures', async () => {
     const deps = world({ results: ['throw', 'throw', 'throw'] });
     await runWatchdogLoop(wd as never, deps as never);
     const s = readSchedulerState('nightwatch');
@@ -163,7 +163,7 @@ describe('watchdog scheduler', () => {
     expect(deps.alerts).toHaveLength(1);
   });
 
-  it('a hold-down transition with ledger.heldDownAlerted already true fires no alert (durable "once per state change", spec §5.5)', async () => {
+  it('a hold-down transition with ledger.heldDownAlerted already true fires no duplicate alert', async () => {
     writeLedger('nightwatch', { version: 1, open: {}, heldDownAlerted: true });
     const deps = world({ results: ['error', 'error', 'error'] });
     await runWatchdogLoop(wd as never, deps as never);
@@ -201,7 +201,7 @@ describe('watchdog scheduler', () => {
   });
 });
 
-describe('runScheduler threads its loaded cfg through to run + notifier deps (final review #1)', () => {
+describe('runScheduler threads its loaded config through to run and notifier dependencies', () => {
   const cfgPath = () => join(dir, 'fleet.yaml');
   const writeCfgFile = () => writeFileSync(cfgPath(),
     'roles:\n  Alice: {}\nwatchdogs:\n  nightwatch: { coordinator: FleetCoordinator }\n');
@@ -258,7 +258,7 @@ describe('runScheduler threads its loaded cfg through to run + notifier deps (fi
   });
 });
 
-describe('runScheduler recovers a run lock at startup, but only when it is demonstrably stale (finding #2)', () => {
+describe('runScheduler recovers a run lock at startup only when it is demonstrably stale', () => {
   const writeCfg = () => writeFileSync(join(dir, 'fleet.yaml'),
     'roles:\n  Alice: {}\nwatchdogs:\n  nightwatch: { coordinator: FleetCoordinator }\n');
 
@@ -319,7 +319,7 @@ describe('runScheduler recovers a run lock at startup, but only when it is demon
   });
 });
 
-describe('resetSchedulerState reclaims the run lock too, but only if stale (final review #2b, tightened by finding #2)', () => {
+describe('resetSchedulerState reclaims the run lock only when it is stale', () => {
   it('an operator restart of a held-down watchdog clears a STALE lock, not just the failure/hold-down state', () => {
     const lockDir = join(watchdogDir('nightwatch'), '.run-lock');
     mkdirSync(lockDir, { recursive: true });

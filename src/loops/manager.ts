@@ -2,8 +2,8 @@ import { randomUUID } from 'node:crypto';
 
 import type { ResolvedRoleLoop } from './config.js';
 import {
-  ScheduledLoopStateStore, deterministicJitter, increment, type LoopRuntimeState,
-  type ScheduledLoopsFile, type StateWriter,
+  ScheduledLoopStateStore, deterministicJitter, increment, type LoopMissedGap,
+  type LoopRuntimeState, type ScheduledLoopsFile, type StateWriter,
 } from './state.js';
 import { RoleTurnArbiter } from '../session/arbiter.js';
 import type { TurnResult } from '../session/types.js';
@@ -74,7 +74,7 @@ export class ScheduledLoopManager implements ScheduledLoopManagerHandle {
   }
 
   start(): void {
-    if (!this.store.fresh) this.skipRestartMisses();
+    if (!this.store.fresh) this.skipRestartBacklog();
     this.schedule();
   }
 
@@ -175,10 +175,15 @@ export class ScheduledLoopManager implements ScheduledLoopManagerHandle {
   ): Promise<LoopActionResult> {
     const runId = `sl_${randomUUID()}`;
     const origin = { kind: 'scheduled-loop' as const, loop: definition.name, runId };
-    const prompt = this.envelope(definition, runId, scheduledAt);
+    // The gap is read here and cleared only if the turn is actually admitted:
+    // an attempt that ends `skipped_busy` or `unavailable` reported it to
+    // nobody, so it has to still be there for the attempt that succeeds.
+    const gap = state.missedGap;
+    const prompt = this.envelope(definition, runId, scheduledAt, gap);
     let claimed = false;
     const result = await this.arbiter.tryScheduled(prompt, origin, () => {
       claimed = true;
+      state.missedGap = null;
       state.activeRunId = runId;
       state.lastRunId = runId;
       state.lastStartedAt = new Date(this.deps.now()).toISOString();
@@ -301,7 +306,15 @@ export class ScheduledLoopManager implements ScheduledLoopManagerHandle {
       this.role, definition.name, next, definition.jitterMs)).toISOString();
   }
 
+  /**
+   * Coalesce a backlog into one skip. The counters alone say how many
+   * occurrences were lost but never when or for how long, so the window is
+   * recorded too and carried on the state until a run is actually told about it
+   * — a dropped pass has to stay visible to the next one, not just to whoever
+   * was reading the log at the time.
+   */
   private skipMissed(definition: ResolvedRoleLoop, state: LoopRuntimeState, now: number): void {
+    const from = state.nextScheduledAt;
     let missed = 0;
     while (Date.parse(state.nextDueAt) <= now) {
       this.advance(definition, state);
@@ -311,15 +324,44 @@ export class ScheduledLoopManager implements ScheduledLoopManagerHandle {
     state.counts.skippedMissed = increment(state.counts.skippedMissed, missed);
     state.lastOutcome = 'skipped_missed';
     state.lastFinishedAt = new Date(now).toISOString();
+    // Successive outages before any run lands merge into one gap: the earliest
+    // start wins, so the window always spans the whole silence.
+    const previous = state.missedGap;
+    state.missedGap = {
+      count: increment(previous?.count ?? 0, missed),
+      fromAt: previous?.fromAt ?? from,
+      throughAt: state.lastScheduledAt ?? from,
+      detectedAt: new Date(now).toISOString(),
+    };
     this.store.persist();
-    this.deps.log(`[${this.role}] loop ${definition.name} skipped_missed count=${missed}`);
+    this.deps.log(`[${this.role}] loop ${definition.name} skipped_missed count=${missed} `
+      + `gap=${from}..${state.missedGap.throughAt} `
+      + `unreported=${state.missedGap.count}`);
   }
 
-  private skipRestartMisses(): void {
+  /**
+   * Restart is not, by itself, a reason to lose an occurrence a running manager
+   * would still have run. `poll` tolerates lateness up to one full interval and
+   * runs the tick late; this path used to drop anything already due however
+   * recently, so a role restarted seconds after its own tick came due lost it
+   * outright. For an oversight role that is precisely the pass which would have
+   * recorded why it restarted, so the failure erased its own witness.
+   *
+   * The tolerance is the only thing shared with `poll`. A backlog at least one
+   * interval deep is still coalesced into a single skip and never replayed —
+   * after a long outage exactly one occurrence survives, and `schedule` then
+   * arms it through the ordinary path rather than firing a burst here.
+   *
+   * Running the survivor late cannot outpace the configured cadence: `advance`
+   * moves the cursor by exactly one `intervalMs` per occurrence from the nominal
+   * time, so a loop that keeps restarting still runs at most once per interval.
+   */
+  private skipRestartBacklog(): void {
     const now = this.deps.now();
     for (const definition of this.definitions.values()) {
       const state = this.store.state.loops[definition.name];
-      if (definition.enabled && !state.operatorDisabled && Date.parse(state.nextDueAt) <= now)
+      if (definition.enabled && !state.operatorDisabled
+          && now >= Date.parse(state.nextDueAt) + definition.intervalMs)
         this.skipMissed(definition, state, now);
     }
   }
@@ -378,17 +420,41 @@ export class ScheduledLoopManager implements ScheduledLoopManagerHandle {
     this.arm(backoffMs(this.pollFailures));
   }
 
-  private envelope(definition: ResolvedRoleLoop, runId: string, scheduledAt: number): string {
+  /**
+   * The envelope is the only channel a scheduled pass has for learning about
+   * the passes that did not happen. A gap stated here is what lets an oversight
+   * role report its own outage instead of resuming as if nothing was missed.
+   */
+  private envelope(
+    definition: ResolvedRoleLoop, runId: string, scheduledAt: number,
+    gap: LoopMissedGap | null,
+  ): string {
+    const lateBy = Math.max(0, this.deps.now() - scheduledAt);
     return [
       '[fleet-loop]',
       `loop: ${definition.name}`,
       `run: ${runId}`,
       `scheduled_at: ${new Date(scheduledAt).toISOString()}`,
+      ...(lateBy > 0 ? [`started_late_by_ms: ${lateBy}`] : []),
+      ...(gap ? [
+        `missed_occurrences: ${gap.count}`,
+        `missed_window: ${gap.fromAt}..${gap.throughAt}`,
+        `missed_gap_ms: ${Math.max(0, Date.parse(gap.detectedAt) - Date.parse(gap.fromAt))}`,
+      ] : []),
       'origin: local-trusted-config',
       '',
       'This is a scheduled internal maintenance turn, not an owner message and not ordinary ours mail.',
       'Perform one bounded pass. Do not wait for the next tick. Do not report to an owner unless your',
       'configured policy and an existing authenticated proactive-report route authorize a material report.',
+      // Same single route as the owner-request prompt, and for the same reason.
+      'To send a file, call ours `send_file` with the recipient and the path — to your owner-channel',
+      'identity if this role has one, otherwise directly to the contact who should receive it.',
+      'A file written anywhere else is not delivered and nothing will report that it was not.',
+      ...(gap ? ['',
+        'This loop did not run for the window above: those occurrences were coalesced away while the role',
+        'was unavailable, and this pass is the first since. Treat the gap as part of what you are reporting',
+        'on — it is the record of your own outage, and no later pass will be told about it.',
+      ] : []),
       '',
       definition.prompt,
     ].join('\n');

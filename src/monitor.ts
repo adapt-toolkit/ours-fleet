@@ -4,7 +4,7 @@ import { join } from 'node:path';
 import type { MonitorConfig, MonitorInterrupt, NotifyEventType } from './config.js';
 import { classifyFailureText, type FailureEvidence } from './model-recovery.js';
 
-// ─── The supervisor-owned message monitor (DESIGN-external-monitor §1, §3, §4) ──
+// ─── The supervisor-owned message monitor ───────────────────────────────────
 //
 // An in-process long-poll client of the ours daemon notification API, hosted by
 // the per-role runner (`runOnce`). It primes at the stream tip BEFORE the tmux
@@ -74,7 +74,7 @@ export interface MonitorDeps {
   onFailureEvidence?(evidence: FailureEvidence): boolean;
 }
 
-// Code constants (not config — YAGNI, design §2).
+// Code constants rather than user configuration.
 const DEFAULT_PORT = 3050;
 // The daemon normally holds for 25s, but that value is operator-configurable
 // and synchronous daemon work can delay the response. The former 35s timer
@@ -307,7 +307,7 @@ const plural = (n: number, one: string, many = one + 's') => (n === 1 ? one : ma
 /**
  * Summarize a (coalesced) batch of events into one content-free console line —
  * count + senders + ids, ending in the call to action. Falls back to compact
- * counts when a burst would blow past the length cap (design §3, edge: burst).
+ * counts when a burst would exceed the length cap.
  */
 export function formatNotificationLine(events: NotifyEvent[]): string {
   const of = (t: string) => events.filter(e => e.event === t);
@@ -343,7 +343,7 @@ export function formatNotificationLine(events: NotifyEvent[]): string {
   return `${PREFIX} ${compact} — run get_messages`;
 }
 
-// ─── Modal-dialog detection (design §3.2, refined empirically) ────────────────
+// ─── Modal-dialog detection, refined empirically ─────────────────────────────
 //
 // `❯` is Claude Code's ordinary composer prompt, so it is on screen in nearly
 // every capture. Testing for it *anywhere* in the pane therefore says nothing;
@@ -399,7 +399,7 @@ export function looksModal(pane: string): boolean {
  * Heuristic: did the turn shown in this pane TERMINATE in an API-level error?
  * Claude Code renders a failed turn's tail as an `API Error:` line (a Usage-Policy
  * refusal, a 4xx, etc.). We scan a generous tail window so the marker survives a
- * trailing idle composer redrawn beneath it (design §3.2, refine empirically).
+ * trailing idle composer redrawn beneath it; refine empirically.
  * The N-consecutive threshold in the Monitor debounces the odd false match.
  */
 export function looksApiError(pane: string): boolean {

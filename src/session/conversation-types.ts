@@ -1,12 +1,12 @@
 import type { PromptOrigin, TurnCancellationSource, TurnOutcome } from './types.js';
 
 /**
- * Durable conversation domain schema (ACP web console, spec §5.2).
+ * Durable conversation domain schema for the ACP web console.
  *
  * `SessionEvent` in ./types.js remains the compact diagnostic projection; the
  * types here describe the durable per-role conversation ledger. Nothing in this
  * file touches the wire: ACP updates are reduced into these shapes by the
- * normalizer, and the store (phase 1) assigns `seq`/`eventId`/timestamps.
+ * normalizer, and the store assigns `seq`/`eventId`/timestamps.
  */
 
 export type ConversationEventKind =
@@ -75,11 +75,35 @@ export interface CappedText {
   bytes: number;
   truncated?: true;
   digest?: string;
+  /** Bytes omitted from the front when the retained fragment is a tail. */
+  omittedPrefixBytes?: number;
+  /** The retained tail starts inside one logical line because that line alone exceeded the cap. */
+  startsMidLine?: true;
+}
+
+/** A path kept as a UTF-8-safe tail, with additive provenance only when capped. */
+export interface BoundedPath {
+  path: string;
+  pathBytes?: number;
+  pathTruncated?: true;
+  pathDigest?: string;
+  pathOmittedPrefixBytes?: number;
 }
 
 export type NormalizedToolContent =
   | { type: 'content'; content: NormalizedContentBlock }
-  | { type: 'diff'; path: string; newText: CappedText; oldText?: CappedText }
+  | BoundedPath & {
+      type: 'diff';
+      newText: CappedText;
+      oldText?: CappedText;
+      /** Additive provenance for oversized snapshot diffs reduced to their changed region. */
+      operation?: 'append' | 'edit' | 'delete' | 'noop' | 'replace';
+      beforeBytes?: number;
+      afterBytes?: number;
+      commonPrefixBytes?: number;
+      commonSuffixBytes?: number;
+      bounded?: true;
+    }
   /** A tool-owned display terminal reference — never a PTY attachment. */
   | { type: 'terminal'; terminalId: string };
 
@@ -130,7 +154,7 @@ export interface ToolUpsertPayload {
   kind?: string;
   status?: string;
   content?: NormalizedToolContent[];
-  locations?: Array<{ path: string; line?: number }>;
+  locations?: Array<BoundedPath & { line?: number }>;
   rawInput?: BoundedJson;
   rawOutput?: BoundedJson;
 }
@@ -160,6 +184,8 @@ export interface UnsupportedPayload {
   /** The wire discriminant (or 'unknown' when even that was absent). */
   sessionUpdate: string;
   bytes: number;
+  /** Digest of the omitted original/normalized representation when it was bounded. */
+  digest?: string;
   /** Sanitized JSON preview, capped; enough to diagnose, never to exhaust. */
   preview?: string;
 }
@@ -275,7 +301,7 @@ export interface ConversationEventV1 {
   adapterMeta?: AdapterMeta[];
 }
 
-// ── Browser commands and receipts (phase 1 transport contracts) ──────────────
+// ── Browser commands and receipt transport contracts ────────────────────────
 
 export interface SubmitPromptCommand {
   /** Idempotency-Key / clientRequestId. Reuse with a different body is a conflict. */

@@ -188,7 +188,7 @@ describe('replaceFileAtomically', () => {
   });
 });
 
-describe('concurrent pre-trust across processes (6.1)', () => {
+describe('concurrent pre-trust across processes', () => {
   it('ten processes trusting ten paths lose no entry and no operator state', async () => {
     const claudeJson = join(home, '.claude.json');
     // Pre-existing operator state that must survive untouched.

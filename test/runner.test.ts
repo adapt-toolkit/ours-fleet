@@ -9,9 +9,10 @@ import { execFileSync } from 'node:child_process';
 import { stringify } from 'yaml';
 import {
   runOnce, runTemp, runSupervised, buildPaneCommand, reserveLaunchSlot, readExitRecord,
-  readRestartLedger, resetRestartLedger, backoffFor, loadTempRole, RESTART_FAIL_THRESHOLD,
+  readRestartLedger, resetRestartLedger, writeRestartLedger, backoffFor, loadTempRole,
+  RESTART_FAIL_THRESHOLD, RUN_MARKER_FILE,
   TEMP_IDENTITY_CLOSE_DEBOUNCE_MS, TEMP_IDENTITY_POLL_MS,
-  isRecoverableTempStartupCancellation,
+  isRecoverableTempStartupCancellation, managedFleetProxyEnv,
   type AttemptResult, type RunnerDeps,
 } from '../src/runner.js';
 import {
@@ -29,6 +30,7 @@ import {
   OwnerBinderConflictError, OwnerBinderHandoffTimeoutError,
 } from '../src/owner-channel/binder.js';
 import { prepareTempSupervisor } from '../src/temp-lifecycle.js';
+import type { ResolvedRole } from '../src/config.js';
 
 let dir: string;
 beforeEach(() => {
@@ -162,6 +164,31 @@ describe('buildPaneCommand', () => {
       env: { ...process.env, NO_COLOR: 'parent' }, encoding: 'utf8',
     })).toBe('1|legacy');
   });
+
+  it('makes every supervised tmux harness a daemon client, never a daemon starter', () => {
+    const cmd = buildPaneCommand(
+      { argv: ['agent'], env: { OURS_AUTOSTART: '1' } },
+      { OURS_AUTOSTART: '1' }, '/tmp/es');
+    expect(cmd).toContain(`OURS_AUTOSTART='0'`);
+    expect(cmd).not.toContain(`OURS_AUTOSTART='1'`);
+  });
+});
+
+describe('managed fleet child environment', () => {
+  it('makes every supervised ACP harness a daemon client, never a daemon starter', () => {
+    const role = {
+      name: 'A', harness: 'fake', session: 'acp', identity: 'A', sourceFile: 'x',
+      permissions: { approval: 'ask', filesystem: 'workspace', unattended: 'deny' },
+      permissionsDeclared: false,
+      monitor: {
+        mode: 'fleet', enabled: true, wake_sources: [], batch_ms: 2_000,
+        inject: 'notification', interrupt: false, turn_fail_threshold: 3,
+      },
+      env: { OURS_AUTOSTART: '1' },
+    } satisfies ResolvedRole;
+    const env = managedFleetProxyEnv(role, '/state');
+    expect(env.OURS_AUTOSTART).toBe('0');
+  });
 });
 
 describe('runOnce isolation', () => {
@@ -286,6 +313,30 @@ describe('runOnce isolation', () => {
 });
 
 describe('runOnce', () => {
+  it('applies default lossless worklog rotation before launching the role', async () => {
+    writeCfg({ A: { harness: 'fake' } });
+    const d = agentDir('A');
+    mkdirSync(d, { recursive: true });
+    const original = 'HISTORICAL-START\n' + 'old line\n'.repeat(140_000)
+      + 'RESTART-CONTINUITY ž 🧪\n';
+    writeFileSync(join(d, 'WORKLOG.md'), original);
+    const { deps } = fakeWorld({ exitCode: '0', exitFile: join(d, '.exit-status') });
+
+    await runOnce('A', {}, deps);
+
+    const active = readFileSync(join(d, 'WORKLOG.md'), 'utf8');
+    expect(Buffer.byteLength(active)).toBeLessThanOrEqual(256 * 1024);
+    expect(active).toContain('RESTART-CONTINUITY ž 🧪');
+    const archive = readdirSync(d).find(name => /^WORKLOG\..+\.md$/.test(name));
+    expect(archive).toBeDefined();
+    expect(readFileSync(join(d, archive!), 'utf8')).toBe(original);
+    const provenance = JSON.parse(readFileSync(join(d, '.worklog-rotation.json'), 'utf8'));
+    expect(provenance).toMatchObject({
+      archive, archiveContainsFullSnapshot: true,
+      olderArchives: 'WORKLOG.archives', recentArchiveLimit: 12,
+    });
+  });
+
   it('upgrades legacy temp snapshots to explicit monitor ownership', () => {
     const d = agentDir('OldTemp', true);
     mkdirSync(d, { recursive: true });
@@ -377,9 +428,28 @@ describe('runOnce', () => {
     expect(readFileSync(join(d, '.session-id'), 'utf8').trim()).toBe('KEEP');
     expect(existsSync(join(d, '.booted'))).toBe(true);
   });
+
+  /**
+   * FleetRetrospector's `.booted` still read 07:05:43 after its 07:35:57
+   * restart, because `.booted` was only written on the fresh path. Any health
+   * check reading it reported the original boot for a role that had restarted.
+   */
+  it('stamps .booted on a resume attempt, not just the first boot', async () => {
+    writeCfg({ A: { harness: 'fake' } });
+    const d = agentDir('A'); mkdirSync(d, { recursive: true });
+    writeFileSync(join(d, '.session-id'), 'KEEP\n');
+    writeFileSync(join(d, '.booted'), '');            // an earlier boot's marker
+    const { deps } = fakeWorld({ exitCode: '137', lifeChecks: 30, exitFile: join(d, '.exit-status') });
+
+    const result = await runOnce('A', {}, deps);
+
+    expect(result.mode).toBe('resume');               // existence semantics preserved
+    const stamped = readFileSync(join(d, '.booted'), 'utf8').trim();
+    expect(stamped).toMatch(/^\d{4}-\d{2}-\d{2}T[\d:.]+Z resume$/);
+  });
 });
 
-describe('creation-time isolation reaches the FIRST launch (6.3)', () => {
+describe('creation-time isolation reaches the FIRST launch', () => {
   it("a role whose config carries `isolation` is sandbox-wrapped on its first start", async () => {
     // This is the property --isolation-file exists for: the very first process
     // is confined, not the one after the operator edits fleet.yaml.
@@ -394,7 +464,7 @@ describe('creation-time isolation reaches the FIRST launch (6.3)', () => {
   });
 });
 
-describe('exit classification (1.6)', () => {
+describe('exit classification', () => {
   const readRecord = (d: string) =>
     JSON.parse(readFileSync(join(d, '.exit-status'), 'utf8')) as { class: string; detail: string };
 
@@ -512,7 +582,7 @@ describe('exit classification (1.6)', () => {
   });
 });
 
-describe('runOnce ACP startup outcome (1.2)', () => {
+describe('runOnce ACP startup outcome', () => {
   const acpFixture = join(dirname(fileURLToPath(import.meta.url)), 'fixtures', 'acp-agent.mjs');
 
   /** The fake adapter, taught to launch the ACP fixture as its agent process. */
@@ -547,6 +617,60 @@ describe('runOnce ACP startup outcome (1.2)', () => {
   }
 
   beforeEach(() => { registerAdapter(acpAdapter); });
+
+  it('passes only provenance attached to the exact ACP launch into the session', async () => {
+    registerAdapter({
+      ...acpAdapter,
+      id: 'fake-acp-provenance',
+      buildAcpLaunch: () => ({
+        argv: ['fixture-acp'], env: {}, permissionMetadataSource: 'codex-acp',
+      }),
+    });
+    writeCfg({ A: {
+      harness: 'fake-acp-provenance', session: 'acp',
+      permissions: { approval: 'allow', filesystem: 'workspace', unattended: 'wait' },
+    } });
+    mkdirSync(agentDir('A'), { recursive: true });
+    const { deps } = acpDeps();
+    let observedSource: string | undefined;
+    let alive = true;
+    const fakeAcp: SessionHandle = {
+      backend: 'acp', pid: 4242,
+      isAlive: () => alive,
+      snapshot: () => ({ backend: 'acp', alive, readiness: 'idle' }),
+      queuePrompt: async (_text, options) => {
+        alive = false;
+        return {
+          promptId: 'startup', queuedBehind: 0, origin: options?.origin,
+          completion: Promise.resolve(turnResult(true, 'completed', 'end_turn')),
+        };
+      },
+      submitPrompt: async (text, options) =>
+        (await fakeAcp.queuePrompt(text, options)).completion,
+      interrupt: async () => ({ state: 'settled' }),
+      respondPermission: () => false,
+      eventsSince: () => [],
+      subscribe: () => () => {},
+      setControllerAttached: () => {},
+      exitResult: () => ({ version: 1, class: 'clean', code: 0, detail: 'test complete' }),
+      close: async () => { alive = false; },
+    };
+    const runnerDeps: Partial<RunnerDeps> = {
+      ...deps,
+      startAcpSession: async options => {
+        observedSource = options.permissionMetadataSource;
+        return fakeAcp;
+      },
+      createControlServer: () => ({
+        start: async () => {}, close: async () => {},
+        setFleetSpawner: () => {}, setOwnerChannel: () => {},
+        setConfigReloader: () => {}, setLoopManager: () => {},
+      }),
+    };
+
+    await runOnce('A', {}, runnerDeps);
+    expect(observedSource).toBe('codex-acp');
+  });
 
   it('a refused startup prompt fails the role instead of logging it up', async () => {
     writeCfg({ A: {
@@ -701,7 +825,7 @@ describe('runOnce ACP startup outcome (1.2)', () => {
     expect(events.some(e => e.kind === 'agent_text' && e.text === 'mode:acceptEdits')).toBe(true);
   });
 
-  it('warns once at startup that an unattended role auto-denies (1.3)', async () => {
+  it('warns once at startup that an unattended role auto-denies', async () => {
     writeCfg({ A: {
       harness: 'fake-acp', session: 'acp',
       permissions: { approval: 'ask', filesystem: 'workspace', unattended: 'deny' },
@@ -716,7 +840,7 @@ describe('runOnce ACP startup outcome (1.2)', () => {
     expect(warnings[0]).toContain('reject_once');
   });
 
-  it('says nothing about auto-denial when the role waits instead (1.3)', async () => {
+  it('says nothing about auto-denial when the role waits instead', async () => {
     writeCfg({ A: {
       harness: 'fake-acp', session: 'acp',
       permissions: { approval: 'ask', filesystem: 'workspace', unattended: 'wait' },
@@ -729,7 +853,7 @@ describe('runOnce ACP startup outcome (1.2)', () => {
     expect(logs.some(l => l.includes('permission policy'))).toBe(false);
   });
 
-  it('records the ACP child\'s real exit, per class (1.6)', async () => {
+  it('records the ACP child\'s real exit, per class', async () => {
     for (const [code, cls, fresh] of [['0', 'clean', true], ['4', 'program-exit', false]] as const) {
       writeCfg({ A: {
         harness: 'fake-acp', session: 'acp',
@@ -750,7 +874,7 @@ describe('runOnce ACP startup outcome (1.2)', () => {
     }
   }, 20_000);
 
-  it('a floor-compliant role starts with ZERO permission prompts (2.1)', async () => {
+  it('a floor-compliant role starts with ZERO permission prompts', async () => {
     // The startup prompt makes the agent request a tool permission. A role whose
     // resolved permissions clear the floor must have it granted automatically —
     // nothing pending, nothing denied, and the turn completes.
@@ -1253,7 +1377,7 @@ describe('runTemp', () => {
   });
 });
 
-describe('restart-loop containment (3.2)', () => {
+describe('restart-loop containment', () => {
   /** A fake clock and a fake child, so the policy is tested, not the sessions. */
   function supervisorWorld(stateDir: string, opts: {
     /** Seconds each attempt "lasts", by attempt index. Last value repeats. */
@@ -1380,6 +1504,104 @@ describe('restart-loop containment (3.2)', () => {
     // Without the reset, 7 instant failures would have opened the circuit.
     expect(readRestartLedger(d).circuit).toBe('closed');
     expect(readRestartLedger(d).consecutiveImmediateFailures).toBe(2);
+  });
+
+  it('does not let near-threshold failures reset an active restart streak', async () => {
+    const d = setup();
+    // FleetCoordinator's 2026-08-16 loop crossed the adapter's 20s immediate
+    // boundary by small amounts between faster deaths. Each crossing used to
+    // erase the durable count, so this sequence could repeat forever at 1/5 or
+    // 2/5 despite never sustaining a useful session.
+    const w = supervisorWorld(d, {
+      durations: [17.3, 19.5, 20.3, 40.7, 32.3],
+      stopAfter: RESTART_FAIL_THRESHOLD,
+    });
+
+    const ledger = await runSupervised('A', {}, w.deps, w.attempt);
+
+    expect(w.attempts).toHaveLength(RESTART_FAIL_THRESHOLD);
+    expect(ledger.circuit).toBe('open');
+    expect(ledger.consecutiveImmediateFailures).toBe(RESTART_FAIL_THRESHOLD);
+    expect(w.sleeps).toEqual([2_000, 4_000, 8_000, 16_000]);
+  });
+
+  /**
+   * FleetRetrospector was OOM-killed at 07:35:49 on 2026-08-17 and restarted by
+   * systemd at 07:35:57. `.booted` still read 07:05:43 and the ledger still read
+   * `consecutiveImmediateFailures: 0, updatedAt: 07:05:40` — both indicators
+   * described the run that had died, because both are only written at attempt
+   * boundaries inside a living supervisor process.
+   */
+  it('records an abrupt termination the previous supervisor never survived to write', async () => {
+    const d = setup();
+    // A supervisor that was killed: its run marker is still on disk, owned by a
+    // pid that is not ours.
+    writeFileSync(join(d, RUN_MARKER_FILE), JSON.stringify({
+      version: 1, pid: process.pid + 1, startedAt: '2026-08-17T07:05:40.000Z',
+    }) + '\n');
+    writeRestartLedger(d, {
+      version: 1, consecutiveImmediateFailures: 0, lastReason: '', nextDelayMs: 0,
+      resumeDiscarded: false, circuit: 'closed', updatedAt: '2026-08-17T07:05:40.293Z',
+    });
+
+    const w = supervisorWorld(d, { durations: [100], stopAfter: 1 });
+    await runSupervised('A', {}, w.deps, w.attempt);
+
+    const ledger = readRestartLedger(d);
+    expect(ledger.lastTermination?.class).toBe('abrupt');
+    expect(ledger.lastTermination?.runStartedAt).toBe('2026-08-17T07:05:40.000Z');
+    expect(ledger.abruptTerminations).toBe(1);
+    expect(ledger.updatedAt).not.toBe('2026-08-17T07:05:40.293Z');
+    expect(w.logs.some(l => l.includes('ended abruptly'))).toBe(true);
+    // A long, healthy attempt clears the failure streak — and must not erase
+    // the fact that the role died and came back.
+    expect(ledger.consecutiveImmediateFailures).toBe(0);
+    expect(existsSync(join(d, RUN_MARKER_FILE))).toBe(false);   // orderly exit released it
+  });
+
+  it('reports a clean previous run when no marker was left behind', async () => {
+    const d = setup();
+    const w = supervisorWorld(d, { durations: [100], stopAfter: 1 });
+    await runSupervised('A', {}, w.deps, w.attempt);
+
+    const ledger = readRestartLedger(d);
+    expect(ledger.lastTermination?.class).toBe('clean');
+    expect(ledger.abruptTerminations ?? 0).toBe(0);
+  });
+
+  it('keeps the abrupt-termination record across an operator ledger reset', () => {
+    const d = setup();
+    writeRestartLedger(d, {
+      version: 1, consecutiveImmediateFailures: 3, lastReason: 'boom', nextDelayMs: 8_000,
+      resumeDiscarded: false, circuit: 'open', updatedAt: '2026-08-17T07:35:57.000Z',
+      abruptTerminations: 2,
+      lastTermination: {
+        class: 'abrupt', detail: 'killed', observedAt: '2026-08-17T07:35:57.000Z',
+      },
+    });
+
+    resetRestartLedger(d);
+
+    const ledger = readRestartLedger(d);
+    expect(ledger.circuit).toBe('closed');
+    expect(ledger.consecutiveImmediateFailures).toBe(0);
+    expect(ledger.abruptTerminations).toBe(2);
+    expect(ledger.lastTermination?.class).toBe('abrupt');
+  });
+
+  it('closes an active streak after the full recovery window', async () => {
+    const d = setup();
+    // fake's 20s fast-fail threshold × five tolerated attempts = 100s.
+    const w = supervisorWorld(d, {
+      durations: [17, 100, 17], rotatesAt: [0], stopAfter: 3,
+    });
+
+    await runSupervised('A', {}, w.deps, w.attempt);
+
+    expect(readRestartLedger(d)).toMatchObject({
+      circuit: 'closed', consecutiveImmediateFailures: 1, resumeDiscarded: false,
+    });
+    expect(w.attempts.map(a => a.allowResumeRotation)).toEqual([true, false, true]);
   });
 
   it('discards resume state at most once in a failure sequence', async () => {

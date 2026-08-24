@@ -28,7 +28,7 @@ export interface SupervisorBackend {
    * Ensure the role's unit exists and is enabled + started. Idempotent, and
    * EXPLICIT about whether it created the registration: rollback may only
    * remove what this transaction made, so "did I create this?" has to be
-   * answerable rather than assumed (6.2).
+   * answerable rather than assumed.
    */
   install(name: string, binPath: string): Promise<InstallOutcome>;
   start(name: string): Promise<void>;

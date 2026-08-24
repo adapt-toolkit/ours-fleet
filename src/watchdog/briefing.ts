@@ -6,8 +6,8 @@ import type { BriefingVocab } from '../harness/types.js';
 export interface WatchManifestRole { name: string; stateDir: string }
 
 /**
- * The fixed run manifest a watchdog run reads at `manifestPath` (7.3 §3, Task 7 writes it,
- * Task 12+ digest reads it back). It carries everything the run needs to identify itself in
+ * The fixed run manifest a watchdog run reads at `manifestPath`. It carries everything the
+ * run and digest reader need to identify the run in
  * report.json (`watchdog`, `run_id`, `started_at`) plus the suppression digest that makes
  * alerting idempotent across runs.
  */
@@ -24,7 +24,7 @@ export interface WatchdogBriefingOpts {
   vocabulary: BriefingVocab;
   /** What spawn actually established about the watchdog's ours identity (7.3, decision 3). */
   identityGuarantee: 'verified' | 'created' | 'unverified';
-  /** Raw prompt_file content, appended as extra focus — never a replacement (owner decision 1). */
+  /** Raw prompt_file content, appended as extra focus — never a replacement. */
   promptFocus?: string;
 }
 
@@ -59,8 +59,8 @@ function bindSection(
  * run): bind, observe-only rules, procedure, status vocabulary, evidence rules, alert rules,
  * report schema, and — if the watchdog configures one — an appended prompt_file focus.
  *
- * The contract is fixed for every watchdog (spec §5: "The schema is fixed for every watchdog,
- * including ones with a prompt_file; the override adds focus, never fields"), so every section
+ * The contract is fixed for every watchdog, including ones with a prompt_file; the override
+ * adds focus, never fields. Therefore every section
  * below is unconditional except the identity-guarantee wording and the trailing focus append.
  */
 export function generateWatchdogBriefing(opts: WatchdogBriefingOpts): string {
@@ -75,7 +75,7 @@ export function generateWatchdogBriefing(opts: WatchdogBriefingOpts): string {
   L.push('persists past writing your report.');
   L.push(...bindSection('## 1. Bind your identity', wd, v, guarantee));
 
-  // 2. Observe-only rules, verbatim (spec §1).
+  // 2. Observe-only rules.
   L.push('', '## 2. Observe-only — non-negotiable');
   L.push(
     'You observe and report. You never restart, stop, spawn or remove a role, never answer a ' +
@@ -111,13 +111,20 @@ export function generateWatchdogBriefing(opts: WatchdogBriefingOpts): string {
   L.push('   role, that role degrades to `unknown` — never guess `healthy`. `unknown` means the');
   L.push('   evidence is insufficient, not that the role is fine.');
 
-  // 4. Status vocabulary — spec §4 definitions, verbatim where quoted.
+  // 4. Status vocabulary and definitions.
   L.push('', '## 4. Status vocabulary (fixed)');
   L.push(`interval = ${formatDuration(wd.intervalMs)} — thresholds below are multiples of this.`);
   L.push('');
   L.push('- `healthy` — alive, on-briefing, recent progress.');
   L.push('- `idle` — alive, nothing assigned or nothing to do. Not an anomaly.');
   L.push('- `stale` = no worklog append and no console progress for ≥ 3 intervals.');
+  L.push('');
+  L.push('`session.readiness` from `ours-fleet status` is TURN OCCUPANCY, not activity: a mail');
+  L.push('wake delivered by ACP steering runs an entire turn while readiness stays `idle`. Never');
+  L.push('report `idle` or `stale` from `readiness=idle` alone — corroborate with the');
+  L.push('`activity:` line of the same `status` output (`active` means the agent is working),');
+  L.push('the worklog, or `ours-fleet peek`. `activity: unobservable` is missing evidence, not');
+  L.push('an idle agent.');
   L.push('- `blocked` = waiting on a permission/prompt/modal longer than one interval.');
   L.push('- `off_briefing` — activity contradicts the briefing (wrong repo, out-of-scope work,');
   L.push('  ignored routine).');
@@ -134,7 +141,7 @@ export function generateWatchdogBriefing(opts: WatchdogBriefingOpts): string {
   L.push('values, tokens, file contents beyond quoted evidence, or a full pane dump — quote only');
   L.push('the specific line(s) that support the finding.');
 
-  // 6. Alert rules — spec §5 rules 1-4, plus the digest-authoritative sentence, verbatim.
+  // 6. Alert rules plus the digest-authoritative sentence.
   L.push('', '## 6. Alert rules');
   L.push('1. Alert on a finding that is **new** (role+status not open) or **escalated** (e.g.');
   L.push('   `stale` → `blocked`).');
@@ -156,7 +163,7 @@ export function generateWatchdogBriefing(opts: WatchdogBriefingOpts): string {
     'set alerted:true and add an alerts[] entry for each. If nothing qualifies, send nothing.',
   );
 
-  // 7. Report schema — spec §5 example, plus the write-order sentence, verbatim.
+  // 7. Report schema plus the write-order sentence.
   L.push('', '## 7. Write your report');
   L.push('`report.json` has this fixed schema (`schema_version` is always the literal `1`;');
   L.push('`status` is `ok` when every role is `healthy`/`idle`, `anomalies` when any role is not,');

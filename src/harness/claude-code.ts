@@ -4,12 +4,23 @@ import { home } from '../paths.js';
 import { realExec, type Exec } from '../exec.js';
 import type { ResolvedRole } from '../config.js';
 import type {
-  HarnessAdapter, RoleDirs, SessionPrep, SessionState, Launch, UnattendedCapability, ValidationError,
+  AcpMcpServer, HarnessAdapter, RoleDirs, SessionPrep, SessionState, Launch, UnattendedCapability,
+  ValidationError,
 } from './types.js';
 import { registerAdapter } from './registry.js';
 import { replaceFileAtomically, withFileLock, type LockDeps } from '../atomic-file.js';
 import { harnessRuntimeDir } from '../isolation/policy.js';
 import { bundledAcpAgent } from './acp-agent.js';
+
+/** One entry of `harness_options.mcp_servers`, in `.mcp.json`'s own shape. */
+interface McpServerSpec {
+  type?: string;
+  command?: string;
+  args?: string[];
+  env?: Record<string, string>;
+  url?: string;
+  headers?: Record<string, string>;
+}
 
 interface ClaudeOptions {
   plugins?: Record<string, boolean>;
@@ -17,9 +28,106 @@ interface ClaudeOptions {
   mem_palace_midsession_autosave?: boolean;
   permission_mode?: string;
   effort?: string;
+  mcp_servers?: Record<string, McpServerSpec>;
+  mcp_servers_only?: boolean;
 }
-const OPTION_KEYS = ['plugins', 'mem_palace', 'mem_palace_midsession_autosave', 'permission_mode', 'effort'];
+const OPTION_KEYS = [
+  'plugins', 'mem_palace', 'mem_palace_midsession_autosave', 'permission_mode', 'effort',
+  'mcp_servers', 'mcp_servers_only',
+];
 const EFFORT_LEVELS = ['low', 'medium', 'high', 'xhigh', 'max'];
+/** `.mcp.json` server types. Absent means stdio, as the file format has it. */
+const MCP_SERVER_TYPES = ['stdio', 'http', 'sse'];
+
+/** A role that names its own ACP command runs a process fleet did not choose. */
+const customAcpCommand = (role: ResolvedRole): boolean =>
+  role.session === 'acp' && role.session_options?.acp?.command != null;
+
+/**
+ * Does this server set include the ours connector?
+ *
+ * Load-bearing, and the reason it is a check rather than a doc line:
+ * `mcp_servers_only` maps to `--strict-mcp-config`, which ignores EVERY other MCP
+ * configuration — project `.mcp.json`, user settings, and **plugins**. On a
+ * normal install the ours connector arrives as a plugin
+ * (`~/.claude/plugins/.../plugin.json` declares `ours`), so a role that turns
+ * strict mode on without re-declaring it loses `send_message` and `get_messages`
+ * and cannot report that it has: a mute agent looks exactly like a quiet one.
+ *
+ * Matched on the command line rather than the server's NAME, because the name is
+ * the operator's to choose and would make this trivially satisfiable by writing
+ * `ours:` above the wrong command.
+ */
+const declaresOursConnector = (servers: Record<string, McpServerSpec>): boolean =>
+  Object.values(servers).some(s =>
+    [s.command ?? '', ...(s.args ?? [])].some(part =>
+      /(^|[/\\])ours-mcp($|\s)|@ours\.network[/\\]mcp/.test(part)));
+
+/** Shape-check `harness_options.mcp_servers` against `.mcp.json`'s own rules. */
+function validateMcpServers(servers: unknown): ValidationError[] {
+  if (servers == null) return [];
+  const at = (k = '') => ({ path: `harness_options.mcp_servers${k}` });
+  if (typeof servers !== 'object' || Array.isArray(servers))
+    return [{ ...at(), message: 'must be a map of server name to server definition' }];
+  const entries = Object.entries(servers as Record<string, unknown>);
+  if (!entries.length)
+    return [{ ...at(), message: 'must declare at least one server, or be omitted' }];
+  const errors: ValidationError[] = [];
+  for (const [name, raw] of entries) {
+    const p = `.${name}`;
+    if (!/^[A-Za-z0-9_-]+$/.test(name)) {
+      errors.push({ ...at(p), message: 'server name must be [A-Za-z0-9_-]' });
+      continue;
+    }
+    if (raw == null || typeof raw !== 'object' || Array.isArray(raw)) {
+      errors.push({ ...at(p), message: 'must be a map' });
+      continue;
+    }
+    const s = raw as McpServerSpec;
+    if (s.type != null && !MCP_SERVER_TYPES.includes(s.type))
+      errors.push({ ...at(`${p}.type`), message: `must be one of: ${MCP_SERVER_TYPES.join(', ')}` });
+    const remote = s.type === 'http' || s.type === 'sse';
+    if (remote) {
+      if (typeof s.url !== 'string' || !s.url.trim())
+        errors.push({ ...at(`${p}.url`), message: `must be a non-empty URL for a ${s.type} server` });
+      if (s.command != null)
+        errors.push({ ...at(`${p}.command`), message: `must not be set for a ${s.type} server` });
+    } else {
+      if (typeof s.command !== 'string' || !s.command.trim())
+        errors.push({ ...at(`${p}.command`), message: 'must be a non-empty command for a stdio server' });
+      if (s.args != null && (!Array.isArray(s.args) || s.args.some(a => typeof a !== 'string')))
+        errors.push({ ...at(`${p}.args`), message: 'must be an array of strings' });
+      if (s.url != null)
+        errors.push({ ...at(`${p}.url`), message: 'must not be set for a stdio server' });
+    }
+    for (const key of ['env', 'headers'] as const) {
+      const v = s[key];
+      if (v == null) continue;
+      if (typeof v !== 'object' || Array.isArray(v)
+          || Object.values(v).some(x => typeof x !== 'string'))
+        errors.push({ ...at(`${p}.${key}`), message: 'must be a map of string to string' });
+    }
+  }
+  return errors;
+}
+
+/** `harness_options.mcp_servers` in ACP's `session/new` array shape. */
+function acpMcpServersFor(servers: Record<string, McpServerSpec> | undefined): AcpMcpServer[] {
+  if (!servers) return [];
+  // `env` and `headers` are REQUIRED arrays in the protocol, so they are always
+  // sent — empty when the role declared none.
+  const pairs = (r: Record<string, string> | undefined) =>
+    Object.entries(r ?? {}).map(([name, value]) => ({ name, value }));
+  return Object.entries(servers).map(([name, s]) => {
+    if (s.type === 'http' || s.type === 'sse')
+      return { name, type: s.type, url: s.url!, headers: pairs(s.headers) };
+    // Stdio carries NO `type` field: ACP's stdio variant is the one without it,
+    // and the bundled agent keys on exactly that (claude-agent-acp
+    // acp-agent.js:4058, `!("type" in server)`), so sending `type: 'stdio'`
+    // would drop the server on the floor.
+    return { name, command: s.command!, args: s.args ?? [], env: pairs(s.env) };
+  });
+}
 
 /** Claude Code's accepted --permission-mode values. */
 const PERMISSION_MODES = ['default', 'acceptEdits', 'plan', 'dontAsk', 'bypassPermissions'];
@@ -173,16 +281,50 @@ export function makeClaudeCodeAdapter(exec: Exec = realExec): HarnessAdapter {
       };
     },
 
-    validateOptions(opts: unknown): ValidationError[] {
+    validateOptions(opts: unknown, role?: ResolvedRole): ValidationError[] {
       if (opts == null) return [];
       if (typeof opts !== 'object' || Array.isArray(opts))
         return [{ path: 'harness_options', message: 'must be a map' }];
       const errors = Object.keys(opts)
         .filter(k => !OPTION_KEYS.includes(k))
         .map(k => ({ path: `harness_options.${k}`, message: `unknown option; allowed: ${OPTION_KEYS.join(', ')}` }));
-      const effort = (opts as ClaudeOptions).effort;
+      const o = opts as ClaudeOptions;
+      const effort = o.effort;
       if (effort != null && !EFFORT_LEVELS.includes(effort))
         errors.push({ path: 'harness_options.effort', message: `must be one of: ${EFFORT_LEVELS.join(', ')}` });
+      if (o.mcp_servers_only != null && typeof o.mcp_servers_only !== 'boolean')
+        errors.push({ path: 'harness_options.mcp_servers_only', message: 'must be a boolean' });
+      errors.push(...validateMcpServers(o.mcp_servers));
+      if (o.mcp_servers_only === true && !o.mcp_servers)
+        errors.push({
+          path: 'harness_options.mcp_servers_only',
+          message: 'requires harness_options.mcp_servers; on its own it would leave the role with no MCP servers at all',
+        });
+      // The muteness gate. Only when the declared set is otherwise well-formed —
+      // a shape error already told the operator to look here.
+      if (o.mcp_servers_only === true && o.mcp_servers && errors.length === 0
+          && !declaresOursConnector(o.mcp_servers))
+        errors.push({
+          path: 'harness_options.mcp_servers',
+          message: 'mcp_servers_only ignores every other MCP configuration, INCLUDING plugins — and the ours '
+            + 'connector is normally a plugin, so this role would have no send_message or get_messages and no way '
+            + 'to report that. Declare it explicitly, e.g. ours: { command: ours-mcp, args: [proxy] }',
+        });
+      // Session-aware refusals. Both options reach an ACP session through the
+      // bundled agent's `_meta` vocabulary, so a role that launches a DIFFERENT
+      // ACP agent cannot be promised either one. Refuse rather than send it and
+      // hope: silently dropping the config is the defect being fixed here.
+      if (role && customAcpCommand(role)) {
+        for (const key of ['plugins', 'mcp_servers', 'mcp_servers_only'] as const) {
+          if (o[key] == null) continue;
+          errors.push({
+            path: `harness_options.${key}`,
+            message: 'cannot be honoured with session_options.acp.command: it is delivered through the bundled '
+              + 'Claude ACP agent\'s _meta vocabulary, which another agent has no reason to read. Drop the '
+              + 'custom ACP command, or drop this option',
+          });
+        }
+      }
       return errors;
     },
 
@@ -201,22 +343,50 @@ export function makeClaudeCodeAdapter(exec: Exec = realExec): HarnessAdapter {
         CLAUDE_AUTOCOMPACT_PCT_OVERRIDE: String(autocompactPct(role)),
         MEMPALACE_HOOKS_AUTO_SAVE: 'false',
         MEMPALACE_MIDSESSION_AUTOSAVE: o.mem_palace_midsession_autosave ? 'true' : 'false',
+        // The role's identity, for the ours connector to bind at startup instead of
+        // the briefing telling the MODEL to call choose_identity. Both launches
+        // return `prep.env`, so this one line covers tmux and ACP alike.
+        //
+        // The bind the connector performs is PLAIN and fail-closed: it can never
+        // evict a live session, and a role whose identity does not exist yet simply
+        // boots unbound and falls through to the briefing's create-if-missing step.
+        // Nothing here may ever grow a force flag.
+        OURS_BIND_IDENTITY: role.identity,
       };
       if (!memPalace) env.MEMPALACE_DISABLED = 'true';
 
-      // Per-role harness runtime home (5.1). Created before sandbox entry so the
+      // Per-role harness runtime home. Created before sandbox entry so the
       // bind has something to mount; harmless for un-isolated roles.
       // Only a role that declares `isolation:` gets a sandbox, and only a
       // sandbox needs this directory to exist before entry.
       if (role.isolation) mkdirSync(harnessRuntimeDir(dirs.stateDir, 'claude'), { recursive: true });
 
       const argv: string[] = [];
+      let settingsOverlay: string | undefined;
       if (Object.keys(enabledPlugins).length) {
-        const overlay = join(dirs.stateDir, '.settings-overlay.json');
-        writeFileSync(overlay, JSON.stringify({ enabledPlugins }, null, 2));
-        argv.push('--settings', overlay);
+        settingsOverlay = join(dirs.stateDir, '.settings-overlay.json');
+        writeFileSync(settingsOverlay, JSON.stringify({ enabledPlugins }, null, 2));
+        argv.push('--settings', settingsOverlay);
       }
-      return { argv, env };
+
+      // `harness_options.mcp_servers` — the tmux delivery. `--mcp-config` ADDS the
+      // file's servers; `--strict-mcp-config` is what makes the set exclusive, and
+      // it is opt-in per role because it drops everything else the user has,
+      // plugins included (see `declaresOursConnector`).
+      let mcpConfigFile: string | undefined;
+      if (o.mcp_servers) {
+        mcpConfigFile = join(dirs.stateDir, '.mcp-config.json');
+        writeFileSync(
+          mcpConfigFile, JSON.stringify({ mcpServers: o.mcp_servers }, null, 2), { mode: 0o600 });
+        argv.push('--mcp-config', mcpConfigFile);
+        if (o.mcp_servers_only === true) argv.push('--strict-mcp-config');
+      }
+
+      return {
+        argv, env,
+        ...(settingsOverlay ? { settingsOverlay } : {}),
+        ...(mcpConfigFile ? { mcpConfigFile } : {}),
+      };
     },
 
     buildLaunch(role: ResolvedRole, mode: 'fresh' | 'resume', s: SessionState, prep: SessionPrep): Launch {
@@ -249,6 +419,46 @@ export function makeClaudeCodeAdapter(exec: Exec = realExec): HarnessAdapter {
     // backends cannot disagree about what a role's permissions translate to.
     acpPermissionModeId(role: ResolvedRole): string | undefined {
       return permissionMode(role);
+    },
+
+    /**
+     * Deliver, over ACP, the two things the tmux launch delivers as flags.
+     *
+     * `buildAcpLaunch` builds its own argv and cannot carry `prep.argv`: the
+     * process it launches is the ACP agent, not `claude`, and it takes none of
+     * claude's flags. That is why `harness_options.plugins` did nothing at all on
+     * an ACP role — the overlay was written and then dropped, and the mem-palace
+     * toggle rode `prep.env` and survived, so the failure was silent AND
+     * selective.
+     *
+     * `_meta.claudeCode.options` is the bundled agent's own passthrough into the
+     * Claude Agent SDK (@agentclientprotocol/claude-agent-acp, acp-agent.js:4092
+     * → the `options` object at :4144). `settings` takes the same overlay path
+     * `--settings` takes; `strictMcpConfig` is the SDK's spelling of
+     * `--strict-mcp-config`. Both are spread BEFORE the fields the agent forces,
+     * so neither is overwritten.
+     *
+     * ⚠ RETURNS NOTHING FOR A ROLE THAT NAMES ITS OWN ACP COMMAND. That process
+     * is not the bundled agent and has no reason to read this vocabulary; sending
+     * it anyway would be the silent drop again, one level down. `validateOptions`
+     * refuses those roles instead.
+     */
+    acpSessionMeta(role: ResolvedRole, prep: SessionPrep): Record<string, unknown> | undefined {
+      if (customAcpCommand(role)) return undefined;
+      const options: Record<string, unknown> = {};
+      if (prep.settingsOverlay) options.settings = prep.settingsOverlay;
+      if ((role.harness_options as ClaudeOptions | undefined)?.mcp_servers_only === true)
+        options.strictMcpConfig = true;
+      return Object.keys(options).length ? { claudeCode: { options } } : undefined;
+    },
+
+    /**
+     * The declared servers, in ACP's array shape. Sent on `session/new` and on
+     * resume/load, because the SDK builds its server set once per session and a
+     * resumed session that dropped them would quietly lose its tools.
+     */
+    acpMcpServers(role: ResolvedRole): AcpMcpServer[] {
+      return acpMcpServersFor((role.harness_options as ClaudeOptions | undefined)?.mcp_servers);
     },
 
     isolationPaths(_role: ResolvedRole, _dirs: RoleDirs) {

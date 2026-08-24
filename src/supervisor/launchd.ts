@@ -11,7 +11,7 @@ export const labelFor = (name: string) => `network.ours.fleet.${name}`;
  * asked of it cannot drift apart. They are not the same question:
  *
  * - `liveness` asks "does this role's context still exist" — a loaded job counts,
- *   including one waiting between KeepAlive restarts (1.1);
+ *   including one waiting between KeepAlive restarts;
  * - `install` asks "did the job I just bootstrapped actually START" — for which a
  *   job that is loaded, not running, and has already exited once is a failure.
  *
@@ -55,7 +55,7 @@ function plist(name: string, binPath: string): string {
   <key>Label</key><string>${labelFor(name)}</string>
   <key>ProgramArguments</key>
   <array><string>${binPath}</string><string>_run</string><string>${name}</string></array>
-  <!-- The runner owns the child-session restart loop (3.2). launchd must only
+  <!-- The runner owns the child-session restart loop. launchd must only
        recover the runner PROCESS crashing: a bare KeepAlive would resume the
        uncounted relaunch loop and restart a deliberately held-down agent. -->
   <key>KeepAlive</key><dict><key>SuccessfulExit</key><false/></dict>
@@ -83,7 +83,7 @@ function plist(name: string, binPath: string): string {
  * - loaded and running, or waiting for a KeepAlive restart, or not running with
  *   nothing exited yet (it simply has not been spawned yet — the asynchrony
  *   RunAtLoad introduces) → NOT a failure;
- * - an unreadable probe → `unknown`, never a failure (1.1). launchd may be fine
+ * - an unreadable probe → `unknown`, never a failure. launchd may be fine
  *   and the tool merely unable to answer.
  */
 export function classifyStart(job: LaunchdJob): { started: 'yes' | 'no' | 'unknown'; detail: string } {
@@ -142,7 +142,7 @@ export function makeLaunchdBackend(exec: Exec = realExec, uid: number = process.
       writeFileSync(plistPath(name), plist(name, binPath));
       await exec('launchctl', ['bootout', `${domain}/${labelFor(name)}`]); // best-effort refresh
       // Undo only what WE wrote. A plist that was already there belongs to
-      // whoever put it there, and rollback may never remove it (6.2).
+      // whoever put it there, and rollback may never remove it.
       const undo = async () => {
         if (existed) return;
         await exec('launchctl', ['bootout', `${domain}/${labelFor(name)}`]);
@@ -153,7 +153,7 @@ export function makeLaunchdBackend(exec: Exec = realExec, uid: number = process.
         // The plist is already on disk, carrying RunAtLoad. Throwing here means
         // `install` never returns `{created: true}`, so the creation transaction
         // records nothing and its rollback removes nothing — and a spawn that
-        // failed at registration leaves a launch artifact behind (6.2). Undo our
+        // failed at registration leaves a launch artifact behind. Undo our
         // own partial write before throwing, and only when WE wrote it.
         await undo();
         throw new Error(`launchctl bootstrap ${labelFor(name)} failed: ${r.stderr.trim()}`);

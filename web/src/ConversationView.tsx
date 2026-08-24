@@ -103,7 +103,7 @@ export function ConversationView({ roleId }: { roleId: string }) {
     };
   }, [connect]);
 
-  // Follow the stream only while the reader is at the bottom (spec §7.1).
+  // Follow the stream only while the reader is at the bottom.
   // This has to land BEFORE paint: a post-paint scroll shows every commit at
   // its previous offset first, which on a fresh hydration is the top of the
   // history — the transcript then visibly scrolls down to the newest message.
@@ -247,9 +247,8 @@ function TurnBlock({ turn, onDecide }: {
           </summary>
           <div className="tool-detail">
             {tool.locations?.length ? <div><strong>Locations</strong>
-              {tool.locations.map((location, index) => <code key={index}>
-                {location.path}{location.line ? `:${location.line}` : ''}
-              </code>)}</div> : null}
+              {tool.locations.map((location, index) =>
+                <ToolLocation key={index} location={location} />)}</div> : null}
             {tool.content?.map((content, index) => <ToolContent key={index} content={content} />)}
             {tool.rawInput && <JsonDisclosure label="Input" value={tool.rawInput} />}
             {tool.rawOutput && <JsonDisclosure label="Output" value={tool.rawOutput} />}
@@ -271,13 +270,65 @@ function TurnBlock({ turn, onDecide }: {
   </article>;
 }
 
-function ToolContent({ content }: { content: Record<string, unknown> }) {
+export function ToolLocation({ location }: {
+  location: {
+    path: string; line?: number; pathBytes?: number; pathTruncated?: true;
+    pathDigest?: string; pathOmittedPrefixBytes?: number;
+  };
+}) {
+  return <div className="tool-content"><code>
+    {location.path}{location.line ? `:${location.line}` : ''}
+  </code>{location.pathTruncated && <small className="muted">
+    Path tail only · {location.pathBytes ?? '?'} bytes total
+    {typeof location.pathOmittedPrefixBytes === 'number'
+      ? ` · ${location.pathOmittedPrefixBytes} leading bytes omitted` : ''}
+    {location.pathDigest ? ` · digest ${location.pathDigest}` : ''}
+  </small>}</div>;
+}
+
+type DiffTextView = {
+  text?: string; bytes?: number; truncated?: true; digest?: string;
+  omittedPrefixBytes?: number; startsMidLine?: true;
+};
+
+function DiffTextProvenance({ label, value }: { label: string; value?: DiffTextView }) {
+  if (!value) return null;
+  return <small className="muted">{label}
+    {typeof value.bytes === 'number' ? ` · ${value.bytes} bytes` : ''}
+    {value.truncated ? ' · retained bounded tail' : ''}
+    {typeof value.omittedPrefixBytes === 'number'
+      ? ` · ${value.omittedPrefixBytes} leading bytes omitted` : ''}
+    {value.startsMidLine ? ' · retained tail starts mid-line' : ''}
+    {value.digest ? ` · digest ${value.digest}` : ''}
+  </small>;
+}
+
+export function ToolContent({ content }: { content: Record<string, unknown> }) {
   if (content.type === 'diff') {
-    const oldText = content.oldText as { text?: string } | undefined;
-    const newText = content.newText as { text?: string } | undefined;
-    return <div className="tool-content"><strong>Diff · {String(content.path ?? '')}</strong>
+    const oldText = content.oldText as DiffTextView | undefined;
+    const newText = content.newText as DiffTextView | undefined;
+    const operation = typeof content.operation === 'string' ? content.operation : 'diff';
+    const bounded = content.bounded === true;
+    return <div className="tool-content"><strong>{operation === 'diff' ? 'Diff' : operation} · {String(content.path ?? '')}</strong>
+      {content.pathTruncated === true && <small className="muted">
+        Path tail only · {String(content.pathBytes ?? '?')} bytes total
+        {content.pathOmittedPrefixBytes ? ` · ${content.pathOmittedPrefixBytes} leading bytes omitted` : ''}
+        {content.pathDigest ? ` · digest ${String(content.pathDigest)}` : ''}
+      </small>}
+      {bounded && <small className="muted">Current change only
+        {typeof content.beforeBytes === 'number' && typeof content.afterBytes === 'number'
+          ? ` · file ${content.beforeBytes} → ${content.afterBytes} bytes` : ''}
+        {typeof content.commonPrefixBytes === 'number'
+          ? ` · ${content.commonPrefixBytes} unchanged prefix bytes omitted` : ''}
+        {typeof content.commonSuffixBytes === 'number'
+          ? ` · ${content.commonSuffixBytes} unchanged suffix bytes omitted` : ''}
+      </small>}
       {oldText && <pre className="diff-old">{oldText.text}</pre>}
       <pre className="diff-new">{newText?.text}</pre>
+      {(bounded || oldText?.truncated || oldText?.digest) &&
+        <DiffTextProvenance label="Prior side" value={oldText} />}
+      {(bounded || newText?.truncated || newText?.digest) &&
+        <DiffTextProvenance label="Current side" value={newText} />}
     </div>;
   }
   if (content.type === 'terminal')

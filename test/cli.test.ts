@@ -44,10 +44,14 @@ describe('ours-fleet CLI', () => {
     expect(first.stdout).not.toContain('canary-must-not-leak');
     const plan = JSON.parse(first.stdout);
     expect(plan.schemaVersion).toBe(1);
+    // ANTHROPIC_MODEL is present because the role declares a model: the pin the
+    // harness actually reads is derived from `model:`, not left to be inherited.
     expect(plan.roles[0].env).toEqual({
       redacted: true,
-      keys: ['A_PUBLIC', 'Z_SECRET'],
-      values: { A_PUBLIC: '<redacted>', Z_SECRET: '<redacted>' },
+      keys: ['ANTHROPIC_MODEL', 'A_PUBLIC', 'Z_SECRET'],
+      values: {
+        ANTHROPIC_MODEL: '<redacted>', A_PUBLIC: '<redacted>', Z_SECRET: '<redacted>',
+      },
     });
   });
 
@@ -189,7 +193,7 @@ describe('ours-fleet CLI', () => {
     expect(r.stderr).toContain('config not found');
   });
 
-  it('config shows watchdogs and --json includes them in the plan (acceptance 1)', async () => {
+  it('config shows watchdogs and --json includes them in the plan', async () => {
     const { writeFileSync } = await import('node:fs');
     writeFileSync(join(dir, 'fleet.yaml'),
       'roles:\n  Alice: {}\n  Docs: {}\n'
@@ -212,7 +216,7 @@ describe('ours-fleet CLI', () => {
     });
   });
 
-  it('config fails on a watchdog with an unknown key (acceptance 1)', async () => {
+  it('config fails on a watchdog with an unknown key', async () => {
     const { writeFileSync } = await import('node:fs');
     writeFileSync(join(dir, 'fleet.yaml'),
       'roles:\n  A: {}\nwatchdogs:\n  w: { coordinator: C, intervall: 5m }\n');
@@ -233,7 +237,7 @@ describe('ours-fleet CLI', () => {
     expect(r2.stderr + r2.stdout).toMatch(/already running/);
   });
 
-  it('watchdog-report shows latest, --list, run-id and --json (acceptance 7)', async () => {
+  it('watchdog-report shows latest, --list, run-id and --json', async () => {
     const { writeFileSync, readFileSync } = await import('node:fs');
     writeFileSync(join(dir, 'fleet.yaml'), 'roles:\n  A: {}\nwatchdogs:\n  w: { coordinator: C }\n');
     const reportsDir = join(dir, '.ours-fleet', 'watchdogs', 'w', 'reports');
@@ -266,7 +270,7 @@ describe('ours-fleet CLI', () => {
     expect(unknown.code).toBe(1);
   });
 
-  it('watchdog-report refuses a path-traversal-shaped name and touches nothing outside watchdogsRoot (finding #1)', async () => {
+  it('watchdog-report refuses a path-traversal-shaped name and touches nothing outside watchdogsRoot', async () => {
     const { writeFileSync, mkdirSync: mkdir, statSync } = await import('node:fs');
     writeFileSync(join(dir, 'fleet.yaml'), 'roles:\n  A: {}\nwatchdogs:\n  w: { coordinator: C }\n');
     // watchdogsRoot() is `<dir>/.ours-fleet/watchdogs`; join(watchdogsRoot(), '../../evil')
@@ -305,7 +309,7 @@ describe('ours-fleet CLI', () => {
     expect(parsed.runs[0].runId).toBe('20260731T115000Z');
   });
 
-  it('watchdog-report surfaces an error report\'s diagnostic tail (acceptance 9)', async () => {
+  it('watchdog-report surfaces an error report\'s diagnostic tail', async () => {
     const { writeFileSync } = await import('node:fs');
     writeFileSync(join(dir, 'fleet.yaml'), 'roles:\n  A: {}\nwatchdogs:\n  w: { coordinator: C }\n');
     const reportsDir = join(dir, '.ours-fleet', 'watchdogs', 'w', 'reports');
@@ -324,7 +328,7 @@ describe('ours-fleet CLI', () => {
     expect(r.stdout).toContain('boom line');
   });
 
-  it('restart <watchdog> releases a held-down watchdog (spec §3, Task 15)', async () => {
+  it('restart <watchdog> releases a held-down watchdog', async () => {
     const { writeFileSync, readFileSync } = await import('node:fs');
     writeFileSync(join(dir, 'fleet.yaml'), 'roles:\n  A: {}\nwatchdogs:\n  w: { coordinator: C }\n');
     const sdir = join(dir, '.ours-fleet', 'watchdogs', 'w');
@@ -357,7 +361,7 @@ describe('ours-fleet CLI', () => {
       expect(r.stdout).toContain(flag);
   });
 
-  it('spawn offers --isolation-file, the one new operator input (6.3)', async () => {
+  it('spawn offers --isolation-file, the one new operator input', async () => {
     const r = await run(['spawn', '--help']);
     expect(r.code).toBe(0);
     expect(r.stdout).toContain('--isolation-file');
@@ -366,7 +370,7 @@ describe('ours-fleet CLI', () => {
     expect(r.stdout).toContain('fleet.yaml');
   });
 
-  it('docs describe creation-time isolation (6.3)', async () => {
+  it('docs describe creation-time isolation', async () => {
     const r = await run(['docs']);
     expect(r.stdout).toContain('--isolation-file');
     expect(r.stdout).toContain('Creation-time isolation');
@@ -393,7 +397,7 @@ describe('ours-fleet CLI', () => {
     expect(r.stdout).toMatch(/mem=2G/);
   });
 
-  it('config and doctor print the SAME permission warning (2.3)', async () => {
+  it('config and doctor print the SAME permission warning', async () => {
     const { writeFileSync } = await import('node:fs');
     writeFileSync(join(dir, 'fleet.yaml'),
       'roles:\n'
@@ -417,15 +421,16 @@ describe('ours-fleet CLI', () => {
     expect(cfg.stdout).not.toContain("role 'Exact':");
     expect(doc.stdout).toMatch(/permissions: Exact.*\(exact\)/);
 
-    expect(cfg.stdout).not.toContain("role 'AcpWorkspace':");
+    expect(cfg.stdout).toContain(
+      "role 'AcpWorkspace': Codex ACP mode 'agent-full-access' couples approval and filesystem");
     expect(doc.stdout).toMatch(
-      /permissions: AcpWorkspace.*mode=agent approval=never sandbox=workspace-write.*\(exact\)/);
+      /permissions: AcpWorkspace.*mode=agent-full-access approval=never sandbox=danger-full-access.*couples approval and filesystem/);
     expect(doc.stdout).toMatch(/unattended floor: AcpWorkspace.*workspace-edit/);
     expect(cfg.stdout).not.toContain("role 'AcpFull':");
     expect(doc.stdout).toMatch(/permissions: AcpFull.*mode=agent-full-access.*\(exact\)/);
   }, 10_000);
 
-  it('status names a held-down role, its reason and when (3.2)', async () => {
+  it('status names a held-down role, its reason and when', async () => {
     const { mkdirSync, writeFileSync } = await import('node:fs');
     const stateDir = join(dir, '.ours-fleet', 'agents', 'Wedged');
     mkdirSync(stateDir, { recursive: true });
@@ -444,7 +449,7 @@ describe('ours-fleet CLI', () => {
     expect(r.stdout).toContain('ours-fleet restart Wedged');
   });
 
-  it('config and doctor both report a contradicted permission intent (2.4)', async () => {
+  it('config and doctor both report a contradicted permission intent', async () => {
     const { writeFileSync } = await import('node:fs');
     writeFileSync(join(dir, 'fleet.yaml'),
       'roles:\n'
@@ -467,7 +472,7 @@ describe('ours-fleet CLI', () => {
     expect(doc.stdout).not.toContain("role 'Single': harness_options");
   });
 
-  it('peek and send never call an unreachable role dead (1.5)', async () => {
+  it('peek and send never call an unreachable role dead', async () => {
     // No tmux session and no control socket: the honest answer is "I could not
     // reach it", plus what that does and does not prove.
     for (const argv of [['peek', 'Ghost'], ['send', 'Ghost', 'hi']]) {
@@ -478,7 +483,7 @@ describe('ours-fleet CLI', () => {
     }
   });
 
-  it('send into a busy ACP role returns as queued, not as a dead agent (1.5)', async () => {
+  it('send into a busy ACP role returns as queued, not as a dead agent', async () => {
     const { mkdirSync } = await import('node:fs');
     const { AcpSession } = await import('../src/session/acp.js');
     const { RoleControlServer } = await import('../src/session/control.js');
@@ -515,7 +520,7 @@ describe('ours-fleet CLI', () => {
     }
   }, 40_000);
 
-  it('doctor fails with the parser cause for a config `config` rejects (1.4)', async () => {
+  it('doctor fails with the parser cause for a config `config` rejects', async () => {
     const { writeFileSync } = await import('node:fs');
     writeFileSync(join(dir, 'fleet.yaml'), 'roles:\n  A:\n    harnes: claude-code\n');
 
@@ -532,7 +537,7 @@ describe('ours-fleet CLI', () => {
     expect(doc.stdout).toMatch(/MISS roles\s+unknown/);
   });
 
-  it('peek renders automatic permission decisions on a live ACP role (1.3)', async () => {
+  it('peek renders automatic permission decisions on a live ACP role', async () => {
     const { mkdirSync } = await import('node:fs');
     const { AcpSession } = await import('../src/session/acp.js');
     const { RoleControlServer } = await import('../src/session/control.js');
@@ -577,7 +582,7 @@ describe('ours-fleet CLI', () => {
   });
 });
 
-describe('never-prompt failure and the capability floor are documented (7.4)', () => {
+describe('never-prompt failure and the capability floor are documented', () => {
   it('docs explain the silent denial and how to detect it before launch', async () => {
     const r = await run(['docs']);
     expect(r.code).toBe(0);

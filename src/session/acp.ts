@@ -9,17 +9,20 @@ import { Readable, Writable } from 'node:stream';
 import * as acp from '@agentclientprotocol/sdk';
 
 import type { CommonPermissions } from '../config.js';
+import type { AcpMcpServer } from '../harness/types.js';
 import { normalizeSessionUpdate } from './conversation-normalizer.js';
 import { ConversationEventStore, IdempotencyConflictError } from './conversation-store.js';
 import type {
-  ConversationSnapshot, ConversationSource, PromptOrigin, PromptReceipt, SubmitPromptCommand,
+  ConversationEventV1, ConversationSnapshot, ConversationSource, PromptOrigin, PromptReceipt,
+  SubmitPromptCommand,
 } from './conversation-types.js';
 import { SessionEvents } from './events.js';
 import {
   ACP_CANCEL_DEADLINE_EXCEEDED, SessionControlError, classifyChildExit, turnResult,
 } from './types.js';
 import type {
-  ConversationHandlePage, ExitRecord, InterruptOutcome, PermissionDecision, QueuedPrompt,
+  ConversationHandlePage, ExitRecord, InterruptOutcome, PermissionDecision, PromptDelivery,
+  QueuedPrompt,
   SessionEvent,
   RuntimeSelectorMetadata, SessionHandle, SessionSnapshot, SubmitPromptOptions,
   TurnCancellationSource, TurnOutcome,
@@ -51,10 +54,25 @@ const CANCEL_SETTLE_GRACE_MS = 15_000;
 const CANCEL_TERMINATE_GRACE_MS = 5_000;
 /** A permission no human answered is eventually a decision nobody made. */
 const PERMISSION_TIMEOUT_MS = 10 * 60_000;
-/** Spec §4.3: 10-15 s before a vanished controller triggers the unattended policy. */
+/** Wait 10–15 seconds before a vanished controller triggers the unattended policy. */
 const CONTROLLER_GRACE_MS = 12_000;
 /** Bound safe-boundary waiting without turning a hung tool into cancellation. */
 export const AFTER_TOOL_BOUNDARY_TIMEOUT_MS = 120_000;
+/**
+ * How long a steering-started turn is presumed to still own the adapter after
+ * its last update. Such a turn has no prompt id, so it never reports a
+ * stopReason and there is no exact end to observe — silence is the only signal
+ * available, and this is the bound that turns it into a decision.
+ *
+ * Sized from the fleet's own scheduled-run history: across 1513 completed
+ * scheduled runs the longest silence WITHIN a working turn was 120.2 s (p99
+ * 41.0 s; 5 runs above 60 s). A shorter grace would release the lease while the
+ * adapter is still working and re-admit a prompt into a busy turn, which is the
+ * FLEET-003 failure itself. The costs are deliberately asymmetric: holding too
+ * long skips one best-effort maintenance tick, releasing too early SIGTERMs a
+ * live role.
+ */
+export const STEERING_OCCUPANCY_IDLE_MS = 150_000;
 const TERMINAL_TOOL_STATUSES = new Set(['completed', 'failed']);
 
 const SCHEDULED_LOOP_REDACTION = '[scheduled-loop content redacted]';
@@ -172,7 +190,7 @@ function canonicallyWithin(root: string, candidates: string[]): boolean {
  * Map typed prompt provenance to the conversation ledger's source vocabulary.
  * Only operator-authored local sources may persist prompt bodies; external
  * E2E bodies (owner channel, monitor wakes) and scheduled-loop content are
- * recorded as digest/size placeholders (spec §8.3).
+ * recorded as digest/size placeholders.
  */
 function conversationSource(origin: PromptOrigin | undefined): {
   source: ConversationSource; persistBody: boolean;
@@ -224,6 +242,22 @@ export interface AcpSessionOptions {
   modeId?: string;
   /** Adapter-resolved live permission policy; separate from ACP agent-specific session modes. */
   permissionMode?: NonNullable<SessionSnapshot['permissionMode']>;
+  /** Adapter-authenticated request-metadata vocabulary; never inferred from ACP `_meta`. */
+  permissionMetadataSource?: 'codex-acp';
+  /**
+   * MCP servers the ROLE declares, for every session/new, resume and load. Empty
+   * or omitted sends `[]`, which is what fleet has always sent and leaves the
+   * agent's own configuration untouched.
+   */
+  mcpServers?: AcpMcpServer[];
+  /**
+   * Adapter-supplied `_meta` for session/new — the only route by which a
+   * capability the CLI takes as a flag reaches an agent that accepts none.
+   * Per-agent vocabulary, so the ADAPTER decides whether there is anything to
+   * send; this layer only forwards it. Never sent on resume or load: it carries
+   * session-creation options the agent has already applied.
+   */
+  sessionMeta?: Record<string, unknown>;
   log(line: string): void;
   /** Test seam for the cancel-escalation grace period; production uses the default. */
   cancelGraceMs?: number;
@@ -235,6 +269,8 @@ export interface AcpSessionOptions {
   controllerGraceMs?: number;
   /** Test seam; production uses AFTER_TOOL_BOUNDARY_TIMEOUT_MS. */
   afterToolBoundaryTimeoutMs?: number;
+  /** Test seam; production uses STEERING_OCCUPANCY_IDLE_MS. */
+  steeringOccupancyIdleMs?: number;
 }
 
 /**
@@ -261,6 +297,8 @@ export class AcpSession implements SessionHandle {
   private readonly child: ChildProcessWithoutNullStreams;
   private readonly events: SessionEvents;
   private readonly conversation: ConversationEventStore;
+  /** Cursor before this runner generation began; older durable events stay off the live console. */
+  private readonly conversationStartCursor?: string;
   /** New on every runner start; permission/turn IDs from prior generations are stale. */
   private readonly sessionGeneration = randomUUID();
   /** True while `session/load` replays history as ordinary updates. */
@@ -270,6 +308,12 @@ export class AcpSession implements SessionHandle {
   private connection: acp.ClientConnection;
   private sessionId?: string;
   private readiness: SessionSnapshot['readiness'] = 'starting';
+  /**
+   * Last non-replayed session update from the agent. `readiness` cannot answer
+   * "is this agent working" for a steered turn (FLEET-002), and this is the
+   * evidence that can.
+   */
+  private lastUpdateAt?: string;
   private lastError?: string;
   private promptTail: Promise<unknown> = Promise.resolve();
   private queueDepth = 0;
@@ -285,6 +329,13 @@ export class AcpSession implements SessionHandle {
   private cancelEscalation?: ReturnType<typeof setTimeout>;
   private cancelForceKill?: ReturnType<typeof setTimeout>;
   private cancelRecoveryReason?: string;
+  /**
+   * Held while a steering-started turn is believed to own the adapter. It is a
+   * lease, not a latch: `steeringRelease` always fires, so the role can never be
+   * stranded busy by a wake whose turn ended without telling anyone.
+   */
+  private steeringOccupied = false;
+  private steeringRelease?: ReturnType<typeof setTimeout>;
   /**
    * Rejects the moment the adapter process is gone. Every in-flight ACP request
    * races it, so a dead adapter can never leave a turn — and therefore a
@@ -316,6 +367,7 @@ export class AcpSession implements SessionHandle {
     this.conversation = new ConversationEventStore(join(options.stateDir, '.conversation'), {
       roleId: options.name, log: line => options.log(`[${options.name}] ${line}`),
     });
+    this.conversationStartCursor = this.conversation.lastCursor();
     this.sessionFile = join(options.stateDir, '.acp-session-id');
     this.terminated = new Promise<never>((_resolve, reject) => { this.terminate = reject; });
     // Nothing awaits this promise until a request races it; an unobserved
@@ -325,6 +377,7 @@ export class AcpSession implements SessionHandle {
     child.once('exit', (code, signal) => {
       if (this.cancelForceKill) clearTimeout(this.cancelForceKill);
       this.cancelForceKill = undefined;
+      this.releaseSteeringOccupancy('adapter exited');
       // Record the child's real exit code/signal. The tmux path can only see a
       // shell's `$?`; here the truth is available, so keep it.
       const classified = classifyChildExit(code, signal);
@@ -387,7 +440,7 @@ export class AcpSession implements SessionHandle {
   }
 
   /**
-   * Honest restart recovery (spec §5.3): a prompt that was admitted but never
+   * Honest restart recovery: a prompt that was admitted but never
    * started is safe to dispatch again; a turn that had already started may
    * have caused side effects, so it is closed as `unknown_after_restart` —
    * never silently replayed.
@@ -429,17 +482,61 @@ export class AcpSession implements SessionHandle {
     return this.child.exitCode === null && (this.child.signalCode ?? null) === null;
   }
 
+  /**
+   * Take the occupancy lease for a turn the adapter started on its own behalf.
+   * Refreshed by every adapter update, so it tracks work actually happening
+   * rather than a fixed guess at how long a wake takes.
+   */
+  private holdSteeringOccupancy(): void {
+    if (this.closing || !this.isAlive()) return;
+    this.steeringOccupied = true;
+    this.refreshSteeringOccupancy();
+  }
+
+  private refreshSteeringOccupancy(): void {
+    if (!this.steeringOccupied) return;
+    if (this.steeringRelease) clearTimeout(this.steeringRelease);
+    this.steeringRelease = setTimeout(
+      () => this.releaseSteeringOccupancy('adapter silent'),
+      this.options.steeringOccupancyIdleMs ?? STEERING_OCCUPANCY_IDLE_MS);
+    this.steeringRelease.unref?.();
+  }
+
+  /**
+   * Every exit from occupancy comes through here, including the ones that are
+   * not the timer: a real turn boundary, close, and adapter exit. A lease that
+   * can leak is worse than the bug it fixes — it would leave the role reporting
+   * `running` forever and starve scheduled admission permanently.
+   */
+  private releaseSteeringOccupancy(reason: string): void {
+    if (this.steeringRelease) clearTimeout(this.steeringRelease);
+    this.steeringRelease = undefined;
+    if (!this.steeringOccupied) return;
+    this.steeringOccupied = false;
+    this.options.log(
+      `[${this.options.name}] steering-started turn no longer holds the adapter (${reason})`);
+  }
+
   snapshot(): SessionSnapshot {
     return {
       backend: 'acp',
       alive: this.isAlive(),
-      readiness: this.readiness,
+      // A steering-started turn is real work with no prompt id. Reporting the
+      // session idle while it runs is what let the arbiter admit a scheduled
+      // prompt into a busy adapter, whose `session/prompt` then never returned
+      // a stopReason and ended in a cancellation deadline and a SIGTERM.
+      readiness: this.readiness === 'idle' && this.steeringOccupied
+        ? 'running' : this.readiness,
       sessionId: this.sessionId,
       lastError: this.lastError,
       pendingPermissionId: this.pendingPermissions.keys().next().value as string | undefined,
       runtimeModel: this.runtimeModel,
       reasoningEffort: this.reasoningEffort,
       permissionMode: this.options.permissionMode,
+      activity: {
+        activeToolCalls: this.activeToolCalls.size,
+        ...(this.lastUpdateAt ? { lastUpdateAt: this.lastUpdateAt } : {}),
+      },
     };
   }
 
@@ -616,14 +713,19 @@ export class AcpSession implements SessionHandle {
       );
     if (this.closing || !this.sessionId || !this.isAlive())
       throw new SessionControlError('offline', this.lastError ?? 'ACP session is offline');
-    if (options.interrupt) await this.cancelActive(options.interruptSource ?? 'local-console');
+    const delivery = options.interrupt
+      ? await this.prepareInterruptingDelivery(options.interruptSource ?? 'local-console')
+      : undefined;
     // Interrupting delivery must still use steering when supported. With no
     // live turn, the extension starts one and acknowledges `startedNewTurn`
     // immediately; a normal session/prompt would keep the monitor blocked until
     // the entire wake-triggered turn terminated.
     if (options.steer && this.steeringSupported) {
       const promptId = randomUUID();
-      return { promptId, queuedBehind: 0, completion: this.steerPrompt(text), origin: options.origin };
+      return {
+        promptId, queuedBehind: 0, completion: this.steerPrompt(text), origin: options.origin,
+        ...(delivery ? { delivery } : {}),
+      };
     }
     const promptId = randomUUID();
     const queuedBehind = this.queueDepth;
@@ -638,14 +740,54 @@ export class AcpSession implements SessionHandle {
         return turnResult(false, 'failed', (error as Error)?.message ?? String(error));
       },
     );
-    return { promptId, queuedBehind, completion, origin: options.origin };
+    return {
+      promptId, queuedBehind, completion, origin: options.origin,
+      delivery: delivery ?? (queuedBehind > 0 ? 'queued' : 'started'),
+    };
+  }
+
+  /**
+   * Prepare the session for a prompt that asked to pre-empt current work.
+   *
+   * The old behaviour was one unconditional `session/cancel` notification
+   * followed immediately by `session/prompt`. That is what produced the owner's
+   * "request failed before completion":
+   *
+   *  - `cancelActive` only awaits settlement when `this.activeTurn` is set, and
+   *    a turn the ADAPTER started (steering's `startedNewTurn`) is never tracked
+   *    here. So the cancel raced the adapter's own transcript repair and the new
+   *    prompt landed while the last assistant message still held an unresolved
+   *    `tool_use` — rejected with `stop_reason=tool_use`.
+   *  - With nothing running at all, it still sent the cancel, and the prompt
+   *    landed on a bare interrupted user message — rejected with
+   *    `stop_reason=null`.
+   *
+   * So: never cancel across a tool boundary, and never cancel something whose
+   * settlement cannot be awaited. Everything else is queued, which the ACP queue
+   * already does correctly. The returned state is what the caller may claim to a
+   * human — `interrupted` only when a turn really was cancelled.
+   */
+  private async prepareInterruptingDelivery(
+    source: TurnCancellationSource,
+  ): Promise<PromptDelivery> {
+    if (!this.sessionId) return 'started';
+    // No fleet-tracked turn to await. Either the session is idle — cancelling it
+    // corrupts the transcript for no gain — or the adapter is running a turn
+    // fleet never started, whose settlement nothing here can wait for. Queue in
+    // both cases: the ACP queue already orders this correctly.
+    if (!this.activeTurn) return this.activeToolCalls.size > 0 ? 'deferred' : 'started';
+    // A tracked turn IS safe to cancel: cancelActive settles pending permissions
+    // and awaits the turn's own settlement before this returns, so the prompt
+    // below cannot race the adapter's transcript repair.
+    await this.cancelActive(source);
+    return 'interrupted';
   }
 
   /**
    * Durably record a prompt admission BEFORE acceptance is returned. Browser
    * admissions are transactional — a prompt the ledger cannot hold is refused,
    * because an acknowledged-then-lost prompt is worse than an error. Every
-   * other source degrades to best-effort so the agent keeps working (§5.3).
+   * other source degrades to best-effort so the agent keeps working.
    */
   private admitToLedger(
     promptId: string, text: string, queuedBehind: number, options: SubmitPromptOptions,
@@ -950,6 +1092,7 @@ export class AcpSession implements SessionHandle {
     this.cancelForceKill = undefined;
     if (this.controllerGrace) clearTimeout(this.controllerGrace);
     this.controllerGrace = undefined;
+    this.releaseSteeringOccupancy('session closed');
     for (const [permissionId, pending] of [...this.pendingPermissions])
       this.settlePendingAutomatically(permissionId, pending, 'cancelled', undefined,
         'the session closed while this request was pending');
@@ -967,6 +1110,18 @@ export class AcpSession implements SessionHandle {
       acpSessionId: this.sessionId, payload: { status: 'offline' },
     });
     this.conversation.close();
+  }
+
+  /**
+   * The role's declared MCP servers, or `[]`.
+   *
+   * Sent on resume and load as well as on new: the agent builds its server set
+   * once per session, so a resumed session that omitted them would come back
+   * without the tools the role's config declares — which is exactly the shape of
+   * silent drop this plumbing exists to end.
+   */
+  private declaredMcpServers(): AcpMcpServer[] {
+    return this.options.mcpServers ?? [];
   }
 
   private async initialize(): Promise<void> {
@@ -990,7 +1145,7 @@ export class AcpSession implements SessionHandle {
       const resumed = await this.connection.agent.request(acp.methods.agent.session.resume, {
         sessionId: persisted,
         cwd: this.options.cwd,
-        mcpServers: [],
+        mcpServers: this.declaredMcpServers(),
       });
       this.captureRuntimeMetadata(resumed.configOptions);
       this.sessionId = persisted;
@@ -1002,7 +1157,7 @@ export class AcpSession implements SessionHandle {
         const loaded = await this.connection.agent.request(acp.methods.agent.session.load, {
           sessionId: persisted,
           cwd: this.options.cwd,
-          mcpServers: [],
+          mcpServers: this.declaredMcpServers(),
         });
         this.captureRuntimeMetadata(loaded.configOptions);
       } finally { this.replaying = false; }
@@ -1010,7 +1165,8 @@ export class AcpSession implements SessionHandle {
     } else {
       const created = await this.connection.agent.request(acp.methods.agent.session.new, {
         cwd: this.options.cwd,
-        mcpServers: [],
+        mcpServers: this.declaredMcpServers(),
+        ...(this.options.sessionMeta ? { _meta: this.options.sessionMeta } : {}),
       });
       this.sessionId = created.sessionId;
       this.captureRuntimeMetadata(created.configOptions);
@@ -1113,6 +1269,10 @@ export class AcpSession implements SessionHandle {
         this.activeTurn?.id === turnId ? this.activeTurn.output : undefined);
     } finally {
       this.releaseAllTools();
+      // A turn this client owned has ended, so the adapter has reported a
+      // boundary: whatever a steering call started before it is over too. This
+      // is the release path that does not depend on the silence timer.
+      this.releaseSteeringOccupancy('turn boundary');
       if (this.activeTurn?.id === turnId) {
         this.activeTurn.settle();
         if (this.cancelEscalation) clearTimeout(this.cancelEscalation);
@@ -1138,6 +1298,11 @@ export class AcpSession implements SessionHandle {
       ]);
       if (response.outcome === 'failed')
         return turnResult(false, 'failed', 'ACP steering failed');
+      // `injected` joined a turn this client already owns and will settle.
+      // `startedNewTurn` created one nobody owns: the adapter is working and
+      // will never answer for it, so admission has to learn about it here or
+      // not at all.
+      if (response.outcome === 'startedNewTurn') this.holdSteeringOccupancy();
       return turnResult(true, 'inconclusive', response.outcome);
     } catch (error) {
       const detail = (error as Error)?.message ?? String(error);
@@ -1164,6 +1329,17 @@ export class AcpSession implements SessionHandle {
     // Permission is part of the tool lifecycle. Reserve before any policy or
     // human decision so a monitor wake cannot slip between request and answer.
     this.reservePermission(toolCallId, permissionId);
+    if (this.isEffectiveCodexProtectedMcpApproval(params)) {
+      // Protected MCP approval is already the tool's narrow gate. Never turn
+      // this one decision into an adapter-wide standing grant.
+      const option = choose(['allow_once']);
+      const response = this.settleAutomatically(params, option, 'allowed',
+        'permissionMode.fleetMode=allow',
+        'the trusted Codex adapter authenticated a protected MCP approval request');
+      if (option) this.allowPermission(toolCallId, permissionId);
+      else this.releasePermission(toolCallId, permissionId);
+      return Promise.resolve(response);
+    }
     if (this.options.permissions.approval === 'allow' && this.withinAutomaticBoundary(params)) {
       const option = choose(['allow_always', 'allow_once']);
       const response = this.settleAutomatically(params, option, 'allowed',
@@ -1300,7 +1476,39 @@ export class AcpSession implements SessionHandle {
     return canonicallyWithin(cwd, locations.map(location => resolve(location.path)));
   }
 
+  /**
+   * Codex ACP 1.1.7 marks its protected MCP elicitation bridge on a locationless
+   * execute request. The marker is meaningful only together with the runner's
+   * independently supplied, adapter-authenticated metadata vocabulary and effective
+   * mode: an arbitrary ACP process cannot gain this path by copying `_meta` alone.
+   * Exact option ids/kinds bind recognition to the protected-MCP shape and keep
+   * malformed requests on the ordinary fail-closed path.
+   */
+  private isEffectiveCodexProtectedMcpApproval(
+    params: acp.RequestPermissionRequest,
+  ): boolean {
+    const locations = params.toolCall.locations ?? [];
+    return this.options.permissionMetadataSource === 'codex-acp'
+      && this.options.permissionMode?.fleetMode === 'allow'
+      && params.toolCall.kind === 'execute'
+      && params.toolCall.status === 'pending'
+      && locations.length === 0
+      && params._meta?.is_mcp_tool_approval === true
+      && params.options.some(option =>
+        option.optionId === 'allow_once' && option.kind === 'allow_once')
+      && params.options.some(option =>
+        option.optionId === 'decline' && option.kind === 'reject_once');
+  }
+
   private recordUpdate(update: acp.SessionUpdate): void {
+    // Replayed history is not current activity: `session/load` would otherwise
+    // make a cold session look like it had just been working. The same reason
+    // keeps it from extending the steering lease, which is evidence the adapter
+    // is working right now — for a steering-started turn, the only evidence.
+    if (!this.replaying) {
+      this.lastUpdateAt = new Date().toISOString();
+      this.refreshSteeringOccupancy();
+    }
     const scheduled = this.activeTurn?.origin?.kind === 'scheduled-loop';
     const messagePhase = update.sessionUpdate === 'agent_message_chunk'
       ? this.codexMessagePhase(update) : undefined;
@@ -1402,7 +1610,28 @@ export class AcpSession implements SessionHandle {
   // ── conversation ledger access (SessionHandle) ─────────────────────────────
 
   conversationPage(request: { after?: string; limit?: number } = {}): ConversationHandlePage {
-    return { ...this.conversation.page(request), snapshot: this.conversationSnapshot() };
+    const floor = Number(this.conversationStartCursor ?? 0);
+    const requested = Number(request.after ?? 0);
+    let after = String(Math.max(
+      Number.isSafeInteger(floor) ? floor : 0,
+      Number.isSafeInteger(requested) ? requested : 0,
+    ));
+    const limit = Math.min(Math.max(request.limit ?? 200, 1), 1_000);
+    let page = this.conversation.page({ after, limit });
+    let visible = page.events.filter(event => this.isCurrentConversationEvent(event));
+    // A resumed adapter may replay a page made entirely of prior session/load
+    // history. Advance over it without exposing it or making the browser stop
+    // before later current-session records.
+    while (!visible.length && page.hasMore && page.nextCursor && page.nextCursor !== after) {
+      after = page.nextCursor;
+      page = this.conversation.page({ after, limit });
+      visible = page.events.filter(event => this.isCurrentConversationEvent(event));
+    }
+    return {
+      ...page,
+      events: visible,
+      snapshot: this.conversationSnapshot(),
+    };
   }
 
   conversationSnapshot(): ConversationSnapshot {
@@ -1416,7 +1645,13 @@ export class AcpSession implements SessionHandle {
   }
 
   subscribeConversation(listener: Parameters<ConversationEventStore['subscribe']>[0]): () => void {
-    return this.conversation.subscribe(listener);
+    return this.conversation.subscribe(event => {
+      if (this.isCurrentConversationEvent(event)) listener(event);
+    });
+  }
+
+  private isCurrentConversationEvent(event: ConversationEventV1): boolean {
+    return event.sessionGeneration === this.sessionGeneration && event.source !== 'agent_replay';
   }
 
   private fail(error: unknown): void {

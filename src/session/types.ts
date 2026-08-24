@@ -3,6 +3,17 @@ import type {
   ConversationEventV1, ConversationSnapshot, PromptReceipt, SubmitPromptCommand,
 } from './conversation-types.js';
 
+/**
+ * TURN OCCUPANCY, and nothing else: `idle` means no fleet-tracked turn is in
+ * flight, which is exactly the question `arbiter.tryScheduled` asks before it
+ * admits a prompt. It is NOT a claim that the agent is doing nothing — a wake
+ * delivered through the `_session/steering` extension answers `startedNewTurn`
+ * and runs a whole turn that fleet never gets a `session/prompt` response for
+ * (ACP has no turn-end session update), so `readiness` stays `idle` for its
+ * entire duration. Anything reporting activity or liveness to a human must
+ * corroborate with `SessionSnapshot.activity` instead of reading `idle` here as
+ * "not working".
+ */
 export type SessionReadiness =
   | 'starting'
   | 'idle'
@@ -117,6 +128,16 @@ export function interruptOutcome(result: InterruptResult): InterruptOutcome {
  * stop here: the session has the prompt, and waiting for the turn to finish is
  * a different question with a different, much longer, timescale.
  */
+/**
+ * What actually happened to an admitted prompt, so a caller reporting to a
+ * human can be accurate instead of repeating what it asked for.
+ *
+ * `interrupted` is only ever returned when a turn was really cancelled for this
+ * prompt. `deferred` says the session is busy with work this prompt could not
+ * safely pre-empt — the prompt is admitted and will run, just not yet.
+ */
+export type PromptDelivery = 'started' | 'queued' | 'interrupted' | 'deferred';
+
 export interface QueuedPrompt {
   promptId: string;
   /** Turns already queued ahead of this one. 0 means it starts immediately. */
@@ -124,6 +145,8 @@ export interface QueuedPrompt {
   origin?: PromptOrigin;
   /** The turn's terminal result. Never rejects. */
   completion: Promise<TurnResult>;
+  /** Observed admission outcome. Absent on backends that do not report it. */
+  delivery?: PromptDelivery;
 }
 
 /**
@@ -223,6 +246,20 @@ export interface SessionSnapshot {
     /** Exact harness-native approval/permission mode used by this runner. */
     nativeMode: string;
   };
+  /**
+   * Observed agent activity, independent of turn occupancy: the evidence a
+   * human-facing surface needs before calling a role idle. Absent on backends
+   * that cannot observe the agent at all (tmux), which is itself honest — no
+   * evidence is not evidence of inactivity.
+   */
+  activity?: SessionActivity;
+}
+
+export interface SessionActivity {
+  /** ACP tool calls currently reserved (lifecycle open or permission pending). */
+  activeToolCalls: number;
+  /** When the agent last sent ANY session update, replay excluded. */
+  lastUpdateAt?: string;
 }
 
 export type SessionEventKind =

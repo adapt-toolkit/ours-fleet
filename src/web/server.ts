@@ -500,7 +500,7 @@ export async function buildWebServer(
           throw new FleetError('capability_unavailable', 'this role has no conversation ledger');
         const after = typeof hello.after === 'string' && hello.after ? hello.after : undefined;
 
-        // Backpressure discipline (spec §5.5): a browser that cannot keep up
+        // Backpressure discipline: a browser that cannot keep up
         // gets an explicit resync signal, then a close — durable events are
         // never dropped silently, the store remains the recovery source.
         let resyncSent = false;
