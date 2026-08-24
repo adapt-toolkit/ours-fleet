@@ -518,39 +518,20 @@ describe('provision saga', () => {
   });
 
   describe('cleanupMembers', () => {
-    it('removes member identities and closes room record', async () => {
-      const rec = createRoomRecord({ room_id: 'room-clean', room_name: 'Clean' });
-      const { updateMemberSeats } = await import('../src/rooms-tasks/room-state.js');
-      updateMemberSeats('room-clean', [
-        { role_name: 'mem-1', identity_cid: 'c1', slot: 'dev', cowork_role: 'Developer', seat_state: 'active' },
-        { role_name: 'mem-2', identity_cid: 'c2', slot: 'dev', cowork_role: 'Developer', seat_state: 'active' },
-      ]);
-
-      const cowork = mockCoworkAdapter();
-      await cleanupMembers({
-        roomId: 'room-clean',
-        closeCoworkRoom: true,
-        cowork,
-      });
-
-      const room = getRoomRecord('room-clean')!;
-      expect(room.state).toBe('closed');
-      expect(cowork.closeRoom).toHaveBeenCalledWith('room-clean');
-    });
-
     it('handles missing room record without throwing', async () => {
       await expect(cleanupMembers({ roomId: 'nonexistent' })).resolves.toBeUndefined();
     });
 
-    it('skips cowork close when not configured', async () => {
+    it('refuses the legacy partial cleanup path without Cowork', async () => {
       createRoomRecord({ room_id: 'room-skip', room_name: 'Skip' });
       const cowork = mockCoworkAdapter();
 
-      await cleanupMembers({ roomId: 'room-skip' });
+      await expect(cleanupMembers({ roomId: 'room-skip' }))
+        .rejects.toThrow(/deterministic room-close saga/i);
 
       expect(cowork.closeRoom).not.toHaveBeenCalled();
       const room = getRoomRecord('room-skip')!;
-      expect(room.state).toBe('closed');
+      expect(room.state).toBe('provisioning');
     });
   });
 });

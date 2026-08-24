@@ -33,6 +33,8 @@ function context(overrides: Partial<OwnerCommandContext> = {}): OwnerCommandCont
     runHarnessCommand: vi.fn(async () => undefined),
     restart: vi.fn(async () => undefined),
     fleetList: vi.fn(async () => 'Coordinator: acp'),
+    closeRoom: vi.fn(async roomId => { replies.push(`scheduled:${roomId}`); }),
+    terminalTask: vi.fn(async (taskId, kind) => { replies.push(`terminal:${taskId}:${kind}`); }),
     recentEvents: () => [],
     readWorklogTail: vi.fn(async () => undefined),
     reply: async text => { replies.push(text); },
@@ -421,8 +423,8 @@ describe('owner-channel task subcommands', () => {
     reviewTask(t.task_id);
     const ctx = context();
     await dispatchOwnerCommand(`/task done ${t.task_id} ship it`, ctx);
-    expect(ctx.replies).toHaveLength(1);
-    expect(ctx.replies[0]).toContain('done');
+    expect(ctx.terminalTask).toHaveBeenCalledWith(t.task_id, 'done', { summary: 'ship it' });
+    expect(ctx.replies).toEqual([`terminal:${t.task_id}:done`]);
   });
 
   it('/task cancel requires ID twice', async () => {
@@ -437,8 +439,31 @@ describe('owner-channel task subcommands', () => {
     const t = await createTestTask();
     const ctx = context();
     await dispatchOwnerCommand(`/task cancel ${t.task_id} ${t.task_id}`, ctx);
-    expect(ctx.replies).toHaveLength(1);
-    expect(ctx.replies[0]).toContain('cancelled');
+    expect(ctx.terminalTask).toHaveBeenCalledWith(t.task_id, 'cancelled');
+    expect(ctx.replies).toEqual([`terminal:${t.task_id}:cancelled`]);
+  });
+
+  it('/task recover reschedules an accepted pending terminal intent', async () => {
+    const t = await createTestTask();
+    const {
+      activateTask, reviewTask, startTask, updateTaskRoom,
+    } = await import('../src/rooms-tasks/task-state.js');
+    const { acceptTaskTerminalIntent } = await import('../src/rooms-tasks/terminal.js');
+    startTask(t.task_id);
+    activateTask(t.task_id);
+    reviewTask(t.task_id);
+    updateTaskRoom(t.task_id, 'room-terminal-recover', 'c'.repeat(64));
+    await acceptTaskTerminalIntent({
+      taskId: t.task_id,
+      kind: 'done',
+      roomId: 'room-terminal-recover',
+      outcome: { summary: 'recover me' },
+    });
+    const ctx = context();
+    await dispatchOwnerCommand(`/task recover ${t.task_id}`, ctx);
+    expect(ctx.terminalTask).toHaveBeenCalledWith(
+      t.task_id, 'done', { summary: 'recover me' },
+    );
   });
 
   it('/task start without id returns usage', async () => {
@@ -622,14 +647,15 @@ describe('owner-channel room subcommands', () => {
     expect(ctx.replies[0]).toContain('destructive');
   });
 
-  it('/room close <id> <id> closes a room', async () => {
+  it('/room close <id> <id> delegates to the durable external close path', async () => {
     const r = await createTestRoom();
     const { activateRoom } = await import('../src/rooms-tasks/room-state.js');
     activateRoom(r.room_id);
     const ctx = context();
     await dispatchOwnerCommand(`/room close ${r.room_id} ${r.room_id}`, ctx);
     expect(ctx.replies).toHaveLength(1);
-    expect(ctx.replies[0]).toContain('closed');
+    expect(ctx.replies[0]).toBe(`scheduled:${r.room_id}`);
+    expect(ctx.closeRoom).toHaveBeenCalledWith(r.room_id);
   });
 
   it('/room reports error for nonexistent room', async () => {

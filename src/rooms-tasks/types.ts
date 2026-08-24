@@ -48,6 +48,20 @@ export interface TaskOutcome {
   artifacts?: string[];
 }
 
+export interface TaskTerminalIntent {
+  kind: 'done' | 'cancelled';
+  status: 'pending' | 'settled';
+  room_id?: string;
+  outcome?: TaskOutcome;
+  accepted_at: string;
+  settled_at?: string;
+  error?: string;
+  error_at?: string;
+  recovery_hint?: string;
+  first_failure?: string;
+  first_recovery_hint?: string;
+}
+
 export interface TaskRecord {
   task_id: string;
   title: string;
@@ -66,6 +80,7 @@ export interface TaskRecord {
   started_at?: string;
   ended_at?: string;
   outcome?: TaskOutcome;
+  terminal_intent?: TaskTerminalIntent;
 }
 
 // ── Room orchestration (Fleet side) ─────────────────────────────────────
@@ -99,12 +114,38 @@ export type ProvisioningDetail =
   | 'waiting_seats'
   | 'uncertain';
 
+export type MemberRetirementPhase =
+  | 'stop_requested'
+  | 'liveness_absent'
+  | 'archive_secured'
+  | 'identity_absent';
+
+export interface MemberRetirement {
+  phase: MemberRetirementPhase;
+  launch_id: string;
+  updated_at: string;
+  archive_path?: string;
+}
+
+export type RoomClosePhase = 'retire_members' | 'close_cowork' | 'completed';
+
+export interface RoomCloseCursor {
+  phase: RoomClosePhase;
+  accepted_at: string;
+  error?: string;
+  error_at?: string;
+  recovery_hint?: string;
+  first_failure?: string;
+  first_recovery_hint?: string;
+}
+
 export interface RoomMemberSeat {
   role_name: string;
   identity_cid: string;
   slot: string;
   cowork_role: string;
   seat_state: 'pending' | 'active' | 'removed';
+  retirement?: MemberRetirement;
 }
 
 export interface RoomOrchestrationRecord {
@@ -123,6 +164,7 @@ export interface RoomOrchestrationRecord {
   created_at: string;
   activated_at?: string;
   closed_at?: string;
+  close?: RoomCloseCursor;
 }
 
 // ── Templates ───────────────────────────────────────────────────────────

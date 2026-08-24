@@ -10,7 +10,8 @@ const mocks = vi.hoisted(() => ({
   createRoom: vi.fn(),
   closeRoom: vi.fn().mockResolvedValue(undefined),
   provisionMembers: vi.fn(),
-  cleanupMembers: vi.fn().mockResolvedValue(undefined),
+  closeManagedRoom: vi.fn().mockResolvedValue({ state: 'closed' }),
+  launchFleetWorker: vi.fn(),
 }));
 
 vi.mock('../src/rooms-tasks/cowork-adapter.js', async (importOriginal) => {
@@ -29,10 +30,18 @@ vi.mock('../src/rooms-tasks/provision.js', async (importOriginal) => {
   return {
     ...actual,
     provisionMembers: mocks.provisionMembers,
-    cleanupMembers: mocks.cleanupMembers,
     getBinPath: () => '/usr/bin/true',
   };
 });
+
+vi.mock('../src/rooms-tasks/close.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../src/rooms-tasks/close.js')>();
+  return { ...actual, closeManagedRoom: mocks.closeManagedRoom };
+});
+
+vi.mock('../src/rooms-tasks/external-worker.js', () => ({
+  launchFleetWorker: mocks.launchFleetWorker,
+}));
 
 // ── Imports (resolved after mock interception) ──────────────────────────
 
@@ -84,7 +93,18 @@ beforeEach(() => {
 
   mocks.createRoom.mockReset().mockResolvedValue({ room_id: ROOM_ID, identity_cid: 'c'.repeat(64) });
   mocks.closeRoom.mockReset().mockResolvedValue(undefined);
-  mocks.cleanupMembers.mockReset().mockResolvedValue(undefined);
+  mocks.closeManagedRoom.mockReset().mockResolvedValue({ state: 'closed' });
+  mocks.launchFleetWorker.mockReset().mockImplementation(async (args: string[]) => {
+    if (args[0] !== 'task' || args[1] !== '_settle') return;
+    const taskId = args[2];
+    setTimeout(() => {
+      void import('../src/rooms-tasks/terminal.js').then(({ settleTaskTerminalIntent }) =>
+        settleTaskTerminalIntent({
+          taskId,
+          cowork: { closeRoom: mocks.closeRoom },
+        }).catch(() => undefined));
+    }, 0);
+  });
   // The real provisionMembers ends by activating the room and the task; the
   // fake preserves exactly that contract so the CLI's state flow is exercised.
   mocks.provisionMembers.mockReset().mockImplementation(async ({ roomId, taskId }: { roomId: string; taskId?: string }) => {
@@ -290,8 +310,8 @@ describe('task finish', () => {
     const t = await activeTask();
     await run('finish', t.task_id);
     expect(getTask(t.task_id).state).toBe('done');
-    expect(mocks.cleanupMembers).toHaveBeenCalledWith(
-      expect.objectContaining({ roomId: ROOM_ID, taskId: t.task_id, closeCoworkRoom: true }));
+    expect(mocks.closeManagedRoom).toHaveBeenCalledWith(
+      expect.objectContaining({ roomId: ROOM_ID }));
   });
 
   it('finishes a task already in review', async () => {
@@ -328,11 +348,48 @@ describe('task finish', () => {
     expect(getTask(t.task_id).state).toBe('backlog');
   });
 
-  it('still completes the task when room cleanup fails', async () => {
-    mocks.cleanupMembers.mockRejectedValue(new Error('room gone'));
+  it('does not report successful finish when deterministic room close fails', async () => {
+    mocks.closeManagedRoom.mockRejectedValue(new Error('room close failed'));
     const t = await activeTask();
-    await run('finish', t.task_id);
-    expect(getTask(t.task_id).state).toBe('done');
+    await expect(run('finish', t.task_id)).rejects.toThrow(ExitError);
+    expect(getTask(t.task_id)).toMatchObject({
+      state: 'review', terminal_intent: { status: 'pending', error: 'room close failed' },
+    });
+    expect(out.join('\n')).toContain('room close failed');
+  });
+
+  it('the hidden worker durably records failures after terminal acceptance', async () => {
+    mocks.closeManagedRoom.mockRejectedValue(new Error('hidden worker failed'));
+    const t = await activeTask();
+    await expect(run('finish', t.task_id)).rejects.toThrow(ExitError);
+    out = [];
+    await expect(run('_settle', t.task_id)).rejects.toThrow(ExitError);
+    expect(getTask(t.task_id)).toMatchObject({
+      state: 'review',
+      terminal_intent: {
+        status: 'pending',
+        first_failure: 'hidden worker failed',
+        first_recovery_hint: `Retry 'ours-fleet task recover ${t.task_id}'.`,
+        error: 'hidden worker failed',
+        recovery_hint: `External settle worker failed. Retry task recover ${t.task_id}.`,
+      },
+    });
+  });
+
+  it('task recover resumes a pending terminal intent to convergence', async () => {
+    mocks.closeManagedRoom.mockRejectedValueOnce(new Error('room close failed'));
+    const t = await activeTask();
+    await expect(run('finish', t.task_id)).rejects.toThrow(ExitError);
+    mocks.closeManagedRoom.mockResolvedValue({ state: 'closed' });
+    out = [];
+    await run('recover', t.task_id);
+    expect(getTask(t.task_id)).toMatchObject({
+      state: 'done', terminal_intent: {
+        status: 'settled', first_failure: 'room close failed',
+        first_recovery_hint: `Retry 'ours-fleet task recover ${t.task_id}'.`,
+      },
+    });
+    expect(out.join('\n')).toContain(`Task ${t.task_id} · done`);
   });
 
   it('emits the finished task as --json', async () => {

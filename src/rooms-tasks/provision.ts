@@ -6,7 +6,7 @@ import {
 import type { CoworkAdapter } from './cowork-adapter.js';
 import {
   advanceSaga, setSagaError, updateMemberSeats, activateRoom,
-  getRoomRecord, closeRoom as closeRoomRecord,
+  getRoomRecord,
 } from './room-state.js';
 import {
   activateTask, updateTaskMembers, failTask, getTask,
@@ -17,6 +17,7 @@ import type {
 } from './types.js';
 import { spawnTemp } from '../spawn.js';
 import { findRole, type FleetConfig } from '../config.js';
+import { closeManagedRoom } from './close.js';
 
 export function getBinPath(): string {
   try { return realpathSync(process.argv[1]); } catch { return process.argv[1]; }
@@ -293,11 +294,8 @@ export async function cleanupMembers(input: {
 }): Promise<void> {
   const room = getRoomRecord(input.roomId);
   if (!room) return;
-  for (const seat of room.member_seats) {
-    await removeMemberIdentity(seat.role_name);
+  if (!input.closeCoworkRoom || !input.cowork) {
+    throw new Error('member cleanup requires the shared deterministic room-close saga and Cowork adapter');
   }
-  if (input.closeCoworkRoom && input.cowork) {
-    try { await input.cowork.closeRoom(input.roomId); } catch { /* best-effort */ }
-  }
-  closeRoomRecord(input.roomId);
+  await closeManagedRoom({ roomId: input.roomId, cowork: input.cowork });
 }
