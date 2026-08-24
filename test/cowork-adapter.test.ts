@@ -136,7 +136,12 @@ describe('Cowork management-socket adapter', () => {
       methods.push(method);
       if (method === 'room.list') return [room({ state: 'active' })];
       if (method === 'room.participants') return [{ identity: 'C'.repeat(64), role: 'Developer', state: 'active' }];
-      if (method === 'room.show') return room({ state: 'active' });
+      if (method === 'room.show') return room({
+        state: 'active',
+        role_briefings: {
+          Reviewer: { text: 'Exact current charter', version: 4, updated_at: '2026-08-24T00:00:00Z' },
+        },
+      });
       if (method === 'room.close') return room({ state: 'closed' });
       throw new Error(`unexpected ${method}`);
     });
@@ -145,9 +150,107 @@ describe('Cowork management-socket adapter', () => {
     expect(await adapter.getSeats('01ABCDEF0123456789ABCDEFGH')).toEqual([
       { identity_cid: 'C'.repeat(64), role: 'Developer', seat_state: 'active' },
     ]);
-    expect((await adapter.recoverRoom('01ABCDEF0123456789ABCDEFGH')).state).toBe('active');
+    expect(await adapter.recoverRoom('01ABCDEF0123456789ABCDEFGH')).toMatchObject({
+      state: 'active',
+      role_briefings: {
+        Reviewer: { text: 'Exact current charter', version: 4 },
+      },
+    });
     await adapter.closeRoom('01ABCDEF0123456789ABCDEFGH');
     expect(methods).toEqual(['room.list', 'room.participants', 'room.show', 'room.close']);
+  });
+
+  it('authors an exact role briefing and returns its durable version', async () => {
+    const socketPath = await rpcServer(request => {
+      expect(request).toMatchObject({
+        method: 'room.briefing.role.set',
+        params: {
+          room_id: '01ABCDEF0123456789ABCDEFGH',
+          role: 'Reviewer',
+          text: 'Review the exact diff.',
+        },
+      });
+      return room({
+        role_briefings: {
+          Reviewer: {
+            text: 'Review the exact diff.', version: 3,
+            updated_at: '2026-08-24T00:00:00.000Z',
+          },
+        },
+      });
+    });
+    await expect(createCoworkAdapter({ socketPath }).setRoleBriefing(
+      '01ABCDEF0123456789ABCDEFGH',
+      { role: 'Reviewer', text: 'Review the exact diff.' },
+    )).resolves.toEqual({
+      role: 'Reviewer', text: 'Review the exact diff.', version: 3,
+      updated_at: '2026-08-24T00:00:00.000Z',
+    });
+  });
+
+  it('projects only normalized room briefing, chat, and relay history evidence', async () => {
+    const socketPath = await rpcServer(request => {
+      expect(request).toMatchObject({
+        method: 'room.history',
+        params: {
+          room_id: '01ABCDEF0123456789ABCDEFGH', after: 12, limit: 50, view: 'operator',
+        },
+      });
+      return [{
+        kind: 'message', seq: 13, record_id: 'room:13', at: '2026-08-24T00:00:00Z',
+        message_id: 'message-1', category: 'role_briefing',
+        author: { identity: 'A'.repeat(64), display_name: 'Room', role: 'room' },
+        text: 'Role charter', recipient_identities: ['B'.repeat(64)],
+        briefing_role: 'Reviewer', briefing_version: 2,
+      }, {
+        kind: 'relay_intent', seq: 14, record_id: 'room:14', at: '2026-08-24T00:00:01Z',
+        message_id: 'message-1', recipient_identity: 'B'.repeat(64),
+      }, {
+        kind: 'relay_result', seq: 15, record_id: 'room:15', at: '2026-08-24T00:00:02Z',
+        intent_record_id: 'room:14', message_id: 'message-1',
+        recipient_identity: 'B'.repeat(64), status: 'queued', wire_id: 'wire-1',
+      }, {
+        kind: 'file', seq: 16, record_id: 'room:16', at: '2026-08-24T00:00:03Z',
+      }];
+    });
+    await expect(createCoworkAdapter({ socketPath }).getHistory(
+      '01ABCDEF0123456789ABCDEFGH', { after: 12, limit: 50 },
+    )).resolves.toEqual({
+      raw_count: 4,
+      next_after: 16,
+      records: [
+        expect.objectContaining({ kind: 'message', message_id: 'message-1', briefing_version: 2 }),
+        expect.objectContaining({ kind: 'relay_intent', record_id: 'room:14' }),
+        expect.objectContaining({ kind: 'relay_result', status: 'queued', wire_id: 'wire-1' }),
+      ],
+    });
+  });
+
+  it('preserves raw pagination progress when every record is filtered out', async () => {
+    const socketPath = await rpcServer(() => [
+      {
+        kind: 'membership_intent', seq: 40, record_id: 'room:40',
+        at: '2026-08-24T00:00:00Z', action: 'remove',
+      },
+      {
+        kind: 'file', seq: 41, record_id: 'room:41',
+        at: '2026-08-24T00:00:01Z', file_id: 'file-1',
+      },
+    ]);
+    await expect(createCoworkAdapter({ socketPath }).getHistory(
+      '01ABCDEF0123456789ABCDEFGH', { after: 39, limit: 2 },
+    )).resolves.toEqual({ records: [], raw_count: 2, next_after: 41 });
+  });
+
+  it('fails closed on malformed room history author provenance', async () => {
+    const socketPath = await rpcServer(() => [{
+      kind: 'message', seq: 1, record_id: 'room:1', at: 'now', message_id: 'm',
+      category: 'chat', author: { display_name: 'forged', role: 'Owner' },
+      text: '{}', recipient_identities: [],
+    }]);
+    await expect(createCoworkAdapter({ socketPath }).getHistory(
+      '01ABCDEF0123456789ABCDEFGH',
+    )).rejects.toThrow(/author.identity/);
   });
 
   it('fails closed on Cowork RPC errors', async () => {

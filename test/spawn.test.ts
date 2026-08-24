@@ -259,6 +259,24 @@ describe('spawnTemp', () => {
     expect(snap.session).toBe('acp');
   });
 
+  it('persists a trusted room startup gate only in the temp role snapshot', async () => {
+    const gate = {
+      room_id: '01ROOM', room_identity_cid: 'A'.repeat(64),
+      briefing_role: 'Reviewer', briefing_version: 1,
+      briefing_sha256: 'b'.repeat(64), owner_seat_cid: null,
+    };
+    const d = await spawnTemp({
+      name: 'RoomReviewer', mission: 'bootstrap', roomStartupGate: gate,
+    }, '/b/ours-fleet', () => {});
+    const snap = parse(readFileSync(join(d, 'role.yaml'), 'utf8'));
+    expect(snap.roomStartupGate).toEqual(gate);
+    expect(readFileSync(join(d, 'briefing.md'), 'utf8')).toContain('## Room startup gate');
+    writeFileSync(join(dir, 'public-gate.yaml'), stringify({
+      roles: { Public: { roomStartupGate: gate } },
+    }));
+    expect(() => loadConfig(join(dir, 'public-gate.yaml'))).toThrow();
+  });
+
   it('never inherits wildcard scheduled loops into a temporary role', async () => {
     writeFileSync(join(dir, 'fleet.yaml'), stringify({
       defaults: { harness: 'fake', session: 'acp' },

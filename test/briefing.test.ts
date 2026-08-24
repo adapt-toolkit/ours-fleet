@@ -72,6 +72,66 @@ describe('generateBriefing', () => {
     expect(b).not.toContain('## Charter');
     expect(b).toContain('choose_identity');   // boot steps always appended
     expect(b).toContain('## On restart');
+    expect(b).toContain('did not declare a profile source');
+    expect(b).not.toContain('with the **Charter** section above');
+  });
+
+  it('uses Mission as the explicit profile source when no persona exists', () => {
+    const b = generateBriefing({ ...base, persona: undefined }, vocab, opts);
+    expect(b).toContain('summary of your Mission');
+    expect(b).toContain('with the **Mission** section above');
+    expect(b).not.toContain('summary of your Charter');
+  });
+
+  it('renders a CID-pinned room gate before any authoritative profile write', () => {
+    const roomRole = {
+      ...base,
+      session: 'acp' as const,
+      persona: undefined,
+      mission: 'LOCAL BOOTSTRAP ONLY — authoritative charter must not be copied here',
+      monitor: {
+        mode: 'fleet' as const, enabled: true, wake_sources: [], batch_ms: 2000,
+        inject: 'notification' as const,
+      },
+      roomStartupGate: {
+        room_id: '01ROOM', room_identity_cid: 'A'.repeat(64),
+        briefing_role: 'Reviewer', briefing_version: 2,
+        briefing_sha256: 'b'.repeat(64), owner_seat_cid: 'C'.repeat(64),
+      },
+    } as ResolvedRole;
+    const b = generateBriefing(roomRole, vocab, opts);
+    expect(b).toContain('## Room startup gate');
+    expect(b).toContain('room_role_briefing');
+    expect(b).toContain('A'.repeat(64));
+    expect(b).toContain('C'.repeat(64));
+    expect(b).toContain('briefing_message_id');
+    expect(b).toContain('profile_applied');
+    expect(b).toContain('list_history');
+    expect(b).toContain('get_history_item');
+    expect(b).toContain('Only after the ACK is sent');
+    expect(b).not.toContain('LOCAL BOOTSTRAP ONLY');
+    const receive = b.indexOf('Call **get_messages**');
+    const profile = b.indexOf('set the entire exact text as your persona');
+    const ack = b.indexOf('fleet_room_briefing_ack');
+    const monitor = b.indexOf('Wakes arrive as [fleet-monitor]');
+    expect(receive).toBeGreaterThan(0);
+    expect(profile).toBeGreaterThan(receive);
+    expect(ack).toBeGreaterThan(profile);
+    expect(monitor).toBeGreaterThan(ack);
+  });
+
+  it('makes owner_seat_cid=null mean no room participant has Owner authority', () => {
+    const b = generateBriefing({
+      ...base,
+      roomStartupGate: {
+        room_id: '01ROOM', room_identity_cid: 'A'.repeat(64),
+        briefing_role: 'Reviewer', briefing_version: 1,
+        briefing_sha256: 'b'.repeat(64), owner_seat_cid: null,
+      },
+    } as ResolvedRole, vocab, opts);
+    expect(b).toContain('Authenticated Owner seat CID: `none`');
+    expect(b).toContain('this room has no authenticated Owner seat');
+    expect(b).toContain('"owner_seat_cid":null');
   });
 
   it('renders the Routines section with the injected routinesPath', () => {

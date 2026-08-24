@@ -11,6 +11,7 @@ import {
   resolveRoleModel, resolveWorklogPolicy, validateMonitorConfig,
   type ApprovalMode, type FilesystemMode, type ResolvedRole, type RoleConfig,
   type CommonPermissions, type MonitorConfig, type SessionBackendId, type UnattendedMode,
+  type RoomStartupGate,
 } from './config.js';
 import { applyRole, up, type OpsDeps } from './ops.js';
 import { START_STAGGER_FILE } from './runner.js';
@@ -72,6 +73,8 @@ export interface SpawnOpts {
   creationActionId?: string;
   /** Set only by a live role supervisor after a role-scoped proxy request. */
   callerRole?: string;
+  /** Trusted Fleet-internal gate for a Cowork room member; not a CLI/config surface. */
+  roomStartupGate?: RoomStartupGate;
   /** Internal provenance labels for values filled by the caller's supervisor. */
   inheritedFromCaller?: string[];
   /**
@@ -518,6 +521,7 @@ async function spawnTempInner(
     worklog: resolveWorklogPolicy(cfg.defaults.worklog, fromOpts.worklog),
     auth_proxy: resolveAuthProxy(cfg.defaults.auth_proxy, fromOpts.auth_proxy),
     sourceFile: '(temp)',
+    roomStartupGate: o.roomStartupGate,
   };
   role.env = {
     ...((cfg.defaults.env ?? {}) as Record<string, string>),

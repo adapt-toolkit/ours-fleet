@@ -9,7 +9,7 @@ import {
   TEMP_LAUNCH_GRACE_MS, archiveTempState, makeTempSupervisorLauncher,
   markTempSupervisorActive, prepareTempSupervisor, readTempSupervisor,
   reclaimStaleTempState, secureStoppedTempArchive, stopTempSupervisor,
-  tempArchiveForLaunch, tempSupervisorLiveness, tempSystemdUnit,
+  tempArchiveForCreationAction, tempArchiveForLaunch, tempSupervisorLiveness, tempSystemdUnit,
 } from '../src/temp-lifecycle.js';
 import { agentDir, stateRoot } from '../src/paths.js';
 import type { Exec } from '../src/exec.js';
@@ -251,6 +251,23 @@ describe('exact operator targeting and evidence', () => {
       'WORKLOG.md', 'role.yaml', 'termination.jsonl',
     ]);
     expect(readFileSync(join(archived, 'WORKLOG.md'), 'utf8')).toBe('room evidence\n');
+  });
+
+  it('resolves a terminated archive by exact creation action provenance', async () => {
+    const dir = temp('CrashWindow');
+    writeFileSync(join(dir, 'creation.json'), JSON.stringify({
+      role: 'CrashWindow', creationActionId: 'action-123',
+    }));
+    await markTempSupervisorActive(dir, 424242);
+    const launchId = readTempSupervisor(dir)!.launchId;
+    const archived = await secureStoppedTempArchive('CrashWindow', launchId, {
+      kill: () => { throw Object.assign(new Error('gone'), { code: 'ESRCH' }); },
+      exec: async () => ({ stdout: '', stderr: '', code: 0 }),
+    });
+    expect(tempArchiveForCreationAction('CrashWindow', 'action-123')).toEqual({
+      path: archived, launchId,
+    });
+    expect(tempArchiveForCreationAction('CrashWindow', 'other')).toBeUndefined();
   });
 });
 

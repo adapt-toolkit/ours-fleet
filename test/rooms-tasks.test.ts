@@ -17,7 +17,8 @@ import {
 import {
   createRoomRecord, getRoomRecord, listRoomRecords,
   advanceSaga, setSagaError, setRoomIdentity, setOwnerSeat,
-  updateMemberSeats, activateRoom, closeRoom,
+  updateMemberSeats, updateRoomRoleBriefing, updateMemberStartup,
+  activateRoom, closeRoom,
   RoomStateError,
 } from '../src/rooms-tasks/room-state.js';
 import {
@@ -507,6 +508,69 @@ describe('room-state', () => {
       const r = updateMemberSeats('mem-1', seats);
       expect(r.member_seats).toHaveLength(1);
       expect(r.member_seats[0].role_name).toBe('Dev-1');
+    });
+  });
+
+  describe('durable member startup state', () => {
+    it('persists one exact role definition at room scope', () => {
+      createRoomRecord({ room_id: 'brief-1', room_name: 'Brief' });
+      const r = updateRoomRoleBriefing('brief-1', 'Reviewer', {
+        role: 'Reviewer', text: 'Review exactly.', sha256: 'a'.repeat(64),
+        version: 2, state: 'configured', attempts: 1,
+        updated_at: '2026-08-24T00:00:00.000Z',
+      });
+      expect(r.role_briefings?.Reviewer).toMatchObject({ version: 2, attempts: 1 });
+      expect(getRoomRecord('brief-1')?.role_briefings?.Reviewer.text).toBe('Review exactly.');
+    });
+
+    it('persists forward-only launch and briefing progress per seat', () => {
+      createRoomRecord({ room_id: 'brief-2', room_name: 'Brief' });
+      updateMemberSeats('brief-2', [{
+        role_name: 'Reviewer-1', identity_cid: 'cid-1', slot: 'reviewer',
+        cowork_role: 'Reviewer', seat_state: 'active',
+      }]);
+      updateMemberStartup('brief-2', 'Reviewer-1', {
+        launch: {
+          state: 'intent', attempt: 1, action_id: 'action-1',
+          mission_sha256: 'b'.repeat(64), updated_at: '2026-08-24T00:00:00.000Z',
+        },
+        briefing: {
+          role: 'Reviewer', state: 'pending', rejected_ack_count: 0,
+        },
+      });
+      const r = updateMemberStartup('brief-2', 'Reviewer-1', {
+        launch: {
+          state: 'launched', attempt: 1, action_id: 'action-1',
+          mission_sha256: 'b'.repeat(64), launch_id: 'launch-1',
+          updated_at: '2026-08-24T00:00:01.000Z',
+        },
+        briefing: {
+          role: 'Reviewer', state: 'relay_queued', message_id: 'message-1',
+          relay_intent_record_id: 'room:2', relay_result_record_id: 'room:3',
+          rejected_ack_count: 0,
+        },
+      });
+      expect(r.member_seats[0].launch?.launch_id).toBe('launch-1');
+      expect(r.member_seats[0].briefing?.state).toBe('relay_queued');
+      expect(() => updateMemberStartup('brief-2', 'Reviewer-1', {
+        briefing: { role: 'Reviewer', state: 'pending', rejected_ack_count: 0 },
+      })).toThrow(/cannot move backward/);
+    });
+
+    it('permits a stopped launch to begin a new durable attempt', () => {
+      createRoomRecord({ room_id: 'brief-3', room_name: 'Brief' });
+      updateMemberSeats('brief-3', [{
+        role_name: 'Reviewer-1', identity_cid: 'cid-1', slot: 'reviewer',
+        cowork_role: 'Reviewer', seat_state: 'active',
+        launch: { state: 'stopped', attempt: 1, updated_at: 'old' },
+      }]);
+      const r = updateMemberStartup('brief-3', 'Reviewer-1', {
+        launch: {
+          state: 'intent', attempt: 2, action_id: 'action-2',
+          mission_sha256: 'c'.repeat(64), updated_at: 'new',
+        },
+      });
+      expect(r.member_seats[0].launch).toMatchObject({ state: 'intent', attempt: 2 });
     });
   });
 
