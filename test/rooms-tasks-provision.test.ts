@@ -587,7 +587,7 @@ describe('provision saga', () => {
       expect(removeCallArgs.length).toBeGreaterThanOrEqual(1);
     });
 
-    it('rolls back all identities when cowork admission fails', async () => {
+    it('retains durable identities and resumes when cowork admission fails', async () => {
       const template = makeTemplate();
       const cowork = mockCoworkAdapter({ issueInviteFail: true });
       const task = createTask({ title: 'Admit fail', origin: { type: 'cli' } });
@@ -605,9 +605,20 @@ describe('provision saga', () => {
       const room = getRoomRecord('room-admit')!;
       expect(room.saga.error).toBe('invite issuance failed');
       expect(room.provisioning_detail).toBe('member_failed');
+      expect(room.member_seats).toHaveLength(2);
 
       const t = getTask(task.task_id);
-      expect(t.state).toBe('failed');
+      expect(t.state).toBe('provisioning');
+      expect(t.blocked?.reason).toBe('invite issuance failed');
+      expect(mocks.mockRemoveIdentity).not.toHaveBeenCalled();
+
+      const recovered = await provisionMembers({
+        cfg: minimalCfg(), cowork: mockCoworkAdapter(), roomId: 'room-admit',
+        taskId: task.task_id, template, binPath: '/usr/bin/ours-fleet',
+      });
+      expect(recovered.state).toBe('active');
+      expect(mocks.mockCreateIdentity).toHaveBeenCalledTimes(2);
+      expect(getTask(task.task_id).blocked).toBeUndefined();
     });
   });
 

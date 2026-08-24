@@ -195,7 +195,8 @@ async function ensureLaunch(input: {
       throw new Error(`existing launch for ${member.name} does not match its durable intent`);
     }
     const supervisor = readTempSupervisor(dir);
-    if (!supervisor) throw new Error(`existing launch for ${member.name} has no supervisor metadata`);
+    if (!supervisor || supervisor.role !== member.name)
+      throw new Error(`existing launch for ${member.name} has mismatched supervisor metadata`);
     const live = await tempSupervisorLiveness(dir);
     if (live === 'unknown') throw new Error(`existing launch for ${member.name} has unknown liveness`);
     if (live === 'running') {
@@ -234,7 +235,8 @@ async function ensureLaunch(input: {
     surface: 'agent', creationActionId: actionId, roomStartupGate: gate,
   }, provision.binPath);
   const supervisor = readTempSupervisor(launchedDir);
-  if (!supervisor || !launchMatches(launchedDir, member, actionId, missionSha, gate)) {
+  if (!supervisor || supervisor.role !== member.name
+      || !launchMatches(launchedDir, member, actionId, missionSha, gate)) {
     throw new Error(`new launch for ${member.name} did not persist matching provenance`);
   }
   updateMemberStartup(provision.roomId, member.name, { launch: {
@@ -375,6 +377,7 @@ export async function provisionMembers(
       });
       setSagaError(roomId, error instanceof Error ? error.message : String(error),
         'Role briefing configuration failed. Retry task or room recover.', 'member_failed');
+      if (taskId) blockTask(taskId, error instanceof Error ? error.message : String(error));
       throw error;
     }
   }
@@ -400,10 +403,9 @@ export async function provisionMembers(
       }
     }
   } catch (error) {
-    for (const name of createdIdentities) await removeMemberIdentity(name);
     setSagaError(roomId, error instanceof Error ? error.message : String(error),
       'Role-group admission failed. Retry with `task recover`.', 'member_failed');
-    if (taskId) failTask(taskId, error instanceof Error ? error.message : String(error));
+    if (taskId) blockTask(taskId, error instanceof Error ? error.message : String(error));
     throw error;
   }
 
