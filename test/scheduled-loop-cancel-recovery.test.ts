@@ -28,14 +28,14 @@ function definition(overrides: Partial<ResolvedRoleLoop> = {}): ResolvedRoleLoop
 }
 
 /**
- * The confirmed post-upgrade D6 shape, reproduced end to end against the ACP
+ * The confirmed cancellation-recovery shape, reproduced end to end against the ACP
  * fixture: a scheduled health pass ignores its cancellation and keeps running
  * until the loop's own deadline fires (in production ~300 s), then the ACP
  * cancel grace expires on top of it (~15 s more — the observed ~315 s), and the
  * adapter is restarted. Everything below the loop deadline uses real code; only
  * the loop's own timers are driven by the fake clock so the test is fast.
  */
-describe('scheduled-loop cancellation recovery (D6)', () => {
+describe('scheduled-loop cancellation recovery', () => {
   it('recovers a health pass that ignores cancellation, and leaves no run active', async () => {
     const stateDir = mkdtempSync(join(tmpdir(), 'ours-fleet-loop-acp-'));
     dirs.push(stateDir);

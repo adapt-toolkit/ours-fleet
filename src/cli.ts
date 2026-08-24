@@ -58,6 +58,7 @@ import {
 } from './fleet-proxy.js';
 import './harness/claude-code.js';   // registers the claude-code adapter
 import './harness/codex.js';         // registers the codex adapter
+import { registerTemplateCommands, registerTaskCommands, registerRoomCommands } from './rooms-tasks/cli.js';
 
 // sudo/su shells lack XDG_RUNTIME_DIR, breaking every systemctl/journalctl
 // --user child (supervisor commands, logs, doctor). Derive it before dispatch. (#9)
@@ -476,7 +477,7 @@ program.command('status <name>').description('unit/agent state')
     const buildNote = created && creationBuildNote(created);
     if (buildNote) console.log(`build: ${buildNote}`);
     // A held-down role looks like a healthy running unit from the outside — the
-    // runner is alive on purpose. Say so, with the reason and when (3.2).
+    // runner is alive on purpose. Say so, with the reason and when.
     const ledger = readRestartLedger(agentDir(name));
     if (ledger.circuit === 'open')
       console.log(`HELD DOWN since ${ledger.openedAt ?? ledger.updatedAt} after `
@@ -873,7 +874,7 @@ cOpt(ownerAuthorizationCommand.command('revoke <Role> <contact-cid>')
 /**
  * A watchdog is addressable if it's still configured, or its store dir survives
  * config removal. The name-shape check runs BEFORE any filesystem lookup
- * (finding #1): a hostile `name` (path separators, '..', etc.) must never
+ * A hostile `name` (path separators, '..', etc.) must never
  * reach `join(watchdogsRoot(), name)` — treated as simply unknown, same as
  * store.ts's own `watchdogDir` choke-point guard (defense in depth).
  */
@@ -890,7 +891,7 @@ function renderHeldDownLine(state: WatchdogSchedulerState): string | undefined {
     + `consecutive failures: ${state.lastError ?? 'unknown error'}`;
 }
 
-/** errorReport() rides a bounded diagnostic tail as an extra key outside WatchdogReport proper (spec: acceptance 9). */
+/** errorReport() carries a bounded diagnostic tail as an extra key outside WatchdogReport proper. */
 type ReportWithTail = WatchdogReport & { tail?: string };
 
 /** Full human rendering of one report: header, held-down warning, counts, then non-healthy roles + evidence. */
@@ -1105,7 +1106,7 @@ cOpt(program.command('spawn [name]').description('spawn a new agent (permanent b
         console.log(`spawned '${roleName}' (config: ${file})`);
       }
       // The same provenance that was persisted, so what the operator reads now
-      // and what a reviewer reads later cannot disagree (6.6).
+      // and what a reviewer reads later cannot disagree.
       if (lastProvenance) {
         console.log(`  created by ${lastProvenance.command} `
           + `v${lastProvenance.fleetVersion}+${lastProvenance.fleetBuild} `
@@ -1303,11 +1304,16 @@ function configureWebAccess(opts: {
   return undefined;
 }
 
+// ── rooms & tasks ──────────────────────────────────────────────────────────
+registerTemplateCommands(program, cOpt);
+registerTaskCommands(program, cOpt);
+registerRoomCommands(program, cOpt);
+
 program.command('_run <name>', { hidden: true }).description('internal: supervisor entrypoint')
   .option('-c, --configuration <file>')
   .action(async (name, opts) => {
     // The supervised loop, not a single session: restart policy lives here now,
-    // where it can count across attempts (3.2).
+    // where it can count across attempts.
     try { await runSupervised(name, { configPath: opts.configuration }); } catch (e) { die(e); }
   });
 

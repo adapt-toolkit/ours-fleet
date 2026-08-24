@@ -125,7 +125,7 @@ describe('AcpSession', () => {
     await session.close();
   });
 
-  it('a refused turn is delivered but not successful (1.2)', async () => {
+  it('a refused turn is delivered but not successful', async () => {
     const session = await start();
     const result = await session.submitPrompt('refuse this');
     expect(result).toMatchObject({
@@ -137,7 +137,7 @@ describe('AcpSession', () => {
     await session.close();
   });
 
-  it('a cancelled turn is delivered but not successful (1.2)', async () => {
+  it('a cancelled turn is delivered but not successful', async () => {
     const session = await start();
     const result = await session.submitPrompt('cancel this');
     expect(result).toMatchObject({ accepted: true, outcome: 'cancelled', succeeded: false });
@@ -251,7 +251,7 @@ describe('AcpSession', () => {
     await session.close();
   });
 
-  it('denies unattended requests once each, never always (1.3)', async () => {
+  it('denies unattended requests once each, never always', async () => {
     const session = await start('ask');          // unattended: 'deny', no controller
     const result = await session.submitPrompt('permission twice');
     expect(result.succeeded).toBe(true);
@@ -276,7 +276,7 @@ describe('AcpSession', () => {
     await session.close();
   });
 
-  it('persists each automatic decision to .session-events.jsonl (1.3)', async () => {
+  it('persists each automatic decision to .session-events.jsonl', async () => {
     const session = await start('ask');
     await session.submitPrompt('permission twice');
     const stateDir = dirs.at(-1)!;
@@ -291,7 +291,7 @@ describe('AcpSession', () => {
     await session.close();
   });
 
-  it('records a policy denial as approval=deny, not as an unattended one (1.3)', async () => {
+  it('records a policy denial as approval=deny, not as an unattended one', async () => {
     const session = await start('deny');
     session.setControllerAttached(true);         // attached, and still denied
     await session.submitPrompt('permission');
@@ -304,7 +304,7 @@ describe('AcpSession', () => {
     await session.close();
   });
 
-  it('records an automatic allow with the policy that permitted it (1.3)', async () => {
+  it('records an automatic allow with the policy that permitted it', async () => {
     const session = await start('allow');
     await session.submitPrompt('permission');
     const decision = session.eventsSince(0).find(e => e.kind === 'permission');
@@ -386,7 +386,7 @@ describe('AcpSession', () => {
     await session.close();
   });
 
-  it('queues a prompt behind a running turn instead of waiting for it (1.5)', async () => {
+  it('queues a prompt behind a running turn instead of waiting for it', async () => {
     const session = await start();
     const busy = session.submitPrompt('block 1500');        // a turn that runs for 1.5s
     await new Promise(r => setTimeout(r, 50));              // let it actually start
@@ -407,7 +407,7 @@ describe('AcpSession', () => {
     await session.close();
   });
 
-  it('queuePrompt on a dead session is a typed offline error (1.5)', async () => {
+  it('queuePrompt on a dead session is a typed offline error', async () => {
     const session = await start();
     await session.close();
     const error = await session.queuePrompt('hi').then(() => null, e => e as SessionControlError);
@@ -972,7 +972,7 @@ describe('AcpSession', () => {
   });
 });
 
-describe('role control failures are typed (1.5)', () => {
+describe('role control failures are typed', () => {
   it('reports a forced cancellation to the control plane as accepted, not failed', async () => {
     const session = await start('allow', { cancelGraceMs: 120 });
     const stateDir = dirs.at(-1)!;

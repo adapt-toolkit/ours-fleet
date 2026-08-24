@@ -377,7 +377,7 @@ describe('validateOptions / prereqs', () => {
   });
 });
 
-describe('Codex neutral permission mapping and the unattended floor (2.1)', () => {
+describe('Codex neutral permission mapping and the unattended floor', () => {
   const a = makeCodexAdapter(okExec);
   const APPROVALS = ['ask', 'auto', 'allow', 'deny'] as const;
   const FILESYSTEMS = ['read-only', 'workspace', 'unrestricted'] as const;

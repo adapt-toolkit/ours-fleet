@@ -19,7 +19,7 @@ import type {
  * generic rendering paths.
  */
 
-/** Cap for any single normalized text payload (spec §5.3). */
+/** Cap for any single normalized text payload. */
 export const MAX_TEXT_BYTES = 256 * 1024;
 /** Cap for each retained side of an oversized snapshot-style file diff. */
 export const MAX_DIFF_TEXT_BYTES = 64 * 1024;

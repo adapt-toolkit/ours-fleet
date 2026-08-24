@@ -72,7 +72,7 @@ describe('buildWatchdogFindings', () => {
     expect(findings.size).toBe(1);
   });
 
-  it('skips a disabled watchdog entirely, even though its last stored report still has a blocked finding (finding #5)', () => {
+  it('skips a disabled watchdog entirely even when its last stored report has a blocked finding', () => {
     const reports: Record<string, WatchdogReport | undefined> = {
       nightwatch: report({
         watchdog: 'nightwatch', status: 'anomalies',

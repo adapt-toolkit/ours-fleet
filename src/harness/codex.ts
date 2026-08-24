@@ -324,7 +324,7 @@ export function makeCodexAdapter(exec: Exec = realExec): HarnessAdapter {
     },
 
     async prepareSession(role: ResolvedRole, dirs: RoleDirs): Promise<SessionPrep> {
-      // Per-role harness runtime home (5.1); harmless for un-isolated roles.
+      // Per-role harness runtime home; harmless for un-isolated roles.
       // Only a role that declares `isolation:` gets a sandbox, and only a
       // sandbox needs this directory to exist before entry.
       if (role.isolation) mkdirSync(harnessRuntimeDir(dirs.stateDir, 'codex'), { recursive: true });
@@ -491,7 +491,8 @@ export function makeCodexAdapter(exec: Exec = realExec): HarnessAdapter {
       currentIdentityTool: 'current_identity',
       sendTool: 'send_message',
       getMessagesTool: 'get_messages',
-      watchCommand: id => `ours-mcp watch "${id}"`,
+      listHistoryTool: 'list_history',
+      getHistoryItemTool: 'get_history_item',
       monitorInstruction: (id, configuredRole) => {
         const consented = (configuredRole?.harness_options as CodexOptions | undefined)?.monitor === true;
         const consent = consented

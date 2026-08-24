@@ -1,23 +1,26 @@
 import { createHash } from 'node:crypto';
 import {
-  chmodSync, copyFileSync, lstatSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync,
+  chmodSync, copyFileSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync,
+  symlinkSync, writeFileSync,
 } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { PassThrough } from 'node:stream';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import type { OwnerAttachmentConfig, OwnerChannelConfig } from '../src/config.js';
 import {
   AttachmentRecoveryState, admitAttachments, cleanupAttachmentRoot, prepareAttachmentDirectory,
   parseRetrievedAttachments, sanitizeFilename, validateAttachmentSelection,
-  validateAttachmentRelaySelection,
+  validateAttachmentRelaySelection, writeRecoveredAttachment,
   type IncomingAttachment, type RetrievedAttachment,
 } from '../src/owner-channel/attachments.js';
 import { OwnerChannel } from '../src/owner-channel/channel.js';
-import type { OursToolClient } from '../src/owner-channel/mcp.js';
+import type {
+  OursContactsView, OursInboundMessage, OursIncomingFile, OursOps, OursRetrievedFile,
+} from '../src/owner-channel/ours-client.js';
 import { OwnerConversationState } from '../src/owner-channel/state.js';
 import type { QueuedPrompt, SessionHandle, TurnResult } from '../src/session/types.js';
+import { historyFile, historyMessage, incomingMessage } from './owner-history-fixtures.js';
 
 const OWNER = 'A'.repeat(64);
 const OTHER = 'B'.repeat(64);
@@ -31,33 +34,93 @@ const attachmentConfig: OwnerAttachmentConfig = {
   allowed_mime: ['text/plain', 'application/pdf', 'image/png', 'audio/ogg'],
 };
 
-class AttachmentClient implements OursToolClient {
+const EMPTY_CONTACTS: OursContactsView = {
+  contacts: [], pending: [], roots: {}, degraded: [], renames: {},
+};
+
+class AttachmentClient implements OursOps {
   calls: Array<{ name: string; args?: Record<string, unknown> }> = [];
   batches: unknown[][] = [];
   files: unknown[] = [];
   retrieved = new Map<string, Record<string, unknown>>();
+  messageHistory = new Map<string, OursInboundMessage>();
   failText?: string;
   failFile = false;
   failTools = new Set<string>();
   async start() {}
   async close() {}
-  async callTool(name: string, args?: Record<string, unknown>): Promise<unknown> {
+  async bindIdentity(name: string) { this.record('bindIdentity', { name }); }
+  async listContacts() { this.record('listContacts'); return EMPTY_CONTACTS; }
+  async generateInvite(name?: string) {
+    this.record('generateInvite', { name });
+    return { blob: 'blob', inviteId: 'invite-1', mode: 'one_time' as const };
+  }
+  async addContact(a: { invite: string; name?: string }) {
+    this.record('addContact', { ...a });
+    return { display: a.name ?? 'Peer', cid: OTHER };
+  }
+  async listIncomingMessages() {
+    this.record('listIncomingMessages');
+    const batch = this.batches[0] ?? [];
+    if (!batch.length) this.batches.shift();
+    return batch.map((item, index) => {
+      const persistent = historyMessage(item, index + 1);
+      this.messageHistory.set(persistent.wire_id, persistent);
+      return incomingMessage(item, index + 1);
+    });
+  }
+  async getMessages(limit: number) {
+    this.record('getMessages', { limit });
+    const batch = this.batches.shift() ?? [];
+    const messages = batch.slice(0, limit).map((item, index) => historyMessage(item, index + 1));
+    for (const message of messages) this.messageHistory.set(message.wire_id, message);
+    if (batch.length > limit) this.batches.unshift(batch.slice(limit));
+    return { count: messages.length, messages, remaining: Math.max(0, batch.length - limit) };
+  }
+  async getHistoryItem(wireId: string) {
+    this.record('getHistoryItem', { wireId });
+    return this.messageHistory.get(wireId) ?? null;
+  }
+  async *watchNotifications(
+    _identity: string, options?: { since?: number | 'tip'; signal?: AbortSignal },
+  ) {
+    await new Promise<void>(resolve => {
+      if (options?.signal?.aborted) resolve();
+      else options?.signal?.addEventListener('abort', () => resolve(), { once: true });
+    });
+  }
+  async listIncomingFiles() {
+    this.record('listIncomingFiles');
+    return this.files as OursIncomingFile[];
+  }
+  async getFileInfo(wireId: string) {
+    this.record('getFileInfo', { wireId });
+    const item = this.retrieved.get(wireId) ?? this.files.find(value =>
+      String((value as Record<string, unknown>).wire_id ?? '') === wireId);
+    return item ? historyFile(item) : null;
+  }
+  async getFiles(wireIds: string[]) {
+    this.record('getFiles', { wireIds });
+    return {
+      files: wireIds.map(wire => this.retrieved.get(wire)) as OursRetrievedFile[],
+      text: '', mode: 'selected' as const, requested: wireIds,
+    };
+  }
+  async fetchFile(wireId: string) {
+    this.record('fetchFile', { wireId });
+    return readFileSync(String(this.retrieved.get(wireId)?.path));
+  }
+  async sendMessage(a: { contact: string; text: string; replyToWireId?: string }) {
+    this.record('sendMessage', { ...a });
+    if (a.text === this.failText) throw new Error('transport unavailable');
+  }
+  async sendFile(a: { contact: string; path: string; filename: string; replyToWireId?: string }) {
+    this.record('sendFile', { ...a });
+    if (this.failFile) throw new Error('file transport unavailable');
+  }
+  private record(name: string, args?: Record<string, unknown>): void {
     this.calls.push({ name, args });
     if (this.failTools.has(name)) throw new Error(`${name} failed`);
-    if (name === 'get_messages') return { messages: this.batches.shift() ?? [] };
-    if (name === 'list_incoming_files') return { count: this.files.length, files: this.files };
-    if (name === 'get_files') {
-      const wires = args?.wire_ids as string[];
-      return { files: wires.map(wire => this.retrieved.get(wire)) };
-    }
-    if (name === 'save_file') {
-      const item = this.retrieved.get(String(args?.wire_id));
-      copyFileSync(String(item?.path), String(args?.dest_path));
-      return { saved: true };
-    }
-    if (name === 'send_message' && args?.text === this.failText) throw new Error('transport unavailable');
-    if (name === 'send_file' && this.failFile) throw new Error('file transport unavailable');
-    return {};
   }
 }
 
@@ -73,7 +136,7 @@ function listed(overrides: Record<string, unknown> = {}) {
 function retrieved(source: string, bytes: Buffer, overrides: Record<string, unknown> = {}) {
   return {
     ...listed(), path: source, size: bytes.length,
-    sha256: createHash('sha256').update(bytes).digest('hex'), status: 'processed',
+    sha256: createHash('sha256').update(bytes).digest('hex'), status: 'read',
     sender: 'Phone', ...overrides,
   };
 }
@@ -89,11 +152,12 @@ function deferredPrompt() {
 
 async function setup(
   owners = [OWNER], recover = false, attachments = attachmentConfig, agent?: string,
-  existingDir?: string,
+  existingDir?: string, prepare?: (client: AttachmentClient) => void, start = true,
 ) {
   const dir = existingDir ?? mkdtempSync(join(tmpdir(), 'ours-owner-attachments-'));
   if (!existingDir) dirs.push(dir);
   const client = new AttachmentClient();
+  prepare?.(client);
   const pending = deferredPrompt();
   const queuePrompt = vi.fn(async () => pending.queued);
   const session = {
@@ -112,13 +176,11 @@ async function setup(
   const logs: string[] = [];
   const channel = new OwnerChannel({
     role: 'Role', harness: 'claude-code', config, session, stateDir: dir, client, log: line => logs.push(line),
-    watch: () => ({
-      pid: 1, exitCode: null, stdout: new PassThrough(), stderr: new PassThrough(),
-      once: () => undefined, kill: () => true,
-    }) as never,
   });
-  await channel.start();
-  await channel.drain();
+  if (start) {
+    await channel.start();
+    await channel.drain();
+  }
   return { dir, client, channel, queuePrompt, logs, ...pending };
 }
 
@@ -128,6 +190,13 @@ afterEach(() => {
 });
 
 describe('owner-channel attachment ingress', () => {
+  it('fails closed when a journaled file is absent from persistent history', async () => {
+    const status = await setup(
+      [OWNER], true, attachmentConfig, undefined, undefined, undefined, false);
+    await expect(status.channel.drain()).rejects.toThrow(/missing from persistent history/);
+    expect(status.queuePrompt).not.toHaveBeenCalled();
+  });
+
   it('handles a file-only wake, admits bytes privately, and cleans up after exact-wire delivery', async () => {
     const status = await setup();
     const bytes = Buffer.from('hello');
@@ -137,7 +206,7 @@ describe('owner-channel attachment ingress', () => {
     status.client.retrieved.set(FILE_WIRE, retrieved(source, bytes));
 
     await status.channel.drain();
-    expect(status.client.calls).toContainEqual({ name: 'get_files', args: { wire_ids: [FILE_WIRE] } });
+    expect(status.client.calls).toContainEqual({ name: 'getFiles', args: { wireIds: [FILE_WIRE] } });
     const prompt = String(status.queuePrompt.mock.calls[0][0]);
     expect(prompt).toContain('notes.txt');
     expect(prompt).toContain('detected MIME: text/plain');
@@ -147,8 +216,8 @@ describe('owner-channel attachment ingress', () => {
     expect(readFileSync(admittedPath!, 'utf8')).toBe('hello');
 
     status.finish({ accepted: true, outcome: 'completed', succeeded: true, output: 'Reviewed.' });
-    await vi.waitFor(() => expect(status.client.calls).toContainEqual({ name: 'send_message', args: {
-      contact: OWNER, text: 'Reviewed.', reply_to_wire_id: FILE_WIRE,
+    await vi.waitFor(() => expect(status.client.calls).toContainEqual({ name: 'sendMessage', args: {
+      contact: OWNER, text: 'Reviewed.', replyToWireId: FILE_WIRE,
     } }));
     await vi.waitFor(() => expect(() => lstatSync(admittedPath!)).toThrow());
     expect(readFileSync(join(status.dir, '.owner-channel-state.json'), 'utf8')).not.toContain('hello');
@@ -193,17 +262,17 @@ describe('owner-channel attachment ingress', () => {
     const unauthorized = await setup();
     unauthorized.client.files = [listed({ from: { id: OTHER, name: 'Impostor' } })];
     await unauthorized.channel.drain();
-    expect(unauthorized.client.calls.some(call => call.name === 'get_files')).toBe(false);
-    expect(unauthorized.client.calls.some(call => call.name === 'send_message')).toBe(false);
+    expect(unauthorized.client.calls.some(call => call.name === 'getFiles')).toBe(false);
+    expect(unauthorized.client.calls.some(call => call.name === 'sendMessage')).toBe(false);
     await unauthorized.channel.close();
 
     for (const overrides of [{ size: 2_000 }, { mime: 'application/x-executable' }]) {
       const rejected = await setup();
       rejected.client.files = [listed(overrides)];
       await rejected.channel.drain();
-      expect(rejected.client.calls.some(call => call.name === 'get_files')).toBe(false);
-      expect(rejected.client.calls.find(call => call.name === 'send_message')?.args)
-        .toMatchObject({ contact: OWNER, reply_to_wire_id: FILE_WIRE });
+      expect(rejected.client.calls.some(call => call.name === 'getFiles')).toBe(false);
+      expect(rejected.client.calls.find(call => call.name === 'sendMessage')?.args)
+        .toMatchObject({ contact: OWNER, replyToWireId: FILE_WIRE });
       await rejected.channel.close();
     }
 
@@ -216,8 +285,8 @@ describe('owner-channel attachment ingress', () => {
       reply_to: { wire_id: CAPTION_WIRE },
     }));
     await overCount.channel.drain();
-    expect(overCount.client.calls.some(call => call.name === 'get_files')).toBe(false);
-    expect(overCount.client.calls.find(call => call.name === 'send_message')?.args?.text)
+    expect(overCount.client.calls.some(call => call.name === 'getFiles')).toBe(false);
+    expect(overCount.client.calls.find(call => call.name === 'sendMessage')?.args?.text)
       .toContain('4-file limit');
     await overCount.channel.close();
   });
@@ -254,15 +323,15 @@ describe('owner-channel attachment ingress', () => {
     await status.channel.drain();
 
     expect(status.queuePrompt).not.toHaveBeenCalled();
-    expect(status.client.calls).toContainEqual({ name: 'send_message', args: {
-      contact: OWNER, text: 'Attached report.', reply_to_wire_id: ownerWire,
+    expect(status.client.calls).toContainEqual({ name: 'sendMessage', args: {
+      contact: OWNER, text: 'Attached report.', replyToWireId: ownerWire,
     } });
-    expect(status.client.calls).toContainEqual({ name: 'send_file', args: {
+    expect(status.client.calls).toContainEqual({ name: 'sendFile', args: {
       contact: OWNER, path: expect.any(String), filename: 'report.txt',
-      reply_to_wire_id: ownerWire,
+      replyToWireId: ownerWire,
     } });
     expect(status.client.calls.filter(call =>
-      call.args?.text === 'Attached report.' || call.name === 'send_file')
+      call.args?.text === 'Attached report.' || call.name === 'sendFile')
       .every(call => call.args?.contact === OWNER)).toBe(true);
     await status.channel.close();
   });
@@ -303,8 +372,8 @@ describe('owner-channel attachment ingress', () => {
 
     await status.channel.drain();
 
-    expect(status.client.calls.find(call => call.name === 'send_file')?.args).toMatchObject({
-      contact: OWNER, filename: 'response.txt', reply_to_wire_id: FILE_WIRE,
+    expect(status.client.calls.find(call => call.name === 'sendFile')?.args).toMatchObject({
+      contact: OWNER, filename: 'response.txt', replyToWireId: FILE_WIRE,
     });
     await status.channel.close();
   });
@@ -328,11 +397,11 @@ describe('owner-channel attachment ingress', () => {
 
     await status.channel.drain();
 
-    expect(status.client.calls.find(call => call.name === 'send_file')?.args).toMatchObject({
+    expect(status.client.calls.find(call => call.name === 'sendFile')?.args).toMatchObject({
       contact: OTHER, filename: 'idea.txt',
     });
-    expect(status.client.calls.find(call => call.name === 'send_file')?.args)
-      .not.toHaveProperty('reply_to_wire_id');
+    expect(status.client.calls.find(call => call.name === 'sendFile')?.args)
+      .not.toHaveProperty('replyToWireId');
     await status.channel.close();
   });
 
@@ -347,11 +416,11 @@ describe('owner-channel attachment ingress', () => {
     await status.channel.drain();
     await status.channel.drain();
 
-    expect(status.client.calls.some(call => call.name === 'get_files')).toBe(false);
-    expect(status.client.calls.some(call => call.name === 'send_file')).toBe(false);
-    expect(status.client.calls.filter(call => call.name === 'send_message')).toEqual([{
-      name: 'send_message', args: {
-        contact: AGENT, text: expect.stringContaining('queued'), reply_to_wire_id: FILE_WIRE,
+    expect(status.client.calls.some(call => call.name === 'getFiles')).toBe(false);
+    expect(status.client.calls.some(call => call.name === 'sendFile')).toBe(false);
+    expect(status.client.calls.filter(call => call.name === 'sendMessage')).toEqual([{
+      name: 'sendMessage', args: {
+        contact: AGENT, text: expect.stringContaining('queued'), replyToWireId: FILE_WIRE,
       },
     }]);
     expect(status.logs.join('\n')).toContain('no authenticated owner route matches the source wire');
@@ -390,10 +459,10 @@ describe('owner-channel attachment ingress', () => {
     await status.channel.drain();
 
     expect(status.client.calls.some(call => call.args?.text === 'Do not emit me alone.')).toBe(false);
-    expect(status.client.calls.some(call => call.name === 'send_file')).toBe(false);
-    expect(status.client.calls).toContainEqual({ name: 'send_message', args: {
+    expect(status.client.calls.some(call => call.name === 'sendFile')).toBe(false);
+    expect(status.client.calls).toContainEqual({ name: 'sendMessage', args: {
       contact: AGENT, text: expect.stringContaining('not relayed'),
-      reply_to_wire_id: CAPTION_WIRE,
+      replyToWireId: CAPTION_WIRE,
     } });
     status.client.batches.push([caption], []);
     await status.channel.drain();
@@ -403,7 +472,7 @@ describe('owner-channel attachment ingress', () => {
     await status.channel.close();
   });
 
-  it('replays a deferred caption with a journaled processed managed-agent file after restart', async () => {
+  it('recovers a claimed caption with a journaled read managed-agent file after restart', async () => {
     const AGENT = 'C'.repeat(64);
     const ownerWire = '9'.repeat(64);
     const dir = mkdtempSync(join(tmpdir(), 'ours-owner-agent-recovery-'));
@@ -415,33 +484,42 @@ describe('owner-channel attachment ingress', () => {
       fileWireIds: [FILE_WIRE], createdAt: Date.now(),
     });
     const bytes = Buffer.from('recovered report');
-    const source = join(dir, 'processed-agent-report');
+    const source = join(dir, 'history-agent-report');
     writeFileSync(source, bytes);
 
-    const status = await setup([OWNER], false, attachmentConfig, AGENT, dir);
+    const status = await setup([OWNER], false, attachmentConfig, AGENT, dir, client => {
+      client.files = [listed({
+        from: { id: AGENT, name: 'Role' }, filename: 'recovered.txt', size: bytes.length,
+        status: 'read', reply_to: { wire_id: CAPTION_WIRE },
+      })];
+      client.retrieved.set(FILE_WIRE, retrieved(source, bytes, {
+        from: { id: AGENT, name: 'Role' }, filename: 'recovered.txt',
+        status: 'read', reply_to: { wire_id: CAPTION_WIRE },
+      }));
+    });
     status.client.batches.push([{
       msg_id: 17, wire_id: CAPTION_WIRE, from: { id: AGENT, name: 'Role' },
       text: 'Recovered caption.', reply_to: { wire_id: ownerWire },
     }], []);
     status.client.files = [listed({
       from: { id: AGENT, name: 'Role' }, filename: 'recovered.txt', size: bytes.length,
-      status: 'processed', reply_to: { wire_id: CAPTION_WIRE },
+      status: 'read', reply_to: { wire_id: CAPTION_WIRE },
     })];
     status.client.retrieved.set(FILE_WIRE, retrieved(source, bytes, {
       from: { id: AGENT, name: 'Role' }, filename: 'recovered.txt',
-      status: 'processed', reply_to: { wire_id: CAPTION_WIRE },
+      status: 'read', reply_to: { wire_id: CAPTION_WIRE },
     }));
 
     await status.channel.drain();
 
     expect(status.client.calls).toContainEqual({
-      name: 'save_file', args: { wire_id: FILE_WIRE, dest_path: expect.any(String) },
+      name: 'fetchFile', args: { wireId: FILE_WIRE },
     });
-    expect(status.client.calls).toContainEqual({ name: 'send_message', args: {
-      contact: OWNER, text: 'Recovered caption.', reply_to_wire_id: ownerWire,
+    expect(status.client.calls).toContainEqual({ name: 'sendMessage', args: {
+      contact: OWNER, text: 'Recovered caption.', replyToWireId: ownerWire,
     } });
-    expect(status.client.calls.find(call => call.name === 'send_file')?.args)
-      .toMatchObject({ contact: OWNER, filename: 'recovered.txt', reply_to_wire_id: ownerWire });
+    expect(status.client.calls.find(call => call.name === 'sendFile')?.args)
+      .toMatchObject({ contact: OWNER, filename: 'recovered.txt', replyToWireId: ownerWire });
     expect(JSON.parse(readFileSync(join(dir,
       '.owner-channel-attachment-recovery.json'), 'utf8')).pending).toEqual([]);
     await status.channel.close();
@@ -479,9 +557,9 @@ describe('owner-channel attachment ingress', () => {
 
     expect(status.client.calls.filter(call => call.args?.text === 'May have been delivered.'))
       .toHaveLength(1);
-    expect(status.client.calls.filter(call => call.name === 'send_file')).toHaveLength(1);
-    expect(status.client.calls).toContainEqual({ name: 'send_message', args: {
-      contact: AGENT, text: expect.stringContaining('uncertain'), reply_to_wire_id: CAPTION_WIRE,
+    expect(status.client.calls.filter(call => call.name === 'sendFile')).toHaveLength(1);
+    expect(status.client.calls).toContainEqual({ name: 'sendMessage', args: {
+      contact: AGENT, text: expect.stringContaining('uncertain'), replyToWireId: CAPTION_WIRE,
     } });
     const conversation = JSON.parse(readFileSync(join(status.dir,
       '.owner-channel-conversations.json'), 'utf8'));
@@ -511,7 +589,7 @@ describe('owner-channel attachment ingress', () => {
     }));
     await status.channel.drain();
     expect(status.queuePrompt).toHaveBeenCalledTimes(2);
-    expect(status.client.calls.filter(call => call.name === 'get_files')).toHaveLength(2);
+    expect(status.client.calls.filter(call => call.name === 'getFiles')).toHaveLength(2);
     status.finish({ accepted: true, outcome: 'completed', succeeded: true, output: 'Done.' });
     await vi.waitFor(() => expect(status.client.calls.filter(call => call.args?.text === 'Done.')).toHaveLength(2));
     await status.channel.drain();
@@ -520,23 +598,28 @@ describe('owner-channel attachment ingress', () => {
   });
 
   it('resumes a journaled post-retrieval request with selected save_file recovery', async () => {
-    const status = await setup([OWNER], true);
     const bytes = Buffer.from('OggSvoice');
-    const source = join(status.dir, 'processed-voice');
+    const dir = mkdtempSync(join(tmpdir(), 'ours-owner-attachments-'));
+    dirs.push(dir);
+    new AttachmentRecoveryState(join(dir, '.owner-channel-attachment-recovery.json')).add({
+      id: createHash('sha256').update(FILE_WIRE).digest('hex'), contact: OWNER,
+      originWireId: FILE_WIRE, fileWireIds: [FILE_WIRE], createdAt: Date.now(),
+    });
+    const source = join(dir, 'history-voice');
     writeFileSync(source, bytes);
-    status.client.files = [listed({
-      filename: 'voice.ogg', mime: 'audio/ogg', size: bytes.length,
-      status: 'processed', kind: 'voice_message',
-    })];
-    status.client.retrieved.set(FILE_WIRE, retrieved(source, bytes, {
-      filename: 'voice.ogg', mime: 'audio/ogg', kind: 'voice_message',
-    }));
+    const status = await setup([OWNER], false, attachmentConfig, undefined, dir, client => {
+      client.files = [listed({
+        filename: 'voice.ogg', mime: 'audio/ogg', size: bytes.length,
+        status: 'read', kind: 'voice_message',
+      })];
+      client.retrieved.set(FILE_WIRE, retrieved(source, bytes, {
+        filename: 'voice.ogg', mime: 'audio/ogg', status: 'read', kind: 'voice_message',
+      }));
+    });
     await status.channel.drain();
-    const save = status.client.calls.find(call => call.name === 'save_file');
-    expect(save?.args?.wire_id).toBe(FILE_WIRE);
-    expect(String(save?.args?.dest_path)).toMatch(
-      new RegExp(`/\\.recovered-${FILE_WIRE}-[a-f0-9-]{36}$`));
-    expect(status.client.calls.some(call => call.name === 'get_files')).toBe(false);
+    const save = status.client.calls.find(call => call.name === 'fetchFile');
+    expect(save?.args?.wireId).toBe(FILE_WIRE);
+    expect(status.client.calls.some(call => call.name === 'getFiles')).toBe(false);
     expect(String(status.queuePrompt.mock.calls[0][0])).toContain('category restart_recovery');
     status.finish({ accepted: true, outcome: 'completed', succeeded: true, output: 'Recovered.' });
     await vi.waitFor(() => expect(status.client.calls.some(call => call.args?.text === 'Recovered.')).toBe(true));
@@ -609,13 +692,13 @@ describe('managed-agent attachment egress', () => {
 
     await status.channel.drain();
     expect(status.queuePrompt).not.toHaveBeenCalled();
-    const sends = status.client.calls.filter(call => call.name === 'send_file');
+    const sends = status.client.calls.filter(call => call.name === 'sendFile');
     expect(sends).toHaveLength(3);
     expect(sends.map(call => call.args?.filename)).toEqual(['notes.md', 'page.html', 'attachment.bin']);
     expect(sends.every(call => call.args?.contact === OWNER
-      && call.args?.reply_to_wire_id === ownerWire)).toBe(true);
-    expect(status.client.calls).toContainEqual({ name: 'send_message', args: {
-      contact: OWNER, text: 'Requested artifacts', reply_to_wire_id: ownerWire,
+      && call.args?.replyToWireId === ownerWire)).toBe(true);
+    expect(status.client.calls).toContainEqual({ name: 'sendMessage', args: {
+      contact: OWNER, text: 'Requested artifacts', replyToWireId: ownerWire,
     } });
     expect(status.logs.join('\n')).not.toMatch(/# Notes|<h1>|notes\.md|page\.html/);
     await status.channel.close();
@@ -631,9 +714,9 @@ describe('managed-agent attachment egress', () => {
       filename: 'owner.md', mime: 'text/markdown',
     }));
     await status.channel.drain();
-    expect(status.client.calls.some(call => call.name === 'get_files')).toBe(false);
-    expect(status.client.calls.some(call => call.name === 'send_file')).toBe(false);
-    expect(status.client.calls.find(call => call.name === 'send_message')?.args?.text)
+    expect(status.client.calls.some(call => call.name === 'getFiles')).toBe(false);
+    expect(status.client.calls.some(call => call.name === 'sendFile')).toBe(false);
+    expect(status.client.calls.find(call => call.name === 'sendMessage')?.args?.text)
       .toContain('MIME type text/markdown is not allowed');
     await status.channel.close();
   });
@@ -647,8 +730,8 @@ describe('managed-agent attachment egress', () => {
       await establishRoute(status);
       status.client.files = [listed(overrides)];
       await status.channel.drain();
-      expect(status.client.calls.some(call => call.name === 'get_files')).toBe(false);
-      expect(status.client.calls.some(call => call.name === 'send_file')).toBe(false);
+      expect(status.client.calls.some(call => call.name === 'getFiles')).toBe(false);
+      expect(status.client.calls.some(call => call.name === 'sendFile')).toBe(false);
       await status.channel.close();
     }
   });
@@ -666,16 +749,16 @@ describe('managed-agent attachment egress', () => {
     status.client.retrieved.set(FILE_WIRE, retrieved(source, bytes, {
       from: { id: AGENT, name: 'Role' }, mime: 'application/octet-stream', filename: 'artifact.bin',
     }));
-    status.client.failTools.add('send_file');
+    status.client.failTools.add('sendFile');
     await status.channel.drain();
-    expect(status.client.calls.filter(call => call.name === 'send_file')).toHaveLength(1);
+    expect(status.client.calls.filter(call => call.name === 'sendFile')).toHaveLength(1);
     const recoveryPath = join(status.dir, '.owner-channel-attachment-recovery.json');
     expect(readFileSync(recoveryPath, 'utf8')).not.toMatch(/artifact\.bin|artifact/);
 
     await status.channel.close();
-    status.client.failTools.delete('send_file');
+    status.client.failTools.delete('sendFile');
     status.client.files = [listed({
-      from: { id: AGENT, name: 'Role' }, size: bytes.length, status: 'processed',
+      from: { id: AGENT, name: 'Role' }, size: bytes.length, status: 'read',
       mime: 'application/octet-stream', filename: 'artifact.bin',
     })];
     const restarted = new OwnerChannel({
@@ -690,14 +773,10 @@ describe('managed-agent attachment egress', () => {
         queuePrompt: status.queuePrompt, interrupt: vi.fn(), eventsSince: () => [],
       } as unknown as SessionHandle,
       stateDir: status.dir, client: status.client, log: line => status.logs.push(line),
-      watch: () => ({
-        pid: 1, exitCode: null, stdout: new PassThrough(), stderr: new PassThrough(),
-        once: () => undefined, kill: () => true,
-      }) as never,
     });
     await restarted.start();
     await restarted.drain();
-    expect(status.client.calls.filter(call => call.name === 'send_file')).toHaveLength(1);
+    expect(status.client.calls.filter(call => call.name === 'sendFile')).toHaveLength(1);
     expect(JSON.parse(readFileSync(recoveryPath, 'utf8')).pending).toEqual([]);
     await restarted.close();
   });
@@ -760,7 +839,7 @@ describe('attachment admission and recovery primitives', () => {
     const base: RetrievedAttachment = {
       ...(listed() as unknown as IncomingAttachment), fileId: 7, wireId: FILE_WIRE,
       senderId: OWNER, senderName: 'Phone', filename: '../../secret.txt', mime: 'text/plain',
-      size: 5, status: 'processed', date: '', kind: 'file', replyTo: null,
+      size: 5, status: 'read', date: '', kind: 'file', replyTo: null,
       path: link, sha256: createHash('sha256').update('hello').digest('hex'),
     };
     await expect(admitAttachments([base], dir, attachmentConfig)).rejects.toThrow(/regular file/);
@@ -959,5 +1038,83 @@ describe('voice-message MIME admission', () => {
     status.finish({ accepted: true, outcome: 'completed', succeeded: true, output: 'Heard.' });
     await vi.waitFor(() => expect(status.client.calls.some(call => call.args?.text === 'Heard.')).toBe(true));
     await status.channel.close();
+  });
+});
+
+describe('recovered attachment writes', () => {
+  const dir = () => {
+    const path = mkdtempSync(join(tmpdir(), 'ours-owner-recovered-'));
+    dirs.push(path);
+    return path;
+  };
+
+  it('derives the destination from a validated wire id inside the request directory', async () => {
+    const root = dir();
+    const path = await writeRecoveredAttachment(root, FILE_WIRE, Buffer.from('bytes'));
+    expect(path).toBe(join(root, path.slice(root.length + 1)));
+    expect(path.slice(root.length + 1))
+      .toMatch(new RegExp(`^\\.recovered-${FILE_WIRE}-[0-9a-f-]{36}$`));
+    expect(readFileSync(path, 'utf8')).toBe('bytes');
+    expect(lstatSync(path).mode & 0o777).toBe(0o600);
+    // No temp file survives a successful publish.
+    expect(readdirSync(root)).toEqual([path.slice(root.length + 1)]);
+  });
+
+  // The daemon used to be handed a dest_path. Nothing may reach outside the
+  // prepared request directory now, and a wire id is the only input.
+  it('refuses a wire id that is not exactly 64 hex characters', async () => {
+    const root = dir();
+    for (const wire of ['../../etc/passwd', `${FILE_WIRE}/../escape`, '', 'zz'.repeat(32)])
+      await expect(writeRecoveredAttachment(root, wire, Buffer.from('x')))
+        .rejects.toThrow(/wire id is not a 64-hex value/);
+    expect(readdirSync(root)).toEqual([]);
+  });
+
+  it('refuses a symlinked request directory', async () => {
+    const root = dir();
+    const real = join(root, 'real');
+    const link = join(root, 'link');
+    mkdirSync(real, { mode: 0o700 });
+    symlinkSync(real, link);
+    await expect(writeRecoveredAttachment(link, FILE_WIRE, Buffer.from('x')))
+      .rejects.toThrow(/not a safe directory/);
+    expect(readdirSync(real)).toEqual([]);
+  });
+
+  it('completes a short write rather than publishing a truncated file', async () => {
+    const root = dir();
+    const bytes = Buffer.from('partial-write-bytes');
+    const chunks: number[] = [];
+    const path = await writeRecoveredAttachment(root, FILE_WIRE, bytes, {
+      // One byte per call: a single writeFile hides this, a loop must not.
+      write: async (handle, buffer, offset) => {
+        chunks.push(offset);
+        const { bytesWritten } = await handle.write(buffer, offset, 1);
+        return bytesWritten;
+      },
+    });
+    expect(readFileSync(path)).toEqual(bytes);
+    expect(chunks).toHaveLength(bytes.length);
+  });
+
+  it('leaves nothing behind when the write cannot progress', async () => {
+    const root = dir();
+    await expect(writeRecoveredAttachment(root, FILE_WIRE, Buffer.from('abc'), {
+      write: async () => 0,
+    })).rejects.toThrow(/write made no progress at byte 0/);
+    expect(readdirSync(root)).toEqual([]);
+  });
+
+  it('leaves nothing behind when the write itself fails mid-file', async () => {
+    const root = dir();
+    let calls = 0;
+    await expect(writeRecoveredAttachment(root, FILE_WIRE, Buffer.from('abcdef'), {
+      write: async (handle, buffer, offset) => {
+        if (calls++ > 0) throw new Error('disk full');
+        const { bytesWritten } = await handle.write(buffer, offset, 2);
+        return bytesWritten;
+      },
+    })).rejects.toThrow(/disk full/);
+    expect(readdirSync(root)).toEqual([]);
   });
 });

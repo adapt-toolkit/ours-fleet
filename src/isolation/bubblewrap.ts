@@ -2,10 +2,10 @@ import { realExec, type Exec } from '../exec.js';
 import type { IsolationBackend, ResolvedIsolation, WrapContext, NetworkMode } from './types.js';
 
 /**
- * Phase 2 network policy: only `deny` unshares the network namespace. `broker`
- * keeps the host network so ours messaging (a loopback TCP daemon on this host —
- * see the Phase-0 spike) keeps working; hardening `broker` to `--unshare-net` +
- * a loopback forwarder is Phase 4. `allow`/`allowlist` also keep host net.
+ * Only `deny` unshares the network namespace. `broker`
+ * keeps the host network so ours messaging through a loopback TCP daemon keeps
+ * working; hardening `broker` to `--unshare-net` plus
+ * a loopback forwarder is not implemented. `allow`/`allowlist` also keep host net.
  */
 export function unsharesNet(network: NetworkMode): boolean {
   return network === 'deny';

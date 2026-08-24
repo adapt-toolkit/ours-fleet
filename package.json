@@ -38,6 +38,8 @@
     "@agentclientprotocol/sdk": "^1.3.0",
     "@fastify/static": "^10.1.2",
     "@fastify/websocket": "^11.2.0",
+    "@ours.network/cli": "1.0.1",
+    "@ours.network/sdk": "3.0.1",
     "@xterm/addon-fit": "0.10.0",
     "@xterm/addon-serialize": "0.13.0",
     "@xterm/headless": "5.5.0",

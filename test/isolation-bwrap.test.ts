@@ -82,7 +82,7 @@ describe('bubblewrap wrap() argv', () => {
     expect(wrap({ network: 'deny' })).toContain('--unshare-net');
   });
 
-  it('keeps host net for network: broker (messaging preserved; broker hardening is Phase 4)', () => {
+  it('keeps host net for network: broker so messaging remains available', () => {
     expect(wrap({ network: 'broker' })).not.toContain('--unshare-net');
   });
 

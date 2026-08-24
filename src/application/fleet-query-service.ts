@@ -84,7 +84,7 @@ export interface FleetQueryOptions {
   control?: typeof controlRequest;
   capabilityContext?: CapabilityContext;
   /**
-   * Watchdog anomalies feeding into Needs Attention (Task 19): roleId -> worst
+   * Watchdog anomalies feeding into Needs Attention: roleId -> worst
    * current finding across all watchdogs. Optional and absent by default so
    * every pre-existing caller (and its tests) is unaffected; runtime.ts wires
    * the real provider, built from watchdog reports on disk.

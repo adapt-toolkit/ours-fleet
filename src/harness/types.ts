@@ -90,7 +90,8 @@ export interface BriefingVocab {
   currentIdentityTool: string;
   sendTool: string;
   getMessagesTool: string;
-  watchCommand(identity: string): string;
+  listHistoryTool: string;
+  getHistoryItemTool: string;
   monitorInstruction(identity: string, role?: ResolvedRole): string;
   /** Wake-source wording for a role whose monitor is supervisor-owned (monitor.mode=fleet). */
   supervisedWakeNote(identity: string, role?: ResolvedRole): string;
@@ -99,7 +100,7 @@ export interface BriefingVocab {
 }
 
 /**
- * How a harness's host state splits for sandboxing (5.1). `home` is the
+ * How a harness's host state splits for sandboxing. `home` is the
  * directory the CLI treats as its own and whose RUNTIME state must be per-role;
  * `shared` are the credential, instruction and configuration paths that stay
  * shared and become read-only inside the sandbox.
@@ -171,7 +172,7 @@ export interface HarnessAdapter {
   nativePermissionOverrides(options: unknown): Record<string, unknown>;
   /**
    * Host paths this harness needs inside a sandbox, split into a per-role
-   * writable home and shared read-only credentials/config (5.1). Omit for a
+   * writable home and shared read-only credentials/config. Omit for a
    * harness with no host state of its own.
    */
   isolationPaths?(role: ResolvedRole, dirs: RoleDirs): HarnessIsolationPaths;

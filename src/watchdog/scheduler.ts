@@ -38,14 +38,14 @@ export function writeSchedulerState(name: string, s: WatchdogSchedulerState): vo
 }
 
 /**
- * Operator release (Task 15): clears failures and heldDown so a held-down
+ * Operator release clears failures and heldDown so a held-down
  * loop's next held-down poll sees a clean state and resumes running. Also
  * clears the ledger's `heldDownAlerted` flag — that flag is what makes "alert
  * once per hold-down" durable across scheduler restarts (it lives in
  * alerts.json, not state.json), so a release must reset it too or a
  * subsequent hold-down would silently alert zero times.
  *
- * Also reclaims a STALE run lock (final review #2, tightened by finding #2):
+ * Also reclaims a demonstrably stale run lock:
  * a watchdog SIGKILLed mid-run (e.g. systemd's TimeoutStopSec on a
  * fleet-wide stop) leaves `.run-lock` behind forever — the loop's `finally`
  * that would normally release it never runs. Without this, every future tick
@@ -70,7 +70,7 @@ export function resetSchedulerState(name: string): void {
 export const WATCHDOG_HOLD_THRESHOLD = 3;
 export const WATCHDOG_BACKOFF_MAX_MS = 3_600_000;
 
-/** Bounded exponential backoff: 1x, 2x, 4x, ... capped at WATCHDOG_BACKOFF_MAX_MS (spec §3). */
+/** Bounded exponential backoff: 1x, 2x, 4x, ... capped at WATCHDOG_BACKOFF_MAX_MS. */
 export function watchdogBackoffMs(intervalMs: number, failures: number): number {
   if (failures <= 0) return intervalMs;
   return Math.min(intervalMs * 2 ** (failures - 1), WATCHDOG_BACKOFF_MAX_MS);
@@ -83,7 +83,7 @@ export interface SchedulerDeps {
   binPath: string;
   /**
    * The fleet config `runScheduler` loaded from the `-c FILE`/default path
-   * (final review #1). Threaded into both `runOnceFor`'s and the notifier's
+   * Threaded into both `runOnceFor`'s and the notifier's
    * deps so a run under a non-default config doesn't silently fall back to
    * `loadConfig()`'s default `~/fleet.yaml`. `runWatchdogLoop` callers that
    * bypass `runScheduler` (tests) may omit it — the run/notifier machinery
@@ -95,7 +95,7 @@ export interface SchedulerDeps {
   /** Loop exit for tests + SIGTERM (wired by the CLI, not here). */
   shouldStop?(): boolean;
   /**
-   * Scheduler-level alert hook (Task 14, spec §5.5): fired once per hold-down
+   * Scheduler-level alert hook: fired once per hold-down
    * transition (guarded in `settle` by `ledger.heldDownAlerted`, cleared by
    * `resetSchedulerState`). Default: `executeNotifierRun` — the fleet
    * process can't message on its own (deviation 4), so the default delivers
@@ -116,7 +116,7 @@ export interface SchedulerDeps {
    * Injectable run-lock primitives. Default: store's acquireRunLock /
    * releaseRunLock. Both are mkdir/rmdir-backed and can throw (EACCES, EIO,
    * ENOTEMPTY on release) — the loop always classifies such a throw as a
-   * failed tick rather than letting it escape (review finding #1).
+   * failed tick rather than letting it escape.
    */
   locks?: { acquire(name: string): boolean; release(name: string): void };
 }
@@ -146,7 +146,7 @@ export async function runWatchdogLoop(wd: ResolvedWatchdog, deps: SchedulerDeps)
    * before the next tick. On the tick that transitions into hold-down, sleep
    * `heldPollMs` rather than the (possibly hour-long) backoff delay — an
    * operator's resetSchedulerState must be noticed within one poll cycle,
-   * not after the last backoff finishes (review finding #2).
+   * not after the last backoff finishes.
    */
   const settle = async (isFailure: boolean, errorMessage: string | undefined, startedAt: Date): Promise<void> => {
     const s = readSchedulerState(wd.name);
@@ -173,7 +173,7 @@ export async function runWatchdogLoop(wd: ResolvedWatchdog, deps: SchedulerDeps)
     if (justHeld) {
       const msg = `watchdog ${wd.name} held down after ${WATCHDOG_HOLD_THRESHOLD} consecutive failed runs: ${s.lastError}`;
       deps.log(msg);
-      // "Once per state change" (spec §5.5) must survive a scheduler restart, so the guard
+      // "Once per state change" must survive a scheduler restart, so the guard
       // lives in the ledger (alerts.json), not in memory — resetSchedulerState clears it.
       const ledger = readLedger(wd.name);
       if (!ledger.heldDownAlerted) {
@@ -201,7 +201,7 @@ export async function runWatchdogLoop(wd: ResolvedWatchdog, deps: SchedulerDeps)
     // rethrows non-ENOENT failures). Never let that throw escape this loop:
     // runScheduler drives every watchdog's loop via Promise.all, so an
     // uncaught throw here would kill every OTHER watchdog's loop too.
-    // Classify it as this tick's failure instead (review finding #1).
+    // Classify it as this tick's failure instead.
     let acquired = false;
     let acquireError: string | undefined;
     try {
@@ -226,7 +226,7 @@ export async function runWatchdogLoop(wd: ResolvedWatchdog, deps: SchedulerDeps)
       // Failure count is untouched by a skip; only lastRunAt/nextRunAt move.
       // The backoff cadence (not the raw interval) still governs during an
       // active failure streak: a skip isn't a finished run, so it shouldn't
-      // reset the retry cadence to full speed either (spec §3).
+      // reset the retry cadence to full speed either.
       const skipState = readSchedulerState(wd.name);
       const delay = watchdogBackoffMs(wd.intervalMs, skipState.consecutiveFailures);
       writeSchedulerState(wd.name, {
@@ -273,14 +273,14 @@ export async function runWatchdogLoop(wd: ResolvedWatchdog, deps: SchedulerDeps)
 
 /**
  * Run every enabled watchdog's loop concurrently until deps.shouldStop().
- * SIGTERM wiring into shouldStop is the CLI's job (Task 10), not this
+ * SIGTERM wiring into shouldStop is the CLI's job, not this
  * function's.
  */
 export async function runScheduler(configPath: string | undefined, deps: SchedulerDeps): Promise<void> {
   const cfg = loadConfig(configPath);
   const watchdogs = cfg.watchdogs.filter(w => w.enabled);
-  // Recover from a SIGKILLed prior run (final review #2a, tightened by
-  // finding #2): a scheduler restart is EVIDENCE, not proof, that no
+  // Recover from a SIGKILLed prior run: a scheduler restart is EVIDENCE,
+  // not proof, that no
   // scheduler-owned run is in flight — a foreground `watchdog-run`, or
   // another scheduler instance, may genuinely still hold a watchdog's lock.
   // Only a DEMONSTRABLY stale lock (dead owner pid, or a legacy lock with no

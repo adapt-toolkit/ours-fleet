@@ -71,11 +71,37 @@ export function makeSystemdBackend(exec: Exec = realExec): SupervisorBackend {
       const unitDir = join(home(), '.config', 'systemd', 'user');
       // Lingering user units often start before a login shell imports its PATH.
       // Pin the Node runtime and persist the install-time PATH so the runner and
-      // children such as `ours-mcp proxy` resolve the same tools after reboot.
+      // structured operator CLI resolve the same tools after reboot.
       const servicePath = [...new Set([
         dirname(process.execPath),
         ...(process.env.PATH ?? '').split(delimiter),
       ].filter(Boolean))].join(delimiter);
+      // Same reason as PATH, for the other thing a lingering unit cannot inherit:
+      // WHICH ours daemon this fleet was set up against.
+      //
+      // ours-fleet resolves its daemon from OURS_CONFIG / OURS_PORT / OURS_STATE_DIR
+      // and otherwise falls back to ~/.ours and port 3050 (src/monitor.ts). A host
+      // set up against a non-default daemon — the installer's multi-daemon profiles
+      // do exactly this — passes that selection to `ours-fleet init` in the
+      // environment, and it died there: nothing persisted it, so every runner
+      // systemd started at boot resolved the default daemon again, and on a host
+      // where only the non-default daemon exists that is a daemon that is not there.
+      //
+      // ONLY OURS_CONFIG is baked, deliberately. It names which daemon, and leaves
+      // that daemon's own config file authoritative for port and state directory, so
+      // a later edit to it still wins. Baking OURS_PORT/OURS_STATE_DIR would freeze
+      // those into a unit file that outranks the config for ever after — the failure
+      // mode @ours.network/cli avoids for the same reason (packages/cli/src/
+      // service.ts: "The port is deliberately NOT baked").
+      //
+      // Absent from init's environment ⇒ no line, and the unit is byte-for-byte what
+      // it has always been. This teaches fleet nothing about installer profiles; it
+      // persists the selection fleet was initialised with.
+      const unitEnv = ['PATH=' + servicePath];
+      if (process.env.OURS_CONFIG) unitEnv.push('OURS_CONFIG=' + process.env.OURS_CONFIG);
+      const environmentLines = unitEnv
+        .map(value => `Environment="${value.replace(/\\/g, '\\\\').replace(/"/g, '\\"').replace(/%/g, '%%')}"`)
+        .join('\n');
       mkdirSync(unitDir, { recursive: true });
       writeFileSync(join(unitDir, UNIT_TEMPLATE), `[Unit]
 Description=ours-fleet agent %i
@@ -83,10 +109,10 @@ After=default.target
 
 [Service]
 Type=simple
-Environment="PATH=${servicePath.replace(/\\/g, '\\\\').replace(/"/g, '\\"').replace(/%/g, '%%')}"
+${environmentLines}
 ExecStart=${unitArg(process.execPath)} ${unitArg(binPath)} _run %i
 # The RUNNER owns the child-session restart loop, with a counted, backed-off
-# circuit breaker (3.2). systemd must only recover the runner PROCESS crashing —
+# circuit breaker. systemd must only recover the runner PROCESS crashing —
 # Restart=always here would resume the uncounted two-second relaunch loop, and
 # would also restart a runner that is deliberately holding a failing agent down.
 Restart=on-failure
@@ -107,12 +133,12 @@ WantedBy=default.target
 
     async install(name) {
       // Ask FIRST whether this unit was already enabled, so a rollback can tell
-      // "we registered this" from "it was already here" (6.2).
+      // "we registered this" from "it was already here".
       const before = await ctl('is-enabled', unitFor(name));
       const alreadyEnabled = before.stdout.trim() === 'enabled';
       const r = await ctl('enable', '--now', unitFor(name));
       // Undo only what WE enabled. A unit that was already enabled belongs to
-      // whoever enabled it, and rollback may never remove that (6.2).
+      // whoever enabled it, and rollback may never remove that.
       const undo = async () => { if (!alreadyEnabled) await ctl('disable', '--now', unitFor(name)); };
       if (r.code !== 0) {
         // `enable --now` is enable THEN start, so a non-zero result can arrive
@@ -137,7 +163,7 @@ WantedBy=default.target
       // care whether this systemd propagates a start failure into the exit
       // code, so it is correct both on versions that do and versions that do
       // not. Only a DEFINITE stop counts. An unanswerable probe is `unknown`
-      // and must never be read as a failed start (1.1) — the unit may be
+      // and must never be read as a failed start — the unit may be
       // perfectly fine and the bus merely unreachable.
       const live = await probeLiveness(ctl, name);
       if (live.state === 'stopped') {

@@ -68,6 +68,8 @@ The state dir contract:
 | `.identity`, `.cwd`, `.session-id`, `.booted`, `.exit-status`, `.config-path` | supervisor | dot-marker state — session resume and boot bookkeeping |
 | `.monitor-state.json`, `.monitor-status` | supervisor monitor | atomic body-free cursor/pending state and health |
 | `.owner-channel-state.json` | owner-channel bridge | bounded wire-ID dedupe only; never message/reply plaintext |
+| `.owner-channel-message-recovery.json` | owner-channel bridge | mode-0600 body-free message claim journal: wire ID, history sequence, and claim time only |
+| `.owner-channel-attachment-recovery.json` | owner-channel bridge | mode-0600 attachment route journal; never filenames, paths, transcript text, or bytes |
 | `.owner-channel-binder.lock/`, `.owner-channel-binder.json` | owner-channel supervisor | mode-0600 role/identity + PID/start-marker ownership and release metadata; never mail plaintext or credentials |
 | `.session-events.jsonl`, `.control.sock`, `.control-token` | ACP backend | bounded typed console projection and private attachment control |
 
@@ -79,7 +81,7 @@ The state dir contract:
 | tmux | roles using `session: tmux` (the default) | `apt install tmux` / `brew install tmux` |
 | Node ≥ 22 | Claude roles using `session: acp` | required by the maintained Claude ACP adapter |
 | a harness CLI, logged in | the agent itself | e.g. Claude Code (`claude`) or Codex CLI (`codex`) |
-| `ours-mcp` daemon | identity + agent-to-agent messaging | `npm i -g @ours.network/mcp && ours-mcp start` |
+| `ours` CLI + shared daemon | identity + agent-to-agent messaging | `npm i -g @ours.network/cli && ours daemon start` |
 
 Linux only: `ours-fleet init` enables *linger* so roles run without a login session
 and survive reboots. macOS: launchd agents start **at login** (no linger
@@ -208,11 +210,12 @@ offline shell and no stale fleet state.
 The console provides evidence-separated inventory and status, ACP activity and
 permission controls, redacted logs, typed text send, confirmed lifecycle
 actions, transactional permanent/temporary creation, and a shared tmux browser
-terminal. Identity is fixed to the role name. Creation uses the current
-authenticated identity existence check and reports verified, missing, or
-unknown evidence; a newly launched harness follows its generated first-boot
-instructions to choose or create and bind the identity. The console never
-claims that the host created an identity and never deletes one.
+terminal. Identity is fixed to the role name. Creation uses the authenticated
+daemon inventory and reports verified, missing, or unknown evidence. A missing
+permanent role identity is created deterministically before launch with local
+discovery and auto-accept enabled, then the provisioning lease is released so
+the harness only has to bind it. Fleet never silently replaces or force-adopts
+an existing identity.
 
 ACP tool diffs are normalized before they enter the durable conversation
 ledger. Small diffs retain their existing before/after representation. When an
@@ -236,8 +239,9 @@ the role capability-detects the ours MCP `create_temporary_identity` tool and
 uses it when available, so the newly created identity is owned and cleaned up
 by that connector session lifecycle. Older ours servers remain compatible via
 `create_identity`. A collision or creation error stops for operator review;
-fleet never force-adopts or deletes identity state. Permanent roles continue to
-use normal `create_identity` bootstrap behavior.
+fleet never force-adopts or deletes identity state. Permanent roles are
+provisioned by fleet before launch and never delegate normal identity creation
+to the harness.
 
 `node-pty` is optional: if its native module cannot load, ACP and all
 non-terminal features remain available and tmux Terminal is disabled with a
@@ -383,7 +387,7 @@ roles:
       batch_ms: 2000                    # coalesce a burst into one line (default 2000)
       inject: notification              # notification (default) | full (bodies inline; roadmap)
     owner_channel:                      # optional trusted owner ingress; requires session: acp
-      identity: "Name Owner Channel"     # existing, dedicated ours identity bound only by fleet
+      identity: "Name Owner Channel"     # dedicated identity; fleet creates it with safe local defaults
       owners: [owner-contact-cid]        # authenticated ours contact IDs, never display names
       agent: managed-agent-cid           # exact role CID allowed to relay messages/files outward
       interrupt: false                  # false queues; true cancels current work first
@@ -454,6 +458,44 @@ Every supervised role is a client of the operator-configured ours daemon. Fleet
 forces `OURS_AUTOSTART=0` in both tmux and ACP harness processes, after role environment
 overlays, so `env.OURS_AUTOSTART` cannot transfer shared daemon lifecycle ownership to an
 agent. Operators and explicit installer/setup flows remain responsible for starting it.
+
+### Rooms and tasks
+
+Rooms always use `ours-cowork`; there is no room-provider selector. Configure
+the cowork daemon connection and the room owner directly:
+
+```yaml
+rooms:
+  cowork:
+    config: /home/me/.ours-cowork/config.json
+  owner:
+    expected_cid: 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+    public_invite_file: /home/me/.ours-fleet/owner-room-invite.txt
+  defaults:
+    template: team
+    attach_owner: true
+    close_when_task_done: true
+
+tasks:
+  default_room_template: team
+  create_mode: start
+  close_room_on_done: true
+```
+
+Human task and room results use the same compact Markdown presentation in the
+CLI and authenticated owner channel: a short heading, icon-plus-word status,
+code-formatted identifiers, bounded summaries, and actionable recovery or error
+steps. Untrusted prose is context-escaped and control characters are neutralized;
+Messenger-bound results are capped at 3,500 Unicode code points and 12,000 UTF-8
+bytes with structural omission notices. `--json` bypasses this presentation layer
+and retains the versioned machine schema and serialization order.
+
+Older prerelease files that contain the exact legacy line `provider: cowork`
+under `rooms:` still load, but the key is ignored and omitted from resolved
+configuration. Remove it when editing the file. Any other legacy value is an
+error because fleet must not silently change the requested semantics. The
+optional `rooms.owner.provider` setting is separate and defaults to
+`messenger-server`.
 
 ### Scheduled agent loops
 
@@ -672,13 +714,14 @@ agent's briefing tells it **not** to arm a native harness Monitor.
 
 With `monitor.mode: native`, ours-fleet does not start its supervisor monitor;
 the generated briefing instead instructs the harness to arm its own wake
-mechanism (`ours-mcp watch` for Claude Code, or the Codex
+mechanism (the structured `ours api watch-notifications` JSONL stream for Claude Code,
+or the Codex
 `arm_monitor`/`foreground_monitor` flow). The old `monitor.enabled: true|false`
 form remains accepted as a compatibility alias for `fleet|native`, respectively,
 but new configuration should use `mode`.
 
 `inject: full` (pushing message bodies
-inline) is on the roadmap and needs two new ours-mcp daemon endpoints; today all
+inline) is on the roadmap and needs two new daemon endpoints; today all
 roles deliver `notification` lines and drain via `get_messages`.
 
 ACP stdio remains private to the persistent runner. `send`, `peek`, and the basic
@@ -689,8 +732,10 @@ console later; no terminal UI is part of the monitor or session backend.
 ### Trusted owner channel
 
 `owner_channel` adds a second ours identity to a role without changing the
-role's normal identity. Create that dedicated identity in ours first, connect it
-to each owner/controller identity and the managed role identity, put the owners'
+role's normal identity. Fleet creates that dedicated permanent identity when it
+is missing, with local exposure and local auto-accept disabled, and releases the
+provisioning lease before the supervisor binds it. Connect it to each
+owner/controller identity and the managed role identity, put the owners'
 immutable contact CIDs in `owners`, and put the managed role identity's exact CID
 in `agent`. The channel identity must not be any role identity or another role's
 channel identity. Add it to the control plane just like another contact, then
@@ -902,22 +947,26 @@ command path sits behind the authenticated owner-CID check: a non-owner sending
 `/force-restart` or `/model` is silently ignored exactly like any other
 unauthorized mail.
 
-Processed wire IDs are durably bounded for deduplication, while
-message and response bodies stay out of fleet state. Delivery is at-least-once
-across a crash (the bridge requeues fetched input before starting a turn); true
-exactly-once processing would require a leased claim/idempotency primitive in
-ours-mcp.
+Handled wire IDs are durably bounded for deduplication, while message and
+response bodies stay out of fleet state. Before consuming mail, fleet reads the
+body-free oldest-first metadata from `listIncomingMessages`, atomically journals
+the exact wire/sequence slice (at most 200), and calls `getMessages` with that
+exact length. A returned wire/sequence set mismatch fails closed. After a crash,
+journaled bodies are loaded only from persistent history with `getHistoryItem`;
+the journal is pruned only after the existing durable owner-channel state marks
+the wire handled. This provides at-least-once turn delivery without placing
+message plaintext in fleet state.
 
 Inbound owner attachments use the same authenticated-CID and exact-wire routing
-boundary. Fleet first calls the metadata-only `list_incoming_files`, groups a
+boundary. Fleet first calls the metadata-only `listIncomingFiles`, groups a
 file-only wake or a same-sender reply-linked text caption, and checks the enabled,
 count, declared MIME, per-file size, and total-size policy before retrieving any
-bytes. It then calls selective `get_files` only for the admitted wire IDs. An
+bytes. It then calls selective `getFiles` only for the admitted wire IDs. An
 unauthorized sender is ignored without retrieval or reply. A rejected authorized
 request receives a bounded reason correlated to its file wire.
 
 Retrieved files must be regular, non-symlink paths whose byte count and SHA-256
-match ours-mcp metadata. Fleet additionally checks content signatures against the
+match typed SDK metadata. Fleet additionally checks content signatures against the
 declared MIME, sanitizes traversal/control characters from names, and copies each
 file into a random request-scoped directory at mode 0700 with files at mode 0600.
 The `[fleet-owner]` turn receives only bounded metadata, the private local paths,
@@ -928,17 +977,19 @@ the agent must use the audio path rather than inventing text.
 Request files are removed after final delivery and stale directories are removed
 after `retention_ms`. A bounded mode-0600 recovery journal stores only owner CID
 and wire routing metadata—never filenames, paths, captions, transcripts, or file
-bytes. If ours-mcp already marked a selected file processed when fleet restarts,
-fleet resumes only that journaled wire with `save_file`; a deferred managed-agent
-caption is replayed with its journaled processed files before the group is
-admitted or relayed. Conversation route state migrates from v1 to a bounded v2
+bytes. If a selected file is already read when fleet restarts, fleet resolves
+only that journaled wire with `getFileInfo` and retrieves its immutable blob with
+`fetchFile`; a claimed managed-agent caption is loaded from message history and
+rejoined with its journaled read files before the group is admitted or relayed.
+Recovered voice files remain transcript-unavailable and are never sent through
+a second transcription attempt. Conversation route state migrates from v1 to a
+bounded v2
 source-wire index so a correlated group keeps the authenticated owner selected by
-its original request even after later owner traffic. Recovered voice is explicitly
-marked transcript-unavailable. Corrupt recovery state disables attachment
-admission. The host must run an ours-mcp version whose
-`list_incoming_files`, selective `get_files`, and `save_file` schemas support
-these guarantees; `ours-mcp voice-status --json` reports whether transcription
-is currently configured.
+its original request even after later owner traffic. Corrupt recovery state disables attachment
+admission. The host must run an ours daemon compatible with SDK 2.0.1 whose
+typed incoming-file, selective retrieval, and file-fetch operations support
+these guarantees; `ours config show --json` reports `sttConfigured` without
+revealing provider credentials.
 
 Managed-agent file egress is a separate trust direction. It retains the same
 metadata provenance checks, count/per-file/request byte caps, regular-file and
@@ -984,7 +1035,7 @@ pass the legacy `ours-fleet spawn --monitor` flag) to record explicit persistent
 for the harness-native monitor, including supervised restarts. This does not choose the
 wake owner; use `monitor.mode: fleet|native` for that. In the standard-Codex fallback, the agent separately surfaces the
 `ours-codex` recommendation before asking to enter `foreground_monitor`. It never backgrounds
-`ours-mcp watch`, because a detached watch cannot wake a Codex turn. The foreground
+the structured CLI watcher, because a detached process cannot wake a Codex turn. The foreground
 wait is re-entered after each handled message; `ours-codex` instead wakes the idle
 session through its App Server integration.
 
@@ -1068,7 +1119,7 @@ picks the most recently active session **in the role's `cwd`**. This works
 cleanly as long as each role has its own `cwd` (the common case); two roles
 sharing an identical `cwd` could have their resumes cross — give them distinct
 working directories if that matters. MCP and monitor wiring is provided by
-[`@ours.network/codex`](https://github.com/adapt-toolkit/ours-mcp/tree/main/packages/codex);
+[`@ours.network/codex`](https://www.npmjs.com/package/@ours.network/codex);
 the core ours skill discovers fleet behavior through `ours-fleet docs`.
 `ours-fleet doctor --harness codex` verifies the CLI, ours plugin, and enhanced launcher/fallback.
 

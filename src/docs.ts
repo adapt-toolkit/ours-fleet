@@ -190,7 +190,8 @@ exists. If missing, it uses ours MCP \`create_temporary_identity\` when that too
 is exposed, tying a newly-created identity to the connector session lifecycle;
 older servers fall back to \`create_identity\`. Collisions and creation errors
 stop safely without force-adopting or deleting identity state. Permanent roles
-retain normal \`create_identity\` behavior.
+are provisioned by fleet before launch and never delegate normal identity
+creation to the harness.
 
 The temporary supervisor treats its first positive identity observation as the
 lifecycle readiness gate: a cold harness may take as long as needed to read its
@@ -321,6 +322,63 @@ Supervised roles connect to the operator-configured ours daemon; they do not own
 lifecycle. Fleet forces \`OURS_AUTOSTART=0\` in tmux and ACP child processes after role
 environment overlays. Start the shared daemon only through an explicit operator or
 installer/setup flow.
+
+## Rooms and tasks
+
+Rooms always use \`ours-cowork\`; there is no room-provider selector. Configure
+the cowork daemon connection and room owner directly:
+
+\`\`\`yaml
+rooms:
+  cowork:
+    config: /home/me/.ours-cowork/config.json
+  owner:
+    expected_cid: 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+    public_invite_file: /home/me/.ours-fleet/owner-room-invite.txt
+  defaults:
+    template: team
+    attach_owner: true
+    close_when_task_done: true
+tasks:
+  default_room_template: team
+  create_mode: start
+  close_room_on_done: true
+\`\`\`
+
+Human task and room results use the same compact Markdown presentation in the
+CLI and authenticated owner channel: a short heading, icon-plus-word status,
+code-formatted identifiers, bounded summaries, and actionable recovery or error
+steps. Untrusted prose is context-escaped and control characters are neutralized;
+Messenger-bound results are capped at 3,500 Unicode code points and 12,000 UTF-8
+bytes with structural omission notices. \`--json\` bypasses this presentation layer
+and retains the versioned machine schema and serialization order.
+
+Older prerelease files with the exact legacy \`provider: cowork\` key under
+\`rooms:\` still load, but the key is ignored and omitted from resolved
+configuration. Remove it when editing the file. Any other legacy value is an
+error. The optional \`rooms.owner.provider\` setting is separate and defaults to
+\`messenger-server\`.
+
+Finish and Delete are distinct terminal task actions:
+
+\`ours-fleet task finish <id>\` moves an active or review task to \`done\` and
+deletes its associated Cowork room after retiring its members. The room then
+disappears from normal Fleet and Cowork views; its brief, messages, repository
+references, and attachments are not retained as an inspectable archive.
+The prerelease configuration names \`tasks.close_room_on_done\` and
+\`rooms.defaults.close_when_task_done\` are retained for compatibility, but
+\`true\` now means this close-then-delete behavior.
+
+\`ours-fleet room delete <id> <id>\` is the canonical destructive room command.
+\`room close <id> <id>\` remains a deprecated alias with identical deletion
+semantics. Older prerelease \`closed\` room records are deleted directly the next
+time \`room list\` reconciles Fleet with Cowork.
+
+\`ours-fleet task delete <id> <id>\` removes only a \`done\` task's Fleet backlog
+record. The exact task ID is required twice for confirmation. Delete rejects every
+other task state, never changes any room state, and reports an already-missing
+task as an idempotent no-op. The Owner-channel equivalent is
+\`/task delete <id> <id>\`.
 
 ## Permissions
 
@@ -521,8 +579,8 @@ Inspect \`ours-fleet status Name\`, \`peek Name\`, role logs, and
 
 ## Trusted owner channel
 
-An ACP role may declare a separate, existing ours identity which fleet — never
-the agent — binds:
+An ACP role may declare a separate ours identity which fleet — never the agent —
+creates when missing and binds:
 
 \`\`\`yaml
 owner_channel:
@@ -540,6 +598,13 @@ owner_channel:
     retention_ms: 86400000
     allowed_mime: [application/pdf, text/plain, image/png, audio/ogg]
 \`\`\`
+
+Permanent role identities are also reconciled before launch. Fleet creates a
+missing role identity with local exposure and local auto-accept enabled. A
+missing owner-channel identity uses the safer inverse policy: both are disabled.
+The short provisioning lease is released before the agent or channel binds.
+Temporary role identities remain connector-owned because their creating lease
+defines their cleanup lifetime.
 
 This does not replace the role identity. Normal identity mail remains untrusted
 peer input: the agent reads it through \`get_messages\` and replies through
@@ -588,13 +653,18 @@ their content signature must match the declared MIME, and symlinks or non-regula
 paths fail closed. Sanitized copies live only in a mode-0700 request directory as
 mode-0600 files and are removed after completion or bounded stale retention.
 
-Voice prompts include a bounded transcript only when ours-mcp reports success.
+Voice prompts include a bounded transcript only when typed daemon metadata reports success.
 Failure or unavailability is explicit and preserves the private audio path as the
-fallback. Run \`ours-mcp voice-status --json\` to inspect the host configuration.
-A mode-0600 crash journal contains only authenticated CID and wire routing data;
-it never stores captions, filenames, paths, transcript text, or bytes. Journaled
-post-retrieval files resume selectively through \`save_file\`. A deferred agent
-caption is replayed with its processed files before the group is admitted. Fleet
+input for direct review. Run \`ours config show --json\` and inspect \`sttConfigured\` without
+revealing provider credentials.
+A mode-0600 message claim journal stores only wire ID, persistent-history
+sequence, and claim time. Fleet journals the exact body-free oldest-first slice
+before calling \`getMessages\` with that slice length, rejects a returned set
+mismatch, and loads a crash-recovered body only through \`getHistoryItem\`.
+The attachment crash journal contains only authenticated CID and wire routing
+data; it never stores captions, filenames, paths, transcript text, or bytes.
+Journaled read files resume through \`getFileInfo\` and \`fetchFile\`. A claimed
+agent caption is loaded from history and rejoined before the group is admitted. Fleet
 resolves one authenticated owner route before retrieving bytes, admits every file
 before emitting the caption or any file, and sends every part to that same route.
 Unknown correlated routes remain queued without retrieval and receive one bounded
@@ -746,7 +816,7 @@ reconcile explicitly; no chain preserves detection-only behavior.
 `;
 
 /**
- * What every shipped spawn-skill variant must say, and must not say (7.1).
+ * What every shipped spawn-skill variant must say, and must not say.
  *
  * The skills are separate markdown files in two published plugins, written for
  * two different harnesses, so they cannot literally be one file. This is the
@@ -776,7 +846,7 @@ export const SPAWN_SKILL_CONTRACT = {
     // The only intent that clears the floor, and the honest alternative.
     '--approval allow',
     '--unattended wait',
-    // Creation-time isolation (6.3) — the one new operator input this release adds.
+    // Creation-time isolation — the one new operator input this release adds.
     '--isolation-file',
   ],
   /**

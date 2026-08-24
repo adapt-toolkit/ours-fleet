@@ -121,7 +121,7 @@ export function validateIsolationConfig(raw: unknown): string[] {
 }
 
 /**
- * Where a role's per-role harness runtime state lives (5.1). Under the agent's
+ * Where a role's per-role harness runtime state lives. Under the agent's
  * own state directory, so it is covered by the state dir's existing lifecycle
  * and by the forbidden-path exception, and is never shared with a peer.
  */
@@ -165,7 +165,7 @@ export function resolveIsolation(cfg: IsolationConfig, ctx: WrapContext): Resolv
   addRw(stateDir);
   addRw(runCwd);
   if (ctx.harnessHome && ctx.harnessRuntimeDir) {
-    // The harness home is backed by a PER-ROLE directory (5.1): the agent gets a
+    // The harness home is backed by a PER-ROLE directory: the agent gets a
     // writable home for its sessions, caches and history, and anything a future
     // CLI version writes lands there too. The shared credentials, global
     // instructions and configuration are then layered back read-only, so they

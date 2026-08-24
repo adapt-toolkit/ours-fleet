@@ -1,5 +1,8 @@
 import { userInfo } from 'node:os';
 import { existsSync, readFileSync } from 'node:fs';
+import {
+  attachOursClient, type AttachOursClientOptions, type OursClient,
+} from '@ours.network/sdk/client';
 import { realExec, type Exec } from './exec.js';
 import { isolationContextFor, loadConfig, type ResolvedRole } from './config.js';
 import type { ConfigDiagnostic, YamlMode } from './config-yaml.js';
@@ -35,6 +38,11 @@ interface MonitorProfile {
   endpoint: DaemonEndpoint;
   roles: string[];
 }
+
+type DoctorDaemonClient = Pick<OursClient, 'version'>;
+type AttachDoctorDaemon = (
+  options: AttachOursClientOptions,
+) => Promise<DoctorDaemonClient>;
 
 /** Resolve and deduplicate the effective daemon profiles used by monitored roles. */
 function resolveMonitorProfiles(roles: ResolvedRole[]): MonitorProfile[] {
@@ -99,6 +107,7 @@ export async function doctor(
   exec: Exec = realExec,
   platform: NodeJS.Platform = process.platform,
   fetchImpl: FetchLike = (u, i) => globalThis.fetch(u, i) as unknown as ReturnType<FetchLike>,
+  attachDaemon: AttachDoctorDaemon = attachOursClient,
 ): Promise<PrereqReport> {
   const checks: PrereqCheck[] = [];
 
@@ -130,6 +139,134 @@ export async function doctor(
     detail: `warning: ${diagnostic.message}`,
   });
 
+  // ── Rooms/tasks checks ────────────────────────────────────────
+  if (loaded.ok && loaded.rooms) {
+    const rooms = loaded.rooms;
+
+    // Cowork socket reachability
+    const coworkConfig = rooms.cowork?.config;
+    try {
+      const { createCoworkAdapter } = await import('./rooms-tasks/cowork-adapter.js');
+      const adapter = createCoworkAdapter({ configPath: coworkConfig });
+      const reachable = await adapter.available();
+      checks.push({
+        name: 'cowork', ok: reachable,
+        detail: reachable
+          ? 'management socket reachable'
+          : `management socket unreachable${coworkConfig ? ` (config: ${coworkConfig})` : ''}`,
+      });
+    } catch (e) {
+      checks.push({
+        name: 'cowork', ok: false,
+        detail: `management socket error${coworkConfig ? ` (config: ${coworkConfig})` : ''}: ${(e as Error)?.message ?? e}`,
+      });
+    }
+
+    // Owner CID shape
+    const cidOk = /^[0-9a-fA-F]{64}$/.test(rooms.owner.expected_cid);
+    checks.push({
+      name: 'rooms: owner CID', ok: cidOk,
+      detail: cidOk ? 'valid 64-hex CID' : `invalid CID shape: ${rooms.owner.expected_cid.slice(0, 16)}...`,
+    });
+
+    // Invite presence (never content)
+    checks.push({
+      name: 'rooms: owner invite',
+      ok: !!loaded.ownerInviteFingerprint,
+      detail: loaded.ownerInviteFingerprint
+        ? `present (fingerprint: ${loaded.ownerInviteFingerprint.slice(0, 12)}...)`
+        : 'not configured — room owner attachment will use waiting_owner_invite',
+    });
+
+    // Template validity and referenced role validity
+    const { listTemplates, resolveTemplate } = await import('./rooms-tasks/templates.js');
+    const customs = loaded.roomTemplates ?? {};
+    const templates = listTemplates(customs);
+    const roleNames = new Set(roles.map(r => r.name));
+    for (const t of templates) {
+      const badRefs = t.members
+        .filter(m => m.role_ref && !roleNames.has(m.role_ref))
+        .map(m => m.role_ref);
+      if (badRefs.length) {
+        checks.push({
+          name: `template: ${t.name}@${t.version}`,
+          ok: true,
+          detail: `warning: role_ref(s) ${badRefs.join(', ')} not found in configured roles`,
+        });
+      }
+    }
+
+    // Default template validity
+    const defaultTemplate = loaded.rooms.defaults?.template
+      ?? loaded.tasks?.default_room_template;
+    if (defaultTemplate) {
+      const resolved = resolveTemplate(defaultTemplate, customs);
+      checks.push({
+        name: 'rooms: default template',
+        ok: !!resolved,
+        detail: resolved
+          ? `${resolved.name}@${resolved.version}`
+          : `template '${defaultTemplate}' not found`,
+      });
+    }
+
+    // Shared-daemon selection coherence
+    if (rooms.cowork?.config) {
+      const { existsSync: exists } = await import('node:fs');
+      const configOk = exists(rooms.cowork.config);
+      checks.push({
+        name: 'rooms: cowork config', ok: configOk,
+        detail: configOk
+          ? `cowork config at ${rooms.cowork.config}`
+          : `cowork config not found: ${rooms.cowork.config}`,
+      });
+    }
+
+    // Hard room-management capability check
+    try {
+      const { createCoworkAdapter } = await import('./rooms-tasks/cowork-adapter.js');
+      const adapter = createCoworkAdapter({ configPath: coworkConfig });
+      const roomList = await adapter.listRooms();
+      checks.push({
+        name: 'rooms: capability', ok: true,
+        detail: `cowork room management operational (${roomList.length} room(s))`,
+      });
+    } catch (e) {
+      const msg = (e as Error)?.message ?? String(e);
+      const isProto = msg.includes('protocol') || msg.includes('invalid');
+      checks.push({
+        name: 'rooms: capability', ok: false,
+        detail: isProto
+          ? `cowork does not support room management protocol — upgrade ours-cowork to a version that supports the room management protocol`
+          : `room management check failed: ${msg}`,
+      });
+    }
+
+    // Stale task/room warnings
+    try {
+      const { listTasks } = await import('./rooms-tasks/task-state.js');
+      const { listRoomRecords } = await import('./rooms-tasks/room-state.js');
+      const tasks = listTasks();
+      const roomRecords = listRoomRecords();
+      const roomIds = new Set(roomRecords.map(r => r.room_id));
+      const taskIds = new Set(tasks.map(t => t.task_id));
+
+      const orphanedTasks = tasks.filter(t => t.room_id && !roomIds.has(t.room_id));
+      const orphanedRooms = roomRecords.filter(r => r.task_id && !taskIds.has(r.task_id));
+
+      if (orphanedTasks.length)
+        checks.push({
+          name: 'rooms: stale tasks', ok: true,
+          detail: `warning: ${orphanedTasks.length} task(s) reference missing rooms: ${orphanedTasks.map(t => t.task_id).join(', ')}`,
+        });
+      if (orphanedRooms.length)
+        checks.push({
+          name: 'rooms: stale rooms', ok: true,
+          detail: `warning: ${orphanedRooms.length} room(s) reference missing tasks: ${orphanedRooms.map(r => r.room_id).join(', ')}`,
+        });
+    } catch { /* state dir may not exist yet */ }
+  }
+
   if (roles.length === 0 || roles.some(role => (role.session ?? 'tmux') === 'tmux')) {
     const tmux = await exec('tmux', ['-V']);
     checks.push({
@@ -138,16 +275,21 @@ export async function doctor(
     });
   }
 
-  const mcp = await exec('ours-mcp', ['--version']);
-  checks.push({
-    name: 'ours-mcp', ok: mcp.code === 0,
-    detail: mcp.code === 0 ? mcp.stdout.trim() : 'not found — npm i -g @ours.network/mcp',
-  });
-  if (mcp.code === 0) {
-    const st = await exec('ours-mcp', ['status']);
+  try {
+    const client = await attachDaemon({
+      env: process.env,
+      leaseToken: `ours-fleet-doctor-${process.pid}`,
+      clientPid: process.pid,
+    });
+    const info = await client.version();
+    if (info.name !== 'ours' || typeof info.version !== 'string')
+      throw new Error('the selected endpoint did not return a valid ours daemon identity');
+    checks.push({ name: 'ours daemon', ok: true, detail: `running (${info.version})` });
+  } catch (error) {
     checks.push({
-      name: 'ours-mcp daemon', ok: st.code === 0,
-      detail: st.code === 0 ? 'running' : 'not running — start it with: ours-mcp start',
+      name: 'ours daemon', ok: false,
+      detail: `not reachable through the SDK — start it with: ours daemon start `
+        + `[${(error as Error)?.message ?? String(error)}]`,
     });
   }
 
@@ -173,7 +315,7 @@ export async function doctor(
     });
   }
 
-  // Per-role permission translation (2.3). Rendered from the same analysis the
+  // Per-role permission translation. Rendered from the same analysis the
   // `config` command prints, so the two commands cannot disagree.
   for (const analysis of analyzeFleetPermissions(roles)) {
     if (!analysis.supported) {
@@ -193,14 +335,14 @@ export async function doctor(
         : `${summary} (exact)`,
     });
 
-    // A role that states its permission intent twice, in two disagreeing places
-    // (2.4). Quiet when there is a single source of intent.
+    // Report a role that states its permission intent twice in disagreeing places.
+    // Stay quiet when there is a single source of intent.
     for (const conflict of analysis.conflicts ?? [])
       checks.push({
         name: `permission conflict: ${analysis.role}`, ok: true, detail: conflict.warning,
       });
 
-    // The floor is checked BEFORE start (2.1): an under-permissioned unattended
+    // The floor is checked BEFORE start: an under-permissioned unattended
     // role never reports its own failure, because the denial happens inside the
     // harness with nobody attached to see it.
     const floor = analysis.floor!;
@@ -248,7 +390,7 @@ export async function doctor(
   }
 
   // Isolation reporting (AC-9). Backend availability is advisory — isolation is
-  // opt-in per role (OQ-1), so a missing bwrap must not fail doctor for fleets that
+  // opt-in per role, so a missing bwrap must not fail doctor for fleets that
   // don't use it. Only a role that DECLARES isolation and cannot get it under
   // `strict` is a hard failure.
   const bw = await makeBubblewrapBackend(exec).available();
@@ -261,7 +403,7 @@ export async function doctor(
   if (platform === 'linux')
     checks.push({ name: 'isolation: cgroup delegation', ok: true, detail: cgroupDelegationDetail() });
   for (const r of roles.filter(r => r.isolation)) {
-    // A refused mount is a launch-blocking policy error (5.2), not a warning.
+    // A refused mount is a launch-blocking policy error, not a warning.
     let policy;
     try { policy = resolveIsolation(r.isolation!, isolationContextFor(r)); }
     catch (e) {
@@ -284,7 +426,7 @@ export async function doctor(
     checks.push({ name: `isolation: ${r.name}`, ok, detail });
   }
 
-  // Monitor daemon-API reachability (design §5): only when a role is supervised.
+  // Probe monitor daemon-API reachability only when a role is supervised.
   // /state-dir is unauthenticated (liveness); /identities exercises the token so a
   // shared-mode misconfig (401) surfaces here rather than as a silent deaf monitor.
   const monitorProfiles = resolveMonitorProfiles(roles);
@@ -312,7 +454,7 @@ export async function doctor(
       }
     } catch (e) {
       detail = `unreachable on :${endpoint.port} — monitored roles run degraded until it is up ` +
-        `(start it: ours-mcp start) [${(e as Error)?.message ?? e}]`;
+        `(start it: ours daemon start) [${(e as Error)?.message ?? e}]`;
     }
     checks.push({ name: checkName, ok, detail });
   }
@@ -431,13 +573,23 @@ export async function doctor(
  * clean bill of health for a configuration `ours-fleet config` refuses outright.
  */
 type ConfigLoad =
-  | { ok: true; roles: ResolvedRole[]; files: string[]; diagnostics: ConfigDiagnostic[] }
+  | {
+      ok: true; roles: ResolvedRole[]; files: string[]; diagnostics: ConfigDiagnostic[];
+      rooms?: import('./rooms-tasks/types.js').RoomsConfig;
+      roomTemplates?: import('./rooms-tasks/types.js').RoomTemplatesConfig;
+      tasks?: import('./rooms-tasks/types.js').TasksConfig;
+      ownerInviteFingerprint?: string;
+    }
   | { ok: false; error: string };
 
 function loadConfigResult(configPath?: string, yamlMode?: YamlMode): ConfigLoad {
   try {
     const cfg = loadConfig(configPath, { yamlMode });
-    return { ok: true, roles: cfg.roles, files: cfg.files, diagnostics: cfg.diagnostics };
+    return {
+      ok: true, roles: cfg.roles, files: cfg.files, diagnostics: cfg.diagnostics,
+      rooms: cfg.rooms, roomTemplates: cfg.roomTemplates, tasks: cfg.tasks,
+      ownerInviteFingerprint: cfg.ownerInviteFingerprint,
+    };
   } catch (e) {
     return { ok: false, error: e instanceof Error ? e.message : String(e) };
   }

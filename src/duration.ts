@@ -1,4 +1,4 @@
-/** Parse `30s | 10m | 2h` duration strings to milliseconds (spec §2). */
+/** Parse `30s | 10m | 2h` duration strings to milliseconds. */
 const UNIT_MS: Record<string, number> = { s: 1_000, m: 60_000, h: 3_600_000, d: 86_400_000 };
 const RE = /^(\d+)([smhd])$/;
 

@@ -11,12 +11,14 @@ import {
   resolveRoleModel, resolveWorklogPolicy, validateMonitorConfig,
   type ApprovalMode, type FilesystemMode, type ResolvedRole, type RoleConfig,
   type CommonPermissions, type MonitorConfig, type SessionBackendId, type UnattendedMode,
+  type RoomStartupGate,
 } from './config.js';
 import { resolveRoleModelEnv } from './model-env.js';
 import { applyRole, up, type OpsDeps } from './ops.js';
 import { START_STAGGER_FILE } from './runner.js';
 import {
-  buildProvenance, daemonIdentityProvisioner, ensureIdentity, provenanceOf,
+  buildProvenance, daemonIdentityInventoryProvisioner, daemonIdentityProvisioner,
+  ensureIdentity, provenanceOf,
   withCreationTransaction, writeProvenance, writeRoleFile,
   type CreationDeps, type CreationProvenance, type CreationTransaction,
   type IdentityGuarantee, type ProvenanceEntry,
@@ -72,12 +74,14 @@ export interface SpawnOpts {
   creationActionId?: string;
   /** Set only by a live role supervisor after a role-scoped proxy request. */
   callerRole?: string;
+  /** Trusted Fleet-internal gate for a Cowork room member; not a CLI/config surface. */
+  roomStartupGate?: RoomStartupGate;
   /** Internal provenance labels for values filled by the caller's supervisor. */
   inheritedFromCaller?: string[];
   /**
    * Path to a file holding exactly the existing `isolation:` mapping — the same
    * schema fleet.yaml uses, not a second policy language. The ONE new operator
-   * input in this release (6.3).
+   * input in this release.
    */
   isolationFile?: string;
   overseeInterval?: string;
@@ -296,7 +300,7 @@ export function spawnDryRun(o: SpawnOpts): SpawnDryRun {
 
 /**
  * Which settings came from the operator, from fleet defaults, or from a
- * built-in (6.6). Built while the options are still separable — once they are
+ * built-in. Built while the options are still separable — once they are
  * merged into a ResolvedRole the distinction is gone.
  *
  * `env`, `bio`, `persona` and `harness_options` are deliberately absent: the
@@ -342,21 +346,21 @@ export async function spawnPermanent(
   validateSpawnOpts(o);
   if (o.isolationFile) readIsolationFile(o.isolationFile);   // fail before reserving
   if (o.missionFile) readMissionFile(o.missionFile);         // fail before reserving
-  // Name AND identity reserved together, before anything is written or started
-  // (6.4). A loser of the race creates no config, no state, no service.
+  // Reserve name and identity together before anything is written or started.
+  // A loser of the race creates no config, state, or service.
   creation.onStage?.('reserving');
   return withCreationTransaction(
     { role: o.name, identity: effectiveIdentity(o) },
     async tx => {
       assertNameFree(o);
       const cfg = loadConfig(o.configPath);
-      // Establish the identity BEFORE the service is enabled (7.3), and record
+      // Establish the identity BEFORE the service is enabled, and record
       // what was actually guaranteed so the briefing can say something true.
       creation.onStage?.('checking_identity');
       const guarantee = await ensureIdentity(
         effectiveIdentity(o),
         profileValues(o),
-        creation.identityProvisioner ?? daemonIdentityProvisioner(),
+        creation.identityProvisioner ?? deps.identityProvisioner ?? daemonIdentityProvisioner(),
         deps.log);
       creation.onStage?.('checking_identity', {
         result: guarantee.evidence, guarantee: guarantee.state,
@@ -386,7 +390,7 @@ export async function spawnPermanent(
         undo: () => { if (!stateExisted) rmSync(stateDir, { recursive: true, force: true }); },
       });
       // Journal the service registration BEFORE it happens, and undo only the
-      // registrations this transaction actually created (6.2). `registered` is
+      // registrations this transaction actually created. `registered` is
       // filled by `up`'s onInstalled hook at the moment each registration is
       // made — not from its return value, which never arrives when `up` throws
       // after registering.
@@ -396,7 +400,7 @@ export async function spawnPermanent(
         undo: async () => { for (const n of registered) await deps.backend.uninstall(n); },
       });
       // Provenance is written BEFORE the role starts, so a role that fails to
-      // launch still records how it was asked for (6.6).
+      // launch still records how it was asked for.
       const provenance = buildProvenance({
         role: o.name, lifetime: 'permanent', fleetVersion: VERSION,
         settings: provenanceSettings(o, cfg.defaults),
@@ -407,7 +411,12 @@ export async function spawnPermanent(
       creation.onStage?.('registering_supervisor');
       await up(
         loadConfig(o.configPath), [o.name],
-        { ...deps, onInstalled: outcome => registered.push(outcome.role) },
+        {
+          ...deps,
+          ...(creation.identityProvisioner
+            ? { identityProvisioner: creation.identityProvisioner } : {}),
+          onInstalled: outcome => registered.push(outcome.role),
+        },
         o.configPath, guarantee.state);
       lastProvenance = provenance;
       return file;
@@ -449,8 +458,8 @@ export async function spawnTemp(
   // Retire only supervisors whose recorded owner is definitively stopped. This
   // bounded pass keeps the active roster clean without deleting old evidence.
   await reclaimStaleTempState();
-  // Temporary roles go through the SAME reservation boundary as permanent ones
-  // (6.4): a temp agent competes for the same names.
+  // Temporary roles go through the same reservation boundary as permanent ones:
+  // a temp agent competes for the same names.
   creation.onStage?.('reserving');
   return withCreationTransaction(
     { role: o.name, identity: effectiveIdentity(o) },
@@ -460,7 +469,7 @@ export async function spawnTemp(
       const guarantee = await ensureIdentity(
         effectiveIdentity(o),
         profileValues(o),
-        creation.identityProvisioner ?? daemonIdentityProvisioner(),
+        creation.identityProvisioner ?? daemonIdentityInventoryProvisioner(),
         creation.log);
       creation.onStage?.('checking_identity', {
         result: guarantee.evidence, guarantee: guarantee.state,
@@ -521,13 +530,14 @@ async function spawnTempInner(
     permissions: resolvePermissions(cfg.defaults.permissions, fromOpts.permissions),
     permissionsDeclared:
       fromOpts.permissions !== undefined || cfg.defaults.permissions !== undefined,
-    // Temp agents inherit the fleet-wide monitor defaults via the snapshot (design §2).
+    // Temp agents inherit the fleet-wide monitor defaults via the snapshot.
     monitor: resolveMonitorConfig(cfg.defaults.monitor, fromOpts.monitor),
     owner_channel: resolveOwnerChannelConfig(
       cfg.defaults.owner_channel, fromOpts.owner_channel, session),
     worklog: resolveWorklogPolicy(cfg.defaults.worklog, fromOpts.worklog),
     auth_proxy: tempAuthProxy,
     sourceFile: '(temp)',
+    roomStartupGate: o.roomStartupGate,
   };
   role.env = modelEnv.env;
   if (role.auth_proxy && role.harness !== 'claude-code')

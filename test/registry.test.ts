@@ -31,8 +31,9 @@ export const fakeAdapter: HarnessAdapter = {
     temporaryCreateTool: 'create_temporary_identity', setBioTool: 'set_bio',
     setPersonaTool: 'set_persona', currentIdentityTool: 'current_identity',
     sendTool: 'send_message', getMessagesTool: 'get_messages',
-    watchCommand: id => `ours-mcp watch "${id}"`,
-    monitorInstruction: id => `Arm a persistent Monitor running \`ours-mcp watch "${id}"\`.`,
+    listHistoryTool: 'list_history', getHistoryItemTool: 'get_history_item',
+    monitorInstruction: id =>
+      `Arm a persistent Monitor running \`ours api watch-notifications --input '{"identity":"${id}"}' --json\`.`,
     supervisedWakeNote: () => 'Wakes arrive as [fleet-monitor] lines — do NOT arm a Monitor. Run get_messages.',
     launchNote: name => `You are session ${name}.`,
     restartPrompt: (id, wl, role) => role?.monitor?.mode === 'fleet'
@@ -55,7 +56,7 @@ describe('harness registry', () => {
   });
 });
 
-describe('adapter permission-translation contract (2.3)', () => {
+describe('adapter permission-translation contract', () => {
   it('refuses to register an adapter that does not declare translatePermissions', () => {
     const { translatePermissions, ...silent } = fakeAdapter;
     expect(() => registerAdapter({ ...silent, id: 'silent' } as unknown as HarnessAdapter))

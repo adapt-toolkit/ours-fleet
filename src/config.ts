@@ -14,6 +14,10 @@ import { resolveWatchdogs } from './watchdog/config.js';
 import type { ResolvedWatchdog } from './watchdog/config.js';
 import { resolveLoops } from './loops/config.js';
 import type { ResolvedLoop, ResolvedRoleLoop } from './loops/config.js';
+import {
+  validateRoomsConfig, validateTasksConfig, validateRoomTemplatesConfig,
+} from './rooms-tasks/config.js';
+import type { RoomsConfig, RoomTemplatesConfig, TasksConfig } from './rooms-tasks/types.js';
 import { CAPABILITIES, CAP_MONITOR_INTERRUPT_AFTER_TOOL } from './capabilities.js';
 import { runningLabel } from './provenance.js';
 
@@ -71,7 +75,7 @@ export interface SessionOptions {
   };
 }
 
-/** Resolved per-role supervisor-monitor config (see DESIGN-external-monitor §2). */
+/** Resolved per-role supervisor-monitor config. */
 export interface MonitorConfig {
   /** Who owns mail wake delivery: ours-fleet supervisor or the native harness. */
   mode: MonitorMode;
@@ -135,7 +139,7 @@ export const DEFAULT_OWNER_ATTACHMENT_MIME = [
   'application/vnd.openxmlformats-officedocument.presentationml.presentation',
 ] as const;
 
-/** Default wake sources when a role does not list its own (design §2). */
+/** Default wake sources when a role does not list its own. */
 export const DEFAULT_WAKE_SOURCES: NotifyEventType[] =
   ['message_received', 'file_received', 'local_contact_request', 'pending_message'];
 const MONITOR_KEYS = [
@@ -232,6 +236,16 @@ export interface RoleConfig {
   auth_proxy?: Partial<AuthProxyConfig>;
 }
 
+/** Internal startup contract for Fleet-provisioned Cowork room members. */
+export interface RoomStartupGate {
+  room_id: string;
+  room_identity_cid: string;
+  briefing_role: string;
+  briefing_version: number;
+  briefing_sha256: string;
+  owner_seat_cid: string | null;
+}
+
 export interface ResolvedRole extends Omit<RoleConfig, 'model' | 'owner_channel' | 'worklog'> {
   name: string;
   harness: string;
@@ -241,7 +255,7 @@ export interface ResolvedRole extends Omit<RoleConfig, 'model' | 'owner_channel'
    * Whether `permissions:` was actually written by the operator (on the role or
    * in defaults), as opposed to resolved from built-in defaults. A role that
    * states its intent only once — neutrally OR natively — has nothing to
-   * contradict, and must not be warned at (2.4).
+   * contradict, and must not be warned at.
    */
   permissionsDeclared: boolean;
   identity: string;
@@ -252,6 +266,8 @@ export interface ResolvedRole extends Omit<RoleConfig, 'model' | 'owner_channel'
   worklog?: WorklogPolicy;
   auth_proxy?: AuthProxyConfig;
   loops?: ResolvedRoleLoop[];
+  /** Internal/transient: never accepted as a user-authored RoleConfig key. */
+  roomStartupGate?: RoomStartupGate;
 }
 
 export interface FleetConfig {
@@ -265,6 +281,17 @@ export interface FleetConfig {
   diagnostics: ConfigDiagnostic[];
   watchdogs: ResolvedWatchdog[];
   loops: ResolvedLoop[];
+  rooms?: import('./rooms-tasks/types.js').RoomsConfig;
+  roomTemplates?: import('./rooms-tasks/types.js').RoomTemplatesConfig;
+  tasks?: import('./rooms-tasks/types.js').TasksConfig;
+  /** SHA-256 fingerprint of the resolved owner invite (never the invite itself). */
+  ownerInviteFingerprint?: string;
+  /**
+   * Resolved owner invite for immediate private-IPC use only. This property is
+   * deliberately non-enumerable so config dumps and JSON output cannot expose
+   * the bearer credential.
+   */
+  ownerInvite?: string;
 }
 
 export class ConfigError extends Error {}
@@ -291,7 +318,7 @@ export function resolveRoleModel(
 export function isolationContextFor(role: ResolvedRole): WrapContext {
   const stateDir = agentDir(role.name, (role as ResolvedRole & { __temp?: boolean }).__temp === true);
   const runCwd = role.cwd ?? stateDir;
-  // Ask the harness how its host state splits (5.1). An adapter that declares
+  // Ask the harness how its host state splits. An adapter that declares
   // none keeps the historical whole-home mount.
   let split: { home?: string; shared: string[] } | undefined;
   try { split = getAdapter(role.harness).isolationPaths?.(role, { stateDir, runCwd }); }
@@ -350,9 +377,10 @@ export function loadConfig(
       const parsed = parseFleetDocument(p, readFileSync(p, 'utf8'), options.yamlMode);
       const doc = parsed.value;
       diagnostics.push(...parsed.diagnostics);
-      const extra = Object.keys(doc).filter(k => k !== 'roles');
+      const FLEET_D_ALLOWED = ['roles', 'rooms', 'room_templates', 'tasks'];
+      const extra = Object.keys(doc).filter(k => !FLEET_D_ALLOWED.includes(k));
       if (extra.length)
-        throw new ConfigError(`${p}: fleet.d files may only define roles: (found: ${extra.join(', ')})`);
+        throw new ConfigError(`${p}: fleet.d files may only define ${FLEET_D_ALLOWED.join(', ')}: (found: ${extra.join(', ')})`);
       docs.push({ file: p, doc });
       files.push(p);
     }
@@ -449,7 +477,7 @@ export function loadConfig(
         env: Object.keys(env).length ? env : undefined,
         loops: [],
       });
-      // Forbidden-path enforcement (5.2): a mount that would breach the policy
+      // Forbidden-path enforcement: a mount that would breach the policy
       // is a configuration error, caught by `config` rather than at launch.
       if (isolation !== undefined) {
         const role = roles[roles.length - 1];
@@ -464,10 +492,50 @@ export function loadConfig(
   const watchdogs = resolveWatchdogs(baseDoc, base, roles, vars, defaults);
   const resolvedLoops = resolveLoops(baseDoc.loops, base, roles, vars);
   for (const role of roles) role.loops = resolvedLoops.byRole.get(role.name) ?? [];
-  return {
+
+  // ── Rooms, room_templates, tasks (split-config merge) ──────────────
+  // These sections may appear in the base fleet.yaml and/or in fleet.d files.
+  // Base provides defaults; fleet.d extends. Only one source may define rooms/tasks
+  // top-level (room_templates merge by name, last writer wins).
+  let rooms: RoomsConfig | undefined;
+  let ownerInviteFingerprint: string | undefined;
+  let ownerInvite: string | undefined;
+  let roomTemplates: RoomTemplatesConfig | undefined;
+  let tasks: TasksConfig | undefined;
+
+  for (const { file, doc } of docs) {
+    if (doc.rooms !== undefined) {
+      if (rooms) throw new ConfigError(`rooms: defined in multiple files; last: ${file}`);
+      const validated = validateRoomsConfig(deepSub(doc.rooms, vars), vars, file);
+      ownerInviteFingerprint = validated._invite?.fingerprint;
+      ownerInvite = validated._invite?.value;
+      const { _invite: _, ...clean } = validated;
+      rooms = clean;
+    }
+    if (doc.room_templates !== undefined) {
+      const validated = validateRoomTemplatesConfig(deepSub(doc.room_templates, vars), file);
+      roomTemplates = { ...(roomTemplates ?? {}), ...validated };
+    }
+    if (doc.tasks !== undefined) {
+      if (tasks) throw new ConfigError(`tasks: defined in multiple files; last: ${file}`);
+      tasks = validateTasksConfig(deepSub(doc.tasks, vars), file);
+    }
+  }
+
+  const result: FleetConfig = {
     roles, vars, defaults, files, startStaggerMs, diagnostics, watchdogs,
     loops: resolvedLoops.loops,
+    rooms, roomTemplates, tasks, ownerInviteFingerprint,
   };
+  if (ownerInvite !== undefined) {
+    Object.defineProperty(result, 'ownerInvite', {
+      value: ownerInvite,
+      enumerable: false,
+      writable: false,
+      configurable: false,
+    });
+  }
+  return result;
 }
 
 /**
@@ -802,7 +870,7 @@ function resolveStartStaggerMs(raw: unknown, base: string): number {
 
 /**
  * Merge `defaults.monitor` under the role's own `monitor:` key-by-key, validate the
- * result, and fill code-constant defaults (design §2). `monitor.mode` selects
+ * result, and fill code-constant defaults. `monitor.mode` selects
  * fleet-owned or native-harness monitoring; absent everywhere ⇒ fleet. The old
  * `enabled` boolean remains a compatibility alias. Throws ConfigError on a
  * malformed block so a typo fails loudly rather than silently disarming a monitor.

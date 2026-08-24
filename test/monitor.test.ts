@@ -228,7 +228,7 @@ describe('token resolution (issue #17)', () => {
     expect(resolveEndpoint(baseEnv()).url('A')).toContain(':3050/');
   });
 
-  it('matches ours-mcp parseInt + nullish port semantics', () => {
+  it('matches the daemon parseInt + nullish port semantics', () => {
     writeCfg({ port: 4100 });
     expect(resolveEndpoint(baseEnv({ OURS_PORT: '4200suffix' })).port).toBe(4200);
     expect(resolveEndpoint(baseEnv({ OURS_PORT: 'not-a-port' })).port).toBe(4100);
@@ -614,7 +614,7 @@ describe('Monitor.run — delivery', () => {
     expect(readFileSync(join(dir, '.notify-cursor'), 'utf8').trim()).toBe('2');
   });
 
-  it('a refused ACP wake keeps the cursor, degrades with the reason, and replays (1.2)', async () => {
+  it('a refused ACP wake keeps the cursor, degrades with the reason, and replays', async () => {
     const tmux = fakeTmux();
     const submitted: string[] = [];
     const { fetch } = scriptedFetch([
@@ -644,7 +644,7 @@ describe('Monitor.run — delivery', () => {
     expect(readFileSync(join(dir, '.notify-cursor'), 'utf8').trim()).toBe('2');
   });
 
-  it('a refusal that never recovers leaves the durable cursor behind and says why (1.2)', async () => {
+  it('a refusal that never recovers leaves the durable cursor behind and says why', async () => {
     const tmux = fakeTmux();
     let submits = 0;
     const { fetch } = scriptedFetch([
@@ -677,7 +677,7 @@ describe('Monitor.run — delivery', () => {
     expect(state).toMatchObject({ deliveredCursor: 1, pending: { count: 1 } });
   });
 
-  it('a cancelled wake is likewise not a delivery (1.2)', async () => {
+  it('a cancelled wake is likewise not a delivery', async () => {
     const tmux = fakeTmux();
     const { fetch } = scriptedFetch([
       { cursor: 1, events: [] },
@@ -1398,7 +1398,7 @@ describe('Monitor.run — injection into a dirty composer (unsubmitted human tex
   });
 });
 
-describe('Monitor status is typed, timestamped, and self-heals per cause (1.8)', () => {
+describe('Monitor status is typed, timestamped, and self-heals per cause', () => {
   const statusLines = () =>
     readFileSync(join(dir, '.monitor-status'), 'utf8').trim().split('\n');
   const status = () => statusLines().join('\n');

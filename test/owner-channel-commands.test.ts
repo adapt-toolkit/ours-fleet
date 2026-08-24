@@ -1,4 +1,7 @@
-import { describe, expect, it, vi } from 'vitest';
+import { describe, expect, it, vi, beforeEach, afterEach } from 'vitest';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 
 import {
   dispatchOwnerCommand, isOwnerCommandText, ownerCommandHelp, ownerCommands,
@@ -30,6 +33,8 @@ function context(overrides: Partial<OwnerCommandContext> = {}): OwnerCommandCont
     runHarnessCommand: vi.fn(async () => undefined),
     restart: vi.fn(async () => undefined),
     fleetList: vi.fn(async () => 'Coordinator: acp'),
+    closeRoom: vi.fn(async roomId => { replies.push(`scheduled:${roomId}`); }),
+    terminalTask: vi.fn(async (taskId, kind) => { replies.push(`terminal:${taskId}:${kind}`); }),
     recentEvents: () => [],
     readWorklogTail: vi.fn(async () => undefined),
     reply: async text => { replies.push(text); },
@@ -148,7 +153,7 @@ describe('owner command registry', () => {
       await dispatchOwnerCommand(`/comments ${bad}`, ctx);
       expect(ctx.setComments).not.toHaveBeenCalled();
       expect(ctx.replies).toHaveLength(1);
-      expect(ctx.replies[0]).toContain('/comments [status|on|off]');
+      expect(ctx.replies[0]).toContain('Invalid command');
       expect(ctx.replies[0]).toContain('/help');
     }
   });
@@ -218,7 +223,7 @@ describe('owner command registry', () => {
     await dispatchOwnerCommand('/model', ctx);
     expect(ctx.runHarnessCommand).not.toHaveBeenCalled();
     expect(ctx.replies).toHaveLength(1);
-    expect(ctx.replies[0]).toContain('/model <model-id>');
+    expect(ctx.replies[0]).toContain('Invalid command');
   });
 
   it('returns help for a malformed /model argument', async () => {
@@ -320,5 +325,632 @@ describe('owner command registry', () => {
     expect(ctx.replies).toHaveLength(1);
     expect(ctx.replies[0]).toContain('⚠️');
     expect(ctx.replies[0]).not.toContain('spawn failed');
+  });
+});
+
+// ── Task/Room/Template subcommands ──────────────────────────────
+
+describe('owner-channel task subcommands', () => {
+  let dir: string;
+  let origHome: string | undefined;
+
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), 'ours-fleet-oc-'));
+    origHome = process.env.OURS_FLEET_HOME;
+    process.env.OURS_FLEET_HOME = dir;
+  });
+  afterEach(() => {
+    if (origHome !== undefined) process.env.OURS_FLEET_HOME = origHome;
+    else delete process.env.OURS_FLEET_HOME;
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  async function createTestTask(start = false) {
+    const { createTask } = await import('../src/rooms-tasks/task-state.js');
+    return createTask({
+      title: 'test task',
+      template: { name: 'dev', version: 1, content_hash: 'abc' },
+      origin: { type: 'cli' },
+      start,
+    });
+  }
+
+  it('snapshots the Markdown task lifecycle integration surface', async () => {
+    const t = await createTestTask();
+    const replies: string[] = [];
+    for (const command of [
+      `/task show ${t.task_id}`,
+      `/task start ${t.task_id}`,
+    ]) {
+      const ctx = context();
+      await dispatchOwnerCommand(command, ctx);
+      replies.push(...ctx.replies);
+    }
+    const { activateTask } = await import('../src/rooms-tasks/task-state.js');
+    activateTask(t.task_id);
+    for (const command of [
+      `/task block ${t.task_id} waiting on *dependency*`,
+      `/task unblock ${t.task_id}`,
+      `/task review ${t.task_id}`,
+      '/task list all',
+      `/task recover ${t.task_id}`,
+    ]) {
+      const ctx = context();
+      await dispatchOwnerCommand(command, ctx);
+      replies.push(...ctx.replies);
+    }
+    expect(replies.map(reply => reply
+      .replaceAll(t.task_id, '<TASK_ID>')
+      .replace(/\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{3}Z/g, '<ISO_DATE>')))
+      .toMatchSnapshot();
+  });
+
+  it('/task <id> shows task details (backward compat)', async () => {
+    const t = await createTestTask();
+    const ctx = context();
+    await dispatchOwnerCommand(`/task ${t.task_id}`, ctx);
+    expect(ctx.replies).toHaveLength(1);
+    expect(ctx.replies[0]).toContain(t.task_id);
+    expect(ctx.replies[0]).toContain('test task');
+  });
+
+  it('/task show <id> shows task details', async () => {
+    const t = await createTestTask();
+    const ctx = context();
+    await dispatchOwnerCommand(`/task show ${t.task_id}`, ctx);
+    expect(ctx.replies).toHaveLength(1);
+    expect(ctx.replies[0]).toContain(t.task_id);
+  });
+
+  it('/task start <id> transitions backlog → provisioning', async () => {
+    const t = await createTestTask();
+    const ctx = context();
+    await dispatchOwnerCommand(`/task start ${t.task_id}`, ctx);
+    expect(ctx.replies).toHaveLength(1);
+    expect(ctx.replies[0]).toContain('Provisioning');
+  });
+
+  it('/task block <id> <reason> blocks an active task', async () => {
+    const t = await createTestTask();
+    const { startTask, activateTask } = await import('../src/rooms-tasks/task-state.js');
+    startTask(t.task_id);
+    activateTask(t.task_id);
+    const ctx = context();
+    await dispatchOwnerCommand(`/task block ${t.task_id} waiting on deps`, ctx);
+    expect(ctx.replies).toHaveLength(1);
+    expect(ctx.replies[0]).toContain('blocked');
+    expect(ctx.replies[0]).toContain('waiting on deps');
+  });
+
+  it('/task unblock <id> unblocks a blocked task', async () => {
+    const t = await createTestTask();
+    const { startTask, activateTask, blockTask } = await import('../src/rooms-tasks/task-state.js');
+    startTask(t.task_id);
+    activateTask(t.task_id);
+    blockTask(t.task_id, 'waiting');
+    const ctx = context();
+    await dispatchOwnerCommand(`/task unblock ${t.task_id}`, ctx);
+    expect(ctx.replies).toHaveLength(1);
+    expect(ctx.replies[0]).toContain('unblocked');
+  });
+
+  it('/task review <id> moves to review', async () => {
+    const t = await createTestTask();
+    const { startTask, activateTask } = await import('../src/rooms-tasks/task-state.js');
+    startTask(t.task_id);
+    activateTask(t.task_id);
+    const ctx = context();
+    await dispatchOwnerCommand(`/task review ${t.task_id}`, ctx);
+    expect(ctx.replies).toHaveLength(1);
+    expect(ctx.replies[0]).toContain('review');
+  });
+
+  it('/task done <id> completes a task', async () => {
+    const t = await createTestTask();
+    const { startTask, activateTask, reviewTask } = await import('../src/rooms-tasks/task-state.js');
+    startTask(t.task_id);
+    activateTask(t.task_id);
+    reviewTask(t.task_id);
+    const ctx = context();
+    await dispatchOwnerCommand(`/task done ${t.task_id} ship it`, ctx);
+    expect(ctx.terminalTask).toHaveBeenCalledWith(t.task_id, 'done', { summary: 'ship it' });
+    expect(ctx.replies).toEqual([`terminal:${t.task_id}:done`]);
+  });
+
+  it('keeps arbitrary task effect errors generic and never exposes their text', async () => {
+    const secret = 'cannot connect using /secret/path token=canary-token';
+    const ctx = context({ terminalTask: vi.fn(async () => { throw new Error(secret); }) });
+    await dispatchOwnerCommand('/task done task-safe-id', ctx);
+    expect(ctx.replies).toHaveLength(1);
+    expect(ctx.replies[0]).toContain('Command failed');
+    expect(ctx.replies[0]).not.toContain('cannot connect');
+    expect(ctx.replies[0]).not.toContain('/secret/path');
+    expect(ctx.replies[0]).not.toContain('canary-token');
+  });
+
+  it('/task cancel requires ID twice', async () => {
+    const t = await createTestTask();
+    const ctx = context();
+    await dispatchOwnerCommand(`/task cancel ${t.task_id}`, ctx);
+    expect(ctx.replies).toHaveLength(1);
+    expect(ctx.replies[0]).toContain('destructive');
+  });
+
+  it('/task cancel <id> <id> cancels a task', async () => {
+    const t = await createTestTask();
+    const ctx = context();
+    await dispatchOwnerCommand(`/task cancel ${t.task_id} ${t.task_id}`, ctx);
+    expect(ctx.terminalTask).toHaveBeenCalledWith(t.task_id, 'cancelled');
+    expect(ctx.replies).toEqual([`terminal:${t.task_id}:cancelled`]);
+  });
+
+  it('/task delete requires the exact task ID twice', async () => {
+    const t = await createTestTask();
+    const ctx = context();
+    await dispatchOwnerCommand(`/task delete ${t.task_id} different-id`, ctx);
+    expect(ctx.replies).toHaveLength(1);
+    expect(ctx.replies[0]).toContain('destructive');
+  });
+
+  it('/task delete rejects trailing confirmation tokens', async () => {
+    const t = await createTestTask();
+    const ctx = context();
+    await dispatchOwnerCommand(`/task delete ${t.task_id} ${t.task_id} extra`, ctx);
+    expect(ctx.replies).toHaveLength(1);
+    expect(ctx.replies[0]).toContain('destructive');
+  });
+
+  it('/task delete removes a done task and reports a repeat as already absent', async () => {
+    const t = await createTestTask(true);
+    const { activateTask, reviewTask, completeTask, getTask } =
+      await import('../src/rooms-tasks/task-state.js');
+    activateTask(t.task_id);
+    reviewTask(t.task_id);
+    completeTask(t.task_id);
+
+    const first = context();
+    await dispatchOwnerCommand(`/task delete ${t.task_id} ${t.task_id}`, first);
+    expect(first.replies[0]).toContain('## 🗑️ Task deleted');
+    expect(first.replies[0]).toContain(t.task_id);
+    expect(() => getTask(t.task_id)).toThrow(/not found/);
+
+    const retry = context();
+    await dispatchOwnerCommand(`/task delete ${t.task_id} ${t.task_id}`, retry);
+    expect(retry.replies[0]).toContain('## 🗑️ Task already absent');
+    expect(retry.replies[0]).toContain(t.task_id);
+  });
+
+  it('/task recover reschedules an accepted pending terminal intent', async () => {
+    const t = await createTestTask();
+    const {
+      activateTask, reviewTask, startTask, updateTaskRoom,
+    } = await import('../src/rooms-tasks/task-state.js');
+    const { acceptTaskTerminalIntent } = await import('../src/rooms-tasks/terminal.js');
+    startTask(t.task_id);
+    activateTask(t.task_id);
+    reviewTask(t.task_id);
+    updateTaskRoom(t.task_id, 'room-terminal-recover', 'c'.repeat(64));
+    await acceptTaskTerminalIntent({
+      taskId: t.task_id,
+      kind: 'done',
+      roomId: 'room-terminal-recover',
+      outcome: { summary: 'recover me' },
+    });
+    const ctx = context();
+    await dispatchOwnerCommand(`/task recover ${t.task_id}`, ctx);
+    expect(ctx.terminalTask).toHaveBeenCalledWith(
+      t.task_id, 'done', { summary: 'recover me' },
+    );
+  });
+
+  it('/task start without id returns usage', async () => {
+    const ctx = context();
+    await dispatchOwnerCommand('/task start', ctx);
+    expect(ctx.replies).toHaveLength(1);
+    expect(ctx.replies[0]).toContain('usage');
+  });
+
+  it('/task block without reason returns usage', async () => {
+    const ctx = context();
+    await dispatchOwnerCommand('/task block abc123', ctx);
+    expect(ctx.replies).toHaveLength(1);
+    expect(ctx.replies[0]).toContain('usage');
+  });
+
+  it('/task reports error for nonexistent task', async () => {
+    const ctx = context();
+    await dispatchOwnerCommand('/task show nonexistent', ctx);
+    expect(ctx.replies).toHaveLength(1);
+    expect(ctx.replies[0]).toContain('⚠️');
+  });
+
+  it('/task create creates a task in provisioning by default', async () => {
+    const ctx = context();
+    await dispatchOwnerCommand('/task create my new task', ctx);
+    expect(ctx.replies).toHaveLength(1);
+    expect(ctx.replies[0]).toContain('created');
+    expect(ctx.replies[0]).toContain('Provisioning');
+  });
+
+  it('/task create --backlog creates a task in backlog', async () => {
+    const ctx = context();
+    await dispatchOwnerCommand('/task create --backlog backlog task', ctx);
+    expect(ctx.replies).toHaveLength(1);
+    expect(ctx.replies[0]).toContain('created');
+    expect(ctx.replies[0]).toContain('backlog');
+  });
+
+  it('/task create --template=dev includes template in reply', async () => {
+    const ctx = context();
+    await dispatchOwnerCommand('/task create --template=dev templated task', ctx);
+    expect(ctx.replies).toHaveLength(1);
+    expect(ctx.replies[0]).toContain('**Template:** `dev`');
+  });
+
+  it('/task create without title returns usage', async () => {
+    const ctx = context();
+    await dispatchOwnerCommand('/task create', ctx);
+    expect(ctx.replies).toHaveLength(1);
+    expect(ctx.replies[0]).toContain('usage');
+  });
+
+  it('/task create --no-room sets no_room on task record', async () => {
+    const ctx = context();
+    await dispatchOwnerCommand('/task create --no-room manual task', ctx);
+    expect(ctx.replies).toHaveLength(1);
+    expect(ctx.replies[0]).toContain('**Room:** Not requested');
+    const { listTasks } = await import('../src/rooms-tasks/task-state.js');
+    const tasks = listTasks();
+    const t = tasks.find(t => t.title === 'manual task');
+    expect(t).toBeDefined();
+    expect(t!.no_room).toBe(true);
+  });
+
+  it('/task create with multi-line brief stores brief on task record', async () => {
+    const ctx = context();
+    await dispatchOwnerCommand('/task create Fix parser\nThis is the detailed brief.\nSecond line of brief.', ctx);
+    expect(ctx.replies).toHaveLength(1);
+    expect(ctx.replies[0]).toContain('created');
+    const { listTasks } = await import('../src/rooms-tasks/task-state.js');
+    const tasks = listTasks();
+    const t = tasks.find(t => t.title === 'Fix parser');
+    expect(t).toBeDefined();
+    expect(t!.brief).toBe('This is the detailed brief.\nSecond line of brief.');
+  });
+
+  it('/task create --no-room --backlog with multi-line brief stores all fields', async () => {
+    const ctx = context();
+    await dispatchOwnerCommand('/task create --no-room --backlog Complex task\nBrief line 1\nBrief line 2', ctx);
+    expect(ctx.replies).toHaveLength(1);
+    expect(ctx.replies[0]).toContain('Backlog');
+    expect(ctx.replies[0]).toContain('**Room:** Not requested');
+    const { listTasks } = await import('../src/rooms-tasks/task-state.js');
+    const tasks = listTasks();
+    const t = tasks.find(t => t.title === 'Complex task');
+    expect(t).toBeDefined();
+    expect(t!.no_room).toBe(true);
+    expect(t!.brief).toBe('Brief line 1\nBrief line 2');
+    expect(t!.state).toBe('backlog');
+  });
+
+  it('/task list shows all tasks', async () => {
+    await createTestTask();
+    const ctx = context();
+    await dispatchOwnerCommand('/task list', ctx);
+    expect(ctx.replies).toHaveLength(1);
+    expect(ctx.replies[0]).toContain('test task');
+  });
+
+  it('/task list backlog filters to backlog state', async () => {
+    await createTestTask(); // backlog by default
+    const ctx = context();
+    await dispatchOwnerCommand('/task list backlog', ctx);
+    expect(ctx.replies).toHaveLength(1);
+    expect(ctx.replies[0]).toContain('Backlog');
+    expect(ctx.replies[0]).toContain('test task');
+  });
+
+  it('/task list blocked shows no blocked tasks when none exist', async () => {
+    await createTestTask();
+    const ctx = context();
+    await dispatchOwnerCommand('/task list blocked', ctx);
+    expect(ctx.replies).toHaveLength(1);
+    expect(ctx.replies[0]).toContain('No blocked');
+  });
+
+  it('/task recover <id> shows task state', async () => {
+    const t = await createTestTask();
+    const ctx = context();
+    await dispatchOwnerCommand(`/task recover ${t.task_id}`, ctx);
+    expect(ctx.replies).toHaveLength(1);
+    expect(ctx.replies[0]).toContain(t.task_id);
+    expect(ctx.replies[0]).toContain('Backlog');
+  });
+
+  it('/task recover without id returns usage', async () => {
+    const ctx = context();
+    await dispatchOwnerCommand('/task recover', ctx);
+    expect(ctx.replies).toHaveLength(1);
+    expect(ctx.replies[0]).toContain('usage');
+  });
+});
+
+describe('owner-channel room subcommands', () => {
+  let dir: string;
+  let origHome: string | undefined;
+
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), 'ours-fleet-oc-'));
+    origHome = process.env.OURS_FLEET_HOME;
+    process.env.OURS_FLEET_HOME = dir;
+  });
+  afterEach(() => {
+    if (origHome !== undefined) process.env.OURS_FLEET_HOME = origHome;
+    else delete process.env.OURS_FLEET_HOME;
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  async function createTestRoom(id?: string) {
+    const { randomUUID } = await import('node:crypto');
+    const { createRoomRecord } = await import('../src/rooms-tasks/room-state.js');
+    return createRoomRecord({
+      room_id: id ?? randomUUID().replace(/-/g, '').slice(0, 16),
+      room_name: 'test room',
+    });
+  }
+
+  it('snapshots the Markdown room list/show/recovery integration surface', async () => {
+    const r = await createTestRoom('room-snapshot');
+    const replies: string[] = [];
+    for (const command of ['/room list', `/room show ${r.room_id}`, `/room recover ${r.room_id}`]) {
+      const ctx = context();
+      await dispatchOwnerCommand(command, ctx);
+      replies.push(...ctx.replies);
+    }
+    expect(replies.map(reply => reply
+      .replaceAll(r.room_id, '<ROOM_ID>')
+      .replace(/\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{3}Z/g, '<ISO_DATE>')))
+      .toMatchSnapshot();
+  });
+
+  it('/room <id> shows room details (backward compat)', async () => {
+    const r = await createTestRoom();
+    const ctx = context();
+    await dispatchOwnerCommand(`/room ${r.room_id}`, ctx);
+    expect(ctx.replies).toHaveLength(1);
+    expect(ctx.replies[0]).toContain(r.room_id);
+    expect(ctx.replies[0]).toContain('test room');
+  });
+
+  it('/room show <id> shows room details', async () => {
+    const r = await createTestRoom();
+    const ctx = context();
+    await dispatchOwnerCommand(`/room show ${r.room_id}`, ctx);
+    expect(ctx.replies).toHaveLength(1);
+    expect(ctx.replies[0]).toContain(r.room_id);
+  });
+
+  it('/room show and recover redact stored saga diagnostics', async () => {
+    const r = await createTestRoom();
+    const secret = 'stack at /secret/path token=canary-token';
+    const { setSagaError } = await import('../src/rooms-tasks/room-state.js');
+    setSagaError(r.room_id, secret, secret, 'member_failed');
+    for (const command of [`/room show ${r.room_id}`, `/room recover ${r.room_id}`]) {
+      const ctx = context();
+      await dispatchOwnerCommand(command, ctx);
+      expect(ctx.replies).toHaveLength(1);
+      expect(ctx.replies[0]).toContain('inspect role logs');
+      expect(ctx.replies[0]).not.toContain('/secret/path');
+      expect(ctx.replies[0]).not.toContain('canary-token');
+    }
+  });
+
+  it('keeps arbitrary room effect errors generic and never exposes their text', async () => {
+    const r = await createTestRoom();
+    const { activateRoom } = await import('../src/rooms-tasks/room-state.js');
+    activateRoom(r.room_id);
+    const secret = 'cannot connect using /secret/path token=canary-token';
+    const ctx = context({ closeRoom: vi.fn(async () => { throw new Error(secret); }) });
+    await dispatchOwnerCommand(`/room close ${r.room_id} ${r.room_id}`, ctx);
+    expect(ctx.replies).toHaveLength(1);
+    expect(ctx.replies[0]).toContain('Command failed');
+    expect(ctx.replies[0]).not.toContain('/secret/path');
+    expect(ctx.replies[0]).not.toContain('canary-token');
+  });
+
+  it('/room close requires ID twice', async () => {
+    const r = await createTestRoom();
+    const ctx = context();
+    await dispatchOwnerCommand(`/room close ${r.room_id}`, ctx);
+    expect(ctx.replies).toHaveLength(1);
+    expect(ctx.replies[0]).toContain('destructive');
+  });
+
+  it('/room delete requires ID twice', async () => {
+    const r = await createTestRoom();
+    const ctx = context();
+    await dispatchOwnerCommand(`/room delete ${r.room_id}`, ctx);
+    expect(ctx.replies).toHaveLength(1);
+    expect(ctx.replies[0]).toContain('destructive');
+  });
+
+  it('/room delete <id> <id> delegates to the durable external delete path', async () => {
+    const r = await createTestRoom();
+    const { activateRoom } = await import('../src/rooms-tasks/room-state.js');
+    activateRoom(r.room_id);
+    const ctx = context();
+    await dispatchOwnerCommand(`/room delete ${r.room_id} ${r.room_id}`, ctx);
+    expect(ctx.replies).toHaveLength(1);
+    expect(ctx.replies[0]).toBe(`scheduled:${r.room_id}`);
+    expect(ctx.closeRoom).toHaveBeenCalledWith(r.room_id);
+  });
+
+  it('/room close <id> <id> delegates to the durable external close path', async () => {
+    const r = await createTestRoom();
+    const { activateRoom } = await import('../src/rooms-tasks/room-state.js');
+    activateRoom(r.room_id);
+    const ctx = context();
+    await dispatchOwnerCommand(`/room close ${r.room_id} ${r.room_id}`, ctx);
+    expect(ctx.replies).toHaveLength(1);
+    expect(ctx.replies[0]).toBe(`scheduled:${r.room_id}`);
+    expect(ctx.closeRoom).toHaveBeenCalledWith(r.room_id);
+  });
+
+  it('/room reports error for nonexistent room', async () => {
+    const ctx = context();
+    await dispatchOwnerCommand('/room show nonexistent', ctx);
+    expect(ctx.replies).toHaveLength(1);
+    expect(ctx.replies[0]).toContain('⚠️');
+  });
+
+  it('/room create creates a room', async () => {
+    const ctx = context();
+    await dispatchOwnerCommand('/room create --template=team my room', ctx);
+    expect(ctx.replies).toHaveLength(1);
+    expect(ctx.replies[0]).toContain('created');
+    expect(ctx.replies[0]).toContain('**Template:** `team`');
+  });
+
+  it('/room create without name returns usage', async () => {
+    const ctx = context();
+    await dispatchOwnerCommand('/room create', ctx);
+    expect(ctx.replies).toHaveLength(1);
+    expect(ctx.replies[0]).toContain('usage');
+  });
+
+  it('/room create --template=team persists template_snapshot', async () => {
+    const ctx = context();
+    await dispatchOwnerCommand('/room create --template=team My Dev Room', ctx);
+    expect(ctx.replies).toHaveLength(1);
+    expect(ctx.replies[0]).toContain('created');
+    expect(ctx.replies[0]).toContain('**Template:** `team`');
+    const { listRoomRecords } = await import('../src/rooms-tasks/room-state.js');
+    const rooms = listRoomRecords();
+    const r = rooms.find(r => r.room_name === 'My Dev Room');
+    expect(r).toBeDefined();
+    expect(r!.template_snapshot).toBeDefined();
+    expect(r!.template_snapshot!.name).toBe('team');
+    expect(r!.template_snapshot!.content_hash).toBeTruthy();
+  });
+
+  it('/room create with unknown template returns error', async () => {
+    const ctx = context();
+    await dispatchOwnerCommand('/room create --template=nonexistent My Room', ctx);
+    expect(ctx.replies).toHaveLength(1);
+    expect(ctx.replies[0]).toContain('unknown template');
+  });
+
+  it('/room create with multi-line goal stores goal on room record', async () => {
+    const ctx = context();
+    await dispatchOwnerCommand('/room create --template=team Goal Room\nFix the parser bug.\nSecond goal line.', ctx);
+    expect(ctx.replies).toHaveLength(1);
+    expect(ctx.replies[0]).toContain('created');
+    const { listRoomRecords } = await import('../src/rooms-tasks/room-state.js');
+    const rooms = listRoomRecords();
+    const r = rooms.find(r => r.room_name === 'Goal Room');
+    expect(r).toBeDefined();
+    expect(r!.goal).toBe('Fix the parser bug.\nSecond goal line.');
+    expect(r!.template_snapshot).toBeDefined();
+  });
+
+  it('/room list shows rooms', async () => {
+    await createTestRoom();
+    const ctx = context();
+    await dispatchOwnerCommand('/room list', ctx);
+    expect(ctx.replies).toHaveLength(1);
+    expect(ctx.replies[0]).toContain('test room');
+  });
+
+  it('/room list active filters to active rooms', async () => {
+    const r = await createTestRoom();
+    const { activateRoom } = await import('../src/rooms-tasks/room-state.js');
+    activateRoom(r.room_id);
+    const ctx = context();
+    await dispatchOwnerCommand('/room list active', ctx);
+    expect(ctx.replies).toHaveLength(1);
+    expect(ctx.replies[0]).toContain('test room');
+  });
+
+  it('/room list and show hide legacy closed room records', async () => {
+    const r = await createTestRoom();
+    const { closeRoom } = await import('../src/rooms-tasks/room-state.js');
+    closeRoom(r.room_id);
+    const listCtx = context();
+    await dispatchOwnerCommand('/room list', listCtx);
+    expect(listCtx.replies).toEqual(['## 🏠 Rooms\n\nNo rooms found.']);
+    const showCtx = context();
+    await dispatchOwnerCommand(`/room show ${r.room_id}`, showCtx);
+    expect(showCtx.replies[0]).toContain('## ⚠️ Not found');
+  });
+
+  it('/room recover migrates a legacy closed record through deletion', async () => {
+    const r = await createTestRoom();
+    const { closeRoom } = await import('../src/rooms-tasks/room-state.js');
+    closeRoom(r.room_id);
+    const ctx = context();
+    await dispatchOwnerCommand(`/room recover ${r.room_id}`, ctx);
+    expect(ctx.closeRoom).toHaveBeenCalledWith(r.room_id);
+  });
+
+  it('/room recover <id> shows room saga state', async () => {
+    const r = await createTestRoom();
+    const ctx = context();
+    await dispatchOwnerCommand(`/room recover ${r.room_id}`, ctx);
+    expect(ctx.replies).toHaveLength(1);
+    expect(ctx.replies[0]).toContain(r.room_id);
+    expect(ctx.replies[0]).toContain('**Saga:**');
+  });
+
+  it('/room recover nonexistent returns not found', async () => {
+    const ctx = context();
+    await dispatchOwnerCommand('/room recover nonexistent', ctx);
+    expect(ctx.replies).toHaveLength(1);
+    expect(ctx.replies[0]).toContain('⚠️');
+  });
+
+  it('/room recover without id returns usage', async () => {
+    const ctx = context();
+    await dispatchOwnerCommand('/room recover', ctx);
+    expect(ctx.replies).toHaveLength(1);
+    expect(ctx.replies[0]).toContain('usage');
+  });
+});
+
+describe('owner-channel template subcommands', () => {
+  it('/template show <name> shows template details', async () => {
+    const ctx = context();
+    await dispatchOwnerCommand('/template show team', ctx);
+    expect(ctx.replies).toHaveLength(1);
+    expect(ctx.replies[0]).toContain('team');
+    expect(ctx.replies[0]).toContain('Developer');
+  });
+
+  it('/template <name> shows template details (backward compat)', async () => {
+    const ctx = context();
+    await dispatchOwnerCommand('/template team@1', ctx);
+    expect(ctx.replies).toHaveLength(1);
+    expect(ctx.replies[0]).toContain('team');
+  });
+
+  it('/template list lists all templates', async () => {
+    const ctx = context();
+    await dispatchOwnerCommand('/template list', ctx);
+    expect(ctx.replies).toHaveLength(1);
+    expect(ctx.replies[0]).toContain('team');
+    expect(ctx.replies[0]).toContain('pair');
+  });
+
+  it('/template show reports not found', async () => {
+    const ctx = context();
+    await dispatchOwnerCommand('/template show nonexistent', ctx);
+    expect(ctx.replies).toHaveLength(1);
+    expect(ctx.replies[0]).toContain('not found');
+  });
+
+  it('/template show without name returns usage', async () => {
+    const ctx = context();
+    await dispatchOwnerCommand('/template show', ctx);
+    expect(ctx.replies).toHaveLength(1);
+    expect(ctx.replies[0]).toContain('usage');
   });
 });

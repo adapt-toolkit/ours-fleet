@@ -59,7 +59,7 @@ function spawnExamples(text: string): Array<{ command: string; permissions: Comm
     }));
 }
 
-describe('shipped spawn skills are written from one source of truth (7.1)', () => {
+describe('shipped spawn skills are written from one source of truth', () => {
   for (const v of VARIANTS) {
     it(`${v.id}: states every required fact and none of the corrected ones`, () => {
       const text = flat(skill(v.path, 'spawn-ours-agent'));
@@ -117,7 +117,7 @@ describe('shipped spawn skills are written from one source of truth (7.1)', () =
     });
 });
 
-describe('following only the shipped skill produces a role doctor accepts (7.1)', () => {
+describe('following only the shipped skill produces a role doctor accepts', () => {
   for (const v of VARIANTS) {
     const examples = spawnExamples(skill(v.path, 'spawn-ours-agent'));
 
@@ -150,11 +150,11 @@ describe('following only the shipped skill produces a role doctor accepts (7.1)'
 });
 
 /**
- * The oversight half (7.2). An overseer reads its generated briefing OR this
+ * The oversight half. An overseer reads its generated briefing OR this
  * skill; if they disagree about what a `peek` failure proves, one of them is
  * telling it to restart a working agent.
  */
-describe('shipped oversee skills use the one result taxonomy (7.2)', () => {
+describe('shipped oversee skills use the one result taxonomy', () => {
   for (const v of VARIANTS) {
     const text = skill(v.path, 'oversee-agents');
 

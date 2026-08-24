@@ -103,7 +103,7 @@ export function ConversationView({ roleId }: { roleId: string }) {
     };
   }, [connect]);
 
-  // Follow the stream only while the reader is at the bottom (spec §7.1).
+  // Follow the stream only while the reader is at the bottom.
   // This has to land BEFORE paint: a post-paint scroll shows every commit at
   // its previous offset first, which on a fresh hydration is the top of the
   // history — the transcript then visibly scrolls down to the newest message.

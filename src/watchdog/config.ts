@@ -48,7 +48,7 @@ export function resolveWatchdogs(
     throw new ConfigError(`${baseFile}: watchdogs: must be a map`);
   const roleNames = new Set(roles.map(r => r.name));
   const roleIdentities = new Set(roles.map(r => r.identity));
-  // Tracks identity -> owning watchdog name across entries (final review #5):
+  // Tracks identity -> owning watchdog name across entries:
   // two watchdogs declaring the same identity would otherwise share a temp
   // dir, tmux session, and run lock with no error until they collide at
   // runtime.

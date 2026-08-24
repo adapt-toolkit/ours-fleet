@@ -120,7 +120,7 @@ describe('resolveIsolation fs extras and secrets', () => {
   });
 });
 
-describe('forbidden-path enforcement (5.2)', () => {
+describe('forbidden-path enforcement', () => {
   // A real directory tree, so canonicalisation (and symlinks) are exercised
   // rather than mocked. The forbidden set is derived from `home` and from the
   // agents root, so both must be real paths under the temp home.
@@ -267,7 +267,7 @@ describe('forbidden-path enforcement (5.2)', () => {
   });
 });
 
-describe('shared harness credentials are read-only (5.1)', () => {
+describe('shared harness credentials are read-only', () => {
   const stateDir = '/home/fleet/.ours-fleet/agents/Dev';
   const runtime = (h: string) => join(stateDir, 'harness', h);
 

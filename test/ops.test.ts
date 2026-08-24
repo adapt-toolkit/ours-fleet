@@ -71,6 +71,7 @@ function deps(backend: SupervisorBackend, watchdogService?: OpsDeps['watchdogSer
   const d: OpsDeps = {
     backend, binPath: '/bin/ours-fleet',
     log: l => logs.push(l),
+    identityProvisioner: { exists: async () => true },
     ...(watchdogService ? { watchdogService } : {}),
   };
   return { d, logs };
@@ -78,7 +79,7 @@ function deps(backend: SupervisorBackend, watchdogService?: OpsDeps['watchdogSer
 
 /**
  * `installChanged` simulates WatchdogServiceManager.install()'s own changed-detection
- * (finding #4): defaults to true, matching a first-ever install (no unit file yet).
+ * Defaults to true, matching a first-ever install with no unit file yet.
  * Tests that need to prove the config-fingerprint gate on its own set it false —
  * a real install() would too, since binPath/configPath (the only inputs the real
  * unit content depends on) are unchanged between those calls.
@@ -164,6 +165,58 @@ describe('applyRole', () => {
 });
 
 describe('up / down / restart', () => {
+  it('creates permanent role and owner-channel identities before service installation', async () => {
+    writeCfg({ A: {
+      harness: 'fake', session: 'acp', identity: 'RoleIdentity', bio: 'Role bio',
+      persona: 'Role persona',
+      owner_channel: { identity: 'RoleOwner', owners: ['owner-cid'] },
+    } });
+    const present = new Set<string>();
+    const created: Array<{ name: string; profile: Record<string, unknown> }> = [];
+    const order: string[] = [];
+    const { calls, backend } = fakeBackend();
+    backend.install = async name => {
+      order.push(`install:${name}`);
+      calls.push(['install', name]);
+      return { created: true, detail: 'installed' };
+    };
+    const { d } = deps(backend);
+    d.identityProvisioner = {
+      exists: async name => present.has(name),
+      create: async (name, profile) => {
+        order.push(`identity:${name}`);
+        present.add(name);
+        created.push({ name, profile });
+      },
+    };
+
+    await up(loadConfig(), ['A'], d);
+
+    expect(order).toEqual(['identity:RoleIdentity', 'identity:RoleOwner', 'install:A']);
+    expect(created).toEqual([
+      { name: 'RoleIdentity', profile: {
+        bio: 'Role bio', persona: 'Role persona', exposeLocal: true, localAutoAccept: true,
+      } },
+      { name: 'RoleOwner', profile: {
+        bio: 'Authenticated owner channel for the ours-fleet A role.',
+        exposeLocal: false, localAutoAccept: false,
+      } },
+    ]);
+    const briefing = readFileSync(join(agentDir('A'), 'briefing.md'), 'utf8');
+    expect(briefing).toContain('It was created when your role');
+    expect(briefing).not.toContain('call **create_identity**');
+  });
+
+  it('refuses to start when permanent identity reconciliation is unavailable', async () => {
+    writeCfg({ A: { harness: 'fake' } });
+    const { calls, backend } = fakeBackend();
+    const { d } = deps(backend);
+    d.identityProvisioner = { exists: async () => 'unknown' };
+
+    await expect(up(loadConfig(), ['A'], d)).rejects.toThrow(/could not establish permanent ours identity/);
+    expect(calls.some(call => call[0] === 'install')).toBe(false);
+  });
+
   it('installs every role promptly (launch spacing is enforced by the start gate, not here)', async () => {
     writeCfg({ A: { harness: 'fake' }, B: { harness: 'fake' } });
     const { calls, backend } = fakeBackend();
@@ -180,7 +233,7 @@ describe('up / down / restart', () => {
     expect(calls).toEqual([['stop', 'B']]);
   });
 
-  it('down reports the backend\'s real stop failure (1.5)', async () => {
+  it('down reports the backend\'s real stop failure', async () => {
     writeCfg({ A: { harness: 'fake' } });
     const { backend } = fakeBackend();
     backend.stop = async () => {
@@ -249,7 +302,7 @@ describe('up/down reconcile the supervised watchdog scheduler', () => {
   const withWatchdog = (extra = '') =>
     writeFileSync(join(dir, 'fleet.yaml'), `roles:\n  A: {}\nwatchdogs:\n  w: { coordinator: A${extra} }\n`);
 
-  it('up with an enabled watchdog installs + restarts the scheduler when supervised (final review #4: `start` is a no-op on an already-active unit, so config changes never reach it)', async () => {
+  it('up with an enabled watchdog installs and restarts the supervised scheduler so config changes reach an active unit', async () => {
     withWatchdog();
     const { backend } = fakeBackend();
     const { calls, svc } = fakeWatchdogService();
@@ -259,7 +312,7 @@ describe('up/down reconcile the supervised watchdog scheduler', () => {
     expect(logs.join('\n')).toMatch(/↑ watchdogs scheduler.*w/);
   });
 
-  describe('restart is gated on an actual change, not fired on every up (finding #4)', () => {
+  describe('restart is gated on an actual change, not fired on every up', () => {
     it('a second reconcile of the SAME config calls start, not restart — an unrelated `up` must not interrupt an in-flight check', async () => {
       withWatchdog();
       const { backend } = fakeBackend();
@@ -316,7 +369,7 @@ describe('up/down reconcile the supervised watchdog scheduler', () => {
     expect(calls).toEqual(['stop']);
   });
 
-  it('up with no watchdogs and an unsupervised service never calls stop (final review #3: spurious stop on watchdog-less fleets)', async () => {
+  it('up with no watchdogs and an unsupervised service never calls stop', async () => {
     writeCfg({ A: { harness: 'fake' } });
     const { backend } = fakeBackend();
     const { calls, svc } = fakeWatchdogService({ supervised: false });
@@ -375,7 +428,7 @@ describe('up/down reconcile the supervised watchdog scheduler', () => {
     expect(calls).toEqual(['stop']);
   });
 
-  it('a whole-fleet down never calls stop when the service reports unsupervised (final review #3)', async () => {
+  it('a whole-fleet down never calls stop when the service reports unsupervised', async () => {
     withWatchdog();
     const { backend } = fakeBackend();
     const { calls, svc } = fakeWatchdogService({ supervised: false });
@@ -401,7 +454,7 @@ describe('up/down reconcile the supervised watchdog scheduler', () => {
   });
 });
 
-describe('up liveness (1.1) — only a definite stop discards session context', () => {
+describe('up liveness — only a definite stop discards session context', () => {
   /** label, systemd ActiveState, SubState, does `up` boot it fresh? */
   const SHAPES: Array<[string, string, string, boolean]> = [
     ['running', 'active', 'running', false],
@@ -480,7 +533,7 @@ describe('up liveness (1.1) — only a definite stop discards session context', 
   });
 });
 
-describe('explicit operator actions reset the restart circuit (3.2)', () => {
+describe('explicit operator actions reset the restart circuit', () => {
   const heldDown = () => {
     const stateDir = agentDir('A');
     mkdirSync(stateDir, { recursive: true });

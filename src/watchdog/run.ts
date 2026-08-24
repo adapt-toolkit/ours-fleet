@@ -13,7 +13,7 @@ import { generateNotifierBriefing, generateWatchdogBriefing, type WatchManifest 
 import { computeDigest, reconcileLedger, readLedger, writeLedger } from './alerts.js';
 import { applyRole } from '../ops.js';
 import {
-  daemonIdentityProvisioner, ensureIdentity, type IdentityProvisioner,
+  daemonIdentityInventoryProvisioner, ensureIdentity, type IdentityProvisioner,
 } from '../creation.js';
 import { runOnce, START_STAGGER_FILE } from '../runner.js';
 import { agentDir, tmpRoot } from '../paths.js';
@@ -34,7 +34,7 @@ const POLL_MS = 1000;
 const WRITE_STABLE_MS = 2000;
 /** Grace given to the agent after a stable report before the session is killed. */
 const HARVEST_GRACE_MS = 5000;
-/** Fixed deadline for a one-shot notifier run — always 2 minutes, never wd.timeoutMs (Task 14). */
+/** Fixed deadline for a one-shot notifier run — always 2 minutes, never wd.timeoutMs. */
 const NOTIFIER_TIMEOUT_MS = 120_000;
 
 type SentinelBreakReason = 'stable' | 'exited' | 'timeout';
@@ -187,7 +187,7 @@ async function discoverLiveTemporaryRoles(): Promise<string[]> {
  * didn't), store the result, and always clean up the temp dir.
  *
  * The scheduler's run-lock guarantees only one run per watchdog at a time;
- * this function itself takes no lock (Task 8).
+ * this function itself takes no lock.
  */
 export async function executeWatchdogRun(
   wd: ResolvedWatchdog, deps: WatchdogRunDeps,
@@ -209,7 +209,7 @@ export async function executeWatchdogRun(
   let report: WatchdogReport;
   try {
     const guarantee = await ensureIdentity(
-      wd.identity, {}, deps.identityProvisioner ?? daemonIdentityProvisioner(), deps.log);
+      wd.identity, {}, deps.identityProvisioner ?? daemonIdentityInventoryProvisioner(), deps.log);
 
     const cfg = deps.cfg ?? loadConfig();
     const discovered = wd.watchExplicit
@@ -245,7 +245,7 @@ export async function executeWatchdogRun(
     writeFileSync(manifestPath, JSON.stringify(manifest, null, 2) + '\n');
     // Snapshot the fleet start-stagger so the detached run (no config path
     // threaded through `_run-watchdog`) honors the same host-wide launch gate
-    // as every other role (spec §3) — mirrors src/spawn.ts:503-504.
+    // as every other role — mirrors the spawn path.
     if (cfg.startStaggerMs > 0)
       writeFileSync(join(dir, START_STAGGER_FILE), String(cfg.startStaggerMs));
 
@@ -281,7 +281,7 @@ export async function executeWatchdogRun(
       }
     }
 
-    // Isolation degradation (spec §7): a weaker guarantee must never look like
+    // A weaker isolation guarantee must never look like
     // the strong one, so stamp it on every outcome, error reports included.
     if (existsSync(join(dir, '.isolation-degraded')))
       (report as WatchdogReport & { isolation?: string }).isolation = 'degraded';
@@ -305,7 +305,7 @@ export async function executeWatchdogRun(
  * (owner-approved deviation 4), so this is how a scheduler tick that can't reach an operator any
  * other way still gets a message out.
  *
- * Reuses the Task 7/8 run machinery (temp-dir prep, ensureIdentity, ResolvedRole shape, child
+ * Reuses the ordinary run machinery (temp-dir prep, ensureIdentity, ResolvedRole shape, child
  * launch, kill mechanics) but stores no report, touches no ledger findings, and writes no
  * watch.json manifest — `sent.json` is this run's only completion sentinel. A fixed 2-minute
  * deadline applies regardless of `wd.timeoutMs`.
@@ -349,7 +349,7 @@ export async function executeNotifierRun(
     if (existsSync(runDir)) rmSync(runDir, { recursive: true, force: true });
 
     const guarantee = await ensureIdentity(
-      wd.identity, {}, deps.identityProvisioner ?? daemonIdentityProvisioner(), deps.log);
+      wd.identity, {}, deps.identityProvisioner ?? daemonIdentityInventoryProvisioner(), deps.log);
 
     const cfg = deps.cfg ?? loadConfig();
     const role = buildWatchdogRole(wd, cfg);
@@ -364,7 +364,7 @@ export async function executeNotifierRun(
     }));
     // loadTempRole (runner.ts) needs this to run the child via `_run-watchdog`.
     writeFileSync(join(dir, 'role.yaml'), stringify(role));
-    // Same host-wide launch-gate snapshot executeWatchdogRun writes (spec §3).
+    // Use the same host-wide launch-gate snapshot executeWatchdogRun writes.
     if (cfg.startStaggerMs > 0)
       writeFileSync(join(dir, START_STAGGER_FILE), String(cfg.startStaggerMs));
 

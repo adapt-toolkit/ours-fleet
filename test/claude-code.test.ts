@@ -55,13 +55,13 @@ describe('vocabulary — supervised monitor migration', () => {
   it('restartPrompt drops the re-arm line when the monitor is supervised', () => {
     const p = v.restartPrompt('Alice Dev', '/w/WORKLOG.md', role({ monitor: mon('fleet') }));
     expect(p).not.toContain('re-arm');
-    expect(p).not.toContain('ours-mcp watch');
+    expect(p).not.toContain('ours api watch-notifications');
     expect(p).toContain('choose_identity name "Alice Dev"');
   });
 
   it('restartPrompt keeps the re-arm line for a native-monitor role', () => {
     const p = v.restartPrompt('Alice Dev', '/w/WORKLOG.md', role({ monitor: mon('native') }));
-    expect(p).toContain('ours-mcp watch "Alice Dev"');
+    expect(p).toContain('ours api watch-notifications');
   });
 
   // ── issue #16: mandate the Monitor TOOL, not a background Bash command ──
@@ -69,34 +69,34 @@ describe('vocabulary — supervised monitor migration', () => {
     const m = v.monitorInstruction('Alice Dev');
     expect(m).toContain('persistent Monitor');
     expect(m).toContain('NOT a background Bash');
-    expect(m).toContain('ours-mcp watch "Alice Dev"');
+    expect(m).toContain('ours api watch-notifications');
   });
 
   it('non-supervised restartPrompt mandates the Monitor TOOL, not background Bash', () => {
     const p = v.restartPrompt('Alice Dev', '/w/WORKLOG.md', role({ monitor: mon('native') }));
     expect(p).toContain('persistent Monitor');
     expect(p).toContain('NOT a background Bash');
-    expect(p).toContain('ours-mcp watch "Alice Dev"');
+    expect(p).toContain('ours api watch-notifications');
   });
 
   it('non-supervised restartPrompt (no monitor field at all) also mandates the Monitor TOOL', () => {
     const p = v.restartPrompt('Alice Dev', '/w/WORKLOG.md', role());
     expect(p).toContain('persistent Monitor');
     expect(p).toContain('NOT a background Bash');
-    expect(p).toContain('ours-mcp watch "Alice Dev"');
+    expect(p).toContain('ours api watch-notifications');
   });
 
   it('supervised restartPrompt states mail arrives as [fleet-monitor] and forbids an in-session Monitor', () => {
     const p = v.restartPrompt('Alice Dev', '/w/WORKLOG.md', role({ monitor: mon('fleet') }));
     expect(p).toContain('[fleet-monitor]');
     expect(p).toContain('do NOT arm an in-session Monitor');
-    expect(p).not.toContain('ours-mcp watch');
+    expect(p).not.toContain('ours api watch-notifications');
   });
 
   it('monitorInstruction and non-supervised restartPrompt share the same mandate wording', () => {
     const mi = v.monitorInstruction('Alice Dev');
     const rp = v.restartPrompt('Alice Dev', '/w/WORKLOG.md', role({ monitor: mon('native') }));
-    for (const frag of ['persistent Monitor', 'NOT a background Bash', 'ours-mcp watch "Alice Dev"']) {
+    for (const frag of ['persistent Monitor', 'NOT a background Bash', 'ours api watch-notifications']) {
       expect(mi).toContain(frag);
       expect(rp).toContain(frag);
     }
@@ -121,7 +121,7 @@ describe('pretrust', () => {
     expect(JSON.parse(readFileSync(cj(), 'utf8')).projects['/w'].hasTrustDialogAccepted).toBe(true);
   });
 
-  it('on malformed JSON: warns, skips, and NEVER overwrites the file (6.1)', async () => {
+  it('on malformed JSON: warns, skips, and NEVER overwrites the file', async () => {
     const corrupt = '{ "projects": { broken';
     writeFileSync(cj(), corrupt);
     const logs: string[] = [];
@@ -147,7 +147,7 @@ describe('pretrust', () => {
     expect(readdirSync(dir).filter(f => f.endsWith('.lock'))).toEqual([]);
   });
 
-  it('a role launch is never failed by pre-trust, whatever goes wrong (6.1)', async () => {
+  it('a role launch is never failed by pre-trust, whatever goes wrong', async () => {
     // A realistic mess: something has left a DIRECTORY where the file belongs.
     mkdirSync(cj(), { recursive: true });
     const logs: string[] = [];
@@ -223,7 +223,7 @@ describe('buildLaunch', () => {
     expect(resume.argv.slice(0, 7)).toEqual(
       ['claude', '--settings', '/o.json', '--remote-control', 'Alice', '--resume', 'SID']);
     expect(resume.argv[7]).toContain('choose_identity name "Alice Dev" force=true');
-    expect(resume.argv[7]).toContain('ours-mcp watch "Alice Dev"');
+    expect(resume.argv[7]).toContain('ours api watch-notifications');
     expect(resume.argv[7].toLowerCase()).not.toContain('a2adapt');
   });
 
@@ -372,7 +372,7 @@ describe('buildAcpLaunch', () => {
   });
 });
 
-describe('neutral permission mapping and the unattended floor (2.1)', () => {
+describe('neutral permission mapping and the unattended floor', () => {
   const a = makeClaudeCodeAdapter(okExec);
   const APPROVALS = ['ask', 'auto', 'allow', 'deny'] as const;
   const FILESYSTEMS = ['read-only', 'workspace', 'unrestricted'] as const;

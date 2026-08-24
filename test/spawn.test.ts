@@ -42,7 +42,10 @@ function fakeDeps() {
     async liveness() { return { state: 'stopped' as const, detail: 'inactive (dead)' }; },
     logsArgs: n => ({ cmd: 'true', args: [n] }),
   };
-  const d: OpsDeps = { backend, binPath: '/b/ours-fleet', sleep: async () => {}, log: () => {} };
+  const d: OpsDeps = {
+    backend, binPath: '/b/ours-fleet', sleep: async () => {}, log: () => {},
+    identityProvisioner: { exists: async () => true },
+  };
   return { d, calls };
 }
 
@@ -256,6 +259,24 @@ describe('spawnTemp', () => {
     expect(snap.session).toBe('acp');
   });
 
+  it('persists a trusted room startup gate only in the temp role snapshot', async () => {
+    const gate = {
+      room_id: '01ROOM', room_identity_cid: 'A'.repeat(64),
+      briefing_role: 'Reviewer', briefing_version: 1,
+      briefing_sha256: 'b'.repeat(64), owner_seat_cid: null,
+    };
+    const d = await spawnTemp({
+      name: 'RoomReviewer', mission: 'bootstrap', roomStartupGate: gate,
+    }, '/b/ours-fleet', () => {});
+    const snap = parse(readFileSync(join(d, 'role.yaml'), 'utf8'));
+    expect(snap.roomStartupGate).toEqual(gate);
+    expect(readFileSync(join(d, 'briefing.md'), 'utf8')).toContain('## Room startup gate');
+    writeFileSync(join(dir, 'public-gate.yaml'), stringify({
+      roles: { Public: { roomStartupGate: gate } },
+    }));
+    expect(() => loadConfig(join(dir, 'public-gate.yaml'))).toThrow();
+  });
+
   it('never inherits wildcard scheduled loops into a temporary role', async () => {
     writeFileSync(join(dir, 'fleet.yaml'), stringify({
       defaults: { harness: 'fake', session: 'acp' },
@@ -269,7 +290,7 @@ describe('spawnTemp', () => {
   });
 });
 
-describe('atomic role + identity reservation (6.4)', () => {
+describe('atomic role + identity reservation', () => {
   /** A registry that records claims, so races are observable. */
   function fakeRegistry() {
     const held = new Set<string>();
@@ -397,7 +418,7 @@ describe('atomic role + identity reservation (6.4)', () => {
   });
 });
 
-describe('identity is established before launch (7.3)', () => {
+describe('identity is established before launch', () => {
   const provisioner = (
     exists: boolean | 'unknown',
     create?: (n: string, p: { bio?: string; persona?: string }) => Promise<void>,
@@ -448,26 +469,26 @@ describe('identity is established before launch (7.3)', () => {
     expect(existsSync(agentDir('Broken'))).toBe(false);
   });
 
-  it('a host that cannot create says so, and the briefing does not claim a guarantee', async () => {
+  it('a host that cannot create refuses permanent launch before the harness starts', async () => {
     const logs: string[] = [];
-    const { d } = fakeDeps();
+    const { d, calls } = fakeDeps();
     d.log = l => logs.push(l);
-    await spawnPermanent({ name: 'Unchecked', identity: 'Unchecked' }, d,
-      { identityProvisioner: provisioner(false) });          // exists=false, no create()
+    await expect(spawnPermanent({ name: 'Unchecked', identity: 'Unchecked' }, d,
+      { identityProvisioner: provisioner(false) }))          // exists=false, no create()
+      .rejects.toThrow(/could not establish permanent ours identity/);
 
     expect(logs.join('\n')).toContain('cannot create one automatically');
-    expect(briefingOf('Unchecked')).toContain('was NOT verified');
-    expect(briefingOf('Unchecked')).toContain('create_identity');
+    expect(calls.some(call => call[0] === 'install')).toBe(false);
   });
 
-  it('an unreachable daemon is "unknown", never mistaken for absent', async () => {
-    const { d } = fakeDeps();
+  it('an unreachable daemon is never mistaken for absence or delegated to the agent', async () => {
+    const { d, calls } = fakeDeps();
     let createCalled = false;
-    await spawnPermanent({ name: 'Offline', identity: 'Offline' }, d, {
+    await expect(spawnPermanent({ name: 'Offline', identity: 'Offline' }, d, {
       identityProvisioner: provisioner('unknown', async () => { createCalled = true; }),
-    });
+    })).rejects.toThrow(/could not establish permanent ours identity/);
     expect(createCalled).toBe(false);       // do not create on no evidence
-    expect(briefingOf('Offline')).toContain('was NOT verified');
+    expect(calls.some(call => call[0] === 'install')).toBe(false);
   });
 
   it('a temp spawn gets the same guarantee in its briefing', async () => {
@@ -489,7 +510,7 @@ describe('identity is established before launch (7.3)', () => {
   });
 });
 
-describe('every failed creation stage rolls back (6.2)', () => {
+describe('every failed creation stage rolls back', () => {
   const provisioner = (created: string[], removed: string[]) => ({
     async exists() { return false as const; },
     async create(n: string) { created.push(n); },
@@ -503,7 +524,7 @@ describe('every failed creation stage rolls back (6.2)', () => {
 
   /** Fault-inject at each stage in turn; each must leave nothing behind. */
   // `state` is not in this list on purpose: `up` tolerates a failing liveness
-  // probe by design (1.1), so it is not an injectable failure point. The
+  // probe by design, so it is not an injectable failure point. The
   // config-write stage is covered by the 6.4 rollback test above.
   const STAGES = ['identity', 'service'] as const;
 
@@ -546,7 +567,7 @@ describe('every failed creation stage rolls back (6.2)', () => {
    * The other half of the same defect — a backend `install` that throws AFTER
    * writing its artifact, where no caller can ever hear about it — is the
    * backend's own responsibility and is covered in test/supervisor.test.ts,
-   * "a failed registration leaves no artifact (6.2)".
+   * "a failed registration leaves no artifact".
    */
   it('a service registration this transaction created is uninstalled on failure', async () => {
     const { d, calls } = fakeDeps();
@@ -604,7 +625,7 @@ describe('every failed creation stage rolls back (6.2)', () => {
   });
 });
 
-describe('creation-time isolation (6.3)', () => {
+describe('creation-time isolation', () => {
   const policy = 'network: deny\nfs:\n  read:\n    - /opt/reference\nresources:\n  mem: 2G\n';
   const writePolicy = (body = policy) => {
     const p = join(dir, 'policy.yaml');
@@ -678,7 +699,7 @@ describe('creation-time isolation (6.3)', () => {
   });
 });
 
-describe('creation provenance (6.6)', () => {
+describe('creation provenance', () => {
   const provenanceOf = (name: string, temp = false) =>
     JSON.parse(readFileSync(join(agentDir(name, temp), 'creation.json'), 'utf8'));
 

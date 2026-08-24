@@ -77,7 +77,7 @@ describe('watchdogs config', () => {
     base(TWO_ROLES + 'watchdogs:\n  w: { coordinator: C, identity: Alice }\n');
     expect(() => loadConfig()).toThrowError(/watchdog 'w'.*identity 'Alice' collides/);
   });
-  it('rejects two watchdogs sharing an explicit identity (final review #5: unchecked collision -> shared temp dir + tmux session + locks)', () => {
+  it('rejects two watchdogs sharing an explicit identity to prevent shared temp state and locks', () => {
     base(TWO_ROLES + 'watchdogs:\n  w1: { coordinator: C, identity: Shared }\n  w2: { coordinator: C, identity: Shared }\n');
     expect(() => loadConfig()).toThrowError(/watchdog 'w2': identity 'Shared' collides with watchdog 'w1'/);
   });
@@ -107,7 +107,7 @@ describe('watchdogs config', () => {
     base(TWO_ROLES);
     mkdirSync(join(dir, 'fleet.d'), { recursive: true });
     writeFileSync(join(dir, 'fleet.d', 'w.yaml'), 'watchdogs:\n  w: { coordinator: C }\n');
-    expect(() => loadConfig()).toThrowError(/fleet.d files may only define roles:/);
+    expect(() => loadConfig()).toThrowError(/fleet.d files may only define roles/);
   });
 });
 

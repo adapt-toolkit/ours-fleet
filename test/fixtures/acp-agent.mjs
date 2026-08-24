@@ -4,6 +4,7 @@ const sessionId = 'fixture-session';
 let permissionRequestId = 10_000;
 const pendingPermission = new Map();
 let activePromptId;
+let pendingToolwaitAnswer;
 // A "stubborn" prompt ignores session/cancel entirely: the adapter-misbehavior
 // case the client's cancel-escalation grace period exists for.
 const stubbornPrompts = new Set();
@@ -319,7 +320,14 @@ createInterface({ input: process.stdin }).on('line', line => {
         });
         setTimeout(() => {
           update({ sessionUpdate: 'tool_call_update', toolCallId: 'wait-tool', status: 'completed' });
-          setTimeout(() => answerPrompt(message.id, stopReasonFor(text)), 20);
+          const answer = () => answerPrompt(message.id, stopReasonFor(text));
+          pendingToolwaitAnswer = answer;
+          setTimeout(() => {
+            if (pendingToolwaitAnswer === answer) {
+              pendingToolwaitAnswer = null;
+              answer();
+            }
+          }, 5000);
         }, delay);
       } else if (/\blate\b/i.test(text)) {
         // Start a tool, then wait: only session/cancel releases this prompt,
@@ -397,6 +405,11 @@ createInterface({ input: process.stdin }).on('line', line => {
         id: message.id,
         result: { outcome: startedNewTurn ? 'startedNewTurn' : 'injected' },
       });
+      if (pendingToolwaitAnswer) {
+        const answer = pendingToolwaitAnswer;
+        pendingToolwaitAnswer = null;
+        setTimeout(() => answer(), 5);
+      }
       break;
     }
     case 'session/cancel':

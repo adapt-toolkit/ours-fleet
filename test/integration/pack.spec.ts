@@ -70,6 +70,22 @@ describe('npm pack from a checkout with no dist', () => {
     expect(entries.some(name => name.startsWith('dist/web-app/'))).toBe(true);
   });
 
+  // What the nightly channel exists to deliver. A tarball that packs and stamps
+  // correctly but ships the old transport would publish green and be wrong.
+  it('ships the SDK-backed owner-channel client and not the removed MCP transport', () => {
+    expect(entries).toContain('dist/owner-channel/ours-client.js');
+    expect(entries).toContain('dist/owner-channel/channel.js');
+    expect(entries).not.toContain('dist/owner-channel/mcp.js');
+  });
+
+  it('declares the pinned ours SDK and structured CLI', async () => {
+    const shipped = await run('tar', ['-xzOf', packed, 'package/package.json'],
+      { maxBuffer: 32 * 1024 * 1024 });
+    const pkg = JSON.parse(shipped.stdout) as { dependencies: Record<string, string> };
+    expect(pkg.dependencies['@ours.network/sdk']).toBe('3.0.1');
+    expect(pkg.dependencies['@ours.network/cli']).toBe('1.0.1');
+  });
+
   it('leaks no environment file, tarball, or node_modules into the package', () => {
     expect(entries.filter(name => name.startsWith('node_modules/'))).toEqual([]);
     expect(entries).not.toContain('.env');

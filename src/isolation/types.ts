@@ -1,4 +1,4 @@
-/** Isolation backend selector. `auto` probes bubblewrap then podman; `none` disables wrapping. */
+/** Isolation backend selector. `auto` probes bubblewrap; `none` disables wrapping. */
 export type IsolationBackendId = 'auto' | 'bubblewrap' | 'podman' | 'none';
 /** What to do when the requested backend is unavailable. */
 export type OnUnavailable = 'warn' | 'strict';
@@ -40,7 +40,7 @@ export interface IsolationConfig {
 export interface Mount { src: string; dst: string; mode: 'ro' | 'rw' }
 
 /**
- * Runtime facts the pure resolver needs to compute the durable mount set (§5.2):
+ * Runtime facts the pure resolver needs to compute the durable mount set:
  * the agent's state dir, its working dir, the fleet user's home, and (if the ours
  * broker exposes one) a unix-socket endpoint to bind in.
  */
@@ -54,7 +54,7 @@ export interface WrapContext {
   additionalWriteDirs?: string[];
   /**
    * The harness's home directory on the host (`~/.claude`, `~/.codex`). Mounted
-   * from `harnessRuntimeDir` so the agent's own runtime state is per-role (5.1).
+   * from `harnessRuntimeDir` so the agent's own runtime state is per-role.
    */
   harnessHome?: string;
   /** Per-role writable directory backing `harnessHome` inside the sandbox. */

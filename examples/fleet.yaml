@@ -71,7 +71,7 @@ roles:
 
   FleetCoordinator:
     # A reliable owner channel requires ACP so fleet can capture the correlated
-    # final answer. Create this dedicated ours identity/contact before enabling.
+    # final answer. Fleet creates its dedicated identity with safe local defaults.
     # session: acp
     # owner_channel:
     #   identity: FleetCoordinator Owner Channel
@@ -142,6 +142,24 @@ roles:
   #     sandbox: read-only
   #     approval: on-request
   #     monitor: true
+
+# Rooms always use ours-cowork; configure its connection directly. The owner
+# provider is a separate setting and defaults to messenger-server.
+# rooms:
+#   cowork:
+#     config: /home/me/.ours-cowork/config.json
+#   owner:
+#     expected_cid: 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+#     public_invite_file: /home/me/.ours-fleet/owner-room-invite.txt
+#   defaults:
+#     template: team
+#     attach_owner: true
+#     close_when_task_done: true
+#
+# tasks:
+#   default_room_template: team
+#   create_mode: start
+#   close_room_on_done: true
 
 # Scheduled internal turns are ACP-only, idle-only, and never build a backlog.
 # The base file must be owned by you and not group/world writable when an enabled

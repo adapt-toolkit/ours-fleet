@@ -1,12 +1,12 @@
 import type { PromptOrigin, TurnCancellationSource, TurnOutcome } from './types.js';
 
 /**
- * Durable conversation domain schema (ACP web console, spec §5.2).
+ * Durable conversation domain schema for the ACP web console.
  *
  * `SessionEvent` in ./types.js remains the compact diagnostic projection; the
  * types here describe the durable per-role conversation ledger. Nothing in this
  * file touches the wire: ACP updates are reduced into these shapes by the
- * normalizer, and the store (phase 1) assigns `seq`/`eventId`/timestamps.
+ * normalizer, and the store assigns `seq`/`eventId`/timestamps.
  */
 
 export type ConversationEventKind =
@@ -301,7 +301,7 @@ export interface ConversationEventV1 {
   adapterMeta?: AdapterMeta[];
 }
 
-// ── Browser commands and receipts (phase 1 transport contracts) ──────────────
+// ── Browser commands and receipt transport contracts ────────────────────────
 
 export interface SubmitPromptCommand {
   /** Idempotency-Key / clientRequestId. Reuse with a different body is a conflict. */

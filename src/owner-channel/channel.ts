@@ -1,8 +1,6 @@
-import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
-import { createHash, randomUUID } from 'node:crypto';
+import { createHash } from 'node:crypto';
 import { existsSync, readFileSync } from 'node:fs';
 import { mkdir, readFile, readdir, rm } from 'node:fs/promises';
-import { createInterface } from 'node:readline';
 import { join } from 'node:path';
 
 import {
@@ -10,18 +8,24 @@ import {
   type OwnerAttachmentConfig, type OwnerChannelConfig,
 } from '../config.js';
 import { replaceFileAtomically } from '../atomic-file.js';
-import { resolveEndpoint, type FetchLike } from '../monitor.js';
 import {
   ACP_CANCEL_DEADLINE_EXCEEDED, SessionControlError, interruptOutcome,
   type QueuedPrompt, type SessionEvent, type SessionHandle, type TurnResult,
 } from '../session/types.js';
 import { VERSION } from '../version.js';
 import {
+  renderMarkdownFailure, renderMarkdownResult, taskStatus,
+} from '../rooms-tasks/markdown.js';
+import {
   dispatchOwnerCommand, fleetCliOps, isOwnerCommandText,
   type OwnerCommandContext, type OwnerFleetOps,
 } from './commands.js';
 import type { ManagedFleetSpawnResult } from '../fleet-proxy.js';
-import { OursMcpClient, type OursToolClient } from './mcp.js';
+import {
+  OURS_BOUND_ELSEWHERE, OursSdkClient, oursErrorCode,
+  type OursContactsView, type OursHistoryFile, type OursHistoryMessage,
+  type OursInboundMessage, type OursIncomingMessage, type OursOps,
+} from './ours-client.js';
 import {
   ownerNotices,
   type OwnerCommentsState, type OwnerProgressPhase, type OwnerUpdatePhase,
@@ -37,24 +41,22 @@ import {
   AttachmentRecoveryState, admitAttachments, cleanupAttachmentRoot,
   parseIncomingAttachments, parseRetrievedAttachments, prepareAttachmentDirectory,
   recoveredAttachment, removeRequestDirectory, safeField, validateAttachmentSelection,
-  validateAttachmentRelaySelection,
+  validateAttachmentRelaySelection, writeRecoveredAttachment,
   type AdmittedAttachment, type IncomingAttachment, type PendingAttachmentRequest,
 } from './attachments.js';
 import {
   acquireOwnerBinderLease, OWNER_BIND_HANDOFF_TIMEOUT_MS,
   type OwnerBinderDeps, type OwnerBinderLease,
 } from './binder.js';
+import { MessageRecoveryState, type PendingMessageClaim } from './message-recovery.js';
 
-interface InboundMessage {
-  msg_id?: number;
-  wire_id?: string;
-  text?: string;
-  from?: { id?: string; name?: string } | string;
-  sender?: { id?: string; name?: string } | string;
-  sender_id?: string;
-  sender_name?: string;
-  reply_to?: { wire_id?: string; sentence?: number } | null;
-}
+/**
+ * The daemon's own inbound message shape. It used to be a hand-written union of
+ * every field name the legacy connector might have rendered, because the
+ * transport returned whatever text the tool produced; the typed client removes
+ * the guesswork.
+ */
+type InboundMessage = OursInboundMessage;
 
 interface AttachmentGroup {
   files: IncomingAttachment[];
@@ -70,15 +72,8 @@ export interface OwnerChannelOptions {
   session: SessionHandle;
   stateDir: string;
   env?: Record<string, string>;
-  command?: string;
   log(line: string): void;
-  client?: OursToolClient;
-  /** Legacy child-process test seam; production uses the direct notification API. */
-  watch?: (identity: string) => ChildProcessWithoutNullStreams;
-  /** Test seam for the production direct notification long-poll. */
-  watchFetch?: FetchLike;
-  /** Test seam for the long-poll stall bound; production uses OWNER_WATCH_STALL_MS. */
-  watchStallMs?: number;
+  client?: OursOps;
   /** Test seam; production uses the detached ours-fleet CLI (`fleetCliOps`). */
   fleet?: OwnerFleetOps;
   /** Forwarded to fleet CLI invocations spawned for owner commands. */
@@ -126,7 +121,13 @@ export type { OwnerUpdatePhase } from './notices.js';
 export interface OwnerContact {
   cid: string;
   name: string;
+  /** Structural, from which daemon collection the row came: established or pending. */
   status: string;
+  /**
+   * Retained for the `ours-fleet owner contact list` column. The daemon's typed
+   * contact view has no such field, so it is always absent; it is not inferred
+   * from anything a contact controls.
+   */
   kind?: string;
   human?: { cid?: string; name?: string };
 }
@@ -160,23 +161,13 @@ const COMMENTARY_MAX_CHARS = 1_600;
 const COMMENTARY_MAX_BYTES = 6_400;
 const COMMENTARY_MAX_UPDATES = 32;
 const COMMENTARY_DEDUPE_LIMIT = 512;
-const OWNER_WATCH_STALL_MS = 120_000;
 const OWNER_WATCH_BACKOFF_MAX_MS = 30_000;
-/**
- * Credentials that are wrong now are wrong on the next attempt too. Retrying a
- * permanent 401 forever burns the daemon and hides the real fault behind an
- * endless reconnect log, so the watch stops after this many consecutive auth
- * rejections and records a terminal reason instead.
- */
-const OWNER_WATCH_AUTH_FATAL_ATTEMPTS = 5;
-
-type OwnerWatchReason = 'OWNER_WATCH_CONNECTED' | 'OWNER_WATCH_STREAM_ERROR'
-  | 'OWNER_WATCH_STALLED' | 'OWNER_WATCH_AUTH_FAILED' | 'OWNER_WATCH_AUTH_FATAL'
-  | 'OWNER_WATCH_CURSOR_RECOVERED';
+const OWNER_MESSAGE_BATCH_LIMIT = 200;
+type OwnerWatchReason = 'OWNER_WATCH_CONNECTING' | 'OWNER_WATCH_CONNECTED'
+  | 'OWNER_WATCH_STREAM_ERROR' | 'OWNER_WATCH_STATE_RECOVERED';
 
 interface OwnerWatchState {
-  version: 1;
-  cursor: number;
+  version: 2;
   reconnects: number;
   consecutiveFailures: number;
   reason: OwnerWatchReason;
@@ -191,11 +182,12 @@ class RelayUnroutableError extends Error {}
  * chooses its reply recipient; both are fixed from authenticated message data.
  */
 export class OwnerChannel implements OwnerChannelHandle {
-  private readonly client: OursToolClient;
+  private readonly client: OursOps;
   private readonly state: OwnerChannelState;
   private readonly authorizations: OwnerAuthorizationState;
   private readonly conversations: OwnerConversationState;
   private readonly tasks: OwnerTaskState;
+  private readonly messageRecovery: MessageRecoveryState;
   private readonly attachmentRecovery: AttachmentRecoveryState;
   private readonly attachmentConfig: OwnerAttachmentConfig;
   private readonly attachmentRoot: string;
@@ -204,7 +196,7 @@ export class OwnerChannel implements OwnerChannelHandle {
    * (a crash must replay them) but must not be queued twice while live.
    */
   private readonly inFlight = new Set<string>();
-  /** Wires already NACKed to the managed agent, so a deferred replay stays quiet. */
+  /** Wires already NACKed to the managed agent, so a history replay stays quiet. */
   private readonly relayNacks = new Set<string>();
   /**
    * fleet.yaml declares the restart baseline; `/comments on|off` changes only
@@ -215,7 +207,6 @@ export class OwnerChannel implements OwnerChannelHandle {
   private readonly commentsBaseline: boolean;
   private commentsEnabled: boolean;
   private stopping = false;
-  private watchProcess?: ChildProcessWithoutNullStreams;
   private watchTask?: Promise<void>;
   private watchAbort?: AbortController;
   private drainTask?: Promise<void>;
@@ -230,8 +221,8 @@ export class OwnerChannel implements OwnerChannelHandle {
   private readonly fleetOps: OwnerFleetOps;
 
   constructor(private readonly options: OwnerChannelOptions) {
-    this.client = options.client ?? new OursMcpClient(
-      options.command, options.env, line => options.log(`[${options.role}] owner channel ${line}`));
+    this.client = options.client ?? new OursSdkClient(
+      options.env, line => options.log(`[${options.role}] owner channel ${line}`));
     this.fleetOps = options.fleet ?? fleetCliOps(options.role, options.configPath);
     this.state = new OwnerChannelState(join(options.stateDir, '.owner-channel-state.json'));
     this.authorizations = new OwnerAuthorizationState(
@@ -239,6 +230,8 @@ export class OwnerChannel implements OwnerChannelHandle {
     this.conversations = new OwnerConversationState(
       join(options.stateDir, '.owner-channel-conversations.json'));
     this.tasks = new OwnerTaskState(join(options.stateDir, '.owner-channel-tasks.json'));
+    this.messageRecovery = new MessageRecoveryState(
+      join(options.stateDir, '.owner-channel-message-recovery.json'));
     this.attachmentRecovery = new AttachmentRecoveryState(
       join(options.stateDir, '.owner-channel-attachment-recovery.json'));
     this.attachmentRoot = join(options.stateDir, '.owner-channel-inbox');
@@ -258,6 +251,8 @@ export class OwnerChannel implements OwnerChannelHandle {
       options.log(`[${options.role}] owner conversation state corrupt; proactive messages disabled`);
     if (!this.tasks.integrity().ok)
       options.log(`[${options.role}] owner task state corrupt; proactive reports disabled`);
+    if (!this.messageRecovery.integrity())
+      options.log(`[${options.role}] owner message recovery state corrupt; message intake disabled`);
     if (!this.attachmentRecovery.integrity())
       options.log(`[${options.role}] owner attachment recovery state corrupt; attachments disabled`);
   }
@@ -275,11 +270,15 @@ export class OwnerChannel implements OwnerChannelHandle {
       const bindStartedAt = now();
       for (;;) {
         try {
-          await this.client.callTool('choose_identity', { name: this.options.config.identity });
+          await this.client.bindIdentity(this.options.config.identity);
           break;
         } catch (error) {
-          const message = (error as Error)?.message ?? String(error);
-          const liveConflict = /currently bound to another live session/i.test(message);
+          // The predecessor's lease may still be in flight. Only the daemon's
+          // own typed verdict may extend the handoff window: matching the
+          // wording of an error message would let any other failure whose text
+          // happens to say "bound to another live session" — including one
+          // relayed from a peer — spin here for the whole timeout.
+          const liveConflict = oursErrorCode(error) === OURS_BOUND_ELSEWHERE;
           if (!this.binder.inherited || !liveConflict
               || now() - bindStartedAt >= OWNER_BIND_HANDOFF_TIMEOUT_MS)
             throw error;
@@ -302,9 +301,10 @@ export class OwnerChannel implements OwnerChannelHandle {
       ).catch(error => this.logError('attachment crash cleanup failed', error));
     }
     this.ready = true;
-    this.watchTask = this.options.watch ? this.legacyWatchLoop() : this.watchLoop();
     // Do not make role startup wait for an old owner request to finish a turn.
-    void this.drain().catch(error => this.logError('initial drain failed', error));
+    // watchLoop itself drains before every establishment, including this first
+    // one, so there is no drain-to-tip race.
+    this.watchTask = this.watchLoop();
   }
 
   drain(): Promise<void> {
@@ -322,12 +322,8 @@ export class OwnerChannel implements OwnerChannelHandle {
   async close(): Promise<void> {
     this.stopping = true;
     this.ready = false;
-    const watch = this.watchProcess;
-    this.watchProcess = undefined;
-    if (watch && watch.exitCode === null) watch.kill('SIGTERM');
     this.watchAbort?.abort();
-    if (!this.options.watch)
-      await this.watchTask?.catch(error => this.logError('watch shutdown failed', error));
+    await this.watchTask?.catch(error => this.logError('watch shutdown failed', error));
     this.watchTask = undefined;
     await this.managementTail;
     try { await this.client.close(); }
@@ -374,10 +370,14 @@ export class OwnerChannel implements OwnerChannelHandle {
         return { action: request.action, contacts: await this.contacts() };
       case 'contact_invite': {
         this.assertLabel(request.name);
-        const raw = await this.client.callTool('generate_invite', request.name ? { name: request.name } : {});
-        const invite = typeof raw === 'string' ? raw : String((raw as { invite?: unknown })?.invite ?? '');
-        if (!invite) throw new Error('ours-mcp returned no invite');
-        return { action: request.action, invite };
+        // The invite is the blob field, not a sentence containing it. The MCP
+        // surface answered with "One-time invite for X created (invite_id …).
+        // Share this blob out-of-band …:\n<blob>" and the whole sentence was
+        // handed out as the invite, so any rewording changed the payload.
+        const { blob } = await this.client.generateInvite(request.name);
+        if (typeof blob !== 'string' || !blob)
+          throw new Error('the ours daemon returned no invite blob');
+        return { action: request.action, invite: blob };
       }
       case 'contact_add': {
         if (typeof request.invite !== 'string' || !request.invite)
@@ -385,17 +385,18 @@ export class OwnerChannel implements OwnerChannelHandle {
         if (Buffer.byteLength(request.invite) > 48 * 1024)
           throw new Error('invite exceeds 49152 bytes');
         this.assertLabel(request.name);
-        let raw: unknown;
+        let added: { display: string; cid: string };
         try {
-          raw = await this.client.callTool('add_contact', {
+          added = await this.client.addContact({
             invite: request.invite, ...(request.name ? { name: request.name } : {}),
           });
         } catch {
           // Daemon errors are not allowed to reflect invite material through
           // the control response, CLI stderr, or supervisor logs.
-          throw new Error('ours-mcp could not accept the contact invite');
+          throw new Error('the ours daemon could not accept the contact invite');
         }
-        return { action: request.action, status: 'pending', contact: this.contact(raw) };
+        const contact = this.contact(added.cid, added.display, 'pending');
+        return { action: request.action, status: 'pending', ...(contact ? { contact } : {}) };
       }
       case 'owner_list':
         return {
@@ -461,31 +462,39 @@ export class OwnerChannel implements OwnerChannelHandle {
     }
   }
 
+  /**
+   * The daemon reports established contacts and pending introductions as two
+   * separate collections, so the status is structural rather than a word parsed
+   * out of a rendered line. Nothing here can be spoofed by a contact's own
+   * display name.
+   */
   private async contacts(): Promise<OwnerContact[]> {
-    const raw = await this.client.callTool('list_contacts');
-    const values = Array.isArray(raw) ? raw : (raw as { contacts?: unknown })?.contacts;
-    if (!Array.isArray(values)) return [];
-    return values.map(value => this.contact(value)).filter((v): v is OwnerContact => Boolean(v))
+    const view = await this.client.listContacts();
+    const rows = [
+      ...(Array.isArray(view?.contacts) ? view.contacts : [])
+        .map(row => this.contact(row?.container_id, row?.name, 'established', view)),
+      ...(Array.isArray(view?.pending) ? view.pending : [])
+        .map(row => this.contact(row?.container_id, row?.name, 'pending', view)),
+    ];
+    return rows.filter((row): row is OwnerContact => Boolean(row))
       .sort((a, b) => a.cid.localeCompare(b.cid));
   }
 
-  private contact(raw: unknown): OwnerContact | undefined {
-    if (!raw || typeof raw !== 'object') return undefined;
-    const value = raw as Record<string, unknown>;
-    const cid = String(value.cid ?? value.id ?? value.container_id ?? value.containerId ?? '');
+  private contact(
+    cidValue: unknown, nameValue: unknown, status: 'established' | 'pending',
+    view?: OursContactsView,
+  ): OwnerContact | undefined {
+    const cid = String(cidValue ?? '');
     if (!/^[A-Fa-f0-9]{64}$/.test(cid)) return undefined;
-    const humanRaw = value.human ?? value.root;
-    const human = humanRaw && typeof humanRaw === 'object' ? humanRaw as Record<string, unknown> : undefined;
+    const root = view?.roots?.[cid];
+    const rootCid = String(root?.root_cid ?? '');
     return {
       cid,
-      name: this.safeMetadata(value.name ?? value.display_name ?? cid),
-      status: this.safeMetadata(value.status ?? 'established'),
-      ...(typeof value.kind === 'string' ? { kind: this.safeMetadata(value.kind) } : {}),
-      ...(human ? { human: {
-        ...(typeof (human.cid ?? human.id) === 'string'
-          && /^[A-Fa-f0-9]{64}$/.test(String(human.cid ?? human.id))
-          ? { cid: String(human.cid ?? human.id) } : {}),
-        ...(human.name ? { name: this.safeMetadata(human.name) } : {}),
+      name: this.safeMetadata(nameValue ?? cid),
+      status,
+      ...(root ? { human: {
+        ...(/^[A-Fa-f0-9]{64}$/.test(rootCid) ? { cid: rootCid } : {}),
+        ...(root.root_name ? { name: this.safeMetadata(root.root_name) } : {}),
       } } : {}),
     };
   }
@@ -669,55 +678,158 @@ export class OwnerChannel implements OwnerChannelHandle {
   }
 
   private async drainAll(): Promise<void> {
-    // A finite cap protects the supervisor if a broken daemon repeats unread
-    // messages forever. A watch notification will resume draining later.
+    // A finite cap protects the supervisor if a broken daemon never advances
+    // its oldest-first unread batch. A watch hint will resume draining later.
     for (let pass = 0; pass < 100 && !this.stopping; pass++) {
-      const [raw, fileResult] = await Promise.all([
-        this.client.callTool('get_messages') as Promise<{ messages?: unknown }>,
-        this.client.callTool('list_incoming_files')
+      const [claimed, fileResult] = await Promise.all([
+        this.claimMessages(),
+        this.client.listIncomingFiles()
           .catch(error => {
             this.logError('attachment metadata inspection unavailable', error);
             return undefined;
           }),
       ]);
-      const messages = Array.isArray(raw?.messages)
-        ? raw.messages.filter(message => message && typeof message === 'object') as InboundMessage[]
-        : [];
-      let files: IncomingAttachment[] = [];
-      try { files = parseIncomingAttachments(fileResult); }
-      catch (error) { this.logError('attachment metadata inspection unavailable', error); }
       const pending = this.attachmentRecovery.integrity() ? this.attachmentRecovery.list() : [];
+      let files = await this.attachmentMetadata(fileResult, pending);
       const pendingWires = new Set(pending.flatMap(item => item.fileWireIds));
       files = files.filter(file => (file.status === 'unread' || pendingWires.has(file.wireId))
         && !this.state.has(file.wireId));
-      if (!messages.length && !files.length) return;
-
-      // get_messages marks the batch processed. Requeue allowed, unhandled
-      // inputs before executing them so a mid-turn process crash can replay.
-      const deferred = messages.filter(message => {
-        const wireId = this.wireId(message);
-        return wireId && !this.state.has(wireId)
-          && this.acceptedSender(this.sender(message).id)
-          && Number.isInteger(message.msg_id);
-      }).map(message => message.msg_id!);
-      if (deferred.length)
-        await this.client.callTool('defer_messages', { msg_ids: deferred });
+      if (!claimed.messages.length && !files.length && claimed.remaining === 0) return;
 
       let advanced = false;
       const consumedMessages = new Set<InboundMessage>();
-      const groups = this.attachmentGroups(files, messages, pending, consumedMessages);
+      const groups = this.attachmentGroups(files, claimed.messages, pending, consumedMessages);
       for (const group of groups)
         advanced = await this.handleAttachmentGroup(group) || advanced;
-      for (const message of messages) {
+      for (const message of claimed.messages) {
         if (!consumedMessages.has(message)) advanced = await this.handle(message) || advanced;
       }
+      this.messageRecovery.pruneHandled(wireId => this.state.has(wireId));
 
-      // Deferred in-flight messages are intentionally visible again until
-      // their correlated response is delivered. Do not spin on those replay
-      // copies; a new watch event or completion-triggered drain will resume.
-      if (!advanced) return;
+      // Journaled in-flight messages remain history-recoverable until their
+      // correlated response is delivered. Do not spin on those copies once the
+      // unread SQLite queue itself is empty; completion triggers another drain.
+      if (!advanced && claimed.remaining === 0) return;
     }
     this.options.log(`[${this.options.role}] owner channel drain capped at 100 batches`);
+  }
+
+  /**
+   * Claim the exact oldest unread SQLite batch before marking it read.
+   * The journal contains only wire IDs and sequence numbers; bodies remain in
+   * the daemon's persistent history and are recovered with getHistoryItem.
+   */
+  private async claimMessages(): Promise<{
+    messages: InboundMessage[];
+    remaining: number;
+  }> {
+    if (!this.messageRecovery.integrity())
+      throw new Error('message recovery state is corrupt; refusing owner message intake');
+    this.messageRecovery.pruneHandled(wireId => this.state.has(wireId));
+
+    const recovered: InboundMessage[] = [];
+    for (const claim of this.messageRecovery.list()) {
+      const item = await this.client.getHistoryItem(claim.wireId);
+      if (!item)
+        throw new Error(`journaled owner message ${claim.wireId} is missing from persistent history`);
+      recovered.push(this.historyMessage(item, claim));
+    }
+
+    const listed = await this.client.listIncomingMessages();
+    if (!Array.isArray(listed)) throw new Error('the ours daemon returned invalid unread message metadata');
+    const preflight = listed.slice(0, OWNER_MESSAGE_BATCH_LIMIT);
+    const now = Date.now();
+    const claims = preflight.map(item => this.messageClaim(item, now));
+    const claimKeys = new Set(claims.map(item => `${item.seq}\0${item.wireId}`));
+    if (claimKeys.size !== claims.length)
+      throw new Error('the ours daemon returned duplicate unread message metadata');
+    this.messageRecovery.claim(claims);
+
+    let fresh: InboundMessage[] = [];
+    let remaining = 0;
+    // SDK batchLimit rejects zero. An empty preflight is a read-only drain.
+    if (claims.length) {
+      const payload = await this.client.getMessages(claims.length);
+      if (!payload || !Array.isArray(payload.messages)
+          || !Number.isSafeInteger(payload.remaining) || payload.remaining < 0)
+        throw new Error('the ours daemon returned an invalid claimed message batch');
+      fresh = payload.messages.map(message => this.historyMessage(message));
+      remaining = payload.remaining;
+      const expected = claimKeys;
+      const actual = new Set(fresh.map(item => `${item.seq}\0${item.wire_id}`));
+      if (fresh.length !== claims.length || actual.size !== fresh.length
+          || actual.size !== expected.size
+          || [...expected].some(item => !actual.has(item)))
+        throw new Error('the ours daemon claimed a different message batch than fleet journaled');
+    }
+
+    const merged = new Map<string, InboundMessage>();
+    for (const message of [...recovered, ...fresh]) {
+      const wireId = this.wireId(message);
+      const previous = merged.get(wireId);
+      if (previous && previous.seq !== message.seq)
+        throw new Error('persistent message history changed sequence during recovery');
+      merged.set(wireId, message);
+    }
+    return {
+      messages: [...merged.values()].sort((a, b) => a.seq - b.seq),
+      remaining,
+    };
+  }
+
+  private messageClaim(message: OursIncomingMessage, claimedAt: number): PendingMessageClaim {
+    const value = message as unknown as Record<string, unknown>;
+    const wireId = String(value.wire_id ?? '').trim();
+    const seq = Number(value.seq);
+    if (!wireId || !Number.isSafeInteger(seq) || seq < 1
+        || value.status !== 'unread' || value.inbox_state !== 'unread')
+      throw new Error('the ours daemon returned malformed unread message metadata');
+    return { wireId, seq, claimedAt };
+  }
+
+  private historyMessage(
+    message: OursHistoryMessage | OursInboundMessage,
+    claim?: PendingMessageClaim,
+  ): InboundMessage {
+    const value = message as unknown as Record<string, unknown>;
+    const wireId = String(value.wire_id ?? '').trim();
+    const seq = Number(value.seq);
+    const direction = String(value.direction ?? '');
+    if (!wireId || !Number.isSafeInteger(seq) || seq < 1 || direction !== 'in'
+        || (claim && (claim.wireId !== wireId || claim.seq !== seq)))
+      throw new Error('persistent owner message metadata mismatched its recovery claim');
+    return message as InboundMessage;
+  }
+
+  private async attachmentMetadata(
+    unread: OursHistoryFile[] | undefined,
+    pending: PendingAttachmentRequest[],
+  ): Promise<IncomingAttachment[]> {
+    const raw: OursHistoryFile[] = Array.isArray(unread) ? [...unread] : [];
+    const present = new Set(raw.map(file => String(file.wire_id ?? '')));
+    for (const recovery of pending) {
+      for (const wireId of recovery.fileWireIds) {
+        if (present.has(wireId)) continue;
+        const item = await this.client.getFileInfo(wireId);
+        if (!item)
+          throw new Error(`journaled owner file ${wireId} is missing from persistent history`);
+        if (item.wire_id !== wireId || item.direction !== 'in'
+            || item.inbox_state !== 'read' || item.status !== 'read')
+          throw new Error(`journaled owner file ${wireId} mismatched persistent history`);
+        raw.push(item);
+        present.add(wireId);
+      }
+    }
+    const files = parseIncomingAttachments(raw);
+    const byWire = new Map(files.map(file => [file.wireId, file]));
+    for (const recovery of pending) {
+      for (const wireId of recovery.fileWireIds) {
+        const file = byWire.get(wireId);
+        if (!file || file.senderId !== recovery.contact)
+          throw new Error(`journaled owner file ${wireId} failed recovery provenance validation`);
+      }
+    }
+    return files;
   }
 
   private attachmentGroups(
@@ -741,9 +853,9 @@ export class OwnerChannel implements OwnerChannelHandle {
       const caption = recovery.originWireId === recovery.fileWireIds[0]
         ? undefined : messageByWire.get(recovery.originWireId);
       if (caption && this.sender(caption).id !== recovery.contact) continue;
-      // A managed-agent caption is deferred before retrieval. If recovery sees
-      // the processed file before that body is replayed, keep the file reserved
-      // by the journal until both halves are present again.
+      // A managed-agent caption is claimed before its inbox row becomes read.
+      // If recovery sees a read file before that body is recovered from history,
+      // keep the file reserved by the journal until both halves are present.
       if (!caption && !recovery.fileWireIds.includes(recovery.originWireId)) continue;
       if (caption) consumed.add(caption);
       groups.push({ files: exact, recovery, ...(caption ? { caption } : {}) });
@@ -814,16 +926,15 @@ export class OwnerChannel implements OwnerChannelHandle {
       if (!group.recovery) this.attachmentRecovery.add(recovery);
       requestDir = await prepareAttachmentDirectory(this.attachmentRoot, requestId);
       const unread = group.files.filter(file => file.status === 'unread');
-      const processed = group.files.filter(file => file.status !== 'unread');
+      const historyRecovered = group.files.filter(file => file.status !== 'unread');
       const retrieved = unread.length
-        ? parseRetrievedAttachments(await this.client.callTool('get_files', {
-          wire_ids: unread.map(file => file.wireId),
-        }), unread)
+        ? parseRetrievedAttachments(
+          await this.client.getFiles(unread.map(file => file.wireId)), unread)
         : [];
-      for (const file of processed) {
-        if (!group.recovery) throw new Error('unexpected processed attachment without recovery route');
-        const recoveryPath = join(requestDir, `.recovered-${file.wireId}-${randomUUID()}`);
-        await this.client.callTool('save_file', { wire_id: file.wireId, dest_path: recoveryPath });
+      for (const file of historyRecovered) {
+        if (!group.recovery) throw new Error('unexpected read attachment without recovery route');
+        const recoveryPath = await writeRecoveredAttachment(
+          requestDir, file.wireId, await this.client.fetchFile(file.wireId));
         retrieved.push(await recoveredAttachment(file, recoveryPath));
       }
       const order = new Map(group.files.map((file, index) => [file.wireId, index]));
@@ -896,17 +1007,18 @@ export class OwnerChannel implements OwnerChannelHandle {
           // it silently IS the correct outcome; delivering again is the bug.
           this.options.log(`[${this.options.role}] managed-agent relay replay of a delivered wire consumed`);
         } else if (error instanceof RelayUnroutableError) {
-          // No owner route exists yet. Leave the wire deferred and unconsumed
-          // so the daemon replays it after the first owner contact, and tell
-          // the authenticated agent once so the wait is never silent.
+          // No owner route exists yet. Leave the wire journaled and unconsumed
+          // so persistent history replays it after the first owner contact, and
+          // tell the authenticated agent once so the wait is never silent.
           this.options.log(`[${this.options.role}] owner channel managed-agent relay has no owner `
             + `route yet; message stays queued: ${this.errorText(error)}`);
-          await this.nackManagedAgent(sender.id, message, wireId, ownerNotices.relayQueued());
+          await this.nackManagedAgent(
+            sender.id, message.wire_id ? wireId : undefined, wireId, ownerNotices.relayQueued());
           return false;
         } else {
           this.logError('managed-agent message relay refused', error);
-          await this.nackManagedAgent(
-            sender.id, message, wireId, ownerNotices.relayRefused(this.errorText(error)));
+          await this.nackManagedAgent(sender.id, message.wire_id ? wireId : undefined, wireId,
+            ownerNotices.relayRefused(this.errorText(error)));
         }
       }
       this.state.remember(wireId);
@@ -955,9 +1067,9 @@ export class OwnerChannel implements OwnerChannelHandle {
       await rm(outbox, { recursive: true, force: true });
       if (error instanceof SessionControlError
           && error.reasonCode === ACP_CANCEL_DEADLINE_EXCEEDED) {
-        // drainAll deferred this authenticated message before delivery. The
+        // drainAll journaled this authenticated message before delivery. The
         // adapter generation is terminating, so leave the wire unhandled and
-        // body-free: the resumed owner channel will replay it exactly once.
+        // body-free: the resumed owner channel recovers it exactly once.
         this.options.log(`[${this.options.role}] owner request ${requestId.slice(0, 12)} `
           + `held for adapter resume reason=${ACP_CANCEL_DEADLINE_EXCEEDED}`);
         return false;
@@ -1020,6 +1132,9 @@ export class OwnerChannel implements OwnerChannelHandle {
         return this.commentsState();
       },
       fleetList: () => this.fleetOps.list(),
+      closeRoom: roomId => this.closeRoomFromOwner(sender, roomId, wireId),
+      terminalTask: (taskId, kind, outcome) =>
+        this.terminalTaskFromOwner(sender, taskId, kind, outcome, wireId),
       recentEvents: limit => this.options.session.eventsSince(0).slice(-limit),
       readWorklogTail: maxChars => this.readWorklogTail(maxChars),
       reply: async replyText => { await this.send(sender.id, replyText, wireId); },
@@ -1075,6 +1190,79 @@ export class OwnerChannel implements OwnerChannelHandle {
     this.state.remember(wireId);
     this.options.log(`[${this.options.role}] owner requested ${command}`);
     await this.fleetOps.restart(mode);
+  }
+
+  /**
+   * The caller may itself be a room member. Persist and acknowledge acceptance
+   * before an external worker starts a saga that can retire this process.
+   */
+  private async closeRoomFromOwner(
+    sender: { id: string; name: string }, roomId: string, wireId: string,
+  ): Promise<void> {
+    const { acceptManagedRoomClose, recordManagedRoomCloseError } =
+      await import('../rooms-tasks/close.js');
+    await acceptManagedRoomClose(roomId);
+    await this.send(sender.id, renderMarkdownFailure({
+      kind: 'pending', subject: `/room delete ${roomId} ${roomId}`,
+      detail: 'The deletion request was accepted and is still being settled.',
+      action: `Run /room recover ${roomId} if deletion remains pending.`,
+    }), wireId);
+    this.state.remember(wireId);
+    try {
+      await this.fleetOps.closeRoom(roomId);
+    } catch (error) {
+      await recordManagedRoomCloseError(
+        roomId,
+        error instanceof Error ? error.message : String(error),
+        `External delete worker failed to start. Retry /room delete ${roomId} ${roomId}.`,
+      );
+      throw error;
+    }
+  }
+
+  /** Carry a task terminal request through a worker that survives this role. */
+  private async terminalTaskFromOwner(
+    sender: { id: string; name: string },
+    taskId: string,
+    kind: import('../rooms-tasks/types.js').TaskTerminalIntent['kind'],
+    outcome: import('../rooms-tasks/types.js').TaskOutcome | undefined,
+    wireId: string,
+  ): Promise<void> {
+    const { getTask } = await import('../rooms-tasks/task-state.js');
+    const {
+      acceptTaskTerminalIntent, recordTaskTerminalIntentError,
+    } = await import('../rooms-tasks/terminal.js');
+    const task = getTask(taskId);
+    const accepted = await acceptTaskTerminalIntent({
+      taskId, kind, roomId: task.room_id, outcome,
+    });
+    if (accepted.terminal_intent?.status === 'settled') {
+      await this.send(sender.id, renderMarkdownResult({
+        icon: '📋', title: 'Task terminal action complete',
+        fields: [
+          { label: 'ID', value: taskId, kind: 'code' },
+          { label: 'Status', value: taskStatus(accepted.state), kind: 'markdown' },
+        ],
+      }), wireId);
+      this.state.remember(wireId);
+      return;
+    }
+    await this.send(sender.id, renderMarkdownFailure({
+      kind: 'pending', subject: `/task ${kind === 'done' ? 'done' : 'cancel'} ${taskId}`,
+      detail: 'The terminal request was accepted and is still being settled.',
+      action: `Run /task recover ${taskId} if it remains pending.`,
+    }), wireId);
+    this.state.remember(wireId);
+    try {
+      await this.fleetOps.settleTask(taskId);
+    } catch (error) {
+      await recordTaskTerminalIntentError(
+        taskId,
+        error instanceof Error ? error.message : String(error),
+        `External settle worker failed to start. Retry the identical task command or run task recover ${taskId}.`,
+      );
+      throw error;
+    }
   }
 
   /** Code-point-safe tail of the worklog, or undefined when there is none. */
@@ -1157,7 +1345,9 @@ export class OwnerChannel implements OwnerChannelHandle {
   ): Promise<boolean> {
     const captionWire = group.caption ? this.wireId(group.caption) : undefined;
     const nackWire = captionWire ?? group.files[0].wireId;
-    const nackMessage = group.caption ?? { wire_id: nackWire };
+    // A caption whose own wire id is synthetic (msg_id only) must not be echoed
+    // back as a reply reference; a file wire always is a real one.
+    const nackReplyTo = (group.caption ? group.caption.wire_id : nackWire) ? nackWire : undefined;
     let requestDir: string | undefined;
     let recovery: PendingAttachmentRequest | undefined;
     try {
@@ -1190,16 +1380,15 @@ export class OwnerChannel implements OwnerChannelHandle {
       if (!group.recovery) this.attachmentRecovery.add(recovery);
       requestDir = await prepareAttachmentDirectory(this.attachmentRoot, transactionId);
       const unread = group.files.filter(file => file.status === 'unread');
-      const processed = group.files.filter(file => file.status !== 'unread');
+      const historyRecovered = group.files.filter(file => file.status !== 'unread');
       const retrieved = unread.length
-        ? parseRetrievedAttachments(await this.client.callTool('get_files', {
-          wire_ids: unread.map(file => file.wireId),
-        }), unread)
+        ? parseRetrievedAttachments(
+          await this.client.getFiles(unread.map(file => file.wireId)), unread)
         : [];
-      for (const file of processed) {
-        if (!group.recovery) throw new Error('unexpected processed attachment without recovery route');
-        const recoveryPath = join(requestDir, `.recovered-${file.wireId}-${randomUUID()}`);
-        await this.client.callTool('save_file', { wire_id: file.wireId, dest_path: recoveryPath });
+      for (const file of historyRecovered) {
+        if (!group.recovery) throw new Error('unexpected read attachment without recovery route');
+        const recoveryPath = await writeRecoveredAttachment(
+          requestDir, file.wireId, await this.client.fetchFile(file.wireId));
         retrieved.push(await recoveredAttachment(file, recoveryPath));
       }
       const order = new Map(group.files.map((file, index) => [file.wireId, index]));
@@ -1214,9 +1403,9 @@ export class OwnerChannel implements OwnerChannelHandle {
       try {
         if (caption) await this.send(contact, caption, replyTo);
         for (const file of admitted) {
-          await this.client.callTool('send_file', {
+          await this.client.sendFile({
             contact, path: file.path, filename: file.filename,
-            ...(replyTo ? { reply_to_wire_id: replyTo } : {}),
+            ...(replyTo ? { replyToWireId: replyTo } : {}),
           });
         }
       } catch {
@@ -1241,12 +1430,12 @@ export class OwnerChannel implements OwnerChannelHandle {
       if (error instanceof RelayUnroutableError) {
         this.options.log(`[${this.options.role}] managed-agent attachment has no owner route; `
           + `transaction stays queued: ${this.errorText(error)}`);
-        await this.nackManagedAgent(agent, nackMessage, nackWire, ownerNotices.relayQueued());
+        await this.nackManagedAgent(agent, nackReplyTo, nackWire, ownerNotices.relayQueued());
         return false;
       }
       this.logError('managed-agent caption/file relay refused', error);
       await this.nackManagedAgent(
-        agent, nackMessage, nackWire, ownerNotices.relayRefused(this.errorText(error)));
+        agent, nackReplyTo, nackWire, ownerNotices.relayRefused(this.errorText(error)));
       // Rejection/admission failure and uncertain transport are terminal and
       // visible. Consuming every correlated wire prevents a later partial replay.
       for (const wire of handledWireIds) this.state.remember(wire);
@@ -1277,18 +1466,18 @@ export class OwnerChannel implements OwnerChannelHandle {
 
   /**
    * One bounded NACK per wire: an unroutable or refused relay must be visible
-   * to the authenticated agent, while its deferred replays stay quiet. NACK
+   * to the authenticated agent, while its history replays stay quiet. NACK
    * delivery is best-effort — it must never make the failure worse.
    */
   private async nackManagedAgent(
-    contact: string, message: InboundMessage, wireId: string, notice: string,
+    contact: string, replyTo: string | undefined, wireId: string, notice: string,
   ): Promise<void> {
     if (this.relayNacks.has(wireId)) return;
     this.relayNacks.add(wireId);
     if (this.relayNacks.size > RELAY_NACK_MEMORY)
       this.relayNacks.delete(this.relayNacks.values().next().value as string);
     try {
-      await this.send(contact, notice, message.wire_id ? wireId : undefined);
+      await this.send(contact, notice, replyTo);
     } catch (error) {
       this.logError('managed-agent relay NACK delivery failed', error);
     }
@@ -1651,9 +1840,9 @@ export class OwnerChannel implements OwnerChannelHandle {
     return createHash('sha256').update(wireId).digest('hex');
   }
 
-  private send(contact: string, text: string, replyTo?: string): Promise<unknown> {
-    return this.client.callTool('send_message', {
-      contact, text, ...(replyTo ? { reply_to_wire_id: replyTo } : {}),
+  private send(contact: string, text: string, replyTo?: string): Promise<void> {
+    return this.client.sendMessage({
+      contact, text, ...(replyTo ? { replyToWireId: replyTo } : {}),
     });
   }
 
@@ -1662,11 +1851,11 @@ export class OwnerChannel implements OwnerChannelHandle {
       .filter(entry => entry.isFile())
       .sort((a, b) => a.name.localeCompare(b.name));
     for (const entry of entries) {
-      await this.client.callTool('send_file', {
+      await this.client.sendFile({
         contact,
         path: join(outbox, entry.name),
         filename: entry.name,
-        reply_to_wire_id: replyTo,
+        replyToWireId: replyTo,
       });
     }
     await rm(outbox, { recursive: true, force: true });
@@ -1691,10 +1880,11 @@ export class OwnerChannel implements OwnerChannelHandle {
   }
 
   private sender(message: InboundMessage): { id: string; name: string } {
-    const source = message.from ?? message.sender;
-    if (typeof source === 'string') return { id: source, name: source };
-    const id = String(source?.id ?? message.sender_id ?? '');
-    return { id, name: String(source?.name ?? message.sender_name ?? id) };
+    // Authenticated routing data, straight from the daemon's typed envelope.
+    // The id still goes through the CID checks in acceptedSender/isEffectiveOwner.
+    const source = message.from as { id?: unknown; name?: unknown } | undefined;
+    const id = String(source?.id ?? '');
+    return { id, name: String(source?.name ?? id) };
   }
 
   private latestEventSeq(events: SessionEvent[]): number {
@@ -1725,164 +1915,116 @@ export class OwnerChannel implements OwnerChannelHandle {
   }
 
   private async watchLoop(): Promise<void> {
-    const endpoint = resolveEndpoint({ ...process.env, ...(this.options.env ?? {}) });
-    const fetch = this.options.watchFetch
-      ?? ((url: string, init?: { headers?: Record<string, string>; signal?: AbortSignal }) =>
-        globalThis.fetch(url, init) as unknown as ReturnType<FetchLike>);
     const sleep = this.options.binderDeps?.sleep
       ?? (ms => new Promise<void>(resolve => setTimeout(resolve, ms)));
     const restored = this.readWatchState();
     let state = restored.state;
-    // An unreadable cursor is the ONLY reason to restart at the tip. Say so on
-    // the next successful connect, and drain first: everything the lost cursor
-    // would have pointed at is still in the inbox, which is the authority.
-    let recovering = restored.recovered;
-    let cursor: number | 'tip' = state?.cursor ?? 'tip';
+    if (restored.recovered)
+      state = this.writeWatchState(state, 'OWNER_WATCH_STATE_RECOVERED');
     let delayMs = 1_000;
-    let authFailures = 0;
-    if (recovering) await this.drain().catch(error => this.logError('cursor recovery drain failed', error));
+    let attempts = 0;
     while (!this.stopping) {
       const ctrl = new AbortController();
       this.watchAbort = ctrl;
-      let stalled = false;
-      let authRejected = false;
-      const timer = setTimeout(() => { stalled = true; ctrl.abort(); },
-        this.options.watchStallMs ?? OWNER_WATCH_STALL_MS);
-      timer.unref?.();
       try {
-        const response = await fetch(
-          `${endpoint.url(this.options.config.identity)}?since=${cursor}`,
-          { headers: endpoint.headers, signal: ctrl.signal },
-        );
-        if (response.status === 401) {
-          authRejected = true;
-          authFailures++;
-          const at = cursor === 'tip' ? state?.cursor ?? 0 : cursor;
-          if (authFailures >= OWNER_WATCH_AUTH_FATAL_ATTEMPTS) {
-            state = this.writeWatchState(state, at, 'OWNER_WATCH_AUTH_FATAL', true);
-            this.options.log(`[${this.options.role}] owner watch stopped `
-              + `reason=OWNER_WATCH_AUTH_FATAL after ${authFailures} consecutive HTTP 401 responses; `
-              + 'owner notifications require re-authorization and will not be retried');
-            return;
-          }
-          state = this.writeWatchState(state, at, 'OWNER_WATCH_AUTH_FAILED', true);
-          throw new Error('OWNER_WATCH_AUTH_FAILED: daemon rejected notification credentials');
+        // This drain is unconditional at EVERY establishment. Starting the SDK
+        // stream at 0 then replays notification hints instead of tip-priming,
+        // so mail arriving after the drain but before the first request cannot
+        // fall into a gap. Persistent history plus fleet's body-free claim
+        // journal is authoritative; durable wire-ID dedupe makes hints harmless.
+        await this.drain();
+        if (this.stopping) return;
+        state = this.writeWatchState(
+          state, 'OWNER_WATCH_CONNECTING', { reconnected: attempts > 0 });
+        attempts++;
+        for await (const _event of this.client.watchNotifications(
+          this.options.config.identity, { since: 0, signal: ctrl.signal },
+        )) {
+          if (this.stopping) return;
+          state = this.writeWatchState(
+            state, 'OWNER_WATCH_CONNECTED', { resetFailures: true });
+          delayMs = 1_000;
+          // Notification events contain no bodies and are only wake hints.
+          // Draining is idempotent at the turn boundary because wire IDs are
+          // recorded before a managed request is dispatched.
+          await this.drain();
         }
-        if (!response.ok) throw new Error(`daemon returned HTTP ${response.status}`);
-        const body = await response.json();
-        const next = typeof body.cursor === 'number' ? body.cursor : cursor === 'tip' ? 0 : cursor;
-        const reconnect = (state?.consecutiveFailures ?? 0) > 0;
-        state = this.writeWatchState(state, next,
-          recovering ? 'OWNER_WATCH_CURSOR_RECOVERED' : 'OWNER_WATCH_CONNECTED',
-          false, reconnect);
-        recovering = false;
-        authFailures = 0;
-        cursor = next;
-        delayMs = 1_000;
-        // Notification events are content-free hints. The inbox remains the
-        // authority and its wire-level durable dedupe prevents duplicate turns.
-        if ((body.events?.length ?? 0) > 0) await this.drain();
+        if (!this.stopping) throw new Error('ours SDK notification stream ended');
       } catch (error) {
         if (this.stopping) return;
-        const reason: OwnerWatchReason = stalled
-          ? 'OWNER_WATCH_STALLED' : 'OWNER_WATCH_STREAM_ERROR';
-        const current = cursor === 'tip' ? state?.cursor ?? 0 : cursor;
-        cursor = current;
-        // Only THIS iteration's auth rejection is already written. A stale
-        // AUTH_FAILED from an earlier attempt must never suppress the cursor,
-        // the failure counter, or a later STALLED transition.
-        if (!authRejected) state = this.writeWatchState(state, current, reason, true);
+        // SDK 2 deliberately hides transport status behind its typed stream.
+        // Do not parse error prose to rediscover it: every failure follows the
+        // same capped retry path forever, and the pre-establishment drain makes
+        // that retry correctness-preserving.
+        state = this.writeWatchState(
+          state, 'OWNER_WATCH_STREAM_ERROR', { failed: true });
         this.options.log(`[${this.options.role}] owner watch reconnect `
-          + `reason=${authRejected ? 'OWNER_WATCH_AUTH_FAILED' : reason} `
-          + `delay_ms=${delayMs} cursor=${current}`);
+          + `reason=OWNER_WATCH_STREAM_ERROR delay_ms=${delayMs} `
+          + `failures=${state.consecutiveFailures}: ${this.errorText(error)}`);
         await sleep(delayMs);
         delayMs = Math.min(delayMs * 2, OWNER_WATCH_BACKOFF_MAX_MS);
       } finally {
-        clearTimeout(timer);
         if (this.watchAbort === ctrl) this.watchAbort = undefined;
       }
     }
   }
 
   /**
-   * `recovered` distinguishes a first-ever start (no state, nothing lost) from a
-   * cursor we HAD and can no longer read. Only the latter is a recovery, and the
-   * caller needs to know because the reason it reports is the only evidence a
-   * durable cursor was ever lost.
+   * `recovered` distinguishes a first-ever start from unreadable persisted
+   * diagnostics. Notification correctness does not depend on this state: every
+   * establishment drains and then replays SDK hints from offset zero.
    */
   private readWatchState(): { state?: OwnerWatchState; recovered: boolean } {
     const path = join(this.options.stateDir, '.owner-channel-watch.json');
     if (!existsSync(path)) return { recovered: false };
     try {
-      const value = JSON.parse(readFileSync(path, 'utf8')) as Partial<OwnerWatchState>;
-      if (value.version !== 1 || !Number.isSafeInteger(value.cursor) || value.cursor! < 0
+      const value = JSON.parse(readFileSync(path, 'utf8')) as {
+        version?: number;
+        reconnects?: number;
+        consecutiveFailures?: number;
+        reason?: string;
+        updatedAt?: string;
+      };
+      if ((value.version !== 1 && value.version !== 2)
           || !Number.isSafeInteger(value.reconnects) || value.reconnects! < 0
           || !Number.isSafeInteger(value.consecutiveFailures) || value.consecutiveFailures! < 0)
         throw new Error('invalid owner watch state');
-      return { state: value as OwnerWatchState, recovered: false };
+      const reasons = new Set<OwnerWatchReason>([
+        'OWNER_WATCH_CONNECTING', 'OWNER_WATCH_CONNECTED',
+        'OWNER_WATCH_STREAM_ERROR', 'OWNER_WATCH_STATE_RECOVERED',
+      ]);
+      return { state: {
+        version: 2,
+        reconnects: value.reconnects!,
+        consecutiveFailures: value.consecutiveFailures!,
+        reason: reasons.has(value.reason as OwnerWatchReason)
+          ? value.reason as OwnerWatchReason : 'OWNER_WATCH_CONNECTING',
+        updatedAt: typeof value.updatedAt === 'string'
+          ? value.updatedAt : new Date(this.options.binderDeps?.now?.() ?? Date.now()).toISOString(),
+      }, recovered: false };
     } catch {
       this.options.log(`[${this.options.role}] owner watch `
-        + 'reason=OWNER_WATCH_CURSOR_RECOVERED invalid cursor state; draining inbox and starting at tip');
+        + 'reason=OWNER_WATCH_STATE_RECOVERED invalid persisted counters; restarting safely');
       return { recovered: true };
     }
   }
 
   private writeWatchState(
-    previous: OwnerWatchState | undefined, cursor: number, reason: OwnerWatchReason,
-    failed: boolean, reconnected = false,
+    previous: OwnerWatchState | undefined, reason: OwnerWatchReason,
+    options: { failed?: boolean; resetFailures?: boolean; reconnected?: boolean } = {},
   ): OwnerWatchState {
     const state: OwnerWatchState = {
-      version: 1,
-      cursor,
-      reconnects: (previous?.reconnects ?? 0) + (reconnected ? 1 : 0),
-      consecutiveFailures: failed ? (previous?.consecutiveFailures ?? 0) + 1 : 0,
+      version: 2,
+      reconnects: (previous?.reconnects ?? 0) + (options.reconnected ? 1 : 0),
+      consecutiveFailures: options.failed
+        ? (previous?.consecutiveFailures ?? 0) + 1
+        : options.resetFailures ? 0 : previous?.consecutiveFailures ?? 0,
       reason,
       updatedAt: new Date(this.options.binderDeps?.now?.() ?? Date.now()).toISOString(),
     };
     replaceFileAtomically(
       join(this.options.stateDir, '.owner-channel-watch.json'), `${JSON.stringify(state)}\n`, 0o600);
     return state;
-  }
-
-  /** Compatibility path for injected child-process tests; production is direct. */
-  private async legacyWatchLoop(): Promise<void> {
-    let delayMs = 1_000;
-    while (!this.stopping) {
-      try {
-        const child = this.options.watch?.(this.options.config.identity) ?? spawn(
-          this.options.command ?? 'ours-mcp', ['watch', this.options.config.identity], {
-            env: { ...process.env, ...(this.options.env ?? {}) }, stdio: ['pipe', 'pipe', 'pipe'],
-          });
-        this.watchProcess = child;
-        await new Promise<void>((resolve, reject) => {
-          if (child.pid) { resolve(); return; }
-          child.once('spawn', resolve);
-          child.once('error', reject);
-        });
-        createInterface({ input: child.stderr }).on('line', line =>
-          this.options.log(`[${this.options.role}] owner watch: ${line}`));
-        delayMs = 1_000;
-        // Drain at every (re)attachment, not only after a future notification:
-        // a failed send/turn leaves the input deferred and may not emit another
-        // watch line by itself.
-        await this.drain();
-        for await (const _line of createInterface({ input: child.stdout })) {
-          if (this.stopping) break;
-          await this.drain();
-        }
-        if (!this.stopping) throw new Error('watch exited');
-      } catch (error) {
-        if (!this.stopping) {
-          this.logError('watch failed; retrying', error);
-          await new Promise(resolve => setTimeout(resolve, delayMs));
-          delayMs = Math.min(delayMs * 2, 30_000);
-        }
-      } finally {
-        const child = this.watchProcess;
-        this.watchProcess = undefined;
-        if (child && child.exitCode === null) child.kill('SIGTERM');
-      }
-    }
   }
 
   private errorText(error: unknown): string {

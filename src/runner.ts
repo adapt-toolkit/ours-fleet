@@ -30,6 +30,7 @@ import {
   classifyFailureText,
 } from './model-recovery.js';
 import { rotateWorklog } from './worklog.js';
+import { reconcilePermanentRoleIdentities } from './creation.js';
 import { OwnerChannel, type OwnerChannelHandle, type OwnerChannelOptions } from './owner-channel/channel.js';
 import {
   acquireOwnerBinderLease, OwnerBinderHandoffTimeoutError, type OwnerBinderLease,
@@ -276,7 +277,7 @@ export function readExitRecord(path: string): ExitRecord | null {
   return { version: 1, class: 'unknown', detail: `unreadable exit record: ${raw.slice(0, 120)}` };
 }
 
-// ─── Restart-loop containment (3.2) ──────────────────────────────────────────
+// ─── Restart-loop containment ──────────────────────────────────────────
 //
 // The child-session restart loop used to BE the service manager: systemd's
 // `Restart=always RestartSec=2` and launchd's `KeepAlive`. Neither can count,
@@ -626,11 +627,11 @@ export async function runOnce(
     : adapter.buildLaunch(role, mode, { sessionId }, prep);
 
   // Isolation is additive: only roles that declare `isolation:` are wrapped. The
-  // env prefix + exit capture in buildPaneCommand stay host-side (see §5.3).
+  // env prefix + exit capture in buildPaneCommand stay host-side.
   let wrappedArgv = launch.argv;
   if (role.isolation) {
-    // Start with the SAME durable context config validation and doctor judged
-    // (5.2), then add the selected launch's exact runtime closure. Those paths
+    // Start with the same durable context that config validation and doctor judged,
+    // then add the selected launch's exact runtime closure. Those paths
     // still pass through resolveIsolation's canonical blocklist enforcement.
     const runtime = resolveLaunchRuntime(launch.argv);
     launch = { ...launch, argv: runtime.argv };
@@ -650,8 +651,8 @@ export async function runOnce(
     }
     wrappedArgv = sel.backend.wrap(launch.argv, policy, ctx);
 
-    // Resource caps wrap the sandbox from OUTSIDE, at the pane's own cgroup scope
-    // (§5.4). Applies even when the sandbox degraded to none.
+    // Resource caps wrap the sandbox from outside, at the pane's own cgroup scope.
+    // This applies even when the sandbox degraded to none.
     const { argv: rprefix, warnings } = resourceArgs(policy.resources, deps.cpuDelegated());
     for (const w of warnings) deps.log(`[${name}] WARNING ${w}`);
     if (rprefix.length) wrappedArgv = [...rprefix, ...wrappedArgv];
@@ -672,7 +673,7 @@ export async function runOnce(
     }
   }
 
-  // Supervisor mail monitor (design §1): prime the notification cursor at the
+  // Prime the supervisor mail monitor's notification cursor at the
   // stream tip BEFORE the session launches so no arrival is missed during boot
   // (backlog before the tip is the SessionStart hook's job). Native-mode roles
   // leave wake ownership to the harness. Temp snapshots predating `monitor:` are
@@ -1181,6 +1182,15 @@ export async function runSupervised(
 
     let result: AttemptResult;
     try {
+      // Service-manager boot and automatic retry bypass the operator-facing
+      // up/restart commands. Reconcile again immediately before every real
+      // permanent harness attempt; the operation is idempotent and releases its
+      // provisioning lease before the agent or owner channel binds.
+      if (attempt === runOnce) {
+        const configPath = resolveConfigPath(dir, opts.configPath);
+        const role = findRole(loadConfig(configPath), name);
+        await reconcilePermanentRoleIdentities(role, undefined, deps.log);
+      }
       result = await attempt(
         name, { configPath: opts.configPath, allowResumeRotation: !ledger.resumeDiscarded }, deps);
     } catch (e) {

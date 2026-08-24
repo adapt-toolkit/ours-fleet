@@ -449,7 +449,7 @@ describe('runOnce', () => {
   });
 });
 
-describe('creation-time isolation reaches the FIRST launch (6.3)', () => {
+describe('creation-time isolation reaches the FIRST launch', () => {
   it("a role whose config carries `isolation` is sandbox-wrapped on its first start", async () => {
     // This is the property --isolation-file exists for: the very first process
     // is confined, not the one after the operator edits fleet.yaml.
@@ -464,7 +464,7 @@ describe('creation-time isolation reaches the FIRST launch (6.3)', () => {
   });
 });
 
-describe('exit classification (1.6)', () => {
+describe('exit classification', () => {
   const readRecord = (d: string) =>
     JSON.parse(readFileSync(join(d, '.exit-status'), 'utf8')) as { class: string; detail: string };
 
@@ -582,7 +582,7 @@ describe('exit classification (1.6)', () => {
   });
 });
 
-describe('runOnce ACP startup outcome (1.2)', () => {
+describe('runOnce ACP startup outcome', () => {
   const acpFixture = join(dirname(fileURLToPath(import.meta.url)), 'fixtures', 'acp-agent.mjs');
 
   /** The fake adapter, taught to launch the ACP fixture as its agent process. */
@@ -825,7 +825,7 @@ describe('runOnce ACP startup outcome (1.2)', () => {
     expect(events.some(e => e.kind === 'agent_text' && e.text === 'mode:acceptEdits')).toBe(true);
   });
 
-  it('warns once at startup that an unattended role auto-denies (1.3)', async () => {
+  it('warns once at startup that an unattended role auto-denies', async () => {
     writeCfg({ A: {
       harness: 'fake-acp', session: 'acp',
       permissions: { approval: 'ask', filesystem: 'workspace', unattended: 'deny' },
@@ -840,7 +840,7 @@ describe('runOnce ACP startup outcome (1.2)', () => {
     expect(warnings[0]).toContain('reject_once');
   });
 
-  it('says nothing about auto-denial when the role waits instead (1.3)', async () => {
+  it('says nothing about auto-denial when the role waits instead', async () => {
     writeCfg({ A: {
       harness: 'fake-acp', session: 'acp',
       permissions: { approval: 'ask', filesystem: 'workspace', unattended: 'wait' },
@@ -853,7 +853,7 @@ describe('runOnce ACP startup outcome (1.2)', () => {
     expect(logs.some(l => l.includes('permission policy'))).toBe(false);
   });
 
-  it('records the ACP child\'s real exit, per class (1.6)', async () => {
+  it('records the ACP child\'s real exit, per class', async () => {
     for (const [code, cls, fresh] of [['0', 'clean', true], ['4', 'program-exit', false]] as const) {
       writeCfg({ A: {
         harness: 'fake-acp', session: 'acp',
@@ -874,7 +874,7 @@ describe('runOnce ACP startup outcome (1.2)', () => {
     }
   }, 20_000);
 
-  it('a floor-compliant role starts with ZERO permission prompts (2.1)', async () => {
+  it('a floor-compliant role starts with ZERO permission prompts', async () => {
     // The startup prompt makes the agent request a tool permission. A role whose
     // resolved permissions clear the floor must have it granted automatically —
     // nothing pending, nothing denied, and the turn completes.
@@ -1377,7 +1377,7 @@ describe('runTemp', () => {
   });
 });
 
-describe('restart-loop containment (3.2)', () => {
+describe('restart-loop containment', () => {
   /** A fake clock and a fake child, so the policy is tested, not the sessions. */
   function supervisorWorld(stateDir: string, opts: {
     /** Seconds each attempt "lasts", by attempt index. Last value repeats. */

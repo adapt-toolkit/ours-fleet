@@ -11,7 +11,7 @@ import type {
 
 /**
  * Durable, append-only, single-writer conversation ledger for one role
- * (spec §5.3). The per-role runner is the only writer; readers page by seq.
+ * The per-role runner is the only writer; readers page by seq.
  *
  * Unlike `SessionEvents` (a bounded diagnostic projection that may drop
  * writes silently), this store is the transcript of record: an acknowledged

@@ -106,7 +106,7 @@ export async function startWebConsole(options: StartWebOptions): Promise<Running
   const watchdogConfigProvider = cachedConfigProvider(options.configPath);
   const log = options.log ?? (() => {});
   let loggedWatchdogFindingsError = false;
-  // Needs-attention integration (Task 19): worst per-role watchdog finding,
+  // Needs-attention integration: worst per-role watchdog finding,
   // rebuilt from stored reports. A store hiccup (corrupt state, unreadable
   // report) must never break the fleet list, so it degrades to an empty map
   // and logs once rather than repeating on every poll. status() calls this

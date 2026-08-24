@@ -15,6 +15,10 @@ import {
   archiveTempState, stopTempSupervisor, tempSupervisorLiveness,
 } from './temp-lifecycle.js';
 import { realExec, type Exec } from './exec.js';
+import {
+  daemonIdentityProvisioner, reconcilePermanentRoleIdentities,
+  type IdentityProvisioner,
+} from './creation.js';
 
 /** An install outcome tagged with the role it belongs to. */
 export interface InstallOutcome extends BackendInstallOutcome { role: string }
@@ -28,16 +32,18 @@ export interface OpsDeps {
   /** Test seam for exact detached-supervisor signaling/liveness. */
   kill?(pid: number, signal: NodeJS.Signals | 0): void;
   sleep?(ms: number): Promise<void>;
+  /** Permanent identity reconciliation seam; temporary roles never use this lifecycle. */
+  identityProvisioner?: IdentityProvisioner;
   /**
    * Called the INSTANT a registration is created, before anything else can
    * fail. A creation transaction that learns about registrations only from
    * `up()`'s return value learns nothing when `up()` throws — and the service
-   * it just registered is then invisible to rollback (6.2). Optional: plain
+   * it just registered is then invisible to rollback. Optional: plain
    * `ours-fleet up` has no transaction to tell.
    */
   onInstalled?(outcome: InstallOutcome): void;
   /**
-   * Optional: supervises the single watchdog-scheduler process (Task 10).
+   * Optional: supervises the single watchdog-scheduler process.
    * Absent for callers that predate watchdogs — `up`/`down` must never throw
    * just because this hook is missing.
    */
@@ -105,13 +111,15 @@ export async function up(
 ): Promise<InstallOutcome[]> {
   const outcomes: InstallOutcome[] = [];
   for (const role of selectRoles(cfg, names)) {
-    const dir = applyRole(role, { configPath, identityGuarantee });
+    const guarantee = await reconcilePermanentRoleIdentities(
+      role, deps.identityProvisioner ?? daemonIdentityProvisioner(), deps.log, identityGuarantee);
+    const dir = applyRole(role, { configPath, identityGuarantee: guarantee });
     // Only a *definite* stop boots fresh so the role reads the briefing we just
     // wrote. A running, restarting, or unprobeable role keeps its context —
     // guessing "stopped" from an unanswered probe silently discards a live
     // conversation.
     // An explicit operator `up` is the sanctioned way to release a held-down
-    // role: the still-alive runner polls this file and resumes (3.2).
+    // role: the still-alive runner polls this file and resumes.
     resetRestartLedger(dir);
     const live = await deps.backend.liveness(role.name)
       .catch(e => ({ state: 'unknown' as const, detail: e instanceof Error ? e.message : String(e) }));
@@ -119,7 +127,7 @@ export async function up(
     else if (live.state === 'unknown')
       deps.log(`  ! ${role.name}: liveness unknown, keeping session context — ${live.detail}`);
     // Report what each install actually did, so a creation transaction can undo
-    // only the registrations IT made (6.2). Announced immediately as well as
+    // only the registrations IT made. Announced immediately as well as
     // returned: a later role in this same loop can throw, and the registrations
     // already made must still be undoable.
     const outcome = { ...await deps.backend.install(role.name, deps.binPath), role: role.name };
@@ -144,7 +152,7 @@ function stableStringify(value: unknown): string {
   });
 }
 
-/** sha256 over the resolved enabled-watchdog set, stable regardless of config source order (finding #4). */
+/** SHA-256 over the resolved enabled-watchdog set, stable regardless of config source order. */
 function watchdogFingerprint(enabled: ResolvedWatchdog[]): string {
   const sorted = [...enabled].sort((a, b) => a.name.localeCompare(b.name));
   return createHash('sha256').update(stableStringify(sorted)).digest('hex');
@@ -166,14 +174,14 @@ function writeFingerprint(fingerprint: string): void {
 
 /**
  * Install/start (or stop) the single supervised watchdog-scheduler process
- * (Task 10) to match the config's enabled watchdogs. Runs on every `up`,
+ * to match the config's enabled watchdogs. Runs on every `up`,
  * including a named `up <Role>` — cheap and idempotent, and the alternative
  * (only reconciling on a whole-fleet `up`) would leave a newly-enabled
  * watchdog unscheduled until the next bare `up`. Never throws: a scheduler
  * hiccup must not fail the role installs that already succeeded.
  *
  * Restarts ONLY when something the scheduler actually needs to pick up
- * changed (finding #4): an unconditional `restart()` on every `up` —
+ * changed: an unconditional `restart()` on every `up` —
  * including a named `up <SomeUnrelatedRole>` — interrupted whatever the
  * scheduler was mid-run (a 15s stop timeout can kill a long check without a
  * report). Two independent signals decide: `svc.install()`'s own `changed`
@@ -190,7 +198,7 @@ async function reconcileWatchdogScheduler(cfg: FleetConfig, deps: OpsDeps, confi
   if (!svc) return;
   const enabled = cfg.watchdogs.filter(w => w.enabled);
   try {
-    // Check supervised() before any stop (final review #3): on an
+    // Check supervised() before any stop: on an
     // unsupervised platform/config, the scheduler was never installed, so
     // stopping it is not just a no-op — on Linux, stop() throws for a unit
     // that was never loaded. A watchdog-less fleet must not see that
@@ -209,7 +217,7 @@ async function reconcileWatchdogScheduler(cfg: FleetConfig, deps: OpsDeps, confi
     if (unitChanged || fingerprintChanged) {
       // restart(), not start(): start() is a no-op on an already-active unit,
       // so a config change (new/changed watchdogs) would never reach a
-      // scheduler that's already running (final review #4).
+      // scheduler that's already running.
       await svc.restart();
       deps.log(`↑ watchdogs scheduler (${enabled.map(w => w.name).join(', ')})`);
     } else {
@@ -249,7 +257,7 @@ export async function down(cfg: FleetConfig, names: string[], deps: OpsDeps): Pr
   // Only a whole-fleet `down` (no names) stops the scheduler — stopping one
   // named role is not a decision to stop watching the others (tolerate
   // absence/errors: a never-installed scheduler must not fail `down`).
-  // supervised() gates the call itself (final review #3): on an
+  // supervised() gates the call itself: on an
   // unsupervised platform/config there is nothing installed to stop, and
   // Linux's stop() throws for a unit that was never loaded.
   if (names.length === 0 && deps.watchdogService?.supervised()) {
@@ -265,7 +273,11 @@ export async function restartRoles(
   cfg: FleetConfig, names: string[], deps: OpsDeps, mode: 'keep' | 'fresh', configPath?: string,
 ): Promise<void> {
   for (const role of selectRoles(cfg, names)) {
-    const dir = applyRole(role, { fresh: mode === 'fresh', configPath });
+    const guarantee = await reconcilePermanentRoleIdentities(
+      role, deps.identityProvisioner ?? daemonIdentityProvisioner(), deps.log);
+    const dir = applyRole(role, {
+      fresh: mode === 'fresh', configPath, identityGuarantee: guarantee,
+    });
     resetRestartLedger(dir);                    // explicit restart closes the circuit
     await deps.backend.restart(role.name);
     deps.log(mode === 'fresh'

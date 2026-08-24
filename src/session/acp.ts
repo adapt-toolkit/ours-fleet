@@ -54,7 +54,7 @@ const CANCEL_SETTLE_GRACE_MS = 15_000;
 const CANCEL_TERMINATE_GRACE_MS = 5_000;
 /** A permission no human answered is eventually a decision nobody made. */
 const PERMISSION_TIMEOUT_MS = 10 * 60_000;
-/** Spec §4.3: 10-15 s before a vanished controller triggers the unattended policy. */
+/** Wait 10–15 seconds before a vanished controller triggers the unattended policy. */
 const CONTROLLER_GRACE_MS = 12_000;
 /** Bound safe-boundary waiting without turning a hung tool into cancellation. */
 export const AFTER_TOOL_BOUNDARY_TIMEOUT_MS = 120_000;
@@ -190,7 +190,7 @@ function canonicallyWithin(root: string, candidates: string[]): boolean {
  * Map typed prompt provenance to the conversation ledger's source vocabulary.
  * Only operator-authored local sources may persist prompt bodies; external
  * E2E bodies (owner channel, monitor wakes) and scheduled-loop content are
- * recorded as digest/size placeholders (spec §8.3).
+ * recorded as digest/size placeholders.
  */
 function conversationSource(origin: PromptOrigin | undefined): {
   source: ConversationSource; persistBody: boolean;
@@ -440,7 +440,7 @@ export class AcpSession implements SessionHandle {
   }
 
   /**
-   * Honest restart recovery (spec §5.3): a prompt that was admitted but never
+   * Honest restart recovery: a prompt that was admitted but never
    * started is safe to dispatch again; a turn that had already started may
    * have caused side effects, so it is closed as `unknown_after_restart` —
    * never silently replayed.
@@ -787,7 +787,7 @@ export class AcpSession implements SessionHandle {
    * Durably record a prompt admission BEFORE acceptance is returned. Browser
    * admissions are transactional — a prompt the ledger cannot hold is refused,
    * because an acknowledged-then-lost prompt is worse than an error. Every
-   * other source degrades to best-effort so the agent keeps working (§5.3).
+   * other source degrades to best-effort so the agent keeps working.
    */
   private admitToLedger(
     promptId: string, text: string, queuedBehind: number, options: SubmitPromptOptions,

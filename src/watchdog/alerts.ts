@@ -40,7 +40,7 @@ export function writeLedger(name: string, l: AlertLedger): void {
 }
 
 /**
- * Reconcile rules (spec §5): an `error`-status report carries no role evidence, so the ledger
+ * An `error`-status report carries no role evidence, so the ledger
  * is returned unchanged. For each finding with rank > 0: an existing open entry keeps its
  * `since` and updates `status` on escalation/de-escalation; a new one opens with `since = now`.
  * Any role reported `healthy`/`idle` closes (deletes) its open entry. Every role named in
@@ -76,7 +76,7 @@ export function reconcileLedger(l: AlertLedger, report: WatchdogReport, now: Dat
   return { ...l, open };
 }
 
-/** Ledger's open findings + cooldown, in the shape watch.json's `digest` field carries (Task 7 writes it, run reads it back). */
+/** Ledger open findings and cooldown in the shape carried by watch.json's `digest` field. */
 export function computeDigest(l: AlertLedger, cooldownMs: number, now: Date): WatchManifest['digest'] {
   return {
     cooldown_ms: cooldownMs,
