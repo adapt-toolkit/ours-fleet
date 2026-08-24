@@ -127,6 +127,32 @@ async function removeMemberIdentity(name: string): Promise<void> {
   } catch { /* best-effort cleanup */ }
 }
 
+async function redeemRoomInviteAsMember(
+  member: ExpandedMember, invite: string, roomIdentityCid: string,
+): Promise<void> {
+  const client = await attachOursClient({
+    env: process.env,
+    leaseToken: `ours-fleet-member-admit-${process.pid}-${randomUUID()}`,
+    clientPid: process.pid,
+  });
+  try {
+    const bound = await client.chooseIdentity({ name: member.name, force: false });
+    if (bound.cid.toLowerCase() !== member.cid.toLowerCase()) {
+      throw new Error(
+        `member ${member.name} identity CID mismatch: expected ${member.cid}, found ${bound.cid}`,
+      );
+    }
+    const added = await client.addContact({ invite });
+    if (added.cid.toLowerCase() !== roomIdentityCid.toLowerCase()) {
+      throw new Error(
+        `member ${member.name} invite resolved to ${added.cid}; expected room ${roomIdentityCid}`,
+      );
+    }
+  } finally {
+    await client.releaseLease().catch(() => {});
+  }
+}
+
 function settingsFor(member: ExpandedMember, cfg: FleetConfig): MemberSettings {
   let refRole;
   try { refRole = findRole(cfg, member.roleRef); } catch { /* no ref role */ }
@@ -453,9 +479,20 @@ export async function provisionMembers(
         role: coworkRole, min_accepts: group.length,
       });
       for (const member of group) {
-        await cowork.acceptInvite(roomId, invite, {
-          role: coworkRole, expected_cid: member.cid,
-        });
+        await redeemRoomInviteAsMember(member, invite, existing.room_identity_cid);
+      }
+      // Reconciliation attributes newly authenticated contacts to the one live
+      // invite. Complete this group before another role descriptor is minted.
+      const reconciled = await cowork.recoverRoom(roomId);
+      for (const member of group) {
+        const seat = reconciled.seats.find(candidate =>
+          candidate.identity_cid === member.cid && candidate.seat_state !== 'removed');
+        if (!seat) {
+          throw new Error(`Cowork did not authenticate member ${member.name} after invite redemption`);
+        }
+        if (seat.role !== coworkRole) {
+          throw new Error(`Cowork seat ${member.cid} has role ${seat.role}; expected ${coworkRole}`);
+        }
       }
     }
   } catch (error) {

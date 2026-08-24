@@ -136,7 +136,7 @@ describe('Cowork management-socket adapter', () => {
       methods.push(method);
       if (method === 'room.list') return [room({ state: 'active' })];
       if (method === 'room.participants') return [{ identity: 'C'.repeat(64), role: 'Developer', state: 'active' }];
-      if (method === 'room.show') return room({
+      if (method === 'room.reconcile') return room({
         state: 'active',
         role_briefings: {
           Reviewer: { text: 'Exact current charter', version: 4, updated_at: '2026-08-24T00:00:00Z' },
@@ -165,7 +165,7 @@ describe('Cowork management-socket adapter', () => {
     await adapter.closeRoom('01ABCDEF0123456789ABCDEFGH');
     await adapter.deleteRoom('01ABCDEF0123456789ABCDEFGH');
     expect(methods).toEqual([
-      'room.list', 'room.participants', 'room.show', 'room.close', 'room.delete',
+      'room.list', 'room.participants', 'room.reconcile', 'room.close', 'room.delete',
     ]);
   });
 
