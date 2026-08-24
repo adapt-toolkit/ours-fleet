@@ -129,13 +129,50 @@ describe('Cowork management-socket adapter', () => {
     )).resolves.toEqual({ seat_cid: 'B'.repeat(64), seat_state: 'pending' });
   });
 
+  it('negotiates exact provenance and retains Cowork invite IDs', async () => {
+    const socketPath = await rpcServer(request => {
+      if (request.method === 'room.capabilities') {
+        expect(request.params).toEqual({ room_id: '01ABCDEF0123456789ABCDEFGH' });
+        return { admission_provenance: 'exact_invite_id' };
+      }
+      expect(request).toMatchObject({
+        method: 'room.invite',
+        params: {
+          room_id: '01ABCDEF0123456789ABCDEFGH',
+          mode: 'public', role: 'Developer', min_accepts: 2,
+        },
+      });
+      return {
+        blob: 'secret-room-invite',
+        invite: { invite_id: 'invite-developers', min_accepts: 2 },
+      };
+    });
+    const adapter = createCoworkAdapter({ socketPath });
+    await expect(adapter.getAdmissionCapabilities('01ABCDEF0123456789ABCDEFGH'))
+      .resolves.toEqual({ admission_provenance: 'exact_invite_id' });
+    await expect(adapter.issueInvite('01ABCDEF0123456789ABCDEFGH', {
+      role: 'Developer', min_accepts: 2,
+    })).resolves.toEqual({
+      invite: 'secret-room-invite', invite_id: 'invite-developers', min_accepts: 2,
+    });
+  });
+
+  it('fails closed on an unrecognized admission provenance capability', async () => {
+    const socketPath = await rpcServer(() => ({ admission_provenance: 'timing_guess' }));
+    await expect(createCoworkAdapter({ socketPath }).getAdmissionCapabilities(
+      '01ABCDEF0123456789ABCDEFGH',
+    )).rejects.toThrow(/admission_provenance is invalid/);
+  });
+
   it('uses Cowork as source of truth for list, participants, recovery, close, and delete', async () => {
     const methods: string[] = [];
     const socketPath = await rpcServer(request => {
       const method = String(request.method);
       methods.push(method);
       if (method === 'room.list') return [room({ state: 'active' })];
-      if (method === 'room.participants') return [{ identity: 'C'.repeat(64), role: 'Developer', state: 'active' }];
+      if (method === 'room.participants') return [{
+        identity: 'C'.repeat(64), role: 'Developer', state: 'active', invite_id: 'invite-c',
+      }];
       if (method === 'room.reconcile') return room({
         state: 'active',
         role_briefings: {
@@ -154,7 +191,10 @@ describe('Cowork management-socket adapter', () => {
     const adapter = createCoworkAdapter({ socketPath });
     expect((await adapter.listRooms())[0]?.state).toBe('active');
     expect(await adapter.getSeats('01ABCDEF0123456789ABCDEFGH')).toEqual([
-      { identity_cid: 'C'.repeat(64), role: 'Developer', seat_state: 'active' },
+      {
+        identity_cid: 'C'.repeat(64), role: 'Developer', seat_state: 'active',
+        invite_id: 'invite-c',
+      },
     ]);
     expect(await adapter.recoverRoom('01ABCDEF0123456789ABCDEFGH')).toMatchObject({
       state: 'active',

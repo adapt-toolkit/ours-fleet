@@ -104,36 +104,52 @@ function mockCoworkAdapter(opts?: {
   issueInviteFail?: boolean;
   acceptInviteFail?: boolean;
   acknowledgeBriefings?: boolean;
-  initialSeats?: Array<{ cid: string; role: string }>;
+  initialSeats?: Array<{ cid: string; role: string; invite_id?: string }>;
   relayStatus?: 'queued' | 'send_failed';
   setBriefingFail?: boolean;
   initialRoleBriefings?: Array<{ role: string; text: string; version: number }>;
   historyPrefixRawCount?: number;
   endlessRawBacklog?: boolean;
+  admissionProvenance?: 'exact_invite_id' | 'legacy_unattributed';
+  redemptionInviteId?: string;
+  observedInviteId?: string;
 }): CoworkAdapter {
   invitesIssued = [];
   let inviteSeq = 0;
   let briefingSeq = 0;
   const admitted = new Map<string, string>();
-  for (const seat of opts?.initialSeats ?? []) admitted.set(seat.cid, seat.role);
+  const admittedInvites = new Map<string, string>();
+  const inviteRoles = new Map<string, { inviteId: string; role: string }>();
+  for (const seat of opts?.initialSeats ?? []) {
+    admitted.set(seat.cid, seat.role);
+    admittedInvites.set(seat.cid, seat.invite_id ?? 'invite-1');
+  }
   const briefings = new Map<string, { text: string; version: number }>();
   for (const briefing of opts?.initialRoleBriefings ?? [])
     briefings.set(briefing.role, { text: briefing.text, version: briefing.version });
   return {
     available: vi.fn().mockResolvedValue(true),
+    getAdmissionCapabilities: vi.fn().mockResolvedValue({
+      admission_provenance: opts?.admissionProvenance ?? 'exact_invite_id',
+    }),
     createRoom: vi.fn().mockResolvedValue({
       room_id: 'room-test', identity_name: 'room-id', identity_cid: 'room-cid',
     }),
     issueInvite: vi.fn().mockImplementation(async (_roomId, inviteOpts) => {
       if (opts?.issueInviteFail) throw new Error('invite issuance failed');
       const invite = `secret-invite-${++inviteSeq}`;
+      const inviteId = `invite-${inviteSeq}`;
       invitesIssued.push(invite);
+      inviteRoles.set(invite, { inviteId, role: inviteOpts.role });
       mocks.onRedeem.mockImplementation((name: string, redeemed: string) => {
-        if (redeemed !== invite) throw new Error('unexpected invite redemption');
+        const metadata = inviteRoles.get(redeemed);
+        if (!metadata) throw new Error('unexpected invite redemption');
         const cid = mocks.identities.get(name) ?? 'cid-001';
-        admitted.set(cid, inviteOpts.role);
+        admitted.set(cid, metadata.role);
+        admittedInvites.set(cid, opts?.observedInviteId ?? metadata.inviteId);
+        return opts?.redemptionInviteId ?? metadata.inviteId;
       });
-      return { invite, min_accepts: inviteOpts.min_accepts };
+      return { invite, invite_id: inviteId, min_accepts: inviteOpts.min_accepts };
     }),
     acceptInvite: vi.fn().mockImplementation(async (_roomId, _invite, acceptOpts) => {
       if (opts?.acceptInviteFail) throw new Error('accept failed');
@@ -225,6 +241,7 @@ function mockCoworkAdapter(opts?: {
         room_name: 'Test', state: 'active' as const,
         seats: [...admitted].map(([identity_cid, role]) => ({
           identity_cid, role, seat_state: 'active' as const,
+          invite_id: admittedInvites.get(identity_cid),
         })),
         role_briefings: Object.fromEntries([...roles].flatMap(role => {
           const briefing = briefings.get(role);
@@ -245,6 +262,7 @@ function mockCoworkAdapter(opts?: {
         identity_cid,
         role,
         seat_state: 'active' as const,
+        invite_id: admittedInvites.get(identity_cid),
       }));
     }),
     recoverRoom: vi.fn().mockImplementation(async roomId => ({
@@ -252,6 +270,7 @@ function mockCoworkAdapter(opts?: {
       room_name: 'Test', state: 'active',
       seats: [...admitted].map(([identity_cid, role]) => ({
         identity_cid, role, seat_state: 'active' as const,
+        invite_id: admittedInvites.get(identity_cid),
       })),
       role_briefings: {},
     })),
@@ -315,8 +334,8 @@ beforeEach(() => {
         return { name, cid: mocks.identities.get(name) ?? 'cid-001' };
       }),
       addContact: vi.fn(async ({ invite }: { invite: string }) => {
-        mocks.onRedeem(boundName, invite);
-        return { cid: 'room-cid', display: 'Room' };
+        const inviteId = mocks.onRedeem(boundName, invite);
+        return { cid: 'room-cid', display: 'Room', inviteId };
       }),
     };
   });
@@ -436,8 +455,8 @@ describe('provision saga', () => {
     });
   });
 
-  describe('serial role-group admission', () => {
-    it('issues one invite per cowork role, not per member', async () => {
+  describe('concurrent exact-provenance admission', () => {
+    it('admits a multi-role team concurrently with one exact invite per role', async () => {
       const template = makeTemplate([
         { slot: 'dev', role: 'Developer', count: 2, role_ref: 'Dev' },
         { slot: 'reviewer', role: 'Reviewer', count: 1, role_ref: 'Rev' },
@@ -463,9 +482,65 @@ describe('provision saga', () => {
       expect(cowork.acceptInvite).not.toHaveBeenCalled();
       expect(mocks.onRedeem).toHaveBeenCalledTimes(3);
       const issueOrder = (cowork.issueInvite as ReturnType<typeof vi.fn>).mock.invocationCallOrder;
+      const redeemOrder = mocks.onRedeem.mock.invocationCallOrder;
       const reconcileOrder = (cowork.recoverRoom as ReturnType<typeof vi.fn>).mock.invocationCallOrder;
-      expect(issueOrder[0]).toBeLessThan(reconcileOrder[0]);
-      expect(reconcileOrder[0]).toBeLessThan(issueOrder[1]);
+      expect(issueOrder[1]).toBeLessThan(redeemOrder[0]);
+      expect(redeemOrder.at(-1)).toBeLessThan(reconcileOrder[0]);
+    });
+
+    it('admits a two-role pair without serializing either invite', async () => {
+      const cowork = mockCoworkAdapter();
+      createProvisionRoom({ room_id: 'room-pair', room_name: 'Pair' });
+
+      await provisionMembers({
+        cfg: minimalCfg(), cowork, roomId: 'room-pair',
+        template: makeTemplate([
+          { slot: 'builder', role: 'Builder', count: 1, role_ref: 'Build' },
+          { slot: 'reviewer', role: 'Reviewer', count: 1, role_ref: 'Review' },
+        ]),
+        binPath: '/usr/bin/ours-fleet',
+      });
+
+      const issues = (cowork.issueInvite as ReturnType<typeof vi.fn>).mock.invocationCallOrder;
+      const redeems = mocks.onRedeem.mock.invocationCallOrder;
+      expect(issues).toHaveLength(2);
+      expect(issues[1]).toBeLessThan(redeems[0]);
+      expect(cowork.recoverRoom).toHaveBeenCalledTimes(1);
+    });
+
+    it('fails closed before minting an invite when exact provenance is unavailable', async () => {
+      const cowork = mockCoworkAdapter({ admissionProvenance: 'legacy_unattributed' });
+      createProvisionRoom({ room_id: 'room-legacy', room_name: 'Legacy' });
+
+      await expect(provisionMembers({
+        cfg: minimalCfg(), cowork, roomId: 'room-legacy', template: makeTemplate(),
+        binPath: '/usr/bin/ours-fleet',
+      })).rejects.toThrow(/refusing ambiguous room admission/);
+
+      expect(cowork.issueInvite).not.toHaveBeenCalled();
+      expect(mocks.onRedeem).not.toHaveBeenCalled();
+    });
+
+    it('rejects a member redemption that does not echo the retained invite ID', async () => {
+      const cowork = mockCoworkAdapter({ redemptionInviteId: 'different-invite' });
+      createProvisionRoom({ room_id: 'room-redeem-mismatch', room_name: 'Mismatch' });
+
+      await expect(provisionMembers({
+        cfg: minimalCfg(), cowork, roomId: 'room-redeem-mismatch', template: makeTemplate(),
+        binPath: '/usr/bin/ours-fleet',
+      })).rejects.toThrow(/redeemed invite different-invite; expected invite-1/);
+
+      expect(cowork.recoverRoom).not.toHaveBeenCalled();
+    });
+
+    it('rejects Cowork observation whose authenticated origin is another invite', async () => {
+      const cowork = mockCoworkAdapter({ observedInviteId: 'different-invite' });
+      createProvisionRoom({ room_id: 'room-origin-mismatch', room_name: 'Mismatch' });
+
+      await expect(provisionMembers({
+        cfg: minimalCfg(), cowork, roomId: 'room-origin-mismatch', template: makeTemplate(),
+        binPath: '/usr/bin/ours-fleet',
+      })).rejects.toThrow(/admission provenance mismatch/);
     });
   });
 
@@ -702,7 +777,7 @@ describe('provision saga', () => {
       });
       updateMemberSeats('room-intent-gap', [{
         role_name: roleName, identity_cid: 'cid-001', slot: 'dev',
-        cowork_role: 'Developer', seat_state: 'active',
+        cowork_role: 'Developer', seat_state: 'active', admission_invite_id: 'invite-1',
         launch: {
           state: 'intent', attempt: 1, action_id: 'action-crash',
           mission_sha256: '0'.repeat(64), updated_at: '2026-08-24T00:00:00.000Z',
@@ -753,7 +828,7 @@ describe('provision saga', () => {
       mocks.mockArchiveForAction.mockReturnValueOnce({ path: archive, launchId: `launch-${roleName}` });
       updateMemberSeats('room-intent-archive', [{
         role_name: roleName, identity_cid: 'cid-001', slot: 'dev',
-        cowork_role: 'Developer', seat_state: 'active',
+        cowork_role: 'Developer', seat_state: 'active', admission_invite_id: 'invite-1',
         launch: {
           state: 'intent', attempt: 1, action_id: 'action-archived',
           mission_sha256: sha256Text(mission), updated_at: '2026-08-24T00:00:00.000Z',

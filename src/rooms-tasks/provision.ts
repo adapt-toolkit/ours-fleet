@@ -128,7 +128,7 @@ async function removeMemberIdentity(name: string): Promise<void> {
 }
 
 async function redeemRoomInviteAsMember(
-  member: ExpandedMember, invite: string, roomIdentityCid: string,
+  member: ExpandedMember, invite: string, inviteId: string, roomIdentityCid: string,
 ): Promise<void> {
   const client = await attachOursClient({
     env: process.env,
@@ -142,10 +142,17 @@ async function redeemRoomInviteAsMember(
         `member ${member.name} identity CID mismatch: expected ${member.cid}, found ${bound.cid}`,
       );
     }
-    const added = await client.addContact({ invite });
+    const added = await client.addContact({ invite }) as Awaited<
+      ReturnType<OursClient['addContact']>
+    > & { inviteId?: string };
     if (added.cid.toLowerCase() !== roomIdentityCid.toLowerCase()) {
       throw new Error(
         `member ${member.name} invite resolved to ${added.cid}; expected room ${roomIdentityCid}`,
+      );
+    }
+    if (added.inviteId !== inviteId) {
+      throw new Error(
+        `member ${member.name} redeemed invite ${added.inviteId ?? 'without provenance'}; expected ${inviteId}`,
       );
     }
   } finally {
@@ -322,6 +329,7 @@ export async function provisionMembers(
   const existing = getRoomRecord(roomId);
   if (!existing?.room_identity_cid)
     throw new Error(`room ${roomId} has no pinned room identity CID`);
+  const roomIdentityCid = existing.room_identity_cid;
   const persistedSeats = existing?.member_seats ?? [];
   const resuming = plan.length > 0
     && plan.every(p => persistedSeats.some(s => s.role_name === p.name));
@@ -457,14 +465,33 @@ export async function provisionMembers(
     }
   }
 
+  const policy: StartupWaitPolicy = {
+    timeoutMs: input.startupWait?.timeoutMs ?? 60_000,
+    initialDelayMs: input.startupWait?.initialDelayMs ?? 250,
+    maxDelayMs: input.startupWait?.maxDelayMs ?? 2_000,
+    now: input.startupWait?.now ?? Date.now,
+    sleep: input.startupWait?.sleep ?? (ms => new Promise(resolve => setTimeout(resolve, ms))),
+  };
   advanceSaga(roomId, 'join_role_groups', 5);
   try {
+    const capabilities = await cowork.getAdmissionCapabilities(roomId);
+    if (capabilities.admission_provenance !== 'exact_invite_id') {
+      throw new Error(
+        'Cowork does not provide exact authenticated invite provenance; refusing ambiguous room admission',
+      );
+    }
     const observedSeats = await cowork.getSeats(roomId);
     for (const member of members) {
       const observed = observedSeats.find(seat => seat.identity_cid === member.cid
         && seat.seat_state !== 'removed');
-      if (observed && observed.role !== member.coworkRole)
+      if (!observed) continue;
+      if (observed.role !== member.coworkRole)
         throw new Error(`Cowork seat ${member.cid} has role ${observed.role}; expected ${member.coworkRole}`);
+      const persisted = seats.find(seat => seat.role_name === member.name)!;
+      if (!persisted.admission_invite_id
+          || observed.invite_id !== persisted.admission_invite_id) {
+        throw new Error(`Cowork admission provenance mismatch for existing member ${member.name}`);
+      }
     }
     const admitted = new Set(observedSeats
       .filter(seat => seat.seat_state !== 'removed').map(seat => seat.identity_cid));
@@ -474,26 +501,49 @@ export async function provisionMembers(
         ...(roleGroups.get(member.coworkRole) ?? []), member,
       ]);
     }
-    for (const [coworkRole, group] of roleGroups) {
-      const { invite } = await cowork.issueInvite(roomId, {
+    const admissions = await Promise.all([...roleGroups].map(async ([coworkRole, group]) => {
+      const issued = await cowork.issueInvite(roomId, {
         role: coworkRole, min_accepts: group.length,
       });
-      for (const member of group) {
-        await redeemRoomInviteAsMember(member, invite, existing.room_identity_cid);
-      }
-      // Reconciliation attributes newly authenticated contacts to the one live
-      // invite. Complete this group before another role descriptor is minted.
+      return { coworkRole, group, ...issued };
+    }));
+    const inviteByMember = new Map(admissions.flatMap(admission =>
+      admission.group.map(member => [member.name, admission.invite_id] as const)));
+    seats = seats.map(seat => ({
+      ...seat,
+      ...(inviteByMember.has(seat.role_name)
+        ? { admission_invite_id: inviteByMember.get(seat.role_name)! } : {}),
+    }));
+    updateMemberSeats(roomId, seats);
+    await Promise.all(admissions.flatMap(admission => admission.group.map(member =>
+      redeemRoomInviteAsMember(
+        member, admission.invite, admission.invite_id, roomIdentityCid,
+      ))));
+    const admissionDeadline = policy.now() + policy.timeoutMs;
+    let admissionDelay = policy.initialDelayMs;
+    for (;;) {
       const reconciled = await cowork.recoverRoom(roomId);
-      for (const member of group) {
-        const seat = reconciled.seats.find(candidate =>
-          candidate.identity_cid === member.cid && candidate.seat_state !== 'removed');
-        if (!seat) {
-          throw new Error(`Cowork did not authenticate member ${member.name} after invite redemption`);
-        }
-        if (seat.role !== coworkRole) {
-          throw new Error(`Cowork seat ${member.cid} has role ${seat.role}; expected ${coworkRole}`);
+      let waiting = false;
+      for (const admission of admissions) {
+        for (const member of admission.group) {
+          const seat = reconciled.seats.find(candidate =>
+            candidate.identity_cid === member.cid && candidate.seat_state !== 'removed');
+          if (!seat) { waiting = true; continue; }
+          if (seat.role !== admission.coworkRole || seat.invite_id !== admission.invite_id) {
+            throw new Error(
+              `Cowork admission provenance mismatch for member ${member.name}`,
+            );
+          }
         }
       }
+      if (!waiting) break;
+      if (policy.now() >= admissionDeadline) {
+        throw new Error('Cowork did not observe every authenticated room invite redemption');
+      }
+      await policy.sleep(admissionDelay);
+      admissionDelay = Math.min(
+        policy.maxDelayMs, Math.max(admissionDelay + 1, admissionDelay * 2),
+      );
     }
   } catch (error) {
     setSagaError(roomId, error instanceof Error ? error.message : String(error),
@@ -544,13 +594,6 @@ export async function provisionMembers(
     throw error;
   }
 
-  const policy: StartupWaitPolicy = {
-    timeoutMs: input.startupWait?.timeoutMs ?? 60_000,
-    initialDelayMs: input.startupWait?.initialDelayMs ?? 250,
-    maxDelayMs: input.startupWait?.maxDelayMs ?? 2_000,
-    now: input.startupWait?.now ?? Date.now,
-    sleep: input.startupWait?.sleep ?? (ms => new Promise(resolve => setTimeout(resolve, ms))),
-  };
   const deadline = policy.now() + policy.timeoutMs;
   let delay = policy.initialDelayMs;
   for (;;) {

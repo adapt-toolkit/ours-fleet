@@ -29,6 +29,7 @@ export interface CoworkInviteAcceptResult {
 
 export interface CoworkInviteResult {
   invite: string;
+  invite_id: string;
   min_accepts: number;
 }
 
@@ -36,6 +37,11 @@ export interface CoworkSeatInfo {
   identity_cid: string;
   role: string;
   seat_state: 'pending' | 'active' | 'removed';
+  invite_id?: string;
+}
+
+export interface CoworkAdmissionCapabilities {
+  admission_provenance: 'exact_invite_id' | 'legacy_unattributed';
 }
 
 export interface CoworkRoomInfo {
@@ -65,6 +71,7 @@ export interface CoworkHistoryPage {
 
 export interface CoworkAdapter {
   available(): Promise<boolean>;
+  getAdmissionCapabilities(roomId: string): Promise<CoworkAdmissionCapabilities>;
   createRoom(opts: {
     room_name: string;
     goal: string;
@@ -161,6 +168,9 @@ function projectSeat(value: unknown, operation: string): CoworkSeatInfo {
     identity_cid: string(seat.identity, operation, 'seat.identity'),
     role: string(seat.role, operation, 'seat.role'),
     seat_state: seatState(seat.state, operation),
+    ...(seat.invite_id === undefined ? {} : {
+      invite_id: string(seat.invite_id, operation, 'seat.invite_id'),
+    }),
   };
 }
 
@@ -388,6 +398,18 @@ export function createCoworkAdapter(options: CoworkAdapterOptions = {}): CoworkA
     async available() {
       try { await call('room.list', {}); return true; } catch { return false; }
     },
+    async getAdmissionCapabilities(roomId) {
+      const result = object(await call('room.capabilities', {
+        room_id: roomId,
+      }), 'room.capabilities', 'capabilities');
+      if (result.admission_provenance !== 'exact_invite_id'
+          && result.admission_provenance !== 'legacy_unattributed') {
+        throw new CoworkProtocolError(
+          'room.capabilities', 'capabilities.admission_provenance is invalid',
+        );
+      }
+      return { admission_provenance: result.admission_provenance };
+    },
     async createRoom(opts) {
       const result = projectRoom(await call('room.create', {
         name: opts.room_name,
@@ -424,6 +446,7 @@ export function createCoworkAdapter(options: CoworkAdapterOptions = {}): CoworkA
       const invite = object(receipt.invite, 'room.invite', 'receipt.invite');
       return {
         invite: string(receipt.blob, 'room.invite', 'receipt.blob'),
+        invite_id: string(invite.invite_id, 'room.invite', 'receipt.invite.invite_id'),
         min_accepts: typeof invite.min_accepts === 'number'
           ? invite.min_accepts : opts.min_accepts,
       };

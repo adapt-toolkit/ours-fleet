@@ -206,6 +206,8 @@ export interface RoomMemberSeat {
   slot: string;
   cowork_role: string;
   seat_state: 'pending' | 'active' | 'removed';
+  /** Non-secret Cowork descriptor retained for exact authenticated admission recovery. */
+  admission_invite_id?: string;
   launch?: RoomMemberLaunchState;
   briefing?: RoomMemberBriefingState;
   retirement?: MemberRetirement;
