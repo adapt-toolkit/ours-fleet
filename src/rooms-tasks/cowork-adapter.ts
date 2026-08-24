@@ -29,6 +29,7 @@ export interface CoworkInviteAcceptResult {
 
 export interface CoworkInviteResult {
   invite: string;
+  invite_id: string;
   min_accepts: number;
 }
 
@@ -80,6 +81,7 @@ export interface CoworkAdapter {
     role: string;
     min_accepts: number;
   }): Promise<CoworkInviteResult>;
+  revokeInvite(roomId: string, inviteId: string): Promise<void>;
   setRoleBriefing(roomId: string, opts: {
     role: string;
     text: string;
@@ -424,9 +426,13 @@ export function createCoworkAdapter(options: CoworkAdapterOptions = {}): CoworkA
       const invite = object(receipt.invite, 'room.invite', 'receipt.invite');
       return {
         invite: string(receipt.blob, 'room.invite', 'receipt.blob'),
+        invite_id: string(invite.invite_id, 'room.invite', 'receipt.invite.invite_id'),
         min_accepts: typeof invite.min_accepts === 'number'
           ? invite.min_accepts : opts.min_accepts,
       };
+    },
+    async revokeInvite(roomId, inviteId) {
+      await call('room.revoke', { room_id: roomId, invite_id: inviteId });
     },
     async setRoleBriefing(roomId, opts) {
       const result = object(await call('room.briefing.role.set', {

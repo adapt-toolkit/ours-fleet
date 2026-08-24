@@ -129,6 +129,36 @@ describe('Cowork management-socket adapter', () => {
     )).resolves.toEqual({ seat_cid: 'B'.repeat(64), seat_state: 'pending' });
   });
 
+  it('returns Cowork invite IDs and revokes through the existing room.revoke route', async () => {
+    const methods: string[] = [];
+    const socketPath = await rpcServer(request => {
+      methods.push(String(request.method));
+      if (request.method === 'room.invite') return {
+        blob: 'secret-role-invite',
+        invite: { invite_id: 'invite-existing-contract', min_accepts: 2 },
+      };
+      if (request.method === 'room.revoke') {
+        expect(request.params).toEqual({
+          room_id: '01ABCDEF0123456789ABCDEFGH',
+          invite_id: 'invite-existing-contract',
+        });
+        return { invite_id: 'invite-existing-contract', state: 'revoked' };
+      }
+      throw new Error(`unexpected ${String(request.method)}`);
+    });
+    const adapter = createCoworkAdapter({ socketPath });
+
+    await expect(adapter.issueInvite('01ABCDEF0123456789ABCDEFGH', {
+      role: 'Developer', min_accepts: 2,
+    })).resolves.toEqual({
+      invite: 'secret-role-invite', invite_id: 'invite-existing-contract', min_accepts: 2,
+    });
+    await expect(adapter.revokeInvite(
+      '01ABCDEF0123456789ABCDEFGH', 'invite-existing-contract',
+    )).resolves.toBeUndefined();
+    expect(methods).toEqual(['room.invite', 'room.revoke']);
+  });
+
   it('uses Cowork as source of truth for list, participants, recovery, close, and delete', async () => {
     const methods: string[] = [];
     const socketPath = await rpcServer(request => {

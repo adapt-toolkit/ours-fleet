@@ -315,6 +315,79 @@ afterEach(() => {
 
 // ── task work ────────────────────────────────────────────────────────────
 
+describe('task title to Cowork room naming', () => {
+  const unicodeTitle = 'Релиз 🚀 — 東京 / naïve café';
+
+  function expectExactRoomName(): void {
+    expect(mocks.createRoom).toHaveBeenCalledWith(expect.objectContaining({
+      room_name: unicodeTitle,
+    }));
+    expect(getRoomRecord(ROOM_ID)?.room_name).toBe(unicodeTitle);
+  }
+
+  it('preserves an immediate task create title exactly', async () => {
+    await run('create', '--title', unicodeTitle, '--json');
+    expect(JSON.parse(out.join('\n')).task.title).toBe(unicodeTitle);
+    expectExactRoomName();
+  });
+
+  it('preserves a backlog title exactly when task start creates its room', async () => {
+    await run('create', '--title', unicodeTitle, '--backlog', '--json');
+    const taskId = JSON.parse(out.join('\n')).task.task_id as string;
+    out = [];
+    mocks.createRoom.mockClear();
+    await run('start', taskId, '--json');
+    expect(JSON.parse(out.join('\n')).task.title).toBe(unicodeTitle);
+    expectExactRoomName();
+  });
+
+  it('preserves a backlog title exactly when task work creates its room', async () => {
+    const task = createTask({
+      title: unicodeTitle, origin: { type: 'cli' }, no_room: true, start: false,
+    });
+    await run('work', task.task_id, '--json');
+    expect(JSON.parse(out.join('\n')).task.title).toBe(unicodeTitle);
+    expectExactRoomName();
+  });
+});
+
+describe('decomposed task title to Cowork room naming', () => {
+  const decomposedTitle = 'Cafe\u0301 release — A\u030Angstro\u0308m';
+
+  function expectExactDecomposedRoomName(): void {
+    expect(decomposedTitle).not.toBe(decomposedTitle.normalize('NFC'));
+    expect(mocks.createRoom).toHaveBeenCalledWith(expect.objectContaining({
+      room_name: decomposedTitle,
+    }));
+    expect(getRoomRecord(ROOM_ID)?.room_name).toBe(decomposedTitle);
+  }
+
+  it('preserves decomposed code points through task create and room create', async () => {
+    await run('create', '--title', decomposedTitle, '--json');
+    expect(JSON.parse(out.join('\n')).task.title).toBe(decomposedTitle);
+    expectExactDecomposedRoomName();
+  });
+
+  it('preserves decomposed code points when task start creates the room', async () => {
+    await run('create', '--title', decomposedTitle, '--backlog', '--json');
+    const taskId = JSON.parse(out.join('\n')).task.task_id as string;
+    out = [];
+    mocks.createRoom.mockClear();
+    await run('start', taskId, '--json');
+    expect(JSON.parse(out.join('\n')).task.title).toBe(decomposedTitle);
+    expectExactDecomposedRoomName();
+  });
+
+  it('preserves decomposed code points when task work creates the room', async () => {
+    const task = createTask({
+      title: decomposedTitle, origin: { type: 'cli' }, no_room: true, start: false,
+    });
+    await run('work', task.task_id, '--json');
+    expect(JSON.parse(out.join('\n')).task.title).toBe(decomposedTitle);
+    expectExactDecomposedRoomName();
+  });
+});
+
 describe('task work', () => {
   it('takes a backlog task to active with a provisioned room', async () => {
     const t = backlogTask();
