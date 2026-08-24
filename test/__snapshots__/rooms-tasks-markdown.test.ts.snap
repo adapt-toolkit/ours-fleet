@@ -1,0 +1,71 @@
+// Vitest Snapshot v1, https://vitest.dev/guide/snapshot.html
+
+exports[`task/room Markdown primitives > maps every declared state to an icon and word, with a runtime fallback 1`] = `
+[
+  "⏸️ Backlog",
+  "⏳ Provisioning",
+  "🟢 Active",
+  "🟡 Review",
+  "✅ Done",
+  "🚫 Cancelled",
+  "❌ Failed",
+]
+`;
+
+exports[`task/room Markdown primitives > maps every declared state to an icon and word, with a runtime fallback 2`] = `
+[
+  "⏳ Provisioning",
+  "🟢 Active",
+  "⏳ Closing",
+  "🔒 Closed",
+]
+`;
+
+exports[`task/room Markdown renderers > snapshots a compact structured result and actionable failure 1`] = `
+"## 📋 Task details
+
+- **ID:** \`\`task\`one\`\`
+
+- **Title:** Fix \\*parser\\* \\[now\\]
+
+- **Status:** 🟢 Active
+
+**Summary:**
+
+> line one
+> line \\> two
+
+### Next steps
+- Run /task review task-one."
+`;
+
+exports[`task/room Markdown renderers > snapshots a compact structured result and actionable failure 2`] = `
+"## ⚠️ Not found
+
+- **Command:** \`/task show missing\`
+
+- **Reason:** Task was not found.
+
+### Next step
+- Run /task list to find a valid task ID."
+`;
+
+exports[`task/room Markdown renderers > snapshots zero, one, and many list results 1`] = `
+"## 📋 Tasks
+
+No tasks found."
+`;
+
+exports[`task/room Markdown renderers > snapshots zero, one, and many list results 2`] = `
+"## 📋 Tasks
+
+- 🟢 Active \`task-one\` — Fix parser"
+`;
+
+exports[`task/room Markdown renderers > snapshots zero, one, and many list results 3`] = `
+"## 🏠 Rooms
+
+- 🟢 Active \`room-one\` — Alpha
+
+- ⏳ Closing \`room-two\` — Beta"
+`;

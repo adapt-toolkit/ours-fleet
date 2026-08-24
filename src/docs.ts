@@ -337,6 +337,14 @@ tasks:
   close_room_on_done: true
 \`\`\`
 
+Human task and room results use the same compact Markdown presentation in the
+CLI and authenticated owner channel: a short heading, icon-plus-word status,
+code-formatted identifiers, bounded summaries, and actionable recovery or error
+steps. Untrusted prose is context-escaped and control characters are neutralized;
+Messenger-bound results are capped at 3,500 Unicode code points and 12,000 UTF-8
+bytes with structural omission notices. \`--json\` bypasses this presentation layer
+and retains the versioned machine schema and serialization order.
+
 Older prerelease files with the exact legacy \`provider: cowork\` key under
 \`rooms:\` still load, but the key is ignored and omitted from resolved
 configuration. Remove it when editing the file. Any other legacy value is an

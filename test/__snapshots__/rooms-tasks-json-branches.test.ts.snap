@@ -1,0 +1,101 @@
+// Vitest Snapshot v1, https://vitest.dev/guide/snapshot.html
+
+exports[`task/room JSON presentation contract > pins every room --json serializer branch exactly and before Markdown rendering 1`] = `
+[
+  "if (opts.json) {
+          console.log(JSON.stringify({ schema_version: 1, room: record }, null, 2));
+          return;
+        }",
+  "if (opts.json) {
+          console.log(JSON.stringify({ schema_version: 1, rooms }, null, 2));
+          return;
+        }",
+  "if (opts.json) {
+          console.log(JSON.stringify({ schema_version: 1, room: cowork, orchestration: r ?? null }, null, 2));
+          return;
+        }",
+  "if (opts.json) {
+          console.log(JSON.stringify({ schema_version: 1, room_id: id, url, room_name: room.room_name }, null, 2));
+          return;
+        }",
+  "if (opts.json) {
+          console.log(JSON.stringify({
+            schema_version: 1,
+            room_id: id,
+            members,
+            owner_seat_cid: r?.owner_seat_cid ?? null,
+          }, null, 2));
+          return;
+        }",
+  "if (opts.json) {
+          console.log(JSON.stringify({ schema_version: 1, room_id: id, deleted: settled.deleted }, null, 2));
+          return;
+        }",
+  "if (opts.json) {
+            console.log(JSON.stringify({
+              schema_version: 1, room: null, orchestration: null,
+              recovery_actions: [settled.timedOut
+                ? \`Deletion remains pending — retry room delete \${id} \${id}\`
+                : 'Deletion completed successfully'],
+            }, null, 2));
+            return;
+          }",
+  "if (opts.json) {
+          console.log(JSON.stringify({ schema_version: 1, room: cowork, orchestration: r ?? null, recovery_actions: actions }, null, 2));
+          return;
+        }",
+  "if (opts.json) {
+          console.log(JSON.stringify({ schema_version: 1, ...result }, null, 2));
+          return;
+        }",
+]
+`;
+
+exports[`task/room JSON presentation contract > pins every task --json serializer branch exactly and before Markdown rendering 1`] = `
+[
+  "if (opts.json) {
+          console.log(JSON.stringify({ schema_version: 1, task: record }, null, 2));
+          return;
+        }",
+  "if (opts.json) {
+          console.log(JSON.stringify({ schema_version: 1, tasks }, null, 2));
+          return;
+        }",
+  "if (opts.json) {
+          console.log(JSON.stringify({
+            schema_version: 1, task: t, orchestration: room ?? null,
+          }, null, 2));
+          return;
+        }",
+  "if (opts.json) { console.log(JSON.stringify({ schema_version: 1, task: t }, null, 2)); return; }",
+  "if (opts.json) { console.log(JSON.stringify({ schema_version: 1, task: t }, null, 2)); return; }",
+  "if (opts.json) { console.log(JSON.stringify({ schema_version: 1, task: t }, null, 2)); return; }",
+  "if (opts.json) { console.log(JSON.stringify({ schema_version: 1, task: t }, null, 2)); return; }",
+  "if (opts.json) { console.log(JSON.stringify({ schema_version: 1, task: t }, null, 2)); return; }",
+  "if (opts.json) { console.log(JSON.stringify({ schema_version: 1, task: t }, null, 2)); return; }",
+  "if (opts.json) {
+          console.log(JSON.stringify({ schema_version: 1, task_id: id, deleted }, null, 2));
+          return;
+        }",
+  "if (opts.json) {
+          console.log(JSON.stringify({ schema_version: 1, ...result }, null, 2));
+          return;
+        }",
+  "if (opts.json) {
+          console.log(JSON.stringify({ schema_version: 1, task: t }, null, 2));
+          return;
+        }",
+  "if (opts.json) {
+            console.log(JSON.stringify({ schema_version: 1, task: t, status: 'already_active' }, null, 2));
+            return;
+          }",
+  "if (opts.json) {
+          console.log(JSON.stringify({ schema_version: 1, task: t }, null, 2));
+          return;
+        }",
+  "if (opts.json) {
+          console.log(JSON.stringify({ schema_version: 1, task: t }, null, 2));
+          return;
+        }",
+]
+`;

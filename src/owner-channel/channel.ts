@@ -14,6 +14,9 @@ import {
 } from '../session/types.js';
 import { VERSION } from '../version.js';
 import {
+  renderMarkdownFailure, renderMarkdownResult, taskStatus,
+} from '../rooms-tasks/markdown.js';
+import {
   dispatchOwnerCommand, fleetCliOps, isOwnerCommandText,
   type OwnerCommandContext, type OwnerFleetOps,
 } from './commands.js';
@@ -1207,7 +1210,11 @@ export class OwnerChannel implements OwnerChannelHandle {
     const { acceptManagedRoomClose, recordManagedRoomCloseError } =
       await import('../rooms-tasks/close.js');
     await acceptManagedRoomClose(roomId);
-    await this.send(sender.id, `🗑️ Room ${roomId} deletion accepted/pending`, wireId);
+    await this.send(sender.id, renderMarkdownFailure({
+      kind: 'pending', subject: `/room delete ${roomId} ${roomId}`,
+      detail: 'The deletion request was accepted and is still being settled.',
+      action: `Run /room recover ${roomId} if deletion remains pending.`,
+    }), wireId);
     this.state.remember(wireId);
     try {
       await this.fleetOps.closeRoom(roomId);
@@ -1238,11 +1245,21 @@ export class OwnerChannel implements OwnerChannelHandle {
       taskId, kind, roomId: task.room_id, outcome,
     });
     if (accepted.terminal_intent?.status === 'settled') {
-      await this.send(sender.id, `✅ Task ${taskId} → ${accepted.state}`, wireId);
+      await this.send(sender.id, renderMarkdownResult({
+        icon: '📋', title: 'Task terminal action complete',
+        fields: [
+          { label: 'ID', value: taskId, kind: 'code' },
+          { label: 'Status', value: taskStatus(accepted.state), kind: 'markdown' },
+        ],
+      }), wireId);
       this.state.remember(wireId);
       return;
     }
-    await this.send(sender.id, `⏳ Task ${taskId} terminal intent accepted/pending`, wireId);
+    await this.send(sender.id, renderMarkdownFailure({
+      kind: 'pending', subject: `/task ${kind === 'done' ? 'done' : 'cancel'} ${taskId}`,
+      detail: 'The terminal request was accepted and is still being settled.',
+      action: `Run /task recover ${taskId} if it remains pending.`,
+    }), wireId);
     this.state.remember(wireId);
     try {
       await this.fleetOps.settleTask(taskId);

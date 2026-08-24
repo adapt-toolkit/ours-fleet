@@ -27,12 +27,203 @@ import {
 import { createCoworkAdapter, CoworkProtocolError, CoworkUnavailableError } from './cowork-adapter.js';
 import { TASK_CANCELLABLE_STATES, TASK_TERMINAL_STATES } from './types.js';
 import type { RoomOrchestrationRecord, TaskOrigin, TemplateDefinition, TemplateSnapshot } from './types.js';
+import {
+  markdownCode, markdownProse, renderMarkdownFailure, renderMarkdownList,
+  renderMarkdownResult, roomStatus, taskStatus,
+} from './markdown.js';
+
+type TaskRoomPublicErrorCode =
+  | 'task_confirmation_mismatch' | 'room_confirmation_mismatch'
+  | 'task_terminal' | 'task_terminal_already' | 'task_non_resumable'
+  | 'template_not_found' | 'template_mismatch' | 'task_template_drift'
+  | 'room_filter' | 'room_not_found' | 'room_record_not_found';
+
+class TaskRoomPublicError extends Error {
+  constructor(
+    readonly code: TaskRoomPublicErrorCode,
+    readonly fields: Readonly<Record<string, string>> = {},
+  ) {
+    super(code);
+    this.name = 'TaskRoomPublicError';
+  }
+}
+
+const PUBLIC_ERROR_FIELD = /^[A-Za-z0-9._:@-]{1,160}$/u;
+
+function taskRoomPublicError(
+  code: TaskRoomPublicErrorCode, fields: Record<string, unknown> = {},
+): TaskRoomPublicError {
+  const validated = Object.fromEntries(Object.entries(fields).flatMap(([key, value]) => {
+    const text = String(value ?? '');
+    return PUBLIC_ERROR_FIELD.test(text) ? [[key, text]] : [];
+  }));
+  return new TaskRoomPublicError(code, validated);
+}
+
+function taskRoomPublicFailure(error: TaskRoomPublicError): {
+  legacy: string; kind: 'usage' | 'not_found' | 'state'; detail: string; action: string;
+} {
+  const f = error.fields;
+  switch (error.code) {
+    case 'task_confirmation_mismatch': return {
+      legacy: 'confirmation ID must match task ID', kind: 'usage',
+      detail: 'The two task IDs must match.', action: 'Repeat the same task ID twice.',
+    };
+    case 'room_confirmation_mismatch': return {
+      legacy: 'confirmation ID must match room ID', kind: 'usage',
+      detail: 'The two room IDs must match.', action: 'Repeat the same room ID twice.',
+    };
+    case 'template_not_found': return {
+      legacy: `template not found: ${f.template ?? 'requested-template'}`, kind: 'not_found',
+      detail: `The requested template ${f.template ?? ''}`.trim() + ' was not found.',
+      action: 'Run ours-fleet template list and retry with an available template.',
+    };
+    case 'template_mismatch': return {
+      legacy: `template ${f.requested ?? 'requested-template'} does not match room ${f.room ?? 'requested-room'}'s provisioned template ${f.provisioned ?? 'recorded-template'}`,
+      kind: 'state', detail: 'The requested template does not match the room’s provisioned template.',
+      action: 'Use the room’s recorded template or create a new room.',
+    };
+    case 'task_template_drift': return {
+      legacy: `task template snapshot no longer matches ${f.template ?? 'the recorded template'}`,
+      kind: 'state', detail: 'The task template snapshot no longer matches the recorded template.',
+      action: 'Run the matching show and recover commands before retrying.',
+    };
+    case 'task_terminal': return {
+      legacy: `task ${f.task ?? 'requested-task'} is in terminal state '${f.state ?? 'terminal'}'`,
+      kind: 'state', detail: 'The task is already in a terminal state.',
+      action: 'Run ours-fleet task show to inspect the completed task.',
+    };
+    case 'task_terminal_already': return {
+      legacy: `task ${f.task ?? 'requested-task'} is already in terminal state '${f.state ?? 'terminal'}'`,
+      kind: 'state', detail: 'The task is already in a terminal state.',
+      action: 'Run ours-fleet task show to inspect the completed task.',
+    };
+    case 'task_non_resumable': return {
+      legacy: `task ${f.task ?? 'requested-task'} has room ${f.room ?? 'requested-room'} in a non-resumable state — run 'task recover ${f.task ?? 'requested-task'}'`,
+      kind: 'state', detail: 'The task’s room is in a non-resumable state.',
+      action: `Run ours-fleet task recover ${f.task ?? '<id>'}.`,
+    };
+    case 'room_filter': return {
+      legacy: 'room state filter must be active, provisioning, or all', kind: 'usage',
+      detail: 'The room state filter must be active, provisioning, or all.',
+      action: 'Choose one of the supported room state filters.',
+    };
+    case 'room_not_found': return {
+      legacy: `room not found: ${f.room ?? 'requested-room'}`, kind: 'not_found',
+      detail: `Room ${f.room ?? ''}`.trim() + ' was not found.',
+      action: 'Run ours-fleet room list to find a live room ID.',
+    };
+    case 'room_record_not_found': return {
+      legacy: `room not found in Fleet orchestration: ${f.room ?? 'requested-room'}`, kind: 'not_found',
+      detail: `Room ${f.room ?? ''}`.trim() + ' was not found in Fleet orchestration.',
+      action: 'Run ours-fleet room list to find a live room ID.',
+    };
+  }
+}
 
 function die(e: unknown): never {
-  const msg = e instanceof Error ? e.message : String(e);
+  const msg = e instanceof TaskRoomPublicError
+    ? taskRoomPublicFailure(e).legacy : e instanceof Error ? e.message : String(e);
   process.stderr.write(`error: ${msg}\n`);
   process.exit(1);
 }
+
+const TASK_STATE_WORD = '(?:backlog|provisioning|active|review|done|cancelled|failed)';
+const SAFE_ID_WORD = '[A-Za-z0-9_-]{1,128}';
+
+function isKnownTaskStateMessage(message: string): boolean {
+  return [
+    new RegExp(`^cannot transition from '${TASK_STATE_WORD}' to '${TASK_STATE_WORD}'$`, 'u'),
+    new RegExp(`^task ${SAFE_ID_WORD} has a pending '(?:done|cancelled)' terminal intent$`, 'u'),
+    new RegExp(`^cannot (?:block|cancel) a '${TASK_STATE_WORD}' task$`, 'u'),
+    /^task is not blocked$/u,
+    new RegExp(`^task ${SAFE_ID_WORD} already has a conflicting '(?:done|cancelled)' terminal intent$`, 'u'),
+    new RegExp(`^task ${SAFE_ID_WORD} is already in terminal state '${TASK_STATE_WORD}'$`, 'u'),
+    new RegExp(`^task ${SAFE_ID_WORD} is not tied to room ${SAFE_ID_WORD}$`, 'u'),
+    new RegExp(`^task ${SAFE_ID_WORD} has no terminal intent$`, 'u'),
+    new RegExp(`^task ${SAFE_ID_WORD} reached terminal state '${TASK_STATE_WORD}' outside its intent$`, 'u'),
+    new RegExp(`^cannot delete a '${TASK_STATE_WORD}' task; only 'done' tasks can be deleted$`, 'u'),
+  ].some(pattern => pattern.test(message));
+}
+
+function isKnownRoomStateMessage(message: string): boolean {
+  return [
+    new RegExp(`^room ${SAFE_ID_WORD} history cursor cannot move backward$`, 'u'),
+    new RegExp(`^room ${SAFE_ID_WORD} is not closing$`, 'u'),
+    new RegExp(`^room ${SAFE_ID_WORD} has no recorded member .{1,128}$`, 'u'),
+    new RegExp(`^room ${SAFE_ID_WORD} member .{1,128} (?:launch|briefing|retirement) cannot move backward to [A-Za-z_]+$`, 'u'),
+    new RegExp(`^room ${SAFE_ID_WORD} member .{1,128} launch changed from ${SAFE_ID_WORD} to ${SAFE_ID_WORD}$`, 'u'),
+    new RegExp(`^room ${SAFE_ID_WORD} close cannot move backward to [A-Za-z_]+$`, 'u'),
+  ].some(pattern => pattern.test(message));
+}
+
+function dieTaskRoom(e: unknown): never {
+  if (e instanceof TaskRoomPublicError) {
+    const failure = taskRoomPublicFailure(e);
+    const output = renderMarkdownFailure({
+      kind: failure.kind, subject: 'ours-fleet task/room', detail: failure.detail,
+      action: failure.action,
+    });
+    process.stderr.write(`${output}\n`);
+    process.exit(1);
+  }
+  const taskMissing = e instanceof TaskStateError
+    ? /^task not found: ([A-Za-z0-9_-]{1,128})$/u.exec(e.message) : null;
+  const roomMissing = e instanceof RoomStateError
+    ? /^room not found: ([A-Za-z0-9_-]{1,128})$/u.exec(e.message) : null;
+  const notFoundId = taskMissing?.[1] ?? roomMissing?.[1];
+  const state = e instanceof TaskStateError ? isKnownTaskStateMessage(e.message)
+    : e instanceof RoomStateError ? isKnownRoomStateMessage(e.message) : false;
+  const validation = e instanceof ConfigError
+    || (e instanceof TaskStateError
+      && e.message === 'invalid task ID: expected the canonical 17-character lowercase ID');
+  const kind = notFoundId ? 'not_found' : state ? 'state' : validation ? 'usage' : 'unexpected';
+  const output = renderMarkdownFailure({
+    kind,
+    subject: 'ours-fleet task/room',
+    ...(notFoundId ? { detail: `${taskMissing ? 'Task' : 'Room'} ${notFoundId} was not found.` }
+      : state ? { detail: 'The current task or room state does not allow that action.' }
+        : validation ? { detail: 'Fleet configuration is invalid or incomplete.' } : {}),
+    action: notFoundId ? 'Run the matching list command to find a valid ID.'
+      : state ? 'Run the matching show command to inspect the current state.'
+        : validation ? 'Check the command options and configuration, then retry.'
+          : 'Retry once; if it repeats, run ours-fleet doctor and inspect the role logs.',
+  });
+  process.stderr.write(`${output}\n`);
+  process.exit(1);
+}
+
+const taskListMarkdown = (tasks: ReturnType<typeof listTasks>, title = 'Tasks'): string =>
+  renderMarkdownList({
+    icon: '📋', title, empty: 'No tasks found.',
+    records: tasks.map(t =>
+      `${taskStatus(t.state)} ${markdownCode(t.task_id)} — ${markdownProse(t.title)}`
+      + (t.blocked ? ` — 🚧 Blocked: ${markdownProse(t.blocked.reason)}` : '')),
+  });
+
+const taskActionMarkdown = (
+  title: string, task: ReturnType<typeof getTask>,
+  fields: Parameters<typeof renderMarkdownResult>[0]['fields'] = [],
+): string => renderMarkdownResult({
+  icon: '📋', title,
+  fields: [
+    { label: 'ID', value: task.task_id, kind: 'code' },
+    { label: 'Status', value: taskStatus(task.state), kind: 'markdown' },
+    ...fields,
+  ],
+});
+
+const roomActionMarkdown = (
+  title: string, room: RoomOrchestrationRecord,
+  fields: Parameters<typeof renderMarkdownResult>[0]['fields'] = [],
+): string => renderMarkdownResult({
+  icon: '🏠', title,
+  fields: [
+    { label: 'ID', value: room.room_id, kind: 'code' },
+    { label: 'Status', value: roomStatus(room.state), kind: 'markdown' },
+    ...fields,
+  ],
+});
 
 const PUBLIC_SETTLE_WAIT_MS = 60_000;
 const PUBLIC_SETTLE_POLL_MS = 100;
@@ -128,26 +319,34 @@ function durableTaskRoomTemplate(
   return snapshot;
 }
 
-function printRoomStartupEvidence(room: RoomOrchestrationRecord): void {
+function roomStartupSections(
+  room: RoomOrchestrationRecord,
+): NonNullable<Parameters<typeof renderMarkdownResult>[0]['sections']> {
+  const sections: NonNullable<Parameters<typeof renderMarkdownResult>[0]['sections']> = [];
   const definitions = Object.values(room.role_briefings ?? {});
   if (definitions.length) {
-    console.log('Role briefings:');
-    for (const definition of definitions.sort((a, b) => a.role.localeCompare(b.role)))
-      console.log(`  ${definition.role} v${definition.version ?? '?'} ${definition.state} sha256:${definition.sha256}`);
+    sections.push({
+      heading: 'Role briefings',
+      markdownItems: definitions.sort((a, b) => a.role.localeCompare(b.role)).map(definition =>
+        `${markdownCode(definition.role)} — version ${markdownCode(definition.version ?? '?')} — ${markdownProse(definition.state)}`),
+    });
   }
   if (room.member_seats.length) {
-    console.log('Fleet startup evidence:');
-    for (const seat of room.member_seats) {
+    sections.push({
+      heading: 'Fleet startup evidence',
+      markdownItems: room.member_seats.map(seat => {
       const launch = seat.launch?.state ?? 'unrecorded';
       const briefing = seat.briefing?.state ?? 'unrecorded';
-      console.log(`  ${seat.role_name} ${seat.identity_cid} role=${seat.cowork_role} seat=${seat.seat_state} launch=${launch} briefing=${briefing}`);
-      if (seat.briefing?.message_id)
-        console.log(`    briefing_message=${seat.briefing.message_id} relay=${seat.briefing.relay_result_record_id ?? 'pending'} ack=${seat.briefing.acknowledgement_message_id ?? 'pending'}`);
-      if (seat.briefing?.last_rejected_ack_reason)
-        console.log(`    rejected_ack_seq=${seat.briefing.last_rejected_ack_seq} reason=${seat.briefing.last_rejected_ack_reason}`);
-      if (seat.launch?.error) console.log(`    launch_error=${seat.launch.error}`);
-    }
+        return `${markdownCode(seat.role_name)} — ${markdownProse(seat.cowork_role)} — `
+          + `seat ${markdownProse(seat.seat_state)}, launch ${markdownProse(launch)}, briefing ${markdownProse(briefing)}`
+          + (seat.briefing?.acknowledgement_message_id ? ' — acknowledgement recorded' : '')
+          + (seat.briefing?.last_rejected_ack_reason
+            ? ' — rejected acknowledgement recorded; inspect role logs' : '')
+          + (seat.launch?.error ? ' — launch failure recorded; inspect role logs' : '');
+      }),
+    });
   }
+  return sections;
 }
 
 async function provisionRoom(cfg: FleetConfig, input: {
@@ -325,7 +524,7 @@ export function registerTaskCommands(parent: Command, cOpt: (cmd: Command) => Co
         let templateRef;
         if (opts.template) {
           const t = resolveTemplate(opts.template, allTemplates(cfg));
-          if (!t) die(new Error(`template not found: ${opts.template}`));
+          if (!t) throw taskRoomPublicError('template_not_found', { template: opts.template });
           const snap = snapshotTemplate(t);
           templateRef = { name: snap.name, version: snap.version, content_hash: snap.content_hash };
         } else if (opts.room !== false) {
@@ -379,9 +578,11 @@ export function registerTaskCommands(parent: Command, cOpt: (cmd: Command) => Co
           console.log(JSON.stringify({ schema_version: 1, task: record }, null, 2));
           return;
         }
-        console.log(`Task ${record.task_id} created · ${record.state}`);
-        if (templateRef) console.log(`Template: ${templateRef.name}@${templateRef.version}`);
-      } catch (e) { die(e); }
+        console.log(taskActionMarkdown('Task created', record, [
+          { label: 'Title', value: record.title },
+          ...(templateRef ? [{ label: 'Template', value: `${templateRef.name}@${templateRef.version}`, kind: 'code' as const }] : []),
+        ]));
+      } catch (e) { if (opts.json) die(e); dieTaskRoom(e); }
     });
 
   cOpt(taskCmd.command('list'))
@@ -399,12 +600,8 @@ export function registerTaskCommands(parent: Command, cOpt: (cmd: Command) => Co
           console.log(JSON.stringify({ schema_version: 1, tasks }, null, 2));
           return;
         }
-        if (!tasks.length) { console.log('No tasks.'); return; }
-        for (const t of tasks) {
-          const blocked = t.blocked ? ` [BLOCKED: ${t.blocked.reason}]` : '';
-          console.log(`${t.task_id}  ${t.state}${blocked}  ${t.title}`);
-        }
-      } catch (e) { die(e); }
+        console.log(taskListMarkdown(tasks));
+      } catch (e) { if (opts.json) die(e); dieTaskRoom(e); }
     });
 
   taskCmd.command('show <id>')
@@ -420,24 +617,31 @@ export function registerTaskCommands(parent: Command, cOpt: (cmd: Command) => Co
           }, null, 2));
           return;
         }
-        console.log(`Task: ${t.task_id}`);
-        console.log(`Title: ${t.title}`);
-        console.log(`State: ${t.state}${t.blocked ? ` [BLOCKED: ${t.blocked.reason}]` : ''}`);
-        if (t.template) console.log(`Template: ${t.template.name}@${t.template.version}`);
-        if (t.room_id) console.log(`Room: ${t.room_id}`);
-        if (t.room_identity_cid) console.log(`Room CID: ${t.room_identity_cid}`);
-        if (t.member_roles.length) {
-          console.log('Members:');
-          for (const m of t.member_roles)
-            console.log(`  ${m.name} (${m.cowork_role}) ${m.identity_cid}`);
-        }
-        if (room) printRoomStartupEvidence(room);
-        console.log(`Origin: ${t.origin.type}`);
-        console.log(`Created: ${t.created_at}`);
-        if (t.started_at) console.log(`Started: ${t.started_at}`);
-        if (t.ended_at) console.log(`Ended: ${t.ended_at}`);
-        if (t.outcome) console.log(`Outcome: ${t.outcome.summary}`);
-      } catch (e) { die(e); }
+        console.log(renderMarkdownResult({
+          icon: '📋', title: 'Task details',
+          fields: [
+            { label: 'ID', value: t.task_id, kind: 'code' },
+            { label: 'Title', value: t.title },
+            { label: 'Status', value: taskStatus(t.state), kind: 'markdown' },
+            ...(t.blocked ? [{ label: 'Blocked', value: t.blocked.reason }] : []),
+            ...(t.template ? [{ label: 'Template', value: `${t.template.name}@${t.template.version}`, kind: 'code' as const }] : []),
+            ...(t.room_id ? [{ label: 'Room', value: t.room_id, kind: 'code' as const }] : []),
+            ...(t.room_identity_cid ? [{ label: 'Room CID', value: t.room_identity_cid, kind: 'code' as const }] : []),
+            { label: 'Origin', value: t.origin.type },
+            { label: 'Created', value: t.created_at, kind: 'code' },
+            ...(t.started_at ? [{ label: 'Started', value: t.started_at, kind: 'code' as const }] : []),
+            ...(t.ended_at ? [{ label: 'Ended', value: t.ended_at, kind: 'code' as const }] : []),
+            ...(t.outcome ? [{ label: 'Outcome', value: t.outcome.summary, multiline: true }] : []),
+          ],
+          sections: [
+            ...(t.member_roles.length ? [{
+              heading: 'Members', markdownItems: t.member_roles.map(m =>
+                `${markdownCode(m.name)} — ${markdownProse(m.cowork_role)} — ${markdownCode(m.identity_cid)}`),
+            }] : []),
+            ...(room ? roomStartupSections(room) : []),
+          ],
+        }));
+      } catch (e) { if (opts.json) die(e); dieTaskRoom(e); }
     });
 
   cOpt(taskCmd.command('start <id>'))
@@ -450,7 +654,9 @@ export function registerTaskCommands(parent: Command, cOpt: (cmd: Command) => Co
         if (t.template && !t.room_id) {
           const template = resolveRoomTemplate(cfg, t.template.name);
           if (!template || template.content_hash !== t.template.content_hash)
-            throw new Error(`task template snapshot no longer matches ${t.template.name}@${t.template.version}`);
+            throw taskRoomPublicError('task_template_drift', {
+              template: `${t.template.name}@${t.template.version}`,
+            });
           await provisionRoom(cfg, {
             name: t.title,
             goal: t.title,
@@ -464,8 +670,8 @@ export function registerTaskCommands(parent: Command, cOpt: (cmd: Command) => Co
           t = getTask(t.task_id);
         }
         if (opts.json) { console.log(JSON.stringify({ schema_version: 1, task: t }, null, 2)); return; }
-        console.log(`Task ${t.task_id} · provisioning`);
-      } catch (e) { die(e); }
+        console.log(taskActionMarkdown('Task started', t));
+      } catch (e) { if (opts.json) die(e); dieTaskRoom(e); }
     });
 
   taskCmd.command('block <id>')
@@ -476,8 +682,8 @@ export function registerTaskCommands(parent: Command, cOpt: (cmd: Command) => Co
       try {
         const t = blockTask(id, opts.reason);
         if (opts.json) { console.log(JSON.stringify({ schema_version: 1, task: t }, null, 2)); return; }
-        console.log(`Task ${t.task_id} · blocked: ${opts.reason}`);
-      } catch (e) { die(e); }
+        console.log(taskActionMarkdown('Task blocked', t, [{ label: 'Reason', value: opts.reason }]));
+      } catch (e) { if (opts.json) die(e); dieTaskRoom(e); }
     });
 
   taskCmd.command('unblock <id>')
@@ -487,8 +693,8 @@ export function registerTaskCommands(parent: Command, cOpt: (cmd: Command) => Co
       try {
         const t = unblockTask(id);
         if (opts.json) { console.log(JSON.stringify({ schema_version: 1, task: t }, null, 2)); return; }
-        console.log(`Task ${t.task_id} · unblocked`);
-      } catch (e) { die(e); }
+        console.log(taskActionMarkdown('Task unblocked', t));
+      } catch (e) { if (opts.json) die(e); dieTaskRoom(e); }
     });
 
   taskCmd.command('review <id>')
@@ -498,8 +704,8 @@ export function registerTaskCommands(parent: Command, cOpt: (cmd: Command) => Co
       try {
         const t = reviewTask(id);
         if (opts.json) { console.log(JSON.stringify({ schema_version: 1, task: t }, null, 2)); return; }
-        console.log(`Task ${t.task_id} · review`);
-      } catch (e) { die(e); }
+        console.log(taskActionMarkdown('Task ready for review', t));
+      } catch (e) { if (opts.json) die(e); dieTaskRoom(e); }
     });
 
   cOpt(taskCmd.command('done <id>'))
@@ -533,11 +739,16 @@ export function registerTaskCommands(parent: Command, cOpt: (cmd: Command) => Co
         const t = settled.task;
         if (opts.json) { console.log(JSON.stringify({ schema_version: 1, task: t }, null, 2)); return; }
         if (settled.timedOut) {
-          console.log(`Task ${t.task_id} · ${t.state} (terminal intent accepted/pending; run task recover ${id})`);
+          console.log(renderMarkdownFailure({
+            kind: 'pending', subject: `task done ${id}`,
+            detail: 'The completion request was accepted and is still being settled.',
+            action: `Run ours-fleet task recover ${id}.`,
+          }));
           return;
         }
-        console.log(`Task ${t.task_id} · done`);
-      } catch (e) { die(e); }
+        console.log(taskActionMarkdown('Task completed', t,
+          t.outcome ? [{ label: 'Summary', value: t.outcome.summary, multiline: true }] : []));
+      } catch (e) { if (opts.json) die(e); dieTaskRoom(e); }
     });
 
   cOpt(taskCmd.command('cancel <id> <confirm-id>'))
@@ -546,7 +757,7 @@ export function registerTaskCommands(parent: Command, cOpt: (cmd: Command) => Co
     .action(async (id: string, confirmId: string, opts: { configuration?: string; json?: boolean }) => {
       try {
         if (id !== confirmId)
-          die(new Error('confirmation ID must match task ID'));
+          throw taskRoomPublicError('task_confirmation_mismatch');
         const current = getTask(id);
         if (!TASK_CANCELLABLE_STATES.includes(current.state))
           throw new TaskStateError(`cannot cancel a '${current.state}' task`);
@@ -560,11 +771,15 @@ export function registerTaskCommands(parent: Command, cOpt: (cmd: Command) => Co
         const t = settled.task;
         if (opts.json) { console.log(JSON.stringify({ schema_version: 1, task: t }, null, 2)); return; }
         if (settled.timedOut) {
-          console.log(`Task ${t.task_id} · ${t.state} (terminal intent accepted/pending; run task recover ${id})`);
+          console.log(renderMarkdownFailure({
+            kind: 'pending', subject: `task cancel ${id} ${id}`,
+            detail: 'The cancellation request was accepted and is still being settled.',
+            action: `Run ours-fleet task recover ${id}.`,
+          }));
           return;
         }
-        console.log(`Task ${t.task_id} · cancelled`);
-      } catch (e) { die(e); }
+        console.log(taskActionMarkdown('Task cancelled', t));
+      } catch (e) { if (opts.json) die(e); dieTaskRoom(e); }
     });
 
   cOpt(taskCmd.command('delete <id> <confirm-id>'))
@@ -572,16 +787,17 @@ export function registerTaskCommands(parent: Command, cOpt: (cmd: Command) => Co
     .option('--json', 'JSON output')
     .action((id: string, confirmId: string, opts: { json?: boolean }) => {
       try {
-        if (id !== confirmId) die(new Error('confirmation ID must match task ID'));
+        if (id !== confirmId) throw taskRoomPublicError('task_confirmation_mismatch');
         const deleted = deleteTask(id);
         if (opts.json) {
           console.log(JSON.stringify({ schema_version: 1, task_id: id, deleted }, null, 2));
           return;
         }
-        console.log(deleted
-          ? `Task ${id} · deleted from backlog`
-          : `Task ${id} · already absent`);
-      } catch (e) { die(e); }
+        console.log(renderMarkdownResult({
+          icon: '🗑️', title: deleted ? 'Task deleted' : 'Task already absent',
+          fields: [{ label: 'ID', value: id, kind: 'code' }],
+        }));
+      } catch (e) { if (opts.json) die(e); dieTaskRoom(e); }
     });
 
   cOpt(taskCmd.command('recover <id>'))
@@ -654,15 +870,22 @@ export function registerTaskCommands(parent: Command, cOpt: (cmd: Command) => Co
           console.log(JSON.stringify({ schema_version: 1, ...result }, null, 2));
           return;
         }
-        console.log(`Task ${t.task_id} · ${t.state}`);
-        if (room) console.log(`Room ${room.room_id} · ${room.state} · saga: ${room.saga.phase}`);
-        if (result.recovery_actions.length) {
-          console.log('Recovery actions:');
-          for (const a of result.recovery_actions) console.log(`  - ${a}`);
-        } else {
-          console.log('No automated recovery actions available.');
-        }
-      } catch (e) { die(e); }
+        console.log(renderMarkdownResult({
+          icon: '🛟', title: 'Task recovery',
+          fields: [
+            { label: 'Task', value: t.task_id, kind: 'code' },
+            { label: 'Status', value: taskStatus(t.state), kind: 'markdown' },
+            ...(room ? [
+              { label: 'Room', value: room.room_id, kind: 'code' as const },
+              { label: 'Room status', value: roomStatus(room.state), kind: 'markdown' as const },
+              { label: 'Saga', value: room.saga.phase, kind: 'code' as const },
+            ] : []),
+          ],
+          sections: result.recovery_actions.length
+            ? [{ heading: 'Next steps', items: result.recovery_actions }]
+            : [{ heading: 'Result', items: ['No automated recovery action is available.'] }],
+        }));
+      } catch (e) { if (opts.json) die(e); dieTaskRoom(e); }
     });
 
   cOpt(taskCmd.command('_settle <id>', { hidden: true }))
@@ -676,12 +899,13 @@ export function registerTaskCommands(parent: Command, cOpt: (cmd: Command) => Co
           console.log(JSON.stringify({ schema_version: 1, task: t }, null, 2));
           return;
         }
-        console.log(`Task ${t.task_id} · ${t.state}`);
+        console.log(taskActionMarkdown('Task terminal action settled', t));
       } catch (e) {
         await recordTaskTerminalIntentError(
           id, errorText(e), `External settle worker failed. Retry task recover ${id}.`,
         ).catch(() => {});
-        die(e);
+        if (opts.json) die(e);
+        dieTaskRoom(e);
       }
     });
 
@@ -695,24 +919,28 @@ export function registerTaskCommands(parent: Command, cOpt: (cmd: Command) => Co
         let t = getTask(id);
 
         if (TASK_TERMINAL_STATES.includes(t.state))
-          die(new Error(`task ${id} is in terminal state '${t.state}'`));
+          throw taskRoomPublicError('task_terminal', { task: id, state: t.state });
 
         if (t.state === 'active' && t.room_id) {
           // An explicit --template must agree with the room the task already
           // runs in; a conflicting override is an error, not a silent no-op.
           if (opts.template) {
             const override = resolveTemplate(opts.template, allTemplates(cfg));
-            if (!override) die(new Error(`template not found: ${opts.template}`));
+            if (!override) throw taskRoomPublicError('template_not_found', { template: opts.template });
             const overrideSnap = snapshotTemplate(override);
             const roomSnap = getRoomRecord(t.room_id)?.template_snapshot ?? t.template;
             if (roomSnap && (roomSnap.name !== overrideSnap.name || roomSnap.content_hash !== overrideSnap.content_hash))
-              die(new Error(`template ${overrideSnap.name}@${overrideSnap.version} does not match room ${t.room_id}'s provisioned template ${roomSnap.name}@${roomSnap.version}`));
+              throw taskRoomPublicError('template_mismatch', {
+                requested: `${overrideSnap.name}@${overrideSnap.version}`, room: t.room_id,
+                provisioned: `${roomSnap.name}@${roomSnap.version}`,
+              });
           }
           if (opts.json) {
             console.log(JSON.stringify({ schema_version: 1, task: t, status: 'already_active' }, null, 2));
             return;
           }
-          console.log('Task already has an active room');
+          console.log(taskActionMarkdown('Task already active', t,
+            t.room_id ? [{ label: 'Room', value: t.room_id, kind: 'code' }] : []));
           return;
         }
 
@@ -729,24 +957,34 @@ export function registerTaskCommands(parent: Command, cOpt: (cmd: Command) => Co
           ?? 'single';
         const resolved = durableSnapshot && !opts.template
           ? undefined : resolveTemplate(templateName, allTemplates(cfg));
-        if (!durableSnapshot && !resolved) die(new Error(`template not found: ${templateName}`));
-        if (opts.template && !resolved) die(new Error(`template not found: ${templateName}`));
+        if (!durableSnapshot && !resolved)
+          throw taskRoomPublicError('template_not_found', { template: templateName });
+        if (opts.template && !resolved)
+          throw taskRoomPublicError('template_not_found', { template: templateName });
         if (durableSnapshot && resolved) {
           const requested = snapshotTemplate(resolved);
           if (requested.name !== durableSnapshot.name
               || requested.content_hash !== durableSnapshot.content_hash) {
-            die(new Error(`template ${requested.name}@${requested.version} does not match room ${existingRoom!.room_id}'s provisioned template ${durableSnapshot.name}@${durableSnapshot.version}`));
+            throw taskRoomPublicError('template_mismatch', {
+              requested: `${requested.name}@${requested.version}`, room: existingRoom!.room_id,
+              provisioned: `${durableSnapshot.name}@${durableSnapshot.version}`,
+            });
           }
         }
         const snap = durableSnapshot ?? snapshotTemplate(resolved!);
         if (!opts.template && t.template && snap.content_hash !== t.template.content_hash)
-          die(new Error(`task template snapshot no longer matches ${t.template.name}@${t.template.version}`));
+          throw taskRoomPublicError('task_template_drift', {
+            template: `${t.template.name}@${t.template.version}`,
+          });
         // A provisioned room is pinned to its snapshot: never resume or re-pin
         // an existing room under a different template.
         if (t.room_id) {
           const roomSnap = getRoomRecord(t.room_id)?.template_snapshot;
           if (roomSnap && (roomSnap.name !== snap.name || roomSnap.content_hash !== snap.content_hash))
-            die(new Error(`template ${snap.name}@${snap.version} does not match room ${t.room_id}'s provisioned template ${roomSnap.name}@${roomSnap.version}`));
+            throw taskRoomPublicError('template_mismatch', {
+              requested: `${snap.name}@${snap.version}`, room: t.room_id,
+              provisioned: `${roomSnap.name}@${roomSnap.version}`,
+            });
         }
         let templateRef = t.template;
         if (!templateRef || templateRef.name !== snap.name || templateRef.content_hash !== snap.content_hash) {
@@ -804,7 +1042,7 @@ export function registerTaskCommands(parent: Command, cOpt: (cmd: Command) => Co
             }
             t = getTask(t.task_id);
           } else {
-            die(new Error(`task ${id} has room ${t.room_id} in a non-resumable state — run 'task recover ${id}'`));
+            throw taskRoomPublicError('task_non_resumable', { task: id, room: t.room_id });
           }
         }
 
@@ -812,15 +1050,20 @@ export function registerTaskCommands(parent: Command, cOpt: (cmd: Command) => Co
           console.log(JSON.stringify({ schema_version: 1, task: t }, null, 2));
           return;
         }
-        console.log(`Task ${t.task_id} · ${t.state}`);
-        if (templateRef) console.log(`Template: ${templateRef.name}@${templateRef.version}`);
-        if (t.room_id) console.log(`Room: ${t.room_id}`);
-        if (t.member_roles.length) {
-          console.log('Agents:');
-          for (const m of t.member_roles)
-            console.log(`  ${m.name} (${m.cowork_role})`);
-        }
-      } catch (e) { die(e); }
+        console.log(renderMarkdownResult({
+          icon: '🛠️', title: 'Task work ready',
+          fields: [
+            { label: 'ID', value: t.task_id, kind: 'code' },
+            { label: 'Status', value: taskStatus(t.state), kind: 'markdown' },
+            ...(templateRef ? [{ label: 'Template', value: `${templateRef.name}@${templateRef.version}`, kind: 'code' as const }] : []),
+            ...(t.room_id ? [{ label: 'Room', value: t.room_id, kind: 'code' as const }] : []),
+          ],
+          sections: t.member_roles.length ? [{
+            heading: 'Agents', markdownItems: t.member_roles.map(m =>
+              `${markdownCode(m.name)} — ${markdownProse(m.cowork_role)}`),
+          }] : [],
+        }));
+      } catch (e) { if (opts.json) die(e); dieTaskRoom(e); }
     });
 
   cOpt(taskCmd.command('finish <id>'))
@@ -837,7 +1080,7 @@ export function registerTaskCommands(parent: Command, cOpt: (cmd: Command) => Co
         let t = getTask(id);
 
         if (TASK_TERMINAL_STATES.includes(t.state))
-          die(new Error(`task ${id} is already in terminal state '${t.state}'`));
+          throw taskRoomPublicError('task_terminal_already', { task: id, state: t.state });
 
         if (t.state === 'active') {
           reviewTask(id);
@@ -855,11 +1098,16 @@ export function registerTaskCommands(parent: Command, cOpt: (cmd: Command) => Co
           return;
         }
         if (settled.timedOut) {
-          console.log(`Task ${t.task_id} · ${t.state} (terminal intent accepted/pending; run task recover ${id})`);
+          console.log(renderMarkdownFailure({
+            kind: 'pending', subject: `task finish ${id}`,
+            detail: 'The finish request was accepted and is still being settled.',
+            action: `Run ours-fleet task recover ${id}.`,
+          }));
           return;
         }
-        console.log(`Task ${t.task_id} · done`);
-      } catch (e) { die(e); }
+        console.log(taskActionMarkdown('Task finished', t,
+          t.outcome ? [{ label: 'Summary', value: t.outcome.summary, multiline: true }] : []));
+      } catch (e) { if (opts.json) die(e); dieTaskRoom(e); }
     });
 }
 
@@ -886,7 +1134,7 @@ export function registerRoomCommands(parent: Command, cOpt: (cmd: Command) => Co
         let templateSnapshot;
         if (opts.template) {
           const t = resolveTemplate(opts.template, allTemplates(cfg));
-          if (!t) die(new Error(`template not found: ${opts.template}`));
+          if (!t) throw taskRoomPublicError('template_not_found', { template: opts.template });
           templateSnapshot = snapshotTemplate(t);
         }
 
@@ -901,9 +1149,11 @@ export function registerRoomCommands(parent: Command, cOpt: (cmd: Command) => Co
           console.log(JSON.stringify({ schema_version: 1, room: record }, null, 2));
           return;
         }
-        console.log(`Room ${record.room_id} created · ${record.state}`);
-        if (templateSnapshot) console.log(`Template: ${templateSnapshot.name}@${templateSnapshot.version}`);
-      } catch (e) { die(e); }
+        console.log(roomActionMarkdown('Room created', record, [
+          { label: 'Name', value: record.room_name },
+          ...(templateSnapshot ? [{ label: 'Template', value: `${templateSnapshot.name}@${templateSnapshot.version}`, kind: 'code' as const }] : []),
+        ]));
+      } catch (e) { if (opts.json) die(e); dieTaskRoom(e); }
     });
 
   cOpt(roomCmd.command('list'))
@@ -914,7 +1164,7 @@ export function registerRoomCommands(parent: Command, cOpt: (cmd: Command) => Co
       try {
         const cfg = loadCfg(opts);
         if (opts.state && !['active', 'provisioning', 'all'].includes(opts.state))
-          throw new Error('room state filter must be active, provisioning, or all');
+          throw taskRoomPublicError('room_filter');
         const stateFilter = opts.state === 'active' || opts.state === 'provisioning'
           ? opts.state : undefined;
         const adapter = coworkFor(cfg);
@@ -933,10 +1183,13 @@ export function registerRoomCommands(parent: Command, cOpt: (cmd: Command) => Co
           console.log(JSON.stringify({ schema_version: 1, rooms }, null, 2));
           return;
         }
-        if (!rooms.length) { console.log('No rooms.'); return; }
-        for (const r of rooms)
-          console.log(`${r.room_id}  ${r.state}  ${r.room_name}${r.orchestration?.task_id ? ` (task: ${r.orchestration.task_id})` : ''}`);
-      } catch (e) { die(e); }
+        console.log(renderMarkdownList({
+          icon: '🏠', title: 'Rooms', empty: 'No rooms found.',
+          records: rooms.map(r =>
+            `${roomStatus(r.state)} ${markdownCode(r.room_id)} — ${markdownProse(r.room_name)}`
+            + (r.orchestration?.task_id ? ` — Task ${markdownCode(r.orchestration.task_id)}` : '')),
+        }));
+      } catch (e) { if (opts.json) die(e); dieTaskRoom(e); }
     });
 
   cOpt(roomCmd.command('show <id>'))
@@ -947,31 +1200,37 @@ export function registerRoomCommands(parent: Command, cOpt: (cmd: Command) => Co
         const cfg = loadCfg(opts);
         const tracked = getRoomRecord(id);
         if (tracked?.state === 'closing' || tracked?.state === 'closed')
-          die(new Error(`room not found: ${id}`));
+          throw taskRoomPublicError('room_not_found', { room: id });
         const cowork = await coworkFor(cfg).getRoom(id);
         if (!cowork || cowork.state === 'closing' || cowork.state === 'closed')
-          die(new Error(`room not found: ${id}`));
+          throw taskRoomPublicError('room_not_found', { room: id });
         const r = tracked;
         if (opts.json) {
           console.log(JSON.stringify({ schema_version: 1, room: cowork, orchestration: r ?? null }, null, 2));
           return;
         }
-        console.log(`Room: ${cowork.room_id}`);
-        console.log(`Name: ${cowork.room_name}`);
-        console.log(`State: ${cowork.state}`);
-        console.log(`Identity CID: ${cowork.identity_cid}`);
-        if (r?.task_id) console.log(`Task: ${r.task_id}`);
-        if (r) console.log(`Saga: ${r.saga.phase} (step ${r.saga.step_index})`);
-        if (r?.provisioning_detail) console.log(`Detail: ${r.provisioning_detail}`);
-        if (r?.saga.error) console.log(`Error: ${r.saga.error}`);
-        if (cowork.seats.length) {
-          console.log('Members:');
-          for (const s of cowork.seats)
-            console.log(`  ${s.identity_cid} (${s.role}) ${s.seat_state}`);
-        }
-        if (r) printRoomStartupEvidence(r);
-        if (r) console.log(`Tracked by Fleet since: ${r.created_at}`);
-      } catch (e) { die(e); }
+        console.log(renderMarkdownResult({
+          icon: '🏠', title: 'Room details',
+          fields: [
+            { label: 'ID', value: cowork.room_id, kind: 'code' },
+            { label: 'Name', value: cowork.room_name },
+            { label: 'Status', value: roomStatus(cowork.state), kind: 'markdown' },
+            { label: 'Identity CID', value: cowork.identity_cid, kind: 'code' },
+            ...(r?.task_id ? [{ label: 'Task', value: r.task_id, kind: 'code' as const }] : []),
+            ...(r ? [{ label: 'Saga', value: `${r.saga.phase} (step ${r.saga.step_index})` }] : []),
+            ...(r?.provisioning_detail ? [{ label: 'Detail', value: r.provisioning_detail }] : []),
+            ...(r?.saga.error ? [{ label: 'Last error', value: 'Provisioning failure recorded; inspect role logs.' }] : []),
+            ...(r ? [{ label: 'Tracked since', value: r.created_at, kind: 'code' as const }] : []),
+          ],
+          sections: [
+            ...(cowork.seats.length ? [{
+              heading: 'Members', markdownItems: cowork.seats.map(s =>
+                `${markdownCode(s.identity_cid)} — ${markdownProse(s.role)} — ${markdownProse(s.seat_state)}`),
+            }] : []),
+            ...(r ? roomStartupSections(r) : []),
+          ],
+        }));
+      } catch (e) { if (opts.json) die(e); dieTaskRoom(e); }
     });
 
   cOpt(roomCmd.command('open <id>'))
@@ -982,18 +1241,24 @@ export function registerRoomCommands(parent: Command, cOpt: (cmd: Command) => Co
         const cfg = loadCfg(opts);
         const tracked = getRoomRecord(id);
         if (tracked?.state === 'closing' || tracked?.state === 'closed')
-          die(new Error(`room not found: ${id}`));
+          throw taskRoomPublicError('room_not_found', { room: id });
         const room = await coworkFor(cfg).getRoom(id);
         if (!room || room.state === 'closing' || room.state === 'closed')
-          die(new Error(`room not found: ${id}`));
+          throw taskRoomPublicError('room_not_found', { room: id });
         const url = `http://localhost:4460/room/${id}`;
         if (opts.json) {
           console.log(JSON.stringify({ schema_version: 1, room_id: id, url, room_name: room.room_name }, null, 2));
           return;
         }
-        console.log(`Room ${id} — ${room.room_name}`);
-        console.log(`Local console: ${url}`);
-      } catch (e) { die(e); }
+        console.log(renderMarkdownResult({
+          icon: '🏠', title: 'Room console',
+          fields: [
+            { label: 'Room', value: id, kind: 'code' },
+            { label: 'Name', value: room.room_name },
+            { label: 'Local console', value: url, kind: 'code' },
+          ],
+        }));
+      } catch (e) { if (opts.json) die(e); dieTaskRoom(e); }
     });
 
   cOpt(roomCmd.command('members <id>'))
@@ -1004,11 +1269,11 @@ export function registerRoomCommands(parent: Command, cOpt: (cmd: Command) => Co
         const cfg = loadCfg(opts);
         const r = getRoomRecord(id);
         if (r?.state === 'closing' || r?.state === 'closed')
-          die(new Error(`room not found: ${id}`));
+          throw taskRoomPublicError('room_not_found', { room: id });
         const adapter = coworkFor(cfg);
         const room = await adapter.getRoom(id);
         if (!room || room.state === 'closing' || room.state === 'closed')
-          die(new Error(`room not found: ${id}`));
+          throw taskRoomPublicError('room_not_found', { room: id });
         const members = await adapter.getSeats(id);
         if (opts.json) {
           console.log(JSON.stringify({
@@ -1019,12 +1284,21 @@ export function registerRoomCommands(parent: Command, cOpt: (cmd: Command) => Co
           }, null, 2));
           return;
         }
-        console.log(`Room ${id}${r ? ` — ${r.room_name}` : ''}`);
-        if (r?.owner_seat_cid) console.log(`Owner: ${r.owner_seat_cid}`);
-        if (!members.length) { console.log('No members.'); return; }
-        for (const s of members)
-          console.log(`  ${s.identity_cid} (${s.role}) ${s.seat_state}`);
-      } catch (e) { die(e); }
+        console.log(renderMarkdownResult({
+          icon: '👥', title: 'Room members',
+          fields: [
+            { label: 'Room', value: id, kind: 'code' },
+            ...(r ? [{ label: 'Name', value: r.room_name }] : []),
+            ...(r?.owner_seat_cid ? [{ label: 'Owner', value: r.owner_seat_cid, kind: 'code' as const }] : []),
+          ],
+          sections: [{
+            heading: 'Members',
+            ...(members.length ? { markdownItems: members.map(s =>
+              `${markdownCode(s.identity_cid)} — ${markdownProse(s.role)} — ${markdownProse(s.seat_state)}`) }
+              : { items: ['No members found.'] }),
+          }],
+        }));
+      } catch (e) { if (opts.json) die(e); dieTaskRoom(e); }
     });
 
   const deleteAction = async (
@@ -1032,10 +1306,10 @@ export function registerRoomCommands(parent: Command, cOpt: (cmd: Command) => Co
     opts: { configuration?: string; json?: boolean },
   ): Promise<void> => {
       try {
-        if (id !== confirmId) die(new Error('confirmation ID must match room ID'));
+        if (id !== confirmId) throw taskRoomPublicError('room_confirmation_mismatch');
         coworkFor(loadCfg(opts));
         const existing = getRoomRecord(id);
-        if (!existing) throw new Error(`room not found in Fleet orchestration: ${id}`);
+        if (!existing) throw taskRoomPublicError('room_record_not_found', { room: id });
         await acceptManagedRoomClose(id);
         const settled = await launchRoomDeleteWorker(id, opts.configuration);
         if (opts.json) {
@@ -1043,11 +1317,18 @@ export function registerRoomCommands(parent: Command, cOpt: (cmd: Command) => Co
           return;
         }
         if (settled.timedOut) {
-          console.log(`Room ${id} · deletion accepted/pending; run room delete ${id} ${id}`);
+          console.log(renderMarkdownFailure({
+            kind: 'pending', subject: `room delete ${id} ${id}`,
+            detail: 'The deletion request was accepted and is still being settled.',
+            action: `Run ours-fleet room delete ${id} ${id} or room recover ${id}.`,
+          }));
           return;
         }
-        console.log(`Room ${id} · deleted`);
-      } catch (e) { die(e); }
+        console.log(renderMarkdownResult({
+          icon: '🗑️', title: 'Room deleted',
+          fields: [{ label: 'ID', value: id, kind: 'code' }],
+        }));
+      } catch (e) { if (opts.json) die(e); dieTaskRoom(e); }
     };
 
   cOpt(roomCmd.command('delete <id> <confirm-id>'))
@@ -1079,9 +1360,16 @@ export function registerRoomCommands(parent: Command, cOpt: (cmd: Command) => Co
             }, null, 2));
             return;
           }
-          console.log(settled.timedOut
-            ? `Room ${id} · deletion pending`
-            : `Room ${id} · deleted`);
+          console.log(renderMarkdownResult({
+            icon: settled.timedOut ? '⏳' : '🗑️',
+            title: settled.timedOut ? 'Room deletion pending' : 'Room deleted',
+            fields: [{ label: 'ID', value: id, kind: 'code' }],
+            sections: [{ heading: 'Next step', items: [
+              settled.timedOut
+                ? `Run ours-fleet room delete ${id} ${id} or room recover ${id} again.`
+                : 'No recovery action is needed.',
+            ] }],
+          }));
           return;
         }
         const cowork = await adapter.recoverRoom(id);
@@ -1106,8 +1394,8 @@ export function registerRoomCommands(parent: Command, cOpt: (cmd: Command) => Co
           r = advanceSaga(id, 'create_members', 3);
         }
         const actions: string[] = [];
-        if (r?.saga.error) actions.push(`Last error: ${r.saga.error}`);
-        if (r?.saga.recovery_hint) actions.push(r.saga.recovery_hint);
+        if (r?.saga.error) actions.push('A provisioning failure is recorded; inspect role logs for diagnostics.');
+        if (r?.saga.recovery_hint) actions.push('Recovery guidance is recorded; inspect role logs for diagnostics.');
         if (r?.provisioning_detail === 'waiting_cowork')
           actions.push('Check ours-cowork service status');
         if (r?.provisioning_detail === 'waiting_owner_invite')
@@ -1149,14 +1437,18 @@ export function registerRoomCommands(parent: Command, cOpt: (cmd: Command) => Co
           console.log(JSON.stringify({ schema_version: 1, room: cowork, orchestration: r ?? null, recovery_actions: actions }, null, 2));
           return;
         }
-        console.log(`Room ${cowork.room_id} · ${cowork.state}${r ? ` · saga: ${r.saga.phase}` : ''}`);
-        if (actions.length) {
-          console.log('Recovery:');
-          for (const a of actions) console.log(`  - ${a}`);
-        } else {
-          console.log('No recovery actions needed.');
-        }
-      } catch (e) { die(e); }
+        console.log(renderMarkdownResult({
+          icon: '🛟', title: 'Room recovery',
+          fields: [
+            { label: 'Room', value: cowork.room_id, kind: 'code' },
+            { label: 'Status', value: roomStatus(cowork.state), kind: 'markdown' },
+            ...(r ? [{ label: 'Saga', value: r.saga.phase, kind: 'code' as const }] : []),
+          ],
+          sections: actions.length
+            ? [{ heading: 'Next steps', items: actions }]
+            : [{ heading: 'Result', items: ['No recovery action is needed.'] }],
+        }));
+      } catch (e) { if (opts.json) die(e); dieTaskRoom(e); }
     });
 
   const internalDeleteAction = async (
@@ -1169,12 +1461,16 @@ export function registerRoomCommands(parent: Command, cOpt: (cmd: Command) => Co
           console.log(JSON.stringify({ schema_version: 1, ...result }, null, 2));
           return;
         }
-        console.log(`Room ${id} · deleted`);
+        console.log(renderMarkdownResult({
+          icon: '🗑️', title: 'Room deleted',
+          fields: [{ label: 'ID', value: id, kind: 'code' }],
+        }));
       } catch (e) {
         await recordManagedRoomCloseError(
           id, errorText(e), `External delete worker failed. Retry room delete ${id} ${id}.`,
         ).catch(() => {});
-        die(e);
+        if (opts.json) die(e);
+        dieTaskRoom(e);
       }
     };
 

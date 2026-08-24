@@ -153,7 +153,7 @@ describe('owner command registry', () => {
       await dispatchOwnerCommand(`/comments ${bad}`, ctx);
       expect(ctx.setComments).not.toHaveBeenCalled();
       expect(ctx.replies).toHaveLength(1);
-      expect(ctx.replies[0]).toContain('/comments [status|on|off]');
+      expect(ctx.replies[0]).toContain('Invalid command');
       expect(ctx.replies[0]).toContain('/help');
     }
   });
@@ -223,7 +223,7 @@ describe('owner command registry', () => {
     await dispatchOwnerCommand('/model', ctx);
     expect(ctx.runHarnessCommand).not.toHaveBeenCalled();
     expect(ctx.replies).toHaveLength(1);
-    expect(ctx.replies[0]).toContain('/model <model-id>');
+    expect(ctx.replies[0]).toContain('Invalid command');
   });
 
   it('returns help for a malformed /model argument', async () => {
@@ -355,6 +355,36 @@ describe('owner-channel task subcommands', () => {
     });
   }
 
+  it('snapshots the Markdown task lifecycle integration surface', async () => {
+    const t = await createTestTask();
+    const replies: string[] = [];
+    for (const command of [
+      `/task show ${t.task_id}`,
+      `/task start ${t.task_id}`,
+    ]) {
+      const ctx = context();
+      await dispatchOwnerCommand(command, ctx);
+      replies.push(...ctx.replies);
+    }
+    const { activateTask } = await import('../src/rooms-tasks/task-state.js');
+    activateTask(t.task_id);
+    for (const command of [
+      `/task block ${t.task_id} waiting on *dependency*`,
+      `/task unblock ${t.task_id}`,
+      `/task review ${t.task_id}`,
+      '/task list all',
+      `/task recover ${t.task_id}`,
+    ]) {
+      const ctx = context();
+      await dispatchOwnerCommand(command, ctx);
+      replies.push(...ctx.replies);
+    }
+    expect(replies.map(reply => reply
+      .replaceAll(t.task_id, '<TASK_ID>')
+      .replace(/\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{3}Z/g, '<ISO_DATE>')))
+      .toMatchSnapshot();
+  });
+
   it('/task <id> shows task details (backward compat)', async () => {
     const t = await createTestTask();
     const ctx = context();
@@ -377,7 +407,7 @@ describe('owner-channel task subcommands', () => {
     const ctx = context();
     await dispatchOwnerCommand(`/task start ${t.task_id}`, ctx);
     expect(ctx.replies).toHaveLength(1);
-    expect(ctx.replies[0]).toContain('provisioning');
+    expect(ctx.replies[0]).toContain('Provisioning');
   });
 
   it('/task block <id> <reason> blocks an active task', async () => {
@@ -427,6 +457,17 @@ describe('owner-channel task subcommands', () => {
     expect(ctx.replies).toEqual([`terminal:${t.task_id}:done`]);
   });
 
+  it('keeps arbitrary task effect errors generic and never exposes their text', async () => {
+    const secret = 'cannot connect using /secret/path token=canary-token';
+    const ctx = context({ terminalTask: vi.fn(async () => { throw new Error(secret); }) });
+    await dispatchOwnerCommand('/task done task-safe-id', ctx);
+    expect(ctx.replies).toHaveLength(1);
+    expect(ctx.replies[0]).toContain('Command failed');
+    expect(ctx.replies[0]).not.toContain('cannot connect');
+    expect(ctx.replies[0]).not.toContain('/secret/path');
+    expect(ctx.replies[0]).not.toContain('canary-token');
+  });
+
   it('/task cancel requires ID twice', async () => {
     const t = await createTestTask();
     const ctx = context();
@@ -469,12 +510,14 @@ describe('owner-channel task subcommands', () => {
 
     const first = context();
     await dispatchOwnerCommand(`/task delete ${t.task_id} ${t.task_id}`, first);
-    expect(first.replies).toEqual([`🗑️ Task ${t.task_id} deleted from backlog`]);
+    expect(first.replies[0]).toContain('## 🗑️ Task deleted');
+    expect(first.replies[0]).toContain(t.task_id);
     expect(() => getTask(t.task_id)).toThrow(/not found/);
 
     const retry = context();
     await dispatchOwnerCommand(`/task delete ${t.task_id} ${t.task_id}`, retry);
-    expect(retry.replies).toEqual([`🗑️ Task ${t.task_id} already absent`]);
+    expect(retry.replies[0]).toContain('## 🗑️ Task already absent');
+    expect(retry.replies[0]).toContain(t.task_id);
   });
 
   it('/task recover reschedules an accepted pending terminal intent', async () => {
@@ -526,7 +569,7 @@ describe('owner-channel task subcommands', () => {
     await dispatchOwnerCommand('/task create my new task', ctx);
     expect(ctx.replies).toHaveLength(1);
     expect(ctx.replies[0]).toContain('created');
-    expect(ctx.replies[0]).toContain('provisioning');
+    expect(ctx.replies[0]).toContain('Provisioning');
   });
 
   it('/task create --backlog creates a task in backlog', async () => {
@@ -541,7 +584,7 @@ describe('owner-channel task subcommands', () => {
     const ctx = context();
     await dispatchOwnerCommand('/task create --template=dev templated task', ctx);
     expect(ctx.replies).toHaveLength(1);
-    expect(ctx.replies[0]).toContain('Template: dev');
+    expect(ctx.replies[0]).toContain('**Template:** `dev`');
   });
 
   it('/task create without title returns usage', async () => {
@@ -555,7 +598,7 @@ describe('owner-channel task subcommands', () => {
     const ctx = context();
     await dispatchOwnerCommand('/task create --no-room manual task', ctx);
     expect(ctx.replies).toHaveLength(1);
-    expect(ctx.replies[0]).toContain('No room requested');
+    expect(ctx.replies[0]).toContain('**Room:** Not requested');
     const { listTasks } = await import('../src/rooms-tasks/task-state.js');
     const tasks = listTasks();
     const t = tasks.find(t => t.title === 'manual task');
@@ -579,8 +622,8 @@ describe('owner-channel task subcommands', () => {
     const ctx = context();
     await dispatchOwnerCommand('/task create --no-room --backlog Complex task\nBrief line 1\nBrief line 2', ctx);
     expect(ctx.replies).toHaveLength(1);
-    expect(ctx.replies[0]).toContain('backlog');
-    expect(ctx.replies[0]).toContain('No room requested');
+    expect(ctx.replies[0]).toContain('Backlog');
+    expect(ctx.replies[0]).toContain('**Room:** Not requested');
     const { listTasks } = await import('../src/rooms-tasks/task-state.js');
     const tasks = listTasks();
     const t = tasks.find(t => t.title === 'Complex task');
@@ -603,7 +646,7 @@ describe('owner-channel task subcommands', () => {
     const ctx = context();
     await dispatchOwnerCommand('/task list backlog', ctx);
     expect(ctx.replies).toHaveLength(1);
-    expect(ctx.replies[0]).toContain('backlog');
+    expect(ctx.replies[0]).toContain('Backlog');
     expect(ctx.replies[0]).toContain('test task');
   });
 
@@ -621,7 +664,7 @@ describe('owner-channel task subcommands', () => {
     await dispatchOwnerCommand(`/task recover ${t.task_id}`, ctx);
     expect(ctx.replies).toHaveLength(1);
     expect(ctx.replies[0]).toContain(t.task_id);
-    expect(ctx.replies[0]).toContain('backlog');
+    expect(ctx.replies[0]).toContain('Backlog');
   });
 
   it('/task recover without id returns usage', async () => {
@@ -656,6 +699,20 @@ describe('owner-channel room subcommands', () => {
     });
   }
 
+  it('snapshots the Markdown room list/show/recovery integration surface', async () => {
+    const r = await createTestRoom('room-snapshot');
+    const replies: string[] = [];
+    for (const command of ['/room list', `/room show ${r.room_id}`, `/room recover ${r.room_id}`]) {
+      const ctx = context();
+      await dispatchOwnerCommand(command, ctx);
+      replies.push(...ctx.replies);
+    }
+    expect(replies.map(reply => reply
+      .replaceAll(r.room_id, '<ROOM_ID>')
+      .replace(/\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{3}Z/g, '<ISO_DATE>')))
+      .toMatchSnapshot();
+  });
+
   it('/room <id> shows room details (backward compat)', async () => {
     const r = await createTestRoom();
     const ctx = context();
@@ -671,6 +728,34 @@ describe('owner-channel room subcommands', () => {
     await dispatchOwnerCommand(`/room show ${r.room_id}`, ctx);
     expect(ctx.replies).toHaveLength(1);
     expect(ctx.replies[0]).toContain(r.room_id);
+  });
+
+  it('/room show and recover redact stored saga diagnostics', async () => {
+    const r = await createTestRoom();
+    const secret = 'stack at /secret/path token=canary-token';
+    const { setSagaError } = await import('../src/rooms-tasks/room-state.js');
+    setSagaError(r.room_id, secret, secret, 'member_failed');
+    for (const command of [`/room show ${r.room_id}`, `/room recover ${r.room_id}`]) {
+      const ctx = context();
+      await dispatchOwnerCommand(command, ctx);
+      expect(ctx.replies).toHaveLength(1);
+      expect(ctx.replies[0]).toContain('inspect role logs');
+      expect(ctx.replies[0]).not.toContain('/secret/path');
+      expect(ctx.replies[0]).not.toContain('canary-token');
+    }
+  });
+
+  it('keeps arbitrary room effect errors generic and never exposes their text', async () => {
+    const r = await createTestRoom();
+    const { activateRoom } = await import('../src/rooms-tasks/room-state.js');
+    activateRoom(r.room_id);
+    const secret = 'cannot connect using /secret/path token=canary-token';
+    const ctx = context({ closeRoom: vi.fn(async () => { throw new Error(secret); }) });
+    await dispatchOwnerCommand(`/room close ${r.room_id} ${r.room_id}`, ctx);
+    expect(ctx.replies).toHaveLength(1);
+    expect(ctx.replies[0]).toContain('Command failed');
+    expect(ctx.replies[0]).not.toContain('/secret/path');
+    expect(ctx.replies[0]).not.toContain('canary-token');
   });
 
   it('/room close requires ID twice', async () => {
@@ -723,7 +808,7 @@ describe('owner-channel room subcommands', () => {
     await dispatchOwnerCommand('/room create --template=team my room', ctx);
     expect(ctx.replies).toHaveLength(1);
     expect(ctx.replies[0]).toContain('created');
-    expect(ctx.replies[0]).toContain('Template: team');
+    expect(ctx.replies[0]).toContain('**Template:** `team`');
   });
 
   it('/room create without name returns usage', async () => {
@@ -738,7 +823,7 @@ describe('owner-channel room subcommands', () => {
     await dispatchOwnerCommand('/room create --template=team My Dev Room', ctx);
     expect(ctx.replies).toHaveLength(1);
     expect(ctx.replies[0]).toContain('created');
-    expect(ctx.replies[0]).toContain('Template: team');
+    expect(ctx.replies[0]).toContain('**Template:** `team`');
     const { listRoomRecords } = await import('../src/rooms-tasks/room-state.js');
     const rooms = listRoomRecords();
     const r = rooms.find(r => r.room_name === 'My Dev Room');
@@ -792,10 +877,10 @@ describe('owner-channel room subcommands', () => {
     closeRoom(r.room_id);
     const listCtx = context();
     await dispatchOwnerCommand('/room list', listCtx);
-    expect(listCtx.replies).toEqual(['🏠 No rooms.']);
+    expect(listCtx.replies).toEqual(['## 🏠 Rooms\n\nNo rooms found.']);
     const showCtx = context();
     await dispatchOwnerCommand(`/room show ${r.room_id}`, showCtx);
-    expect(showCtx.replies[0]).toContain('room not found');
+    expect(showCtx.replies[0]).toContain('## ⚠️ Not found');
   });
 
   it('/room recover migrates a legacy closed record through deletion', async () => {
@@ -813,7 +898,7 @@ describe('owner-channel room subcommands', () => {
     await dispatchOwnerCommand(`/room recover ${r.room_id}`, ctx);
     expect(ctx.replies).toHaveLength(1);
     expect(ctx.replies[0]).toContain(r.room_id);
-    expect(ctx.replies[0]).toContain('saga');
+    expect(ctx.replies[0]).toContain('**Saga:**');
   });
 
   it('/room recover nonexistent returns not found', async () => {

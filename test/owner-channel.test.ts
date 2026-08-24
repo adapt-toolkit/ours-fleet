@@ -727,7 +727,7 @@ describe('OwnerChannel deterministic command dispatch', () => {
     await missing.channel.drain();
     expect(missing.queuePrompt).not.toHaveBeenCalled();
     expect(String(missing.client.calls.find(call => call.name === 'sendMessage')?.args?.text))
-      .toContain('/model <model-id>');
+      .toContain('Invalid command');
 
     const malformed = setup([ownerMessage(58, 'wire-model-bad', '/model $(reboot) now')]);
     await malformed.channel.drain();
@@ -792,8 +792,10 @@ describe('OwnerChannel deterministic command dispatch', () => {
     expect(stateWhenSpawned).toBe('closing');
     expect(wireWhenSpawned).toContain('wire-room-close');
     expect(sendsWhenSpawned).toBeGreaterThan(0);
-    expect(String(client.calls.find(call => call.name === 'sendMessage')?.args?.text))
-      .toContain('accepted/pending');
+    const acknowledgement = String(client.calls.find(call => call.name === 'sendMessage')?.args?.text);
+    expect(acknowledgement).toContain('deletion request was accepted and is still being settled');
+    expect(acknowledgement).toContain(`/room delete ${roomId} ${roomId}`);
+    expect(acknowledgement).not.toContain('Room closed');
   });
 
   it('persists task terminal intent and the wire before launching its external worker', async () => {
@@ -840,7 +842,7 @@ describe('OwnerChannel deterministic command dispatch', () => {
     expect(fleet.settleTask).toHaveBeenCalledWith(task.task_id);
     const texts = client.calls.filter(call => call.name === 'sendMessage')
       .map(call => String(call.args?.text));
-    expect(texts.some(text => text.includes('accepted/pending'))).toBe(true);
+    expect(texts.some(text => text.includes('accepted and is still being settled'))).toBe(true);
     expect(texts.some(text => text.includes('worker scheduled'))).toBe(false);
     expect(persistedTask).toMatchObject({
       state: 'review',
@@ -882,7 +884,7 @@ describe('OwnerChannel deterministic command dispatch', () => {
     });
     const texts = client.calls.filter(call => call.name === 'sendMessage')
       .map(call => String(call.args?.text));
-    expect(texts.some(text => text.includes('accepted/pending'))).toBe(true);
+    expect(texts.some(text => text.includes('accepted and is still being settled'))).toBe(true);
     expect(texts.some(text => text.includes('worker scheduled'))).toBe(false);
     expect(texts.some(text => text.includes('→ cancelled'))).toBe(false);
   });
