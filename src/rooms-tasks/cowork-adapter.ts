@@ -10,6 +10,7 @@ import { homedir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { createConnection } from 'node:net';
 import type { Socket } from 'node:net';
+import type { RoomHistoryEvidence } from './types.js';
 
 const RPC_VERSION = 1;
 const DEFAULT_TIMEOUT_MS = 10_000;
@@ -48,6 +49,13 @@ export interface CoworkRoomInfo {
   briefing?: string;
 }
 
+export interface CoworkRoleBriefingInfo {
+  role: string;
+  text: string;
+  version: number;
+  updated_at: string;
+}
+
 export interface CoworkAdapter {
   available(): Promise<boolean>;
   createRoom(opts: {
@@ -65,6 +73,14 @@ export interface CoworkAdapter {
     role: string;
     min_accepts: number;
   }): Promise<CoworkInviteResult>;
+  setRoleBriefing(roomId: string, opts: {
+    role: string;
+    text: string;
+  }): Promise<CoworkRoleBriefingInfo>;
+  getHistory(roomId: string, opts?: {
+    after?: number;
+    limit?: number;
+  }): Promise<RoomHistoryEvidence[]>;
   getRoom(roomId: string): Promise<CoworkRoomInfo | undefined>;
   listRooms(): Promise<CoworkRoomInfo[]>;
   closeRoom(roomId: string): Promise<void>;
@@ -156,6 +172,80 @@ function projectRoom(value: unknown, operation: string): CoworkRoomInfo {
     ...(typeof mission?.goal === 'string' ? { goal: mission.goal } : {}),
     ...(typeof mission?.briefing === 'string' ? { briefing: mission.briefing } : {}),
   };
+}
+
+function positiveInteger(value: unknown, operation: string, label: string): number {
+  if (!Number.isSafeInteger(value) || (value as number) < 1)
+    throw new CoworkProtocolError(operation, `${label} must be a positive safe integer`);
+  return value as number;
+}
+
+function stringArray(value: unknown, operation: string, label: string): string[] {
+  if (!Array.isArray(value)) throw new CoworkProtocolError(operation, `${label} must be an array`);
+  return value.map((entry, index) => string(entry, operation, `${label}[${index}]`));
+}
+
+function projectHistoryRecord(value: unknown): RoomHistoryEvidence | undefined {
+  const operation = 'room.history';
+  const record = object(value, operation, 'record');
+  const kind = string(record.kind, operation, 'record.kind');
+  const common = {
+    seq: positiveInteger(record.seq, operation, 'record.seq'),
+    record_id: string(record.record_id, operation, 'record.record_id'),
+    at: string(record.at, operation, 'record.at'),
+  };
+  if (kind === 'message') {
+    if (record.category !== 'role_briefing' && record.category !== 'chat') return undefined;
+    const author = object(record.author, operation, 'record.author');
+    return {
+      kind, ...common,
+      message_id: string(record.message_id, operation, 'record.message_id'),
+      category: record.category,
+      author: {
+        identity: string(author.identity, operation, 'record.author.identity'),
+        display_name: string(author.display_name, operation, 'record.author.display_name'),
+        role: string(author.role, operation, 'record.author.role'),
+      },
+      text: text(record.text, operation, 'record.text'),
+      recipient_identities: stringArray(
+        record.recipient_identities, operation, 'record.recipient_identities'),
+      ...(record.briefing_role === undefined ? {} : {
+        briefing_role: string(record.briefing_role, operation, 'record.briefing_role'),
+      }),
+      ...(record.briefing_version === undefined ? {} : {
+        briefing_version: positiveInteger(
+          record.briefing_version, operation, 'record.briefing_version'),
+      }),
+    };
+  }
+  if (kind === 'relay_intent') {
+    if (record.message_id === undefined) return undefined;
+    return {
+      kind, ...common,
+      message_id: string(record.message_id, operation, 'record.message_id'),
+      recipient_identity: string(
+        record.recipient_identity, operation, 'record.recipient_identity'),
+    };
+  }
+  if (kind === 'relay_result') {
+    if (record.message_id === undefined) return undefined;
+    if (record.status !== 'queued' && record.status !== 'send_failed'
+        && record.status !== 'skipped_removed') {
+      throw new CoworkProtocolError(operation, 'record.status is invalid');
+    }
+    return {
+      kind, ...common,
+      intent_record_id: string(record.intent_record_id, operation, 'record.intent_record_id'),
+      message_id: string(record.message_id, operation, 'record.message_id'),
+      recipient_identity: string(
+        record.recipient_identity, operation, 'record.recipient_identity'),
+      status: record.status,
+      ...(record.wire_id === undefined ? {} : {
+        wire_id: string(record.wire_id, operation, 'record.wire_id'),
+      }),
+    };
+  }
+  return undefined;
 }
 
 /** Resolve the same config/state inputs as ours-cowork and return its Unix socket. */
@@ -314,6 +404,37 @@ export function createCoworkAdapter(options: CoworkAdapterOptions = {}): CoworkA
         min_accepts: typeof invite.min_accepts === 'number'
           ? invite.min_accepts : opts.min_accepts,
       };
+    },
+    async setRoleBriefing(roomId, opts) {
+      const result = object(await call('room.briefing.role.set', {
+        room_id: roomId, role: opts.role, text: opts.text,
+      }), 'room.briefing.role.set', 'room');
+      const briefings = object(
+        result.role_briefings, 'room.briefing.role.set', 'room.role_briefings');
+      const briefing = object(
+        briefings[opts.role], 'room.briefing.role.set', `room.role_briefings.${opts.role}`);
+      return {
+        role: opts.role,
+        text: text(briefing.text, 'room.briefing.role.set', 'briefing.text'),
+        version: positiveInteger(
+          briefing.version, 'room.briefing.role.set', 'briefing.version'),
+        updated_at: string(
+          briefing.updated_at, 'room.briefing.role.set', 'briefing.updated_at'),
+      };
+    },
+    async getHistory(roomId, opts = {}) {
+      const result = await call('room.history', {
+        room_id: roomId,
+        ...(opts.after === undefined ? {} : { after: opts.after }),
+        ...(opts.limit === undefined ? {} : { limit: opts.limit }),
+        view: 'operator',
+      });
+      if (!Array.isArray(result))
+        throw new CoworkProtocolError('room.history', 'result must be an array');
+      return result.flatMap(record => {
+        const projected = projectHistoryRecord(record);
+        return projected ? [projected] : [];
+      });
     },
     async getRoom(roomId) {
       try { return projectRoom(await call('room.show', { room_id: roomId }), 'room.show'); }

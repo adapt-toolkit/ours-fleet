@@ -92,9 +92,11 @@ export type SagaPhase =
   | 'create_room'
   | 'attach_owner'
   | 'create_members'
+  | 'configure_briefings'
   | 'join_role_groups'
   | 'wait_seats'
   | 'launch_work'
+  | 'wait_briefing_acks'
   | 'activate'
   | 'completed'
   | 'failed';
@@ -112,7 +114,65 @@ export type ProvisioningDetail =
   | 'owner_cid_mismatch'
   | 'member_failed'
   | 'waiting_seats'
+  | 'waiting_briefing_delivery'
+  | 'waiting_briefing_acks'
+  | 'briefing_delivery_failed'
   | 'uncertain';
+
+export interface RoomRoleBriefingDefinition {
+  role: string;
+  text: string;
+  sha256: string;
+  version?: number;
+  state: 'pending' | 'configured' | 'failed';
+  attempts: number;
+  updated_at: string;
+  last_error?: string;
+}
+
+export interface RoomMemberLaunchState {
+  state: 'pending' | 'intent' | 'launched' | 'stopped' | 'failed';
+  attempt: number;
+  action_id?: string;
+  mission_sha256?: string;
+  launch_id?: string;
+  updated_at: string;
+  error?: string;
+}
+
+export interface RoomMemberBriefingState {
+  role: string;
+  state: 'pending' | 'relay_queued' | 'relay_failed' | 'acknowledged';
+  message_id?: string;
+  relay_intent_record_id?: string;
+  relay_result_record_id?: string;
+  relay_wire_id?: string;
+  checked_at?: string;
+  acknowledged_at?: string;
+  acknowledgement_message_id?: string;
+  acknowledgement_seq?: number;
+  rejected_ack_count: number;
+  last_rejected_ack_reason?: string;
+  last_rejected_ack_seq?: number;
+}
+
+export type RoomHistoryEvidence =
+  | {
+      kind: 'message'; seq: number; record_id: string; at: string; message_id: string;
+      category: 'role_briefing' | 'chat';
+      author: { identity: string; display_name: string; role: string };
+      text: string; recipient_identities: string[];
+      briefing_role?: string; briefing_version?: number;
+    }
+  | {
+      kind: 'relay_intent'; seq: number; record_id: string; at: string;
+      message_id: string; recipient_identity: string;
+    }
+  | {
+      kind: 'relay_result'; seq: number; record_id: string; at: string;
+      intent_record_id: string; message_id: string; recipient_identity: string;
+      status: 'queued' | 'send_failed' | 'skipped_removed'; wire_id?: string;
+    };
 
 export type MemberRetirementPhase =
   | 'stop_requested'
@@ -145,6 +205,8 @@ export interface RoomMemberSeat {
   slot: string;
   cowork_role: string;
   seat_state: 'pending' | 'active' | 'removed';
+  launch?: RoomMemberLaunchState;
+  briefing?: RoomMemberBriefingState;
   retirement?: MemberRetirement;
 }
 
@@ -159,6 +221,7 @@ export interface RoomOrchestrationRecord {
   provisioning_detail?: ProvisioningDetail;
   owner_seat_cid?: string;
   owner_invite_fingerprint?: string;
+  role_briefings?: Record<string, RoomRoleBriefingDefinition>;
   member_seats: RoomMemberSeat[];
   state: RoomOrchestrationState;
   created_at: string;

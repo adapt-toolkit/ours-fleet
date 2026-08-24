@@ -6,6 +6,7 @@ import type {
   RoomOrchestrationRecord, RoomOrchestrationState, SagaCursor, SagaPhase,
   RoomMemberSeat, ProvisioningDetail,
   MemberRetirementPhase, RoomClosePhase,
+  RoomRoleBriefingDefinition, RoomMemberLaunchState, RoomMemberBriefingState,
 } from './types.js';
 
 export const roomsDir = () => join(stateRoot(), 'rooms');
@@ -132,6 +133,56 @@ export function updateMemberSeats(
 ): RoomOrchestrationRecord {
   const r = readRoom(id);
   r.member_seats = seats;
+  writeRoom(r);
+  return r;
+}
+
+export function updateRoomRoleBriefing(
+  id: string,
+  role: string,
+  definition: RoomRoleBriefingDefinition,
+): RoomOrchestrationRecord {
+  const r = readRoom(id);
+  r.role_briefings = { ...(r.role_briefings ?? {}), [role]: definition };
+  writeRoom(r);
+  return r;
+}
+
+const LAUNCH_ORDER: readonly RoomMemberLaunchState['state'][] = [
+  'pending', 'intent', 'launched', 'stopped', 'failed',
+];
+
+const BRIEFING_ORDER: readonly RoomMemberBriefingState['state'][] = [
+  'pending', 'relay_queued', 'relay_failed', 'acknowledged',
+];
+
+export function updateMemberStartup(
+  id: string,
+  roleName: string,
+  update: {
+    launch?: RoomMemberLaunchState;
+    briefing?: RoomMemberBriefingState;
+  },
+): RoomOrchestrationRecord {
+  const r = readRoom(id);
+  const seat = r.member_seats.find(candidate => candidate.role_name === roleName);
+  if (!seat) throw new RoomStateError(`room ${id} has no recorded member ${roleName}`);
+  if (update.launch && seat.launch
+      && LAUNCH_ORDER.indexOf(update.launch.state) < LAUNCH_ORDER.indexOf(seat.launch.state)
+      && !(seat.launch.state === 'stopped' && update.launch.state === 'intent')
+      && !(seat.launch.state === 'failed' && update.launch.state === 'intent')) {
+    throw new RoomStateError(
+      `room ${id} member ${roleName} launch cannot move backward to ${update.launch.state}`,
+    );
+  }
+  if (update.briefing && seat.briefing
+      && BRIEFING_ORDER.indexOf(update.briefing.state) < BRIEFING_ORDER.indexOf(seat.briefing.state)) {
+    throw new RoomStateError(
+      `room ${id} member ${roleName} briefing cannot move backward to ${update.briefing.state}`,
+    );
+  }
+  if (update.launch) seat.launch = update.launch;
+  if (update.briefing) seat.briefing = update.briefing;
   writeRoom(r);
   return r;
 }
