@@ -686,6 +686,7 @@ describe('rooms-tasks split-config backward compat', () => {
     ].join('\n'));
     const cfg = loadConfig();
     expect(cfg.rooms).toBeDefined();
+    expect(cfg.rooms).not.toHaveProperty('provider');
     expect(cfg.rooms!.owner.expected_cid).toBe(cid);
     expect(cfg.rooms!.owner.public_invite).toBe('[REDACTED]');
     expect(cfg.ownerInviteFingerprint).toBeDefined();
@@ -693,6 +694,22 @@ describe('rooms-tasks split-config backward compat', () => {
     expect(cfg.ownerInvite).toBe('test-invite-string');
     expect(Object.keys(cfg)).not.toContain('ownerInvite');
     expect(JSON.stringify(cfg)).not.toContain('test-invite-string');
+  });
+
+  it('accepts and drops legacy rooms.provider while loading split config', () => {
+    const cid = 'a'.repeat(64);
+    base([
+      'roles: {}',
+      'rooms:',
+      '  provider: cowork',
+      '  owner:',
+      `    expected_cid: ${cid}`,
+      '',
+    ].join('\n'));
+    const cfg = loadConfig();
+    expect(cfg.rooms).toBeDefined();
+    expect(cfg.rooms).not.toHaveProperty('provider');
+    expect(JSON.stringify(cfg.rooms)).not.toContain('"provider":"cowork"');
   });
 
   it('loads tasks config from fleet.yaml', () => {

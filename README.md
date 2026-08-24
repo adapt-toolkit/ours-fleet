@@ -434,6 +434,36 @@ role's `harness_options`, so a fleet can set common Codex permission/profile def
 and override individual keys per role. `monitor` merges the same way — a role block
 overrides `defaults.monitor` key-by-key.
 
+### Rooms and tasks
+
+Rooms always use `ours-cowork`; there is no room-provider selector. Configure
+the cowork daemon connection and the room owner directly:
+
+```yaml
+rooms:
+  cowork:
+    config: /home/me/.ours-cowork/config.json
+  owner:
+    expected_cid: 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+    public_invite_file: /home/me/.ours-fleet/owner-room-invite.txt
+  defaults:
+    template: team
+    attach_owner: true
+    close_when_task_done: true
+
+tasks:
+  default_room_template: team
+  create_mode: start
+  close_room_on_done: true
+```
+
+Older prerelease files that contain the exact legacy line `provider: cowork`
+under `rooms:` still load, but the key is ignored and omitted from resolved
+configuration. Remove it when editing the file. Any other legacy value is an
+error because fleet must not silently change the requested semantics. The
+optional `rooms.owner.provider` setting is separate and defaults to
+`messenger-server`.
+
 ### Scheduled agent loops
 
 Top-level `loops` schedule literal prompts from trusted local YAML. Enabled targets

@@ -315,6 +315,34 @@ Role values override defaults. \`\${name}\` substitutes entries from \`vars\`.
 Other role fields include \`max_tokens\`, \`autocompact_pct\`, and \`isolation\`.
 Use README.md for the complete isolation policy and resource-cap schema.
 
+## Rooms and tasks
+
+Rooms always use \`ours-cowork\`; there is no room-provider selector. Configure
+the cowork daemon connection and room owner directly:
+
+\`\`\`yaml
+rooms:
+  cowork:
+    config: /home/me/.ours-cowork/config.json
+  owner:
+    expected_cid: 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+    public_invite_file: /home/me/.ours-fleet/owner-room-invite.txt
+  defaults:
+    template: team
+    attach_owner: true
+    close_when_task_done: true
+tasks:
+  default_room_template: team
+  create_mode: start
+  close_room_on_done: true
+\`\`\`
+
+Older prerelease files with the exact legacy \`provider: cowork\` key under
+\`rooms:\` still load, but the key is ignored and omitted from resolved
+configuration. Remove it when editing the file. Any other legacy value is an
+error. The optional \`rooms.owner.provider\` setting is separate and defaults to
+\`messenger-server\`.
+
 ## Permissions
 
 Prefer the harness-neutral \`permissions\` block:

@@ -817,7 +817,7 @@ describe('doctor rooms-tasks checks (§5.3)', () => {
 
   const ROOMS_YAML = (cid = CID_64, extra = '') =>
     `roles:\n  Developer:\n    harness: fake\n` +
-    `rooms:\n  provider: cowork\n  owner:\n    expected_cid: ${cid}\n${extra}`;
+    `rooms:\n  owner:\n    expected_cid: ${cid}\n${extra}`;
 
   it('runs owner CID shape check on valid config', async () => {
     registerAdapter(fakeAdapter);

@@ -74,7 +74,7 @@ beforeEach(() => {
   cfgPath = join(dir, 'fleet.yaml');
   writeFileSync(cfgPath,
     'roles: {}\n'
-    + 'rooms:\n  provider: cowork\n'
+    + 'rooms:\n'
     + '  owner:\n    expected_cid: ' + 'a'.repeat(64) + '\n'
     + '  defaults:\n    attach_owner: false\n');
   out = [];
