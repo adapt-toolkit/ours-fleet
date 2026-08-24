@@ -127,6 +127,32 @@ async function removeMemberIdentity(name: string): Promise<void> {
   } catch { /* best-effort cleanup */ }
 }
 
+async function redeemRoomInviteAsMember(
+  member: ExpandedMember, invite: string, roomIdentityCid: string,
+): Promise<void> {
+  const client = await attachOursClient({
+    env: process.env,
+    leaseToken: `ours-fleet-member-admit-${process.pid}-${randomUUID()}`,
+    clientPid: process.pid,
+  });
+  try {
+    const bound = await client.chooseIdentity({ name: member.name, force: false });
+    if (bound.cid.toLowerCase() !== member.cid.toLowerCase()) {
+      throw new Error(
+        `member ${member.name} identity CID mismatch: expected ${member.cid}, found ${bound.cid}`,
+      );
+    }
+    const added = await client.addContact({ invite });
+    if (added.cid.toLowerCase() !== roomIdentityCid.toLowerCase()) {
+      throw new Error(
+        `member ${member.name} invite resolved to ${added.cid}; expected room ${roomIdentityCid}`,
+      );
+    }
+  } finally {
+    await client.releaseLease().catch(() => {});
+  }
+}
+
 function settingsFor(member: ExpandedMember, cfg: FleetConfig): MemberSettings {
   let refRole;
   try { refRole = findRole(cfg, member.roleRef); } catch { /* no ref role */ }
@@ -431,6 +457,13 @@ export async function provisionMembers(
     }
   }
 
+  const policy: StartupWaitPolicy = {
+    timeoutMs: input.startupWait?.timeoutMs ?? 60_000,
+    initialDelayMs: input.startupWait?.initialDelayMs ?? 250,
+    maxDelayMs: input.startupWait?.maxDelayMs ?? 2_000,
+    now: input.startupWait?.now ?? Date.now,
+    sleep: input.startupWait?.sleep ?? (ms => new Promise(resolve => setTimeout(resolve, ms))),
+  };
   advanceSaga(roomId, 'join_role_groups', 5);
   try {
     const observedSeats = await cowork.getSeats(roomId);
@@ -453,9 +486,35 @@ export async function provisionMembers(
         role: coworkRole, min_accepts: group.length,
       });
       for (const member of group) {
-        await cowork.acceptInvite(roomId, invite, {
-          role: coworkRole, expected_cid: member.cid,
-        });
+        await redeemRoomInviteAsMember(member, invite, existing.room_identity_cid);
+      }
+      // Cowork deliberately permits one live invite because the standard SDK
+      // exposes authenticated contacts but not per-contact invite provenance.
+      // Reconcile this completed role group before minting the next descriptor.
+      const deadline = policy.now() + policy.timeoutMs;
+      let delay = policy.initialDelayMs;
+      for (;;) {
+        const reconciled = await cowork.recoverRoom(roomId);
+        let waitingForContact = false;
+        for (const member of group) {
+          const seat = reconciled.seats.find(candidate =>
+            candidate.identity_cid === member.cid && candidate.seat_state !== 'removed');
+          if (!seat) {
+            waitingForContact = true;
+            continue;
+          }
+          if (seat.role !== coworkRole) {
+            throw new Error(`Cowork seat ${member.cid} has role ${seat.role}; expected ${coworkRole}`);
+          }
+        }
+        if (!waitingForContact) break;
+        if (policy.now() >= deadline) {
+          throw new Error(
+            `Cowork did not authenticate role group ${coworkRole} after invite redemption`,
+          );
+        }
+        await policy.sleep(delay);
+        delay = Math.min(policy.maxDelayMs, Math.max(delay + 1, delay * 2));
       }
     }
   } catch (error) {
@@ -507,13 +566,6 @@ export async function provisionMembers(
     throw error;
   }
 
-  const policy: StartupWaitPolicy = {
-    timeoutMs: input.startupWait?.timeoutMs ?? 60_000,
-    initialDelayMs: input.startupWait?.initialDelayMs ?? 250,
-    maxDelayMs: input.startupWait?.maxDelayMs ?? 2_000,
-    now: input.startupWait?.now ?? Date.now,
-    sleep: input.startupWait?.sleep ?? (ms => new Promise(resolve => setTimeout(resolve, ms))),
-  };
   const deadline = policy.now() + policy.timeoutMs;
   let delay = policy.initialDelayMs;
   for (;;) {

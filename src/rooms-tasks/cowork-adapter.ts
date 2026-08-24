@@ -485,10 +485,9 @@ export function createCoworkAdapter(options: CoworkAdapterOptions = {}): CoworkA
       return result.map((seat) => projectSeat(seat, 'room.participants'));
     },
     async recoverRoom(roomId) {
-      // Cowork performs packet/state reconciliation during daemon recovery.
-      // Its `room.recover` RPC is specifically invite-receipt recovery, so a
-      // Fleet reconciliation pass must read `room.show`, not mutate invites.
-      return projectRoom(await call('room.show', { room_id: roomId }), 'room.show');
+      return projectRoom(
+        await call('room.reconcile', { room_id: roomId }), 'room.reconcile',
+      );
     },
   };
 }
