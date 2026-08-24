@@ -35,8 +35,8 @@ function allTemplates(cfg: FleetConfig): Record<string, TemplateDefinition> {
 }
 
 function coworkFor(cfg: FleetConfig) {
-  if (!cfg.rooms || cfg.rooms.provider !== 'cowork')
-    throw new ConfigError('rooms: configure provider: cowork before creating or querying rooms');
+  if (!cfg.rooms)
+    throw new ConfigError('rooms: configuration is required before creating or querying rooms');
   return createCoworkAdapter({ configPath: cfg.rooms.cowork?.config });
 }
 

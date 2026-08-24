@@ -69,11 +69,16 @@ export function validateRoomsConfig(
   path: string,
 ): RoomsConfig & { _invite?: { value: string; fingerprint: string } } {
   if (!isPlainObject(raw)) throw new RoomsTasksConfigError(path, 'rooms: must be a mapping');
-  rejectUnknown(raw, RK as unknown as string[], path, 'rooms');
-
-  const provider = (raw.provider as string | undefined) ?? 'cowork';
-  if (provider !== 'cowork')
-    throw new RoomsTasksConfigError(path, `rooms.provider: unsupported '${provider}'; allowed: cowork`);
+  // Migration-only input: provider selection was exposed before rooms shipped,
+  // even though cowork was the sole implementation. Accept the one historical
+  // value without carrying it into the current schema or resolved config.
+  if (Object.hasOwn(raw, 'provider') && raw.provider !== 'cowork')
+    throw new RoomsTasksConfigError(
+      path,
+      'rooms.provider: only the legacy value \'cowork\' can be migrated; remove this field because ours-cowork is always used',
+    );
+  const { provider: _legacyProvider, ...current } = raw;
+  rejectUnknown(current, RK as unknown as string[], path, 'rooms');
 
   let cowork: RoomsCoworkConfig | undefined;
   if (raw.cowork !== undefined) {
@@ -115,7 +120,7 @@ export function validateRoomsConfig(
     };
   }
 
-  return { provider, cowork, owner, defaults, _invite: invite } as
+  return { cowork, owner, defaults, _invite: invite } as
     RoomsConfig & { _invite?: { value: string; fingerprint: string } };
 }
 

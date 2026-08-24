@@ -187,7 +187,6 @@ export interface RoomsDefaults {
 }
 
 export interface RoomsConfig {
-  provider: string;
   cowork?: RoomsCoworkConfig;
   owner: RoomsOwnerConfig;
   defaults?: RoomsDefaults;
@@ -204,7 +203,7 @@ export type RoomTemplatesConfig = Record<string, TemplateDefinition>;
 
 // ── Validation keys ─────────────────────────────────────────────────────
 
-export const ROOMS_KEYS = ['provider', 'cowork', 'owner', 'defaults'] as const;
+export const ROOMS_KEYS = ['cowork', 'owner', 'defaults'] as const;
 export const ROOMS_OWNER_KEYS = ['provider', 'public_invite', 'public_invite_file', 'expected_cid', 'role'] as const;
 export const ROOMS_COWORK_KEYS = ['config'] as const;
 export const ROOMS_DEFAULTS_KEYS = ['template', 'attach_owner', 'close_when_task_done'] as const;

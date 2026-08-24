@@ -550,7 +550,7 @@ describe('config validation', () => {
       const cfg = validateRoomsConfig({
         owner: { expected_cid: CID_64 },
       }, vars, 'test');
-      expect(cfg.provider).toBe('cowork');
+      expect(cfg).not.toHaveProperty('provider');
       expect(cfg.owner.expected_cid).toBe(CID_64);
       expect(cfg.owner.role).toBe('Owner');
     });
@@ -627,11 +627,29 @@ describe('config validation', () => {
       }, vars, 'test')).toThrow(/unknown key.*bogus/);
     });
 
-    it('rejects unsupported provider', () => {
-      expect(() => validateRoomsConfig({
-        provider: 'something-else',
+    it('accepts and drops the exact legacy cowork provider', () => {
+      const cfg = validateRoomsConfig({
+        provider: 'cowork',
         owner: { expected_cid: CID_64 },
-      }, vars, 'test')).toThrow(/unsupported/);
+      }, vars, 'test');
+      expect(cfg).not.toHaveProperty('provider');
+    });
+
+    it.each(['something-else', null, undefined, 1, true, {}])(
+      'rejects a non-migratable legacy provider value: %j',
+      provider => {
+        expect(() => validateRoomsConfig({
+          provider,
+          owner: { expected_cid: CID_64 },
+        }, vars, 'test')).toThrow(/rooms\.provider:.*remove this field/);
+      },
+    );
+
+    it('preserves the distinct owner provider setting', () => {
+      const cfg = validateRoomsConfig({
+        owner: { provider: 'messenger-server', expected_cid: CID_64 },
+      }, vars, 'test');
+      expect(cfg.owner.provider).toBe('messenger-server');
     });
 
     it('accepts valid defaults section', () => {
