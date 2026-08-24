@@ -1,8 +1,14 @@
 import { execFile, spawn } from 'node:child_process';
 
 import type { InterruptOutcome, SessionEvent, SessionSnapshot } from '../session/types.js';
-import type { TaskOutcome, TaskTerminalIntent } from '../rooms-tasks/types.js';
+import type {
+  RoomOrchestrationRecord, TaskOutcome, TaskRecord, TaskTerminalIntent,
+} from '../rooms-tasks/types.js';
 import { launchFleetWorker } from '../rooms-tasks/external-worker.js';
+import {
+  markdownCode, markdownProse, renderMarkdownFailure, renderMarkdownList,
+  renderMarkdownResult, roomStatus, taskStatus,
+} from '../rooms-tasks/markdown.js';
 import { OWNER_COMMENT_LABEL, ownerNotices, type OwnerCommentsState } from './notices.js';
 
 /**
@@ -75,6 +81,37 @@ class OwnerCommandUsageError extends Error {}
 
 const MODEL_ID = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
 const REPLY_MAX_CHARS = 3_500;
+
+const taskListRecord = (task: TaskRecord): string =>
+  `${taskStatus(task.state)} ${markdownCode(task.task_id)} — ${markdownProse(task.title)}`
+  + (task.blocked ? ` — 🚧 Blocked: ${markdownProse(task.blocked.reason)}` : '');
+
+const roomListRecord = (room: RoomOrchestrationRecord): string =>
+  `${roomStatus(room.state)} ${markdownCode(room.room_id)} — ${markdownProse(room.room_name)}`
+  + (room.task_id ? ` — Task ${markdownCode(room.task_id)}` : '');
+
+const taskAction = (
+  title: string, task: TaskRecord, fields: Parameters<typeof renderMarkdownResult>[0]['fields'] = [],
+): string => renderMarkdownResult({
+  icon: '📋', title,
+  fields: [
+    { label: 'ID', value: task.task_id, kind: 'code' },
+    { label: 'Status', value: taskStatus(task.state), kind: 'markdown' },
+    ...fields,
+  ],
+});
+
+const roomAction = (
+  title: string, room: RoomOrchestrationRecord,
+  fields: Parameters<typeof renderMarkdownResult>[0]['fields'] = [],
+): string => renderMarkdownResult({
+  icon: '🏠', title,
+  fields: [
+    { label: 'ID', value: room.room_id, kind: 'code' },
+    { label: 'Status', value: roomStatus(room.state), kind: 'markdown' },
+    ...fields,
+  ],
+});
 
 const strip = (value: unknown, max: number): string =>
   String(value).replace(/[\u0000-\u001f\u007f]/g, ' ').slice(0, max);
@@ -226,12 +263,10 @@ export const ownerCommands: OwnerCommand[] = [
       const { listTasks } = await import('../rooms-tasks/task-state.js');
       const stateFilter = args?.trim() || undefined;
       const tasks = listTasks(stateFilter && stateFilter !== 'all' ? { state: stateFilter as any } : undefined);
-      if (!tasks.length) return ctx.reply('📋 No tasks.');
-      const lines = tasks.map(t => {
-        const blocked = t.blocked ? ` [BLOCKED: ${t.blocked.reason}]` : '';
-        return `${t.task_id}  ${t.state}${blocked}  ${t.title}`;
-      });
-      await ctx.reply(tail(`📋 Tasks:\n${lines.join('\n')}`, REPLY_MAX_CHARS));
+      await ctx.reply(renderMarkdownList({
+        icon: '📋', title: 'Tasks', empty: 'No tasks found.',
+        records: tasks.map(taskListRecord),
+      }));
     },
   },
   {
@@ -249,16 +284,19 @@ export const ownerCommands: OwnerCommand[] = [
       const showTask = async (id: string) => {
         const { getTask } = await import('../rooms-tasks/task-state.js');
         const t = getTask(id);
-        const lines = [
-          `📋 Task: ${t.task_id}`,
-          `Title: ${t.title}`,
-          `State: ${t.state}${t.blocked ? ` [BLOCKED: ${t.blocked.reason}]` : ''}`,
-          ...(t.template ? [`Template: ${t.template.name}@${t.template.version}`] : []),
-          ...(t.room_id ? [`Room: ${t.room_id}`] : []),
-          `Origin: ${t.origin.type}`,
-          `Created: ${t.created_at}`,
-        ];
-        await ctx.reply(lines.join('\n'));
+        await ctx.reply(renderMarkdownResult({
+          icon: '📋', title: 'Task details',
+          fields: [
+            { label: 'ID', value: t.task_id, kind: 'code' },
+            { label: 'Title', value: t.title },
+            { label: 'Status', value: taskStatus(t.state), kind: 'markdown' },
+            ...(t.blocked ? [{ label: 'Blocked', value: t.blocked.reason }] : []),
+            ...(t.template ? [{ label: 'Template', value: `${t.template.name}@${t.template.version}`, kind: 'code' as const }] : []),
+            ...(t.room_id ? [{ label: 'Room', value: t.room_id, kind: 'code' as const }] : []),
+            { label: 'Origin', value: t.origin.type },
+            { label: 'Created', value: t.created_at, kind: 'code' },
+          ],
+        }));
       };
 
       try {
@@ -280,10 +318,11 @@ export const ownerCommands: OwnerCommand[] = [
               ...(noRoom ? { no_room: true } : {}),
               ...(trailingLines ? { brief: trailingLines } : {}),
             });
-            const lines = [`Task ${t.task_id} created · ${t.state}`];
-            if (template) lines.push(`Template: ${template}`);
-            if (noRoom) lines.push('No room requested');
-            await ctx.reply(lines.join('\n'));
+            await ctx.reply(taskAction('Task created', t, [
+              { label: 'Title', value: t.title },
+              ...(template ? [{ label: 'Template', value: template, kind: 'code' as const }] : []),
+              ...(noRoom ? [{ label: 'Room', value: 'Not requested' }] : []),
+            ]));
             break;
           }
           case 'list': {
@@ -299,15 +338,16 @@ export const ownerCommands: OwnerCommand[] = [
             const tasks = listTasks(stateFilter);
             if (filter === 'blocked') {
               const blocked = tasks.filter(t => t.blocked);
-              if (!blocked.length) { await ctx.reply('📋 No blocked tasks.'); break; }
-              const lines = blocked.map(t => `${t.task_id}  ${t.state}  ${t.title}  [BLOCKED: ${t.blocked!.reason}]`);
-              await ctx.reply(tail(`📋 Blocked tasks:\n${lines.join('\n')}`, REPLY_MAX_CHARS));
+              await ctx.reply(renderMarkdownList({
+                icon: '🚧', title: 'Blocked tasks', empty: 'No blocked tasks found.',
+                records: blocked.map(taskListRecord),
+              }));
               break;
             }
-            if (!tasks.length) { await ctx.reply('📋 No tasks.'); break; }
-            const lines = tasks.map(t =>
-              `${t.task_id}  ${t.state}  ${t.title}${t.blocked ? ` [BLOCKED]` : ''}`);
-            await ctx.reply(tail(`📋 Tasks:\n${lines.join('\n')}`, REPLY_MAX_CHARS));
+            await ctx.reply(renderMarkdownList({
+              icon: '📋', title: 'Tasks', empty: 'No tasks found.',
+              records: tasks.map(taskListRecord),
+            }));
             break;
           }
           case 'show': {
@@ -319,7 +359,7 @@ export const ownerCommands: OwnerCommand[] = [
             if (!rest[0]) throw new OwnerCommandUsageError('usage: /task start <id>');
             const { startTask } = await import('../rooms-tasks/task-state.js');
             const t = startTask(rest[0]);
-            await ctx.reply(`✅ Task ${t.task_id} → provisioning`);
+            await ctx.reply(taskAction('Task started', t));
             break;
           }
           case 'block': {
@@ -327,21 +367,21 @@ export const ownerCommands: OwnerCommand[] = [
             const { blockTask } = await import('../rooms-tasks/task-state.js');
             const reason = rest.slice(1).join(' ');
             const t = blockTask(rest[0], reason);
-            await ctx.reply(`🚧 Task ${t.task_id} blocked: ${reason}`);
+            await ctx.reply(taskAction('Task blocked', t, [{ label: 'Reason', value: reason }]));
             break;
           }
           case 'unblock': {
             if (!rest[0]) throw new OwnerCommandUsageError('usage: /task unblock <id>');
             const { unblockTask } = await import('../rooms-tasks/task-state.js');
             const t = unblockTask(rest[0]);
-            await ctx.reply(`✅ Task ${t.task_id} unblocked`);
+            await ctx.reply(taskAction('Task unblocked', t));
             break;
           }
           case 'review': {
             if (!rest[0]) throw new OwnerCommandUsageError('usage: /task review <id>');
             const { reviewTask } = await import('../rooms-tasks/task-state.js');
             const t = reviewTask(rest[0]);
-            await ctx.reply(`📝 Task ${t.task_id} → review`);
+            await ctx.reply(taskAction('Task ready for review', t));
             break;
           }
           case 'done': {
@@ -361,9 +401,10 @@ export const ownerCommands: OwnerCommand[] = [
               throw new OwnerCommandUsageError('destructive: /task delete <id> <id> — provide the task ID twice');
             const { deleteTask } = await import('../rooms-tasks/task-state.js');
             const deleted = deleteTask(rest[0]);
-            await ctx.reply(deleted
-              ? `🗑️ Task ${rest[0]} deleted from backlog`
-              : `🗑️ Task ${rest[0]} already absent`);
+            await ctx.reply(renderMarkdownResult({
+              icon: '🗑️', title: deleted ? 'Task deleted' : 'Task already absent',
+              fields: [{ label: 'ID', value: rest[0], kind: 'code' }],
+            }));
             break;
           }
           case 'recover': {
@@ -383,11 +424,21 @@ export const ownerCommands: OwnerCommand[] = [
               if (room.provisioning_detail === 'owner_cid_mismatch') hints.push('Owner CID mismatch');
               if (room.provisioning_detail === 'member_failed') hints.push(`Member failed at step ${room.saga.step_index}`);
             }
-            const lines = [`Task ${t.task_id} · ${t.state}`];
-            if (room) lines.push(`Room ${room.room_id} · ${room.state} · saga: ${room.saga.phase}`);
-            if (hints.length) lines.push(`Hints: ${hints.join('; ')}`);
-            else lines.push('No automated recovery actions available.');
-            await ctx.reply(lines.join('\n'));
+            await ctx.reply(renderMarkdownResult({
+              icon: '🛟', title: 'Task recovery',
+              fields: [
+                { label: 'Task', value: t.task_id, kind: 'code' },
+                { label: 'Status', value: taskStatus(t.state), kind: 'markdown' },
+                ...(room ? [
+                  { label: 'Room', value: room.room_id, kind: 'code' as const },
+                  { label: 'Room status', value: roomStatus(room.state), kind: 'markdown' as const },
+                  { label: 'Saga', value: room.saga.phase, kind: 'code' as const },
+                ] : []),
+              ],
+              sections: hints.length
+                ? [{ heading: 'Next steps', items: hints }]
+                : [{ heading: 'Result', items: ['No automated recovery action is available.'] }],
+            }));
             break;
           }
           default:
@@ -396,7 +447,20 @@ export const ownerCommands: OwnerCommand[] = [
         }
       } catch (e) {
         if (e instanceof OwnerCommandUsageError) throw e;
-        await ctx.reply(`⚠️ ${e instanceof Error ? e.message : String(e)}`);
+        const detail = e instanceof Error ? e.message : String(e);
+        const notFound = /not found|already absent/i.test(detail);
+        const state = /cannot |terminal state|not blocked|pending/i.test(detail);
+        const validation = /invalid task ID|unknown template|template not found/i.test(detail);
+        const kind = notFound ? 'not_found' : state ? 'state' : validation ? 'usage' : 'unexpected';
+        await ctx.reply(renderMarkdownFailure({
+          kind,
+          subject: `/task ${sub}`,
+          ...(kind === 'unexpected' ? {} : { detail }),
+          action: notFound ? 'Run /task list to find a valid task ID.'
+            : state ? 'Run /task show <id> to inspect the current task state.'
+              : validation ? 'Check the command arguments or run /help.'
+                : 'Retry once; if it repeats, inspect the role logs.',
+        }));
       }
     },
   },
@@ -407,10 +471,10 @@ export const ownerCommands: OwnerCommand[] = [
       const rooms = listRoomRecords().filter(
         room => room.state === 'active' || room.state === 'provisioning',
       );
-      if (!rooms.length) return ctx.reply('🏠 No rooms.');
-      const lines = rooms.map(r =>
-        `${r.room_id}  ${r.state}  ${r.room_name}${r.task_id ? ` (task: ${r.task_id})` : ''}`);
-      await ctx.reply(tail(`🏠 Rooms:\n${lines.join('\n')}`, REPLY_MAX_CHARS));
+      await ctx.reply(renderMarkdownList({
+        icon: '🏠', title: 'Rooms', empty: 'No rooms found.',
+        records: rooms.map(roomListRecord),
+      }));
     }),
   },
   {
@@ -428,19 +492,23 @@ export const ownerCommands: OwnerCommand[] = [
       const showRoom = async (id: string) => {
         const { getRoomRecord } = await import('../rooms-tasks/room-state.js');
         const r = getRoomRecord(id);
-        if (!r || r.state === 'closing' || r.state === 'closed')
-          return ctx.reply(`⚠️ room not found: ${id}`);
-        const lines = [
-          `🏠 Room: ${r.room_id}`,
-          `Name: ${r.room_name}`,
-          `State: ${r.state}`,
-          `Saga: ${r.saga.phase} (step ${r.saga.step_index})`,
-          ...(r.task_id ? [`Task: ${r.task_id}`] : []),
-          ...(r.provisioning_detail ? [`Detail: ${r.provisioning_detail}`] : []),
-          ...(r.saga.error ? [`Error: ${r.saga.error}`] : []),
-          `Created: ${r.created_at}`,
-        ];
-        await ctx.reply(lines.join('\n'));
+        if (!r || r.state === 'closing' || r.state === 'closed') return ctx.reply(renderMarkdownFailure({
+          kind: 'not_found', subject: `/room show ${id}`,
+          detail: `Room ${id} was not found.`, action: 'Run /room list to find a valid room ID.',
+        }));
+        await ctx.reply(renderMarkdownResult({
+          icon: '🏠', title: 'Room details',
+          fields: [
+            { label: 'ID', value: r.room_id, kind: 'code' },
+            { label: 'Name', value: r.room_name },
+            { label: 'Status', value: roomStatus(r.state), kind: 'markdown' },
+            { label: 'Saga', value: `${r.saga.phase} (step ${r.saga.step_index})` },
+            ...(r.task_id ? [{ label: 'Task', value: r.task_id, kind: 'code' as const }] : []),
+            ...(r.provisioning_detail ? [{ label: 'Detail', value: r.provisioning_detail }] : []),
+            ...(r.saga.error ? [{ label: 'Last error', value: 'Provisioning failure recorded; inspect role logs.' }] : []),
+            { label: 'Created', value: r.created_at, kind: 'code' },
+          ],
+        }));
       };
 
       try {
@@ -465,9 +533,10 @@ export const ownerCommands: OwnerCommand[] = [
               ...(templateSnapshot ? { template_snapshot: templateSnapshot } : {}),
               ...(roomTrailingLines ? { goal: roomTrailingLines } : {}),
             });
-            const lines = [`🏠 Room ${r.room_id} created · ${r.state}`];
-            if (templateName) lines.push(`Template: ${templateName}`);
-            await ctx.reply(lines.join('\n'));
+            await ctx.reply(roomAction('Room created', r, [
+              { label: 'Name', value: r.room_name },
+              ...(templateName ? [{ label: 'Template', value: templateName, kind: 'code' as const }] : []),
+            ]));
             break;
           }
           case 'list': {
@@ -477,10 +546,10 @@ export const ownerCommands: OwnerCommand[] = [
               room => room.state === 'active' || room.state === 'provisioning',
             );
             if (filter === 'active') rooms = rooms.filter(r => r.state === 'active');
-            if (!rooms.length) { await ctx.reply('🏠 No rooms.'); break; }
-            const lines = rooms.map(r =>
-              `${r.room_id}  ${r.state}  ${r.room_name}${r.task_id ? ` (task: ${r.task_id})` : ''}`);
-            await ctx.reply(tail(`🏠 Rooms:\n${lines.join('\n')}`, REPLY_MAX_CHARS));
+            await ctx.reply(renderMarkdownList({
+              icon: '🏠', title: 'Rooms', empty: 'No rooms found.',
+              records: rooms.map(roomListRecord),
+            }));
             break;
           }
           case 'show': {
@@ -501,16 +570,30 @@ export const ownerCommands: OwnerCommand[] = [
             if (!rest[0]) throw new OwnerCommandUsageError('usage: /room recover <id>');
             const { getRoomRecord } = await import('../rooms-tasks/room-state.js');
             const r = getRoomRecord(rest[0]);
-            if (!r) { await ctx.reply(`⚠️ room not found: ${rest[0]}`); break; }
+            if (!r) {
+              await ctx.reply(renderMarkdownFailure({
+                kind: 'not_found', subject: `/room recover ${rest[0]}`,
+                detail: `Room ${rest[0]} was not found.`, action: 'Run /room list to find a valid room ID.',
+              }));
+              break;
+            }
             if (r.state === 'closing' || r.state === 'closed') {
               await ctx.closeRoom(r.room_id);
               break;
             }
-            const lines = [`🏠 Room ${r.room_id} · ${r.state} · saga: ${r.saga.phase}`];
-            if (r.saga.error) lines.push(`Error: ${r.saga.error}`);
-            if (r.provisioning_detail) lines.push(`Detail: ${r.provisioning_detail}`);
-            lines.push(r.saga.error ? 'Run `ours-fleet room recover` from CLI for full recovery.' : 'No recovery needed.');
-            await ctx.reply(lines.join('\n'));
+            await ctx.reply(renderMarkdownResult({
+              icon: '🛟', title: 'Room recovery',
+              fields: [
+                { label: 'Room', value: r.room_id, kind: 'code' },
+                { label: 'Status', value: roomStatus(r.state), kind: 'markdown' },
+                { label: 'Saga', value: r.saga.phase, kind: 'code' },
+                ...(r.saga.error ? [{ label: 'Last error', value: r.saga.error }] : []),
+                ...(r.provisioning_detail ? [{ label: 'Detail', value: r.provisioning_detail }] : []),
+              ],
+              sections: [{ heading: 'Next step', items: [r.saga.error
+                ? 'Run ours-fleet room recover from the CLI for full recovery.'
+                : 'No recovery action is needed.'] }],
+            }));
             break;
           }
           default:
@@ -519,7 +602,20 @@ export const ownerCommands: OwnerCommand[] = [
         }
       } catch (e) {
         if (e instanceof OwnerCommandUsageError) throw e;
-        await ctx.reply(`⚠️ ${e instanceof Error ? e.message : String(e)}`);
+        const detail = e instanceof Error ? e.message : String(e);
+        const notFound = /not found/i.test(detail);
+        const state = /cannot |not closing|already closed/i.test(detail);
+        const validation = /invalid room ID|unknown template/i.test(detail);
+        const kind = notFound ? 'not_found' : state ? 'state' : validation ? 'usage' : 'unexpected';
+        await ctx.reply(renderMarkdownFailure({
+          kind,
+          subject: `/room ${sub}`,
+          ...(kind === 'unexpected' ? {} : { detail }),
+          action: notFound ? 'Run /room list to find a valid room ID.'
+            : state ? 'Run /room show <id> to inspect the current room state.'
+              : validation ? 'Check the command arguments or run /help.'
+                : 'Retry once; if it repeats, inspect the role logs.',
+        }));
       }
     },
   },
@@ -620,7 +716,10 @@ export async function dispatchOwnerCommand(
     await command.execute(ctx, args);
   } catch (error) {
     if (error instanceof OwnerCommandUsageError)
-      return ctx.reply(ownerCommandHelp(error.message));
+      return ctx.reply(renderMarkdownFailure({
+        kind: 'usage', subject: token, detail: error.message,
+        action: `Use ${command.usage ?? `/${command.name}`} or run /help.`,
+      }));
     // The failure notice carries no internal detail; the channel logs it.
     await ctx.reply(ownerNotices.commandFailed(command.usage ?? `/${command.name}`));
     throw error;

@@ -1,0 +1,81 @@
+// Vitest Snapshot v1, https://vitest.dev/guide/snapshot.html
+
+exports[`owner-channel room subcommands > snapshots the Markdown room list/show/recovery integration surface 1`] = `
+[
+  "## 🏠 Rooms
+
+- ⏳ Provisioning \`<ROOM_ID>\` — test room",
+  "## 🏠 Room details
+
+- **ID:** \`<ROOM_ID>\`
+
+- **Name:** test room
+
+- **Status:** ⏳ Provisioning
+
+- **Saga:** persist\\_intent (step 0)
+
+- **Created:** \`<ISO_DATE>\`",
+  "## 🛟 Room recovery
+
+- **Room:** \`<ROOM_ID>\`
+
+- **Status:** ⏳ Provisioning
+
+- **Saga:** \`persist_intent\`
+
+### Next step
+- No recovery action is needed.",
+]
+`;
+
+exports[`owner-channel task subcommands > snapshots the Markdown task lifecycle integration surface 1`] = `
+[
+  "## 📋 Task details
+
+- **ID:** \`<TASK_ID>\`
+
+- **Title:** test task
+
+- **Status:** ⏸️ Backlog
+
+- **Template:** \`dev@1\`
+
+- **Origin:** cli
+
+- **Created:** \`<ISO_DATE>\`",
+  "## 📋 Task started
+
+- **ID:** \`<TASK_ID>\`
+
+- **Status:** ⏳ Provisioning",
+  "## 📋 Task blocked
+
+- **ID:** \`<TASK_ID>\`
+
+- **Status:** 🟢 Active
+
+- **Reason:** waiting on \\*dependency\\*",
+  "## 📋 Task unblocked
+
+- **ID:** \`<TASK_ID>\`
+
+- **Status:** 🟢 Active",
+  "## 📋 Task ready for review
+
+- **ID:** \`<TASK_ID>\`
+
+- **Status:** 🟡 Review",
+  "## 📋 Tasks
+
+- 🟡 Review \`<TASK_ID>\` — test task",
+  "## 🛟 Task recovery
+
+- **Task:** \`<TASK_ID>\`
+
+- **Status:** 🟡 Review
+
+### Result
+- No automated recovery action is available.",
+]
+`;

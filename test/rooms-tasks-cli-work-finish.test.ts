@@ -17,6 +17,7 @@ const mocks = vi.hoisted(() => ({
   recoverRoom: vi.fn(),
   getRoom: vi.fn(),
   listRooms: vi.fn(),
+  markdownRender: vi.fn(),
 }));
 
 vi.mock('../src/rooms-tasks/cowork-adapter.js', async (importOriginal) => {
@@ -56,6 +57,25 @@ vi.mock('../src/rooms-tasks/close.js', async (importOriginal) => {
 vi.mock('../src/rooms-tasks/external-worker.js', () => ({
   launchFleetWorker: mocks.launchFleetWorker,
 }));
+
+vi.mock('../src/rooms-tasks/markdown.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../src/rooms-tasks/markdown.js')>();
+  return {
+    ...actual,
+    renderMarkdownResult: (...args: Parameters<typeof actual.renderMarkdownResult>) => {
+      mocks.markdownRender('result');
+      return actual.renderMarkdownResult(...args);
+    },
+    renderMarkdownList: (...args: Parameters<typeof actual.renderMarkdownList>) => {
+      mocks.markdownRender('list');
+      return actual.renderMarkdownList(...args);
+    },
+    renderMarkdownFailure: (...args: Parameters<typeof actual.renderMarkdownFailure>) => {
+      mocks.markdownRender('failure');
+      return actual.renderMarkdownFailure(...args);
+    },
+  };
+});
 
 // ── Imports (resolved after mock interception) ──────────────────────────
 
@@ -98,6 +118,11 @@ async function runLocalTask(...args: string[]): Promise<void> {
 
 async function runRoom(...args: string[]): Promise<void> {
   await makeProgram().parseAsync(['room', ...args, '-c', cfgPath], { from: 'user' });
+}
+
+function expectExactJson(value: unknown): void {
+  expect(`${out.join('\n')}\n`).toBe(`${JSON.stringify(value, null, 2)}\n`);
+  expect(mocks.markdownRender).not.toHaveBeenCalled();
 }
 
 function writeCustomTemplate(include = true): void {
@@ -175,6 +200,7 @@ beforeEach(() => {
         }).catch(() => undefined));
     }, 0);
   });
+  mocks.markdownRender.mockReset();
   // The real provisionMembers ends by activating the room and the task; the
   // fake preserves exactly that contract so the CLI's state flow is exercised.
   mocks.provisionMembers.mockReset().mockImplementation(async ({ roomId, taskId }: { roomId: string; taskId?: string }) => {
@@ -258,13 +284,13 @@ describe('task work', () => {
     expect(after.state).toBe('active');
     expect(after.room_id).toBe(ROOM_ID);
     expect(getRoomRecord(ROOM_ID)!.task_id).toBe(t.task_id);
-    expect(out.join('\n')).toContain(`Room: ${ROOM_ID}`);
+    expect(out.join('\n')).toContain(`**Room:** \`${ROOM_ID}\``);
   });
 
   it('defaults to the single template when none is configured or stored', async () => {
     const t = backlogTask();
     await run('work', t.task_id);
-    expect(out.join('\n')).toContain('Template: single@1');
+    expect(out.join('\n')).toContain('**Template:** `single@1`');
     expect(mocks.provisionMembers).toHaveBeenCalledWith(
       expect.objectContaining({ template: expect.objectContaining({ name: 'single' }) }));
   });
@@ -272,7 +298,7 @@ describe('task work', () => {
   it('honours an explicit --template over the default', async () => {
     const t = backlogTask();
     await run('work', t.task_id, '--template', 'team');
-    expect(out.join('\n')).toContain('Template: team@1');
+    expect(out.join('\n')).toContain('**Template:** `team@1`');
     expect(mocks.provisionMembers).toHaveBeenCalledWith(
       expect.objectContaining({ template: expect.objectContaining({ name: 'team' }) }));
   });
@@ -282,7 +308,7 @@ describe('task work', () => {
     await run('work', t.task_id);
     mocks.createRoom.mockClear();
     await run('work', t.task_id);
-    expect(out.join('\n')).toContain('already has an active room');
+    expect(out.join('\n')).toContain('## 📋 Task already active');
     expect(mocks.createRoom).not.toHaveBeenCalled();
     expect(getTask(t.task_id).room_id).toBe(ROOM_ID);
   });
@@ -291,10 +317,12 @@ describe('task work', () => {
     const t = backlogTask();
     await run('work', t.task_id);
     out = [];
+    mocks.markdownRender.mockClear();
     await run('work', t.task_id, '--json');
     const payload = JSON.parse(out.join('\n'));
     expect(payload.status).toBe('already_active');
     expect(payload.task.task_id).toBe(t.task_id);
+    expectExactJson({ schema_version: 1, task: getTask(t.task_id), status: 'already_active' });
   });
 
   it('task and room show expose per-seat launch, relay, ACK, and rejection evidence', async () => {
@@ -318,17 +346,22 @@ describe('task work', () => {
       },
     }]);
     out = [];
+    mocks.markdownRender.mockClear();
     await runLocalTask('show', t.task_id, '--json');
     const taskPayload = JSON.parse(out.join('\n'));
     expect(taskPayload.orchestration.member_seats[0].briefing.state).toBe('relay_queued');
+    expectExactJson({
+      schema_version: 1, task: getTask(t.task_id), orchestration: getRoomRecord(ROOM_ID),
+    });
 
     out = [];
     await runRoom('show', ROOM_ID);
     const text = out.join('\n');
-    expect(text).toContain('launch=launched briefing=relay_queued');
-    expect(text).toContain('briefing_message=briefing-2 relay=relay-2 ack=pending');
-    expect(text).toContain('reason=owner_seat_cid mismatch');
-    expect(text).toContain(`Developer v2 configured sha256:${'f'.repeat(64)}`);
+    expect(text).toContain('launch launched, briefing relay\\_queued');
+    expect(text).toContain('rejected acknowledgement: owner\\_seat\\_cid mismatch');
+    expect(text).not.toContain('briefing_message=');
+    expect(text).not.toContain('sha256:');
+    expect(text).toContain('`Developer` — version `2` — configured');
   });
 
   it('refuses a terminal-state task', async () => {
@@ -438,6 +471,7 @@ describe('task work', () => {
     await run('work', t.task_id, '--template', 'durable');
     writeCustomTemplate(false);
     out = [];
+    mocks.markdownRender.mockClear();
     await run('recover', t.task_id, '--json');
     const payload = JSON.parse(out.join('\n'));
     expect(payload.task.state).toBe('active');
@@ -445,6 +479,10 @@ describe('task work', () => {
     expect(mocks.provisionMembers).toHaveBeenLastCalledWith(expect.objectContaining({
       template: expect.objectContaining({ name: 'durable', version: 7 }),
     }));
+    expectExactJson({
+      schema_version: 1, task: getTask(t.task_id), room: getRoomRecord(ROOM_ID),
+      recovery_actions: ['Provisioning resumed successfully'],
+    });
   });
 
   it('room recover uses the task-bound durable snapshot after config removal', async () => {
@@ -456,10 +494,13 @@ describe('task work', () => {
     const t = backlogTask();
     await run('work', t.task_id, '--template', 'durable');
     writeCustomTemplate(false);
+    out = [];
+    mocks.markdownRender.mockClear();
     await runRoom('recover', ROOM_ID, '--json');
     expect(mocks.provisionMembers).toHaveBeenLastCalledWith(expect.objectContaining({
       template: expect.objectContaining({ name: 'durable', version: 7 }),
     }));
+    expect(mocks.markdownRender).not.toHaveBeenCalled();
   });
 
   it('refuses to resume a waiting room under a different --template', async () => {
@@ -490,9 +531,9 @@ describe('task work', () => {
 
     out = [];
     await run('work', t.task_id, '--template', 'single');
-    expect(out.join('\n')).toContain('already has an active room');
+    expect(out.join('\n')).toContain('## 📋 Task already active');
     await run('work', t.task_id);
-    expect(out.join('\n')).toContain('already has an active room');
+    expect(out.join('\n')).toContain('## 📋 Task already active');
   });
 
   it('reports a non-resumable room instead of silently stranding the task', async () => {
@@ -566,7 +607,8 @@ describe('task finish', () => {
     expect(getTask(t.task_id)).toMatchObject({
       state: 'review', terminal_intent: { status: 'pending', error: 'room delete failed' },
     });
-    expect(out.join('\n')).toContain('room delete failed');
+    expect(out.join('\n')).toContain('## ⚠️ Command failed');
+    expect(out.join('\n')).not.toContain('room delete failed');
   });
 
   it('the hidden worker durably records failures after terminal acceptance', async () => {
@@ -604,15 +646,18 @@ describe('task finish', () => {
         first_recovery_hint: `Retry 'ours-fleet task recover ${t.task_id}'.`,
       },
     });
-    expect(out.join('\n')).toContain(`Task ${t.task_id} · done`);
+    expect(out.join('\n')).toContain(`**Task:** \`${t.task_id}\``);
+    expect(out.join('\n')).toContain('✅ Done');
   });
 
   it('emits the finished task as --json', async () => {
     const t = await activeTask();
     out = [];
+    mocks.markdownRender.mockClear();
     await run('finish', t.task_id, '--json');
     const payload = JSON.parse(out.join('\n'));
     expect(payload.task.state).toBe('done');
+    expectExactJson({ schema_version: 1, task: getTask(t.task_id) });
   });
 });
 
@@ -637,7 +682,8 @@ describe('task delete', () => {
     const t = doneTask();
     await run('delete', t.task_id, t.task_id);
     expect(() => getTask(t.task_id)).toThrow(/not found/);
-    expect(out.join('\n')).toContain(`Task ${t.task_id} · deleted from backlog`);
+    expect(out.join('\n')).toContain('## 🗑️ Task deleted');
+    expect(out.join('\n')).toContain(t.task_id);
     expect(mocks.closeManagedRoom).not.toHaveBeenCalled();
     expect(mocks.closeRoom).not.toHaveBeenCalled();
     expect(getRoomRecord(ROOM_ID)).toMatchObject({ task_id: t.task_id });
@@ -647,9 +693,8 @@ describe('task delete', () => {
     const t = doneTask();
     await run('delete', t.task_id, t.task_id);
     out = [];
+    mocks.markdownRender.mockClear();
     await run('delete', t.task_id, t.task_id, '--json');
-    expect(JSON.parse(out.join('\n'))).toEqual({
-      schema_version: 1, task_id: t.task_id, deleted: false,
-    });
+    expectExactJson({ schema_version: 1, task_id: t.task_id, deleted: false });
   });
 });
