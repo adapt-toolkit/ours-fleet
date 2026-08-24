@@ -25,7 +25,7 @@ import {
   validateRoomsConfig, validateTasksConfig, validateRoomTemplatesConfig,
   fingerprint, RoomsTasksConfigError,
 } from '../src/rooms-tasks/config.js';
-import type { TemplateDefinition } from '../src/rooms-tasks/types.js';
+import type { TaskState, TemplateDefinition } from '../src/rooms-tasks/types.js';
 
 let dir: string;
 let origHome: string | undefined;
@@ -378,10 +378,52 @@ describe('task-state', () => {
   });
 
   describe('deleteTask', () => {
-    it('removes task file', () => {
-      const t = createTask({ title: 'Delete me', origin });
-      deleteTask(t.task_id);
+    function taskInState(state: TaskState) {
+      const t = createTask({ title: `${state} task`, origin, start: state === 'backlog' ? false : undefined });
+      if (state === 'backlog' || state === 'provisioning') return t;
+      if (state === 'cancelled') return cancelTask(t.task_id);
+      if (state === 'failed') return failTask(t.task_id, 'failed for test');
+      activateTask(t.task_id);
+      if (state === 'active') return getTask(t.task_id);
+      reviewTask(t.task_id);
+      if (state === 'review') return getTask(t.task_id);
+      return completeTask(t.task_id);
+    }
+
+    it.each([
+      'backlog', 'provisioning', 'active', 'review', 'cancelled', 'failed',
+    ] as const)('rejects a %s task', state => {
+      const t = taskInState(state);
+      expect(() => deleteTask(t.task_id)).toThrow(
+        `cannot delete a '${state}' task; only 'done' tasks can be deleted`,
+      );
+      expect(getTask(t.task_id).state).toBe(state);
+    });
+
+    it('removes only a done task and is idempotent when repeated', () => {
+      const t = taskInState('done');
+      expect(deleteTask(t.task_id)).toBe(true);
       expect(() => getTask(t.task_id)).toThrow(/not found/);
+      expect(deleteTask(t.task_id)).toBe(false);
+    });
+
+    it('preserves the associated room orchestration record', () => {
+      const t = taskInState('done');
+      updateTaskRoom(t.task_id, 'room-delete-preserve', 'c'.repeat(64));
+      const room = createRoomRecord({
+        room_id: 'room-delete-preserve', room_name: 'Archived room', task_id: t.task_id,
+      });
+
+      expect(deleteTask(t.task_id)).toBe(true);
+      expect(getRoomRecord(room.room_id)).toEqual(room);
+    });
+
+    it('rejects a traversal-shaped ID without touching an outside file', () => {
+      const outside = join(dir, 'outside.json');
+      writeFileSync(outside, JSON.stringify({ state: 'done' }));
+
+      expect(() => deleteTask('../outside')).toThrow(/invalid task ID/);
+      expect(readFileSync(outside, 'utf8')).toBe(JSON.stringify({ state: 'done' }));
     });
   });
 

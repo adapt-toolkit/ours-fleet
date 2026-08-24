@@ -236,7 +236,7 @@ export const ownerCommands: OwnerCommand[] = [
   },
   {
     name: 'task',
-    usage: '/task <create|list|show|start|block|unblock|review|done|cancel|recover> ...',
+    usage: '/task <create|list|show|start|block|unblock|review|done|cancel|delete|recover> ...',
     summary: 'task lifecycle subcommands',
     execute: async (ctx, args) => {
       if (!args) throw new OwnerCommandUsageError('usage: /task <subcommand> <id>');
@@ -354,6 +354,16 @@ export const ownerCommands: OwnerCommand[] = [
             if (rest.length < 2 || rest[0] !== rest[1])
               throw new OwnerCommandUsageError('destructive: /task cancel <id> <id> — provide the task ID twice');
             await ctx.terminalTask(rest[0], 'cancelled');
+            break;
+          }
+          case 'delete': {
+            if (rest.length !== 2 || rest[0] !== rest[1])
+              throw new OwnerCommandUsageError('destructive: /task delete <id> <id> — provide the task ID twice');
+            const { deleteTask } = await import('../rooms-tasks/task-state.js');
+            const deleted = deleteTask(rest[0]);
+            await ctx.reply(deleted
+              ? `🗑️ Task ${rest[0]} deleted from backlog`
+              : `🗑️ Task ${rest[0]} already absent`);
             break;
           }
           case 'recover': {

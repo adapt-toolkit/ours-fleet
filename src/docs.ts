@@ -343,6 +343,18 @@ configuration. Remove it when editing the file. Any other legacy value is an
 error. The optional \`rooms.owner.provider\` setting is separate and defaults to
 \`messenger-server\`.
 
+Finish and Delete are distinct terminal task actions:
+
+\`ours-fleet task finish <id>\` moves an active or review task to \`done\` and
+closes its associated Cowork room. Cowork retains the room brief, messages,
+summaries, repository references, and attachments as an inspectable archive.
+
+\`ours-fleet task delete <id> <id>\` removes only a \`done\` task's Fleet backlog
+record. The exact task ID is required twice for confirmation. Delete rejects every
+other task state, never closes or deletes the Cowork room/archive, and reports an
+already-missing task as an idempotent no-op. The Owner-channel equivalent is
+\`/task delete <id> <id>\`.
+
 ## Permissions
 
 Prefer the harness-neutral \`permissions\` block:
