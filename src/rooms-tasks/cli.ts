@@ -558,9 +558,14 @@ export function registerTaskCommands(parent: Command, cOpt: (cmd: Command) => Co
             result.recovery_actions.push('Owner CID mismatch — verify rooms.owner.expected_cid matches Messenger identity');
           if (room.provisioning_detail === 'member_failed')
             result.recovery_actions.push(`Member creation failed at saga step ${room.saga.step_index} — inspect and retry`);
+          if (room.provisioning_detail === 'waiting_briefing_acks')
+            result.recovery_actions.push('Members are not ready — inspect per-seat briefing and ACK evidence, then retry recovery');
+          if (room.provisioning_detail === 'briefing_delivery_failed')
+            result.recovery_actions.push('Cowork briefing relay failed terminally — replace the seat or use a Cowork-supported redelivery');
 
           const resumable: import('./types.js').SagaPhase[] =
-            ['create_members', 'join_role_groups', 'wait_seats', 'launch_work', 'activate'];
+            ['create_members', 'configure_briefings', 'join_role_groups', 'wait_seats',
+              'launch_work', 'wait_briefing_acks', 'activate'];
           if (resumable.includes(room.saga.phase)) {
             const template = t.template ? resolveRoomTemplate(cfg, t.template.name) : undefined;
             if (template) {
@@ -704,7 +709,8 @@ export function registerTaskCommands(parent: Command, cOpt: (cmd: Command) => Co
           // pending on the last run). Resume it exactly as `task recover` does.
           const room = getRoomRecord(t.room_id);
           const resumable: import('./types.js').SagaPhase[] =
-            ['create_members', 'join_role_groups', 'wait_seats', 'launch_work', 'activate'];
+            ['create_members', 'configure_briefings', 'join_role_groups', 'wait_seats',
+              'launch_work', 'wait_briefing_acks', 'activate'];
           if (room && resumable.includes(room.saga.phase)) {
             try {
               await provisionMembers({
@@ -1002,10 +1008,15 @@ export function registerRoomCommands(parent: Command, cOpt: (cmd: Command) => Co
           actions.push('Check ours-cowork service status');
         if (r?.provisioning_detail === 'waiting_owner_invite')
           actions.push('Rotate rooms.owner.public_invite in config, then re-run recover');
+        if (r?.provisioning_detail === 'waiting_briefing_acks')
+          actions.push('Inspect per-seat briefing and ACK evidence, then re-run recover');
+        if (r?.provisioning_detail === 'briefing_delivery_failed')
+          actions.push('Replace the failed seat or use a Cowork-supported briefing redelivery');
 
         if (r && r.state === 'provisioning') {
           const resumable: import('./types.js').SagaPhase[] =
-            ['create_members', 'join_role_groups', 'wait_seats', 'launch_work', 'activate'];
+            ['create_members', 'configure_briefings', 'join_role_groups', 'wait_seats',
+              'launch_work', 'wait_briefing_acks', 'activate'];
           if (resumable.includes(r.saga.phase) && r.template_snapshot) {
             try {
               const template = resolveRoomTemplate(cfg, r.template_snapshot.name);
