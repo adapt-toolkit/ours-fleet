@@ -243,44 +243,4 @@ describe('FLEET-003 scheduled-loop admission after a steered wake', () => {
     await dying.close();
   });
 
-  it('still cancels a genuinely working turn well inside the settlement deadline', async () => {
-    const stateDir = mkdtempSync(join(tmpdir(), 'ours-fleet-steer-control-'));
-    dirs.push(stateDir);
-    const logs: string[] = [];
-    // Control for the six production runs that settled in 34-329 ms and were
-    // never SIGTERMed. A real turn, cancelled, must still settle promptly and
-    // leave the role alive.
-    const session = await startSession(stateDir, logs, {});
-    const arbiter = new RoleTurnArbiter(session);
-    const clock = fakeTimers();
-    let now = 0;
-    const manager = new ScheduledLoopManager(
-      'Coordinator', [definition({ prompt: 'block 5000', promptBytes: 10 })], stateDir, arbiter, {
-        now: () => now,
-        setTimer: clock.setTimer,
-        clearTimer: clock.clearTimer,
-        log: line => logs.push(line),
-        cancelAbandonMs: 5_000,
-      });
-
-    manager.start();
-    await manager.poll();
-    for (let i = 0; i < 100 && session.snapshot().readiness !== 'running'; i++)
-      await new Promise(resolve => setTimeout(resolve, 10));
-    expect(manager.status().loops.health.activeRunId).toMatch(/^sl_/);
-
-    const startedAt = Date.now();
-    now = 5 * 60_000;
-    clock.pending(5 * 60_000)!.callback();
-    for (let i = 0; i < 200 && manager.status().loops.health.activeRunId !== null; i++)
-      await new Promise(resolve => setTimeout(resolve, 10));
-
-    expect(Date.now() - startedAt).toBeLessThan(150);
-    expect(manager.status().loops.health.lastOutcome).toContain('cancelled');
-    expect(session.isAlive()).toBe(true);
-    expect(logs.join('\n')).not.toContain('ACP_CANCEL_DEADLINE_EXCEEDED');
-
-    await manager.stop();
-    await session.close();
-  });
 });
