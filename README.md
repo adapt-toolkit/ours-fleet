@@ -454,10 +454,10 @@ role's `harness_options`, so a fleet can set common Codex permission/profile def
 and override individual keys per role. `monitor` merges the same way — a role block
 overrides `defaults.monitor` key-by-key.
 
-Every supervised role is a client of the operator-configured ours daemon. Fleet
-forces `OURS_AUTOSTART=0` in both tmux and ACP harness processes, after role environment
-overlays, so `env.OURS_AUTOSTART` cannot transfer shared daemon lifecycle ownership to an
-agent. Operators and explicit installer/setup flows remain responsible for starting it.
+Every supervised role is a client of the operator-configured ours daemon. Fleet strips the
+obsolete, presence-sensitive `OURS_AUTOSTART` variable from both tmux and ACP harness
+processes. `ours-mcp proxy` is client-only and never starts a daemon; operators and explicit
+installer/setup flows remain responsible for starting it.
 
 ### Rooms and tasks
 

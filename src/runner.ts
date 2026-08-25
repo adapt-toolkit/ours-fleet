@@ -109,18 +109,18 @@ const defaultDeps = (): RunnerDeps => ({
 });
 
 const MONITOR_OWNER_FILE = '.monitor-owner';
-/** Fleet roles consume the operator-owned daemon; a role session never starts it. */
-const FLEET_OURS_AUTOSTART = '0';
+const OBSOLETE_OURS_AUTOSTART_ENV = 'OURS_AUTOSTART';
 
 /** Environment injected only into the managed harness process. */
 export function managedFleetProxyEnv(
   role: ResolvedRole, stateDir: string,
 ): Record<string, string> {
+  const roleEnv = { ...(role.env ?? {}) };
+  // ours-mcp 1.0 treats presence (even "0") as a fatal legacy lifecycle mode.
+  // Managed children are daemon clients; the proxy itself never starts one.
+  delete roleEnv[OBSOLETE_OURS_AUTOSTART_ENV];
   return {
-    ...(role.env ?? {}),
-    // This must win over both inherited/configured auto-start. ACP agents run
-    // directly rather than through ours-codex, so the runner owns this fence.
-    OURS_AUTOSTART: FLEET_OURS_AUTOSTART,
+    ...roleEnv,
     [FLEET_PROXY_STATE_DIR_ENV]: stateDir,
     [FLEET_PROXY_CALLER_ENV]: role.name,
   };
@@ -219,19 +219,16 @@ export function buildPaneCommand(
   launch: Launch, roleEnv: Record<string, string> | undefined, exitStatusPath: string,
   paneArgv: string[] = launch.argv,
 ): string {
-  const env = {
+  const env: Record<string, string> = {
     PATH: process.env.PATH ?? '', COLORTERM: 'truecolor', ...launch.env, ...(roleEnv ?? {}),
-    // Tmux roles have the same daemon-client boundary as ACP roles. Keep this
-    // last so neither harness preparation nor a role env block can take over
-    // the shared daemon lifecycle.
-    OURS_AUTOSTART: FLEET_OURS_AUTOSTART,
   };
+  delete env[OBSOLETE_OURS_AUTOSTART_ENV];
   // Interactive panes should advertise colour even when the supervisor itself
   // was launched with NO_COLOR. A role may still deliberately opt back in to
   // NO_COLOR (or replace COLORTERM) through its explicit env block.
   const unsetNoColor = Object.prototype.hasOwnProperty.call(roleEnv ?? {}, 'NO_COLOR')
     ? '' : '-u NO_COLOR ';
-  const envPfx = 'env ' + unsetNoColor
+  const envPfx = 'env -u OURS_AUTOSTART ' + unsetNoColor
     + Object.entries(env).map(([k, v]) => `${k}=${shq(v)}`).join(' ');
   const cmd = paneArgv.map(shq).join(' ');
   // Write a structured record, not a bare number: the wait status alone cannot
@@ -756,6 +753,7 @@ export async function runOnce(
       // role-only adapter hook prevents a PATH fallback or resolver skew from
       // claiming metadata trust for an argv it did not authenticate.
       permissionMetadataSource: (launch as AcpLaunch).permissionMetadataSource,
+      scrubObsoleteOursAutostart: true,
       log: deps.log,
     });
     pid = acpSession.pid;

@@ -135,8 +135,10 @@ export interface HarnessAdapter {
   acpPermissionModeId?(role: ResolvedRole): string | undefined;
   /**
    * The MCP servers this role declares, for the `mcpServers` array of ACP's
-   * `session/new` / `resume` / `load`. `undefined` preserves the agent's
-   * inherited configuration; an explicit empty array disables all servers.
+   * `session/new` / `resume` / `load`. ACP requires an array on the wire, so
+   * `undefined` is encoded as `[]` while the authenticated bundled adapter is
+   * left to preserve its inherited configuration. An explicit empty array uses
+   * that adapter's compatibility path to disable all inherited servers.
    */
   acpMcpServers?(role: ResolvedRole): AcpMcpServer[] | undefined;
   /**

@@ -320,9 +320,9 @@ Other role fields include \`max_tokens\`, \`autocompact_pct\`, and \`isolation\`
 Use README.md for the complete isolation policy and resource-cap schema.
 
 Supervised roles connect to the operator-configured ours daemon; they do not own its
-lifecycle. Fleet forces \`OURS_AUTOSTART=0\` in tmux and ACP child processes after role
-environment overlays. Start the shared daemon only through an explicit operator or
-installer/setup flow.
+lifecycle. Fleet strips the obsolete, presence-sensitive \`OURS_AUTOSTART\` variable from
+tmux and ACP children; \`ours-mcp proxy\` is client-only and never starts a daemon. Start
+the shared daemon only through an explicit operator or installer/setup flow.
 
 ## Rooms and tasks
 
@@ -515,9 +515,10 @@ headers }\`). By default they are ADDED to whatever the OS user running the role
 already has configured, on both session types: tmux passes \`--mcp-config\`, and
 ACP sends them in \`session/new\`.
 
-When \`mcp_servers\` is absent, Fleet omits ACP's \`mcpServers\` field so the
-agent keeps its inherited servers. An explicit empty ACP server array is different:
-it is forwarded as \`[]\` and disables every inherited server.
+When \`mcp_servers\` is absent, Fleet sends ACP's protocol-required empty
+\`mcpServers\` array without an exclusive override, so the agent keeps its inherited
+servers. An explicitly empty configured set is different: Fleet preserves that intent
+through the bundled adapter's compatibility path and disables every inherited server.
 
 \`mcp_servers_only: true\` makes the declared set EXCLUSIVE — \`--strict-mcp-config\`
 on tmux, \`strictMcpConfig\` on ACP. It is all-or-nothing and it ignores every

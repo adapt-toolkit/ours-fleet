@@ -75,6 +75,9 @@ export const AFTER_TOOL_BOUNDARY_TIMEOUT_MS = 120_000;
 export const STEERING_OCCUPANCY_IDLE_MS = 150_000;
 const TERMINAL_TOOL_STATUSES = new Set(['completed', 'failed']);
 
+/** Consumed only by Fleet's authenticated bundled-Codex app-server proxy. */
+export const CODEX_DISABLE_INHERITED_MCP_ENV = 'OURS_FLEET_CODEX_DISABLE_INHERITED_MCP';
+
 const SCHEDULED_LOOP_REDACTION = '[scheduled-loop content redacted]';
 const OWNER_COMMENTARY_REDACTION = '[assistant commentary redacted]';
 const MAX_CANONICAL_SYMLINK_DEPTH = 40;
@@ -244,10 +247,13 @@ export interface AcpSessionOptions {
   permissionMode?: NonNullable<SessionSnapshot['permissionMode']>;
   /** Adapter-authenticated request-metadata vocabulary; never inferred from ACP `_meta`. */
   permissionMetadataSource?: 'codex-acp';
+  /** Fleet-managed ours proxies must never receive the obsolete presence-sensitive flag. */
+  scrubObsoleteOursAutostart?: boolean;
   /**
    * MCP servers the ROLE declares, for every session/new, resume and load.
-   * Omitted preserves inherited configuration; an explicit empty array disables
-   * every inherited server.
+   * Omitted preserves inherited configuration (encoded as ACP's required `[]`);
+   * an explicit empty array disables every inherited server through the
+   * authenticated bundled-adapter compatibility path.
    */
   mcpServers?: AcpMcpServer[];
   /**
@@ -403,9 +409,24 @@ export class AcpSession implements SessionHandle {
 
   static async start(options: AcpSessionOptions): Promise<AcpSession> {
     if (!options.argv.length) throw new Error('ACP agent command is empty');
+    const disableInheritedCodexMcp = options.permissionMetadataSource === 'codex-acp'
+      && options.mcpServers !== undefined && options.mcpServers.length === 0;
+    // Obsolete ours-mcp lifecycle flags are presence-sensitive. The shared
+    // daemon remains operator-owned; managed ACP children are clients only.
+    const childEnv = {
+      ...process.env,
+      ...options.env,
+    };
+    if (options.scrubObsoleteOursAutostart) delete childEnv.OURS_AUTOSTART;
+    Object.assign(childEnv,
+      // Write both states for the authenticated proxy: a stale ambient `1`
+      // must never leak explicit-empty semantics into a later inherited role.
+      options.permissionMetadataSource === 'codex-acp'
+        ? { [CODEX_DISABLE_INHERITED_MCP_ENV]: disableInheritedCodexMcp ? '1' : '0' }
+        : {});
     const child = spawn(options.argv[0], options.argv.slice(1), {
       cwd: options.cwd,
-      env: { ...process.env, ...options.env },
+      env: childEnv,
       stdio: ['pipe', 'pipe', 'pipe'],
     });
     await new Promise<void>((resolve, reject) => {
@@ -1112,11 +1133,9 @@ export class AcpSession implements SessionHandle {
     this.conversation.close();
   }
 
-  /** Preserve inheritance on omission; carry even an explicit empty override. */
-  private declaredMcpServers(): { mcpServers: AcpMcpServer[] } | Record<string, never> {
-    return this.options.mcpServers === undefined
-      ? {}
-      : { mcpServers: this.options.mcpServers };
+  /** ACP requires the field. Bundled agents treat [] as no client-added servers. */
+  private declaredMcpServers(): AcpMcpServer[] {
+    return this.options.mcpServers ?? [];
   }
 
   private async initialize(): Promise<void> {
@@ -1140,7 +1159,7 @@ export class AcpSession implements SessionHandle {
       const resumed = await this.connection.agent.request(acp.methods.agent.session.resume, {
         sessionId: persisted,
         cwd: this.options.cwd,
-        ...this.declaredMcpServers(),
+        mcpServers: this.declaredMcpServers(),
       });
       this.captureRuntimeMetadata(resumed.configOptions);
       this.sessionId = persisted;
@@ -1152,7 +1171,7 @@ export class AcpSession implements SessionHandle {
         const loaded = await this.connection.agent.request(acp.methods.agent.session.load, {
           sessionId: persisted,
           cwd: this.options.cwd,
-          ...this.declaredMcpServers(),
+          mcpServers: this.declaredMcpServers(),
         }) as { configOptions?: acp.SessionConfigOption[] | null };
         this.captureRuntimeMetadata(loaded.configOptions);
       } finally { this.replaying = false; }
@@ -1160,7 +1179,7 @@ export class AcpSession implements SessionHandle {
     } else {
       const created = await this.connection.agent.request(acp.methods.agent.session.new, {
         cwd: this.options.cwd,
-        ...this.declaredMcpServers(),
+        mcpServers: this.declaredMcpServers(),
         ...(this.options.sessionMeta ? { _meta: this.options.sessionMeta } : {}),
       }) as { sessionId: string; configOptions?: acp.SessionConfigOption[] | null };
       this.sessionId = created.sessionId;

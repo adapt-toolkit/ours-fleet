@@ -9,6 +9,7 @@ const APPROVAL_ENV = 'OURS_FLEET_CODEX_APPROVAL';
 const SANDBOX_ENV = 'OURS_FLEET_CODEX_SANDBOX';
 const REAL_CODEX_ENV = 'OURS_FLEET_REAL_CODEX_PATH';
 const ACP_MANIFEST_ENV = 'OURS_FLEET_CODEX_ACP_MANIFEST';
+const DISABLE_INHERITED_MCP_ENV = 'OURS_FLEET_CODEX_DISABLE_INHERITED_MCP';
 
 const APPROVAL_POLICIES = new Set(['untrusted', 'on-request', 'never']);
 const SANDBOX_MODES = new Set(['read-only', 'workspace-write', 'danger-full-access']);
@@ -32,21 +33,34 @@ function sandboxMode(policy: unknown): string | undefined {
  * configured approval policy on the request Codex actually executes.
  */
 function rewriteMessage(
-  value: unknown, approval: string, expectedSandbox: string,
+  value: unknown, approval: string, expectedSandbox: string, disableInheritedMcp: boolean,
 ): unknown {
   if (Array.isArray(value))
-    return value.map(candidate => rewriteMessage(candidate, approval, expectedSandbox));
-  if (!isObject(value) || value.method !== 'turn/start' || !isObject(value.params)) return value;
-  if (sandboxMode(value.params.sandboxPolicy) !== expectedSandbox) return value;
-  return { ...value, params: { ...value.params, approvalPolicy: approval } };
+    return value.map(candidate =>
+      rewriteMessage(candidate, approval, expectedSandbox, disableInheritedMcp));
+  if (!isObject(value) || !isObject(value.params)) return value;
+  if (value.method === 'turn/start') {
+    if (sandboxMode(value.params.sandboxPolicy) !== expectedSandbox) return value;
+    return { ...value, params: { ...value.params, approvalPolicy: approval } };
+  }
+  if (disableInheritedMcp
+      && (value.method === 'thread/start' || value.method === 'thread/resume')) {
+    const config = isObject(value.params.config) ? value.params.config : {};
+    return {
+      ...value,
+      params: { ...value.params, config: { ...config, mcp_servers: {} } },
+    };
+  }
+  return value;
 }
 
 /** Transform one app-server NDJSON request; malformed input passes through. */
 export function rewriteCodexAppServerRequest(
-  line: string, approval: string, expectedSandbox: string,
+  line: string, approval: string, expectedSandbox: string, disableInheritedMcp = false,
 ): string {
   try {
-    return JSON.stringify(rewriteMessage(JSON.parse(line), approval, expectedSandbox));
+    return JSON.stringify(
+      rewriteMessage(JSON.parse(line), approval, expectedSandbox, disableInheritedMcp));
   } catch {
     return line;
   }
@@ -77,6 +91,7 @@ export function runCodexAppServerProxy(): void {
     throw new Error('the fleet Codex proxy may only be launched as CODEX_PATH app-server');
   const approval = requiredChoice(APPROVAL_ENV, APPROVAL_POLICIES);
   const expectedSandbox = requiredChoice(SANDBOX_ENV, SANDBOX_MODES);
+  const disableInheritedMcp = process.env[DISABLE_INHERITED_MCP_ENV] === '1';
   const launch = realCodexLaunch();
   const env = { ...process.env };
   delete env.CODEX_PATH;
@@ -84,6 +99,7 @@ export function runCodexAppServerProxy(): void {
   delete env[SANDBOX_ENV];
   delete env[REAL_CODEX_ENV];
   delete env[ACP_MANIFEST_ENV];
+  delete env[DISABLE_INHERITED_MCP_ENV];
 
   const child = spawn(launch.command, launch.args, {
     env, shell: launch.shell, stdio: ['pipe', 'pipe', 'pipe'],
@@ -112,7 +128,8 @@ export function runCodexAppServerProxy(): void {
   child.stdin.on('error', () => {});
   input.on('line', line => {
     if (finished) return;
-    const output = rewriteCodexAppServerRequest(line, approval, expectedSandbox) + '\n';
+    const output = rewriteCodexAppServerRequest(
+      line, approval, expectedSandbox, disableInheritedMcp) + '\n';
     if (!child.stdin.write(output)) {
       input.pause();
       child.stdin.once('drain', () => {

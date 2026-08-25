@@ -61,6 +61,27 @@ async function runProxy(realCodexPath: string, pendingInput?: string): Promise<{
 }
 
 describe('Codex app-server permission proxy', () => {
+  it.each(['thread/start', 'thread/resume'])
+  ('turns an authenticated explicit-empty marker into config.mcp_servers={} for %s', method => {
+    const input = JSON.stringify({
+      jsonrpc: '2.0', id: 3, method,
+      params: { threadId: 'T', config: { model: 'gpt-5.6', feature: { enabled: true } } },
+    });
+    const output = JSON.parse(rewriteCodexAppServerRequest(
+      input, 'never', 'workspace-write', true));
+    expect(output.params.config).toEqual({
+      model: 'gpt-5.6', feature: { enabled: true }, mcp_servers: {},
+    });
+  });
+
+  it('does not infer explicit empty from an ordinary Codex session request', () => {
+    const input = JSON.stringify({
+      jsonrpc: '2.0', id: 3, method: 'thread/start',
+      params: { config: { model: 'gpt-5.6' } },
+    });
+    expect(rewriteCodexAppServerRequest(input, 'never', 'workspace-write')).toBe(input);
+  });
+
   it.each([
     ['untrusted', 'read-only', { type: 'readOnly', networkAccess: false }],
     ['never', 'workspace-write', { type: 'workspaceWrite', writableRoots: [] }],

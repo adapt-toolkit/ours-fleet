@@ -202,13 +202,22 @@ createInterface({ input: process.stdin }).on('line', line => {
           protocolVersion: 1,
           agentCapabilities: {
             loadSession: process.env.ACP_FIXTURE_LOAD_SESSION === '1',
-            sessionCapabilities: { close: {} },
+            sessionCapabilities: {
+              close: {},
+              ...(process.env.ACP_FIXTURE_RESUME_SESSION === '1' ? { resume: {} } : {}),
+            },
           },
           _meta: { steering: { supported: true } },
         },
       });
       break;
     case 'session/new':
+      if (process.env.ACP_FIXTURE_REQUIRE_MCP_SERVERS === '1'
+          && !Array.isArray(message.params?.mcpServers)) {
+        send({ jsonrpc: '2.0', id: message.id,
+          error: { code: -32602, message: 'Invalid params: mcpServers required' } });
+        break;
+      }
       // Echo back what the CLIENT actually declared, so a test can assert that
       // per-role MCP servers and the agent-specific `_meta` options reached the
       // wire instead of being dropped on the way to the ACP launch.
@@ -220,6 +229,12 @@ createInterface({ input: process.stdin }).on('line', line => {
             text: `new-params:${JSON.stringify({
               mcpServers: message.params?.mcpServers ?? null,
               _meta: message.params?._meta ?? null,
+              oursAutostart: process.env.OURS_AUTOSTART ?? null,
+              // Mirrors ours-mcp 1.0's presence-sensitive tools/list contract.
+              oursMcpTools: Object.prototype.hasOwnProperty.call(process.env, 'OURS_AUTOSTART')
+                ? [] : ['choose_identity', 'get_messages'],
+              disableInheritedMcp:
+                process.env.OURS_FLEET_CODEX_DISABLE_INHERITED_MCP ?? null,
             })}`,
           },
           messageId: 'new-params-1',
@@ -227,12 +242,49 @@ createInterface({ input: process.stdin }).on('line', line => {
       }
       send({ jsonrpc: '2.0', id: message.id, result: { sessionId } });
       break;
+    case 'session/resume':
+      if (process.env.ACP_FIXTURE_REQUIRE_MCP_SERVERS === '1'
+          && !Array.isArray(message.params?.mcpServers)) {
+        send({ jsonrpc: '2.0', id: message.id,
+          error: { code: -32602, message: 'Invalid params: mcpServers required' } });
+        break;
+      }
+      if (process.env.ACP_FIXTURE_ECHO_SESSION_PARAMS === '1') {
+        update({
+          sessionUpdate: 'agent_message_chunk',
+          content: { type: 'text', text: `resume-params:${JSON.stringify({
+            mcpServers: message.params?.mcpServers ?? null,
+            disableInheritedMcp:
+              process.env.OURS_FLEET_CODEX_DISABLE_INHERITED_MCP ?? null,
+          })}` },
+          messageId: 'resume-params-1',
+        });
+      }
+      send({ jsonrpc: '2.0', id: message.id, result: {} });
+      break;
     case 'session/load':
+      if (process.env.ACP_FIXTURE_REQUIRE_MCP_SERVERS === '1'
+          && !Array.isArray(message.params?.mcpServers)) {
+        send({ jsonrpc: '2.0', id: message.id,
+          error: { code: -32602, message: 'Invalid params: mcpServers required' } });
+        break;
+      }
       // ACP `session/load` replays prior history as ordinary updates BEFORE the
       // response — the dedupe-on-replay case a durable transcript must survive.
       if (process.env.ACP_FIXTURE_REPLAY === '1') {
         update({ sessionUpdate: 'user_message_chunk', content: { type: 'text', text: 'replayed question' }, messageId: 'replay-user-1' });
         update({ sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'replayed answer' }, messageId: 'replay-msg-1' });
+      }
+      if (process.env.ACP_FIXTURE_ECHO_SESSION_PARAMS === '1') {
+        update({
+          sessionUpdate: 'agent_message_chunk',
+          content: { type: 'text', text: `load-params:${JSON.stringify({
+            mcpServers: message.params?.mcpServers ?? null,
+            disableInheritedMcp:
+              process.env.OURS_FLEET_CODEX_DISABLE_INHERITED_MCP ?? null,
+          })}` },
+          messageId: 'load-params-1',
+        });
       }
       send({ jsonrpc: '2.0', id: message.id, result: {} });
       break;

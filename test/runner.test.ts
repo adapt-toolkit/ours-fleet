@@ -150,7 +150,7 @@ describe('buildPaneCommand', () => {
     const exitFile = join(dir, 'pane-exit');
     const probe = ['sh', '-c', 'printf "%s|%s" "${NO_COLOR-unset}" "$COLORTERM"'];
     const inherited = buildPaneCommand({ argv: probe, env: {} }, undefined, exitFile);
-    expect(inherited).toContain('env -u NO_COLOR ');
+    expect(inherited).toContain('-u NO_COLOR ');
     expect(inherited).toContain("COLORTERM='truecolor'");
     expect(execFileSync('sh', ['-c', inherited], {
       env: { ...process.env, NO_COLOR: '1' }, encoding: 'utf8',
@@ -165,17 +165,26 @@ describe('buildPaneCommand', () => {
     })).toBe('1|legacy');
   });
 
-  it('makes every supervised tmux harness a daemon client, never a daemon starter', () => {
+  it.each(['', '0', '1'])
+  ('actively unsets supervised tmux OURS_AUTOSTART=%j while preserving sibling env', value => {
+    const exitFile = join(dir, 'pane-exit-autostart');
+    const probe = ['sh', '-c',
+      'printf "%s|%s" "${OURS_AUTOSTART+x}" "$FLEET_SIBLING_ENV"'];
     const cmd = buildPaneCommand(
-      { argv: ['agent'], env: { OURS_AUTOSTART: '1' } },
-      { OURS_AUTOSTART: '1' }, '/tmp/es');
-    expect(cmd).toContain(`OURS_AUTOSTART='0'`);
+      { argv: probe, env: { OURS_AUTOSTART: value, FLEET_SIBLING_ENV: 'kept' } },
+      { OURS_AUTOSTART: value }, exitFile);
+    expect(cmd).toContain('env -u OURS_AUTOSTART ');
+    expect(cmd).not.toContain(`OURS_AUTOSTART='0'`);
     expect(cmd).not.toContain(`OURS_AUTOSTART='1'`);
+    expect(execFileSync('sh', ['-c', cmd], {
+      env: { ...process.env, OURS_AUTOSTART: 'inherited' }, encoding: 'utf8',
+    })).toBe('|kept');
   });
 });
 
 describe('managed fleet child environment', () => {
-  it('makes every supervised ACP harness a daemon client, never a daemon starter', () => {
+  it.each(['', '0', '1'])
+  ('actively omits supervised ACP OURS_AUTOSTART=%j and preserves sibling env', value => {
     const role = {
       name: 'A', harness: 'fake', session: 'acp', identity: 'A', sourceFile: 'x',
       permissions: { approval: 'ask', filesystem: 'workspace', unattended: 'deny' },
@@ -184,10 +193,11 @@ describe('managed fleet child environment', () => {
         mode: 'fleet', enabled: true, wake_sources: [], batch_ms: 2_000,
         inject: 'notification', interrupt: false, turn_fail_threshold: 3,
       },
-      env: { OURS_AUTOSTART: '1' },
+      env: { OURS_AUTOSTART: value, FLEET_SIBLING_ENV: 'kept' },
     } satisfies ResolvedRole;
     const env = managedFleetProxyEnv(role, '/state');
-    expect(env.OURS_AUTOSTART).toBe('0');
+    expect(env).not.toHaveProperty('OURS_AUTOSTART');
+    expect(env.FLEET_SIBLING_ENV).toBe('kept');
   });
 });
 
@@ -633,6 +643,7 @@ describe('runOnce ACP startup outcome', () => {
     mkdirSync(agentDir('A'), { recursive: true });
     const { deps } = acpDeps();
     let observedSource: string | undefined;
+    let observedAutostartScrub = false;
     let alive = true;
     const fakeAcp: SessionHandle = {
       backend: 'acp', pid: 4242,
@@ -659,6 +670,7 @@ describe('runOnce ACP startup outcome', () => {
       ...deps,
       startAcpSession: async options => {
         observedSource = options.permissionMetadataSource;
+        observedAutostartScrub = options.scrubObsoleteOursAutostart === true;
         return fakeAcp;
       },
       createControlServer: () => ({
@@ -670,6 +682,7 @@ describe('runOnce ACP startup outcome', () => {
 
     await runOnce('A', {}, runnerDeps);
     expect(observedSource).toBe('codex-acp');
+    expect(observedAutostartScrub).toBe(true);
   });
 
   it('a refused startup prompt fails the role instead of logging it up', async () => {
