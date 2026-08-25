@@ -515,9 +515,10 @@ headers }\`). By default they are ADDED to whatever the OS user running the role
 already has configured, on both session types: tmux passes \`--mcp-config\`, and
 ACP sends them in \`session/new\`.
 
-When \`mcp_servers\` is absent, Fleet omits ACP's \`mcpServers\` field so the
-agent keeps its inherited servers. An explicit empty ACP server array is different:
-it is forwarded as \`[]\` and disables every inherited server.
+When \`mcp_servers\` is absent, Fleet sends ACP's protocol-required empty
+\`mcpServers\` array without an exclusive override, so the agent keeps its inherited
+servers. An explicitly empty configured set is different: Fleet preserves that intent
+through the bundled adapter's compatibility path and disables every inherited server.
 
 \`mcp_servers_only: true\` makes the declared set EXCLUSIVE — \`--strict-mcp-config\`
 on tmux, \`strictMcpConfig\` on ACP. It is all-or-nothing and it ignores every
