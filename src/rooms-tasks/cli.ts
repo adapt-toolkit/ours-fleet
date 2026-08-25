@@ -375,7 +375,7 @@ async function provisionRoom(cfg: FleetConfig, input: {
   });
   let record = createRoomRecord({
     room_id: created.room_id,
-    room_name: input.name,
+    room_name: created.room_name,
     room_identity_cid: created.identity_cid,
     task_id: input.taskId,
     template_snapshot: input.template,

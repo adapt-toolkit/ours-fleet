@@ -18,6 +18,7 @@ const MAX_RESPONSE_BYTES = 4 * 1024 * 1024;
 
 export interface CoworkRoomCreateResult {
   room_id: string;
+  room_name: string;
   identity_name: string;
   identity_cid: string;
 }
@@ -403,7 +404,12 @@ export function createCoworkAdapter(options: CoworkAdapterOptions = {}): CoworkA
       }), 'room.create');
       if (!result.identity_cid)
         throw new CoworkProtocolError('room.create', 'created room did not establish an identity CID');
-      return { room_id: result.room_id, identity_name: result.identity_name, identity_cid: result.identity_cid };
+      return {
+        room_id: result.room_id,
+        room_name: result.room_name,
+        identity_name: result.identity_name,
+        identity_cid: result.identity_cid,
+      };
     },
     async acceptInvite(roomId, invite, opts) {
       const receipt = object(await call('room.accept', {

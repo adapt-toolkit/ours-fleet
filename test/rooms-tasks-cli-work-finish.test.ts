@@ -161,7 +161,12 @@ beforeEach(() => {
   vi.spyOn(process.stderr, 'write').mockImplementation((line: unknown) => { out.push(String(line)); return true; });
   exitSpy = vi.spyOn(process, 'exit').mockImplementation((() => { throw new ExitError(); }) as never);
 
-  mocks.createRoom.mockReset().mockResolvedValue({ room_id: ROOM_ID, identity_cid: 'c'.repeat(64) });
+  mocks.createRoom.mockReset().mockImplementation(async ({ room_name }: { room_name: string }) => ({
+    room_id: ROOM_ID,
+    room_name,
+    identity_name: 'room-id',
+    identity_cid: 'c'.repeat(64),
+  }));
   mocks.recoverRoom.mockReset().mockResolvedValue({
     room_id: ROOM_ID, identity_name: 'room-id', identity_cid: 'c'.repeat(64),
     room_name: 'Fix the parser', state: 'active', seats: [], role_briefings: {},
@@ -354,6 +359,29 @@ describe('task title to Cowork room naming', () => {
 
     expect(JSON.parse(out.join('\n')).task.title).toBe(unicodeTitle);
     expectExactRoomName();
+  });
+
+  it('sends the stored title unchanged but persists Cowork normalized display name', async () => {
+    const exactTitle = '  Cafe\u0301 launch 🚀  ';
+    const displayName = 'Café launch 🚀';
+    const task = createTask({
+      title: exactTitle, origin: { type: 'cli' }, no_room: true, start: false,
+    });
+    mocks.createRoom.mockResolvedValueOnce({
+      room_id: ROOM_ID,
+      room_name: displayName,
+      identity_name: 'ours-cowork-technical-room-id',
+      identity_cid: 'c'.repeat(64),
+    });
+
+    await run('work', task.task_id, '--json');
+
+    expect(mocks.createRoom).toHaveBeenCalledWith(expect.objectContaining({
+      room_name: exactTitle,
+    }));
+    expect(getTask(task.task_id).title).toBe(exactTitle);
+    expect(getRoomRecord(ROOM_ID)?.room_name).toBe(displayName);
+    expect(getRoomRecord(ROOM_ID)?.room_name).not.toBe('ours-cowork-technical-room-id');
   });
 });
 

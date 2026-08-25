@@ -104,8 +104,32 @@ describe('Cowork management-socket adapter', () => {
       quiet_membership: true,
     })).resolves.toEqual({
       room_id: '01ABCDEF0123456789ABCDEFGH',
+      room_name: 'Release room',
       identity_name: 'ours-cowork-01ABCDEF0123456789ABCDEFGH',
       identity_cid: 'A'.repeat(64),
+    });
+  });
+
+  it('passes display-name bytes unchanged and keeps room_name separate from identity_name', async () => {
+    const taskTitle = '  Cafe\u0301 launch 🚀  ';
+    const socketPath = await rpcServer(request => {
+      expect(request).toMatchObject({
+        method: 'room.create',
+        params: { name: taskTitle },
+      });
+      return room({
+        room_name: 'Café launch 🚀',
+        identity_name: 'ours-cowork-01ABCDEF0123456789ABCDEFGH',
+      });
+    });
+
+    await expect(createCoworkAdapter({ socketPath }).createRoom({
+      room_name: taskTitle,
+      goal: 'Ship',
+      briefing: 'Preserve the naming boundary',
+    })).resolves.toMatchObject({
+      room_name: 'Café launch 🚀',
+      identity_name: 'ours-cowork-01ABCDEF0123456789ABCDEFGH',
     });
   });
 

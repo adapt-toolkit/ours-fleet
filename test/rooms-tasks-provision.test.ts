@@ -128,7 +128,7 @@ function mockCoworkAdapter(opts?: {
   return {
     available: vi.fn().mockResolvedValue(true),
     createRoom: vi.fn().mockResolvedValue({
-      room_id: 'room-test', identity_name: 'room-id', identity_cid: 'room-cid',
+      room_id: 'room-test', room_name: 'Test', identity_name: 'room-id', identity_cid: 'room-cid',
     }),
     issueInvite: vi.fn().mockImplementation(async (_roomId, inviteOpts) => {
       if (opts?.issueInviteFail) throw new Error('invite issuance failed');
