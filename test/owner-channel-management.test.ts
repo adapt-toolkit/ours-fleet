@@ -34,6 +34,8 @@ class ManagementClient implements OursOps {
     roots: {}, degraded: [], renames: {},
   };
   failSendTo = new Set<string>();
+  /** Optional deterministic delivery gate for exercising in-flight send ordering. */
+  sendGate?: (args: { contact: string; text: string; replyToWireId?: string }) => Promise<void>;
   /** How many binds must fail, and with which error. */
   bindFailures = 0;
   bindError: () => Error = () => errBoundElsewhere('Coordinator-owner');
@@ -113,6 +115,7 @@ class ManagementClient implements OursOps {
   async sendMessage(a: { contact: string; text: string; replyToWireId?: string }) {
     this.calls.push({ name: 'sendMessage', args: { ...a } });
     if (this.failSendTo.has(a.contact)) throw new Error('sendMessage failed');
+    await this.sendGate?.(a);
   }
   async sendFile(a: { contact: string; path: string; filename: string; replyToWireId?: string }) {
     this.calls.push({ name: 'sendFile', args: { ...a } });
@@ -855,6 +858,11 @@ describe('OwnerChannel live management', () => {
 
   it('opens only during the exact active request and routes a later report to that origin', async () => {
     const { channel, client, queuePrompt } = setup();
+    let releaseFinalSends!: () => void;
+    const finalSendsReleased = new Promise<void>(resolve => { releaseFinalSends = resolve; });
+    client.sendGate = async args => {
+      if (args.text.startsWith('Original final')) await finalSendsReleased;
+    };
     const completed = (output: string) => ({
       accepted: true as const, outcome: 'completed' as const, succeeded: true, output,
     });
@@ -886,10 +894,23 @@ describe('OwnerChannel live management', () => {
     finishB(completed('Original final B'));
     await vi.waitFor(() => expect(client.calls.filter(call => call.name === 'sendMessage'
       && String(call.args?.text).startsWith('Original final'))).toHaveLength(2));
-    await channel.manage({ action: 'task_report', taskId: openedB.taskId,
-      phase: 'done', message: 'The second specialist finished.' });
-    await channel.manage({ action: 'task_report', taskId: openedA.taskId,
-      phase: 'blocked', message: 'The first specialist needs an external dependency.' });
+    // Recording the send call is not finalization: the transport promise and
+    // complete(...).finally() are still pending, so the production guard must hold.
+    await expect(channel.manage({ action: 'task_report', taskId: openedB.taskId,
+      phase: 'done', message: 'The second specialist finished.' }))
+      .rejects.toThrow(/only after.*finalized/);
+    releaseFinalSends();
+    await vi.waitFor(async () => {
+      await expect(channel.manage({ action: 'task_report', taskId: openedB.taskId,
+        phase: 'done', message: 'The second specialist finished.' })).resolves.toMatchObject({
+        action: 'task_report', phase: 'done', state: 'closed',
+      });
+    });
+    await vi.waitFor(async () => {
+      await expect(channel.manage({ action: 'task_report', taskId: openedA.taskId,
+        phase: 'blocked', message: 'The first specialist needs an external dependency.' }))
+        .resolves.toMatchObject({ action: 'task_report', phase: 'blocked', state: 'closed' });
+    });
     const reports = client.calls.filter(call => call.name === 'sendMessage'
       && String(call.args?.text).includes('Follow-up'));
     expect(reports.map(call => call.args)).toEqual([
