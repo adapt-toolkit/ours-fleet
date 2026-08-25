@@ -761,6 +761,32 @@ describe('creation provenance', () => {
     expect(provenanceOf('Scout', true).lifetime).toBe('temporary');
   });
 
+  it('persists managed caller inheritance sources while explicit overrides stay explicit', async () => {
+    const inherited = [
+      'harness', 'session', 'model', 'cwd', 'coordinator', 'approval', 'filesystem',
+      'unattended', 'monitorConfig',
+    ];
+    await spawnTemp({
+      name: 'Inherited', harness: 'codex', session: 'acp', model: 'gpt-test',
+      cwd: '/work/project', coordinator: 'Coord', approval: 'allow',
+      filesystem: 'unrestricted', unattended: 'wait',
+      monitorConfig: { mode: 'fleet', interrupt: true },
+      surface: 'agent', callerRole: 'Coord', inheritedFromCaller: inherited,
+    }, '/b/ours-fleet', () => {});
+    const p = provenanceOf('Inherited', true);
+    expect(p.callerRole).toBe('Coord');
+    for (const key of [
+      'harness', 'session', 'model', 'cwd', 'coordinator', 'approval', 'filesystem',
+      'unattended', 'monitor',
+    ]) expect(p.settings[key].source, key).toBe('caller-role');
+
+    await spawnTemp({
+      name: 'Explicit', harness: 'codex', approval: 'ask',
+      inheritedFromCaller: ['harness'],
+    }, '/b/ours-fleet', () => {});
+    expect(provenanceOf('Explicit', true).settings.approval.source).toBe('cli');
+  });
+
   it('records an explicit --permission-mode, and omits it when unset', async () => {
     const { d } = fakeDeps();
     await spawnPermanent({

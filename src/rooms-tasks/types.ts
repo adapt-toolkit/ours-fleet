@@ -129,6 +129,8 @@ export interface RoomMemberLaunchState {
   state: 'pending' | 'intent' | 'launched' | 'stopped' | 'failed';
   attempt: number;
   action_id?: string;
+  /** Expected authenticated proxy caller while adopting a post-spawn crash. */
+  caller_role?: string;
   mission_sha256?: string;
   launch_id?: string;
   updated_at: string;

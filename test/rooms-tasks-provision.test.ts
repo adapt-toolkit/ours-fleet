@@ -5,12 +5,17 @@ import { join } from 'node:path';
 
 const mocks = vi.hoisted(() => ({
   spawnTemp: vi.fn(),
+  controlRequest: vi.fn(),
   tempLiveness: vi.fn(),
   secureArchive: vi.fn(),
   archiveForAction: vi.fn(),
 }));
 
-vi.mock('../src/spawn.js', () => ({ spawnTemp: mocks.spawnTemp }));
+vi.mock('../src/spawn.js', async importOriginal => ({
+  ...(await importOriginal<typeof import('../src/spawn.js')>()),
+  spawnTemp: mocks.spawnTemp,
+}));
+vi.mock('../src/session/control.js', () => ({ controlRequest: mocks.controlRequest }));
 vi.mock('../src/temp-lifecycle.js', async importOriginal => ({
   ...(await importOriginal<typeof import('../src/temp-lifecycle.js')>()),
   tempSupervisorLiveness: mocks.tempLiveness,
@@ -19,6 +24,7 @@ vi.mock('../src/temp-lifecycle.js', async importOriginal => ({
 }));
 
 import { provisionMembers } from '../src/rooms-tasks/provision.js';
+import { spawnDryRun } from '../src/spawn.js';
 import { createRoomRecord, getRoomRecord } from '../src/rooms-tasks/room-state.js';
 import { createTask, getTask } from '../src/rooms-tasks/task-state.js';
 import type {
@@ -26,10 +32,31 @@ import type {
 } from '../src/rooms-tasks/cowork-adapter.js';
 import type { FleetConfig } from '../src/config.js';
 import type { TemplateSnapshot } from '../src/rooms-tasks/types.js';
+import { BUILTIN_TEMPLATES, snapshotTemplate } from '../src/rooms-tasks/templates.js';
+import {
+  FLEET_PROXY_CALLER_ENV, FLEET_PROXY_STATE_DIR_ENV,
+} from '../src/fleet-proxy.js';
+import { inheritCallerSpawnDefaults } from '../src/fleet-proxy.js';
+import type { ResolvedRole } from '../src/config.js';
+import '../src/harness/codex.js';
+import '../src/harness/claude-code.js';
 
 let root: string;
 let previousHome: string | undefined;
+let previousProxyStateDir: string | undefined;
+let previousProxyCaller: string | undefined;
 let acceptSpawn: ((opts: Record<string, any>) => void) | undefined;
+
+const caller = {
+  name: 'Coordinator', harness: 'codex', session: 'acp', identity: 'Coordinator',
+  cwd: '/work/project', model: 'gpt-test', sourceFile: '/fleet.yaml',
+  permissions: { approval: 'allow', filesystem: 'unrestricted', unattended: 'wait' },
+  permissionsDeclared: true,
+  monitor: {
+    mode: 'fleet', enabled: true, wake_sources: ['message_received'], batch_ms: 2_000,
+    inject: 'notification', interrupt: true, turn_fail_threshold: 3,
+  },
+} satisfies ResolvedRole;
 
 function cfg(overrides: Partial<FleetConfig> = {}): FleetConfig {
   return {
@@ -108,10 +135,36 @@ function coworkHarness(options: { acceptOnSpawn?: boolean; failIssueAt?: number 
   };
 }
 
+function mockManagedSpawns(): void {
+  mocks.controlRequest.mockImplementation(async (_stateDir, request) => {
+    const inherited = inheritCallerSpawnDefaults(
+      caller, request.spawn as Record<string, any>, '/fleet.yaml',
+    );
+    const creationActionId = `supervisor-${inherited.options.creationActionId}`;
+    const options = {
+      ...inherited.options, creationActionId, callerRole: caller.name,
+    };
+    const statePath = await mocks.spawnTemp(options, '/usr/bin/ours-fleet');
+    return {
+      ok: true,
+      result: {
+        caller: caller.name, role: options.name, lifetime: 'temporary', statePath,
+        harness: options.harness, session: options.session,
+        model: options.model, monitor: options.monitorConfig,
+        inherited: inherited.inherited, creationActionId,
+      },
+    };
+  });
+}
+
 beforeEach(() => {
   root = mkdtempSync(join(tmpdir(), 'fleet-simple-room-'));
   previousHome = process.env.OURS_FLEET_HOME;
+  previousProxyStateDir = process.env[FLEET_PROXY_STATE_DIR_ENV];
+  previousProxyCaller = process.env[FLEET_PROXY_CALLER_ENV];
   process.env.OURS_FLEET_HOME = root;
+  delete process.env[FLEET_PROXY_STATE_DIR_ENV];
+  delete process.env[FLEET_PROXY_CALLER_ENV];
   acceptSpawn = undefined;
   vi.clearAllMocks();
   mocks.tempLiveness.mockResolvedValue('running');
@@ -125,6 +178,7 @@ beforeEach(() => {
     }));
     writeFileSync(join(dir, 'creation.json'), JSON.stringify({
       creationActionId: opts.creationActionId, role: opts.name,
+      surface: opts.surface, callerRole: opts.callerRole,
     }));
     writeFileSync(join(dir, '.temp-supervisor.json'), JSON.stringify({
       version: 1, role: opts.name, launchId: `launch-${opts.name}`,
@@ -138,6 +192,10 @@ beforeEach(() => {
 afterEach(() => {
   if (previousHome === undefined) delete process.env.OURS_FLEET_HOME;
   else process.env.OURS_FLEET_HOME = previousHome;
+  if (previousProxyStateDir === undefined) delete process.env[FLEET_PROXY_STATE_DIR_ENV];
+  else process.env[FLEET_PROXY_STATE_DIR_ENV] = previousProxyStateDir;
+  if (previousProxyCaller === undefined) delete process.env[FLEET_PROXY_CALLER_ENV];
+  else process.env[FLEET_PROXY_CALLER_ENV] = previousProxyCaller;
   rmSync(root, { recursive: true, force: true });
 });
 
@@ -263,5 +321,138 @@ describe('simple Cowork room member startup', () => {
     });
     expect(mocks.spawnTemp.mock.calls[0][0].roomMemberStartup.task)
       .toContain('Role persona:\nReview carefully.');
+  });
+
+  it.each(['pair', 'team'] as const)(
+    'routes every %s member through authenticated direct-spawn inheritance',
+    async templateName => {
+      process.env[FLEET_PROXY_STATE_DIR_ENV] = '/state/Coordinator';
+      process.env[FLEET_PROXY_CALLER_ENV] = 'Coordinator';
+      const selected = BUILTIN_TEMPLATES.find(candidate => candidate.name === templateName)!;
+      const tpl = snapshotTemplate(selected);
+      createRoomRecord({
+        room_id: `room-${templateName}`, room_name: 'Room', room_identity_cid: 'room-cid',
+      });
+      const h = coworkHarness();
+      mockManagedSpawns();
+
+      await provisionMembers({
+        cfg: cfg(), cowork: h.cowork, roomId: `room-${templateName}`, template: tpl,
+        binPath: '/usr/bin/ours-fleet',
+      });
+
+      expect(mocks.controlRequest).toHaveBeenCalledTimes(tpl.members.length);
+      for (const [stateDir, request] of mocks.controlRequest.mock.calls) {
+        expect(stateDir).toBe('/state/Coordinator');
+        expect(request).toMatchObject({
+          command: 'fleet_spawn',
+          spawn: { temp: true, surface: 'agent', creationActionId: expect.any(String) },
+        });
+      }
+      for (const [spawn] of mocks.spawnTemp.mock.calls) {
+        expect(spawn).toMatchObject({
+          harness: 'codex', session: 'acp', model: 'gpt-test', cwd: '/work/project',
+          coordinator: 'Coordinator', approval: 'allow', filesystem: 'unrestricted',
+          unattended: 'wait', monitorConfig: { mode: 'fleet', interrupt: true },
+          callerRole: 'Coordinator', inheritedFromCaller: [
+            'harness', 'session', 'cwd', 'coordinator', 'approval', 'filesystem',
+            'unattended', 'monitorConfig', 'model',
+          ],
+        });
+      }
+    },
+  );
+
+  it('uses direct temporary spawn safely when authenticated caller context is absent', async () => {
+    createRoomRecord({
+      room_id: 'room-standalone', room_name: 'Room', room_identity_cid: 'room-cid',
+    });
+    const h = coworkHarness();
+    await provisionMembers({
+      cfg: cfg(), cowork: h.cowork, roomId: 'room-standalone', template: template(1),
+      binPath: '/usr/bin/ours-fleet',
+    });
+    expect(mocks.controlRequest).not.toHaveBeenCalled();
+    expect(mocks.spawnTemp).toHaveBeenCalledOnce();
+    expect(mocks.spawnTemp.mock.calls[0][0]).toMatchObject({ surface: 'agent' });
+    expect(mocks.spawnTemp.mock.calls[0][0]).not.toHaveProperty('callerRole');
+    expect(mocks.spawnTemp.mock.calls[0][0]).not.toHaveProperty('inheritedFromCaller');
+    const fallback = spawnDryRun({
+      ...mocks.spawnTemp.mock.calls[0][0], name: 'fallback-preview', identity: 'fallback-preview',
+    }).resolvedRole;
+    expect(fallback).toMatchObject({
+      harness: 'claude-code', session: 'tmux',
+      permissions: { approval: 'ask', filesystem: 'workspace', unattended: 'deny' },
+      monitor: { mode: 'fleet' },
+    });
+  });
+
+  it('keeps explicit member settings ahead of caller inheritance and suppresses cross-harness model', async () => {
+    process.env[FLEET_PROXY_STATE_DIR_ENV] = '/state/Coordinator';
+    process.env[FLEET_PROXY_CALLER_ENV] = 'Coordinator';
+    const tpl = template(1);
+    tpl.members[0].overrides = {
+      harness: 'claude-code', cwd: '/explicit',
+      permissions: { approval: 'ask', filesystem: 'workspace', unattended: 'deny' },
+    };
+    createRoomRecord({
+      room_id: 'room-explicit', room_name: 'Room', room_identity_cid: 'room-cid',
+    });
+    const h = coworkHarness();
+    mockManagedSpawns();
+
+    await provisionMembers({
+      cfg: cfg(), cowork: h.cowork, roomId: 'room-explicit', template: tpl,
+      binPath: '/usr/bin/ours-fleet',
+    });
+
+    const spawn = mocks.spawnTemp.mock.calls[0][0];
+    expect(spawn).toMatchObject({
+      harness: 'claude-code', session: 'acp', cwd: '/explicit', coordinator: 'Coordinator',
+      approval: 'ask', filesystem: 'workspace', unattended: 'deny',
+      monitorConfig: { mode: 'fleet', interrupt: true },
+    });
+    expect(spawn.model).toBeUndefined();
+    expect(spawn.inheritedFromCaller).toEqual([
+      'session', 'coordinator', 'monitorConfig',
+    ]);
+  });
+
+  it('adopts supervisor provenance after a crash before the spawn response', async () => {
+    process.env[FLEET_PROXY_STATE_DIR_ENV] = '/state/Coordinator';
+    process.env[FLEET_PROXY_CALLER_ENV] = 'Coordinator';
+    createRoomRecord({
+      room_id: 'room-crash', room_name: 'Room', room_identity_cid: 'room-cid',
+    });
+    const h = coworkHarness({ acceptOnSpawn: false });
+    let supervisorAction = '';
+    mocks.controlRequest.mockImplementationOnce(async (_stateDir, request) => {
+      const inherited = inheritCallerSpawnDefaults(
+        caller, request.spawn as Record<string, any>, '/fleet.yaml',
+      );
+      supervisorAction = `supervisor-${inherited.options.creationActionId}`;
+      await mocks.spawnTemp({
+        ...inherited.options, creationActionId: supervisorAction, callerRole: caller.name,
+      }, '/usr/bin/ours-fleet');
+      throw new Error('simulated process loss before control response');
+    });
+    const input = {
+      cfg: cfg(), cowork: h.cowork, roomId: 'room-crash', template: template(1),
+      binPath: '/usr/bin/ours-fleet', startupWait: { timeoutMs: 0, now: () => 1 },
+    };
+    await expect(provisionMembers(input)).rejects.toThrow('simulated process loss');
+
+    expect(getRoomRecord('room-crash')!.member_seats[0].launch).toMatchObject({
+      state: 'failed', caller_role: 'Coordinator',
+    });
+    mocks.controlRequest.mockReset();
+    mockManagedSpawns();
+
+    await provisionMembers(input);
+
+    expect(mocks.controlRequest).not.toHaveBeenCalled();
+    expect(getRoomRecord('room-crash')!.member_seats[0].launch).toMatchObject({
+      state: 'launched', action_id: supervisorAction, caller_role: 'Coordinator',
+    });
   });
 });
