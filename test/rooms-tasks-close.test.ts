@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -86,6 +86,59 @@ describe('deterministic managed room close', () => {
       },
     });
     expect(closed.close).toMatchObject({ phase: 'completed' });
+  });
+
+  it('removes an exact-CID never-launched identity without requiring launch proof', async () => {
+    updateMemberSeats(ROOM_ID, [{
+      role_name: 'member-1', identity_cid: CID, slot: 'dev',
+      cowork_role: 'Developer', seat_state: 'pending',
+      launch: { state: 'pending', attempt: 0, updated_at: '2026-08-24T00:00:00.000Z' },
+    }]);
+    sdk.listIdentities.mockResolvedValueOnce([{
+      name: 'member-1', cid: CID, kind: 'role', temp: null, session: null,
+    }]).mockResolvedValue([]);
+    const cowork = { closeRoom: vi.fn(async () => undefined) };
+
+    const closed = await closeManagedRoom({ roomId: ROOM_ID, cowork });
+
+    expect(closed.member_seats[0]).toMatchObject({
+      seat_state: 'removed',
+      retirement: { phase: 'identity_absent', launch_id: 'never-launched' },
+    });
+    expect(sdk.removeIdentity).toHaveBeenCalledWith({ name: 'member-1' });
+  });
+
+  it('fails closed when a never-launched identity unexpectedly has Fleet temp state', async () => {
+    updateMemberSeats(ROOM_ID, [{
+      role_name: 'member-1', identity_cid: CID, slot: 'dev',
+      cowork_role: 'Developer', seat_state: 'pending',
+      launch: { state: 'pending', attempt: 0, updated_at: '2026-08-24T00:00:00.000Z' },
+    }]);
+    mkdirSync(join(root, '.ours-fleet', 'tmp', 'member-1'), { recursive: true });
+    const cowork = { closeRoom: vi.fn(async () => undefined) };
+
+    await expect(closeManagedRoom({ roomId: ROOM_ID, cowork }))
+      .rejects.toThrow(/unexpectedly has Fleet temp state/);
+    expect(sdk.removeIdentity).not.toHaveBeenCalled();
+    expect(cowork.closeRoom).not.toHaveBeenCalled();
+  });
+
+  it('refuses never-launched cleanup when the same name has a different CID', async () => {
+    updateMemberSeats(ROOM_ID, [{
+      role_name: 'member-1', identity_cid: CID, slot: 'dev',
+      cowork_role: 'Developer', seat_state: 'pending',
+      launch: { state: 'pending', attempt: 0, updated_at: '2026-08-24T00:00:00.000Z' },
+    }]);
+    sdk.listIdentities.mockResolvedValue([{
+      name: 'member-1', cid: 'cd'.repeat(32), kind: 'role', temp: null, session: null,
+    }]);
+    const cowork = { closeRoom: vi.fn(async () => undefined) };
+
+    await expect(closeManagedRoom({ roomId: ROOM_ID, cowork }))
+      .rejects.toThrow(/CID mismatch/);
+    expect(sdk.removeIdentity).not.toHaveBeenCalled();
+    expect(cowork.closeRoom).not.toHaveBeenCalled();
+    expect(getRoomRecord(ROOM_ID)!.member_seats[0].retirement).toBeUndefined();
   });
 
   it('does not advance past an accepted stop until liveness is proven absent', async () => {

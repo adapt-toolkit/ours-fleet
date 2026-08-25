@@ -9,22 +9,18 @@ import { join } from 'node:path';
 
 const mocks = vi.hoisted(() => {
   const cidCounter = { n: 0 };
-  const mockCreateIdentity = vi.fn().mockImplementation(async () => ({
-    info: { cid: `cid-${String(++cidCounter.n).padStart(3, '0')}` },
-  }));
+  const identities = new Map<string, string>();
+  const mockCreateIdentity = vi.fn();
   const mockReleaseLease = vi.fn().mockResolvedValue(undefined);
   const mockRemoveIdentity = vi.fn().mockResolvedValue(undefined);
-  const mockAttachOursClient = vi.fn().mockResolvedValue({
-    createIdentity: mockCreateIdentity,
-    removeIdentity: mockRemoveIdentity,
-    releaseLease: mockReleaseLease,
-  });
+  const onRedeem = vi.fn();
+  const mockAttachOursClient = vi.fn();
   const mockSpawnTemp = vi.fn();
   const mockTempLiveness = vi.fn().mockResolvedValue('running');
   const mockSecureArchive = vi.fn();
   const mockArchiveForAction = vi.fn();
   return {
-    cidCounter,
+    cidCounter, identities, onRedeem,
     mockAttachOursClient,
     mockCreateIdentity,
     mockRemoveIdentity,
@@ -104,6 +100,8 @@ let invitesIssued: string[];
 function mockCoworkAdapter(opts?: {
   seatsActive?: boolean;
   issueInviteFail?: boolean;
+  issueInviteFailRole?: string;
+  redeemFailRole?: string;
   acceptInviteFail?: boolean;
   acknowledgeBriefings?: boolean;
   initialSeats?: Array<{ cid: string; role: string }>;
@@ -112,26 +110,32 @@ function mockCoworkAdapter(opts?: {
   initialRoleBriefings?: Array<{ role: string; text: string; version: number }>;
   historyPrefixRawCount?: number;
   endlessRawBacklog?: boolean;
+  reconcileDelayCalls?: number;
 }): CoworkAdapter {
   invitesIssued = [];
   let inviteSeq = 0;
   let briefingSeq = 0;
+  let reconcileCalls = 0;
   const admitted = new Map<string, string>();
+  const inviteRoles = new Map<string, string>();
   for (const seat of opts?.initialSeats ?? []) admitted.set(seat.cid, seat.role);
   const briefings = new Map<string, { text: string; version: number }>();
   for (const briefing of opts?.initialRoleBriefings ?? [])
     briefings.set(briefing.role, { text: briefing.text, version: briefing.version });
-  return {
+  const adapter: CoworkAdapter = {
     available: vi.fn().mockResolvedValue(true),
     createRoom: vi.fn().mockResolvedValue({
       room_id: 'room-test', identity_name: 'room-id', identity_cid: 'room-cid',
     }),
     issueInvite: vi.fn().mockImplementation(async (_roomId, inviteOpts) => {
-      if (opts?.issueInviteFail) throw new Error('invite issuance failed');
+      if (opts?.issueInviteFail || opts?.issueInviteFailRole === inviteOpts.role)
+        throw new Error('invite issuance failed');
       const invite = `secret-invite-${++inviteSeq}`;
       invitesIssued.push(invite);
-      return { invite, min_accepts: inviteOpts.min_accepts };
+      inviteRoles.set(invite, inviteOpts.role);
+      return { invite, invite_id: `invite-id-${inviteSeq}`, min_accepts: inviteOpts.min_accepts };
     }),
+    revokeInvite: vi.fn().mockResolvedValue(undefined),
     acceptInvite: vi.fn().mockImplementation(async (_roomId, _invite, acceptOpts) => {
       if (opts?.acceptInviteFail) throw new Error('accept failed');
       admitted.set(acceptOpts.expected_cid, acceptOpts.role);
@@ -244,11 +248,24 @@ function mockCoworkAdapter(opts?: {
         seat_state: 'active' as const,
       }));
     }),
-    recoverRoom: vi.fn().mockResolvedValue({
-      room_id: 'room-test', identity_name: 'room-id', identity_cid: 'room-cid',
-      room_name: 'Test', state: 'active', seats: [],
-    }),
+    recoverRoom: vi.fn().mockImplementation(async roomId => ({
+      room_id: roomId, identity_name: 'room-id', identity_cid: 'room-cid',
+      room_name: 'Test', state: 'active',
+      seats: ++reconcileCalls <= (opts?.reconcileDelayCalls ?? 0) ? [] : [...admitted].map(([identity_cid, role]) => ({
+        identity_cid, role, seat_state: 'active' as const,
+      })),
+      role_briefings: {},
+    })),
   };
+
+  mocks.onRedeem.mockImplementation((name: string, invite: string) => {
+    const cid = mocks.identities.get(name);
+    const role = inviteRoles.get(invite);
+    if (!cid || !role) throw new Error('unexpected invite redemption');
+    if (opts?.redeemFailRole === role) throw new Error('invite redemption failed');
+    admitted.set(cid, role);
+  });
+  return adapter;
 }
 
 function stateDir(): string { return join(dir, 'state'); }
@@ -287,17 +304,33 @@ beforeEach(() => {
   origHome = process.env.OURS_FLEET_HOME;
   process.env.OURS_FLEET_HOME = dir;
   mocks.cidCounter.n = 0;
+  mocks.identities.clear();
   vi.clearAllMocks();
 
-  mocks.mockCreateIdentity.mockImplementation(async () => ({
-    info: { cid: `cid-${String(++mocks.cidCounter.n).padStart(3, '0')}` },
-  }));
+  mocks.mockCreateIdentity.mockImplementation(async ({ name }: { name: string }) => {
+    const cid = `cid-${String(++mocks.cidCounter.n).padStart(3, '0')}`;
+    mocks.identities.set(name, cid);
+    return { info: { cid } };
+  });
   mocks.mockReleaseLease.mockResolvedValue(undefined);
   mocks.mockRemoveIdentity.mockResolvedValue(undefined);
-  mocks.mockAttachOursClient.mockResolvedValue({
-    createIdentity: mocks.mockCreateIdentity,
-    removeIdentity: mocks.mockRemoveIdentity,
-    releaseLease: mocks.mockReleaseLease,
+  mocks.mockAttachOursClient.mockImplementation(async () => {
+    let boundName = '';
+    return {
+      createIdentity: mocks.mockCreateIdentity,
+      removeIdentity: mocks.mockRemoveIdentity,
+      releaseLease: mocks.mockReleaseLease,
+      chooseIdentity: vi.fn(async ({ name }: { name: string }) => {
+        boundName = name;
+        const cid = mocks.identities.get(name) ?? 'cid-001';
+        mocks.identities.set(name, cid);
+        return { name, cid };
+      }),
+      addContact: vi.fn(async ({ invite }: { invite: string }) => {
+        mocks.onRedeem(boundName, invite);
+        return { cid: 'room-cid', display: 'Room' };
+      }),
+    };
   });
   mocks.mockSpawnTemp.mockImplementation(async (opts) => {
     const roleDir = join(dir, '.ours-fleet', 'tmp', opts.name);
@@ -415,7 +448,7 @@ describe('provision saga', () => {
     });
   });
 
-  describe('serial role-group admission', () => {
+  describe('concurrent role-group admission', () => {
     it('issues one invite per cowork role, not per member', async () => {
       const template = makeTemplate([
         { slot: 'dev', role: 'Developer', count: 2, role_ref: 'Dev' },
@@ -439,7 +472,77 @@ describe('provision saga', () => {
       expect(devCall).toBeDefined();
       expect((devCall![1] as { min_accepts: number }).min_accepts).toBe(2);
 
-      expect(cowork.acceptInvite).toHaveBeenCalledTimes(3);
+      expect(cowork.acceptInvite).not.toHaveBeenCalled();
+      expect(mocks.onRedeem).toHaveBeenCalledTimes(3);
+      const issueOrder = (cowork.issueInvite as ReturnType<typeof vi.fn>).mock.invocationCallOrder;
+      expect(Math.max(...issueOrder)).toBeLessThan(
+        Math.min(...mocks.onRedeem.mock.invocationCallOrder),
+      );
+    });
+
+    it('waits boundedly for every exact CID and role after member redemption', async () => {
+      const template = makeTemplate([
+        { slot: 'dev', role: 'Developer', count: 1, role_ref: 'Dev' },
+      ]);
+      const cowork = mockCoworkAdapter({ reconcileDelayCalls: 1 });
+      createProvisionRoom({ room_id: 'room-delayed-admit', room_name: 'Delayed admission' });
+      let clock = 0;
+      const sleep = vi.fn(async (ms: number) => { clock += ms; });
+
+      const result = await provisionMembers({
+        cfg: minimalCfg(), cowork, roomId: 'room-delayed-admit', template,
+        binPath: '/usr/bin/ours-fleet',
+        startupWait: {
+          timeoutMs: 1_000, initialDelayMs: 10, maxDelayMs: 20,
+          now: () => clock, sleep,
+        },
+      });
+
+      expect(result.state).toBe('active');
+      expect(cowork.recoverRoom).toHaveBeenCalledTimes(2);
+      expect(sleep).toHaveBeenCalledWith(10);
+    });
+
+    it('revokes successfully issued descriptors when concurrent sibling issuance fails', async () => {
+      const template = makeTemplate([
+        { slot: 'dev', role: 'Developer', count: 1, role_ref: 'Dev' },
+        { slot: 'reviewer', role: 'Reviewer', count: 1, role_ref: 'Rev' },
+      ]);
+      const cowork = mockCoworkAdapter({ issueInviteFailRole: 'Reviewer' });
+      createProvisionRoom({ room_id: 'room-partial-issue', room_name: 'Partial issue' });
+
+      await expect(provisionMembers({
+        cfg: minimalCfg(), cowork, roomId: 'room-partial-issue', template,
+        binPath: '/usr/bin/ours-fleet',
+      })).rejects.toThrow('invite issuance failed');
+
+      expect(cowork.issueInvite).toHaveBeenCalledTimes(2);
+      expect(cowork.revokeInvite).toHaveBeenCalledWith(
+        'room-partial-issue', 'invite-id-1',
+      );
+      expect(mocks.onRedeem).not.toHaveBeenCalled();
+    });
+
+    it('revokes every issued descriptor when a concurrent member redemption fails', async () => {
+      const template = makeTemplate([
+        { slot: 'dev', role: 'Developer', count: 1, role_ref: 'Dev' },
+        { slot: 'reviewer', role: 'Reviewer', count: 1, role_ref: 'Rev' },
+      ]);
+      const cowork = mockCoworkAdapter({ redeemFailRole: 'Reviewer' });
+      createProvisionRoom({ room_id: 'room-partial-redeem', room_name: 'Partial redeem' });
+
+      await expect(provisionMembers({
+        cfg: minimalCfg(), cowork, roomId: 'room-partial-redeem', template,
+        binPath: '/usr/bin/ours-fleet',
+      })).rejects.toThrow('invite redemption failed');
+
+      expect(cowork.revokeInvite).toHaveBeenCalledTimes(2);
+      expect(cowork.revokeInvite).toHaveBeenCalledWith(
+        'room-partial-redeem', 'invite-id-1',
+      );
+      expect(cowork.revokeInvite).toHaveBeenCalledWith(
+        'room-partial-redeem', 'invite-id-2',
+      );
     });
   });
 
