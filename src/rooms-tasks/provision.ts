@@ -14,7 +14,14 @@ import type {
   TemplateSnapshot, TemplateMemberSlot,
 } from './types.js';
 import { spawnTemp } from '../spawn.js';
+import type { SpawnOpts } from '../spawn.js';
 import { findRole, type FleetConfig, type RoomMemberStartup } from '../config.js';
+import {
+  FLEET_PROXY_CALLER_ENV, FLEET_PROXY_STATE_DIR_ENV,
+  type ManagedFleetSpawnResult,
+} from '../fleet-proxy.js';
+import { controlRequest } from '../session/control.js';
+import { SessionControlError } from '../session/types.js';
 import { closeManagedRoom } from './close.js';
 import { buildRoomMemberTask, sha256Text } from './member-startup.js';
 import { agentDir } from '../paths.js';
@@ -61,6 +68,52 @@ interface MemberSettings {
   harness?: string;
   cwd?: string;
   persona?: string;
+  approval?: SpawnOpts['approval'];
+  filesystem?: SpawnOpts['filesystem'];
+  unattended?: SpawnOpts['unattended'];
+}
+
+/**
+ * Room commands run inside a managed role when invoked by an agent. Route that
+ * launch through the role's authenticated supervisor so omitted settings use
+ * the exact same inheritance contract as `ours-fleet spawn`. A standalone CLI
+ * has no caller context and deliberately retains the normal Fleet fallback.
+ */
+interface RoomMemberSpawnResult {
+  statePath: string;
+  creationActionId: string;
+  callerRole?: string;
+}
+
+async function spawnRoomMember(
+  options: SpawnOpts, binPath: string,
+): Promise<RoomMemberSpawnResult> {
+  const stateDir = process.env[FLEET_PROXY_STATE_DIR_ENV];
+  if (!stateDir) return {
+    statePath: await spawnTemp(options, binPath),
+    creationActionId: options.creationActionId!,
+  };
+
+  const response = await controlRequest(
+    stateDir, { command: 'fleet_spawn', spawn: options }, 10 * 60_000,
+  );
+  if (!response.ok) {
+    throw new SessionControlError(
+      response.kind ?? 'backend', response.error ?? 'managed room member spawn failed',
+    );
+  }
+  const result = response.result as ManagedFleetSpawnResult;
+  const expectedCaller = process.env[FLEET_PROXY_CALLER_ENV];
+  if (expectedCaller && result.caller !== expectedCaller) {
+    throw new Error(
+      `fleet proxy caller mismatch: expected '${expectedCaller}', got '${result.caller}'`,
+    );
+  }
+  return {
+    statePath: result.statePath,
+    creationActionId: result.creationActionId,
+    callerRole: result.caller,
+  };
 }
 
 function shortId(id: string): string { return id.slice(0, 8); }
@@ -87,11 +140,15 @@ function expandMembers(
 function settingsFor(member: ExpandedMember, cfg: FleetConfig): MemberSettings {
   let refRole;
   try { refRole = findRole(cfg, member.roleRef); } catch { /* no ref role */ }
+  const permissions = member.overrides?.permissions;
   return {
     model: member.overrides?.model ?? refRole?.model,
     harness: member.overrides?.harness ?? refRole?.harness,
     cwd: member.overrides?.cwd ?? refRole?.cwd,
     persona: member.overrides?.persona ?? refRole?.persona,
+    approval: permissions?.approval as SpawnOpts['approval'],
+    filesystem: permissions?.filesystem as SpawnOpts['filesystem'],
+    unattended: permissions?.unattended as SpawnOpts['unattended'],
   };
 }
 
@@ -167,28 +224,47 @@ async function retainRunningLaunch(input: {
   const dir = agentDir(member.name, true);
   const taskSha = sha256Text(task);
 
-  if ((seat.launch?.state === 'intent' || seat.launch?.state === 'launched') && existsSync(dir)) {
+  if ((seat.launch?.state === 'intent' || seat.launch?.state === 'launched'
+      || seat.launch?.state === 'failed') && existsSync(dir)) {
     if (!seat.launch.action_id || !launchMatches(
       dir, member, seat.launch.action_id, taskSha, provision.roomId,
       roomIdentityCid, seat.invite_id,
     )) {
-      throw new Error(`existing launch for ${member.name} does not match its durable intent`);
+      const provenance = readProvenance(dir);
+      const adoptable = (seat.launch.state === 'intent' || seat.launch.state === 'failed')
+        && Boolean(seat.launch.caller_role)
+        && provenance?.surface === 'agent'
+        && provenance.callerRole === seat.launch.caller_role
+        && typeof provenance.creationActionId === 'string'
+        && launchMatches(
+          dir, member, provenance.creationActionId, taskSha, provision.roomId,
+          roomIdentityCid, seat.invite_id,
+        );
+      if (!adoptable)
+        throw new Error(`existing launch for ${member.name} does not match its durable intent`);
+      updateMemberStartup(provision.roomId, member.name, { launch: {
+        ...seat.launch, state: 'intent', action_id: provenance!.creationActionId!,
+        updated_at: new Date().toISOString(),
+      } });
+      seat = getRoomRecord(provision.roomId)!.member_seats
+        .find(candidate => candidate.role_name === member.name)!;
     }
     const supervisor = readTempSupervisor(dir);
     if (!supervisor || supervisor.role !== member.name)
       throw new Error(`existing launch for ${member.name} has mismatched supervisor metadata`);
     const live = await tempSupervisorLiveness(dir);
     if (live === 'unknown') throw new Error(`existing launch for ${member.name} has unknown liveness`);
+    const retainedLaunch = seat.launch!;
     if (live === 'running') {
       updateMemberStartup(provision.roomId, member.name, { launch: {
-        ...seat.launch, state: 'launched', launch_id: supervisor.launchId,
+        ...retainedLaunch, state: 'launched', launch_id: supervisor.launchId,
         updated_at: new Date().toISOString(),
       } });
       return true;
     }
     await secureStoppedTempArchive(member.name, supervisor.launchId);
     updateMemberStartup(provision.roomId, member.name, { launch: {
-      ...seat.launch, state: 'stopped', launch_id: supervisor.launchId,
+      ...retainedLaunch, state: 'stopped', launch_id: supervisor.launchId,
       updated_at: new Date().toISOString(),
     } });
     return false;
@@ -240,14 +316,18 @@ async function launchMember(input: {
   const seat = getRoomRecord(provision.roomId)!.member_seats
     .find(candidate => candidate.role_name === member.name)!;
   const actionId = randomUUID();
+  let effectiveActionId: string = actionId;
   const attempt = (seat.launch?.attempt ?? 0) + 1;
   const taskSha = sha256Text(startup.task);
+  const proxyCaller = process.env[FLEET_PROXY_STATE_DIR_ENV]
+    ? process.env[FLEET_PROXY_CALLER_ENV] : undefined;
   updateMemberStartup(provision.roomId, member.name, { launch: {
     state: 'intent', attempt, action_id: actionId, mission_sha256: taskSha,
+    ...(proxyCaller ? { caller_role: proxyCaller } : {}),
     updated_at: new Date().toISOString(),
   } });
   try {
-    const launchedDir = await spawnTemp({
+    const launched = await spawnRoomMember({
       name: member.name,
       temp: true,
       identity: member.name,
@@ -255,24 +335,38 @@ async function launchMember(input: {
       model: settings.model,
       harness: settings.harness,
       cwd: settings.cwd,
+      approval: settings.approval,
+      filesystem: settings.filesystem,
+      unattended: settings.unattended,
       surface: 'agent',
       creationActionId: actionId,
       roomMemberStartup: startup,
     }, provision.binPath);
+    const launchedDir = launched.statePath;
+    effectiveActionId = launched.creationActionId;
+    if (launched.creationActionId !== actionId) {
+      updateMemberStartup(provision.roomId, member.name, { launch: {
+        state: 'intent', attempt, action_id: launched.creationActionId,
+        mission_sha256: taskSha, updated_at: new Date().toISOString(),
+        ...(launched.callerRole ? { caller_role: launched.callerRole } : {}),
+      } });
+    }
     const supervisor = readTempSupervisor(launchedDir);
     if (!supervisor || supervisor.role !== member.name || !launchMatches(
-      launchedDir, member, actionId, taskSha, provision.roomId,
+      launchedDir, member, launched.creationActionId, taskSha, provision.roomId,
       startup.room_identity_cid, startup.invite_id,
     )) {
       throw new Error(`new launch for ${member.name} did not persist matching provenance`);
     }
     updateMemberStartup(provision.roomId, member.name, { launch: {
-      state: 'launched', attempt, action_id: actionId, mission_sha256: taskSha,
+      state: 'launched', attempt, action_id: launched.creationActionId, mission_sha256: taskSha,
+      ...(launched.callerRole ? { caller_role: launched.callerRole } : {}),
       launch_id: supervisor.launchId, updated_at: new Date().toISOString(),
     } });
   } catch (error) {
     updateMemberStartup(provision.roomId, member.name, { launch: {
-      state: 'failed', attempt, action_id: actionId, mission_sha256: taskSha,
+      state: 'failed', attempt, action_id: effectiveActionId, mission_sha256: taskSha,
+      ...(proxyCaller ? { caller_role: proxyCaller } : {}),
       updated_at: new Date().toISOString(),
       error: error instanceof Error ? error.message : String(error),
     } });
