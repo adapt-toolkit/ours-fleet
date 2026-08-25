@@ -35,6 +35,8 @@ export interface CoworkInviteResult {
 
 export interface CoworkSeatInfo {
   identity_cid: string;
+  display_name: string;
+  invite_id: string;
   role: string;
   seat_state: 'pending' | 'active' | 'removed';
 }
@@ -78,6 +80,7 @@ export interface CoworkAdapter {
     expected_cid: string;
   }): Promise<CoworkInviteAcceptResult>;
   issueInvite(roomId: string, opts: {
+    mode?: 'one_time' | 'public';
     role: string;
     min_accepts: number;
   }): Promise<CoworkInviteResult>;
@@ -161,6 +164,8 @@ function projectSeat(value: unknown, operation: string): CoworkSeatInfo {
   const seat = object(value, operation, 'seat');
   return {
     identity_cid: string(seat.identity, operation, 'seat.identity'),
+    display_name: string(seat.display_name, operation, 'seat.display_name'),
+    invite_id: string(seat.invite_id, operation, 'seat.invite_id'),
     role: string(seat.role, operation, 'seat.role'),
     seat_state: seatState(seat.state, operation),
   };
@@ -419,7 +424,7 @@ export function createCoworkAdapter(options: CoworkAdapterOptions = {}): CoworkA
     async issueInvite(roomId, opts) {
       const receipt = object(await call('room.invite', {
         room_id: roomId,
-        mode: 'public',
+        mode: opts.mode ?? 'public',
         role: opts.role,
         min_accepts: opts.min_accepts,
       }), 'room.invite', 'receipt');

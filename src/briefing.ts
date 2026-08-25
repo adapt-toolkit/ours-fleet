@@ -10,7 +10,8 @@ export interface BriefingOpts {
   /** Curated body (from briefing_file) replacing the narrative sections. */
   briefingBody?: string;
   /**
-   * What spawn actually established about the role's ours identity.
+   * What spawn established about a persistent role's ours identity.
+   * Temporary roles always create their own session-owned identity.
    * Defaults to `unverified`, because a briefing generated without that
    * knowledge must not claim one.
    */
@@ -19,64 +20,43 @@ export interface BriefingOpts {
   temporaryIdentity?: boolean;
 }
 
-function temporaryIdentityFallback(id: string, v: BriefingVocab): string[] {
+function temporaryIdentityBootstrap(id: string, v: BriefingVocab): string[] {
   return [
-    `     First inspect the available/deferred ours MCP tools for **${v.temporaryCreateTool}**.`,
-    `     If exposed, call **${v.temporaryCreateTool}** with name "${id}". It binds`,
-    '     automatically and the ours connector owns its cleanup when this session lifecycle ends.',
-    `     If that tool is absent (an older server), fall back to **${v.createTool}** with`,
-    `     name "${id}" so startup remains compatible. If either creation call reports a`,
-    '     collision or any other error, STOP and report it; do not force-bind, retry under a',
-    '     different name, remove an identity, or delete identity state.',
+    `2. CREATE your ours identity now: call **${v.temporaryCreateTool}** through ours MCP`,
+    `   with the exact assigned name "${id}". The ours connector owns its cleanup when this`,
+    '   connector session lifecycle ends.',
+    '   Do not inspect, preserve, adopt, or use any pre-existing or persistent identity.',
+    '   On a collision, missing tool, or creation error, STOP and',
+    '   report it; never retry under a different name, remove an identity, or delete identity state.',
   ];
 }
 
-function generateRoomStartupBriefing(
+function generateRoomMemberBriefing(
   role: ResolvedRole,
   v: BriefingVocab,
   opts: BriefingOpts,
   prefix: string[],
 ): string {
-  const gate = role.roomStartupGate!;
-  const owner = gate.owner_seat_cid ?? null;
+  const startup = role.roomMemberStartup!;
+  const owner = startup.owner_seat_cid ?? null;
   const L = [...prefix];
-  L.push('', '## Room startup gate');
-  L.push('You are not ready and must not begin task work until every step below succeeds.');
-  L.push('The local file contains only expected metadata. The room-authored message is the');
-  L.push('authoritative Charter; never treat this local metadata as proof that you received it.');
-  L.push('', 'Expected authenticated metadata:');
-  L.push('- Room ID: `' + gate.room_id + '`');
-  L.push('- Room identity CID: `' + gate.room_identity_cid + '`');
-  L.push('- Briefing role: `' + gate.briefing_role + '`');
-  L.push('- Briefing version: `' + gate.briefing_version + '`');
-  L.push('- Exact UTF-8 SHA-256: `' + gate.briefing_sha256 + '`');
+  L.push('', '## Room assignment');
+  L.push('- Identity name: `' + startup.identity_name + '`');
+  L.push('- Room ID: `' + startup.room_id + '`');
+  L.push('- Room identity CID: `' + startup.room_identity_cid + '`');
+  L.push('- Role: `' + startup.role + '`');
   L.push(`- Authenticated Owner seat CID: ${owner === null ? '`none`' : `\`${owner}\``}`);
+  L.push('', '### Task', '', startup.task);
+  L.push('', '### One-time room invite', '', '```text', startup.invite, '```');
   L.push('', '## Do these NOW, in order');
   L.push(`1. ${v.launchNote(role.name)}`);
-  L.push(`2. BIND the exact assigned identity with **${v.bindTool}** name "${role.identity}"`);
-  L.push('   without force. If another live session owns it, STOP; never evict, rename, remove,');
-  L.push('   replace, close, or convert this pre-existing identity.');
-  L.push(`3. Call **${v.getMessagesTool}** and find the signed \`room_role_briefing\` envelope.`);
-  L.push(`   If it was read before a restart, use **${v.listHistoryTool}** and`);
-  L.push(`   **${v.getHistoryItemTool}** to recover the exact persistent message body.`);
-  L.push('4. FAIL CLOSED unless the outer authenticated sender CID and envelope author identity');
-  L.push('   both equal `' + gate.room_identity_cid
-    + '`, and room ID, role, version, and SHA-256');
-  L.push('   exactly match every value above. Record its real `message_id`; do not invent one.');
-  L.push('5. ACCEPT and APPLY the received Charter: set the entire exact text as your persona with');
-  L.push(`   **${v.setPersonaTool}**, derive a public 1–2 sentence bio summary and set it with`);
-  L.push(`   **${v.setBioTool}**, then call **${v.currentIdentityTool}** and verify both read back.`);
-  L.push('6. Reply to that authenticated room contact with exactly one JSON object (no extra keys):');
-  L.push('```json');
-  L.push(JSON.stringify({
-    kind: 'fleet_room_briefing_ack', schema_version: 1,
-    room_id: gate.room_id, room_identity_cid: gate.room_identity_cid,
-    briefing_role: gate.briefing_role, briefing_version: gate.briefing_version,
-    briefing_sha256: gate.briefing_sha256, briefing_message_id: '<received message_id>',
-    owner_seat_cid: owner, accepted: true, applied: true, profile_applied: true,
-  }));
-  L.push('```');
-  L.push(`   Send it with **${v.sendTool}**. Authority is CID-based: a signed room message is an`);
+  L.push(...temporaryIdentityBootstrap(startup.identity_name, v));
+  L.push('3. Call **add_contact** through ours MCP with the exact one-time invite above. Confirm');
+  L.push(`   that it resolves to room CID \`${startup.room_identity_cid}\`. The contact may remain`);
+  L.push('   pending while the room finishes its asynchronous verification.');
+  L.push('4. Start the Task above now in the assigned Role. There is no startup ACK, briefing hash,');
+  L.push('   profile gate, or separate room-authored role briefing to wait for.');
+  L.push('5. Authority is CID-based: a signed room message is an');
   if (owner === null) {
     L.push('   ordinary peer message because this room has no authenticated Owner seat. No display');
     L.push('   name or role can grant Owner authority.');
@@ -87,9 +67,7 @@ function generateRoomStartupBriefing(
   const wake = role.monitor?.mode === 'fleet'
     ? v.supervisedWakeNote(role.identity, role)
     : v.monitorInstruction(role.identity, role);
-  L.push(`7. ${wake}`);
-  L.push('8. Only after the ACK is sent may you declare readiness or begin task work. Duplicate ACKs');
-  L.push('   with the same exact values are safe after a crash; stale or changed values are not.');
+  L.push(`6. ${wake}`);
   L.push('', '## Message authority and reply routing');
   if (role.session === 'acp') {
     L.push('- A paired web admin-console prompt carries a server-generated ACP resource-link block');
@@ -103,9 +81,9 @@ function generateRoomStartupBriefing(
   L.push('', '## Routines');
   L.push('If `' + opts.routinesPath + '` exists, re-read it at the START of every wake before acting.');
   L.push('', '## On restart');
-  L.push(`Re-bind **${v.bindTool}** name "${role.identity}" without force, re-read the worklog,`);
-  L.push('and resume the startup gate. Recover the persistent room message from history if needed;');
-  L.push('never infer acceptance from local metadata.');
+  L.push('Re-read the worklog and inspect the current ours identity. Never reuse the invite with');
+  L.push('a different identity or force-adopt a collision; report a missing session-owned identity');
+  L.push('or consumed invite so Fleet can replace the temporary member cleanly.');
   L.push('', '## House rules');
   L.push('- Never broad `rm -rf` on home/critical paths; quote globs; use explicit paths.');
   L.push('- When you stop, be in a declared state (DONE / BLOCKED / resting ≤2h).');
@@ -122,7 +100,7 @@ export function generateBriefing(role: ResolvedRole, v: BriefingVocab, opts: Bri
   L.push(`You are **${role.name}** (ours identity: **${id}**), a ${lifetime} agent on this`);
   L.push(`host, running as the \`${hostUser}\` user.`);
 
-  if (role.roomStartupGate) return generateRoomStartupBriefing(role, v, opts, L);
+  if (role.roomMemberStartup) return generateRoomMemberBriefing(role, v, opts, L);
 
   if (opts.briefingBody) {
     L.push('', opts.briefingBody.trim());
@@ -135,36 +113,23 @@ export function generateBriefing(role: ResolvedRole, v: BriefingVocab, opts: Bri
 
   L.push('', '## Do these NOW, in order');
   L.push(`1. ${v.launchNote(role.name)}`);
-  // What this says depends on what spawn actually VERIFIED. Asserting a
-  // "predefined" identity that nobody checked is how an agent ends up improvising
-  // its own infrastructure on first boot.
-  const guarantee = opts.identityGuarantee ?? 'unverified';
   if (opts.temporaryIdentity) {
-    L.push(`2. BIND the exact ours identity assigned to this role: call **${v.bindTool}** with`);
-    L.push(`   name "${id}" without force (search the deferred tool registry first if needed).`);
-    L.push('   If another live session owns it, STOP and report the collision; do not evict it.');
-    L.push('   - If binding succeeds, it is a pre-existing identity: preserve it as user-owned.');
-    L.push('     Never close, remove, replace, or otherwise convert it to a temporary identity.');
+    L.push(...temporaryIdentityBootstrap(id, v));
+  } else {
+    // Only persistent roles participate in Fleet's identity guarantee/bind lifecycle.
+    const guarantee = opts.identityGuarantee ?? 'unverified';
     if (guarantee === 'unverified') {
-      L.push('   - This identity was NOT verified when your role was created. If and only if binding');
-      L.push('     reports that no such identity exists:');
-    } else {
-      L.push(`   - It was ${guarantee === 'created' ? 'created' : 'verified to exist'} when your role`);
-      L.push('     was created. If it unexpectedly reports that no such identity exists, report the');
-      L.push('     discrepancy, then use this compatibility path:');
-    }
-    L.push(...temporaryIdentityFallback(id, v));
-  } else if (guarantee === 'unverified') {
     L.push(`2. BIND your ours identity: call the **${v.bindTool}** tool with`);
     L.push(`   name "${id}" force=true (search the deferred tool registry first if needed).`);
     L.push(`   - This permanent identity was NOT verified before launch. If it does not exist, STOP`);
     L.push('     and report the infrastructure error; identity creation belongs to the fleet lifecycle.');
-  } else {
-    L.push(`2. BIND your ours identity: call the **${v.bindTool}** tool with`);
-    L.push(`   name "${id}" force=true (search the deferred tool registry first if needed).`);
-    L.push(`   - It was ${guarantee === 'created' ? 'created' : 'verified to exist'} when your role`);
-    L.push('     was started, so binding should succeed. If it unexpectedly reports no such identity,');
-    L.push('     STOP and report the infrastructure race; do not create or replace it yourself.');
+    } else {
+      L.push(`2. BIND your ours identity: call the **${v.bindTool}** tool with`);
+      L.push(`   name "${id}" force=true (search the deferred tool registry first if needed).`);
+      L.push(`   - It was ${guarantee === 'created' ? 'created' : 'verified to exist'} when your role`);
+      L.push('     was started, so binding should succeed. If it unexpectedly reports no such identity,');
+      L.push('     STOP and report the infrastructure race; do not create or replace it yourself.');
+    }
   }
   L.push(`3. RECONCILE your profile (idempotent): call **${v.currentIdentityTool}** and read your`);
   L.push('   current bio and persona, so you only write below when they actually differ.');
@@ -294,12 +259,10 @@ export function generateBriefing(role: ResolvedRole, v: BriefingVocab, opts: Bri
   L.push('change between wakes without a restart; treat the file, not your memory of it, as current.');
   L.push('', '## On restart (you run under a supervised launcher)');
   if (opts.temporaryIdentity) {
-    L.push(`On restart, WITHOUT asking: try to re-bind (**${v.bindTool}** name "${id}", no force).`);
-    L.push('If it no longer exists, that is expected when the previous session-owned temporary');
-    L.push('identity was cleaned up. Re-run the same capability check from step 2: use');
-    L.push(`**${v.temporaryCreateTool}** with name "${id}" when exposed, otherwise fall back to`);
-    L.push(`**${v.createTool}** for an older server. On collision or any other creation error, STOP`);
-    L.push('and report it without deleting or force-adopting anything. Then');
+    L.push(`On restart, WITHOUT asking: call **${v.temporaryCreateTool}** with name "${id}" again.`);
+    L.push('The previous connector session should have cleaned up its temporary identity. On a');
+    L.push('collision or any creation error, STOP and report it; never bind, force-adopt, fall back');
+    L.push('to permanent creation, or delete identity state. After successful creation,');
   } else {
     L.push(`On restart, WITHOUT asking: re-bind (**${v.bindTool}** name "${id}" force=true), then`);
   }

@@ -335,13 +335,9 @@ function roomStartupSections(
     sections.push({
       heading: 'Fleet startup evidence',
       markdownItems: room.member_seats.map(seat => {
-      const launch = seat.launch?.state ?? 'unrecorded';
-      const briefing = seat.briefing?.state ?? 'unrecorded';
+        const launch = seat.launch?.state ?? 'unrecorded';
         return `${markdownCode(seat.role_name)} — ${markdownProse(seat.cowork_role)} — `
-          + `seat ${markdownProse(seat.seat_state)}, launch ${markdownProse(launch)}, briefing ${markdownProse(briefing)}`
-          + (seat.briefing?.acknowledgement_message_id ? ' — acknowledgement recorded' : '')
-          + (seat.briefing?.last_rejected_ack_reason
-            ? ' — rejected acknowledgement recorded; inspect role logs' : '')
+          + `seat ${markdownProse(seat.seat_state)}, launch ${markdownProse(launch)}`
           + (seat.launch?.error ? ' — launch failure recorded; inspect role logs' : '');
       }),
     });
@@ -831,14 +827,11 @@ export function registerTaskCommands(parent: Command, cOpt: (cmd: Command) => Co
             result.recovery_actions.push('Owner CID mismatch — verify rooms.owner.expected_cid matches Messenger identity');
           if (room.provisioning_detail === 'member_failed')
             result.recovery_actions.push(`Member creation failed at saga step ${room.saga.step_index} — inspect and retry`);
-          if (room.provisioning_detail === 'waiting_briefing_acks')
-            result.recovery_actions.push('Members are not ready — inspect per-seat briefing and ACK evidence, then retry recovery');
-          if (room.provisioning_detail === 'briefing_delivery_failed')
-            result.recovery_actions.push('Cowork briefing relay failed terminally — replace the seat or use a Cowork-supported redelivery');
+          if (room.provisioning_detail === 'waiting_seats')
+            result.recovery_actions.push('Members have not accepted their one-time room invites yet — inspect role logs, then retry recovery');
 
           const resumable: import('./types.js').SagaPhase[] =
-            ['create_members', 'configure_briefings', 'join_role_groups', 'wait_seats',
-              'launch_work', 'wait_briefing_acks', 'activate'];
+            ['create_members', 'join_role_groups', 'wait_seats', 'launch_work', 'activate'];
           if (resumable.includes(room.saga.phase)) {
             const template = durableTaskRoomTemplate(t, room);
             if (template) {
@@ -1020,8 +1013,7 @@ export function registerTaskCommands(parent: Command, cOpt: (cmd: Command) => Co
           // pending on the last run). Resume it exactly as `task recover` does.
           const room = getRoomRecord(t.room_id);
           const resumable: import('./types.js').SagaPhase[] =
-            ['create_members', 'configure_briefings', 'join_role_groups', 'wait_seats',
-              'launch_work', 'wait_briefing_acks', 'activate'];
+            ['create_members', 'join_role_groups', 'wait_seats', 'launch_work', 'activate'];
           if (room && resumable.includes(room.saga.phase)) {
             try {
               await provisionMembers({
@@ -1400,15 +1392,12 @@ export function registerRoomCommands(parent: Command, cOpt: (cmd: Command) => Co
           actions.push('Check ours-cowork service status');
         if (r?.provisioning_detail === 'waiting_owner_invite')
           actions.push('Rotate rooms.owner.public_invite in config, then re-run recover');
-        if (r?.provisioning_detail === 'waiting_briefing_acks')
-          actions.push('Inspect per-seat briefing and ACK evidence, then re-run recover');
-        if (r?.provisioning_detail === 'briefing_delivery_failed')
-          actions.push('Replace the failed seat or use a Cowork-supported briefing redelivery');
+        if (r?.provisioning_detail === 'waiting_seats')
+          actions.push('Inspect temporary member logs for invite acceptance, then re-run recover');
 
         if (r && r.state === 'provisioning') {
           const resumable: import('./types.js').SagaPhase[] =
-            ['create_members', 'configure_briefings', 'join_role_groups', 'wait_seats',
-              'launch_work', 'wait_briefing_acks', 'activate'];
+            ['create_members', 'join_role_groups', 'wait_seats', 'launch_work', 'activate'];
           if (resumable.includes(r.saga.phase) && r.template_snapshot) {
             try {
               const template = r.task_id

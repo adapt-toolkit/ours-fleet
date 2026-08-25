@@ -6,7 +6,7 @@ import type {
   RoomOrchestrationRecord, RoomOrchestrationState, SagaCursor, SagaPhase,
   RoomMemberSeat, ProvisioningDetail,
   MemberRetirementPhase, RoomClosePhase,
-  RoomRoleBriefingDefinition, RoomMemberLaunchState, RoomMemberBriefingState,
+  RoomRoleBriefingDefinition, RoomMemberLaunchState,
 } from './types.js';
 
 export const roomsDir = () => join(stateRoot(), 'rooms');
@@ -167,17 +167,10 @@ const LAUNCH_ORDER: readonly RoomMemberLaunchState['state'][] = [
   'pending', 'intent', 'launched', 'stopped', 'failed',
 ];
 
-const BRIEFING_ORDER: readonly RoomMemberBriefingState['state'][] = [
-  'pending', 'relay_queued', 'relay_failed', 'acknowledged',
-];
-
 export function updateMemberStartup(
   id: string,
   roleName: string,
-  update: {
-    launch?: RoomMemberLaunchState;
-    briefing?: RoomMemberBriefingState;
-  },
+  update: { launch?: RoomMemberLaunchState },
 ): RoomOrchestrationRecord {
   const r = readRoom(id);
   const seat = r.member_seats.find(candidate => candidate.role_name === roleName);
@@ -190,14 +183,7 @@ export function updateMemberStartup(
       `room ${id} member ${roleName} launch cannot move backward to ${update.launch.state}`,
     );
   }
-  if (update.briefing && seat.briefing
-      && BRIEFING_ORDER.indexOf(update.briefing.state) < BRIEFING_ORDER.indexOf(seat.briefing.state)) {
-    throw new RoomStateError(
-      `room ${id} member ${roleName} briefing cannot move backward to ${update.briefing.state}`,
-    );
-  }
   if (update.launch) seat.launch = update.launch;
-  if (update.briefing) seat.briefing = update.briefing;
   writeRoom(r);
   return r;
 }

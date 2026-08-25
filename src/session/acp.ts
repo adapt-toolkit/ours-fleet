@@ -245,9 +245,9 @@ export interface AcpSessionOptions {
   /** Adapter-authenticated request-metadata vocabulary; never inferred from ACP `_meta`. */
   permissionMetadataSource?: 'codex-acp';
   /**
-   * MCP servers the ROLE declares, for every session/new, resume and load. Empty
-   * or omitted sends `[]`, which is what fleet has always sent and leaves the
-   * agent's own configuration untouched.
+   * MCP servers the ROLE declares, for every session/new, resume and load.
+   * Omitted preserves inherited configuration; an explicit empty array disables
+   * every inherited server.
    */
   mcpServers?: AcpMcpServer[];
   /**
@@ -1112,16 +1112,11 @@ export class AcpSession implements SessionHandle {
     this.conversation.close();
   }
 
-  /**
-   * The role's declared MCP servers, or `[]`.
-   *
-   * Sent on resume and load as well as on new: the agent builds its server set
-   * once per session, so a resumed session that omitted them would come back
-   * without the tools the role's config declares — which is exactly the shape of
-   * silent drop this plumbing exists to end.
-   */
-  private declaredMcpServers(): AcpMcpServer[] {
-    return this.options.mcpServers ?? [];
+  /** Preserve inheritance on omission; carry even an explicit empty override. */
+  private declaredMcpServers(): { mcpServers: AcpMcpServer[] } | Record<string, never> {
+    return this.options.mcpServers === undefined
+      ? {}
+      : { mcpServers: this.options.mcpServers };
   }
 
   private async initialize(): Promise<void> {
@@ -1145,7 +1140,7 @@ export class AcpSession implements SessionHandle {
       const resumed = await this.connection.agent.request(acp.methods.agent.session.resume, {
         sessionId: persisted,
         cwd: this.options.cwd,
-        mcpServers: this.declaredMcpServers(),
+        ...this.declaredMcpServers(),
       });
       this.captureRuntimeMetadata(resumed.configOptions);
       this.sessionId = persisted;
@@ -1157,17 +1152,17 @@ export class AcpSession implements SessionHandle {
         const loaded = await this.connection.agent.request(acp.methods.agent.session.load, {
           sessionId: persisted,
           cwd: this.options.cwd,
-          mcpServers: this.declaredMcpServers(),
-        });
+          ...this.declaredMcpServers(),
+        }) as { configOptions?: acp.SessionConfigOption[] | null };
         this.captureRuntimeMetadata(loaded.configOptions);
       } finally { this.replaying = false; }
       this.sessionId = persisted;
     } else {
       const created = await this.connection.agent.request(acp.methods.agent.session.new, {
         cwd: this.options.cwd,
-        mcpServers: this.declaredMcpServers(),
+        ...this.declaredMcpServers(),
         ...(this.options.sessionMeta ? { _meta: this.options.sessionMeta } : {}),
-      });
+      }) as { sessionId: string; configOptions?: acp.SessionConfigOption[] | null };
       this.sessionId = created.sessionId;
       this.captureRuntimeMetadata(created.configOptions);
     }

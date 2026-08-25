@@ -483,7 +483,7 @@ describe('ACP delivery of flag-shaped harness options', () => {
     const r = acpRole();
     const prep = await a.prepareSession(r, { stateDir, runCwd: stateDir });
     expect(a.acpSessionMeta!(r, prep)).toBeUndefined();
-    expect(a.acpMcpServers!(r)).toEqual([]);
+    expect(a.acpMcpServers!(r)).toBeUndefined();
   });
 
   it('sends nothing to an ACP agent fleet did not choose', async () => {
@@ -544,6 +544,11 @@ describe('harness_options.mcp_servers', () => {
     ]);
     expect(a.acpSessionMeta!(r, { argv: [], env: {} }))
       .toEqual({ claudeCode: { options: { strictMcpConfig: true } } });
+  });
+
+  it('does not override ACP MCP servers when mcp_servers is absent', () => {
+    const adapter = makeClaudeCodeAdapter(okExec);
+    expect(adapter.acpMcpServers!(role({ session: 'acp' }))).toBeUndefined();
   });
 
   it('refuses a strict role that would lose the ours connector and go mute', () => {
