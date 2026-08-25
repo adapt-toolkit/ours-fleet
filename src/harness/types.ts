@@ -135,10 +135,10 @@ export interface HarnessAdapter {
   acpPermissionModeId?(role: ResolvedRole): string | undefined;
   /**
    * The MCP servers this role declares, for the `mcpServers` array of ACP's
-   * `session/new` / `resume` / `load`. Empty (or omitted) leaves the agent's own
-   * configuration alone, which is what fleet has always sent.
+   * `session/new` / `resume` / `load`. `undefined` preserves the agent's
+   * inherited configuration; an explicit empty array disables all servers.
    */
-  acpMcpServers?(role: ResolvedRole): AcpMcpServer[];
+  acpMcpServers?(role: ResolvedRole): AcpMcpServer[] | undefined;
   /**
    * Agent-specific `_meta` for `session/new` — how a capability the CLI takes as
    * a flag reaches an ACP agent that accepts no flags.

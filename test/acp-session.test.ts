@@ -1185,7 +1185,11 @@ describe('session/new carries the role\'s declared servers and agent options', (
     });
   });
 
-  it('sends [] and no _meta when the role declared nothing — the old behaviour', async () => {
-    expect(await params()).toEqual({ mcpServers: [], _meta: null });
+  it('omits mcpServers when the role declared nothing so the agent inherits its configuration', async () => {
+    expect(await params()).toEqual({ mcpServers: null, _meta: null });
+  });
+
+  it('sends an explicit empty list to disable every inherited MCP server', async () => {
+    expect(await params({ mcpServers: [] })).toEqual({ mcpServers: [], _meta: null });
   });
 });

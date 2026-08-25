@@ -11,17 +11,17 @@ import {
   resolveRoleModel, resolveWorklogPolicy, validateMonitorConfig,
   type ApprovalMode, type FilesystemMode, type ResolvedRole, type RoleConfig,
   type CommonPermissions, type MonitorConfig, type SessionBackendId, type UnattendedMode,
-  type RoomStartupGate,
+  type RoomMemberStartup,
 } from './config.js';
 import { resolveRoleModelEnv } from './model-env.js';
 import { applyRole, up, type OpsDeps } from './ops.js';
 import { START_STAGGER_FILE } from './runner.js';
 import {
-  buildProvenance, daemonIdentityInventoryProvisioner, daemonIdentityProvisioner,
+  buildProvenance, daemonIdentityProvisioner,
   ensureIdentity, provenanceOf,
   withCreationTransaction, writeProvenance, writeRoleFile,
   type CreationDeps, type CreationProvenance, type CreationTransaction,
-  type IdentityGuarantee, type ProvenanceEntry,
+  type ProvenanceEntry,
 } from './creation.js';
 import { VERSION } from './version.js';
 import './harness/claude-code.js';
@@ -74,8 +74,8 @@ export interface SpawnOpts {
   creationActionId?: string;
   /** Set only by a live role supervisor after a role-scoped proxy request. */
   callerRole?: string;
-  /** Trusted Fleet-internal gate for a Cowork room member; not a CLI/config surface. */
-  roomStartupGate?: RoomStartupGate;
+  /** Trusted Fleet-internal first-boot payload for a Cowork room member. */
+  roomMemberStartup?: RoomMemberStartup;
   /** Internal provenance labels for values filled by the caller's supervisor. */
   inheritedFromCaller?: string[];
   /**
@@ -466,22 +466,10 @@ export async function spawnTemp(
     async tx => {
       creation.onStage?.('checking_identity');
       assertNameFree(o);
-      const guarantee = await ensureIdentity(
-        effectiveIdentity(o),
-        profileValues(o),
-        creation.identityProvisioner ?? daemonIdentityInventoryProvisioner(),
-        creation.log);
       creation.onStage?.('checking_identity', {
-        result: guarantee.evidence, guarantee: guarantee.state,
+        result: 'unknown', guarantee: 'unverified',
       });
-      if (guarantee.state === 'created')
-        tx.record({
-          stage: `ours identity ${effectiveIdentity(o)}`,
-          undo: async () => {
-            await creation.identityProvisioner?.remove?.(effectiveIdentity(o));
-          },
-        });
-      return spawnTempInner(o, binPath, launch, tx, guarantee, creation.onStage);
+      return spawnTempInner(o, binPath, launch, tx, creation.onStage);
     },
     creation,
   );
@@ -489,7 +477,7 @@ export async function spawnTemp(
 
 async function spawnTempInner(
   o: SpawnOpts, binPath: string, launch: SupervisorLauncher, tx: CreationTransaction,
-  guarantee: IdentityGuarantee, onStage: CreationDeps['onStage'],
+  onStage: CreationDeps['onStage'],
 ): Promise<string> {
   const cfg = loadConfig(o.configPath);
   const defaultHarness = cfg.defaults.harness as string | undefined;
@@ -537,13 +525,13 @@ async function spawnTempInner(
     worklog: resolveWorklogPolicy(cfg.defaults.worklog, fromOpts.worklog),
     auth_proxy: tempAuthProxy,
     sourceFile: '(temp)',
-    roomStartupGate: o.roomStartupGate,
+    roomMemberStartup: o.roomMemberStartup,
   };
   role.env = modelEnv.env;
   if (role.auth_proxy && role.harness !== 'claude-code')
     throw new Error('auth_proxy is supported only by claude-code');
   onStage?.('writing_role');
-  const dir = applyRole(role, { temp: true, identityGuarantee: guarantee.state });
+  const dir = applyRole(role, { temp: true, identityGuarantee: 'unverified' });
   const provenance = buildProvenance({
     role: o.name, lifetime: 'temporary', fleetVersion: VERSION,
     settings: provenanceSettings(o, cfg.defaults),

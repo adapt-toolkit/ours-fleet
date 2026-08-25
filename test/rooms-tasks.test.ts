@@ -565,7 +565,7 @@ describe('room-state', () => {
       expect(getRoomRecord('brief-1')?.role_briefings?.Reviewer.text).toBe('Review exactly.');
     });
 
-    it('persists forward-only launch and briefing progress per seat', () => {
+    it('persists forward-only launch progress per seat', () => {
       createRoomRecord({ room_id: 'brief-2', room_name: 'Brief' });
       updateMemberSeats('brief-2', [{
         role_name: 'Reviewer-1', identity_cid: 'cid-1', slot: 'reviewer',
@@ -576,9 +576,6 @@ describe('room-state', () => {
           state: 'intent', attempt: 1, action_id: 'action-1',
           mission_sha256: 'b'.repeat(64), updated_at: '2026-08-24T00:00:00.000Z',
         },
-        briefing: {
-          role: 'Reviewer', state: 'pending', rejected_ack_count: 0,
-        },
       });
       const r = updateMemberStartup('brief-2', 'Reviewer-1', {
         launch: {
@@ -586,16 +583,13 @@ describe('room-state', () => {
           mission_sha256: 'b'.repeat(64), launch_id: 'launch-1',
           updated_at: '2026-08-24T00:00:01.000Z',
         },
-        briefing: {
-          role: 'Reviewer', state: 'relay_queued', message_id: 'message-1',
-          relay_intent_record_id: 'room:2', relay_result_record_id: 'room:3',
-          rejected_ack_count: 0,
-        },
       });
       expect(r.member_seats[0].launch?.launch_id).toBe('launch-1');
-      expect(r.member_seats[0].briefing?.state).toBe('relay_queued');
       expect(() => updateMemberStartup('brief-2', 'Reviewer-1', {
-        briefing: { role: 'Reviewer', state: 'pending', rejected_ack_count: 0 },
+        launch: {
+          state: 'intent', attempt: 1, action_id: 'action-1',
+          mission_sha256: 'b'.repeat(64), updated_at: 'older',
+        },
       })).toThrow(/cannot move backward/);
     });
 

@@ -233,13 +233,13 @@ from the current runner generation and excludes adapter `session/load` replay;
 those replay events remain in the durable ledger with `agent_replay` provenance
 for diagnosis and recovery rather than appearing as current work.
 
-For a temporary role, those first-boot instructions preserve and bind an
-existing identity when one is present. If the assigned identity is missing,
-the role capability-detects the ours MCP `create_temporary_identity` tool and
-uses it when available, so the newly created identity is owned and cleaned up
-by that connector session lifecycle. Older ours servers remain compatible via
-`create_identity`. A collision or creation error stops for operator review;
-fleet never force-adopts or deletes identity state. Permanent roles are
+For every temporary role, the first-boot instructions call ours MCP
+`create_temporary_identity` with the exact assigned name, so the new identity
+is owned and cleaned up by that connector session lifecycle. Temporary roles
+never bind pre-existing identities or fall back to permanent `create_identity`.
+Fleet does not inspect, preserve, or provision an ours identity for temp spawn.
+A collision, missing tool, or creation error stops for operator review; fleet
+never force-adopts or deletes identity state. Permanent roles are
 provisioned by fleet before launch and never delegate normal identity creation
 to the harness.
 
@@ -481,6 +481,13 @@ tasks:
   create_mode: start
   close_room_on_done: true
 ```
+
+Fleet launches each template member with a dedicated one-time Cowork invite.
+The generated temporary-agent briefing contains the exact identity name, invite,
+Cowork role, and task. The agent creates that identity itself with ours MCP
+`create_temporary_identity`, accepts the invite with `add_contact`, and starts
+work immediately. Fleet activates the room from Cowork's authenticated seat; there
+is no briefing hash, startup ACK, or separate role-briefing readiness gate.
 
 Human task and room results use the same compact Markdown presentation in the
 CLI and authenticated owner channel: a short heading, icon-plus-word status,

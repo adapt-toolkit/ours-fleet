@@ -259,20 +259,23 @@ describe('spawnTemp', () => {
     expect(snap.session).toBe('acp');
   });
 
-  it('persists a trusted room startup gate only in the temp role snapshot', async () => {
-    const gate = {
+  it('persists a trusted simple room startup payload only in the temp role snapshot', async () => {
+    const startup = {
       room_id: '01ROOM', room_identity_cid: 'A'.repeat(64),
-      briefing_role: 'Reviewer', briefing_version: 1,
-      briefing_sha256: 'b'.repeat(64), owner_seat_cid: null,
+      identity_name: 'RoomReviewer', invite_id: 'invite-1', invite: 'secret-invite',
+      role: 'Reviewer', task: 'Review exactly.', owner_seat_cid: null,
     };
     const d = await spawnTemp({
-      name: 'RoomReviewer', mission: 'bootstrap', roomStartupGate: gate,
+      name: 'RoomReviewer', mission: startup.task, roomMemberStartup: startup,
     }, '/b/ours-fleet', () => {});
     const snap = parse(readFileSync(join(d, 'role.yaml'), 'utf8'));
-    expect(snap.roomStartupGate).toEqual(gate);
-    expect(readFileSync(join(d, 'briefing.md'), 'utf8')).toContain('## Room startup gate');
+    expect(snap.roomMemberStartup).toEqual(startup);
+    const briefing = readFileSync(join(d, 'briefing.md'), 'utf8');
+    expect(briefing).toContain('## Room assignment');
+    expect(briefing).toContain('secret-invite');
+    expect(briefing).not.toContain('fleet_room_briefing_ack');
     writeFileSync(join(dir, 'public-gate.yaml'), stringify({
-      roles: { Public: { roomStartupGate: gate } },
+      roles: { Public: { roomMemberStartup: startup } },
     }));
     expect(() => loadConfig(join(dir, 'public-gate.yaml'))).toThrow();
   });
@@ -491,10 +494,15 @@ describe('identity is established before launch', () => {
     expect(calls.some(call => call[0] === 'install')).toBe(false);
   });
 
-  it('a temp spawn gets the same guarantee in its briefing', async () => {
+  it('a temp spawn does not inspect or provision a pre-existing identity', async () => {
+    let inspected = false;
     const d = await spawnTemp({ name: 'TempKnown', identity: 'TempKnown' }, '/b/ours-fleet', () => {},
-      { identityProvisioner: provisioner(true) });
-    expect(readFileSync(join(d, 'briefing.md'), 'utf8')).toContain('verified to exist');
+      { identityProvisioner: { async exists() { inspected = true; throw new Error('must not inspect'); } } });
+    expect(inspected).toBe(false);
+    const briefing = readFileSync(join(d, 'briefing.md'), 'utf8');
+    expect(briefing).toContain('create_temporary_identity');
+    expect(briefing).not.toContain('choose_identity');
+    expect(briefing).toContain('Do not inspect, preserve, adopt, or use any pre-existing');
   });
 
   it('a temp spawn writes lifecycle-compatible identity bootstrap instructions', async () => {
@@ -505,8 +513,9 @@ describe('identity is established before launch', () => {
     expect(briefing).toContain('a temporary agent');
     expect(briefing).toContain('create_temporary_identity');
     expect(briefing).toContain('name "ExplicitTempIdentity"');
-    expect(briefing).toContain('older server');
     expect(briefing).toContain('connector owns its cleanup');
+    expect(briefing).not.toContain('choose_identity');
+    expect(briefing).not.toContain('call **create_identity**');
   });
 });
 

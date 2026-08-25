@@ -100,6 +100,11 @@ async function removeExactMemberIdentity(seat: RoomMemberSeat): Promise<void> {
   await withIdentityClient(async client => {
     const before = listedIdentity(await client.listIdentities(), seat.role_name);
     if (!before) return;
+    if (!seat.identity_cid) {
+      throw new Error(
+        `room member '${seat.role_name}' exists without a recorded authenticated CID; refusing removal`,
+      );
+    }
     if (before.cid?.toLowerCase() !== seat.identity_cid.toLowerCase()) {
       throw new Error(
         `room member '${seat.role_name}' identity CID mismatch: recorded ${seat.identity_cid}, found ${before.cid ?? 'none'}`,

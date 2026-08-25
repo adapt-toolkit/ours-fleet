@@ -83,7 +83,7 @@ describe('generateBriefing', () => {
     expect(b).not.toContain('summary of your Charter');
   });
 
-  it('renders a CID-pinned room gate before any authoritative profile write', () => {
+  it('renders the complete simple room assignment and starts work without an ACK gate', () => {
     const roomRole = {
       ...base,
       session: 'acp' as const,
@@ -93,45 +93,50 @@ describe('generateBriefing', () => {
         mode: 'fleet' as const, enabled: true, wake_sources: [], batch_ms: 2000,
         inject: 'notification' as const,
       },
-      roomStartupGate: {
+      roomMemberStartup: {
         room_id: '01ROOM', room_identity_cid: 'A'.repeat(64),
-        briefing_role: 'Reviewer', briefing_version: 2,
-        briefing_sha256: 'b'.repeat(64), owner_seat_cid: 'C'.repeat(64),
+        identity_name: 'reviewer-1', invite_id: 'invite-1', invite: 'secret-invite',
+        role: 'Reviewer', task: 'Review the exact implementation.',
+        owner_seat_cid: 'C'.repeat(64),
       },
     } as ResolvedRole;
     const b = generateBriefing(roomRole, vocab, opts);
-    expect(b).toContain('## Room startup gate');
-    expect(b).toContain('room_role_briefing');
+    expect(b).toContain('## Room assignment');
+    expect(b).toContain('reviewer-1');
+    expect(b).toContain('secret-invite');
+    expect(b).toContain('Review the exact implementation.');
+    expect(b).toContain('create_temporary_identity');
+    expect(b).toContain('add_contact');
     expect(b).toContain('A'.repeat(64));
     expect(b).toContain('C'.repeat(64));
-    expect(b).toContain('briefing_message_id');
-    expect(b).toContain('profile_applied');
-    expect(b).toContain('list_history');
-    expect(b).toContain('get_history_item');
-    expect(b).toContain('Only after the ACK is sent');
+    expect(b).toContain('Start the Task above now');
+    expect(b).not.toContain('fleet_room_briefing_ack');
+    expect(b).not.toContain('briefing_sha256');
+    expect(b).not.toContain('list_history');
+    expect(b).not.toContain('get_history_item');
     expect(b).not.toContain('LOCAL BOOTSTRAP ONLY');
-    const receive = b.indexOf('Call **get_messages**');
-    const profile = b.indexOf('set the entire exact text as your persona');
-    const ack = b.indexOf('fleet_room_briefing_ack');
+    const create = b.indexOf('create_temporary_identity');
+    const accept = b.indexOf('add_contact');
+    const work = b.indexOf('Start the Task above now');
     const monitor = b.indexOf('Wakes arrive as [fleet-monitor]');
-    expect(receive).toBeGreaterThan(0);
-    expect(profile).toBeGreaterThan(receive);
-    expect(ack).toBeGreaterThan(profile);
-    expect(monitor).toBeGreaterThan(ack);
+    expect(create).toBeGreaterThan(0);
+    expect(accept).toBeGreaterThan(create);
+    expect(work).toBeGreaterThan(accept);
+    expect(monitor).toBeGreaterThan(work);
   });
 
   it('makes owner_seat_cid=null mean no room participant has Owner authority', () => {
     const b = generateBriefing({
       ...base,
-      roomStartupGate: {
+      roomMemberStartup: {
         room_id: '01ROOM', room_identity_cid: 'A'.repeat(64),
-        briefing_role: 'Reviewer', briefing_version: 1,
-        briefing_sha256: 'b'.repeat(64), owner_seat_cid: null,
+        identity_name: 'reviewer-1', invite_id: 'invite-1', invite: 'secret-invite',
+        role: 'Reviewer', task: 'Review.', owner_seat_cid: null,
       },
     } as ResolvedRole, vocab, opts);
     expect(b).toContain('Authenticated Owner seat CID: `none`');
     expect(b).toContain('this room has no authenticated Owner seat');
-    expect(b).toContain('"owner_seat_cid":null');
+    expect(b).not.toContain('fleet_room_briefing_ack');
   });
 
   it('renders the Routines section with the injected routinesPath', () => {
@@ -272,37 +277,34 @@ describe('temporary-role identity compatibility', () => {
   const temporary = (extra: Partial<Parameters<typeof generateBriefing>[2]> = {}) =>
     generateBriefing(base, vocab, { ...opts, temporaryIdentity: true, ...extra });
 
-  it('capability-detects session-scoped creation and names the older-server fallback', () => {
+  it('directly creates the assigned session-scoped identity', () => {
     const b = temporary();
-    expect(b).toContain('available/deferred ours MCP tools');
+    expect(b).toContain('CREATE your ours identity now');
     expect(b).toContain('create_temporary_identity');
-    expect(b).toContain('If exposed');
-    expect(b).toContain('If that tool is absent (an older server)');
-    expect(b).toContain('create_identity');
     expect(b).toContain('name "Alice Dev"');
+    expect(b).toContain('connector owns its cleanup');
   });
 
-  it('preserves an existing or explicitly supplied identity instead of converting it', () => {
+  it('never binds or adopts a pre-existing identity, regardless of provisioning evidence', () => {
     const b = temporary({ identityGuarantee: 'verified' });
-    expect(b).toContain('pre-existing identity: preserve it as user-owned');
-    expect(b).toContain('Never close, remove, replace, or otherwise convert it');
-    expect(b).toContain('without force');
-    expect(b).toContain('do not evict it');
+    expect(b).not.toContain('choose_identity');
+    expect(b).not.toContain('BIND the exact');
+    expect(b).toContain('Do not inspect, preserve, adopt, or use any pre-existing');
+    expect(b).not.toMatch(/\bBIND your ours identity\b/);
   });
 
-  it('states the MCP-owned lifecycle and recreates through the capability path on restart', () => {
+  it('states the MCP-owned lifecycle and recreates directly on restart', () => {
     const b = temporary();
-    expect(b).toContain('connector owns its cleanup when this session lifecycle ends');
-    expect(b).toContain('previous session-owned temporary');
-    expect(b).toContain('when exposed, otherwise fall back');
+    expect(b).toContain('connector owns its cleanup when this');
+    expect(b).toContain('create_temporary_identity** with name "Alice Dev" again');
+    expect(b).not.toContain('re-bind');
   });
 
-  it('fails safely on collisions and creation errors without deleting identity state', () => {
+  it('fails safely without fallback or deleting identity state', () => {
     const b = temporary();
-    expect(b).toContain('collision or any other error, STOP and report it');
-    expect(b).toContain('do not force-bind');
+    expect(b).toContain('collision, missing tool, or creation error, STOP');
     expect(b).toContain('remove an identity');
-    expect(b).not.toContain('remove_identity');
+    expect(b).not.toContain('call **create_identity**');
   });
 
   it('keeps permanent-role creation in the fleet lifecycle', () => {

@@ -112,8 +112,10 @@ function validateMcpServers(servers: unknown): ValidationError[] {
 }
 
 /** `harness_options.mcp_servers` in ACP's `session/new` array shape. */
-function acpMcpServersFor(servers: Record<string, McpServerSpec> | undefined): AcpMcpServer[] {
-  if (!servers) return [];
+function acpMcpServersFor(
+  servers: Record<string, McpServerSpec> | undefined,
+): AcpMcpServer[] | undefined {
+  if (!servers) return undefined;
   // `env` and `headers` are REQUIRED arrays in the protocol, so they are always
   // sent — empty when the role declared none.
   const pairs = (r: Record<string, string> | undefined) =>
@@ -457,7 +459,7 @@ export function makeClaudeCodeAdapter(exec: Exec = realExec): HarnessAdapter {
      * resume/load, because the SDK builds its server set once per session and a
      * resumed session that dropped them would quietly lose its tools.
      */
-    acpMcpServers(role: ResolvedRole): AcpMcpServer[] {
+    acpMcpServers(role: ResolvedRole): AcpMcpServer[] | undefined {
       return acpMcpServersFor((role.harness_options as ClaudeOptions | undefined)?.mcp_servers);
     },
 

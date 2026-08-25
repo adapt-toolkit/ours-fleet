@@ -236,13 +236,15 @@ export interface RoleConfig {
   auth_proxy?: Partial<AuthProxyConfig>;
 }
 
-/** Internal startup contract for Fleet-provisioned Cowork room members. */
-export interface RoomStartupGate {
+/** Internal first-boot payload for a Fleet-provisioned Cowork room member. */
+export interface RoomMemberStartup {
   room_id: string;
   room_identity_cid: string;
-  briefing_role: string;
-  briefing_version: number;
-  briefing_sha256: string;
+  identity_name: string;
+  invite_id: string;
+  invite: string;
+  role: string;
+  task: string;
   owner_seat_cid: string | null;
 }
 
@@ -267,7 +269,7 @@ export interface ResolvedRole extends Omit<RoleConfig, 'model' | 'owner_channel'
   auth_proxy?: AuthProxyConfig;
   loops?: ResolvedRoleLoop[];
   /** Internal/transient: never accepted as a user-authored RoleConfig key. */
-  roomStartupGate?: RoomStartupGate;
+  roomMemberStartup?: RoomMemberStartup;
 }
 
 export interface FleetConfig {

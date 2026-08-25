@@ -184,12 +184,13 @@ records receive a bounded grace so a not-yet-registered transient unit cannot be
 mistaken for a stopped one. Stale recorded supervisors are reclaimed in bounded
 batches by moving their state to the same recovery archive, never by blind deletion.
 
-Temporary-role identity bootstrap is capability-based. The generated briefing
-first tries to bind the exact assigned identity and preserves it when it already
-exists. If missing, it uses ours MCP \`create_temporary_identity\` when that tool
-is exposed, tying a newly-created identity to the connector session lifecycle;
-older servers fall back to \`create_identity\`. Collisions and creation errors
-stop safely without force-adopting or deleting identity state. Permanent roles
+Every temporary role creates a new session-owned identity by calling ours MCP
+\`create_temporary_identity\` with its exact assigned name. It never binds a
+pre-existing identity and never falls back to permanent \`create_identity\`.
+Fleet does not inspect, preserve, or provision an ours identity for temporary
+spawn; creation belongs exclusively to the launched temporary agent session.
+Collisions, missing tool support, and creation errors stop safely without
+force-adopting or deleting identity state. Permanent roles
 are provisioned by fleet before launch and never delegate normal identity
 creation to the harness.
 
@@ -344,6 +345,13 @@ tasks:
   create_mode: start
   close_room_on_done: true
 \`\`\`
+
+Fleet launches each template member with a dedicated one-time Cowork invite.
+The generated temporary-agent briefing contains the exact identity name, invite,
+Cowork role, and task. The agent creates that identity itself with ours MCP
+\`create_temporary_identity\`, accepts the invite with \`add_contact\`, and starts
+work immediately. Fleet activates the room from Cowork's authenticated seat; there
+is no briefing hash, startup ACK, or separate role-briefing readiness gate.
 
 Human task and room results use the same compact Markdown presentation in the
 CLI and authenticated owner channel: a short heading, icon-plus-word status,
@@ -506,6 +514,10 @@ dontAsk, bypassPermissions), \`plugins\`, \`mem_palace\`,
 headers }\`). By default they are ADDED to whatever the OS user running the role
 already has configured, on both session types: tmux passes \`--mcp-config\`, and
 ACP sends them in \`session/new\`.
+
+When \`mcp_servers\` is absent, Fleet omits ACP's \`mcpServers\` field so the
+agent keeps its inherited servers. An explicit empty ACP server array is different:
+it is forwarded as \`[]\` and disables every inherited server.
 
 \`mcp_servers_only: true\` makes the declared set EXCLUSIVE — \`--strict-mcp-config\`
 on tmux, \`strictMcpConfig\` on ACP. It is all-or-nothing and it ignores every

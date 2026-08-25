@@ -133,10 +133,16 @@ describe('Cowork management-socket adapter', () => {
     const methods: string[] = [];
     const socketPath = await rpcServer(request => {
       methods.push(String(request.method));
-      if (request.method === 'room.invite') return {
-        blob: 'secret-role-invite',
-        invite: { invite_id: 'invite-existing-contract', min_accepts: 2 },
-      };
+      if (request.method === 'room.invite') {
+        expect(request.params).toEqual({
+          room_id: '01ABCDEF0123456789ABCDEFGH', mode: 'one_time',
+          role: 'Developer', min_accepts: 1,
+        });
+        return {
+          blob: 'secret-role-invite',
+          invite: { invite_id: 'invite-existing-contract', min_accepts: 1 },
+        };
+      }
       if (request.method === 'room.revoke') {
         expect(request.params).toEqual({
           room_id: '01ABCDEF0123456789ABCDEFGH',
@@ -149,9 +155,9 @@ describe('Cowork management-socket adapter', () => {
     const adapter = createCoworkAdapter({ socketPath });
 
     await expect(adapter.issueInvite('01ABCDEF0123456789ABCDEFGH', {
-      role: 'Developer', min_accepts: 2,
+      mode: 'one_time', role: 'Developer', min_accepts: 1,
     })).resolves.toEqual({
-      invite: 'secret-role-invite', invite_id: 'invite-existing-contract', min_accepts: 2,
+      invite: 'secret-role-invite', invite_id: 'invite-existing-contract', min_accepts: 1,
     });
     await expect(adapter.revokeInvite(
       '01ABCDEF0123456789ABCDEFGH', 'invite-existing-contract',
@@ -165,7 +171,10 @@ describe('Cowork management-socket adapter', () => {
       const method = String(request.method);
       methods.push(method);
       if (method === 'room.list') return [room({ state: 'active' })];
-      if (method === 'room.participants') return [{ identity: 'C'.repeat(64), role: 'Developer', state: 'active' }];
+      if (method === 'room.participants') return [{
+        identity: 'C'.repeat(64), display_name: 'developer-1',
+        invite_id: 'invite-1', role: 'Developer', state: 'active',
+      }];
       if (method === 'room.show') return room({
         state: 'active',
         role_briefings: {
@@ -184,7 +193,10 @@ describe('Cowork management-socket adapter', () => {
     const adapter = createCoworkAdapter({ socketPath });
     expect((await adapter.listRooms())[0]?.state).toBe('active');
     expect(await adapter.getSeats('01ABCDEF0123456789ABCDEFGH')).toEqual([
-      { identity_cid: 'C'.repeat(64), role: 'Developer', seat_state: 'active' },
+      {
+        identity_cid: 'C'.repeat(64), display_name: 'developer-1',
+        invite_id: 'invite-1', role: 'Developer', seat_state: 'active',
+      },
     ]);
     expect(await adapter.recoverRoom('01ABCDEF0123456789ABCDEFGH')).toMatchObject({
       state: 'active',

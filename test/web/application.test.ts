@@ -162,19 +162,23 @@ identity: Temp
         await new Promise(resolve => setTimeout(resolve, 10));
       expect(service.get(first.actionId)).toMatchObject({
         state: finalState,
-        identityCheck: flow.check === false ? 'missing' : 'unknown',
+        identityCheck: flow.lifetime === 'temporary'
+          ? 'unknown'
+          : flow.check === false ? 'missing' : 'unknown',
         identityBindingEvidence: 'not-structured',
       });
       const stateDir = join(
         root, '.ours-fleet', flow.lifetime === 'permanent' ? 'agents' : 'tmp', request.name,
       );
       const briefing = readFileSync(join(stateDir, 'briefing.md'), 'utf8');
-      expect(briefing).toContain('choose_identity');
       if (flow.lifetime === 'permanent') {
+        expect(briefing).toContain('choose_identity');
         expect(briefing).not.toContain('call **create_identity**');
         expect(briefing).toContain('It was created when your role');
       } else {
         expect(briefing).toContain('create_temporary_identity');
+        expect(briefing).not.toContain('choose_identity');
+        expect(briefing).not.toContain('call **create_identity**');
       }
       expect(service.get(first.actionId)?.stages.map(stage => stage.stage)).toContain(
         'identity_bootstrap_pending',

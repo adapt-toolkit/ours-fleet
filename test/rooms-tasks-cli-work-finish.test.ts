@@ -437,7 +437,7 @@ describe('task work', () => {
     expectExactJson({ schema_version: 1, task: getTask(t.task_id), status: 'already_active' });
   });
 
-  it('task and room show expose per-seat launch, relay, ACK, and rejection evidence', async () => {
+  it('task and room show expose per-seat launch and authenticated seat evidence', async () => {
     const t = backlogTask();
     await run('work', t.task_id);
     updateRoomRoleBriefing(ROOM_ID, 'Developer', {
@@ -469,10 +469,9 @@ describe('task work', () => {
     out = [];
     await runRoom('show', ROOM_ID);
     const text = out.join('\n');
-    expect(text).toContain('launch launched, briefing relay\\_queued');
-    expect(text).toContain('rejected acknowledgement recorded; inspect role logs');
-    expect(text).not.toContain('owner\\_seat\\_cid mismatch');
-    expect(text).not.toContain('briefing_message=');
+    expect(text).toContain('seat active, launch launched');
+    expect(text).not.toContain('briefing relay\\_queued');
+    expect(text).not.toContain('acknowledgement');
     expect(text).not.toContain('sha256:');
     expect(text).toContain('`Developer` — version `2` — configured');
   });
@@ -577,7 +576,7 @@ describe('task work', () => {
   it('work recovery uses the durable room snapshot after config template removal', async () => {
     writeCustomTemplate(true);
     mocks.provisionMembers.mockImplementationOnce(async ({ roomId }: { roomId: string }) => {
-      advanceSaga(roomId, 'wait_briefing_acks', 8, 'waiting_briefing_acks');
+      advanceSaga(roomId, 'wait_seats', 5, 'waiting_seats');
       return getRoomRecord(roomId)!;
     });
     const t = backlogTask();
@@ -593,7 +592,7 @@ describe('task work', () => {
   it('task recover refreshes output and uses the durable room snapshot after config drift', async () => {
     writeCustomTemplate(true);
     mocks.provisionMembers.mockImplementationOnce(async ({ roomId }: { roomId: string }) => {
-      advanceSaga(roomId, 'wait_briefing_acks', 8, 'waiting_briefing_acks');
+      advanceSaga(roomId, 'wait_seats', 5, 'waiting_seats');
       return getRoomRecord(roomId)!;
     });
     const t = backlogTask();
@@ -617,7 +616,7 @@ describe('task work', () => {
   it('room recover uses the task-bound durable snapshot after config removal', async () => {
     writeCustomTemplate(true);
     mocks.provisionMembers.mockImplementationOnce(async ({ roomId }: { roomId: string }) => {
-      advanceSaga(roomId, 'wait_briefing_acks', 8, 'waiting_briefing_acks');
+      advanceSaga(roomId, 'wait_seats', 5, 'waiting_seats');
       return getRoomRecord(roomId)!;
     });
     const t = backlogTask();
