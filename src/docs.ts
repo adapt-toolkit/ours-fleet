@@ -320,9 +320,9 @@ Other role fields include \`max_tokens\`, \`autocompact_pct\`, and \`isolation\`
 Use README.md for the complete isolation policy and resource-cap schema.
 
 Supervised roles connect to the operator-configured ours daemon; they do not own its
-lifecycle. Fleet forces \`OURS_AUTOSTART=0\` in tmux and ACP child processes after role
-environment overlays. Start the shared daemon only through an explicit operator or
-installer/setup flow.
+lifecycle. Fleet strips the obsolete, presence-sensitive \`OURS_AUTOSTART\` variable from
+tmux and ACP children; \`ours-mcp proxy\` is client-only and never starts a daemon. Start
+the shared daemon only through an explicit operator or installer/setup flow.
 
 ## Rooms and tasks
 

@@ -1167,6 +1167,7 @@ describe('session/new carries the role\'s declared servers and agent options', (
       mode: 'fresh',
       permissions: { approval: 'allow', filesystem: 'workspace', unattended: 'deny' },
       permissionMetadataSource: 'codex-acp',
+      scrubObsoleteOursAutostart: true,
       log: () => {},
       ...over,
     });
@@ -1183,13 +1184,16 @@ describe('session/new carries the role\'s declared servers and agent options', (
     })).toEqual({
       mcpServers: [{ name: 'ours', command: 'ours-mcp', args: ['proxy'], env: [] }],
       _meta: { claudeCode: { options: { strictMcpConfig: true } } },
+      oursAutostart: null,
+      oursMcpTools: ['choose_identity', 'get_messages'],
       disableInheritedMcp: '0',
     });
   });
 
   it('sends protocol-required [] when the role declared nothing', async () => {
     expect(await params()).toEqual({
-      mcpServers: [], _meta: null, disableInheritedMcp: '0',
+      mcpServers: [], _meta: null, oursAutostart: null,
+      oursMcpTools: ['choose_identity', 'get_messages'], disableInheritedMcp: '0',
     });
   });
 
@@ -1197,7 +1201,27 @@ describe('session/new carries the role\'s declared servers and agent options', (
     expect(await params({ env: {
       ACP_FIXTURE_ECHO_SESSION_PARAMS: '1',
       OURS_FLEET_CODEX_DISABLE_INHERITED_MCP: '1',
-    } })).toEqual({ mcpServers: [], _meta: null, disableInheritedMcp: '0' });
+    } })).toEqual({
+      mcpServers: [], _meta: null, oursAutostart: null,
+      oursMcpTools: ['choose_identity', 'get_messages'],
+      disableInheritedMcp: '0',
+    });
+  });
+
+  it.each(['', '0', '1'])('actively scrubs managed OURS_AUTOSTART=%j and exposes ours tools',
+    async value => {
+      expect(await params({ env: {
+        ACP_FIXTURE_ECHO_SESSION_PARAMS: '1', OURS_AUTOSTART: value,
+      } })).toMatchObject({
+        oursAutostart: null, oursMcpTools: ['choose_identity', 'get_messages'],
+      });
+    });
+
+  it('does not scrub an arbitrary non-managed ACP child', async () => {
+    expect(await params({
+      env: { ACP_FIXTURE_ECHO_SESSION_PARAMS: '1', OURS_AUTOSTART: 'custom' },
+      scrubObsoleteOursAutostart: false,
+    })).toMatchObject({ oursAutostart: 'custom', oursMcpTools: [] });
   });
 
   it('isolates opposite MCP intents across concurrent role processes', async () => {
@@ -1206,22 +1230,28 @@ describe('session/new carries the role\'s declared servers and agent options', (
       params({ mcpServers: [] }),
     ]);
     expect(inherited).toEqual({
-      mcpServers: [], _meta: null, disableInheritedMcp: '0',
+      mcpServers: [], _meta: null, oursAutostart: null,
+      oursMcpTools: ['choose_identity', 'get_messages'], disableInheritedMcp: '0',
     });
     expect(disabled).toEqual({
-      mcpServers: [], _meta: null, disableInheritedMcp: '1',
+      mcpServers: [], _meta: null, oursAutostart: null,
+      oursMcpTools: ['choose_identity', 'get_messages'], disableInheritedMcp: '1',
     });
   });
 
   it('sends an explicit empty list to disable every inherited MCP server', async () => {
     expect(await params({
       mcpServers: [], permissionMetadataSource: 'codex-acp',
-    })).toEqual({ mcpServers: [], _meta: null, disableInheritedMcp: '1' });
+    })).toEqual({
+      mcpServers: [], _meta: null, oursAutostart: null,
+      oursMcpTools: ['choose_identity', 'get_messages'], disableInheritedMcp: '1',
+    });
   });
 
   it('never marks an explicit empty list for an unauthenticated/custom ACP agent', async () => {
     expect(await params({ mcpServers: [], permissionMetadataSource: undefined })).toEqual({
-      mcpServers: [], _meta: null, disableInheritedMcp: null,
+      mcpServers: [], _meta: null, oursAutostart: null,
+      oursMcpTools: ['choose_identity', 'get_messages'], disableInheritedMcp: null,
     });
   });
 
@@ -1232,7 +1262,7 @@ describe('session/new carries the role\'s declared servers and agent options', (
       name: 'tmp-contract-role', argv: [process.execPath, fixture], cwd: stateDir,
       env: { ACP_FIXTURE_REQUIRE_MCP_SERVERS: '1' }, stateDir, mode: 'fresh',
       permissions: { approval: 'allow', filesystem: 'workspace', unattended: 'deny' },
-      permissionMetadataSource: 'codex-acp', log: () => {},
+      permissionMetadataSource: 'codex-acp', scrubObsoleteOursAutostart: true, log: () => {},
     });
     expect(await session.submitPrompt('first turn')).toMatchObject({
       succeeded: true, output: 'echo:first turn',
@@ -1262,6 +1292,7 @@ describe.each(['resume', 'load'] as const)('session/%s carries required MCP stat
       stateDir, mode: 'resume',
       permissions: { approval: 'allow', filesystem: 'workspace', unattended: 'deny' },
       permissionMetadataSource: 'codex-acp',
+      scrubObsoleteOursAutostart: true,
       ...(mcpServers === undefined ? {} : { mcpServers: [...mcpServers] }),
       log: () => {},
     });

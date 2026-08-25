@@ -247,6 +247,8 @@ export interface AcpSessionOptions {
   permissionMode?: NonNullable<SessionSnapshot['permissionMode']>;
   /** Adapter-authenticated request-metadata vocabulary; never inferred from ACP `_meta`. */
   permissionMetadataSource?: 'codex-acp';
+  /** Fleet-managed ours proxies must never receive the obsolete presence-sensitive flag. */
+  scrubObsoleteOursAutostart?: boolean;
   /**
    * MCP servers the ROLE declares, for every session/new, resume and load.
    * Omitted preserves inherited configuration (encoded as ACP's required `[]`);
@@ -409,17 +411,22 @@ export class AcpSession implements SessionHandle {
     if (!options.argv.length) throw new Error('ACP agent command is empty');
     const disableInheritedCodexMcp = options.permissionMetadataSource === 'codex-acp'
       && options.mcpServers !== undefined && options.mcpServers.length === 0;
+    // Obsolete ours-mcp lifecycle flags are presence-sensitive. The shared
+    // daemon remains operator-owned; managed ACP children are clients only.
+    const childEnv = {
+      ...process.env,
+      ...options.env,
+    };
+    if (options.scrubObsoleteOursAutostart) delete childEnv.OURS_AUTOSTART;
+    Object.assign(childEnv,
+      // Write both states for the authenticated proxy: a stale ambient `1`
+      // must never leak explicit-empty semantics into a later inherited role.
+      options.permissionMetadataSource === 'codex-acp'
+        ? { [CODEX_DISABLE_INHERITED_MCP_ENV]: disableInheritedCodexMcp ? '1' : '0' }
+        : {});
     const child = spawn(options.argv[0], options.argv.slice(1), {
       cwd: options.cwd,
-      env: {
-        ...process.env,
-        ...options.env,
-        // Write both states for the authenticated proxy: a stale ambient `1`
-        // must never leak explicit-empty semantics into a later inherited role.
-        ...(options.permissionMetadataSource === 'codex-acp'
-          ? { [CODEX_DISABLE_INHERITED_MCP_ENV]: disableInheritedCodexMcp ? '1' : '0' }
-          : {}),
-      },
+      env: childEnv,
       stdio: ['pipe', 'pipe', 'pipe'],
     });
     await new Promise<void>((resolve, reject) => {

@@ -229,6 +229,10 @@ createInterface({ input: process.stdin }).on('line', line => {
             text: `new-params:${JSON.stringify({
               mcpServers: message.params?.mcpServers ?? null,
               _meta: message.params?._meta ?? null,
+              oursAutostart: process.env.OURS_AUTOSTART ?? null,
+              // Mirrors ours-mcp 1.0's presence-sensitive tools/list contract.
+              oursMcpTools: Object.prototype.hasOwnProperty.call(process.env, 'OURS_AUTOSTART')
+                ? [] : ['choose_identity', 'get_messages'],
               disableInheritedMcp:
                 process.env.OURS_FLEET_CODEX_DISABLE_INHERITED_MCP ?? null,
             })}`,
