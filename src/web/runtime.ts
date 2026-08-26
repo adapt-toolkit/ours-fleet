@@ -31,6 +31,7 @@ import { startWebControlServer, type WebControlServer } from './control.js';
 import { WebAccessStore, validatePublicOrigin, type WebAccessConfig } from './access.js';
 import { buildWatchdogFindings, cachedWatchdogFindingsProvider, WatchdogQueryService } from '../watchdog/query.js';
 import { latestReport } from '../watchdog/store.js';
+import { TaskRoomApplicationService } from '../application/task-room-service.js';
 
 const CONFIG_CACHE_TTL_MS = 5_000;
 
@@ -178,6 +179,7 @@ export async function startWebConsole(options: StartWebOptions): Promise<Running
   try {
     server = await buildWebServer({
     query, repository, logs, commands, creation, removal, audit, events, watchdogs, configuration,
+    taskRooms: new TaskRoomApplicationService(options.configPath),
     topology: readTopology, topologyDrafts, topologyPromote,
     terminalUpgrade: terminalAvailable
       ? async (socket, _request, roleId, _ticket, hello) => terminals.connect(socket, roleId, hello)

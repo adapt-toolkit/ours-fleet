@@ -19,7 +19,7 @@ import {
 import { createRoomRecord, getRoomRecord } from '../src/rooms-tasks/room-state.js';
 import { hashTemplate, listTemplates, resolveTemplate } from '../src/rooms-tasks/templates.js';
 import { renderMarkdownResult, roomStatus, taskStatus } from '../src/rooms-tasks/markdown.js';
-import { TaskRoomApplicationError } from '../src/application/task-room-service.js';
+import { TaskRoomApplicationError, TaskRoomApplicationService } from '../src/application/task-room-service.js';
 
 function context(overrides: Partial<OwnerCommandContext> = {}): OwnerCommandContext & {
   replies: string[];
@@ -85,6 +85,16 @@ function context(overrides: Partial<OwnerCommandContext> = {}): OwnerCommandCont
     listTasks: vi.fn(filter => {
       return readTasks(filter);
     }),
+    groupedTasks: vi.fn(filter => new TaskRoomApplicationService().groupedTasks(filter)),
+    listTaskLists: vi.fn(() => new TaskRoomApplicationService().listTaskLists()),
+    createTaskList: vi.fn(name => new TaskRoomApplicationService().createTaskList({
+      actor: { kind: 'authenticated_owner', surface: 'messenger', cid: 'owner' }, name })),
+    renameTaskList: vi.fn((name, newName) => new TaskRoomApplicationService().renameTaskList({
+      actor: { kind: 'authenticated_owner', surface: 'messenger', cid: 'owner' }, name, newName })),
+    deleteTaskList: vi.fn((name, destination) => new TaskRoomApplicationService().deleteTaskList({
+      actor: { kind: 'authenticated_owner', surface: 'messenger', cid: 'owner' }, name, destination })),
+    moveTask: vi.fn((taskId, list) => new TaskRoomApplicationService().moveTask({
+      actor: { kind: 'authenticated_owner', surface: 'messenger', cid: 'owner' }, taskId, list })),
     getTask: vi.fn(taskId => {
       const task = readTask(taskId);
       return { task, orchestration: task.room_id ? getRoomRecord(task.room_id) : undefined };
@@ -490,6 +500,35 @@ describe('owner-channel task subcommands', () => {
     expect(ctx.replies).toHaveLength(1);
     expect(ctx.replies[0]).toContain(t.task_id);
     expect(ctx.replies[0]).toContain('test task');
+  });
+
+  it('supports every list operation including names with spaces via multiline grammar', async () => {
+    const task = await createTestTask();
+    const commands = [
+      '/task list-create\nPersonal Stuff',
+      '/task list-rename\nPersonal Stuff\nTeam Work',
+      `/task move ${task.task_id}\nTeam Work`,
+      '/task list --group-by-list\nTeam Work',
+      '/task list-delete\nTeam Work\ndefault',
+    ];
+    for (const command of commands) {
+      const ctx = context(); await dispatchOwnerCommand(command, ctx);
+      expect(ctx.replies[0]).not.toContain('Unexpected failure');
+    }
+    expect(readTask(task.task_id).list_name).toBe('default');
+  });
+
+  it('returns stable owner-channel errors for duplicate and unsafe non-empty deletion', async () => {
+    const task = await createTestTask();
+    for (const command of ['/task list-create\nOwner Work', `/task move ${task.task_id}\nOwner Work`])
+      await dispatchOwnerCommand(command, context());
+    const duplicate = context();
+    await dispatchOwnerCommand('/task list-create\nOwner Work', duplicate);
+    expect(duplicate.replies[0]).toContain('task list already exists: Owner Work');
+    const unsafe = context();
+    await dispatchOwnerCommand('/task list-delete\nOwner Work', unsafe);
+    expect(unsafe.replies[0]).toContain("is not empty; destination is required");
+    expect(readTask(task.task_id).list_name).toBe('Owner Work');
   });
 
   it('/task show <id> shows task details', async () => {

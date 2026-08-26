@@ -3,6 +3,7 @@ import { execFile, spawn } from 'node:child_process';
 import type { InterruptOutcome, SessionEvent, SessionSnapshot } from '../session/types.js';
 import type {
   RoomOrchestrationRecord, TaskOutcome, TaskRecord, TaskTerminalIntent,
+  TaskListRecord,
 } from '../rooms-tasks/types.js';
 import { launchFleetWorker } from '../rooms-tasks/external-worker.js';
 import { RoomStateError } from '../rooms-tasks/room-state.js';
@@ -15,6 +16,7 @@ import { OWNER_COMMENT_LABEL, ownerNotices, type OwnerCommentsState } from './no
 import { TaskRoomApplicationError } from '../application/task-room-service.js';
 import type { CreateRoomRequest, CreateTaskRequest, TaskRoomApplicationService } from '../application/task-room-service.js';
 import type { TaskState } from '../rooms-tasks/types.js';
+import { TaskListError } from '../rooms-tasks/task-lists.js';
 
 /**
  * Fleet-level effects a deterministic owner command may trigger. Production
@@ -70,7 +72,13 @@ export interface OwnerCommandContext {
   recoverTask(taskId: string): Promise<void>;
   createTask(input: Omit<CreateTaskRequest, 'actor'>): Promise<TaskRecord>;
   startTask(taskId: string): Promise<TaskRecord>;
-  listTasks(filter?: { state?: TaskState | TaskState[] }): TaskRecord[];
+  listTasks(filter?: { state?: TaskState | TaskState[]; list?: string }): TaskRecord[];
+  groupedTasks(filter?: { state?: TaskState | TaskState[]; list?: string }): Array<{ list: TaskListRecord; tasks: TaskRecord[] }>;
+  listTaskLists(): TaskListRecord[];
+  createTaskList(name: string): Promise<TaskListRecord>;
+  renameTaskList(name: string, newName: string): Promise<TaskListRecord>;
+  deleteTaskList(name: string, destination?: string): Promise<{ deleted: TaskListRecord; moved: number; destination?: TaskListRecord }>;
+  moveTask(taskId: string, list: string): Promise<TaskRecord>;
   getTask(taskId: string): { task: TaskRecord; orchestration: RoomOrchestrationRecord | undefined };
   blockTask(taskId: string, reason: string): TaskRecord;
   unblockTask(taskId: string): TaskRecord;
@@ -105,6 +113,7 @@ const REPLY_MAX_CHARS = 3_500;
 
 const taskListRecord = (task: TaskRecord): string =>
   `${taskStatus(task.state)} ${markdownCode(task.task_id)} — ${markdownProse(task.title)}`
+  + ` — List ${markdownCode(task.list_name ?? 'default')}`
   + (task.blocked ? ` — 🚧 Blocked: ${markdownProse(task.blocked.reason)}` : '');
 
 const roomListRecord = (room: RoomOrchestrationRecord): string =>
@@ -135,8 +144,15 @@ function isKnownOwnerRoomState(message: string): boolean {
 }
 
 function ownerTaskFailure(error: unknown): {
-  kind: 'not_found' | 'state' | 'unexpected'; detail?: string; action: string;
+  kind: 'not_found' | 'state' | 'usage' | 'unexpected'; detail?: string; action: string;
 } {
+  if (error instanceof TaskListError) return {
+    kind: error.code === 'list_not_found' ? 'not_found'
+      : error.code === 'invalid_name' ? 'usage' : 'state',
+    detail: error.message,
+    action: error.code === 'list_not_found' ? 'Run /task lists to find a valid list.'
+      : 'Choose a valid list name or an explicit different destination.',
+  };
   if (error instanceof TaskStateError) {
     const missing = /^task not found: ([A-Za-z0-9_-]{1,128})$/u.exec(error.message);
     if (missing) return {
@@ -377,6 +393,7 @@ export const ownerCommands: OwnerCommand[] = [
             { label: 'ID', value: t.task_id, kind: 'code' },
             { label: 'Title', value: t.title },
             { label: 'Status', value: taskStatus(t.state), kind: 'markdown' },
+            { label: 'List', value: t.list_name ?? 'default', kind: 'code' },
             ...(t.blocked ? [{ label: 'Blocked', value: t.blocked.reason }] : []),
             ...(t.template ? [{ label: 'Template', value: `${t.template.name}@${t.template.version}`, kind: 'code' as const }] : []),
             ...(t.room_id ? [{ label: 'Room', value: t.room_id, kind: 'code' as const }] : []),
@@ -394,11 +411,14 @@ export const ownerCommands: OwnerCommand[] = [
             const tplFlag = rest.find(r => r.startsWith('--template='));
             const template = tplFlag ? tplFlag.slice('--template='.length) : undefined;
             const noRoom = rest.includes('--no-room');
-            const titleParts = rest.filter(r => r !== '--backlog' && !r.startsWith('--template=') && r !== '--no-room');
+            const listFlag = rest.find(r => r.startsWith('--list='));
+            const list = listFlag?.slice('--list='.length);
+            const titleParts = rest.filter(r => r !== '--backlog' && !r.startsWith('--template=')
+              && !r.startsWith('--list=') && r !== '--no-room');
             if (!titleParts.length) throw new OwnerCommandUsageError('usage: /task create [--backlog] [--template=<name>|--no-room] <title>');
             const t = await ctx.createTask({
               title: titleParts.join(' '), origin: { type: 'owner_channel' },
-              backlog, template, noRoom, brief: trailingLines,
+              backlog, template, noRoom, brief: trailingLines, list,
             });
             await ctx.reply(taskAction('Task created', t, [
               { label: 'Title', value: t.title },
@@ -408,7 +428,10 @@ export const ownerCommands: OwnerCommand[] = [
             break;
           }
           case 'list': {
-            const filter = rest[0];
+            const listFlag = rest.find(r => r.startsWith('--list='));
+            const list = trailingLines ?? listFlag?.slice('--list='.length);
+            const grouped = rest.includes('--group-by-list');
+            const filter = rest.find(r => !r.startsWith('--'));
             const stateMap: Record<string, string | string[]> = {
               backlog: 'backlog', active: 'active', blocked: 'active',
               done: 'done', all: ['backlog', 'provisioning', 'active', 'review', 'done', 'cancelled', 'failed'],
@@ -416,7 +439,8 @@ export const ownerCommands: OwnerCommand[] = [
             const stateFilter = filter && stateMap[filter]
               ? { state: stateMap[filter] as any }
               : undefined;
-            const tasks = ctx.listTasks(stateFilter);
+            const combined = { ...(stateFilter ?? {}), ...(list ? { list } : {}) };
+            const tasks = ctx.listTasks(combined);
             if (filter === 'blocked') {
               const blocked = tasks.filter(t => t.blocked);
               await ctx.reply(renderMarkdownList({
@@ -425,10 +449,57 @@ export const ownerCommands: OwnerCommand[] = [
               }));
               break;
             }
+            if (grouped) {
+              const groups = ctx.groupedTasks(combined);
+              await ctx.reply(groups.map(group => renderMarkdownList({
+                icon: '📋', title: `Tasks — ${group.list.name}`, empty: 'No tasks found.',
+                records: group.tasks.map(taskListRecord),
+              })).join('\n\n'));
+              break;
+            }
             await ctx.reply(renderMarkdownList({
               icon: '📋', title: 'Tasks', empty: 'No tasks found.',
               records: tasks.map(taskListRecord),
             }));
+            break;
+          }
+          case 'lists': {
+            const lists = ctx.listTaskLists();
+            await ctx.reply(renderMarkdownList({ icon: '📚', title: 'Task lists', empty: 'No task lists found.',
+              records: lists.map(list => `${markdownCode(list.name)}${list.built_in ? ' — built-in' : ''}`) }));
+            break;
+          }
+          case 'list-create': {
+            const name = trailingLines ?? rest.join(' ');
+            if (!name) throw new OwnerCommandUsageError('usage: /task list-create\n<name>');
+            const list = await ctx.createTaskList(name);
+            await ctx.reply(renderMarkdownResult({ icon: '📚', title: 'Task list created', fields: [{ label: 'Name', value: list.name }] }));
+            break;
+          }
+          case 'list-rename': {
+            const names = argLines.slice(1).map(line => line.trim()).filter(Boolean);
+            const current = names.length === 2 ? names[0] : rest[0];
+            const next = names.length === 2 ? names[1] : rest[1];
+            if (!current || !next) throw new OwnerCommandUsageError('usage: /task list-rename\n<name>\n<new-name>');
+            const list = await ctx.renameTaskList(current, next);
+            await ctx.reply(renderMarkdownResult({ icon: '📚', title: 'Task list renamed', fields: [{ label: 'Name', value: list.name }] }));
+            break;
+          }
+          case 'list-delete': {
+            const names = argLines.slice(1).map(line => line.trim()).filter(Boolean);
+            const name = names[0] ?? rest[0];
+            const destination = names[1] ?? rest.find(r => r.startsWith('--move-to='))?.slice('--move-to='.length);
+            if (!name) throw new OwnerCommandUsageError('usage: /task list-delete\n<name>\n[move-to-name]');
+            const result = await ctx.deleteTaskList(name, destination);
+            await ctx.reply(renderMarkdownResult({ icon: '🗑️', title: 'Task list deleted', fields: [
+              { label: 'Name', value: result.deleted.name }, { label: 'Tasks moved', value: String(result.moved) },
+            ] }));
+            break;
+          }
+          case 'move': {
+            const destination = trailingLines ?? rest.find(r => r.startsWith('--list='))?.slice('--list='.length);
+            if (!rest[0] || !destination) throw new OwnerCommandUsageError('usage: /task move <id> --list=<name>');
+            await showTask((await ctx.moveTask(rest[0], destination)).task_id);
             break;
           }
           case 'show': {

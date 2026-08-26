@@ -53,6 +53,39 @@ describe('withFileLock', () => {
     writeFileSync(join(lock, 'ts'), '0');            // epoch — long stale
     await expect(withFileLock(lock, () => 'recovered')).resolves.toBe('recovered');
   });
+
+  it('does not steal or remove a live lock after the stale interval', async () => {
+    const lock = join(home, 'live.lock');
+    let clock = 0;
+    let release!: () => void;
+    const held = withFileLock(lock, () => new Promise<void>(resolve => { release = resolve; }),
+      { now: () => clock, sleep: async () => { clock += 25; } }, 50);
+    await new Promise(resolve => setImmediate(resolve));
+    let entered = false;
+    const waiter = withFileLock(lock, () => { entered = true; },
+      { now: () => clock, sleep: async () => { clock += 25; await new Promise(resolve => setImmediate(resolve)); } }, 50);
+    await new Promise(resolve => setTimeout(resolve, 10));
+    expect(entered).toBe(false);
+    release(); await held; await waiter;
+    expect(entered).toBe(true);
+  });
+
+  it('publishes only fully populated claims when preparation is stalled', async () => {
+    const lock = join(home, 'publish.lock');
+    let prepared!: () => void; const preparedSignal = new Promise<void>(resolve => { prepared = resolve; });
+    let publish!: () => void; const publishGate = new Promise<void>(resolve => { publish = resolve; });
+    const first = withFileLock(lock, () => 'first', {
+      beforePublish: async () => { prepared(); await publishGate; },
+    });
+    await preparedSignal;
+    expect(() => readFileSync(join(lock, 'owner.json'), 'utf8')).toThrow(/ENOENT/);
+    let releaseSecond!: () => void;
+    const second = withFileLock(lock, () => new Promise<void>(resolve => { releaseSecond = resolve; }));
+    await new Promise(resolve => setImmediate(resolve));
+    expect(JSON.parse(readFileSync(join(lock, 'owner.json'), 'utf8'))).toMatchObject({ pid: process.pid });
+    publish(); releaseSecond(); await second;
+    await expect(first).resolves.toBe('first');
+  });
 });
 
 describe('replaceFileAtomically', () => {

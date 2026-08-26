@@ -39,7 +39,7 @@ export interface TaskMemberRole {
 }
 
 export interface TaskOrigin {
-  type: 'cli' | 'owner_channel';
+  type: 'cli' | 'owner_channel' | 'web';
   owner_cid?: string;
 }
 
@@ -64,6 +64,10 @@ export interface TaskTerminalIntent {
 
 export interface TaskRecord {
   task_id: string;
+  /** Stable organizational list identifier. Missing legacy values mean `default`. */
+  list_id: string;
+  /** Derived presentation field; repositories must never persist it. */
+  list_name: string;
   title: string;
   brief?: string;
   brief_file?: string;
@@ -81,6 +85,13 @@ export interface TaskRecord {
   ended_at?: string;
   outcome?: TaskOutcome;
   terminal_intent?: TaskTerminalIntent;
+}
+
+export interface TaskListRecord {
+  list_id: string;
+  name: string;
+  built_in: boolean;
+  created_at: string;
 }
 
 // ── Room orchestration (Fleet side) ─────────────────────────────────────
