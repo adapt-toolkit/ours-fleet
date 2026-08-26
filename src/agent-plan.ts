@@ -18,6 +18,13 @@ const SCOPE = /^[A-Za-z0-9][A-Za-z0-9._:/-]*$/u;
 export type ResolutionLayer =
   | 'explicit_operation' | 'task_default' | 'room_default' | 'template_member' | 'creator';
 export type PermissionField = keyof PermissionSpec;
+const PROVENANCE_RESOURCE_KIND: Readonly<Record<Exclude<ResolutionLayer, 'creator'>, ResourceKind>> = {
+  explicit_operation: 'Agent', task_default: 'TasksPolicy',
+  room_default: 'RoomsPolicy', template_member: 'RoomTemplate',
+};
+const APPEND_RESOURCE_KIND = {
+  template: 'RoomTemplate', room: 'RoomsPolicy', task_member: 'TasksPolicy',
+} as const;
 
 export interface RuntimeIdentityIntent {
   name: string;
@@ -175,6 +182,12 @@ export interface ValueProvenance {
   creatorSnapshotDigest?: string;
 }
 
+export type BrainSelection =
+  | { kind: 'inline' }
+  | { kind: 'template'; brainId: string }
+  | { kind: 'creator_plan' };
+export type BrainProvenance = ValueProvenance & { brainSelection: BrainSelection };
+
 export interface RoleAppendProvenance {
   layer: 'template' | 'room' | 'task_member';
   sourceType: 'resource' | 'runtime_operation';
@@ -209,7 +222,7 @@ export interface AgentPlan {
     personaBytes: number;
   }>;
   brain: Readonly<BrainSpec>;
-  brainProvenance: Readonly<ValueProvenance>;
+  brainProvenance: Readonly<BrainProvenance>;
   identity: Readonly<RuntimeIdentityIntent>;
   lifecycle: 'persistent' | 'temporary';
   runtime?: Readonly<AgentRuntimeSpec>;
@@ -438,7 +451,13 @@ function validateAdapter(
   return clone(value);
 }
 
-function verifyCreator(plan: AgentPlan): void {
+/**
+ * Validate every persisted AgentPlan field and cross-field binding.
+ *
+ * This is deterministic integrity validation only. It does not authenticate the
+ * plan, revive an authorization grant, or issue either opaque evidence type.
+ */
+export function validateAgentPlanStructure(plan: AgentPlan): void {
   const required = [
     'schemaVersion', 'agentId', 'generation', 'snapshotDigest', 'source', 'sourceRevisions', 'role',
     'brain', 'brainProvenance', 'identity', 'lifecycle', 'permissions', 'permissionProvenance',
@@ -450,38 +469,109 @@ function verifyCreator(plan: AgentPlan): void {
     throw new AgentPlanResolutionError('creator plan is missing required fields');
   if (plan.schemaVersion !== 1 || !Number.isSafeInteger(plan.generation) || plan.generation < 1)
     throw new AgentPlanResolutionError('creator plan has invalid schema or generation');
+  if (!Number.isSafeInteger(plan.evaluatedAt) || plan.evaluatedAt < 0)
+    throw new AgentPlanResolutionError('creator plan evaluatedAt is invalid');
+  if (!['persistent', 'temporary'].includes(plan.lifecycle))
+    throw new AgentPlanResolutionError('creator plan lifecycle is invalid');
   resourceId(plan.agentId, 'creatorPlan.agentId');
   digest(plan.snapshotDigest, 'creatorPlan.snapshotDigest');
   digest(plan.planDigest, 'creatorPlan.planDigest');
   if (!completePermissions(plan.permissions)) throw new AgentPlanResolutionError('creator plan permissions are incomplete');
+  object(plan.role, 'creatorPlan.role', [
+    'id', 'effective', 'appendProvenance', 'missionBytes', 'personaBytes',
+  ]);
+  object(plan.source, 'creatorPlan.source', [
+    'kind', 'agentId', 'role', 'identity', 'lifecycle', 'runtime', 'brain', 'permissions',
+  ]);
   const { planDigest, ...unsigned } = plan;
   if (hash(unsigned) !== planDigest) throw new AgentPlanResolutionError('creator plan digest is stale or tampered');
   normalizedPartialPermissions(plan.permissions, plan.agentId, plan.role.id);
   validateAdapter(plan.adapter, plan.brain, plan.permissions);
-  object(plan.role, 'creatorPlan.role', [
-    'id', 'effective', 'appendProvenance', 'missionBytes', 'personaBytes',
-  ]);
   resourceId(plan.role.id, 'creatorPlan.role.id');
+  const parsedRole = parseTypedResource('agent-plan:persisted-role', stringify({
+    kind: 'Role', version: 1, id: plan.role.id, spec: plan.role.effective,
+  }));
+  if (parsedRole.kind !== 'Role' || canonical(parsedRole.spec) !== canonical(plan.role.effective))
+    throw new AgentPlanResolutionError('creator plan effective Role is invalid');
+  if (!Array.isArray(plan.role.appendProvenance))
+    throw new AgentPlanResolutionError('creator plan Role append provenance must be an array');
+  if (!Number.isSafeInteger(plan.role.missionBytes) || plan.role.missionBytes < 0
+      || !Number.isSafeInteger(plan.role.personaBytes) || plan.role.personaBytes < 0
+      || plan.role.missionBytes !== Buffer.byteLength(plan.role.effective.mission ?? '')
+      || plan.role.personaBytes !== Buffer.byteLength(plan.role.effective.persona ?? ''))
+    throw new AgentPlanResolutionError('creator plan effective Role byte counts are inconsistent');
+  for (const [index, append] of plan.role.appendProvenance.entries()) {
+    object(append, `creatorPlan.role.appendProvenance[${index}]`, [
+      'layer', 'sourceType', 'sourceId',
+      ...(own(append, 'sourceDigest') ? ['sourceDigest'] : []), 'missionBytes', 'personaBytes',
+    ]);
+    if (!['template', 'room', 'task_member'].includes(append.layer)
+        || !['resource', 'runtime_operation'].includes(append.sourceType))
+      throw new AgentPlanResolutionError(`creatorPlan.role.appendProvenance[${index}] is invalid`);
+    token(append.sourceId, `creatorPlan.role.appendProvenance[${index}].sourceId`);
+    if (append.sourceType === 'runtime_operation') digest(append.sourceDigest,
+      `creatorPlan.role.appendProvenance[${index}].sourceDigest`);
+    else if (own(append, 'sourceDigest'))
+      throw new AgentPlanResolutionError(`creatorPlan.role.appendProvenance[${index}] resource has a digest`);
+    if (!Number.isSafeInteger(append.missionBytes) || append.missionBytes < 0
+        || !Number.isSafeInteger(append.personaBytes) || append.personaBytes < 0)
+      throw new AgentPlanResolutionError(`creatorPlan.role.appendProvenance[${index}] byte count is invalid`);
+    if (append.sourceType === 'runtime_operation' && append.sourceDigest !== hash(plan.operation))
+      throw new AgentPlanResolutionError(`creatorPlan.role.appendProvenance[${index}] operation binding is inconsistent`);
+  }
+  const appendOrder = { template: 0, room: 1, task_member: 2 } as const;
+  if (plan.role.appendProvenance.some((append, index, all) =>
+    index > 0 && appendOrder[append.layer as keyof typeof appendOrder]
+      <= appendOrder[all[index - 1].layer as keyof typeof appendOrder]))
+    throw new AgentPlanResolutionError('creator plan Role append provenance is not in fixed order');
+  if (plan.role.appendProvenance.reduce((sum, append) => sum + append.missionBytes, 0) > plan.role.missionBytes
+      || plan.role.appendProvenance.reduce((sum, append) => sum + append.personaBytes, 0) > plan.role.personaBytes)
+    throw new AgentPlanResolutionError('creator plan Role append byte counts exceed effective Role');
+  const parsedBrain = parseTypedResource('agent-plan:persisted-brain', stringify({
+    kind: 'Brain', version: 1, id: 'validation', spec: plan.brain,
+  }));
+  if (parsedBrain.kind !== 'Brain' || canonical(parsedBrain.spec) !== canonical(plan.brain))
+    throw new AgentPlanResolutionError('creator plan Brain is invalid');
   if (plan.source.agentId !== plan.agentId)
     throw new AgentPlanResolutionError('creator plan source is bound to another Agent ID');
   if (plan.source.kind !== 'persistent_resource' && plan.source.kind !== 'runtime_composition')
     throw new AgentPlanResolutionError('creator plan source kind is invalid');
   object(plan.source, 'creatorPlan.source', plan.source.kind === 'persistent_resource'
     ? ['kind', 'agentId'] : ['kind', 'agentId', 'role', 'identity', 'lifecycle', 'runtime', 'brain', 'permissions']);
+  resourceId(plan.source.agentId, 'creatorPlan.source.agentId');
+  if (plan.source.kind === 'persistent_resource' && plan.lifecycle !== 'persistent')
+    throw new AgentPlanResolutionError('persistent Agent source must have persistent lifecycle');
   if (plan.source.kind === 'runtime_composition') {
     if (plan.source.role !== plan.role.id || canonical(plan.source.identity) !== canonical(plan.identity)
         || plan.source.lifecycle !== plan.lifecycle)
       throw new AgentPlanResolutionError('creator plan source, Role, IdentityIntent, or lifecycle binding is inconsistent');
+    resourceId(plan.source.role, 'creatorPlan.source.role');
+    object(plan.source.identity, 'creatorPlan.source.identity', ['name', 'ownership']);
+    boundedText(plan.source.identity.name, 'creatorPlan.source.identity.name');
+    if (plan.source.runtime) normalizedRuntime(plan.source.runtime, plan.agentId);
+    if (plan.source.brain) parseBrainRef(plan.source.brain, 'creatorPlan.source.brain', '$');
+    if (plan.source.permissions) normalizedPartialPermissions(plan.source.permissions, plan.agentId, plan.role.id);
   }
+  if (canonical(plan.runtime ?? null) !== canonical(
+    plan.source.kind === 'runtime_composition' ? plan.source.runtime ?? null : plan.runtime ?? null))
+    throw new AgentPlanResolutionError('creator plan runtime binding is inconsistent');
+  if (plan.runtime) normalizedRuntime(plan.runtime, plan.agentId);
   object(plan.identity, 'creatorPlan.identity', ['name', 'ownership']);
   boundedText(plan.identity.name, 'creatorPlan.identity.name');
   if (!['existing', 'create_persistent', 'create_temporary'].includes(plan.identity.ownership))
     throw new AgentPlanResolutionError('creator plan IdentityIntent ownership is invalid');
+  if ((plan.lifecycle === 'temporary' && plan.identity.ownership === 'create_persistent')
+      || (plan.lifecycle === 'persistent' && plan.identity.ownership === 'create_temporary'))
+    throw new AgentPlanResolutionError('creator plan lifecycle and IdentityIntent are inconsistent');
   object(plan.principal, 'creatorPlan.principal', ['id', 'kind']); token(plan.principal.id, 'creatorPlan.principal.id');
+  if (!['agent', 'owner', 'system'].includes(plan.principal.kind))
+    throw new AgentPlanResolutionError('creator plan principal.kind is invalid');
   object(plan.operation, 'creatorPlan.operation', ['id', 'type', 'resourceScope']);
   token(plan.operation.id, 'creatorPlan.operation.id'); token(plan.operation.type, 'creatorPlan.operation.type');
   scope(plan.operation.resourceScope, 'creatorPlan.operation.resourceScope');
   token(plan.authorizationRevision, 'creatorPlan.authorizationRevision');
+  if (!Array.isArray(plan.sourceRevisions))
+    throw new AgentPlanResolutionError('creator plan source revisions must be an array');
   for (const [index, source] of plan.sourceRevisions.entries()) {
     object(source, `creatorPlan.sourceRevisions[${index}]`, ['kind', 'id', 'relativePath', 'sha256']);
     if (!['Role', 'Brain', 'Agent', 'RoomTemplate', 'RoomsPolicy', 'TasksPolicy'].includes(source.kind))
@@ -491,16 +581,40 @@ function verifyCreator(plan: AgentPlan): void {
     if (!/^[a-f0-9]{64}$/u.test(source.sha256))
       throw new AgentPlanResolutionError(`creatorPlan.sourceRevisions[${index}].sha256 is invalid`);
   }
+  const sortedRevisions = [...plan.sourceRevisions].sort((a, b) => Buffer.compare(
+    Buffer.from(`${a.kind}\0${a.id}\0${a.relativePath}\0${a.sha256}`),
+    Buffer.from(`${b.kind}\0${b.id}\0${b.relativePath}\0${b.sha256}`),
+  ));
+  if (canonical(sortedRevisions) !== canonical(plan.sourceRevisions)
+      || new Set(plan.sourceRevisions.map(source => `${source.kind}\0${source.id}`)).size
+        !== plan.sourceRevisions.length)
+    throw new AgentPlanResolutionError('creator plan source revisions are not unique and bytewise ordered');
+  if (!plan.sourceRevisions.some(source => source.kind === 'Role' && source.id === plan.role.id)
+      || (plan.source.kind === 'persistent_resource'
+        && !plan.sourceRevisions.some(source => source.kind === 'Agent' && source.id === plan.agentId)))
+    throw new AgentPlanResolutionError('creator plan is missing its defining resource revision');
   const layers: readonly ResolutionLayer[] = [
     'explicit_operation', 'task_default', 'room_default', 'template_member', 'creator',
   ];
-  const validateProvenance = (value: ValueProvenance, name: string): void => {
+  const revisionFor = (kind: ResourceKind, id: string): boolean =>
+    plan.sourceRevisions.some(source => source.kind === kind && source.id === id);
+  for (const [index, append] of plan.role.appendProvenance.entries()) {
+    const kind = APPEND_RESOURCE_KIND[append.layer as keyof typeof APPEND_RESOURCE_KIND];
+    if (append.sourceType === 'resource'
+        && !revisionFor(kind, append.sourceId))
+      throw new AgentPlanResolutionError(
+        `creatorPlan.role.appendProvenance[${index}] lacks its exact ${kind} source revision`);
+  }
+  const validateProvenance = (value: ValueProvenance, name: string, brain = false): void => {
     const creatorLayer = value.layer === 'creator';
     object(value, name, creatorLayer
-      ? ['layer', 'sourceType', 'sourceId', 'creatorAgentId', 'creatorGeneration', 'creatorPlanDigest', 'creatorSnapshotDigest']
+      ? ['layer', 'sourceType', 'sourceId', 'creatorAgentId', 'creatorGeneration', 'creatorPlanDigest', 'creatorSnapshotDigest',
+        ...(brain ? ['brainSelection'] : [])]
       : value.sourceType === 'runtime_operation'
-        ? ['layer', 'sourceType', 'sourceId', 'sourceDigest', 'principalId', 'operationId']
-        : ['layer', 'sourceType', 'sourceId', 'principalId', 'operationId']);
+        ? ['layer', 'sourceType', 'sourceId', 'sourceDigest', 'principalId', 'operationId',
+          ...(brain ? ['brainSelection'] : [])]
+        : ['layer', 'sourceType', 'sourceId', 'principalId', 'operationId',
+          ...(brain ? ['brainSelection'] : [])]);
     if (!layers.includes(value.layer)) throw new AgentPlanResolutionError(`${name}.layer is invalid`);
     if (creatorLayer ? value.sourceType !== 'creator_plan'
       : !['resource', 'runtime_operation'].includes(value.sourceType))
@@ -515,9 +629,31 @@ function verifyCreator(plan: AgentPlan): void {
     } else if (value.principalId !== plan.principal.id || value.operationId !== plan.operation.id) {
       throw new AgentPlanResolutionError(`${name} principal or operation binding is inconsistent`);
     }
-    if (value.sourceType === 'runtime_operation') digest(value.sourceDigest, `${name}.sourceDigest`);
+    if (value.sourceType === 'resource') {
+      const kind = PROVENANCE_RESOURCE_KIND[value.layer as Exclude<ResolutionLayer, 'creator'>];
+      if (!revisionFor(kind, value.sourceId))
+        throw new AgentPlanResolutionError(`${name} lacks its exact ${kind} source revision`);
+    }
+    if (value.sourceType === 'runtime_operation') {
+      digest(value.sourceDigest, `${name}.sourceDigest`);
+      if (value.sourceDigest !== hash(plan.operation))
+        throw new AgentPlanResolutionError(`${name} operation digest binding is inconsistent`);
+    }
+    if (brain) {
+      const selection = (value as BrainProvenance).brainSelection;
+      object(selection, `${name}.brainSelection`, selection?.kind === 'template'
+        ? ['kind', 'brainId'] : ['kind']);
+      if (selection.kind === 'template') resourceId(selection.brainId, `${name}.brainSelection.brainId`);
+      else if (!['inline', 'creator_plan'].includes(selection.kind))
+        throw new AgentPlanResolutionError(`${name}.brainSelection.kind is invalid`);
+      if ((creatorLayer && selection.kind !== 'creator_plan')
+          || (!creatorLayer && selection.kind === 'creator_plan'))
+        throw new AgentPlanResolutionError(`${name}.brainSelection is inconsistent with provenance`);
+    }
   };
-  validateProvenance(plan.brainProvenance, 'creatorPlan.brainProvenance');
+  validateProvenance(plan.brainProvenance, 'creatorPlan.brainProvenance', true);
+  object(plan.permissionProvenance, 'creatorPlan.permissionProvenance', ['approval', 'filesystem', 'unattended']);
+  object(plan.delegation, 'creatorPlan.delegation', ['approval', 'filesystem', 'unattended']);
   for (const field of ['approval', 'filesystem', 'unattended'] as const) {
     validateProvenance(plan.permissionProvenance[field], `creatorPlan.permissionProvenance.${field}`);
     const decision = plan.delegation[field];
@@ -527,6 +663,54 @@ function verifyCreator(plan: AgentPlan): void {
     if (decision.field !== field || decision.effective !== plan.permissions[field]
         || decision.requested !== plan.permissions[field])
       throw new AgentPlanResolutionError(`creatorPlan.delegation.${field} binding is inconsistent`);
+    if (!['no_creator_explicit', 'within_creator', 'owner_grant'].includes(decision.decision))
+      throw new AgentPlanResolutionError(`creatorPlan.delegation.${field} decision is invalid`);
+    if (decision.creator !== undefined)
+      normalizedPartialPermissions({ [field]: decision.creator }, plan.agentId, plan.role.id);
+    if (decision.grantCeiling !== undefined)
+      normalizedPartialPermissions({ [field]: decision.grantCeiling }, plan.agentId, plan.role.id);
+    const effectiveRank = (RANK[field] as Record<string, number>)[decision.effective];
+    const creatorRank = decision.creator === undefined ? undefined
+      : (RANK[field] as Record<string, number>)[decision.creator];
+    const retainedCeiling = plan.ownerDelegation?.grant.ceilings[field];
+    const retainedCeilingRank = retainedCeiling === undefined ? undefined
+      : (RANK[field] as Record<string, number>)[retainedCeiling];
+    if (decision.grantCeiling !== retainedCeiling)
+      throw new AgentPlanResolutionError(`creatorPlan.delegation.${field} retained grant ceiling is inconsistent`);
+    if (decision.decision === 'owner_grant') {
+      token(decision.grantId, `creatorPlan.delegation.${field}.grantId`);
+      if (!decision.grantCeiling || !plan.ownerDelegation
+          || decision.grantId !== plan.ownerDelegation.grant.grantId)
+        throw new AgentPlanResolutionError(`creatorPlan.delegation.${field} Owner grant binding is inconsistent`);
+      if (decision.creator === undefined)
+        throw new AgentPlanResolutionError(`creatorPlan.delegation.${field} Owner grant lacks creator policy`);
+      if (effectiveRank <= creatorRank! || effectiveRank > retainedCeilingRank!)
+        throw new AgentPlanResolutionError(`creatorPlan.delegation.${field} Owner grant rank is inconsistent`);
+    } else if (decision.grantId !== undefined)
+      throw new AgentPlanResolutionError(`creatorPlan.delegation.${field} unexpectedly references an Owner grant`);
+    if (decision.decision === 'no_creator_explicit' && decision.creator !== undefined)
+      throw new AgentPlanResolutionError(`creatorPlan.delegation.${field} unexpectedly has creator policy`);
+    if (decision.decision === 'no_creator_explicit'
+        && (decision.grantCeiling !== undefined || plan.ownerDelegation))
+      throw new AgentPlanResolutionError(`creatorPlan.delegation.${field} unexpectedly has Owner grant policy`);
+    if (decision.decision === 'within_creator' && decision.creator === undefined)
+      throw new AgentPlanResolutionError(`creatorPlan.delegation.${field} lacks creator policy`);
+    if (decision.decision === 'within_creator' && effectiveRank > creatorRank!)
+      throw new AgentPlanResolutionError(`creatorPlan.delegation.${field} exceeds creator policy`);
+  }
+  if (plan.membership) {
+    object(plan.membership, 'creatorPlan.membership', [
+      ...(own(plan.membership, 'roomId') ? ['roomId'] : []),
+      ...(own(plan.membership, 'taskId') ? ['taskId'] : []),
+      ...(own(plan.membership, 'slot') ? ['slot'] : []),
+      ...(own(plan.membership, 'ordinal') ? ['ordinal'] : []),
+      ...(own(plan.membership, 'memberId') ? ['memberId'] : []),
+    ]);
+    for (const field of ['roomId', 'taskId', 'slot', 'memberId'] as const)
+      if (plan.membership[field] !== undefined) token(plan.membership[field], `creatorPlan.membership.${field}`);
+    if (plan.membership.ordinal !== undefined
+        && (!Number.isSafeInteger(plan.membership.ordinal) || plan.membership.ordinal < 1))
+      throw new AgentPlanResolutionError('creator plan membership ordinal is invalid');
   }
   if (plan.ownerDelegation) {
     object(plan.ownerDelegation, 'creatorPlan.ownerDelegation', ['grant', 'trusted']);
@@ -539,6 +723,12 @@ function verifyCreator(plan: AgentPlan): void {
       'grantId', 'authenticatedOwnerCid', 'subjectPrincipalId', 'operationId', 'operationType',
       'resourceScope', 'revision', 'expiresAt', 'ceilings',
     ]);
+    for (const field of ['grantId', 'authenticatedOwnerCid', 'subjectPrincipalId', 'operationId', 'operationType', 'revision'] as const)
+      token(grant[field], `creatorPlan.ownerDelegation.grant.${field}`);
+    scope(grant.resourceScope, 'creatorPlan.ownerDelegation.grant.resourceScope');
+    if (!Number.isSafeInteger(grant.expiresAt) || grant.expiresAt < 0)
+      throw new AgentPlanResolutionError('creator plan Owner delegation expiry is invalid');
+    validateOwnerDelegationAgainstTrustedBindings(grant, trusted);
     if (grant.authenticatedOwnerCid !== trusted.pinnedOwnerCid
         || grant.subjectPrincipalId !== trusted.subjectPrincipalId
         || grant.operationId !== trusted.operationId || grant.operationType !== trusted.operationType
@@ -549,6 +739,21 @@ function verifyCreator(plan: AgentPlan): void {
       throw new AgentPlanResolutionError('creator plan Owner delegation bindings are inconsistent');
     normalizedPartialPermissions(grant.ceilings, grant.grantId, plan.role.id);
   }
+  const expectedRevisionKeys = new Set<string>([`Role\0${plan.role.id}`]);
+  if (plan.source.kind === 'persistent_resource') expectedRevisionKeys.add(`Agent\0${plan.agentId}`);
+  for (const value of [plan.brainProvenance, ...Object.values(plan.permissionProvenance)]) {
+    if (value.sourceType === 'resource')
+      expectedRevisionKeys.add(`${PROVENANCE_RESOURCE_KIND[value.layer as Exclude<ResolutionLayer, 'creator'>]}\0${value.sourceId}`);
+  }
+  for (const append of plan.role.appendProvenance) {
+    if (append.sourceType === 'resource')
+      expectedRevisionKeys.add(`${APPEND_RESOURCE_KIND[append.layer as keyof typeof APPEND_RESOURCE_KIND]}\0${append.sourceId}`);
+  }
+  if (plan.brainProvenance.brainSelection.kind === 'template')
+    expectedRevisionKeys.add(`Brain\0${plan.brainProvenance.brainSelection.brainId}`);
+  const actualRevisionKeys = new Set(plan.sourceRevisions.map(source => `${source.kind}\0${source.id}`));
+  if (canonical([...actualRevisionKeys].sort()) !== canonical([...expectedRevisionKeys].sort()))
+    throw new AgentPlanResolutionError('creator plan source revisions are not the exact selected resource closure');
 }
 
 /** Structural check only; this does not issue authority evidence. */
@@ -561,7 +766,7 @@ export function validateCreatorPlanAgainstTrustedBindings(
     throw new AgentPlanResolutionError('trusted creator generation is invalid');
   digest(trusted.planDigest, 'trustedCreatorBindings.planDigest');
   digest(trusted.snapshotDigest, 'trustedCreatorBindings.snapshotDigest');
-  verifyCreator(plan);
+  validateAgentPlanStructure(plan);
   if (plan.agentId !== trusted.agentId || plan.generation !== trusted.generation
       || plan.planDigest !== trusted.planDigest || plan.snapshotDigest !== trusted.snapshotDigest)
     throw new AgentPlanResolutionError('creator plan does not match independently trusted bindings');
@@ -799,7 +1004,7 @@ function resolveAgentPlanAuthorized(
     }
   }
   let resolvedBrain: BrainSpec | undefined;
-  let brainProvenance: ValueProvenance | undefined;
+  let brainProvenance: BrainProvenance | undefined;
   const sourceRevisionKeys = new Set<string>([`Role\0${selected.role}`]);
   if (selected.sourceRevisionId) sourceRevisionKeys.add(`Agent\0${selected.sourceRevisionId}`);
   for (const [layer, value] of ordered) {
@@ -807,11 +1012,17 @@ function resolveAgentPlanAuthorized(
     const result = normalizeBrain(value.brain, input.snapshot, layer);
     resolvedBrain = result.brain;
     if (result.sourceRevisionId) sourceRevisionKeys.add(`Brain\0${result.sourceRevisionId}`);
-    brainProvenance = provenance(layer, value.source, input); break;
+    brainProvenance = {
+      ...provenance(layer, value.source, input),
+      brainSelection: result.sourceRevisionId
+        ? { kind: 'template', brainId: result.sourceRevisionId } : { kind: 'inline' },
+    }; break;
   }
   if (!resolvedBrain && input.creatorEvidence) {
     resolvedBrain = clone(input.creatorEvidence.plan.brain);
-    brainProvenance = provenance('creator', undefined, input);
+    brainProvenance = {
+      ...provenance('creator', undefined, input), brainSelection: { kind: 'creator_plan' },
+    };
   }
   if (!resolvedBrain || !brainProvenance)
     throw new AgentPlanResolutionError('complete Brain is required without authenticated creator context');
@@ -876,20 +1087,18 @@ function resolveAgentPlanAuthorized(
         && (!Number.isSafeInteger(input.membership.ordinal) || input.membership.ordinal < 1))
       throw new AgentPlanResolutionError('membership.ordinal must be a positive safe integer');
   }
-  for (const [layer, value] of ordered) {
-    void layer;
-    if (value?.source.kind === 'resource')
-      sourceRevisionKeys.add(`${value.source.resourceKind}\0${value.source.resourceId}`);
+  for (const value of [brainProvenance, ...Object.values(permissionProvenance)]) {
+    if (value.sourceType === 'resource')
+      sourceRevisionKeys.add(`${PROVENANCE_RESOURCE_KIND[value.layer as Exclude<ResolutionLayer, 'creator'>]}\0${value.sourceId}`);
   }
-  for (const context of Object.values(input.roleContext ?? {})) {
-    if (context?.source.kind === 'resource')
-      sourceRevisionKeys.add(`${context.source.resourceKind}\0${context.source.resourceId}`);
+  for (const append of role.appendProvenance) {
+    if (append.sourceType === 'resource')
+      sourceRevisionKeys.add(`${APPEND_RESOURCE_KIND[append.layer]}\0${append.sourceId}`);
   }
   const currentSourceRevisions = input.snapshot.sources
     .filter(source => sourceRevisionKeys.has(`${source.kind}\0${source.id}`))
     .map(({ kind, id, relativePath, sha256 }) => ({ kind, id, relativePath, sha256 }));
-  const sourceRevisions = [...(input.creatorEvidence?.plan.sourceRevisions ?? []), ...currentSourceRevisions]
-    .filter((source, index, all) => all.findIndex(candidate => canonical(candidate) === canonical(source)) === index)
+  const sourceRevisions = currentSourceRevisions
     .sort((a, b) => Buffer.compare(
       Buffer.from(`${a.kind}\0${a.id}\0${a.relativePath}\0${a.sha256}`),
       Buffer.from(`${b.kind}\0${b.id}\0${b.relativePath}\0${b.sha256}`),

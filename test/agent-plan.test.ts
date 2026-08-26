@@ -5,12 +5,17 @@ import { join } from 'node:path';
 import {
   computeAgentPlanDigest, computeBrainDigest, computeOperationDigest, computePermissionsDigest,
   createAgentPlanResolver, resolveAgentPlan as resolveWithoutAuthority, ROLE_CONTEXT_SEPARATOR,
-  validateCreatorPlanAgainstTrustedBindings, validateOwnerDelegationAgainstTrustedBindings,
+  validateAgentPlanStructure, validateCreatorPlanAgainstTrustedBindings,
+  validateOwnerDelegationAgainstTrustedBindings,
   type AdapterValidationRecord, type AgentPlan, type AgentPlanEvidenceAuthority,
   type AgentPlanResolutionInput, type OwnerDelegationGrant, type TrustedCreatorPlanBindings,
   type TrustedOwnerDelegationBindings, type VerifiedCreatorPlanEvidence,
   type VerifiedOwnerDelegationEvidence,
 } from '../src/agent-plan.js';
+import {
+  decodeAgentPlan, encodeAgentPlan, MAX_AGENT_PLAN_ENVELOPE_BYTES,
+  presentAgentPlan, renderAgentPlanSummary,
+} from '../src/agent-plan-codec.js';
 import { loadConfigResourceSnapshot, type ConfigResourceSnapshot } from '../src/config-resource-loader.js';
 import type { BrainSpec, PermissionSpec } from '../src/config-resources.js';
 
@@ -181,7 +186,10 @@ describe('pure AgentPlan resolution', () => {
   });
 
   it('inherits atomic Brain and missing permission fields from a verified creator plan', () => {
-    const creator = resolveAgentPlan(baseInput(brain('creator')));
+    const creatorInput = baseInput(brain('creator'));
+    if (creatorInput.source.kind !== 'runtime_composition') throw new Error('expected runtime source');
+    creatorInput.source.brain = { template: 'creator' };
+    const creator = resolveAgentPlan(creatorInput);
     const input = baseInput();
     delete (input.source as { brain?: BrainSpec }).brain;
     (input.source as { permissions?: Partial<PermissionSpec> }).permissions = { approval: 'ask' };
@@ -191,7 +199,13 @@ describe('pure AgentPlan resolution', () => {
     expect(plan.brainProvenance).toMatchObject({ layer: 'creator', creatorPlanDigest: creator.planDigest });
     expect(plan.permissionProvenance.filesystem.layer).toBe('creator');
     expect(plan.identity).toEqual({ name: 'worker-1', ownership: 'create_temporary' });
-    expect(plan.sourceRevisions).toEqual(expect.arrayContaining(creator.sourceRevisions));
+    expect(creator.sourceRevisions).toEqual(expect.arrayContaining([
+      expect.objectContaining({ kind: 'Brain', id: 'creator' }),
+    ]));
+    expect(plan.sourceRevisions).not.toEqual(expect.arrayContaining([
+      expect.objectContaining({ kind: 'Brain', id: 'creator' }),
+    ]));
+    expect(plan.brainProvenance.brainSelection).toEqual({ kind: 'creator_plan' });
   });
 
   it('rejects stale or tampered creator plan digests', () => {
@@ -417,5 +431,265 @@ describe('pure AgentPlan resolution', () => {
       source: { kind: 'mystery' } as never, brain: { template: 'task' },
     };
     expect(() => resolveAgentPlan(layerKind)).toThrow(/source.kind is invalid/u);
+  });
+});
+
+const canonicalTest = (value: unknown): string => {
+  if (value === null || typeof value !== 'object') return JSON.stringify(value);
+  if (Array.isArray(value)) return `[${value.map(canonicalTest).join(',')}]`;
+  return `{${Object.keys(value).sort((a, b) => Buffer.compare(Buffer.from(a), Buffer.from(b)))
+    .map(key => `${JSON.stringify(key)}:${canonicalTest((value as Record<string, unknown>)[key])}`).join(',')}}`;
+};
+const envelopeBytes = (plan: AgentPlan, patch: Record<string, unknown> = {}): Buffer => Buffer.from(`${canonicalTest({
+  schemaVersion: 1, kind: 'AgentPlan', agentId: plan.agentId, generation: plan.generation,
+  planDigest: plan.planDigest, snapshotDigest: plan.snapshotDigest, plan, ...patch,
+})}\n`);
+const rehashPlan = (plan: AgentPlan): AgentPlan => {
+  const { planDigest: _old, ...unsigned } = plan;
+  plan.planDigest = computeAgentPlanDigest(unsigned);
+  return plan;
+};
+const sortRevisions = (plan: AgentPlan): void => {
+  plan.sourceRevisions = [...plan.sourceRevisions].sort((a, b) => Buffer.compare(
+    Buffer.from(`${a.kind}\0${a.id}\0${a.relativePath}\0${a.sha256}`),
+    Buffer.from(`${b.kind}\0${b.id}\0${b.relativePath}\0${b.sha256}`),
+  ));
+};
+
+describe('AgentPlan durable codec and presentation', () => {
+  it('round-trips one canonical LF-terminated byte form and deep-freezes decode', () => {
+    const plan = resolveAgentPlan(baseInput());
+    const encoded = encodeAgentPlan(plan);
+    expect(encoded.at(-1)).toBe(10);
+    expect(encoded.toString()).toBe(envelopeBytes(plan).toString());
+    const decoded = decodeAgentPlan(encoded);
+    expect(decoded.plan).toEqual(plan);
+    expect(Object.isFrozen(decoded)).toBe(true);
+    expect(Object.isFrozen(decoded.plan.permissionProvenance.approval)).toBe(true);
+    expect(encodeAgentPlan(decoded.plan)).toEqual(encoded);
+  });
+
+  it.each([
+    ['agentId', { agentId: 'other-agent' }],
+    ['generation', { generation: 2 }],
+    ['planDigest', { planDigest: `sha256:${'f'.repeat(64)}` }],
+    ['snapshotDigest', { snapshotDigest: `sha256:${'e'.repeat(64)}` }],
+  ])('rejects duplicated envelope %s mismatch', (_field, patch) => {
+    const plan = resolveAgentPlan(baseInput());
+    expect(() => decodeAgentPlan(envelopeBytes(plan, patch))).toThrow(/index fields/u);
+  });
+
+  it('rejects alternate whitespace/key order, missing LF, and duplicate-key bytes', () => {
+    const plan = resolveAgentPlan(baseInput());
+    const canonical = encodeAgentPlan(plan).toString();
+    expect(() => decodeAgentPlan(` ${canonical}`)).toThrow(/canonical/u);
+    expect(() => decodeAgentPlan(canonical.trimEnd())).toThrow(/canonical/u);
+    expect(() => decodeAgentPlan(canonical.replace('{', '{"kind":"AgentPlan",'))).toThrow(/canonical/u);
+    const parsed = JSON.parse(canonical) as Record<string, unknown>;
+    const reordered = { plan: parsed.plan, schemaVersion: parsed.schemaVersion, kind: parsed.kind,
+      agentId: parsed.agentId, generation: parsed.generation, planDigest: parsed.planDigest,
+      snapshotDigest: parsed.snapshotDigest };
+    expect(() => decodeAgentPlan(`${JSON.stringify(reordered)}\n`)).toThrow(/canonical/u);
+  });
+
+  it('bounds bytes and structure before recursive canonicalization', () => {
+    expect(() => decodeAgentPlan(Buffer.alloc(MAX_AGENT_PLAN_ENVELOPE_BYTES + 1, 0x20))).toThrow(/byte length/u);
+    const deep = `${'{"a":'.repeat(66)}0${'}'.repeat(66)}\n`;
+    expect(() => decodeAgentPlan(deep)).toThrow(/deeply nested/u);
+    const huge = `{"a":"${'x'.repeat(128 * 1024 + 1)}"}\n`;
+    expect(() => decodeAgentPlan(huge)).toThrow(/oversized string/u);
+  });
+
+  it('rejects a structurally invalid plan even when its digest is valid', () => {
+    const invalid = JSON.parse(JSON.stringify(resolveAgentPlan(baseInput()))) as AgentPlan;
+    (invalid.principal as { kind: string }).kind = 'intruder';
+    const { planDigest: _old, ...unsigned } = invalid;
+    invalid.planDigest = computeAgentPlanDigest(unsigned);
+    expect(() => decodeAgentPlan(envelopeBytes(invalid))).toThrow(/principal.kind/u);
+    expect(() => validateAgentPlanStructure(invalid)).toThrow(/principal.kind/u);
+    const malformed = JSON.parse(JSON.stringify(resolveAgentPlan(baseInput()))) as AgentPlan;
+    (malformed as unknown as { source: null }).source = null;
+    const { planDigest: _malformedDigest, ...malformedUnsigned } = malformed;
+    malformed.planDigest = computeAgentPlanDigest(malformedUnsigned);
+    expect(() => decodeAgentPlan(envelopeBytes(malformed))).toThrow(/source must be an object/u);
+  });
+
+  it('binds every resource provenance to the exact layer kind and current source revision', () => {
+    const creator = resolveAgentPlan(baseInput());
+    const input = baseInput(); input.creatorEvidence = verifiedCreator(creator);
+    if (input.source.kind !== 'runtime_composition') throw new Error('expected runtime source');
+    input.source.permissions = { approval: 'ask', unattended: 'deny' };
+    input.taskDefault = {
+      source: { kind: 'resource', resourceKind: 'TasksPolicy', resourceId: 'default' },
+      permissions: { filesystem: 'read-only' },
+    };
+    input.adapter = adapter(brain('explicit'), {
+      approval: 'ask', filesystem: 'read-only', unattended: 'deny',
+    });
+    const selected = resolveAgentPlan(input);
+    expect(selected.permissionProvenance.filesystem).toMatchObject({
+      layer: 'task_default', sourceType: 'resource', sourceId: 'default',
+    });
+
+    const missing = JSON.parse(JSON.stringify(selected)) as AgentPlan;
+    missing.permissionProvenance.filesystem.sourceId = 'ghost';
+    rehashPlan(missing);
+    expect(() => decodeAgentPlan(envelopeBytes(missing))).toThrow(/exact TasksPolicy source revision/u);
+
+    const wrongKind = JSON.parse(JSON.stringify(selected)) as AgentPlan;
+    const revision = wrongKind.sourceRevisions.find(source => source.kind === 'TasksPolicy');
+    if (!revision) throw new Error('expected TasksPolicy revision');
+    revision.kind = 'RoomsPolicy'; sortRevisions(wrongKind); rehashPlan(wrongKind);
+    expect(() => decodeAgentPlan(envelopeBytes(wrongKind))).toThrow(/exact TasksPolicy source revision/u);
+
+    const appendInput = baseInput();
+    appendInput.roleContext = { template: {
+      source: { kind: 'resource', resourceKind: 'RoomTemplate', resourceId: 'template-1' },
+      mission_append: 'context',
+    } };
+    const append = JSON.parse(JSON.stringify(resolveAgentPlan(appendInput))) as AgentPlan;
+    append.role.appendProvenance[0].sourceId = 'ghost'; rehashPlan(append);
+    expect(() => decodeAgentPlan(envelopeBytes(append))).toThrow(/exact RoomTemplate source revision/u);
+  });
+
+  it('rejects duplicate logical resource revisions even when bytes and digest are otherwise valid', () => {
+    const plan = JSON.parse(JSON.stringify(resolveAgentPlan(baseInput()))) as AgentPlan;
+    plan.sourceRevisions.push({ ...plan.sourceRevisions[0], relativePath: 'roles.d/other.yaml', sha256: 'b'.repeat(64) });
+    sortRevisions(plan); rehashPlan(plan);
+    expect(() => decodeAgentPlan(envelopeBytes(plan))).toThrow(/not unique/u);
+  });
+
+  it('binds inline/template/creator Brain selection to the exact Brain revision closure', () => {
+    const templateInput = baseInput();
+    if (templateInput.source.kind !== 'runtime_composition') throw new Error('expected runtime source');
+    templateInput.source.brain = { template: 'explicit' };
+    const selected = resolveAgentPlan(templateInput);
+    expect(selected.brainProvenance.brainSelection).toEqual({ kind: 'template', brainId: 'explicit' });
+    expect(selected.sourceRevisions).toEqual(expect.arrayContaining([
+      expect.objectContaining({ kind: 'Brain', id: 'explicit' }),
+    ]));
+
+    const missing = JSON.parse(JSON.stringify(selected)) as AgentPlan;
+    missing.sourceRevisions = missing.sourceRevisions.filter(source => source.kind !== 'Brain');
+    rehashPlan(missing);
+    expect(() => decodeAgentPlan(envelopeBytes(missing))).toThrow(/exact selected resource closure|exact Brain/u);
+
+    const wrong = JSON.parse(JSON.stringify(selected)) as AgentPlan;
+    const brainRevision = wrong.sourceRevisions.find(source => source.kind === 'Brain');
+    if (!brainRevision) throw new Error('expected Brain revision');
+    brainRevision.kind = 'RoomsPolicy'; sortRevisions(wrong); rehashPlan(wrong);
+    expect(() => decodeAgentPlan(envelopeBytes(wrong))).toThrow(/exact selected resource closure|exact Brain/u);
+
+    const inline = JSON.parse(JSON.stringify(resolveAgentPlan(baseInput()))) as AgentPlan;
+    expect(inline.brainProvenance.brainSelection).toEqual({ kind: 'inline' });
+    inline.sourceRevisions.push({
+      kind: 'Brain', id: 'ghost', relativePath: 'brains.d/ghost.yaml', sha256: 'c'.repeat(64),
+    });
+    sortRevisions(inline); rehashPlan(inline);
+    expect(() => decodeAgentPlan(envelopeBytes(inline))).toThrow(/exact selected resource closure/u);
+
+    const forgedSelection = JSON.parse(JSON.stringify(selected)) as AgentPlan;
+    forgedSelection.brainProvenance.brainSelection = { kind: 'inline' };
+    rehashPlan(forgedSelection);
+    expect(() => decodeAgentPlan(envelopeBytes(forgedSelection))).toThrow(/exact selected resource closure/u);
+  });
+
+  it('revalidates no-creator and within-creator delegation ranks after decode', () => {
+    const noCreator = JSON.parse(JSON.stringify(resolveAgentPlan(baseInput()))) as AgentPlan;
+    noCreator.delegation.approval.creator = 'ask'; rehashPlan(noCreator);
+    expect(() => decodeAgentPlan(envelopeBytes(noCreator))).toThrow(/unexpectedly has creator policy/u);
+
+    const creatorInput = baseInput();
+    if (creatorInput.source.kind !== 'runtime_composition') throw new Error('expected runtime source');
+    creatorInput.source.permissions = { approval: 'allow', filesystem: 'workspace', unattended: 'deny' };
+    creatorInput.adapter = adapter(brain('explicit'), creatorInput.source.permissions);
+    const creator = resolveAgentPlan(creatorInput);
+    const childInput = baseInput(); childInput.creatorEvidence = verifiedCreator(creator);
+    if (childInput.source.kind !== 'runtime_composition') throw new Error('expected runtime source');
+    childInput.source.permissions = { approval: 'auto', filesystem: 'workspace', unattended: 'deny' };
+    childInput.adapter = adapter(brain('explicit'), childInput.source.permissions);
+    const within = JSON.parse(JSON.stringify(resolveAgentPlan(childInput))) as AgentPlan;
+    within.delegation.approval.creator = 'ask'; rehashPlan(within);
+    expect(() => decodeAgentPlan(envelopeBytes(within))).toThrow(/exceeds creator policy/u);
+  });
+
+  it('revalidates Owner grant decision ceiling, retained ceiling, and rank after decode', () => {
+    const creator = resolveAgentPlan(baseInput());
+    const input = baseInput(); input.creatorEvidence = verifiedCreator(creator);
+    if (input.source.kind !== 'runtime_composition') throw new Error('expected runtime source');
+    input.source.permissions = { approval: 'allow', filesystem: 'workspace', unattended: 'deny' };
+    input.adapter = adapter(brain('explicit'), input.source.permissions);
+    input.ownerDelegationEvidence = verifiedGrant({
+      grantId: 'grant-1', authenticatedOwnerCid: 'owner-cid', subjectPrincipalId: 'owner-1',
+      operationId: 'op-1', operationType: 'agent.create', resourceScope: 'agents/worker-1',
+      revision: 'auth-3', expiresAt: 2000, ceilings: { approval: 'allow' },
+    });
+    const valid = resolveAgentPlan(input);
+
+    const decisionMismatch = JSON.parse(JSON.stringify(valid)) as AgentPlan;
+    decisionMismatch.delegation.approval.grantCeiling = 'auto'; rehashPlan(decisionMismatch);
+    expect(() => decodeAgentPlan(envelopeBytes(decisionMismatch))).toThrow(/retained grant ceiling|rank/u);
+
+    const retainedMismatch = JSON.parse(JSON.stringify(valid)) as AgentPlan;
+    retainedMismatch.ownerDelegation!.grant.ceilings.approval = 'auto'; rehashPlan(retainedMismatch);
+    expect(() => decodeAgentPlan(envelopeBytes(retainedMismatch))).toThrow(/retained grant ceiling|rank/u);
+  });
+
+  it('uses a strict presentation allowlist and omits authority, prose, operation, and runtime data', () => {
+    const creator = resolveAgentPlan(baseInput());
+    const input = baseInput();
+    input.creatorEvidence = verifiedCreator(creator);
+    if (input.source.kind !== 'runtime_composition') throw new Error('expected runtime source');
+    input.source.runtime = { scheduling: { cwd: '/forbidden-runtime-secret' } };
+    (input.source.permissions as PermissionSpec).approval = 'allow';
+    input.adapter = adapter(brain('explicit'), { approval: 'allow', filesystem: 'workspace', unattended: 'deny' });
+    input.ownerDelegationEvidence = verifiedGrant({
+      grantId: 'grant-visible', authenticatedOwnerCid: 'owner-cid',
+      subjectPrincipalId: 'owner-1', operationId: 'op-1', operationType: 'agent.create',
+      resourceScope: 'agents/worker-1', revision: 'auth-3', expiresAt: 2000,
+      ceilings: { approval: 'allow' },
+    });
+    const plan = resolveAgentPlan(input);
+    const raw = JSON.stringify(presentAgentPlan(plan));
+    expect(raw).not.toContain('Base mission');
+    expect(raw).not.toContain('Base persona');
+    expect(raw).not.toContain('forbidden-runtime-secret');
+    expect(raw).not.toContain('agent.create');
+    expect(raw).not.toContain('owner-cid');
+    expect(raw).not.toContain('trusted');
+    expect(raw).toContain('grant-visible');
+    expect(raw).toContain('owner_grant');
+    expect(raw).toContain('"brain":{"harness":"codex","model":"explicit","effort":"high","session":"acp"}');
+    const summary = renderAgentPlanSummary(plan);
+    expect(summary).toContain(`sourceDigest=${plan.brainProvenance.sourceDigest}`);
+    expect(summary).toContain('grant="grant-visible"');
+  });
+
+  it('renders controls safely and deterministically elides variable lists with count and digest', () => {
+    const input = baseInput();
+    if (input.source.kind !== 'runtime_composition') throw new Error('expected runtime source');
+    input.source.identity.name = 'worker"\\control';
+    input.roleContext = {
+      template: { source: { kind: 'resource', resourceKind: 'RoomTemplate', resourceId: 'template-1' }, mission_append: 'template' },
+      room: { source: { kind: 'resource', resourceKind: 'RoomsPolicy', resourceId: 'default' }, mission_append: 'room' },
+      taskMember: { source: { kind: 'resource', resourceKind: 'TasksPolicy', resourceId: 'default' }, mission_append: 'task' },
+    };
+    const plan = resolveAgentPlan(input);
+    const left = renderAgentPlanSummary(plan);
+    const right = renderAgentPlanSummary(plan);
+    expect(left).toBe(right);
+    expect(left).toContain('worker\\"\\\\control');
+    expect(left).toContain('SourceRevision.omitted=1');
+    expect(left).toMatch(/SourceRevision\.omittedDigest=sha256:[a-f0-9]{64}/u);
+    expect(left).not.toContain('tasks.d/default.yaml');
+  });
+
+  it('decoded data cannot act as opaque evidence for either resolver', () => {
+    const plan = resolveAgentPlan(baseInput());
+    const decoded = decodeAgentPlan(encodeAgentPlan(plan));
+    const request = baseInput();
+    request.creatorEvidence = decoded as unknown as VerifiedCreatorPlanEvidence;
+    expect(() => resolveWithoutAuthority(request)).toThrow(/not authenticated/u);
+    expect(() => resolveAgentPlan(request)).toThrow(/not authenticated/u);
   });
 });
