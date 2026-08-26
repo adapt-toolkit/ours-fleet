@@ -263,6 +263,13 @@ describe('ours-fleet CLI', () => {
     expect(JSON.parse(one.stdout).run_id).toBe('20260731T115000Z');
     expect(one.stdout).toBe(JSON.stringify(report) + '\n'); // stored JSON, unmodified
 
+    // CLI report history remains usable when configuration is removed or broken.
+    // The web query deliberately propagates its cfgProvider failure instead.
+    writeFileSync(join(dir, 'fleet.yaml'), 'roles: [broken\n');
+    const historyFallback = await run(['watchdog-report', 'w', '--list', '--json']);
+    expect(historyFallback.code).toBe(0);
+    expect(JSON.parse(historyFallback.stdout).runs[0].runId).toBe('20260731T115000Z');
+
     const missing = await run(['watchdog-report', 'w', '29990101T000000Z']);
     expect(missing.code).toBe(1);
 

@@ -5,6 +5,53 @@ import { FleetError, normalizeError } from './errors.js';
 import { RoleRepository } from './role-repository.js';
 import type { RoleStatus } from './types.js';
 
+export interface RestartBatchPlan {
+  readonly roleIds: readonly string[];
+  readonly mode: 'keep' | 'fresh';
+  readonly config: ReturnType<typeof loadConfig>;
+  readonly configPath?: string;
+}
+
+/** Shared restart kernel. Receipt policy and surface rendering stay with callers. */
+export class RoleLifecycleService {
+  constructor(private readonly options: RoleCommandOptions) {}
+
+  async prepareRestart(input: {
+    roleIds: string[]; mode: 'keep' | 'fresh'; config?: ReturnType<typeof loadConfig>;
+  }): Promise<RestartBatchPlan> {
+    const config = input.config ?? loadConfig(this.options.configPath);
+    const selected = input.roleIds.length ? input.roleIds : config.roles.map(role => role.name);
+    for (const roleId of selected) {
+      const role = await this.options.repository.get(roleId);
+      if (!role) throw new FleetError('role_not_found', `no such role '${roleId}'`);
+      if (role.lifetime !== 'permanent')
+        throw new FleetError('capability_unavailable', 'lifecycle is unavailable for temporary/orphan roles');
+    }
+    return Object.freeze({
+      roleIds: Object.freeze([...input.roleIds]), mode: input.mode, config,
+      ...(this.options.configPath ? { configPath: this.options.configPath } : {}),
+    });
+  }
+
+  async executeRestart(plan: RestartBatchPlan): Promise<void> {
+    await (this.options.restart ?? restartRoles)(
+      plan.config, [...plan.roleIds], this.options.ops, plan.mode, plan.configPath,
+    );
+  }
+
+  status(roleId: string): Promise<RoleStatus> { return this.options.status(roleId); }
+}
+
+/** Adapter-facing batch entry point used by CLI and detached Messenger workers. */
+export async function executeRestartBatch(
+  lifecycle: Pick<RoleLifecycleService, 'prepareRestart' | 'executeRestart'>,
+  input: { roleIds: string[]; mode: 'keep' | 'fresh'; config?: ReturnType<typeof loadConfig> },
+): Promise<RestartBatchPlan> {
+  const plan = await lifecycle.prepareRestart(input);
+  await lifecycle.executeRestart(plan);
+  return plan;
+}
+
 export type LifecycleAction = 'start' | 'stop' | 'restart_resume' | 'restart_fresh';
 export interface CommandReceipt {
   actionId: string;
@@ -23,12 +70,17 @@ export interface RoleCommandOptions {
   configPath?: string;
   status(roleId: string): Promise<RoleStatus>;
   onProgress?: (receipt: CommandReceipt) => void;
+  restart?: typeof restartRoles;
+  lifecycle?: RoleLifecycleService;
 }
 
 export class RoleCommandService {
   private readonly receipts = new Map<string, CommandReceipt>();
   private readonly locks = new Map<string, Promise<void>>();
-  constructor(private readonly options: RoleCommandOptions) {}
+  readonly lifecycle: RoleLifecycleService;
+  constructor(private readonly options: RoleCommandOptions) {
+    this.lifecycle = options.lifecycle ?? new RoleLifecycleService(options);
+  }
 
   async execute(input: {
     roleId: string; action: LifecycleAction; actionId?: string; confirmation?: string;
@@ -66,9 +118,13 @@ export class RoleCommandService {
         await up(config, [receipt.roleId], this.options.ops, this.options.configPath);
       else if (receipt.action === 'stop')
         await this.options.ops.backend.stop(receipt.roleId);
-      else await restartRoles(
-        config, [receipt.roleId], this.options.ops,
-        receipt.action === 'restart_fresh' ? 'fresh' : 'keep', this.options.configPath);
+      else {
+        const plan = await this.lifecycle.prepareRestart({
+          roleIds: [receipt.roleId],
+          mode: receipt.action === 'restart_fresh' ? 'fresh' : 'keep', config,
+        });
+        await this.lifecycle.executeRestart(plan);
+      }
       try {
         const status = await this.options.status(receipt.roleId);
         receipt.postcondition = { overall: status.overall, observedAt: status.observedAt };

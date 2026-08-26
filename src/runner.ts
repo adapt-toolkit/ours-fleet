@@ -40,7 +40,7 @@ import {
   ScheduledLoopManager, type ScheduledLoopManagerHandle,
 } from './loops/manager.js';
 import {
-  FLEET_PROXY_CALLER_ENV, FLEET_PROXY_STATE_DIR_ENV, inheritCallerSpawnDefaults,
+  FLEET_PROXY_CALLER_ENV, FLEET_PROXY_STATE_DIR_ENV,
   type ManagedFleetSpawnResult,
 } from './fleet-proxy.js';
 import type { SpawnOpts } from './spawn.js';
@@ -150,40 +150,18 @@ async function executeManagedSpawn(
   caller: ResolvedRole, configPath: string | undefined, requested: SpawnOpts,
   log: (line: string) => void,
 ): Promise<ManagedFleetSpawnResult> {
-  const { options, inherited } = inheritCallerSpawnDefaults(caller, requested, configPath);
-  const creationActionId = randomUUID();
-  options.creationActionId = creationActionId;
-  const spawnModule = await import('./spawn.js');
-  const preview = spawnModule.spawnDryRun(options).resolvedRole;
   const runtimeBinPath = (() => {
     try { return realpathSync(process.argv[1]); } catch { return process.argv[1]; }
   })();
-  let statePath: string;
-  if (options.temp) {
-    statePath = await spawnModule.spawnTemp(options, runtimeBinPath);
-  } else {
-    const { pickBackend } = await import('./supervisor/index.js');
-    const { WatchdogServiceManager } = await import('./watchdog/service.js');
-    statePath = await spawnModule.spawnPermanent(options, {
-      backend: pickBackend(), binPath: runtimeBinPath, log,
-      watchdogService: new WatchdogServiceManager(),
-    });
-  }
-  const result: ManagedFleetSpawnResult = {
-    caller: caller.name,
-    role: options.name,
-    lifetime: options.temp ? 'temporary' : 'permanent',
-    statePath,
-    harness: preview.harness,
-    session: preview.session,
-    // Read back from the resolved environment, not from the request: the banner
-    // must name the model the child will run, not the one that was asked for.
-    ...(effectiveRoleModel(preview) ? { model: effectiveRoleModel(preview)! } : {}),
-    monitor: { mode: preview.monitor.mode, interrupt: preview.monitor.interrupt },
-    permissionMode: effectivePermissionMode(preview),
-    inherited,
-    creationActionId,
-  };
+  const [{ RoleCreationService }, { pickBackend }, { WatchdogServiceManager }] = await Promise.all([
+    import('./application/role-creation-service.js'), import('./supervisor/index.js'),
+    import('./watchdog/service.js'),
+  ]);
+  const service = new RoleCreationService({ configPath,
+    ops: { backend: pickBackend(), binPath: runtimeBinPath, log,
+      watchdogService: new WatchdogServiceManager() },
+    binPath: runtimeBinPath, journal: false });
+  const result = await service.createManaged(caller, requested);
   log(`[${caller.name}] managed fleet proxy spawned ${result.lifetime} role ${result.role} `
     + `harness=${result.harness} session=${result.session} `
     + `model=${result.model ?? '(harness default)'} `

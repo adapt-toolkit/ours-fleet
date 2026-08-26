@@ -46,4 +46,13 @@ describe('supervisor-independent owner close workers', () => {
     expect(args.some(value => value.includes('OURS_FLEET_SUPERVISOR'))).toBe(false);
     expect(args.some(value => value.includes('CODEX_THREAD_ID'))).toBe(false);
   });
+
+  it('launches full task recovery through the dedicated hidden worker', async () => {
+    child.execFile.mockImplementation((_file, _args, _options, callback) => callback(null, '', ''));
+    await fleetCliOps('RetiringMember', '/tmp/fleet.yaml').recoverTask('task-123');
+    const args = child.execFile.mock.calls[0][1] as string[];
+    expect(args).toEqual(expect.arrayContaining([
+      process.execPath, process.argv[1], 'task', '_recover', 'task-123', '-c', '/tmp/fleet.yaml',
+    ]));
+  });
 });

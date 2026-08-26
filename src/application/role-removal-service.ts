@@ -19,7 +19,12 @@ export interface RoleRemovalPreview {
 export class RoleRemovalService {
   constructor(private readonly options: { configPath?: string; ops: OpsDeps; currentControlRole?: string }) {}
 
-  preview(requested: string): RoleRemovalPreview {
+  async removeDirect(input: { actor: { kind: 'local_control'; surface: 'cli' }; role: string }): Promise<void> {
+    const cfg = loadConfig(this.options.configPath);
+    await rmRole(cfg, input.role, this.options.ops);
+  }
+
+  previewWeb(requested: string): RoleRemovalPreview {
     if (!ROLE_NAME_RE.test(requested)) throw new FleetError('invalid_request', 'invalid role name');
     const cfg = loadConfig(this.options.configPath);
     const names = new Set(cfg.roles.map(role => role.name));
@@ -56,8 +61,8 @@ export class RoleRemovalService {
     };
   }
 
-  async remove(input: { role: string; confirmation?: string; confirmed?: boolean; coordinatorAcknowledged?: boolean }): Promise<RoleRemovalPreview & { removed: true; recoveryPath: string }> {
-    const preview = this.preview(input.role);
+  async removeWeb(input: { role: string; confirmation?: string; confirmed?: boolean; coordinatorAcknowledged?: boolean }): Promise<RoleRemovalPreview & { removed: true; recoveryPath: string }> {
+    const preview = this.previewWeb(input.role);
     if (preview.selfProtected)
       throw new FleetError('forbidden', 'the current control role cannot remove itself from its own web session');
     if (preview.coordinatorProtection && !input.coordinatorAcknowledged)
@@ -83,5 +88,12 @@ export class RoleRemovalService {
       this.options.ops.log(`removed orphaned backend/state '${preview.role}'`);
     }
     return { ...preview, removed: true, recoveryPath };
+  }
+
+  /** @deprecated Internal compatibility aliases; surface adapters use explicit policies above. */
+  preview(requested: string): RoleRemovalPreview { return this.previewWeb(requested); }
+  /** @deprecated Internal compatibility aliases; surface adapters use explicit policies above. */
+  remove(input: { role: string; confirmation?: string; confirmed?: boolean; coordinatorAcknowledged?: boolean }) {
+    return this.removeWeb(input);
   }
 }

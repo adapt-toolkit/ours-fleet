@@ -3,14 +3,17 @@ import { chmodSync, existsSync, readFileSync, rmSync, writeFileSync } from 'node
 import { createConnection, createServer, type Server, type Socket } from 'node:net';
 import { join } from 'node:path';
 
-import { SessionControlError, interruptOutcome } from './types.js';
-import type { ControlFailureKind, SessionHandle } from './types.js';
+import { SessionControlError } from './types.js';
+import type { ControlFailureKind, SessionEvent, SessionHandle, SessionSnapshot } from './types.js';
 import type {
   OwnerChannelHandle, OwnerChannelManagementRequest,
 } from '../owner-channel/channel.js';
 import type { ScheduledLoopManagerHandle } from '../loops/manager.js';
 import type { SpawnOpts } from '../spawn.js';
 import type { ManagedFleetSpawnResult } from '../fleet-proxy.js';
+import {
+  interruptSession, queueSessionPrompt, respondSessionPermission, respondSessionPermissionV2,
+} from '../application/session-mutations.js';
 
 const MAX_LINE_BYTES = 64 * 1024;
 
@@ -60,6 +63,27 @@ export interface ControlResponse {
   error?: string;
   /** Why it failed, so the caller does not have to guess from the text. */
   kind?: ControlFailureKind;
+}
+
+export interface RetainedEventPage {
+  events: SessionEvent[];
+  snapshot: SessionSnapshot;
+  firstSeq: number;
+  lastSeq: number;
+  truncated: boolean;
+}
+
+/** The one retained-range projection shared by polling and live-follow admission. */
+export function retainedEventPage(session: SessionHandle, since: number): RetainedEventPage {
+  const events = session.eventsSince(since);
+  const all = session.eventsSince(0);
+  return {
+    events,
+    snapshot: session.snapshot(),
+    firstSeq: all[0]?.seq ?? 0,
+    lastSeq: all.at(-1)?.seq ?? 0,
+    truncated: Boolean(all[0] && since > 0 && since < all[0].seq - 1),
+  };
 }
 
 /**
@@ -317,7 +341,7 @@ export class RoleControlServer {
           // Answer on QUEUE ACCEPTANCE, not on turn completion. A turn can run
           // for minutes; blocking here made every `send` into a busy agent time
           // out, and the timeout was then reported as a dead agent.
-          const queued = await this.session.queuePrompt(request.text, {
+          const queued = await queueSessionPrompt(this.session, request.text, {
             origin: { kind: 'local-console' },
           });
           this.write(socket, {
@@ -331,7 +355,8 @@ export class RoleControlServer {
         case 'respond_permission': {
           if (!request.permissionId || !request.optionId)
             throw new SessionControlError('rejected', 'permissionId and optionId are required');
-          const accepted = this.session.respondPermission(request.permissionId, request.optionId);
+          const accepted = respondSessionPermission(
+            this.session, request.permissionId, request.optionId);
           this.write(socket, {
             version: 1, id: request.id, ok: accepted,
             result: { accepted },
@@ -343,7 +368,7 @@ export class RoleControlServer {
         case 'interrupt': {
           // Forced recovery cancelled the turn just as surely as a cooperative
           // stop did. Report HOW, never as a failed operation.
-          const outcome = interruptOutcome(await this.session.interrupt('local-console'));
+          const outcome = await interruptSession(this.session, 'local-console');
           this.write(socket, { version: 1, id: request.id, ok: true, result: outcome });
           return;
         }
@@ -396,29 +421,17 @@ export class RoleControlServer {
         }
         case 'events_since': {
           const since = Number.isFinite(request.since) ? Number(request.since) : 0;
-          const events = this.session.eventsSince(since);
-          const all = this.session.eventsSince(0);
           this.write(socket, {
             version: 1, id: request.id, ok: true,
-            result: {
-              events, snapshot: this.session.snapshot(),
-              firstSeq: all[0]?.seq ?? 0, lastSeq: all.at(-1)?.seq ?? 0,
-              truncated: Boolean(all[0] && since > 0 && since < all[0].seq - 1),
-            },
+            result: retainedEventPage(this.session, since),
           });
           return;
         }
         case 'follow': {
           const since = Number.isFinite(request.since) ? Number(request.since) : 0;
-          const events = this.session.eventsSince(since);
-          const all = this.session.eventsSince(0);
           this.write(socket, {
             version: 1, id: request.id, ok: true,
-            result: {
-              events, snapshot: this.session.snapshot(),
-              firstSeq: all[0]?.seq ?? 0, lastSeq: all.at(-1)?.seq ?? 0,
-              truncated: Boolean(all[0] && since > 0 && since < all[0].seq - 1),
-            },
+            result: retainedEventPage(this.session, since),
           });
           const controller = request.controller !== false;
           if (controller) this.session.setControllerAttached(true);
@@ -484,7 +497,7 @@ export class RoleControlServer {
             this.write(socket, { version: 1, id: request.id, ok: true, result: existing });
             return;
           }
-          const outcome = interruptOutcome(await this.session.interrupt('local-console'));
+          const outcome = await interruptSession(this.session, 'local-console');
           const receipt = {
             accepted: true, commandId: request.commandId, at: new Date().toISOString(),
             ...outcome,
@@ -503,11 +516,12 @@ export class RoleControlServer {
               || !request.optionId?.trim() || !request.sessionGeneration?.trim())
             throw new SessionControlError('rejected',
               'commandId, permissionId, optionId and sessionGeneration are required');
-          if (!this.session.respondPermissionV2)
+          const result = respondSessionPermissionV2(
+            this.session,
+            request.permissionId, request.optionId, request.sessionGeneration);
+          if (result === 'unavailable')
             throw new SessionControlError('rejected',
               'generation-bound permission responses are unavailable for this role');
-          const result = this.session.respondPermissionV2(
-            request.permissionId, request.optionId, request.sessionGeneration);
           if (result === 'stale')
             throw new SessionControlError('rejected',
               'stale_state: permission is settled, expired, invalid, or belongs to another session generation');

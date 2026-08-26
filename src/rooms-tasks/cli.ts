@@ -6,9 +6,6 @@ import {
   acceptManagedRoomClose, deleteLegacyClosedRooms, deleteManagedRoom,
   recordManagedRoomCloseError,
 } from './close.js';
-import {
-  acceptTaskTerminalIntent, recordTaskTerminalIntentError, settleTaskTerminalIntent,
-} from './terminal.js';
 import { launchFleetWorker } from './external-worker.js';
 import {
   resolveTemplate, listTemplates, snapshotTemplate, hashTemplate,
@@ -31,6 +28,7 @@ import {
   markdownCode, markdownProse, renderMarkdownFailure, renderMarkdownList,
   renderMarkdownResult, roomStatus, taskStatus,
 } from './markdown.js';
+import { TaskRoomApplicationError, TaskRoomApplicationService } from '../application/task-room-service.js';
 
 type TaskRoomPublicErrorCode =
   | 'task_confirmation_mismatch' | 'room_confirmation_mismatch'
@@ -158,6 +156,8 @@ function isKnownRoomStateMessage(message: string): boolean {
 }
 
 function dieTaskRoom(e: unknown): never {
+  if (e instanceof TaskRoomApplicationError)
+    e = taskRoomPublicError(e.code as TaskRoomPublicErrorCode, e.fields);
   if (e instanceof TaskRoomPublicError) {
     const failure = taskRoomPublicFailure(e);
     const output = renderMarkdownFailure({
@@ -242,10 +242,10 @@ async function launchTaskSettleWorker(
   try {
     await launchFleetWorker(['task', '_settle', taskId], `task-settle-${taskId}`, configPath);
   } catch (error) {
-    await recordTaskTerminalIntentError(
-      taskId, errorText(error),
-      `External settle worker failed to start. Retry task recover ${taskId}.`,
-    );
+    await taskRoomService(configPath).recordSettlementError({
+      actor: { kind: 'local_control', surface: 'cli' }, taskId, error: errorText(error),
+      recoveryHint: `External settle worker failed to start. Retry task recover ${taskId}.`,
+    });
     throw error;
   }
   const deadline = Date.now() + PUBLIC_SETTLE_WAIT_MS;
@@ -267,10 +267,10 @@ async function launchRoomDeleteWorker(
   try {
     await launchFleetWorker(['room', '_delete', roomId], `room-delete-${roomId}`, configPath);
   } catch (error) {
-    await recordManagedRoomCloseError(
-      roomId, errorText(error),
-      `External delete worker failed to start. Retry room delete ${roomId} ${roomId}.`,
-    );
+    await taskRoomService(configPath).recordRoomSettlementError({
+      actor: { kind: 'local_control', surface: 'cli' }, roomId, error: errorText(error),
+      recoveryHint: `External delete worker failed to start. Retry room delete ${roomId} ${roomId}.`,
+    });
     throw error;
   }
   const deadline = Date.now() + PUBLIC_SETTLE_WAIT_MS;
@@ -287,6 +287,15 @@ async function launchRoomDeleteWorker(
 
 function loadCfg(opts: { configuration?: string }): FleetConfig {
   return loadConfig(opts.configuration);
+}
+
+function taskRoomService(configuration?: string): TaskRoomApplicationService {
+  return new TaskRoomApplicationService(configuration, {
+    loadConfiguration: loadConfig,
+    cowork: coworkFor,
+    binPath: getBinPath,
+    provisionMembers,
+  });
 }
 
 function allTemplates(cfg: FleetConfig): Record<string, TemplateDefinition> {
@@ -432,8 +441,7 @@ export function registerTemplateCommands(parent: Command, cOpt: (cmd: Command) =
     .option('--json', 'JSON output')
     .action((opts: { configuration?: string; json?: boolean }) => {
       try {
-        const cfg = loadCfg(opts);
-        const templates = listTemplates(allTemplates(cfg));
+        const templates = taskRoomService(opts.configuration).listTemplates();
         if (opts.json) {
           console.log(JSON.stringify({ schema_version: 1, templates }, null, 2));
           return;
@@ -451,11 +459,9 @@ export function registerTemplateCommands(parent: Command, cOpt: (cmd: Command) =
     .option('--json', 'JSON output')
     .action((name: string, opts: { configuration?: string; json?: boolean }) => {
       try {
-        const cfg = loadCfg(opts);
-        const t = resolveTemplate(name, allTemplates(cfg));
-        if (!t) die(new Error(`template not found: ${name}`));
+        const t = taskRoomService(opts.configuration).getTemplate(name);
         if (opts.json) {
-          console.log(JSON.stringify({ schema_version: 1, template: { ...t, content_hash: hashTemplate(t) } }, null, 2));
+          console.log(JSON.stringify({ schema_version: 1, template: t }, null, 2));
           return;
         }
         console.log(`${t.name}@${t.version}  ${t.description}`);
@@ -463,7 +469,7 @@ export function registerTemplateCommands(parent: Command, cOpt: (cmd: Command) =
         console.log(`\nMembers:`);
         for (const m of t.members)
           console.log(`  ${m.slot}: ${m.count}× ${m.role} (ref: ${m.role_ref})`);
-        console.log(`\nContent hash: ${hashTemplate(t)}`);
+        console.log(`\nContent hash: ${t.content_hash}`);
       } catch (e) { die(e); }
     });
 
@@ -472,17 +478,7 @@ export function registerTemplateCommands(parent: Command, cOpt: (cmd: Command) =
     .option('--json', 'JSON output')
     .action((opts: { configuration?: string; json?: boolean }) => {
       try {
-        const cfg = loadCfg(opts);
-        const templates = listTemplates(allTemplates(cfg));
-        const problems: { template: string; issues: string[] }[] = [];
-        for (const t of templates) {
-          const issues: string[] = [];
-          for (const m of t.members) {
-            if (!cfg.roles.some(r => r.name === m.role_ref))
-              issues.push(`member ${m.slot}: role_ref '${m.role_ref}' not found in fleet roles`);
-          }
-          if (issues.length) problems.push({ template: `${t.name}@${t.version}`, issues });
-        }
+        const problems = taskRoomService(opts.configuration).validateTemplates();
         if (opts.json) {
           console.log(JSON.stringify({ schema_version: 1, valid: !problems.length, problems }, null, 2));
           return;
@@ -516,59 +512,12 @@ export function registerTaskCommands(parent: Command, cOpt: (cmd: Command) => Co
       room?: boolean; idempotencyKey?: string; json?: boolean;
     }) => {
       try {
-        const cfg = loadCfg(opts);
-        let templateRef;
-        if (opts.template) {
-          const t = resolveTemplate(opts.template, allTemplates(cfg));
-          if (!t) throw taskRoomPublicError('template_not_found', { template: opts.template });
-          const snap = snapshotTemplate(t);
-          templateRef = { name: snap.name, version: snap.version, content_hash: snap.content_hash };
-        } else if (opts.room !== false) {
-          const defaultTpl = cfg.tasks?.default_room_template ?? cfg.rooms?.defaults?.template ?? 'team';
-          const t = resolveTemplate(defaultTpl, allTemplates(cfg));
-          if (t) {
-            const snap = snapshotTemplate(t);
-            templateRef = { name: snap.name, version: snap.version, content_hash: snap.content_hash };
-          }
-        }
-
-        let brief = opts.brief;
-        if (opts.briefFile) {
-          brief = readFileSync(opts.briefFile, 'utf8');
-        }
-
-        const origin: TaskOrigin = { type: 'cli' };
-        let record = createTask({
-          title: opts.title,
-          brief,
-          brief_file: opts.briefFile,
-          template: templateRef,
-          origin,
-          idempotency_key: opts.idempotencyKey,
-          start: !opts.backlog,
+        const record = await taskRoomService(opts.configuration).createTask({
+          actor: { kind: 'local_control', surface: 'cli' }, title: opts.title,
+          brief: opts.brief, briefFile: opts.briefFile, template: opts.template,
+          backlog: opts.backlog, noRoom: opts.room === false,
+          idempotencyKey: opts.idempotencyKey, origin: { type: 'cli' },
         });
-
-        if (!opts.backlog && opts.room !== false && templateRef && !record.room_id) {
-          const template = resolveRoomTemplate(cfg, templateRef.name);
-          try {
-            await provisionRoom(cfg, {
-              name: opts.title,
-              goal: opts.title,
-              brief,
-              template,
-              taskId: record.task_id,
-              onCreated: room => {
-                record = updateTaskRoom(record.task_id, room.room_id, room.room_identity_cid!);
-              },
-            });
-            record = getTask(record.task_id);
-          } catch (error) {
-            if (error instanceof CoworkUnavailableError) {
-              blockTask(record.task_id, 'Cowork management socket is unavailable');
-            }
-            throw error;
-          }
-        }
 
         if (opts.json) {
           console.log(JSON.stringify({ schema_version: 1, task: record }, null, 2));
@@ -576,9 +525,13 @@ export function registerTaskCommands(parent: Command, cOpt: (cmd: Command) => Co
         }
         console.log(taskActionMarkdown('Task created', record, [
           { label: 'Title', value: record.title },
-          ...(templateRef ? [{ label: 'Template', value: `${templateRef.name}@${templateRef.version}`, kind: 'code' as const }] : []),
+          ...(record.template ? [{ label: 'Template', value: `${record.template.name}@${record.template.version}`, kind: 'code' as const }] : []),
         ]));
-      } catch (e) { if (opts.json) die(e); dieTaskRoom(e); }
+      } catch (e) {
+        if (e instanceof TaskRoomApplicationError && e.code === 'template_not_found')
+          e = taskRoomPublicError('template_not_found', { template: opts.template });
+        if (opts.json) die(e); dieTaskRoom(e);
+      }
     });
 
   cOpt(taskCmd.command('list'))
@@ -591,7 +544,8 @@ export function registerTaskCommands(parent: Command, cOpt: (cmd: Command) => Co
         if (opts.state && opts.state !== 'all') {
           stateFilter = opts.state as import('./types.js').TaskState;
         }
-        const tasks = listTasks(stateFilter ? { state: stateFilter } : undefined);
+        const tasks = taskRoomService(opts.configuration).listTasks(
+          stateFilter ? { state: stateFilter } : undefined);
         if (opts.json) {
           console.log(JSON.stringify({ schema_version: 1, tasks }, null, 2));
           return;
@@ -605,8 +559,7 @@ export function registerTaskCommands(parent: Command, cOpt: (cmd: Command) => Co
     .option('--json', 'JSON output')
     .action((id: string, opts: { json?: boolean }) => {
       try {
-        const t = getTask(id);
-        const room = t.room_id ? getRoomRecord(t.room_id) : undefined;
+        const { task: t, orchestration: room } = taskRoomService().getTask(id);
         if (opts.json) {
           console.log(JSON.stringify({
             schema_version: 1, task: t, orchestration: room ?? null,
@@ -645,29 +598,19 @@ export function registerTaskCommands(parent: Command, cOpt: (cmd: Command) => Co
     .option('--json', 'JSON output')
     .action(async (id: string, opts: { configuration?: string; json?: boolean }) => {
       try {
-        const cfg = loadCfg(opts);
-        let t = startTask(id);
-        if (t.template && !t.room_id) {
-          const template = resolveRoomTemplate(cfg, t.template.name);
-          if (!template || template.content_hash !== t.template.content_hash)
-            throw taskRoomPublicError('task_template_drift', {
-              template: `${t.template.name}@${t.template.version}`,
-            });
-          await provisionRoom(cfg, {
-            name: t.title,
-            goal: t.title,
-            brief: t.brief,
-            template,
-            taskId: t.task_id,
-            onCreated: room => {
-              t = updateTaskRoom(t.task_id, room.room_id, room.room_identity_cid!);
-            },
-          });
-          t = getTask(t.task_id);
-        }
+        const t = await taskRoomService(opts.configuration).startTask({
+          actor: { kind: 'local_control', surface: 'cli' }, taskId: id,
+        });
         if (opts.json) { console.log(JSON.stringify({ schema_version: 1, task: t }, null, 2)); return; }
         console.log(taskActionMarkdown('Task started', t));
-      } catch (e) { if (opts.json) die(e); dieTaskRoom(e); }
+      } catch (e) {
+        if (e instanceof TaskRoomApplicationError && e.code === 'task_template_drift')
+          e = taskRoomPublicError('task_template_drift', {
+            template: getTask(id).template
+              ? `${getTask(id).template!.name}@${getTask(id).template!.version}` : undefined,
+          });
+        if (opts.json) die(e); dieTaskRoom(e);
+      }
     });
 
   taskCmd.command('block <id>')
@@ -676,7 +619,9 @@ export function registerTaskCommands(parent: Command, cOpt: (cmd: Command) => Co
     .option('--json', 'JSON output')
     .action((id: string, opts: { reason: string; json?: boolean }) => {
       try {
-        const t = blockTask(id, opts.reason);
+        const t = taskRoomService().blockTask({
+          actor: { kind: 'local_control', surface: 'cli' }, taskId: id, reason: opts.reason,
+        });
         if (opts.json) { console.log(JSON.stringify({ schema_version: 1, task: t }, null, 2)); return; }
         console.log(taskActionMarkdown('Task blocked', t, [{ label: 'Reason', value: opts.reason }]));
       } catch (e) { if (opts.json) die(e); dieTaskRoom(e); }
@@ -687,7 +632,9 @@ export function registerTaskCommands(parent: Command, cOpt: (cmd: Command) => Co
     .option('--json', 'JSON output')
     .action((id: string, opts: { json?: boolean }) => {
       try {
-        const t = unblockTask(id);
+        const t = taskRoomService().unblockTask({
+          actor: { kind: 'local_control', surface: 'cli' }, taskId: id,
+        });
         if (opts.json) { console.log(JSON.stringify({ schema_version: 1, task: t }, null, 2)); return; }
         console.log(taskActionMarkdown('Task unblocked', t));
       } catch (e) { if (opts.json) die(e); dieTaskRoom(e); }
@@ -698,7 +645,9 @@ export function registerTaskCommands(parent: Command, cOpt: (cmd: Command) => Co
     .option('--json', 'JSON output')
     .action((id: string, opts: { json?: boolean }) => {
       try {
-        const t = reviewTask(id);
+        const t = taskRoomService().reviewTask({
+          actor: { kind: 'local_control', surface: 'cli' }, taskId: id,
+        });
         if (opts.json) { console.log(JSON.stringify({ schema_version: 1, task: t }, null, 2)); return; }
         console.log(taskActionMarkdown('Task ready for review', t));
       } catch (e) { if (opts.json) die(e); dieTaskRoom(e); }
@@ -714,24 +663,12 @@ export function registerTaskCommands(parent: Command, cOpt: (cmd: Command) => Co
         let summary = opts.summary;
         if (opts.summaryFile) summary = readFileSync(opts.summaryFile, 'utf8');
         const outcome = summary ? { summary } : undefined;
-        const current = getTask(id);
-        if (TASK_TERMINAL_STATES.includes(current.state))
-          throw new TaskStateError(`task ${id} is already in terminal state '${current.state}'`);
-        if (current.state !== 'review')
-          throw new TaskStateError(`cannot transition from '${current.state}' to 'done'`);
-        let roomId: string | undefined;
-        let cfg: FleetConfig | undefined;
-        if (current.room_id) {
-          cfg = loadCfg(opts);
-          const shouldClose = cfg.tasks?.close_room_on_done
-            ?? cfg.rooms?.defaults?.close_when_task_done
-            ?? false;
-          if (shouldClose) roomId = current.room_id;
-        }
-        await acceptTaskTerminalIntent({ taskId: id, kind: 'done', roomId, outcome });
-        const settled = roomId
+        const plan = await taskRoomService(opts.configuration).completeTask({
+          actor: { kind: 'local_control', surface: 'cli' }, taskId: id, outcome,
+        });
+        const settled = plan.settlementRequired
           ? await launchTaskSettleWorker(id, opts.configuration)
-          : { task: getTask(id), timedOut: false };
+          : { task: plan.task, timedOut: false };
         const t = settled.task;
         if (opts.json) { console.log(JSON.stringify({ schema_version: 1, task: t }, null, 2)); return; }
         if (settled.timedOut) {
@@ -754,16 +691,12 @@ export function registerTaskCommands(parent: Command, cOpt: (cmd: Command) => Co
       try {
         if (id !== confirmId)
           throw taskRoomPublicError('task_confirmation_mismatch');
-        const current = getTask(id);
-        if (!TASK_CANCELLABLE_STATES.includes(current.state))
-          throw new TaskStateError(`cannot cancel a '${current.state}' task`);
-        if (current.room_id) loadCfg(opts);
-        await acceptTaskTerminalIntent({
-          taskId: id, kind: 'cancelled', roomId: current.room_id,
+        const plan = await taskRoomService(opts.configuration).cancelTask({
+          actor: { kind: 'local_control', surface: 'cli' }, taskId: id,
         });
-        const settled = current.room_id
+        const settled = plan.settlementRequired
           ? await launchTaskSettleWorker(id, opts.configuration)
-          : { task: getTask(id), timedOut: false };
+          : { task: plan.task, timedOut: false };
         const t = settled.task;
         if (opts.json) { console.log(JSON.stringify({ schema_version: 1, task: t }, null, 2)); return; }
         if (settled.timedOut) {
@@ -784,7 +717,9 @@ export function registerTaskCommands(parent: Command, cOpt: (cmd: Command) => Co
     .action((id: string, confirmId: string, opts: { json?: boolean }) => {
       try {
         if (id !== confirmId) throw taskRoomPublicError('task_confirmation_mismatch');
-        const deleted = deleteTask(id);
+        const deleted = taskRoomService().deleteTask({
+          actor: { kind: 'local_control', surface: 'cli' }, taskId: id,
+        });
         if (opts.json) {
           console.log(JSON.stringify({ schema_version: 1, task_id: id, deleted }, null, 2));
           return;
@@ -801,64 +736,28 @@ export function registerTaskCommands(parent: Command, cOpt: (cmd: Command) => Co
     .option('--json', 'JSON output')
     .action(async (id: string, opts: { configuration?: string; json?: boolean }) => {
       try {
-        const cfg = loadCfg(opts);
-        let t = getTask(id);
-        let terminalTimedOut = false;
-        if (t.terminal_intent?.status === 'pending') {
-          const settled = await launchTaskSettleWorker(id, opts.configuration);
-          t = settled.task;
-          terminalTimedOut = settled.timedOut;
-        }
-        let room = t.room_id ? getRoomRecord(t.room_id) : undefined;
-        const result = {
-          task: t,
-          room: room ?? null,
-          recovery_actions: [] as string[],
-        };
-        if (terminalTimedOut) {
-          result.recovery_actions.push(`Terminal intent remains pending — retry task recover ${id}`);
-        }
-        if (t.state === 'provisioning' && room) {
-          if (room.provisioning_detail === 'waiting_cowork')
-            result.recovery_actions.push('Cowork management socket unreachable — check ours-cowork service');
-          if (room.provisioning_detail === 'waiting_owner_invite')
-            result.recovery_actions.push('Owner invite invalid or expired — rotate rooms.owner.public_invite in config');
-          if (room.provisioning_detail === 'owner_cid_mismatch')
-            result.recovery_actions.push('Owner CID mismatch — verify rooms.owner.expected_cid matches Messenger identity');
-          if (room.provisioning_detail === 'member_failed')
-            result.recovery_actions.push(`Member creation failed at saga step ${room.saga.step_index} — inspect and retry`);
-          if (room.provisioning_detail === 'waiting_seats')
-            result.recovery_actions.push('Members have not accepted their one-time room invites yet — inspect role logs, then retry recovery');
-
-          const resumable: import('./types.js').SagaPhase[] =
-            ['create_members', 'join_role_groups', 'wait_seats', 'launch_work', 'activate'];
-          if (resumable.includes(room.saga.phase)) {
-            const template = durableTaskRoomTemplate(t, room);
-            if (template) {
-              try {
-                await provisionMembers({
-                  cfg,
-                  cowork: coworkFor(cfg),
-                  roomId: room.room_id,
-                  taskId: t.task_id,
-                  template,
-                  binPath: getBinPath(),
-                  brief: t.brief,
-                  goal: t.title,
-                });
-                t = getTask(t.task_id);
-                room = getRoomRecord(room.room_id);
-                result.task = t;
-                result.room = room ?? null;
-                result.recovery_actions = ['Provisioning resumed successfully'];
-              } catch (error) {
-                result.recovery_actions.push(
-                  `Resume failed: ${error instanceof Error ? error.message : String(error)}`,
-                );
-              }
-            }
-          }
-        }
+        const app = taskRoomService(opts.configuration);
+        const actor = { kind: 'local_control' as const, surface: 'cli' as const };
+        const begin = await app.beginTaskRecovery({ actor, taskId: id });
+        const recovered = begin.kind === 'terminal_worker_required'
+          ? await (async () => {
+            const settled = await launchTaskSettleWorker(id, opts.configuration);
+            return app.continueTaskRecovery({ actor, taskId: id, terminalTimedOut: settled.timedOut });
+          })()
+          : begin.result;
+        const t = recovered.task;
+        const room = recovered.room;
+        const recoveryActions = recovered.issues.map(issue => {
+          if (issue.code === 'terminal_pending') return `Terminal intent remains pending — retry task recover ${id}`;
+          if (issue.code === 'waiting_cowork') return 'Cowork management socket unreachable — check ours-cowork service';
+          if (issue.code === 'waiting_owner_invite') return 'Owner invite invalid or expired — rotate rooms.owner.public_invite in config';
+          if (issue.code === 'owner_cid_mismatch') return 'Owner CID mismatch — verify rooms.owner.expected_cid matches Messenger identity';
+          if (issue.code === 'member_failed') return `Member creation failed at saga step ${issue.stepIndex} — inspect and retry`;
+          if (issue.code === 'waiting_seats') return 'Members have not accepted their one-time room invites yet — inspect role logs, then retry recovery';
+          if (issue.code === 'resume_failed') return `Resume failed: ${issue.error}`;
+          return 'Provisioning resumed successfully';
+        });
+        const result = { task: t, room: room ?? null, recovery_actions: recoveryActions };
         if (opts.json) {
           console.log(JSON.stringify({ schema_version: 1, ...result }, null, 2));
           return;
@@ -874,8 +773,8 @@ export function registerTaskCommands(parent: Command, cOpt: (cmd: Command) => Co
               { label: 'Saga', value: room.saga.phase, kind: 'code' as const },
             ] : []),
           ],
-          sections: result.recovery_actions.length
-            ? [{ heading: 'Next steps', items: result.recovery_actions }]
+          sections: recoveryActions.length
+            ? [{ heading: 'Next steps', items: recoveryActions }]
             : [{ heading: 'Result', items: ['No automated recovery action is available.'] }],
         }));
       } catch (e) { if (opts.json) die(e); dieTaskRoom(e); }
@@ -886,20 +785,48 @@ export function registerTaskCommands(parent: Command, cOpt: (cmd: Command) => Co
     .option('--json', 'JSON output')
     .action(async (id: string, opts: { configuration?: string; json?: boolean }) => {
       try {
-        const cfg = loadCfg(opts);
-        const t = await settleTaskTerminalIntent({ taskId: id, cowork: coworkFor(cfg) });
+        const app = taskRoomService(opts.configuration);
+        const t = await app.settleTask({
+          actor: { kind: 'internal_worker', surface: 'cli' }, taskId: id,
+        });
         if (opts.json) {
           console.log(JSON.stringify({ schema_version: 1, task: t }, null, 2));
           return;
         }
         console.log(taskActionMarkdown('Task terminal action settled', t));
       } catch (e) {
-        await recordTaskTerminalIntentError(
-          id, errorText(e), `External settle worker failed. Retry task recover ${id}.`,
-        ).catch(() => {});
+        await taskRoomService(opts.configuration).recordSettlementError({
+          actor: { kind: 'internal_worker', surface: 'cli' }, taskId: id,
+          error: errorText(e), recoveryHint: `External settle worker failed. Retry task recover ${id}.`,
+        }).catch(() => {});
         if (opts.json) die(e);
         dieTaskRoom(e);
       }
+    });
+
+  cOpt(taskCmd.command('_recover <id>', { hidden: true }))
+    .description('internal: settle and continue task recovery')
+    .option('--json', 'JSON output')
+    .action(async (id: string, opts: { configuration?: string; json?: boolean }) => {
+      const app = taskRoomService(opts.configuration);
+      const actor = { kind: 'internal_worker' as const, surface: 'cli' as const };
+      try {
+        const begin = await app.beginTaskRecovery({ actor, taskId: id });
+        const result = begin.kind === 'terminal_worker_required'
+          ? await (async () => {
+            try { await app.settleTask({ actor, taskId: id }); }
+            catch (error) {
+              await app.recordSettlementError({
+                actor, taskId: id, error: errorText(error),
+                recoveryHint: `External settle worker failed. Retry task recover ${id}.`,
+              }).catch(() => {});
+              throw error;
+            }
+            return app.continueTaskRecovery({ actor, taskId: id, terminalTimedOut: false });
+          })()
+          : begin.result;
+        console.log(JSON.stringify({ schema_version: 1, recovery: result }, null, 2));
+      } catch (e) { if (opts.json) die(e); dieTaskRoom(e); }
     });
 
   cOpt(taskCmd.command('work <id>'))
@@ -908,26 +835,11 @@ export function registerTaskCommands(parent: Command, cOpt: (cmd: Command) => Co
     .option('--json', 'JSON output')
     .action(async (id: string, opts: { configuration?: string; template?: string; json?: boolean }) => {
       try {
-        const cfg = loadCfg(opts);
-        let t = getTask(id);
-
-        if (TASK_TERMINAL_STATES.includes(t.state))
-          throw taskRoomPublicError('task_terminal', { task: id, state: t.state });
-
-        if (t.state === 'active' && t.room_id) {
-          // An explicit --template must agree with the room the task already
-          // runs in; a conflicting override is an error, not a silent no-op.
-          if (opts.template) {
-            const override = resolveTemplate(opts.template, allTemplates(cfg));
-            if (!override) throw taskRoomPublicError('template_not_found', { template: opts.template });
-            const overrideSnap = snapshotTemplate(override);
-            const roomSnap = getRoomRecord(t.room_id)?.template_snapshot ?? t.template;
-            if (roomSnap && (roomSnap.name !== overrideSnap.name || roomSnap.content_hash !== overrideSnap.content_hash))
-              throw taskRoomPublicError('template_mismatch', {
-                requested: `${overrideSnap.name}@${overrideSnap.version}`, room: t.room_id,
-                provisioned: `${roomSnap.name}@${roomSnap.version}`,
-              });
-          }
+        const result = await taskRoomService(opts.configuration).ensureTaskWork({
+          actor: { kind: 'local_control', surface: 'cli' }, taskId: id, template: opts.template,
+        });
+        const t = result.task;
+        if (result.status === 'already_active') {
           if (opts.json) {
             console.log(JSON.stringify({ schema_version: 1, task: t, status: 'already_active' }, null, 2));
             return;
@@ -936,108 +848,6 @@ export function registerTaskCommands(parent: Command, cOpt: (cmd: Command) => Co
             t.room_id ? [{ label: 'Room', value: t.room_id, kind: 'code' }] : []));
           return;
         }
-
-        // Select and validate the template snapshot before any state change or
-        // provisioning. An explicit --template re-pins the task; a stored ref
-        // must still match its snapshot (same contract as `task start`).
-        const existingRoom = t.room_id ? getRoomRecord(t.room_id) : undefined;
-        const durableSnapshot = existingRoom ? durableTaskRoomTemplate(t, existingRoom) : undefined;
-        const templateName = opts.template
-          ?? durableSnapshot?.name
-          ?? t.template?.name
-          ?? cfg.tasks?.default_room_template
-          ?? cfg.rooms?.defaults?.template
-          ?? 'single';
-        const resolved = durableSnapshot && !opts.template
-          ? undefined : resolveTemplate(templateName, allTemplates(cfg));
-        if (!durableSnapshot && !resolved)
-          throw taskRoomPublicError('template_not_found', { template: templateName });
-        if (opts.template && !resolved)
-          throw taskRoomPublicError('template_not_found', { template: templateName });
-        if (durableSnapshot && resolved) {
-          const requested = snapshotTemplate(resolved);
-          if (requested.name !== durableSnapshot.name
-              || requested.content_hash !== durableSnapshot.content_hash) {
-            throw taskRoomPublicError('template_mismatch', {
-              requested: `${requested.name}@${requested.version}`, room: existingRoom!.room_id,
-              provisioned: `${durableSnapshot.name}@${durableSnapshot.version}`,
-            });
-          }
-        }
-        const snap = durableSnapshot ?? snapshotTemplate(resolved!);
-        if (!opts.template && t.template && snap.content_hash !== t.template.content_hash)
-          throw taskRoomPublicError('task_template_drift', {
-            template: `${t.template.name}@${t.template.version}`,
-          });
-        // A provisioned room is pinned to its snapshot: never resume or re-pin
-        // an existing room under a different template.
-        if (t.room_id) {
-          const roomSnap = getRoomRecord(t.room_id)?.template_snapshot;
-          if (roomSnap && (roomSnap.name !== snap.name || roomSnap.content_hash !== snap.content_hash))
-            throw taskRoomPublicError('template_mismatch', {
-              requested: `${snap.name}@${snap.version}`, room: t.room_id,
-              provisioned: `${roomSnap.name}@${roomSnap.version}`,
-            });
-        }
-        let templateRef = t.template;
-        if (!templateRef || templateRef.name !== snap.name || templateRef.content_hash !== snap.content_hash) {
-          templateRef = { name: snap.name, version: snap.version, content_hash: snap.content_hash };
-          t = updateTaskTemplate(t.task_id, templateRef);
-        }
-
-        if (t.state === 'backlog') {
-          t = startTask(id);
-        }
-
-        if (!t.room_id) {
-          try {
-            await provisionRoom(cfg, {
-              name: t.title,
-              goal: t.title,
-              brief: t.brief,
-              template: snap,
-              taskId: t.task_id,
-              onCreated: room => {
-                t = updateTaskRoom(t.task_id, room.room_id, room.room_identity_cid!);
-              },
-            });
-            t = getTask(t.task_id);
-          } catch (error) {
-            if (error instanceof CoworkUnavailableError) {
-              blockTask(t.task_id, 'Cowork management socket is unavailable');
-            }
-            throw error;
-          }
-        } else if (t.state === 'provisioning') {
-          // The task already has a room mid-provisioning (e.g. seats were still
-          // pending on the last run). Resume it exactly as `task recover` does.
-          const room = getRoomRecord(t.room_id);
-          const resumable: import('./types.js').SagaPhase[] =
-            ['create_members', 'join_role_groups', 'wait_seats', 'launch_work', 'activate'];
-          if (room && resumable.includes(room.saga.phase)) {
-            try {
-              await provisionMembers({
-                cfg,
-                cowork: coworkFor(cfg),
-                roomId: room.room_id,
-                taskId: t.task_id,
-                template: snap,
-                binPath: getBinPath(),
-                brief: t.brief,
-                goal: t.title,
-              });
-            } catch (error) {
-              if (error instanceof CoworkUnavailableError) {
-                blockTask(t.task_id, 'Cowork management socket is unavailable');
-              }
-              throw error;
-            }
-            t = getTask(t.task_id);
-          } else {
-            throw taskRoomPublicError('task_non_resumable', { task: id, room: t.room_id });
-          }
-        }
-
         if (opts.json) {
           console.log(JSON.stringify({ schema_version: 1, task: t }, null, 2));
           return;
@@ -1047,15 +857,17 @@ export function registerTaskCommands(parent: Command, cOpt: (cmd: Command) => Co
           fields: [
             { label: 'ID', value: t.task_id, kind: 'code' },
             { label: 'Status', value: taskStatus(t.state), kind: 'markdown' },
-            ...(templateRef ? [{ label: 'Template', value: `${templateRef.name}@${templateRef.version}`, kind: 'code' as const }] : []),
+            ...(t.template ? [{ label: 'Template', value: `${t.template.name}@${t.template.version}`, kind: 'code' as const }] : []),
             ...(t.room_id ? [{ label: 'Room', value: t.room_id, kind: 'code' as const }] : []),
           ],
-          sections: t.member_roles.length ? [{
-            heading: 'Agents', markdownItems: t.member_roles.map(m =>
-              `${markdownCode(m.name)} — ${markdownProse(m.cowork_role)}`),
-          }] : [],
+          sections: t.member_roles.length ? [{ heading: 'Agents', markdownItems: t.member_roles.map(m =>
+            `${markdownCode(m.name)} — ${markdownProse(m.cowork_role)}`) }] : [],
         }));
-      } catch (e) { if (opts.json) die(e); dieTaskRoom(e); }
+      } catch (e) {
+        if (e instanceof TaskRoomApplicationError)
+          e = taskRoomPublicError(e.code as TaskRoomPublicErrorCode, e.fields);
+        if (opts.json) die(e); dieTaskRoom(e);
+      }
     });
 
   cOpt(taskCmd.command('finish <id>'))
@@ -1069,21 +881,13 @@ export function registerTaskCommands(parent: Command, cOpt: (cmd: Command) => Co
         if (opts.summaryFile) summary = readFileSync(opts.summaryFile, 'utf8');
         const outcome = summary ? { summary } : undefined;
 
-        let t = getTask(id);
-
-        if (TASK_TERMINAL_STATES.includes(t.state))
-          throw taskRoomPublicError('task_terminal_already', { task: id, state: t.state });
-
-        if (t.state === 'active') {
-          reviewTask(id);
-        }
-
-        if (t.room_id) loadCfg(opts); // validate configuration before durable acceptance
-        await acceptTaskTerminalIntent({ taskId: id, kind: 'done', roomId: t.room_id, outcome });
-        const settled = t.room_id
+        const plan = await taskRoomService(opts.configuration).finishTask({
+          actor: { kind: 'local_control', surface: 'cli' }, taskId: id, outcome,
+        });
+        const settled = plan.settlementRequired
           ? await launchTaskSettleWorker(id, opts.configuration)
-          : { task: getTask(id), timedOut: false };
-        t = settled.task;
+          : { task: plan.task, timedOut: false };
+        const t = settled.task;
 
         if (opts.json) {
           console.log(JSON.stringify({ schema_version: 1, task: t }, null, 2));
@@ -1099,7 +903,11 @@ export function registerTaskCommands(parent: Command, cOpt: (cmd: Command) => Co
         }
         console.log(taskActionMarkdown('Task finished', t,
           t.outcome ? [{ label: 'Summary', value: t.outcome.summary, multiline: true }] : []));
-      } catch (e) { if (opts.json) die(e); dieTaskRoom(e); }
+      } catch (e) {
+        if (e instanceof TaskRoomApplicationError)
+          e = taskRoomPublicError(e.code as TaskRoomPublicErrorCode, e.fields);
+        if (opts.json) die(e); dieTaskRoom(e);
+      }
     });
 }
 
@@ -1119,22 +927,9 @@ export function registerRoomCommands(parent: Command, cOpt: (cmd: Command) => Co
       goal?: string; brief?: string; briefFile?: string; json?: boolean;
     }) => {
       try {
-        const cfg = loadCfg(opts);
-        let brief = opts.brief;
-        if (opts.briefFile) brief = readFileSync(opts.briefFile, 'utf8');
-
-        let templateSnapshot;
-        if (opts.template) {
-          const t = resolveTemplate(opts.template, allTemplates(cfg));
-          if (!t) throw taskRoomPublicError('template_not_found', { template: opts.template });
-          templateSnapshot = snapshotTemplate(t);
-        }
-
-        const record = await provisionRoom(cfg, {
-          name: opts.name,
-          goal: opts.goal,
-          brief,
-          template: templateSnapshot,
+        const record = await taskRoomService(opts.configuration).createRoom({
+          actor: { kind: 'local_control', surface: 'cli' }, name: opts.name,
+          template: opts.template, goal: opts.goal, brief: opts.brief, briefFile: opts.briefFile,
         });
 
         if (opts.json) {
@@ -1143,7 +938,7 @@ export function registerRoomCommands(parent: Command, cOpt: (cmd: Command) => Co
         }
         console.log(roomActionMarkdown('Room created', record, [
           { label: 'Name', value: record.room_name },
-          ...(templateSnapshot ? [{ label: 'Template', value: `${templateSnapshot.name}@${templateSnapshot.version}`, kind: 'code' as const }] : []),
+          ...(record.template_snapshot ? [{ label: 'Template', value: `${record.template_snapshot.name}@${record.template_snapshot.version}`, kind: 'code' as const }] : []),
         ]));
       } catch (e) { if (opts.json) die(e); dieTaskRoom(e); }
     });
@@ -1154,23 +949,12 @@ export function registerRoomCommands(parent: Command, cOpt: (cmd: Command) => Co
     .option('--json', 'JSON output')
     .action(async (opts: { configuration?: string; state?: string; json?: boolean }) => {
       try {
-        const cfg = loadCfg(opts);
         if (opts.state && !['active', 'provisioning', 'all'].includes(opts.state))
           throw taskRoomPublicError('room_filter');
         const stateFilter = opts.state === 'active' || opts.state === 'provisioning'
           ? opts.state : undefined;
-        const adapter = coworkFor(cfg);
-        await deleteLegacyClosedRooms({ cowork: adapter });
-        const local = new Map(listRoomRecords().map(room => [room.room_id, room]));
-        const coworkRooms = await adapter.listRooms();
-        const rooms = coworkRooms
-          .filter(room => room.state === 'active' || room.state === 'provisioning')
-          .filter(room => {
-            const tracked = local.get(room.room_id);
-            return !tracked || tracked.state === 'active' || tracked.state === 'provisioning';
-          })
-          .filter(room => !stateFilter || room.state === stateFilter)
-          .map(room => ({ ...room, orchestration: local.get(room.room_id) ?? null }));
+        const rooms = await taskRoomService(opts.configuration).listRooms(
+          stateFilter ? { state: stateFilter } : undefined);
         if (opts.json) {
           console.log(JSON.stringify({ schema_version: 1, rooms }, null, 2));
           return;
@@ -1189,14 +973,8 @@ export function registerRoomCommands(parent: Command, cOpt: (cmd: Command) => Co
     .option('--json', 'JSON output')
     .action(async (id: string, opts: { configuration?: string; json?: boolean }) => {
       try {
-        const cfg = loadCfg(opts);
-        const tracked = getRoomRecord(id);
-        if (tracked?.state === 'closing' || tracked?.state === 'closed')
-          throw taskRoomPublicError('room_not_found', { room: id });
-        const cowork = await coworkFor(cfg).getRoom(id);
-        if (!cowork || cowork.state === 'closing' || cowork.state === 'closed')
-          throw taskRoomPublicError('room_not_found', { room: id });
-        const r = tracked;
+        const { room: cowork, orchestration: r } =
+          await taskRoomService(opts.configuration).getRoomDetail(id);
         if (opts.json) {
           console.log(JSON.stringify({ schema_version: 1, room: cowork, orchestration: r ?? null }, null, 2));
           return;
@@ -1230,13 +1008,7 @@ export function registerRoomCommands(parent: Command, cOpt: (cmd: Command) => Co
     .option('--json', 'JSON output')
     .action(async (id: string, opts: { configuration?: string; json?: boolean }) => {
       try {
-        const cfg = loadCfg(opts);
-        const tracked = getRoomRecord(id);
-        if (tracked?.state === 'closing' || tracked?.state === 'closed')
-          throw taskRoomPublicError('room_not_found', { room: id });
-        const room = await coworkFor(cfg).getRoom(id);
-        if (!room || room.state === 'closing' || room.state === 'closed')
-          throw taskRoomPublicError('room_not_found', { room: id });
+        const { room } = await taskRoomService(opts.configuration).getRoomDetail(id);
         const url = `http://localhost:4460/room/${id}`;
         if (opts.json) {
           console.log(JSON.stringify({ schema_version: 1, room_id: id, url, room_name: room.room_name }, null, 2));
@@ -1258,15 +1030,8 @@ export function registerRoomCommands(parent: Command, cOpt: (cmd: Command) => Co
     .option('--json', 'JSON output')
     .action(async (id: string, opts: { configuration?: string; json?: boolean }) => {
       try {
-        const cfg = loadCfg(opts);
-        const r = getRoomRecord(id);
-        if (r?.state === 'closing' || r?.state === 'closed')
-          throw taskRoomPublicError('room_not_found', { room: id });
-        const adapter = coworkFor(cfg);
-        const room = await adapter.getRoom(id);
-        if (!room || room.state === 'closing' || room.state === 'closed')
-          throw taskRoomPublicError('room_not_found', { room: id });
-        const members = await adapter.getSeats(id);
+        const { orchestration: r, members } =
+          await taskRoomService(opts.configuration).getRoomMembers(id);
         if (opts.json) {
           console.log(JSON.stringify({
             schema_version: 1,
@@ -1299,10 +1064,9 @@ export function registerRoomCommands(parent: Command, cOpt: (cmd: Command) => Co
   ): Promise<void> => {
       try {
         if (id !== confirmId) throw taskRoomPublicError('room_confirmation_mismatch');
-        coworkFor(loadCfg(opts));
-        const existing = getRoomRecord(id);
-        if (!existing) throw taskRoomPublicError('room_record_not_found', { room: id });
-        await acceptManagedRoomClose(id);
+        await taskRoomService(opts.configuration).requestRoomDeletion({
+          actor: { kind: 'local_control', surface: 'cli' }, roomId: id,
+        });
         const settled = await launchRoomDeleteWorker(id, opts.configuration);
         if (opts.json) {
           console.log(JSON.stringify({ schema_version: 1, room_id: id, deleted: settled.deleted }, null, 2));
@@ -1338,10 +1102,10 @@ export function registerRoomCommands(parent: Command, cOpt: (cmd: Command) => Co
     .option('--json', 'JSON output')
     .action(async (id: string, opts: { configuration?: string; json?: boolean }) => {
       try {
-        const cfg = loadCfg(opts);
-        const adapter = coworkFor(cfg);
-        let r = getRoomRecord(id);
-        if (r?.state === 'closing' || r?.state === 'closed') {
+        const recovered = await taskRoomService(opts.configuration).recoverRoom({
+          actor: { kind: 'local_control', surface: 'cli' }, roomId: id,
+        });
+        if (recovered.kind === 'deletion_worker_required') {
           const settled = await launchRoomDeleteWorker(id, opts.configuration);
           if (opts.json) {
             console.log(JSON.stringify({
@@ -1356,72 +1120,13 @@ export function registerRoomCommands(parent: Command, cOpt: (cmd: Command) => Co
             icon: settled.timedOut ? '⏳' : '🗑️',
             title: settled.timedOut ? 'Room deletion pending' : 'Room deleted',
             fields: [{ label: 'ID', value: id, kind: 'code' }],
-            sections: [{ heading: 'Next step', items: [
-              settled.timedOut
-                ? `Run ours-fleet room delete ${id} ${id} or room recover ${id} again.`
-                : 'No recovery action is needed.',
-            ] }],
+            sections: [{ heading: 'Next step', items: [settled.timedOut
+              ? `Run ours-fleet room delete ${id} ${id} or room recover ${id} again.`
+              : 'No recovery action is needed.'] }],
           }));
           return;
         }
-        const cowork = await adapter.recoverRoom(id);
-        r = getRoomRecord(id);
-        if (r && !r.owner_seat_cid
-          && (r.provisioning_detail === 'waiting_owner_invite'
-            || r.provisioning_detail === 'owner_cid_mismatch')) {
-          const expected = cfg.rooms!.owner.expected_cid.toLowerCase();
-          const existing = (await adapter.getSeats(id))
-            .find(seat => seat.identity_cid.toLowerCase() === expected && seat.seat_state !== 'removed');
-          if (!existing && !cfg.ownerInvite)
-            throw new ConfigError('rooms.owner: configure public_invite or public_invite_file before recovery');
-          let acceptedCid = existing?.identity_cid;
-          if (!acceptedCid) {
-            const accepted = await adapter.acceptInvite(id, cfg.ownerInvite!, {
-              role: cfg.rooms!.owner.role,
-              expected_cid: cfg.rooms!.owner.expected_cid,
-            });
-            acceptedCid = accepted.seat_cid;
-          }
-          setOwnerSeat(id, acceptedCid, cfg.ownerInviteFingerprint ?? '');
-          r = advanceSaga(id, 'create_members', 3);
-        }
-        const actions: string[] = [];
-        if (r?.saga.error) actions.push('A provisioning failure is recorded; inspect role logs for diagnostics.');
-        if (r?.saga.recovery_hint) actions.push('Recovery guidance is recorded; inspect role logs for diagnostics.');
-        if (r?.provisioning_detail === 'waiting_cowork')
-          actions.push('Check ours-cowork service status');
-        if (r?.provisioning_detail === 'waiting_owner_invite')
-          actions.push('Rotate rooms.owner.public_invite in config, then re-run recover');
-        if (r?.provisioning_detail === 'waiting_seats')
-          actions.push('Inspect temporary member logs for invite acceptance, then re-run recover');
-
-        if (r && r.state === 'provisioning') {
-          const resumable: import('./types.js').SagaPhase[] =
-            ['create_members', 'join_role_groups', 'wait_seats', 'launch_work', 'activate'];
-          if (resumable.includes(r.saga.phase) && r.template_snapshot) {
-            try {
-              const template = r.task_id
-                ? durableTaskRoomTemplate(getTask(r.task_id), r)
-                : r.template_snapshot;
-              if (template) {
-                await provisionMembers({
-                  cfg,
-                  cowork: adapter,
-                  roomId: r.room_id,
-                  taskId: r.task_id,
-                  template,
-                  binPath: getBinPath(),
-                  goal: r.room_name,
-                });
-                r = getRoomRecord(id);
-                actions.splice(0, actions.length, 'Provisioning resumed successfully');
-              }
-            } catch (error) {
-              actions.push(`Resume failed: ${error instanceof Error ? error.message : String(error)}`);
-            }
-          }
-        }
-
+        const { room: cowork, orchestration: r, issues: actions } = recovered;
         if (opts.json) {
           console.log(JSON.stringify({ schema_version: 1, room: cowork, orchestration: r ?? null, recovery_actions: actions }, null, 2));
           return;
@@ -1433,8 +1138,7 @@ export function registerRoomCommands(parent: Command, cOpt: (cmd: Command) => Co
             { label: 'Status', value: roomStatus(cowork.state), kind: 'markdown' },
             ...(r ? [{ label: 'Saga', value: r.saga.phase, kind: 'code' as const }] : []),
           ],
-          sections: actions.length
-            ? [{ heading: 'Next steps', items: actions }]
+          sections: actions.length ? [{ heading: 'Next steps', items: actions }]
             : [{ heading: 'Result', items: ['No recovery action is needed.'] }],
         }));
       } catch (e) { if (opts.json) die(e); dieTaskRoom(e); }
@@ -1444,8 +1148,10 @@ export function registerRoomCommands(parent: Command, cOpt: (cmd: Command) => Co
     id: string, opts: { configuration?: string; json?: boolean },
   ): Promise<void> => {
       try {
-        const cfg = loadCfg(opts);
-        const result = await deleteManagedRoom({ roomId: id, cowork: coworkFor(cfg) });
+        const app = taskRoomService(opts.configuration);
+        const result = await app.settleRoomDeletion({
+          actor: { kind: 'internal_worker', surface: 'cli' }, roomId: id,
+        });
         if (opts.json) {
           console.log(JSON.stringify({ schema_version: 1, ...result }, null, 2));
           return;
@@ -1455,9 +1161,10 @@ export function registerRoomCommands(parent: Command, cOpt: (cmd: Command) => Co
           fields: [{ label: 'ID', value: id, kind: 'code' }],
         }));
       } catch (e) {
-        await recordManagedRoomCloseError(
-          id, errorText(e), `External delete worker failed. Retry room delete ${id} ${id}.`,
-        ).catch(() => {});
+        await taskRoomService(opts.configuration).recordRoomSettlementError({
+          actor: { kind: 'internal_worker', surface: 'cli' }, roomId: id, error: errorText(e),
+          recoveryHint: `External delete worker failed. Retry room delete ${id} ${id}.`,
+        }).catch(() => {});
         if (opts.json) die(e);
         dieTaskRoom(e);
       }

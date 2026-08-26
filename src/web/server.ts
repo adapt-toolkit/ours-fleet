@@ -283,7 +283,7 @@ export async function buildWebServer(
     auth.authenticate(request);
     if (!ROLE_NAME_RE.test(request.params.id)) throw new FleetError('invalid_request', 'invalid role name');
     if (!services.removal) throw new FleetError('capability_unavailable', 'role removal is unavailable');
-    return services.removal.preview(request.params.id);
+    return services.removal.previewWeb(request.params.id);
   });
 
   app.post<{ Params: { id: string } }>('/api/v1/roles/:id/remove', async request => {
@@ -291,7 +291,7 @@ export async function buildWebServer(
     if (!ROLE_NAME_RE.test(request.params.id)) throw new FleetError('invalid_request', 'invalid role name');
     if (!services.removal) throw new FleetError('capability_unavailable', 'role removal is unavailable');
     const body = request.body as { confirmation?: string; confirmed?: boolean; coordinatorAcknowledged?: boolean };
-    const result = await services.removal.remove({ role: request.params.id, ...body });
+    const result = await services.removal.removeWeb({ role: request.params.id, ...body });
     events.publish('role.removed', { role: result.role }, result.role);
     await audit.record({ requestId: request.id, browser: session.id, roleId: result.role, action: 'role.remove', result: 'succeeded' });
     return result;

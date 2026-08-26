@@ -88,6 +88,8 @@ import {
   updateRoomRoleBriefing, setSagaError,
 } from '../src/rooms-tasks/room-state.js';
 import { CoworkUnavailableError } from '../src/rooms-tasks/cowork-adapter.js';
+import { TaskRoomApplicationService } from '../src/application/task-room-service.js';
+import { acceptTaskTerminalIntent } from '../src/rooms-tasks/terminal.js';
 
 const ROOM_ID = '01hzyk8m0000000000000000aa';
 
@@ -553,6 +555,17 @@ describe('task work', () => {
     expect(mocks.createRoom).not.toHaveBeenCalled();
   });
 
+  it('preserves the versioned CLI task-start drift error contract', async () => {
+    const t = createTask({
+      title: 'Drifted start', origin: { type: 'cli' }, start: false,
+      template: { name: 'team', version: 7, content_hash: 'f'.repeat(64) },
+    });
+    await expect(run('start', t.task_id, '--json')).rejects.toThrow(ExitError);
+    expect(out.join('\n')).toContain('team@7');
+    expect(getTask(t.task_id).state).toBe('provisioning');
+    expect(mocks.createRoom).not.toHaveBeenCalled();
+  });
+
   it('resumes a room stuck in waiting_seats: second work reaches active', async () => {
     // First provisioning run ends with seats pending, exactly as the real
     // provisionMembers does when getSeats reports inactive members.
@@ -758,6 +771,62 @@ describe('task finish', () => {
     });
   });
 
+  it('the hidden worker delegates settlement exactly once to the application service', async () => {
+    const t = await activeTask();
+    const settleTask = vi.spyOn(TaskRoomApplicationService.prototype, 'settleTask')
+      .mockResolvedValue({ ...t, state: 'done' });
+    await run('_settle', t.task_id);
+    expect(settleTask).toHaveBeenCalledOnce();
+    expect(settleTask).toHaveBeenCalledWith({
+      actor: { kind: 'internal_worker', surface: 'cli' }, taskId: t.task_id,
+    });
+  });
+
+  it('the recovery worker orders begin, settlement, then continuation', async () => {
+    const t = backlogTask();
+    const begin = vi.spyOn(TaskRoomApplicationService.prototype, 'beginTaskRecovery')
+      .mockResolvedValue({ kind: 'terminal_worker_required', taskId: t.task_id });
+    const settle = vi.spyOn(TaskRoomApplicationService.prototype, 'settleTask').mockResolvedValue(t);
+    const continuation = vi.spyOn(TaskRoomApplicationService.prototype, 'continueTaskRecovery')
+      .mockResolvedValue({ kind: 'no_op', task: t, room: undefined, issues: [] });
+    await run('_recover', t.task_id);
+    expect(begin).toHaveBeenCalledOnce();
+    expect(settle).toHaveBeenCalledOnce();
+    expect(continuation).toHaveBeenCalledWith({
+      actor: { kind: 'internal_worker', surface: 'cli' }, taskId: t.task_id, terminalTimedOut: false,
+    });
+    expect(begin.mock.invocationCallOrder[0]).toBeLessThan(settle.mock.invocationCallOrder[0]);
+    expect(settle.mock.invocationCallOrder[0]).toBeLessThan(continuation.mock.invocationCallOrder[0]);
+  });
+
+  it('the recovery worker records settlement failure and never continues', async () => {
+    mocks.deleteManagedRoom.mockRejectedValue(new Error('recovery settle failed'));
+    const t = await activeTask();
+    reviewTask(t.task_id);
+    await acceptTaskTerminalIntent({ taskId: t.task_id, kind: 'done', roomId: t.room_id });
+    const continuation = vi.spyOn(TaskRoomApplicationService.prototype, 'continueTaskRecovery');
+    await expect(run('_recover', t.task_id)).rejects.toThrow(ExitError);
+    expect(continuation).not.toHaveBeenCalled();
+    expect(getTask(t.task_id)).toMatchObject({ terminal_intent: {
+      status: 'pending', error: 'recovery settle failed',
+      recovery_hint: `External settle worker failed. Retry task recover ${t.task_id}.`,
+    } });
+  });
+
+  it('records a CLI settlement-worker launch failure through durable terminal state', async () => {
+    mocks.launchFleetWorker.mockRejectedValueOnce(new Error('worker spawn failed'));
+    const t = createTask({
+      title: 'Cancel launch failure', origin: { type: 'cli' }, start: false, room_id: ROOM_ID,
+    });
+    await expect(run('cancel', t.task_id, t.task_id)).rejects.toThrow(ExitError);
+    expect(getTask(t.task_id)).toMatchObject({
+      terminal_intent: {
+        status: 'pending', error: 'worker spawn failed',
+        recovery_hint: `External settle worker failed to start. Retry task recover ${t.task_id}.`,
+      },
+    });
+  });
+
   it('task recover resumes a pending terminal intent to convergence', async () => {
     mocks.deleteManagedRoom.mockRejectedValueOnce(new Error('room delete failed'));
     const t = await activeTask();
@@ -825,5 +894,34 @@ describe('task delete', () => {
     mocks.markdownRender.mockClear();
     await run('delete', t.task_id, t.task_id, '--json');
     expectExactJson({ schema_version: 1, task_id: t.task_id, deleted: false });
+  });
+});
+
+describe('internal room deletion workers', () => {
+  it.each(['_delete', '_close'])('%s delegates settlement exactly once', async alias => {
+    const settle = vi.spyOn(TaskRoomApplicationService.prototype, 'settleRoomDeletion')
+      .mockResolvedValueOnce({ room_id: ROOM_ID, deleted: true });
+    await runRoom(alias, ROOM_ID, '--json');
+    expect(settle).toHaveBeenCalledOnce();
+    expect(settle).toHaveBeenCalledWith({
+      actor: { kind: 'internal_worker', surface: 'cli' }, roomId: ROOM_ID,
+    });
+    settle.mockRestore();
+  });
+
+  it('records the durable recovery hint when settlement fails', async () => {
+    const settle = vi.spyOn(TaskRoomApplicationService.prototype, 'settleRoomDeletion')
+      .mockRejectedValueOnce(new Error('remote delete unavailable'));
+    const record = vi.spyOn(TaskRoomApplicationService.prototype, 'recordRoomSettlementError')
+      .mockResolvedValueOnce(undefined as never);
+    await expect(runRoom('_delete', ROOM_ID)).rejects.toThrow(ExitError);
+    expect(record).toHaveBeenCalledOnce();
+    expect(record).toHaveBeenCalledWith(expect.objectContaining({
+      actor: { kind: 'internal_worker', surface: 'cli' }, roomId: ROOM_ID,
+      error: 'remote delete unavailable',
+      recoveryHint: `External delete worker failed. Retry room delete ${ROOM_ID} ${ROOM_ID}.`,
+    }));
+    settle.mockRestore();
+    record.mockRestore();
   });
 });

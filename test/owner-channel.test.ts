@@ -8,7 +8,9 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import { OwnerChannel } from '../src/owner-channel/channel.js';
 import { ownerCommandHelp, type OwnerFleetOps } from '../src/owner-channel/commands.js';
-import { activateRoom, createRoomRecord, getRoomRecord } from '../src/rooms-tasks/room-state.js';
+import {
+  activateRoom, closeRoom, createRoomRecord, getRoomRecord,
+} from '../src/rooms-tasks/room-state.js';
 import {
   activateTask, createTask, getTask, reviewTask, startTask,
 } from '../src/rooms-tasks/task-state.js';
@@ -122,6 +124,8 @@ function setup(messages: unknown[], result = {
   accepted: true, outcome: 'completed' as const, succeeded: true, output: 'Agent answer',
 }, options: {
   interrupt?: boolean; queuedBehind?: number; fleet?: OwnerFleetOps; events?: SessionEvent[];
+  configPath?: string;
+  prepareRestart?: (role: string, mode: 'keep' | 'fresh') => Promise<void>;
 } = {}) {
   const dir = mkdtempSync(join(tmpdir(), 'ours-owner-channel-'));
   dirs.push(dir);
@@ -145,6 +149,8 @@ function setup(messages: unknown[], result = {
       interrupt: options.interrupt ?? false, progress_interval_ms: 0,
     },
     session, stateDir: dir, client, log: () => undefined,
+    ...(options.configPath ? { configPath: options.configPath } : {}),
+    prepareRestart: options.prepareRestart ?? (async () => undefined),
     ...(options.fleet ? { fleet: options.fleet } : {}),
   });
   return { channel, client, queuePrompt, interrupt, dir };
@@ -655,6 +661,7 @@ describe('OwnerChannel deterministic command dispatch', () => {
     list: vi.fn(async () => 'Coordinator: acp\nScout: 1 windows (created ...)'),
     closeRoom: vi.fn(async () => undefined),
     settleTask: vi.fn(async () => undefined),
+    recoverTask: vi.fn(async () => undefined),
   });
 
   it('returns help for an unknown slash command instead of forwarding it', async () => {
@@ -679,6 +686,8 @@ describe('OwnerChannel deterministic command dispatch', () => {
       for (const name of ['/help', '/status', '/interrupt', '/clear', '/compact',
         '/model <model-id>', '/restart', '/force-restart', '/ls', '/peek', '/worklog', '/version'])
         expect(sent).toContain(name);
+      expect(sent).not.toContain('/owner-channel');
+      expect(sent).not.toContain('/owner authorize');
     }
   });
 
@@ -744,10 +753,11 @@ describe('OwnerChannel deterministic command dispatch', () => {
 
   it('sends the restart notice and marks the wire handled before bouncing the role', async () => {
     const fleet = fakeFleet();
+    const prepareRestart = vi.fn(async (_role: string, _mode: 'keep' | 'fresh') => undefined);
     let sendsWhenRestarted = -1;
     let stateWhenRestarted = '';
     const { channel, client, queuePrompt, dir } = setup(
-      [ownerMessage(59, 'wire-restart', '/restart')], undefined, { fleet });
+      [ownerMessage(59, 'wire-restart', '/restart')], undefined, { fleet, prepareRestart });
     fleet.restart.mockImplementation(async () => {
       sendsWhenRestarted = client.calls.filter(call => call.name === 'sendMessage').length;
       stateWhenRestarted = existsSync(join(dir, '.owner-channel-state.json'))
@@ -755,6 +765,9 @@ describe('OwnerChannel deterministic command dispatch', () => {
     });
     await channel.drain();
     expect(queuePrompt).not.toHaveBeenCalled();
+    expect(prepareRestart).toHaveBeenCalledWith('Coordinator', 'keep');
+    expect(prepareRestart.mock.invocationCallOrder[0])
+      .toBeLessThan(fleet.restart.mock.invocationCallOrder[0]);
     expect(fleet.restart).toHaveBeenCalledOnce();
     expect(fleet.restart).toHaveBeenCalledWith('keep');
     // The confirmation left first and the wire was already durable: the restart
@@ -765,6 +778,21 @@ describe('OwnerChannel deterministic command dispatch', () => {
     expect(sent).toContain('/restart');
   });
 
+  it('does not acknowledge or launch a restart when shared preparation fails', async () => {
+    const fleet = fakeFleet();
+    const prepareRestart = vi.fn(async () => { throw new Error('role missing'); });
+    const { channel, client } = setup(
+      [ownerMessage(590, 'wire-restart-invalid', '/restart')], undefined,
+      { fleet, prepareRestart },
+    );
+    await channel.drain();
+    expect(prepareRestart).toHaveBeenCalledWith('Coordinator', 'keep');
+    expect(fleet.restart).not.toHaveBeenCalled();
+    const sends = client.calls.filter(call => call.name === 'sendMessage');
+    expect(sends).toHaveLength(1);
+    expect(String(sends[0].args?.text)).not.toContain('Restarting');
+  });
+
   it('persists and acknowledges room-close acceptance before launching the external worker', async () => {
     const fleet = fakeFleet();
     const fleetHome = mkdtempSync(join(tmpdir(), 'ours-owner-room-close-'));
@@ -772,12 +800,15 @@ describe('OwnerChannel deterministic command dispatch', () => {
     const previousHome = process.env.OURS_FLEET_HOME;
     process.env.OURS_FLEET_HOME = fleetHome;
     const roomId = '01hzyk8m0000000000000000aa';
+    const configPath = join(fleetHome, 'fleet.yaml');
+    writeFileSync(configPath, 'rooms:\n  owner:\n    expected_cid: ' + 'a'.repeat(64)
+      + '\n  defaults:\n    attach_owner: false\n');
     createRoomRecord({ room_id: roomId, room_name: 'Owner close' });
     activateRoom(roomId);
     const { channel, client, queuePrompt, dir } = setup(
       [ownerMessage(591, 'wire-room-close', `/room close ${roomId} ${roomId}`)],
       undefined,
-      { fleet },
+      { fleet, configPath },
     );
     let stateWhenSpawned = '';
     let wireWhenSpawned = '';
@@ -804,6 +835,42 @@ describe('OwnerChannel deterministic command dispatch', () => {
     expect(acknowledgement).not.toContain('Room closed');
   });
 
+  it('acknowledges and remembers closing-room recovery before one worker launch', async () => {
+    const fleet = fakeFleet();
+    const fleetHome = mkdtempSync(join(tmpdir(), 'ours-owner-room-recover-'));
+    dirs.push(fleetHome);
+    const previousHome = process.env.OURS_FLEET_HOME;
+    process.env.OURS_FLEET_HOME = fleetHome;
+    const roomId = '01hzyk8m0000000000000000ab';
+    const configPath = join(fleetHome, 'fleet.yaml');
+    writeFileSync(configPath, 'rooms:\n  owner:\n    expected_cid: ' + 'a'.repeat(64)
+      + '\n  defaults:\n    attach_owner: false\n');
+    createRoomRecord({ room_id: roomId, room_name: 'Owner recover' });
+    activateRoom(roomId);
+    closeRoom(roomId);
+    const { channel, client, queuePrompt, dir } = setup(
+      [ownerMessage(5911, 'wire-room-recover', `/room recover ${roomId}`)],
+      undefined, { fleet, configPath },
+    );
+    let wireWhenSpawned = '';
+    let sendsWhenSpawned = 0;
+    fleet.closeRoom.mockImplementation(async () => {
+      wireWhenSpawned = readFileSync(join(dir, '.owner-channel-state.json'), 'utf8');
+      sendsWhenSpawned = client.calls.filter(call => call.name === 'sendMessage').length;
+    });
+    try { await channel.drain(); }
+    finally {
+      if (previousHome === undefined) delete process.env.OURS_FLEET_HOME;
+      else process.env.OURS_FLEET_HOME = previousHome;
+    }
+    expect(queuePrompt).not.toHaveBeenCalled();
+    expect(fleet.closeRoom).toHaveBeenCalledTimes(1);
+    expect(fleet.closeRoom).toHaveBeenCalledWith(roomId);
+    expect(wireWhenSpawned).toContain('wire-room-recover');
+    expect(sendsWhenSpawned).toBeGreaterThan(0);
+    expect(lastReply(client)).toContain('deletion recovery is still being settled');
+  });
+
   it('persists task terminal intent and the wire before launching its external worker', async () => {
     const fleet = fakeFleet();
     const fleetHome = mkdtempSync(join(tmpdir(), 'ours-owner-task-settle-'));
@@ -821,10 +888,12 @@ describe('OwnerChannel deterministic command dispatch', () => {
       room_id: task.room_id!, room_name: 'Owner task room', task_id: task.task_id,
     });
     activateRoom(task.room_id!);
+    const configPath = join(fleetHome, 'fleet.yaml');
+    writeFileSync(configPath, 'tasks:\n  close_room_on_done: true\n');
     const { channel, client, dir } = setup(
       [ownerMessage(592, 'wire-task-settle', `/task done ${task.task_id} shipped`)],
       undefined,
-      { fleet },
+      { fleet, configPath },
     );
     let intentWhenSpawned = '';
     let wireWhenSpawned = '';
@@ -854,6 +923,36 @@ describe('OwnerChannel deterministic command dispatch', () => {
       state: 'review',
       terminal_intent: { kind: 'done', outcome: { summary: 'shipped' }, status: 'pending' },
     });
+  });
+
+  it('completes Messenger done without settlement when close_on_done is false', async () => {
+    const fleet = fakeFleet();
+    const fleetHome = mkdtempSync(join(tmpdir(), 'ours-owner-task-no-close-'));
+    dirs.push(fleetHome);
+    const previousHome = process.env.OURS_FLEET_HOME;
+    process.env.OURS_FLEET_HOME = fleetHome;
+    const configPath = join(fleetHome, 'fleet.yaml');
+    writeFileSync(configPath, 'tasks:\n  close_room_on_done: false\n');
+    const task = createTask({
+      title: 'Owner done without close', origin: { type: 'owner_channel' }, start: true,
+      room_id: '01hzyk8m0000000000000000ae',
+    });
+    activateTask(task.task_id);
+    reviewTask(task.task_id);
+    const { channel, client } = setup(
+      [ownerMessage(594, 'wire-task-no-close', `/task done ${task.task_id}`)],
+      undefined, { fleet, configPath },
+    );
+    try {
+      await channel.drain();
+      expect(getTask(task.task_id).state).toBe('done');
+    } finally {
+      if (previousHome === undefined) delete process.env.OURS_FLEET_HOME;
+      else process.env.OURS_FLEET_HOME = previousHome;
+    }
+    expect(fleet.settleTask).not.toHaveBeenCalled();
+    expect(client.calls.some(call => String(call.args?.text).includes('Task terminal action complete')))
+      .toBe(true);
   });
 
   it('persists external task-settle launch failure without reporting terminal success', async () => {

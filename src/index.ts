@@ -31,7 +31,7 @@ export { RoleRepository } from './application/role-repository.js';
 export { FleetQueryService } from './application/fleet-query-service.js';
 export { AcpRoleSessionAdapter, TmuxRoleSessionAdapter } from './application/session-control.js';
 export { RoleCreationService } from './application/role-creation-service.js';
-export { RoleCommandService } from './application/role-command-service.js';
+export { RoleCommandService, RoleLifecycleService } from './application/role-command-service.js';
 export { StructuredLogService } from './application/log-service.js';
 export { roleCapabilities } from './application/capabilities.js';
 export { FleetError, normalizeError } from './application/errors.js';

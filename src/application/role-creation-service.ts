@@ -13,11 +13,15 @@ import {
 import { replaceFileAtomically } from '../atomic-file.js';
 import { stateRoot } from '../paths.js';
 import {
-  buildRoleConfig, spawnPermanent, spawnTemp, validateSpawnOpts,
+  buildRoleConfig, spawnDryRun, spawnPermanent, spawnTemp, validateSpawnOpts,
   type SpawnOpts, type SupervisorLauncher,
 } from '../spawn.js';
 import type { OpsDeps } from '../ops.js';
+import type { ResolvedRole } from '../config.js';
 import { FleetError, normalizeError } from './errors.js';
+import { inheritCallerSpawnDefaults, type ManagedFleetSpawnResult } from '../fleet-proxy.js';
+import { effectivePermissionMode } from '../permissions.js';
+import { effectiveRoleModel } from '../model-env.js';
 import {
   claudeModelCatalog, codexModelCatalog, type HarnessModelCatalog, type HarnessModelOption,
 } from './model-catalog.js';
@@ -134,7 +138,13 @@ export interface RoleCreationServiceOptions {
   probeReady?: (name: string, session: 'acp' | 'tmux') => Promise<'ready' | 'attention' | 'unknown'>;
   onProgress?: (action: CreationAction) => void;
   modelCatalogs?: Partial<Record<'codex' | 'claude-code', () => HarnessModelCatalog>>;
+  /** Direct/managed callers must not create or restore the web action journal. */
+  journal?: boolean;
 }
+
+export type CreationPlan =
+  | { origin: 'direct'; options: SpawnOpts; preview: ReturnType<typeof spawnDryRun> }
+  | { origin: 'managed'; options: SpawnOpts; preview: ReturnType<typeof spawnDryRun>; caller: string; inherited: string[] };
 
 const canonical = (value: unknown): string => {
   if (Array.isArray(value)) return `[${value.map(canonical).join(',')}]`;
@@ -160,9 +170,54 @@ export class RoleCreationService {
 
   constructor(private readonly options: RoleCreationServiceOptions) {
     this.journalDir = options.journalDir ?? `${stateRoot()}/web/creation-actions`;
-    mkdirSync(this.journalDir, { recursive: true, mode: 0o700 });
+    if (options.journal !== false) mkdirSync(this.journalDir, { recursive: true, mode: 0o700 });
     this.identityProvisioner = options.identityProvisioner ?? daemonIdentityProvisioner();
-    this.restore();
+    if (options.journal !== false) this.restore();
+  }
+
+  previewSpawn(input: { origin: 'direct'; options: SpawnOpts }
+    | { origin: 'managed'; caller: ResolvedRole; options: SpawnOpts }): CreationPlan {
+    if (input.origin === 'direct') {
+      const options = { ...input.options, surface: 'cli' as const };
+      return { origin: 'direct', options, preview: spawnDryRun(options) };
+    }
+    const inherited = inheritCallerSpawnDefaults(
+      input.caller, input.options, this.options.configPath,
+    );
+    const options = { ...inherited.options, surface: 'agent' as const,
+      callerRole: input.caller.name };
+    return { origin: 'managed', options, caller: input.caller.name,
+      inherited: inherited.inherited, preview: spawnDryRun(options) };
+  }
+
+  async createDirect(options: SpawnOpts): Promise<{
+    plan: Extract<CreationPlan, { origin: 'direct' }>; statePath: string;
+  }> {
+    const plan = this.previewSpawn({ origin: 'direct', options }) as Extract<CreationPlan, { origin: 'direct' }>;
+    return { plan, statePath: await this.launchSync(plan.options) };
+  }
+
+  async createManaged(caller: ResolvedRole, requested: SpawnOpts): Promise<ManagedFleetSpawnResult> {
+    const plan = this.previewSpawn({ origin: 'managed', caller, options: requested }) as
+      Extract<CreationPlan, { origin: 'managed' }>;
+    const creationActionId = randomUUID();
+    plan.options.creationActionId = creationActionId;
+    const statePath = await this.launchSync(plan.options);
+    return {
+      caller: plan.caller, role: plan.options.name,
+      lifetime: plan.options.temp ? 'temporary' : 'permanent', statePath,
+      harness: plan.preview.resolvedRole.harness, session: plan.preview.resolvedRole.session,
+      ...(effectiveRoleModel(plan.preview.resolvedRole) ? { model: effectiveRoleModel(plan.preview.resolvedRole)! } : {}),
+      monitor: { mode: plan.preview.resolvedRole.monitor.mode, interrupt: plan.preview.resolvedRole.monitor.interrupt },
+      permissionMode: effectivePermissionMode(plan.preview.resolvedRole), inherited: plan.inherited,
+      creationActionId,
+    };
+  }
+
+  private launchSync(options: SpawnOpts, creation?: CreationDeps): Promise<string> {
+    return options.temp
+      ? spawnTemp(options, this.options.binPath, this.options.tempLauncher, creation)
+      : spawnPermanent(options, this.options.ops, creation);
   }
 
   async capabilities(): Promise<CreationCapabilities> {
@@ -353,13 +408,7 @@ export class RoleCreationService {
           : { exists: name => this.identityProvisioner.exists(name) },
         onStage: (stage, evidence) => this.coreStage(action, stage, evidence),
       };
-      if (preview.effective.lifetime === 'permanent') {
-        await spawnPermanent(this.spawnOptions(preview.request, action.actionId), this.options.ops, creation);
-      } else {
-        await spawnTemp(
-          this.spawnOptions(preview.request, action.actionId), this.options.binPath,
-          this.options.tempLauncher, creation);
-      }
+      await this.launchSync(this.spawnOptions(preview.request, action.actionId), creation);
       this.stage(action, 'launched', 'launch accepted; readiness not yet confirmed');
       this.stage(
         action, 'identity_bootstrap_pending',
@@ -411,6 +460,16 @@ export class RoleCreationService {
   }
 
   private validate(input: CreateRoleSessionRequest): CreateRoleSessionRequest {
+    const allowed = new Set([
+      'name', 'harness', 'model', 'reasoningEffort', 'session', 'cwd', 'lifetime', 'mission',
+      'coordinator', 'permissions', 'bio', 'persona', 'monitor', 'openAfterCreate',
+      'highRiskAcknowledged', 'reuseExistingIdentityAcknowledged',
+      'unverifiedIdentityAcknowledged',
+    ]);
+    const unsupported = Object.keys(input as unknown as Record<string, unknown>)
+      .filter(key => !allowed.has(key));
+    if (unsupported.length)
+      throw new FleetError('invalid_request', `unsupported web creation field: ${unsupported[0]}`);
     if (!ROLE_NAME_RE.test(input.name)) throw new FleetError('invalid_request', 'invalid role name');
     if (!['codex', 'claude-code'].includes(input.harness))
       throw new FleetError('invalid_request', 'unsupported harness');
@@ -461,7 +520,8 @@ export class RoleCreationService {
 
   private spawnOptions(request: CreateRoleSessionRequest, creationActionId?: string): SpawnOpts {
     return {
-      name: request.name, identity: request.name, harness: request.harness,
+      name: request.name, temp: request.lifetime === 'temporary',
+      identity: request.name, harness: request.harness,
       model: request.model, session: request.session, cwd: request.cwd,
       reasoningEffort: request.reasoningEffort,
       mission: request.mission, coordinator: request.coordinator,
