@@ -1,11 +1,11 @@
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import {
-  mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync,
+  mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync,
 } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
-  ConfigResourceLoadError, loadConfigResourceSnapshot,
+  ConfigResourceLoadError, loadConfigResourceSnapshot, loadConfigResourceSnapshotFromDocuments,
 } from '../src/config-resource-loader.js';
 
 let root: string;
@@ -51,6 +51,45 @@ beforeEach(() => {
 afterEach(() => rmSync(root, { recursive: true, force: true }));
 
 describe('secure typed resource discovery and graph snapshots', () => {
+  it('validates an in-memory proposed document set with disk-snapshot parity', () => {
+    const a = write('roles.d/a.yaml', role('A'));
+    const b = write('brains.d/b.yaml', brain('B'));
+    const disk = loadConfigResourceSnapshot({ bootstrapFile: bootstrap });
+    const proposed = loadConfigResourceSnapshotFromDocuments({
+      bootstrapFile: bootstrap,
+      bootstrapBytes: readFileSync(bootstrap),
+      configDir,
+      documents: [
+        { relativePath: 'brains.d/b.yaml', bytes: readFileSync(b) },
+        { relativePath: 'roles.d/a.yaml', bytes: readFileSync(a) },
+      ],
+    });
+    expect(proposed.digest).toBe(disk.digest);
+    expect(proposed.sources).toEqual(disk.sources);
+    expect(proposed.resources).toEqual(disk.resources);
+    expect(Object.isFrozen(proposed.resources.Role?.A.spec)).toBe(true);
+  });
+
+  it('rejects invalid or duplicate proposed document paths before graph validation', () => {
+    const base = {
+      bootstrapFile: bootstrap, bootstrapBytes: readFileSync(bootstrap), configDir,
+    };
+    expect(() => loadConfigResourceSnapshotFromDocuments({
+      ...base, documents: [{ relativePath: '../roles.d/a.yaml', bytes: Buffer.from(role('A')) }],
+    })).toThrow(/invalid proposed typed path/u);
+    expect(() => loadConfigResourceSnapshotFromDocuments({
+      ...base,
+      documents: [
+        { relativePath: 'roles.d/a.yaml', bytes: Buffer.from(role('A')) },
+        { relativePath: 'roles.d/a.yaml', bytes: Buffer.from(role('B')) },
+      ],
+    })).toThrow(/duplicate proposed typed path/u);
+    expect(() => loadConfigResourceSnapshotFromDocuments({
+      ...base,
+      documents: [{ relativePath: 'roles.d/a.yaml', bytes: Buffer.from(role('A')) }],
+      limits: { maxFileBytes: 100, maxAggregateBytes: 100 },
+    })).toThrow(/aggregate byte limit/u);
+  });
   it('loads all six kinds in deterministic order and deeply freezes the snapshot', () => {
     write('roles.d/z.yaml', role('Worker'));
     write('roles.d/A.yaml', role('Coordinator'));

@@ -76,6 +76,12 @@ export interface ConfigResourceSnapshot {
   diagnostics: readonly Readonly<LoaderDiagnostic>[];
 }
 
+export interface ConfigResourceDocument {
+  /** One-level typed path such as `roles.d/coordinator.yaml`. */
+  relativePath: string;
+  bytes: Buffer;
+}
+
 export class ConfigResourceLoadError extends Error {
   constructor(readonly sourceFile: string, readonly fieldPath: string, message: string) {
     super(`${sourceFile}:${fieldPath}: ${message}`);
@@ -246,6 +252,12 @@ function parseBootstrap(path: string, bytes: Buffer): Record<string, unknown> {
   return value;
 }
 
+export function resolveConfigResourceDirectory(bootstrapFile: string, bootstrapBytes: Buffer): string {
+  const path = resolve(bootstrapFile);
+  const bootstrap = parseBootstrap(path, bootstrapBytes);
+  return resolve(dirname(path), (bootstrap.config_dir as string | undefined) ?? 'fleet.conf.d');
+}
+
 function resolveBrain(ref: BrainRef, brains: Readonly<Record<string, TypedResource>>, source: string, path: string): BrainSpec {
   if (!('template' in ref)) return ref;
   const resource = brains[ref.template];
@@ -341,6 +353,119 @@ function graphValidate(
         `unknown RoomTemplate '${resource.spec.default_room_template}'`);
     if (resource.spec.brain) checkBrain(resource.spec.brain, source, '$.spec.brain', resource.id);
   }
+}
+
+/**
+ * Validate a complete proposed document set without consulting the filesystem.
+ * Transaction code supplies bytes already read through the secure disk loader's
+ * identity boundary; this seam performs the identical schema/graph/digest work
+ * without making staged files visible or rewriting bootstrap `config_dir`.
+ */
+export function loadConfigResourceSnapshotFromDocuments(options: {
+  bootstrapFile: string;
+  bootstrapBytes: Buffer;
+  configDir: string;
+  documents: readonly ConfigResourceDocument[];
+  validateBrain?: BrainValidationHook;
+  limits?: Partial<ResourceLoaderLimits>;
+}): ConfigResourceSnapshot {
+  const limits = { ...DEFAULT_RESOURCE_LOADER_LIMITS, ...(options.limits ?? {}) };
+  if (!Number.isSafeInteger(limits.maxFileBytes) || limits.maxFileBytes < 1
+      || !Number.isSafeInteger(limits.maxAggregateBytes)
+      || limits.maxAggregateBytes < limits.maxFileBytes)
+    throw new ConfigResourceLoadError(options.bootstrapFile, '$', 'invalid loader byte limits');
+  if (!Buffer.isBuffer(options.bootstrapBytes) || options.bootstrapBytes.length > limits.maxFileBytes)
+    throw new ConfigResourceLoadError(
+      options.bootstrapFile, '$', `bootstrap must be a Buffer within ${limits.maxFileBytes} bytes`);
+  let aggregate = options.bootstrapBytes.length;
+  for (const document of options.documents) {
+    if (!Buffer.isBuffer(document.bytes) || document.bytes.length > limits.maxFileBytes)
+      throw new ConfigResourceLoadError(
+        options.bootstrapFile, '$', `proposed document must be a Buffer within ${limits.maxFileBytes} bytes`);
+    aggregate += document.bytes.length;
+    if (aggregate > limits.maxAggregateBytes)
+      throw new ConfigResourceLoadError(options.bootstrapFile, '$', 'aggregate byte limit exceeded');
+  }
+  const bootstrapFile = resolve(options.bootstrapFile);
+  const configDir = resolve(options.configDir);
+  const bootstrap = parseBootstrap(bootstrapFile, options.bootstrapBytes);
+  const configuredDir = bootstrap.config_dir as string | undefined;
+  const selectedDir = resolve(dirname(bootstrapFile), configuredDir ?? 'fleet.conf.d');
+  if (selectedDir !== configDir)
+    throw new ConfigResourceLoadError(
+      bootstrapFile, '$.config_dir', 'proposed config_dir must match the transaction config directory');
+
+  const diagnostics: LoaderDiagnostic[] = [];
+  const sources: ConfigResourceSource[] = [];
+  const resources: Partial<Record<ResourceKind, Record<string, TypedResource>>> = {};
+  const hash = createHash('sha256');
+  digestPart(hash, 'bootstrap', options.bootstrapBytes);
+  const seenPaths = new Set<string>();
+  for (const document of options.documents) {
+    const parts = document.relativePath.split('/');
+    if (parts.length !== 2 || !parts[0] || !parts[1]
+        || !(parts[0] in DIRECTORY_KIND) || parts[1] === '.' || parts[1] === '..')
+      throw new ConfigResourceLoadError(
+        bootstrapFile, '$', `invalid proposed typed path '${document.relativePath}'`);
+  }
+  const ordered = [...options.documents].sort((left, right) => {
+    const [leftDir, leftName] = left.relativePath.split('/');
+    const [rightDir, rightName] = right.relativePath.split('/');
+    const dirs = Object.keys(DIRECTORY_KIND);
+    const directoryOrder = dirs.indexOf(leftDir) - dirs.indexOf(rightDir);
+    return directoryOrder || Buffer.compare(Buffer.from(leftName), Buffer.from(rightName));
+  });
+
+  for (const document of ordered) {
+    const parts = document.relativePath.split('/');
+    if (seenPaths.has(document.relativePath))
+      throw new ConfigResourceLoadError(
+        bootstrapFile, '$', `duplicate proposed typed path '${document.relativePath}'`);
+    seenPaths.add(document.relativePath);
+    const [directoryName, entryName] = parts as [keyof typeof DIRECTORY_KIND, string];
+    const sourceFile = join(configDir, directoryName, entryName);
+    const yaml = entryName.endsWith('.yaml') || entryName.endsWith('.yml');
+    if (!yaml) {
+      diagnostics.push({
+        severity: 'warning', code: 'ignored_entry', sourceFile,
+        message: 'ignored non-YAML entry in typed directory',
+      });
+      continue;
+    }
+    try { parseFleetDocument(sourceFile, document.bytes.toString('utf8'), 'strict'); }
+    catch (error) {
+      throw new ConfigResourceLoadError(
+        sourceFile, '$', error instanceof Error ? error.message : String(error));
+    }
+    let resource: TypedResource;
+    try { resource = parseTypedResource(sourceFile, document.bytes.toString('utf8')); }
+    catch (error) {
+      if (error instanceof ResourceValidationError) throw error;
+      throw new ConfigResourceLoadError(
+        sourceFile, '$', error instanceof Error ? error.message : String(error));
+    }
+    const expectedKind = DIRECTORY_KIND[directoryName];
+    if (resource.kind !== expectedKind)
+      throw new ConfigResourceLoadError(
+        sourceFile, '$.kind', `directory ${directoryName} requires kind ${expectedKind}`);
+    const byKind = resources[resource.kind] ??= Object.create(null) as Record<string, TypedResource>;
+    if (Object.hasOwn(byKind, resource.id))
+      throw new ConfigResourceLoadError(
+        sourceFile, '$.id', `duplicate ${resource.kind} id '${resource.id}'`);
+    byKind[resource.id] = resource;
+    const sha256 = createHash('sha256').update(document.bytes).digest('hex');
+    sources.push({
+      kind: resource.kind, id: resource.id, sourceFile, relativePath: document.relativePath,
+      size: document.bytes.length, sha256, resource,
+    });
+    digestPart(hash, `${resource.kind}:${document.relativePath}`, document.bytes);
+  }
+  graphValidate(sources, resources, options.validateBrain ?? (() => []));
+  return deepFreeze({
+    schemaVersion: 2 as const, bootstrapFile, configDir,
+    digest: `sha256:${hash.digest('hex')}`, bootstrap: structuredClone(bootstrap),
+    sources, resources, diagnostics,
+  });
 }
 
 export function loadConfigResourceSnapshot(options: {
