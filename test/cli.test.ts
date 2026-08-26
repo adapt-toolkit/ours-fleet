@@ -1,5 +1,12 @@
 import { describe, it, expect, beforeAll, beforeEach, afterEach } from 'vitest';
-import { existsSync, mkdirSync, mkdtempSync, rmSync } from 'node:fs';
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from 'node:fs';
 import { spawn } from 'node:child_process';
 import { once } from 'node:events';
 import { tmpdir } from 'node:os';
@@ -22,6 +29,18 @@ afterEach(() => rmSync(dir, { recursive: true, force: true }));
 
 const run = (args: string[]) =>
   realExec('node', [CLI, ...args], { env: { ...process.env, OURS_FLEET_HOME: dir } });
+
+const writeWatchdogReportFixture = () => {
+  writeFileSync(join(dir, 'fleet.yaml'), 'roles:\n  A: {}\nwatchdogs:\n  w: { coordinator: C }\n');
+  const reportsDir = join(dir, '.ours-fleet', 'watchdogs', 'w', 'reports');
+  mkdirSync(reportsDir, { recursive: true });
+  const fixture = JSON.parse(
+    readFileSync(resolve('test/fixtures/watchdog-good-report.json'), 'utf8'),
+  ) as Record<string, unknown>;
+  const report = { ...fixture, watchdog: 'w', run_id: '20260731T115000Z' };
+  writeFileSync(join(reportsDir, '20260731T115000Z.json'), JSON.stringify(report));
+  return report;
+};
 
 describe('ours-fleet CLI', () => {
   it('config --json emits a versioned deterministic plan without env secrets', async () => {
@@ -238,16 +257,7 @@ describe('ours-fleet CLI', () => {
   });
 
   it('watchdog-report shows latest, --list, run-id and --json', async () => {
-    const { writeFileSync, readFileSync } = await import('node:fs');
-    writeFileSync(join(dir, 'fleet.yaml'), 'roles:\n  A: {}\nwatchdogs:\n  w: { coordinator: C }\n');
-    const reportsDir = join(dir, '.ours-fleet', 'watchdogs', 'w', 'reports');
-    mkdirSync(reportsDir, { recursive: true });
-    const fixture = JSON.parse(
-      readFileSync(resolve('test/fixtures/watchdog-good-report.json'), 'utf8'),
-    ) as Record<string, unknown>;
-    const report = { ...fixture, watchdog: 'w', run_id: '20260731T115000Z' };
-    writeFileSync(join(reportsDir, '20260731T115000Z.json'), JSON.stringify(report));
-
+    const report = writeWatchdogReportFixture();
     const latest = await run(['watchdog-report', 'w']);
     expect(latest.code).toBe(0);
     expect(latest.stdout).toMatch(/w.*20260731T115000Z/s);
@@ -262,14 +272,20 @@ describe('ours-fleet CLI', () => {
     expect(one.code).toBe(0);
     expect(JSON.parse(one.stdout).run_id).toBe('20260731T115000Z');
     expect(one.stdout).toBe(JSON.stringify(report) + '\n'); // stored JSON, unmodified
+  });
 
+  it('watchdog-report history remains available with broken configuration', async () => {
+    writeWatchdogReportFixture();
     // CLI report history remains usable when configuration is removed or broken.
     // The web query deliberately propagates its cfgProvider failure instead.
     writeFileSync(join(dir, 'fleet.yaml'), 'roles: [broken\n');
     const historyFallback = await run(['watchdog-report', 'w', '--list', '--json']);
     expect(historyFallback.code).toBe(0);
     expect(JSON.parse(historyFallback.stdout).runs[0].runId).toBe('20260731T115000Z');
+  });
 
+  it('watchdog-report rejects missing runs and unknown watchdogs', async () => {
+    writeWatchdogReportFixture();
     const missing = await run(['watchdog-report', 'w', '29990101T000000Z']);
     expect(missing.code).toBe(1);
 
