@@ -9,6 +9,9 @@ import type {
   UnattendedCapability,
 } from './types.js';
 import { registerAdapter } from './registry.js';
+import {
+  translatePortablePermissionCodes,
+} from './brain-adapter.js';
 import { harnessRuntimeDir } from '../isolation/policy.js';
 import {
   resolveBundledAcpAgent, type AcpAgentResolution,
@@ -60,9 +63,7 @@ function sandboxMode(role: ResolvedRole): string | undefined {
   const s = (role.harness_options as CodexOptions | undefined)?.sandbox;
   if (s == null) {
     const filesystem = role.permissions?.filesystem;
-    if (filesystem === 'read-only') return 'read-only';
-    if (filesystem === 'unrestricted') return 'danger-full-access';
-    if (filesystem === 'workspace') return 'workspace-write';
+    if (filesystem) return translatePortablePermissionCodes('codex', role.permissions).legacyNative.sandbox;
     return undefined;
   }
   if (!SANDBOX_MODES.includes(s))
@@ -89,10 +90,9 @@ function modeForSandbox(sandbox: string | undefined): string | undefined {
 function acpAgentMode(role: ResolvedRole): string | undefined {
   const explicitSandbox = (role.harness_options as CodexOptions | undefined)?.sandbox;
   if (explicitSandbox != null) return modeForSandbox(sandboxMode(role));
-  if (role.permissions?.approval === 'allow') return 'agent-full-access';
-  if (role.permissions?.approval === 'auto') return 'agent';
-  const sandbox = sandboxMode(role);
-  return modeForSandbox(sandbox);
+  if (role.permissions)
+    return translatePortablePermissionCodes('codex', role.permissions).coupledAcpMode;
+  return undefined;
 }
 
 function acpModePermissions(mode: string | undefined): {
@@ -122,9 +122,8 @@ function approvalPolicy(role: ResolvedRole): string | undefined {
   const a = o?.approval ?? o?.permission_mode;
   if (a == null) {
     const approval = role.permissions?.approval;
-    if (approval === 'allow') return 'never';
-    if (approval === 'auto' || approval === 'deny') return 'on-request';
-    if (approval === 'ask') return 'untrusted';
+    if (approval)
+      return translatePortablePermissionCodes('codex', role.permissions).legacyNative.approval;
     return undefined;
   }
   if (!APPROVAL_POLICIES.includes(a))
@@ -413,13 +412,9 @@ export function makeCodexAdapter(exec: Exec = realExec): HarnessAdapter {
     },
 
     translatePermissions(permissions) {
-      const approval = permissions.approval === 'allow' ? 'never'
-        : permissions.approval === 'ask' ? 'untrusted' : 'on-request';
-      const sandbox = permissions.filesystem === 'read-only'
-        ? 'read-only'
-        : permissions.filesystem === 'unrestricted'
-          ? 'danger-full-access'
-          : 'workspace-write';
+      const translated = translatePortablePermissionCodes('codex', permissions);
+      const approval = translated.legacyNative.approval;
+      const sandbox = translated.legacyNative.sandbox;
       return {
         supported: true,
         native: { approval, sandbox },

@@ -36,6 +36,11 @@ const adapter = (value: BrainSpec, policy = permissions()): AdapterValidationRec
     approvalMode: policy.approval, filesystemMode: policy.filesystem,
     unattendedMode: policy.unattended, exact: true,
   },
+  enforcement: {
+    approval: { owner: 'native_adapter', policyDigest: `sha256:${'1'.repeat(64)}` },
+    filesystem: { owner: 'native_adapter', policyDigest: `sha256:${'1'.repeat(64)}` },
+    unattended: { owner: 'body_controller', policyDigest: `sha256:${'1'.repeat(64)}` },
+  },
 });
 class TestEvidenceAuthority implements AgentPlanEvidenceAuthority {
   private readonly creators = new WeakMap<object, { plan: AgentPlan; trusted: TrustedCreatorPlanBindings }>();
@@ -389,6 +394,9 @@ describe('pure AgentPlan resolution', () => {
     const arbitraryMode = baseInput();
     (arbitraryMode.adapter.nativeDescriptor as unknown as Record<string, unknown>).approvalMode = 'secret-value';
     expect(() => resolveAgentPlan(arbitraryMode)).toThrow(/approval mode code is invalid/u);
+    const wrongOwner = baseInput();
+    wrongOwner.adapter.enforcement.filesystem.owner = 'fleet_isolation';
+    expect(() => resolveAgentPlan(wrongOwner)).toThrow(/filesystem enforcement must belong/u);
   });
 
   it('is deterministic, deep-freezes output, records membership, and never mutates input', () => {

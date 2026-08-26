@@ -8,6 +8,9 @@ import type {
   ValidationError,
 } from './types.js';
 import { registerAdapter } from './registry.js';
+import {
+  translatePortablePermissionCodes,
+} from './brain-adapter.js';
 import { replaceFileAtomically, withFileLock, type LockDeps } from '../atomic-file.js';
 import { harnessRuntimeDir } from '../isolation/policy.js';
 import { bundledAcpAgent } from './acp-agent.js';
@@ -146,14 +149,13 @@ const PERMISSION_MODES = ['default', 'acceptEdits', 'plan', 'dontAsk', 'bypassPe
  * gets this; `ask` and `deny` are never elevated.
  */
 export function nativePermissionMode(
-  approval: ResolvedRole['permissions']['approval'],
+  approval: ResolvedRole['permissions']['approval'] | undefined,
 ): string | undefined {
-  switch (approval) {
-    case 'allow': return 'bypassPermissions';
-    case 'auto': return 'acceptEdits';
-    case 'deny': return 'plan';
-    default: return undefined;               // ask uses Claude's native default
-  }
+  if (approval === undefined) return undefined;
+  if (approval === 'deny') return 'plan';
+  const permissions = { approval, filesystem: 'workspace', unattended: 'deny' } as const;
+  const mode = translatePortablePermissionCodes('claude-code', permissions).legacyNative.permission_mode;
+  return mode === 'default' ? undefined : mode;
 }
 
 /**
@@ -486,7 +488,8 @@ export function makeClaudeCodeAdapter(exec: Exec = realExec): HarnessAdapter {
     },
 
     translatePermissions(permissions) {
-      const native = nativePermissionMode(permissions.approval) ?? 'default';
+      const native = translatePortablePermissionCodes('claude-code', permissions)
+        .legacyNative.permission_mode;
       const exact = permissions.filesystem === 'workspace' && permissions.approval === 'ask';
       return {
         supported: true,

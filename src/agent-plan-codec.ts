@@ -221,6 +221,11 @@ export function presentAgentPlan(plan: AgentPlan): Readonly<Record<string, unkno
         unattendedMode: plan.adapter.nativeDescriptor.unattendedMode,
         exact: plan.adapter.nativeDescriptor.exact,
       },
+      enforcement: {
+        approval: { ...plan.adapter.enforcement.approval },
+        filesystem: { ...plan.adapter.enforcement.filesystem },
+        unattended: { ...plan.adapter.enforcement.unattended },
+      },
     },
     authorizationRevision: plan.authorizationRevision,
     snapshotDigest: plan.snapshotDigest, planDigest: plan.planDigest, evaluatedAt: plan.evaluatedAt,
@@ -280,6 +285,7 @@ export function renderAgentPlanSummary(plan: AgentPlan): string {
     `Digests plan=${plan.planDigest} snapshot=${plan.snapshotDigest} brain=${plan.adapter.brainDigest} permissions=${plan.adapter.permissionsDigest}`,
     `Adapter id=${safe(plan.adapter.adapterId)} version=${safe(plan.adapter.adapterVersion)} policyRevision=${safe(plan.adapter.policyRevision)} policyDigest=${plan.adapter.policyDigest}`,
     `Native approval=${plan.adapter.nativeDescriptor.approvalMode} filesystem=${plan.adapter.nativeDescriptor.filesystemMode} unattended=${plan.adapter.nativeDescriptor.unattendedMode} exact=${plan.adapter.nativeDescriptor.exact}`,
+    `Enforcement approval=${plan.adapter.enforcement.approval.owner} filesystem=${plan.adapter.enforcement.filesystem.owner} unattended=${plan.adapter.enforcement.unattended.owner} policyDigest=${plan.adapter.policyDigest}`,
     `Role id=${safe(plan.role.id)} missionBytes=${plan.role.missionBytes} personaBytes=${plan.role.personaBytes}`,
     `Brain provenance ${humanBrainProvenance(plan.brainProvenance)}`,
     ...(['approval', 'filesystem', 'unattended'] as const).map(field =>

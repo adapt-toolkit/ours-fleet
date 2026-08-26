@@ -96,6 +96,10 @@ export interface AdapterValidationRecord {
     unattendedMode: 'deny' | 'wait' | 'native-deny' | 'native-block';
     exact: boolean;
   }>;
+  enforcement: Readonly<Record<PermissionField, Readonly<{
+    owner: 'native_adapter' | 'fleet_isolation' | 'body_controller';
+    policyDigest: string;
+  }>>>;
 }
 
 export interface OwnerDelegationGrant {
@@ -417,7 +421,7 @@ function validateAdapter(
 ): AdapterValidationRecord {
   object(value, 'adapter', [
     'redacted', 'adapterId', 'adapterVersion', 'policyRevision', 'policyDigest', 'brainDigest',
-    'permissionsDigest', 'portableDescriptor', 'nativeDescriptor',
+    'permissionsDigest', 'portableDescriptor', 'nativeDescriptor', 'enforcement',
   ]);
   if (value.redacted !== true) throw new AgentPlanResolutionError('adapter result must be explicitly redacted');
   for (const field of ['adapterId', 'adapterVersion', 'policyRevision'] as const) token(value[field], `adapter.${field}`);
@@ -448,6 +452,27 @@ function validateAdapter(
     throw new AgentPlanResolutionError('adapter native unattended mode code is invalid');
   if (typeof value.nativeDescriptor.exact !== 'boolean')
     throw new AgentPlanResolutionError('adapter native descriptor exact must be boolean');
+  if (value.nativeDescriptor.exact !== true)
+    throw new AgentPlanResolutionError('adapter native descriptor must prove exact enforcement');
+  object(value.enforcement, 'adapter.enforcement', ['approval', 'filesystem', 'unattended']);
+  for (const field of ['approval', 'filesystem', 'unattended'] as const) {
+    const enforcement = value.enforcement[field];
+    object(enforcement, `adapter.enforcement.${field}`, ['owner', 'policyDigest']);
+    if (!['native_adapter', 'fleet_isolation', 'body_controller'].includes(enforcement.owner))
+      throw new AgentPlanResolutionError(`adapter.enforcement.${field}.owner is invalid`);
+    if (enforcement.policyDigest !== value.policyDigest)
+      throw new AgentPlanResolutionError(`adapter.enforcement.${field} is bound to another policy`);
+    if (field === 'unattended' && enforcement.owner !== 'body_controller')
+      throw new AgentPlanResolutionError('adapter unattended enforcement must belong to body_controller');
+    if (field === 'approval' && enforcement.owner !== 'native_adapter')
+      throw new AgentPlanResolutionError('adapter approval enforcement must belong to native_adapter');
+    if (field === 'filesystem') {
+      const expectedOwner = value.nativeDescriptor.filesystemMode === 'external-isolation'
+        ? 'fleet_isolation' : 'native_adapter';
+      if (enforcement.owner !== expectedOwner)
+        throw new AgentPlanResolutionError(`adapter filesystem enforcement must belong to ${expectedOwner}`);
+    }
+  }
   return clone(value);
 }
 
