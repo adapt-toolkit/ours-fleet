@@ -3,7 +3,7 @@ import { SessionControlError } from '../session/types.js';
 import { CreationConflictError } from '../creation.js';
 
 export type FleetErrorCode =
-  | 'role_not_found' | 'capability_unavailable' | 'invalid_request'
+  | 'role_not_found' | 'resource_not_found' | 'capability_unavailable' | 'invalid_request'
   | 'offline' | 'control_unavailable' | 'timeout' | 'rejected'
   | 'backend_failure' | 'conflict' | 'stale_state'
   | 'prerequisite_unavailable' | 'idempotency_conflict'

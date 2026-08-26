@@ -58,9 +58,16 @@ exports[`task/room JSON presentation contract > pins every task --json serialize
           return;
         }",
   "if (opts.json) {
-          console.log(JSON.stringify({ schema_version: 1, tasks }, null, 2));
+          console.log(JSON.stringify(opts.groupByList
+            ? { schema_version: 1, groups: service.groupedTasks(filter) }
+            : { schema_version: 1, tasks }, null, 2));
           return;
         }",
+  "if (opts.json) { console.log(JSON.stringify({ schema_version: 1, lists }, null, 2)); return; }",
+  "if (opts.json) { console.log(JSON.stringify({ schema_version: 1, list }, null, 2)); return; }",
+  "if (opts.json) { console.log(JSON.stringify({ schema_version: 1, list }, null, 2)); return; }",
+  "if (opts.json) { console.log(JSON.stringify({ schema_version: 1, ...result }, null, 2)); return; }",
+  "if (opts.json) { console.log(JSON.stringify({ schema_version: 1, task }, null, 2)); return; }",
   "if (opts.json) {
           console.log(JSON.stringify({
             schema_version: 1, task: t, orchestration: room ?? null,

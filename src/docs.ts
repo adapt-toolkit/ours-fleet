@@ -361,6 +361,25 @@ Messenger-bound results are capped at 3,500 Unicode code points and 12,000 UTF-8
 bytes with structural omission notices. \`--json\` bypasses this presentation layer
 and retains the versioned machine schema and serialization order.
 
+Every task belongs to a named list. The built-in \`default\` list always exists,
+and legacy tasks or create calls without \`--list\` resolve to it. Use \`task lists\`,
+\`task list-create <name>\`, \`task list-rename <name> <new-name>\`, and
+\`task list-delete <name> [--move-to <destination>]\` to manage lists. A non-empty
+list cannot be deleted without an explicit, different destination; Fleet moves
+the assignments and never deletes the tasks. \`task move <id> --list <name>\`
+changes only organizational metadata. \`task list --list <name>\` filters and
+\`--group-by-list --json\` returns deterministic groups.
+
+List names are NFC-normalized, case-sensitive, and limited to 64 Unicode code
+points. Leading/trailing whitespace, controls, format/path characters, normalized
+duplicates, and the reserved exact name \`default\` are rejected. The authenticated
+owner channel provides the matching \`/task\` subcommands, while authenticated web
+clients use \`/api/v1/task-lists\`, \`/api/v1/tasks\`, and
+\`/api/v1/tasks/:id/list\`; every adapter delegates to the same application service.
+Messenger's multiline command grammar treats surrounding whitespace on each
+value line as transport framing; the canonical value passed to the shared service
+is the trimmed line. CLI arguments and REST strings are passed verbatim.
+
 Older prerelease files with the exact legacy \`provider: cowork\` key under
 \`rooms:\` still load, but the key is ignored and omitted from resolved
 configuration. Remove it when editing the file. Any other legacy value is an

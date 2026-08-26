@@ -27,6 +27,9 @@ import type { TopologyDraftStore } from './topology-draft-store.js';
 import type { TopologyPromoteService } from './topology-promote.js';
 import type { RoleRemovalService } from '../application/role-removal-service.js';
 import { ROLE_NAME_RE } from '../config.js';
+import type { TaskRoomApplicationService } from '../application/task-room-service.js';
+import { TaskListError } from '../rooms-tasks/task-lists.js';
+import { TaskStateError } from '../rooms-tasks/task-state.js';
 
 export interface WebServices {
   query: FleetQueryService;
@@ -43,6 +46,7 @@ export interface WebServices {
   topologyDrafts?: TopologyDraftStore;
   topologyPromote?: TopologyPromoteService;
   removal?: RoleRemovalService;
+  taskRooms?: TaskRoomApplicationService;
   terminalUpgrade?: (
     socket: WebSocket, request: FastifyRequest, roleId: string,
     ticket: string, hello: Record<string, unknown>,
@@ -58,7 +62,7 @@ export interface WebServer {
 }
 
 const statusFor = (code: string): number => ({
-  role_not_found: 404, unauthorized: 401, forbidden: 403, conflict: 409,
+  role_not_found: 404, resource_not_found: 404, unauthorized: 401, forbidden: 403, conflict: 409,
   idempotency_conflict: 409, stale_state: 409, rate_limited: 429,
   invalid_request: 400, capability_unavailable: 409, prerequisite_unavailable: 503,
 }[code] ?? 500);
@@ -191,6 +195,86 @@ export async function buildWebServer(
   app.get('/api/v1/roles', async request => {
     auth.authenticate(request);
     return { roles: await services.query.list() };
+  });
+
+  const taskApi = async <T>(fn: () => T | Promise<T>): Promise<T> => {
+    try { return await fn(); }
+    catch (error) {
+      if (error instanceof TaskListError) {
+        const code = error.code === 'list_not_found' ? 'resource_not_found'
+          : ['duplicate_name', 'destination_required', 'same_destination', 'default_immutable'].includes(error.code)
+            ? 'conflict' : 'invalid_request';
+        throw new FleetError(code, error.message);
+      }
+      if (error instanceof TaskStateError) {
+        throw new FleetError(error.message.startsWith('task not found:') ? 'resource_not_found' : 'conflict', error.message);
+      }
+      throw error;
+    }
+  };
+  const requireTaskRooms = (): TaskRoomApplicationService => {
+    if (!services.taskRooms) throw new FleetError('capability_unavailable', 'task operations are unavailable');
+    return services.taskRooms;
+  };
+
+  app.get('/api/v1/task-lists', async request => {
+    auth.authenticate(request);
+    return { lists: requireTaskRooms().listTaskLists() };
+  });
+  app.post('/api/v1/task-lists', async (request, reply) => {
+    auth.authenticate(request, true);
+    const name = String((request.body as { name?: unknown })?.name ?? '');
+    const list = await taskApi(() => requireTaskRooms().createTaskList({ actor: { kind: 'local_control', surface: 'web' }, name }));
+    reply.code(201); return { list };
+  });
+  app.patch('/api/v1/task-lists/:name', async request => {
+    auth.authenticate(request, true);
+    const name = (request.params as { name: string }).name;
+    const newName = String((request.body as { name?: unknown })?.name ?? '');
+    return { list: await taskApi(() => requireTaskRooms().renameTaskList({ actor: { kind: 'local_control', surface: 'web' }, name, newName })) };
+  });
+  app.delete('/api/v1/task-lists/:name', async request => {
+    auth.authenticate(request, true);
+    const name = (request.params as { name: string }).name;
+    const destination = (request.query as { destination?: string }).destination;
+    return taskApi(() => requireTaskRooms().deleteTaskList({ actor: { kind: 'local_control', surface: 'web' }, name, destination }));
+  });
+  app.get('/api/v1/tasks', async request => {
+    auth.authenticate(request);
+    const query = request.query as { state?: string; list?: string; groupByList?: string };
+    const states = ['backlog', 'provisioning', 'active', 'review', 'done', 'cancelled', 'failed'];
+    if (query.state && query.state !== 'all' && !states.includes(query.state))
+      throw new FleetError('invalid_request', 'invalid task state filter');
+    if (query.groupByList !== undefined && !['true', 'false'].includes(query.groupByList))
+      throw new FleetError('invalid_request', 'groupByList must be true or false');
+    const state = query.state && query.state !== 'all' ? query.state as import('../rooms-tasks/types.js').TaskState : undefined;
+    const filter = { ...(state ? { state } : {}), ...(query.list ? { list: query.list } : {}) };
+    return taskApi(() => query.groupByList === 'true'
+      ? { groups: requireTaskRooms().groupedTasks(filter) }
+      : { tasks: requireTaskRooms().listTasks(filter) });
+  });
+  app.post('/api/v1/tasks', async (request, reply) => {
+    auth.authenticate(request, true);
+    const body = request.body as Record<string, unknown>;
+    if (typeof body?.title !== 'string' || !body.title)
+      throw new FleetError('invalid_request', 'title is required');
+    const task = await taskApi(() => requireTaskRooms().createTask({
+      actor: { kind: 'local_control', surface: 'web' }, title: body.title as string,
+      brief: typeof body.brief === 'string' ? body.brief : undefined,
+      template: typeof body.template === 'string' ? body.template : undefined,
+      backlog: body.backlog === true, noRoom: body.noRoom === true,
+      list: typeof body.list === 'string' ? body.list : undefined,
+      idempotencyKey: typeof request.headers['idempotency-key'] === 'string'
+        ? request.headers['idempotency-key'] : undefined,
+      origin: { type: 'web' },
+    }));
+    reply.code(201); return { task };
+  });
+  app.patch('/api/v1/tasks/:id/list', async request => {
+    auth.authenticate(request, true);
+    const taskId = (request.params as { id: string }).id;
+    const list = String((request.body as { list?: unknown })?.list ?? '');
+    return { task: await taskApi(() => requireTaskRooms().moveTask({ actor: { kind: 'local_control', surface: 'web' }, taskId, list })) };
   });
 
   app.get('/api/v1/configuration', async request => {

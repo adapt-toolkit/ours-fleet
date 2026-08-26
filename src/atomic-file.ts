@@ -18,6 +18,8 @@ import { randomUUID } from 'node:crypto';
 export interface LockDeps {
   now?(): number;
   sleep?(ms: number): Promise<void>;
+  /** Test hook after a complete private claim is prepared, before atomic publication. */
+  beforePublish?(): void | Promise<void>;
 }
 
 /** The syscalls a replace depends on, injectable so faults can be forced deterministically. */
@@ -31,9 +33,9 @@ const DEFAULT_STALE_MS = 10_000;
 const POLL_MS = 25;
 
 /**
- * Run `fn` holding a cross-process lock. `mkdir` is atomic on every platform we
- * support, so the directory's existence IS the lock; the timestamp inside lets a
- * crashed holder's lock be broken rather than deadlocking the fleet forever.
+ * Run `fn` holding a cross-process lock. A fully populated private claim directory
+ * is atomically renamed to the canonical path, so contenders never observe partial
+ * ownership metadata; its timestamp lets a crashed holder be reclaimed safely.
  * Same strategy as the runner's launch gate, factored out so both use one.
  *
  * The lock is always released, including when `fn` throws.
@@ -47,21 +49,35 @@ export async function withFileLock<T>(
   const now = deps.now ?? (() => Date.now());
   const sleep = deps.sleep ?? ((ms: number) => new Promise<void>(r => { setTimeout(r, ms); }));
   const stampPath = join(lockPath, 'ts');
+  const ownerPath = join(lockPath, 'owner.json');
+  const token = randomUUID();
   mkdirSync(dirname(lockPath), { recursive: true });
 
   for (let waited = 0; ;) {
+    const claimPath = `${lockPath}.claim.${process.pid}.${randomUUID()}`;
     try {
-      mkdirSync(lockPath);
-      writeFileSync(stampPath, String(now()));
+      mkdirSync(claimPath);
+      writeFileSync(join(claimPath, 'ts'), String(now()));
+      writeFileSync(join(claimPath, 'owner.json'), JSON.stringify({ token, pid: process.pid }));
+      await deps.beforePublish?.();
+      renameSync(claimPath, lockPath);
       break;
     } catch (e) {
-      if ((e as NodeJS.ErrnoException).code !== 'EEXIST') throw e;
+      rmSync(claimPath, { recursive: true, force: true });
+      if (!['EEXIST', 'ENOTEMPTY'].includes((e as NodeJS.ErrnoException).code ?? '')) throw e;
       let held: number | null = null;
       try {
         const n = parseInt(readFileSync(stampPath, 'utf8').trim(), 10);
         held = Number.isFinite(n) ? n : null;
       } catch { /* holder died between mkdir and stamp */ }
-      if ((held !== null && now() - held > staleMs) || waited > staleMs * 2) {
+      let ownerAlive = false;
+      try {
+        const owner = JSON.parse(readFileSync(ownerPath, 'utf8')) as { pid?: number };
+        if (typeof owner.pid === 'number') {
+          try { process.kill(owner.pid, 0); ownerAlive = true; } catch { /* dead owner */ }
+        }
+      } catch { /* legacy or incomplete lock */ }
+      if (!ownerAlive && ((held !== null && now() - held > staleMs) || waited > staleMs * 2)) {
         rmSync(lockPath, { recursive: true, force: true });   // break a dead holder's lock
         continue;
       }
@@ -73,7 +89,10 @@ export async function withFileLock<T>(
   try {
     return await fn();
   } finally {
-    rmSync(lockPath, { recursive: true, force: true });
+    try {
+      const owner = JSON.parse(readFileSync(ownerPath, 'utf8')) as { token?: string };
+      if (owner.token === token) rmSync(lockPath, { recursive: true, force: true });
+    } catch { /* never remove a lock whose ownership cannot be proved */ }
   }
 }
 

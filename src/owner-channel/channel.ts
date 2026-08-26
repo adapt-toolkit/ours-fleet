@@ -1164,6 +1164,20 @@ export class OwnerChannel implements OwnerChannelHandle {
         actor: { kind: 'authenticated_owner', surface: 'messenger', cid: sender.id }, taskId,
       }),
       listTasks: filter => new TaskRoomApplicationService(this.options.configPath).listTasks(filter),
+      groupedTasks: filter => new TaskRoomApplicationService(this.options.configPath).groupedTasks(filter),
+      listTaskLists: () => new TaskRoomApplicationService(this.options.configPath).listTaskLists(),
+      createTaskList: name => new TaskRoomApplicationService(this.options.configPath).createTaskList({
+        actor: { kind: 'authenticated_owner', surface: 'messenger', cid: sender.id }, name,
+      }),
+      renameTaskList: (name, newName) => new TaskRoomApplicationService(this.options.configPath).renameTaskList({
+        actor: { kind: 'authenticated_owner', surface: 'messenger', cid: sender.id }, name, newName,
+      }),
+      deleteTaskList: (name, destination) => new TaskRoomApplicationService(this.options.configPath).deleteTaskList({
+        actor: { kind: 'authenticated_owner', surface: 'messenger', cid: sender.id }, name, destination,
+      }),
+      moveTask: (taskId, list) => new TaskRoomApplicationService(this.options.configPath).moveTask({
+        actor: { kind: 'authenticated_owner', surface: 'messenger', cid: sender.id }, taskId, list,
+      }),
       getTask: taskId => new TaskRoomApplicationService(this.options.configPath).getTask(taskId),
       blockTask: (taskId, reason) => new TaskRoomApplicationService(this.options.configPath).blockTask({
         actor: { kind: 'authenticated_owner', surface: 'messenger', cid: sender.id }, taskId, reason,

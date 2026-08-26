@@ -96,6 +96,38 @@ async function authenticated(overrides: Record<string, unknown> = {}) {
 }
 
 describe('secure local web host', () => {
+  it('exposes authenticated task-list and assignment routes through the shared service', async () => {
+    const task = { task_id: 'task-id', list_id: 'default', list_name: 'default' };
+    const taskRooms = {
+      listTaskLists: vi.fn(() => [{ list_id: 'default', name: 'default', built_in: true }]),
+      createTaskList: vi.fn(async ({ name }) => ({ list_id: 'list-id', name, built_in: false })),
+      renameTaskList: vi.fn(async ({ newName }) => ({ list_id: 'list-id', name: newName, built_in: false })),
+      deleteTaskList: vi.fn(async () => ({ deleted: { name: 'Work' }, moved: 1 })),
+      listTasks: vi.fn(() => [task]), groupedTasks: vi.fn(() => [{ list: { name: 'default' }, tasks: [task] }]),
+      createTask: vi.fn(async () => task), moveTask: vi.fn(async () => task),
+    };
+    const { server, cookie, csrf } = await authenticated({ taskRooms });
+    const readHeaders = { host: boundary.host, cookie };
+    const writeHeaders = { ...readHeaders, origin: boundary.origin, 'x-csrf-token': csrf };
+    expect((await server.app.inject({ method: 'GET', url: '/api/v1/task-lists', headers: readHeaders })).statusCode).toBe(200);
+    expect((await server.app.inject({ method: 'POST', url: '/api/v1/task-lists', headers: writeHeaders,
+      payload: { name: 'Work' } })).statusCode).toBe(201);
+    expect((await server.app.inject({ method: 'PATCH', url: '/api/v1/task-lists/Work', headers: writeHeaders,
+      payload: { name: 'Renamed' } })).statusCode).toBe(200);
+    expect((await server.app.inject({ method: 'DELETE', url: '/api/v1/task-lists/Renamed?destination=default',
+      headers: writeHeaders })).statusCode).toBe(200);
+    expect((await server.app.inject({ method: 'GET', url: '/api/v1/tasks?list=default&groupByList=true',
+      headers: readHeaders })).json()).toHaveProperty('groups');
+    expect((await server.app.inject({ method: 'POST', url: '/api/v1/tasks', headers: writeHeaders,
+      payload: { title: 'Task', backlog: true, list: 'default' } })).statusCode).toBe(201);
+    expect((await server.app.inject({ method: 'PATCH', url: '/api/v1/tasks/task-id/list', headers: writeHeaders,
+      payload: { list: 'default' } })).statusCode).toBe(200);
+    const rejected = await server.app.inject({ method: 'POST', url: '/api/v1/task-lists',
+      headers: readHeaders, payload: { name: 'No CSRF' } });
+    expect(rejected.statusCode).toBe(403);
+    expect(taskRooms.moveTask).toHaveBeenCalledWith(expect.objectContaining({ taskId: 'task-id', list: 'default' }));
+    await server.close();
+  });
   it('does not bridge browser device trust into owner-channel authorization management', async () => {
     const { server, cookie } = await authenticated();
     const response = await server.app.inject({

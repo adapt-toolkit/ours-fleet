@@ -29,6 +29,7 @@ import {
   renderMarkdownResult, roomStatus, taskStatus,
 } from './markdown.js';
 import { TaskRoomApplicationError, TaskRoomApplicationService } from '../application/task-room-service.js';
+import { TaskListError } from './task-lists.js';
 
 type TaskRoomPublicErrorCode =
   | 'task_confirmation_mismatch' | 'room_confirmation_mismatch'
@@ -167,6 +168,20 @@ function dieTaskRoom(e: unknown): never {
     process.stderr.write(`${output}\n`);
     process.exit(1);
   }
+  if (e instanceof TaskListError) {
+    const notFound = e.code === 'list_not_found';
+    const conflict = ['duplicate_name', 'reserved_name', 'default_immutable',
+      'destination_required', 'same_destination'].includes(e.code);
+    const output = renderMarkdownFailure({
+      kind: notFound ? 'not_found' : conflict ? 'state' : 'usage',
+      subject: 'ours-fleet task list',
+      detail: e.message,
+      action: notFound ? 'Run ours-fleet task lists to find a valid list.'
+        : conflict ? 'Choose a different list name or an explicit valid destination.'
+          : 'Use a valid NFC-normalized name of at most 64 Unicode code points.',
+    });
+    process.stderr.write(`${output}\n`); process.exit(1);
+  }
   const taskMissing = e instanceof TaskStateError
     ? /^task not found: ([A-Za-z0-9_-]{1,128})$/u.exec(e.message) : null;
   const roomMissing = e instanceof RoomStateError
@@ -198,6 +213,7 @@ const taskListMarkdown = (tasks: ReturnType<typeof listTasks>, title = 'Tasks'):
     icon: '📋', title, empty: 'No tasks found.',
     records: tasks.map(t =>
       `${taskStatus(t.state)} ${markdownCode(t.task_id)} — ${markdownProse(t.title)}`
+      + ` — List ${markdownCode(t.list_name ?? 'default')}`
       + (t.blocked ? ` — 🚧 Blocked: ${markdownProse(t.blocked.reason)}` : '')),
   });
 
@@ -209,6 +225,7 @@ const taskActionMarkdown = (
   fields: [
     { label: 'ID', value: task.task_id, kind: 'code' },
     { label: 'Status', value: taskStatus(task.state), kind: 'markdown' },
+    { label: 'List', value: task.list_name ?? 'default', kind: 'code' },
     ...fields,
   ],
 });
@@ -505,11 +522,12 @@ export function registerTaskCommands(parent: Command, cOpt: (cmd: Command) => Co
     .option('--backlog', 'create in backlog (do not start immediately)')
     .option('--no-room', 'create task without a room')
     .option('--idempotency-key <key>', 'idempotency key')
+    .option('--list <name>', 'task list (default: default)')
     .option('--json', 'JSON output')
     .action(async (opts: {
       configuration?: string; title: string; template?: string;
       brief?: string; briefFile?: string; backlog?: boolean;
-      room?: boolean; idempotencyKey?: string; json?: boolean;
+      room?: boolean; idempotencyKey?: string; list?: string; json?: boolean;
     }) => {
       try {
         const record = await taskRoomService(opts.configuration).createTask({
@@ -517,6 +535,7 @@ export function registerTaskCommands(parent: Command, cOpt: (cmd: Command) => Co
           brief: opts.brief, briefFile: opts.briefFile, template: opts.template,
           backlog: opts.backlog, noRoom: opts.room === false,
           idempotencyKey: opts.idempotencyKey, origin: { type: 'cli' },
+          list: opts.list,
         });
 
         if (opts.json) {
@@ -537,20 +556,83 @@ export function registerTaskCommands(parent: Command, cOpt: (cmd: Command) => Co
   cOpt(taskCmd.command('list'))
     .description('list tasks')
     .option('--state <state>', 'filter by state (backlog|active|provisioning|review|done|cancelled|failed|all)')
+    .option('--list <name>', 'filter by task list')
+    .option('--group-by-list', 'group deterministic results by list (JSON)')
     .option('--json', 'JSON output')
-    .action((opts: { configuration?: string; state?: string; json?: boolean }) => {
+    .action((opts: { configuration?: string; state?: string; list?: string; groupByList?: boolean; json?: boolean }) => {
       try {
         let stateFilter: import('./types.js').TaskState | undefined;
         if (opts.state && opts.state !== 'all') {
           stateFilter = opts.state as import('./types.js').TaskState;
         }
-        const tasks = taskRoomService(opts.configuration).listTasks(
-          stateFilter ? { state: stateFilter } : undefined);
+        const service = taskRoomService(opts.configuration);
+        const filter = { ...(stateFilter ? { state: stateFilter } : {}), ...(opts.list ? { list: opts.list } : {}) };
+        const tasks = service.listTasks(filter);
         if (opts.json) {
-          console.log(JSON.stringify({ schema_version: 1, tasks }, null, 2));
+          console.log(JSON.stringify(opts.groupByList
+            ? { schema_version: 1, groups: service.groupedTasks(filter) }
+            : { schema_version: 1, tasks }, null, 2));
           return;
         }
         console.log(taskListMarkdown(tasks));
+      } catch (e) { if (opts.json) die(e); dieTaskRoom(e); }
+    });
+
+  taskCmd.command('lists')
+    .description('list named task lists')
+    .option('--json', 'JSON output')
+    .action((opts: { json?: boolean }) => {
+      try {
+        const lists = taskRoomService().listTaskLists();
+        if (opts.json) { console.log(JSON.stringify({ schema_version: 1, lists }, null, 2)); return; }
+        console.log(renderMarkdownList({ icon: '📚', title: 'Task lists', empty: 'No task lists found.',
+          records: lists.map(list => `${markdownCode(list.name)}${list.built_in ? ' — built-in' : ''}`) }));
+      } catch (e) { if (opts.json) die(e); dieTaskRoom(e); }
+    });
+
+  taskCmd.command('list-create <name>')
+    .description('create a named task list')
+    .option('--json', 'JSON output')
+    .action(async (name: string, opts: { json?: boolean }) => {
+      try {
+        const list = await taskRoomService().createTaskList({ actor: { kind: 'local_control', surface: 'cli' }, name });
+        if (opts.json) { console.log(JSON.stringify({ schema_version: 1, list }, null, 2)); return; }
+        console.log(renderMarkdownResult({ icon: '📚', title: 'Task list created', fields: [{ label: 'Name', value: list.name }] }));
+      } catch (e) { if (opts.json) die(e); dieTaskRoom(e); }
+    });
+
+  taskCmd.command('list-rename <name> <new-name>')
+    .description('rename a named task list')
+    .option('--json', 'JSON output')
+    .action(async (name: string, newName: string, opts: { json?: boolean }) => {
+      try {
+        const list = await taskRoomService().renameTaskList({ actor: { kind: 'local_control', surface: 'cli' }, name, newName });
+        if (opts.json) { console.log(JSON.stringify({ schema_version: 1, list }, null, 2)); return; }
+        console.log(renderMarkdownResult({ icon: '📚', title: 'Task list renamed', fields: [{ label: 'Name', value: list.name }] }));
+      } catch (e) { if (opts.json) die(e); dieTaskRoom(e); }
+    });
+
+  taskCmd.command('list-delete <name>')
+    .description('delete a task list; non-empty lists require --move-to')
+    .option('--move-to <name>', 'destination for assigned tasks')
+    .option('--json', 'JSON output')
+    .action(async (name: string, opts: { moveTo?: string; json?: boolean }) => {
+      try {
+        const result = await taskRoomService().deleteTaskList({ actor: { kind: 'local_control', surface: 'cli' }, name, destination: opts.moveTo });
+        if (opts.json) { console.log(JSON.stringify({ schema_version: 1, ...result }, null, 2)); return; }
+        console.log(renderMarkdownResult({ icon: '🗑️', title: 'Task list deleted', fields: [{ label: 'Name', value: result.deleted.name }, { label: 'Tasks moved', value: String(result.moved) }] }));
+      } catch (e) { if (opts.json) die(e); dieTaskRoom(e); }
+    });
+
+  taskCmd.command('move <id>')
+    .description('move a task to another list without changing its lifecycle')
+    .requiredOption('--list <name>', 'destination task list')
+    .option('--json', 'JSON output')
+    .action(async (id: string, opts: { list: string; json?: boolean }) => {
+      try {
+        const task = await taskRoomService().moveTask({ actor: { kind: 'local_control', surface: 'cli' }, taskId: id, list: opts.list });
+        if (opts.json) { console.log(JSON.stringify({ schema_version: 1, task }, null, 2)); return; }
+        console.log(taskActionMarkdown('Task moved', task));
       } catch (e) { if (opts.json) die(e); dieTaskRoom(e); }
     });
 

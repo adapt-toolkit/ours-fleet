@@ -11,9 +11,14 @@ import {
 import {
   activateTask, blockTask as persistBlockTask, createTask as persistTask,
   deleteTask as persistDeleteTask, getTask as readTask, listTasks as readTasks,
+  moveTaskToList,
   reviewTask as persistReviewTask, startTask as transitionTask,
   TaskStateError, unblockTask as persistUnblockTask, updateTaskRoom, updateTaskTemplate,
 } from '../rooms-tasks/task-state.js';
+import {
+  createTaskListLocked, DEFAULT_TASK_LIST_ID, deleteTaskListRecordLocked, readTaskLists,
+  renameTaskListLocked, resolveTaskList, TaskListError, withTaskListsLock,
+} from '../rooms-tasks/task-lists.js';
 import { hashTemplate, listTemplates, resolveTemplate, snapshotTemplate } from '../rooms-tasks/templates.js';
 import {
   acceptManagedRoomClose, deleteLegacyClosedRooms, deleteManagedRoom, recordManagedRoomCloseError,
@@ -22,12 +27,12 @@ import {
   acceptTaskTerminalIntent, recordTaskTerminalIntentError, settleTaskTerminalIntent,
 } from '../rooms-tasks/terminal.js';
 import type {
-  RoomOrchestrationRecord, TaskOrigin, TaskOutcome, TaskRecord, TaskState, TemplateSnapshot,
+  RoomOrchestrationRecord, TaskListRecord, TaskOrigin, TaskOutcome, TaskRecord, TaskState, TemplateSnapshot,
 } from '../rooms-tasks/types.js';
 import { TASK_CANCELLABLE_STATES, TASK_TERMINAL_STATES } from '../rooms-tasks/types.js';
 
 export type TaskRoomActor =
-  | { kind: 'local_control'; surface: 'cli' }
+  | { kind: 'local_control'; surface: 'cli' | 'web' }
   | { kind: 'authenticated_owner'; surface: 'messenger'; cid: string }
   | { kind: 'internal_worker'; surface: 'cli' };
 
@@ -69,6 +74,7 @@ export interface CreateTaskRequest {
   noRoom?: boolean;
   idempotencyKey?: string;
   origin: TaskOrigin;
+  list?: string;
 }
 export interface CreateRoomRequest {
   actor: TaskRoomActor;
@@ -84,6 +90,7 @@ export interface TaskRoomServiceDeps {
   cowork?(config: FleetConfig): CoworkAdapter;
   binPath?(): string;
   provisionMembers?: typeof provisionMembers;
+  moveTaskToList?: typeof moveTaskToList;
 }
 
 /** Exact extraction of the previously CLI-owned task create/start behavior. */
@@ -101,11 +108,13 @@ export class TaskRoomApplicationService {
       name: template.name, version: template.version, content_hash: template.content_hash,
     };
     const brief = request.briefFile ? readFileSync(request.briefFile, 'utf8') : request.brief;
-    let task = persistTask({
-      title: request.title, brief, brief_file: request.briefFile, template: ref,
-      origin: request.origin, idempotency_key: request.idempotencyKey,
-      start: !request.backlog,
-      no_room: request.noRoom,
+    let task = await withTaskListsLock(() => {
+      const list = resolveTaskList(request.list ?? 'default');
+      return persistTask({
+        title: request.title, brief, brief_file: request.briefFile, template: ref,
+        origin: request.origin, idempotency_key: request.idempotencyKey,
+        start: !request.backlog, no_room: request.noRoom, listId: list.list_id,
+      });
     });
     if (!request.backlog && !request.noRoom && ref && !task.room_id) {
       try {
@@ -150,8 +159,61 @@ export class TaskRoomApplicationService {
     return task;
   }
 
-  listTasks(filter?: { state?: TaskState | TaskState[] }): TaskRecord[] {
-    return readTasks(filter);
+  listTasks(filter?: { state?: TaskState | TaskState[]; list?: string }): TaskRecord[] {
+    const listId = filter?.list === undefined ? undefined : resolveTaskList(filter.list).list_id;
+    return readTasks({ state: filter?.state, listId });
+  }
+
+  listTaskLists(): TaskListRecord[] { return readTaskLists(); }
+
+  groupedTasks(filter?: { state?: TaskState | TaskState[]; list?: string }): Array<{
+    list: TaskListRecord; tasks: TaskRecord[];
+  }> {
+    const tasks = this.listTasks(filter);
+    const lists = filter?.list ? [resolveTaskList(filter.list)] : readTaskLists();
+    return lists.map(list => ({ list, tasks: tasks.filter(task => task.list_id === list.list_id) }));
+  }
+
+  async createTaskList(input: { actor: TaskRoomActor; name: string }): Promise<TaskListRecord> {
+    return withTaskListsLock(() => createTaskListLocked(input.name));
+  }
+
+  async renameTaskList(input: {
+    actor: TaskRoomActor; name: string; newName: string;
+  }): Promise<TaskListRecord> {
+    return withTaskListsLock(() => renameTaskListLocked(input.name, input.newName));
+  }
+
+  async moveTask(input: {
+    actor: TaskRoomActor; taskId: string; list: string;
+  }): Promise<TaskRecord> {
+    return withTaskListsLock(() => {
+      const destination = resolveTaskList(input.list);
+      return (this.deps.moveTaskToList ?? moveTaskToList)(input.taskId, destination.list_id);
+    });
+  }
+
+  async deleteTaskList(input: {
+    actor: TaskRoomActor; name: string; destination?: string;
+  }): Promise<{ deleted: TaskListRecord; moved: number; destination?: TaskListRecord }> {
+    return withTaskListsLock(() => {
+      const source = resolveTaskList(input.name);
+      if (source.list_id === DEFAULT_TASK_LIST_ID)
+        throw new TaskListError('default_immutable', "the 'default' list cannot be deleted");
+      const assigned = readTasks({ listId: source.list_id });
+      let destination: TaskListRecord | undefined;
+      if (assigned.length) {
+        if (!input.destination)
+          throw new TaskListError('destination_required', `task list '${source.name}' is not empty; destination is required`);
+        destination = resolveTaskList(input.destination);
+        if (destination.list_id === source.list_id)
+          throw new TaskListError('same_destination', 'deletion destination must differ from the source list');
+        for (const task of assigned)
+          (this.deps.moveTaskToList ?? moveTaskToList)(task.task_id, destination.list_id);
+      }
+      deleteTaskListRecordLocked(source.list_id);
+      return { deleted: source, moved: assigned.length, destination };
+    });
   }
 
   getTask(taskId: string): {
