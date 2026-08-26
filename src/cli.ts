@@ -9,14 +9,14 @@ import { VERSION } from './version.js';
 import {
   analyzeInstalls, buildInfo, buildLabel, discoverInstalls, runningLabel,
 } from './provenance.js';
-import { agentDir, agentsRoot, tmpRoot, logsRoot, deriveXdgRuntimeDir, watchdogsRoot } from './paths.js';
+import { agentDir, agentsRoot, tmpRoot, logsRoot, deriveXdgRuntimeDir } from './paths.js';
 import { findRole, loadConfig, ROLE_NAME_RE } from './config.js';
 import type { YamlMode } from './config-yaml.js';
 import { formatDuration } from './duration.js';
 import { resolvedPlan } from './resolved-plan.js';
 import { Tmux, tmuxArgs } from './tmux.js';
 import { pickBackend } from './supervisor/index.js';
-import { up, down, restartRoles, rmRole, type OpsDeps } from './ops.js';
+import { up, down, type OpsDeps } from './ops.js';
 import { readRestartLedger, runSupervised, runTemp } from './runner.js';
 import { executeWatchdogRun, runWatchdogAgent } from './watchdog/run.js';
 import { readSchedulerState, resetSchedulerState, runScheduler, type WatchdogSchedulerState } from './watchdog/scheduler.js';
@@ -26,9 +26,8 @@ import {
   acquireRunLock, latestReport, listRuns, readReport, releaseRunLock, reportsDir, type RunListEntry,
 } from './watchdog/store.js';
 import type { WatchdogReport } from './watchdog/report.js';
-import {
-  lastProvenance, spawnDryRun, spawnPermanent, spawnTemp, type SpawnOpts,
-} from './spawn.js';
+import { watchdogAddressable } from './watchdog/query.js';
+import { lastProvenance, type SpawnOpts } from './spawn.js';
 import { stringify } from 'yaml';
 import { resolvedRolePlan } from './resolved-plan.js';
 import { creationBuildNote, formatProvenance, readProvenance } from './creation.js';
@@ -59,6 +58,13 @@ import {
 import './harness/claude-code.js';   // registers the claude-code adapter
 import './harness/codex.js';         // registers the codex adapter
 import { registerTemplateCommands, registerTaskCommands, registerRoomCommands } from './rooms-tasks/cli.js';
+import { RoleCreationService } from './application/role-creation-service.js';
+import { RoleRemovalService } from './application/role-removal-service.js';
+import { RoleRepository } from './application/role-repository.js';
+import { FleetQueryService } from './application/fleet-query-service.js';
+import {
+  executeRestartBatch, RoleLifecycleService,
+} from './application/role-command-service.js';
 
 // sudo/su shells lack XDG_RUNTIME_DIR, breaking every systemctl/journalctl
 // --user child (supervisor commands, logs, doctor). Derive it before dispatch. (#9)
@@ -72,6 +78,13 @@ const deps = (): OpsDeps => ({
   log: l => console.log(l),
   watchdogService: new WatchdogServiceManager(),
 });
+
+const roleLifecycle = (configPath: string | undefined, operationDeps: OpsDeps) => {
+  const repository = new RoleRepository({ configPath });
+  const query = new FleetQueryService({ repository, supervisor: operationDeps.backend });
+  return new RoleLifecycleService({ repository, ops: operationDeps, configPath,
+    status: async roleId => (await query.detail(roleId)).status });
+};
 
 const die = (e: unknown): never => { console.error(String(e instanceof Error ? e.message : e)); process.exit(1); };
 
@@ -332,14 +345,22 @@ cOpt(program.command('restart [names...]').description('re-sync config + bounce,
       }
       // Bare `restart` (no names) restarts every role — that meaning must
       // survive even though filtering an empty array also yields [].
-      if (names.length === 0 || roleNames.length > 0)
-        await restartRoles(cfg, roleNames, deps(), 'keep', opts.configuration);
+      if (names.length === 0 || roleNames.length > 0) {
+        const operationDeps = deps();
+        const lifecycle = roleLifecycle(opts.configuration, operationDeps);
+        await executeRestartBatch(lifecycle, { roleIds: roleNames, mode: 'keep', config: cfg });
+      }
     } catch (e) { die(e); }
   });
 
 cOpt(program.command('force-restart [names...]').description('re-sync + bounce FRESH (context wiped)'))
   .action(async (names, opts) => {
-    try { await restartRoles(loadConfig(opts.configuration), names, deps(), 'fresh', opts.configuration); } catch (e) { die(e); }
+    try {
+      const cfg = loadConfig(opts.configuration);
+      const operationDeps = deps();
+      const lifecycle = roleLifecycle(opts.configuration, operationDeps);
+      await executeRestartBatch(lifecycle, { roleIds: names, mode: 'fresh', config: cfg });
+    } catch (e) { die(e); }
   });
 
 program.command('ls').description('list running fleet sessions')
@@ -879,10 +900,11 @@ cOpt(ownerAuthorizationCommand.command('revoke <Role> <contact-cid>')
  * store.ts's own `watchdogDir` choke-point guard (defense in depth).
  */
 function watchdogKnown(name: string, configPath?: string): boolean {
+  let configured: string[] = [];
   try {
-    if (loadConfig(configPath).watchdogs.some(w => w.name === name)) return true;
+    configured = loadConfig(configPath).watchdogs.map(w => w.name);
   } catch { /* config missing/broken: fall through to the store check */ }
-  return ROLE_NAME_RE.test(name) && existsSync(joinPath(watchdogsRoot(), name));
+  return watchdogAddressable(name, configured);
 }
 
 function renderHeldDownLine(state: WatchdogSchedulerState): string | undefined {
@@ -1003,7 +1025,11 @@ cOpt(program.command('watchdog-report <name> [runId]')
 
 cOpt(program.command('rm <name>').description('stop + remove a role (temporary evidence is archived)'))
   .action(async (name, opts) => {
-    try { await rmRole(loadConfig(opts.configuration), name, deps()); } catch (e) { die(e); }
+    try {
+      await new RoleRemovalService({ configPath: opts.configuration, ops: deps() }).removeDirect({
+        actor: { kind: 'local_control', surface: 'cli' }, role: name,
+      });
+    } catch (e) { die(e); }
   });
 
 cOpt(program.command('spawn [name]').description('spawn a new agent (permanent by default)'))
@@ -1054,8 +1080,11 @@ cOpt(program.command('spawn [name]').description('spawn a new agent (permanent b
         dryRun: opts.dryRun, json: opts.json,
       };
       if (o.json && !o.dryRun) throw new Error('--json is currently valid only with --dry-run');
+      const creationDeps = deps();
+      const creation = new RoleCreationService({ configPath: opts.configuration,
+        ops: creationDeps, binPath, journal: false });
       if (o.dryRun) {
-        const result = spawnDryRun(o);
+        const result = creation.previewSpawn({ origin: 'direct', options: o }).preview;
         if (o.json) {
           process.stdout.write(`${JSON.stringify({
             schemaVersion: result.schemaVersion,
@@ -1097,12 +1126,13 @@ cOpt(program.command('spawn [name]').description('spawn a new agent (permanent b
         console.log(`→ watch it: ours-fleet peek ${result.role}   |   attach: ours-fleet attach ${result.role}`);
         return;
       }
-      const plannedPermissionMode = effectivePermissionMode(spawnDryRun(o).resolvedRole);
+      const created = await creation.createDirect(o);
+      const plannedPermissionMode = effectivePermissionMode(created.plan.preview.resolvedRole);
       if (o.temp) {
-        const dir = await spawnTemp(o, binPath);
+        const dir = created.statePath;
         console.log(`spawned temp agent '${roleName}' (state: ${dir}; gone on exit/reboot)`);
       } else {
-        const file = await spawnPermanent(o, deps());
+        const file = created.statePath;
         console.log(`spawned '${roleName}' (config: ${file})`);
       }
       // The same provenance that was persisted, so what the operator reads now

@@ -1,7 +1,7 @@
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { AuditSink } from '../../src/web/audit.js';
 import { WebAuth } from '../../src/web/auth.js';
@@ -58,11 +58,13 @@ describe('topology draft and promote routes', () => {
   async function authenticated() {
     const topology = async () => mergeTopology(
       loadConfig(file), loadConfig(file).roles.map(role => roleItem(role.name, role.mission)) as never, drafts.read());
+    const audit = new AuditSink(join(dir, 'audit'));
+    const events = { publish: vi.fn(), close: vi.fn() };
     const server = await buildWebServer({
       query: { async list() { return loadConfig(file).roles.map(role => roleItem(role.name, role.mission)); } },
       repository: {}, logs: {}, commands: {}, creation: {},
       async session() { return {}; },
-      audit: new AuditSink(join(dir, 'audit')),
+      audit, events,
       configuration,
       topology,
       topologyDrafts: drafts,
@@ -76,7 +78,7 @@ describe('topology draft and promote routes', () => {
     });
     const cookie = ([] as string[]).concat(exchange.headers['set-cookie'] ?? [])
       .map(value => value.split(';')[0]).join('; ');
-    return { server, cookie, csrf: exchange.json().csrfToken as string };
+    return { server, cookie, csrf: exchange.json().csrfToken as string, audit, events };
   }
 
   const sketch = (nodes: unknown[], edges: unknown[] = []) => ({
@@ -152,7 +154,7 @@ describe('topology draft and promote routes', () => {
   });
 
   it('adds a sketch to the configuration without launching anything', async () => {
-    const { server, cookie, csrf } = await authenticated();
+    const { server, cookie, csrf, audit, events } = await authenticated();
     const headers = { host: boundary.host, origin: boundary.origin, cookie, 'x-csrf-token': csrf };
     await drafts.write(drafts.read().revision,
       sketch([{ id: 'agent:Reviewer', kind: 'agent', fields: { mission: 'Review pull requests' } }]));
@@ -181,10 +183,15 @@ describe('topology draft and promote routes', () => {
     expect(readFileSync(file, 'utf8')).toContain('# operator header');
     expect(loadConfig(file).roles.map(role => role.name)).toEqual(['Alice', 'Reviewer']);
     expect(drafts.read().draft.drafts.nodes).toEqual([]);
+    expect(events.publish.mock.calls.map(call => call[0])).toEqual([
+      'configuration.changed', 'topology.draft.changed',
+    ]);
+    expect(audit.list().filter(event => event.action === 'topology.promote'))
+      .toMatchObject([{ result: 'succeeded' }]);
   });
 
   it('reports an incomplete sketch as a bad request with the reason', async () => {
-    const { server, cookie, csrf } = await authenticated();
+    const { server, cookie, csrf, audit, events } = await authenticated();
     const headers = { host: boundary.host, origin: boundary.origin, cookie, 'x-csrf-token': csrf };
     await drafts.write(drafts.read().revision, sketch([{ id: 'agent:Blank', kind: 'agent', fields: {} }]));
 
@@ -196,6 +203,8 @@ describe('topology draft and promote routes', () => {
     expect(response.statusCode).toBe(400);
     expect(response.json().error.message).toMatch(/not ready to add/);
     expect(readFileSync(file, 'utf8')).not.toContain('Blank');
+    expect(events.publish).not.toHaveBeenCalled();
+    expect(audit.list().some(event => event.action === 'topology.promote')).toBe(false);
   });
 
   it('rejects a malformed promote body and a stale configuration revision', async () => {

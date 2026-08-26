@@ -182,7 +182,39 @@ describe('owner-channel CLI', () => {
       action: 'task_report', taskId: TASK, phase: 'done',
       message: 'Specialist verification passed.\n',
     });
+    expect(calls.filter(call => call.action === 'owner_authorize')).toEqual([
+      { action: 'owner_authorize', cid: B },
+    ]);
+    expect(calls.filter(call => call.action === 'owner_revoke')).toEqual([
+      { action: 'owner_revoke', cid: B },
+    ]);
   }, CLI_INTEGRATION_TIMEOUT_MS);
+
+  it('validates owner CIDs before transport and acknowledges only a persisted success', async () => {
+    config();
+    const persisted = join(homeDir, 'owner-persisted');
+    const manage = vi.fn(async (request: OwnerChannelManagementRequest) => {
+      if (request.action !== 'owner_authorize') throw new Error('unexpected action');
+      writeFileSync(persisted, request.cid);
+      return {
+        action: request.action,
+        owner: { cid: request.cid, source: 'dynamic' as const, effective: true },
+      };
+    });
+    await startControl(manage);
+
+    const invalid = await run([
+      'owner-channel', 'owner', 'authorize', 'PhoneRole', '../not-a-cid',
+    ]);
+    expect(invalid.code).toBe(1);
+    expect(invalid.stderr).toContain('contact CID must be exactly 64 hexadecimal characters');
+    expect(manage).not.toHaveBeenCalled();
+
+    const valid = await run(['owner-channel', 'owner', 'authorize', 'PhoneRole', B]);
+    expect(manage).toHaveBeenCalledWith({ action: 'owner_authorize', cid: B });
+    expect(valid).toEqual({ code: 0, stdout: `Authorized owner ${B} (dynamic).\n`, stderr: '' });
+    expect(existsSync(persisted)).toBe(true);
+  });
 
   it('prefers the managed role proxy for spawn and supports --role', async () => {
     config();

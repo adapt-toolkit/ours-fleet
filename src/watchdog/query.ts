@@ -10,6 +10,17 @@ import { listRuns, readReport, type RunListEntry } from './store.js';
 
 export interface WatchdogRoleFinding { watchdog: string; status: WatchdogRoleStatus; reason: string }
 
+/** Shared configured-or-surviving-history addressability rule. */
+export function watchdogAddressable(
+  name: string,
+  configured: readonly string[],
+  historyExists: (validName: string) => boolean =
+    validName => existsSync(join(watchdogsRoot(), validName)),
+): boolean {
+  if (configured.includes(name)) return true;
+  return ROLE_NAME_RE.test(name) && historyExists(name);
+}
+
 /**
  * Needs-attention integration: worst current finding per role across
  * every configured watchdog, for FleetQueryService.status() to fold into a
@@ -131,8 +142,7 @@ export class WatchdogQueryService {
    */
   private requireKnown(name: string): void {
     const cfg = this.cfgProvider();
-    if (cfg.watchdogs.some(wd => wd.name === name)) return;
-    if (ROLE_NAME_RE.test(name) && existsSync(join(watchdogsRoot(), name))) return;
+    if (watchdogAddressable(name, cfg.watchdogs.map(wd => wd.name))) return;
     throw new FleetError('role_not_found', `no such watchdog '${name}'`);
   }
 }

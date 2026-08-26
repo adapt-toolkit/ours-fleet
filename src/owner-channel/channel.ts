@@ -8,13 +8,19 @@ import {
   type OwnerAttachmentConfig, type OwnerChannelConfig,
 } from '../config.js';
 import { replaceFileAtomically } from '../atomic-file.js';
+import { TaskRoomApplicationService } from '../application/task-room-service.js';
+import { RoleLifecycleService } from '../application/role-command-service.js';
+import { RoleRepository } from '../application/role-repository.js';
+import { FleetQueryService } from '../application/fleet-query-service.js';
+import { interruptSession, queueSessionPrompt } from '../application/session-mutations.js';
+import { pickBackend } from '../supervisor/index.js';
 import {
-  ACP_CANCEL_DEADLINE_EXCEEDED, SessionControlError, interruptOutcome,
+  ACP_CANCEL_DEADLINE_EXCEEDED, SessionControlError,
   type QueuedPrompt, type SessionEvent, type SessionHandle, type TurnResult,
 } from '../session/types.js';
 import { VERSION } from '../version.js';
 import {
-  renderMarkdownFailure, renderMarkdownResult, taskStatus,
+  renderMarkdownFailure, renderMarkdownResult, roomStatus, taskStatus,
 } from '../rooms-tasks/markdown.js';
 import {
   dispatchOwnerCommand, fleetCliOps, isOwnerCommandText,
@@ -76,6 +82,8 @@ export interface OwnerChannelOptions {
   client?: OursOps;
   /** Test seam; production uses the detached ours-fleet CLI (`fleetCliOps`). */
   fleet?: OwnerFleetOps;
+  /** Read-only restart validation; production uses the shared lifecycle service. */
+  prepareRestart?: (role: string, mode: 'keep' | 'fresh') => Promise<void>;
   /** Forwarded to fleet CLI invocations spawned for owner commands. */
   configPath?: string;
   /** Deterministic clock/process seams for binder handoff tests. */
@@ -219,11 +227,22 @@ export class OwnerChannel implements OwnerChannelHandle {
   private binderOwnedInternally = false;
 
   private readonly fleetOps: OwnerFleetOps;
+  private readonly prepareRestart: (role: string, mode: 'keep' | 'fresh') => Promise<void>;
 
   constructor(private readonly options: OwnerChannelOptions) {
     this.client = options.client ?? new OursSdkClient(
       options.env, line => options.log(`[${options.role}] owner channel ${line}`));
     this.fleetOps = options.fleet ?? fleetCliOps(options.role, options.configPath);
+    this.prepareRestart = options.prepareRestart ?? (async (role, mode) => {
+      const backend = pickBackend();
+      const repository = new RoleRepository({ configPath: options.configPath });
+      const query = new FleetQueryService({ repository, supervisor: backend });
+      const lifecycle = new RoleLifecycleService({ repository,
+        ops: { backend, binPath: process.argv[1], log: options.log },
+        configPath: options.configPath,
+        status: async roleId => (await query.detail(roleId)).status });
+      await lifecycle.prepareRestart({ roleIds: [role], mode });
+    });
     this.state = new OwnerChannelState(join(options.stateDir, '.owner-channel-state.json'));
     this.authorizations = new OwnerAuthorizationState(
       join(options.stateDir, '.owner-channel-owners.json'), options.config.owners);
@@ -943,7 +962,7 @@ export class OwnerChannel implements OwnerChannelHandle {
       outbox = this.outboxDir(originWireId);
       await mkdir(outbox, { recursive: true, mode: 0o700 });
       const activityCursor = this.latestEventSeq(this.options.session.eventsSince(0));
-      const queued = await this.options.session.queuePrompt(
+      const queued = await queueSessionPrompt(this.options.session,
         this.ownerAttachmentPrompt(sender, originWireId, requestId, admitted, group.caption),
         {
           interrupt: this.options.config.interrupt,
@@ -1057,7 +1076,7 @@ export class OwnerChannel implements OwnerChannelHandle {
     let queued;
     const activityCursor = this.latestEventSeq(this.options.session.eventsSince(0));
     try {
-      queued = await this.options.session.queuePrompt(
+      queued = await queueSessionPrompt(this.options.session,
         this.ownerPrompt(sender, text, wireId), {
         interrupt: this.options.config.interrupt,
         ...(this.options.config.interrupt ? { interruptSource: 'owner' as const } : {}),
@@ -1120,7 +1139,7 @@ export class OwnerChannel implements OwnerChannelHandle {
       harness: this.options.harness,
       version: VERSION,
       snapshot: () => this.options.session.snapshot(),
-      interrupt: async () => interruptOutcome(await this.options.session.interrupt('owner')),
+      interrupt: () => interruptSession(this.options.session, 'owner'),
       runHarnessCommand: command => this.runHarnessCommand(sender, command, wireId),
       restart: mode => this.restartSelf(sender, mode, wireId),
       comments: () => this.commentsState(),
@@ -1133,8 +1152,38 @@ export class OwnerChannel implements OwnerChannelHandle {
       },
       fleetList: () => this.fleetOps.list(),
       closeRoom: roomId => this.closeRoomFromOwner(sender, roomId, wireId),
+      recoverRoom: roomId => this.recoverRoomFromOwner(sender, roomId, wireId),
       terminalTask: (taskId, kind, outcome) =>
         this.terminalTaskFromOwner(sender, taskId, kind, outcome, wireId),
+      recoverTask: taskId => this.recoverTaskFromOwner(sender, taskId, wireId),
+      createTask: input => new TaskRoomApplicationService(this.options.configPath).createTask({
+        ...input,
+        actor: { kind: 'authenticated_owner', surface: 'messenger', cid: sender.id },
+      }),
+      startTask: taskId => new TaskRoomApplicationService(this.options.configPath).startTask({
+        actor: { kind: 'authenticated_owner', surface: 'messenger', cid: sender.id }, taskId,
+      }),
+      listTasks: filter => new TaskRoomApplicationService(this.options.configPath).listTasks(filter),
+      getTask: taskId => new TaskRoomApplicationService(this.options.configPath).getTask(taskId),
+      blockTask: (taskId, reason) => new TaskRoomApplicationService(this.options.configPath).blockTask({
+        actor: { kind: 'authenticated_owner', surface: 'messenger', cid: sender.id }, taskId, reason,
+      }),
+      unblockTask: taskId => new TaskRoomApplicationService(this.options.configPath).unblockTask({
+        actor: { kind: 'authenticated_owner', surface: 'messenger', cid: sender.id }, taskId,
+      }),
+      reviewTask: taskId => new TaskRoomApplicationService(this.options.configPath).reviewTask({
+        actor: { kind: 'authenticated_owner', surface: 'messenger', cid: sender.id }, taskId,
+      }),
+      deleteTask: taskId => new TaskRoomApplicationService(this.options.configPath).deleteTask({
+        actor: { kind: 'authenticated_owner', surface: 'messenger', cid: sender.id }, taskId,
+      }),
+      listRoomQueries: filter => new TaskRoomApplicationService(this.options.configPath).listRooms(filter),
+      getRoomQuery: id => new TaskRoomApplicationService(this.options.configPath).getRoomDetail(id),
+      listTemplateQueries: () => new TaskRoomApplicationService(this.options.configPath).listTemplates(),
+      getTemplateQuery: name => new TaskRoomApplicationService(this.options.configPath).getTemplate(name),
+      createRoom: input => new TaskRoomApplicationService(this.options.configPath).createRoom({
+        ...input, actor: { kind: 'authenticated_owner', surface: 'messenger', cid: sender.id },
+      }),
       recentEvents: limit => this.options.session.eventsSince(0).slice(-limit),
       readWorklogTail: maxChars => this.readWorklogTail(maxChars),
       reply: async replyText => { await this.send(sender.id, replyText, wireId); },
@@ -1154,7 +1203,7 @@ export class OwnerChannel implements OwnerChannelHandle {
     sender: { id: string; name: string }, command: string, wireId: string,
   ): Promise<void> {
     const requestId = this.requestId(wireId);
-    const queued = await this.options.session.queuePrompt(command, {
+    const queued = await queueSessionPrompt(this.options.session, command, {
       origin: { kind: 'owner', requestId },
     });
     this.inFlight.add(wireId);
@@ -1185,6 +1234,7 @@ export class OwnerChannel implements OwnerChannelHandle {
     sender: { id: string; name: string }, mode: 'keep' | 'fresh', wireId: string,
   ): Promise<void> {
     const command = mode === 'fresh' ? '/force-restart' : '/restart';
+    await this.prepareRestart(this.options.role, mode);
     await this.send(sender.id,
       ownerNotices.restarting(this.options.role, command, mode), wireId);
     this.state.remember(wireId);
@@ -1199,9 +1249,9 @@ export class OwnerChannel implements OwnerChannelHandle {
   private async closeRoomFromOwner(
     sender: { id: string; name: string }, roomId: string, wireId: string,
   ): Promise<void> {
-    const { acceptManagedRoomClose, recordManagedRoomCloseError } =
-      await import('../rooms-tasks/close.js');
-    await acceptManagedRoomClose(roomId);
+    const app = new TaskRoomApplicationService(this.options.configPath);
+    const actor = { kind: 'authenticated_owner' as const, surface: 'messenger' as const, cid: sender.id };
+    await app.requestRoomDeletion({ actor, roomId });
     await this.send(sender.id, renderMarkdownFailure({
       kind: 'pending', subject: `/room delete ${roomId} ${roomId}`,
       detail: 'The deletion request was accepted and is still being settled.',
@@ -1211,16 +1261,88 @@ export class OwnerChannel implements OwnerChannelHandle {
     try {
       await this.fleetOps.closeRoom(roomId);
     } catch (error) {
-      await recordManagedRoomCloseError(
-        roomId,
-        error instanceof Error ? error.message : String(error),
-        `External delete worker failed to start. Retry /room delete ${roomId} ${roomId}.`,
-      );
+      await app.recordRoomSettlementError({ actor, roomId,
+        error: error instanceof Error ? error.message : String(error),
+        recoveryHint: `External delete worker failed to start. Retry /room delete ${roomId} ${roomId}.` });
       throw error;
     }
   }
 
+  private async recoverRoomFromOwner(
+    sender: { id: string; name: string }, roomId: string, wireId: string,
+  ): Promise<void> {
+    const app = new TaskRoomApplicationService(this.options.configPath);
+    const actor = { kind: 'authenticated_owner' as const, surface: 'messenger' as const, cid: sender.id };
+    const result = await app.recoverRoom({ actor, roomId });
+    if (result.kind === 'deletion_worker_required') {
+      await this.send(sender.id, renderMarkdownFailure({ kind: 'pending',
+        subject: `/room recover ${roomId}`,
+        detail: 'The deletion recovery is still being settled.',
+        action: `Run /room recover ${roomId} if deletion remains pending.` }), wireId);
+      this.state.remember(wireId);
+      try { await this.fleetOps.closeRoom(roomId); }
+      catch (error) {
+        await app.recordRoomSettlementError({ actor, roomId,
+          error: error instanceof Error ? error.message : String(error),
+          recoveryHint: `External delete worker failed to start. Retry /room delete ${roomId} ${roomId}.` });
+        throw error;
+      }
+      return;
+    }
+    const r = result.orchestration;
+    await this.send(sender.id, renderMarkdownResult({ icon: '🛟', title: 'Room recovery',
+      fields: [{ label: 'Room', value: result.room.room_id, kind: 'code' },
+        { label: 'Status', value: roomStatus(result.room.state), kind: 'markdown' },
+        ...(r ? [{ label: 'Saga', value: r.saga.phase, kind: 'code' as const }] : [])],
+      sections: result.issues.length ? [{ heading: 'Next steps', items: result.issues }]
+        : [{ heading: 'Result', items: ['No recovery action is needed.'] }] }), wireId);
+    this.state.remember(wireId);
+  }
+
   /** Carry a task terminal request through a worker that survives this role. */
+  private async recoverTaskFromOwner(
+    sender: { id: string; name: string }, taskId: string, wireId: string,
+  ): Promise<void> {
+    const app = new TaskRoomApplicationService(this.options.configPath);
+    const actor = { kind: 'authenticated_owner' as const, surface: 'messenger' as const, cid: sender.id };
+    const begin = await app.beginTaskRecovery({ actor, taskId });
+    if (begin.kind === 'terminal_worker_required') {
+      await this.send(sender.id, renderMarkdownFailure({
+        kind: 'pending', subject: `/task recover ${taskId}`,
+        detail: 'The recovery request was accepted and is still being settled.',
+        action: `Run /task recover ${taskId} if it remains pending.`,
+      }), wireId);
+      this.state.remember(wireId);
+      try { await this.fleetOps.recoverTask(taskId); }
+      catch (error) {
+        await app.recordSettlementError({ actor, taskId,
+          error: error instanceof Error ? error.message : String(error),
+          recoveryHint: `External settle worker failed to start. Retry /task recover ${taskId}.` });
+        throw error;
+      }
+      return;
+    }
+    const { task, room, issues } = begin.result;
+    const hints = issues.map(issue => issue.code === 'waiting_cowork' ? 'Cowork socket unreachable'
+      : issue.code === 'waiting_owner_invite' ? 'Owner invite missing or invalid'
+      : issue.code === 'owner_cid_mismatch' ? 'Owner CID mismatch'
+      : issue.code === 'member_failed' ? `Member failed at step ${issue.stepIndex}`
+      : issue.code === 'resume_failed' ? `Resume failed: ${issue.error}`
+      : issue.code === 'provisioning_resumed' ? 'Provisioning resumed successfully'
+      : issue.code);
+    await this.send(sender.id, renderMarkdownResult({
+      icon: '🛟', title: 'Task recovery',
+      fields: [{ label: 'Task', value: task.task_id, kind: 'code' },
+        { label: 'Status', value: taskStatus(task.state), kind: 'markdown' },
+        ...(room ? [{ label: 'Room', value: room.room_id, kind: 'code' as const },
+          { label: 'Room status', value: roomStatus(room.state), kind: 'markdown' as const },
+          { label: 'Saga', value: room.saga.phase, kind: 'code' as const }] : [])],
+      sections: hints.length ? [{ heading: 'Next steps', items: hints }]
+        : [{ heading: 'Result', items: ['No automated recovery action is available.'] }],
+    }), wireId);
+    this.state.remember(wireId);
+  }
+
   private async terminalTaskFromOwner(
     sender: { id: string; name: string },
     taskId: string,
@@ -1228,20 +1350,17 @@ export class OwnerChannel implements OwnerChannelHandle {
     outcome: import('../rooms-tasks/types.js').TaskOutcome | undefined,
     wireId: string,
   ): Promise<void> {
-    const { getTask } = await import('../rooms-tasks/task-state.js');
-    const {
-      acceptTaskTerminalIntent, recordTaskTerminalIntentError,
-    } = await import('../rooms-tasks/terminal.js');
-    const task = getTask(taskId);
-    const accepted = await acceptTaskTerminalIntent({
-      taskId, kind, roomId: task.room_id, outcome,
-    });
-    if (accepted.terminal_intent?.status === 'settled') {
+    const app = new TaskRoomApplicationService(this.options.configPath);
+    const actor = { kind: 'authenticated_owner' as const, surface: 'messenger' as const, cid: sender.id };
+    const plan = kind === 'done'
+      ? await app.completeTask({ actor, taskId, outcome })
+      : await app.cancelTask({ actor, taskId });
+    if (!plan.settlementRequired) {
       await this.send(sender.id, renderMarkdownResult({
         icon: '📋', title: 'Task terminal action complete',
         fields: [
           { label: 'ID', value: taskId, kind: 'code' },
-          { label: 'Status', value: taskStatus(accepted.state), kind: 'markdown' },
+          { label: 'Status', value: taskStatus(plan.task.state), kind: 'markdown' },
         ],
       }), wireId);
       this.state.remember(wireId);
@@ -1256,11 +1375,10 @@ export class OwnerChannel implements OwnerChannelHandle {
     try {
       await this.fleetOps.settleTask(taskId);
     } catch (error) {
-      await recordTaskTerminalIntentError(
-        taskId,
-        error instanceof Error ? error.message : String(error),
-        `External settle worker failed to start. Retry the identical task command or run task recover ${taskId}.`,
-      );
+      await app.recordSettlementError({
+        actor, taskId, error: error instanceof Error ? error.message : String(error),
+        recoveryHint: `External settle worker failed to start. Retry the identical task command or run task recover ${taskId}.`,
+      });
       throw error;
     }
   }

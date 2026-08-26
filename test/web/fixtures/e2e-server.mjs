@@ -340,13 +340,13 @@ const services = {
     get(id) { return actions.get(id); },
   },
   removal: {
-    preview(role) {
+    previewWeb(role) {
       return { role, configured: true, lifetime: 'permanent', confirmation: 'typed-role-name',
         coordinatorProtection: false, selfProtected: false,
         effects: [`Stop and uninstall the exact backend registration for '${role}'.`, `/fixture/state/${role}`],
         recovery: { available: true, detail: 'Fixture recovery archive is available.' } };
     },
-    async remove(input) { return { ...this.preview(input.role), removed: true, recoveryPath: `/fixture/recovery/${input.role}` }; },
+    async removeWeb(input) { return { ...this.previewWeb(input.role), removed: true, recoveryPath: `/fixture/recovery/${input.role}` }; },
   },
   async terminalUpgrade(socket) {
     socket.send(JSON.stringify({

@@ -23,13 +23,25 @@ function fixture(roles: string): { root: string; calls: string[]; service: RoleR
 }
 
 describe('safe web role removal', () => {
+  it('preserves direct CLI removal policy without web preview, archive, or coordinator gates', async () => {
+    const { root, calls, service } = fixture(
+      '  Coordinator: {}\n  Worker: { coordinator: Coordinator }\n');
+    mkdirSync(agentDir('Coordinator'), { recursive: true });
+    writeFileSync(join(agentDir('Coordinator'), 'WORKLOG.md'), 'direct evidence');
+    await service.removeDirect({ actor: { kind: 'local_control', surface: 'cli' },
+      role: 'Coordinator' });
+    expect(calls).toEqual(['Coordinator']);
+    expect(existsSync(agentDir('Coordinator'))).toBe(false);
+    expect(existsSync(join(root, 'fleet.yaml'))).toBe(true);
+    expect(existsSync(join(root, '.ours-fleet', 'recovery', 'removed'))).toBe(false);
+  });
   it('requires exact-case typed confirmation and preserves hand-written configuration with recovery', async () => {
     const { root, calls, service } = fixture('  Worker: { harness: codex }\n');
     mkdirSync(agentDir('Worker'), { recursive: true });
     writeFileSync(join(agentDir('Worker'), 'WORKLOG.md'), 'recover me');
-    expect(() => service.preview('worker')).toThrow(/case-sensitive.*Worker/);
-    await expect(service.remove({ role: 'Worker', confirmation: 'worker' })).rejects.toMatchObject({ code: 'invalid_request' });
-    const result = await service.remove({ role: 'Worker', confirmation: 'Worker' });
+    expect(() => service.previewWeb('worker')).toThrow(/case-sensitive.*Worker/);
+    await expect(service.removeWeb({ role: 'Worker', confirmation: 'worker' })).rejects.toMatchObject({ code: 'invalid_request' });
+    const result = await service.removeWeb({ role: 'Worker', confirmation: 'Worker' });
     expect(calls).toEqual(['Worker']);
     expect(result.recoveryPath).toContain('-Worker');
     expect(existsSync(join(result.recoveryPath, 'state', 'WORKLOG.md'))).toBe(true);
@@ -38,11 +50,11 @@ describe('safe web role removal', () => {
 
   it('fails closed on case-fold collisions and cleans orphaned failed-start state', async () => {
     const collision = fixture('  Coordinator: {}\n  coordinator: {}\n');
-    expect(() => collision.service.preview('coordinator')).toThrow(/case-fold collision/);
+    expect(() => collision.service.previewWeb('coordinator')).toThrow(/case-fold collision/);
     const orphan = fixture('  Stable: {}\n');
     mkdirSync(agentDir('dangling'), { recursive: true });
     writeFileSync(join(agentDir('dangling'), 'briefing.md'), 'minimal');
-    const result = await orphan.service.remove({ role: 'dangling', confirmation: 'dangling' });
+    const result = await orphan.service.removeWeb({ role: 'dangling', confirmation: 'dangling' });
     expect(orphan.calls).toEqual(['dangling']);
     expect(existsSync(agentDir('dangling'))).toBe(false);
     expect(existsSync(join(result.recoveryPath, 'orphan-state', 'briefing.md'))).toBe(true);
@@ -51,9 +63,9 @@ describe('safe web role removal', () => {
   it('protects the current control role and requires coordinator impact acknowledgement', async () => {
     const { root, service } = fixture('  Coordinator: {}\n  Worker: { coordinator: Coordinator }\n');
     const self = new RoleRemovalService({ configPath: join(root, 'fleet.yaml'), ops: (service as any).options.ops, currentControlRole: 'Coordinator' });
-    await expect(self.remove({ role: 'Coordinator', confirmation: 'Coordinator', coordinatorAcknowledged: true }))
+    await expect(self.removeWeb({ role: 'Coordinator', confirmation: 'Coordinator', coordinatorAcknowledged: true }))
       .rejects.toMatchObject({ code: 'forbidden' });
-    await expect(service.remove({ role: 'Coordinator', confirmation: 'Coordinator' }))
+    await expect(service.removeWeb({ role: 'Coordinator', confirmation: 'Coordinator' }))
       .rejects.toMatchObject({ code: 'prerequisite_unavailable' });
   });
 
@@ -73,7 +85,7 @@ describe('safe web role removal', () => {
     });
     (service as any).options.ops.sleep = async () => {};
 
-    const result = await service.remove({ role: 'Temp', confirmed: true });
+    const result = await service.removeWeb({ role: 'Temp', confirmed: true });
 
     expect(calls).toEqual([]); // permanent backend is not used for a temp supervisor
     expect(existsSync(state)).toBe(false);

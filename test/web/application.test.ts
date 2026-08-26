@@ -1,7 +1,7 @@
 import { mkdtempSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { parse } from 'yaml';
 import { RoleRepository } from '../../src/application/role-repository.js';
 import { FleetError, normalizeError } from '../../src/application/errors.js';
@@ -325,5 +325,89 @@ roles: {}
     await expect(service.create(
       request, preview.previewHash, 'fedcba9876543210fedcba9876543210', 'browser',
     )).rejects.toMatchObject({ code: 'prerequisite_unavailable' });
+  });
+
+  it('preserves direct-only creation fields and rejects their injection into web requests', async () => {
+    const root = fixture();
+    const configPath = join(root, 'fleet.yaml');
+    const missionFile = join(root, 'mission.md');
+    const isolationFile = join(root, 'isolation.yaml');
+    writeFileSync(configPath, 'defaults: { harness: codex, session: acp }\nroles: {}\n');
+    writeFileSync(missionFile, 'Direct mission\n');
+    writeFileSync(isolationFile, 'backend: auto\non_unavailable: warn\n');
+    const service = new RoleCreationService({ configPath,
+      ops: { backend, binPath: '/bin/true', log() {} }, binPath: '/bin/true', journal: false });
+    const plan = service.previewSpawn({ origin: 'direct', options: {
+      name: 'DirectFields', identity: 'SeparateIdentity', missionFile, isolationFile,
+      harness: 'codex', profile: 'work', launcher: 'codex', search: true,
+      codexConfig: { model_verbosity: 'low' }, addDirs: [root], temp: true,
+    } });
+    expect(plan.origin).toBe('direct');
+    expect(plan.options).toMatchObject({ identity: 'SeparateIdentity', missionFile, isolationFile,
+      profile: 'work', launcher: 'codex', search: true,
+      codexConfig: { model_verbosity: 'low' }, addDirs: [root] });
+    expect(plan.preview.resolvedRole).toMatchObject({ identity: 'SeparateIdentity',
+      mission: 'Direct mission\n', harness_options: expect.objectContaining({
+        profile: 'work', launcher: 'codex', search: true,
+      }) });
+
+    await expect(service.preview({
+      name: 'WebInjected', harness: 'codex', session: 'acp', lifetime: 'temporary',
+      openAfterCreate: true, permissions: { approval: 'ask', filesystem: 'workspace',
+        unattended: 'deny' }, isolationFile,
+    } as any)).rejects.toMatchObject({ code: 'invalid_request',
+      message: 'unsupported web creation field: isolationFile' });
+  });
+
+  it('persists equivalent role state once through direct, managed, and web creation', async () => {
+    const root = fixture();
+    const configPath = join(root, 'fleet.yaml');
+    writeFileSync(configPath, 'defaults: { harness: codex, session: acp }\nroles: {}\n');
+    let launches = 0;
+    const common = { configPath,
+      ops: { backend, binPath: '/bin/true', log() {} }, binPath: '/bin/true',
+      tempLauncher() { launches++; }, identityProvisioner: { async exists() { return false; } } };
+    const direct = new RoleCreationService({ ...common, journal: false });
+    await direct.createDirect({ name: 'DirectParity', temp: true, harness: 'codex', session: 'acp',
+      approval: 'ask', filesystem: 'workspace', unattended: 'deny',
+      monitorConfig: { mode: 'native' } });
+    const caller = {
+      name: 'TrustedCaller', harness: 'codex', session: 'acp', identity: 'TrustedCaller',
+      permissions: { approval: 'ask', filesystem: 'workspace', unattended: 'deny' },
+      monitor: { mode: 'native', interrupt: false }, sourceFile: configPath,
+    } as any;
+    const managedPlan = direct.previewSpawn({ origin: 'managed', caller,
+      options: { name: 'ManagedParity', temp: true } });
+    expect(managedPlan).toMatchObject({ origin: 'managed', caller: 'TrustedCaller',
+      options: { configPath, callerRole: 'TrustedCaller', surface: 'agent' } });
+    expect(managedPlan.origin === 'managed' && managedPlan.inherited).toEqual(expect.arrayContaining([
+      'harness', 'session', 'coordinator', 'approval', 'filesystem', 'unattended', 'monitorConfig',
+    ]));
+    const managed = await direct.createManaged(caller, { name: 'ManagedParity', temp: true });
+    expect(managed).toMatchObject({ caller: 'TrustedCaller', role: 'ManagedParity',
+      lifetime: 'temporary' });
+    expect(managed.inherited).toEqual(expect.arrayContaining([
+      'harness', 'session', 'coordinator', 'approval', 'filesystem', 'unattended', 'monitorConfig',
+    ]));
+    const web = new RoleCreationService({ ...common,
+      journalDir: join(root, '.ours-fleet', 'web-actions'), probeReady: async () => 'ready' });
+    const request = { name: 'WebParity', harness: 'codex' as const, session: 'acp' as const,
+      lifetime: 'temporary' as const, openAfterCreate: true,
+      permissions: { approval: 'ask' as const, filesystem: 'workspace' as const,
+        unattended: 'deny' as const }, monitor: { mode: 'native' as const } };
+    const preview = await web.preview(request);
+    const action = await web.create(request, preview.previewHash,
+      'abcdef0123456789abcdef0123456789', 'browser');
+    await vi.waitFor(() => expect(web.get(action.actionId)?.state).toBe('session_reachable'));
+    const role = (name: string) => parse(readFileSync(
+      join(root, '.ours-fleet', 'tmp', name, 'role.yaml'), 'utf8')) as Record<string, unknown>;
+    const directRole = role('DirectParity');
+    const managedRole = role('ManagedParity');
+    const webRole = role('WebParity');
+    for (const key of ['harness', 'session', 'permissions', 'monitor']) {
+      expect(webRole[key]).toEqual(directRole[key]);
+      expect(managedRole[key]).toEqual(directRole[key]);
+    }
+    expect(launches).toBe(3);
   });
 });

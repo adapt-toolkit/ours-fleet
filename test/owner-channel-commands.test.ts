@@ -11,6 +11,15 @@ import {
   OWNER_COMMENT_LABEL, ownerNotices, type OwnerCommentsState,
 } from '../src/owner-channel/notices.js';
 import type { SessionEvent, SessionSnapshot } from '../src/session/types.js';
+import {
+  blockTask as persistBlockTask, deleteTask as persistDeleteTask,
+  getTask as readTask, listTasks as readTasks, reviewTask as persistReviewTask,
+  unblockTask as persistUnblockTask,
+} from '../src/rooms-tasks/task-state.js';
+import { createRoomRecord, getRoomRecord } from '../src/rooms-tasks/room-state.js';
+import { hashTemplate, listTemplates, resolveTemplate } from '../src/rooms-tasks/templates.js';
+import { renderMarkdownResult, roomStatus, taskStatus } from '../src/rooms-tasks/markdown.js';
+import { TaskRoomApplicationError } from '../src/application/task-room-service.js';
 
 function context(overrides: Partial<OwnerCommandContext> = {}): OwnerCommandContext & {
   replies: string[];
@@ -18,6 +27,7 @@ function context(overrides: Partial<OwnerCommandContext> = {}): OwnerCommandCont
   const replies: string[] = [];
   const snapshot: SessionSnapshot = { backend: 'acp', alive: true, readiness: 'idle' };
   const comments: OwnerCommentsState = { enabled: true, baseline: true, supported: true };
+  const closeRoom = vi.fn(async (roomId: string) => { replies.push(`scheduled:${roomId}`); });
   return {
     replies,
     comments: () => comments,
@@ -33,8 +43,94 @@ function context(overrides: Partial<OwnerCommandContext> = {}): OwnerCommandCont
     runHarnessCommand: vi.fn(async () => undefined),
     restart: vi.fn(async () => undefined),
     fleetList: vi.fn(async () => 'Coordinator: acp'),
-    closeRoom: vi.fn(async roomId => { replies.push(`scheduled:${roomId}`); }),
+    closeRoom,
+    recoverRoom: vi.fn(async roomId => {
+      const r = getRoomRecord(roomId);
+      if (!r) { replies.push('⚠️ Room not found.'); return; }
+      if (r.state === 'closing' || r.state === 'closed') { await closeRoom(roomId); return; }
+      replies.push(renderMarkdownResult({ icon: '🛟', title: 'Room recovery', fields: [
+        { label: 'Room', value: r.room_id, kind: 'code' },
+        { label: 'Status', value: roomStatus(r.state), kind: 'markdown' },
+        { label: 'Saga', value: r.saga.phase, kind: 'code' },
+        ...(r.saga.error ? [{ label: 'Last error', value: 'Provisioning failure recorded; inspect role logs.' }] : []),
+        ...(r.provisioning_detail ? [{ label: 'Detail', value: r.provisioning_detail }] : []),
+      ], sections: [{ heading: 'Next step', items: [r.saga.error
+        ? 'Run ours-fleet room recover from the CLI for full recovery.'
+        : 'No recovery action is needed.'] }] }));
+    }),
     terminalTask: vi.fn(async (taskId, kind) => { replies.push(`terminal:${taskId}:${kind}`); }),
+    recoverTask: vi.fn(async taskId => {
+      const task = readTask(taskId);
+      const room = task.room_id ? getRoomRecord(task.room_id) : undefined;
+      replies.push(renderMarkdownResult({ icon: '🛟', title: 'Task recovery', fields: [
+        { label: 'Task', value: task.task_id, kind: 'code' },
+        { label: 'Status', value: taskStatus(task.state), kind: 'markdown' },
+        ...(room ? [{ label: 'Room', value: room.room_id, kind: 'code' as const },
+          { label: 'Room status', value: roomStatus(room.state), kind: 'markdown' as const },
+          { label: 'Saga', value: room.saga.phase, kind: 'code' as const }] : []),
+      ], sections: [{ heading: 'Result', items: ['No automated recovery action is available.'] }] }));
+    }),
+    createTask: vi.fn(async input => {
+      const { createTask } = await import('../src/rooms-tasks/task-state.js');
+      return createTask({
+        title: input.title, brief: input.brief, origin: input.origin,
+        start: !input.backlog, no_room: input.noRoom,
+        ...(input.template ? { template: { name: input.template, version: 1, content_hash: '' } } : {}),
+      });
+    }),
+    startTask: vi.fn(async taskId => {
+      const { startTask } = await import('../src/rooms-tasks/task-state.js');
+      return startTask(taskId);
+    }),
+    listTasks: vi.fn(filter => {
+      return readTasks(filter);
+    }),
+    getTask: vi.fn(taskId => {
+      const task = readTask(taskId);
+      return { task, orchestration: task.room_id ? getRoomRecord(task.room_id) : undefined };
+    }),
+    blockTask: vi.fn((taskId, reason) => {
+      return persistBlockTask(taskId, reason);
+    }),
+    unblockTask: vi.fn(taskId => {
+      return persistUnblockTask(taskId);
+    }),
+    reviewTask: vi.fn(taskId => {
+      return persistReviewTask(taskId);
+    }),
+    deleteTask: vi.fn(taskId => {
+      return persistDeleteTask(taskId);
+    }),
+    listRoomQueries: vi.fn(async filter => (await import('../src/rooms-tasks/room-state.js'))
+      .listRoomRecords().filter(room => room.state === 'active' || room.state === 'provisioning')
+      .filter(room => !filter?.state || room.state === filter.state)
+      .map(room => ({ ...room, identity_name: room.room_name, identity_cid: room.room_identity_cid ?? '',
+        seats: [], role_briefings: {}, orchestration: room } as any))),
+    getRoomQuery: vi.fn(async id => {
+      const orchestration = getRoomRecord(id);
+      if (!orchestration || orchestration.state === 'closing' || orchestration.state === 'closed')
+        throw new TaskRoomApplicationError('room_not_found', 'room not found', { room: id });
+      return { room: { ...orchestration, identity_name: orchestration.room_name,
+        identity_cid: orchestration.room_identity_cid ?? '', seats: [], role_briefings: {} } as any,
+      orchestration };
+    }),
+    listTemplateQueries: vi.fn(() => listTemplates({})),
+    getTemplateQuery: vi.fn(name => {
+      const template = resolveTemplate(name, {});
+      if (!template) throw new TaskRoomApplicationError(
+        'template_not_found', 'template not found', { template: name });
+      return { ...template, content_hash: hashTemplate(template) };
+    }),
+    createRoom: vi.fn(async input => {
+      const { randomUUID } = await import('node:crypto');
+      const { createRoomRecord } = await import('../src/rooms-tasks/room-state.js');
+      const template = input.template ? resolveTemplate(input.template, {}) : undefined;
+      if (input.template && !template) throw new TaskRoomApplicationError(
+        'template_not_found', 'template not found', { template: input.template });
+      return createRoomRecord({ room_id: randomUUID().replace(/-/g, '').slice(0, 16),
+        room_name: input.name, goal: input.goal,
+        ...(template ? { template_snapshot: (await import('../src/rooms-tasks/templates.js')).snapshotTemplate(template) } : {}) });
+    }),
     recentEvents: () => [],
     readWorklogTail: vi.fn(async () => undefined),
     reply: async text => { replies.push(text); },
@@ -296,19 +392,21 @@ describe('owner command registry', () => {
   });
 
   it('summarizes recent activity shapes for /peek without leaking text bodies', async () => {
-    const events: SessionEvent[] = [
-      { version: 1, seq: 1, at: 't', kind: 'thought', text: 'SECRET private reasoning' },
-      { version: 1, seq: 2, at: 't', kind: 'tool_call', title: 'Read README.md' },
-      { version: 1, seq: 3, at: 't', kind: 'tool_update', status: 'completed' },
-      { version: 1, seq: 4, at: 't', kind: 'agent_text', text: 'SECRET draft answer' },
-      { version: 1, seq: 5, at: 't', kind: 'turn_stop', stopReason: 'end_turn' },
-    ];
-    const ctx = context({ recentEvents: () => events });
+    const events: SessionEvent[] = Array.from({ length: 22 }, (_, index) => ({
+      version: 1, seq: index + 1, at: 't', kind: 'state', status: `state-${index + 1}`,
+    }));
+    events[2] = { version: 1, seq: 3, at: 't', kind: 'thought', text: 'SECRET old reasoning' };
+    events[3] = { version: 1, seq: 4, at: 't', kind: 'thought', text: 'SECRET retained reasoning' };
+    events[20] = { version: 1, seq: 21, at: 't', kind: 'tool_call', title: 'Read README.md' };
+    events[21] = { version: 1, seq: 22, at: 't', kind: 'turn_stop', stopReason: 'end_turn' };
+    const ctx = context({ recentEvents: limit => events.slice(-limit) });
     await dispatchOwnerCommand('/peek', ctx);
     expect(ctx.replies).toHaveLength(1);
+    expect(ctx.replies[0]).toContain('thought');
     expect(ctx.replies[0]).toContain('tool_call');
     expect(ctx.replies[0]).toContain('Read README.md');
     expect(ctx.replies[0]).toContain('turn_stop');
+    expect(ctx.replies[0]).not.toContain('(state-2)');
     expect(ctx.replies[0]).not.toContain('SECRET');
   });
 
@@ -402,12 +500,30 @@ describe('owner-channel task subcommands', () => {
     expect(ctx.replies[0]).toContain(t.task_id);
   });
 
+  it('/task show delegates detail lookup to the shared service callback', async () => {
+    const t = await createTestTask();
+    const getTask = vi.fn(() => ({ task: t, orchestration: undefined }));
+    const ctx = context({ getTask });
+    await dispatchOwnerCommand(`/task show ${t.task_id}`, ctx);
+    expect(getTask).toHaveBeenCalledWith(t.task_id);
+  });
+
   it('/task start <id> transitions backlog → provisioning', async () => {
     const t = await createTestTask();
     const ctx = context();
     await dispatchOwnerCommand(`/task start ${t.task_id}`, ctx);
     expect(ctx.replies).toHaveLength(1);
     expect(ctx.replies[0]).toContain('Provisioning');
+  });
+
+  it('/task start delegates to and awaits the shared full-provision callback', async () => {
+    const t = await createTestTask();
+    const full = { ...t, state: 'active' as const, room_id: 'room-1', room_identity_cid: 'cid-1' };
+    const startTask = vi.fn(async () => full);
+    const ctx = context({ startTask });
+    await dispatchOwnerCommand(`/task start ${t.task_id}`, ctx);
+    expect(startTask).toHaveBeenCalledWith(t.task_id);
+    expect(ctx.replies[0]).toContain('Active');
   });
 
   it('/task block <id> <reason> blocks an active task', async () => {
@@ -420,6 +536,20 @@ describe('owner-channel task subcommands', () => {
     expect(ctx.replies).toHaveLength(1);
     expect(ctx.replies[0]).toContain('blocked');
     expect(ctx.replies[0]).toContain('waiting on deps');
+  });
+
+  it('delegates block, unblock, and review mutations to shared service callbacks', async () => {
+    const t = await createTestTask();
+    const blockTask = vi.fn(() => ({ ...t, state: 'blocked' as const, blocked_reason: 'deps' }));
+    const unblockTask = vi.fn(() => ({ ...t, state: 'active' as const }));
+    const reviewTask = vi.fn(() => ({ ...t, state: 'review' as const }));
+    const ctx = context({ blockTask, unblockTask, reviewTask });
+    await dispatchOwnerCommand(`/task block ${t.task_id} deps`, ctx);
+    await dispatchOwnerCommand(`/task unblock ${t.task_id}`, ctx);
+    await dispatchOwnerCommand(`/task review ${t.task_id}`, ctx);
+    expect(blockTask).toHaveBeenCalledWith(t.task_id, 'deps');
+    expect(unblockTask).toHaveBeenCalledWith(t.task_id);
+    expect(reviewTask).toHaveBeenCalledWith(t.task_id);
   });
 
   it('/task unblock <id> unblocks a blocked task', async () => {
@@ -486,8 +616,10 @@ describe('owner-channel task subcommands', () => {
 
   it('/task delete requires the exact task ID twice', async () => {
     const t = await createTestTask();
-    const ctx = context();
+    const deleteTask = vi.fn(() => true);
+    const ctx = context({ deleteTask });
     await dispatchOwnerCommand(`/task delete ${t.task_id} different-id`, ctx);
+    expect(deleteTask).not.toHaveBeenCalled();
     expect(ctx.replies).toHaveLength(1);
     expect(ctx.replies[0]).toContain('destructive');
   });
@@ -538,9 +670,7 @@ describe('owner-channel task subcommands', () => {
     });
     const ctx = context();
     await dispatchOwnerCommand(`/task recover ${t.task_id}`, ctx);
-    expect(ctx.terminalTask).toHaveBeenCalledWith(
-      t.task_id, 'done', { summary: 'recover me' },
-    );
+    expect(ctx.recoverTask).toHaveBeenCalledWith(t.task_id);
   });
 
   it('/task start without id returns usage', async () => {
@@ -578,6 +708,19 @@ describe('owner-channel task subcommands', () => {
     expect(ctx.replies).toHaveLength(1);
     expect(ctx.replies[0]).toContain('created');
     expect(ctx.replies[0]).toContain('backlog');
+  });
+
+  it('/task create parses transport syntax into the shared create request', async () => {
+    const created = await createTestTask();
+    const createTask = vi.fn(async () => created);
+    const ctx = context({ createTask });
+    await dispatchOwnerCommand(
+      '/task create --backlog --template=dev Parsed title\nDetailed brief', ctx,
+    );
+    expect(createTask).toHaveBeenCalledWith({
+      title: 'Parsed title', origin: { type: 'owner_channel' }, backlog: true,
+      template: 'dev', noRoom: false, brief: 'Detailed brief',
+    });
   });
 
   it('/task create --template=dev includes template in reply', async () => {
@@ -650,6 +793,13 @@ describe('owner-channel task subcommands', () => {
     expect(ctx.replies[0]).toContain('test task');
   });
 
+  it('/task list parses its state label before delegating to the shared service callback', async () => {
+    const listTasks = vi.fn(() => []);
+    const ctx = context({ listTasks });
+    await dispatchOwnerCommand('/task list backlog', ctx);
+    expect(listTasks).toHaveBeenCalledWith({ state: 'backlog' });
+  });
+
   it('/task list blocked shows no blocked tasks when none exist', async () => {
     await createTestTask();
     const ctx = context();
@@ -672,6 +822,18 @@ describe('owner-channel task subcommands', () => {
     await dispatchOwnerCommand('/task recover', ctx);
     expect(ctx.replies).toHaveLength(1);
     expect(ctx.replies[0]).toContain('usage');
+  });
+
+  it('does not expose CLI-only work or finish as Messenger task actions', async () => {
+    for (const name of ['work', 'finish']) {
+      const createTask = vi.fn(); const startTask = vi.fn(); const recoverTask = vi.fn();
+      const ctx = context({ createTask, startTask, recoverTask,
+        getTask: vi.fn(() => { throw new Error('not a supported action'); }) });
+      await dispatchOwnerCommand(`/task ${name} some-id`, ctx);
+      expect(createTask).not.toHaveBeenCalled();
+      expect(startTask).not.toHaveBeenCalled();
+      expect(recoverTask).not.toHaveBeenCalled();
+    }
   });
 });
 
@@ -811,6 +973,16 @@ describe('owner-channel room subcommands', () => {
     expect(ctx.replies[0]).toContain('**Template:** `team`');
   });
 
+  it('parses Messenger room create into the shared request', async () => {
+    const room = createRoomRecord({ room_id: 'room-delegate', room_name: 'Parsed room' });
+    const createRoom = vi.fn(async () => room);
+    const ctx = context({ createRoom });
+    await dispatchOwnerCommand('/room create --template=team Parsed room\nTrailing goal', ctx);
+    expect(createRoom).toHaveBeenCalledWith({
+      name: 'Parsed room', template: 'team', goal: 'Trailing goal',
+    });
+  });
+
   it('/room create without name returns usage', async () => {
     const ctx = context();
     await dispatchOwnerCommand('/room create', ctx);
@@ -883,6 +1055,32 @@ describe('owner-channel room subcommands', () => {
     expect(showCtx.replies[0]).toContain('## ⚠️ Not found');
   });
 
+  it('delegates /rooms alias and all supported room list filters', async () => {
+    const listRoomQueries = vi.fn(async () => []);
+    for (const command of ['/rooms', '/room list active', '/room list provisioning', '/room list all']) {
+      const ctx = context({ listRoomQueries });
+      await dispatchOwnerCommand(command, ctx);
+    }
+    expect(listRoomQueries.mock.calls).toEqual([
+      [], [{ state: 'active' }], [{ state: 'provisioning' }], [undefined],
+    ]);
+  });
+
+  it('rejects invalid Messenger room filters without querying', async () => {
+    const listRoomQueries = vi.fn(async () => []);
+    const ctx = context({ listRoomQueries });
+    await dispatchOwnerCommand('/room list closed', ctx);
+    expect(listRoomQueries).not.toHaveBeenCalled();
+    expect(ctx.replies[0]).toContain('Invalid command');
+  });
+
+  it('does not misclassify unexpected room query failures as not found', async () => {
+    const ctx = context({ getRoomQuery: vi.fn(async () => { throw new Error('cowork unavailable'); }) });
+    await dispatchOwnerCommand('/room show room-id', ctx);
+    expect(ctx.replies[0]).toContain('Command failed');
+    expect(ctx.replies[0]).not.toContain('Not found');
+  });
+
   it('/room recover migrates a legacy closed record through deletion', async () => {
     const r = await createTestRoom();
     const { closeRoom } = await import('../src/rooms-tasks/room-state.js');
@@ -940,11 +1138,28 @@ describe('owner-channel template subcommands', () => {
     expect(ctx.replies[0]).toContain('pair');
   });
 
+  it('Messenger template list consumes configured templates from the shared query', async () => {
+    const configured = { name: 'configured', version: 9, description: 'Configured template',
+      members: [], builtin: false } as any;
+    const listTemplateQueries = vi.fn(() => [configured]);
+    const ctx = context({ listTemplateQueries });
+    await dispatchOwnerCommand('/template list', ctx);
+    expect(listTemplateQueries).toHaveBeenCalledOnce();
+    expect(ctx.replies[0]).toContain('configured@9');
+  });
+
   it('/template show reports not found', async () => {
     const ctx = context();
     await dispatchOwnerCommand('/template show nonexistent', ctx);
     expect(ctx.replies).toHaveLength(1);
     expect(ctx.replies[0]).toContain('not found');
+  });
+
+  it('does not turn unexpected template query failures into not found', async () => {
+    const ctx = context({ getTemplateQuery: vi.fn(() => { throw new Error('config unreadable'); }) });
+    await expect(dispatchOwnerCommand('/template show team', ctx)).rejects.toThrow('config unreadable');
+    expect(ctx.replies[0]).toContain('could not be executed');
+    expect(ctx.replies[0]).not.toContain('template not found');
   });
 
   it('/template show without name returns usage', async () => {

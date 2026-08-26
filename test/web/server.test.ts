@@ -1,7 +1,7 @@
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { WebAuth } from '../../src/web/auth.js';
 import { AuditSink } from '../../src/web/audit.js';
 import { TrustedDeviceStore } from '../../src/web/device-store.js';
@@ -96,6 +96,45 @@ async function authenticated(overrides: Record<string, unknown> = {}) {
 }
 
 describe('secure local web host', () => {
+  it('does not bridge browser device trust into owner-channel authorization management', async () => {
+    const { server, cookie } = await authenticated();
+    const response = await server.app.inject({
+      method: 'GET', url: '/api/v1/owner-channel/owners',
+      headers: { host: boundary.host, cookie },
+    });
+    expect(response.statusCode).toBe(404);
+  });
+
+  it('delegates restart-resume target and mode through the REST action adapter', async () => {
+    const execute = vi.fn(async () => ({ actionId: 'restart-action', roleId: 'Alpha',
+      action: 'restart_resume', state: 'accepted' }));
+    const { server, cookie, csrf } = await authenticated({ commands: { execute,
+      get: vi.fn() } });
+    const response = await server.app.inject({ method: 'POST', url: '/api/v1/roles/Alpha/actions',
+      headers: { host: boundary.host, origin: boundary.origin, cookie, 'x-csrf-token': csrf },
+      payload: { action: 'restart_resume', actionId: 'restart-action' } });
+    expect(response.statusCode).toBe(202);
+    expect(execute).toHaveBeenCalledWith({ roleId: 'Alpha', action: 'restart_resume',
+      actionId: 'restart-action', confirmation: undefined });
+    await server.close();
+  });
+  it('does not register room or template query routes', async () => {
+    const { server, cookie } = await authenticated();
+    for (const url of ['/api/v1/rooms', '/api/v1/rooms/room-id', '/api/v1/templates']) {
+      const response = await server.app.inject({ method: 'GET', url,
+        headers: { cookie, host: boundary.host } });
+      expect(response.statusCode).toBe(404);
+    }
+    const create = await server.app.inject({ method: 'POST', url: '/api/v1/rooms',
+      headers: { cookie, host: boundary.host } });
+    expect(create.statusCode).toBe(404);
+    for (const url of ['/api/v1/rooms/room-id/delete', '/api/v1/rooms/room-id/recover']) {
+      const response = await server.app.inject({ method: 'POST', url,
+        headers: { cookie, host: boundary.host } });
+      expect(response.statusCode).toBe(404);
+    }
+    await server.app.close();
+  });
   it('accepts localhost and explains an unconfigured browser host as HTML', async () => {
     const server = await testServer();
     server.auth.setBoundary(boundary.origin, boundary.host, {
@@ -228,8 +267,8 @@ describe('secure local web host', () => {
   it('guards role removal with authentication, CSRF, exact path handling, and typed service input', async () => {
     const calls: unknown[] = [];
     const removal = {
-      preview(role: string) { calls.push(['preview', role]); return { role, confirmation: 'typed-role-name' }; },
-      async remove(input: unknown) { calls.push(['remove', input]); return { ...(input as object), removed: true, recoveryPath: '/archive' }; },
+      previewWeb(role: string) { calls.push(['preview', role]); return { role, confirmation: 'typed-role-name' }; },
+      async removeWeb(input: unknown) { calls.push(['remove', input]); return { ...(input as object), removed: true, recoveryPath: '/archive' }; },
     };
     const { server, cookie, csrf } = await authenticated({ removal });
     const unauthenticated = await server.app.inject({ method: 'GET', url: '/api/v1/roles/Alpha/removal-preview', headers: { host: boundary.host } });

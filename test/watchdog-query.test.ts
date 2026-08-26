@@ -1,5 +1,8 @@
 import { describe, expect, it, vi } from 'vitest';
-import { buildWatchdogFindings, cachedWatchdogFindingsProvider } from '../src/watchdog/query.js';
+import {
+  buildWatchdogFindings, cachedWatchdogFindingsProvider, watchdogAddressable,
+  WatchdogQueryService,
+} from '../src/watchdog/query.js';
 import type { WatchdogReport } from '../src/watchdog/report.js';
 
 function report(overrides: Partial<WatchdogReport> = {}): WatchdogReport {
@@ -12,6 +15,30 @@ function report(overrides: Partial<WatchdogReport> = {}): WatchdogReport {
     ...overrides,
   };
 }
+
+describe('watchdogAddressable', () => {
+  it('accepts configured names and removed watchdogs with surviving history', () => {
+    const history = vi.fn((name: string) => name === 'removed');
+    expect(watchdogAddressable('configured', ['configured'], history)).toBe(true);
+    expect(history).not.toHaveBeenCalled();
+    expect(watchdogAddressable('removed', [], history)).toBe(true);
+    expect(watchdogAddressable('unknown', [], history)).toBe(false);
+  });
+
+  it('rejects invalid and traversal-shaped names before filesystem lookup', () => {
+    const history = vi.fn(() => true);
+    for (const name of ['../victim', 'bad/name', '.', ''])
+      expect(watchdogAddressable(name, [], history), name).toBe(false);
+    expect(history).not.toHaveBeenCalled();
+  });
+
+  it('does not hide REST configuration-provider failures behind history fallback', () => {
+    const failure = new Error('broken fleet configuration');
+    const service = new WatchdogQueryService(() => { throw failure; });
+    expect(() => service.reports('removed')).toThrow(failure);
+    expect(() => service.report('removed', 'run-1')).toThrow(failure);
+  });
+});
 
 describe('buildWatchdogFindings', () => {
   it('skips error-status reports entirely', () => {
