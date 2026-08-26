@@ -1,4 +1,12 @@
 import { parseAllDocuments } from 'yaml';
+import { validateIsolationConfigProblems } from './isolation/policy.js';
+import type { IsolationConfig } from './isolation/types.js';
+import { parseDuration } from './duration.js';
+import {
+  AgentPolicyValidationError, validateOwnerChannelPolicyInput, validateWorklogPolicyInput,
+  validateMonitorPolicyProblems,
+  type OwnerChannelPolicyInput, type WorklogPolicyFields,
+} from './agent-runtime-policy.js';
 
 /** All six resource kinds implemented by the intentionally unwired schema layer. */
 export type ResourceKind =
@@ -43,6 +51,20 @@ export interface AgentSpec {
   identity: IdentityIntentSpec;
   lifecycle: 'persistent';
   permissions: PermissionSpec;
+  runtime?: AgentRuntimeSpec;
+}
+
+export interface AgentRuntimeSpec {
+  supervision?: { coordinator?: string; oversee?: Array<{ role: string; interval: string }> };
+  isolation?: IsolationConfig;
+  owner_channel?: OwnerChannelPolicyInput;
+  monitoring?: {
+    mode?: 'fleet' | 'native'; wake_sources?: string[]; batch_ms?: number;
+    inject?: 'notification' | 'full'; interrupt?: boolean | 'after_tool';
+    turn_fail_threshold?: number;
+  };
+  worklog?: false | WorklogPolicyFields;
+  scheduling?: { cwd?: string; max_tokens?: number; autocompact_pct?: number };
 }
 
 export interface RoleContextSpec { mission_append?: string; persona_append?: string }
@@ -220,7 +242,7 @@ function booleanAt(value: unknown, source: string, path: string): boolean {
 }
 
 function positiveIntegerAt(value: unknown, source: string, path: string): number {
-  if (!Number.isInteger(value) || (value as number) < 1)
+  if (!Number.isSafeInteger(value) || (value as number) < 1)
     throw new ResourceValidationError(source, path, 'must be a positive integer');
   return value as number;
 }
@@ -256,9 +278,100 @@ function permissionSpec(
   return result as PermissionSpec | PartialPermissionSpec;
 }
 
+function agentRuntimeSpec(value: unknown, source: string): AgentRuntimeSpec {
+  const path = '$.spec.runtime';
+  const raw = objectAt(value, source, path);
+  exactKeys(raw, [
+    'supervision', 'isolation', 'owner_channel', 'monitoring', 'worklog', 'scheduling',
+  ], source, path);
+  const result: AgentRuntimeSpec = {};
+  if (raw.supervision !== undefined) {
+    const p = `${path}.supervision`; const value = objectAt(raw.supervision, source, p);
+    exactKeys(value, ['coordinator', 'oversee'], source, p);
+    let oversee: Array<{ role: string; interval: string }> | undefined;
+    if (value.oversee !== undefined) {
+      if (!Array.isArray(value.oversee))
+        throw new ResourceValidationError(source, `${p}.oversee`, 'must be a list');
+      oversee = value.oversee.map((item, index) => {
+        const ip = `${p}.oversee[${index}]`; const entry = objectAt(item, source, ip);
+        exactKeys(entry, ['role', 'interval'], source, ip);
+        const intervalPath = `${ip}.interval`;
+        const interval = stringAt(entry.interval, source, intervalPath);
+        try { parseDuration(interval, { name: intervalPath, minMs: 1_000 }); }
+        catch (error) {
+          throw new ResourceValidationError(
+            source, intervalPath, error instanceof Error ? error.message : String(error));
+        }
+        return { role: resourceIdAt(entry.role, source, `${ip}.role`), interval };
+      });
+    }
+    result.supervision = {
+      ...(value.coordinator === undefined ? {} : {
+        coordinator: resourceIdAt(value.coordinator, source, `${p}.coordinator`),
+      }),
+      ...(oversee ? { oversee } : {}),
+    };
+  }
+  if (raw.isolation !== undefined) {
+    const problems = validateIsolationConfigProblems(raw.isolation, `${path}.isolation`);
+    if (problems.length) {
+      const problem = problems[0];
+      throw new ResourceValidationError(source, problem.fieldPath, problem.message);
+    }
+    result.isolation = structuredClone(raw.isolation) as IsolationConfig;
+  }
+  if (raw.owner_channel !== undefined) {
+    try {
+      result.owner_channel = validateOwnerChannelPolicyInput(
+        raw.owner_channel, `${path}.owner_channel`, true);
+    } catch (error) {
+      if (error instanceof AgentPolicyValidationError)
+        throw new ResourceValidationError(source, error.fieldPath, error.detail);
+      throw error;
+    }
+  }
+  if (raw.monitoring !== undefined) {
+    const p = `${path}.monitoring`; const monitoring = objectAt(raw.monitoring, source, p);
+    exactKeys(monitoring, [
+      'mode', 'wake_sources', 'batch_ms', 'inject', 'interrupt', 'turn_fail_threshold',
+    ], source, p);
+    const problems = validateMonitorPolicyProblems(monitoring, { minimumBatchMs: 1 }, p);
+    if (problems.length) {
+      const problem = problems[0];
+      throw new ResourceValidationError(source, problem.fieldPath, problem.message);
+    }
+    result.monitoring = structuredClone(monitoring) as AgentRuntimeSpec['monitoring'];
+  }
+  if (raw.worklog !== undefined) {
+    try {
+      result.worklog = validateWorklogPolicyInput(raw.worklog, `${path}.worklog`, false);
+    } catch (error) {
+      if (error instanceof AgentPolicyValidationError)
+        throw new ResourceValidationError(source, error.fieldPath, error.detail);
+      throw error;
+    }
+  }
+  if (raw.scheduling !== undefined) {
+    const p = `${path}.scheduling`; const scheduling = objectAt(raw.scheduling, source, p);
+    exactKeys(scheduling, ['cwd', 'max_tokens', 'autocompact_pct'], source, p);
+    const pct = scheduling.autocompact_pct;
+    if (pct !== undefined && (typeof pct !== 'number' || !Number.isFinite(pct)
+        || pct <= 0 || pct > 100))
+      throw new ResourceValidationError(source, `${p}.autocompact_pct`, 'must be greater than 0 and at most 100');
+    result.scheduling = {
+      ...(scheduling.cwd === undefined ? {} : { cwd: stringAt(scheduling.cwd, source, `${p}.cwd`) }),
+      ...(scheduling.max_tokens === undefined ? {} : {
+        max_tokens: positiveIntegerAt(scheduling.max_tokens, source, `${p}.max_tokens`),
+      }),
+      ...(pct === undefined ? {} : { autocompact_pct: pct }),
+    };
+  }
+  return result;
+}
+
 function agentSpec(value: unknown, source: string): AgentSpec {
   const raw = objectAt(value, source, '$.spec');
-  exactKeys(raw, ['role', 'brain', 'identity', 'lifecycle', 'permissions'], source, '$.spec');
+  exactKeys(raw, ['role', 'brain', 'identity', 'lifecycle', 'permissions', 'runtime'], source, '$.spec');
   if (raw.lifecycle !== 'persistent')
     throw new ResourceValidationError(source, '$.spec.lifecycle', 'agents.d resources must be persistent');
   const identity = objectAt(raw.identity, source, '$.spec.identity');
@@ -271,6 +384,7 @@ function agentSpec(value: unknown, source: string): AgentSpec {
     brain: parseBrainRef(raw.brain, source, '$.spec.brain'),
     identity: { name: stringAt(identity.name, source, '$.spec.identity.name'), ownership: ownership as IdentityIntentSpec['ownership'] },
     lifecycle: 'persistent', permissions: permissionSpec(raw.permissions, source, '$.spec.permissions', false),
+    ...(raw.runtime === undefined ? {} : { runtime: agentRuntimeSpec(raw.runtime, source) }),
   };
 }
 

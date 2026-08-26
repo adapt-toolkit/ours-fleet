@@ -20,6 +20,25 @@ import {
 import type { RoomsConfig, RoomTemplatesConfig, TasksConfig } from './rooms-tasks/types.js';
 import { CAPABILITIES, CAP_MONITOR_INTERRUPT_AFTER_TOOL } from './capabilities.js';
 import { runningLabel } from './provenance.js';
+import {
+  AgentPolicyValidationError, validateMonitorPolicyInput,
+  validateOwnerChannelPolicyInput, validateWorklogPolicyInput,
+} from './agent-runtime-policy.js';
+
+export function validateMonitorConfig(
+  raw: unknown, capabilities: readonly string[] = CAPABILITIES,
+): string[] {
+  return validateMonitorPolicyInput(raw, {
+    capabilityCheck: {
+      capabilities, required: CAP_MONITOR_INTERRUPT_AFTER_TOOL, buildLabel: runningLabel(),
+    },
+  });
+}
+
+const legacyAgentPolicyMessage = (error: AgentPolicyValidationError): string => {
+  return error.detail.startsWith('unknown key(s)')
+    ? `${error.fieldPath}: ${error.detail}` : `${error.fieldPath} ${error.detail}`;
+};
 
 export interface OverseeEntry { role: string; interval: string }
 export interface WorklogPolicy {
@@ -142,72 +161,11 @@ export const DEFAULT_OWNER_ATTACHMENT_MIME = [
 /** Default wake sources when a role does not list its own. */
 export const DEFAULT_WAKE_SOURCES: NotifyEventType[] =
   ['message_received', 'file_received', 'local_contact_request', 'pending_message'];
-const MONITOR_KEYS = [
-  'mode', 'enabled', 'wake_sources', 'batch_ms', 'inject', 'interrupt', 'turn_fail_threshold',
-];
-const INJECT_MODES: InjectMode[] = ['notification', 'full'];
-const MONITOR_MODES: MonitorMode[] = ['fleet', 'native'];
 const MONITOR_DEFAULT_BATCH_MS = 2000;
 const MONITOR_DEFAULT_TURN_FAIL_THRESHOLD = 3;
 
 const isPlainObject = (v: unknown): v is Record<string, unknown> =>
   v !== null && typeof v === 'object' && !Array.isArray(v);
-
-/**
- * Validate a raw (role-level or merged) `monitor:` block; returns human-readable problems.
- *
- * `capabilities` defaults to what this build declares. A value is rejected in two
- * distinct ways: unknown to every build (a typo), or known but absent from the
- * artifact doing the validating — the second names the capability and the build,
- * because the same fleet.yaml may well be accepted by another install on the host.
- */
-export function validateMonitorConfig(
-  raw: unknown,
-  capabilities: readonly string[] = CAPABILITIES,
-): string[] {
-  const problems: string[] = [];
-  if (!isPlainObject(raw)) return ['monitor: must be a mapping'];
-  const m = raw;
-  const bad = Object.keys(m).filter(k => !MONITOR_KEYS.includes(k));
-  if (bad.length)
-    problems.push(`monitor: unknown key(s) ${bad.join(', ')}; allowed: ${MONITOR_KEYS.join(', ')}`);
-  if (m.enabled !== undefined && typeof m.enabled !== 'boolean')
-    problems.push('monitor.enabled: must be true or false');
-  if (m.mode !== undefined && !MONITOR_MODES.includes(m.mode as MonitorMode))
-    problems.push(`monitor.mode: invalid value '${m.mode}'; allowed: ${MONITOR_MODES.join(', ')}`);
-  if (m.mode !== undefined && typeof m.enabled === 'boolean'
-      && m.enabled !== (m.mode === 'fleet'))
-    problems.push(`monitor.mode '${m.mode}' conflicts with legacy monitor.enabled ${m.enabled}`);
-  if (m.batch_ms !== undefined
-      && (typeof m.batch_ms !== 'number' || !Number.isFinite(m.batch_ms) || m.batch_ms < 0))
-    problems.push('monitor.batch_ms: must be a non-negative number');
-  if (m.inject !== undefined && !INJECT_MODES.includes(m.inject as InjectMode))
-    problems.push(`monitor.inject: invalid value '${m.inject}'; allowed: ${INJECT_MODES.join(', ')}`);
-  if (m.interrupt !== undefined
-      && typeof m.interrupt !== 'boolean' && m.interrupt !== 'after_tool')
-    problems.push("monitor.interrupt: must be true, false, or 'after_tool'");
-  else if (m.interrupt === 'after_tool' && !capabilities.includes(CAP_MONITOR_INTERRUPT_AFTER_TOOL))
-    problems.push(
-      `monitor.interrupt: 'after_tool' needs capability ${CAP_MONITOR_INTERRUPT_AFTER_TOOL}, `
-      + `which the build validating this config (${runningLabel()}) does not declare. `
-      + 'Another install on this host may accept the same file — run `ours-fleet doctor` '
-      + 'to see which artifact serves which path.');
-  if (m.turn_fail_threshold !== undefined
-      && (typeof m.turn_fail_threshold !== 'number' || !Number.isInteger(m.turn_fail_threshold)
-          || m.turn_fail_threshold < 1))
-    problems.push('monitor.turn_fail_threshold: must be a positive integer');
-  if (m.wake_sources !== undefined) {
-    if (!Array.isArray(m.wake_sources)) problems.push('monitor.wake_sources: must be a list');
-    else {
-      const unknown = m.wake_sources.filter(w => !NOTIFY_EVENT_TYPES.includes(w as NotifyEventType));
-      if (unknown.length)
-        problems.push(
-          `monitor.wake_sources: unknown source(s) ${unknown.join(', ')}; ` +
-          `allowed: ${NOTIFY_EVENT_TYPES.join(', ')}`);
-    }
-  }
-  return problems;
-}
 
 export interface RoleConfig {
   harness?: string;
@@ -565,40 +523,6 @@ export function resolveOwnerChannelConfig(
     ...defaultInput,
     ...(role ?? {}),
   };
-  const allowed = [
-    'identity', 'owners', 'agent', 'interrupt', 'progress_interval_ms', 'comments', 'attachments',
-  ];
-  const bad = Object.keys(merged).filter(key => !allowed.includes(key));
-  if (bad.length)
-    throw new ConfigError(`${file}: role '${name}' owner_channel: unknown key(s) ${bad.join(', ')}`);
-  if (typeof merged.identity !== 'string' || !merged.identity.trim())
-    throw new ConfigError(`${file}: role '${name}' owner_channel.identity must be a non-blank string`);
-  if (!Array.isArray(merged.owners) || merged.owners.length === 0
-      || merged.owners.some(owner => typeof owner !== 'string' || !owner.trim()))
-    throw new ConfigError(`${file}: role '${name}' owner_channel.owners must be a non-empty list of contact IDs`);
-  const owners = merged.owners.map(owner => canonicalCid(owner.trim()));
-  if (new Set(owners).size !== owners.length)
-    throw new ConfigError(`${file}: role '${name}' owner_channel.owners must not contain duplicates`);
-  if (merged.agent !== undefined
-      && (typeof merged.agent !== 'string' || !/^[A-Fa-f0-9]{64}$/.test(merged.agent)))
-    throw new ConfigError(
-      `${file}: role '${name}' owner_channel.agent must be exactly 64 hexadecimal characters`);
-  const agent = merged.agent === undefined ? undefined : canonicalCid(merged.agent.trim());
-  if (agent && owners.includes(agent))
-    throw new ConfigError(
-      `${file}: role '${name}' owner_channel.agent must not also be an owner CID`);
-  if (agent && owners.some(owner => !/^[A-Fa-f0-9]{64}$/.test(owner)))
-    throw new ConfigError(
-      `${file}: role '${name}' owner_channel.owners must contain exact 64-hex CIDs when agent relay is configured`);
-  if (merged.interrupt !== undefined && typeof merged.interrupt !== 'boolean')
-    throw new ConfigError(`${file}: role '${name}' owner_channel.interrupt must be true or false`);
-  if (merged.progress_interval_ms !== undefined
-      && (typeof merged.progress_interval_ms !== 'number'
-        || !Number.isFinite(merged.progress_interval_ms) || merged.progress_interval_ms < 0))
-    throw new ConfigError(
-      `${file}: role '${name}' owner_channel.progress_interval_ms must be a non-negative number`);
-  if (merged.comments !== undefined && typeof merged.comments !== 'boolean')
-    throw new ConfigError(`${file}: role '${name}' owner_channel.comments must be true or false`);
   if (defaultInput.attachments !== undefined && !isPlainObject(defaultInput.attachments))
     throw new ConfigError(`${file}: defaults.owner_channel.attachments must be a map`);
   if (role?.attachments !== undefined && !isPlainObject(role.attachments))
@@ -606,61 +530,39 @@ export function resolveOwnerChannelConfig(
   const attachments = {
     ...(defaultInput.attachments ?? {}), ...(role?.attachments ?? {}),
   } as Partial<OwnerAttachmentConfig>;
-  const attachmentKeys = [
-    'enabled', 'max_files_per_request', 'max_file_bytes', 'max_request_bytes',
-    'retention_ms', 'allowed_mime',
-  ];
-  const badAttachmentKeys = Object.keys(attachments)
-    .filter(key => !attachmentKeys.includes(key));
-  if (badAttachmentKeys.length)
-    throw new ConfigError(
-      `${file}: role '${name}' owner_channel.attachments: unknown key(s) ${badAttachmentKeys.join(', ')}`);
-  if (attachments.enabled !== undefined && typeof attachments.enabled !== 'boolean')
-    throw new ConfigError(`${file}: role '${name}' owner_channel.attachments.enabled must be true or false`);
-  const boundedInteger = (key: keyof OwnerAttachmentConfig, min: number, max: number) => {
-    const value = attachments[key];
-    if (value !== undefined && (typeof value !== 'number' || !Number.isSafeInteger(value)
-        || value < min || value > max))
-      throw new ConfigError(
-        `${file}: role '${name}' owner_channel.attachments.${key} must be an integer from ${min} to ${max}`);
-  };
-  boundedInteger('max_files_per_request', 1, 32);
-  boundedInteger('max_file_bytes', 1, 100 * 1024 * 1024);
-  boundedInteger('max_request_bytes', 1, 256 * 1024 * 1024);
-  boundedInteger('retention_ms', 60_000, 30 * 24 * 60 * 60 * 1_000);
-  const maxFileBytes = attachments.max_file_bytes ?? 10 * 1024 * 1024;
-  const maxRequestBytes = attachments.max_request_bytes ?? 20 * 1024 * 1024;
-  if (maxRequestBytes < maxFileBytes)
-    throw new ConfigError(
-      `${file}: role '${name}' owner_channel.attachments.max_request_bytes must be at least max_file_bytes`);
-  const allowedMime = attachments.allowed_mime ?? [...DEFAULT_OWNER_ATTACHMENT_MIME];
-  if (!Array.isArray(allowedMime) || allowedMime.length < 1 || allowedMime.length > 64
-      || allowedMime.some(mime => typeof mime !== 'string'
-        || !/^[a-z0-9][a-z0-9!#$&^_.+-]*\/[a-z0-9][a-z0-9!#$&^_.+-]*$/.test(mime)))
-    throw new ConfigError(
-      `${file}: role '${name}' owner_channel.attachments.allowed_mime must contain 1-64 lowercase MIME types`);
-  if (new Set(allowedMime).size !== allowedMime.length)
-    throw new ConfigError(
-      `${file}: role '${name}' owner_channel.attachments.allowed_mime must not contain duplicates`);
+  let validated;
+  try {
+    validated = validateOwnerChannelPolicyInput(
+      { ...merged, attachments }, 'owner_channel', true);
+  } catch (error) {
+    if (error instanceof AgentPolicyValidationError)
+      throw new ConfigError(`${file}: role '${name}' ${legacyAgentPolicyMessage(error)}`);
+    throw error;
+  }
   if (session !== 'acp')
     throw new ConfigError(
       `${file}: role '${name}' owner_channel requires session: acp for correlated final replies`);
+  const maxFileBytes = validated.attachments?.max_file_bytes ?? 10 * 1024 * 1024;
+  const maxRequestBytes = validated.attachments?.max_request_bytes ?? 20 * 1024 * 1024;
+  if (maxRequestBytes < maxFileBytes)
+    throw new ConfigError(
+      `${file}: role '${name}' owner_channel.attachments.max_request_bytes must be at least max_file_bytes`);
   return {
-    identity: merged.identity.trim(),
-    owners,
-    ...(agent ? { agent } : {}),
-    interrupt: merged.interrupt ?? false,
-    progress_interval_ms: merged.progress_interval_ms ?? 30_000,
+    identity: validated.identity!,
+    owners: validated.owners!,
+    ...(validated.agent ? { agent: validated.agent } : {}),
+    interrupt: validated.interrupt ?? false,
+    progress_interval_ms: validated.progress_interval_ms ?? 30_000,
     // Default true preserves the established live-commentary behavior; an
     // upgrade never silently goes quiet on an owner who relied on it.
-    comments: merged.comments ?? true,
+    comments: validated.comments ?? true,
     attachments: {
-      enabled: attachments.enabled ?? true,
-      max_files_per_request: attachments.max_files_per_request ?? 4,
+      enabled: validated.attachments?.enabled ?? true,
+      max_files_per_request: validated.attachments?.max_files_per_request ?? 4,
       max_file_bytes: maxFileBytes,
       max_request_bytes: maxRequestBytes,
-      retention_ms: attachments.retention_ms ?? 24 * 60 * 60 * 1_000,
-      allowed_mime: [...allowedMime],
+      retention_ms: validated.attachments?.retention_ms ?? 24 * 60 * 60 * 1_000,
+      allowed_mime: validated.attachments?.allowed_mime ?? [...DEFAULT_OWNER_ATTACHMENT_MIME],
     },
   };
 }
@@ -759,20 +661,13 @@ export function resolveWorklogPolicy(
     ...((defaults === false || defaults === undefined ? {} : defaults) as Partial<WorklogPolicy>),
     ...(role === undefined ? {} : role),
   };
-  const bad = Object.keys(merged).filter(key =>
-    !['max_kb', 'keep_tail_kb', 'max_archives'].includes(key));
-  if (bad.length) throw new ConfigError(
-    `${file}: role '${name}' worklog: unknown key(s) ${bad.join(', ')}`);
-  for (const key of ['max_kb', 'keep_tail_kb', 'max_archives'] as const) {
-    const value = merged[key];
-    if (!Number.isInteger(value) || (value as number) <= 0)
-      throw new ConfigError(`${file}: role '${name}' worklog.${key} must be a positive integer`);
+  try {
+    return validateWorklogPolicyInput(merged, 'worklog', true) as WorklogPolicy;
+  } catch (error) {
+    if (error instanceof AgentPolicyValidationError)
+      throw new ConfigError(`${file}: role '${name}' ${legacyAgentPolicyMessage(error)}`);
+    throw error;
   }
-  if ((merged.max_archives as number) > 1000)
-    throw new ConfigError(`${file}: role '${name}' worklog.max_archives must be at most 1000`);
-  if ((merged.keep_tail_kb as number) >= (merged.max_kb as number))
-    throw new ConfigError(`${file}: role '${name}' worklog.keep_tail_kb must be less than max_kb`);
-  return merged as WorklogPolicy;
 }
 
 function resolveSession(raw: unknown, file: string, name: string): SessionBackendId {

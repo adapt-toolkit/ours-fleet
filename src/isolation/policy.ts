@@ -72,52 +72,88 @@ const RESOURCE_KEYS = ['cpu', 'mem', 'pids'];
 const unknownKeys = (obj: Record<string, unknown>, allowed: string[]): string[] =>
   Object.keys(obj).filter(k => !allowed.includes(k));
 
-const enumProblem = (label: string, value: unknown, allowed: readonly string[]): string | null =>
-  value === undefined || allowed.includes(value as string)
-    ? null
-    : `${label}: invalid value '${value}'; allowed: ${allowed.join(', ')}`;
+export interface IsolationValidationProblem { fieldPath: string; message: string }
+
+const validateStringList = (
+  value: unknown, fieldPath: string, problems: IsolationValidationProblem[],
+): void => {
+  if (!Array.isArray(value) || value.some(item => typeof item !== 'string' || !item.length)) {
+    problems.push({ fieldPath, message: 'must be a list of non-empty strings' });
+    return;
+  }
+  if (new Set(value).size !== value.length)
+    problems.push({ fieldPath, message: 'must not contain duplicates' });
+};
 
 /**
  * Validate a raw `isolation:` block. Returns a list of human-readable problems
  * (empty ⇒ valid). Pure; callable from config.ts like adapter.validateOptions.
  */
-export function validateIsolationConfig(raw: unknown): string[] {
-  const problems: string[] = [];
+export function validateIsolationConfigProblems(
+  raw: unknown, path = 'isolation',
+): IsolationValidationProblem[] {
+  const problems: IsolationValidationProblem[] = [];
+  const add = (fieldPath: string, message: string): void => { problems.push({ fieldPath, message }); };
   if (raw === null || typeof raw !== 'object' || Array.isArray(raw))
-    return ['isolation: must be a mapping'];
+    return [{ fieldPath: path, message: 'must be a mapping' }];
   const iso = raw as Record<string, unknown>;
 
   const bad = unknownKeys(iso, ISOLATION_KEYS);
   if (bad.length)
-    problems.push(`isolation: unknown key(s) ${bad.join(', ')}; allowed: ${ISOLATION_KEYS.join(', ')}`);
-
-  for (const p of [
-    enumProblem('isolation.backend', iso.backend, BACKENDS),
-    enumProblem('isolation.on_unavailable', iso.on_unavailable, ON_UNAVAILABLE),
-    enumProblem('isolation.network', iso.network, NETWORK_MODES),
-  ]) if (p) problems.push(p);
+    add(path, `unknown key(s) ${bad.join(', ')}; allowed: ${ISOLATION_KEYS.join(', ')}`);
+  for (const [key, allowed] of [
+    ['backend', BACKENDS], ['on_unavailable', ON_UNAVAILABLE], ['network', NETWORK_MODES],
+  ] as const) {
+    const value = iso[key];
+    if (value !== undefined && !allowed.includes(value as never))
+      add(`${path}.${key}`, `invalid value '${value}'; allowed: ${allowed.join(', ')}`);
+  }
 
   if (iso.fs !== undefined) {
     if (typeof iso.fs !== 'object' || iso.fs === null || Array.isArray(iso.fs))
-      problems.push('isolation.fs: must be a mapping');
+      add(`${path}.fs`, 'must be a mapping');
     else {
-      const fsBad = unknownKeys(iso.fs as Record<string, unknown>, FS_KEYS);
+      const fs = iso.fs as Record<string, unknown>;
+      const fsBad = unknownKeys(fs, FS_KEYS);
       if (fsBad.length)
-        problems.push(`isolation.fs: unknown key(s) ${fsBad.join(', ')}; allowed: ${FS_KEYS.join(', ')}`);
+        add(`${path}.fs`, `unknown key(s) ${fsBad.join(', ')}; allowed: ${FS_KEYS.join(', ')}`);
+      if (fs.read !== undefined) validateStringList(fs.read, `${path}.fs.read`, problems);
+      if (fs.write !== undefined) validateStringList(fs.write, `${path}.fs.write`, problems);
     }
   }
 
   if (iso.resources !== undefined) {
     if (typeof iso.resources !== 'object' || iso.resources === null || Array.isArray(iso.resources))
-      problems.push('isolation.resources: must be a mapping');
+      add(`${path}.resources`, 'must be a mapping');
     else {
-      const rBad = unknownKeys(iso.resources as Record<string, unknown>, RESOURCE_KEYS);
+      const resources = iso.resources as Record<string, unknown>;
+      const rBad = unknownKeys(resources, RESOURCE_KEYS);
       if (rBad.length)
-        problems.push(`isolation.resources: unknown key(s) ${rBad.join(', ')}; allowed: ${RESOURCE_KEYS.join(', ')}`);
+        add(`${path}.resources`, `unknown key(s) ${rBad.join(', ')}; allowed: ${RESOURCE_KEYS.join(', ')}`);
+      if (resources.cpu !== undefined && (typeof resources.cpu !== 'string'
+          || !/^(?:\d+(?:\.\d+)?|\.\d+)$/u.test(resources.cpu)
+          || Number(resources.cpu) <= 0))
+        add(`${path}.resources.cpu`, 'must be a positive decimal string');
+      if (resources.mem !== undefined && (typeof resources.mem !== 'string'
+          || !/^[1-9]\d*(?:[KMGTPE])?$/iu.test(resources.mem)))
+        add(`${path}.resources.mem`, 'must be a positive size string');
+      if (resources.pids !== undefined && (!Number.isSafeInteger(resources.pids)
+          || (resources.pids as number) <= 0))
+        add(`${path}.resources.pids`, 'must be a positive safe integer');
     }
   }
 
+  if (iso.allow_hosts !== undefined)
+    validateStringList(iso.allow_hosts, `${path}.allow_hosts`, problems);
+  if (iso.secrets !== undefined)
+    validateStringList(iso.secrets, `${path}.secrets`, problems);
+
   return problems;
+}
+
+export function validateIsolationConfig(raw: unknown): string[] {
+  return validateIsolationConfigProblems(raw)
+    .map(problem => `${problem.fieldPath}: ${problem.message}`);
 }
 
 /**

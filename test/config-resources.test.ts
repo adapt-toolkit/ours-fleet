@@ -3,6 +3,10 @@ import {
   MAX_BRAIN_FIELD_BYTES, MAX_CAPABILITIES, MAX_CAPABILITY_BYTES, MAX_ROLE_TEXT_BYTES,
   parseBrainRef, parseTypedResource, ResourceValidationError,
 } from '../src/config-resources.js';
+import {
+  validateOwnerChannelPolicyInput, validateWorklogPolicyInput,
+} from '../src/agent-runtime-policy.js';
+import { resolveOwnerChannelConfig, resolveWorklogPolicy } from '../src/config.js';
 
 describe('typed configuration resources', () => {
   it('accepts named and complete inline Brain references', () => {
@@ -159,7 +163,7 @@ spec:
     ['lifecycle: temporary', /must be persistent/u],
     ['lifecycle: persistent\n  mission: injected', /unknown key\(s\): mission/u],
     ['lifecycle: persistent\n  harness: codex', /unknown key\(s\): harness/u],
-    ['lifecycle: persistent\n  runtime: {}', /unknown key\(s\): runtime/u],
+    ['lifecycle: persistent\n  runtime: {native_options: {}}', /unknown key\(s\): native_options/u],
   ])('rejects forbidden Agent composition: %s', (tail, error) => {
     expect(() => parseTypedResource('agent.yaml', `
 kind: Agent
@@ -193,6 +197,132 @@ spec:
     expect(() => parseTypedResource('agent.yaml', base(
       '{name: Worker, ownership: existing}', '{approval: ask, filesystem: workspace}',
     ))).toThrow(/must define approval, filesystem, and unattended/u);
+  });
+
+  it('stores validated Agent runtime input without filling resolved defaults', () => {
+    const parsed = parseTypedResource('agents.d/worker.yaml', `
+kind: Agent
+version: 1
+id: worker
+spec:
+  role: Worker
+  brain: {template: cheap}
+  identity: {name: Worker, ownership: existing}
+  lifecycle: persistent
+  permissions: {approval: ask, filesystem: workspace, unattended: wait}
+  runtime:
+    supervision: {coordinator: coordinator, oversee: [{role: helper, interval: 30s}]}
+    isolation: {backend: bubblewrap, network: allowlist, allow_hosts: [broker.example], resources: {cpu: '1.5', mem: 2G, pids: 64}}
+    owner_channel:
+      identity: fleet-owner
+      owners: [AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA]
+      attachments: {max_files_per_request: 2, allowed_mime: [text/plain]}
+    monitoring: {mode: fleet, wake_sources: [message_received], batch_ms: 50}
+    worklog: {max_kb: 2048}
+    scheduling: {cwd: /work, max_tokens: 100000, autocompact_pct: 80}
+`);
+    expect(parsed).toMatchObject({ kind: 'Agent', spec: { runtime: {
+      supervision: { coordinator: 'coordinator' }, isolation: { backend: 'bubblewrap' },
+      owner_channel: {
+        identity: 'fleet-owner',
+        owners: ['aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'],
+        attachments: { max_files_per_request: 2 },
+      },
+      monitoring: { mode: 'fleet', batch_ms: 50 }, worklog: { max_kb: 2048 },
+      scheduling: { cwd: '/work' },
+    } } });
+    const runtime = (parsed as { spec: { runtime: Record<string, unknown> } }).spec.runtime;
+    expect(runtime.owner_channel).not.toHaveProperty('comments');
+    expect(runtime.monitoring).not.toHaveProperty('inject');
+    expect(runtime.worklog).not.toHaveProperty('keep_tail_kb');
+  });
+
+  it('uses the same pure owner-channel and worklog normalization as legacy resolution', () => {
+    const cid = 'AbCdEf12'.repeat(8);
+    const owner = validateOwnerChannelPolicyInput({
+      identity: ' owner-channel ', owners: [cid], comments: false,
+      attachments: { max_file_bytes: 100, max_request_bytes: 200 },
+    });
+    expect(owner).toEqual({
+      identity: 'owner-channel', owners: [cid.toLowerCase()], comments: false,
+      attachments: { max_file_bytes: 100, max_request_bytes: 200 },
+    });
+    expect(resolveOwnerChannelConfig(undefined, {
+      identity: ' owner-channel ', owners: [cid], comments: false,
+      attachments: { max_file_bytes: 100, max_request_bytes: 200 },
+    }, 'acp')).toMatchObject(owner);
+    expect(validateWorklogPolicyInput({ max_kb: 512, keep_tail_kb: 64 })).toEqual({
+      max_kb: 512, keep_tail_kb: 64,
+    });
+    expect(resolveWorklogPolicy(undefined, { max_kb: 512, keep_tail_kb: 64 }))
+      .toMatchObject({ max_kb: 512, keep_tail_kb: 64 });
+  });
+
+  it.each([
+    ['owner duplicate CIDs', `owner_channel: {identity: owner, owners: [${'A'.repeat(64)}, ${'a'.repeat(64)}]}`, /duplicates/u],
+    ['owner attachment lower bound', 'owner_channel: {identity: owner, owners: [cid], attachments: {max_files_per_request: 0}}', /integer from 1 to 32/u],
+    ['owner attachment cross-field bound', 'owner_channel: {identity: owner, owners: [cid], attachments: {max_file_bytes: 20, max_request_bytes: 10}}', /at least max_file_bytes/u],
+    ['owner unsafe progress integer', `owner_channel: {identity: owner, owners: [cid], progress_interval_ms: ${Number.MAX_SAFE_INTEGER + 1}}`, /safe integer/u],
+    ['worklog archive bound', 'worklog: {max_archives: 1001}', /at most 1000/u],
+    ['worklog cross-field bound', 'worklog: {max_kb: 10, keep_tail_kb: 10}', /less than max_kb/u],
+    ['monitor wake source', 'monitoring: {wake_sources: [message_recieved]}', /unknown source/u],
+    ['monitor zero batch', 'monitoring: {batch_ms: 0}', /at least 1/u],
+    ['monitor unsafe threshold', `monitoring: {turn_fail_threshold: ${Number.MAX_SAFE_INTEGER + 1}}`, /positive integer/u],
+    ['isolation list shape', 'isolation: {fs: {read: nope}}', /list of non-empty strings/u],
+    ['isolation resource value', 'isolation: {resources: {pids: 0}}', /positive safe integer/u],
+    ['scheduling percentage', 'scheduling: {autocompact_pct: 101}', /at most 100/u],
+    ['native runtime option', 'native_options: {command: codex}', /unknown key/u],
+    ['malformed supervision interval', 'supervision: {oversee: [{role: helper, interval: soon}]}', /invalid duration/u],
+    ['zero supervision interval', 'supervision: {oversee: [{role: helper, interval: 0s}]}', /below the minimum/u],
+    ['unsafe supervision interval', `supervision: {oversee: [{role: helper, interval: ${'9'.repeat(30)}d}]}`, /too large/u],
+  ])('rejects invalid portable Agent runtime input: %s', (_name, runtime, error) => {
+    expect(() => parseTypedResource('agent.yaml', `
+kind: Agent
+version: 1
+id: worker
+spec:
+  role: Worker
+  brain: {template: cheap}
+  identity: {name: Worker, ownership: existing}
+  lifecycle: persistent
+  permissions: {approval: ask, filesystem: workspace, unattended: wait}
+  runtime: {${runtime}}
+`)).toThrow(error);
+  });
+
+  it('defers build capability admission while retaining intrinsic monitor validation', () => {
+    expect(parseTypedResource('agent.yaml', `
+kind: Agent
+version: 1
+id: worker
+spec:
+  role: Worker
+  brain: {template: cheap}
+  identity: {name: Worker, ownership: existing}
+  lifecycle: persistent
+  permissions: {approval: ask, filesystem: workspace, unattended: wait}
+  runtime: {monitoring: {interrupt: after_tool}}
+`)).toMatchObject({ spec: { runtime: { monitoring: { interrupt: 'after_tool' } } } });
+  });
+
+  it('reports exact monitor and isolation leaf paths', () => {
+    for (const [runtime, leaf] of [
+      ['monitoring: {turn_fail_threshold: 0}', '$.spec.runtime.monitoring.turn_fail_threshold'],
+      ['isolation: {resources: {pids: 0}}', '$.spec.runtime.isolation.resources.pids'],
+    ] as const) {
+      expect(() => parseTypedResource('agent.yaml', `
+kind: Agent
+version: 1
+id: worker
+spec:
+  role: Worker
+  brain: {template: cheap}
+  identity: {name: Worker, ownership: existing}
+  lifecycle: persistent
+  permissions: {approval: ask, filesystem: workspace, unattended: wait}
+  runtime: {${runtime}}
+`)).toThrow(`agent.yaml:${leaf}`);
+    }
   });
 
   it('parses heterogeneous RoomTemplate members with bounded overrides', () => {

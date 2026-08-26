@@ -3,7 +3,7 @@ import { mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync } from 'node:
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
-  IsolationPolicyError, canonicalPath, mountConflict, resolveIsolation,
+  IsolationPolicyError, canonicalPath, mountConflict, resolveIsolation, validateIsolationConfig,
 } from '../src/isolation/policy.js';
 import { makeBubblewrapBackend } from '../src/isolation/bubblewrap.js';
 import type { WrapContext } from '../src/isolation/types.js';
@@ -17,6 +17,28 @@ const ctx = (over: Partial<WrapContext> = {}): WrapContext => ({
 
 const srcs = (r: ReturnType<typeof resolveIsolation>) => r.mounts.map(m => m.src);
 const mount = (r: ReturnType<typeof resolveIsolation>, src: string) => r.mounts.find(m => m.src === src);
+
+describe('validateIsolationConfig local input', () => {
+  it('accepts typed local policy without runtime probing', () => {
+    expect(validateIsolationConfig({
+      backend: 'bubblewrap', fs: { read: ['/opt'], write: ['/work'] },
+      network: 'allowlist', allow_hosts: ['broker.example'],
+      resources: { cpu: '1.5', mem: '2G', pids: 64 }, secrets: ['/run/secret'],
+    })).toEqual([]);
+  });
+
+  it.each([
+    [{ fs: { read: 'nope' } }, /fs.read: must be a list/u],
+    [{ fs: { write: ['/work', '/work'] } }, /must not contain duplicates/u],
+    [{ allow_hosts: [42] }, /allow_hosts: must be a list/u],
+    [{ secrets: ['', '/run/good'] }, /secrets: must be a list/u],
+    [{ resources: { cpu: '0' } }, /cpu: must be a positive decimal/u],
+    [{ resources: { mem: '-1G' } }, /mem: must be a positive size/u],
+    [{ resources: { pids: Number.MAX_SAFE_INTEGER + 1 } }, /pids: must be a positive safe/u],
+  ])('rejects unsafe local values without invoking runtime resolution: %j', (input, error) => {
+    expect(validateIsolationConfig(input).join('; ')).toMatch(error);
+  });
+});
 
 describe('resolveIsolation defaults', () => {
   it('empty isolation fills sane defaults', () => {
