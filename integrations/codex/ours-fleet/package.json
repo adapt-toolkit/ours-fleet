@@ -1,6 +1,6 @@
 {
   "name": "@ours.network/fleet-codex",
-  "version": "1.0.3",
+  "version": "1.0.4",
   "description": "Native Codex plugin for spawning, configuring, and overseeing ours-fleet agents.",
   "type": "module",
   "license": "FSL-1.1-Apache-2.0",
