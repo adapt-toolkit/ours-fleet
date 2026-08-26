@@ -77,7 +77,7 @@ function authorizedInput(
 }
 
 const rows = (['codex', 'claude-code'] as const).flatMap(harness =>
-  (['ask', 'auto', 'allow', 'deny'] as const).flatMap(approval =>
+  (['ask', 'auto', 'allow'] as const).flatMap(approval =>
     (['read-only', 'workspace', 'unrestricted'] as const).flatMap(filesystem =>
       (['deny', 'wait'] as const).map(unattended =>
         ({ harness, approval, filesystem, unattended })))));
@@ -255,6 +255,19 @@ describe('exact Brain adapter policy resolution', () => {
     expect(() => prepare(input)).toThrow(/immutable data properties/u);
     expect(() => prepare(input)).not.toThrow(/secret-provider-model/u);
   });
+
+  it.each([
+    ['legacy-only approval', { approval: 'deny', filesystem: 'workspace', unattended: 'deny' }],
+    ['unknown approval', { approval: 'sometimes', filesystem: 'workspace', unattended: 'deny' }],
+    ['unknown filesystem', { approval: 'ask', filesystem: 'host', unattended: 'deny' }],
+    ['unknown unattended', { approval: 'ask', filesystem: 'workspace', unattended: 'continue' }],
+  ])('rejects raw-cast invalid durable %s', (_label, rawPermissions) => {
+    const selectedBrain = brain('codex');
+    const policy = evidence(codexPolicy());
+    const portable = rawPermissions as PermissionSpec;
+    expect(() => authorizedResolve(authorizedInput(selectedBrain, portable, policy)))
+      .toThrow(/durable Agent permission value is invalid/u);
+  });
 });
 
 describe('Brain tuple registry and legacy translation parity', () => {
@@ -290,6 +303,17 @@ describe('Brain tuple registry and legacy translation parity', () => {
     if (!legacy.supported) throw new Error('expected supported translation');
     expect(legacy.native).toEqual(shared.legacyNative);
   });
+
+  it.each(['codex', 'claude-code'] as const)(
+    'preserves legacy-only approval=deny translation parity for %s', harness => {
+      const portable = { approval: 'deny', filesystem: 'workspace', unattended: 'deny' } as const;
+      const shared = translatePortablePermissionCodes(harness, portable);
+      const legacy = getAdapter(harness).translatePermissions(portable as PermissionSpec);
+      expect(legacy.supported).toBe(true);
+      if (!legacy.supported) throw new Error('expected supported legacy translation');
+      expect(legacy.native).toEqual(shared.legacyNative);
+    },
+  );
 
   it('shares Claude launch-helper mode selection without executing a launch', async () => {
     const { nativePermissionMode } = await import('../src/harness/claude-code.js');

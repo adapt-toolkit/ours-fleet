@@ -251,6 +251,10 @@ function resolveExactPolicy(
   exactObject(input, 'Brain adapter input', ['brain', 'permissions', 'policy', 'enforcementEvidence']);
   exactObject(input.brain, 'Brain', ['harness', 'model', 'effort', 'session']);
   exactObject(input.permissions, 'permissions', ['approval', 'filesystem', 'unattended']);
+  if (!['ask', 'auto', 'allow'].includes(input.permissions.approval)
+      || !['read-only', 'workspace', 'unrestricted'].includes(input.permissions.filesystem)
+      || !['deny', 'wait'].includes(input.permissions.unattended))
+    throw new BrainAdapterPolicyError('durable Agent permission value is invalid');
   const harness = adapter.harness as 'codex' | 'claude-code';
   if (input.brain.harness !== harness) throw new BrainAdapterPolicyError('Brain harness does not match adapter');
   if (input.brain.session !== 'acp') throw new BrainAdapterPolicyError('Brain session is unsupported; expected acp');
