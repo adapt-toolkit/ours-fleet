@@ -134,13 +134,12 @@ async function retireMember(
   let current = room.member_seats.find(candidate => candidate.role_name === seat.role_name)!;
   let retirement = current.retirement;
   if (!retirement) {
-    if (current.launch?.state === 'pending' && current.launch.attempt === 0) {
+    if (!current.launch && !current.identity_cid) {
       if (existsSync(agentDir(current.role_name, true))) {
         throw new Error(
           `never-launched room member '${current.role_name}' unexpectedly has Fleet temp state`,
         );
       }
-      await (deps.removeIdentity ?? removeExactMemberIdentity)(current);
       advanceMemberRetirement(
         roomId, current.role_name, 'identity_absent', 'never-launched',
       );
