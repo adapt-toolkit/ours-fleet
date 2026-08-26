@@ -31,7 +31,6 @@ const dirs: string[] = [];
 const attachmentConfig: OwnerAttachmentConfig = {
   enabled: true, max_files_per_request: 4, max_file_bytes: 1_024,
   max_request_bytes: 2_048, retention_ms: 60_000,
-  allowed_mime: ['text/plain', 'application/pdf', 'image/png', 'audio/ogg'],
 };
 
 const EMPTY_CONTACTS: OursContactsView = {
@@ -258,7 +257,7 @@ describe('owner-channel attachment ingress', () => {
     await status.channel.close();
   });
 
-  it('rejects unauthorized, oversized, and disallowed metadata before retrieving bytes', async () => {
+  it('rejects unauthorized and oversized metadata before retrieving bytes', async () => {
     const unauthorized = await setup();
     unauthorized.client.files = [listed({ from: { id: OTHER, name: 'Impostor' } })];
     await unauthorized.channel.drain();
@@ -266,15 +265,13 @@ describe('owner-channel attachment ingress', () => {
     expect(unauthorized.client.calls.some(call => call.name === 'sendMessage')).toBe(false);
     await unauthorized.channel.close();
 
-    for (const overrides of [{ size: 2_000 }, { mime: 'application/x-executable' }]) {
-      const rejected = await setup();
-      rejected.client.files = [listed(overrides)];
-      await rejected.channel.drain();
-      expect(rejected.client.calls.some(call => call.name === 'getFiles')).toBe(false);
-      expect(rejected.client.calls.find(call => call.name === 'sendMessage')?.args)
-        .toMatchObject({ contact: OWNER, replyToWireId: FILE_WIRE });
-      await rejected.channel.close();
-    }
+    const oversized = await setup();
+    oversized.client.files = [listed({ size: 2_000 })];
+    await oversized.channel.drain();
+    expect(oversized.client.calls.some(call => call.name === 'getFiles')).toBe(false);
+    expect(oversized.client.calls.find(call => call.name === 'sendMessage')?.args)
+      .toMatchObject({ contact: OWNER, replyToWireId: FILE_WIRE });
+    await oversized.channel.close();
 
     const overCount = await setup();
     overCount.client.batches.push([{
@@ -704,7 +701,7 @@ describe('managed-agent attachment egress', () => {
     await status.channel.close();
   });
 
-  it('does not weaken owner ingress MIME policy when agent egress is configured', async () => {
+  it('relays owner Markdown ingress when agent egress is configured', async () => {
     const status = await setup([OWNER], false, attachmentConfig, AGENT);
     const bytes = Buffer.from('# owner markdown');
     const source = join(status.dir, 'owner.md');
@@ -714,10 +711,12 @@ describe('managed-agent attachment egress', () => {
       filename: 'owner.md', mime: 'text/markdown',
     }));
     await status.channel.drain();
-    expect(status.client.calls.some(call => call.name === 'getFiles')).toBe(false);
+    expect(status.client.calls.some(call => call.name === 'getFiles')).toBe(true);
     expect(status.client.calls.some(call => call.name === 'sendFile')).toBe(false);
-    expect(status.client.calls.find(call => call.name === 'sendMessage')?.args?.text)
-      .toContain('MIME type text/markdown is not allowed');
+    expect(status.queuePrompt).toHaveBeenCalledOnce();
+    expect(String(status.queuePrompt.mock.calls[0][0])).toContain('declared MIME: text/markdown');
+    status.finish({ accepted: true, outcome: 'completed', succeeded: true, output: 'Read.' });
+    await vi.waitFor(() => expect(status.client.calls.some(call => call.args?.text === 'Read.')).toBe(true));
     await status.channel.close();
   });
 
@@ -832,6 +831,8 @@ describe('attachment admission and recovery primitives', () => {
     dirs.push(root);
     const dir = await prepareAttachmentDirectory(join(root, 'inbox'), 'request');
     expect(sanitizeFilename('../../\\..\\secret?.txt')).toBe('secret_.txt');
+    expect(sanitizeFilename('../bad\u0000\u0007\u202ename.md')).toBe('bad   name.md');
+    expect(sanitizeFilename('../bad\u0000\u0007\u202ename.md')).not.toMatch(/[\u0000-\u001f\u007f-\u009f\u202a-\u202e\u2066-\u2069]/u);
     const source = join(root, 'source');
     const link = join(root, 'link');
     writeFileSync(source, 'hello');
@@ -870,14 +871,14 @@ describe('attachment admission and recovery primitives', () => {
     expect(() => parseRetrievedAttachments(raw, [expected])).toThrow(/provenance or integrity/);
   });
 
-  it('keeps MIME strict for owner ingress but report-only for bounded agent egress', async () => {
+  it('accepts arbitrary declared MIME and reports detection without type rejection', async () => {
     const incoming = {
       ...(listed({ mime: 'text/html' }) as unknown as IncomingAttachment),
       fileId: 7, wireId: FILE_WIRE, senderId: AGENT, senderName: 'Agent',
       filename: 'page.html', mime: 'text/html', size: 13, status: 'unread', date: '',
       kind: 'file' as const, replyTo: null,
     };
-    expect(validateAttachmentSelection([incoming], attachmentConfig)).toMatch(/not allowed/);
+    expect(validateAttachmentSelection([incoming], attachmentConfig)).toBeUndefined();
     expect(validateAttachmentRelaySelection([incoming], attachmentConfig)).toBeUndefined();
 
     const root = mkdtempSync(join(tmpdir(), 'ours-egress-mime-'));
@@ -890,11 +891,39 @@ describe('attachment admission and recovery primitives', () => {
       ...incoming, size: bytes.length, path: source,
       sha256: createHash('sha256').update(bytes).digest('hex'),
     };
-    await expect(admitAttachments([retrievedFile], dir, attachmentConfig))
-      .rejects.toThrow(/does not match declared MIME/);
-    const staged = await admitAttachments(
-      [retrievedFile], dir, attachmentConfig, { mimePolicy: 'report-only' });
+    const staged = await admitAttachments([retrievedFile], dir, attachmentConfig);
     expect(staged[0]).toMatchObject({ declaredMime: 'text/html', detectedMime: 'text/plain' });
+  });
+
+  it('accepts empty, custom binary, misleading-extension, and extensionless files', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'ours-opaque-types-'));
+    dirs.push(root);
+    const dir = await prepareAttachmentDirectory(join(root, 'inbox'), 'request');
+    const cases = [
+      { filename: 'empty', mime: 'application/x-empty', bytes: Buffer.alloc(0),
+        detected: 'application/octet-stream' },
+      { filename: 'payload.jpg', mime: 'application/x-custom', bytes: Buffer.from([0, 1, 2, 3]),
+        detected: 'application/octet-stream' },
+      { filename: 'README', mime: '', bytes: Buffer.from('# Markdown'), detected: 'text/plain' },
+    ];
+    const files: RetrievedAttachment[] = cases.map((item, index) => {
+      const path = join(root, `source-${index}`);
+      writeFileSync(path, item.bytes);
+      return {
+        ...(listed() as unknown as IncomingAttachment), fileId: index + 1,
+        wireId: String(index + 4).repeat(64), senderId: OWNER, senderName: 'Phone',
+        filename: item.filename, mime: item.mime, size: item.bytes.length, status: 'read',
+        date: '', kind: 'file', replyTo: null, path,
+        sha256: createHash('sha256').update(item.bytes).digest('hex'),
+      };
+    });
+    expect(validateAttachmentSelection(files, attachmentConfig)).toBeUndefined();
+    const admitted = await admitAttachments(files, dir, attachmentConfig);
+    expect(admitted.map(file => ({ filename: file.filename, declaredMime: file.declaredMime,
+      detectedMime: file.detectedMime, size: file.size }))).toEqual(cases.map(item => ({
+      filename: item.filename, declaredMime: item.mime, detectedMime: item.detected,
+      size: item.bytes.length,
+    })));
   });
 
   it('persists only bounded routing metadata at mode 0600 and expires recovery directories', async () => {
@@ -925,16 +954,12 @@ describe('attachment admission and recovery primitives', () => {
   });
 });
 
-describe('voice-message MIME admission', () => {
+describe('voice-message opaque admission', () => {
   // Voice notes ride "<base>; x-ours-kind=voice-message" verbatim end to end
   // (base varies by recorder: audio/webm Chrome/Android, audio/mp4 iOS Safari,
-  // audio/ogg fallback). Policy applies to the base container type for voice
-  // messages only; ordinary files keep exact allowlist matching.
+  // audio/ogg fallback). The base is metadata only and never an admission gate.
   const VOICE_PARAM = 'x-ours-kind=voice-message';
-  const voiceConfig: OwnerAttachmentConfig = {
-    ...attachmentConfig,
-    allowed_mime: [...attachmentConfig.allowed_mime, 'audio/webm', 'audio/mp4'],
-  };
+  const voiceConfig: OwnerAttachmentConfig = attachmentConfig;
   const WEBM = Buffer.concat([Buffer.from([0x1a, 0x45, 0xdf, 0xa3]), Buffer.from('webm-voice')]);
   const M4A = Buffer.concat([Buffer.from([0, 0, 0, 0x18]), Buffer.from('ftypM4A voice')]);
 
@@ -954,24 +979,21 @@ describe('voice-message MIME admission', () => {
     }
   });
 
-  it('keeps voice admission fail-closed outside the allowlisted audio bases', () => {
-    // Base container absent from the allowlist: still rejected.
+  it('accepts voice metadata regardless of base type while preserving byte limits', () => {
     expect(validateAttachmentSelection(
-      [incoming(`audio/webm; ${VOICE_PARAM}`)], attachmentConfig)).toMatch(/not allowed/);
-    // Forged voice marker on a non-audio type: rejected even though the base is allowlisted.
+      [incoming(`audio/webm; ${VOICE_PARAM}`)], attachmentConfig)).toBeUndefined();
     expect(validateAttachmentSelection(
-      [incoming(`application/pdf; ${VOICE_PARAM}`)], voiceConfig)).toBeTruthy();
-    // Voice-kind limits unchanged: oversize voice files still fail.
+      [incoming(`application/pdf; ${VOICE_PARAM}`)], voiceConfig)).toBeUndefined();
     expect(validateAttachmentSelection(
       [incoming(`audio/webm; ${VOICE_PARAM}`, 'voice_message', { size: 2_000 })],
       voiceConfig)).toMatch(/byte limit/);
   });
 
-  it('leaves ordinary-file policy byte-identical: parameters never match the allowlist', () => {
+  it('accepts parameterized and bare MIME metadata for ordinary files', () => {
     expect(validateAttachmentSelection(
-      [incoming('audio/webm; codecs=opus', 'file')], voiceConfig)).toMatch(/not allowed/);
+      [incoming('audio/webm; codecs=opus', 'file')], voiceConfig)).toBeUndefined();
     expect(validateAttachmentSelection(
-      [incoming(`audio/webm; ${VOICE_PARAM}`, 'file')], voiceConfig)).toMatch(/not allowed/);
+      [incoming(`audio/webm; ${VOICE_PARAM}`, 'file')], voiceConfig)).toBeUndefined();
     expect(validateAttachmentSelection(
       [incoming('audio/webm', 'file')], voiceConfig)).toBeUndefined();
   });
@@ -996,11 +1018,13 @@ describe('voice-message MIME admission', () => {
     });
     const admitted = await admitAttachments(files, dir, voiceConfig);
     expect(admitted.map(file => file.detectedMime)).toEqual(['audio/webm', 'audio/mp4']);
-    expect(admitted.map(file => file.declaredMime)).toEqual(['audio/webm', 'audio/mp4']);
+    expect(admitted.map(file => file.declaredMime)).toEqual([
+      `audio/webm; ${VOICE_PARAM}`, `audio/mp4; ${VOICE_PARAM}`,
+    ]);
     expect(admitted.map(file => file.kind)).toEqual(['voice_message', 'voice_message']);
   });
 
-  it('still rejects voice bytes whose content contradicts the declared base container', async () => {
+  it('accepts voice bytes whose detection contradicts the declared base container', async () => {
     const root = mkdtempSync(join(tmpdir(), 'ours-voice-forged-'));
     dirs.push(root);
     const dir = await prepareAttachmentDirectory(join(root, 'inbox'), 'request');
@@ -1011,8 +1035,10 @@ describe('voice-message MIME admission', () => {
       ...incoming(`audio/webm; ${VOICE_PARAM}`, 'voice_message', { size: bytes.length }),
       path: source, sha256: createHash('sha256').update(bytes).digest('hex'),
     };
-    await expect(admitAttachments([file], dir, voiceConfig))
-      .rejects.toThrow(/does not match declared MIME/);
+    const [admitted] = await admitAttachments([file], dir, voiceConfig);
+    expect(admitted).toMatchObject({
+      declaredMime: `audio/webm; ${VOICE_PARAM}`, detectedMime: 'application/pdf',
+    });
   });
 
   it('routes an authenticated WebM voice message end to end with its transcript', async () => {

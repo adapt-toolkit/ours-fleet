@@ -3,10 +3,7 @@ import { existsSync, readFileSync } from 'node:fs';
 import { mkdir, readFile, readdir, rm } from 'node:fs/promises';
 import { join } from 'node:path';
 
-import {
-  DEFAULT_OWNER_ATTACHMENT_MIME, canonicalCid,
-  type OwnerAttachmentConfig, type OwnerChannelConfig,
-} from '../config.js';
+import { canonicalCid, type OwnerAttachmentConfig, type OwnerChannelConfig } from '../config.js';
 import { replaceFileAtomically } from '../atomic-file.js';
 import { TaskRoomApplicationService } from '../application/task-room-service.js';
 import { RoleLifecycleService } from '../application/role-command-service.js';
@@ -261,7 +258,6 @@ export class OwnerChannel implements OwnerChannelHandle {
     this.attachmentConfig = options.config.attachments ?? {
       enabled: true, max_files_per_request: 4, max_file_bytes: 10 * 1024 * 1024,
       max_request_bytes: 20 * 1024 * 1024, retention_ms: 24 * 60 * 60 * 1_000,
-      allowed_mime: [...DEFAULT_OWNER_ATTACHMENT_MIME],
     };
     const integrity = this.authorizationIntegrity();
     if (!integrity.ok)
@@ -1525,8 +1521,7 @@ export class OwnerChannel implements OwnerChannelHandle {
       }
       const order = new Map(group.files.map((file, index) => [file.wireId, index]));
       retrieved.sort((a, b) => order.get(a.wireId)! - order.get(b.wireId)!);
-      const admitted = await admitAttachments(
-        retrieved, requestDir, this.attachmentConfig, { mimePolicy: 'report-only' });
+      const admitted = await admitAttachments(retrieved, requestDir, this.attachmentConfig);
 
       const digest = createHash('sha256').update(
         `managed-agent-attachment\0${handledWireIds.slice().sort().join('\0')}`,
