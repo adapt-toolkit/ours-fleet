@@ -1,7 +1,12 @@
 import { createHash } from 'node:crypto';
+import { isAbsolute } from 'node:path';
 import type { AdapterValidationRecord } from '../agent-plan.js';
 import { computeBrainDigest, computePermissionsDigest } from '../agent-plan.js';
 import type { BrainSpec, PermissionSpec } from '../config-resources.js';
+import {
+  recheckBundledAcpAgent, resolveAuthenticatedBundledAcpAgent,
+  type AcpAgentResolution, type AcpBundleIdentity,
+} from './acp-agent.js';
 
 const TOKEN = /^[A-Za-z0-9][A-Za-z0-9._:-]*$/u;
 const FIELD = /^[A-Za-z0-9][A-Za-z0-9._:/-]*$/u;
@@ -73,7 +78,9 @@ export interface TrustedAdapterEnforcementBindings {
     kind: 'bundled' | 'fallback';
     packageName: string;
     manifestPath?: string;
+    entrypointPath?: string;
     version?: string;
+    identity?: Readonly<AcpBundleIdentity>;
   }>;
   enforcement: Readonly<Record<'approval' | 'filesystem' | 'unattended', EnforcementOwner>>;
 }
@@ -98,6 +105,17 @@ function canonical(value: unknown): string {
     if (child === undefined) throw new BrainAdapterPolicyError(`adapter policy.${key} must not be undefined`);
     return `${JSON.stringify(key)}:${canonical(child)}`;
   }).join(',')}}`;
+}
+
+function rejectAccessors(value: unknown, name: string, seen = new Set<object>()): void {
+  if (!value || typeof value !== 'object' || seen.has(value as object)) return;
+  seen.add(value as object);
+  for (const key of Object.keys(value)) {
+    const descriptor = Object.getOwnPropertyDescriptor(value, key);
+    if (!descriptor || descriptor.get || descriptor.set)
+      throw new BrainAdapterPolicyError(`${name} must contain only immutable data properties`);
+    rejectAccessors(descriptor.value, `${name}.${key}`, seen);
+  }
 }
 
 export const computeBrainAdapterPolicyDigest = (revision: string, value: BrainAdapterPolicy): string =>
@@ -225,8 +243,11 @@ const EFFORTS = {
 
 function resolveExactPolicy(
   adapter: BrainAdapter, input: BrainAdapterResolutionInput,
-  authority?: BrainAdapterEvidenceAuthority,
+  authority?: BrainAdapterEvidenceAuthority, actualLaunch?: AcpAgentResolution,
 ): AdapterValidationRecord {
+  rejectAccessors(input.brain, 'Brain');
+  rejectAccessors(input.permissions, 'permissions');
+  rejectAccessors(input.policy, 'adapter policy evidence');
   exactObject(input, 'Brain adapter input', ['brain', 'permissions', 'policy', 'enforcementEvidence']);
   exactObject(input.brain, 'Brain', ['harness', 'model', 'effort', 'session']);
   exactObject(input.permissions, 'permissions', ['approval', 'filesystem', 'unattended']);
@@ -250,15 +271,19 @@ function resolveExactPolicy(
   const policyDigest = input.policy.digest;
   const brainDigest = computeBrainDigest(input.brain);
   const permissionsDigest = computePermissionsDigest(input.permissions);
-  const trusted = authority?.authenticateAdapterEvidence(input.enforcementEvidence);
-  if (!trusted) throw new BrainAdapterPolicyError('adapter enforcement evidence was not authenticated');
+  const authenticated = authority?.authenticateAdapterEvidence(input.enforcementEvidence);
+  if (!authenticated) throw new BrainAdapterPolicyError('adapter enforcement evidence was not authenticated');
+  rejectAccessors(authenticated, 'trusted adapter bindings');
+  const trusted = JSON.parse(canonical(authenticated)) as TrustedAdapterEnforcementBindings;
   exactObject(trusted, 'trusted adapter bindings', [
     'harness', 'session', 'adapterId', 'adapterVersion', 'policyDigest', 'brainDigest',
     'permissionsDigest', 'launch', 'enforcement',
   ]);
   exactObject(trusted.launch, 'trusted adapter launch', [
     'kind', 'packageName', ...(trusted.launch.manifestPath === undefined ? [] : ['manifestPath']),
+    ...(trusted.launch.entrypointPath === undefined ? [] : ['entrypointPath']),
     ...(trusted.launch.version === undefined ? [] : ['version']),
+    ...(trusted.launch.identity === undefined ? [] : ['identity']),
   ]);
   exactObject(trusted.enforcement, 'trusted adapter enforcement', ['approval', 'filesystem', 'unattended']);
   const expectedPackage = harness === 'codex'
@@ -272,11 +297,18 @@ function resolveExactPolicy(
       || trusted.permissionsDigest !== permissionsDigest
       || trusted.launch.kind !== 'bundled' || trusted.launch.packageName !== expectedPackage
       || trusted.launch.version !== adapter.adapterVersion || !trusted.launch.manifestPath
-      || !trusted.launch.manifestPath.startsWith('/')
+      || !isAbsolute(trusted.launch.manifestPath) || !trusted.launch.entrypointPath
+      || !isAbsolute(trusted.launch.entrypointPath) || !trusted.launch.identity
       || trusted.enforcement.approval !== expectedOwners.approval
       || trusted.enforcement.filesystem !== expectedOwners.filesystem
       || trusted.enforcement.unattended !== expectedOwners.unattended)
     throw new BrainAdapterPolicyError('trusted adapter enforcement bindings do not match this resolution');
+  if (actualLaunch && (!actualLaunch.bundled || !actualLaunch.identity
+      || actualLaunch.manifestPath !== trusted.launch.manifestPath
+      || actualLaunch.entrypointPath !== trusted.launch.entrypointPath
+      || actualLaunch.version !== trusted.launch.version
+      || canonical(actualLaunch.identity) !== canonical(trusted.launch.identity)))
+    throw new BrainAdapterPolicyError('actual ACP bundle does not match trusted launch evidence');
   const enforcement = {
     approval: { owner: expectedOwners.approval, policyDigest },
     filesystem: { owner: expectedOwners.filesystem, policyDigest },
@@ -347,4 +379,60 @@ export function createBrainAdapterPolicyResolver(
   return input => resolveExactPolicy(
     getBrainAdapter(input.brain.harness, input.brain.session), input, bound,
   );
+}
+
+const ephemeralLaunchBrand: unique symbol = Symbol('ephemeral Brain launch');
+export interface EphemeralPreparedBrainLaunch {
+  readonly [ephemeralLaunchBrand]: true;
+  readonly validation: AdapterValidationRecord;
+  readonly argv: readonly string[];
+  readonly env: Readonly<Record<string, string>>;
+  readonly model: string;
+  readonly effort: string;
+  readonly native: PortablePermissionCodes;
+  recheckAtSideEffectBoundary(): boolean;
+  toJSON(): never;
+}
+
+/**
+ * Bind durable validation and ephemeral launch material to one immutable, zero-launch snapshot.
+ * Availability evidence still comes only from the configured owning authority.
+ */
+export function createBrainAdapterPreparer(
+  authority: BrainAdapterEvidenceAuthority,
+): (input: BrainAdapterResolutionInput) => EphemeralPreparedBrainLaunch {
+  if (!authority || typeof authority.authenticateAdapterEvidence !== 'function')
+    throw new BrainAdapterPolicyError('Brain adapter preparer boundary is invalid');
+  const authenticateAdapterEvidence = authority.authenticateAdapterEvidence.bind(authority);
+  const bound: BrainAdapterEvidenceAuthority = { authenticateAdapterEvidence };
+  return rawInput => {
+    rejectAccessors(rawInput, 'Brain adapter input');
+    const snapshot = JSON.parse(canonical({
+      brain: rawInput.brain, permissions: rawInput.permissions, policy: rawInput.policy,
+    })) as Omit<BrainAdapterResolutionInput, 'enforcementEvidence'>;
+    const input = Object.freeze({ ...snapshot, enforcementEvidence: rawInput.enforcementEvidence });
+    const adapter = getBrainAdapter(input.brain.harness, input.brain.session);
+    const codex = adapter.harness === 'codex';
+    const packageName = codex
+      ? '@agentclientprotocol/codex-acp' : '@agentclientprotocol/claude-agent-acp';
+    const binName = codex ? 'codex-acp' : 'claude-agent-acp';
+    const resolution = resolveAuthenticatedBundledAcpAgent(packageName, binName, binName);
+    if (!resolution.bundled || !resolution.identity)
+      throw new BrainAdapterPolicyError('authenticated bundled ACP launch is unavailable');
+    if (!Array.isArray(resolution.argv) || !resolution.argv.length || resolution.argv.length > 64
+        || resolution.argv.some(arg => typeof arg !== 'string' || !arg.length
+          || Buffer.byteLength(arg) > 4096 || /[\0\r\n]/u.test(arg)))
+      throw new BrainAdapterPolicyError('prepared ACP argv is invalid or exceeds bounds');
+    const validation = resolveExactPolicy(adapter, input, bound, resolution);
+    const native = Object.freeze(translatePortablePermissionCodes(
+      adapter.harness as 'codex' | 'claude-code', input.permissions,
+    ));
+    return Object.freeze({
+      [ephemeralLaunchBrand]: true as const, validation,
+      argv: Object.freeze([...resolution.argv]), env: Object.freeze({}),
+      model: input.brain.model, effort: input.brain.effort, native,
+      recheckAtSideEffectBoundary: () => recheckBundledAcpAgent(resolution),
+      toJSON: (): never => { throw new BrainAdapterPolicyError('ephemeral Brain launch cannot be serialized'); },
+    });
+  };
 }

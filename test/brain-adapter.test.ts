@@ -1,13 +1,14 @@
 import { describe, expect, it } from 'vitest';
 import {
   BrainAdapterRegistry, computeBrainAdapterPolicyDigest, computeModelCatalogDigest,
-  createBrainAdapterPolicyResolver, getBrainAdapter, resolveBrainAdapterPolicy,
+  createBrainAdapterPolicyResolver, createBrainAdapterPreparer, getBrainAdapter, resolveBrainAdapterPolicy,
   translatePortablePermissionCodes,
   type BrainAdapterEvidenceAuthority, type BrainAdapterPolicy, type BrainAdapterPolicyEvidence,
   type BrainAdapterResolutionInput, type TrustedAdapterEnforcementBindings,
   type VerifiedAdapterEnforcementEvidence,
 } from '../src/harness/brain-adapter.js';
 import { computeBrainDigest, computePermissionsDigest } from '../src/agent-plan.js';
+import { resolveAuthenticatedBundledAcpAgent } from '../src/harness/acp-agent.js';
 import { getAdapter } from '../src/harness/registry.js';
 import type { BrainSpec, PermissionSpec } from '../src/config-resources.js';
 import '../src/harness/codex.js';
@@ -57,7 +58,14 @@ function authorizedInput(
       kind: 'bundled', packageName: codex
         ? '@agentclientprotocol/codex-acp' : '@agentclientprotocol/claude-agent-acp',
       manifestPath: codex ? '/trusted/codex-acp/package.json' : '/trusted/claude-agent-acp/package.json',
+      entrypointPath: codex ? '/trusted/codex-acp/index.js' : '/trusted/claude-agent-acp/index.js',
       version: codex ? '1.1.7' : '0.63.0',
+      identity: {
+        manifest: { path: codex ? '/trusted/codex-acp/package.json' : '/trusted/claude-agent-acp/package.json',
+          dev: '1', ino: '2', size: 10, mtimeNs: '3', sha256: `sha256:${'a'.repeat(64)}` },
+        entrypoint: { path: codex ? '/trusted/codex-acp/index.js' : '/trusted/claude-agent-acp/index.js',
+          dev: '1', ino: '4', size: 10, mtimeNs: '3', sha256: `sha256:${'b'.repeat(64)}` },
+      },
     },
     enforcement: {
       approval: 'native_adapter', filesystem: codex ? 'native_adapter' : 'fleet_isolation',
@@ -69,12 +77,33 @@ function authorizedInput(
 }
 
 const rows = (['codex', 'claude-code'] as const).flatMap(harness =>
-  (['ask', 'auto', 'allow'] as const).flatMap(approval =>
+  (['ask', 'auto', 'allow', 'deny'] as const).flatMap(approval =>
     (['read-only', 'workspace', 'unrestricted'] as const).flatMap(filesystem =>
       (['deny', 'wait'] as const).map(unattended =>
         ({ harness, approval, filesystem, unattended })))));
 
+const effortRows = (['codex', 'claude-code'] as const).flatMap(harness =>
+  (harness === 'codex'
+    ? ['low', 'medium', 'high', 'xhigh', 'max', 'ultra']
+    : ['low', 'medium', 'high', 'xhigh', 'max']).flatMap(effort =>
+    rows.filter(row => row.harness === harness).map(row => ({ ...row, effort }))));
+
 describe('exact Brain adapter policy resolution', () => {
+  it.each(effortRows)(
+    'prepares without launch and preserves parity for $harness/$effort/$approval/$filesystem/$unattended',
+    ({ harness, effort, approval, filesystem, unattended }) => {
+      const selectedBrain = brain(harness, { effort });
+      const portable = permissions(approval, filesystem, unattended);
+      const policy = evidence(harness === 'codex' ? codexPolicy() : claudePolicy());
+      const resolved = authorizedResolve(authorizedInput(selectedBrain, portable, policy));
+      expect(resolved.nativeDescriptor).toMatchObject({
+        approvalMode: translatePortablePermissionCodes(harness, portable).approvalMode,
+        filesystemMode: translatePortablePermissionCodes(harness, portable).filesystemMode,
+        unattendedMode: unattended,
+      });
+    },
+  );
+
   it.each(rows)(
     'resolves $harness $approval/$filesystem/$unattended with exact enforcement owners',
     ({ harness, approval, filesystem, unattended }) => {
@@ -185,6 +214,46 @@ describe('exact Brain adapter policy resolution', () => {
       launch: { kind: 'fallback', packageName: '@agentclientprotocol/codex-acp' },
     });
     expect(() => authorizedResolve(fallbackInput)).toThrow(/bindings do not match/u);
+  });
+
+  it('separates redacted durable validation from immutable ephemeral launch material', () => {
+    const selectedBrain = brain('codex');
+    const portable = permissions('allow', 'unrestricted', 'wait');
+    const policy = evidence(codexPolicy());
+    const input = authorizedInput(selectedBrain, portable, policy);
+    const actual = resolveAuthenticatedBundledAcpAgent(
+      '@agentclientprotocol/codex-acp', 'codex-acp', 'codex-acp',
+    );
+    expect(actual.bundled).toBe(true);
+    const original = trusted.get(input.enforcementEvidence as object)!;
+    trusted.set(input.enforcementEvidence as object, { ...original, launch: {
+      kind: 'bundled', packageName: '@agentclientprotocol/codex-acp',
+      manifestPath: actual.manifestPath, entrypointPath: actual.entrypointPath,
+      version: actual.version, identity: actual.identity,
+    } });
+    const prepare = createBrainAdapterPreparer(authority);
+    const prepared = prepare(input);
+    (selectedBrain as { model: string }).model = 'mutated-after-prepare';
+    expect(prepared.model).toBe('gpt-5.6-sol');
+    expect(prepared.argv[1]).toBe(actual.entrypointPath);
+    expect(() => JSON.stringify(prepared)).toThrow(/cannot be serialized/u);
+    expect(JSON.stringify(prepared.validation)).not.toContain(actual.entrypointPath!);
+    expect(JSON.stringify(prepared.validation)).not.toContain(actual.manifestPath!);
+    expect(() => (prepared.argv as string[]).push('mutate')).toThrow();
+    expect(prepared.recheckAtSideEffectBoundary()).toBe(true);
+  });
+
+  it('rejects getter inputs without leaking provider-private values', () => {
+    const selectedBrain = brain('codex');
+    Object.defineProperty(selectedBrain, 'model', {
+      enumerable: true, get: () => 'secret-provider-model',
+    });
+    const portable = permissions('ask', 'workspace', 'deny');
+    const policy = evidence(codexPolicy());
+    const input = authorizedInput(selectedBrain, portable, policy);
+    const prepare = createBrainAdapterPreparer(authority);
+    expect(() => prepare(input)).toThrow(/immutable data properties/u);
+    expect(() => prepare(input)).not.toThrow(/secret-provider-model/u);
   });
 });
 
