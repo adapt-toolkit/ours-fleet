@@ -144,16 +144,8 @@ function parseTranscription(value: unknown, wireId: string): { transcription?: V
   } };
 }
 
-// Voice notes ride "<base>; x-ours-kind=voice-message" verbatim end to end
-// (the recorder's real container varies: audio/webm Chrome/Android, audio/mp4
-// iOS Safari, audio/ogg fallback), so policy for voice messages applies to the
-// base container type. Ordinary files keep exact allowlist matching.
 function baseMime(mime: string): string {
   return mime.split(';')[0].trim();
-}
-
-function policyMime(file: Pick<IncomingAttachment, 'mime' | 'kind'>): string {
-  return file.kind === 'voice_message' ? baseMime(file.mime) : file.mime;
 }
 
 export function validateAttachmentSelection(
@@ -164,10 +156,6 @@ export function validateAttachmentSelection(
     return `the request exceeds the ${config.max_files_per_request}-file limit`;
   let total = 0;
   for (const file of files) {
-    const mime = policyMime(file);
-    if (file.kind === 'voice_message' && !mime.startsWith('audio/'))
-      return `voice-message MIME type ${file.mime || '(missing)'} is not an audio container`;
-    if (!config.allowed_mime.includes(mime)) return `MIME type ${file.mime || '(missing)'} is not allowed`;
     if (file.size > config.max_file_bytes)
       return `a file exceeds the ${config.max_file_bytes}-byte limit`;
     total += file.size;
@@ -179,7 +167,7 @@ export function validateAttachmentSelection(
 
 /**
  * Managed-agent -> owner egress limits. This intentionally does not consult
- * `enabled` or `allowed_mime`: those are owner -> agent admission policy.
+ * `enabled`: that is owner -> agent admission policy.
  */
 export function validateAttachmentRelaySelection(
   files: IncomingAttachment[], config: OwnerAttachmentConfig,
@@ -214,7 +202,6 @@ export async function prepareAttachmentDirectory(root: string, requestId: string
 
 export async function admitAttachments(
   files: RetrievedAttachment[], dir: string, config: OwnerAttachmentConfig,
-  options: { mimePolicy?: 'strict' | 'report-only' } = {},
 ): Promise<AdmittedAttachment[]> {
   const admitted: AdmittedAttachment[] = [];
   let total = 0;
@@ -237,11 +224,8 @@ export async function admitAttachments(
       throw new Error('retrieved attachment size or hash mismatched structured metadata');
     total += bytes.length;
     if (total > config.max_request_bytes) throw new Error('retrieved attachments exceed the request size limit');
-    const declaredMime = policyMime(file);
-    const detectedMime = detectMime(bytes, declaredMime);
-    if ((options.mimePolicy ?? 'strict') === 'strict'
-        && !mimeCompatible(declaredMime, detectedMime))
-      throw new Error(`retrieved attachment content does not match declared MIME ${declaredMime}`);
+    const declaredMime = file.mime;
+    const detectedMime = detectMime(bytes, baseMime(declaredMime));
     const filename = sanitizeFilename(file.filename);
     const finalPath = join(dir, `${index + 1}-${file.wireId.slice(0, 12)}-${filename}`);
     const tmp = join(dir, `.${basename(finalPath)}.${randomUUID()}.tmp`);
@@ -447,6 +431,7 @@ export function sanitizeFilename(value: string): string {
 }
 
 function detectMime(bytes: Buffer, declared: string): string {
+  if (bytes.length === 0) return 'application/octet-stream';
   if (bytes.subarray(0, 5).toString() === '%PDF-') return 'application/pdf';
   if (bytes.subarray(0, 8).equals(Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]))) return 'image/png';
   if (bytes[0] === 0xff && bytes[1] === 0xd8 && bytes[2] === 0xff) return 'image/jpeg';
@@ -461,18 +446,7 @@ function detectMime(bytes: Buffer, declared: string): string {
   if (bytes.subarray(0, 8).equals(Buffer.from([0xd0, 0xcf, 0x11, 0xe0, 0xa1, 0xb1, 0x1a, 0xe1]))) return 'application/x-cfb';
   const text = bytes.toString('utf8');
   if (!text.includes('\ufffd') && !/[\u0000-\u0008\u000b\u000c\u000e-\u001f]/u.test(text)) {
-    if (declared === 'application/json') { try { JSON.parse(text); return 'application/json'; } catch {} }
     return 'text/plain';
   }
   return 'application/octet-stream';
-}
-
-function mimeCompatible(declared: string, detected: string): boolean {
-  if (declared === detected) return true;
-  if (['audio/wav', 'audio/x-wav'].includes(declared) && detected === 'audio/wav') return true;
-  if (detected === 'application/zip' && declared.startsWith('application/vnd.openxmlformats-officedocument.')) return true;
-  if (detected === 'application/x-cfb' && [
-    'application/msword', 'application/vnd.ms-excel', 'application/vnd.ms-powerpoint',
-  ].includes(declared)) return true;
-  return false;
 }

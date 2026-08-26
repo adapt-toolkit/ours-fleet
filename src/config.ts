@@ -122,22 +122,16 @@ export interface OwnerAttachmentConfig {
   max_file_bytes: number;
   max_request_bytes: number;
   retention_ms: number;
-  allowed_mime: string[];
 }
 
-export type OwnerChannelConfigInput = Omit<Partial<OwnerChannelConfig>, 'attachments'> & {
-  attachments?: Partial<OwnerAttachmentConfig>;
+type OwnerAttachmentConfigInput = Partial<OwnerAttachmentConfig> & {
+  /** @deprecated Accepted only so existing configs keep loading; ignored. */
+  allowed_mime?: unknown;
 };
 
-export const DEFAULT_OWNER_ATTACHMENT_MIME = [
-  'application/pdf', 'application/json', 'text/plain',
-  'image/png', 'image/jpeg', 'image/gif', 'image/webp',
-  'audio/ogg', 'audio/mpeg', 'audio/wav', 'audio/x-wav', 'audio/mp4', 'audio/webm',
-  'application/msword', 'application/vnd.ms-excel', 'application/vnd.ms-powerpoint',
-  'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
-  'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
-  'application/vnd.openxmlformats-officedocument.presentationml.presentation',
-] as const;
+export type OwnerChannelConfigInput = Omit<Partial<OwnerChannelConfig>, 'attachments'> & {
+  attachments?: OwnerAttachmentConfigInput;
+};
 
 /** Default wake sources when a role does not list its own. */
 export const DEFAULT_WAKE_SOURCES: NotifyEventType[] =
@@ -605,7 +599,7 @@ export function resolveOwnerChannelConfig(
     throw new ConfigError(`${file}: role '${name}' owner_channel.attachments must be a map`);
   const attachments = {
     ...(defaultInput.attachments ?? {}), ...(role?.attachments ?? {}),
-  } as Partial<OwnerAttachmentConfig>;
+  } as OwnerAttachmentConfigInput;
   const attachmentKeys = [
     'enabled', 'max_files_per_request', 'max_file_bytes', 'max_request_bytes',
     'retention_ms', 'allowed_mime',
@@ -633,15 +627,6 @@ export function resolveOwnerChannelConfig(
   if (maxRequestBytes < maxFileBytes)
     throw new ConfigError(
       `${file}: role '${name}' owner_channel.attachments.max_request_bytes must be at least max_file_bytes`);
-  const allowedMime = attachments.allowed_mime ?? [...DEFAULT_OWNER_ATTACHMENT_MIME];
-  if (!Array.isArray(allowedMime) || allowedMime.length < 1 || allowedMime.length > 64
-      || allowedMime.some(mime => typeof mime !== 'string'
-        || !/^[a-z0-9][a-z0-9!#$&^_.+-]*\/[a-z0-9][a-z0-9!#$&^_.+-]*$/.test(mime)))
-    throw new ConfigError(
-      `${file}: role '${name}' owner_channel.attachments.allowed_mime must contain 1-64 lowercase MIME types`);
-  if (new Set(allowedMime).size !== allowedMime.length)
-    throw new ConfigError(
-      `${file}: role '${name}' owner_channel.attachments.allowed_mime must not contain duplicates`);
   if (session !== 'acp')
     throw new ConfigError(
       `${file}: role '${name}' owner_channel requires session: acp for correlated final replies`);
@@ -660,7 +645,6 @@ export function resolveOwnerChannelConfig(
       max_file_bytes: maxFileBytes,
       max_request_bytes: maxRequestBytes,
       retention_ms: attachments.retention_ms ?? 24 * 60 * 60 * 1_000,
-      allowed_mime: [...allowedMime],
     },
   };
 }

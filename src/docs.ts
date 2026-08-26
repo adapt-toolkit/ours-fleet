@@ -628,7 +628,6 @@ owner_channel:
     max_file_bytes: 10485760
     max_request_bytes: 20971520
     retention_ms: 86400000
-    allowed_mime: [application/pdf, text/plain, image/png, audio/ogg]
 \`\`\`
 
 Permanent role identities are also reconciled before launch. Fleet creates a
@@ -677,13 +676,17 @@ suppresses receipts, progress notices, or the final answer.
 
 Owner documents, images, and voice messages use the same authenticated sender
 and source-wire boundary. Fleet inspects body-free metadata first and rejects
-disabled, over-count, over-size, or disallowed-MIME requests before selective
+disabled, over-count, or over-size requests before selective
 retrieval. Unauthorized CIDs are never retrieved or answered. Reply-linked text
 and files from the same sender become one ordered request; a file-only wake also
 starts a turn. Retrieved bytes must match their structured size and SHA-256,
-their content signature must match the declared MIME, and symlinks or non-regular
-paths fail closed. Sanitized copies live only in a mode-0700 request directory as
+while MIME values, extensions, file categories, and declared-versus-detected mismatches
+remain report-only metadata. Symlinks or non-regular paths fail closed. Sanitized copies live only in a mode-0700 request directory as
 mode-0600 files and are removed after completion or bounded stale retention.
+
+The legacy \`attachments.allowed_mime\` key is accepted and ignored so existing
+configurations keep loading; it is omitted from resolved configuration and cannot
+affect admission.
 
 Voice prompts include a bounded transcript only when typed daemon metadata reports success.
 Failure or unavailability is explicit and preserves the private audio path as the

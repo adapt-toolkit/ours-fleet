@@ -400,7 +400,6 @@ roles:
         max_file_bytes: 10485760         # 10 MiB
         max_request_bytes: 20971520      # 20 MiB total, and >= max_file_bytes
         retention_ms: 86400000           # stale crash cleanup; 1 minute..30 days
-        allowed_mime: [application/pdf, text/plain, image/png, audio/ogg]
     model: claude-fable-5               # launch on a specific model (pass-through id; default: launcher default)
     mission: one line
     persona: |                          # operating contract (published as persona)
@@ -967,19 +966,24 @@ message plaintext in fleet state.
 Inbound owner attachments use the same authenticated-CID and exact-wire routing
 boundary. Fleet first calls the metadata-only `listIncomingFiles`, groups a
 file-only wake or a same-sender reply-linked text caption, and checks the enabled,
-count, declared MIME, per-file size, and total-size policy before retrieving any
-bytes. It then calls selective `getFiles` only for the admitted wire IDs. An
+count, per-file size, and total-size policy before retrieving any bytes. MIME values,
+extensions, file categories, and declared-versus-detected mismatches are metadata,
+never rejection criteria. It then calls selective `getFiles` only for the admitted wire IDs. An
 unauthorized sender is ignored without retrieval or reply. A rejected authorized
 request receives a bounded reason correlated to its file wire.
 
 Retrieved files must be regular, non-symlink paths whose byte count and SHA-256
-match typed SDK metadata. Fleet additionally checks content signatures against the
-declared MIME, sanitizes traversal/control characters from names, and copies each
+match typed SDK metadata. Fleet detects recognizable content only to report metadata,
+sanitizes traversal/control characters from names, and copies each
 file into a random request-scoped directory at mode 0700 with files at mode 0600.
 The `[fleet-owner]` turn receives only bounded metadata, the private local paths,
 and an explicit daemon transcription result for voice messages. Successful
 transcripts are included; `failed` and `unavailable` states are stated plainly so
 the agent must use the audio path rather than inventing text.
+
+The legacy `attachments.allowed_mime` key is accepted and ignored so existing
+configurations continue to load. It is omitted from resolved configuration and
+cannot affect attachment admission.
 
 Request files are removed after final delivery and stale directories are removed
 after `retention_ms`. A bounded mode-0600 recovery journal stores only owner CID
@@ -1002,11 +1006,11 @@ Managed-agent file egress is a separate trust direction. It retains the same
 metadata provenance checks, count/per-file/request byte caps, regular-file and
 no-symlink reads, actual byte-count/SHA-256 verification, filename sanitization,
 private staging, fixed owner routing, and bounded body-free recovery metadata.
-It deliberately does not consult `attachments.enabled` or `allowed_mime`; MIME is
+It deliberately does not consult `attachments.enabled`; MIME is
 still detected during byte validation, but a declared-versus-detected mismatch is
-not an egress deny gate. Markdown, HTML, octet-stream, unknown extensions, and normal
-binaries are therefore routable only from the exact configured `agent` CID.
-Owner-to-agent admission above remains byte-for-byte strict. Each outbound file
+not a deny gate in either direction. Markdown, HTML, octet-stream, unknown extensions,
+and normal binaries are therefore routable only across their authenticated direction.
+Each outbound file
 gets a durable pre-send marker: a failed/ambiguous send becomes `uncertain` and is
 not blindly retried, while files not yet attempted remain recoverable after restart.
 Logs contain counts and byte totals, never filenames or raw bytes.

@@ -2,9 +2,7 @@ import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import {
-  loadConfig, findRole, validateMonitorConfig, ConfigError, DEFAULT_OWNER_ATTACHMENT_MIME,
-} from '../src/config.js';
+import { loadConfig, findRole, validateMonitorConfig, ConfigError } from '../src/config.js';
 import { runningLabel } from '../src/provenance.js';
 
 let dir: string;
@@ -47,7 +45,6 @@ describe('loadConfig', () => {
       attachments: {
         enabled: true, max_files_per_request: 4, max_file_bytes: 10 * 1024 * 1024,
         max_request_bytes: 20 * 1024 * 1024, retention_ms: 24 * 60 * 60 * 1_000,
-        allowed_mime: [...DEFAULT_OWNER_ATTACHMENT_MIME],
       },
     });
     base('roles:\n  A:\n    owner_channel: { identity: A-owner, owners: [cid] }\n');
@@ -136,7 +133,7 @@ describe('loadConfig', () => {
     expect(() => loadConfig()).toThrow(/unknown key\(s\) comment/);
   });
 
-  it('deep-merges and validates owner attachment policy', () => {
+  it('deep-merges type-agnostic owner attachment limits and ignores the legacy MIME key', () => {
     base([
       'defaults:',
       '  owner_channel:',
@@ -154,14 +151,17 @@ describe('loadConfig', () => {
     ].join('\n'));
     expect(findRole(loadConfig(), 'A').owner_channel?.attachments).toMatchObject({
       enabled: true, max_files_per_request: 2, max_file_bytes: 100,
-      max_request_bytes: 200, allowed_mime: ['text/plain', 'image/png'],
+      max_request_bytes: 200,
     });
+    expect(findRole(loadConfig(), 'A').owner_channel?.attachments).not.toHaveProperty('allowed_mime');
+    for (const legacyValue of ['[Text/Plain]', '[]', 'anything', 'null']) {
+      base(`roles:\n  A:\n    session: acp\n    owner_channel:\n      identity: A-owner\n      owners: [cid]\n      attachments: { allowed_mime: ${legacyValue} }\n`);
+      expect(findRole(loadConfig(), 'A').owner_channel?.attachments).not.toHaveProperty('allowed_mime');
+    }
     for (const policy of [
       'max_files_per_request: 0',
       'max_file_bytes: 200, max_request_bytes: 100',
       'retention_ms: 100',
-      'allowed_mime: [Text/Plain]',
-      'allowed_mime: [text/plain, text/plain]',
       'unknown: true',
     ]) {
       base(`roles:\n  A:\n    session: acp\n    owner_channel:\n      identity: A-owner\n      owners: [cid]\n      attachments: { ${policy} }\n`);
