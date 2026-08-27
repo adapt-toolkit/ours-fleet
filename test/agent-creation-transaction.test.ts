@@ -5,9 +5,11 @@ import { writeSync } from 'node:fs';
 import { createHash } from 'node:crypto';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
-import { AgentCreationTransaction, type IdentityActionBindings, type TrustedAcquisitionProof,
+import { AgentCreationTransaction, DurableAgentCreationCompletionAuthority,
+  type IdentityActionBindings, type TrustedAcquisitionProof,
   type TrustedIdentityVerification, type TrustedOwnershipCapability } from '../src/agent-creation-transaction.js';
-import { DurableAgentGenerationAuthority, GenerationReservationError } from '../src/agent-generation-reservation.js';
+import { DurableAgentGenerationAuthority, DurableAgentGenerationReader,
+  GenerationReservationError } from '../src/agent-generation-reservation.js';
 import { AgentCompositionService, consumePreparedForTransaction,
   type AgentPlanTransactionConsumer, type VerifiedTransactionConsumerEvidence } from '../src/agent-composition-service.js';
 import { computeBrainDigest, computePermissionsDigest, resolveAgentPlan, type AdapterValidationRecord, type AgentPlan } from '../src/agent-plan.js';
@@ -382,6 +384,43 @@ describe('idempotent identity acquisition recovery', () => {
     chmodSync(join(generations.authenticate(reservation!)!.canonicalDir, 'identity-binding.json'), 0o644);
     await expect(transaction.resume({ agentId: 'worker-1', actionId: 'action-1' }))
       .rejects.toMatchObject({ code: 'corrupt_state' });
+  });
+
+  it('rehydrates terminal Complete through dedicated read-only authorities with zero identity effect', async () => {
+    const generations = new DurableAgentGenerationAuthority(state); const harness = providerHarness();
+    const transaction = new AgentCreationTransaction(issuedConsumer(), generations,
+      harness.provider, harness.authority);
+    const result = await start(transaction, generations, plan());
+    const record = generations.authenticate(result.reservation)!;
+    for (const fn of Object.values(harness.provider)) if (typeof fn === 'function' && 'mockClear' in fn) fn.mockClear();
+    const transitionDir = join(record.canonicalDir, 'identity-transitions');
+    const before = readdirSync(transitionDir).map(file => [file, readFileSync(join(transitionDir, file), 'utf8')]);
+    const reader = new DurableAgentGenerationReader(state);
+    const reservation = reader.readExact(record);
+    const completion = new DurableAgentCreationCompletionAuthority(reader);
+    const evidence = completion.validateComplete(reservation);
+    expect(completion.authenticateComplete(evidence)).toMatchObject({ agentId: 'worker-1',
+      actionId: 'action-1', identity: { name: 'worker-1', acquisition: 'created' } });
+    expect(readdirSync(transitionDir).map(file => [file, readFileSync(join(transitionDir, file), 'utf8')]))
+      .toEqual(before);
+    for (const fn of Object.values(harness.provider)) if (typeof fn === 'function' && 'mock' in fn)
+      expect(fn).not.toHaveBeenCalled();
+  });
+
+  it('completion-only authority rejects nonterminal state without appending or calling identity', async () => {
+    const generations = new DurableAgentGenerationAuthority(state); const harness = providerHarness();
+    const crashing = new AgentCreationTransaction(issuedConsumer(), generations,
+      harness.provider, harness.authority, { afterCreateAuthorized: () => { throw new Error('crash'); } });
+    await expect(start(crashing, generations, plan())).rejects.toThrow('crash');
+    const evidence = await generations.lookup('worker-1', 'action-1'); const record = generations.authenticate(evidence!)!;
+    for (const fn of Object.values(harness.provider)) if (typeof fn === 'function' && 'mockClear' in fn) fn.mockClear();
+    const before = readdirSync(join(record.canonicalDir, 'identity-transitions'));
+    const reader = new DurableAgentGenerationReader(state); const reservation = reader.readExact(record);
+    expect(() => new DurableAgentCreationCompletionAuthority(reader).validateComplete(reservation))
+      .toThrow(/corrupt_state/u);
+    expect(readdirSync(join(record.canonicalDir, 'identity-transitions'))).toEqual(before);
+    for (const fn of Object.values(harness.provider)) if (typeof fn === 'function' && 'mock' in fn)
+      expect(fn).not.toHaveBeenCalled();
   });
 
   it('binds snapshot/reservation/actionKey and rejects classification inconsistency on complete replay', async () => {

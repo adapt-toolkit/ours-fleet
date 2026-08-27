@@ -10,7 +10,8 @@ import { authenticateTransactionConsumer, consumePreparedForTransaction,
   type AgentPlanTransactionConsumer, type PreparedAgentCreation } from './agent-composition-service.js';
 import {
   DurableAgentGenerationAuthority, GenerationReservationError,
-  type GenerationReservationRecord, type VerifiedGenerationReservation,
+  type AgentGenerationEvidenceAuthority, type GenerationReservationRecord,
+  type VerifiedGenerationReservation,
 } from './agent-generation-reservation.js';
 import { readStoredAgentPlan } from './agent-plan-store.js';
 import { withConfigGraphLock } from './config-graph-lock.js';
@@ -160,8 +161,167 @@ function fsyncDir(path: string): void {
   try { fsyncSync(fd); } finally { closeSync(fd); }
 }
 
+class CompletionValidator {
+  constructor(private readonly generations: AgentGenerationEvidenceAuthority,
+    private readonly faults: AgentCreationFaults = {}) {}
+
+  validate(reservation: VerifiedGenerationReservation): Readonly<CompleteAgentCreationBindings> {
+    const record = this.generations.authenticate(reservation);
+    if (!record) throw new GenerationReservationError('corrupt_state');
+    const plan = readStoredAgentPlan(record.canonicalDir, record, 'transaction').plan;
+    const bindings = this.bindings(record, plan);
+    const chain = this.chain(record, false);
+    this.assertChainBindings(chain, bindings);
+    if (chain.at(-1)?.state !== 'complete') throw new AgentCreationTransactionError('corrupt_state');
+    const identity = this.verifiedArtifacts(record, bindings, chain);
+    return Object.freeze({ actionId: record.actionId, agentId: record.agentId,
+      generation: record.generation, planDigest: record.planDigest, snapshotDigest: record.snapshotDigest,
+      reservationDigest: record.reservationDigest, canonicalDir: record.canonicalDir,
+      identity: Object.freeze(identity) });
+  }
+
+  bindings(record: Readonly<GenerationReservationRecord>, plan: AgentPlan): IdentityActionBindings {
+    const unsigned = { actionId: record.actionId, agentId: record.agentId, generation: record.generation,
+      name: plan.identity.name, ownership: plan.identity.ownership, planDigest: record.planDigest,
+      reservationDigest: record.reservationDigest };
+    return { actionKey: digest(canonical(unsigned)), ...unsigned };
+  }
+
+  chain(record: Readonly<GenerationReservationRecord>, create: boolean): Transition[] {
+    const dir = join(record.canonicalDir, 'identity-transitions');
+    if (create) privateDir(dir); else assertNoSymlink(dir);
+    let files: string[];
+    try { files = readdirSync(dir).filter(name => !name.startsWith('.')).sort(); }
+    catch { throw new AgentCreationTransactionError('corrupt_state'); }
+    const output: Transition[] = [];
+    for (let ordinal = 0; ordinal < files.length; ordinal++) {
+      const file = files[ordinal]!;
+      if (!/^\d{8}-[a-z_]+\.json$/u.test(file)) throw new AgentCreationTransactionError('corrupt_state');
+      const value = secureJson(join(dir, file), this.faults);
+      if (!exact(value, ['schemaVersion', 'kind', 'actionId', 'agentId', 'generation', 'planDigest',
+        'snapshotDigest', 'ordinal', 'from', 'state', 'prevDigest', 'event', 'digest']))
+        throw new AgentCreationTransactionError('corrupt_state');
+      const transition = value as unknown as Transition; const prior = output.at(-1);
+      const { digest: recordDigest, ...transitionUnsigned } = transition;
+      if (transition.schemaVersion !== 1 || transition.kind !== 'AgentIdentityTransition'
+          || transition.actionId !== record.actionId || transition.agentId !== record.agentId
+          || transition.generation !== record.generation || transition.planDigest !== record.planDigest
+          || transition.snapshotDigest !== record.snapshotDigest || transition.ordinal !== ordinal
+          || file !== `${String(ordinal).padStart(8, '0')}-${transition.state}.json`
+          || transition.from !== (prior?.state ?? null) || transition.prevDigest !== (prior?.digest ?? null)
+          || !EDGES[prior?.state ?? 'start']?.includes(transition.state)
+          || !SHA.test(recordDigest) || digest(canonical(transitionUnsigned)) !== recordDigest
+          || !transition.event || typeof transition.event !== 'object' || Array.isArray(transition.event))
+        throw new AgentCreationTransactionError('corrupt_state');
+      this.validateEvent(transition); output.push(Object.freeze(transition));
+    }
+    return output;
+  }
+
+  validateEvent(value: Transition): void {
+    const event = value.event; const empty = () => exact(event, []); let valid = false;
+    if (['pending', 'verifying', 'complete', 'compensated', 'compensation_failed'].includes(value.state)) valid = empty();
+    else if (value.state === 'create_authorized')
+      valid = exact(event, ['actionKey']) && typeof event.actionKey === 'string' && SHA.test(event.actionKey);
+    else if (value.state === 'acquired') valid = event.outcome === 'created_by_action'
+      ? exact(event, ['outcome', 'receiptDigest']) && typeof event.receiptDigest === 'string' && SHA.test(event.receiptDigest)
+      : event.outcome === 'existing_before_action' && exact(event, ['outcome']);
+    else if (value.state === 'verified') valid = exact(event,
+      ['provider', 'authenticatedIdentityId', 'evidenceDigest', 'acquisition'])
+      && typeof event.provider === 'string' && event.provider.length > 0
+      && typeof event.authenticatedIdentityId === 'string' && event.authenticatedIdentityId.length > 0
+      && typeof event.evidenceDigest === 'string' && SHA.test(event.evidenceDigest)
+      && ['external', 'created'].includes(String(event.acquisition));
+    else if (value.state === 'compensating') valid = exact(event, ['receiptDigest'])
+      && typeof event.receiptDigest === 'string' && SHA.test(event.receiptDigest);
+    else if (value.state === 'ambiguous') valid = exact(event, ['reason']) && typeof event.reason === 'string'
+      && /^[a-z][a-z0-9_]{0,63}$/u.test(event.reason);
+    if (!valid) throw new AgentCreationTransactionError('corrupt_state');
+  }
+
+  assertChainBindings(chain: readonly Transition[], bindings: IdentityActionBindings): void {
+    const authorized = chain.find(value => value.state === 'create_authorized');
+    if (authorized && authorized.event.actionKey !== bindings.actionKey)
+      throw new AgentCreationTransactionError('corrupt_state');
+    const acquired = chain.find(value => value.state === 'acquired');
+    const verified = chain.find(value => value.state === 'verified');
+    if (acquired && verified) {
+      const expected = acquired.event.outcome === 'created_by_action' ? 'created' : 'external';
+      if (verified.event.acquisition !== expected) throw new AgentCreationTransactionError('corrupt_state');
+    }
+    const compensating = chain.find(value => value.state === 'compensating');
+    if (compensating && compensating.event.receiptDigest !== acquired?.event.receiptDigest)
+      throw new AgentCreationTransactionError('corrupt_state');
+  }
+
+  acquiredEvent(chain: readonly Transition[]): { outcome: string; receiptDigest?: string } {
+    const event = chain.find(value => value.state === 'acquired')?.event;
+    if (!event || !['existing_before_action', 'created_by_action'].includes(String(event.outcome))
+        || (event.outcome === 'created_by_action'
+          ? typeof event.receiptDigest !== 'string' || !SHA.test(event.receiptDigest)
+          : event.receiptDigest !== undefined))
+      throw new AgentCreationTransactionError('corrupt_state');
+    return event as { outcome: string; receiptDigest?: string };
+  }
+
+  verifiedArtifacts(record: Readonly<GenerationReservationRecord>, bindings: IdentityActionBindings,
+    chain: readonly Transition[]): CompleteAgentCreationBindings['identity'] {
+    const acquired = this.acquiredEvent(chain);
+    const verified = chain.find(value => value.state === 'verified')?.event;
+    if (!verified) throw new AgentCreationTransactionError('corrupt_state');
+    const binding = secureJson(join(record.canonicalDir, 'identity-binding.json'), this.faults);
+    if (!exact(binding, ['schemaVersion', 'kind', 'actionId', 'agentId', 'generation', 'name', 'ownership',
+      'planDigest', 'snapshotDigest', 'reservationDigest', 'actionKey', 'provider',
+      'authenticatedIdentityId', 'evidenceDigest', 'acquisition'])
+        || binding.schemaVersion !== 1 || binding.kind !== 'AuthenticatedIdentityBinding'
+        || binding.actionId !== record.actionId || binding.agentId !== record.agentId
+        || binding.generation !== record.generation || binding.name !== bindings.name
+        || binding.ownership !== bindings.ownership || binding.planDigest !== record.planDigest
+        || binding.snapshotDigest !== record.snapshotDigest || binding.reservationDigest !== record.reservationDigest
+        || binding.actionKey !== bindings.actionKey || typeof binding.provider !== 'string'
+        || typeof binding.authenticatedIdentityId !== 'string' || typeof binding.evidenceDigest !== 'string'
+        || !SHA.test(binding.evidenceDigest) || !['external', 'created'].includes(String(binding.acquisition))
+        || binding.provider !== verified.provider || binding.authenticatedIdentityId !== verified.authenticatedIdentityId
+        || binding.evidenceDigest !== verified.evidenceDigest || binding.acquisition !== verified.acquisition)
+      throw new AgentCreationTransactionError('corrupt_state');
+    const provenance = secureJson(join(record.canonicalDir, 'creation-provenance.json'), this.faults);
+    if (!exact(provenance, ['schemaVersion', 'kind', 'actionId', 'agentId', 'generation', 'planDigest',
+      'snapshotDigest', 'reservationDigest', 'actionKey', 'acquisition', 'verificationEvidenceDigest'])
+        || provenance.schemaVersion !== 1 || provenance.kind !== 'AgentCreationProvenance'
+        || provenance.actionId !== record.actionId || provenance.agentId !== record.agentId
+        || provenance.generation !== record.generation || provenance.planDigest !== record.planDigest
+        || provenance.snapshotDigest !== record.snapshotDigest || provenance.reservationDigest !== record.reservationDigest
+        || provenance.actionKey !== bindings.actionKey || provenance.acquisition !== acquired.outcome
+        || provenance.verificationEvidenceDigest !== binding.evidenceDigest
+        || binding.acquisition === 'external' && provenance.acquisition !== 'existing_before_action'
+        || binding.acquisition === 'created' && provenance.acquisition !== 'created_by_action')
+      throw new AgentCreationTransactionError('corrupt_state');
+    return { name: String(binding.name), ownership: String(binding.ownership), provider: String(binding.provider),
+      authenticatedIdentityId: String(binding.authenticatedIdentityId), evidenceDigest: String(binding.evidenceDigest),
+      acquisition: binding.acquisition as 'external' | 'created' };
+  }
+}
+
+/** Terminal-only completion reader. It has no creation consumer or identity-effect surface. */
+export class DurableAgentCreationCompletionAuthority implements AgentCreationCompletionAuthority {
+  readonly #validator: CompletionValidator;
+  readonly #evidence = new WeakMap<object, Readonly<CompleteAgentCreationBindings>>();
+  constructor(generations: AgentGenerationEvidenceAuthority, faults: AgentCreationFaults = {}) {
+    this.#validator = new CompletionValidator(generations, faults);
+  }
+  validateComplete(reservation: VerifiedGenerationReservation): VerifiedCompleteAgentCreation {
+    const trusted = this.#validator.validate(reservation);
+    const evidence = Object.freeze({ [completeBrand]: true as const }); this.#evidence.set(evidence, trusted);
+    return evidence;
+  }
+  authenticateComplete(evidence: VerifiedCompleteAgentCreation) {
+    return this.#evidence.get(evidence as object);
+  }
+}
+
 export class AgentCreationTransaction {
-  readonly #completeEvidence = new WeakMap<object, Readonly<CompleteAgentCreationBindings>>();
+  readonly #completion: DurableAgentCreationCompletionAuthority;
+  readonly #validator: CompletionValidator;
   constructor(
     private readonly consumer: AgentPlanTransactionConsumer,
     private readonly generations: DurableAgentGenerationAuthority,
@@ -170,6 +330,8 @@ export class AgentCreationTransaction {
     private readonly faults: AgentCreationFaults = {},
   ) {
     if (!authenticateTransactionConsumer(consumer)) throw new AgentCreationTransactionError('invalid_provider');
+    this.#validator = new CompletionValidator(generations, faults);
+    this.#completion = new DurableAgentCreationCompletionAuthority(generations, faults);
   }
 
   async persistPrepared(prepared: PreparedAgentCreation, input: Readonly<{ actionId: string; targetEvidence?: unknown }>): Promise<AgentCreationResult> {
@@ -182,21 +344,10 @@ export class AgentCreationTransaction {
     return this.#resumeReservation(await this.generations.resume(input.agentId, input.actionId));
   }
   validateComplete(reservation: VerifiedGenerationReservation): VerifiedCompleteAgentCreation {
-    const record = this.#reservation(reservation);
-    const plan = readStoredAgentPlan(record.canonicalDir, record, 'transaction').plan;
-    const bindings = this.#bindings(record, plan); const chain = this.#chain(record);
-    this.#assertChainBindings(chain, bindings);
-    if (chain.at(-1)?.state !== 'complete') throw new AgentCreationTransactionError('corrupt_state');
-    const identity = this.#verifiedArtifacts(record, bindings, chain);
-    const trusted = Object.freeze({ actionId: record.actionId, agentId: record.agentId,
-      generation: record.generation, planDigest: record.planDigest, snapshotDigest: record.snapshotDigest,
-      reservationDigest: record.reservationDigest, canonicalDir: record.canonicalDir,
-      identity: Object.freeze(identity) });
-    const evidence = Object.freeze({ [completeBrand]: true as const }); this.#completeEvidence.set(evidence, trusted);
-    return evidence;
+    return this.#completion.validateComplete(reservation);
   }
   authenticateComplete(evidence: VerifiedCompleteAgentCreation): Readonly<CompleteAgentCreationBindings> | undefined {
-    return this.#completeEvidence.get(evidence as object);
+    return this.#completion.authenticateComplete(evidence);
   }
   async #resumeReservation(reservation: VerifiedGenerationReservation): Promise<AgentCreationResult> {
     const record = this.#reservation(reservation);
@@ -303,10 +454,7 @@ export class AgentCreationTransaction {
     const record = this.generations.authenticate(value); if (!record) throw new GenerationReservationError('corrupt_state'); return record;
   }
   #bindings(record: GenerationReservationRecord, plan: AgentPlan): IdentityActionBindings {
-    const unsigned = { actionId: record.actionId, agentId: record.agentId, generation: record.generation,
-      name: plan.identity.name, ownership: plan.identity.ownership, planDigest: record.planDigest,
-      reservationDigest: record.reservationDigest };
-    return { actionKey: digest(canonical(unsigned)), ...unsigned };
+    return this.#validator.bindings(record, plan);
   }
   #acquisition(raw: unknown, bindings: IdentityActionBindings): Readonly<TrustedAcquisitionProof> {
     const proof = this.evidence.authenticateAcquisition(raw);
@@ -332,13 +480,7 @@ export class AgentCreationTransaction {
     return proof;
   }
   #acquiredEvent(chain: readonly Transition[]): { outcome: string; receiptDigest?: string } {
-    const event = chain.find(value => value.state === 'acquired')?.event;
-    if (!event || !['existing_before_action', 'created_by_action'].includes(String(event.outcome))
-        || (event.outcome === 'created_by_action'
-          ? typeof event.receiptDigest !== 'string' || !SHA.test(event.receiptDigest)
-          : event.receiptDigest !== undefined))
-      throw new AgentCreationTransactionError('corrupt_state');
-    return event as { outcome: string; receiptDigest?: string };
+    return this.#validator.acquiredEvent(chain);
   }
   async #compensate(record: GenerationReservationRecord, bindings: IdentityActionBindings,
     receiptDigest: string, ownership: string): Promise<void> {
@@ -360,68 +502,10 @@ export class AgentCreationTransaction {
   }
 
   #chain(record: GenerationReservationRecord): Transition[] {
-    const dir = join(record.canonicalDir, 'identity-transitions'); privateDir(dir);
-    const files = readdirSync(dir).filter(name => !name.startsWith('.')).sort(); const output: Transition[] = [];
-    for (let ordinal = 0; ordinal < files.length; ordinal++) {
-      const file = files[ordinal]!; if (!/^\d{8}-[a-z_]+\.json$/u.test(file)) throw new AgentCreationTransactionError('corrupt_state');
-      const value = secureJson(join(dir, file), this.faults);
-      if (!exact(value, ['schemaVersion', 'kind', 'actionId', 'agentId', 'generation', 'planDigest',
-        'snapshotDigest', 'ordinal', 'from', 'state', 'prevDigest', 'event', 'digest']))
-        throw new AgentCreationTransactionError('corrupt_state');
-      const transition = value as unknown as Transition; const prior = output.at(-1);
-      const { digest: recordDigest, ...unsigned } = transition;
-      if (transition.schemaVersion !== 1 || transition.kind !== 'AgentIdentityTransition'
-          || transition.actionId !== record.actionId || transition.agentId !== record.agentId
-          || transition.generation !== record.generation || transition.planDigest !== record.planDigest
-          || transition.snapshotDigest !== record.snapshotDigest || transition.ordinal !== ordinal
-          || file !== `${String(ordinal).padStart(8, '0')}-${transition.state}.json`
-          || transition.from !== (prior?.state ?? null) || transition.prevDigest !== (prior?.digest ?? null)
-          || !EDGES[prior?.state ?? 'start']?.includes(transition.state)
-          || !SHA.test(recordDigest) || digest(canonical(unsigned)) !== recordDigest
-          || !transition.event || typeof transition.event !== 'object' || Array.isArray(transition.event))
-        throw new AgentCreationTransactionError('corrupt_state');
-      this.#validateTransitionEvent(transition);
-      output.push(Object.freeze(transition));
-    }
-    return output;
-  }
-  #validateTransitionEvent(value: Transition): void {
-    const event = value.event;
-    const empty = () => exact(event, []);
-    let valid = false;
-    if (['pending', 'verifying', 'complete', 'compensated', 'compensation_failed'].includes(value.state)) valid = empty();
-    else if (value.state === 'create_authorized')
-      valid = exact(event, ['actionKey']) && typeof event.actionKey === 'string' && SHA.test(event.actionKey);
-    else if (value.state === 'acquired') {
-      valid = event.outcome === 'created_by_action'
-        ? exact(event, ['outcome', 'receiptDigest']) && typeof event.receiptDigest === 'string' && SHA.test(event.receiptDigest)
-        : event.outcome === 'existing_before_action' && exact(event, ['outcome']);
-    } else if (value.state === 'verified')
-      valid = exact(event, ['provider', 'authenticatedIdentityId', 'evidenceDigest', 'acquisition'])
-        && typeof event.provider === 'string' && event.provider.length > 0
-        && typeof event.authenticatedIdentityId === 'string' && event.authenticatedIdentityId.length > 0
-        && typeof event.evidenceDigest === 'string' && SHA.test(event.evidenceDigest)
-        && ['external', 'created'].includes(String(event.acquisition));
-    else if (value.state === 'compensating')
-      valid = exact(event, ['receiptDigest']) && typeof event.receiptDigest === 'string' && SHA.test(event.receiptDigest);
-    else if (value.state === 'ambiguous')
-      valid = exact(event, ['reason']) && typeof event.reason === 'string'
-        && /^[a-z][a-z0-9_]{0,63}$/u.test(event.reason);
-    if (!valid) throw new AgentCreationTransactionError('corrupt_state');
+    return this.#validator.chain(record, true);
   }
   #assertChainBindings(chain: readonly Transition[], bindings: IdentityActionBindings): void {
-    const authorized = chain.find(value => value.state === 'create_authorized');
-    if (authorized && authorized.event.actionKey !== bindings.actionKey)
-      throw new AgentCreationTransactionError('corrupt_state');
-    const acquired = chain.find(value => value.state === 'acquired');
-    const verified = chain.find(value => value.state === 'verified');
-    if (acquired && verified) {
-      const expected = acquired.event.outcome === 'created_by_action' ? 'created' : 'external';
-      if (verified.event.acquisition !== expected) throw new AgentCreationTransactionError('corrupt_state');
-    }
-    const compensating = chain.find(value => value.state === 'compensating');
-    if (compensating && compensating.event.receiptDigest !== acquired?.event.receiptDigest)
-      throw new AgentCreationTransactionError('corrupt_state');
+    this.#validator.assertChainBindings(chain, bindings);
   }
   async #append(record: GenerationReservationRecord, state: AgentCreationState, event: Record<string, unknown>): Promise<void> {
     const dir = join(record.canonicalDir, 'identity-transitions'); privateDir(dir);
@@ -464,48 +548,6 @@ export class AgentCreationTransaction {
   }
   #verifiedArtifacts(record: GenerationReservationRecord, bindings: IdentityActionBindings,
     chain: readonly Transition[]): CompleteAgentCreationBindings['identity'] {
-    const acquired = this.#acquiredEvent(chain);
-    const verified = chain.find(value => value.state === 'verified')?.event;
-    if (!verified) throw new AgentCreationTransactionError('corrupt_state');
-    const binding = secureJson(join(record.canonicalDir, 'identity-binding.json'), this.faults);
-    if (!exact(binding, ['schemaVersion', 'kind', 'actionId', 'agentId', 'generation', 'name', 'ownership',
-      'planDigest', 'snapshotDigest', 'reservationDigest', 'actionKey', 'provider',
-      'authenticatedIdentityId', 'evidenceDigest', 'acquisition'])
-        || binding.schemaVersion !== 1 || binding.kind !== 'AuthenticatedIdentityBinding'
-        || binding.actionId !== record.actionId || binding.agentId !== record.agentId
-        || binding.generation !== record.generation || binding.name !== bindings.name
-        || binding.ownership !== bindings.ownership || binding.planDigest !== record.planDigest
-        || binding.snapshotDigest !== record.snapshotDigest
-        || binding.reservationDigest !== record.reservationDigest || binding.actionKey !== bindings.actionKey
-        || typeof binding.provider !== 'string' || typeof binding.authenticatedIdentityId !== 'string'
-        || typeof binding.evidenceDigest !== 'string' || !SHA.test(binding.evidenceDigest)
-        || !['external', 'created'].includes(String(binding.acquisition)))
-      throw new AgentCreationTransactionError('corrupt_state');
-    if (binding.provider !== verified.provider
-        || binding.authenticatedIdentityId !== verified.authenticatedIdentityId
-        || binding.evidenceDigest !== verified.evidenceDigest
-        || binding.acquisition !== verified.acquisition)
-      throw new AgentCreationTransactionError('corrupt_state');
-    const provenance = secureJson(join(record.canonicalDir, 'creation-provenance.json'), this.faults);
-    if (!exact(provenance, ['schemaVersion', 'kind', 'actionId', 'agentId', 'generation', 'planDigest',
-      'snapshotDigest', 'reservationDigest', 'actionKey', 'acquisition', 'verificationEvidenceDigest'])
-        || provenance.schemaVersion !== 1
-        || provenance.kind !== 'AgentCreationProvenance' || provenance.actionId !== record.actionId
-        || provenance.agentId !== record.agentId || provenance.generation !== record.generation
-        || provenance.planDigest !== record.planDigest
-        || provenance.snapshotDigest !== record.snapshotDigest
-        || provenance.reservationDigest !== record.reservationDigest
-        || provenance.actionKey !== bindings.actionKey
-        || !['existing_before_action', 'created_by_action'].includes(String(provenance.acquisition))
-        || typeof provenance.verificationEvidenceDigest !== 'string'
-        || !SHA.test(provenance.verificationEvidenceDigest)
-        || provenance.verificationEvidenceDigest !== binding.evidenceDigest
-        || provenance.acquisition !== acquired.outcome
-        || binding.acquisition === 'external' && provenance.acquisition !== 'existing_before_action'
-        || binding.acquisition === 'created' && provenance.acquisition !== 'created_by_action')
-      throw new AgentCreationTransactionError('corrupt_state');
-    return { name: String(binding.name), ownership: String(binding.ownership),
-      provider: String(binding.provider), authenticatedIdentityId: String(binding.authenticatedIdentityId),
-      evidenceDigest: String(binding.evidenceDigest), acquisition: binding.acquisition as 'external' | 'created' };
+    return this.#validator.verifiedArtifacts(record, bindings, chain);
   }
 }

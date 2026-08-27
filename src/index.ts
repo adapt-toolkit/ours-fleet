@@ -42,6 +42,9 @@ export {
   AGENT_START_LOCATOR_FILENAME, AgentStartLocatorError, readAgentStartLocator,
 } from './agent-start-locator.js';
 export type { AgentStartLocator, AgentStartLocatorExpectedBindings } from './agent-start-locator.js';
+export { createProductionAgentSupervisorRehydration } from './agent-supervisor-rehydration.js';
+export type { PermanentAgentSupervisorSeam, ProductionAgentSupervisorRehydration,
+  ProductionAgentSupervisorRehydrationDeps } from './agent-supervisor-rehydration.js';
 export { RoleCommandService, RoleLifecycleService } from './application/role-command-service.js';
 export { StructuredLogService } from './application/log-service.js';
 export { roleCapabilities } from './application/capabilities.js';

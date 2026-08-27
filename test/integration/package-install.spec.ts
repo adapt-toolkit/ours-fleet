@@ -66,6 +66,9 @@ describe('packed root package', () => {
         const { authenticatePrepared, legacyAcpIntegrityDigest } = await import(
           pathToFileURL(join(fleetRoot, 'dist', 'harness', 'acp-attempt.js')).href
         );
+        const { createProductionAgentSupervisorRehydration } = await import(
+          pathToFileURL(join(fleetRoot, 'dist', 'index.js')).href
+        );
         const adapter = makeCodexAdapter(async cmd => ({
           code: cmd === 'sh' ? 1 : 0, stdout: '', stderr: '',
         }));
@@ -90,9 +93,23 @@ describe('packed root package', () => {
         const launch = authenticatePrepared(adapter.acpLegacyAuthority, adapter, evidence, input, context);
         if (!launch) throw new Error('packed ACP attempt did not authenticate');
         const claim = adapter.effectivePermissions(role);
+        const absentSupervisorRoot = join(process.cwd(), 'absent-supervisor-root');
+        const rehydrator = createProductionAgentSupervisorRehydration({
+          trustedStateRoot: absentSupervisorRoot,
+          policies: { resolvePolicy: () => { throw new Error('not called'); } },
+          adapterAuthority: { authenticateAdapterEvidence: () => undefined },
+          driverFactory: () => { throw new Error('not called'); },
+          reconciliation: { reconcileStart: async () => ({}), authenticateStart: () => undefined,
+            reconcileRetire: async () => ({}), authenticateRetire: () => undefined },
+        });
         process.stdout.write(JSON.stringify({
           version: codex.version,
           claim,
+          supervisorExport: {
+            factory: typeof createProductionAgentSupervisorRehydration,
+            rehydrate: typeof rehydrator.rehydrate,
+            missingRootUntouched: !existsSync(absentSupervisorRoot),
+          },
           permissionMetadataSource: launch.permissionMetadataSource,
           prepared: {
             codeXPathExists: launch.env.CODEX_PATH ? existsSync(launch.env.CODEX_PATH) : false,
@@ -108,6 +125,9 @@ describe('packed root package', () => {
 
       expect(result.version).toBe(CODEX_ACP_VERSION);
       expect(result.permissionMetadataSource).toBe('codex-acp');
+      expect(result.supervisorExport).toEqual({
+        factory: 'function', rehydrate: 'function', missingRootUntouched: true,
+      });
       expect(result.claim).toMatchObject({
         supported: true,
         exact: false,

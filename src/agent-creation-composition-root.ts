@@ -16,6 +16,7 @@ import type { AgentPlanEvidenceAuthority, PlanOperation } from './agent-plan.js'
 import type { BrainAdapterEvidenceAuthority } from './harness/brain-adapter.js';
 import type { ConfigResourceSnapshot } from './config-resource-loader.js';
 import type { IdentityProvisioner, IdentityProvisionProfile } from './creation.js';
+import { AgentSupervisorHandoffPublisher } from './agent-supervisor-handoff.js';
 
 export interface PermanentAgentCreationResult extends AgentCreationResult {
   locator?: Readonly<AgentStartLocator>;
@@ -34,6 +35,7 @@ export class AgentCreationCompositionRoot {
     private readonly composition: AgentCompositionService,
     private readonly transaction: AgentCreationTransaction,
     locators: AgentStartLocatorPublisher = new AgentStartLocatorPublisher(transaction),
+    private readonly handoffs?: AgentSupervisorHandoffPublisher,
   ) { this.#locators = locators; }
 
   async createPermanent(
@@ -51,12 +53,14 @@ export class AgentCreationCompositionRoot {
     return this.#finish(await this.transaction.resume({ agentId, actionId }));
   }
 
-  #finish(result: AgentCreationResult): PermanentAgentCreationResult {
+  async #finish(result: AgentCreationResult): Promise<PermanentAgentCreationResult> {
     if (result.state !== 'complete') return result;
     const complete = this.transaction.validateComplete(result.reservation);
     const authenticated = this.transaction.authenticateComplete(complete);
     if (!authenticated) throw new AgentCompositionError('invalid_context');
-    return { ...result, locator: this.#locators.publish(complete),
+    const locator = this.#locators.publish(complete);
+    await this.handoffs?.publish(complete);
+    return { ...result, locator,
       identityAcquisition: authenticated.identity.acquisition,
       identityName: authenticated.identity.name };
   }
@@ -136,7 +140,8 @@ export function createProductionAgentCreationCompositionRoot(
   const generationsAuthority = new DurableAgentGenerationAuthority(deps.trustedStateRoot);
   const identity = new AgentProductionIdentityAuthority(deps.identityProvisioner, deps.identityProfile);
   const transaction = new AgentCreationTransaction(consumer, generationsAuthority, identity, identity);
-  const root = new AgentCreationCompositionRoot(composition, transaction);
+  const root = new AgentCreationCompositionRoot(composition, transaction, undefined,
+    new AgentSupervisorHandoffPublisher(deps.trustedStateRoot, transaction));
   const issue = (principal: Readonly<{ id: string; kind: 'system' | 'agent' }>,
     context: ProductionIngressContext): VerifiedCreationCallerEvidence => {
     const owned = ownIngress(context);

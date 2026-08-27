@@ -34,6 +34,12 @@ export interface VerifiedGenerationReservation {
   readonly generation: number; readonly planDigest: string; readonly snapshotDigest: string;
   readonly canonicalDir: string; readonly reservationDigest: string;
 }
+export interface AgentGenerationEvidenceAuthority {
+  authenticate(evidence: VerifiedGenerationReservation): Readonly<GenerationReservationRecord> | undefined;
+}
+export type ExactGenerationReservationBindings = Readonly<Pick<GenerationReservationRecord,
+  'actionId' | 'agentId' | 'generation' | 'planDigest' | 'snapshotDigest' | 'canonicalDir'
+  | 'planBytesDigest' | 'reservationDigest'>>;
 export interface GenerationReservationFaults {
   afterPlan?(): void; afterReservation?(): void; duringIndex?(): void;
   beforeSecureOpen?(path: string): void;
@@ -299,5 +305,64 @@ export class DurableAgentGenerationAuthority {
       snapshotDigest: record.snapshotDigest, canonicalDir: record.canonicalDir,
       reservationDigest: record.reservationDigest });
     this.#evidence.set(evidence, record); return evidence;
+  }
+}
+
+/** Strictly read-only reconstruction for a supervisor. It never creates locks, directories, or indexes. */
+export class DurableAgentGenerationReader implements AgentGenerationEvidenceAuthority {
+  readonly #root: string;
+  readonly #evidence = new WeakMap<object, GenerationReservationRecord>();
+  constructor(trustedRoot: string, private readonly faults: GenerationReservationFaults = {}) {
+    this.#root = resolve(trustedRoot);
+  }
+
+  readExact(expected: ExactGenerationReservationBindings): VerifiedGenerationReservation {
+    if (!TOKEN.test(expected.agentId) || !TOKEN.test(expected.actionId)
+        || !Number.isSafeInteger(expected.generation) || expected.generation < 1
+        || ![expected.planDigest, expected.snapshotDigest, expected.planBytesDigest,
+          expected.reservationDigest].every(value => SHA.test(value)))
+      throw new GenerationReservationError('invalid_request');
+    const agentRoot = join(this.#root, 'agents', safe(expected.agentId));
+    assertNoSymlink(agentRoot);
+    const index = this.#readIndex(agentRoot, expected.actionId);
+    if (index.agentId !== expected.agentId || index.reservationDigest !== expected.reservationDigest)
+      throw new GenerationReservationError('corrupt_state');
+    const path = join(agentRoot, 'reservations',
+      `${pad(expected.generation)}-${expected.reservationDigest.slice(7)}.json`);
+    const record = parseReservation(path, this.faults);
+    for (const key of ['actionId', 'agentId', 'generation', 'planDigest', 'snapshotDigest',
+      'canonicalDir', 'planBytesDigest', 'reservationDigest'] as const)
+      if (record[key] !== expected[key]) throw new GenerationReservationError('corrupt_state');
+    const canonicalDir = join(agentRoot, 'candidates', safe(expected.actionId),
+      `${pad(expected.generation)}-${expected.planDigest.slice(7)}`);
+    if (resolve(record.canonicalDir) !== resolve(canonicalDir)
+        || !resolve(record.canonicalDir).startsWith(`${resolve(agentRoot)}${sep}`))
+      throw new GenerationReservationError('corrupt_state');
+    const envelope = readStoredAgentPlan(record.canonicalDir, record, 'generation-reader');
+    if (digest(encodeAgentPlan(envelope.plan)) !== record.planBytesDigest)
+      throw new GenerationReservationError('corrupt_state');
+    const evidence = Object.freeze({ [evidenceBrand]: true as const, actionId: record.actionId,
+      agentId: record.agentId, generation: record.generation, planDigest: record.planDigest,
+      snapshotDigest: record.snapshotDigest, canonicalDir: record.canonicalDir,
+      reservationDigest: record.reservationDigest });
+    this.#evidence.set(evidence, record);
+    return evidence;
+  }
+
+  authenticate(evidence: VerifiedGenerationReservation): Readonly<GenerationReservationRecord> | undefined {
+    return this.#evidence.get(evidence as object);
+  }
+
+  #readIndex(agentRoot: string, actionId: string): { agentId: string; reservationDigest: string } {
+    const value = readCanonical(join(agentRoot, 'actions', `${safe(actionId)}.json`), this.faults);
+    if (!exact(value, ['schemaVersion', 'kind', 'actionId', 'agentId', 'reservationDigest', 'indexDigest'])
+        || value.schemaVersion !== 1 || value.kind !== 'AgentGenerationActionIndex'
+        || value.actionId !== actionId || typeof value.agentId !== 'string' || !TOKEN.test(value.agentId)
+        || typeof value.reservationDigest !== 'string' || !SHA.test(value.reservationDigest)
+        || typeof value.indexDigest !== 'string' || !SHA.test(value.indexDigest))
+      throw new GenerationReservationError('corrupt_state');
+    const { indexDigest, ...unsigned } = value;
+    if (digest(canonical(unsigned)) !== indexDigest) throw new GenerationReservationError('corrupt_state');
+    return { agentId: value.agentId, reservationDigest: value.reservationDigest };
   }
 }

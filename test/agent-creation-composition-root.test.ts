@@ -1,4 +1,5 @@
-import { mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync,
+  writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
@@ -11,6 +12,7 @@ import { loadConfigResourceSnapshot } from '../src/config-resource-loader.js';
 import { computeBrainAdapterPolicyDigest } from '../src/harness/brain-adapter.js';
 import type { BrainAdapterPolicy, TrustedAdapterEnforcementBindings,
   VerifiedAdapterEnforcementEvidence } from '../src/harness/brain-adapter.js';
+import { readAgentSupervisorHandoff } from '../src/agent-supervisor-handoff.js';
 
 const bindings = (): IdentityActionBindings => ({
   actionKey: `sha256:${'1'.repeat(64)}`, actionId: 'action-1', agentId: 'agent-1',
@@ -141,6 +143,28 @@ describe('permanent Agent creation composition root', () => {
     expect(locators.publish).toHaveBeenCalledWith(complete);
   });
 
+  it('does not expose an active generation when locator publication succeeds but handoff publication fails', async () => {
+    const trusted = mkdtempSync(join(tmpdir(), 'composition-handoff-failure-')); tempRoots.push(trusted);
+    const agentRoot = join(trusted, 'agents', Buffer.from('agent-1').toString('base64url'));
+    mkdirSync(agentRoot, { recursive: true, mode: 0o700 });
+    const locatorPath = join(agentRoot, 'agent-start-locator.json'); const activePath = join(agentRoot, 'active.json');
+    const reservation = {}; const complete = {}; const order: string[] = [];
+    const composition = { prepare: () => ({ lifecycle: 'persistent', identity: { ownership: 'create_persistent' },
+      operation: { id: 'action-1' } }) };
+    const transaction = { persistPrepared: async () => ({ state: 'complete', reservation }), resume: vi.fn(),
+      validateComplete: () => complete,
+      authenticateComplete: () => ({ identity: { acquisition: 'created', name: 'agent-1' } }) };
+    const locators = { publish: () => { order.push('locator'); writeFileSync(locatorPath, '{}\n', { mode: 0o600 });
+      return { kind: 'AgentStartLocator' }; } };
+    const handoffs = { publish: async () => { order.push('handoff'); throw new Error('handoff fsync failed'); } };
+    const root = new AgentCreationCompositionRoot(composition as never, transaction as never,
+      locators as never, handoffs as never);
+    await expect(root.createPermanent(request(), 'action-1')).rejects.toThrow(/handoff fsync failed/u);
+    expect(order).toEqual(['locator', 'handoff']); expect(existsSync(locatorPath)).toBe(true);
+    expect(existsSync(activePath)).toBe(false);
+    expect(() => readAgentSupervisorHandoff(trusted, 'agent-1')).toThrow(/invalid_handoff/u);
+  });
+
   it('does not publish for ambiguous creation and rejects temporary requests', async () => {
     const composition = { prepare: vi.fn((input: AgentCompositionRequest) => ({
       lifecycle: input.source.kind === 'runtime_composition' ? input.source.lifecycle : 'persistent',
@@ -242,6 +266,9 @@ describe('real production Agent creation assembly', () => {
     const locatorPath = join(rootFromLocator(f.root), 'agent-start-locator.json');
     expect(statSync(locatorPath).mode & 0o777).toBe(0o600);
     expect(readFileSync(join(rootFromLocator(f.root), 'identity-binding.json'), 'utf8')).toContain(f.cid);
+    expect(readAgentSupervisorHandoff(join(f.root, 'trusted'), 'agent-1')).toMatchObject({
+      actionId: 'action-1', generation: 1, identityEvidenceDigest: expect.stringMatching(/^sha256:/u),
+    });
     expect(f.creates()).toBe(1);
     const secondContext = { ...f.context, operation: Object.freeze({ id: 'action-2',
       type: 'agent.create', resourceScope: 'agents/agent-2' }) };
