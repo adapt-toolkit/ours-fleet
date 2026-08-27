@@ -430,6 +430,57 @@ describe('identity is established before launch', () => {
   const briefingOf = (name: string) =>
     readFileSync(join(agentDir(name), 'briefing.md'), 'utf8');
 
+  it('uses authenticated permanent Agent handoff and preserves the known guarantee through up', async () => {
+    const { d } = fakeDeps(); let executions = 0; let inspected = false;
+    await spawnPermanent({ name: 'Composed', identity: 'Composed', creationActionId: 'action-1' }, d, {
+      identityProvisioner: { async exists() { inspected = true; throw new Error('legacy identity path'); } },
+      permanentAgentCreation: { async execute() {
+        executions += 1;
+        return { state: 'complete', reservation: {} as never,
+          locator: { kind: 'AgentStartLocator', agentId: 'Composed',
+            actionId: 'action-1' } as never, identityAcquisition: 'created', identityName: 'Composed' };
+      } },
+    });
+    expect(executions).toBe(1);
+    expect(inspected).toBe(false);
+    expect(briefingOf('Composed')).toContain('It was created when your role');
+  });
+
+  it.each([
+    ['agent', { agentId: 'Other', actionId: 'action-1' }, 'Composed'],
+    ['action', { agentId: 'Composed', actionId: 'other' }, 'Composed'],
+    ['identity', { agentId: 'Composed', actionId: 'action-1' }, 'Other'],
+  ])('rejects foreign %s handoff before role publication', async (_kind, locator, identityName) => {
+    const { d, calls } = fakeDeps();
+    await expect(spawnPermanent({ name: 'Composed', identity: 'Composed', creationActionId: 'action-1' }, d, {
+      permanentAgentCreation: { async execute() { return { state: 'complete', reservation: {} as never,
+        locator: { kind: 'AgentStartLocator', ...locator } as never,
+        identityAcquisition: 'created', identityName }; } },
+    })).rejects.toThrow(/handoff binding mismatch/u);
+    expect(existsSync(join(dir, 'fleet.d', 'Composed.yaml'))).toBe(false);
+    expect(calls.filter(call => call[0] === 'install')).toEqual([]);
+  });
+
+  it('rejects a foreign identity acquisition outcome before role publication', async () => {
+    const { d, calls } = fakeDeps();
+    await expect(spawnPermanent({ name: 'Composed', creationActionId: 'action-1' }, d, {
+      permanentAgentCreation: { async execute() { return { state: 'complete', reservation: {} as never,
+        locator: { kind: 'AgentStartLocator', agentId: 'Composed', actionId: 'action-1' } as never,
+        identityAcquisition: 'foreign' as never, identityName: 'Composed' }; } },
+    })).rejects.toThrow(/did not complete/u);
+    expect(existsSync(join(dir, 'fleet.d', 'Composed.yaml'))).toBe(false);
+    expect(calls.filter(call => call[0] === 'install')).toEqual([]);
+  });
+
+  it('fails before role publication when permanent Agent composition is not complete', async () => {
+    const { d, calls } = fakeDeps();
+    await expect(spawnPermanent({ name: 'Ambiguous' }, d, { permanentAgentCreation: {
+      async execute() { return { state: 'ambiguous', reservation: {} as never, outcome: 'unknown' }; },
+    } })).rejects.toThrow(/did not complete \(ambiguous\)/u);
+    expect(existsSync(join(dir, 'fleet.d', 'Ambiguous.yaml'))).toBe(false);
+    expect(calls.filter(call => call[0] === 'install')).toEqual([]);
+  });
+
 
 
   it('an existing identity is verified, and the briefing says so', async () => {

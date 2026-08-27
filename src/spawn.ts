@@ -21,7 +21,7 @@ import {
   ensureIdentity, provenanceOf,
   withCreationTransaction, writeProvenance, writeRoleFile,
   type CreationDeps, type CreationProvenance, type CreationTransaction,
-  type ProvenanceEntry,
+  type IdentityGuarantee, type ProvenanceEntry,
 } from './creation.js';
 import { VERSION } from './version.js';
 import './harness/claude-code.js';
@@ -357,15 +357,33 @@ export async function spawnPermanent(
       // Establish the identity BEFORE the service is enabled, and record
       // what was actually guaranteed so the briefing can say something true.
       creation.onStage?.('checking_identity');
-      const guarantee = await ensureIdentity(
-        effectiveIdentity(o),
-        profileValues(o),
-        creation.identityProvisioner ?? deps.identityProvisioner ?? daemonIdentityProvisioner(),
-        deps.log);
+      let guarantee: IdentityGuarantee;
+      if (creation.permanentAgentCreation) {
+        const expectedAgentId = o.name;
+        const expectedActionId = o.creationActionId;
+        const expectedIdentity = effectiveIdentity(o);
+        const composed = await creation.permanentAgentCreation.execute();
+        if (composed.state !== 'complete' || !composed.locator
+            || !['created', 'external'].includes(composed.identityAcquisition ?? ''))
+          throw new Error(`permanent Agent composition did not complete (${composed.state})`);
+        if (composed.locator.agentId !== expectedAgentId
+            || composed.locator.actionId !== expectedActionId
+            || composed.identityName !== expectedIdentity)
+          throw new Error('permanent Agent composition handoff binding mismatch');
+        guarantee = composed.identityAcquisition === 'created'
+          ? { state: 'created', evidence: 'missing', detail: 'authenticated Agent composition created the identity' }
+          : { state: 'verified', evidence: 'verified', detail: 'authenticated Agent composition verified the identity' };
+      } else {
+        guarantee = await ensureIdentity(
+          effectiveIdentity(o),
+          profileValues(o),
+          creation.identityProvisioner ?? deps.identityProvisioner ?? daemonIdentityProvisioner(),
+          deps.log);
+      }
       creation.onStage?.('checking_identity', {
         result: guarantee.evidence, guarantee: guarantee.state,
       });
-      if (guarantee.state === 'created')
+      if (guarantee.state === 'created' && !creation.permanentAgentCreation)
         // We minted it; a failed creation must not leave an orphan identity
         // behind. Only ever removes an identity THIS transaction created.
         tx.record({

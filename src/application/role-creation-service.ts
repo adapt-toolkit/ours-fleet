@@ -25,6 +25,9 @@ import { effectiveRoleModel } from '../model-env.js';
 import {
   claudeModelCatalog, codexModelCatalog, type HarnessModelCatalog, type HarnessModelOption,
 } from './model-catalog.js';
+import type { AgentCompositionRequest } from '../agent-composition-service.js';
+import type { PermanentAgentCreationResult, ProductionAgentCreationAssembly,
+  ProductionIngressContext } from '../agent-creation-composition-root.js';
 
 export interface CreateRoleSessionRequest {
   name: string;
@@ -140,6 +143,16 @@ export interface RoleCreationServiceOptions {
   modelCatalogs?: Partial<Record<'codex' | 'claude-code', () => HarnessModelCatalog>>;
   /** Direct/managed callers must not create or restore the web action journal. */
   journal?: boolean;
+  /** Trusted bridge from validated direct/managed ingress into the production Agent composition root. */
+  permanentAgentCreation?: ((input: Readonly<{
+    plan: CreationPlan; actionId: string;
+  }>) => Promise<PermanentAgentCreationResult>) | {
+    /** Authority-coherent real production assembly; RoleCreationService owns invocation. */
+    assembly: ProductionAgentCreationAssembly;
+    context(input: Readonly<{ plan: CreationPlan; actionId: string }>): ProductionIngressContext;
+    request(input: Readonly<{ plan: CreationPlan; actionId: string }>):
+      Omit<AgentCompositionRequest, 'callerEvidence'>;
+  };
 }
 
 export type CreationPlan =
@@ -154,6 +167,24 @@ const canonical = (value: unknown): string => {
   return JSON.stringify(value);
 };
 const hash = (value: unknown) => createHash('sha256').update(canonical(value)).digest('hex');
+
+function ownedFrozen<T>(value: T, seen = new WeakSet<object>()): T {
+  if (!value || typeof value !== 'object') return value;
+  if (seen.has(value as object)) throw new FleetError('invalid_request', 'creation plan must be acyclic');
+  seen.add(value as object);
+  const source = value as object;
+  const output: Record<PropertyKey, unknown> | unknown[] = Array.isArray(source) ? [] : {};
+  for (const key of Reflect.ownKeys(source)) {
+    if (Array.isArray(source) && key === 'length') continue;
+    const descriptor = Object.getOwnPropertyDescriptor(source, key);
+    if (!descriptor || descriptor.get || descriptor.set || !descriptor.enumerable)
+      throw new FleetError('invalid_request', 'creation plan must contain plain data');
+    Object.defineProperty(output, key, { value: ownedFrozen(descriptor.value, seen), enumerable: true,
+      configurable: false, writable: false });
+  }
+  seen.delete(source);
+  return Object.freeze(output) as T;
+}
 
 function bounded(value: string | undefined, name: string, max: number): void {
   if (value === undefined) return;
@@ -194,7 +225,8 @@ export class RoleCreationService {
     plan: Extract<CreationPlan, { origin: 'direct' }>; statePath: string;
   }> {
     const plan = this.previewSpawn({ origin: 'direct', options }) as Extract<CreationPlan, { origin: 'direct' }>;
-    return { plan, statePath: await this.launchSync(plan.options) };
+    plan.options.creationActionId = randomUUID();
+    return { plan, statePath: await this.launchSync(plan.options, undefined, plan) };
   }
 
   async createManaged(caller: ResolvedRole, requested: SpawnOpts): Promise<ManagedFleetSpawnResult> {
@@ -202,7 +234,7 @@ export class RoleCreationService {
       Extract<CreationPlan, { origin: 'managed' }>;
     const creationActionId = randomUUID();
     plan.options.creationActionId = creationActionId;
-    const statePath = await this.launchSync(plan.options);
+    const statePath = await this.launchSync(plan.options, undefined, plan);
     return {
       caller: plan.caller, role: plan.options.name,
       lifetime: plan.options.temp ? 'temporary' : 'permanent', statePath,
@@ -214,10 +246,29 @@ export class RoleCreationService {
     };
   }
 
-  private launchSync(options: SpawnOpts, creation?: CreationDeps): Promise<string> {
+  private launchSync(options: SpawnOpts, creation?: CreationDeps, plan?: CreationPlan): Promise<string> {
+    const actionId = options.creationActionId;
+    const composed = !options.temp && plan?.preview.resolvedRole.session === 'acp'
+      && actionId && this.options.permanentAgentCreation
+      ? { execute: () => this.executePermanentAgentCreation(this.options.permanentAgentCreation!, plan, actionId) }
+      : undefined;
+    const deps = composed ? { ...creation, permanentAgentCreation: composed } : creation;
     return options.temp
-      ? spawnTemp(options, this.options.binPath, this.options.tempLauncher, creation)
-      : spawnPermanent(options, this.options.ops, creation);
+      ? spawnTemp(options, this.options.binPath, this.options.tempLauncher, deps)
+      : spawnPermanent(options, this.options.ops, deps);
+  }
+
+  private executePermanentAgentCreation(
+    bridge: NonNullable<RoleCreationServiceOptions['permanentAgentCreation']>,
+    plan: CreationPlan, actionId: string,
+  ): Promise<PermanentAgentCreationResult> {
+    const input = Object.freeze({ plan: ownedFrozen(plan), actionId });
+    if (typeof bridge === 'function') return bridge(input);
+    const context = bridge.context(input);
+    const callerEvidence = plan.origin === 'direct'
+      ? bridge.assembly.ingress.direct(context)
+      : bridge.assembly.ingress.managed(plan.caller, context);
+    return bridge.assembly.root.createPermanent({ ...bridge.request(input), callerEvidence }, actionId);
   }
 
   async capabilities(): Promise<CreationCapabilities> {
@@ -408,7 +459,11 @@ export class RoleCreationService {
           : { exists: name => this.identityProvisioner.exists(name) },
         onStage: (stage, evidence) => this.coreStage(action, stage, evidence),
       };
-      await this.launchSync(this.spawnOptions(preview.request, action.actionId), creation);
+      const options = this.spawnOptions(preview.request, action.actionId);
+      const plan: Extract<CreationPlan, { origin: 'direct' }> = {
+        origin: 'direct', options, preview: spawnDryRun(options),
+      };
+      await this.launchSync(options, creation, plan);
       this.stage(action, 'launched', 'launch accepted; readiness not yet confirmed');
       this.stage(
         action, 'identity_bootstrap_pending',

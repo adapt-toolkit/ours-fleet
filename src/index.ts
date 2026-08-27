@@ -31,6 +31,17 @@ export { RoleRepository } from './application/role-repository.js';
 export { FleetQueryService } from './application/fleet-query-service.js';
 export { AcpRoleSessionAdapter, TmuxRoleSessionAdapter } from './application/session-control.js';
 export { RoleCreationService } from './application/role-creation-service.js';
+export {
+  createProductionAgentCreationCompositionRoot,
+} from './agent-creation-composition-root.js';
+export type {
+  PermanentAgentCreationResult, ProductionAgentCreationAssembly,
+  ProductionAgentCreationDeps, ProductionAgentCreationIngress, ProductionIngressContext,
+} from './agent-creation-composition-root.js';
+export {
+  AGENT_START_LOCATOR_FILENAME, AgentStartLocatorError, readAgentStartLocator,
+} from './agent-start-locator.js';
+export type { AgentStartLocator, AgentStartLocatorExpectedBindings } from './agent-start-locator.js';
 export { RoleCommandService, RoleLifecycleService } from './application/role-command-service.js';
 export { StructuredLogService } from './application/log-service.js';
 export { roleCapabilities } from './application/capabilities.js';

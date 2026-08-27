@@ -8,6 +8,7 @@ import { replaceFileAtomically, withFileLock, type LockDeps } from './atomic-fil
 import { stateRoot } from './paths.js';
 import { buildInfo, UNKNOWN_BUILD } from './provenance.js';
 import type { ResolvedRole } from './config.js';
+import type { PermanentAgentCreationResult } from './agent-creation-composition-root.js';
 
 /**
  * One creation transaction: role name and ours identity reserved together,
@@ -61,6 +62,8 @@ export interface CreationDeps {
   identityRegistry?: IdentityRegistry;
   /** Verify/create the ours identity. Injectable so tests need no daemon. */
   identityProvisioner?: IdentityProvisioner;
+  /** Trusted permanent Agent composition handoff. Temporary creation never invokes it. */
+  permanentAgentCreation?: { execute(): Promise<PermanentAgentCreationResult> };
   /** Descriptive progress around the existing transaction; never a second workflow. */
   onStage?(stage: CreationCoreStage, evidence?: Record<string, string | boolean>): void;
 }
@@ -219,13 +222,24 @@ export interface IdentityProvisioner {
   /** Does this identity exist? `unknown` when the daemon could not be asked. */
   exists(name: string): Promise<boolean | 'unknown'>;
   /** Create it, publishing bio/persona through the same path. Absent = cannot. */
-  create?(name: string, profile: IdentityProvisionProfile): Promise<void>;
+  create?(name: string, profile: IdentityProvisionProfile): Promise<void | IdentityCreateOutcome>;
+  /** Authenticated permanent identity inspection. Boolean exists() is not identity evidence. */
+  inspect?(name: string): Promise<IdentityInspection>;
   /**
    * Undo a `create` during rollback. Only ever called for an identity THIS
    * transaction created; absent means "cannot", and the orphan is reported.
    */
   remove?(name: string): Promise<void>;
 }
+
+export type IdentityInspection =
+  | { state: 'present'; cid: string }
+  | { state: 'absent' }
+  | { state: 'unknown' };
+export type IdentityCreateOutcome =
+  | { state: 'created_here'; cid: string }
+  | { state: 'existing'; cid: string }
+  | { state: 'unknown' };
 
 export interface IdentityProvisionProfile {
   bio?: string;
@@ -385,6 +399,19 @@ export function daemonIdentityProvisioner(
         return 'unknown';
       }
     },
+    async inspect(name: string) {
+      try {
+        const client = await attachClient({
+          env, leaseToken: `ours-fleet-identity-inspect-${process.pid}-${randomUUID()}`,
+          clientPid: process.pid,
+        });
+        if (!client.listIdentities) return { state: 'unknown' };
+        const identities = await client.listIdentities();
+        const existing = identities.find(identity => identity.name === name);
+        if (!existing || existing.temp) return { state: 'absent' };
+        return { state: 'present', cid: existing.cid };
+      } catch { return { state: 'unknown' }; }
+    },
   };
   if (options.createPermanent === false) return provisioner;
 
@@ -402,30 +429,32 @@ export function daemonIdentityProvisioner(
       if (existing) {
         if (existing.temp)
           throw new Error(`identity '${name}' exists but is temporary; refusing to convert or adopt it`);
-        return; // another reconciler won the create race
+        return { state: 'existing', cid: existing.cid }; // another reconciler won the create race
       }
       if (!before.some(identity => identity.kind === 'root'))
         throw new Error(
           `cannot create role identity '${name}': this host has no Human identity; run ours onboarding first`);
 
-      let createdHere = false;
+      let createdCid: string | undefined;
       try {
-        await client.createIdentity({
+        const created = await client.createIdentity({
           name,
           bio: profile.bio ?? '',
           exposeLocal: profile.exposeLocal ?? true,
           localAutoAccept: profile.localAutoAccept ?? true,
         });
-        createdHere = true;
+        createdCid = created.info.cid;
       } catch (error) {
         // Creation is daemon-atomic. If a concurrent reconciler won by name,
         // accept only the compatible permanent identity now visible.
         const after = await client.listIdentities();
         const raced = after.find(identity => identity.name === name);
         if (!raced || raced.temp) throw error;
+        return { state: 'existing', cid: raced.cid };
       }
-      if (createdHere && profile.persona && client.setPersona)
+      if (profile.persona && client.setPersona)
         await client.setPersona({ persona: profile.persona });
+      return createdCid ? { state: 'created_here', cid: createdCid } : { state: 'unknown' };
     } finally {
       // createIdentity binds this lease. The managed role/channel is the next
       // owner, so never leave the short-lived provisioning client holding it.
