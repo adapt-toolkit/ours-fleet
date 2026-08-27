@@ -88,15 +88,11 @@ describe('deterministic managed room close', () => {
     expect(closed.close).toMatchObject({ phase: 'completed' });
   });
 
-  it('removes an exact-CID never-launched identity without requiring launch proof', async () => {
+  it('closes a never-created member without identity removal or CID proof', async () => {
     updateMemberSeats(ROOM_ID, [{
-      role_name: 'member-1', identity_cid: CID, slot: 'dev',
+      role_name: 'member-1', slot: 'dev',
       cowork_role: 'Developer', seat_state: 'pending',
-      launch: { state: 'pending', attempt: 0, updated_at: '2026-08-24T00:00:00.000Z' },
     }]);
-    sdk.listIdentities.mockResolvedValueOnce([{
-      name: 'member-1', cid: CID, kind: 'role', temp: null, session: null,
-    }]).mockResolvedValue([]);
     const cowork = { closeRoom: vi.fn(async () => undefined) };
 
     const closed = await closeManagedRoom({ roomId: ROOM_ID, cowork });
@@ -105,14 +101,14 @@ describe('deterministic managed room close', () => {
       seat_state: 'removed',
       retirement: { phase: 'identity_absent', launch_id: 'never-launched' },
     });
-    expect(sdk.removeIdentity).toHaveBeenCalledWith({ name: 'member-1' });
+    expect(sdk.listIdentities).not.toHaveBeenCalled();
+    expect(sdk.removeIdentity).not.toHaveBeenCalled();
   });
 
   it('fails closed when a never-launched identity unexpectedly has Fleet temp state', async () => {
     updateMemberSeats(ROOM_ID, [{
-      role_name: 'member-1', identity_cid: CID, slot: 'dev',
+      role_name: 'member-1', slot: 'dev',
       cowork_role: 'Developer', seat_state: 'pending',
-      launch: { state: 'pending', attempt: 0, updated_at: '2026-08-24T00:00:00.000Z' },
     }]);
     mkdirSync(join(root, '.ours-fleet', 'tmp', 'member-1'), { recursive: true });
     const cowork = { closeRoom: vi.fn(async () => undefined) };
@@ -123,19 +119,15 @@ describe('deterministic managed room close', () => {
     expect(cowork.closeRoom).not.toHaveBeenCalled();
   });
 
-  it('refuses never-launched cleanup when the same name has a different CID', async () => {
+  it('does not classify authenticated identity evidence as never-created', async () => {
     updateMemberSeats(ROOM_ID, [{
       role_name: 'member-1', identity_cid: CID, slot: 'dev',
       cowork_role: 'Developer', seat_state: 'pending',
-      launch: { state: 'pending', attempt: 0, updated_at: '2026-08-24T00:00:00.000Z' },
-    }]);
-    sdk.listIdentities.mockResolvedValue([{
-      name: 'member-1', cid: 'cd'.repeat(32), kind: 'role', temp: null, session: null,
     }]);
     const cowork = { closeRoom: vi.fn(async () => undefined) };
 
     await expect(closeManagedRoom({ roomId: ROOM_ID, cowork }))
-      .rejects.toThrow(/CID mismatch/);
+      .rejects.toThrow(/no live Fleet temp-state identity proof/);
     expect(sdk.removeIdentity).not.toHaveBeenCalled();
     expect(cowork.closeRoom).not.toHaveBeenCalled();
     expect(getRoomRecord(ROOM_ID)!.member_seats[0].retirement).toBeUndefined();

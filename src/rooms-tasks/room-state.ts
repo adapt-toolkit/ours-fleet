@@ -164,7 +164,7 @@ export function updateRoomHistoryCursor(id: string, cursor: number): RoomOrchest
 }
 
 const LAUNCH_ORDER: readonly RoomMemberLaunchState['state'][] = [
-  'pending', 'intent', 'launched', 'stopped', 'failed',
+  'launched', 'stopped',
 ];
 
 export function updateMemberStartup(
@@ -177,8 +177,7 @@ export function updateMemberStartup(
   if (!seat) throw new RoomStateError(`room ${id} has no recorded member ${roleName}`);
   if (update.launch && seat.launch
       && LAUNCH_ORDER.indexOf(update.launch.state) < LAUNCH_ORDER.indexOf(seat.launch.state)
-      && !(seat.launch.state === 'stopped' && update.launch.state === 'intent')
-      && !(seat.launch.state === 'failed' && update.launch.state === 'intent')) {
+      && !(seat.launch.state === 'stopped' && update.launch.state === 'launched')) {
     throw new RoomStateError(
       `room ${id} member ${roleName} launch cannot move backward to ${update.launch.state}`,
     );

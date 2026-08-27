@@ -565,18 +565,12 @@ describe('room-state', () => {
       expect(getRoomRecord('brief-1')?.role_briefings?.Reviewer.text).toBe('Review exactly.');
     });
 
-    it('persists forward-only launch progress per seat', () => {
+    it('persists only concrete forward launch progress per seat', () => {
       createRoomRecord({ room_id: 'brief-2', room_name: 'Brief' });
       updateMemberSeats('brief-2', [{
         role_name: 'Reviewer-1', identity_cid: 'cid-1', slot: 'reviewer',
         cowork_role: 'Reviewer', seat_state: 'active',
       }]);
-      updateMemberStartup('brief-2', 'Reviewer-1', {
-        launch: {
-          state: 'intent', attempt: 1, action_id: 'action-1',
-          mission_sha256: 'b'.repeat(64), updated_at: '2026-08-24T00:00:00.000Z',
-        },
-      });
       const r = updateMemberStartup('brief-2', 'Reviewer-1', {
         launch: {
           state: 'launched', attempt: 1, action_id: 'action-1',
@@ -585,12 +579,6 @@ describe('room-state', () => {
         },
       });
       expect(r.member_seats[0].launch?.launch_id).toBe('launch-1');
-      expect(() => updateMemberStartup('brief-2', 'Reviewer-1', {
-        launch: {
-          state: 'intent', attempt: 1, action_id: 'action-1',
-          mission_sha256: 'b'.repeat(64), updated_at: 'older',
-        },
-      })).toThrow(/cannot move backward/);
     });
 
     it('permits a stopped launch to begin a new durable attempt', () => {
@@ -598,15 +586,18 @@ describe('room-state', () => {
       updateMemberSeats('brief-3', [{
         role_name: 'Reviewer-1', identity_cid: 'cid-1', slot: 'reviewer',
         cowork_role: 'Reviewer', seat_state: 'active',
-        launch: { state: 'stopped', attempt: 1, updated_at: 'old' },
+        launch: {
+          state: 'stopped', attempt: 1, action_id: 'action-1', launch_id: 'launch-1',
+          mission_sha256: 'c'.repeat(64), updated_at: 'old',
+        },
       }]);
       const r = updateMemberStartup('brief-3', 'Reviewer-1', {
         launch: {
-          state: 'intent', attempt: 2, action_id: 'action-2',
+          state: 'launched', attempt: 2, action_id: 'action-2', launch_id: 'launch-2',
           mission_sha256: 'c'.repeat(64), updated_at: 'new',
         },
       });
-      expect(r.member_seats[0].launch).toMatchObject({ state: 'intent', attempt: 2 });
+      expect(r.member_seats[0].launch).toMatchObject({ state: 'launched', attempt: 2 });
     });
   });
 

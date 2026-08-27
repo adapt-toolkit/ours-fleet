@@ -24,6 +24,7 @@ vi.mock('../src/temp-lifecycle.js', async importOriginal => ({
 }));
 
 import { provisionMembers } from '../src/rooms-tasks/provision.js';
+import { closeManagedRoom } from '../src/rooms-tasks/close.js';
 import { spawnDryRun } from '../src/spawn.js';
 import { createRoomRecord, getRoomRecord } from '../src/rooms-tasks/room-state.js';
 import { createTask, getTask } from '../src/rooms-tasks/task-state.js';
@@ -281,7 +282,7 @@ describe('simple Cowork room member startup', () => {
     })).rejects.toThrow('has role Owner; expected Developer');
   });
 
-  it('revokes a freshly issued invite when its member launch fails', async () => {
+  it('leaves no durable launch record after pre-creation failure and retries normally', async () => {
     createRoomRecord({ room_id: 'room-fail', room_name: 'Room', room_identity_cid: 'room-cid' });
     const h = coworkHarness();
     mocks.spawnTemp.mockRejectedValueOnce(new Error('launch failed'));
@@ -290,7 +291,43 @@ describe('simple Cowork room member startup', () => {
       binPath: '/usr/bin/ours-fleet',
     })).rejects.toThrow('launch failed');
     expect(h.revokeInvite).toHaveBeenCalledWith('room-fail', 'invite-1');
-    expect(getRoomRecord('room-fail')?.member_seats[0].launch?.state).toBe('failed');
+    expect(getRoomRecord('room-fail')?.member_seats[0].launch).toBeUndefined();
+    const persisted = readFileSync(
+      join(root, '.ours-fleet', 'rooms', 'room-fail.json'), 'utf8',
+    );
+    expect(persisted).not.toContain('"intent"');
+    expect(persisted).not.toContain('"failed"');
+    expect(persisted).not.toContain('action_id');
+
+    // A new invocation reads the durable room record and performs a normal retry.
+    await expect(provisionMembers({
+      cfg: cfg(), cowork: h.cowork, roomId: 'room-fail', template: template(1),
+      binPath: '/usr/bin/ours-fleet',
+    })).resolves.toMatchObject({ state: 'active' });
+    expect(mocks.spawnTemp).toHaveBeenCalledTimes(2);
+    expect(getRoomRecord('room-fail')?.member_seats[0].launch?.state).toBe('launched');
+  });
+
+  it('cancels canonically after pre-creation failure without member retirement', async () => {
+    createRoomRecord({
+      room_id: 'room-cancel-fail', room_name: 'Room', room_identity_cid: 'room-cid',
+    });
+    const h = coworkHarness();
+    mocks.spawnTemp.mockRejectedValueOnce(new Error('launch failed before creation'));
+    await expect(provisionMembers({
+      cfg: cfg(), cowork: h.cowork, roomId: 'room-cancel-fail', template: template(1),
+      binPath: '/usr/bin/ours-fleet',
+    })).rejects.toThrow('launch failed before creation');
+
+    const closed = await closeManagedRoom({ roomId: 'room-cancel-fail', cowork: h.cowork });
+    expect(closed).toMatchObject({
+      state: 'closed',
+      member_seats: [{
+        retirement: { phase: 'identity_absent', launch_id: 'never-launched' },
+      }],
+    });
+    expect(closed.member_seats[0].launch).toBeUndefined();
+    expect(h.cowork.closeRoom).toHaveBeenCalledWith('room-cancel-fail');
   });
 
   it('does not persist invite secrets in Fleet room orchestration state', async () => {
@@ -443,7 +480,7 @@ describe('simple Cowork room member startup', () => {
     await expect(provisionMembers(input)).rejects.toThrow('simulated process loss');
 
     expect(getRoomRecord('room-crash')!.member_seats[0].launch).toMatchObject({
-      state: 'failed', caller_role: 'Coordinator',
+      state: 'launched', action_id: supervisorAction, caller_role: 'Coordinator',
     });
     mocks.controlRequest.mockReset();
     mockManagedSpawns();

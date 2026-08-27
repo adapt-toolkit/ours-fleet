@@ -363,8 +363,7 @@ function roomStartupSections(
       markdownItems: room.member_seats.map(seat => {
         const launch = seat.launch?.state ?? 'unrecorded';
         return `${markdownCode(seat.role_name)} — ${markdownProse(seat.cowork_role)} — `
-          + `seat ${markdownProse(seat.seat_state)}, launch ${markdownProse(launch)}`
-          + (seat.launch?.error ? ' — launch failure recorded; inspect role logs' : '');
+          + `seat ${markdownProse(seat.seat_state)}, launch ${markdownProse(launch)}`;
       }),
     });
   }
