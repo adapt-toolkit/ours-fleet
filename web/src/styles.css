@@ -192,8 +192,16 @@ legend { margin-bottom: 13px; color: var(--mint); text-transform: uppercase; fon
 .legend-line.spawned { border-color: var(--mint); border-top-style: dashed; }
 .legend-line.watches { border-color: #d7ad58; border-top-style: dotted; }
 .legend-line.targets { height: 5px; border-color: #729ed6; border-bottom: 1px dotted #729ed6; }
-.topology-node { position: absolute; width: 150px; min-height: 62px; display: grid; gap: 3px; z-index: 1; padding: 0; text-align: left; border: 1px solid #344044; border-radius: 10px; background: #111718; box-shadow: 0 8px 24px rgba(0,0,0,.28); transform: translateY(-50%); }
-.topology-open { display: grid; gap: 3px; min-width: 0; padding: 10px 28px 10px 12px; color: inherit; text-align: left; border: 0; background: transparent; cursor: pointer; }
+.topology-node { position: absolute; width: 150px; min-height: 62px; display: grid; gap: 3px; z-index: 1; padding: 0 0 6px; text-align: left; border: 1px solid #344044; border-radius: 10px; background: #111718; box-shadow: 0 8px 24px rgba(0,0,0,.28); transform: translateY(-50%); }
+.node-actions { display: grid; grid-template-columns: 1fr 1fr; gap: 3px; padding: 0 6px; }
+.node-action { overflow: hidden; padding: 2px 4px; color: #a7b2b4; border: 1px solid #2b3639; border-radius: 6px; background: #0d1314; font-size: 10px; line-height: 1.35; letter-spacing: 0; text-align: center; text-overflow: ellipsis; cursor: pointer; white-space: nowrap; }
+.node-actions > :only-child { grid-column: span 2; }
+.node-action:hover, .node-action:focus { color: var(--mint); border-color: var(--mint); }
+.topology-node.connect-source { border-color: var(--mint); box-shadow: 0 0 0 2px rgba(88,199,160,.45); }
+.topology-node.connect-target .topology-open { cursor: crosshair; }
+.topology-node.connect-target:hover { border-color: var(--mint); }
+.banner.pending { border-color: var(--mint); color: #d5dddf; }
+.topology-open { display: grid; gap: 2px; min-width: 0; padding: 8px 10px 6px 12px; color: inherit; text-align: left; border: 0; background: transparent; cursor: pointer; }
 .topology-remove { position: absolute; top: 5px; right: 5px; width: 22px; height: 22px; padding: 0; color: var(--muted); border: 0; background: transparent; }
 .topology-remove:hover, .topology-remove:focus { color: #ff8e85; }
 .topology-node:hover { border-color: var(--mint); transform: translateY(-50%) translateY(-2px); }

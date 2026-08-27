@@ -358,6 +358,24 @@ export async function buildWebServer(
     return result;
   });
 
+  app.post('/api/v1/topology/oversee/preview', async request => {
+    auth.authenticate(request, true);
+    return promotion().previewOversee(overseeRequest(request.body));
+  });
+
+  // Writes `oversee:` into fleet.yaml and stops there. An overseer picks its
+  // wards up from its briefing the next time it starts; nothing starts here.
+  app.post('/api/v1/topology/oversee', async request => {
+    const session = auth.authenticate(request, true);
+    const body = overseeRequest(request.body);
+    const result = await promotion().connectOversee(body);
+    events.publish('configuration.changed', { revision: result.newRevision });
+    await audit.record({
+      requestId: request.id, browser: session.id, action: 'topology.oversee', result: 'succeeded',
+    });
+    return result;
+  });
+
   app.get<{ Params: { id: string } }>('/api/v1/roles/:id', async request => {
     auth.authenticate(request);
     return services.query.detail(request.params.id);
@@ -688,6 +706,19 @@ function promoteRequest(body: unknown): { ids: string[]; configRevision: string;
     ids: value.ids as string[],
     configRevision: String(value.configRevision ?? ''),
     draftRevision: typeof value.draftRevision === 'string' ? value.draftRevision : undefined,
+  };
+}
+
+function overseeRequest(body: unknown): {
+  from: string; to: string; interval?: string; configRevision: string;
+} {
+  const value = (body ?? {}) as Record<string, unknown>;
+  if (typeof value.from !== 'string' || typeof value.to !== 'string')
+    throw new FleetError('invalid_request', 'from and to must name two agents');
+  return {
+    from: value.from, to: value.to,
+    interval: typeof value.interval === 'string' && value.interval !== '' ? value.interval : undefined,
+    configRevision: String(value.configRevision ?? ''),
   };
 }
 
