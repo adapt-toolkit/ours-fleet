@@ -18,8 +18,14 @@ export interface TrustedRuntimeAdapter {
   adapterId:string; adapterVersion:string; policyDigest:string; descriptorDigest:string;
   descriptor:Readonly<Record<string,unknown>>;
 }
+export interface ResolvedRuntimeAdapter {
+  durable:Readonly<TrustedRuntimeAdapter>;
+  /** Opaque process-local capability; excluded from every durable projection and key. */
+  preparationEvidence:unknown;
+}
+type DurableRuntimeAdapter = TrustedRuntimeAdapter;
 export interface RuntimeAdapterAuthority {
-  resolve(completion:Readonly<CompleteAgentCreationBindings>):Readonly<TrustedRuntimeAdapter>;
+  resolve(completion:Readonly<CompleteAgentCreationBindings>):Readonly<ResolvedRuntimeAdapter>;
 }
 export type RuntimeProofOutcome = 'not_started'|'started_by_action'|'unknown';
 export interface TrustedRuntimeStartProof {
@@ -50,12 +56,12 @@ export interface RuntimeProviderEvidenceAuthority {
 }
 export interface IdempotentRuntimeProvider {
   readonly supportsIdempotentRuntimeActionKeys:true;
-  reconcileStart(input:Readonly<RuntimeProviderBindings>):Promise<unknown>;
-  startBrain(input:Readonly<RuntimeProviderBindings & {descriptor:Readonly<Record<string,unknown>>}>):Promise<unknown>;
-  checkReadiness(input:Readonly<RuntimeProviderBindings & {providerRuntimeId:string}>):Promise<unknown>;
-  reconcileRestore(input:Readonly<RuntimeProviderBindings & {providerRuntimeId:string;restoreRequestKey:string}>):Promise<unknown>;
-  reconcileRetire(input:Readonly<RuntimeProviderBindings & {providerRuntimeId:string;retireEffectKey:string}>):Promise<unknown>;
-  acquireCurrent(input:Readonly<RuntimeProviderBindings & {providerRuntimeId:string;retireEffectKey:string}>):Promise<unknown>;
+  reconcileStart(input:Readonly<RuntimeProviderBindings>,preparation:unknown):Promise<unknown>;
+  startBrain(input:Readonly<RuntimeProviderBindings & {descriptor:Readonly<Record<string,unknown>>}>,preparation:unknown):Promise<unknown>;
+  checkReadiness(input:Readonly<RuntimeProviderBindings & {providerRuntimeId:string}>,preparation:unknown):Promise<unknown>;
+  reconcileRestore(input:Readonly<RuntimeProviderBindings & {providerRuntimeId:string;restoreRequestKey:string}>,preparation:unknown):Promise<unknown>;
+  reconcileRetire(input:Readonly<RuntimeProviderBindings & {providerRuntimeId:string;retireEffectKey:string}>,preparation:unknown):Promise<unknown>;
+  acquireCurrent(input:Readonly<RuntimeProviderBindings & {providerRuntimeId:string;retireEffectKey:string}>,preparation:unknown):Promise<unknown>;
   retire(capability:unknown):Promise<void>;
 }
 export interface RuntimeProviderBindings extends RuntimeCommon {
@@ -119,10 +125,10 @@ export class AgentRuntimeTransaction {
     if(state==='active_claimed'){await this.#append('launch',trusted,request,common,'start_authorized',{startEffectKey:bindings.startEffectKey});state='start_authorized';}
     if(state==='start_authorized'){await this.#append('launch',trusted,request,common,'starting',{});state='starting';}
     if(state==='starting'){
-      let proof=this.#startProof(await this.provider.reconcileStart(bindings),bindings);
+      let proof=this.#startProof(await this.provider.reconcileStart(bindings,admitted.preparationEvidence),bindings);
       if(proof.outcome==='not_started'){
-        const hint=await this.provider.startBrain({...bindings,descriptor:adapter.descriptor});
-        proof=this.#startProof(await this.provider.reconcileStart(bindings),bindings,hint);
+        const hint=await this.provider.startBrain({...bindings,descriptor:adapter.descriptor},admitted.preparationEvidence);
+        proof=this.#startProof(await this.provider.reconcileStart(bindings,admitted.preparationEvidence),bindings,hint);
       }
       if(proof.outcome!=='started_by_action'){await this.#append('launch',trusted,request,common,'ambiguous',{reason:'start_unknown'});return {state:'ambiguous',runtimeInstanceKey:common.runtimeInstanceKey};}
       await this.#append('launch',trusted,request,common,'started',{provider:proof.provider,
@@ -138,7 +144,7 @@ export class AgentRuntimeTransaction {
       await this.#append('launch',trusted,request,common,'readiness_checking',{});state='readiness_checking';
     }
     if(state==='readiness_checking'){
-      const binding=this.#binding(trusted,bindings,adapter); const proof=this.#readiness(await this.provider.checkReadiness({...bindings,providerRuntimeId:String(binding.providerRuntimeId)}),bindings,String(binding.providerRuntimeId));
+      const binding=this.#binding(trusted,bindings,adapter); const proof=this.#readiness(await this.provider.checkReadiness({...bindings,providerRuntimeId:String(binding.providerRuntimeId)},admitted.preparationEvidence),bindings,String(binding.providerRuntimeId));
       const terminal=proof.outcome==='unknown'?'ambiguous':proof.outcome;
       await this.#append('launch',trusted,request,common,terminal,proof.outcome==='unknown'?{reason:'readiness_unknown'}:{evidenceDigest:proof.evidenceDigest});
       return {state:terminal,runtimeInstanceKey:common.runtimeInstanceKey};
@@ -157,7 +163,7 @@ export class AgentRuntimeTransaction {
       let chain=this.#chain('restore',a.trusted,a.request,a.common,RESTORE),state=chain.at(-1)!.state;
       if(['restored','missing','ambiguous'].includes(state))return{state,runtimeInstanceKey:a.common.runtimeInstanceKey};
       if(state==='restore_authorized'){await this.#append('restore',a.trusted,a.request,a.common,'reconciling',{});state='reconciling';}
-      const binding=this.#binding(a.trusted,a.bindings,a.adapter); const proof=this.#restore(await this.provider.reconcileRestore({...a.bindings,providerRuntimeId:String(binding.providerRuntimeId),restoreRequestKey:key}),a.bindings,String(binding.providerRuntimeId));
+      const binding=this.#binding(a.trusted,a.bindings,a.adapter); const proof=this.#restore(await this.provider.reconcileRestore({...a.bindings,providerRuntimeId:String(binding.providerRuntimeId),restoreRequestKey:key},a.preparationEvidence),a.bindings,String(binding.providerRuntimeId));
       state=proof.outcome==='current_exact'?'restored':proof.outcome==='absent'?'missing':'ambiguous';
       await this.#append('restore',a.trusted,a.request,a.common,state,state==='ambiguous'?{reason:'restore_unknown'}:{evidenceDigest:proof.evidenceDigest});return{state,runtimeInstanceKey:a.common.runtimeInstanceKey};
     });
@@ -172,10 +178,10 @@ export class AgentRuntimeTransaction {
       await this.#append('retire',a.trusted,a.request,a.common,'retire_authorized',{retireEffectKey:key});let chain=this.#chain('retire',a.trusted,a.request,a.common,RETIRE),state=chain.at(-1)!.state;
       if(['retired','retire_failed','already_absent','ambiguous'].includes(state))return{state,runtimeInstanceKey:a.common.runtimeInstanceKey};
       if(state==='retire_authorized'){await this.#append('retire',a.trusted,a.request,a.common,'reconciling',{});state='reconciling';}
-      const binding=this.#binding(a.trusted,a.bindings,a.adapter);const proof=this.#retireProof(await this.provider.reconcileRetire({...a.bindings,providerRuntimeId:String(binding.providerRuntimeId),retireEffectKey:key}),a.bindings,String(binding.providerRuntimeId),key);
+      const binding=this.#binding(a.trusted,a.bindings,a.adapter);const proof=this.#retireProof(await this.provider.reconcileRetire({...a.bindings,providerRuntimeId:String(binding.providerRuntimeId),retireEffectKey:key},a.preparationEvidence),a.bindings,String(binding.providerRuntimeId),key);
       if(proof.outcome==='already_absent'){await this.#append('retire',a.trusted,a.request,a.common,'already_absent',{evidenceDigest:proof.evidenceDigest});return{state:'already_absent',runtimeInstanceKey:a.common.runtimeInstanceKey};}
       if(proof.outcome!=='current_exact'){await this.#append('retire',a.trusted,a.request,a.common,'ambiguous',{reason:'retire_unknown'});return{state:'ambiguous',runtimeInstanceKey:a.common.runtimeInstanceKey};}
-      await this.#append('retire',a.trusted,a.request,a.common,'retiring',{evidenceDigest:proof.evidenceDigest});const capability=await this.provider.acquireCurrent({...a.bindings,providerRuntimeId:String(binding.providerRuntimeId),retireEffectKey:key});
+      await this.#append('retire',a.trusted,a.request,a.common,'retiring',{evidenceDigest:proof.evidenceDigest});const capability=await this.provider.acquireCurrent({...a.bindings,providerRuntimeId:String(binding.providerRuntimeId),retireEffectKey:key},a.preparationEvidence);
       const current=this.proofs.consumeCurrent(capability);if(!current||!current.currentOwner||current.runtimeInstanceKey!==a.common.runtimeInstanceKey||current.retireEffectKey!==key||current.providerRuntimeId!==binding.providerRuntimeId){await this.#append('retire',a.trusted,a.request,a.common,'ambiguous',{reason:'ownership_unknown'});return{state:'ambiguous',runtimeInstanceKey:a.common.runtimeInstanceKey};}
       try{await this.provider.retire(capability);await this.#append('retire',a.trusted,a.request,a.common,'retired',{});return{state:'retired',runtimeInstanceKey:a.common.runtimeInstanceKey};}
       catch{await this.#append('retire',a.trusted,a.request,a.common,'ambiguous',{reason:'retire_unknown'});return{state:'ambiguous',runtimeInstanceKey:a.common.runtimeInstanceKey};}
@@ -199,10 +205,11 @@ export class AgentRuntimeTransaction {
       generation:Number(authenticated.generation),planDigest:String(authenticated.planDigest),
       reservationDigest:String(authenticated.reservationDigest),issuedAt:Number(authenticated.issuedAt),
       ...(reason===undefined?{}:{recoveryReason:String(reason)})}) as Readonly<TrustedRuntimeOperationRequest>;
-    const fresh=this.completion.validateComplete(reservation);const trusted=this.completion.authenticateComplete(fresh);if(!trusted)throw new AgentRuntimeTransactionError('unauthorized');const adapter=this.adapters.resolve(trusted);
+    const fresh=this.completion.validateComplete(reservation);const trusted=this.completion.authenticateComplete(fresh);if(!trusted)throw new AgentRuntimeTransactionError('unauthorized');const resolved=this.adapters.resolve(trusted);const adapter=resolved?.durable;const preparationEvidence=resolved?.preparationEvidence;
     let descriptorBytes:string;
     try{descriptorBytes=runtimeCanonical(adapter?.descriptor);}catch{throw new AgentRuntimeTransactionError('unauthorized');}
-    if(!adapter||!TOKEN.test(adapter.adapterId)||!TOKEN.test(adapter.adapterVersion)
+    if(!adapter||!preparationEvidence||typeof preparationEvidence!=='object'
+      ||!TOKEN.test(adapter.adapterId)||!TOKEN.test(adapter.adapterVersion)
       ||Buffer.byteLength(descriptorBytes,'utf8')>64*1024
       ||![adapter.policyDigest,adapter.descriptorDigest].every(value=>SHA.test(value))
       ||runtimeDigest(descriptorBytes)!==adapter.descriptorDigest)throw new AgentRuntimeTransactionError('unauthorized');
@@ -210,7 +217,7 @@ export class AgentRuntimeTransaction {
       policyDigest:String(adapter.policyDigest),descriptorDigest:String(adapter.descriptorDigest),
       descriptor:deepFreeze(JSON.parse(descriptorBytes) as Record<string,unknown>)});
     const runtimeInstanceKey=runtimeDigest(runtimeCanonical({agentId:trusted.agentId,generation:trusted.generation,planDigest:trusted.planDigest,snapshotDigest:trusted.snapshotDigest,reservationDigest:trusted.reservationDigest,identityEvidenceDigest:trusted.identity.evidenceDigest,adapterId:ownedAdapter.adapterId,adapterVersion:ownedAdapter.adapterVersion,adapterPolicyDigest:ownedAdapter.policyDigest}));
-    const common:RuntimeCommon={agentId:trusted.agentId,generation:trusted.generation,planDigest:trusted.planDigest,snapshotDigest:trusted.snapshotDigest,reservationDigest:trusted.reservationDigest,identityEvidenceDigest:trusted.identity.evidenceDigest,runtimeInstanceKey};const startEffectKey=runtimeDigest(runtimeCanonical({kind:'runtime.start',runtimeInstanceKey}));const bindings={...common,startEffectKey,adapterDescriptorDigest:ownedAdapter.descriptorDigest};return{request,trusted,adapter:ownedAdapter,common,bindings};
+    const common:RuntimeCommon={agentId:trusted.agentId,generation:trusted.generation,planDigest:trusted.planDigest,snapshotDigest:trusted.snapshotDigest,reservationDigest:trusted.reservationDigest,identityEvidenceDigest:trusted.identity.evidenceDigest,runtimeInstanceKey};const startEffectKey=runtimeDigest(runtimeCanonical({kind:'runtime.start',runtimeInstanceKey}));const bindings={...common,startEffectKey,adapterDescriptorDigest:ownedAdapter.descriptorDigest};return{request,trusted,adapter:ownedAdapter,preparationEvidence,common,bindings};
   }
   #fresh(reservation:VerifiedGenerationReservation,expected:Readonly<CompleteAgentCreationBindings>){const evidence=this.completion.validateComplete(reservation);const current=this.completion.authenticateComplete(evidence);if(!current||runtimeCanonical(current)!==runtimeCanonical(expected))throw new AgentRuntimeTransactionError('corrupt');}
   #validatePrerequisite(operation:RuntimeTransition['chain'],reservation:VerifiedGenerationReservation,
@@ -225,8 +232,8 @@ export class AgentRuntimeTransaction {
   #readiness(raw:unknown,b:RuntimeProviderBindings,id:string){const p=this.proofs.authenticateReadiness(raw);if(!p||p.runtimeInstanceKey!==b.runtimeInstanceKey||p.startEffectKey!==b.startEffectKey||p.providerRuntimeId!==id||!['ready','not_ready','unknown'].includes(p.outcome)||!SHA.test(p.evidenceDigest))throw new AgentRuntimeTransactionError('invalid_proof');return p;}
   #restore(raw:unknown,b:RuntimeProviderBindings,id:string){const p=this.proofs.authenticateRestore(raw);if(!p||p.runtimeInstanceKey!==b.runtimeInstanceKey||p.startEffectKey!==b.startEffectKey||p.providerRuntimeId!==id||!['current_exact','absent','unknown'].includes(p.outcome)||!SHA.test(p.evidenceDigest))throw new AgentRuntimeTransactionError('invalid_proof');return p;}
   #retireProof(raw:unknown,b:RuntimeProviderBindings,id:string,key:string){const p=this.proofs.authenticateRetire(raw);if(!p||p.runtimeInstanceKey!==b.runtimeInstanceKey||p.retireEffectKey!==key||p.providerRuntimeId!==id||!['current_exact','already_absent','unknown'].includes(p.outcome)||!SHA.test(p.evidenceDigest))throw new AgentRuntimeTransactionError('invalid_proof');return p;}
-  #runtimeArtifacts(t:Readonly<CompleteAgentCreationBindings>,r:Readonly<TrustedRuntimeOperationRequest>,b:RuntimeProviderBindings,a:Readonly<TrustedRuntimeAdapter>,p:Readonly<TrustedRuntimeStartProof>){const binding={schemaVersion:1,kind:'AgentRuntimeBinding',...b,provider:p.provider,providerRuntimeId:p.providerRuntimeId,startEvidenceDigest:p.startEvidenceDigest};this.records.publishArtifact(t.canonicalDir,'runtime-binding.json',binding);this.records.publishArtifact(t.canonicalDir,'runtime-provenance.json',{schemaVersion:1,kind:'AgentRuntimeProvenance',requestActionId:r.requestActionId,authorizationRevision:r.authorizationRevision,...b,startEvidenceDigest:p.startEvidenceDigest,adapterId:a.adapterId,adapterVersion:a.adapterVersion});}
-  #binding(t:Readonly<CompleteAgentCreationBindings>,b:RuntimeProviderBindings,a:Readonly<TrustedRuntimeAdapter>){
+  #runtimeArtifacts(t:Readonly<CompleteAgentCreationBindings>,r:Readonly<TrustedRuntimeOperationRequest>,b:RuntimeProviderBindings,a:Readonly<DurableRuntimeAdapter>,p:Readonly<TrustedRuntimeStartProof>){const binding={schemaVersion:1,kind:'AgentRuntimeBinding',...b,provider:p.provider,providerRuntimeId:p.providerRuntimeId,startEvidenceDigest:p.startEvidenceDigest};this.records.publishArtifact(t.canonicalDir,'runtime-binding.json',binding);this.records.publishArtifact(t.canonicalDir,'runtime-provenance.json',{schemaVersion:1,kind:'AgentRuntimeProvenance',requestActionId:r.requestActionId,authorizationRevision:r.authorizationRevision,...b,startEvidenceDigest:p.startEvidenceDigest,adapterId:a.adapterId,adapterVersion:a.adapterVersion});}
+  #binding(t:Readonly<CompleteAgentCreationBindings>,b:RuntimeProviderBindings,a:Readonly<DurableRuntimeAdapter>){
     const v=this.records.readArtifact(t.canonicalDir,'runtime-binding.json');
     const provenance=this.records.readArtifact(t.canonicalDir,'runtime-provenance.json');
     for(const [key,value] of Object.entries(b)) if(v[key]!==value||provenance[key]!==value)

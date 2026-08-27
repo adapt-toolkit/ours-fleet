@@ -56,6 +56,7 @@ function harness(records: AgentRuntimeRecordStore) {
   const restoreProofs = new WeakMap<object, object>(); const retireProofs = new WeakMap<object, object>();
   const currentProofs = new WeakMap<object, object>();
   const descriptor = Object.freeze({ mode: 'inert' });
+  const preparationEvidence = Object.freeze({ secret: 'process-only-secret', toJSON: () => { throw new Error('opaque'); } });
   const provider = {
     supportsIdempotentRuntimeActionKeys: true as const,
     reconcileStart: vi.fn(async (input: Record<string, unknown>) => { const raw = {};
@@ -91,10 +92,11 @@ function harness(records: AgentRuntimeRecordStore) {
     },
   };
   const transaction = new AgentRuntimeTransaction(completion, operations, {
-    resolve: () => ({ adapterId: 'codex', adapterVersion: '1', policyDigest: `sha256:${'5'.repeat(64)}`,
-      descriptorDigest: runtimeDigest(runtimeCanonical(descriptor)), descriptor }),
+    resolve: () => ({ durable: { adapterId: 'codex', adapterVersion: '1', policyDigest: `sha256:${'5'.repeat(64)}`,
+      descriptorDigest: runtimeDigest(runtimeCanonical(descriptor)), descriptor }, preparationEvidence }),
   }, provider, proofs, records);
   return { transaction, requestEvidence, request, completion, provider, proofs,
+    preparationEvidence,
     setReadinessOutcome: (value: typeof readinessOutcome) => { readinessOutcome = value; } };
 }
 
@@ -210,8 +212,10 @@ describe('operation authority bounds', () => {
     await expect(h.transaction.start(reservation, h.requestEvidence)).resolves.toMatchObject({ state: 'ready' });
     expect(h.provider.startBrain).toHaveBeenCalledWith(expect.objectContaining({
       runtimeInstanceKey: expect.stringMatching(/^sha256:/u),
-    }));
+    }), h.preparationEvidence);
     expect(existsSync(join(canonicalDir, 'runtime-launch-transitions'))).toBe(true);
+    expect(readFileSync(join(canonicalDir, 'runtime-binding.json'), 'utf8')).not.toContain('process-only-secret');
+    expect(readFileSync(join(canonicalDir, 'runtime-provenance.json'), 'utf8')).not.toContain('process-only-secret');
   });
 
   it('rejects agent-authorized retire and non-system restore before filesystem or provider effects', async () => {

@@ -503,6 +503,20 @@ export class BrainAdapterPreparationAuthority {
     } catch { return undefined; }
     return issued;
   }
+
+  /** Same-instance runtime bridge: authenticate the exact input while retaining issued adapter/artifact bindings. */
+  authenticateForRuntime(
+    evidence: EphemeralPreparedBrainLaunch, expectedInput: BrainAdapterResolutionInput,
+  ): AuthenticatedPreparedBrainLaunchBindings | undefined {
+    const issued = this.#issued.get(evidence as object);
+    if (!issued || expectedInput.enforcementEvidence !== issued.input.enforcementEvidence) return undefined;
+    try {
+      if (canonical({ brain: expectedInput.brain, permissions: expectedInput.permissions, policy: expectedInput.policy })
+          !== canonical({ brain: issued.input.brain, permissions: issued.input.permissions, policy: issued.input.policy }))
+        return undefined;
+    } catch { return undefined; }
+    return issued;
+  }
 }
 
 function deepFreezeBrainSnapshot<T>(value: T, seen = new Set<object>()): T {

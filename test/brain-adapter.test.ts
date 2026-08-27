@@ -262,6 +262,10 @@ describe('exact Brain adapter policy resolution', () => {
     const prepared = issuer.prepare(input);
     const adapter = getBrainAdapter('codex', 'acp');
     const bindings = issuer.authenticate(prepared, input, adapter, actual.identity!);
+    expect(issuer.authenticateForRuntime(prepared, input)).toBe(bindings);
+    expect(issuer.authenticateForRuntime(prepared, { ...input,
+      enforcementEvidence: {} as VerifiedAdapterEnforcementEvidence })).toBeUndefined();
+    expect(issuer.authenticateForRuntime({} as typeof prepared, input)).toBeUndefined();
     expect(bindings?.adapter).toBe(adapter);
     expect(Object.isFrozen(bindings?.input.brain)).toBe(true);
     expect(Object.isFrozen(bindings?.artifactIdentity)).toBe(true);
