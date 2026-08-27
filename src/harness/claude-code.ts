@@ -7,7 +7,10 @@ import type {
   AcpMcpServer, HarnessAdapter, RoleDirs, SessionPrep, SessionState, Launch, UnattendedCapability,
   ValidationError,
 } from './types.js';
-import { registerAdapter } from './registry.js';
+import { registerAdapter, registerBodyBrainAdapterDescriptor } from './registry.js';
+import {
+  createAcpBodyBrainInjectedProvider, createAcpBodyBrainPreparedLaunch,
+} from '../session/acp-body-brain-provider.js';
 import {
   translatePortablePermissionCodes,
 } from './brain-adapter.js';
@@ -570,3 +573,27 @@ function roleStateDir(role: ResolvedRole): string {
 
 export const claudeCodeAdapter = makeClaudeCodeAdapter();
 registerAdapter(claudeCodeAdapter);
+registerBodyBrainAdapterDescriptor(Object.freeze({
+  schemaVersion: 1 as const, harnessId: 'claude-code' as const,
+  adapterId: 'claude-code-acp' as const, adapterVersion: '0.63.0',
+  prepare(role: ResolvedRole, prep: SessionPrep) {
+    if (role.harness !== 'claude-code') throw new Error('Claude BodyBrain descriptor cannot translate another harness');
+    const effort = (role.harness_options as ClaudeOptions | undefined)?.effort;
+    if (!role.model || !effort) throw new Error('Claude BodyBrain translation requires explicit model and effort');
+    const launch = claudeCodeAdapter.buildAcpLaunch!(role, prep);
+    const modeId = claudeCodeAdapter.acpPermissionModeId!(role);
+    const mcpServers = claudeCodeAdapter.acpMcpServers!(role);
+    const sessionMeta = claudeCodeAdapter.acpSessionMeta!(role, prep);
+    return createAcpBodyBrainPreparedLaunch({
+      schemaVersion: 1, adapterId: 'claude-code-acp', adapterVersion: '0.63.0',
+      argv: launch.argv, env: launch.env,
+      translation: {
+        model: role.model, effort,
+        ...(modeId ? { modeId } : {}),
+        ...(mcpServers === undefined ? {} : { mcpServers }),
+        ...(sessionMeta === undefined ? {} : { sessionMeta }),
+      },
+    });
+  },
+  createProvider: createAcpBodyBrainInjectedProvider,
+}));

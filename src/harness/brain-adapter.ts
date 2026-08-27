@@ -7,6 +7,10 @@ import {
   recheckBundledAcpAgent, resolveAuthenticatedBundledAcpAgent,
   type AcpAgentResolution, type AcpBundleIdentity,
 } from './acp-agent.js';
+import { getBodyBrainAdapterDescriptor } from './registry.js';
+import {
+  createAcpBodyBrainPreparedLaunch, type AcpBodyBrainPreparedLaunch,
+} from '../session/acp-body-brain-provider.js';
 
 const TOKEN = /^[A-Za-z0-9][A-Za-z0-9._:-]*$/u;
 const FIELD = /^[A-Za-z0-9][A-Za-z0-9._:/-]*$/u;
@@ -394,6 +398,7 @@ export interface EphemeralPreparedBrainLaunch {
   readonly model: string;
   readonly effort: string;
   readonly native: PortablePermissionCodes;
+  readonly bodyBrainLaunch: Readonly<AcpBodyBrainPreparedLaunch>;
   recheckAtSideEffectBoundary(): boolean;
   toJSON(): never;
 }
@@ -431,10 +436,35 @@ export function createBrainAdapterPreparer(
     const native = Object.freeze(translatePortablePermissionCodes(
       adapter.harness as 'codex' | 'claude-code', input.permissions,
     ));
+    let descriptor;
+    try { descriptor = getBodyBrainAdapterDescriptor(adapter.harness as 'codex' | 'claude-code'); }
+    catch { throw new BrainAdapterPolicyError('production BodyBrain adapter descriptor is unavailable'); }
+    if (descriptor.harnessId !== adapter.harness || descriptor.adapterId !== adapter.adapterId
+        || descriptor.adapterVersion !== adapter.adapterVersion
+        || descriptor.adapterId !== validation.adapterId || descriptor.adapterVersion !== validation.adapterVersion
+        || descriptor.adapterVersion !== resolution.version)
+      throw new BrainAdapterPolicyError('BodyBrain adapter descriptor does not match authenticated policy and launch');
+    const modeId = adapter.harness === 'codex'
+      ? native.coupledAcpMode
+      : native.approvalMode === 'default' ? undefined : native.approvalMode;
+    const bodyBrainLaunch = createAcpBodyBrainPreparedLaunch({
+      schemaVersion: 1, adapterId: descriptor.adapterId, adapterVersion: descriptor.adapterVersion,
+      argv: resolution.argv, env: {},
+      translation: {
+        model: input.brain.model, effort: input.brain.effort,
+        ...(modeId ? { modeId } : {}),
+        ...(adapter.harness === 'codex' ? { permissionMetadataSource: 'codex-acp' as const } : {}),
+      },
+    });
+    if (bodyBrainLaunch.adapterId !== descriptor.adapterId
+        || bodyBrainLaunch.adapterVersion !== descriptor.adapterVersion
+        || bodyBrainLaunch.translation.model !== input.brain.model
+        || bodyBrainLaunch.translation.effort !== input.brain.effort)
+      throw new BrainAdapterPolicyError('prepared BodyBrain launch does not match registered descriptor');
     return Object.freeze({
       [ephemeralLaunchBrand]: true as const, validation,
       argv: Object.freeze([...resolution.argv]), env: Object.freeze({}),
-      model: input.brain.model, effort: input.brain.effort, native,
+      model: input.brain.model, effort: input.brain.effort, native, bodyBrainLaunch,
       recheckAtSideEffectBoundary: () => recheckBundledAcpAgent(resolution),
       toJSON: (): never => { throw new BrainAdapterPolicyError('ephemeral Brain launch cannot be serialized'); },
     });

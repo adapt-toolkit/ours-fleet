@@ -1,6 +1,10 @@
 import type { McpServer } from '@agentclientprotocol/sdk';
 
 import type { CommonPermissions, FleetPermissionMode, ResolvedRole } from '../config.js';
+import type {
+  AcpBodyBrainInjectedDriver, AcpBodyBrainPreparedLaunch,
+} from '../session/acp-body-brain-provider.js';
+import type { AcpBodyBrainProvider } from '../session/acp-body-brain-transport.js';
 
 export interface PrereqCheck { name: string; ok: boolean; detail: string }
 export interface PrereqReport { ok: boolean; checks: PrereqCheck[] }
@@ -180,4 +184,21 @@ export interface HarnessAdapter {
   isolationPaths?(role: ResolvedRole, dirs: RoleDirs): HarnessIsolationPaths;
   vocabulary: BriefingVocab;
   exitPolicy: ExitPolicy;
+}
+
+/**
+ * Production registration seam between a harness translation and the shared
+ * ACP Body–Brain provider. It remains separate from HarnessAdapter until the
+ * Agent runtime cutover: legacy harness registration must not imply that a
+ * Body–Brain implementation exists.
+ */
+export interface AcpBodyBrainAdapterDescriptor {
+  readonly schemaVersion: 1;
+  readonly harnessId: 'codex' | 'claude-code';
+  readonly adapterId: 'codex-acp' | 'claude-code-acp';
+  readonly adapterVersion: string;
+  prepare(role: ResolvedRole, prep: SessionPrep): Readonly<AcpBodyBrainPreparedLaunch>;
+  createProvider(
+    launch: Readonly<AcpBodyBrainPreparedLaunch>, driver: AcpBodyBrainInjectedDriver,
+  ): AcpBodyBrainProvider;
 }

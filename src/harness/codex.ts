@@ -8,7 +8,10 @@ import type {
   AcpLaunch, HarnessAdapter, RoleDirs, SessionPrep, SessionState, Launch, ValidationError,
   UnattendedCapability,
 } from './types.js';
-import { registerAdapter } from './registry.js';
+import { registerAdapter, registerBodyBrainAdapterDescriptor } from './registry.js';
+import {
+  createAcpBodyBrainInjectedProvider, createAcpBodyBrainPreparedLaunch,
+} from '../session/acp-body-brain-provider.js';
 import {
   translatePortablePermissionCodes,
 } from './brain-adapter.js';
@@ -27,10 +30,11 @@ interface CodexOptions {
   config?: Record<string, unknown>;
   add_dirs?: string[];
   monitor?: boolean;
+  effort?: string;
 }
 const OPTION_KEYS = [
   'launcher', 'sandbox', 'approval', 'permission_mode', 'search', 'profile', 'config', 'add_dirs',
-  'monitor',
+  'monitor', 'effort',
 ];
 
 const LAUNCHERS = ['auto', 'ours-codex', 'codex'];
@@ -39,6 +43,7 @@ const LAUNCHERS = ['auto', 'ours-codex', 'codex'];
 const SANDBOX_MODES = ['read-only', 'workspace-write', 'danger-full-access'];
 /** Codex CLI's accepted `--ask-for-approval` values. */
 const APPROVAL_POLICIES = ['untrusted', 'on-request', 'never'];
+const CODEX_EFFORTS = ['low', 'medium', 'high', 'xhigh', 'max', 'ultra'];
 const BUNDLED_CODEX_ACP_VERSION = '1.1.7';
 const CODEX_ACP_PACKAGE = '@agentclientprotocol/codex-acp';
 const CODEX_PROXY_APPROVAL_ENV = 'OURS_FLEET_CODEX_APPROVAL';
@@ -307,6 +312,8 @@ export function makeCodexAdapter(exec: Exec = realExec): HarnessAdapter {
         errs.push({ path: 'harness_options.search', message: 'must be a boolean' });
       if (o.monitor != null && typeof o.monitor !== 'boolean')
         errs.push({ path: 'harness_options.monitor', message: 'must be a boolean' });
+      if (o.effort != null && !CODEX_EFFORTS.includes(o.effort))
+        errs.push({ path: 'harness_options.effort', message: `must be one of: ${CODEX_EFFORTS.join(', ')}` });
       if (o.profile != null && (typeof o.profile !== 'string' || !o.profile.trim()))
         errs.push({ path: 'harness_options.profile', message: 'must be a non-empty profile name' });
       if (o.add_dirs != null && (!Array.isArray(o.add_dirs) || o.add_dirs.some(v => typeof v !== 'string' || !v)))
@@ -538,3 +545,25 @@ function roleStateDir(role: ResolvedRole): string {
 
 export const codexAdapter = makeCodexAdapter();
 registerAdapter(codexAdapter);
+registerBodyBrainAdapterDescriptor(Object.freeze({
+  schemaVersion: 1 as const, harnessId: 'codex' as const,
+  adapterId: 'codex-acp' as const, adapterVersion: BUNDLED_CODEX_ACP_VERSION,
+  prepare(role: ResolvedRole, prep: SessionPrep) {
+    if (role.harness !== 'codex') throw new Error('Codex BodyBrain descriptor cannot translate another harness');
+    const effort = (role.harness_options as CodexOptions | undefined)?.effort;
+    if (!role.model || !effort) throw new Error('Codex BodyBrain translation requires explicit model and effort');
+    const launch = codexAdapter.buildAcpLaunch!(role, prep);
+    const modeId = codexAdapter.acpPermissionModeId!(role);
+    return createAcpBodyBrainPreparedLaunch({
+      schemaVersion: 1, adapterId: 'codex-acp', adapterVersion: BUNDLED_CODEX_ACP_VERSION,
+      argv: launch.argv, env: launch.env,
+      translation: {
+        model: role.model, effort,
+        ...(modeId ? { modeId } : {}),
+        ...(launch.permissionMetadataSource
+          ? { permissionMetadataSource: launch.permissionMetadataSource } : {}),
+      },
+    });
+  },
+  createProvider: createAcpBodyBrainInjectedProvider,
+}));
