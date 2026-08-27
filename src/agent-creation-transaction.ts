@@ -55,6 +55,18 @@ export interface AgentCreationResult {
   state: AgentCreationState; reservation: VerifiedGenerationReservation;
   outcome?: 'existing_before_action' | 'created_by_action' | 'unknown';
 }
+const completeBrand: unique symbol = Symbol('VerifiedCompleteAgentCreation');
+export interface CompleteAgentCreationBindings {
+  actionId: string; agentId: string; generation: number; planDigest: string;
+  snapshotDigest: string; reservationDigest: string; canonicalDir: string;
+  identity: Readonly<{ name: string; ownership: string; provider: string;
+    authenticatedIdentityId: string; evidenceDigest: string; acquisition: 'external' | 'created' }>;
+}
+export interface VerifiedCompleteAgentCreation { readonly [completeBrand]: true }
+export interface AgentCreationCompletionAuthority {
+  validateComplete(reservation: VerifiedGenerationReservation): VerifiedCompleteAgentCreation;
+  authenticateComplete(evidence: VerifiedCompleteAgentCreation): Readonly<CompleteAgentCreationBindings> | undefined;
+}
 export interface AgentCreationFaults {
   afterCreateAuthorized?(): void; afterCreate?(): void;
   beforeSecureOpen?(path: string): void;
@@ -149,6 +161,7 @@ function fsyncDir(path: string): void {
 }
 
 export class AgentCreationTransaction {
+  readonly #completeEvidence = new WeakMap<object, Readonly<CompleteAgentCreationBindings>>();
   constructor(
     private readonly consumer: AgentPlanTransactionConsumer,
     private readonly generations: DurableAgentGenerationAuthority,
@@ -167,6 +180,23 @@ export class AgentCreationTransaction {
   }
   async resume(input: Readonly<{ agentId: string; actionId: string }>): Promise<AgentCreationResult> {
     return this.#resumeReservation(await this.generations.resume(input.agentId, input.actionId));
+  }
+  validateComplete(reservation: VerifiedGenerationReservation): VerifiedCompleteAgentCreation {
+    const record = this.#reservation(reservation);
+    const plan = readStoredAgentPlan(record.canonicalDir, record, 'transaction').plan;
+    const bindings = this.#bindings(record, plan); const chain = this.#chain(record);
+    this.#assertChainBindings(chain, bindings);
+    if (chain.at(-1)?.state !== 'complete') throw new AgentCreationTransactionError('corrupt_state');
+    const identity = this.#verifiedArtifacts(record, bindings, chain);
+    const trusted = Object.freeze({ actionId: record.actionId, agentId: record.agentId,
+      generation: record.generation, planDigest: record.planDigest, snapshotDigest: record.snapshotDigest,
+      reservationDigest: record.reservationDigest, canonicalDir: record.canonicalDir,
+      identity: Object.freeze(identity) });
+    const evidence = Object.freeze({ [completeBrand]: true as const }); this.#completeEvidence.set(evidence, trusted);
+    return evidence;
+  }
+  authenticateComplete(evidence: VerifiedCompleteAgentCreation): Readonly<CompleteAgentCreationBindings> | undefined {
+    return this.#completeEvidence.get(evidence as object);
   }
   async #resumeReservation(reservation: VerifiedGenerationReservation): Promise<AgentCreationResult> {
     const record = this.#reservation(reservation);
@@ -433,7 +463,7 @@ export class AgentCreationTransaction {
     }
   }
   #verifiedArtifacts(record: GenerationReservationRecord, bindings: IdentityActionBindings,
-    chain: readonly Transition[]): void {
+    chain: readonly Transition[]): CompleteAgentCreationBindings['identity'] {
     const acquired = this.#acquiredEvent(chain);
     const verified = chain.find(value => value.state === 'verified')?.event;
     if (!verified) throw new AgentCreationTransactionError('corrupt_state');
@@ -474,5 +504,8 @@ export class AgentCreationTransaction {
         || binding.acquisition === 'external' && provenance.acquisition !== 'existing_before_action'
         || binding.acquisition === 'created' && provenance.acquisition !== 'created_by_action')
       throw new AgentCreationTransactionError('corrupt_state');
+    return { name: String(binding.name), ownership: String(binding.ownership),
+      provider: String(binding.provider), authenticatedIdentityId: String(binding.authenticatedIdentityId),
+      evidenceDigest: String(binding.evidenceDigest), acquisition: binding.acquisition as 'external' | 'created' };
   }
 }

@@ -530,4 +530,33 @@ describe('idempotent identity acquisition recovery', () => {
     expect(harness.provider.reconcileAcquisition).not.toHaveBeenCalled();
     expect(harness.provider.verifyIdentity).not.toHaveBeenCalled();
   });
+
+  it('issues an opaque authenticated completion capability bound to the exact durable creation', async () => {
+    const generations = new DurableAgentGenerationAuthority(state); const harness = providerHarness();
+    const transaction = new AgentCreationTransaction(issuedConsumer(), generations, harness.provider, harness.authority);
+    const result = await start(transaction, generations, plan());
+    const evidence = transaction.validateComplete(result.reservation);
+    expect(transaction.authenticateComplete(evidence)).toMatchObject({
+      actionId: 'action-1', agentId: 'worker-1', generation: 1,
+      reservationDigest: result.reservation.reservationDigest,
+      identity: { provider: 'ours', authenticatedIdentityId: 'identity-1', acquisition: 'created' },
+    });
+    expect(transaction.authenticateComplete({ ...evidence } as never)).toBeUndefined();
+    expect(transaction.authenticateComplete({} as never)).toBeUndefined();
+    const restarted = new AgentCreationTransaction(issuedConsumer(), generations, harness.provider, harness.authority);
+    expect(restarted.authenticateComplete(evidence)).toBeUndefined();
+    expect(restarted.authenticateComplete(restarted.validateComplete(result.reservation))).toBeDefined();
+  });
+
+  it('does not let previously issued completion evidence substitute for fresh durable validation', async () => {
+    const generations = new DurableAgentGenerationAuthority(state); const harness = providerHarness();
+    const transaction = new AgentCreationTransaction(issuedConsumer(), generations, harness.provider, harness.authority);
+    const result = await start(transaction, generations, plan());
+    const earlier = transaction.validateComplete(result.reservation);
+    expect(transaction.authenticateComplete(earlier)).toBeDefined();
+    const record = generations.authenticate(result.reservation)!;
+    chmodSync(join(record.canonicalDir, 'identity-binding.json'), 0o644);
+    await expect(() => transaction.validateComplete(result.reservation))
+      .toThrow(expect.objectContaining({ code: 'corrupt_state' }));
+  });
 });
