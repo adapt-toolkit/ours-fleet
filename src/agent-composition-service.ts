@@ -17,6 +17,22 @@ import type { BrainSpec } from './config-resources.js';
 
 declare const callerBrand: unique symbol;
 export interface VerifiedCreationCallerEvidence { readonly [callerBrand]: true }
+declare const transactionConsumerEvidenceBrand: unique symbol;
+export interface VerifiedTransactionConsumerEvidence { readonly [transactionConsumerEvidenceBrand]: true }
+const transactionConsumerBrand: unique symbol = Symbol('AgentPlanTransactionConsumer');
+export interface AgentPlanTransactionConsumer {
+  readonly [transactionConsumerBrand]: true;
+}
+const transactionConsumers = new WeakMap<object, (prepared: PreparedAgentCreation) => AgentPlan>();
+export const authenticateTransactionConsumer = (consumer: AgentPlanTransactionConsumer): boolean =>
+  transactionConsumers.has(consumer as object);
+export function consumePreparedForTransaction(
+  consumer: AgentPlanTransactionConsumer, prepared: PreparedAgentCreation,
+): AgentPlan {
+  const consume = transactionConsumers.get(consumer as object);
+  if (!consume) throw new AgentCompositionError('foreign_prepared');
+  return consume(prepared);
+}
 
 export interface TrustedCompositionContext {
   principal: Readonly<RequestPrincipal>;
@@ -43,6 +59,7 @@ export interface AgentCompositionAuthority extends AgentPlanEvidenceAuthority {
     principal: RequestPrincipal; operation: PlanOperation; authorizationRevision: string;
     agentId: string; snapshotDigest: string; snapshotRevision: string;
   }>): Readonly<TrustedGenerationAllocation>;
+  authenticateTransactionConsumer?(evidence: VerifiedTransactionConsumerEvidence): boolean;
 }
 
 export interface TrustedAdapterPolicySource {
@@ -178,6 +195,7 @@ function ownPlainData(value: unknown): unknown {
 
 export class AgentCompositionService {
   readonly #plans = new WeakMap<object, AgentPlan>();
+  readonly #prepared = new WeakSet<object>();
   readonly #generations = new Map<string, number>();
   readonly #resolveAdapter: ReturnType<typeof createBrainAdapterPolicyResolver>;
 
@@ -336,11 +354,12 @@ export class AgentCompositionService {
       toJSON(): never { throw new AgentCompositionError('foreign_prepared'); },
     });
     this.#plans.set(prepared, plan);
+    this.#prepared.add(prepared);
     return prepared;
   }
 
   inspect(prepared: PreparedAgentCreation): Readonly<Record<string, unknown>> {
-    if (!this.#plans.has(prepared)) throw new AgentCompositionError('foreign_prepared');
+    if (!this.#prepared.has(prepared)) throw new AgentCompositionError('foreign_prepared');
     return freeze({
       redacted: true, schemaVersion: 1, agentId: prepared.agentId, generation: prepared.generation,
       planDigest: prepared.planDigest, snapshotDigest: prepared.snapshotDigest,
@@ -350,9 +369,25 @@ export class AgentCompositionService {
     });
   }
 
-  consume(prepared: PreparedAgentCreation): AgentPlan {
+  /** Issue the only capability creation transactions accept. */
+  issueTransactionConsumer(evidence: VerifiedTransactionConsumerEvidence): AgentPlanTransactionConsumer {
+    let authenticated = false;
+    try { authenticated = this.authority.authenticateTransactionConsumer?.(evidence) === true; }
+    catch { /* fail closed */ }
+    if (!authenticated) throw new AgentCompositionError('unauthenticated_caller');
+    const consumer: AgentPlanTransactionConsumer = Object.freeze({
+      [transactionConsumerBrand]: true as const,
+    });
+    transactionConsumers.set(consumer, prepared => this.#consume(prepared));
+    return consumer;
+  }
+
+  #consume(prepared: PreparedAgentCreation): AgentPlan {
     const plan = this.#plans.get(prepared);
     if (!plan) throw new AgentCompositionError('foreign_prepared');
+    // Prepared is an authority capability, not a reusable plan handle.  Removing
+    // it before returning also makes callback re-entry fail closed.
+    this.#plans.delete(prepared);
     return plan;
   }
 }

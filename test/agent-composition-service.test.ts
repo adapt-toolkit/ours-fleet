@@ -4,8 +4,10 @@ import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import {
   AgentCompositionError, AgentCompositionService,
+  consumePreparedForTransaction,
   type AgentCompositionAuthority, type AgentCompositionRequest,
-  type TrustedCompositionContext, type VerifiedCreationCallerEvidence,
+  type PreparedAgentCreation, type TrustedCompositionContext, type VerifiedCreationCallerEvidence,
+  type VerifiedTransactionConsumerEvidence,
 } from '../src/agent-composition-service.js';
 import {
   computeBrainDigest, computePermissionsDigest,
@@ -20,6 +22,9 @@ import {
   type VerifiedAdapterEnforcementEvidence,
 } from '../src/harness/brain-adapter.js';
 import type { BrainSpec, PermissionSpec } from '../src/config-resources.js';
+import { AgentCreationTransaction, type IdentityActionBindings,
+  type TrustedAcquisitionProof, type TrustedIdentityVerification } from '../src/agent-creation-transaction.js';
+import { DurableAgentGenerationAuthority } from '../src/agent-generation-reservation.js';
 
 let root: string;
 let contexts: WeakMap<object, Readonly<TrustedCompositionContext>>;
@@ -31,6 +36,9 @@ let allocate: ReturnType<typeof vi.fn>;
 let policyCalls: ReturnType<typeof vi.fn>;
 let authority: AgentCompositionAuthority;
 let service: AgentCompositionService;
+const transactionEvidence = {} as VerifiedTransactionConsumerEvidence;
+const consume = (target: AgentCompositionService, prepared: PreparedAgentCreation) =>
+  consumePreparedForTransaction(target.issueTransactionConsumer(transactionEvidence), prepared);
 
 const freeze = <T>(value: T): T => {
   if (value && typeof value === 'object' && !Object.isFrozen(value)) {
@@ -104,6 +112,7 @@ beforeEach(() => {
   }));
   authority = {
     authenticateContext: evidence => contexts.get(evidence as object), allocateGeneration: allocate,
+    authenticateTransactionConsumer: evidence => evidence === transactionEvidence,
     authenticateCreator: evidence => creators.get(evidence as object),
     authenticateOwnerDelegation: evidence => owners.get(evidence as object),
   };
@@ -117,15 +126,48 @@ beforeEach(() => {
 afterEach(() => rmSync(root, { recursive: true, force: true }));
 
 describe('authenticated inert Agent composition', () => {
+  it('runs a creation transaction only with a real issued consumer and real Prepared capability', async () => {
+    const prepared = service.prepare(request(caller()));
+    const consumer = service.issueTransactionConsumer(transactionEvidence);
+    const acquisitions = new WeakMap<object, TrustedAcquisitionProof>();
+    const verifications = new WeakMap<object, TrustedIdentityVerification>();
+    let receipt: string | undefined;
+    const acquisition = (bindings: IdentityActionBindings, outcome: TrustedAcquisitionProof['outcome']) => {
+      const raw = {}; acquisitions.set(raw, { ...bindings, outcome,
+        ...(outcome === 'created_by_action' ? { receiptDigest: receipt! } : {}) }); return raw;
+    };
+    const provider = {
+      supportsIdempotentActionKeys: true as const,
+      lookupExisting: async (bindings: IdentityActionBindings) => acquisition(bindings, 'existing_before_action'),
+      reconcileAcquisition: async (bindings: IdentityActionBindings) =>
+        acquisition(bindings, receipt ? 'created_by_action' : 'not_started'),
+      createPersistent: async () => ({}),
+      createTemporary: async () => { receipt = `sha256:${'a'.repeat(64)}`; return {}; },
+      verifyIdentity: async (bindings: IdentityActionBindings & { acquisition: 'external' | 'created' }) => {
+        const raw = {}; verifications.set(raw, { ...bindings, outcome: 'verified', provider: 'ours',
+          authenticatedIdentityId: 'identity-1', evidenceDigest: `sha256:${'b'.repeat(64)}` }); return raw;
+      },
+      reconcileReceipt: async () => ({}), removeCreated: async () => {}, closeTemporary: async () => {},
+    };
+    const transaction = new AgentCreationTransaction(consumer,
+      new DurableAgentGenerationAuthority(join(root, 'transaction-state')), provider, {
+        authenticateAcquisition: value => acquisitions.get(value as object),
+        authenticateVerification: value => verifications.get(value as object),
+        authenticateOwnership: () => undefined,
+      });
+    await expect(transaction.persistPrepared(prepared, { actionId: 'transaction-action' }))
+      .resolves.toMatchObject({ state: 'complete' });
+  });
+
   it('prepares direct Owner input once and exposes only an opaque redacted summary', () => {
     const prepared = service.prepare(request(caller()));
     expect(prepared).toMatchObject({ redacted: true, agentId: 'worker-1', generation: 1, brain, permissions });
     expect(allocate).toHaveBeenCalledOnce(); expect(policyCalls).toHaveBeenCalledOnce();
-    expect(Object.isFrozen(prepared)).toBe(true); expect(Object.isFrozen(service.consume(prepared))).toBe(true);
+    expect(Object.isFrozen(prepared)).toBe(true); expect(Object.isFrozen(consume(service, prepared))).toBe(true);
     expect(() => JSON.stringify(prepared)).toThrow(/foreign_prepared/u);
     const shown = JSON.stringify(service.inspect(prepared));
     expect(shown).not.toMatch(/secret mission|secret persona|owner-cid|roles\.d/u);
-    expect(() => service.consume({ ...prepared } as never)).toThrow(/foreign_prepared/u);
+    expect(() => consume(service, { ...prepared } as never)).toThrow(/foreign_prepared/u);
   });
 
   it('rejects absent/foreign context and caller-controlled graph or adapter fields before allocation', () => {
@@ -224,7 +266,7 @@ describe('authenticated inert Agent composition', () => {
 
   it('requires agent caller identity to equal trusted creator agentId and plan.agentId', () => {
     const ownerPrepared = service.prepare(request(caller(), { source: source('creator-1') }));
-    const creatorPlan = service.consume(ownerPrepared);
+    const creatorPlan = consume(service, ownerPrepared);
     const creatorEvidence = {} as VerifiedCreatorPlanEvidence;
     creators.set(creatorEvidence as object, { plan: creatorPlan, trusted: {
       agentId: creatorPlan.agentId, generation: creatorPlan.generation,
@@ -238,7 +280,7 @@ describe('authenticated inert Agent composition', () => {
 
   it('authenticates creator evidence once and cannot substitute a second record', () => {
     const creatorPrepared = service.prepare(request(caller(), { source: source('creator-1') }));
-    const creatorPlan = service.consume(creatorPrepared); const evidence = {} as VerifiedCreatorPlanEvidence;
+    const creatorPlan = consume(service, creatorPrepared); const evidence = {} as VerifiedCreatorPlanEvidence;
     let calls = 0;
     authority.authenticateCreator = () => { calls += 1; return calls === 1 ? { plan: creatorPlan, trusted: {
       agentId: creatorPlan.agentId, generation: creatorPlan.generation,
@@ -250,7 +292,7 @@ describe('authenticated inert Agent composition', () => {
 
   it('passes valid Owner delegation once and rejects invalid service-level evidence', () => {
     const creatorPrepared = service.prepare(request(caller(), { source: source('creator-1') }));
-    const creatorPlan = service.consume(creatorPrepared); const creatorEvidence = {} as VerifiedCreatorPlanEvidence;
+    const creatorPlan = consume(service, creatorPrepared); const creatorEvidence = {} as VerifiedCreatorPlanEvidence;
     creators.set(creatorEvidence as object, { plan: creatorPlan, trusted: {
       agentId: creatorPlan.agentId, generation: creatorPlan.generation,
       planDigest: creatorPlan.planDigest, snapshotDigest: creatorPlan.snapshotDigest,
@@ -269,7 +311,7 @@ describe('authenticated inert Agent composition', () => {
     const prepared = service.prepare(request(caller('agent', 'creator-1'), {
       source: elevated, creatorEvidence, ownerDelegationEvidence: ownerEvidence,
     }));
-    expect(service.consume(prepared).delegation.approval.decision).toBe('owner_grant');
+    expect(consume(service, prepared).delegation.approval.decision).toBe('owner_grant');
     const bad = {} as VerifiedOwnerDelegationEvidence;
     expect(() => service.prepare(request(caller('agent', 'creator-1'), {
       source: elevated, creatorEvidence, ownerDelegationEvidence: bad,
@@ -278,7 +320,7 @@ describe('authenticated inert Agent composition', () => {
 
   it('inherits Brain atomically and permissions per field from the authenticated creator', () => {
     const creatorPrepared = service.prepare(request(caller(), { source: source('creator-1') }));
-    const creatorPlan = service.consume(creatorPrepared); const creatorEvidence = {} as VerifiedCreatorPlanEvidence;
+    const creatorPlan = consume(service, creatorPrepared); const creatorEvidence = {} as VerifiedCreatorPlanEvidence;
     creators.set(creatorEvidence as object, { plan: creatorPlan, trusted: {
       agentId: creatorPlan.agentId, generation: creatorPlan.generation,
       planDigest: creatorPlan.planDigest, snapshotDigest: creatorPlan.snapshotDigest,
@@ -288,7 +330,7 @@ describe('authenticated inert Agent composition', () => {
     const prepared = service.prepare(request(caller('agent', 'creator-1'), {
       source: inherited as never, creatorEvidence,
     }));
-    const child = service.consume(prepared);
+    const child = consume(service, prepared);
     expect(child.brain).toEqual(creatorPlan.brain);
     expect(child.permissionProvenance.filesystem.layer).toBe('creator');
   });
@@ -346,16 +388,16 @@ describe('authenticated inert Agent composition', () => {
     const prepared = service.prepare(request(evidence, { source: mutable }));
     expect(prepared).toMatchObject({ agentId: 'worker-1', brain: { model: 'gpt-5.6-sol' },
       permissions: { filesystem: 'workspace' } });
-    expect(service.consume(prepared).agentId).toBe('worker-1');
+    expect(consume(service, prepared).agentId).toBe('worker-1');
   });
 
   it('owns request values after return and rejects foreign-service Prepared objects', () => {
     const evidence = caller(); const mutable = source(); const prepared = service.prepare(request(evidence, { source: mutable }));
     mutable.brain.model = 'mutated'; mutable.permissions.filesystem = 'unrestricted';
-    expect(service.consume(prepared).brain.model).toBe('gpt-5.6-sol');
+    expect(consume(service, prepared).brain.model).toBe('gpt-5.6-sol');
     const foreign = new AgentCompositionService(authority, { resolvePolicy: policyCalls },
       { authenticateAdapterEvidence: e => adapterTrust.get(e as object) });
-    expect(() => foreign.consume(prepared)).toThrow(/foreign_prepared/u);
-    expect(() => service.consume({ ...prepared } as never)).toThrow(/foreign_prepared/u);
+    expect(() => consume(foreign, prepared)).toThrow(/foreign_prepared/u);
+    expect(() => consume(service, { ...prepared } as never)).toThrow(/foreign_prepared/u);
   });
 });
