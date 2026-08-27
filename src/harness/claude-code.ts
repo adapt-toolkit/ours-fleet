@@ -1,4 +1,5 @@
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { createHash } from 'node:crypto';
 import { join } from 'node:path';
 import { home } from '../paths.js';
 import { realExec, type Exec } from '../exec.js';
@@ -7,16 +8,21 @@ import type {
   AcpMcpServer, HarnessAdapter, RoleDirs, SessionPrep, SessionState, Launch, UnattendedCapability,
   ValidationError,
 } from './types.js';
-import { registerAdapter, registerBodyBrainAdapterDescriptor } from './registry.js';
 import {
-  createAcpBodyBrainInjectedProvider, createAcpBodyBrainPreparedLaunch,
-} from '../session/acp-body-brain-provider.js';
+  CLAUDE_CODE_BODY_BRAIN_DESCRIPTOR, registerAdapter, registerBodyBrainAdapterDescriptor,
+} from './registry.js';
+import {
+  LegacyAcpPreparationAuthority, type LegacyAcpAttemptInput,
+  type LegacyAcpRuntimeContext,
+} from './acp-attempt.js';
 import {
   translatePortablePermissionCodes,
 } from './brain-adapter.js';
 import { replaceFileAtomically, withFileLock, type LockDeps } from '../atomic-file.js';
 import { harnessRuntimeDir } from '../isolation/policy.js';
-import { bundledAcpAgent } from './acp-agent.js';
+import {
+  resolveAuthenticatedBundledAcpAgent, type AcpAgentResolution,
+} from './acp-agent.js';
 
 /** One entry of `harness_options.mcp_servers`, in `.mcp.json`'s own shape. */
 interface McpServerSpec {
@@ -118,7 +124,7 @@ function validateMcpServers(servers: unknown): ValidationError[] {
 }
 
 /** `harness_options.mcp_servers` in ACP's `session/new` array shape. */
-function acpMcpServersFor(
+function translateAcpMcpServers(
   servers: Record<string, McpServerSpec> | undefined,
 ): AcpMcpServer[] | undefined {
   if (!servers) return undefined;
@@ -215,14 +221,14 @@ export function autocompactPct(role: ResolvedRole): number {
  * entry so unrelated operator state survives untouched, and replace the file
  * atomically. Never fatal — a role that cannot be pre-trusted still launches.
  */
-export async function pretrust(
+async function applyPretrust(
   dir: string,
   deps: { log?(line: string): void; lock?: LockDeps } = {},
-): Promise<void> {
+): Promise<boolean> {
   const p = join(home(), '.claude.json');
   const log = deps.log ?? (() => {});
   try {
-    await withFileLock(`${p}.lock`, () => {
+    return await withFileLock(`${p}.lock`, () => {
       let doc: Record<string, unknown>;
       if (!existsSync(p)) doc = {};
       else {
@@ -235,11 +241,11 @@ export async function pretrust(
           // the role down for a file it does not own.
           log(`pretrust: ${p} is not valid JSON (${(e as Error).message}) — skipping pre-trust; `
             + `the role may block on Claude's trust dialog until the file is repaired`);
-          return;
+          return false;
         }
         if (doc === null || typeof doc !== 'object' || Array.isArray(doc)) {
           log(`pretrust: ${p} does not contain a JSON object — skipping pre-trust`);
-          return;
+          return false;
         }
       }
       const projects = (doc.projects ??= {}) as Record<string, Record<string, unknown>>;
@@ -248,11 +254,17 @@ export async function pretrust(
       e.hasCompletedProjectOnboarding = true;
       e.projectOnboardingSeenCount = Math.max((e.projectOnboardingSeenCount as number) ?? 0, 1);
       replaceFileAtomically(p, JSON.stringify(doc, null, 2));
+      return true;
     }, deps.lock);
   } catch (e) {
     log(`pretrust: could not update ${p} (${(e as Error).message}) — continuing without pre-trust`);
+    return false;
   }
 }
+
+export async function pretrust(
+  dir: string, deps: { log?(line: string): void; lock?: LockDeps } = {},
+): Promise<void> { await applyPretrust(dir, deps); }
 
 /**
  * Shared Monitor-arming mandate (issue #16). Single-sourced so the briefing and
@@ -271,7 +283,8 @@ const armMonitor = (id: string): string =>
   'so inbound ours mail wakes you';
 
 export function makeClaudeCodeAdapter(exec: Exec = realExec): HarnessAdapter {
-  return {
+  let adapter!: HarnessAdapter;
+  adapter = {
     id: 'claude-code',
     supportsResume: true,
 
@@ -411,62 +424,11 @@ export function makeClaudeCodeAdapter(exec: Exec = realExec): HarnessAdapter {
       return { argv, env: prep.env };
     },
 
-    buildAcpLaunch(role: ResolvedRole, prep: SessionPrep): Launch {
-      const configured = role.session_options?.acp?.command;
-      const argv = Array.isArray(configured)
-        ? [...configured]
-        : typeof configured === 'string'
-          ? ['sh', '-c', configured]
-          : bundledAcpAgent(
-              '@agentclientprotocol/claude-agent-acp', 'claude-agent-acp', 'claude-agent-acp');
-      return { argv, env: prep.env };
+    async prepareAcpLegacy(input: LegacyAcpAttemptInput, context: LegacyAcpRuntimeContext) {
+      return this.acpLegacyAuthority!.prepare(input, context);
     },
 
-    // Same source as buildLaunch's --permission-mode flag, so the tmux and ACP
-    // backends cannot disagree about what a role's permissions translate to.
-    acpPermissionModeId(role: ResolvedRole): string | undefined {
-      return permissionMode(role);
-    },
-
-    /**
-     * Deliver, over ACP, the two things the tmux launch delivers as flags.
-     *
-     * `buildAcpLaunch` builds its own argv and cannot carry `prep.argv`: the
-     * process it launches is the ACP agent, not `claude`, and it takes none of
-     * claude's flags. That is why `harness_options.plugins` did nothing at all on
-     * an ACP role — the overlay was written and then dropped, and the mem-palace
-     * toggle rode `prep.env` and survived, so the failure was silent AND
-     * selective.
-     *
-     * `_meta.claudeCode.options` is the bundled agent's own passthrough into the
-     * Claude Agent SDK (@agentclientprotocol/claude-agent-acp, acp-agent.js:4092
-     * → the `options` object at :4144). `settings` takes the same overlay path
-     * `--settings` takes; `strictMcpConfig` is the SDK's spelling of
-     * `--strict-mcp-config`. Both are spread BEFORE the fields the agent forces,
-     * so neither is overwritten.
-     *
-     * ⚠ RETURNS NOTHING FOR A ROLE THAT NAMES ITS OWN ACP COMMAND. That process
-     * is not the bundled agent and has no reason to read this vocabulary; sending
-     * it anyway would be the silent drop again, one level down. `validateOptions`
-     * refuses those roles instead.
-     */
-    acpSessionMeta(role: ResolvedRole, prep: SessionPrep): Record<string, unknown> | undefined {
-      if (customAcpCommand(role)) return undefined;
-      const options: Record<string, unknown> = {};
-      if (prep.settingsOverlay) options.settings = prep.settingsOverlay;
-      if ((role.harness_options as ClaudeOptions | undefined)?.mcp_servers_only === true)
-        options.strictMcpConfig = true;
-      return Object.keys(options).length ? { claudeCode: { options } } : undefined;
-    },
-
-    /**
-     * The declared servers, in ACP's array shape. Sent on `session/new` and on
-     * resume/load, because the SDK builds its server set once per session and a
-     * resumed session that dropped them would quietly lose its tools.
-     */
-    acpMcpServers(role: ResolvedRole): AcpMcpServer[] | undefined {
-      return acpMcpServersFor((role.harness_options as ClaudeOptions | undefined)?.mcp_servers);
-    },
+    acpLegacyAuthority: undefined,
 
     isolationPaths(_role: ResolvedRole, _dirs: RoleDirs) {
       const claudeHome = join(home(), '.claude');
@@ -559,6 +521,60 @@ export function makeClaudeCodeAdapter(exec: Exec = realExec): HarnessAdapter {
 
     exitPolicy: { cleanExitIsFresh: true, fastFailSecs: 20 },
   };
+  const acpResolutions = new WeakMap<object, AcpAgentResolution | null>();
+  const acpAuthority = new LegacyAcpPreparationAuthority(adapter, {
+    translate(input, context) {
+      if (input.harness !== 'claude-code' || input.adapterOptions.harness !== 'claude-code')
+        throw new Error('Claude ACP translation received another harness');
+      const options = input.adapterOptions;
+      const configured = input.acpCommand;
+      const resolution = configured == null ? resolveAuthenticatedBundledAcpAgent(
+        '@agentclientprotocol/claude-agent-acp', 'claude-agent-acp', 'claude-agent-acp') : undefined;
+      const argv = Array.isArray(configured) ? [...configured]
+        : typeof configured === 'string' ? ['sh', '-c', configured]
+          : resolution!.argv;
+      const enabledPlugins = { ...options.plugins };
+      if (!options.memPalace) enabledPlugins['mempalace@mempalace'] = false;
+      const files = Object.keys(enabledPlugins).length
+        ? [{ name: '.settings-overlay.json', contents: JSON.stringify({ enabledPlugins }, null, 2), mode: 0o600 }]
+        : [];
+      const settings = files.length ? join(context.stateDir, files[0].name) : undefined;
+      const modeId = input.nativePermissions.approvalMode === 'default'
+        ? undefined : input.nativePermissions.approvalMode;
+      const mcpServers = translateAcpMcpServers(options.mcpServers as Record<string, McpServerSpec> | undefined);
+      const sessionMeta = configured == null && (settings || options.mcpServersOnly)
+        ? { claudeCode: { options: { ...(settings ? { settings } : {}),
+          ...(options.mcpServersOnly ? { strictMcpConfig: true } : {}) } } } : undefined;
+      const translation = {
+        argv, env: {
+          OURS_BIND_IDENTITY: input.identityName,
+          CLAUDE_AUTOCOMPACT_PCT_OVERRIDE: String(input.scheduling.autocompactPct ?? 80),
+          MEMPALACE_HOOKS_AUTO_SAVE: 'false',
+          MEMPALACE_MIDSESSION_AUTOSAVE: options.memPalaceMidSessionAutosave ? 'true' : 'false',
+          ...(!options.memPalace ? { MEMPALACE_DISABLED: 'true' } : {}),
+        }, ...(modeId ? { modeId } : {}), ...(mcpServers === undefined ? {} : { mcpServers }),
+        ...(sessionMeta ? { sessionMeta } : {}), ...(files.length ? { files } : {}),
+      };
+      acpResolutions.set(translation, resolution ?? null);
+      return translation;
+    },
+    async probe(translation) {
+      const resolution = acpResolutions.get(translation as object);
+      if (resolution === undefined) throw new Error('Claude ACP translation has no bound artifact probe');
+      if (resolution && (!resolution.bundled || !resolution.identity || resolution.version !== '0.63.0'))
+        throw new Error('Claude ACP bundled artifact is unavailable or version-skewed');
+      return { adapterId: 'claude-code-acp', adapterVersion: resolution ? '0.63.0' : 'custom',
+        artifactDigest: `sha256:${createHash('sha256').update(JSON.stringify(
+          resolution?.identity ?? { customArgv: translation.argv })).digest('hex')}` };
+    },
+    async pretrust(context) {
+      const stateApplied = await applyPretrust(context.stateDir);
+      const cwdApplied = context.runCwd === context.stateDir || await applyPretrust(context.runCwd);
+      return stateApplied && cwdApplied;
+    },
+  });
+  Object.defineProperty(adapter, 'acpLegacyAuthority', { value: acpAuthority, enumerable: true });
+  return adapter;
 }
 
 // The adapter needs the state dir for briefing/worklog paths in launch prompts.
@@ -573,27 +589,4 @@ function roleStateDir(role: ResolvedRole): string {
 
 export const claudeCodeAdapter = makeClaudeCodeAdapter();
 registerAdapter(claudeCodeAdapter);
-registerBodyBrainAdapterDescriptor(Object.freeze({
-  schemaVersion: 1 as const, harnessId: 'claude-code' as const,
-  adapterId: 'claude-code-acp' as const, adapterVersion: '0.63.0',
-  prepare(role: ResolvedRole, prep: SessionPrep) {
-    if (role.harness !== 'claude-code') throw new Error('Claude BodyBrain descriptor cannot translate another harness');
-    const effort = (role.harness_options as ClaudeOptions | undefined)?.effort;
-    if (!role.model || !effort) throw new Error('Claude BodyBrain translation requires explicit model and effort');
-    const launch = claudeCodeAdapter.buildAcpLaunch!(role, prep);
-    const modeId = claudeCodeAdapter.acpPermissionModeId!(role);
-    const mcpServers = claudeCodeAdapter.acpMcpServers!(role);
-    const sessionMeta = claudeCodeAdapter.acpSessionMeta!(role, prep);
-    return createAcpBodyBrainPreparedLaunch({
-      schemaVersion: 1, adapterId: 'claude-code-acp', adapterVersion: '0.63.0',
-      argv: launch.argv, env: launch.env,
-      translation: {
-        model: role.model, effort,
-        ...(modeId ? { modeId } : {}),
-        ...(mcpServers === undefined ? {} : { mcpServers }),
-        ...(sessionMeta === undefined ? {} : { sessionMeta }),
-      },
-    });
-  },
-  createProvider: createAcpBodyBrainInjectedProvider,
-}));
+registerBodyBrainAdapterDescriptor(CLAUDE_CODE_BODY_BRAIN_DESCRIPTOR);

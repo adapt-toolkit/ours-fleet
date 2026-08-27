@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from 'vitest';
 
-import type { ResolvedRole } from '../src/config.js';
 import {
+  CLAUDE_CODE_BODY_BRAIN_DESCRIPTOR, CODEX_BODY_BRAIN_DESCRIPTOR,
   getBodyBrainAdapterDescriptor, knownBodyBrainAdapterDescriptors,
   registerBodyBrainAdapterDescriptor,
 } from '../src/harness/registry.js';
@@ -33,7 +33,6 @@ function descriptor(
   return Object.freeze({
     schemaVersion: 1 as const, harnessId, adapterId,
     adapterVersion: harnessId === 'codex' ? '1.1.7' : '0.63.0',
-    prepare: (_role: ResolvedRole) => createAcpBodyBrainPreparedLaunch(launch(adapterId)),
     createProvider: (prepared: Readonly<AcpBodyBrainPreparedLaunch>, driver: AcpBodyBrainInjectedDriver) =>
       createAcpBodyBrainInjectedProvider(prepared, driver),
   });
@@ -87,11 +86,15 @@ describe('Phase 4C BodyBrain descriptor registry', () => {
       ...descriptor('codex'), adapterVersion: '9.9.9',
     }))).toThrow(/invalid BodyBrain/u);
 
-    const codex = descriptor('codex'); const claude = descriptor('claude-code');
+    expect(() => registerBodyBrainAdapterDescriptor(descriptor('codex'))).toThrow(/foreign/u);
+    expect(() => registerBodyBrainAdapterDescriptor(descriptor('claude-code'))).toThrow(/foreign/u);
+
+    const codex = CODEX_BODY_BRAIN_DESCRIPTOR;
+    const claude = CLAUDE_CODE_BODY_BRAIN_DESCRIPTOR;
     registerBodyBrainAdapterDescriptor(codex);
     expect(getBodyBrainAdapterDescriptor('codex')).toBe(codex);
     expect(() => registerBodyBrainAdapterDescriptor(codex)).toThrow(/duplicate/u);
-    expect(() => registerBodyBrainAdapterDescriptor(descriptor('codex'))).toThrow(/duplicate/u);
+    expect(() => registerBodyBrainAdapterDescriptor(descriptor('codex'))).toThrow(/foreign/u);
     registerBodyBrainAdapterDescriptor(claude);
     expect(knownBodyBrainAdapterDescriptors()).toEqual(['claude-code', 'codex']);
     expect(getBodyBrainAdapterDescriptor('claude-code')).toBe(claude);
@@ -206,93 +209,16 @@ describe('injected ACP BodyBrain provider conformance', () => {
   );
 });
 
-const productionRole = (harness: 'codex' | 'claude-code', patch: Partial<ResolvedRole> = {}) => ({
-  name: `role-${harness}`, harness, session: 'acp', identity: `identity-${harness}`, sourceFile: 'test',
-  model: harness === 'codex' ? 'gpt-5.6-terra' : 'claude-sonnet-4-6',
-  harness_options: { effort: harness === 'codex' ? 'ultra' : 'medium' },
-  permissions: { approval: 'auto', filesystem: 'workspace', unattended: 'deny' },
-  permissionsDeclared: true,
-  monitor: { mode: 'fleet', enabled: true, wake_sources: [], batch_ms: 2000, inject: 'notification' },
-  ...patch,
-}) as ResolvedRole;
-
-describe('registered production ACP BodyBrain translations', () => {
-  it.each(['codex', 'claude-code'] as const)(
-    'binds %s descriptor identity/policy and drives fresh plus restore without a process launch', async harness => {
-      vi.resetModules();
-      await import('../src/harness/codex.js');
-      await import('../src/harness/claude-code.js');
-      const registry = await import('../src/harness/registry.js');
-      const brainAdapters = await import('../src/harness/brain-adapter.js');
-      const registered = registry.getBodyBrainAdapterDescriptor(harness);
-      const policy = brainAdapters.getBrainAdapter(harness, 'acp');
-      expect(registered).toMatchObject({
-        schemaVersion: 1, harnessId: harness, adapterId: policy.adapterId,
-        adapterVersion: policy.adapterVersion,
-      });
-      expect(Object.isFrozen(registered)).toBe(true);
-      expect(() => registered.prepare(productionRole(harness === 'codex' ? 'claude-code' : 'codex'), {
-        argv: [], env: {},
-      })).toThrow(/another harness/u);
-      const prepared = registered.prepare(productionRole(harness), {
-        argv: [], env: { OWNED: '1' }, settingsOverlay: '/state/settings.json',
-      });
-      expect(prepared).toMatchObject({
-        schemaVersion: 1, adapterId: policy.adapterId, adapterVersion: policy.adapterVersion,
-        env: { OWNED: '1' },
-        translation: {
-          model: harness === 'codex' ? 'gpt-5.6-terra' : 'claude-sonnet-4-6',
-          effort: harness === 'codex' ? 'ultra' : 'medium',
-          modeId: harness === 'codex' ? 'agent' : 'acceptEdits',
-        },
-      });
-      expect(Object.isFrozen(prepared)).toBe(true);
-      expect(Object.isFrozen(prepared.translation)).toBe(true);
-      if (harness === 'codex') {
-        expect(prepared.translation.permissionMetadataSource).toBe('codex-acp');
-        expect(prepared.translation.sessionMeta).toBeUndefined();
-        expect(prepared.translation.mcpServers).toBeUndefined();
-      } else {
-        expect(prepared.translation.permissionMetadataSource).toBeUndefined();
-        expect(prepared.translation.sessionMeta).toEqual({
-          claudeCode: { options: { settings: '/state/settings.json' } },
-        });
-        expect(prepared.translation.mcpServers).toBeUndefined();
-      }
-
-      const freshFake = fakeDriver();
-      const fresh = registered.createProvider(prepared, freshFake.driver);
-      fresh.subscribe(() => undefined);
-      expect(await fresh.start({ protocolVersion: 1, generation: 'generation-fresh', planDigest: digest }))
-        .toMatchObject({ state: 'accepted' });
-      expect(freshFake.calls).toContain(`start:${policy.adapterId}:${prepared.translation.model}:${prepared.translation.effort}`);
-      await fresh.cleanup();
-      const restoreFake = fakeDriver();
-      const restored = registered.createProvider(prepared, restoreFake.driver);
-      restored.subscribe(() => undefined);
-      const metadata = { schemaVersion: 1 as const, token: 'opaque-restore', digest };
-      expect(await restored.restore({ protocolVersion: 1, generation: 'generation-restore', planDigest: digest,
-        sessionMetadata: metadata })).toEqual({ state: 'accepted', sessionMetadata: metadata });
-      expect(restoreFake.calls).toContain(`restore:${policy.adapterId}:${prepared.translation.model}:${prepared.translation.effort}`);
-      await restored.cleanup();
-    },
-  );
-
-  it('preserves Claude inherited versus explicit-empty MCP semantics and bundled-only metadata', async () => {
+describe('registered production ACP BodyBrain descriptors', () => {
+  it.each(['codex', 'claude-code'] as const)('pins %s without a duplicate prepare path', async harness => {
     vi.resetModules();
+    await import('../src/harness/codex.js');
     await import('../src/harness/claude-code.js');
     const registry = await import('../src/harness/registry.js');
-    const registered = registry.getBodyBrainAdapterDescriptor('claude-code');
-    const inherited = registered.prepare(productionRole('claude-code'), { argv: [], env: {} });
-    const explicitEmpty = registered.prepare(productionRole('claude-code', {
-      harness_options: { effort: 'medium', mcp_servers: {} },
-    }), { argv: [], env: {} });
-    expect(inherited.translation.mcpServers).toBeUndefined();
-    expect(explicitEmpty.translation.mcpServers).toEqual([]);
-    const custom = registered.prepare(productionRole('claude-code', {
-      session_options: { acp: { command: ['custom-acp'] } },
-    }), { argv: [], env: {}, settingsOverlay: '/must-not-cross' });
-    expect(custom.translation.sessionMeta).toBeUndefined();
-    expect(custom.argv).toEqual(['custom-acp']);
+    const registered = registry.getBodyBrainAdapterDescriptor(harness);
+    expect(Reflect.ownKeys(registered).sort()).toEqual([
+      'adapterId', 'adapterVersion', 'createProvider', 'harnessId', 'schemaVersion',
+    ]);
+    expect(Object.isFrozen(registered)).toBe(true);
   });
 });

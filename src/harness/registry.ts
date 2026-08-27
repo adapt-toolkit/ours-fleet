@@ -1,4 +1,5 @@
 import type { AcpBodyBrainAdapterDescriptor, HarnessAdapter } from './types.js';
+import { createAcpBodyBrainInjectedProvider } from '../session/acp-body-brain-provider.js';
 
 const adapters = new Map<string, HarnessAdapter>();
 const bodyBrainAdapters = new Map<string, AcpBodyBrainAdapterDescriptor>();
@@ -7,6 +8,19 @@ const BODY_BRAIN_PRODUCTION = Object.freeze({
   codex: Object.freeze({ adapterId: 'codex-acp', adapterVersion: '1.1.7' }),
   'claude-code': Object.freeze({ adapterId: 'claude-code-acp', adapterVersion: '0.63.0' }),
 } as const);
+
+export const CODEX_BODY_BRAIN_DESCRIPTOR: AcpBodyBrainAdapterDescriptor = Object.freeze({
+  schemaVersion: 1, harnessId: 'codex', adapterId: 'codex-acp', adapterVersion: '1.1.7',
+  createProvider: createAcpBodyBrainInjectedProvider,
+});
+export const CLAUDE_CODE_BODY_BRAIN_DESCRIPTOR: AcpBodyBrainAdapterDescriptor = Object.freeze({
+  schemaVersion: 1, harnessId: 'claude-code', adapterId: 'claude-code-acp', adapterVersion: '0.63.0',
+  createProvider: createAcpBodyBrainInjectedProvider,
+});
+const PINNED_BODY_BRAIN = Object.freeze({
+  codex: CODEX_BODY_BRAIN_DESCRIPTOR,
+  'claude-code': CLAUDE_CODE_BODY_BRAIN_DESCRIPTOR,
+});
 
 function exactDataObject(value: unknown, keys: readonly string[]): value is Record<string, unknown> {
   if (!value || typeof value !== 'object' || Array.isArray(value) || !Object.isFrozen(value)
@@ -63,14 +77,16 @@ export function productionAdapters(): string[] {
  */
 export function registerBodyBrainAdapterDescriptor(descriptor: AcpBodyBrainAdapterDescriptor): void {
   if (!exactDataObject(descriptor, [
-    'schemaVersion', 'harnessId', 'adapterId', 'adapterVersion', 'prepare', 'createProvider',
+    'schemaVersion', 'harnessId', 'adapterId', 'adapterVersion', 'createProvider',
   ])) throw new Error('BodyBrain adapter descriptor must be an exact frozen data object');
   const expected = BODY_BRAIN_PRODUCTION[descriptor.harnessId as keyof typeof BODY_BRAIN_PRODUCTION];
   if (!expected) throw new Error(`unknown production BodyBrain harness '${String(descriptor.harnessId)}'`);
   if (descriptor.schemaVersion !== 1 || descriptor.adapterId !== expected.adapterId
       || descriptor.adapterVersion !== expected.adapterVersion
-      || typeof descriptor.prepare !== 'function' || typeof descriptor.createProvider !== 'function')
+      || typeof descriptor.createProvider !== 'function')
     throw new Error(`invalid BodyBrain adapter descriptor for '${descriptor.harnessId}'`);
+  if (descriptor !== PINNED_BODY_BRAIN[descriptor.harnessId])
+    throw new Error(`foreign BodyBrain adapter descriptor for '${descriptor.harnessId}'`);
   if (bodyBrainAdapters.has(descriptor.harnessId))
     throw new Error(`duplicate BodyBrain adapter descriptor '${descriptor.harnessId}'`);
   bodyBrainAdapters.set(descriptor.harnessId, descriptor);

@@ -403,23 +403,37 @@ export interface EphemeralPreparedBrainLaunch {
   toJSON(): never;
 }
 
+export interface AuthenticatedPreparedBrainLaunchBindings {
+  readonly input: Readonly<BrainAdapterResolutionInput>;
+  readonly adapter: Readonly<BrainAdapter>;
+  readonly validation: AdapterValidationRecord;
+  readonly native: PortablePermissionCodes;
+  readonly bodyBrainLaunch: Readonly<AcpBodyBrainPreparedLaunch>;
+  readonly artifactIdentity: AcpBundleIdentity;
+}
+
 /**
  * Bind durable validation and ephemeral launch material to one immutable, zero-launch snapshot.
  * Availability evidence still comes only from the configured owning authority.
  */
-export function createBrainAdapterPreparer(
-  authority: BrainAdapterEvidenceAuthority,
-): (input: BrainAdapterResolutionInput) => EphemeralPreparedBrainLaunch {
-  if (!authority || typeof authority.authenticateAdapterEvidence !== 'function')
-    throw new BrainAdapterPolicyError('Brain adapter preparer boundary is invalid');
-  const authenticateAdapterEvidence = authority.authenticateAdapterEvidence.bind(authority);
-  const bound: BrainAdapterEvidenceAuthority = { authenticateAdapterEvidence };
-  return rawInput => {
+export class BrainAdapterPreparationAuthority {
+  readonly #issued = new WeakMap<object, AuthenticatedPreparedBrainLaunchBindings>();
+  readonly #bound: BrainAdapterEvidenceAuthority;
+
+  constructor(authority: BrainAdapterEvidenceAuthority) {
+    if (!authority || typeof authority.authenticateAdapterEvidence !== 'function')
+      throw new BrainAdapterPolicyError('Brain adapter preparer boundary is invalid');
+    const authenticateAdapterEvidence = authority.authenticateAdapterEvidence.bind(authority);
+    this.#bound = { authenticateAdapterEvidence };
+  }
+
+  prepare(rawInput: BrainAdapterResolutionInput): EphemeralPreparedBrainLaunch {
     rejectAccessors(rawInput, 'Brain adapter input');
     const snapshot = JSON.parse(canonical({
       brain: rawInput.brain, permissions: rawInput.permissions, policy: rawInput.policy,
     })) as Omit<BrainAdapterResolutionInput, 'enforcementEvidence'>;
-    const input = Object.freeze({ ...snapshot, enforcementEvidence: rawInput.enforcementEvidence });
+    const frozenSnapshot = deepFreezeBrainSnapshot(snapshot);
+    const input = Object.freeze({ ...frozenSnapshot, enforcementEvidence: rawInput.enforcementEvidence });
     const adapter = getBrainAdapter(input.brain.harness, input.brain.session);
     const codex = adapter.harness === 'codex';
     const packageName = codex
@@ -432,8 +446,8 @@ export function createBrainAdapterPreparer(
         || resolution.argv.some(arg => typeof arg !== 'string' || !arg.length
           || Buffer.byteLength(arg) > 4096 || /[\0\r\n]/u.test(arg)))
       throw new BrainAdapterPolicyError('prepared ACP argv is invalid or exceeds bounds');
-    const validation = resolveExactPolicy(adapter, input, bound, resolution);
-    const native = Object.freeze(translatePortablePermissionCodes(
+    const validation = resolveExactPolicy(adapter, input, this.#bound, resolution);
+    const native = deepFreezeBrainSnapshot(translatePortablePermissionCodes(
       adapter.harness as 'codex' | 'claude-code', input.permissions,
     ));
     let descriptor;
@@ -461,12 +475,49 @@ export function createBrainAdapterPreparer(
         || bodyBrainLaunch.translation.model !== input.brain.model
         || bodyBrainLaunch.translation.effort !== input.brain.effort)
       throw new BrainAdapterPolicyError('prepared BodyBrain launch does not match registered descriptor');
-    return Object.freeze({
+    const evidence = deepFreezeBrainSnapshot({
       [ephemeralLaunchBrand]: true as const, validation,
       argv: Object.freeze([...resolution.argv]), env: Object.freeze({}),
       model: input.brain.model, effort: input.brain.effort, native, bodyBrainLaunch,
       recheckAtSideEffectBoundary: () => recheckBundledAcpAgent(resolution),
       toJSON: (): never => { throw new BrainAdapterPolicyError('ephemeral Brain launch cannot be serialized'); },
     });
-  };
+    const artifactIdentity = deepFreezeBrainSnapshot(JSON.parse(canonical(resolution.identity)) as AcpBundleIdentity);
+    this.#issued.set(evidence, Object.freeze({
+      input, adapter, validation, native, bodyBrainLaunch, artifactIdentity,
+    }));
+    return evidence;
+  }
+
+  authenticate(
+    evidence: EphemeralPreparedBrainLaunch, expectedInput: BrainAdapterResolutionInput,
+    expectedAdapter: BrainAdapter, expectedArtifactIdentity: AcpBundleIdentity,
+  ): AuthenticatedPreparedBrainLaunchBindings | undefined {
+    const issued = this.#issued.get(evidence as object);
+    if (!issued || issued.adapter !== expectedAdapter
+        || expectedInput.enforcementEvidence !== issued.input.enforcementEvidence) return undefined;
+    try {
+      if (canonical({ brain: expectedInput.brain, permissions: expectedInput.permissions, policy: expectedInput.policy })
+          !== canonical({ brain: issued.input.brain, permissions: issued.input.permissions, policy: issued.input.policy })
+          || canonical(expectedArtifactIdentity) !== canonical(issued.artifactIdentity)) return undefined;
+    } catch { return undefined; }
+    return issued;
+  }
+}
+
+function deepFreezeBrainSnapshot<T>(value: T, seen = new Set<object>()): T {
+  if (!value || typeof value !== 'object' || seen.has(value as object)) return value;
+  seen.add(value as object);
+  for (const key of Reflect.ownKeys(value as object)) {
+    const descriptor = Object.getOwnPropertyDescriptor(value as object, key);
+    if (descriptor && 'value' in descriptor) deepFreezeBrainSnapshot(descriptor.value, seen);
+  }
+  return Object.freeze(value);
+}
+
+export function createBrainAdapterPreparer(
+  authority: BrainAdapterEvidenceAuthority,
+): (input: BrainAdapterResolutionInput) => EphemeralPreparedBrainLaunch {
+  const issuer = new BrainAdapterPreparationAuthority(authority);
+  return issuer.prepare.bind(issuer);
 }

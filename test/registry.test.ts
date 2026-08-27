@@ -83,4 +83,16 @@ describe('adapter permission-translation contract', () => {
       expect(t.supported, id).toBe(true);
     }
   });
+
+  it('production ACP adapters expose only the shared authenticated attempt seam', async () => {
+    await import('../src/harness/claude-code.js');
+    await import('../src/harness/codex.js');
+    for (const id of ['claude-code', 'codex']) {
+      const adapter = getAdapter(id) as HarnessAdapter & Record<string, unknown>;
+      expect(adapter.prepareAcpLegacy).toBeTypeOf('function');
+      expect(adapter.acpLegacyAuthority).toBeDefined();
+      for (const removed of ['buildAcpLaunch', 'acpPermissionModeId', 'acpMcpServers', 'acpSessionMeta'])
+        expect(Object.hasOwn(adapter, removed), `${id}.${removed}`).toBe(false);
+    }
+  });
 });

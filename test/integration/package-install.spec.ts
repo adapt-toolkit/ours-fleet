@@ -63,6 +63,9 @@ describe('packed root package', () => {
         const { makeCodexAdapter } = await import(
           pathToFileURL(join(fleetRoot, 'dist', 'harness', 'codex.js')).href
         );
+        const { authenticatePrepared, legacyAcpIntegrityDigest } = await import(
+          pathToFileURL(join(fleetRoot, 'dist', 'harness', 'acp-attempt.js')).href
+        );
         const adapter = makeCodexAdapter(async cmd => ({
           code: cmd === 'sh' ? 1 : 0, stdout: '', stderr: '',
         }));
@@ -76,17 +79,25 @@ describe('packed root package', () => {
         };
         const stateDir = join(process.cwd(), 'state');
         mkdirSync(stateDir);
-        const prep = await adapter.prepareSession(role, { stateDir, runCwd: process.cwd() });
-        const launch = adapter.buildAcpLaunch(role, prep);
+        const projection = { schemaVersion: 1, roleName: role.name, harness: 'codex',
+          identityName: role.identity, lifetime: 'persistent', permissions: role.permissions,
+          nativePermissions: { approvalMode: 'never', filesystemMode: 'danger-full-access', unattendedMode: 'deny', exact: true },
+          isolationRequested: false, scheduling: {},
+          adapterOptions: { harness: 'codex', launcher: 'auto', search: false, addDirs: [], config: {} } };
+        const input = { ...projection, integrityDigest: legacyAcpIntegrityDigest(projection) };
+        const context = { stateDir, runCwd: process.cwd(), baseEnv: {}, sessionMode: 'fresh', sessionId: 'packed-1' };
+        const evidence = await adapter.prepareAcpLegacy(input, context);
+        const launch = authenticatePrepared(adapter.acpLegacyAuthority, adapter, evidence, input, context);
+        if (!launch) throw new Error('packed ACP attempt did not authenticate');
         const claim = adapter.effectivePermissions(role);
         process.stdout.write(JSON.stringify({
           version: codex.version,
           claim,
           permissionMetadataSource: launch.permissionMetadataSource,
           prepared: {
-            codeXPathExists: existsSync(prep.env.CODEX_PATH),
-            approval: prep.env.OURS_FLEET_CODEX_APPROVAL,
-            sandbox: prep.env.OURS_FLEET_CODEX_SANDBOX,
+            codeXPathExists: launch.env.CODEX_PATH ? existsSync(launch.env.CODEX_PATH) : false,
+            approval: launch.env.OURS_FLEET_CODEX_APPROVAL,
+            sandbox: launch.env.OURS_FLEET_CODEX_SANDBOX,
             initialAgentMode: launch.env.INITIAL_AGENT_MODE,
           },
         }));
@@ -136,6 +147,9 @@ describe('packed root package', () => {
         const { makeCodexAdapter } = await import(
           pathToFileURL(join(fleetRoot, 'dist', 'harness', 'codex.js')).href
         );
+        const { authenticatePrepared, legacyAcpIntegrityDigest } = await import(
+          pathToFileURL(join(fleetRoot, 'dist', 'harness', 'acp-attempt.js')).href
+        );
         const adapter = makeCodexAdapter(async () => ({
           code: 1, stdout: '', stderr: '',
         }));
@@ -147,11 +161,19 @@ describe('packed root package', () => {
           session: 'acp',
           permissions: { approval: 'allow', filesystem: 'workspace', unattended: 'wait' },
         };
-        const launch = adapter.buildAcpLaunch(role, { argv: [], env: {} });
+        const projection = { schemaVersion: 1, roleName: role.name, harness: 'codex',
+          identityName: role.identity, lifetime: 'persistent', permissions: role.permissions,
+          nativePermissions: { approvalMode: 'never', filesystemMode: 'workspace', unattendedMode: 'wait', exact: true },
+          isolationRequested: false, scheduling: {},
+          adapterOptions: { harness: 'codex', launcher: 'auto', search: false, addDirs: [], config: {} } };
+        const input = { ...projection, integrityDigest: legacyAcpIntegrityDigest(projection) };
+        const context = { stateDir: process.cwd(), runCwd: process.cwd(), baseEnv: {}, sessionMode: 'fresh', sessionId: 'packed-2' };
+        let error;
+        try { await adapter.prepareAcpLegacy(input, context); }
+        catch (caught) { error = String(caught); }
         process.stdout.write(JSON.stringify({
           bundledPresent: existsSync(codexRoot),
-          argv: launch.argv,
-          permissionMetadataSource: launch.permissionMetadataSource,
+          rejected: /bundled artifact is unavailable or version-skewed/.test(error ?? ''),
         }));
       `;
       const fallback = JSON.parse(execFileSync(process.execPath, [
@@ -159,7 +181,7 @@ describe('packed root package', () => {
       ], { cwd: consumerWithoutOptionalDir, encoding: 'utf8' }));
       expect(fallback).toEqual({
         bundledPresent: false,
-        argv: ['codex-acp'],
+        rejected: true,
       });
       expect(existsSync(join(
         consumerWithoutOptionalDir, 'node_modules', '@agentclientprotocol', 'codex-acp',

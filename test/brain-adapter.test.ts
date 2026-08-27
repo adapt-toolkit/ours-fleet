@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import {
-  BrainAdapterRegistry, computeBrainAdapterPolicyDigest, computeModelCatalogDigest,
+  BrainAdapterPreparationAuthority, BrainAdapterRegistry, computeBrainAdapterPolicyDigest, computeModelCatalogDigest,
   createBrainAdapterPolicyResolver, createBrainAdapterPreparer, getBrainAdapter, resolveBrainAdapterPolicy,
   translatePortablePermissionCodes,
   type BrainAdapterEvidenceAuthority, type BrainAdapterPolicy, type BrainAdapterPolicyEvidence,
@@ -9,8 +9,9 @@ import {
 } from '../src/harness/brain-adapter.js';
 import { computeBrainDigest, computePermissionsDigest } from '../src/agent-plan.js';
 import { resolveAuthenticatedBundledAcpAgent } from '../src/harness/acp-agent.js';
-import { getAdapter } from '../src/harness/registry.js';
+import { getAdapter, getBodyBrainAdapterDescriptor } from '../src/harness/registry.js';
 import type { BrainSpec, PermissionSpec } from '../src/config-resources.js';
+import type { AcpBodyBrainInjectedDriver } from '../src/session/acp-body-brain-provider.js';
 import '../src/harness/codex.js';
 import '../src/harness/claude-code.js';
 import * as brainAdapterModule from '../src/harness/brain-adapter.js';
@@ -243,6 +244,82 @@ describe('exact Brain adapter policy resolution', () => {
     expect(prepared.recheckAtSideEffectBoundary()).toBe(true);
   });
 
+  it('authenticates only exact authority, adapter, enforcement, input and artifact bindings', () => {
+    const selectedBrain = brain('codex');
+    const portable = permissions('allow', 'unrestricted', 'wait');
+    const policy = evidence(codexPolicy());
+    const input = authorizedInput(selectedBrain, portable, policy);
+    const actual = resolveAuthenticatedBundledAcpAgent(
+      '@agentclientprotocol/codex-acp', 'codex-acp', 'codex-acp',
+    );
+    const original = trusted.get(input.enforcementEvidence as object)!;
+    trusted.set(input.enforcementEvidence as object, { ...original, launch: {
+      kind: 'bundled', packageName: '@agentclientprotocol/codex-acp',
+      manifestPath: actual.manifestPath, entrypointPath: actual.entrypointPath,
+      version: actual.version, identity: actual.identity,
+    } });
+    const issuer = new BrainAdapterPreparationAuthority(authority);
+    const prepared = issuer.prepare(input);
+    const adapter = getBrainAdapter('codex', 'acp');
+    const bindings = issuer.authenticate(prepared, input, adapter, actual.identity!);
+    expect(bindings?.adapter).toBe(adapter);
+    expect(Object.isFrozen(bindings?.input.brain)).toBe(true);
+    expect(Object.isFrozen(bindings?.artifactIdentity)).toBe(true);
+    expect(new BrainAdapterPreparationAuthority(authority)
+      .authenticate(prepared, input, adapter, actual.identity!)).toBeUndefined();
+    expect(issuer.authenticate({} as typeof prepared, input, adapter, actual.identity!)).toBeUndefined();
+    expect(issuer.authenticate(prepared, { ...input, enforcementEvidence: {} as VerifiedAdapterEnforcementEvidence },
+      adapter, actual.identity!)).toBeUndefined();
+    expect(issuer.authenticate(prepared, { ...input, brain: { ...input.brain, model: 'other' } },
+      adapter, actual.identity!)).toBeUndefined();
+    expect(issuer.authenticate(prepared, input, { ...adapter }, actual.identity!)).toBeUndefined();
+    expect(issuer.authenticate(prepared, input, adapter, {
+      ...actual.identity!, entrypoint: { ...actual.identity!.entrypoint, size: actual.identity!.entrypoint.size + 1 },
+    })).toBeUndefined();
+  });
+
+  it.each(['codex', 'claude-code'] as const)(
+    'drives authenticated %s production descriptor fresh and restore launches', async harness => {
+      const selectedBrain = brain(harness);
+      const portable = permissions('allow', harness === 'codex' ? 'unrestricted' : 'workspace', 'wait');
+      const policy = evidence(harness === 'codex' ? codexPolicy() : claudePolicy());
+      const input = authorizedInput(selectedBrain, portable, policy);
+      const packageName = harness === 'codex'
+        ? '@agentclientprotocol/codex-acp' : '@agentclientprotocol/claude-agent-acp';
+      const binName = harness === 'codex' ? 'codex-acp' : 'claude-agent-acp';
+      const actual = resolveAuthenticatedBundledAcpAgent(packageName, binName, binName);
+      const original = trusted.get(input.enforcementEvidence as object)!;
+      trusted.set(input.enforcementEvidence as object, { ...original, launch: {
+        kind: 'bundled', packageName, manifestPath: actual.manifestPath,
+        entrypointPath: actual.entrypointPath, version: actual.version, identity: actual.identity,
+      } });
+      const issuer = new BrainAdapterPreparationAuthority(authority);
+      const prepared = issuer.prepare(input);
+      const adapter = getBrainAdapter(harness, 'acp');
+      const bindings = issuer.authenticate(prepared, input, adapter, actual.identity!)!;
+      const calls: string[] = [];
+      const driver: AcpBodyBrainInjectedDriver = {
+        subscribe: () => () => {},
+        start: async request => { calls.push(`start:${request.launch.adapterId}`); return { state: 'accepted',
+          sessionMetadata: { schemaVersion: 1, token: 'opaque', digest: `sha256:${'a'.repeat(64)}` } }; },
+        restore: async request => { calls.push(`restore:${request.launch.adapterId}`); return { state: 'accepted',
+          sessionMetadata: request.lifecycle.sessionMetadata! }; },
+        submit: async () => ({ state: 'accepted' }), respondPermission: async () => ({ state: 'accepted' }),
+        cancel: async () => ({ state: 'accepted' }), forceTerminate: async () => ({ state: 'accepted' }),
+        close: async () => ({ state: 'accepted' }), retire: async () => ({ state: 'accepted' }), cleanup: async () => {},
+      };
+      const descriptor = getBodyBrainAdapterDescriptor(harness);
+      const fresh = descriptor.createProvider(bindings.bodyBrainLaunch, driver); fresh.subscribe(() => {});
+      const started = await fresh.start({ protocolVersion: 1, generation: 'g1', planDigest: `sha256:${'b'.repeat(64)}` });
+      expect(started.state).toBe('accepted'); await fresh.cleanup();
+      const restored = descriptor.createProvider(bindings.bodyBrainLaunch, driver); restored.subscribe(() => {});
+      expect((await restored.restore({ protocolVersion: 1, generation: 'g2', planDigest: `sha256:${'b'.repeat(64)}`,
+        sessionMetadata: started.sessionMetadata! })).state).toBe('accepted');
+      expect(calls).toEqual([`start:${adapter.adapterId}`, `restore:${adapter.adapterId}`]);
+      await restored.cleanup();
+    },
+  );
+
   it('rejects getter inputs without leaking provider-private values', () => {
     const selectedBrain = brain('codex');
     Object.defineProperty(selectedBrain, 'model', {
@@ -325,7 +402,6 @@ describe('Brain tuple registry and legacy translation parity', () => {
   });
 
   it('shares Codex ACP mode selection without executing a launch', () => {
-    const adapter = getAdapter('codex');
     for (const [approval, filesystem, expected] of [
       ['ask', 'read-only', 'read-only'], ['auto', 'workspace', 'agent'],
       ['allow', 'unrestricted', 'agent-full-access'],
@@ -334,11 +410,7 @@ describe('Brain tuple registry and legacy translation parity', () => {
       const shared = translatePortablePermissionCodes('codex', portable);
       expect(shared.legacyNative.sandbox).toBe(filesystem === 'workspace'
         ? 'workspace-write' : filesystem === 'unrestricted' ? 'danger-full-access' : 'read-only');
-      const role = {
-        permissions: portable, harness_options: undefined, session: 'acp', session_options: undefined,
-      } as unknown as import('../src/config.js').ResolvedRole;
       expect(shared.coupledAcpMode).toBe(expected);
-      expect(adapter.acpPermissionModeId!(role)).toBe(expected);
     }
   });
 });

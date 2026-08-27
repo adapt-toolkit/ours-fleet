@@ -5,6 +5,10 @@ import type {
   AcpBodyBrainInjectedDriver, AcpBodyBrainPreparedLaunch,
 } from '../session/acp-body-brain-provider.js';
 import type { AcpBodyBrainProvider } from '../session/acp-body-brain-transport.js';
+import type {
+  LegacyAcpAttemptInput, LegacyAcpPreparationAuthority, LegacyAcpRuntimeContext,
+  LegacyPreparedAcpAttempt,
+} from './acp-attempt.js';
 
 export interface PrereqCheck { name: string; ok: boolean; detail: string }
 export interface PrereqReport { ok: boolean; checks: PrereqCheck[] }
@@ -130,32 +134,12 @@ export interface HarnessAdapter {
   validateOptions(opts: unknown, role?: ResolvedRole): ValidationError[];
   prepareSession(role: ResolvedRole, dirs: RoleDirs): Promise<SessionPrep>;
   buildLaunch(role: ResolvedRole, mode: 'fresh' | 'resume', s: SessionState, prep: SessionPrep): Launch;
-  buildAcpLaunch?(role: ResolvedRole, prep: SessionPrep): AcpLaunch;
-  /**
-   * The native permission-mode id an ACP session should run at, from the same
-   * translation `buildLaunch` uses for its CLI flag. `undefined` keeps the
-   * agent's default. Omit for a harness whose ACP agent has no modes.
-   */
-  acpPermissionModeId?(role: ResolvedRole): string | undefined;
-  /**
-   * The MCP servers this role declares, for the `mcpServers` array of ACP's
-   * `session/new` / `resume` / `load`. ACP requires an array on the wire, so
-   * `undefined` is encoded as `[]` while the authenticated bundled adapter is
-   * left to preserve its inherited configuration. An explicit empty array uses
-   * that adapter's compatibility path to disable all inherited servers.
-   */
-  acpMcpServers?(role: ResolvedRole): AcpMcpServer[] | undefined;
-  /**
-   * Agent-specific `_meta` for `session/new` — how a capability the CLI takes as
-   * a flag reaches an ACP agent that accepts no flags.
-   *
-   * ⚠ THIS IS A PER-AGENT VOCABULARY, NOT PROTOCOL. `_meta` is free-form in ACP,
-   * so what an adapter puts here is only honoured by the agent it was written
-   * for. An adapter must therefore return nothing for an ACP command it did not
-   * choose, and the options that depend on it must be refused at validation for
-   * such a role rather than sent and silently ignored.
-   */
-  acpSessionMeta?(role: ResolvedRole, prep: SessionPrep): Record<string, unknown> | undefined;
+  /** Temporary legacy bridge. See the Phase-5 deletion gate in acp-attempt.ts. */
+  prepareAcpLegacy?(
+    input: LegacyAcpAttemptInput, context: LegacyAcpRuntimeContext,
+  ): Promise<LegacyPreparedAcpAttempt>;
+  /** Instance-owned issuer paired with prepareAcpLegacy; integrity is not authority. */
+  readonly acpLegacyAuthority?: LegacyAcpPreparationAuthority;
   /** Effective portable policy and harness-native approval mode after native overrides win. */
   effectivePermissionMode?(role: ResolvedRole): {
     fleetMode: FleetPermissionMode;
@@ -197,7 +181,6 @@ export interface AcpBodyBrainAdapterDescriptor {
   readonly harnessId: 'codex' | 'claude-code';
   readonly adapterId: 'codex-acp' | 'claude-code-acp';
   readonly adapterVersion: string;
-  prepare(role: ResolvedRole, prep: SessionPrep): Readonly<AcpBodyBrainPreparedLaunch>;
   createProvider(
     launch: Readonly<AcpBodyBrainPreparedLaunch>, driver: AcpBodyBrainInjectedDriver,
   ): AcpBodyBrainProvider;

@@ -1,4 +1,5 @@
 import { chmodSync, existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { createHash } from 'node:crypto';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { agentDir, home } from '../paths.js';
@@ -8,17 +9,20 @@ import type {
   AcpLaunch, HarnessAdapter, RoleDirs, SessionPrep, SessionState, Launch, ValidationError,
   UnattendedCapability,
 } from './types.js';
-import { registerAdapter, registerBodyBrainAdapterDescriptor } from './registry.js';
 import {
-  createAcpBodyBrainInjectedProvider, createAcpBodyBrainPreparedLaunch,
-} from '../session/acp-body-brain-provider.js';
+  CODEX_BODY_BRAIN_DESCRIPTOR, registerAdapter, registerBodyBrainAdapterDescriptor,
+} from './registry.js';
 import {
   translatePortablePermissionCodes,
 } from './brain-adapter.js';
 import { harnessRuntimeDir } from '../isolation/policy.js';
 import {
-  resolveBundledAcpAgent, type AcpAgentResolution,
+  resolveAuthenticatedBundledAcpAgent, resolveBundledAcpAgent, type AcpAgentResolution,
 } from './acp-agent.js';
+import {
+  LegacyAcpPreparationAuthority, type LegacyAcpAttemptInput,
+  type LegacyAcpRuntimeContext,
+} from './acp-attempt.js';
 
 interface CodexOptions {
   launcher?: string;
@@ -251,7 +255,8 @@ function hasInstalledOursPlugin(output: string): boolean {
 }
 
 export function makeCodexAdapter(exec: Exec = realExec): HarnessAdapter {
-  return {
+  let adapter!: HarnessAdapter;
+  adapter = {
     id: 'codex',
     supportsResume: true,
 
@@ -362,33 +367,11 @@ export function makeCodexAdapter(exec: Exec = realExec): HarnessAdapter {
       return { argv, env: prep.env };
     },
 
-    buildAcpLaunch(role: ResolvedRole, prep: SessionPrep): AcpLaunch {
-      const configured = role.session_options?.acp?.command;
-      // Resolve once: both argv and permission-metadata provenance must describe
-      // the same artifact. A bare PATH fallback is launchable for compatibility,
-      // but is never authenticated for protected-MCP auto-approval.
-      const resolved = configured == null
-        ? codexAcpLaunchForResolution(bundledCodexAcp())
-        : undefined;
-      const argv = Array.isArray(configured)
-        ? [...configured]
-        : typeof configured === 'string'
-          ? ['sh', '-c', configured]
-          : resolved!.argv;
-      const initialMode = acpAgentMode(role);
-      return {
-        argv,
-        env: initialMode ? { ...prep.env, INITIAL_AGENT_MODE: initialMode } : prep.env,
-        ...(resolved?.permissionMetadataSource
-          ? { permissionMetadataSource: resolved.permissionMetadataSource } : {}),
-      };
+    async prepareAcpLegacy(input: LegacyAcpAttemptInput, context: LegacyAcpRuntimeContext) {
+      return this.acpLegacyAuthority!.prepare(input, context);
     },
 
-    // INITIAL_AGENT_MODE covers session/new in codex-acp; session/set_mode
-    // keeps resumed/loaded sessions and live status on the identical mode.
-    acpPermissionModeId(role: ResolvedRole): string | undefined {
-      return acpAgentMode(role);
-    },
+    acpLegacyAuthority: undefined,
 
     isolationPaths(role: ResolvedRole, _dirs: RoleDirs) {
       const codexHome = join(home(), '.codex');
@@ -532,6 +515,65 @@ export function makeCodexAdapter(exec: Exec = realExec): HarnessAdapter {
 
     exitPolicy: { cleanExitIsFresh: true, fastFailSecs: 20 },
   };
+  const acpResolutions = new WeakMap<object, AcpAgentResolution | null>();
+  const acpAuthority = new LegacyAcpPreparationAuthority(adapter, {
+    translate(input, context) {
+      if (input.harness !== 'codex' || input.adapterOptions.harness !== 'codex')
+        throw new Error('Codex ACP translation received another harness');
+      const configured = input.acpCommand;
+      const resolution = configured == null
+        ? resolveAuthenticatedBundledAcpAgent(CODEX_ACP_PACKAGE, 'codex-acp', 'codex-acp') : undefined;
+      const launch = resolution ? codexAcpLaunchForResolution(resolution) : undefined;
+      const argv = Array.isArray(configured) ? [...configured]
+        : typeof configured === 'string' ? ['sh', '-c', configured] : launch!.argv;
+      const modeId = input.nativePermissions.filesystemMode === 'read-only' ? 'read-only'
+        : input.nativePermissions.filesystemMode === 'danger-full-access' ? 'agent-full-access'
+          : input.nativePermissions.filesystemMode === 'workspace-write' ? 'agent'
+            : input.nativePermissions.approvalMode === 'never' ? 'agent-full-access' : 'agent';
+      const source = configured == null ? compiledProxyModule() : undefined;
+      const proxyModuleName = '.codex-app-server-proxy.mjs';
+      const proxyName = process.platform === 'win32'
+        ? '.codex-app-server-proxy.cmd' : '.codex-app-server-proxy';
+      const proxyModule = join(context.stateDir, proxyModuleName);
+      const proxyCommand = join(context.stateDir, proxyName);
+      const files = source && resolution?.bundled && resolution.manifestPath ? [
+        { name: proxyModuleName, contents: readFileSync(source, 'utf8'), mode: 0o600 },
+        { name: proxyName, contents: process.platform === 'win32'
+          ? `@echo off\r\n"${process.execPath.replaceAll('"', '""')}" "${proxyModule.replaceAll('"', '""')}" %*\r\n`
+          : `#!/bin/sh\nexec ${shellQuote(process.execPath)} ${shellQuote(proxyModule)} "$@"\n`, mode: 0o700 },
+      ] : [];
+      const filesystem = input.nativePermissions.filesystemMode === 'read-only' ? 'read-only'
+        : ['unrestricted', 'danger-full-access'].includes(input.nativePermissions.filesystemMode)
+          ? 'danger-full-access' : 'workspace-write';
+      const translation = {
+        argv,
+        env: { OURS_BIND_IDENTITY: input.identityName, INITIAL_AGENT_MODE: modeId,
+          ...(files.length ? {
+            CODEX_PATH: proxyCommand,
+            [CODEX_PROXY_APPROVAL_ENV]: input.nativePermissions.approvalMode,
+            [CODEX_PROXY_SANDBOX_ENV]: filesystem,
+            [CODEX_PROXY_MANIFEST_ENV]: resolution!.manifestPath!,
+          } : {}) }, modeId, ...(files.length ? { files } : {}),
+        ...(launch?.permissionMetadataSource ? {
+          permissionMetadataSource: launch.permissionMetadataSource,
+        } : {}),
+      };
+      acpResolutions.set(translation, resolution ?? null);
+      return translation;
+    },
+    async probe(translation) {
+      const resolution = acpResolutions.get(translation as object);
+      if (resolution === undefined) throw new Error('Codex ACP translation has no bound artifact probe');
+      if (resolution && (!resolution.bundled || !resolution.identity
+          || resolution.version !== BUNDLED_CODEX_ACP_VERSION))
+        throw new Error('Codex ACP bundled artifact is unavailable or version-skewed');
+      return { adapterId: 'codex-acp', adapterVersion: resolution ? BUNDLED_CODEX_ACP_VERSION : 'custom',
+        artifactDigest: `sha256:${createHash('sha256').update(JSON.stringify(
+          resolution?.identity ?? { customArgv: translation.argv })).digest('hex')}` };
+    },
+  });
+  Object.defineProperty(adapter, 'acpLegacyAuthority', { value: acpAuthority, enumerable: true });
+  return adapter;
 }
 
 // The adapter needs the state dir for briefing/worklog paths in launch prompts.
@@ -545,25 +587,4 @@ function roleStateDir(role: ResolvedRole): string {
 
 export const codexAdapter = makeCodexAdapter();
 registerAdapter(codexAdapter);
-registerBodyBrainAdapterDescriptor(Object.freeze({
-  schemaVersion: 1 as const, harnessId: 'codex' as const,
-  adapterId: 'codex-acp' as const, adapterVersion: BUNDLED_CODEX_ACP_VERSION,
-  prepare(role: ResolvedRole, prep: SessionPrep) {
-    if (role.harness !== 'codex') throw new Error('Codex BodyBrain descriptor cannot translate another harness');
-    const effort = (role.harness_options as CodexOptions | undefined)?.effort;
-    if (!role.model || !effort) throw new Error('Codex BodyBrain translation requires explicit model and effort');
-    const launch = codexAdapter.buildAcpLaunch!(role, prep);
-    const modeId = codexAdapter.acpPermissionModeId!(role);
-    return createAcpBodyBrainPreparedLaunch({
-      schemaVersion: 1, adapterId: 'codex-acp', adapterVersion: BUNDLED_CODEX_ACP_VERSION,
-      argv: launch.argv, env: launch.env,
-      translation: {
-        model: role.model, effort,
-        ...(modeId ? { modeId } : {}),
-        ...(launch.permissionMetadataSource
-          ? { permissionMetadataSource: launch.permissionMetadataSource } : {}),
-      },
-    });
-  },
-  createProvider: createAcpBodyBrainInjectedProvider,
-}));
+registerBodyBrainAdapterDescriptor(CODEX_BODY_BRAIN_DESCRIPTOR);

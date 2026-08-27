@@ -8,7 +8,12 @@ import {
   type ResolvedRole,
 } from './config.js';
 import { getAdapter } from './harness/registry.js';
-import type { AcpLaunch, Launch } from './harness/types.js';
+import type { Launch } from './harness/types.js';
+import {
+  authenticatePrepared, legacyAcpIntegrityDigest,
+  type AuthenticatedLegacyPreparedAcpAttempt, type LegacyAcpAttemptInput,
+  type LegacyAcpRuntimeContext,
+} from './harness/acp-attempt.js';
 import { Tmux } from './tmux.js';
 import {
   createMonitor, probeIdentityPresence,
@@ -46,6 +51,7 @@ import {
 import type { SpawnOpts } from './spawn.js';
 import { effectivePermissionMode } from './permissions.js';
 import { assertModelPinReachesChild, effectiveRoleModel, repinModelEnv } from './model-env.js';
+import { translatePortablePermissionCodes } from './harness/brain-adapter.js';
 import {
   archiveTempState, markTempSupervisorActive, requestedTempStopReason,
   type TempTerminationReason,
@@ -140,6 +146,21 @@ export function harnessChildEnv(
   const env = { ...(launchEnv ?? {}), ...managedFleetProxyEnv(role, stateDir) };
   assertModelPinReachesChild(role, env);
   return env;
+}
+
+function translateLegacyNative(
+  adapter: ReturnType<typeof getAdapter>, role: ResolvedRole, permissions: ResolvedRole['permissions'],
+): { approvalMode: string; filesystemMode: string; unattendedMode: string; exact: boolean } {
+  const translated = translatePortablePermissionCodes(
+    (role.harness === 'claude-code' ? 'claude-code' : 'codex'), permissions,
+  );
+  const effective = adapter.effectivePermissions?.(role);
+  const native = effective?.supported ? effective.native as Record<string, unknown> : {};
+  return {
+    approvalMode: String(native.approval ?? native.mode ?? translated.approvalMode),
+    filesystemMode: String(native.sandbox ?? translated.filesystemMode),
+    unattendedMode: translated.unattendedMode, exact: effective?.supported ? effective.exact : true,
+  };
 }
 
 /**
@@ -569,37 +590,78 @@ export async function runOnce(
   // spawn banner is a claim made before the process exists; this is the log line
   // that can be checked against the session afterwards.
   deps.log(`[${name}] model: ${effectiveRoleModel(role) ?? '(harness default)'}`);
+  const sidFile = join(dir, '.session-id');
+  const hadSessionId = existsSync(sidFile);
+  const sessionId = hadSessionId ? readFileSync(sidFile, 'utf8').trim() : randomUUID();
+  const bootedFile = join(dir, '.booted');
+  const exitFile = join(dir, '.exit-status');
+  const booted = existsSync(bootedFile);
+  const mode: 'fresh' | 'resume' = booted && adapter.supportsResume ? 'resume' : 'fresh';
+  const runCwd = role.cwd && existsSync(role.cwd) ? role.cwd : dir;
+  const sessionBackend = role.session ?? 'tmux';
+  let authenticatedAcp: AuthenticatedLegacyPreparedAcpAttempt | undefined;
+  let launch: Launch;
+  if (sessionBackend === 'acp') {
+    if (!adapter.prepareAcpLegacy || !adapter.acpLegacyAuthority)
+      throw new Error(`harness '${role.harness}' does not support the ACP session backend`);
+    const permissions = role.permissions ?? resolvePermissions(undefined, undefined);
+    const codes = translateLegacyNative(adapter, role, permissions);
+    const options = (role.harness_options ?? {}) as Record<string, unknown>;
+    const legacyHarness = role.harness === 'claude-code' ? 'claude-code' as const : 'codex' as const;
+    const projection = {
+      schemaVersion: 1 as const, roleName: role.name, harness: legacyHarness,
+      ...(role.model === undefined ? {} : { model: role.model }),
+      ...(typeof options.effort === 'string' ? { effort: options.effort } : {}),
+      identityName: role.identity, lifetime: temp ? 'temporary' as const : 'persistent' as const,
+      permissions, nativePermissions: codes,
+      ...(role.session_options?.acp?.command === undefined ? {} : {
+        acpCommand: role.session_options.acp.command,
+      }),
+      isolationRequested: role.isolation !== undefined,
+      scheduling: role.autocompact_pct === undefined ? {} : { autocompactPct: Math.round(role.autocompact_pct) },
+      adapterOptions: legacyHarness === 'codex' ? {
+        harness: 'codex' as const,
+        launcher: (options.launcher ?? 'auto') as 'auto' | 'ours-codex' | 'codex',
+        ...(typeof options.profile === 'string' ? { profile: options.profile } : {}),
+        search: options.search === true, addDirs: (options.add_dirs ?? []) as string[],
+        config: (options.config ?? {}) as Record<string, unknown>,
+      } : {
+        harness: 'claude-code' as const,
+        plugins: (options.plugins ?? {}) as Record<string, boolean>, memPalace: options.mem_palace !== false,
+        memPalaceMidSessionAutosave: options.mem_palace_midsession_autosave === true,
+        ...(options.mcp_servers === undefined ? {} : { mcpServers: options.mcp_servers as Record<string, unknown> }),
+        mcpServersOnly: options.mcp_servers_only === true,
+      },
+    };
+    const input: LegacyAcpAttemptInput = Object.freeze({
+      ...projection, integrityDigest: legacyAcpIntegrityDigest(projection),
+    });
+    const context: LegacyAcpRuntimeContext = Object.freeze({
+      stateDir: dir, runCwd, baseEnv: Object.freeze(harnessChildEnv(role, {}, dir)),
+      sessionMode: mode, sessionId,
+    });
+    const evidence = await adapter.prepareAcpLegacy(input, context);
+    authenticatedAcp = authenticatePrepared(adapter.acpLegacyAuthority, adapter, evidence, input, context);
+    if (!authenticatedAcp) throw new Error('ACP attempt preparation evidence was not authenticated');
+    launch = { argv: [...authenticatedAcp.argv], env: { ...authenticatedAcp.env } };
+  } else {
+    const prep = await adapter.prepareSession(role, { stateDir: dir, runCwd });
+    launch = adapter.buildLaunch(role, mode, { sessionId }, prep);
+  }
+
+  // ACP's shared authority has now completed all closed validation and byte construction.
+  // Only after that gate may the runner create or mutate its pre-existing body lifecycle
+  // records. These files are not ACP launch evidence and are never used to bless it.
   mkdirSync(dir, { recursive: true });
   const rotation = rotateWorklog(join(dir, 'WORKLOG.md'), role.worklog);
   if (rotation.deferred)
     deps.log(`[${name}] worklog rotation deferred: concurrent modification detected`);
   else if (rotation.rotated)
     deps.log(`[${name}] worklog rotated: ${rotation.beforeBytes} -> ${rotation.afterBytes} bytes`);
-
-  const sidFile = join(dir, '.session-id');
-  if (!existsSync(sidFile)) writeFileSync(sidFile, randomUUID() + '\n');
-  const sessionId = readFileSync(sidFile, 'utf8').trim();
-  const bootedFile = join(dir, '.booted');
-  const exitFile = join(dir, '.exit-status');
-  const booted = existsSync(bootedFile);
-  const mode: 'fresh' | 'resume' = booted && adapter.supportsResume ? 'resume' : 'fresh';
-  // Stamp EVERY attempt, not just the first. `.booted` used to be written only
-  // on the fresh path, so after a restart — including one the supervisor never
-  // saw, like an OOM-kill — its mtime still read the original boot and any
-  // health check reading it reported "no restarts". The existence test above
-  // already ran, so rewriting cannot change the fresh/resume decision.
+  if (!hadSessionId) writeFileSync(sidFile, `${sessionId}\n`);
+  // Stamp EVERY attempt, not just the first. The existence test already ran,
+  // so rewriting cannot change the fresh/resume decision.
   writeFileSync(bootedFile, `${new Date(deps.now()).toISOString()} ${mode}\n`);
-
-  const runCwd = role.cwd && existsSync(role.cwd) ? role.cwd : dir;
-  const prep = await adapter.prepareSession(role, { stateDir: dir, runCwd });
-  const sessionBackend = role.session ?? 'tmux';
-  let launch = sessionBackend === 'acp'
-    ? (() => {
-        if (!adapter.buildAcpLaunch)
-          throw new Error(`harness '${role.harness}' does not support the ACP session backend`);
-        return adapter.buildAcpLaunch(role, prep);
-      })()
-    : adapter.buildLaunch(role, mode, { sessionId }, prep);
 
   // Isolation is additive: only roles that declare `isolation:` are wrapped. The
   // env prefix + exit capture in buildPaneCommand stay host-side.
@@ -718,19 +780,19 @@ export async function runOnce(
       stateDir: dir,
       mode,
       permissions: perms,
-      modeId: adapter.acpPermissionModeId?.(role),
+      modeId: authenticatedAcp?.modeId,
       // The role's declared MCP servers, and the bundled agent's `_meta`
       // vocabulary for the options it takes no flag for. Both come from the
       // ADAPTER and from `prep`: the ACP launch cannot carry `prep.argv`, so this
       // is the route by which harness_options that used to be silently dropped
       // for an ACP role actually reach the session.
-      mcpServers: adapter.acpMcpServers?.(role),
-      sessionMeta: adapter.acpSessionMeta?.(role, prep),
+      mcpServers: authenticatedAcp?.mcpServers ? [...authenticatedAcp.mcpServers] : undefined,
+      sessionMeta: authenticatedAcp?.sessionMeta,
       permissionMode: effectivePermissionMode(role),
       // Provenance travels with the exact ACP launch. Keeping it out of a
       // role-only adapter hook prevents a PATH fallback or resolver skew from
       // claiming metadata trust for an argv it did not authenticate.
-      permissionMetadataSource: (launch as AcpLaunch).permissionMetadataSource,
+      permissionMetadataSource: authenticatedAcp?.permissionMetadataSource,
       scrubObsoleteOursAutostart: true,
       log: deps.log,
     });
