@@ -173,6 +173,21 @@ export interface AgentPlanResolutionInput {
   adapter: AdapterValidationRecord;
 }
 
+export type AgentPlanCompositionInput = Omit<AgentPlanResolutionInput,
+  'snapshot' | 'principal' | 'operation' | 'authorizationRevision' | 'generation'
+  | 'evaluatedAt' | 'adapter'>;
+export interface TrustedAgentPlanContext {
+  snapshot: ConfigResourceSnapshot;
+  principal: RequestPrincipal;
+  operation: PlanOperation;
+  authorizationRevision: string;
+  generation: number;
+  evaluatedAt: number;
+}
+export interface AgentPlanAdapterResolver {
+  resolve(brain: Readonly<BrainSpec>, permissions: Readonly<PermissionSpec>): AdapterValidationRecord;
+}
+
 export interface ValueProvenance {
   layer: ResolutionLayer;
   sourceType: 'resource' | 'runtime_operation' | 'creator_plan';
@@ -960,7 +975,9 @@ export function computePermissionsDigest(permissions: PermissionSpec): string { 
 export function computeOperationDigest(operation: PlanOperation): string { return hash(operation); }
 
 function resolveAgentPlanAuthorized(
-  rawInput: AgentPlanResolutionInput, authority?: AgentPlanEvidenceAuthority,
+  rawInput: AgentPlanResolutionInput | (AgentPlanCompositionInput & TrustedAgentPlanContext),
+  authority?: AgentPlanEvidenceAuthority,
+  adapterResolver?: AgentPlanAdapterResolver,
 ): AgentPlan {
   const creatorRecord = rawInput.creatorEvidence
     ? authority?.authenticateCreator(rawInput.creatorEvidence) : undefined;
@@ -1101,7 +1118,11 @@ function resolveAgentPlanAuthorized(
     };
   }
 
-  const adapter = validateAdapter(input.adapter, resolvedBrain, permissions);
+  const adapter = validateAdapter(
+    adapterResolver ? adapterResolver.resolve(deepFreeze(clone(resolvedBrain)), deepFreeze(clone(permissions)))
+      : input.adapter,
+    resolvedBrain, permissions,
+  );
   const role = resolveRole(input, selected.role);
   if (input.membership) {
     object(input.membership, 'membership', ['roomId', 'taskId', 'slot', 'ordinal', 'memberId']);
@@ -1159,4 +1180,23 @@ export function createAgentPlanResolver(
   const authenticateOwnerDelegation = authority.authenticateOwnerDelegation.bind(authority);
   const bound: AgentPlanEvidenceAuthority = { authenticateCreator, authenticateOwnerDelegation };
   return input => resolveAgentPlanAuthorized(input, bound);
+}
+
+/** Compose from an authority-owned context; request data cannot supply graph, actor, generation, or adapter. */
+export function createAuthenticatedAgentPlanComposer(
+  authority: AgentPlanEvidenceAuthority,
+  context: TrustedAgentPlanContext,
+  adapterResolver: AgentPlanAdapterResolver,
+): (input: AgentPlanCompositionInput) => AgentPlan {
+  if (!adapterResolver || typeof adapterResolver.resolve !== 'function')
+    throw new AgentPlanResolutionError('AgentPlan adapter resolver is invalid');
+  if (!authority || typeof authority.authenticateCreator !== 'function'
+      || typeof authority.authenticateOwnerDelegation !== 'function')
+    throw new AgentPlanResolutionError('AgentPlan evidence authority is invalid');
+  const bound: AgentPlanEvidenceAuthority = {
+    authenticateCreator: authority.authenticateCreator.bind(authority),
+    authenticateOwnerDelegation: authority.authenticateOwnerDelegation.bind(authority),
+  };
+  const boundAdapter = { resolve: adapterResolver.resolve.bind(adapterResolver) };
+  return input => resolveAgentPlanAuthorized({ ...input, ...context }, bound, boundAdapter);
 }
