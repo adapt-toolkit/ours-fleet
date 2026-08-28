@@ -13,6 +13,8 @@ import { computeBrainAdapterPolicyDigest } from '../src/harness/brain-adapter.js
 import type { BrainAdapterPolicy, TrustedAdapterEnforcementBindings,
   VerifiedAdapterEnforcementEvidence } from '../src/harness/brain-adapter.js';
 import { readAgentSupervisorHandoff } from '../src/agent-supervisor-handoff.js';
+import { createInternalTempAgentPrelaunchAuthority } from '../src/temp-agent-supervisor-rehydration.js';
+import { AgentInstallationService } from '../src/agent-installation.js';
 
 const bindings = (): IdentityActionBindings => ({
   actionKey: `sha256:${'1'.repeat(64)}`, actionId: 'action-1', agentId: 'agent-1',
@@ -212,7 +214,7 @@ describe('permanent Agent creation composition root', () => {
 });
 
 describe('real production Agent creation assembly', () => {
-  function setup(presentInitially = false) {
+  function setup(presentInitially = false, cidSequence?: string[]) {
     const root = mkdtempSync(join(tmpdir(), 'production-agent-root-'));
     tempRoots.push(root);
     mkdirSync(join(root, 'fleet.conf.d', 'roles.d'), { recursive: true });
@@ -238,16 +240,19 @@ describe('real production Agent creation assembly', () => {
           sha256: `sha256:${'b'.repeat(64)}` } } },
       enforcement: { approval: 'native_adapter', filesystem: 'native_adapter', unattended: 'body_controller' } };
     const present = new Set(presentInitially ? ['agent-1'] : []); const cid = 'A'.repeat(64); let creates = 0;
-    const identityCid = (name: string) => name === 'agent-1' ? cid : 'B'.repeat(64);
+    let cidRead = 0;
+    const identityCid = (name: string) => cidSequence?.[Math.min(cidRead++, cidSequence.length - 1)]
+      ?? (name === 'agent-1' ? cid : 'B'.repeat(64));
     const provisioner = { exists: async (name: string) => present.has(name),
       inspect: async (name: string) => present.has(name)
         ? { state: 'present' as const, cid: identityCid(name) } : { state: 'absent' as const },
       create: async (name: string) => { creates++; present.add(name);
         return { state: 'created_here' as const, cid: identityCid(name) }; } };
-    const make = () => createProductionAgentCreationCompositionRoot({ trustedStateRoot: join(root, 'trusted'),
+    const make = (faults: Record<string, unknown> = {}) => createProductionAgentCreationCompositionRoot({ trustedStateRoot: join(root, 'trusted'),
       identityProvisioner: provisioner, identityProfile: {},
       policies: { resolvePolicy: () => ({ policy, enforcementEvidence: evidence }) },
-      adapterAuthority: { authenticateAdapterEvidence: value => value === evidence ? trusted : undefined }, now: () => 2 });
+      adapterAuthority: { authenticateAdapterEvidence: value => value === evidence ? trusted : undefined }, now: () => 2,
+      ...faults });
     const context = { operation: Object.freeze({ id: 'action-1', type: 'agent.create',
       resourceScope: 'agents/agent-1' }), authorizationRevision: 'auth-1', snapshot,
       snapshotRevision: 'graph-1', issuedAt: 1 };
@@ -279,6 +284,118 @@ describe('real production Agent creation assembly', () => {
       source: secondSource }, 'action-2');
     expect(second).toMatchObject({ state: 'complete', locator: { generation: 1 } });
     expect(f.creates()).toBe(2);
+  });
+
+  it('reserves a temporary plan without identity effects and rehydrates only opaque prelaunch data', async () => {
+    const f = setup(); const assembly = f.make(); const callerEvidence = assembly.ingress.direct(f.context);
+    const source = { ...f.source, lifecycle: 'temporary' as const,
+      identity: { name: 'agent-1', ownership: 'create_temporary' as const } };
+    const installed = await assembly.temporary.reserve({ callerEvidence, source }, 'action-1');
+    expect(installed).toEqual({ agentId: 'agent-1', generation: 1, lifetime: 'temporary', completion: 'deferred' });
+    expect(f.creates()).toBe(0);
+    const rehydrator = createInternalTempAgentPrelaunchAuthority(join(f.root, 'trusted'));
+    const seam = rehydrator.rehydrate('agent-1');
+    expect(seam).toMatchObject({ agentId: 'agent-1', generation: 1 });
+    expect(Object.keys(seam).sort()).toEqual(['agentId', 'generation']);
+    expect(rehydrator.authenticate(seam)).toMatchObject({ lifetime: 'temporary', actionId: 'action-1' });
+    expect(() => readAgentSupervisorHandoff(join(f.root, 'trusted'), 'agent-1')).toThrow();
+    const before = readFileSync(join(f.root, 'trusted', 'agents', Buffer.from('agent-1').toString('base64url'),
+      'temp-active.json'), 'utf8');
+    const retryCaller = assembly.ingress.direct(f.context);
+    await expect(assembly.temporary.reserve({ callerEvidence: retryCaller, source }, 'action-1'))
+      .resolves.toEqual(installed);
+    expect(readFileSync(join(f.root, 'trusted', 'agents', Buffer.from('agent-1').toString('base64url'),
+      'temp-active.json'), 'utf8')).toBe(before);
+    expect(f.creates()).toBe(0);
+  });
+
+  it.each(['role', 'brain', 'identity', 'context', 'action'] as const)(
+    'rejects a conflicting temporary replay with changed %s binding and preserves exact handoff', async changed => {
+      const f = setup(); const assembly = f.make();
+      const source = { ...f.source, lifecycle: 'temporary' as const,
+        identity: { name: 'agent-1', ownership: 'create_temporary' as const } };
+      const firstCaller = assembly.ingress.direct(f.context);
+      await assembly.temporary.reserve({ callerEvidence: firstCaller, source }, 'action-1');
+      const path = join(f.root, 'trusted', 'agents', Buffer.from('agent-1').toString('base64url'),
+        'temp-active.json'); const before = readFileSync(path, 'utf8');
+      const context = changed === 'context' || changed === 'action' ? { ...f.context,
+        operation: Object.freeze({ ...f.context.operation, id: changed === 'action' ? 'action-2' : 'action-1',
+          resourceScope: changed === 'context' ? 'agents/other' : f.context.operation.resourceScope }) } : f.context;
+      const changedSource = changed === 'role' ? { ...source, role: 'Other' }
+        : changed === 'brain' ? { ...source, brain: { ...source.brain, model: 'other-model' } }
+          : changed === 'identity' ? { ...source, identity: { ...source.identity, name: 'other-name' } }
+            : source;
+      await expect(assembly.temporary.reserve({ callerEvidence: assembly.ingress.direct(context),
+        source: changedSource }, changed === 'action' ? 'action-2' : 'action-1')).rejects.toThrow();
+      expect(readFileSync(path, 'utf8')).toBe(before); expect(f.creates()).toBe(0);
+    });
+
+  it('installs an existing permanent identity through real inspection and completion authorities', async () => {
+    const f = setup(true); const assembly = f.make(); const installer = new AgentInstallationService(assembly);
+    const result = await installer.installPermanent({ context: f.context, actionId: 'action-1',
+      composition: { source: { ...f.source, identity: { name: 'agent-1', ownership: 'existing' as const } } } });
+    expect(result).toMatchObject({ state: 'complete', identityAcquisition: 'external', identityName: 'agent-1' });
+    expect(f.creates()).toBe(0);
+    expect(readAgentSupervisorHandoff(join(f.root, 'trusted'), 'agent-1')).toMatchObject({ lifetime: 'persistent' });
+    expect(() => createInternalTempAgentPrelaunchAuthority(join(f.root, 'trusted')).rehydrate('agent-1')).toThrow();
+    const before = readFileSync(join(f.root, 'trusted', 'agents', Buffer.from('agent-1').toString('base64url'), 'active.json'), 'utf8');
+    await expect(installer.installPermanent({ context: f.context, actionId: 'action-1',
+      composition: { source: { ...f.source, identity: { name: 'agent-1', ownership: 'existing' as const } } } }))
+      .resolves.toMatchObject({ state: 'complete' });
+    expect(readFileSync(join(f.root, 'trusted', 'agents', Buffer.from('agent-1').toString('base64url'), 'active.json'), 'utf8')).toBe(before);
+  });
+
+  it.each(['role', 'brain', 'identity', 'context'] as const)(
+    'rejects permanent replay authority confusion with changed %s binding', async changed => {
+      const f = setup(true); const installer = new AgentInstallationService(f.make());
+      const source = { ...f.source, identity: { name: 'agent-1', ownership: 'existing' as const } };
+      await installer.installPermanent({ context: f.context, actionId: 'action-1', composition: { source } });
+      const path = join(f.root, 'trusted', 'agents', Buffer.from('agent-1').toString('base64url'), 'active.json');
+      const before = readFileSync(path, 'utf8');
+      const context = changed === 'context' ? { ...f.context, authorizationRevision: 'auth-2' } : f.context;
+      const changedSource = changed === 'role' ? { ...source, role: 'Other' }
+        : changed === 'brain' ? { ...source, brain: { ...source.brain, model: 'other-model' } }
+          : changed === 'identity' ? { ...source, identity: { ...source.identity, name: 'other-name' } }
+            : source;
+      await expect(installer.installPermanent({ context, actionId: 'action-1',
+        composition: { source: changedSource } })).rejects.toThrow(/invalid_request/u);
+      expect(readFileSync(path, 'utf8')).toBe(before); expect(f.creates()).toBe(0);
+    });
+
+  it.each([{ name: 'missing identity', setup: () => setup(false) },
+    { name: 'CID substitution', setup: () => setup(true, ['A'.repeat(64), 'B'.repeat(64)]) }])(
+    'fails closed for $name without creating an identity or publishing active', async entry => {
+      const f = entry.setup(); const installer = new AgentInstallationService(f.make());
+      const result = await installer.installPermanent({ context: f.context, actionId: 'action-1',
+        composition: { source: { ...f.source, identity: { name: 'agent-1', ownership: 'existing' as const } } } });
+      expect(result.state).not.toBe('complete'); expect(f.creates()).toBe(0);
+      expect(() => readAgentSupervisorHandoff(join(f.root, 'trusted'), 'agent-1')).toThrow();
+    });
+
+  it.each(['creation', 'handoff'] as const)('recovers exact installer replay after %s crash without duplicate identity effect', async boundary => {
+    const f = setup(true); let crash = true;
+    const assembly = f.make(boundary === 'creation' ? { creationFaults: { afterCreateAuthorized: () => {
+      if (crash) { crash = false; throw new Error('crash'); }
+    } } } : { handoffFaults: { beforeReplace: () => { if (crash) { crash = false; throw new Error('crash'); } } } });
+    const installer = new AgentInstallationService(assembly); const input = { context: f.context, actionId: 'action-1',
+      composition: { source: { ...f.source, identity: { name: 'agent-1', ownership: 'existing' as const } } } };
+    await expect(installer.installPermanent(input)).rejects.toThrow();
+    expect(f.creates()).toBe(0); expect(() => readAgentSupervisorHandoff(join(f.root, 'trusted'), 'agent-1')).toThrow();
+    await expect(installer.installPermanent(input)).resolves.toMatchObject({ state: 'complete', identityAcquisition: 'external' });
+    expect(f.creates()).toBe(0); expect(readAgentSupervisorHandoff(join(f.root, 'trusted'), 'agent-1')).toMatchObject({ generation: 1 });
+  });
+
+  it.each(['corrupt active', 'partial action index'] as const)('fails closed on %s without identity creation or overwrite', async corruption => {
+    const f = setup(true); const agentRoot = join(f.root, 'trusted', 'agents', Buffer.from('agent-1').toString('base64url'));
+    mkdirSync(agentRoot, { recursive: true, mode: 0o700 }); let corruptPath: string;
+    if (corruption === 'corrupt active') corruptPath = join(agentRoot, 'active.json');
+    else { const actions = join(agentRoot, 'actions'); mkdirSync(actions, { mode: 0o700 });
+      corruptPath = join(actions, `${Buffer.from('action-1').toString('base64url')}.json`); }
+    writeFileSync(corruptPath, '{}\n', { mode: 0o600 }); const installer = new AgentInstallationService(f.make());
+    await expect(installer.installPermanent({ context: f.context, actionId: 'action-1', composition: {
+      source: { ...f.source, identity: { name: 'agent-1', ownership: 'existing' as const } } } })).rejects.toThrow();
+    expect(f.creates()).toBe(0); expect(readFileSync(corruptPath, 'utf8')).toBe('{}\n');
+    if (corruption === 'partial action index') expect(existsSync(join(agentRoot, 'active.json'))).toBe(false);
   });
 
   it('treats restart presence as terminal ambiguous and managed ingress without creator proof fails closed', async () => {

@@ -45,6 +45,10 @@ export type { AgentStartLocator, AgentStartLocatorExpectedBindings } from './age
 export { createProductionAgentSupervisorRehydration } from './agent-supervisor-rehydration.js';
 export type { PermanentAgentSupervisorSeam, ProductionAgentSupervisorRehydration,
   ProductionAgentSupervisorRehydrationDeps } from './agent-supervisor-rehydration.js';
+export { AgentInstallationService } from './agent-installation.js';
+export { createProductionTempAgentSupervisorRehydration } from './temp-agent-supervisor-rehydration.js';
+export type { TempAgentPrelaunchReservation,
+  ProductionTempAgentSupervisorRehydration } from './temp-agent-supervisor-rehydration.js';
 export { RoleCommandService, RoleLifecycleService } from './application/role-command-service.js';
 export { StructuredLogService } from './application/log-service.js';
 export { roleCapabilities } from './application/capabilities.js';

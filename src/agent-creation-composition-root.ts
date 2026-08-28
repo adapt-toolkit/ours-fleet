@@ -5,7 +5,7 @@ import {
   type VerifiedCreationCallerEvidence, type VerifiedTransactionConsumerEvidence,
 } from './agent-composition-service.js';
 import {
-  AgentCreationTransaction, type AgentCreationResult,
+  AgentCreationTransaction, type AgentCreationFaults, type AgentCreationResult,
 } from './agent-creation-transaction.js';
 import {
   AgentStartLocatorPublisher, type AgentStartLocator,
@@ -16,7 +16,9 @@ import type { AgentPlanEvidenceAuthority, PlanOperation } from './agent-plan.js'
 import type { BrainAdapterEvidenceAuthority } from './harness/brain-adapter.js';
 import type { ConfigResourceSnapshot } from './config-resource-loader.js';
 import type { IdentityProvisioner, IdentityProvisionProfile } from './creation.js';
-import { AgentSupervisorHandoffPublisher } from './agent-supervisor-handoff.js';
+import { AgentSupervisorHandoffPublisher, type AgentSupervisorHandoffFaults } from './agent-supervisor-handoff.js';
+import { TempAgentPlanReservationRoot } from './temp-agent-plan-reservation.js';
+import { TempAgentSupervisorHandoffPublisher } from './temp-agent-supervisor-handoff.js';
 
 export interface PermanentAgentCreationResult extends AgentCreationResult {
   locator?: Readonly<AgentStartLocator>;
@@ -85,9 +87,14 @@ export interface ProductionAgentCreationDeps {
   adapterAuthority: BrainAdapterEvidenceAuthority;
   planEvidence?: AgentPlanEvidenceAuthority;
   now?: () => number;
+  creationFaults?: AgentCreationFaults;
+  handoffFaults?: AgentSupervisorHandoffFaults;
 }
 export interface ProductionAgentCreationAssembly {
   root: AgentCreationCompositionRoot;
+  temporary: Readonly<{ reserve(request: AgentCompositionRequest, actionId: string): Promise<Readonly<{
+    agentId: string; generation: number; lifetime: 'temporary'; completion: 'deferred';
+  }>> }>;
   ingress: ProductionAgentCreationIngress;
 }
 
@@ -139,9 +146,45 @@ export function createProductionAgentCreationCompositionRoot(
   const consumer = composition.issueTransactionConsumer(transactionEvidence);
   const generationsAuthority = new DurableAgentGenerationAuthority(deps.trustedStateRoot);
   const identity = new AgentProductionIdentityAuthority(deps.identityProvisioner, deps.identityProfile);
-  const transaction = new AgentCreationTransaction(consumer, generationsAuthority, identity, identity);
+  const transaction = new AgentCreationTransaction(consumer, generationsAuthority, identity, identity,
+    deps.creationFaults);
   const root = new AgentCreationCompositionRoot(composition, transaction, undefined,
-    new AgentSupervisorHandoffPublisher(deps.trustedStateRoot, transaction));
+    new AgentSupervisorHandoffPublisher(deps.trustedStateRoot, transaction, deps.handoffFaults));
+  const temporaryReservations = new TempAgentPlanReservationRoot(composition, consumer, generationsAuthority);
+  const temporaryHandoffs = new TempAgentSupervisorHandoffPublisher(deps.trustedStateRoot, temporaryReservations);
+  type TempStatus = Readonly<{ agentId: string; generation: number;
+    lifetime: 'temporary'; completion: 'deferred' }>;
+  const installedTemporary = new Map<string, {
+    binding: string; creatorEvidence?: unknown; ownerDelegationEvidence?: unknown;
+    evidence?: Awaited<ReturnType<TempAgentPlanReservationRoot['reserve']>>; status?: TempStatus;
+  }>();
+  const temporary = Object.freeze({ reserve: async (request: AgentCompositionRequest, actionId: string) => {
+    const source = request?.source;
+    const context = request && typeof request === 'object'
+      ? contexts.get(request.callerEvidence as object) : undefined;
+    if (!source || !context) throw new AgentCompositionError('unauthenticated_caller');
+    const key = `${source.agentId}\0${actionId}`;
+    const { callerEvidence: _callerEvidence, creatorEvidence, ownerDelegationEvidence, ...plainRequest } = request;
+    const binding = canonicalAdmission({ context, request: plainRequest, actionId });
+    let admission = installedTemporary.get(key);
+    if (admission) {
+      if (admission.binding !== binding || admission.creatorEvidence !== creatorEvidence
+          || admission.ownerDelegationEvidence !== ownerDelegationEvidence)
+        throw new AgentCompositionError('invalid_request');
+    } else {
+      admission = { binding, creatorEvidence, ownerDelegationEvidence };
+      installedTemporary.set(key, admission);
+    }
+    try { admission.evidence ??= await temporaryReservations.reserve(request, actionId); }
+    catch (error) {
+      if (error instanceof AgentCompositionError) installedTemporary.delete(key);
+      throw error;
+    }
+    const handoff = await temporaryHandoffs.publish(admission.evidence);
+    const status = admission.status ?? Object.freeze({ agentId: handoff.agentId, generation: handoff.generation,
+      lifetime: 'temporary' as const, completion: 'deferred' as const });
+    admission.status = status; return status;
+  } });
   const issue = (principal: Readonly<{ id: string; kind: 'system' | 'agent' }>,
     context: ProductionIngressContext): VerifiedCreationCallerEvidence => {
     const owned = ownIngress(context);
@@ -149,9 +192,31 @@ export function createProductionAgentCreationCompositionRoot(
     contexts.set(evidence as object, Object.freeze({ principal: Object.freeze({ ...principal }), ...owned }));
     return evidence;
   };
-  return Object.freeze({ root, ingress: Object.freeze({
+  return Object.freeze({ root, temporary, ingress: Object.freeze({
     direct: (context: ProductionIngressContext) => issue({ id: 'system', kind: 'system' }, context),
     managed: (callerAgentId: string, context: ProductionIngressContext) =>
       issue({ id: callerAgentId, kind: 'agent' }, context),
   }) });
+}
+
+function canonicalAdmission(value: unknown): string {
+  let nodes = 0;
+  const visit = (current: unknown): string => {
+    if (++nodes > 16_384) throw new AgentCompositionError('invalid_request');
+    if (current === null || typeof current === 'string' || typeof current === 'boolean'
+        || typeof current === 'number' && Number.isFinite(current)) return JSON.stringify(current);
+    if (!current || typeof current !== 'object') throw new AgentCompositionError('invalid_request');
+    if (!Array.isArray(current) && ![Object.prototype, null].includes(Object.getPrototypeOf(current)))
+      throw new AgentCompositionError('invalid_request');
+    const keys = Reflect.ownKeys(current);
+    if (keys.some(key => typeof key !== 'string')) throw new AgentCompositionError('invalid_request');
+    if (Array.isArray(current)) return `[${current.map(item => visit(item)).join(',')}]`;
+    return `{${(keys as string[]).sort().map(key => {
+      const descriptor = Object.getOwnPropertyDescriptor(current, key);
+      if (!descriptor?.enumerable || descriptor.get || descriptor.set || descriptor.value === undefined)
+        throw new AgentCompositionError('invalid_request');
+      return `${JSON.stringify(key)}:${visit(descriptor.value)}`;
+    }).join(',')}}`;
+  };
+  return visit(value);
 }

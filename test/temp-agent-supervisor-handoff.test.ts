@@ -1,0 +1,46 @@
+import {createHash}from'node:crypto';import {chmodSync,existsSync,lstatSync,mkdirSync,mkdtempSync,readFileSync,readdirSync,renameSync,rmSync,symlinkSync,unlinkSync,writeFileSync} from 'node:fs';
+import {tmpdir} from 'node:os';import{join}from'node:path';import{afterEach,describe,expect,it}from'vitest';
+import{TempAgentSupervisorHandoffPublisher,readTempAgentSupervisorHandoff}from'../src/temp-agent-supervisor-handoff.js';
+import{runtimeCanonical}from'../src/agent-runtime-record.js';
+const roots:string[]=[];afterEach(()=>roots.splice(0).forEach(root=>rmSync(root,{recursive:true,force:true})));
+function fixture(root=mkdtempSync(join(tmpdir(),'temp-handoff-')),generation=1,actionId='x'){if(!roots.includes(root))roots.push(root);const agentRoot=join(root,'agents',Buffer.from('a').toString('base64url'));
+  mkdirSync(agentRoot,{recursive:true,mode:0o700});const evidence={};const record={agentId:'a',actionId:'x',generation:1,
+    planDigest:`sha256:${String(generation).repeat(64).slice(0,64)}`,snapshotDigest:`sha256:${'2'.repeat(64)}`,reservationDigest:`sha256:${createHash('sha256').update(actionId).digest('hex')}`,
+    canonicalDir:join(agentRoot,`candidate-${actionId}`),planBytesDigest:`sha256:${'4'.repeat(64)}`};record.actionId=actionId;record.generation=generation;const prepared={authorizationRevision:'auth'};
+  return{root,agentRoot,evidence,authority:{authenticate:(value:unknown)=>value===evidence?{record,prepared}:undefined}};}
+function tree(path:string):unknown{if(!existsSync(path))return null;const stat=lstatSync(path,{bigint:true});if(!stat.isDirectory())return{mode:Number(stat.mode),size:String(stat.size),mtimeNs:String(stat.mtimeNs),digest:createHash('sha256').update(readFileSync(path)).digest('hex')};
+  return{mode:Number(stat.mode),mtimeNs:String(stat.mtimeNs),children:Object.fromEntries(readdirSync(path).sort().map(n=>[n,tree(join(path,n))]))};}
+describe('temporary supervisor handoff',()=>{
+  it('rejects raw plan, reservation, and handoff-shaped objects',async()=>{const f=fixture();for(const raw of[{},f.authority.authenticate(f.evidence),{agentId:'a',lifetime:'temporary'}])await expect(new TempAgentSupervisorHandoffPublisher(f.root,f.authority as never).publish(raw as never)).rejects.toMatchObject({code:'invalid_reservation'});});
+  it('publishes and securely reads the separate temporary schema',async()=>{const f=fixture();const value=await new TempAgentSupervisorHandoffPublisher(f.root,f.authority as never).publish(f.evidence as never);
+    expect(readTempAgentSupervisorHandoff(f.root,'a')).toEqual(value);expect(value.lifetime).toBe('temporary');});
+  it('cleans temp bytes and leaves active absent on file fsync failure',async()=>{const f=fixture();await expect(new TempAgentSupervisorHandoffPublisher(f.root,f.authority as never,
+    {fsyncFile:()=>{throw new Error('crash');}}).publish(f.evidence as never)).rejects.toThrow();expect(existsSync(join(f.agentRoot,'temp-active.json'))).toBe(false);
+    expect(readdirSync(f.agentRoot).filter(n=>n.endsWith('.tmp'))).toEqual([]);});
+  it('never writes the permanent active filename',async()=>{const f=fixture();await new TempAgentSupervisorHandoffPublisher(f.root,f.authority as never).publish(f.evidence as never);
+    expect(existsSync(join(f.agentRoot,'active.json'))).toBe(false);expect(readFileSync(join(f.agentRoot,'temp-active.json'),'utf8')).toContain('temporary');});
+  it.each(['symlink','mode','canonical-extra','truncation','substitution','before-open-race']as const)('rejects %s without reader mutation',async attack=>{const f=fixture();await new TempAgentSupervisorHandoffPublisher(f.root,f.authority as never).publish(f.evidence as never);
+    const path=join(f.agentRoot,'temp-active.json'),original=readFileSync(path);let raced:unknown;let faults={};
+    if(attack==='symlink'){const target=join(f.root,'foreign');writeFileSync(target,original,{mode:0o600});unlinkSync(path);symlinkSync(target,path);}
+    else if(attack==='mode')chmodSync(path,0o644);else if(attack==='canonical-extra'){const v=JSON.parse(original.toString());v.extra=true;writeFileSync(path,`${runtimeCanonical(v)}\n`,{mode:0o600});}
+    else if(attack==='truncation')writeFileSync(path,original.subarray(0,10),{mode:0o600});else if(attack==='substitution'){const v=JSON.parse(original.toString());v.identityLifecycle='daemon_owned';const{handoffDigest:_,...u}=v;v.handoffDigest=`sha256:${createHash('sha256').update(runtimeCanonical(u)).digest('hex')}`;writeFileSync(path,`${runtimeCanonical(v)}\n`,{mode:0o600});}
+    else{const replacement=join(f.root,'replacement');writeFileSync(replacement,original,{mode:0o600});faults={beforeSecureOpen:(opened:string)=>{if(opened===path){renameSync(replacement,path);raced=tree(f.root);}}};}
+    const before=tree(f.root);expect(()=>readTempAgentSupervisorHandoff(f.root,'a',faults)).toThrow();expect(tree(f.root)).toEqual(attack==='before-open-race'?raced:before);
+  });
+  it('accepts identical and exact N+1 while rejecting rollback and concurrent peer',async()=>{const one=fixture();const publisher=new TempAgentSupervisorHandoffPublisher(one.root,one.authority as never);const first=await publisher.publish(one.evidence as never);expect(await publisher.publish(one.evidence as never)).toEqual(first);
+    const left=fixture(one.root,2,'left'),right=fixture(one.root,2,'right');const settled=await Promise.allSettled([new TempAgentSupervisorHandoffPublisher(one.root,left.authority as never).publish(left.evidence as never),new TempAgentSupervisorHandoffPublisher(one.root,right.authority as never).publish(right.evidence as never)]);
+    expect(settled.filter(v=>v.status==='fulfilled')).toHaveLength(1);expect(settled.filter(v=>v.status==='rejected')).toHaveLength(1);
+    await expect(publisher.publish(one.evidence as never)).rejects.toMatchObject({code:'generation_conflict'});
+  });
+  it('post-replace and directory-fsync crashes leave a complete readable record',async()=>{const f=fixture();await expect(new TempAgentSupervisorHandoffPublisher(f.root,f.authority as never,{afterReplace:()=>{throw new Error('crash');}}).publish(f.evidence as never)).rejects.toThrow();expect(readTempAgentSupervisorHandoff(f.root,'a')).toMatchObject({generation:1});
+    const two=fixture(f.root,2,'two');await expect(new TempAgentSupervisorHandoffPublisher(f.root,two.authority as never,{fsyncDirectory:()=>{throw new Error('crash');}}).publish(two.evidence as never)).rejects.toThrow();expect(readTempAgentSupervisorHandoff(f.root,'a')).toMatchObject({generation:2});
+  });
+  it('file-fsync and before-replace failures preserve an existing prior and remove temp residue',async()=>{for(const fault of['fsyncFile','beforeReplace']as const){const f=fixture();const first=await new TempAgentSupervisorHandoffPublisher(f.root,f.authority as never).publish(f.evidence as never);const two=fixture(f.root,2,`two-${fault}`);
+    await expect(new TempAgentSupervisorHandoffPublisher(f.root,two.authority as never,{[fault]:()=>{throw new Error('crash');}}).publish(two.evidence as never)).rejects.toThrow();expect(readTempAgentSupervisorHandoff(f.root,'a')).toEqual(first);expect(readdirSync(f.agentRoot).filter(n=>n.endsWith('.tmp'))).toEqual([]);}}
+  );
+  it('before-replace failure from absent leaves no active record',async()=>{const f=fixture();await expect(new TempAgentSupervisorHandoffPublisher(f.root,f.authority as never,{beforeReplace:()=>{throw new Error('crash');}}).publish(f.evidence as never)).rejects.toThrow();expect(existsSync(join(f.agentRoot,'temp-active.json'))).toBe(false);});
+  it('rejects skip and sequential same-generation different records',async()=>{const f=fixture();await new TempAgentSupervisorHandoffPublisher(f.root,f.authority as never).publish(f.evidence as never);const skip=fixture(f.root,3,'skip');await expect(new TempAgentSupervisorHandoffPublisher(f.root,skip.authority as never).publish(skip.evidence as never)).rejects.toMatchObject({code:'generation_conflict'});
+    const left=fixture(f.root,2,'left-sequential');await new TempAgentSupervisorHandoffPublisher(f.root,left.authority as never).publish(left.evidence as never);const right=fixture(f.root,2,'right-sequential');await expect(new TempAgentSupervisorHandoffPublisher(f.root,right.authority as never).publish(right.evidence as never)).rejects.toMatchObject({code:'generation_conflict'});});
+  it('refuses to overwrite corrupt extant active bytes',async()=>{const f=fixture();writeFileSync(join(f.agentRoot,'temp-active.json'),'{}\n',{mode:0o600});await expect(new TempAgentSupervisorHandoffPublisher(f.root,f.authority as never).publish(f.evidence as never)).rejects.toThrow();expect(readFileSync(join(f.agentRoot,'temp-active.json'),'utf8')).toBe('{}\n');});
+  it('rejects permanent-schema content even at the temporary filename',async()=>{const f=fixture();const permanent={schemaVersion:1,kind:'AgentSupervisorHandoff',agentId:'a',actionId:'x',generation:1,planDigest:`sha256:${'1'.repeat(64)}`,snapshotDigest:`sha256:${'2'.repeat(64)}`,reservationDigest:`sha256:${'3'.repeat(64)}`,authorizationRevision:'auth',lifetime:'persistent'};writeFileSync(join(f.agentRoot,'temp-active.json'),`${runtimeCanonical(permanent)}\n`,{mode:0o600});expect(()=>readTempAgentSupervisorHandoff(f.root,'a')).toThrow();});
+});

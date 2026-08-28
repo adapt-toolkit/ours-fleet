@@ -66,7 +66,8 @@ describe('packed root package', () => {
         const { authenticatePrepared, legacyAcpIntegrityDigest } = await import(
           pathToFileURL(join(fleetRoot, 'dist', 'harness', 'acp-attempt.js')).href
         );
-        const { createProductionAgentSupervisorRehydration } = await import(
+        const { createProductionAgentSupervisorRehydration,
+          createProductionTempAgentSupervisorRehydration, AgentInstallationService } = await import(
           pathToFileURL(join(fleetRoot, 'dist', 'index.js')).href
         );
         const adapter = makeCodexAdapter(async cmd => ({
@@ -102,6 +103,7 @@ describe('packed root package', () => {
           reconciliation: { reconcileStart: async () => ({}), authenticateStart: () => undefined,
             reconcileRetire: async () => ({}), authenticateRetire: () => undefined },
         });
+        const tempRehydrator = createProductionTempAgentSupervisorRehydration(absentSupervisorRoot);
         process.stdout.write(JSON.stringify({
           version: codex.version,
           claim,
@@ -109,6 +111,9 @@ describe('packed root package', () => {
             factory: typeof createProductionAgentSupervisorRehydration,
             rehydrate: typeof rehydrator.rehydrate,
             missingRootUntouched: !existsSync(absentSupervisorRoot),
+            tempSurface: Object.keys(tempRehydrator).sort(),
+            tempAuthenticate: typeof tempRehydrator.authenticate,
+            installer: typeof AgentInstallationService,
           },
           permissionMetadataSource: launch.permissionMetadataSource,
           prepared: {
@@ -127,6 +132,8 @@ describe('packed root package', () => {
       expect(result.permissionMetadataSource).toBe('codex-acp');
       expect(result.supervisorExport).toEqual({
         factory: 'function', rehydrate: 'function', missingRootUntouched: true,
+        tempSurface: ['rehydrate'], tempAuthenticate: 'undefined',
+        installer: 'function',
       });
       expect(result.claim).toMatchObject({
         supported: true,
