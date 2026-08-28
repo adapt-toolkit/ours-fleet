@@ -1,12 +1,13 @@
 import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
 import { replaceFileAtomically } from '../atomic-file.js';
+import { withFileLock } from '../atomic-file.js';
 import { stateRoot } from '../paths.js';
 import type {
   RoomOrchestrationRecord, RoomOrchestrationState, SagaCursor, SagaPhase,
   RoomMemberSeat, ProvisioningDetail,
   MemberRetirementPhase, RoomClosePhase,
-  RoomRoleBriefingDefinition, RoomMemberLaunchState,
+  RoomRoleBriefingDefinition, RoomMemberLaunchState, CanonicalRoomMemberPlanBinding,
 } from './types.js';
 
 export const roomsDir = () => join(stateRoot(), 'rooms');
@@ -186,6 +187,38 @@ export function updateMemberStartup(
   if (update.launch) seat.launch = update.launch;
   writeRoom(r);
   return r;
+}
+
+const PLAN_BINDING_FIELDS = [
+  'kind', 'agent_id', 'generation', 'action_id', 'plan_digest', 'snapshot_digest',
+  'brain_digest', 'role_id', 'reservation_digest', 'handoff_digest',
+  'authorization_revision', 'identity_ownership',
+] as const;
+
+const samePlanBinding = (
+  left: CanonicalRoomMemberPlanBinding, right: CanonicalRoomMemberPlanBinding,
+): boolean => PLAN_BINDING_FIELDS.every(field => left[field] === right[field]);
+
+export async function bindCanonicalMemberPlan(
+  id: string, roleName: string, binding: CanonicalRoomMemberPlanBinding,
+): Promise<RoomOrchestrationRecord> {
+  return withFileLock(`${roomPath(id)}.binding.lock`, () => {
+    const r = readRoom(id);
+    if (r.state !== 'provisioning')
+      throw new RoomStateError(`room ${id} cannot bind a member plan while ${r.state}`);
+    const seat = r.member_seats.find(candidate => candidate.role_name === roleName);
+    if (!seat) throw new RoomStateError(`room ${id} has no recorded member ${roleName}`);
+    if (seat.plan_binding) {
+      if (!samePlanBinding(seat.plan_binding, binding))
+        throw new RoomStateError(`room ${id} member ${roleName} plan binding conflicts`);
+      return r;
+    }
+    if (seat.launch && (seat.launch.state !== 'pending' || seat.launch.attempt !== 0))
+      throw new RoomStateError(`room ${id} member ${roleName} cannot bind a plan after launch intent`);
+    seat.plan_binding = structuredClone(binding);
+    writeRoom(r);
+    return r;
+  });
 }
 
 export function activateRoom(id: string): RoomOrchestrationRecord {

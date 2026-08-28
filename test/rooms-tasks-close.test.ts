@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { mkdirSync, mkdtempSync, rmSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -19,6 +19,9 @@ import {
 import {
   activateRoom, createRoomRecord, getRoomRecord, updateMemberSeats,
 } from '../src/rooms-tasks/room-state.js';
+import { createAgentProductionRuntime } from '../src/agent-production-runtime.js';
+import type { ResolvedRole } from '../src/config.js';
+import type { CanonicalRoomMemberPlanBinding } from '../src/rooms-tasks/types.js';
 
 const ROOM_ID = '01hzyk8m0000000000000000aa';
 const CID = 'ab'.repeat(32);
@@ -69,7 +72,122 @@ function fixture() {
   return { calls, deps, cowork };
 }
 
+const canonicalRole: ResolvedRole = {
+  name: 'member-1', harness: 'codex', session: 'acp', identity: 'member-1', model: 'exact',
+  sourceFile: 'test', permissionsDeclared: true,
+  permissions: { approval: 'ask', filesystem: 'workspace', unattended: 'deny' },
+  monitor: { mode: 'native', enabled: false, wake_sources: [], batch_ms: 0,
+    inject: 'notification', interrupt: false },
+};
+
+async function reserveCanonicalBinding(
+  agentId: string, actionId: string,
+): Promise<CanonicalRoomMemberPlanBinding> {
+  const runtime = createAgentProductionRuntime({
+    trustedStateRoot: join(root, '.ours-fleet'),
+    identityProvisioner: { exists: async () => false }, now: () => 1,
+  });
+  await runtime.createRole({ role: { ...canonicalRole, name: agentId, identity: agentId },
+    lifetime: 'temporary', actionId });
+  const { handoff, plan } = runtime.resumeTemporaryComposition({
+    agentId, actionId,
+  });
+  return {
+    kind: 'canonical_agent_plan', agent_id: handoff.agentId, generation: handoff.generation,
+    action_id: handoff.actionId, plan_digest: handoff.planDigest,
+    snapshot_digest: handoff.snapshotDigest, brain_digest: plan.adapter.brainDigest,
+    role_id: plan.role.id, reservation_digest: handoff.reservationDigest,
+    handoff_digest: handoff.handoffDigest,
+    authorization_revision: handoff.authorizationRevision,
+    identity_ownership: 'create_temporary',
+  };
+}
+
+async function installCanonicalSeat(): Promise<CanonicalRoomMemberPlanBinding> {
+  const binding = await reserveCanonicalBinding('member-1', 'close-action');
+  updateMemberSeats(ROOM_ID, [{
+    role_name: 'member-1', identity_cid: CID, slot: 'dev', cowork_role: 'Developer',
+    seat_state: 'active', plan_binding: binding,
+  }]);
+  const dir = join(root, '.ours-fleet', 'tmp', 'member-1');
+  mkdirSync(dir, { recursive: true });
+  writeFileSync(join(dir, '.identity'), 'member-1\n');
+  writeFileSync(join(dir, '.temp-supervisor.json'), JSON.stringify({
+    version: 1, role: 'member-1', launchId: 'canonical-launch',
+    createdAt: new Date(1).toISOString(), phase: 'active',
+  }));
+  return binding;
+}
+
 describe('deterministic managed room close', () => {
+  it('authenticates the exact stored canonical AgentPlan before retirement', async () => {
+    await installCanonicalSeat();
+    const f = fixture();
+    delete f.deps.inspectMember;
+
+    const closed = await closeManagedRoom({ roomId: ROOM_ID, cowork: f.cowork, deps: f.deps });
+
+    expect(closed.state).toBe('closed');
+    expect(f.calls).toEqual([
+      'stop:member-1', 'absent:member-1', 'archive:member-1',
+      'identity:member-1', `cowork:${ROOM_ID}`,
+    ]);
+  });
+
+  it.each([
+    ['kind', 'legacy_agent_plan'],
+    ['agent_id', 'other-agent'],
+    ['brain_digest', `sha256:${'a'.repeat(64)}`],
+    ['role_id', 'OtherRole'],
+    ['generation', 99],
+    ['action_id', 'other-action'],
+    ['plan_digest', `sha256:${'b'.repeat(64)}`],
+    ['snapshot_digest', `sha256:${'c'.repeat(64)}`],
+    ['reservation_digest', `sha256:${'d'.repeat(64)}`],
+    ['handoff_digest', `sha256:${'e'.repeat(64)}`],
+    ['authorization_revision', 'other-revision'],
+    ['identity_ownership', 'create_persistent'],
+  ] as const)('rejects substituted canonical binding field %s before mutation or effects', async (field, value) => {
+    const binding = await installCanonicalSeat();
+    updateMemberSeats(ROOM_ID, [{
+      role_name: 'member-1', identity_cid: CID, slot: 'dev', cowork_role: 'Developer',
+      seat_state: 'active', plan_binding: { ...binding, [field]: value } as CanonicalRoomMemberPlanBinding,
+    }]);
+    const before = structuredClone(getRoomRecord(ROOM_ID));
+    const f = fixture();
+    delete f.deps.inspectMember;
+
+    await expect(closeManagedRoom({ roomId: ROOM_ID, cowork: f.cowork, deps: f.deps }))
+      .rejects.toThrow(/canonical AgentPlan authority mismatch|invalid_request|invalid_handoff/u);
+
+    expect(getRoomRecord(ROOM_ID)).toEqual(before);
+    expect(f.deps.requestStop).not.toHaveBeenCalled();
+    expect(f.deps.secureArchive).not.toHaveBeenCalled();
+    expect(f.deps.removeIdentity).not.toHaveBeenCalled();
+    expect(f.cowork.closeRoom).not.toHaveBeenCalled();
+  });
+
+  it('rejects a whole valid binding copied from another temporary agent', async () => {
+    await installCanonicalSeat();
+    const other = await reserveCanonicalBinding('member-2', 'other-action');
+    updateMemberSeats(ROOM_ID, [{
+      role_name: 'member-1', identity_cid: CID, slot: 'dev', cowork_role: 'Developer',
+      seat_state: 'active', plan_binding: other,
+    }]);
+    const before = structuredClone(getRoomRecord(ROOM_ID));
+    const f = fixture();
+    delete f.deps.inspectMember;
+
+    await expect(closeManagedRoom({ roomId: ROOM_ID, cowork: f.cowork, deps: f.deps }))
+      .rejects.toThrow(/canonical AgentPlan authority mismatch/u);
+
+    expect(getRoomRecord(ROOM_ID)).toEqual(before);
+    expect(f.deps.requestStop).not.toHaveBeenCalled();
+    expect(f.deps.secureArchive).not.toHaveBeenCalled();
+    expect(f.deps.removeIdentity).not.toHaveBeenCalled();
+    expect(f.cowork.closeRoom).not.toHaveBeenCalled();
+  });
+
   it('checkpoints exact retirement before Cowork and terminal close', async () => {
     const f = fixture();
     const closed = await closeManagedRoom({ roomId: ROOM_ID, cowork: f.cowork, deps: f.deps });

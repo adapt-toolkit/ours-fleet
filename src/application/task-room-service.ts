@@ -30,6 +30,10 @@ import type {
   RoomOrchestrationRecord, TaskListRecord, TaskOrigin, TaskOutcome, TaskRecord, TaskState, TemplateSnapshot,
 } from '../rooms-tasks/types.js';
 import { TASK_CANCELLABLE_STATES, TASK_TERMINAL_STATES } from '../rooms-tasks/types.js';
+import { loadConfigResourceSnapshot, type ConfigResourceSnapshot } from '../config-resource-loader.js';
+import { defaultConfigPath } from '../paths.js';
+import { previewRoomMemberComposition } from '../rooms-tasks/member-composition.js';
+import type { ExplicitBrainRoomTemplateMemberSpec, RoomTemplateResource } from '../config-resources.js';
 
 export type TaskRoomActor =
   | { kind: 'local_control'; surface: 'cli' | 'web' }
@@ -87,6 +91,7 @@ export interface CreateRoomRequest {
 
 export interface TaskRoomServiceDeps {
   loadConfiguration?(path?: string): FleetConfig;
+  loadResourceSnapshot?(path: string): ConfigResourceSnapshot;
   cowork?(config: FleetConfig): CoworkAdapter;
   binPath?(): string;
   provisionMembers?: typeof provisionMembers;
@@ -96,6 +101,10 @@ export interface TaskRoomServiceDeps {
 /** Exact extraction of the previously CLI-owned task create/start behavior. */
 export class TaskRoomApplicationService {
   private recovery?: { taskId: string; config: FleetConfig };
+  private readonly canonicalTemplates = new WeakMap<TemplateSnapshot, Readonly<{
+    snapshot: ConfigResourceSnapshot; templateId: string;
+    members: readonly Readonly<ExplicitBrainRoomTemplateMemberSpec>[];
+  }>>();
   constructor(
     private readonly configurationPath?: string,
     private readonly deps: TaskRoomServiceDeps = {},
@@ -136,10 +145,7 @@ export class TaskRoomApplicationService {
     const brief = request.briefFile ? readFileSync(request.briefFile, 'utf8') : request.brief;
     let template: TemplateSnapshot | undefined;
     if (request.template) {
-      const definition = resolveTemplate(request.template, cfg.roomTemplates ?? {});
-      if (!definition) throw new TaskRoomApplicationError(
-        'template_not_found', `template not found: ${request.template}`, { template: request.template });
-      template = snapshotTemplate(definition);
+      template = this.selectTemplate(cfg, request.template);
     }
     return this.provisionRoom(cfg, {
       title: request.name, brief, goal: request.goal,
@@ -148,10 +154,11 @@ export class TaskRoomApplicationService {
 
   async startTask(input: { actor: TaskRoomActor; taskId: string }): Promise<TaskRecord> {
     const cfg = (this.deps.loadConfiguration ?? loadConfig)(this.configurationPath);
+    const before = readTask(input.taskId);
+    const selected = before.template && !before.room_id ? this.existingTemplate(cfg, before) : undefined;
     let task = transitionTask(input.taskId);
     if (task.template && !task.room_id) {
-      const template = this.existingTemplate(cfg, task);
-      await this.provisionRoom(cfg, task, template, room => {
+      await this.provisionRoom(cfg, task, selected!, room => {
         task = updateTaskRoom(task.task_id, room.room_id, room.room_identity_cid!);
       });
       task = readTask(task.task_id);
@@ -519,11 +526,18 @@ export class TaskRoomApplicationService {
     let task = readTask(input.taskId);
     if (TASK_TERMINAL_STATES.includes(task.state)) throw new TaskRoomApplicationError(
       'task_terminal', 'task terminal', { task: input.taskId, state: task.state });
+    const linkedRoom = task.room_id ? getRoomRecord(task.room_id) : undefined;
+    if (task.room_id && !linkedRoom)
+      throw new TaskRoomApplicationError('task_non_resumable',
+        `task ${task.task_id} references missing room ${task.room_id}`,
+        { task: task.task_id, room: task.room_id });
+    if (linkedRoom && linkedRoom.template_snapshot?.canonical?.kind !== 'canonical_room_template')
+      throw new TaskRoomApplicationError('task_non_resumable',
+        `legacy room ${linkedRoom.room_id} is recovery/close-only; create a new room from a schema-v2 RoomTemplate`,
+        { task: task.task_id, room: linkedRoom.room_id });
     if (task.state === 'active' && task.room_id) {
       if (input.template) {
-        const definition = resolveTemplate(input.template, cfg.roomTemplates ?? {});
-        if (!definition) throw new TaskRoomApplicationError('template_not_found', 'template not found', { template: input.template });
-        const requested = snapshotTemplate(definition);
+        const requested = this.selectTemplate(cfg, input.template);
         const pinned = getRoomRecord(task.room_id)?.template_snapshot ?? task.template;
         if (pinned && (pinned.name !== requested.name || pinned.content_hash !== requested.content_hash))
           throw new TaskRoomApplicationError('template_mismatch', 'template mismatch', {
@@ -532,22 +546,21 @@ export class TaskRoomApplicationService {
       }
       return { task, status: 'already_active' };
     }
-    const room = task.room_id ? getRoomRecord(task.room_id) : undefined;
+    const room = linkedRoom;
     const durable = room?.template_snapshot;
     if (durable && (!task.template || task.template.name !== durable.name
       || task.template.version !== durable.version || task.template.content_hash !== durable.content_hash))
       throw new Error(`task ${task.task_id} template reference does not match room ${room!.room_id}'s durable snapshot`);
     const templateName = input.template ?? durable?.name ?? task.template?.name
       ?? cfg.tasks?.default_room_template ?? cfg.rooms?.defaults?.template ?? 'single';
-    const definition = durable && !input.template ? undefined
-      : resolveTemplate(templateName, cfg.roomTemplates ?? {});
-    if (input.template && !definition) throw new TaskRoomApplicationError(
-      'template_not_found', 'template not found', { template: templateName });
-    if (!durable && !definition) throw new TaskRoomApplicationError(
-      'template_not_found', 'template not found', { template: templateName });
-    const snapshot = durable ?? snapshotTemplate(definition!);
-    if (durable && input.template && definition) {
-      const requested = snapshotTemplate(definition);
+    const requested = this.selectTemplate(cfg, templateName);
+    const snapshot = durable ?? requested;
+    if (durable?.canonical) {
+      const current = this.canonicalTemplates.get(requested)!;
+      this.canonicalTemplates.set(snapshot, { ...current, templateId: durable.canonical.template_id,
+        members: durable.canonical.members });
+    }
+    if (durable && input.template) {
       if (requested.name !== durable.name || requested.content_hash !== durable.content_hash)
         throw new TaskRoomApplicationError('template_mismatch', 'template mismatch', {
           requested: `${requested.name}@${requested.version}`, room: room!.room_id,
@@ -584,7 +597,9 @@ export class TaskRoomApplicationService {
         const cowork = this.deps.cowork ? this.deps.cowork(cfg) : createCoworkAdapter({ configPath: cfg.rooms.cowork?.config });
         await (this.deps.provisionMembers ?? provisionMembers)({ cfg, cowork, roomId: room.room_id,
           taskId: task.task_id, template: snapshot, binPath: (this.deps.binPath ?? getBinPath)(),
-          brief: task.brief, goal: task.title });
+          brief: task.brief, goal: task.title,
+          ...(this.canonicalTemplates.get(snapshot)
+            ? { canonical: this.canonicalTemplates.get(snapshot)! } : {}) });
         task = readTask(task.task_id);
       } catch (error) {
         if (error instanceof CoworkUnavailableError) persistBlockTask(task.task_id, 'Cowork management socket is unavailable');
@@ -600,25 +615,56 @@ export class TaskRoomApplicationService {
     if (noRoom) return undefined;
     const name = requested
       ?? cfg.tasks?.default_room_template ?? cfg.rooms?.defaults?.template ?? 'team';
-    const definition = resolveTemplate(name, cfg.roomTemplates ?? {});
-    if (!definition) {
-      if (requested) throw new TaskRoomApplicationError(
-        'template_not_found', `template not found: ${requested}`,
-      );
-      return undefined;
-    }
-    return snapshotTemplate(definition);
+    return this.selectTemplate(cfg, name);
   }
 
   private existingTemplate(cfg: FleetConfig, task: TaskRecord): TemplateSnapshot {
     const ref = task.template!;
-    const definition = resolveTemplate(ref.name, cfg.roomTemplates ?? {});
-    const snapshot = definition ? snapshotTemplate(definition) : undefined;
-    if (!snapshot || snapshot.content_hash !== ref.content_hash)
+    const snapshot = this.selectTemplate(cfg, ref.name);
+    if (snapshot.content_hash !== ref.content_hash)
       throw new TaskRoomApplicationError(
         'task_template_drift', `task template snapshot no longer matches ${ref.name}@${ref.version}`,
       );
     return snapshot;
+  }
+
+  private selectTemplate(cfg: FleetConfig, name: string): TemplateSnapshot {
+    let snapshot: ConfigResourceSnapshot;
+    try {
+      const path = this.configurationPath ?? defaultConfigPath();
+      snapshot = this.deps.loadResourceSnapshot
+        ? this.deps.loadResourceSnapshot(path)
+        : loadConfigResourceSnapshot({ bootstrapFile: path });
+    } catch (error) {
+      throw new TaskRoomApplicationError('template_not_found',
+        `legacy room templates cannot provision new members; migrate '${name}' to a schema-v2 RoomTemplate with explicit Brain and complete permissions`,
+        { template: name, migration: 'schema-v2 RoomTemplate + Role + Brain' });
+    }
+    const resource = snapshot.resources.RoomTemplate?.[name] as RoomTemplateResource | undefined;
+    if (!resource || resource.kind !== 'RoomTemplate') throw new TaskRoomApplicationError(
+      'template_not_found', `canonical RoomTemplate not found: ${name}`, { template: name });
+    const source = snapshot.sources.find(candidate => candidate.kind === 'RoomTemplate' && candidate.id === name);
+    if (!source) throw new Error(`canonical RoomTemplate '${name}' has no source evidence`);
+    const members = resource.spec.members.map((member, index) => {
+      const preview = previewRoomMemberComposition(snapshot, member,
+        `RoomTemplate/${name}`, `$.spec.members[${index}]`);
+      if (!member.permissions || member.permissions.approval === undefined
+          || member.permissions.filesystem === undefined || member.permissions.unattended === undefined)
+        throw new Error(`RoomTemplate/${name}: member ${index} requires complete permissions`);
+      return preview.member;
+    });
+    const durable: TemplateSnapshot = {
+      name, version: resource.spec.version, description: resource.spec.description,
+      ...(resource.spec.contract === undefined ? {} : { contract: resource.spec.contract }),
+      ...(resource.spec.room === undefined ? {} : { room: resource.spec.room }),
+      content_hash: source.sha256,
+      members: members.map(member => ({ slot: member.slot, role: member.role,
+        count: member.count, role_ref: member.role })),
+      canonical: { kind: 'canonical_room_template', template_id: name,
+        snapshot_digest: snapshot.digest, members },
+    };
+    this.canonicalTemplates.set(durable, { snapshot, templateId: name, members });
+    return durable;
   }
 
   private async provisionRoom(
@@ -670,6 +716,8 @@ export class TaskRoomApplicationService {
       cfg, cowork, roomId: room.room_id, taskId: task.task_id, template,
       binPath: (this.deps.binPath ?? getBinPath)(), brief: task.brief,
       goal: task.task_id ? task.title : task.goal,
+      ...(this.canonicalTemplates.get(template)
+        ? { canonical: this.canonicalTemplates.get(template)! } : {}),
     });
     room = activateRoom(room.room_id);
     if (task.task_id) activateTask(task.task_id);

@@ -18,7 +18,27 @@ const mocks = vi.hoisted(() => ({
   getRoom: vi.fn(),
   listRooms: vi.fn(),
   markdownRender: vi.fn(),
+  resourceLoadError: false,
 }));
+
+vi.mock('../src/config-resource-loader.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../src/config-resource-loader.js')>();
+  return { ...actual, loadConfigResourceSnapshot: () => {
+    if (mocks.resourceLoadError) throw new Error('legacy configuration');
+    const doc = (relativePath: string, text: string) => ({ relativePath, bytes: Buffer.from(text) });
+    const template = (id: string, version = 1) => doc(`room-templates.d/${id}.yaml`,
+      `kind: RoomTemplate\nversion: 1\nid: ${id}\nspec:\n  version: ${version}\n  description: ${id}\n  members:\n    - {slot: dev, role: Developer, count: 1, brain: {template: dev}, permissions: {approval: ask, filesystem: workspace, unattended: deny}}\n`);
+    return actual.loadConfigResourceSnapshotFromDocuments({
+      bootstrapFile: '/cfg/fleet.yaml', configDir: '/cfg/fleet.conf.d',
+      bootstrapBytes: Buffer.from('schema_version: 2\nconfig_dir: fleet.conf.d\npolicy: {}\n'),
+      documents: [
+        doc('roles.d/dev.yaml', 'kind: Role\nversion: 1\nid: Developer\nspec: {}\n'),
+        doc('brains.d/dev.yaml', 'kind: Brain\nversion: 1\nid: dev\nspec: {harness: codex, model: test, effort: medium, session: acp}\n'),
+        template('single'), template('team'), template('durable', 7),
+      ],
+    });
+  } };
+});
 
 vi.mock('../src/rooms-tasks/cowork-adapter.js', async (importOriginal) => {
   const actual = await importOriginal<typeof import('../src/rooms-tasks/cowork-adapter.js')>();
@@ -164,6 +184,7 @@ beforeEach(() => {
   exitSpy = vi.spyOn(process, 'exit').mockImplementation((() => { throw new ExitError(); }) as never);
 
   mocks.createRoom.mockReset().mockResolvedValue({ room_id: ROOM_ID, identity_cid: 'c'.repeat(64) });
+  mocks.resourceLoadError = false;
   mocks.recoverRoom.mockReset().mockResolvedValue({
     room_id: ROOM_ID, identity_name: 'room-id', identity_cid: 'c'.repeat(64),
     room_name: 'Fix the parser', state: 'active', seats: [], role_briefings: {},
@@ -327,20 +348,19 @@ describe('task title to Cowork room naming', () => {
     expect(getRoomRecord(ROOM_ID)?.room_name).toBe(unicodeTitle);
   }
 
-  it('preserves an immediate task create title exactly', async () => {
-    await run('create', '--title', unicodeTitle, '--json');
-    expect(JSON.parse(out.join('\n')).task.title).toBe(unicodeTitle);
-    expectExactRoomName();
+  it('rejects legacy immediate provisioning before creating a room', async () => {
+    mocks.resourceLoadError = true;
+    await expect(run('create', '--title', unicodeTitle, '--json')).rejects.toThrow(ExitError);
+    expect(out.join('\n')).toContain('template not found: team');
+    expect(mocks.createRoom).not.toHaveBeenCalled();
   });
 
-  it('preserves a backlog title exactly when task start creates its room', async () => {
-    await run('create', '--title', unicodeTitle, '--backlog', '--json');
-    const taskId = JSON.parse(out.join('\n')).task.task_id as string;
-    out = [];
-    mocks.createRoom.mockClear();
-    await run('start', taskId, '--json');
-    expect(JSON.parse(out.join('\n')).task.title).toBe(unicodeTitle);
-    expectExactRoomName();
+  it('rejects a legacy backlog template before task creation', async () => {
+    mocks.resourceLoadError = true;
+    await expect(run('create', '--title', unicodeTitle, '--backlog', '--json'))
+      .rejects.toThrow(ExitError);
+    expect(out.join('\n')).toContain('template not found: team');
+    expect(mocks.createRoom).not.toHaveBeenCalled();
   });
 
   it('preserves a backlog title exactly when task work creates its room', async () => {
@@ -364,20 +384,17 @@ describe('decomposed task title to Cowork room naming', () => {
     expect(getRoomRecord(ROOM_ID)?.room_name).toBe(decomposedTitle);
   }
 
-  it('preserves decomposed code points through task create and room create', async () => {
-    await run('create', '--title', decomposedTitle, '--json');
-    expect(JSON.parse(out.join('\n')).task.title).toBe(decomposedTitle);
-    expectExactDecomposedRoomName();
+  it('rejects a decomposed-title legacy create before room mutation', async () => {
+    mocks.resourceLoadError = true;
+    await expect(run('create', '--title', decomposedTitle, '--json')).rejects.toThrow(ExitError);
+    expect(mocks.createRoom).not.toHaveBeenCalled();
   });
 
-  it('preserves decomposed code points when task start creates the room', async () => {
-    await run('create', '--title', decomposedTitle, '--backlog', '--json');
-    const taskId = JSON.parse(out.join('\n')).task.task_id as string;
-    out = [];
-    mocks.createRoom.mockClear();
-    await run('start', taskId, '--json');
-    expect(JSON.parse(out.join('\n')).task.title).toBe(decomposedTitle);
-    expectExactDecomposedRoomName();
+  it('rejects a decomposed-title legacy backlog before task mutation', async () => {
+    mocks.resourceLoadError = true;
+    await expect(run('create', '--title', decomposedTitle, '--backlog', '--json'))
+      .rejects.toThrow(ExitError);
+    expect(mocks.createRoom).not.toHaveBeenCalled();
   });
 
   it('preserves decomposed code points when task work creates the room', async () => {
@@ -562,7 +579,7 @@ describe('task work', () => {
     });
     await expect(run('start', t.task_id, '--json')).rejects.toThrow(ExitError);
     expect(out.join('\n')).toContain('team@7');
-    expect(getTask(t.task_id).state).toBe('provisioning');
+    expect(getTask(t.task_id).state).toBe('backlog');
     expect(mocks.createRoom).not.toHaveBeenCalled();
   });
 

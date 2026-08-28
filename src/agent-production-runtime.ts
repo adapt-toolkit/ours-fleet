@@ -17,6 +17,8 @@ import type { SessionHandle } from './session/types.js';
 import type { AcpSessionOptions } from './session/acp.js';
 import { effectiveRoleModel } from './model-env.js';
 import { runtimeCanonical } from './agent-runtime-record.js';
+import { readStoredAgentPlan } from './agent-plan-store.js';
+import type { AgentPlan } from './agent-plan.js';
 
 export interface AgentProductionRuntimeDeps {
   trustedStateRoot: string;
@@ -45,11 +47,25 @@ export interface AgentProductionSessionInput {
 export interface AgentProductionRoleInput {
   role: ResolvedRole; lifetime: 'persistent' | 'temporary'; actionId: string;
 }
+export interface TemporaryCompositionReservationInput {
+  context: ProductionIngressContext;
+  request: Omit<AgentCompositionRequest, 'callerEvidence'>;
+  actionId: string;
+}
+export interface TemporaryCompositionResumeInput { agentId: string; actionId: string }
+export interface TemporaryCompositionResumeResult {
+  handoff: Readonly<import('./temp-agent-supervisor-handoff.js').TempAgentSupervisorHandoff>;
+  plan: Readonly<AgentPlan>;
+}
 
 export interface AgentProductionRuntime {
   create(input: Readonly<AgentProductionCreationInput>): Promise<AgentProductionCreationResult>;
   createRole(input: Readonly<AgentProductionRoleInput>): Promise<AgentProductionCreationResult>;
   launch(input: Readonly<AgentProductionSessionInput>): Promise<SessionHandle>;
+  reserveTemporaryComposition(input: Readonly<TemporaryCompositionReservationInput>):
+    Promise<Readonly<import('./temp-agent-supervisor-handoff.js').TempAgentSupervisorHandoff>>;
+  resumeTemporaryComposition(input: Readonly<TemporaryCompositionResumeInput>):
+    Readonly<TemporaryCompositionResumeResult>;
 }
 
 const digest = (value: unknown): string => `sha256:${createHash('sha256')
@@ -129,6 +145,27 @@ export function createAgentProductionRuntime(deps: AgentProductionRuntimeDeps): 
       role: input.plan.preview.resolvedRole,
       lifetime: input.plan.options.temp ? 'temporary' : 'persistent', actionId: input.actionId }),
     createRole,
+    reserveTemporaryComposition: async (input: Readonly<TemporaryCompositionReservationInput>) => {
+      const callerEvidence = composed.creation.ingress.direct(input.context);
+      await composed.creation.temporary.reserve(
+        Object.freeze({ ...input.request, callerEvidence }), input.actionId,
+      );
+      const handoff = readTempAgentSupervisorHandoff(deps.trustedStateRoot, input.request.source.agentId);
+      if (handoff.actionId !== input.actionId) throw new AgentCompositionError('invalid_request');
+      return handoff;
+    },
+    resumeTemporaryComposition: (input: Readonly<TemporaryCompositionResumeInput>) => {
+      const handoff = readTempAgentSupervisorHandoff(deps.trustedStateRoot, input.agentId);
+      if (handoff.actionId !== input.actionId) throw new AgentCompositionError('invalid_request');
+      const plan = readStoredAgentPlan(handoff.canonicalDir, handoff, 'temporary-product-resume').plan;
+      if (plan.agentId !== handoff.agentId || plan.generation !== handoff.generation
+          || plan.planDigest !== handoff.planDigest || plan.snapshotDigest !== handoff.snapshotDigest
+          || plan.authorizationRevision !== handoff.authorizationRevision
+          || plan.operation.id !== handoff.actionId || plan.lifecycle !== 'temporary'
+          || plan.identity.ownership !== 'create_temporary')
+        throw new AgentCompositionError('invalid_request');
+      return Object.freeze({ handoff, plan });
+    },
     launch: async (input: Readonly<AgentProductionSessionInput>) => {
       const active = input.lifetime === 'temporary'
         ? readTempAgentSupervisorHandoff(deps.trustedStateRoot, input.agentId)

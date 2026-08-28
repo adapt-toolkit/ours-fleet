@@ -4,7 +4,7 @@ import { parse } from 'yaml';
 import type { CoworkAdapter, CoworkSeatInfo } from './cowork-adapter.js';
 import {
   advanceSaga, setSagaError, updateMemberSeats, updateMemberStartup,
-  activateRoom, getRoomRecord,
+  activateRoom, getRoomRecord, bindCanonicalMemberPlan,
 } from './room-state.js';
 import {
   activateTask, updateTaskMembers, blockTask, unblockTask, getTask,
@@ -31,6 +31,10 @@ import {
   readTempSupervisor, secureStoppedTempArchive, tempArchiveForCreationAction,
   tempSupervisorLiveness,
 } from '../temp-lifecycle.js';
+import { withFileLock } from '../atomic-file.js';
+import type { ConfigResourceSnapshot } from '../config-resource-loader.js';
+import type { ExplicitBrainRoomTemplateMemberSpec } from '../config-resources.js';
+import { reserveCanonicalRoomMemberPlan } from './member-plan.js';
 
 export function getBinPath(): string {
   try { return realpathSync(process.argv[1]); } catch { return process.argv[1]; }
@@ -46,6 +50,11 @@ export interface ProvisionMembersInput {
   brief?: string;
   goal?: string;
   startupWait?: Partial<StartupWaitPolicy>;
+  canonical?: Readonly<{
+    snapshot: ConfigResourceSnapshot;
+    templateId: string;
+    members: readonly Readonly<ExplicitBrainRoomTemplateMemberSpec>[];
+  }>;
 }
 
 export interface StartupWaitPolicy {
@@ -62,6 +71,8 @@ interface ExpandedMember {
   coworkRole: string;
   roleRef: string;
   overrides?: TemplateMemberSlot['overrides'];
+  canonical?: Readonly<ExplicitBrainRoomTemplateMemberSpec>;
+  ordinal: number;
 }
 
 interface MemberSettings {
@@ -88,15 +99,24 @@ interface RoomMemberSpawnResult {
 
 async function spawnRoomMember(
   options: SpawnOpts, binPath: string,
+  canonical?: Readonly<{ runtime: ReturnType<typeof createAgentProductionRuntime> }>,
 ): Promise<RoomMemberSpawnResult> {
   const stateDir = process.env[FLEET_PROXY_STATE_DIR_ENV];
-  if (!stateDir) {
-    const runtime = createAgentProductionRuntime({ trustedStateRoot: stateRoot(),
+  if (!stateDir || canonical) {
+    const runtime = canonical?.runtime ?? createAgentProductionRuntime({ trustedStateRoot: stateRoot(),
       identityProvisioner: daemonIdentityProvisioner() });
-    const plan = Object.freeze({ origin: 'direct' as const, options,
+    const legacyPlan = canonical ? undefined : Object.freeze({ origin: 'direct' as const, options,
       preview: spawnDryRun(options) });
     return { statePath: await spawnTemp(options, binPath, undefined, {
-      temporaryAgentCreation: { execute: () => runtime.create({ plan, actionId: options.creationActionId! }) },
+      temporaryAgentCreation: { execute: async () => {
+        if (!canonical) return runtime.create({ plan: legacyPlan!, actionId: options.creationActionId! });
+        const resumed = runtime.resumeTemporaryComposition({
+          agentId: options.name, actionId: options.creationActionId!,
+        });
+        return Object.freeze({ state: 'reserved' as const, agentId: resumed.handoff.agentId,
+          generation: resumed.handoff.generation, actionId: resumed.handoff.actionId,
+          lifetime: 'temporary' as const, completion: 'deferred' as const });
+      } },
     }), creationActionId: options.creationActionId! };
   }
 
@@ -127,16 +147,22 @@ function shortId(id: string): string { return id.slice(0, 8); }
 function expandMembers(
   template: TemplateSnapshot,
   prefix: string,
+  canonical?: ProvisionMembersInput['canonical'],
 ): ExpandedMember[] {
   const result: ExpandedMember[] = [];
-  for (const slot of template.members) {
+  const slots = canonical?.members ?? template.members;
+  let ordinal = 0;
+  for (const slot of slots) {
     for (let i = 1; i <= slot.count; i++) {
+      ordinal += 1;
       result.push({
         name: `${prefix}-${slot.slot}-${i}`,
         slot: slot.slot,
         coworkRole: slot.role,
-        roleRef: slot.role_ref,
-        overrides: slot.overrides,
+        roleRef: 'role_ref' in slot ? slot.role_ref : slot.role,
+        ...('overrides' in slot ? { overrides: slot.overrides } : {}),
+        ...(canonical ? { canonical: slot as ExplicitBrainRoomTemplateMemberSpec } : {}),
+        ordinal,
       });
     }
   }
@@ -317,11 +343,12 @@ async function launchMember(input: {
   member: ExpandedMember;
   settings: MemberSettings;
   startup: RoomMemberStartup;
+  canonicalRuntime?: ReturnType<typeof createAgentProductionRuntime>;
 }): Promise<void> {
   const { provision, member, settings, startup } = input;
   const seat = getRoomRecord(provision.roomId)!.member_seats
     .find(candidate => candidate.role_name === member.name)!;
-  const actionId = randomUUID();
+  const actionId = seat.plan_binding?.action_id ?? randomUUID();
   let effectiveActionId: string = actionId;
   const attempt = (seat.launch?.attempt ?? 0) + 1;
   const taskSha = sha256Text(startup.task);
@@ -347,7 +374,7 @@ async function launchMember(input: {
       surface: 'agent',
       creationActionId: actionId,
       roomMemberStartup: startup,
-    }, provision.binPath);
+    }, provision.binPath, input.canonicalRuntime ? { runtime: input.canonicalRuntime } : undefined);
     const launchedDir = launched.statePath;
     effectiveActionId = launched.creationActionId;
     if (launched.creationActionId !== actionId) {
@@ -422,12 +449,12 @@ function reconcileMemberSeats(
   return { complete, seats };
 }
 
-export async function provisionMembers(
+async function provisionMembersLocked(
   input: ProvisionMembersInput,
 ): Promise<RoomOrchestrationRecord> {
   const { cfg, cowork, roomId, taskId, template } = input;
   const prefix = taskId ? shortId(taskId) : `room-${shortId(roomId)}`;
-  const members = expandMembers(template, prefix);
+  const members = expandMembers(template, prefix, input.canonical);
   const existing = getRoomRecord(roomId);
   if (!existing?.room_identity_cid)
     throw new Error(`room ${roomId} has no pinned room identity CID`);
@@ -448,6 +475,8 @@ export async function provisionMembers(
     })));
   }
 
+  const runtime = createAgentProductionRuntime({ trustedStateRoot: stateRoot(),
+    identityProvisioner: daemonIdentityProvisioner() });
   const settings = new Map(members.map(member => [member.name, settingsFor(member, cfg)]));
   const tasks = new Map(members.map(member => [member.name, roomTask(
     input, member, settings.get(member.name)!, members, roomIdentityCid, ownerSeatCid,
@@ -466,8 +495,42 @@ export async function provisionMembers(
     reconcileMemberSeats(roomId, members, initialRoom.seats);
     for (const member of members) {
       const task = tasks.get(member.name)!;
-      const currentSeat = getRoomRecord(roomId)!.member_seats
+      let currentSeat = getRoomRecord(roomId)!.member_seats
         .find(seat => seat.role_name === member.name)!;
+      if (input.canonical) {
+        if (!currentSeat.plan_binding) {
+          const binding = await reserveCanonicalRoomMemberPlan(runtime, {
+            snapshot: input.canonical.snapshot, templateId: input.canonical.templateId,
+            member: member.canonical!, roomId, ...(taskId ? { taskId } : {}),
+            memberId: member.name, identityName: member.name, ordinal: member.ordinal,
+            actionId: randomUUID(), issuedAt: Date.now(),
+          });
+          await bindCanonicalMemberPlan(roomId, member.name, binding);
+          currentSeat = getRoomRecord(roomId)!.member_seats
+            .find(seat => seat.role_name === member.name)!;
+        }
+        const binding = currentSeat.plan_binding;
+        if (!binding) throw new Error(`canonical member ${member.name} has no durable plan binding`);
+        const resumed = runtime.resumeTemporaryComposition({
+          agentId: binding.agent_id, actionId: binding.action_id,
+        });
+        if (resumed.handoff.generation !== binding.generation
+            || resumed.handoff.planDigest !== binding.plan_digest
+            || resumed.handoff.snapshotDigest !== binding.snapshot_digest
+            || resumed.handoff.reservationDigest !== binding.reservation_digest
+            || resumed.handoff.handoffDigest !== binding.handoff_digest
+            || resumed.handoff.authorizationRevision !== binding.authorization_revision)
+          throw new Error(`stored AgentPlan for ${member.name} does not match its durable seat binding`);
+        settings.set(member.name, {
+          harness: resumed.plan.brain.harness,
+          model: resumed.plan.brain.model,
+          cwd: resumed.plan.runtime?.scheduling?.cwd,
+          persona: resumed.plan.role.effective.persona,
+          approval: resumed.plan.permissions.approval as SpawnOpts['approval'],
+          filesystem: resumed.plan.permissions.filesystem as SpawnOpts['filesystem'],
+          unattended: resumed.plan.permissions.unattended as SpawnOpts['unattended'],
+        });
+      }
       if (currentSeat.seat_state === 'active') {
         if (!await retainRunningLaunch({
           provision: input, member, task, roomIdentityCid,
@@ -499,6 +562,7 @@ export async function provisionMembers(
             task,
             owner_seat_cid: ownerSeatCid,
           },
+          ...(input.canonical ? { canonicalRuntime: runtime } : {}),
         });
       } catch (error) {
         await cowork.revokeInvite(roomId, issued.invite_id).catch(() => {});
@@ -548,6 +612,15 @@ export async function provisionMembers(
   const record = activateRoom(roomId);
   if (taskId) activateTask(taskId);
   return record;
+}
+
+export async function provisionMembers(
+  input: ProvisionMembersInput,
+): Promise<RoomOrchestrationRecord> {
+  return withFileLock(
+    `${stateRoot()}/rooms/${encodeURIComponent(input.roomId)}.provision.lock`,
+    () => provisionMembersLocked(input),
+  );
 }
 
 export async function cleanupMembers(input: {

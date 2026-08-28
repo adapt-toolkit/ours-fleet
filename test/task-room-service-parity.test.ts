@@ -15,6 +15,7 @@ import { snapshotTemplate } from '../src/rooms-tasks/templates.js';
 import type { FleetConfig } from '../src/config.js';
 import type { CoworkAdapter } from '../src/rooms-tasks/cowork-adapter.js';
 import type { TemplateDefinition } from '../src/rooms-tasks/types.js';
+import { loadConfigResourceSnapshotFromDocuments } from '../src/config-resource-loader.js';
 
 const definition: TemplateDefinition = {
   name: 'empty-team', version: 1, description: 'No members', members: [],
@@ -27,6 +28,20 @@ function config(): FleetConfig {
     watchdogs: [], loops: [], roomTemplates: { 'empty-team': definition },
     rooms: { owner: { role: 'Owner' }, defaults: { attach_owner: false } },
   } as FleetConfig;
+}
+
+function canonicalSnapshot() {
+  const doc = (relativePath: string, text: string) => ({ relativePath, bytes: Buffer.from(text) });
+  return loadConfigResourceSnapshotFromDocuments({
+    bootstrapFile: '/cfg/fleet.yaml', configDir: '/cfg/fleet.conf.d',
+    bootstrapBytes: Buffer.from('schema_version: 2\nconfig_dir: fleet.conf.d\npolicy: {}\n'),
+    documents: [
+      doc('roles.d/dev.yaml', 'kind: Role\nversion: 1\nid: Developer\nspec: {}\n'),
+      doc('brains.d/dev.yaml', 'kind: Brain\nversion: 1\nid: dev\nspec: {harness: codex, model: test, effort: medium, session: acp}\n'),
+      doc('room-templates.d/empty.yaml', 'kind: RoomTemplate\nversion: 1\nid: empty-team\nspec:\n  version: 1\n  description: Canonical team\n  contract: Execute the task.\n  members:\n    - {slot: dev, role: Developer, count: 1, brain: {template: dev}, permissions: {approval: ask, filesystem: workspace, unattended: deny}}\n'),
+      doc('room-templates.d/members.yaml', 'kind: RoomTemplate\nversion: 1\nid: members\nspec:\n  version: 1\n  description: Members\n  contract: Contract\n  members:\n    - {slot: dev, role: Developer, count: 1, brain: {template: dev}, permissions: {approval: ask, filesystem: workspace, unattended: deny}}\n'),
+    ],
+  });
 }
 
 function cowork() {
@@ -63,11 +78,49 @@ afterEach(() => {
 function service(fake: CoworkAdapter): TaskRoomApplicationService {
   return new TaskRoomApplicationService(undefined, {
     loadConfiguration: config, cowork: () => fake, binPath: () => '/fleet',
-    provisionMembers: vi.fn(),
+    loadResourceSnapshot: canonicalSnapshot,
+    provisionMembers: vi.fn(async ({ roomId, taskId }) => {
+      const room = activateRoom(roomId);
+      if (taskId) activateTask(taskId);
+      return room;
+    }),
   });
 }
 
 describe('task create/start surface parity', () => {
+  it('rejects linked legacy rooms before active or provisioning task mutation', async () => {
+    for (const state of ['active', 'provisioning'] as const) {
+      const roomId = `legacy-${state}`;
+      const legacy = snapshotTemplate(definition);
+      const task = createTask({ title: `Legacy ${state}`, origin: { type: 'cli' }, start: true,
+        room_id: roomId, template: { name: legacy.name, version: legacy.version,
+          content_hash: legacy.content_hash } });
+      if (state === 'active') activateTask(task.task_id);
+      createRoomRecord({ room_id: roomId, room_name: roomId, task_id: task.task_id,
+        room_identity_cid: 'room-cid', template_snapshot: legacy });
+      const beforeTask = structuredClone(getTask(task.task_id));
+      const beforeRoom = structuredClone(getRoomRecord(roomId));
+      await expect(service(cowork().adapter).ensureTaskWork({
+        actor: { kind: 'local_control', surface: 'cli' }, taskId: task.task_id,
+      })).rejects.toThrow(/recovery\/close-only/u);
+      expect(getTask(task.task_id)).toEqual(beforeTask);
+      expect(getRoomRecord(roomId)).toEqual(beforeRoom);
+    }
+  });
+
+  it('rejects a dangling room reference before task mutation', async () => {
+    const task = createTask({ title: 'Dangling', origin: { type: 'cli' }, start: false,
+      room_id: 'missing-room', template: { name: 'empty-team', version: 1,
+        content_hash: 'f'.repeat(64) } });
+    const before = structuredClone(getTask(task.task_id));
+    await expect(service(cowork().adapter).ensureTaskWork({
+      actor: { kind: 'local_control', surface: 'cli' }, taskId: task.task_id,
+    })).rejects.toMatchObject({ code: 'task_non_resumable',
+      fields: { task: task.task_id, room: 'missing-room' } });
+    expect(getTask(task.task_id)).toEqual(before);
+    expect(getRoomRecord('missing-room')).toBeUndefined();
+  });
+
   it('runs the extracted complete provision flow for create', async () => {
     const h = cowork();
     const result = await service(h.adapter).createTask({
@@ -240,7 +293,7 @@ describe('task create/start surface parity', () => {
       task: { state: 'review', terminal_intent: { kind: 'done', room_id: 'room-shared' } } });
   });
 
-  it('rejects an explicit unknown work template even when a durable room snapshot exists', async () => {
+  it('rejects a legacy durable room before considering an explicit work override', async () => {
     const template = snapshotTemplate(definition);
     const task = createTask({ title: 'Pinned work', origin: { type: 'cli' }, start: true,
       room_id: 'room-pinned-work', template: { name: template.name, version: template.version,
@@ -250,7 +303,8 @@ describe('task create/start surface parity', () => {
     const app = service(cowork().adapter);
     await expect(app.ensureTaskWork({ actor: { kind: 'local_control', surface: 'cli' },
       taskId: task.task_id, template: 'does-not-exist' }))
-      .rejects.toMatchObject({ code: 'template_not_found', fields: { template: 'does-not-exist' } });
+      .rejects.toMatchObject({ code: 'task_non_resumable',
+        fields: { task: task.task_id, room: 'room-pinned-work' } });
   });
 
   it('finish preserves active-to-review before linked acceptance', async () => {
@@ -310,6 +364,7 @@ describe('task create/start surface parity', () => {
     const h = cowork();
     const provision = vi.fn(async ({ roomId }: { roomId: string }) => getRoomRecord(roomId)!);
     const app = new TaskRoomApplicationService(undefined, { loadConfiguration: () => cfg,
+      loadResourceSnapshot: canonicalSnapshot,
       cowork: () => h.adapter, binPath: () => '/fleet', provisionMembers: provision as any });
     await app.createRoom({ actor: { kind: 'local_control', surface: 'cli' }, name: 'Room name',
       template: 'members', goal: '  raw goal  ', brief: ' raw brief ' });
@@ -424,10 +479,11 @@ describe('task create/start surface parity', () => {
   });
 
   it('runs the extracted complete provision flow for start', async () => {
-    const template = snapshotTemplate(definition);
+    const templateHash = canonicalSnapshot().sources.find(source =>
+      source.kind === 'RoomTemplate' && source.id === 'empty-team')!.sha256;
     const task = createTask({
       title: 'Backlog', origin: { type: 'cli' }, start: false,
-      template: { name: template.name, version: template.version, content_hash: template.content_hash },
+      template: { name: 'empty-team', version: 1, content_hash: templateHash },
     });
     const h = cowork();
     const result = await service(h.adapter).startTask({

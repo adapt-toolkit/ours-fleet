@@ -148,6 +148,21 @@ export interface RoomMemberLaunchState {
   error?: string;
 }
 
+export interface CanonicalRoomMemberPlanBinding {
+  kind: 'canonical_agent_plan';
+  agent_id: string;
+  generation: number;
+  action_id: string;
+  plan_digest: string;
+  snapshot_digest: string;
+  brain_digest: string;
+  role_id: string;
+  reservation_digest: string;
+  handoff_digest: string;
+  authorization_revision: string;
+  identity_ownership: 'create_temporary';
+}
+
 export type RoomHistoryEvidence =
   | {
       kind: 'message'; seq: number; record_id: string; at: string; message_id: string;
@@ -199,6 +214,8 @@ export interface RoomMemberSeat {
   cowork_role: string;
   seat_state: 'pending' | 'active' | 'removed';
   launch?: RoomMemberLaunchState;
+  /** Absent only on pre-H2b legacy seats, which are close/recovery-only. */
+  plan_binding?: CanonicalRoomMemberPlanBinding;
   retirement?: MemberRetirement;
 }
 
@@ -262,6 +279,13 @@ export interface TemplateDefinition {
 
 export interface TemplateSnapshot extends TemplateDefinition {
   content_hash: string;
+  /** Present only for H2b canonical provisioning; absence marks a legacy snapshot. */
+  canonical?: Readonly<{
+    kind: 'canonical_room_template';
+    template_id: string;
+    snapshot_digest: string;
+    members: readonly Readonly<import('../config-resources.js').ExplicitBrainRoomTemplateMemberSpec>[];
+  }>;
 }
 
 // ── Config sections ─────────────────────────────────────────────────────

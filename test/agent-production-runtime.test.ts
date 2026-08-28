@@ -25,7 +25,10 @@ describe('Agent production runtime facade', () => {
       inspect: async name => identities.has(name)
         ? { state: 'present' as const, cid: identities.get(name)! } : { state: 'absent' as const }, create,
     }, now: () => 1 });
-    expect(Object.keys(runtime)).toEqual(['create', 'createRole', 'launch']);
+    expect(Object.keys(runtime)).toEqual([
+      'create', 'createRole', 'reserveTemporaryComposition',
+      'resumeTemporaryComposition', 'launch',
+    ]);
     const permanent = await runtime.createRole({ role: role('Permanent'), lifetime: 'persistent', actionId: 'p-1' });
     expect(permanent).toMatchObject({ state: 'complete', identityAcquisition: 'created',
       identityName: 'Permanent' });
@@ -34,6 +37,12 @@ describe('Agent production runtime facade', () => {
     const temporary = await runtime.createRole({ role: role('Temporary'), lifetime: 'temporary', actionId: 't-1' });
     expect(temporary).toEqual({ state: 'reserved', agentId: 'Temporary', generation: 1,
       actionId: 't-1', lifetime: 'temporary', completion: 'deferred' });
+    const resumed = runtime.resumeTemporaryComposition({ agentId: 'Temporary', actionId: 't-1' });
+    expect(resumed).toMatchObject({ handoff: { agentId: 'Temporary', actionId: 't-1' },
+      plan: { agentId: 'Temporary', lifecycle: 'temporary' } });
+    writeFileSync(join(resumed.handoff.canonicalDir, 'agent-plan.json'), '{}\n', { mode: 0o600 });
+    expect(() => runtime.resumeTemporaryComposition({ agentId: 'Temporary', actionId: 't-1' }))
+      .toThrow(/invalid_plan/u);
     expect(create).toHaveBeenCalledOnce();
   });
 

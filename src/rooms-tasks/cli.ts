@@ -75,7 +75,7 @@ function taskRoomPublicFailure(error: TaskRoomPublicError): {
     case 'template_not_found': return {
       legacy: `template not found: ${f.template ?? 'requested-template'}`, kind: 'not_found',
       detail: `The requested template ${f.template ?? ''}`.trim() + ' was not found.',
-      action: 'Run ours-fleet template list and retry with an available template.',
+      action: 'Run ours-fleet template list; migrate legacy entries to a schema-v2 RoomTemplate with explicit Role, Brain, and complete permissions.',
     };
     case 'template_mismatch': return {
       legacy: `template ${f.requested ?? 'requested-template'} does not match room ${f.room ?? 'requested-room'}'s provisioned template ${f.provisioned ?? 'recorded-template'}`,
@@ -308,7 +308,6 @@ function loadCfg(opts: { configuration?: string }): FleetConfig {
 
 function taskRoomService(configuration?: string): TaskRoomApplicationService {
   return new TaskRoomApplicationService(configuration, {
-    loadConfiguration: loadConfig,
     cowork: coworkFor,
     binPath: getBinPath,
     provisionMembers,
@@ -548,7 +547,9 @@ export function registerTaskCommands(parent: Command, cOpt: (cmd: Command) => Co
         ]));
       } catch (e) {
         if (e instanceof TaskRoomApplicationError && e.code === 'template_not_found')
-          e = taskRoomPublicError('template_not_found', { template: opts.template });
+          e = taskRoomPublicError('template_not_found', {
+            template: opts.template ?? e.fields.template,
+          });
         if (opts.json) die(e); dieTaskRoom(e);
       }
     });

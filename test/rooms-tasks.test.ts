@@ -18,7 +18,7 @@ import {
   createRoomRecord, getRoomRecord, listRoomRecords,
   advanceSaga, setSagaError, setRoomIdentity, setOwnerSeat,
   updateMemberSeats, updateRoomRoleBriefing, updateMemberStartup,
-  activateRoom, closeRoom,
+  activateRoom, closeRoom, bindCanonicalMemberPlan,
   RoomStateError,
 } from '../src/rooms-tasks/room-state.js';
 import {
@@ -435,6 +435,52 @@ describe('task-state', () => {
 // ── Room state ─────────────────────────────────────────────────────────────
 
 describe('room-state', () => {
+  it('serializes canonical plan binding with order-independent replay and no loser mutation', async () => {
+    createRoomRecord({ room_id: 'bind-1', room_name: 'Bind' });
+    updateMemberSeats('bind-1', [{ role_name: 'member-1', slot: 'dev', cowork_role: 'Developer',
+      seat_state: 'pending', launch: { state: 'pending', attempt: 0, updated_at: 'now' } }]);
+    const binding = { kind: 'canonical_agent_plan' as const, agent_id: 'member-1', generation: 1,
+      action_id: 'action-1', plan_digest: `sha256:${'1'.repeat(64)}`,
+      snapshot_digest: `sha256:${'2'.repeat(64)}`, brain_digest: `sha256:${'3'.repeat(64)}`,
+      role_id: 'Developer', reservation_digest: `sha256:${'4'.repeat(64)}`,
+      handoff_digest: `sha256:${'5'.repeat(64)}`, authorization_revision: 'revision',
+      identity_ownership: 'create_temporary' as const };
+    expect((await bindCanonicalMemberPlan('bind-1', 'member-1', binding)).member_seats[0].plan_binding)
+      .toEqual(binding);
+    const reordered = Object.fromEntries(Object.entries(binding).reverse()) as unknown as typeof binding;
+    expect((await bindCanonicalMemberPlan('bind-1', 'member-1', reordered)).member_seats[0].plan_binding)
+      .toEqual(binding);
+    const beforeConflict = structuredClone(getRoomRecord('bind-1'));
+    await expect(bindCanonicalMemberPlan('bind-1', 'member-1', { ...binding, action_id: 'other' }))
+      .rejects.toThrow(/plan binding conflicts/u);
+    expect(getRoomRecord('bind-1')).toEqual(beforeConflict);
+
+    createRoomRecord({ room_id: 'bind-2', room_name: 'Bind after launch' });
+    updateMemberSeats('bind-2', [{ role_name: 'member-2', slot: 'dev', cowork_role: 'Developer',
+      seat_state: 'pending', launch: { state: 'intent', attempt: 1, action_id: 'started', updated_at: 'now' } }]);
+    const beforeLaunchConflict = structuredClone(getRoomRecord('bind-2'));
+    await expect(bindCanonicalMemberPlan('bind-2', 'member-2', { ...binding, agent_id: 'member-2' }))
+      .rejects.toThrow(/after launch intent/u);
+    expect(getRoomRecord('bind-2')).toEqual(beforeLaunchConflict);
+
+    createRoomRecord({ room_id: 'bind-race', room_name: 'Bind race' });
+    updateMemberSeats('bind-race', [{ role_name: 'member-race', slot: 'dev', cowork_role: 'Developer',
+      seat_state: 'pending', launch: { state: 'pending', attempt: 0, updated_at: 'now' } }]);
+    const left = { ...binding, agent_id: 'member-race', action_id: 'left' };
+    const right = { ...binding, agent_id: 'member-race', action_id: 'right' };
+    const outcomes = await Promise.allSettled([
+      bindCanonicalMemberPlan('bind-race', 'member-race', left),
+      bindCanonicalMemberPlan('bind-race', 'member-race', right),
+    ]);
+    expect(outcomes.map(outcome => outcome.status).sort()).toEqual(['fulfilled', 'rejected']);
+    const winner = getRoomRecord('bind-race')!.member_seats[0].plan_binding!;
+    expect(['left', 'right']).toContain(winner.action_id);
+    const afterRace = structuredClone(getRoomRecord('bind-race'));
+    await expect(bindCanonicalMemberPlan('bind-race', 'member-race',
+      winner.action_id === 'left' ? right : left)).rejects.toThrow(/conflicts/u);
+    expect(getRoomRecord('bind-race')).toEqual(afterRace);
+  });
+
   describe('createRoomRecord', () => {
     it('creates a room in provisioning state', () => {
       const r = createRoomRecord({ room_id: 'room-1', room_name: 'Test Room' });

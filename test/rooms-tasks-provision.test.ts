@@ -9,6 +9,10 @@ const mocks = vi.hoisted(() => ({
   tempLiveness: vi.fn(),
   secureArchive: vi.fn(),
   archiveForAction: vi.fn(),
+  productionRuntime: {
+    create: vi.fn(), reserveTemporaryComposition: vi.fn(),
+    resumeTemporaryComposition: vi.fn(),
+  },
 }));
 
 vi.mock('../src/spawn.js', async importOriginal => ({
@@ -21,6 +25,9 @@ vi.mock('../src/temp-lifecycle.js', async importOriginal => ({
   tempSupervisorLiveness: mocks.tempLiveness,
   secureStoppedTempArchive: mocks.secureArchive,
   tempArchiveForCreationAction: mocks.archiveForAction,
+}));
+vi.mock('../src/agent-production-runtime.js', () => ({
+  createAgentProductionRuntime: () => mocks.productionRuntime,
 }));
 
 import { provisionMembers } from '../src/rooms-tasks/provision.js';
@@ -40,6 +47,7 @@ import { inheritCallerSpawnDefaults } from '../src/fleet-proxy.js';
 import type { ResolvedRole } from '../src/config.js';
 import '../src/harness/codex.js';
 import '../src/harness/claude-code.js';
+import { loadConfigResourceSnapshotFromDocuments } from '../src/config-resource-loader.js';
 
 let root: string;
 let previousHome: string | undefined;
@@ -168,6 +176,8 @@ beforeEach(() => {
   acceptSpawn = undefined;
   vi.clearAllMocks();
   mocks.tempLiveness.mockResolvedValue('running');
+  mocks.productionRuntime.create.mockResolvedValue({ state: 'reserved', agentId: 'unused',
+    generation: 1, actionId: 'unused', lifetime: 'temporary', completion: 'deferred' });
   mocks.spawnTemp.mockImplementation(async (opts: Record<string, any>) => {
     const dir = join(root, '.ours-fleet', 'tmp', opts.name);
     mkdirSync(dir, { recursive: true });
@@ -200,6 +210,93 @@ afterEach(() => {
 });
 
 describe('simple Cowork room member startup', () => {
+  it('binds a canonical stored AgentPlan before issuing its invite', async () => {
+    const doc = (relativePath: string, text: string) => ({ relativePath, bytes: Buffer.from(text) });
+    const snapshot = loadConfigResourceSnapshotFromDocuments({
+      bootstrapFile: '/cfg/fleet.yaml', configDir: '/cfg/fleet.conf.d',
+      bootstrapBytes: Buffer.from('schema_version: 2\nconfig_dir: fleet.conf.d\npolicy: {}\n'),
+      documents: [
+        doc('roles.d/worker.yaml', 'kind: Role\nversion: 1\nid: Worker\nspec: {persona: Canonical}\n'),
+        doc('brains.d/brain.yaml', 'kind: Brain\nversion: 1\nid: brain\nspec: {harness: codex, model: exact, effort: high, session: acp}\n'),
+      ],
+    });
+    const member = { slot: 'developer', role: 'Worker', count: 1,
+      brain: { template: 'brain' },
+      permissions: { approval: 'ask', filesystem: 'workspace', unattended: 'deny' } } as const;
+    const handoff = { schemaVersion: 1, kind: 'TempAgentSupervisorHandoff',
+      agentId: 'room-room-can-developer-1', actionId: 'canonical-action', generation: 1,
+      planDigest: `sha256:${'1'.repeat(64)}`, snapshotDigest: snapshot.digest,
+      reservationDigest: `sha256:${'2'.repeat(64)}`, canonicalDir: '/canonical',
+      planBytesDigest: `sha256:${'3'.repeat(64)}`, authorizationRevision: 'revision',
+      lifetime: 'temporary', identityLifecycle: 'connector_session_owned', completion: 'deferred',
+      handoffDigest: `sha256:${'4'.repeat(64)}` } as const;
+    mocks.productionRuntime.reserveTemporaryComposition.mockImplementation(async input => ({
+      ...handoff, agentId: input.request.source.agentId, actionId: input.actionId,
+    }));
+    mocks.productionRuntime.resumeTemporaryComposition.mockImplementation(input => ({
+      handoff: { ...handoff, agentId: input.agentId, actionId: input.actionId },
+      plan: { agentId: input.agentId, generation: 1, planDigest: handoff.planDigest,
+        snapshotDigest: snapshot.digest, brain: { harness: 'codex', model: 'exact', effort: 'high', session: 'acp' },
+        runtime: { scheduling: { cwd: '/bound' } }, role: { effective: { persona: 'Canonical' } },
+        permissions: member.permissions },
+    }));
+    createRoomRecord({ room_id: 'room-canonical', room_name: 'Room', room_identity_cid: 'room-cid' });
+    const h = coworkHarness();
+    let releaseInvite!: () => void;
+    let markInviteReached!: () => void;
+    const inviteReached = new Promise<void>(resolve => { markInviteReached = resolve; });
+    const inviteRelease = new Promise<void>(resolve => { releaseInvite = resolve; });
+    h.issueInvite.mockImplementationOnce(async (_roomId, opts) => {
+      expect(getRoomRecord('room-canonical')!.member_seats[0].plan_binding).toMatchObject({
+        kind: 'canonical_agent_plan', plan_digest: handoff.planDigest,
+      });
+      markInviteReached();
+      await inviteRelease;
+      return { invite: 'secret-invite-1', invite_id: 'invite-1', min_accepts: opts.min_accepts };
+    });
+    const canonicalInput = { cfg: cfg(), cowork: h.cowork, roomId: 'room-canonical',
+      template: template(1), canonical: { snapshot, templateId: 'pair', members: [member] },
+      binPath: '/usr/bin/ours-fleet' };
+    const winner = provisionMembers(canonicalInput);
+    await inviteReached;
+    const contender = provisionMembers(canonicalInput);
+    await Promise.resolve();
+    expect(h.cowork.recoverRoom).toHaveBeenCalledTimes(1);
+    expect(mocks.productionRuntime.reserveTemporaryComposition).toHaveBeenCalledOnce();
+    releaseInvite();
+    await Promise.all([winner, contender]);
+    const changed = loadConfigResourceSnapshotFromDocuments({
+      bootstrapFile: '/changed/fleet.yaml', configDir: '/changed/fleet.conf.d',
+      bootstrapBytes: Buffer.from('schema_version: 2\nconfig_dir: fleet.conf.d\npolicy: {revision: changed}\n'),
+      documents: [
+        doc('roles.d/worker.yaml', 'kind: Role\nversion: 1\nid: Worker\nspec: {persona: Changed}\n'),
+        doc('brains.d/brain.yaml', 'kind: Brain\nversion: 1\nid: brain\nspec: {harness: codex, model: changed, effort: low, session: acp}\n'),
+      ],
+    });
+    await provisionMembers({ cfg: cfg(), cowork: h.cowork, roomId: 'room-canonical',
+      template: template(1), canonical: { snapshot: changed, templateId: 'pair', members: [member] },
+      binPath: '/usr/bin/ours-fleet' });
+    expect(mocks.productionRuntime.reserveTemporaryComposition).toHaveBeenCalledOnce();
+    expect(mocks.productionRuntime.resumeTemporaryComposition).toHaveBeenCalledTimes(3);
+    expect(mocks.spawnTemp).toHaveBeenCalledOnce();
+    expect(mocks.spawnTemp.mock.calls[0][0]).toMatchObject({
+      model: 'exact', harness: 'codex', cwd: '/bound', creationActionId: expect.any(String),
+    });
+
+    const durableBinding = structuredClone(
+      getRoomRecord('room-canonical')!.member_seats[0].plan_binding,
+    );
+    mocks.productionRuntime.resumeTemporaryComposition.mockImplementationOnce(() => {
+      throw new Error('invalid stored AgentPlan');
+    });
+    await expect(provisionMembers({ cfg: cfg(), cowork: h.cowork, roomId: 'room-canonical',
+      template: template(1), canonical: { snapshot: changed, templateId: 'pair', members: [member] },
+      binPath: '/usr/bin/ours-fleet' })).rejects.toThrow(/invalid stored AgentPlan/u);
+    expect(h.issueInvite).toHaveBeenCalledOnce();
+    expect(mocks.spawnTemp).toHaveBeenCalledOnce();
+    expect(getRoomRecord('room-canonical')!.member_seats[0].plan_binding).toEqual(durableBinding);
+  });
+
   it('issues one one-time invite per temporary agent and activates from authenticated seats', async () => {
     const task = createTask({ title: 'Ship', origin: { type: 'cli' } });
     createRoomRecord({

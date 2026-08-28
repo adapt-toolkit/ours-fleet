@@ -5,6 +5,8 @@ import { attachOursClient, type OursClient } from '@ours.network/sdk/client';
 
 import { withFileLock } from '../atomic-file.js';
 import { agentDir, stateRoot } from '../paths.js';
+import { daemonIdentityProvisioner } from '../creation.js';
+import { createAgentProductionRuntime } from '../agent-production-runtime.js';
 import {
   readTempSupervisor, secureStoppedTempArchive, stopTempSupervisor, tempSupervisorLiveness,
   type TempLifecycleDeps,
@@ -53,7 +55,37 @@ function exactMemberIdentity(seat: RoomMemberSeat): void {
   }
 }
 
+function authenticateCanonicalBinding(seat: RoomMemberSeat): void {
+  if (seat.plan_binding) {
+    const binding = seat.plan_binding;
+    const runtime = createAgentProductionRuntime({
+      trustedStateRoot: stateRoot(), identityProvisioner: daemonIdentityProvisioner(),
+    });
+    const { handoff, plan } = runtime.resumeTemporaryComposition({
+      agentId: binding.agent_id, actionId: binding.action_id,
+    });
+    const exact = handoff.agentId === binding.agent_id
+      && plan.agentId === binding.agent_id
+      && seat.role_name === binding.agent_id
+      && handoff.generation === binding.generation
+      && handoff.actionId === binding.action_id
+      && handoff.planDigest === binding.plan_digest
+      && handoff.snapshotDigest === binding.snapshot_digest
+      && handoff.reservationDigest === binding.reservation_digest
+      && handoff.handoffDigest === binding.handoff_digest
+      && handoff.authorizationRevision === binding.authorization_revision
+      && binding.kind === 'canonical_agent_plan'
+      && binding.identity_ownership === 'create_temporary'
+      && plan.identity.ownership === binding.identity_ownership
+      && plan.role.id === binding.role_id
+      && plan.adapter.brainDigest === binding.brain_digest;
+    if (!exact)
+      throw new Error(`room member '${seat.role_name}' canonical AgentPlan authority mismatch`);
+  }
+}
+
 async function inspectMember(seat: RoomMemberSeat): Promise<{ launchId: string }> {
+  authenticateCanonicalBinding(seat);
   exactMemberIdentity(seat);
   const supervisor = readTempSupervisor(agentDir(seat.role_name, true));
   if (!supervisor || supervisor.role !== seat.role_name) {
@@ -215,6 +247,10 @@ export async function closeManagedRoom(input: {
   const deps = input.deps ?? {};
   const lock = deps.lock ?? withFileLock;
   return lock(roomCloseLockPath(input.roomId), async () => {
+    const before = getRoomRecord(input.roomId);
+    for (const seat of before?.member_seats ?? []) {
+      if (seat.plan_binding && !seat.retirement) authenticateCanonicalBinding(seat);
+    }
     let room = beginRoomClose(input.roomId);
     if (room.state === 'closed') return room;
     try {
