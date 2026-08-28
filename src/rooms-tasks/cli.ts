@@ -33,6 +33,7 @@ import { TaskListError } from './task-lists.js';
 import {
   recordFleetAuditFailure, recordFleetAuditPresentation, recordFleetAuditResource,
 } from '../fleet-command-audit.js';
+import { createTaskReport, createTasksReport, writeReportArtifact } from '../reports/index.js';
 
 type TaskRoomPublicErrorCode =
   | 'task_confirmation_mismatch' | 'room_confirmation_mismatch'
@@ -339,6 +340,24 @@ function auditRoom(operation: string, room: RoomOrchestrationRecord, previousSta
       role: safeSelectionSummary(member.launch?.agent_definition, 'role') === 'unresolved'
         ? member.cowork_role : safeSelectionSummary(member.launch?.agent_definition, 'role'),
       permissions: safePermissionsSummary(member.launch?.agent_definition) })) });
+}
+
+async function emitTaskHtml(input: {
+  service: TaskRoomApplicationService;
+  filter?: { state?: import('./types.js').TaskState | import('./types.js').TaskState[]; list?: string };
+  selectedList?: string;
+  state?: import('./types.js').TaskState;
+  output?: string;
+  overwrite?: boolean;
+}): Promise<void> {
+  const artifact = await createTasksReport({
+    viewer: { surface: 'cli', authority: 'local-owner' },
+    collect: () => ({ lists: input.service.listTaskLists(), tasks: input.service.listTasks(input.filter) }),
+    selectedList: input.selectedList, state: input.state,
+  });
+  if (!input.output) { process.stdout.write(artifact.html); return; }
+  const result = await writeReportArtifact(artifact, { output: input.output, overwrite: input.overwrite });
+  process.stdout.write(`${JSON.stringify({ schema_version: 1, artifact: artifact.metadata, delivery: result })}\n`);
 }
 
 const roomActionMarkdown = (
@@ -704,9 +723,15 @@ export function registerTaskCommands(parent: Command, cOpt: (cmd: Command) => Co
     .option('--state <state>', 'filter by state (backlog|active|provisioning|review|done|cancelled|failed|all)')
     .option('--list <name>', 'filter by task list')
     .option('--group-by-list', 'group deterministic results by list (JSON)')
+    .option('--format <format>', 'output format (text|html)', 'text')
+    .option('--output <path>', 'write HTML artifact to path')
+    .option('--overwrite', 'replace an existing HTML output file')
     .option('--json', 'JSON output')
-    .action((opts: { configuration?: string; state?: string; list?: string; groupByList?: boolean; json?: boolean }) => {
+    .action(async (opts: { configuration?: string; state?: string; list?: string; groupByList?: boolean; format?: string; output?: string; overwrite?: boolean; json?: boolean }) => {
       try {
+        if (!['text', 'html'].includes(opts.format ?? 'text')) throw new TaskStateError('format must be text or html');
+        if (opts.json && opts.format === 'html') throw new TaskStateError('--json and --format html are mutually exclusive');
+        if ((opts.output || opts.overwrite) && opts.format !== 'html') throw new TaskStateError('--output/--overwrite require --format html');
         let stateFilter: import('./types.js').TaskState | undefined;
         if (opts.state && opts.state !== 'all') {
           stateFilter = opts.state as import('./types.js').TaskState;
@@ -714,6 +739,10 @@ export function registerTaskCommands(parent: Command, cOpt: (cmd: Command) => Co
         const service = taskRoomService(opts.configuration);
         const filter = { ...(stateFilter ? { state: stateFilter } : {}), ...(opts.list ? { list: opts.list } : {}) };
         const tasks = service.listTasks(filter);
+        if (opts.format === 'html') {
+          await emitTaskHtml({ service, filter, selectedList: opts.list, state: stateFilter, output: opts.output, overwrite: opts.overwrite });
+          return;
+        }
         if (opts.json) {
           console.log(JSON.stringify(opts.groupByList
             ? { schema_version: 1, groups: service.groupedTasks(filter) }
@@ -726,10 +755,21 @@ export function registerTaskCommands(parent: Command, cOpt: (cmd: Command) => Co
 
   taskCmd.command('lists')
     .description('list named task lists')
+    .option('--format <format>', 'output format (text|html)', 'text')
+    .option('--output <path>', 'write HTML artifact to path')
+    .option('--overwrite', 'replace an existing HTML output file')
     .option('--json', 'JSON output')
-    .action((opts: { json?: boolean }) => {
+    .action(async (opts: { configuration?: string; format?: string; output?: string; overwrite?: boolean; json?: boolean }) => {
       try {
-        const lists = taskRoomService().listTaskLists();
+        if (!['text', 'html'].includes(opts.format ?? 'text')) throw new TaskStateError('format must be text or html');
+        if (opts.json && opts.format === 'html') throw new TaskStateError('--json and --format html are mutually exclusive');
+        if ((opts.output || opts.overwrite) && opts.format !== 'html') throw new TaskStateError('--output/--overwrite require --format html');
+        const service = taskRoomService(opts.configuration);
+        const lists = service.listTaskLists();
+        if (opts.format === 'html') {
+          await emitTaskHtml({ service, output: opts.output, overwrite: opts.overwrite });
+          return;
+        }
         if (opts.json) { console.log(JSON.stringify({ schema_version: 1, lists }, null, 2)); return; }
         console.log(renderMarkdownList({ icon: '📚', title: 'Task lists', empty: 'No task lists found.',
           records: lists.map(list => `${markdownCode(list.name)}${list.built_in ? ' — built-in' : ''}`) }));
@@ -784,10 +824,24 @@ export function registerTaskCommands(parent: Command, cOpt: (cmd: Command) => Co
 
   taskCmd.command('show <id>')
     .description('show task details')
+    .option('--format <format>', 'output format (text|html)', 'text')
+    .option('--output <path>', 'write HTML artifact to path')
+    .option('--overwrite', 'replace an existing HTML output file')
     .option('--json', 'JSON output')
-    .action((id: string, opts: { json?: boolean }) => {
+    .action(async (id: string, opts: { format?: string; output?: string; overwrite?: boolean; json?: boolean }) => {
       try {
-        const { task: t, orchestration: room } = taskRoomService().getTask(id);
+        if (!['text', 'html'].includes(opts.format ?? 'text')) throw new TaskStateError('format must be text or html');
+        if (opts.json && opts.format === 'html') throw new TaskStateError('--json and --format html are mutually exclusive');
+        if ((opts.output || opts.overwrite) && opts.format !== 'html') throw new TaskStateError('--output/--overwrite require --format html');
+        const service = taskRoomService();
+        if (opts.format === 'html') {
+          const artifact = await createTaskReport({ viewer: { surface: 'cli', authority: 'local-owner' }, taskId: id,
+            collect: () => service.getTask(id).task });
+          if (!opts.output) { process.stdout.write(artifact.html); return; }
+          const delivery = await writeReportArtifact(artifact, { output: opts.output, overwrite: opts.overwrite });
+          process.stdout.write(`${JSON.stringify({ schema_version: 1, artifact: artifact.metadata, delivery })}\n`); return;
+        }
+        const { task: t, orchestration: room } = service.getTask(id);
         if (opts.json) {
           console.log(JSON.stringify({
             schema_version: 1, task: t, orchestration: room ?? null,

@@ -17,6 +17,7 @@ import { TaskRoomApplicationError } from '../application/task-room-service.js';
 import type { CreateRoomRequest, CreateTaskRequest, TaskRoomApplicationService } from '../application/task-room-service.js';
 import type { TaskState } from '../rooms-tasks/types.js';
 import { TaskListError } from '../rooms-tasks/task-lists.js';
+import { createTaskReport, createTasksReport } from '../reports/index.js';
 
 /**
  * Fleet-level effects a deterministic owner command may trigger. Production
@@ -41,6 +42,7 @@ export interface OwnerFleetOps {
  * cannot name another agent or another recipient.
  */
 export interface OwnerCommandContext {
+  authenticatedCid?: string;
   role: string;
   /** Harness id of the role (e.g. 'claude-code', 'codex'); gates forwarding. */
   harness: string;
@@ -92,6 +94,30 @@ export interface OwnerCommandContext {
   recentEvents(limit: number): SessionEvent[];
   readWorklogTail(maxChars: number): Promise<string | undefined>;
   reply(text: string): Promise<void>;
+  replyHtml(filename: string, html: string): Promise<void>;
+}
+
+async function ownerTaskReport(ctx: OwnerCommandContext, input: {
+  filter?: { state?: TaskState | TaskState[]; list?: string };
+  list?: string;
+  blockedOnly?: boolean;
+}) {
+  return createTasksReport({
+    viewer: { surface: 'messenger', authenticatedCid: ctx.authenticatedCid ?? 'owner-command-context', roomCids: [] },
+    collect: () => {
+      const tasks = ctx.listTasks(input.filter);
+      return { lists: ctx.listTaskLists(), tasks: input.blockedOnly ? tasks.filter(task => task.blocked) : tasks };
+    },
+    selectedList: input.list, source: { name: 'ours-fleet', version: ctx.version },
+  });
+}
+
+async function ownerFocusedTaskReport(ctx: OwnerCommandContext, taskId: string) {
+  return createTaskReport({
+    viewer: { surface: 'messenger', authenticatedCid: ctx.authenticatedCid ?? 'owner-command-context', roomCids: [] },
+    taskId, collect: () => ctx.getTask(taskId).task,
+    source: { name: 'ours-fleet', version: ctx.version },
+  });
 }
 
 export interface OwnerCommand {
@@ -441,8 +467,15 @@ export const ownerCommands: OwnerCommand[] = [
               : undefined;
             const combined = { ...(stateFilter ?? {}), ...(list ? { list } : {}) };
             const tasks = ctx.listTasks(combined);
+            const html = rest.includes('--format=html') || rest.includes('--html');
             if (filter === 'blocked') {
               const blocked = tasks.filter(t => t.blocked);
+              if (html) {
+                const artifact = await ownerTaskReport(ctx, { filter: combined, list, blockedOnly: true });
+                await ctx.replyHtml(artifact.metadata.filename, artifact.html);
+                await ctx.reply(`HTML report attached: ${artifact.metadata.filename}`);
+                break;
+              }
               await ctx.reply(renderMarkdownList({
                 icon: '🚧', title: 'Blocked tasks', empty: 'No blocked tasks found.',
                 records: blocked.map(taskListRecord),
@@ -450,11 +483,23 @@ export const ownerCommands: OwnerCommand[] = [
               break;
             }
             if (grouped) {
+              if (html) {
+                const artifact = await ownerTaskReport(ctx, { filter: combined, list });
+                await ctx.replyHtml(artifact.metadata.filename, artifact.html);
+                await ctx.reply(`HTML report attached: ${artifact.metadata.filename}`);
+                break;
+              }
               const groups = ctx.groupedTasks(combined);
               await ctx.reply(groups.map(group => renderMarkdownList({
                 icon: '📋', title: `Tasks — ${group.list.name}`, empty: 'No tasks found.',
                 records: group.tasks.map(taskListRecord),
               })).join('\n\n'));
+              break;
+            }
+            if (html) {
+              const artifact = await ownerTaskReport(ctx, { filter: combined, list });
+              await ctx.replyHtml(artifact.metadata.filename, artifact.html);
+              await ctx.reply(`HTML report attached: ${artifact.metadata.filename}`);
               break;
             }
             await ctx.reply(renderMarkdownList({
@@ -465,6 +510,12 @@ export const ownerCommands: OwnerCommand[] = [
           }
           case 'lists': {
             const lists = ctx.listTaskLists();
+            if (rest.includes('--format=html') || rest.includes('--html')) {
+              const artifact = await ownerTaskReport(ctx, {});
+              await ctx.replyHtml(artifact.metadata.filename, artifact.html);
+              await ctx.reply(`HTML report attached: ${artifact.metadata.filename}`);
+              break;
+            }
             await ctx.reply(renderMarkdownList({ icon: '📚', title: 'Task lists', empty: 'No task lists found.',
               records: lists.map(list => `${markdownCode(list.name)}${list.built_in ? ' — built-in' : ''}`) }));
             break;
@@ -503,8 +554,17 @@ export const ownerCommands: OwnerCommand[] = [
             break;
           }
           case 'show': {
-            if (!rest[0]) throw new OwnerCommandUsageError('usage: /task show <id>');
-            await showTask(rest[0]);
+            const html = rest.includes('--format=html') || rest.includes('--html');
+            const positional = rest.filter(value => value !== '--format=html' && value !== '--html');
+            if (positional.length !== 1 || rest.some(value => value.startsWith('--') && value !== '--format=html' && value !== '--html'))
+              throw new OwnerCommandUsageError('usage: /task show <id> [--format=html]');
+            if (html) {
+              const artifact = await ownerFocusedTaskReport(ctx, positional[0]);
+              await ctx.replyHtml(artifact.metadata.filename, artifact.html);
+              await ctx.reply(`HTML report attached: ${artifact.metadata.filename}`);
+              break;
+            }
+            await showTask(positional[0]);
             break;
           }
           case 'start': {

@@ -1,0 +1,27 @@
+import { chromium } from '@playwright/test';
+import { resolve } from 'node:path';
+import { pathToFileURL } from 'node:url';
+
+const file = resolve(process.argv[2] ?? '');
+if (!process.argv[2]) throw new Error('usage: verify-task-navigator.mjs <html-file>');
+const browser = await chromium.launch({ headless: true });
+const page = await browser.newPage({ viewport: { width: 1440, height: 900 } });
+const url = pathToFileURL(file).href;
+await page.goto(url);
+const defaultBackground = await page.locator('a[href="#list-release"]').evaluate(node => getComputedStyle(node).backgroundColor);
+await page.locator('a[href="#list-waiting"]').focus();
+await page.keyboard.press('Enter');
+await page.waitForFunction(() => location.hash === '#list-waiting');
+const focusedId = await page.locator('#list-waiting').evaluate(node => node.id);
+const waitingBackground = await page.locator('a[href="#list-waiting"]').evaluate(node => getComputedStyle(node).backgroundColor);
+await page.goBack();
+if (new URL(page.url()).hash) throw new Error('browser back did not restore the default location');
+await page.goto(`${url}#list-release`);
+if (await page.locator('#list-release').count() !== 1) throw new Error('release deep link is not unique');
+await page.setViewportSize({ width: 390, height: 844 });
+const mobileWidth = await page.locator('.navigator-shell').evaluate(node => node.getBoundingClientRect().width);
+await page.emulateMedia({ media: 'print', colorScheme: 'light' });
+const printPanels = await page.locator('.list-panel').evaluateAll(nodes => nodes.map(node => getComputedStyle(node).display));
+if (printPanels.some(display => display === 'none')) throw new Error('print hides a list panel');
+await browser.close();
+console.log(JSON.stringify({ defaultBackground, waitingBackground, focusedId, mobileWidth, printPanels }));

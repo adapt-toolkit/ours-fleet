@@ -1,6 +1,6 @@
 import { createHash } from 'node:crypto';
 import { existsSync, readFileSync } from 'node:fs';
-import { mkdir, readFile, readdir, rm } from 'node:fs/promises';
+import { mkdir, readFile, readdir, rm, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 
 import { canonicalCid, type OwnerAttachmentConfig, type OwnerChannelConfig } from '../config.js';
@@ -1371,6 +1371,7 @@ export class OwnerChannel implements OwnerChannelHandle {
     sender: { id: string; name: string }, text: string, wireId: string,
   ): Promise<void> {
     const ctx: OwnerCommandContext = {
+      authenticatedCid: sender.id,
       role: this.options.role,
       harness: this.options.harness,
       version: VERSION,
@@ -1437,6 +1438,15 @@ export class OwnerChannel implements OwnerChannelHandle {
       recentEvents: limit => this.options.session.eventsSince(0).slice(-limit),
       readWorklogTail: maxChars => this.readWorklogTail(maxChars),
       reply: async replyText => { await this.send(sender.id, replyText, wireId); },
+      replyHtml: async (filename, html) => {
+        const directory = join(this.options.stateDir, '.owner-channel-report-outbox', this.requestId(wireId));
+        const path = join(directory, filename);
+        await mkdir(directory, { recursive: true, mode: 0o700 });
+        try {
+          await writeFile(path, html, { flag: 'wx', mode: 0o600 });
+          await this.client.sendFile({ contact: sender.id, path, filename, replyToWireId: wireId });
+        } finally { await rm(directory, { recursive: true, force: true }); }
+      },
     };
     try {
       await dispatchOwnerCommand(text, ctx);
