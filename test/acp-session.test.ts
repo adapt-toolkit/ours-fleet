@@ -5,7 +5,10 @@ import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
-import { AcpSession } from '../src/session/acp.js';
+import { AcpSession, createInjectedAcpSession } from '../src/session/acp.js';
+import * as acpSessionModule from '../src/session/acp.js';
+import { AgentConversationRelay } from '../src/agent-conversation-control.js';
+import type { AcpBodyBrainProvider } from '../src/session/acp-body-brain-transport.js';
 import {
   RoleControlServer, controlRequest, controlSocketPath, controlTokenPath, livenessNote,
 } from '../src/session/control.js';
@@ -1303,5 +1306,47 @@ describe.each(['resume', 'load'] as const)('session/%s carries required MCP stat
       mcpServers: mcpServers ?? [], disableInheritedMcp,
     });
     await session.close();
+  });
+});
+
+describe('injected durable BodyBrain construction', () => {
+  it('does not compose a second AcpSession owner or alias restore to a fresh launch', () => {
+    expect('createAcpSessionBodyBrainDriver' in acpSessionModule).toBe(false);
+  });
+
+  it('reuses AcpSession queue, ledger, event and terminal-result semantics after validated relay claim', async () => {
+    const stateDir = mkdtempSync(join(tmpdir(), 'ours-fleet-injected-acp-')); dirs.push(stateDir);
+    let listener: ((value: unknown) => void) | undefined; let seq = 0;
+    const provider: AcpBodyBrainProvider = {
+      subscribe: next => { listener = next; return () => { listener = undefined; }; },
+      start: async () => ({ state: 'accepted', sessionMetadata: { schemaVersion: 1,
+        token: 'injected-session', digest: `sha256:${'a'.repeat(64)}` } }), restore: vi.fn(),
+      submit: vi.fn(async request => { queueMicrotask(() => listener?.({ protocolVersion: 1,
+        generation: request.generation, transportSeq: ++seq, notificationId: `n${seq}`,
+        kind: 'completed', promptId: request.promptId, outcome: 'completed' }));
+        return { state: 'accepted' }; }),
+      respondPermission: vi.fn(async () => ({ state: 'accepted' })),
+      cancel: vi.fn(async () => ({ state: 'accepted' })),
+      forceTerminate: vi.fn(async () => ({ state: 'accepted' })),
+      close: vi.fn(async () => ({ state: 'accepted' })), retire: vi.fn(async () => ({ state: 'accepted' })),
+      cleanup: vi.fn(async () => undefined),
+    };
+    const relay = new AgentConversationRelay({ agentId: 'A', generation: 1,
+      runtimeInstanceKey: 'runtime', providerRuntimeId: 'injected-session' }, 'codex-acp', provider);
+    await relay.start({ protocolVersion: 1, generation: 'g1', planDigest: `sha256:${'b'.repeat(64)}` });
+    const session = await createInjectedAcpSession({ name: 'A', cwd: stateDir, stateDir, mode: 'fresh',
+      permissions: { approval: 'allow', filesystem: 'workspace', unattended: 'deny' }, log: () => {} },
+    relay, relay.issue());
+    expect(session.pid).toBe(2_147_483_647); expect(session.pid).not.toBe(process.pid);
+    await expect(session.submitPrompt('hello', { origin: { kind: 'startup' } }))
+      .resolves.toMatchObject({ accepted: true, succeeded: true, outcome: 'completed' });
+    expect(session.eventsSince(0)).toEqual(expect.arrayContaining([
+      expect.objectContaining({ kind: 'state', status: 'running' }),
+      expect.objectContaining({ kind: 'turn_stop', stopReason: 'end_turn' }),
+    ]));
+    expect(readFileSync(join(stateDir, '.conversation', 'events-000001.jsonl'), 'utf8')).toContain('turn.completed');
+    const osKill = vi.spyOn(process, 'kill'); await session.close();
+    expect(provider.close).toHaveBeenCalledOnce(); expect(provider.forceTerminate).toHaveBeenCalledOnce();
+    expect(osKill).not.toHaveBeenCalled(); osKill.mockRestore();
   });
 });

@@ -16,6 +16,8 @@ import {
 import { getBodyBrainAdapterDescriptor } from './harness/registry.js';
 import type { AcpBodyBrainInjectedDriver } from './session/acp-body-brain-provider.js';
 import type { AcpBodyBrainProvider, AcpSessionMetadata } from './session/acp-body-brain-transport.js';
+import { AgentConversationRelay, type AgentConversationEndpoint,
+  type AgentConversationEndpointAuthority } from './agent-conversation-control.js';
 
 const preparationBrand: unique symbol = Symbol('agent runtime Brain preparation');
 export interface VerifiedAgentRuntimePreparation { readonly [preparationBrand]: true }
@@ -155,10 +157,12 @@ export interface AgentRuntimeReconciliationAuthority {
   authenticateRetire(evidence:unknown,input:Readonly<AgentRuntimeReconciliationQuery&{providerRuntimeId:string;retireEffectKey:string}>):AuthenticatedAgentRuntimeRetireReconciliation|undefined;
 }
 
-interface Live {provider:AcpBodyBrainProvider;providerRuntimeId:string;preparation:unknown;}
+interface Live {provider:AcpBodyBrainProvider;providerRuntimeId:string;preparation:unknown;
+  conversation:AgentConversationRelay;}
 
 /** Production process-local bridge; durable truth remains owned by AgentRuntimeTransaction. */
-export class AuthenticatedAgentRuntimeProvider implements IdempotentRuntimeProvider,RuntimeProviderEvidenceAuthority{
+export class AuthenticatedAgentRuntimeProvider implements IdempotentRuntimeProvider,RuntimeProviderEvidenceAuthority,
+AgentConversationEndpointAuthority{
   readonly supportsIdempotentRuntimeActionKeys=true as const;
   readonly #live=new Map<string,Live>();
   readonly #starting=new Map<string,{evidence:unknown;promise:Promise<void>}>();
@@ -221,12 +225,15 @@ export class AuthenticatedAgentRuntimeProvider implements IdempotentRuntimeProvi
       try{const descriptor=getBodyBrainAdapterDescriptor(prepared.brain.adapter.harness as 'codex'|'claude-code');
         if(descriptor.adapterId!==prepared.brain.validation.adapterId
           ||descriptor.adapterVersion!==prepared.brain.validation.adapterVersion)throw new TypeError();
-        provider=descriptor.createProvider(prepared.brain.bodyBrainLaunch,this.drivers(prepared.brain,bindings));
-        provider.subscribe(()=>undefined);
-        const result=await provider.start({protocolVersion:1,generation:`g${bindings.generation}`,planDigest:bindings.planDigest});
+        const driver=this.drivers(prepared.brain,bindings);
+        provider=descriptor.createProvider(prepared.brain.bodyBrainLaunch,driver);
+        const providerRuntimeId=this.#id(bindings);const conversation=new AgentConversationRelay({agentId:bindings.agentId,
+          generation:bindings.generation,runtimeInstanceKey:bindings.runtimeInstanceKey,providerRuntimeId},descriptor.adapterId,provider,
+        ()=>typeof (driver as {pid?:unknown}).pid==='function'?(driver as unknown as {pid():number}).pid():2_147_483_647);
+        const result=await conversation.start({protocolVersion:1,generation:`g${bindings.generation}`,planDigest:bindings.planDigest});
         if(result.state!=='accepted'){await provider.cleanup();return;}
         this.preparations.recordMetadata(evidence,result.sessionMetadata);
-        const providerRuntimeId=this.#id(bindings);this.#live.set(bindings.runtimeInstanceKey,{provider,providerRuntimeId,preparation:evidence});
+        this.#live.set(bindings.runtimeInstanceKey,{provider,providerRuntimeId,preparation:evidence,conversation});
       }catch{try{await provider?.cleanup();}catch{/* redacted */}}})();
     this.#starting.set(bindings.runtimeInstanceKey,{evidence,promise:pending});
     void pending.finally(()=>this.#starting.delete(bindings.runtimeInstanceKey));
@@ -244,10 +251,14 @@ export class AuthenticatedAgentRuntimeProvider implements IdempotentRuntimeProvi
     const prepared=this.#prepared(bindings,evidence);let live=this.#live.get(bindings.runtimeInstanceKey);
     if(!live&&prepared.sessionMetadata){
       try{const descriptor=getBodyBrainAdapterDescriptor(prepared.brain.adapter.harness as 'codex'|'claude-code');
-        const provider=descriptor.createProvider(prepared.brain.bodyBrainLaunch,this.drivers(prepared.brain,bindings));provider.subscribe(()=>undefined);
-        const result=await provider.restore({protocolVersion:1,generation:`g${bindings.generation}`,
+        const driver=this.drivers(prepared.brain,bindings);
+        const provider=descriptor.createProvider(prepared.brain.bodyBrainLaunch,driver);
+        const conversation=new AgentConversationRelay({agentId:bindings.agentId,generation:bindings.generation,
+          runtimeInstanceKey:bindings.runtimeInstanceKey,providerRuntimeId:bindings.providerRuntimeId},descriptor.adapterId,provider,
+        ()=>typeof (driver as {pid?:unknown}).pid==='function'?(driver as unknown as {pid():number}).pid():2_147_483_647);
+        const result=await conversation.restore({protocolVersion:1,generation:`g${bindings.generation}`,
           planDigest:bindings.planDigest,sessionMetadata:prepared.sessionMetadata});
-        if(result.state==='accepted'){live={provider,providerRuntimeId:bindings.providerRuntimeId,preparation:evidence};
+        if(result.state==='accepted'){live={provider,providerRuntimeId:bindings.providerRuntimeId,preparation:evidence,conversation};
           this.#live.set(bindings.runtimeInstanceKey,live);}else await provider.cleanup();
       }catch{/* unknown proof below */}
     }
@@ -283,6 +294,15 @@ export class AuthenticatedAgentRuntimeProvider implements IdempotentRuntimeProvi
     await live.provider.cleanup();
     this.#live.delete(current.runtimeInstanceKey);
   }
+  issueConversation(runtimeInstanceKey:string,evidence:unknown):AgentConversationEndpoint{
+    const live=this.#live.get(runtimeInstanceKey);
+    if(!live||live.preparation!==evidence)
+      throw new TypeError('runtime conversation is unavailable');
+    return live.conversation.issue();
+  }
+  authenticate(value:AgentConversationEndpoint){for(const live of this.#live.values()){
+    const authenticated=live.conversation.authenticate(value);if(authenticated)return authenticated;
+  }return undefined;}
   authenticateStart(value:unknown){return value&&typeof value==='object'?this.#start.get(value as object):undefined;}
   authenticateRestore(value:unknown){return value&&typeof value==='object'?this.#restore.get(value as object):undefined;}
   authenticateReadiness(value:unknown){return value&&typeof value==='object'?this.#ready.get(value as object):undefined;}

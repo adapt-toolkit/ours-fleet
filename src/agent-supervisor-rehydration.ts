@@ -13,6 +13,8 @@ import { AgentRuntimePreparationAuthority, AuthenticatedAgentRuntimeProvider,
   type AgentRuntimeDriverFactory, type AgentRuntimeReconciliationAuthority,
   type DurableRuntimeAdapterDescriptor } from './agent-runtime-provider.js';
 import { BrainAdapterPreparationAuthority, type BrainAdapterEvidenceAuthority } from './harness/brain-adapter.js';
+import { createInjectedAcpSession, type AcpSessionOptions } from './session/acp.js';
+import type { SessionHandle } from './session/types.js';
 
 export interface PermanentAgentSupervisorSeam {
   readonly agentId: string;
@@ -22,6 +24,12 @@ export interface PermanentAgentSupervisorSeam {
 }
 export interface ProductionAgentSupervisorRehydration {
   rehydrate(agentId: string): PermanentAgentSupervisorSeam;
+}
+export interface InternalPermanentAgentSupervisorSeam extends PermanentAgentSupervisorSeam {
+  startSession(options: Omit<AcpSessionOptions, 'argv' | 'env'>): Promise<SessionHandle>;
+}
+export interface InternalAgentSupervisorRehydration {
+  rehydrate(agentId: string): InternalPermanentAgentSupervisorSeam;
 }
 export interface ProductionAgentSupervisorRehydrationDeps {
   trustedStateRoot: string;
@@ -37,9 +45,9 @@ const digest = (value: unknown): string => `sha256:${createHash('sha256')
   .update(runtimeCanonical(value)).digest('hex')}`;
 
 /** Construct a read-only rehydrator. No trusted directory or external runtime is touched here. */
-export function createProductionAgentSupervisorRehydration(
+function createAgentSupervisorRehydration(
   deps: ProductionAgentSupervisorRehydrationDeps,
-): ProductionAgentSupervisorRehydration {
+): InternalAgentSupervisorRehydration {
   if (!deps || typeof deps !== 'object' || typeof deps.trustedStateRoot !== 'string'
       || !deps.policies || !deps.adapterAuthority) throw new TypeError('invalid supervisor rehydration dependencies');
   const generations = new DurableAgentGenerationReader(deps.trustedStateRoot);
@@ -49,7 +57,7 @@ export function createProductionAgentSupervisorRehydration(
   const preparations = new AgentRuntimePreparationAuthority(brains, plans);
   const now = deps.now ?? Date.now;
 
-  const rehydrate = (agentId: string): PermanentAgentSupervisorSeam => {
+  const rehydrate = (agentId: string): InternalPermanentAgentSupervisorSeam => {
     if (!TOKEN.test(agentId)) throw new TypeError('invalid supervisor agent id');
     const active = readAgentSupervisorHandoff(deps.trustedStateRoot, agentId);
     const reservation = generations.readExact(active);
@@ -100,11 +108,33 @@ export function createProductionAgentSupervisorRehydration(
         ...(reason === undefined ? {} : { recoveryReason: reason }) }));
       return evidence;
     };
+    const start = () => transaction.start(reservation, issue('start'));
     const seam = Object.freeze({ agentId: complete.agentId,
       generation: complete.generation,
-      start: () => transaction.start(reservation, issue('start')),
-      restore: (reason: string) => transaction.restore(reservation, issue('restore', reason)) });
+      start,
+      restore: (reason: string) => transaction.restore(reservation, issue('restore', reason)),
+      startSession: async (options: Omit<AcpSessionOptions, 'argv' | 'env'>) => {
+        const runtime = await start();
+        if (runtime.state !== 'ready') throw new TypeError('supervisor runtime is not ready');
+        const endpoint = provider.issueConversation(runtime.runtimeInstanceKey, preparation);
+        return createInjectedAcpSession(options, provider, endpoint);
+      } });
     return seam;
   };
   return Object.freeze({ rehydrate });
+}
+
+export function createInternalAgentSupervisorRehydration(
+  deps: ProductionAgentSupervisorRehydrationDeps,
+): InternalAgentSupervisorRehydration { return createAgentSupervisorRehydration(deps); }
+
+export function createProductionAgentSupervisorRehydration(
+  deps: ProductionAgentSupervisorRehydrationDeps,
+): ProductionAgentSupervisorRehydration {
+  const internal = createAgentSupervisorRehydration(deps);
+  return Object.freeze({ rehydrate: (agentId: string): PermanentAgentSupervisorSeam => {
+    const seam = internal.rehydrate(agentId);
+    return Object.freeze({ agentId: seam.agentId, generation: seam.generation,
+      start: () => seam.start(), restore: (reason: string) => seam.restore(reason) });
+  } });
 }

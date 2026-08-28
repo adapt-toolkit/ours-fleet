@@ -20,6 +20,9 @@ import { SessionEvents } from './events.js';
 import {
   ACP_CANCEL_DEADLINE_EXCEEDED, SessionControlError, classifyChildExit, turnResult,
 } from './types.js';
+import type { AgentConversationEndpoint, AgentConversationEndpointAuthority,
+  AuthenticatedAgentConversationEndpoint } from '../agent-conversation-control.js';
+import type { AcpBodyBrainDelivery } from './acp-body-brain-transport.js';
 import type {
   ConversationHandlePage, ExitRecord, InterruptOutcome, PermissionDecision, PromptDelivery,
   QueuedPrompt,
@@ -1673,4 +1676,109 @@ export class AcpSession implements SessionHandle {
     this.readiness = 'failed';
     this.events.emit('error', { text: this.lastError });
   }
+}
+
+/**
+ * Package-internal composition seam for an already-started durable Body–Brain endpoint.
+ * It is deliberately absent from src/index.ts; callers can provide only opaque evidence,
+ * never a provider, driver, transport, or raw protocol connection.
+ */
+export async function createInjectedAcpSession(
+  options: Omit<AcpSessionOptions, 'argv' | 'env'>,
+  authority: AgentConversationEndpointAuthority, evidence: AgentConversationEndpoint,
+): Promise<AcpSession> {
+  const endpoint = authority.authenticate(evidence);
+  if (!endpoint) throw new TypeError('authenticated conversation endpoint unavailable');
+  return createInjectedSession(options, endpoint);
+}
+
+async function createInjectedSession(
+  options: Omit<AcpSessionOptions, 'argv' | 'env'>,
+  endpoint: AuthenticatedAgentConversationEndpoint,
+): Promise<AcpSession> {
+  const { EventEmitter } = await import('node:events');
+  const { PassThrough } = await import('node:stream');
+  const child = new EventEmitter() as ChildProcessWithoutNullStreams;
+  // A virtual protocol owner has no OS child pid. Use an unreachable positive
+  // sentinel; child.kill below is protocol-only and can never signal this runner.
+  Object.assign(child, { pid: endpoint.pid, stdin: new PassThrough(), stdout: new PassThrough(),
+    stderr: new PassThrough(), exitCode: null, signalCode: null,
+    kill: (signal = 'SIGTERM') => { void endpoint.forceTerminate({ generation: `g${endpoint.generation}`,
+      commandId: `session-force-${signal}-${Date.now()}` }); return true; } });
+  const pending = new Map<string, { resolve(value: { stopReason: string }): void;
+    reject(error: Error): void }>();
+  let instance: AcpSession | undefined; let closed = false; let command = 0;
+  const generation = `g${endpoint.generation}`;
+  const commandId = () => `session-command-${++command}`;
+  const contentText = (blocks: unknown): string => Array.isArray(blocks)
+    ? blocks.flatMap(block => block && typeof block === 'object' && (block as { type?: unknown }).type === 'text'
+      ? [String((block as { text?: unknown }).text ?? '')] : []).join('') : '';
+  const request = async (method: unknown, params: Record<string, unknown>): Promise<unknown> => {
+    if (closed) throw new SessionControlError('offline', 'the ACP session was closed');
+    if (method === acp.methods.agent.initialize) return { protocolVersion: acp.PROTOCOL_VERSION,
+      agentCapabilities: { sessionCapabilities: { resume: {}, close: {} } } };
+    if (method === acp.methods.agent.session.new || method === acp.methods.agent.session.resume
+        || method === acp.methods.agent.session.load)
+      return { sessionId: endpoint.providerRuntimeId, configOptions: [] };
+    if (method === acp.methods.agent.session.setMode) return {};
+    if (method === acp.methods.agent.session.close) { await endpoint.close({ generation, commandId: commandId() }); return {}; }
+    if (method === acp.methods.agent.session.cancel) {
+      const result = await endpoint.cancel({ generation, commandId: commandId() });
+      if (result.state !== 'accepted') throw new SessionControlError('offline', `ACP cancel ${result.code}`);
+      return {};
+    }
+    if (method === acp.methods.agent.session.prompt) {
+      const promptId = String(params.sessionId ? randomUUID() : randomUUID());
+      const body = new TextEncoder().encode(contentText(params.prompt));
+      const completion = new Promise<{ stopReason: string }>((resolve, reject) =>
+        pending.set(promptId, { resolve, reject }));
+      const accepted = await endpoint.submit({ generation, commandId: commandId(), promptId,
+        origin: { kind: 'local_console', requestId: promptId } }, body);
+      body.fill(0);
+      if (accepted.state !== 'accepted') { pending.delete(promptId);
+        throw new SessionControlError('offline', `ACP submit ${accepted.code}`); }
+      return completion;
+    }
+    if (method === '_session/steering') throw new Error('ACP steering unsupported');
+    throw new Error('unsupported injected ACP method');
+  };
+  const connection = { agent: { request, notify: async (method: unknown) => {
+    if (method === acp.methods.agent.session.cancel)
+      await endpoint.cancel({ generation, commandId: commandId() });
+  } }, close: () => { closed = true; } } as unknown as acp.ClientConnection;
+  const sessionOptions: AcpSessionOptions = { ...options, argv: ['internal-body-brain'], env: {} };
+  instance = new (AcpSession as unknown as { new(options: AcpSessionOptions,
+    child: ChildProcessWithoutNullStreams, connection: acp.ClientConnection): AcpSession })(
+      sessionOptions, child, connection);
+  endpoint.subscribe((delivery: AcpBodyBrainDelivery) => {
+    if (!instance) return;
+    if (delivery.state === 'failed') {
+      for (const waiter of pending.values()) waiter.reject(new Error(`ACP transport ${delivery.code}`));
+      pending.clear(); closed = true; Object.assign(child, { exitCode: 1 }); child.emit('exit', 1, null); return;
+    }
+    const notification = delivery.notification;
+    if (notification.kind === 'completed') {
+      const waiter = pending.get(notification.promptId); if (!waiter) return;
+      pending.delete(notification.promptId); waiter.resolve({ stopReason: notification.outcome === 'refused'
+        ? 'refusal' : notification.outcome === 'cancelled' ? 'cancelled' : 'end_turn' });
+    } else if (notification.kind === 'permission_requested') {
+      const requestPermission = (instance as unknown as { requestPermission(value: unknown): Promise<{
+        outcome: { outcome: string; optionId?: string } }> }).requestPermission.bind(instance);
+      void requestPermission({ sessionId: endpoint.providerRuntimeId, toolCall: {
+        toolCallId: notification.permissionId }, options: notification.optionIds.map(optionId => ({
+        optionId, name: optionId, kind: optionId.includes('reject') ? 'reject_once' : 'allow_once' })) })
+        .then(async response => { const optionId = response.outcome.optionId;
+          if (response.outcome.outcome === 'selected' && optionId)
+            await endpoint.respondPermission({ generation, commandId: commandId(),
+              permissionId: notification.permissionId, optionId }); });
+    } else if (notification.kind === 'exited' || notification.kind === 'failed') {
+      closed = true;
+      for (const waiter of pending.values()) waiter.reject(new Error(`ACP ${notification.kind}`)); pending.clear();
+      Object.assign(child, { exitCode: notification.kind === 'exited' && notification.code === 'clean_exit' ? 0 : 1 });
+      child.emit('exit', child.exitCode, null);
+    }
+  });
+  await (instance as unknown as { initialize(): Promise<void> }).initialize();
+  (instance as unknown as { recoverOpenPrompts(): void }).recoverOpenPrompts();
+  return instance;
 }

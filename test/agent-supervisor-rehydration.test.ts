@@ -100,6 +100,8 @@ describe('production Agent supervisor rehydration', () => {
     const seam = root.rehydrate('agent-1');
     expect(seam).toMatchObject({ agentId: 'agent-1', generation: 1,
       start: expect.any(Function), restore: expect.any(Function) });
+    expect(Object.keys(seam).sort()).toEqual(['agentId', 'generation', 'restore', 'start']);
+    expect((seam as unknown as { startSession?: unknown }).startSession).toBeUndefined();
     expect(Object.isFrozen(seam)).toBe(true);
     expect(tree(f.trustedRoot)).toEqual(before);
     expect(f.driverFactory).not.toHaveBeenCalled();
