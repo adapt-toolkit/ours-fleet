@@ -1,4 +1,5 @@
 import { createHash } from 'node:crypto';
+import type * as acp from '@agentclientprotocol/sdk';
 import {
   BODY_BRAIN_MAX_ID_BYTES,
   BODY_BRAIN_PROTOCOL_VERSION,
@@ -7,6 +8,7 @@ import {
 } from './body-brain.js';
 
 export const ACP_BODY_BRAIN_MAX_BODY_BYTES = 16 * 1024 * 1024;
+export const ACP_BODY_BRAIN_MAX_UPDATE_BYTES = 320 * 1024;
 /** Parity invariant with the landed BodyBrain recovery/conformance capacity. */
 export const ACP_BODY_BRAIN_MAX_PERMISSION_OPTIONS = 16;
 
@@ -32,8 +34,11 @@ interface NotificationBase {
   transportSeq: number;
   notificationId: string;
 }
+/** Explicit protocol-owned discriminated union. Raw SDK object identities never cross this boundary. */
+export type AcpBodyBrainSessionUpdate = Readonly<acp.SessionUpdate>;
 export type AcpBodyBrainNotification = Readonly<NotificationBase & (
   | { kind: 'started' }
+  | { kind: 'session_update'; update: AcpBodyBrainSessionUpdate }
   | { kind: 'completed'; promptId: string; outcome: BodyBrainTurnOutcome; output?: AcpBodyReference }
   | { kind: 'permission_requested'; promptId: string; permissionId: string; optionIds: readonly string[] }
   | { kind: 'exited'; code: 'clean_exit' | 'forced' | 'lost'; promptId?: string }
@@ -111,6 +116,168 @@ function promptOrigin(value: unknown): value is BodyBrainPromptOrigin {
     && token(value.loopId) && token(value.runId);
 }
 
+const UPDATE_KEYS: Readonly<Record<string, readonly [readonly string[], readonly string[]]>> = Object.freeze({
+  user_message_chunk: [['sessionUpdate', 'content'], ['messageId', '_meta']],
+  agent_message_chunk: [['sessionUpdate', 'content'], ['messageId', '_meta']],
+  agent_thought_chunk: [['sessionUpdate', 'content'], ['messageId', '_meta']],
+  tool_call: [['sessionUpdate', 'toolCallId', 'title'], ['name', 'kind', 'status', 'content', 'locations', 'rawInput', 'rawOutput', '_meta']],
+  tool_call_update: [['sessionUpdate', 'toolCallId'], ['name', 'kind', 'status', 'title', 'content', 'locations', 'rawInput', 'rawOutput', '_meta']],
+  plan: [['sessionUpdate', 'entries'], ['_meta']],
+  plan_update: [['sessionUpdate', 'plan'], ['_meta']],
+  plan_removed: [['sessionUpdate', 'planId'], ['_meta']],
+  available_commands_update: [['sessionUpdate', 'availableCommands'], ['_meta']],
+  current_mode_update: [['sessionUpdate', 'currentModeId'], ['_meta']],
+  config_option_update: [['sessionUpdate', 'configOptions'], ['_meta']],
+  session_info_update: [['sessionUpdate'], ['title', 'updatedAt', '_meta']],
+  usage_update: [['sessionUpdate', 'used', 'size'], ['cost', '_meta']],
+});
+
+function copyUpdateValue(value: unknown, depth = 0): unknown {
+  if (depth > 32) throw new TypeError('update depth exceeded');
+  if (value === null || typeof value === 'boolean') return value;
+  if (typeof value === 'string') {
+    if (Buffer.byteLength(value) > ACP_BODY_BRAIN_MAX_UPDATE_BYTES) throw new TypeError('update string oversized');
+    return value;
+  }
+  if (typeof value === 'number') {
+    if (!Number.isFinite(value)) throw new TypeError('invalid update number');
+    return value;
+  }
+  if (Array.isArray(value)) {
+    if (value.length > 4096) throw new TypeError('update array oversized');
+    return Object.freeze(value.map(item => copyUpdateValue(item, depth + 1)));
+  }
+  if (!plain(value) || Object.keys(value).length > 4096) throw new TypeError('invalid update value');
+  const result: Record<string, unknown> = {};
+  for (const [key, nested] of Object.entries(value)) {
+    if (!bounded(key)) throw new TypeError('invalid update key');
+    result[key] = copyUpdateValue(nested, depth + 1);
+  }
+  return Object.freeze(result);
+}
+
+const nullableString = (value: unknown): boolean => value === null || typeof value === 'string';
+const optionalString = (value: unknown): boolean => value === undefined || nullableString(value);
+const finite = (value: unknown): value is number => typeof value === 'number' && Number.isFinite(value);
+const toolKinds = new Set(['read', 'edit', 'delete', 'move', 'search', 'execute', 'think', 'fetch', 'switch_mode', 'other']);
+const toolStatuses = new Set(['pending', 'in_progress', 'completed', 'failed']);
+const validMeta = (value: unknown): boolean => value === undefined || value === null || plain(value);
+function validAnnotations(value: unknown): boolean {
+  return value === undefined || value === null || (plain(value)
+    && exact(value, [], ['audience', 'lastModified', 'priority', '_meta'])
+    && (value.audience === undefined || value.audience === null || (Array.isArray(value.audience)
+      && value.audience.every(role => role === 'assistant' || role === 'user')))
+    && optionalString(value.lastModified) && (value.priority === undefined || value.priority === null || finite(value.priority))
+    && validMeta(value._meta));
+}
+function validResource(value: unknown): boolean {
+  if (!plain(value) || typeof value.uri !== 'string' || !optionalString(value.mimeType) || !validMeta(value._meta)) return false;
+  return typeof value.text === 'string'
+    ? exact(value, ['uri', 'text'], ['mimeType', '_meta'])
+    : typeof value.blob === 'string' && exact(value, ['uri', 'blob'], ['mimeType', '_meta']);
+}
+function validContent(value: unknown): boolean {
+  if (!plain(value) || typeof value.type !== 'string') return false;
+  if (value.type === 'text') return exact(value, ['type', 'text'], ['annotations', '_meta']) && typeof value.text === 'string'
+    && validAnnotations(value.annotations) && validMeta(value._meta);
+  if (value.type === 'image' || value.type === 'audio') return exact(value, ['type', 'data', 'mimeType'],
+    value.type === 'image' ? ['uri', 'annotations', '_meta'] : ['annotations', '_meta'])
+    && typeof value.data === 'string' && typeof value.mimeType === 'string' && optionalString(value.uri)
+    && validAnnotations(value.annotations) && validMeta(value._meta);
+  if (value.type === 'resource_link') return exact(value, ['type', 'name', 'uri'],
+    ['title', 'description', 'mimeType', 'size', 'annotations', '_meta']) && typeof value.name === 'string'
+    && typeof value.uri === 'string' && optionalString(value.title) && optionalString(value.description)
+    && optionalString(value.mimeType) && (value.size === undefined || value.size === null || finite(value.size))
+    && validAnnotations(value.annotations) && validMeta(value._meta);
+  if (value.type === 'resource') return exact(value, ['type', 'resource'], ['annotations', '_meta'])
+    && validResource(value.resource) && validAnnotations(value.annotations) && validMeta(value._meta);
+  return false;
+}
+function validToolLocation(value: unknown): boolean {
+  return plain(value) && exact(value, ['path'], ['line', '_meta']) && typeof value.path === 'string'
+    && (value.line === undefined || value.line === null || (Number.isSafeInteger(value.line) && (value.line as number) >= 0))
+    && validMeta(value._meta);
+}
+function validToolFields(raw: Record<string, unknown>, create: boolean): boolean {
+  return typeof raw.toolCallId === 'string' && (!create || typeof raw.title === 'string')
+    && (raw.title === undefined || nullableString(raw.title)) && optionalString(raw.name)
+    && (raw.kind === undefined || raw.kind === null || toolKinds.has(raw.kind as string))
+    && (raw.status === undefined || raw.status === null || toolStatuses.has(raw.status as string))
+    && (raw.content === undefined || raw.content === null || (Array.isArray(raw.content) && raw.content.every(item =>
+      plain(item) && ((item.type === 'content' && exact(item, ['type', 'content'], ['_meta']) && validContent(item.content) && validMeta(item._meta))
+        || (item.type === 'diff' && exact(item, ['type', 'path', 'newText'], ['oldText', '_meta']) && typeof item.path === 'string'
+          && typeof item.newText === 'string' && optionalString(item.oldText) && validMeta(item._meta))
+        || (item.type === 'terminal' && exact(item, ['type', 'terminalId'], ['_meta'])
+          && typeof item.terminalId === 'string' && validMeta(item._meta))))))
+    && (raw.locations === undefined || raw.locations === null
+      || (Array.isArray(raw.locations) && raw.locations.every(validToolLocation)));
+}
+function validPlanEntry(item: unknown): boolean {
+  return plain(item) && exact(item, ['content', 'priority', 'status'], ['_meta']) && typeof item.content === 'string'
+    && ['high', 'medium', 'low'].includes(item.priority as string)
+    && ['pending', 'in_progress', 'completed'].includes(item.status as string) && validMeta(item._meta);
+}
+function validPlanUpdate(value: unknown): boolean {
+  if (!plain(value) || typeof value.type !== 'string' || typeof value.planId !== 'string' || !validMeta(value._meta)) return false;
+  if (value.type === 'items') return exact(value, ['type', 'planId', 'entries'], ['_meta'])
+    && Array.isArray(value.entries) && value.entries.every(validPlanEntry);
+  if (value.type === 'file') return exact(value, ['type', 'planId', 'uri'], ['_meta']) && typeof value.uri === 'string';
+  return value.type === 'markdown' && exact(value, ['type', 'planId', 'content'], ['_meta']) && typeof value.content === 'string';
+}
+function validSelectOption(value: unknown): boolean {
+  return plain(value) && exact(value, ['value', 'name'], ['description', '_meta']) && typeof value.value === 'string'
+    && typeof value.name === 'string' && optionalString(value.description) && validMeta(value._meta);
+}
+function validConfigOption(value: unknown): boolean {
+  if (!plain(value) || typeof value.type !== 'string' || typeof value.id !== 'string' || typeof value.name !== 'string'
+      || !optionalString(value.description) || (value.category !== undefined && value.category !== null
+        && typeof value.category !== 'string') || !validMeta(value._meta)) return false;
+  if (value.type === 'boolean') return exact(value, ['type', 'id', 'name', 'currentValue'],
+    ['description', 'category', '_meta']) && typeof value.currentValue === 'boolean';
+  if (value.type !== 'select' || !exact(value, ['type', 'id', 'name', 'currentValue', 'options'],
+    ['description', 'category', '_meta']) || typeof value.currentValue !== 'string' || !Array.isArray(value.options)) return false;
+  const options = value.options;
+  const flat = options.every(validSelectOption);
+  const grouped = options.every(group => plain(group) && exact(group, ['group', 'name', 'options'], ['_meta'])
+    && typeof group.group === 'string' && typeof group.name === 'string' && validMeta(group._meta)
+    && Array.isArray(group.options) && group.options.every(validSelectOption));
+  return flat || grouped;
+}
+function validUpdateFields(raw: Record<string, unknown>): boolean {
+  if (!validMeta(raw._meta)) return false;
+  switch (raw.sessionUpdate) {
+    case 'user_message_chunk': case 'agent_message_chunk': case 'agent_thought_chunk':
+      return validContent(raw.content) && optionalString(raw.messageId);
+    case 'tool_call': return validToolFields(raw, true);
+    case 'tool_call_update': return validToolFields(raw, false);
+    case 'plan': return Array.isArray(raw.entries) && raw.entries.every(validPlanEntry);
+    case 'plan_update': return validPlanUpdate(raw.plan);
+    case 'plan_removed': return typeof raw.planId === 'string';
+    case 'available_commands_update': return Array.isArray(raw.availableCommands) && raw.availableCommands.every(item =>
+      plain(item) && exact(item, ['name', 'description'], ['input', '_meta']) && typeof item.name === 'string'
+      && typeof item.description === 'string' && (item.input === undefined || item.input === null
+        || (plain(item.input) && exact(item.input, ['hint'], ['_meta']) && typeof item.input.hint === 'string')));
+    case 'current_mode_update': return typeof raw.currentModeId === 'string';
+    case 'config_option_update': return Array.isArray(raw.configOptions) && raw.configOptions.every(validConfigOption);
+    case 'session_info_update': return optionalString(raw.title) && optionalString(raw.updatedAt);
+    case 'usage_update': return finite(raw.used) && finite(raw.size) && (raw.cost === undefined || raw.cost === null
+      || (plain(raw.cost) && exact(raw.cost, ['amount', 'currency'], ['_meta'])
+        && finite(raw.cost.amount) && typeof raw.cost.currency === 'string'));
+    default: return false;
+  }
+}
+
+export function sanitizeAcpBodyBrainSessionUpdate(raw: unknown): AcpBodyBrainSessionUpdate | undefined {
+  if (!plain(raw) || typeof raw.sessionUpdate !== 'string') return undefined;
+  const shape = UPDATE_KEYS[raw.sessionUpdate];
+  if (!shape || !exact(raw, shape[0], shape[1]) || !validUpdateFields(raw)) return undefined;
+  try {
+    const owned = copyUpdateValue(raw) as AcpBodyBrainSessionUpdate;
+    if (Buffer.byteLength(canonical(owned)) > ACP_BODY_BRAIN_MAX_UPDATE_BYTES) return undefined;
+    return owned;
+  } catch { return undefined; }
+}
+
 const outcomes = new Set<BodyBrainTurnOutcome>(['completed', 'refused', 'cancelled', 'failed', 'inconclusive']);
 function parseNotification(raw: unknown): AcpBodyBrainNotification | undefined {
   if (!plain(raw) || raw.protocolVersion !== BODY_BRAIN_PROTOCOL_VERSION || !token(raw.generation)
@@ -120,6 +287,11 @@ function parseNotification(raw: unknown): AcpBodyBrainNotification | undefined {
   switch (raw.kind) {
     case 'started':
       return exact(raw, base) ? { ...raw } as unknown as AcpBodyBrainNotification : undefined;
+    case 'session_update': {
+      if (!exact(raw, [...base, 'update'])) return undefined;
+      const update = sanitizeAcpBodyBrainSessionUpdate(raw.update);
+      return update ? { ...raw, update } as unknown as AcpBodyBrainNotification : undefined;
+    }
     case 'completed':
       return exact(raw, [...base, 'promptId', 'outcome'], ['output']) && token(raw.promptId)
         && outcomes.has(raw.outcome as BodyBrainTurnOutcome) && (raw.output === undefined || bodyReference(raw.output))

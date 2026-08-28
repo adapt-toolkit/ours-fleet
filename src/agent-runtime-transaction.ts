@@ -31,6 +31,7 @@ export type RuntimeProofOutcome = 'not_started'|'started_by_action'|'unknown';
 export interface TrustedRuntimeStartProof {
   runtimeInstanceKey:string; startEffectKey:string; outcome:RuntimeProofOutcome; provider:string;
   providerRuntimeId?:string; startEvidenceDigest?:string; receiptDigest?:string;
+  sessionLocator?:string; sessionMetadataDigest?:string;
 }
 export interface TrustedRuntimeRestoreProof {
   runtimeInstanceKey:string; startEffectKey:string; providerRuntimeId:string;
@@ -59,7 +60,8 @@ export interface IdempotentRuntimeProvider {
   reconcileStart(input:Readonly<RuntimeProviderBindings>,preparation:unknown):Promise<unknown>;
   startBrain(input:Readonly<RuntimeProviderBindings & {descriptor:Readonly<Record<string,unknown>>}>,preparation:unknown):Promise<unknown>;
   checkReadiness(input:Readonly<RuntimeProviderBindings & {providerRuntimeId:string}>,preparation:unknown):Promise<unknown>;
-  reconcileRestore(input:Readonly<RuntimeProviderBindings & {providerRuntimeId:string;restoreRequestKey:string}>,preparation:unknown):Promise<unknown>;
+  reconcileRestore(input:Readonly<RuntimeProviderBindings & {providerRuntimeId:string;restoreRequestKey:string;
+    sessionLocator:string;sessionMetadataDigest:string}>,preparation:unknown):Promise<unknown>;
   reconcileRetire(input:Readonly<RuntimeProviderBindings & {providerRuntimeId:string;retireEffectKey:string}>,preparation:unknown):Promise<unknown>;
   acquireCurrent(input:Readonly<RuntimeProviderBindings & {providerRuntimeId:string;retireEffectKey:string}>,preparation:unknown):Promise<unknown>;
   retire(capability:unknown):Promise<void>;
@@ -112,11 +114,12 @@ export class AgentRuntimeTransaction {
     await this.#append('launch',trusted,request,common,'active_claimed',{claimDigest:claim.claimDigest});
     let chain=this.#chain('launch',trusted,request,common,LAUNCH); let state=chain.at(-1)?.state;
     const durableStarted=chain.find(value=>value.state==='started')?.event;
-    if(durableStarted) this.#runtimeArtifacts(trusted,request,bindings,adapter,
+    if(durableStarted) this.#runtimeArtifacts(trusted,request,bindings,adapter,this.#validateStartProof(
       {runtimeInstanceKey:bindings.runtimeInstanceKey,startEffectKey:bindings.startEffectKey,
         outcome:'started_by_action',provider:String(durableStarted.provider),
         providerRuntimeId:String(durableStarted.providerRuntimeId),
-        startEvidenceDigest:String(durableStarted.startEvidenceDigest),receiptDigest:String(durableStarted.receiptDigest)});
+        startEvidenceDigest:String(durableStarted.startEvidenceDigest),receiptDigest:String(durableStarted.receiptDigest),
+        sessionLocator:String(durableStarted.sessionLocator),sessionMetadataDigest:String(durableStarted.sessionMetadataDigest)},bindings));
     if(state==='ready'||state==='not_ready'){
       this.#binding(trusted,bindings,adapter);
       return {state,runtimeInstanceKey:common.runtimeInstanceKey};
@@ -132,15 +135,17 @@ export class AgentRuntimeTransaction {
       }
       if(proof.outcome!=='started_by_action'){await this.#append('launch',trusted,request,common,'ambiguous',{reason:'start_unknown'});return {state:'ambiguous',runtimeInstanceKey:common.runtimeInstanceKey};}
       await this.#append('launch',trusted,request,common,'started',{provider:proof.provider,
-        providerRuntimeId:proof.providerRuntimeId!,startEvidenceDigest:proof.startEvidenceDigest!,receiptDigest:proof.receiptDigest!});
+        providerRuntimeId:proof.providerRuntimeId!,startEvidenceDigest:proof.startEvidenceDigest!,receiptDigest:proof.receiptDigest!,
+        sessionLocator:proof.sessionLocator!,sessionMetadataDigest:proof.sessionMetadataDigest!});
       this.#runtimeArtifacts(trusted,request,bindings,adapter,proof); state='started';
     }
     if(state==='started'){
       const event=this.#chain('launch',trusted,request,common,LAUNCH).at(-1)!.event;
-      this.#runtimeArtifacts(trusted,request,bindings,adapter,{runtimeInstanceKey:bindings.runtimeInstanceKey,
+      this.#runtimeArtifacts(trusted,request,bindings,adapter,this.#validateStartProof({runtimeInstanceKey:bindings.runtimeInstanceKey,
         startEffectKey:bindings.startEffectKey,outcome:'started_by_action',provider:String(event.provider),
         providerRuntimeId:String(event.providerRuntimeId),startEvidenceDigest:String(event.startEvidenceDigest),
-        receiptDigest:String(event.receiptDigest)});
+        receiptDigest:String(event.receiptDigest),sessionLocator:String(event.sessionLocator),
+        sessionMetadataDigest:String(event.sessionMetadataDigest)},bindings));
       await this.#append('launch',trusted,request,common,'readiness_checking',{});state='readiness_checking';
     }
     if(state==='readiness_checking'){
@@ -163,7 +168,8 @@ export class AgentRuntimeTransaction {
       let chain=this.#chain('restore',a.trusted,a.request,a.common,RESTORE),state=chain.at(-1)!.state;
       if(['restored','missing','ambiguous'].includes(state))return{state,runtimeInstanceKey:a.common.runtimeInstanceKey};
       if(state==='restore_authorized'){await this.#append('restore',a.trusted,a.request,a.common,'reconciling',{});state='reconciling';}
-      const binding=this.#binding(a.trusted,a.bindings,a.adapter); const proof=this.#restore(await this.provider.reconcileRestore({...a.bindings,providerRuntimeId:String(binding.providerRuntimeId),restoreRequestKey:key},a.preparationEvidence),a.bindings,String(binding.providerRuntimeId));
+      const binding=this.#binding(a.trusted,a.bindings,a.adapter); const proof=this.#restore(await this.provider.reconcileRestore({...a.bindings,providerRuntimeId:String(binding.providerRuntimeId),restoreRequestKey:key,
+        sessionLocator:String(binding.sessionLocator),sessionMetadataDigest:String(binding.sessionMetadataDigest)},a.preparationEvidence),a.bindings,String(binding.providerRuntimeId));
       state=proof.outcome==='current_exact'?'restored':proof.outcome==='absent'?'missing':'ambiguous';
       await this.#append('restore',a.trusted,a.request,a.common,state,state==='ambiguous'?{reason:'restore_unknown'}:{evidenceDigest:proof.evidenceDigest});return{state,runtimeInstanceKey:a.common.runtimeInstanceKey};
     });
@@ -228,17 +234,20 @@ export class AgentRuntimeTransaction {
   async #append(chain:RuntimeTransition['chain'],trusted:Readonly<CompleteAgentCreationBindings>,request:Readonly<TrustedRuntimeOperationRequest>,common:RuntimeCommon,state:string,event:Record<string,unknown>){await this.records.append(trusted.canonicalDir,chain,request.requestActionId,request.authorizationRevision,common,state,event);}
   #chain(chain:RuntimeTransition['chain'],trusted:Readonly<CompleteAgentCreationBindings>,request:Readonly<TrustedRuntimeOperationRequest>,common:RuntimeCommon,edges:Record<string,readonly string[]>){const values=this.records.readChain(trusted.canonicalDir,chain,request.requestActionId,common);for(let index=0;index<values.length;index++){const prior=values[index-1]?.state??'start';if(!edges[prior]?.includes(values[index]!.state)||values[index]!.authorizationRevision!==request.authorizationRevision)throw new AgentRuntimeTransactionError('corrupt');}return values;}
   #claim(claim:Readonly<RuntimeCommon>,common:RuntimeCommon){if(runtimeCanonical(claim)!==runtimeCanonical({...common,schemaVersion:1,kind:'AgentRuntimeActiveClaim',claimDigest:(claim as Record<string,unknown>).claimDigest}))throw new AgentRuntimeTransactionError('corrupt');}
-  #startProof(raw:unknown,b:RuntimeProviderBindings,_hint?:unknown){const p=this.proofs.authenticateStart(raw);const started=p?.outcome==='started_by_action';if(!p||p.runtimeInstanceKey!==b.runtimeInstanceKey||p.startEffectKey!==b.startEffectKey||!['not_started','started_by_action','unknown'].includes(p.outcome)||!TOKEN.test(p.provider)||started&&(!p.providerRuntimeId||!TOKEN.test(p.providerRuntimeId)||!p.startEvidenceDigest||!p.receiptDigest||![p.startEvidenceDigest,p.receiptDigest].every(x=>SHA.test(x)))||!started&&(p.providerRuntimeId!==undefined||p.startEvidenceDigest!==undefined||p.receiptDigest!==undefined))throw new AgentRuntimeTransactionError('invalid_proof');return p;}
+  #startProof(raw:unknown,b:RuntimeProviderBindings,_hint?:unknown){const p=this.proofs.authenticateStart(raw);return this.#validateStartProof(p,b);}
+  #validateStartProof(p:Readonly<TrustedRuntimeStartProof>|undefined,b:RuntimeProviderBindings){const started=p?.outcome==='started_by_action';const receipt=started&&p.sessionLocator&&p.sessionMetadataDigest?runtimeDigest(runtimeCanonical({kind:'start-receipt',runtimeInstanceKey:b.runtimeInstanceKey,startEffectKey:b.startEffectKey,sessionLocator:p.sessionLocator,sessionMetadataDigest:p.sessionMetadataDigest})):undefined;if(!p||p.runtimeInstanceKey!==b.runtimeInstanceKey||p.startEffectKey!==b.startEffectKey||!['not_started','started_by_action','unknown'].includes(p.outcome)||!TOKEN.test(p.provider)||started&&(!p.providerRuntimeId||!TOKEN.test(p.providerRuntimeId)||!p.startEvidenceDigest||!p.receiptDigest||p.receiptDigest!==receipt||!p.sessionLocator||!TOKEN.test(p.sessionLocator)||!p.sessionMetadataDigest||![p.startEvidenceDigest,p.receiptDigest,p.sessionMetadataDigest].every(x=>SHA.test(x)))||!started&&(p.providerRuntimeId!==undefined||p.startEvidenceDigest!==undefined||p.receiptDigest!==undefined||p.sessionLocator!==undefined||p.sessionMetadataDigest!==undefined))throw new AgentRuntimeTransactionError('invalid_proof');return p;}
   #readiness(raw:unknown,b:RuntimeProviderBindings,id:string){const p=this.proofs.authenticateReadiness(raw);if(!p||p.runtimeInstanceKey!==b.runtimeInstanceKey||p.startEffectKey!==b.startEffectKey||p.providerRuntimeId!==id||!['ready','not_ready','unknown'].includes(p.outcome)||!SHA.test(p.evidenceDigest))throw new AgentRuntimeTransactionError('invalid_proof');return p;}
   #restore(raw:unknown,b:RuntimeProviderBindings,id:string){const p=this.proofs.authenticateRestore(raw);if(!p||p.runtimeInstanceKey!==b.runtimeInstanceKey||p.startEffectKey!==b.startEffectKey||p.providerRuntimeId!==id||!['current_exact','absent','unknown'].includes(p.outcome)||!SHA.test(p.evidenceDigest))throw new AgentRuntimeTransactionError('invalid_proof');return p;}
   #retireProof(raw:unknown,b:RuntimeProviderBindings,id:string,key:string){const p=this.proofs.authenticateRetire(raw);if(!p||p.runtimeInstanceKey!==b.runtimeInstanceKey||p.retireEffectKey!==key||p.providerRuntimeId!==id||!['current_exact','already_absent','unknown'].includes(p.outcome)||!SHA.test(p.evidenceDigest))throw new AgentRuntimeTransactionError('invalid_proof');return p;}
-  #runtimeArtifacts(t:Readonly<CompleteAgentCreationBindings>,r:Readonly<TrustedRuntimeOperationRequest>,b:RuntimeProviderBindings,a:Readonly<DurableRuntimeAdapter>,p:Readonly<TrustedRuntimeStartProof>){const binding={schemaVersion:1,kind:'AgentRuntimeBinding',...b,provider:p.provider,providerRuntimeId:p.providerRuntimeId,startEvidenceDigest:p.startEvidenceDigest};this.records.publishArtifact(t.canonicalDir,'runtime-binding.json',binding);this.records.publishArtifact(t.canonicalDir,'runtime-provenance.json',{schemaVersion:1,kind:'AgentRuntimeProvenance',requestActionId:r.requestActionId,authorizationRevision:r.authorizationRevision,...b,startEvidenceDigest:p.startEvidenceDigest,adapterId:a.adapterId,adapterVersion:a.adapterVersion});}
+  #runtimeArtifacts(t:Readonly<CompleteAgentCreationBindings>,r:Readonly<TrustedRuntimeOperationRequest>,b:RuntimeProviderBindings,a:Readonly<DurableRuntimeAdapter>,p:Readonly<TrustedRuntimeStartProof>){const binding={schemaVersion:1,kind:'AgentRuntimeBinding',...b,provider:p.provider,providerRuntimeId:p.providerRuntimeId,startEvidenceDigest:p.startEvidenceDigest,sessionLocator:p.sessionLocator,sessionMetadataDigest:p.sessionMetadataDigest};this.records.publishArtifact(t.canonicalDir,'runtime-binding.json',binding);this.records.publishArtifact(t.canonicalDir,'runtime-provenance.json',{schemaVersion:1,kind:'AgentRuntimeProvenance',requestActionId:r.requestActionId,authorizationRevision:r.authorizationRevision,...b,startEvidenceDigest:p.startEvidenceDigest,sessionLocator:p.sessionLocator,sessionMetadataDigest:p.sessionMetadataDigest,adapterId:a.adapterId,adapterVersion:a.adapterVersion});}
   #binding(t:Readonly<CompleteAgentCreationBindings>,b:RuntimeProviderBindings,a:Readonly<DurableRuntimeAdapter>){
     const v=this.records.readArtifact(t.canonicalDir,'runtime-binding.json');
     const provenance=this.records.readArtifact(t.canonicalDir,'runtime-provenance.json');
     for(const [key,value] of Object.entries(b)) if(v[key]!==value||provenance[key]!==value)
       throw new AgentRuntimeTransactionError('corrupt');
-    if(typeof v.providerRuntimeId!=='string'||v.startEvidenceDigest!==provenance.startEvidenceDigest
+    if(typeof v.providerRuntimeId!=='string'||!TOKEN.test(String(v.sessionLocator))||!SHA.test(String(v.sessionMetadataDigest))
+      ||v.startEvidenceDigest!==provenance.startEvidenceDigest
+      ||v.sessionLocator!==provenance.sessionLocator||v.sessionMetadataDigest!==provenance.sessionMetadataDigest
       ||provenance.adapterId!==a.adapterId||provenance.adapterVersion!==a.adapterVersion)
       throw new AgentRuntimeTransactionError('corrupt');
     if(typeof provenance.requestActionId!=='string'||typeof provenance.authorizationRevision!=='string')
@@ -256,7 +265,8 @@ export class AgentRuntimeTransaction {
     const started=launch.find(value=>value.state==='started');
     if(!started||started.authorizationRevision!==provenance.authorizationRevision
       ||started.event.provider!==v.provider||started.event.providerRuntimeId!==v.providerRuntimeId
-      ||started.event.startEvidenceDigest!==v.startEvidenceDigest)
+      ||started.event.startEvidenceDigest!==v.startEvidenceDigest||started.event.sessionLocator!==v.sessionLocator
+      ||started.event.sessionMetadataDigest!==v.sessionMetadataDigest)
       throw new AgentRuntimeTransactionError('corrupt');
     return v;
   }

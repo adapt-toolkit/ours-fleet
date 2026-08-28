@@ -63,7 +63,7 @@ const eventSchemas: Record<RuntimeTransition['chain'], Record<string, readonly s
   launch: {
     prerequisites_validated: ['prerequisiteDigest'], active_claimed: ['claimDigest'],
     start_authorized: ['startEffectKey'], starting: [],
-    started: ['provider','providerRuntimeId','startEvidenceDigest','receiptDigest'],
+    started: ['provider','providerRuntimeId','startEvidenceDigest','receiptDigest','sessionLocator','sessionMetadataDigest'],
     readiness_checking: [], ready: ['evidenceDigest'], not_ready: ['evidenceDigest'], ambiguous: ['reason'],
   },
   restore: { restore_authorized: ['restoreRequestKey'], reconciling: [], restored: ['evidenceDigest'],
@@ -329,11 +329,12 @@ export class AgentRuntimeRecordStore {
     const keys = binding
       ? ['schemaVersion','kind','agentId','generation','planDigest','snapshotDigest','reservationDigest',
         'identityEvidenceDigest','runtimeInstanceKey','startEffectKey','adapterDescriptorDigest','provider',
-        'providerRuntimeId','startEvidenceDigest']
+        'providerRuntimeId','startEvidenceDigest','sessionLocator','sessionMetadataDigest']
       : name === 'runtime-provenance.json'
         ? ['schemaVersion','kind','requestActionId','authorizationRevision','agentId','generation','planDigest',
           'snapshotDigest','reservationDigest','identityEvidenceDigest','runtimeInstanceKey','startEffectKey',
           'adapterDescriptorDigest','startEvidenceDigest','adapterId','adapterVersion']
+          .concat(['sessionLocator','sessionMetadataDigest'])
         : [];
     if (keys.length === 0 || !exact(value, keys)
         || value.schemaVersion !== 1

@@ -26,7 +26,9 @@ export interface ProductionAgentSupervisorRehydration {
   rehydrate(agentId: string): PermanentAgentSupervisorSeam;
 }
 export interface InternalPermanentAgentSupervisorSeam extends PermanentAgentSupervisorSeam {
-  startSession(options: Omit<AcpSessionOptions, 'argv' | 'env'>): Promise<SessionHandle>;
+  startSession(options: Omit<AcpSessionOptions, 'argv' | 'env'>,
+    runtimeLaunchContext: Readonly<{ evidence: unknown; sessionRequestId: string;
+      sessionRequest: Readonly<Record<string, unknown>> }>): Promise<SessionHandle>;
 }
 export interface InternalAgentSupervisorRehydration {
   rehydrate(agentId: string): InternalPermanentAgentSupervisorSeam;
@@ -97,10 +99,11 @@ function createAgentSupervisorRehydration(
     const provider = new AuthenticatedAgentRuntimeProvider(preparations, complete, deps.driverFactory, deps.reconciliation);
     const transaction = new AgentRuntimeTransaction(completions, operations, adapters, provider, provider,
       new AgentRuntimeRecordStore());
-    const issue = (operation: 'start' | 'restore', reason?: string): VerifiedRuntimeOperationRequest => {
+    const issue = (operation: 'start' | 'restore', reason?: string, sessionRequestId?: string): VerifiedRuntimeOperationRequest => {
       const evidence = Object.freeze({}) as VerifiedRuntimeOperationRequest;
       const requestActionId = digest({ kind: `supervisor.${operation}`, agentId: complete.agentId,
-        generation: complete.generation, reservationDigest: complete.reservationDigest }).slice(7);
+        generation: complete.generation, reservationDigest: complete.reservationDigest,
+        ...(operation === 'restore' ? { sessionRequestId } : {}) }).slice(7);
       requests.set(evidence as object, Object.freeze({ operation, requestActionId,
         authorizationRevision: plan.authorizationRevision, principal: Object.freeze({ id: 'system', kind: 'system' }),
         agentId: complete.agentId, generation: complete.generation, planDigest: complete.planDigest,
@@ -113,9 +116,17 @@ function createAgentSupervisorRehydration(
       generation: complete.generation,
       start,
       restore: (reason: string) => transaction.restore(reservation, issue('restore', reason)),
-      startSession: async (options: Omit<AcpSessionOptions, 'argv' | 'env'>) => {
-        const runtime = await start();
-        if (runtime.state !== 'ready') throw new TypeError('supervisor runtime is not ready');
+      startSession: async (options: Omit<AcpSessionOptions, 'argv' | 'env'>,
+        runtimeLaunchContext?: Readonly<{ evidence: unknown; sessionRequestId: string;
+          sessionRequest: Readonly<Record<string, unknown>> }>) => {
+        if (!runtimeLaunchContext) throw new TypeError('runtime launch context unavailable');
+        preparations.attachLaunchContext(preparation, runtimeLaunchContext);
+        let runtime = await start();
+        if (runtime.state === 'ready' && !provider.hasConversation(runtime.runtimeInstanceKey, preparation)) {
+          runtime = await transaction.restore(reservation, issue('restore',
+            'permanent supervisor process restart', runtimeLaunchContext.sessionRequestId));
+          if (runtime.state !== 'restored') throw new TypeError('supervisor runtime is not restored');
+        } else if (runtime.state !== 'ready') throw new TypeError('supervisor runtime is not ready');
         const endpoint = provider.issueConversation(runtime.runtimeInstanceKey, preparation);
         return createInjectedAcpSession(options, provider, endpoint);
       } });

@@ -1757,7 +1757,10 @@ async function createInjectedSession(
       pending.clear(); closed = true; Object.assign(child, { exitCode: 1 }); child.emit('exit', 1, null); return;
     }
     const notification = delivery.notification;
-    if (notification.kind === 'completed') {
+    if (notification.kind === 'session_update') {
+      (instance as unknown as { recordUpdate(update: acp.SessionUpdate): void })
+        .recordUpdate(notification.update);
+    } else if (notification.kind === 'completed') {
       const waiter = pending.get(notification.promptId); if (!waiter) return;
       pending.delete(notification.promptId); waiter.resolve({ stopReason: notification.outcome === 'refused'
         ? 'refusal' : notification.outcome === 'cancelled' ? 'cancelled' : 'end_turn' });

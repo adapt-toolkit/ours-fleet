@@ -257,7 +257,7 @@ describe('authenticated Agent runtime provider bridge',()=>{
     await expect(foreignProvider.reconcileStart(b,opaque)).rejects.toThrow(/unavailable/u);
   });
 
-  it('reconciles a crash after external start without issuing a second start',async()=>{
+  it('keeps a crash after an unproven external start unknown without issuing a second start',async()=>{
     const adapter=getBrainAdapter('codex','acp');const durableAdapter=durable(adapter.adapterId,adapter.adapterVersion);
     const launch=createAcpBodyBrainPreparedLaunch({schemaVersion:1,adapterId:'codex-acp',adapterVersion:'1.1.7',
       argv:['node','agent.js'],env:{},translation:{model:'gpt-5.6-sol',effort:'high',permissionMetadataSource:'codex-acp'}});
@@ -272,12 +272,12 @@ describe('authenticated Agent runtime provider bridge',()=>{
     const first=new AuthenticatedAgentRuntimeProvider(authority,completion,crashingDriver,reconcile);
     expect(first.authenticateStart(await first.reconcileStart(b,opaque))).toMatchObject({outcome:'not_started'});
     const recoveredProof=first.authenticateStart(await first.startBrain({...b,descriptor:durableAdapter.descriptor},opaque));
-    expect(recoveredProof).toMatchObject({outcome:'started_by_action',providerRuntimeId:externalId});
+    expect(recoveredProof).toMatchObject({outcome:'unknown'});
     const restartedPlan=planAuthority({brain:{},permissions:{},enforcementEvidence:{}},durableAdapter);
     const restartedAuthority=new AgentRuntimePreparationAuthority(brains as never,restartedPlan.authority);
     const restartedOpaque=restartedAuthority.prepare(restartedPlan.evidence,restartedPlan.launchInput,durableAdapter);
     const restarted=new AuthenticatedAgentRuntimeProvider(restartedAuthority,completion,crashingDriver,reconcile);
-    expect(restarted.authenticateStart(await restarted.reconcileStart(b,restartedOpaque))).toMatchObject({outcome:'started_by_action'});
+    expect(restarted.authenticateStart(await restarted.reconcileStart(b,restartedOpaque))).toMatchObject({outcome:'unknown'});
     expect(starts).toBe(1);
   });
 });

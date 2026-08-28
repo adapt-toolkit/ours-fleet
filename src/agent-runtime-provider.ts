@@ -67,6 +67,8 @@ interface Prepared {
   brain:AuthenticatedPreparedBrainLaunchBindings;
   runtimeInstanceKey:string; startEffectKey:string; adapterDescriptorDigest:string;
   sessionMetadata?:Readonly<AcpSessionMetadata>;
+  runtimeLaunchContext?:Readonly<{evidence:unknown;sessionRequestId:string;
+    sessionRequest:Readonly<Record<string,unknown>>}>;
 }
 
 const sameCompletion=(left:Readonly<CompleteAgentCreationBindings>,right:Readonly<CompleteAgentCreationBindings>)=>
@@ -132,10 +134,28 @@ export class AgentRuntimePreparationAuthority {
     if(!prepared)throw new TypeError('runtime Brain preparation is unavailable');
     prepared.sessionMetadata=Object.freeze({...metadata});
   }
+  attachLaunchContext(evidence:unknown,context:Readonly<{evidence:unknown;sessionRequestId:string;
+    sessionRequest:Readonly<Record<string,unknown>>}>):void{
+    const prepared=evidence&&typeof evidence==='object'?this.#issued.get(evidence as object):undefined;
+    if(!prepared||!context||typeof context!=='object'||typeof context.sessionRequestId!=='string'||!context.sessionRequestId)
+      throw new TypeError('runtime launch context unavailable');
+    if(prepared.runtimeLaunchContext){if(prepared.runtimeLaunchContext.evidence===context.evidence
+      &&prepared.runtimeLaunchContext.sessionRequestId===context.sessionRequestId
+      &&runtimeCanonical(prepared.runtimeLaunchContext.sessionRequest)===runtimeCanonical(context.sessionRequest))return;
+      throw new TypeError('runtime launch context unavailable');}
+    prepared.runtimeLaunchContext=Object.freeze({evidence:context.evidence,sessionRequestId:context.sessionRequestId,
+      sessionRequest:Object.freeze(JSON.parse(runtimeCanonical(context.sessionRequest)))});
+  }
+  takeLaunchContext(evidence:unknown):Readonly<{evidence:unknown;sessionRequestId:string;
+    sessionRequest:Readonly<Record<string,unknown>>}>|undefined{
+    const prepared=evidence&&typeof evidence==='object'?this.#issued.get(evidence as object):undefined;
+    const context=prepared?.runtimeLaunchContext;if(prepared)delete prepared.runtimeLaunchContext;return context;
+  }
 }
 
 export type AgentRuntimeDriverFactory=(prepared:Readonly<AuthenticatedPreparedBrainLaunchBindings>,
-  bindings:Readonly<RuntimeProviderBindings>)=>AcpBodyBrainInjectedDriver;
+  bindings:Readonly<RuntimeProviderBindings&{providerRuntimeId:string}>, canonicalDir:string,
+  runtimeLaunchContext:unknown, actionId:string)=>AcpBodyBrainInjectedDriver;
 
 export interface AgentRuntimeReconciliationQuery extends RuntimeProviderBindings {
   readonly providerRuntimeId?:string;
@@ -158,6 +178,7 @@ export interface AgentRuntimeReconciliationAuthority {
 }
 
 interface Live {provider:AcpBodyBrainProvider;providerRuntimeId:string;preparation:unknown;
+  sessionMetadata:Readonly<AcpSessionMetadata>;
   conversation:AgentConversationRelay;}
 
 /** Production process-local bridge; durable truth remains owned by AgentRuntimeTransaction. */
@@ -199,10 +220,16 @@ AgentConversationEndpointAuthority{
       outcome=this.reconciliation.authenticateStart(raw,bindings);}catch{/* unknown below */}
     if(outcome?.outcome==='not_started')this.#startAuthorized.set(bindings.runtimeInstanceKey,evidence);
     else this.#startAuthorized.delete(bindings.runtimeInstanceKey);
-    return this.#issue(this.#start,outcome?.outcome==='started_by_action'?{runtimeInstanceKey:bindings.runtimeInstanceKey,
+    let exactLive=false;
+    if(outcome?.outcome==='started_by_action'&&live)
+      exactLive=live.providerRuntimeId===outcome.providerRuntimeId;
+    return this.#issue(this.#start,exactLive?{runtimeInstanceKey:bindings.runtimeInstanceKey,
       startEffectKey:bindings.startEffectKey,outcome:'started_by_action',provider:'acp-body-brain',
-      providerRuntimeId:outcome.providerRuntimeId,startEvidenceDigest:this.#digest('start-evidence',bindings),
-      receiptDigest:this.#digest('start-receipt',bindings)}:outcome?.outcome==='not_started'
+      providerRuntimeId:live!.providerRuntimeId,startEvidenceDigest:this.#digest('start-evidence',bindings),
+      receiptDigest:runtimeDigest(runtimeCanonical({kind:'start-receipt',runtimeInstanceKey:bindings.runtimeInstanceKey,
+        startEffectKey:bindings.startEffectKey,sessionLocator:live!.sessionMetadata.token,
+        sessionMetadataDigest:live!.sessionMetadata.digest})),sessionLocator:live!.sessionMetadata.token,
+      sessionMetadataDigest:live!.sessionMetadata.digest}:outcome?.outcome==='not_started'
       ?{runtimeInstanceKey:bindings.runtimeInstanceKey,startEffectKey:bindings.startEffectKey,
         outcome:'not_started',provider:'acp-body-brain'}
       :{runtimeInstanceKey:bindings.runtimeInstanceKey,startEffectKey:bindings.startEffectKey,
@@ -225,15 +252,18 @@ AgentConversationEndpointAuthority{
       try{const descriptor=getBodyBrainAdapterDescriptor(prepared.brain.adapter.harness as 'codex'|'claude-code');
         if(descriptor.adapterId!==prepared.brain.validation.adapterId
           ||descriptor.adapterVersion!==prepared.brain.validation.adapterVersion)throw new TypeError();
-        const driver=this.drivers(prepared.brain,bindings);
+        const providerRuntimeId=this.#id(bindings);const context=this.preparations.takeLaunchContext(evidence);
+        const driver=this.drivers(prepared.brain,{...bindings,providerRuntimeId},prepared.completion.canonicalDir,
+          context,prepared.completion.actionId);
         provider=descriptor.createProvider(prepared.brain.bodyBrainLaunch,driver);
-        const providerRuntimeId=this.#id(bindings);const conversation=new AgentConversationRelay({agentId:bindings.agentId,
+        const conversation=new AgentConversationRelay({agentId:bindings.agentId,
           generation:bindings.generation,runtimeInstanceKey:bindings.runtimeInstanceKey,providerRuntimeId},descriptor.adapterId,provider,
         ()=>typeof (driver as {pid?:unknown}).pid==='function'?(driver as unknown as {pid():number}).pid():2_147_483_647);
         const result=await conversation.start({protocolVersion:1,generation:`g${bindings.generation}`,planDigest:bindings.planDigest});
         if(result.state!=='accepted'){await provider.cleanup();return;}
         this.preparations.recordMetadata(evidence,result.sessionMetadata);
-        this.#live.set(bindings.runtimeInstanceKey,{provider,providerRuntimeId,preparation:evidence,conversation});
+        this.#live.set(bindings.runtimeInstanceKey,{provider,providerRuntimeId,preparation:evidence,conversation,
+          sessionMetadata:result.sessionMetadata});
       }catch{try{await provider?.cleanup();}catch{/* redacted */}}})();
     this.#starting.set(bindings.runtimeInstanceKey,{evidence,promise:pending});
     void pending.finally(()=>this.#starting.delete(bindings.runtimeInstanceKey));
@@ -247,18 +277,24 @@ AgentConversationEndpointAuthority{
       providerRuntimeId:bindings.providerRuntimeId,outcome:current?'ready':'unknown',evidenceDigest:this.#digest('readiness',bindings)});
   }
 
-  async reconcileRestore(bindings:Readonly<RuntimeProviderBindings&{providerRuntimeId:string;restoreRequestKey:string}>,evidence:unknown){
+  async reconcileRestore(bindings:Readonly<RuntimeProviderBindings&{providerRuntimeId:string;restoreRequestKey:string;
+    sessionLocator:string;sessionMetadataDigest:string}>,evidence:unknown){
     const prepared=this.#prepared(bindings,evidence);let live=this.#live.get(bindings.runtimeInstanceKey);
+    if(!prepared.sessionMetadata)this.preparations.recordMetadata(evidence,Object.freeze({schemaVersion:1,
+      token:bindings.sessionLocator,digest:bindings.sessionMetadataDigest}));
     if(!live&&prepared.sessionMetadata){
       try{const descriptor=getBodyBrainAdapterDescriptor(prepared.brain.adapter.harness as 'codex'|'claude-code');
-        const driver=this.drivers(prepared.brain,bindings);
+        const context=this.preparations.takeLaunchContext(evidence);
+        const driver=this.drivers(prepared.brain,{...bindings,providerRuntimeId:bindings.providerRuntimeId},
+          prepared.completion.canonicalDir,context,prepared.completion.actionId);
         const provider=descriptor.createProvider(prepared.brain.bodyBrainLaunch,driver);
         const conversation=new AgentConversationRelay({agentId:bindings.agentId,generation:bindings.generation,
           runtimeInstanceKey:bindings.runtimeInstanceKey,providerRuntimeId:bindings.providerRuntimeId},descriptor.adapterId,provider,
         ()=>typeof (driver as {pid?:unknown}).pid==='function'?(driver as unknown as {pid():number}).pid():2_147_483_647);
         const result=await conversation.restore({protocolVersion:1,generation:`g${bindings.generation}`,
           planDigest:bindings.planDigest,sessionMetadata:prepared.sessionMetadata});
-        if(result.state==='accepted'){live={provider,providerRuntimeId:bindings.providerRuntimeId,preparation:evidence,conversation};
+        if(result.state==='accepted'){live={provider,providerRuntimeId:bindings.providerRuntimeId,preparation:evidence,conversation,
+          sessionMetadata:result.sessionMetadata};
           this.#live.set(bindings.runtimeInstanceKey,live);}else await provider.cleanup();
       }catch{/* unknown proof below */}
     }
@@ -299,6 +335,9 @@ AgentConversationEndpointAuthority{
     if(!live||live.preparation!==evidence)
       throw new TypeError('runtime conversation is unavailable');
     return live.conversation.issue();
+  }
+  hasConversation(runtimeInstanceKey:string,evidence:unknown):boolean{
+    const live=this.#live.get(runtimeInstanceKey);return !!live&&live.preparation===evidence;
   }
   authenticate(value:AgentConversationEndpoint){for(const live of this.#live.values()){
     const authenticated=live.conversation.authenticate(value);if(authenticated)return authenticated;

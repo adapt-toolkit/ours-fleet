@@ -2,8 +2,10 @@ import { createHash } from 'node:crypto';
 import { describe, expect, it, vi } from 'vitest';
 import {
   ACP_BODY_BRAIN_MAX_PERMISSION_OPTIONS,
+  ACP_BODY_BRAIN_MAX_UPDATE_BYTES,
   ACP_BODY_BRAIN_MAX_BODY_BYTES,
   AcpBodyBrainTransportBoundary,
+  sanitizeAcpBodyBrainSessionUpdate,
   type AcpBodyBrainProvider,
   type AcpBodyBrainNotification,
   type AcpBodySource,
@@ -240,6 +242,53 @@ describe('AcpBodyBrainTransportBoundary lifecycle', () => {
 });
 
 describe('notification validation', () => {
+  const validUpdates = [
+    { sessionUpdate: 'user_message_chunk', content: { type: 'text', text: 'u' } },
+    { sessionUpdate: 'agent_message_chunk', content: { type: 'resource_link', name: 'n', uri: 'file:///x' } },
+    { sessionUpdate: 'agent_thought_chunk', content: { type: 'resource', resource: { uri: 'file:///x', text: 't' } } },
+    { sessionUpdate: 'tool_call', toolCallId: 't', title: 'tool', kind: 'read', status: 'pending',
+      content: [{ type: 'diff', path: '/x', newText: 'n' }], locations: [{ path: '/x', line: 1 }] },
+    { sessionUpdate: 'tool_call_update', toolCallId: 't', status: 'completed' },
+    { sessionUpdate: 'plan', entries: [{ content: 'x', priority: 'high', status: 'pending' }] },
+    { sessionUpdate: 'plan_update', plan: { type: 'markdown', planId: 'p', content: '# plan' } },
+    { sessionUpdate: 'plan_removed', planId: 'p' },
+    { sessionUpdate: 'available_commands_update', availableCommands: [{ name: 'x', description: 'd', input: { hint: 'h' } }] },
+    { sessionUpdate: 'current_mode_update', currentModeId: 'mode' },
+    { sessionUpdate: 'config_option_update', configOptions: [{ type: 'select', id: 'model', name: 'Model',
+      currentValue: 'a', options: [{ value: 'a', name: 'A' }] },
+    { type: 'boolean', id: 'thinking', name: 'Thinking', currentValue: true }] },
+    { sessionUpdate: 'session_info_update', title: 'title', updatedAt: null },
+    { sessionUpdate: 'usage_update', used: 1, size: 2, cost: { amount: 0.1, currency: 'USD' } },
+  ] as const;
+
+  it('accepts every exact update variant as an owned no-throw protocol DTO', () => {
+    for (const update of validUpdates) {
+      const accepted = sanitizeAcpBodyBrainSessionUpdate(update);
+      expect(accepted, update.sessionUpdate).toBeDefined();
+      expect(() => JSON.stringify(accepted)).not.toThrow();
+      expect(Object.isFrozen(accepted)).toBe(true);
+    }
+  });
+
+  it('rejects wrong types, nested extras, and accessor-bearing objects for every update variant', () => {
+    for (const update of validUpdates) {
+      const wrong = { ...update } as Record<string, unknown>;
+      const required = Object.keys(wrong).find(key => key !== 'sessionUpdate')!;
+      wrong[required] = Symbol('wrong');
+      expect(sanitizeAcpBodyBrainSessionUpdate(wrong), `${update.sessionUpdate} wrong type`).toBeUndefined();
+      expect(sanitizeAcpBodyBrainSessionUpdate({ ...update, unexpected: true }),
+        `${update.sessionUpdate} top extra`).toBeUndefined();
+    }
+    expect(sanitizeAcpBodyBrainSessionUpdate({ sessionUpdate: 'tool_call', toolCallId: 't', title: 't',
+      locations: [{ path: '/x', unexpected: true }] })).toBeUndefined();
+    expect(sanitizeAcpBodyBrainSessionUpdate({ sessionUpdate: 'config_option_update', configOptions: [
+      { type: 'boolean', id: 'x', name: 'X', currentValue: true, unexpected: true },
+    ] })).toBeUndefined();
+    const accessor = { sessionUpdate: 'usage_update', used: 1, size: 2 };
+    Object.defineProperty(accessor, 'cost', { enumerable: true, get: () => ({ amount: 1, currency: 'USD' }) });
+    expect(sanitizeAcpBodyBrainSessionUpdate(accessor)).toBeUndefined();
+  });
+
   it('rejects gaps, duplicate sequence numbers, generation changes, and ID conflicts', async () => {
     const value = await active();
     value.notify(notification({ transportSeq: 2 }));
@@ -298,6 +347,31 @@ describe('notification validation', () => {
       notificationId: 'n1', transportSeq: 1, generation, protocolVersion: 1,
     });
     expect(value.deliveries[1]).toEqual({ state: 'failed', code: 'sequence_duplicate' });
+  });
+
+  it('accepts only exact bounded session updates and deeply owns their DTO', async () => {
+    const value = await active();
+    const raw = { sessionUpdate: 'agent_message_chunk', messageId: 'm1',
+      content: { type: 'text', text: 'hello' } };
+    value.notify(notification({ kind: 'session_update', update: raw }));
+    raw.content.text = 'mutated';
+    const delivered = (value.deliveries[0] as { notification: AcpBodyBrainNotification }).notification;
+    expect(delivered.kind === 'session_update' && delivered.update).toEqual({
+      sessionUpdate: 'agent_message_chunk', messageId: 'm1', content: { type: 'text', text: 'hello' },
+    });
+    expect(delivered.kind === 'session_update' && Object.isFrozen(delivered.update)).toBe(true);
+    expect(delivered.kind === 'session_update' && Object.isFrozen(delivered.update.content)).toBe(true);
+
+    const malformed = await active();
+    malformed.notify(notification({ kind: 'session_update', update: {
+      sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'hello' }, secretEscape: true,
+    } }));
+    expect(malformed.deliveries).toEqual([{ state: 'failed', code: 'invalid_notification' }]);
+    const oversized = await active();
+    oversized.notify(notification({ kind: 'session_update', update: {
+      sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'x'.repeat(ACP_BODY_BRAIN_MAX_UPDATE_BYTES + 1) },
+    } }));
+    expect(oversized.deliveries).toEqual([{ state: 'failed', code: 'invalid_notification' }]);
   });
 });
 

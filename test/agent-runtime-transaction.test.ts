@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, unlinkSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, unlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import type { VerifiedGenerationReservation } from '../src/agent-generation-reservation.js';
@@ -62,7 +62,11 @@ function harness(records: AgentRuntimeRecordStore) {
     reconcileStart: vi.fn(async (input: Record<string, unknown>) => { const raw = {};
       startProofs.set(raw, started ? { runtimeInstanceKey: input.runtimeInstanceKey, startEffectKey: input.startEffectKey,
         outcome: 'started_by_action', provider: 'inert', providerRuntimeId: 'runtime-1',
-        startEvidenceDigest: `sha256:${'7'.repeat(64)}`, receiptDigest: `sha256:${'8'.repeat(64)}` }
+        startEvidenceDigest: `sha256:${'7'.repeat(64)}`,
+        receiptDigest: runtimeDigest(runtimeCanonical({ kind: 'start-receipt',
+          runtimeInstanceKey: input.runtimeInstanceKey, startEffectKey: input.startEffectKey,
+          sessionLocator: 'session-1', sessionMetadataDigest: `sha256:${'6'.repeat(64)}` })),
+        sessionLocator: 'session-1', sessionMetadataDigest: `sha256:${'6'.repeat(64)}` }
         : { runtimeInstanceKey: input.runtimeInstanceKey, startEffectKey: input.startEffectKey,
           outcome: 'not_started', provider: 'inert' }); return raw; }),
     startBrain: vi.fn(async () => { started = true; return {}; }),
@@ -144,6 +148,9 @@ describe('started transition crash recovery', () => {
     expect(h.provider.startBrain).toHaveBeenCalledTimes(1);
     expect(existsSync(join(canonicalDir, 'runtime-binding.json'))).toBe(true);
     expect(existsSync(join(canonicalDir, 'runtime-provenance.json'))).toBe(true);
+    expect(JSON.parse(readFileSync(join(canonicalDir, 'runtime-binding.json'), 'utf8'))).toMatchObject({
+      sessionLocator: 'session-1', sessionMetadataDigest: `sha256:${'6'.repeat(64)}`,
+    });
   });
 
   it('serializes concurrent replay so the provider start effect occurs at most once', async () => {
@@ -178,6 +185,31 @@ describe('started transition crash recovery', () => {
     await expect(h.transaction.start(reservation, h.requestEvidence)).resolves.toMatchObject({ state: 'ready' });
     expect(existsSync(join(canonicalDir, 'runtime-provenance.json'))).toBe(true);
     expect(h.provider.startBrain).toHaveBeenCalledTimes(1);
+  });
+
+  it('repairs a provenance-only publication by recreating the missing binding', async () => {
+    const h = harness(new AgentRuntimeRecordStore()); await h.transaction.start(reservation, h.requestEvidence);
+    unlinkSync(join(canonicalDir, 'runtime-binding.json'));
+    await expect(h.transaction.start(reservation, h.requestEvidence)).resolves.toMatchObject({ state: 'ready' });
+    expect(existsSync(join(canonicalDir, 'runtime-binding.json'))).toBe(true);
+    expect(h.provider.startBrain).toHaveBeenCalledTimes(1);
+  });
+
+  it('will not repair artifacts from a started transition whose receipt mismatches metadata', async () => {
+    let crash = true; const records = new AgentRuntimeRecordStore({ afterTransition: state => {
+      if (state === 'started' && crash) { crash = false; throw new Error('crash after started'); }
+    } });
+    const h = harness(records);
+    await expect(h.transaction.start(reservation, h.requestEvidence)).rejects.toThrow('crash after started');
+    const dir = records.chainDir(canonicalDir, 'launch', 'start-1');
+    const path = join(dir, readdirSync(dir).find(name => name.endsWith('-started.json'))!);
+    const value = JSON.parse(readFileSync(path, 'utf8')) as Record<string, unknown>;
+    (value.event as Record<string, unknown>).receiptDigest = `sha256:${'0'.repeat(64)}`;
+    const { digest: _digest, ...unsigned } = value; value.digest = runtimeDigest(runtimeCanonical(unsigned));
+    unlinkSync(path); writeFileSync(path, `${runtimeCanonical(value)}\n`, { mode: 0o600 });
+    await expect(h.transaction.start(reservation, h.requestEvidence)).rejects.toMatchObject({ code: 'invalid_proof' });
+    expect(existsSync(join(canonicalDir, 'runtime-binding.json'))).toBe(false);
+    expect(existsSync(join(canonicalDir, 'runtime-provenance.json'))).toBe(false);
   });
 
   it('converges after the durable start index is published but before transitions', async () => {
@@ -338,6 +370,18 @@ describe('restore and retire durable operation chains', () => {
     value.extra = 'forged'; unlinkSync(path);
     writeFileSync(path, `${runtimeCanonical(value)}\n`, { mode: 0o600 });
     h.request.operation = 'restore'; h.request.requestActionId = 'restore-forged';
+    h.request.principal = { id: 'system-1', kind: 'system' }; h.request.recoveryReason = 'recovery';
+    await expect(h.transaction.restore(reservation, h.requestEvidence)).rejects.toMatchObject({ code: 'corrupt' });
+    expect(h.provider.reconcileRestore).not.toHaveBeenCalled();
+  });
+
+  it('rejects a recomputed session metadata substitution before restore effects', async () => {
+    const h = harness(new AgentRuntimeRecordStore()); await h.transaction.start(reservation, h.requestEvidence);
+    const path = join(canonicalDir, 'runtime-binding.json');
+    const value = JSON.parse(readFileSync(path, 'utf8')) as Record<string, unknown>;
+    value.sessionLocator = 'foreign-session'; unlinkSync(path);
+    writeFileSync(path, `${runtimeCanonical(value)}\n`, { mode: 0o600 });
+    h.request.operation = 'restore'; h.request.requestActionId = 'restore-substituted';
     h.request.principal = { id: 'system-1', kind: 'system' }; h.request.recoveryReason = 'recovery';
     await expect(h.transaction.restore(reservation, h.requestEvidence)).rejects.toMatchObject({ code: 'corrupt' });
     expect(h.provider.reconcileRestore).not.toHaveBeenCalled();

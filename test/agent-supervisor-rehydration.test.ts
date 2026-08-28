@@ -5,7 +5,9 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { createProductionAgentCreationCompositionRoot } from '../src/agent-creation-composition-root.js';
-import { createProductionAgentSupervisorRehydration } from '../src/agent-supervisor-rehydration.js';
+import { createInternalAgentSupervisorRehydration,
+  createProductionAgentSupervisorRehydration } from '../src/agent-supervisor-rehydration.js';
+import { agentRuntimeSessionRequestBindings } from '../src/agent-launch-composition-root.js';
 import { computeBrainDigest, computePermissionsDigest } from '../src/agent-plan.js';
 import { loadConfigResourceSnapshot } from '../src/config-resource-loader.js';
 import { computeBrainAdapterPolicyDigest } from '../src/harness/brain-adapter.js';
@@ -83,6 +85,49 @@ async function fixture() {
 }
 
 describe('production Agent supervisor rehydration', () => {
+  it('uses exact restore, never fresh start, in a second process-local rehydrator over durable ready state', async () => {
+    const f = await fixture(); const starts: string[] = []; const restores: string[] = [];
+    const makeDriver = () => { let listener: ((value: unknown) => void) | undefined;
+      const accepted = async () => ({ state: 'accepted' as const });
+      return { subscribe: (next: (value: unknown) => void) => { listener = next; return () => { listener = undefined; }; },
+        start: async (request: { lifecycle: { generation: string } }) => { starts.push(request.lifecycle.generation);
+          return { state: 'accepted' as const, sessionMetadata: { schemaVersion: 1 as const,
+            token: 'durable-session', digest: `sha256:${'d'.repeat(64)}` } }; },
+        restore: async (request: { lifecycle: { generation: string; sessionMetadata?: { token: string } } }) => {
+          restores.push(`${request.lifecycle.generation}:${request.lifecycle.sessionMetadata?.token}`);
+          return { state: 'accepted' as const, sessionMetadata: request.lifecycle.sessionMetadata! }; },
+        submit: accepted, respondPermission: accepted, cancel: accepted, forceTerminate: accepted,
+        close: accepted, retire: accepted, cleanup: async () => { listener = undefined; } };
+    };
+    const startEvidence = new WeakMap<object, 'not_started'>();
+    const reconciliation = { reconcileStart: async () => { const evidence = {}; startEvidence.set(evidence, 'not_started'); return evidence; },
+      authenticateStart: (evidence: unknown) => evidence && typeof evidence === 'object' && startEvidence.has(evidence as object)
+        ? { outcome: 'not_started' as const } : undefined,
+      reconcileRetire: async () => ({}), authenticateRetire: () => ({ outcome: 'already_absent' as const }) };
+    const deps = { ...f, driverFactory: vi.fn(() => makeDriver() as never), reconciliation, now: () => 10 };
+    const options = { name: 'agent-1', cwd: f.trustedRoot, stateDir: f.trustedRoot, mode: 'fresh' as const,
+      permissions: { approval: 'ask' as const, filesystem: 'workspace' as const, unattended: 'deny' as const },
+      log: () => undefined };
+    const context = (id: string) => ({ evidence: Object.freeze({}), sessionRequestId: id,
+      sessionRequest: agentRuntimeSessionRequestBindings(options) });
+    const first = createInternalAgentSupervisorRehydration(deps).rehydrate('agent-1');
+    const firstSession = await first.startSession(options, context('first'));
+    expect(starts).toEqual(['g1']); expect(restores).toEqual([]); await firstSession.close();
+    const second = createInternalAgentSupervisorRehydration(deps).rehydrate('agent-1');
+    const secondSession = await second.startSession(options, context('second'));
+    expect(starts).toEqual(['g1']); expect(restores).toEqual(['g1:durable-session']);
+    expect(secondSession).toBeDefined(); await secondSession.close();
+    const agentRoot = join(f.trustedRoot, 'agents', Buffer.from('agent-1').toString('base64url'));
+    const active = JSON.parse(readFileSync(join(agentRoot, 'active.json'), 'utf8'));
+    const bindingPath = join(active.canonicalDir, 'runtime-binding.json');
+    const binding = JSON.parse(readFileSync(bindingPath, 'utf8'));
+    binding.sessionMetadataDigest = `sha256:${'0'.repeat(64)}`;
+    writeFileSync(bindingPath, `${canonical(binding)}\n`, { mode: 0o600 });
+    const third = createInternalAgentSupervisorRehydration(deps).rehydrate('agent-1');
+    await expect(third.startSession(options, context('third'))).rejects.toThrow();
+    expect(starts).toEqual(['g1']); expect(restores).toEqual(['g1:durable-session']);
+    expect(deps.driverFactory).toHaveBeenCalledTimes(2);
+  });
   it('constructs without creating a missing trusted root', () => {
     const missing = join(root, 'missing');
     createProductionAgentSupervisorRehydration({ trustedStateRoot: missing,

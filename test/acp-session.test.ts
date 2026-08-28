@@ -1338,6 +1338,24 @@ describe('injected durable BodyBrain construction', () => {
       permissions: { approval: 'allow', filesystem: 'workspace', unattended: 'deny' }, log: () => {} },
     relay, relay.issue());
     expect(session.pid).toBe(2_147_483_647); expect(session.pid).not.toBe(process.pid);
+    listener?.({ protocolVersion: 1, generation: 'g1', transportSeq: ++seq, notificationId: `n${seq}`,
+      kind: 'session_update', update: { sessionUpdate: 'agent_message_chunk', messageId: 'm1',
+        content: { type: 'text', text: 'streamed' } } });
+    expect(session.eventsSince(0)).toEqual(expect.arrayContaining([
+      expect.objectContaining({ kind: 'agent_text', text: 'streamed', messageId: 'm1' }),
+    ]));
+    for (const update of [
+      { sessionUpdate: 'agent_thought_chunk', content: { type: 'text', text: 'thought' } },
+      { sessionUpdate: 'tool_call', toolCallId: 'tool-1', title: 'Read', status: 'pending' },
+      { sessionUpdate: 'tool_call_update', toolCallId: 'tool-1', status: 'completed' },
+      { sessionUpdate: 'plan', entries: [{ content: 'work', priority: 'high', status: 'completed' }] },
+      { sessionUpdate: 'usage_update', used: 1, size: 2 },
+      { sessionUpdate: 'current_mode_update', currentModeId: 'default' },
+      { sessionUpdate: 'session_info_update', title: 'title' },
+      { sessionUpdate: 'available_commands_update', availableCommands: [] },
+      { sessionUpdate: 'config_option_update', configOptions: [] },
+    ]) expect(() => listener?.({ protocolVersion: 1, generation: 'g1', transportSeq: ++seq,
+      notificationId: `n${seq}`, kind: 'session_update', update })).not.toThrow();
     await expect(session.submitPrompt('hello', { origin: { kind: 'startup' } }))
       .resolves.toMatchObject({ accepted: true, succeeded: true, outcome: 'completed' });
     expect(session.eventsSince(0)).toEqual(expect.arrayContaining([
