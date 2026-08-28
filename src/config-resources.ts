@@ -76,6 +76,9 @@ export interface RoomTemplateMemberSpec {
   permissions?: PartialPermissionSpec;
   role_context?: RoleContextSpec;
 }
+export type ExplicitBrainRoomTemplateMemberSpec = Omit<RoomTemplateMemberSpec, 'brain'> & {
+  brain: BrainRef;
+};
 export interface RoomTemplateSpec {
   version: number;
   description: string;

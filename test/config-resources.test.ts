@@ -79,6 +79,26 @@ spec: { template: cheap }
 `)).toThrow(/require a complete inline definition/u);
   });
 
+  it('keeps absent legacy member Brain parse-compatible but validates it atomically when present', () => {
+    const resource = (brain: string) => `
+kind: RoomTemplate
+version: 1
+id: pair
+spec:
+  version: 1
+  description: pair
+  members:
+    - {slot: worker, role: Worker, count: 1${brain}}
+`;
+    expect(parseTypedResource('pair.yaml', resource('')))
+      .toMatchObject({ spec: { members: [{ role: 'Worker' }] } });
+    expect(parseTypedResource('pair.yaml', resource(', brain: {template: cheap}')))
+      .toMatchObject({ spec: { members: [{ role: 'Worker', brain: { template: 'cheap' } }] } });
+    expect(() => parseTypedResource('pair.yaml', resource(
+      ', brain: {harness: codex, model: gpt, session: acp}',
+    ))).toThrow(/exactly \{template\}/u);
+  });
+
   it('rejects duplicate capabilities, invalid IDs, unknown top-level fields, and YAML streams', () => {
     const cases = [
       [`kind: Role\nversion: 1\nid: bad.id\nspec: {}\n`, /must match/u],
@@ -345,6 +365,7 @@ spec:
     - slot: critic
       role: Critic
       count: 1
+      brain: {harness: codex, model: gpt, effort: high, session: acp}
 `);
     expect(resource).toMatchObject({ kind: 'RoomTemplate', id: 'pair' });
     expect((resource as { spec: { members: unknown[] } }).spec.members).toHaveLength(2);
