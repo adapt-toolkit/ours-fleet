@@ -6,6 +6,9 @@ import { basename, join } from 'node:path';
 import { replaceFileAtomically, withFileLock } from './atomic-file.js';
 import { realExec, type Exec } from './exec.js';
 import { stateRoot, tmpRoot } from './paths.js';
+import { TempAgentSupervisorHandoffRetirementAuthority,
+  readTempAgentSupervisorHandoffIfPresent,
+  type TempAgentSupervisorHandoff } from './temp-agent-supervisor-handoff.js';
 
 export const TEMP_SUPERVISOR_FILE = '.temp-supervisor.json';
 export const TEMP_TERMINATION_FILE = 'termination.jsonl';
@@ -241,6 +244,14 @@ export function archiveTempState(
   return paths.target;
 }
 
+/** Retire the private Agent publication before removing its live lifecycle state. */
+export async function retireTempAgentPublication(role: string,
+  expected?: Readonly<TempAgentSupervisorHandoff>): Promise<'retired'|'duplicate'|'absent'> {
+  if (!expected) return 'absent';
+  if (expected.agentId !== role) throw new Error(`temporary Agent publication does not bind role '${role}'`);
+  return new TempAgentSupervisorHandoffRetirementAuthority(stateRoot()).retire(expected);
+}
+
 function isArchiveForLaunch(path: string, role: string, launchId: string): boolean {
   const supervisor = readTempSupervisor(path);
   if (supervisor?.role !== role || supervisor.launchId !== launchId) return false;
@@ -317,12 +328,14 @@ export async function secureStoppedTempArchive(
         `temporary role '${role}' no longer matches recorded launch ${launchId}; refusing to archive`,
       );
     }
+    const agentPublication = readTempAgentSupervisorHandoffIfPresent(stateRoot(), role);
     const live = await tempSupervisorLiveness(dir, deps);
     if (live !== 'stopped') {
       throw new Error(
         `temporary role '${role}' supervisor is ${live}; refusing to archive before proven stop`,
       );
     }
+    await retireTempAgentPublication(role, agentPublication);
     const archived = archiveTempState(
       role, 'operator-stop', 'retired',
       'room close proved the supervisor stopped; full role evidence preserved',
@@ -572,7 +585,9 @@ export async function reclaimStaleTempState(deps: TempLifecycleDeps = {}): Promi
   for (const entry of entries) {
     const dir = join(tmpRoot(), entry.name);
     if (!readTempSupervisor(dir)) continue; // legacy evidence has no safe ownership proof
+    const agentPublication = readTempAgentSupervisorHandoffIfPresent(stateRoot(), entry.name);
     if (await tempSupervisorLiveness(dir, deps) !== 'stopped') continue;
+    await retireTempAgentPublication(entry.name, agentPublication);
     const target = archiveTempState(
       entry.name, 'stale-supervisor', 'reclaimed',
       'supervisor is definitively stopped; state moved from the live roster without deletion',

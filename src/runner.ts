@@ -9,11 +9,6 @@ import {
 } from './config.js';
 import { getAdapter } from './harness/registry.js';
 import type { Launch } from './harness/types.js';
-import {
-  authenticatePrepared, legacyAcpIntegrityDigest,
-  type AuthenticatedLegacyPreparedAcpAttempt, type LegacyAcpAttemptInput,
-  type LegacyAcpRuntimeContext,
-} from './harness/acp-attempt.js';
 import { Tmux } from './tmux.js';
 import {
   createMonitor, probeIdentityPresence,
@@ -25,7 +20,9 @@ import { selectIsolationBackend } from './isolation/registry.js';
 import { resourceArgs, cpuControllerDelegated } from './isolation/resources.js';
 import type { WrapContext } from './isolation/types.js';
 import { resolveLaunchRuntime } from './isolation/runtime.js';
-import { AcpSession, type AcpSessionOptions } from './session/acp.js';
+import type { AgentProductionSessionInput } from './agent-production-runtime.js';
+import { createAgentProductionRuntime } from './agent-production-runtime.js';
+import { readTempAgentSupervisorHandoffIfPresent } from './temp-agent-supervisor-handoff.js';
 import { controlRequest, RoleControlServer } from './session/control.js';
 import { TmuxSession } from './session/tmux.js';
 import { ACP_CANCEL_DEADLINE_EXCEEDED, classifyShellStatus } from './session/types.js';
@@ -35,7 +32,7 @@ import {
   classifyFailureText,
 } from './model-recovery.js';
 import { rotateWorklog } from './worklog.js';
-import { reconcilePermanentRoleIdentities } from './creation.js';
+import { daemonIdentityProvisioner, reconcilePermanentRoleIdentities } from './creation.js';
 import { OwnerChannel, type OwnerChannelHandle, type OwnerChannelOptions } from './owner-channel/channel.js';
 import {
   acquireOwnerBinderLease, OwnerBinderHandoffTimeoutError, type OwnerBinderLease,
@@ -51,9 +48,8 @@ import {
 import type { SpawnOpts } from './spawn.js';
 import { effectivePermissionMode } from './permissions.js';
 import { assertModelPinReachesChild, effectiveRoleModel, repinModelEnv } from './model-env.js';
-import { translatePortablePermissionCodes } from './harness/brain-adapter.js';
 import {
-  archiveTempState, markTempSupervisorActive, requestedTempStopReason,
+  archiveTempState, markTempSupervisorActive, requestedTempStopReason, retireTempAgentPublication,
   type TempTerminationReason,
 } from './temp-lifecycle.js';
 
@@ -72,7 +68,7 @@ export interface RunnerDeps {
   /** Construct trusted owner ingress (injectable for lifecycle tests). */
   createOwnerChannel(opts: OwnerChannelOptions): OwnerChannelHandle;
   /** Start the ACP transport (injectable for deterministic runner lifecycle tests). */
-  startAcpSession(opts: AcpSessionOptions): Promise<SessionHandle>;
+  startAcpSession(opts: AgentProductionSessionInput): Promise<SessionHandle>;
   /** Construct the authenticated role control route (injectable where sockets are unavailable). */
   createControlServer(
     stateDir: string, session: SessionHandle, log: (line: string) => void,
@@ -86,7 +82,10 @@ export interface RunnerDeps {
   shouldStop?(): boolean;
 }
 
-const defaultDeps = (): RunnerDeps => ({
+const defaultDeps = (): RunnerDeps => {
+  const agents = createAgentProductionRuntime({ trustedStateRoot: stateRoot(),
+    identityProvisioner: daemonIdentityProvisioner() });
+  return ({
   tmux: new Tmux(),
   exec: realExec,
   cpuDelegated: () => cpuControllerDelegated(),
@@ -97,7 +96,7 @@ const defaultDeps = (): RunnerDeps => ({
   fetch: (url, init) => globalThis.fetch(url, init) as unknown as ReturnType<FetchLike>,
   createMonitor: opts => createMonitor(opts),
   createOwnerChannel: opts => new OwnerChannel(opts),
-  startAcpSession: opts => AcpSession.start(opts),
+  startAcpSession: opts => agents.launch(opts),
   createControlServer: (stateDir, session, log) => new RoleControlServer(stateDir, session, log),
   acquireOwnerBinder: (stateDir, role, identity) => acquireOwnerBinderLease(
     stateDir, role, identity),
@@ -112,7 +111,8 @@ const defaultDeps = (): RunnerDeps => ({
       throw new Error('prior owner channel returned an invalid startup notice result');
     return result.status;
   },
-});
+  });
+};
 
 const MONITOR_OWNER_FILE = '.monitor-owner';
 const OBSOLETE_OURS_AUTOSTART_ENV = 'OURS_AUTOSTART';
@@ -148,21 +148,6 @@ export function harnessChildEnv(
   return env;
 }
 
-function translateLegacyNative(
-  adapter: ReturnType<typeof getAdapter>, role: ResolvedRole, permissions: ResolvedRole['permissions'],
-): { approvalMode: string; filesystemMode: string; unattendedMode: string; exact: boolean } {
-  const translated = translatePortablePermissionCodes(
-    (role.harness === 'claude-code' ? 'claude-code' : 'codex'), permissions,
-  );
-  const effective = adapter.effectivePermissions?.(role);
-  const native = effective?.supported ? effective.native as Record<string, unknown> : {};
-  return {
-    approvalMode: String(native.approval ?? native.mode ?? translated.approvalMode),
-    filesystemMode: String(native.sandbox ?? translated.filesystemMode),
-    unattendedMode: translated.unattendedMode, exact: effective?.supported ? effective.exact : true,
-  };
-}
-
 /**
  * Execute a typed proxy request in the caller's supervisor. Dynamic imports
  * avoid a runner↔spawn initialization cycle (spawn imports runner constants).
@@ -181,7 +166,9 @@ async function executeManagedSpawn(
   const service = new RoleCreationService({ configPath,
     ops: { backend: pickBackend(), binPath: runtimeBinPath, log,
       watchdogService: new WatchdogServiceManager() },
-    binPath: runtimeBinPath, journal: false });
+    binPath: runtimeBinPath, journal: false,
+    agentProductionRuntime: createAgentProductionRuntime({ trustedStateRoot: stateRoot(),
+      identityProvisioner: daemonIdentityProvisioner() }) });
   const result = await service.createManaged(caller, requested);
   log(`[${caller.name}] managed fleet proxy spawned ${result.lifetime} role ${result.role} `
     + `harness=${result.harness} session=${result.session} `
@@ -599,51 +586,9 @@ export async function runOnce(
   const mode: 'fresh' | 'resume' = booted && adapter.supportsResume ? 'resume' : 'fresh';
   const runCwd = role.cwd && existsSync(role.cwd) ? role.cwd : dir;
   const sessionBackend = role.session ?? 'tmux';
-  let authenticatedAcp: AuthenticatedLegacyPreparedAcpAttempt | undefined;
   let launch: Launch;
   if (sessionBackend === 'acp') {
-    if (!adapter.prepareAcpLegacy || !adapter.acpLegacyAuthority)
-      throw new Error(`harness '${role.harness}' does not support the ACP session backend`);
-    const permissions = role.permissions ?? resolvePermissions(undefined, undefined);
-    const codes = translateLegacyNative(adapter, role, permissions);
-    const options = (role.harness_options ?? {}) as Record<string, unknown>;
-    const legacyHarness = role.harness === 'claude-code' ? 'claude-code' as const : 'codex' as const;
-    const projection = {
-      schemaVersion: 1 as const, roleName: role.name, harness: legacyHarness,
-      ...(role.model === undefined ? {} : { model: role.model }),
-      ...(typeof options.effort === 'string' ? { effort: options.effort } : {}),
-      identityName: role.identity, lifetime: temp ? 'temporary' as const : 'persistent' as const,
-      permissions, nativePermissions: codes,
-      ...(role.session_options?.acp?.command === undefined ? {} : {
-        acpCommand: role.session_options.acp.command,
-      }),
-      isolationRequested: role.isolation !== undefined,
-      scheduling: role.autocompact_pct === undefined ? {} : { autocompactPct: Math.round(role.autocompact_pct) },
-      adapterOptions: legacyHarness === 'codex' ? {
-        harness: 'codex' as const,
-        launcher: (options.launcher ?? 'auto') as 'auto' | 'ours-codex' | 'codex',
-        ...(typeof options.profile === 'string' ? { profile: options.profile } : {}),
-        search: options.search === true, addDirs: (options.add_dirs ?? []) as string[],
-        config: (options.config ?? {}) as Record<string, unknown>,
-      } : {
-        harness: 'claude-code' as const,
-        plugins: (options.plugins ?? {}) as Record<string, boolean>, memPalace: options.mem_palace !== false,
-        memPalaceMidSessionAutosave: options.mem_palace_midsession_autosave === true,
-        ...(options.mcp_servers === undefined ? {} : { mcpServers: options.mcp_servers as Record<string, unknown> }),
-        mcpServersOnly: options.mcp_servers_only === true,
-      },
-    };
-    const input: LegacyAcpAttemptInput = Object.freeze({
-      ...projection, integrityDigest: legacyAcpIntegrityDigest(projection),
-    });
-    const context: LegacyAcpRuntimeContext = Object.freeze({
-      stateDir: dir, runCwd, baseEnv: Object.freeze(harnessChildEnv(role, {}, dir)),
-      sessionMode: mode, sessionId,
-    });
-    const evidence = await adapter.prepareAcpLegacy(input, context);
-    authenticatedAcp = authenticatePrepared(adapter.acpLegacyAuthority, adapter, evidence, input, context);
-    if (!authenticatedAcp) throw new Error('ACP attempt preparation evidence was not authenticated');
-    launch = { argv: [...authenticatedAcp.argv], env: { ...authenticatedAcp.env } };
+    launch = { argv: [], env: {} };
   } else {
     const prep = await adapter.prepareSession(role, { stateDir: dir, runCwd });
     launch = adapter.buildLaunch(role, mode, { sessionId }, prep);
@@ -666,7 +611,7 @@ export async function runOnce(
   // Isolation is additive: only roles that declare `isolation:` are wrapped. The
   // env prefix + exit capture in buildPaneCommand stay host-side.
   let wrappedArgv = launch.argv;
-  if (role.isolation) {
+  if (role.isolation && sessionBackend !== 'acp') {
     // Start with the same durable context that config validation and doctor judged,
     // then add the selected launch's exact runtime closure. Those paths
     // still pass through resolveIsolation's canonical blocklist enforcement.
@@ -772,30 +717,13 @@ export async function runOnce(
     if (perms.unattended === 'deny')
       deps.log(`[${name}] permission policy: unattended=deny — with no console attached, ` +
         `permission requests are automatically denied once each (reject_once) and the turn continues`);
-    acpSession = await deps.startAcpSession({
-      name,
-      argv: wrappedArgv,
-      cwd: runCwd,
-      env: harnessChildEnv(role, launch.env, dir),
-      stateDir: dir,
-      mode,
-      permissions: perms,
-      modeId: authenticatedAcp?.modeId,
-      // The role's declared MCP servers, and the bundled agent's `_meta`
-      // vocabulary for the options it takes no flag for. Both come from the
-      // ADAPTER and from `prep`: the ACP launch cannot carry `prep.argv`, so this
-      // is the route by which harness_options that used to be silently dropped
-      // for an ACP role actually reach the session.
-      mcpServers: authenticatedAcp?.mcpServers ? [...authenticatedAcp.mcpServers] : undefined,
-      sessionMeta: authenticatedAcp?.sessionMeta,
-      permissionMode: effectivePermissionMode(role),
-      // Provenance travels with the exact ACP launch. Keeping it out of a
-      // role-only adapter hook prevents a PATH fallback or resolver skew from
-      // claiming metadata trust for an argv it did not authenticate.
-      permissionMetadataSource: authenticatedAcp?.permissionMetadataSource,
-      scrubObsoleteOursAutostart: true,
-      log: deps.log,
-    });
+    acpSession = await deps.startAcpSession({ agentId: name,
+      lifetime: temp ? 'temporary' : 'persistent', cwd: runCwd,
+      env: Object.freeze(harnessChildEnv(role, {}, dir)), session: {
+        name, cwd: runCwd, stateDir: dir, mode, permissions: perms,
+        permissionMode: effectivePermissionMode(role), scrubObsoleteOursAutostart: true,
+        log: deps.log,
+      } });
     pid = acpSession.pid;
     arbiter = new RoleTurnArbiter(acpSession);
     sessionHandle = arbiter;
@@ -1328,6 +1256,9 @@ function fastFailSecsFor(name: string, configPath?: string): number {
 /** Temp-agent entrypoint: run once, journal why it ended, then archive its evidence. */
 export async function runTemp(name: string, deps: Partial<RunnerDeps> = {}): Promise<void> {
   const dir = agentDir(name, true);
+  // Bind retirement to the publication this supervisor actually inherited.
+  // A newer generation may replace it while this process exits; it is never ours to delete.
+  const agentPublication = readTempAgentSupervisorHandoffIfPresent(stateRoot(), name);
   await markTempSupervisorActive(dir);
   let signal: NodeJS.Signals | undefined;
   const onTerm = () => { signal = 'SIGTERM'; };
@@ -1359,6 +1290,7 @@ export async function runTemp(name: string, deps: Partial<RunnerDeps> = {}): Pro
       : result
         ? `${result.exit.detail}; elapsed=${result.elapsedSecs.toFixed(1)}s`
         : 'temporary supervisor ended without an attempt result';
+    await retireTempAgentPublication(name, agentPublication);
     const archived = archiveTempState(name, reason, outcome, detail);
     deps.log?.(`[${name}] temporary lifecycle ${outcome}: ${reason}`
       + `${archived ? `; evidence archived at ${archived}` : '; state already archived'}`);

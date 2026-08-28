@@ -61,11 +61,12 @@ function write(relative: string, contents: string): void {
   const path = join(root, 'fleet.conf.d', relative); mkdirSync(dirname(path), { recursive: true });
   writeFileSync(path, contents);
 }
-function caller(kind: 'owner' | 'agent' = 'owner', id = kind === 'owner' ? 'owner-1' : 'creator-1') {
+function caller(kind: 'owner' | 'agent' = 'owner', id = kind === 'owner' ? 'owner-1' : 'creator-1',
+  operationId = 'op-1') {
   const evidence = {} as VerifiedCreationCallerEvidence;
   const snapshot = loadConfigResourceSnapshot({ bootstrapFile: join(root, 'fleet.yaml') });
   contexts.set(evidence as object, freeze({
-    principal: { id, kind }, operation: { id: 'op-1', type: 'agent.create', resourceScope: 'agents/worker-1' },
+    principal: { id, kind }, operation: { id: operationId, type: 'agent.create', resourceScope: 'agents/worker-1' },
     authorizationRevision: 'auth-1', ...(kind === 'owner' ? { authenticatedOwnerCid: 'owner-cid' } : {}),
     snapshot, snapshotRevision: 'graph-1', issuedAt: 100,
   }));
@@ -238,6 +239,15 @@ describe('authenticated inert Agent composition', () => {
     }));
     expect(() => service.prepare(request(evidence, { source: source('worker-2') }))).toThrow(/invalid_generation/u);
     expect(policyCalls).toHaveBeenCalledTimes(1);
+  });
+
+  it('allows different trusted operations to propose the same generation for durable arbitration', () => {
+    service.prepare(request(caller('owner', 'owner-1', 'op-left')));
+    nextGeneration = 1;
+    expect(() => service.prepare(request(caller('owner', 'owner-1', 'op-right')))).not.toThrow();
+    nextGeneration = 1;
+    expect(() => service.prepare(request(caller('owner', 'owner-1', 'op-right'))))
+      .toThrow(/generation_reuse/u);
   });
 
   it.each([

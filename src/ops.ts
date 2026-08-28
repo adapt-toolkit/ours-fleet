@@ -3,7 +3,7 @@ import {
 } from 'node:fs';
 import { join } from 'node:path';
 import { randomUUID, createHash } from 'node:crypto';
-import { agentDir, fleetDDir, watchdogsRoot } from './paths.js';
+import { agentDir, fleetDDir, stateRoot, watchdogsRoot } from './paths.js';
 import type { FleetConfig, ResolvedRole } from './config.js';
 import { findRole } from './config.js';
 import type { ResolvedWatchdog } from './watchdog/config.js';
@@ -12,13 +12,15 @@ import { generateBriefing } from './briefing.js';
 import { resetRestartLedger } from './runner.js';
 import type { InstallOutcome as BackendInstallOutcome, SupervisorBackend } from './supervisor/types.js';
 import {
-  archiveTempState, stopTempSupervisor, tempSupervisorLiveness,
+  archiveTempState, retireTempAgentPublication, stopTempSupervisor, tempSupervisorLiveness,
 } from './temp-lifecycle.js';
 import { realExec, type Exec } from './exec.js';
 import {
   daemonIdentityProvisioner, reconcilePermanentRoleIdentities,
   type IdentityProvisioner,
 } from './creation.js';
+import type { AgentProductionRuntime } from './agent-production-runtime.js';
+import { readTempAgentSupervisorHandoffIfPresent } from './temp-agent-supervisor-handoff.js';
 
 /** An install outcome tagged with the role it belongs to. */
 export interface InstallOutcome extends BackendInstallOutcome { role: string }
@@ -34,6 +36,8 @@ export interface OpsDeps {
   sleep?(ms: number): Promise<void>;
   /** Permanent identity reconciliation seam; temporary roles never use this lifecycle. */
   identityProvisioner?: IdentityProvisioner;
+  /** Required product creation authority for declarative ACP roles. */
+  agentProductionRuntime?: AgentProductionRuntime;
   /**
    * Called the INSTANT a registration is created, before anything else can
    * fail. A creation transaction that learns about registrations only from
@@ -111,7 +115,21 @@ export async function up(
 ): Promise<InstallOutcome[]> {
   const outcomes: InstallOutcome[] = [];
   for (const role of selectRoles(cfg, names)) {
-    const guarantee = await reconcilePermanentRoleIdentities(
+    let guarantee: 'verified' | 'created' | 'unverified';
+    if (role.session === 'acp' && identityGuarantee === undefined) {
+      if (!deps.agentProductionRuntime)
+        throw new Error(`role '${role.name}': Agent production runtime is required; recreate this ACP role`);
+      const actionId = `declarative-${createHash('sha256').update(JSON.stringify(role)).digest('hex')}`;
+      const created = await deps.agentProductionRuntime.createRole({ role, lifetime: 'persistent', actionId });
+      if (created.state !== 'complete' || !('identityAcquisition' in created)
+          || !['created', 'external'].includes(created.identityAcquisition ?? ''))
+        throw new Error(`role '${role.name}': Agent creation did not complete (${created.state})`);
+      guarantee = created.identityAcquisition === 'created' ? 'created' : 'verified';
+      // Agent creation owns the primary identity. Keep auxiliary owner-channel
+      // identities on the existing reconciliation path without re-acquiring it.
+      await reconcilePermanentRoleIdentities(role,
+        deps.identityProvisioner ?? daemonIdentityProvisioner(), deps.log, guarantee);
+    } else guarantee = await reconcilePermanentRoleIdentities(
       role, deps.identityProvisioner ?? daemonIdentityProvisioner(), deps.log, identityGuarantee);
     const dir = applyRole(role, { configPath, identityGuarantee: guarantee });
     // Only a *definite* stop boots fresh so the role reads the briefing we just
@@ -273,7 +291,17 @@ export async function restartRoles(
   cfg: FleetConfig, names: string[], deps: OpsDeps, mode: 'keep' | 'fresh', configPath?: string,
 ): Promise<void> {
   for (const role of selectRoles(cfg, names)) {
-    const guarantee = await reconcilePermanentRoleIdentities(
+    let guarantee: 'verified' | 'created' | 'unverified';
+    if (role.session === 'acp') {
+      if (!deps.agentProductionRuntime)
+        throw new Error(`role '${role.name}': Agent production runtime is required; recreate this ACP role`);
+      const actionId = `declarative-${createHash('sha256').update(JSON.stringify(role)).digest('hex')}`;
+      const created = await deps.agentProductionRuntime.createRole({ role, lifetime: 'persistent', actionId });
+      if (created.state !== 'complete' || !('identityAcquisition' in created)
+          || !['created', 'external'].includes(created.identityAcquisition ?? ''))
+        throw new Error(`role '${role.name}': Agent creation did not complete (${created.state})`);
+      guarantee = created.identityAcquisition === 'created' ? 'created' : 'verified';
+    } else guarantee = await reconcilePermanentRoleIdentities(
       role, deps.identityProvisioner ?? daemonIdentityProvisioner(), deps.log);
     const dir = applyRole(role, {
       fresh: mode === 'fresh', configPath, identityGuarantee: guarantee,
@@ -291,6 +319,7 @@ export async function rmRole(cfg: FleetConfig, name: string, deps: OpsDeps): Pro
   const temporaryDir = /^[A-Za-z0-9_-]+$/.test(name) ? agentDir(name, true) : '';
   const configured = cfg.roles.find(role => role.name === name);
   if (!configured && temporaryDir && existsSync(temporaryDir)) {
+    const agentPublication = readTempAgentSupervisorHandoffIfPresent(stateRoot(), name);
     const lifecycleDeps = { exec: deps.exec ?? realExec, ...(deps.kill ? { kill: deps.kill } : {}) };
     const stopOutcome = await stopTempSupervisor(name, lifecycleDeps);
     const sleep = deps.sleep ?? ((ms: number) => new Promise<void>(resolve => setTimeout(resolve, ms)));
@@ -308,6 +337,7 @@ export async function rmRole(cfg: FleetConfig, name: string, deps: OpsDeps): Pro
     if (existsSync(temporaryDir) && liveness !== 'stopped')
       throw new Error(
         `temporary role '${name}' supervisor is ${liveness}; refusing to archive live or ambiguous state`);
+    if (existsSync(temporaryDir)) await retireTempAgentPublication(name, agentPublication);
     const archived = existsSync(temporaryDir)
       ? archiveTempState(name, 'operator-stop', 'retired',
           'operator removal completed after supervisor liveness was proven stopped; evidence preserved')

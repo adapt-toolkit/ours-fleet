@@ -58,6 +58,7 @@ export interface AgentCompositionAuthority extends AgentPlanEvidenceAuthority {
   allocateGeneration(input: Readonly<{
     principal: RequestPrincipal; operation: PlanOperation; authorizationRevision: string;
     agentId: string; snapshotDigest: string; snapshotRevision: string;
+    callerEvidence: VerifiedCreationCallerEvidence;
   }>): Readonly<TrustedGenerationAllocation>;
   authenticateTransactionConsumer?(evidence: VerifiedTransactionConsumerEvidence): boolean;
 }
@@ -287,6 +288,7 @@ export class AgentCompositionService {
       principal: context.principal, operation: context.operation,
       authorizationRevision: context.authorizationRevision, agentId,
       snapshotDigest: context.snapshot.digest, snapshotRevision: context.snapshotRevision,
+      callerEvidence: request.callerEvidence,
     }); } catch { throw new AgentCompositionError('invalid_generation'); }
     try {
       if (!exactData(allocation, [
@@ -300,7 +302,8 @@ export class AgentCompositionService {
           || !Number.isSafeInteger(allocation.generation) || allocation.generation < 1)
         throw new AgentCompositionError('invalid_generation');
     } catch { throw new AgentCompositionError('invalid_generation'); }
-    const generationKey = `${context.snapshot.digest}\0${context.snapshotRevision}\0${agentId}`;
+    const generationKey = `${context.snapshot.digest}\0${context.snapshotRevision}\0${agentId}`
+      + `\0${context.operation.id}\0${context.operation.type}\0${context.operation.resourceScope}`;
     if ((this.#generations.get(generationKey) ?? 0) >= allocation.generation)
       throw new AgentCompositionError('generation_reuse');
     // Allocation is consumed before fallible policy/plan work; a failed attempt cannot reuse it.

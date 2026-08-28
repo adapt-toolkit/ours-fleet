@@ -32,6 +32,8 @@ import { WebAccessStore, validatePublicOrigin, type WebAccessConfig } from './ac
 import { buildWatchdogFindings, cachedWatchdogFindingsProvider, WatchdogQueryService } from '../watchdog/query.js';
 import { latestReport } from '../watchdog/store.js';
 import { TaskRoomApplicationService } from '../application/task-room-service.js';
+import { daemonIdentityProvisioner } from '../creation.js';
+import { createAgentProductionRuntime } from '../agent-production-runtime.js';
 
 const CONFIG_CACHE_TTL_MS = 5_000;
 
@@ -131,9 +133,12 @@ export async function startWebConsole(options: StartWebOptions): Promise<Running
     capabilityContext: { terminalPtyAvailable: terminalAvailable },
     watchdogFindings,
   });
-  const ops = { backend, binPath: options.binPath, log };
+  const identityProvisioner = daemonIdentityProvisioner();
+  const agentProductionRuntime = createAgentProductionRuntime({ trustedStateRoot: stateRoot(), identityProvisioner });
+  const ops = { backend, binPath: options.binPath, log, identityProvisioner, agentProductionRuntime };
   const creation = new RoleCreationService({
     configPath: options.configPath, ops, binPath: options.binPath,
+    agentProductionRuntime,
     allowedCwdRoots: [realpathSync(home()), realpathSync(process.cwd())],
     probeReady: async name => {
       const detail = await query.detail(name).catch(() => undefined);

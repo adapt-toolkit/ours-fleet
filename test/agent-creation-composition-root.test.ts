@@ -201,6 +201,20 @@ describe('permanent Agent creation composition root', () => {
     expect(locators.publish).not.toHaveBeenCalled();
   });
 
+  it('releases an attempt-bound generation admission when preparation rejects early', async () => {
+    const release = vi.fn();
+    const admit = vi.fn(async () => release);
+    const composition = { prepare: vi.fn(() => { throw new Error('early preparation rejection'); }) };
+    const transaction = { persistPrepared: vi.fn(), resume: vi.fn(), validateComplete: vi.fn(),
+      authenticateComplete: vi.fn() };
+    const root = new AgentCreationCompositionRoot(composition as never, transaction as never,
+      { publish: vi.fn() } as never, undefined, admit);
+    await expect(root.createPermanent(request(), 'action-1')).rejects.toThrow(/early preparation/u);
+    expect(admit).toHaveBeenCalledOnce();
+    expect(release).toHaveBeenCalledOnce();
+    expect(transaction.persistPrepared).not.toHaveBeenCalled();
+  });
+
   it('binds the authenticated operation id to the durable action id', async () => {
     const composition = { prepare: vi.fn(() => ({ lifecycle: 'persistent',
       identity: { ownership: 'create_persistent' }, operation: { id: 'authorized-action' } })) };
@@ -309,7 +323,7 @@ describe('real production Agent creation assembly', () => {
     expect(f.creates()).toBe(0);
   });
 
-  it.each(['role', 'brain', 'identity', 'context', 'action'] as const)(
+  it.each(['role', 'brain', 'identity', 'context'] as const)(
     'rejects a conflicting temporary replay with changed %s binding and preserves exact handoff', async changed => {
       const f = setup(); const assembly = f.make();
       const source = { ...f.source, lifecycle: 'temporary' as const,
@@ -318,17 +332,29 @@ describe('real production Agent creation assembly', () => {
       await assembly.temporary.reserve({ callerEvidence: firstCaller, source }, 'action-1');
       const path = join(f.root, 'trusted', 'agents', Buffer.from('agent-1').toString('base64url'),
         'temp-active.json'); const before = readFileSync(path, 'utf8');
-      const context = changed === 'context' || changed === 'action' ? { ...f.context,
-        operation: Object.freeze({ ...f.context.operation, id: changed === 'action' ? 'action-2' : 'action-1',
-          resourceScope: changed === 'context' ? 'agents/other' : f.context.operation.resourceScope }) } : f.context;
+      const context = changed === 'context' ? { ...f.context,
+        operation: Object.freeze({ ...f.context.operation,
+          resourceScope: 'agents/other' }) } : f.context;
       const changedSource = changed === 'role' ? { ...source, role: 'Other' }
         : changed === 'brain' ? { ...source, brain: { ...source.brain, model: 'other-model' } }
           : changed === 'identity' ? { ...source, identity: { ...source.identity, name: 'other-name' } }
             : source;
       await expect(assembly.temporary.reserve({ callerEvidence: assembly.ingress.direct(context),
-        source: changedSource }, changed === 'action' ? 'action-2' : 'action-1')).rejects.toThrow();
+        source: changedSource }, 'action-1')).rejects.toThrow();
       expect(readFileSync(path, 'utf8')).toBe(before); expect(f.creates()).toBe(0);
     });
+
+  it('allocates sequential generations for recurring temporary actions without identity effects', async () => {
+    const f = setup(); const assembly = f.make();
+    const source = { ...f.source, lifecycle: 'temporary' as const,
+      identity: { name: 'agent-1', ownership: 'create_temporary' as const } };
+    const first = await assembly.temporary.reserve({ callerEvidence: assembly.ingress.direct(f.context),
+      source }, 'action-1');
+    const nextContext = { ...f.context, operation: Object.freeze({ ...f.context.operation, id: 'action-2' }) };
+    const second = await assembly.temporary.reserve({ callerEvidence: assembly.ingress.direct(nextContext),
+      source }, 'action-2');
+    expect(first.generation).toBe(1); expect(second.generation).toBe(2); expect(f.creates()).toBe(0);
+  });
 
   it('installs an existing permanent identity through real inspection and completion authorities', async () => {
     const f = setup(true); const assembly = f.make(); const installer = new AgentInstallationService(assembly);

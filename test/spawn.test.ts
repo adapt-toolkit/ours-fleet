@@ -17,6 +17,8 @@ import type { OpsDeps } from '../src/ops.js';
 import type { SupervisorBackend } from '../src/supervisor/types.js';
 import '../src/harness/claude-code.js';
 import '../src/harness/codex.js';
+import { createAgentProductionRuntime } from '../src/agent-production-runtime.js';
+import { readTempAgentSupervisorHandoffIfPresent } from '../src/temp-agent-supervisor-handoff.js';
 
 let dir: string;
 beforeEach(() => {
@@ -24,6 +26,11 @@ beforeEach(() => {
   process.env.OURS_FLEET_HOME = dir;
   registerAdapter(fakeAdapter);
   writeFileSync(join(dir, 'fleet.yaml'), stringify({ defaults: { harness: 'fake' }, roles: { Coord: {} } }));
+});
+
+const temporaryAgentCreation = (agentId: string, actionId?: string) => ({
+  execute: async () => ({ state: 'reserved' as const, agentId, generation: 1,
+    actionId, lifetime: 'temporary' as const, completion: 'deferred' as const }),
 });
 afterEach(() => {
   delete process.env.OURS_FLEET_HOME;
@@ -253,6 +260,7 @@ describe('spawnTemp', () => {
       { name: 'AcpScout', harness: 'codex', session: 'acp' },
       '/b/ours-fleet',
       () => {},
+      { temporaryAgentCreation: temporaryAgentCreation('AcpScout') as never },
     );
     const snap = parse(readFileSync(join(d, 'role.yaml'), 'utf8'));
     expect(snap.harness).toBe('codex');
@@ -287,7 +295,8 @@ describe('spawnTemp', () => {
       loops: { pass: { roles: ['*'], interval: '5m', prompt: 'permanent-only pass' } },
     }), { mode: 0o600 });
     chmodSync(join(dir, 'fleet.yaml'), 0o600);
-    const d = await spawnTemp({ name: 'TempLoop', session: 'acp' }, '/b/ours-fleet', () => {});
+    const d = await spawnTemp({ name: 'TempLoop', session: 'acp' }, '/b/ours-fleet', () => {},
+      { temporaryAgentCreation: temporaryAgentCreation('TempLoop') as never });
     const snap = parse(readFileSync(join(d, 'role.yaml'), 'utf8'));
     expect(snap.loops).toBeUndefined();
   });
@@ -411,6 +420,22 @@ describe('atomic role + identity reservation', () => {
       .toContain('"reason":"startup-failure"');
     // Name reusable straight away.
     await expect(spawnTemp({ name: 'TempFail' }, '/b/ours-fleet', () => {})).resolves.toBeTruthy();
+  });
+
+  it('startup rollback retires the exact temporary Agent publication', async () => {
+    const name = 'AcpRollback'; const actionId = 'rollback-1';
+    const role = { name, harness: 'codex', session: 'acp', identity: name, sourceFile: 'test',
+      permissionsDeclared: true, permissions: { approval: 'ask', filesystem: 'workspace', unattended: 'deny' },
+      monitor: { mode: 'native', enabled: false, wake_sources: [], batch_ms: 0,
+        inject: 'notification', interrupt: false } } as const;
+    const runtime = createAgentProductionRuntime({ trustedStateRoot: stateRoot(),
+      identityProvisioner: { exists: async () => false } });
+    const reserved = await runtime.createRole({ role, lifetime: 'temporary', actionId });
+    await expect(spawnTemp({ name, harness: 'codex', session: 'acp', creationActionId: actionId },
+      '/b/ours-fleet', () => { throw new Error('could not detach'); },
+      { temporaryAgentCreation: { execute: async () => reserved } as never }))
+      .rejects.toThrow(/could not detach/u);
+    expect(readTempAgentSupervisorHandoffIfPresent(stateRoot(), name)).toBeUndefined();
   });
 
   it('a successful spawn releases its reservations so nothing leaks', async () => {
@@ -823,7 +848,8 @@ describe('creation provenance', () => {
       filesystem: 'unrestricted', unattended: 'wait',
       monitorConfig: { mode: 'fleet', interrupt: true },
       surface: 'agent', callerRole: 'Coord', inheritedFromCaller: inherited,
-    }, '/b/ours-fleet', () => {});
+    }, '/b/ours-fleet', () => {},
+    { temporaryAgentCreation: temporaryAgentCreation('Inherited') as never });
     const p = provenanceOf('Inherited', true);
     expect(p.callerRole).toBe('Coord');
     for (const key of [

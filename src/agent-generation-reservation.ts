@@ -1,7 +1,7 @@
 import { createHash, randomUUID } from 'node:crypto';
 import {
   chmodSync, closeSync, constants, fstatSync, fsyncSync, linkSync, lstatSync, mkdirSync,
-  openSync, readSync, readdirSync, unlinkSync, writeSync,
+  openSync, readSync, readdirSync, rmSync, unlinkSync, writeSync,
 } from 'node:fs';
 import type { BigIntStats } from 'node:fs';
 import { basename, dirname, join, parse, resolve, sep } from 'node:path';
@@ -177,6 +177,25 @@ export class DurableAgentGenerationAuthority {
     return withConfigGraphLock(join(agentRoot, '.allocation'), 'exclusive', () =>
       this.#existingLocked(agentRoot, actionId, false));
   }
+  /** Secure proposal only; persist() remains the final CAS and may reject a stale proposal. */
+  async admit(agentId: string, actionId: string): Promise<Readonly<{
+    agentId: string; actionId: string; generation: number; existing: boolean;
+  }>> {
+    if (!TOKEN.test(agentId) || !TOKEN.test(actionId)) throw new GenerationReservationError('invalid_request');
+    const agentRoot = join(this.#root, 'agents', safe(agentId));
+    for (const path of [agentRoot, join(agentRoot, 'reservations'), join(agentRoot, 'actions')]) privateDir(path);
+    return withConfigGraphLock(join(agentRoot, '.allocation'), 'exclusive', () => {
+      const existing = this.#existingLocked(agentRoot, actionId, false);
+      if (existing) {
+        const record = this.authenticate(existing);
+        if (!record) throw new GenerationReservationError('corrupt_state');
+        return Object.freeze({ agentId, actionId, generation: record.generation, existing: true });
+      }
+      const reservations = this.#reservations(agentRoot);
+      const generation = reservations.reduce((max, record) => Math.max(max, record.generation), 0) + 1;
+      return Object.freeze({ agentId, actionId, generation, existing: false });
+    });
+  }
   async persist(plan: AgentPlan, actionId: string): Promise<VerifiedGenerationReservation> {
     if (!TOKEN.test(actionId) || !TOKEN.test(plan.agentId) || !Number.isSafeInteger(plan.generation)
         || plan.generation < 1 || !SHA.test(plan.planDigest) || !SHA.test(plan.snapshotDigest))
@@ -190,8 +209,16 @@ export class DurableAgentGenerationAuthority {
     storeAgentPlan(candidate, plan, expected, 'generation');
     const envelope = readStoredAgentPlan(candidate, expected, 'generation'); const bytes = encodeAgentPlan(envelope.plan);
     this.faults.afterPlan?.();
-    return withConfigGraphLock(join(agentRoot, '.allocation'), 'exclusive', () =>
-      this.#reserveLocked(agentRoot, actionId, candidate, bytes, expected));
+    try { return await withConfigGraphLock(join(agentRoot, '.allocation'), 'exclusive', () =>
+      this.#reserveLocked(agentRoot, actionId, candidate, bytes, expected)); }
+    catch (error) {
+      // A stale different-action proposal can never become valid after another action
+      // commits that generation. Remove only this exact unreserved candidate so a fresh
+      // whole-operation retry can recompute max+1; committed/action-indexed state is untouched.
+      if (error instanceof GenerationReservationError && error.code === 'generation_conflict')
+        rmSync(candidate, { recursive: true, force: true });
+      throw error;
+    }
   }
   async resume(agentId: string, actionId: string): Promise<VerifiedGenerationReservation> {
     if (!TOKEN.test(agentId) || !TOKEN.test(actionId)) throw new GenerationReservationError('invalid_request');

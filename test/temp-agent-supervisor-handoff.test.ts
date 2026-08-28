@@ -1,6 +1,6 @@
 import {createHash}from'node:crypto';import {chmodSync,existsSync,lstatSync,mkdirSync,mkdtempSync,readFileSync,readdirSync,renameSync,rmSync,symlinkSync,unlinkSync,writeFileSync} from 'node:fs';
 import {tmpdir} from 'node:os';import{join}from'node:path';import{afterEach,describe,expect,it}from'vitest';
-import{TempAgentSupervisorHandoffPublisher,readTempAgentSupervisorHandoff}from'../src/temp-agent-supervisor-handoff.js';
+import{TempAgentSupervisorHandoffPublisher,TempAgentSupervisorHandoffRetirementAuthority,readTempAgentSupervisorHandoff}from'../src/temp-agent-supervisor-handoff.js';
 import{runtimeCanonical}from'../src/agent-runtime-record.js';
 const roots:string[]=[];afterEach(()=>roots.splice(0).forEach(root=>rmSync(root,{recursive:true,force:true})));
 function fixture(root=mkdtempSync(join(tmpdir(),'temp-handoff-')),generation=1,actionId='x'){if(!roots.includes(root))roots.push(root);const agentRoot=join(root,'agents',Buffer.from('a').toString('base64url'));
@@ -43,4 +43,28 @@ describe('temporary supervisor handoff',()=>{
     const left=fixture(f.root,2,'left-sequential');await new TempAgentSupervisorHandoffPublisher(f.root,left.authority as never).publish(left.evidence as never);const right=fixture(f.root,2,'right-sequential');await expect(new TempAgentSupervisorHandoffPublisher(f.root,right.authority as never).publish(right.evidence as never)).rejects.toMatchObject({code:'generation_conflict'});});
   it('refuses to overwrite corrupt extant active bytes',async()=>{const f=fixture();writeFileSync(join(f.agentRoot,'temp-active.json'),'{}\n',{mode:0o600});await expect(new TempAgentSupervisorHandoffPublisher(f.root,f.authority as never).publish(f.evidence as never)).rejects.toThrow();expect(readFileSync(join(f.agentRoot,'temp-active.json'),'utf8')).toBe('{}\n');});
   it('rejects permanent-schema content even at the temporary filename',async()=>{const f=fixture();const permanent={schemaVersion:1,kind:'AgentSupervisorHandoff',agentId:'a',actionId:'x',generation:1,planDigest:`sha256:${'1'.repeat(64)}`,snapshotDigest:`sha256:${'2'.repeat(64)}`,reservationDigest:`sha256:${'3'.repeat(64)}`,authorizationRevision:'auth',lifetime:'persistent'};writeFileSync(join(f.agentRoot,'temp-active.json'),`${runtimeCanonical(permanent)}\n`,{mode:0o600});expect(()=>readTempAgentSupervisorHandoff(f.root,'a')).toThrow();});
+  it('retires under the publication authority and makes only the exact retry idempotent',async()=>{const f=fixture();await new TempAgentSupervisorHandoffPublisher(f.root,f.authority as never).publish(f.evidence as never);
+    const expected=readTempAgentSupervisorHandoff(f.root,'a');const retirement=new TempAgentSupervisorHandoffRetirementAuthority(f.root);expect(await retirement.retire(expected)).toBe('retired');
+    expect(existsSync(join(f.agentRoot,'temp-active.json'))).toBe(false);expect(await retirement.retire(expected)).toBe('duplicate');});
+  it('refuses a nonsequential newer active publication over a retired binding',async()=>{const one=fixture();await new TempAgentSupervisorHandoffPublisher(one.root,one.authority as never).publish(one.evidence as never);
+    const expected=readTempAgentSupervisorHandoff(one.root,'a');await new TempAgentSupervisorHandoffRetirementAuthority(one.root).retire(expected);const two=fixture(one.root,3,'three');
+    await new TempAgentSupervisorHandoffPublisher(one.root,two.authority as never).publish(two.evidence as never);
+    await expect(new TempAgentSupervisorHandoffRetirementAuthority(one.root).retire(expected)).rejects.toMatchObject({code:'generation_conflict'});
+    expect(readTempAgentSupervisorHandoff(one.root,'a')).toMatchObject({generation:3,actionId:'three'});});
+  it('retires the exact next recurring generation and advances its durable duplicate marker',async()=>{const one=fixture();await new TempAgentSupervisorHandoffPublisher(one.root,one.authority as never).publish(one.evidence as never);
+    const retirement=new TempAgentSupervisorHandoffRetirementAuthority(one.root);await retirement.retire(readTempAgentSupervisorHandoff(one.root,'a'));const two=fixture(one.root,2,'two');
+    await new TempAgentSupervisorHandoffPublisher(one.root,two.authority as never).publish(two.evidence as never);
+    const expected=readTempAgentSupervisorHandoff(one.root,'a');expect(await retirement.retire(expected)).toBe('retired');expect(await retirement.retire(expected)).toBe('duplicate');});
+  it.each(['corrupt','symlink','before-unlink-race']as const)('retirement rejects %s without deleting foreign bytes',async attack=>{const f=fixture();await new TempAgentSupervisorHandoffPublisher(f.root,f.authority as never).publish(f.evidence as never);
+    const expected=readTempAgentSupervisorHandoff(f.root,'a');const path=join(f.agentRoot,'temp-active.json');let faults={};if(attack==='corrupt')writeFileSync(path,'{}\n',{mode:0o600});
+    else if(attack==='symlink'){const target=join(f.root,'foreign-retire');writeFileSync(target,readFileSync(path),{mode:0o600});unlinkSync(path);symlinkSync(target,path);}
+    else faults={beforeUnlink:()=>{const replacement=join(f.root,'retire-replacement');writeFileSync(replacement,readFileSync(path),{mode:0o600});renameSync(replacement,path);}};
+    await expect(new TempAgentSupervisorHandoffRetirementAuthority(f.root,faults).retire(expected)).rejects.toThrow();
+    expect(existsSync(path)).toBe(true);});
+  it('classifies unlink and directory-fsync crashes and recovers from the durable retired binding',async()=>{for(const fault of['unlink','afterUnlink','fsyncDirectory']as const){const f=fixture();await new TempAgentSupervisorHandoffPublisher(f.root,f.authority as never).publish(f.evidence as never);let calls=0;
+    const expected=readTempAgentSupervisorHandoff(f.root,'a');
+    const faults=fault==='unlink'?{unlink:()=>{throw new Error('unlink crash');}}:fault==='afterUnlink'?{afterUnlink:()=>{throw new Error('after unlink crash');}}:{fsyncDirectory:()=>{if(++calls===2)throw new Error('directory fsync crash');}};
+    await expect(new TempAgentSupervisorHandoffRetirementAuthority(f.root,faults).retire(expected)).rejects.toMatchObject({code:'write_failed'});
+    expect(await new TempAgentSupervisorHandoffRetirementAuthority(f.root).retire(expected)).toMatch(/retired|duplicate/u);}}
+  );
 });

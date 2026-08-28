@@ -28,6 +28,7 @@ import {
 import type { AgentCompositionRequest } from '../agent-composition-service.js';
 import type { PermanentAgentCreationResult, ProductionAgentCreationAssembly,
   ProductionIngressContext } from '../agent-creation-composition-root.js';
+import type { AgentProductionRuntime } from '../agent-production-runtime.js';
 
 export interface CreateRoleSessionRequest {
   name: string;
@@ -153,6 +154,8 @@ export interface RoleCreationServiceOptions {
     request(input: Readonly<{ plan: CreationPlan; actionId: string }>):
       Omit<AgentCompositionRequest, 'callerEvidence'>;
   };
+  /** Product facade used by all post-update ACP creation producers. */
+  agentProductionRuntime?: Pick<AgentProductionRuntime, 'create'>;
 }
 
 export type CreationPlan =
@@ -248,11 +251,18 @@ export class RoleCreationService {
 
   private launchSync(options: SpawnOpts, creation?: CreationDeps, plan?: CreationPlan): Promise<string> {
     const actionId = options.creationActionId;
-    const composed = !options.temp && plan?.preview.resolvedRole.session === 'acp'
+    const product = plan?.preview.resolvedRole.session === 'acp' && actionId
+      && this.options.agentProductionRuntime
+      ? { execute: () => this.options.agentProductionRuntime!.create({ plan: ownedFrozen(plan), actionId }) }
+      : undefined;
+    const composed = !options.temp && !product && plan?.preview.resolvedRole.session === 'acp'
       && actionId && this.options.permanentAgentCreation
       ? { execute: () => this.executePermanentAgentCreation(this.options.permanentAgentCreation!, plan, actionId) }
       : undefined;
-    const deps = composed ? { ...creation, permanentAgentCreation: composed } : creation;
+    const deps = product ? options.temp
+      ? { ...creation, temporaryAgentCreation: product }
+      : { ...creation, permanentAgentCreation: product as never }
+      : composed ? { ...creation, permanentAgentCreation: composed } : creation;
     return options.temp
       ? spawnTemp(options, this.options.binPath, this.options.tempLauncher, deps)
       : spawnPermanent(options, this.options.ops, deps);

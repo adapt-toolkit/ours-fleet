@@ -9,6 +9,7 @@ import { stateRoot } from './paths.js';
 import { buildInfo, UNKNOWN_BUILD } from './provenance.js';
 import type { ResolvedRole } from './config.js';
 import type { PermanentAgentCreationResult } from './agent-creation-composition-root.js';
+import type { AgentProductionCreationResult } from './agent-production-runtime.js';
 
 /**
  * One creation transaction: role name and ours identity reserved together,
@@ -64,6 +65,8 @@ export interface CreationDeps {
   identityProvisioner?: IdentityProvisioner;
   /** Trusted permanent Agent composition handoff. Temporary creation never invokes it. */
   permanentAgentCreation?: { execute(): Promise<PermanentAgentCreationResult> };
+  /** Product Agent creation reservation used by temporary ACP producers. */
+  temporaryAgentCreation?: { execute(): Promise<AgentProductionCreationResult> };
   /** Descriptive progress around the existing transaction; never a second workflow. */
   onStage?(stage: CreationCoreStage, evidence?: Record<string, string | boolean>): void;
 }

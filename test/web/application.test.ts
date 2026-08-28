@@ -39,6 +39,15 @@ const backend: SupervisorBackend = {
   logsArgs() { return { cmd: 'tmux', args: [] }; },
 };
 
+const agentProductionRuntime = { create: async (input: any) => input.plan.options.temp
+  ? ({ state: 'reserved' as const, agentId: input.plan.options.name, generation: 1,
+      actionId: input.actionId, lifetime: 'temporary' as const, completion: 'deferred' as const })
+  : ({ state: 'complete' as const, reservation: {} as never,
+      locator: { kind: 'AgentStartLocator', agentId: input.plan.options.name,
+        actionId: input.actionId } as never,
+      identityAcquisition: 'created' as const,
+      identityName: input.plan.options.identity ?? input.plan.options.name }) };
+
 describe('application services', () => {
   it('unions configured, permanent, temporary, orphan, and corrupt state without secrets', async () => {
     const root = fixture();
@@ -121,6 +130,7 @@ identity: Temp
           async remove() { mutationCalls++; },
         },
         tempLauncher() {},
+        agentProductionRuntime,
         allowedCwdRoots: [root],
         journalDir: join(root, '.ours-fleet', 'web-actions'),
         probeReady: async () => flow.probe,
@@ -183,7 +193,7 @@ identity: Temp
       expect(service.get(first.actionId)?.stages.map(stage => stage.stage)).toContain(
         'identity_bootstrap_pending',
       );
-      expect(mutationCalls).toBe(flow.lifetime === 'permanent' ? 1 : 0);
+      expect(mutationCalls).toBe(flow.lifetime === 'permanent' && flow.session === 'tmux' ? 1 : 0);
       const written = flow.lifetime === 'permanent'
         ? parse(readFileSync(join(root, 'fleet.d', `${request.name}.yaml`), 'utf8')).roles[request.name]
         : parse(readFileSync(join(stateDir, 'role.yaml'), 'utf8'));
@@ -366,7 +376,8 @@ roles: {}
     let launches = 0;
     const common = { configPath,
       ops: { backend, binPath: '/bin/true', log() {} }, binPath: '/bin/true',
-      tempLauncher() { launches++; }, identityProvisioner: { async exists() { return false; } } };
+      tempLauncher() { launches++; }, identityProvisioner: { async exists() { return false; } },
+      agentProductionRuntime };
     const direct = new RoleCreationService({ ...common, journal: false });
     await direct.createDirect({ name: 'DirectParity', temp: true, harness: 'codex', session: 'acp',
       approval: 'ask', filesystem: 'workspace', unattended: 'deny',

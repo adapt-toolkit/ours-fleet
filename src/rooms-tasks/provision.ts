@@ -13,7 +13,7 @@ import type {
   RoomOrchestrationRecord, RoomMemberSeat, TaskMemberRole,
   TemplateSnapshot, TemplateMemberSlot,
 } from './types.js';
-import { spawnTemp } from '../spawn.js';
+import { spawnDryRun, spawnTemp } from '../spawn.js';
 import type { SpawnOpts } from '../spawn.js';
 import { findRole, type FleetConfig, type RoomMemberStartup } from '../config.js';
 import {
@@ -24,8 +24,9 @@ import { controlRequest } from '../session/control.js';
 import { SessionControlError } from '../session/types.js';
 import { closeManagedRoom } from './close.js';
 import { buildRoomMemberTask, sha256Text } from './member-startup.js';
-import { agentDir } from '../paths.js';
-import { readProvenance } from '../creation.js';
+import { agentDir, stateRoot } from '../paths.js';
+import { daemonIdentityProvisioner, readProvenance } from '../creation.js';
+import { createAgentProductionRuntime } from '../agent-production-runtime.js';
 import {
   readTempSupervisor, secureStoppedTempArchive, tempArchiveForCreationAction,
   tempSupervisorLiveness,
@@ -89,10 +90,15 @@ async function spawnRoomMember(
   options: SpawnOpts, binPath: string,
 ): Promise<RoomMemberSpawnResult> {
   const stateDir = process.env[FLEET_PROXY_STATE_DIR_ENV];
-  if (!stateDir) return {
-    statePath: await spawnTemp(options, binPath),
-    creationActionId: options.creationActionId!,
-  };
+  if (!stateDir) {
+    const runtime = createAgentProductionRuntime({ trustedStateRoot: stateRoot(),
+      identityProvisioner: daemonIdentityProvisioner() });
+    const plan = Object.freeze({ origin: 'direct' as const, options,
+      preview: spawnDryRun(options) });
+    return { statePath: await spawnTemp(options, binPath, undefined, {
+      temporaryAgentCreation: { execute: () => runtime.create({ plan, actionId: options.creationActionId! }) },
+    }), creationActionId: options.creationActionId! };
+  }
 
   const response = await controlRequest(
     stateDir, { command: 'fleet_spawn', spawn: options }, 10 * 60_000,

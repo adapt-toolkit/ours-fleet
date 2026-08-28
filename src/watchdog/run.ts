@@ -4,6 +4,7 @@ import {
 import { spawn as spawnChild, execFile } from 'node:child_process';
 import { join } from 'node:path';
 import { promisify } from 'node:util';
+import { randomUUID } from 'node:crypto';
 import { stringify } from 'yaml';
 import type { ResolvedWatchdog } from './config.js';
 import type { WatchdogReport } from './report.js';
@@ -16,7 +17,7 @@ import {
   daemonIdentityInventoryProvisioner, ensureIdentity, type IdentityProvisioner,
 } from '../creation.js';
 import { runOnce, START_STAGGER_FILE } from '../runner.js';
-import { agentDir, tmpRoot } from '../paths.js';
+import { agentDir, stateRoot, tmpRoot } from '../paths.js';
 import {
   loadConfig, resolveMonitorConfig, resolveWorklogPolicy, ROLE_NAME_RE,
   type FleetConfig, type ResolvedRole,
@@ -25,6 +26,10 @@ import { getAdapter } from '../harness/registry.js';
 import { redactLogLine } from '../application/log-service.js';
 import { controlRequest, controlSocketPath } from '../session/control.js';
 import { Tmux } from '../tmux.js';
+import { createAgentProductionRuntime, type AgentProductionRuntime } from '../agent-production-runtime.js';
+import { retireTempAgentPublication } from '../temp-lifecycle.js';
+import { readTempAgentSupervisorHandoffIfPresent,
+  type TempAgentSupervisorHandoff } from '../temp-agent-supervisor-handoff.js';
 
 const execFileAsync = promisify(execFile);
 
@@ -90,6 +95,7 @@ export interface WatchdogRunDeps {
   now?(): Date;
   sleep?(ms: number): Promise<void>;
   identityProvisioner?: IdentityProvisioner;
+  agentProductionRuntime?: AgentProductionRuntime;
   /**
    * Injectable child launcher for tests. Default: spawn
    * `node <binPath> _run-watchdog <roleName>` detached:false, stdio to
@@ -199,6 +205,7 @@ export async function executeWatchdogRun(
   const startedAt = start.toISOString();
   const roleName = wd.identity;
   const runDir = agentDir(roleName, true);
+  let agentPublication: Readonly<TempAgentSupervisorHandoff> | undefined;
   // Read once, before the manifest is written: the same snapshot both seeds the
   // digest the agent sees and is the base the post-run reconcile folds into.
   const ledger = readLedger(wd.name);
@@ -219,6 +226,15 @@ export async function executeWatchdogRun(
       .filter(name => name !== wd.identity);
     const runWd = { ...wd, watch };
     const role = buildWatchdogRole(runWd, cfg);
+    if (role.session === 'acp') {
+      const agentProductionRuntime = deps.agentProductionRuntime ?? createAgentProductionRuntime({
+        trustedStateRoot: stateRoot(), identityProvisioner: deps.identityProvisioner
+          ?? daemonIdentityInventoryProvisioner(),
+      });
+      await agentProductionRuntime.createRole({ role, lifetime: 'temporary',
+        actionId: `watchdog-${runId}` });
+      agentPublication = readTempAgentSupervisorHandoffIfPresent(stateRoot(), roleName);
+    }
 
     const dir = applyRole(role, { temp: true, identityGuarantee: guarantee.state });
     const reportPath = join(dir, 'report.json');
@@ -286,6 +302,7 @@ export async function executeWatchdogRun(
     if (existsSync(join(dir, '.isolation-degraded')))
       (report as WatchdogReport & { isolation?: string }).isolation = 'degraded';
   } finally {
+    await retireTempAgentPublication(roleName, agentPublication);
     rmSync(runDir, { recursive: true, force: true });
   }
 
@@ -343,6 +360,7 @@ export async function executeNotifierRun(
 
   const roleName = wd.identity;
   const runDir = agentDir(roleName, true);
+  let agentPublication: Readonly<TempAgentSupervisorHandoff> | undefined;
 
   try {
     // A crashed previous run can leave the temp dir behind; start clean.
@@ -353,6 +371,15 @@ export async function executeNotifierRun(
 
     const cfg = deps.cfg ?? loadConfig();
     const role = buildWatchdogRole(wd, cfg);
+    if (role.session === 'acp') {
+      const agentProductionRuntime = deps.agentProductionRuntime ?? createAgentProductionRuntime({
+        trustedStateRoot: stateRoot(), identityProvisioner: deps.identityProvisioner
+          ?? daemonIdentityInventoryProvisioner(),
+      });
+      await agentProductionRuntime.createRole({ role, lifetime: 'temporary',
+        actionId: `notifier-${randomUUID()}` });
+      agentPublication = readTempAgentSupervisorHandoffIfPresent(stateRoot(), roleName);
+    }
 
     const dir = applyRole(role, { temp: true, identityGuarantee: guarantee.state });
     const sentinelPath = join(dir, 'sent.json');
@@ -381,6 +408,7 @@ export async function executeNotifierRun(
   } finally {
     // Same "never escape" rule as the lock acquire above: cleanup and release are each
     // guarded individually so neither can turn a handled failure into an unhandled one.
+    try { await retireTempAgentPublication(roleName, agentPublication); } catch (e) { fail(e); }
     try { rmSync(runDir, { recursive: true, force: true }); } catch (e) { fail(e); }
     try { releaseRunLock(wd.name); } catch (e) { fail(e); }
   }

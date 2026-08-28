@@ -15,6 +15,9 @@ import { makeSystemdBackend } from '../src/supervisor/systemd.js';
 import type { Exec } from '../src/exec.js';
 import type { Liveness, SupervisorBackend } from '../src/supervisor/types.js';
 import { makeTempSupervisorLauncher, prepareTempSupervisor, tempSystemdUnit } from '../src/temp-lifecycle.js';
+import { createAgentProductionRuntime } from '../src/agent-production-runtime.js';
+import { readTempAgentSupervisorHandoffIfPresent } from '../src/temp-agent-supervisor-handoff.js';
+import { stateRoot } from '../src/paths.js';
 
 let dir: string;
 beforeEach(() => {
@@ -189,6 +192,14 @@ describe('up / down / restart', () => {
         created.push({ name, profile });
       },
     };
+    d.agentProductionRuntime = { createRole: async ({ role, actionId }) => {
+      await d.identityProvisioner!.create!(role.identity, {
+        bio: role.bio, persona: role.persona, exposeLocal: true, localAutoAccept: true,
+      });
+      return { state: 'complete' as const, reservation: {} as never,
+        locator: { kind: 'AgentStartLocator', agentId: role.name, actionId } as never,
+        identityAcquisition: 'created' as const, identityName: role.identity };
+    } } as never;
 
     await up(loadConfig(), ['A'], d);
 
@@ -616,6 +627,13 @@ describe('rmRole', () => {
       stdout: args.includes('show') ? 'inactive\n' : '', stderr: '', code: 0,
     });
     d.sleep = async () => {};
+    const runtime = createAgentProductionRuntime({ trustedStateRoot: stateRoot(),
+      identityProvisioner: { exists: async () => false } });
+    await runtime.createRole({ role: { name: 'Temp', harness: 'codex', session: 'acp', identity: 'Temp',
+      sourceFile: 'test', permissionsDeclared: true,
+      permissions: { approval: 'ask', filesystem: 'workspace', unattended: 'deny' },
+      monitor: { mode: 'native', enabled: false, wake_sources: [], batch_ms: 0,
+        inject: 'notification', interrupt: false } }, lifetime: 'temporary', actionId: 'operator-stop-1' });
 
     await rmRole(loadConfig(), 'Temp', d);
 
@@ -625,6 +643,7 @@ describe('rmRole', () => {
     const archived = readdirSync(recovery).find(name => name.includes('-Temp-'))!;
     expect(readFileSync(join(recovery, archived, 'WORKLOG.md'), 'utf8')).toContain('keep this');
     expect(logs.join('\n')).toContain("removed temporary role 'Temp'");
+    expect(readTempAgentSupervisorHandoffIfPresent(stateRoot(), 'Temp')).toBeUndefined();
   });
 
   it('rm archives a stopped temp role whose supervisor metadata is incomplete', async () => {
@@ -646,6 +665,32 @@ describe('rmRole', () => {
     const archived = readdirSync(recovery).find(name => name.includes('-Incomplete-'))!;
     expect(readFileSync(join(recovery, archived, 'WORKLOG.md'), 'utf8'))
       .toContain('preserve incomplete launch evidence');
+  });
+
+  it('operator stop preserves a replacement Agent generation published after capture', async () => {
+    writeCfg({}); const name = 'Replaced'; const tempDir = agentDir(name, true);
+    mkdirSync(tempDir, { recursive: true }); prepareTempSupervisor(tempDir, name);
+    await makeTempSupervisorLauncher({ platform: 'linux', supervisor: 'systemd',
+      exec: async () => ({ stdout: '', stderr: '', code: 0 }) })(
+      '/bin/ours-fleet', ['_run-temp', name], tempDir);
+    const runtime = createAgentProductionRuntime({ trustedStateRoot: stateRoot(),
+      identityProvisioner: { exists: async () => false } });
+    const role = { name, harness: 'codex', session: 'acp', identity: name, sourceFile: 'test',
+      permissionsDeclared: true, permissions: { approval: 'ask', filesystem: 'workspace', unattended: 'deny' },
+      monitor: { mode: 'native', enabled: false, wake_sources: [], batch_ms: 0,
+        inject: 'notification', interrupt: false } } as const;
+    await runtime.createRole({ role: role as never, lifetime: 'temporary', actionId: 'stop-1' });
+    const { backend } = fakeBackend(); const { d } = deps(backend); let replaced = false;
+    d.exec = async (_command, args) => {
+      if (!replaced) { replaced = true;
+        await runtime.createRole({ role: role as never, lifetime: 'temporary', actionId: 'stop-2' }); }
+      return { stdout: args.includes('show') ? 'inactive\n' : '', stderr: '', code: 0 };
+    };
+    d.sleep = async () => {};
+    await expect(rmRole(loadConfig(), name, d)).rejects.toMatchObject({ code: 'generation_conflict' });
+    expect(readTempAgentSupervisorHandoffIfPresent(stateRoot(), name))
+      .toMatchObject({ generation: 2, actionId: 'stop-2' });
+    expect(existsSync(tempDir)).toBe(true);
   });
 
   it('refuses to archive a detached temp supervisor that remains live after SIGTERM', async () => {

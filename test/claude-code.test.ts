@@ -11,7 +11,6 @@ import { checkUnattendedFloor } from '../src/permissions.js';
 import { agentDir } from '../src/paths.js';
 import { loadConfig, findRole, type ResolvedRole } from '../src/config.js';
 import type { Exec } from '../src/exec.js';
-import { authenticatePrepared, legacyAcpIntegrityDigest } from '../src/harness/acp-attempt.js';
 
 let dir: string;
 beforeEach(() => {
@@ -26,32 +25,6 @@ const role = (over: Partial<ResolvedRole> = {}): ResolvedRole => ({
   name: 'Alice', harness: 'claude-code', identity: 'Alice Dev', sourceFile: 'x', ...over,
 });
 const okExec: Exec = async () => ({ stdout: '2.1.0 (Claude Code)', stderr: '', code: 0 });
-
-async function prepareAcp(r: ResolvedRole, native = {
-  approvalMode: 'default', filesystemMode: 'workspace', unattendedMode: 'deny', exact: true,
-}) {
-  const stateDir = join(dir, `acp-${Math.random().toString(16).slice(2)}`); mkdirSync(stateDir, { recursive: true });
-  const adapter = makeClaudeCodeAdapter(okExec);
-  const options = (r.harness_options ?? {}) as Record<string, unknown>;
-  const projection = {
-    schemaVersion: 1 as const, roleName: r.name, harness: 'claude-code' as const,
-    ...(r.model ? { model: r.model } : {}), ...(typeof options.effort === 'string' ? { effort: options.effort } : {}),
-    identityName: r.identity, lifetime: 'persistent' as const, permissions: r.permissions!,
-    nativePermissions: native,
-    ...(r.session_options?.acp?.command === undefined ? {} : { acpCommand: r.session_options.acp.command }),
-    isolationRequested: false, scheduling: { autocompactPct: autocompactPct(r) },
-    adapterOptions: { harness: 'claude-code' as const,
-      plugins: (options.plugins ?? {}) as Record<string, boolean>, memPalace: options.mem_palace !== false,
-      memPalaceMidSessionAutosave: options.mem_palace_mid_session_autosave === true,
-      ...('mcp_servers' in options ? { mcpServers: options.mcp_servers as Record<string, unknown> } : {}),
-      mcpServersOnly: options.mcp_servers_only === true },
-  };
-  const input = { ...projection, integrityDigest: legacyAcpIntegrityDigest(projection) };
-  const context = { stateDir, runCwd: stateDir, baseEnv: {}, sessionMode: 'fresh' as const, sessionId: 'contract-1' };
-  const evidence = await adapter.prepareAcpLegacy!(input, context);
-  return { adapter, input, context, evidence,
-    launch: authenticatePrepared(adapter.acpLegacyAuthority!, adapter, evidence, input, context)! };
-}
 
 describe('autocompactPct', () => {
   it('derives from max_tokens against the 1M window', () =>
@@ -231,65 +204,6 @@ describe('prepareSession', () => {
     const d = JSON.parse(readFileSync(join(dir, '.claude.json'), 'utf8'));
     expect(d.projects[stateDir].hasTrustDialogAccepted).toBe(true);
     expect(d.projects['/repo'].hasTrustDialogAccepted).toBe(true);
-  });
-});
-
-describe('authenticated ACP contract', () => {
-  it.each([
-    ['allow', 'bypassPermissions'], ['auto', 'acceptEdits'], ['deny', 'plan'], ['ask', undefined],
-  ] as const)('projects approval=%s to mode %s', async (approval, modeId) => {
-    const result = await prepareAcp(role({ session: 'acp',
-      permissions: { approval, filesystem: 'workspace', unattended: 'deny' },
-    }), { approvalMode: modeId ?? 'default', filesystemMode: 'workspace', unattendedMode: 'deny', exact: true });
-    expect(result.launch.modeId).toBe(modeId);
-    expect(result.launch.hostEffect).toBe('pretrust_applied');
-    expect(result.launch.adapterVersion).toBe('0.63.0');
-  });
-
-  it('delivers plugins, explicit MCP servers, strict metadata and scheduling through one attempt', async () => {
-    const servers = { ours: { command: 'ours-mcp', args: ['proxy'] },
-      trello: { type: 'http', url: 'https://mcp.trello.test', headers: { Authorization: 'x' } } };
-    const result = await prepareAcp(role({ session: 'acp', model: 'claude-opus-4-6', autocompact_pct: 67,
-      harness_options: { effort: 'high', plugins: { 'x@m': true }, mcp_servers: servers,
-        mcp_servers_only: true, mem_palace: false, mem_palace_mid_session_autosave: true },
-      permissions: { approval: 'auto', filesystem: 'workspace', unattended: 'deny' },
-    }), { approvalMode: 'acceptEdits', filesystemMode: 'workspace', unattendedMode: 'deny', exact: true });
-    expect(result.input).toMatchObject({ model: 'claude-opus-4-6', effort: 'high' });
-    expect(result.launch.env).toMatchObject({ CLAUDE_AUTOCOMPACT_PCT_OVERRIDE: '67',
-      MEMPALACE_DISABLED: 'true', MEMPALACE_MIDSESSION_AUTOSAVE: 'true' });
-    expect(result.launch.mcpServers).toEqual([
-      { name: 'ours', command: 'ours-mcp', args: ['proxy'], env: [] },
-      { name: 'trello', type: 'http', url: 'https://mcp.trello.test', headers: [{ name: 'Authorization', value: 'x' }] },
-    ]);
-    expect(result.launch.sessionMeta).toEqual({ claudeCode: { options: {
-      settings: join(result.context.stateDir, '.settings-overlay.json'), strictMcpConfig: true,
-    } } });
-    expect(JSON.parse(readFileSync(join(result.context.stateDir, '.settings-overlay.json'), 'utf8')))
-      .toEqual({ enabledPlugins: { 'x@m': true, 'mempalace@mempalace': false } });
-  });
-
-  it('distinguishes inherited MCP absence, explicit empty MCP, and custom command provenance', async () => {
-    const inherited = await prepareAcp(role({ session: 'acp', permissions: {
-      approval: 'ask', filesystem: 'workspace', unattended: 'deny',
-    } }));
-    expect(inherited.launch.mcpServers).toBeUndefined();
-    expect(inherited.launch.sessionMeta).toBeUndefined();
-    const empty = await prepareAcp(role({ session: 'acp', harness_options: { mcp_servers: {} },
-      permissions: { approval: 'ask', filesystem: 'workspace', unattended: 'deny' } }));
-    expect(empty.launch.mcpServers).toEqual([]);
-    const custom = await prepareAcp(role({ session: 'acp',
-      session_options: { acp: { command: 'custom-claude-acp --flag' } },
-      permissions: { approval: 'ask', filesystem: 'workspace', unattended: 'deny' } }));
-    expect(custom.launch.argv).toEqual(['sh', '-c', 'custom-claude-acp --flag']);
-    expect(custom.launch.adapterVersion).toBe('custom');
-    expect(custom.launch.sessionMeta).toBeUndefined();
-  });
-
-  it('fails the attempt truthfully when the shared trust file cannot be parsed', async () => {
-    writeFileSync(join(dir, '.claude.json'), '{broken');
-    await expect(prepareAcp(role({ session: 'acp', permissions: {
-      approval: 'ask', filesystem: 'workspace', unattended: 'deny',
-    } }))).rejects.toThrow(/pretrust outcome is uncertain/u);
   });
 });
 

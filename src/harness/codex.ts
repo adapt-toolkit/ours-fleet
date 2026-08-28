@@ -1,5 +1,4 @@
 import { chmodSync, existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
-import { createHash } from 'node:crypto';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { agentDir, home } from '../paths.js';
@@ -16,13 +15,7 @@ import {
   translatePortablePermissionCodes,
 } from './brain-adapter.js';
 import { harnessRuntimeDir } from '../isolation/policy.js';
-import {
-  resolveAuthenticatedBundledAcpAgent, resolveBundledAcpAgent, type AcpAgentResolution,
-} from './acp-agent.js';
-import {
-  LegacyAcpPreparationAuthority, type LegacyAcpAttemptInput,
-  type LegacyAcpRuntimeContext,
-} from './acp-attempt.js';
+import { resolveBundledAcpAgent, type AcpAgentResolution } from './acp-agent.js';
 
 interface CodexOptions {
   launcher?: string;
@@ -367,12 +360,6 @@ export function makeCodexAdapter(exec: Exec = realExec): HarnessAdapter {
       return { argv, env: prep.env };
     },
 
-    async prepareAcpLegacy(input: LegacyAcpAttemptInput, context: LegacyAcpRuntimeContext) {
-      return this.acpLegacyAuthority!.prepare(input, context);
-    },
-
-    acpLegacyAuthority: undefined,
-
     isolationPaths(role: ResolvedRole, _dirs: RoleDirs) {
       const codexHome = join(home(), '.codex');
       const profile = (role.harness_options as CodexOptions | undefined)?.profile;
@@ -515,64 +502,6 @@ export function makeCodexAdapter(exec: Exec = realExec): HarnessAdapter {
 
     exitPolicy: { cleanExitIsFresh: true, fastFailSecs: 20 },
   };
-  const acpResolutions = new WeakMap<object, AcpAgentResolution | null>();
-  const acpAuthority = new LegacyAcpPreparationAuthority(adapter, {
-    translate(input, context) {
-      if (input.harness !== 'codex' || input.adapterOptions.harness !== 'codex')
-        throw new Error('Codex ACP translation received another harness');
-      const configured = input.acpCommand;
-      const resolution = configured == null
-        ? resolveAuthenticatedBundledAcpAgent(CODEX_ACP_PACKAGE, 'codex-acp', 'codex-acp') : undefined;
-      const launch = resolution ? codexAcpLaunchForResolution(resolution) : undefined;
-      const argv = Array.isArray(configured) ? [...configured]
-        : typeof configured === 'string' ? ['sh', '-c', configured] : launch!.argv;
-      const modeId = input.nativePermissions.filesystemMode === 'read-only' ? 'read-only'
-        : input.nativePermissions.filesystemMode === 'danger-full-access' ? 'agent-full-access'
-          : input.nativePermissions.filesystemMode === 'workspace-write' ? 'agent'
-            : input.nativePermissions.approvalMode === 'never' ? 'agent-full-access' : 'agent';
-      const source = configured == null ? compiledProxyModule() : undefined;
-      const proxyModuleName = '.codex-app-server-proxy.mjs';
-      const proxyName = process.platform === 'win32'
-        ? '.codex-app-server-proxy.cmd' : '.codex-app-server-proxy';
-      const proxyModule = join(context.stateDir, proxyModuleName);
-      const proxyCommand = join(context.stateDir, proxyName);
-      const files = source && resolution?.bundled && resolution.manifestPath ? [
-        { name: proxyModuleName, contents: readFileSync(source, 'utf8'), mode: 0o600 },
-        { name: proxyName, contents: process.platform === 'win32'
-          ? `@echo off\r\n"${process.execPath.replaceAll('"', '""')}" "${proxyModule.replaceAll('"', '""')}" %*\r\n`
-          : `#!/bin/sh\nexec ${shellQuote(process.execPath)} ${shellQuote(proxyModule)} "$@"\n`, mode: 0o700 },
-      ] : [];
-      const filesystem = input.nativePermissions.filesystemMode === 'read-only' ? 'read-only'
-        : ['unrestricted', 'danger-full-access'].includes(input.nativePermissions.filesystemMode)
-          ? 'danger-full-access' : 'workspace-write';
-      const translation = {
-        argv,
-        env: { OURS_BIND_IDENTITY: input.identityName, INITIAL_AGENT_MODE: modeId,
-          ...(files.length ? {
-            CODEX_PATH: proxyCommand,
-            [CODEX_PROXY_APPROVAL_ENV]: input.nativePermissions.approvalMode,
-            [CODEX_PROXY_SANDBOX_ENV]: filesystem,
-            [CODEX_PROXY_MANIFEST_ENV]: resolution!.manifestPath!,
-          } : {}) }, modeId, ...(files.length ? { files } : {}),
-        ...(launch?.permissionMetadataSource ? {
-          permissionMetadataSource: launch.permissionMetadataSource,
-        } : {}),
-      };
-      acpResolutions.set(translation, resolution ?? null);
-      return translation;
-    },
-    async probe(translation) {
-      const resolution = acpResolutions.get(translation as object);
-      if (resolution === undefined) throw new Error('Codex ACP translation has no bound artifact probe');
-      if (resolution && (!resolution.bundled || !resolution.identity
-          || resolution.version !== BUNDLED_CODEX_ACP_VERSION))
-        throw new Error('Codex ACP bundled artifact is unavailable or version-skewed');
-      return { adapterId: 'codex-acp', adapterVersion: resolution ? BUNDLED_CODEX_ACP_VERSION : 'custom',
-        artifactDigest: `sha256:${createHash('sha256').update(JSON.stringify(
-          resolution?.identity ?? { customArgv: translation.argv })).digest('hex')}` };
-    },
-  });
-  Object.defineProperty(adapter, 'acpLegacyAuthority', { value: acpAuthority, enumerable: true });
   return adapter;
 }
 

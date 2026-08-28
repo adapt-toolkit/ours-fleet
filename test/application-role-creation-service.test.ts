@@ -35,6 +35,9 @@ const completed = (input: { plan: { options: { name: string; identity?: string }
     locator: { kind: 'AgentStartLocator', agentId: input.plan.options.name,
       actionId: input.actionId } as never, identityAcquisition: 'external' as const,
     identityName: input.plan.options.identity ?? input.plan.options.name });
+const temporaryRuntime = { create: async (input: { plan: { options: { name: string } }; actionId: string }) =>
+  ({ state: 'reserved' as const, agentId: input.plan.options.name, generation: 1,
+    actionId: input.actionId, lifetime: 'temporary' as const, completion: 'deferred' as const }) };
 
 describe('RoleCreationService permanent Agent ingress', () => {
   it('binds direct creation to a generated action and direct-origin plan', async () => {
@@ -102,7 +105,8 @@ describe('RoleCreationService permanent Agent ingress', () => {
 
   it('never invokes permanent composition for temporary direct creation', async () => {
     const create = vi.fn(async input => completed(input));
-    const service = new RoleCreationService({ ...options(create), tempLauncher() {} });
+    const service = new RoleCreationService({ ...options(create), tempLauncher() {},
+      agentProductionRuntime: temporaryRuntime });
     await service.createDirect({ name: 'Temporary', temp: true, harness: 'codex', session: 'acp' });
     expect(create).not.toHaveBeenCalled();
   });
@@ -140,6 +144,7 @@ describe('RoleCreationService permanent Agent ingress', () => {
 
     const temporaryHook = vi.fn(async input => completed(input)); const temporaryOptions = options(temporaryHook);
     const temporary = new RoleCreationService({ ...temporaryOptions, tempLauncher() {},
+      agentProductionRuntime: temporaryRuntime,
       identityProvisioner: { exists: async () => false }, probeReady: async () => 'ready' });
     const temporaryRequest = request('WebTemporary', 'temporary');
     const tempPreview = await temporary.preview(temporaryRequest);

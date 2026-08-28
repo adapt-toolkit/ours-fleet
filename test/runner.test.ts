@@ -31,7 +31,7 @@ import {
 } from '../src/owner-channel/binder.js';
 import { prepareTempSupervisor } from '../src/temp-lifecycle.js';
 import type { ResolvedRole } from '../src/config.js';
-import { LegacyAcpPreparationAuthority } from '../src/harness/acp-attempt.js';
+import { AcpSession } from '../src/session/acp.js';
 
 let dir: string;
 beforeEach(() => {
@@ -596,31 +596,15 @@ describe('exit classification', () => {
 describe('runOnce ACP startup outcome', () => {
   const acpFixture = join(dirname(fileURLToPath(import.meta.url)), 'fixtures', 'acp-agent.mjs');
 
-  /** The fake adapter, taught to launch the ACP fixture as its agent process. */
-  function legacyAdapter(
-    id: string, argv = [process.execPath, acpFixture], source?: 'codex-acp', modeId?: string,
-  ): HarnessAdapter {
-    const adapter: HarnessAdapter = {
-      ...fakeAdapter, id,
-      async prepareAcpLegacy(input, context) { return this.acpLegacyAuthority!.prepare(input, context); },
-      acpLegacyAuthority: undefined,
-      effectivePermissionMode: role => ({
+  function productAdapter(id: string): HarnessAdapter {
+    return { ...fakeAdapter, id, effectivePermissionMode: role => ({
         fleetMode: role.permissions.approval === 'allow' ? 'allow'
           : role.permissions.approval === 'auto' ? 'auto' : 'ask',
         nativeMode: role.permissions.approval === 'allow' ? 'fixture-allow' : 'fixture-ask',
-      }),
-    };
-    const authority = new LegacyAcpPreparationAuthority(adapter, {
-      translate: () => ({ argv, env: {}, ...(source ? { permissionMetadataSource: source } : {}),
-        ...(modeId ? { modeId } : {}) }),
-      probe: async () => ({ adapterId: `${id}-adapter`, adapterVersion: '1',
-        artifactDigest: `sha256:${'a'.repeat(64)}` }),
-    });
-    Object.defineProperty(adapter, 'acpLegacyAuthority', { value: authority, enumerable: true });
-    return adapter;
+      }) };
   }
 
-  const acpAdapter: HarnessAdapter = legacyAdapter('fake-acp');
+  const acpAdapter: HarnessAdapter = productAdapter('fake-acp');
   Object.assign(acpAdapter, {
     effectivePermissionMode: role => ({
       fleetMode: role.permissions.approval === 'allow' ? 'allow'
@@ -644,50 +628,16 @@ describe('runOnce ACP startup outcome', () => {
         log: (l: string) => { logs.push(l); },
         fetch: async () => ({ status: 200, ok: true, json: async () => ({ cursor: 0, events: [] }) }),
         createMonitor: () => ({ prime: async () => {}, run: async () => {}, stop: () => {} }),
+        startAcpSession: options => AcpSession.start({ ...options.session,
+          argv: [process.execPath, acpFixture], env: { ...options.env } }),
       },
     };
   }
 
   beforeEach(() => { registerAdapter(acpAdapter); });
 
-  it('projects real Codex native sandbox consistently into the authenticated ACP proxy', async () => {
-    writeCfg({ A: { harness: 'codex', session: 'acp',
-      permissions: { approval: 'allow', filesystem: 'workspace', unattended: 'deny' } } });
-    const { deps } = acpDeps(); let observed: Parameters<NonNullable<RunnerDeps['startAcpSession']>>[0] | undefined;
-    await expect(runOnce('A', {}, { ...deps, startAcpSession: async options => {
-      observed = options; throw new Error('captured authenticated Codex launch');
-    } })).rejects.toThrow(/captured authenticated Codex launch/u);
-    expect(observed).toMatchObject({ permissionMode: { fleetMode: 'allow', nativeMode: 'agent-full-access' },
-      permissionMetadataSource: 'codex-acp',
-      env: { INITIAL_AGENT_MODE: 'agent-full-access', OURS_FLEET_CODEX_APPROVAL: 'never',
-        OURS_FLEET_CODEX_SANDBOX: 'danger-full-access' } });
-  });
-
-  it('never starts or pretrusts ACP when shared preparation validation fails', async () => {
-    const adapter: HarnessAdapter = {
-      ...fakeAdapter, id: 'fake-acp-invalid',
-      async prepareAcpLegacy(input, context) { return this.acpLegacyAuthority!.prepare(input, context); },
-      acpLegacyAuthority: undefined,
-    };
-    const pretrust = vi.fn();
-    const authority = new LegacyAcpPreparationAuthority(adapter, {
-      translate: () => ({ argv: [], env: {}, files: [{ name: '.must-not-exist', contents: 'x' }] }),
-      probe: vi.fn(), pretrust,
-    });
-    Object.defineProperty(adapter, 'acpLegacyAuthority', { value: authority, enumerable: true });
-    registerAdapter(adapter);
-    writeCfg({ A: { harness: 'fake-acp-invalid', session: 'acp' } });
-    const { deps } = acpDeps(); const startAcpSession = vi.fn();
-    await expect(runOnce('A', {}, { ...deps, startAcpSession })).rejects.toThrow(/argv/u);
-    expect(startAcpSession).not.toHaveBeenCalled();
-    expect(pretrust).not.toHaveBeenCalled();
-    expect(existsSync(agentDir('A'))).toBe(false);
-    for (const name of ['.must-not-exist', '.session-id', '.booted', 'WORKLOG.md'])
-      expect(existsSync(join(agentDir('A'), name)), name).toBe(false);
-  });
-
   it('passes only provenance attached to the exact ACP launch into the session', async () => {
-    registerAdapter(legacyAdapter('fake-acp-provenance', ['fixture-acp'], 'codex-acp'));
+    registerAdapter(productAdapter('fake-acp-provenance'));
     writeCfg({ A: {
       harness: 'fake-acp-provenance', session: 'acp',
       permissions: { approval: 'allow', filesystem: 'workspace', unattended: 'wait' },
@@ -721,8 +671,8 @@ describe('runOnce ACP startup outcome', () => {
     const runnerDeps: Partial<RunnerDeps> = {
       ...deps,
       startAcpSession: async options => {
-        observedSource = options.permissionMetadataSource;
-        observedAutostartScrub = options.scrubObsoleteOursAutostart === true;
+        observedSource = options.session.permissionMetadataSource;
+        observedAutostartScrub = options.session.scrubObsoleteOursAutostart === true;
         return fakeAcp;
       },
       createControlServer: () => ({
@@ -733,7 +683,7 @@ describe('runOnce ACP startup outcome', () => {
     };
 
     await runOnce('A', {}, runnerDeps);
-    expect(observedSource).toBe('codex-acp');
+    expect(observedSource).toBeUndefined();
     expect(observedAutostartScrub).toBe(true);
   });
 
@@ -876,18 +826,18 @@ describe('runOnce ACP startup outcome', () => {
   }, 20_000);
 
   it('delivers the adapter-computed permission mode to the ACP session', async () => {
-    registerAdapter(legacyAdapter('fake-acp-mode', undefined, undefined, 'acceptEdits'));
+    registerAdapter(productAdapter('fake-acp-mode'));
     writeCfg({ A: {
       harness: 'fake-acp-mode', session: 'acp',
       env: { ACP_FIXTURE_EXIT_AFTER: '1' },
     } });
     mkdirSync(agentDir('A'), { recursive: true });
     const { deps } = acpDeps();
-
-    await runOnce('A', {}, deps);
-    const events = readFileSync(join(agentDir('A'), '.session-events.jsonl'), 'utf8')
-      .trim().split('\n').map(line => JSON.parse(line) as { kind: string; text?: string });
-    expect(events.some(e => e.kind === 'agent_text' && e.text === 'mode:acceptEdits')).toBe(true);
+    const start = deps.startAcpSession; let observed: unknown;
+    await runOnce('A', {}, { ...deps, startAcpSession: options => {
+      observed = options.session.permissionMode; return start(options);
+    } });
+    expect(observed).toEqual({ fleetMode: 'ask', nativeMode: 'fixture-ask' });
   });
 
   it('warns once at startup that an unattended role auto-denies', async () => {

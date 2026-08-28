@@ -2,7 +2,7 @@ import { spawn as spawnChild } from 'node:child_process';
 import { closeSync, existsSync, mkdirSync, openSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { parse, stringify } from 'yaml';
-import { agentDir, fleetDDir } from './paths.js';
+import { agentDir, fleetDDir, stateRoot } from './paths.js';
 import { validateIsolationConfig } from './isolation/policy.js';
 import type { IsolationConfig } from './isolation/types.js';
 import {
@@ -29,8 +29,11 @@ import './harness/codex.js';
 import { getAdapter } from './harness/registry.js';
 import {
   archiveTempState, makeTempSupervisorLauncher, prepareTempSupervisor, reclaimStaleTempState,
+  retireTempAgentPublication,
   type SupervisorLauncher,
 } from './temp-lifecycle.js';
+import { readTempAgentSupervisorHandoffIfPresent,
+  type TempAgentSupervisorHandoff } from './temp-agent-supervisor-handoff.js';
 
 /**
  * The provenance record written by the most recent spawn in this process, so
@@ -487,7 +490,18 @@ export async function spawnTemp(
       creation.onStage?.('checking_identity', {
         result: 'unknown', guarantee: 'unverified',
       });
-      return spawnTempInner(o, binPath, launch, tx, creation.onStage);
+      let agentPublication: Readonly<TempAgentSupervisorHandoff> | undefined;
+      if (creation.temporaryAgentCreation) {
+        const reserved = await creation.temporaryAgentCreation.execute();
+        if (reserved.state !== 'reserved' || reserved.lifetime !== 'temporary'
+            || reserved.completion !== 'deferred' || reserved.agentId !== o.name
+            || reserved.actionId !== o.creationActionId)
+          throw new Error('temporary Agent composition handoff binding mismatch');
+        agentPublication = readTempAgentSupervisorHandoffIfPresent(stateRoot(), o.name);
+      } else if ((o.session ?? loadConfig(o.configPath).defaults.session ?? 'tmux') === 'acp') {
+        throw new Error('temporary ACP Agent production runtime is unavailable');
+      }
+      return spawnTempInner(o, binPath, launch, tx, creation.onStage, agentPublication);
     },
     creation,
   );
@@ -495,7 +509,7 @@ export async function spawnTemp(
 
 async function spawnTempInner(
   o: SpawnOpts, binPath: string, launch: SupervisorLauncher, tx: CreationTransaction,
-  onStage: CreationDeps['onStage'],
+  onStage: CreationDeps['onStage'], agentPublication?: Readonly<TempAgentSupervisorHandoff>,
 ): Promise<string> {
   const cfg = loadConfig(o.configPath);
   const defaultHarness = cfg.defaults.harness as string | undefined;
@@ -559,10 +573,11 @@ async function spawnTempInner(
   lastProvenance = provenance;
   tx.record({
     stage: `temp state dir ${dir}`,
-    undo: () => {
+    undo: async () => {
       // A failed launch is still lifecycle evidence: briefing, provenance,
       // metadata and supervisor output explain what happened. Remove it from
       // the live roster by atomic archive, never recursive deletion.
+      await retireTempAgentPublication(o.name, agentPublication);
       archiveTempState(
         o.name, 'startup-failure', 'failed',
         'temporary creation rolled back after launch/setup failure; evidence preserved',

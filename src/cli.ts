@@ -9,7 +9,7 @@ import { VERSION } from './version.js';
 import {
   analyzeInstalls, buildInfo, buildLabel, discoverInstalls, runningLabel,
 } from './provenance.js';
-import { agentDir, agentsRoot, tmpRoot, logsRoot, deriveXdgRuntimeDir } from './paths.js';
+import { agentDir, agentsRoot, tmpRoot, logsRoot, deriveXdgRuntimeDir, stateRoot } from './paths.js';
 import { findRole, loadConfig, ROLE_NAME_RE } from './config.js';
 import type { YamlMode } from './config-yaml.js';
 import { formatDuration } from './duration.js';
@@ -30,7 +30,8 @@ import { watchdogAddressable } from './watchdog/query.js';
 import { lastProvenance, type SpawnOpts } from './spawn.js';
 import { stringify } from 'yaml';
 import { resolvedRolePlan } from './resolved-plan.js';
-import { creationBuildNote, formatProvenance, readProvenance } from './creation.js';
+import { creationBuildNote, daemonIdentityProvisioner, formatProvenance, readProvenance } from './creation.js';
+import { createAgentProductionRuntime } from './agent-production-runtime.js';
 import { doctor } from './doctor.js';
 import {
   allWarnings, analyzeFleetPermissions, effectivePermissionMode, formatNative,
@@ -72,12 +73,12 @@ deriveXdgRuntimeDir();
 
 const binPath = (() => { try { return realpathSync(process.argv[1]); } catch { return process.argv[1]; } })();
 
-const deps = (): OpsDeps => ({
-  backend: pickBackend(),
-  binPath,
-  log: l => console.log(l),
-  watchdogService: new WatchdogServiceManager(),
-});
+const deps = (): OpsDeps => {
+  const identityProvisioner = daemonIdentityProvisioner();
+  return ({ backend: pickBackend(), binPath, log: l => console.log(l),
+    watchdogService: new WatchdogServiceManager(), identityProvisioner,
+    agentProductionRuntime: createAgentProductionRuntime({ trustedStateRoot: stateRoot(), identityProvisioner }) });
+};
 
 const roleLifecycle = (configPath: string | undefined, operationDeps: OpsDeps) => {
   const repository = new RoleRepository({ configPath });
@@ -1081,8 +1082,9 @@ cOpt(program.command('spawn [name]').description('spawn a new agent (permanent b
       };
       if (o.json && !o.dryRun) throw new Error('--json is currently valid only with --dry-run');
       const creationDeps = deps();
+      const agentProductionRuntime = creationDeps.agentProductionRuntime!;
       const creation = new RoleCreationService({ configPath: opts.configuration,
-        ops: creationDeps, binPath, journal: false });
+        ops: creationDeps, binPath, journal: false, agentProductionRuntime });
       if (o.dryRun) {
         const result = creation.previewSpawn({ origin: 'direct', options: o }).preview;
         if (o.json) {

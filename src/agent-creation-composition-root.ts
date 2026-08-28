@@ -38,17 +38,21 @@ export class AgentCreationCompositionRoot {
     private readonly transaction: AgentCreationTransaction,
     locators: AgentStartLocatorPublisher = new AgentStartLocatorPublisher(transaction),
     private readonly handoffs?: AgentSupervisorHandoffPublisher,
+    private readonly admit?: (request: AgentCompositionRequest, actionId: string) => Promise<() => void>,
   ) { this.#locators = locators; }
 
   async createPermanent(
     request: AgentCompositionRequest, actionId: string,
   ): Promise<PermanentAgentCreationResult> {
-    const prepared = this.composition.prepare(request);
-    if (prepared.lifecycle !== 'persistent' || prepared.identity.ownership === 'create_temporary'
-        || prepared.operation.id !== actionId)
-      throw new AgentCompositionError('invalid_request');
-    const result = await this.transaction.persistPrepared(prepared, { actionId });
-    return this.#finish(result);
+    const release = await this.admit?.(request, actionId);
+    try {
+      const prepared = this.composition.prepare(request);
+      if (prepared.lifecycle !== 'persistent' || prepared.identity.ownership === 'create_temporary'
+          || prepared.operation.id !== actionId)
+        throw new AgentCompositionError('invalid_request');
+      const result = await this.transaction.persistPrepared(prepared, { actionId });
+      return this.#finish(result);
+    } finally { release?.(); }
   }
 
   async resumePermanent(agentId: string, actionId: string): Promise<PermanentAgentCreationResult> {
@@ -124,7 +128,7 @@ export function createProductionAgentCreationCompositionRoot(
   deps: ProductionAgentCreationDeps,
 ): ProductionAgentCreationAssembly {
   const contexts = new WeakMap<object, Readonly<TrustedCompositionContext>>();
-  const allocatedAgents = new Set<string>();
+  const generationAdmissions = new WeakMap<object, number>();
   const transactionEvidence = Object.freeze({}) as VerifiedTransactionConsumerEvidence;
   const planEvidence = deps.planEvidence;
   const authority: AgentCompositionAuthority = {
@@ -132,9 +136,11 @@ export function createProductionAgentCreationCompositionRoot(
     // H1a production creation is initial generation only. Exact-action retries use
     // resumePermanent and never re-prepare or invent a next durable generation.
     allocateGeneration: input => {
-      if (allocatedAgents.has(input.agentId)) throw new AgentCompositionError('generation_reuse');
-      allocatedAgents.add(input.agentId);
-      return Object.freeze({ agentId: input.agentId, generation: 1, operationId: input.operation.id,
+      const evidence = input.callerEvidence as object;
+      const generation = generationAdmissions.get(evidence);
+      if (!generation) throw new AgentCompositionError('invalid_generation');
+      generationAdmissions.delete(evidence);
+      return Object.freeze({ agentId: input.agentId, generation, operationId: input.operation.id,
         authorizationRevision: input.authorizationRevision, snapshotDigest: input.snapshotDigest,
         snapshotRevision: input.snapshotRevision });
     },
@@ -148,8 +154,23 @@ export function createProductionAgentCreationCompositionRoot(
   const identity = new AgentProductionIdentityAuthority(deps.identityProvisioner, deps.identityProfile);
   const transaction = new AgentCreationTransaction(consumer, generationsAuthority, identity, identity,
     deps.creationFaults);
+  const admit = async (request: AgentCompositionRequest, actionId: string): Promise<() => void> => {
+    const context = request && typeof request === 'object'
+      ? contexts.get(request.callerEvidence as object) : undefined;
+    const source = request && typeof request === 'object'
+      ? Object.getOwnPropertyDescriptor(request, 'source')?.value as { agentId?: unknown } | undefined : undefined;
+    const agentId = source && typeof source === 'object'
+      ? Object.getOwnPropertyDescriptor(source, 'agentId')?.value : undefined;
+    if (!context || context.operation.id !== actionId || typeof agentId !== 'string')
+      throw new AgentCompositionError('invalid_request');
+    const admission = await generationsAuthority.admit(agentId, actionId);
+    const evidence = request.callerEvidence as object;
+    if (generationAdmissions.has(evidence)) throw new AgentCompositionError('invalid_generation');
+    generationAdmissions.set(evidence, admission.generation);
+    return () => generationAdmissions.delete(evidence);
+  };
   const root = new AgentCreationCompositionRoot(composition, transaction, undefined,
-    new AgentSupervisorHandoffPublisher(deps.trustedStateRoot, transaction, deps.handoffFaults));
+    new AgentSupervisorHandoffPublisher(deps.trustedStateRoot, transaction, deps.handoffFaults), admit);
   const temporaryReservations = new TempAgentPlanReservationRoot(composition, consumer, generationsAuthority);
   const temporaryHandoffs = new TempAgentSupervisorHandoffPublisher(deps.trustedStateRoot, temporaryReservations);
   type TempStatus = Readonly<{ agentId: string; generation: number;
@@ -175,7 +196,11 @@ export function createProductionAgentCreationCompositionRoot(
       admission = { binding, creatorEvidence, ownerDelegationEvidence };
       installedTemporary.set(key, admission);
     }
-    try { admission.evidence ??= await temporaryReservations.reserve(request, actionId); }
+    try { if (!admission.evidence) {
+      const release = await admit(request, actionId);
+      try { admission.evidence = await temporaryReservations.reserve(request, actionId); }
+      finally { release(); }
+    } }
     catch (error) {
       if (error instanceof AgentCompositionError) installedTemporary.delete(key);
       throw error;

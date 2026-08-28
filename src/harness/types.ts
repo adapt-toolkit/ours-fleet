@@ -5,10 +5,6 @@ import type {
   AcpBodyBrainInjectedDriver, AcpBodyBrainPreparedLaunch,
 } from '../session/acp-body-brain-provider.js';
 import type { AcpBodyBrainProvider } from '../session/acp-body-brain-transport.js';
-import type {
-  LegacyAcpAttemptInput, LegacyAcpPreparationAuthority, LegacyAcpRuntimeContext,
-  LegacyPreparedAcpAttempt,
-} from './acp-attempt.js';
 
 export interface PrereqCheck { name: string; ok: boolean; detail: string }
 export interface PrereqReport { ok: boolean; checks: PrereqCheck[] }
@@ -134,12 +130,6 @@ export interface HarnessAdapter {
   validateOptions(opts: unknown, role?: ResolvedRole): ValidationError[];
   prepareSession(role: ResolvedRole, dirs: RoleDirs): Promise<SessionPrep>;
   buildLaunch(role: ResolvedRole, mode: 'fresh' | 'resume', s: SessionState, prep: SessionPrep): Launch;
-  /** Temporary legacy bridge. See the Phase-5 deletion gate in acp-attempt.ts. */
-  prepareAcpLegacy?(
-    input: LegacyAcpAttemptInput, context: LegacyAcpRuntimeContext,
-  ): Promise<LegacyPreparedAcpAttempt>;
-  /** Instance-owned issuer paired with prepareAcpLegacy; integrity is not authority. */
-  readonly acpLegacyAuthority?: LegacyAcpPreparationAuthority;
   /** Effective portable policy and harness-native approval mode after native overrides win. */
   effectivePermissionMode?(role: ResolvedRole): {
     fleetMode: FleetPermissionMode;

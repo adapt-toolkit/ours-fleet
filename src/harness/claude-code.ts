@@ -1,5 +1,4 @@
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
-import { createHash } from 'node:crypto';
 import { join } from 'node:path';
 import { home } from '../paths.js';
 import { realExec, type Exec } from '../exec.js';
@@ -12,17 +11,10 @@ import {
   CLAUDE_CODE_BODY_BRAIN_DESCRIPTOR, registerAdapter, registerBodyBrainAdapterDescriptor,
 } from './registry.js';
 import {
-  LegacyAcpPreparationAuthority, type LegacyAcpAttemptInput,
-  type LegacyAcpRuntimeContext,
-} from './acp-attempt.js';
-import {
   translatePortablePermissionCodes,
 } from './brain-adapter.js';
 import { replaceFileAtomically, withFileLock, type LockDeps } from '../atomic-file.js';
 import { harnessRuntimeDir } from '../isolation/policy.js';
-import {
-  resolveAuthenticatedBundledAcpAgent, type AcpAgentResolution,
-} from './acp-agent.js';
 
 /** One entry of `harness_options.mcp_servers`, in `.mcp.json`'s own shape. */
 interface McpServerSpec {
@@ -424,12 +416,6 @@ export function makeClaudeCodeAdapter(exec: Exec = realExec): HarnessAdapter {
       return { argv, env: prep.env };
     },
 
-    async prepareAcpLegacy(input: LegacyAcpAttemptInput, context: LegacyAcpRuntimeContext) {
-      return this.acpLegacyAuthority!.prepare(input, context);
-    },
-
-    acpLegacyAuthority: undefined,
-
     isolationPaths(_role: ResolvedRole, _dirs: RoleDirs) {
       const claudeHome = join(home(), '.claude');
       return {
@@ -521,59 +507,6 @@ export function makeClaudeCodeAdapter(exec: Exec = realExec): HarnessAdapter {
 
     exitPolicy: { cleanExitIsFresh: true, fastFailSecs: 20 },
   };
-  const acpResolutions = new WeakMap<object, AcpAgentResolution | null>();
-  const acpAuthority = new LegacyAcpPreparationAuthority(adapter, {
-    translate(input, context) {
-      if (input.harness !== 'claude-code' || input.adapterOptions.harness !== 'claude-code')
-        throw new Error('Claude ACP translation received another harness');
-      const options = input.adapterOptions;
-      const configured = input.acpCommand;
-      const resolution = configured == null ? resolveAuthenticatedBundledAcpAgent(
-        '@agentclientprotocol/claude-agent-acp', 'claude-agent-acp', 'claude-agent-acp') : undefined;
-      const argv = Array.isArray(configured) ? [...configured]
-        : typeof configured === 'string' ? ['sh', '-c', configured]
-          : resolution!.argv;
-      const enabledPlugins = { ...options.plugins };
-      if (!options.memPalace) enabledPlugins['mempalace@mempalace'] = false;
-      const files = Object.keys(enabledPlugins).length
-        ? [{ name: '.settings-overlay.json', contents: JSON.stringify({ enabledPlugins }, null, 2), mode: 0o600 }]
-        : [];
-      const settings = files.length ? join(context.stateDir, files[0].name) : undefined;
-      const modeId = input.nativePermissions.approvalMode === 'default'
-        ? undefined : input.nativePermissions.approvalMode;
-      const mcpServers = translateAcpMcpServers(options.mcpServers as Record<string, McpServerSpec> | undefined);
-      const sessionMeta = configured == null && (settings || options.mcpServersOnly)
-        ? { claudeCode: { options: { ...(settings ? { settings } : {}),
-          ...(options.mcpServersOnly ? { strictMcpConfig: true } : {}) } } } : undefined;
-      const translation = {
-        argv, env: {
-          OURS_BIND_IDENTITY: input.identityName,
-          CLAUDE_AUTOCOMPACT_PCT_OVERRIDE: String(input.scheduling.autocompactPct ?? 80),
-          MEMPALACE_HOOKS_AUTO_SAVE: 'false',
-          MEMPALACE_MIDSESSION_AUTOSAVE: options.memPalaceMidSessionAutosave ? 'true' : 'false',
-          ...(!options.memPalace ? { MEMPALACE_DISABLED: 'true' } : {}),
-        }, ...(modeId ? { modeId } : {}), ...(mcpServers === undefined ? {} : { mcpServers }),
-        ...(sessionMeta ? { sessionMeta } : {}), ...(files.length ? { files } : {}),
-      };
-      acpResolutions.set(translation, resolution ?? null);
-      return translation;
-    },
-    async probe(translation) {
-      const resolution = acpResolutions.get(translation as object);
-      if (resolution === undefined) throw new Error('Claude ACP translation has no bound artifact probe');
-      if (resolution && (!resolution.bundled || !resolution.identity || resolution.version !== '0.63.0'))
-        throw new Error('Claude ACP bundled artifact is unavailable or version-skewed');
-      return { adapterId: 'claude-code-acp', adapterVersion: resolution ? '0.63.0' : 'custom',
-        artifactDigest: `sha256:${createHash('sha256').update(JSON.stringify(
-          resolution?.identity ?? { customArgv: translation.argv })).digest('hex')}` };
-    },
-    async pretrust(context) {
-      const stateApplied = await applyPretrust(context.stateDir);
-      const cwdApplied = context.runCwd === context.stateDir || await applyPretrust(context.runCwd);
-      return stateApplied && cwdApplied;
-    },
-  });
-  Object.defineProperty(adapter, 'acpLegacyAuthority', { value: acpAuthority, enumerable: true });
   return adapter;
 }
 

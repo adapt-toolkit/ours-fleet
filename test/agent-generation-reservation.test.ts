@@ -35,13 +35,13 @@ beforeEach(() => {
 });
 afterEach(() => rmSync(root, { recursive: true, force: true }));
 
-function selected() {
+function selected(generation = 1, actionId = 'action-1') {
   return resolveAgentPlan({ snapshot: loadConfigResourceSnapshot({ bootstrapFile: join(root, 'fleet.yaml') }),
     source: { kind: 'runtime_composition', agentId: 'agent-1', role: 'Builder',
       identity: { name: 'agent-1', ownership: 'create_persistent' }, lifecycle: 'persistent', brain, permissions },
     principal: { id: 'system', kind: 'system' }, operation: {
-      id: 'action-1', type: 'agent.create', resourceScope: 'agents/agent-1' },
-    authorizationRevision: 'auth-1', generation: 1, evaluatedAt: 1, adapter });
+      id: actionId, type: 'agent.create', resourceScope: 'agents/agent-1' },
+    authorizationRevision: 'auth-1', generation, evaluatedAt: 1, adapter });
 }
 
 function tree(path: string): unknown {
@@ -134,4 +134,37 @@ describe('DurableAgentGenerationReader', () => {
       expect(() => new DurableAgentGenerationReader(trusted, faults).readExact(f.expected)).toThrow();
       expect(tree(trusted)).toEqual(attack === 'before-open-race' ? racedTree : before);
     });
+});
+
+describe('DurableAgentGenerationAuthority admission', () => {
+  it('survives process-local reset, advances sequentially, and returns an older exact action', async () => {
+    const first = new DurableAgentGenerationAuthority(trusted);
+    expect(await first.admit('agent-1', 'action-1')).toMatchObject({ generation: 1, existing: false });
+    await first.persist(selected(1, 'action-1'), 'action-1');
+    const restarted = new DurableAgentGenerationAuthority(trusted);
+    expect(await restarted.admit('agent-1', 'action-2')).toMatchObject({ generation: 2, existing: false });
+    await restarted.persist(selected(2, 'action-2'), 'action-2');
+    expect(await new DurableAgentGenerationAuthority(trusted).admit('agent-1', 'action-1'))
+      .toMatchObject({ generation: 1, existing: true });
+  });
+
+  it('lets different actions race on one proposal, then a clean loser retry advances', async () => {
+    const authority = new DurableAgentGenerationAuthority(trusted);
+    const [left, right] = await Promise.all([
+      authority.admit('agent-1', 'left'), authority.admit('agent-1', 'right'),
+    ]);
+    expect(left.generation).toBe(1); expect(right.generation).toBe(1);
+    const settled = await Promise.allSettled([
+      authority.persist(selected(1, 'left'), 'left'),
+      authority.persist(selected(1, 'right'), 'right'),
+    ]);
+    expect(settled.filter(value => value.status === 'fulfilled')).toHaveLength(1);
+    const loser = settled[0]!.status === 'rejected' ? 'left' : 'right';
+    expect(settled.find(value => value.status === 'rejected')).toMatchObject({
+      reason: expect.objectContaining({ code: 'generation_conflict' }),
+    });
+    const retry = new DurableAgentGenerationAuthority(trusted);
+    expect(await retry.admit('agent-1', loser)).toMatchObject({ generation: 2, existing: false });
+    await expect(retry.persist(selected(2, loser), loser)).resolves.toBeDefined();
+  });
 });
