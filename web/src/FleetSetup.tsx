@@ -104,10 +104,10 @@ function Defaults({ model, catalogs, advanced, update }: { model: Model; catalog
     else delete draft.defaults.harness_options.effort;
   });
   return <><h3>1. Choose how agents run</h3><p className="muted">This becomes the starting point for every agent. Existing sessions are not restarted by saving.</p>
-    <div className="decision-note"><strong>Recommended default</strong><span>ACP gives structured activity; tmux gives a terminal. Pick an exact catalog model, or let the harness resolve its default when a new session launches.</span></div>
+    <div className="decision-note"><strong>Session model</strong><span>ACP gives structured activity through the selected harness adapter. Pick an exact catalog model, or let the harness resolve its default when a new session launches.</span></div>
     <div className="form-grid three">
       <label>Harness<select value={harness} onChange={event => field('harness', event.target.value)}><option value="codex">Codex</option><option value="claude-code">Claude Code</option></select></label>
-      <label>Session<select value={defaults.session ?? 'tmux'} onChange={event => field('session', event.target.value)}><option value="acp">ACP</option><option value="tmux">tmux</option></select></label>
+      <label>Session<select value={defaults.session ?? 'acp'} onChange={event => field('session', event.target.value)}><option value="acp">ACP</option></select></label>
       <label>Model<select aria-label="Fleet model" value={selected?.id ?? ''} onChange={event => { field('model', event.target.value); const next = options.find(option => option.id === event.target.value); setEffort(next?.defaultReasoningEffort ?? ''); }}>
         <option value="">Use harness default (resolved at launch)</option>{options.map(option => <option value={option.id} key={option.id}>{option.label} — {option.id}</option>)}</select></label>
       <label>Reasoning effort<select aria-label="Fleet reasoning effort" value={effort ?? ''} onChange={event => setEffort(event.target.value)}><option value="">Model default</option>{(selected?.reasoningEfforts ?? []).map(value => <option key={value}>{value}</option>)}</select></label>

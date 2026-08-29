@@ -98,14 +98,8 @@ export interface RoleCapabilities {
   inventory: true;
   status: true;
   output: { recent: boolean; stream: boolean; structured: boolean; replayCursor: boolean };
-  input: { text: boolean; rawKeys: boolean; interrupt: boolean; steering: boolean };
+  input: { text: boolean; interrupt: boolean; steering: boolean };
   permissions: { observe: boolean; respond: boolean };
-  terminal: {
-    available: boolean;
-    reason?: 'wrong_backend' | 'pty_unavailable' | 'offline' | 'incompatible_runner';
-    multiViewer: boolean;
-    writerLease: boolean;
-  };
   lifecycle: {
     start: boolean; stop: boolean; restartResume: boolean; restartFresh: boolean; remove: boolean;
   };

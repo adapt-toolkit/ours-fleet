@@ -1152,7 +1152,7 @@ describe('role control failures are typed', () => {
 // `mcpServers` was hard-coded to `[]` on new, resume and load, and `_meta` was
 // never sent at all — so a role's own MCP servers had no route to an ACP session,
 // and the `--settings` overlay that carries `harness_options.plugins` had none
-// either (buildAcpLaunch cannot carry `prep.argv`). These assert the wire, not
+// either (the adapter owns the launched argv). These assert the wire, not
 // the adapter: the fixture echoes back the params it was actually given.
 describe('session/new carries the role\'s declared servers and agent options', () => {
   const params = async (over: Partial<Parameters<typeof AcpSession.start>[0]> = {}) => {

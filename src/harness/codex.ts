@@ -5,7 +5,7 @@ import { agentDir, home } from '../paths.js';
 import { realExec, type Exec } from '../exec.js';
 import type { ResolvedRole } from '../config.js';
 import type {
-  AcpLaunch, HarnessAdapter, RoleDirs, SessionPrep, SessionState, Launch, ValidationError,
+  AcpLaunch, HarnessAdapter, RoleDirs, SessionPrep, ValidationError,
   UnattendedCapability,
 } from './types.js';
 import { registerAdapter } from './registry.js';
@@ -13,6 +13,8 @@ import { harnessRuntimeDir } from '../isolation/policy.js';
 import {
   resolveBundledAcpAgent, type AcpAgentResolution,
 } from './acp-agent.js';
+import { CodexAgentSessionAdapter } from './codex-session.js';
+import type { AcpSessionTransport } from './acp-session-transport.js';
 
 interface CodexOptions {
   launcher?: string;
@@ -140,6 +142,25 @@ function bundledCodexAcp() {
   return resolveBundledAcpAgent(CODEX_ACP_PACKAGE, 'codex-acp', 'codex-acp');
 }
 
+function codexAgentLaunch(role: ResolvedRole, prep: SessionPrep): AcpLaunch {
+  const configured = role.session_options?.acp?.command;
+  const resolved = configured == null
+    ? codexAcpLaunchForResolution(bundledCodexAcp())
+    : undefined;
+  const argv = Array.isArray(configured)
+    ? [...configured]
+    : typeof configured === 'string'
+      ? ['sh', '-c', configured]
+      : resolved!.argv;
+  const initialMode = acpAgentMode(role);
+  return {
+    argv,
+    env: initialMode ? { ...prep.env, INITIAL_AGENT_MODE: initialMode } : prep.env,
+    ...(resolved?.permissionMetadataSource
+      ? { permissionMetadataSource: resolved.permissionMetadataSource } : {}),
+  };
+}
+
 /** Bind launch argv and metadata provenance to one already-completed resolution. */
 export function codexAcpLaunchForResolution(
   resolution: AcpAgentResolution,
@@ -246,9 +267,25 @@ function hasInstalledOursPlugin(output: string): boolean {
   } catch { return false; }
 }
 
-export function makeCodexAdapter(exec: Exec = realExec): HarnessAdapter {
+export function makeCodexAdapter(
+  exec: Exec = realExec, transport?: AcpSessionTransport,
+): HarnessAdapter {
   return {
     id: 'codex',
+    agentSession: new CodexAgentSessionAdapter({
+      prepareLaunch(role, prep) {
+        const launch = codexAgentLaunch(role, prep);
+        const { permissionMetadataSource, ...neutral } = launch;
+        return {
+          ...neutral,
+          ...(permissionMetadataSource
+            ? { adapterState: { permissionMetadataSource } } : {}),
+        };
+      },
+      permissionModeId: role => acpAgentMode(role),
+      mcpServers: () => undefined,
+      sessionMeta: () => undefined,
+    }, transport),
     supportsResume: true,
 
     async checkPrereqs() {
@@ -328,60 +365,14 @@ export function makeCodexAdapter(exec: Exec = realExec): HarnessAdapter {
       // Only a role that declares `isolation:` gets a sandbox, and only a
       // sandbox needs this directory to exist before entry.
       if (role.isolation) mkdirSync(harnessRuntimeDir(dirs.stateDir, 'codex'), { recursive: true });
-      const requested = launcherMode(role);
-      const hasOursCodex = await commandAvailable('ours-codex', exec);
-      if (requested === 'ours-codex' && !hasOursCodex)
-        throw new Error('harness_options.launcher is ours-codex, but ours-codex is not on PATH; install @ours.network/codex or use launcher: auto');
-      const command = requested === 'codex' ? 'codex' : hasOursCodex ? 'ours-codex' : 'codex';
       return {
-        argv: [],
         // OURS_BIND_IDENTITY is the connector's startup bind seed — see the note in
         // claude-code.ts's prepareSession. It belongs on EVERY harness that runs a
         // role with an ours identity, not just claude-code: a seed that works on one
         // harness and silently does nothing on the other is the same class of defect
         // as a config key that only works on one session type.
         env: { OURS_BIND_IDENTITY: role.identity, ...codexAcpEnvironment(role, dirs) },
-        command,
       };
-    },
-
-    buildLaunch(role: ResolvedRole, mode: 'fresh' | 'resume', _s: SessionState, prep: SessionPrep): Launch {
-      const stateDir = roleStateDir(role);
-      const flags = commonFlags(role);
-      const command = prep.command ?? 'codex';
-      const argv = mode === 'fresh'
-        ? [command, ...flags, ...prep.argv, `Read and follow ${join(stateDir, 'briefing.md')} now.`]
-        : [command, 'resume', '--last', ...flags, ...prep.argv,
-            this.vocabulary.restartPrompt(role.identity, join(stateDir, 'WORKLOG.md'), role)];
-      return { argv, env: prep.env };
-    },
-
-    buildAcpLaunch(role: ResolvedRole, prep: SessionPrep): AcpLaunch {
-      const configured = role.session_options?.acp?.command;
-      // Resolve once: both argv and permission-metadata provenance must describe
-      // the same artifact. A bare PATH fallback is launchable for compatibility,
-      // but is never authenticated for protected-MCP auto-approval.
-      const resolved = configured == null
-        ? codexAcpLaunchForResolution(bundledCodexAcp())
-        : undefined;
-      const argv = Array.isArray(configured)
-        ? [...configured]
-        : typeof configured === 'string'
-          ? ['sh', '-c', configured]
-          : resolved!.argv;
-      const initialMode = acpAgentMode(role);
-      return {
-        argv,
-        env: initialMode ? { ...prep.env, INITIAL_AGENT_MODE: initialMode } : prep.env,
-        ...(resolved?.permissionMetadataSource
-          ? { permissionMetadataSource: resolved.permissionMetadataSource } : {}),
-      };
-    },
-
-    // INITIAL_AGENT_MODE covers session/new in codex-acp; session/set_mode
-    // keeps resumed/loaded sessions and live status on the identical mode.
-    acpPermissionModeId(role: ResolvedRole): string | undefined {
-      return acpAgentMode(role);
     },
 
     isolationPaths(role: ResolvedRole, _dirs: RoleDirs) {
@@ -534,7 +525,7 @@ export function makeCodexAdapter(exec: Exec = realExec): HarnessAdapter {
 
 // The adapter needs the state dir for briefing/worklog paths in launch prompts.
 // Roles' state dirs are canonical: agentDir(name) — temp roles carry their dir in cwd handling
-// by the runner, which passes dirs to prepareSession; buildLaunch derives from the same rule.
+// by the runner, which passes dirs to prepareSession.
 function roleStateDir(role: ResolvedRole): string {
   // Temp roles are marked by the runner via a private field to keep the interface small.
   const temp = (role as ResolvedRole & { __temp?: boolean }).__temp === true;

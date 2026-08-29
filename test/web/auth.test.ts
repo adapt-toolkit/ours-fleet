@@ -47,9 +47,9 @@ describe('browser auth and trusted devices', () => {
     const authenticated = request({
       host, origin, cookie: `ofs_session=${session.id}`, 'x-csrf-token': session.csrf,
     });
-    const { ticket } = auth.mintTicket(authenticated, 'terminal', 'Alpha');
-    expect(auth.consumeTicket(authenticated, ticket, 'terminal', 'Alpha').id).toBe(session.id);
-    expect(() => auth.consumeTicket(authenticated, ticket, 'terminal', 'Alpha'))
+    const { ticket } = auth.mintTicket(authenticated, 'conversation', 'Alpha');
+    expect(auth.consumeTicket(authenticated, ticket, 'conversation', 'Alpha').id).toBe(session.id);
+    expect(() => auth.consumeTicket(authenticated, ticket, 'conversation', 'Alpha'))
       .toThrow(/already used/);
   });
 

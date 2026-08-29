@@ -12,7 +12,7 @@ export interface ManagedFleetSpawnResult {
   lifetime: 'permanent' | 'temporary';
   statePath: string;
   harness: string;
-  session: 'tmux' | 'acp';
+  session: 'acp';
   model?: string;
   monitor: Pick<MonitorConfig, 'mode' | 'interrupt'>;
   /** Adapter-resolved portable policy and exact native runtime mode. */

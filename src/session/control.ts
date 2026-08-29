@@ -4,7 +4,7 @@ import { createConnection, createServer, type Server, type Socket } from 'node:n
 import { join } from 'node:path';
 
 import { SessionControlError } from './types.js';
-import type { ControlFailureKind, SessionEvent, SessionHandle, SessionSnapshot } from './types.js';
+import type { AgentSession, ControlFailureKind, SessionEvent, SessionSnapshot } from './types.js';
 import type {
   OwnerChannelHandle, OwnerChannelManagementRequest,
 } from '../owner-channel/channel.js';
@@ -74,7 +74,7 @@ export interface RetainedEventPage {
 }
 
 /** The one retained-range projection shared by polling and live-follow admission. */
-export function retainedEventPage(session: SessionHandle, since: number): RetainedEventPage {
+export function retainedEventPage(session: AgentSession, since: number): RetainedEventPage {
   const events = session.eventsSince(since);
   const all = session.eventsSince(0);
   return {
@@ -215,7 +215,7 @@ export class RoleControlServer {
 
   constructor(
     stateDir: string,
-    private readonly session: SessionHandle,
+    private readonly session: AgentSession,
     private readonly log: (line: string) => void,
   ) {
     this.socketPath = controlSocketPath(stateDir);

@@ -48,7 +48,7 @@ roles:
     session: acp
     env: { SECRET: never-return-this }
   Permanent:
-    session: tmux
+    session: acp
 `);
     mkdirSync(join(root, '.ours-fleet', 'agents', 'Permanent'));
     mkdirSync(join(root, '.ours-fleet', 'agents', 'Orphan'));
@@ -62,9 +62,7 @@ identity: Temp
     writeFileSync(join(root, '.ours-fleet', 'tmp', 'Broken', 'role.yaml'), '[');
     const repo = new RoleRepository({
       configPath: join(root, 'fleet.yaml'),
-      probeBackend: async (_name, intended) => ({
-        acp: intended === 'acp', tmux: intended === 'tmux',
-      }),
+      probeBackend: async (_name, intended) => ({ acp: intended === 'acp' }),
     });
     const roles = await repo.list();
     expect(roles.map(role => role.id)).toEqual(['Broken', 'ConfigOnly', 'Orphan', 'Permanent', 'Temp']);
@@ -87,25 +85,24 @@ identity: Temp
   it('computes capabilities from evidence and optional PTY availability', () => {
     const caps = roleCapabilities({
       id: 'A', lifetime: 'permanent', configured: true, stateHealth: 'present',
-      configuredBackend: 'tmux', detectedBackend: 'tmux',
+      configuredBackend: 'acp', detectedBackend: 'acp',
       compatibility: { compatible: true }, problems: [],
     }, {
       roleId: 'A', observedAt: new Date().toISOString(), overall: 'ready',
       supervisor: { backend: 'none', liveness: 'running', detail: 'running' },
-      session: { backend: 'tmux', reachability: 'online', readiness: 'idle', evidence: 'inferred' },
+      session: { backend: 'acp', reachability: 'online', readiness: 'idle', evidence: 'authoritative' },
       restart: { circuit: 'closed', consecutiveImmediateFailures: 0, nextDelayMs: 0 },
       monitor: { mode: 'unknown', health: 'unknown', stale: true },
       isolation: { degraded: false }, problems: [],
-    }, { terminalPtyAvailable: false });
+    });
     expect(caps.input.text).toBe(true);
-    expect(caps.terminal).toMatchObject({ available: false, reason: 'pty_unavailable' });
   });
 
   for (const flow of [
     { lifetime: 'permanent', session: 'acp', harness: 'codex', check: false, probe: 'ready' },
-    { lifetime: 'permanent', session: 'tmux', harness: 'claude-code', check: false, probe: 'attention' },
+    { lifetime: 'permanent', session: 'acp', harness: 'claude-code', check: false, probe: 'attention' },
     { lifetime: 'temporary', session: 'acp', harness: 'claude-code', check: false, probe: 'ready' },
-    { lifetime: 'temporary', session: 'tmux', harness: 'codex', check: 'unknown', probe: 'attention' },
+    { lifetime: 'temporary', session: 'acp', harness: 'codex', check: 'unknown', probe: 'attention' },
   ] as const) {
     it(`creates ${flow.lifetime} ${flow.harness}/${flow.session} with honest ${String(flow.check)} identity evidence`, async () => {
       const root = fixture();
@@ -284,7 +281,7 @@ roles: {}
     });
     const base = {
       name: 'ClaudeBlank', harness: 'claude-code' as const, model: null,
-      session: 'tmux' as const, lifetime: 'temporary' as const, openAfterCreate: true,
+      session: 'acp' as const, lifetime: 'temporary' as const, openAfterCreate: true,
       permissions: {
         approval: 'ask' as const, filesystem: 'workspace' as const, unattended: 'deny' as const,
       },

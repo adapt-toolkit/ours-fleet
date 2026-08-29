@@ -50,11 +50,11 @@ describe('managed fleet spawn defaults', () => {
 
   it('preserves explicit overrides and does not copy a model across harnesses', () => {
     const result = inheritCallerSpawnDefaults(caller, {
-      name: 'ClaudeWorker', harness: 'claude-code', session: 'tmux', cwd: '/other',
+      name: 'ClaudeWorker', harness: 'claude-code', session: 'acp', cwd: '/other',
       approval: 'ask', model: 'claude-explicit',
     }, undefined);
     expect(result.options).toMatchObject({
-      harness: 'claude-code', session: 'tmux', cwd: '/other', approval: 'ask',
+      harness: 'claude-code', session: 'acp', cwd: '/other', approval: 'ask',
       model: 'claude-explicit', coordinator: 'Coordinator',
     });
     expect(result.inherited).not.toEqual(expect.arrayContaining([

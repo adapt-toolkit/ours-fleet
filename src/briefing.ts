@@ -208,9 +208,6 @@ export function generateBriefing(role: ResolvedRole, v: BriefingVocab, opts: Bri
     L.push(`7. Await messages. When the monitor wakes you (or the owner requests a manual check),`);
     L.push(`   call **${v.getMessagesTool}**, act on them,`);
     L.push(`   and reply with ${v.sendTool}. No coordinator is configured — the owner drives you`);
-    // NOT `tmux attach -t <name>`: each role's pane lives on its own tmux
-    // socket (#32), so a bare attach finds no server. `ours-fleet attach`
-    // addresses the right one.
     L.push(`   via \`ours-fleet attach ${role.name}\` or by messaging "${id}".`);
   }
 
@@ -238,7 +235,7 @@ export function generateBriefing(role: ResolvedRole, v: BriefingVocab, opts: Bri
     L.push('idle or stalled from `readiness=idle` alone.');
     L.push('');
     L.push('Then judge the console content: stuck on a prompt/menu/trust dialog → answer it directly');
-    L.push('with `ours-fleet send <Name> "<text>"` (or `--key <K>` for raw keys); idle with work');
+    L.push('with `ours-fleet send <Name> "<text>"`; idle with work');
     L.push('assigned → nudge; actively working → do nothing, and do not mistake a long turn for a');
     L.push('stall. Escalate over ours messaging only when you cannot resolve it yourself.');
   }

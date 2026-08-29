@@ -4,14 +4,13 @@ import { resolve } from 'node:path';
 import { loadConfig, type FleetConfig } from '../config.js';
 import { RoleRepository } from '../application/role-repository.js';
 import { FleetQueryService } from '../application/fleet-query-service.js';
-import { AcpRoleSessionAdapter, TmuxRoleSessionAdapter } from '../application/session-control.js';
+import { AcpRoleSessionAdapter } from '../application/session-control.js';
 import { StructuredLogService } from '../application/log-service.js';
 import { RoleCommandService } from '../application/role-command-service.js';
 import { RoleCreationService } from '../application/role-creation-service.js';
 import { RoleRemovalService } from '../application/role-removal-service.js';
 import { FleetError } from '../application/errors.js';
 import { controlRequest, controlSocketPath } from '../session/control.js';
-import { Tmux } from '../tmux.js';
 import { pickBackend } from '../supervisor/index.js';
 import { realExec } from '../exec.js';
 import { home, stateRoot } from '../paths.js';
@@ -23,7 +22,6 @@ import { mergeTopology } from './topology-model.js';
 import { TopologyDraftStore } from './topology-draft-store.js';
 import { TopologyPromoteService } from './topology-promote.js';
 import { doctor } from '../doctor.js';
-import { TerminalBridgeManager } from './terminal/bridge.js';
 import { acquireWebServerLock } from './lock.js';
 import { TrustedDeviceStore } from './device-store.js';
 import { WebAuth } from './auth.js';
@@ -84,7 +82,6 @@ export async function startWebConsole(options: StartWebOptions): Promise<Running
     Date.now, new TrustedDeviceStore(webDir),
     access,
   );
-  const tmux = new Tmux();
   const backend = pickBackend();
   const repository = new RoleRepository({
     configPath: options.configPath,
@@ -97,13 +94,11 @@ export async function startWebConsole(options: StartWebOptions): Promise<Running
         try { acp = (await controlRequest(dir, { command: 'snapshot' }, 500)).ok; }
         catch { /* stale socket is evidence, not reachability */ }
       }
-      return { acp, tmux: await tmux.has(name).catch(() => false) };
+      return { acp };
     },
   });
   const events = new FleetEventBus();
   const audit = new AuditSink();
-  const terminals = new TerminalBridgeManager({ repository, audit, tmux });
-  const terminalAvailable = await terminals.available();
   const watchdogConfigProvider = cachedConfigProvider(options.configPath);
   const log = options.log ?? (() => {});
   let loggedWatchdogFindingsError = false;
@@ -127,8 +122,8 @@ export async function startWebConsole(options: StartWebOptions): Promise<Running
     }
   }, CONFIG_CACHE_TTL_MS);
   const query = new FleetQueryService({
-    repository, supervisor: backend, tmux,
-    capabilityContext: { terminalPtyAvailable: terminalAvailable },
+    repository, supervisor: backend,
+    capabilityContext: {},
     watchdogFindings,
   });
   const ops = { backend, binPath: options.binPath, log };
@@ -181,9 +176,6 @@ export async function startWebConsole(options: StartWebOptions): Promise<Running
     query, repository, logs, commands, creation, removal, audit, events, watchdogs, configuration,
     taskRooms: new TaskRoomApplicationService(options.configPath),
     topology: readTopology, topologyDrafts, topologyPromote,
-    terminalUpgrade: terminalAvailable
-      ? async (socket, _request, roleId, _ticket, hello) => terminals.connect(socket, roleId, hello)
-      : undefined,
     async session(roleId) {
       const role = await repository.get(roleId);
       if (!role) throw new FleetError('role_not_found', `no such role '${roleId}'`);
@@ -192,8 +184,6 @@ export async function startWebConsole(options: StartWebOptions): Promise<Running
         if (!dir) throw new FleetError('control_unavailable', 'role state directory is unavailable');
         return new AcpRoleSessionAdapter(dir);
       }
-      if (role.configuredBackend === 'tmux' || role.detectedBackend === 'tmux')
-        return new TmuxRoleSessionAdapter(roleId, tmux);
       throw new FleetError('capability_unavailable', 'role session backend is unavailable');
     },
     }, { origin: `http://127.0.0.1:${requestedPort}`, host: `127.0.0.1:${requestedPort}` }, { auth });
@@ -237,7 +227,7 @@ export async function startWebConsole(options: StartWebOptions): Promise<Running
   return {
     ...server, address: browserOrigin,
     async close() {
-      try { await control.close(); await terminals.close(); await server.close(); }
+      try { await control.close(); await server.close(); }
       finally { lock.release(); }
     },
   };

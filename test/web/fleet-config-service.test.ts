@@ -100,7 +100,7 @@ describe('safe web fleet configuration service', () => {
       '',
       'defaults:',
       '  harness: claude-code        # adapter for roles without their own',
-      '  session: tmux               # tmux (default) | acp',
+      '  session: acp                # only supported session',
       '',
       'roles:',
       '',
@@ -125,7 +125,7 @@ describe('safe web fleet configuration service', () => {
     expect(saved).toContain('#   ours-fleet up            create/start every role');
     expect(saved).toContain('  # Coordinator routes work to the others.');
     expect(saved).toContain('  harness: claude-code        # adapter for roles without their own');
-    expect(saved).toContain('  session: tmux               # tmux (default) | acp');
+    expect(saved).toContain('  session: acp                # only supported session');
     expect(saved).toContain('    cwd: ${work_root}/alpha');
     expect(saved).toContain('mission: Ship even more safely');
     // Exactly one line changed anywhere in the file.

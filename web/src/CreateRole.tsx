@@ -4,7 +4,7 @@ import { useLivePoll } from './use-live-poll';
 
 type Form = {
   name: string; harness: 'codex' | 'claude-code'; model: string; reasoningEffort: string;
-  session: 'acp' | 'tmux'; cwd: string; lifetime: 'permanent' | 'temporary';
+  session: 'acp'; cwd: string; lifetime: 'permanent' | 'temporary';
   mission: string; coordinator: string; approval: 'ask' | 'auto' | 'allow';
   filesystem: 'read-only' | 'workspace' | 'unrestricted'; unattended: 'deny' | 'wait';
   bio: string; persona: string; highRiskAcknowledged: boolean; openAfterCreate: boolean;
@@ -130,7 +130,7 @@ export function CreateRole({ onClose, onCreated }: {
         </div></fieldset>
         <fieldset><legend>Runtime</legend><div className="form-grid">
           <label>Harness<select value={form.harness} onChange={e => change('harness', e.target.value as Form['harness'])}><option value="codex">Codex</option><option value="claude-code">Claude Code</option></select></label>
-          <label>Session<select value={form.session} onChange={e => change('session', e.target.value as Form['session'])}><option value="acp">ACP activity</option><option value="tmux">tmux terminal</option></select></label>
+          <label>Session<select value={form.session} onChange={e => change('session', e.target.value as Form['session'])}><option value="acp">ACP activity</option></select></label>
           <label>Model<select aria-label="Known model" value={modelChoices[form.harness].some(model => model.id === form.model) ? form.model : ''}
             onChange={e => { const selected = modelChoices[form.harness].find(model => model.id === e.target.value); change('model', e.target.value); change('reasoningEffort', selected?.defaultReasoningEffort ?? ''); }}>
             <option value="">Use harness default (resolved after launch)</option>

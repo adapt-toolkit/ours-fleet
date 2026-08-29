@@ -203,7 +203,7 @@ describe('ours-fleet CLI', () => {
     const r = await run(['doctor']);
     expect([0, 1]).toContain(r.code);
     expect(r.stdout).toContain('node');
-    expect(r.stdout).toContain('tmux');
+    expect(r.stdout).toContain('ours daemon');
   });
 
   it('config errors cleanly on a missing explicit file', async () => {
@@ -555,7 +555,7 @@ describe('ours-fleet CLI', () => {
     expect(doc.code).toBe(1);                        // must not read green
     expect(doc.stdout).toContain('unknown key(s) harnes');   // same actionable cause
     expect(doc.stdout).toContain('node');            // host checks still ran
-    expect(doc.stdout).toContain('tmux');
+    expect(doc.stdout).toContain('ours daemon');
     expect(doc.stdout).toMatch(/claude-code: /);     // AI CLI checks did not disappear
     expect(doc.stdout).toMatch(/MISS roles\s+unknown/);
   });

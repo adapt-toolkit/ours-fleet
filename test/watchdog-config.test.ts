@@ -21,7 +21,7 @@ describe('watchdogs config', () => {
     expect(wd).toMatchObject({
       name: 'nightwatch', coordinator: 'FleetCoordinator', enabled: true,
       intervalMs: 600_000, watch: ['Alice', 'Docs'], harness: 'claude-code',
-      session: 'tmux', identity: 'Watchdog-nightwatch',
+      session: 'acp', identity: 'Watchdog-nightwatch',
       timeoutMs: 300_000, keepReports: 50, alertCooldownMs: 3_600_000,
     });
     expect(wd.promptFile).toBeUndefined();

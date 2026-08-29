@@ -77,7 +77,7 @@ describe('packed root package', () => {
         const stateDir = join(process.cwd(), 'state');
         mkdirSync(stateDir);
         const prep = await adapter.prepareSession(role, { stateDir, runCwd: process.cwd() });
-        const launch = adapter.buildAcpLaunch(role, prep);
+        const launch = adapter.agentSession.prepareLaunch(role, prep);
         const claim = adapter.effectivePermissions(role);
         process.stdout.write(JSON.stringify({
           version: codex.version,
@@ -147,7 +147,7 @@ describe('packed root package', () => {
           session: 'acp',
           permissions: { approval: 'allow', filesystem: 'workspace', unattended: 'wait' },
         };
-        const launch = adapter.buildAcpLaunch(role, { argv: [], env: {} });
+        const launch = adapter.agentSession.prepareLaunch(role, { env: {} });
         process.stdout.write(JSON.stringify({
           bundledPresent: existsSync(codexRoot),
           argv: launch.argv,

@@ -24,7 +24,7 @@ import type {
   ConversationHandlePage, ExitRecord, InterruptOutcome, PermissionDecision, PromptDelivery,
   QueuedPrompt,
   SessionEvent,
-  RuntimeSelectorMetadata, SessionHandle, SessionSnapshot, SubmitPromptOptions,
+  AgentSession, RuntimeSelectorMetadata, SessionSnapshot, SubmitPromptOptions,
   TurnCancellationSource, TurnOutcome,
   TurnResult,
 } from './types.js';
@@ -296,7 +296,7 @@ export function classifyStopReason(stopReason: string | undefined): TurnOutcome 
  * Persistent ACP v1 client. It is the sole owner of the agent's stdio; all
  * human/automation attachment happens through the fleet role-control protocol.
  */
-export class AcpSession implements SessionHandle {
+export class AcpSession implements AgentSession {
   readonly backend = 'acp' as const;
   readonly pid: number;
 
@@ -384,8 +384,7 @@ export class AcpSession implements SessionHandle {
       if (this.cancelForceKill) clearTimeout(this.cancelForceKill);
       this.cancelForceKill = undefined;
       this.releaseSteeringOccupancy('adapter exited');
-      // Record the child's real exit code/signal. The tmux path can only see a
-      // shell's `$?`; here the truth is available, so keep it.
+      // Record the child's real exit code/signal while the truth is available.
       const classified = classifyChildExit(code, signal);
       this.exit = this.cancelRecoveryReason
         ? { ...classified, detail: `${this.cancelRecoveryReason}; ${classified.detail}` }
@@ -1621,7 +1620,7 @@ export class AcpSession implements SessionHandle {
     });
   }
 
-  // ── conversation ledger access (SessionHandle) ─────────────────────────────
+  // ── conversation ledger access (AgentSession) ─────────────────────────────
 
   conversationPage(request: { after?: string; limit?: number } = {}): ConversationHandlePage {
     const floor = Number(this.conversationStartCursor ?? 0);

@@ -23,7 +23,7 @@ const COMMENTED = [
   '',
   'defaults:',
   '  harness: claude-code        # adapter for roles that do not set their own',
-  '  session: tmux',
+  '  session: acp',
   '',
   'roles:',
   '',

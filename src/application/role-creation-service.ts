@@ -32,7 +32,7 @@ export interface CreateRoleSessionRequest {
   /** null means the selected harness's own default; web blank fields send null. */
   model?: string | null;
   reasoningEffort?: string | null;
-  session: 'acp' | 'tmux';
+  session: 'acp';
   cwd?: string;
   lifetime: 'permanent' | 'temporary';
   mission?: string;
@@ -59,7 +59,7 @@ export interface CreationCapabilities {
   reasons: string[];
   harnesses: Array<{
     id: 'codex' | 'claude-code'; available: boolean;
-    sessions: Array<'acp' | 'tmux'>; defaultModel?: string; models: string[];
+    sessions: Array<'acp'>; defaultModel?: string; models: string[];
     modelOptions: HarnessModelOption[]; catalogSource: string; customModelAllowed: true;
     warnings: string[];
   }>;
@@ -84,7 +84,7 @@ export type IdentityPreflight = 'verified' | 'missing' | 'unknown';
 export interface CreationPreview {
   request: CreateRoleSessionRequest;
   effective: {
-    name: string; identity: string; harness: string; session: 'acp' | 'tmux';
+    name: string; identity: string; harness: string; session: 'acp';
     model?: string; reasoningEffort?: string; cwd?: string; lifetime: 'permanent' | 'temporary';
     permissions: CommonPermissions;
     monitor: MonitorConfig;
@@ -112,7 +112,7 @@ export interface CreationAction {
   actionId: string;
   requestHash: string;
   roleId: string;
-  session: 'acp' | 'tmux';
+  session: 'acp';
   lifetime: 'permanent' | 'temporary';
   state: CreationStage;
   stages: Array<{ stage: CreationStage; at: string; detail?: string }>;
@@ -135,7 +135,7 @@ export interface RoleCreationServiceOptions {
   tempLauncher?: SupervisorLauncher;
   allowedCwdRoots?: string[];
   journalDir?: string;
-  probeReady?: (name: string, session: 'acp' | 'tmux') => Promise<'ready' | 'attention' | 'unknown'>;
+  probeReady?: (name: string, session: 'acp') => Promise<'ready' | 'attention' | 'unknown'>;
   onProgress?: (action: CreationAction) => void;
   modelCatalogs?: Partial<Record<'codex' | 'claude-code', () => HarnessModelCatalog>>;
   /** Direct/managed callers must not create or restore the web action journal. */
@@ -250,13 +250,13 @@ export class RoleCreationService {
       reasons,
       harnesses: [
         {
-          id: 'codex', available: true, sessions: ['acp', 'tmux'],
+          id: 'codex', available: true, sessions: ['acp'],
           defaultModel: resolveRoleModel(undefined, 'codex', defaults),
           ...codexModels, catalogSource: 'codex-runtime-catalog', customModelAllowed: true,
           warnings: codexCatalog.warnings,
         },
         {
-          id: 'claude-code', available: true, sessions: ['acp', 'tmux'],
+          id: 'claude-code', available: true, sessions: ['acp'],
           defaultModel: resolveRoleModel(undefined, 'claude-code', defaults),
           ...claudeModels, catalogSource: 'claude-adapter-2.1', customModelAllowed: true,
           warnings: claudeCatalog.warnings,
@@ -291,7 +291,7 @@ export class RoleCreationService {
     const effective = {
       name: request.name, identity: request.name,
       harness: request.harness ?? (defaults.harness as string | undefined) ?? 'claude-code',
-      session: request.session ?? (defaults.session as 'acp' | 'tmux' | undefined) ?? 'tmux',
+      session: request.session ?? (defaults.session as 'acp' | undefined) ?? 'acp',
       model: resolveRoleModel(request.model, request.harness, defaults),
       reasoningEffort: request.reasoningEffort ?? undefined,
       cwd, lifetime: request.lifetime,
@@ -419,9 +419,7 @@ export class RoleCreationService {
       this.stage(action, 'waiting_for_session');
       const ready = await this.waitForReady(action.roleId, action.session);
       if (ready === 'ready') {
-        action.openPath = action.session === 'acp'
-          ? `/roles/${encodeURIComponent(action.roleId)}/activity`
-          : `/roles/${encodeURIComponent(action.roleId)}/terminal`;
+        action.openPath = `/roles/${encodeURIComponent(action.roleId)}/activity`;
         this.stage(
           action, 'session_reachable',
           'session is reachable; identity binding has no structured evidence in this version',
@@ -448,7 +446,7 @@ export class RoleCreationService {
   }
 
   private async waitForReady(
-    role: string, session: 'acp' | 'tmux',
+    role: string, session: 'acp',
   ): Promise<'ready' | 'attention' | 'unknown'> {
     if (!this.options.probeReady) return 'unknown';
     for (let attempt = 0; attempt < 20; attempt++) {
@@ -473,7 +471,7 @@ export class RoleCreationService {
     if (!ROLE_NAME_RE.test(input.name)) throw new FleetError('invalid_request', 'invalid role name');
     if (!['codex', 'claude-code'].includes(input.harness))
       throw new FleetError('invalid_request', 'unsupported harness');
-    if (!['acp', 'tmux'].includes(input.session))
+    if (input.session !== 'acp')
       throw new FleetError('invalid_request', 'unsupported session backend');
     if (!['permanent', 'temporary'].includes(input.lifetime))
       throw new FleetError('invalid_request', 'unsupported lifetime');

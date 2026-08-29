@@ -7,7 +7,7 @@ import { classifyFailureText, type FailureEvidence } from './model-recovery.js';
 // ─── The supervisor-owned message monitor ───────────────────────────────────
 //
 // An in-process long-poll client of the ours daemon notification API, hosted by
-// the per-role runner (`runOnce`). It primes at the stream tip BEFORE the tmux
+// the per-role runner (`runOnce`). It primes at the stream tip BEFORE the agent
 // session launches (zero deaf gap), then streams content-free arrival events,
 // filters them by the role's wake_sources, coalesces a burst, and injects a
 // single `[fleet-monitor] …` line into the console. Failures are written to
@@ -36,16 +36,8 @@ export type FetchLike = (
   url: string, init?: { headers?: Record<string, string>; signal?: AbortSignal },
 ) => Promise<FetchResponse>;
 
-export interface MonitorTmux {
-  has(name: string): Promise<boolean>;
-  capture(name: string, lines?: number): Promise<string>;
-  sendText(name: string, text: string): Promise<void>;
-  sendKey(name: string, key: string): Promise<void>;
-}
-
 export interface MonitorDeps {
   fetch: FetchLike;
-  tmux: MonitorTmux;
   isAlive(pid: number): boolean;
   sleep(ms: number): Promise<void>;
   now(): number;
@@ -56,7 +48,7 @@ export interface MonitorDeps {
     clear(t: ReturnType<typeof setTimeout>): void;
   };
   /**
-   * Structured prompt delivery used by ACP sessions. Tmux remains the fallback.
+   * Structured prompt delivery used by agent sessions.
    * `succeeded` is the turn's TERMINAL result, not merely that the session took
    * the prompt: a refused or cancelled wake was seen and not acted on, and must
    * not commit the cursor.
@@ -636,7 +628,11 @@ export class Monitor {
 
   private async deliver(pid: number, batch: NotifyEvent[]): Promise<boolean> {
     const line = formatNotificationLine(batch);
-    if (this.deps.delivery) {
+    if (!this.deps.delivery) {
+      this.degrade('delivery', 'structured agent-session delivery is unavailable');
+      return false;
+    }
+    {
       const result = await this.deps.delivery.submit(line, { interrupt: this.cfg.interrupt });
       if (!result.succeeded) {
         // Name the reason: "refused" and "cancelled" are the agent's answer,
@@ -653,88 +649,6 @@ export class Monitor {
         this.recordTurn('completed');
       return true;
     }
-    // Tmux exposes no authenticated tool lifecycle. `after_tool` therefore
-    // degrades to the existing non-cancelling injection path; never guess a
-    // boundary from pane text and never send C-c for this mode.
-    if (this.cfg.interrupt === true) await this.deps.tmux.sendKey(this.name, 'C-c');
-    if (this.cfg.interrupt === 'after_tool')
-      this.degrade('safe-boundary', 'after_tool unsupported by tmux; using non-cancelling delivery');
-    const state = await this.awaitInjectable(pid);
-    if (state !== 'ready') {
-      if (state === 'offline') this.degrade('offline', 'offline during delivery');
-      else if (state === 'modal')
-        this.degrade('modal', `modal wedge — pane held a dialog for ` +
-          `${MODAL_GIVE_UP_MS / 1000}s, wake not injected`);
-      return false;
-    }
-    await this.clearComposer();                        // start from an empty composer
-    await this.deps.tmux.sendText(this.name, line);   // send-keys -l + Enter
-    let delivered = false;
-    // Verify submission for THIS line even if stop() arrives mid-flight: the text
-    // is already in the composer and we want it submitted (at-least-once). A truly
-    // dead pane makes safeCapture return '' ⇒ not-in-composer ⇒ breaks, no wasted Enter.
-    for (let i = 0; i < MAX_ENTER_RETRIES;) {
-      await this.deps.sleep(POST_VERIFY_MS);
-      const capture = await safeCapture(this.deps.tmux, this.name);
-      if (!capture.ok) {
-        this.degrade('delivery', 'capture failed during injection verification');
-        return false;
-      }
-      // A dialog can appear after the initial send. Never let a verification
-      // retry confirm it. Wait under the same bounded modal policy as initial
-      // injection, then re-capture immediately before considering Enter.
-      if (looksModal(capture.pane)) {
-        const state = await this.awaitInjectable(pid);
-        if (state === 'ready') continue;
-        if (state === 'offline')
-          this.degrade('offline', 'offline during injection verification');
-        else if (state === 'modal')
-          this.degrade('modal', `modal wedge during injection verification — ` +
-            `no Enter sent for ${MODAL_GIVE_UP_MS / 1000}s`);
-        return false;
-      }
-      if (!stillInComposer(capture.pane, line)) { delivered = true; break; }
-      await this.deps.tmux.sendKey(this.name, 'Enter');
-      i++;
-    }
-    if (!delivered) { this.degrade('delivery', 'injection unverified'); return false; }
-    this.recover('delivery', 'modal');
-    // The wake landed and a turn started; observe how that turn terminates so a
-    // refusal-wedge (every turn dies with `API Error:` while delivery stays green)
-    // becomes visible in `.monitor-status` instead of masquerading as armed (#19).
-    const recoveryTriggered = await this.observeTurnOutcome(pid);
-    return !recoveryTriggered;
-  }
-
-  /**
-   * Watch the pane until the just-triggered turn settles, then fold its outcome
-   * into the API-error streak and republish `.monitor-status`. A completed turn
-   * (or an inconclusive give-up) resets/keeps the streak; an `API Error:` tail
-   * grows it. Once the streak reaches the threshold the status degrades; a later
-   * completed turn flips it back to armed. Detection only — no remediation (#19).
-   */
-  private async observeTurnOutcome(pid: number): Promise<boolean> {
-    for (let i = 0; i < TURN_OBSERVE_POLLS; i++) {
-      if (this.stopped) return false;                                  // shutting down — leave status
-      if (!this.deps.isAlive(pid) || !(await this.deps.tmux.has(this.name))) return false; // loop marks offline
-      const capture = await safeCapture(this.deps.tmux, this.name);
-      if (!capture.ok) {
-        this.degrade('delivery', 'capture failed during turn observation');
-        return false;
-      }
-      if (looksApiError(capture.pane)) {
-        const evidence = classifyFailureText(capture.pane);
-        const recoveryTriggered = evidence
-          ? this.deps.onFailureEvidence?.(evidence) === true
-          : false;
-        this.recordTurn('api-error');
-        return recoveryTriggered;
-      }
-      if (!looksRunning(capture.pane)) { this.recordTurn('completed'); return false; }
-      await this.deps.sleep(TURN_OBSERVE_INTERVAL_MS);
-    }
-    this.recordTurn('inconclusive');   // still running at give-up: hold the streak, don't re-arm
-    return false;
   }
 
   /** Update the consecutive-API-error streak and derive `.monitor-status` from it. */
@@ -757,34 +671,6 @@ export class Monitor {
    * the composer is cleared by hand. Best-effort: a dead pane just makes the keys
    * no-ops (delivery is still verified downstream).
    */
-  private async clearComposer(): Promise<void> {
-    for (const key of COMPOSER_CLEAR_KEYS) await this.deps.tmux.sendKey(this.name, key);
-  }
-
-  /**
-   * Block until the console can accept input; classify offline/stopped/ready, or
-   * `modal` when the pane still looks modal after `MODAL_GIVE_UP_MS`. The bound is
-   * what keeps a modal from wedging delivery silently: we still never `Enter` into
-   * the dialog, but the give-up is reported instead of retried forever.
-   */
-  private async awaitInjectable(pid: number): Promise<'ready' | 'offline' | 'stopped' | 'modal'> {
-    let modalWaits = 0;
-    for (;;) {
-      if (this.stopped) return 'stopped';
-      if (!this.deps.isAlive(pid) || !(await this.deps.tmux.has(this.name))) return 'offline';
-      const now = this.deps.now();
-      if (now < this.bootDeadline) { await this.deps.sleep(this.bootDeadline - now); continue; }
-      const capture = await safeCapture(this.deps.tmux, this.name);
-      if (!capture.ok) {
-        this.degrade('delivery', 'capture failed while checking session readiness');
-        await this.deps.sleep(MODAL_RETRY_MS);
-        continue;
-      }
-      if (!looksModal(capture.pane)) return 'ready';
-      if (modalWaits++ >= MAX_MODAL_WAITS) return 'modal';
-      await this.deps.sleep(MODAL_RETRY_MS);
-    }
-  }
 
   private async doFetch(
     since: string,
@@ -908,13 +794,6 @@ export class Monitor {
 
 export function createMonitor(o: MonitorOpts): Monitor {
   return new Monitor(o);
-}
-
-async function safeCapture(
-  tmux: MonitorTmux, name: string,
-): Promise<{ ok: true; pane: string } | { ok: false; pane: '' }> {
-  try { return { ok: true, pane: await tmux.capture(name) }; }
-  catch { return { ok: false, pane: '' }; }
 }
 
 const msg = (e: unknown): string => (e as Error)?.message ?? String(e);

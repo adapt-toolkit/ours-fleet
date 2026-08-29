@@ -1,10 +1,8 @@
-import { randomUUID } from 'node:crypto';
 import { controlRequest, followConversation } from '../session/control.js';
 import type {
   ConversationEventV1, ConversationSnapshot, PromptReceipt,
 } from '../session/conversation-types.js';
 import type { SessionEvent, SessionSnapshot } from '../session/types.js';
-import { Tmux } from '../tmux.js';
 import { FleetError, normalizeError } from './errors.js';
 import type {
   OutputPage, SendReceipt, SessionDescriptor,
@@ -240,34 +238,5 @@ export class AcpRoleSessionAdapter implements RoleSessionControl {
         );
       return response.result;
     } catch (error) { throw normalizeError(error); }
-  }
-}
-
-export class TmuxRoleSessionAdapter implements RoleSessionControl {
-  constructor(private readonly roleId: string, private readonly tmux: Tmux = new Tmux()) {}
-
-  async describe(): Promise<SessionDescriptor> {
-    return { backend: 'tmux', protocolVersion: 1, features: ['text', 'capture'] };
-  }
-  async snapshot(): Promise<SessionSnapshot> {
-    const alive = await this.tmux.has(this.roleId);
-    return { backend: 'tmux', alive, readiness: alive ? 'idle' : 'failed' };
-  }
-  async recentOutput(request: { limit?: number } = {}): Promise<OutputPage> {
-    try {
-      const text = await this.tmux.capture(this.roleId, Math.min(request.limit ?? 100, 500));
-      return { events: [], text, truncated: false };
-    } catch (error) { throw normalizeError(error); }
-  }
-  async sendText(text: string): Promise<SendReceipt> {
-    if (!text.trim()) throw new FleetError('invalid_request', 'text is required');
-    if (Buffer.byteLength(text) > 32 * 1024)
-      throw new FleetError('invalid_request', 'text exceeds 32 KiB');
-    try { await this.tmux.sendText(this.roleId, text); }
-    catch (error) { throw normalizeError(error); }
-    return {
-      accepted: true, promptId: randomUUID(), queuedBehind: 0, terminalOutcomeKnown: false,
-      detail: 'literal text and Enter sent; terminal outcome is unknown',
-    };
   }
 }

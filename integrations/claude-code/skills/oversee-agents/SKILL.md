@@ -1,6 +1,6 @@
 ---
 name: oversee-agents
-description: Keep an eye on ours-fleet agents you spawned or were assigned, across tmux or ACP sessions. Inspect state, unstick agents through ours-fleet controls, and escalate consequential choices. Use when the user or your persona/briefing says "keep an eye on X", "oversee agents", "watch agents", or right after spawning an agent.
+description: Keep an eye on ours-fleet agents you spawned or were assigned over ACP sessions. Inspect state, unstick agents through ours-fleet controls, and escalate consequential choices. Use when the user or your persona/briefing says "keep an eye on X", "oversee agents", "watch agents", or right after spawning an agent.
 ---
 
 # Oversee ours-fleet agents
@@ -13,8 +13,7 @@ ours-fleet status <Name>
 ours-fleet peek <Name> [lines]
 ours-fleet logs <Name>
 ours-fleet send <Name> "<text>"
-ours-fleet send <Name> --key <K>      # tmux only
-ours-fleet attach <Name>              # tmux or ACP interactive control
+ours-fleet attach <Name>              # structured interactive control
 ```
 
 ## 1. Determine your assignment
@@ -62,7 +61,7 @@ Once you know the role is alive, classify what the console actually shows:
 
 | Console shows | Action |
 |---|---|
-| Permission prompt or trust dialog | Answer only within already-authorized scope. Use `send --key` for tmux or the `/permit` control shown by ACP `attach`. |
+| Permission prompt or trust dialog | Answer only within already-authorized scope using the `/permit` control shown by `attach`. |
 | A question the agent asked its (absent) user | Answer with what you know of the mission: `ours-fleet send <Name> "<answer>"`. |
 | Crashed to a shell prompt / error text | Investigate (`ours-fleet logs <Name>`); restart a permanent role only once `status` confirms it is offline. |
 | Idle with work still assigned | Nudge: `ours-fleet send <Name> "Status? Continue with <task> or declare BLOCKED."` |

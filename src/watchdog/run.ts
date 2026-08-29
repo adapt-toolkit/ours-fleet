@@ -1,9 +1,8 @@
 import {
   closeSync, existsSync, openSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync,
 } from 'node:fs';
-import { spawn as spawnChild, execFile } from 'node:child_process';
+import { spawn as spawnChild } from 'node:child_process';
 import { join } from 'node:path';
-import { promisify } from 'node:util';
 import { stringify } from 'yaml';
 import type { ResolvedWatchdog } from './config.js';
 import type { WatchdogReport } from './report.js';
@@ -24,9 +23,7 @@ import {
 import { getAdapter } from '../harness/registry.js';
 import { redactLogLine } from '../application/log-service.js';
 import { controlRequest, controlSocketPath } from '../session/control.js';
-import { Tmux } from '../tmux.js';
 
-const execFileAsync = promisify(execFile);
 
 /** How often the deadline loop polls for a completed report or a dead child. */
 const POLL_MS = 1000;
@@ -74,7 +71,6 @@ async function killIfNeeded(
   if (reason === 'stable' || reason === 'timeout') {
     if (reason === 'stable') await sleep(HARVEST_GRACE_MS);
     child.kill();
-    await killTmuxSession(roleName);
   }
 }
 
@@ -123,12 +119,6 @@ function defaultLaunchChild(binPath: string, roleName: string, runDir: string): 
   };
 }
 
-/** Best-effort: the tmux session outlives the supervisor child (`runOnce` created it). */
-async function killTmuxSession(roleName: string): Promise<void> {
-  try { await execFileAsync('tmux', ['kill-session', '-t', roleName]); }
-  catch { /* best effort */ }
-}
-
 /** Last 4096 chars of run.log, redacted — attached to error reports as diagnostic tail. */
 function readTail(runDir: string): string | undefined {
   try {
@@ -162,19 +152,15 @@ async function discoverLiveTemporaryRoles(): Promise<string[]> {
       .filter(entry => entry.isDirectory() && !entry.isSymbolicLink() && ROLE_NAME_RE.test(entry.name))
       .map(entry => entry.name);
   } catch { return []; }
-  const tmux = new Tmux();
   const live = await Promise.all(names.map(async name => {
     const dir = agentDir(name, true);
-    const [acpAlive, tmuxAlive] = await Promise.all([
-      existsSync(controlSocketPath(dir))
-        ? controlRequest(dir, { command: 'status' }, 2_000)
-            .then(response => response.ok
-              && (response.result as { alive?: boolean } | undefined)?.alive === true)
-            .catch(() => false)
-        : Promise.resolve(false),
-      tmux.has(name).catch(() => false),
-    ]);
-    return acpAlive || tmuxAlive ? name : undefined;
+    const alive = existsSync(controlSocketPath(dir))
+      ? await controlRequest(dir, { command: 'status' }, 2_000)
+          .then(response => response.ok
+            && (response.result as { alive?: boolean } | undefined)?.alive === true)
+          .catch(() => false)
+      : false;
+    return alive ? name : undefined;
   }));
   return live.filter((name): name is string => name !== undefined);
 }

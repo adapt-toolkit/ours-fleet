@@ -13,7 +13,7 @@ import { interruptSession, queueSessionPrompt } from '../application/session-mut
 import { pickBackend } from '../supervisor/index.js';
 import {
   ACP_CANCEL_DEADLINE_EXCEEDED, SessionControlError,
-  type QueuedPrompt, type SessionEvent, type SessionHandle, type TurnResult,
+  type AgentSession, type QueuedPrompt, type SessionEvent, type TurnResult,
 } from '../session/types.js';
 import { VERSION } from '../version.js';
 import {
@@ -72,7 +72,7 @@ export interface OwnerChannelOptions {
   /** Harness id of the role (e.g. 'claude-code', 'codex'); gates which slash commands may be forwarded. */
   harness: string;
   config: OwnerChannelConfig;
-  session: SessionHandle;
+  session: AgentSession;
   stateDir: string;
   env?: Record<string, string>;
   log(line: string): void;

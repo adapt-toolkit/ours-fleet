@@ -15,8 +15,8 @@ export interface RoleRepositoryOptions {
   configPath?: string;
   permanentRoot?: string;
   temporaryRoot?: string;
-  probeBackend?: (name: string, intended?: 'acp' | 'tmux') => Promise<{
-    acp: boolean; tmux: boolean;
+  probeBackend?: (name: string, intended?: 'acp') => Promise<{
+    acp: boolean;
   }>;
   concurrency?: number;
   timeoutMs?: number;
@@ -58,7 +58,11 @@ function snapshot(path: string, name: string): { role?: ResolvedRole; problem?: 
       throw new Error('snapshot is not a bounded regular file');
     const raw = parse(readFileSync(path, 'utf8')) as RoleConfig & Partial<ResolvedRole>;
     if (!raw || typeof raw !== 'object') throw new Error('snapshot must be a mapping');
-    const session = raw.session === 'acp' || raw.session === 'tmux' ? raw.session : 'tmux';
+    if ((raw.session as string | undefined) === 'tmux') throw new Error(
+      'session: tmux is no longer supported; use session: acp with the Codex or Claude Code adapter');
+    if (raw.session !== undefined && raw.session !== 'acp')
+      throw new Error(`unsupported session '${String(raw.session)}'; expected session: acp`);
+    const session = 'acp' as const;
     return {
       role: {
         ...raw, name, harness: typeof raw.harness === 'string' ? raw.harness : 'claude-code',
@@ -170,17 +174,15 @@ export class RoleRepository {
     } catch { return undefined; }
   }
 
-  private async detect(name: string, intended?: 'acp' | 'tmux'): Promise<RoleRecord['detectedBackend']> {
+  private async detect(name: string, intended?: 'acp'): Promise<RoleRecord['detectedBackend']> {
     if (!this.options.probeBackend) return intended ?? 'none';
     const timeoutMs = this.options.timeoutMs ?? 2_000;
     const result = await Promise.race([
       this.options.probeBackend(name, intended),
-      new Promise<{ acp: boolean; tmux: boolean }>(resolve =>
-        setTimeout(() => resolve({ acp: false, tmux: false }), timeoutMs)),
-    ]).catch(() => ({ acp: false, tmux: false }));
-    if (result.acp && result.tmux) return 'ambiguous';
+      new Promise<{ acp: boolean }>(resolve =>
+        setTimeout(() => resolve({ acp: false }), timeoutMs)),
+    ]).catch(() => ({ acp: false }));
     if (result.acp) return 'acp';
-    if (result.tmux) return 'tmux';
     return 'none';
   }
 }

@@ -164,7 +164,7 @@ describe('prepareSession', () => {
       role({ max_tokens: 500000, harness_options: { plugins: { 'x@m': true }, mem_palace: false } }),
       { stateDir, runCwd: stateDir });
     const overlay = join(stateDir, '.settings-overlay.json');
-    expect(prep.argv).toEqual(['--settings', overlay]);
+    expect(prep.settingsOverlay).toBe(overlay);
     const j = JSON.parse(readFileSync(overlay, 'utf8'));
     expect(j.enabledPlugins).toEqual({ 'x@m': true, 'mempalace@mempalace': false });
     expect(prep.env.CLAUDE_AUTOCOMPACT_PCT_OVERRIDE).toBe('50');
@@ -176,7 +176,7 @@ describe('prepareSession', () => {
     const a = makeClaudeCodeAdapter(okExec);
     const stateDir = join(dir, 's2'); mkdirSync(stateDir, { recursive: true });
     const prep = await a.prepareSession(role(), { stateDir, runCwd: stateDir });
-    expect(prep.argv).toEqual([]);
+    expect(prep.settingsOverlay).toBeUndefined();
     expect(existsSync(join(stateDir, '.settings-overlay.json'))).toBe(false);
     expect(prep.env.MEMPALACE_DISABLED).toBeUndefined();
   });
@@ -189,14 +189,12 @@ describe('prepareSession', () => {
     expect(prep.env.OURS_BIND_IDENTITY).toBe('Alice Dev');
   });
 
-  it('carries the bind seed onto BOTH launches, since only prep.env reaches ACP', async () => {
+  it('carries the bind seed onto the agent-session launch', async () => {
     const a = makeClaudeCodeAdapter(okExec);
     const stateDir = join(dir, 'bind2'); mkdirSync(stateDir, { recursive: true });
     const r = role({ identity: 'Alice Dev' });
     const prep = await a.prepareSession(r, { stateDir, runCwd: stateDir });
-    expect(a.buildLaunch(r, 'fresh', { sessionId: 's' }, prep).env.OURS_BIND_IDENTITY)
-      .toBe('Alice Dev');
-    expect(a.buildAcpLaunch!(r, prep).env.OURS_BIND_IDENTITY).toBe('Alice Dev');
+    expect(a.agentSession.prepareLaunch(r, prep).env.OURS_BIND_IDENTITY).toBe('Alice Dev');
   });
 
   it('pre-trusts state dir and cwd', async () => {
@@ -206,127 +204,6 @@ describe('prepareSession', () => {
     const d = JSON.parse(readFileSync(join(dir, '.claude.json'), 'utf8'));
     expect(d.projects[stateDir].hasTrustDialogAccepted).toBe(true);
     expect(d.projects['/repo'].hasTrustDialogAccepted).toBe(true);
-  });
-});
-
-describe('buildLaunch', () => {
-  it('fresh + resume argv', () => {
-    const a = makeClaudeCodeAdapter(okExec);
-    const r = role();
-    const prep = { argv: ['--settings', '/o.json'], env: {} };
-    const fresh = a.buildLaunch(r, 'fresh', { sessionId: 'SID' }, prep);
-    expect(fresh.argv).toEqual([
-      'claude', '--settings', '/o.json', '--remote-control', 'Alice',
-      '--session-id', 'SID', `Read and follow ${agentDir('Alice')}/briefing.md now.`,
-    ]);
-    const resume = a.buildLaunch(r, 'resume', { sessionId: 'SID' }, prep);
-    expect(resume.argv.slice(0, 7)).toEqual(
-      ['claude', '--settings', '/o.json', '--remote-control', 'Alice', '--resume', 'SID']);
-    expect(resume.argv[7]).toContain('choose_identity name "Alice Dev" force=true');
-    expect(resume.argv[7]).toContain('ours api watch-notifications');
-    expect(resume.argv[7].toLowerCase()).not.toContain('a2adapt');
-  });
-
-  it('injects --model right after claude when role.model is set (fresh + resume)', () => {
-    const a = makeClaudeCodeAdapter(okExec);
-    const r = role({ model: 'claude-fable-5' });
-    const prep = { argv: ['--settings', '/o.json'], env: {} };
-
-    const fresh = a.buildLaunch(r, 'fresh', { sessionId: 'SID' }, prep);
-    expect(fresh.argv.slice(0, 5)).toEqual(
-      ['claude', '--model', 'claude-fable-5', '--settings', '/o.json']);
-    // trailing positional prompt is still last
-    expect(fresh.argv[fresh.argv.length - 1]).toContain('briefing.md now.');
-
-    const resume = a.buildLaunch(r, 'resume', { sessionId: 'SID' }, prep);
-    expect(resume.argv.slice(0, 5)).toEqual(
-      ['claude', '--model', 'claude-fable-5', '--settings', '/o.json']);
-  });
-
-  it('injects --model for a role whose model came from defaults.model', () => {
-    writeFileSync(join(dir, 'fleet.yaml'),
-      'defaults:\n  model: claude-fable-5\nroles:\n  Alice: {}\n');
-    const r = findRole(loadConfig(), 'Alice');
-    expect(r.model).toBe('claude-fable-5');
-    const a = makeClaudeCodeAdapter(okExec);
-    const prep = { argv: ['--settings', '/o.json'], env: {} };
-    const fresh = a.buildLaunch(r, 'fresh', { sessionId: 'SID' }, prep);
-    expect(fresh.argv.slice(0, 3)).toEqual(['claude', '--model', 'claude-fable-5']);
-  });
-
-  it('injects --permission-mode when harness_options.permission_mode is set', () => {
-    const a = makeClaudeCodeAdapter(okExec);
-    const r = role({ harness_options: { permission_mode: 'dontAsk' } });
-    const prep = { argv: ['--settings', '/o.json'], env: {} };
-    const fresh = a.buildLaunch(r, 'fresh', { sessionId: 'SID' }, prep);
-    expect(fresh.argv).toEqual([
-      'claude', '--permission-mode', 'dontAsk', '--settings', '/o.json',
-      '--remote-control', 'Alice',
-      '--session-id', 'SID', `Read and follow ${agentDir('Alice')}/briefing.md now.`,
-    ]);
-    const resume = a.buildLaunch(r, 'resume', { sessionId: 'SID' }, prep);
-    expect(resume.argv.slice(0, 5)).toEqual(
-      ['claude', '--permission-mode', 'dontAsk', '--settings', '/o.json']);
-  });
-
-  it('accepts every valid permission mode', () => {
-    const a = makeClaudeCodeAdapter(okExec);
-    const prep = { argv: [], env: {} };
-    for (const pm of ['default', 'acceptEdits', 'plan', 'dontAsk', 'bypassPermissions']) {
-      const r = role({ harness_options: { permission_mode: pm } });
-      const launch = a.buildLaunch(r, 'fresh', { sessionId: 'SID' }, prep);
-      expect(launch.argv.slice(0, 3)).toEqual(['claude', '--permission-mode', pm]);
-    }
-  });
-
-  it('argv is byte-identical to before when permission_mode is unset (backward compat)', () => {
-    const a = makeClaudeCodeAdapter(okExec);
-    const prep = { argv: ['--settings', '/o.json'], env: {} };
-    const without = a.buildLaunch(role(), 'fresh', { sessionId: 'SID' }, prep);
-    const withEmpty = a.buildLaunch(
-      role({ harness_options: {} }), 'fresh', { sessionId: 'SID' }, prep);
-    expect(without.argv).toEqual([
-      'claude', '--settings', '/o.json', '--remote-control', 'Alice',
-      '--session-id', 'SID', `Read and follow ${agentDir('Alice')}/briefing.md now.`,
-    ]);
-    expect(withEmpty.argv).toEqual(without.argv);
-  });
-
-  it('throws a clear error naming allowed values on a bad permission_mode', () => {
-    const a = makeClaudeCodeAdapter(okExec);
-    const r = role({ harness_options: { permission_mode: 'yolo' } });
-    const prep = { argv: [], env: {} };
-    expect(() => a.buildLaunch(r, 'fresh', { sessionId: 'SID' }, prep))
-      .toThrow(/permission_mode/);
-    expect(() => a.buildLaunch(r, 'fresh', { sessionId: 'SID' }, prep))
-      .toThrow(/default, acceptEdits, plan, dontAsk, bypassPermissions/);
-  });
-});
-
-describe('acpPermissionModeId', () => {
-  const a = makeClaudeCodeAdapter(okExec);
-  const perms = (approval: 'allow' | 'auto' | 'ask' | 'deny') =>
-    ({ approval, filesystem: 'workspace', unattended: 'deny' } as const);
-
-  it('single-sources the ACP mode from the same mapping as the tmux launch', () => {
-    expect(a.acpPermissionModeId!(role({ permissions: perms('allow') }))).toBe('bypassPermissions');
-    expect(a.acpPermissionModeId!(role({ permissions: perms('auto') }))).toBe('acceptEdits');
-    expect(a.acpPermissionModeId!(role({ permissions: perms('deny') }))).toBe('plan');
-    expect(a.acpPermissionModeId!(role({ permissions: perms('ask') }))).toBeUndefined();
-  });
-
-  it('honors an explicit harness_options.permission_mode override', () => {
-    const r = role({
-      permissions: perms('allow'), harness_options: { permission_mode: 'acceptEdits' },
-    });
-    expect(a.acpPermissionModeId!(r)).toBe('acceptEdits');
-  });
-
-  it('rejects a bad override with the same clear error as the tmux launch', () => {
-    const r = role({ harness_options: { permission_mode: 'yolo' } });
-    expect(() => a.acpPermissionModeId!(r)).toThrow(/permission_mode/);
-    expect(() => a.acpPermissionModeId!(r))
-      .toThrow(/default, acceptEdits, plan, dontAsk, bypassPermissions/);
   });
 });
 
@@ -346,29 +223,6 @@ describe('validateOptions / prereqs', () => {
     const rep = await a.checkPrereqs();
     expect(rep.ok).toBe(false);
     expect(rep.checks[0].detail).toContain('not found');
-  });
-});
-
-describe('buildAcpLaunch', () => {
-  it('uses the bundled Claude ACP adapter when supported and preserves the Node 20 fallback', () => {
-    const launch = makeClaudeCodeAdapter(okExec).buildAcpLaunch!(
-      role(), { argv: [], env: {} });
-    expect(launch.permissionMetadataSource).toBeUndefined();
-    if (Number(process.versions.node.split('.')[0]) >= 22) {
-      expect(launch.argv[0]).toBe(process.execPath);
-      expect(launch.argv[1]).toMatch(
-        /@agentclientprotocol[/\\]claude-agent-acp[/\\]dist[/\\]index\.js$/);
-    } else {
-      expect(launch.argv).toEqual(['claude-agent-acp']);
-    }
-  });
-
-  it('preserves an explicit ACP command override', () => {
-    const launch = makeClaudeCodeAdapter(okExec).buildAcpLaunch!(
-      role({ session_options: { acp: { command: 'custom-claude-acp --flag' } } }),
-      { argv: [], env: {} },
-    );
-    expect(launch.argv).toEqual(['sh', '-c', 'custom-claude-acp --flag']);
   });
 });
 
@@ -394,18 +248,6 @@ describe('neutral permission mapping and the unattended floor', () => {
     expect(mode('ask')).toBe('default');
     expect(mode('auto')).toBe('acceptEdits');
     expect(mode('deny')).toBe('plan');
-  });
-
-  it('launch argv uses the same mapping as the translation', () => {
-    const prep = { argv: [], env: {} };
-    for (const approval of APPROVALS) {
-      const r = role({ permissions: { approval, filesystem: 'workspace', unattended: 'deny' } });
-      const argv = a.buildLaunch(r, 'fresh', { sessionId: 's' }, prep).argv;
-      const t = a.translatePermissions(r.permissions!) as { native: Record<string, unknown> };
-      const i = argv.indexOf('--permission-mode');
-      if (approval === 'ask') expect(i, approval).toBe(-1);        // Claude's own default
-      else expect(argv[i + 1], approval).toBe(t.native.permission_mode);
-    }
   });
 
   it('every neutral combination resolves, and only allow clears the floor', () => {
@@ -457,134 +299,7 @@ describe('neutral permission mapping and the unattended floor', () => {
 
 // ── defect 3: harness_options that used to be silently dropped on ACP ────────
 //
-// `buildAcpLaunch` builds its own argv and cannot carry `prep.argv`, so the
+// The agent-session adapter builds its own argv and cannot carry prep argv, so the
 // `--settings` overlay `plugins` writes was produced and then thrown away for
 // every `session: acp` role, with no warning. The mem-palace toggle rode
 // `prep.env` and survived, which is what made the failure silent AND selective.
-describe('ACP delivery of flag-shaped harness options', () => {
-  const acpRole = (harness_options?: Record<string, unknown>): ResolvedRole =>
-    role({ session: 'acp', ...(harness_options ? { harness_options } : {}) });
-
-  it('sends the plugins overlay through the bundled agent _meta, not argv', async () => {
-    const a = makeClaudeCodeAdapter(okExec);
-    const stateDir = join(dir, 'acp-plugins'); mkdirSync(stateDir, { recursive: true });
-    const r = acpRole({ plugins: { 'x@m': true } });
-    const prep = await a.prepareSession(r, { stateDir, runCwd: stateDir });
-    const overlay = join(stateDir, '.settings-overlay.json');
-    expect(prep.settingsOverlay).toBe(overlay);
-    // The ACP launch still carries no argv — that is the constraint, not the bug.
-    expect(a.buildAcpLaunch!(r, prep).argv).not.toContain('--settings');
-    expect(a.acpSessionMeta!(r, prep)).toEqual({ claudeCode: { options: { settings: overlay } } });
-  });
-
-  it('sends nothing when the role configured nothing', async () => {
-    const a = makeClaudeCodeAdapter(okExec);
-    const stateDir = join(dir, 'acp-bare'); mkdirSync(stateDir, { recursive: true });
-    const r = acpRole();
-    const prep = await a.prepareSession(r, { stateDir, runCwd: stateDir });
-    expect(a.acpSessionMeta!(r, prep)).toBeUndefined();
-    expect(a.acpMcpServers!(r)).toBeUndefined();
-  });
-
-  it('sends nothing to an ACP agent fleet did not choose', async () => {
-    const a = makeClaudeCodeAdapter(okExec);
-    const stateDir = join(dir, 'acp-custom'); mkdirSync(stateDir, { recursive: true });
-    const r = role({
-      session: 'acp',
-      session_options: { acp: { command: ['some-other-acp'] } },
-      harness_options: { plugins: { 'x@m': true } },
-    });
-    const prep = await a.prepareSession(r, { stateDir, runCwd: stateDir });
-    expect(a.acpSessionMeta!(r, prep)).toBeUndefined();
-    // …and it is refused rather than quietly ignored.
-    expect(a.validateOptions(r.harness_options, r).map(e => e.path))
-      .toContain('harness_options.plugins');
-  });
-});
-
-describe('harness_options.mcp_servers', () => {
-  const servers = {
-    ours: { command: 'ours-mcp', args: ['proxy'] },
-    trello: { type: 'http', url: 'https://mcp.trello.com/v1' },
-  };
-
-  it('writes a config file and adds --mcp-config on the tmux launch', async () => {
-    const a = makeClaudeCodeAdapter(okExec);
-    const stateDir = join(dir, 'mcp-tmux'); mkdirSync(stateDir, { recursive: true });
-    const r = role({ harness_options: { mcp_servers: servers } });
-    const prep = await a.prepareSession(r, { stateDir, runCwd: stateDir });
-    const file = join(stateDir, '.mcp-config.json');
-    expect(prep.mcpConfigFile).toBe(file);
-    expect(prep.argv).toEqual(['--mcp-config', file]);
-    expect(JSON.parse(readFileSync(file, 'utf8'))).toEqual({ mcpServers: servers });
-    // Additive by default: exclusivity is a separate, explicit opt-in.
-    expect(prep.argv).not.toContain('--strict-mcp-config');
-    expect(a.buildLaunch(r, 'fresh', { sessionId: 's' }, prep).argv)
-      .toEqual(expect.arrayContaining(['--mcp-config', file]));
-  });
-
-  it('adds --strict-mcp-config only when mcp_servers_only is set', async () => {
-    const a = makeClaudeCodeAdapter(okExec);
-    const stateDir = join(dir, 'mcp-strict'); mkdirSync(stateDir, { recursive: true });
-    const prep = await a.prepareSession(
-      role({ harness_options: { mcp_servers: servers, mcp_servers_only: true } }),
-      { stateDir, runCwd: stateDir });
-    expect(prep.argv).toContain('--strict-mcp-config');
-  });
-
-  it('delivers the same set, and the same exclusivity, over ACP', () => {
-    const a = makeClaudeCodeAdapter(okExec);
-    const r = role({
-      session: 'acp', harness_options: { mcp_servers: servers, mcp_servers_only: true },
-    });
-    // Stdio entries carry NO `type`; that is how ACP discriminates the variant.
-    expect(a.acpMcpServers!(r)).toEqual([
-      { name: 'ours', command: 'ours-mcp', args: ['proxy'], env: [] },
-      { name: 'trello', type: 'http', url: 'https://mcp.trello.com/v1', headers: [] },
-    ]);
-    expect(a.acpSessionMeta!(r, { argv: [], env: {} }))
-      .toEqual({ claudeCode: { options: { strictMcpConfig: true } } });
-  });
-
-  it('does not override ACP MCP servers when mcp_servers is absent', () => {
-    const adapter = makeClaudeCodeAdapter(okExec);
-    expect(adapter.acpMcpServers!(role({ session: 'acp' }))).toBeUndefined();
-  });
-
-  it('refuses a strict role that would lose the ours connector and go mute', () => {
-    const a = makeClaudeCodeAdapter(okExec);
-    const errs = a.validateOptions({
-      mcp_servers: { trello: { type: 'http', url: 'https://mcp.trello.com/v1' } },
-      mcp_servers_only: true,
-    });
-    expect(errs).toHaveLength(1);
-    expect(errs[0].path).toBe('harness_options.mcp_servers');
-    expect(errs[0].message).toContain('ours-mcp');
-  });
-
-  it('accepts a strict role that declares the ours connector', () => {
-    expect(makeClaudeCodeAdapter(okExec)
-      .validateOptions({ mcp_servers: servers, mcp_servers_only: true })).toEqual([]);
-  });
-
-  it('refuses mcp_servers_only on its own', () => {
-    const errs = makeClaudeCodeAdapter(okExec).validateOptions({ mcp_servers_only: true });
-    expect(errs.map(e => e.path)).toContain('harness_options.mcp_servers_only');
-  });
-
-  it('reports shape errors per server, by path', () => {
-    const errs = makeClaudeCodeAdapter(okExec).validateOptions({
-      mcp_servers: {
-        nocommand: { args: ['x'] },
-        remote: { type: 'http' },
-        'bad name': { command: 'x' },
-        badtype: { type: 'grpc', command: 'x' },
-      },
-    });
-    const paths = errs.map(e => e.path);
-    expect(paths).toContain('harness_options.mcp_servers.nocommand.command');
-    expect(paths).toContain('harness_options.mcp_servers.remote.url');
-    expect(paths).toContain('harness_options.mcp_servers.bad name');
-    expect(paths).toContain('harness_options.mcp_servers.badtype.type');
-  });
-});

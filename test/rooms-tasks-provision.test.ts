@@ -381,7 +381,7 @@ describe('simple Cowork room member startup', () => {
       ...mocks.spawnTemp.mock.calls[0][0], name: 'fallback-preview', identity: 'fallback-preview',
     }).resolvedRole;
     expect(fallback).toMatchObject({
-      harness: 'claude-code', session: 'tmux',
+      harness: 'claude-code', session: 'acp',
       permissions: { approval: 'ask', filesystem: 'workspace', unattended: 'deny' },
       monitor: { mode: 'fleet' },
     });

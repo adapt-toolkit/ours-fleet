@@ -6,11 +6,11 @@
  */
 export const AI_DOCS = `# ours-fleet reference
 
-ours-fleet runs persistent or temporary, identity-bound AI roles. A role selects
-a harness independently from its session backend:
+ours-fleet runs persistent or temporary, identity-bound AI roles through the
+structured ACP session path:
 
 - harness: \`claude-code\` or \`codex\`
-- session: \`tmux\` (default) or \`acp\`
+- session: \`acp\` (default and only supported value)
 - lifetime: permanent (supervised, restartable) or \`spawn --temp\`
 
 ## Discover and validate
@@ -91,15 +91,14 @@ ours-fleet ls
 ours-fleet status|peek|attach|logs Name
 ours-fleet logs -f Name
 ours-fleet send Name "prompt"
-ours-fleet send Name --key Enter        # tmux only
 ours-fleet rm Name
 ours-fleet watchdog-report <name> [run-id] [--list] [--json]
 ours-fleet watchdog-run <name>
 \`\`\`
 
-\`peek\`, \`attach\`, and text \`send\` work with tmux and ACP. ACP attachment
-also accepts \`/permit <permission-id> <option-id>\`, \`/interrupt\`, and
-\`/detach\`. Raw \`--key\` input is tmux-only.
+\`peek\`, \`attach\`, and text \`send\` use the structured agent session.
+Attachment also accepts \`/permit <permission-id> <option-id>\`, \`/interrupt\`,
+and \`/detach\`.
 
 ## Local web console
 
@@ -156,7 +155,7 @@ harness's own default.
 
 \`\`\`sh
 ours-fleet spawn [--temp] [Name | --role Name] \\
-  --harness codex|claude-code --session tmux|acp \\
+  --harness codex|claude-code --session acp \\
   --mission "one line" --cwd /absolute/path --identity Identity \\
   --coordinator Coordinator --model MODEL \\
   --approval ask|auto|allow \\
@@ -214,8 +213,8 @@ calling role. Explicit options always win. Selecting a different harness without
 \`--model\` leaves model selection to that harness/fleet defaults rather than
 copying an incompatible caller model. This automatic proxy is a convenience and
 attribution mechanism, not an isolation boundary: an unrestricted role can still
-invoke another binary path directly. Tmux roles and host/operator shells keep the
-ordinary direct CLI behavior.
+invoke another binary path directly. Host/operator shells keep the ordinary direct
+CLI behavior.
 
 Codex-specific spawn flags: \`--sandbox\`, \`--permission-mode\`, \`--launcher\`,
 \`--profile\`, \`--search\`, repeatable \`--codex-config key=value\`, repeatable
@@ -254,8 +253,6 @@ roles:
     session_options:                    # advanced overrides; normally omit
       # acp:
       #   command: [/custom/codex-acp, --flag]
-      tmux:
-        boot_grace_ms: 10000
     monitor:
       mode: fleet                        # fleet supervisor | native harness monitor
       interrupt: false                    # false queues; true cancels; after_tool steers at an ACP tool boundary
@@ -321,7 +318,7 @@ Use README.md for the complete isolation policy and resource-cap schema.
 
 Supervised roles connect to the operator-configured ours daemon; they do not own its
 lifecycle. Fleet strips the obsolete, presence-sensitive \`OURS_AUTOSTART\` variable from
-tmux and ACP children; \`ours-mcp proxy\` is client-only and never starts a daemon. Start
+agent-session children; \`ours-mcp proxy\` is client-only and never starts a daemon. Start
 the shared daemon only through an explicit operator or installer/setup flow.
 
 ## Rooms and tasks
@@ -496,9 +493,7 @@ Security meaning: \`ask\` maps to Codex \`untrusted\` and Claude \`default\`.
 \`auto\` selects Codex ACP \`agent\` (\`on-request\` + \`workspace-write\`) and
 Claude \`acceptEdits\`. \`approval: allow\` selects Codex ACP's fully
 non-interactive yolo mode, reported as \`agent-full-access\` (\`never\` +
-\`danger-full-access\`), and Claude \`bypassPermissions\`. Codex tmux retains
-independent approval and sandbox flags: \`auto\` is \`on-request\`, \`allow\`
-is \`never\`, and \`filesystem\` still selects the sandbox. These modes genuinely
+\`danger-full-access\`), and Claude \`bypassPermissions\`. These modes genuinely
 permit the actions the role was authorized to take —
 \`dontAsk\` only suppresses the prompt while still refusing the action. Nothing
 other than an explicit \`allow\` becomes non-interactive. Legacy \`deny\` keeps
@@ -531,16 +526,15 @@ dontAsk, bypassPermissions), \`plugins\`, \`mem_palace\`,
 \`mcp_servers\` declares MCP servers for the role, in \`.mcp.json\`'s own shape
 (a map of name to \`{ command, args, env }\`, or \`{ type: http|sse, url,
 headers }\`). By default they are ADDED to whatever the OS user running the role
-already has configured, on both session types: tmux passes \`--mcp-config\`, and
-ACP sends them in \`session/new\`.
+already has configured. The Claude Code adapter sends them in \`session/new\`.
 
 When \`mcp_servers\` is absent, Fleet sends ACP's protocol-required empty
 \`mcpServers\` array without an exclusive override, so the agent keeps its inherited
 servers. An explicitly empty configured set is different: Fleet preserves that intent
 through the bundled adapter's compatibility path and disables every inherited server.
 
-\`mcp_servers_only: true\` makes the declared set EXCLUSIVE — \`--strict-mcp-config\`
-on tmux, \`strictMcpConfig\` on ACP. It is all-or-nothing and it ignores every
+\`mcp_servers_only: true\` makes the declared set EXCLUSIVE through
+\`strictMcpConfig\`. It is all-or-nothing and it ignores every
 other MCP configuration: project \`.mcp.json\`, user settings, and **plugins**.
 The ours connector is normally installed as a plugin, so a strict role that does
 not re-declare it has no \`send_message\` and no \`get_messages\` — it cannot even
@@ -566,8 +560,8 @@ The maintained \`@agentclientprotocol/codex-acp\` and
 \`@agentclientprotocol/claude-agent-acp\` runtimes are bundled automatically as
 optional ours-fleet dependencies. The supervisor resolves their executable
 entrypoints internally, so default ACP roles do not depend on global PATH.
-The maintained Claude adapter requires Node 22; tmux and Codex ACP continue to
-work on the ours-fleet core minimum of Node 20.
+The maintained Claude adapter requires Node 22; Codex ACP continues to work on
+the ours-fleet core minimum of Node 20.
 
 Override an adapter only when necessary with \`session_options.acp.command\`
 (string or argv list). If optional dependencies were deliberately omitted,
@@ -581,7 +575,7 @@ ours-fleet falls back to a compatible globally installed \`codex-acp\` or
 - \`fleet\` (default): the ours-fleet supervisor consumes body-free daemon
   events and advances its durable cursor only after delivery is accepted. ACP
   uses live steering when supported and falls back to structured
-  \`session/prompt\`; tmux uses verified console injection.
+  \`session/prompt\`.
 - \`native\`: ours-fleet starts no supervisor monitor; the generated briefing
   instructs Claude Code or Codex to arm its harness-native wake mechanism.
 
@@ -712,8 +706,8 @@ provenance checks.
 The channel identity must be unique and must not be a role identity. The bridge
 persists bounded wire IDs only, never message/reply plaintext, and requeues input
 before starting its turn for at-least-once crash recovery. It currently requires
-\`session: acp\`: tmux has no structured, turn-correlated final answer, and pane
-scraping cannot provide the same reliable reply guarantee.
+the structured agent-session interface backed by ACP so correlated final replies
+retain their delivery guarantee.
 
 ### Live contact and owner administration
 
@@ -761,7 +755,7 @@ contains bounded CIDs and audit actions only. Corruption disables all effective
 owners and refuses mutation rather than resurrecting authority; revoking the
 last effective owner is always refused.
 
-A missing/stopped role, tmux session, role without \`owner_channel\`, unavailable
+A missing/stopped role, role without \`owner_channel\`, unavailable
 MCP client, or a role entering shutdown returns an actionable error with no
 side effects. Management uses no network listener and never logs or persists
 invite material.

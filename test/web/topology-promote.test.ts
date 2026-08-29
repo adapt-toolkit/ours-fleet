@@ -153,7 +153,7 @@ describe('adding sketches to the fleet', () => {
     expect(config.roles[0].loops?.map(loop => loop.name).sort()).toEqual(['evening', 'morning']);
   });
 
-  it('defaults an interval and disables a loop whose target is not on ACP', async () => {
+  it('defaults an interval and enables a loop whose target uses the default ACP session', async () => {
     await seed('roles:\n  Alice:\n    mission: Ship\n', {
       ...emptyDraft(),
       drafts: {
@@ -165,10 +165,9 @@ describe('adding sketches to the fleet', () => {
     await promote(['loop:nightly']);
 
     const [loop] = loadConfig(file).loops;
-    // Enabled would be a hard ConfigError on a tmux role and would break the fleet.
-    expect(loop.enabled).toBe(false);
+    expect(loop.enabled).toBe(true);
     expect(loop.intervalMs).toBe(600_000);
-    expect(readFileSync(file, 'utf8')).toContain('    enabled: false');
+    expect(readFileSync(file, 'utf8')).not.toContain('    enabled: false');
   });
 
   it('leaves an enabled loop enabled when every target is on ACP', async () => {

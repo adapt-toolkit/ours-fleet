@@ -262,7 +262,7 @@ function AuditView() {
   }, []);
   useLivePoll(refresh, reason => setError((reason as Error).message));
   return <div className="content"><div className="panel"><h2>Security & action metadata</h2>
-    <p className="muted">Prompt text, terminal bytes, credentials, and log content are never recorded here.</p>
+    <p className="muted">Prompt text, credentials, and log content are never recorded here.</p>
     {error && <p className="warning">Refresh failed: {error}</p>}
     <div className="audit-list">{records.map((record, index) =>
       <div key={index}><time>{new Date(record.at).toLocaleString()}</time><strong>{record.action}</strong><span>{record.result}</span></div>)}</div>

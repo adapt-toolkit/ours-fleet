@@ -37,7 +37,7 @@ vars:
 
 defaults:
   harness: claude-code        # adapter for roles that don't set their own
-  session: tmux               # tmux (default) | acp; independent of harness
+  session: acp                # supported Fleet↔agent session path
   permissions:                # common intent translated to each harness/backend
     approval: ask             # ask | allow | deny
     filesystem: workspace     # read-only | workspace | unrestricted
@@ -61,7 +61,7 @@ defaults:
   #   config:
   #     model_reasoning_effort: high
   #
-  # To run those roles over ACP instead of tmux:
+  # To override the default ACP agent command:
   # session: acp
   # session_options:
   #   acp:

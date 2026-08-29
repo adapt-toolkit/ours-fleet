@@ -8,23 +8,22 @@ import {
   type ResolvedRole,
 } from './config.js';
 import { getAdapter } from './harness/registry.js';
-import type { AcpLaunch, Launch } from './harness/types.js';
-import { Tmux } from './tmux.js';
 import {
   createMonitor, probeIdentityPresence,
   type MonitorDeps, type MonitorHandle, type MonitorOpts, type FetchLike,
 } from './monitor.js';
-import { realExec, shq, type Exec } from './exec.js';
+import { realExec, type Exec } from './exec.js';
 import { resolveIsolation } from './isolation/policy.js';
 import { selectIsolationBackend } from './isolation/registry.js';
 import { resourceArgs, cpuControllerDelegated } from './isolation/resources.js';
 import type { WrapContext } from './isolation/types.js';
 import { resolveLaunchRuntime } from './isolation/runtime.js';
-import { AcpSession, type AcpSessionOptions } from './session/acp.js';
 import { controlRequest, RoleControlServer } from './session/control.js';
-import { TmuxSession } from './session/tmux.js';
 import { ACP_CANCEL_DEADLINE_EXCEEDED, classifyShellStatus } from './session/types.js';
-import type { ExitRecord, SessionHandle, TurnResult } from './session/types.js';
+import type { AgentSession, ExitRecord, TurnResult } from './session/types.js';
+import type {
+  AgentSessionAdapter, AgentSessionStartOptions,
+} from './harness/agent-session.js';
 import {
   effectiveModelForRole, modelRecoveryHeld, reconcileModelRecovery, recordModelFailure,
   classifyFailureText,
@@ -52,7 +51,6 @@ import {
 } from './temp-lifecycle.js';
 
 export interface RunnerDeps {
-  tmux: Tmux;
   exec: Exec;
   cpuDelegated(): boolean;
   isAlive(pid: number): boolean;
@@ -66,10 +64,13 @@ export interface RunnerDeps {
   /** Construct trusted owner ingress (injectable for lifecycle tests). */
   createOwnerChannel(opts: OwnerChannelOptions): OwnerChannelHandle;
   /** Start the ACP transport (injectable for deterministic runner lifecycle tests). */
-  startAcpSession(opts: AcpSessionOptions): Promise<SessionHandle>;
+  /** Neutral construction seam for deterministic runner lifecycle tests. */
+  startAgentSession(
+    adapter: AgentSessionAdapter, options: AgentSessionStartOptions,
+  ): Promise<AgentSession>;
   /** Construct the authenticated role control route (injectable where sockets are unavailable). */
   createControlServer(
-    stateDir: string, session: SessionHandle, log: (line: string) => void,
+    stateDir: string, session: AgentSession, log: (line: string) => void,
   ): Pick<RoleControlServer,
     'start' | 'close' | 'setFleetSpawner' | 'setOwnerChannel' | 'setConfigReloader' | 'setLoopManager'>;
   /** Acquire the cross-process owner-channel binder lease before replacing the control socket. */
@@ -81,7 +82,6 @@ export interface RunnerDeps {
 }
 
 const defaultDeps = (): RunnerDeps => ({
-  tmux: new Tmux(),
   exec: realExec,
   cpuDelegated: () => cpuControllerDelegated(),
   isAlive: pid => { try { process.kill(pid, 0); return true; } catch { return false; } },
@@ -91,7 +91,7 @@ const defaultDeps = (): RunnerDeps => ({
   fetch: (url, init) => globalThis.fetch(url, init) as unknown as ReturnType<FetchLike>,
   createMonitor: opts => createMonitor(opts),
   createOwnerChannel: opts => new OwnerChannel(opts),
-  startAcpSession: opts => AcpSession.start(opts),
+  startAgentSession: (adapter, options) => adapter.start(options),
   createControlServer: (stateDir, session, log) => new RoleControlServer(stateDir, session, log),
   acquireOwnerBinder: (stateDir, role, identity) => acquireOwnerBinderLease(
     stateDir, role, identity),
@@ -186,42 +186,10 @@ export function recordMonitorOwner(dir: string, owner: 'fleet' | 'native'): bool
   return owner === 'fleet' && previous === 'native';
 }
 
-/**
- * Compose the tmux pane shell command: env prefix + argv + exit-status capture.
- * `paneArgv` defaults to `launch.argv`; when isolation is active the caller passes
- * the sandbox-wrapped argv (e.g. `bwrap … -- claude …`). The `env` prefix and the
- * `echo $? > exitfile` capture stay host-side, outside the sandbox, so the runner
- * still sees the real exit code.
- */
-export function buildPaneCommand(
-  launch: Launch, roleEnv: Record<string, string> | undefined, exitStatusPath: string,
-  paneArgv: string[] = launch.argv,
-): string {
-  const env: Record<string, string> = {
-    PATH: process.env.PATH ?? '', COLORTERM: 'truecolor', ...launch.env, ...(roleEnv ?? {}),
-  };
-  delete env[OBSOLETE_OURS_AUTOSTART_ENV];
-  // Interactive panes should advertise colour even when the supervisor itself
-  // was launched with NO_COLOR. A role may still deliberately opt back in to
-  // NO_COLOR (or replace COLORTERM) through its explicit env block.
-  const unsetNoColor = Object.prototype.hasOwnProperty.call(roleEnv ?? {}, 'NO_COLOR')
-    ? '' : '-u NO_COLOR ';
-  const envPfx = 'env -u OURS_AUTOSTART ' + unsetNoColor
-    + Object.entries(env).map(([k, v]) => `${k}=${shq(v)}`).join(' ');
-  const cmd = paneArgv.map(shq).join(' ');
-  // Write a structured record, not a bare number: the wait status alone cannot
-  // say whether the file is missing because the program never exited or because
-  // nothing ever wrote it. `printf` is POSIX; no shell branching is needed
-  // because classification happens in one place, in TypeScript.
-  const record = `'{"version":1,"backend":"tmux","status":'"$__ofs"'}'`;
-  return `${envPfx} ${cmd}; __ofs=$?; printf %s ${record} > ${shq(exitStatusPath)}`;
-}
-
 /** Adapt runner deps and the role's daemon-profile overrides for the monitor. */
 function monitorDeps(deps: RunnerDeps, roleEnv?: Record<string, string>): MonitorDeps {
   return {
     fetch: deps.fetch,
-    tmux: deps.tmux,
     isAlive: deps.isAlive,
     sleep: deps.sleep,
     now: deps.now,
@@ -592,17 +560,10 @@ export async function runOnce(
 
   const runCwd = role.cwd && existsSync(role.cwd) ? role.cwd : dir;
   const prep = await adapter.prepareSession(role, { stateDir: dir, runCwd });
-  const sessionBackend = role.session ?? 'tmux';
-  let launch = sessionBackend === 'acp'
-    ? (() => {
-        if (!adapter.buildAcpLaunch)
-          throw new Error(`harness '${role.harness}' does not support the ACP session backend`);
-        return adapter.buildAcpLaunch(role, prep);
-      })()
-    : adapter.buildLaunch(role, mode, { sessionId }, prep);
+  const sessionBackend = role.session ?? 'acp';
+  let launch = adapter.agentSession.prepareLaunch(role, prep);
 
-  // Isolation is additive: only roles that declare `isolation:` are wrapped. The
-  // env prefix + exit capture in buildPaneCommand stay host-side.
+  // Isolation is additive: only roles that declare `isolation:` are wrapped.
   let wrappedArgv = launch.argv;
   if (role.isolation) {
     // Start with the same durable context that config validation and doctor judged,
@@ -638,7 +599,7 @@ export async function runOnce(
   // user unit concurrently on boot; `ours-fleet up`/restart-all bulk-start) does not
   // hit the harness/API rate limit at once. Time-based via a shared launch gate, so
   // a lone start or a solo crash-restart waits zero. Applied right before the harness
-  // launch (tmux.newSession); the cheap monitor prime still runs immediately after.
+  // agent-session start; the cheap monitor prime still runs immediately after.
   if (staggerMs > 0) {
     const slot = await reserveLaunchSlot(stateRoot(), staggerMs, deps);
     const wait = slot - deps.now();
@@ -653,7 +614,7 @@ export async function runOnce(
   // (backlog before the tip is the SessionStart hook's job). Native-mode roles
   // leave wake ownership to the harness. Temp snapshots predating `monitor:` are
   // treated as native (monitor may be undefined on an old role.yaml).
-  let sessionHandle: SessionHandle | undefined;
+  let sessionHandle: AgentSession | undefined;
   let modelRecovery: 'advance' | 'hold' | undefined;
   const resolvedMonitorDeps = monitorDeps(deps, role.env);
   resolvedMonitorDeps.onFailureEvidence = evidence => {
@@ -687,7 +648,7 @@ export async function runOnce(
 
   rmSync(exitFile, { force: true });
   let pid: number;
-  let acpSession: SessionHandle | undefined;
+  let agentSession: AgentSession | undefined;
   let control: ReturnType<RunnerDeps['createControlServer']> | undefined;
   let unsubscribeRecovery: (() => void) | undefined;
   let monitorLoop: Promise<void> | undefined;
@@ -702,7 +663,7 @@ export async function runOnce(
   let loopGeneration = JSON.stringify((role.loops ?? []).map(loop => [
     loop.name, loop.definitionHash, loop.promptHash,
   ]));
-  if (sessionBackend === 'acp') {
+  {
     const perms = role.permissions ?? resolvePermissions(undefined, undefined);
     // Say once, at startup, that this role will decide permission requests by
     // itself. Without it the only trace of an auto-denied tool call is a turn
@@ -710,34 +671,16 @@ export async function runOnce(
     if (perms.unattended === 'deny')
       deps.log(`[${name}] permission policy: unattended=deny — with no console attached, ` +
         `permission requests are automatically denied once each (reject_once) and the turn continues`);
-    acpSession = await deps.startAcpSession({
-      name,
-      argv: wrappedArgv,
-      cwd: runCwd,
-      env: harnessChildEnv(role, launch.env, dir),
-      stateDir: dir,
-      mode,
-      permissions: perms,
-      modeId: adapter.acpPermissionModeId?.(role),
-      // The role's declared MCP servers, and the bundled agent's `_meta`
-      // vocabulary for the options it takes no flag for. Both come from the
-      // ADAPTER and from `prep`: the ACP launch cannot carry `prep.argv`, so this
-      // is the route by which harness_options that used to be silently dropped
-      // for an ACP role actually reach the session.
-      mcpServers: adapter.acpMcpServers?.(role),
-      sessionMeta: adapter.acpSessionMeta?.(role, prep),
-      permissionMode: effectivePermissionMode(role),
-      // Provenance travels with the exact ACP launch. Keeping it out of a
-      // role-only adapter hook prevents a PATH fallback or resolver skew from
-      // claiming metadata trust for an argv it did not authenticate.
-      permissionMetadataSource: (launch as AcpLaunch).permissionMetadataSource,
-      scrubObsoleteOursAutostart: true,
-      log: deps.log,
+    agentSession = await deps.startAgentSession(adapter.agentSession, {
+      role, prep,
+      launch: { ...launch, argv: wrappedArgv, env: harnessChildEnv(role, launch.env, dir) },
+      cwd: runCwd, stateDir: dir, mode, permissions: perms,
+      permissionMode: effectivePermissionMode(role), log: deps.log,
     });
-    pid = acpSession.pid;
-    arbiter = new RoleTurnArbiter(acpSession);
+    pid = agentSession.pid;
+    arbiter = new RoleTurnArbiter(agentSession);
     sessionHandle = arbiter;
-    unsubscribeRecovery = acpSession.subscribe(event => {
+    unsubscribeRecovery = agentSession.subscribe(event => {
       if (event.kind !== 'error' || !event.text) return;
       const evidence = classifyFailureText(
         event.text, 'acp', new Date(deps.now()).toISOString());
@@ -757,7 +700,7 @@ export async function runOnce(
               + `${(notifyError as Error)?.message ?? String(notifyError)}`);
           }
         }
-        await acpSession.close();
+        await agentSession.close();
         unsubscribeRecovery?.();
         throw new Error(`[${name}] owner channel failed to start: `
           + `${(error as Error)?.message ?? String(error)}`);
@@ -767,7 +710,7 @@ export async function runOnce(
     try { await control.start(); }
     catch (error) {
       ownerBinder?.release();
-      await acpSession.close();
+      await agentSession.close();
       unsubscribeRecovery?.();
       throw error;
     }
@@ -843,7 +786,7 @@ export async function runOnce(
     const started = await starting;
     // A temporary role's first turn can be the active turn when an ours wake
     // needs immediate attention. A typed console/monitor cancellation ends
-    // only that turn: the already-live ACP session and any queued wake remain
+    // only that turn: the already-live agent session and any queued wake remain
     // valid. Keep every unproven cancellation, refusal, shutdown, and genuine
     // failure terminal so a role that never accepted its briefing is not
     // silently reported as healthy.
@@ -852,7 +795,7 @@ export async function runOnce(
       monitor?.stop();
       await control.close();
       ownerBinder?.release();
-      await acpSession.close();
+      await agentSession.close();
       unsubscribeRecovery?.();
       if (modelRecovery) {
         if (monitorLoop) await monitorLoop;
@@ -894,7 +837,7 @@ export async function runOnce(
         await ownerChannel.close().catch(() => undefined);
         await control.close();
         ownerBinder?.release();
-        await acpSession.close();
+        await agentSession.close();
         unsubscribeRecovery?.();
         throw new Error(`[${name}] owner channel failed to start: `
           + `${(error as Error)?.message ?? String(error)}`);
@@ -947,18 +890,6 @@ export async function runOnce(
         deps.log(`[${name}] scheduled loop manager unavailable: ${(error as Error)?.name ?? 'Error'}`);
       }
     }
-  } else {
-    await deps.tmux.kill(name);
-    await deps.tmux.newSession(
-      name, runCwd, buildPaneCommand(launch, role.env, exitFile, wrappedArgv));
-    let panePid: number | null = null;
-    for (let i = 0; i < 40 && panePid === null; i++) {
-      panePid = await deps.tmux.panePid(name);
-      if (panePid === null) await deps.sleep(250);
-    }
-    if (panePid === null) throw new Error(`[${name}] could not resolve tmux pane pid`);
-    pid = panePid;
-    sessionHandle = new TmuxSession(name, pid, deps.tmux, deps.isAlive);
   }
   deps.log(
     `[${name}] up; pid=${pid} cwd=${runCwd} harness=${role.harness} session=${sessionBackend} mode=${mode}`);
@@ -994,7 +925,7 @@ export async function runOnce(
       } else if (presence.state === 'absent' && identityObserved) {
         identityAbsentSince ??= now;
         // Require a continuous, time-bounded run of authoritative absence.
-        // The first positive observation is the readiness gate: cold tmux
+        // The first positive observation is the readiness gate: cold harness
         // starts may spend minutes loading the harness and briefing before the
         // agent creates/binds its identity, and absence before then is not a
         // close event. After readiness, debounce a real disappearance.
@@ -1036,18 +967,13 @@ export async function runOnce(
   ownerBinder?.release();
   if (monitor) { monitor.stop(); await monitorLoop; }
   unsubscribeRecovery?.();
-  if (acpSession && !sessionClosed) await acpSession.close();
+  if (agentSession && !sessionClosed) await agentSession.close();
   const elapsed = (deps.now() - start) / 1000;
   // Establish what actually happened before deciding anything. Absence of a
   // record is `unknown` — except when the console itself is gone, which is a
   // different event with a different consequence.
-  const exitRecord: ExitRecord = acpSession
-    ? acpSession.exitResult()
-      ?? { version: 1, class: 'unknown', detail: 'the ACP agent stopped without reporting an exit' }
-    : readExitRecord(exitFile)
-      ?? (await deps.tmux.has(name)
-        ? { version: 1, class: 'unknown', detail: 'the pane process ended without writing an exit record' }
-        : { version: 1, class: 'session-destroyed', detail: `the tmux session '${name}' no longer exists` });
+  const exitRecord: ExitRecord = agentSession.exitResult()
+    ?? { version: 1, class: 'unknown', detail: 'the agent session stopped without reporting an exit' };
   writeFileSync(exitFile, JSON.stringify({
     ...exitRecord, at: new Date(deps.now()).toISOString(), elapsedSecs: Number(elapsed.toFixed(1)),
   }) + '\n');

@@ -3,7 +3,7 @@ import { realExec, shq, type Exec } from '../exec.js';
 import type { SupervisorBackend } from './types.js';
 
 /**
- * No supervision: sessions are plain tmux, nothing survives a reboot and
+ * No service supervision: tmux contains the direct runner process, nothing survives a reboot and
  * nothing restarts on crash. Used for temp agents and CI tests
  * (OURS_FLEET_SUPERVISOR=none).
  */
@@ -11,7 +11,7 @@ export function makeNoneBackend(exec: Exec = realExec): SupervisorBackend {
   const tmux = new Tmux(exec);
   return {
     id: 'none',
-    async init() { return ['no supervisor: sessions are plain tmux (no reboot survival)']; },
+    async init() { return ['no service supervisor: direct runner containment only (no reboot survival)']; },
     async install(name, binPath) {
       const existed = await tmux.kill(name);        // true when a session was there
       await tmux.newSession(name, process.cwd(), `${shq(binPath)} _run ${shq(name)}`);

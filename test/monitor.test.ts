@@ -41,35 +41,14 @@ function scriptedFetch(script: Scripted[], onCall?: (url: string, n: number) => 
   return { fetch, calls: () => calls };
 }
 
-interface FakeTmux {
-  has: MonitorDeps['tmux']['has'];
-  capture: MonitorDeps['tmux']['capture'];
-  sendText: MonitorDeps['tmux']['sendText'];
-  sendKey: MonitorDeps['tmux']['sendKey'];
-  sent: string[];
-  enters: number;
-}
-function fakeTmux(opts: { has?: boolean; pane?: () => string } = {}): FakeTmux {
-  const sent: string[] = [];
-  let enters = 0;
-  return {
-    sent, get enters() { return enters; },
-    has: async () => opts.has ?? true,
-    capture: async () => (opts.pane ? opts.pane() : ''),
-    sendText: async (_n: string, t: string) => { sent.push(t); },
-    sendKey: async (_n: string, _k: string) => { enters++; },
-  } as FakeTmux;
-}
-
 let dir: string;
 beforeEach(() => { dir = mkdtempSync(join(tmpdir(), 'ours-fleet-mon-')); });
 afterEach(() => { rmSync(dir, { recursive: true, force: true }); });
 
-function makeDeps(fetch: MonitorDeps['fetch'], tmux: FakeTmux, over: Partial<MonitorDeps> = {}): MonitorDeps {
+function makeDeps(fetch: MonitorDeps['fetch'], over: Partial<MonitorDeps> = {}): MonitorDeps {
   let clock = 0;
   return {
     fetch,
-    tmux,
     isAlive: () => true,
     // Virtual clock, but yield to the macrotask queue so a runaway loop in the
     // monitor surfaces as a vitest timeout instead of starving timers and hanging
@@ -429,7 +408,7 @@ describe('Monitor.prime', () => {
     const fetch: MonitorDeps['fetch'] = async (_url, init) => new Promise((_resolve, reject) => {
       init?.signal?.addEventListener('abort', () => reject(new Error('This operation was aborted')));
     });
-    const deps = makeDeps(fetch, fakeTmux(), {
+    const deps = makeDeps(fetch, {
       timers: {
         set: callback => { timeout = callback; return 1 as unknown as ReturnType<typeof setTimeout>; },
         clear: () => undefined,
@@ -445,8 +424,7 @@ describe('Monitor.prime', () => {
 
   it('primes at tip, records the cursor, and marks armed', async () => {
     const { fetch, calls } = scriptedFetch([{ cursor: 128, events: [] }]);
-    const tmux = fakeTmux();
-    const mon = createMonitor({ name: 'A', agentDir: dir, cfg: CFG(), deps: makeDeps(fetch, tmux) });
+    const mon = createMonitor({ name: 'A', agentDir: dir, cfg: CFG(), deps: makeDeps(fetch) });
     await mon.prime();
     expect(calls()[0]).toContain('since=tip');
     expect(readFileSync(join(dir, '.notify-cursor'), 'utf8').trim()).toBe('128');
@@ -463,7 +441,7 @@ describe('Monitor.prime', () => {
     }));
     const { fetch, calls } = scriptedFetch([]);
     const mon = createMonitor({
-      name: 'A', agentDir: dir, cfg: CFG(), deps: makeDeps(fetch, fakeTmux()),
+      name: 'A', agentDir: dir, cfg: CFG(), deps: makeDeps(fetch),
     });
     await mon.prime();
     expect(calls()).toEqual([]);
@@ -480,7 +458,7 @@ describe('Monitor.prime', () => {
     }));
     const { fetch, calls } = scriptedFetch([{ cursor: 128, events: [] }]);
     const mon = createMonitor({
-      name: 'A', agentDir: dir, cfg: CFG(), deps: makeDeps(fetch, fakeTmux()),
+      name: 'A', agentDir: dir, cfg: CFG(), deps: makeDeps(fetch),
     });
     await mon.prime({ resetCursor: true });
     expect(calls()[0]).toContain('since=tip');
@@ -491,12 +469,10 @@ describe('Monitor.prime', () => {
 
   it('marks failed and never injects on a 401', async () => {
     const { fetch } = scriptedFetch([{ status: 401 }]);
-    const tmux = fakeTmux();
-    const mon = createMonitor({ name: 'A', agentDir: dir, cfg: CFG(), deps: makeDeps(fetch, tmux) });
+    const mon = createMonitor({ name: 'A', agentDir: dir, cfg: CFG(), deps: makeDeps(fetch) });
     await mon.prime();
     expect(readFileSync(join(dir, '.monitor-status'), 'utf8')).toMatch(/failed/);
     await mon.run(1);                       // must return immediately, no throw
-    expect(tmux.sent).toEqual([]);
   });
 
   it('names the selected config and token-file paths on a 401 without exposing the token', async () => {
@@ -504,7 +480,7 @@ describe('Monitor.prime', () => {
     const stateDir = join(dir, 'selected-state');
     writeFileSync(configPath, JSON.stringify({ apiToken: 'super-secret', stateDir }));
     const { fetch } = scriptedFetch([{ status: 401 }]);
-    const deps = makeDeps(fetch, fakeTmux(), { env: { OURS_CONFIG: configPath } });
+    const deps = makeDeps(fetch, { env: { OURS_CONFIG: configPath } });
     const mon = createMonitor({ name: 'A', agentDir: dir, cfg: CFG(), deps });
     await mon.prime();
     const status = readFileSync(join(dir, '.monitor-status'), 'utf8');
@@ -516,7 +492,7 @@ describe('Monitor.prime', () => {
 
   it('degrades (does not throw) when the daemon is down at prime', async () => {
     const { fetch } = scriptedFetch([{ throw: 'ECONNREFUSED' }]);
-    const mon = createMonitor({ name: 'A', agentDir: dir, cfg: CFG(), deps: makeDeps(fetch, fakeTmux()) });
+    const mon = createMonitor({ name: 'A', agentDir: dir, cfg: CFG(), deps: makeDeps(fetch) });
     await expect(mon.prime()).resolves.toBeUndefined();
     expect(readFileSync(join(dir, '.monitor-status'), 'utf8')).toMatch(/degraded/);
   });
@@ -524,7 +500,6 @@ describe('Monitor.prime', () => {
 
 describe('Monitor.run — delivery', () => {
   it('routes notifications by configured identity, not role name', async () => {
-    const tmux = fakeTmux();
     const { fetch, calls } = scriptedFetch([
       { cursor: 1, events: [] },
       { cursor: 2, events: [] },
@@ -532,7 +507,7 @@ describe('Monitor.run — delivery', () => {
     let mon: ReturnType<typeof createMonitor>;
     mon = createMonitor({
       name: 'Reviewer', identity: 'Alice', agentDir: dir, cfg: CFG({ batch_ms: 0 }),
-      deps: makeDeps(fetch, tmux),
+      deps: makeDeps(fetch),
     });
     await mon.prime();
     await mon.run(1);
@@ -540,63 +515,13 @@ describe('Monitor.run — delivery', () => {
     expect(calls().some(url => url.includes('/identities/Reviewer/'))).toBe(false);
   });
 
-  it('does not commit the cursor until a failed delivery is later accepted', async () => {
-    const tmux = fakeTmux();
-    let attempts = 0;
-    tmux.sendText = async (_name, text) => {
-      tmux.sent.push(text);
-      attempts++;
-      if (attempts === 1) throw new Error('tmux send failed');
-      mon.stop();
-    };
-    const { fetch } = scriptedFetch([
-      { cursor: 1, events: [] },
-      { cursor: 2, events: [{ event: 'message_received', from: 'C', msg_id: 1 }] },
-      { cursor: 2, events: [] },
-    ]);
-    let mon: ReturnType<typeof createMonitor>;
-    mon = createMonitor({
-      name: 'A', agentDir: dir, cfg: CFG({ batch_ms: 0 }), deps: makeDeps(fetch, tmux),
-    });
-    await mon.prime();
-    await mon.run(1);
-    expect(attempts).toBe(2);
-    expect(readFileSync(join(dir, '.notify-cursor'), 'utf8').trim()).toBe('2');
-  });
-
-  it('persists body-free pending state while leaving the delivered cursor behind', async () => {
-    const tmux = fakeTmux();
-    let alive = true;
-    tmux.sendText = async () => { alive = false; throw new Error('pane disappeared'); };
-    const { fetch } = scriptedFetch([
-      { cursor: 1, events: [] },
-      { cursor: 2, events: [{ event: 'message_received', from: 'C', msg_id: 44 }] },
-    ]);
-    const mon = createMonitor({
-      name: 'Role', identity: 'Identity', agentDir: dir, cfg: CFG({ batch_ms: 0 }),
-      deps: makeDeps(fetch, tmux, { isAlive: () => alive }),
-    });
-    await mon.prime();
-    await mon.run(1);
-    expect(readFileSync(join(dir, '.notify-cursor'), 'utf8').trim()).toBe('1');
-    const state = JSON.parse(readFileSync(join(dir, '.monitor-state.json'), 'utf8'));
-    expect(state).toMatchObject({
-      identity: 'Identity',
-      observedCursor: 2,
-      deliveredCursor: 1,
-      pending: { count: 1, eventTypes: ['message_received'] },
-    });
-    expect(JSON.stringify(state)).not.toContain('44');
-  });
-
-  it('uses structured prompt delivery for ACP without touching tmux', async () => {
-    const tmux = fakeTmux();
+  it('uses structured prompt delivery for the agent session', async () => {
     const delivered: string[] = [];
     const { fetch } = scriptedFetch([
       { cursor: 1, events: [] },
       { cursor: 2, events: [{ event: 'message_received', from: 'C', msg_id: 9 }] },
     ]);
-    const deps = makeDeps(fetch, tmux, {
+    const deps = makeDeps(fetch, {
       delivery: {
         submit: async text => {
           delivered.push(text);
@@ -610,19 +535,17 @@ describe('Monitor.run — delivery', () => {
     await mon.prime();
     await mon.run(1);
     expect(delivered).toEqual(['[fleet-monitor] 1 new message from C (#9) — run get_messages']);
-    expect(tmux.sent).toEqual([]);
     expect(readFileSync(join(dir, '.notify-cursor'), 'utf8').trim()).toBe('2');
   });
 
   it('a refused ACP wake keeps the cursor, degrades with the reason, and replays', async () => {
-    const tmux = fakeTmux();
     const submitted: string[] = [];
     const { fetch } = scriptedFetch([
       { cursor: 1, events: [] },                                                  // prime tip
       { cursor: 2, events: [{ event: 'message_received', from: 'C', msg_id: 9 }] },
       { cursor: 2, events: [] },                                                  // replay poll
     ]);
-    const deps = makeDeps(fetch, tmux, {
+    const deps = makeDeps(fetch, {
       delivery: {
         submit: async text => {
           submitted.push(text);
@@ -645,13 +568,12 @@ describe('Monitor.run — delivery', () => {
   });
 
   it('a refusal that never recovers leaves the durable cursor behind and says why', async () => {
-    const tmux = fakeTmux();
     let submits = 0;
     const { fetch } = scriptedFetch([
       { cursor: 1, events: [] },
       { cursor: 2, events: [{ event: 'message_received', from: 'C', msg_id: 9 }] },
     ]);
-    const deps = makeDeps(fetch, tmux, {
+    const deps = makeDeps(fetch, {
       delivery: {
         submit: async () => {
           submits++;
@@ -678,12 +600,11 @@ describe('Monitor.run — delivery', () => {
   });
 
   it('a cancelled wake is likewise not a delivery', async () => {
-    const tmux = fakeTmux();
     const { fetch } = scriptedFetch([
       { cursor: 1, events: [] },
       { cursor: 2, events: [{ event: 'message_received', from: 'C', msg_id: 9 }] },
     ]);
-    const deps = makeDeps(fetch, tmux, {
+    const deps = makeDeps(fetch, {
       delivery: {
         submit: async () => { mon.stop(); return { succeeded: false, outcome: 'cancelled' }; },
       },
@@ -697,13 +618,12 @@ describe('Monitor.run — delivery', () => {
   });
 
   it('requests ACP interruption before delivering when monitor.interrupt is enabled', async () => {
-    const tmux = fakeTmux();
     const delivered: Array<{ text: string; interrupt?: boolean }> = [];
     const { fetch } = scriptedFetch([
       { cursor: 1, events: [] },
       { cursor: 2, events: [{ event: 'message_received', from: 'C', msg_id: 10 }] },
     ]);
-    const deps = makeDeps(fetch, tmux, {
+    const deps = makeDeps(fetch, {
       delivery: {
         submit: async (text, options) => {
           delivered.push({ text, interrupt: options?.interrupt });
@@ -725,13 +645,12 @@ describe('Monitor.run — delivery', () => {
   });
 
   it('passes after_tool through ACP and commits the cursor only after safe delivery completes', async () => {
-    const tmux = fakeTmux();
     const { fetch } = scriptedFetch([
       { cursor: 1, events: [] },
       { cursor: 2, events: [{ event: 'message_received', from: 'C', msg_id: 12 }] },
     ]);
     let completed = false;
-    const deps = makeDeps(fetch, tmux, {
+    const deps = makeDeps(fetch, {
       delivery: {
         submit: async (_text, options) => {
           expect(options?.interrupt).toBe('after_tool');
@@ -761,7 +680,7 @@ describe('Monitor.run — delivery', () => {
       { cursor: 1, events: [] },
       { cursor: 2, events: [{ event: 'message_received', from: 'C', msg_id: 13 }] },
     ]);
-    const deps = makeDeps(fetch, fakeTmux(), {
+    const deps = makeDeps(fetch, {
       delivery: {
         submit: async () => {
           mon.stop();
@@ -791,7 +710,7 @@ describe('Monitor.run — delivery', () => {
       { cursor: 2, events: [{ event: 'message_received', from: 'Architect', msg_id: 10 }] },
       { cursor: 3, events: [{ event: 'message_received', from: 'Verifier', msg_id: 11 }] },
     ]);
-    const deps = makeDeps(fetch, fakeTmux(), {
+    const deps = makeDeps(fetch, {
       delivery: {
         // ACP steering acknowledges immediately while the triggered agent turn
         // continues, so the second poll represents mail arriving during work.
@@ -834,7 +753,7 @@ describe('Monitor.run — delivery', () => {
         { event: 'message_received', from: 'Developer', msg_id: 21 },
       ] },
     ]);
-    const deps = makeDeps(fetch, fakeTmux(), {
+    const deps = makeDeps(fetch, {
       delivery: {
         submit: async text => {
           delivered.push(text);
@@ -855,547 +774,6 @@ describe('Monitor.run — delivery', () => {
     expect(readFileSync(join(dir, '.notify-cursor'), 'utf8').trim()).toBe('3');
   });
 
-  it('presses C-c before tmux wake delivery when monitor.interrupt is enabled', async () => {
-    const tmux = fakeTmux();
-    const keys: string[] = [];
-    const originalSendKey = tmux.sendKey;
-    tmux.sendKey = async (name, key) => {
-      keys.push(key);
-      await originalSendKey(name, key);
-    };
-    const { fetch } = scriptedFetch([
-      { cursor: 1, events: [] },
-      { cursor: 2, events: [{ event: 'message_received', from: 'C', msg_id: 11 }] },
-    ]);
-    const originalSendText = tmux.sendText;
-    tmux.sendText = async (name, text) => {
-      await originalSendText(name, text);
-      mon.stop();
-    };
-    let mon: ReturnType<typeof createMonitor>;
-    mon = createMonitor({
-      name: 'A', agentDir: dir, cfg: CFG({ batch_ms: 0, interrupt: true }),
-      deps: makeDeps(fetch, tmux),
-    });
-    await mon.prime();
-    await mon.run(1);
-    expect(keys[0]).toBe('C-c');
-    expect(tmux.sent).toHaveLength(1);
-  });
-
-  it('never sends C-c for after_tool on tmux and reports the conservative fallback', async () => {
-    const tmux = fakeTmux();
-    const keys: string[] = [];
-    const originalSendKey = tmux.sendKey;
-    tmux.sendKey = async (name, key) => {
-      keys.push(key);
-      await originalSendKey(name, key);
-    };
-    const { fetch } = scriptedFetch([
-      { cursor: 1, events: [] },
-      { cursor: 2, events: [{ event: 'message_received', from: 'C', msg_id: 14 }] },
-    ]);
-    const originalSendText = tmux.sendText;
-    tmux.sendText = async (name, text) => {
-      await originalSendText(name, text);
-      mon.stop();
-    };
-    let mon: ReturnType<typeof createMonitor>;
-    mon = createMonitor({
-      name: 'A', agentDir: dir, cfg: CFG({ batch_ms: 0, interrupt: 'after_tool' }),
-      deps: makeDeps(fetch, tmux),
-    });
-    await mon.prime();
-    await mon.run(1);
-    expect(keys).not.toContain('C-c');
-    expect(tmux.sent).toHaveLength(1);
-    expect(readFileSync(join(dir, '.monitor-status'), 'utf8'))
-      .toContain('after_tool unsupported by tmux');
-  });
-
-  it('injects one notification line for a filtered wake and advances the cursor', async () => {
-    const tmux = fakeTmux();
-    const { fetch } = scriptedFetch([
-      { cursor: 10, events: [] },                                             // prime tip
-      { cursor: 20, events: [                                                 // poll 1
-        { event: 'message_received', from: 'Coord', msg_id: 7 },
-        { event: 'sibling_contact_added', from: 'ignored' },                  // filtered out
-      ] },
-    ]);
-    let stopped = false;
-    const deps = makeDeps(fetch, tmux);
-    const mon = createMonitor({ name: 'A', agentDir: dir, cfg: CFG({ batch_ms: 0 }), deps });
-    // Stop the loop as soon as the line lands.
-    const origSend = tmux.sendText;
-    tmux.sendText = async (n, t) => { await origSend(n, t); if (!stopped) { stopped = true; mon.stop(); } };
-    await mon.prime();
-    await mon.run(1);
-    expect(tmux.sent).toHaveLength(1);
-    expect(tmux.sent[0]).toBe('[fleet-monitor] 1 new message from Coord (#7) — run get_messages');
-    expect(readFileSync(join(dir, '.notify-cursor'), 'utf8').trim()).toBe('20');
-  });
-
-  it('holds injection while a modal dialog is on screen, then delivers when it clears', async () => {
-    let modal = true;
-    const tmux = fakeTmux({ pane: () => (modal ? 'Do you want to proceed?\n❯ 1. Yes\n  2. No' : 'idle\n> ') });
-    const { fetch } = scriptedFetch([
-      { cursor: 1, events: [] },
-      { cursor: 2, events: [{ event: 'message_received', from: 'C', msg_id: 1 }] },
-    ]);
-    const deps = makeDeps(fetch, tmux);
-    let sleeps = 0;
-    const mon = createMonitor({
-      name: 'A', agentDir: dir, cfg: CFG({ batch_ms: 0 }),
-      deps: { ...deps, sleep: async (ms: number) => { await deps.sleep(ms); if (++sleeps === 3) modal = false; } },
-    });
-    const orig = tmux.sendText;
-    tmux.sendText = async (n, t) => { await orig(n, t); mon.stop(); };
-    await mon.prime();
-    await mon.run(1);
-    expect(modal).toBe(false);
-    expect(tmux.sent).toHaveLength(1);
-  });
-
-  it('does not inject and degrades when the session is offline', async () => {
-    const tmux = fakeTmux({ has: false });
-    const { fetch } = scriptedFetch([
-      { cursor: 1, events: [] },
-      { cursor: 2, events: [{ event: 'message_received', from: 'C', msg_id: 1 }] },
-    ]);
-    const deps = makeDeps(fetch, tmux, { isAlive: () => false });
-    const mon = createMonitor({ name: 'A', agentDir: dir, cfg: CFG({ batch_ms: 0 }), deps });
-    await mon.prime();
-    // isAlive false ⇒ run() should return promptly without injecting.
-    await mon.run(1);
-    expect(tmux.sent).toEqual([]);
-  });
-
-  it('re-sends Enter when the line is still sitting in the composer', async () => {
-    // pane keeps showing the injected text on the last line until the 2nd Enter.
-    let entersSeen = 0;
-    const line = '[fleet-monitor] 1 new message from C (#1) — run get_messages';
-    const tmux = fakeTmux({ pane: () => (entersSeen >= 1 ? 'submitted\n> ' : `│ > ${line}`) });
-    tmux.sendKey = async () => { entersSeen++; };
-    const { fetch } = scriptedFetch([
-      { cursor: 1, events: [] },
-      { cursor: 2, events: [{ event: 'message_received', from: 'C', msg_id: 1 }] },
-    ]);
-    const mon = createMonitor({ name: 'A', agentDir: dir, cfg: CFG({ batch_ms: 0 }), deps: makeDeps(fetch, tmux) });
-    const orig = tmux.sendText;
-    tmux.sendText = async (n, t) => { await orig(n, t); mon.stop(); };
-    await mon.prime();
-    await mon.run(1);
-    expect(tmux.sent).toHaveLength(1);
-    expect(entersSeen).toBeGreaterThanOrEqual(1);   // re-sent Enter at least once
-  });
-
-  it('re-sends Enter when a wrapped composer line starts fifth from the bottom', async () => {
-    const pane = [
-      `│ ❯ ${LONG_WAKE.slice(0, -12)}`,
-      `│   ${LONG_WAKE.slice(-12)}`,
-      '╰──────────────────────────────────────────────────────────╯',
-      '  ? for shortcuts',
-      '  /rc',
-    ].join('\n');
-    expect(await retryEntersForPane(pane)).toBe(1);
-  });
-
-  async function retryEntersForPane(pane: string): Promise<number> {
-    let stuck = true;
-    let submitEnters = 0;
-    const tmux = fakeTmux({ pane: () => stuck ? pane : 'submitted\n> ' });
-    tmux.sendKey = async (_name, key) => {
-      if (key === 'Enter') {
-        submitEnters++;
-        stuck = false;
-      }
-    };
-    const { fetch } = scriptedFetch([
-      { cursor: 1, events: [] },
-      { cursor: 2, events: [{ event: 'message_received', from: 'FleetCoordinator', msg_id: 459 }] },
-    ]);
-    const mon = createMonitor({ name: 'A', agentDir: dir, cfg: CFG({ batch_ms: 0 }), deps: makeDeps(fetch, tmux) });
-    const orig = tmux.sendText;
-    tmux.sendText = async (n, t) => { await orig(n, t); mon.stop(); };
-    await mon.prime();
-    await mon.run(1);
-    return submitEnters;
-  }
-
-  const LONG_WAKE = '[fleet-monitor] 1 new message from FleetCoordinator (#459) — run get_messages';
-
-  it('keeps detecting an unwrapped composer line with a one-row footer', async () => {
-    const pane = [
-      `│ ❯ ${LONG_WAKE}`,
-      '╰──────────────────────────────────────────────────────────╯',
-      '  ? for shortcuts',
-    ].join('\n');
-    expect(await retryEntersForPane(pane)).toBe(1);
-  });
-
-  it('detects an unwrapped line at the borderless Codex composer prompt', async () => {
-    const pane = [
-      `› ${LONG_WAKE}`,
-      '',
-      '  gpt-5 high · ~/work',
-    ].join('\n');
-    expect(await retryEntersForPane(pane)).toBe(1);
-  });
-
-  it('detects a wrapped composer line with a one-row footer', async () => {
-    const pane = [
-      `│ ❯ ${LONG_WAKE.slice(0, 60)}`,
-      `│   ${LONG_WAKE.slice(60)}`,
-      '╰──────────────────────────────────────────────────────────╯',
-      '  ? for shortcuts',
-    ].join('\n');
-    expect(await retryEntersForPane(pane)).toBe(1);
-  });
-
-  it('detects a wrapped composer line above a three-row footer', async () => {
-    const pane = [
-      `│ ❯ ${LONG_WAKE.slice(0, 60)}`,
-      `│   ${LONG_WAKE.slice(60)}`,
-      '╰──────────────────────────────────────────────────────────╯',
-      '  ? for shortcuts',
-      '  install gh for PR status',
-      '  /rc',
-    ].join('\n');
-    expect(await retryEntersForPane(pane)).toBe(1);
-  });
-
-  it('detects a composer line wrapped across three rows', async () => {
-    const pane = [
-      `│ ❯ ${LONG_WAKE.slice(0, 26)}`,
-      `│   ${LONG_WAKE.slice(26, 52)}`,
-      `│   ${LONG_WAKE.slice(52)}`,
-      '╰──────────────────────────────────────────────────────────╯',
-      '  ? for shortcuts',
-    ].join('\n');
-    expect(await retryEntersForPane(pane)).toBe(1);
-  });
-
-  it('detects a composer line when its first 48 characters cross a wrap boundary', async () => {
-    const pane = [
-      `│ ❯ ${LONG_WAKE.slice(0, 24)}`,
-      `│   ${LONG_WAKE.slice(24)}`,
-      '╰──────────────────────────────────────────────────────────╯',
-      '  ? for shortcuts',
-    ].join('\n');
-    expect(await retryEntersForPane(pane)).toBe(1);
-  });
-
-  it('treats an empty capture as not in the composer and wastes no Enter', async () => {
-    expect(await retryEntersForPane('')).toBe(0);
-  });
-
-  it('never re-sends Enter and degrades when a modal opens after wake submission', async () => {
-    let sent = false;
-    let retryEnters = 0;
-    const tmux = fakeTmux({
-      pane: () => sent ? [
-        `❯ ${LONG_WAKE}`,
-        'Do you want to allow this action?',
-        '❯ 1. Yes',
-        '  2. No',
-      ].join('\n') : 'idle\n> ',
-    });
-    tmux.sendKey = async (_name, key) => {
-      if (key === 'Enter') retryEnters++;
-    };
-    const { fetch } = scriptedFetch(
-      [
-        { cursor: 1, events: [] },
-        { cursor: 2, events: [{ event: 'message_received', from: 'FleetCoordinator', msg_id: 459 }] },
-      ],
-      (_url, i) => { if (i === 2) mon.stop(); },
-    );
-    let mon: ReturnType<typeof createMonitor>;
-    mon = createMonitor({ name: 'A', agentDir: dir, cfg: CFG({ batch_ms: 0 }), deps: makeDeps(fetch, tmux) });
-    const orig = tmux.sendText;
-    tmux.sendText = async (n, t) => {
-      await orig(n, t);
-      sent = true;
-    };
-
-    await mon.prime();
-    await mon.run(1);
-
-    expect(retryEnters).toBe(0);
-    expect(readFileSync(join(dir, '.monitor-status'), 'utf8'))
-      .toMatch(/degraded: modal .* — modal wedge during injection verification/);
-  });
-
-  it('resumes verification after a retry-path modal clears', async () => {
-    let sent = false;
-    let modal = true;
-    let stuck = true;
-    let retryEnters = 0;
-    const tmux = fakeTmux({
-      pane: () => {
-        if (!sent) return 'idle\n> ';
-        if (modal) return 'Do you want to allow this action?\n❯ 1. Yes\n  2. No';
-        if (stuck) return `│ ❯ ${LONG_WAKE}\n╰────────╯\n  ? for shortcuts`;
-        return 'submitted\n> ';
-      },
-    });
-    tmux.sendKey = async (_name, key) => {
-      if (key === 'Enter') {
-        retryEnters++;
-        stuck = false;
-        mon.stop();
-      }
-    };
-    const { fetch } = scriptedFetch([
-      { cursor: 1, events: [] },
-      { cursor: 2, events: [{ event: 'message_received', from: 'FleetCoordinator', msg_id: 459 }] },
-    ]);
-    const base = makeDeps(fetch, tmux);
-    let mon: ReturnType<typeof createMonitor>;
-    mon = createMonitor({
-      name: 'A',
-      agentDir: dir,
-      cfg: CFG({ batch_ms: 0 }),
-      deps: {
-        ...base,
-        sleep: async ms => {
-          await base.sleep(ms);
-          if (ms === 5_000) modal = false;
-        },
-      },
-    });
-    const orig = tmux.sendText;
-    tmux.sendText = async (n, t) => {
-      await orig(n, t);
-      sent = true;
-    };
-
-    await mon.prime();
-    await mon.run(1);
-
-    expect(retryEnters).toBe(1);
-    expect(readFileSync(join(dir, '.monitor-status'), 'utf8').trim()).toMatch(/^armed at /);
-  });
-
-  it('retries with backoff on a transient error, then delivers', async () => {
-    const tmux = fakeTmux();
-    const { fetch } = scriptedFetch([
-      { cursor: 1, events: [] },                                              // prime
-      { throw: 'daemon bounce' },                                             // transient
-      { cursor: 3, events: [{ event: 'message_received', from: 'C', msg_id: 9 }] },
-    ]);
-    const mon = createMonitor({ name: 'A', agentDir: dir, cfg: CFG({ batch_ms: 0 }), deps: makeDeps(fetch, tmux) });
-    const orig = tmux.sendText;
-    tmux.sendText = async (n, t) => { await orig(n, t); mon.stop(); };
-    await mon.prime();
-    await mon.run(1);
-    expect(tmux.sent).toHaveLength(1);
-    expect(tmux.sent[0]).toContain('#9');
-  });
-
-  it('gives up on a persistent modal and degrades instead of waiting forever', async () => {
-    // A pane the modal heuristic never clears (a real dialog nobody answers, or a
-    // false positive). Delivery must not spin silently: it has to stop, leave an
-    // explicit status, and still never press Enter into the dialog.
-    const tmux = fakeTmux({ pane: () => 'Do you want to proceed?\n❯ 1. Yes\n  2. No' });
-    const { fetch } = scriptedFetch(
-      [{ cursor: 1, events: [] }, { cursor: 2, events: [{ event: 'message_received', from: 'C', msg_id: 1 }] }],
-      (_url, i) => { if (i === 2) mon.stop(); },      // stop on the poll after delivery gave up
-    );
-    let mon: ReturnType<typeof createMonitor>;
-    const base = makeDeps(fetch, tmux);
-    const modalWaitMs: number[] = [];
-    mon = createMonitor({
-      name: 'A', agentDir: dir, cfg: CFG({ batch_ms: 0 }),
-      deps: { ...base, sleep: async (ms: number) => { modalWaitMs.push(ms); await base.sleep(ms); } },
-    });
-    await mon.prime();
-    await mon.run(1);                                 // must return, not hang
-
-    expect(tmux.sent).toEqual([]);                    // never typed into the dialog
-    expect(readFileSync(join(dir, '.monitor-status'), 'utf8')).toMatch(/degraded: modal .* modal wedge/);
-    // Bounded, but not trigger-happy: long enough for a human to answer a real
-    // dialog, short enough that a wedge surfaces in the status within minutes.
-    const waited = modalWaitMs.filter(ms => ms === 5_000).reduce((a, b) => a + b, 0);
-    expect(waited).toBeGreaterThanOrEqual(60_000);
-    expect(waited).toBeLessThanOrEqual(300_000);
-  });
-
-  it('re-arms after a modal wedge once the pane clears on a later wake', async () => {
-    // The degraded status must not be sticky: the next wake that gets through
-    // re-arms it.
-    let modal = true;
-    const tmux = fakeTmux({ pane: () => (modal ? 'Do you want to proceed?\n❯ 1. Yes\n  2. No' : 'idle\n> ') });
-    const { fetch } = scriptedFetch(
-      [
-        { cursor: 1, events: [] },
-        { cursor: 2, events: [{ event: 'message_received', from: 'C', msg_id: 1 }] },  // wedges
-        { cursor: 3, events: [{ event: 'message_received', from: 'C', msg_id: 2 }] },  // delivers
-      ],
-      (_url, i) => { if (i === 2) modal = false; if (i === 3) mon.stop(); },
-    );
-    let mon: ReturnType<typeof createMonitor>;
-    const statuses: string[] = [];
-    mon = createMonitor({ name: 'A', agentDir: dir, cfg: CFG({ batch_ms: 0 }), deps: makeDeps(fetch, tmux) });
-    const orig = tmux.sendText;
-    tmux.sendText = async (n, t) => { statuses.push(readFileSync(join(dir, '.monitor-status'), 'utf8').trim()); await orig(n, t); };
-    await mon.prime();
-    await mon.run(1);
-
-    expect(tmux.sent).toHaveLength(1);                          // only the second wake landed
-    expect(statuses[0]).toMatch(/degraded: modal at \S+ — modal wedge/);   // the wedge was recorded…
-    expect(readFileSync(join(dir, '.monitor-status'), 'utf8').trim())
-      .toMatch(/^armed at /);                                             // …and cleared
-  });
-
-  it('is disabled short-circuit: run() with a fatal prime never polls the loop', async () => {
-    const { fetch, calls } = scriptedFetch([{ status: 401 }]);
-    const mon = createMonitor({ name: 'A', agentDir: dir, cfg: CFG(), deps: makeDeps(fetch, fakeTmux()) });
-    await mon.prime();
-    await mon.run(1);
-    expect(calls()).toHaveLength(1);        // only the prime fetch happened
-  });
-});
-
-describe('Monitor.run — turn-outcome degradation (issue #19: refusal-wedge)', () => {
-  // A wedged session: delivery keeps succeeding (status looks armed) but every
-  // delivered wake's turn dies with `API Error:`. After N consecutive such turns
-  // the monitor must degrade `.monitor-status`, then re-arm on the first turn that
-  // completes cleanly. The pane the monitor captures during turn observation is
-  // what encodes the outcome.
-  const API_ERROR_PANE = 'ran get_messages\n⎿  API Error: Claude Code is unable to respond (usage policy)\n';
-  const COMPLETED_PANE = 'assistant: replied to Coord and drained the mail.\n> ';
-  const status = () => readFileSync(join(dir, '.monitor-status'), 'utf8').trim();
-
-  it('degrades after N consecutive API-error turns and re-arms on a completed turn', async () => {
-    const N = 3;
-    let pane = API_ERROR_PANE;
-    const tmux = fakeTmux({ pane: () => pane });
-    // prime, then N api-error wakes, then one final wake whose turn completes cleanly.
-    const wake = (k: number) => ({ cursor: 10 + k, events: [{ event: 'message_received', from: 'Coord', msg_id: k }] as NotifyEvent[] });
-    const { fetch } = scriptedFetch(
-      [{ cursor: 1, events: [] }, ...Array.from({ length: N + 1 }, (_, k) => wake(k))],
-      (_url, i) => { if (i === N + 2) mon.stop(); },   // stop on the quiet poll after the last delivery
-    );
-    let mon: ReturnType<typeof createMonitor>;
-    const deps = makeDeps(fetch, tmux);
-    mon = createMonitor({ name: 'A', agentDir: dir, cfg: CFG({ batch_ms: 0, turn_fail_threshold: N }), deps });
-
-    let delivered = 0;
-    const perTurnStatus: string[] = [];
-    const origSend = tmux.sendText;
-    tmux.sendText = async (n, t) => {
-      if (delivered > 0) perTurnStatus.push(status());   // status left by the PREVIOUS turn's observation
-      await origSend(n, t);
-      delivered++;
-      if (delivered === N + 1) pane = COMPLETED_PANE;     // the final turn completes cleanly
-    };
-
-    await mon.prime();
-    await mon.run(1);
-
-    // perTurnStatus[k] is the status after delivered turn (k+1). The first N-1 stay
-    // armed (streak below N); the Nth reading (after the Nth api-error turn) degrades.
-    expect(perTurnStatus[0]).toMatch(/^armed at /);              // after turn 1 (streak 1)
-    expect(perTurnStatus[1]).toMatch(/^armed at /);              // after turn 2 (streak 2)
-    expect(perTurnStatus[2]).toMatch(                            // after turn 3 (streak 3 === N)
-      /^degraded: turns-failing at \S+ — turns failing \(api error\)$/);
-    expect(status()).toMatch(/^armed at /);      // after the final completed turn: re-armed
-    expect(tmux.sent).toHaveLength(N + 1);       // delivery itself never stopped
-  });
-
-  it('does not degrade when API-error turns are broken up by a completed turn (needs CONSECUTIVE)', async () => {
-    let pane = API_ERROR_PANE;
-    const tmux = fakeTmux({ pane: () => pane });
-    // err, err, COMPLETED, err, err — never 3 in a row, so with N=3 it must stay armed.
-    const outcomes = [API_ERROR_PANE, API_ERROR_PANE, COMPLETED_PANE, API_ERROR_PANE, API_ERROR_PANE];
-    const wake = (k: number) => ({ cursor: 10 + k, events: [{ event: 'message_received', from: 'Coord', msg_id: k }] as NotifyEvent[] });
-    const { fetch } = scriptedFetch(
-      [{ cursor: 1, events: [] }, ...outcomes.map((_, k) => wake(k))],
-      (_url, i) => { if (i === outcomes.length + 1) mon.stop(); },
-    );
-    let mon: ReturnType<typeof createMonitor>;
-    mon = createMonitor({ name: 'A', agentDir: dir, cfg: CFG({ batch_ms: 0, turn_fail_threshold: 3 }), deps: makeDeps(fetch, tmux) });
-
-    let delivered = 0;
-    const seen: string[] = [];
-    const origSend = tmux.sendText;
-    tmux.sendText = async (n, t) => {
-      if (delivered > 0) seen.push(status());
-      pane = outcomes[delivered];                // set THIS turn's outcome before it is observed
-      await origSend(n, t);
-      delivered++;
-    };
-
-    await mon.prime();
-    await mon.run(1);
-    seen.push(status());                          // final turn's outcome
-    expect(seen.some(x => x.includes('turns-failing'))).toBe(false);
-    expect(status()).toMatch(/^armed at /);
-  });
-});
-
-describe('Monitor.run — injection into a dirty composer (unsubmitted human text)', () => {
-  // A STATEFUL tmux composer. It models the two ways stray, unsubmitted keystrokes
-  // break injection today: (1) the typed line concatenates onto them, and (2) if
-  // they opened a slash-command menu (buffer starts with '/'), the menu captures
-  // Enter so nothing submits at all — the wedge. `send-keys -l text` then Enter is
-  // one sendText call (mirrors Tmux.sendText); C-u clears the line.
-  interface Composer extends FakeTmux { submitted: string[]; buffer(): string }
-  function composerTmux(initial = ''): Composer {
-    let buf = initial;
-    const submitted: string[] = [];
-    const sent: string[] = [];
-    const enter = () => { if (buf.length > 0 && !buf.startsWith('/')) { submitted.push(buf); buf = ''; } };
-    return {
-      sent, submitted, buffer: () => buf,
-      get enters() { return 0; },
-      has: async () => true,
-      capture: async () => `assistant: earlier reply\n> ${buf}`,
-      sendText: async (_n: string, t: string) => { sent.push(t); buf += t; enter(); }, // -l text, then Enter
-      sendKey: async (_n: string, k: string) => {
-        if (k === 'C-u') buf = '';                 // kill to line start
-        else if (k === 'Enter') enter();
-        // 'C-e' (cursor to end) is a no-op in this single-line model
-      },
-    } as Composer;
-  }
-
-  const LINE = '[fleet-monitor] 1 new message from Coord (#1) — run get_messages';
-  const status = () => readFileSync(join(dir, '.monitor-status'), 'utf8').trim();
-  // Distinct cursor per poll, fixed msg_id so every wake renders the same LINE.
-  const wake = (k: number) => ({ cursor: 10 + k, events: [{ event: 'message_received', from: 'Coord', msg_id: 1 }] as NotifyEvent[] });
-
-  it('clears stray text so the submitted wake is the clean line, not stray+line', async () => {
-    const tmux = composerTmux('draft note I never sent');   // unsubmitted human text
-    const { fetch } = scriptedFetch(
-      [{ cursor: 1, events: [] }, wake(0)],
-      (_url, i) => { if (i === 2) mon.stop(); },
-    );
-    let mon: ReturnType<typeof createMonitor>;
-    mon = createMonitor({ name: 'A', agentDir: dir, cfg: CFG({ batch_ms: 0 }), deps: makeDeps(fetch, tmux) });
-    await mon.prime();
-    await mon.run(1);
-    expect(tmux.submitted).toEqual([LINE]);   // exactly the wake — no 'draft note' prefix
-    expect(tmux.buffer()).toBe('');           // composer left clean
-    expect(status()).toMatch(/^armed at /);
-  });
-
-  it('delivers despite an open slash-command menu, and the stray text does not wedge the next injection', async () => {
-    const tmux = composerTmux('/');            // a lone '/' left the slash menu open — captures Enter
-    const { fetch } = scriptedFetch(
-      [{ cursor: 1, events: [] }, wake(0), wake(1)],
-      (_url, i) => { if (i === 3) mon.stop(); },
-    );
-    let mon: ReturnType<typeof createMonitor>;
-    mon = createMonitor({ name: 'A', agentDir: dir, cfg: CFG({ batch_ms: 0 }), deps: makeDeps(fetch, tmux) });
-    await mon.prime();
-    await mon.run(1);
-    // Both wakes submit as clean lines; no lingering wedge from the stray '/'.
-    expect(tmux.submitted).toHaveLength(2);
-    expect(tmux.submitted.every(m => m === LINE)).toBe(true);
-    expect(status()).toMatch(/^armed at /);
-  });
 });
 
 describe('Monitor status is typed, timestamped, and self-heals per cause', () => {
@@ -1411,7 +789,7 @@ describe('Monitor status is typed, timestamped, and self-heals per cause', () =>
 
   it('every status line carries a parseable ISO timestamp', async () => {
     const { fetch } = scriptedFetch([{ cursor: 5, events: [] }]);
-    const mon = createMonitor({ name: 'A', agentDir: dir, cfg: CFG(), deps: makeDeps(fetch, fakeTmux()) });
+    const mon = createMonitor({ name: 'A', agentDir: dir, cfg: CFG(), deps: makeDeps(fetch) });
     await mon.prime();
     for (const line of statusLines()) {
       const stamp = /\bat (\S+)/.exec(line)?.[1];
@@ -1427,96 +805,10 @@ describe('Monitor status is typed, timestamped, and self-heals per cause', () =>
       { cursor: 1, events: [] },              // recovery: a quiet poll
     ], (_url, i) => { if (i === 3) mon.stop(); });
     let mon: ReturnType<typeof createMonitor>;
-    mon = createMonitor({ name: 'A', agentDir: dir, cfg: CFG({ batch_ms: 0 }), deps: makeDeps(fetch, fakeTmux()) });
+    mon = createMonitor({ name: 'A', agentDir: dir, cfg: CFG({ batch_ms: 0 }), deps: makeDeps(fetch) });
     await mon.prime();
     await mon.run(1);
     expect(status()).toMatch(/^armed at /);
   });
 
-  it('a hiccup then a successful EVENT poll also self-clears it', async () => {
-    const tmux = fakeTmux({ pane: () => COMPLETED_PANE });
-    const { fetch } = scriptedFetch([
-      { cursor: 1, events: [] },
-      { throw: 'ECONNREFUSED' },
-      wake(1),                                 // recovery poll that also carries a wake
-    ]);
-    let mon: ReturnType<typeof createMonitor>;
-    const deps = makeDeps(fetch, tmux);
-    mon = createMonitor({ name: 'A', agentDir: dir, cfg: CFG({ batch_ms: 0 }), deps });
-    const orig = tmux.sendText;
-    tmux.sendText = async (n, t) => { await orig(n, t); mon.stop(); };
-    await mon.prime();
-    await mon.run(1);
-    expect(status()).toMatch(/^armed at /);
-    expect(status()).not.toContain('connectivity');
-  });
-
-  it('a successful poll CANNOT erase a turn-failure degradation', async () => {
-    const N = 2;
-    let pane = API_ERROR_PANE;
-    const tmux = fakeTmux({ pane: () => pane });
-    // N api-error wakes to degrade, then quiet successful polls.
-    const { fetch } = scriptedFetch(
-      [{ cursor: 1, events: [] }, wake(0), wake(1), { cursor: 20, events: [] }, { cursor: 21, events: [] }],
-      (_url, i) => { if (i === 4) mon.stop(); },
-    );
-    let mon: ReturnType<typeof createMonitor>;
-    mon = createMonitor({
-      name: 'A', agentDir: dir, cfg: CFG({ batch_ms: 0, turn_fail_threshold: N }),
-      deps: makeDeps(fetch, tmux),
-    });
-    await mon.prime();
-    await mon.run(1);
-
-    expect(pane).toBe(API_ERROR_PANE);                    // turns never recovered
-    expect(status()).toContain('turns-failing');          // and the poll did not paper over it
-    expect(status()).not.toMatch(/^armed at /);
-  });
-
-  it('a completed turn is what clears turns-failing', async () => {
-    const N = 2;
-    let pane = API_ERROR_PANE;
-    const tmux = fakeTmux({ pane: () => pane });
-    const { fetch } = scriptedFetch(
-      [{ cursor: 1, events: [] }, wake(0), wake(1), wake(2)],
-      (_url, i) => { if (i === 4) mon.stop(); },
-    );
-    let delivered = 0;
-    let mon: ReturnType<typeof createMonitor>;
-    mon = createMonitor({
-      name: 'A', agentDir: dir, cfg: CFG({ batch_ms: 0, turn_fail_threshold: N }),
-      deps: makeDeps(fetch, tmux),
-    });
-    const orig = tmux.sendText;
-    tmux.sendText = async (n, t) => {
-      if (++delivered === 3) pane = COMPLETED_PANE;       // the third turn completes
-      await orig(n, t);
-    };
-    await mon.prime();
-    await mon.run(1);
-    expect(status()).toMatch(/^armed at /);
-  });
-
-  it('a connection hiccup and a turn failure are reported as two separate causes', async () => {
-    const N = 1;
-    const pane = API_ERROR_PANE;
-    const tmux = fakeTmux({ pane: () => pane });
-    const { fetch } = scriptedFetch(
-      // Stop on the second failing poll, so the loop exits while the stream is
-      // still down and both causes are live at once.
-      [{ cursor: 1, events: [] }, wake(0), { throw: 'ECONNREFUSED' }, { throw: 'ECONNREFUSED' }],
-      (_url, i) => { if (i === 3) mon.stop(); },
-    );
-    let mon: ReturnType<typeof createMonitor>;
-    mon = createMonitor({
-      name: 'A', agentDir: dir, cfg: CFG({ batch_ms: 0, turn_fail_threshold: N }),
-      deps: makeDeps(fetch, tmux),
-    });
-    await mon.prime();
-    await mon.run(1);
-    const lines = statusLines();
-    expect(lines.some(l => l.startsWith('degraded: turns-failing'))).toBe(true);
-    expect(lines.some(l => l.startsWith('degraded: connectivity'))).toBe(true);
-    for (const line of lines) expect(Number.isNaN(Date.parse(/\bat (\S+)/.exec(line)![1]))).toBe(false);
-  });
 });
