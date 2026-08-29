@@ -6,7 +6,8 @@ import type { ResolvedRole } from './config.js';
 import type { CreationPlan } from './application/role-creation-service.js';
 import type { IdentityProvisioner, IdentityProvisionProfile } from './creation.js';
 import { loadConfigResourceSnapshotFromDocuments } from './config-resource-loader.js';
-import { createProductionAgentLaunchComposition } from './agent-production-launch-composition.js';
+import { createControlledProductionAgentLaunchComposition,
+  createProductionAgentLaunchComposition } from './agent-production-launch-composition.js';
 import { agentRuntimeSessionRequestBindings, type AgentLaunchRequest } from './agent-launch-composition-root.js';
 import { readAgentSupervisorHandoff } from './agent-supervisor-handoff.js';
 import { readTempAgentSupervisorHandoff } from './temp-agent-supervisor-handoff.js';
@@ -19,6 +20,11 @@ import { effectiveRoleModel } from './model-env.js';
 import { runtimeCanonical } from './agent-runtime-record.js';
 import { readStoredAgentPlan } from './agent-plan-store.js';
 import type { AgentPlan } from './agent-plan.js';
+import type { ConfigResourceSnapshot } from './config-resource-loader.js';
+import type { AgentSupervisorControlAuthority, AgentSupervisorControlLease } from './agent-supervisor-control.js';
+import { createPermanentWithSupervisorControl,
+  resumePermanentWithSupervisorControl, retirePermanentWithSupervisorControl } from './agent-creation-composition-root.js';
+import type { AgentSupervisorHandoff } from './agent-supervisor-handoff.js';
 
 export interface AgentProductionRuntimeDeps {
   trustedStateRoot: string;
@@ -67,6 +73,15 @@ export interface AgentProductionRuntime {
   resumeTemporaryComposition(input: Readonly<TemporaryCompositionResumeInput>):
     Readonly<TemporaryCompositionResumeResult>;
 }
+interface ManagedRuntimeOps {
+  prepare(input: Readonly<{ snapshot: ConfigResourceSnapshot; agentId: string; actionId: string;
+    controlLease: AgentSupervisorControlLease; operation?: 'create'|'reconfigure' }>): Promise<PermanentAgentCreationResult>;
+  resume(input: Readonly<{ agentId: string; actionId: string;
+    controlLease: AgentSupervisorControlLease }>): Promise<PermanentAgentCreationResult>;
+  retire(input: Readonly<{ active: Readonly<AgentSupervisorHandoff>; actionId: string;
+    controlLease: AgentSupervisorControlLease }>): Promise<void>;
+}
+const managedRuntimes = new WeakMap<AgentProductionRuntime, ManagedRuntimeOps>();
 
 const digest = (value: unknown): string => `sha256:${createHash('sha256')
   .update(runtimeCanonical(value)).digest('hex')}`;
@@ -113,9 +128,41 @@ function productionAdmission(role: ResolvedRole, lifetime: 'persistent' | 'tempo
 
 /** Product facade: callers see Agent create/launch only; artifact authorities remain private. */
 export function createAgentProductionRuntime(deps: AgentProductionRuntimeDeps): AgentProductionRuntime {
+  return assembleAgentProductionRuntime(deps);
+}
+/** Internal management assembly; deliberately not re-exported by the package entry point. */
+export function createControlledAgentProductionRuntime(deps: AgentProductionRuntimeDeps,
+  control: AgentSupervisorControlAuthority): AgentProductionRuntime {
+  return assembleAgentProductionRuntime(deps, control);
+}
+export function prepareManagedPersistentResource(runtime: AgentProductionRuntime,
+  input: Parameters<ManagedRuntimeOps['prepare']>[0]) {
+  const managed = managedRuntimes.get(runtime);
+  if (!managed) throw new AgentCompositionError('invalid_context'); return managed.prepare(input);
+}
+export function reconfigureManagedPersistentResource(runtime: AgentProductionRuntime,
+  input: Omit<Parameters<ManagedRuntimeOps['prepare']>[0], 'operation'>) {
+  const managed = managedRuntimes.get(runtime);
+  if (!managed) throw new AgentCompositionError('invalid_context');
+  return managed.prepare({ ...input, operation: 'reconfigure' });
+}
+export function resumeManagedPersistentResource(runtime: AgentProductionRuntime,
+  input: Parameters<ManagedRuntimeOps['resume']>[0]) {
+  const managed = managedRuntimes.get(runtime);
+  if (!managed) throw new AgentCompositionError('invalid_context'); return managed.resume(input);
+}
+export function retireManagedPersistentResource(runtime: AgentProductionRuntime,
+  input: Parameters<ManagedRuntimeOps['retire']>[0]) {
+  const managed = managedRuntimes.get(runtime);
+  if (!managed) throw new AgentCompositionError('invalid_context'); return managed.retire(input);
+}
+function assembleAgentProductionRuntime(deps: AgentProductionRuntimeDeps,
+  supervisorControl?: AgentSupervisorControlAuthority): AgentProductionRuntime {
   const now = deps.now ?? Date.now;
-  const composed = createProductionAgentLaunchComposition({ trustedStateRoot: deps.trustedStateRoot,
-    identityProvisioner: deps.identityProvisioner, identityProfile: deps.identityProfile ?? {}, now });
+  const launchDeps = { trustedStateRoot: deps.trustedStateRoot,
+    identityProvisioner: deps.identityProvisioner, identityProfile: deps.identityProfile ?? {}, now };
+  const composed = supervisorControl ? createControlledProductionAgentLaunchComposition(launchDeps, supervisorControl)
+    : createProductionAgentLaunchComposition(launchDeps);
   const createRole = async (input: Readonly<AgentProductionRoleInput>): Promise<AgentProductionCreationResult> => {
       if (input.lifetime === 'persistent') {
         const path = join(resolve(deps.trustedStateRoot), 'agents',
@@ -140,7 +187,28 @@ export function createAgentProductionRuntime(deps: AgentProductionRuntimeDeps): 
       }
       return composed.creation.root.createPermanent(request, input.actionId);
     };
-  return Object.freeze({
+  const managed: ManagedRuntimeOps = {
+    prepare: async input => {
+      const resource = input.snapshot.resources.Agent?.[input.agentId];
+      if (!resource) throw new AgentCompositionError('invalid_request');
+      const operationKind = input.operation ?? 'create';
+      const operation = Object.freeze({ id: input.actionId,
+        type: operationKind === 'reconfigure' ? 'agent.reconfigure' : 'agent.start',
+        resourceScope: `agents/${input.agentId}` });
+      const context = Object.freeze({ operation,
+        authorizationRevision: digest({ operation, snapshot: input.snapshot.digest, agent: input.agentId }),
+        snapshot: input.snapshot, snapshotRevision: input.snapshot.digest, issuedAt: now() });
+      const callerEvidence = composed.creation.ingress.direct(context);
+      return createPermanentWithSupervisorControl(composed.creation.root, Object.freeze({
+        source: Object.freeze({ kind: 'persistent_resource' as const, agentId: input.agentId }), callerEvidence,
+      }), input.actionId, input.controlLease, operationKind);
+    },
+    resume: input => resumePermanentWithSupervisorControl(composed.creation.root,
+      input.agentId, input.actionId, input.controlLease),
+    retire: input => retirePermanentWithSupervisorControl(composed.creation.root,
+      input.active, input.actionId, input.controlLease),
+  };
+  const runtime: AgentProductionRuntime = Object.freeze({
     create: (input: Readonly<AgentProductionCreationInput>) => createRole({
       role: input.plan.preview.resolvedRole,
       lifetime: input.plan.options.temp ? 'temporary' : 'persistent', actionId: input.actionId }),
@@ -180,4 +248,5 @@ export function createAgentProductionRuntime(deps: AgentProductionRuntimeDeps): 
       return composed.launch.launch(request);
     },
   });
+  if (supervisorControl) managedRuntimes.set(runtime, managed); return runtime;
 }

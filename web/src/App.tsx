@@ -9,6 +9,7 @@ import { TopologyEditor } from './TopologyEditor';
 import { FleetSetup, type ConfigRead } from './FleetSetup';
 import type { Topology } from './topology-presentation';
 import { confirmAndRemoveRole } from './remove-role';
+import { ResourceEditors } from './ResourceEditors';
 
 type FleetItem = {
   role: {
@@ -162,9 +163,9 @@ export function App() {
         ? <RoleWorkspace roleId={selected} onBack={() => setSelected('')} onRemoved={() => { setSelected(''); requestRefresh(); }} />
         : view === 'configuration'
           ? configuration
-            ? <FleetSetup key={configuration.revision} initial={configuration} onSaved={next => {
+            ? <><ResourceEditors /><FleetSetup key={configuration.revision} initial={configuration} onSaved={next => {
               setConfiguration(next); setView('fleet'); requestRefresh();
-            }} />
+            }} /></>
             : <div className="content"><div className="empty">Loading configuration…</div></div>
         : view === 'audit'
           ? <AuditView />

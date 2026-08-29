@@ -213,6 +213,11 @@ export interface RoomMemberSeat {
   slot: string;
   cowork_role: string;
   seat_state: 'pending' | 'active' | 'removed';
+  invite_attempt?: {
+    phase: 'invite_attempting' | 'invite_recorded' | 'invite_outcome_unknown';
+    action_id: string; request_digest: string; room_id: string; role: string;
+    mode: 'one_time'; min_accepts: 1; updated_at: string; recovery_key_hash?: string;
+  };
   launch?: RoomMemberLaunchState;
   /** Absent only on pre-H2b legacy seats, which are close/recovery-only. */
   plan_binding?: CanonicalRoomMemberPlanBinding;

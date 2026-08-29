@@ -1,6 +1,6 @@
 import { existsSync, mkdirSync, readdirSync, readFileSync, unlinkSync, writeFileSync, rmSync, renameSync } from 'node:fs';
 import { join } from 'node:path';
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { replaceFileAtomically } from '../atomic-file.js';
 import { stateRoot } from '../paths.js';
 import type {
@@ -60,7 +60,22 @@ function generateTaskId(): string {
 const TASK_ID_PATTERN = /^[0-9a-z]{9}[0-9a-f]{8}$/;
 
 export class TaskStateError extends Error {}
-type StoredTaskRecord = Omit<TaskRecord, 'list_id' | 'list_name'> & { list_id?: string };
+export interface TaskEffectReceipt {
+  version: 1; keyHash: string; principalHash: string; requestHash: string;
+  operation: 'task.start'|'task.block'|'task.unblock'|'task.review'; resourceId: string;
+  beforeDigest: string; afterDigest: string; disposition: 'completed'; result: Partial<TaskRecord>;
+  acknowledged?: boolean;
+}
+export interface TaskEffectContext extends Omit<TaskEffectReceipt, 'version'|'resourceId'|'afterDigest'|'disposition'|'result'> {
+  beforePublish?(): void;
+  afterPublish?(): void;
+}
+const RECEIPTS = Symbol('management-effect-receipts');
+type ReceiptTaskRecord = TaskRecord & { [RECEIPTS]?: TaskEffectReceipt[] };
+type StoredTaskRecord = Omit<TaskRecord, 'list_id' | 'list_name'> & {
+  list_id?: string; _management_receipts?: TaskEffectReceipt[];
+};
+const MAX_EFFECT_RECEIPTS = 16;
 
 function assertCanonicalTaskId(id: string): void {
   if (!TASK_ID_PATTERN.test(id)) {
@@ -85,6 +100,8 @@ function writeTask(record: TaskRecord | StoredTaskRecord): void {
   mkdirSync(tasksDir(), { recursive: true });
   const persisted = { ...record } as Record<string, unknown>;
   delete persisted.list_name;
+  const receipts = (record as ReceiptTaskRecord)[RECEIPTS];
+  if (receipts?.length) persisted._management_receipts = receipts;
   replaceFileAtomically(taskPath(record.task_id), JSON.stringify(persisted, null, 2) + '\n');
 }
 
@@ -92,7 +109,80 @@ function presentTask(record: StoredTaskRecord): TaskRecord {
   const listId = record.list_id ?? DEFAULT_TASK_LIST_ID;
   const list = readTaskLists().find(item => item.list_id === listId);
   if (!list) throw new TaskStateError(`task ${record.task_id} references missing list ${listId}`);
-  return { ...record, list_id: listId, list_name: list.name };
+  const { _management_receipts: receipts, ...visible } = record;
+  const presented = { ...visible, list_id: listId, list_name: list.name } as ReceiptTaskRecord;
+  if (receipts) Object.defineProperty(presented, RECEIPTS, { value: receipts, writable: true, configurable: true });
+  return presented;
+}
+
+export function getTaskEffectReceipt(id: string, keyHash: string): TaskEffectReceipt | undefined {
+  return withTaskLock(id, () => {
+    const receipts = (readTask(id) as ReceiptTaskRecord)[RECEIPTS];
+    if (!receipts) return undefined;
+    if (!Array.isArray(receipts) || receipts.length > MAX_EFFECT_RECEIPTS) throw new TaskStateError('invalid task effect receipts');
+    const receipt = receipts.find(item => item?.keyHash === keyHash);
+    if (!receipt) return undefined;
+    const hex = /^[a-f0-9]{64}$/u;
+    if (receipt.version !== 1 || !hex.test(receipt.keyHash) || !hex.test(receipt.principalHash)
+        || !hex.test(receipt.requestHash) || !hex.test(receipt.beforeDigest) || !hex.test(receipt.afterDigest)
+        || receipt.resourceId !== id || !['task.start', 'task.block', 'task.unblock', 'task.review'].includes(receipt.operation)
+        || receipt.disposition !== 'completed' || (receipt.acknowledged !== undefined && receipt.acknowledged !== true)
+        || !receipt.result || typeof receipt.result !== 'object')
+      throw new TaskStateError('invalid task effect receipt');
+    const resultKeys = new Set(['task_id', 'title', 'state', 'room_id', 'list_id', 'list_name', 'blocked',
+      'started_at', 'ended_at']);
+    if (Object.keys(receipt.result).some(key => !resultKeys.has(key))
+        || receipt.result.task_id !== id || typeof receipt.result.title !== 'string'
+        || !VALID_TRANSITIONS[receipt.result.state as TaskState]
+        || (receipt.result.blocked !== undefined && (typeof receipt.result.blocked !== 'object'
+          || Object.keys(receipt.result.blocked).some(key => !['reason', 'at'].includes(key))))
+        || digestTask(receipt.result) !== receipt.afterDigest)
+      throw new TaskStateError('invalid task effect receipt result');
+    return receipt;
+  });
+}
+
+export function acknowledgeTaskEffectReceipt(id: string, keyHash: string, hooks: {
+  beforePublish?(): void; afterPublish?(): void;
+} = {}): void {
+  withTaskLock(id, () => {
+    const task = readTask(id) as ReceiptTaskRecord; const receipts = task[RECEIPTS] ?? [];
+    const index = receipts.findIndex(item => item.keyHash === keyHash);
+    if (index < 0 || receipts[index]!.acknowledged) return;
+    hooks.beforePublish?.();
+    const next = [...receipts]; next[index] = { ...next[index]!, acknowledged: true };
+    Object.defineProperty(task, RECEIPTS, { value: next, writable: true, configurable: true });
+    writeTask(task); hooks.afterPublish?.();
+  });
+}
+
+function publishEffect(task: ReceiptTaskRecord, context: TaskEffectContext | undefined): void {
+  if (!context) { writeTask(task); return; }
+  const prior = (task[RECEIPTS] ?? []).filter(item => !item.acknowledged);
+  if (!prior.some(item => item.keyHash === context.keyHash) && prior.length >= MAX_EFFECT_RECEIPTS)
+    throw new TaskStateError('task effect receipt capacity reached');
+  context.beforePublish?.();
+  const visible = { ...task } as Record<string, unknown>; delete visible.list_name;
+  const safeResult: Partial<TaskRecord> = { task_id: task.task_id, title: task.title, state: task.state,
+    ...(task.room_id ? { room_id: task.room_id } : {}), ...(task.list_id ? { list_id: task.list_id } : {}),
+    ...(task.list_name ? { list_name: task.list_name } : {}), ...(task.blocked ? { blocked: task.blocked } : {}),
+    ...(task.started_at ? { started_at: task.started_at } : {}), ...(task.ended_at ? { ended_at: task.ended_at } : {}) };
+  const receipt: TaskEffectReceipt = { version: 1, keyHash: context.keyHash,
+    principalHash: context.principalHash, requestHash: context.requestHash,
+    operation: context.operation, resourceId: task.task_id, beforeDigest: context.beforeDigest,
+    afterDigest: digestTask(safeResult), disposition: 'completed', result: safeResult };
+  Object.defineProperty(task, RECEIPTS, { value: [...prior.filter(item => item.keyHash !== receipt.keyHash), receipt]
+    , writable: true, configurable: true });
+  writeTask(task); context.afterPublish?.();
+}
+
+function digestTask(value: unknown): string {
+  const canonical = (child: unknown): string => Array.isArray(child) ? `[${child.map(canonical).join(',')}]`
+    : child && typeof child === 'object' ? `{${Object.entries(child as Record<string, unknown>)
+      .filter(([key, item]) => key !== '_management_receipts' && item !== undefined)
+      .sort(([a], [b]) => a.localeCompare(b)).map(([key, item]) => `${JSON.stringify(key)}:${canonical(item)}`).join(',')}}`
+      : JSON.stringify(child);
+  return createHash('sha256').update(canonical(value)).digest('hex');
 }
 
 // ── Lifecycle transitions ───────────────────────────────────────────────
@@ -192,14 +282,14 @@ export function findByIdempotencyKey(key: string): TaskRecord | undefined {
   return listTasks().find(t => t.idempotency_key === key);
 }
 
-export function startTask(id: string): TaskRecord {
+export function startTask(id: string, effect?: TaskEffectContext): TaskRecord {
   return withTaskLock(id, () => {
   const t = readTask(id);
   assertNoPendingTerminalIntent(t);
   assertTransition(t.state, 'provisioning');
   t.state = 'provisioning';
   t.started_at = new Date().toISOString();
-  writeTask(t);
+  publishEffect(t, effect);
   return t;
   });
 }
@@ -216,37 +306,37 @@ export function activateTask(id: string): TaskRecord {
   });
 }
 
-export function blockTask(id: string, reason: string): TaskRecord {
+export function blockTask(id: string, reason: string, effect?: TaskEffectContext): TaskRecord {
   return withTaskLock(id, () => {
   const t = readTask(id);
   assertNoPendingTerminalIntent(t);
   if (TASK_TERMINAL_STATES.includes(t.state))
     throw new TaskStateError(`cannot block a '${t.state}' task`);
   t.blocked = { reason, at: new Date().toISOString() };
-  writeTask(t);
+  publishEffect(t, effect);
   return t;
   });
 }
 
-export function unblockTask(id: string): TaskRecord {
+export function unblockTask(id: string, effect?: TaskEffectContext): TaskRecord {
   return withTaskLock(id, () => {
   const t = readTask(id);
   assertNoPendingTerminalIntent(t);
   if (!t.blocked) throw new TaskStateError('task is not blocked');
   delete t.blocked;
-  writeTask(t);
+  publishEffect(t, effect);
   return t;
   });
 }
 
-export function reviewTask(id: string): TaskRecord {
+export function reviewTask(id: string, effect?: TaskEffectContext): TaskRecord {
   return withTaskLock(id, () => {
   const t = readTask(id);
   assertNoPendingTerminalIntent(t);
   assertTransition(t.state, 'review');
   t.state = 'review';
   delete t.blocked;
-  writeTask(t);
+  publishEffect(t, effect);
   return t;
   });
 }

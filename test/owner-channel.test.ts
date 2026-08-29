@@ -1,15 +1,17 @@
 import {
-  existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync,
+  existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync,
 } from 'node:fs';
 import { createHash } from 'node:crypto';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
-import { OwnerChannel } from '../src/owner-channel/channel.js';
+import { OwnerChannel, createOwnerCommandManagement } from '../src/owner-channel/channel.js';
 import { ownerCommandHelp, type OwnerFleetOps } from '../src/owner-channel/commands.js';
 import {
-  activateRoom, closeRoom, createRoomRecord, getRoomRecord,
+  activateRoom, advanceRoomClose, beginRoomRecovery, closeRoom, createRoomRecord, getRoomRecord,
+  gcAcknowledgedRoomDeletionTombstone, getRoomRecoveryReceipt,
+  publishRoomDeletionTombstoneAndUnlink, roomRecoveryDetail,
 } from '../src/rooms-tasks/room-state.js';
 import {
   activateTask, createTask, getTask, reviewTask, startTask,
@@ -25,9 +27,656 @@ import {
 } from '../src/session/types.js';
 import { VERSION } from '../src/version.js';
 import { historyMessage, incomingMessage } from './owner-history-fixtures.js';
+import { TaskRoomApplicationService } from '../src/application/task-room-service.js';
+import { ManagementOperationStore, managementDigest } from '../src/application/management-operation-store.js';
+import { acknowledgeManagedRoomCloseReceipt, recordManagedRoomCloseError,
+  settleManagedRoomRecovery } from '../src/rooms-tasks/close.js';
 
 const OWNER_CID = 'A'.repeat(64);
 const OTHER_OWNER_CID = 'B'.repeat(64);
+
+describe('production Owner management adapter', () => {
+  it('binds duplicate and altered wire delivery to one effect and canonical authenticated CID', async () => {
+    const fleetHome = mkdtempSync(join(tmpdir(), 'owner-management-wire-'));
+    const previousHome = process.env.OURS_FLEET_HOME; process.env.OURS_FLEET_HOME = fleetHome;
+    const configPath = join(fleetHome, 'fleet.yaml');
+    writeFileSync(configPath, 'schema_version: 2\nconfig_dir: fleet.conf.d\npolicy: {}\n');
+    try {
+      const upper = createOwnerCommandManagement({ configPath, senderCid: OWNER_CID, wireId: 'same-wire' });
+      await upper.createTask({ title: 'One', origin: { type: 'owner_channel' }, backlog: true, noRoom: true });
+      await upper.createTask({ title: 'One', origin: { type: 'owner_channel' }, backlog: true, noRoom: true });
+      expect(new TaskRoomApplicationService(configPath).listTasks()).toHaveLength(1);
+      expect(await upper.execute({ operation: 'task.create', title: 'Altered', origin: 'owner_channel' },
+        'same-wire:task.create')).toMatchObject({ ok: false, error: { code: 'idempotency_conflict' } });
+      const lower = createOwnerCommandManagement({ configPath, senderCid: OWNER_CID.toLowerCase(), wireId: 'same-wire' });
+      expect(await lower.execute({ operation: 'task.create', title: 'One', origin: 'owner_channel',
+        backlog: true, noRoom: true }, 'same-wire:task.create')).toMatchObject({ ok: true,
+        replay: { source: 'journal', redacted: true } });
+      const other = createOwnerCommandManagement({ configPath, senderCid: OTHER_OWNER_CID, wireId: 'same-wire' });
+      expect(await other.execute({ operation: 'task.create', title: 'One', origin: 'owner_channel',
+        backlog: true, noRoom: true }, 'same-wire:task.create')).toMatchObject({ ok: false,
+        error: { code: 'idempotency_conflict', message: 'idempotency key is unavailable' } });
+      expect(new TaskRoomApplicationService(configPath).listTasks()).toHaveLength(1);
+    } finally {
+      if (previousHome === undefined) delete process.env.OURS_FLEET_HOME;
+      else process.env.OURS_FLEET_HOME = previousHome;
+      rmSync(fleetHome, { recursive: true, force: true });
+    }
+  });
+
+  it('rejects start when task state changes after the exact detail read', async () => {
+    const fleetHome = mkdtempSync(join(tmpdir(), 'owner-management-stale-'));
+    const previousHome = process.env.OURS_FLEET_HOME; process.env.OURS_FLEET_HOME = fleetHome;
+    const configPath = join(fleetHome, 'fleet.yaml');
+    writeFileSync(configPath, 'schema_version: 2\nconfig_dir: fleet.conf.d\npolicy: {}\n');
+    try {
+      const base = createOwnerCommandManagement({ configPath, senderCid: OWNER_CID, wireId: 'create-wire' });
+      const task = await base.createTask({ title: 'Race', origin: { type: 'owner_channel' },
+        backlog: true, noRoom: true });
+      const racing = createOwnerCommandManagement({ configPath, senderCid: OWNER_CID, wireId: 'start-wire',
+        afterStartRead: () => new TaskRoomApplicationService(configPath).blockTask({
+          actor: { kind: 'authenticated_owner', surface: 'messenger', cid: OWNER_CID },
+          taskId: task.task_id, reason: 'concurrent',
+        }) });
+      await expect(racing.startTask(task.task_id)).rejects.toMatchObject({ code: 'stale_state' });
+      expect(new TaskRoomApplicationService(configPath).getTask(task.task_id).task)
+        .toMatchObject({ state: 'backlog', blocked: { reason: 'concurrent' } });
+    } finally {
+      if (previousHome === undefined) delete process.env.OURS_FLEET_HOME;
+      else process.env.OURS_FLEET_HOME = previousHome;
+      rmSync(fleetHome, { recursive: true, force: true });
+    }
+  });
+
+  it('routes block, unblock, and review through distinct digest-bound wire operations', async () => {
+    const fleetHome = mkdtempSync(join(tmpdir(), 'owner-management-lifecycle-'));
+    const previousHome = process.env.OURS_FLEET_HOME; process.env.OURS_FLEET_HOME = fleetHome;
+    const configPath = join(fleetHome, 'fleet.yaml');
+    writeFileSync(configPath, 'schema_version: 2\nconfig_dir: fleet.conf.d\npolicy: {}\n');
+    try {
+      const create = createOwnerCommandManagement({ configPath, senderCid: OWNER_CID, wireId: 'create-life' });
+      const task = await create.createTask({ title: 'Lifecycle', origin: { type: 'owner_channel' },
+        backlog: true, noRoom: true });
+      const lifecycle = createOwnerCommandManagement({ configPath, senderCid: OWNER_CID, wireId: 'life-wire' });
+      expect(await lifecycle.blockTask(task.task_id, 'wait')).toMatchObject({ blocked: { reason: 'wait' } });
+      const blockedAt = new TaskRoomApplicationService(configPath).getTask(task.task_id).task.blocked?.at;
+      expect(await lifecycle.blockTask(task.task_id, 'wait')).toMatchObject({ blocked: { reason: 'wait' } });
+      expect(new TaskRoomApplicationService(configPath).getTask(task.task_id).task.blocked?.at).toBe(blockedAt);
+      expect((await lifecycle.unblockTask(task.task_id)).blocked).toBeUndefined();
+      expect((await lifecycle.unblockTask(task.task_id)).blocked).toBeUndefined();
+      expect(await lifecycle.startTask(task.task_id)).toMatchObject({ state: 'provisioning' });
+      activateTask(task.task_id);
+      expect(await lifecycle.reviewTask(task.task_id)).toMatchObject({ state: 'review' });
+      expect(await lifecycle.reviewTask(task.task_id)).toMatchObject({ state: 'review' });
+      for (const suffix of ['task.block', 'task.unblock', 'task.start', 'task.review'])
+        expect(existsSync(join(fleetHome, '.ours-fleet', 'management-operations',
+          `${managementDigest(`life-wire:${suffix}`)}.json`))).toBe(true);
+    } finally {
+      if (previousHome === undefined) delete process.env.OURS_FLEET_HOME;
+      else process.env.OURS_FLEET_HOME = previousHome;
+      rmSync(fleetHome, { recursive: true, force: true });
+    }
+  });
+
+  it.each(['task.block', 'task.unblock', 'task.review'] as const)(
+    'rejects %s after a concurrent post-detail state change without its requested effect', async operation => {
+      const fleetHome = mkdtempSync(join(tmpdir(), 'owner-management-stale-mutation-'));
+      const previousHome = process.env.OURS_FLEET_HOME; process.env.OURS_FLEET_HOME = fleetHome;
+      const configPath = join(fleetHome, 'fleet.yaml');
+      writeFileSync(configPath, 'schema_version: 2\nconfig_dir: fleet.conf.d\npolicy: {}\n');
+      try {
+        const service = new TaskRoomApplicationService(configPath);
+        const base = createOwnerCommandManagement({ configPath, senderCid: OWNER_CID, wireId: `create-${operation}` });
+        const task = await base.createTask({ title: operation, origin: { type: 'owner_channel' },
+          backlog: true, noRoom: true });
+        if (operation === 'task.unblock') service.blockTask({ actor: { kind: 'local_control', surface: 'cli' },
+          taskId: task.task_id, reason: 'initial' });
+        if (operation === 'task.review') {
+          await service.startTask({ actor: { kind: 'local_control', surface: 'cli' }, taskId: task.task_id });
+          activateTask(task.task_id);
+        }
+        const racing = createOwnerCommandManagement({ configPath, senderCid: OWNER_CID, wireId: `race-${operation}`,
+          afterTaskRead: async current => {
+            if (current !== operation) return;
+            if (operation === 'task.review') service.blockTask({ actor: { kind: 'local_control', surface: 'cli' },
+              taskId: task.task_id, reason: 'concurrent' });
+            else await service.startTask({ actor: { kind: 'local_control', surface: 'cli' }, taskId: task.task_id });
+          } });
+        const attempt = operation === 'task.block' ? racing.blockTask(task.task_id, 'requested')
+          : operation === 'task.unblock' ? racing.unblockTask(task.task_id) : racing.reviewTask(task.task_id);
+        await expect(attempt).rejects.toMatchObject({ code: 'stale_state' });
+        const after = service.getTask(task.task_id).task;
+        if (operation === 'task.review') expect(after).toMatchObject({ state: 'active', blocked: { reason: 'concurrent' } });
+        else {
+          expect(after.state).toBe('provisioning');
+          if (operation === 'task.unblock') expect(after.blocked).toMatchObject({ reason: 'initial' });
+          else expect(after.blocked).toBeUndefined();
+        }
+      } finally {
+        if (previousHome === undefined) delete process.env.OURS_FLEET_HOME;
+        else process.env.OURS_FLEET_HOME = previousHome;
+        rmSync(fleetHome, { recursive: true, force: true });
+      }
+    });
+
+  it('recovers an exact published task receipt after restart without re-effecting', async () => {
+    const fleetHome = mkdtempSync(join(tmpdir(), 'owner-management-task-crash-'));
+    const previousHome = process.env.OURS_FLEET_HOME; process.env.OURS_FLEET_HOME = fleetHome;
+    const configPath = join(fleetHome, 'fleet.yaml');
+    writeFileSync(configPath, 'schema_version: 2\nconfig_dir: fleet.conf.d\npolicy: {}\n');
+    try {
+      const create = createOwnerCommandManagement({ configPath, senderCid: OWNER_CID, wireId: 'crash-create' });
+      const task = await create.createTask({ title: 'Crash receipt', origin: { type: 'owner_channel' },
+        backlog: true, noRoom: true });
+      const first = createOwnerCommandManagement({ configPath, senderCid: OWNER_CID, wireId: 'crash-block',
+        beforeOperationWrite: phase => { if (phase === 'completed') throw new Error('completed journal unavailable'); } });
+      await expect(first.blockTask(task.task_id, 'once')).rejects.toThrow('completed journal unavailable');
+      const service = new TaskRoomApplicationService(configPath);
+      const blockedAt = service.getTask(task.task_id).task.blocked?.at;
+      const store = new ManagementOperationStore(join(fleetHome, '.ours-fleet', 'management-operations'));
+      const keyHash = managementDigest('crash-block:task.block');
+      expect(store.read(keyHash)).toMatchObject({ phase: 'effecting' });
+      service.unblockTask({ actor: { kind: 'local_control', surface: 'cli' }, taskId: task.task_id });
+      await expect(createOwnerCommandManagement({ configPath, senderCid: OTHER_OWNER_CID, wireId: 'crash-block' })
+        .blockTask(task.task_id, 'once')).rejects.toMatchObject({ code: 'idempotency_conflict',
+          message: 'idempotency key is unavailable' });
+      await expect(createOwnerCommandManagement({ configPath, senderCid: OWNER_CID, wireId: 'crash-block' })
+        .blockTask(task.task_id, 'altered')).rejects.toMatchObject({ code: 'idempotency_conflict' });
+      const restarted = createOwnerCommandManagement({ configPath, senderCid: OWNER_CID, wireId: 'crash-block' });
+      expect(await restarted.blockTask(task.task_id, 'once')).toMatchObject({
+        task_id: task.task_id, blocked: { reason: 'once', at: blockedAt },
+      });
+      expect(service.getTask(task.task_id).task.blocked).toBeUndefined();
+      expect(store.read(keyHash)).toMatchObject({ phase: 'completed', response: { ok: true } });
+      const persisted = JSON.parse(readFileSync(join(fleetHome, '.ours-fleet', 'tasks',
+        `${task.task_id}.json`), 'utf8')) as { _management_receipts: unknown };
+      expect(JSON.stringify(persisted._management_receipts))
+        .not.toMatch(/owner|credential|invite|token|private|delegation/iu);
+    } finally {
+      if (previousHome === undefined) delete process.env.OURS_FLEET_HOME;
+      else process.env.OURS_FLEET_HOME = previousHome;
+      rmSync(fleetHome, { recursive: true, force: true });
+    }
+  });
+
+  it('publishes task state and receipt atomically, fails closed on tamper, and bounds retention', async () => {
+    const fleetHome = mkdtempSync(join(tmpdir(), 'owner-management-task-receipts-'));
+    const previousHome = process.env.OURS_FLEET_HOME; process.env.OURS_FLEET_HOME = fleetHome;
+    const configPath = join(fleetHome, 'fleet.yaml');
+    writeFileSync(configPath, 'schema_version: 2\nconfig_dir: fleet.conf.d\npolicy: {}\n');
+    try {
+      const created = await createOwnerCommandManagement({ configPath, senderCid: OWNER_CID, wireId: 'receipt-create' })
+        .createTask({ title: 'Receipts', origin: { type: 'owner_channel' }, backlog: true, noRoom: true });
+      createRoomRecord({ room_id: 'pending-room-recovery', room_name: 'Pending recovery' });
+      beginRoomRecovery('pending-room-recovery', { keyHash: '7'.repeat(64), principalHash: '8'.repeat(64),
+        requestHash: '9'.repeat(64), operation: 'room.recover',
+        beforeDigest: managementDigest(roomRecoveryDetail('pending-room-recovery')) });
+      const beforeCrash = createOwnerCommandManagement({ configPath, senderCid: OWNER_CID, wireId: 'before-publish',
+        beforeTaskEffectPublish: () => { throw new Error('crash-before-publication'); } });
+      await expect(beforeCrash.blockTask(created.task_id, 'must-not-land')).rejects.toThrow('crash-before-publication');
+      expect(new TaskRoomApplicationService(configPath).getTask(created.task_id).task.blocked).toBeUndefined();
+
+      const service = new TaskRoomApplicationService(configPath);
+      for (let index = 0; index < 20; index += 1) {
+        await createOwnerCommandManagement({ configPath, senderCid: OWNER_CID, wireId: `bounded-${index}` })
+          .blockTask(created.task_id, `reason-${index}`);
+        await createOwnerCommandManagement({ configPath, senderCid: OWNER_CID, wireId: `bounded-unblock-${index}` })
+          .unblockTask(created.task_id);
+      }
+      const pendingRoomReceipt = getRoomRecoveryReceipt('pending-room-recovery', '7'.repeat(64));
+      expect(pendingRoomReceipt).toMatchObject({ workerStatus: 'pending' });
+      expect(pendingRoomReceipt?.acknowledged).toBeUndefined();
+      const taskPath = join(fleetHome, '.ours-fleet', 'tasks', `${created.task_id}.json`);
+      let persisted = JSON.parse(readFileSync(taskPath, 'utf8')) as { _management_receipts: Array<Record<string, unknown>> };
+      expect(persisted._management_receipts).toHaveLength(1);
+      expect(persisted._management_receipts[0]).toMatchObject({ operation: 'task.unblock', acknowledged: true });
+      expect(statSync(taskPath).mode & 0o777).toBe(0o600);
+      expect(JSON.stringify(persisted._management_receipts))
+        .not.toMatch(/identity|owner|credential|invite|token|private|delegation/iu);
+
+      const store = new ManagementOperationStore(join(fleetHome, '.ours-fleet', 'management-operations'));
+      const crash = createOwnerCommandManagement({ configPath, senderCid: OWNER_CID, wireId: 'natural-crash',
+        beforeOperationWrite: phase => { if (phase === 'completed') throw new Error('completed journal unavailable'); } });
+      await expect(crash.blockTask(created.task_id, 'crashed')).rejects.toThrow('completed journal unavailable');
+      const crashKey = managementDigest('natural-crash:task.block');
+      expect(store.read(crashKey)).toMatchObject({ phase: 'effecting' });
+      expect(store.read(crashKey)?.response).toBeUndefined();
+      for (let index = 0; index < 20; index += 1) {
+        await createOwnerCommandManagement({ configPath, senderCid: OWNER_CID, wireId: `other-unblock-${index}` })
+          .unblockTask(created.task_id);
+        await createOwnerCommandManagement({ configPath, senderCid: OWNER_CID, wireId: `other-block-${index}` })
+          .blockTask(created.task_id, `unrelated-${index}`);
+      }
+      persisted = JSON.parse(readFileSync(taskPath, 'utf8')) as typeof persisted;
+      expect(persisted._management_receipts).toHaveLength(2);
+      expect(persisted._management_receipts.some(item => item.keyHash === crashKey && !item.acknowledged)).toBe(true);
+      const recovery = createOwnerCommandManagement({ configPath, senderCid: OWNER_CID, wireId: 'natural-crash' });
+      expect(await recovery.blockTask(created.task_id, 'crashed')).toMatchObject({ blocked: { reason: 'crashed' } });
+      expect(service.getTask(created.task_id).task.blocked).toMatchObject({ reason: 'unrelated-19' });
+
+      const tamperCrash = createOwnerCommandManagement({ configPath, senderCid: OWNER_CID, wireId: 'tamper-crash',
+        beforeOperationWrite: phase => { if (phase === 'completed') throw new Error('tamper journal interruption'); } });
+      await expect(tamperCrash.blockTask(created.task_id, 'tamper')).rejects.toThrow('tamper journal interruption');
+      persisted = JSON.parse(readFileSync(taskPath, 'utf8')) as typeof persisted;
+      const pristine = JSON.stringify(persisted);
+      const mutations: Array<(receipt: Record<string, any>) => void> = [
+        receipt => { (receipt.result as Record<string, unknown>).state = 'done'; },
+        receipt => { receipt.afterDigest = '0'.repeat(64); },
+        receipt => { receipt.operation = 'task.review'; },
+        receipt => { receipt.resourceId = '0mtaaaaaaaaaaaaaa1'; },
+        receipt => { receipt.disposition = 'failed'; },
+        receipt => { (receipt.result as Record<string, unknown>).identityCid = 'SECRET-AUTHORITY'; },
+      ];
+      const tampered = createOwnerCommandManagement({ configPath, senderCid: OWNER_CID, wireId: 'tamper-crash' });
+      for (const mutate of mutations) {
+        const altered = JSON.parse(pristine) as typeof persisted; mutate(altered._management_receipts.at(-1)!);
+        writeFileSync(taskPath, `${JSON.stringify(altered, null, 2)}\n`, { mode: 0o600 });
+        await expect(tampered.blockTask(created.task_id, 'tamper')).rejects.toMatchObject({
+          code: expect.stringMatching(/^(?:internal|idempotency_conflict)$/u),
+        });
+        expect(service.getTask(created.task_id).task.blocked).toMatchObject({ reason: 'tamper' });
+      }
+      writeFileSync(taskPath, `${pristine}\n`, { mode: 0o600 });
+    } finally {
+      if (previousHome === undefined) delete process.env.OURS_FLEET_HOME;
+      else process.env.OURS_FLEET_HOME = previousHome;
+      rmSync(fleetHome, { recursive: true, force: true });
+    }
+  });
+
+  it.each(['task.start', 'task.unblock', 'task.review'] as const)(
+    'recovers an exact %s receipt after post-publication interruption', async operation => {
+      const fleetHome = mkdtempSync(join(tmpdir(), 'owner-management-task-restart-matrix-'));
+      const previousHome = process.env.OURS_FLEET_HOME; process.env.OURS_FLEET_HOME = fleetHome;
+      const configPath = join(fleetHome, 'fleet.yaml');
+      writeFileSync(configPath, 'schema_version: 2\nconfig_dir: fleet.conf.d\npolicy: {}\n');
+      try {
+        const service = new TaskRoomApplicationService(configPath);
+        const task = await createOwnerCommandManagement({ configPath, senderCid: OWNER_CID,
+          wireId: `matrix-create-${operation}` }).createTask({ title: operation,
+            origin: { type: 'owner_channel' }, backlog: true, noRoom: true });
+        if (operation === 'task.unblock') service.blockTask({ actor: { kind: 'local_control', surface: 'cli' },
+          taskId: task.task_id, reason: 'initial' });
+        if (operation === 'task.review') {
+          await service.startTask({ actor: { kind: 'local_control', surface: 'cli' }, taskId: task.task_id });
+          activateTask(task.task_id);
+        }
+        const wireId = `matrix-${operation}`;
+        const interrupted = createOwnerCommandManagement({ configPath, senderCid: OWNER_CID, wireId,
+          beforeOperationWrite: phase => { if (phase === 'completed') throw new Error('post-publication'); } });
+        const attempt = operation === 'task.start' ? interrupted.startTask(task.task_id)
+          : operation === 'task.unblock' ? interrupted.unblockTask(task.task_id) : interrupted.reviewTask(task.task_id);
+        await expect(attempt).rejects.toThrow('post-publication');
+        const published = service.getTask(task.task_id).task;
+        const keyHash = managementDigest(`${wireId}:${operation}`);
+        const store = new ManagementOperationStore(join(fleetHome, '.ours-fleet', 'management-operations'));
+        expect(store.read(keyHash)).toMatchObject({ phase: 'effecting' });
+        service.blockTask({ actor: { kind: 'local_control', surface: 'cli' }, taskId: task.task_id, reason: 'later' });
+        const restarted = createOwnerCommandManagement({ configPath, senderCid: OWNER_CID, wireId });
+        const recovered = operation === 'task.start' ? await restarted.startTask(task.task_id)
+          : operation === 'task.unblock' ? await restarted.unblockTask(task.task_id) : await restarted.reviewTask(task.task_id);
+        expect(recovered).toMatchObject({ task_id: task.task_id, state: published.state });
+        expect(service.getTask(task.task_id).task.blocked).toMatchObject({ reason: 'later' });
+        expect(store.read(keyHash)).toMatchObject({ phase: 'completed', response: { ok: true } });
+      } finally {
+        if (previousHome === undefined) delete process.env.OURS_FLEET_HOME;
+        else process.env.OURS_FLEET_HOME = previousHome;
+        rmSync(fleetHome, { recursive: true, force: true });
+      }
+    });
+
+  it('finalizes receipts idempotently on either side of acknowledgement publication', async () => {
+    const fleetHome = mkdtempSync(join(tmpdir(), 'owner-management-task-finalize-'));
+    const previousHome = process.env.OURS_FLEET_HOME; process.env.OURS_FLEET_HOME = fleetHome;
+    const configPath = join(fleetHome, 'fleet.yaml');
+    writeFileSync(configPath, 'schema_version: 2\nconfig_dir: fleet.conf.d\npolicy: {}\n');
+    try {
+      const task = await createOwnerCommandManagement({ configPath, senderCid: OWNER_CID, wireId: 'finalize-create' })
+        .createTask({ title: 'Finalize', origin: { type: 'owner_channel' }, backlog: true, noRoom: true });
+      const taskPath = join(fleetHome, '.ours-fleet', 'tasks', `${task.task_id}.json`);
+      const receipts = () => (JSON.parse(readFileSync(taskPath, 'utf8')) as {
+        _management_receipts: Array<{ acknowledged?: boolean; operation: string }>;
+      })._management_receipts;
+      const before = createOwnerCommandManagement({ configPath, senderCid: OWNER_CID, wireId: 'finalize-before',
+        beforeTaskEffectFinalize: () => { throw new Error('before acknowledgement'); } });
+      expect(await before.blockTask(task.task_id, 'before')).toMatchObject({ blocked: { reason: 'before' } });
+      expect(receipts()).toHaveLength(1); expect(receipts()[0]!.operation).toBe('task.block');
+      expect(receipts()[0]!.acknowledged).toBeUndefined();
+      expect(await createOwnerCommandManagement({ configPath, senderCid: OWNER_CID, wireId: 'finalize-before' })
+        .blockTask(task.task_id, 'before')).toMatchObject({ blocked: { reason: 'before' } });
+      expect(receipts()).toMatchObject([{ operation: 'task.block', acknowledged: true }]);
+
+      const after = createOwnerCommandManagement({ configPath, senderCid: OWNER_CID, wireId: 'finalize-after',
+        afterTaskEffectFinalize: () => { throw new Error('after acknowledgement'); } });
+      expect(await after.unblockTask(task.task_id)).toMatchObject({ task_id: task.task_id });
+      expect(receipts().at(-1)).toMatchObject({ operation: 'task.unblock', acknowledged: true });
+      await createOwnerCommandManagement({ configPath, senderCid: OWNER_CID, wireId: 'finalize-gc' })
+        .blockTask(task.task_id, 'gc');
+      expect(receipts()).toMatchObject([{ operation: 'task.block', acknowledged: true }]);
+    } finally {
+      if (previousHome === undefined) delete process.env.OURS_FLEET_HOME;
+      else process.env.OURS_FLEET_HOME = previousHome;
+      rmSync(fleetHome, { recursive: true, force: true });
+    }
+  });
+
+  it('recovers only durable room-close acceptance without fabricating worker completion', async () => {
+    const fleetHome = mkdtempSync(join(tmpdir(), 'owner-management-room-delete-crash-'));
+    const previousHome = process.env.OURS_FLEET_HOME; process.env.OURS_FLEET_HOME = fleetHome;
+    try {
+      const room = activateRoom(createRoomRecord({ room_id: 'room-delete-receipt', room_name: 'Delete receipt' }).room_id);
+      const adapter = { getRoom: vi.fn(async () => ({ room_id: room.room_id, state: 'active' })) } as any;
+      const app = new TaskRoomApplicationService(undefined, { loadConfiguration: () => ({ rooms: {
+        owner: { role: 'Owner' }, defaults: { attach_owner: false },
+      } }) as any, cowork: () => adapter, binPath: () => '/fleet', provisionMembers: vi.fn() });
+      const detail = await app.getRoomDetail(room.room_id);
+      const command = { operation: 'room.delete' as const, id: room.room_id,
+        confirmationId: room.room_id, expectedStateDigest: managementDigest(detail) };
+      const crash = createOwnerCommandManagement({ senderCid: OWNER_CID, wireId: 'room-delete-crash',
+        taskRoomApplicationService: app,
+        beforeOperationWrite: phase => { if (phase === 'completed') throw new Error('room journal interruption'); } });
+      await expect(crash.execute(command, 'room-delete-crash:room.delete'))
+        .rejects.toThrow('room journal interruption');
+      const store = new ManagementOperationStore(join(fleetHome, '.ours-fleet', 'management-operations'));
+      const keyHash = managementDigest('room-delete-crash:room.delete');
+      expect(store.read(keyHash)).toMatchObject({ phase: 'effecting' });
+      expect(getRoomRecord(room.room_id)).toMatchObject({ state: 'closing', close: { phase: 'retire_members' } });
+      advanceRoomClose(room.room_id, 'close_cowork');
+
+      let releaseAck!: () => void; let ackRead!: () => void;
+      const read = new Promise<void>(resolve => { ackRead = resolve; });
+      const release = new Promise<void>(resolve => { releaseAck = resolve; });
+      const ack = acknowledgeManagedRoomCloseReceipt(room.room_id, keyHash, { beforeState: async () => {
+        ackRead(); await release;
+      } });
+      await read;
+      const evidence = recordManagedRoomCloseError(room.room_id, 'worker failed', 'retry worker');
+      releaseAck(); await Promise.all([ack, evidence]);
+      expect(getRoomRecord(room.room_id)).toMatchObject({ close: { phase: 'close_cowork',
+        error: 'worker failed', recovery_hint: 'retry worker' } });
+
+      const roomPath = join(fleetHome, '.ours-fleet', 'rooms', `${room.room_id}.json`);
+      const pristine = readFileSync(roomPath, 'utf8');
+      const mutations: Array<(receipt: Record<string, any>) => void> = [
+        receipt => { receipt.result.room.close.phase = 'close_cowork'; },
+        receipt => { receipt.result.room.close.accepted_at = 'not-a-time'; },
+        receipt => { receipt.result.room.close.accepted_at = '2026-08-28T17:00:00Z'; },
+        receipt => { receipt.result.room.room_name = 'x'.repeat(161); },
+        receipt => { receipt.result.room.close.identityCid = 'SECRET'; },
+        receipt => { receipt.result.room.close.invite = 'SECRET'; },
+        receipt => { receipt.result.room.close.token = 'SECRET'; },
+        receipt => { receipt.result.room.close.credential = 'SECRET'; },
+        receipt => { receipt.result.room.close.privateKey = 'SECRET'; },
+        receipt => { receipt.result.room.close.delegation = 'SECRET'; },
+        receipt => { receipt.result.room.close.error = 'unsafe'; },
+        receipt => { receipt.result.room.close.recovery_hint = 'unsafe'; },
+        receipt => { receipt.result.room.close.unknown = 'unsafe'; },
+      ];
+      const restarted = createOwnerCommandManagement({ senderCid: OWNER_CID, wireId: 'room-delete-crash',
+        taskRoomApplicationService: app });
+      for (const mutate of mutations) {
+        const altered = JSON.parse(pristine) as { _management_receipts: Array<Record<string, any>> };
+        const receipt = altered._management_receipts[0]!; mutate(receipt);
+        receipt.afterDigest = managementDigest(receipt.result);
+        writeFileSync(roomPath, `${JSON.stringify(altered, null, 2)}\n`, { mode: 0o600 });
+        expect(await restarted.execute(command, 'room-delete-crash:room.delete')).toMatchObject({
+          ok: false, error: { code: 'internal' },
+        });
+        expect(getRoomRecord(room.room_id)).toMatchObject({ close: { phase: 'close_cowork',
+          error: 'worker failed', recovery_hint: 'retry worker' } });
+      }
+      const containerMutations: Array<(stored: Record<string, any>) => void> = [
+        stored => { stored._management_receipts = {}; },
+        stored => { stored._management_receipts = Array.from({ length: 17 },
+          () => structuredClone(stored._management_receipts[0])); },
+        stored => { stored._management_receipts.push({ version: 1 }); },
+      ];
+      for (const mutate of containerMutations) {
+        const altered = JSON.parse(pristine) as Record<string, any>; mutate(altered);
+        writeFileSync(roomPath, `${JSON.stringify(altered, null, 2)}\n`, { mode: 0o600 });
+        expect(await restarted.execute(command, 'room-delete-crash:room.delete')).toMatchObject({
+          ok: false, error: { code: 'internal' },
+        });
+        expect(getRoomRecord(room.room_id)).toMatchObject({ close: { phase: 'close_cowork',
+          error: 'worker failed', recovery_hint: 'retry worker' } });
+      }
+      writeFileSync(roomPath, pristine, { mode: 0o600 });
+
+      expect(await restarted.execute(command, 'room-delete-crash:room.delete')).toMatchObject({ ok: true,
+        replay: { source: 'journal', redacted: true }, result: { type: 'room-close', value: {
+          room: { room_id: room.room_id, state: 'closing', close: { phase: 'retire_members' } },
+          settlementRequired: true,
+        } } });
+      expect(getRoomRecord(room.room_id)).toMatchObject({ state: 'closing', close: { phase: 'close_cowork',
+        error: 'worker failed', recovery_hint: 'retry worker' } });
+      expect(store.read(keyHash)).toMatchObject({ phase: 'completed', response: { ok: true } });
+      const stored = JSON.parse(readFileSync(roomPath, 'utf8')) as {
+        _management_receipts: Array<{ acknowledged?: boolean; disposition: string }>;
+      };
+      expect(stored._management_receipts).toMatchObject([{ acknowledged: true, disposition: 'accepted' }]);
+      expect(JSON.stringify(stored._management_receipts))
+        .not.toMatch(/identity|owner|credential|invite|token|private|delegation/iu);
+    } finally {
+      if (previousHome === undefined) delete process.env.OURS_FLEET_HOME;
+      else process.env.OURS_FLEET_HOME = previousHome;
+      rmSync(fleetHome, { recursive: true, force: true });
+    }
+  });
+
+  it('atomically admits cursor-bound room recovery and replays acceptance after journal interruption', async () => {
+    const fleetHome = mkdtempSync(join(tmpdir(), 'owner-management-room-recover-'));
+    const previousHome = process.env.OURS_FLEET_HOME; process.env.OURS_FLEET_HOME = fleetHome;
+    try {
+      const room = createRoomRecord({ room_id: 'room-recover-receipt', room_name: 'Recover receipt' });
+      const detail = roomRecoveryDetail(room.room_id);
+      const command = { operation: 'room.recover' as const, id: room.room_id,
+        expectedStateDigest: managementDigest(detail) };
+      const crash = createOwnerCommandManagement({ senderCid: OWNER_CID, wireId: 'room-recover-crash',
+        beforeOperationWrite: phase => { if (phase === 'completed') throw new Error('recover journal interruption'); } });
+      await expect(crash.execute(command, 'room-recover-crash:room.recover'))
+        .rejects.toThrow('recover journal interruption');
+      const restarted = createOwnerCommandManagement({ senderCid: OWNER_CID, wireId: 'room-recover-crash' });
+      expect(await restarted.execute(command, 'room-recover-crash:room.recover')).toMatchObject({ ok: true,
+        replay: { source: 'journal', redacted: true }, result: { type: 'room-recovery', value: {
+          kind: 'provisioning_worker_required', room_id: room.room_id, settlementRequired: true,
+          cursor: { kind: 'provision', state: 'provisioning', phase: 'persist_intent', step_index: 0 },
+        } } });
+      expect(getRoomRecord(room.room_id)).toMatchObject({ state: 'provisioning', saga: { phase: 'persist_intent' } });
+    } finally {
+      if (previousHome === undefined) delete process.env.OURS_FLEET_HOME;
+      else process.env.OURS_FLEET_HOME = previousHome;
+      rmSync(fleetHome, { recursive: true, force: true });
+    }
+  });
+
+  it('settles a receipt-selected close through a retained deletion tombstone', async () => {
+    const fleetHome = mkdtempSync(join(tmpdir(), 'owner-management-room-recover-close-'));
+    const previousHome = process.env.OURS_FLEET_HOME; process.env.OURS_FLEET_HOME = fleetHome;
+    try {
+      const room = activateRoom(createRoomRecord({ room_id: 'room-recover-close', room_name: 'Recover close' }).room_id);
+      closeRoom(room.room_id);
+      const command = { operation: 'room.recover' as const, id: room.room_id,
+        expectedStateDigest: managementDigest(roomRecoveryDetail(room.room_id)) };
+      const key = 'room-recover-close-key';
+      expect(await createOwnerCommandManagement({ senderCid: OWNER_CID, wireId: key })
+        .execute(command, key)).toMatchObject({ ok: true, result: { value: { kind: 'deletion_worker_required' } } });
+      const cowork = { closeRoom: vi.fn(async () => undefined), deleteRoom: vi.fn(async () => undefined) };
+      const durabilityOrder: string[] = [];
+      await expect(settleManagedRoomRecovery({ roomId: room.room_id,
+        keyHash: managementDigest(key), principalHash: managementDigest({ authority: 'cid', cid: OWNER_CID.toLowerCase() }),
+        requestHash: managementDigest({ operation: 'room.recover', id: room.room_id }), cowork,
+        recoveryHooks: { afterTombstonePublication: () => durabilityOrder.push('tombstone'),
+          afterRoomUnlink: () => durabilityOrder.push('unlink'),
+          afterDirectorySync: () => durabilityOrder.push('directory-fsync') } }))
+        .resolves.toEqual({ room_id: room.room_id, deleted: true });
+      expect(durabilityOrder).toEqual(['tombstone', 'unlink', 'directory-fsync']);
+      expect(cowork.deleteRoom).toHaveBeenCalledOnce();
+      expect(getRoomRecord(room.room_id)).toBeUndefined();
+      const tombstones = readdirSync(join(fleetHome, '.ours-fleet', 'rooms')).filter(name => name.startsWith('.deleted-'));
+      expect(tombstones).toHaveLength(1);
+      expect(JSON.parse(readFileSync(join(fleetHome, '.ours-fleet', 'rooms', tombstones[0]!), 'utf8')))
+        .toMatchObject({ phase: 'deleted', acknowledged: true, roomId: room.room_id });
+      expect(await createOwnerCommandManagement({ senderCid: OWNER_CID, wireId: key })
+        .execute(command, key)).toMatchObject({ ok: true, replay: { source: 'journal' },
+          result: { value: { kind: 'deletion_worker_required', room_id: room.room_id } } });
+      expect(gcAcknowledgedRoomDeletionTombstone(room.room_id, managementDigest(key))).toBe(true);
+      expect(await createOwnerCommandManagement({ senderCid: OWNER_CID, wireId: key })
+        .execute(command, key)).toMatchObject({ ok: true, replay: { source: 'journal' },
+          result: { value: { kind: 'deletion_worker_required', room_id: room.room_id } } });
+    } finally {
+      if (previousHome === undefined) delete process.env.OURS_FLEET_HOME;
+      else process.env.OURS_FLEET_HOME = previousHome;
+      rmSync(fleetHome, { recursive: true, force: true });
+    }
+  });
+
+  it('fails closed when retained deletion evidence disagrees with the live recovery receipt', async () => {
+    const fleetHome = mkdtempSync(join(tmpdir(), 'owner-management-room-recover-conflict-'));
+    const previousHome = process.env.OURS_FLEET_HOME; process.env.OURS_FLEET_HOME = fleetHome;
+    try {
+      const room = activateRoom(createRoomRecord({ room_id: 'room-recover-conflict',
+        room_name: 'Recover conflict' }).room_id);
+      closeRoom(room.room_id);
+      const key = 'room-recover-conflict-key';
+      const command = { operation: 'room.recover' as const, id: room.room_id,
+        expectedStateDigest: managementDigest(roomRecoveryDetail(room.room_id)) };
+      await createOwnerCommandManagement({ senderCid: OWNER_CID, wireId: key }).execute(command, key);
+      const keyHash = managementDigest(key); const rooms = join(fleetHome, '.ours-fleet', 'rooms');
+      const tombstonePath = join(rooms, `.deleted-${encodeURIComponent(room.room_id)}-${keyHash}.json`);
+      writeFileSync(tombstonePath, JSON.stringify({ version: 1, roomId: room.room_id, keyHash,
+        principalHash: '0'.repeat(64), requestHash: '1'.repeat(64), cursorDigest: '2'.repeat(64),
+        bindingsDigest: '3'.repeat(64), resultDigest: '4'.repeat(64), phase: 'local_delete_pending' }) + '\n');
+      expect(() => publishRoomDeletionTombstoneAndUnlink(room.room_id, keyHash))
+        .toThrow('room deletion evidence conflicts');
+      expect(getRoomRecord(room.room_id)).toMatchObject({ room_id: room.room_id, state: 'closed' });
+    } finally {
+      if (previousHome === undefined) delete process.env.OURS_FLEET_HOME;
+      else process.env.OURS_FLEET_HOME = previousHome;
+      rmSync(fleetHome, { recursive: true, force: true });
+    }
+  });
+
+  it('authenticates a pending tombstone after an unlink crash without rerunning external effects', async () => {
+    const fleetHome = mkdtempSync(join(tmpdir(), 'owner-management-room-recover-unlink-crash-'));
+    const previousHome = process.env.OURS_FLEET_HOME; process.env.OURS_FLEET_HOME = fleetHome;
+    try {
+      const room = activateRoom(createRoomRecord({ room_id: 'room-recover-unlink-crash',
+        room_name: 'Recover unlink crash' }).room_id);
+      closeRoom(room.room_id);
+      const key = 'room-recover-unlink-crash-key'; const keyHash = managementDigest(key);
+      const principalHash = managementDigest({ authority: 'cid', cid: OWNER_CID.toLowerCase() });
+      const requestHash = managementDigest({ operation: 'room.recover', id: room.room_id });
+      await createOwnerCommandManagement({ senderCid: OWNER_CID, wireId: key }).execute({
+        operation: 'room.recover', id: room.room_id,
+        expectedStateDigest: managementDigest(roomRecoveryDetail(room.room_id)),
+      }, key);
+      expect(() => publishRoomDeletionTombstoneAndUnlink(room.room_id, keyHash, {
+        afterRoomUnlink: () => { throw new Error('unlink crash'); },
+      })).toThrow('unlink crash');
+      expect(getRoomRecord(room.room_id)).toBeUndefined();
+      const cowork = { closeRoom: vi.fn(async () => undefined), deleteRoom: vi.fn(async () => undefined) };
+      await expect(settleManagedRoomRecovery({ roomId: room.room_id, keyHash, principalHash,
+        requestHash, cowork })).resolves.toEqual({ room_id: room.room_id, deleted: true });
+      expect(cowork.closeRoom).not.toHaveBeenCalled(); expect(cowork.deleteRoom).not.toHaveBeenCalled();
+      const tombstone = readdirSync(join(fleetHome, '.ours-fleet', 'rooms'))
+        .find(name => name.startsWith('.deleted-'))!;
+      expect(JSON.parse(readFileSync(join(fleetHome, '.ours-fleet', 'rooms', tombstone), 'utf8')))
+        .toMatchObject({ phase: 'deleted', acknowledged: true });
+    } finally {
+      if (previousHome === undefined) delete process.env.OURS_FLEET_HOME;
+      else process.env.OURS_FLEET_HOME = previousHome;
+      rmSync(fleetHome, { recursive: true, force: true });
+    }
+  });
+
+  it('resumes a crash after tombstone publication before unlink without rerunning external effects', async () => {
+    const fleetHome = mkdtempSync(join(tmpdir(), 'owner-management-room-recover-publish-crash-'));
+    const previousHome = process.env.OURS_FLEET_HOME; process.env.OURS_FLEET_HOME = fleetHome;
+    try {
+      const room = activateRoom(createRoomRecord({ room_id: 'room-recover-publish-crash',
+        room_name: 'Recover publish crash' }).room_id);
+      closeRoom(room.room_id);
+      const key = 'room-recover-publish-crash-key'; const keyHash = managementDigest(key);
+      const principalHash = managementDigest({ authority: 'cid', cid: OWNER_CID.toLowerCase() });
+      const requestHash = managementDigest({ operation: 'room.recover', id: room.room_id });
+      await createOwnerCommandManagement({ senderCid: OWNER_CID, wireId: key }).execute({
+        operation: 'room.recover', id: room.room_id,
+        expectedStateDigest: managementDigest(roomRecoveryDetail(room.room_id)),
+      }, key);
+      expect(() => publishRoomDeletionTombstoneAndUnlink(room.room_id, keyHash, {
+        afterTombstonePublication: () => { throw new Error('publication crash'); },
+      })).toThrow('publication crash');
+      expect(getRoomRecord(room.room_id)).toMatchObject({ room_id: room.room_id });
+      expect(gcAcknowledgedRoomDeletionTombstone(room.room_id, keyHash)).toBe(false);
+      const cowork = { closeRoom: vi.fn(async () => undefined), deleteRoom: vi.fn(async () => undefined) };
+      await expect(settleManagedRoomRecovery({ roomId: room.room_id, keyHash, principalHash,
+        requestHash, cowork })).resolves.toEqual({ room_id: room.room_id, deleted: true });
+      expect(cowork.closeRoom).not.toHaveBeenCalled(); expect(cowork.deleteRoom).not.toHaveBeenCalled();
+      expect(getRoomRecord(room.room_id)).toBeUndefined();
+    } finally {
+      if (previousHome === undefined) delete process.env.OURS_FLEET_HOME;
+      else process.env.OURS_FLEET_HOME = previousHome;
+      rmSync(fleetHome, { recursive: true, force: true });
+    }
+  });
+
+  it('serializes concurrent close workers into one Cowork deletion effect', async () => {
+    const fleetHome = mkdtempSync(join(tmpdir(), 'owner-management-room-recover-concurrent-'));
+    const previousHome = process.env.OURS_FLEET_HOME; process.env.OURS_FLEET_HOME = fleetHome;
+    try {
+      const room = activateRoom(createRoomRecord({ room_id: 'room-recover-concurrent',
+        room_name: 'Recover concurrent' }).room_id);
+      closeRoom(room.room_id);
+      const key = 'room-recover-concurrent-key'; const keyHash = managementDigest(key);
+      const principalHash = managementDigest({ authority: 'cid', cid: OWNER_CID.toLowerCase() });
+      const requestHash = managementDigest({ operation: 'room.recover', id: room.room_id });
+      await createOwnerCommandManagement({ senderCid: OWNER_CID, wireId: key }).execute({
+        operation: 'room.recover', id: room.room_id,
+        expectedStateDigest: managementDigest(roomRecoveryDetail(room.room_id)),
+      }, key);
+      const cowork = { closeRoom: vi.fn(async () => undefined), deleteRoom: vi.fn(async () => undefined) };
+      const results = await Promise.all([settleManagedRoomRecovery({ roomId: room.room_id, keyHash,
+        principalHash, requestHash, cowork }), settleManagedRoomRecovery({ roomId: room.room_id,
+        keyHash, principalHash, requestHash, cowork })]);
+      expect(results).toEqual([{ room_id: room.room_id, deleted: true },
+        { room_id: room.room_id, deleted: true }]);
+      expect(cowork.deleteRoom).toHaveBeenCalledOnce();
+    } finally {
+      if (previousHome === undefined) delete process.env.OURS_FLEET_HOME;
+      else process.env.OURS_FLEET_HOME = previousHome;
+      rmSync(fleetHome, { recursive: true, force: true });
+    }
+  });
+
+  it('reuses the exact room identity after remote deletion lands before its tombstone checkpoint', async () => {
+    const fleetHome = mkdtempSync(join(tmpdir(), 'owner-management-room-recover-delete-crash-'));
+    const previousHome = process.env.OURS_FLEET_HOME; process.env.OURS_FLEET_HOME = fleetHome;
+    try {
+      const room = activateRoom(createRoomRecord({ room_id: 'room-recover-delete-crash',
+        room_name: 'Recover delete crash' }).room_id);
+      closeRoom(room.room_id);
+      const key = 'room-recover-delete-crash-key'; const keyHash = managementDigest(key);
+      const principalHash = managementDigest({ authority: 'cid', cid: OWNER_CID.toLowerCase() });
+      const requestHash = managementDigest({ operation: 'room.recover', id: room.room_id });
+      await createOwnerCommandManagement({ senderCid: OWNER_CID, wireId: key }).execute({
+        operation: 'room.recover', id: room.room_id,
+        expectedStateDigest: managementDigest(roomRecoveryDetail(room.room_id)),
+      }, key);
+      const cowork = { closeRoom: vi.fn(async () => undefined), deleteRoom: vi.fn(async () => undefined) };
+      await expect(settleManagedRoomRecovery({ roomId: room.room_id, keyHash, principalHash,
+        requestHash, cowork, recoveryHooks: { afterCoworkDelete: () => { throw new Error('delete crash'); } } }))
+        .rejects.toThrow('delete crash');
+      expect(getRoomRecord(room.room_id)).toMatchObject({ room_id: room.room_id });
+      await expect(settleManagedRoomRecovery({ roomId: room.room_id, keyHash, principalHash,
+        requestHash, cowork })).resolves.toEqual({ room_id: room.room_id, deleted: true });
+      expect(cowork.deleteRoom.mock.calls).toEqual([[room.room_id], [room.room_id]]);
+    } finally {
+      if (previousHome === undefined) delete process.env.OURS_FLEET_HOME;
+      else process.env.OURS_FLEET_HOME = previousHome;
+      rmSync(fleetHome, { recursive: true, force: true });
+    }
+  });
+});
 
 export const EMPTY_CONTACTS: OursContactsView = {
   contacts: [], pending: [], roots: {}, degraded: [], renames: {},
@@ -835,7 +1484,7 @@ describe('OwnerChannel deterministic command dispatch', () => {
     expect(acknowledgement).not.toContain('Room closed');
   });
 
-  it('acknowledges and remembers closing-room recovery before one worker launch', async () => {
+  it('acknowledges and remembers closing-room recovery without claiming or launching completion', async () => {
     const fleet = fakeFleet();
     const fleetHome = mkdtempSync(join(tmpdir(), 'ours-owner-room-recover-'));
     dirs.push(fleetHome);
@@ -852,23 +1501,16 @@ describe('OwnerChannel deterministic command dispatch', () => {
       [ownerMessage(5911, 'wire-room-recover', `/room recover ${roomId}`)],
       undefined, { fleet, configPath },
     );
-    let wireWhenSpawned = '';
-    let sendsWhenSpawned = 0;
-    fleet.closeRoom.mockImplementation(async () => {
-      wireWhenSpawned = readFileSync(join(dir, '.owner-channel-state.json'), 'utf8');
-      sendsWhenSpawned = client.calls.filter(call => call.name === 'sendMessage').length;
-    });
     try { await channel.drain(); }
     finally {
       if (previousHome === undefined) delete process.env.OURS_FLEET_HOME;
       else process.env.OURS_FLEET_HOME = previousHome;
     }
     expect(queuePrompt).not.toHaveBeenCalled();
-    expect(fleet.closeRoom).toHaveBeenCalledTimes(1);
-    expect(fleet.closeRoom).toHaveBeenCalledWith(roomId);
-    expect(wireWhenSpawned).toContain('wire-room-recover');
-    expect(sendsWhenSpawned).toBeGreaterThan(0);
-    expect(lastReply(client)).toContain('deletion recovery is still being settled');
+    expect(fleet.closeRoom).not.toHaveBeenCalled();
+    expect(readFileSync(join(dir, '.owner-channel-state.json'), 'utf8')).toContain('wire-room-recover');
+    expect(lastReply(client)).toContain('durably accepted and requires its bound worker');
+    expect(lastReply(client)).not.toMatch(/deletion completed successfully|room deleted/iu);
   });
 
   it('persists task terminal intent and the wire before launching its external worker', async () => {

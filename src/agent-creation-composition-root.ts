@@ -17,6 +17,9 @@ import type { BrainAdapterEvidenceAuthority } from './harness/brain-adapter.js';
 import type { ConfigResourceSnapshot } from './config-resource-loader.js';
 import type { IdentityProvisioner, IdentityProvisionProfile } from './creation.js';
 import { AgentSupervisorHandoffPublisher, type AgentSupervisorHandoffFaults } from './agent-supervisor-handoff.js';
+import type { AgentSupervisorHandoff } from './agent-supervisor-handoff.js';
+import type { AgentSupervisorControlAuthority, AgentSupervisorControlBinding,
+  AgentSupervisorControlLease } from './agent-supervisor-control.js';
 import { TempAgentPlanReservationRoot } from './temp-agent-plan-reservation.js';
 import { TempAgentSupervisorHandoffPublisher } from './temp-agent-supervisor-handoff.js';
 
@@ -25,6 +28,17 @@ export interface PermanentAgentCreationResult extends AgentCreationResult {
   identityAcquisition?: 'external' | 'created';
   identityName?: string;
 }
+type ControlledRoot = Readonly<{
+  create(request: AgentCompositionRequest, actionId: string,
+    lease: AgentSupervisorControlLease,
+    operation?: 'create'|'reconfigure'): Promise<PermanentAgentCreationResult>;
+  resume(agentId: string, actionId: string,
+    lease: AgentSupervisorControlLease): Promise<PermanentAgentCreationResult>;
+  retire(active: Readonly<AgentSupervisorHandoff>, actionId: string,
+    lease: AgentSupervisorControlLease): Promise<void>;
+}>;
+const controlledRoots = new WeakMap<AgentCreationCompositionRoot, ControlledRoot>();
+const rootControls = new WeakMap<AgentCreationCompositionRoot, AgentSupervisorControlAuthority>();
 
 /**
  * Production handoff root for persistent Agent creation. It intentionally owns
@@ -39,11 +53,18 @@ export class AgentCreationCompositionRoot {
     locators: AgentStartLocatorPublisher = new AgentStartLocatorPublisher(transaction),
     private readonly handoffs?: AgentSupervisorHandoffPublisher,
     private readonly admit?: (request: AgentCompositionRequest, actionId: string) => Promise<() => void>,
-  ) { this.#locators = locators; }
+  ) { this.#locators = locators; controlledRoots.set(this, Object.freeze({
+    create: (request, actionId, lease, operation) => this.#create(request, actionId, lease, operation),
+    resume: (agentId, actionId, lease) => this.#resume(agentId, actionId, lease),
+    retire: (active, actionId, lease) => this.#retire(active, actionId, lease),
+  })); }
 
-  async createPermanent(
-    request: AgentCompositionRequest, actionId: string,
-  ): Promise<PermanentAgentCreationResult> {
+  createPermanent(request: AgentCompositionRequest, actionId: string): Promise<PermanentAgentCreationResult> {
+    return this.#create(request, actionId);
+  }
+  async #create(request: AgentCompositionRequest, actionId: string,
+    controlLease?: AgentSupervisorControlLease,
+    operation: 'create'|'reconfigure' = 'create'): Promise<PermanentAgentCreationResult> {
     const release = await this.admit?.(request, actionId);
     try {
       const prepared = this.composition.prepare(request);
@@ -51,25 +72,76 @@ export class AgentCreationCompositionRoot {
           || prepared.operation.id !== actionId)
         throw new AgentCompositionError('invalid_request');
       const result = await this.transaction.persistPrepared(prepared, { actionId });
-      return this.#finish(result);
+      const supervisorControl = rootControls.get(this);
+      if (controlLease && supervisorControl && !supervisorControl.bind(controlLease, {
+        agentId: prepared.agentId, operation, priorGeneration: prepared.generation - 1,
+        targetGeneration: prepared.generation, actionId, planDigest: prepared.planDigest,
+        snapshotDigest: prepared.snapshotDigest, rootId: 'production-agent-creation',
+        publisherId: 'agent-supervisor-handoff',
+      })) throw new AgentCompositionError('invalid_context');
+      return this.#finish(result, controlLease, operation);
     } finally { release?.(); }
   }
 
-  async resumePermanent(agentId: string, actionId: string): Promise<PermanentAgentCreationResult> {
-    return this.#finish(await this.transaction.resume({ agentId, actionId }));
+  resumePermanent(agentId: string, actionId: string): Promise<PermanentAgentCreationResult> {
+    return this.#resume(agentId, actionId);
+  }
+  async #resume(agentId: string, actionId: string,
+    controlLease?: AgentSupervisorControlLease): Promise<PermanentAgentCreationResult> {
+    const result = await this.transaction.resume({ agentId, actionId });
+    const supervisorControl = rootControls.get(this);
+    if (controlLease && supervisorControl && result.state === 'complete') {
+      const exact = this.transaction.authenticateComplete(this.transaction.validateComplete(result.reservation));
+      if (!exact || !supervisorControl.bind(controlLease, { agentId: exact.agentId,
+        operation: 'resume', priorGeneration: exact.generation, targetGeneration: exact.generation,
+        actionId: exact.actionId, planDigest: exact.planDigest, snapshotDigest: exact.snapshotDigest,
+        rootId: 'production-agent-creation', publisherId: 'agent-supervisor-handoff' }))
+        throw new AgentCompositionError('invalid_context');
+    }
+    return this.#finish(result, controlLease, 'resume');
   }
 
-  async #finish(result: AgentCreationResult): Promise<PermanentAgentCreationResult> {
+  async #finish(result: AgentCreationResult,
+    controlLease?: AgentSupervisorControlLease,
+    operation: AgentSupervisorControlBinding['operation'] = 'create'): Promise<PermanentAgentCreationResult> {
     if (result.state !== 'complete') return result;
     const complete = this.transaction.validateComplete(result.reservation);
     const authenticated = this.transaction.authenticateComplete(complete);
     if (!authenticated) throw new AgentCompositionError('invalid_context');
     const locator = this.#locators.publish(complete);
-    await this.handoffs?.publish(complete);
+    await this.handoffs?.publish(complete, controlLease, operation);
     return { ...result, locator,
       identityAcquisition: authenticated.identity.acquisition,
       identityName: authenticated.identity.name };
   }
+  #retire(active: Readonly<AgentSupervisorHandoff>, actionId: string,
+    lease: AgentSupervisorControlLease): Promise<void> {
+    if (!this.handoffs) throw new AgentCompositionError('invalid_context');
+    return this.handoffs.retire(active, actionId, lease);
+  }
+}
+
+/** Internal bridge; deliberately not re-exported by the package entry point. */
+export function createPermanentWithSupervisorControl(root: AgentCreationCompositionRoot,
+  request: AgentCompositionRequest, actionId: string, lease: AgentSupervisorControlLease,
+  operation: 'create'|'reconfigure' = 'create') {
+  const controlled = controlledRoots.get(root);
+  if (!controlled) throw new AgentCompositionError('invalid_context');
+  return controlled.create(request, actionId, lease, operation);
+}
+/** Internal bridge; deliberately not re-exported by the package entry point. */
+export function resumePermanentWithSupervisorControl(root: AgentCreationCompositionRoot,
+  agentId: string, actionId: string, lease: AgentSupervisorControlLease) {
+  const controlled = controlledRoots.get(root);
+  if (!controlled) throw new AgentCompositionError('invalid_context');
+  return controlled.resume(agentId, actionId, lease);
+}
+/** Internal bridge; deliberately not re-exported by the package entry point. */
+export function retirePermanentWithSupervisorControl(root: AgentCreationCompositionRoot,
+  active: Readonly<AgentSupervisorHandoff>, actionId: string, lease: AgentSupervisorControlLease) {
+  const controlled = controlledRoots.get(root);
+  if (!controlled) throw new AgentCompositionError('invalid_context');
+  return controlled.retire(active, actionId, lease);
 }
 
 export interface ProductionIngressContext {
@@ -127,6 +199,16 @@ function ownIngress(context: ProductionIngressContext): Omit<TrustedCompositionC
 export function createProductionAgentCreationCompositionRoot(
   deps: ProductionAgentCreationDeps,
 ): ProductionAgentCreationAssembly {
+  return assembleProductionAgentCreation(deps);
+}
+/** Internal management assembly; deliberately not re-exported by the package entry point. */
+export function createControlledProductionAgentCreationCompositionRoot(
+  deps: ProductionAgentCreationDeps, supervisorControl: AgentSupervisorControlAuthority,
+): ProductionAgentCreationAssembly {
+  return assembleProductionAgentCreation(deps, supervisorControl);
+}
+function assembleProductionAgentCreation(deps: ProductionAgentCreationDeps,
+  supervisorControl?: AgentSupervisorControlAuthority): ProductionAgentCreationAssembly {
   const contexts = new WeakMap<object, Readonly<TrustedCompositionContext>>();
   const generationAdmissions = new WeakMap<object, number>();
   const transactionEvidence = Object.freeze({}) as VerifiedTransactionConsumerEvidence;
@@ -170,7 +252,9 @@ export function createProductionAgentCreationCompositionRoot(
     return () => generationAdmissions.delete(evidence);
   };
   const root = new AgentCreationCompositionRoot(composition, transaction, undefined,
-    new AgentSupervisorHandoffPublisher(deps.trustedStateRoot, transaction, deps.handoffFaults), admit);
+    new AgentSupervisorHandoffPublisher(deps.trustedStateRoot, transaction, deps.handoffFaults,
+      supervisorControl), admit);
+  if (supervisorControl) rootControls.set(root, supervisorControl);
   const temporaryReservations = new TempAgentPlanReservationRoot(composition, consumer, generationsAuthority);
   const temporaryHandoffs = new TempAgentSupervisorHandoffPublisher(deps.trustedStateRoot, temporaryReservations);
   type TempStatus = Readonly<{ agentId: string; generation: number;

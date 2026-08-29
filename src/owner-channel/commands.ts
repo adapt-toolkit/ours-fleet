@@ -17,6 +17,7 @@ import { TaskRoomApplicationError } from '../application/task-room-service.js';
 import type { CreateRoomRequest, CreateTaskRequest, TaskRoomApplicationService } from '../application/task-room-service.js';
 import type { TaskState } from '../rooms-tasks/types.js';
 import { TaskListError } from '../rooms-tasks/task-lists.js';
+import type { ManagementCommand, ManagementResponse } from '../application/management-contract.js';
 
 /**
  * Fleet-level effects a deterministic owner command may trigger. Production
@@ -64,6 +65,7 @@ export interface OwnerCommandContext {
    */
   setComments(enabled: boolean): OwnerCommentsState;
   fleetList(): Promise<string>;
+  manage?(command: ManagementCommand, idempotencyKey?: string): Promise<ManagementResponse>;
   /** Persist acceptance, acknowledge it, then launch the external close worker. */
   closeRoom(roomId: string): Promise<void>;
   recoverRoom(roomId: string): Promise<void>;
@@ -80,9 +82,9 @@ export interface OwnerCommandContext {
   deleteTaskList(name: string, destination?: string): Promise<{ deleted: TaskListRecord; moved: number; destination?: TaskListRecord }>;
   moveTask(taskId: string, list: string): Promise<TaskRecord>;
   getTask(taskId: string): { task: TaskRecord; orchestration: RoomOrchestrationRecord | undefined };
-  blockTask(taskId: string, reason: string): TaskRecord;
-  unblockTask(taskId: string): TaskRecord;
-  reviewTask(taskId: string): TaskRecord;
+  blockTask(taskId: string, reason: string): TaskRecord | Promise<TaskRecord>;
+  unblockTask(taskId: string): TaskRecord | Promise<TaskRecord>;
+  reviewTask(taskId: string): TaskRecord | Promise<TaskRecord>;
   deleteTask(taskId: string): boolean;
   listRoomQueries(filter?: { state?: 'active' | 'provisioning' }): ReturnType<TaskRoomApplicationService['listRooms']>;
   getRoomQuery(id: string): ReturnType<TaskRoomApplicationService['getRoomDetail']>;
@@ -336,6 +338,26 @@ export const ownerCommands: OwnerCommand[] = [
       ctx.reply(`📊 Fleet sessions:\n${tail(stripMultiline(await ctx.fleetList(), 10_000), REPLY_MAX_CHARS)}`)),
   },
   {
+    name: 'resource', usage: '/resource <list|get|create|update|delete> ...',
+    summary: 'manage typed Role, Brain, Agent, template, and policy resources',
+    execute: async (ctx, args) => {
+      if (!ctx.manage) throw new OwnerCommandUsageError('typed resource management is unavailable');
+      const [verb, first, second, ...rest] = args.split(/\s+/u).filter(Boolean);
+      let command: ManagementCommand; let key: string | undefined;
+      if (verb === 'list') command = { operation: 'resource.list', ...(first ? { kind: first as never } : {}) };
+      else if (verb === 'get') command = { operation: 'resource.get', kind: first as never, id: second };
+      else if (verb === 'delete') { key = rest[1]; command = { operation: 'resource.delete', kind: first as never,
+        id: second, expectedDigest: rest[0] }; }
+      else if (verb === 'create' || verb === 'update') {
+        const resource = JSON.parse([second, ...rest].join(' ')); key = first;
+        command = { operation: `resource.${verb}`, expectedDigest: first, resource } as ManagementCommand;
+      } else throw new OwnerCommandUsageError('usage: /resource <list|get|create|update|delete> ...');
+      const response = await ctx.manage(command, key);
+      await ctx.reply(response.ok ? `📦 ${JSON.stringify(response.result)}`
+        : `⚠️ ${response.error.code}: ${response.error.message}`);
+    },
+  },
+  {
     name: 'peek', summary: 'summarize recent session activity (event shapes only, no content)',
     execute: noArgs('/peek', async ctx => {
       const lines = ctx.recentEvents(20).map(event => ['·', event.kind,
@@ -516,19 +538,19 @@ export const ownerCommands: OwnerCommand[] = [
           case 'block': {
             if (!rest[0] || !rest[1]) throw new OwnerCommandUsageError('usage: /task block <id> <reason>');
             const reason = rest.slice(1).join(' ');
-            const t = ctx.blockTask(rest[0], reason);
+            const t = await ctx.blockTask(rest[0], reason);
             await ctx.reply(taskAction('Task blocked', t, [{ label: 'Reason', value: reason }]));
             break;
           }
           case 'unblock': {
             if (!rest[0]) throw new OwnerCommandUsageError('usage: /task unblock <id>');
-            const t = ctx.unblockTask(rest[0]);
+            const t = await ctx.unblockTask(rest[0]);
             await ctx.reply(taskAction('Task unblocked', t));
             break;
           }
           case 'review': {
             if (!rest[0]) throw new OwnerCommandUsageError('usage: /task review <id>');
-            const t = ctx.reviewTask(rest[0]);
+            const t = await ctx.reviewTask(rest[0]);
             await ctx.reply(taskAction('Task ready for review', t));
             break;
           }

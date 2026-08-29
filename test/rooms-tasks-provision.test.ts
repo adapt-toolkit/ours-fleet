@@ -30,9 +30,13 @@ vi.mock('../src/agent-production-runtime.js', () => ({
   createAgentProductionRuntime: () => mocks.productionRuntime,
 }));
 
-import { provisionMembers } from '../src/rooms-tasks/provision.js';
+import { provisionMembers, settleManagedRoomProvisionRecovery } from '../src/rooms-tasks/provision.js';
 import { spawnDryRun } from '../src/spawn.js';
-import { createRoomRecord, getRoomRecord } from '../src/rooms-tasks/room-state.js';
+import {
+  beginRoomRecovery, createRoomRecord, getRoomRecord, getRoomRecoveryReceipt, roomRecoveryDetail,
+  updateMemberSeats,
+} from '../src/rooms-tasks/room-state.js';
+import { managementDigest } from '../src/application/management-operation-store.js';
 import { createTask, getTask } from '../src/rooms-tasks/task-state.js';
 import type {
   CoworkAdapter, CoworkRoomInfo, CoworkSeatInfo,
@@ -320,6 +324,213 @@ describe('simple Cowork room member startup', () => {
     expect(mocks.spawnTemp).toHaveBeenCalledTimes(2);
     expect(getTask(task.task_id)).toMatchObject({ state: 'active' });
     expect(getTask(task.task_id).member_roles).toHaveLength(2);
+  });
+
+  it('settles only the receipt-selected provisioning worker and checkpoints it after durable activation', async () => {
+    createRoomRecord({ room_id: 'room-managed-recover', room_name: 'Room', room_identity_cid: 'room-cid' });
+    const keyHash = 'a'.repeat(64); const principalHash = 'b'.repeat(64); const requestHash = 'c'.repeat(64);
+    beginRoomRecovery('room-managed-recover', { keyHash, principalHash, requestHash,
+      operation: 'room.recover', beforeDigest: managementDigest(roomRecoveryDetail('room-managed-recover')) });
+    const h = coworkHarness();
+    await expect(settleManagedRoomProvisionRecovery({ cfg: cfg(), cowork: h.cowork,
+      roomId: 'room-managed-recover', template: template(0), binPath: '/usr/bin/ours-fleet',
+      keyHash, principalHash: '9'.repeat(64), requestHash })).rejects.toThrow('worker is unavailable');
+    await expect(settleManagedRoomProvisionRecovery({ cfg: cfg(), cowork: h.cowork,
+      roomId: 'room-managed-recover', template: template(0), binPath: '/usr/bin/ours-fleet',
+      keyHash, principalHash, requestHash: '8'.repeat(64) })).rejects.toThrow('worker is unavailable');
+    expect(h.cowork.recoverRoom).not.toHaveBeenCalled();
+    await expect(settleManagedRoomProvisionRecovery({ cfg: cfg(), cowork: h.cowork,
+      roomId: 'room-managed-recover', template: template(0), binPath: '/usr/bin/ours-fleet',
+      keyHash, principalHash, requestHash })).resolves.toMatchObject({ state: 'active' });
+    expect(getRoomRecoveryReceipt('room-managed-recover', keyHash))
+      .toMatchObject({ workerStatus: 'checkpointed', acknowledged: true });
+    const calls = vi.mocked(h.cowork.recoverRoom).mock.calls.length;
+    await expect(settleManagedRoomProvisionRecovery({ cfg: cfg(), cowork: h.cowork,
+      roomId: 'room-managed-recover', template: template(0), binPath: '/usr/bin/ours-fleet',
+      keyHash, principalHash, requestHash })).resolves.toMatchObject({ state: 'active' });
+    expect(vi.mocked(h.cowork.recoverRoom).mock.calls).toHaveLength(calls);
+  });
+
+  it('recovers the durable-activation and checkpoint-before-ack crash boundaries', async () => {
+    for (const boundary of ['afterDurableState', 'afterCheckpoint'] as const) {
+      const roomId = `room-managed-${boundary}`;
+      createRoomRecord({ room_id: roomId, room_name: 'Room', room_identity_cid: 'room-cid' });
+      const keyHash = boundary === 'afterDurableState' ? 'd'.repeat(64) : 'e'.repeat(64);
+      const principalHash = 'b'.repeat(64); const requestHash = 'c'.repeat(64);
+      beginRoomRecovery(roomId, { keyHash, principalHash, requestHash, operation: 'room.recover',
+        beforeDigest: managementDigest(roomRecoveryDetail(roomId)) });
+      const h = coworkHarness(); const base = { cfg: cfg(), cowork: h.cowork, roomId,
+        template: template(0), binPath: '/usr/bin/ours-fleet', keyHash, principalHash, requestHash };
+      await expect(settleManagedRoomProvisionRecovery({ ...base, recoveryHooks: {
+        [boundary]: () => { throw new Error(boundary); },
+      } })).rejects.toThrow(boundary);
+      expect(getRoomRecord(roomId)).toMatchObject({ state: 'active' });
+      expect(getRoomRecoveryReceipt(roomId, keyHash)).toMatchObject({
+        workerStatus: boundary === 'afterDurableState' ? 'pending' : 'checkpointed',
+      });
+      const callsBeforeReplay = vi.mocked(h.cowork.recoverRoom).mock.calls.length;
+      await expect(settleManagedRoomProvisionRecovery(base)).resolves.toMatchObject({ state: 'active' });
+      expect(getRoomRecoveryReceipt(roomId, keyHash)).toMatchObject({
+        workerStatus: 'checkpointed', acknowledged: true,
+      });
+      if (boundary === 'afterCheckpoint')
+        expect(vi.mocked(h.cowork.recoverRoom).mock.calls).toHaveLength(callsBeforeReplay);
+    }
+  });
+
+  it('keeps the selected receipt pending while authenticated seats are still incomplete', async () => {
+    const roomId = 'room-managed-waiting';
+    createRoomRecord({ room_id: roomId, room_name: 'Room', room_identity_cid: 'room-cid' });
+    const keyHash = 'f'.repeat(64); const principalHash = 'b'.repeat(64); const requestHash = 'c'.repeat(64);
+    beginRoomRecovery(roomId, { keyHash, principalHash, requestHash, operation: 'room.recover',
+      beforeDigest: managementDigest(roomRecoveryDetail(roomId)) });
+    const h = coworkHarness({ acceptOnSpawn: false });
+    await expect(settleManagedRoomProvisionRecovery({ cfg: cfg(), cowork: h.cowork, roomId,
+      template: template(1), binPath: '/usr/bin/ours-fleet', keyHash, principalHash, requestHash,
+      startupWait: { timeoutMs: 0, now: () => 1 } })).resolves.toMatchObject({
+        state: 'provisioning', provisioning_detail: 'waiting_seats',
+      });
+    expect(getRoomRecoveryReceipt(roomId, keyHash)).toMatchObject({ workerStatus: 'pending' });
+  });
+
+  it('rejects a tampered receipt cursor before selecting a provisioning worker', async () => {
+    const roomId = 'room-managed-tamper';
+    createRoomRecord({ room_id: roomId, room_name: 'Room', room_identity_cid: 'room-cid' });
+    const keyHash = '7'.repeat(64); const principalHash = 'b'.repeat(64); const requestHash = 'c'.repeat(64);
+    beginRoomRecovery(roomId, { keyHash, principalHash, requestHash, operation: 'room.recover',
+      beforeDigest: managementDigest(roomRecoveryDetail(roomId)) });
+    const path = join(root, '.ours-fleet', 'rooms', `${roomId}.json`);
+    const stored = JSON.parse(readFileSync(path, 'utf8'));
+    stored._management_receipts[0].cursor.bindingsDigest = '6'.repeat(64);
+    writeFileSync(path, JSON.stringify(stored, null, 2) + '\n');
+    const h = coworkHarness();
+    await expect(settleManagedRoomProvisionRecovery({ cfg: cfg(), cowork: h.cowork, roomId,
+      template: template(0), binPath: '/usr/bin/ours-fleet', keyHash, principalHash, requestHash }))
+      .rejects.toThrow('invalid room recovery receipt');
+    expect(h.cowork.recoverRoom).not.toHaveBeenCalled();
+  });
+
+  it('fail-stops ambiguous invite attempts without hidden retry or inferred success', async () => {
+    for (const boundary of ['afterInviteIntent', 'afterInviteEffect'] as const) {
+      const task = createTask({ title: boundary, origin: { type: 'cli' } });
+      const roomId = `room-${boundary}`;
+      createRoomRecord({ room_id: roomId, room_name: 'Room', room_identity_cid: 'room-cid',
+        task_id: task.task_id });
+      const h = coworkHarness(); const input = { cfg: cfg(), cowork: h.cowork, roomId,
+        taskId: task.task_id, template: template(1), binPath: '/usr/bin/ours-fleet' };
+      await expect(provisionMembers({ ...input, recoveryHooks: {
+        [boundary]: () => { throw new Error(`crash-${boundary}`); },
+      } })).rejects.toThrow(`crash-${boundary}`);
+      expect(getRoomRecord(roomId)?.member_seats[0]).toMatchObject({
+        invite_attempt: { phase: 'invite_outcome_unknown' },
+      });
+      const issued = h.issueInvite.mock.calls.length;
+      const repeated = await Promise.allSettled([provisionMembers(input), provisionMembers(input)]);
+      expect(repeated).toEqual([expect.objectContaining({ status: 'rejected' }),
+        expect.objectContaining({ status: 'rejected' })]);
+      expect(h.issueInvite).toHaveBeenCalledTimes(issued);
+      expect(getRoomRecord(roomId)).toMatchObject({ state: 'provisioning',
+        provisioning_detail: 'member_failed' });
+      expect(getTask(task.task_id).blocked?.reason).toContain('automatic retry is disabled');
+    }
+  });
+
+  it('fail-stops an invalid invite response without persisting or exposing its secret', async () => {
+    const task = createTask({ title: 'invalid invite', origin: { type: 'cli' } });
+    const roomId = 'room-invalid-invite';
+    createRoomRecord({ room_id: roomId, room_name: 'Room', room_identity_cid: 'room-cid',
+      task_id: task.task_id });
+    const h = coworkHarness();
+    h.issueInvite.mockResolvedValueOnce({ invite: 'SECRET-INVALID', invite_id: '', min_accepts: 1 });
+    const input = { cfg: cfg(), cowork: h.cowork, roomId, taskId: task.task_id,
+      template: template(1), binPath: '/usr/bin/ours-fleet' };
+    await expect(provisionMembers(input)).rejects.toThrow('invalid invite receipt');
+    expect(getRoomRecord(roomId)?.member_seats[0]).toMatchObject({
+      invite_attempt: { phase: 'invite_outcome_unknown' },
+    });
+    expect(readFileSync(join(root, '.ours-fleet', 'rooms', `${roomId}.json`), 'utf8'))
+      .not.toContain('SECRET-INVALID');
+    await expect(provisionMembers(input)).rejects.toThrow('automatic retry is disabled');
+    expect(h.issueInvite).toHaveBeenCalledOnce();
+    expect(getTask(task.task_id).blocked?.reason).toContain('automatic retry is disabled');
+  });
+
+  it('fail-stops a preseeded durable invite attempt on restart and concurrent recovery', async () => {
+    const task = createTask({ title: 'preseeded invite', origin: { type: 'cli' } });
+    const roomId = 'room-preseed'; const roleName = `${task.task_id.slice(0, 8)}-developer-1`;
+    createRoomRecord({ room_id: roomId, room_name: 'Room', room_identity_cid: 'room-cid',
+      task_id: task.task_id });
+    updateMemberSeats(roomId, [{ role_name: roleName, slot: 'developer', cowork_role: 'Developer',
+      seat_state: 'pending', launch: { state: 'pending', attempt: 0, updated_at: new Date().toISOString() },
+      invite_attempt: { phase: 'invite_attempting', action_id: 'preseeded-action',
+        recovery_key_hash: 'a'.repeat(64), request_digest: 'b'.repeat(64), room_id: roomId,
+        role: 'Developer', mode: 'one_time', min_accepts: 1, updated_at: new Date().toISOString() } }]);
+    const keyHash = 'a'.repeat(64); const principalHash = 'c'.repeat(64); const requestHash = 'd'.repeat(64);
+    beginRoomRecovery(roomId, { keyHash, principalHash, requestHash, operation: 'room.recover',
+      beforeDigest: managementDigest(roomRecoveryDetail(roomId)) });
+    const h = coworkHarness(); const input = { cfg: cfg(), cowork: h.cowork, roomId,
+      taskId: task.task_id, template: template(1), binPath: '/usr/bin/ours-fleet',
+      keyHash, principalHash, requestHash };
+    const repeated = await Promise.allSettled([
+      settleManagedRoomProvisionRecovery(input), settleManagedRoomProvisionRecovery(input),
+    ]);
+    expect(repeated.map(item => item.status)).toEqual(['rejected', 'rejected']);
+    expect(h.issueInvite).not.toHaveBeenCalled();
+    expect(getRoomRecord(roomId)).toMatchObject({ provisioning_detail: 'member_failed',
+      saga: { error: expect.stringContaining('automatic retry is disabled'),
+        recovery_hint: 'Manually clean up or recreate the failed room/member before starting a new operation.' },
+      member_seats: [expect.objectContaining({ invite_attempt:
+        expect.objectContaining({ phase: 'invite_outcome_unknown' }) })] });
+    expect(getTask(task.task_id).blocked?.reason).toContain('automatic retry is disabled');
+    expect(getRoomRecoveryReceipt(roomId, keyHash)).toMatchObject({ workerStatus: 'pending' });
+  });
+
+  it('rejects altered durable invite-attempt bindings before worker selection', async () => {
+    const mutations: Array<(attempt: Record<string, any>) => void> = [
+      attempt => { attempt.phase = 'invite_recorded'; },
+      attempt => { attempt.action_id = 'altered-action'; },
+      attempt => { attempt.recovery_key_hash = '9'.repeat(64); },
+      attempt => { attempt.role = 'Owner'; attempt.min_accepts = 2; },
+      attempt => { attempt.request_digest = '8'.repeat(64); },
+    ];
+    for (const [index, mutate] of mutations.entries()) {
+      const roomId = `room-bind-${index}`; const keyHash = `${index + 1}`.repeat(64);
+      createRoomRecord({ room_id: roomId, room_name: 'Room', room_identity_cid: 'room-cid' });
+      updateMemberSeats(roomId, [{ role_name: `member-${index}`, slot: 'developer', cowork_role: 'Developer',
+        seat_state: 'pending', launch: { state: 'pending', attempt: 0, updated_at: new Date().toISOString() },
+        invite_attempt: { phase: 'invite_attempting', action_id: 'bound-action',
+          recovery_key_hash: keyHash, request_digest: 'b'.repeat(64), room_id: roomId,
+          role: 'Developer', mode: 'one_time', min_accepts: 1, updated_at: new Date().toISOString() } }]);
+      const principalHash = 'c'.repeat(64); const requestHash = 'd'.repeat(64);
+      beginRoomRecovery(roomId, { keyHash, principalHash, requestHash, operation: 'room.recover',
+        beforeDigest: managementDigest(roomRecoveryDetail(roomId)) });
+      const path = join(root, '.ours-fleet', 'rooms', `${roomId}.json`);
+      const stored = JSON.parse(readFileSync(path, 'utf8')); mutate(stored.member_seats[0].invite_attempt);
+      writeFileSync(path, JSON.stringify(stored, null, 2) + '\n');
+      const h = coworkHarness();
+      await expect(settleManagedRoomProvisionRecovery({ cfg: cfg(), cowork: h.cowork, roomId,
+        template: template(0), binPath: '/usr/bin/ours-fleet', keyHash, principalHash, requestHash }))
+        .rejects.toThrow('bindings changed');
+      expect(h.issueInvite).not.toHaveBeenCalled();
+    }
+  });
+
+  it('serializes concurrent workers for one receipt into one provisioning effect sequence', async () => {
+    const roomId = 'room-managed-concurrent';
+    createRoomRecord({ room_id: roomId, room_name: 'Room', room_identity_cid: 'room-cid' });
+    const keyHash = '5'.repeat(64); const principalHash = 'b'.repeat(64); const requestHash = 'c'.repeat(64);
+    beginRoomRecovery(roomId, { keyHash, principalHash, requestHash, operation: 'room.recover',
+      beforeDigest: managementDigest(roomRecoveryDetail(roomId)) });
+    const h = coworkHarness(); const input = { cfg: cfg(), cowork: h.cowork, roomId,
+      template: template(0), binPath: '/usr/bin/ours-fleet', keyHash, principalHash, requestHash };
+    const results = await Promise.all([
+      settleManagedRoomProvisionRecovery(input), settleManagedRoomProvisionRecovery(input),
+    ]);
+    expect(results).toEqual([expect.objectContaining({ state: 'active' }),
+      expect.objectContaining({ state: 'active' })]);
+    expect(h.cowork.recoverRoom).toHaveBeenCalledTimes(2);
+    expect(getRoomRecoveryReceipt(roomId, keyHash))
+      .toMatchObject({ workerStatus: 'checkpointed', acknowledged: true });
   });
 
   it('puts identity name, invite, role, and full task in the agent-owned startup payload', async () => {

@@ -94,7 +94,7 @@ describe('task/room JSON presentation contract', () => {
 
   it('pins every room --json serializer branch exactly and before Markdown rendering', () => {
     const branches = jsonBranches('registerRoomCommands');
-    expect(branches).toHaveLength(9);
+    expect(branches).toHaveLength(8);
     expect(branches).toMatchSnapshot();
   });
 

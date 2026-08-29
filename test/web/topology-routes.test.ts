@@ -153,7 +153,7 @@ describe('topology draft and promote routes', () => {
     expect(invalid.json().error.message).toMatch(/may not store field "env"/);
   });
 
-  it('adds a sketch to the configuration without launching anything', async () => {
+  it('rejects preview and apply of a retired sketch without changing configuration or drafts', async () => {
     const { server, cookie, csrf, audit, events } = await authenticated();
     const headers = { host: boundary.host, origin: boundary.origin, cookie, 'x-csrf-token': csrf };
     await drafts.write(drafts.read().revision,
@@ -168,29 +168,26 @@ describe('topology draft and promote routes', () => {
     const preview = await server.app.inject({
       method: 'POST', url: '/api/v1/topology/promote/preview', headers, payload: body,
     });
-    expect(preview.statusCode).toBe(200);
-    expect(preview.json().diff).toContain('+  Reviewer:');
+    expect(preview.statusCode).toBe(409);
+    expect(preview.json().error).toMatchObject({
+      code: 'incompatible_version', retryable: false,
+      details: { migration: 'explicit_role_brain_agent_resources' },
+    });
     expect(readFileSync(file, 'utf8')).not.toContain('Reviewer');
 
     const promoted = await server.app.inject({
       method: 'POST', url: '/api/v1/topology/promote', headers, payload: body,
     });
-    expect(promoted.statusCode).toBe(200);
-    expect(promoted.json().promoted).toEqual(['agent:Reviewer']);
-    expect(promoted.json().saved).toBe(true);
-    // Configuration only: save never restarts and never starts a role.
-    expect(promoted.json().impact.summary).toMatch(/apply\/restart .* separately/);
-    expect(readFileSync(file, 'utf8')).toContain('# operator header');
-    expect(loadConfig(file).roles.map(role => role.name)).toEqual(['Alice', 'Reviewer']);
-    expect(drafts.read().draft.drafts.nodes).toEqual([]);
-    expect(events.publish.mock.calls.map(call => call[0])).toEqual([
-      'configuration.changed', 'topology.draft.changed',
-    ]);
-    expect(audit.list().filter(event => event.action === 'topology.promote'))
-      .toMatchObject([{ result: 'succeeded' }]);
+    expect(promoted.statusCode).toBe(409);
+    expect(promoted.json().error.code).toBe('incompatible_version');
+    expect(readFileSync(file, 'utf8')).not.toContain('Reviewer');
+    expect(loadConfig(file).roles.map(role => role.name)).toEqual(['Alice']);
+    expect(drafts.read().draft.drafts.nodes).toHaveLength(1);
+    expect(events.publish).not.toHaveBeenCalled();
+    expect(audit.list().filter(event => event.errorCode === 'incompatible_version')).toHaveLength(2);
   });
 
-  it('reports an incomplete sketch as a bad request with the reason', async () => {
+  it('does not interpret even an incomplete retired sketch', async () => {
     const { server, cookie, csrf, audit, events } = await authenticated();
     const headers = { host: boundary.host, origin: boundary.origin, cookie, 'x-csrf-token': csrf };
     await drafts.write(drafts.read().revision, sketch([{ id: 'agent:Blank', kind: 'agent', fields: {} }]));
@@ -200,14 +197,14 @@ describe('topology draft and promote routes', () => {
       payload: { ids: ['agent:Blank'], configRevision: configuration.read().revision },
     });
 
-    expect(response.statusCode).toBe(400);
-    expect(response.json().error.message).toMatch(/not ready to add/);
+    expect(response.statusCode).toBe(409);
+    expect(response.json().error.code).toBe('incompatible_version');
     expect(readFileSync(file, 'utf8')).not.toContain('Blank');
     expect(events.publish).not.toHaveBeenCalled();
     expect(audit.list().some(event => event.action === 'topology.promote')).toBe(false);
   });
 
-  it('rejects a malformed promote body and a stale configuration revision', async () => {
+  it('rejects a malformed body before the retired-format boundary and otherwise ignores stale legacy revisions', async () => {
     const { server, cookie, csrf } = await authenticated();
     const headers = { host: boundary.host, origin: boundary.origin, cookie, 'x-csrf-token': csrf };
 
@@ -224,6 +221,7 @@ describe('topology draft and promote routes', () => {
       payload: { ids: ['agent:Reviewer'], configRevision: 'stale' },
     });
     expect(stale.statusCode).toBe(409);
+    expect(stale.json().error.code).toBe('incompatible_version');
   });
 
   it('serves the merged graph with completeness on the read route', async () => {

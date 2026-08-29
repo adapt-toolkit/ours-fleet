@@ -32,7 +32,9 @@ describe('topology presentation', () => {
   });
 
   it('defines an accessible explanation for every edge style and fallback direction', () => {
-    expect(EDGE_LEGEND.map(item => item.kind)).toEqual(['oversees', 'watches', 'targets', 'spawned']);
+    expect(EDGE_LEGEND.map(item => item.kind)).toEqual([
+      'performs', 'uses', 'oversees', 'watches', 'targets', 'spawned',
+    ]);
     expect(describeEdge(topology.edges[0], 'agent:Child')).toContain('incoming from agent:Parent');
     expect(EDGE_LEGEND.every(item => item.description.length > 20)).toBe(true);
   });

@@ -96,6 +96,24 @@ async function authenticated(overrides: Record<string, unknown> = {}) {
 }
 
 describe('secure local web host', () => {
+  it('routes authenticated typed management through the shared kernel envelope', async () => {
+    const execute = vi.fn(async (_principal, request) => ({ version: 1, requestId: request.requestId,
+      ok: true, result: { type: 'resources', digest: 'sha256:test', resources: [] } }));
+    const { server, cookie, csrf } = await authenticated({ management: { execute } });
+    const response = await server.app.inject({ method: 'POST', url: '/api/v1/management',
+      headers: { host: boundary.host, origin: boundary.origin, cookie, 'x-csrf-token': csrf,
+        'idempotency-key': 'web-key' },
+      payload: { version: 1, requestId: 'untrusted-browser-id', command: { operation: 'resource.list' } } });
+    expect(response.statusCode).toBe(200);
+    expect(execute).toHaveBeenCalledWith({ surface: 'web', local: true }, expect.objectContaining({
+      requestId: expect.not.stringMatching('untrusted-browser-id'), idempotencyKey: 'web-key',
+    }));
+    const denied = await server.app.inject({ method: 'POST', url: '/api/v1/management',
+      headers: { host: boundary.host, origin: boundary.origin, cookie },
+      payload: { version: 1, command: { operation: 'resource.list' } } });
+    expect(denied.statusCode).toBe(403);
+    await server.close();
+  });
   it('exposes authenticated task-list and assignment routes through the shared service', async () => {
     const task = { task_id: 'task-id', list_id: 'default', list_name: 'default' };
     const taskRooms = {
@@ -106,7 +124,12 @@ describe('secure local web host', () => {
       listTasks: vi.fn(() => [task]), groupedTasks: vi.fn(() => [{ list: { name: 'default' }, tasks: [task] }]),
       createTask: vi.fn(async () => task), moveTask: vi.fn(async () => task),
     };
-    const { server, cookie, csrf } = await authenticated({ taskRooms });
+    const management = { execute: vi.fn(async (_principal, request) => ({ version: 1,
+      requestId: request.requestId, ok: true, result: request.command.operation === 'task.list'
+        ? { type: 'tasks', value: request.command.groupByList
+          ? [{ list: { name: 'default' }, tasks: [task] }] : [task] }
+        : { type: 'task', value: task } })) };
+    const { server, cookie, csrf } = await authenticated({ taskRooms, management });
     const readHeaders = { host: boundary.host, cookie };
     const writeHeaders = { ...readHeaders, origin: boundary.origin, 'x-csrf-token': csrf };
     expect((await server.app.inject({ method: 'GET', url: '/api/v1/task-lists', headers: readHeaders })).statusCode).toBe(200);
@@ -118,7 +141,8 @@ describe('secure local web host', () => {
       headers: writeHeaders })).statusCode).toBe(200);
     expect((await server.app.inject({ method: 'GET', url: '/api/v1/tasks?list=default&groupByList=true',
       headers: readHeaders })).json()).toHaveProperty('groups');
-    expect((await server.app.inject({ method: 'POST', url: '/api/v1/tasks', headers: writeHeaders,
+    expect((await server.app.inject({ method: 'POST', url: '/api/v1/tasks',
+      headers: { ...writeHeaders, 'idempotency-key': 'create-task' },
       payload: { title: 'Task', backlog: true, list: 'default' } })).statusCode).toBe(201);
     expect((await server.app.inject({ method: 'PATCH', url: '/api/v1/tasks/task-id/list', headers: writeHeaders,
       payload: { list: 'default' } })).statusCode).toBe(200);
@@ -126,6 +150,9 @@ describe('secure local web host', () => {
       headers: readHeaders, payload: { name: 'No CSRF' } });
     expect(rejected.statusCode).toBe(403);
     expect(taskRooms.moveTask).toHaveBeenCalledWith(expect.objectContaining({ taskId: 'task-id', list: 'default' }));
+    expect(management.execute).toHaveBeenCalledWith({ surface: 'web', local: true },
+      expect.objectContaining({ command: expect.objectContaining({ operation: 'task.create' }),
+        idempotencyKey: 'create-task' }));
     await server.close();
   });
   it('does not bridge browser device trust into owner-channel authorization management', async () => {

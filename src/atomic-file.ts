@@ -31,6 +31,7 @@ export interface WriteDeps {
 
 const DEFAULT_STALE_MS = 10_000;
 const POLL_MS = 25;
+const HELD_SYNC_LOCKS = new Set<string>();
 
 /**
  * Run `fn` holding a cross-process lock. A fully populated private claim directory
@@ -89,6 +90,66 @@ export async function withFileLock<T>(
   try {
     return await fn();
   } finally {
+    try {
+      const owner = JSON.parse(readFileSync(ownerPath, 'utf8')) as { token?: string };
+      if (owner.token === token) rmSync(lockPath, { recursive: true, force: true });
+    } catch { /* never remove a lock whose ownership cannot be proved */ }
+  }
+}
+
+/**
+ * Synchronous counterpart for small state-only critical sections whose public
+ * API is intentionally synchronous. It publishes the same ownership record as
+ * `withFileLock`, so async saga locks and sync checkpoint locks interoperate.
+ * Never use this around network, process, identity, or other long-running work.
+ */
+export function withFileLockSync<T>(
+  lockPath: string,
+  fn: () => T,
+  staleMs: number = DEFAULT_STALE_MS,
+): T {
+  if (HELD_SYNC_LOCKS.has(lockPath)) throw new Error(`synchronous lock is not reentrant: ${lockPath}`);
+  const stampPath = join(lockPath, 'ts');
+  const ownerPath = join(lockPath, 'owner.json');
+  const token = randomUUID();
+  mkdirSync(dirname(lockPath), { recursive: true });
+
+  for (let waited = 0; ;) {
+    const claimPath = `${lockPath}.claim.${process.pid}.${randomUUID()}`;
+    try {
+      mkdirSync(claimPath);
+      writeFileSync(join(claimPath, 'ts'), String(Date.now()));
+      writeFileSync(join(claimPath, 'owner.json'), JSON.stringify({ token, pid: process.pid }));
+      renameSync(claimPath, lockPath);
+      HELD_SYNC_LOCKS.add(lockPath);
+      break;
+    } catch (error) {
+      rmSync(claimPath, { recursive: true, force: true });
+      if (!['EEXIST', 'ENOTEMPTY'].includes((error as NodeJS.ErrnoException).code ?? '')) throw error;
+      let held: number | null = null;
+      try {
+        const value = parseInt(readFileSync(stampPath, 'utf8').trim(), 10);
+        held = Number.isFinite(value) ? value : null;
+      } catch { /* holder died between publication steps */ }
+      let ownerAlive = false;
+      try {
+        const owner = JSON.parse(readFileSync(ownerPath, 'utf8')) as { pid?: number };
+        if (typeof owner.pid === 'number') {
+          try { process.kill(owner.pid, 0); ownerAlive = true; } catch { /* dead owner */ }
+        }
+      } catch { /* incomplete or legacy lock */ }
+      if (!ownerAlive && ((held !== null && Date.now() - held > staleMs) || waited > staleMs * 2)) {
+        rmSync(lockPath, { recursive: true, force: true });
+        continue;
+      }
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, POLL_MS);
+      waited += POLL_MS;
+    }
+  }
+
+  try { return fn(); }
+  finally {
+    HELD_SYNC_LOCKS.delete(lockPath);
     try {
       const owner = JSON.parse(readFileSync(ownerPath, 'utf8')) as { token?: string };
       if (owner.token === token) rmSync(lockPath, { recursive: true, force: true });

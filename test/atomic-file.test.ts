@@ -1,9 +1,9 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { execFile } from 'node:child_process';
-import { mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync, writeSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync, writeSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
-import { replaceFileAtomically, withFileLock, type WriteDeps } from '../src/atomic-file.js';
+import { replaceFileAtomically, withFileLock, withFileLockSync, type WriteDeps } from '../src/atomic-file.js';
 
 // dist/cli.js et al are built once by vitest's globalSetup
 // (test/global-setup.ts), before any test file runs — the pretrust-child.mjs
@@ -85,6 +85,63 @@ describe('withFileLock', () => {
     expect(JSON.parse(readFileSync(join(lock, 'owner.json'), 'utf8'))).toMatchObject({ pid: process.pid });
     publish(); releaseSecond(); await second;
     await expect(first).resolves.toBe('first');
+  });
+});
+
+describe('withFileLockSync', () => {
+  it('uses the canonical claim metadata, rejects re-entry, and releases after throws', () => {
+    const lock = join(home, 'sync.lock');
+    expect(() => withFileLockSync(lock, () => {
+      expect(JSON.parse(readFileSync(join(lock, 'owner.json'), 'utf8'))).toMatchObject({ pid: process.pid });
+      expect(Number(readFileSync(join(lock, 'ts'), 'utf8'))).toBeGreaterThan(0);
+      expect(() => withFileLockSync(lock, () => undefined)).toThrow('not reentrant');
+      throw new Error('sync boom');
+    })).toThrow('sync boom');
+    expect(existsSync(lock)).toBe(false);
+    expect(withFileLockSync(lock, () => 'released')).toBe('released');
+  });
+
+  it('supports the required async-long to sync-short ordering without re-entering the long lock', async () => {
+    const long = join(home, 'long.lock'); const short = join(home, 'short.lock');
+    await expect(withFileLock(long, () => withFileLockSync(short, () => 'checkpoint')))
+      .resolves.toBe('checkpoint');
+  });
+
+  it('reclaims a stale dead owner but never steals a live owner', async () => {
+    const stale = join(home, 'stale-sync.lock'); mkdirSync(stale);
+    writeFileSync(join(stale, 'ts'), '0');
+    writeFileSync(join(stale, 'owner.json'), JSON.stringify({ token: 'dead', pid: 2_000_000_000 }));
+    expect(withFileLockSync(stale, () => 'reclaimed', 1)).toBe('reclaimed');
+
+    const live = join(home, 'live-sync.lock'); mkdirSync(live);
+    writeFileSync(join(live, 'ts'), '0');
+    writeFileSync(join(live, 'owner.json'), JSON.stringify({ token: 'live', pid: process.pid }));
+    const script = `import { withFileLockSync } from ${JSON.stringify(join(DIST, 'atomic-file.js'))};`
+      + `withFileLockSync(${JSON.stringify(live)},()=>process.stdout.write('stolen'),1);`;
+    const contender = execFile(process.execPath, ['--input-type=module', '-e', script]);
+    let output = ''; contender.stdout?.on('data', chunk => { output += String(chunk); });
+    await new Promise(resolve => setTimeout(resolve, 75));
+    expect(output).toBe(''); expect(contender.exitCode).toBeNull();
+    contender.kill(); await new Promise(resolve => contender.once('exit', resolve));
+  });
+
+  it('serializes synchronous critical sections across processes', async () => {
+    const lock = join(home, 'cross.lock'); const marker = join(home, 'entered');
+    const target = join(home, 'order'); writeFileSync(target, '');
+    const modulePath = JSON.stringify(join(DIST, 'atomic-file.js'));
+    const firstScript = `import {withFileLockSync} from ${modulePath};import{writeFileSync,appendFileSync}from'node:fs';`
+      + `withFileLockSync(${JSON.stringify(lock)},()=>{writeFileSync(${JSON.stringify(marker)},'1');`
+      + `Atomics.wait(new Int32Array(new SharedArrayBuffer(4)),0,0,150);appendFileSync(${JSON.stringify(target)},'A')});`;
+    const secondScript = `import {withFileLockSync} from ${modulePath};import{appendFileSync}from'node:fs';`
+      + `withFileLockSync(${JSON.stringify(lock)},()=>appendFileSync(${JSON.stringify(target)},'B'));`;
+    const first = execFile(process.execPath, ['--input-type=module', '-e', firstScript]);
+    for (let i = 0; i < 100 && !existsSync(marker); i++)
+      await new Promise(resolve => setTimeout(resolve, 5));
+    expect(existsSync(marker)).toBe(true);
+    const second = execFile(process.execPath, ['--input-type=module', '-e', secondScript]);
+    await Promise.all([first, second].map(proc => new Promise<void>((resolve, reject) =>
+      proc.once('exit', code => code === 0 ? resolve() : reject(new Error(`child exited ${code}`))))));
+    expect(readFileSync(target, 'utf8')).toBe('AB');
   });
 });
 

@@ -5,7 +5,8 @@ import { join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { IdentityActionBindings } from '../src/agent-creation-transaction.js';
 import { AgentProductionIdentityAuthority } from '../src/agent-production-identity-authority.js';
-import { AgentCreationCompositionRoot, createProductionAgentCreationCompositionRoot } from '../src/agent-creation-composition-root.js';
+import { AgentCreationCompositionRoot, createPermanentWithSupervisorControl,
+  createProductionAgentCreationCompositionRoot, resumePermanentWithSupervisorControl } from '../src/agent-creation-composition-root.js';
 import type { AgentCompositionRequest } from '../src/agent-composition-service.js';
 import { computeBrainDigest, computePermissionsDigest } from '../src/agent-plan.js';
 import { loadConfigResourceSnapshot } from '../src/config-resource-loader.js';
@@ -126,6 +127,23 @@ describe('permanent Agent creation composition root', () => {
       lifecycle, brain: { harness: 'codex', model: 'gpt', effort: 'high', session: 'acp' },
       permissions: { approval: 'ask', filesystem: 'workspace', unattended: 'deny' } },
   } as unknown as AgentCompositionRequest);
+
+  it('propagates the exact opaque control capability through create and resume publication', async () => {
+    const lease = Object.freeze(Object.create(null)); const resumeLease = Object.freeze(Object.create(null));
+    const reservation = {}; const complete = {};
+    const composition = { prepare: () => ({ lifecycle: 'persistent', identity: { ownership: 'create_persistent' },
+      operation: { id: 'action-1' } }) };
+    const transaction = { persistPrepared: async () => ({ state: 'complete', reservation }),
+      resume: async () => ({ state: 'complete', reservation }), validateComplete: () => complete,
+      authenticateComplete: () => ({ identity: { acquisition: 'external', name: 'agent-1' } }) };
+    const handoffs = { publish: vi.fn(async () => undefined) };
+    const root = new AgentCreationCompositionRoot(composition as never, transaction as never,
+      { publish: () => ({ kind: 'AgentStartLocator' }) } as never, handoffs as never);
+    await createPermanentWithSupervisorControl(root, request(), 'action-1', lease);
+    await resumePermanentWithSupervisorControl(root, 'agent-1', 'action-1', resumeLease);
+    expect(handoffs.publish).toHaveBeenNthCalledWith(1, complete, lease, 'create');
+    expect(handoffs.publish).toHaveBeenNthCalledWith(2, complete, resumeLease, 'resume');
+  });
 
   it('publishes the handoff only after authenticated complete', async () => {
     const prepared = { lifecycle: 'persistent', identity: { ownership: 'create_persistent' },

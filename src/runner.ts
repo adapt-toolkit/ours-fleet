@@ -1,10 +1,10 @@
-import { existsSync, readFileSync, writeFileSync, rmSync, mkdirSync, realpathSync } from 'node:fs';
+import { existsSync, lstatSync, readFileSync, writeFileSync, rmSync, mkdirSync, realpathSync } from 'node:fs';
 import { join } from 'node:path';
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { parse } from 'yaml';
 import { agentDir, home, stateRoot } from './paths.js';
 import {
-  loadConfig, findRole, isolationContextFor, resolveMonitorConfig, resolvePermissions,
+  loadConfig, findRole, isolationContextFor, resolveMonitorConfig, resolvePermissions, resolveWorklogPolicy,
   type ResolvedRole,
 } from './config.js';
 import { getAdapter } from './harness/registry.js';
@@ -23,6 +23,10 @@ import { resolveLaunchRuntime } from './isolation/runtime.js';
 import type { AgentProductionSessionInput } from './agent-production-runtime.js';
 import { createAgentProductionRuntime } from './agent-production-runtime.js';
 import { readTempAgentSupervisorHandoffIfPresent } from './temp-agent-supervisor-handoff.js';
+import { readAgentSupervisorHandoff } from './agent-supervisor-handoff.js';
+import { readStoredAgentPlan } from './agent-plan-store.js';
+import type { AgentPlan } from './agent-plan.js';
+import { encodeAgentPlan } from './agent-plan-codec.js';
 import { controlRequest, RoleControlServer } from './session/control.js';
 import { TmuxSession } from './session/tmux.js';
 import { ACP_CANCEL_DEADLINE_EXCEEDED, classifyShellStatus } from './session/types.js';
@@ -497,6 +501,45 @@ export function loadTempRole(name: string): ResolvedRole {
   return role;
 }
 
+export interface TypedPersistentAgentBinding { role: ResolvedRole; stateDir: string; generation: number }
+function persistentHandoffPath(name: string): string {
+  return join(stateRoot(), 'agents', Buffer.from(name).toString('base64url'), 'active.json');
+}
+/** ENOENT alone permits legacy Role lookup; a present but invalid typed artifact fails closed. */
+export function loadTypedPersistentAgent(name: string): TypedPersistentAgentBinding | undefined {
+  try { lstatSync(persistentHandoffPath(name)); }
+  catch (error) { if ((error as NodeJS.ErrnoException).code === 'ENOENT') return undefined; throw error; }
+  const handoff = readAgentSupervisorHandoff(stateRoot(), name);
+  const plan = readStoredAgentPlan(handoff.canonicalDir, handoff, 'runner').plan;
+  if (plan.agentId !== handoff.agentId || plan.generation !== handoff.generation
+      || plan.operation.id !== handoff.actionId || plan.authorizationRevision !== handoff.authorizationRevision
+      || plan.lifecycle !== 'persistent'
+      || `sha256:${createHash('sha256').update(encodeAgentPlan(plan)).digest('hex')}` !== handoff.planBytesDigest)
+    throw new Error(`typed Agent '${name}' binding mismatch`);
+  return Object.freeze({ role: roleFromAgentPlan(plan, handoff.canonicalDir),
+    stateDir: handoff.canonicalDir, generation: handoff.generation });
+}
+
+function roleFromAgentPlan(plan: Readonly<AgentPlan>, sourceFile: string): ResolvedRole {
+  if (plan.brain.session !== 'acp') throw new Error(`typed Agent '${plan.agentId}' requires ACP`);
+  const monitoring = plan.runtime?.monitoring;
+  return {
+    name: plan.agentId, harness: plan.brain.harness, session: 'acp', identity: plan.identity.name,
+    model: plan.brain.model === 'default' ? undefined : plan.brain.model,
+    harness_options: { effort: plan.brain.effort }, permissions: { ...plan.permissions },
+    permissionsDeclared: true, sourceFile,
+    ...(plan.role.effective.mission ? { mission: plan.role.effective.mission } : {}),
+    ...(plan.role.effective.persona ? { persona: plan.role.effective.persona } : {}),
+    ...(plan.role.effective.bio ? { bio: plan.role.effective.bio } : {}),
+    ...(plan.runtime?.scheduling?.cwd ? { cwd: plan.runtime.scheduling.cwd } : {}),
+    ...(plan.runtime?.supervision?.coordinator ? { coordinator: plan.runtime.supervision.coordinator } : {}),
+    ...(plan.runtime?.supervision?.oversee ? { oversee: [...plan.runtime.supervision.oversee] } : {}),
+    ...(plan.runtime?.isolation ? { isolation: plan.runtime.isolation } : {}),
+    monitor: resolveMonitorConfig(undefined, monitoring as never),
+    worklog: resolveWorklogPolicy(undefined, plan.runtime?.worklog, sourceFile, plan.agentId),
+  };
+}
+
 /**
  * Fall back to the config path applyRole() recorded at the last up/restart/spawn
  * for this role. systemd's shared unit template (`ours-fleet-agent@.service`)
@@ -547,7 +590,7 @@ export async function runOnce(
 ): Promise<AttemptResult> {
   const deps = { ...defaultDeps(), ...partialDeps };
   const temp = opts.temp === true;
-  const dir = agentDir(name, temp);
+  let dir = agentDir(name, temp);
   const configPath = temp ? opts.configPath : resolveConfigPath(dir, opts.configPath);
   // Resolve the role and the fleet-wide start-stagger. Permanent roles read the
   // live config; temp/detached agents read the value spawnTemp snapshotted into
@@ -558,9 +601,9 @@ export async function runOnce(
     role = loadTempRole(name);
     staggerMs = readStartStagger(dir);
   } else {
-    const cfg = loadConfig(configPath);
-    role = findRole(cfg, name);
-    staggerMs = cfg.startStaggerMs;
+    const typed = loadTypedPersistentAgent(name);
+    if (typed) { role = typed.role; dir = typed.stateDir; staggerMs = 0; }
+    else { const cfg = loadConfig(configPath); role = findRole(cfg, name); staggerMs = cfg.startStaggerMs; }
   }
   const effectiveModel = effectiveModelForRole(dir, role);
   if (effectiveModel !== role.model) {
@@ -1153,9 +1196,12 @@ export async function runSupervised(
       // permanent harness attempt; the operation is idempotent and releases its
       // provisioning lease before the agent or owner channel binds.
       if (attempt === runOnce) {
-        const configPath = resolveConfigPath(dir, opts.configPath);
-        const role = findRole(loadConfig(configPath), name);
-        await reconcilePermanentRoleIdentities(role, undefined, deps.log);
+        const typed = loadTypedPersistentAgent(name);
+        if (!typed) {
+          const configPath = resolveConfigPath(dir, opts.configPath);
+          const role = findRole(loadConfig(configPath), name);
+          await reconcilePermanentRoleIdentities(role, undefined, deps.log);
+        }
       }
       result = await attempt(
         name, { configPath: opts.configPath, allowResumeRotation: !ledger.resumeDiscarded }, deps);

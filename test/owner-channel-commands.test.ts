@@ -149,6 +149,14 @@ function context(overrides: Partial<OwnerCommandContext> = {}): OwnerCommandCont
 }
 
 describe('owner command registry', () => {
+  it('routes typed resource reads through the authenticated management port', async () => {
+    const manage = vi.fn(async () => ({ version: 1 as const, requestId: 'wire', ok: true as const,
+      result: { type: 'resources' as const, digest: 'sha256:test', resources: [] } }));
+    const ctx = context({ manage });
+    await dispatchOwnerCommand('/resource list Role', ctx);
+    expect(manage).toHaveBeenCalledWith({ operation: 'resource.list', kind: 'Role' }, undefined);
+    expect(ctx.replies.at(-1)).toContain('"type":"resources"');
+  });
   it('recognizes only trimmed slash-prefixed text as a command attempt', () => {
     expect(isOwnerCommandText('/help')).toBe(true);
     expect(isOwnerCommandText('  /help  ')).toBe(true);

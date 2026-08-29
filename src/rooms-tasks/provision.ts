@@ -4,7 +4,8 @@ import { parse } from 'yaml';
 import type { CoworkAdapter, CoworkSeatInfo } from './cowork-adapter.js';
 import {
   advanceSaga, setSagaError, updateMemberSeats, updateMemberStartup,
-  activateRoom, getRoomRecord, bindCanonicalMemberPlan,
+  acknowledgeCheckpointedRoomRecovery, activateRoom, checkpointRoomRecovery, getRoomRecord,
+  getRoomRecoveryReceipt, roomRecoveryDetail, bindCanonicalMemberPlan,
 } from './room-state.js';
 import {
   activateTask, updateTaskMembers, blockTask, unblockTask, getTask,
@@ -55,6 +56,7 @@ export interface ProvisionMembersInput {
     templateId: string;
     members: readonly Readonly<ExplicitBrainRoomTemplateMemberSpec>[];
   }>;
+  recoveryHooks?: { afterInviteIntent?(): void; afterInviteEffect?(): void };
 }
 
 export interface StartupWaitPolicy {
@@ -539,14 +541,48 @@ async function provisionMembersLocked(
         }
         continue;
       }
+      if (currentSeat.invite_attempt?.phase === 'invite_attempting'
+          || (currentSeat.invite_attempt?.phase === 'invite_recorded'
+            && currentSeat.launch?.state === 'pending')) {
+        const seats = getRoomRecord(roomId)!.member_seats.map(seat => seat.role_name === member.name
+          ? { ...seat, invite_attempt: { ...currentSeat.invite_attempt!,
+            phase: 'invite_outcome_unknown' as const, updated_at: new Date().toISOString() } } : seat);
+        updateMemberSeats(roomId, seats);
+        throw new Error(`invite outcome for ${member.name} is unknown; automatic retry is disabled`);
+      }
+      if (currentSeat.invite_attempt?.phase === 'invite_outcome_unknown')
+        throw new Error(`invite outcome for ${member.name} is unknown; automatic retry is disabled`);
       if (await retainRunningLaunch({ provision: input, member, task, roomIdentityCid })) continue;
 
-      const issued = await cowork.issueInvite(roomId, {
-        mode: 'one_time', role: member.coworkRole, min_accepts: 1,
-      });
-      const seats = getRoomRecord(roomId)!.member_seats.map(seat =>
-        seat.role_name === member.name ? { ...seat, invite_id: issued.invite_id } : seat);
-      updateMemberSeats(roomId, seats);
+      const inviteActionId = randomUUID();
+      const inviteRequest = { room_id: roomId, role: member.coworkRole, mode: 'one_time' as const,
+        min_accepts: 1 as const };
+      updateMemberSeats(roomId, getRoomRecord(roomId)!.member_seats.map(seat =>
+        seat.role_name === member.name ? { ...seat, invite_attempt: { phase: 'invite_attempting' as const,
+          action_id: inviteActionId, request_digest: sha256Text(JSON.stringify(inviteRequest)),
+          ...inviteRequest, updated_at: new Date().toISOString(),
+          ...('keyHash' in input && typeof input.keyHash === 'string'
+            ? { recovery_key_hash: input.keyHash } : {}) } } : seat));
+      let issued;
+      try {
+        input.recoveryHooks?.afterInviteIntent?.();
+        issued = await cowork.issueInvite(roomId, {
+          mode: 'one_time', role: member.coworkRole, min_accepts: 1,
+        });
+        if (!issued || typeof issued.invite_id !== 'string' || !issued.invite_id
+            || typeof issued.invite !== 'string' || !issued.invite || issued.min_accepts !== 1)
+          throw new Error(`invalid invite receipt for ${member.name}`);
+        input.recoveryHooks?.afterInviteEffect?.();
+      } catch (error) {
+        updateMemberSeats(roomId, getRoomRecord(roomId)!.member_seats.map(seat =>
+          seat.role_name === member.name ? { ...seat, invite_attempt: { ...seat.invite_attempt!,
+            phase: 'invite_outcome_unknown' as const, updated_at: new Date().toISOString() } } : seat));
+        throw error;
+      }
+      updateMemberSeats(roomId, getRoomRecord(roomId)!.member_seats.map(seat =>
+        seat.role_name === member.name ? { ...seat, invite_id: issued.invite_id,
+          invite_attempt: { ...seat.invite_attempt!, phase: 'invite_recorded' as const,
+            updated_at: new Date().toISOString() } } : seat));
       try {
         await launchMember({
           provision: input,
@@ -570,9 +606,15 @@ async function provisionMembersLocked(
       }
     }
   } catch (error) {
-    const reason = error instanceof Error ? error.message : String(error);
-    setSagaError(roomId, reason,
-      'Member invite or launch failed. Retry with `task recover`.', 'member_failed');
+    const ambiguous = getRoomRecord(roomId)?.member_seats
+      .find(seat => seat.invite_attempt?.phase === 'invite_outcome_unknown');
+    const reason = ambiguous
+      ? `invite outcome for ${ambiguous.role_name} is unknown; automatic retry is disabled`
+      : error instanceof Error ? error.message : String(error);
+    const hint = ambiguous
+      ? 'Manually clean up or recreate the failed room/member before starting a new operation.'
+      : 'Member invite or launch failed. Retry with `task recover`.';
+    setSagaError(roomId, reason, hint, 'member_failed');
     if (taskId) blockTask(taskId, reason);
     throw error;
   }
@@ -620,6 +662,38 @@ export async function provisionMembers(
   return withFileLock(
     `${stateRoot()}/rooms/${encodeURIComponent(input.roomId)}.provision.lock`,
     () => provisionMembersLocked(input),
+  );
+}
+
+/** Receipt-selected provisioning worker. Admission must already be durably journaled. */
+export async function settleManagedRoomProvisionRecovery(input: ProvisionMembersInput & {
+  keyHash: string; principalHash: string; requestHash: string;
+  recoveryHooks?: { afterDurableState?(): void; afterCheckpoint?(): void };
+}): Promise<RoomOrchestrationRecord> {
+  return withFileLock(
+    `${stateRoot()}/rooms/${encodeURIComponent(input.roomId)}.provision.lock`,
+    async () => {
+      const receipt = getRoomRecoveryReceipt(input.roomId, input.keyHash);
+      if (!receipt || receipt.cursor.kind !== 'provision'
+          || receipt.principalHash !== input.principalHash || receipt.requestHash !== input.requestHash)
+        throw new Error('room recovery provisioning worker is unavailable');
+      const currentCursor = roomRecoveryDetail(input.roomId).cursor;
+      if (currentCursor.kind === 'provision'
+          && currentCursor.bindingsDigest !== receipt.cursor.bindingsDigest)
+        throw new Error('room recovery provisioning bindings changed');
+      if (receipt.workerStatus === 'checkpointed') {
+        acknowledgeCheckpointedRoomRecovery(input.roomId, input.keyHash);
+        return getRoomRecord(input.roomId)!;
+      }
+      const room = await provisionMembersLocked(input);
+      if (room.state !== 'active') return room;
+      input.recoveryHooks?.afterDurableState?.();
+      checkpointRoomRecovery(input.roomId, input.keyHash, { kind: 'provision',
+        principalHash: input.principalHash, requestHash: input.requestHash });
+      input.recoveryHooks?.afterCheckpoint?.();
+      acknowledgeCheckpointedRoomRecovery(input.roomId, input.keyHash);
+      return room;
+    },
   );
 }
 

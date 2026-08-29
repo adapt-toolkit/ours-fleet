@@ -1,5 +1,7 @@
 import type { Command } from 'commander';
+import { randomUUID } from 'node:crypto';
 import { readFileSync } from 'node:fs';
+import { join } from 'node:path';
 import { loadConfig, type FleetConfig, ConfigError, findRole } from '../config.js';
 import { provisionMembers, getBinPath } from './provision.js';
 import {
@@ -30,6 +32,13 @@ import {
 } from './markdown.js';
 import { TaskRoomApplicationError, TaskRoomApplicationService } from '../application/task-room-service.js';
 import { TaskListError } from './task-lists.js';
+import { defaultConfigPath, stateRoot } from '../paths.js';
+import { ResourceManagementService } from '../application/resource-management-service.js';
+import { ManagementOperationStore, managementDigest } from '../application/management-operation-store.js';
+import { ManagementKernel } from '../application/management-kernel.js';
+import type { ManagementCommand } from '../application/management-contract.js';
+import { FleetError } from '../application/errors.js';
+import { TaskRoomManagementService } from '../application/task-room-management-service.js';
 
 type TaskRoomPublicErrorCode =
   | 'task_confirmation_mismatch' | 'room_confirmation_mismatch'
@@ -509,8 +518,35 @@ export function registerTemplateCommands(parent: Command, cOpt: (cmd: Command) =
     });
 }
 
-export function registerTaskCommands(parent: Command, cOpt: (cmd: Command) => Command): void {
+export function registerTaskCommands(parent: Command, cOpt: (cmd: Command) => Command,
+  management?: (configPath?: string) => ManagementKernel): void {
   const taskCmd = parent.command('task').description('task lifecycle operations');
+  const manage = async (configuration: string | undefined, command: ManagementCommand,
+    idempotencyKey?: string) => {
+    const service = taskRoomService(configuration);
+    const kernel = management?.(configuration) ?? new ManagementKernel(
+      new ResourceManagementService(configuration ?? defaultConfigPath()),
+      { execute: async () => { throw new FleetError('capability_unavailable', 'Agent lifecycle management is unavailable'); } },
+      { authorize: principal => principal.surface === 'cli' && principal.local === true },
+      new ManagementOperationStore(join(stateRoot(), 'management-operations')), undefined,
+      new TaskRoomManagementService(service));
+    const response = await kernel.execute({ surface: 'cli', local: true }, { version: 1,
+      requestId: `task-cli-${Date.now()}`, command, ...(idempotencyKey ? { idempotencyKey } : {}) });
+    if (!response.ok) {
+      const reason = response.error.details?.reason;
+      if (reason === 'room_not_found' || reason === 'room_record_not_found')
+        throw taskRoomPublicError(reason, response.error.details);
+      throw new FleetError(response.error.code, response.error.message,
+        { requestId: response.error.requestId, retryable: response.error.retryable,
+          provesOffline: response.error.provesOffline, details: response.error.details });
+    }
+    return response.result;
+  };
+  const mutateTask = async (configuration: string | undefined, id: string,
+    command: (expectedStateDigest: string) => ManagementCommand) => {
+    const current = await manage(configuration, { operation: 'task.get', id });
+    return manage(configuration, command(managementDigest((current as { value: unknown }).value)), randomUUID());
+  };
 
   cOpt(taskCmd.command('create'))
     .description('create a new task')
@@ -529,13 +565,14 @@ export function registerTaskCommands(parent: Command, cOpt: (cmd: Command) => Co
       room?: boolean; idempotencyKey?: string; list?: string; json?: boolean;
     }) => {
       try {
-        const record = await taskRoomService(opts.configuration).createTask({
-          actor: { kind: 'local_control', surface: 'cli' }, title: opts.title,
-          brief: opts.brief, briefFile: opts.briefFile, template: opts.template,
-          backlog: opts.backlog, noRoom: opts.room === false,
-          idempotencyKey: opts.idempotencyKey, origin: { type: 'cli' },
-          list: opts.list,
-        });
+        const brief = opts.briefFile ? readFileSync(opts.briefFile, 'utf8') : opts.brief;
+        const managed = await manage(opts.configuration, { operation: 'task.create', title: opts.title,
+          origin: 'cli', ...(brief === undefined ? {} : { brief }),
+          ...(opts.template === undefined ? {} : { template: opts.template }),
+          ...(opts.backlog === undefined ? {} : { backlog: opts.backlog }),
+          ...(opts.room === undefined ? {} : { noRoom: opts.room === false }),
+          ...(opts.list === undefined ? {} : { list: opts.list }) }, opts.idempotencyKey ?? randomUUID());
+        const record = (managed as { value: import('./types.js').TaskRecord }).value;
 
         if (opts.json) {
           console.log(JSON.stringify({ schema_version: 1, task: record }, null, 2));
@@ -546,9 +583,11 @@ export function registerTaskCommands(parent: Command, cOpt: (cmd: Command) => Co
           ...(record.template ? [{ label: 'Template', value: `${record.template.name}@${record.template.version}`, kind: 'code' as const }] : []),
         ]));
       } catch (e) {
-        if (e instanceof TaskRoomApplicationError && e.code === 'template_not_found')
+        if ((e instanceof TaskRoomApplicationError && e.code === 'template_not_found')
+            || (e instanceof FleetError && e.details?.reason === 'template_not_found'))
           e = taskRoomPublicError('template_not_found', {
-            template: opts.template ?? e.fields.template,
+            template: opts.template ?? (e instanceof TaskRoomApplicationError
+              ? e.fields.template : e.details?.template),
           });
         if (opts.json) die(e); dieTaskRoom(e);
       }
@@ -560,18 +599,20 @@ export function registerTaskCommands(parent: Command, cOpt: (cmd: Command) => Co
     .option('--list <name>', 'filter by task list')
     .option('--group-by-list', 'group deterministic results by list (JSON)')
     .option('--json', 'JSON output')
-    .action((opts: { configuration?: string; state?: string; list?: string; groupByList?: boolean; json?: boolean }) => {
+    .action(async (opts: { configuration?: string; state?: string; list?: string; groupByList?: boolean; json?: boolean }) => {
       try {
         let stateFilter: import('./types.js').TaskState | undefined;
         if (opts.state && opts.state !== 'all') {
           stateFilter = opts.state as import('./types.js').TaskState;
         }
-        const service = taskRoomService(opts.configuration);
-        const filter = { ...(stateFilter ? { state: stateFilter } : {}), ...(opts.list ? { list: opts.list } : {}) };
-        const tasks = service.listTasks(filter);
+        const managed = await manage(opts.configuration, { operation: 'task.list',
+          ...(stateFilter ? { state: stateFilter } : {}), ...(opts.list ? { list: opts.list } : {}),
+          ...(opts.groupByList ? { groupByList: true } : {}) });
+        const value = (managed as { value: unknown }).value;
+        const tasks = opts.groupByList ? [] : value as import('./types.js').TaskRecord[];
         if (opts.json) {
           console.log(JSON.stringify(opts.groupByList
-            ? { schema_version: 1, groups: service.groupedTasks(filter) }
+            ? { schema_version: 1, groups: value }
             : { schema_version: 1, tasks }, null, 2));
           return;
         }
@@ -640,9 +681,10 @@ export function registerTaskCommands(parent: Command, cOpt: (cmd: Command) => Co
   taskCmd.command('show <id>')
     .description('show task details')
     .option('--json', 'JSON output')
-    .action((id: string, opts: { json?: boolean }) => {
+    .action(async (id: string, opts: { configuration?: string; json?: boolean }) => {
       try {
-        const { task: t, orchestration: room } = taskRoomService().getTask(id);
+        const managed = await manage(opts.configuration, { operation: 'task.get', id });
+        const { task: t, orchestration: room } = (managed as { value: ReturnType<TaskRoomApplicationService['getTask']> }).value;
         if (opts.json) {
           console.log(JSON.stringify({
             schema_version: 1, task: t, orchestration: room ?? null,
@@ -681,9 +723,9 @@ export function registerTaskCommands(parent: Command, cOpt: (cmd: Command) => Co
     .option('--json', 'JSON output')
     .action(async (id: string, opts: { configuration?: string; json?: boolean }) => {
       try {
-        const t = await taskRoomService(opts.configuration).startTask({
-          actor: { kind: 'local_control', surface: 'cli' }, taskId: id,
-        });
+        const managed = await mutateTask(opts.configuration, id,
+          expectedStateDigest => ({ operation: 'task.start', id, expectedStateDigest }));
+        const t = (managed as { value: import('./types.js').TaskRecord }).value;
         if (opts.json) { console.log(JSON.stringify({ schema_version: 1, task: t }, null, 2)); return; }
         console.log(taskActionMarkdown('Task started', t));
       } catch (e) {
@@ -700,11 +742,11 @@ export function registerTaskCommands(parent: Command, cOpt: (cmd: Command) => Co
     .description('mark a task as blocked')
     .requiredOption('--reason <reason>', 'blocking reason')
     .option('--json', 'JSON output')
-    .action((id: string, opts: { reason: string; json?: boolean }) => {
+    .action(async (id: string, opts: { configuration?: string; reason: string; json?: boolean }) => {
       try {
-        const t = taskRoomService().blockTask({
-          actor: { kind: 'local_control', surface: 'cli' }, taskId: id, reason: opts.reason,
-        });
+        const managed = await mutateTask(opts.configuration, id,
+          expectedStateDigest => ({ operation: 'task.block', id, reason: opts.reason, expectedStateDigest }));
+        const t = (managed as { value: import('./types.js').TaskRecord }).value;
         if (opts.json) { console.log(JSON.stringify({ schema_version: 1, task: t }, null, 2)); return; }
         console.log(taskActionMarkdown('Task blocked', t, [{ label: 'Reason', value: opts.reason }]));
       } catch (e) { if (opts.json) die(e); dieTaskRoom(e); }
@@ -713,11 +755,11 @@ export function registerTaskCommands(parent: Command, cOpt: (cmd: Command) => Co
   taskCmd.command('unblock <id>')
     .description('unblock a task')
     .option('--json', 'JSON output')
-    .action((id: string, opts: { json?: boolean }) => {
+    .action(async (id: string, opts: { configuration?: string; json?: boolean }) => {
       try {
-        const t = taskRoomService().unblockTask({
-          actor: { kind: 'local_control', surface: 'cli' }, taskId: id,
-        });
+        const managed = await mutateTask(opts.configuration, id,
+          expectedStateDigest => ({ operation: 'task.unblock', id, expectedStateDigest }));
+        const t = (managed as { value: import('./types.js').TaskRecord }).value;
         if (opts.json) { console.log(JSON.stringify({ schema_version: 1, task: t }, null, 2)); return; }
         console.log(taskActionMarkdown('Task unblocked', t));
       } catch (e) { if (opts.json) die(e); dieTaskRoom(e); }
@@ -726,11 +768,11 @@ export function registerTaskCommands(parent: Command, cOpt: (cmd: Command) => Co
   taskCmd.command('review <id>')
     .description('move a task to review')
     .option('--json', 'JSON output')
-    .action((id: string, opts: { json?: boolean }) => {
+    .action(async (id: string, opts: { configuration?: string; json?: boolean }) => {
       try {
-        const t = taskRoomService().reviewTask({
-          actor: { kind: 'local_control', surface: 'cli' }, taskId: id,
-        });
+        const managed = await mutateTask(opts.configuration, id,
+          expectedStateDigest => ({ operation: 'task.review', id, expectedStateDigest }));
+        const t = (managed as { value: import('./types.js').TaskRecord }).value;
         if (opts.json) { console.log(JSON.stringify({ schema_version: 1, task: t }, null, 2)); return; }
         console.log(taskActionMarkdown('Task ready for review', t));
       } catch (e) { if (opts.json) die(e); dieTaskRoom(e); }
@@ -835,7 +877,9 @@ export function registerTaskCommands(parent: Command, cOpt: (cmd: Command) => Co
           if (issue.code === 'waiting_cowork') return 'Cowork management socket unreachable — check ours-cowork service';
           if (issue.code === 'waiting_owner_invite') return 'Owner invite invalid or expired — rotate rooms.owner.public_invite in config';
           if (issue.code === 'owner_cid_mismatch') return 'Owner CID mismatch — verify rooms.owner.expected_cid matches Messenger identity';
-          if (issue.code === 'member_failed') return `Member creation failed at saga step ${issue.stepIndex} — inspect and retry`;
+          if (issue.code === 'member_failed') return issue.manualCleanup
+            ? 'Invite outcome is unknown — manually clean up or recreate the failed room/member; automatic retry is disabled'
+            : `Member creation failed at saga step ${issue.stepIndex} — inspect and retry`;
           if (issue.code === 'waiting_seats') return 'Members have not accepted their one-time room invites yet — inspect role logs, then retry recovery';
           if (issue.code === 'resume_failed') return `Resume failed: ${issue.error}`;
           return 'Provisioning resumed successfully';
@@ -994,8 +1038,63 @@ export function registerTaskCommands(parent: Command, cOpt: (cmd: Command) => Co
     });
 }
 
-export function registerRoomCommands(parent: Command, cOpt: (cmd: Command) => Command): void {
+export function registerRoomCommands(parent: Command, cOpt: (cmd: Command) => Command,
+  management?: (configPath?: string) => ManagementKernel): void {
   const roomCmd = parent.command('room').description('room orchestration operations');
+  const manageRoom = async (configuration: string | undefined, command: ManagementCommand,
+    idempotencyKey?: string) => {
+    const service = taskRoomService(configuration);
+    const kernel = management?.(configuration) ?? new ManagementKernel(
+      new ResourceManagementService(configuration ?? defaultConfigPath()),
+      { execute: async () => { throw new FleetError('capability_unavailable', 'Agent lifecycle management is unavailable'); } },
+      { authorize: principal => principal.surface === 'cli' && principal.local === true },
+      new ManagementOperationStore(join(stateRoot(), 'management-operations')), undefined,
+      new TaskRoomManagementService(service));
+    const response = await kernel.execute({ surface: 'cli', local: true }, {
+      version: 1, requestId: `room-cli-${Date.now()}`, command,
+      ...(idempotencyKey ? { idempotencyKey } : {}),
+    });
+    if (!response.ok) {
+      const reason = response.error.details?.reason;
+      if (reason === 'room_not_found' || reason === 'room_record_not_found')
+        throw taskRoomPublicError(reason, response.error.details);
+      throw new FleetError(response.error.code, response.error.message,
+        { requestId: response.error.requestId, retryable: response.error.retryable,
+          provesOffline: response.error.provesOffline, details: response.error.details });
+    }
+    return response.result;
+  };
+
+  cOpt(roomCmd.command('resource <operation> [kind] [id]'))
+    .description('typed resource management from room workflows')
+    .option('--file <path>', 'JSON resource for create/update')
+    .option('--expected-digest <digest>', 'optimistic configuration digest')
+    .option('--idempotency-key <key>', 'durable replay key')
+    .action(async (operation: string, kind: string | undefined, id: string | undefined, opts: {
+      configuration?: string; file?: string; expectedDigest?: string; idempotencyKey?: string;
+    }) => {
+      try {
+        let command: ManagementCommand;
+        if (operation === 'list') command = { operation: 'resource.list', ...(kind ? { kind: kind as never } : {}) };
+        else if (operation === 'get') command = { operation: 'resource.get', kind: kind as never, id: id! };
+        else if (operation === 'delete') command = { operation: 'resource.delete', kind: kind as never,
+          id: id!, expectedDigest: String(opts.expectedDigest ?? '') };
+        else if (operation === 'create' || operation === 'update') {
+          if (!opts.file) throw new Error('--file is required for create/update');
+          command = { operation: `resource.${operation}`, resource: JSON.parse(readFileSync(opts.file, 'utf8')),
+            expectedDigest: String(opts.expectedDigest ?? '') } as ManagementCommand;
+        } else throw new Error('operation must be list, get, create, update, or delete');
+        const kernel = management?.(opts.configuration) ?? new ManagementKernel(new ResourceManagementService(opts.configuration ?? defaultConfigPath()),
+          { execute: async () => { throw new FleetError('capability_unavailable', 'Agent lifecycle management is unavailable'); } },
+          { authorize: principal => principal.surface === 'room' && principal.local === true },
+          new ManagementOperationStore(join(stateRoot(), 'management-operations')));
+        const response = await kernel.execute({ surface: 'room', local: true }, { version: 1,
+          requestId: `room-cli-${Date.now()}`, command,
+          ...(opts.idempotencyKey ? { idempotencyKey: opts.idempotencyKey } : {}) });
+        if (!response.ok) throw new Error(`${response.error.code}: ${response.error.message}`);
+        console.log(JSON.stringify(response.result, null, 2));
+      } catch (error) { dieTaskRoom(error); }
+    });
 
   cOpt(roomCmd.command('create'))
     .description('create a standalone room')
@@ -1004,16 +1103,19 @@ export function registerRoomCommands(parent: Command, cOpt: (cmd: Command) => Co
     .option('--goal <text>', 'room goal')
     .option('--brief <text>', 'room briefing')
     .option('--brief-file <path>', 'room briefing from file')
+    .option('--idempotency-key <key>', 'idempotency key')
     .option('--json', 'JSON output')
     .action(async (opts: {
       configuration?: string; name: string; template?: string;
-      goal?: string; brief?: string; briefFile?: string; json?: boolean;
+      goal?: string; brief?: string; briefFile?: string; idempotencyKey?: string; json?: boolean;
     }) => {
       try {
-        const record = await taskRoomService(opts.configuration).createRoom({
-          actor: { kind: 'local_control', surface: 'cli' }, name: opts.name,
-          template: opts.template, goal: opts.goal, brief: opts.brief, briefFile: opts.briefFile,
-        });
+        const brief = opts.briefFile ? readFileSync(opts.briefFile, 'utf8') : opts.brief;
+        const managed = await manageRoom(opts.configuration, { operation: 'room.create', name: opts.name,
+          ...(opts.template === undefined ? {} : { template: opts.template }),
+          ...(opts.goal === undefined ? {} : { goal: opts.goal }),
+          ...(brief === undefined ? {} : { brief }) }, opts.idempotencyKey ?? randomUUID());
+        const record = (managed as { value: import('./types.js').RoomOrchestrationRecord }).value;
 
         if (opts.json) {
           console.log(JSON.stringify({ schema_version: 1, room: record }, null, 2));
@@ -1036,8 +1138,9 @@ export function registerRoomCommands(parent: Command, cOpt: (cmd: Command) => Co
           throw taskRoomPublicError('room_filter');
         const stateFilter = opts.state === 'active' || opts.state === 'provisioning'
           ? opts.state : undefined;
-        const rooms = await taskRoomService(opts.configuration).listRooms(
-          stateFilter ? { state: stateFilter } : undefined);
+        const managed = await manageRoom(opts.configuration, { operation: 'room.list',
+          ...(stateFilter ? { state: stateFilter } : {}) });
+        const rooms = (managed as { value: Awaited<ReturnType<TaskRoomApplicationService['listRooms']>> }).value;
         if (opts.json) {
           console.log(JSON.stringify({ schema_version: 1, rooms }, null, 2));
           return;
@@ -1056,8 +1159,9 @@ export function registerRoomCommands(parent: Command, cOpt: (cmd: Command) => Co
     .option('--json', 'JSON output')
     .action(async (id: string, opts: { configuration?: string; json?: boolean }) => {
       try {
-        const { room: cowork, orchestration: r } =
-          await taskRoomService(opts.configuration).getRoomDetail(id);
+        const managed = await manageRoom(opts.configuration, { operation: 'room.get', id });
+        const { room: cowork, orchestration: r } = (managed as {
+          value: Awaited<ReturnType<TaskRoomApplicationService['getRoomDetail']>> }).value;
         if (opts.json) {
           console.log(JSON.stringify({ schema_version: 1, room: cowork, orchestration: r ?? null }, null, 2));
           return;
@@ -1185,44 +1289,25 @@ export function registerRoomCommands(parent: Command, cOpt: (cmd: Command) => Co
     .option('--json', 'JSON output')
     .action(async (id: string, opts: { configuration?: string; json?: boolean }) => {
       try {
-        const recovered = await taskRoomService(opts.configuration).recoverRoom({
-          actor: { kind: 'local_control', surface: 'cli' }, roomId: id,
-        });
-        if (recovered.kind === 'deletion_worker_required') {
-          const settled = await launchRoomDeleteWorker(id, opts.configuration);
-          if (opts.json) {
-            console.log(JSON.stringify({
-              schema_version: 1, room: null, orchestration: null,
-              recovery_actions: [settled.timedOut
-                ? `Deletion remains pending — retry room delete ${id} ${id}`
-                : 'Deletion completed successfully'],
-            }, null, 2));
-            return;
-          }
-          console.log(renderMarkdownResult({
-            icon: settled.timedOut ? '⏳' : '🗑️',
-            title: settled.timedOut ? 'Room deletion pending' : 'Room deleted',
-            fields: [{ label: 'ID', value: id, kind: 'code' }],
-            sections: [{ heading: 'Next step', items: [settled.timedOut
-              ? `Run ours-fleet room delete ${id} ${id} or room recover ${id} again.`
-              : 'No recovery action is needed.'] }],
-          }));
-          return;
-        }
-        const { room: cowork, orchestration: r, issues: actions } = recovered;
+        const detail = taskRoomService(opts.configuration).getRoomRecoveryDetail(id);
+        const managed = await manageRoom(opts.configuration, { operation: 'room.recover', id,
+          expectedStateDigest: managementDigest(detail) }, `room-cli-recover:${id}`);
+        const recovered = (managed as { value: { kind: string; room_id: string;
+          cursor: { phase: string; state: string }; settlementRequired: boolean } }).value;
         if (opts.json) {
-          console.log(JSON.stringify({ schema_version: 1, room: cowork, orchestration: r ?? null, recovery_actions: actions }, null, 2));
+          console.log(JSON.stringify({ schema_version: 1, recovery: recovered }, null, 2));
           return;
         }
         console.log(renderMarkdownResult({
           icon: '🛟', title: 'Room recovery',
           fields: [
-            { label: 'Room', value: cowork.room_id, kind: 'code' },
-            { label: 'Status', value: roomStatus(cowork.state), kind: 'markdown' },
-            ...(r ? [{ label: 'Saga', value: r.saga.phase, kind: 'code' as const }] : []),
+            { label: 'Room', value: recovered.room_id, kind: 'code' },
+            { label: 'Status', value: roomStatus(recovered.cursor.state as never), kind: 'markdown' },
+            { label: 'Cursor', value: recovered.cursor.phase, kind: 'code' },
           ],
-          sections: actions.length ? [{ heading: 'Next steps', items: actions }]
-            : [{ heading: 'Result', items: ['No recovery action is needed.'] }],
+          sections: [{ heading: 'Result', items: [recovered.settlementRequired
+            ? 'Recovery was durably accepted and requires its bound worker.'
+            : 'The room is already at a durable no-effect checkpoint.'] }],
         }));
       } catch (e) { if (opts.json) die(e); dieTaskRoom(e); }
     });

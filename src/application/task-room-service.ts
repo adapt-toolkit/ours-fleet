@@ -6,8 +6,10 @@ import {
 } from '../rooms-tasks/cowork-adapter.js';
 import { getBinPath, provisionMembers } from '../rooms-tasks/provision.js';
 import {
-  activateRoom, advanceSaga, createRoomRecord, getRoomRecord, listRoomRecords, setOwnerSeat, setSagaError,
+  activateRoom, advanceSaga, beginRoomRecovery, createRoomRecord, getRoomRecord, listRoomRecords,
+  roomRecoveryDetail, setOwnerSeat, setSagaError,
 } from '../rooms-tasks/room-state.js';
+import type { RoomEffectContext, RoomRecoveryContext } from '../rooms-tasks/room-state.js';
 import {
   activateTask, blockTask as persistBlockTask, createTask as persistTask,
   deleteTask as persistDeleteTask, getTask as readTask, listTasks as readTasks,
@@ -15,6 +17,7 @@ import {
   reviewTask as persistReviewTask, startTask as transitionTask,
   TaskStateError, unblockTask as persistUnblockTask, updateTaskRoom, updateTaskTemplate,
 } from '../rooms-tasks/task-state.js';
+import type { TaskEffectContext } from '../rooms-tasks/task-state.js';
 import {
   createTaskListLocked, DEFAULT_TASK_LIST_ID, deleteTaskListRecordLocked, readTaskLists,
   renameTaskListLocked, resolveTaskList, TaskListError, withTaskListsLock,
@@ -46,7 +49,7 @@ export interface TaskSettlementPlan {
 }
 export type TaskRecoveryIssue =
   | { code: 'terminal_pending' | 'waiting_cowork' | 'waiting_owner_invite' | 'owner_cid_mismatch' | 'waiting_seats' | 'provisioning_resumed' }
-  | { code: 'member_failed'; stepIndex: number }
+  | { code: 'member_failed'; stepIndex: number; manualCleanup?: true }
   | { code: 'resume_failed'; error: string };
 export interface TaskRecoveryResult {
   kind: 'provisioning_resumed' | 'provisioning_resume_failed' | 'provisioning_non_resumable' | 'terminal' | 'no_op';
@@ -152,11 +155,11 @@ export class TaskRoomApplicationService {
     }, template, () => {});
   }
 
-  async startTask(input: { actor: TaskRoomActor; taskId: string }): Promise<TaskRecord> {
+  async startTask(input: { actor: TaskRoomActor; taskId: string; effect?: TaskEffectContext }): Promise<TaskRecord> {
     const cfg = (this.deps.loadConfiguration ?? loadConfig)(this.configurationPath);
     const before = readTask(input.taskId);
     const selected = before.template && !before.room_id ? this.existingTemplate(cfg, before) : undefined;
-    let task = transitionTask(input.taskId);
+    let task = transitionTask(input.taskId, input.effect);
     if (task.template && !task.room_id) {
       await this.provisionRoom(cfg, task, selected!, room => {
         task = updateTaskRoom(task.task_id, room.room_id, room.room_identity_cid!);
@@ -230,16 +233,16 @@ export class TaskRoomApplicationService {
     return { task, orchestration: task.room_id ? getRoomRecord(task.room_id) : undefined };
   }
 
-  blockTask(input: { actor: TaskRoomActor; taskId: string; reason: string }): TaskRecord {
-    return persistBlockTask(input.taskId, input.reason);
+  blockTask(input: { actor: TaskRoomActor; taskId: string; reason: string; effect?: TaskEffectContext }): TaskRecord {
+    return persistBlockTask(input.taskId, input.reason, input.effect);
   }
 
-  unblockTask(input: { actor: TaskRoomActor; taskId: string }): TaskRecord {
-    return persistUnblockTask(input.taskId);
+  unblockTask(input: { actor: TaskRoomActor; taskId: string; effect?: TaskEffectContext }): TaskRecord {
+    return persistUnblockTask(input.taskId, input.effect);
   }
 
-  reviewTask(input: { actor: TaskRoomActor; taskId: string }): TaskRecord {
-    return persistReviewTask(input.taskId);
+  reviewTask(input: { actor: TaskRoomActor; taskId: string; effect?: TaskEffectContext }): TaskRecord {
+    return persistReviewTask(input.taskId, input.effect);
   }
 
   deleteTask(input: { actor: TaskRoomActor; taskId: string }): boolean {
@@ -322,7 +325,10 @@ export class TaskRoomApplicationService {
     if (room.provisioning_detail === 'waiting_cowork') issues.push({ code: 'waiting_cowork' });
     if (room.provisioning_detail === 'waiting_owner_invite') issues.push({ code: 'waiting_owner_invite' });
     if (room.provisioning_detail === 'owner_cid_mismatch') issues.push({ code: 'owner_cid_mismatch' });
-    if (room.provisioning_detail === 'member_failed') issues.push({ code: 'member_failed', stepIndex: room.saga.step_index });
+    if (room.provisioning_detail === 'member_failed') issues.push({ code: 'member_failed',
+      stepIndex: room.saga.step_index,
+      ...(room.saga.recovery_hint?.startsWith('Manually clean up or recreate')
+        ? { manualCleanup: true as const } : {}) });
     if (room.provisioning_detail === 'waiting_seats') issues.push({ code: 'waiting_seats' });
     const resumable = ['create_members', 'join_role_groups', 'wait_seats', 'launch_work', 'activate'];
     if (!resumable.includes(room.saga.phase)) return {
@@ -416,7 +422,7 @@ export class TaskRoomApplicationService {
     return { room, orchestration, members: await adapter.getSeats(id) };
   }
 
-  async requestRoomDeletion(input: { actor: TaskRoomActor; roomId: string }) {
+  async requestRoomDeletion(input: { actor: TaskRoomActor; roomId: string; effect?: RoomEffectContext }) {
     const cfg = (this.deps.loadConfiguration ?? loadConfig)(this.configurationPath);
     if (!cfg.rooms) throw new ConfigError('rooms: configuration is required before creating or querying rooms');
     if (this.deps.cowork) this.deps.cowork(cfg);
@@ -427,7 +433,13 @@ export class TaskRoomApplicationService {
         'room_record_not_found', 'room record not found', { room: input.roomId },
       );
     }
-    return { room: await acceptManagedRoomClose(input.roomId), settlementRequired: true as const };
+    return { room: await acceptManagedRoomClose(input.roomId, input.effect), settlementRequired: true as const };
+  }
+
+  getRoomRecoveryDetail(roomId: string) { return roomRecoveryDetail(roomId); }
+
+  acceptRoomRecovery(input: { actor: TaskRoomActor; roomId: string; effect: RoomRecoveryContext }) {
+    return beginRoomRecovery(input.roomId, input.effect).result;
   }
 
   async settleRoomDeletion(input: {

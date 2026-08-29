@@ -51,6 +51,8 @@ describe('packed root package', () => {
       const fleetPackage = JSON.parse(readFileSync(join(fleetRoot, 'package.json'), 'utf8'));
       expect(fleetPackage.optionalDependencies['@agentclientprotocol/codex-acp'])
         .toBe(CODEX_ACP_VERSION);
+      const publicDeclaration = readFileSync(join(fleetRoot, 'dist', 'index.d.ts'), 'utf8');
+      expect(publicDeclaration).not.toMatch(/AgentSupervisorControl|controlLease|supervisorControl|preparePersistentResource|resumePersistentResource/u);
 
       const probe = `
         import { readFileSync } from 'node:fs';
@@ -87,6 +89,8 @@ describe('packed root package', () => {
             rawPermanent: typeof index.createProductionAgentSupervisorRehydration,
             rawTemporary: typeof index.createProductionTempAgentSupervisorRehydration,
             installer: typeof AgentInstallationService,
+            controlledRuntime: typeof index.createControlledAgentProductionRuntime,
+            controlledRoot: typeof index.createControlledProductionAgentCreationCompositionRoot,
           },
           legacyAttempt: typeof adapter.prepareAcpLegacy,
         }));
@@ -97,7 +101,8 @@ describe('packed root package', () => {
 
       expect(result.version).toBe(CODEX_ACP_VERSION);
       expect(result.productExport).toEqual({ runtime: 'function', rawPermanent: 'undefined',
-        rawTemporary: 'undefined', installer: 'function' });
+        rawTemporary: 'undefined', installer: 'function', controlledRuntime: 'undefined',
+        controlledRoot: 'undefined' });
       expect(result.legacyAttempt).toBe('undefined');
       expect(result.claim).toMatchObject({
         supported: true,

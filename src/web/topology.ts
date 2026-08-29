@@ -3,9 +3,10 @@ import { join } from 'node:path';
 
 import type { FleetConfig } from '../config.js';
 import type { RoleRecord, RoleStatus } from '../application/types.js';
+import type { ConfigResourceSnapshot } from '../config-resource-loader.js';
 
-export type TopologyNodeKind = 'agent' | 'watchdog' | 'loop';
-export type TopologyEdgeKind = 'oversees' | 'watches' | 'targets' | 'spawned';
+export type TopologyNodeKind = 'role' | 'brain' | 'agent' | 'watchdog' | 'loop';
+export type TopologyEdgeKind = 'performs' | 'uses' | 'oversees' | 'watches' | 'targets' | 'spawned';
 
 export interface TopologyNode {
   id: string;
@@ -33,7 +34,7 @@ export interface TopologySnapshot {
 
 export interface RuntimeRoleItem { role: RoleRecord; status: RoleStatus }
 
-export function deriveTopology(config: FleetConfig, roles: RuntimeRoleItem[]): TopologySnapshot {
+export function deriveTopology(config: FleetConfig, roles: RuntimeRoleItem[], resources?: ConfigResourceSnapshot): TopologySnapshot {
   const nodes: TopologyNode[] = roles.map(({ role, status }) => ({
     id: `agent:${role.id}`, kind: 'agent', label: role.id, status: status.overall,
     lifetime: role.lifetime, href: `/roles/${encodeURIComponent(role.id)}`,
@@ -43,6 +44,21 @@ export function deriveTopology(config: FleetConfig, roles: RuntimeRoleItem[]): T
   const agentIds = new Set(roles.map(item => item.role.id));
   const add = (kind: TopologyEdgeKind, from: string, to: string, label: string) =>
     edges.push({ id: `${kind}:${from}:${to}`, kind, from, to, label });
+
+  for (const resource of resources?.sources ?? []) {
+    const typed = resource.resource;
+    if (typed.kind === 'Role') nodes.push({ id: `role:${typed.id}`, kind: 'role', label: typed.id,
+      status: 'configured', detail: typed.spec.mission });
+    if (typed.kind === 'Brain') nodes.push({ id: `brain:${typed.id}`, kind: 'brain', label: typed.id,
+      status: 'configured', detail: `${typed.spec.harness} · ${typed.spec.model}` });
+    if (typed.kind === 'Agent') {
+      if (!nodes.some(node => node.id === `agent:${resource.id}`))
+        nodes.push({ id: `agent:${resource.id}`, kind: 'agent', label: resource.id, status: 'configured' });
+      add('performs', `agent:${typed.id}`, `role:${typed.spec.role}`, 'performs role');
+      if ('template' in typed.spec.brain)
+        add('uses', `agent:${typed.id}`, `brain:${typed.spec.brain.template}`, 'uses brain');
+    }
+  }
 
   for (const role of config.roles) for (const entry of role.oversee ?? [])
     if (agentIds.has(role.name) && agentIds.has(entry.role))

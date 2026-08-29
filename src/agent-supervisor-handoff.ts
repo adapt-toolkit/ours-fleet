@@ -8,6 +8,8 @@ import { readStoredAgentPlan } from './agent-plan-store.js';
 import { encodeAgentPlan } from './agent-plan-codec.js';
 import { readAgentStartLocator, type AgentStartLocatorExpectedBindings } from './agent-start-locator.js';
 import { withConfigGraphLock } from './config-graph-lock.js';
+import type { AgentSupervisorControlAuthority, AgentSupervisorControlBinding,
+  AgentSupervisorControlLease } from './agent-supervisor-control.js';
 
 export const AGENT_SUPERVISOR_HANDOFF_FILENAME = 'active.json';
 const SHA = /^sha256:[a-f0-9]{64}$/u;
@@ -124,9 +126,12 @@ export function readAgentSupervisorHandoff(trustedRoot: string, agentId: string,
 
 export class AgentSupervisorHandoffPublisher {
   constructor(private readonly trustedRoot: string, private readonly completion: AgentCreationCompletionAuthority,
-    private readonly faults: AgentSupervisorHandoffFaults = {}) {}
+    private readonly faults: AgentSupervisorHandoffFaults = {},
+    private readonly control?: AgentSupervisorControlAuthority) {}
 
-  async publish(evidence: VerifiedCompleteAgentCreation): Promise<Readonly<AgentSupervisorHandoff>> {
+  async publish(evidence: VerifiedCompleteAgentCreation,
+    lease?: AgentSupervisorControlLease,
+    operation: AgentSupervisorControlBinding['operation'] = 'create'): Promise<Readonly<AgentSupervisorHandoff>> {
     const complete = this.completion.authenticateComplete(evidence);
     if (!complete) throw new AgentSupervisorHandoffError('invalid_completion');
     const plan = readStoredAgentPlan(complete.canonicalDir, complete, 'supervisor-handoff').plan;
@@ -144,15 +149,41 @@ export class AgentSupervisorHandoffPublisher {
       locatorDigest: locator.locatorDigest, canonicalDir: complete.canonicalDir,
       planBytesDigest: digest(encodeAgentPlan(plan)) };
     const record = Object.freeze({ ...unsigned, handoffDigest: digest(canonical(unsigned)) });
-    await this.#cas(record); return record;
+    if (this.control) {
+      const binding: AgentSupervisorControlBinding = { agentId: record.agentId, operation,
+        priorGeneration: operation === 'create' || operation === 'reconfigure'
+          ? record.generation - 1 : record.generation,
+        targetGeneration: record.generation, actionId: record.actionId,
+        planDigest: record.planDigest, snapshotDigest: record.snapshotDigest,
+        rootId: 'production-agent-creation', publisherId: 'agent-supervisor-handoff' };
+      if (!lease || !this.control.consume(lease, binding))
+        throw new AgentSupervisorHandoffError('invalid_completion');
+      await this.#cas(record, false);
+    } else await this.#cas(record, true);
+    return record;
   }
 
-  async #cas(record: AgentSupervisorHandoff): Promise<void> {
+  async retire(active: Readonly<AgentSupervisorHandoff>, actionId: string,
+    lease: AgentSupervisorControlLease): Promise<void> {
+    if (!this.control || !this.control.consume(lease, { agentId: active.agentId, operation: 'retire',
+      priorGeneration: active.generation, targetGeneration: active.generation, actionId,
+      planDigest: active.planDigest, snapshotDigest: active.snapshotDigest,
+      rootId: 'production-agent-creation', publisherId: 'agent-supervisor-handoff' }))
+      throw new AgentSupervisorHandoffError('invalid_completion');
+    const current = readAgentSupervisorHandoff(this.trustedRoot, active.agentId, this.faults);
+    if (canonical(current) !== canonical(active)) throw new AgentSupervisorHandoffError('generation_conflict');
+    const agentRoot = join(resolve(this.trustedRoot), 'agents', safe(active.agentId));
+    unlinkSync(join(agentRoot, AGENT_SUPERVISOR_HANDOFF_FILENAME));
+    const dir = openSync(agentRoot, constants.O_RDONLY | constants.O_NOFOLLOW);
+    try { fsyncSync(dir); } finally { closeSync(dir); }
+  }
+
+  async #cas(record: AgentSupervisorHandoff, acquireActive: boolean): Promise<void> {
     const agentRoot = join(resolve(this.trustedRoot), 'agents', safe(record.agentId));
     assertParents(agentRoot); const stat = lstatSync(agentRoot);
     if (!stat.isDirectory() || (stat.mode & 0o077) !== 0) throw new AgentSupervisorHandoffError('write_failed');
     const path = join(agentRoot, AGENT_SUPERVISOR_HANDOFF_FILENAME);
-    await withConfigGraphLock(join(agentRoot, '.active'), 'exclusive', () => {
+    const write = () => {
       let prior: Readonly<AgentSupervisorHandoff> | undefined;
       try { prior = readAgentSupervisorHandoff(this.trustedRoot, record.agentId, this.faults); }
       catch (error) {
@@ -187,6 +218,8 @@ export class AgentSupervisorHandoffPublisher {
         throw new AgentSupervisorHandoffError('write_failed');
       } finally { if (fd !== undefined) try { closeSync(fd); } catch { /* stable error */ }
         try { unlinkSync(temp); } catch { /* non-authoritative temp */ } }
-    });
+    };
+    if (acquireActive) await withConfigGraphLock(join(agentRoot, '.active'), 'exclusive', write);
+    else await write();
   }
 }

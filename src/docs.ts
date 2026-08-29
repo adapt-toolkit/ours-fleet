@@ -353,6 +353,12 @@ Cowork role, and task. The agent creates that identity itself with ours MCP
 work immediately. Fleet activates the room from Cowork's authenticated seat; there
 is no briefing hash, startup ACK, or separate role-briefing readiness gate.
 
+Invite creation is deliberately at-most-once. Fleet durably records an attempt
+before asking Cowork to create the invite. If Cowork rejects the request, returns
+an invalid receipt, or Fleet loses the response, provisioning stops visibly and
+does not infer success or issue another invite during recovery. The operator must
+clean up or recreate the failed room/member explicitly before trying again.
+
 Human task and room results use the same compact Markdown presentation in the
 CLI and authenticated owner channel: a short heading, icon-plus-word status,
 code-formatted identifiers, bounded summaries, and actionable recovery or error

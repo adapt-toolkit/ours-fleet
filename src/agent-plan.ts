@@ -937,8 +937,10 @@ function sourceValues(input: AuthorizedResolutionInput): {
     const resource = input.snapshot.resources.Agent?.[input.source.agentId];
     if (!resource || resource.kind !== 'Agent')
       throw new AgentPlanResolutionError(`unknown Agent '${input.source.agentId}'`);
+    const identity = input.operation.type === 'agent.reconfigure' && input.generation > 1
+      ? { ...resource.spec.identity, ownership: 'existing' as const } : clone(resource.spec.identity);
     return {
-      agentId: resource.id, role: resource.spec.role, identity: clone(resource.spec.identity),
+      agentId: resource.id, role: resource.spec.role, identity,
       lifecycle: resource.spec.lifecycle,
       ...(resource.spec.runtime ? { runtime: normalizedRuntime(resource.spec.runtime, resource.id) } : {}),
       explicit: { source: { kind: 'resource', resourceKind: 'Agent', resourceId: resource.id },

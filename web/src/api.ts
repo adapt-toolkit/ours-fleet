@@ -86,6 +86,11 @@ export class ApiClient {
 }
 
 export const api = new ApiClient();
+export type ManagementRequest = {
+  version: 1; requestId: string; idempotencyKey?: string; command: Record<string, unknown>;
+};
+export const manage = <T>(request: ManagementRequest, key = idempotencyKey()): Promise<T> =>
+  api.post<T>('/api/v1/management', request, { 'idempotency-key': key });
 export const idempotencyKey = () => {
   const bytes = crypto.getRandomValues(new Uint8Array(16));
   return [...bytes].map(byte => byte.toString(16).padStart(2, '0')).join('');

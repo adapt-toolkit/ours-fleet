@@ -30,6 +30,8 @@ import { ROLE_NAME_RE } from '../config.js';
 import type { TaskRoomApplicationService } from '../application/task-room-service.js';
 import { TaskListError } from '../rooms-tasks/task-lists.js';
 import { TaskStateError } from '../rooms-tasks/task-state.js';
+import type { ManagementKernel } from '../application/management-kernel.js';
+import type { ManagementRequest } from '../application/management-contract.js';
 
 export interface WebServices {
   query: FleetQueryService;
@@ -47,6 +49,7 @@ export interface WebServices {
   topologyPromote?: TopologyPromoteService;
   removal?: RoleRemovalService;
   taskRooms?: TaskRoomApplicationService;
+  management?: ManagementKernel;
   terminalUpgrade?: (
     socket: WebSocket, request: FastifyRequest, roleId: string,
     ticket: string, hello: Record<string, unknown>,
@@ -63,7 +66,7 @@ export interface WebServer {
 
 const statusFor = (code: string): number => ({
   role_not_found: 404, resource_not_found: 404, unauthorized: 401, forbidden: 403, conflict: 409,
-  idempotency_conflict: 409, stale_state: 409, rate_limited: 429,
+  idempotency_conflict: 409, stale_state: 409, incompatible_version: 409, rate_limited: 429,
   invalid_request: 400, capability_unavailable: 409, prerequisite_unavailable: 503,
 }[code] ?? 500);
 
@@ -197,6 +200,40 @@ export async function buildWebServer(
     return { roles: await services.query.list() };
   });
 
+  app.post('/api/v1/management', async request => {
+    const session = auth.authenticate(request, true);
+    if (!services.management)
+      throw new FleetError('capability_unavailable', 'typed resource management is unavailable');
+    const body = request.body as ManagementRequest;
+    const response = await services.management.execute({ surface: 'web', local: true }, {
+      ...body, requestId: request.id,
+      idempotencyKey: typeof request.headers['idempotency-key'] === 'string'
+        ? request.headers['idempotency-key'] : body?.idempotencyKey,
+    });
+    await audit.record({ requestId: request.id, browser: session.id,
+      action: `management.${body?.command?.operation ?? 'invalid'}`, result: response.ok ? 'succeeded' : 'rejected',
+      ...(!response.ok ? { errorCode: response.error.code } : {}) });
+    return response;
+  });
+
+  const webManagement = async (request: FastifyRequest,
+    command: ManagementRequest['command'], mutation = false) => {
+    if (!services.management)
+      throw new FleetError('capability_unavailable', 'shared management is unavailable');
+    const key = request.headers['idempotency-key'];
+    if (mutation && typeof key !== 'string')
+      throw new FleetError('invalid_request', 'Idempotency-Key header is required');
+    const response = await services.management.execute({ surface: 'web', local: true }, {
+      version: 1, requestId: request.id, command,
+      ...(typeof key === 'string' ? { idempotencyKey: key } : {}),
+    });
+    if (!response.ok) throw new FleetError(response.error.code, response.error.message, {
+      requestId: response.error.requestId, provesOffline: response.error.provesOffline,
+      retryable: response.error.retryable, details: response.error.details,
+    });
+    return response.result;
+  };
+
   const taskApi = async <T>(fn: () => T | Promise<T>): Promise<T> => {
     try { return await fn(); }
     catch (error) {
@@ -249,26 +286,28 @@ export async function buildWebServer(
       throw new FleetError('invalid_request', 'groupByList must be true or false');
     const state = query.state && query.state !== 'all' ? query.state as import('../rooms-tasks/types.js').TaskState : undefined;
     const filter = { ...(state ? { state } : {}), ...(query.list ? { list: query.list } : {}) };
-    return taskApi(() => query.groupByList === 'true'
-      ? { groups: requireTaskRooms().groupedTasks(filter) }
-      : { tasks: requireTaskRooms().listTasks(filter) });
+    if (!services.management) return query.groupByList === 'true'
+      ? { groups: await taskApi(() => requireTaskRooms().groupedTasks(filter)) }
+      : { tasks: await taskApi(() => requireTaskRooms().listTasks(filter)) };
+    const managed = await webManagement(request, { operation: 'task.list',
+      ...(state ? { state } : {}), ...(query.list ? { list: query.list } : {}),
+      groupByList: query.groupByList === 'true' });
+    return query.groupByList === 'true' ? { groups: (managed as { value: unknown }).value }
+      : { tasks: (managed as { value: unknown }).value };
   });
   app.post('/api/v1/tasks', async (request, reply) => {
     auth.authenticate(request, true);
     const body = request.body as Record<string, unknown>;
     if (typeof body?.title !== 'string' || !body.title)
       throw new FleetError('invalid_request', 'title is required');
-    const task = await taskApi(() => requireTaskRooms().createTask({
-      actor: { kind: 'local_control', surface: 'web' }, title: body.title as string,
+    const managed = await webManagement(request, {
+      operation: 'task.create', title: body.title as string, origin: 'web',
       brief: typeof body.brief === 'string' ? body.brief : undefined,
       template: typeof body.template === 'string' ? body.template : undefined,
       backlog: body.backlog === true, noRoom: body.noRoom === true,
       list: typeof body.list === 'string' ? body.list : undefined,
-      idempotencyKey: typeof request.headers['idempotency-key'] === 'string'
-        ? request.headers['idempotency-key'] : undefined,
-      origin: { type: 'web' },
-    }));
-    reply.code(201); return { task };
+    }, true);
+    reply.code(201); return { task: (managed as { value: unknown }).value };
   });
   app.patch('/api/v1/tasks/:id/list', async request => {
     auth.authenticate(request, true);

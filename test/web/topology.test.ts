@@ -5,6 +5,7 @@ import { afterEach, describe, expect, it } from 'vitest';
 
 import { deriveTopology, readSpawnLineage } from '../../src/web/topology.js';
 import type { FleetConfig } from '../../src/config.js';
+import { loadConfigResourceSnapshotFromDocuments } from '../../src/config-resource-loader.js';
 
 const roleItem = (id: string, lifetime: 'permanent' | 'temporary' = 'permanent', parentRole?: string) => ({
   role: {
@@ -50,6 +51,23 @@ describe('fleet topology derivation', () => {
     ]);
     expect(topology.edges).toEqual([]);
     expect(topology.unknownLineage).toEqual(['Orphaned', 'Unattributed']);
+  });
+
+  it('renders inert Role and Brain separately from the Agent that binds them', () => {
+    const snapshot = loadConfigResourceSnapshotFromDocuments({
+      bootstrapFile: '/typed/fleet.yaml', configDir: '/typed/fleet.conf.d',
+      bootstrapBytes: Buffer.from('schema_version: 2\nconfig_dir: fleet.conf.d\npolicy: {}\n'),
+      documents: [
+        { relativePath: 'roles.d/writer.yaml', bytes: Buffer.from('kind: Role\nversion: 1\nid: writer\nspec:\n  mission: Write\n') },
+        { relativePath: 'brains.d/codex.yaml', bytes: Buffer.from('kind: Brain\nversion: 1\nid: codex\nspec:\n  harness: codex\n  model: gpt-5\n  effort: medium\n  session: acp\n') },
+        { relativePath: 'agents.d/alice.yaml', bytes: Buffer.from('kind: Agent\nversion: 1\nid: alice\nspec:\n  role: writer\n  brain:\n    template: codex\n  identity:\n    name: alice\n    ownership: existing\n  lifecycle: persistent\n  permissions:\n    approval: ask\n    filesystem: workspace\n    unattended: deny\n') },
+      ],
+    });
+    const topology = deriveTopology({ roles: [], watchdogs: [], loops: [] } as unknown as FleetConfig, [], snapshot);
+    expect(topology.nodes.map(node => node.id)).toEqual(['role:writer', 'brain:codex', 'agent:alice']);
+    expect(topology.edges.map(edge => `${edge.kind}:${edge.from}->${edge.to}`)).toEqual([
+      'performs:agent:alice->role:writer', 'uses:agent:alice->brain:codex',
+    ]);
   });
 });
 

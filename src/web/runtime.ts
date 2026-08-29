@@ -9,12 +9,11 @@ import { StructuredLogService } from '../application/log-service.js';
 import { RoleCommandService } from '../application/role-command-service.js';
 import { RoleCreationService } from '../application/role-creation-service.js';
 import { RoleRemovalService } from '../application/role-removal-service.js';
-import { FleetError } from '../application/errors.js';
 import { controlRequest, controlSocketPath } from '../session/control.js';
 import { Tmux } from '../tmux.js';
 import { pickBackend } from '../supervisor/index.js';
 import { realExec } from '../exec.js';
-import { home, stateRoot } from '../paths.js';
+import { defaultConfigPath, home, stateRoot } from '../paths.js';
 import { AuditSink } from './audit.js';
 import { FleetEventBus } from './events.js';
 import { buildWebServer, type WebServer } from './server.js';
@@ -33,7 +32,18 @@ import { buildWatchdogFindings, cachedWatchdogFindingsProvider, WatchdogQuerySer
 import { latestReport } from '../watchdog/store.js';
 import { TaskRoomApplicationService } from '../application/task-room-service.js';
 import { daemonIdentityProvisioner } from '../creation.js';
-import { createAgentProductionRuntime } from '../agent-production-runtime.js';
+import { createControlledAgentProductionRuntime, prepareManagedPersistentResource,
+  resumeManagedPersistentResource, retireManagedPersistentResource } from '../agent-production-runtime.js';
+import { reconfigureManagedPersistentResource } from '../agent-production-runtime.js';
+import { FleetError } from '../application/errors.js';
+import { ResourceManagementService } from '../application/resource-management-service.js';
+import { ManagementOperationStore } from '../application/management-operation-store.js';
+import { ManagementKernel } from '../application/management-kernel.js';
+import { loadConfigResourceSnapshot } from '../config-resource-loader.js';
+import { AgentSupervisorControlAuthority } from '../agent-supervisor-control.js';
+import { AgentManagementService } from '../application/agent-management-service.js';
+import { readAgentSupervisorHandoff } from '../agent-supervisor-handoff.js';
+import { TaskRoomManagementService } from '../application/task-room-management-service.js';
 
 const CONFIG_CACHE_TTL_MS = 5_000;
 
@@ -134,7 +144,9 @@ export async function startWebConsole(options: StartWebOptions): Promise<Running
     watchdogFindings,
   });
   const identityProvisioner = daemonIdentityProvisioner();
-  const agentProductionRuntime = createAgentProductionRuntime({ trustedStateRoot: stateRoot(), identityProvisioner });
+  const supervisorControl = new AgentSupervisorControlAuthority(stateRoot());
+  const agentProductionRuntime = createControlledAgentProductionRuntime({ trustedStateRoot: stateRoot(),
+    identityProvisioner }, supervisorControl);
   const ops = { backend, binPath: options.binPath, log, identityProvisioner, agentProductionRuntime };
   const creation = new RoleCreationService({
     configPath: options.configPath, ops, binPath: options.binPath,
@@ -176,15 +188,54 @@ export async function startWebConsole(options: StartWebOptions): Promise<Running
   });
   const topologyDrafts = new TopologyDraftStore({ dir: webDir });
   const readTopology = async () => mergeTopology(
-    loadConfig(options.configPath), await query.list(), topologyDrafts.read());
+    loadConfig(options.configPath), await query.list(), topologyDrafts.read(),
+    loadConfigResourceSnapshot({ bootstrapFile: options.configPath ?? defaultConfigPath() }));
   const topologyPromote = new TopologyPromoteService({
     drafts: topologyDrafts, configuration, topology: readTopology,
   });
+  const bootstrapFile = options.configPath ?? defaultConfigPath();
+  const taskRooms = new TaskRoomApplicationService(options.configPath);
+  const management = new ManagementKernel(
+    new ResourceManagementService(bootstrapFile),
+    new AgentManagementService({ control: supervisorControl, backend, binPath: options.binPath,
+      readHandoff: agentId => {
+        try { return { state: 'present', handoff: readAgentSupervisorHandoff(stateRoot(), agentId) }; }
+        catch (error) {
+          const path = resolve(stateRoot(), 'agents', Buffer.from(agentId).toString('base64url'), 'active.json');
+          if (!existsSync(path)) return { state: 'missing' };
+          return { state: 'corrupt', detail: error instanceof Error ? error.message : String(error) };
+        }
+      },
+      startInitial: async (agentId, actionId, controlLease) => {
+        await prepareManagedPersistentResource(agentProductionRuntime, {
+          snapshot: loadConfigResourceSnapshot({ bootstrapFile }), agentId,
+          actionId, controlLease,
+        });
+        return readAgentSupervisorHandoff(stateRoot(), agentId);
+      },
+      startExisting: async (handoff, controlLease) => {
+        await resumeManagedPersistentResource(agentProductionRuntime, { agentId: handoff.agentId,
+          actionId: handoff.actionId, controlLease });
+      },
+      retire: (handoff, actionId, controlLease) => retireManagedPersistentResource(agentProductionRuntime,
+        { active: handoff, actionId, controlLease }),
+      reconfigure: async (agentId, expectedDigest, actionId, controlLease) => {
+        const snapshot = loadConfigResourceSnapshot({ bootstrapFile });
+        if (snapshot.digest !== expectedDigest) throw new FleetError('stale_state', 'configuration digest changed');
+        await reconfigureManagedPersistentResource(agentProductionRuntime,
+          { snapshot, agentId, actionId, controlLease });
+        return readAgentSupervisorHandoff(stateRoot(), agentId);
+      },
+    }),
+    { authorize: principal => principal.surface === 'web' && principal.local === true },
+    new ManagementOperationStore(resolve(webDir, 'management-operations')),
+    undefined, new TaskRoomManagementService(taskRooms),
+  );
   let server: WebServer;
   try {
     server = await buildWebServer({
     query, repository, logs, commands, creation, removal, audit, events, watchdogs, configuration,
-    taskRooms: new TaskRoomApplicationService(options.configPath),
+    taskRooms, management,
     topology: readTopology, topologyDrafts, topologyPromote,
     terminalUpgrade: terminalAvailable
       ? async (socket, _request, roleId, _ticket, hello) => terminals.connect(socket, roleId, hello)

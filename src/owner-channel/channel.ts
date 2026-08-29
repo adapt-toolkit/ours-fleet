@@ -55,6 +55,13 @@ import {
   type OwnerBinderDeps, type OwnerBinderLease,
 } from './binder.js';
 import { MessageRecoveryState, type PendingMessageClaim } from './message-recovery.js';
+import { ManagementKernel } from '../application/management-kernel.js';
+import { ManagementOperationStore, managementDigest } from '../application/management-operation-store.js';
+import { ResourceManagementService } from '../application/resource-management-service.js';
+import { FleetError } from '../application/errors.js';
+import { TaskRoomManagementService } from '../application/task-room-management-service.js';
+import { defaultConfigPath, stateRoot } from '../paths.js';
+import type { ManagementCommand, ManagementResponse } from '../application/management-contract.js';
 
 /**
  * The daemon's own inbound message shape. It used to be a hand-written union of
@@ -63,6 +70,72 @@ import { MessageRecoveryState, type PendingMessageClaim } from './message-recove
  * the guesswork.
  */
 type InboundMessage = OursInboundMessage;
+
+/** Deep test seam and production adapter for authenticated Owner management commands. */
+export function createOwnerCommandManagement(options: {
+  configPath?: string; senderCid: string; wireId: string; afterStartRead?(): void | Promise<void>;
+  afterTaskRead?(operation: 'task.start'|'task.block'|'task.unblock'|'task.review'): void | Promise<void>;
+  beforeTaskEffectPublish?(operation: 'task.start'|'task.block'|'task.unblock'|'task.review'): void;
+  afterTaskEffectPublish?(operation: 'task.start'|'task.block'|'task.unblock'|'task.review'): void;
+  beforeTaskEffectFinalize?(operation: 'task.start'|'task.block'|'task.unblock'|'task.review'): void;
+  afterTaskEffectFinalize?(operation: 'task.start'|'task.block'|'task.unblock'|'task.review'): void;
+  beforeOperationWrite?(phase: import('../application/management-operation-store.js').ManagementOperationPhase): void;
+  taskRoomApplicationService?: TaskRoomApplicationService;
+}) {
+  const canonicalSender = options.senderCid.toLowerCase();
+  const execute = (command: ManagementCommand, idempotencyKey?: string): Promise<ManagementResponse> =>
+    new ManagementKernel(
+      new ResourceManagementService(options.configPath ?? defaultConfigPath()),
+      { execute: async () => { throw new FleetError('capability_unavailable', 'Agent lifecycle management is unavailable'); } },
+      { authorize: principal => principal.surface === 'owner'
+        && principal.cid?.toLowerCase() === canonicalSender },
+      new ManagementOperationStore(join(stateRoot(), 'management-operations'), {}, {
+        ...(options.beforeOperationWrite ? { beforeWrite: record => options.beforeOperationWrite!(record.phase) } : {}),
+      }), undefined,
+      new TaskRoomManagementService(options.taskRoomApplicationService
+        ?? new TaskRoomApplicationService(options.configPath), {
+        ...(options.beforeTaskEffectPublish ? { beforeTaskEffectPublish: options.beforeTaskEffectPublish } : {}),
+        ...(options.afterTaskEffectPublish ? { afterTaskEffectPublish: options.afterTaskEffectPublish } : {}),
+        ...(options.beforeTaskEffectFinalize ? { beforeTaskEffectFinalize: options.beforeTaskEffectFinalize } : {}),
+        ...(options.afterTaskEffectFinalize ? { afterTaskEffectFinalize: options.afterTaskEffectFinalize } : {}),
+      }),
+    ).execute({ surface: 'owner', cid: canonicalSender }, {
+      version: 1, requestId: options.wireId, command, ...(idempotencyKey ? { idempotencyKey } : {}),
+    });
+  const value = async (command: ManagementCommand, idempotencyKey?: string): Promise<unknown> => {
+    const response = await execute(command, idempotencyKey);
+    if (!response.ok) throw new FleetError(response.error.code, response.error.message,
+      { requestId: response.error.requestId, retryable: response.error.retryable,
+        provesOffline: response.error.provesOffline, details: response.error.details });
+    return 'value' in response.result ? response.result.value : response.result;
+  };
+  const mutateTask = async (taskId: string, suffix: string,
+    command: (expectedStateDigest: string) => ManagementCommand) => {
+    const before = await value({ operation: 'task.get', id: taskId });
+    if (suffix === 'task.start') await options.afterStartRead?.();
+    await options.afterTaskRead?.(suffix as 'task.start'|'task.block'|'task.unblock'|'task.review');
+    return value(command(managementDigest(before)), `${options.wireId}:${suffix}`) as
+      Promise<import('../rooms-tasks/types.js').TaskRecord>;
+  };
+  return {
+    execute,
+    createTask: (input: Omit<import('../application/task-room-service.js').CreateTaskRequest, 'actor'>) =>
+      value({ operation: 'task.create', title: input.title, origin: 'owner_channel',
+        ...(input.brief === undefined ? {} : { brief: input.brief }),
+        ...(input.template === undefined ? {} : { template: input.template }),
+        ...(input.backlog === undefined ? {} : { backlog: input.backlog }),
+        ...(input.noRoom === undefined ? {} : { noRoom: input.noRoom }),
+        ...(input.list === undefined ? {} : { list: input.list }) }, `${options.wireId}:task.create`) as Promise<import('../rooms-tasks/types.js').TaskRecord>,
+    startTask: (taskId: string) => mutateTask(taskId, 'task.start',
+      expectedStateDigest => ({ operation: 'task.start', id: taskId, expectedStateDigest })),
+    blockTask: (taskId: string, reason: string) => mutateTask(taskId, 'task.block',
+      expectedStateDigest => ({ operation: 'task.block', id: taskId, reason, expectedStateDigest })),
+    unblockTask: (taskId: string) => mutateTask(taskId, 'task.unblock',
+      expectedStateDigest => ({ operation: 'task.unblock', id: taskId, expectedStateDigest })),
+    reviewTask: (taskId: string) => mutateTask(taskId, 'task.review',
+      expectedStateDigest => ({ operation: 'task.review', id: taskId, expectedStateDigest })),
+  };
+}
 
 interface AttachmentGroup {
   files: IncomingAttachment[];
@@ -1134,6 +1207,9 @@ export class OwnerChannel implements OwnerChannelHandle {
   private async handleCommand(
     sender: { id: string; name: string }, text: string, wireId: string,
   ): Promise<void> {
+    const management = createOwnerCommandManagement({
+      configPath: this.options.configPath, senderCid: sender.id, wireId,
+    });
     const ctx: OwnerCommandContext = {
       role: this.options.role,
       harness: this.options.harness,
@@ -1151,18 +1227,14 @@ export class OwnerChannel implements OwnerChannelHandle {
         return this.commentsState();
       },
       fleetList: () => this.fleetOps.list(),
+      manage: management.execute,
       closeRoom: roomId => this.closeRoomFromOwner(sender, roomId, wireId),
       recoverRoom: roomId => this.recoverRoomFromOwner(sender, roomId, wireId),
       terminalTask: (taskId, kind, outcome) =>
         this.terminalTaskFromOwner(sender, taskId, kind, outcome, wireId),
       recoverTask: taskId => this.recoverTaskFromOwner(sender, taskId, wireId),
-      createTask: input => new TaskRoomApplicationService(this.options.configPath).createTask({
-        ...input,
-        actor: { kind: 'authenticated_owner', surface: 'messenger', cid: sender.id },
-      }),
-      startTask: taskId => new TaskRoomApplicationService(this.options.configPath).startTask({
-        actor: { kind: 'authenticated_owner', surface: 'messenger', cid: sender.id }, taskId,
-      }),
+      createTask: management.createTask,
+      startTask: management.startTask,
       listTasks: filter => new TaskRoomApplicationService(this.options.configPath).listTasks(filter),
       groupedTasks: filter => new TaskRoomApplicationService(this.options.configPath).groupedTasks(filter),
       listTaskLists: () => new TaskRoomApplicationService(this.options.configPath).listTaskLists(),
@@ -1179,15 +1251,9 @@ export class OwnerChannel implements OwnerChannelHandle {
         actor: { kind: 'authenticated_owner', surface: 'messenger', cid: sender.id }, taskId, list,
       }),
       getTask: taskId => new TaskRoomApplicationService(this.options.configPath).getTask(taskId),
-      blockTask: (taskId, reason) => new TaskRoomApplicationService(this.options.configPath).blockTask({
-        actor: { kind: 'authenticated_owner', surface: 'messenger', cid: sender.id }, taskId, reason,
-      }),
-      unblockTask: taskId => new TaskRoomApplicationService(this.options.configPath).unblockTask({
-        actor: { kind: 'authenticated_owner', surface: 'messenger', cid: sender.id }, taskId,
-      }),
-      reviewTask: taskId => new TaskRoomApplicationService(this.options.configPath).reviewTask({
-        actor: { kind: 'authenticated_owner', surface: 'messenger', cid: sender.id }, taskId,
-      }),
+      blockTask: management.blockTask,
+      unblockTask: management.unblockTask,
+      reviewTask: management.reviewTask,
       deleteTask: taskId => new TaskRoomApplicationService(this.options.configPath).deleteTask({
         actor: { kind: 'authenticated_owner', surface: 'messenger', cid: sender.id }, taskId,
       }),
@@ -1286,30 +1352,21 @@ export class OwnerChannel implements OwnerChannelHandle {
     sender: { id: string; name: string }, roomId: string, wireId: string,
   ): Promise<void> {
     const app = new TaskRoomApplicationService(this.options.configPath);
-    const actor = { kind: 'authenticated_owner' as const, surface: 'messenger' as const, cid: sender.id };
-    const result = await app.recoverRoom({ actor, roomId });
-    if (result.kind === 'deletion_worker_required') {
-      await this.send(sender.id, renderMarkdownFailure({ kind: 'pending',
-        subject: `/room recover ${roomId}`,
-        detail: 'The deletion recovery is still being settled.',
-        action: `Run /room recover ${roomId} if deletion remains pending.` }), wireId);
-      this.state.remember(wireId);
-      try { await this.fleetOps.closeRoom(roomId); }
-      catch (error) {
-        await app.recordRoomSettlementError({ actor, roomId,
-          error: error instanceof Error ? error.message : String(error),
-          recoveryHint: `External delete worker failed to start. Retry /room delete ${roomId} ${roomId}.` });
-        throw error;
-      }
-      return;
-    }
-    const r = result.orchestration;
+    const detail = app.getRoomRecoveryDetail(roomId);
+    const response = await createOwnerCommandManagement({ configPath: this.options.configPath,
+      senderCid: sender.id, wireId }).execute({ operation: 'room.recover', id: roomId,
+      expectedStateDigest: managementDigest(detail) }, `${wireId}:room.recover`);
+    if (!response.ok) throw new FleetError(response.error.code, response.error.message,
+      { details: response.error.details });
+    const result = (response.result as { value: { kind: string; room_id: string;
+      cursor: { phase: string; state: string }; settlementRequired: boolean } }).value;
     await this.send(sender.id, renderMarkdownResult({ icon: '🛟', title: 'Room recovery',
-      fields: [{ label: 'Room', value: result.room.room_id, kind: 'code' },
-        { label: 'Status', value: roomStatus(result.room.state), kind: 'markdown' },
-        ...(r ? [{ label: 'Saga', value: r.saga.phase, kind: 'code' as const }] : [])],
-      sections: result.issues.length ? [{ heading: 'Next steps', items: result.issues }]
-        : [{ heading: 'Result', items: ['No recovery action is needed.'] }] }), wireId);
+      fields: [{ label: 'Room', value: result.room_id, kind: 'code' },
+        { label: 'Status', value: roomStatus(result.cursor.state as never), kind: 'markdown' },
+        { label: 'Cursor', value: result.cursor.phase, kind: 'code' }],
+      sections: [{ heading: 'Result', items: [result.settlementRequired
+        ? 'Recovery was durably accepted and requires its bound worker.'
+        : 'The room is already at a durable no-effect checkpoint.'] }] }), wireId);
     this.state.remember(wireId);
   }
 
@@ -1340,7 +1397,9 @@ export class OwnerChannel implements OwnerChannelHandle {
     const hints = issues.map(issue => issue.code === 'waiting_cowork' ? 'Cowork socket unreachable'
       : issue.code === 'waiting_owner_invite' ? 'Owner invite missing or invalid'
       : issue.code === 'owner_cid_mismatch' ? 'Owner CID mismatch'
-      : issue.code === 'member_failed' ? `Member failed at step ${issue.stepIndex}`
+      : issue.code === 'member_failed' ? issue.manualCleanup
+        ? 'Invite outcome unknown — manually clean up or recreate the failed room/member; automatic retry is disabled'
+        : `Member failed at step ${issue.stepIndex}`
       : issue.code === 'resume_failed' ? `Resume failed: ${issue.error}`
       : issue.code === 'provisioning_resumed' ? 'Provisioning resumed successfully'
       : issue.code);

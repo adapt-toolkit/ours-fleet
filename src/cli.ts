@@ -9,7 +9,7 @@ import { VERSION } from './version.js';
 import {
   analyzeInstalls, buildInfo, buildLabel, discoverInstalls, runningLabel,
 } from './provenance.js';
-import { agentDir, agentsRoot, tmpRoot, logsRoot, deriveXdgRuntimeDir, stateRoot } from './paths.js';
+import { agentDir, agentsRoot, tmpRoot, logsRoot, deriveXdgRuntimeDir, stateRoot, defaultConfigPath } from './paths.js';
 import { findRole, loadConfig, ROLE_NAME_RE } from './config.js';
 import type { YamlMode } from './config-yaml.js';
 import { formatDuration } from './duration.js';
@@ -28,10 +28,13 @@ import {
 import type { WatchdogReport } from './watchdog/report.js';
 import { watchdogAddressable } from './watchdog/query.js';
 import { lastProvenance, type SpawnOpts } from './spawn.js';
-import { stringify } from 'yaml';
+import { parse, stringify } from 'yaml';
 import { resolvedRolePlan } from './resolved-plan.js';
 import { creationBuildNote, daemonIdentityProvisioner, formatProvenance, readProvenance } from './creation.js';
-import { createAgentProductionRuntime } from './agent-production-runtime.js';
+import { createAgentProductionRuntime, createControlledAgentProductionRuntime,
+  prepareManagedPersistentResource, resumeManagedPersistentResource,
+  retireManagedPersistentResource, reconfigureManagedPersistentResource } from './agent-production-runtime.js';
+import { FleetError } from './application/errors.js';
 import { doctor } from './doctor.js';
 import {
   allWarnings, analyzeFleetPermissions, effectivePermissionMode, formatNative,
@@ -63,6 +66,16 @@ import { RoleCreationService } from './application/role-creation-service.js';
 import { RoleRemovalService } from './application/role-removal-service.js';
 import { RoleRepository } from './application/role-repository.js';
 import { FleetQueryService } from './application/fleet-query-service.js';
+import { ResourceManagementService } from './application/resource-management-service.js';
+import { ManagementOperationStore } from './application/management-operation-store.js';
+import { ManagementKernel } from './application/management-kernel.js';
+import type { ManagementCommand } from './application/management-contract.js';
+import { AgentSupervisorControlAuthority } from './agent-supervisor-control.js';
+import { AgentManagementService } from './application/agent-management-service.js';
+import { readAgentSupervisorHandoff } from './agent-supervisor-handoff.js';
+import { loadConfigResourceSnapshot } from './config-resource-loader.js';
+import { TaskRoomManagementService } from './application/task-room-management-service.js';
+import { TaskRoomApplicationService } from './application/task-room-service.js';
 import {
   executeRestartBatch, RoleLifecycleService,
 } from './application/role-command-service.js';
@@ -105,6 +118,38 @@ const program = new Command()
 const cOpt = (cmd: Command) => cmd.option('-c, --configuration <file>', 'config file (default: ~/fleet.yaml + ~/fleet.d/)');
 
 const collect = (value: string, previous: string[]) => [...previous, value];
+
+const managementKernels = new Map<string, ManagementKernel>();
+const localManagement = (configPath: string | undefined) => {
+  const bootstrapFile = configPath ?? defaultConfigPath(); const backend = pickBackend();
+  const existing = managementKernels.get(bootstrapFile); if (existing) return existing;
+  const control = new AgentSupervisorControlAuthority(stateRoot()); const identityProvisioner = daemonIdentityProvisioner();
+  const runtime = createControlledAgentProductionRuntime({ trustedStateRoot: stateRoot(), identityProvisioner }, control);
+  const readHandoff = (agentId: string) => {
+    try { return { state: 'present' as const, handoff: readAgentSupervisorHandoff(stateRoot(), agentId) }; }
+    catch (error) { const path = joinPath(stateRoot(), 'agents', Buffer.from(agentId).toString('base64url'), 'active.json');
+      return existsSync(path) ? { state: 'corrupt' as const, detail: String(error) } : { state: 'missing' as const }; }
+  };
+  const kernel = new ManagementKernel(new ResourceManagementService(bootstrapFile), new AgentManagementService({
+    control, backend, binPath, readHandoff,
+    startInitial: async (agentId, actionId, controlLease) => { await prepareManagedPersistentResource(runtime, {
+      snapshot: loadConfigResourceSnapshot({ bootstrapFile }), agentId,
+      actionId, controlLease }); return readAgentSupervisorHandoff(stateRoot(), agentId); },
+    startExisting: async (handoff, controlLease) => { await resumeManagedPersistentResource(runtime, {
+      agentId: handoff.agentId, actionId: handoff.actionId, controlLease }); },
+    retire: (handoff, actionId, controlLease) => retireManagedPersistentResource(runtime,
+      { active: handoff, actionId, controlLease }),
+    reconfigure: async (agentId, expectedDigest, actionId, controlLease) => {
+      const snapshot = loadConfigResourceSnapshot({ bootstrapFile });
+      if (snapshot.digest !== expectedDigest) throw new FleetError('stale_state', 'configuration digest changed');
+      await reconfigureManagedPersistentResource(runtime, { snapshot, agentId, actionId, controlLease });
+      return readAgentSupervisorHandoff(stateRoot(), agentId);
+    },
+  }), { authorize: principal => principal.local === true && (principal.surface === 'cli' || principal.surface === 'room') },
+  new ManagementOperationStore(joinPath(stateRoot(), 'management-operations')), undefined,
+  new TaskRoomManagementService(new TaskRoomApplicationService(configPath)));
+  managementKernels.set(bootstrapFile, kernel); return kernel;
+};
 
 program.command('docs')
   .alias('man')
@@ -1151,6 +1196,51 @@ cOpt(program.command('spawn [name]').description('spawn a new agent (permanent b
     } catch (e) { die(e); }
   });
 
+const resourceCommand = cOpt(program.command('resource <operation> [kind] [id]')
+  .description('typed Role/Brain/Agent/RoomTemplate/RoomsPolicy/TasksPolicy CRUD'))
+  .option('--file <path>', 'YAML or JSON resource for create/update')
+  .option('--expected-digest <digest>', 'required optimistic configuration digest for mutations')
+  .option('--idempotency-key <key>', 'durable replay key for mutations');
+resourceCommand.action(async (operation, kind, id, opts) => {
+  try {
+    let command: ManagementCommand;
+    if (operation === 'list') command = { operation: 'resource.list', ...(kind ? { kind } : {}) } as ManagementCommand;
+    else if (operation === 'get') command = { operation: 'resource.get', kind, id } as ManagementCommand;
+    else if (operation === 'delete') command = { operation: 'resource.delete', kind, id,
+      expectedDigest: String(opts.expectedDigest ?? '') } as ManagementCommand;
+    else if (operation === 'create' || operation === 'update') {
+      if (!opts.file) throw new Error('--file is required for create/update');
+      const resource = parse(readFileSync(resolvePath(opts.file), 'utf8'));
+      command = { operation: `resource.${operation}`, resource,
+        expectedDigest: String(opts.expectedDigest ?? '') } as ManagementCommand;
+    } else throw new Error('operation must be list, get, create, update, or delete');
+    const response = await localManagement(opts.configuration).execute({ surface: 'cli', local: true }, {
+      version: 1, requestId: `cli-${Date.now()}`, command,
+      ...(opts.idempotencyKey ? { idempotencyKey: String(opts.idempotencyKey) } : {}),
+    });
+    if (!response.ok) throw new Error(`${response.error.code}: ${response.error.message}`);
+    process.stdout.write(`${JSON.stringify(response.result, null, 2)}\n`);
+  } catch (error) { die(error); }
+});
+
+cOpt(program.command('agent <operation> <id>').description('typed Agent lifecycle: start|resume|reconfigure|retire'))
+  .option('--idempotency-key <key>', 'durable replay key')
+  .option('--expected-digest <digest>', 'required configuration digest for reconfigure')
+  .action(async (operation, id, opts) => {
+    try {
+      if (!['start', 'resume', 'reconfigure', 'retire'].includes(operation))
+        throw new Error('operation must be start, resume, reconfigure, or retire');
+      if (operation === 'reconfigure' && !opts.expectedDigest) throw new Error('--expected-digest is required for reconfigure');
+      const response = await localManagement(opts.configuration).execute({ surface: 'cli', local: true }, {
+        version: 1, requestId: `cli-${Date.now()}`, command: { operation: `agent.${operation}`, id,
+          ...(operation === 'reconfigure' ? { expectedDigest: String(opts.expectedDigest) } : {}) } as ManagementCommand,
+        ...(opts.idempotencyKey ? { idempotencyKey: String(opts.idempotencyKey) } : {}),
+      });
+      if (!response.ok) throw new Error(`${response.error.code}: ${response.error.message}`);
+      process.stdout.write(`${JSON.stringify(response.result, null, 2)}\n`);
+    } catch (error) { die(error); }
+  });
+
 cOpt(program.command('doctor').description('prerequisite report'))
   .option('--harness <id>', 'check one harness explicitly')
   .option('--yaml-mode <mode>', 'non-plain YAML policy: compat|strict', 'compat')
@@ -1338,8 +1428,8 @@ function configureWebAccess(opts: {
 
 // ── rooms & tasks ──────────────────────────────────────────────────────────
 registerTemplateCommands(program, cOpt);
-registerTaskCommands(program, cOpt);
-registerRoomCommands(program, cOpt);
+registerTaskCommands(program, cOpt, localManagement);
+registerRoomCommands(program, cOpt, localManagement);
 
 program.command('_run <name>', { hidden: true }).description('internal: supervisor entrypoint')
   .option('-c, --configuration <file>')

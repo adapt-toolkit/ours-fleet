@@ -1,7 +1,7 @@
 export type MissingRequirement = { field: string; why: string; fix: string };
 
 export type TopologyNode = {
-  id: string; kind: 'agent' | 'watchdog' | 'loop'; label: string; status: string;
+  id: string; kind: 'role' | 'brain' | 'agent' | 'watchdog' | 'loop'; label: string; status: string;
   lifetime?: string; href?: string; detail?: string;
   /** Present once the server serves the merged draft/config model. */
   origin?: 'draft' | 'config';
@@ -14,7 +14,7 @@ export type TopologyNode = {
   fields?: Record<string, string | number | boolean>;
 };
 export type TopologyEdge = {
-  id: string; kind: 'oversees' | 'watches' | 'targets' | 'spawned';
+  id: string; kind: 'performs' | 'uses' | 'oversees' | 'watches' | 'targets' | 'spawned';
   from: string; to: string; label: string;
   origin?: 'draft' | 'config';
   implicit?: boolean;
@@ -59,6 +59,8 @@ export const canPromote = (node: TopologyNode): boolean =>
   node.origin === 'draft' && node.complete === true && node.valid !== false;
 
 export const EDGE_LEGEND: Array<{ kind: TopologyEdge['kind']; label: string; description: string }> = [
+  { kind: 'performs', label: 'Role binding', description: 'This Agent performs an inert Role definition.' },
+  { kind: 'uses', label: 'Brain binding', description: 'This Agent uses this Brain runtime definition.' },
   { kind: 'oversees', label: 'Oversight', description: 'A coordinator is responsible for checking this agent.' },
   { kind: 'watches', label: 'Watchdog', description: 'A watchdog checks this agent on its configured interval.' },
   { kind: 'targets', label: 'Scheduled loop', description: 'A scheduled loop sends recurring work to this agent.' },
@@ -75,6 +77,7 @@ export function describeEdge(edge: TopologyEdge, nodeId?: string): string {
 export interface PositionedNode extends TopologyNode { x: number; y: number }
 
 export function layoutTopology(topology: Topology): { nodes: PositionedNode[]; height: number } {
+  const definitions = topology.nodes.filter(node => node.kind === 'role' || node.kind === 'brain');
   const agents = topology.nodes.filter(node => node.kind === 'agent');
   const watchdogs = topology.nodes.filter(node => node.kind === 'watchdog');
   const loops = topology.nodes.filter(node => node.kind === 'loop');
@@ -95,12 +98,12 @@ export function layoutTopology(topology: Topology): { nodes: PositionedNode[]; h
   for (const root of agents.filter(node => !spawned.has(node.id))) visit(root);
   // A corrupt/cyclic provenance chain cannot hide a node from the fallback.
   for (const node of agents) visit(node);
-  const rows = Math.max(orderedAgents.length, watchdogs.length, loops.length, 1);
+  const rows = Math.max(orderedAgents.length, watchdogs.length, loops.length, definitions.length, 1);
   const height = Math.max(360, rows * 112 + 70);
   const place = (values: TopologyNode[], x: number): PositionedNode[] => values.map((node, index) => ({
     ...node, x, y: 62 + index * ((height - 110) / Math.max(values.length, 1)),
   }));
-  return { nodes: [...place(watchdogs, 80), ...place(orderedAgents, 410), ...place(loops, 750)], height };
+  return { nodes: [...place([...definitions, ...watchdogs], 80), ...place(orderedAgents, 410), ...place(loops, 750)], height };
 }
 
 /**

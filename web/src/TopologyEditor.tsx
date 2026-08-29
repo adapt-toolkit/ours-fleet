@@ -107,7 +107,9 @@ export function TopologyEditor({ topology, onRefresh, onOpenAgent, onOpenWatchdo
   const nodes = topology.nodes;
   const takenIds = useMemo(() => nodes.map(node => node.id), [nodes]);
   const context = useMemo(() => ({
-    kinds: new Map(nodes.map(node => [node.id, node.kind])),
+    kinds: new Map(nodes.filter((node): node is TopologyNode & { kind: NodeKind } =>
+      node.kind === 'agent' || node.kind === 'watchdog' || node.kind === 'loop')
+      .map(node => [node.id, node.kind])),
     draftIds: new Set(nodes.filter(node => node.origin === 'draft').map(node => node.id)),
   }), [nodes]);
   const byId = useMemo(() => new Map(nodes.map(node => [node.id, node])), [nodes]);
@@ -396,7 +398,7 @@ function Inspector({
         onBlur={event => { if (event.target.value !== node.label) onRename(event.target.value); }} />
     </label>}
 
-    {isDraft && FIELDS[node.kind].map(field => <label key={field.key}>{field.label}
+    {isDraft && FIELDS[node.kind as NodeKind].map(field => <label key={field.key}>{field.label}
       {field.long
         ? <textarea defaultValue={String(fields[field.key] ?? '')} disabled={!writable}
           onBlur={event => onField(field.key, event.target.value)} />

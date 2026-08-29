@@ -14,8 +14,12 @@ import {
 import type { CoworkAdapter } from './cowork-adapter.js';
 import {
   advanceMemberRetirement, advanceRoomClose, beginRoomClose, closeRoom,
-  deleteRoomRecord, getRoomRecord, listRoomRecords, setRoomCloseError,
+  acknowledgeRoomEffectReceipt, deleteRoomRecord, getRoomEffectReceipt,
+  completeRoomDeletionTombstone, getAuthenticatedRoomDeletionTombstone, getRoomRecord,
+  getRoomRecoveryReceipt, listRoomRecords,
+  publishRoomDeletionTombstoneAndUnlink, setRoomCloseError,
 } from './room-state.js';
+import type { RoomEffectContext } from './room-state.js';
 import type { RoomMemberSeat, RoomOrchestrationRecord } from './types.js';
 
 const CLOSE_LOCK_STALE_MS = 5 * 60_000;
@@ -219,13 +223,26 @@ async function retireMember(
 }
 
 /** One forward-only room close saga shared by every Fleet entry point. */
-export function acceptManagedRoomClose(roomId: string): Promise<RoomOrchestrationRecord> {
+export function acceptManagedRoomClose(roomId: string, effect?: RoomEffectContext): Promise<RoomOrchestrationRecord> {
   return withFileLock(
     roomCloseLockPath(roomId),
-    () => beginRoomClose(roomId),
+    () => beginRoomClose(roomId, effect),
     {},
     CLOSE_LOCK_STALE_MS,
   );
+}
+
+export function getManagedRoomCloseReceipt(roomId: string, keyHash: string) {
+  return withFileLock(roomCloseLockPath(roomId), () => getRoomEffectReceipt(roomId, keyHash), {},
+    CLOSE_LOCK_STALE_MS);
+}
+
+export function acknowledgeManagedRoomCloseReceipt(roomId: string, keyHash: string,
+  hooks: { beforeState?(): void | Promise<void> } = {}): Promise<void> {
+  return withFileLock(roomCloseLockPath(roomId), async () => {
+    await hooks.beforeState?.(); acknowledgeRoomEffectReceipt(roomId, keyHash);
+  }, {},
+    CLOSE_LOCK_STALE_MS);
 }
 
 export function recordManagedRoomCloseError(
@@ -313,4 +330,35 @@ export async function deleteManagedRoom(input: {
   }
   deleteRoomRecord(input.roomId);
   return { room_id: input.roomId, deleted: true };
+}
+
+/** Receipt-selected close worker. The caller must already have a completed acceptance journal. */
+export async function settleManagedRoomRecovery(input: {
+  roomId: string; keyHash: string; principalHash: string; requestHash: string;
+  cowork: Pick<CoworkAdapter, 'closeRoom'|'deleteRoom'>; deps?: RoomCloseDeps;
+  recoveryHooks?: { afterCoworkDelete?(): void; afterTombstonePublication?(): void;
+    afterRoomUnlink?(): void; afterDirectorySync?(): void };
+}): Promise<{ room_id: string; deleted: true }> {
+  const deps = input.deps ?? {};
+  return withFileLock(roomCloseLockPath(input.roomId), async () => {
+    const retained = getAuthenticatedRoomDeletionTombstone(input.roomId, input.keyHash, input);
+    if (retained) {
+      if (retained.phase === 'local_delete_pending') {
+        publishRoomDeletionTombstoneAndUnlink(input.roomId, input.keyHash);
+        completeRoomDeletionTombstone(input.roomId, input.keyHash);
+      }
+      return { room_id: input.roomId, deleted: true };
+    }
+    const receipt = getRoomRecoveryReceipt(input.roomId, input.keyHash);
+    if (!receipt || receipt.cursor.kind !== 'close' || receipt.workerStatus !== 'pending'
+        || receipt.principalHash !== input.principalHash || receipt.requestHash !== input.requestHash)
+      throw new Error('room recovery close worker is unavailable');
+    await closeManagedRoom({ roomId: input.roomId, cowork: input.cowork,
+      deps: { ...deps, lock: async (_path, work) => work() } });
+    await input.cowork.deleteRoom(input.roomId);
+    input.recoveryHooks?.afterCoworkDelete?.();
+    publishRoomDeletionTombstoneAndUnlink(input.roomId, input.keyHash, input.recoveryHooks);
+    completeRoomDeletionTombstone(input.roomId, input.keyHash);
+    return { room_id: input.roomId, deleted: true };
+  }, {}, CLOSE_LOCK_STALE_MS);
 }

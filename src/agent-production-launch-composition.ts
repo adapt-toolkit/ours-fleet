@@ -1,5 +1,7 @@
-import { createProductionAgentCreationCompositionRoot,
+import { createControlledProductionAgentCreationCompositionRoot,
+  createProductionAgentCreationCompositionRoot,
   type ProductionAgentCreationDeps } from './agent-creation-composition-root.js';
+import type { AgentSupervisorControlAuthority } from './agent-supervisor-control.js';
 import { AgentLaunchCompositionRoot, type TempAgentBrainLauncher } from './agent-launch-composition-root.js';
 import { ProductionBrainAuthority } from './agent-production-brain-authority.js';
 import { ProductionAgentRuntimeReconciliationAuthority } from './agent-runtime-reconciliation.js';
@@ -146,10 +148,20 @@ export type ProductionAgentLaunchCompositionDeps = Omit<ProductionAgentCreationD
 
 /** One non-live library assembly owns creation and launch policy/evidence identity. */
 export function createProductionAgentLaunchComposition(deps: ProductionAgentLaunchCompositionDeps) {
+  return assembleProductionAgentLaunch(deps);
+}
+/** Internal management assembly; deliberately not re-exported by the package entry point. */
+export function createControlledProductionAgentLaunchComposition(deps: ProductionAgentLaunchCompositionDeps,
+  control: AgentSupervisorControlAuthority) {
+  return assembleProductionAgentLaunch(deps, control);
+}
+function assembleProductionAgentLaunch(deps: ProductionAgentLaunchCompositionDeps,
+  control?: AgentSupervisorControlAuthority) {
   const brains = new ProductionBrainAuthority();
   const contexts = new AgentRuntimeLaunchContextAuthority();
-  const creation = createProductionAgentCreationCompositionRoot({ ...deps, policies: brains,
-    adapterAuthority: brains });
+  const creationDeps = { ...deps, policies: brains, adapterAuthority: brains };
+  const creation = control ? createControlledProductionAgentCreationCompositionRoot(creationDeps, control)
+    : createProductionAgentCreationCompositionRoot(creationDeps);
   const reconciliation = new ProductionAgentRuntimeReconciliationAuthority();
   const driverFactory = (prepared: Parameters<typeof createAcpBodyBrainDriver>[0] | unknown,
     bindings: Parameters<typeof createAcpBodyBrainDriver>[1], canonicalDir: string, envelope: unknown,

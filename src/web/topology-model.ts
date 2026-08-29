@@ -6,6 +6,7 @@ import {
 import type {
   DraftFieldValue, DraftNode, DraftPosition, TopologyDraftRead,
 } from './topology-draft-store.js';
+import type { ConfigResourceSnapshot } from '../config-resource-loader.js';
 
 /**
  * The console's read model: authoritative configuration overlaid with the
@@ -96,8 +97,9 @@ export function mergeTopology(
   config: FleetConfig,
   roles: RuntimeRoleItem[],
   draft: TopologyDraftRead,
+  resources?: ConfigResourceSnapshot,
 ): MergedTopology {
-  const snapshot = deriveTopology(config, roles);
+  const snapshot = deriveTopology(config, roles, resources);
   const problems: Problem[] = draft.problem ? [draft.problem] : [];
 
   const configIds = new Set(snapshot.nodes.map(node => node.id));
@@ -163,12 +165,13 @@ function configNode(node: TopologyNode, config: FleetConfig): MergedTopologyNode
     if (role && !nonBlank(role.mission)) missing.push(AGENT_MISSION);
   } else if (node.kind === 'watchdog') {
     enabled = config.watchdogs.find(candidate => candidate.name === name)?.enabled;
-  } else {
+  } else if (node.kind === 'loop') {
     enabled = config.loops.find(candidate => candidate.name === name)?.enabled;
   }
 
   const complete = missing.length === 0;
-  return { ...node, origin: 'config', valid: true, complete, launchable: complete, missing, enabled };
+  return { ...node, origin: 'config', valid: true, complete,
+    launchable: node.kind !== 'role' && node.kind !== 'brain' && complete, missing, enabled };
 }
 
 /* ------------------------------------------------------------------ *

@@ -2,8 +2,13 @@ import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { createAgentProductionRuntime } from '../src/agent-production-runtime.js';
+import { createAgentProductionRuntime, createControlledAgentProductionRuntime,
+  prepareManagedPersistentResource, resumeManagedPersistentResource,
+  retireManagedPersistentResource, reconfigureManagedPersistentResource } from '../src/agent-production-runtime.js';
 import type { ResolvedRole } from '../src/config.js';
+import { AgentSupervisorControlAuthority } from '../src/agent-supervisor-control.js';
+import { loadConfigResourceSnapshotFromDocuments } from '../src/config-resource-loader.js';
+import { readAgentSupervisorHandoff } from '../src/agent-supervisor-handoff.js';
 
 const roots: string[] = [];
 afterEach(() => roots.splice(0).forEach(root => rmSync(root, { recursive: true, force: true })));
@@ -14,6 +19,43 @@ const role = (name: string): ResolvedRole => ({ name, harness: 'codex', session:
     inject: 'notification', interrupt: false } });
 
 describe('Agent production runtime facade', () => {
+  it('publishes a typed Agent under the continuously held exact control capability', async () => {
+    const trustedStateRoot = mkdtempSync(join(tmpdir(), 'agent-product-')); roots.push(trustedStateRoot);
+    const control = new AgentSupervisorControlAuthority(trustedStateRoot); let present = false;
+    const runtime = createControlledAgentProductionRuntime({ trustedStateRoot,
+      identityProvisioner: { inspect: async name => present
+        ? { state: 'present' as const, cid: name.repeat(64).slice(0, 64) } : { state: 'absent' as const },
+      exists: async () => present, create: async name => { present = true;
+        return { state: 'created_here' as const, cid: name.repeat(64).slice(0, 64) }; } }, now: () => 1 }, control);
+    const snapshot = loadConfigResourceSnapshotFromDocuments({ bootstrapFile: '/typed/fleet.yaml',
+      configDir: '/typed/fleet.conf.d', bootstrapBytes: Buffer.from('schema_version: 2\nconfig_dir: fleet.conf.d\npolicy: {}\n'),
+      documents: [
+        { relativePath: 'roles.d/writer.yaml', bytes: Buffer.from('kind: Role\nversion: 1\nid: writer\nspec:\n  mission: Write\n') },
+        { relativePath: 'brains.d/codex.yaml', bytes: Buffer.from('kind: Brain\nversion: 1\nid: codex\nspec:\n  harness: codex\n  model: gpt-5\n  effort: medium\n  session: acp\n') },
+        { relativePath: 'agents.d/alice.yaml', bytes: Buffer.from('kind: Agent\nversion: 1\nid: alice\nspec:\n  role: writer\n  brain:\n    template: codex\n  identity:\n    name: alice\n    ownership: create_persistent\n  lifecycle: persistent\n  permissions:\n    approval: ask\n    filesystem: workspace\n    unattended: deny\n') },
+      ] });
+    await control.exclusive('alice', async lease => {
+      await expect(prepareManagedPersistentResource(runtime, { snapshot, agentId: 'alice', actionId: 'start-1',
+        controlLease: lease })).resolves.toMatchObject({ state: 'complete' });
+      await expect(prepareManagedPersistentResource(runtime, { snapshot, agentId: 'alice', actionId: 'start-1',
+        controlLease: lease })).rejects.toThrow();
+    });
+    await control.exclusive('other', lease => expect(resumeManagedPersistentResource(runtime, { agentId: 'alice',
+      actionId: 'start-1', controlLease: lease })).rejects.toThrow(/invalid_context/u));
+    await control.exclusive('alice', lease => expect(reconfigureManagedPersistentResource(runtime,
+      { snapshot, agentId: 'alice', actionId: 'reconfigure-1', controlLease: lease }))
+      .resolves.toMatchObject({ state: 'complete' }));
+    const active = readAgentSupervisorHandoff(trustedStateRoot, 'alice');
+    expect(active).toMatchObject({ generation: 2, actionId: 'reconfigure-1' });
+    await control.exclusive('alice', async lease => {
+      expect(control.bind(lease, { agentId: 'alice', operation: 'retire',
+        priorGeneration: active.generation, targetGeneration: active.generation, actionId: 'retire-1',
+        planDigest: active.planDigest, snapshotDigest: active.snapshotDigest,
+        rootId: 'production-agent-creation', publisherId: 'agent-supervisor-handoff' })).toBe(true);
+      await retireManagedPersistentResource(runtime, { active, actionId: 'retire-1', controlLease: lease });
+    });
+    expect(() => readAgentSupervisorHandoff(trustedStateRoot, 'alice')).toThrow();
+  });
   it('creates permanent and temporary product Agents without exposing internal authorities', async () => {
     const trustedStateRoot = mkdtempSync(join(tmpdir(), 'agent-product-')); roots.push(trustedStateRoot);
     const identities = new Map<string, string>(); const create = vi.fn(async (name: string) => {

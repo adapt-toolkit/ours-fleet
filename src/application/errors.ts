@@ -64,6 +64,16 @@ export function safeLine(input: string, max = 512): string {
 
 export function normalizeError(error: unknown, requestId?: string): FleetError {
   if (error instanceof FleetError) return error;
+  const application = error as { name?: unknown; code?: unknown; message?: unknown;
+    fields?: Record<string, unknown> };
+  if (application?.name === 'TaskRoomApplicationError' && typeof application.code === 'string') {
+    const details: Record<string, string> = { reason: application.code };
+    for (const [key, value] of Object.entries(application.fields ?? {}))
+      if (typeof value === 'string' || typeof value === 'number' || typeof value === 'boolean')
+        details[key] = String(value);
+    return new FleetError('invalid_request', typeof application.message === 'string'
+      ? application.message : application.code, { requestId, details });
+  }
   if (error instanceof CreationConflictError)
     return new FleetError('conflict', error.message, { requestId, retryable: true });
   if (error instanceof SessionControlError) {

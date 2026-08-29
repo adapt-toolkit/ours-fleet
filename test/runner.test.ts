@@ -13,6 +13,7 @@ import {
   RESTART_FAIL_THRESHOLD, RUN_MARKER_FILE,
   TEMP_IDENTITY_CLOSE_DEBOUNCE_MS, TEMP_IDENTITY_POLL_MS,
   isRecoverableTempStartupCancellation, managedFleetProxyEnv,
+  loadTypedPersistentAgent,
   type AttemptResult, type RunnerDeps,
 } from '../src/runner.js';
 import {
@@ -32,6 +33,7 @@ import {
 import { prepareTempSupervisor } from '../src/temp-lifecycle.js';
 import type { ResolvedRole } from '../src/config.js';
 import { AcpSession } from '../src/session/acp.js';
+import { createAgentProductionRuntime } from '../src/agent-production-runtime.js';
 
 let dir: string;
 beforeEach(() => {
@@ -42,6 +44,33 @@ beforeEach(() => {
 afterEach(() => {
   delete process.env.OURS_FLEET_HOME;
   rmSync(dir, { recursive: true, force: true });
+});
+
+describe('typed persistent Agent runner admission', () => {
+  it('boots its exact AgentPlan binding without a legacy fleet.yaml Role', async () => {
+    let present = false;
+    const runtime = createAgentProductionRuntime({ trustedStateRoot: stateRoot(), identityProvisioner: {
+      inspect: async name => present ? { state: 'present' as const, cid: name.repeat(64).slice(0, 64) }
+        : { state: 'absent' as const }, exists: async () => present,
+      create: async name => { present = true; return { state: 'created_here' as const,
+        cid: name.repeat(64).slice(0, 64) }; },
+    }, now: () => 1 });
+    await runtime.createRole({ role: { name: 'Typed', harness: 'codex', session: 'acp', identity: 'Typed',
+      model: 'gpt-5', mission: 'Typed mission', sourceFile: 'admission', permissionsDeclared: true,
+      permissions: { approval: 'ask', filesystem: 'workspace', unattended: 'deny' },
+      monitor: { mode: 'native', enabled: false, wake_sources: [], batch_ms: 0,
+        inject: 'notification', interrupt: false } }, lifetime: 'persistent', actionId: 'typed-1' });
+    expect(existsSync(join(dir, 'fleet.yaml'))).toBe(false);
+    expect(loadTypedPersistentAgent('Typed')).toMatchObject({ generation: 1,
+      role: { name: 'Typed', harness: 'codex', session: 'acp', mission: 'Typed mission' } });
+  });
+
+  it('rejects a corrupt active artifact without falling back to Role lookup', () => {
+    const root = join(stateRoot(), 'agents', Buffer.from('Typed').toString('base64url'));
+    mkdirSync(root, { recursive: true, mode: 0o700 });
+    writeFileSync(join(root, 'active.json'), '{}\n', { mode: 0o600 });
+    expect(() => loadTypedPersistentAgent('Typed')).toThrow(/invalid_handoff/u);
+  });
 });
 
 /** Records the monitor lifecycle the runner drives, and proves prime happens

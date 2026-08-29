@@ -32,16 +32,7 @@ exports[`task/room JSON presentation contract > pins every room --json serialize
           return;
         }",
   "if (opts.json) {
-            console.log(JSON.stringify({
-              schema_version: 1, room: null, orchestration: null,
-              recovery_actions: [settled.timedOut
-                ? \`Deletion remains pending — retry room delete \${id} \${id}\`
-                : 'Deletion completed successfully'],
-            }, null, 2));
-            return;
-          }",
-  "if (opts.json) {
-          console.log(JSON.stringify({ schema_version: 1, room: cowork, orchestration: r ?? null, recovery_actions: actions }, null, 2));
+          console.log(JSON.stringify({ schema_version: 1, recovery: recovered }, null, 2));
           return;
         }",
   "if (opts.json) {
@@ -59,7 +50,7 @@ exports[`task/room JSON presentation contract > pins every task --json serialize
         }",
   "if (opts.json) {
           console.log(JSON.stringify(opts.groupByList
-            ? { schema_version: 1, groups: service.groupedTasks(filter) }
+            ? { schema_version: 1, groups: value }
             : { schema_version: 1, tasks }, null, 2));
           return;
         }",
