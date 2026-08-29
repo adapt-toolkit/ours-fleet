@@ -1,0 +1,7 @@
+kind: Role
+version: 1
+id: Developer
+display_name: Developer
+spec:
+  mission: Implement approved changes and verify them with focused evidence.
+  capabilities: [implementation, testing]

@@ -1,0 +1,23 @@
+kind: RoomTemplate
+version: 1
+id: team
+display_name: Delivery team
+spec:
+  version: 1
+  description: Architect, Developer, and Tester deliver a task through independent stages.
+  members:
+    - slot: architect
+      role: Architect
+      count: 1
+      brain: {template: claude-opus}
+      permissions: {approval: ask, filesystem: workspace, unattended: wait}
+    - slot: developer
+      role: Developer
+      count: 1
+      brain: {template: gpt-sol}
+      permissions: {approval: ask, filesystem: workspace, unattended: wait}
+    - slot: tester
+      role: Tester
+      count: 1
+      brain: {template: claude-fable}
+      permissions: {approval: ask, filesystem: workspace, unattended: wait}

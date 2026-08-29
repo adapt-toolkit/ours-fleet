@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeAll, beforeEach, afterEach } from 'vitest';
-import { existsSync, mkdirSync, mkdtempSync, rmSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, renameSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { spawn } from 'node:child_process';
 import { once } from 'node:events';
 import { tmpdir } from 'node:os';
@@ -22,8 +22,140 @@ afterEach(() => rmSync(dir, { recursive: true, force: true }));
 
 const run = (args: string[]) =>
   realExec('node', [CLI, ...args], { env: { ...process.env, OURS_FLEET_HOME: dir } });
+const runWithFault = (home: string, fault: string) => realExec('node', [CLI, 'init', '--config-only'], {
+  env: { ...process.env, OURS_FLEET_HOME: home, OURS_FLEET_INIT_FAULT: fault },
+});
 
 describe('ours-fleet CLI', () => {
+  it('init installs the exact private schema-v2 graph and repeats as a no-op', async () => {
+    const first = await run(['init', '--config-only']);
+    expect(first).toMatchObject({ code: 0, stderr: '' });
+    expect(first.stdout).toContain('installed private schema-v2 configuration');
+    const bootstrap = readFileSync(join(dir, 'fleet.yaml'), 'utf8');
+    expect(bootstrap).toContain('schema_version: 2');
+    const selected = bootstrap.match(/^config_dir: (.+)$/mu)?.[1];
+    expect(selected).toMatch(/^\.fleet\.conf\.d-/u);
+    expect(existsSync(join(dir, selected!, 'room-templates.d', 'team.yaml'))).toBe(true);
+    expect(existsSync(join(dir, selected!, 'rooms.d'))).toBe(false);
+    const second = await run(['init', '--config-only']);
+    expect(second).toMatchObject({ code: 0, stderr: '' });
+    expect(second.stdout).toContain('already matches');
+  });
+
+  it('init refuses differing, partial, and symlinked targets before adding files', async () => {
+    writeFileSync(join(dir, 'fleet.yaml'), 'operator-owned: true\n', { mode: 0o600 });
+    const partial = await run(['init', '--config-only']);
+    expect(partial.code).toBe(1);
+    expect(partial.stderr).toContain('does not select');
+    expect(readFileSync(join(dir, 'fleet.yaml'), 'utf8')).toBe('operator-owned: true\n');
+    expect(existsSync(join(dir, 'fleet.conf.d'))).toBe(false);
+
+    rmSync(join(dir, 'fleet.yaml'));
+    const target = join(dir, 'operator.yaml'); writeFileSync(target, 'owned\n');
+    symlinkSync(target, join(dir, 'fleet.yaml')); mkdirSync(join(dir, 'fleet.conf.d'), { mode: 0o700 });
+    const linked = await run(['init', '--config-only']);
+    expect(linked.code).toBe(1);
+    expect(linked.stderr).toMatch(/non-symlink|partial/u);
+    expect(readFileSync(target, 'utf8')).toBe('owned\n');
+  });
+
+  it('init rejects a configuration home beneath a symlinked parent before creating artifacts', async () => {
+    const actual = join(dir, 'actual'); mkdirSync(actual, { mode: 0o700 });
+    const linkedParent = join(dir, 'linked'); symlinkSync(actual, linkedParent);
+    const selectedHome = join(linkedParent, 'home');
+    const result = await realExec('node', [CLI, 'init', '--config-only'], {
+      env: { ...process.env, OURS_FLEET_HOME: selectedHome },
+    });
+    expect(result.code).toBe(1);
+    expect(result.stderr).toContain('must not contain symlink components');
+    expect(existsSync(join(actual, 'home', 'fleet.yaml'))).toBe(false);
+    expect(existsSync(join(actual, 'home'))).toBe(false);
+  });
+
+  it('init retries every fsync and link crash boundary without deleting unreachable artifacts', async () => {
+    const points = [
+      ...Array.from({ length: 21 }, (_, index) => [`before-fsync:${index}`, `after-fsync:${index}`]).flat(),
+      'before-link', 'after-link',
+    ];
+    for (const [index, point] of points.entries()) {
+      const home = join(dir, `fault-${index}`); mkdirSync(home, { mode: 0o700 });
+      const sentinel = join(home, 'operator.keep'); writeFileSync(sentinel, point, { mode: 0o600 });
+      const failed = await runWithFault(home, point);
+      expect(failed.code, point).toBe(1);
+      expect(readFileSync(sentinel, 'utf8'), point).toBe(point);
+      const artifactsBefore = readdirSync(home).filter(name => name.startsWith('.fleet.conf.d-'));
+      expect(artifactsBefore.length, point).toBeGreaterThanOrEqual(1);
+      const retry = await realExec('node', [CLI, 'init', '--config-only'], {
+        env: { ...process.env, OURS_FLEET_HOME: home },
+      });
+      expect(retry.code, point).toBe(0);
+      expect(readFileSync(sentinel, 'utf8'), point).toBe(point);
+      for (const artifact of artifactsBefore) expect(existsSync(join(home, artifact)), point).toBe(true);
+    }
+  }, 120_000);
+
+  it('concurrent init has one exact winner and an unchanged loser without deleting either artifact', async () => {
+    const concurrent = () => realExec('node', [CLI, 'init', '--config-only'], {
+      env: { ...process.env, OURS_FLEET_HOME: dir, OURS_FLEET_INIT_FAULT: 'pause-before-link:500' },
+    });
+    const [a, b] = await Promise.all([concurrent(), concurrent()]);
+    expect([a.code, b.code]).toEqual([0, 0]);
+    expect([a.stdout, b.stdout].join('\n')).toContain('installed private schema-v2 configuration');
+    expect([a.stdout, b.stdout].join('\n')).toContain('already matches');
+    expect(readdirSync(dir).filter(name => name.startsWith('.fleet.conf.d-')).length).toBe(2);
+  });
+
+  it('init rejects differing complete graphs, extras, unsafe modes, and selected-dir symlinks', async () => {
+    const cases: Array<[string, (home: string, selected: string) => void]> = [
+      ['different bytes', (home, selected) => writeFileSync(join(home, selected, 'roles.d', 'agent.yaml'), 'owned\n')],
+      ['extra entry', (home, selected) => writeFileSync(join(home, selected, 'roles.d', 'extra.txt'), 'owned\n')],
+      ['file mode', (home, selected) => chmodSync(join(home, selected, 'roles.d', 'agent.yaml'), 0o644)],
+      ['directory mode', (home, selected) => chmodSync(join(home, selected, 'roles.d'), 0o755)],
+      ['selected-dir symlink', (home, selected) => {
+        const moved = join(home, `${selected}-operator`); renameSync(join(home, selected), moved);
+        symlinkSync(moved, join(home, selected));
+      }],
+    ];
+    for (const [name, mutate] of cases) {
+      const home = join(dir, name.replaceAll(' ', '-')); mkdirSync(home, { mode: 0o700 });
+      const created = await realExec('node', [CLI, 'init', '--config-only'], {
+        env: { ...process.env, OURS_FLEET_HOME: home },
+      });
+      expect(created.code, name).toBe(0);
+      const selected = readFileSync(join(home, 'fleet.yaml'), 'utf8').match(/^config_dir: (.+)$/mu)![1];
+      mutate(home, selected);
+      const retry = await realExec('node', [CLI, 'init', '--config-only'], {
+        env: { ...process.env, OURS_FLEET_HOME: home },
+      });
+      expect(retry.code, name).toBe(1);
+    }
+  }, 30_000);
+
+  it('racing nonmatching file, directory, and symlink targets are preserved', async () => {
+    for (const kind of ['file', 'directory', 'symlink'] as const) {
+      const home = join(dir, `race-${kind}`); mkdirSync(home, { mode: 0o700 });
+      const operator = join(home, 'operator-owned'); writeFileSync(operator, 'owned\n', { mode: 0o600 });
+      const ready = join(dir, `ready-${kind}`);
+      const pending = realExec('node', [CLI, 'init', '--config-only'], {
+        env: { ...process.env, OURS_FLEET_HOME: home, OURS_FLEET_INIT_FAULT: 'pause-before-link:1500',
+          OURS_FLEET_INIT_READY_FILE: ready },
+      });
+      for (let attempts = 0; !existsSync(ready) && attempts < 100; attempts++)
+        await new Promise(resolveDelay => setTimeout(resolveDelay, 25));
+      expect(existsSync(ready), kind).toBe(true);
+      const target = join(home, 'fleet.yaml');
+      if (kind === 'file') writeFileSync(target, 'operator: true\n', { mode: 0o600 });
+      else if (kind === 'directory') mkdirSync(target, { mode: 0o700 });
+      else symlinkSync(operator, target);
+      const result = await pending;
+      expect(result.code, kind).toBe(1);
+      if (kind === 'file') expect(readFileSync(target, 'utf8')).toBe('operator: true\n');
+      else if (kind === 'directory') expect(readdirSync(target)).toEqual([]);
+      else expect(readFileSync(target, 'utf8')).toBe('owned\n');
+      expect(readFileSync(operator, 'utf8')).toBe('owned\n');
+      expect(readdirSync(home).some(entry => entry.startsWith('.fleet.conf.d-'))).toBe(true);
+    }
+  }, 15_000);
   it('config --json emits a versioned deterministic plan without env secrets', async () => {
     const file = join(dir, 'fleet.yaml');
     const { writeFileSync } = await import('node:fs');
@@ -69,15 +201,13 @@ describe('ours-fleet CLI', () => {
     expect(strict.stderr).toContain('non-plain YAML');
   });
 
-  it('config prints the merged plan from the example file', async () => {
-    const r = await run(['config', '-c', resolve('examples/fleet.yaml')]);
+  it('resource list loads the schema-v2 example graph', async () => {
+    const r = await run(['resource', 'list', '-c', resolve('examples/fleet.yaml')]);
     expect(r.code).toBe(0);
-    expect(r.stdout).toContain('● FleetCoordinator');
-    expect(r.stdout).toContain('● Alice');
-    expect(r.stdout).toContain('harness:     claude-code');
-    expect(r.stdout).toContain('monitor:     fleet (interrupt=false)');
-    expect(r.stdout).toContain('oversees:    Alice@5m');
-    expect(r.stdout).toContain('source:');
+    expect(r.stdout).toContain('Architect');
+    expect(r.stdout).toContain('claude-fable');
+    expect(r.stdout).toContain('RoomTemplate');
+    expect(r.stderr).toBe('');
   });
 
   it('--help lists the important commands', async () => {
@@ -160,6 +290,10 @@ describe('ours-fleet CLI', () => {
   });
 
   it('docs and man print the AI-friendly configuration reference', async () => {
+    const quickstart = readFileSync(resolve('README.md'), 'utf8');
+    expect(quickstart).toContain('Before launching rooms, inspect\n`config_dir` in `~/fleet.yaml`');
+    expect(quickstart).not.toContain('~/fleet.conf.d/rooms.d/default.yaml');
+    expect(quickstart).not.toContain('Before launching rooms, create\nInspect');
     for (const command of ['docs', 'man']) {
       const r = await run([command]);
       expect(r.code).toBe(0);

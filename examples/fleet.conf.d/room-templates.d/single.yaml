@@ -1,0 +1,13 @@
+kind: RoomTemplate
+version: 1
+id: single
+display_name: Single agent
+spec:
+  version: 1
+  description: One general agent works with owner oversight.
+  members:
+    - slot: agent
+      role: Agent
+      count: 1
+      brain: {template: gpt-sol}
+      permissions: {approval: ask, filesystem: workspace, unattended: wait}

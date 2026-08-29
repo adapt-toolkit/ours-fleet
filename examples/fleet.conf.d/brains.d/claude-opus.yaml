@@ -1,0 +1,9 @@
+kind: Brain
+version: 1
+id: claude-opus
+display_name: Claude Opus
+spec:
+  harness: claude-code
+  model: claude-opus-5
+  effort: high
+  session: acp

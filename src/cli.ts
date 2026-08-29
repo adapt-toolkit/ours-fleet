@@ -1,15 +1,19 @@
 #!/usr/bin/env node
 import { spawn as spawnChild } from 'node:child_process';
-import { existsSync, mkdirSync, readFileSync, readdirSync, statSync } from 'node:fs';
-import { realpathSync } from 'node:fs';
-import { join as joinPath, resolve as resolvePath } from 'node:path';
+import {
+  chmodSync, closeSync, constants, existsSync, fsyncSync, lstatSync, mkdirSync,
+  linkSync, mkdtempSync, openSync, readFileSync, readdirSync, realpathSync, rmSync,
+  statSync, writeFileSync,
+} from 'node:fs';
+import { dirname, join as joinPath, relative, resolve as resolvePath } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { createInterface } from 'node:readline';
 import { Command } from 'commander';
 import { VERSION } from './version.js';
 import {
   analyzeInstalls, buildInfo, buildLabel, discoverInstalls, runningLabel,
 } from './provenance.js';
-import { agentDir, agentsRoot, tmpRoot, logsRoot, deriveXdgRuntimeDir, stateRoot, defaultConfigPath } from './paths.js';
+import { agentDir, agentsRoot, tmpRoot, logsRoot, deriveXdgRuntimeDir, stateRoot, defaultConfigPath, home } from './paths.js';
 import { findRole, loadConfig, ROLE_NAME_RE } from './config.js';
 import type { YamlMode } from './config-yaml.js';
 import { formatDuration } from './duration.js';
@@ -108,6 +112,180 @@ const passthrough = (cmd: string, args: string[]) =>
     const c = spawnChild(cmd, args, { stdio: 'inherit' });
     c.on('exit', code => resolve(code ?? 1));
   });
+
+const DEFAULT_CONFIG_FILES = Object.freeze([
+  'fleet.yaml',
+  'fleet.conf.d/roles.d/architect.yaml',
+  'fleet.conf.d/roles.d/developer.yaml',
+  'fleet.conf.d/roles.d/tester.yaml',
+  'fleet.conf.d/roles.d/secretary.yaml',
+  'fleet.conf.d/roles.d/critic.yaml',
+  'fleet.conf.d/roles.d/agent.yaml',
+  'fleet.conf.d/brains.d/claude-fable.yaml',
+  'fleet.conf.d/brains.d/claude-opus.yaml',
+  'fleet.conf.d/brains.d/gpt-sol.yaml',
+  'fleet.conf.d/brains.d/gpt-terra.yaml',
+  'fleet.conf.d/room-templates.d/single.yaml',
+  'fleet.conf.d/room-templates.d/pair.yaml',
+  'fleet.conf.d/room-templates.d/team.yaml',
+  'fleet.conf.d/tasks.d/default.yaml',
+] as const);
+
+const defaultExamplesRoot = () => resolvePath(dirname(fileURLToPath(import.meta.url)), '..', 'examples');
+
+let initFsyncIndex = 0;
+function initFaultPoint(point: string): void {
+  const selected = process.env.OURS_FLEET_INIT_FAULT;
+  if (point === 'before-link' && selected?.startsWith('pause-before-link:')) {
+    const readyFile = process.env.OURS_FLEET_INIT_READY_FILE;
+    if (readyFile) writeFileSync(readyFile, 'ready\n', { flag: 'wx', mode: 0o600 });
+    const milliseconds = Number(selected.slice('pause-before-link:'.length));
+    if (Number.isSafeInteger(milliseconds) && milliseconds > 0 && milliseconds <= 5_000)
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, milliseconds);
+  }
+  if (selected === point) throw new Error(`injected init fault at ${point}`);
+}
+
+function initFsync(fd: number): void {
+  const index = initFsyncIndex++;
+  initFaultPoint(`before-fsync:${index}`); fsyncSync(fd); initFaultPoint(`after-fsync:${index}`);
+}
+
+function fsyncDir(path: string): void {
+  const fd = openSync(path, constants.O_RDONLY | (constants.O_DIRECTORY ?? 0));
+  try { initFsync(fd); } finally { closeSync(fd); }
+}
+
+function privateWrite(path: string, contents: Buffer): void {
+  mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
+  const fd = openSync(path, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL, 0o600);
+  try { writeFileSync(fd, contents); initFsync(fd); } finally { closeSync(fd); }
+  chmodSync(path, 0o600);
+}
+
+function expectedDefaultConfig(): Map<string, Buffer> {
+  const root = defaultExamplesRoot();
+  return new Map(DEFAULT_CONFIG_FILES.map(name => {
+    const source = resolvePath(root, name);
+    if (relative(root, source).startsWith('..')) throw new FleetError('internal', 'default configuration path escaped examples root');
+    const stat = lstatSync(source);
+    if (!stat.isFile() || stat.isSymbolicLink())
+      throw new FleetError('internal', `packaged default is not a regular file: ${name}`);
+    return [name, readFileSync(source)] as const;
+  }));
+}
+
+function inspectDefaultTree(root: string): { files: Set<string>; dirs: Set<string> } {
+  const files = new Set<string>(); const dirs = new Set<string>();
+  const visit = (directory: string): void => {
+    const dirStat = lstatSync(directory);
+    if (!dirStat.isDirectory() || dirStat.isSymbolicLink() || (dirStat.mode & 0o777) !== 0o700)
+      throw new FleetError('conflict', `${directory}: default configuration directories must be private non-symlink directories (0700)`);
+    if (directory !== root) dirs.add(relative(root, directory));
+    for (const entry of readdirSync(directory, { withFileTypes: true })) {
+      const path = joinPath(directory, entry.name); const name = relative(root, path);
+      if (entry.isSymbolicLink()) throw new FleetError('conflict', `${path}: symlinks are not allowed in the default configuration`);
+      if (entry.isDirectory()) visit(path);
+      else if (entry.isFile()) {
+        const stat = lstatSync(path);
+        if ((stat.mode & 0o777) !== 0o600)
+          throw new FleetError('conflict', `${path}: default configuration files must have mode 0600`);
+        files.add(name);
+      } else throw new FleetError('conflict', `${path}: unexpected non-file entry in default configuration`);
+    }
+  };
+  visit(root); return { files, dirs };
+}
+
+function installDefaultConfig(): 'created' | 'unchanged' {
+  const expected = expectedDefaultConfig(); const targetHome = resolvePath(home());
+  let existingAncestor = targetHome;
+  while (!existsSync(existingAncestor)) existingAncestor = dirname(existingAncestor);
+  if (realpathSync.native(existingAncestor) !== existingAncestor)
+    throw new FleetError('conflict', `${targetHome}: configuration home path must not contain symlink components`);
+  mkdirSync(targetHome, { recursive: true, mode: 0o700 });
+  if (realpathSync.native(targetHome) !== targetHome)
+    throw new FleetError('conflict', `${targetHome}: configuration home path must not contain symlink components`);
+  const homeBefore = lstatSync(targetHome, { bigint: true });
+  if (!homeBefore.isDirectory() || homeBefore.isSymbolicLink())
+    throw new FleetError('conflict', `${targetHome}: configuration home must be a non-symlink directory`);
+  const bootstrap = joinPath(targetHome, 'fleet.yaml');
+  const verifyPublished = (): boolean => {
+    if (!existsSync(bootstrap)) return false;
+    const bootstrapStat = lstatSync(bootstrap);
+    if (!bootstrapStat.isFile() || bootstrapStat.isSymbolicLink() || (bootstrapStat.mode & 0o777) !== 0o600)
+      throw new FleetError('conflict', `${bootstrap}: must be a private regular non-symlink file (0600)`);
+    const parsed = parse(readFileSync(bootstrap, 'utf8')) as { config_dir?: unknown };
+    if (typeof parsed?.config_dir !== 'string' || !/^\.fleet\.conf\.d-[A-Za-z0-9_-]+$/u.test(parsed.config_dir))
+      throw new FleetError('conflict', `${bootstrap}: does not select a generated private resource directory`);
+    const configDir = joinPath(targetHome, parsed.config_dir);
+    if (dirname(configDir) !== targetHome)
+      throw new FleetError('conflict', `${bootstrap}: generated config_dir escapes the configuration home`);
+    const observed = inspectDefaultTree(configDir);
+    const expectedFiles = new Set([...expected.keys()].filter(name => name !== 'fleet.yaml')
+      .map(name => name.slice('fleet.conf.d/'.length)));
+    expectedFiles.add('.fleet-bootstrap');
+    const expectedDirs = new Set([...expectedFiles].flatMap(name => {
+      const parts = dirname(name).split('/'); const result: string[] = [];
+      for (let i = 1; i <= parts.length; i++) result.push(parts.slice(0, i).join('/'));
+      return result.filter(value => value !== '.');
+    }));
+    if ([...observed.files].sort().join('\0') !== [...expectedFiles].sort().join('\0')
+        || [...observed.dirs].sort().join('\0') !== [...expectedDirs].sort().join('\0'))
+      throw new FleetError('conflict', 'default configuration differs or contains unexpected entries; refusing to overwrite it');
+    for (const [name, contents] of expected) {
+      const path = name === 'fleet.yaml' ? bootstrap
+        : joinPath(configDir, name.slice('fleet.conf.d/'.length));
+      const wanted = name === 'fleet.yaml'
+        ? Buffer.from(contents.toString('utf8').replace('config_dir: fleet.conf.d', `config_dir: ${parsed.config_dir}`))
+        : contents;
+      if (!readFileSync(path).equals(wanted))
+        throw new FleetError('conflict', `${path}: differs from the packaged default; refusing to overwrite it`);
+    }
+    const staged = joinPath(configDir, '.fleet-bootstrap');
+    const stagedStat = lstatSync(staged, { bigint: true }); const publishedStat = lstatSync(bootstrap, { bigint: true });
+    if (!stagedStat.isFile() || stagedStat.dev !== publishedStat.dev || stagedStat.ino !== publishedStat.ino
+        || stagedStat.nlink !== 2n || publishedStat.nlink !== 2n)
+      throw new FleetError('conflict', 'published bootstrap hard-link identity differs from the generated graph');
+    return true;
+  };
+  if (existsSync(bootstrap)) { verifyPublished(); return 'unchanged'; }
+  const configDir = mkdtempSync(joinPath(targetHome, '.fleet.conf.d-')); chmodSync(configDir, 0o700);
+  try {
+    const basename = relative(targetHome, configDir);
+    for (const [name, contents] of expected) {
+      if (name === 'fleet.yaml') continue;
+      privateWrite(joinPath(configDir, name.slice('fleet.conf.d/'.length)), contents);
+    }
+    const bootstrapBytes = expected.get('fleet.yaml')!.toString('utf8')
+      .replace('config_dir: fleet.conf.d', `config_dir: ${basename}`);
+    const staged = joinPath(configDir, '.fleet-bootstrap'); privateWrite(staged, Buffer.from(bootstrapBytes));
+    const directories = new Set<string>([configDir]);
+    for (const name of expected.keys()) if (name !== 'fleet.yaml') {
+      let directory = dirname(joinPath(configDir, name.slice('fleet.conf.d/'.length)));
+      while (directory.startsWith(configDir)) { directories.add(directory); if (directory === configDir) break; directory = dirname(directory); }
+    }
+    for (const directory of [...directories].sort((a, b) => b.length - a.length)) fsyncDir(directory);
+    fsyncDir(targetHome);
+    const homeNow = lstatSync(targetHome, { bigint: true });
+    if (homeNow.dev !== homeBefore.dev || homeNow.ino !== homeBefore.ino)
+      throw new FleetError('conflict', 'configuration home changed during default installation');
+    try { initFaultPoint('before-link'); linkSync(staged, bootstrap); initFaultPoint('after-link'); }
+    catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'EEXIST' && verifyPublished()) return 'unchanged';
+      throw error;
+    }
+    fsyncDir(targetHome);
+    const homeAfter = lstatSync(targetHome, { bigint: true });
+    if (homeAfter.dev !== homeBefore.dev || homeAfter.ino !== homeBefore.ino)
+      throw new FleetError('conflict', 'configuration home changed during default publication');
+    if (!verifyPublished())
+      throw new FleetError('conflict', 'published default configuration could not be verified');
+    return 'created';
+  } catch (error) {
+    throw new FleetError('conflict', `default installation stopped without deleting any path; an unreachable private init artifact may require manual inspection (${String(error instanceof Error ? error.message : error)})`);
+  }
+}
 
 const program = new Command()
   .name('ours-fleet')
@@ -1256,11 +1434,17 @@ cOpt(program.command('doctor').description('prerequisite report'))
     process.exit(rep.ok ? 0 : 1);
   });
 
-program.command('init').description('one-time host setup (units, dirs, linger)')
-  .action(async () => {
+program.command('init').description('install a safe default configuration and perform one-time host setup')
+  .option('--config-only', 'install or verify the default configuration without host service setup')
+  .action(async opts => {
+    const config = installDefaultConfig();
+    console.log(config === 'created'
+      ? `installed private schema-v2 configuration at ${defaultConfigPath()}`
+      : `default schema-v2 configuration already matches ${defaultConfigPath()}`);
+    if (opts.configOnly) return;
     for (const d of [agentsRoot(), tmpRoot(), logsRoot()]) mkdirSync(d, { recursive: true });
     for (const m of await pickBackend().init(binPath)) console.log(m);
-    console.log('\nNext: copy examples/fleet.yaml to ~/fleet.yaml, edit, then: ours-fleet up');
+    console.log('\nNext: run ours-fleet doctor, then configure optional room-owner routing before launching rooms.');
   });
 
 const webCommand = cOpt(program.command('web').description('start or open the secure localhost fleet web console'))

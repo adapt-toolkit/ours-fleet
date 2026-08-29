@@ -1,0 +1,7 @@
+kind: Role
+version: 1
+id: Architect
+display_name: Architect
+spec:
+  mission: Define the solution, constraints, and acceptance criteria before implementation.
+  capabilities: [architecture, planning]

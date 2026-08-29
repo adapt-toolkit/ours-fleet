@@ -1,0 +1,19 @@
+kind: RoomTemplate
+version: 1
+id: pair
+display_name: Secretary and Critic
+spec:
+  version: 1
+  description: A Secretary implements while an independent Critic reviews.
+  contract: Deliberate material decisions and require independent acceptance before publication.
+  members:
+    - slot: secretary
+      role: Secretary
+      count: 1
+      brain: {template: claude-fable}
+      permissions: {approval: ask, filesystem: workspace, unattended: wait}
+    - slot: critic
+      role: Critic
+      count: 1
+      brain: {template: gpt-sol}
+      permissions: {approval: ask, filesystem: workspace, unattended: wait}

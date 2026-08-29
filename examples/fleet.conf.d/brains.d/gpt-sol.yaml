@@ -1,0 +1,9 @@
+kind: Brain
+version: 1
+id: gpt-sol
+display_name: GPT Sol
+spec:
+  harness: codex
+  model: gpt-5.6-sol
+  effort: medium
+  session: acp

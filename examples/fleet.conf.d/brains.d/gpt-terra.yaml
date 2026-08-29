@@ -1,0 +1,9 @@
+kind: Brain
+version: 1
+id: gpt-terra
+display_name: GPT Terra
+spec:
+  harness: codex
+  model: gpt-5.6-terra
+  effort: medium
+  session: acp

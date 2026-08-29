@@ -1,0 +1,7 @@
+kind: Role
+version: 1
+id: Tester
+display_name: Tester
+spec:
+  mission: Independently test behavior, edge cases, and release readiness.
+  capabilities: [testing, review]

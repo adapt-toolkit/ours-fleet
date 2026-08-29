@@ -49,6 +49,8 @@ describe('packed root package', () => {
 
       const fleetRoot = join(consumerDir, 'node_modules', '@ours.network', 'fleet');
       const fleetPackage = JSON.parse(readFileSync(join(fleetRoot, 'package.json'), 'utf8'));
+      expect(existsSync(join(fleetRoot, 'examples', 'fleet.yaml'))).toBe(true);
+      expect(existsSync(join(fleetRoot, 'examples', 'fleet.conf.d', 'room-templates.d', 'team.yaml'))).toBe(true);
       expect(fleetPackage.optionalDependencies['@agentclientprotocol/codex-acp'])
         .toBe(CODEX_ACP_VERSION);
       const publicDeclaration = readFileSync(join(fleetRoot, 'dist', 'index.d.ts'), 'utf8');
@@ -113,6 +115,43 @@ describe('packed root package', () => {
       });
       expect(result.claim.warnings.join('\n'))
         .toContain("mode 'agent-full-access' couples approval and filesystem");
+
+      const initHome = join(root, 'fresh-home'); mkdirSync(initHome, { mode: 0o700 });
+      const installedCli = join(fleetRoot, 'dist', 'cli.js');
+      const initEnv = { ...process.env, OURS_FLEET_HOME: initHome,
+        npm_config_update_notifier: 'false' };
+      const initialized = execFileSync(process.execPath, [installedCli, 'init', '--config-only'], {
+        cwd: consumerDir, encoding: 'utf8', env: initEnv,
+      });
+      expect(initialized).toContain('installed private schema-v2 configuration');
+      expect(execFileSync(process.execPath, [installedCli, 'init', '--config-only'], {
+        cwd: consumerDir, encoding: 'utf8', env: initEnv,
+      })).toContain('already matches');
+      const graphProbe = `
+        import { join } from 'node:path';
+        import { pathToFileURL } from 'node:url';
+        const fleetRoot = ${JSON.stringify('${FLEET_ROOT}')};
+        const home = ${JSON.stringify('${INIT_HOME}')};
+        const { loadConfigResourceSnapshot } = await import(
+          pathToFileURL(join(fleetRoot, 'dist', 'config-resource-loader.js')).href
+        );
+        const snapshot = loadConfigResourceSnapshot({ bootstrapFile: join(home, 'fleet.yaml') });
+        process.stdout.write(JSON.stringify(Object.fromEntries(
+          Object.entries(snapshot.resources).map(([kind, values]) => [kind, Object.keys(values).sort()]))));
+      `.replace('${FLEET_ROOT}', fleetRoot).replace('${INIT_HOME}', initHome);
+      const installedGraph = JSON.parse(execFileSync(process.execPath, [
+        '--input-type=module', '--eval', graphProbe,
+      ], { cwd: consumerDir, encoding: 'utf8' }));
+      expect(installedGraph).toEqual({
+        Role: ['Agent', 'Architect', 'Critic', 'Developer', 'Secretary', 'Tester'],
+        Brain: ['claude-fable', 'claude-opus', 'gpt-sol', 'gpt-terra'],
+        RoomTemplate: ['pair', 'single', 'team'], TasksPolicy: ['default'],
+      });
+      const selectedDir = readFileSync(join(initHome, 'fleet.yaml'), 'utf8')
+        .match(/^config_dir: (.+)$/mu)?.[1];
+      expect(selectedDir).toMatch(/^\.fleet\.conf\.d-/u);
+      expect(readFileSync(join(initHome, selectedDir!, 'tasks.d', 'default.yaml'), 'utf8'))
+        .not.toMatch(/expected_cid|public_invite|owner_channel|attach_owner/u);
 
       writeFileSync(join(consumerWithoutOptionalDir, 'package.json'), JSON.stringify({
         private: true,

@@ -15,6 +15,7 @@
   "files": [
     "dist",
     "contrib",
+    "examples",
     "README.md",
     "LICENSE"
   ],

@@ -1,0 +1,7 @@
+kind: Role
+version: 1
+id: Agent
+display_name: Agent
+spec:
+  mission: Complete the assigned task with owner oversight.
+  capabilities: [general]

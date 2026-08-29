@@ -91,7 +91,7 @@ equivalent); logs land in `~/.ours-fleet/logs/`.
 
 ```sh
 npm i -g @ours.network/fleet
-ours-fleet init      # units/dirs/linger for this user
+ours-fleet init      # private schema-v2 defaults plus units/dirs/linger
 ours-fleet doctor    # verifies everything above, with actionable messages
 ```
 
@@ -106,13 +106,25 @@ become that account and repeat.
 
 ## Quickstart
 
+`ours-fleet init` installs an owner-free schema-v2 graph with six Roles, Claude
+Fable/Opus and GPT Sol/Terra Brain examples, and `single`, `pair`, and `team` room
+templates. Files are private (`0600`, directories `0700`); an exact repeat is a
+no-op, while any operator edit, partial graph, extra entry, or symlink is never
+overwritten. Use `ours-fleet init --config-only` when host service setup is not
+needed.
+
+Room-owner routing is intentionally not guessed. Before launching rooms, inspect
+`config_dir` in `~/fleet.yaml` (or use the resource-management commands), then add
+`rooms.d/default.yaml` there with a `RoomsPolicy` containing your own
+64-hex owner CID and optional invite settings. Until then configuration and Agent
+surfaces work, while room provisioning fails closed with an actionable missing
+room-owner prerequisite.
+
 ```sh
-cp "$(npm root -g)/@ours.network/fleet/examples/fleet.yaml" ~/fleet.yaml
-$EDITOR ~/fleet.yaml          # name your roles, missions, personas
-ours-fleet up                 # boot the fleet (staggered)
-ours-fleet ls                 # running consoles
-ours-fleet attach Alice       # watch one live (Ctrl-b d to leave)
-ours-fleet peek Alice         # or just glance
+ours-fleet init
+ours-fleet doctor
+ours-fleet resource list
+ours-fleet web
 ```
 
 ## Spawning agents

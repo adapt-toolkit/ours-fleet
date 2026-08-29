@@ -1,0 +1,10 @@
+kind: TasksPolicy
+version: 1
+id: default
+spec:
+  default_room_template: single
+  create_mode: start
+  close_room_on_done: true
+  retain_completed_for: 7d
+  brain: {template: gpt-sol}
+  permissions: {approval: ask, filesystem: workspace, unattended: wait}

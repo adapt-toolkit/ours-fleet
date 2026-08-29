@@ -84,6 +84,7 @@ PATH order.
 
 \`\`\`sh
 ours-fleet init
+ours-fleet init --config-only           # schema-v2 defaults, no host services
 ours-fleet up|down [Name...]
 ours-fleet restart [Name...]            # preserve/resume harness context
 ours-fleet force-restart [Name...]      # fresh context; briefing is reloaded
@@ -100,6 +101,16 @@ ours-fleet watchdog-run <name>
 \`peek\`, \`attach\`, and text \`send\` work with tmux and ACP. ACP attachment
 also accepts \`/permit <permission-id> <option-id>\`, \`/interrupt\`, and
 \`/detach\`. Raw \`--key\` input is tmux-only.
+
+\`init\` installs a private, owner-free schema-v2 graph containing the standard
+Roles, Claude Fable/Opus and GPT Sol/Terra Brain examples, and \`single\`, \`pair\`,
+and \`team\` RoomTemplates. It is an
+exact idempotent no-op and never overwrites a differing, partial, unsafe, or
+symlinked graph. Room-owner routing is an optional post-init step: inspect
+\`config_dir\` in \`~/fleet.yaml\` (or use resource-management commands), then add a
+\`RoomsPolicy\` at \`rooms.d/default.yaml\` there with the operator's own
+validated 64-hex CID and invite settings. Room launch fails closed until that
+policy exists; no CID, invite, or owner channel is installed by default.
 
 ## Local web console
 

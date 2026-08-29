@@ -1,0 +1,9 @@
+kind: Brain
+version: 1
+id: claude-fable
+display_name: Claude Fable
+spec:
+  harness: claude-code
+  model: claude-fable-5
+  effort: medium
+  session: acp

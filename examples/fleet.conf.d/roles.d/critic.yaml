@@ -1,0 +1,7 @@
+kind: Role
+version: 1
+id: Critic
+display_name: Critic
+spec:
+  mission: Review decisions and implementation independently before acceptance.
+  capabilities: [review, testing]
