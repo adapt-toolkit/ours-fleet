@@ -31,7 +31,7 @@ export interface AcpBodyBrainDriverLaunchRequest {
   readonly lifecycle: Readonly<AcpStartRequest | AcpRestoreRequest>;
 }
 
-/** Narrow process-free seam implemented by an ACP protocol owner in Phase 4C2/5. */
+/** Narrow process-free seam implemented by an ACP protocol owner. */
 export interface AcpBodyBrainInjectedDriver {
   subscribe(listener: (notification: unknown) => void): () => void;
   start(request: Readonly<AcpBodyBrainDriverLaunchRequest>): Promise<AcpLifecycleResult>;

@@ -21,7 +21,7 @@ afterEach(async () => {
 });
 
 /**
- * The full Phase-1 stack, no stubs: browser HTTP/WS -> web service ->
+ * The full production stack, no stubs: browser HTTP/WS -> web service ->
  * AcpRoleSessionAdapter -> private control socket -> AcpSession -> fixture
  * adapter, with the durable ledger in between.
  */

@@ -71,9 +71,9 @@ export function productionAdapters(): string[] {
 }
 
 /**
- * Phase-4 registry is deliberately separate from the legacy harness registry:
+ * The Body–Brain registry is deliberately separate from the legacy harness registry:
  * a registered CLI harness is not evidence that a Body–Brain implementation
- * exists. Production consumption therefore fails closed until C2 registers it.
+ * exists. Production consumption therefore fails closed until the adapter registers it.
  */
 export function registerBodyBrainAdapterDescriptor(descriptor: AcpBodyBrainAdapterDescriptor): void {
   if (!exactDataObject(descriptor, [

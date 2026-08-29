@@ -64,7 +64,7 @@ function fakeDriver(patch: Partial<AcpBodyBrainInjectedDriver> = {}) {
   return { driver, calls, emit: (value: unknown) => listener?.(value) };
 }
 
-describe('Phase 4C BodyBrain descriptor registry', () => {
+describe('BodyBrain descriptor registry', () => {
   it('fails closed while absent and owns exact production registrations deterministically', () => {
     expect(knownBodyBrainAdapterDescriptors()).toEqual([]);
     expect(() => getBodyBrainAdapterDescriptor('codex')).toThrow(/not registered/u);
