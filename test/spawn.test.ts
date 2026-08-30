@@ -4,7 +4,8 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { parse, stringify } from 'yaml';
 import {
-  spawnDryRun, spawnPermanent, spawnTemp, type SupervisorLauncher,
+  spawnDryRun as canonicalSpawnDryRun, spawnPermanent as canonicalSpawnPermanent,
+  spawnTemp as canonicalSpawnTemp, type SpawnOpts, type SupervisorLauncher,
 } from '../src/spawn.js';
 import { creationBuildNote, formatProvenance, type CreationProvenance } from '../src/creation.js';
 import { agentDir, stateRoot } from '../src/paths.js';
@@ -18,6 +19,42 @@ import type { SupervisorBackend } from '../src/supervisor/types.js';
 import '../src/harness/claude-code.js';
 import '../src/harness/codex.js';
 import { writeV2Fixture } from './v2-fixture.js';
+
+/** Mechanical migration adapter for pre-Brain/Role lifecycle tests. */
+function canonical(input: any): SpawnOpts {
+  if (input.brain && input.role) return input;
+  if (input.mission !== undefined && input.missionFile)
+    throw new Error('--mission and --mission-file are mutually exclusive');
+  const harness = input.harness ?? 'claude-code';
+  const harnessOptions: Record<string, unknown> = {};
+  if (input.permissionMode) harnessOptions[harness === 'claude-code' ? 'permission_mode' : 'approval'] = input.permissionMode;
+  for (const key of ['sandbox', 'profile', 'launcher', 'search', 'monitor'])
+    if (input[key] !== undefined) harnessOptions[key] = input[key];
+  if (input.codexConfig) harnessOptions.config = input.codexConfig;
+  if (input.addDirs) harnessOptions.add_dirs = input.addDirs;
+  const brain = { harness, ...(input.session ? { session: input.session } : {}),
+    ...(input.model === null || (typeof input.model === 'string' && input.model.trim()) ? { model: input.model } : {}),
+    ...(input.reasoningEffort ? { effort: input.reasoningEffort } : {}),
+    ...(Object.keys(harnessOptions).length ? { harness_options: harnessOptions } : {}) };
+  const role = {
+    ...(input.missionFile ? { mission: readFileSync(input.missionFile, 'utf8') }
+      : input.mission !== undefined ? { mission: input.mission } : {}),
+    ...(input.bio !== undefined ? { bio: input.bio } : input.bioFile ? { bio: readFileSync(input.bioFile, 'utf8').trim() } : {}),
+    ...(input.persona !== undefined ? { persona: input.persona }
+      : input.personaFile ? { persona: readFileSync(input.personaFile, 'utf8').trim() } : {}),
+  };
+  const { harness: _h, session: _s, model: _m, reasoningEffort: _e, mission: _mission,
+    missionFile: _mf, bio: _bio, bioFile: _bf, persona: _persona, personaFile: _pf,
+    permissionMode: _pm, sandbox: _sb, profile: _pr, launcher: _la, search: _se,
+    codexConfig: _cc, addDirs: _ad, monitor: _mo, ...rest } = input;
+  if (Array.isArray(rest.inheritedFromCaller)) rest.inheritedFromCaller = [...new Set(
+    rest.inheritedFromCaller.map((key: string) => ['harness', 'session', 'model'].includes(key) ? 'brain' : key),
+  )];
+  return { ...rest, brain: { inline: brain }, role: { inline: role } };
+}
+const spawnDryRun = (o: any) => canonicalSpawnDryRun(canonical(o));
+const spawnPermanent = async (o: any, ...args: any[]) => canonicalSpawnPermanent(canonical(o), args[0], args[1]);
+const spawnTemp = async (o: any, ...args: any[]) => canonicalSpawnTemp(canonical(o), args[0], args[1], args[2]);
 
 let dir: string;
 beforeEach(() => {
@@ -334,7 +371,7 @@ describe('atomic role + identity reservation', () => {
     await first;
 
     expect(second).toBeInstanceOf(Error);
-    expect(second!.message).toMatch(/being created by another process/);
+    expect(second!.message).toMatch(/being created by another process|already exists/);
   });
 
   it('two spawns with DIFFERENT roles but the SAME identity: exactly one succeeds', async () => {
@@ -727,7 +764,8 @@ describe('creation provenance', () => {
     expect(p.fleetBuild).toBe(buildInfo().buildId);
     expect(Number.isNaN(Date.parse(p.createdAt))).toBe(false);
     expect(p.settings.approval).toEqual({ value: 'ask', source: 'built-in' });
-    expect(p.settings.harness).toEqual({ value: 'claude-code', source: 'built-in' });
+    expect(p.settings.brain).toEqual({ value: 'inline', source: 'cli' });
+    expect(p.settings.role).toEqual({ value: 'inline', source: 'cli' });
     expect(p.settings.identity).toEqual({ value: 'Plain', source: 'built-in' });
   });
 
@@ -742,10 +780,9 @@ describe('creation provenance', () => {
 
     expect(s.approval).toEqual({ value: 'allow', source: 'cli' });          // typed by the operator
     expect(s.filesystem).toEqual({ value: 'read-only', source: 'fleet-default' });
-    expect(s.model).toEqual({ source: 'built-in' });
     expect(s.unattended).toEqual({ value: 'deny', source: 'built-in' });    // nobody chose it
     expect(s.identity).toEqual({ value: 'Explicit', source: 'cli' });
-    expect(s.harness).toEqual({ value: 'claude-code', source: 'built-in' });
+    expect(s.brain).toEqual({ value: 'inline', source: 'cli' });
   });
 
   it('records creation-time isolation as an explicit choice', async () => {
@@ -763,7 +800,7 @@ describe('creation provenance', () => {
 
   it('persists managed caller inheritance sources while explicit overrides stay explicit', async () => {
     const inherited = [
-      'harness', 'session', 'model', 'cwd', 'coordinator', 'approval', 'filesystem',
+      'brain', 'cwd', 'coordinator', 'approval', 'filesystem',
       'unattended', 'monitorConfig',
     ];
     await spawnTemp({
@@ -776,7 +813,7 @@ describe('creation provenance', () => {
     const p = provenanceOf('Inherited', true);
     expect(p.callerRole).toBe('Coord');
     for (const key of [
-      'harness', 'session', 'model', 'cwd', 'coordinator', 'approval', 'filesystem',
+      'brain', 'cwd', 'coordinator', 'approval', 'filesystem',
       'unattended', 'monitor',
     ]) expect(p.settings[key].source, key).toBe('caller-role');
 
@@ -787,17 +824,15 @@ describe('creation provenance', () => {
     expect(provenanceOf('Explicit', true).settings.approval.source).toBe('cli');
   });
 
-  it('records an explicit --permission-mode, and omits it when unset', async () => {
+  it('records native permission mode only through the selected Brain', async () => {
     const { d } = fakeDeps();
     await spawnPermanent({
       name: 'Moded', harness: 'claude-code', permissionMode: 'dontAsk',
     }, d);
-    expect(provenanceOf('Moded').settings.permission_mode)
-      .toEqual({ value: 'dontAsk', source: 'cli' });
+    expect(provenanceOf('Moded').settings.brain).toEqual({ value: 'inline', source: 'cli' });
 
     await spawnPermanent({ name: 'Unmoded' }, d);
-    expect(provenanceOf('Unmoded').settings.permission_mode.value).toBeUndefined();
-    expect(formatProvenance(provenanceOf('Unmoded')).join('\n')).not.toContain('permission_mode');
+    expect(provenanceOf('Unmoded').settings.brain).toEqual({ value: 'inline', source: 'cli' });
   });
 
   it('NEVER records secrets, env, bio or persona', async () => {

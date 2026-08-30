@@ -230,6 +230,27 @@ export interface RoleConfig {
   auth_proxy?: Partial<AuthProxyConfig>;
 }
 
+export type AgentSelection<T extends Record<string, unknown> = Record<string, unknown>> =
+  | { ref: string }
+  | { inline: T };
+
+/** Canonical authoring contract shared by configured, spawned, and room agents. */
+export interface AgentDefinition {
+  role: AgentSelection;
+  brain: AgentSelection;
+  permissions?: Partial<CommonPermissions>;
+  identity?: string;
+  cwd?: string;
+  coordinator?: string;
+  env?: Record<string, string>;
+  oversee?: OverseeEntry[];
+  isolation?: IsolationConfig;
+  monitor?: Partial<MonitorConfig>;
+  owner_channel?: OwnerChannelConfigInput;
+  worklog?: WorklogPolicyInput;
+  auth_proxy?: Partial<AuthProxyConfig>;
+}
+
 /** Internal first-boot payload for a Fleet-provisioned Cowork room member. */
 export interface RoomMemberStartup {
   room_id: string;
@@ -265,6 +286,8 @@ export interface ResolvedRole extends Omit<RoleConfig, 'model' | 'owner_channel'
   provenance?: Record<string, FieldProvenance>;
   /** Internal/transient: never accepted as a user-authored RoleConfig key. */
   roomMemberStartup?: RoomMemberStartup;
+  /** Original unresolved selections only; denied operational fields never enter inheritance state. */
+  agentSelections?: Pick<AgentDefinition, 'role' | 'brain'>;
 }
 
 export interface FieldProvenance {
@@ -279,6 +302,8 @@ export interface FieldProvenance {
 
 export interface FleetConfig {
   roles: ResolvedRole[];
+  /** Canonical, variable-resolved Agent authoring documents keyed by stable Agent ID. */
+  agentDefinitions?: Record<string, AgentDefinition>;
   vars: Record<string, string>;
   defaults: Record<string, unknown>;
   files: string[];
@@ -353,12 +378,12 @@ const ROLE_KEYS = [
   'isolation', 'monitor', 'owner_channel', 'worklog', 'auth_proxy',
 ];
 
-const ROLE_PRESET_KEYS = ['mission', 'persona', 'bio', 'briefing_file'];
-const BRAIN_PRESET_KEYS = [
+export const ROLE_PRESET_KEYS = ['mission', 'persona', 'bio', 'briefing_file'];
+export const BRAIN_PRESET_KEYS = [
   'harness', 'session', 'session_options', 'model', 'model_chain', 'max_tokens',
   'autocompact_pct', 'harness_options', 'effort',
 ];
-const AGENT_KEYS = [
+export const AGENT_KEYS = [
   'role', 'brain', 'permissions', 'identity', 'cwd', 'coordinator', 'env', 'oversee',
   'isolation', 'monitor', 'owner_channel', 'worklog', 'auth_proxy',
 ];
@@ -372,7 +397,7 @@ function schemaError(file: string, pointer: string, summary: string): never {
   throw new ConfigError(`${file}: E_SCHEMA ${pointer}: ${summary}`);
 }
 
-function validateRoleValue(value: BarePreset, file: string, pointer: string): void {
+export function validateRoleValue(value: BarePreset, file: string, pointer: string): void {
   const limits: Record<string, { bytes: number; nonblank?: boolean }> = {
     mission: { bytes: 16 * 1024, nonblank: true },
     persona: { bytes: 16 * 1024 },
@@ -391,7 +416,7 @@ function validateRoleValue(value: BarePreset, file: string, pointer: string): vo
     schemaError(file, `${pointer}/briefing_file`, 'must be a non-blank relative path');
 }
 
-function validateBrainValue(value: BarePreset, file: string, pointer: string): void {
+export function validateBrainValue(value: BarePreset, file: string, pointer: string): void {
   if (typeof value.harness !== 'string' || !value.harness.trim())
     schemaError(file, `${pointer}/harness`, 'is required and must be a registered non-blank harness ID');
   if (value.model !== undefined && value.model !== null
@@ -447,7 +472,7 @@ function assertTrustedPath(path: string, expected: 'file' | 'directory'): void {
     throw new ConfigError(`E_FILE_TRUST: ${path} is group/world writable (mode ${(st.mode & 0o777).toString(8)})`);
 }
 
-function assertBareKeys(value: unknown, allowed: string[], label: string): BarePreset {
+export function assertBareKeys(value: unknown, allowed: string[], label: string): BarePreset {
   if (!isPlainObject(value)) throw new ConfigError(`${label}: E_SCHEMA: must be a mapping`);
   const bad = Object.keys(value).filter(key => !allowed.includes(key));
   if (bad.length) throw new ConfigError(`${label}: E_UNKNOWN_KEY: unknown key(s) ${bad.join(', ')}; allowed: ${allowed.join(', ')}`);
@@ -532,8 +557,8 @@ function deepSubStrict(
 
 function composeSplitRoles(
   base: string, baseDoc: Record<string, unknown>, yamlMode: YamlMode,
-  diagnostics: ConfigDiagnostic[], files: string[],
-): { file: string; doc: Record<string, unknown>; provenance?: Record<string, FieldProvenance> }[] {
+  diagnostics: ConfigDiagnostic[], files: string[], additionalAgent?: { id: string; definition: AgentDefinition },
+): { file: string; doc: Record<string, unknown>; provenance?: Record<string, FieldProvenance>; agentSelections?: Pick<AgentDefinition, 'role' | 'brain'>; agentDefinition?: AgentDefinition }[] {
   if (baseDoc.api_version !== V2_API_VERSION)
     throw new ConfigError(`${base}: legacy fleet configuration is unsupported; run 'ours-fleet doctor' and rewrite it as ${V2_API_VERSION}`);
   if ('roles' in baseDoc)
@@ -544,8 +569,15 @@ function composeSplitRoles(
   const brains = readKindDirectory(join(root, 'brains'), 'brain', false, yamlMode, diagnostics, files);
   const roles = readKindDirectory(join(root, 'roles'), 'role', false, yamlMode, diagnostics, files);
   const agents = readKindDirectory(join(root, 'agents'), 'agent', true, yamlMode, diagnostics, files);
+  if (additionalAgent) {
+    if (agents.has(additionalAgent.id))
+      throw new ConfigError(`agent '${additionalAgent.id}' already exists`);
+    agents.set(additionalAgent.id, {
+      file: '(spawn request)', value: structuredClone(additionalAgent.definition) as unknown as BarePreset,
+    });
+  }
   const vars = (baseDoc.vars ?? {}) as Record<string, string>;
-  const documents: { file: string; doc: Record<string, unknown>; provenance?: Record<string, FieldProvenance> }[] = [];
+  const documents: { file: string; doc: Record<string, unknown>; provenance?: Record<string, FieldProvenance>; agentSelections?: Pick<AgentDefinition, 'role' | 'brain'>; agentDefinition?: AgentDefinition }[] = [];
   for (const [id, agent] of agents) {
     const a = assertBareKeys(agent.value, AGENT_KEYS, `${agent.file}: agent '${id}'`);
     if (!('role' in a) || !('brain' in a)) throw new ConfigError(`${agent.file}: agent '${id}' requires role and brain`);
@@ -619,8 +651,15 @@ function composeSplitRoles(
         ? { sourcePointer: `/agents/${id}/brain/ref`, kind: 'Brain', id: String((a.brain as Record<string, unknown>).ref) }
         : undefined);
     delete provenance.role; delete provenance.brain;
+    const canonicalDefinition = {
+      role: deepSubStrict(a.role, vars, agent.file, `/agents/${id}/role`),
+      brain: deepSubStrict(a.brain, vars, agent.file, `/agents/${id}/brain`),
+      ...operational,
+    } as AgentDefinition;
     documents.push({ file: agent.file,
-      doc: { roles: { [id]: { ...brainValue, ...roleValue, ...operational } } }, provenance });
+      doc: { roles: { [id]: { ...brainValue, ...roleValue, ...operational } } }, provenance,
+      agentSelections: structuredClone({ role: canonicalDefinition.role, brain: canonicalDefinition.brain }),
+      agentDefinition: canonicalDefinition });
   }
   return documents;
 }
@@ -637,12 +676,12 @@ function deepSub(v: unknown, vars: Record<string, string>): unknown {
 /** Load a v2 manifest and bare Agent/Role/Brain documents from its stem directory. */
 export function loadConfig(
   configPath?: string,
-  options: { yamlMode?: YamlMode } = {},
+  options: { yamlMode?: YamlMode; additionalAgent?: { id: string; definition: AgentDefinition }; skipWatchdogs?: boolean } = {},
 ): FleetConfig {
   const base = configPath ?? defaultConfigPath();
   const files: string[] = [];
   const diagnostics: ConfigDiagnostic[] = [];
-  let docs: { file: string; doc: Record<string, unknown>; provenance?: Record<string, FieldProvenance> }[] = [];
+  let docs: { file: string; doc: Record<string, unknown>; provenance?: Record<string, FieldProvenance>; agentSelections?: Pick<AgentDefinition, 'role' | 'brain'>; agentDefinition?: AgentDefinition }[] = [];
   let manifestDoc: Record<string, unknown> = {};
   if (existsSync(base)) {
     assertTrustedPath(base, 'file');
@@ -659,21 +698,28 @@ export function loadConfig(
   if (existsSync(dd) && readdirSync(dd).some(f => f.endsWith('.yaml') || f.endsWith('.yml')))
     throw new ConfigError(`${dd}: legacy fleet.d configuration is unsupported; run 'ours-fleet doctor' and move agents to ${splitRootFor(base)}/agents/`);
   docs = [{ file: base, doc: manifestDoc }, ...composeSplitRoles(
-    base, manifestDoc, options.yamlMode ?? 'compat', diagnostics, files,
+    base, manifestDoc, options.yamlMode ?? 'compat', diagnostics, files, options.additionalAgent,
   )];
   const baseDoc = manifestDoc;
   const vars = (baseDoc.vars ?? {}) as Record<string, string>;
   const defaults = (baseDoc.defaults ?? {}) as Record<string, unknown>;
+  const legacyRuntimeDefaults = ['harness', 'model', 'model_chain', 'effort', 'harness_options',
+    'session', 'session_options', 'max_tokens', 'autocompact_pct']
+    .filter(key => Object.hasOwn(defaults, key));
+  if (legacyRuntimeDefaults.length)
+    throw new ConfigError(`${base}: E_LEGACY /defaults: Brain-owned field(s) ${legacyRuntimeDefaults.join(', ')} are unsupported; move them to a Brain definition`);
   const startStaggerMs = resolveStartStaggerMs(baseDoc.start_stagger_ms, base);
   const seen = new Map<string, string>();
   const roles: ResolvedRole[] = [];
-  for (const { file, doc, provenance } of docs) {
+  const agentDefinitions: Record<string, AgentDefinition> = {};
+  for (const { file, doc, provenance, agentSelections, agentDefinition } of docs) {
     for (const [name, raw] of Object.entries((doc.roles ?? {}) as Record<string, RoleConfig | null>)) {
       if (!ROLE_NAME_RE.test(name))
         throw new ConfigError(`${file}: invalid role name '${name}' (allowed: [A-Za-z0-9_-])`);
       const prev = seen.get(name);
       if (prev) throw new ConfigError(`role '${name}' defined in both ${prev} and ${file}`);
       seen.set(name, file);
+      if (agentDefinition) agentDefinitions[name] = structuredClone(agentDefinition);
       const r = deepSub(raw ?? {}, vars) as RoleConfig;
       const bad = Object.keys(r).filter(k => !ROLE_KEYS.includes(k));
       if (bad.length)
@@ -767,6 +813,7 @@ export function loadConfig(
         auth_proxy: authProxy,
         env: Object.keys(env).length ? env : undefined,
         loops: [],
+        ...(agentSelections ? { agentSelections } : {}),
       });
       // Forbidden-path enforcement: a mount that would breach the policy
       // is a configuration error, caught by `config` rather than at launch.
@@ -780,7 +827,15 @@ export function loadConfig(
     }
   }
   validateOwnerChannelIdentities(roles);
-  const watchdogs = resolveWatchdogs(baseDoc, base, roles, vars, defaults);
+  const watchdogs = options.skipWatchdogs ? [] : resolveWatchdogs(
+    baseDoc, base, roles, vars, agentDefinitions,
+    (name, definition) => {
+      const id = `WatchdogAgent${name}`.slice(0, 64);
+      return findRole(loadConfig(base, {
+        yamlMode: options.yamlMode, additionalAgent: { id, definition }, skipWatchdogs: true,
+      }), id);
+    },
+  );
   const resolvedLoops = resolveLoops(baseDoc.loops, base, roles, vars);
   for (const role of roles) role.loops = resolvedLoops.byRole.get(role.name) ?? [];
 
@@ -814,7 +869,7 @@ export function loadConfig(
   }
 
   const result: FleetConfig = {
-    roles, vars, defaults, files, startStaggerMs, diagnostics, watchdogs,
+    roles, agentDefinitions, vars, defaults, files, startStaggerMs, diagnostics, watchdogs,
     loops: resolvedLoops.loops,
     rooms, roomTemplates, tasks, ownerInviteFingerprint,
     configMode: 'split-v2',

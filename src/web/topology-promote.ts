@@ -168,7 +168,14 @@ function agentEntry(node: MergedTopologyNode): Record<string, unknown> {
  */
 function watchdogEntry(node: MergedTopologyNode, merged: MergedTopology): Record<string, unknown> {
   const scoped = linked(merged, node.id, 'watches');
-  return { ...pick(node, WATCHDOG_FIELDS), ...(scoped.length ? { watch: scoped } : {}) };
+  return {
+    ...pick(node, WATCHDOG_FIELDS),
+    agent: {
+      role: { inline: {} },
+      brain: { inline: { harness: 'claude-code', ...pick(node, BRAIN_FIELDS) } },
+    },
+    ...(scoped.length ? { watch: scoped } : {}),
+  };
 }
 
 function loopEntry(

@@ -124,9 +124,7 @@ Permanent, unattended (announce it to yourself if you are its coordinator):
 
 ```sh
 ours-fleet spawn <Name> \
-  --harness claude-code --session acp \
-  --mission "<one-line mission>" \
-  --bio-file /tmp/spawn-bio.md --persona-file /tmp/spawn-persona.md \
+  --brain <BrainId> --role <RoleId> \
   --approval allow --filesystem workspace --unattended deny \
   --isolation-file /tmp/spawn-isolation.yaml \
   [--cwd <dir>] [--coordinator <YourRoleName>]
@@ -136,9 +134,7 @@ Permanent, attended — a human will answer its prompts:
 
 ```sh
 ours-fleet spawn <Name> \
-  --harness claude-code --session acp \
-  --mission "<one-line mission>" \
-  --bio-file /tmp/spawn-bio.md --persona-file /tmp/spawn-persona.md \
+  --brain <BrainId> --role <RoleId> \
   --approval ask --filesystem workspace --unattended wait
 ```
 
@@ -146,13 +142,11 @@ Temporary — add `--temp`; it uses the same structured session interface:
 
 ```sh
 ours-fleet spawn --temp <Name> \
-  --harness claude-code --session acp \
-  --mission "<one-line mission>" \
-  --bio-file /tmp/spawn-bio.md --persona-file /tmp/spawn-persona.md \
+  --brain <BrainId> --role <RoleId> \
   --approval allow --filesystem workspace --unattended deny
 ```
 
-Pass model, permission, session, and coordinator choices exactly as approved.
+Pass Brain, Role, permission, and coordinator choices exactly as approved.
 Do not persist secrets in fleet YAML.
 
 ## 8. Verify

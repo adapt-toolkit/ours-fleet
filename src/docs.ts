@@ -149,21 +149,19 @@ harness's own default.
 ## Spawn
 
 \`\`\`sh
-ours-fleet spawn [--temp] [Name | --role Name] \\
-  --harness codex|claude-code --session acp \\
-  --mission "one line" --cwd /absolute/path --identity Identity \\
-  --coordinator Coordinator --model MODEL \\
+ours-fleet spawn [--temp] [Name | --name Name] \\
+  --brain BRAIN_ID --role ROLE_ID \\
+  --cwd /absolute/path --identity Identity --coordinator Coordinator \\
   --approval ask|auto|allow \\
   --filesystem read-only|workspace|unrestricted \\
-  --unattended deny|wait \\
-  --bio-file /path/bio.md --persona-file /path/persona.md
+  --unattended deny|wait --isolation-file /path/isolation.yaml
 \`\`\`
 
 Permanent spawn writes \`~/fleet/agents/Name.yaml\` and starts a supervised role.
 \`--temp\` writes active state under \`~/.ours-fleet/tmp\` and starts an independent
 transient supervisor (a collected systemd unit or submitted launchd job). It is
 not enabled across reboot and does not die when the role that spawned it restarts.
-Both lifetimes support \`--session acp\`. When a temporary role's bound identity
+Brain definitions own the ACP session backend. When a temporary role's bound identity
 closes or its session ends, the supervisor, monitor and live roster entry retire
 together; state moves intact to \`~/.ours-fleet/recovery/temporary\` with a
 termination record. Failed launches use the same archive rather than deleting
@@ -196,26 +194,23 @@ valid-but-empty daemon indexes are ambiguous and reset closure debounce rather
 than becoming cleanup authority.
 
 Inside a managed ACP role, the same CLI automatically routes a real \`spawn\`
-through that role's authenticated supervisor control socket. \`--role Name\` is
-accepted as an alternative to the positional name, so a minimal delegated call
-is \`ours-fleet spawn --role DeveloperX --temp\`. The supervisor records the
+through that role's authenticated supervisor control socket. \`--name Name\` is
+accepted as an alternative to the positional Agent name. The supervisor records the
 calling role, performs creation, and only after success sends a structured
 spawn notice through the caller's owner channel when one is configured.
 
-Omitted harness, session, working directory, coordinator, neutral permissions,
-fleet monitor policy, and (when the harness is unchanged) model inherit from the
-calling role. Explicit options always win. Selecting a different harness without
-\`--model\` leaves model selection to that harness/fleet defaults rather than
-copying an incompatible caller model. This automatic proxy is a convenience and
+Omitted Brain and Role selections, working directory, coordinator, neutral permissions,
+and fleet monitor policy inherit from the calling Agent. Explicit options always win.
+Identity, mission/profile text, environment, owner routing, auth proxy, room startup,
+isolation, worklog, and sensitive inline Brain values never inherit implicitly.
+This automatic proxy is a convenience and
 attribution mechanism, not an isolation boundary: an unrestricted role can still
 invoke another binary path directly. Host/operator shells keep the ordinary direct
 CLI behavior.
 
-Codex-specific spawn flags: \`--sandbox\`, \`--permission-mode\`, \`--launcher\`,
-\`--profile\`, \`--search\`, repeatable \`--codex-config key=value\`, repeatable
-\`--add-dir\`, and legacy \`--monitor\` (consent for the native Codex monitor,
-not the \`monitor.mode\` wake-owner selector). Run \`ours-fleet help spawn\` for
-exact values.
+Brain owns harness, session, model, reasoning effort, token limits, and native harness
+options. Removed runtime flags are rejected with migration guidance rather than silently
+reinterpreted. A selection is a stable ID or an explicit \`inline:{...}\` mapping.
 
 ## fleet.yaml
 
@@ -238,18 +233,12 @@ watchdogs:
     enabled: true                   # default true; false = configured but never scheduled
     interval: 10m                   # default 10m; 30s | 10m | 2h, minimum 1m
     watch: [Alice, CodexReviewer]   # explicit lists are exact; omit for configured + live temp roles
-    harness: claude-code            # default: built-in claude-code
-    model: claude-fable-5           # default: same resolution rule roles use (resolveRoleModel)
-    session: acp                    # default: built-in ACP
+    agent: { ref: WatchdogAgent }   # required: declared Agent ID, or canonical inline Agent definition
     identity: Watchdog-nightwatch   # default: Watchdog-<name>
     timeout: 5m                     # default 5m; a run past this is killed and recorded as error
     keep_reports: 50                # default 50 reports retained per watchdog
     alert_cooldown: 60m             # default 60m before the same finding alerts again
     prompt_file: /abs/extra.md      # optional extra focus, APPENDED to the fixed contract
-    isolation:                      # optional; omitted means no OS sandbox, like an ordinary role
-      backend: bubblewrap           # when present, the ordinary role isolation schema applies
-      network: broker
-      fs: { read: [/opt/watch-data] }
 \`\`\`
 
 An Agent is a separate bare document under \`~/fleet/agents/<ID>.yaml\`:
@@ -266,9 +255,9 @@ A watchdog observes and reports; it never restarts, stops, spawns, or removes a
 role, answers a pending permission, edits a workspace, or approves anything on
 the owner's behalf. \`watchdogs:\` may appear only in the base config
 (\`~/fleet.yaml\` or \`-c FILE\`); Agent/Role/Brain documents never own it.
-Watchdogs are not isolated by default. An explicit watchdog \`isolation:\` block
-uses the same policy schema as a role and is applied unchanged; declare every
-extra filesystem access required by a custom prompt there.
+The selected Agent owns Brain, Role, permissions, isolation, and every other
+agent setting. Legacy watchdog \`harness\`, \`model\`, \`session\`, and
+\`isolation\` fields fail with migration guidance.
 When \`watch:\` is omitted, each run watches the configured roles plus temporary
 fleet roles that are live when the run starts. An explicit \`watch:\` list is
 never augmented.

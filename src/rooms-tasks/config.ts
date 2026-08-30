@@ -2,16 +2,17 @@ import { existsSync, readFileSync } from 'node:fs';
 import { createHash } from 'node:crypto';
 import type {
   RoomsConfig, RoomsOwnerConfig, RoomsCoworkConfig, RoomsDefaults,
-  TasksConfig, TemplateDefinition, RoomTemplatesConfig,
+  TasksConfig, TemplateDefinition, RoomTemplatesConfig, TemplateMemberSlot,
   ROOMS_KEYS, ROOMS_OWNER_KEYS, ROOMS_COWORK_KEYS, ROOMS_DEFAULTS_KEYS,
-  TASKS_KEYS, TEMPLATE_KEYS, TEMPLATE_MEMBER_KEYS, TEMPLATE_OVERRIDE_KEYS,
+  TASKS_KEYS, TEMPLATE_KEYS, TEMPLATE_MEMBER_KEYS,
 } from './types.js';
 import {
   ROOMS_KEYS as RK, ROOMS_OWNER_KEYS as ROK, ROOMS_COWORK_KEYS as RCK,
   ROOMS_DEFAULTS_KEYS as RDK, TASKS_KEYS as TK, TEMPLATE_KEYS as TPK,
-  TEMPLATE_MEMBER_KEYS as TMK, TEMPLATE_OVERRIDE_KEYS as TOK,
+  TEMPLATE_MEMBER_KEYS as TMK,
 } from './types.js';
 import { BUILTIN_TEMPLATES } from './templates.js';
+import { isSensitiveConfigKey } from '../sensitive-config.js';
 
 const isPlainObject = (v: unknown): v is Record<string, unknown> =>
   v !== null && typeof v === 'object' && !Array.isArray(v);
@@ -191,19 +192,36 @@ export function validateRoomTemplatesConfig(
         throw new RoomsTasksConfigError(path, `room_templates.${name}.members[${i}].role: required string`);
       if (!Number.isInteger(m.count) || (m.count as number) < 1)
         throw new RoomsTasksConfigError(path, `room_templates.${name}.members[${i}].count: required positive integer`);
-      if (!m.role_ref || typeof m.role_ref !== 'string')
-        throw new RoomsTasksConfigError(path, `room_templates.${name}.members[${i}].role_ref: required string`);
-      if (m.overrides !== undefined) {
-        if (!isPlainObject(m.overrides))
-          throw new RoomsTasksConfigError(path, `room_templates.${name}.members[${i}].overrides: must be a mapping`);
-        rejectUnknown(m.overrides, TOK as unknown as string[], path, `room_templates.${name}.members[${i}].overrides`);
+      if (!isPlainObject(m.agent))
+        throw new RoomsTasksConfigError(path, `room_templates.${name}.members[${i}].agent: required mapping`);
+      const agentKeys = Object.keys(m.agent);
+      const isRef = agentKeys.length === 1 && typeof m.agent.ref === 'string';
+      const isDefinition = agentKeys.includes('role') && agentKeys.includes('brain');
+      if (!isRef && !isDefinition)
+        throw new RoomsTasksConfigError(path,
+          `room_templates.${name}.members[${i}].agent: must be {ref} or canonical {role, brain, ...}`);
+      const containsSensitive = (value: unknown): boolean => Array.isArray(value)
+        ? value.some(containsSensitive)
+        : Boolean(value && typeof value === 'object' && Object.entries(value as Record<string, unknown>)
+          .some(([key, child]) => isSensitiveConfigKey(key) || containsSensitive(child)));
+      if (isDefinition && containsSensitive(m.agent))
+        throw new RoomsTasksConfigError(path,
+          `room_templates.${name}.members[${i}].agent: inline sensitive configuration cannot be persisted; use references`);
+      if (isDefinition) {
+        const definition = m.agent as Record<string, unknown>;
+        const brain = isPlainObject(definition.brain) && isPlainObject(definition.brain.inline)
+          ? definition.brain.inline : undefined;
+        if (definition.env !== undefined || definition.owner_channel !== undefined
+            || definition.auth_proxy !== undefined || brain?.harness_options !== undefined
+            || brain?.session_options !== undefined)
+          throw new RoomsTasksConfigError(path,
+            `room_templates.${name}.members[${i}].agent: secret-capable inline fields cannot be persisted; use references`);
       }
       return {
         slot: m.slot as string,
         role: m.role as string,
         count: m.count as number,
-        role_ref: m.role_ref as string,
-        overrides: m.overrides as Record<string, unknown> | undefined,
+        agent: structuredClone(m.agent) as TemplateMemberSlot['agent'],
       };
     });
 

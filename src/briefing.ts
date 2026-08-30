@@ -193,10 +193,10 @@ export function generateBriefing(role: ResolvedRole, v: BriefingVocab, opts: Bri
     L.push('This ACP role has a supervisor-scoped ours-fleet proxy. Use the ordinary');
     L.push('`ours-fleet spawn` command; the CLI routes it through your live supervisor, which');
     L.push('records you as the caller and reports successful creation to your owner channel.');
-    L.push('A minimal call is `ours-fleet spawn --role DeveloperName --temp`.');
-    L.push('For omitted execution settings, the supervisor inherits your harness, session, model,');
+    L.push('A minimal call is `ours-fleet spawn DeveloperName --temp`.');
+    L.push('For omitted settings, the supervisor inherits your canonical Brain and Role selections,');
     L.push('working directory, neutral permissions, coordinator, and fleet monitor policy. Every');
-    L.push('explicit spawn option wins. An explicit different harness does not inherit your model.');
+    L.push('explicit option wins; identity/session-local and secret material never inherit.');
     L.push('This proxy is attribution and convenience, not a security boundary for unisolated roles.');
   }
   if (role.coordinator) {

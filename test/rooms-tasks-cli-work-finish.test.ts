@@ -140,7 +140,7 @@ function writeCustomTemplate(include = true): void {
       '    version: 7',
       '    description: durable template',
       '    members:',
-      '      - { slot: dev, role: Developer, count: 1, role_ref: Dev }',
+      '      - { slot: dev, role: Developer, count: 1, agent: { ref: Dev } }',
       '',
     ].join('\n') : ''));
 }

@@ -53,6 +53,7 @@ const caller = {
   cwd: '/work/project', model: 'gpt-test', sourceFile: '/fleet.yaml',
   permissions: { approval: 'allow', filesystem: 'unrestricted', unattended: 'wait' },
   permissionsDeclared: true,
+  agentSelections: { brain: { ref: 'codex' }, role: { ref: 'Coordinator' } },
   monitor: {
     mode: 'fleet', enabled: true, wake_sources: ['message_received'], batch_ms: 2_000,
     inject: 'notification', interrupt: true, turn_fail_threshold: 3,
@@ -70,7 +71,9 @@ function template(count = 2): TemplateSnapshot {
   return {
     name: 'simple', version: 1, description: 'Simple room', content_hash: 'a'.repeat(64),
     contract: 'Implement, review, and report evidence.',
-    members: [{ slot: 'developer', role: 'Developer', count, role_ref: 'Dev' }],
+    members: [{ slot: 'developer', role: 'Developer', count, agent: {
+      brain: { inline: { harness: 'codex' } }, role: { inline: { persona: 'Developer' } },
+    } }],
   };
 }
 
@@ -243,7 +246,7 @@ describe('simple Cowork room member startup', () => {
     expect(spawn.roomMemberStartup.task).toContain('Goal: Implement it');
     expect(spawn.roomMemberStartup.task).toContain('Brief: Keep it simple.');
     expect(spawn.roomMemberStartup.task).toContain('Collaboration contract:');
-    expect(spawn.mission).toBe(spawn.roomMemberStartup.task);
+    expect(spawn).not.toHaveProperty('mission');
   });
 
   it('waits for seat acceptance without reissuing or relaunching a live member', async () => {
@@ -262,6 +265,22 @@ describe('simple Cowork room member startup', () => {
     h.acceptAll();
     const active = await provisionMembers(input);
     expect(active.state).toBe('active');
+    expect(h.issueInvite).toHaveBeenCalledTimes(1);
+    expect(mocks.spawnTemp).toHaveBeenCalledTimes(1);
+  });
+
+  it('fails safely when a pending seat Agent definition drifts before recovery', async () => {
+    createRoomRecord({ room_id: 'room-drift', room_name: 'Room', room_identity_cid: 'room-cid' });
+    const h = coworkHarness({ acceptOnSpawn: false });
+    const input = { cfg: cfg(), cowork: h.cowork, roomId: 'room-drift', template: template(1),
+      binPath: '/usr/bin/ours-fleet', startupWait: { timeoutMs: 0, now: () => 1 } };
+    await provisionMembers(input);
+    const drifted = structuredClone(input.template);
+    drifted.members[0].agent = {
+      brain: { inline: { harness: 'codex', model: 'different-model' } }, role: { inline: {} },
+    };
+    await expect(provisionMembers({ ...input, template: drifted }))
+      .rejects.toThrow(/Agent definition drift.*durable launch intent/);
     expect(h.issueInvite).toHaveBeenCalledTimes(1);
     expect(mocks.spawnTemp).toHaveBeenCalledTimes(1);
   });
@@ -307,19 +326,37 @@ describe('simple Cowork room member startup', () => {
     expect(readFileSync(roomFile, 'utf8')).toContain('invite-1');
   });
 
-  it('preserves role harness, model, cwd, and persona overrides', async () => {
+  it('persists only a structural Agent projection, never secret-capable values', async () => {
+    createRoomRecord({ room_id: 'room-redact', room_name: 'Room', room_identity_cid: 'room-cid' });
+    const tpl = template(1);
+    tpl.members[0].agent = {
+      brain: { inline: { harness: 'codex', harness_options: { endpoint: 'brain-sentinel' } } },
+      role: { inline: { persona: 'safe' } }, env: { ENDPOINT: 'env-sentinel' },
+    };
+    await provisionMembers({ cfg: cfg(), cowork: coworkHarness().cowork, roomId: 'room-redact',
+      template: tpl, binPath: '/usr/bin/ours-fleet' });
+    const state = readFileSync(join(root, '.ours-fleet', 'rooms', 'room-redact.json'), 'utf8');
+    expect(state).not.toContain('brain-sentinel');
+    expect(state).not.toContain('env-sentinel');
+    expect(state).toContain('agent_fingerprint');
+    expect(state).toContain('operationalFields');
+  });
+
+  it('preserves the canonical room Agent definition', async () => {
     createRoomRecord({ room_id: 'room-override', room_name: 'Room', room_identity_cid: 'room-cid' });
     const h = coworkHarness();
     const tpl = template(1);
-    tpl.members[0].overrides = {
-      harness: 'codex', model: 'gpt-test', cwd: '/workspace', persona: 'Review carefully.',
+    tpl.members[0].agent = {
+      brain: { inline: { harness: 'codex', model: 'gpt-test' } },
+      role: { inline: { persona: 'Review carefully.' } }, cwd: '/workspace',
     };
     await provisionMembers({
       cfg: cfg(), cowork: h.cowork, roomId: 'room-override', template: tpl,
       binPath: '/usr/bin/ours-fleet',
     });
     expect(mocks.spawnTemp.mock.calls[0][0]).toMatchObject({
-      harness: 'codex', model: 'gpt-test', cwd: '/workspace',
+      agentDefinition: { brain: { inline: { harness: 'codex', model: 'gpt-test' } },
+        role: { inline: { persona: 'Review carefully.' } }, cwd: '/workspace' },
     });
     expect(mocks.spawnTemp.mock.calls[0][0].roomMemberStartup.task)
       .toContain('Role persona:\nReview carefully.');
@@ -332,6 +369,7 @@ describe('simple Cowork room member startup', () => {
       process.env[FLEET_PROXY_CALLER_ENV] = 'Coordinator';
       const selected = BUILTIN_TEMPLATES.find(candidate => candidate.name === templateName)!;
       const tpl = snapshotTemplate(selected);
+      tpl.members = tpl.members.map(member => ({ ...member, agent: structuredClone(template(1).members[0].agent) }));
       createRoomRecord({
         room_id: `room-${templateName}`, room_name: 'Room', room_identity_cid: 'room-cid',
       });
@@ -352,15 +390,8 @@ describe('simple Cowork room member startup', () => {
         });
       }
       for (const [spawn] of mocks.spawnTemp.mock.calls) {
-        expect(spawn).toMatchObject({
-          harness: 'codex', session: 'acp', model: 'gpt-test', cwd: '/work/project',
-          coordinator: 'Coordinator', approval: 'allow', filesystem: 'unrestricted',
-          unattended: 'wait', monitorConfig: { mode: 'fleet', interrupt: true },
-          callerRole: 'Coordinator', inheritedFromCaller: [
-            'harness', 'session', 'cwd', 'coordinator', 'approval', 'filesystem',
-            'unattended', 'monitorConfig', 'model',
-          ],
-        });
+        expect(spawn).toMatchObject({ agentDefinition: template(1).members[0].agent,
+          callerRole: 'Coordinator', inheritedFromCaller: [] });
       }
     },
   );
@@ -383,18 +414,18 @@ describe('simple Cowork room member startup', () => {
       ...mocks.spawnTemp.mock.calls[0][0], name: 'fallback-preview', identity: 'fallback-preview',
     }).resolvedRole;
     expect(fallback).toMatchObject({
-      harness: 'claude-code', session: 'acp',
+      harness: 'codex', session: 'acp',
       permissions: { approval: 'ask', filesystem: 'workspace', unattended: 'deny' },
       monitor: { mode: 'fleet' },
     });
   });
 
-  it('keeps explicit member settings ahead of caller inheritance and suppresses cross-harness model', async () => {
+  it('keeps the exact canonical member definition ahead of caller inheritance', async () => {
     process.env[FLEET_PROXY_STATE_DIR_ENV] = '/state/Coordinator';
     process.env[FLEET_PROXY_CALLER_ENV] = 'Coordinator';
     const tpl = template(1);
-    tpl.members[0].overrides = {
-      harness: 'claude-code', cwd: '/explicit',
+    tpl.members[0].agent = {
+      brain: { inline: { harness: 'claude-code' } }, role: { inline: {} }, cwd: '/explicit',
       permissions: { approval: 'ask', filesystem: 'workspace', unattended: 'deny' },
     };
     createRoomRecord({
@@ -410,14 +441,10 @@ describe('simple Cowork room member startup', () => {
 
     const spawn = mocks.spawnTemp.mock.calls[0][0];
     expect(spawn).toMatchObject({
-      harness: 'claude-code', session: 'acp', cwd: '/explicit', coordinator: 'Coordinator',
-      approval: 'ask', filesystem: 'workspace', unattended: 'deny',
-      monitorConfig: { mode: 'fleet', interrupt: true },
+      agentDefinition: { brain: { inline: { harness: 'claude-code' } }, role: { inline: {} },
+        cwd: '/explicit', permissions: { approval: 'ask', filesystem: 'workspace', unattended: 'deny' } },
     });
-    expect(spawn.model).toBeUndefined();
-    expect(spawn.inheritedFromCaller).toEqual([
-      'session', 'coordinator', 'monitorConfig',
-    ]);
+    expect(spawn.inheritedFromCaller).toEqual([]);
   });
 
   it('adopts supervisor provenance after a crash before the spawn response', async () => {

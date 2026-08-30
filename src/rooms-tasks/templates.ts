@@ -14,9 +14,9 @@ const TEAM: TemplateDefinition = {
     'Completion requires tester sign-off.',
   ].join('\n'),
   members: [
-    { slot: 'architect', role: 'Architect', count: 1, role_ref: 'Architect' },
-    { slot: 'developer', role: 'Developer', count: 1, role_ref: 'Developer' },
-    { slot: 'tester', role: 'Tester', count: 1, role_ref: 'Tester' },
+    { slot: 'architect', role: 'Architect', count: 1, agent: { ref: 'Architect' } },
+    { slot: 'developer', role: 'Developer', count: 1, agent: { ref: 'Developer' } },
+    { slot: 'tester', role: 'Tester', count: 1, agent: { ref: 'Tester' } },
   ],
 };
 
@@ -33,8 +33,8 @@ const PAIR: TemplateDefinition = {
     'Completion requires joint sign-off.',
   ].join('\n'),
   members: [
-    { slot: 'secretary', role: 'Secretary', count: 1, role_ref: 'Secretary' },
-    { slot: 'critic', role: 'Critic', count: 1, role_ref: 'Critic' },
+    { slot: 'secretary', role: 'Secretary', count: 1, agent: { ref: 'Secretary' } },
+    { slot: 'critic', role: 'Critic', count: 1, agent: { ref: 'Critic' } },
   ],
 };
 
@@ -49,7 +49,7 @@ const SINGLE: TemplateDefinition = {
     'Owner reviews and approves completion.',
   ].join('\n'),
   members: [
-    { slot: 'agent', role: 'Agent', count: 1, role_ref: 'Agent' },
+    { slot: 'agent', role: 'Agent', count: 1, agent: { ref: 'Agent' } },
   ],
 };
 

@@ -2,6 +2,7 @@ import { describe, it, expect, beforeAll, beforeEach, afterEach } from 'vitest';
 import {
   existsSync,
   chmodSync,
+  cpSync,
   mkdirSync,
   mkdtempSync,
   readFileSync,
@@ -145,7 +146,18 @@ describe('ours-fleet CLI', () => {
   });
 
   it('config prints the merged plan from the example file', async () => {
-    const r = await run(['config', '-c', resolve('examples/fleet.yaml')]);
+    const example = join(dir, 'example');
+    mkdirSync(example);
+    cpSync(resolve('examples/fleet.yaml'), join(example, 'fleet.yaml'));
+    cpSync(resolve('examples/fleet'), join(example, 'fleet'), { recursive: true });
+    chmodSync(join(example, 'fleet.yaml'), 0o600);
+    for (const kind of ['agents', 'roles', 'brains']) {
+      chmodSync(join(example, 'fleet', kind), 0o700);
+      for (const name of (await import('node:fs')).readdirSync(join(example, 'fleet', kind)))
+        chmodSync(join(example, 'fleet', kind, name), 0o600);
+    }
+    chmodSync(join(example, 'fleet'), 0o700);
+    const r = await run(['config', '-c', join(example, 'fleet.yaml')]);
     expect(r.code).toBe(0);
     expect(r.stdout).toContain('● FleetCoordinator');
     expect(r.stdout).toContain('● Alice');
@@ -239,7 +251,7 @@ describe('ours-fleet CLI', () => {
       const r = await run([command]);
       expect(r.code).toBe(0);
       expect(r.stdout).toContain('# ours-fleet reference');
-      expect(r.stdout).toContain('Both lifetimes support `--session acp`');
+      expect(r.stdout).toContain('--brain BRAIN_ID --role ROLE_ID');
       expect(r.stdout).toContain('approval: ask|auto|allow');
       expect(r.stdout).toContain('@agentclientprotocol/codex-acp');
       expect(r.stdout).toContain('bundled automatically');
@@ -432,11 +444,12 @@ describe('ours-fleet CLI', () => {
     expect(cfgAfter.stdout).not.toContain('(held down)');
   });
 
-  it('spawn --help lists model and Codex controls', async () => {
+  it('spawn --help exposes only Brain/Role agent configuration', async () => {
     const r = await run(['spawn', '--help']);
     expect(r.code).toBe(0);
-    expect(r.stdout).toContain('--model');
-    for (const flag of ['--permission-mode', '--sandbox', '--profile', '--launcher', '--codex-config', '--add-dir', '--monitor'])
+    expect(r.stdout).not.toContain('--model');
+    expect(r.stdout).not.toContain('--harness');
+    for (const flag of ['--brain', '--role', '--approval', '--filesystem', '--unattended'])
       expect(r.stdout).toContain(flag);
   });
 

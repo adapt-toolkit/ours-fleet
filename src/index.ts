@@ -24,7 +24,7 @@ export { pickBackend } from './supervisor/index.js';
 export type { SupervisorBackend } from './supervisor/types.js';
 export { up, down, restartRoles, rmRole, applyRole } from './ops.js';
 export {
-  spawnPermanent, spawnTemp, buildRoleConfig, profileValues, validateSpawnOpts,
+  spawnPermanent, spawnTemp, agentDefinitionFromSpawn, validateSpawnOpts,
 } from './spawn.js';
 export { RoleRepository } from './application/role-repository.js';
 export { FleetQueryService } from './application/fleet-query-service.js';

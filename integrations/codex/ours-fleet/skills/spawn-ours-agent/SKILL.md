@@ -105,20 +105,10 @@ Ask only for choices not already supplied:
 - **Persona:** local operating contract covering mandate, quality bar,
   boundaries, and escalation. Use the writing-agent-bios skill when available.
 - **Coordinator:** optionally announce readiness to an existing ours identity.
-- **Native Codex mail monitoring:** explicitly ask whether to arm it. Pass the
-  legacy `--monitor` consent flag only after a clear yes. This is distinct from
-  fleet YAML `monitor.mode: fleet|native`, which chooses the wake owner.
+- **Brain:** select a declared Brain whose Codex runtime and monitor policy match the request.
 
-Codex-native controls, offered when relevant:
-
-- model: launcher default or `--model <id>`
-- native approval: `--permission-mode untrusted|on-request|never`
-- native sandbox: `--sandbox read-only|workspace-write|danger-full-access`
-- launcher: `auto` (preferred), `ours-codex`, or `codex`
-- profile: `--profile <name>`
-- search: `--search`
-- arbitrary config: repeatable `--codex-config key=value`
-- additional writable roots: repeatable `--add-dir <path>`
+Codex-native model, reasoning, sandbox, launcher, profile, search, arbitrary config,
+and additional writable roots are Brain-owned and are never separate spawn flags.
 
 ## 5. Materialize approved profile text
 
@@ -150,10 +140,8 @@ cannot cross.
 Build an argument array from the approved choices. Permanent, unattended:
 
 ```sh
-ours-fleet spawn Worker --harness codex --launcher auto \
-  --session acp \
-  --mission "Own the worker implementation" --cwd /absolute/project \
-  --bio-file /tmp/worker-bio.md --persona-file /tmp/worker-persona.md \
+ours-fleet spawn Worker --brain CodexWorker --role Worker \
+  --cwd /absolute/project \
   --approval allow --filesystem workspace --unattended deny \
   --isolation-file /tmp/worker-isolation.yaml \
   --coordinator Coordinator
@@ -162,17 +150,12 @@ ours-fleet spawn Worker --harness codex --launcher auto \
 Permanent, attended — a human will answer its prompts:
 
 ```sh
-ours-fleet spawn Worker --harness codex --launcher auto \
-  --session acp \
-  --mission "Own the worker implementation" --cwd /absolute/project \
-  --bio-file /tmp/worker-bio.md --persona-file /tmp/worker-persona.md \
+ours-fleet spawn Worker --brain CodexWorker --role Worker \
+  --cwd /absolute/project \
   --approval ask --filesystem workspace --unattended wait
 ```
 
-Add `--temp` for a temporary role; it can also use `--session acp`.
-Pass the legacy `--monitor` flag only after consent to arm Codex's native
-monitor. It does not select the wake owner; `monitor.mode` does that in YAML.
-Pass model, profile, search, config, and additional directories exactly as
+Add `--temp` for a temporary role. Pass Brain and Role selections exactly as
 approved. Do not persist secrets in `--codex-config` or fleet YAML; use the
 role's `env` configuration for environment-based credentials.
 

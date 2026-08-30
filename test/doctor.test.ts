@@ -865,13 +865,13 @@ describe('doctor rooms-tasks checks', () => {
     expect(cw.detail).toMatch(/management socket/);
   });
 
-  it('warns on template role_ref referencing unknown role', async () => {
+  it('warns on template Agent ref referencing an unknown Agent', async () => {
     registerAdapter(fakeAdapter);
-    writeCfg(ROOMS_YAML() + `room_templates:\n  my-team:\n    version: 1\n    description: test\n    members:\n      - slot: dev\n        role: Dev\n        count: 1\n        role_ref: NonExistentRole\n`);
+    writeCfg(ROOMS_YAML() + `room_templates:\n  my-team:\n    version: 1\n    description: test\n    members:\n      - slot: dev\n        role: Dev\n        count: 1\n        agent: { ref: NonExistentAgent }\n`);
     const rep = await run();
-    const tpl = rep.checks.find(c => c.name?.startsWith('template:') && c.detail?.includes('NonExistentRole'))!;
+    const tpl = rep.checks.find(c => c.name?.startsWith('template:') && c.detail?.includes('NonExistentAgent'))!;
     expect(tpl).toBeTruthy();
-    expect(tpl.detail).toContain('not found in configured roles');
+    expect(tpl.detail).toContain('not found in configured Agents');
   });
 
   it('validates default template when configured', async () => {

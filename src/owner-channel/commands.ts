@@ -728,8 +728,8 @@ export const ownerCommands: OwnerCommand[] = [
           ...(t.builtin ? ['Source: built-in'] : []),
           ...(t.contract ? [`Contract: ${t.contract}`] : []),
           'Members:',
-          ...t.members.map(m =>
-            `  ${m.slot} (${m.role}) ×${m.count} → role_ref: ${m.role_ref}`),
+          ...t.members.map(m => `  ${m.slot} (${m.role}) ×${m.count} → `
+            + `${'ref' in m.agent ? `Agent ref: ${m.agent.ref}` : 'inline Agent'}`),
         ];
         await ctx.reply(lines.join('\n'));
       };
