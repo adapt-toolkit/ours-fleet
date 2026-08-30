@@ -77,6 +77,34 @@ describe('production agent-session adapters', () => {
     }));
   });
 
+  it.each(['low', 'high'] as const)(
+    'Codex carries resolved %s effort to actual ACP session construction', async effort => {
+      const transport = vi.fn(async () => session);
+      const adapter = makeCodexAdapter(exec, transport);
+      const resolvedRole = role('codex', { model: 'gpt-test', effort });
+
+      await start(adapter, resolvedRole, { env: {} }, 'fresh');
+
+      expect(transport).toHaveBeenCalledWith(expect.objectContaining({
+        configSelections: [
+          { configId: 'model', value: 'gpt-test' },
+          { configId: 'reasoning_effort', value: effort },
+        ],
+      }));
+    },
+  );
+
+  it('Codex leaves ACP runtime defaults untouched when Brain effort is omitted', async () => {
+    const transport = vi.fn(async () => session);
+    const adapter = makeCodexAdapter(exec, transport);
+
+    await start(adapter, role('codex', { model: 'gpt-test' }), { env: {} }, 'fresh');
+
+    expect(transport).toHaveBeenCalledWith(expect.objectContaining({
+      configSelections: [{ configId: 'model', value: 'gpt-test' }],
+    }));
+  });
+
   it('Codex treats an operator-selected ACP command as untrusted', async () => {
     const transport = vi.fn(async () => session);
     const adapter = makeCodexAdapter(exec, transport);

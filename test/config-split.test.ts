@@ -5,6 +5,7 @@ import { tmpdir } from 'node:os';
 import { findRole, loadConfig } from '../src/config.js';
 import { spawnDryRun } from '../src/spawn.js';
 import { resolvedRolePlan } from '../src/resolved-plan.js';
+import { getAdapter } from '../src/harness/registry.js';
 import '../src/harness/codex.js';
 import '../src/harness/claude-code.js';
 
@@ -57,6 +58,10 @@ describe('Agent Role Brain split configuration', () => {
       mission: 'Build it', persona: 'Be precise', bio: 'Developer', cwd: '/work/alice',
     });
     expect(alice.harness_options).toMatchObject({ config: { model_reasoning_effort: 'high' } });
+    expect(getAdapter('codex').agentSession.sessionConfigSelections(alice)).toEqual([
+      { configId: 'model', value: 'gpt-5.6' },
+      { configId: 'reasoning_effort', value: 'high' },
+    ]);
     expect(alice.sourceFile).toBe(join(dir, 'fleet', 'agents', 'Alice.yaml'));
     expect(cfg.configMode).toBe('split-v2');
     expect(cfg.sourceDocuments).toEqual(expect.arrayContaining([
@@ -154,6 +159,30 @@ describe('Agent Role Brain split configuration', () => {
       expect(dry.roleDocument).toMatchObject({ brain: { inline: { harness, effort } } });
       expect(dry.resolvedRole).toMatchObject({ harness, effort, harness_options: native });
     }
+  });
+
+  it('routes a room canonical agent definition through the same Codex effort constructor', () => {
+    manifest();
+    kind('agents', 'Existing.yaml',
+      'role: { inline: {} }\nbrain: { inline: { harness: codex } }\n');
+    const dry = spawnDryRun({
+      name: 'RoomMember', temp: true, configPath: join(dir, 'fleet.yaml'),
+      agentDefinition: {
+        brain: { inline: { harness: 'codex', model: 'gpt-room', effort: 'low' } },
+        role: { inline: { mission: 'Review' } },
+      },
+    });
+    expect(dry.roleDocument).toMatchObject({
+      brain: { inline: { harness: 'codex', model: 'gpt-room', effort: 'low' } },
+    });
+    expect(dry.resolvedRole).toMatchObject({
+      harness: 'codex', model: 'gpt-room', effort: 'low',
+      harness_options: { config: { model_reasoning_effort: 'low' } },
+    });
+    expect(getAdapter('codex').agentSession.sessionConfigSelections(dry.resolvedRole)).toEqual([
+      { configId: 'model', value: 'gpt-room' },
+      { configId: 'reasoning_effort', value: 'low' },
+    ]);
   });
 
   it('substitutes preset and inline values, but never refs, and rejects unknown vars safely', () => {

@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { chmodSync, mkdtempSync, writeFileSync, readFileSync, readdirSync, existsSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -88,6 +88,23 @@ function fakeDeps() {
 }
 
 describe('spawnPermanent', () => {
+  it('rejects unsupported Codex effort before identity, config, state, or service side effects', async () => {
+    const { d, calls } = fakeDeps();
+    const identityExists = vi.fn(async () => true);
+    d.identityProvisioner = { exists: identityExists };
+
+    await expect(spawnPermanent({
+      name: 'InvalidEffort', harness: 'codex', reasoningEffort: 'impossible',
+    }, d)).rejects.toThrow(
+      'Codex Brain effort must be one of: low, medium, high, xhigh, max, ultra',
+    );
+
+    expect(calls).toEqual([]);
+    expect(identityExists).not.toHaveBeenCalled();
+    expect(existsSync(join(dir, 'fleet', 'agents', 'InvalidEffort.yaml'))).toBe(false);
+    expect(existsSync(agentDir('InvalidEffort'))).toBe(false);
+  });
+
   it('rejects an effective identity already owned by a static role', async () => {
     const { d } = fakeDeps();
     await expect(spawnPermanent({ name: 'Other', identity: 'Coord' }, d))
