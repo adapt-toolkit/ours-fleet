@@ -21,6 +21,7 @@ export interface ResolvedBrainSelection {
   model?: string | null;
   harnessOptions?: Record<string, unknown>;
 }
+export interface AgentSessionConfigSelection { configId: string; value: string }
 
 export interface AgentSessionStartOptions {
   role: ResolvedRole;
@@ -45,5 +46,6 @@ export interface AgentSessionAdapter {
   /** Harness-owned environment channel used to pin/recover a model, if any. */
   modelEnvironmentVariable(): string | undefined;
   prepareLaunch(role: ResolvedRole, prep: SessionPrep): PreparedAgentSessionLaunch;
+  sessionConfigSelections(role: ResolvedRole): AgentSessionConfigSelection[];
   start(options: AgentSessionStartOptions): Promise<AgentSession>;
 }

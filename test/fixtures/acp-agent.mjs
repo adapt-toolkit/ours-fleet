@@ -33,6 +33,7 @@ let promptsAnswered = 0;
 const STEERING_OCCUPIES = process.env.ACP_FIXTURE_STEERING_OCCUPIES === '1';
 const STEERING_TURN_MS = parseInt(process.env.ACP_FIXTURE_STEERING_TURN_MS ?? '400', 10) || 400;
 let steeringTurnActive = false;
+let fixtureConfigOptions = JSON.parse(process.env.ACP_FIXTURE_CONFIG_OPTIONS ?? '[]');
 
 const stopReasonFor = text =>
   FORCED_STOP_REASON ??
@@ -240,7 +241,8 @@ createInterface({ input: process.stdin }).on('line', line => {
           messageId: 'new-params-1',
         });
       }
-      send({ jsonrpc: '2.0', id: message.id, result: { sessionId } });
+      send({ jsonrpc: '2.0', id: message.id,
+        result: { sessionId, configOptions: fixtureConfigOptions } });
       break;
     case 'session/resume':
       if (process.env.ACP_FIXTURE_REQUIRE_MCP_SERVERS === '1'
@@ -260,7 +262,7 @@ createInterface({ input: process.stdin }).on('line', line => {
           messageId: 'resume-params-1',
         });
       }
-      send({ jsonrpc: '2.0', id: message.id, result: {} });
+      send({ jsonrpc: '2.0', id: message.id, result: { configOptions: fixtureConfigOptions } });
       break;
     case 'session/load':
       if (process.env.ACP_FIXTURE_REQUIRE_MCP_SERVERS === '1'
@@ -286,7 +288,7 @@ createInterface({ input: process.stdin }).on('line', line => {
           messageId: 'load-params-1',
         });
       }
-      send({ jsonrpc: '2.0', id: message.id, result: {} });
+      send({ jsonrpc: '2.0', id: message.id, result: { configOptions: fixtureConfigOptions } });
       break;
     case 'session/close':
       send({ jsonrpc: '2.0', id: message.id, result: {} });
@@ -312,6 +314,27 @@ createInterface({ input: process.stdin }).on('line', line => {
       });
       send({ jsonrpc: '2.0', id: message.id, result: {} });
       break;
+    case 'session/set_config_option': {
+      if (process.env.ACP_FIXTURE_SET_CONFIG_FAIL === '1') {
+        send({ jsonrpc: '2.0', id: message.id,
+          error: { code: -32602, message: 'config unavailable' } });
+        break;
+      }
+      const option = fixtureConfigOptions.find(candidate =>
+        candidate.id === message.params.configId);
+      if (!option) {
+        send({ jsonrpc: '2.0', id: message.id,
+          error: { code: -32602, message: 'unknown config option' } });
+        break;
+      }
+      if (process.env.ACP_FIXTURE_IGNORE_CONFIG !== '1')
+        option.currentValue = message.params.value;
+      update({ sessionUpdate: 'agent_message_chunk', content: { type: 'text',
+        text: `config:${message.params.configId}=${message.params.value}` } });
+      send({ jsonrpc: '2.0', id: message.id,
+        result: { configOptions: fixtureConfigOptions } });
+      break;
+    }
     case 'session/prompt': {
       const text = message.params.prompt.find(block => block.type === 'text')?.text ?? '';
       // FLEET-003 wire shape: while a steering-started turn owns the adapter,

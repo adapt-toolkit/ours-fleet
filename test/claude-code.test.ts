@@ -27,6 +27,15 @@ const role = (over: Partial<ResolvedRole> = {}): ResolvedRole => ({
 });
 const okExec: Exec = async () => ({ stdout: '2.1.0 (Claude Code)', stderr: '', code: 0 });
 
+describe('Brain session configuration', () => {
+  it('maps explicit Brain effort to the required ACP effort option only', () => {
+    const session = makeClaudeCodeAdapter(okExec).agentSession;
+    expect(session.sessionConfigSelections(role({ effort: 'high' })))
+      .toEqual([{ configId: 'effort', value: 'high' }]);
+    expect(session.sessionConfigSelections(role())).toEqual([]);
+  });
+});
+
 describe('autocompactPct', () => {
   it('derives from max_tokens against the 1M window', () =>
     expect(autocompactPct(role({ max_tokens: 500000 }))).toBe(50));

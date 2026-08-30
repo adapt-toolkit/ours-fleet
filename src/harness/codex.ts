@@ -295,6 +295,8 @@ export function makeCodexAdapter(
             ? { adapterState: { permissionMetadataSource } } : {}),
         };
       },
+      sessionConfigSelections: role => typeof role.model === 'string'
+        ? [{ configId: 'model', value: role.model }] : [],
       permissionModeId: role => acpAgentMode(role),
       mcpServers: () => undefined,
       sessionMeta: () => undefined,
