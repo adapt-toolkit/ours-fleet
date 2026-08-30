@@ -600,6 +600,7 @@ describe('AcpSession', () => {
         statePath: '/state/Worker', harness: 'codex', session: 'acp' as const,
         model: 'gpt-test', monitor: { mode: 'fleet' as const, interrupt: true },
         inherited: ['harness', 'session'], creationActionId: 'action-1',
+        brainSummary: 'ref:B (inherited)', roleSummary: 'ref:R (inherited)',
       }));
       control.setFleetSpawner(spawn);
       const response = await controlRequest(stateDir, {

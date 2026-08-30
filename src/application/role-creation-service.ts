@@ -187,6 +187,14 @@ export class RoleCreationService {
     const creationActionId = randomUUID();
     plan.options.creationActionId = creationActionId;
     const statePath = await this.launchSync(plan.options);
+    const selectionSummary = (kind: 'brain' | 'role'): string => {
+      const value = plan.options[kind];
+      const provenance = plan.inherited.includes(kind) ? 'inherited' : 'explicit';
+      if (!value) return `unresolved (${provenance})`;
+      if ('ref' in value) return `ref:${value.ref} (${provenance})`;
+      const fingerprint = createHash('sha256').update(JSON.stringify(value.inline)).digest('hex').slice(0, 16);
+      return `inline:sha256:${fingerprint} (${provenance})`;
+    };
     return {
       caller: plan.caller, role: plan.options.name,
       lifetime: plan.options.temp ? 'temporary' : 'permanent', statePath,
@@ -195,6 +203,7 @@ export class RoleCreationService {
       monitor: { mode: plan.preview.resolvedRole.monitor.mode, interrupt: plan.preview.resolvedRole.monitor.interrupt },
       permissionMode: effectivePermissionMode(plan.preview.resolvedRole), inherited: plan.inherited,
       creationActionId,
+      brainSummary: selectionSummary('brain'), roleSummary: selectionSummary('role'),
     };
   }
 

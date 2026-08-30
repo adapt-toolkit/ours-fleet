@@ -72,7 +72,7 @@ export interface RunnerDeps {
   createControlServer(
     stateDir: string, session: AgentSession, log: (line: string) => void,
   ): Pick<RoleControlServer,
-    'start' | 'close' | 'setFleetSpawner' | 'setOwnerChannel' | 'setConfigReloader' | 'setLoopManager'>;
+    'start' | 'close' | 'setFleetSpawner' | 'setFleetAuditor' | 'setOwnerChannel' | 'setConfigReloader' | 'setLoopManager'>;
   /** Acquire the cross-process owner-channel binder lease before replacing the control socket. */
   acquireOwnerBinder(stateDir: string, role: string, identity: string): Promise<OwnerBinderLease>;
   /** Ask the still-authenticated predecessor to emit the fixed recovery notice. */
@@ -656,7 +656,6 @@ export async function runOnce(
   let sessionClosed = false;
   let ownerChannel: OwnerChannelHandle | undefined;
   let ownerBinder: OwnerBinderLease | undefined;
-  const pendingFleetSpawnNotices: ManagedFleetSpawnResult[] = [];
   let loopManager: ScheduledLoopManagerHandle | undefined;
   let arbiter: RoleTurnArbiter | undefined;
   let reloadLoopConfig: (() => Promise<{ changed: boolean; loops: number }>) | undefined;
@@ -715,16 +714,7 @@ export async function runOnce(
       throw error;
     }
     control.setFleetSpawner(async requested => {
-      const event = await executeManagedSpawn(role, configPath, requested, deps.log);
-      if (!role.owner_channel) return event;
-      if (ownerChannel?.notifyFleetSpawn) {
-        try { await ownerChannel.notifyFleetSpawn(event); }
-        catch (error) {
-          deps.log(`[${name}] spawned-agent owner notice failed: `
-            + `${(error as Error)?.message ?? String(error)}`);
-        }
-      } else pendingFleetSpawnNotices.push(event);
-      return event;
+      return executeManagedSpawn(role, configPath, requested, deps.log);
     });
     resolvedMonitorDeps.delivery = {
       // A wake is only delivered when its turn TERMINATES successfully. A
@@ -842,15 +832,14 @@ export async function runOnce(
         throw new Error(`[${name}] owner channel failed to start: `
           + `${(error as Error)?.message ?? String(error)}`);
       }
-      for (const event of pendingFleetSpawnNotices.splice(0)) {
-        try { await ownerChannel.notifyFleetSpawn?.(event); }
-        catch (error) {
-          deps.log(`[${name}] deferred spawned-agent owner notice failed: `
-            + `${(error as Error)?.message ?? String(error)}`);
-        }
-      }
     }
-    if (ownerChannel) control.setOwnerChannel(ownerChannel);
+    if (ownerChannel) {
+      control.setOwnerChannel(ownerChannel);
+      control.setFleetAuditor({
+        begin: (requestId, argv) => ownerChannel!.beginFleetCommandAudit!(requestId, argv),
+        finish: input => ownerChannel!.finishFleetCommandAudit!(input),
+      });
+    }
     reloadLoopConfig = async (): Promise<{ changed: boolean; loops: number }> => {
       const nextRole = findRole(loadConfig(configPath), name);
       const definitions = nextRole.loops ?? [];

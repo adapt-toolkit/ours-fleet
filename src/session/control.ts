@@ -12,6 +12,10 @@ import type { ScheduledLoopManagerHandle } from '../loops/manager.js';
 import type { SpawnOpts } from '../spawn.js';
 import type { ManagedFleetSpawnResult } from '../fleet-proxy.js';
 import {
+  validateFleetAuditBegin, validateFleetAuditFinish,
+  type FleetAuditAttempt, type FleetAuditPresentation, type FleetCommandOutcomeClass,
+} from '../fleet-command-audit.js';
+import {
   interruptSession, queueSessionPrompt, respondSessionPermission, respondSessionPermissionV2,
 } from '../application/session-mutations.js';
 
@@ -24,7 +28,7 @@ export interface ControlRequest {
   command: 'status' | 'snapshot' | 'submit_prompt' | 'respond_permission' | 'interrupt' | 'follow' | 'events_since' | 'owner_channel_manage'
     | 'loop_status' | 'loop_run_now' | 'loop_disable' | 'loop_enable' | 'reload_config'
     | 'conversation_page' | 'conversation_follow' | 'submit_prompt_v2' | 'interrupt_v2'
-    | 'respond_permission_v2' | 'fleet_spawn';
+    | 'respond_permission_v2' | 'fleet_spawn' | 'fleet_audit_begin' | 'fleet_audit_finish';
   text?: string;
   permissionId?: string;
   optionId?: string;
@@ -47,6 +51,16 @@ export interface ControlRequest {
   sessionGeneration?: string;
   /** Typed managed-spawn request accepted only over the authenticated role control plane. */
   spawn?: SpawnOpts;
+  audit?: {
+    requestId?: string;
+    argv?: string[];
+    correlationId?: string;
+    class?: FleetCommandOutcomeClass;
+    exitCode?: number;
+    effect?: 'not_started' | 'completed' | 'unknown';
+    resourceIds?: Record<string, string>;
+    presentation?: FleetAuditPresentation;
+  };
 }
 
 /** Commands that require protocol version 3. */
@@ -212,6 +226,14 @@ export class RoleControlServer {
   private loopManager?: ScheduledLoopManagerHandle;
   private reloadConfig?: () => Promise<unknown>;
   private fleetSpawner?: (options: SpawnOpts) => Promise<ManagedFleetSpawnResult>;
+  private fleetAuditor?: {
+    begin(requestId: string, argv: string[]): Promise<FleetAuditAttempt>;
+    finish(input: {
+      correlationId: string; class: FleetCommandOutcomeClass; exitCode?: number;
+      effect: 'not_started' | 'completed' | 'unknown'; resourceIds?: Record<string, string>;
+      presentation?: FleetAuditPresentation;
+    }): Promise<FleetAuditAttempt>;
+  };
 
   constructor(
     stateDir: string,
@@ -264,6 +286,8 @@ export class RoleControlServer {
   ): void {
     this.fleetSpawner = fleetSpawner;
   }
+
+  setFleetAuditor(auditor: RoleControlServer['fleetAuditor']): void { this.fleetAuditor = auditor; }
 
   private accept(socket: Socket): void {
     this.sockets.add(socket);
@@ -407,6 +431,28 @@ export class RoleControlServer {
           if (!this.fleetSpawner)
             throw new SessionControlError('rejected', 'managed fleet spawning is unavailable for this role');
           const result = await this.fleetSpawner(request.spawn);
+          this.write(socket, { version: 1, id: request.id, ok: true, result });
+          return;
+        }
+        case 'fleet_audit_begin': {
+          if (!this.fleetAuditor) throw new SessionControlError('rejected', 'fleet auditing is unavailable');
+          try { validateFleetAuditBegin(request.audit); }
+          catch { throw new SessionControlError('rejected', 'valid fleet audit begin fields are required'); }
+          const result = await this.fleetAuditor.begin(request.audit.requestId, request.audit.argv);
+          this.write(socket, { version: 1, id: request.id, ok: true, result });
+          return;
+        }
+        case 'fleet_audit_finish': {
+          if (!this.fleetAuditor) throw new SessionControlError('rejected', 'fleet auditing is unavailable');
+          try { validateFleetAuditFinish(request.audit); }
+          catch { throw new SessionControlError('rejected', 'valid fleet audit finish fields are required'); }
+          const audit = request.audit;
+          const result = await this.fleetAuditor.finish({
+            correlationId: audit.correlationId, class: audit.class, effect: audit.effect,
+            ...(audit.exitCode === undefined ? {} : { exitCode: audit.exitCode }),
+            ...(audit.resourceIds ? { resourceIds: audit.resourceIds } : {}),
+            ...(audit.presentation ? { presentation: audit.presentation } : {}),
+          });
           this.write(socket, { version: 1, id: request.id, ok: true, result });
           return;
         }

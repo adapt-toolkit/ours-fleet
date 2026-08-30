@@ -45,6 +45,11 @@ function distIsFresh(): boolean {
 }
 
 export default async function setup(): Promise<void> {
+  // The test runner itself may be launched from a managed Agent. Child CLI
+  // fixtures exercise direct/operator behavior unless a test explicitly sets
+  // the proxy pair, so do not accidentally audit the test harness as commands.
+  delete process.env.OURS_FLEET_PROXY_STATE_DIR;
+  delete process.env.OURS_FLEET_PROXY_CALLER;
   if (distIsFresh()) {
     console.log('[global-setup] dist fresh — skipping build');
     return;
