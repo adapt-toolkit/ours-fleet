@@ -23,24 +23,19 @@ ours-fleet doctor [-c FILE] [--harness codex|claude-code]
 ours-fleet version [--json]             # build identity, capabilities, every install on PATH
 \`\`\`
 
-Default configuration is \`~/fleet.yaml\` plus sorted \`~/fleet.d/*.yaml\` role
-drop-ins. An explicit \`-c FILE\` replaces \`~/fleet.yaml\`; fleet.d still adds
-roles. Validate with \`config\` and \`doctor\` before starting or restarting.
+Configuration v2 is \`~/fleet.yaml\` plus typed bare documents under the exact
+stem directories \`~/fleet/agents\`, \`~/fleet/roles\`, and \`~/fleet/brains\`.
+The manifest owns fleet-wide operational defaults and automation; each Agent
+selects one inline/ref Role and Brain and carries its operational fields.
+Legacy top-level \`roles:\` and \`fleet.d\` are rejected. Validate the complete
+trusted source set with \`config\` and \`doctor\` before starting or restarting.
 
-The CLI never writes the base file: \`spawn\` writes \`~/fleet.d/Name.yaml\`. The
-web console does write it, as a whole document — its setup wizard and
-configuration editor may create, change or remove any top-level block, including
-\`vars:\`, \`defaults:\`, \`roles:\`, \`watchdogs:\` and \`loops:\`. Only the base
-file may hold \`defaults:\`, \`watchdogs:\` and \`loops:\`; a fleet.d drop-in may
-declare \`roles:\` and nothing else. Unrecognised top-level keys are round-tripped
-untouched. Console edits are applied as surgical splices against the file's exact
-bytes, so an unchanged save is byte-identical and lines outside the edit keep their
-comments and spacing. One exception: changing the length of a block sequence
-(\`watch:\`, \`oversee:\`, \`roles:\`, \`wake_sources:\`) may replace that collection
-wholesale and drop inline comments written on its items; lines outside that
-collection remain byte-preserved. Each save is revision-guarded, reviewed as a diff
-of the real file before anything is written, validated by the real loader, and
-backed up next to the file first.
+Permanent \`spawn\` writes \`~/fleet/agents/Name.yaml\`. The web console edits an
+explicit \`{manifest, agents}\` model while Role/Brain presets remain read-only.
+Its aggregate revision includes every Agent/Role/Brain source, previews a
+redacted per-document diff in an exact-stem private staging tree, and saves under
+one root lock with a private multi-file backup and full rollback. A no-op is
+byte-identical and creates no backup.
 
 ## Build identity and install provenance
 
@@ -164,7 +159,7 @@ ours-fleet spawn [--temp] [Name | --role Name] \\
   --bio-file /path/bio.md --persona-file /path/persona.md
 \`\`\`
 
-Permanent spawn writes \`~/fleet.d/Name.yaml\` and starts a supervised role.
+Permanent spawn writes \`~/fleet/agents/Name.yaml\` and starts a supervised role.
 \`--temp\` writes active state under \`~/.ours-fleet/tmp\` and starts an independent
 transient supervisor (a collected systemd unit or submitted launchd job). It is
 not enabled across reboot and does not die when the role that spawned it restarts.
@@ -225,61 +220,17 @@ exact values.
 ## fleet.yaml
 
 \`\`\`yaml
+api_version: ours.network/fleet/v2
 vars:
   work_root: /home/me/work
 start_stagger_ms: 0
 defaults:
-  harness: codex
-  session: acp
-  model: gpt-model-id
   permissions:
     approval: ask
     filesystem: workspace
     unattended: deny
   monitor:
     mode: fleet                          # fleet (default) | native
-roles:
-  Coordinator:
-    harness: codex
-    session: acp
-    identity: Coordinator
-    cwd: \${work_root}/project
-    mission: Coordinate work and delegate implementation.
-    model: gpt-model-id
-    permissions:
-      approval: ask
-      filesystem: workspace
-      unattended: deny
-    session_options:                    # advanced overrides; normally omit
-      # acp:
-      #   command: [/custom/codex-acp, --flag]
-    monitor:
-      mode: fleet                        # fleet supervisor | native harness monitor
-      interrupt: false                    # false queues; true cancels; after_tool steers at an ACP tool boundary
-      wake_sources: [message_received, file_received, local_contact_request, pending_message]
-      batch_ms: 2000
-      inject: notification
-      turn_fail_threshold: 3
-    harness_options:
-      launcher: auto
-      sandbox: workspace-write
-      approval: on-request
-      search: false
-      profile: fleet
-      add_dirs: [/data/shared]
-      config:
-        model_reasoning_effort: high
-      mcp_servers:                       # claude-code: per-role MCP servers, additive by default
-        ours: { command: ours-mcp, args: [proxy] }
-      mcp_servers_only: false            # true = ONLY these; drops user/project/plugin servers
-    bio: Public role card and when peers should engage it.
-    persona: Local operating contract, boundaries, and escalation policy.
-    briefing_file: /absolute/custom-briefing.md
-    coordinator: AnotherCoordinator
-    env:
-      KEY: value
-    oversee:
-      - { role: Worker, interval: 5m }
 watchdogs:
   nightwatch:                       # [A-Za-z0-9_-], must not collide with a role name
     coordinator: FleetCoordinator   # required — where alerts go
@@ -287,9 +238,9 @@ watchdogs:
     enabled: true                   # default true; false = configured but never scheduled
     interval: 10m                   # default 10m; 30s | 10m | 2h, minimum 1m
     watch: [Alice, CodexReviewer]   # explicit lists are exact; omit for configured + live temp roles
-    harness: claude-code            # default: defaults.harness
+    harness: claude-code            # default: built-in claude-code
     model: claude-fable-5           # default: same resolution rule roles use (resolveRoleModel)
-    session: acp                    # default: defaults.session
+    session: acp                    # default: built-in ACP
     identity: Watchdog-nightwatch   # default: Watchdog-<name>
     timeout: 5m                     # default 5m; a run past this is killed and recorded as error
     keep_reports: 50                # default 50 reports retained per watchdog
@@ -301,10 +252,20 @@ watchdogs:
       fs: { read: [/opt/watch-data] }
 \`\`\`
 
+An Agent is a separate bare document under \`~/fleet/agents/<ID>.yaml\`:
+
+\`\`\`yaml
+role: { inline: { mission: Coordinate work and delegate implementation. } }
+brain: { inline: { harness: codex, session: acp, model: gpt-model-id } }
+identity: Coordinator
+cwd: \${work_root}/project
+oversee: [{ agent: Worker, interval: 5m }]
+\`\`\`
+
 A watchdog observes and reports; it never restarts, stops, spawns, or removes a
 role, answers a pending permission, edits a workspace, or approves anything on
 the owner's behalf. \`watchdogs:\` may appear only in the base config
-(\`~/fleet.yaml\` or \`-c FILE\`), not in \`~/fleet.d/*.yaml\` drop-ins.
+(\`~/fleet.yaml\` or \`-c FILE\`); Agent/Role/Brain documents never own it.
 Watchdogs are not isolated by default. An explicit watchdog \`isolation:\` block
 uses the same policy schema as a role and is applied unchanged; declare every
 extra filesystem access required by a custom prompt there.
@@ -312,8 +273,9 @@ When \`watch:\` is omitted, each run watches the configured roles plus temporary
 fleet roles that are live when the run starts. An explicit \`watch:\` list is
 never augmented.
 
-Role values override defaults. \`\${name}\` substitutes entries from \`vars\`.
-Other role fields include \`max_tokens\`, \`autocompact_pct\`, and \`isolation\`.
+Agent operational values override manifest operational defaults. Role and Brain
+ownership never cross-merges. \`\${name}\` substitutes entries from \`vars\`.
+Brain fields include \`max_tokens\` and \`autocompact_pct\`; isolation is Agent-owned.
 Use README.md for the complete isolation policy and resource-cap schema.
 
 Supervised roles connect to the operator-configured ours daemon; they do not own its

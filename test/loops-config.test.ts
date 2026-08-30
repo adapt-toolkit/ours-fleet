@@ -5,6 +5,7 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
 import { loadConfig } from '../src/config.js';
 import { resolvedPlan } from '../src/resolved-plan.js';
+import { writeV2Fixture } from './v2-fixture.js';
 
 let dir: string;
 let file: string;
@@ -18,7 +19,7 @@ afterEach(() => {
   rmSync(dir, { recursive: true, force: true });
 });
 
-const write = (yaml: string) => writeFileSync(file, yaml, { mode: 0o600 });
+const write = (yaml: string) => writeV2Fixture(file, yaml);
 
 describe('scheduled loop configuration', () => {
   it('resolves exact and permanent-only wildcard roles with full-interval defaults', () => {

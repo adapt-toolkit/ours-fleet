@@ -19,10 +19,10 @@ turns such sessions into **roles**: long-lived agents that
 - can **spawn subagents** (permanent or temporary) and **oversee** them: peek into
   a ward's console, answer a stuck prompt, nudge it back to work.
 
-The whole fleet is described in one hand-written `~/fleet.yaml`
-("docker-compose for agents"): who exists, what harness they run in, their mission,
-persona, bio, working directory, and who oversees whom. `ours-fleet up` makes
-reality match the file.
+The fleet uses a v2 manifest plus typed documents: `~/fleet.yaml` holds
+fleet-wide operational policy and automation, while `~/fleet/agents`,
+`~/fleet/roles`, and `~/fleet/brains` hold bare Agent, Role, and Brain documents.
+`ours-fleet up` makes reality match that trusted split source set.
 
 **Harness-agnostic by design.** The core never assumes a specific agent CLI; each
 harness is a small adapter (how to launch, how to resume, how to wire config).
@@ -31,17 +31,19 @@ public — each additional harness (Gemini CLI, OpenCode, …) is a small adapte
 A single fleet can mix harnesses per role:
 
 ```yaml
-roles:
-  Reviewer:                 # runs in Claude Code
-    harness: claude-code
-  Prototyper:                # runs in Codex CLI
-    harness: codex
+# ~/fleet/agents/Reviewer.yaml
+role: { ref: reviewer }
+brain: { inline: { harness: claude-code, session: acp } }
+
+# ~/fleet/agents/Prototyper.yaml
+role: { inline: { mission: Build prototypes } }
+brain: { inline: { harness: codex, session: acp } }
 ```
 
 ## How it works
 
 ```
-~/fleet.yaml + ~/fleet.d/*.yaml           your declaration
+~/fleet.yaml + ~/fleet/{agents,roles,brains}/*.yaml   your declaration
         │  ours-fleet up
         ▼
 briefing.md per role  ──►  agent session adapter  ──►  ACP client/session  ──►  ACP agent
@@ -105,8 +107,9 @@ become that account and repeat.
 ## Quickstart
 
 ```sh
+cp -R "$(npm root -g)/@ours.network/fleet/examples/fleet" ~/fleet
 cp "$(npm root -g)/@ours.network/fleet/examples/fleet.yaml" ~/fleet.yaml
-$EDITOR ~/fleet.yaml          # name your roles, missions, personas
+$EDITOR ~/fleet/agents/*.yaml # compose Role + Brain and operational settings
 ours-fleet up                 # boot the fleet (staggered)
 ours-fleet ls                 # running consoles
 ours-fleet attach Alice       # watch one live (Ctrl-b d to leave)
@@ -252,27 +255,19 @@ Security boundaries:
 - tests use temporary fleet homes and fake supervisors/identity providers—never
   active role state.
 
-Permanent spawns are written to `~/fleet.d/<Name>.yaml`; the CLI never edits your
-hand-written `~/fleet.yaml`. `ours-fleet rm <Name>` unspawns.
+Permanent spawns write a bare Agent document to
+`~/fleet/agents/<Name>.yaml`; generated-source ownership is recorded so removal
+never deletes an unproven hand-written neighbor. `ours-fleet rm <Name>` unspawns.
 
-The web console is the one writer that can touch the base file, and it saves the
-file as a whole document: its setup wizard and configuration editor may create,
-change or remove any top-level block, including `vars:`, `defaults:`, `roles:`,
-`watchdogs:` and `loops:`. (`defaults:`, `watchdogs:` and `loops:` can only live
-in the base file — a `~/fleet.d/*.yaml` drop-in may declare `roles:` and nothing
-else.) Top-level keys the console does not recognise are round-tripped untouched.
-
-Console edits are applied as surgical splices against the file's exact bytes, so
-an unchanged save is a byte-for-byte no-op and lines outside the edit keep their
-comments, spacing and quoting. One bounded exception: changing the *length* of a
-block sequence — adding or removing an entry under `watch:`, `oversee:`, `roles:`
-or `wake_sources:` — rewrites that one collection as a whole, which drops inline
-comments written on its individual items. The loss is confined to the collection
-you edited, is shown in the diff before anything is written, and can be declined
-by not saving. Each write is revision-guarded, reviewed as a diff of the real
-file, validated with the real loader, and preceded by a timestamped backup.
-Values under `env:` — and the `vars:` entries they interpolate — are masked in
-the diff and never leave the host.
+The web editor reads and writes the split document model explicitly as
+`{manifest, agents}`. Role and Brain presets are visible through Agent refs but
+remain read-only. Saves use one aggregate revision over the manifest and all
+Agent/Role/Brain sources, validate an exact-stem private staging tree, show a
+deterministic redacted diff per document, and hold one manifest-root lock.
+Changed/deleted files are backed up together; any partial failure restores every
+document or reports the private recovery directory. An unchanged save is a
+byte-for-byte no-op and creates no backup. Nested environment, authentication,
+invite, and isolation secrets never leave the host.
 
 From inside Claude Code, Codex, or Hermes with the core `ours` plugin installed,
 say **"spawn an ours agent …"**. The core skill checks for `ours-fleet`, installs
@@ -290,16 +285,16 @@ ours-fleet peek Worker          # what is it doing?
 ours-fleet send Worker "continue with the tests, then report"
 ```
 
-Declare standing assignments in `fleet.yaml` (rendered into the overseer's
+Declare standing assignments in the overseer's bare Agent document (rendered into its
 briefing) — or just write "keep an eye on Alice and Bob every 5 minutes" in a
 persona; the bundled `oversee-agents` skill defines what that means operationally:
 
 ```yaml
-roles:
-  FleetCoordinator:
-    oversee:
-      - { role: Alice, interval: 5m }
-      - { role: Bob,   interval: 5m }
+role: { ref: coordinator }
+brain: { ref: claude-default }
+oversee:
+  - { agent: Alice, interval: 5m }
+  - { agent: Bob,   interval: 5m }
 ```
 
 ## Command reference
@@ -342,28 +337,30 @@ in its state dir) across supervisor-triggered restarts — systemd/launchd re-in
 agent process with no arguments, so without this the role would silently fall back to
 the default `~/fleet.yaml` on its very first crash-restart and fail to resolve.
 
-## fleet.yaml reference
+## split configuration field reference
 
-```yaml
+The following is a schematic field inventory, not a single YAML document. Host
+settings belong in `~/fleet.yaml`; reusable behavior and harness settings belong
+in `~/fleet/roles/<id>.yaml` and `~/fleet/brains/<id>.yaml`; operational fields
+belong in `~/fleet/agents/<id>.yaml`.
+
+```text
 vars: { work_root: /home/me/work }      # ${var} substitution anywhere below
+api_version: ours.network/fleet/v2
 start_stagger_ms: 0                     # delay between agent LAUNCHES (host-wide, ms); 0 = no stagger
 defaults:
-  harness: claude-code                  # for roles that don't set one
-  session: acp                          # supported Fleet↔agent session path
   permissions:                         # common intent, translated by each harness/backend
     approval: ask                       # ask | auto | allow (`deny` is a deprecated alias)
     filesystem: workspace               # read-only | workspace | unrestricted
     unattended: deny                    # deny | wait
-  model: claude-fable-5                 # default model for roles that don't set one (per-role model / --model wins)
-  max_tokens: 500000                    # session cap (harness-interpreted)
   monitor:
     mode: fleet                         # fleet (default) | native
   worklog:                              # built-ins shown; set false to opt out
     max_kb: 1024                        # rotate only above this active-log size
     keep_tail_kb: 256                   # UTF-8 tail; line-aligned when one fits
     max_archives: 12                    # recent beside log; older preserved cold
-roles:
-  Name:                                 # [A-Za-z0-9_-]+
+Agent document:
+  Name:                                 # filename stem; [A-Za-z0-9_-]+
     harness: claude-code
     session: acp                         # optional; ACP is the only supported session
     session_options:
@@ -400,7 +397,7 @@ roles:
     bio: |                              # public card (published as bio)
     briefing_file: curated.md           # replaces the generated narrative
     env: { KEY: value }                 # extra session env
-    oversee: [{ role: X, interval: 5m }]
+    oversee: [{ agent: X, interval: 5m }]
     harness_options:                    # adapter-owned, adapter-validated
       plugins: { "name@marketplace": false }   # claude-code: plugin overrides
       # mem_palace: false                      # claude-code: disable memory plugin
@@ -438,13 +435,12 @@ loops:                                    # trusted local scheduled ACP turns
       If nothing material changed, complete silently without an owner report.
 ```
 
-Merge order: `fleet.yaml` ← `fleet.d/*.yaml`; a duplicate role name is a hard
-error naming both files. Identities and roles are decoupled — removing a role
-never deletes an identity. `session` is ACP-backed for both supported harnesses.
-`defaults.harness_options` is shallow-merged with each
-role's `harness_options`, so a fleet can set common Codex permission/profile defaults
-and override individual keys per role. `monitor` merges the same way — a role block
-overrides `defaults.monitor` key-by-key.
+The v2 loader reads the manifest, then sorted bare Role, Brain, and Agent
+documents from its exact stem directory. Duplicate filename-derived IDs are a
+hard error. Identities and Agents are decoupled—removing an Agent never deletes
+an identity. Role, Brain, and operational ownership are composed explicitly;
+there is no generic cross-kind merge. Manifest operational defaults such as
+`monitor` and `permissions` merge only within their owning Agent fields.
 
 Every supervised role is a client of the operator-configured ours daemon. Fleet strips the
 obsolete, presence-sensitive `OURS_AUTOSTART` variable from ACP harness
@@ -1037,27 +1033,22 @@ the structured CLI watcher, because a detached process cannot wake a Codex turn.
 wait is re-entered after each handled message; `ours-codex` instead wakes the idle
 session through its App Server integration.
 
-The main Codex controls needed by fleet roles are available declaratively and when spawning:
+The main Codex controls are Brain-owned and also available when spawning:
 
 ```yaml
-defaults:
-  harness: codex
-  model: gpt-5.4
-  harness_options:
-    launcher: auto
-    profile: fleet                 # $CODEX_HOME/fleet.config.toml
-    sandbox: workspace-write
-    approval: on-request
-    monitor: true                  # consent for Codex's native monitor; not the wake-owner selector
-    search: true
-    add_dirs: [/data/shared]
-    config:
-      model_reasoning_effort: high
-
-roles:
-  Reviewer:
-    harness_options:
-      sandbox: read-only           # overrides just this default key
+# ~/fleet/brains/codex-review.yaml
+harness: codex
+session: acp
+model: gpt-5.4
+harness_options:
+  launcher: auto
+  profile: fleet
+  sandbox: read-only
+  approval: on-request
+  monitor: true
+  search: true
+  add_dirs: [/data/shared]
+  config: { model_reasoning_effort: high }
 ```
 
 Equivalent one-off/permanent spawn controls include `--model`, `--permission-mode`,

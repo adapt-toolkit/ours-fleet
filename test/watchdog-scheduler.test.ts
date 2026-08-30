@@ -13,6 +13,7 @@ import {
 import { errorReport } from '../src/watchdog/report.js';
 import { readLedger, writeLedger } from '../src/watchdog/alerts.js';
 import { loadConfig } from '../src/config.js';
+import { writeV2Fixture } from './v2-fixture.js';
 
 /** A pid that is guaranteed dead: spawnSync blocks until the child has exited. */
 function deadPid(): number {
@@ -203,7 +204,7 @@ describe('watchdog scheduler', () => {
 
 describe('runScheduler threads its loaded config through to run and notifier dependencies', () => {
   const cfgPath = () => join(dir, 'fleet.yaml');
-  const writeCfgFile = () => writeFileSync(cfgPath(),
+  const writeCfgFile = () => writeV2Fixture(cfgPath(),
     'roles:\n  Alice: {}\nwatchdogs:\n  nightwatch: { coordinator: FleetCoordinator }\n');
 
   it('passes the scheduler-loaded cfg into runOnceFor\'s deps, not the default loadConfig() fallback', async () => {
@@ -259,7 +260,7 @@ describe('runScheduler threads its loaded config through to run and notifier dep
 });
 
 describe('runScheduler recovers a run lock at startup only when it is demonstrably stale', () => {
-  const writeCfg = () => writeFileSync(join(dir, 'fleet.yaml'),
+  const writeCfg = () => writeV2Fixture(join(dir, 'fleet.yaml'),
     'roles:\n  Alice: {}\nwatchdogs:\n  nightwatch: { coordinator: FleetCoordinator }\n');
 
   it('reclaims a lock whose owner pid is dead, so a SIGKILLed prior run does not wedge scheduling forever', async () => {

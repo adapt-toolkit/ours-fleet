@@ -10,6 +10,7 @@ import { RoleCreationService } from '../../src/application/role-creation-service
 import type { SupervisorBackend } from '../../src/supervisor/types.js';
 import type { OpsDeps } from '../../src/ops.js';
 import { SessionControlError } from '../../src/session/types.js';
+import { writeV2Fixture } from '../v2-fixture.js';
 
 let oldHome: string | undefined;
 afterEach(() => {
@@ -42,7 +43,7 @@ const backend: SupervisorBackend = {
 describe('application services', () => {
   it('unions configured, permanent, temporary, orphan, and corrupt state without secrets', async () => {
     const root = fixture();
-    writeFileSync(join(root, 'fleet.yaml'), `
+    writeV2Fixture(join(root, 'fleet.yaml'), `
 roles:
   ConfigOnly:
     session: acp
@@ -106,7 +107,7 @@ identity: Temp
   ] as const) {
     it(`creates ${flow.lifetime} ${flow.harness}/${flow.session} with honest ${String(flow.check)} identity evidence`, async () => {
       const root = fixture();
-      writeFileSync(join(root, 'fleet.yaml'), 'defaults: { harness: codex, session: acp }\nroles: {}\n');
+      writeV2Fixture(join(root, 'fleet.yaml'), 'defaults: { harness: codex, session: acp }\nroles: {}\n');
       let mutationCalls = 0;
       const service = new RoleCreationService({
         configPath: join(root, 'fleet.yaml'),
@@ -182,7 +183,7 @@ identity: Temp
       );
       expect(mutationCalls).toBe(flow.lifetime === 'permanent' ? 1 : 0);
       const written = flow.lifetime === 'permanent'
-        ? parse(readFileSync(join(root, 'fleet.d', `${request.name}.yaml`), 'utf8')).roles[request.name]
+        ? parse(readFileSync(join(root, 'fleet', 'agents', `${request.name}.yaml`), 'utf8'))
         : parse(readFileSync(join(stateDir, 'role.yaml'), 'utf8'));
       expect(written.monitor.mode).toBe(request.monitor.mode);
       const creation = JSON.parse(readFileSync(join(stateDir, 'creation.json'), 'utf8'));
@@ -196,11 +197,14 @@ identity: Temp
 
   it('previews monitor defaults/provenance and rejects unsupported or invalid web monitor input', async () => {
     const root = fixture();
-    writeFileSync(join(root, 'fleet.yaml'), `defaults:
+    writeV2Fixture(join(root, 'fleet.yaml'), `defaults:
   harness: codex
   model: fleet-codex
   monitor: { mode: native, batch_ms: 5000 }
 roles:
+  ExistingCodex:
+    harness: codex
+    model: fleet-codex
   ExistingClaude:
     harness: claude-code
     model: fleet-sonnet
@@ -268,7 +272,7 @@ roles:
 
   it('treats blank web model as harness default instead of a foreign fleet default', async () => {
     const root = fixture();
-    writeFileSync(join(root, 'fleet.yaml'), `defaults:
+    writeV2Fixture(join(root, 'fleet.yaml'), `defaults:
   harness: codex
   model: gpt-5.6
 roles: {}
@@ -292,8 +296,8 @@ roles: {}
     const inherited = await service.preview({
       ...base, name: 'CodexInherited', harness: 'codex', model: undefined,
     });
-    expect(inherited.effective.model).toBe('gpt-5.6');
-    expect(inherited.provenance.model).toBe('fleet-default');
+    expect(inherited.effective.model).toBeUndefined();
+    expect(inherited.provenance.model).toBe('built-in');
     const explicit = await service.preview({ ...base, name: 'ClaudeExplicit', model: 'claude-x' });
     expect(explicit.effective.model).toBe('claude-x');
     expect(explicit.provenance.model).toBe('request');
@@ -301,7 +305,7 @@ roles: {}
 
   it('requires explicit confirmation before reusing an existing identity', async () => {
     const root = fixture();
-    writeFileSync(join(root, 'fleet.yaml'), 'roles: {}\n');
+    writeV2Fixture(join(root, 'fleet.yaml'), 'roles: {}\n');
     const service = new RoleCreationService({
       configPath: join(root, 'fleet.yaml'),
       ops: { backend, binPath: '/bin/true', log() {} },
@@ -329,7 +333,7 @@ roles: {}
     const configPath = join(root, 'fleet.yaml');
     const missionFile = join(root, 'mission.md');
     const isolationFile = join(root, 'isolation.yaml');
-    writeFileSync(configPath, 'defaults: { harness: codex, session: acp }\nroles: {}\n');
+    writeV2Fixture(configPath, 'defaults: { harness: codex, session: acp }\nroles: {}\n');
     writeFileSync(missionFile, 'Direct mission\n');
     writeFileSync(isolationFile, 'backend: auto\non_unavailable: warn\n');
     const service = new RoleCreationService({ configPath,
@@ -359,7 +363,7 @@ roles: {}
   it('persists equivalent role state once through direct, managed, and web creation', async () => {
     const root = fixture();
     const configPath = join(root, 'fleet.yaml');
-    writeFileSync(configPath, 'defaults: { harness: codex, session: acp }\nroles: {}\n');
+    writeV2Fixture(configPath, 'defaults: { harness: codex, session: acp }\nroles: {}\n');
     let launches = 0;
     const common = { configPath,
       ops: { backend, binPath: '/bin/true', log() {} }, binPath: '/bin/true',

@@ -273,6 +273,16 @@ export function makeClaudeCodeAdapter(
   return {
     id: 'claude-code',
     agentSession: new ClaudeCodeAgentSessionAdapter({
+      resolveBrain(brain) {
+        if (brain.effort != null
+            && (typeof brain.effort !== 'string' || !EFFORT_LEVELS.includes(brain.effort)))
+          throw new Error(`Claude Code Brain effort must be one of: ${EFFORT_LEVELS.join(', ')}`);
+        return {
+          model: brain.model,
+          harnessOptions: { ...(brain.harnessOptions ?? {}), ...(brain.effort ? { effort: brain.effort } : {}) },
+        };
+      },
+      modelEnvironmentVariable: () => 'ANTHROPIC_MODEL',
       prepareLaunch(role, prep) {
         const configured = role.session_options?.acp?.command;
         const argv = Array.isArray(configured)

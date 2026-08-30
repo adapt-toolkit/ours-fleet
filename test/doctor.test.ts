@@ -12,6 +12,7 @@ import type { Exec, ExecResult } from '../src/exec.js';
 import type { FetchLike } from '../src/monitor.js';
 import type { AttachOursClientOptions, OursClient } from '@ours.network/sdk/client';
 import { cliPath, installPrefix, pkgRoot } from './install-fixtures.js';
+import { writeV2Fixture } from './v2-fixture.js';
 
 // A stub daemon API for the monitor reachability probe.
 const stubFetch = (state: 'ok' | '401' | 'down' | 'notdaemon' = 'ok'): FetchLike => async (url) => {
@@ -93,6 +94,7 @@ describe('doctor', () => {
   });
 
   it('reports linger only on linux and passes when all green', async () => {
+    writeV2Fixture(join(dir, 'fleet.yaml'), { roles: {} });
     const green = execWith({
       'tmux -V': { stdout: 'tmux 3.6', stderr: '', code: 0 },
       'ours version': { stdout: JSON.stringify({ name: '@ours.network/cli', version: '1.0.1' }), stderr: '', code: 0 },
@@ -118,7 +120,7 @@ describe('doctor', () => {
   });
 
   it('recognizes the ACP adapter bundled with ours-fleet when no global bin is on PATH', async () => {
-    writeFileSync(join(dir, 'fleet.yaml'),
+    writeV2Fixture(join(dir, 'fleet.yaml'),
       'roles:\n  Coder:\n    harness: codex\n    session: acp\n    monitor:\n      enabled: false\n');
     const rep = await doctor({}, execWith({
       'ours version': { stdout: JSON.stringify({ name: '@ours.network/cli', version: '1.0.1' }), stderr: '', code: 0 },
@@ -152,7 +154,7 @@ describe('doctor scheduled-loop checkpoint', () => {
     lastWallMs?: number; health?: string; running?: boolean; operatorDisabled?: boolean;
   } = {}) {
     registerAdapter(fakeAdapter);
-    writeFileSync(join(dir, 'fleet.yaml'), [
+    writeV2Fixture(join(dir, 'fleet.yaml'), [
       'roles:', '  Coordinator: { harness: fake, session: acp, monitor: { enabled: false } }',
       'loops:', '  health:', '    roles: [Coordinator]', '    interval: 10m',
       '    prompt: check in', '',
@@ -252,7 +254,7 @@ describe('doctor isolation reporting', () => {
 
   it('reports per-role effective isolation (backend, net, caps)', async () => {
     registerAdapter(fakeAdapter);
-    writeFileSync(join(dir, 'fleet.yaml'),
+    writeV2Fixture(join(dir, 'fleet.yaml'),
       'roles:\n  Sec:\n    harness: fake\n    isolation:\n      network: deny\n      resources:\n        mem: 2G\n        cpu: "1"\n');
     const rep = await doctor({}, green(), 'linux', stubFetch('ok'));
     const r = rep.checks.find(c => c.name === 'isolation: Sec')!;
@@ -265,7 +267,7 @@ describe('doctor isolation reporting', () => {
 
   it('flags a strict role that cannot be sandboxed as a failed check', async () => {
     registerAdapter(fakeAdapter);
-    writeFileSync(join(dir, 'fleet.yaml'),
+    writeV2Fixture(join(dir, 'fleet.yaml'),
       'roles:\n  Sec:\n    harness: fake\n    isolation:\n      on_unavailable: strict\n');
     const rep = await doctor({}, green({ 'bwrap --version': { stdout: '', stderr: '', code: 127 } }), 'linux', stubFetch('ok'));
     const r = rep.checks.find(c => c.name === 'isolation: Sec')!;
@@ -285,7 +287,7 @@ describe('doctor monitor probe', () => {
   });
   const withRole = (monitorYaml: string) => {
     registerAdapter(fakeAdapter);
-    writeFileSync(join(dir, 'fleet.yaml'), `roles:\n  A:\n    harness: fake\n${monitorYaml}`);
+    writeV2Fixture(join(dir, 'fleet.yaml'), `roles:\n  A:\n    harness: fake\n${monitorYaml}`);
   };
 
   it('reports the daemon API reachable + authorized for a supervised role', async () => {
@@ -353,13 +355,13 @@ describe('doctor monitor probe', () => {
 
   it('deduplicates identical role profiles and probes distinct role.env profiles separately', async () => {
     registerAdapter(fakeAdapter);
-    writeFileSync(join(dir, 'fleet.yaml'), JSON.stringify({
+    writeV2Fixture(join(dir, 'fleet.yaml'), {
       roles: {
         A: { harness: 'fake', env: { OURS_PORT: '4201', OURS_API_TOKEN: 'shared' } },
         B: { harness: 'fake', env: { OURS_PORT: '4201', OURS_API_TOKEN: 'shared' } },
         C: { harness: 'fake', env: { OURS_PORT: '4202', OURS_API_TOKEN: 'other' } },
       },
-    }));
+    });
     const calls: Array<{ url: string; token?: string }> = [];
     const fetch: FetchLike = async (url, init) => {
       calls.push({ url, token: init?.headers?.['x-ours-api-token'] });
@@ -437,7 +439,22 @@ describe('doctor config validity', () => {
   };
   const run = (opts: Parameters<typeof doctor>[0] = {}) =>
     doctor(opts, execWith(HEALTHY_HOST), 'linux', stubFetch());
-  const writeCfg = (yaml: string) => writeFileSync(join(dir, 'fleet.yaml'), yaml);
+  const writeCfg = (yaml: string) => writeFileSync(join(dir, 'fleet.yaml'), yaml, { mode: 0o600 });
+  const writeRejected = (label: string) => {
+    writeV2Fixture(join(dir, 'fleet.yaml'), { roles: {} });
+    if (label === 'a YAML syntax error') {
+      writeCfg('api_version: ours.network/fleet/v2\nvars: [oops\n');
+      return;
+    }
+    const subjects: Record<string, [string, string]> = {
+      'an unknown role key': ['A', 'role: { inline: {} }\nbrain: { inline: { harness: fake } }\nharnes: fake\n'],
+      'a misspelled permission key': ['A', 'role: { inline: {} }\nbrain: { inline: { harness: fake } }\npermissions: { aproval: allow }\n'],
+      'an invalid session backend': ['A', 'role: { inline: {} }\nbrain: { inline: { harness: fake, session: telepathy } }\n'],
+      'a role name with illegal characters': ['bad name', 'role: { inline: {} }\nbrain: { inline: { harness: fake } }\n'],
+    };
+    const [name, source] = subjects[label];
+    writeFileSync(join(dir, 'fleet', 'agents', `${name}.yaml`), source, { mode: 0o600 });
+  };
 
   /** Every configuration `ours-fleet config` refuses. */
   const REJECTED: Array<[string, string, RegExp]> = [
@@ -447,12 +464,13 @@ describe('doctor config validity', () => {
       /permissions: unknown key\(s\) aproval/],
     ['an invalid session backend', 'roles:\n  A:\n    session: telepathy\n', /session: must be: acp/],
     ['a role name with illegal characters', 'roles:\n  "bad name":\n    harness: fake\n',
-      /invalid role name/],
+      /invalid agent id/],
   ];
 
   for (const [label, yaml, cause] of REJECTED) {
     it(`fails on ${label}, naming the same cause as \`config\``, async () => {
-      writeCfg(yaml);
+      void yaml;
+      writeRejected(label);
       // The premise: `config` rejects this exact input.
       expect(() => loadConfig(join(dir, 'fleet.yaml'))).toThrow();
       const parserMessage = (() => {
@@ -492,13 +510,14 @@ describe('doctor config validity', () => {
   });
 
   it('reports the configured-role count and does not fail an empty fleet', async () => {
-    const rep = await run();                          // no fleet.yaml at all
+    writeV2Fixture(join(dir, 'fleet.yaml'), { roles: {} });
+    const rep = await run();
     expect(rep.checks.find(c => c.name === 'roles')).toMatchObject({ ok: true, detail: '0 configured' });
     expect(rep.checks.find(c => c.name === 'config')!.ok).toBe(true);
   });
 
   it('counts the roles a valid config resolves and names the files', async () => {
-    writeCfg('roles:\n  A:\n    harness: fake\n  B:\n    harness: fake\n');
+    writeV2Fixture(join(dir, 'fleet.yaml'), 'roles:\n  A:\n    harness: fake\n  B:\n    harness: fake\n');
     const rep = await run();
     expect(rep.checks.find(c => c.name === 'roles')!.detail).toBe('2 configured');
     expect(rep.checks.find(c => c.name === 'config')!.detail).toContain('fleet.yaml');
@@ -530,7 +549,7 @@ describe('doctor permission translation', () => {
     'loginctl show-user': { stdout: 'Linger=yes', stderr: '', code: 0 },
   };
   const run = () => doctor({}, execWith(HEALTHY), 'linux', stubFetch());
-  const writeCfg = (yaml: string) => writeFileSync(join(dir, 'fleet.yaml'), yaml);
+  const writeCfg = (yaml: string) => writeV2Fixture(join(dir, 'fleet.yaml'), yaml);
   const check = (rep: Awaited<ReturnType<typeof doctor>>, role: string) =>
     rep.checks.find(c => c.name === `permissions: ${role}`)!;
 
@@ -595,7 +614,7 @@ describe('doctor unattended capability floor', () => {
     'loginctl show-user': { stdout: 'Linger=yes', stderr: '', code: 0 },
   };
   const run = () => doctor({}, execWith(HEALTHY), 'linux', stubFetch());
-  const writeCfg = (yaml: string) => writeFileSync(join(dir, 'fleet.yaml'), yaml);
+  const writeCfg = (yaml: string) => writeV2Fixture(join(dir, 'fleet.yaml'), yaml);
   const floor = (rep: Awaited<ReturnType<typeof doctor>>, role: string) =>
     rep.checks.find(c => c.name === `unattended floor: ${role}`)!;
 
@@ -661,7 +680,7 @@ describe('native overrides contradicting neutral intent', () => {
     'loginctl show-user': { stdout: 'Linger=yes', stderr: '', code: 0 },
   };
   const run = () => doctor({}, execWith(HEALTHY), 'linux', stubFetch());
-  const writeCfg = (yaml: string) => writeFileSync(join(dir, 'fleet.yaml'), yaml);
+  const writeCfg = (yaml: string) => writeV2Fixture(join(dir, 'fleet.yaml'), yaml);
   const conflicts = (rep: Awaited<ReturnType<typeof doctor>>, role: string) =>
     rep.checks.filter(c => c.name === `permission conflict: ${role}`);
 
@@ -800,7 +819,7 @@ describe('doctor rooms-tasks checks', () => {
   const CID_64 = 'a'.repeat(64);
   const run = (opts: Parameters<typeof doctor>[0] = {}) =>
     doctor(opts, execWith(HEALTHY_HOST), 'linux', stubFetch());
-  const writeCfg = (yaml: string) => writeFileSync(join(dir, 'fleet.yaml'), yaml);
+  const writeCfg = (yaml: string) => writeV2Fixture(join(dir, 'fleet.yaml'), yaml);
 
   const ROOMS_YAML = (cid = CID_64, extra = '') =>
     `roles:\n  Developer:\n    harness: fake\n` +

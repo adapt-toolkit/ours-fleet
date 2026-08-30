@@ -1,4 +1,4 @@
-# fleet.yaml — declarative fleet of persistent agents ("docker-compose for agents").
+# fleet.yaml — fleet-wide manifest; Agent/Role/Brain files live under ./fleet/.
 #
 #   ours-fleet up            create/start every role (idempotent)
 #   ours-fleet up Alice      only the named role(s)
@@ -6,24 +6,17 @@
 #   ours-fleet down          stop everything
 #   ours-fleet config        validate + print the merged plan
 #
-# The CLI never edits this file: spawned roles land in ~/fleet.d/<Name>.yaml
-# (one machine-written file per role; delete = unspawn).
+# Agent files are bare mappings in ./fleet/agents; reusable presets are in
+# ./fleet/roles and ./fleet/brains. Kind comes from the directory and ID from filename.
 #
-# The web console CAN edit this file. Its setup wizard and configuration editor
-# save it as a whole document, so any top-level block may be created, changed or
-# removed — `vars:` (including values like work_root below), `defaults:`,
-# `roles:`, `watchdogs:` and `loops:` alike. `defaults:`, `watchdogs:` and
-# `loops:` can ONLY live here; fleet.d drop-ins may declare `roles:` and nothing
-# else. Keys the console does not know about are round-tripped untouched.
-#
-# Console edits are applied as surgical splices against these exact bytes, so an
-# unchanged save is byte-identical and lines outside the edit keep their comment,
-# spacing and quoting. One exception: adding or removing an entry in a block list
-# (`watch:`, `oversee:`, `roles:`, `wake_sources:`) may rewrite that one list as a
-# whole, dropping inline comments written on its items; lines outside that list
-# are still byte-preserved. Each save is revision-guarded, reviewed as a diff of
-# the real file before anything is written, validated by the real loader, and
-# preceded by a timestamped backup beside this file.
+# The v2 manifest contains fleet-wide operational policy and automation only.
+# Brain and Role settings belong in bare documents under ./fleet/brains and
+# ./fleet/roles; Agents compose them under ./fleet/agents. Legacy `roles:` and
+# `fleet.d` are rejected. The web editor writes the manifest and direct Agent
+# documents transactionally; Role/Brain presets remain read-only. Run
+# `ours-fleet config` to validate the complete source set.
+
+api_version: ours.network/fleet/v2
 
 vars:
   work_root: /home/me/work
@@ -36,112 +29,17 @@ vars:
 # start_stagger_ms: 4000
 
 defaults:
-  harness: claude-code        # adapter for roles that don't set their own
-  session: acp                # supported Fleet↔agent session path
   permissions:                # common intent translated to each harness/backend
     approval: ask             # ask | allow | deny
     filesystem: workspace     # read-only | workspace | unrestricted
     unattended: deny          # deny | wait when no ACP console is attached
-  # model: claude-fable-5       # default model for roles without their own (per-role model / --model wins)
-  max_tokens: 500000          # session cap before auto-compact (harness-interpreted)
   monitor:
     mode: fleet               # fleet (default): ours-fleet supervisor; native: harness-owned monitor
     interrupt: false          # false: queue; true: cancel; after_tool: steer at an ACP tool boundary
 
-  # To make Codex the fleet default instead:
-  # harness: codex
-  # model: gpt-5.4
-  # harness_options:
-  #   launcher: auto          # prefer ours-codex; fall back to codex
-  #   profile: fleet          # ~/.codex/fleet.config.toml (or $CODEX_HOME equivalent)
-  #   sandbox: workspace-write
-  #   approval: on-request
-  #   monitor: true             # consent for Codex's native monitor; not monitor.mode
-  #   search: true
-  #   config:
-  #     model_reasoning_effort: high
-  #
-  # To override the default ACP agent command:
-  # session: acp
-  # session_options:
-  #   acp:
-  #     command: codex-acp     # optional; this is the Codex default
-
-roles:
-
-  FleetCoordinator:
-    # A reliable owner channel requires ACP so fleet can capture the correlated
-    # final answer. Fleet creates its dedicated identity with safe local defaults.
-    # session: acp
-    # owner_channel:
-    #   identity: FleetCoordinator Owner Channel
-    #   owners: [replace-with-your-owner-contact-cid]
-    #   interrupt: false
-    #   progress_interval_ms: 30000
-    #   comments: true          # relay live "🟡 Live update:" ACP commentary;
-    #                           # restart baseline for the /comments command
-    #   attachments:
-    #     enabled: true
-    #     max_files_per_request: 4
-    #     max_file_bytes: 10485760
-    #     max_request_bytes: 20971520
-    #     retention_ms: 86400000
-    #     allowed_mime: [application/pdf, text/plain, image/png, audio/ogg]
-    identity: FleetCoordinator
-    cwd: ${work_root}
-    persona: |
-      You are the always-on hub of this fleet. You do not do the work yourself —
-      you decompose owner goals into tasks, dispatch them to the other roles over
-      ours messaging, keep an eye on your wards, and report back.
-    bio: |
-      Fleet coordinator: routes tasks, oversees worker agents, first point of contact.
-    oversee:                  # rendered into the briefing as explicit assignments
-      - { role: Alice, interval: 5m }
-
-  Alice:
-    coordinator: FleetCoordinator   # announces here on boot
-    cwd: ${work_root}/alice
-    mission: Own the alice repository end to end.
-    # model: claude-fable-5          # launch this role on a specific model (default: launcher default)
-    persona: |
-      You are Alice, sole owner of the alice repository. Fix things at the source,
-      ship sound tests, and escalate cross-repo questions to the coordinator.
-    env:
-      EXAMPLE_FLAG: "1"             # extra env passed into the session
-    monitor:                        # override the fleet default per role (merges key-by-key)
-      wake_sources:                 # default: message_received, file_received,
-        - message_received          #          local_contact_request, pending_message
-        - file_received
-      batch_ms: 2000                # coalesce a burst into one console line (default 2000)
-      # interrupt: true             # cancel active work so this role handles every wake immediately
-      # mode: native                # use this harness's native monitor instead of ours-fleet
-    isolation:                      # OS-level sandbox (additive — omit for today's behavior)
-      network: broker               # broker (default): ours messaging works, general egress denied
-      resources:                    # per-agent cgroup caps at the pane
-        mem: 4G                     # → MemoryMax=4G + MemorySwapMax=0 (hard OOM bound)
-        cpu: "2"                    # → CPUQuota=200% (2 cores)
-      # backend: auto               # auto (default): bubblewrap if usable, else degrade per on_unavailable
-      # on_unavailable: warn        # warn (default): run un-isolated + drop a marker; strict: refuse to launch
-      # fs:
-      #   read: [ /opt/toolchains ] # extra read-only binds (state dir + cwd are always included)
-      #   write: [ ]                # extra read-write binds
-      # secrets: [ "${work_root}/.secrets/tok:/run/secrets/tok" ]  # host:container, mounted read-only
-    harness_options:                # adapter-owned (claude-code shown)
-      plugins:
-        "some-plugin@some-marketplace": false
-      # mem_palace: false           # example: fully disable a memory plugin for this role
-
-  # CodexReviewer:
-  #   harness: codex
-  #   coordinator: FleetCoordinator
-  #   cwd: ${work_root}/alice
-  #   model: gpt-5.4
-  #   mission: Review Alice's changes independently.
-  #   harness_options:
-  #     launcher: auto              # ours-codex when installed, otherwise codex
-  #     sandbox: read-only
-  #     approval: on-request
-  #     monitor: true
+# Harness, model, effort, session, token limits, session_options, and
+# harness_options are Brain-owned. Define them in ./fleet/brains and select the
+# Brain from each Agent document; see ./fleet/brains/claude-default.yaml.
 
 # Rooms always use ours-cowork; configure its connection directly. The owner
 # provider is a separate setting and defaults to messenger-server.

@@ -90,6 +90,7 @@ import {
 import { CoworkUnavailableError } from '../src/rooms-tasks/cowork-adapter.js';
 import { TaskRoomApplicationService } from '../src/application/task-room-service.js';
 import { acceptTaskTerminalIntent } from '../src/rooms-tasks/terminal.js';
+import { writeV2Fixture } from './v2-fixture.js';
 
 const ROOM_ID = '01hzyk8m0000000000000000aa';
 
@@ -128,7 +129,7 @@ function expectExactJson(value: unknown): void {
 }
 
 function writeCustomTemplate(include = true): void {
-  writeFileSync(cfgPath,
+  writeV2Fixture(cfgPath,
     'roles: {}\n'
     + 'rooms:\n'
     + '  owner:\n    expected_cid: ' + 'a'.repeat(64) + '\n'
@@ -153,7 +154,7 @@ beforeEach(() => {
   origHome = process.env.OURS_FLEET_HOME;
   process.env.OURS_FLEET_HOME = dir;
   cfgPath = join(dir, 'fleet.yaml');
-  writeFileSync(cfgPath,
+  writeV2Fixture(cfgPath,
     'roles: {}\n'
     + 'rooms:\n'
     + '  owner:\n    expected_cid: ' + 'a'.repeat(64) + '\n'

@@ -37,6 +37,31 @@ async function start(
 }
 
 describe('production agent-session adapters', () => {
+  it('translates neutral Brain selection through each harness adapter', () => {
+    const codex = makeCodexAdapter(exec);
+    const claude = makeClaudeCodeAdapter(exec);
+
+    expect(codex.agentSession.resolveBrain({ model: 'gpt-test', effort: 'high' })).toEqual({
+      model: 'gpt-test', harnessOptions: { config: { model_reasoning_effort: 'high' } },
+    });
+    expect(claude.agentSession.resolveBrain({ model: 'claude-test', effort: 'high' })).toEqual({
+      model: 'claude-test', harnessOptions: { effort: 'high' },
+    });
+  });
+
+  it('preserves omitted and explicit-null model selection', () => {
+    const adapter = makeCodexAdapter(exec);
+    expect(adapter.agentSession.resolveBrain({}).model).toBeUndefined();
+    expect(adapter.agentSession.resolveBrain({ model: null }).model).toBeNull();
+  });
+
+  it('makes each harness adapter reject unsupported or non-string neutral effort', () => {
+    for (const adapter of [makeCodexAdapter(exec), makeClaudeCodeAdapter(exec)]) {
+      expect(() => adapter.agentSession.resolveBrain({ effort: 'impossible' })).toThrow(/effort must be one of/);
+      expect(() => adapter.agentSession.resolveBrain({ effort: 7 as unknown as string })).toThrow(/effort must be one of/);
+    }
+  });
+
   it('Codex preserves mode, isolation-wrapped argv, initial mode, and trusted provenance', async () => {
     const transport = vi.fn(async () => session);
     const adapter = makeCodexAdapter(exec, transport);

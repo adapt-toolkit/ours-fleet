@@ -22,6 +22,7 @@ import { FleetError, normalizeError } from './errors.js';
 import { inheritCallerSpawnDefaults, type ManagedFleetSpawnResult } from '../fleet-proxy.js';
 import { effectivePermissionMode } from '../permissions.js';
 import { effectiveRoleModel } from '../model-env.js';
+import { getAdapter } from '../harness/registry.js';
 import {
   claudeModelCatalog, codexModelCatalog, type HarnessModelCatalog, type HarnessModelOption,
 } from './model-catalog.js';
@@ -477,8 +478,13 @@ export class RoleCreationService {
       throw new FleetError('invalid_request', 'unsupported lifetime');
     bounded(input.model ?? undefined, 'model', 128);
     bounded(input.reasoningEffort ?? undefined, 'reasoning effort', 16);
-    if (input.reasoningEffort != null && !['low', 'medium', 'high', 'xhigh', 'max', 'ultra'].includes(input.reasoningEffort))
-      throw new FleetError('invalid_request', 'unsupported reasoning effort');
+    if (input.reasoningEffort != null) {
+      try {
+        getAdapter(input.harness).agentSession.resolveBrain({ effort: input.reasoningEffort });
+      } catch (error) {
+        throw new FleetError('invalid_request', (error as Error).message);
+      }
+    }
     bounded(input.mission, 'mission', 4_096);
     bounded(input.coordinator, 'coordinator', 128);
     bounded(input.bio, 'bio', 8_192);

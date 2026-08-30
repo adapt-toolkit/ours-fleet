@@ -5,6 +5,8 @@ import type { HarnessAdapter } from '../src/harness/types.js';
 export const fakeAdapter: HarnessAdapter = {
   id: 'fake',
   agentSession: {
+    resolveBrain(brain) { return { model: brain.model, harnessOptions: brain.harnessOptions }; },
+    modelEnvironmentVariable() { return undefined; },
     prepareLaunch(_role, prep) { return { argv: ['fakebin', '--fake-prep'], env: prep.env }; },
     async start() { throw new Error('fake agent session must be injected by the test'); },
   },
@@ -63,6 +65,20 @@ describe('harness registry', () => {
 });
 
 describe('adapter permission-translation contract', () => {
+  it('refuses an adapter missing the unified Brain selection method', () => {
+    const agentSession = { ...fakeAdapter.agentSession } as Partial<typeof fakeAdapter.agentSession>;
+    delete agentSession.resolveBrain;
+    expect(() => registerAdapter({ ...fakeAdapter, id: 'brainless', agentSession } as unknown as HarnessAdapter))
+      .toThrow(/agentSession\.resolveBrain/);
+  });
+
+  it('refuses an adapter missing its model recovery channel declaration', () => {
+    const agentSession = { ...fakeAdapter.agentSession } as Partial<typeof fakeAdapter.agentSession>;
+    delete agentSession.modelEnvironmentVariable;
+    expect(() => registerAdapter({ ...fakeAdapter, id: 'model-channel-less', agentSession } as unknown as HarnessAdapter))
+      .toThrow(/agentSession\.modelEnvironmentVariable/);
+  });
+
   it('refuses to register an adapter that does not declare translatePermissions', () => {
     const { translatePermissions, ...silent } = fakeAdapter;
     expect(() => registerAdapter({ ...silent, id: 'silent' } as unknown as HarnessAdapter))

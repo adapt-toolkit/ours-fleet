@@ -7,6 +7,7 @@ import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vite
 import { RoleControlServer } from '../src/session/control.js';
 import type { OwnerChannelHandle, OwnerChannelManagementRequest } from '../src/owner-channel/channel.js';
 import type { SessionHandle } from '../src/session/types.js';
+import { writeV2Fixture } from './v2-fixture.js';
 
 const CLI = resolve('dist/cli.js');
 const A = 'A'.repeat(64);
@@ -59,7 +60,7 @@ function config(body = [
   'roles:', '  PhoneRole:', '    session: acp', '    owner_channel:',
   '      identity: PhoneRole-owner', `      owners: [${A}]`, '',
 ].join('\n')): void {
-  writeFileSync(join(homeDir, 'fleet.yaml'), body);
+  writeV2Fixture(join(homeDir, 'fleet.yaml'), body);
 }
 
 async function startControl(manage: OwnerChannelHandle['manage']): Promise<void> {

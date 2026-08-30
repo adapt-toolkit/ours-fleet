@@ -4,6 +4,7 @@ import { loadConfig, ROLE_NAME_RE } from '../config.js';
 import { agentDir, stateRoot } from '../paths.js';
 import { rmRole, type OpsDeps } from '../ops.js';
 import { FleetError } from './errors.js';
+import { provesGeneratedAgentSource } from '../generated-agent-source.js';
 
 export interface RoleRemovalPreview {
   role: string;
@@ -50,7 +51,10 @@ export class RoleRemovalService {
       `Stop and uninstall the exact backend registration for '${requested}'.`,
       `Archive then remove ${lifetime === 'temporary' ? temporaryState : permanentState}.`,
     ];
-    if (role?.sourceFile.includes('/fleet.d/')) effects.push(`Remove spawned configuration ${role.sourceFile}.`);
+    const generatedSource = role && provesGeneratedAgentSource(
+      agentDir(requested), cfg.files[0], role.sourceFile,
+    );
+    if (generatedSource) effects.push(`Remove generated Agent configuration ${role.sourceFile}.`);
     else if (role) effects.push(`Keep hand-written configuration ${role.sourceFile}; the role can be recreated from it.`);
     else effects.push('Clean dangling unit/state left before configuration registration completed.');
     return {
@@ -78,7 +82,8 @@ export class RoleRemovalService {
     const recoveryPath = join(stateRoot(), 'recovery', 'removed', `${stamp}-${preview.role}`);
     mkdirSync(recoveryPath, { recursive: true, mode: 0o700 });
     if (existsSync(sourceState)) cpSync(sourceState, join(recoveryPath, 'state'), { recursive: true });
-    if (role?.sourceFile.includes('/fleet.d/') && existsSync(role.sourceFile))
+    if (role && provesGeneratedAgentSource(agentDir(preview.role), cfg.files[0], role.sourceFile)
+        && existsSync(role.sourceFile))
       cpSync(role.sourceFile, join(recoveryPath, basename(role.sourceFile)));
     if (role || preview.lifetime === 'temporary')
       await rmRole(cfg, preview.role, this.options.ops);

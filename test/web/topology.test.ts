@@ -25,7 +25,7 @@ const roleItem = (id: string, lifetime: 'permanent' | 'temporary' = 'permanent',
 describe('fleet topology derivation', () => {
   it('derives oversight, watchdog, loop, and attributed spawn edges from facts', () => {
     const config = {
-      roles: [{ name: 'Coordinator', oversee: [{ role: 'Worker', interval: '5m' }] }, { name: 'Worker' }],
+      roles: [{ name: 'Coordinator', oversee: [{ agent: 'Worker', interval: '5m' }] }, { name: 'Worker' }],
       watchdogs: [{ name: 'nightwatch', enabled: true, intervalMs: 60_000, watch: ['Worker'] }],
       loops: [{ name: 'review', enabled: true, intervalMs: 120_000, roleNames: ['Coordinator'] }],
     } as unknown as FleetConfig;

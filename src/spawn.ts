@@ -2,13 +2,13 @@ import { spawn as spawnChild } from 'node:child_process';
 import { closeSync, existsSync, mkdirSync, openSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { parse, stringify } from 'yaml';
-import { agentDir, fleetDDir } from './paths.js';
+import { agentDir, defaultConfigPath } from './paths.js';
 import { validateIsolationConfig } from './isolation/policy.js';
 import type { IsolationConfig } from './isolation/types.js';
 import {
   loadConfig, resolveAuthProxy, resolveModelChain, resolveMonitorConfig, resolveOwnerChannelConfig,
   resolvePermissions,
-  resolveRoleModel, resolveWorklogPolicy, validateMonitorConfig,
+  resolveRoleModel, resolveWorklogPolicy, splitRootFor, validateMonitorConfig,
   type ApprovalMode, type FilesystemMode, type ResolvedRole, type RoleConfig,
   type CommonPermissions, type MonitorConfig, type SessionBackendId, type UnattendedMode,
   type RoomMemberStartup,
@@ -24,6 +24,7 @@ import {
   type ProvenanceEntry,
 } from './creation.js';
 import { VERSION } from './version.js';
+import { recordGeneratedAgentSource } from './generated-agent-source.js';
 import './harness/claude-code.js';
 import './harness/codex.js';
 import { getAdapter } from './harness/registry.js';
@@ -106,7 +107,8 @@ export function profileValues(o: SpawnOpts): { bio?: string; persona?: string } 
 /** Pure option-to-role mapping shared by CLI and application services. */
 export function buildRoleConfig(o: SpawnOpts, defaultHarness?: string): RoleConfig {
   const r: RoleConfig = {};
-  if (o.harness) r.harness = o.harness;
+  const harness = o.harness ?? defaultHarness;
+  if (harness) r.harness = harness;
   if (o.session) r.session = o.session;
   if (o.identity) r.identity = o.identity;
   if (o.cwd) r.cwd = o.cwd;
@@ -115,7 +117,7 @@ export function buildRoleConfig(o: SpawnOpts, defaultHarness?: string): RoleConf
   else if (o.mission !== undefined) r.mission = o.mission;
   if (o.model === null) r.model = null;
   else if (o.model?.trim()) r.model = o.model.trim();
-  const harness = o.harness ?? defaultHarness;
+  if (o.reasoningEffort?.trim()) r.effort = o.reasoningEffort.trim();
   const harnessOptions: Record<string, unknown> = {};
   if (o.permissionMode) harnessOptions[harness === 'claude-code' ? 'permission_mode' : 'approval'] = o.permissionMode;
   if (o.sandbox) harnessOptions.sandbox = o.sandbox;
@@ -123,9 +125,7 @@ export function buildRoleConfig(o: SpawnOpts, defaultHarness?: string): RoleConf
   if (o.launcher) harnessOptions.launcher = o.launcher;
   if (o.search === true) harnessOptions.search = true;
   const codexConfig = { ...(o.codexConfig ?? {}) };
-  if (o.reasoningEffort && harness === 'codex') codexConfig.model_reasoning_effort = o.reasoningEffort;
   if (Object.keys(codexConfig).length) harnessOptions.config = codexConfig;
-  if (o.reasoningEffort && harness === 'claude-code') harnessOptions.effort = o.reasoningEffort;
   if (o.addDirs?.length) harnessOptions.add_dirs = o.addDirs;
   if (o.monitor === true) harnessOptions.monitor = true;
   if (Object.keys(harnessOptions).length) r.harness_options = harnessOptions;
@@ -226,8 +226,26 @@ export const effectiveIdentity = (o: SpawnOpts): string => o.identity ?? o.name;
 export interface SpawnDryRun {
   schemaVersion: 1;
   warning: string;
-  roleDocument: { roles: Record<string, RoleConfig> };
+  roleDocument: Record<string, unknown>;
   resolvedRole: ResolvedRole;
+}
+
+/** Bare Agent document written by v2 spawn: inline Role × inline Brain + operations. */
+export function buildAgentDocument(raw: RoleConfig): Record<string, unknown> {
+  const role = Object.fromEntries(['mission', 'persona', 'bio', 'briefing_file']
+    .filter(key => raw[key as keyof RoleConfig] !== undefined)
+    .map(key => [key, raw[key as keyof RoleConfig]]));
+  const brain = Object.fromEntries([
+    'harness', 'session', 'session_options', 'model', 'model_chain', 'max_tokens',
+    'autocompact_pct', 'harness_options', 'effort',
+  ].filter(key => raw[key as keyof RoleConfig] !== undefined)
+    .map(key => [key, raw[key as keyof RoleConfig]]));
+  const operational = Object.fromEntries([
+    'permissions', 'identity', 'cwd', 'coordinator', 'env', 'oversee', 'isolation',
+    'monitor', 'owner_channel', 'worklog', 'auth_proxy',
+  ].filter(key => raw[key as keyof RoleConfig] !== undefined)
+    .map(key => [key, raw[key as keyof RoleConfig]]));
+  return { role: { inline: role }, brain: { inline: brain }, ...operational };
 }
 
 /**
@@ -240,7 +258,9 @@ export function spawnDryRun(o: SpawnOpts): SpawnDryRun {
   if (o.missionFile) readMissionFile(o.missionFile);
   assertNameFree(o);
   const cfg = loadConfig(o.configPath);
-  const raw = buildRoleConfig(o, cfg.defaults.harness as string | undefined);
+  const raw = buildRoleConfig(
+    o, (cfg.defaults.harness as string | undefined) ?? 'claude-code',
+  );
   const harnessOptions = {
     ...((cfg.defaults.harness_options ?? {}) as Record<string, unknown>),
     ...(raw.harness_options ?? {}),
@@ -258,18 +278,25 @@ export function spawnDryRun(o: SpawnOpts): SpawnDryRun {
     roleEnv: raw.env,
     ...(authProxy ? { authProxyBaseUrl: authProxy.base_url } : {}),
   });
-  const model = modelEnv.model;
+  const adapter = getAdapter(harness);
+  const brain = adapter.agentSession.resolveBrain({
+    model: modelEnv.model,
+    effort: raw.effort,
+    harnessOptions: Object.keys(harnessOptions).length ? harnessOptions : undefined,
+  });
+  const model = brain.model ?? undefined;
   const session = raw.session ?? (cfg.defaults.session as SessionBackendId | undefined) ?? 'acp';
   const resolvedRole: ResolvedRole = {
     ...raw,
     name: o.name,
-    sourceFile: o.temp ? '(temp dry-run)' : join(fleetDDir(), `${o.name}.yaml`),
+    sourceFile: o.temp ? '(temp dry-run)' : join(splitRootFor(o.configPath ?? defaultConfigPath()), 'agents', `${o.name}.yaml`),
     harness,
     session,
     session_options: raw.session_options,
     permissions: resolvePermissions(cfg.defaults.permissions, raw.permissions),
     permissionsDeclared: raw.permissions !== undefined || cfg.defaults.permissions !== undefined,
     identity: effectiveIdentity(o),
+    effort: raw.effort,
     model,
     model_chain: resolveModelChain(
       model,
@@ -277,7 +304,7 @@ export function spawnDryRun(o: SpawnOpts): SpawnDryRun {
         ? cfg.defaults.model_chain as string[] | undefined
         : undefined),
     ),
-    harness_options: Object.keys(harnessOptions).length ? harnessOptions : undefined,
+    harness_options: brain.harnessOptions,
     isolation: raw.isolation ?? (cfg.defaults.isolation as IsolationConfig | undefined),
     monitor: resolveMonitorConfig(cfg.defaults.monitor, raw.monitor),
     owner_channel: resolveOwnerChannelConfig(
@@ -286,7 +313,6 @@ export function spawnDryRun(o: SpawnOpts): SpawnDryRun {
     auth_proxy: authProxy,
   };
   resolvedRole.env = modelEnv.env;
-  const adapter = getAdapter(resolvedRole.harness);
   if (resolvedRole.auth_proxy && resolvedRole.harness !== 'claude-code')
     throw new Error('auth_proxy is supported only by claude-code');
   const optionProblems = adapter.validateOptions(resolvedRole.harness_options, resolvedRole);
@@ -295,7 +321,7 @@ export function spawnDryRun(o: SpawnOpts): SpawnDryRun {
   return {
     schemaVersion: 1,
     warning: 'collision checks are a snapshot; a real spawn reserves names atomically',
-    roleDocument: { roles: { [o.name]: raw } },
+    roleDocument: buildAgentDocument(raw),
     resolvedRole,
   };
 }
@@ -341,7 +367,7 @@ function provenanceSettings(
   };
 }
 
-/** Permanent spawn: persist to ~/fleet.d/<Name>.yaml, then bring it up. */
+/** Permanent spawn: persist one bare Agent document under the selected v2 root. */
 export async function spawnPermanent(
   o: SpawnOpts, deps: OpsDeps, creation: CreationDeps = {},
 ): Promise<string> {
@@ -376,12 +402,13 @@ export async function spawnPermanent(
             await creation.identityProvisioner?.remove?.(effectiveIdentity(o));
           },
         });
-      mkdirSync(fleetDDir(), { recursive: true });
+      const agentRoot = join(splitRootFor(o.configPath ?? defaultConfigPath()), 'agents');
+      mkdirSync(agentRoot, { recursive: true });
       creation.onStage?.('writing_role');
-      const file = join(fleetDDir(), `${o.name}.yaml`);
-      writeRoleFile(tx, file, stringify({
-        roles: { [o.name]: buildRoleConfig(o, cfg.defaults.harness as string | undefined) },
-      }));
+      const file = join(agentRoot, `${o.name}.yaml`);
+      writeRoleFile(tx, file, stringify(buildAgentDocument(
+        buildRoleConfig(o, (cfg.defaults.harness as string | undefined) ?? 'claude-code'),
+      )));
       // `up` materialises the state dir and registers the service. Journal the
       // dir before it exists so a failure leaves the name genuinely reusable
       // rather than blocked by a half-built directory.
@@ -410,6 +437,9 @@ export async function spawnPermanent(
       });
       mkdirSync(agentDir(o.name), { recursive: true });
       writeProvenance(agentDir(o.name), provenance);
+      recordGeneratedAgentSource(
+        agentDir(o.name), o.configPath ?? defaultConfigPath(), file,
+      );
       creation.onStage?.('registering_supervisor');
       await up(
         loadConfig(o.configPath), [o.name],
@@ -501,7 +531,13 @@ async function spawnTempInner(
     roleEnv: fromOpts.env,
     ...(tempAuthProxy ? { authProxyBaseUrl: tempAuthProxy.base_url } : {}),
   });
-  const model = modelEnv.model;
+  const adapter = getAdapter(harness);
+  const brain = adapter.agentSession.resolveBrain({
+    model: modelEnv.model,
+    effort: fromOpts.effort,
+    harnessOptions: Object.keys(mergedHarnessOptions).length ? mergedHarnessOptions : undefined,
+  });
+  const model = brain.model ?? undefined;
   const session = o.session ?? (cfg.defaults.session as SessionBackendId | undefined) ?? 'acp';
   const role: ResolvedRole = {
     ...fromOpts,          // includes `isolation` when --isolation-file was given
@@ -509,6 +545,7 @@ async function spawnTempInner(
     harness,
     session,
     identity: o.identity ?? o.name,
+    effort: fromOpts.effort,
     model,
     model_chain: resolveModelChain(
       model,
@@ -516,7 +553,7 @@ async function spawnTempInner(
         ? cfg.defaults.model_chain as string[] | undefined
         : undefined),
     ),
-    harness_options: Object.keys(mergedHarnessOptions).length ? mergedHarnessOptions : undefined,
+    harness_options: brain.harnessOptions,
     permissions: resolvePermissions(cfg.defaults.permissions, fromOpts.permissions),
     permissionsDeclared:
       fromOpts.permissions !== undefined || cfg.defaults.permissions !== undefined,

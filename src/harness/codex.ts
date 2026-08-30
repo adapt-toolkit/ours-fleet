@@ -273,6 +273,19 @@ export function makeCodexAdapter(
   return {
     id: 'codex',
     agentSession: new CodexAgentSessionAdapter({
+      resolveBrain(brain) {
+        const levels = ['low', 'medium', 'high', 'xhigh', 'max', 'ultra'];
+        if (brain.effort != null
+            && (typeof brain.effort !== 'string' || !levels.includes(brain.effort)))
+          throw new Error(`Codex Brain effort must be one of: ${levels.join(', ')}`);
+        const harnessOptions = { ...(brain.harnessOptions ?? {}) };
+        if (brain.effort) harnessOptions.config = {
+          ...((harnessOptions.config ?? {}) as Record<string, unknown>),
+          model_reasoning_effort: brain.effort,
+        };
+        return { model: brain.model, harnessOptions };
+      },
+      modelEnvironmentVariable: () => undefined,
       prepareLaunch(role, prep) {
         const launch = codexAgentLaunch(role, prep);
         const { permissionMetadataSource, ...neutral } = launch;

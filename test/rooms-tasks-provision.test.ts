@@ -40,6 +40,7 @@ import { inheritCallerSpawnDefaults } from '../src/fleet-proxy.js';
 import type { ResolvedRole } from '../src/config.js';
 import '../src/harness/codex.js';
 import '../src/harness/claude-code.js';
+import { writeV2Fixture } from './v2-fixture.js';
 
 let root: string;
 let previousHome: string | undefined;
@@ -163,6 +164,7 @@ beforeEach(() => {
   previousProxyStateDir = process.env[FLEET_PROXY_STATE_DIR_ENV];
   previousProxyCaller = process.env[FLEET_PROXY_CALLER_ENV];
   process.env.OURS_FLEET_HOME = root;
+  writeV2Fixture(join(root, 'fleet.yaml'), {});
   delete process.env[FLEET_PROXY_STATE_DIR_ENV];
   delete process.env[FLEET_PROXY_CALLER_ENV];
   acceptSpawn = undefined;
