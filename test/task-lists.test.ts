@@ -13,6 +13,7 @@ import { buildWebServer } from '../src/web/server.js';
 import { WebAuth } from '../src/web/auth.js';
 import { TrustedDeviceStore } from '../src/web/device-store.js';
 import { dispatchOwnerCommand } from '../src/owner-channel/commands.js';
+import { writeV2Fixture } from './v2-fixture.js';
 
 let root: string;
 let previousHome: string | undefined;
@@ -29,6 +30,7 @@ beforeEach(() => {
   root = mkdtempSync(join(tmpdir(), 'fleet-task-lists-'));
   previousHome = process.env.OURS_FLEET_HOME;
   process.env.OURS_FLEET_HOME = root;
+  writeV2Fixture(join(root, 'fleet.yaml'), {});
 });
 afterEach(() => {
   if (previousHome === undefined) delete process.env.OURS_FLEET_HOME;

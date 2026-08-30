@@ -214,11 +214,11 @@ export function generateBriefing(role: ResolvedRole, v: BriefingVocab, opts: Bri
   if (role.oversee?.length) {
     L.push('', '## Oversight assignments');
     L.push('These agents are your wards — you keep them unstuck:');
-    for (const o of role.oversee) L.push(`- **${o.role}** — check every ${o.interval}`);
+    for (const o of role.oversee) L.push(`- **${o.agent}** — check every ${o.interval}`);
     L.push('');
     L.push('Procedure (see also the oversee-agents skill if available). On each tick, for each ward');
     L.push('run BOTH — they answer different questions:');
-    for (const o of role.oversee) L.push(`\`ours-fleet status ${o.role}\` then \`ours-fleet peek ${o.role}\``);
+    for (const o of role.oversee) L.push(`\`ours-fleet status ${o.agent}\` then \`ours-fleet peek ${o.agent}\``);
     L.push('');
     L.push('**One console command is not a liveness verdict.** A `peek` or `send` that fails tells');
     L.push('you what happened to YOUR REQUEST, and only one of its outcomes says the agent is gone.');

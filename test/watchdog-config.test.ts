@@ -6,11 +6,12 @@ import { loadConfig } from '../src/config.js';
 import { partitionRestartNames } from '../src/watchdog/config.js';
 import type { FleetConfig } from '../src/config.js';
 import type { ResolvedWatchdog } from '../src/watchdog/config.js';
+import { writeV2Fixture } from './v2-fixture.js';
 
 let dir: string;
 beforeEach(() => { dir = mkdtempSync(join(tmpdir(), 'ours-fleet-wd-')); process.env.OURS_FLEET_HOME = dir; });
 afterEach(() => { delete process.env.OURS_FLEET_HOME; rmSync(dir, { recursive: true, force: true }); });
-const base = (s: string) => writeFileSync(join(dir, 'fleet.yaml'), s);
+const base = (s: string) => writeV2Fixture(join(dir, 'fleet.yaml'), s);
 
 const TWO_ROLES = 'roles:\n  Alice: {}\n  Docs: {}\n';
 
@@ -32,9 +33,9 @@ describe('watchdogs config', () => {
     base(TWO_ROLES);
     expect(loadConfig().watchdogs).toEqual([]);
   });
-  it('inherits defaults.harness/session/model like roles do', () => {
+  it('uses explicit watchdog Brain settings instead of forbidden manifest Brain defaults', () => {
     base('defaults: { harness: claude-code, session: acp, model: claude-fable-5 }\n'
-      + TWO_ROLES + 'watchdogs:\n  w: { coordinator: C }\n');
+      + TWO_ROLES + 'watchdogs:\n  w: { coordinator: C, session: acp, model: claude-fable-5 }\n');
     const wd = loadConfig().watchdogs[0];
     expect(wd.session).toBe('acp');
     expect(wd.model).toBe('claude-fable-5');
@@ -103,11 +104,12 @@ describe('watchdogs config', () => {
     base(TWO_ROLES + 'watchdogs:\n  w: { coordinator: C, enabled: false }\n');
     expect(loadConfig().watchdogs[0].enabled).toBe(false);
   });
-  it('is rejected in fleet.d drop-ins (roles-only rule already enforced)', () => {
+  it('rejects the legacy fleet.d mechanism before loading watchdog entries', () => {
     base(TWO_ROLES);
     mkdirSync(join(dir, 'fleet.d'), { recursive: true });
-    writeFileSync(join(dir, 'fleet.d', 'w.yaml'), 'watchdogs:\n  w: { coordinator: C }\n');
-    expect(() => loadConfig()).toThrowError(/fleet.d files may only define roles/);
+    writeFileSync(join(dir, 'fleet.d', 'w.yaml'),
+      'api_version: ours.network/fleet/v2\nwatchdogs:\n  w: { coordinator: C }\n');
+    expect(() => loadConfig()).toThrowError(/legacy fleet.d configuration is unsupported/);
   });
 });
 

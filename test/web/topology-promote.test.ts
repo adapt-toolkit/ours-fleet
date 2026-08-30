@@ -9,6 +9,7 @@ import { TopologyDraftStore, emptyDraft } from '../../src/web/topology-draft-sto
 import { TopologyPromoteService } from '../../src/web/topology-promote.js';
 import { mergeTopology } from '../../src/web/topology-model.js';
 import type { RuntimeRoleItem } from '../../src/web/topology.js';
+import { writeV2Fixture } from '../v2-fixture.js';
 
 const roleItem = (id: string, mission?: string): RuntimeRoleItem => ({
   role: {
@@ -35,7 +36,9 @@ describe('adding sketches to the fleet', () => {
   let previousHome: string | undefined;
 
   const seed = async (source: string, draft: unknown) => {
-    writeFileSync(file, source, { mode: 0o600 });
+    writeV2Fixture(file, source);
+    if (source.startsWith('# keep me\n'))
+      writeFileSync(file, `# keep me\n${readFileSync(file, 'utf8')}`, { mode: 0o600 });
     if (draft) await drafts.write(drafts.read().revision, draft);
   };
 
@@ -80,8 +83,9 @@ describe('adding sketches to the fleet', () => {
     expect(result.promoted).toEqual(['agent:Reviewer']);
     expect(result.draftsCleared).toBe(true);
     expect(text).toContain('# keep me');
-    expect(text).toContain('  Reviewer:');
-    expect(text).toContain('    mission: Review pull requests');
+    const agentText = readFileSync(join(dir, 'fleet', 'agents', 'Reviewer.yaml'), 'utf8');
+    expect(agentText).toContain('mission: Review pull requests');
+    expect(agentText).toContain('harness: claude-code');
     expect(loadConfig(file).roles.map(role => role.name)).toEqual(['Alice', 'Reviewer']);
     expect(drafts.read().draft.drafts.nodes).toEqual([]);
     // The canvas position outlives promotion so the node does not jump.
@@ -109,7 +113,9 @@ describe('adding sketches to the fleet', () => {
 
     // An agent added afterwards is watched with no edit to the watchdog at all.
     const opened = configuration.read();
-    (opened.model.roles as any).Bob = { mission: 'Review' };
+    opened.model.agents.Bob = {
+      role: { inline: { mission: 'Review' } }, brain: { inline: { harness: 'claude-code' } },
+    };
     await configuration.write(opened.revision, opened.model);
     expect(loadConfig(file).watchdogs[0].watch).toEqual(['Alice', 'Bob']);
   });
@@ -235,7 +241,9 @@ describe('adding sketches to the fleet', () => {
 
       // Adding another agent must not expand a scoped watchdog.
       const opened = configuration.read();
-      (opened.model.roles as any).Bob = { mission: 'Review' };
+      opened.model.agents.Bob = {
+        role: { inline: { mission: 'Review' } }, brain: { inline: { harness: 'claude-code' } },
+      };
       await configuration.write(opened.revision, opened.model);
       expect(loadConfig(file).watchdogs[0].watch).toEqual(['Alice']);
       expect(drafts.read().draft.drafts.edges).toEqual([]);
@@ -300,7 +308,9 @@ describe('adding sketches to the fleet', () => {
       // The opposite of the scoped case: a standalone watchdog must keep
       // covering agents added later with no edit of its own.
       const opened = configuration.read();
-      (opened.model.roles as any).Bob = { mission: 'Review' };
+      opened.model.agents.Bob = {
+        role: { inline: { mission: 'Review' } }, brain: { inline: { harness: 'claude-code' } },
+      };
       await configuration.write(opened.revision, opened.model);
       expect(loadConfig(file).watchdogs[0].watch).toEqual(['Alice', 'Bob']);
       expect(readFileSync(file, 'utf8')).not.toContain('watch:');
@@ -390,7 +400,8 @@ describe('adding sketches to the fleet', () => {
     });
 
     expect(preview.promoted).toEqual(['agent:Reviewer']);
-    expect(preview.diff).toContain('+  Reviewer:');
+    expect(preview.diff).toContain('+++ agents/Reviewer.yaml (proposed)');
+    expect(preview.diff).toContain('+    mission: Review');
     expect(readFileSync(file, 'utf8')).toBe(before);
     expect(drafts.read().draft.drafts.nodes).toHaveLength(1);
   });
@@ -410,9 +421,9 @@ describe('adding sketches to the fleet', () => {
     });
 
     await promote(['agent:Reviewer']);
-    const text = readFileSync(file, 'utf8');
+    const text = readFileSync(join(dir, 'fleet', 'agents', 'Reviewer.yaml'), 'utf8');
 
-    expect(text).toContain('    identity: ReviewerBot');
+    expect(text).toContain('identity: ReviewerBot');
     expect(text).not.toContain('prompt:');
     expect(loadConfig(file).roles.find(role => role.name === 'Reviewer')?.identity).toBe('ReviewerBot');
   });

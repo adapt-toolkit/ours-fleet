@@ -1,4 +1,5 @@
 import type { ResolvedRole } from './config.js';
+import { getAdapter } from './harness/registry.js';
 
 /**
  * Which environment variable a harness reads to pin the model it RUNS.
@@ -11,13 +12,9 @@ import type { ResolvedRole } from './config.js';
  * ACP role, and a fleet-wide `defaults.env.ANTHROPIC_MODEL` silently outranked
  * an explicitly requested one.
  */
-export const MODEL_ENV_BY_HARNESS: Readonly<Record<string, string>> = {
-  'claude-code': 'ANTHROPIC_MODEL',
-};
-
 /** The model-pin variable for a harness, or undefined if it pins no model by env. */
 export function modelEnvVar(harness: string | undefined): string | undefined {
-  return harness === undefined ? undefined : MODEL_ENV_BY_HARNESS[harness];
+  return harness === undefined ? undefined : getAdapter(harness).agentSession.modelEnvironmentVariable();
 }
 
 export interface RoleModelEnvInput {

@@ -70,6 +70,17 @@ describe('npm pack from a checkout with no dist', () => {
     expect(entries.some(name => name.startsWith('dist/web-app/'))).toBe(true);
   });
 
+  it('ships the complete split default configuration referenced by init', () => {
+    for (const path of [
+      'examples/fleet.yaml',
+      'examples/fleet/agents/Alice.yaml',
+      'examples/fleet/agents/FleetCoordinator.yaml',
+      'examples/fleet/roles/developer.yaml',
+      'examples/fleet/roles/coordinator.yaml',
+      'examples/fleet/brains/claude-default.yaml',
+    ]) expect(entries).toContain(path);
+  });
+
   // What the nightly channel exists to deliver. A tarball that packs and stamps
   // correctly but ships the old transport would publish green and be wrong.
   it('ships the SDK-backed owner-channel client and not the removed MCP transport', () => {

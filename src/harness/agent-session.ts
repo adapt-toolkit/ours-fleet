@@ -12,6 +12,16 @@ export interface PreparedAgentSessionLaunch extends Launch {
   readonly adapterState?: unknown;
 }
 
+export interface BrainSelection {
+  model?: string | null;
+  effort?: string;
+  harnessOptions?: Record<string, unknown>;
+}
+export interface ResolvedBrainSelection {
+  model?: string | null;
+  harnessOptions?: Record<string, unknown>;
+}
+
 export interface AgentSessionStartOptions {
   role: ResolvedRole;
   prep: SessionPrep;
@@ -30,6 +40,10 @@ export interface AgentSessionStartOptions {
  * the shared transport implementation.
  */
 export interface AgentSessionAdapter {
+  /** Harness-owned translation of neutral Brain selection into launch state. */
+  resolveBrain(brain: BrainSelection): ResolvedBrainSelection;
+  /** Harness-owned environment channel used to pin/recover a model, if any. */
+  modelEnvironmentVariable(): string | undefined;
   prepareLaunch(role: ResolvedRole, prep: SessionPrep): PreparedAgentSessionLaunch;
   start(options: AgentSessionStartOptions): Promise<AgentSession>;
 }

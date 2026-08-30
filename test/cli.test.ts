@@ -1,6 +1,7 @@
 import { describe, it, expect, beforeAll, beforeEach, afterEach } from 'vitest';
 import {
   existsSync,
+  chmodSync,
   mkdirSync,
   mkdtempSync,
   readFileSync,
@@ -13,6 +14,8 @@ import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { realExec } from '../src/exec.js';
 import { UNATTENDED_FLOOR } from '../src/permissions.js';
+import { writeV2Fixture } from './v2-fixture.js';
+import { INIT_COMPLETION_GUIDANCE } from '../src/init-guidance.js';
 
 const CLI = resolve('dist/cli.js');
 let dir: string;
@@ -31,7 +34,7 @@ const run = (args: string[]) =>
   realExec('node', [CLI, ...args], { env: { ...process.env, OURS_FLEET_HOME: dir } });
 
 const writeWatchdogReportFixture = () => {
-  writeFileSync(join(dir, 'fleet.yaml'), 'roles:\n  A: {}\nwatchdogs:\n  w: { coordinator: C }\n');
+  writeV2Fixture(join(dir, 'fleet.yaml'), 'roles:\n  A: {}\nwatchdogs:\n  w: { coordinator: C }\n');
   const reportsDir = join(dir, '.ours-fleet', 'watchdogs', 'w', 'reports');
   mkdirSync(reportsDir, { recursive: true });
   const fixture = JSON.parse(
@@ -43,10 +46,58 @@ const writeWatchdogReportFixture = () => {
 };
 
 describe('ours-fleet CLI', () => {
+  it('init guidance copies the complete split default configuration', () => {
+    expect(INIT_COMPLETION_GUIDANCE).toContain('examples/fleet.yaml" ~/fleet.yaml');
+    expect(INIT_COMPLETION_GUIDANCE).toContain('examples/fleet" ~/fleet');
+    expect(INIT_COMPLETION_GUIDANCE).toContain('~/fleet/{agents,roles,brains}/*.yaml');
+  });
+
+  it('redacts nested harness secrets identically from human and JSON config output', async () => {
+    const file = join(dir, 'fleet.yaml');
+    const root = join(dir, 'fleet');
+    const agents = join(root, 'agents');
+    writeFileSync(file, 'api_version: ours.network/fleet/v2\n');
+    mkdirSync(agents, { recursive: true });
+    writeFileSync(join(agents, 'A.yaml'), [
+      'role: { inline: {} }',
+      'brain:',
+      '  inline:',
+      '    harness: codex',
+      '    harness_options:',
+      '      access_token: canary-token',
+      '      nested:',
+      '        password: canary-password',
+      '        API-key: canary-api-key',
+      '        credential: canary-credential',
+      '        private_key: canary-private-key',
+      '        auth: canary-auth',
+      '        invite: canary-invite',
+      '        visible: okay',
+      '',
+    ].join('\n'));
+    chmodSync(file, 0o600);
+    chmodSync(root, 0o700);
+    chmodSync(agents, 0o700);
+    chmodSync(join(agents, 'A.yaml'), 0o600);
+    const human = await run(['config', '-c', file]);
+    const json = await run(['config', '-c', file, '--json']);
+    expect(human.code).toBe(0);
+    expect(json.code).toBe(0);
+    for (const output of [human.stdout, json.stdout]) {
+      expect(output).not.toContain('canary-token');
+      expect(output).not.toContain('canary-password');
+      expect(output).not.toContain('canary-api-key');
+      expect(output).not.toContain('canary-credential');
+      expect(output).not.toContain('canary-private-key');
+      expect(output).not.toContain('canary-auth');
+      expect(output).not.toContain('canary-invite');
+      expect(output).toContain('<redacted>');
+    }
+  });
+
   it('config --json emits a versioned deterministic plan without env secrets', async () => {
     const file = join(dir, 'fleet.yaml');
-    const { writeFileSync } = await import('node:fs');
-    writeFileSync(file, [
+    writeV2Fixture(file, [
       'roles:',
       '  A:',
       '    model: approved-model',
@@ -62,7 +113,12 @@ describe('ours-fleet CLI', () => {
     expect(first.stderr).toBe('');
     expect(first.stdout).not.toContain('canary-must-not-leak');
     const plan = JSON.parse(first.stdout);
-    expect(plan.schemaVersion).toBe(1);
+    expect(plan.schemaVersion).toBe(2);
+    expect(plan.configMode).toBe('split-v2');
+    expect(plan.sourceDocuments).toEqual(expect.arrayContaining([
+      expect.objectContaining({ kind: 'Manifest' }),
+      expect.objectContaining({ kind: 'Agent', id: 'A' }),
+    ]));
     // ANTHROPIC_MODEL is present because the role declares a model: the pin the
     // harness actually reads is derived from `model:`, not left to be inherited.
     expect(plan.roles[0].env).toEqual({
@@ -76,8 +132,8 @@ describe('ours-fleet CLI', () => {
 
   it('config --json keeps compatibility warnings off stdout and strict mode fails', async () => {
     const file = join(dir, 'fleet.yaml');
-    const { writeFileSync } = await import('node:fs');
-    writeFileSync(file, 'roles:\n  A: &role {}\n  B: *role\n');
+    writeV2Fixture(file, { roles: {} });
+    writeFileSync(file, 'api_version: ours.network/fleet/v2\nvars: &shared { value: yes }\nextra: *shared\n', { mode: 0o600 });
     const compat = await run(['config', '-c', file, '--json']);
     expect(compat.code).toBe(0);
     expect(() => JSON.parse(compat.stdout)).not.toThrow();
@@ -214,7 +270,7 @@ describe('ours-fleet CLI', () => {
 
   it('config shows watchdogs and --json includes them in the plan', async () => {
     const { writeFileSync } = await import('node:fs');
-    writeFileSync(join(dir, 'fleet.yaml'),
+    writeV2Fixture(join(dir, 'fleet.yaml'),
       'roles:\n  Alice: {}\n  Docs: {}\n'
       + 'watchdogs:\n'
       + '  nightwatch: { coordinator: FleetCoordinator, isolation: { network: deny } }\n'
@@ -237,7 +293,7 @@ describe('ours-fleet CLI', () => {
 
   it('config fails on a watchdog with an unknown key', async () => {
     const { writeFileSync } = await import('node:fs');
-    writeFileSync(join(dir, 'fleet.yaml'),
+    writeV2Fixture(join(dir, 'fleet.yaml'),
       'roles:\n  A: {}\nwatchdogs:\n  w: { coordinator: C, intervall: 5m }\n');
     const r = await run(['config']);
     expect(r.code).toBe(1);
@@ -246,7 +302,7 @@ describe('ours-fleet CLI', () => {
 
   it('watchdog-run refuses an unknown watchdog and respects the run lock', async () => {
     const { writeFileSync } = await import('node:fs');
-    writeFileSync(join(dir, 'fleet.yaml'), 'roles:\n  A: {}\nwatchdogs:\n  w: { coordinator: C }\n');
+    writeV2Fixture(join(dir, 'fleet.yaml'), 'roles:\n  A: {}\nwatchdogs:\n  w: { coordinator: C }\n');
     const r = await run(['watchdog-run', 'ghost']);
     expect(r.code).toBe(1);
     expect(r.stderr + r.stdout).toMatch(/unknown watchdog 'ghost'/);
@@ -295,7 +351,7 @@ describe('ours-fleet CLI', () => {
 
   it('watchdog-report refuses a path-traversal-shaped name and touches nothing outside watchdogsRoot', async () => {
     const { writeFileSync, mkdirSync: mkdir, statSync } = await import('node:fs');
-    writeFileSync(join(dir, 'fleet.yaml'), 'roles:\n  A: {}\nwatchdogs:\n  w: { coordinator: C }\n');
+    writeV2Fixture(join(dir, 'fleet.yaml'), 'roles:\n  A: {}\nwatchdogs:\n  w: { coordinator: C }\n');
     // watchdogsRoot() is `<dir>/.ours-fleet/watchdogs`; join(watchdogsRoot(), '../../evil')
     // lands at `<dir>/evil` — two levels up from `watchdogs`. Pre-create that as an unrelated
     // "victim" directory (0755, no reports/) so the traversal target actually exists: without
@@ -317,7 +373,7 @@ describe('ours-fleet CLI', () => {
 
   it('watchdog-report --list --json emits machine-readable run metadata, not the human table', async () => {
     const { writeFileSync, readFileSync } = await import('node:fs');
-    writeFileSync(join(dir, 'fleet.yaml'), 'roles:\n  A: {}\nwatchdogs:\n  w: { coordinator: C }\n');
+    writeV2Fixture(join(dir, 'fleet.yaml'), 'roles:\n  A: {}\nwatchdogs:\n  w: { coordinator: C }\n');
     const reportsDir = join(dir, '.ours-fleet', 'watchdogs', 'w', 'reports');
     mkdirSync(reportsDir, { recursive: true });
     const fixture = JSON.parse(
@@ -334,7 +390,7 @@ describe('ours-fleet CLI', () => {
 
   it('watchdog-report surfaces an error report\'s diagnostic tail', async () => {
     const { writeFileSync } = await import('node:fs');
-    writeFileSync(join(dir, 'fleet.yaml'), 'roles:\n  A: {}\nwatchdogs:\n  w: { coordinator: C }\n');
+    writeV2Fixture(join(dir, 'fleet.yaml'), 'roles:\n  A: {}\nwatchdogs:\n  w: { coordinator: C }\n');
     const reportsDir = join(dir, '.ours-fleet', 'watchdogs', 'w', 'reports');
     mkdirSync(reportsDir, { recursive: true });
     const report = {
@@ -353,7 +409,7 @@ describe('ours-fleet CLI', () => {
 
   it('restart <watchdog> releases a held-down watchdog', async () => {
     const { writeFileSync, readFileSync } = await import('node:fs');
-    writeFileSync(join(dir, 'fleet.yaml'), 'roles:\n  A: {}\nwatchdogs:\n  w: { coordinator: C }\n');
+    writeV2Fixture(join(dir, 'fleet.yaml'), 'roles:\n  A: {}\nwatchdogs:\n  w: { coordinator: C }\n');
     const sdir = join(dir, '.ours-fleet', 'watchdogs', 'w');
     mkdirSync(sdir, { recursive: true });
     writeFileSync(join(sdir, 'state.json'), JSON.stringify({
@@ -410,7 +466,7 @@ describe('ours-fleet CLI', () => {
 
   it('config prints an isolation summary for a role that declares it', async () => {
     const { writeFileSync } = await import('node:fs');
-    writeFileSync(join(dir, 'fleet.yaml'),
+    writeV2Fixture(join(dir, 'fleet.yaml'),
       'roles:\n  Sec:\n    isolation:\n      network: deny\n      resources:\n        mem: 2G\n        cpu: "1.5"\n');
     const r = await run(['config']);
     expect(r.code).toBe(0);
@@ -422,7 +478,7 @@ describe('ours-fleet CLI', () => {
 
   it('config and doctor print the SAME permission warning', async () => {
     const { writeFileSync } = await import('node:fs');
-    writeFileSync(join(dir, 'fleet.yaml'),
+    writeV2Fixture(join(dir, 'fleet.yaml'),
       'roles:\n'
       + '  Lossy:\n    harness: claude-code\n    permissions:\n      approval: allow\n'
       + '  Exact:\n    harness: codex\n    permissions:\n      approval: allow\n      filesystem: unrestricted\n'
@@ -474,7 +530,7 @@ describe('ours-fleet CLI', () => {
 
   it('config and doctor both report a contradicted permission intent', async () => {
     const { writeFileSync } = await import('node:fs');
-    writeFileSync(join(dir, 'fleet.yaml'),
+    writeV2Fixture(join(dir, 'fleet.yaml'),
       'roles:\n'
       + '  Contradicted:\n    harness: claude-code\n'
       + '    permissions:\n      approval: allow\n'
@@ -544,8 +600,10 @@ describe('ours-fleet CLI', () => {
   }, 40_000);
 
   it('doctor fails with the parser cause for a config `config` rejects', async () => {
-    const { writeFileSync } = await import('node:fs');
-    writeFileSync(join(dir, 'fleet.yaml'), 'roles:\n  A:\n    harnes: claude-code\n');
+    writeV2Fixture(join(dir, 'fleet.yaml'), { roles: {} });
+    writeFileSync(join(dir, 'fleet', 'agents', 'A.yaml'),
+      'role: { inline: {} }\nbrain: { inline: { harness: claude-code } }\nharnes: claude-code\n',
+      { mode: 0o600 });
 
     const cfg = await run(['config']);
     expect(cfg.code).toBe(1);
@@ -590,13 +648,19 @@ describe('ours-fleet CLI', () => {
     }
   }, 30_000);
 
-  it('config prints a role model from fleet.d', async () => {
+  it('rejects legacy fleet.d and prints a model from a bare Agent document', async () => {
     const { mkdirSync, writeFileSync } = await import('node:fs');
     const { stringify } = await import('yaml');
     mkdirSync(join(dir, 'fleet.d'), { recursive: true });
     writeFileSync(
       join(dir, 'fleet.d', 'M.yaml'),
       stringify({ roles: { M: { model: 'claude-fable-5' } } }));
+    writeV2Fixture(join(dir, 'fleet.yaml'), { roles: {} });
+    const legacy = await run(['config']);
+    expect(legacy.code).toBe(1);
+    expect(legacy.stderr).toContain('legacy fleet.d configuration is unsupported');
+    rmSync(join(dir, 'fleet.d'), { recursive: true, force: true });
+    writeV2Fixture(join(dir, 'fleet.yaml'), { roles: { M: { model: 'claude-fable-5' } } });
     const r = await run(['config']);
     expect(r.code).toBe(0);
     expect(r.stdout).toContain('● M');
@@ -668,7 +732,7 @@ describe('ours-fleet version', () => {
   it('config prints the build that resolved the plan', async () => {
     const file = join(dir, 'fleet.yaml');
     const { writeFileSync } = await import('node:fs');
-    writeFileSync(file, 'roles:\n  A: {}\n');
+    writeV2Fixture(file, 'roles:\n  A: {}\n');
     const { stdout } = await run(['config', '-c', file]);
     expect(stdout).toMatch(/build:\s+ours-fleet \d+\.\d+\.\d+\+[0-9a-f]{12}/);
   });

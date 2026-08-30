@@ -30,6 +30,7 @@ import {
 import { prepareTempSupervisor } from '../src/temp-lifecycle.js';
 import type { ResolvedRole } from '../src/config.js';
 import { AcpSession } from '../src/session/acp.js';
+import { writeV2Fixture } from './v2-fixture.js';
 
 let dir: string;
 beforeEach(() => {
@@ -141,7 +142,7 @@ function fakeWorld(opts: { exitCode?: string; lifeChecks?: number; exitDelayMs?:
 }
 
 const writeCfg = (roles: Record<string, object>) =>
-  writeFileSync(join(dir, 'fleet.yaml'), stringify({ roles }));
+  writeV2Fixture(join(dir, 'fleet.yaml'), { roles });
 
 describe('managed fleet child environment', () => {
   it.each(['', '0', '1'])
@@ -563,6 +564,7 @@ describe('runOnce ACP startup outcome', () => {
     ...fakeAdapter,
     id: 'fake-acp',
     agentSession: {
+      ...fakeAdapter.agentSession,
       prepareLaunch: () => ({ argv: [process.execPath, acpFixture], env: {} }),
       start: options => AcpSession.start({
         name: options.role.name, argv: options.launch.argv, cwd: options.cwd,
@@ -982,7 +984,7 @@ describe('runOnce ACP startup outcome', () => {
   });
 
   it('starts scheduled loops only after ACP startup and stops them before teardown', async () => {
-    writeFileSync(join(dir, 'fleet.yaml'), stringify({
+    writeV2Fixture(join(dir, 'fleet.yaml'), {
       roles: { A: {
         harness: 'fake-acp', session: 'acp',
         env: { ACP_FIXTURE_EXIT_AFTER: '2' },
@@ -990,7 +992,7 @@ describe('runOnce ACP startup outcome', () => {
       loops: { health: {
         roles: ['A'], interval: '1m', initial_delay: '0s', prompt: 'bounded health pass',
       } },
-    }), { mode: 0o600 });
+    });
     const stateDir = agentDir('A');
     mkdirSync(stateDir, { recursive: true });
     const { deps, logs } = acpDeps();
@@ -1281,7 +1283,7 @@ describe('reserveLaunchSlot (start gate)', () => {
 
 describe('runOnce start-stagger', () => {
   it('runs the launch through the gate when start_stagger_ms is set (lone = no real wait)', async () => {
-    writeFileSync(join(dir, 'fleet.yaml'), stringify({ start_stagger_ms: 5000, roles: { A: { harness: 'fake' } } }));
+    writeV2Fixture(join(dir, 'fleet.yaml'), { start_stagger_ms: 5000, roles: { A: { harness: 'fake' } } });
     const d = agentDir('A'); mkdirSync(d, { recursive: true });
     const { deps, paneCommands } = fakeWorld({ exitCode: '0', exitFile: join(d, '.exit-status') });
     await runOnce('A', {}, deps);
@@ -1303,7 +1305,7 @@ describe('runOnce config-path fallback', () => {
     // Default ~/fleet.yaml has no role A at all — only the custom file does.
     writeCfg({});
     const customCfg = join(dir, 'custom.yaml');
-    writeFileSync(customCfg, stringify({ roles: { A: { harness: 'fake' } } }));
+    writeV2Fixture(customCfg, { roles: { A: { harness: 'fake' } } });
     const d = agentDir('A');
     mkdirSync(d, { recursive: true });
     writeFileSync(join(d, '.config-path'), customCfg + '\n');

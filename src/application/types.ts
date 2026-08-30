@@ -15,7 +15,7 @@ export interface ResolvedRoleView {
   cwd?: string;
   permissions: CommonPermissions;
   nativeRuntime?: { approval?: string; permissionMode?: string; sandbox?: string };
-  oversee?: Array<{ role: string; interval: string }>;
+  oversee?: Array<{ agent: string; interval: string }>;
 }
 
 export interface RoleRecord {

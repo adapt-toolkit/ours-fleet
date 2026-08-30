@@ -3,7 +3,7 @@ import {
 } from 'node:fs';
 import { join } from 'node:path';
 import { randomUUID, createHash } from 'node:crypto';
-import { agentDir, fleetDDir, watchdogsRoot } from './paths.js';
+import { agentDir, watchdogsRoot } from './paths.js';
 import type { FleetConfig, ResolvedRole } from './config.js';
 import { findRole } from './config.js';
 import type { ResolvedWatchdog } from './watchdog/config.js';
@@ -19,6 +19,7 @@ import {
   daemonIdentityProvisioner, reconcilePermanentRoleIdentities,
   type IdentityProvisioner,
 } from './creation.js';
+import { provesGeneratedAgentSource } from './generated-agent-source.js';
 
 /** An install outcome tagged with the role it belongs to. */
 export interface InstallOutcome extends BackendInstallOutcome { role: string }
@@ -317,9 +318,12 @@ export async function rmRole(cfg: FleetConfig, name: string, deps: OpsDeps): Pro
     return;
   }
   const role = findRole(cfg, name);
+  const generatedSource = provesGeneratedAgentSource(
+    agentDir(name), cfg.files[0], role.sourceFile,
+  );
   await deps.backend.uninstall(name);
   rmSync(agentDir(name), { recursive: true, force: true });
-  if (role.sourceFile.startsWith(fleetDDir() + '/')) {
+  if (generatedSource && existsSync(role.sourceFile)) {
     unlinkSync(role.sourceFile);
     deps.log(`removed ${role.sourceFile}`);
   }

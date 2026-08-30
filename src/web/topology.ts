@@ -45,8 +45,8 @@ export function deriveTopology(config: FleetConfig, roles: RuntimeRoleItem[]): T
     edges.push({ id: `${kind}:${from}:${to}`, kind, from, to, label });
 
   for (const role of config.roles) for (const entry of role.oversee ?? [])
-    if (agentIds.has(role.name) && agentIds.has(entry.role))
-      add('oversees', `agent:${role.name}`, `agent:${entry.role}`, `oversees · ${entry.interval}`);
+    if (agentIds.has(role.name) && agentIds.has(entry.agent))
+      add('oversees', `agent:${role.name}`, `agent:${entry.agent}`, `oversees · ${entry.interval}`);
 
   for (const watchdog of config.watchdogs) {
     const id = `watchdog:${watchdog.name}`;

@@ -10,6 +10,8 @@ import {
 } from './acp-session-transport.js';
 
 export interface ClaudeCodeSessionStrategy {
+  resolveBrain: AgentSessionAdapter['resolveBrain'];
+  modelEnvironmentVariable: AgentSessionAdapter['modelEnvironmentVariable'];
   prepareLaunch(role: ResolvedRole, prep: SessionPrep): PreparedAgentSessionLaunch;
   permissionModeId(role: ResolvedRole): string | undefined;
   mcpServers(role: ResolvedRole): AcpMcpServer[] | undefined;
@@ -22,6 +24,12 @@ export class ClaudeCodeAgentSessionAdapter implements AgentSessionAdapter {
     private readonly strategy: ClaudeCodeSessionStrategy,
     private readonly transport: AcpSessionTransport = AcpSession.start,
   ) {}
+
+  resolveBrain(brain: Parameters<AgentSessionAdapter['resolveBrain']>[0]) {
+    return this.strategy.resolveBrain(brain);
+  }
+
+  modelEnvironmentVariable() { return this.strategy.modelEnvironmentVariable(); }
 
   prepareLaunch(role: ResolvedRole, prep: SessionPrep): PreparedAgentSessionLaunch {
     return this.strategy.prepareLaunch(role, prep);

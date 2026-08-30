@@ -128,7 +128,7 @@ export async function doctor(
   const loaded = loadConfigResult(opts.configPath, opts.yamlMode);
   const roles = loaded.ok ? loaded.roles : [];
   checks.push(loaded.ok
-    ? { name: 'config', ok: true, detail: loaded.files.join(' + ') || '(none — no fleet.yaml or fleet.d)' }
+    ? { name: 'config', ok: true, detail: loaded.files.join(' + ') }
     : { name: 'config', ok: false, detail: loaded.error });
   checks.push(loaded.ok
     ? { name: 'roles', ok: true, detail: `${roles.length} configured` }

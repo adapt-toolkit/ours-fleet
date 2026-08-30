@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
-import { mkdtempSync, writeFileSync, rmSync } from 'node:fs';
+import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { loadConfig, findRole, ConfigError, type ResolvedRole } from '../src/config.js';
@@ -7,6 +7,7 @@ import {
   assertModelPinReachesChild, modelEnvVar, resolveRoleModelEnv,
 } from '../src/model-env.js';
 import { harnessChildEnv } from '../src/runner.js';
+import { writeV2Fixture } from './v2-fixture.js';
 
 let dir: string;
 beforeEach(() => {
@@ -18,7 +19,7 @@ afterEach(() => {
   rmSync(dir, { recursive: true, force: true });
 });
 
-const base = (s: string) => writeFileSync(join(dir, 'fleet.yaml'), s);
+const base = (s: string) => writeV2Fixture(join(dir, 'fleet.yaml'), s);
 
 describe('modelEnvVar', () => {
   it('knows the pin variable for claude-code and nothing else', () => {

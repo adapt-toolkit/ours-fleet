@@ -6,6 +6,7 @@ import { join as joinPath, resolve as resolvePath } from 'node:path';
 import { createInterface } from 'node:readline';
 import { Command } from 'commander';
 import { VERSION } from './version.js';
+import { INIT_COMPLETION_GUIDANCE } from './init-guidance.js';
 import {
   analyzeInstalls, buildInfo, buildLabel, discoverInstalls, runningLabel,
 } from './provenance.js';
@@ -13,7 +14,7 @@ import { agentDir, agentsRoot, tmpRoot, logsRoot, deriveXdgRuntimeDir } from './
 import { findRole, loadConfig, ROLE_NAME_RE } from './config.js';
 import type { YamlMode } from './config-yaml.js';
 import { formatDuration } from './duration.js';
-import { resolvedPlan } from './resolved-plan.js';
+import { redactSensitive, resolvedPlan } from './resolved-plan.js';
 import { pickBackend } from './supervisor/index.js';
 import { up, down, type OpsDeps } from './ops.js';
 import { readRestartLedger, runSupervised, runTemp } from './runner.js';
@@ -100,7 +101,7 @@ const program = new Command()
   .enablePositionalOptions()
   .version(VERSION);
 
-const cOpt = (cmd: Command) => cmd.option('-c, --configuration <file>', 'config file (default: ~/fleet.yaml + ~/fleet.d/)');
+const cOpt = (cmd: Command) => cmd.option('-c, --configuration <file>', 'manifest (default: ~/fleet.yaml; documents under ~/fleet/)');
 
 const collect = (value: string, previous: string[]) => [...previous, value];
 
@@ -276,11 +277,12 @@ cOpt(program.command('config').description('validate + print the merged plan (no
         console.log(`    source:      ${r.sourceFile}`);
         if (r.cwd) console.log(`    cwd:         ${r.cwd}`);
         if (r.model) console.log(`    model:       ${r.model}`);
+        if (r.effort) console.log(`    effort:      ${r.effort}`);
         if (r.harness_options && Object.keys(r.harness_options).length)
-          console.log(`    options:     ${JSON.stringify(r.harness_options)}`);
+          console.log(`    options:     ${JSON.stringify(redactSensitive(r.harness_options))}`);
         if (r.coordinator) console.log(`    coordinator: ${r.coordinator}`);
         if (r.mission) console.log(`    mission:     ${r.mission.split('\n')[0]}`);
-        if (r.oversee?.length) console.log(`    oversees:    ${r.oversee.map(o => `${o.role}@${o.interval}`).join(', ')}`);
+        if (r.oversee?.length) console.log(`    oversees:    ${r.oversee.map(o => `${o.agent}@${o.interval}`).join(', ')}`);
         if (r.isolation) {
           const iso = r.isolation;
           const caps = [
@@ -1156,7 +1158,7 @@ program.command('init').description('one-time host setup (units, dirs, linger)')
   .action(async () => {
     for (const d of [agentsRoot(), tmpRoot(), logsRoot()]) mkdirSync(d, { recursive: true });
     for (const m of await pickBackend().init(binPath)) console.log(m);
-    console.log('\nNext: copy examples/fleet.yaml to ~/fleet.yaml, edit, then: ours-fleet up');
+    console.log(INIT_COMPLETION_GUIDANCE);
   });
 
 const webCommand = cOpt(program.command('web').description('start or open the secure localhost fleet web console'))

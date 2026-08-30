@@ -107,6 +107,8 @@ export function redactSourceSecrets(source: string, marker: string): string {
 
   redactEnvMap(['defaults', 'env']);
   for (const name of mapKeys(document, ['roles'])) redactEnvMap(['roles', name, 'env']);
+  // A v2 Agent document is itself the role/ops mapping, so env is top-level.
+  redactEnvMap(['env']);
 
   const vars = document.getIn(['vars'], true);
   if (isMap(vars)) for (const item of vars.items) {

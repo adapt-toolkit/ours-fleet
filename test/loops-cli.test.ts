@@ -7,6 +7,7 @@ import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vite
 import type { ScheduledLoopManagerHandle } from '../src/loops/manager.js';
 import { RoleControlServer } from '../src/session/control.js';
 import type { SessionHandle } from '../src/session/types.js';
+import { writeV2Fixture } from './v2-fixture.js';
 
 const CLI = resolve('dist/cli.js');
 let homeDir: string;
@@ -30,11 +31,11 @@ const run = (args: string[]) => new Promise<{ code: number; stdout: string; stde
 });
 
 function config(enabled = true) {
-  writeFileSync(join(homeDir, 'fleet.yaml'), [
+  writeV2Fixture(join(homeDir, 'fleet.yaml'), [
     'roles:', '  Coordinator: { session: acp }', 'loops:', '  health:',
     '    roles: [Coordinator]', '    interval: 10m', `    enabled: ${enabled}`,
     '    prompt: CANARY_CLI_PROMPT', '',
-  ].join('\n'), { mode: 0o600 });
+  ].join('\n'));
 }
 
 function state() {

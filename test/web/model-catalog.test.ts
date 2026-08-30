@@ -19,13 +19,17 @@ describe('local harness model catalogs', () => {
     })]);
   });
 
-  it('exposes exact Claude 2.1 IDs and persists effort in harness-native options', () => {
+  it('exposes exact Claude 2.1 IDs and keeps creation effort neutral for both harnesses', () => {
     expect(claudeModelCatalog().models.map(model => model.id)).toEqual([
       'claude-fable-5', 'claude-opus-5', 'claude-sonnet-5',
     ]);
+    expect(buildRoleConfig({ name: 'C', harness: 'claude-code', reasoningEffort: 'max' }))
+      .toMatchObject({ effort: 'max' });
+    expect(buildRoleConfig({ name: 'X', harness: 'codex', reasoningEffort: 'ultra' }))
+      .toMatchObject({ effort: 'ultra' });
     expect(buildRoleConfig({ name: 'C', harness: 'claude-code', reasoningEffort: 'max' }).harness_options)
-      .toEqual({ effort: 'max' });
+      .toBeUndefined();
     expect(buildRoleConfig({ name: 'X', harness: 'codex', reasoningEffort: 'ultra' }).harness_options)
-      .toEqual({ config: { model_reasoning_effort: 'ultra' } });
+      .toBeUndefined();
   });
 });

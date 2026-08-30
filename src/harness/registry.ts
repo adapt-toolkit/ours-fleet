@@ -3,6 +3,12 @@ import type { HarnessAdapter } from './types.js';
 const adapters = new Map<string, HarnessAdapter>();
 
 export function registerAdapter(a: HarnessAdapter): void {
+  if (typeof a.agentSession?.resolveBrain !== 'function')
+    throw new Error(
+      `harness adapter '${a.id}' must implement agentSession.resolveBrain(): translate neutral model/effort`);
+  if (typeof a.agentSession?.modelEnvironmentVariable !== 'function')
+    throw new Error(
+      `harness adapter '${a.id}' must implement agentSession.modelEnvironmentVariable()`);
   // Enforced here rather than left to the type system: an adapter that silently
   // omits the capability is how the neutral-permission warnings ended up with no
   // caller and no reader.

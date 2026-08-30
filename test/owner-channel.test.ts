@@ -25,6 +25,7 @@ import {
 } from '../src/session/types.js';
 import { VERSION } from '../src/version.js';
 import { historyMessage, incomingMessage } from './owner-history-fixtures.js';
+import { writeV2Fixture } from './v2-fixture.js';
 
 const OWNER_CID = 'A'.repeat(64);
 const OTHER_OWNER_CID = 'B'.repeat(64);
@@ -801,7 +802,7 @@ describe('OwnerChannel deterministic command dispatch', () => {
     process.env.OURS_FLEET_HOME = fleetHome;
     const roomId = '01hzyk8m0000000000000000aa';
     const configPath = join(fleetHome, 'fleet.yaml');
-    writeFileSync(configPath, 'rooms:\n  owner:\n    expected_cid: ' + 'a'.repeat(64)
+    writeV2Fixture(configPath, 'rooms:\n  owner:\n    expected_cid: ' + 'a'.repeat(64)
       + '\n  defaults:\n    attach_owner: false\n');
     createRoomRecord({ room_id: roomId, room_name: 'Owner close' });
     activateRoom(roomId);
@@ -843,7 +844,7 @@ describe('OwnerChannel deterministic command dispatch', () => {
     process.env.OURS_FLEET_HOME = fleetHome;
     const roomId = '01hzyk8m0000000000000000ab';
     const configPath = join(fleetHome, 'fleet.yaml');
-    writeFileSync(configPath, 'rooms:\n  owner:\n    expected_cid: ' + 'a'.repeat(64)
+    writeV2Fixture(configPath, 'rooms:\n  owner:\n    expected_cid: ' + 'a'.repeat(64)
       + '\n  defaults:\n    attach_owner: false\n');
     createRoomRecord({ room_id: roomId, room_name: 'Owner recover' });
     activateRoom(roomId);
@@ -889,7 +890,7 @@ describe('OwnerChannel deterministic command dispatch', () => {
     });
     activateRoom(task.room_id!);
     const configPath = join(fleetHome, 'fleet.yaml');
-    writeFileSync(configPath, 'tasks:\n  close_room_on_done: true\n');
+    writeV2Fixture(configPath, 'tasks:\n  close_room_on_done: true\n');
     const { channel, client, dir } = setup(
       [ownerMessage(592, 'wire-task-settle', `/task done ${task.task_id} shipped`)],
       undefined,
@@ -932,7 +933,7 @@ describe('OwnerChannel deterministic command dispatch', () => {
     const previousHome = process.env.OURS_FLEET_HOME;
     process.env.OURS_FLEET_HOME = fleetHome;
     const configPath = join(fleetHome, 'fleet.yaml');
-    writeFileSync(configPath, 'tasks:\n  close_room_on_done: false\n');
+    writeV2Fixture(configPath, 'tasks:\n  close_room_on_done: false\n');
     const task = createTask({
       title: 'Owner done without close', origin: { type: 'owner_channel' }, start: true,
       room_id: '01hzyk8m0000000000000000ae',
@@ -962,6 +963,7 @@ describe('OwnerChannel deterministic command dispatch', () => {
     dirs.push(fleetHome);
     const previousHome = process.env.OURS_FLEET_HOME;
     process.env.OURS_FLEET_HOME = fleetHome;
+    writeV2Fixture(join(fleetHome, 'fleet.yaml'), {});
     const task = createTask({
       title: 'Owner cancel', origin: { type: 'owner_channel' }, start: false,
       room_id: '01hzyk8m0000000000000000ad',

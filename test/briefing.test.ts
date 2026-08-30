@@ -57,7 +57,7 @@ describe('generateBriefing', () => {
 
   it('renders oversight assignments with peek/send procedure', () => {
     const b = generateBriefing(
-      { ...base, oversee: [{ role: 'Bob', interval: '5m' }] }, vocab, opts);
+      { ...base, oversee: [{ agent: 'Bob', interval: '5m' }] }, vocab, opts);
     expect(b).toContain('## Oversight assignments');
     expect(b).toContain('Bob');
     expect(b).toContain('every 5m');
@@ -325,7 +325,7 @@ describe('temporary-role identity compatibility', () => {
  */
 describe('the oversight procedure distinguishes busy from dead', () => {
   const overseeing = generateBriefing(
-    { ...base, oversee: [{ role: 'Bob', interval: '5m' }] }, vocab, opts);
+    { ...base, oversee: [{ agent: 'Bob', interval: '5m' }] }, vocab, opts);
 
   it('carries the taxonomy verbatim from its single definition', () => {
     // Not a paraphrase: the exact lines the CLI's own wording produces.

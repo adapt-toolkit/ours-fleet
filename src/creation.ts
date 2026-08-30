@@ -448,12 +448,12 @@ export function daemonIdentityInventoryProvisioner(
   });
 }
 
-/** Atomically write a role's fleet.d file, journalling it for rollback. */
+/** Atomically write a bare Agent file, journalling it for rollback. */
 export function writeRoleFile(tx: CreationTransaction, file: string, contents: string): void {
   const existed = existsSync(file);
   replaceFileAtomically(file, contents, 0o644);
   tx.record({
-    stage: `fleet.d file ${file}`,
+    stage: `Agent file ${file}`,
     // Only remove what THIS transaction created; never delete a file the
     // operator already had.
     undo: () => { if (!existed) rmSync(file, { force: true }); },
