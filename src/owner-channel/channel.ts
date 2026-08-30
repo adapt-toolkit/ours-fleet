@@ -4,6 +4,7 @@ import { mkdir, readFile, readdir, rm } from 'node:fs/promises';
 import { join } from 'node:path';
 
 import { canonicalCid, type OwnerAttachmentConfig, type OwnerChannelConfig } from '../config.js';
+import { DAEMON_RECOVERY_DEADLINE_MS } from '../daemon-recovery.js';
 import { replaceFileAtomically } from '../atomic-file.js';
 import { TaskRoomApplicationService } from '../application/task-room-service.js';
 import { RoleLifecycleService } from '../application/role-command-service.js';
@@ -87,15 +88,44 @@ export interface OwnerChannelOptions {
   binderDeps?: OwnerBinderDeps;
   /** Pre-acquired by the runner so the predecessor control socket remains reachable while waiting. */
   binderLease?: OwnerBinderLease;
+  recoveryDeps?: {
+    now(): number;
+    setTimer(fn: () => void, ms: number): ReturnType<typeof setTimeout>;
+    clearTimer(timer: ReturnType<typeof setTimeout>): void;
+    deadlineMs?: number;
+  };
 }
 
 export interface OwnerChannelHandle {
   start(): Promise<void>;
   drain(): Promise<void>;
   close(): Promise<void>;
+  /** Reattach this same supervisor-owned channel after a daemon generation change. */
+  recover?(epoch: string): Promise<void>;
+  /** False when shutdown skipped client disposal because quiescence was unproven. */
+  binderReleaseSafe?(): boolean;
   manage(request: OwnerChannelManagementRequest): Promise<OwnerChannelManagementResult>;
   /** Fleet-owned deterministic lifecycle notice; absent on legacy test doubles. */
   notifyFleetSpawn?(event: ManagedFleetSpawnResult): Promise<void>;
+}
+
+export const OWNER_RECOVERY_QUEUE_CAPACITY = 32;
+export const OWNER_RECOVERY_DEGRADED = 'OWNER_RECOVERY_DEGRADED';
+
+export class OwnerRecoveryDegradedError extends Error {
+  readonly code = OWNER_RECOVERY_DEGRADED;
+  constructor() {
+    super('owner channel recovery is degraded');
+    this.name = 'OwnerRecoveryDegradedError';
+  }
+}
+
+export class OwnerRecoveryTimeoutError extends Error {
+  readonly code = OWNER_RECOVERY_DEGRADED;
+  constructor(readonly stage: string) {
+    super(`owner channel recovery timed out at ${stage}`);
+    this.name = 'OwnerRecoveryTimeoutError';
+  }
 }
 
 export type OwnerChannelManagementRequest =
@@ -219,7 +249,17 @@ export class OwnerChannel implements OwnerChannelHandle {
   private readonly completionTasks = new Set<Promise<void>>();
   private readonly activeRequests = new Map<string, ActiveOwnerRequest>();
   private managementTail: Promise<unknown> = Promise.resolve();
+  private recoveryEpoch?: string;
+  private recoveryTask?: Promise<void>;
+  private recoveryToken = 0;
+  private recoveryQueued = 0;
+  private watchGeneration = 0;
+  /** A timed-out client operation that must settle before replacement is safe. */
+  private recoveryQuiescence?: Promise<void>;
+  private releaseSafe = true;
   private ready = false;
+  private startedOnce = false;
+  private shutdownDegraded = false;
   private binder?: OwnerBinderLease;
   private binderOwnedInternally = false;
 
@@ -274,6 +314,7 @@ export class OwnerChannel implements OwnerChannelHandle {
 
   async start(): Promise<void> {
     this.stopping = false;
+    this.shutdownDegraded = false;
     this.binderOwnedInternally = !this.options.binderLease;
     this.binder = this.options.binderLease ?? await acquireOwnerBinderLease(
       this.options.stateDir, this.options.role, this.options.config.identity, this.options.binderDeps);
@@ -315,11 +356,12 @@ export class OwnerChannel implements OwnerChannelHandle {
         this.attachmentRoot, Date.now(), this.attachmentConfig.retention_ms,
       ).catch(error => this.logError('attachment crash cleanup failed', error));
     }
+    this.startedOnce = true;
     this.ready = true;
     // Do not make role startup wait for an old owner request to finish a turn.
     // watchLoop itself drains before every establishment, including this first
     // one, so there is no drain-to-tip race.
-    this.watchTask = this.watchLoop();
+    this.watchTask = this.watchLoop(++this.watchGeneration);
   }
 
   drain(): Promise<void> {
@@ -335,27 +377,48 @@ export class OwnerChannel implements OwnerChannelHandle {
   }
 
   async close(): Promise<void> {
+    if (this.recoveryTask) this.shutdownDegraded = true;
     this.stopping = true;
     this.ready = false;
-    this.watchAbort?.abort();
-    await this.watchTask?.catch(error => this.logError('watch shutdown failed', error));
+    this.recoveryToken++;
+    this.watchGeneration++;
+    const staleWatch = this.watchTask;
     this.watchTask = undefined;
-    await this.managementTail;
-    try { await this.client.close(); }
-    finally {
-      if (this.binderOwnedInternally) this.binder?.release();
-      this.binder = undefined;
+    this.watchAbort?.abort();
+    const now = this.options.recoveryDeps?.now ?? (() => Date.now());
+    const deadlineAt = now()
+      + (this.options.recoveryDeps?.deadlineMs ?? DAEMON_RECOVERY_DEADLINE_MS);
+    let disposed = false;
+    try {
+      await this.recoveryStage('shutdown_quiescence', Promise.all([
+        staleWatch?.catch(error => this.logError('watch shutdown failed', error)),
+        this.drainTask?.catch(error => this.logError('drain shutdown failed', error)),
+        this.managementTail.then(() => undefined),
+        this.recoveryQuiescence,
+      ]), deadlineAt);
+      await this.recoveryStage('shutdown_close', this.client.close(), deadlineAt);
+      disposed = true;
+      this.writeShutdownState('closed', 'OWNER_SHUTDOWN_CLOSED', now());
+    } catch (error) {
+      this.shutdownDegraded = true;
+      this.releaseSafe = false;
+      const stage = error instanceof OwnerRecoveryTimeoutError ? error.stage : 'shutdown_unknown';
+      this.writeShutdownState('degraded', `OWNER_${stage.toUpperCase()}_TIMEOUT`, now());
+      this.options.log(`[${this.options.role}] owner shutdown degraded stage=${stage}`);
+    } finally {
+      if (disposed && this.binderOwnedInternally) this.binder?.release();
+      if (disposed) this.binder = undefined;
     }
   }
 
+  binderReleaseSafe(): boolean { return this.releaseSafe; }
+
   manage(request: OwnerChannelManagementRequest): Promise<OwnerChannelManagementResult> {
-    const run = this.managementTail.then(() => this.manageNow(request));
-    this.managementTail = run.then(() => undefined, () => undefined);
-    return run;
+    return this.queueManagement(() => this.manageNow(request));
   }
 
   notifyFleetSpawn(event: ManagedFleetSpawnResult): Promise<void> {
-    const run = this.managementTail.then(async () => {
+    return this.queueManagement(async () => {
       if (!this.ready || this.stopping) throw new Error('owner-channel MCP client is unavailable');
       const model = event.model ? `, model ${event.model}` : '';
       const monitorPolicy = event.monitor.interrupt === true
@@ -372,8 +435,121 @@ export class OwnerChannel implements OwnerChannelHandle {
           + `(${event.harness}/${event.session}${model}; ${monitor}${permission}).${inherited}`,
         `fleet-spawn\0${event.creationActionId}`, 0);
     });
+  }
+
+  recover(epoch: string): Promise<void> {
+    if (this.stopping) return Promise.reject(new Error('owner channel is stopping'));
+    if (this.recoveryEpoch === epoch && this.recoveryTask) return this.recoveryTask;
+    this.recoveryEpoch = epoch;
+    this.ready = false;
+    const token = ++this.recoveryToken;
+    const watchGeneration = ++this.watchGeneration;
+    const staleWatch = this.watchTask;
+    this.watchTask = undefined;
+    this.watchAbort?.abort();
+    const superseded = () => this.stopping || token !== this.recoveryToken;
+    const now = this.options.recoveryDeps?.now ?? (() => Date.now());
+    const deadlineAt = now()
+      + (this.options.recoveryDeps?.deadlineMs ?? DAEMON_RECOVERY_DEADLINE_MS);
+    const run = this.managementTail.then(async () => {
+      if (superseded()) throw new Error('owner recovery epoch superseded');
+      if (this.recoveryQuiescence) {
+        const debt = this.recoveryQuiescence;
+        await this.recoveryStage('prior_quiescence', debt, deadlineAt);
+        if (this.recoveryQuiescence === debt) this.recoveryQuiescence = undefined;
+      }
+      // Quiesce every stale-client reader before replacing its transport. A
+      // watch can be inside the shared drain task when its abort lands.
+      await this.recoveryStage('stale_quiescence', Promise.all([
+        staleWatch?.catch(error => this.logError('stale watch shutdown failed', error)),
+        this.drainTask?.catch(error => this.logError('stale drain shutdown failed', error)),
+      ]), deadlineAt);
+      if (superseded()) throw new Error('owner recovery epoch superseded');
+      await this.recoveryStage('close', this.client.close(), deadlineAt);
+      if (superseded()) throw new Error('owner recovery epoch superseded');
+      try {
+        await this.recoveryStage('start', this.client.start(), deadlineAt);
+        if (superseded()) throw new Error('owner recovery epoch superseded');
+        await this.recoveryStage(
+          'bind', this.client.bindIdentity(this.options.config.identity), deadlineAt);
+        if (superseded()) throw new Error('owner recovery epoch superseded');
+        // Journal-aware drain is the only operation allowed to mark owner mail
+        // read. The final listing is a typed, read-only channel probe.
+        await this.recoveryStage('drain', this.drain(), deadlineAt);
+        await this.recoveryStage('list', this.client.listIncomingMessages(), deadlineAt);
+        if (superseded()) throw new Error('owner recovery epoch superseded');
+        this.ready = true;
+        this.watchTask = this.watchLoop(watchGeneration);
+      } catch (error) {
+        this.ready = false;
+        if (token === this.recoveryToken) this.recoveryToken++;
+        // A timed-out operation may still be using this client. Never overlap
+        // its disposal; the recorded quiescence debt gates the next retry.
+        if (!this.recoveryQuiescence) {
+          try {
+            await this.recoveryStage('close_after_failure', this.client.close(), deadlineAt);
+          } catch (closeError) {
+            this.logError('recovery client close failed', closeError);
+          }
+        }
+        throw error;
+      }
+    });
     this.managementTail = run.then(() => undefined, () => undefined);
-    return run;
+    const task = run.finally(() => {
+      if (this.recoveryTask === task) this.recoveryTask = undefined;
+    });
+    this.recoveryTask = task;
+    return task;
+  }
+
+  private recoveryStage<T>(stage: string, operation: Promise<T>, deadlineAt: number): Promise<T> {
+    const now = this.options.recoveryDeps?.now ?? (() => Date.now());
+    const remaining = Math.max(0, deadlineAt - now());
+    const setTimer = this.options.recoveryDeps?.setTimer ?? ((fn, ms) => setTimeout(fn, ms));
+    const clearTimer = this.options.recoveryDeps?.clearTimer ?? (timer => clearTimeout(timer));
+    let timer!: ReturnType<typeof setTimeout>;
+    const timeout = new Promise<never>((_resolve, reject) => {
+      timer = setTimer(() => reject(new OwnerRecoveryTimeoutError(stage)), remaining);
+    });
+    return Promise.race([operation, timeout]).catch(error => {
+      if (error instanceof OwnerRecoveryTimeoutError) {
+        const debt = operation.then(() => undefined, () => undefined);
+        this.recoveryQuiescence = debt;
+      }
+      throw error;
+    }).finally(() => clearTimer(timer));
+  }
+
+  private writeShutdownState(
+    state: 'closed' | 'degraded', reason: string, at: number,
+  ): void {
+    try {
+      replaceFileAtomically(join(this.options.stateDir, '.owner-channel-shutdown.json'),
+        JSON.stringify({ version: 1, state, reason, at: new Date(at).toISOString() }, null, 2) + '\n');
+    } catch (error) {
+      this.logError('shutdown status write failed', error);
+    }
+  }
+
+  private queueManagement<T>(operation: () => Promise<T>): Promise<T> {
+    const deferred = this.recoveryTask !== undefined && !this.ready;
+    if (!this.ready && !deferred) return Promise.reject(
+      !this.startedOnce || (this.stopping && !this.shutdownDegraded)
+        ? new Error('owner-channel MCP client is unavailable')
+        : new OwnerRecoveryDegradedError(),
+    );
+    if (deferred && this.recoveryQueued >= OWNER_RECOVERY_QUEUE_CAPACITY)
+      return Promise.reject(new Error('owner recovery queue is full'));
+    if (deferred) this.recoveryQueued++;
+    const run = this.managementTail.then(() => {
+      if (!this.ready || this.stopping) throw new OwnerRecoveryDegradedError();
+      return operation();
+    });
+    this.managementTail = run.then(() => undefined, () => undefined);
+    return run.finally(() => {
+      if (deferred) this.recoveryQueued = Math.max(0, this.recoveryQueued - 1);
+    });
   }
 
   private async manageNow(
@@ -2041,7 +2217,7 @@ export class OwnerChannel implements OwnerChannelHandle {
     return undefined;
   }
 
-  private async watchLoop(): Promise<void> {
+  private async watchLoop(generation: number): Promise<void> {
     const sleep = this.options.binderDeps?.sleep
       ?? (ms => new Promise<void>(resolve => setTimeout(resolve, ms)));
     const restored = this.readWatchState();
@@ -2050,7 +2226,7 @@ export class OwnerChannel implements OwnerChannelHandle {
       state = this.writeWatchState(state, 'OWNER_WATCH_STATE_RECOVERED');
     let delayMs = 1_000;
     let attempts = 0;
-    while (!this.stopping) {
+    while (!this.stopping && generation === this.watchGeneration) {
       const ctrl = new AbortController();
       this.watchAbort = ctrl;
       try {
@@ -2060,14 +2236,14 @@ export class OwnerChannel implements OwnerChannelHandle {
         // fall into a gap. Persistent history plus fleet's body-free claim
         // journal is authoritative; durable wire-ID dedupe makes hints harmless.
         await this.drain();
-        if (this.stopping) return;
+        if (this.stopping || generation !== this.watchGeneration) return;
         state = this.writeWatchState(
           state, 'OWNER_WATCH_CONNECTING', { reconnected: attempts > 0 });
         attempts++;
         for await (const _event of this.client.watchNotifications(
           this.options.config.identity, { since: 0, signal: ctrl.signal },
         )) {
-          if (this.stopping) return;
+          if (this.stopping || generation !== this.watchGeneration) return;
           state = this.writeWatchState(
             state, 'OWNER_WATCH_CONNECTED', { resetFailures: true });
           delayMs = 1_000;
@@ -2076,9 +2252,10 @@ export class OwnerChannel implements OwnerChannelHandle {
           // recorded before a managed request is dispatched.
           await this.drain();
         }
-        if (!this.stopping) throw new Error('ours SDK notification stream ended');
+        if (!this.stopping && generation === this.watchGeneration)
+          throw new Error('ours SDK notification stream ended');
       } catch (error) {
-        if (this.stopping) return;
+        if (this.stopping || generation !== this.watchGeneration) return;
         // SDK 2 deliberately hides transport status behind its typed stream.
         // Do not parse error prose to rediscover it: every failure follows the
         // same capped retry path forever, and the pre-establishment drain makes

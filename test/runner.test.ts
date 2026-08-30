@@ -1,6 +1,6 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import {
-  mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync, readdirSync, rmSync,
+  mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync, readdirSync, rmSync, statSync,
 } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
@@ -12,6 +12,7 @@ import {
   RESTART_FAIL_THRESHOLD, RUN_MARKER_FILE,
   TEMP_IDENTITY_CLOSE_DEBOUNCE_MS, TEMP_IDENTITY_POLL_MS,
   isRecoverableTempStartupCancellation, managedFleetProxyEnv,
+  SUPERVISOR_RECYCLE_REQUIRED, SupervisorRecycleRequiredError,
   type AttemptResult, type RunnerDeps,
 } from '../src/runner.js';
 import {
@@ -71,8 +72,9 @@ function monitorRecorder(sessionCreated: () => boolean) {
 
 /** Fake agent session that dies after `lifeChecks` liveness polls and writes
  * `.exit-status` at the moment of death. */
-function fakeWorld(opts: { exitCode?: string; lifeChecks?: number; exitDelayMs?: number; exitFile?: string; rawExitRecord?: string; exitResult?: ExitRecord | null; bwrap?: 'ok' | 'missing'; cpuDelegated?: boolean; legacyExitFile?: boolean; sessionGone?: boolean } = {}) {
+function fakeWorld(opts: { exitCode?: string; lifeChecks?: number; exitDelayMs?: number; exitFile?: string; rawExitRecord?: string; exitResult?: ExitRecord | null; bwrap?: 'ok' | 'missing'; cpuDelegated?: boolean; legacyExitFile?: boolean; sessionGone?: boolean; recoveryGate?: Promise<void> } = {}) {
   const paneCommands: string[] = [];
+  const recoveryPrompts: string[] = [];
   const starts: Array<{ mode: 'fresh' | 'resume'; argv: string[]; env: Record<string, string> }> = [];
   let clock = 0;
   let checks = 0;
@@ -85,6 +87,9 @@ function fakeWorld(opts: { exitCode?: string; lifeChecks?: number; exitDelayMs?:
   const deps = {
     exec,
     cpuDelegated: () => opts.cpuDelegated ?? true,
+    probeGeneration: async () => ({ state: 'ready' as const, generation: {
+      bootId: 'test-boot', pid: 1, startedAt: 1, stateDir: dir,
+    } }),
     isAlive: () => {
       checks++;
       if (checks >= (opts.lifeChecks ?? 2)) {
@@ -106,6 +111,11 @@ function fakeWorld(opts: { exitCode?: string; lifeChecks?: number; exitDelayMs?:
       starts.push({ mode: options.mode, argv: options.launch.argv, env: options.launch.env });
       let closed = false;
       let seq = 0;
+      const conversationListeners = new Set<(event: any) => void>();
+      const emit = (event: any) => conversationListeners.forEach(listener => listener({
+        schemaVersion: 1, roleId: 'A', eventId: `event-${++seq}`, seq,
+        at: '2026-08-30T00:00:00Z', sessionGeneration: 'fake-generation', ...event,
+      }));
       return {
         backend: 'acp' as const,
         pid: 4242,
@@ -115,15 +125,36 @@ function fakeWorld(opts: { exitCode?: string; lifeChecks?: number; exitDelayMs?:
           return checks < (opts.lifeChecks ?? 2);
         },
         snapshot: () => ({ backend: 'acp' as const, alive: !closed, readiness: 'idle' as const }),
-        queuePrompt: async () => ({
-          promptId: 'fake-prompt', queuedBehind: 0,
-          completion: Promise.resolve(turnResult(true, 'completed')),
-        }),
+        queuePrompt: async (text: string) => {
+          const promptId = text.includes('[fleet-recovery]') ? `recovery-${seq}` : 'fake-prompt';
+          if (text.includes('[fleet-recovery]')) {
+            recoveryPrompts.push(text);
+            await opts.recoveryGate;
+            emit({ kind: 'prompt.admitted', promptId, payload: { queuedBehind: 0 } });
+            for (const [toolCallId, title, rawInput] of [
+              ['choose', 'choose_identity', { name: 'A', force: false }],
+              ['current', 'current_identity', {}],
+              ['messages', 'get_messages', {}],
+            ] as const) emit({
+              kind: 'tool.upsert', promptId, toolCallId,
+              payload: { toolCallId, snapshot: true, title, status: 'completed',
+                rawInput: { json: rawInput, bytes: 2 } },
+            });
+            emit({ kind: 'turn.completed', promptId, payload: { outcome: 'completed' } });
+          }
+          return {
+            promptId, queuedBehind: 0,
+            completion: Promise.resolve(turnResult(true, 'completed')),
+          };
+        },
         submitPrompt: async () => turnResult(true, 'completed'),
         interrupt: async () => ({ state: 'settled' as const }),
         respondPermission: () => true,
         eventsSince: () => [],
         subscribe: () => () => {},
+        subscribeConversation: (listener: (event: any) => void) => {
+          conversationListeners.add(listener); return () => conversationListeners.delete(listener);
+        },
         setControllerAttached: () => {},
         exitResult: () => Object.prototype.hasOwnProperty.call(opts, 'exitResult')
           ? opts.exitResult!
@@ -138,7 +169,7 @@ function fakeWorld(opts: { exitCode?: string; lifeChecks?: number; exitDelayMs?:
       };
     },
   };
-  return { deps, paneCommands, starts, monitor: rec };
+  return { deps, paneCommands, starts, monitor: rec, recoveryPrompts };
 }
 
 const writeCfg = (roles: Record<string, object>) =>
@@ -283,6 +314,41 @@ describe('runOnce isolation', () => {
     const { deps } = fakeWorld({ exitCode: '0', exitFile: join(d, '.exit-status') });
     await runOnce('A', {}, deps);
     expect(existsSync(join(d, '.isolation-degraded'))).toBe(false);
+  });
+});
+
+describe('daemon generation recovery integration', () => {
+  it('does not report active recovery after an ordinary clean persistent shutdown', async () => {
+    writeCfg({ A: { harness: 'fake', monitor: { mode: 'native' } } });
+    const d = agentDir('A');
+    mkdirSync(d, { recursive: true });
+    const world = fakeWorld({ lifeChecks: 4, exitFile: join(d, '.exit-status') });
+    await runOnce('A', {}, world.deps);
+    expect(existsSync(join(d, '.daemon-recovery.json'))).toBe(false);
+  });
+
+  it('observes baseline before session, collapses loss/change, and proves one exact recovery turn', async () => {
+    writeCfg({ A: { harness: 'fake', monitor: { mode: 'native' } } });
+    const d = agentDir('A');
+    mkdirSync(d, { recursive: true });
+    const world = fakeWorld({ lifeChecks: 10, exitFile: join(d, '.exit-status') });
+    const generations = [
+      { state: 'ready' as const, generation: { bootId: 'boot-1', pid: 1, startedAt: 1, stateDir: dir } },
+      { state: 'unavailable' as const, reason: 'DAEMON_INFO_UNREACHABLE' },
+      { state: 'ready' as const, generation: { bootId: 'boot-2', pid: 2, startedAt: 2, stateDir: dir } },
+    ];
+    let probes = 0;
+    world.deps.probeGeneration = async () => generations[Math.min(probes++, generations.length - 1)];
+    await runOnce('A', {}, world.deps);
+    expect(world.recoveryPrompts).toHaveLength(1);
+    expect(world.recoveryPrompts[0]).toContain('force false');
+    const statusPath = join(d, '.daemon-recovery.json');
+    expect(statSync(statusPath).mode & 0o777).toBe(0o600);
+    expect(JSON.parse(readFileSync(statusPath, 'utf8'))).toMatchObject({
+      identity: 'A', state: 'recovered',
+      paths: { agent: { state: 'recovered', attempts: 1 }, owner: { state: 'recovered', attempts: 1 } },
+    });
+    expect(readFileSync(join(d, '.session-id'), 'utf8')).toBeTruthy();
   });
 });
 
@@ -1173,6 +1239,27 @@ describe('temporary identity retirement', () => {
     expect(world.paneCommands).toHaveLength(1);
   });
 
+  it('cancels in-flight generation recovery on temp stop and fences late completion', async () => {
+    const d = writeTemp('T');
+    let release!: () => void;
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    const world = fakeWorld({ lifeChecks: 100, exitFile: join(d, '.exit-status'), recoveryGate: gate });
+    let probes = 0;
+    world.deps.probeGeneration = async () => ({ state: 'ready' as const, generation: {
+      bootId: probes++ === 0 ? 'boot-1' : 'boot-2', pid: probes, startedAt: probes, stateDir: dir,
+    } });
+    world.deps.shouldStop = () => true;
+    const result = await runOnce('T', { temp: true }, world.deps);
+    expect(result.retirementReason).toBe('supervisor-signal');
+    expect(world.recoveryPrompts).toHaveLength(1);
+    const statusPath = join(d, '.daemon-recovery.json');
+    const before = readFileSync(statusPath, 'utf8');
+    release();
+    await new Promise(resolve => setImmediate(resolve));
+    expect(readFileSync(statusPath, 'utf8')).toBe(before);
+    expect(JSON.parse(before).state).toBe('cancelled');
+  });
+
   it('uses first observed presence as readiness even when a cold bind exceeds the former 30s grace', async () => {
     const d = writeTemp('T');
     const world = fakeWorld({ lifeChecks: 200, exitCode: '0', exitFile: join(d, '.exit-status') });
@@ -1374,6 +1461,23 @@ describe('runTemp', () => {
     expect(readFileSync(join(archiveRoot, archived, 'termination.jsonl'), 'utf8'))
       .toContain('"reason":"identity-closed"');
   });
+
+  it('archives a distinct recycle reason and rethrows for a fresh supervisor PID', async () => {
+    const d = agentDir('Recycle', true);
+    mkdirSync(d, { recursive: true });
+    writeFileSync(join(d, 'role.yaml'), stringify({
+      name: 'Recycle', harness: 'fake', identity: 'Recycle', sourceFile: 'tmp',
+    }));
+    const logs: string[] = [];
+    await expect(runTemp('Recycle', { log: line => logs.push(line) }, async () => {
+      throw new SupervisorRecycleRequiredError();
+    })).rejects.toBeInstanceOf(SupervisorRecycleRequiredError);
+    const archiveRoot = join(stateRoot(), 'recovery', 'temporary');
+    const archived = readdirSync(archiveRoot).find(name => name.includes('-Recycle-'))!;
+    expect(readFileSync(join(archiveRoot, archived, 'termination.jsonl'), 'utf8'))
+      .toContain('"reason":"supervisor-recycle"');
+    expect(logs).toContainEqual(expect.stringContaining('failed: supervisor-recycle'));
+  });
 });
 
 describe('restart-loop containment', () => {
@@ -1434,6 +1538,31 @@ describe('restart-loop containment', () => {
     expect(backoffFor(4)).toBe(16_000);
     expect(backoffFor(5)).toBe(32_000);
     expect(backoffFor(99)).toBe(60_000);          // bounded
+  });
+
+  it('escapes the in-process loop for supervisor recycle without touching the restart circuit', async () => {
+    const d = setup();
+    const logs: string[] = [];
+    let attempts = 0;
+    const attempt = async (): Promise<AttemptResult> => {
+      attempts++;
+      throw new SupervisorRecycleRequiredError();
+    };
+    await expect(runSupervised('A', {}, {
+      now: () => 1_000,
+      sleep: async () => { throw new Error('must not back off or hold down'); },
+      shouldStop: () => false,
+      log: line => logs.push(line),
+    }, attempt)).rejects.toBeInstanceOf(SupervisorRecycleRequiredError);
+    expect(attempts).toBe(1);
+    expect(readRestartLedger(d)).toMatchObject({
+      consecutiveImmediateFailures: 0,
+      circuit: 'closed',
+      nextDelayMs: 0,
+      lastReason: SUPERVISOR_RECYCLE_REQUIRED,
+    });
+    expect(logs).toContainEqual(expect.stringContaining(SUPERVISOR_RECYCLE_REQUIRED));
+    expect(existsSync(join(d, RUN_MARKER_FILE))).toBe(false);
   });
 
   it('an immediate-exit program reaches exactly N attempts, then holds down', async () => {
