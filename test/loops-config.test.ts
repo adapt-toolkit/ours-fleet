@@ -54,11 +54,9 @@ describe('scheduled loop configuration', () => {
       .toEqual(['all']);
   });
 
-  it('allows disabled tmux definitions but rejects enabled incompatible targets', () => {
+  it('rejects legacy tmux roles before loop activation', () => {
     write('roles:\n  A: { session: tmux }\nloops:\n  check: { roles: [A], interval: 1m, prompt: hi, enabled: false }\n');
-    expect(loadConfig(file).loops[0].enabled).toBe(false);
-    write('roles:\n  A: { session: tmux }\nloops:\n  check: { roles: [A], interval: 1m, prompt: hi }\n');
-    expect(() => loadConfig(file)).toThrow(/scheduled loops require session: acp/);
+    expect(() => loadConfig(file)).toThrow(/tmux is no longer supported/);
   });
 
   it.each([

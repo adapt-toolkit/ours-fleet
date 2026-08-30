@@ -170,8 +170,10 @@ export function readIsolationFile(path: string): IsolationConfig {
 export function validateSpawnOpts(o: SpawnOpts): void {
   if (o.mission !== undefined && o.missionFile)
     throw new Error('--mission and --mission-file are mutually exclusive');
-  if (o.session && !['tmux', 'acp'].includes(o.session))
-    throw new Error(`invalid --session '${o.session}'; allowed: tmux, acp`);
+  if ((o.session as string | undefined) === 'tmux')
+    throw new Error("invalid --session 'tmux'; tmux is no longer supported; use --session acp");
+  if (o.session && o.session !== 'acp')
+    throw new Error(`invalid --session '${o.session}'; allowed: acp`);
   if (o.approval && !['ask', 'auto', 'allow', 'deny'].includes(o.approval))
     throw new Error(
       `invalid --approval '${o.approval}'; allowed: ask, auto, allow (deprecated alias: deny)`);
@@ -257,7 +259,7 @@ export function spawnDryRun(o: SpawnOpts): SpawnDryRun {
     ...(authProxy ? { authProxyBaseUrl: authProxy.base_url } : {}),
   });
   const model = modelEnv.model;
-  const session = raw.session ?? (cfg.defaults.session as SessionBackendId | undefined) ?? 'tmux';
+  const session = raw.session ?? (cfg.defaults.session as SessionBackendId | undefined) ?? 'acp';
   const resolvedRole: ResolvedRole = {
     ...raw,
     name: o.name,
@@ -317,7 +319,7 @@ function provenanceSettings(
   const inheritedModel = resolveRoleModel(undefined, o.harness, defaults);
   return {
     harness: tagged('harness', provenanceOf(o.harness, defaults.harness, 'claude-code')),
-    session: tagged('session', provenanceOf(o.session, defaults.session, 'tmux')),
+    session: tagged('session', provenanceOf(o.session, defaults.session, 'acp')),
     identity: o.identity
       ? { value: o.identity, source: 'cli' }
       : { value: o.name, source: 'built-in' },     // defaults to the role name
@@ -500,7 +502,7 @@ async function spawnTempInner(
     ...(tempAuthProxy ? { authProxyBaseUrl: tempAuthProxy.base_url } : {}),
   });
   const model = modelEnv.model;
-  const session = o.session ?? (cfg.defaults.session as SessionBackendId | undefined) ?? 'tmux';
+  const session = o.session ?? (cfg.defaults.session as SessionBackendId | undefined) ?? 'acp';
   const role: ResolvedRole = {
     ...fromOpts,          // includes `isolation` when --isolation-file was given
     name: o.name,
@@ -558,10 +560,7 @@ async function spawnTempInner(
   if (cfg.startStaggerMs > 0)
     writeFileSync(join(dir, START_STAGGER_FILE), String(cfg.startStaggerMs));
   prepareTempSupervisor(dir, o.name);
-  // Run the supervisor independently — NOT inside a tmux session named <name>.
-  // `_run-temp` -> runOnce() creates AND kills the tmux session <name> for the
-  // agent itself; a supervisor sharing that session name would SIGHUP its own
-  // process before the agent ever launches. On a service-managed host the temp
+  // Run the supervisor independently. On a service-managed host the temp
   // runner gets its own transient unit/job, so stopping the coordinator's unit
   // cannot kill a live worker in the coordinator's cgroup.
   onStage?.('starting_temp');

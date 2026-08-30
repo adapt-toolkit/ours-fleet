@@ -49,7 +49,7 @@ export const NOTIFY_EVENT_TYPES = [
 export type NotifyEventType = (typeof NOTIFY_EVENT_TYPES)[number];
 export type InjectMode = 'notification' | 'full';
 export type MonitorMode = 'fleet' | 'native';
-export type SessionBackendId = 'tmux' | 'acp';
+export type SessionBackendId = 'acp';
 /** Public, harness-neutral permission policy. */
 export type FleetPermissionMode = 'ask' | 'auto' | 'allow';
 /** `deny` is a deprecated, fail-closed compatibility alias retained for old fleet files. */
@@ -69,9 +69,6 @@ export interface SessionOptions {
   acp?: {
     /** ACP agent command and arguments. Defaults are supplied by the harness adapter. */
     command?: string | string[];
-  };
-  tmux?: {
-    boot_grace_ms?: number;
   };
 }
 
@@ -760,9 +757,13 @@ export function resolveWorklogPolicy(
 }
 
 function resolveSession(raw: unknown, file: string, name: string): SessionBackendId {
-  const value = raw ?? 'tmux';
-  if (value !== 'tmux' && value !== 'acp')
-    throw new ConfigError(`${file}: role '${name}' session: must be one of: tmux, acp`);
+  const value = raw ?? 'acp';
+  if (value === 'tmux')
+    throw new ConfigError(
+      `${file}: role '${name}' session: tmux is no longer supported; use session: acp `
+      + 'with the Codex or Claude Code adapter');
+  if (value !== 'acp')
+    throw new ConfigError(`${file}: role '${name}' session: must be: acp`);
   return value;
 }
 
@@ -781,22 +782,20 @@ function resolveSessionOptions(
       ...(((defaults as SessionOptions | undefined)?.acp) ?? {}),
       ...(role?.acp ?? {}),
     },
-    tmux: {
-      ...(((defaults as SessionOptions | undefined)?.tmux) ?? {}),
-      ...(role?.tmux ?? {}),
-    },
   };
-  const bad = Object.keys(merged).filter(k => k !== 'acp' && k !== 'tmux');
+  if ((defaults as Record<string, unknown> | undefined)?.tmux !== undefined
+      || (role as Record<string, unknown> | undefined)?.tmux !== undefined)
+    throw new ConfigError(
+      `${file}: role '${name}' session_options.tmux is no longer supported; `
+      + 'use session: acp with session_options.acp');
+  const bad = Object.keys(merged).filter(k => k !== 'acp');
   if (bad.length)
     throw new ConfigError(`${file}: role '${name}' session_options: unknown key(s) ${bad.join(', ')}`);
-  if (!isPlainObject(merged.acp) || !isPlainObject(merged.tmux))
+  if (!isPlainObject(merged.acp))
     throw new ConfigError(`${file}: role '${name}' session_options.${session} must be a map`);
   const acpBad = Object.keys(merged.acp).filter(k => k !== 'command');
-  const tmuxBad = Object.keys(merged.tmux).filter(k => k !== 'boot_grace_ms');
   if (acpBad.length)
     throw new ConfigError(`${file}: role '${name}' session_options.acp: unknown key(s) ${acpBad.join(', ')}`);
-  if (tmuxBad.length)
-    throw new ConfigError(`${file}: role '${name}' session_options.tmux: unknown key(s) ${tmuxBad.join(', ')}`);
   const command = merged.acp.command;
   if (command !== undefined
       && !(typeof command === 'string' && command.trim())
@@ -804,12 +803,7 @@ function resolveSessionOptions(
         && command.every(v => typeof v === 'string' && v.length > 0)))
     throw new ConfigError(
       `${file}: role '${name}' session_options.acp.command must be a non-empty string or string list`);
-  const grace = merged.tmux.boot_grace_ms;
-  if (grace !== undefined
-      && (typeof grace !== 'number' || !Number.isFinite(grace) || grace < 0))
-    throw new ConfigError(
-      `${file}: role '${name}' session_options.tmux.boot_grace_ms must be a non-negative number`);
-  return Object.keys(merged.acp).length || Object.keys(merged.tmux).length ? merged : undefined;
+  return Object.keys(merged.acp).length ? merged : undefined;
 }
 
 export function resolvePermissions(

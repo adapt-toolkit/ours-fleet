@@ -245,9 +245,8 @@ describe('owner-channel CLI', () => {
   }, CLI_INTEGRATION_TIMEOUT_MS);
 
   it('rejects invalid targets, invalid CIDs, conflicting invite sources, and unavailable channels', async () => {
-    config('roles:\n  Wrong: { session: tmux }\n  Plain: { session: acp }\n  PhoneRole:\n    session: acp\n    owner_channel:\n      identity: PhoneRole-owner\n      owners: [' + A + ']\n');
+    config('roles:\n  Plain: { session: acp }\n  PhoneRole:\n    session: acp\n    owner_channel:\n      identity: PhoneRole-owner\n      owners: [' + A + ']\n');
     expect((await run(['owner-channel', 'contact', 'list', 'Missing'])).stderr).toMatch(/no such role/);
-    expect((await run(['owner-channel', 'contact', 'list', 'Wrong'])).stderr).toMatch(/requires ACP/);
     expect((await run(['owner-channel', 'contact', 'list', 'Plain'])).stderr).toMatch(/no owner_channel/);
     expect((await run(['owner-channel', 'contact', 'list', 'PhoneRole'])).stderr).toMatch(/stopped.*control socket/);
     expect((await run(['owner-channel', 'owner', 'authorize', 'PhoneRole', 'not-a-cid'])).stderr)

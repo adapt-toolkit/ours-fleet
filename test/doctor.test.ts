@@ -68,19 +68,6 @@ const execWith = (table: Record<string, ExecResult>): Exec =>
   async (cmd, args) => table[[cmd, args[0] ?? ''].join(' ')] ?? { stdout: '', stderr: '', code: 0 };
 
 describe('doctor', () => {
-  it('flags missing tmux with an install hint', async () => {
-    const rep = await doctor({}, execWith({
-      'tmux -V': { stdout: '', stderr: '', code: 127 },
-      'ours version': { stdout: JSON.stringify({ name: '@ours.network/cli', version: '1.0.1' }), stderr: '', code: 0 },
-      'ours daemon': { stdout: JSON.stringify({ state: 'running' }), stderr: '', code: 0 },
-      'loginctl show-user': { stdout: 'Linger=yes', stderr: '', code: 0 },
-    }), 'linux');
-    const t = rep.checks.find(c => c.name === 'tmux')!;
-    expect(t.ok).toBe(false);
-    expect(t.detail).toContain('apt install tmux');
-    expect(rep.ok).toBe(false);
-  });
-
   it('flags a stopped ours daemon', async () => {
     const rep = await doctor({}, execWith({
       'tmux -V': { stdout: 'tmux 3.6', stderr: '', code: 0 },
@@ -458,7 +445,7 @@ describe('doctor config validity', () => {
     ['an unknown role key', 'roles:\n  A:\n    harnes: fake\n', /unknown key\(s\) harnes/],
     ['a misspelled permission key', 'roles:\n  A:\n    permissions:\n      aproval: allow\n',
       /permissions: unknown key\(s\) aproval/],
-    ['an invalid session backend', 'roles:\n  A:\n    session: telepathy\n', /session: must be one of/],
+    ['an invalid session backend', 'roles:\n  A:\n    session: telepathy\n', /session: must be: acp/],
     ['a role name with illegal characters', 'roles:\n  "bad name":\n    harness: fake\n',
       /invalid role name/],
   ];
@@ -485,7 +472,7 @@ describe('doctor config validity', () => {
   it('keeps running the host checks when the config is invalid', async () => {
     writeCfg('roles:\n  A:\n    harnes: fake\n');
     const rep = await run();
-    for (const name of ['node', 'tmux', 'ours daemon', 'linger', 'user bus'])
+    for (const name of ['node', 'ours daemon', 'linger', 'user bus'])
       expect(rep.checks.find(c => c.name === name), name).toBeDefined();
   });
 

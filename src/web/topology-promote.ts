@@ -173,10 +173,7 @@ function loopEntry(
     roles, ...pick(node, LOOP_FIELDS),
   };
   entry.interval ??= DEFAULT_LOOP_INTERVAL;
-  // An enabled loop hard-requires `session: acp` on every target. Adding one to a
-  // tmux agent would make the whole fleet unloadable, so it arrives switched off
-  // and badged instead — the owner turns it on after switching the agent to ACP.
-  if (node.enabled === false || !roles.every(role => sessionOf(model, role) === 'acp')) entry.enabled = false;
+  if (node.enabled === false) entry.enabled = false;
   return entry;
 }
 
@@ -190,7 +187,7 @@ function linked(merged: MergedTopology, id: string, kind: 'watches' | 'targets')
 function sessionOf(model: EditableFleetModel, role: string): string {
   const roles = model.roles as Record<string, Record<string, unknown> | null> | undefined;
   const defaults = model.defaults as Record<string, unknown> | undefined;
-  return String(roles?.[role]?.session ?? defaults?.session ?? 'tmux');
+  return String(roles?.[role]?.session ?? defaults?.session ?? 'acp');
 }
 
 function section(model: EditableFleetModel, key: string): Record<string, unknown> {

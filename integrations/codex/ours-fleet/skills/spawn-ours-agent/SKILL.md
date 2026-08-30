@@ -1,6 +1,6 @@
 ---
 name: spawn-ours-agent
-description: Spawn and configure a new ours-fleet agent from Codex, with a permanent or temporary lifetime and a tmux or ACP session. Use when the user asks to spawn an agent, create a fleet role, start a background agent, delegate work to another Codex session, choose its model, session, or permissions, or create a subagent with its own ours identity and console.
+description: Spawn and configure a new ours-fleet agent from Codex, with a permanent or temporary lifetime and an ACP session. Use when the user asks to spawn an agent, create a fleet role, start a background agent, delegate work to another Codex session, choose its model or permissions, or create a subagent with its own ours identity and console.
 ---
 
 # Spawn an ours-fleet agent
@@ -54,8 +54,8 @@ What this means in practice, on this harness:
 
 | Neutral intent | Native settings | Meets the floor? |
 | --- | --- | --- |
-| `--approval allow --filesystem workspace` | ACP: `agent-full-access` / `never` / `danger-full-access`; tmux: `never` / `workspace-write` | yes |
-| `--approval allow --filesystem read-only` | ACP: `agent-full-access` / `never` / `danger-full-access`; tmux: `never` / `read-only` | ACP yes; tmux no |
+| `--approval allow --filesystem workspace` | `agent-full-access` / `never` / `danger-full-access` | yes |
+| `--approval allow --filesystem read-only` | `agent-full-access` / `never` / `danger-full-access` | yes |
 | `--approval auto` | ACP: `agent` / `on-request` / `workspace-write` | no — `read-state` only |
 | `--approval ask` or legacy `deny` | conservative prompting mode | no — `read-state` only |
 
@@ -96,7 +96,7 @@ Ask only for choices not already supplied:
 
 - **Lifetime:** permanent (supervised, restartable, survives reboot) or
   temporary (detached supervisor, removed on exit/reboot).
-- **Session:** `tmux` or `acp`; both lifetimes support both.
+- **Session:** `acp`; both lifetimes use the shared structured session interface.
 - **Name:** `[A-Za-z0-9_-]+`; confirm it is absent from `ours-fleet config` and
   `ours-fleet ls`.
 - **Mission and working directory.**
@@ -151,7 +151,7 @@ Build an argument array from the approved choices. Permanent, unattended:
 
 ```sh
 ours-fleet spawn Worker --harness codex --launcher auto \
-  --session <tmux|acp> \
+  --session acp \
   --mission "Own the worker implementation" --cwd /absolute/project \
   --bio-file /tmp/worker-bio.md --persona-file /tmp/worker-persona.md \
   --approval allow --filesystem workspace --unattended deny \
@@ -163,7 +163,7 @@ Permanent, attended — a human will answer its prompts:
 
 ```sh
 ours-fleet spawn Worker --harness codex --launcher auto \
-  --session <tmux|acp> \
+  --session acp \
   --mission "Own the worker implementation" --cwd /absolute/project \
   --bio-file /tmp/worker-bio.md --persona-file /tmp/worker-persona.md \
   --approval ask --filesystem workspace --unattended wait
@@ -190,14 +190,13 @@ settings it translated to; the floor line lists what the role actually grants,
 or names what is missing. A failure there means the role will silently do less
 than its briefing says — fix the permissions rather than starting it.
 
-For ACP, `status` must report `backend: acp`, `alive: true`, and a running/idle
-readiness. For a temporary tmux role, the pane is authoritative. Confirm that
+`status` must report `backend: acp`, `alive: true`, and a running/idle
+readiness. Confirm that
 Codex loaded its briefing and reached identity binding. First use can display
 Codex authorization prompts for ours MCP tools.
 Surface those prompts to the user; do not grant persistent trust without their
-explicit approval. Use `ours-fleet send <Name> --key <choice>` only for tmux and
-only for the authorization scope the user approved; ACP permissions are answered
-through `ours-fleet attach`.
+explicit approval. Permissions are answered through `ours-fleet attach` and only
+within the authorization scope the user approved.
 
 If monitoring was approved, confirm the console reports `arm_monitor` success.
 Under native Codex, expect the role to surface the `ours-codex` recommendation

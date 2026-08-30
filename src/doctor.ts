@@ -267,13 +267,6 @@ export async function doctor(
     } catch { /* state dir may not exist yet */ }
   }
 
-  if (roles.length === 0 || roles.some(role => (role.session ?? 'tmux') === 'tmux')) {
-    const tmux = await exec('tmux', ['-V']);
-    checks.push({
-      name: 'tmux', ok: tmux.code === 0,
-      detail: tmux.code === 0 ? tmux.stdout.trim() : 'not found — apt install tmux / brew install tmux',
-    });
-  }
 
   try {
     const client = await attachDaemon({

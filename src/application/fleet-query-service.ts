@@ -5,7 +5,6 @@ import { classifyActivity } from '../session/activity.js';
 import { controlRequest } from '../session/control.js';
 import { SessionControlError, type SessionSnapshot } from '../session/types.js';
 import { readExitRecord, readRestartLedger } from '../runner.js';
-import { Tmux } from '../tmux.js';
 import { roleCapabilities, type CapabilityContext } from './capabilities.js';
 import { FleetError } from './errors.js';
 import { RoleRepository } from './role-repository.js';
@@ -61,7 +60,7 @@ function sessionOverall(
       || isolation.degraded
       || problems.some(problem => problem.severity === 'error' || problem.source === 'watchdog')
       || session.readiness === 'failed') return 'attention';
-  // A reachable ACP/tmux session is the user's live interaction surface. Its
+  // A reachable agent session is the user's live interaction surface. Its
   // evidence remains authoritative even when a service manager no longer owns
   // the process (for example, a detached ACP session with an inactive unit).
   if (session.reachability === 'online'
@@ -80,7 +79,6 @@ function sessionOverall(
 export interface FleetQueryOptions {
   repository: RoleRepository;
   supervisor: SupervisorBackend;
-  tmux?: Tmux;
   control?: typeof controlRequest;
   capabilityContext?: CapabilityContext;
   /**
@@ -93,10 +91,8 @@ export interface FleetQueryOptions {
 }
 
 export class FleetQueryService {
-  private readonly tmux: Tmux;
   private readonly control: typeof controlRequest;
   constructor(private readonly options: FleetQueryOptions) {
-    this.tmux = options.tmux ?? new Tmux();
     this.control = options.control ?? controlRequest;
   }
 
@@ -198,25 +194,6 @@ export class FleetQueryService {
             : failure === 'control-unavailable' ? 'unavailable' : 'unknown',
           readiness: offline ? 'failed' : 'unknown',
           evidence: 'authoritative', lastError: clean((error as Error).message),
-          activity: { state: 'unobservable' },
-        };
-      }
-    }
-    if (intended === 'tmux' || role.detectedBackend === 'tmux') {
-      try {
-        const has = await this.tmux.has(role.id);
-        return {
-          backend: 'tmux', reachability: has ? 'online' : supervisor === 'stopped' ? 'offline' : 'unknown',
-          readiness: has ? 'idle' : supervisor === 'running' ? 'starting' : 'failed',
-          evidence: 'inferred',
-          // tmux exposes no agent-side evidence at all, and `readiness: idle`
-          // here is a pane-liveness inference, not an activity claim.
-          activity: { state: 'unobservable' },
-        };
-      } catch (error) {
-        return {
-          backend: 'tmux', reachability: 'unknown', readiness: 'unknown',
-          evidence: 'inferred', lastError: clean((error as Error).message),
           activity: { state: 'unobservable' },
         };
       }

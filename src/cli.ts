@@ -14,7 +14,6 @@ import { findRole, loadConfig, ROLE_NAME_RE } from './config.js';
 import type { YamlMode } from './config-yaml.js';
 import { formatDuration } from './duration.js';
 import { resolvedPlan } from './resolved-plan.js';
-import { Tmux, tmuxArgs } from './tmux.js';
 import { pickBackend } from './supervisor/index.js';
 import { up, down, type OpsDeps } from './ops.js';
 import { readRestartLedger, runSupervised, runTemp } from './runner.js';
@@ -97,7 +96,7 @@ const passthrough = (cmd: string, args: string[]) =>
 
 const program = new Command()
   .name('ours-fleet')
-  .description('Fleet of persistent, identity-bound AI agents — selectable harness and tmux/ACP sessions.')
+  .description('Fleet of persistent, identity-bound AI agents — selectable harnesses over ACP sessions.')
   .enablePositionalOptions()
   .version(VERSION);
 
@@ -365,14 +364,10 @@ cOpt(program.command('force-restart [names...]').description('re-sync + bounce F
 
 program.command('ls').description('list running fleet sessions')
   .action(async () => {
-    // Each session has its own tmux server (#32), so there is no single server
-    // to ask: the known role names ARE the list of servers to poll.
-    const names: string[] = [];
     const acp: string[] = [];
     for (const root of [agentsRoot(), tmpRoot()]) {
       if (!existsSync(root)) continue;
       for (const name of readdirSync(root)) {
-        names.push(name);
         const stateDir = joinPath(root, name);
         if (!existsSync(controlSocketPath(stateDir))) continue;
         try {
@@ -389,14 +384,13 @@ program.command('ls').description('list running fleet sessions')
         } catch { /* ignore stale sockets */ }
       }
     }
-    const tmux = await new Tmux().list(names);
-    console.log([tmux, ...acp].filter(Boolean).join('\n') || '(none)');
+    console.log(acp.join('\n') || '(none)');
   });
 
 program.command('attach <name>').description('open the live console (Ctrl-b d to leave)')
   .action(async name => {
     const stateDir = acpStateDir(name);
-    if (!stateDir) process.exit(await passthrough('tmux', tmuxArgs(name, ['attach', '-t', name])));
+    if (!stateDir) throw new SessionControlError('offline', 'agent session is offline');
     try {
       const { socket, send } = await followControl(stateDir, message => {
         if ('event' in message) renderSessionEvent(message.event as SessionEvent);
@@ -420,7 +414,7 @@ program.command('attach <name>').description('open the live console (Ctrl-b d to
     } catch (e) { die(e); }
   });
 
-/** Classify a raw tmux failure: only "no such session" proves the pane is gone. */
+/** Preserve typed control failures and classify only definite missing-session errors as offline. */
 const asControlError = (e: unknown): SessionControlError => {
   if (e instanceof SessionControlError) return e;
   const message = e instanceof Error ? e.message : String(e);
@@ -449,20 +443,15 @@ program.command('peek <name> [lines]').description('pane snapshot without attach
           throw new SessionControlError(response.kind ?? 'backend', response.error ?? 'peek failed');
         const events = (response.result as { events?: SessionEvent[] } | undefined)?.events ?? [];
         for (const event of events.slice(-(lines ? Number(lines) : 40))) renderSessionEvent(event);
-      } else {
-        console.log(await new Tmux().capture(name, lines ? Number(lines) : 40));
-      }
+      } else throw new SessionControlError('offline', 'agent session is offline');
     }
     catch (e) { die(controlFailure(name, 'peek', e)); }
   });
 
 program.command('send <name> [text...]').description("type into the agent's console")
-  .option('--key <key>', 'send a raw key instead (Escape, Up, C-c, ...)')
   .action(async (name, text, opts) => {
     const stateDir = acpStateDir(name);
-    if (stateDir && opts.key) die('--key is available only for tmux sessions');
-    if (!stateDir && !opts.key && !text?.length) die('nothing to send: give text or --key');
-    if (stateDir && !text?.length) die('nothing to send: give text');
+    if (!text?.length) die('nothing to send: give text');
     try {
       if (stateDir) {
         // Returns on queue acceptance: a turn already running is not a failure.
@@ -474,8 +463,7 @@ program.command('send <name> [text...]').description("type into the agent's cons
         console.log(queued?.queuedBehind
           ? `queued for ${name} behind ${queued.queuedBehind} running turn(s)`
           : `queued for ${name}`);
-      } else if (opts.key) await new Tmux().sendKey(name, opts.key);
-      else await new Tmux().sendText(name, text.join(' '));
+      } else throw new SessionControlError('offline', 'agent session is offline');
     } catch (e) {
       die(controlFailure(name, 'send', e, asControlError(e).kind === 'timeout'
         ? '\n  The prompt may already have been delivered — do not assume it was lost.'
@@ -1036,7 +1024,7 @@ cOpt(program.command('spawn [name]').description('spawn a new agent (permanent b
   .option('--role <name>', 'role name (alternative to the positional name)')
   .option('--temp', 'temporary: independent transient supervisor, archived on retirement, gone on reboot')
   .option('--harness <id>', 'harness adapter (default: defaults.harness)')
-  .option('--session <backend>', 'session backend: tmux|acp (default: defaults.session or tmux)')
+  .option('--session <backend>', 'session backend: acp (default: acp)')
   .option('--mission <text>', 'one-line mission')
   .option('--mission-file <path>', 'UTF-8 mission text (mutually exclusive with --mission)')
   .option('--identity <name>', 'ours identity to bind (default: role name)')

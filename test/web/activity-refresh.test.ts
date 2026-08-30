@@ -10,7 +10,7 @@ describe('activity polling merge', () => {
     });
   });
 
-  it('replaces tmux pane snapshots instead of concatenating them', () => {
+  it('replaces text snapshots instead of concatenating them', () => {
     expect(mergeOutput({ text: 'old', events: [] }, { text: 'new', events: [], truncated: false }).text).toBe('new');
   });
 });

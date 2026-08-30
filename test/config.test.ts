@@ -47,8 +47,8 @@ describe('loadConfig', () => {
         max_request_bytes: 20 * 1024 * 1024, retention_ms: 24 * 60 * 60 * 1_000,
       },
     });
-    base('roles:\n  A:\n    owner_channel: { identity: A-owner, owners: [cid] }\n');
-    expect(() => loadConfig()).toThrow(/requires session: acp/);
+    base('roles:\n  A:\n    session: tmux\n');
+    expect(() => loadConfig()).toThrow(/tmux is no longer supported.*session: acp/);
   });
 
   it('requires an exact managed-agent CID distinct from owner authority', () => {
@@ -293,12 +293,13 @@ describe('loadConfig', () => {
     expect(b.identity).toBe('Bee');
   });
 
-  it('selects the session backend with one setting and defaults to tmux', () => {
-    base('defaults:\n  session: acp\nroles:\n  A: {}\n  B:\n    session: tmux\n');
+  it('defaults to ACP and rejects the legacy tmux backend precisely', () => {
+    base('defaults:\n  session: acp\nroles:\n  A: {}\n');
     expect(findRole(loadConfig(), 'A').session).toBe('acp');
-    expect(findRole(loadConfig(), 'B').session).toBe('tmux');
     base('roles:\n  C: {}\n');
-    expect(findRole(loadConfig(), 'C').session).toBe('tmux');
+    expect(findRole(loadConfig(), 'C').session).toBe('acp');
+    base('roles:\n  Legacy:\n    session: tmux\n');
+    expect(() => loadConfig()).toThrow(/tmux is no longer supported.*session: acp/);
   });
 
   it('merges common permission intent and ACP command settings', () => {
@@ -331,7 +332,7 @@ describe('loadConfig', () => {
 
   it('rejects invalid session and common permission values', () => {
     base('roles:\n  A:\n    session: screen\n');
-    expect(() => loadConfig()).toThrowError(/session.*tmux, acp/);
+    expect(() => loadConfig()).toThrowError(/session.*acp/);
     base('roles:\n  A:\n    permissions:\n      approval: maybe\n');
     expect(() => loadConfig()).toThrowError(/permissions\.approval/);
   });

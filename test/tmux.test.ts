@@ -27,33 +27,6 @@ describe('Tmux', () => {
     await expect(new Tmux(exec).newSession('A', '/w', 'x')).rejects.toThrowError(/boom/);
   });
 
-  it('sendText sends literal text then Enter', async () => {
-    const { calls, exec } = recorder();
-    await new Tmux(exec).sendText('A', 'hello world');
-    expect(calls[0]).toEqual(['tmux', '-L', 'ours-fleet-A', 'send-keys', '-t', 'A', '-l', 'hello world']);
-    expect(calls[1]).toEqual(['tmux', '-L', 'ours-fleet-A', 'send-keys', '-t', 'A', 'Enter']);
-  });
-
-  it('sendKey sends a raw key', async () => {
-    const { calls, exec } = recorder();
-    await new Tmux(exec).sendKey('A', 'Escape');
-    expect(calls[0]).toEqual(['tmux', '-L', 'ours-fleet-A', 'send-keys', '-t', 'A', 'Escape']);
-  });
-
-  it('capture returns the last N lines', async () => {
-    const { exec } = recorder({ 'capture-pane -t': { stdout: 'l1\nl2\nl3\nl4\n', stderr: '', code: 0 } });
-    expect(await new Tmux(exec).capture('A', 2)).toBe('l3\nl4');
-  });
-
-  it('panePid parses the first line', async () => {
-    const { exec } = recorder({ 'list-panes -t': { stdout: '4242\n', stderr: '', code: 0 } });
-    expect(await new Tmux(exec).panePid('A')).toBe(4242);
-  });
-
-  it('panePid returns null when session is gone', async () => {
-    const { exec } = recorder({ 'list-panes -t': { stdout: '', stderr: 'no session', code: 1 } });
-    expect(await new Tmux(exec).panePid('A')).toBeNull();
-  });
 });
 
 /**
@@ -66,16 +39,10 @@ describe('one tmux server per session (#32)', () => {
     const { calls, exec } = recorder({ 'list-panes -t': { stdout: '7\n', stderr: '', code: 0 } });
     const tmux = new Tmux(exec);
 
-    // Drive the WHOLE surface: a single command that forgets `-L` is enough to
-    // put a pane back on the shared server.
+    // Drive the complete containment surface.
     await tmux.has('A');
     await tmux.newSession('A', '/w', 'run');
     await tmux.kill('A');
-    await tmux.capture('A');
-    await tmux.panePid('A');
-    await tmux.list(['A']);
-    await tmux.sendText('A', 'hi');
-    await tmux.sendKey('A', 'Enter');
 
     expect(calls.length).toBeGreaterThan(0);
     for (const call of calls) expect(call.slice(0, 3)).toEqual(['tmux', '-L', 'ours-fleet-A']);
@@ -99,17 +66,6 @@ describe('one tmux server per session (#32)', () => {
     expect(tmuxArgs('A', ['ls'])).toEqual(['-L', 'ours-fleet-A', 'ls']);
   });
 
-  it('list asks each named server and skips the ones that are not running', async () => {
-    const calls: string[][] = [];
-    const exec: Exec = async (cmd, args) => {
-      calls.push([cmd, ...args]);
-      return args[1] === 'ours-fleet-Beta'
-        ? { stdout: '', stderr: 'no server running on /tmp/tmux-1000/ours-fleet-Beta', code: 1 }
-        : { stdout: `${args[1].replace('ours-fleet-', '')}: 1 windows\n`, stderr: '', code: 0 };
-    };
-    expect(await new Tmux(exec).list(['Alpha', 'Beta', 'Gamma'])).toBe('Alpha: 1 windows\nGamma: 1 windows');
-    expect(calls.map(c => c[2])).toEqual(['ours-fleet-Alpha', 'ours-fleet-Beta', 'ours-fleet-Gamma']);
-  });
 });
 
 describe('shq', () => {

@@ -4,13 +4,15 @@ import { home } from '../paths.js';
 import { realExec, type Exec } from '../exec.js';
 import type { ResolvedRole } from '../config.js';
 import type {
-  AcpMcpServer, HarnessAdapter, RoleDirs, SessionPrep, SessionState, Launch, UnattendedCapability,
+  AcpMcpServer, HarnessAdapter, RoleDirs, SessionPrep, UnattendedCapability,
   ValidationError,
 } from './types.js';
 import { registerAdapter } from './registry.js';
 import { replaceFileAtomically, withFileLock, type LockDeps } from '../atomic-file.js';
 import { harnessRuntimeDir } from '../isolation/policy.js';
 import { bundledAcpAgent } from './acp-agent.js';
+import { ClaudeCodeAgentSessionAdapter } from './claude-code-session.js';
+import type { AcpSessionTransport } from './acp-session-transport.js';
 
 /** One entry of `harness_options.mcp_servers`, in `.mcp.json`'s own shape. */
 interface McpServerSpec {
@@ -265,9 +267,34 @@ const armMonitor = (id: string): string =>
   `background Bash task never wakes you on output) running \`${watchCommand(id)}\` ` +
   'so inbound ours mail wakes you';
 
-export function makeClaudeCodeAdapter(exec: Exec = realExec): HarnessAdapter {
+export function makeClaudeCodeAdapter(
+  exec: Exec = realExec, transport?: AcpSessionTransport,
+): HarnessAdapter {
   return {
     id: 'claude-code',
+    agentSession: new ClaudeCodeAgentSessionAdapter({
+      prepareLaunch(role, prep) {
+        const configured = role.session_options?.acp?.command;
+        const argv = Array.isArray(configured)
+          ? [...configured]
+          : typeof configured === 'string'
+            ? ['sh', '-c', configured]
+            : bundledAcpAgent(
+                '@agentclientprotocol/claude-agent-acp', 'claude-agent-acp', 'claude-agent-acp');
+        return { argv, env: prep.env };
+      },
+      permissionModeId: role => permissionMode(role),
+      mcpServers: role => acpMcpServersFor(
+        (role.harness_options as ClaudeOptions | undefined)?.mcp_servers),
+      sessionMeta(role, prep) {
+        if (customAcpCommand(role)) return undefined;
+        const options: Record<string, unknown> = {};
+        if (prep.settingsOverlay) options.settings = prep.settingsOverlay;
+        if ((role.harness_options as ClaudeOptions | undefined)?.mcp_servers_only === true)
+          options.strictMcpConfig = true;
+        return Object.keys(options).length ? { claudeCode: { options } } : undefined;
+      },
+    }, transport),
     supportsResume: true,
 
     async checkPrereqs() {
@@ -347,7 +374,7 @@ export function makeClaudeCodeAdapter(exec: Exec = realExec): HarnessAdapter {
         MEMPALACE_MIDSESSION_AUTOSAVE: o.mem_palace_midsession_autosave ? 'true' : 'false',
         // The role's identity, for the ours connector to bind at startup instead of
         // the briefing telling the MODEL to call choose_identity. Both launches
-        // return `prep.env`, so this one line covers tmux and ACP alike.
+        // reaches the adapter-owned ACP child through `prep.env`.
         //
         // The bind the connector performs is PLAIN and fail-closed: it can never
         // evict a live session, and a role whose identity does not exist yet simply
@@ -363,104 +390,25 @@ export function makeClaudeCodeAdapter(exec: Exec = realExec): HarnessAdapter {
       // sandbox needs this directory to exist before entry.
       if (role.isolation) mkdirSync(harnessRuntimeDir(dirs.stateDir, 'claude'), { recursive: true });
 
-      const argv: string[] = [];
       let settingsOverlay: string | undefined;
       if (Object.keys(enabledPlugins).length) {
         settingsOverlay = join(dirs.stateDir, '.settings-overlay.json');
         writeFileSync(settingsOverlay, JSON.stringify({ enabledPlugins }, null, 2));
-        argv.push('--settings', settingsOverlay);
       }
 
-      // `harness_options.mcp_servers` — the tmux delivery. `--mcp-config` ADDS the
-      // file's servers; `--strict-mcp-config` is what makes the set exclusive, and
-      // it is opt-in per role because it drops everything else the user has,
-      // plugins included (see `declaresOursConnector`).
+      // Keep the MCP config artifact for diagnostics and adapter metadata.
       let mcpConfigFile: string | undefined;
       if (o.mcp_servers) {
         mcpConfigFile = join(dirs.stateDir, '.mcp-config.json');
         writeFileSync(
           mcpConfigFile, JSON.stringify({ mcpServers: o.mcp_servers }, null, 2), { mode: 0o600 });
-        argv.push('--mcp-config', mcpConfigFile);
-        if (o.mcp_servers_only === true) argv.push('--strict-mcp-config');
       }
 
       return {
-        argv, env,
+        env,
         ...(settingsOverlay ? { settingsOverlay } : {}),
         ...(mcpConfigFile ? { mcpConfigFile } : {}),
       };
-    },
-
-    buildLaunch(role: ResolvedRole, mode: 'fresh' | 'resume', s: SessionState, prep: SessionPrep): Launch {
-      const stateDir = roleStateDir(role);
-      const pm = permissionMode(role);
-      const o = role.harness_options as ClaudeOptions | undefined;
-      const base = ['claude', ...(role.model ? ['--model', role.model] : []),
-                    ...(o?.effort ? ['--effort', o.effort] : []),
-                    ...(pm ? ['--permission-mode', pm] : []),
-                    ...prep.argv, '--remote-control', role.name];
-      const argv = mode === 'fresh'
-        ? [...base, '--session-id', s.sessionId, `Read and follow ${join(stateDir, 'briefing.md')} now.`]
-        : [...base, '--resume', s.sessionId,
-            this.vocabulary.restartPrompt(role.identity, join(stateDir, 'WORKLOG.md'), role)];
-      return { argv, env: prep.env };
-    },
-
-    buildAcpLaunch(role: ResolvedRole, prep: SessionPrep): Launch {
-      const configured = role.session_options?.acp?.command;
-      const argv = Array.isArray(configured)
-        ? [...configured]
-        : typeof configured === 'string'
-          ? ['sh', '-c', configured]
-          : bundledAcpAgent(
-              '@agentclientprotocol/claude-agent-acp', 'claude-agent-acp', 'claude-agent-acp');
-      return { argv, env: prep.env };
-    },
-
-    // Same source as buildLaunch's --permission-mode flag, so the tmux and ACP
-    // backends cannot disagree about what a role's permissions translate to.
-    acpPermissionModeId(role: ResolvedRole): string | undefined {
-      return permissionMode(role);
-    },
-
-    /**
-     * Deliver, over ACP, the two things the tmux launch delivers as flags.
-     *
-     * `buildAcpLaunch` builds its own argv and cannot carry `prep.argv`: the
-     * process it launches is the ACP agent, not `claude`, and it takes none of
-     * claude's flags. That is why `harness_options.plugins` did nothing at all on
-     * an ACP role — the overlay was written and then dropped, and the mem-palace
-     * toggle rode `prep.env` and survived, so the failure was silent AND
-     * selective.
-     *
-     * `_meta.claudeCode.options` is the bundled agent's own passthrough into the
-     * Claude Agent SDK (@agentclientprotocol/claude-agent-acp, acp-agent.js:4092
-     * → the `options` object at :4144). `settings` takes the same overlay path
-     * `--settings` takes; `strictMcpConfig` is the SDK's spelling of
-     * `--strict-mcp-config`. Both are spread BEFORE the fields the agent forces,
-     * so neither is overwritten.
-     *
-     * ⚠ RETURNS NOTHING FOR A ROLE THAT NAMES ITS OWN ACP COMMAND. That process
-     * is not the bundled agent and has no reason to read this vocabulary; sending
-     * it anyway would be the silent drop again, one level down. `validateOptions`
-     * refuses those roles instead.
-     */
-    acpSessionMeta(role: ResolvedRole, prep: SessionPrep): Record<string, unknown> | undefined {
-      if (customAcpCommand(role)) return undefined;
-      const options: Record<string, unknown> = {};
-      if (prep.settingsOverlay) options.settings = prep.settingsOverlay;
-      if ((role.harness_options as ClaudeOptions | undefined)?.mcp_servers_only === true)
-        options.strictMcpConfig = true;
-      return Object.keys(options).length ? { claudeCode: { options } } : undefined;
-    },
-
-    /**
-     * The declared servers, in ACP's array shape. Sent on `session/new` and on
-     * resume/load, because the SDK builds its server set once per session and a
-     * resumed session that dropped them would quietly lose its tools.
-     */
-    acpMcpServers(role: ResolvedRole): AcpMcpServer[] | undefined {
-      return acpMcpServersFor((role.harness_options as ClaudeOptions | undefined)?.mcp_servers);
     },
 
     isolationPaths(_role: ResolvedRole, _dirs: RoleDirs) {
@@ -557,7 +505,7 @@ export function makeClaudeCodeAdapter(exec: Exec = realExec): HarnessAdapter {
 
 // The adapter needs the state dir for briefing/worklog paths in launch prompts.
 // Roles' state dirs are canonical: agentDir(name) — temp roles carry their dir in cwd handling
-// by the runner, which passes dirs to prepareSession; buildLaunch derives from the same rule.
+// by the runner, which passes dirs to prepareSession.
 import { agentDir } from '../paths.js';
 function roleStateDir(role: ResolvedRole): string {
   // Temp roles are marked by the runner via a private field to keep the interface small.

@@ -370,7 +370,7 @@ describe('owner command registry', () => {
   });
 
   it('preserves the multi-line fleet listing for /ls exactly', async () => {
-    const listing = 'Coordinator: acp (running)\nDeveloper-1: acp (running)\nWatchdog: tmux (idle)';
+    const listing = 'Coordinator: acp (running)\nDeveloper-1: acp (running)\nWatchdog: acp (idle)';
     const ctx = context({ fleetList: vi.fn(async () => listing) });
     await dispatchOwnerCommand('/ls', ctx);
     expect(ctx.replies).toEqual([`📊 Fleet sessions:\n${listing}`]);

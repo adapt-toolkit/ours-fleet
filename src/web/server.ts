@@ -47,10 +47,6 @@ export interface WebServices {
   topologyPromote?: TopologyPromoteService;
   removal?: RoleRemovalService;
   taskRooms?: TaskRoomApplicationService;
-  terminalUpgrade?: (
-    socket: WebSocket, request: FastifyRequest, roleId: string,
-    ticket: string, hello: Record<string, unknown>,
-  ) => Promise<void>;
 }
 
 export interface WebServer {
@@ -162,7 +158,7 @@ export async function buildWebServer(
     return {
       version: VERSION, api: { major: 1, minor: 0 },
       websocketProtocols: [
-        'ours-fleet-events.v1', 'ours-fleet-terminal.v1', 'ours-fleet-conversation.v1',
+        'ours-fleet-events.v1', 'ours-fleet-conversation.v1',
       ],
       auditDegraded: audit.degraded,
     };
@@ -412,7 +408,7 @@ export async function buildWebServer(
     const control = await services.session(request.params.id);
     // The idempotent, durably admitted path — used whenever the caller sends a
     // command id and the role has a conversation ledger. The legacy path stays
-    // for old clients and tmux roles.
+    // for old clients.
     if (control.submitPromptV2) {
       const admittedCommandId = commandId ?? randomBytes(16).toString('hex');
       const receipt = await control.submitPromptV2({
@@ -526,9 +522,9 @@ export async function buildWebServer(
 
   app.post('/api/v1/ws-tickets', async request => {
     const body = request.body as {
-      purpose?: 'events' | 'terminal' | 'conversation'; roleId?: string;
+      purpose?: 'events' | 'conversation'; roleId?: string;
     };
-    if (!body?.purpose || !['events', 'terminal', 'conversation'].includes(body.purpose))
+    if (!body?.purpose || !['events', 'conversation'].includes(body.purpose))
       throw new FleetError('invalid_request', 'ticket purpose is required');
     if (body.purpose === 'conversation' && !body.roleId)
       throw new FleetError('invalid_request', 'a conversation ticket must be bound to a role');
@@ -626,19 +622,6 @@ export async function buildWebServer(
           if (socket.readyState === socket.OPEN) socket.ping();
         }, 30_000);
         socket.on('close', () => { clearInterval(heartbeat); follow.close(); });
-      });
-    });
-
-  app.get<{ Params: { id: string } }>(
-    '/api/v1/roles/:id/terminal', { websocket: true }, (socket, request) => {
-      requireSubprotocol(request, 'ours-fleet-terminal.v1');
-      authorizeSocket(socket, request, async hello => {
-        const ticket = String(hello.ticket ?? '');
-        const session = auth.consumeTicket(request, ticket, 'terminal', request.params.id);
-        auth.bindSocket(session.id, socket);
-        if (!services.terminalUpgrade)
-          throw new FleetError('capability_unavailable', 'terminal PTY support is unavailable');
-        await services.terminalUpgrade(socket, request, request.params.id, ticket, hello);
       });
     });
 

@@ -1,7 +1,7 @@
 # @ours.network/fleet-codex
 
 Native OpenAI Codex plugin for `ours-fleet`. It adds skills for creating Codex
-fleet roles and overseeing agents in their tmux consoles. The
+fleet roles and overseeing agents through structured sessions. The
 `@ours.network/fleet` CLI performs the actual lifecycle operations.
 
 ## Install

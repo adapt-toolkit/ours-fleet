@@ -110,7 +110,7 @@ export interface InterruptOutcome {
 }
 
 /**
- * What a `SessionHandle.interrupt` implementation may resolve. Before 0.17.1 the
+ * What an `AgentSession.interrupt` implementation may resolve. Before 0.17.1 the
  * contract was `Promise<void>`, and resolving at all meant the cancellation had
  * taken effect cooperatively — so an implementation written against that
  * contract stays valid and keeps its exact meaning. Only in-tree consumers read
@@ -167,7 +167,7 @@ export interface ExitRecord {
   code?: number;
   /** Signal that killed it, when one did. */
   signal?: string;
-  /** Raw wait status as the pane shell saw it (tmux only). */
+  /** Raw wait status retained when migrating a legacy shell-exit record. */
   status?: number;
   at?: string;
   /** One line an operator can read. */
@@ -248,8 +248,7 @@ export interface SessionSnapshot {
   };
   /**
    * Observed agent activity, independent of turn occupancy: the evidence a
-   * human-facing surface needs before calling a role idle. Absent on backends
-   * that cannot observe the agent at all (tmux), which is itself honest — no
+   * human-facing surface needs before calling a role idle. When absent, no
    * evidence is not evidence of inactivity.
    */
   activity?: SessionActivity;
@@ -325,7 +324,12 @@ export interface ConversationHandlePage {
   snapshot: ConversationSnapshot;
 }
 
-export interface SessionHandle {
+/**
+ * The live, harness-neutral contract between Fleet and one agent session.
+ * Harness adapters construct this handle; orchestration code must not depend
+ * on the ACP transport which currently implements it.
+ */
+export interface AgentSession {
   readonly backend: SessionBackendId;
   readonly pid: number;
   isAlive(): boolean;
@@ -367,3 +371,6 @@ export interface SessionHandle {
   exitResult(): ExitRecord | null;
   close(): Promise<void>;
 }
+
+/** @deprecated Public compatibility name; use AgentSession. */
+export type SessionHandle = AgentSession;

@@ -8,8 +8,8 @@ harnesses — from one declarative file.**
 An AI coding agent in a terminal dies when you close the laptop. `ours-fleet`
 turns such sessions into **roles**: long-lived agents that
 
-- **run through a selectable session backend** — existing detached tmux consoles
-  or structured ACP sessions — which you can attach to, peek at, or prompt,
+- **run through structured ACP sessions** behind a shared Codex/Claude Code
+  agent-session interface, which you can inspect or prompt,
 - are **supervised** — systemd (Linux) or launchd (macOS) restarts them on crash
   and brings them back after a reboot,
 - **resume their context** across restarts (when the harness supports it),
@@ -44,8 +44,7 @@ roles:
 ~/fleet.yaml + ~/fleet.d/*.yaml           your declaration
         │  ours-fleet up
         ▼
-briefing.md per role  ──►  tmux session  ──►  harness CLI (claude …)
-                       └─►  ACP client   ──►  ACP agent (codex-acp …)
+briefing.md per role  ──►  agent session adapter  ──►  ACP client/session  ──►  ACP agent
         ▲                        │
  systemd --user / launchd ───────┘   restart on crash, start at boot/login
 ```
@@ -78,7 +77,6 @@ The state dir contract:
 | What | Why | Install |
 |---|---|---|
 | Node ≥ 20 | runs `ours-fleet` itself | nodejs.org, `apt`, or `brew` |
-| tmux | roles using `session: tmux` (the default) | `apt install tmux` / `brew install tmux` |
 | Node ≥ 22 | Claude roles using `session: acp` | required by the maintained Claude ACP adapter |
 | a harness CLI, logged in | the agent itself | e.g. Claude Code (`claude`) or Codex CLI (`codex`) |
 | `ours` CLI + shared daemon | identity + agent-to-agent messaging | `npm i -g @ours.network/cli && ours daemon start` |
@@ -98,8 +96,8 @@ ours-fleet doctor    # verifies everything above, with actionable messages
 The maintained Codex and Claude ACP adapters install as optional dependencies of
 `ours-fleet` and are resolved internally; users do not install adapter commands
 or add them to `PATH`. An explicit `session_options.acp.command` remains
-available for custom adapters. On Node 20–21, tmux and Codex ACP remain
-available, while maintained Claude ACP requires upgrading to Node 22.
+available for custom adapters. On Node 20–21, Codex ACP remains available,
+while maintained Claude ACP requires upgrading to Node 22.
 
 Each OS user manages their own fleet — to host roles under a sandboxed account,
 become that account and repeat.
@@ -139,8 +137,8 @@ fleet monitor policy, and same-harness model inherit from the caller. Explicit
 flags win; changing harness without a model lets the selected harness/fleet
 defaults choose one. After creation succeeds, fleet can deterministically notify
 the caller's owner channel with the caller and spawned-role details. This is an
-honest-actor convenience and attribution path, not a security boundary; tmux,
-host shells, and deliberately bypassed absolute binaries retain direct behavior.
+honest-actor convenience and attribution path, not a security boundary; host
+shells and deliberately bypassed absolute binaries retain direct behavior.
 
 ## Local web console
 
@@ -209,8 +207,8 @@ offline shell and no stale fleet state.
 
 The console provides evidence-separated inventory and status, ACP activity and
 permission controls, redacted logs, typed text send, confirmed lifecycle
-actions, transactional permanent/temporary creation, and a shared tmux browser
-terminal. Identity is fixed to the role name. Creation uses the authenticated
+actions, and transactional permanent/temporary creation. Identity is fixed to
+the role name. Creation uses the authenticated
 daemon inventory and reports verified, missing, or unknown evidence. A missing
 permanent role identity is created deterministically before launch with local
 discovery and auto-accept enabled, then the provisioning lease is released so
@@ -243,19 +241,16 @@ never force-adopts or deletes identity state. Permanent roles are
 provisioned by fleet before launch and never delegate normal identity creation
 to the harness.
 
-`node-pty` is optional: if its native module cannot load, ACP and all
-non-terminal features remain available and tmux Terminal is disabled with a
-diagnostic.
+The web console uses structured ACP activity rather than exposing a raw agent terminal.
 
 Security boundaries:
 
 - configured `Host` and `Origin`, CSRF, one-time WebSocket tickets, and explicit
   bind/origin policy are enforced server-side;
 - cwd values must resolve beneath configured local roots;
-- terminal bytes are intentionally unredacted and are never copied into audit
-  records; normal logs are bounded and redacted;
-- tests use temporary fleet homes, fake supervisors/identity providers, and
-  isolated tmux sockets—never active role state.
+- normal logs are bounded and redacted;
+- tests use temporary fleet homes and fake supervisors/identity providers—never
+  active role state.
 
 Permanent spawns are written to `~/fleet.d/<Name>.yaml`; the CLI never edits your
 hand-written `~/fleet.yaml`. `ours-fleet rm <Name>` unspawns.
@@ -292,7 +287,6 @@ them and unsticks them:
 
 ```sh
 ours-fleet peek Worker          # what is it doing?
-ours-fleet send Worker --key 1  # answer the menu it's stuck on
 ours-fleet send Worker "continue with the tests, then report"
 ```
 
@@ -315,7 +309,7 @@ ours-fleet docs | man                 AI-friendly complete reference
 ours-fleet up|down|restart|force-restart [-c FILE] [Name...]
 ours-fleet config [-c FILE]         validate + print merged plan
 ours-fleet ls | attach | peek | logs [-f] | status <Name>
-ours-fleet send <Name> "text" | --key <K>
+ours-fleet send <Name> "text"
 ours-fleet spawn [--temp] [<Name> | --role <Name>] [--harness --session --mission --model --approval ...]
 ours-fleet loops validate|list|status
 ours-fleet loops reload <Role>
@@ -355,7 +349,7 @@ vars: { work_root: /home/me/work }      # ${var} substitution anywhere below
 start_stagger_ms: 0                     # delay between agent LAUNCHES (host-wide, ms); 0 = no stagger
 defaults:
   harness: claude-code                  # for roles that don't set one
-  session: tmux                         # tmux (default) | acp
+  session: acp                          # supported Fleet↔agent session path
   permissions:                         # common intent, translated by each harness/backend
     approval: ask                       # ask | auto | allow (`deny` is a deprecated alias)
     filesystem: workspace               # read-only | workspace | unrestricted
@@ -371,7 +365,7 @@ defaults:
 roles:
   Name:                                 # [A-Za-z0-9_-]+
     harness: claude-code
-    session: acp                         # one flag selects ACP; omit for tmux
+    session: acp                         # optional; ACP is the only supported session
     session_options:
       acp:
         command: claude-agent-acp        # optional advanced override
@@ -446,15 +440,14 @@ loops:                                    # trusted local scheduled ACP turns
 
 Merge order: `fleet.yaml` ← `fleet.d/*.yaml`; a duplicate role name is a hard
 error naming both files. Identities and roles are decoupled — removing a role
-never deletes an identity. `session` is independent of `harness`, so changing a
-role from tmux to ACP does not change its identity, mission, monitor, or permission
-contract. `defaults.harness_options` is shallow-merged with each
+never deletes an identity. `session` is ACP-backed for both supported harnesses.
+`defaults.harness_options` is shallow-merged with each
 role's `harness_options`, so a fleet can set common Codex permission/profile defaults
 and override individual keys per role. `monitor` merges the same way — a role block
 overrides `defaults.monitor` key-by-key.
 
 Every supervised role is a client of the operator-configured ours daemon. Fleet strips the
-obsolete, presence-sensitive `OURS_AUTOSTART` variable from both tmux and ACP harness
+obsolete, presence-sensitive `OURS_AUTOSTART` variable from ACP harness
 processes. `ours-mcp proxy` is client-only and never starts a daemon; operators and explicit
 installer/setup flows remain responsible for starting it.
 
@@ -597,9 +590,7 @@ since a human can still attach a console and answer.
 `auto` selects Codex ACP `agent` (`on-request` + `workspace-write`) / Claude
 `acceptEdits`. `allow` selects Codex ACP's fully non-interactive yolo mode,
 reported by the adapter as `agent-full-access` (`never` +
-`danger-full-access`); Claude uses `bypassPermissions`. For Codex tmux, where the
-approval and sandbox flags remain independent, `auto` is `on-request` and
-`allow` is `never` while `filesystem` still chooses the sandbox.
+`danger-full-access`); Claude uses `bypassPermissions`.
 `dontAsk` suppresses only the *prompt*, not the denial, which is why an
 `allow` role previously ran unable to do its job. Legacy `deny` is accepted
 only for compatibility and retains its conservative Codex `on-request` /
@@ -689,8 +680,8 @@ their boots ~4 s apart instead of firing all seven at once.
 With `monitor.mode: fleet` (the default), the **ours-fleet supervisor** delivers
 a role's mail wakes: the per-role runner long-polls the ours daemon's notification API and
 submits a single `[fleet-monitor] N new messages from … — run get_messages` prompt
-through the selected backend. ACP uses live steering when its adapter supports it
-and falls back to structured `session/prompt`; tmux uses verified console input.
+through the shared agent session. ACP uses live steering when its adapter supports it
+and falls back to structured `session/prompt`.
 Set `monitor.interrupt: true` on roles where every configured wake should cancel
 the active turn before the notification is delivered. This is intentionally
 content-blind: the supervisor cannot inspect encrypted message bodies, so all
@@ -700,8 +691,7 @@ tool result or pending permission. Fleet waits for terminal ACP tool/update
 evidence, then steers the wake without calling `session.cancel`. If the tool is
 still active after 120 seconds, or the adapter cannot expose authenticated tool
 boundaries/steering, fleet visibly degrades to non-cancelling steering or queued
-delivery. Tmux never receives `C-c` for `after_tool`. Explicit human and control
-interrupts remain immediate.
+delivery. Explicit human and control interrupts remain immediate.
 The default is `false`: a role that must begin a post-readiness mission
 immediately, including second-and-later mail received while it is working, must
 set `monitor.mode: fleet` and `monitor.interrupt: true` explicitly. Readiness and
@@ -794,8 +784,8 @@ invites, message bodies, credentials, or keys. A corrupt overlay fails closed
 (no effective owners and no mutation), and the last effective owner cannot be
 revoked.
 
-These commands require a running ACP role with `owner_channel` enabled. Missing,
-stopped, tmux, disabled, draining, and unavailable-MCP targets fail without
+These commands require a running role with `owner_channel` enabled. Missing,
+stopped, disabled, draining, and unavailable-MCP targets fail without
 starting a second client, binding an identity, or opening a network listener.
 
 The managed agent can use its ordinary ours `send_message` or `send_file` tool to
@@ -1015,11 +1005,8 @@ gets a durable pre-send marker: a failed/ambiguous send becomes `uncertain` and 
 not blindly retried, while files not yet attempted remain recoverable after restart.
 Logs contain counts and byte totals, never filenames or raw bytes.
 
-Owner channels currently require `session: acp`. Fleet needs structured,
-turn-correlated assistant output for automatic replies; scraping a tmux pane
-cannot reliably distinguish the final answer from thoughts, tool output, or
-unrelated concurrent work. The config rejects tmux instead of silently offering
-weaker semantics.
+Owner channels use the structured agent-session interface for turn-correlated
+assistant output and reliable automatic replies.
 
 ## Codex roles
 
@@ -1083,7 +1070,7 @@ role-specific ours daemon, or configure the host default in `~/.ours/config.json
 
 Each role can be sandboxed at the environment level via an `isolation:` block —
 **fully additive: a role with no block behaves exactly as before.** The agent's
-tmux-pane process is wrapped in [bubblewrap](https://github.com/containers/bubblewrap)
+agent process is wrapped in [bubblewrap](https://github.com/containers/bubblewrap)
 (rootless, no setuid), resource-limited by `systemd-run --user --scope`.
 
 An empty `isolation: {}` gives a sensible default posture: filesystem-confined to

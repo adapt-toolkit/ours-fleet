@@ -9,11 +9,11 @@
     {
       "name": "ours-fleet",
       "displayName": "ours-fleet",
-      "description": "Spawn and oversee ours-fleet agents from inside Claude Code: co-draft bio/persona, spawn permanent or temporary fleet agents, and keep wards unstuck via tmux peek/send.",
+      "description": "Spawn and oversee ours-fleet agents from inside Claude Code: co-draft bio/persona, spawn permanent or temporary fleet agents, and keep wards unstuck via structured ACP controls.",
       "author": { "name": "Adapt Framework Solutions Ltd", "url": "https://ours.network" },
       "homepage": "https://github.com/adapt-toolkit/ours-fleet",
       "repository": "https://github.com/adapt-toolkit/ours-fleet",
-      "keywords": ["fleet", "agents", "tmux", "spawn", "oversight", "ours"],
+      "keywords": ["fleet", "agents", "acp", "spawn", "oversight", "ours"],
       "source": "./integrations/claude-code"
     }
   ]

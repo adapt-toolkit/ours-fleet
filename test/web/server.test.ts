@@ -26,13 +26,13 @@ async function testServer(overrides: Record<string, unknown> = {}) {
 function services() {
   const role = {
     id: 'Alpha', lifetime: 'permanent', configured: true, stateHealth: 'present',
-    configuredBackend: 'tmux', detectedBackend: 'tmux',
+    configuredBackend: 'acp', detectedBackend: 'acp',
     compatibility: { compatible: true }, problems: [],
   };
   const status = {
     roleId: 'Alpha', observedAt: new Date().toISOString(), overall: 'ready',
     supervisor: { backend: 'none', liveness: 'running', detail: 'running' },
-    session: { backend: 'tmux', reachability: 'online', readiness: 'idle', evidence: 'inferred' },
+    session: { backend: 'acp', reachability: 'online', readiness: 'idle', evidence: 'inferred' },
     restart: { circuit: 'closed', consecutiveImmediateFailures: 0, nextDelayMs: 0 },
     monitor: { mode: 'unknown', health: 'unknown', stale: true },
     isolation: { degraded: false }, problems: [],
@@ -45,8 +45,8 @@ function services() {
     repository: { async get() { return role; } },
     async session() {
       return {
-        async describe() { return { backend: 'tmux', protocolVersion: 1, features: [] }; },
-        async snapshot() { return { backend: 'tmux', alive: true, readiness: 'idle' }; },
+        async describe() { return { backend: 'acp', protocolVersion: 1, features: [] }; },
+        async snapshot() { return { backend: 'acp', alive: true, readiness: 'idle' }; },
         async recentOutput() { return { events: [], text: 'safe', truncated: false }; },
         async sendText() {
           return {
@@ -367,7 +367,7 @@ describe('secure local web host', () => {
 describe('watchdog read endpoints', () => {
   const WATCHDOG: ResolvedWatchdog = {
     name: 'nightwatch', coordinator: 'FleetCoordinator', enabled: true,
-    intervalMs: 600_000, watch: ['Alice'], harness: 'claude-code', session: 'tmux',
+    intervalMs: 600_000, watch: ['Alice'], harness: 'claude-code', session: 'acp',
     identity: 'Watchdog-nightwatch', timeoutMs: 300_000, keepReports: 50,
     alertCooldownMs: 3_600_000, sourceFile: 'fleet.yaml',
   };

@@ -50,7 +50,7 @@ export function resolveWatchdogs(
   const roleIdentities = new Set(roles.map(r => r.identity));
   // Tracks identity -> owning watchdog name across entries:
   // two watchdogs declaring the same identity would otherwise share a temp
-  // dir, tmux session, and run lock with no error until they collide at
+  // dir, agent session, and run lock with no error until they collide at
   // runtime.
   const watchdogIdentities = new Map<string, string>();
   const out: ResolvedWatchdog[] = [];
@@ -79,9 +79,11 @@ export function resolveWatchdogs(
       throw new ConfigError(`${where}: identity '${identity}' collides with watchdog '${collidingWatchdog}'`);
     watchdogIdentities.set(identity, name);
     const harness = w.harness ?? (defaults.harness as string | undefined) ?? 'claude-code';
-    const sessionRaw = w.session ?? (defaults.session as string | undefined) ?? 'tmux';
-    if (sessionRaw !== 'tmux' && sessionRaw !== 'acp')
-      throw new ConfigError(`${where}: session must be 'tmux' or 'acp'`);
+    const sessionRaw = w.session ?? (defaults.session as string | undefined) ?? 'acp';
+    if (sessionRaw === 'tmux')
+      throw new ConfigError(`${where}: session 'tmux' is no longer supported; use session: acp`);
+    if (sessionRaw !== 'acp')
+      throw new ConfigError(`${where}: session must be 'acp'`);
     if (w.prompt_file !== undefined) {
       if (typeof w.prompt_file !== 'string' || !isAbsolute(w.prompt_file))
         throw new ConfigError(`${where}: prompt_file must be an absolute path`);

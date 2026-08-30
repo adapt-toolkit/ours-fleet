@@ -4,9 +4,8 @@ import type { ResolvedRole } from './config.js';
  * Which environment variable a harness reads to pin the model it RUNS.
  *
  * This is not a convenience: for `claude-code` it is the only channel that
- * reaches the ACP backend at all. `buildLaunch` (tmux) passes `--model`, but
- * `buildAcpLaunch` launches the ACP adapter with no model argument, and that
- * adapter resolves its model in this order — ANTHROPIC_MODEL, then
+ * reaches the Claude Code ACP adapter. The adapter resolves its model in this
+ * order — ANTHROPIC_MODEL, then
  * `settings.model`, then a resumed session's live model, then its first
  * catalogue entry. A role's declared model was therefore invisible to every
  * ACP role, and a fleet-wide `defaults.env.ANTHROPIC_MODEL` silently outranked

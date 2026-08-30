@@ -5,10 +5,9 @@ import {
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { execFileSync } from 'node:child_process';
 import { stringify } from 'yaml';
 import {
-  runOnce, runTemp, runSupervised, buildPaneCommand, reserveLaunchSlot, readExitRecord,
+  runOnce, runTemp, runSupervised, reserveLaunchSlot, readExitRecord,
   readRestartLedger, resetRestartLedger, writeRestartLedger, backoffFor, loadTempRole,
   RESTART_FAIL_THRESHOLD, RUN_MARKER_FILE,
   TEMP_IDENTITY_CLOSE_DEBOUNCE_MS, TEMP_IDENTITY_POLL_MS,
@@ -17,11 +16,10 @@ import {
 } from '../src/runner.js';
 import {
   ACP_CANCEL_DEADLINE_EXCEEDED, classifyChildExit, classifyShellStatus, turnResult,
-  type SessionHandle, type TurnResult,
+  type ExitRecord, type SessionHandle, type TurnResult,
 } from '../src/session/types.js';
 import { registerAdapter } from '../src/harness/registry.js';
 import { agentDir, stateRoot } from '../src/paths.js';
-import { Tmux } from '../src/tmux.js';
 import { fakeAdapter } from './registry.test.js';
 import type { Exec } from '../src/exec.js';
 import type { HarnessAdapter } from '../src/harness/types.js';
@@ -31,6 +29,7 @@ import {
 } from '../src/owner-channel/binder.js';
 import { prepareTempSupervisor } from '../src/temp-lifecycle.js';
 import type { ResolvedRole } from '../src/config.js';
+import { AcpSession } from '../src/session/acp.js';
 
 let dir: string;
 beforeEach(() => {
@@ -44,7 +43,7 @@ afterEach(() => {
 });
 
 /** Records the monitor lifecycle the runner drives, and proves prime happens
- *  before the tmux session is created. */
+ *  before the agent session is created. */
 function monitorRecorder(sessionCreated: () => boolean) {
   const rec = {
     constructed: 0,
@@ -69,45 +68,28 @@ function monitorRecorder(sessionCreated: () => boolean) {
   return { rec, createMonitor };
 }
 
-/** Fake tmux whose pane "process" dies after `lifeChecks` liveness polls,
- *  writing `.exit-status` (like the pane shell would) at the moment of death. */
-function fakeWorld(opts: { exitCode?: string; lifeChecks?: number; exitDelayMs?: number; exitFile?: string; rawExitRecord?: string; bwrap?: 'ok' | 'missing'; cpuDelegated?: boolean; legacyExitFile?: boolean; sessionGone?: boolean } = {}) {
+/** Fake agent session that dies after `lifeChecks` liveness polls and writes
+ * `.exit-status` at the moment of death. */
+function fakeWorld(opts: { exitCode?: string; lifeChecks?: number; exitDelayMs?: number; exitFile?: string; rawExitRecord?: string; exitResult?: ExitRecord | null; bwrap?: 'ok' | 'missing'; cpuDelegated?: boolean; legacyExitFile?: boolean; sessionGone?: boolean } = {}) {
   const paneCommands: string[] = [];
+  const starts: Array<{ mode: 'fresh' | 'resume'; argv: string[]; env: Record<string, string> }> = [];
   let clock = 0;
   let checks = 0;
   let sessionCreated = false;
-  let sessionKilled = false;
   const exec: Exec = async (cmd, args) => {
     if (cmd === 'bwrap') return { stdout: 'bubblewrap 0.11.1\n', stderr: '', code: opts.bwrap === 'missing' ? 127 : 0 };
-    if (cmd === 'tmux') {
-      // Faithful to #32: a real tmux invoked without `-L` talks to the SHARED
-      // default server, which is a different server from this role's. A fake
-      // that answered anyway would let the socket flag be dropped unnoticed.
-      if (args[0] !== '-L' || !args[1].startsWith('ours-fleet-'))
-        return { stdout: '', stderr: 'no server running on the default socket', code: 1 };
-      const sub = args[2];
-      if (sub === 'new-session') {
-        paneCommands.push(args[args.length - 1]); sessionCreated = true; sessionKilled = false;
-      }
-      if (sub === 'kill-session' && sessionCreated) sessionKilled = true;
-      if (sub === 'list-panes') return { stdout: '4242\n', stderr: '', code: 0 };
-      if (sub === 'has-session')
-        return { stdout: '', stderr: '', code: opts.sessionGone || sessionKilled ? 1 : 0 };
-    }
     return { stdout: '', stderr: '', code: 0 };
   };
   const { rec, createMonitor } = monitorRecorder(() => sessionCreated);
   const deps = {
-    tmux: new Tmux(exec),
     exec,
     cpuDelegated: () => opts.cpuDelegated ?? true,
     isAlive: () => {
-      if (sessionKilled) return false;
       checks++;
       if (checks >= (opts.lifeChecks ?? 2)) {
         if (opts.exitFile) writeFileSync(opts.exitFile, opts.rawExitRecord ?? (opts.legacyExitFile
           ? (opts.exitCode ?? '0') + '\n'                       // pre-upgrade `echo $?`
-          : JSON.stringify({ version: 1, backend: 'tmux', status: Number(opts.exitCode ?? '0') })));
+          : JSON.stringify({ version: 1, backend: 'acp', status: Number(opts.exitCode ?? '0') })));
         return false;
       }
       return true;
@@ -117,70 +99,49 @@ function fakeWorld(opts: { exitCode?: string; lifeChecks?: number; exitDelayMs?:
     log: () => {},
     fetch: async () => ({ status: 200, ok: true, json: async () => ({ cursor: 0, events: [] }) }),
     createMonitor,
+    startAgentSession: async (_adapter: unknown, options: { mode: 'fresh' | 'resume'; launch: { argv: string[]; env: Record<string, string> } }) => {
+      sessionCreated = true;
+      paneCommands.push(options.launch.argv.join(' '));
+      starts.push({ mode: options.mode, argv: options.launch.argv, env: options.launch.env });
+      let closed = false;
+      let seq = 0;
+      return {
+        backend: 'acp' as const,
+        pid: 4242,
+        isAlive: () => {
+          if (closed) return false;
+          checks++;
+          return checks < (opts.lifeChecks ?? 2);
+        },
+        snapshot: () => ({ backend: 'acp' as const, alive: !closed, readiness: 'idle' as const }),
+        queuePrompt: async () => ({
+          promptId: 'fake-prompt', queuedBehind: 0,
+          completion: Promise.resolve(turnResult(true, 'completed')),
+        }),
+        submitPrompt: async () => turnResult(true, 'completed'),
+        interrupt: async () => ({ state: 'settled' as const }),
+        respondPermission: () => true,
+        eventsSince: () => [],
+        subscribe: () => () => {},
+        setControllerAttached: () => {},
+        exitResult: () => Object.prototype.hasOwnProperty.call(opts, 'exitResult')
+          ? opts.exitResult!
+          : opts.sessionGone
+            ? { version: 1 as const, class: 'session-destroyed' as const,
+                detail: 'session no longer exists' }
+            : opts.rawExitRecord === ACP_CANCEL_DEADLINE_EXCEEDED
+              ? { version: 1 as const, class: 'cancelled' as const,
+                  detail: ACP_CANCEL_DEADLINE_EXCEEDED }
+              : classifyShellStatus(Number(opts.exitCode ?? 0)),
+        close: async () => { closed = true; },
+      };
+    },
   };
-  return { deps, paneCommands, monitor: rec };
+  return { deps, paneCommands, starts, monitor: rec };
 }
 
 const writeCfg = (roles: Record<string, object>) =>
   writeFileSync(join(dir, 'fleet.yaml'), stringify({ roles }));
-
-describe('buildPaneCommand', () => {
-  it('escapes argv and env, appends exit capture', () => {
-    const cmd = buildPaneCommand(
-      { argv: ['bin', "it's"], env: { A: 'x y' } }, { B: 'z' }, '/tmp/es');
-    expect(cmd).toContain(`A='x y'`);
-    expect(cmd).toContain(`B='z'`);
-    expect(cmd).toContain(`'bin' 'it'\\''s'`);
-    expect(cmd).toContain(`__ofs=$?`);
-    expect(cmd).toContain(`> '/tmp/es'`);
-  });
-
-  it('runs a sandbox-wrapped argv while keeping env + exit capture host-side', () => {
-    const cmd = buildPaneCommand(
-      { argv: ['claude', 'go'], env: { A: 'x' } }, { B: 'z' }, '/tmp/es',
-      ['bwrap', '--die-with-parent', '--', 'claude', 'go']);
-    expect(cmd.startsWith('env ')).toBe(true);         // env prefix host-side
-    expect(cmd).toContain(`A='x'`);
-    expect(cmd).toContain(`'bwrap' '--die-with-parent' '--' 'claude' 'go'`);
-    expect(cmd).toContain(`> '/tmp/es'`);                              // exit capture host-side
-    expect(cmd.indexOf('bwrap')).toBeLessThan(cmd.indexOf('__ofs=$?')); // capture is outside
-  });
-
-  it('unsets inherited NO_COLOR, defaults truecolor, and honors explicit role overrides', () => {
-    const exitFile = join(dir, 'pane-exit');
-    const probe = ['sh', '-c', 'printf "%s|%s" "${NO_COLOR-unset}" "$COLORTERM"'];
-    const inherited = buildPaneCommand({ argv: probe, env: {} }, undefined, exitFile);
-    expect(inherited).toContain('-u NO_COLOR ');
-    expect(inherited).toContain("COLORTERM='truecolor'");
-    expect(execFileSync('sh', ['-c', inherited], {
-      env: { ...process.env, NO_COLOR: '1' }, encoding: 'utf8',
-    })).toBe('unset|truecolor');
-
-    const explicit = buildPaneCommand(
-      { argv: probe, env: {} }, { NO_COLOR: '1', COLORTERM: 'legacy' }, exitFile,
-    );
-    expect(explicit).not.toContain('-u NO_COLOR');
-    expect(execFileSync('sh', ['-c', explicit], {
-      env: { ...process.env, NO_COLOR: 'parent' }, encoding: 'utf8',
-    })).toBe('1|legacy');
-  });
-
-  it.each(['', '0', '1'])
-  ('actively unsets supervised tmux OURS_AUTOSTART=%j while preserving sibling env', value => {
-    const exitFile = join(dir, 'pane-exit-autostart');
-    const probe = ['sh', '-c',
-      'printf "%s|%s" "${OURS_AUTOSTART+x}" "$FLEET_SIBLING_ENV"'];
-    const cmd = buildPaneCommand(
-      { argv: probe, env: { OURS_AUTOSTART: value, FLEET_SIBLING_ENV: 'kept' } },
-      { OURS_AUTOSTART: value }, exitFile);
-    expect(cmd).toContain('env -u OURS_AUTOSTART ');
-    expect(cmd).not.toContain(`OURS_AUTOSTART='0'`);
-    expect(cmd).not.toContain(`OURS_AUTOSTART='1'`);
-    expect(execFileSync('sh', ['-c', cmd], {
-      env: { ...process.env, OURS_AUTOSTART: 'inherited' }, encoding: 'utf8',
-    })).toBe('|kept');
-  });
-});
 
 describe('managed fleet child environment', () => {
   it.each(['', '0', '1'])
@@ -202,17 +163,16 @@ describe('managed fleet child environment', () => {
 });
 
 describe('runOnce isolation', () => {
-  it('wraps the pane command under bwrap when the role declares isolation', async () => {
+  it('wraps the agent command under bwrap when the role declares isolation', async () => {
     writeCfg({ A: { harness: 'fake', isolation: {} } });
     const d = agentDir('A'); mkdirSync(d, { recursive: true });
     const { deps, paneCommands } = fakeWorld({ exitCode: '0', exitFile: join(d, '.exit-status') });
     await runOnce('A', {}, deps);
-    expect(paneCommands[0]).toContain(`'bwrap'`);
-    expect(paneCommands[0]).toMatch(/'--'.*'fakebin'/);      // original argv after --
-    expect(paneCommands[0]).toContain('__ofs=$?');           // exit capture preserved
+    expect(paneCommands[0]).toContain('bwrap');
+    expect(paneCommands[0]).toMatch(/--.*fakebin/);      // original argv after --
   });
 
-  it('resolves and read-only binds a home-scoped tmux launcher', async () => {
+  it('resolves and read-only binds a home-scoped agent launcher', async () => {
     const binDir = join(dir, '.local', 'bin');
     const launcher = join(binDir, 'home-launcher');
     mkdirSync(binDir, { recursive: true });
@@ -220,7 +180,10 @@ describe('runOnce isolation', () => {
     registerAdapter({
       ...fakeAdapter,
       id: 'home-runtime',
-      buildLaunch: (_role, _mode, _state, prep) => ({ argv: ['home-launcher'], env: prep.env }),
+      agentSession: {
+        ...fakeAdapter.agentSession,
+        prepareLaunch: (_role, prep) => ({ argv: ['home-launcher'], env: prep.env }),
+      },
     });
     writeCfg({ A: { harness: 'home-runtime', isolation: {} } });
     const d = agentDir('A'); mkdirSync(d, { recursive: true });
@@ -229,8 +192,8 @@ describe('runOnce isolation', () => {
     process.env.PATH = `${binDir}:${oldPath ?? ''}`;
     try { await runOnce('A', {}, deps); }
     finally { process.env.PATH = oldPath; }
-    expect(paneCommands[0]).toContain(`'--ro-bind-try' '${launcher}' '${launcher}'`);
-    expect(paneCommands[0]).toMatch(new RegExp(`'--'.*'${launcher}'`));
+    expect(paneCommands[0]).toContain(`--ro-bind-try ${launcher} ${launcher}`);
+    expect(paneCommands[0]).toMatch(new RegExp(`--.*${launcher}`));
   });
 
   it('does not wrap when the role has no isolation block', async () => {
@@ -239,7 +202,7 @@ describe('runOnce isolation', () => {
     const { deps, paneCommands } = fakeWorld({ exitCode: '0', exitFile: join(d, '.exit-status') });
     await runOnce('A', {}, deps);
     expect(paneCommands[0]).not.toContain('bwrap');
-    expect(paneCommands[0]).toContain(`'fakebin'`);
+    expect(paneCommands[0]).toContain('fakebin');
   });
 
   it('still captures the exit code from a wrapped role', async () => {
@@ -258,7 +221,7 @@ describe('runOnce isolation', () => {
     const { deps, paneCommands } = fakeWorld({ exitCode: '0', exitFile: join(d, '.exit-status'), bwrap: 'missing' });
     await runOnce('A', {}, deps);
     expect(paneCommands[0]).not.toContain('bwrap');
-    expect(paneCommands[0]).toContain(`'fakebin'`);
+    expect(paneCommands[0]).toContain('fakebin');
   });
 
   it('strict + unavailable backend refuses to launch', async () => {
@@ -353,7 +316,7 @@ describe('runOnce', () => {
     writeFileSync(join(d, 'role.yaml'), stringify({
       name: 'OldTemp',
       harness: 'fake',
-      session: 'tmux',
+      session: 'acp',
       identity: 'OldTemp',
       sourceFile: '(temp)',
       monitor: {
@@ -372,12 +335,12 @@ describe('runOnce', () => {
     writeCfg({ A: { harness: 'fake' } });
     const d = agentDir('A');
     mkdirSync(d, { recursive: true });
-    const { deps, paneCommands } = fakeWorld({ exitCode: '1', lifeChecks: 30, exitFile: join(d, '.exit-status') });
+    const { deps, paneCommands, starts } = fakeWorld({ exitCode: '1', lifeChecks: 30, exitFile: join(d, '.exit-status') });
     await runOnce('A', {}, deps);
     expect(existsSync(join(d, '.session-id'))).toBe(true);
-    expect(paneCommands[0]).toContain('--sid');       // fake adapter fresh marker
+    expect(starts[0].mode).toBe('fresh');
     expect(paneCommands[0]).toContain('--fake-prep');
-    expect(paneCommands[0]).toContain('FAKE=');
+    expect(starts[0].env).toMatchObject({ FAKE: '1' });
     // crash (code 1, slow) keeps .booted → next run resumes
     expect(existsSync(join(d, '.booted'))).toBe(true);
   });
@@ -397,10 +360,10 @@ describe('runOnce', () => {
     const d = agentDir('A'); mkdirSync(d, { recursive: true });
     writeFileSync(join(d, '.session-id'), 'OLD\n');
     writeFileSync(join(d, '.booted'), '');
-    const { deps, paneCommands } = fakeWorld(
+    const { deps, starts } = fakeWorld(
       { exitCode: '1', exitDelayMs: 100, exitFile: join(d, '.exit-status') }); // dies ~0.2s < 20s
     await runOnce('A', {}, deps);
-    expect(paneCommands[0]).toContain('--resume');
+    expect(starts[0].mode).toBe('resume');
     expect(readFileSync(join(d, '.session-id'), 'utf8').trim()).not.toBe('OLD');
     expect(existsSync(join(d, '.booted'))).toBe(false);
   });
@@ -414,7 +377,7 @@ describe('runOnce', () => {
       exitDelayMs: 100,
       exitFile: join(d, '.exit-status'),
       // AcpSession supplies this typed reason directly in its ExitRecord. The
-      // malformed tmux record is only a deterministic seam for giving runOnce
+      // malformed legacy record is only a deterministic seam for giving runOnce
       // the same detail without a real adapter or a cancellation timer.
       rawExitRecord: ACP_CANCEL_DEADLINE_EXCEEDED,
     });
@@ -468,9 +431,9 @@ describe('creation-time isolation reaches the FIRST launch', () => {
     mkdirSync(d, { recursive: true });
     const { deps, paneCommands } = fakeWorld({ exitCode: '0', exitFile: join(d, '.exit-status') });
     await runOnce('Sec', {}, deps);
-    expect(paneCommands[0]).toContain(`'bwrap'`);
-    expect(paneCommands[0]).toContain(`'--unshare-net'`);      // network: deny honoured
-    expect(paneCommands[0]).toMatch(/'--'.*'fakebin'/);
+    expect(paneCommands[0]).toContain('bwrap');
+    expect(paneCommands[0]).toContain('--unshare-net');      // network: deny honoured
+    expect(paneCommands[0]).toMatch(/--.*fakebin/);
   });
 });
 
@@ -512,13 +475,13 @@ describe('exit classification', () => {
   });
 
   /** label, shell status, resulting class, does the next start resume? */
-  const TMUX_CASES: Array<[string, string, string, boolean]> = [
+  const EXIT_CASES: Array<[string, string, string, boolean]> = [
     ['a clean exit', '0', 'clean', false],
     ['a non-zero program exit', '1', 'program-exit', true],
     ['a signal', '137', 'signal', true],
   ];
 
-  for (const [label, status, cls, resumes] of TMUX_CASES) {
+  for (const [label, status, cls, resumes] of EXIT_CASES) {
     it(`records ${label} and ${resumes ? 'resumes' : 'starts fresh'} next time`, async () => {
       writeCfg({ A: { harness: 'fake' } });
       const d = agentDir('A'); mkdirSync(d, { recursive: true });
@@ -536,7 +499,7 @@ describe('exit classification', () => {
     writeCfg({ A: { harness: 'fake' } });
     const d = agentDir('A'); mkdirSync(d, { recursive: true });
     writeFileSync(join(d, '.booted'), '');
-    const { deps } = fakeWorld({ lifeChecks: 30 });          // no exitFile ⇒ nothing written
+    const { deps } = fakeWorld({ lifeChecks: 30, exitResult: null });
     await runOnce('A', {}, deps);
     expect(readRecord(d).class).toBe('unknown');
     expect(existsSync(join(d, '.booted'))).toBe(true);
@@ -599,7 +562,15 @@ describe('runOnce ACP startup outcome', () => {
   const acpAdapter: HarnessAdapter = {
     ...fakeAdapter,
     id: 'fake-acp',
-    buildAcpLaunch: () => ({ argv: [process.execPath, acpFixture], env: {} }),
+    agentSession: {
+      prepareLaunch: () => ({ argv: [process.execPath, acpFixture], env: {} }),
+      start: options => AcpSession.start({
+        name: options.role.name, argv: options.launch.argv, cwd: options.cwd,
+        env: options.launch.env, stateDir: options.stateDir, mode: options.mode,
+        permissions: options.permissions, permissionMode: options.permissionMode,
+        scrubObsoleteOursAutostart: true, log: options.log,
+      }),
+    },
     effectivePermissionMode: role => ({
       fleetMode: role.permissions.approval === 'allow' ? 'allow'
         : role.permissions.approval === 'auto' ? 'auto' : 'ask',
@@ -614,7 +585,7 @@ describe('runOnce ACP startup outcome', () => {
     return {
       logs,
       deps: {
-        tmux: new Tmux(exec), exec,
+        exec,
         cpuDelegated: () => true,
         isAlive: () => true,
         sleep: (ms: number) => new Promise<void>(r => setTimeout(r, Math.min(ms, 25))),
@@ -632,9 +603,13 @@ describe('runOnce ACP startup outcome', () => {
     registerAdapter({
       ...acpAdapter,
       id: 'fake-acp-provenance',
-      buildAcpLaunch: () => ({
-        argv: ['fixture-acp'], env: {}, permissionMetadataSource: 'codex-acp',
-      }),
+      agentSession: {
+        ...acpAdapter.agentSession,
+        prepareLaunch: () => ({
+          argv: ['fixture-acp'], env: {},
+          adapterState: { permissionMetadataSource: 'codex-acp' },
+        }),
+      },
     });
     writeCfg({ A: {
       harness: 'fake-acp-provenance', session: 'acp',
@@ -643,7 +618,6 @@ describe('runOnce ACP startup outcome', () => {
     mkdirSync(agentDir('A'), { recursive: true });
     const { deps } = acpDeps();
     let observedSource: string | undefined;
-    let observedAutostartScrub = false;
     let alive = true;
     const fakeAcp: SessionHandle = {
       backend: 'acp', pid: 4242,
@@ -668,9 +642,9 @@ describe('runOnce ACP startup outcome', () => {
     };
     const runnerDeps: Partial<RunnerDeps> = {
       ...deps,
-      startAcpSession: async options => {
-        observedSource = options.permissionMetadataSource;
-        observedAutostartScrub = options.scrubObsoleteOursAutostart === true;
+      startAgentSession: async (_adapter, options) => {
+        observedSource = (options.launch.adapterState as { permissionMetadataSource?: string })
+          ?.permissionMetadataSource;
         return fakeAcp;
       },
       createControlServer: () => ({
@@ -682,7 +656,6 @@ describe('runOnce ACP startup outcome', () => {
 
     await runOnce('A', {}, runnerDeps);
     expect(observedSource).toBe('codex-acp');
-    expect(observedAutostartScrub).toBe(true);
   });
 
   it('a refused startup prompt fails the role instead of logging it up', async () => {
@@ -774,7 +747,7 @@ describe('runOnce ACP startup outcome', () => {
       exitResult: () => ({ version: 1, class: 'clean', code: 0, detail: 'test stop' }),
       close: async () => { alive = false; },
     };
-    runnerDeps.startAcpSession = async () => fakeAcp;
+    runnerDeps.startAgentSession = async () => fakeAcp;
     runnerDeps.createControlServer = (_stateDir, session) => {
       controlSession = session;
       return {
@@ -824,7 +797,18 @@ describe('runOnce ACP startup outcome', () => {
   }, 20_000);
 
   it('delivers the adapter-computed permission mode to the ACP session', async () => {
-    registerAdapter({ ...acpAdapter, id: 'fake-acp-mode', acpPermissionModeId: () => 'acceptEdits' });
+    registerAdapter({
+      ...acpAdapter, id: 'fake-acp-mode',
+      agentSession: {
+        ...acpAdapter.agentSession,
+        start: options => AcpSession.start({
+          name: options.role.name, argv: options.launch.argv, cwd: options.cwd,
+          env: options.launch.env, stateDir: options.stateDir, mode: options.mode,
+          permissions: options.permissions, permissionMode: options.permissionMode,
+          modeId: 'acceptEdits', scrubObsoleteOursAutostart: true, log: options.log,
+        }),
+      },
+    });
     writeCfg({ A: {
       harness: 'fake-acp-mode', session: 'acp',
       env: { ACP_FIXTURE_EXIT_AFTER: '1' },
@@ -1086,7 +1070,7 @@ describe('runOnce monitor integration', () => {
     const { deps, monitor } = fakeWorld({ exitCode: '0', exitFile: join(d, '.exit-status') });
     await runOnce('A', {}, deps);
     expect(monitor.constructed).toBe(1);
-    expect(monitor.primedBeforeSession).toBe(true);   // cursor primed before tmux.newSession
+    expect(monitor.primedBeforeSession).toBe(true);   // cursor primed before adapter start
     expect(monitor.ranPid).toBe(4242);
     expect(monitor.stopped).toBe(true);               // stopped when the pane pid died
   });
@@ -1162,7 +1146,7 @@ describe('temporary identity retirement', () => {
     const d = agentDir(name, true);
     mkdirSync(d, { recursive: true });
     writeFileSync(join(d, 'role.yaml'), stringify({
-      name, harness: 'fake', session: 'tmux', identity: name,
+      name, harness: 'fake', session: 'acp', identity: name,
       monitor: { mode: 'native' }, sourceFile: '(temp)',
     }));
     return d;

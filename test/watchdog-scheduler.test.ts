@@ -31,7 +31,7 @@ afterEach(() => {
 
 const wd = {
   name: 'nightwatch', coordinator: 'FleetCoordinator', enabled: true,
-  intervalMs: 600_000, watch: ['Alice'], harness: 'claude-code', session: 'tmux' as const,
+  intervalMs: 600_000, watch: ['Alice'], harness: 'claude-code', session: 'acp' as const,
   identity: 'Watchdog-nightwatch', timeoutMs: 300_000, keepReports: 50,
   alertCooldownMs: 3_600_000, sourceFile: 'f',
 };

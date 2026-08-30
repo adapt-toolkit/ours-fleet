@@ -1329,13 +1329,6 @@ describe('OwnerChannel notice presentation', () => {
     expect(reply).not.toContain('changed by /comments');
   });
 
-  it('reports the setting as inert on a non-ACP backend', async () => {
-    const { channel, client } = liveSetup({ interrupt: false, backend: 'tmux' });
-    client.batches.push([ownerMessage(1, 'wire-tmux', '/comments status')]);
-    await channel.drain();
-    expect(lastReply(client)).toContain('no effect here');
-  });
-
   it('pins commentary to the initiating owner when the latest route changes mid-turn', async () => {
     vi.useFakeTimers();
     const { channel, client, completions, emit } = liveSetup({

@@ -187,8 +187,8 @@ describe('spawn --model', () => {
     const permanent = findRole(loadConfig(), 'ClaudePermanent');
     expect(permanent.model).toBeUndefined();
     expect(permanent.model_chain).toBeUndefined();
-    expect(getAdapter('claude-code').buildLaunch(
-      permanent, 'fresh', { sessionId: 'SID' }, { argv: [], env: {} },
+    expect(getAdapter('claude-code').agentSession.prepareLaunch(
+      permanent, { env: {} },
     ).argv).not.toContain('--model');
 
     const tempDir = await spawnTemp({
@@ -197,8 +197,8 @@ describe('spawn --model', () => {
     const temporary = parse(readFileSync(join(tempDir, 'role.yaml'), 'utf8'));
     expect(temporary.model).toBeUndefined();
     expect(temporary.model_chain).toBeUndefined();
-    expect(getAdapter('claude-code').buildLaunch(
-      temporary, 'fresh', { sessionId: 'SID' }, { argv: [], env: {} },
+    expect(getAdapter('claude-code').agentSession.prepareLaunch(
+      temporary, { env: {} },
     ).argv).not.toContain('--model');
   });
 });
@@ -231,7 +231,7 @@ describe('spawn Codex options', () => {
 });
 
 describe('spawnTemp', () => {
-  it('snapshots the role and launches the supervisor detached (not in a same-named tmux session)', async () => {
+  it('snapshots the role and launches the supervisor detached', async () => {
     const launched: { binPath: string; args: string[]; dir: string }[] = [];
     const d = await spawnTemp(
       { name: 'Scout', mission: 'recon' },
@@ -243,8 +243,7 @@ describe('spawnTemp', () => {
     expect(snap.harness).toBe('fake');       // from defaults
     expect(snap.mission).toBe('recon');
     expect(readFileSync(join(d, 'briefing.md'), 'utf8')).toContain('recon');
-    // Supervisor launched detached with the temp dir as its state — NOT inside a
-    // tmux session named 'Scout' (which runOnce owns and kills for the agent).
+    // Supervisor launched detached with the temp dir as its state.
     expect(launched).toEqual([{ binPath: '/b/ours-fleet', args: ['_run-temp', 'Scout'], dir: d }]);
   });
 
