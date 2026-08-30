@@ -1,4 +1,6 @@
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import {
+  existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync,
+} from 'node:fs';
 import { createConnection, createServer, type Socket } from 'node:net';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
@@ -28,6 +30,7 @@ async function start(
     afterToolBoundaryTimeoutMs?: number;
     unattended?: 'deny' | 'wait';
     permissionMode?: { fleetMode: 'ask' | 'auto' | 'allow'; nativeMode: string };
+    configSelections?: Array<{ configId: string; value: string }>;
   } = {},
 ) {
   const stateDir = mkdtempSync(join(tmpdir(), 'ours-fleet-acp-'));
@@ -43,6 +46,7 @@ async function start(
       approval, filesystem: 'workspace', unattended: extra.unattended ?? 'deny',
     },
     modeId: extra.modeId,
+    configSelections: extra.configSelections,
     permissionMode: extra.permissionMode,
     log: extra.log ?? (() => {}),
     ...(extra.cancelGraceMs !== undefined ? { cancelGraceMs: extra.cancelGraceMs } : {}),
@@ -339,6 +343,81 @@ describe('AcpSession', () => {
     await session.close();
   });
 
+  it('applies ordered required session config before mode and refreshes runtime metadata', async () => {
+    const options = JSON.stringify([
+      { id: 'model', name: 'Model', category: 'model', type: 'select',
+        currentValue: 'default', options: [{ value: 'default', name: 'Default' },
+          { value: 'brain-model', name: 'Brain model' }] },
+      { id: 'effort', name: 'Effort', category: 'thought_level', type: 'select',
+        currentValue: 'low', options: [{ value: 'low', name: 'Low' },
+          { value: 'high', name: 'High' }] },
+    ]);
+    const session = await start('allow', {
+      env: { ACP_FIXTURE_CONFIG_OPTIONS: options },
+      configSelections: [
+        { configId: 'model', value: 'brain-model' }, { configId: 'effort', value: 'high' },
+      ],
+      modeId: 'plan',
+    });
+    const applied = session.eventsSince(0).filter(event => event.kind === 'agent_text')
+      .map(event => event.text).filter(text => text?.startsWith('config:') || text?.startsWith('mode:'));
+    expect(applied).toEqual(['config:model=brain-model', 'config:effort=high', 'mode:plan']);
+    expect(session.snapshot()).toMatchObject({
+      runtimeModel: { value: 'brain-model', label: 'Brain model' },
+      reasoningEffort: { value: 'high', label: 'High' },
+    });
+    await session.close();
+  });
+
+  it('fails closed when a required session config is missing or refused', async () => {
+    await expect(start('allow', {
+      configSelections: [{ configId: 'model', value: 'brain-model' }],
+    })).rejects.toThrow("did not advertise required session config option 'model'");
+    const options = JSON.stringify([{ id: 'model', name: 'Model', category: 'model',
+      type: 'select', currentValue: 'default', options: [] }]);
+    await expect(start('allow', {
+      env: { ACP_FIXTURE_CONFIG_OPTIONS: options, ACP_FIXTURE_SET_CONFIG_FAIL: '1' },
+      configSelections: [{ configId: 'model', value: 'brain-model' }],
+    })).rejects.toThrow("refused required session config option 'model'");
+    await expect(start('allow', {
+      env: { ACP_FIXTURE_CONFIG_OPTIONS: options, ACP_FIXTURE_IGNORE_CONFIG: '1' },
+      configSelections: [{ configId: 'model', value: 'brain-model' }],
+    })).rejects.toThrow("did not apply required session config option 'model'");
+  });
+
+  it('issues no session/set_config_option when no config selection is configured', async () => {
+    const options = JSON.stringify([{ id: 'model', name: 'Model', category: 'model',
+      type: 'select', currentValue: 'default', options: [] }]);
+    const session = await start('allow', { env: { ACP_FIXTURE_CONFIG_OPTIONS: options } });
+    expect(session.eventsSince(0).some(event =>
+      event.kind === 'agent_text' && event.text?.startsWith('config:'))).toBe(false);
+    await session.close();
+  });
+
+  it('does not persist a closed session id when required config startup fails', async () => {
+    const stateDir = mkdtempSync(join(tmpdir(), 'ours-fleet-acp-'));
+    dirs.push(stateDir);
+    const common = {
+      name: 'A', argv: [process.execPath, fixture], cwd: stateDir, stateDir, mode: 'fresh' as const,
+      permissions: { approval: 'allow' as const, filesystem: 'workspace' as const,
+        unattended: 'deny' as const },
+      configSelections: [{ configId: 'model', value: 'brain-model' }], log: () => {},
+    };
+    await expect(AcpSession.start({ ...common, env: {} }))
+      .rejects.toThrow("did not advertise required session config option 'model'");
+    expect(existsSync(join(stateDir, '.acp-session-id'))).toBe(false);
+
+    const options = JSON.stringify([{ id: 'model', name: 'Model', category: 'model',
+      type: 'select', currentValue: 'default',
+      options: [{ value: 'brain-model', name: 'Brain model' }] }]);
+    const retried = await AcpSession.start({
+      ...common, env: { ACP_FIXTURE_CONFIG_OPTIONS: options },
+    });
+    expect(readFileSync(join(stateDir, '.acp-session-id'), 'utf8')).toBe('fixture-session\n');
+    expect(retried.snapshot().runtimeModel).toEqual({ value: 'brain-model', label: 'Brain model' });
+    await retried.close();
+  });
+
   it('reports adapter-resolved effective and native modes in the live snapshot', async () => {
     const permissionMode = { fleetMode: 'allow' as const, nativeMode: 'bypassPermissions' };
     const session = await start('allow', { permissionMode });
@@ -370,6 +449,45 @@ describe('AcpSession', () => {
     });
     expect(session.eventsSince(0).some(event =>
       event.kind === 'agent_text' && event.text === 'mode:plan')).toBe(true);
+    await session.close();
+  });
+
+  it('reapplies required session config after loading a persisted session', async () => {
+    const stateDir = mkdtempSync(join(tmpdir(), 'ours-fleet-acp-'));
+    dirs.push(stateDir);
+    writeFileSync(join(stateDir, '.acp-session-id'), 'fixture-session\n');
+    const options = JSON.stringify([{ id: 'effort', name: 'Effort', category: 'thought_level',
+      type: 'select', currentValue: 'low', options: [{ value: 'high', name: 'High' }] }]);
+    const session = await AcpSession.start({
+      name: 'A', argv: [process.execPath, fixture], cwd: stateDir,
+      env: { ACP_FIXTURE_LOAD_SESSION: '1', ACP_FIXTURE_CONFIG_OPTIONS: options },
+      stateDir, mode: 'resume',
+      permissions: { approval: 'allow', filesystem: 'workspace', unattended: 'deny' },
+      configSelections: [{ configId: 'effort', value: 'high' }], log: () => {},
+    });
+    expect(session.eventsSince(0).some(event =>
+      event.kind === 'agent_text' && event.text === 'config:effort=high')).toBe(true);
+    expect(session.snapshot().reasoningEffort).toEqual({ value: 'high', label: 'High' });
+    await session.close();
+  });
+
+  it('reapplies required session config after resuming a persisted session', async () => {
+    const stateDir = mkdtempSync(join(tmpdir(), 'ours-fleet-acp-'));
+    dirs.push(stateDir);
+    writeFileSync(join(stateDir, '.acp-session-id'), 'fixture-session\n');
+    const options = JSON.stringify([{ id: 'model', name: 'Model', category: 'model',
+      type: 'select', currentValue: 'default',
+      options: [{ value: 'brain-model', name: 'Brain model' }] }]);
+    const session = await AcpSession.start({
+      name: 'A', argv: [process.execPath, fixture], cwd: stateDir,
+      env: { ACP_FIXTURE_RESUME_SESSION: '1', ACP_FIXTURE_CONFIG_OPTIONS: options },
+      stateDir, mode: 'resume',
+      permissions: { approval: 'allow', filesystem: 'workspace', unattended: 'deny' },
+      configSelections: [{ configId: 'model', value: 'brain-model' }], log: () => {},
+    });
+    expect(session.eventsSince(0).some(event =>
+      event.kind === 'agent_text' && event.text === 'config:model=brain-model')).toBe(true);
+    expect(session.snapshot().runtimeModel).toEqual({ value: 'brain-model', label: 'Brain model' });
     await session.close();
   });
 

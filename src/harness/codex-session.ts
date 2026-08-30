@@ -13,6 +13,7 @@ export interface CodexSessionStrategy {
   resolveBrain: AgentSessionAdapter['resolveBrain'];
   modelEnvironmentVariable: AgentSessionAdapter['modelEnvironmentVariable'];
   prepareLaunch(role: ResolvedRole, prep: SessionPrep): PreparedAgentSessionLaunch;
+  sessionConfigSelections(role: ResolvedRole): ReturnType<AgentSessionAdapter['sessionConfigSelections']>;
   permissionModeId(role: ResolvedRole): string | undefined;
   mcpServers(role: ResolvedRole): AcpMcpServer[] | undefined;
   sessionMeta(role: ResolvedRole, prep: SessionPrep): Record<string, unknown> | undefined;
@@ -34,6 +35,9 @@ export class CodexAgentSessionAdapter implements AgentSessionAdapter {
   prepareLaunch(role: ResolvedRole, prep: SessionPrep): PreparedAgentSessionLaunch {
     return this.strategy.prepareLaunch(role, prep);
   }
+  sessionConfigSelections(role: ResolvedRole) {
+    return this.strategy.sessionConfigSelections(role);
+  }
 
   start(options: AgentSessionStartOptions) {
     const { role, prep, launch } = options;
@@ -43,6 +47,7 @@ export class CodexAgentSessionAdapter implements AgentSessionAdapter {
       modeId: this.strategy.permissionModeId(role),
       mcpServers: this.strategy.mcpServers(role),
       sessionMeta: this.strategy.sessionMeta(role, prep),
+      configSelections: this.strategy.sessionConfigSelections(role),
       permissionMode: options.permissionMode,
       permissionMetadataSource: acpAdapterState(launch.adapterState).permissionMetadataSource,
       scrubObsoleteOursAutostart: true,

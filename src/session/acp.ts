@@ -243,6 +243,8 @@ export interface AcpSessionOptions {
   permissions: CommonPermissions;
   /** Native permission-mode id to request via session/set_mode; undefined keeps the agent default. */
   modeId?: string;
+  /** Ordered explicit Brain choices that must be applied before readiness. */
+  configSelections?: Array<{ configId: string; value: string }>;
   /** Adapter-resolved live permission policy; separate from ACP agent-specific session modes. */
   permissionMode?: NonNullable<SessionSnapshot['permissionMode']>;
   /** Adapter-authenticated request-metadata vocabulary; never inferred from ACP `_meta`. */
@@ -1154,13 +1156,15 @@ export class AcpSession implements AgentSession {
     const persisted = this.options.mode === 'resume' && existsSync(this.sessionFile)
       ? readFileSync(this.sessionFile, 'utf8').trim()
       : '';
+    let advertisedConfigOptions: acp.SessionConfigOption[] | null | undefined;
     if (persisted && this.capabilities?.sessionCapabilities?.resume != null) {
       const resumed = await this.connection.agent.request(acp.methods.agent.session.resume, {
         sessionId: persisted,
         cwd: this.options.cwd,
         mcpServers: this.declaredMcpServers(),
       });
-      this.captureRuntimeMetadata(resumed.configOptions);
+      advertisedConfigOptions = resumed.configOptions;
+      this.captureRuntimeMetadata(advertisedConfigOptions);
       this.sessionId = persisted;
     } else if (persisted && this.capabilities?.loadSession) {
       // `session/load` replays prior history as ordinary updates before the
@@ -1172,7 +1176,8 @@ export class AcpSession implements AgentSession {
           cwd: this.options.cwd,
           mcpServers: this.declaredMcpServers(),
         }) as { configOptions?: acp.SessionConfigOption[] | null };
-        this.captureRuntimeMetadata(loaded.configOptions);
+        advertisedConfigOptions = loaded.configOptions;
+        this.captureRuntimeMetadata(advertisedConfigOptions);
       } finally { this.replaying = false; }
       this.sessionId = persisted;
     } else {
@@ -1182,8 +1187,34 @@ export class AcpSession implements AgentSession {
         ...(this.options.sessionMeta ? { _meta: this.options.sessionMeta } : {}),
       }) as { sessionId: string; configOptions?: acp.SessionConfigOption[] | null };
       this.sessionId = created.sessionId;
-      this.captureRuntimeMetadata(created.configOptions);
+      advertisedConfigOptions = created.configOptions;
+      this.captureRuntimeMetadata(advertisedConfigOptions);
     }
+    for (const selection of this.options.configSelections ?? []) {
+      if (!advertisedConfigOptions?.some(option => option.id === selection.configId))
+        throw new Error(
+          `ACP agent did not advertise required session config option '${selection.configId}'`);
+      let configured: { configOptions: acp.SessionConfigOption[] };
+      try {
+        configured = await this.connection.agent.request(
+          acp.methods.agent.session.setConfigOption,
+          { sessionId: this.sessionId, configId: selection.configId, value: selection.value },
+        ) as { configOptions: acp.SessionConfigOption[] };
+      } catch (error) {
+        throw new Error(
+          `ACP agent refused required session config option '${selection.configId}' value '${selection.value}': `
+          + (error instanceof Error ? error.message : String(error)));
+      }
+      advertisedConfigOptions = configured.configOptions;
+      this.captureRuntimeMetadata(advertisedConfigOptions);
+      const applied = advertisedConfigOptions.find(option => option.id === selection.configId);
+      if (applied?.currentValue !== selection.value)
+        throw new Error(
+          `ACP agent did not apply required session config option '${selection.configId}' value '${selection.value}'`);
+    }
+    // Do not persist a session until every required Brain choice is live. A
+    // failed startup closes the ACP session; persisting its id first would make
+    // a later resume repeatedly target that invalid session.
     writeFileSync(this.sessionFile, this.sessionId + '\n', { mode: 0o600 });
     // Deliver the configured permission mode whichever way the session came up
     // (new, resume or load) — the launch flag never reaches an ACP agent. A

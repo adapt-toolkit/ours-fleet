@@ -293,6 +293,8 @@ export function makeClaudeCodeAdapter(
                 '@agentclientprotocol/claude-agent-acp', 'claude-agent-acp', 'claude-agent-acp');
         return { argv, env: prep.env };
       },
+      sessionConfigSelections: role => typeof role.effort === 'string'
+        ? [{ configId: 'effort', value: role.effort }] : [],
       permissionModeId: role => permissionMode(role),
       mcpServers: role => acpMcpServersFor(
         (role.harness_options as ClaudeOptions | undefined)?.mcp_servers),
