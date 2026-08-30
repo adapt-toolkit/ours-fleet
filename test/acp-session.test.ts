@@ -348,24 +348,60 @@ describe('AcpSession', () => {
       { id: 'model', name: 'Model', category: 'model', type: 'select',
         currentValue: 'default', options: [{ value: 'default', name: 'Default' },
           { value: 'brain-model', name: 'Brain model' }] },
-      { id: 'effort', name: 'Effort', category: 'thought_level', type: 'select',
+      { id: 'reasoning_effort', name: 'Effort', category: 'thought_level', type: 'select',
         currentValue: 'low', options: [{ value: 'low', name: 'Low' },
           { value: 'high', name: 'High' }] },
     ]);
     const session = await start('allow', {
       env: { ACP_FIXTURE_CONFIG_OPTIONS: options },
       configSelections: [
-        { configId: 'model', value: 'brain-model' }, { configId: 'effort', value: 'high' },
+        { configId: 'model', value: 'brain-model' },
+        { configId: 'reasoning_effort', value: 'high' },
       ],
       modeId: 'plan',
     });
     const applied = session.eventsSince(0).filter(event => event.kind === 'agent_text')
       .map(event => event.text).filter(text => text?.startsWith('config:') || text?.startsWith('mode:'));
-    expect(applied).toEqual(['config:model=brain-model', 'config:effort=high', 'mode:plan']);
+    expect(applied).toEqual([
+      'config:model=brain-model', 'config:reasoning_effort=high', 'mode:plan',
+    ]);
     expect(session.snapshot()).toMatchObject({
       runtimeModel: { value: 'brain-model', label: 'Brain model' },
       reasoningEffort: { value: 'high', label: 'High' },
     });
+    await session.close();
+  });
+
+  it.each(['low', 'high'] as const)(
+    'observes distinct %s reasoning effort at ACP runtime', async effort => {
+      const options = JSON.stringify([{
+        id: 'reasoning_effort', name: 'Reasoning effort', category: 'thought_level',
+        type: 'select', currentValue: 'medium', options: [
+          { value: 'low', name: 'Low' }, { value: 'medium', name: 'Medium' },
+          { value: 'high', name: 'High' },
+        ],
+      }]);
+      const session = await start('allow', {
+        env: { ACP_FIXTURE_CONFIG_OPTIONS: options },
+        configSelections: [{ configId: 'reasoning_effort', value: effort }],
+      });
+      expect(session.snapshot().reasoningEffort).toEqual({
+        value: effort, label: effort === 'low' ? 'Low' : 'High',
+      });
+      await session.close();
+    },
+  );
+
+  it('retains the advertised ACP reasoning default when no Brain effort is selected', async () => {
+    const options = JSON.stringify([{
+      id: 'reasoning_effort', name: 'Reasoning effort', category: 'thought_level',
+      type: 'select', currentValue: 'medium', options: [{ value: 'medium', name: 'Medium' }],
+    }]);
+    const session = await start('allow', { env: { ACP_FIXTURE_CONFIG_OPTIONS: options } });
+    expect(session.snapshot().reasoningEffort).toEqual({ value: 'medium', label: 'Medium' });
+    expect(session.eventsSince(0).some(event =>
+      event.kind === 'agent_text' && event.text?.startsWith('config:reasoning_effort=')))
+      .toBe(false);
     await session.close();
   });
 

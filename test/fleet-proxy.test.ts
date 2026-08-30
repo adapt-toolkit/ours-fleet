@@ -63,6 +63,19 @@ describe('managed fleet spawn defaults', () => {
     ]));
   });
 
+  it('preserves inherited parent effort while an explicit child Brain wins', () => {
+    const parent = { ...caller, agentSelections: {
+      brain: { inline: { harness: 'codex', model: 'gpt-parent', effort: 'high' } },
+      role: { ref: 'Coordinator' },
+    } } satisfies ResolvedRole;
+    expect(inheritCallerSpawnDefaults(parent, { name: 'Inherited' }, undefined).options.brain)
+      .toEqual({ inline: { harness: 'codex', model: 'gpt-parent', effort: 'high' } });
+    expect(inheritCallerSpawnDefaults(parent, {
+      name: 'Override', brain: { inline: { harness: 'codex', model: 'gpt-child', effort: 'low' } },
+    }, undefined).options.brain)
+      .toEqual({ inline: { harness: 'codex', model: 'gpt-child', effort: 'low' } });
+  });
+
   it('inherits the caller effective mode after a native override, not its creation default', () => {
     const overridden = {
       ...caller,

@@ -295,8 +295,12 @@ export function makeCodexAdapter(
             ? { adapterState: { permissionMetadataSource } } : {}),
         };
       },
-      sessionConfigSelections: role => typeof role.model === 'string'
-        ? [{ configId: 'model', value: role.model }] : [],
+      sessionConfigSelections: role => [
+        ...(typeof role.model === 'string'
+          ? [{ configId: 'model', value: role.model }] : []),
+        ...(typeof role.effort === 'string'
+          ? [{ configId: 'reasoning_effort', value: role.effort }] : []),
+      ],
       permissionModeId: role => acpAgentMode(role),
       mcpServers: () => undefined,
       sessionMeta: () => undefined,

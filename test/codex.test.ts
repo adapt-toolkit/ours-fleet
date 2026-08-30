@@ -26,10 +26,15 @@ const execWith = (oursCodex: boolean): Exec => async (cmd, args) => {
 const okExec = execWith(false);
 
 describe('prepareSession', () => {
-  it('maps an explicit Brain model to the required ACP model option only', () => {
+  it('maps explicit Brain model and effort to ordered required ACP options', () => {
     const session = makeCodexAdapter(okExec).agentSession;
-    expect(session.sessionConfigSelections(role({ model: 'gpt-brain' })))
-      .toEqual([{ configId: 'model', value: 'gpt-brain' }]);
+    expect(session.sessionConfigSelections(role({ model: 'gpt-brain', effort: 'high' })))
+      .toEqual([
+        { configId: 'model', value: 'gpt-brain' },
+        { configId: 'reasoning_effort', value: 'high' },
+      ]);
+    expect(session.sessionConfigSelections(role({ effort: 'low' })))
+      .toEqual([{ configId: 'reasoning_effort', value: 'low' }]);
     expect(session.sessionConfigSelections(role())).toEqual([]);
   });
   it('prepares the same ACP environment when ours-codex is installed', async () => {
