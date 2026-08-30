@@ -27,6 +27,10 @@ describe('the pack contract is declared, not incidental', () => {
     expect(manifest().files).toContain('dist');
   });
 
+  it('ships the complete split default configuration used by init guidance', () => {
+    expect(manifest().files).toContain('examples');
+  });
+
   it('still gates publishing on a build and the test suite', () => {
     // prepack owns the artifact; prepublishOnly owns the decision to release it.
     // Both run on `npm publish`, and the build is idempotent — the stamped build

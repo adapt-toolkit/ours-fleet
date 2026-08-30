@@ -6,6 +6,7 @@ import { join as joinPath, resolve as resolvePath } from 'node:path';
 import { createInterface } from 'node:readline';
 import { Command } from 'commander';
 import { VERSION } from './version.js';
+import { INIT_COMPLETION_GUIDANCE } from './init-guidance.js';
 import {
   analyzeInstalls, buildInfo, buildLabel, discoverInstalls, runningLabel,
 } from './provenance.js';
@@ -1157,7 +1158,7 @@ program.command('init').description('one-time host setup (units, dirs, linger)')
   .action(async () => {
     for (const d of [agentsRoot(), tmpRoot(), logsRoot()]) mkdirSync(d, { recursive: true });
     for (const m of await pickBackend().init(binPath)) console.log(m);
-    console.log('\nNext: copy examples/fleet.yaml to ~/fleet.yaml, edit, then: ours-fleet up');
+    console.log(INIT_COMPLETION_GUIDANCE);
   });
 
 const webCommand = cOpt(program.command('web').description('start or open the secure localhost fleet web console'))

@@ -15,6 +15,7 @@ import { join, resolve } from 'node:path';
 import { realExec } from '../src/exec.js';
 import { UNATTENDED_FLOOR } from '../src/permissions.js';
 import { writeV2Fixture } from './v2-fixture.js';
+import { INIT_COMPLETION_GUIDANCE } from '../src/init-guidance.js';
 
 const CLI = resolve('dist/cli.js');
 let dir: string;
@@ -45,6 +46,12 @@ const writeWatchdogReportFixture = () => {
 };
 
 describe('ours-fleet CLI', () => {
+  it('init guidance copies the complete split default configuration', () => {
+    expect(INIT_COMPLETION_GUIDANCE).toContain('examples/fleet.yaml" ~/fleet.yaml');
+    expect(INIT_COMPLETION_GUIDANCE).toContain('examples/fleet" ~/fleet');
+    expect(INIT_COMPLETION_GUIDANCE).toContain('~/fleet/{agents,roles,brains}/*.yaml');
+  });
+
   it('redacts nested harness secrets identically from human and JSON config output', async () => {
     const file = join(dir, 'fleet.yaml');
     const root = join(dir, 'fleet');
