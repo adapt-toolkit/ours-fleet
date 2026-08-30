@@ -17,7 +17,7 @@ import {
 import { runOnce, START_STAGGER_FILE } from '../runner.js';
 import { agentDir, tmpRoot } from '../paths.js';
 import {
-  loadConfig, resolveMonitorConfig, resolveWorklogPolicy, ROLE_NAME_RE,
+  loadConfig, ROLE_NAME_RE,
   type FleetConfig, type ResolvedRole,
 } from '../config.js';
 import { getAdapter } from '../harness/registry.js';
@@ -128,19 +128,10 @@ function readTail(runDir: string): string | undefined {
 }
 
 /** The temp role every watchdog-family run launches under. Isolation is opt-in. */
-function buildWatchdogRole(wd: ResolvedWatchdog, cfg: FleetConfig): ResolvedRole {
+function buildWatchdogRole(wd: ResolvedWatchdog, _cfg: FleetConfig): ResolvedRole {
   return {
-    name: wd.identity, sourceFile: '(watchdog)',
-    harness: wd.harness, session: wd.session,
-    identity: wd.identity, model: wd.model,
-    // Watchdogs are observe-only by contract, but their sanctioned status commands
-    // must reach host control sockets. Keep approvals/unattended escalation denied
-    // while disabling the harness's native filesystem/network sandbox.
-    permissions: { approval: 'deny', filesystem: 'unrestricted', unattended: 'deny' },
-    permissionsDeclared: true,
-    monitor: resolveMonitorConfig(cfg.defaults.monitor, undefined),
-    worklog: resolveWorklogPolicy(cfg.defaults.worklog, undefined),
-    isolation: wd.isolation,
+    ...structuredClone(wd.resolvedAgent),
+    name: wd.identity, sourceFile: '(watchdog)', identity: wd.identity,
   };
 }
 

@@ -364,8 +364,12 @@ export class TaskRoomApplicationService {
   validateTemplates(): { template: string; issues: string[] }[] {
     const cfg = (this.deps.loadConfiguration ?? loadConfig)(this.configurationPath);
     return listTemplates(cfg.roomTemplates ?? {}).flatMap(template => {
-      const issues = template.members.flatMap(member => cfg.roles.some(role => role.name === member.role_ref)
-        ? [] : [`member ${member.slot}: role_ref '${member.role_ref}' not found in fleet roles`]);
+      const issues = template.members.flatMap(member => {
+        if (!('ref' in member.agent)) return [];
+        const ref = member.agent.ref;
+        return cfg.roles.some(role => role.name === ref)
+          ? [] : [`member ${member.slot}: Agent ref '${ref}' not found`];
+      });
       return issues.length ? [{ template: `${template.name}@${template.version}`, issues }] : [];
     });
   }

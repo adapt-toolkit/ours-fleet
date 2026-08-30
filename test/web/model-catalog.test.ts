@@ -3,7 +3,6 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import { claudeModelCatalog, codexModelCatalog } from '../../src/application/model-catalog.js';
-import { buildRoleConfig } from '../../src/spawn.js';
 
 describe('local harness model catalogs', () => {
   it('uses only picker-visible exact Codex IDs and their catalog effort contract', () => {
@@ -19,17 +18,9 @@ describe('local harness model catalogs', () => {
     })]);
   });
 
-  it('exposes exact Claude 2.1 IDs and keeps creation effort neutral for both harnesses', () => {
+  it('exposes exact Claude 2.1 IDs', () => {
     expect(claudeModelCatalog().models.map(model => model.id)).toEqual([
       'claude-fable-5', 'claude-opus-5', 'claude-sonnet-5',
     ]);
-    expect(buildRoleConfig({ name: 'C', harness: 'claude-code', reasoningEffort: 'max' }))
-      .toMatchObject({ effort: 'max' });
-    expect(buildRoleConfig({ name: 'X', harness: 'codex', reasoningEffort: 'ultra' }))
-      .toMatchObject({ effort: 'ultra' });
-    expect(buildRoleConfig({ name: 'C', harness: 'claude-code', reasoningEffort: 'max' }).harness_options)
-      .toBeUndefined();
-    expect(buildRoleConfig({ name: 'X', harness: 'codex', reasoningEffort: 'ultra' }).harness_options)
-      .toBeUndefined();
   });
 });

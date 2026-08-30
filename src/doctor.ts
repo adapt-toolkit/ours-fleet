@@ -185,13 +185,13 @@ export async function doctor(
     const roleNames = new Set(roles.map(r => r.name));
     for (const t of templates) {
       const badRefs = t.members
-        .filter(m => m.role_ref && !roleNames.has(m.role_ref))
-        .map(m => m.role_ref);
+        .filter(m => 'ref' in m.agent && !roleNames.has(m.agent.ref))
+        .map(m => 'ref' in m.agent ? m.agent.ref : '');
       if (badRefs.length) {
         checks.push({
           name: `template: ${t.name}@${t.version}`,
           ok: true,
-          detail: `warning: role_ref(s) ${badRefs.join(', ')} not found in configured roles`,
+          detail: `warning: Agent ref(s) ${badRefs.join(', ')} not found in configured Agents`,
         });
       }
     }

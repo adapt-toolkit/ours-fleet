@@ -3,7 +3,7 @@ import { chmodSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync }
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { findRole, loadConfig } from '../src/config.js';
-import { buildAgentDocument, spawnDryRun } from '../src/spawn.js';
+import { spawnDryRun } from '../src/spawn.js';
 import { resolvedRolePlan } from '../src/resolved-plan.js';
 import '../src/harness/codex.js';
 import '../src/harness/claude-code.js';
@@ -130,9 +130,8 @@ describe('Agent Role Brain split configuration', () => {
 
   it('preserves neutral effort through writer, loader, adapter materialization, and inspection', () => {
     manifest();
-    const document = buildAgentDocument({
-      harness: 'codex', effort: 'xhigh', mission: 'Inspect',
-    });
+    const document = { role: { inline: { mission: 'Inspect' } },
+      brain: { inline: { harness: 'codex', effort: 'xhigh' } } };
     kind('agents', 'Writer.yaml', `${JSON.stringify(document)}\n`);
     const role = findRole(loadConfig(), 'Writer');
     expect(role.effort).toBe('xhigh');
@@ -148,7 +147,8 @@ describe('Agent Role Brain split configuration', () => {
       ['claude-code', 'max', { effort: 'max' }],
     ] as const) {
       const dry = spawnDryRun({
-        name: `Dry-${harness}`, harness, reasoningEffort: effort, configPath: join(dir, 'fleet.yaml'),
+        name: `Dry-${harness}`, brain: { inline: { harness, effort } }, role: { inline: {} },
+        configPath: join(dir, 'fleet.yaml'),
         temp: true,
       });
       expect(dry.roleDocument).toMatchObject({ brain: { inline: { harness, effort } } });

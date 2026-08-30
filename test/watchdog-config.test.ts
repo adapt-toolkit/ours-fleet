@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
-import { mkdtempSync, rmSync, writeFileSync, mkdirSync } from 'node:fs';
+import { chmodSync, mkdtempSync, rmSync, writeFileSync, mkdirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { loadConfig } from '../src/config.js';
@@ -40,6 +40,15 @@ describe('watchdogs config', () => {
     expect(wd.session).toBe('acp');
     expect(wd.model).toBe('claude-fable-5');
   });
+  it('rejects removed watchdog runtime fields with migration guidance', () => {
+    const path = join(dir, 'fleet.yaml');
+    mkdirSync(join(dir, 'fleet', 'agents'), { recursive: true });
+    chmodSync(join(dir, 'fleet'), 0o700);
+    chmodSync(join(dir, 'fleet', 'agents'), 0o700);
+    writeFileSync(path, 'api_version: ours.network/fleet/v2\nwatchdogs:\n  w: { coordinator: C, harness: codex }\n');
+    chmodSync(path, 0o600);
+    expect(() => loadConfig(path)).toThrowError(/E_LEGACY.*harness.*canonical Agent/);
+  });
   it('substitutes ${var} from vars:', () => {
     base('vars: { coord: FleetCoordinator }\n' + TWO_ROLES
       + 'watchdogs:\n  w: { coordinator: "${coord}" }\n');
@@ -60,7 +69,7 @@ describe('watchdogs config', () => {
     });
 
     base(TWO_ROLES + 'watchdogs:\n  w: { coordinator: C, isolation: { network: typo } }\n');
-    expect(() => loadConfig()).toThrowError(/watchdog 'w'.*isolation.network: invalid value 'typo'/);
+    expect(() => loadConfig()).toThrowError(/WatchdogAgentw.*isolation.network: invalid value 'typo'/);
   });
   it('requires coordinator', () => {
     base(TWO_ROLES + 'watchdogs:\n  w: { interval: 10m }\n');

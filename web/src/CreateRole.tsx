@@ -3,11 +3,11 @@ import { api, idempotencyKey } from './api';
 import { useLivePoll } from './use-live-poll';
 
 type Form = {
-  name: string; harness: 'codex' | 'claude-code'; model: string; reasoningEffort: string;
-  session: 'acp'; cwd: string; lifetime: 'permanent' | 'temporary';
-  mission: string; coordinator: string; approval: 'ask' | 'auto' | 'allow';
+  name: string; brain: string; role: string;
+  cwd: string; lifetime: 'permanent' | 'temporary';
+  coordinator: string; approval: 'ask' | 'auto' | 'allow';
   filesystem: 'read-only' | 'workspace' | 'unrestricted'; unattended: 'deny' | 'wait';
-  bio: string; persona: string; highRiskAcknowledged: boolean; openAfterCreate: boolean;
+  highRiskAcknowledged: boolean; openAfterCreate: boolean;
   reuseExistingIdentityAcknowledged: boolean; unverifiedIdentityAcknowledged: boolean;
   monitorMode: 'fleet' | 'native'; monitorInterrupt: boolean | 'after_tool';
   monitorWakeSources: string[]; monitorBatchMs: string; monitorInject: 'notification'; advanced: boolean;
@@ -17,17 +17,15 @@ const WAKE_SOURCES = [
   'pending_message', 'contact_restored', 'inbound_error', 'state_import_failed',
 ] as const;
 const initial: Form = {
-  name: '', harness: 'codex', model: '', reasoningEffort: '', session: 'acp', cwd: '',
-  lifetime: 'permanent', mission: '', coordinator: '', approval: 'ask',
-  filesystem: 'workspace', unattended: 'deny', bio: '', persona: '',
+  name: '', brain: '', role: '', cwd: '',
+  lifetime: 'permanent', coordinator: '', approval: 'ask',
+  filesystem: 'workspace', unattended: 'deny',
   highRiskAcknowledged: false, openAfterCreate: true,
   reuseExistingIdentityAcknowledged: false, unverifiedIdentityAcknowledged: false,
   monitorMode: 'fleet', monitorInterrupt: false,
   monitorWakeSources: ['message_received', 'file_received', 'local_contact_request', 'pending_message'],
   monitorBatchMs: '2000', monitorInject: 'notification', advanced: false,
 };
-
-type ModelOption = { id: string; label: string; reasoningEfforts: string[]; defaultReasoningEffort?: string; source: string };
 
 export function CreateRole({ onClose, onCreated }: {
   onClose(): void; onCreated(role: string, path?: string): void;
@@ -37,15 +35,10 @@ export function CreateRole({ onClose, onCreated }: {
   const [action, setAction] = useState<any>();
   const [error, setError] = useState('');
   const [busy, setBusy] = useState(false);
-  const [modelChoices, setModelChoices] = useState<Record<Form['harness'], ModelOption[]>>({
-    codex: [], 'claude-code': [],
-  });
   useEffect(() => {
     const controller = new AbortController();
     void api.get<any>('/api/v1/creation-capabilities', controller.signal).then(capabilities => {
       if (controller.signal.aborted) return;
-      setModelChoices(Object.fromEntries((capabilities.harnesses ?? []).map((harness: any) =>
-        [harness.id, harness.modelOptions ?? []])) as Record<Form['harness'], ModelOption[]>);
       const defaults = capabilities.monitor?.defaults;
       if (!defaults) return;
       setForm(current => ({
@@ -73,13 +66,10 @@ export function CreateRole({ onClose, onCreated }: {
       .includes(action.state));
   useLivePoll(refreshAction, reason => { setError((reason as Error).message); setBusy(false); }, actionPending);
   const request = useMemo(() => ({
-    name: form.name, harness: form.harness,
-    model: form.model.trim() || null, reasoningEffort: form.reasoningEffort || null,
-    session: form.session, cwd: form.cwd || undefined,
-    lifetime: form.lifetime, mission: form.mission || undefined,
+    name: form.name, brain: { ref: form.brain }, role: { ref: form.role },
+    cwd: form.cwd || undefined, lifetime: form.lifetime,
     coordinator: form.coordinator || undefined,
     permissions: { approval: form.approval, filesystem: form.filesystem, unattended: form.unattended },
-    bio: form.bio || undefined, persona: form.persona || undefined,
     highRiskAcknowledged: form.highRiskAcknowledged,
     reuseExistingIdentityAcknowledged: form.reuseExistingIdentityAcknowledged,
     unverifiedIdentityAcknowledged: form.unverifiedIdentityAcknowledged,
@@ -125,25 +115,11 @@ export function CreateRole({ onClose, onCreated }: {
         <fieldset><legend>Identity</legend><div className="form-grid">
           <label>Role / session name<input value={form.name} onChange={e => change('name', e.target.value)} placeholder="Researcher" /></label>
           <label>Derived identity <small>fixed to role name</small><input value={form.name} readOnly aria-readonly="true" placeholder="Researcher" /></label>
-          <label className="wide">Mission<input value={form.mission} onChange={e => change('mission', e.target.value)} /></label>
           <label>Coordinator<input value={form.coordinator} onChange={e => change('coordinator', e.target.value)} /></label>
         </div></fieldset>
         <fieldset><legend>Runtime</legend><div className="form-grid">
-          <label>Harness<select value={form.harness} onChange={e => change('harness', e.target.value as Form['harness'])}><option value="codex">Codex</option><option value="claude-code">Claude Code</option></select></label>
-          <label>Session<select value={form.session} onChange={e => change('session', e.target.value as Form['session'])}><option value="acp">ACP activity</option></select></label>
-          <label>Model<select aria-label="Known model" value={modelChoices[form.harness].some(model => model.id === form.model) ? form.model : ''}
-            onChange={e => { const selected = modelChoices[form.harness].find(model => model.id === e.target.value); change('model', e.target.value); change('reasoningEffort', selected?.defaultReasoningEffort ?? ''); }}>
-            <option value="">Use harness default (resolved after launch)</option>
-            {modelChoices[form.harness].map(model => <option value={model.id} key={model.id}>{model.label} — {model.id}</option>)}
-          </select></label>
-          <label>Reasoning effort<select aria-label="Reasoning effort" value={form.reasoningEffort} onChange={e => change('reasoningEffort', e.target.value)}>
-            <option value="">Model default</option>
-            {(modelChoices[form.harness].find(model => model.id === form.model)?.reasoningEfforts ?? []).map(effort => <option key={effort}>{effort}</option>)}
-          </select></label>
-          {form.advanced && <label>Custom model ID <small>exact ID; validated by the harness at launch</small>
-            <input aria-label="Model" value={form.model}
-              onChange={e => { change('model', e.target.value); change('reasoningEffort', ''); }} placeholder="vendor model ID" />
-          </label>}
+          <label>Brain reference<input value={form.brain} onChange={e => change('brain', e.target.value)} placeholder="codex-default" /></label>
+          <label>Role reference<input value={form.role} onChange={e => change('role', e.target.value)} placeholder="developer" /></label>
           <label>Lifetime<select value={form.lifetime} onChange={e => change('lifetime', e.target.value as Form['lifetime'])}><option value="permanent">Permanent</option><option value="temporary">Temporary — gone on exit/reboot</option></select></label>
           <label className="wide">Working directory <small>blank uses private role state</small><input value={form.cwd} onChange={e => change('cwd', e.target.value)} placeholder="/absolute/existing/path" /></label>
         </div></fieldset>
@@ -187,10 +163,6 @@ export function CreateRole({ onClose, onCreated }: {
         </div>{(form.approval === 'allow' || form.filesystem === 'unrestricted') &&
           <label className="risk"><input type="checkbox" checked={form.highRiskAcknowledged} onChange={e => change('highRiskAcknowledged', e.target.checked)} />
             I understand the adapter’s elevated native permission translation.</label>}</fieldset>}
-        {form.advanced && <fieldset><legend>Profile</legend><div className="form-grid">
-          <label>Public bio<textarea value={form.bio} onChange={e => change('bio', e.target.value)} /></label>
-          <label>Local persona<textarea value={form.persona} onChange={e => change('persona', e.target.value)} /></label>
-        </div></fieldset>}
         {preview && <div className="review"><h3>Effective plan</h3>
           <dl>{Object.entries(preview.effective).map(([key, value]) => <div key={key}><dt>{key}</dt><dd>{key === 'model' && value == null
             ? 'harness default'
@@ -207,7 +179,7 @@ export function CreateRole({ onClose, onCreated }: {
         </div>}
         {error && <div className="banner error">{error}</div>}
         <div className="modal-actions"><button className="secondary" onClick={onClose}>Cancel</button>
-          {!preview ? <button className="primary" disabled={busy || !form.name} onClick={() => void review()}>{busy ? 'Reviewing…' : 'Review effective plan'}</button>
+          {!preview ? <button className="primary" disabled={busy || !form.name || !form.brain || !form.role} onClick={() => void review()}>{busy ? 'Reviewing…' : 'Review effective plan'}</button>
             : <button className="primary" disabled={busy || preview.prerequisites?.length} onClick={() => void create()}>{busy ? 'Creating…' : 'Create atomically'}</button>}</div>
       </div> : <div className="progress">
         <h3>{action.roleId}</h3><p>Creation continues if this browser disconnects.</p>

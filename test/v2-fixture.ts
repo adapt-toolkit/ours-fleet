@@ -3,7 +3,25 @@ import { dirname, join } from 'node:path';
 import { parse, stringify } from 'yaml';
 import type { RoleConfig } from '../src/config.js';
 import { splitRootFor } from '../src/config.js';
-import { buildAgentDocument } from '../src/spawn.js';
+import '../src/harness/claude-code.js';
+import '../src/harness/codex.js';
+
+function buildAgentDocument(raw: RoleConfig): Record<string, unknown> {
+  const role = Object.fromEntries(['mission', 'persona', 'bio', 'briefing_file']
+    .filter(key => raw[key as keyof RoleConfig] !== undefined)
+    .map(key => [key, raw[key as keyof RoleConfig]]));
+  const brain = Object.fromEntries([
+    'harness', 'session', 'session_options', 'model', 'model_chain', 'max_tokens',
+    'autocompact_pct', 'harness_options', 'effort',
+  ].filter(key => raw[key as keyof RoleConfig] !== undefined)
+    .map(key => [key, raw[key as keyof RoleConfig]]));
+  const operational = Object.fromEntries([
+    'permissions', 'identity', 'cwd', 'coordinator', 'env', 'oversee', 'isolation',
+    'monitor', 'owner_channel', 'worklog', 'auth_proxy',
+  ].filter(key => raw[key as keyof RoleConfig] !== undefined)
+    .map(key => [key, raw[key as keyof RoleConfig]]));
+  return { role: { inline: role }, brain: { inline: brain }, ...operational };
+}
 
 /**
  * Mechanical success-fixture migration only. Tests for malformed YAML, legacy
@@ -19,6 +37,18 @@ export function writeV2Fixture(
   const model = parsed as Record<string, unknown>;
   const roles = (model.roles ?? {}) as Record<string, RoleConfig | null>;
   const defaults = (model.defaults ?? {}) as Record<string, unknown>;
+  const watchdogs = (model.watchdogs ?? {}) as Record<string, Record<string, unknown>>;
+  for (const entry of Object.values(watchdogs)) {
+    if (entry.agent) continue;
+    const brain = Object.fromEntries(['harness', 'model', 'session']
+      .filter(key => entry[key] !== undefined || defaults[key] !== undefined)
+      .map(key => [key, entry[key] ?? defaults[key]]));
+    const isolation = entry.isolation;
+    for (const key of ['harness', 'model', 'session', 'isolation']) delete entry[key];
+    entry.agent = { role: { inline: {} }, brain: { inline: {
+      harness: 'claude-code', ...brain,
+    } }, ...(isolation === undefined ? {} : { isolation }) };
+  }
   const brainDefaultKeys = [
     'harness', 'session', 'session_options', 'model', 'model_chain', 'max_tokens',
     'autocompact_pct', 'harness_options', 'effort',

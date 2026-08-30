@@ -485,7 +485,8 @@ export function registerTemplateCommands(parent: Command, cOpt: (cmd: Command) =
         if (t.contract) console.log(`\nContract:\n${t.contract}`);
         console.log(`\nMembers:`);
         for (const m of t.members)
-          console.log(`  ${m.slot}: ${m.count}× ${m.role} (ref: ${m.role_ref})`);
+          console.log(`  ${m.slot}: ${m.count}× ${m.role} (`
+            + `${'ref' in m.agent ? `agent ref: ${m.agent.ref}` : 'inline Agent'})`);
         console.log(`\nContent hash: ${t.content_hash}`);
       } catch (e) { die(e); }
     });

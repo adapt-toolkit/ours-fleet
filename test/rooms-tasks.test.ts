@@ -810,7 +810,7 @@ describe('config validation', () => {
     const validTemplate = {
       version: 1,
       description: 'Test template',
-      members: [{ slot: 'dev', role: 'Developer', count: 2, role_ref: 'Dev' }],
+      members: [{ slot: 'dev', role: 'Developer', count: 2, agent: { ref: 'Dev' } }],
     };
 
     it('accepts valid template', () => {
@@ -833,13 +833,13 @@ describe('config validation', () => {
 
     it('rejects missing version', () => {
       expect(() => validateRoomTemplatesConfig({
-        't': { description: 'x', members: [{ slot: 'a', role: 'A', count: 1, role_ref: 'A' }] },
+        't': { description: 'x', members: [{ slot: 'a', role: 'A', count: 1, agent: { ref: 'A' } }] },
       }, 'test')).toThrow(/version.*required positive integer/);
     });
 
     it('rejects missing description', () => {
       expect(() => validateRoomTemplatesConfig({
-        't': { version: 1, members: [{ slot: 'a', role: 'A', count: 1, role_ref: 'A' }] },
+        't': { version: 1, members: [{ slot: 'a', role: 'A', count: 1, agent: { ref: 'A' } }] },
       }, 'test')).toThrow(/description.*required string/);
     });
 
@@ -876,26 +876,27 @@ describe('config validation', () => {
       }, 'test')).toThrow(/unknown key.*bad_key/);
     });
 
-    it('rejects unknown keys in member overrides', () => {
+    it('rejects the removed task-only override schema', () => {
       expect(() => validateRoomTemplatesConfig({
         't': {
           version: 1, description: 'x',
-          members: [{ slot: 'a', role: 'A', count: 1, role_ref: 'A', overrides: { bad: true } }],
+          members: [{ slot: 'a', role: 'A', count: 1, agent: { ref: 'A' }, overrides: { bad: true } }],
         },
-      }, 'test')).toThrow(/unknown key.*bad/);
+      }, 'test')).toThrow(/unknown key.*overrides/);
     });
 
-    it('accepts valid member overrides', () => {
+    it('accepts a canonical inline Agent', () => {
       const cfg = validateRoomTemplatesConfig({
         't': {
           version: 1, description: 'x',
           members: [{
-            slot: 'a', role: 'A', count: 1, role_ref: 'A',
-            overrides: { model: 'claude-opus-4-6', persona: 'test' },
+            slot: 'a', role: 'A', count: 1,
+            agent: { brain: { inline: { harness: 'claude-code', model: 'claude-opus-4-6' } },
+              role: { inline: { persona: 'test' } } },
           }],
         },
       }, 'test');
-      expect(cfg.t.members[0].overrides).toBeDefined();
+      expect(cfg.t.members[0].agent).toBeDefined();
     });
   });
 

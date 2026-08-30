@@ -6,12 +6,13 @@ import { agentDir, defaultConfigPath } from './paths.js';
 import { validateIsolationConfig } from './isolation/policy.js';
 import type { IsolationConfig } from './isolation/types.js';
 import {
-  loadConfig, resolveAuthProxy, resolveModelChain, resolveMonitorConfig, resolveOwnerChannelConfig,
+  loadConfig, findRole, resolveAuthProxy, resolveModelChain, resolveMonitorConfig, resolveOwnerChannelConfig,
   resolvePermissions,
   resolveRoleModel, resolveWorklogPolicy, splitRootFor, validateMonitorConfig,
   type ApprovalMode, type FilesystemMode, type ResolvedRole, type RoleConfig,
   type CommonPermissions, type MonitorConfig, type SessionBackendId, type UnattendedMode,
   type RoomMemberStartup,
+  type AgentDefinition, type AgentSelection,
 } from './config.js';
 import { resolveRoleModelEnv } from './model-env.js';
 import { applyRole, up, type OpsDeps } from './ops.js';
@@ -42,34 +43,18 @@ export let lastProvenance: CreationProvenance | undefined;
 export interface SpawnOpts {
   name: string;
   temp?: boolean;
-  harness?: string;
-  session?: SessionBackendId;
-  mission?: string;
-  missionFile?: string;
+  brain?: AgentSelection;
+  role?: AgentSelection;
+  /** Trusted canonical definition used by room provisioning; never a second schema. */
+  agentDefinition?: AgentDefinition;
   identity?: string;
   cwd?: string;
   coordinator?: string;
-  /** null explicitly selects the harness default; undefined retains normal fleet inheritance. */
-  model?: string | null;
-  permissionMode?: string;
   approval?: ApprovalMode;
   filesystem?: FilesystemMode;
   unattended?: UnattendedMode;
-  sandbox?: string;
-  profile?: string;
-  launcher?: string;
-  search?: boolean;
-  codexConfig?: Record<string, string | number | boolean>;
-  reasoningEffort?: string | null;
-  addDirs?: string[];
-  monitor?: boolean;
   /** Typed external monitor configuration used by trusted creation surfaces. */
   monitorConfig?: Partial<MonitorConfig>;
-  bioFile?: string;
-  personaFile?: string;
-  /** Inline profile values for trusted typed callers such as the local web service. */
-  bio?: string;
-  persona?: string;
   /** Internal, non-sensitive provenance correlation for typed presentation layers. */
   surface?: 'cli' | 'web' | 'agent';
   creationActionId?: string;
@@ -91,57 +76,38 @@ export interface SpawnOpts {
   json?: boolean;
 }
 
-export function profileValues(o: SpawnOpts): { bio?: string; persona?: string } {
-  if (o.bio !== undefined && o.bioFile)
-    throw new Error('bio and bioFile are mutually exclusive');
-  if (o.persona !== undefined && o.personaFile)
-    throw new Error('persona and personaFile are mutually exclusive');
+export function agentDefinitionFromSpawn(o: SpawnOpts): AgentDefinition {
+  if (o.agentDefinition) {
+    if (o.brain !== undefined || o.role !== undefined || o.cwd !== undefined
+        || o.coordinator !== undefined || o.approval !== undefined || o.filesystem !== undefined
+        || o.unattended !== undefined || o.isolationFile !== undefined || o.monitorConfig !== undefined)
+      throw new Error('canonical agentDefinition conflicts with separate Agent fields');
+    const definition = structuredClone(o.agentDefinition);
+    if (o.identity) definition.identity = o.identity;
+    return definition;
+  }
+  if (!o.role) throw new Error('--role is required (declared ID or inline mapping)');
+  if (!o.brain) throw new Error('--brain is required (declared ID or inline mapping)');
+  const permissions = o.approval || o.filesystem || o.unattended ? {
+    ...(o.approval ? { approval: o.approval } : {}),
+    ...(o.filesystem ? { filesystem: o.filesystem } : {}),
+    ...(o.unattended ? { unattended: o.unattended } : {}),
+  } : undefined;
   return {
-    bio: o.bio !== undefined ? o.bio.trim()
-      : o.bioFile ? readFileSync(o.bioFile, 'utf8').trim() : undefined,
-    persona: o.persona !== undefined ? o.persona.trim()
-      : o.personaFile ? readFileSync(o.personaFile, 'utf8').trim() : undefined,
+    role: structuredClone(o.role), brain: structuredClone(o.brain),
+    ...(o.identity ? { identity: o.identity } : {}),
+    ...(o.cwd ? { cwd: o.cwd } : {}),
+    ...(o.coordinator ? { coordinator: o.coordinator } : {}),
+    ...(permissions ? { permissions } : {}),
+    ...(o.isolationFile ? { isolation: readIsolationFile(o.isolationFile) } : {}),
+    ...(o.monitorConfig ? { monitor: structuredClone(o.monitorConfig) } : {}),
   };
 }
 
-/** Pure option-to-role mapping shared by CLI and application services. */
-export function buildRoleConfig(o: SpawnOpts, defaultHarness?: string): RoleConfig {
-  const r: RoleConfig = {};
-  const harness = o.harness ?? defaultHarness;
-  if (harness) r.harness = harness;
-  if (o.session) r.session = o.session;
-  if (o.identity) r.identity = o.identity;
-  if (o.cwd) r.cwd = o.cwd;
-  if (o.coordinator) r.coordinator = o.coordinator;
-  if (o.missionFile) r.mission = readMissionFile(o.missionFile);
-  else if (o.mission !== undefined) r.mission = o.mission;
-  if (o.model === null) r.model = null;
-  else if (o.model?.trim()) r.model = o.model.trim();
-  if (o.reasoningEffort?.trim()) r.effort = o.reasoningEffort.trim();
-  const harnessOptions: Record<string, unknown> = {};
-  if (o.permissionMode) harnessOptions[harness === 'claude-code' ? 'permission_mode' : 'approval'] = o.permissionMode;
-  if (o.sandbox) harnessOptions.sandbox = o.sandbox;
-  if (o.profile) harnessOptions.profile = o.profile;
-  if (o.launcher) harnessOptions.launcher = o.launcher;
-  if (o.search === true) harnessOptions.search = true;
-  const codexConfig = { ...(o.codexConfig ?? {}) };
-  if (Object.keys(codexConfig).length) harnessOptions.config = codexConfig;
-  if (o.addDirs?.length) harnessOptions.add_dirs = o.addDirs;
-  if (o.monitor === true) harnessOptions.monitor = true;
-  if (Object.keys(harnessOptions).length) r.harness_options = harnessOptions;
-  if (o.approval || o.filesystem || o.unattended) {
-    r.permissions = {
-      ...(o.approval ? { approval: o.approval } : {}),
-      ...(o.filesystem ? { filesystem: o.filesystem } : {}),
-      ...(o.unattended ? { unattended: o.unattended } : {}),
-    };
-  }
-  const profile = profileValues(o);
-  if (profile.bio) r.bio = profile.bio;
-  if (profile.persona) r.persona = profile.persona;
-  if (o.isolationFile) r.isolation = readIsolationFile(o.isolationFile);
-  if (o.monitorConfig) r.monitor = { ...o.monitorConfig };
-  return r;
+function resolvedSpawn(o: SpawnOpts): { definition: AgentDefinition; role: ResolvedRole } {
+  const definition = agentDefinitionFromSpawn(o);
+  const cfg = loadConfig(o.configPath, { additionalAgent: { id: o.name, definition } });
+  return { definition, role: findRole(cfg, o.name) };
 }
 
 /**
@@ -168,12 +134,6 @@ export function readIsolationFile(path: string): IsolationConfig {
 }
 
 export function validateSpawnOpts(o: SpawnOpts): void {
-  if (o.mission !== undefined && o.missionFile)
-    throw new Error('--mission and --mission-file are mutually exclusive');
-  if ((o.session as string | undefined) === 'tmux')
-    throw new Error("invalid --session 'tmux'; tmux is no longer supported; use --session acp");
-  if (o.session && o.session !== 'acp')
-    throw new Error(`invalid --session '${o.session}'; allowed: acp`);
   if (o.approval && !['ask', 'auto', 'allow', 'deny'].includes(o.approval))
     throw new Error(
       `invalid --approval '${o.approval}'; allowed: ask, auto, allow (deprecated alias: deny)`);
@@ -186,18 +146,10 @@ export function validateSpawnOpts(o: SpawnOpts): void {
     throw new Error(`invalid role name '${o.name}'`);
   if (o.identity && !/^[A-Za-z0-9_-]+$/.test(o.identity))
     throw new Error(`invalid identity name '${o.identity}'`);
-  if (o.model && (o.model.length > 128 || /[\0-\x1f\x7f]/.test(o.model)))
-    throw new Error('model must be printable and at most 128 characters');
   if (o.monitorConfig) {
     const problems = validateMonitorConfig(o.monitorConfig);
     if (problems.length) throw new Error(problems.join('; '));
   }
-}
-
-/** Read mission text without trimming or newline rewriting. */
-export function readMissionFile(path: string): string {
-  try { return readFileSync(path, 'utf8'); }
-  catch (e) { throw new Error(`--mission-file ${path}: ${(e as Error).message}`); }
 }
 
 /**
@@ -230,24 +182,6 @@ export interface SpawnDryRun {
   resolvedRole: ResolvedRole;
 }
 
-/** Bare Agent document written by v2 spawn: inline Role × inline Brain + operations. */
-export function buildAgentDocument(raw: RoleConfig): Record<string, unknown> {
-  const role = Object.fromEntries(['mission', 'persona', 'bio', 'briefing_file']
-    .filter(key => raw[key as keyof RoleConfig] !== undefined)
-    .map(key => [key, raw[key as keyof RoleConfig]]));
-  const brain = Object.fromEntries([
-    'harness', 'session', 'session_options', 'model', 'model_chain', 'max_tokens',
-    'autocompact_pct', 'harness_options', 'effort',
-  ].filter(key => raw[key as keyof RoleConfig] !== undefined)
-    .map(key => [key, raw[key as keyof RoleConfig]]));
-  const operational = Object.fromEntries([
-    'permissions', 'identity', 'cwd', 'coordinator', 'env', 'oversee', 'isolation',
-    'monitor', 'owner_channel', 'worklog', 'auth_proxy',
-  ].filter(key => raw[key as keyof RoleConfig] !== undefined)
-    .map(key => [key, raw[key as keyof RoleConfig]]));
-  return { role: { inline: role }, brain: { inline: brain }, ...operational };
-}
-
 /**
  * Validate and resolve a spawn without reserving names, contacting the daemon,
  * or writing state. Collision checks are necessarily a point-in-time snapshot.
@@ -255,73 +189,13 @@ export function buildAgentDocument(raw: RoleConfig): Record<string, unknown> {
 export function spawnDryRun(o: SpawnOpts): SpawnDryRun {
   validateSpawnOpts(o);
   if (o.isolationFile) readIsolationFile(o.isolationFile);
-  if (o.missionFile) readMissionFile(o.missionFile);
   assertNameFree(o);
-  const cfg = loadConfig(o.configPath);
-  const raw = buildRoleConfig(
-    o, (cfg.defaults.harness as string | undefined) ?? 'claude-code',
-  );
-  const harnessOptions = {
-    ...((cfg.defaults.harness_options ?? {}) as Record<string, unknown>),
-    ...(raw.harness_options ?? {}),
-  };
-  const harness = raw.harness ?? (cfg.defaults.harness as string | undefined) ?? 'claude-code';
-  const defaultHarness = (cfg.defaults.harness as string | undefined) ?? 'claude-code';
-  const inheritsModelDefaults = harness === defaultHarness && raw.model !== null;
-  const authProxy = resolveAuthProxy(cfg.defaults.auth_proxy, raw.auth_proxy);
-  // One resolution for the environment and the model it pins (src/model-env.ts).
-  const modelEnv = resolveRoleModelEnv({
-    harness,
-    model: resolveRoleModel(raw.model, raw.harness, cfg.defaults),
-    modelWasExplicit: raw.model !== undefined,
-    defaultsEnv: (cfg.defaults.env ?? {}) as Record<string, string>,
-    roleEnv: raw.env,
-    ...(authProxy ? { authProxyBaseUrl: authProxy.base_url } : {}),
-  });
-  const adapter = getAdapter(harness);
-  const brain = adapter.agentSession.resolveBrain({
-    model: modelEnv.model,
-    effort: raw.effort,
-    harnessOptions: Object.keys(harnessOptions).length ? harnessOptions : undefined,
-  });
-  const model = brain.model ?? undefined;
-  const session = raw.session ?? (cfg.defaults.session as SessionBackendId | undefined) ?? 'acp';
-  const resolvedRole: ResolvedRole = {
-    ...raw,
-    name: o.name,
-    sourceFile: o.temp ? '(temp dry-run)' : join(splitRootFor(o.configPath ?? defaultConfigPath()), 'agents', `${o.name}.yaml`),
-    harness,
-    session,
-    session_options: raw.session_options,
-    permissions: resolvePermissions(cfg.defaults.permissions, raw.permissions),
-    permissionsDeclared: raw.permissions !== undefined || cfg.defaults.permissions !== undefined,
-    identity: effectiveIdentity(o),
-    effort: raw.effort,
-    model,
-    model_chain: resolveModelChain(
-      model,
-      raw.model_chain ?? (inheritsModelDefaults
-        ? cfg.defaults.model_chain as string[] | undefined
-        : undefined),
-    ),
-    harness_options: brain.harnessOptions,
-    isolation: raw.isolation ?? (cfg.defaults.isolation as IsolationConfig | undefined),
-    monitor: resolveMonitorConfig(cfg.defaults.monitor, raw.monitor),
-    owner_channel: resolveOwnerChannelConfig(
-      cfg.defaults.owner_channel, raw.owner_channel, session),
-    worklog: resolveWorklogPolicy(cfg.defaults.worklog, raw.worklog),
-    auth_proxy: authProxy,
-  };
-  resolvedRole.env = modelEnv.env;
-  if (resolvedRole.auth_proxy && resolvedRole.harness !== 'claude-code')
-    throw new Error('auth_proxy is supported only by claude-code');
-  const optionProblems = adapter.validateOptions(resolvedRole.harness_options, resolvedRole);
-  if (optionProblems.length)
-    throw new Error(optionProblems.map(problem => `${problem.path}: ${problem.message}`).join('; '));
+  const resolved = resolvedSpawn(o);
+  const resolvedRole = resolved.role;
   return {
     schemaVersion: 1,
     warning: 'collision checks are a snapshot; a real spawn reserves names atomically',
-    roleDocument: buildAgentDocument(raw),
+    roleDocument: structuredClone(resolved.definition) as unknown as Record<string, unknown>,
     resolvedRole,
   };
 }
@@ -341,22 +215,16 @@ function provenanceSettings(
   const callerDefaults = new Set(o.inheritedFromCaller ?? []);
   const tagged = (key: string, entry: ProvenanceEntry): ProvenanceEntry =>
     callerDefaults.has(key) ? { ...entry, source: 'caller-role' } : entry;
-  const explicitModel = typeof o.model === 'string' ? o.model.trim() : undefined;
-  const inheritedModel = resolveRoleModel(undefined, o.harness, defaults);
+  const selection = (value: AgentSelection | undefined): string | undefined =>
+    value && 'ref' in value ? `ref:${value.ref}` : value ? 'inline' : undefined;
   return {
-    harness: tagged('harness', provenanceOf(o.harness, defaults.harness, 'claude-code')),
-    session: tagged('session', provenanceOf(o.session, defaults.session, 'acp')),
+    brain: tagged('brain', provenanceOf(selection(o.brain), undefined, undefined)),
+    role: tagged('role', provenanceOf(selection(o.role), undefined, undefined)),
     identity: o.identity
       ? { value: o.identity, source: 'cli' }
       : { value: o.name, source: 'built-in' },     // defaults to the role name
     cwd: tagged('cwd', provenanceOf(o.cwd, undefined, undefined)),
-    model: tagged('model', o.model === null
-      ? { value: undefined, source: 'cli' }
-      : explicitModel
-        ? { value: explicitModel, source: 'cli' }
-        : { value: inheritedModel, source: inheritedModel ? 'fleet-default' : 'built-in' }),
     coordinator: tagged('coordinator', provenanceOf(o.coordinator, undefined, undefined)),
-    permission_mode: provenanceOf(o.permissionMode, undefined, undefined),
     approval: tagged('approval', provenanceOf(o.approval, perms.approval, 'ask')),
     filesystem: tagged('filesystem', provenanceOf(o.filesystem, perms.filesystem, 'workspace')),
     unattended: tagged('unattended', provenanceOf(o.unattended, perms.unattended, 'deny')),
@@ -373,7 +241,7 @@ export async function spawnPermanent(
 ): Promise<string> {
   validateSpawnOpts(o);
   if (o.isolationFile) readIsolationFile(o.isolationFile);   // fail before reserving
-  if (o.missionFile) readMissionFile(o.missionFile);         // fail before reserving
+  const prepared = resolvedSpawn(o);                         // canonical validation before mutation
   // Reserve name and identity together before anything is written or started.
   // A loser of the race creates no config, state, or service.
   creation.onStage?.('reserving');
@@ -387,7 +255,7 @@ export async function spawnPermanent(
       creation.onStage?.('checking_identity');
       const guarantee = await ensureIdentity(
         effectiveIdentity(o),
-        profileValues(o),
+        { bio: prepared.role.bio, persona: prepared.role.persona },
         creation.identityProvisioner ?? deps.identityProvisioner ?? daemonIdentityProvisioner(),
         deps.log);
       creation.onStage?.('checking_identity', {
@@ -406,9 +274,7 @@ export async function spawnPermanent(
       mkdirSync(agentRoot, { recursive: true });
       creation.onStage?.('writing_role');
       const file = join(agentRoot, `${o.name}.yaml`);
-      writeRoleFile(tx, file, stringify(buildAgentDocument(
-        buildRoleConfig(o, (cfg.defaults.harness as string | undefined) ?? 'claude-code'),
-      )));
+      writeRoleFile(tx, file, stringify(agentDefinitionFromSpawn(o)));
       // `up` materialises the state dir and registers the service. Journal the
       // dir before it exists so a failure leaves the name genuinely reusable
       // rather than blocked by a half-built directory.
@@ -486,7 +352,7 @@ export async function spawnTemp(
 ): Promise<string> {
   validateSpawnOpts(o);
   if (o.isolationFile) readIsolationFile(o.isolationFile);   // fail before reserving
-  if (o.missionFile) readMissionFile(o.missionFile);         // fail before reserving
+  const prepared = resolvedSpawn(o);                         // canonical validation before mutation
   // Retire only supervisors whose recorded owner is definitively stopped. This
   // bounded pass keeps the active roster clean without deleting old evidence.
   await reclaimStaleTempState();
@@ -501,74 +367,20 @@ export async function spawnTemp(
       creation.onStage?.('checking_identity', {
         result: 'unknown', guarantee: 'unverified',
       });
-      return spawnTempInner(o, binPath, launch, tx, creation.onStage);
+      return spawnTempInner(o, prepared.role, binPath, launch, tx, creation.onStage);
     },
     creation,
   );
 }
 
 async function spawnTempInner(
-  o: SpawnOpts, binPath: string, launch: SupervisorLauncher, tx: CreationTransaction,
+  o: SpawnOpts, preparedRole: ResolvedRole, binPath: string, launch: SupervisorLauncher, tx: CreationTransaction,
   onStage: CreationDeps['onStage'],
 ): Promise<string> {
   const cfg = loadConfig(o.configPath);
-  const defaultHarness = cfg.defaults.harness as string | undefined;
-  const fromOpts = buildRoleConfig(o, defaultHarness);
-  const mergedHarnessOptions = {
-    ...((cfg.defaults.harness_options ?? {}) as Record<string, unknown>),
-    ...(fromOpts.harness_options ?? {}),
-  };
-  const harness = o.harness ?? defaultHarness ?? 'claude-code';
-  const inheritsModelDefaults = harness === (defaultHarness ?? 'claude-code') && o.model !== null;
-  const tempAuthProxy = resolveAuthProxy(cfg.defaults.auth_proxy, fromOpts.auth_proxy);
-  // An explicitly requested --model must reach the child, not just the banner
-  // (src/model-env.ts).
-  const modelEnv = resolveRoleModelEnv({
-    harness,
-    model: resolveRoleModel(o.model, o.harness, cfg.defaults),
-    modelWasExplicit: o.model !== undefined,
-    defaultsEnv: (cfg.defaults.env ?? {}) as Record<string, string>,
-    roleEnv: fromOpts.env,
-    ...(tempAuthProxy ? { authProxyBaseUrl: tempAuthProxy.base_url } : {}),
-  });
-  const adapter = getAdapter(harness);
-  const brain = adapter.agentSession.resolveBrain({
-    model: modelEnv.model,
-    effort: fromOpts.effort,
-    harnessOptions: Object.keys(mergedHarnessOptions).length ? mergedHarnessOptions : undefined,
-  });
-  const model = brain.model ?? undefined;
-  const session = o.session ?? (cfg.defaults.session as SessionBackendId | undefined) ?? 'acp';
   const role: ResolvedRole = {
-    ...fromOpts,          // includes `isolation` when --isolation-file was given
-    name: o.name,
-    harness,
-    session,
-    identity: o.identity ?? o.name,
-    effort: fromOpts.effort,
-    model,
-    model_chain: resolveModelChain(
-      model,
-      fromOpts.model_chain ?? (inheritsModelDefaults
-        ? cfg.defaults.model_chain as string[] | undefined
-        : undefined),
-    ),
-    harness_options: brain.harnessOptions,
-    permissions: resolvePermissions(cfg.defaults.permissions, fromOpts.permissions),
-    permissionsDeclared:
-      fromOpts.permissions !== undefined || cfg.defaults.permissions !== undefined,
-    // Temp agents inherit the fleet-wide monitor defaults via the snapshot.
-    monitor: resolveMonitorConfig(cfg.defaults.monitor, fromOpts.monitor),
-    owner_channel: resolveOwnerChannelConfig(
-      cfg.defaults.owner_channel, fromOpts.owner_channel, session),
-    worklog: resolveWorklogPolicy(cfg.defaults.worklog, fromOpts.worklog),
-    auth_proxy: tempAuthProxy,
-    sourceFile: '(temp)',
-    roomMemberStartup: o.roomMemberStartup,
+    ...preparedRole, sourceFile: '(temp)', loops: undefined, roomMemberStartup: o.roomMemberStartup,
   };
-  role.env = modelEnv.env;
-  if (role.auth_proxy && role.harness !== 'claude-code')
-    throw new Error('auth_proxy is supported only by claude-code');
   onStage?.('writing_role');
   const dir = applyRole(role, { temp: true, identityGuarantee: 'unverified' });
   const provenance = buildProvenance({

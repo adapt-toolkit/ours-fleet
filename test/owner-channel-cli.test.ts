@@ -223,15 +223,16 @@ describe('owner-channel CLI', () => {
     const stateDir = join(homeDir, '.ours-fleet', 'agents', 'PhoneRole');
     const spawn = vi.fn(async options => ({
       caller: 'PhoneRole', role: options.name, lifetime: options.temp ? 'temporary' as const : 'permanent' as const,
-      statePath: '/state/ProxyWorker', harness: options.harness ?? 'codex', session: 'acp' as const,
+      statePath: '/state/ProxyWorker', harness: 'claude-code', session: 'acp' as const,
       model: 'gpt-proxy', monitor: { mode: 'fleet' as const, interrupt: true },
       permissionMode: { fleetMode: 'allow' as const, nativeMode: 'bypassPermissions' },
-      inherited: ['session', 'model', 'monitorConfig'], creationActionId: 'proxy-action',
+      inherited: ['brain', 'role', 'monitorConfig'], creationActionId: 'proxy-action',
     }));
     control!.setFleetSpawner(spawn);
 
     const result = await run([
-      'spawn', '--role', 'ProxyWorker', '--temp', '--harness', 'claude-code',
+      'spawn', 'ProxyWorker', '--temp', '--brain', 'inline:{"harness":"claude-code"}',
+      '--role', 'inline:{}',
     ], {
       OURS_FLEET_PROXY_STATE_DIR: stateDir,
       OURS_FLEET_PROXY_CALLER: 'PhoneRole',
@@ -241,7 +242,8 @@ describe('owner-channel CLI', () => {
     expect(result.stdout).toContain('claude-code/acp');
     expect(result.stdout).toContain('permission=allow native=bypassPermissions');
     expect(spawn).toHaveBeenCalledWith(expect.objectContaining({
-      name: 'ProxyWorker', temp: true, harness: 'claude-code',
+      name: 'ProxyWorker', temp: true,
+      brain: { inline: { harness: 'claude-code' } }, role: { inline: {} },
     }));
   }, CLI_INTEGRATION_TIMEOUT_MS);
 

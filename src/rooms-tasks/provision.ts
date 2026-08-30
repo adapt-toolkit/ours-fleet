@@ -1,5 +1,5 @@
-import { randomUUID } from 'node:crypto';
-import { existsSync, readFileSync, realpathSync } from 'node:fs';
+import { createHash, randomUUID } from 'node:crypto';
+import { existsSync, readFileSync, realpathSync, statSync } from 'node:fs';
 import { parse } from 'yaml';
 import type { CoworkAdapter, CoworkSeatInfo } from './cowork-adapter.js';
 import {
@@ -15,7 +15,8 @@ import type {
 } from './types.js';
 import { spawnTemp } from '../spawn.js';
 import type { SpawnOpts } from '../spawn.js';
-import { findRole, type FleetConfig, type RoomMemberStartup } from '../config.js';
+import { findRole, loadConfig, type FleetConfig, type RoomMemberStartup } from '../config.js';
+import type { AgentDefinition } from '../config.js';
 import {
   FLEET_PROXY_CALLER_ENV, FLEET_PROXY_STATE_DIR_ENV,
   type ManagedFleetSpawnResult,
@@ -59,18 +60,35 @@ interface ExpandedMember {
   name: string;
   slot: string;
   coworkRole: string;
-  roleRef: string;
-  overrides?: TemplateMemberSlot['overrides'];
+  agent: TemplateMemberSlot['agent'];
 }
 
 interface MemberSettings {
-  model?: string;
-  harness?: string;
-  cwd?: string;
+  definition: AgentDefinition;
   persona?: string;
-  approval?: SpawnOpts['approval'];
-  filesystem?: SpawnOpts['filesystem'];
-  unattended?: SpawnOpts['unattended'];
+}
+
+function canonicalJson(value: unknown): string {
+  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(',')}]`;
+  if (value && typeof value === 'object') return `{${Object.entries(value as Record<string, unknown>)
+    .sort(([a], [b]) => a.localeCompare(b))
+    .map(([key, item]) => `${JSON.stringify(key)}:${canonicalJson(item)}`).join(',')}}`;
+  return JSON.stringify(value);
+}
+
+function launchDefinition(definition: AgentDefinition): {
+  projection: Record<string, unknown>; fingerprint: string;
+} {
+  const selectionEvidence = (selection: AgentDefinition['brain'] | AgentDefinition['role']) =>
+    'ref' in selection ? { kind: 'ref', id: selection.ref } : { kind: 'inline' };
+  return {
+    projection: {
+      brain: selectionEvidence(definition.brain), role: selectionEvidence(definition.role),
+      operationalFields: Object.keys(definition)
+        .filter(key => key !== 'brain' && key !== 'role').sort(),
+    },
+    fingerprint: createHash('sha256').update(canonicalJson(definition)).digest('hex'),
+  };
 }
 
 /**
@@ -129,8 +147,7 @@ function expandMembers(
         name: `${prefix}-${slot.slot}-${i}`,
         slot: slot.slot,
         coworkRole: slot.role,
-        roleRef: slot.role_ref,
-        overrides: slot.overrides,
+        agent: structuredClone(slot.agent),
       });
     }
   }
@@ -138,17 +155,23 @@ function expandMembers(
 }
 
 function settingsFor(member: ExpandedMember, cfg: FleetConfig): MemberSettings {
-  let refRole;
-  try { refRole = findRole(cfg, member.roleRef); } catch { /* no ref role */ }
-  const permissions = member.overrides?.permissions;
+  if (!('ref' in member.agent)) {
+    const role = member.agent.role;
+    if (cfg.files[0] && existsSync(cfg.files[0]) && statSync(cfg.files[0]).isFile())
+      loadConfig(cfg.files[0], { additionalAgent: {
+        id: `RoomPreflight${member.name.replace(/[^A-Za-z0-9_-]/g, '')}`.slice(0, 64),
+        definition: member.agent,
+      } });
+    return { definition: structuredClone(member.agent),
+      ...('inline' in role && typeof role.inline.persona === 'string'
+        ? { persona: role.inline.persona } : {}) };
+  }
+  const refRole = findRole(cfg, member.agent.ref);
+  const definition = cfg.agentDefinitions?.[member.agent.ref];
+  if (!definition) throw new Error(`Agent '${member.agent.ref}' has no canonical definition`);
   return {
-    model: member.overrides?.model ?? refRole?.model,
-    harness: member.overrides?.harness ?? refRole?.harness,
-    cwd: member.overrides?.cwd ?? refRole?.cwd,
-    persona: member.overrides?.persona ?? refRole?.persona,
-    approval: permissions?.approval as SpawnOpts['approval'],
-    filesystem: permissions?.filesystem as SpawnOpts['filesystem'],
-    unattended: permissions?.unattended as SpawnOpts['unattended'],
+    definition: structuredClone(definition),
+    persona: refRole.persona,
   };
 }
 
@@ -199,13 +222,11 @@ function launchMatches(
     };
     const startup = role.roomMemberStartup;
     return role.identity === member.name
-      && typeof role.mission === 'string'
-      && sha256Text(role.mission) === taskSha
       && startup?.room_id === roomId
       && startup.room_identity_cid === roomIdentityCid
       && startup.identity_name === member.name
       && startup.role === member.coworkRole
-      && startup.task === role.mission
+      && sha256Text(startup.task ?? '') === taskSha
       && (expectedInviteId === undefined || startup.invite_id === expectedInviteId)
       && typeof startup.invite === 'string'
       && startup.invite.length > 0;
@@ -319,10 +340,14 @@ async function launchMember(input: {
   let effectiveActionId: string = actionId;
   const attempt = (seat.launch?.attempt ?? 0) + 1;
   const taskSha = sha256Text(startup.task);
+  const effectiveAgentDefinition = structuredClone(settings.definition);
+  const { projection: agentDefinition, fingerprint: agentFingerprint } =
+    launchDefinition(effectiveAgentDefinition);
   const proxyCaller = process.env[FLEET_PROXY_STATE_DIR_ENV]
     ? process.env[FLEET_PROXY_CALLER_ENV] : undefined;
   updateMemberStartup(provision.roomId, member.name, { launch: {
     state: 'intent', attempt, action_id: actionId, mission_sha256: taskSha,
+    agent_definition: agentDefinition, agent_fingerprint: agentFingerprint,
     ...(proxyCaller ? { caller_role: proxyCaller } : {}),
     updated_at: new Date().toISOString(),
   } });
@@ -331,13 +356,7 @@ async function launchMember(input: {
       name: member.name,
       temp: true,
       identity: member.name,
-      mission: startup.task,
-      model: settings.model,
-      harness: settings.harness,
-      cwd: settings.cwd,
-      approval: settings.approval,
-      filesystem: settings.filesystem,
-      unattended: settings.unattended,
+      agentDefinition: settings.definition,
       surface: 'agent',
       creationActionId: actionId,
       roomMemberStartup: startup,
@@ -347,7 +366,8 @@ async function launchMember(input: {
     if (launched.creationActionId !== actionId) {
       updateMemberStartup(provision.roomId, member.name, { launch: {
         state: 'intent', attempt, action_id: launched.creationActionId,
-        mission_sha256: taskSha, updated_at: new Date().toISOString(),
+        mission_sha256: taskSha, agent_definition: agentDefinition,
+        agent_fingerprint: agentFingerprint, updated_at: new Date().toISOString(),
         ...(launched.callerRole ? { caller_role: launched.callerRole } : {}),
       } });
     }
@@ -360,12 +380,14 @@ async function launchMember(input: {
     }
     updateMemberStartup(provision.roomId, member.name, { launch: {
       state: 'launched', attempt, action_id: launched.creationActionId, mission_sha256: taskSha,
+      agent_definition: agentDefinition, agent_fingerprint: agentFingerprint,
       ...(launched.callerRole ? { caller_role: launched.callerRole } : {}),
       launch_id: supervisor.launchId, updated_at: new Date().toISOString(),
     } });
   } catch (error) {
     updateMemberStartup(provision.roomId, member.name, { launch: {
       state: 'failed', attempt, action_id: effectiveActionId, mission_sha256: taskSha,
+      agent_definition: agentDefinition, agent_fingerprint: agentFingerprint,
       ...(proxyCaller ? { caller_role: proxyCaller } : {}),
       updated_at: new Date().toISOString(),
       error: error instanceof Error ? error.message : String(error),
@@ -422,6 +444,8 @@ export async function provisionMembers(
   const { cfg, cowork, roomId, taskId, template } = input;
   const prefix = taskId ? shortId(taskId) : `room-${shortId(roomId)}`;
   const members = expandMembers(template, prefix);
+  // Resolve every Agent before persisting launch intent or touching Cowork membership.
+  const settings = new Map(members.map(member => [member.name, settingsFor(member, cfg)]));
   const existing = getRoomRecord(roomId);
   if (!existing?.room_identity_cid)
     throw new Error(`room ${roomId} has no pinned room identity CID`);
@@ -433,16 +457,26 @@ export async function provisionMembers(
     && members.every(member => persistedNames.has(member.name));
   if (!resuming) {
     advanceSaga(roomId, 'create_members', 3);
-    updateMemberSeats(roomId, members.map(member => ({
+    updateMemberSeats(roomId, members.map(member => {
+      const evidence = launchDefinition(settings.get(member.name)!.definition);
+      return ({
       role_name: member.name,
       slot: member.slot,
       cowork_role: member.coworkRole,
       seat_state: 'pending' as const,
-      launch: { state: 'pending' as const, attempt: 0, updated_at: new Date().toISOString() },
-    })));
+      launch: { state: 'pending' as const, attempt: 0,
+        agent_definition: evidence.projection, agent_fingerprint: evidence.fingerprint,
+        updated_at: new Date().toISOString() },
+    }); }));
+  } else {
+    for (const member of members) {
+      const seat = existing.member_seats.find(candidate => candidate.role_name === member.name)!;
+      const evidence = launchDefinition(settings.get(member.name)!.definition);
+      if (!seat.launch?.agent_fingerprint || seat.launch.agent_fingerprint !== evidence.fingerprint)
+        throw new Error(`Agent definition drift for ${member.name}; durable launch intent does not match current configuration`);
+    }
   }
 
-  const settings = new Map(members.map(member => [member.name, settingsFor(member, cfg)]));
   const tasks = new Map(members.map(member => [member.name, roomTask(
     input, member, settings.get(member.name)!, members, roomIdentityCid, ownerSeatCid,
   )]));

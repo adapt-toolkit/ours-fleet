@@ -126,19 +126,16 @@ ours-fleet spawn Worker --mission "own the worker repo" \
 ours-fleet spawn --temp Scout --mission "one-off research"   # gone on exit/reboot
 
 # Codex role: ours-codex is preferred automatically; plain codex is the fallback
-ours-fleet spawn Coder --harness codex --model gpt-5.4 \
-  --session acp --approval ask --filesystem workspace \
-  --profile fleet --search --monitor --coordinator FleetCoordinator
-# Note: --monitor is legacy consent for Codex's native monitor. Choose the
-# wake owner separately in fleet.yaml with monitor.mode: fleet|native.
+ours-fleet spawn Coder --brain codex-fleet --role developer \
+  --approval ask --filesystem workspace --coordinator FleetCoordinator
 ```
 
 Inside a managed ACP role, `ours-fleet spawn` is transparently routed through
-that role's live supervisor. `ours-fleet spawn --role DeveloperX --temp` is the
-minimal form: omitted harness, session, cwd, coordinator, neutral permissions,
-fleet monitor policy, and same-harness model inherit from the caller. Explicit
-flags win; changing harness without a model lets the selected harness/fleet
-defaults choose one. After creation succeeds, fleet can deterministically notify
+that role's live supervisor. `ours-fleet spawn DeveloperX --temp` is the
+minimal form: omitted Brain/Role selections, cwd, coordinator, neutral permissions,
+and fleet monitor policy inherit from the caller. Identity, environment, owner routing,
+room startup, and sensitive inline Brain values do not. Explicit flags win. After
+creation succeeds, fleet can deterministically notify
 the caller's owner channel with the caller and spawned-role details. This is an
 honest-actor convenience and attribution path, not a security boundary; host
 shells and deliberately bypassed absolute binaries retain direct behavior.
@@ -305,7 +302,7 @@ ours-fleet up|down|restart|force-restart [-c FILE] [Name...]
 ours-fleet config [-c FILE]         validate + print merged plan
 ours-fleet ls | attach | peek | logs [-f] | status <Name>
 ours-fleet send <Name> "text"
-ours-fleet spawn [--temp] [<Name> | --role <Name>] [--harness --session --mission --model --approval ...]
+ours-fleet spawn [--temp] [<Name> | --name <Name>] --brain <ID|inline:{...}> --role <ID|inline:{...}> [--approval ...]
 ours-fleet loops validate|list|status
 ours-fleet loops reload <Role>
 ours-fleet loops run-now|disable|enable <Role> <Loop>
@@ -359,13 +356,9 @@ defaults:
     max_kb: 1024                        # rotate only above this active-log size
     keep_tail_kb: 256                   # UTF-8 tail; line-aligned when one fits
     max_archives: 12                    # recent beside log; older preserved cold
-Agent document:
-  Name:                                 # filename stem; [A-Za-z0-9_-]+
-    harness: claude-code
-    session: acp                         # optional; ACP is the only supported session
-    session_options:
-      acp:
-        command: claude-agent-acp        # optional advanced override
+Agent document (\`~/fleet/agents/Name.yaml\`):
+  role: { ref: RoleID }
+  brain: { ref: BrainID }                # Brain owns harness/model/session/reasoning
     identity: "Display Name"            # ours identity to bind (default: Name)
     cwd: ${work_root}/repo              # where the harness process runs
     coordinator: FleetCoordinator       # announce target on boot
@@ -1051,10 +1044,9 @@ harness_options:
   config: { model_reasoning_effort: high }
 ```
 
-Equivalent one-off/permanent spawn controls include `--model`, `--permission-mode`,
-`--sandbox`, `--profile`, `--launcher`, `--search`, legacy `--monitor` (native
-Codex monitor consent), repeatable
-`--codex-config key=value`, and repeatable `--add-dir`. Use `env.OURS_PORT`/`env.OURS_CONFIG` for a
+One-off/permanent spawn selects a Brain that owns model, reasoning, native permission,
+sandbox, profile, launcher, search, monitor consent, native config, and additional roots.
+Use `env.OURS_PORT`/`env.OURS_CONFIG` for a
 role-specific ours daemon, or configure the host default in `~/.ours/config.json`.
 
 ## Agent isolation

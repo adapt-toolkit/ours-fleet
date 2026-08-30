@@ -21,7 +21,7 @@ export interface RoleModelEnvInput {
   harness: string;
   /** Already resolved by `resolveRoleModel` — may come from the fleet default. */
   model: string | undefined;
-  /** True when the role (or `--model`) named a model, including `model: null`. */
+  /** True when the resolved Brain named a model, including `model: null`. */
   modelWasExplicit: boolean;
   defaultsEnv?: Record<string, string>;
   roleEnv?: Record<string, string>;
@@ -42,7 +42,7 @@ export interface RoleModelEnv {
  * never disagree.
  *
  * Precedence, highest first:
- *   1. an explicit `model:` / `--model` on the role
+ *   1. an explicit `model:` on the resolved Brain
  *   2. the role's own `env:` pin
  *   3. the fleet `defaults.model`
  *   4. the fleet `defaults.env` pin

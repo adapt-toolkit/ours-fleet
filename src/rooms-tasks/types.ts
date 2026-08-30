@@ -143,6 +143,9 @@ export interface RoomMemberLaunchState {
   /** Expected authenticated proxy caller while adopting a post-spawn crash. */
   caller_role?: string;
   mission_sha256?: string;
+  /** Redacted, deterministic effective Agent launch definition retained for retry inspection. */
+  agent_definition?: Record<string, unknown>;
+  agent_fingerprint?: string;
   launch_id?: string;
   updated_at: string;
   error?: string;
@@ -229,20 +232,8 @@ export interface TemplateMemberSlot {
   slot: string;
   role: string;
   count: number;
-  role_ref: string;
-  overrides?: TemplateRoleOverrides;
-}
-
-export interface TemplateRoleOverrides {
-  harness?: string;
-  model?: string;
-  model_chain?: string[];
-  permissions?: Record<string, unknown>;
-  isolation?: Record<string, unknown>;
-  cwd?: string;
-  env?: Record<string, string>;
-  persona?: string;
-  mission?: string;
+  /** Canonical Agent definition, or stable reference to a declared Agent. */
+  agent: import('../config.js').AgentDefinition | { ref: string };
 }
 
 export interface TemplateRoomConfig {
@@ -307,7 +298,4 @@ export const ROOMS_COWORK_KEYS = ['config'] as const;
 export const ROOMS_DEFAULTS_KEYS = ['template', 'attach_owner', 'close_when_task_done'] as const;
 export const TASKS_KEYS = ['default_room_template', 'create_mode', 'close_room_on_done', 'retain_completed_for'] as const;
 export const TEMPLATE_KEYS = ['version', 'description', 'room', 'contract', 'members', 'override_builtin'] as const;
-export const TEMPLATE_MEMBER_KEYS = ['slot', 'role', 'count', 'role_ref', 'overrides'] as const;
-export const TEMPLATE_OVERRIDE_KEYS = [
-  'harness', 'model', 'model_chain', 'permissions', 'isolation', 'cwd', 'env', 'persona', 'mission',
-] as const;
+export const TEMPLATE_MEMBER_KEYS = ['slot', 'role', 'count', 'agent'] as const;

@@ -38,7 +38,9 @@ describe('split-document fleet configuration service', () => {
     opened.model.agents.Beta = {
       role: { inline: { mission: 'Review' } }, brain: { inline: { harness: 'claude-code' } },
     };
-    opened.model.manifest.watchdogs = { health: { coordinator: 'Alpha' } };
+    opened.model.manifest.watchdogs = { health: { coordinator: 'Alpha', agent: {
+      role: { inline: {} }, brain: { inline: { harness: 'codex' } },
+    } } };
     opened.model.manifest.loops = { pass: { roles: ['*'], interval: '10m', prompt: 'check' } };
     const saved = await service.write(opened.revision, opened.model);
     expect(saved.diff).toContain('agents/Beta.yaml');

@@ -11,7 +11,7 @@ import {
   analyzeInstalls, buildInfo, buildLabel, discoverInstalls, runningLabel,
 } from './provenance.js';
 import { agentDir, agentsRoot, tmpRoot, logsRoot, deriveXdgRuntimeDir } from './paths.js';
-import { findRole, loadConfig, ROLE_NAME_RE } from './config.js';
+import { findRole, loadConfig, ROLE_NAME_RE, type AgentSelection } from './config.js';
 import type { YamlMode } from './config-yaml.js';
 import { formatDuration } from './duration.js';
 import { redactSensitive, resolvedPlan } from './resolved-plan.js';
@@ -97,7 +97,7 @@ const passthrough = (cmd: string, args: string[]) =>
 
 const program = new Command()
   .name('ours-fleet')
-  .description('Fleet of persistent, identity-bound AI agents — selectable harnesses over ACP sessions.')
+  .description('Fleet of persistent, identity-bound AI agents — canonical Brain + Role definitions over ACP sessions.')
   .enablePositionalOptions()
   .version(VERSION);
 
@@ -236,6 +236,19 @@ function parseCodexConfig(values: string[] | undefined): Record<string, string |
     else out[key] = value;
   }
   return out;
+}
+
+function parseAgentSelection(raw: string | undefined, kind: 'brain' | 'role'): AgentSelection | undefined {
+  if (raw === undefined) return undefined;
+  if (ROLE_NAME_RE.test(raw)) return { ref: raw };
+  if (!raw.startsWith('inline:'))
+    throw new Error(`invalid --${kind}; use a declared ID or inline:{...}`);
+  let value: unknown;
+  try { value = JSON.parse(raw.slice('inline:'.length)); }
+  catch { throw new Error(`invalid --${kind} inline mapping`); }
+  if (!value || typeof value !== 'object' || Array.isArray(value))
+    throw new Error(`invalid --${kind} inline mapping`);
+  return { inline: value as Record<string, unknown> };
 }
 
 cOpt(program.command('config').description('validate + print the merged plan (no side effects)'))
@@ -1023,49 +1036,31 @@ cOpt(program.command('rm <name>').description('stop + remove a role (temporary e
   });
 
 cOpt(program.command('spawn [name]').description('spawn a new agent (permanent by default)'))
-  .option('--role <name>', 'role name (alternative to the positional name)')
+  .option('--name <name>', 'agent name (alternative to the positional name)')
+  .option('--brain <selection>', 'Brain ID or inline:{...} definition')
+  .option('--role <selection>', 'Role ID or inline:{...} definition')
   .option('--temp', 'temporary: independent transient supervisor, archived on retirement, gone on reboot')
-  .option('--harness <id>', 'harness adapter (default: defaults.harness)')
-  .option('--session <backend>', 'session backend: acp (default: acp)')
-  .option('--mission <text>', 'one-line mission')
-  .option('--mission-file <path>', 'UTF-8 mission text (mutually exclusive with --mission)')
-  .option('--identity <name>', 'ours identity to bind (default: role name)')
+  .option('--identity <name>', 'ours identity to bind (default: Agent name)')
   .option('--cwd <dir>', 'working directory')
   .option('--coordinator <name>', 'announce target')
-  .option('--model <id>', 'model id to launch on (e.g. claude-fable-5); default: launcher default')
-  .option('--permission-mode <mode>', 'harness permission mode (Codex: untrusted|on-request|never; Claude: native values)')
   .option('--approval <mode>', 'fleet permission mode: ask|auto|allow (Codex ACP allow selects agent-full-access; deny is deprecated)')
   .option('--filesystem <mode>', 'common filesystem intent: read-only|workspace|unrestricted')
   .option('--unattended <mode>', 'permission behavior without a console: deny|wait')
-  .option('--sandbox <mode>', 'Codex sandbox: read-only|workspace-write|danger-full-access')
-  .option('--profile <name>', 'Codex profile file name ($CODEX_HOME/<name>.config.toml)')
-  .option('--launcher <mode>', 'Codex launcher: auto|ours-codex|codex (default: auto)')
-  .option('--search', 'enable Codex live web search')
-  .option('--codex-config <key=value>', 'Codex config override (repeatable)', collect, [])
-  .option('--add-dir <dir>', 'additional Codex writable directory (repeatable)', collect, [])
-  .option('--monitor', 'legacy: consent to arm Codex\'s native monitor (wake owner is monitor.mode in YAML)')
-  .option('--bio-file <file>', 'public bio (file)')
-  .option('--persona-file <file>', 'persona / operating contract (file)')
   .option('--isolation-file <path>', 'file holding an isolation: mapping (same schema as fleet.yaml)')
   .option('--dry-run', 'validate and print without reserving or creating anything')
   .option('--json', 'with --dry-run, emit a stable secret-safe JSON result')
   .action(async (name, opts) => {
     try {
-      const roleName = String(name ?? opts.role ?? '');
-      if (!roleName) throw new Error('role name is required (positional or --role)');
-      if (name && opts.role && name !== opts.role)
-        throw new Error(`positional role '${name}' conflicts with --role '${opts.role}'`);
+      const roleName = String(name ?? opts.name ?? '');
+      if (!roleName) throw new Error('agent name is required (positional or --name)');
+      if (name && opts.name && name !== opts.name)
+        throw new Error(`positional agent name conflicts with --name`);
       const o: SpawnOpts = {
-        name: roleName, temp: opts.temp, harness: opts.harness, session: opts.session, mission: opts.mission,
-        missionFile: opts.missionFile,
+        name: roleName, temp: opts.temp,
+        brain: parseAgentSelection(opts.brain, 'brain'), role: parseAgentSelection(opts.role, 'role'),
         identity: opts.identity, cwd: opts.cwd, coordinator: opts.coordinator,
-        model: opts.model,
-        permissionMode: opts.permissionMode, approval: opts.approval,
+        approval: opts.approval,
         filesystem: opts.filesystem, unattended: opts.unattended,
-        sandbox: opts.sandbox, profile: opts.profile,
-        launcher: opts.launcher, search: opts.search,
-        codexConfig: parseCodexConfig(opts.codexConfig), addDirs: opts.addDir, monitor: opts.monitor,
-        bioFile: opts.bioFile, personaFile: opts.personaFile,
         isolationFile: opts.isolationFile, configPath: opts.configuration,
         dryRun: opts.dryRun, json: opts.json,
       };
@@ -1092,7 +1087,7 @@ cOpt(program.command('spawn [name]').description('spawn a new agent (permanent b
       if (proxyStateDir) {
         // Paths entered in the agent shell belong to that shell's cwd, not the
         // supervisor process. Normalize before crossing the control boundary.
-        for (const key of ['missionFile', 'bioFile', 'personaFile', 'isolationFile'] as const) {
+        for (const key of ['isolationFile'] as const) {
           if (o[key]) o[key] = resolvePath(o[key]!);
         }
         const response = await controlRequest(
@@ -1361,4 +1356,11 @@ cOpt(program.command('_run-watchdogs', { hidden: true }))
     } catch (e) { die(e); }
   });
 
-program.parseAsync(process.argv);
+const spawnIndex = process.argv.indexOf('spawn');
+if (spawnIndex >= 0 && process.argv.slice(spawnIndex + 1).some(arg =>
+  arg === '--harness' || arg.startsWith('--harness=') || arg === '--model' || arg.startsWith('--model='))) {
+  console.error('error: --harness and --model were removed; select a Brain with --brain');
+  process.exitCode = 1;
+} else {
+  program.parseAsync(process.argv);
+}
