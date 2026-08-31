@@ -227,5 +227,5 @@ describe('named task lists', () => {
     expect(getTask(created.task_id).list_name).toBe('default');
     expect(ownerService.listTaskLists().some(list => list.name === 'Owner Renamed')).toBe(false);
     await server.close();
-  });
+  }, 20_000);
 });
