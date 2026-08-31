@@ -63,6 +63,10 @@ describe('packed root package', () => {
         const { makeCodexAdapter } = await import(
           pathToFileURL(join(fleetRoot, 'dist', 'harness', 'codex.js')).href
         );
+        const { bootstrapPresets } = await import(
+          pathToFileURL(join(fleetRoot, 'dist', 'preset-bootstrap.js')).href
+        );
+        const seeded = bootstrapPresets(join(process.cwd(), 'seeded', 'alternate.yaml'));
         let transportOptions;
         const adapter = makeCodexAdapter(
           async cmd => ({ code: cmd === 'sh' ? 1 : 0, stdout: '', stderr: '' }),
@@ -97,6 +101,12 @@ describe('packed root package', () => {
             sandbox: prep.env.OURS_FLEET_CODEX_SANDBOX,
             initialAgentMode: launch.env.INITIAL_AGENT_MODE,
           },
+          presets: {
+            revision: seeded.revision,
+            created: seeded.created.length,
+            team: existsSync(join(process.cwd(), 'seeded', 'alternate', 'room_templates', 'team.yaml')),
+            tester: existsSync(join(process.cwd(), 'seeded', 'alternate', 'roles', 'Tester.yaml')),
+          },
         }));
       `;
       const result = JSON.parse(execFileSync(process.execPath, [
@@ -120,6 +130,7 @@ describe('packed root package', () => {
         sandbox: 'danger-full-access',
         initialAgentMode: 'agent-full-access',
       });
+      expect(result.presets).toEqual({ revision: 1, created: 17, team: true, tester: true });
 
       writeFileSync(join(consumerWithoutOptionalDir, 'package.json'), JSON.stringify({
         private: true,

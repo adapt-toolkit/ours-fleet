@@ -39,6 +39,44 @@ afterEach(() => {
 });
 
 describe('Agent Role Brain split configuration', () => {
+  it('loads bare Room template files with provenance and deterministic manifest overrides', () => {
+    manifest();
+    kind('agents', 'Agent.yaml', 'role: { inline: {} }\nbrain: { inline: { harness: codex } }\n');
+    const templates = join(dir, 'fleet', 'room_templates');
+    mkdirSync(templates, { recursive: true });
+    chmodSync(templates, 0o700);
+    const file = join(templates, 'single.yaml');
+    writeFileSync(file, 'version: 1\ndescription: file\nmembers:\n  - { slot: agent, role: Agent, count: 1, agent: { ref: Agent } }\n');
+    chmodSync(file, 0o600);
+    const loaded = loadConfig();
+    expect(loaded.roomTemplates?.single).toMatchObject({ name: 'single', version: 1, sourceFile: file });
+    expect(loaded.sourceDocuments).toContainEqual({ kind: 'RoomTemplate', id: 'single', path: file });
+
+    manifest('room_templates:\n  single:\n    version: 1\n    description: hidden drift\n    members:\n      - { slot: agent, role: Agent, count: 1, agent: { ref: Agent } }\n');
+    expect(() => loadConfig()).toThrow(/shadows file preset.*override_builtin.*higher version/);
+    manifest('room_templates:\n  single:\n    version: 2\n    override_builtin: true\n    description: explicit migration override\n    members:\n      - { slot: agent, role: Agent, count: 1, agent: { ref: Agent } }\n');
+    const overridden = loadConfig();
+    expect(overridden.roomTemplates?.single).toMatchObject({
+      version: 2, description: 'explicit migration override', sourceFile: join(dir, 'fleet.yaml'),
+    });
+    expect(overridden.diagnostics).toEqual(expect.arrayContaining([
+      expect.objectContaining({ kind: 'deprecated-field', message: expect.stringContaining('override_builtin') }),
+    ]));
+  });
+
+  it('rejects duplicate yaml/yml Room template stems', () => {
+    manifest();
+    kind('agents', 'Agent.yaml', 'role: { inline: {} }\nbrain: { inline: { harness: codex } }\n');
+    const templates = join(dir, 'fleet', 'room_templates');
+    mkdirSync(templates, { recursive: true });
+    chmodSync(templates, 0o700);
+    for (const filename of ['single.yaml', 'single.yml']) {
+      writeFileSync(join(templates, filename), 'version: 1\ndescription: x\nmembers: [{ slot: a, role: A, count: 1, agent: { ref: Agent } }]\n');
+      chmodSync(join(templates, filename), 0o600);
+    }
+    expect(() => loadConfig()).toThrow(/E_DUPLICATE_ID.*room template 'single'/);
+  });
+
   it('composes preset Role and Brain into one runtime role', () => {
     manifest('vars:\n  root: /work\n');
     kind('roles', 'developer.yaml', 'mission: Build it\npersona: Be precise\nbio: Developer\n');

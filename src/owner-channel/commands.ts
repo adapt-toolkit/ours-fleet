@@ -699,10 +699,8 @@ export const ownerCommands: OwnerCommand[] = [
     execute: noArgs('/templates', async ctx => {
       const templates = ctx.listTemplateQueries();
       if (!templates.length) return ctx.reply('📐 No templates.');
-      const lines = templates.map(t => {
-        const tag = t.builtin ? ' (built-in)' : '';
-        return `${t.name}@${t.version}${tag}  ${t.description}`;
-      });
+      const lines = templates.map(t =>
+        `${t.name}@${t.version}  ${t.description}  [file: ${t.sourceFile ?? 'manifest'}]`);
       await ctx.reply(`📐 Templates:\n${lines.join('\n')}`);
     }),
   },
@@ -725,7 +723,7 @@ export const ownerCommands: OwnerCommand[] = [
         const lines = [
           `📐 Template: ${t.name}@${t.version}`,
           `Description: ${t.description}`,
-          ...(t.builtin ? ['Source: built-in'] : []),
+          `Source: ${t.sourceFile ?? 'manifest'}`,
           ...(t.contract ? [`Contract: ${t.contract}`] : []),
           'Members:',
           ...t.members.map(m => `  ${m.slot} (${m.role}) ×${m.count} → `
@@ -743,10 +741,8 @@ export const ownerCommands: OwnerCommand[] = [
         case 'list': {
           const templates = ctx.listTemplateQueries();
           if (!templates.length) return ctx.reply('📐 No templates.');
-          const lines = templates.map(t => {
-            const tag = t.builtin ? ' (built-in)' : '';
-            return `${t.name}@${t.version}${tag}  ${t.description}`;
-          });
+          const lines = templates.map(t =>
+            `${t.name}@${t.version}  ${t.description}  [file: ${t.sourceFile ?? 'manifest'}]`);
           await ctx.reply(`📐 Templates:\n${lines.join('\n')}`);
           break;
         }

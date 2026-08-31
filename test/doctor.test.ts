@@ -884,9 +884,12 @@ describe('doctor rooms-tasks checks', () => {
     expect(dt.detail).toContain('not found');
   });
 
-  it('passes default template when it resolves to a builtin', async () => {
+  it('passes default template when it resolves to configured YAML', async () => {
     registerAdapter(fakeAdapter);
-    writeCfg(ROOMS_YAML(CID_64, '  defaults:\n    template: team\n'));
+    writeCfg(ROOMS_YAML(CID_64, '  defaults:\n    template: team\n')
+      + 'room_templates:\n  team:\n    version: 1\n    description: configured team\n'
+      + '    members:\n      - slot: dev\n        role: Dev\n        count: 1\n'
+      + '        agent: { role: { inline: {} }, brain: { inline: { harness: fake } } }\n');
     const rep = await run();
     const dt = rep.checks.find(c => c.name === 'rooms: default template')!;
     expect(dt.ok).toBe(true);

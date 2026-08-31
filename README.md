@@ -43,7 +43,7 @@ brain: { inline: { harness: codex, session: acp } }
 ## How it works
 
 ```
-~/fleet.yaml + ~/fleet/{agents,roles,brains}/*.yaml   your declaration
+~/fleet.yaml + ~/fleet/{agents,roles,brains,room_templates}/*.yaml   your declaration
         │  ours-fleet up
         ▼
 briefing.md per role  ──►  agent session adapter  ──►  ACP client/session  ──►  ACP agent
@@ -91,7 +91,7 @@ equivalent); logs land in `~/.ours-fleet/logs/`.
 
 ```sh
 npm i -g @ours.network/fleet
-ours-fleet init      # units/dirs/linger for this user
+ours-fleet init      # units/dirs/linger + missing standard presets
 ours-fleet doctor    # verifies everything above, with actionable messages
 ```
 
@@ -107,8 +107,8 @@ become that account and repeat.
 ## Quickstart
 
 ```sh
-cp -R "$(npm root -g)/@ours.network/fleet/examples/fleet" ~/fleet
-cp "$(npm root -g)/@ours.network/fleet/examples/fleet.yaml" ~/fleet.yaml
+ours-fleet init               # safe to repeat: creates missing files, never replaces edits
+ours-fleet config             # validates Agents, Roles, Brains, and Room templates
 $EDITOR ~/fleet/agents/*.yaml # compose Role + Brain and operational settings
 ours-fleet up                 # boot the fleet (staggered)
 ours-fleet ls                 # running consoles
@@ -441,6 +441,25 @@ processes. `ours-mcp proxy` is client-only and never starts a daemon; operators 
 installer/setup flows remain responsible for starting it.
 
 ### Rooms and tasks
+
+Init installs editable `single`, `pair`, and `team` definitions under
+`~/fleet/room_templates/`, plus every exact-cased Agent, Role, and Brain they
+reference. Inspect them with `ours-fleet template list` and
+`ours-fleet template show team`. After configuring the authenticated owner below:
+
+```sh
+ours-fleet task create --title "Solo task" --template single
+ours-fleet task create --title "Reviewed change" --template pair
+ours-fleet task create --title "Phased delivery" --template team
+```
+
+`ours-fleet init -c /path/custom.yaml` seeds `/path/custom/` instead. Init reports
+the packaged preset revision and source directory and only seeds missing files.
+It never upgrades an edited preset. To adopt a newer packaged file explicitly,
+copy the reported source file beside the existing target as `.new-default`, review
+`diff -u`, then replace the target yourself. This is the sole adoption operation;
+rerunning init is not an update. Users upgrading from hardcoded templates should
+run init once (with the same `-c` selection they normally use).
 
 Rooms always use `ours-cowork`; there is no room-provider selector. Configure
 the cowork daemon connection and the room owner directly:

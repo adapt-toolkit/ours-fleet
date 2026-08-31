@@ -18,7 +18,7 @@ import { isSensitiveConfigKey } from '../sensitive-config.js';
 export const REDACTED_ENV_VALUE = '__OURS_FLEET_SECRET_REDACTED__';
 const MAX_CONFIG_BYTES = 256 * 1024;
 const DIFF_CONTEXT_LINES = 3;
-const KINDS = ['agents', 'roles', 'brains'] as const;
+const KINDS = ['agents', 'roles', 'brains', 'room_templates'] as const;
 
 export interface EditableFleetModel {
   manifest: Record<string, unknown>;
@@ -199,7 +199,8 @@ function readSources(manifest: string): SourceSet {
     if (!existsSync(dir)) { if (kind === 'agents') throw new FleetError('invalid_request', `required Agent root missing: ${dir}`); continue; }
     trustedDirectory(dir);
     for (const name of readdirSync(dir).sort()) {
-      if (kind === 'agents' && !['.yaml', '.yml'].includes(extname(name).toLowerCase())) continue;
+      if ((kind === 'agents' || kind === 'room_templates')
+          && !['.yaml', '.yml'].includes(extname(name).toLowerCase())) continue;
       documents.set(join(kind, name), trustedFile(join(dir, name)));
     }
   }
@@ -240,7 +241,9 @@ function renderProposal(current: SourceSet, model: EditableFleetModel): Map<stri
     next.set(oldRel ?? join('agents', `${id}.yaml`), oldRel
       ? render(current.documents.get(oldRel)!, doc) : stringify(doc));
   }
-  for (const [rel, source] of current.documents) if (rel.startsWith('roles/') || rel.startsWith('brains/')) next.set(rel, source);
+  for (const [rel, source] of current.documents) if (
+    rel.startsWith('roles/') || rel.startsWith('brains/') || rel.startsWith('room_templates/')
+  ) next.set(rel, source);
   return next;
 }
 

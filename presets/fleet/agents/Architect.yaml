@@ -1,0 +1,3 @@
+role: { ref: Architect }
+brain: { ref: claude-default }
+permissions: { approval: ask, filesystem: workspace, unattended: deny }
