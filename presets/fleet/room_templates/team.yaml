@@ -7,6 +7,6 @@ contract: |
   Tester verifies spec conformance and test coverage.
   Completion requires tester sign-off.
 members:
-  - { slot: architect, role: Architect, count: 1, agent: { ref: Architect } }
-  - { slot: developer, role: Developer, count: 1, agent: { ref: Developer } }
-  - { slot: tester, role: Tester, count: 1, agent: { ref: Tester } }
+  - { slot: architect, role: Architect, count: 1, agent_template: Architect }
+  - { slot: developer, role: Developer, count: 1, agent_template: Developer }
+  - { slot: tester, role: Tester, count: 1, agent_template: Tester }

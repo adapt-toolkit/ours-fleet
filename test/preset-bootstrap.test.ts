@@ -6,7 +6,7 @@ import {
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { bootstrapPresets } from '../src/preset-bootstrap.js';
-import { loadConfig } from '../src/config.js';
+import { loadConfig, validateEffectiveAgentTemplate } from '../src/config.js';
 import { listTemplates } from '../src/rooms-tasks/templates.js';
 import '../src/harness/claude-code.js';
 import '../src/harness/codex.js';
@@ -19,8 +19,8 @@ describe('packaged preset bootstrap', () => {
   it('materializes a complete resolvable standard configuration at an explicit root', () => {
     const configPath = join(root, 'alternate.yaml');
     const seeded = bootstrapPresets(configPath);
-    expect(seeded.revision).toBe(1);
-    expect(seeded.created).toHaveLength(17);
+    expect(seeded.revision).toBe(3);
+    expect(seeded.created).toHaveLength(66);
     const cfg = loadConfig(configPath);
     expect(listTemplates(cfg.roomTemplates ?? {}).map(template => template.name))
       .toEqual(['pair', 'single', 'team']);
@@ -29,15 +29,17 @@ describe('packaged preset bootstrap', () => {
     for (const template of listTemplates(cfg.roomTemplates ?? {})) {
       expect(template.sourceFile).toBe(join(root, 'alternate', 'room_templates', `${template.name}.yaml`));
       for (const member of template.members) {
-        expect('ref' in member.agent).toBe(true);
-        if (!('ref' in member.agent)) continue;
-        const definition = cfg.agentDefinitions?.[member.agent.ref];
-        expect(definition, `${template.name}:${member.agent.ref}`).toBeDefined();
-        expect(definition?.role).toEqual({ ref: member.role });
-        expect(definition?.brain).toEqual({ ref: 'claude-default' });
+        const definition = cfg.agentTemplates?.[member.agent_template];
+        expect(definition, `${template.name}:${member.agent_template}`).toBeDefined();
+        expect(definition?.role).toEqual({ inline: expect.objectContaining({}) });
+        expect(definition?.brain).toEqual({ inline: expect.objectContaining({ harness: 'claude-code' }) });
         expect(definition?.permissions).toMatchObject({ approval: 'ask', unattended: 'deny' });
       }
     }
+    expect(Object.keys(cfg.brainPresets ?? {})).toHaveLength(49);
+    for (const [id, brain] of Object.entries(cfg.brainPresets ?? {}))
+      expect(() => validateEffectiveAgentTemplate({ role: { inline: {} }, brain: { inline: brain } }, id))
+        .not.toThrow();
   });
 
   it('is repeatable and preserves edited and partial trees byte-for-byte', () => {
@@ -50,7 +52,7 @@ describe('packaged preset bootstrap', () => {
     expect(readFileSync(role, 'utf8')).toBe('mission: my edited contract\n');
     expect(existsSync(join(root, 'fleet', 'roles', 'Tester.yaml'))).toBe(true);
     expect(second.created).toEqual([join(root, 'fleet', 'roles', 'Tester.yaml')]);
-    expect(second.preserved).toHaveLength(16);
+    expect(second.preserved).toHaveLength(65);
   });
 
   it('creates private files and refuses symlink targets', () => {

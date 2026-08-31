@@ -73,10 +73,12 @@ describe('npm pack from a checkout with no dist', () => {
   it('ships the complete split default configuration referenced by init', () => {
     for (const path of [
       'presets/manifest.json',
+      'presets/brain-catalog.json',
       'presets/fleet.yaml',
       'presets/fleet/brains/claude-default.yaml',
+      'presets/fleet/agents/FleetCoordinator.yaml',
       ...['Agent', 'Secretary', 'Critic', 'Architect', 'Developer', 'Tester']
-        .flatMap(name => [`presets/fleet/agents/${name}.yaml`, `presets/fleet/roles/${name}.yaml`]),
+        .flatMap(name => [`presets/fleet/agent_templates/${name}.yaml`, `presets/fleet/roles/${name}.yaml`]),
       'presets/fleet/room_templates/single.yaml',
       'presets/fleet/room_templates/pair.yaml',
       'presets/fleet/room_templates/team.yaml',

@@ -1,0 +1,16 @@
+{
+  "schema_version": 1,
+  "catalog_revision": 1,
+  "models": [
+    { "harness": "codex", "session": "acp", "model": "gpt-5.6-sol", "efforts": ["low", "medium", "high", "xhigh", "max", "ultra"] },
+    { "harness": "codex", "session": "acp", "model": "gpt-5.6-terra", "efforts": ["low", "medium", "high", "xhigh", "max", "ultra"] },
+    { "harness": "codex", "session": "acp", "model": "gpt-5.6-luna", "efforts": ["low", "medium", "high", "xhigh", "max"] },
+    { "harness": "codex", "session": "acp", "model": "gpt-5.5", "efforts": ["low", "medium", "high", "xhigh"] },
+    { "harness": "codex", "session": "acp", "model": "gpt-5.4", "efforts": ["low", "medium", "high", "xhigh"] },
+    { "harness": "codex", "session": "acp", "model": "gpt-5.4-mini", "efforts": ["low", "medium", "high", "xhigh"] },
+    { "harness": "codex", "session": "acp", "model": "gpt-5.3-codex-spark", "efforts": ["low", "medium", "high", "xhigh"] },
+    { "harness": "claude-code", "session": "acp", "model": "claude-fable-5", "efforts": ["low", "medium", "high", "xhigh", "max"] },
+    { "harness": "claude-code", "session": "acp", "model": "claude-opus-5", "efforts": ["low", "medium", "high", "xhigh", "max"] },
+    { "harness": "claude-code", "session": "acp", "model": "claude-sonnet-5", "efforts": ["low", "medium", "high", "xhigh", "max"] }
+  ]
+}

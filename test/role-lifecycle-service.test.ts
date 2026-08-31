@@ -54,6 +54,16 @@ describe('RoleLifecycleService restart batches', () => {
       }));
     expect(h.restart).not.toHaveBeenCalled();
   });
+
+  it('distinguishes an inert template target from an ordinary missing role', async () => {
+    const h = service(['FleetCoordinator']);
+    const config = { ...cfg(['FleetCoordinator']), agentTemplates: { Secretary: {} } } as FleetConfig;
+    await expect(h.lifecycle.prepareRestart({ roleIds: ['Secretary'], mode: 'fresh', config }))
+      .rejects.toMatchObject({ code: 'capability_unavailable', message: expect.stringMatching(/inert Agent Template/) });
+    await expect(h.lifecycle.prepareRestart({ roleIds: ['Unknown'], mode: 'fresh', config }))
+      .rejects.toMatchObject({ code: 'role_not_found', message: "no such role 'Unknown'" });
+    expect(h.restart).not.toHaveBeenCalled();
+  });
 });
 
 describe('restart-resume adapter parity', () => {
@@ -113,6 +123,13 @@ describe('restart-resume adapter parity', () => {
         await h.lifecycle.executeRestart(plan);
       }, reply: vi.fn(async () => undefined),
     } as any)).rejects.toMatchObject({ code: 'role_not_found' });
+    expect(h.effects).toEqual([]);
+  });
+
+  it('rejects an inert template through the command service before recording effects', async () => {
+    const h = harness();
+    await expect(h.commands.execute({ roleId: 'Agent', action: 'start', actionId: 'template' }))
+      .rejects.toMatchObject({ code: 'capability_unavailable', message: expect.stringMatching(/inert Agent Template/) });
     expect(h.effects).toEqual([]);
   });
 });

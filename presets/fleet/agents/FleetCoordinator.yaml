@@ -1,0 +1,4 @@
+template: Agent
+overrides:
+  role: { ref: Agent }
+  coordinator: FleetCoordinator

@@ -44,7 +44,7 @@ afterEach(() => {
 
 const TEST_TEMPLATE: TemplateDefinition = {
   name: 'team', version: 1, description: 'test team', sourceFile: '/config/team.yaml',
-  members: [{ slot: 'dev', role: 'Developer', count: 1, agent: { ref: 'Developer' } }],
+  members: [{ slot: 'dev', role: 'Developer', count: 1, agent_template: 'Developer' }],
 };
 const TEST_TEMPLATES = { team: TEST_TEMPLATE };
 
@@ -68,7 +68,7 @@ describe('templates', () => {
     });
 
     it('resolves a solo-agent template', () => {
-      const single = { ...TEST_TEMPLATE, name: 'single', members: [{ slot: 'agent', role: 'Agent', count: 1, agent: { ref: 'Agent' } }] };
+      const single = { ...TEST_TEMPLATE, name: 'single', members: [{ slot: 'agent', role: 'Agent', count: 1, agent_template: 'Agent' }] };
       const t = resolveTemplate('single', { single });
       expect(t).toBeDefined();
       expect(t!.members).toHaveLength(1);
@@ -813,7 +813,7 @@ describe('config validation', () => {
     const validTemplate = {
       version: 1,
       description: 'Test template',
-      members: [{ slot: 'dev', role: 'Developer', count: 2, agent: { ref: 'Dev' } }],
+      members: [{ slot: 'dev', role: 'Developer', count: 2, agent_template: 'Dev' }],
     };
 
     it('accepts valid template', () => {
@@ -836,13 +836,13 @@ describe('config validation', () => {
 
     it('rejects missing version', () => {
       expect(() => validateRoomTemplatesConfig({
-        't': { description: 'x', members: [{ slot: 'a', role: 'A', count: 1, agent: { ref: 'A' } }] },
+        't': { description: 'x', members: [{ slot: 'a', role: 'A', count: 1, agent_template: 'A' }] },
       }, 'test')).toThrow(/version.*required positive integer/);
     });
 
     it('rejects missing description', () => {
       expect(() => validateRoomTemplatesConfig({
-        't': { version: 1, members: [{ slot: 'a', role: 'A', count: 1, agent: { ref: 'A' } }] },
+        't': { version: 1, members: [{ slot: 'a', role: 'A', count: 1, agent_template: 'A' }] },
       }, 'test')).toThrow(/description.*required string/);
     });
 
@@ -856,6 +856,13 @@ describe('config validation', () => {
       expect(() => validateRoomTemplatesConfig({
         't': { version: 1, description: 'x', members: [{ slot: 'a' }] },
       }, 'test')).toThrow(/role.*required string/);
+    });
+
+    it('rejects duplicate member slots', () => {
+      expect(() => validateRoomTemplatesConfig({ t: { ...validTemplate, members: [
+        { slot: 'dev', role: 'Developer', count: 1, agent_template: 'Dev' },
+        { slot: 'dev', role: 'Tester', count: 1, agent_template: 'Test' },
+      ] } }, 'test')).toThrow("duplicate slot 'dev'");
     });
 
     it('accepts a standard name because authority is file-backed', () => {
@@ -884,13 +891,13 @@ describe('config validation', () => {
       expect(() => validateRoomTemplatesConfig({
         't': {
           version: 1, description: 'x',
-          members: [{ slot: 'a', role: 'A', count: 1, agent: { ref: 'A' }, overrides: { bad: true } }],
+          members: [{ slot: 'a', role: 'A', count: 1, agent_template: 'A', overrides: { bad: true } }],
         },
       }, 'test')).toThrow(/unknown key.*overrides/);
     });
 
-    it('accepts a canonical inline Agent', () => {
-      const cfg = validateRoomTemplatesConfig({
+    it('rejects legacy inline or persistent Agent coupling actionably', () => {
+      expect(() => validateRoomTemplatesConfig({
         't': {
           version: 1, description: 'x',
           members: [{
@@ -899,8 +906,7 @@ describe('config validation', () => {
               role: { inline: { persona: 'test' } } },
           }],
         },
-      }, 'test');
-      expect(cfg.t.members[0].agent).toBeDefined();
+      }, 'test')).toThrow(/persistent Agent references are no longer allowed.*agent_template/);
     });
   });
 

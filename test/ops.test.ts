@@ -17,6 +17,7 @@ import type { Liveness, SupervisorBackend } from '../src/supervisor/types.js';
 import { makeTempSupervisorLauncher, prepareTempSupervisor, tempSystemdUnit } from '../src/temp-lifecycle.js';
 import { writeV2Fixture } from './v2-fixture.js';
 import { recordGeneratedAgentSource } from '../src/generated-agent-source.js';
+import { bootstrapPresets } from '../src/preset-bootstrap.js';
 
 let dir: string;
 beforeEach(() => {
@@ -248,7 +249,7 @@ describe('up / down / restart', () => {
     expect(logs.join('\n')).not.toContain('maybe not running');   // the old guess
   });
 
-  it('down targets an exact state-backed temporary role absent from merged YAML', async () => {
+  it('down refuses a state-backed temporary role absent from declared persistent Agents', async () => {
     writeCfg({ A: { harness: 'fake' } });
     const tempDir = agentDir('Temp', true);
     mkdirSync(tempDir, { recursive: true });
@@ -265,11 +266,10 @@ describe('up / down / restart', () => {
       return { stdout: '', stderr: '', code: 0 };
     };
 
-    await down(loadConfig(), ['Temp'], d);
-
-    expect(commands).toEqual([['systemctl', '--user', 'stop', tempSystemdUnit('Temp')]]);
-    expect(calls).toEqual([]); // no permanent backend was guessed
-    expect(logs.join('\n')).toContain('temporary role Temp');
+    await expect(down(loadConfig(), ['Temp'], d)).rejects.toThrow(/no such role 'Temp'/);
+    expect(commands).toEqual([]);
+    expect(calls).toEqual([]);
+    expect(logs).toEqual([]);
   });
 
   it('restart fresh clears markers then bounces', async () => {
@@ -282,6 +282,34 @@ describe('up / down / restart', () => {
     await restartRoles(loadConfig(), ['A'], d, 'fresh');
     expect(existsSync(join(stateDir, '.booted'))).toBe(false);
     expect(calls).toContainEqual(['restart', 'A']);
+  });
+
+  it('fresh defaults force-restart only FleetCoordinator and keep templates inert', async () => {
+    const configPath = join(dir, 'fleet.yaml'); bootstrapPresets(configPath);
+    const config = loadConfig(configPath);
+    expect(config.roles.map(role => role.name)).toEqual(['FleetCoordinator']);
+    const { calls, backend } = fakeBackend(); const { d } = deps(backend);
+    await restartRoles(config, [], d, 'fresh', configPath);
+    expect(calls.filter(call => call[0] === 'restart')).toEqual([['restart', 'FleetCoordinator']]);
+    const before = [...calls];
+    await expect(up(config, ['Secretary'], d, configPath)).rejects.toThrow(/inert Agent Template/);
+    await expect(down(config, ['Secretary'], d)).rejects.toThrow(/inert Agent Template/);
+    await expect(restartRoles(config, ['Secretary'], d, 'keep', configPath))
+      .rejects.toThrow(/inert Agent Template/);
+    expect(calls).toEqual(before);
+    await expect(restartRoles(config, ['DoesNotExist'], d, 'keep', configPath))
+      .rejects.toThrow(/no such role 'DoesNotExist'/);
+  });
+
+  it('a persistent Agent reusing a template remains independently lifecycle-targetable', async () => {
+    const configPath = join(dir, 'fleet.yaml'); bootstrapPresets(configPath);
+    const instance = join(dir, 'fleet', 'agents', 'SecretaryInstance.yaml');
+    writeFileSync(instance, 'template: Secretary\noverrides:\n  identity: SecretaryInstance\n', { mode: 0o600 });
+    const config = loadConfig(configPath);
+    const { calls, backend } = fakeBackend(); const { d } = deps(backend);
+    await restartRoles(config, ['SecretaryInstance'], d, 'keep', configPath);
+    expect(calls).toContainEqual(['restart', 'SecretaryInstance']);
+    expect(calls).not.toContainEqual(['restart', 'Secretary']);
   });
 
   it('up records the given configPath in each role\'s .config-path marker', async () => {

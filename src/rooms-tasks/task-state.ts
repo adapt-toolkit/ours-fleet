@@ -127,6 +127,7 @@ export interface CreateTaskInput {
   brief?: string;
   brief_file?: string;
   template?: TaskTemplateRef;
+  execution_plan?: TaskRecord['execution_plan'];
   origin: TaskOrigin;
   idempotency_key?: string;
   start?: boolean;
@@ -138,7 +139,13 @@ export interface CreateTaskInput {
 export function createTask(input: CreateTaskInput): TaskRecord {
   const key = input.idempotency_key ?? randomUUID();
   const existing = findByIdempotencyKey(key);
-  if (existing) return existing;
+  if (existing) {
+    const existingPlan = existing.execution_plan?.plan_hash;
+    const requestedPlan = input.execution_plan?.plan_hash;
+    if (existingPlan !== requestedPlan)
+      throw new TaskStateError(`idempotency key '${key}' was already used with a different execution plan`);
+    return existing;
+  }
 
   const state: TaskState = input.start === false ? 'backlog' : 'provisioning';
   const record: StoredTaskRecord = {
@@ -149,6 +156,7 @@ export function createTask(input: CreateTaskInput): TaskRecord {
     brief_file: input.brief_file,
     state,
     template: input.template,
+    execution_plan: input.execution_plan,
     no_room: input.no_room || undefined,
     room_id: input.room_id,
     member_roles: [],
@@ -162,6 +170,21 @@ export function createTask(input: CreateTaskInput): TaskRecord {
 }
 
 export function getTask(id: string): TaskRecord { return withTaskLock(id, () => readTask(id)); }
+
+export function updateTaskExecutionPlan(
+  id: string, executionPlan: NonNullable<TaskRecord['execution_plan']>,
+): TaskRecord {
+  return withTaskLock(id, () => {
+    const task = readTask(id);
+    if (task.execution_plan && task.execution_plan.plan_hash !== executionPlan.plan_hash)
+      throw new TaskStateError(`task ${id} execution plan mismatch`);
+    task.execution_plan = executionPlan;
+    task.template = { name: executionPlan.snapshot.name, version: executionPlan.snapshot.version,
+      content_hash: executionPlan.snapshot.content_hash };
+    writeTask(task);
+    return readTask(id);
+  });
+}
 
 export function listTasks(filter?: { state?: TaskState | TaskState[]; listId?: string }): TaskRecord[] {
   const dir = tasksDir();

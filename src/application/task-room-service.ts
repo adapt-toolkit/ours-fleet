@@ -15,13 +15,16 @@ import {
   moveTaskToList,
   reviewTask as persistReviewTask, startTask as transitionTask,
   TaskStateError, unblockTask as persistUnblockTask, updateTaskRoom, updateTaskTemplate,
+  updateTaskExecutionPlan,
 } from '../rooms-tasks/task-state.js';
 import {
   createTaskListLocked, DEFAULT_TASK_LIST_ID, deleteTaskListRecordLocked, readTaskLists,
   renameTaskListLocked, resolveTaskList, TaskListError, withTaskListsLock,
 } from '../rooms-tasks/task-lists.js';
+import { hashTemplate, listTemplates, resolveTemplate, sealTemplateSnapshot, snapshotTemplate } from '../rooms-tasks/templates.js';
+import { acquireLaunchSnapshotLock, releaseLaunchSnapshot } from '../rooms-tasks/launch-snapshot.js';
+import { hashMemberOverrides, prepareExecutionPlan, type MemberOverrides } from '../rooms-tasks/member-overrides.js';
 import { recordFleetAuditPresentation } from '../fleet-command-audit.js';
-import { hashTemplate, listTemplates, resolveTemplate, snapshotTemplate } from '../rooms-tasks/templates.js';
 import {
   acceptManagedRoomClose, deleteLegacyClosedRooms, deleteManagedRoom, recordManagedRoomCloseError,
 } from '../rooms-tasks/close.js';
@@ -77,6 +80,7 @@ export interface CreateTaskRequest {
   idempotencyKey?: string;
   origin: TaskOrigin;
   list?: string;
+  members?: MemberOverrides;
 }
 export interface CreateRoomRequest {
   actor: TaskRoomActor;
@@ -85,6 +89,7 @@ export interface CreateRoomRequest {
   goal?: string;
   brief?: string;
   briefFile?: string;
+  members?: MemberOverrides;
 }
 
 export interface TaskRoomServiceDeps {
@@ -153,19 +158,44 @@ export class TaskRoomApplicationService {
 
   async createTask(request: CreateTaskRequest): Promise<TaskRecord> {
     const cfg = (this.deps.loadConfiguration ?? loadConfig)(this.configurationPath);
-    const template = this.createTemplate(cfg, request.template, request.noRoom);
-    const ref = template && {
-      name: template.name, version: template.version, content_hash: template.content_hash,
-    };
+    let template = this.createTemplate(cfg, request.template, request.noRoom);
+    let launchDefinitions: Record<string, import('../config.js').AgentTemplateDefinition> | undefined;
+    let executionPlan: TaskRecord['execution_plan'];
+    let preparedPlan: ReturnType<typeof prepareExecutionPlan> | undefined;
+    if (template) {
+      const definition = resolveTemplate(template.name, cfg.roomTemplates ?? {})!;
+      preparedPlan = prepareExecutionPlan(definition, cfg, request.members ?? {});
+      launchDefinitions = preparedPlan.launchDefinitions;
+    }
     const brief = request.briefFile ? readFileSync(request.briefFile, 'utf8') : request.brief;
-    let task = await withTaskListsLock(() => {
-      const list = resolveTaskList(request.list ?? 'default');
-      return persistTask({
-        title: request.title, brief, brief_file: request.briefFile, template: ref,
-        origin: request.origin, idempotency_key: request.idempotencyKey,
-        start: !request.backlog, no_room: request.noRoom, listId: list.list_id,
+    const unlock = preparedPlan ? acquireLaunchSnapshotLock() : undefined;
+    let sealedHash: string | undefined;
+    let task: TaskRecord;
+    try {
+      if (preparedPlan) {
+        template = sealTemplateSnapshot(preparedPlan.snapshot, cfg.agentTemplates ?? {}, preparedPlan.launchDefinitions);
+        sealedHash = template.launch_snapshot_hash;
+        executionPlan = { schema_version: 1, snapshot: template, overrides: preparedPlan.overrides,
+          overrides_hash: preparedPlan.overridesHash,
+          plan_hash: preparedPlan.planHash };
+      }
+      const ref = template && { name: template.name, version: template.version, content_hash: template.content_hash };
+      task = await withTaskListsLock(() => {
+        const list = resolveTaskList(request.list ?? 'default');
+        return persistTask({
+          title: request.title, brief, brief_file: request.briefFile, template: ref,
+          execution_plan: executionPlan,
+          origin: request.origin, idempotency_key: request.idempotencyKey,
+          start: !request.backlog, no_room: request.noRoom, listId: list.list_id,
+        });
       });
-    });
+    } catch (error) {
+      unlock?.();
+      if (sealedHash) releaseLaunchSnapshot(sealedHash);
+      throw error;
+    }
+    unlock?.();
+    const ref = template && { name: template.name, version: template.version, content_hash: template.content_hash };
     recordFleetAuditPresentation({ kind: 'task', operation: 'create', id: task.task_id,
       title: task.title, previousState: 'none', newState: task.state, revision: task.created_at,
       list: task.list_name ?? 'default', roomId: task.room_id,
@@ -175,7 +205,7 @@ export class TaskRoomApplicationService {
       try {
         const room = await this.provisionRoom(cfg, task, template!, created => {
           task = updateTaskRoom(task.task_id, created.room_id, created.room_identity_cid!);
-        });
+        }, launchDefinitions);
         task = readTask(task.task_id);
         if (task.state === 'active' && room.state === 'active') recordFleetAuditPresentation({ kind: 'task', operation: 'work', id: task.task_id,
           title: task.title, previousState: 'provisioning', newState: task.state,
@@ -205,45 +235,21 @@ export class TaskRoomApplicationService {
       const definition = resolveTemplate(request.template, cfg.roomTemplates ?? {});
       if (!definition) throw new TaskRoomApplicationError(
         'template_not_found', `template not found: ${request.template}`, { template: request.template });
-      template = snapshotTemplate(definition);
+      if (request.members && Object.keys(request.members).length) {
+        const prepared = prepareExecutionPlan(definition, cfg, request.members);
+        template = prepared.snapshot;
+        return this.provisionRoom(cfg, { title: request.name, brief, goal: request.goal },
+          template, () => {}, prepared.launchDefinitions);
+      }
+      template = snapshotTemplate(definition, cfg.agentTemplates);
     }
     return this.provisionRoom(cfg, {
       title: request.name, brief, goal: request.goal,
     }, template, () => {});
   }
 
-  async startTask(input: { actor: TaskRoomActor; taskId: string }): Promise<TaskRecord> {
-    const cfg = (this.deps.loadConfiguration ?? loadConfig)(this.configurationPath);
-    let task = transitionTask(input.taskId);
-    recordFleetAuditPresentation({ kind: 'task', operation: 'start', id: task.task_id,
-      title: task.title, previousState: 'backlog', newState: task.state,
-      revision: task.started_at ?? task.created_at, list: task.list_name ?? 'default',
-      template: task.template ? `${task.template.name}@${task.template.version}` : undefined,
-      agents: [] });
-    if (task.template && !task.room_id) {
-      const template = this.existingTemplate(cfg, task);
-      try {
-        const room = await this.provisionRoom(cfg, task, template, created => {
-          task = updateTaskRoom(task.task_id, created.room_id, created.room_identity_cid!);
-        });
-        task = readTask(task.task_id);
-        if (task.state === 'active' && room.state === 'active') recordFleetAuditPresentation({ kind: 'task', operation: 'work', id: task.task_id,
-        title: task.title, previousState: 'provisioning', newState: task.state,
-        revision: getRoomRecord(task.room_id!)?.activated_at ?? task.started_at ?? task.created_at,
-        list: task.list_name ?? 'default', roomId: task.room_id,
-        template: task.template ? `${task.template.name}@${task.template.version}` : undefined,
-          agents: taskAgents(task) });
-        else recordFleetAuditPresentation({ kind: 'lifecycle_failure', resource: 'Task', id: task.task_id,
-          state: task.state, category: 'provision_pending', eventId: roomFailureEventId(room) });
-      } catch (error) {
-        const failed = task.room_id ? getRoomRecord(task.room_id) : undefined;
-        recordFleetAuditPresentation({ kind: 'lifecycle_failure', resource: 'Task', id: task.task_id,
-          state: readTask(task.task_id).state, category: 'provision_failed',
-          eventId: failed ? roomFailureEventId(failed) : task.created_at });
-        throw error;
-      }
-    }
-    return task;
+  async startTask(input: { actor: TaskRoomActor; taskId: string; template?: string; members?: MemberOverrides }): Promise<TaskRecord> {
+    return (await this.ensureTaskWork(input)).task;
   }
 
   listTasks(filter?: { state?: TaskState | TaskState[]; list?: string }): TaskRecord[] {
@@ -452,10 +458,9 @@ export class TaskRoomApplicationService {
     const cfg = (this.deps.loadConfiguration ?? loadConfig)(this.configurationPath);
     return listTemplates(cfg.roomTemplates ?? {}).flatMap(template => {
       const issues = template.members.flatMap(member => {
-        if (!('ref' in member.agent)) return [];
-        const ref = member.agent.ref;
-        return cfg.roles.some(role => role.name === ref)
-          ? [] : [`member ${member.slot}: Agent ref '${ref}' not found`];
+        const ref = member.agent_template;
+        return cfg.agentTemplates?.[ref]
+          ? [] : [`member ${member.slot}: Agent Template '${ref}' not found`];
       });
       return issues.length ? [{ template: `${template.name}@${template.version}`, issues }] : [];
     });
@@ -604,55 +609,100 @@ export class TaskRoomApplicationService {
   }
 
   async ensureTaskWork(input: {
-    actor: TaskRoomActor; taskId: string; template?: string;
+    actor: TaskRoomActor; taskId: string; template?: string; members?: MemberOverrides;
   }): Promise<{ task: TaskRecord; status: 'ready' | 'already_active' }> {
     const cfg = (this.deps.loadConfiguration ?? loadConfig)(this.configurationPath);
     let task = readTask(input.taskId);
     if (TASK_TERMINAL_STATES.includes(task.state)) throw new TaskRoomApplicationError(
       'task_terminal', 'task terminal', { task: input.taskId, state: task.state });
     if (task.state === 'active' && task.room_id) {
-      if (input.template) {
-        const definition = resolveTemplate(input.template, cfg.roomTemplates ?? {});
-        if (!definition) throw new TaskRoomApplicationError('template_not_found', 'template not found', { template: input.template });
-        const requested = snapshotTemplate(definition);
-        const pinned = getRoomRecord(task.room_id)?.template_snapshot ?? task.template;
-        if (pinned && (pinned.name !== requested.name || pinned.content_hash !== requested.content_hash))
+      if (input.template || input.members) {
+        const pinned = getRoomRecord(task.room_id)?.template_snapshot ?? task.execution_plan?.snapshot;
+        if (!pinned) throw new TaskRoomApplicationError('template_mismatch',
+          'active task has no durable execution plan', { room: task.room_id });
+        const templateName = input.template ?? pinned.name;
+        if ((!input.template || input.template === pinned.name) && input.members
+            && task.execution_plan?.overrides_hash === hashMemberOverrides(input.members))
+          return { task, status: 'already_active' };
+        const definition = resolveTemplate(templateName, cfg.roomTemplates ?? {});
+        if (!definition) throw new TaskRoomApplicationError('template_not_found',
+          'template not found', { template: templateName });
+        const requested = prepareExecutionPlan(definition, cfg, input.members ?? {});
+        const pinnedPlanHash = task.execution_plan?.plan_hash ?? pinned.content_hash;
+        if (pinned.name !== requested.snapshot.name || pinnedPlanHash !== requested.planHash)
           throw new TaskRoomApplicationError('template_mismatch', 'template mismatch', {
-            requested: `${requested.name}@${requested.version}`, room: task.room_id,
+            requested: `${requested.snapshot.name}@${requested.snapshot.version}`, room: task.room_id,
             provisioned: `${pinned.name}@${pinned.version}` });
       }
       return { task, status: 'already_active' };
     }
     const room = task.room_id ? getRoomRecord(task.room_id) : undefined;
-    const durable = room?.template_snapshot;
+    const durable = room?.template_snapshot ?? task.execution_plan?.snapshot;
     if (durable && (!task.template || task.template.name !== durable.name
       || task.template.version !== durable.version || task.template.content_hash !== durable.content_hash))
-      throw new Error(`task ${task.task_id} template reference does not match room ${room!.room_id}'s durable snapshot`);
+      throw new Error(`task ${task.task_id} template reference does not match its durable execution snapshot`);
     const templateName = input.template ?? durable?.name ?? task.template?.name
       ?? cfg.tasks?.default_room_template ?? cfg.rooms?.defaults?.template ?? 'single';
-    const definition = durable && !input.template ? undefined
+    const storedOverridesMatch = !!(durable && input.members && task.execution_plan?.overrides_hash
+      === hashMemberOverrides(input.members));
+    const definition = durable && !input.template && (!input.members || storedOverridesMatch) ? undefined
       : resolveTemplate(templateName, cfg.roomTemplates ?? {});
     if (input.template && !definition) throw new TaskRoomApplicationError(
       'template_not_found', 'template not found', { template: templateName });
     if (!durable && !definition) throw new TaskRoomApplicationError(
       'template_not_found', 'template not found', { template: templateName });
-    const snapshot = durable ?? snapshotTemplate(definition!);
+    let launchDefinitions: Record<string, import('../config.js').AgentTemplateDefinition> | undefined;
+    let preparedPlan = !durable && definition
+      ? prepareExecutionPlan(definition, cfg, input.members ?? {}) : undefined;
+    let snapshot = durable ?? preparedPlan!.snapshot;
+    if (preparedPlan) launchDefinitions = preparedPlan.launchDefinitions;
+    if (input.members && Object.keys(input.members).length && !storedOverridesMatch) {
+      if (!definition) throw new TaskRoomApplicationError('template_mismatch',
+        'member overrides cannot change an existing Room execution plan');
+      const prepared = preparedPlan ?? prepareExecutionPlan(definition, cfg, input.members);
+      preparedPlan = prepared;
+      if (durable && prepared.planHash !== durable.content_hash) throw new TaskRoomApplicationError(
+        'template_mismatch', 'member overrides do not match existing execution plan');
+      snapshot = prepared.snapshot;
+      launchDefinitions = prepared.launchDefinitions;
+    }
     if (durable && input.template && definition) {
-      const requested = snapshotTemplate(definition);
+      const requested = snapshotTemplate(definition, cfg.agentTemplates);
       if (requested.name !== durable.name || requested.content_hash !== durable.content_hash)
         throw new TaskRoomApplicationError('template_mismatch', 'template mismatch', {
           requested: `${requested.name}@${requested.version}`, room: room!.room_id,
           provisioned: `${durable.name}@${durable.version}` });
     }
-    if (!input.template && task.template && snapshot.content_hash !== task.template.content_hash)
-      throw new TaskRoomApplicationError('task_template_drift', 'task template drift', {
-        template: `${task.template.name}@${task.template.version}` });
+    if (!input.template && task.template && snapshot.content_hash !== task.template.content_hash) {
+      // Pre-execution-plan backlog records used the template-only hash. Accept
+      // that exact legacy pin once, then upgrade it to the complete sealed plan.
+      const legacyHash = definition
+        ? snapshotTemplate(definition, cfg.agentTemplates).content_hash : undefined;
+      if (task.template.content_hash !== legacyHash)
+        throw new TaskRoomApplicationError('task_template_drift', 'task template drift', {
+          template: `${task.template.name}@${task.template.version}` });
+    }
     if (task.room_id && room?.template_snapshot
       && (room.template_snapshot.name !== snapshot.name || room.template_snapshot.content_hash !== snapshot.content_hash))
       throw new TaskRoomApplicationError('template_mismatch', 'template mismatch', {
         requested: `${snapshot.name}@${snapshot.version}`, room: task.room_id,
         provisioned: `${room.template_snapshot.name}@${room.template_snapshot.version}` });
-    if (!task.template || task.template.name !== snapshot.name || task.template.content_hash !== snapshot.content_hash)
+    if (preparedPlan && !task.room_id) {
+      const unlock = acquireLaunchSnapshotLock();
+      let sealed: TemplateSnapshot | undefined;
+      try {
+        sealed = sealTemplateSnapshot(snapshot, cfg.agentTemplates ?? {}, launchDefinitions);
+        task = updateTaskExecutionPlan(task.task_id, { schema_version: 1, snapshot: sealed,
+          overrides: preparedPlan.overrides, overrides_hash: preparedPlan.overridesHash,
+          plan_hash: preparedPlan.planHash });
+        snapshot = sealed;
+      } catch (error) {
+        unlock();
+        if (sealed?.launch_snapshot_hash) releaseLaunchSnapshot(sealed.launch_snapshot_hash);
+        throw error;
+      }
+      unlock();
+    } else if (!task.template || task.template.name !== snapshot.name || task.template.content_hash !== snapshot.content_hash)
       task = updateTaskTemplate(task.task_id, { name: snapshot.name, version: snapshot.version, content_hash: snapshot.content_hash });
     if (task.state === 'backlog') {
       task = transitionTask(task.task_id);
@@ -665,7 +715,7 @@ export class TaskRoomApplicationService {
       try {
         await this.provisionRoom(cfg, task, snapshot, created => {
           task = updateTaskRoom(task.task_id, created.room_id, created.room_identity_cid!);
-        });
+        }, launchDefinitions);
         task = readTask(task.task_id);
       } catch (error) {
         if (error instanceof CoworkUnavailableError)
@@ -719,13 +769,13 @@ export class TaskRoomApplicationService {
       );
       return undefined;
     }
-    return snapshotTemplate(definition);
+  return snapshotTemplate(definition, cfg.agentTemplates);
   }
 
   private existingTemplate(cfg: FleetConfig, task: TaskRecord): TemplateSnapshot {
     const ref = task.template!;
     const definition = resolveTemplate(ref.name, cfg.roomTemplates ?? {});
-    const snapshot = definition ? snapshotTemplate(definition) : undefined;
+  const snapshot = definition ? snapshotTemplate(definition, cfg.agentTemplates) : undefined;
     if (!snapshot || snapshot.content_hash !== ref.content_hash)
       throw new TaskRoomApplicationError(
         'task_template_drift', `task template snapshot no longer matches ${ref.name}@${ref.version}`,
@@ -738,6 +788,7 @@ export class TaskRoomApplicationService {
     task: Pick<TaskRecord, 'title' | 'brief'> & { task_id?: string; goal?: string },
     template: TemplateSnapshot | undefined,
     onCreated: (room: RoomOrchestrationRecord) => void,
+    launchDefinitions?: Record<string, import('../config.js').AgentTemplateDefinition>,
   ): Promise<RoomOrchestrationRecord> {
     const rooms = cfg.rooms;
     if (!rooms) throw new ConfigError('rooms: configuration is required');
@@ -749,16 +800,29 @@ export class TaskRoomApplicationService {
         throw new ConfigError('rooms: configuration is required before creating or querying rooms');
       return createCoworkAdapter({ configPath: cfg.rooms.cowork?.config });
     })();
-    const created = await cowork.createRoom({
+    const unlockSnapshot = template ? acquireLaunchSnapshotLock() : undefined;
+    let launchTemplate: TemplateSnapshot | undefined;
+    let created;
+    let room: RoomOrchestrationRecord;
+    try {
+      launchTemplate = template ? (template.launch_snapshot_hash ? template
+        : sealTemplateSnapshot(template, cfg.agentTemplates ?? {}, launchDefinitions)) : undefined;
+      created = await cowork.createRoom({
       room_name: task.title, goal: task.goal?.trim() || task.title,
-      briefing: task.brief?.trim() || template?.contract?.trim() || task.goal?.trim() || task.title,
-      quiet_membership: template?.room?.quiet_membership,
-      anonymous: template?.room?.anonymous,
+      briefing: task.brief?.trim() || launchTemplate?.contract?.trim() || task.goal?.trim() || task.title,
+      quiet_membership: launchTemplate?.room?.quiet_membership,
+      anonymous: launchTemplate?.room?.anonymous,
     });
-    let room = createRoomRecord({
+      room = createRoomRecord({
       room_id: created.room_id, room_name: task.title, room_identity_cid: created.identity_cid,
-      task_id: task.task_id, template_snapshot: template,
+      task_id: task.task_id, template_snapshot: launchTemplate,
     });
+    } catch (error) {
+      unlockSnapshot?.();
+      if (launchTemplate?.launch_snapshot_hash) releaseLaunchSnapshot(launchTemplate.launch_snapshot_hash);
+      throw error;
+    }
+    unlockSnapshot?.();
     recordFleetAuditPresentation({ kind: 'room', operation: 'create', id: room.room_id,
       name: room.room_name, previousState: 'none', newState: 'provisioning',
       revision: room.created_at, taskId: room.task_id,
@@ -786,9 +850,9 @@ export class TaskRoomApplicationService {
       }
     }
     room = advanceSaga(room.room_id, 'create_members', 3);
-    if (template?.members.length) try {
+    if (launchTemplate?.members.length) try {
       room = await (this.deps.provisionMembers ?? provisionMembers)({
-        cfg, cowork, roomId: room.room_id, taskId: task.task_id, template,
+        cfg, cowork, roomId: room.room_id, taskId: task.task_id, template: launchTemplate,
         binPath: (this.deps.binPath ?? getBinPath)(), brief: task.brief,
         goal: task.task_id ? task.title : task.goal,
       });
@@ -806,7 +870,7 @@ export class TaskRoomApplicationService {
       participants: roomParticipants(room) });
     else recordFleetAuditPresentation({ kind: 'lifecycle_failure', resource: 'Room', id: room.room_id,
       state: room.state, category: 'provision_pending', eventId: roomFailureEventId(room) });
-    if (task.task_id && !template?.members.length) activateTask(task.task_id);
+    if (task.task_id && !launchTemplate?.members.length) activateTask(task.task_id);
     return room;
   }
 }

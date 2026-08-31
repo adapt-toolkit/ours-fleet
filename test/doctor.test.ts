@@ -13,6 +13,7 @@ import type { FetchLike } from '../src/monitor.js';
 import type { AttachOursClientOptions, OursClient } from '@ours.network/sdk/client';
 import { cliPath, installPrefix, pkgRoot } from './install-fixtures.js';
 import { writeV2Fixture } from './v2-fixture.js';
+import { bootstrapPresets } from '../src/preset-bootstrap.js';
 
 // A stub daemon API for the monitor reachability probe.
 const stubFetch = (state: 'ok' | '401' | 'down' | 'notdaemon' = 'ok'): FetchLike => async (url) => {
@@ -69,6 +70,19 @@ const execWith = (table: Record<string, ExecResult>): Exec =>
   async (cmd, args) => table[[cmd, args[0] ?? ''].join(' ')] ?? { stdout: '', stderr: '', code: 0 };
 
 describe('doctor', () => {
+  it('warns when packaged Codex Brain model/effort pairs are absent from the local runtime catalog', async () => {
+    const configPath = join(dir, 'catalog.yaml'); bootstrapPresets(configPath);
+    const cache = join(dir, 'models.json');
+    writeFileSync(cache, JSON.stringify({ models: [{ slug: 'gpt-5.6-sol', display_name: 'Sol',
+      visibility: 'list', supported_reasoning_levels: [{ effort: 'low' }] }] }));
+    const rep = await doctor({ configPath, codexCatalogPath: cache }, undefined, 'darwin');
+    const check = rep.checks.find(item => item.name === 'brain catalog: Codex runtime drift')!;
+    expect(check.ok).toBe(true);
+    expect(check.detail).toContain('warning: packaged Brain preset(s) absent');
+    expect(check.detail).toContain('codex-gpt-5-6-terra-low (gpt-5.6-terra/low)');
+    expect(check.detail).toContain('codex-gpt-5-6-sol-medium (gpt-5.6-sol/medium)');
+    expect(check.detail).not.toContain('codex-gpt-5-6-sol-low (gpt-5.6-sol/low)');
+  });
   it('flags a stopped ours daemon', async () => {
     const rep = await doctor({}, execWith({
       'tmux -V': { stdout: 'tmux 3.6', stderr: '', code: 0 },
@@ -867,11 +881,12 @@ describe('doctor rooms-tasks checks', () => {
 
   it('warns on template Agent ref referencing an unknown Agent', async () => {
     registerAdapter(fakeAdapter);
-    writeCfg(ROOMS_YAML() + `room_templates:\n  my-team:\n    version: 1\n    description: test\n    members:\n      - slot: dev\n        role: Dev\n        count: 1\n        agent: { ref: NonExistentAgent }\n`);
+    writeCfg(ROOMS_YAML() + `room_templates:\n  my-team:\n    version: 1\n    description: test\n    members:\n      - slot: dev\n        role: Dev\n        count: 1\n        agent_template: NonExistentAgent\n`);
+    rmSync(join(dir, 'fleet', 'agent_templates', 'NonExistentAgent.yaml'));
     const rep = await run();
     const tpl = rep.checks.find(c => c.name?.startsWith('template:') && c.detail?.includes('NonExistentAgent'))!;
     expect(tpl).toBeTruthy();
-    expect(tpl.detail).toContain('not found in configured Agents');
+    expect(tpl.detail).toContain('Agent Template(s) NonExistentAgent not found');
   });
 
   it('validates default template when configured', async () => {
@@ -889,7 +904,10 @@ describe('doctor rooms-tasks checks', () => {
     writeCfg(ROOMS_YAML(CID_64, '  defaults:\n    template: team\n')
       + 'room_templates:\n  team:\n    version: 1\n    description: configured team\n'
       + '    members:\n      - slot: dev\n        role: Dev\n        count: 1\n'
-      + '        agent: { role: { inline: {} }, brain: { inline: { harness: fake } } }\n');
+      + '        agent_template: Developer\n');
+    mkdirSync(join(dir, 'fleet', 'agent_templates'), { recursive: true, mode: 0o700 });
+    writeFileSync(join(dir, 'fleet', 'agent_templates', 'Developer.yaml'),
+      'role: { inline: {} }\nbrain: { inline: { harness: fake } }\n', { mode: 0o600 });
     const rep = await run();
     const dt = rep.checks.find(c => c.name === 'rooms: default template')!;
     expect(dt.ok).toBe(true);

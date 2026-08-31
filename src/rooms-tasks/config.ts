@@ -11,7 +11,6 @@ import {
   ROOMS_DEFAULTS_KEYS as RDK, TASKS_KEYS as TK, TEMPLATE_KEYS as TPK,
   TEMPLATE_MEMBER_KEYS as TMK,
 } from './types.js';
-import { isSensitiveConfigKey } from '../sensitive-config.js';
 
 const isPlainObject = (v: unknown): v is Record<string, unknown> =>
   v !== null && typeof v === 'object' && !Array.isArray(v);
@@ -184,38 +183,25 @@ export function validateRoomTemplatesConfig(
         throw new RoomsTasksConfigError(path, `room_templates.${name}.members[${i}].role: required string`);
       if (!Number.isInteger(m.count) || (m.count as number) < 1)
         throw new RoomsTasksConfigError(path, `room_templates.${name}.members[${i}].count: required positive integer`);
-      if (!isPlainObject(m.agent))
-        throw new RoomsTasksConfigError(path, `room_templates.${name}.members[${i}].agent: required mapping`);
-      const agentKeys = Object.keys(m.agent);
-      const isRef = agentKeys.length === 1 && typeof m.agent.ref === 'string';
-      const isDefinition = agentKeys.includes('role') && agentKeys.includes('brain');
-      if (!isRef && !isDefinition)
+      if (m.agent !== undefined)
         throw new RoomsTasksConfigError(path,
-          `room_templates.${name}.members[${i}].agent: must be {ref} or canonical {role, brain, ...}`);
-      const containsSensitive = (value: unknown): boolean => Array.isArray(value)
-        ? value.some(containsSensitive)
-        : Boolean(value && typeof value === 'object' && Object.entries(value as Record<string, unknown>)
-          .some(([key, child]) => isSensitiveConfigKey(key) || containsSensitive(child)));
-      if (isDefinition && containsSensitive(m.agent))
+          `room_templates.${name}.members[${i}].agent: persistent Agent references are no longer allowed; use agent_template: <ID>`);
+      if (typeof m.agent_template !== 'string' || !m.agent_template.trim())
         throw new RoomsTasksConfigError(path,
-          `room_templates.${name}.members[${i}].agent: inline sensitive configuration cannot be persisted; use references`);
-      if (isDefinition) {
-        const definition = m.agent as Record<string, unknown>;
-        const brain = isPlainObject(definition.brain) && isPlainObject(definition.brain.inline)
-          ? definition.brain.inline : undefined;
-        if (definition.env !== undefined || definition.owner_channel !== undefined
-            || definition.auth_proxy !== undefined || brain?.harness_options !== undefined
-            || brain?.session_options !== undefined)
-          throw new RoomsTasksConfigError(path,
-            `room_templates.${name}.members[${i}].agent: secret-capable inline fields cannot be persisted; use references`);
-      }
+          `room_templates.${name}.members[${i}].agent_template: required non-blank Agent Template ID`);
       return {
         slot: m.slot as string,
         role: m.role as string,
         count: m.count as number,
-        agent: structuredClone(m.agent) as TemplateMemberSlot['agent'],
+        agent_template: m.agent_template,
       };
     });
+    const slots = new Set<string>();
+    for (const member of members) {
+      if (slots.has(member.slot)) throw new RoomsTasksConfigError(path,
+        `room_templates.${name}.members: duplicate slot '${member.slot}'`);
+      slots.add(member.slot);
+    }
 
     let room: { quiet_membership?: boolean; anonymous?: boolean } | undefined;
     if (tplRaw.room !== undefined) {

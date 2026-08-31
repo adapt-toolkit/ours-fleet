@@ -7,5 +7,5 @@ contract: |
   No material change lands without both agreeing.
   Completion requires joint sign-off.
 members:
-  - { slot: secretary, role: Secretary, count: 1, agent: { ref: Secretary } }
-  - { slot: critic, role: Critic, count: 1, agent: { ref: Critic } }
+  - { slot: secretary, role: Secretary, count: 1, agent_template: Secretary }
+  - { slot: critic, role: Critic, count: 1, agent_template: Critic }

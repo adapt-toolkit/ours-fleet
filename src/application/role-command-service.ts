@@ -22,6 +22,11 @@ export class RoleLifecycleService {
     const config = input.config ?? loadConfig(this.options.configPath);
     const selected = input.roleIds.length ? input.roleIds : config.roles.map(role => role.name);
     for (const roleId of selected) {
+      if (config.agentTemplates?.[roleId] && !config.roles.some(role => role.name === roleId))
+        throw new FleetError('capability_unavailable',
+          `'${roleId}' is an inert Agent Template; lifecycle commands target only persistent fleet/agents instances`);
+      if (!config.roles.some(role => role.name === roleId))
+        throw new FleetError('role_not_found', `no such role '${roleId}'`);
       const role = await this.options.repository.get(roleId);
       if (!role) throw new FleetError('role_not_found', `no such role '${roleId}'`);
       if (role.lifetime !== 'permanent')
@@ -92,6 +97,12 @@ export class RoleCommandService {
         throw new FleetError('idempotency_conflict', 'action ID already belongs to another operation');
       return prior;
     }
+    const config = loadConfig(this.options.configPath);
+    if (config.agentTemplates?.[input.roleId] && !config.roles.some(role => role.name === input.roleId))
+      throw new FleetError('capability_unavailable',
+        `'${input.roleId}' is an inert Agent Template; lifecycle commands target only persistent fleet/agents instances`);
+    if (!config.roles.some(role => role.name === input.roleId))
+      throw new FleetError('role_not_found', `no such role '${input.roleId}'`);
     const role = await this.options.repository.get(input.roleId);
     if (!role) throw new FleetError('role_not_found', `no such role '${input.roleId}'`);
     if (role.lifetime !== 'permanent')

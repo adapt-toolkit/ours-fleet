@@ -410,7 +410,9 @@ describe('atomic role + identity reservation', () => {
     await first;
 
     expect(second).toBeInstanceOf(Error);
-    expect(second!.message).toMatch(/identity 'Contested' is already taken|being created/);
+    expect(second!.message).toMatch(
+      /identity 'Contested' is already taken|being created|already used by role/,
+    );
   });
 
   it('the same role with a DIFFERENT identity still conflicts on the role name', async () => {

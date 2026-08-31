@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { chmodSync, existsSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -15,6 +15,7 @@ import { snapshotTemplate } from '../src/rooms-tasks/templates.js';
 import type { FleetConfig } from '../src/config.js';
 import type { CoworkAdapter } from '../src/rooms-tasks/cowork-adapter.js';
 import type { TemplateDefinition } from '../src/rooms-tasks/types.js';
+import { writeV2Fixture } from './v2-fixture.js';
 import { beginFleetAuditCollection, consumeFleetAuditCollection } from '../src/fleet-command-audit.js';
 
 const definition: TemplateDefinition = {
@@ -26,6 +27,11 @@ function config(): FleetConfig {
   return {
     roles: [], vars: {}, defaults: {}, files: [], startStaggerMs: 0, diagnostics: [],
     watchdogs: [], loops: [], roomTemplates: { 'empty-team': definition },
+    agentTemplates: { Dev: { role: { inline: {} }, brain: { inline: { harness: 'codex' } },
+      permissions: { approval: 'allow', filesystem: 'unrestricted', unattended: 'wait' } } },
+    resolveAgentDefinition: (id: string, value: any) => ({ name: id,
+      harness: value.brain.inline.harness, permissions: value.permissions,
+      monitor: { mode: 'fleet' }, session: 'acp' }),
     rooms: { owner: { role: 'Owner' }, defaults: { attach_owner: false } },
   } as FleetConfig;
 }
@@ -71,7 +77,7 @@ function service(fake: CoworkAdapter): TaskRoomApplicationService {
 describe('task create/start surface parity', () => {
   it('does not claim Room activation or Task work while member seats are still pending', async () => {
     const members: TemplateDefinition = { name: 'members', version: 1, description: 'Members',
-      contract: 'Execute.', members: [{ slot: 'dev', role: 'Developer', count: 1, role_ref: 'Dev' }] };
+      contract: 'Execute.', members: [{ slot: 'dev', role: 'Developer', count: 1, agent_template: 'Dev' }] };
     const cfg = { ...config(), roomTemplates: { members } } as FleetConfig;
     const h = cowork();
     const provision = vi.fn(async ({ roomId }: { roomId: string }) => getRoomRecord(roomId)!);
@@ -92,11 +98,11 @@ describe('task create/start surface parity', () => {
 
   it('reports both Room and Task provisioning failures when start member provisioning fails', async () => {
     const members: TemplateDefinition = { name: 'members', version: 1, description: 'Members',
-      contract: 'Execute.', members: [{ slot: 'dev', role: 'Developer', count: 1, role_ref: 'Dev' }] };
-    const snapshot = snapshotTemplate(members);
+      contract: 'Execute.', members: [{ slot: 'dev', role: 'Developer', count: 1, agent_template: 'Dev' }] };
+    const cfg = { ...config(), roomTemplates: { members } } as FleetConfig;
+    const snapshot = snapshotTemplate(members, cfg.agentTemplates);
     const task = createTask({ title: 'Failing start', origin: { type: 'cli' }, start: false,
       template: { name: snapshot.name, version: snapshot.version, content_hash: snapshot.content_hash } });
-    const cfg = { ...config(), roomTemplates: { members } } as FleetConfig;
     const app = new TaskRoomApplicationService(undefined, { loadConfiguration: () => cfg,
       cowork: () => cowork().adapter, binPath: () => '/fleet',
       provisionMembers: vi.fn(async () => { throw new Error('member launch failed'); }) as any });
@@ -120,6 +126,104 @@ describe('task create/start surface parity', () => {
     expect(result).toMatchObject({ state: 'active', room_id: 'room-shared', room_identity_cid: 'room-cid' });
     expect(getRoomRecord('room-shared')).toMatchObject({ task_id: result.task_id, state: 'active' });
     expect(h.createRoom).toHaveBeenCalledOnce();
+  });
+
+  it('pins a sealed execution plan for template-only backlog creation and starts after config removal', async () => {
+    const h = cowork();
+    let current = config();
+    const app = new TaskRoomApplicationService(undefined, {
+      loadConfiguration: () => current, cowork: () => h.adapter, binPath: () => '/fleet',
+      provisionMembers: vi.fn(),
+    });
+    const backlog = await app.createTask({ actor: { kind: 'local_control', surface: 'cli' },
+      title: 'Pinned backlog', template: 'empty-team', backlog: true, origin: { type: 'cli' } });
+    expect(backlog).toMatchObject({ state: 'backlog', execution_plan: {
+      schema_version: 1, plan_hash: expect.any(String), snapshot: {
+        name: 'empty-team', launch_snapshot_hash: expect.any(String),
+      },
+    } });
+    current = { ...current, roomTemplates: {} };
+    const started = await app.startTask({ actor: { kind: 'local_control', surface: 'cli' },
+      taskId: backlog.task_id });
+    expect(started).toMatchObject({ state: 'active', room_id: 'room-shared',
+      execution_plan: { plan_hash: backlog.execution_plan!.plan_hash } });
+    expect(h.createRoom).toHaveBeenCalledOnce();
+  });
+
+  it('compares the complete active plan when either template or members is supplied', async () => {
+    const memberDefinition: TemplateDefinition = { name: 'member-team', version: 1,
+      description: 'Member team', members: [
+        { slot: 'dev', role: 'Developer', count: 1, agent_template: 'Dev' },
+      ] };
+    let cfg = { ...config(), roomTemplates: { 'member-team': memberDefinition, 'empty-team': definition }, agentTemplates: {
+      Dev: { role: { inline: {} }, brain: { inline: { harness: 'codex' } },
+        permissions: { approval: 'ask' } },
+    }, resolveAgentDefinition: (id: string, value: any) => ({ name: id,
+      harness: value.brain.inline.harness, harness_options: value.brain.inline.harness_options,
+      permissions: { approval: 'allow', filesystem: 'unrestricted', unattended: 'wait' },
+      monitor: { mode: 'fleet' }, session: 'acp' }) } as unknown as FleetConfig;
+    const h = cowork();
+    const provision = vi.fn(async ({ roomId, taskId }: { roomId: string; taskId?: string }) => {
+      const room = activateRoom(roomId); if (taskId) activateTask(taskId); return room;
+    });
+    const app = new TaskRoomApplicationService(undefined, { loadConfiguration: () => cfg,
+      cowork: () => h.adapter, binPath: () => '/fleet', provisionMembers: provision as any });
+    const members = { dev: { approval: 'allow' as const } };
+    const active = await app.createTask({ actor: { kind: 'local_control', surface: 'cli' },
+      title: 'Active plan', template: 'member-team', members, origin: { type: 'cli' } });
+    expect(active.state).toBe('active');
+    await expect(app.ensureTaskWork({ actor: { kind: 'local_control', surface: 'cli' },
+      taskId: active.task_id, template: 'member-team', members }))
+      .resolves.toMatchObject({ status: 'already_active' });
+    cfg = { ...cfg, roomTemplates: {}, agentTemplates: {} } as FleetConfig;
+    await expect(app.ensureTaskWork({ actor: { kind: 'local_control', surface: 'cli' },
+      taskId: active.task_id, members }))
+      .resolves.toMatchObject({ status: 'already_active' });
+    cfg = { ...config(), roomTemplates: { 'member-team': memberDefinition, 'empty-team': definition },
+      agentTemplates: { Dev: { role: { inline: {} }, brain: { inline: { harness: 'codex' } },
+        permissions: { approval: 'ask' } } }, resolveAgentDefinition: cfg.resolveAgentDefinition } as FleetConfig;
+    await expect(app.ensureTaskWork({ actor: { kind: 'local_control', surface: 'cli' },
+      taskId: active.task_id, members: { dev: { approval: 'ask' } } }))
+      .rejects.toMatchObject({ code: 'template_mismatch' });
+    await expect(app.ensureTaskWork({ actor: { kind: 'local_control', surface: 'cli' },
+      taskId: active.task_id, template: 'empty-team' }))
+      .rejects.toMatchObject({ code: 'template_mismatch' });
+    expect(h.createRoom).toHaveBeenCalledOnce();
+  });
+
+  it('rejects full-resolution member policy errors before task transition, snapshots, or Cowork', async () => {
+    const configPath = join(root, 'fleet.yaml');
+    writeV2Fixture(configPath, { roles: {}, rooms: { owner: { role: 'Owner' },
+      defaults: { attach_owner: false } }, room_templates: { members: { version: 1,
+      description: 'members', members: [{ slot: 'dev', role: 'Developer', count: 1,
+        agent_template: 'Dev' }] } } });
+    const templatePath = join(root, 'fleet', 'agent_templates', 'Dev.yaml');
+    writeFileSync(templatePath, [
+      'role: { inline: { mission: work } }',
+      'brain: { inline: { harness: codex, session: acp, model: gpt-5.6-sol } }',
+      'permissions: { approval: allow, filesystem: unrestricted, unattended: wait }', '',
+    ].join('\n'), { mode: 0o600 }); chmodSync(templatePath, 0o600);
+    const h = cowork();
+    const app = new TaskRoomApplicationService(configPath, { cowork: () => h.adapter,
+      binPath: () => '/fleet', provisionMembers: vi.fn() });
+    const invalid = [
+      { brain: { inline: { harness: 'codex', session: 'invalid' } } },
+      { monitor: { mode: 'invalid' } },
+      { brain: { inline: { harness: 'codex', session: 'acp', model: 'gpt-5.6-sol',
+        harness_options: { approval: 'never' } } }, permissions: {
+        approval: 'ask', filesystem: 'workspace', unattended: 'wait' } },
+      { permissions: { approval: 'ask', filesystem: 'workspace', unattended: 'deny' } },
+    ];
+    for (const overrides of invalid) {
+      const task = createTask({ title: 'Invalid member', origin: { type: 'cli' }, start: false });
+      await expect(app.startTask({ actor: { kind: 'local_control', surface: 'cli' },
+        taskId: task.task_id, template: 'members', members: { dev: { overrides: overrides as any } } }))
+        .rejects.toThrow();
+      expect(getTask(task.task_id).state).toBe('backlog');
+      expect(getTask(task.task_id).execution_plan).toBeUndefined();
+      expect(existsSync(join(root, 'launch-snapshots'))).toBe(false);
+    }
+    expect(h.createRoom).not.toHaveBeenCalled();
   });
 
   it('owns normalized list/detail reads including linked orchestration', async () => {
@@ -204,7 +308,7 @@ describe('task create/start surface parity', () => {
   });
 
   it('continues timed-out terminal recovery into provisioning and replaces issues on success', async () => {
-    const template = snapshotTemplate(definition);
+    const template = snapshotTemplate(definition, config().agentTemplates);
     const task = createTask({ title: 'Compound recovery', origin: { type: 'cli' }, start: true,
       room_id: 'room-compound', template: { name: template.name, version: template.version,
         content_hash: template.content_hash } });
@@ -347,9 +451,11 @@ describe('task create/start surface parity', () => {
   it('uses effective Cowork goal but preserves raw standalone goal and brief for members', async () => {
     const memberTemplate: TemplateDefinition = { name: 'members', version: 1,
       description: 'Members', contract: 'Contract', members: [
-        { slot: 'dev', role: 'Developer', count: 1, role_ref: 'Dev' },
+        { slot: 'dev', role: 'Developer', count: 1, agent_template: 'Dev' },
       ] };
-    const cfg = { ...config(), roomTemplates: { members: memberTemplate } } as FleetConfig;
+    const cfg = { ...config(), roomTemplates: { members: memberTemplate }, agentTemplates: {
+      Dev: { role: { inline: {} }, brain: { inline: { harness: 'codex' } } },
+    } } as FleetConfig;
     const h = cowork();
     const provision = vi.fn(async ({ roomId }: { roomId: string }) => getRoomRecord(roomId)!);
     const app = new TaskRoomApplicationService(undefined, { loadConfiguration: () => cfg,
@@ -467,7 +573,7 @@ describe('task create/start surface parity', () => {
   });
 
   it('runs the extracted complete provision flow for start', async () => {
-    const template = snapshotTemplate(definition);
+    const template = snapshotTemplate(definition, config().agentTemplates);
     const task = createTask({
       title: 'Backlog', origin: { type: 'cli' }, start: false,
       template: { name: template.name, version: template.version, content_hash: template.content_hash },

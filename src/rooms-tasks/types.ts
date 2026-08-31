@@ -74,6 +74,13 @@ export interface TaskRecord {
   state: TaskState;
   blocked?: TaskBlocked;
   template?: TaskTemplateRef;
+  execution_plan?: {
+    schema_version: 1;
+    snapshot: TemplateSnapshot;
+    overrides: Record<string, unknown>;
+    overrides_hash: string;
+    plan_hash: string;
+  };
   no_room?: boolean;
   room_id?: string;
   room_identity_cid?: string;
@@ -146,6 +153,8 @@ export interface RoomMemberLaunchState {
   /** Redacted, deterministic effective Agent launch definition retained for retry inspection. */
   agent_definition?: Record<string, unknown>;
   agent_fingerprint?: string;
+  agent_template?: string;
+  agent_template_hash?: string;
   launch_id?: string;
   updated_at: string;
   error?: string;
@@ -232,8 +241,8 @@ export interface TemplateMemberSlot {
   slot: string;
   role: string;
   count: number;
-  /** Canonical Agent definition, or stable reference to a declared Agent. */
-  agent: import('../config.js').AgentDefinition | { ref: string };
+  /** Stable reference to an inert Agent Template, never a persistent Agent. */
+  agent_template: string;
 }
 
 export interface TemplateRoomConfig {
@@ -252,8 +261,20 @@ export interface TemplateDefinition {
   members: TemplateMemberSlot[];
 }
 
-export interface TemplateSnapshot extends TemplateDefinition {
+export interface TemplateSnapshotMember extends TemplateMemberSlot {
+  /** Secret-safe public projection; launch material lives in the sealed snapshot. */
+  agent_projection?: Record<string, unknown>;
+  agent_template_hash?: string;
+  /** Private sealed-snapshot lookup key; harmless provenance, not an identity. */
+  launch_definition_id?: string;
+  role_preset?: { id: string; hash: string };
+  brain_preset?: { id: string; hash: string };
+}
+
+export interface TemplateSnapshot extends Omit<TemplateDefinition, 'members'> {
+  members: TemplateSnapshotMember[];
   content_hash: string;
+  launch_snapshot_hash?: string;
 }
 
 // ── Config sections ─────────────────────────────────────────────────────
@@ -299,4 +320,5 @@ export const ROOMS_COWORK_KEYS = ['config'] as const;
 export const ROOMS_DEFAULTS_KEYS = ['template', 'attach_owner', 'close_when_task_done'] as const;
 export const TASKS_KEYS = ['default_room_template', 'create_mode', 'close_room_on_done', 'retain_completed_for'] as const;
 export const TEMPLATE_KEYS = ['version', 'description', 'room', 'contract', 'members', 'override_builtin'] as const;
-export const TEMPLATE_MEMBER_KEYS = ['slot', 'role', 'count', 'agent'] as const;
+/** `agent` is accepted only so validation can emit its actionable migration error. */
+export const TEMPLATE_MEMBER_KEYS = ['slot', 'role', 'count', 'agent_template', 'agent'] as const;

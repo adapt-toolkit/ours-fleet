@@ -18,11 +18,12 @@ import { isSensitiveConfigKey } from '../sensitive-config.js';
 export const REDACTED_ENV_VALUE = '__OURS_FLEET_SECRET_REDACTED__';
 const MAX_CONFIG_BYTES = 256 * 1024;
 const DIFF_CONTEXT_LINES = 3;
-const KINDS = ['agents', 'roles', 'brains', 'room_templates'] as const;
+const KINDS = ['agents', 'agent_templates', 'roles', 'brains', 'room_templates'] as const;
 
 export interface EditableFleetModel {
   manifest: Record<string, unknown>;
   agents: Record<string, Record<string, unknown>>;
+  agent_templates: Record<string, Record<string, unknown>>;
 }
 
 interface SourceSet {
@@ -199,7 +200,7 @@ function readSources(manifest: string): SourceSet {
     if (!existsSync(dir)) { if (kind === 'agents') throw new FleetError('invalid_request', `required Agent root missing: ${dir}`); continue; }
     trustedDirectory(dir);
     for (const name of readdirSync(dir).sort()) {
-      if ((kind === 'agents' || kind === 'room_templates')
+      if ((kind === 'agents' || kind === 'agent_templates' || kind === 'room_templates')
           && !['.yaml', '.yml'].includes(extname(name).toLowerCase())) continue;
       documents.set(join(kind, name), trustedFile(join(dir, name)));
     }
@@ -211,22 +212,31 @@ function modelFrom(sources: SourceSet): EditableFleetModel {
   const manifestKey = basename(sources.manifest);
   const manifest = parseFleetDocument(sources.manifest, sources.documents.get(manifestKey)!, 'strict').value;
   const agents: Record<string, Record<string, unknown>> = {};
+  const agent_templates: Record<string, Record<string, unknown>> = {};
   for (const [rel, source] of sources.documents) if (rel.startsWith(`agents/`)) {
     const id = basename(rel, extname(rel));
     agents[id] = parseFleetDocument(absoluteFor(sources.manifest, rel), source, 'strict').value;
   }
-  return { manifest, agents };
+  for (const [rel, source] of sources.documents) if (rel.startsWith(`agent_templates/`)) {
+    const id = basename(rel, extname(rel));
+    agent_templates[id] = parseFleetDocument(absoluteFor(sources.manifest, rel), source, 'strict').value;
+  }
+  return { manifest, agents, agent_templates };
 }
 
 function assertModel(value: unknown): EditableFleetModel {
   if (!value || typeof value !== 'object' || Array.isArray(value)) throw new FleetError('invalid_request', 'model must be an object');
   const input = value as Record<string, unknown>;
-  if (Object.keys(input).sort().join(',') !== 'agents,manifest') throw new FleetError('invalid_request', 'model allows exactly manifest and agents');
-  for (const key of ['manifest', 'agents']) if (!input[key] || typeof input[key] !== 'object' || Array.isArray(input[key]))
+  if (Object.keys(input).sort().join(',') !== 'agent_templates,agents,manifest') throw new FleetError('invalid_request', 'model allows exactly manifest, agents, and agent_templates');
+  for (const key of ['manifest', 'agents', 'agent_templates']) if (!input[key] || typeof input[key] !== 'object' || Array.isArray(input[key]))
     throw new FleetError('invalid_request', `${key} must be an object`);
   for (const [id, doc] of Object.entries(input.agents as Record<string, unknown>)) {
     if (!ROLE_NAME_RE.test(id)) throw new FleetError('invalid_request', `invalid Agent ID '${id}'`);
     if (!doc || typeof doc !== 'object' || Array.isArray(doc)) throw new FleetError('invalid_request', `Agent '${id}' must be an object`);
+  }
+  for (const [id, doc] of Object.entries(input.agent_templates as Record<string, unknown>)) {
+    if (!ROLE_NAME_RE.test(id)) throw new FleetError('invalid_request', `invalid Agent Template ID '${id}'`);
+    if (!doc || typeof doc !== 'object' || Array.isArray(doc)) throw new FleetError('invalid_request', `Agent Template '${id}' must be an object`);
   }
   return structuredClone(input) as unknown as EditableFleetModel;
 }
@@ -239,6 +249,12 @@ function renderProposal(current: SourceSet, model: EditableFleetModel): Map<stri
     const oldRel = [...current.documents.keys()].find(rel => rel.startsWith('agents/')
       && basename(rel, extname(rel)) === id);
     next.set(oldRel ?? join('agents', `${id}.yaml`), oldRel
+      ? render(current.documents.get(oldRel)!, doc) : stringify(doc));
+  }
+  for (const [id, doc] of Object.entries(model.agent_templates).sort(([a], [b]) => a.localeCompare(b))) {
+    const oldRel = [...current.documents.keys()].find(rel => rel.startsWith('agent_templates/')
+      && basename(rel, extname(rel)) === id);
+    next.set(oldRel ?? join('agent_templates', `${id}.yaml`), oldRel
       ? render(current.documents.get(oldRel)!, doc) : stringify(doc));
   }
   for (const [rel, source] of current.documents) if (
@@ -425,7 +441,7 @@ function sourceSensitiveValues(sources: SourceSet): string[] {
     if (!['.yaml', '.yml'].includes(extname(rel).toLowerCase())) continue;
     try {
       const parsed = parse(source) as unknown;
-      values.push(...sensitiveValues({ manifest: {}, agents: { source: parsed as Record<string, unknown> } }));
+      values.push(...sensitiveValues({ manifest: {}, agents: { source: parsed as Record<string, unknown> }, agent_templates: {} }));
     } catch { /* the authoritative parser reports malformed YAML */ }
   }
   return [...new Set(values)];

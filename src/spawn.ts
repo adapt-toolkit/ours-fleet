@@ -12,7 +12,7 @@ import {
   type ApprovalMode, type FilesystemMode, type ResolvedRole, type RoleConfig,
   type CommonPermissions, type MonitorConfig, type SessionBackendId, type UnattendedMode,
   type RoomMemberStartup,
-  type AgentDefinition, type AgentSelection,
+  type AgentDefinition, type AgentSelection, type FleetConfig,
 } from './config.js';
 import { resolveRoleModelEnv } from './model-env.js';
 import { applyRole, up, type OpsDeps } from './ops.js';
@@ -159,7 +159,14 @@ export function validateSpawnOpts(o: SpawnOpts): void {
  * by the reservation rather than by this function.
  */
 function assertNameFree(o: SpawnOpts): void {
-  const cfg = loadConfig(o.configPath);
+  let cfg: FleetConfig;
+  try {
+    cfg = loadConfig(o.configPath);
+  } catch (error) {
+    if (error instanceof Error && error.message.includes(`resolve to duplicate identity '${effectiveIdentity(o)}'`))
+      throw new Error(`ours identity '${effectiveIdentity(o)}' is already taken or being created right now`);
+    throw error;
+  }
   if (cfg.roles.some(r => r.name === o.name))
     throw new Error(`role '${o.name}' already exists (${cfg.roles.find(r => r.name === o.name)!.sourceFile})`);
   if (existsSync(agentDir(o.name)) || existsSync(agentDir(o.name, true)))
@@ -241,6 +248,9 @@ export async function spawnPermanent(
 ): Promise<string> {
   validateSpawnOpts(o);
   if (o.isolationFile) readIsolationFile(o.isolationFile);   // fail before reserving
+  // Preserve the detailed owner/source diagnostic for an existing identity.
+  // The check is repeated inside the reservation boundary to close races.
+  assertNameFree(o);
   const prepared = resolvedSpawn(o);                         // canonical validation before mutation
   // Reserve name and identity together before anything is written or started.
   // A loser of the race creates no config, state, or service.

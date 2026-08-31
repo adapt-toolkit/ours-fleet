@@ -9,10 +9,11 @@ import { Command } from 'commander';
 import { VERSION } from './version.js';
 import { INIT_COMPLETION_GUIDANCE } from './init-guidance.js';
 import { bootstrapPresets } from './preset-bootstrap.js';
+import { migrateLegacyStarterPresets } from './preset-migration.js';
 import {
   analyzeInstalls, buildInfo, buildLabel, discoverInstalls, runningLabel,
 } from './provenance.js';
-import { agentDir, agentsRoot, tmpRoot, logsRoot, deriveXdgRuntimeDir } from './paths.js';
+import { agentDir, agentsRoot, tmpRoot, logsRoot, deriveXdgRuntimeDir, defaultConfigPath } from './paths.js';
 import { findRole, loadConfig, ROLE_NAME_RE, type AgentSelection } from './config.js';
 import type { YamlMode } from './config-yaml.js';
 import { formatDuration } from './duration.js';
@@ -386,13 +387,12 @@ cOpt(program.command('force-restart [names...]').description('re-sync + bounce F
     } catch (e) { die(e); }
   });
 
-program.command('ls').description('list running fleet sessions')
-  .action(async () => {
+cOpt(program.command('ls').description('list running declared persistent Agent sessions'))
+  .action(async (opts: { configuration?: string }) => {
     const acp: string[] = [];
-    for (const root of [agentsRoot(), tmpRoot()]) {
-      if (!existsSync(root)) continue;
-      for (const name of readdirSync(root)) {
-        const stateDir = joinPath(root, name);
+    const cfg = loadConfig(opts.configuration);
+    for (const { name } of cfg.roles) {
+        const stateDir = agentDir(name);
         if (!existsSync(controlSocketPath(stateDir))) continue;
         try {
           const response = await controlRequest(stateDir, { command: 'status' }, 2_000);
@@ -406,7 +406,6 @@ program.command('ls').description('list running fleet sessions')
               : observed.state === 'quiet' ? ' (no recent agent activity)' : ''}`);
           }
         } catch { /* ignore stale sockets */ }
-      }
     }
     console.log(acp.join('\n') || '(none)');
   });
@@ -501,8 +500,9 @@ program.command('logs <name>').description('show the role log').option('-f, --fo
     process.exit(await passthrough(cmd, args));
   });
 
-program.command('status <name>').description('unit/agent state')
-  .action(async name => {
+cOpt(program.command('status <name>').description('declared persistent Agent unit/session state'))
+  .action(async (name, opts: { configuration?: string }) => {
+    findRole(loadConfig(opts.configuration), name);
     console.log(await pickBackend().status(name));
     // A role outlives the artifact that created it. If a different build is
     // reporting now, its settings may resolve differently than at creation.
@@ -1166,6 +1166,21 @@ cOpt(program.command('init').description('idempotent host setup plus missing pac
     console.log(`Packaged preset revision ${seeded.revision}: ${seeded.sourceRoot}`);
     console.log(`Created ${seeded.created.length}; preserved ${seeded.preserved.length} existing file(s).`);
     console.log(INIT_COMPLETION_GUIDANCE);
+  });
+
+cOpt(program.command('migrate-agent-templates')
+  .description('dry-run the exact legacy starter split; add --write to apply atomically')
+  .option('--write', 'apply the reviewed migration and retain a private recovery backup'))
+  .action((opts: { configuration?: string; write?: boolean }) => {
+    try {
+      const result = migrateLegacyStarterPresets(opts.configuration ?? defaultConfigPath(), { write: opts.write });
+      console.log(result.write ? 'Applied legacy starter migration.' : 'Dry run only; no files were changed.');
+      for (const move of result.moves) console.log(`Move ${move.from} -> ${move.to}`);
+      for (const addition of result.additions) console.log(`Add ${addition}`);
+      console.log(`Staging path: ${result.stagingPath}`);
+      console.log(`Recovery backup: ${result.backupPath}`);
+      if (!result.write) console.log('Re-run with --write to apply this exact migration class.');
+    } catch (error) { die(error); }
   });
 
 const webCommand = cOpt(program.command('web').description('start or open the secure localhost fleet web console'))

@@ -5,4 +5,4 @@ contract: |
   Agent works the task autonomously, consulting the owner when blocked.
   Owner reviews and approves completion.
 members:
-  - { slot: agent, role: Agent, count: 1, agent: { ref: Agent } }
+  - { slot: agent, role: Agent, count: 1, agent_template: Agent }

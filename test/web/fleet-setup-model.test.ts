@@ -1,6 +1,9 @@
 import { describe, expect, it } from 'vitest';
 
-import { agentEditorState, editInlineAgentField } from '../../web/src/FleetSetup.js';
+import {
+  addAgentTemplate, agentEditorState, editInlineAgentField, fleetSetupSections,
+  removeAgentTemplate, renameAgentTemplate, type FleetSetupModel,
+} from '../../web/src/FleetSetup.js';
 
 describe('FleetSetup split Agent editing seam', () => {
   it('renders Role/Brain refs as preset-backed and refuses implicit edits', () => {
@@ -24,5 +27,24 @@ describe('FleetSetup split Agent editing seam', () => {
     expect(agent).toMatchObject({
       role: { inline: { mission: 'after' } }, brain: { inline: { harness: 'codex' } },
     });
+  });
+
+  it('keeps persistent and inert-template sections and mutations independent', () => {
+    const model: FleetSetupModel = {
+      manifest: {}, agents: { Coordinator: { template: 'Worker', overrides: {} } },
+      agent_templates: { Worker: { role: { inline: {} }, brain: { inline: { harness: 'codex' } } } },
+    };
+    expect(fleetSetupSections(model)).toEqual({
+      persistentAgents: ['Coordinator'], inertAgentTemplates: ['Worker'],
+    });
+    expect(agentEditorState(model.agents.Coordinator)).toMatchObject({
+      templateRef: 'Worker', directEditors: false, roleInline: undefined, brainInline: undefined,
+    });
+    const added = addAgentTemplate(model);
+    expect(added).toBe('Template1');
+    expect(renameAgentTemplate(model, added, 'Reviewer')).toBe(true);
+    expect(removeAgentTemplate(model, 'Reviewer')).toBe(true);
+    expect(model.agents).toEqual({ Coordinator: { template: 'Worker', overrides: {} } });
+    expect(Object.keys(model.agent_templates)).toEqual(['Worker']);
   });
 });

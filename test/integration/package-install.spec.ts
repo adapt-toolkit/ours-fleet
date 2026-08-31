@@ -130,7 +130,7 @@ describe('packed root package', () => {
         sandbox: 'danger-full-access',
         initialAgentMode: 'agent-full-access',
       });
-      expect(result.presets).toEqual({ revision: 1, created: 17, team: true, tester: true });
+      expect(result.presets).toEqual({ revision: 3, created: 66, team: true, tester: true });
 
       writeFileSync(join(consumerWithoutOptionalDir, 'package.json'), JSON.stringify({
         private: true,

@@ -50,7 +50,7 @@ describe('ours-fleet CLI', () => {
   it('init guidance copies the complete split default configuration', () => {
     expect(INIT_COMPLETION_GUIDANCE).toContain('ours-fleet config');
     expect(INIT_COMPLETION_GUIDANCE).toContain('ours-fleet template list');
-    expect(INIT_COMPLETION_GUIDANCE).toContain('fleet/{agents,roles,brains,room_templates}/*.yaml');
+    expect(INIT_COMPLETION_GUIDANCE).toContain('fleet/{agents,agent_templates,roles,brains,room_templates}/*.yaml');
   });
 
   it('redacts nested harness secrets identically from human and JSON config output', async () => {
@@ -523,6 +523,7 @@ describe('ours-fleet CLI', () => {
   }, 10_000);
 
   it('status names a held-down role, its reason and when', async () => {
+    writeV2Fixture(join(dir, 'fleet.yaml'), { roles: { Wedged: {} } });
     const { mkdirSync, writeFileSync } = await import('node:fs');
     const stateDir = join(dir, '.ours-fleet', 'agents', 'Wedged');
     mkdirSync(stateDir, { recursive: true });
