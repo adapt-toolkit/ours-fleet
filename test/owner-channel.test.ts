@@ -6,7 +6,10 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
-import { OwnerChannel } from '../src/owner-channel/channel.js';
+import {
+  OWNER_RECOVERY_DEGRADED, OWNER_RECOVERY_QUEUE_CAPACITY, OwnerChannel,
+  type OwnerChannelOptions,
+} from '../src/owner-channel/channel.js';
 import { ownerCommandHelp, type OwnerFleetOps } from '../src/owner-channel/commands.js';
 import {
   activateRoom, closeRoom, createRoomRecord, getRoomRecord,
@@ -115,6 +118,13 @@ afterEach(() => {
   for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true });
 });
 
+function deferred<T = void>() {
+  let resolve!: (value: T | PromiseLike<T>) => void;
+  let reject!: (reason?: unknown) => void;
+  const promise = new Promise<T>((done, fail) => { resolve = done; reject = fail; });
+  return { promise, resolve, reject };
+}
+
 function deferredTurn() {
   let resolve!: (result: TurnResult) => void;
   const completion = new Promise<TurnResult>(done => { resolve = done; });
@@ -127,6 +137,7 @@ function setup(messages: unknown[], result = {
   interrupt?: boolean; queuedBehind?: number; fleet?: OwnerFleetOps; events?: SessionEvent[];
   configPath?: string;
   prepareRestart?: (role: string, mode: 'keep' | 'fresh') => Promise<void>;
+  recoveryDeps?: OwnerChannelOptions['recoveryDeps'];
 } = {}) {
   const dir = mkdtempSync(join(tmpdir(), 'ours-owner-channel-'));
   dirs.push(dir);
@@ -153,9 +164,330 @@ function setup(messages: unknown[], result = {
     ...(options.configPath ? { configPath: options.configPath } : {}),
     prepareRestart: options.prepareRestart ?? (async () => undefined),
     ...(options.fleet ? { fleet: options.fleet } : {}),
+    ...(options.recoveryDeps ? { recoveryDeps: options.recoveryDeps } : {}),
   });
   return { channel, client, queuePrompt, interrupt, dir };
 }
+
+describe('owner channel daemon-generation recovery', () => {
+  it('releases the stale client before fresh attach/bind and performs a journal-safe read probe', async () => {
+    const { channel, client } = setup([]);
+    await channel.start();
+    const order: string[] = [];
+    client.close = vi.fn(async () => { order.push('close'); });
+    client.start = vi.fn(async () => { order.push('start'); });
+    client.bindIdentity = vi.fn(async () => { order.push('bind'); });
+    client.listIncomingMessages = vi.fn(async () => { order.push('list'); return []; });
+
+    await channel.recover('boot-2');
+    expect(order.slice(0, 3)).toEqual(['close', 'start', 'bind']);
+    expect(order.filter(item => item === 'list').length).toBeGreaterThanOrEqual(2);
+    expect(client.calls.some(call => call.name === 'getMessages')).toBe(false);
+    await channel.close();
+  });
+
+  it('quiesces a stale watch drain before closing or starting the replacement client', async () => {
+    const { channel, client } = setup([]);
+    const staleList = deferred<never[]>();
+    const order: string[] = [];
+    let listings = 0;
+    client.listIncomingMessages = vi.fn(async () => {
+      listings++;
+      order.push(listings === 1 ? 'stale-list' : 'fresh-list');
+      return listings === 1 ? staleList.promise : [];
+    });
+    client.close = vi.fn(async () => { order.push('close'); });
+    client.start = vi.fn(async () => { order.push('start'); });
+    client.bindIdentity = vi.fn(async () => { order.push('bind'); });
+    await channel.start();
+    await vi.waitFor(() => expect(order).toEqual(['start', 'bind', 'stale-list']));
+
+    const recovery = channel.recover('boot-2');
+    await new Promise(resolve => setImmediate(resolve));
+    expect(order).toEqual(['start', 'bind', 'stale-list']);
+    staleList.resolve([]);
+    await recovery;
+    expect(order.slice(2, 6)).toEqual(['stale-list', 'close', 'start', 'bind']);
+    expect(order.filter(item => item === 'fresh-list').length).toBeGreaterThanOrEqual(2);
+    await channel.close();
+  });
+
+  it('coalesces one epoch and prevents management from overtaking readiness', async () => {
+    const { channel, client } = setup([]);
+    await channel.start();
+    const attached = deferred();
+    const order: string[] = [];
+    client.close = vi.fn(async () => { order.push('close'); });
+    client.start = vi.fn(async () => { order.push('start'); await attached.promise; });
+    client.bindIdentity = vi.fn(async () => { order.push('bind'); });
+    client.listIncomingMessages = vi.fn(async () => { order.push('list'); return []; });
+    client.listContacts = vi.fn(async () => { order.push('manage'); return EMPTY_CONTACTS; });
+
+    const first = channel.recover('boot-2');
+    const duplicate = channel.recover('boot-2');
+    expect(duplicate).toBe(first);
+    const managed = channel.manage({ action: 'contact_list' });
+    await vi.waitFor(() => expect(order).toEqual(['close', 'start']));
+    expect(order).not.toContain('manage');
+    attached.resolve();
+    await expect(first).resolves.toBeUndefined();
+    await expect(managed).resolves.toMatchObject({ action: 'contact_list' });
+    expect(order.indexOf('manage')).toBeGreaterThan(order.lastIndexOf('list'));
+    await channel.close();
+  });
+
+  it('bounds deferred management and settles overflow deterministically', async () => {
+    const { channel, client } = setup([]);
+    await channel.start();
+    const attached = deferred();
+    client.start = vi.fn(async () => { await attached.promise; });
+    const recovery = channel.recover('boot-2');
+    const queued = Array.from({ length: OWNER_RECOVERY_QUEUE_CAPACITY }, () =>
+      channel.manage({ action: 'contact_list' }));
+    await expect(channel.manage({ action: 'contact_list' })).rejects.toThrow('queue is full');
+    attached.resolve();
+    await recovery;
+    await expect(Promise.all(queued)).resolves.toHaveLength(OWNER_RECOVERY_QUEUE_CAPACITY);
+    await channel.close();
+  });
+
+  it('keeps binder ownership and durable claims intact across a bind failure and retry', async () => {
+    const { channel, client, dir } = setup([]);
+    await channel.start();
+    client.failTools.add('bindIdentity');
+    await expect(channel.recover('boot-2')).rejects.toThrow('bindIdentity failed');
+    expect(existsSync(join(dir, '.owner-channel-message-recovery.json'))).toBe(false);
+    client.failTools.delete('bindIdentity');
+    await expect(channel.recover('boot-2')).resolves.toBeUndefined();
+    expect(client.calls.filter(call => call.name === 'bindIdentity')).toHaveLength(3);
+    await channel.close();
+  });
+
+  it('settles deferred management and proactive work as degraded after recovery failure', async () => {
+    const { channel, client } = setup([]);
+    await channel.start();
+    client.failTools.add('bindIdentity');
+    const contacts = vi.spyOn(client, 'listContacts');
+    const sends = vi.spyOn(client, 'sendMessage');
+    const recovery = channel.recover('boot-2');
+    const managed = channel.manage({ action: 'contact_list' });
+    const proactive = channel.notifyFleetSpawn({
+      caller: 'Coordinator', role: 'Temp', lifetime: 'temporary', harness: 'codex',
+      session: 'acp', monitor: { mode: 'fleet', interrupt: false }, inherited: [],
+      creationActionId: 'creation-1',
+    } as never);
+    await expect(recovery).rejects.toThrow('bindIdentity failed');
+    for (const operation of [managed, proactive]) {
+      const error = await operation.catch(value => value as Error & { code?: string });
+      expect(error).toMatchObject({ code: OWNER_RECOVERY_DEGRADED });
+    }
+    expect(contacts).not.toHaveBeenCalled();
+    expect(sends).not.toHaveBeenCalled();
+    await expect(channel.manage({ action: 'contact_list' }))
+      .rejects.toMatchObject({ code: OWNER_RECOVERY_DEGRADED });
+
+    client.failTools.delete('bindIdentity');
+    await channel.recover('boot-2');
+    await expect(channel.manage({ action: 'contact_list' })).resolves.toMatchObject({
+      action: 'contact_list',
+    });
+    expect(contacts).toHaveBeenCalledTimes(1);
+    await channel.close();
+  });
+
+  it('serializes proactive delivery through successful recovery and sends it exactly once', async () => {
+    const { channel, client } = setup([]);
+    await channel.start();
+    const attached = deferred();
+    client.start = vi.fn(async () => { await attached.promise; });
+    const recovery = channel.recover('boot-proactive');
+    const proactive = channel.notifyFleetSpawn({
+      caller: 'Coordinator', role: 'Temp', lifetime: 'temporary', harness: 'codex',
+      session: 'acp', monitor: { mode: 'fleet', interrupt: false }, inherited: [],
+      creationActionId: 'creation-success',
+    } as never);
+    expect(client.calls.filter(call => call.name === 'sendMessage')).toHaveLength(0);
+    attached.resolve();
+    await recovery;
+    await proactive;
+    const sends = client.calls.filter(call => call.name === 'sendMessage');
+    expect(sends).toHaveLength(1);
+    expect(sends[0].args?.text).toContain('spawned temporary agent Temp');
+    await channel.close();
+  });
+
+  it('processes a new authenticated Owner wire end-to-end after recovery exactly once', async () => {
+    const { channel, client, queuePrompt, dir } = setup([]);
+    await channel.start();
+    await channel.recover('boot-owner-e2e');
+    await new Promise(resolve => setImmediate(resolve));
+    const message = ownerMessage(44, 'wire-after-recovery', 'Perform safe action');
+    client.batches.splice(0, client.batches.length, [message], []);
+    await channel.drain();
+    await vi.waitFor(() => expect(client.calls.filter(call => call.name === 'sendMessage')).toHaveLength(2));
+    expect(queuePrompt).toHaveBeenCalledOnce();
+    expect(queuePrompt.mock.calls[0][0]).toContain('Perform safe action');
+    expect(client.calls.filter(call => call.name === 'sendMessage').map(call => call.args?.replyToWireId))
+      .toEqual(['wire-after-recovery', 'wire-after-recovery']);
+    const journal = readFileSync(join(dir, '.owner-channel-message-recovery.json'), 'utf8');
+    expect(journal).toContain('wire-after-recovery');
+    expect(journal).not.toContain('Perform safe action');
+    await channel.drain(); // duplicate body-free hint with no new unread body
+    expect(queuePrompt).toHaveBeenCalledOnce();
+    expect(client.calls.filter(call => call.name === 'sendMessage')).toHaveLength(2);
+    for (const name of ['.daemon-recovery.json', '.owner-channel-shutdown.json']) {
+      if (existsSync(join(dir, name))) {
+        const diagnostic = readFileSync(join(dir, name), 'utf8');
+        expect(diagnostic).not.toContain('Perform safe action');
+        expect(diagnostic).not.toContain(OWNER_CID);
+      }
+    }
+    await channel.close();
+  });
+
+  it('bounds stale-drain quiescence and forbids replacement overlap until it settles', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(0);
+    const recoveryDeps = {
+      now: () => Date.now(), setTimer: setTimeout, clearTimer: clearTimeout, deadlineMs: 100,
+    };
+    const { channel, client } = setup([], undefined, { recoveryDeps });
+    const stale = deferred<never[]>();
+    let listings = 0;
+    client.listIncomingMessages = vi.fn(async () => ++listings === 1 ? stale.promise : []);
+    await channel.start();
+    await vi.advanceTimersByTimeAsync(0);
+    const closes = vi.spyOn(client, 'close');
+    const starts = vi.spyOn(client, 'start');
+    const recovery = channel.recover('boot-timeout');
+    const queued = channel.manage({ action: 'contact_list' });
+    const recoveryOutcome = recovery.catch(error => error as Error & { stage?: string });
+    const queuedOutcome = queued.catch(error => error as Error & { code?: string });
+    await vi.advanceTimersByTimeAsync(100);
+    await expect(recoveryOutcome).resolves.toMatchObject({ stage: 'stale_quiescence' });
+    await expect(queuedOutcome).resolves.toMatchObject({ code: OWNER_RECOVERY_DEGRADED });
+    expect(closes).not.toHaveBeenCalled();
+    expect(starts).not.toHaveBeenCalled();
+
+    stale.resolve([]);
+    await vi.advanceTimersByTimeAsync(0);
+    await expect(channel.manage({ action: 'contact_list' }))
+      .rejects.toMatchObject({ code: OWNER_RECOVERY_DEGRADED });
+    await expect(channel.recover('boot-timeout')).resolves.toBeUndefined();
+    expect(closes).toHaveBeenCalledTimes(1);
+    expect(starts).toHaveBeenCalledTimes(1);
+    await channel.close();
+  });
+
+  it('bounds a hanging bind, fences its late completion, and degrades queued work', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(0);
+    const recoveryDeps = {
+      now: () => Date.now(), setTimer: setTimeout, clearTimer: clearTimeout, deadlineMs: 100,
+    };
+    const { channel, client } = setup([], undefined, { recoveryDeps });
+    await channel.start();
+    const hanging = deferred<void>();
+    let binds = 0;
+    client.bindIdentity = vi.fn(async () => {
+      binds++;
+      if (binds === 1) await hanging.promise;
+    });
+    const recovery = channel.recover('boot-bind-timeout');
+    const queued = channel.manage({ action: 'contact_list' });
+    const recoveryOutcome = recovery.catch(error => error as Error & { stage?: string });
+    const queuedOutcome = queued.catch(error => error as Error & { code?: string });
+    await vi.advanceTimersByTimeAsync(100);
+    await expect(recoveryOutcome).resolves.toMatchObject({ stage: 'bind' });
+    await expect(queuedOutcome).resolves.toMatchObject({ code: OWNER_RECOVERY_DEGRADED });
+
+    hanging.resolve();
+    await vi.advanceTimersByTimeAsync(0);
+    await expect(channel.manage({ action: 'contact_list' }))
+      .rejects.toMatchObject({ code: OWNER_RECOVERY_DEGRADED });
+    await expect(channel.recover('boot-bind-timeout')).resolves.toBeUndefined();
+    expect(binds).toBe(2);
+    await channel.close();
+  });
+
+  it('bounds close on a never-settling stale drain without overlapping client disposal', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(0);
+    const recoveryDeps = {
+      now: () => Date.now(), setTimer: setTimeout, clearTimer: clearTimeout, deadlineMs: 100,
+    };
+    const { channel, client, dir } = setup([], undefined, { recoveryDeps });
+    const stale = deferred<never[]>();
+    client.listIncomingMessages = vi.fn(async () => stale.promise);
+    await channel.start();
+    await vi.advanceTimersByTimeAsync(0);
+    const clientClose = vi.spyOn(client, 'close');
+    const closing = channel.close();
+    await vi.advanceTimersByTimeAsync(100);
+    await expect(closing).resolves.toBeUndefined();
+    expect(clientClose).not.toHaveBeenCalled();
+    expect(channel.binderReleaseSafe()).toBe(false);
+    expect(JSON.parse(readFileSync(join(dir, '.owner-channel-shutdown.json'), 'utf8')))
+      .toMatchObject({ state: 'degraded', reason: 'OWNER_SHUTDOWN_QUIESCENCE_TIMEOUT' });
+    await expect(channel.manage({ action: 'contact_list' }))
+      .rejects.toMatchObject({ code: OWNER_RECOVERY_DEGRADED });
+    stale.resolve([]);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(clientClose).not.toHaveBeenCalled();
+  });
+
+  it('does not overlap close with quiescence debt from a timed-out bind', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(0);
+    const recoveryDeps = {
+      now: () => Date.now(), setTimer: setTimeout, clearTimer: clearTimeout, deadlineMs: 100,
+    };
+    const { channel, client } = setup([], undefined, { recoveryDeps });
+    await channel.start();
+    const hanging = deferred<void>();
+    client.bindIdentity = vi.fn(async () => { await hanging.promise; });
+    const closeSpy = vi.spyOn(client, 'close');
+    const recovery = channel.recover('boot-bind-close');
+    const recoveryOutcome = recovery.catch(error => error as Error & { stage?: string });
+    await vi.advanceTimersByTimeAsync(100);
+    await expect(recoveryOutcome).resolves.toMatchObject({ stage: 'bind' });
+    const closeCallsBefore = closeSpy.mock.calls.length;
+    const closing = channel.close();
+    await vi.advanceTimersByTimeAsync(100);
+    await expect(closing).resolves.toBeUndefined();
+    expect(closeSpy).toHaveBeenCalledTimes(closeCallsBefore);
+    expect(channel.binderReleaseSafe()).toBe(false);
+    hanging.resolve();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(closeSpy).toHaveBeenCalledTimes(closeCallsBefore);
+  });
+
+  it('fences a superseded epoch and stop from publishing late readiness', async () => {
+    const { channel, client } = setup([]);
+    await channel.start();
+    const firstAttach = deferred();
+    let starts = 0;
+    client.start = vi.fn(async () => {
+      starts++;
+      if (starts === 1) await firstAttach.promise;
+    });
+    const first = channel.recover('boot-2');
+    const second = channel.recover('boot-3');
+    firstAttach.resolve();
+    await expect(first).rejects.toThrow('superseded');
+    await expect(second).resolves.toBeUndefined();
+
+    const stoppedAttach = deferred();
+    client.start = vi.fn(async () => { await stoppedAttach.promise; });
+    const late = channel.recover('boot-4');
+    const closing = channel.close();
+    stoppedAttach.resolve();
+    await expect(late).rejects.toThrow('superseded');
+    await closing;
+    await expect(channel.manage({ action: 'contact_list' }))
+      .rejects.toMatchObject({ code: OWNER_RECOVERY_DEGRADED });
+  });
+});
 
 function liveSetup(options: {
   interrupt?: boolean; progressIntervalMs?: number; owners?: string[];

@@ -5,6 +5,7 @@ import { classifyActivity } from '../session/activity.js';
 import { controlRequest } from '../session/control.js';
 import { SessionControlError, type SessionSnapshot } from '../session/types.js';
 import { readExitRecord, readRestartLedger } from '../runner.js';
+import { readDaemonRecoveryStatus } from '../daemon-recovery.js';
 import { roleCapabilities, type CapabilityContext } from './capabilities.js';
 import { FleetError } from './errors.js';
 import { RoleRepository } from './role-repository.js';
@@ -58,7 +59,8 @@ function sessionOverall(
 ): RoleStatus['overall'] {
   if (restart.circuit === 'open' || monitor.health === 'failed' || monitor.health === 'degraded'
       || isolation.degraded
-      || problems.some(problem => problem.severity === 'error' || problem.source === 'watchdog')
+      || problems.some(problem => problem.severity === 'error'
+        || problem.source === 'watchdog' || problem.source === 'daemon-recovery')
       || session.readiness === 'failed') return 'attention';
   // A reachable agent session is the user's live interaction surface. Its
   // evidence remains authoritative even when a service manager no longer owns
@@ -127,6 +129,16 @@ export class FleetQueryService {
     const lastExit = dir ? readExitRecord(join(dir, '.exit-status')) ?? undefined : undefined;
     const session = await this.session(role, dir, live.state);
     const problems = [...role.problems];
+    const recovery = dir ? readDaemonRecoveryStatus(dir) : undefined;
+    if (recovery && recovery.state !== 'recovered') {
+      const paths = (['agent', 'owner'] as const)
+        .filter(name => recovery.paths[name].state !== 'recovered')
+        .map(name => `${name}:${recovery.paths[name].state}`);
+      problems.push({
+        code: 'daemon_recovery', severity: 'warning', source: 'daemon-recovery',
+        detail: `${recovery.state}; ${paths.join(', ') || 'no degraded path'}; epoch ${recovery.epoch || 'unavailable'}`,
+      });
+    }
     if (live.state === 'running' && session.reachability !== 'online')
       problems.push({
         code: 'supervisor_session_disagreement', severity: 'warning',

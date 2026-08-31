@@ -22,6 +22,7 @@ import type { PrereqCheck, PrereqReport } from './harness/types.js';
 import {
   analyzeInstalls, buildInfo, buildLabel, discoverInstalls, BIN_NAME,
 } from './provenance.js';
+import { readDaemonRecoveryStatus } from './daemon-recovery.js';
 
 /** Which cgroup-v2 controllers are delegated to this user manager (advisory). */
 function cgroupDelegationDetail(): string {
@@ -138,6 +139,18 @@ export async function doctor(
     ok: true,
     detail: `warning: ${diagnostic.message}`,
   });
+  for (const role of roles) {
+    const recovery = readDaemonRecoveryStatus(agentDir(role.name));
+    if (!recovery) continue;
+    const paths = (['agent', 'owner'] as const)
+      .map(name => `${name}=${recovery.paths[name].state}`)
+      .join(', ');
+    checks.push({
+      name: `daemon recovery: ${role.name}`,
+      ok: recovery.state === 'recovered',
+      detail: `${recovery.state}; ${paths}; epoch ${recovery.epoch || 'unavailable'}`,
+    });
+  }
 
   // ── Rooms/tasks checks ────────────────────────────────────────
   if (loaded.ok && loaded.rooms) {

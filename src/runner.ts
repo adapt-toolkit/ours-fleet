@@ -12,6 +12,11 @@ import {
   createMonitor, probeIdentityPresence,
   type MonitorDeps, type MonitorHandle, type MonitorOpts, type FetchLike,
 } from './monitor.js';
+import {
+  DaemonGenerationObserver, RoleRecoveryController, probeDaemonGeneration,
+  type DaemonGenerationProbe,
+} from './daemon-recovery.js';
+import { recoverAgentIdentity } from './agent-recovery-gate.js';
 import { realExec, type Exec } from './exec.js';
 import { resolveIsolation } from './isolation/policy.js';
 import { selectIsolationBackend } from './isolation/registry.js';
@@ -59,6 +64,7 @@ export interface RunnerDeps {
   log(line: string): void;
   /** HTTP transport for the monitor's daemon long-poll (injectable for tests). */
   fetch: FetchLike;
+  probeGeneration(env: NodeJS.ProcessEnv): Promise<DaemonGenerationProbe>;
   /** Construct the supervisor mail monitor (injectable so tests stub it out). */
   createMonitor(opts: MonitorOpts): MonitorHandle;
   /** Construct trusted owner ingress (injectable for lifecycle tests). */
@@ -81,6 +87,16 @@ export interface RunnerDeps {
   shouldStop?(): boolean;
 }
 
+export const SUPERVISOR_RECYCLE_REQUIRED = 'OWNER_CHANNEL_SUPERVISOR_RECYCLE_REQUIRED';
+
+export class SupervisorRecycleRequiredError extends Error {
+  readonly code = SUPERVISOR_RECYCLE_REQUIRED;
+  constructor() {
+    super('owner channel requires a fresh supervisor process after unproven client quiescence');
+    this.name = 'SupervisorRecycleRequiredError';
+  }
+}
+
 const defaultDeps = (): RunnerDeps => ({
   exec: realExec,
   cpuDelegated: () => cpuControllerDelegated(),
@@ -89,6 +105,8 @@ const defaultDeps = (): RunnerDeps => ({
   now: () => Date.now(),
   log: line => process.stderr.write(line + '\n'),
   fetch: (url, init) => globalThis.fetch(url, init) as unknown as ReturnType<FetchLike>,
+  probeGeneration: env => probeDaemonGeneration(
+    (url, init) => globalThis.fetch(url, init) as unknown as ReturnType<FetchLike>, env),
   createMonitor: opts => createMonitor(opts),
   createOwnerChannel: opts => new OwnerChannel(opts),
   startAgentSession: (adapter, options) => adapter.start(options),
@@ -644,6 +662,10 @@ export async function runOnce(
     name, identity: role.identity, agentDir: dir, cfg: role.monitor,
     deps: resolvedMonitorDeps,
   }) : null;
+  const daemonObserver = new DaemonGenerationObserver();
+  const initialDaemon = daemonObserver.observe(
+    await deps.probeGeneration(resolvedMonitorDeps.env));
+  let sessionStartedWithoutDaemonBaseline = initialDaemon.kind !== 'baseline';
   if (monitor) await monitor.prime({ resetCursor: resetMonitorCursor });
 
   rmSync(exitFile, { force: true });
@@ -658,6 +680,7 @@ export async function runOnce(
   let ownerBinder: OwnerBinderLease | undefined;
   let loopManager: ScheduledLoopManagerHandle | undefined;
   let arbiter: RoleTurnArbiter | undefined;
+  let recoveryController: RoleRecoveryController | undefined;
   let reloadLoopConfig: (() => Promise<{ changed: boolean; loops: number }>) | undefined;
   let loopGeneration = JSON.stringify((role.loops ?? []).map(loop => [
     loop.name, loop.definitionHash, loop.promptHash,
@@ -887,16 +910,47 @@ export async function runOnce(
   // pane pid is known and is stopped when that pid dies (task dies with runner).
   monitorLoop ??= monitor?.run(pid);
 
+  recoveryController = new RoleRecoveryController({
+    role: name, identity: role.identity, stateDir: dir, now: deps.now, sleep: deps.sleep,
+    log: deps.log,
+    recoverAgent: async () => {
+      const evidence = await recoverAgentIdentity(arbiter!, role.identity);
+      return evidence.ok ? { ok: true } : { ok: false, reason: evidence.reason };
+    },
+    recoverOwner: async epoch => {
+      if (!ownerChannel?.recover) return { ok: true };
+      try { await ownerChannel.recover(epoch); return { ok: true }; }
+      catch (error) {
+        return { ok: false, reason: error instanceof Error
+          ? `OWNER_${error.name.toUpperCase()}` : 'OWNER_UNKNOWN_ERROR' };
+      }
+    },
+  });
+
   const start = deps.now();
   let nextLoopReloadAt = deps.now() + 30_000;
   let nextIdentityPollAt = deps.now();
+  let nextDaemonProbeAt = deps.now();
   let lastReloadError = '';
   let identityObserved = false;
   let identityAbsentSince: number | undefined;
   let retirementReason: AttemptResult['retirementReason'];
+  let supervisorRecycleRequired = false;
   while (sessionHandle.isAlive()) {
     await deps.sleep(temp ? 500 : 2000);
     const now = deps.now();
+    if (now >= nextDaemonProbeAt) {
+      nextDaemonProbeAt = now + 2_000;
+      const observation = daemonObserver.observe(
+        await deps.probeGeneration(resolvedMonitorDeps.env));
+      if (observation.kind === 'lost') recoveryController.noteLoss(observation.reason);
+      if (observation.kind === 'changed' || observation.kind === 'available'
+          || (observation.kind === 'baseline' && sessionStartedWithoutDaemonBaseline)) {
+        sessionStartedWithoutDaemonBaseline = false;
+        void recoveryController.recover(observation.generation).catch(error =>
+          deps.log(`[${name}] daemon recovery controller failed: ${(error as Error)?.name ?? 'Error'}`));
+      }
+    }
     if (temp && deps.shouldStop?.()) {
       retirementReason = requestedTempStopReason(dir) ?? 'supervisor-signal';
       deps.log(`[${name}] temporary supervisor retirement requested (${retirementReason})`);
@@ -944,6 +998,11 @@ export async function runOnce(
     control?.setLoopManager(undefined);
     await loopManager.stop();
   }
+  // Let already-settled path operations publish their aggregate result before
+  // the shutdown fence invalidates the epoch. This never waits on I/O.
+  await Promise.resolve();
+  await Promise.resolve();
+  recoveryController?.cancel();
   control?.setConfigReloader(undefined);
   // Close the authenticated control route before releasing the binder lease;
   // otherwise the predecessor can unlink the replacement's new socket.
@@ -953,7 +1012,10 @@ export async function runOnce(
     control = undefined;
   }
   if (ownerChannel) await ownerChannel.close();
-  ownerBinder?.release();
+  if (ownerChannel?.binderReleaseSafe?.() === false) {
+    deps.log(`[${name}] owner binder retained because client quiescence was not proven at shutdown`);
+    supervisorRecycleRequired = true;
+  } else ownerBinder?.release();
   if (monitor) { monitor.stop(); await monitorLoop; }
   unsubscribeRecovery?.();
   if (agentSession && !sessionClosed) await agentSession.close();
@@ -998,6 +1060,7 @@ export async function runOnce(
   } else deps.log(
     `[${name}] ${exitRecord.detail} (${elapsed.toFixed(0)}s) -> next start RESUMES context`);
 
+  if (supervisorRecycleRequired) throw new SupervisorRecycleRequiredError();
   return {
     elapsedSecs: elapsed, exit: exitRecord, rotated, mode, modelRecovery,
     ...(retirementReason ? { retirementReason } : {}),
@@ -1085,6 +1148,16 @@ export async function runSupervised(
       result = await attempt(
         name, { configPath: opts.configPath, allowResumeRotation: !ledger.resumeDiscarded }, deps);
     } catch (e) {
+      if (e instanceof SupervisorRecycleRequiredError) {
+        writeRestartLedger(dir, {
+          ...ledger,
+          lastReason: SUPERVISOR_RECYCLE_REQUIRED,
+          nextDelayMs: 0,
+          updatedAt: stamp(),
+        });
+        deps.log(`[${name}] supervisor recycle required: ${SUPERVISOR_RECYCLE_REQUIRED}`);
+        throw e;
+      }
       // A session that could not even start is an immediate failure like any
       // other; it must count, or an unstartable role loops forever.
       result = {
@@ -1179,7 +1252,10 @@ function fastFailSecsFor(name: string, configPath?: string): number {
 }
 
 /** Temp-agent entrypoint: run once, journal why it ended, then archive its evidence. */
-export async function runTemp(name: string, deps: Partial<RunnerDeps> = {}): Promise<void> {
+export async function runTemp(
+  name: string, deps: Partial<RunnerDeps> = {},
+  attempt: typeof runOnce = runOnce,
+): Promise<void> {
   const dir = agentDir(name, true);
   await markTempSupervisorActive(dir);
   let signal: NodeJS.Signals | undefined;
@@ -1190,7 +1266,7 @@ export async function runTemp(name: string, deps: Partial<RunnerDeps> = {}): Pro
   let result: AttemptResult | undefined;
   let failure: unknown;
   try {
-    result = await runOnce(name, { temp: true }, {
+    result = await attempt(name, { temp: true }, {
       ...deps,
       shouldStop: () => Boolean(signal) || (deps.shouldStop?.() ?? false),
     });
@@ -1202,6 +1278,7 @@ export async function runTemp(name: string, deps: Partial<RunnerDeps> = {}): Pro
     const requested = requestedTempStopReason(dir);
     const reason: TempTerminationReason = requested
       ?? result?.retirementReason
+      ?? (failure instanceof SupervisorRecycleRequiredError ? 'supervisor-recycle' : undefined)
       ?? (signal ? 'supervisor-signal' : failure ? 'startup-failure' : 'session-ended');
     // A service-manager stop can make the child connection close before the
     // runner reaches its normal loop. That is still a successful requested
