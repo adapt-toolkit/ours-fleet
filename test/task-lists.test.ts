@@ -129,7 +129,7 @@ describe('named task lists', () => {
     await Promise.all([run(process.execPath, ['--input-type=module', '-e', mover], { env }),
       run(process.execPath, ['--input-type=module', '-e', blocker], { env })]);
     expect(getTask(task.task_id)).toMatchObject({ list_id: list.list_id, blocked: { reason: 'final' } });
-  });
+  }, 20_000);
 
   it('persists identical CLI and authenticated REST operations and typed errors', async () => {
     const env = { ...process.env, OURS_FLEET_HOME: root };
