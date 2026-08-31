@@ -62,6 +62,51 @@ export interface TaskTerminalIntent {
   first_recovery_hint?: string;
 }
 
+/** Origin evidence for an accepted deletion; retained until the record is unlinked. */
+export type TaskDeletionActor =
+  | { kind: 'local_control'; surface: 'cli' | 'web' }
+  | { kind: 'authenticated_owner'; surface: 'messenger'; cid: string };
+
+export type TaskDeletionMemberPhase =
+  | 'pending'
+  | 'stop_requested'
+  | 'liveness_absent'
+  | 'archive_secured'
+  | 'identity_absent';
+
+/**
+ * Durable retirement cursor for a managed member when no room orchestration
+ * record exists to carry the equivalent seat cursor.
+ */
+export interface TaskDeletionMemberCursor {
+  name: string;
+  identity_cid: string;
+  phase: TaskDeletionMemberPhase;
+  launch_id?: string;
+  archive_path?: string;
+  updated_at: string;
+}
+
+/**
+ * First-wins durable deletion intent. There is no settled status: settlement
+ * ends by unlinking the task record, so physical absence is the completion
+ * evidence. While pending, the task is hidden from normal operation and every
+ * lifecycle mutation or room publication is rejected.
+ */
+export interface TaskDeletionIntent {
+  status: 'pending';
+  accepted_at: string;
+  actor: TaskDeletionActor;
+  room_id?: string;
+  /** Snapshot of managed members at acceptance; the missing-room retirement evidence. */
+  members: TaskDeletionMemberCursor[];
+  error?: string;
+  error_at?: string;
+  recovery_hint?: string;
+  first_failure?: string;
+  first_recovery_hint?: string;
+}
+
 export interface TaskRecord {
   task_id: string;
   /** Stable organizational list identifier. Missing legacy values mean `default`. */
@@ -92,6 +137,7 @@ export interface TaskRecord {
   ended_at?: string;
   outcome?: TaskOutcome;
   terminal_intent?: TaskTerminalIntent;
+  deletion?: TaskDeletionIntent;
 }
 
 export interface TaskListRecord {

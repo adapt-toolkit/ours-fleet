@@ -6,6 +6,7 @@ import { stateRoot } from '../paths.js';
 import type {
   TaskRecord, TaskState, TaskBlocked, TaskOrigin, TaskTemplateRef,
   TaskOutcome, TaskMemberRole, TaskTerminalIntent,
+  TaskDeletionActor, TaskDeletionMemberPhase,
 } from './types.js';
 import { TASK_TERMINAL_STATES, TASK_CANCELLABLE_STATES } from './types.js';
 import { DEFAULT_TASK_LIST_ID, readTaskLists } from './task-lists.js';
@@ -120,6 +121,18 @@ function assertNoPendingTerminalIntent(task: TaskRecord): void {
   }
 }
 
+/**
+ * Accepted deletion is the per-task epoch guard: once pending, every lifecycle
+ * mutation, terminal settlement, and room publication must fail boundedly.
+ */
+export function assertNoPendingDeletion(task: TaskRecord): void {
+  if (task.deletion?.status === 'pending') {
+    throw new TaskStateError(
+      `task ${task.task_id} is pending deletion; run 'ours-fleet task delete ${task.task_id} ${task.task_id}' to retry cleanup`,
+    );
+  }
+}
+
 // ── CRUD ────────────────────────────────────────────────────────────────
 
 export interface CreateTaskInput {
@@ -176,6 +189,7 @@ export function updateTaskExecutionPlan(
 ): TaskRecord {
   return withTaskLock(id, () => {
     const task = readTask(id);
+    assertNoPendingDeletion(task);
     if (task.execution_plan && task.execution_plan.plan_hash !== executionPlan.plan_hash)
       throw new TaskStateError(`task ${id} execution plan mismatch`);
     task.execution_plan = executionPlan;
@@ -186,7 +200,9 @@ export function updateTaskExecutionPlan(
   });
 }
 
-export function listTasks(filter?: { state?: TaskState | TaskState[]; listId?: string }): TaskRecord[] {
+export function listTasks(filter?: {
+  state?: TaskState | TaskState[]; listId?: string; includeDeleting?: boolean;
+}): TaskRecord[] {
   const dir = tasksDir();
   if (!existsSync(dir)) return [];
   const states = filter?.state
@@ -197,6 +213,7 @@ export function listTasks(filter?: { state?: TaskState | TaskState[]; listId?: s
     try {
       const id = f.slice(0, -5);
       const t = withTaskLock(id, () => presentTask(JSON.parse(readFileSync(join(dir, f), 'utf8')) as StoredTaskRecord));
+      if (t.deletion?.status === 'pending' && !filter?.includeDeleting) continue;
       if ((!states || states.includes(t.state)) && (!filter?.listId || t.list_id === filter.listId)) tasks.push(t);
     } catch { /* corrupt file, skip */ }
   }
@@ -207,7 +224,9 @@ export function listTasks(filter?: { state?: TaskState | TaskState[]; listId?: s
 
 export function moveTaskToList(id: string, listId: string): TaskRecord {
   return withTaskLock(id, () => {
-    const task = readTask(id); task.list_id = listId; writeTask(task); return readTask(id);
+    const task = readTask(id);
+    assertNoPendingDeletion(task);
+    task.list_id = listId; writeTask(task); return readTask(id);
   });
 }
 
@@ -218,6 +237,7 @@ export function findByIdempotencyKey(key: string): TaskRecord | undefined {
 export function startTask(id: string): TaskRecord {
   return withTaskLock(id, () => {
   const t = readTask(id);
+  assertNoPendingDeletion(t);
   assertNoPendingTerminalIntent(t);
   assertTransition(t.state, 'provisioning');
   t.state = 'provisioning';
@@ -230,6 +250,7 @@ export function startTask(id: string): TaskRecord {
 export function activateTask(id: string): TaskRecord {
   return withTaskLock(id, () => {
   const t = readTask(id);
+  assertNoPendingDeletion(t);
   assertNoPendingTerminalIntent(t);
   assertTransition(t.state, 'active');
   t.state = 'active';
@@ -242,6 +263,7 @@ export function activateTask(id: string): TaskRecord {
 export function blockTask(id: string, reason: string): TaskRecord {
   return withTaskLock(id, () => {
   const t = readTask(id);
+  assertNoPendingDeletion(t);
   assertNoPendingTerminalIntent(t);
   if (TASK_TERMINAL_STATES.includes(t.state))
     throw new TaskStateError(`cannot block a '${t.state}' task`);
@@ -254,6 +276,7 @@ export function blockTask(id: string, reason: string): TaskRecord {
 export function unblockTask(id: string): TaskRecord {
   return withTaskLock(id, () => {
   const t = readTask(id);
+  assertNoPendingDeletion(t);
   assertNoPendingTerminalIntent(t);
   if (!t.blocked) throw new TaskStateError('task is not blocked');
   delete t.blocked;
@@ -265,6 +288,7 @@ export function unblockTask(id: string): TaskRecord {
 export function reviewTask(id: string): TaskRecord {
   return withTaskLock(id, () => {
   const t = readTask(id);
+  assertNoPendingDeletion(t);
   assertNoPendingTerminalIntent(t);
   assertTransition(t.state, 'review');
   t.state = 'review';
@@ -277,6 +301,7 @@ export function reviewTask(id: string): TaskRecord {
 export function completeTask(id: string, outcome?: TaskOutcome): TaskRecord {
   return withTaskLock(id, () => {
   const t = readTask(id);
+  assertNoPendingDeletion(t);
   assertNoPendingTerminalIntent(t);
   assertTransition(t.state, 'done');
   t.state = 'done';
@@ -291,6 +316,7 @@ export function completeTask(id: string, outcome?: TaskOutcome): TaskRecord {
 export function cancelTask(id: string): TaskRecord {
   return withTaskLock(id, () => {
   const t = readTask(id);
+  assertNoPendingDeletion(t);
   assertNoPendingTerminalIntent(t);
   if (!TASK_CANCELLABLE_STATES.includes(t.state))
     throw new TaskStateError(`cannot cancel a '${t.state}' task`);
@@ -313,6 +339,7 @@ export function beginTaskTerminalIntent(
 ): TaskRecord {
   return withTaskLock(id, () => {
   const t = readTask(id);
+  assertNoPendingDeletion(t);
   const existing = t.terminal_intent;
   if (existing) {
     if (existing.kind !== input.kind || existing.room_id !== input.roomId
@@ -372,6 +399,7 @@ export function setTaskTerminalIntentError(
 export function finishTaskTerminalIntent(id: string): TaskRecord {
   return withTaskLock(id, () => {
   const t = readTask(id);
+  assertNoPendingDeletion(t);
   const intent = t.terminal_intent;
   if (!intent) throw new TaskStateError(`task ${id} has no terminal intent`);
   if (intent.status === 'settled') return t;
@@ -399,6 +427,7 @@ export function finishTaskTerminalIntent(id: string): TaskRecord {
 export function failTask(id: string, error: string): TaskRecord {
   return withTaskLock(id, () => {
   const t = readTask(id);
+  assertNoPendingDeletion(t);
   assertNoPendingTerminalIntent(t);
   assertTransition(t.state, 'failed');
   t.state = 'failed';
@@ -417,6 +446,7 @@ export function updateTaskRoom(
 ): TaskRecord {
   return withTaskLock(id, () => {
   const t = readTask(id);
+  assertNoPendingDeletion(t);
   assertNoPendingTerminalIntent(t);
   t.room_id = roomId;
   t.room_identity_cid = roomIdentityCid;
@@ -428,6 +458,7 @@ export function updateTaskRoom(
 export function updateTaskTemplate(id: string, template: TaskTemplateRef): TaskRecord {
   return withTaskLock(id, () => {
   const t = readTask(id);
+  assertNoPendingDeletion(t);
   assertNoPendingTerminalIntent(t);
   t.template = template;
   writeTask(t);
@@ -438,10 +469,171 @@ export function updateTaskTemplate(id: string, template: TaskTemplateRef): TaskR
 export function updateTaskMembers(id: string, members: TaskMemberRole[]): TaskRecord {
   return withTaskLock(id, () => {
   const t = readTask(id);
+  assertNoPendingDeletion(t);
   assertNoPendingTerminalIntent(t);
   t.member_roles = members;
   writeTask(t);
   return t;
+  });
+}
+
+function presentTaskLenient(record: StoredTaskRecord): TaskRecord {
+  try { return presentTask(record); }
+  catch {
+    // A broken list reference must never make a task undeletable.
+    const listId = record.list_id ?? DEFAULT_TASK_LIST_ID;
+    return { ...record, list_id: listId, list_name: listId === DEFAULT_TASK_LIST_ID ? 'default' : listId };
+  }
+}
+
+export type TaskDeletionAcceptance =
+  | { status: 'accepted' | 'pending'; task: TaskRecord }
+  | { status: 'already_absent' };
+
+/**
+ * Persist the first-wins durable deletion intent. Accepts every lifecycle
+ * state, takes precedence over a pending terminal intent, and never touches
+ * remote resources. Repeat requests while pending re-arm settlement; a request
+ * for a missing record reports the idempotent already-absent outcome.
+ *
+ * Low-level record mutation only. Callers serialize acceptance with settlement
+ * through deletion.ts, which holds the common task-operation lock.
+ */
+export function beginTaskDeletionIntent(id: string, actor: TaskDeletionActor): TaskDeletionAcceptance {
+  return withTaskLock(id, () => {
+  assertCanonicalTaskId(id);
+  let stored: StoredTaskRecord;
+  try {
+    stored = JSON.parse(readFileSync(taskPath(id), 'utf8')) as StoredTaskRecord;
+  } catch (error) {
+    if (isNotFoundError(error)) return { status: 'already_absent' };
+    throw error;
+  }
+  if (stored.deletion?.status === 'pending')
+    return { status: 'pending', task: presentTaskLenient(stored) };
+  const now = new Date().toISOString();
+  stored.deletion = {
+    status: 'pending',
+    accepted_at: now,
+    actor,
+    room_id: stored.room_id,
+    members: (stored.member_roles ?? []).map(member => ({
+      name: member.name, identity_cid: member.identity_cid, phase: 'pending', updated_at: now,
+    })),
+  };
+  writeTask(stored);
+  return { status: 'accepted', task: presentTaskLenient(stored) };
+  });
+}
+
+/** Record an actionable settlement failure; the task stays hidden and recoverable. */
+export function setTaskDeletionError(id: string, error: string, recoveryHint: string): TaskRecord {
+  return withTaskLock(id, () => {
+  assertCanonicalTaskId(id);
+  const stored = JSON.parse(readFileSync(taskPath(id), 'utf8')) as StoredTaskRecord;
+  if (stored.deletion?.status !== 'pending')
+    throw new TaskStateError(`task ${id} has no pending deletion`);
+  stored.deletion.first_failure ??= error;
+  stored.deletion.first_recovery_hint ??= recoveryHint;
+  stored.deletion.error = error;
+  const previousErrorAt = Date.parse(stored.deletion.error_at ?? '');
+  stored.deletion.error_at = new Date(Math.max(
+    Date.now(), Number.isFinite(previousErrorAt) ? previousErrorAt + 1 : 0,
+  )).toISOString();
+  stored.deletion.recovery_hint = recoveryHint;
+  writeTask(stored);
+  return presentTaskLenient(stored);
+  });
+}
+
+const DELETION_MEMBER_PHASE_ORDER: Record<TaskDeletionMemberPhase, number> = {
+  pending: 0, stop_requested: 1, liveness_absent: 2, archive_secured: 3, identity_absent: 4,
+};
+
+/** Marker proving a member never launched, mirroring close.ts's short path. */
+export const DELETION_MEMBER_NEVER_LAUNCHED = 'never-launched';
+
+/**
+ * Advance a member retirement cursor carried by the deletion intent. Only
+ * adjacent forward transitions are legal — plus the explicit
+ * pending → identity_absent short path proved by the 'never-launched' marker —
+ * so no managed agent can be claimed retired without the full evidence chain.
+ * launch_id and archive_path are immutable once recorded; same-phase retries
+ * are idempotent but must not change evidence.
+ */
+export function advanceTaskDeletionMember(
+  id: string, name: string, phase: TaskDeletionMemberPhase,
+  launchId?: string, archivePath?: string,
+): TaskRecord {
+  return withTaskLock(id, () => {
+  assertCanonicalTaskId(id);
+  const stored = JSON.parse(readFileSync(taskPath(id), 'utf8')) as StoredTaskRecord;
+  if (stored.deletion?.status !== 'pending')
+    throw new TaskStateError(`task ${id} has no pending deletion`);
+  const cursor = stored.deletion.members.find(member => member.name === name);
+  if (!cursor) throw new TaskStateError(`task ${id} deletion has no member cursor '${name}'`);
+  if (cursor.launch_id !== undefined && launchId !== undefined && launchId !== cursor.launch_id)
+    throw new TaskStateError(
+      `task ${id} deletion member '${name}' launch ownership proof is immutable`,
+    );
+  if (cursor.archive_path !== undefined && archivePath !== undefined && archivePath !== cursor.archive_path)
+    throw new TaskStateError(
+      `task ${id} deletion member '${name}' archive evidence is immutable`,
+    );
+  const step = DELETION_MEMBER_PHASE_ORDER[phase] - DELETION_MEMBER_PHASE_ORDER[cursor.phase];
+  const launch = cursor.launch_id ?? launchId;
+  if (step < 0)
+    throw new TaskStateError(
+      `task ${id} deletion member '${name}' cannot move back from '${cursor.phase}' to '${phase}'`,
+    );
+  if (step === 0) return presentTaskLenient(stored); // idempotent retry, evidence already verified
+  const neverLaunched = cursor.phase === 'pending' && phase === 'identity_absent'
+    && launch === DELETION_MEMBER_NEVER_LAUNCHED;
+  if (step !== 1 && !neverLaunched)
+    throw new TaskStateError(
+      `task ${id} deletion member '${name}' cannot skip from '${cursor.phase}' to '${phase}' without evidence`,
+    );
+  if (launch === undefined)
+    throw new TaskStateError(
+      `task ${id} deletion member '${name}' cannot reach '${phase}' without a launch ownership proof`,
+    );
+  if (phase === 'archive_secured' && (cursor.archive_path ?? archivePath) === undefined)
+    throw new TaskStateError(
+      `task ${id} deletion member '${name}' cannot reach 'archive_secured' without archive evidence`,
+    );
+  cursor.phase = phase;
+  cursor.launch_id = launch;
+  if (archivePath !== undefined) cursor.archive_path = archivePath;
+  cursor.updated_at = new Date().toISOString();
+  writeTask(stored);
+  return presentTaskLenient(stored);
+  });
+}
+
+/**
+ * Physically remove a deletion-pending task record. Settlement-only: callers
+ * must have completed member retirement and room cleanup first. Missing
+ * records are the idempotent already-settled outcome.
+ */
+export function unlinkDeletedTask(id: string): boolean {
+  return withTaskLock(id, () => {
+  assertCanonicalTaskId(id);
+  let stored: StoredTaskRecord;
+  try {
+    stored = JSON.parse(readFileSync(taskPath(id), 'utf8')) as StoredTaskRecord;
+  } catch (error) {
+    if (isNotFoundError(error)) return false;
+    throw error;
+  }
+  if (stored.deletion?.status !== 'pending')
+    throw new TaskStateError(`task ${id} has no pending deletion`);
+  try {
+    unlinkSync(taskPath(id));
+  } catch (error) {
+    if (isNotFoundError(error)) return false;
+    throw error;
+  }
+  return true;
   });
 }
 
