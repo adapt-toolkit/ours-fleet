@@ -265,36 +265,80 @@ const taskActionMarkdown = (
   });
 };
 
-function safeBrainSummary(definition: Record<string, unknown> | undefined): string {
-  const brain = definition?.brain;
-  if (!brain || typeof brain !== 'object' || Array.isArray(brain)) return 'unresolved';
-  const selection = brain as Record<string, unknown>;
+function safeSelectionSummary(definition: Record<string, unknown> | undefined, kind: 'brain' | 'role'): string {
+  const selected = definition?.[kind];
+  if (!selected || typeof selected !== 'object' || Array.isArray(selected)) return 'unresolved';
+  const selection = selected as Record<string, unknown>;
+  if (selection.kind === 'ref' && typeof selection.id === 'string')
+    return `ref:${selection.id} (reference)`;
+  if (selection.kind === 'inline' && typeof selection.fingerprint === 'string')
+    return `inline:${selection.fingerprint} (inline)`;
   if (typeof selection.ref === 'string') return `ref:${selection.ref}`;
   if (!Object.hasOwn(selection, 'inline')) return 'unresolved';
-  const fingerprint = createHash('sha256').update(JSON.stringify(selection.inline)).digest('hex').slice(0, 16);
+  const canonical = (value: unknown): string => Array.isArray(value)
+    ? `[${value.map(canonical).join(',')}]`
+    : value && typeof value === 'object'
+      ? `{${Object.entries(value as Record<string, unknown>).sort(([a], [b]) => a.localeCompare(b))
+        .map(([key, child]) => `${JSON.stringify(key)}:${canonical(child)}`).join(',')}}`
+      : JSON.stringify(value);
+  const fingerprint = createHash('sha256').update(canonical(selection.inline)).digest('hex').slice(0, 16);
   return `inline:sha256:${fingerprint}`;
 }
 
+function safePermissionsSummary(definition: Record<string, unknown> | undefined): string | undefined {
+  const permissions = definition?.permissions;
+  if (!permissions || typeof permissions !== 'object' || Array.isArray(permissions)) return undefined;
+  const policy = permissions as Record<string, unknown>;
+  const fields = ['approval', 'filesystem', 'unattended'].flatMap(key =>
+    typeof policy[key] === 'string' ? [`${key}=${policy[key]}`] : []);
+  return fields.length ? fields.join(',') : undefined;
+}
+
 function auditTask(operation: string, task: ReturnType<typeof getTask>, previousState: string,
-  newState: string = task.state): void {
+  newState: string = task.state, revision?: string): void {
+  const materialSameState = operation === 'block' || operation === 'unblock' || operation === 'settling';
+  if (previousState === newState && !materialSameState) return;
   recordFleetAuditResource('task', task.task_id);
   if (task.room_id) recordFleetAuditResource('room', task.room_id);
   const room = task.room_id ? getRoomRecord(task.room_id) : undefined;
-  const brains = new Map(room?.member_seats.map(seat =>
-    [seat.role_name, safeBrainSummary(seat.launch?.agent_definition)]) ?? []);
-  recordFleetAuditPresentation({ kind: 'task', operation, id: task.task_id, title: task.title,
+  const definitions = new Map(room?.member_seats.map(seat =>
+    [seat.role_name, seat.launch?.agent_definition]) ?? []);
+  const semanticOperation = operation === 'recover'
+    ? newState === 'active' ? 'work' : newState === 'done' ? 'done'
+      : newState === 'cancelled' ? 'cancel' : undefined
+    : operation as 'create' | 'start' | 'work' | 'block' | 'unblock' | 'review'
+      | 'done' | 'cancel' | 'finish' | 'delete' | 'settling';
+  if (!semanticOperation) return;
+  recordFleetAuditPresentation({ kind: 'task', operation: semanticOperation, id: task.task_id, title: task.title,
     previousState, newState,
+    revision: revision ?? task.blocked?.at ?? task.ended_at ?? task.started_at ?? task.created_at,
+    list: task.list_name ?? 'default',
     template: task.template ? `${task.template.name}@${task.template.version}` : undefined,
-    roomId: task.room_id, agents: task.member_roles.map(member => ({ name: member.name,
-      brain: brains.get(member.name) ?? 'unresolved', role: member.cowork_role })) });
+    roomId: task.room_id, agents: [...task.member_roles].sort((a, b) => a.name.localeCompare(b.name)).map(member => ({ name: member.name,
+      brain: safeSelectionSummary(definitions.get(member.name), 'brain'),
+      role: safeSelectionSummary(definitions.get(member.name), 'role') === 'unresolved'
+        ? member.cowork_role : safeSelectionSummary(definitions.get(member.name), 'role'),
+      permissions: safePermissionsSummary(definitions.get(member.name)) })) });
 }
 
 function auditRoom(operation: string, room: RoomOrchestrationRecord, previousState: string,
   newState: string = room.state): void {
+  if (previousState === newState) return;
   recordFleetAuditResource('room', room.room_id);
-  recordFleetAuditPresentation({ kind: 'room', operation, id: room.room_id, previousState, newState,
+  const semanticOperation = operation === 'recover'
+    ? newState === 'active' ? 'activate' : newState === 'deleted' ? 'delete'
+      : newState === 'closing' ? 'close' : undefined
+    : operation as 'create' | 'activate' | 'close' | 'delete';
+  if (!semanticOperation) return;
+  recordFleetAuditPresentation({ kind: 'room', operation: semanticOperation, id: room.room_id, previousState, newState,
+    revision: room.closed_at ?? room.activated_at ?? room.close?.accepted_at ?? room.created_at,
+    name: room.room_name, taskId: room.task_id,
     template: room.template_snapshot ? `${room.template_snapshot.name}@${room.template_snapshot.version}` : undefined,
-    participants: room.member_seats.map(member => ({ name: member.role_name, role: member.cowork_role })) });
+    participants: [...room.member_seats].sort((a, b) => a.role_name.localeCompare(b.role_name)).map(member => ({ name: member.role_name, id: member.identity_cid,
+      brain: safeSelectionSummary(member.launch?.agent_definition, 'brain'),
+      role: safeSelectionSummary(member.launch?.agent_definition, 'role') === 'unresolved'
+        ? member.cowork_role : safeSelectionSummary(member.launch?.agent_definition, 'role'),
+      permissions: safePermissionsSummary(member.launch?.agent_definition) })) });
 }
 
 const roomActionMarkdown = (
@@ -333,6 +377,10 @@ async function launchTaskSettleWorker(
       actor: { kind: 'local_control', surface: 'cli' }, taskId, error: errorText(error),
       recoveryHint: `External settle worker failed to start. Retry task recover ${taskId}.`,
     });
+    const task = getTask(taskId);
+    recordFleetAuditPresentation({ kind: 'lifecycle_failure', resource: 'Task', id: taskId,
+      state: task.state, category: 'settlement_failed',
+      eventId: task.terminal_intent?.error_at ?? task.terminal_intent?.accepted_at ?? task.created_at });
     throw error;
   }
   const deadline = Date.now() + PUBLIC_SETTLE_WAIT_MS;
@@ -344,7 +392,11 @@ async function launchTaskSettleWorker(
     }
     await sleep(PUBLIC_SETTLE_POLL_MS);
   }
-  return { task: getTask(taskId), timedOut: true };
+  const task = getTask(taskId);
+  recordFleetAuditPresentation({ kind: 'lifecycle_failure', resource: 'Task', id: taskId,
+    state: task.state, category: 'settlement_pending',
+    eventId: task.terminal_intent?.accepted_at ?? task.created_at });
+  return { task, timedOut: true };
 }
 
 async function launchRoomDeleteWorker(
@@ -358,6 +410,10 @@ async function launchRoomDeleteWorker(
       actor: { kind: 'local_control', surface: 'cli' }, roomId, error: errorText(error),
       recoveryHint: `External delete worker failed to start. Retry room delete ${roomId} ${roomId}.`,
     });
+    const room = getRoomRecord(roomId);
+    if (room) recordFleetAuditPresentation({ kind: 'lifecycle_failure', resource: 'Room', id: roomId,
+      state: room.state, category: 'cleanup_failed',
+      eventId: room.close?.error_at ?? room.close?.accepted_at ?? room.created_at });
     throw error;
   }
   const deadline = Date.now() + PUBLIC_SETTLE_WAIT_MS;
@@ -369,7 +425,11 @@ async function launchRoomDeleteWorker(
     }
     await sleep(PUBLIC_SETTLE_POLL_MS);
   }
-  return { deleted: getRoomRecord(roomId) === undefined, timedOut: true };
+  const remaining = getRoomRecord(roomId);
+  if (remaining) recordFleetAuditPresentation({ kind: 'lifecycle_failure', resource: 'Room', id: roomId,
+    state: remaining.state, category: 'cleanup_pending',
+    eventId: remaining.close?.accepted_at ?? remaining.created_at });
+  return { deleted: remaining === undefined, timedOut: true };
 }
 
 function loadCfg(opts: { configuration?: string }): FleetConfig {
@@ -497,22 +557,34 @@ async function provisionRoom(cfg: FleetConfig, input: {
           : 'Rotate rooms.owner.public_invite or public_invite_file, then run room recover.',
         mismatch ? 'owner_cid_mismatch' : 'waiting_owner_invite',
       );
+      const failed = getRoomRecord(record.room_id);
+      if (failed) recordFleetAuditPresentation({ kind: 'lifecycle_failure', resource: 'Room',
+        id: failed.room_id, state: failed.state, category: 'provision_failed',
+        eventId: `${failed.created_at}:${failed.saga.phase}:${failed.saga.step_index}` });
       throw error;
     }
   }
   record = advanceSaga(record.room_id, 'create_members', 3);
 
   if (input.template && input.template.members.length > 0) {
-    record = await provisionMembers({
-      cfg,
-      cowork,
-      roomId: record.room_id,
-      taskId: input.taskId,
-      template: input.template,
-      binPath: getBinPath(),
-      brief: input.brief,
-      goal: input.goal,
-    });
+    try {
+      record = await provisionMembers({
+        cfg,
+        cowork,
+        roomId: record.room_id,
+        taskId: input.taskId,
+        template: input.template,
+        binPath: getBinPath(),
+        brief: input.brief,
+        goal: input.goal,
+      });
+    } catch (error) {
+      const failed = getRoomRecord(record.room_id);
+      if (failed) recordFleetAuditPresentation({ kind: 'lifecycle_failure', resource: 'Room',
+        id: failed.room_id, state: failed.state, category: 'provision_failed',
+        eventId: `${failed.created_at}:${failed.saga.phase}:${failed.saga.step_index}` });
+      throw error;
+    }
   } else {
     record = activateRoom(record.room_id);
     if (input.taskId) activateTask(input.taskId);
@@ -611,7 +683,6 @@ export function registerTaskCommands(parent: Command, cOpt: (cmd: Command) => Co
           idempotencyKey: opts.idempotencyKey, origin: { type: 'cli' },
           list: opts.list,
         });
-        auditTask('create', record, 'none');
 
         if (opts.json) {
           console.log(JSON.stringify({ schema_version: 1, task: record }, null, 2));
@@ -755,11 +826,9 @@ export function registerTaskCommands(parent: Command, cOpt: (cmd: Command) => Co
     .option('--json', 'JSON output')
     .action(async (id: string, opts: { configuration?: string; json?: boolean }) => {
       try {
-        const previous = getTask(id).state;
         const t = await taskRoomService(opts.configuration).startTask({
           actor: { kind: 'local_control', surface: 'cli' }, taskId: id,
         });
-        auditTask('start', t, previous);
         if (opts.json) { console.log(JSON.stringify({ schema_version: 1, task: t }, null, 2)); return; }
         console.log(taskActionMarkdown('Task started', t));
       } catch (e) {
@@ -793,11 +862,12 @@ export function registerTaskCommands(parent: Command, cOpt: (cmd: Command) => Co
     .option('--json', 'JSON output')
     .action((id: string, opts: { json?: boolean }) => {
       try {
-        const previous = getTask(id).state;
+        const prior = getTask(id);
+        const previous = prior.state;
         const t = taskRoomService().unblockTask({
           actor: { kind: 'local_control', surface: 'cli' }, taskId: id,
         });
-        auditTask('unblock', t, previous);
+        auditTask('unblock', t, previous, t.state, prior.blocked?.at);
         if (opts.json) { console.log(JSON.stringify({ schema_version: 1, task: t }, null, 2)); return; }
         console.log(taskActionMarkdown('Task unblocked', t));
       } catch (e) { if (opts.json) die(e); dieTaskRoom(e); }
@@ -832,6 +902,8 @@ export function registerTaskCommands(parent: Command, cOpt: (cmd: Command) => Co
         const plan = await taskRoomService(opts.configuration).completeTask({
           actor: { kind: 'local_control', surface: 'cli' }, taskId: id, outcome,
         });
+        if (plan.task.terminal_intent?.status === 'pending') auditTask('settling', plan.task,
+          previous, previous, plan.task.terminal_intent.accepted_at);
         const settled = plan.settlementRequired
           ? await launchTaskSettleWorker(id, opts.configuration)
           : { task: plan.task, timedOut: false };
@@ -862,6 +934,8 @@ export function registerTaskCommands(parent: Command, cOpt: (cmd: Command) => Co
         const plan = await taskRoomService(opts.configuration).cancelTask({
           actor: { kind: 'local_control', surface: 'cli' }, taskId: id,
         });
+        if (plan.task.terminal_intent?.status === 'pending') auditTask('settling', plan.task,
+          previous, previous, plan.task.terminal_intent.accepted_at);
         const settled = plan.settlementRequired
           ? await launchTaskSettleWorker(id, opts.configuration)
           : { task: plan.task, timedOut: false };
@@ -1009,12 +1083,10 @@ export function registerTaskCommands(parent: Command, cOpt: (cmd: Command) => Co
     .option('--json', 'JSON output')
     .action(async (id: string, opts: { configuration?: string; template?: string; json?: boolean }) => {
       try {
-        const previous = getTask(id).state;
         const result = await taskRoomService(opts.configuration).ensureTaskWork({
           actor: { kind: 'local_control', surface: 'cli' }, taskId: id, template: opts.template,
         });
         const t = result.task;
-        auditTask('work', t, previous);
         if (result.status === 'already_active') {
           if (opts.json) {
             console.log(JSON.stringify({ schema_version: 1, task: t, status: 'already_active' }, null, 2));
@@ -1061,6 +1133,8 @@ export function registerTaskCommands(parent: Command, cOpt: (cmd: Command) => Co
         const plan = await taskRoomService(opts.configuration).finishTask({
           actor: { kind: 'local_control', surface: 'cli' }, taskId: id, outcome,
         });
+        if (plan.task.terminal_intent?.status === 'pending') auditTask('settling', plan.task,
+          previous, previous, plan.task.terminal_intent.accepted_at);
         const settled = plan.settlementRequired
           ? await launchTaskSettleWorker(id, opts.configuration)
           : { task: plan.task, timedOut: false };
@@ -1109,7 +1183,6 @@ export function registerRoomCommands(parent: Command, cOpt: (cmd: Command) => Co
           actor: { kind: 'local_control', surface: 'cli' }, name: opts.name,
           template: opts.template, goal: opts.goal, brief: opts.brief, briefFile: opts.briefFile,
         });
-        auditRoom('create', record, 'none');
 
         if (opts.json) {
           console.log(JSON.stringify({ schema_version: 1, room: record }, null, 2));
@@ -1188,7 +1261,6 @@ export function registerRoomCommands(parent: Command, cOpt: (cmd: Command) => Co
     .action(async (id: string, opts: { configuration?: string; json?: boolean }) => {
       try {
         const { room, orchestration } = await taskRoomService(opts.configuration).getRoomDetail(id);
-        if (orchestration) auditRoom('open', orchestration, orchestration.state);
         const url = `http://localhost:4460/room/${id}`;
         if (opts.json) {
           console.log(JSON.stringify({ schema_version: 1, room_id: id, url, room_name: room.room_name }, null, 2));
@@ -1212,7 +1284,6 @@ export function registerRoomCommands(parent: Command, cOpt: (cmd: Command) => Co
       try {
         const { orchestration: r, members } =
           await taskRoomService(opts.configuration).getRoomMembers(id);
-        if (r) auditRoom('members', r, r.state);
         if (opts.json) {
           console.log(JSON.stringify({
             schema_version: 1,
@@ -1249,8 +1320,11 @@ export function registerRoomCommands(parent: Command, cOpt: (cmd: Command) => Co
         await taskRoomService(opts.configuration).requestRoomDeletion({
           actor: { kind: 'local_control', surface: 'cli' }, roomId: id,
         });
+        const closing = getRoomRecord(id);
+        if (previous && closing && previous.state !== closing.state)
+          auditRoom('close', closing, previous.state, closing.state);
         const settled = await launchRoomDeleteWorker(id, opts.configuration);
-        if (previous) auditRoom('delete', previous, previous.state,
+        if (closing) auditRoom('delete', closing, closing.state,
           settled.deleted ? 'deleted' : 'closing');
         if (opts.json) {
           console.log(JSON.stringify({ schema_version: 1, room_id: id, deleted: settled.deleted }, null, 2));

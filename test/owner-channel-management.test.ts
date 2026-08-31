@@ -491,7 +491,7 @@ describe('OwnerChannel live management', () => {
     await channel.close();
   });
 
-  it('delivers one canonical invocation and correlated outcome with raw argv', async () => {
+  it('keeps command invocation silent and delivers only semantic lifecycle events', async () => {
     const { channel, client } = setup({ agent: AGENT });
     await channel.start();
     client.batches.push([{
@@ -506,32 +506,45 @@ describe('OwnerChannel live management', () => {
     ]);
     expect(duplicate.correlationId).toBe(begun.correlationId);
     await channel.finishFleetCommandAudit!({ correlationId: begun.correlationId,
-      class: 'success', effect: 'completed', exitCode: 0, resourceIds: { task: 'task-1' } });
+      class: 'success', effect: 'completed', exitCode: 0, resourceIds: { task: 'task-1' },
+      presentations: [{ kind: 'task', operation: 'create', id: 'task-1', title: 'Unicode Δ',
+        previousState: 'none', newState: 'active', revision: 'created-1', agents: [] }] });
+    const retried = await channel.beginFleetCommandAudit!('request-audit-2', ['task', 'create']);
+    await channel.finishFleetCommandAudit!({ correlationId: retried.correlationId,
+      class: 'success', effect: 'completed', exitCode: 0, resourceIds: { task: 'task-1' },
+      presentations: [
+        { kind: 'task', operation: 'create', id: 'task-1', title: 'Unicode Δ',
+          previousState: 'none', newState: 'active', revision: 'created-1', agents: [] },
+        { kind: 'room', operation: 'create', id: 'room-1', name: 'Room Δ',
+          previousState: 'none', newState: 'provisioning', revision: 'room-created-1', participants: [] },
+      ] });
     const texts = client.calls.filter(call => call.name === 'sendMessage')
       .map(call => String(call.args?.text ?? ''));
-    const invocation = texts.filter(text => text.includes('Fleet command invoked'));
-    const outcome = texts.filter(text => text.includes('Fleet command outcome'));
-    expect(invocation).toHaveLength(1);
-    expect(outcome).toHaveLength(1);
-    expect(invocation[0]).toContain('[REDACTED:value]');
-    expect(outcome[0]).toContain('Task ID: task-1');
-    expect(outcome[0]).toContain('Raw argv (redacted)');
+    expect(texts.filter(text => text.includes('Fleet command'))).toEqual([]);
+    expect(texts.filter(text => text.includes('📋 Task'))).toEqual([
+      expect.stringContaining('Unicode Δ'),
+    ]);
+    expect(texts.filter(text => text.includes('🏠 Room'))).toEqual([
+      expect.stringContaining('Room Δ'),
+    ]);
+    expect(texts.join('\n')).not.toContain('private');
+    expect(texts.join('\n')).not.toContain('argv');
     await channel.close();
   });
 
-  it('fails closed on invocation uncertainty and never retries it after restart', async () => {
+  it('does not depend on Owner delivery for command invocation', async () => {
     const { channel, client, dir } = setup({ agent: AGENT });
     await channel.start();
     client.failSendTo.add(OWNER);
     await expect(channel.beginFleetCommandAudit!('request-uncertain', ['task', 'list']))
-      .rejects.toThrow(/uncertain/);
+      .resolves.toMatchObject({ invocation: 'delivered' });
     client.failSendTo.clear();
     await expect(channel.beginFleetCommandAudit!('request-uncertain', ['task', 'list']))
-      .rejects.toThrow(/uncertain/);
+      .resolves.toMatchObject({ invocation: 'delivered' });
     const ledger = JSON.parse(readFileSync(join(dir, '.owner-channel-command-audit.json'), 'utf8'));
-    expect(ledger.attempts[0]).toMatchObject({ invocation: 'uncertain' });
+    expect(ledger.attempts[0]).toMatchObject({ invocation: 'delivered' });
     expect(ledger.attempts[0]).not.toHaveProperty('outcome');
-    expect(client.calls.filter(call => call.name === 'sendMessage')).toHaveLength(1);
+    expect(client.calls.filter(call => call.name === 'sendMessage')).toHaveLength(0);
     await channel.close();
   });
 
@@ -541,15 +554,44 @@ describe('OwnerChannel live management', () => {
     const begun = await channel.beginFleetCommandAudit!('request-finish-uncertain', ['task', 'list']);
     client.failSendTo.add(OWNER);
     await expect(channel.finishFleetCommandAudit!({ correlationId: begun.correlationId,
-      class: 'success', effect: 'completed', exitCode: 0 }))
-      .rejects.toThrow(/uncertain after execution; effect status=completed/);
+      class: 'success', effect: 'completed', exitCode: 0,
+      presentations: [{ kind: 'task', operation: 'started', id: 'task-1',
+        previousState: 'backlog', newState: 'active', agents: [] }] }))
+      .resolves.toMatchObject({ outcome: { delivery: 'uncertain' } });
     client.failSendTo.clear();
     await expect(channel.finishFleetCommandAudit!({ correlationId: begun.correlationId,
-      class: 'success', effect: 'completed', exitCode: 0 }))
-      .rejects.toThrow(/uncertain after execution; effect status=completed/);
+      class: 'success', effect: 'completed', exitCode: 0,
+      presentations: [{ kind: 'task', operation: 'started', id: 'task-1',
+        previousState: 'backlog', newState: 'active', agents: [] }] }))
+      .resolves.toMatchObject({ outcome: { delivery: 'uncertain' } });
     const ledger = JSON.parse(readFileSync(join(dir, '.owner-channel-command-audit.json'), 'utf8'));
     expect(ledger.attempts[0].outcome).toMatchObject({ effect: 'completed', delivery: 'uncertain' });
-    expect(client.calls.filter(call => call.name === 'sendMessage')).toHaveLength(2);
+    expect(client.calls.filter(call => call.name === 'sendMessage')).toHaveLength(1);
+    await channel.close();
+  });
+
+  it('continues later lifecycle events after an uncertain duplicate while preserving aggregate uncertainty', async () => {
+    const { channel, client } = setup({ agent: AGENT });
+    await channel.start();
+    const taskEvent = { kind: 'task' as const, operation: 'create' as const, eventId: 'task-created-1',
+      id: 'task-1', title: 'Task', previousState: 'none', newState: 'provisioning', agents: [] };
+    const first = await channel.beginFleetCommandAudit!('request-uncertain-event-1', ['task', 'create']);
+    client.failSendTo.add(OWNER);
+    await expect(channel.finishFleetCommandAudit!({ correlationId: first.correlationId,
+      class: 'success', effect: 'completed', exitCode: 0, presentations: [taskEvent] }))
+      .resolves.toMatchObject({ outcome: { delivery: 'uncertain' } });
+
+    client.failSendTo.clear();
+    const second = await channel.beginFleetCommandAudit!('request-uncertain-event-2', ['task', 'work']);
+    await expect(channel.finishFleetCommandAudit!({ correlationId: second.correlationId,
+      class: 'success', effect: 'completed', exitCode: 0, presentations: [taskEvent,
+        { kind: 'room', operation: 'create', eventId: 'room-created-1', id: 'room-1',
+          name: 'Room', previousState: 'none', newState: 'provisioning', participants: [] }] }))
+      .resolves.toMatchObject({ outcome: { delivery: 'uncertain' } });
+    const texts = client.calls.filter(call => call.name === 'sendMessage')
+      .map(call => String(call.args?.text ?? ''));
+    expect(texts.filter(text => text.includes('📋 Task'))).toHaveLength(1);
+    expect(texts.filter(text => text.includes('🏠 Room'))).toHaveLength(1);
     await channel.close();
   });
 

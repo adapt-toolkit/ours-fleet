@@ -267,11 +267,7 @@ describe('owner-channel CLI', () => {
       name: 'ProxyWorker', temp: true,
       brain: { inline: { harness: 'claude-code' } }, role: { inline: {} },
     }));
-    expect(finishAudit).toHaveBeenCalledWith(expect.objectContaining({ presentation: expect.objectContaining({
-      kind: 'agent_started', name: 'ProxyWorker',
-      brain: 'inline:sha256:abc (explicit)', role: 'inline:sha256:def (explicit)',
-      parent: 'PhoneRole', permissions: 'allow/bypassPermissions',
-    }) }));
+    expect(finishAudit).toHaveBeenCalledWith(expect.not.objectContaining({ presentations: expect.anything() }));
   }, CLI_INTEGRATION_TIMEOUT_MS);
 
   it('forwards real Task metadata and JSON failure classification in audit finish payloads', async () => {
@@ -285,7 +281,7 @@ describe('owner-channel CLI', () => {
       argv: [], invocation: 'delivered' as const,
       outcome: { completedAt: '2026-01-01T00:00:01.000Z', class: input.class,
         exitCode: input.exitCode, effect: input.effect, delivery: 'delivered' as const,
-        ...(input.presentation ? { presentation: input.presentation } : {}) },
+        ...(input.presentations ? { presentations: input.presentations } : {}) },
     }));
     control!.setFleetAuditor({
       begin: async input => ({ version: 1, correlationId: '123e4567-e89b-42d3-a456-426614174000',
@@ -300,10 +296,10 @@ describe('owner-channel CLI', () => {
     expect(created.code).toBe(0);
     const taskId = JSON.parse(created.stdout).task.task_id as string;
     expect(finishAudit).toHaveBeenLastCalledWith(expect.objectContaining({ class: 'success',
-      effect: 'completed', resourceIds: { task: taskId }, presentation: expect.objectContaining({
+      effect: 'completed', resourceIds: { task: taskId }, presentations: [expect.objectContaining({
         kind: 'task', operation: 'create', id: taskId, title: 'Proxy metadata',
         previousState: 'none', newState: 'backlog', agents: [],
-      }) }));
+      })] }));
 
     const missing = await run(['task', 'show', 'definitely-missing', '--json'], env);
     expect(missing.code).toBe(1);

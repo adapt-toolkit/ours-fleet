@@ -26,7 +26,7 @@ import {
 } from './commands.js';
 import type { ManagedFleetSpawnResult } from '../fleet-proxy.js';
 import {
-  FleetCommandAuditStore, renderFleetAuditInvocation, renderFleetAuditOutcome,
+  FleetCommandAuditStore, lifecycleEventDigestBasis, renderFleetLifecycleEvent,
   type FleetAuditAttempt, type FleetAuditPresentation, type FleetCommandOutcomeClass,
 } from '../fleet-command-audit.js';
 import {
@@ -115,7 +115,7 @@ export interface OwnerChannelHandle {
   finishFleetCommandAudit?(input: {
     correlationId: string; class: FleetCommandOutcomeClass; exitCode?: number;
     effect: 'not_started' | 'completed' | 'unknown'; resourceIds?: Record<string, string>;
-    presentation?: FleetAuditPresentation;
+    presentations?: FleetAuditPresentation[];
   }): Promise<FleetAuditAttempt>;
 }
 
@@ -433,19 +433,15 @@ export class OwnerChannel implements OwnerChannelHandle {
   notifyFleetSpawn(event: ManagedFleetSpawnResult): Promise<void> {
     return this.queueManagement(async () => {
       if (!this.ready || this.stopping) throw new Error('owner-channel MCP client is unavailable');
-      const model = event.model ? `, model ${event.model}` : '';
-      const monitorPolicy = event.monitor.interrupt === true
-        ? ' with interruption'
-        : event.monitor.interrupt === 'after_tool' ? ' with after-tool steering' : '';
-      const monitor = `${event.monitor.mode} monitor${monitorPolicy}`;
       const permission = event.permissionMode
-        ? `; permission ${event.permissionMode.fleetMode}, native ${event.permissionMode.nativeMode}`
-        : '';
-      const inherited = event.inherited.length
-        ? ` Supervisor inherited omitted defaults: ${event.inherited.join(', ')}.` : '';
+        ? `${event.permissionMode.fleetMode}/${event.permissionMode.nativeMode}` : undefined;
       await this.sendProactiveMessage(
-        `🧑‍💻 ${event.caller} spawned ${event.lifetime} agent ${event.role} `
-          + `(${event.harness}/${event.session}${model}; ${monitor}${permission}).${inherited}`,
+        renderFleetLifecycleEvent({ kind: 'agent_started', eventId: event.creationActionId,
+          id: event.role, name: event.role,
+          lifetime: event.lifetime, brain: event.brainSummary, role: event.roleSummary,
+          harness: event.harness, session: event.session, model: event.model,
+          permissions: permission, parent: event.caller, actionId: event.creationActionId,
+          inherited: event.inherited }),
         `fleet-spawn\0${event.creationActionId}`, 0);
     });
   }
@@ -454,21 +450,9 @@ export class OwnerChannel implements OwnerChannelHandle {
     const run = this.managementTail.then(async () => {
       let attempt = this.commandAudits.begin(requestId, this.options.role, argv);
       if (attempt.invocation === 'delivered') return attempt;
-      if (attempt.invocation === 'uncertain')
-        throw new Error('fleet command invocation delivery is uncertain; execution is denied');
-      if (!this.ready || this.stopping) {
-        this.commandAudits.invocation(attempt.correlationId, this.options.role, 'uncertain');
-        this.options.log(`[${this.options.role}] fleet command invocation ${attempt.correlationId} `
-          + 'delivery unavailable; execution denied');
-        throw new Error('owner-channel MCP client is unavailable; invocation recorded uncertain');
-      }
-      try {
-        await this.sendProactiveMessage(renderFleetAuditInvocation(attempt),
-          `fleet-command-invocation\0${attempt.correlationId}`, 0);
-      } catch (error) {
-        this.commandAudits.invocation(attempt.correlationId, this.options.role, 'uncertain');
-        throw error;
-      }
+      if (attempt.invocation === 'uncertain') return attempt;
+      this.options.log(`[${this.options.role}] fleet proxy command ${attempt.correlationId} `
+        + `route=${attempt.classification.route} decision=${attempt.classification.decision}`);
       attempt = this.commandAudits.invocation(attempt.correlationId, this.options.role, 'delivered');
       return attempt;
     });
@@ -479,33 +463,38 @@ export class OwnerChannel implements OwnerChannelHandle {
   finishFleetCommandAudit(input: {
     correlationId: string; class: FleetCommandOutcomeClass; exitCode?: number;
     effect: 'not_started' | 'completed' | 'unknown'; resourceIds?: Record<string, string>;
-    presentation?: FleetAuditPresentation;
+    presentations?: FleetAuditPresentation[];
   }): Promise<FleetAuditAttempt> {
     const run = this.managementTail.then(async () => {
       let attempt = this.commandAudits.finish(input.correlationId, this.options.role, {
         class: input.class, effect: input.effect,
         ...(input.exitCode === undefined ? {} : { exitCode: input.exitCode }),
         ...(input.resourceIds ? { resourceIds: input.resourceIds } : {}),
-        ...(input.presentation ? { presentation: input.presentation } : {}),
+        ...(input.presentations ? { presentations: input.presentations } : {}),
       });
       if (attempt.outcome?.delivery === 'delivered') return attempt;
-      if (attempt.outcome?.delivery === 'uncertain')
-        throw new Error(`fleet command outcome delivery is uncertain after execution; effect status=${attempt.outcome.effect}`);
-      if (!this.ready || this.stopping) {
-        this.commandAudits.outcome(attempt.correlationId, this.options.role, 'uncertain');
-        this.options.log(`[${this.options.role}] fleet command outcome ${attempt.correlationId} `
-          + `delivery unavailable after execution; effect status=${attempt.outcome?.effect}`);
-        throw new Error(`owner-channel unavailable after execution; effect status=${attempt.outcome?.effect}`);
-      }
+      if (attempt.outcome?.delivery === 'uncertain') return attempt;
+      let uncertain = false;
       try {
-        await this.sendProactiveMessage(renderFleetAuditOutcome(attempt),
-          `fleet-command-outcome\0${attempt.correlationId}`, 0);
+        for (const event of attempt.outcome?.presentations ?? []) {
+          try {
+            await this.sendProactiveMessage(renderFleetLifecycleEvent(event),
+              `fleet-lifecycle\0${lifecycleEventDigestBasis(event)}`, 0);
+          } catch (error) {
+            if (error instanceof DuplicateSendError) {
+              if (error.status !== 'delivered') uncertain = true;
+              this.options.log(`[${this.options.role}] duplicate Fleet lifecycle event suppressed`);
+              continue;
+            }
+            throw error;
+          }
+        }
       } catch (error) {
-        this.commandAudits.outcome(attempt.correlationId, this.options.role, 'uncertain');
-        throw new Error(`fleet command outcome delivery is uncertain after execution; effect status=${attempt.outcome?.effect}`,
-          { cause: error });
+        uncertain = true;
+        this.logError(`fleet lifecycle delivery uncertain correlation=${attempt.correlationId}`, error);
       }
-      attempt = this.commandAudits.outcome(attempt.correlationId, this.options.role, 'delivered');
+      attempt = this.commandAudits.outcome(attempt.correlationId, this.options.role,
+        uncertain ? 'uncertain' : 'delivered');
       return attempt;
     });
     this.managementTail = run.then(() => undefined, () => undefined);

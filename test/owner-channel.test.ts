@@ -312,7 +312,7 @@ describe('owner channel daemon-generation recovery', () => {
     await proactive;
     const sends = client.calls.filter(call => call.name === 'sendMessage');
     expect(sends).toHaveLength(1);
-    expect(sends[0].args?.text).toContain('spawned temporary agent Temp');
+    expect(sends[0].args?.text).toContain('spawned temporary Agent Temp (Temp) — ready');
     await channel.close();
   });
 

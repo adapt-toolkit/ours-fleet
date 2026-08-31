@@ -59,7 +59,6 @@ import {
 } from './fleet-proxy.js';
 import {
   beginFleetAuditCollection, consumeFleetAuditCollection, FleetCliExit,
-  recordFleetAuditPresentation, recordFleetAuditResource,
   type FleetAuditAttempt, type FleetCommandOutcomeClass,
 } from './fleet-command-audit.js';
 import './harness/claude-code.js';   // registers the claude-code adapter
@@ -1105,13 +1104,6 @@ cOpt(program.command('spawn [name]').description('spawn a new agent (permanent b
         if (!response.ok)
           throw new SessionControlError(response.kind ?? 'backend', response.error ?? 'managed spawn failed');
         const result = response.result as ManagedFleetSpawnResult;
-        recordFleetAuditResource('agent', result.role);
-        recordFleetAuditPresentation({ kind: 'agent_started', name: result.role,
-          lifetime: result.lifetime, brain: result.brainSummary, role: result.roleSummary,
-          harness: result.harness, session: result.session, model: result.model,
-          permissions: result.permissionMode
-            ? `${result.permissionMode.fleetMode}/${result.permissionMode.nativeMode}` : undefined,
-          parent: result.caller, actionId: result.creationActionId, inherited: result.inherited });
         const expectedCaller = process.env[FLEET_PROXY_CALLER_ENV];
         if (expectedCaller && result.caller !== expectedCaller)
           throw new Error(`fleet proxy caller mismatch: expected '${expectedCaller}', got '${result.caller}'`);
@@ -1431,7 +1423,7 @@ async function runFleetCli(): Promise<void> {
   const finished = await controlRequest(stateDir, { command: 'fleet_audit_finish', audit: {
     correlationId: attempt.correlationId, class: outcomeClass, exitCode, effect,
     ...(metadata.resourceIds ? { resourceIds: metadata.resourceIds } : {}),
-    ...(metadata.presentation ? { presentation: metadata.presentation } : {}),
+    ...(metadata.presentations ? { presentations: metadata.presentations } : {}),
   } });
   if (!finished.ok)
     throw new SessionControlError(finished.kind ?? 'backend', finished.error ?? `audit delivery failed after execution; effect status=${effect}`);

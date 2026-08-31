@@ -59,7 +59,7 @@ export interface ControlRequest {
     exitCode?: number;
     effect?: 'not_started' | 'completed' | 'unknown';
     resourceIds?: Record<string, string>;
-    presentation?: FleetAuditPresentation;
+    presentations?: FleetAuditPresentation[];
   };
 }
 
@@ -231,7 +231,7 @@ export class RoleControlServer {
     finish(input: {
       correlationId: string; class: FleetCommandOutcomeClass; exitCode?: number;
       effect: 'not_started' | 'completed' | 'unknown'; resourceIds?: Record<string, string>;
-      presentation?: FleetAuditPresentation;
+      presentations?: FleetAuditPresentation[];
     }): Promise<FleetAuditAttempt>;
   };
 
@@ -451,7 +451,7 @@ export class RoleControlServer {
             correlationId: audit.correlationId, class: audit.class, effect: audit.effect,
             ...(audit.exitCode === undefined ? {} : { exitCode: audit.exitCode }),
             ...(audit.resourceIds ? { resourceIds: audit.resourceIds } : {}),
-            ...(audit.presentation ? { presentation: audit.presentation } : {}),
+            ...(audit.presentations ? { presentations: audit.presentations } : {}),
           });
           this.write(socket, { version: 1, id: request.id, ok: true, result });
           return;

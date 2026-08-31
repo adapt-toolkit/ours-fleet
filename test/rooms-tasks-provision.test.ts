@@ -24,6 +24,7 @@ vi.mock('../src/temp-lifecycle.js', async importOriginal => ({
 }));
 
 import { provisionMembers } from '../src/rooms-tasks/provision.js';
+import { beginFleetAuditCollection, consumeFleetAuditCollection } from '../src/fleet-command-audit.js';
 import { spawnDryRun } from '../src/spawn.js';
 import { createRoomRecord, getRoomRecord } from '../src/rooms-tasks/room-state.js';
 import { createTask, getTask } from '../src/rooms-tasks/task-state.js';
@@ -212,6 +213,7 @@ describe('simple Cowork room member startup', () => {
       room_id: 'room-1', room_name: 'Room', room_identity_cid: 'room-cid', task_id: task.task_id,
     });
     const h = coworkHarness();
+    beginFleetAuditCollection();
     const result = await provisionMembers({
       cfg: cfg(), cowork: h.cowork, roomId: 'room-1', taskId: task.task_id,
       template: template(2), binPath: '/usr/bin/ours-fleet',
@@ -229,6 +231,12 @@ describe('simple Cowork room member startup', () => {
     expect(mocks.spawnTemp).toHaveBeenCalledTimes(2);
     expect(getTask(task.task_id)).toMatchObject({ state: 'active' });
     expect(getTask(task.task_id).member_roles).toHaveLength(2);
+    const lifecycle = consumeFleetAuditCollection().presentations ?? [];
+    expect(lifecycle.map(event => [event.kind, event.kind === 'agent_started' ? event.id : undefined]))
+      .toEqual([
+        ['agent_started', result.member_seats[0]!.role_name],
+        ['agent_started', result.member_seats[1]!.role_name],
+      ]);
   });
 
   it('puts identity name, invite, role, and full task in the agent-owned startup payload', async () => {
@@ -333,6 +341,7 @@ describe('simple Cowork room member startup', () => {
     tpl.members[0].agent = {
       brain: { inline: { harness: 'codex', harness_options: { endpoint: 'brain-sentinel' } } },
       role: { inline: { persona: 'safe' } }, env: { ENDPOINT: 'env-sentinel' },
+      permissions: { approval: 'ask', filesystem: 'workspace', unattended: 'deny' },
     };
     await provisionMembers({ cfg: cfg(), cowork: coworkHarness().cowork, roomId: 'room-redact',
       template: tpl, binPath: '/usr/bin/ours-fleet' });
@@ -341,6 +350,7 @@ describe('simple Cowork room member startup', () => {
     expect(state).not.toContain('env-sentinel');
     expect(state).toContain('agent_fingerprint');
     expect(state).toContain('operationalFields');
+    expect(state).toContain('permissions');
   });
 
   it('preserves the canonical room Agent definition', async () => {
@@ -477,11 +487,15 @@ describe('simple Cowork room member startup', () => {
       cfg: cfg(), cowork: h.cowork, roomId: 'room-crash', template: template(1),
       binPath: '/usr/bin/ours-fleet', startupWait: { timeoutMs: 0, now: () => 1 },
     };
+    beginFleetAuditCollection();
     await expect(provisionMembers(input)).rejects.toThrow('simulated process loss');
 
     expect(getRoomRecord('room-crash')!.member_seats[0].launch).toMatchObject({
       state: 'failed', caller_role: 'Coordinator',
     });
+    expect(consumeFleetAuditCollection().presentations).toContainEqual(expect.objectContaining({
+      kind: 'lifecycle_failure', resource: 'Agent', category: 'readiness_failed',
+    }));
     mocks.controlRequest.mockReset();
     mockManagedSpawns();
 
