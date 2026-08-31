@@ -15,6 +15,7 @@ import { snapshotTemplate } from '../src/rooms-tasks/templates.js';
 import type { FleetConfig } from '../src/config.js';
 import type { CoworkAdapter } from '../src/rooms-tasks/cowork-adapter.js';
 import type { TemplateDefinition } from '../src/rooms-tasks/types.js';
+import { beginFleetAuditCollection, consumeFleetAuditCollection } from '../src/fleet-command-audit.js';
 
 const definition: TemplateDefinition = {
   name: 'empty-team', version: 1, description: 'No members', members: [],
@@ -68,6 +69,48 @@ function service(fake: CoworkAdapter): TaskRoomApplicationService {
 }
 
 describe('task create/start surface parity', () => {
+  it('does not claim Room activation or Task work while member seats are still pending', async () => {
+    const members: TemplateDefinition = { name: 'members', version: 1, description: 'Members',
+      contract: 'Execute.', members: [{ slot: 'dev', role: 'Developer', count: 1, role_ref: 'Dev' }] };
+    const cfg = { ...config(), roomTemplates: { members } } as FleetConfig;
+    const h = cowork();
+    const provision = vi.fn(async ({ roomId }: { roomId: string }) => getRoomRecord(roomId)!);
+    const app = new TaskRoomApplicationService(undefined, { loadConfiguration: () => cfg,
+      cowork: () => h.adapter, binPath: () => '/fleet', provisionMembers: provision as any });
+    beginFleetAuditCollection();
+    const task = await app.createTask({ actor: { kind: 'local_control', surface: 'cli' },
+      title: 'Waiting seats', template: 'members', origin: { type: 'cli' } });
+    const events = consumeFleetAuditCollection().presentations ?? [];
+    expect(task.state).toBe('provisioning');
+    expect(events.filter(event => event.kind === 'room' && event.operation === 'activate')).toEqual([]);
+    expect(events.filter(event => event.kind === 'task' && event.operation === 'work')).toEqual([]);
+    expect(events).toEqual(expect.arrayContaining([
+      expect.objectContaining({ kind: 'lifecycle_failure', resource: 'Room', category: 'provision_pending' }),
+      expect.objectContaining({ kind: 'lifecycle_failure', resource: 'Task', category: 'provision_pending' }),
+    ]));
+  });
+
+  it('reports both Room and Task provisioning failures when start member provisioning fails', async () => {
+    const members: TemplateDefinition = { name: 'members', version: 1, description: 'Members',
+      contract: 'Execute.', members: [{ slot: 'dev', role: 'Developer', count: 1, role_ref: 'Dev' }] };
+    const snapshot = snapshotTemplate(members);
+    const task = createTask({ title: 'Failing start', origin: { type: 'cli' }, start: false,
+      template: { name: snapshot.name, version: snapshot.version, content_hash: snapshot.content_hash } });
+    const cfg = { ...config(), roomTemplates: { members } } as FleetConfig;
+    const app = new TaskRoomApplicationService(undefined, { loadConfiguration: () => cfg,
+      cowork: () => cowork().adapter, binPath: () => '/fleet',
+      provisionMembers: vi.fn(async () => { throw new Error('member launch failed'); }) as any });
+    beginFleetAuditCollection();
+    await expect(app.startTask({ actor: { kind: 'local_control', surface: 'cli' }, taskId: task.task_id }))
+      .rejects.toThrow('member launch failed');
+    const failures = (consumeFleetAuditCollection().presentations ?? [])
+      .filter(event => event.kind === 'lifecycle_failure');
+    expect(failures).toEqual(expect.arrayContaining([
+      expect.objectContaining({ resource: 'Room', category: 'provision_failed', eventId: expect.any(String) }),
+      expect.objectContaining({ resource: 'Task', category: 'provision_failed', eventId: expect.any(String) }),
+    ]));
+  });
+
   it('runs the extracted complete provision flow for create', async () => {
     const h = cowork();
     const result = await service(h.adapter).createTask({

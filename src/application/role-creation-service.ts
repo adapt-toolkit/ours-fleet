@@ -192,7 +192,7 @@ export class RoleCreationService {
       const provenance = plan.inherited.includes(kind) ? 'inherited' : 'explicit';
       if (!value) return `unresolved (${provenance})`;
       if ('ref' in value) return `ref:${value.ref} (${provenance})`;
-      const fingerprint = createHash('sha256').update(JSON.stringify(value.inline)).digest('hex').slice(0, 16);
+      const fingerprint = hash(value.inline).slice(0, 16);
       return `inline:sha256:${fingerprint} (${provenance})`;
     };
     return {

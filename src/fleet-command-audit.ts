@@ -15,34 +15,63 @@ export class FleetCliExit extends Error {
 }
 
 export type FleetAuditPresentation =
-  | { kind: 'agent_started'; name: string; lifetime: 'permanent' | 'temporary'; brain: string;
+  | { kind: 'agent_started'; eventId: string; id: string; name: string; lifetime: 'permanent' | 'temporary'; brain: string;
       role: string; harness: string; session: 'acp'; model?: string; permissions?: string;
       parent: string; actionId: string; inherited: string[] }
-  | { kind: 'task'; operation: string; id: string; title?: string; previousState?: string;
+  | { kind: 'task'; operation: 'create' | 'start' | 'work' | 'block' | 'unblock' | 'review'
+      | 'done' | 'cancel' | 'finish' | 'delete' | 'settling'; eventId: string; id: string; title?: string; previousState?: string;
       newState: string; template?: string; roomId?: string;
-      agents: Array<{ name: string; brain?: string; role: string }> }
-  | { kind: 'room'; operation: string; id: string; previousState?: string; newState: string;
-      template?: string; participants: Array<{ name: string; role: string }> };
+      revision?: string; list?: string;
+      agents: Array<{ name: string; brain?: string; role: string; permissions?: string }> }
+  | { kind: 'room'; operation: 'create' | 'activate' | 'close' | 'delete';
+      eventId: string; id: string; previousState?: string; newState: string;
+      revision?: string; name?: string; template?: string; taskId?: string;
+      participants: Array<{ name: string; id?: string; brain?: string; role: string; permissions?: string }> }
+  | { kind: 'lifecycle_failure'; eventId: string; resource: 'Agent' | 'Task' | 'Room'; id: string; state: string;
+      category: 'provision_failed' | 'provision_pending' | 'readiness_failed' | 'settlement_failed' | 'settlement_pending'
+        | 'cleanup_failed' | 'cleanup_pending' };
 
-let collection: { resourceIds: Record<string, string>; presentation?: FleetAuditPresentation;
+/** Commands are Owner-silent unless they record one of these semantic lifecycle kinds. */
+export const FLEET_LIFECYCLE_EVENT_KINDS = Object.freeze([
+  'agent_started', 'task', 'room', 'lifecycle_failure',
+] as const);
+
+/** Stable semantic dedupe basis: resource kind + stable resource ID + transition/action ID. */
+export function lifecycleEventDigestBasis(value: FleetAuditPresentation): string {
+  const resourceKind = value.kind === 'lifecycle_failure' ? value.resource : value.kind;
+  return `${resourceKind}\0${value.id}\0${value.eventId}`;
+}
+
+let collection: { resourceIds: Record<string, string>; presentations: FleetAuditPresentation[];
   failure?: { class: FleetCommandOutcomeClass; effect: 'not_started' | 'completed' | 'unknown' } } | undefined;
-export function beginFleetAuditCollection(): void { collection = { resourceIds: {} }; }
+export function beginFleetAuditCollection(): void { collection = { resourceIds: {}, presentations: [] }; }
 export function recordFleetAuditResource(kind: 'agent' | 'task' | 'room', id: string | undefined): void {
   if (id && collection) collection.resourceIds[kind] = id;
 }
-export function recordFleetAuditPresentation(value: FleetAuditPresentation): void {
-  if (collection) collection.presentation = structuredClone(value);
+type FleetAuditPresentationInput = FleetAuditPresentation extends infer T
+  ? T extends FleetAuditPresentation ? Omit<T, 'eventId'> & { eventId?: string } : never : never;
+export function recordFleetAuditPresentation(value: FleetAuditPresentationInput): void {
+  if (collection && (FLEET_LIFECYCLE_EVENT_KINDS as readonly string[]).includes(value.kind)) {
+    const basis = value.eventId ?? (value.kind === 'agent_started' ? value.actionId
+      : value.kind === 'task' || value.kind === 'room'
+        ? `${value.operation}:${value.revision ?? `${value.previousState ?? 'none'}:${value.newState}`}`
+        : `${value.category}:${value.state}`);
+    collection.presentations.push(structuredClone({ ...value, eventId: basis }));
+    if (value.kind === 'task') collection.resourceIds.task = value.id;
+    if (value.kind === 'room') collection.resourceIds.room = value.id;
+    if (value.kind === 'agent_started') collection.resourceIds.agent = value.id;
+  }
 }
 export function recordFleetAuditFailure(
   failure: { class: FleetCommandOutcomeClass; effect: 'not_started' | 'completed' | 'unknown' },
 ): void { if (collection) collection.failure = failure; }
 export function consumeFleetAuditCollection(): { resourceIds?: Record<string, string>;
-  presentation?: FleetAuditPresentation; failure?: { class: FleetCommandOutcomeClass;
+  presentations?: FleetAuditPresentation[]; failure?: { class: FleetCommandOutcomeClass;
     effect: 'not_started' | 'completed' | 'unknown' } } {
   const current = collection; collection = undefined;
   return {
     ...(current && Object.keys(current.resourceIds).length ? { resourceIds: current.resourceIds } : {}),
-    ...(current?.presentation ? { presentation: current.presentation } : {}),
+    ...(current?.presentations.length ? { presentations: current.presentations } : {}),
     ...(current?.failure ? { failure: current.failure } : {}),
   };
 }
@@ -69,7 +98,7 @@ export interface FleetAuditAttempt {
     effect: 'not_started' | 'completed' | 'unknown';
     delivery: 'sending' | 'delivered' | 'uncertain';
     resourceIds?: Record<string, string>;
-    presentation?: FleetAuditPresentation;
+    presentations?: FleetAuditPresentation[];
   };
 }
 
@@ -83,12 +112,11 @@ const AGENT_SURFACES: Record<string, ReadonlySet<string>> = {
 };
 export const fleetProxyCommandInventory = Object.freeze(Object.fromEntries(
   Object.entries(AGENT_SURFACES).map(([surface, commands]) => [surface, [...commands]])));
-const DENIED = new Set([
-  'up', 'down', 'restart', 'force-restart', 'attach', 'send', 'loops', 'owner-channel',
-  'watchdog-run', 'watchdog-report', 'rm', 'init', 'web',
-]);
 export const fleetProxyTopLevelInventory = Object.freeze({
-  safeRead: [...SAFE_READ], agent: Object.keys(AGENT_SURFACES), denied: [...DENIED],
+  safeRead: [...SAFE_READ], agent: Object.keys(AGENT_SURFACES), public: [
+    'up', 'down', 'restart', 'force-restart', 'attach', 'send', 'loops', 'owner-channel',
+    'watchdog-run', 'watchdog-report', 'rm', 'init', 'web',
+  ], denied: [] as string[],
   hidden: ['_run', '_run-temp', '_run-watchdog', '_run-watchdogs'], aliases: ['man'],
 });
 
@@ -121,13 +149,14 @@ export function classifyFleetArgv(argv: readonly string[]): FleetCommandClassifi
     if (sub.startsWith('_'))
       return { command: `${command} ${sub}`, route: 'supervisor-proxy/internal', decision: 'deny' };
     if (command !== 'spawn' && !AGENT_SURFACES[command]!.has(sub))
-      return { command: `${command} ${sub}`, route: 'supervisor-proxy/unsupported', decision: 'unsupported' };
+      return { command: `${command} ${sub}`, route: `supervisor-proxy/${command}`, decision: 'allow' };
     return { command: sub.startsWith('-') ? command : `${command} ${sub}`,
       route: `supervisor-proxy/${command}`, decision: 'allow' };
   }
-  if (DENIED.has(command))
-    return { command, route: 'supervisor-proxy/permission-denied', decision: 'deny' };
-  return { command, route: 'supervisor-proxy/unsupported', decision: 'unsupported' };
+  // The proxy is attribution and routing, not a product permission boundary.
+  // Commander validates every public command. Hidden process entry points above
+  // remain guarded because recursively invoking them breaks the supervisor protocol.
+  return { command, route: 'supervisor-proxy/public', decision: 'allow' };
 }
 
 const marker = (value: string): string => value === '' ? '[REDACTED:empty]' : '[REDACTED:value]';
@@ -243,7 +272,7 @@ export class FleetCommandAuditStore {
       const prior = { class: attempt.outcome.class, effect: attempt.outcome.effect,
         ...(attempt.outcome.exitCode === undefined ? {} : { exitCode: attempt.outcome.exitCode }),
         ...(attempt.outcome.resourceIds ? { resourceIds: attempt.outcome.resourceIds } : {}),
-        ...(attempt.outcome.presentation ? { presentation: attempt.outcome.presentation } : {}) };
+        ...(attempt.outcome.presentations ? { presentations: attempt.outcome.presentations } : {}) };
       if (JSON.stringify(prior) !== JSON.stringify(outcome))
         throw new Error('conflicting fleet command outcome for existing correlation');
     }
@@ -283,10 +312,10 @@ export function validateFleetAuditBegin(value: unknown): asserts value is { requ
 export function validateFleetAuditFinish(value: unknown): asserts value is {
   correlationId: string; class: FleetCommandOutcomeClass; exitCode?: number;
   effect: 'not_started' | 'completed' | 'unknown'; resourceIds?: Record<string, string>;
-  presentation?: FleetAuditPresentation;
+  presentations?: FleetAuditPresentation[];
 } {
   const input = value as Record<string, unknown> | undefined;
-  const allowed = ['correlationId', 'class', 'exitCode', 'effect', 'resourceIds', 'presentation'];
+  const allowed = ['correlationId', 'class', 'exitCode', 'effect', 'resourceIds', 'presentations'];
   const resources = input?.resourceIds;
   if (!input || Object.keys(input).some(key => !allowed.includes(key))
       || typeof input.correlationId !== 'string' || !UUID.test(input.correlationId)
@@ -295,7 +324,8 @@ export function validateFleetAuditFinish(value: unknown): asserts value is {
       || (resources !== undefined && (!resources || typeof resources !== 'object' || Array.isArray(resources)
         || Object.entries(resources).some(([key, id]) => !['agent', 'task', 'room'].includes(key)
           || typeof id !== 'string' || !SAFE_RESOURCE_ID.test(id))))
-      || (input.presentation !== undefined && !validPresentation(input.presentation)))
+      || (input.presentations !== undefined && (!Array.isArray(input.presentations)
+        || input.presentations.length > 128 || !input.presentations.every(validPresentation))))
     throw new Error('invalid fleet audit finish fields');
 }
 
@@ -305,60 +335,102 @@ function validPresentation(value: unknown): value is FleetAuditPresentation {
   const safe = (v: unknown) => typeof v === 'string' && SAFE_RESOURCE_ID.test(v);
   const text = (v: unknown) => typeof v === 'string' && v.length <= 256
     && !/[\u0000-\u001f\u007f-\u009f\u202a-\u202e\u2066-\u2069]/u.test(v);
-  if (p.kind === 'agent_started') return safe(p.name) && ['permanent', 'temporary'].includes(String(p.lifetime))
+  const exact = (record: Record<string, unknown>, keys: string[]) =>
+    Object.keys(record).every(key => keys.includes(key));
+  const transition = (allowed: Record<string, readonly string[]>) =>
+    typeof p.operation === 'string' && typeof p.newState === 'string'
+      && allowed[p.operation]?.includes(`${String(p.previousState ?? 'none')}→${p.newState}`);
+  if (p.kind === 'agent_started') return exact(p, ['kind', 'eventId', 'id', 'name', 'lifetime', 'brain', 'role',
+    'harness', 'session', 'model', 'permissions', 'parent', 'actionId', 'inherited'])
+    && safe(p.eventId) && safe(p.id) && safe(p.name) && ['permanent', 'temporary'].includes(String(p.lifetime))
     && text(p.brain) && text(p.role) && safe(p.harness) && p.session === 'acp' && safe(p.parent) && safe(p.actionId)
     && (p.model === undefined || text(p.model)) && (p.permissions === undefined || text(p.permissions))
     && Array.isArray(p.inherited) && p.inherited.every(text);
-  if (p.kind === 'task') return safe(p.operation) && safe(p.id) && safe(p.newState)
+  if (p.kind === 'task') return exact(p, ['kind', 'operation', 'eventId', 'id', 'title', 'previousState',
+    'newState', 'template', 'roomId', 'revision', 'list', 'agents'])
+    && ['create', 'start', 'work', 'block', 'unblock', 'review', 'done',
+      'cancel', 'finish', 'delete', 'settling'].includes(String(p.operation)) && safe(p.eventId) && safe(p.id) && safe(p.newState)
+    && transition({ create: ['none→backlog', 'none→provisioning', 'none→active'],
+      start: ['backlog→provisioning'], work: ['provisioning→active'],
+      block: ['backlog→backlog', 'provisioning→provisioning', 'active→active', 'review→review'],
+      unblock: ['backlog→backlog', 'provisioning→provisioning', 'active→active', 'review→review'],
+      review: ['active→review'], done: ['review→done'], finish: ['active→done', 'review→done'],
+      cancel: ['backlog→cancelled', 'provisioning→cancelled', 'active→cancelled', 'review→cancelled'],
+      delete: ['done→deleted'], settling: ['active→active', 'review→review', 'backlog→backlog',
+        'provisioning→provisioning'] })
     && (p.title === undefined || text(p.title)) && (p.previousState === undefined || safe(p.previousState))
     && (p.template === undefined || text(p.template)) && (p.roomId === undefined || safe(p.roomId))
+    && (p.list === undefined || text(p.list)) && (p.revision === undefined || text(p.revision))
     && Array.isArray(p.agents) && p.agents.length <= 64
-    && p.agents.every(a => a && typeof a === 'object' && safe((a as Record<string, unknown>).name)
+    && p.agents.every(a => a && typeof a === 'object'
+      && exact(a as Record<string, unknown>, ['name', 'brain', 'role', 'permissions'])
+      && safe((a as Record<string, unknown>).name)
       && text((a as Record<string, unknown>).role)
-      && ((a as Record<string, unknown>).brain === undefined || text((a as Record<string, unknown>).brain)));
-  if (p.kind === 'room') return safe(p.operation) && safe(p.id) && safe(p.newState)
+      && ((a as Record<string, unknown>).brain === undefined || text((a as Record<string, unknown>).brain))
+      && ((a as Record<string, unknown>).permissions === undefined || text((a as Record<string, unknown>).permissions)));
+  if (p.kind === 'room') return exact(p, ['kind', 'operation', 'eventId', 'id', 'previousState', 'newState',
+    'revision', 'name', 'template', 'taskId', 'participants'])
+    && ['create', 'activate', 'close', 'delete'].includes(String(p.operation))
+    && safe(p.eventId) && safe(p.id) && safe(p.newState)
+    && transition({ create: ['none→provisioning'], activate: ['provisioning→active'],
+      close: ['active→closing', 'provisioning→closing'],
+      delete: ['closing→deleted'] })
     && (p.previousState === undefined || safe(p.previousState))
-    && (p.template === undefined || text(p.template))
+    && (p.name === undefined || text(p.name)) && (p.template === undefined || text(p.template))
+    && (p.taskId === undefined || safe(p.taskId)) && (p.revision === undefined || text(p.revision))
     && Array.isArray(p.participants) && p.participants.length <= 64
-    && p.participants.every(a => a && typeof a === 'object' && safe((a as Record<string, unknown>).name)
-      && text((a as Record<string, unknown>).role));
+    && p.participants.every(a => a && typeof a === 'object'
+      && exact(a as Record<string, unknown>, ['name', 'id', 'brain', 'role', 'permissions'])
+      && safe((a as Record<string, unknown>).name)
+      && text((a as Record<string, unknown>).role)
+      && ((a as Record<string, unknown>).id === undefined || safe((a as Record<string, unknown>).id))
+      && ((a as Record<string, unknown>).brain === undefined || text((a as Record<string, unknown>).brain))
+      && ((a as Record<string, unknown>).permissions === undefined || text((a as Record<string, unknown>).permissions)));
+  if (p.kind === 'lifecycle_failure') return exact(p, ['kind', 'eventId', 'resource', 'id', 'state', 'category'])
+    && ['Agent', 'Task', 'Room'].includes(String(p.resource))
+    && safe(p.eventId) && safe(p.id) && safe(p.state) && ['provision_failed', 'provision_pending', 'readiness_failed', 'settlement_failed',
+      'settlement_pending', 'cleanup_failed', 'cleanup_pending'].includes(String(p.category));
   return false;
 }
 
-export function renderFleetAuditInvocation(attempt: FleetAuditAttempt): string {
-  return ['🧾 Fleet command invoked', `Correlation: ${attempt.correlationId}`, `Agent: ${attempt.caller}`,
-    `Route: ${attempt.classification.route}`, `Fleet action: ${attempt.classification.command}`,
-    `Decision: ${attempt.classification.decision}`, `Invoked: ${attempt.invokedAt}`,
-    `Raw argv (redacted): ${JSON.stringify(attempt.argv)}`].join('\n');
-}
-
-export function renderFleetAuditOutcome(attempt: FleetAuditAttempt): string {
-  if (!attempt.outcome) throw new Error('fleet command audit outcome is absent');
-  return ['🧾 Fleet command outcome', `Correlation: ${attempt.correlationId}`, `Agent: ${attempt.caller}`,
-    `Route: ${attempt.classification.route}`, `Fleet action: ${attempt.classification.command}`,
-    `Result: ${attempt.outcome.class}`, `Effect: ${attempt.outcome.effect}`,
-    ...(attempt.outcome.exitCode === undefined ? [] : [`Exit: ${attempt.outcome.exitCode}`]),
-    ...Object.entries(attempt.outcome.resourceIds ?? {}).sort(([a], [b]) => a.localeCompare(b))
-      .map(([kind, id]) => `${kind[0]?.toUpperCase()}${kind.slice(1)} ID: ${id}`),
-    `Completed: ${attempt.outcome.completedAt}`, `Raw argv (redacted): ${JSON.stringify(attempt.argv)}`,
-    ...renderPresentation(attempt.outcome.presentation)].join('\n');
-}
-
-function renderPresentation(value: FleetAuditPresentation | undefined): string[] {
-  if (!value) return [];
-  if (value.kind === 'agent_started') return ['Structured result: Agent started', `Agent: ${value.name}`,
-    `Brain: ${value.brain}`, `Role: ${value.role}`,
-    `Runtime: ${value.harness}/${value.session}${value.model ? ` model=${value.model}` : ''}`,
-    ...(value.permissions ? [`Permissions: ${value.permissions}`] : []), `Parent: ${value.parent}`,
-    `Agent action ID: ${value.actionId}`,
-    `Inheritance: ${value.inherited.length ? value.inherited.join(', ') : 'none'}`];
-  if (value.kind === 'task') return ['Structured result: Task', `Operation: ${value.operation}`,
-    `Task: ${value.title ? `${value.title} (` : ''}${value.id}${value.title ? ')' : ''}`,
-    `Status: ${value.previousState ?? 'unresolved'} -> ${value.newState}`,
-    ...(value.template ? [`Template: ${value.template}`] : []), ...(value.roomId ? [`Room: ${value.roomId}`] : []),
-    `Responsible Agents: ${value.agents.length ? value.agents.map(a => `${a.name} [Brain ${a.brain ?? 'unresolved'}; Role ${a.role}]`).join('; ') : 'none'}`];
-  return ['Structured result: Room', `Operation: ${value.operation}`, `Room: ${value.id}`,
-    `Status: ${value.previousState ?? 'unresolved'} -> ${value.newState}`,
-    ...(value.template ? [`Template: ${value.template}`] : []),
-    `Participants: ${value.participants.length ? value.participants.map(a => `${a.name} [Role ${a.role}]`).join('; ') : 'none'}`];
+/** Compact Owner presentation. It intentionally has no command, argv, environment, or correlation data. */
+export function renderFleetLifecycleEvent(value: FleetAuditPresentation): string {
+  if (value.kind === 'lifecycle_failure') {
+    const actions = {
+      provision_failed: 'Inspect Fleet service logs, correct configuration, then recover the resource.',
+      provision_pending: 'Run Task or Room recover after checking member readiness.',
+      readiness_failed: 'Inspect the Agent log, correct its configuration, then retry creation.',
+      settlement_failed: 'Inspect Fleet service logs, then run Task recover.',
+      settlement_pending: 'Run Task recover to continue settlement.',
+      cleanup_failed: 'Inspect Fleet service logs, then run Room recover.',
+      cleanup_pending: 'Run Room recover to continue cleanup.',
+    } as const;
+    const lifecycle = value.category.endsWith('_pending') ? 'lifecycle pending' : 'lifecycle failure';
+    return `⚠️ ${value.resource} ${value.id} ${lifecycle} (${value.category}); `
+      + `state ${value.state}. Action: ${actions[value.category]}`;
+  }
+  if (value.kind === 'agent_started') {
+    const permission = value.permissions ? `; permissions ${value.permissions}` : '';
+    return `🧑‍💻 ${value.parent} spawned ${value.lifetime} Agent ${value.name} (${value.id}) — ready. `
+      + `Brain ${value.brain ?? 'unresolved'}; Role ${value.role ?? 'unresolved'}${permission}.`;
+  }
+  if (value.kind === 'task') {
+    const title = value.title ? ` “${value.title}”` : '';
+    const context = [value.list ? `List ${value.list}` : undefined,
+      value.template ? `template ${value.template}` : undefined,
+      value.roomId ? `Room ${value.roomId}` : undefined].filter(Boolean).join('; ');
+    const agents = value.agents.length ? ` Agents: ${value.agents.map(agent =>
+      `${agent.name} [Brain ${agent.brain ?? 'unresolved'}; Role ${agent.role}`
+        + `${agent.permissions ? `; permissions ${agent.permissions}` : ''}]`).join('; ')}.` : '';
+    return `📋 Task${title} (${value.id}) ${value.operation}: `
+      + `${value.previousState ?? 'none'} → ${value.newState}.${context ? ` ${context}.` : ''}${agents}`;
+  }
+  const context = [value.template ? `template ${value.template}` : undefined,
+    value.taskId ? `Task ${value.taskId}` : undefined].filter(Boolean).join('; ');
+  const participants = value.participants.length ? ` Participants: ${value.participants.map(participant =>
+    `${participant.name}${participant.id ? ` (${participant.id})` : ''} [Role ${participant.role}`
+      + `${participant.brain ? `; Brain ${participant.brain}` : ''}`
+      + `${participant.permissions ? `; permissions ${participant.permissions}` : ''}]`).join('; ')}.` : '';
+  return `🏠 Room${value.name ? ` “${value.name}”` : ''} (${value.id}) ${value.operation}: `
+    + `${value.previousState ?? 'none'} → ${value.newState}.${context ? ` ${context}.` : ''}${participants}`;
 }

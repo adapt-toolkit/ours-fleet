@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os';
 import { describe, expect, it } from 'vitest';
 import {
   classifyFleetArgv, FleetCommandAuditStore, redactFleetArgv,
-  renderFleetAuditInvocation, renderFleetAuditOutcome, fleetProxyCommandInventory,
+  lifecycleEventDigestBasis, renderFleetLifecycleEvent, fleetProxyCommandInventory,
   fleetProxyTopLevelInventory, validateFleetAuditBegin, validateFleetAuditFinish,
 } from '../src/fleet-command-audit.js';
 import { fleetWorkerEnv } from '../src/rooms-tasks/external-worker.js';
@@ -37,7 +37,8 @@ describe('fleet command audit', () => {
       if (source.includes(`register${surface[0]!.toUpperCase()}${surface.slice(1)}Commands(program`))
         registered.push(surface);
     const inventory = [...fleetProxyTopLevelInventory.safeRead,
-      ...fleetProxyTopLevelInventory.agent, ...fleetProxyTopLevelInventory.denied,
+      ...fleetProxyTopLevelInventory.agent, ...fleetProxyTopLevelInventory.public,
+      ...fleetProxyTopLevelInventory.denied,
       ...fleetProxyTopLevelInventory.hidden];
     expect([...new Set(registered)].sort()).toEqual([...new Set(inventory)].sort());
     expect(fleetProxyTopLevelInventory.aliases).toContain('man');
@@ -71,14 +72,14 @@ describe('fleet command audit', () => {
     [['--version'], 'allow', '--version'],
     [['man'], 'allow', 'man'],
     [['--', 'task', 'list'], 'allow', 'task list'],
-    [['down', 'A'], 'deny', 'down'],
-    [['send', 'A', 'secret'], 'deny', 'send'],
+    [['down', 'A'], 'allow', 'down'],
+    [['send', 'A', 'secret'], 'allow', 'send'],
     [['_run', 'A'], 'deny', '_run'],
     [['task', '_settle', 't'], 'deny', 'task _settle'],
     [['room', '_delete', 'r'], 'deny', 'room _delete'],
-    [['unknown'], 'unsupported', 'unknown'],
-    [['task', 'exfiltrate'], 'unsupported', 'task exfiltrate'],
-    [['room', 'bogus'], 'unsupported', 'room bogus'],
+    [['unknown'], 'allow', 'unknown'],
+    [['task', 'exfiltrate'], 'allow', 'task exfiltrate'],
+    [['room', 'bogus'], 'allow', 'room bogus'],
     [[], 'unsupported', '<none>'],
   ] as const)('classifies %j', (argv, decision, command) => {
     expect(classifyFleetArgv(argv)).toMatchObject({ decision, command });
@@ -119,6 +120,12 @@ describe('fleet command audit', () => {
     expect(() => validateFleetAuditFinish({ correlationId: id, class: 'success', effect: 'done' })).toThrow();
     expect(() => validateFleetAuditFinish({ correlationId: id, class: 'success', effect: 'completed',
       resourceIds: { token: 'secret' } })).toThrow();
+    expect(() => validateFleetAuditFinish({ correlationId: id, class: 'success', effect: 'completed',
+      presentations: [{ kind: 'task', operation: 'create', id: 't1', previousState: 'active',
+        newState: 'done', agents: [] }] })).toThrow();
+    expect(() => validateFleetAuditFinish({ correlationId: id, class: 'success', effect: 'completed',
+      presentations: [{ kind: 'room', operation: 'create', id: 'r1', previousState: 'none',
+        newState: 'provisioning', participants: [], secret: 'nope' }] })).toThrow();
   });
 
   it('durably dedupes begin, owns correlations, and makes unfinished attempts observable', () => {
@@ -157,39 +164,59 @@ describe('fleet command audit', () => {
     expect(recovered).toMatchObject({ invocation: 'delivered', outcome: { delivery: 'uncertain', effect: 'completed' } });
   });
 
-  it('renders mandatory raw argv in both canonical records', () => {
+  it('keeps raw argv in local diagnostics but never in lifecycle rendering', () => {
     const store = new FleetCommandAuditStore(join(mkdtempSync(join(tmpdir(), 'fleet-audit-')), 'a.json'), {
       now: () => new Date('2026-01-01T00:00:00.000Z'), uuid: () => 'corr',
     });
-    let attempt = store.begin('req', 'Agent', ['task', 'create', '--brief', 'secret']);
-    expect(renderFleetAuditInvocation(attempt)).toContain('Raw argv (redacted): ["task","create","--brief","[REDACTED:value]"]');
-    attempt = store.finish('corr', 'Agent', { class: 'success', effect: 'completed', exitCode: 0 });
-    expect(renderFleetAuditOutcome(attempt)).toContain('Raw argv (redacted): ["task","create","--brief","[REDACTED:value]"]');
+    const attempt = store.begin('req', 'Agent', ['task', 'create', '--brief', 'secret']);
+    expect(attempt.argv).toEqual(['task', 'create', '--brief', '[REDACTED:value]']);
+    const rendered = renderFleetLifecycleEvent({ kind: 'task', operation: 'created', id: 'task-1',
+      previousState: 'none', newState: 'active', agents: [] });
+    expect(rendered).not.toContain('argv');
+    expect(rendered).not.toContain('secret');
   });
 
-  it('renders stable structured Agent, Task, and Room vocabulary after the raw block', () => {
-    const path = join(mkdtempSync(join(tmpdir(), 'fleet-audit-')), 'structured.json');
-    const agentStore = new FleetCommandAuditStore(path, { now: () => new Date('2026-01-01T00:00:00.000Z'), uuid: () => 'agent' });
-    agentStore.begin('req', 'Coordinator', ['spawn', 'Dev']);
-    const agent = agentStore.finish('agent', 'Coordinator', { class: 'success', effect: 'completed', exitCode: 0,
-      presentation: { kind: 'agent_started', name: 'Dev', lifetime: 'temporary', brain: 'brain-ref',
-        role: 'role-ref', harness: 'codex', session: 'acp', permissions: 'allow/full',
-        parent: 'Coordinator', actionId: 'action-1', inherited: ['role'] } });
-    expect(renderFleetAuditOutcome(agent)).toMatch(/Raw argv[\s\S]+Structured result: Agent started/);
-    expect(renderFleetAuditOutcome(agent)).toContain('Brain: brain-ref');
-    const taskStore = new FleetCommandAuditStore(path + '-task', { now: () => new Date('2026-01-01T00:00:00.000Z'), uuid: () => 'task' });
-    taskStore.begin('req', 'Coordinator', ['task', 'start', 't1']);
-    const task = taskStore.finish('task', 'Coordinator', { class: 'success', effect: 'completed', exitCode: 0,
-      presentation: { kind: 'task', operation: 'started', id: 't1', title: 'Ship',
-        previousState: 'backlog', newState: 'active', template: 'team@1', roomId: 'r1',
-        agents: [{ name: 'Dev', brain: 'B', role: 'Developer' }] } });
-    expect(renderFleetAuditOutcome(task)).toContain('Status: backlog -> active');
-    expect(renderFleetAuditOutcome(task)).toContain('Responsible Agents: Dev [Brain B; Role Developer]');
-    const roomStore = new FleetCommandAuditStore(path + '-room', { now: () => new Date('2026-01-01T00:00:00.000Z'), uuid: () => 'room' });
-    roomStore.begin('req', 'Coordinator', ['room', 'open', 'r1']);
-    const room = roomStore.finish('room', 'Coordinator', { class: 'success', effect: 'completed', exitCode: 0,
-      presentation: { kind: 'room', operation: 'opened', id: 'r1', previousState: 'provisioning',
-        newState: 'active', participants: [{ name: 'Critic', role: 'Critic' }] } });
-    expect(renderFleetAuditOutcome(room)).toContain('Participants: Critic [Role Critic]');
+  it('renders compact deterministic Agent, Task, and Room lifecycle vocabulary', () => {
+    const agent = renderFleetLifecycleEvent({ kind: 'agent_started', id: 'Dev', name: 'Dev', lifetime: 'temporary',
+      brain: 'ref:brain (explicit)', role: 'inline:sha256:abcd (inherited)', harness: 'codex',
+      session: 'acp', permissions: 'allow/full', parent: 'Coordinator', actionId: 'action-1', inherited: ['role'] });
+    expect(agent).toContain('Agent Dev (Dev) — ready');
+    expect(agent).toContain('Brain ref:brain (explicit); Role inline:sha256:abcd (inherited)');
+    const task = renderFleetLifecycleEvent({ kind: 'task', operation: 'started', id: 't1', title: 'Ship Δ',
+      previousState: 'backlog', newState: 'active', template: 'team@1', roomId: 'r1', list: 'default',
+      agents: [{ name: 'Dev', brain: 'B', role: 'Developer', permissions: 'allow' }] });
+    expect(task).toContain('backlog → active');
+    expect(task).toContain('Brain B; Role Developer; permissions allow');
+    const room = renderFleetLifecycleEvent({ kind: 'room', operation: 'activated', id: 'r1',
+      previousState: 'provisioning', newState: 'active', taskId: 't1',
+      participants: [{ name: 'Critic', id: 'cid-1', role: 'Critic' }] });
+    expect(room).toContain('Participants: Critic (cid-1) [Role Critic]');
+  });
+
+  it('renders actionable failures from a closed category without exception text', () => {
+    const rendered = renderFleetLifecycleEvent({ kind: 'lifecycle_failure', resource: 'Room',
+      eventId: 'episode-1', id: 'room-1', state: 'closing', category: 'cleanup_failed' });
+    expect(rendered).toContain('Room room-1 lifecycle failure (cleanup_failed)');
+    expect(rendered).toContain('run Room recover');
+    expect(rendered).not.toContain('/private');
+  });
+
+  it('labels actionable pending state without calling it a failure', () => {
+    const rendered = renderFleetLifecycleEvent({ kind: 'lifecycle_failure', resource: 'Room',
+      eventId: 'episode-1', id: 'room-1', state: 'provisioning', category: 'provision_pending' });
+    expect(rendered).toBe('⚠️ Room room-1 lifecycle pending (provision_pending); state provisioning. '
+      + 'Action: Run Task or Room recover after checking member readiness.');
+    expect(rendered).not.toContain('lifecycle failure');
+  });
+
+  it('separates Agent, Task, and Room failure dedupe keys with identical IDs and event IDs', () => {
+    const bases = (['Agent', 'Task', 'Room'] as const).map(resource => lifecycleEventDigestBasis({
+      kind: 'lifecycle_failure', resource, eventId: 'same-event', id: 'same-id', state: 'failed',
+      category: 'provision_failed',
+    }));
+    expect(new Set(bases).size).toBe(3);
+    expect(bases).toEqual([
+      'Agent\0same-id\0same-event', 'Task\0same-id\0same-event', 'Room\0same-id\0same-event',
+    ]);
   });
 });
