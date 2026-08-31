@@ -193,11 +193,21 @@ only sustained authoritative absence closes the role. Unreachable, malformed, or
 valid-but-empty daemon indexes are ambiguous and reset closure debounce rather
 than becoming cleanup authority.
 
-Inside a managed ACP role, the same CLI automatically routes a real \`spawn\`
-through that role's authenticated supervisor control socket. \`--name Name\` is
-accepted as an alternative to the positional Agent name. The supervisor records the
-calling role, performs creation, and only after success sends a structured
-spawn notice through the caller's owner channel when one is configured.
+Inside a managed ACP role, every \`ours-fleet\` CLI attempt first crosses one
+authenticated supervisor audit boundary before Commander parsing or side effects.
+The original CLI remains the executor inside the role's existing OS sandbox. The
+supervisor writes a deterministic, structurally redacted raw argv invocation to the
+role's existing Owner-visible channel, then permits explicit Agent/Task/Room/template
+and safe read-only routes. Operator lifecycle/control, hidden worker, and unknown
+routes are denied but remain audited. A correlated outcome repeats the same redacted
+argv and records a safe success/failure classification plus known resource IDs.
+
+Invocation delivery must be confirmed before execution. Delivery ambiguity fails
+closed. If outcome delivery becomes uncertain after an effect, Fleet records the
+known effect state and never reruns or blindly retries it. Durable correlation state
+makes incomplete and uncertain attempts observable across supervisor restart. Spawn
+still uses the typed supervisor creation service for inheritance, but its former
+standalone announcement is replaced by the canonical audit pair.
 
 Omitted Brain and Role selections, working directory, coordinator, neutral permissions,
 and fleet monitor policy inherit from the calling Agent. Explicit options always win.

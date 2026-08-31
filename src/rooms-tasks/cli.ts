@@ -1,5 +1,6 @@
 import type { Command } from 'commander';
 import { readFileSync } from 'node:fs';
+import { createHash } from 'node:crypto';
 import { loadConfig, type FleetConfig, ConfigError, findRole } from '../config.js';
 import { provisionMembers, getBinPath } from './provision.js';
 import {
@@ -30,6 +31,9 @@ import {
 } from './markdown.js';
 import { TaskRoomApplicationError, TaskRoomApplicationService } from '../application/task-room-service.js';
 import { TaskListError } from './task-lists.js';
+import {
+  recordFleetAuditFailure, recordFleetAuditPresentation, recordFleetAuditResource,
+} from '../fleet-command-audit.js';
 
 type TaskRoomPublicErrorCode =
   | 'task_confirmation_mismatch' | 'room_confirmation_mismatch'
@@ -124,7 +128,31 @@ function die(e: unknown): never {
   const msg = e instanceof TaskRoomPublicError
     ? taskRoomPublicFailure(e).legacy : e instanceof Error ? e.message : String(e);
   process.stderr.write(`error: ${msg}\n`);
+  recordFleetAuditFailure(classifyTaskRoomFailure(e));
   process.exit(1);
+}
+
+function classifyTaskRoomFailure(e: unknown): {
+  class: 'validation' | 'runtime'; effect: 'not_started' | 'unknown';
+} {
+  if (e instanceof TaskRoomApplicationError)
+    e = taskRoomPublicError(e.code as TaskRoomPublicErrorCode, e.fields);
+  if (e instanceof TaskRoomPublicError || e instanceof TaskListError || e instanceof ConfigError)
+    return { class: 'validation', effect: 'not_started' };
+  if (e instanceof TaskStateError) {
+    const known = /^task not found: [A-Za-z0-9_-]{1,128}$/u.test(e.message)
+      || e.message === 'invalid task ID: expected the canonical 17-character lowercase ID'
+      || isKnownTaskStateMessage(e.message);
+    return known ? { class: 'validation', effect: 'not_started' }
+      : { class: 'runtime', effect: 'unknown' };
+  }
+  if (e instanceof RoomStateError) {
+    const known = /^room not found: [A-Za-z0-9_-]{1,128}$/u.test(e.message)
+      || isKnownRoomStateMessage(e.message);
+    return known ? { class: 'validation', effect: 'not_started' }
+      : { class: 'runtime', effect: 'unknown' };
+  }
+  return { class: 'runtime', effect: 'unknown' };
 }
 
 const TASK_STATE_WORD = '(?:backlog|provisioning|active|review|done|cancelled|failed)';
@@ -166,6 +194,7 @@ function dieTaskRoom(e: unknown): never {
       action: failure.action,
     });
     process.stderr.write(`${output}\n`);
+    recordFleetAuditFailure({ class: 'validation', effect: 'not_started' });
     process.exit(1);
   }
   if (e instanceof TaskListError) {
@@ -180,7 +209,9 @@ function dieTaskRoom(e: unknown): never {
         : conflict ? 'Choose a different list name or an explicit valid destination.'
           : 'Use a valid NFC-normalized name of at most 64 Unicode code points.',
     });
-    process.stderr.write(`${output}\n`); process.exit(1);
+    process.stderr.write(`${output}\n`);
+    recordFleetAuditFailure({ class: 'validation', effect: 'not_started' });
+    process.exit(1);
   }
   const taskMissing = e instanceof TaskStateError
     ? /^task not found: ([A-Za-z0-9_-]{1,128})$/u.exec(e.message) : null;
@@ -205,6 +236,7 @@ function dieTaskRoom(e: unknown): never {
           : 'Retry once; if it repeats, run ours-fleet doctor and inspect the role logs.',
   });
   process.stderr.write(`${output}\n`);
+  recordFleetAuditFailure(classifyTaskRoomFailure(e));
   process.exit(1);
 }
 
@@ -220,7 +252,10 @@ const taskListMarkdown = (tasks: ReturnType<typeof listTasks>, title = 'Tasks'):
 const taskActionMarkdown = (
   title: string, task: ReturnType<typeof getTask>,
   fields: Parameters<typeof renderMarkdownResult>[0]['fields'] = [],
-): string => renderMarkdownResult({
+): string => {
+  recordFleetAuditResource('task', task.task_id);
+  if (task.room_id) recordFleetAuditResource('room', task.room_id);
+  return renderMarkdownResult({
   icon: '📋', title,
   fields: [
     { label: 'ID', value: task.task_id, kind: 'code' },
@@ -228,19 +263,55 @@ const taskActionMarkdown = (
     { label: 'List', value: task.list_name ?? 'default', kind: 'code' },
     ...fields,
   ],
-});
+  });
+};
+
+function safeBrainSummary(definition: Record<string, unknown> | undefined): string {
+  const brain = definition?.brain;
+  if (!brain || typeof brain !== 'object' || Array.isArray(brain)) return 'unresolved';
+  const selection = brain as Record<string, unknown>;
+  if (typeof selection.ref === 'string') return `ref:${selection.ref}`;
+  if (!Object.hasOwn(selection, 'inline')) return 'unresolved';
+  const fingerprint = createHash('sha256').update(JSON.stringify(selection.inline)).digest('hex').slice(0, 16);
+  return `inline:sha256:${fingerprint}`;
+}
+
+function auditTask(operation: string, task: ReturnType<typeof getTask>, previousState: string,
+  newState: string = task.state): void {
+  recordFleetAuditResource('task', task.task_id);
+  if (task.room_id) recordFleetAuditResource('room', task.room_id);
+  const room = task.room_id ? getRoomRecord(task.room_id) : undefined;
+  const brains = new Map(room?.member_seats.map(seat =>
+    [seat.role_name, safeBrainSummary(seat.launch?.agent_definition)]) ?? []);
+  recordFleetAuditPresentation({ kind: 'task', operation, id: task.task_id, title: task.title,
+    previousState, newState,
+    template: task.template ? `${task.template.name}@${task.template.version}` : undefined,
+    roomId: task.room_id, agents: task.member_roles.map(member => ({ name: member.name,
+      brain: brains.get(member.name) ?? 'unresolved', role: member.cowork_role })) });
+}
+
+function auditRoom(operation: string, room: RoomOrchestrationRecord, previousState: string,
+  newState: string = room.state): void {
+  recordFleetAuditResource('room', room.room_id);
+  recordFleetAuditPresentation({ kind: 'room', operation, id: room.room_id, previousState, newState,
+    template: room.template_snapshot ? `${room.template_snapshot.name}@${room.template_snapshot.version}` : undefined,
+    participants: room.member_seats.map(member => ({ name: member.role_name, role: member.cowork_role })) });
+}
 
 const roomActionMarkdown = (
   title: string, room: RoomOrchestrationRecord,
   fields: Parameters<typeof renderMarkdownResult>[0]['fields'] = [],
-): string => renderMarkdownResult({
+): string => {
+  recordFleetAuditResource('room', room.room_id);
+  return renderMarkdownResult({
   icon: '🏠', title,
   fields: [
     { label: 'ID', value: room.room_id, kind: 'code' },
     { label: 'Status', value: roomStatus(room.state), kind: 'markdown' },
     ...fields,
   ],
-});
+  });
+};
 
 const PUBLIC_SETTLE_WAIT_MS = 60_000;
 const PUBLIC_SETTLE_POLL_MS = 100;
@@ -538,6 +609,7 @@ export function registerTaskCommands(parent: Command, cOpt: (cmd: Command) => Co
           idempotencyKey: opts.idempotencyKey, origin: { type: 'cli' },
           list: opts.list,
         });
+        auditTask('create', record, 'none');
 
         if (opts.json) {
           console.log(JSON.stringify({ schema_version: 1, task: record }, null, 2));
@@ -681,9 +753,11 @@ export function registerTaskCommands(parent: Command, cOpt: (cmd: Command) => Co
     .option('--json', 'JSON output')
     .action(async (id: string, opts: { configuration?: string; json?: boolean }) => {
       try {
+        const previous = getTask(id).state;
         const t = await taskRoomService(opts.configuration).startTask({
           actor: { kind: 'local_control', surface: 'cli' }, taskId: id,
         });
+        auditTask('start', t, previous);
         if (opts.json) { console.log(JSON.stringify({ schema_version: 1, task: t }, null, 2)); return; }
         console.log(taskActionMarkdown('Task started', t));
       } catch (e) {
@@ -702,9 +776,11 @@ export function registerTaskCommands(parent: Command, cOpt: (cmd: Command) => Co
     .option('--json', 'JSON output')
     .action((id: string, opts: { reason: string; json?: boolean }) => {
       try {
+        const previous = getTask(id).state;
         const t = taskRoomService().blockTask({
           actor: { kind: 'local_control', surface: 'cli' }, taskId: id, reason: opts.reason,
         });
+        auditTask('block', t, previous);
         if (opts.json) { console.log(JSON.stringify({ schema_version: 1, task: t }, null, 2)); return; }
         console.log(taskActionMarkdown('Task blocked', t, [{ label: 'Reason', value: opts.reason }]));
       } catch (e) { if (opts.json) die(e); dieTaskRoom(e); }
@@ -715,9 +791,11 @@ export function registerTaskCommands(parent: Command, cOpt: (cmd: Command) => Co
     .option('--json', 'JSON output')
     .action((id: string, opts: { json?: boolean }) => {
       try {
+        const previous = getTask(id).state;
         const t = taskRoomService().unblockTask({
           actor: { kind: 'local_control', surface: 'cli' }, taskId: id,
         });
+        auditTask('unblock', t, previous);
         if (opts.json) { console.log(JSON.stringify({ schema_version: 1, task: t }, null, 2)); return; }
         console.log(taskActionMarkdown('Task unblocked', t));
       } catch (e) { if (opts.json) die(e); dieTaskRoom(e); }
@@ -728,9 +806,11 @@ export function registerTaskCommands(parent: Command, cOpt: (cmd: Command) => Co
     .option('--json', 'JSON output')
     .action((id: string, opts: { json?: boolean }) => {
       try {
+        const previous = getTask(id).state;
         const t = taskRoomService().reviewTask({
           actor: { kind: 'local_control', surface: 'cli' }, taskId: id,
         });
+        auditTask('review', t, previous);
         if (opts.json) { console.log(JSON.stringify({ schema_version: 1, task: t }, null, 2)); return; }
         console.log(taskActionMarkdown('Task ready for review', t));
       } catch (e) { if (opts.json) die(e); dieTaskRoom(e); }
@@ -743,6 +823,7 @@ export function registerTaskCommands(parent: Command, cOpt: (cmd: Command) => Co
     .option('--json', 'JSON output')
     .action(async (id: string, opts: { configuration?: string; summary?: string; summaryFile?: string; json?: boolean }) => {
       try {
+        const previous = getTask(id).state;
         let summary = opts.summary;
         if (opts.summaryFile) summary = readFileSync(opts.summaryFile, 'utf8');
         const outcome = summary ? { summary } : undefined;
@@ -753,6 +834,7 @@ export function registerTaskCommands(parent: Command, cOpt: (cmd: Command) => Co
           ? await launchTaskSettleWorker(id, opts.configuration)
           : { task: plan.task, timedOut: false };
         const t = settled.task;
+        auditTask('done', t, previous);
         if (opts.json) { console.log(JSON.stringify({ schema_version: 1, task: t }, null, 2)); return; }
         if (settled.timedOut) {
           console.log(renderMarkdownFailure({
@@ -774,6 +856,7 @@ export function registerTaskCommands(parent: Command, cOpt: (cmd: Command) => Co
       try {
         if (id !== confirmId)
           throw taskRoomPublicError('task_confirmation_mismatch');
+        const previous = getTask(id).state;
         const plan = await taskRoomService(opts.configuration).cancelTask({
           actor: { kind: 'local_control', surface: 'cli' }, taskId: id,
         });
@@ -781,6 +864,7 @@ export function registerTaskCommands(parent: Command, cOpt: (cmd: Command) => Co
           ? await launchTaskSettleWorker(id, opts.configuration)
           : { task: plan.task, timedOut: false };
         const t = settled.task;
+        auditTask('cancel', t, previous);
         if (opts.json) { console.log(JSON.stringify({ schema_version: 1, task: t }, null, 2)); return; }
         if (settled.timedOut) {
           console.log(renderMarkdownFailure({
@@ -800,9 +884,12 @@ export function registerTaskCommands(parent: Command, cOpt: (cmd: Command) => Co
     .action((id: string, confirmId: string, opts: { json?: boolean }) => {
       try {
         if (id !== confirmId) throw taskRoomPublicError('task_confirmation_mismatch');
+        let prior: ReturnType<typeof getTask> | undefined;
+        try { prior = getTask(id); } catch { /* idempotent already-absent delete */ }
         const deleted = taskRoomService().deleteTask({
           actor: { kind: 'local_control', surface: 'cli' }, taskId: id,
         });
+        if (prior) auditTask('delete', prior, prior.state, 'deleted');
         if (opts.json) {
           console.log(JSON.stringify({ schema_version: 1, task_id: id, deleted }, null, 2));
           return;
@@ -819,6 +906,7 @@ export function registerTaskCommands(parent: Command, cOpt: (cmd: Command) => Co
     .option('--json', 'JSON output')
     .action(async (id: string, opts: { configuration?: string; json?: boolean }) => {
       try {
+        const previous = getTask(id).state;
         const app = taskRoomService(opts.configuration);
         const actor = { kind: 'local_control' as const, surface: 'cli' as const };
         const begin = await app.beginTaskRecovery({ actor, taskId: id });
@@ -829,6 +917,7 @@ export function registerTaskCommands(parent: Command, cOpt: (cmd: Command) => Co
           })()
           : begin.result;
         const t = recovered.task;
+        auditTask('recover', t, previous);
         const room = recovered.room;
         const recoveryActions = recovered.issues.map(issue => {
           if (issue.code === 'terminal_pending') return `Terminal intent remains pending — retry task recover ${id}`;
@@ -918,10 +1007,12 @@ export function registerTaskCommands(parent: Command, cOpt: (cmd: Command) => Co
     .option('--json', 'JSON output')
     .action(async (id: string, opts: { configuration?: string; template?: string; json?: boolean }) => {
       try {
+        const previous = getTask(id).state;
         const result = await taskRoomService(opts.configuration).ensureTaskWork({
           actor: { kind: 'local_control', surface: 'cli' }, taskId: id, template: opts.template,
         });
         const t = result.task;
+        auditTask('work', t, previous);
         if (result.status === 'already_active') {
           if (opts.json) {
             console.log(JSON.stringify({ schema_version: 1, task: t, status: 'already_active' }, null, 2));
@@ -960,6 +1051,7 @@ export function registerTaskCommands(parent: Command, cOpt: (cmd: Command) => Co
     .option('--json', 'JSON output')
     .action(async (id: string, opts: { configuration?: string; summary?: string; summaryFile?: string; json?: boolean }) => {
       try {
+        const previous = getTask(id).state;
         let summary = opts.summary;
         if (opts.summaryFile) summary = readFileSync(opts.summaryFile, 'utf8');
         const outcome = summary ? { summary } : undefined;
@@ -971,6 +1063,7 @@ export function registerTaskCommands(parent: Command, cOpt: (cmd: Command) => Co
           ? await launchTaskSettleWorker(id, opts.configuration)
           : { task: plan.task, timedOut: false };
         const t = settled.task;
+        auditTask('finish', t, previous);
 
         if (opts.json) {
           console.log(JSON.stringify({ schema_version: 1, task: t }, null, 2));
@@ -1014,6 +1107,7 @@ export function registerRoomCommands(parent: Command, cOpt: (cmd: Command) => Co
           actor: { kind: 'local_control', surface: 'cli' }, name: opts.name,
           template: opts.template, goal: opts.goal, brief: opts.brief, briefFile: opts.briefFile,
         });
+        auditRoom('create', record, 'none');
 
         if (opts.json) {
           console.log(JSON.stringify({ schema_version: 1, room: record }, null, 2));
@@ -1091,7 +1185,8 @@ export function registerRoomCommands(parent: Command, cOpt: (cmd: Command) => Co
     .option('--json', 'JSON output')
     .action(async (id: string, opts: { configuration?: string; json?: boolean }) => {
       try {
-        const { room } = await taskRoomService(opts.configuration).getRoomDetail(id);
+        const { room, orchestration } = await taskRoomService(opts.configuration).getRoomDetail(id);
+        if (orchestration) auditRoom('open', orchestration, orchestration.state);
         const url = `http://localhost:4460/room/${id}`;
         if (opts.json) {
           console.log(JSON.stringify({ schema_version: 1, room_id: id, url, room_name: room.room_name }, null, 2));
@@ -1115,6 +1210,7 @@ export function registerRoomCommands(parent: Command, cOpt: (cmd: Command) => Co
       try {
         const { orchestration: r, members } =
           await taskRoomService(opts.configuration).getRoomMembers(id);
+        if (r) auditRoom('members', r, r.state);
         if (opts.json) {
           console.log(JSON.stringify({
             schema_version: 1,
@@ -1147,10 +1243,13 @@ export function registerRoomCommands(parent: Command, cOpt: (cmd: Command) => Co
   ): Promise<void> => {
       try {
         if (id !== confirmId) throw taskRoomPublicError('room_confirmation_mismatch');
+        const previous = getRoomRecord(id);
         await taskRoomService(opts.configuration).requestRoomDeletion({
           actor: { kind: 'local_control', surface: 'cli' }, roomId: id,
         });
         const settled = await launchRoomDeleteWorker(id, opts.configuration);
+        if (previous) auditRoom('delete', previous, previous.state,
+          settled.deleted ? 'deleted' : 'closing');
         if (opts.json) {
           console.log(JSON.stringify({ schema_version: 1, room_id: id, deleted: settled.deleted }, null, 2));
           return;
@@ -1185,11 +1284,14 @@ export function registerRoomCommands(parent: Command, cOpt: (cmd: Command) => Co
     .option('--json', 'JSON output')
     .action(async (id: string, opts: { configuration?: string; json?: boolean }) => {
       try {
+        const previous = getRoomRecord(id);
         const recovered = await taskRoomService(opts.configuration).recoverRoom({
           actor: { kind: 'local_control', surface: 'cli' }, roomId: id,
         });
         if (recovered.kind === 'deletion_worker_required') {
           const settled = await launchRoomDeleteWorker(id, opts.configuration);
+          if (previous) auditRoom('recover', previous, previous.state,
+            settled.deleted ? 'deleted' : 'closing');
           if (opts.json) {
             console.log(JSON.stringify({
               schema_version: 1, room: null, orchestration: null,
@@ -1210,6 +1312,7 @@ export function registerRoomCommands(parent: Command, cOpt: (cmd: Command) => Co
           return;
         }
         const { room: cowork, orchestration: r, issues: actions } = recovered;
+        if (r) auditRoom('recover', r, previous?.state ?? 'unresolved', r.state);
         if (opts.json) {
           console.log(JSON.stringify({ schema_version: 1, room: cowork, orchestration: r ?? null, recovery_actions: actions }, null, 2));
           return;

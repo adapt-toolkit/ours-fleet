@@ -31,10 +31,17 @@ afterEach(async () => {
   rmSync(homeDir, { recursive: true, force: true });
 });
 
+const cleanEnv = (extraEnv: Record<string, string> = {}): NodeJS.ProcessEnv => {
+  const env = { ...process.env, OURS_FLEET_HOME: homeDir, ...extraEnv };
+  delete env.OURS_FLEET_PROXY_STATE_DIR;
+  delete env.OURS_FLEET_PROXY_CALLER;
+  return { ...env, ...extraEnv };
+};
+
 const run = (args: string[], extraEnv: Record<string, string> = {}) =>
   new Promise<{ code: number; stdout: string; stderr: string }>(resolveRun => {
   execFile(process.execPath, [CLI, ...args], {
-    env: { ...process.env, OURS_FLEET_HOME: homeDir, ...extraEnv },
+    env: cleanEnv(extraEnv),
   },
     (error, stdout, stderr) => resolveRun({
       code: typeof (error as NodeJS.ErrnoException | null)?.code === 'number'
@@ -46,7 +53,7 @@ const run = (args: string[], extraEnv: Record<string, string> = {}) =>
 const runStdin = (args: string[], stdin: string) =>
   new Promise<{ code: number; stdout: string; stderr: string }>(resolveRun => {
     const child = spawn(process.execPath, [CLI, ...args], {
-      env: { ...process.env, OURS_FLEET_HOME: homeDir }, stdio: ['pipe', 'pipe', 'pipe'],
+      env: cleanEnv(), stdio: ['pipe', 'pipe', 'pipe'],
     });
     let stdout = '';
     let stderr = '';
@@ -227,8 +234,23 @@ describe('owner-channel CLI', () => {
       model: 'gpt-proxy', monitor: { mode: 'fleet' as const, interrupt: true },
       permissionMode: { fleetMode: 'allow' as const, nativeMode: 'bypassPermissions' },
       inherited: ['brain', 'role', 'monitorConfig'], creationActionId: 'proxy-action',
+      brainSummary: 'inline:sha256:abc (explicit)', roleSummary: 'inline:sha256:def (explicit)',
     }));
     control!.setFleetSpawner(spawn);
+    const audit = {
+      version: 1 as const, correlationId: '123e4567-e89b-42d3-a456-426614174000',
+      requestId: '123e4567-e89b-42d3-a456-426614174001',
+      caller: 'PhoneRole', invokedAt: '2026-01-01T00:00:00.000Z',
+      classification: { command: 'spawn ProxyWorker', route: 'supervisor-proxy/spawn', decision: 'allow' as const },
+      argv: ['spawn', 'ProxyWorker', '--temp'], invocation: 'delivered' as const,
+    };
+    const finishAudit = vi.fn(async (input: Parameters<NonNullable<Parameters<typeof control.setFleetAuditor>[0]>['finish']>[0]) =>
+      ({ ...audit, outcome: { completedAt: '2026-01-01T00:00:01.000Z',
+        class: input.class, exitCode: input.exitCode, effect: input.effect, delivery: 'delivered' as const } }));
+    control!.setFleetAuditor({
+      begin: async () => audit,
+      finish: finishAudit,
+    });
 
     const result = await run([
       'spawn', 'ProxyWorker', '--temp', '--brain', 'inline:{"harness":"claude-code"}',
@@ -244,6 +266,56 @@ describe('owner-channel CLI', () => {
     expect(spawn).toHaveBeenCalledWith(expect.objectContaining({
       name: 'ProxyWorker', temp: true,
       brain: { inline: { harness: 'claude-code' } }, role: { inline: {} },
+    }));
+    expect(finishAudit).toHaveBeenCalledWith(expect.objectContaining({ presentation: expect.objectContaining({
+      kind: 'agent_started', name: 'ProxyWorker',
+      brain: 'inline:sha256:abc (explicit)', role: 'inline:sha256:def (explicit)',
+      parent: 'PhoneRole', permissions: 'allow/bypassPermissions',
+    }) }));
+  }, CLI_INTEGRATION_TIMEOUT_MS);
+
+  it('forwards real Task metadata and JSON failure classification in audit finish payloads', async () => {
+    config();
+    await startControl(async () => { throw new Error('not used'); });
+    const stateDir = join(homeDir, '.ours-fleet', 'agents', 'PhoneRole');
+    const finishAudit = vi.fn(async (input: Parameters<NonNullable<Parameters<typeof control.setFleetAuditor>[0]>['finish']>[0]) => ({
+      version: 1 as const, correlationId: input.correlationId, requestId: '123e4567-e89b-42d3-a456-426614174001',
+      caller: 'PhoneRole', invokedAt: '2026-01-01T00:00:00.000Z',
+      classification: { command: 'task', route: 'supervisor-proxy/task', decision: 'allow' as const },
+      argv: [], invocation: 'delivered' as const,
+      outcome: { completedAt: '2026-01-01T00:00:01.000Z', class: input.class,
+        exitCode: input.exitCode, effect: input.effect, delivery: 'delivered' as const,
+        ...(input.presentation ? { presentation: input.presentation } : {}) },
+    }));
+    control!.setFleetAuditor({
+      begin: async input => ({ version: 1, correlationId: '123e4567-e89b-42d3-a456-426614174000',
+        requestId: input.requestId, caller: 'PhoneRole', invokedAt: '2026-01-01T00:00:00.000Z',
+        classification: { command: 'task create', route: 'supervisor-proxy/task', decision: 'allow' },
+        argv: input.argv, invocation: 'delivered' }),
+      finish: finishAudit,
+    });
+    const env = { OURS_FLEET_PROXY_STATE_DIR: stateDir, OURS_FLEET_PROXY_CALLER: 'PhoneRole' };
+
+    const created = await run(['task', 'create', '--title', 'Proxy metadata', '--backlog', '--no-room', '--json'], env);
+    expect(created.code).toBe(0);
+    const taskId = JSON.parse(created.stdout).task.task_id as string;
+    expect(finishAudit).toHaveBeenLastCalledWith(expect.objectContaining({ class: 'success',
+      effect: 'completed', resourceIds: { task: taskId }, presentation: expect.objectContaining({
+        kind: 'task', operation: 'create', id: taskId, title: 'Proxy metadata',
+        previousState: 'none', newState: 'backlog', agents: [],
+      }) }));
+
+    const missing = await run(['task', 'show', 'definitely-missing', '--json'], env);
+    expect(missing.code).toBe(1);
+    expect(finishAudit).toHaveBeenLastCalledWith(expect.objectContaining({
+      class: 'validation', effect: 'not_started', exitCode: 1,
+    }));
+
+    writeFileSync(join(homeDir, '.ours-fleet', 'tasks', `${taskId}.json`), '{corrupt');
+    const broken = await run(['task', 'show', taskId, '--json'], env);
+    expect(broken.code).toBe(1);
+    expect(finishAudit).toHaveBeenLastCalledWith(expect.objectContaining({
+      class: 'runtime', effect: 'unknown', exitCode: 1,
     }));
   }, CLI_INTEGRATION_TIMEOUT_MS);
 

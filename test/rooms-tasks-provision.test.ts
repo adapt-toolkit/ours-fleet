@@ -183,6 +183,7 @@ beforeEach(() => {
     }));
     writeFileSync(join(dir, 'creation.json'), JSON.stringify({
       creationActionId: opts.creationActionId, role: opts.name,
+      brainSummary: 'ref:B (explicit)', roleSummary: 'ref:R (explicit)',
       surface: opts.surface, callerRole: opts.callerRole,
     }));
     writeFileSync(join(dir, '.temp-supervisor.json'), JSON.stringify({
