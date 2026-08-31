@@ -17,6 +17,7 @@ import { TaskRoomApplicationError } from '../application/task-room-service.js';
 import type { CreateRoomRequest, CreateTaskRequest, TaskRoomApplicationService } from '../application/task-room-service.js';
 import type { TaskState } from '../rooms-tasks/types.js';
 import { TaskListError } from '../rooms-tasks/task-lists.js';
+import { createTasksReport } from '../reports/index.js';
 
 /**
  * Fleet-level effects a deterministic owner command may trigger. Production
@@ -41,6 +42,7 @@ export interface OwnerFleetOps {
  * cannot name another agent or another recipient.
  */
 export interface OwnerCommandContext {
+  authenticatedCid?: string;
   role: string;
   /** Harness id of the role (e.g. 'claude-code', 'codex'); gates forwarding. */
   harness: string;
@@ -92,6 +94,17 @@ export interface OwnerCommandContext {
   recentEvents(limit: number): SessionEvent[];
   readWorklogTail(maxChars: number): Promise<string | undefined>;
   reply(text: string): Promise<void>;
+  replyHtml(filename: string, html: string): Promise<void>;
+}
+
+async function ownerTaskReport(ctx: OwnerCommandContext) {
+  return createTasksReport({
+    viewer: { surface: 'messenger', authenticatedCid: ctx.authenticatedCid ?? 'owner-command-context', roomCids: [] },
+    collect: () => {
+      return { lists: ctx.listTaskLists(), tasks: ctx.listTasks() };
+    },
+    source: { name: 'ours-fleet', version: ctx.version },
+  });
 }
 
 export interface OwnerCommand {
@@ -362,10 +375,17 @@ export const ownerCommands: OwnerCommand[] = [
     execute: noArgs('/version', async ctx => ctx.reply(`ℹ️ ours-fleet ${ctx.version}`)),
   },
   {
-    name: 'tasks', usage: '/tasks [state]',
-    summary: 'list tasks (optionally filter by state)',
+    name: 'tasks', usage: '/tasks [state|html]',
+    summary: 'list tasks, or attach the HTML report with /tasks html',
     execute: async (ctx, args) => {
       const stateFilter = args?.trim() || undefined;
+      if (stateFilter === 'html') {
+        const artifact = await ownerTaskReport(ctx);
+        await ctx.replyHtml(artifact.metadata.filename, artifact.html);
+        await ctx.reply(`HTML report attached: ${artifact.metadata.filename}`);
+        return;
+      }
+      if (stateFilter && /\s/u.test(stateFilter)) throw new OwnerCommandUsageError('usage: /tasks [state|html]');
       const tasks = ctx.listTasks(stateFilter && stateFilter !== 'all' ? { state: stateFilter as any } : undefined);
       await ctx.reply(renderMarkdownList({
         icon: '📋', title: 'Tasks', empty: 'No tasks found.',
@@ -428,6 +448,9 @@ export const ownerCommands: OwnerCommand[] = [
             break;
           }
           case 'list': {
+            if (rest.some(value => value.startsWith('--')
+              && value !== '--group-by-list' && !value.startsWith('--list=')))
+              throw new OwnerCommandUsageError('usage: /task list [state] [--list=<name>] [--group-by-list]');
             const listFlag = rest.find(r => r.startsWith('--list='));
             const list = trailingLines ?? listFlag?.slice('--list='.length);
             const grouped = rest.includes('--group-by-list');
@@ -464,6 +487,7 @@ export const ownerCommands: OwnerCommand[] = [
             break;
           }
           case 'lists': {
+            if (rest.length || trailingLines) throw new OwnerCommandUsageError('usage: /task lists');
             const lists = ctx.listTaskLists();
             await ctx.reply(renderMarkdownList({ icon: '📚', title: 'Task lists', empty: 'No task lists found.',
               records: lists.map(list => `${markdownCode(list.name)}${list.built_in ? ' — built-in' : ''}`) }));
@@ -503,7 +527,8 @@ export const ownerCommands: OwnerCommand[] = [
             break;
           }
           case 'show': {
-            if (!rest[0]) throw new OwnerCommandUsageError('usage: /task show <id>');
+            if (rest.length !== 1 || rest[0].startsWith('--'))
+              throw new OwnerCommandUsageError('usage: /task show <id>');
             await showTask(rest[0]);
             break;
           }

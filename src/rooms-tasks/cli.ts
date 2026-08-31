@@ -341,6 +341,7 @@ function auditRoom(operation: string, room: RoomOrchestrationRecord, previousSta
       permissions: safePermissionsSummary(member.launch?.agent_definition) })) });
 }
 
+
 const roomActionMarkdown = (
   title: string, room: RoomOrchestrationRecord,
   fields: Parameters<typeof renderMarkdownResult>[0]['fields'] = [],
@@ -705,7 +706,7 @@ export function registerTaskCommands(parent: Command, cOpt: (cmd: Command) => Co
     .option('--list <name>', 'filter by task list')
     .option('--group-by-list', 'group deterministic results by list (JSON)')
     .option('--json', 'JSON output')
-    .action((opts: { configuration?: string; state?: string; list?: string; groupByList?: boolean; json?: boolean }) => {
+    .action(async (opts: { configuration?: string; state?: string; list?: string; groupByList?: boolean; json?: boolean }) => {
       try {
         let stateFilter: import('./types.js').TaskState | undefined;
         if (opts.state && opts.state !== 'all') {
@@ -727,9 +728,10 @@ export function registerTaskCommands(parent: Command, cOpt: (cmd: Command) => Co
   taskCmd.command('lists')
     .description('list named task lists')
     .option('--json', 'JSON output')
-    .action((opts: { json?: boolean }) => {
+    .action(async (opts: { configuration?: string; json?: boolean }) => {
       try {
-        const lists = taskRoomService().listTaskLists();
+        const service = taskRoomService(opts.configuration);
+        const lists = service.listTaskLists();
         if (opts.json) { console.log(JSON.stringify({ schema_version: 1, lists }, null, 2)); return; }
         console.log(renderMarkdownList({ icon: '📚', title: 'Task lists', empty: 'No task lists found.',
           records: lists.map(list => `${markdownCode(list.name)}${list.built_in ? ' — built-in' : ''}`) }));
@@ -785,9 +787,10 @@ export function registerTaskCommands(parent: Command, cOpt: (cmd: Command) => Co
   taskCmd.command('show <id>')
     .description('show task details')
     .option('--json', 'JSON output')
-    .action((id: string, opts: { json?: boolean }) => {
+    .action(async (id: string, opts: { json?: boolean }) => {
       try {
-        const { task: t, orchestration: room } = taskRoomService().getTask(id);
+        const service = taskRoomService();
+        const { task: t, orchestration: room } = service.getTask(id);
         if (opts.json) {
           console.log(JSON.stringify({
             schema_version: 1, task: t, orchestration: room ?? null,

@@ -1,5 +1,5 @@
 import {
-  existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync,
+  existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync,
 } from 'node:fs';
 import { createHash } from 'node:crypto';
 import { tmpdir } from 'node:os';
@@ -39,6 +39,7 @@ export const EMPTY_CONTACTS: OursContactsView = {
 
 class FakeClient implements OursOps {
   calls: Array<{ name: string; args?: Record<string, unknown> }> = [];
+  sentFileModes: Array<{ file: number; directory: number }> = [];
   /**
    * Daemon message batches. Partial envelopes are allowed on purpose: these
    * tests exercise the fields the channel reads, not the daemon's full row.
@@ -103,6 +104,7 @@ class FakeClient implements OursOps {
     this.record('sendMessage', { ...a });
   }
   async sendFile(a: { contact: string; path: string; filename: string; replyToWireId?: string }) {
+    this.sentFileModes.push({ file: statSync(a.path).mode & 0o777, directory: statSync(join(a.path, '..')).mode & 0o777 });
     this.record('sendFile', { ...a });
   }
   private record(name: string, args?: Record<string, unknown>): void {
@@ -995,6 +997,25 @@ describe('OwnerChannel deterministic command dispatch', () => {
     closeRoom: vi.fn(async () => undefined),
     settleTask: vi.fn(async () => undefined),
     recoverTask: vi.fn(async () => undefined),
+  });
+
+  it('sends HTML reports only to the authenticated owner and removes the private temp tree on success and failure', async () => {
+    for (const fail of [false, true]) {
+      const wire = fail ? 'wire-html-fail' : 'wire-html-ok';
+      const { channel, client, dir } = setup([ownerMessage(580 + Number(fail), wire, '/tasks html')]);
+      const previous = process.env.OURS_FLEET_HOME;
+      process.env.OURS_FLEET_HOME = dir;
+      if (fail) client.failTools.add('sendFile');
+      try { await channel.drain(); } finally {
+        if (previous === undefined) delete process.env.OURS_FLEET_HOME; else process.env.OURS_FLEET_HOME = previous;
+      }
+      const requestDir = join(dir, '.owner-channel-report-outbox', createHash('sha256').update(wire).digest('hex'));
+      expect(client.calls.find(call => call.name === 'sendFile')?.args).toMatchObject({
+        contact: OWNER_CID, filename: 'fleet-tasks.html', replyToWireId: wire,
+      });
+      expect(client.sentFileModes).toEqual([{ file: 0o600, directory: 0o700 }]);
+      expect(existsSync(requestDir)).toBe(false);
+    }
   });
 
   it('returns help for an unknown slash command instead of forwarding it', async () => {
