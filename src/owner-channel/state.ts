@@ -5,7 +5,9 @@ import { replaceFileAtomically } from '../atomic-file.js';
 import { canonicalCid } from '../config.js';
 
 /** A send whose (dedupe-scoped) digest was already recorded: it must not repeat. */
-export class DuplicateSendError extends Error {}
+export class DuplicateSendError extends Error {
+  constructor(readonly status: OwnerProactiveSend['status']) { super('duplicate proactive owner message refused'); }
+}
 
 interface ChannelState { version: 1; handled: string[] }
 
@@ -220,8 +222,8 @@ export class OwnerConversationState {
     // 'all' scope serves wire-keyed idempotency: a crash replay must not
     // deliver the same wire to a second owner after the route moved.
     const scope = dedupe === 'all' ? this.sends : recent;
-    if (scope.some(send => send.digest === digest))
-      throw new DuplicateSendError('duplicate proactive owner message refused');
+    const duplicate = scope.find(send => send.digest === digest);
+    if (duplicate) throw new DuplicateSendError(duplicate.status);
     const last = recent.at(-1);
     if (last && now - last.at < minIntervalMs)
       throw new Error(`proactive owner messages are rate-limited to one every ${minIntervalMs}ms`);

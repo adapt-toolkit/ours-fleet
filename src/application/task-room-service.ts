@@ -1,4 +1,5 @@
 import { readFileSync } from 'node:fs';
+import { createHash } from 'node:crypto';
 
 import { ConfigError, loadConfig, type FleetConfig } from '../config.js';
 import {
@@ -23,6 +24,7 @@ import {
 import { hashTemplate, listTemplates, resolveTemplate, sealTemplateSnapshot, snapshotTemplate } from '../rooms-tasks/templates.js';
 import { acquireLaunchSnapshotLock, releaseLaunchSnapshot } from '../rooms-tasks/launch-snapshot.js';
 import { hashMemberOverrides, prepareExecutionPlan, type MemberOverrides } from '../rooms-tasks/member-overrides.js';
+import { recordFleetAuditPresentation } from '../fleet-command-audit.js';
 import {
   acceptManagedRoomClose, deleteLegacyClosedRooms, deleteManagedRoom, recordManagedRoomCloseError,
 } from '../rooms-tasks/close.js';
@@ -98,6 +100,54 @@ export interface TaskRoomServiceDeps {
   moveTaskToList?: typeof moveTaskToList;
 }
 
+function launchSelection(definition: Record<string, unknown> | undefined, key: 'brain' | 'role'): string | undefined {
+  const selected = definition?.[key];
+  if (!selected || typeof selected !== 'object' || Array.isArray(selected)) return undefined;
+  const value = selected as Record<string, unknown>;
+  if (value.kind === 'ref' && typeof value.id === 'string') return `ref:${value.id} (reference)`;
+  if (value.kind === 'inline' && typeof value.fingerprint === 'string')
+    return `inline:${value.fingerprint} (inline)`;
+  return undefined;
+}
+
+function launchPermissions(definition: Record<string, unknown> | undefined): string | undefined {
+  const selected = definition?.permissions;
+  if (!selected || typeof selected !== 'object' || Array.isArray(selected)) return undefined;
+  const value = selected as Record<string, unknown>;
+  const fields = ['approval', 'filesystem', 'unattended'].flatMap(key =>
+    typeof value[key] === 'string' ? [`${key}=${value[key]}`] : []);
+  return fields.length ? fields.join(',') : undefined;
+}
+
+function roomParticipants(room: RoomOrchestrationRecord): Array<{
+  name: string; id?: string; brain?: string; role: string; permissions?: string;
+}> {
+  return [...room.member_seats].sort((a, b) => a.role_name.localeCompare(b.role_name)).map(seat => ({
+    name: seat.role_name, id: seat.identity_cid,
+    brain: launchSelection(seat.launch?.agent_definition, 'brain'),
+    role: launchSelection(seat.launch?.agent_definition, 'role') ?? seat.cowork_role,
+    permissions: launchPermissions(seat.launch?.agent_definition),
+  }));
+}
+
+function taskAgents(task: TaskRecord): Array<{
+  name: string; brain?: string; role: string; permissions?: string;
+}> {
+  const room = task.room_id ? getRoomRecord(task.room_id) : undefined;
+  const seats = new Map(room?.member_seats.map(seat => [seat.role_name, seat]) ?? []);
+  return [...task.member_roles].sort((a, b) => a.name.localeCompare(b.name)).map(member => {
+    const seat = seats.get(member.name);
+    return { name: member.name, brain: launchSelection(seat?.launch?.agent_definition, 'brain'),
+      role: launchSelection(seat?.launch?.agent_definition, 'role') ?? member.cowork_role,
+      permissions: launchPermissions(seat?.launch?.agent_definition) };
+  });
+}
+
+function roomFailureEventId(room: RoomOrchestrationRecord): string {
+  const evidence = `${room.created_at}\0${room.saga.phase}\0${room.saga.step_index}\0${room.saga.error ?? ''}`;
+  return `sha256:${createHash('sha256').update(evidence).digest('hex')}`;
+}
+
 /** Exact extraction of the previously CLI-owned task create/start behavior. */
 export class TaskRoomApplicationService {
   private recovery?: { taskId: string; config: FleetConfig };
@@ -146,15 +196,31 @@ export class TaskRoomApplicationService {
     }
     unlock?.();
     const ref = template && { name: template.name, version: template.version, content_hash: template.content_hash };
+    recordFleetAuditPresentation({ kind: 'task', operation: 'create', id: task.task_id,
+      title: task.title, previousState: 'none', newState: task.state, revision: task.created_at,
+      list: task.list_name ?? 'default', roomId: task.room_id,
+      template: task.template ? `${task.template.name}@${task.template.version}` : undefined,
+      agents: [] });
     if (!request.backlog && !request.noRoom && ref && !task.room_id) {
       try {
-        await this.provisionRoom(cfg, task, template!, room => {
-          task = updateTaskRoom(task.task_id, room.room_id, room.room_identity_cid!);
+        const room = await this.provisionRoom(cfg, task, template!, created => {
+          task = updateTaskRoom(task.task_id, created.room_id, created.room_identity_cid!);
         }, launchDefinitions);
         task = readTask(task.task_id);
+        if (task.state === 'active' && room.state === 'active') recordFleetAuditPresentation({ kind: 'task', operation: 'work', id: task.task_id,
+          title: task.title, previousState: 'provisioning', newState: task.state,
+          revision: getRoomRecord(task.room_id!)?.activated_at ?? task.started_at ?? task.created_at,
+          list: task.list_name ?? 'default', roomId: task.room_id,
+          template: task.template ? `${task.template.name}@${task.template.version}` : undefined,
+          agents: taskAgents(task) });
+        else recordFleetAuditPresentation({ kind: 'lifecycle_failure', resource: 'Task', id: task.task_id,
+          state: task.state, category: 'provision_pending', eventId: roomFailureEventId(room) });
       } catch (error) {
         if (error instanceof CoworkUnavailableError)
           persistBlockTask(task.task_id, 'Cowork management socket is unavailable');
+        recordFleetAuditPresentation({ kind: 'lifecycle_failure', resource: 'Task',
+          id: task.task_id, state: readTask(task.task_id).state, category: 'provision_failed',
+          eventId: task.room_id ? roomFailureEventId(getRoomRecord(task.room_id)!) : task.created_at });
         throw error;
       }
     }
@@ -638,7 +704,13 @@ export class TaskRoomApplicationService {
       unlock();
     } else if (!task.template || task.template.name !== snapshot.name || task.template.content_hash !== snapshot.content_hash)
       task = updateTaskTemplate(task.task_id, { name: snapshot.name, version: snapshot.version, content_hash: snapshot.content_hash });
-    if (task.state === 'backlog') task = transitionTask(task.task_id);
+    if (task.state === 'backlog') {
+      task = transitionTask(task.task_id);
+      recordFleetAuditPresentation({ kind: 'task', operation: 'start', id: task.task_id,
+        title: task.title, previousState: 'backlog', newState: task.state,
+        revision: task.started_at ?? task.created_at, list: task.list_name ?? 'default',
+        template: `${snapshot.name}@${snapshot.version}`, agents: [] });
+    }
     if (!task.room_id) {
       try {
         await this.provisionRoom(cfg, task, snapshot, created => {
@@ -648,6 +720,9 @@ export class TaskRoomApplicationService {
       } catch (error) {
         if (error instanceof CoworkUnavailableError)
           persistBlockTask(task.task_id, 'Cowork management socket is unavailable');
+        recordFleetAuditPresentation({ kind: 'lifecycle_failure', resource: 'Task',
+          id: task.task_id, state: readTask(task.task_id).state, category: 'provision_failed',
+          eventId: task.room_id ? roomFailureEventId(getRoomRecord(task.room_id)!) : task.created_at });
         throw error;
       }
     } else if (task.state === 'provisioning') {
@@ -663,9 +738,21 @@ export class TaskRoomApplicationService {
         task = readTask(task.task_id);
       } catch (error) {
         if (error instanceof CoworkUnavailableError) persistBlockTask(task.task_id, 'Cowork management socket is unavailable');
+        recordFleetAuditPresentation({ kind: 'lifecycle_failure', resource: 'Task',
+          id: task.task_id, state: readTask(task.task_id).state, category: 'provision_failed',
+          eventId: roomFailureEventId(getRoomRecord(task.room_id!)!) });
         throw error;
       }
     }
+    const resultingRoom = getRoomRecord(task.room_id!);
+    if (task.state === 'active' && resultingRoom?.state === 'active') recordFleetAuditPresentation({ kind: 'task', operation: 'work', id: task.task_id,
+      title: task.title, previousState: 'provisioning', newState: task.state,
+      revision: getRoomRecord(task.room_id!)?.activated_at ?? task.started_at ?? task.created_at,
+      list: task.list_name ?? 'default', roomId: task.room_id,
+      template: task.template ? `${task.template.name}@${task.template.version}` : undefined,
+      agents: taskAgents(task) });
+    else if (resultingRoom) recordFleetAuditPresentation({ kind: 'lifecycle_failure', resource: 'Task',
+      id: task.task_id, state: task.state, category: 'provision_pending', eventId: roomFailureEventId(resultingRoom) });
     return { task, status: 'ready' };
   }
 
@@ -736,6 +823,11 @@ export class TaskRoomApplicationService {
       throw error;
     }
     unlockSnapshot?.();
+    recordFleetAuditPresentation({ kind: 'room', operation: 'create', id: room.room_id,
+      name: room.room_name, previousState: 'none', newState: 'provisioning',
+      revision: room.created_at, taskId: room.task_id,
+      template: room.template_snapshot ? `${room.template_snapshot.name}@${room.template_snapshot.version}` : undefined,
+      participants: [] });
     onCreated(room);
     room = advanceSaga(room.room_id, 'create_room', 1);
     if (attachOwner) {
@@ -751,17 +843,34 @@ export class TaskRoomApplicationService {
           mismatch ? 'Verify rooms.owner.expected_cid and rotate the configured invite if necessary.'
             : 'Rotate rooms.owner.public_invite or public_invite_file, then run room recover.',
           mismatch ? 'owner_cid_mismatch' : 'waiting_owner_invite');
+        recordFleetAuditPresentation({ kind: 'lifecycle_failure', resource: 'Room',
+          id: room.room_id, state: getRoomRecord(room.room_id)?.state ?? 'provisioning',
+          category: 'provision_failed', eventId: roomFailureEventId(getRoomRecord(room.room_id) ?? room) });
         throw error;
       }
     }
     room = advanceSaga(room.room_id, 'create_members', 3);
-    if (launchTemplate?.members.length) return (this.deps.provisionMembers ?? provisionMembers)({
-      cfg, cowork, roomId: room.room_id, taskId: task.task_id, template: launchTemplate,
-      binPath: (this.deps.binPath ?? getBinPath)(), brief: task.brief,
-      goal: task.task_id ? task.title : task.goal,
-    });
-    room = activateRoom(room.room_id);
-    if (task.task_id) activateTask(task.task_id);
+    if (launchTemplate?.members.length) try {
+      room = await (this.deps.provisionMembers ?? provisionMembers)({
+        cfg, cowork, roomId: room.room_id, taskId: task.task_id, template: launchTemplate,
+        binPath: (this.deps.binPath ?? getBinPath)(), brief: task.brief,
+        goal: task.task_id ? task.title : task.goal,
+      });
+    } catch (error) {
+      const failed = getRoomRecord(room.room_id) ?? room;
+      recordFleetAuditPresentation({ kind: 'lifecycle_failure', resource: 'Room', id: failed.room_id,
+        state: failed.state, category: 'provision_failed', eventId: roomFailureEventId(failed) });
+      throw error;
+    }
+    else room = activateRoom(room.room_id);
+    if (room.state === 'active') recordFleetAuditPresentation({ kind: 'room', operation: 'activate', id: room.room_id,
+      name: room.room_name, previousState: 'provisioning', newState: 'active',
+      revision: room.activated_at ?? room.created_at, taskId: room.task_id,
+      template: room.template_snapshot ? `${room.template_snapshot.name}@${room.template_snapshot.version}` : undefined,
+      participants: roomParticipants(room) });
+    else recordFleetAuditPresentation({ kind: 'lifecycle_failure', resource: 'Room', id: room.room_id,
+      state: room.state, category: 'provision_pending', eventId: roomFailureEventId(room) });
+    if (task.task_id && !launchTemplate?.members.length) activateTask(task.task_id);
     return room;
   }
 }

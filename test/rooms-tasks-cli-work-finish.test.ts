@@ -92,7 +92,8 @@ import { CoworkUnavailableError } from '../src/rooms-tasks/cowork-adapter.js';
 import { TaskRoomApplicationService } from '../src/application/task-room-service.js';
 import { acceptTaskTerminalIntent } from '../src/rooms-tasks/terminal.js';
 import { writeV2Fixture } from './v2-fixture.js';
-import { beginFleetAuditCollection, consumeFleetAuditCollection } from '../src/fleet-command-audit.js';
+import { beginFleetAuditCollection, consumeFleetAuditCollection,
+  recordFleetAuditPresentation } from '../src/fleet-command-audit.js';
 
 const ROOM_ID = '01hzyk8m0000000000000000aa';
 
@@ -233,8 +234,13 @@ beforeEach(() => {
       updateMemberSeats(roomId, [{ role_name: member.name, identity_cid: member.identity_cid,
         slot: member.slot, cowork_role: member.cowork_role, seat_state: 'active', launch: {
           state: 'launched', attempt: 1, action_id: 'action-1', updated_at: '2026-08-30T00:00:00.000Z',
-          agent_definition: { brain: { ref: 'codex' }, role: { ref: 'Developer' } },
+          agent_definition: { brain: { kind: 'ref', id: 'codex' }, role: { kind: 'ref', id: 'Developer' },
+            permissions: { approval: 'allow', filesystem: 'full', unattended: 'allow' } },
         } }]);
+      recordFleetAuditPresentation({ kind: 'agent_started', id: member.name, name: member.name,
+        lifetime: 'temporary', brain: 'ref:codex (reference)', role: 'ref:Developer (reference)',
+        harness: 'codex', session: 'acp', permissions: 'approval=allow,filesystem=full,unattended=allow',
+        parent: roomId, actionId: 'action-1', inherited: [] });
       if (taskId) updateTaskMembers(taskId, [member]);
     }
     const record = activateRoom(roomId);
@@ -346,18 +352,24 @@ describe('canonical proxied Task/Room audit metadata', () => {
     await run('create', '--title', 'Audited task', '--backlog', '--template', 'durable',
       ...(json ? ['--json'] : []));
     const created = consumeFleetAuditCollection();
-    expect(created.presentation).toMatchObject({ kind: 'task', operation: 'create',
+    expect(created.presentations?.[0]).toMatchObject({ kind: 'task', operation: 'create',
       title: 'Audited task', previousState: 'none', newState: 'backlog', agents: [] });
-    const id = (created.presentation as { id: string }).id;
+    const id = (created.presentations?.[0] as { id: string }).id;
 
     out = [];
     beginFleetAuditCollection();
     await run('start', id, ...(json ? ['--json'] : []));
     expect(consumeFleetAuditCollection()).toMatchObject({
       resourceIds: { task: id, room: ROOM_ID },
-      presentation: { kind: 'task', operation: 'start', id, title: 'Audited task',
-        previousState: 'backlog', newState: 'active', template: 'durable@7', roomId: ROOM_ID,
-        agents: [{ name: expect.any(String), brain: expect.any(String), role: expect.any(String) }] },
+      presentations: [
+        { kind: 'task', operation: 'start', id, previousState: 'backlog', newState: 'provisioning' },
+        { kind: 'room', operation: 'create', id: ROOM_ID, previousState: 'none', newState: 'provisioning' },
+        { kind: 'agent_started', id: 'dev-1', actionId: 'action-1' },
+        { kind: 'room', operation: 'activate', id: ROOM_ID, previousState: 'provisioning', newState: 'active' },
+        { kind: 'task', operation: 'work', id, title: 'Audited task',
+          previousState: 'provisioning', newState: 'active', template: 'durable@7', roomId: ROOM_ID,
+          agents: [{ name: expect.any(String), role: expect.any(String) }] },
+      ],
     });
   });
 
@@ -365,14 +377,14 @@ describe('canonical proxied Task/Room audit metadata', () => {
     const cancellable = backlogTask();
     beginFleetAuditCollection();
     await runLocalTask('cancel', cancellable.task_id, cancellable.task_id, ...(json ? ['--json'] : []));
-    expect(consumeFleetAuditCollection().presentation).toMatchObject({ kind: 'task',
+    expect(consumeFleetAuditCollection().presentations?.[0]).toMatchObject({ kind: 'task',
       operation: 'cancel', id: cancellable.task_id, previousState: 'backlog', newState: 'cancelled' });
 
     const done = backlogTask();
     startTask(done.task_id); activateTask(done.task_id); reviewTask(done.task_id); completeTask(done.task_id);
     beginFleetAuditCollection();
     await runLocalTask('delete', done.task_id, done.task_id, ...(json ? ['--json'] : []));
-    expect(consumeFleetAuditCollection().presentation).toMatchObject({ kind: 'task',
+    expect(consumeFleetAuditCollection().presentations?.[0]).toMatchObject({ kind: 'task',
       operation: 'delete', id: done.task_id, previousState: 'done', newState: 'deleted' });
   });
 
@@ -382,24 +394,31 @@ describe('canonical proxied Task/Room audit metadata', () => {
     await runRoom('create', '--name', 'Audited room', '--template', 'durable', ...(json ? ['--json'] : []));
     expect(consumeFleetAuditCollection()).toMatchObject({
       resourceIds: { room: ROOM_ID },
-      presentation: { kind: 'room', operation: 'create', id: ROOM_ID,
-        previousState: 'none', newState: 'active', template: 'durable@7',
-        participants: [{ name: expect.any(String), role: expect.any(String) }] },
+      presentations: [
+        { kind: 'room', operation: 'create', id: ROOM_ID,
+          previousState: 'none', newState: 'provisioning', template: 'durable@7', participants: [] },
+        { kind: 'agent_started', id: 'dev-1', actionId: 'action-1' },
+        { kind: 'room', operation: 'activate', id: ROOM_ID,
+          previousState: 'provisioning', newState: 'active', template: 'durable@7',
+          participants: [{ name: expect.any(String), brain: 'ref:codex (reference)',
+            role: 'ref:Developer (reference)',
+            permissions: 'approval=allow,filesystem=full,unattended=allow' }] },
+      ],
     });
 
     out = [];
     beginFleetAuditCollection();
     await runRoom('recover', ROOM_ID, ...(json ? ['--json'] : []));
-    expect(consumeFleetAuditCollection().presentation).toMatchObject({ kind: 'room',
-      operation: 'recover', id: ROOM_ID, previousState: 'active', newState: 'active',
-      template: 'durable@7', participants: [{ name: expect.any(String), role: expect.any(String) }] });
+    expect(consumeFleetAuditCollection().presentations).toBeUndefined();
 
     out = [];
     beginFleetAuditCollection();
     await runRoom('delete', ROOM_ID, ROOM_ID, ...(json ? ['--json'] : []));
-    expect(consumeFleetAuditCollection().presentation).toMatchObject({ kind: 'room',
-      operation: 'delete', id: ROOM_ID, previousState: 'active', newState: 'deleted',
-      template: 'durable@7', participants: [{ name: expect.any(String), role: expect.any(String) }] });
+    expect(consumeFleetAuditCollection().presentations).toMatchObject([
+      { kind: 'room', operation: 'close', id: ROOM_ID, previousState: 'active', newState: 'closing' },
+      { kind: 'room', operation: 'delete', id: ROOM_ID, previousState: 'closing', newState: 'deleted',
+        template: 'durable@7', participants: [{ name: expect.any(String), role: expect.any(String) }] },
+    ]);
   });
 
   it('classifies proxied JSON validation separately from unexpected runtime failure', async () => {

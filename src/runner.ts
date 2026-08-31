@@ -737,7 +737,17 @@ export async function runOnce(
       throw error;
     }
     control.setFleetSpawner(async requested => {
-      return executeManagedSpawn(role, configPath, requested, deps.log);
+      const event = await executeManagedSpawn(role, configPath, requested, deps.log);
+      // Room-member launches are collected with their Task/Room transaction so
+      // causal delivery is Task → Room → Agents → Room active → Task active.
+      if (!requested.roomMemberStartup && role.owner_channel && ownerChannel?.notifyFleetSpawn) {
+        try { await ownerChannel.notifyFleetSpawn(event); }
+        catch (error) {
+          deps.log(`[${name}] Agent lifecycle notice delivery failed: `
+            + `${(error as Error)?.message ?? String(error)}`);
+        }
+      }
+      return event;
     });
     resolvedMonitorDeps.delivery = {
       // A wake is only delivered when its turn TERMINATES successfully. A

@@ -33,6 +33,7 @@ import {
   readTempSupervisor, secureStoppedTempArchive, tempArchiveForCreationAction,
   tempSupervisorLiveness,
 } from '../temp-lifecycle.js';
+import { recordFleetAuditPresentation } from '../fleet-command-audit.js';
 
 export function getBinPath(): string {
   try { return realpathSync(process.argv[1]); } catch { return process.argv[1]; }
@@ -71,6 +72,17 @@ interface MemberSettings {
   persona?: string;
   template: string;
   templateHash: string;
+}
+
+function selectionSummary(selection: AgentDefinition['brain'] | AgentDefinition['role']): string {
+  if ('ref' in selection) return `ref:${selection.ref} (reference)`;
+  return `inline:sha256:${createHash('sha256').update(canonicalJson(selection.inline)).digest('hex').slice(0, 16)} (inline)`;
+}
+
+function permissionSummary(definition: AgentDefinition): string | undefined {
+  const permissions = definition.permissions;
+  if (!permissions) return undefined;
+  return `approval=${permissions.approval},filesystem=${permissions.filesystem},unattended=${permissions.unattended}`;
 }
 
 function launchDefinition(definition: AgentDefinition): {
@@ -376,6 +388,11 @@ async function launchMember(input: {
       ...(launched.callerRole ? { caller_role: launched.callerRole } : {}),
       launch_id: supervisor.launchId, updated_at: new Date().toISOString(),
     } });
+    recordFleetAuditPresentation({ kind: 'agent_started', id: member.name, name: member.name,
+      lifetime: 'temporary', brain: selectionSummary(settings.definition.brain),
+      role: selectionSummary(settings.definition.role), harness: 'resolved', session: 'acp',
+      permissions: permissionSummary(settings.definition), parent: provision.roomId,
+      actionId: launched.creationActionId, inherited: [] });
   } catch (error) {
     updateMemberStartup(provision.roomId, member.name, { launch: {
       state: 'failed', attempt, action_id: effectiveActionId, mission_sha256: taskSha,
@@ -385,6 +402,8 @@ async function launchMember(input: {
       updated_at: new Date().toISOString(),
       error: error instanceof Error ? error.message : String(error),
     } });
+    recordFleetAuditPresentation({ kind: 'lifecycle_failure', resource: 'Agent', id: member.name,
+      state: 'failed', category: 'readiness_failed', eventId: effectiveActionId });
     throw error;
   }
 }
