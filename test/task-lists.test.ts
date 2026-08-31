@@ -5,7 +5,6 @@ import { join } from 'node:path';
 import { resolve } from 'node:path';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
-import { createHash } from 'node:crypto';
 import { TaskRoomApplicationService } from '../src/application/task-room-service.js';
 import { createTask, getTask, moveTaskToList } from '../src/rooms-tasks/task-state.js';
 import { TaskListError } from '../src/rooms-tasks/task-lists.js';
@@ -152,25 +151,12 @@ describe('named task lists', () => {
     writeFileSync(storedTaskPath, JSON.stringify(seeded));
     const transportSecrets = [created.idempotency_key, 'SECRET-TRANSPORT-ROOM-CID', '/SECRET/transport/path',
       'SECRET-TRANSPORT-HASH', 'SECRET-TRANSPORT-ERROR', 'SECRET-TRANSPORT-OWNER-CID'];
-    const cliHtml = await cli(['task', 'list', '--format', 'html']);
-    expect(cliHtml.stdout).toContain('<!doctype html>');
-    expect(cliHtml.stdout).toContain('<th scope="col">Name</th><th scope="col">Brief description</th><th scope="col">Status</th>');
-    for (const secret of transportSecrets) expect(cliHtml.stdout).not.toContain(secret);
-    const cliShow = await cli(['task', 'show', created.task_id, '--format', 'html']);
-    expect(cliShow.stdout).toContain('<title>Task — From CLI</title>');
-    for (const secret of transportSecrets) expect(cliShow.stdout).not.toContain(secret);
-    await expect(cli(['task', 'show', created.task_id, '--json', '--format', 'html'])).rejects.toMatchObject({ code: 1 });
-    await expect(cli(['task', 'show', created.task_id, '--output', join(root, 'bad.html')])).rejects.toMatchObject({ code: 1 });
-    const showOutput = join(root, 'task-show.html');
-    await cli(['task', 'show', created.task_id, '--format', 'html', '--output', showOutput]);
-    await expect(cli(['task', 'show', created.task_id, '--format', 'html', '--output', showOutput])).rejects.toMatchObject({ code: 1 });
-    await cli(['task', 'show', created.task_id, '--format', 'html', '--output', showOutput, '--overwrite']);
-    const htmlOutput = join(root, 'tasks.html');
-    const delivery = JSON.parse((await cli(['task', 'lists', '--format', 'html', '--output', htmlOutput])).stdout);
-    expect(delivery.artifact.mediaType).toBe('text/html; charset=utf-8');
-    expect(readFileSync(htmlOutput, 'utf8')).toContain('From CLI');
-    await expect(cli(['task', 'lists', '--format', 'html', '--output', htmlOutput])).rejects.toMatchObject({ code: 1 });
-    await cli(['task', 'lists', '--format', 'html', '--output', htmlOutput, '--overwrite']);
+    const cliList = await cli(['task', 'list']);
+    expect(cliList.stdout).toContain('## 📋 Tasks');
+    expect(cliList.stdout).not.toContain('<!doctype html>');
+    await expect(cli(['task', 'list', '--format', 'html'])).rejects.toMatchObject({ code: 1 });
+    await expect(cli(['task', 'lists', '--output', join(root, 'tasks.html')])).rejects.toMatchObject({ code: 1 });
+    await expect(cli(['task', 'show', created.task_id, '--format', 'html'])).rejects.toMatchObject({ code: 1 });
     await expect(cli(['task', 'list-create', 'CLI Renamed', '--json'])).rejects.toMatchObject({ code: 1 });
 
     const boundary = { origin: 'http://127.0.0.1:49271', host: '127.0.0.1:49271' };
@@ -184,22 +170,8 @@ describe('named task lists', () => {
       .map(value => value.split(';')[0]).join('; ');
     const headers = { host: boundary.host, origin: boundary.origin, cookie,
       'x-csrf-token': exchange.json().csrfToken as string };
-    const report = await server.app.inject({ method: 'GET', url: '/api/v1/reports/tasks', headers: { host: boundary.host, cookie } });
-    expect(report.statusCode).toBe(200);
-    expect(report.headers['content-type']).toContain('text/html');
-    expect(report.headers['content-disposition']).toBe('attachment; filename="fleet-tasks.html"');
-    expect(report.headers['cache-control']).toBe('private, no-store');
-    expect(report.headers['x-content-type-options']).toBe('nosniff');
-    expect(report.body).toContain('From CLI');
-    for (const secret of transportSecrets) expect(report.body).not.toContain(secret);
-    expect((await server.app.inject({ method: 'GET', url: '/api/v1/reports/tasks', headers: { host: boundary.host } })).statusCode).toBe(401);
-    const focused = await server.app.inject({ method: 'GET', url: `/api/v1/reports/tasks/${created.task_id}`, headers: { host: boundary.host, cookie } });
-    expect(focused.statusCode).toBe(200);
-    const focusedName = `fleet-task-${created.task_id}-${createHash('sha256').update(created.task_id).digest('hex').slice(0, 10)}.html`;
-    expect(focused.headers['content-disposition']).toBe(`attachment; filename="${focusedName}"`);
-    for (const secret of transportSecrets) expect(focused.body).not.toContain(secret);
-    expect((await server.app.inject({ method: 'GET', url: '/api/v1/reports/tasks/missing', headers: { host: boundary.host, cookie } })).statusCode).toBe(404);
-    expect((await server.app.inject({ method: 'GET', url: `/api/v1/reports/tasks/${created.task_id}`, headers: { host: boundary.host } })).statusCode).toBe(401);
+    expect((await server.app.inject({ method: 'GET', url: '/api/v1/reports/tasks', headers: { host: boundary.host, cookie } })).statusCode).toBe(404);
+    expect((await server.app.inject({ method: 'GET', url: `/api/v1/reports/tasks/${created.task_id}`, headers: { host: boundary.host, cookie } })).statusCode).toBe(404);
     expect((await server.app.inject({ method: 'POST', url: '/api/v1/task-lists', headers,
       payload: { name: 'REST Work' } })).statusCode).toBe(201);
     expect((await server.app.inject({ method: 'PATCH', url: '/api/v1/task-lists/REST%20Work', headers,
@@ -232,15 +204,32 @@ describe('named task lists', () => {
       reply: async (text: string) => { ownerReplies.push(text); },
       replyHtml: async (filename: string, html: string) => { ownerFiles.push({ filename, html }); },
     } as any;
-    await dispatchOwnerCommand('/task lists --format=html', ownerCtx);
+    await dispatchOwnerCommand('/tasks', ownerCtx);
+    expect(ownerReplies.at(-1)).toContain('## 📋 Tasks');
+    expect(ownerFiles).toHaveLength(0);
+    await dispatchOwnerCommand('/tasks backlog', ownerCtx);
+    expect(ownerReplies.at(-1)).toContain('## 📋 Tasks');
+    expect(ownerFiles).toHaveLength(0);
+    await dispatchOwnerCommand('/tasks html extra', ownerCtx);
+    expect(ownerReplies.at(-1)).toContain('Invalid command');
+    expect(ownerFiles).toHaveLength(0);
+    await dispatchOwnerCommand('/tasks html', ownerCtx);
     expect(ownerFiles).toHaveLength(1);
     expect(ownerFiles[0].filename).toBe('fleet-tasks.html');
     expect(ownerFiles[0].html).toContain('From CLI');
+    expect(ownerFiles[0].html).toContain('<!doctype html>');
+    expect(ownerFiles[0].html).not.toMatch(/<script|<form/iu);
     for (const secret of transportSecrets) expect(ownerFiles[0].html).not.toContain(secret);
+    expect(ownerReplies.at(-1)).toBe('HTML report attached: fleet-tasks.html');
+    await dispatchOwnerCommand('/task lists --format=html', ownerCtx);
+    expect(ownerReplies.at(-1)).toContain('Invalid command');
+    expect(ownerFiles).toHaveLength(1);
+    await dispatchOwnerCommand('/task list --html', ownerCtx);
+    expect(ownerReplies.at(-1)).toContain('Invalid command');
+    expect(ownerFiles).toHaveLength(1);
     await dispatchOwnerCommand(`/task show ${created.task_id} --format=html`, ownerCtx);
-    expect(ownerFiles).toHaveLength(2);
-    expect(ownerFiles[1].filename).toBe(focusedName);
-    for (const secret of transportSecrets) expect(ownerFiles[1].html).not.toContain(secret);
+    expect(ownerReplies.at(-1)).toContain('Invalid command');
+    expect(ownerFiles).toHaveLength(1);
     await dispatchOwnerCommand('/task list-create\nOwner Work', ownerCtx);
     await dispatchOwnerCommand('/task list-rename\nOwner Work\nOwner Renamed', ownerCtx);
     await dispatchOwnerCommand(`/task move ${created.task_id}\nOwner Renamed`, ownerCtx);

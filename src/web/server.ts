@@ -30,7 +30,6 @@ import { ROLE_NAME_RE } from '../config.js';
 import type { TaskRoomApplicationService } from '../application/task-room-service.js';
 import { TaskListError } from '../rooms-tasks/task-lists.js';
 import { TaskStateError } from '../rooms-tasks/task-state.js';
-import { createTaskReport, createTasksReport } from '../reports/index.js';
 
 export interface WebServices {
   query: FleetQueryService;
@@ -249,40 +248,6 @@ export async function buildWebServer(
     return taskApi(() => query.groupByList === 'true'
       ? { groups: requireTaskRooms().groupedTasks(filter) }
       : { tasks: requireTaskRooms().listTasks(filter) });
-  });
-  app.get('/api/v1/reports/tasks', async (request, reply) => {
-    const browserSession = auth.authenticate(request);
-    const query = request.query as { state?: string; list?: string };
-    const states = ['backlog', 'provisioning', 'active', 'review', 'done', 'cancelled', 'failed'] as const;
-    if (query.state && query.state !== 'all' && !states.includes(query.state as typeof states[number]))
-      throw new FleetError('invalid_request', 'invalid task state filter');
-    const state = query.state && query.state !== 'all' ? query.state as import('../rooms-tasks/types.js').TaskState : undefined;
-    const service = requireTaskRooms();
-    const filter = { ...(state ? { state } : {}), ...(query.list ? { list: query.list } : {}) };
-    const artifact = await createTasksReport({
-      viewer: { surface: 'rest', sessionId: browserSession.id, roomCids: [] },
-      collect: () => ({ lists: service.listTaskLists(), tasks: service.listTasks(filter) }),
-      selectedList: query.list, state, source: { name: 'ours-fleet', version: VERSION },
-    });
-    reply.header('Content-Type', artifact.metadata.mediaType);
-    reply.header('Content-Disposition', `attachment; filename="${artifact.metadata.filename}"`);
-    reply.header('Cache-Control', 'private, no-store');
-    reply.header('X-Content-Type-Options', 'nosniff');
-    return reply.send(artifact.html);
-  });
-  app.get('/api/v1/reports/tasks/:id', async (request, reply) => {
-    const browserSession = auth.authenticate(request);
-    const taskId = (request.params as { id: string }).id;
-    const service = requireTaskRooms();
-    const artifact = await taskApi(() => createTaskReport({
-      viewer: { surface: 'rest', sessionId: browserSession.id, roomCids: [] }, taskId,
-      collect: () => service.getTask(taskId).task, source: { name: 'ours-fleet', version: VERSION },
-    }));
-    reply.header('Content-Type', artifact.metadata.mediaType);
-    reply.header('Content-Disposition', `attachment; filename="${artifact.metadata.filename}"`);
-    reply.header('Cache-Control', 'private, no-store');
-    reply.header('X-Content-Type-Options', 'nosniff');
-    return reply.send(artifact.html);
   });
   app.post('/api/v1/tasks', async (request, reply) => {
     auth.authenticate(request, true);

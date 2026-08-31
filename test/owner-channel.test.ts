@@ -1002,7 +1002,7 @@ describe('OwnerChannel deterministic command dispatch', () => {
   it('sends HTML reports only to the authenticated owner and removes the private temp tree on success and failure', async () => {
     for (const fail of [false, true]) {
       const wire = fail ? 'wire-html-fail' : 'wire-html-ok';
-      const { channel, client, dir } = setup([ownerMessage(580 + Number(fail), wire, '/task lists --format=html')]);
+      const { channel, client, dir } = setup([ownerMessage(580 + Number(fail), wire, '/tasks html')]);
       const previous = process.env.OURS_FLEET_HOME;
       process.env.OURS_FLEET_HOME = dir;
       if (fail) client.failTools.add('sendFile');
