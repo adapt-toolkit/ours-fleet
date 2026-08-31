@@ -9,7 +9,7 @@ import {
   readTempSupervisor, secureStoppedTempArchive, stopTempSupervisor, tempSupervisorLiveness,
   type TempLifecycleDeps,
 } from '../temp-lifecycle.js';
-import type { CoworkAdapter } from './cowork-adapter.js';
+import { CoworkProtocolError, type CoworkAdapter } from './cowork-adapter.js';
 import {
   advanceMemberRetirement, advanceRoomClose, beginRoomClose, closeRoom,
   deleteRoomRecord, getRoomRecord, listRoomRecords, setRoomCloseError,
@@ -251,7 +251,13 @@ export async function deleteLegacyClosedRooms(input: {
 }): Promise<string[]> {
   const deleted: string[] = [];
   for (const room of listRoomRecords({ state: 'closed' })) {
-    await input.cowork.deleteRoom(room.room_id);
+    try {
+      await input.cowork.deleteRoom(room.room_id);
+    } catch (error) {
+      // The retained Fleet record is the legacy state being migrated. If the
+      // exact Cowork room is already absent, the desired deletion is complete.
+      if (!(error instanceof CoworkProtocolError && error.code === 'not_found')) throw error;
+    }
     deleteRoomRecord(room.room_id);
     deleted.push(room.room_id);
   }

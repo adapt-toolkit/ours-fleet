@@ -13,7 +13,7 @@ import {
 import { acceptTaskTerminalIntent } from '../src/rooms-tasks/terminal.js';
 import { snapshotTemplate } from '../src/rooms-tasks/templates.js';
 import type { FleetConfig } from '../src/config.js';
-import type { CoworkAdapter } from '../src/rooms-tasks/cowork-adapter.js';
+import { CoworkProtocolError, type CoworkAdapter } from '../src/rooms-tasks/cowork-adapter.js';
 import type { TemplateDefinition } from '../src/rooms-tasks/types.js';
 import { writeV2Fixture } from './v2-fixture.js';
 import { beginFleetAuditCollection, consumeFleetAuditCollection } from '../src/fleet-command-audit.js';
@@ -423,6 +423,23 @@ describe('task create/start surface parity', () => {
     expect(deleteRoom).toHaveBeenCalledWith('room-legacy');
     expect(deleteRoom.mock.invocationCallOrder[0]).toBeLessThan(listRooms.mock.invocationCallOrder[0]);
     expect(getRoomRecord('room-legacy')).toBeUndefined();
+  });
+
+  it('cleans a stale legacy room record when Cowork already deleted the room', async () => {
+    const closed = createRoomRecord({ room_id: 'room-stale', room_name: 'Stale' });
+    closeRoom(closed.room_id);
+    const deleteRoom = vi.fn(async () => {
+      throw new CoworkProtocolError('room.delete', 'room directory does not exist', 'not_found');
+    });
+    const listRooms = vi.fn(async () => [{ room_id: 'room-live', identity_name: 'Live',
+      identity_cid: 'cid-live', room_name: 'Live', state: 'active' as const, seats: [], role_briefings: {} }]);
+    const adapter = { ...cowork().adapter, deleteRoom, listRooms } as CoworkAdapter;
+
+    await expect(service(adapter).listRooms()).resolves.toMatchObject([
+      { room_id: 'room-live', orchestration: null },
+    ]);
+    expect(deleteRoom).toHaveBeenCalledWith('room-stale');
+    expect(getRoomRecord('room-stale')).toBeUndefined();
   });
 
   it('creates standalone rooms with config-before-file ordering and file-over-brief', async () => {
