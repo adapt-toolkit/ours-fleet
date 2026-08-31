@@ -8,6 +8,7 @@ import type {
   MemberRetirementPhase, RoomClosePhase,
   RoomRoleBriefingDefinition, RoomMemberLaunchState,
 } from './types.js';
+import { releaseLaunchSnapshot } from './launch-snapshot.js';
 
 export const roomsDir = () => join(stateRoot(), 'rooms');
 
@@ -62,7 +63,9 @@ export function getRoomRecord(id: string): RoomOrchestrationRecord | undefined {
 /** Remove a terminal orchestration record from the live room inventory. */
 export function deleteRoomRecord(id: string): void {
   const path = roomPath(id);
+  const hash = getRoomRecord(id)?.template_snapshot?.launch_snapshot_hash;
   if (existsSync(path)) rmSync(path);
+  if (hash) releaseLaunchSnapshot(hash);
 }
 
 export function listRoomRecords(filter?: {

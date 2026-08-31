@@ -233,21 +233,8 @@ async function reconcileWatchdogScheduler(cfg: FleetConfig, deps: OpsDeps, confi
 }
 
 export async function down(cfg: FleetConfig, names: string[], deps: OpsDeps): Promise<void> {
-  const roles = names.length ? names.map(name => cfg.roles.find(role => role.name === name)) : cfg.roles;
-  for (let index = 0; index < roles.length; index++) {
-    const role = roles[index];
-    const requested = names[index];
-    if (!role && requested && /^[A-Za-z0-9_-]+$/.test(requested)
-        && existsSync(agentDir(requested, true))) {
-      try {
-        const outcome = await stopTempSupervisor(requested, { exec: deps.exec ?? realExec });
-        deps.log(`■ ${outcome === 'stopped' ? 'stopping' : 'stopped'} temporary role ${requested}`);
-      } catch (e) {
-        deps.log(`  ! could not stop temporary role ${requested}: ${e instanceof Error ? e.message : String(e)}`);
-      }
-      continue;
-    }
-    if (!role) throw new Error(`no such role '${requested}'`);
+  const roles = selectRoles(cfg, names);
+  for (const role of roles) {
     // Never swallow the backend's reason. "maybe not running" hid real stop
     // failures — a wedged unit, an unreachable user bus — behind a guess.
     try { await deps.backend.stop(role.name); deps.log(`■ stopped ${role.name}`); }

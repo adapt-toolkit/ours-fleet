@@ -23,15 +23,15 @@ import { TaskRoomApplicationError, TaskRoomApplicationService } from '../src/app
 
 const STANDARD_TEMPLATES = {
   single: { name: 'single', version: 1, description: 'Solo agent',
-    members: [{ slot: 'agent', role: 'Agent', count: 1, agent: { ref: 'Agent' } }] },
+    members: [{ slot: 'agent', role: 'Agent', count: 1, agent_template: 'Agent' }] },
   pair: { name: 'pair', version: 1, description: 'Review pair', members: [
-    { slot: 'secretary', role: 'Secretary', count: 1, agent: { ref: 'Secretary' } },
-    { slot: 'critic', role: 'Critic', count: 1, agent: { ref: 'Critic' } },
+    { slot: 'secretary', role: 'Secretary', count: 1, agent_template: 'Secretary' },
+    { slot: 'critic', role: 'Critic', count: 1, agent_template: 'Critic' },
   ] },
   team: { name: 'team', version: 1, description: 'Delivery team', members: [
-    { slot: 'architect', role: 'Architect', count: 1, agent: { ref: 'Architect' } },
-    { slot: 'developer', role: 'Developer', count: 1, agent: { ref: 'Developer' } },
-    { slot: 'tester', role: 'Tester', count: 1, agent: { ref: 'Tester' } },
+    { slot: 'architect', role: 'Architect', count: 1, agent_template: 'Architect' },
+    { slot: 'developer', role: 'Developer', count: 1, agent_template: 'Developer' },
+    { slot: 'tester', role: 'Tester', count: 1, agent_template: 'Tester' },
   ] },
 };
 

@@ -61,8 +61,14 @@ const caller = {
 } satisfies ResolvedRole;
 
 function cfg(overrides: Partial<FleetConfig> = {}): FleetConfig {
+  const worker = {
+    brain: { inline: { harness: 'codex' } }, role: { inline: { persona: 'Developer' } },
+  } as const;
   return {
     roles: [], vars: {}, defaults: {}, files: ['test'], startStaggerMs: 0,
+    agentTemplates: Object.fromEntries(
+      ['Agent', 'Secretary', 'Critic', 'Architect', 'Developer', 'Tester']
+        .map(name => [name, structuredClone(worker)])),
     diagnostics: [], watchdogs: [], loops: [], ...overrides,
   } as FleetConfig;
 }
@@ -71,9 +77,7 @@ function template(count = 2): TemplateSnapshot {
   return {
     name: 'simple', version: 1, description: 'Simple room', content_hash: 'a'.repeat(64),
     contract: 'Implement, review, and report evidence.',
-    members: [{ slot: 'developer', role: 'Developer', count, agent: {
-      brain: { inline: { harness: 'codex' } }, role: { inline: { persona: 'Developer' } },
-    } }],
+    members: [{ slot: 'developer', role: 'Developer', count, agent_template: 'Developer' }],
   };
 }
 
@@ -276,11 +280,10 @@ describe('simple Cowork room member startup', () => {
     const input = { cfg: cfg(), cowork: h.cowork, roomId: 'room-drift', template: template(1),
       binPath: '/usr/bin/ours-fleet', startupWait: { timeoutMs: 0, now: () => 1 } };
     await provisionMembers(input);
-    const drifted = structuredClone(input.template);
-    drifted.members[0].agent = {
+    const driftedCfg = cfg({ agentTemplates: { Developer: {
       brain: { inline: { harness: 'codex', model: 'different-model' } }, role: { inline: {} },
-    };
-    await expect(provisionMembers({ ...input, template: drifted }))
+    } } });
+    await expect(provisionMembers({ ...input, cfg: driftedCfg }))
       .rejects.toThrow(/Agent definition drift.*durable launch intent/);
     expect(h.issueInvite).toHaveBeenCalledTimes(1);
     expect(mocks.spawnTemp).toHaveBeenCalledTimes(1);
@@ -329,30 +332,35 @@ describe('simple Cowork room member startup', () => {
 
   it('persists only a structural Agent projection, never secret-capable values', async () => {
     createRoomRecord({ room_id: 'room-redact', room_name: 'Room', room_identity_cid: 'room-cid' });
-    const tpl = template(1);
-    tpl.members[0].agent = {
+    const base = template(1);
+    const redactedDefinition = {
       brain: { inline: { harness: 'codex', harness_options: { endpoint: 'brain-sentinel' } } },
       role: { inline: { persona: 'safe' } }, env: { ENDPOINT: 'env-sentinel' },
     };
-    await provisionMembers({ cfg: cfg(), cowork: coworkHarness().cowork, roomId: 'room-redact',
+    const { content_hash: _hash, ...definition } = base;
+    const tpl = snapshotTemplate(definition, { Developer: redactedDefinition });
+    expect(JSON.stringify(tpl)).not.toContain('brain-sentinel');
+    expect(JSON.stringify(tpl)).not.toContain('env-sentinel');
+    await provisionMembers({ cfg: cfg({ agentTemplates: { Developer: redactedDefinition } }), cowork: coworkHarness().cowork, roomId: 'room-redact',
       template: tpl, binPath: '/usr/bin/ours-fleet' });
     const state = readFileSync(join(root, '.ours-fleet', 'rooms', 'room-redact.json'), 'utf8');
     expect(state).not.toContain('brain-sentinel');
     expect(state).not.toContain('env-sentinel');
     expect(state).toContain('agent_fingerprint');
-    expect(state).toContain('operationalFields');
+    expect(state).toContain('<redacted>');
+    expect(state).toContain('agent_template_hash');
   });
 
   it('preserves the canonical room Agent definition', async () => {
     createRoomRecord({ room_id: 'room-override', room_name: 'Room', room_identity_cid: 'room-cid' });
     const h = coworkHarness();
     const tpl = template(1);
-    tpl.members[0].agent = {
+    const exactDefinition = {
       brain: { inline: { harness: 'codex', model: 'gpt-test' } },
       role: { inline: { persona: 'Review carefully.' } }, cwd: '/workspace',
     };
     await provisionMembers({
-      cfg: cfg(), cowork: h.cowork, roomId: 'room-override', template: tpl,
+      cfg: cfg({ agentTemplates: { Developer: exactDefinition } }), cowork: h.cowork, roomId: 'room-override', template: tpl,
       binPath: '/usr/bin/ours-fleet',
     });
     expect(mocks.spawnTemp.mock.calls[0][0]).toMatchObject({
@@ -373,11 +381,10 @@ describe('simple Cowork room member startup', () => {
       const selected = {
         name: templateName, version: 1, description: `${templateName} fixture`,
         members: roles.map(role => ({
-          slot: role.toLowerCase(), role, count: 1, agent: { ref: role },
+          slot: role.toLowerCase(), role, count: 1, agent_template: role,
         })),
       };
       const tpl = snapshotTemplate(selected);
-      tpl.members = tpl.members.map(member => ({ ...member, agent: structuredClone(template(1).members[0].agent) }));
       createRoomRecord({
         room_id: `room-${templateName}`, room_name: 'Room', room_identity_cid: 'room-cid',
       });
@@ -398,7 +405,7 @@ describe('simple Cowork room member startup', () => {
         });
       }
       for (const [spawn] of mocks.spawnTemp.mock.calls) {
-        expect(spawn).toMatchObject({ agentDefinition: template(1).members[0].agent,
+        expect(spawn).toMatchObject({ agentDefinition: cfg().agentTemplates?.[spawn.roomMemberStartup.role],
           callerRole: 'Coordinator', inheritedFromCaller: [] });
       }
     },
@@ -432,7 +439,7 @@ describe('simple Cowork room member startup', () => {
     process.env[FLEET_PROXY_STATE_DIR_ENV] = '/state/Coordinator';
     process.env[FLEET_PROXY_CALLER_ENV] = 'Coordinator';
     const tpl = template(1);
-    tpl.members[0].agent = {
+    const explicitDefinition = {
       brain: { inline: { harness: 'claude-code' } }, role: { inline: {} }, cwd: '/explicit',
       permissions: { approval: 'ask', filesystem: 'workspace', unattended: 'deny' },
     };
@@ -443,7 +450,7 @@ describe('simple Cowork room member startup', () => {
     mockManagedSpawns();
 
     await provisionMembers({
-      cfg: cfg(), cowork: h.cowork, roomId: 'room-explicit', template: tpl,
+      cfg: cfg({ agentTemplates: { Developer: explicitDefinition } }), cowork: h.cowork, roomId: 'room-explicit', template: tpl,
       binPath: '/usr/bin/ours-fleet',
     });
 

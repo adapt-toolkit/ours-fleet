@@ -109,15 +109,15 @@ const STANDARD_TEMPLATES_YAML = [
   '  single:',
   '    version: 1',
   '    description: solo fixture',
-  '    members: [{ slot: agent, role: Agent, count: 1, agent: { ref: Agent } }]',
+  '    members: [{ slot: agent, role: Agent, count: 1, agent_template: Agent }]',
   '  pair:',
   '    version: 1',
   '    description: pair fixture',
-  '    members: [{ slot: secretary, role: Secretary, count: 1, agent: { ref: Agent } }]',
+  '    members: [{ slot: secretary, role: Secretary, count: 1, agent_template: Agent }]',
   '  team:',
   '    version: 1',
   '    description: team fixture',
-  '    members: [{ slot: developer, role: Developer, count: 1, agent: { ref: Agent } }]',
+  '    members: [{ slot: developer, role: Developer, count: 1, agent_template: Agent }]',
   '',
 ].join('\n');
 
@@ -159,7 +159,7 @@ function writeCustomTemplate(include = true): void {
       '    version: 7',
       '    description: durable template',
       '    members:',
-      '      - { slot: dev, role: Developer, count: 1, agent: { ref: Dev } }',
+      '      - { slot: dev, role: Developer, count: 1, agent_template: Dev }',
       '',
     ].join('\n') : STANDARD_TEMPLATES_YAML));
 }
@@ -668,7 +668,7 @@ describe('task work', () => {
     });
     await expect(run('start', t.task_id, '--json')).rejects.toThrow(ExitError);
     expect(out.join('\n')).toContain('team@7');
-    expect(getTask(t.task_id).state).toBe('provisioning');
+    expect(getTask(t.task_id).state).toBe('backlog');
     expect(mocks.createRoom).not.toHaveBeenCalled();
   });
 

@@ -23,6 +23,7 @@ import {
   analyzeInstalls, buildInfo, buildLabel, discoverInstalls, BIN_NAME,
 } from './provenance.js';
 import { readDaemonRecoveryStatus } from './daemon-recovery.js';
+import { codexModelCatalog } from './application/model-catalog.js';
 
 /** Which cgroup-v2 controllers are delegated to this user manager (advisory). */
 function cgroupDelegationDetail(): string {
@@ -104,6 +105,8 @@ export async function doctor(
     yamlMode?: YamlMode;
     /** Override PATH / running executable when scanning for installs (tests). */
     installScan?: { path?: string; argv1?: string };
+    /** Override the local Codex model cache path (tests). */
+    codexCatalogPath?: string;
   } = {},
   exec: Exec = realExec,
   platform: NodeJS.Platform = process.platform,
@@ -139,6 +142,24 @@ export async function doctor(
     ok: true,
     detail: `warning: ${diagnostic.message}`,
   });
+  if (loaded.ok) {
+    const packaged = Object.entries(loaded.brainPresets ?? {}).flatMap(([id, brain]) =>
+      brain.harness === 'codex' && typeof brain.model === 'string' && typeof brain.effort === 'string'
+        ? [{ id, model: brain.model, effort: brain.effort }] : [])
+      .sort((a, b) => a.id.localeCompare(b.id));
+    if (packaged.length) {
+      const runtime = codexModelCatalog(opts.codexCatalogPath);
+      const available = new Set(runtime.models.flatMap(model =>
+        model.reasoningEfforts.map(effort => `${model.id}\0${effort}`)));
+      const missing = packaged.filter(({ model, effort }) => !available.has(`${model}\0${effort}`));
+      checks.push({ name: 'brain catalog: Codex runtime drift', ok: true,
+        detail: runtime.models.length
+          ? missing.length ? `warning: packaged Brain preset(s) absent from local Codex catalog: ${missing
+            .map(({ id, model, effort }) => `${id} (${model}/${effort})`).join(', ')}`
+            : `all ${packaged.length} packaged Codex model/effort pairs are present locally`
+          : runtime.warnings.join('; ') });
+    }
+  }
   for (const role of roles) {
     const recovery = readDaemonRecoveryStatus(agentDir(role.name));
     if (!recovery) continue;
@@ -195,16 +216,16 @@ export async function doctor(
     const { listTemplates, resolveTemplate } = await import('./rooms-tasks/templates.js');
     const customs = loaded.roomTemplates ?? {};
     const templates = listTemplates(customs);
-    const roleNames = new Set(roles.map(r => r.name));
+    const agentTemplateNames = new Set(Object.keys(loaded.agentTemplates ?? {}));
     for (const t of templates) {
       const badRefs = t.members
-        .filter(m => 'ref' in m.agent && !roleNames.has(m.agent.ref))
-        .map(m => 'ref' in m.agent ? m.agent.ref : '');
+        .filter(m => !agentTemplateNames.has(m.agent_template))
+        .map(m => m.agent_template);
       if (badRefs.length) {
         checks.push({
           name: `template: ${t.name}@${t.version}`,
           ok: true,
-          detail: `warning: Agent ref(s) ${badRefs.join(', ')} not found in configured Agents`,
+          detail: `warning: Agent Template(s) ${badRefs.join(', ')} not found`,
         });
       }
     }
@@ -583,6 +604,8 @@ type ConfigLoad =
       ok: true; roles: ResolvedRole[]; files: string[]; diagnostics: ConfigDiagnostic[];
       rooms?: import('./rooms-tasks/types.js').RoomsConfig;
       roomTemplates?: import('./rooms-tasks/types.js').RoomTemplatesConfig;
+      agentTemplates?: Record<string, import('./config.js').AgentTemplateDefinition>;
+      brainPresets?: Record<string, Record<string, unknown>>;
       tasks?: import('./rooms-tasks/types.js').TasksConfig;
       ownerInviteFingerprint?: string;
     }
@@ -594,6 +617,8 @@ function loadConfigResult(configPath?: string, yamlMode?: YamlMode): ConfigLoad 
     return {
       ok: true, roles: cfg.roles, files: cfg.files, diagnostics: cfg.diagnostics,
       rooms: cfg.rooms, roomTemplates: cfg.roomTemplates, tasks: cfg.tasks,
+      agentTemplates: cfg.agentTemplates,
+      brainPresets: cfg.brainPresets,
       ownerInviteFingerprint: cfg.ownerInviteFingerprint,
     };
   } catch (e) {

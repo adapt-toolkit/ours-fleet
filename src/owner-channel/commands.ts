@@ -727,7 +727,7 @@ export const ownerCommands: OwnerCommand[] = [
           ...(t.contract ? [`Contract: ${t.contract}`] : []),
           'Members:',
           ...t.members.map(m => `  ${m.slot} (${m.role}) ×${m.count} → `
-            + `${'ref' in m.agent ? `Agent ref: ${m.agent.ref}` : 'inline Agent'}`),
+            + `Agent Template: ${m.agent_template}`),
         ];
         await ctx.reply(lines.join('\n'));
       };

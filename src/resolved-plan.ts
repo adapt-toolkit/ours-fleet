@@ -29,6 +29,9 @@ export function resolvedPlan(cfg: FleetConfig): Record<string, unknown> {
     })),
     startStaggerMs: cfg.startStaggerMs,
     diagnostics: cfg.diagnostics.map(diagnostic => ({ ...diagnostic })),
+    agentTemplates: Object.fromEntries(Object.entries(cfg.agentTemplates ?? {})
+      .sort(([a], [b]) => a.localeCompare(b))
+      .map(([name, definition]) => [name, redactSensitive(definition)])),
     roles: cfg.roles.map(role => resolvedRolePlan(role, manifestDir)),
     loops: cfg.loops.map(loop => sortedObject({
       name: loop.name, selectors: [...loop.selectors], roles: [...loop.roleNames],
@@ -52,6 +55,7 @@ export function resolvedRolePlan(role: ResolvedRole, manifestDir = dirname(role.
   return {
     name: role.name,
     sourceFile: role.sourceFile,
+    agentTemplate: role.agentTemplate ?? null,
     references: Object.values(role.provenance ?? {}).flatMap(item => item.viaReference ? [item.viaReference] : [])
       .filter((item, index, all) => all.findIndex(other => JSON.stringify(other) === JSON.stringify(item)) === index)
       .sort((a, b) => a.kind.localeCompare(b.kind) || a.id.localeCompare(b.id)

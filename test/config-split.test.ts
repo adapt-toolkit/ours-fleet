@@ -4,7 +4,7 @@ import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { findRole, loadConfig } from '../src/config.js';
 import { spawnDryRun } from '../src/spawn.js';
-import { resolvedRolePlan } from '../src/resolved-plan.js';
+import { resolvedPlan, resolvedRolePlan } from '../src/resolved-plan.js';
 import { getAdapter } from '../src/harness/registry.js';
 import '../src/harness/codex.js';
 import '../src/harness/claude-code.js';
@@ -17,7 +17,7 @@ function manifest(body = ''): void {
   chmodSync(join(dir, 'fleet.yaml'), 0o600);
 }
 
-function kind(kindName: 'agents' | 'roles' | 'brains', name: string, body: string): void {
+function kind(kindName: 'agents' | 'agent_templates' | 'roles' | 'brains', name: string, body: string): void {
   const root = join(dir, 'fleet', kindName);
   mkdirSync(root, { recursive: true });
   chmodSync(join(dir, 'fleet'), 0o700);
@@ -46,15 +46,15 @@ describe('Agent Role Brain split configuration', () => {
     mkdirSync(templates, { recursive: true });
     chmodSync(templates, 0o700);
     const file = join(templates, 'single.yaml');
-    writeFileSync(file, 'version: 1\ndescription: file\nmembers:\n  - { slot: agent, role: Agent, count: 1, agent: { ref: Agent } }\n');
+    writeFileSync(file, 'version: 1\ndescription: file\nmembers:\n  - { slot: agent, role: Agent, count: 1, agent_template: Agent }\n');
     chmodSync(file, 0o600);
     const loaded = loadConfig();
     expect(loaded.roomTemplates?.single).toMatchObject({ name: 'single', version: 1, sourceFile: file });
     expect(loaded.sourceDocuments).toContainEqual({ kind: 'RoomTemplate', id: 'single', path: file });
 
-    manifest('room_templates:\n  single:\n    version: 1\n    description: hidden drift\n    members:\n      - { slot: agent, role: Agent, count: 1, agent: { ref: Agent } }\n');
+    manifest('room_templates:\n  single:\n    version: 1\n    description: hidden drift\n    members:\n      - { slot: agent, role: Agent, count: 1, agent_template: Agent }\n');
     expect(() => loadConfig()).toThrow(/shadows file preset.*override_builtin.*higher version/);
-    manifest('room_templates:\n  single:\n    version: 2\n    override_builtin: true\n    description: explicit migration override\n    members:\n      - { slot: agent, role: Agent, count: 1, agent: { ref: Agent } }\n');
+    manifest('room_templates:\n  single:\n    version: 2\n    override_builtin: true\n    description: explicit migration override\n    members:\n      - { slot: agent, role: Agent, count: 1, agent_template: Agent }\n');
     const overridden = loadConfig();
     expect(overridden.roomTemplates?.single).toMatchObject({
       version: 2, description: 'explicit migration override', sourceFile: join(dir, 'fleet.yaml'),
@@ -71,7 +71,7 @@ describe('Agent Role Brain split configuration', () => {
     mkdirSync(templates, { recursive: true });
     chmodSync(templates, 0o700);
     for (const filename of ['single.yaml', 'single.yml']) {
-      writeFileSync(join(templates, filename), 'version: 1\ndescription: x\nmembers: [{ slot: a, role: A, count: 1, agent: { ref: Agent } }]\n');
+      writeFileSync(join(templates, filename), 'version: 1\ndescription: x\nmembers: [{ slot: a, role: A, count: 1, agent_template: Agent }]\n');
       chmodSync(join(templates, filename), 0o600);
     }
     expect(() => loadConfig()).toThrow(/E_DUPLICATE_ID.*room template 'single'/);
@@ -114,6 +114,64 @@ describe('Agent Role Brain split configuration', () => {
     expect(resolvedRolePlan(alice)).toEqual(resolvedRolePlan(findRole(loadConfig(), 'Alice')));
     expect((resolvedRolePlan(alice).references as Array<{ kind: string }>).map(ref => ref.kind))
       .toEqual(['Brain', 'Role']);
+  });
+
+  it('keeps templates inert while persistent instances reuse deterministic nested overrides', () => {
+    manifest();
+    kind('agent_templates', 'Worker.yaml', [
+      'role: { inline: { mission: Work } }',
+      'brain: { inline: { harness: codex, harness_options: { access_token: template-secret } } }',
+      'permissions: { approval: ask, filesystem: workspace, unattended: deny }',
+      'env: { A: one, B: two }',
+      'oversee: [{ agent: Other, interval: 5m }]',
+      '',
+    ].join('\n'));
+    kind('agents', 'Persistent.yaml', [
+      'template: Worker',
+      'overrides:',
+      '  permissions: { approval: allow }',
+      '  env: { B: changed, C: three }',
+      '  oversee: [{ agent: Replacement, interval: 10m }]',
+      '',
+    ].join('\n'));
+    const cfg = loadConfig();
+    expect(cfg.roles.map(role => role.name)).toEqual(['Persistent']);
+    expect(findRole(cfg, 'Persistent')).toMatchObject({
+      permissions: { approval: 'allow', filesystem: 'workspace', unattended: 'deny' },
+      env: { A: 'one', B: 'changed', C: 'three' },
+      oversee: [{ agent: 'Replacement', interval: '10m' }],
+      agentTemplate: { id: 'Worker', contentHash: expect.stringMatching(/^[a-f0-9]{64}$/) },
+    });
+    expect(() => findRole(cfg, 'Worker')).toThrow(/inert Agent Template.*lifecycle commands/);
+    const plan = resolvedPlan(cfg) as any;
+    expect(plan.sourceDocuments).toContainEqual(expect.objectContaining({
+      kind: 'AgentTemplate', id: 'Worker', path: 'fleet/agent_templates/Worker.yaml',
+    }));
+    expect(plan.agentTemplates.Worker.brain.inline.harness_options.access_token).toBe('<redacted>');
+    const instancePlan = plan.roles.find((role: any) => role.name === 'Persistent');
+    expect(instancePlan.agentTemplate).toEqual({
+      id: 'Worker', sourceFile: join(dir, 'fleet', 'agent_templates', 'Worker.yaml'),
+      contentHash: expect.stringMatching(/^[a-f0-9]{64}$/),
+    });
+    const initialHash = instancePlan.agentTemplate.contentHash;
+    kind('agent_templates', 'Worker.yaml', [
+      'oversee: [{ interval: 5m, agent: Other }]',
+      'env: { B: two, A: one }',
+      'permissions: { unattended: deny, filesystem: workspace, approval: ask }',
+      'brain: { inline: { harness_options: { access_token: template-secret }, harness: codex } }',
+      'role: { inline: { mission: Work } }',
+      '',
+    ].join('\n'));
+    expect((resolvedPlan(loadConfig()) as any).roles[0].agentTemplate.contentHash).toBe(initialHash);
+    kind('agent_templates', 'Worker.yaml', [
+      'role: { inline: { mission: Changed } }',
+      'brain: { inline: { harness: codex, harness_options: { access_token: template-secret } } }',
+      'permissions: { approval: ask, filesystem: workspace, unattended: deny }',
+      'env: { A: one, B: two }',
+      'oversee: [{ agent: Other, interval: 5m }]',
+      '',
+    ].join('\n'));
+    expect((resolvedPlan(loadConfig()) as any).roles[0].agentTemplate.contentHash).not.toBe(initialHash);
   });
 
   it('accepts fully inline Role and Brain without preset roots', () => {

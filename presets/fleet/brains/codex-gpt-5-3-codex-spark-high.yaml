@@ -1,0 +1,5 @@
+# Generated from presets/brain-catalog.json revision 1.
+harness: codex
+session: acp
+model: gpt-5.3-codex-spark
+effort: high

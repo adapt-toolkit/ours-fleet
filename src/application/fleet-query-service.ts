@@ -99,7 +99,8 @@ export class FleetQueryService {
   }
 
   async list(): Promise<Array<{ role: RoleRecord; status: RoleStatus; capabilities: RoleCapabilities }>> {
-    const roles = await this.options.repository.list();
+    const roles = (await this.options.repository.list())
+      .filter(role => role.configured && role.lifetime === 'permanent');
     return Promise.all(roles.map(async role => {
       const status = await this.status(role);
       return { role, status, capabilities: roleCapabilities(role, status, this.options.capabilityContext) };

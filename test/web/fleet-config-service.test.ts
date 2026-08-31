@@ -24,11 +24,30 @@ describe('split-document fleet configuration service', () => {
   const agentPath = (id = 'Alpha') => join(dir, 'fleet', 'agents', `${id}.yaml`);
   const model = (service: FleetConfigService) => service.read();
 
-  it('reads an explicit manifest + bare Agent map and no legacy roles map', () => {
+  it('reads an explicit manifest plus editable Agent and Agent Template maps', () => {
     const opened = model(new FleetConfigService({ configPath: file }));
     expect(opened.model.manifest.api_version).toBe('ours.network/fleet/v2');
     expect(opened.model.agents.Alpha).toMatchObject({ brain: { inline: { harness: 'codex' } } });
+    expect(opened.model.agent_templates.Agent).toMatchObject({ brain: { inline: { harness: 'claude-code' } } });
     expect(opened.model).not.toHaveProperty('roles');
+  });
+
+  it('adds, edits, and deletes inert Agent Template documents independently of Agents', async () => {
+    const service = new FleetConfigService({ configPath: file });
+    const opened = service.read();
+    opened.model.agent_templates.Reviewer = {
+      role: { inline: { mission: 'Review only' } },
+      brain: { inline: { harness: 'claude-code' } },
+      permissions: { approval: 'ask', filesystem: 'read-only', unattended: 'deny' },
+    };
+    const saved = await service.write(opened.revision, opened.model);
+    expect(saved.diff).toContain('agent_templates/Reviewer.yaml');
+    expect(existsSync(join(dir, 'fleet', 'agent_templates', 'Reviewer.yaml'))).toBe(true);
+    const second = service.read();
+    delete second.model.agent_templates.Reviewer;
+    await service.write(second.revision, second.model);
+    expect(existsSync(join(dir, 'fleet', 'agent_templates', 'Reviewer.yaml'))).toBe(false);
+    expect(existsSync(agentPath())).toBe(true);
   });
 
   it('adds, edits, and deletes Agent documents and edits manifest automation', async () => {
@@ -147,7 +166,7 @@ describe('split-document fleet configuration service', () => {
     const templates = join(dir, 'fleet', 'room_templates');
     mkdirSync(templates, { mode: 0o700 });
     const template = join(templates, 'single.yaml');
-    const source = 'version: 1\ndescription: solo\nmembers:\n  - { slot: agent, role: Agent, count: 1, agent: { ref: Alpha } }\n';
+    const source = 'version: 1\ndescription: solo\nmembers:\n  - { slot: agent, role: Agent, count: 1, agent_template: Alpha }\n';
     writeFileSync(template, source, { mode: 0o600 });
     let staged = false;
     const service = new FleetConfigService({ configPath: file, preflight: async path => {

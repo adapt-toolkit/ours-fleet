@@ -43,7 +43,7 @@ brain: { inline: { harness: codex, session: acp } }
 ## How it works
 
 ```
-~/fleet.yaml + ~/fleet/{agents,roles,brains,room_templates}/*.yaml   your declaration
+~/fleet.yaml + ~/fleet/{agents,agent_templates,roles,brains,room_templates}/*.yaml   your declaration
         │  ours-fleet up
         ▼
 briefing.md per role  ──►  agent session adapter  ──►  ACP client/session  ──►  ACP agent
@@ -356,9 +356,42 @@ defaults:
     max_kb: 1024                        # rotate only above this active-log size
     keep_tail_kb: 256                   # UTF-8 tail; line-aligned when one fits
     max_archives: 12                    # recent beside log; older preserved cold
-Agent document (\`~/fleet/agents/Name.yaml\`):
-  role: { ref: RoleID }
-  brain: { ref: BrainID }                # Brain owns harness/model/session/reasoning
+```
+
+Agent Template document (\`~/fleet/agent_templates/Worker.yaml\`) is inert and reusable:
+
+```yaml
+role: { ref: developer }
+brain: { ref: claude-default }
+permissions: { approval: ask, filesystem: workspace, unattended: deny }
+```
+
+Persistent Agent instance (\`~/fleet/agents/Name.yaml\`) either remains a canonical
+Role/Brain composition or explicitly reuses a template:
+
+```yaml
+template: Worker
+overrides:
+  cwd: /work/name
+  permissions: { approval: allow }
+```
+
+Templates never create identities, supervisors, sessions, or lifecycle/status rows.
+Map overrides merge recursively; scalars and arrays replace; null deletion is rejected.
+
+Canonical Agent document (\`~/fleet/agents/Name.yaml\`):
+
+```yaml
+role: { ref: RoleID }
+brain: { ref: BrainID }                  # Brain owns harness/model/session/reasoning
+identity: "Display Name"                # ours identity to bind (default: Name)
+cwd: ${work_root}/repo                   # where the harness process runs
+coordinator: FleetCoordinator            # announce target on boot
+```
+
+Additional operational field inventory (schematic, not one YAML document):
+
+```text
     identity: "Display Name"            # ours identity to bind (default: Name)
     cwd: ${work_root}/repo              # where the harness process runs
     coordinator: FleetCoordinator       # announce target on boot
@@ -458,8 +491,11 @@ the packaged preset revision and source directory and only seeds missing files.
 It never upgrades an edited preset. To adopt a newer packaged file explicitly,
 copy the reported source file beside the existing target as `.new-default`, review
 `diff -u`, then replace the target yourself. This is the sole adoption operation;
-rerunning init is not an update. Users upgrading from hardcoded templates should
-run init once (with the same `-c` selection they normally use).
+rerunning init is not an update. Users with the exact generated six-worker legacy
+starter set must migrate explicitly: first run `ours-fleet migrate-agent-templates -c FILE`
+for a zero-write plan, then review every move/addition/recovery path and rerun with
+`--write`. Customized or ambiguous known starters are refused without
+mutation; unrelated custom persistent Agents are preserved.
 
 Rooms always use `ours-cowork`; there is no room-provider selector. Configure
 the cowork daemon connection and the room owner directly:

@@ -71,12 +71,27 @@ export function writeV2Fixture(
 
   const root = splitRootFor(manifestPath);
   const agents = join(root, 'agents');
+  const agentTemplates = join(root, 'agent_templates');
   mkdirSync(dirname(manifestPath), { recursive: true });
   mkdirSync(agents, { recursive: true });
+  mkdirSync(agentTemplates, { recursive: true });
   chmodSync(root, 0o700);
   chmodSync(agents, 0o700);
+  chmodSync(agentTemplates, 0o700);
   writeFileSync(manifestPath, stringify(model), { mode: 0o600 });
   chmodSync(manifestPath, 0o600);
+  const referencedTemplates = new Set<string>(['Agent']);
+  for (const template of Object.values((model.room_templates ?? {}) as Record<string, { members?: Array<{ agent_template?: string }> }>))
+    for (const member of template.members ?? []) if (member.agent_template) referencedTemplates.add(member.agent_template);
+  for (const name of referencedTemplates) {
+    const templatePath = join(agentTemplates, `${name}.yaml`);
+    writeFileSync(templatePath, stringify({
+      role: { inline: { mission: 'Complete the assigned room task.' } },
+      brain: { inline: { harness: (defaults.harness as string | undefined) ?? 'claude-code' } },
+      permissions: { approval: 'allow', filesystem: 'unrestricted', unattended: 'wait' },
+    }), { mode: 0o600 });
+    chmodSync(templatePath, 0o600);
+  }
 
   for (const [name, roleInput] of Object.entries(roles)) {
     const explicit = { ...(roleInput ?? {}) };

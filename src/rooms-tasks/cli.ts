@@ -9,8 +9,30 @@ import {
 } from './close.js';
 import { launchFleetWorker } from './external-worker.js';
 import {
-  resolveTemplate, listTemplates, snapshotTemplate, hashTemplate,
+  resolveTemplate, listTemplates, sealTemplateSnapshot, snapshotTemplate, hashTemplate,
 } from './templates.js';
+import { acquireLaunchSnapshotLock, releaseLaunchSnapshot } from './launch-snapshot.js';
+import { parseGroupedMemberArgs, readMembersFile, type MemberOverrides } from './member-overrides.js';
+
+const MEMBER_ARG_FLAGS = new Set([
+  '--member', '--agent-template', '--brain', '--role', '--approval', '--filesystem', '--unattended',
+  '--cwd', '--model', '--effort',
+]);
+
+export function cliMemberOverrides(membersFile?: string, argv = process.argv.slice(2)): MemberOverrides | undefined {
+  const grouped: string[] = [];
+  for (let i = 0; i < argv.length; i++) if (MEMBER_ARG_FLAGS.has(argv[i])) {
+    grouped.push(argv[i], argv[i + 1]); i += 1;
+  }
+  if (membersFile && grouped.length) throw new Error('--members-file cannot be combined with grouped --member options');
+  if (membersFile) return readMembersFile(membersFile);
+  return grouped.length ? parseGroupedMemberArgs(grouped) : undefined;
+}
+function commandArgv(command: Command): string[] {
+  let root = command;
+  while (root.parent) root = root.parent;
+  return (root as Command & { rawArgs?: string[] }).rawArgs ?? process.argv.slice(2);
+}
 import {
   createTask, getTask, listTasks, startTask, activateTask,
   blockTask, unblockTask, reviewTask,
@@ -399,7 +421,7 @@ function resolveRoomTemplate(cfg: FleetConfig, name?: string): TemplateSnapshot 
   if (!name) return undefined;
   const template = resolveTemplate(name, allTemplates(cfg));
   if (!template) throw new Error(`template not found: ${name}`);
-  return snapshotTemplate(template);
+  return snapshotTemplate(template, cfg.agentTemplates);
 }
 
 function durableTaskRoomTemplate(
@@ -454,25 +476,36 @@ async function provisionRoom(cfg: FleetConfig, input: {
   const attachOwner = rooms.defaults?.attach_owner !== false;
   if (attachOwner && !cfg.ownerInvite)
     throw new ConfigError('rooms.owner: public_invite or public_invite_file is required when attach_owner is enabled');
-
   const cowork = coworkFor(cfg);
   const goal = input.goal?.trim() || input.name;
-  const briefing = input.brief?.trim() || input.template?.contract?.trim() || goal;
-  const created = await cowork.createRoom({
+  const unlockSnapshot = input.template ? acquireLaunchSnapshotLock() : undefined;
+  let launchTemplate: TemplateSnapshot | undefined;
+  let record: RoomOrchestrationRecord;
+  try {
+    launchTemplate = input.template
+      ? sealTemplateSnapshot(input.template, cfg.agentTemplates ?? {}) : undefined;
+    const briefing = input.brief?.trim() || launchTemplate?.contract?.trim() || goal;
+    const created = await cowork.createRoom({
     room_name: input.name,
     goal,
     briefing,
-    quiet_membership: input.template?.room?.quiet_membership,
-    anonymous: input.template?.room?.anonymous,
+    quiet_membership: launchTemplate?.room?.quiet_membership,
+    anonymous: launchTemplate?.room?.anonymous,
   });
-  let record = createRoomRecord({
+    record = createRoomRecord({
     room_id: created.room_id,
     room_name: input.name,
     room_identity_cid: created.identity_cid,
     task_id: input.taskId,
-    template_snapshot: input.template,
+    template_snapshot: launchTemplate,
   });
-  input.onCreated?.(record);
+    input.onCreated?.(record);
+  } catch (error) {
+    unlockSnapshot?.();
+    if (launchTemplate?.launch_snapshot_hash) releaseLaunchSnapshot(launchTemplate.launch_snapshot_hash);
+    throw error;
+  }
+  unlockSnapshot?.();
   record = advanceSaga(record.room_id, 'create_room', 1);
 
   if (attachOwner) {
@@ -502,13 +535,13 @@ async function provisionRoom(cfg: FleetConfig, input: {
   }
   record = advanceSaga(record.room_id, 'create_members', 3);
 
-  if (input.template && input.template.members.length > 0) {
+  if (launchTemplate && launchTemplate.members.length > 0) {
     record = await provisionMembers({
       cfg,
       cowork,
       roomId: record.room_id,
       taskId: input.taskId,
-      template: input.template,
+      template: launchTemplate,
       binPath: getBinPath(),
       brief: input.brief,
       goal: input.goal,
@@ -559,7 +592,7 @@ export function registerTemplateCommands(parent: Command, cOpt: (cmd: Command) =
         console.log(`\nMembers:`);
         for (const m of t.members)
           console.log(`  ${m.slot}: ${m.count}× ${m.role} (`
-            + `${'ref' in m.agent ? `agent ref: ${m.agent.ref}` : 'inline Agent'})`);
+            + `agent template: ${m.agent_template})`);
         console.log(`\nContent hash: ${t.content_hash}`);
       } catch (e) { die(e); }
     });
@@ -597,19 +630,32 @@ export function registerTaskCommands(parent: Command, cOpt: (cmd: Command) => Co
     .option('--no-room', 'create task without a room')
     .option('--idempotency-key <key>', 'idempotency key')
     .option('--list <name>', 'task list (default: default)')
+    .option('--members-file <path>', 'typed YAML member overrides')
+    .option('--member <slot>', 'begin a typed member override block')
+    .option('--agent-template <id>', 'Agent Template for the current member block')
+    .option('--brain <id>', 'Brain preset for the current member block')
+    .option('--role <id>', 'Role preset for the current member block')
+    .option('--approval <mode>', 'approval for the current member block')
+    .option('--filesystem <mode>', 'filesystem for the current member block')
+    .option('--unattended <mode>', 'unattended policy for the current member block')
+    .option('--cwd <path>', 'working directory for the current member block')
+    .option('--model <id>', 'model for the current member block')
+    .option('--effort <level>', 'reasoning effort for the current member block')
     .option('--json', 'JSON output')
     .action(async (opts: {
       configuration?: string; title: string; template?: string;
       brief?: string; briefFile?: string; backlog?: boolean;
-      room?: boolean; idempotencyKey?: string; list?: string; json?: boolean;
-    }) => {
+      room?: boolean; idempotencyKey?: string; list?: string; json?: boolean; membersFile?: string;
+    }, command: Command) => {
       try {
+        const members = cliMemberOverrides(opts.membersFile, commandArgv(command));
         const record = await taskRoomService(opts.configuration).createTask({
           actor: { kind: 'local_control', surface: 'cli' }, title: opts.title,
           brief: opts.brief, briefFile: opts.briefFile, template: opts.template,
           backlog: opts.backlog, noRoom: opts.room === false,
           idempotencyKey: opts.idempotencyKey, origin: { type: 'cli' },
           list: opts.list,
+          members,
         });
         auditTask('create', record, 'none');
 
@@ -751,13 +797,26 @@ export function registerTaskCommands(parent: Command, cOpt: (cmd: Command) => Co
     });
 
   cOpt(taskCmd.command('start <id>'))
-    .description('start a backlog task')
+    .description('idempotently select a plan, provision, and start a task')
+    .option('--template <name>', 'room template')
+    .option('--members-file <path>', 'typed YAML member overrides')
+    .option('--member <slot>', 'begin a typed member override block')
+    .option('--agent-template <id>', 'Agent Template for current member')
+    .option('--brain <id>', 'Brain preset for current member')
+    .option('--role <id>', 'Role preset for current member')
+    .option('--approval <mode>', 'approval for current member')
+    .option('--filesystem <mode>', 'filesystem for current member')
+    .option('--unattended <mode>', 'unattended policy for current member')
+    .option('--cwd <path>', 'working directory for current member')
+    .option('--model <id>', 'model for current member')
+    .option('--effort <level>', 'reasoning effort for current member')
     .option('--json', 'JSON output')
-    .action(async (id: string, opts: { configuration?: string; json?: boolean }) => {
+    .action(async (id: string, opts: { configuration?: string; json?: boolean; template?: string; membersFile?: string }, command: Command) => {
       try {
         const previous = getTask(id).state;
         const t = await taskRoomService(opts.configuration).startTask({
           actor: { kind: 'local_control', surface: 'cli' }, taskId: id,
+          template: opts.template, members: cliMemberOverrides(opts.membersFile, commandArgv(command)),
         });
         auditTask('start', t, previous);
         if (opts.json) { console.log(JSON.stringify({ schema_version: 1, task: t }, null, 2)); return; }
@@ -1004,18 +1063,30 @@ export function registerTaskCommands(parent: Command, cOpt: (cmd: Command) => Co
     });
 
   cOpt(taskCmd.command('work <id>'))
-    .description('ensure a task has a room and agents running')
+    .description('deprecated alias for task start')
     .option('--template <name>', 'room template')
+    .option('--members-file <path>', 'typed YAML member overrides')
+    .option('--member <slot>', 'begin a typed member override block')
+    .option('--agent-template <id>', 'Agent Template for current member')
+    .option('--brain <id>', 'Brain preset for current member')
+    .option('--role <id>', 'Role preset for current member')
+    .option('--approval <mode>', 'approval for current member')
+    .option('--filesystem <mode>', 'filesystem for current member')
+    .option('--unattended <mode>', 'unattended policy for current member')
+    .option('--cwd <path>', 'working directory for current member')
+    .option('--model <id>', 'model for current member')
+    .option('--effort <level>', 'reasoning effort for current member')
     .option('--json', 'JSON output')
-    .action(async (id: string, opts: { configuration?: string; template?: string; json?: boolean }) => {
+    .action(async (id: string, opts: { configuration?: string; template?: string; json?: boolean; membersFile?: string }, command: Command) => {
       try {
         const previous = getTask(id).state;
-        const result = await taskRoomService(opts.configuration).ensureTaskWork({
+        console.error('warning: `fleet task work` is deprecated; use `fleet task start`');
+        const t = await taskRoomService(opts.configuration).startTask({
           actor: { kind: 'local_control', surface: 'cli' }, taskId: id, template: opts.template,
+          members: cliMemberOverrides(opts.membersFile, commandArgv(command)),
         });
-        const t = result.task;
         auditTask('work', t, previous);
-        if (result.status === 'already_active') {
+        if (previous === 'active' && t.room_id) {
           if (opts.json) {
             console.log(JSON.stringify({ schema_version: 1, task: t, status: 'already_active' }, null, 2));
             return;
@@ -1099,15 +1170,27 @@ export function registerRoomCommands(parent: Command, cOpt: (cmd: Command) => Co
     .option('--goal <text>', 'room goal')
     .option('--brief <text>', 'room briefing')
     .option('--brief-file <path>', 'room briefing from file')
+    .option('--members-file <path>', 'typed YAML member overrides')
+    .option('--member <slot>', 'begin a typed member override block')
+    .option('--agent-template <id>', 'Agent Template for current member')
+    .option('--brain <id>', 'Brain preset for current member')
+    .option('--role <id>', 'Role preset for current member')
+    .option('--approval <mode>', 'approval for current member')
+    .option('--filesystem <mode>', 'filesystem for current member')
+    .option('--unattended <mode>', 'unattended policy for current member')
+    .option('--cwd <path>', 'working directory for current member')
+    .option('--model <id>', 'model for current member')
+    .option('--effort <level>', 'reasoning effort for current member')
     .option('--json', 'JSON output')
     .action(async (opts: {
       configuration?: string; name: string; template?: string;
-      goal?: string; brief?: string; briefFile?: string; json?: boolean;
-    }) => {
+      goal?: string; brief?: string; briefFile?: string; json?: boolean; membersFile?: string;
+    }, command: Command) => {
       try {
         const record = await taskRoomService(opts.configuration).createRoom({
           actor: { kind: 'local_control', surface: 'cli' }, name: opts.name,
           template: opts.template, goal: opts.goal, brief: opts.brief, briefFile: opts.briefFile,
+          members: cliMemberOverrides(opts.membersFile, commandArgv(command)),
         });
         auditRoom('create', record, 'none');
 

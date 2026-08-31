@@ -1,7 +1,12 @@
 import { useMemo, useState } from 'react';
 import { api } from './api';
 
-type Model = { manifest: Record<string, any>; agents: Record<string, any> };
+export type FleetSetupModel = {
+  manifest: Record<string, any>;
+  agents: Record<string, any>;
+  agent_templates: Record<string, any>;
+};
+type Model = FleetSetupModel;
 export type ConfigRead = {
   path: string; exists: boolean; firstRun: boolean; revision: string; model: Model; redactions: string[];
 };
@@ -15,11 +20,35 @@ const entries = (value: unknown) => Object.entries((value && typeof value === 'o
 
 export function agentEditorState(agent: Record<string, any>) {
   return {
+    templateRef: typeof agent.template === 'string' ? agent.template : undefined,
+    directEditors: typeof agent.template !== 'string',
     roleRef: typeof agent.role?.ref === 'string' ? agent.role.ref : undefined,
     brainRef: typeof agent.brain?.ref === 'string' ? agent.brain.ref : undefined,
     roleInline: agent.role?.inline as Record<string, any> | undefined,
     brainInline: agent.brain?.inline as Record<string, any> | undefined,
   };
+}
+
+export const fleetSetupSections = (model: FleetSetupModel) => ({
+  persistentAgents: Object.keys(model.agents).sort(),
+  inertAgentTemplates: Object.keys(model.agent_templates).sort(),
+});
+
+export function addAgentTemplate(model: FleetSetupModel): string {
+  let n = 1; while (model.agent_templates[`Template${n}`]) n++;
+  const id = `Template${n}`;
+  model.agent_templates[id] = { role: { inline: {} }, brain: { inline: { harness: 'claude-code' } } };
+  return id;
+}
+
+export function renameAgentTemplate(model: FleetSetupModel, from: string, to: string): boolean {
+  if (!to || from === to || model.agent_templates[to] || !model.agent_templates[from]) return false;
+  model.agent_templates[to] = model.agent_templates[from]; delete model.agent_templates[from]; return true;
+}
+
+export function removeAgentTemplate(model: FleetSetupModel, id: string): boolean {
+  if (!model.agent_templates[id]) return false;
+  delete model.agent_templates[id]; return true;
 }
 
 /** Ref-backed presets are immutable in this editor; conversion must be explicit elsewhere. */
@@ -40,6 +69,7 @@ export function FleetSetup({ initial, onSaved }: { initial: ConfigRead; onSaved(
   const [busy, setBusy] = useState(false);
   const [advanced, setAdvanced] = useState(false);
   const roles = useMemo(() => entries(model.agents), [model]);
+  const templates = useMemo(() => entries(model.agent_templates), [model]);
   const update = (fn: (draft: Model) => void) => setModel(value => {
     const draft = structuredClone(value); fn(draft); return draft;
   });
@@ -67,7 +97,7 @@ export function FleetSetup({ initial, onSaved }: { initial: ConfigRead; onSaved(
       <div className="setup-safety"><strong>No implicit restart</strong><span>Save creates a recovery backup. Secret environment values remain hidden.</span></div>
     </div>
     <ol className="setup-steps" aria-label="Setup progress">
-      {['Defaults', 'Agents', 'Automation', 'Review'].map((name, index) =>
+      {['Defaults', 'Agents & templates', 'Automation', 'Review'].map((name, index) =>
         <li key={name} className={step === index ? 'active' : step > index ? 'done' : ''}>{index + 1}<span>{name}</span></li>)}
     </ol>
     <div className="mode-switch" role="group" aria-label="Configuration detail level">
@@ -78,7 +108,7 @@ export function FleetSetup({ initial, onSaved }: { initial: ConfigRead; onSaved(
     {error && <div className="banner error">{error}</div>}
     <div className="panel setup-panel">
       {step === 0 && <Defaults model={model} advanced={advanced} update={update} />}
-      {step === 1 && <Agents roles={roles} advanced={advanced} update={update} />}
+      {step === 1 && <Agents roles={roles} templates={templates} advanced={advanced} update={update} />}
       {step === 2 && <Automation model={model} roles={roles.map(([name]) => name)} advanced={advanced} update={update} />}
       {step === 3 && preview && <Review preview={preview} />}
       <div className="setup-actions">
@@ -103,23 +133,42 @@ function Defaults({ model, advanced, update }: { model: Model; advanced: boolean
     </div></>;
 }
 
-function Agents({ roles, advanced, update }: { roles: Array<[string, any]>; advanced: boolean; update(fn: (draft: Model) => void): void }) {
+function Agents({ roles, templates, advanced, update }: {
+  roles: Array<[string, any]>; templates: Array<[string, any]>;
+  advanced: boolean; update(fn: (draft: Model) => void): void;
+}) {
   const add = () => update(draft => { let n = 1; while (draft.agents[`Agent${n}`]) n++; draft.agents[`Agent${n}`] = { role: { inline: {} }, brain: { inline: { harness: 'claude-code' } } }; });
+  const addTemplate = () => update(draft => { addAgentTemplate(draft); });
   return <><div className="section-title"><div><h3>2. Name the agents and give each a job</h3><p className="muted">Example: Researcher — “Find primary sources and summarize evidence.” Saving adds configuration; it does not restart running agents.</p></div><button className="secondary" onClick={add}>＋ Add agent</button></div>
     <div className="entity-list">{roles.map(([name, role]) => {
       const editor = agentEditorState(role);
       return <div className="entity-card" key={name}>
       <div className="form-grid three">
         <label>Name<input value={name} onChange={event => update(draft => { const next = event.target.value; if (!next || next === name) return; draft.agents[next] = draft.agents[name]; delete draft.agents[name]; })} /></label>
-        {advanced && <label>Coordinator<input value={role.coordinator ?? ''} onChange={event => update(draft => { draft.agents[name].coordinator = event.target.value || undefined; })} /></label>}
-        {advanced && (editor.brainRef
+        {role.template
+          ? <label>Agent Template<input value={role.template} disabled readOnly /></label>
+          : advanced && <label>Coordinator<input value={role.coordinator ?? ''} onChange={event => update(draft => { draft.agents[name].coordinator = event.target.value || undefined; })} /></label>}
+        {!role.template && advanced && (editor.brainRef
           ? <label>Brain preset<input value={editor.brainRef} disabled readOnly /></label>
           : <label>Harness<select value={editor.brainInline?.harness ?? 'claude-code'} onChange={event => update(draft => { editInlineAgentField(draft.agents[name], 'brain', 'harness', event.target.value); })}><option value="claude-code">Claude Code</option><option value="codex">Codex</option></select></label>)}
-        {advanced && <label>Model override<input value={editor.brainRef ? `Preset: ${editor.brainRef}` : editor.brainInline?.model ?? ''} disabled={Boolean(editor.brainRef)} readOnly={Boolean(editor.brainRef)} placeholder="Harness default" onChange={event => update(draft => { editInlineAgentField(draft.agents[name], 'brain', 'model', event.target.value); })} /></label>}
-        <label className="wide">Mission<textarea value={editor.roleRef ? `Preset: ${editor.roleRef}` : editor.roleInline?.mission ?? ''} disabled={Boolean(editor.roleRef)} readOnly={Boolean(editor.roleRef)} onChange={event => update(draft => { editInlineAgentField(draft.agents[name], 'role', 'mission', event.target.value); })} /></label>
-        {advanced && <label>Oversee agents<input value={(role.oversee ?? []).map((item: any) => item.agent).join(', ')} placeholder="Researcher, Reviewer" onChange={event => update(draft => { draft.agents[name].oversee = event.target.value.split(',').map((value: string) => value.trim()).filter(Boolean).map((target: string) => ({ agent: target, interval: '5m' })); })} /></label>}
+        {!role.template && advanced && <label>Model override<input value={editor.brainRef ? `Preset: ${editor.brainRef}` : editor.brainInline?.model ?? ''} disabled={Boolean(editor.brainRef)} readOnly={Boolean(editor.brainRef)} placeholder="Harness default" onChange={event => update(draft => { editInlineAgentField(draft.agents[name], 'brain', 'model', event.target.value); })} /></label>}
+        {!role.template && <label className="wide">Mission<textarea value={editor.roleRef ? `Preset: ${editor.roleRef}` : editor.roleInline?.mission ?? ''} disabled={Boolean(editor.roleRef)} readOnly={Boolean(editor.roleRef)} onChange={event => update(draft => { editInlineAgentField(draft.agents[name], 'role', 'mission', event.target.value); })} /></label>}
+        {!role.template && advanced && <label>Oversee agents<input value={(role.oversee ?? []).map((item: any) => item.agent).join(', ')} placeholder="Researcher, Reviewer" onChange={event => update(draft => { draft.agents[name].oversee = event.target.value.split(',').map((value: string) => value.trim()).filter(Boolean).map((target: string) => ({ agent: target, interval: '5m' })); })} /></label>}
       </div><button className="text-button danger" onClick={() => update(draft => { delete draft.agents[name]; })}>Remove</button>
-    </div>;})}</div>{!roles.length && <div className="empty compact">Add at least one agent to start a fleet.</div>}</>;
+    </div>;})}</div>{!roles.length && <div className="empty compact">Add at least one persistent Agent to run a fleet.</div>}
+    <div className="section-title"><div><h3>Reusable Agent Templates</h3><p className="muted">Templates are inert launch definitions for room workers or persistent Agents. They never create an identity, session, supervisor, or lifecycle row.</p></div><button className="secondary" onClick={addTemplate}>＋ Add template</button></div>
+    <div className="entity-list">{templates.map(([name, template]) => {
+      const editor = agentEditorState(template);
+      return <div className="entity-card" key={`template-${name}`}><span className="eyebrow">inert Agent Template</span>
+        <div className="form-grid three">
+          <label>Name<input value={name} onChange={event => update(draft => { renameAgentTemplate(draft, name, event.target.value); })} /></label>
+          {advanced && (editor.brainRef
+            ? <label>Brain preset<input value={editor.brainRef} disabled readOnly /></label>
+            : <label>Harness<select value={editor.brainInline?.harness ?? 'claude-code'} onChange={event => update(draft => { editInlineAgentField(draft.agent_templates[name], 'brain', 'harness', event.target.value); })}><option value="claude-code">Claude Code</option><option value="codex">Codex</option></select></label>)}
+          <label className="wide">Mission<textarea value={editor.roleRef ? `Preset: ${editor.roleRef}` : editor.roleInline?.mission ?? ''} disabled={Boolean(editor.roleRef)} readOnly={Boolean(editor.roleRef)} onChange={event => update(draft => { editInlineAgentField(draft.agent_templates[name], 'role', 'mission', event.target.value); })} /></label>
+        </div><button className="text-button danger" onClick={() => update(draft => { removeAgentTemplate(draft, name); })}>Remove template</button>
+      </div>;
+    })}</div>{!templates.length && <div className="empty compact">No reusable templates configured.</div>}</>;
 }
 
 function Automation({ model, roles, advanced, update }: { model: Model; roles: string[]; advanced: boolean; update(fn: (draft: Model) => void): void }) {

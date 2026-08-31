@@ -59,6 +59,18 @@ async function recoveryStatus(body: object) {
 }
 
 describe('authoritative session liveness precedence', () => {
+  it('bare query list projects only configured permanent Agents', async () => {
+    const permanent = role();
+    const temporary = { ...role(), id: 'RoomWorker', configured: false,
+      lifetime: 'temporary' as const, stateRef: { lifetime: 'temporary' as const } };
+    const orphan = { ...role(), id: 'OldState', configured: false, lifetime: 'orphan' as const };
+    const query = new FleetQueryService({
+      repository: { list: async () => [permanent, temporary, orphan], stateDir: () => undefined } as never,
+      supervisor,
+    });
+    const listed = await query.list();
+    expect(listed.map(item => item.role.id)).toEqual(['DetachedAcp']);
+  });
   it('surfaces only redacted daemon recovery diagnostics', async () => {
     const result = await recoveryStatus({
       version: 1, identity: 'DetachedAcp', epoch: 'abc123', state: 'degraded', updatedAt: 'now',
