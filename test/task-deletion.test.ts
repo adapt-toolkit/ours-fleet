@@ -10,6 +10,7 @@ import {
   beginTaskTerminalIntent, finishTaskTerminalIntent,
   beginTaskDeletionIntent, setTaskDeletionError, advanceTaskDeletionMember,
   unlinkDeletedTask, updateTaskRoom, updateTaskMembers, moveTaskToList,
+  updateTaskTemplate, updateTaskExecutionPlan,
   tasksDir, TaskStateError,
 } from '../src/rooms-tasks/task-state.js';
 import { acceptTaskDeletion, recordTaskDeletionError } from '../src/rooms-tasks/deletion.js';
@@ -171,6 +172,13 @@ describe('deletion guards', () => {
     expect(() => failTask(t.task_id, 'x')).toThrow(pendingDeletion);
     expect(() => updateTaskRoom(t.task_id, 'r', 'f'.repeat(64))).toThrow(pendingDeletion);
     expect(() => updateTaskMembers(t.task_id, [])).toThrow(pendingDeletion);
+    expect(() => updateTaskTemplate(t.task_id, { name: 'team', version: 1, content_hash: 'h' }))
+      .toThrow(pendingDeletion);
+    expect(() => updateTaskExecutionPlan(t.task_id, {
+      schema_version: 1,
+      snapshot: { name: 'team', version: 1, description: '', members: [], content_hash: 'h' },
+      overrides: {}, overrides_hash: 'oh', plan_hash: 'ph',
+    })).toThrow(pendingDeletion);
     expect(() => moveTaskToList(t.task_id, 'other')).toThrow(pendingDeletion);
     expect(() => beginTaskTerminalIntent(t.task_id, { kind: 'cancelled' })).toThrow(pendingDeletion);
   });
