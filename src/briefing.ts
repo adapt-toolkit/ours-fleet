@@ -191,12 +191,16 @@ export function generateBriefing(role: ResolvedRole, v: BriefingVocab, opts: Bri
   if (role.session === 'acp') {
     L.push('', '### Managed fleet commands');
     L.push('This ACP role has a supervisor-scoped ours-fleet proxy. Use the ordinary');
-    L.push('`ours-fleet spawn` command; the CLI routes it through your live supervisor, which');
-    L.push('records you as the caller and reports successful creation to your owner channel.');
+    L.push('`ours-fleet` command; the CLI opens an authenticated audit attempt with your live');
+    L.push('supervisor before parsing or side effects. Your existing OS sandbox remains the executor.');
+    L.push('Every allowed attempt writes a redacted raw invocation and correlated outcome to your');
+    L.push('Owner-visible channel; denied, invalid, failed, and read-only attempts are visible too.');
     L.push('A minimal call is `ours-fleet spawn DeveloperName --temp`.');
     L.push('For omitted settings, the supervisor inherits your canonical Brain and Role selections,');
     L.push('working directory, neutral permissions, coordinator, and fleet monitor policy. Every');
     L.push('explicit option wins; identity/session-local and secret material never inherit.');
+    L.push('Operator lifecycle/control and hidden worker commands are denied through this route.');
+    L.push('Invocation delivery failure denies execution; outcome uncertainty is reported without retrying effects.');
     L.push('This proxy is attribution and convenience, not a security boundary for unisolated roles.');
   }
   if (role.coordinator) {

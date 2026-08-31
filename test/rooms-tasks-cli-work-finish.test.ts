@@ -81,7 +81,8 @@ vi.mock('../src/rooms-tasks/markdown.js', async (importOriginal) => {
 
 import { registerRoomCommands, registerTaskCommands } from '../src/rooms-tasks/cli.js';
 import {
-  createTask, getTask, activateTask, reviewTask, completeTask, cancelTask, updateTaskRoom,
+  createTask, getTask, startTask, activateTask, reviewTask, completeTask, cancelTask, updateTaskRoom,
+  updateTaskMembers,
 } from '../src/rooms-tasks/task-state.js';
 import {
   createRoomRecord, activateRoom, getRoomRecord, advanceSaga, updateMemberSeats,
@@ -91,6 +92,7 @@ import { CoworkUnavailableError } from '../src/rooms-tasks/cowork-adapter.js';
 import { TaskRoomApplicationService } from '../src/application/task-room-service.js';
 import { acceptTaskTerminalIntent } from '../src/rooms-tasks/terminal.js';
 import { writeV2Fixture } from './v2-fixture.js';
+import { beginFleetAuditCollection, consumeFleetAuditCollection } from '../src/fleet-command-audit.js';
 
 const ROOM_ID = '01hzyk8m0000000000000000aa';
 
@@ -206,7 +208,17 @@ beforeEach(() => {
   mocks.markdownRender.mockReset();
   // The real provisionMembers ends by activating the room and the task; the
   // fake preserves exactly that contract so the CLI's state flow is exercised.
-  mocks.provisionMembers.mockReset().mockImplementation(async ({ roomId, taskId }: { roomId: string; taskId?: string }) => {
+  mocks.provisionMembers.mockReset().mockImplementation(async ({ roomId, taskId, template }:
+    { roomId: string; taskId?: string; template?: { name?: string } }) => {
+    if (template?.name === 'durable') {
+      const member = { name: 'dev-1', identity_cid: 'd'.repeat(64), slot: 'dev', cowork_role: 'Developer' };
+      updateMemberSeats(roomId, [{ role_name: member.name, identity_cid: member.identity_cid,
+        slot: member.slot, cowork_role: member.cowork_role, seat_state: 'active', launch: {
+          state: 'launched', attempt: 1, action_id: 'action-1', updated_at: '2026-08-30T00:00:00.000Z',
+          agent_definition: { brain: { ref: 'codex' }, role: { ref: 'Developer' } },
+        } }]);
+      if (taskId) updateTaskMembers(taskId, [member]);
+    }
     const record = activateRoom(roomId);
     if (taskId) activateTask(taskId);
     return record;
@@ -306,6 +318,81 @@ describe('public task/room failure presentation', () => {
       expectMarkdownFailure(out.join('\n'));
       expect(out.join('\n')).toContain('Run ours-fleet room list');
     }
+  });
+});
+
+describe('canonical proxied Task/Room audit metadata', () => {
+  it.each([false, true])('captures real task create/start transitions (json=%s)', async json => {
+    writeCustomTemplate();
+    beginFleetAuditCollection();
+    await run('create', '--title', 'Audited task', '--backlog', '--template', 'durable',
+      ...(json ? ['--json'] : []));
+    const created = consumeFleetAuditCollection();
+    expect(created.presentation).toMatchObject({ kind: 'task', operation: 'create',
+      title: 'Audited task', previousState: 'none', newState: 'backlog', agents: [] });
+    const id = (created.presentation as { id: string }).id;
+
+    out = [];
+    beginFleetAuditCollection();
+    await run('start', id, ...(json ? ['--json'] : []));
+    expect(consumeFleetAuditCollection()).toMatchObject({
+      resourceIds: { task: id, room: ROOM_ID },
+      presentation: { kind: 'task', operation: 'start', id, title: 'Audited task',
+        previousState: 'backlog', newState: 'active', template: 'durable@7', roomId: ROOM_ID,
+        agents: [{ name: expect.any(String), brain: expect.any(String), role: expect.any(String) }] },
+    });
+  });
+
+  it.each([false, true])('captures cancellation and truthful task deletion (json=%s)', async json => {
+    const cancellable = backlogTask();
+    beginFleetAuditCollection();
+    await runLocalTask('cancel', cancellable.task_id, cancellable.task_id, ...(json ? ['--json'] : []));
+    expect(consumeFleetAuditCollection().presentation).toMatchObject({ kind: 'task',
+      operation: 'cancel', id: cancellable.task_id, previousState: 'backlog', newState: 'cancelled' });
+
+    const done = backlogTask();
+    startTask(done.task_id); activateTask(done.task_id); reviewTask(done.task_id); completeTask(done.task_id);
+    beginFleetAuditCollection();
+    await runLocalTask('delete', done.task_id, done.task_id, ...(json ? ['--json'] : []));
+    expect(consumeFleetAuditCollection().presentation).toMatchObject({ kind: 'task',
+      operation: 'delete', id: done.task_id, previousState: 'done', newState: 'deleted' });
+  });
+
+  it.each([false, true])('captures room create/recover/delete metadata (json=%s)', async json => {
+    writeCustomTemplate();
+    beginFleetAuditCollection();
+    await runRoom('create', '--name', 'Audited room', '--template', 'durable', ...(json ? ['--json'] : []));
+    expect(consumeFleetAuditCollection()).toMatchObject({
+      resourceIds: { room: ROOM_ID },
+      presentation: { kind: 'room', operation: 'create', id: ROOM_ID,
+        previousState: 'none', newState: 'active', template: 'durable@7',
+        participants: [{ name: expect.any(String), role: expect.any(String) }] },
+    });
+
+    out = [];
+    beginFleetAuditCollection();
+    await runRoom('recover', ROOM_ID, ...(json ? ['--json'] : []));
+    expect(consumeFleetAuditCollection().presentation).toMatchObject({ kind: 'room',
+      operation: 'recover', id: ROOM_ID, previousState: 'active', newState: 'active',
+      template: 'durable@7', participants: [{ name: expect.any(String), role: expect.any(String) }] });
+
+    out = [];
+    beginFleetAuditCollection();
+    await runRoom('delete', ROOM_ID, ROOM_ID, ...(json ? ['--json'] : []));
+    expect(consumeFleetAuditCollection().presentation).toMatchObject({ kind: 'room',
+      operation: 'delete', id: ROOM_ID, previousState: 'active', newState: 'deleted',
+      template: 'durable@7', participants: [{ name: expect.any(String), role: expect.any(String) }] });
+  });
+
+  it('classifies proxied JSON validation separately from unexpected runtime failure', async () => {
+    beginFleetAuditCollection();
+    await expect(runLocalTask('show', 'definitely-missing', '--json')).rejects.toThrow(ExitError);
+    expect(consumeFleetAuditCollection().failure).toEqual({ class: 'validation', effect: 'not_started' });
+
+    mocks.getRoom.mockRejectedValueOnce(new Error('backend exploded'));
+    beginFleetAuditCollection();
+    await expect(runRoom('show', ROOM_ID, '--json')).rejects.toThrow(ExitError);
+    expect(consumeFleetAuditCollection().failure).toEqual({ class: 'runtime', effect: 'unknown' });
   });
 });
 

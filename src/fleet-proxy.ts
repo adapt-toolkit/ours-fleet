@@ -20,6 +20,8 @@ export interface ManagedFleetSpawnResult {
   permissionMode?: { fleetMode: 'ask' | 'auto' | 'allow'; nativeMode: string };
   inherited: string[];
   creationActionId: string;
+  brainSummary: string;
+  roleSummary: string;
 }
 
 /**

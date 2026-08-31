@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 import { spawn as spawnChild } from 'node:child_process';
+import { randomUUID } from 'node:crypto';
 import { existsSync, mkdirSync, readFileSync, readdirSync, statSync } from 'node:fs';
 import { realpathSync } from 'node:fs';
 import { join as joinPath, resolve as resolvePath } from 'node:path';
@@ -55,6 +56,11 @@ import { WebAccessStore, passwordAccess, validatePublicOrigin } from './web/acce
 import {
   FLEET_PROXY_CALLER_ENV, FLEET_PROXY_STATE_DIR_ENV, type ManagedFleetSpawnResult,
 } from './fleet-proxy.js';
+import {
+  beginFleetAuditCollection, consumeFleetAuditCollection, FleetCliExit,
+  recordFleetAuditPresentation, recordFleetAuditResource,
+  type FleetAuditAttempt, type FleetCommandOutcomeClass,
+} from './fleet-command-audit.js';
 import './harness/claude-code.js';   // registers the claude-code adapter
 import './harness/codex.js';         // registers the codex adapter
 import { registerTemplateCommands, registerTaskCommands, registerRoomCommands } from './rooms-tasks/cli.js';
@@ -86,7 +92,9 @@ const roleLifecycle = (configPath: string | undefined, operationDeps: OpsDeps) =
     status: async roleId => (await query.detail(roleId)).status });
 };
 
-const die = (e: unknown): never => { console.error(String(e instanceof Error ? e.message : e)); process.exit(1); };
+const die = (e: unknown): never => {
+  console.error(String(e instanceof Error ? e.message : e)); throw new FleetCliExit(1);
+};
 
 /** Exec a child with our stdio (logs/attach). */
 const passthrough = (cmd: string, args: string[]) =>
@@ -99,6 +107,7 @@ const program = new Command()
   .name('ours-fleet')
   .description('Fleet of persistent, identity-bound AI agents — canonical Brain + Role definitions over ACP sessions.')
   .enablePositionalOptions()
+  .exitOverride()
   .version(VERSION);
 
 const cOpt = (cmd: Command) => cmd.option('-c, --configuration <file>', 'manifest (default: ~/fleet.yaml; documents under ~/fleet/)');
@@ -1095,6 +1104,13 @@ cOpt(program.command('spawn [name]').description('spawn a new agent (permanent b
         if (!response.ok)
           throw new SessionControlError(response.kind ?? 'backend', response.error ?? 'managed spawn failed');
         const result = response.result as ManagedFleetSpawnResult;
+        recordFleetAuditResource('agent', result.role);
+        recordFleetAuditPresentation({ kind: 'agent_started', name: result.role,
+          lifetime: result.lifetime, brain: result.brainSummary, role: result.roleSummary,
+          harness: result.harness, session: result.session, model: result.model,
+          permissions: result.permissionMode
+            ? `${result.permissionMode.fleetMode}/${result.permissionMode.nativeMode}` : undefined,
+          parent: result.caller, actionId: result.creationActionId, inherited: result.inherited });
         const expectedCaller = process.env[FLEET_PROXY_CALLER_ENV];
         if (expectedCaller && result.caller !== expectedCaller)
           throw new Error(`fleet proxy caller mismatch: expected '${expectedCaller}', got '${result.caller}'`);
@@ -1146,7 +1162,7 @@ cOpt(program.command('doctor').description('prerequisite report'))
       yamlMode: opts.yamlMode as YamlMode,
     });
     for (const c of rep.checks) console.log(`${c.ok ? 'ok  ' : 'MISS'} ${c.name.padEnd(22)} ${c.detail}`);
-    process.exit(rep.ok ? 0 : 1);
+    if (!rep.ok) throw new FleetCliExit(1);
   });
 
 program.command('init').description('one-time host setup (units, dirs, linger)')
@@ -1356,11 +1372,70 @@ cOpt(program.command('_run-watchdogs', { hidden: true }))
     } catch (e) { die(e); }
   });
 
-const spawnIndex = process.argv.indexOf('spawn');
-if (spawnIndex >= 0 && process.argv.slice(spawnIndex + 1).some(arg =>
-  arg === '--harness' || arg.startsWith('--harness=') || arg === '--model' || arg.startsWith('--model='))) {
-  console.error('error: --harness and --model were removed; select a Brain with --brain');
-  process.exitCode = 1;
-} else {
-  program.parseAsync(process.argv);
+async function parseFleetCli(): Promise<void> {
+  const spawnIndex = process.argv.indexOf('spawn');
+  if (spawnIndex >= 0 && process.argv.slice(spawnIndex + 1).some(arg =>
+    arg === '--harness' || arg.startsWith('--harness=') || arg === '--model' || arg.startsWith('--model='))) {
+    console.error('error: --harness and --model were removed; select a Brain with --brain');
+    throw new FleetCliExit(1);
+  }
+  try { await program.parseAsync(process.argv); }
+  catch (error) {
+    const commander = error as { code?: string; exitCode?: number };
+    if (commander.exitCode === 0) return;
+    if (typeof commander.exitCode === 'number') throw new FleetCliExit(
+      commander.exitCode, 'validation', 'not_started');
+    throw error;
+  }
 }
+
+async function runFleetCli(): Promise<void> {
+  const stateDir = process.env[FLEET_PROXY_STATE_DIR_ENV];
+  const caller = process.env[FLEET_PROXY_CALLER_ENV];
+  if (!stateDir || !caller) { await parseFleetCli(); return; }
+  const requestId = randomUUID();
+  let attempt: FleetAuditAttempt;
+  const begun = await controlRequest(stateDir, {
+    command: 'fleet_audit_begin', audit: { requestId, argv: process.argv.slice(2) },
+  });
+  if (!begun.ok) throw new SessionControlError(begun.kind ?? 'rejected', begun.error ?? 'fleet command audit refused');
+  attempt = begun.result as FleetAuditAttempt;
+  if (attempt.caller !== caller)
+    throw new SessionControlError('rejected', `fleet audit caller mismatch: expected '${caller}', got '${attempt.caller}'`);
+  let exitCode = 0;
+  let outcomeClass: FleetCommandOutcomeClass = 'success';
+  let effect: 'not_started' | 'completed' | 'unknown' = 'completed';
+  beginFleetAuditCollection();
+  if (attempt.classification.decision !== 'allow') {
+    exitCode = 1; outcomeClass = 'denied'; effect = 'not_started';
+    console.error(`fleet supervisor proxy ${attempt.classification.decision}: ${attempt.classification.command}`);
+  } else {
+    const originalExit = process.exit;
+    process.exit = ((code?: number) => { throw new FleetCliExit(code ?? 0); }) as never;
+    try { await parseFleetCli(); }
+    catch (error) {
+      exitCode = error instanceof FleetCliExit ? error.exitCode : 1;
+      outcomeClass = error instanceof FleetCliExit ? error.outcomeClass : 'runtime';
+      effect = error instanceof FleetCliExit ? error.effect : 'unknown';
+      if (!(error instanceof FleetCliExit)) console.error(error instanceof Error ? error.message : String(error));
+    } finally { process.exit = originalExit; }
+  }
+  const metadata = consumeFleetAuditCollection();
+  if (metadata.failure) {
+    outcomeClass = metadata.failure.class; effect = metadata.failure.effect;
+  }
+  const finished = await controlRequest(stateDir, { command: 'fleet_audit_finish', audit: {
+    correlationId: attempt.correlationId, class: outcomeClass, exitCode, effect,
+    ...(metadata.resourceIds ? { resourceIds: metadata.resourceIds } : {}),
+    ...(metadata.presentation ? { presentation: metadata.presentation } : {}),
+  } });
+  if (!finished.ok)
+    throw new SessionControlError(finished.kind ?? 'backend', finished.error ?? `audit delivery failed after execution; effect status=${effect}`);
+  process.exitCode = exitCode;
+}
+
+void runFleetCli().catch(error => {
+  if (!(error instanceof FleetCliExit))
+    console.error(error instanceof Error ? error.message : String(error));
+  process.exitCode = error instanceof FleetCliExit ? error.exitCode : 1;
+});
