@@ -11,7 +11,6 @@ import {
   ROOMS_DEFAULTS_KEYS as RDK, TASKS_KEYS as TK, TEMPLATE_KEYS as TPK,
   TEMPLATE_MEMBER_KEYS as TMK,
 } from './types.js';
-import { BUILTIN_TEMPLATES } from './templates.js';
 import { isSensitiveConfigKey } from '../sensitive-config.js';
 
 const isPlainObject = (v: unknown): v is Record<string, unknown> =>
@@ -164,13 +163,6 @@ export function validateRoomTemplatesConfig(
     if (!isPlainObject(tplRaw))
       throw new RoomsTasksConfigError(path, `room_templates.${name}: must be a mapping`);
     rejectUnknown(tplRaw, [...TPK, 'name'] as string[], path, `room_templates.${name}`);
-
-    const isBuiltinOverride = BUILTIN_TEMPLATES.some(b => b.name === name);
-    if (isBuiltinOverride && !tplRaw.override_builtin)
-      throw new RoomsTasksConfigError(
-        path,
-        `room_templates.${name}: overrides built-in template; set override_builtin: true and bump version`,
-      );
 
     const version = tplRaw.version as number | undefined;
     if (version === undefined || !Number.isInteger(version) || version < 1)

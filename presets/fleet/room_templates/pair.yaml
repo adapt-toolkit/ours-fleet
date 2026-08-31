@@ -1,0 +1,11 @@
+version: 1
+description: "Deliberation pair: Secretary writes code, Critic reviews — every decision deliberated together"
+room: { quiet_membership: false, anonymous: false }
+contract: |
+  Secretary and Critic deliberate every decision together before acting.
+  Secretary writes code; Critic reviews and challenges.
+  No material change lands without both agreeing.
+  Completion requires joint sign-off.
+members:
+  - { slot: secretary, role: Secretary, count: 1, agent: { ref: Secretary } }
+  - { slot: critic, role: Critic, count: 1, agent: { ref: Critic } }

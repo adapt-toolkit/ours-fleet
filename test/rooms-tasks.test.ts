@@ -5,7 +5,6 @@ import { join } from 'node:path';
 
 import {
   resolveTemplate, listTemplates, hashTemplate, snapshotTemplate,
-  BUILTIN_TEMPLATES,
 } from '../src/rooms-tasks/templates.js';
 import {
   createTask, getTask, listTasks, findByIdempotencyKey,
@@ -43,39 +42,45 @@ afterEach(() => {
 
 // ── Templates ──────────────────────────────────────────────────────────────
 
+const TEST_TEMPLATE: TemplateDefinition = {
+  name: 'team', version: 1, description: 'test team', sourceFile: '/config/team.yaml',
+  members: [{ slot: 'dev', role: 'Developer', count: 1, agent: { ref: 'Developer' } }],
+};
+const TEST_TEMPLATES = { team: TEST_TEMPLATE };
+
 describe('templates', () => {
   describe('resolveTemplate', () => {
-    it('resolves built-in by name', () => {
-      const t = resolveTemplate('team', {});
+    it('resolves configured template by name', () => {
+      const t = resolveTemplate('team', TEST_TEMPLATES);
       expect(t).toBeDefined();
       expect(t!.name).toBe('team');
-      expect(t!.builtin).toBe(true);
+      expect(t!.sourceFile).toBe('/config/team.yaml');
     });
 
-    it('resolves built-in by name@version', () => {
-      const t = resolveTemplate('team@1', {});
+    it('resolves configured template by name@version', () => {
+      const t = resolveTemplate('team@1', TEST_TEMPLATES);
       expect(t).toBeDefined();
       expect(t!.version).toBe(1);
     });
 
     it('returns undefined for wrong version', () => {
-      expect(resolveTemplate('team@99', {})).toBeUndefined();
+      expect(resolveTemplate('team@99', TEST_TEMPLATES)).toBeUndefined();
     });
 
-    it('resolves the single builtin as a solo-agent template', () => {
-      const t = resolveTemplate('single', {});
+    it('resolves a solo-agent template', () => {
+      const single = { ...TEST_TEMPLATE, name: 'single', members: [{ slot: 'agent', role: 'Agent', count: 1, agent: { ref: 'Agent' } }] };
+      const t = resolveTemplate('single', { single });
       expect(t).toBeDefined();
-      expect(t!.builtin).toBe(true);
       expect(t!.members).toHaveLength(1);
       expect(t!.members[0].count).toBe(1);
-      expect(resolveTemplate('single@1', {})).toBeDefined();
+      expect(resolveTemplate('single@1', { single })).toBeDefined();
     });
 
     it('returns undefined for unknown name', () => {
       expect(resolveTemplate('nonexistent', {})).toBeUndefined();
     });
 
-    it('custom overrides built-in', () => {
+    it('uses the supplied configured definition', () => {
       const custom: Record<string, TemplateDefinition> = {
         'team': {
           name: 'team', version: 2, description: 'custom dev',
@@ -100,15 +105,12 @@ describe('templates', () => {
   });
 
   describe('listTemplates', () => {
-    it('returns built-ins when no custom templates', () => {
+    it('returns no hidden templates when none are configured', () => {
       const list = listTemplates({});
-      expect(list.length).toBe(BUILTIN_TEMPLATES.length);
-      expect(list.map(t => t.name)).toContain('team');
-      expect(list.map(t => t.name)).toContain('pair');
-      expect(list.map(t => t.name)).toContain('single');
+      expect(list).toEqual([]);
     });
 
-    it('merges custom with built-ins, sorted', () => {
+    it('lists configured templates sorted', () => {
       const custom: Record<string, TemplateDefinition> = {
         'aaa-first': {
           name: 'aaa-first', version: 1, description: 'first alphabetically',
@@ -117,10 +119,10 @@ describe('templates', () => {
       };
       const list = listTemplates(custom);
       expect(list[0].name).toBe('aaa-first');
-      expect(list.length).toBe(BUILTIN_TEMPLATES.length + 1);
+      expect(list.length).toBe(1);
     });
 
-    it('custom with same name as builtin replaces it', () => {
+    it('returns one configured definition per name', () => {
       const custom: Record<string, TemplateDefinition> = {
         'team': {
           name: 'team', version: 2, description: 'override',
@@ -130,32 +132,33 @@ describe('templates', () => {
       const list = listTemplates(custom);
       const dt = list.find(t => t.name === 'team')!;
       expect(dt.version).toBe(2);
-      expect(list.length).toBe(BUILTIN_TEMPLATES.length);
+      expect(list.length).toBe(1);
     });
   });
 
   describe('hashTemplate', () => {
     it('is deterministic', () => {
-      const t = BUILTIN_TEMPLATES[0];
+      const t = TEST_TEMPLATE;
       expect(hashTemplate(t)).toBe(hashTemplate(t));
     });
 
     it('changes when content changes', () => {
-      const t = BUILTIN_TEMPLATES[0];
+      const t = TEST_TEMPLATE;
       const modified = { ...t, description: 'changed' };
       expect(hashTemplate(t)).not.toBe(hashTemplate(modified));
     });
 
     it('is a 64-char hex string', () => {
-      expect(hashTemplate(BUILTIN_TEMPLATES[0])).toMatch(/^[0-9a-f]{64}$/);
+      expect(hashTemplate(TEST_TEMPLATE)).toMatch(/^[0-9a-f]{64}$/);
     });
   });
 
   describe('snapshotTemplate', () => {
     it('adds content_hash field', () => {
-      const snap = snapshotTemplate(BUILTIN_TEMPLATES[0]);
-      expect(snap.content_hash).toBe(hashTemplate(BUILTIN_TEMPLATES[0]));
-      expect(snap.name).toBe(BUILTIN_TEMPLATES[0].name);
+      const snap = snapshotTemplate(TEST_TEMPLATE);
+      expect(snap.content_hash).toBe(hashTemplate(TEST_TEMPLATE));
+      expect(snap.name).toBe(TEST_TEMPLATE.name);
+      expect(snap).not.toHaveProperty('sourceFile');
     });
   });
 });
@@ -462,7 +465,7 @@ describe('room-state', () => {
     });
 
     it('accepts task_id and template_snapshot', () => {
-      const snap = snapshotTemplate(BUILTIN_TEMPLATES[0]);
+      const snap = snapshotTemplate(TEST_TEMPLATE);
       const r = createRoomRecord({
         room_id: 'room-full', room_name: 'Full',
         task_id: 'task-1', template_snapshot: snap,
@@ -855,13 +858,14 @@ describe('config validation', () => {
       }, 'test')).toThrow(/role.*required string/);
     });
 
-    it('requires override_builtin for builtin name', () => {
-      expect(() => validateRoomTemplatesConfig({
+    it('accepts a standard name because authority is file-backed', () => {
+      const cfg = validateRoomTemplatesConfig({
         'team': { version: 2, description: 'override', members: validTemplate.members },
-      }, 'test')).toThrow(/override_builtin/);
+      }, 'test');
+      expect(cfg.team.version).toBe(2);
     });
 
-    it('accepts builtin override with override_builtin: true', () => {
+    it('accepts the deprecated explicit override marker for migration', () => {
       const cfg = validateRoomTemplatesConfig({
         'team': {
           ...validTemplate, version: 2, override_builtin: true,

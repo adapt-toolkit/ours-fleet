@@ -1,0 +1,7 @@
+api_version: ours.network/fleet/v2
+
+defaults:
+  permissions: { approval: ask, filesystem: workspace, unattended: deny }
+
+# Rooms require an authenticated owner CID/invite before they can be started.
+# See `ours-fleet docs`, then add `rooms:` and `tasks:` here.

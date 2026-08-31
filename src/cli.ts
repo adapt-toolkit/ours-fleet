@@ -8,6 +8,7 @@ import { createInterface } from 'node:readline';
 import { Command } from 'commander';
 import { VERSION } from './version.js';
 import { INIT_COMPLETION_GUIDANCE } from './init-guidance.js';
+import { bootstrapPresets } from './preset-bootstrap.js';
 import {
   analyzeInstalls, buildInfo, buildLabel, discoverInstalls, runningLabel,
 } from './provenance.js';
@@ -1165,10 +1166,13 @@ cOpt(program.command('doctor').description('prerequisite report'))
     if (!rep.ok) throw new FleetCliExit(1);
   });
 
-program.command('init').description('one-time host setup (units, dirs, linger)')
-  .action(async () => {
+cOpt(program.command('init').description('idempotent host setup plus missing packaged presets'))
+  .action(async (opts: { configuration?: string }) => {
     for (const d of [agentsRoot(), tmpRoot(), logsRoot()]) mkdirSync(d, { recursive: true });
     for (const m of await pickBackend().init(binPath)) console.log(m);
+    const seeded = bootstrapPresets(opts.configuration);
+    console.log(`Packaged preset revision ${seeded.revision}: ${seeded.sourceRoot}`);
+    console.log(`Created ${seeded.created.length}; preserved ${seeded.preserved.length} existing file(s).`);
     console.log(INIT_COMPLETION_GUIDANCE);
   });
 

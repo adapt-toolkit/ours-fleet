@@ -48,9 +48,9 @@ const writeWatchdogReportFixture = () => {
 
 describe('ours-fleet CLI', () => {
   it('init guidance copies the complete split default configuration', () => {
-    expect(INIT_COMPLETION_GUIDANCE).toContain('examples/fleet.yaml" ~/fleet.yaml');
-    expect(INIT_COMPLETION_GUIDANCE).toContain('examples/fleet" ~/fleet');
-    expect(INIT_COMPLETION_GUIDANCE).toContain('~/fleet/{agents,roles,brains}/*.yaml');
+    expect(INIT_COMPLETION_GUIDANCE).toContain('ours-fleet config');
+    expect(INIT_COMPLETION_GUIDANCE).toContain('ours-fleet template list');
+    expect(INIT_COMPLETION_GUIDANCE).toContain('fleet/{agents,roles,brains,room_templates}/*.yaml');
   });
 
   it('redacts nested harness secrets identically from human and JSON config output', async () => {

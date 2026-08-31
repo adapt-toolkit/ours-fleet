@@ -32,7 +32,7 @@ import type {
 } from '../src/rooms-tasks/cowork-adapter.js';
 import type { FleetConfig } from '../src/config.js';
 import type { TemplateSnapshot } from '../src/rooms-tasks/types.js';
-import { BUILTIN_TEMPLATES, snapshotTemplate } from '../src/rooms-tasks/templates.js';
+import { snapshotTemplate } from '../src/rooms-tasks/templates.js';
 import {
   FLEET_PROXY_CALLER_ENV, FLEET_PROXY_STATE_DIR_ENV,
 } from '../src/fleet-proxy.js';
@@ -368,7 +368,14 @@ describe('simple Cowork room member startup', () => {
     async templateName => {
       process.env[FLEET_PROXY_STATE_DIR_ENV] = '/state/Coordinator';
       process.env[FLEET_PROXY_CALLER_ENV] = 'Coordinator';
-      const selected = BUILTIN_TEMPLATES.find(candidate => candidate.name === templateName)!;
+      const roles = templateName === 'pair'
+        ? ['Secretary', 'Critic'] : ['Architect', 'Developer', 'Tester'];
+      const selected = {
+        name: templateName, version: 1, description: `${templateName} fixture`,
+        members: roles.map(role => ({
+          slot: role.toLowerCase(), role, count: 1, agent: { ref: role },
+        })),
+      };
       const tpl = snapshotTemplate(selected);
       tpl.members = tpl.members.map(member => ({ ...member, agent: structuredClone(template(1).members[0].agent) }));
       createRoomRecord({

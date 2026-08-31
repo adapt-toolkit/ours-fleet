@@ -1,0 +1,12 @@
+version: 1
+description: "Phased task pipeline: Architect specifies, Developer implements, Tester verifies"
+room: { quiet_membership: false, anonymous: false }
+contract: |
+  Architect produces a spec and posts it to the room. Work pauses for owner approval.
+  Developer implements per approved spec.
+  Tester verifies spec conformance and test coverage.
+  Completion requires tester sign-off.
+members:
+  - { slot: architect, role: Architect, count: 1, agent: { ref: Architect } }
+  - { slot: developer, role: Developer, count: 1, agent: { ref: Developer } }
+  - { slot: tester, role: Tester, count: 1, agent: { ref: Tester } }

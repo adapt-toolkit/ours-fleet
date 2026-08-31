@@ -143,6 +143,27 @@ describe('split-document fleet configuration service', () => {
     expect(stagedLayout).toBe(true);
   });
 
+  it('revisions, stages, and preserves file-backed Room templates as read-only sources', async () => {
+    const templates = join(dir, 'fleet', 'room_templates');
+    mkdirSync(templates, { mode: 0o700 });
+    const template = join(templates, 'single.yaml');
+    const source = 'version: 1\ndescription: solo\nmembers:\n  - { slot: agent, role: Agent, count: 1, agent: { ref: Alpha } }\n';
+    writeFileSync(template, source, { mode: 0o600 });
+    let staged = false;
+    const service = new FleetConfigService({ configPath: file, preflight: async path => {
+      staged = existsSync(join(path.slice(0, -5), 'room_templates', 'single.yaml'));
+      return { ok: true, checks: [] };
+    } });
+    const opened = service.read();
+    opened.model.manifest.vars = { changed: 'yes' };
+    await service.write(opened.revision, opened.model);
+    expect(staged).toBe(true);
+    expect(readFileSync(template, 'utf8')).toBe(source);
+    const before = service.read();
+    writeFileSync(template, `${source}# concurrent\n`, { mode: 0o600 });
+    await expect(service.preview(before.revision, before.model)).rejects.toThrow(/changed since opened/);
+  });
+
   it('refuses symlink and permissive sources', () => {
     const real = agentPath();
     const content = readFileSync(real, 'utf8');

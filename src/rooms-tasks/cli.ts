@@ -10,7 +10,6 @@ import {
 import { launchFleetWorker } from './external-worker.js';
 import {
   resolveTemplate, listTemplates, snapshotTemplate, hashTemplate,
-  BUILTIN_TEMPLATES,
 } from './templates.js';
 import {
   createTask, getTask, listTasks, startTask, activateTask,
@@ -79,7 +78,7 @@ function taskRoomPublicFailure(error: TaskRoomPublicError): {
     case 'template_not_found': return {
       legacy: `template not found: ${f.template ?? 'requested-template'}`, kind: 'not_found',
       detail: `The requested template ${f.template ?? ''}`.trim() + ' was not found.',
-      action: 'Run ours-fleet template list and retry with an available template.',
+      action: 'Run ours-fleet init to seed missing file-backed presets, then run ours-fleet template list.',
     };
     case 'template_mismatch': return {
       legacy: `template ${f.requested ?? 'requested-template'} does not match room ${f.room ?? 'requested-room'}'s provisioned template ${f.provisioned ?? 'recorded-template'}`,
@@ -534,10 +533,12 @@ export function registerTemplateCommands(parent: Command, cOpt: (cmd: Command) =
           console.log(JSON.stringify({ schema_version: 1, templates }, null, 2));
           return;
         }
-        if (!templates.length) { console.log('No templates configured.'); return; }
+        if (!templates.length) {
+          console.log('No templates configured. Run ours-fleet init to seed missing file-backed presets.');
+          return;
+        }
         for (const t of templates) {
-          const tag = t.builtin ? ' (built-in)' : '';
-          console.log(`${t.name}@${t.version}${tag}  ${t.description}`);
+          console.log(`${t.name}@${t.version}  ${t.description}  [file: ${t.sourceFile ?? 'manifest'}]`);
         }
       } catch (e) { die(e); }
     });
@@ -553,6 +554,7 @@ export function registerTemplateCommands(parent: Command, cOpt: (cmd: Command) =
           return;
         }
         console.log(`${t.name}@${t.version}  ${t.description}`);
+        console.log(`Source: ${t.sourceFile ?? 'manifest'}`);
         if (t.contract) console.log(`\nContract:\n${t.contract}`);
         console.log(`\nMembers:`);
         for (const m of t.members)

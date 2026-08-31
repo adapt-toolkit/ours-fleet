@@ -245,7 +245,8 @@ export interface TemplateDefinition {
   name: string;
   version: number;
   description: string;
-  builtin?: boolean;
+  /** Authoring provenance only; excluded from snapshots and semantic hashes. */
+  sourceFile?: string;
   room?: TemplateRoomConfig;
   contract?: string;
   members: TemplateMemberSlot[];

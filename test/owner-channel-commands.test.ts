@@ -21,6 +21,20 @@ import { hashTemplate, listTemplates, resolveTemplate } from '../src/rooms-tasks
 import { renderMarkdownResult, roomStatus, taskStatus } from '../src/rooms-tasks/markdown.js';
 import { TaskRoomApplicationError, TaskRoomApplicationService } from '../src/application/task-room-service.js';
 
+const STANDARD_TEMPLATES = {
+  single: { name: 'single', version: 1, description: 'Solo agent',
+    members: [{ slot: 'agent', role: 'Agent', count: 1, agent: { ref: 'Agent' } }] },
+  pair: { name: 'pair', version: 1, description: 'Review pair', members: [
+    { slot: 'secretary', role: 'Secretary', count: 1, agent: { ref: 'Secretary' } },
+    { slot: 'critic', role: 'Critic', count: 1, agent: { ref: 'Critic' } },
+  ] },
+  team: { name: 'team', version: 1, description: 'Delivery team', members: [
+    { slot: 'architect', role: 'Architect', count: 1, agent: { ref: 'Architect' } },
+    { slot: 'developer', role: 'Developer', count: 1, agent: { ref: 'Developer' } },
+    { slot: 'tester', role: 'Tester', count: 1, agent: { ref: 'Tester' } },
+  ] },
+};
+
 function context(overrides: Partial<OwnerCommandContext> = {}): OwnerCommandContext & {
   replies: string[];
 } {
@@ -124,9 +138,9 @@ function context(overrides: Partial<OwnerCommandContext> = {}): OwnerCommandCont
         identity_cid: orchestration.room_identity_cid ?? '', seats: [], role_briefings: {} } as any,
       orchestration };
     }),
-    listTemplateQueries: vi.fn(() => listTemplates({})),
+    listTemplateQueries: vi.fn(() => listTemplates(STANDARD_TEMPLATES)),
     getTemplateQuery: vi.fn(name => {
-      const template = resolveTemplate(name, {});
+      const template = resolveTemplate(name, STANDARD_TEMPLATES);
       if (!template) throw new TaskRoomApplicationError(
         'template_not_found', 'template not found', { template: name });
       return { ...template, content_hash: hashTemplate(template) };
@@ -134,7 +148,7 @@ function context(overrides: Partial<OwnerCommandContext> = {}): OwnerCommandCont
     createRoom: vi.fn(async input => {
       const { randomUUID } = await import('node:crypto');
       const { createRoomRecord } = await import('../src/rooms-tasks/room-state.js');
-      const template = input.template ? resolveTemplate(input.template, {}) : undefined;
+      const template = input.template ? resolveTemplate(input.template, STANDARD_TEMPLATES) : undefined;
       if (input.template && !template) throw new TaskRoomApplicationError(
         'template_not_found', 'template not found', { template: input.template });
       return createRoomRecord({ room_id: randomUUID().replace(/-/g, '').slice(0, 16),

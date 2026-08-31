@@ -4,7 +4,8 @@ import {
 
 export type YamlMode = 'compat' | 'strict';
 export type ConfigDiagnosticKind =
-  | 'anchor' | 'alias' | 'explicit-tag' | 'non-scalar-key' | 'multiple-documents';
+  | 'anchor' | 'alias' | 'explicit-tag' | 'non-scalar-key' | 'multiple-documents'
+  | 'deprecated-field';
 
 export interface ConfigDiagnostic {
   severity: 'warning';

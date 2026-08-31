@@ -72,12 +72,14 @@ describe('npm pack from a checkout with no dist', () => {
 
   it('ships the complete split default configuration referenced by init', () => {
     for (const path of [
-      'examples/fleet.yaml',
-      'examples/fleet/agents/Alice.yaml',
-      'examples/fleet/agents/FleetCoordinator.yaml',
-      'examples/fleet/roles/developer.yaml',
-      'examples/fleet/roles/coordinator.yaml',
-      'examples/fleet/brains/claude-default.yaml',
+      'presets/manifest.json',
+      'presets/fleet.yaml',
+      'presets/fleet/brains/claude-default.yaml',
+      ...['Agent', 'Secretary', 'Critic', 'Architect', 'Developer', 'Tester']
+        .flatMap(name => [`presets/fleet/agents/${name}.yaml`, `presets/fleet/roles/${name}.yaml`]),
+      'presets/fleet/room_templates/single.yaml',
+      'presets/fleet/room_templates/pair.yaml',
+      'presets/fleet/room_templates/team.yaml',
     ]) expect(entries).toContain(path);
   });
 

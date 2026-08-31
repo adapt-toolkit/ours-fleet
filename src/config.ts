@@ -308,7 +308,7 @@ export interface FleetConfig {
   defaults: Record<string, unknown>;
   files: string[];
   configMode?: 'split-v2';
-  sourceDocuments?: Array<{ kind: 'Manifest' | 'Agent' | 'Role' | 'Brain'; id?: string; path: string }>;
+  sourceDocuments?: Array<{ kind: 'Manifest' | 'Agent' | 'Role' | 'Brain' | 'RoomTemplate'; id?: string; path: string }>;
   /** Fleet-wide delay (ms) enforced between agent launches to avoid boot bursts (0 = none). */
   startStaggerMs: number;
   /** Warning-first non-plain YAML migration diagnostics, in source order. */
@@ -507,6 +507,36 @@ function readKindDirectory(
     diagnostics.push(...parsed.diagnostics);
     files.push(file);
     result.set(id, { file, value: parsed.value });
+  }
+  return result;
+}
+
+function readRoomTemplateDirectory(
+  root: string, yamlMode: YamlMode, diagnostics: ConfigDiagnostic[], files: string[],
+): RoomTemplatesConfig {
+  if (!existsSync(root)) return {};
+  assertTrustedPath(root, 'directory');
+  const result: RoomTemplatesConfig = {};
+  const sources = new Map<string, string>();
+  const names = readdirSync(root)
+    .filter(name => ['.yaml', '.yml'].includes(extname(name).toLowerCase())).sort();
+  for (const filename of names) {
+    const file = join(root, filename);
+    assertTrustedPath(file, 'file');
+    const id = basename(filename, extname(filename));
+    const previous = sources.get(id);
+    if (previous)
+      throw new ConfigError(`E_DUPLICATE_ID: room template '${id}' defined by both ${previous} and ${file}`);
+    const parsed = parseFleetDocument(file, readFileSync(file, 'utf8'), yamlMode);
+    diagnostics.push(...parsed.diagnostics);
+    if (parsed.value.override_builtin === true) diagnostics.push({
+      severity: 'warning', kind: 'deprecated-field', file, line: 1, column: 1,
+      message: `${file}: override_builtin is deprecated and ignored for a file-backed Room template`,
+    });
+    files.push(file);
+    const validated = validateRoomTemplatesConfig({ [id]: parsed.value }, file)[id];
+    result[id] = { ...validated, sourceFile: file };
+    sources.set(id, file);
   }
   return result;
 }
@@ -849,6 +879,11 @@ export function loadConfig(
   let roomTemplates: RoomTemplatesConfig | undefined;
   let tasks: TasksConfig | undefined;
 
+  const fileTemplates = readRoomTemplateDirectory(
+    join(splitRootFor(base), 'room_templates'), options.yamlMode ?? 'compat', diagnostics, files,
+  );
+  if (Object.keys(fileTemplates).length) roomTemplates = fileTemplates;
+
   for (const { file, doc } of docs) {
     if (doc.rooms !== undefined) {
       if (rooms) throw new ConfigError(`rooms: defined in multiple files; last: ${file}`);
@@ -860,7 +895,22 @@ export function loadConfig(
     }
     if (doc.room_templates !== undefined) {
       const validated = validateRoomTemplatesConfig(deepSub(doc.room_templates, vars), file);
-      roomTemplates = { ...(roomTemplates ?? {}), ...validated };
+      const raw = doc.room_templates as Record<string, Record<string, unknown>>;
+      for (const [name, template] of Object.entries(validated)) {
+        const shadowed = roomTemplates?.[name];
+        const marker = raw[name]?.override_builtin;
+        if (shadowed && (marker !== true || template.version <= shadowed.version))
+          throw new ConfigError(
+            `${file}: room_templates.${name} shadows file preset ${shadowed.sourceFile}; `
+            + 'set override_builtin: true and use a higher version',
+          );
+        if (marker === true) diagnostics.push({
+          severity: 'warning', kind: 'deprecated-field', file, line: 1, column: 1,
+          message: `${file}: room_templates.${name}.override_builtin is deprecated; `
+            + 'it is retained only as an explicit manifest-over-file migration marker',
+        });
+        roomTemplates = { ...(roomTemplates ?? {}), [name]: { ...template, sourceFile: file } };
+      }
     }
     if (doc.tasks !== undefined) {
       if (tasks) throw new ConfigError(`tasks: defined in multiple files; last: ${file}`);
@@ -877,7 +927,8 @@ export function loadConfig(
       if (path === base) return { kind: 'Manifest' as const, path };
       const parent = basename(dirname(path));
       const kind = parent === 'agents' ? 'Agent' as const
-        : parent === 'roles' ? 'Role' as const : 'Brain' as const;
+        : parent === 'roles' ? 'Role' as const
+          : parent === 'room_templates' ? 'RoomTemplate' as const : 'Brain' as const;
       return { kind, id: basename(path, extname(path)), path };
     }),
   };

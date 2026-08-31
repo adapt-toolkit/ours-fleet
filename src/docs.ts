@@ -24,7 +24,8 @@ ours-fleet version [--json]             # build identity, capabilities, every in
 \`\`\`
 
 Configuration v2 is \`~/fleet.yaml\` plus typed bare documents under the exact
-stem directories \`~/fleet/agents\`, \`~/fleet/roles\`, and \`~/fleet/brains\`.
+stem directories \`~/fleet/agents\`, \`~/fleet/roles\`, \`~/fleet/brains\`, and
+\`~/fleet/room_templates\`.
 The manifest owns fleet-wide operational defaults and automation; each Agent
 selects one inline/ref Role and Brain and carries its operational fields.
 Legacy top-level \`roles:\` and \`fleet.d\` are rejected. Validate the complete
@@ -32,7 +33,7 @@ trusted source set with \`config\` and \`doctor\` before starting or restarting.
 
 Permanent \`spawn\` writes \`~/fleet/agents/Name.yaml\`. The web console edits an
 explicit \`{manifest, agents}\` model while Role/Brain presets remain read-only.
-Its aggregate revision includes every Agent/Role/Brain source, previews a
+Its aggregate revision includes every Agent/Role/Brain/Room-template source, previews a
 redacted per-document diff in an exact-stem private staging tree, and saves under
 one root lock with a private multi-file backup and full rollback. A no-op is
 byte-identical and creates no backup.
@@ -78,7 +79,7 @@ PATH order.
 ## Lifecycle and console commands
 
 \`\`\`sh
-ours-fleet init
+ours-fleet init [-c FILE]               # seed missing presets; never replace an existing file
 ours-fleet up|down [Name...]
 ours-fleet restart [Name...]            # preserve/resume harness context
 ours-fleet force-restart [Name...]      # fresh context; briefing is reloaded
@@ -283,6 +284,28 @@ agent-session children; \`ours-mcp proxy\` is client-only and never starts a dae
 the shared daemon only through an explicit operator or installer/setup flow.
 
 ## Rooms and tasks
+
+\`init\` materializes editable \`single\`, \`pair\`, and \`team\` Room templates plus
+their exact-cased Agent, Role, and Brain presets. The command prints the packaged
+preset revision and source directory. Inspect provenance and content before use:
+
+\`\`\`sh
+ours-fleet config [-c FILE]
+ours-fleet template list [-c FILE]
+ours-fleet template show team [-c FILE]
+ours-fleet task create --title "Solo task" --template single [-c FILE]
+ours-fleet task create --title "Reviewed change" --template pair [-c FILE]
+ours-fleet task create --title "Phased delivery" --template team [-c FILE]
+\`\`\`
+
+An alternate manifest \`-c /path/custom.yaml\` uses \`/path/custom/\` as its split
+root. Repeated init only fills missing files and never adopts a newer default.
+For explicit adoption, copy one file from init's reported packaged source beside
+the target as \`.new-default\`, inspect \`diff -u TARGET TARGET.new-default\`, then
+replace TARGET yourself. Upgrades from hardcoded templates require one
+\`ours-fleet init\` (or \`init -c FILE\`) migration pass. A manifest-level template
+may shadow a same-named file only with \`override_builtin: true\` and a higher
+version; this compatibility marker is deprecated and reported as a diagnostic.
 
 Rooms always use \`ours-cowork\`; there is no room-provider selector. Configure
 the cowork daemon connection and room owner directly:

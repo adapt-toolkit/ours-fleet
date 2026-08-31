@@ -28,7 +28,7 @@ describe('the pack contract is declared, not incidental', () => {
   });
 
   it('ships the complete split default configuration used by init guidance', () => {
-    expect(manifest().files).toContain('examples');
+    expect(manifest().files).toContain('presets');
   });
 
   it('still gates publishing on a build and the test suite', () => {

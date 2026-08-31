@@ -1,0 +1,8 @@
+version: 1
+description: "Solo agent: one general-purpose agent works the task with owner oversight"
+room: { quiet_membership: false, anonymous: false }
+contract: |
+  Agent works the task autonomously, consulting the owner when blocked.
+  Owner reviews and approves completion.
+members:
+  - { slot: agent, role: Agent, count: 1, agent: { ref: Agent } }

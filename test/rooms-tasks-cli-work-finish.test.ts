@@ -104,6 +104,23 @@ let exitSpy: ReturnType<typeof vi.spyOn>;
 
 class ExitError extends Error {}
 
+const STANDARD_TEMPLATES_YAML = [
+  'room_templates:',
+  '  single:',
+  '    version: 1',
+  '    description: solo fixture',
+  '    members: [{ slot: agent, role: Agent, count: 1, agent: { ref: Agent } }]',
+  '  pair:',
+  '    version: 1',
+  '    description: pair fixture',
+  '    members: [{ slot: secretary, role: Secretary, count: 1, agent: { ref: Agent } }]',
+  '  team:',
+  '    version: 1',
+  '    description: team fixture',
+  '    members: [{ slot: developer, role: Developer, count: 1, agent: { ref: Agent } }]',
+  '',
+].join('\n');
+
 function makeProgram(): Command {
   const program = new Command();
   program.exitOverride();
@@ -144,7 +161,7 @@ function writeCustomTemplate(include = true): void {
       '    members:',
       '      - { slot: dev, role: Developer, count: 1, agent: { ref: Dev } }',
       '',
-    ].join('\n') : ''));
+    ].join('\n') : STANDARD_TEMPLATES_YAML));
 }
 
 function backlogTask() {
@@ -160,7 +177,8 @@ beforeEach(() => {
     'roles: {}\n'
     + 'rooms:\n'
     + '  owner:\n    expected_cid: ' + 'a'.repeat(64) + '\n'
-    + '  defaults:\n    attach_owner: false\n');
+    + '  defaults:\n    attach_owner: false\n'
+    + STANDARD_TEMPLATES_YAML);
   out = [];
   vi.spyOn(console, 'log').mockImplementation((line: unknown) => { out.push(String(line)); });
   vi.spyOn(process.stderr, 'write').mockImplementation((line: unknown) => { out.push(String(line)); return true; });
