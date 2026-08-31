@@ -32,8 +32,9 @@ import type {
   CoworkAdapter, CoworkRoomInfo, CoworkSeatInfo,
 } from '../src/rooms-tasks/cowork-adapter.js';
 import type { FleetConfig } from '../src/config.js';
-import type { TemplateSnapshot } from '../src/rooms-tasks/types.js';
-import { snapshotTemplate } from '../src/rooms-tasks/templates.js';
+import type { TemplateDefinition, TemplateSnapshot } from '../src/rooms-tasks/types.js';
+import { prepareExecutionPlan } from '../src/rooms-tasks/member-overrides.js';
+import { sealTemplateSnapshot, snapshotTemplate } from '../src/rooms-tasks/templates.js';
 import {
   FLEET_PROXY_CALLER_ENV, FLEET_PROXY_STATE_DIR_ENV,
 } from '../src/fleet-proxy.js';
@@ -379,6 +380,56 @@ describe('simple Cowork room member startup', () => {
     });
     expect(mocks.spawnTemp.mock.calls[0][0].roomMemberStartup.task)
       .toContain('Role persona:\nReview carefully.');
+  });
+
+  it('provisions the exact sealed member override instead of the base Agent Template', async () => {
+    const definition: TemplateDefinition = {
+      name: 'overridden', version: 1, description: 'Override fixture',
+      members: [{ slot: 'developer', role: 'Developer', count: 1, agent_template: 'Developer' }],
+    };
+    const base = {
+      brain: { inline: { harness: 'claude-code', effort: 'high' } },
+      role: { inline: { persona: 'Developer' } },
+      permissions: { approval: 'ask', filesystem: 'workspace', unattended: 'deny' },
+    } as const;
+    const configuration = cfg({
+      agentTemplates: { Developer: base },
+      brainPresets: { Fast: { harness: 'codex', model: 'gpt-test', effort: 'medium' } },
+      resolveAgentDefinition: (id: string, value: any) => ({
+        name: id, harness: value.brain.inline.harness, session: 'acp',
+        role: value.role, brain: value.brain, permissions: value.permissions,
+        monitor: { mode: 'fleet' },
+      }),
+    } as Partial<FleetConfig>);
+    const prepared = prepareExecutionPlan(definition, configuration, {
+      developer: {
+        brain: 'Fast', approval: 'allow', filesystem: 'unrestricted', unattended: 'wait',
+      },
+    });
+    const sealed = sealTemplateSnapshot(
+      prepared.snapshot, configuration.agentTemplates!, prepared.launchDefinitions,
+    );
+    createRoomRecord({
+      room_id: 'room-sealed-override', room_name: 'Room', room_identity_cid: 'room-cid',
+      template_snapshot: sealed,
+    });
+
+    await provisionMembers({
+      cfg: configuration, cowork: coworkHarness().cowork, roomId: 'room-sealed-override',
+      template: sealed, binPath: '/usr/bin/ours-fleet',
+    });
+
+    expect(mocks.spawnTemp.mock.calls[0][0]).toMatchObject({
+      agentDefinition: {
+        brain: { inline: { harness: 'codex', model: 'gpt-test', effort: 'medium' } },
+        permissions: { approval: 'allow', filesystem: 'unrestricted', unattended: 'wait' },
+      },
+    });
+    expect(getRoomRecord('room-sealed-override')?.member_seats[0]?.launch?.agent_definition)
+      .toMatchObject({
+        brain: { inline: { harness: 'codex', model: 'gpt-test', effort: 'medium' } },
+        permissions: { approval: 'allow', filesystem: 'unrestricted', unattended: 'wait' },
+      });
   });
 
   it.each(['pair', 'team'] as const)(

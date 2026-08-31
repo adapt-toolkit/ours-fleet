@@ -64,6 +64,7 @@ interface ExpandedMember {
   slot: string;
   coworkRole: string;
   agentTemplate: string;
+  launchDefinitionId: string;
   agentTemplateHash?: string;
 }
 
@@ -151,6 +152,7 @@ function expandMembers(
         slot: slot.slot,
         coworkRole: slot.role,
         agentTemplate: slot.agent_template,
+        launchDefinitionId: slot.launch_definition_id ?? slot.agent_template,
         agentTemplateHash: slot.agent_template_hash,
       });
     }
@@ -162,8 +164,12 @@ function settingsFor(
   member: ExpandedMember, cfg: FleetConfig,
   sealed?: Record<string, import('../config.js').AgentTemplateDefinition>,
 ): MemberSettings {
-  const definition = sealed?.[member.agentTemplate] ?? cfg.agentTemplates?.[member.agentTemplate];
-  if (!definition) throw new Error(`Agent Template '${member.agentTemplate}' not found`);
+  const definition = sealed
+    ? sealed[member.launchDefinitionId]
+    : cfg.agentTemplates?.[member.agentTemplate];
+  if (!definition) throw new Error(sealed
+    ? `Sealed Agent definition '${member.launchDefinitionId}' not found`
+    : `Agent Template '${member.agentTemplate}' not found`);
   const role = definition.role;
   return {
     definition: structuredClone(definition) as AgentDefinition,
