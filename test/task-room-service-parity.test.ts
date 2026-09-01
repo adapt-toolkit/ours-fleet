@@ -283,7 +283,7 @@ describe('task create/start surface parity', () => {
     });
   });
 
-  it('owns block, unblock, review, and delete state mutations', () => {
+  it('owns block, unblock, review, and delete state mutations', async () => {
     const app = service(cowork().adapter);
     const task = createTask({ title: 'Lifecycle', origin: { type: 'cli' }, start: true });
     activateTask(task.task_id);
@@ -297,12 +297,17 @@ describe('task create/start surface parity', () => {
       actor: { kind: 'local_control', surface: 'cli' }, taskId: task.task_id,
     }).state).toBe('review');
     completeTask(task.task_id);
-    expect(app.deleteTask({
+    const accepted = await app.requestTaskDeletion({
       actor: { kind: 'local_control', surface: 'cli' }, taskId: task.task_id,
-    })).toBe(true);
-    expect(app.deleteTask({
+    });
+    expect(accepted.status).toBe('accepted');
+    const settled = await app.settleTaskDeletion({
+      actor: { kind: 'internal_worker', surface: 'cli' }, taskId: task.task_id,
+    });
+    expect(settled.deleted).toBe(true);
+    expect(await app.requestTaskDeletion({
       actor: { kind: 'local_control', surface: 'cli' }, taskId: task.task_id,
-    })).toBe(false);
+    })).toEqual({ status: 'already_absent' });
   });
 
   it('uses configured done policy while cancellation always settles a linked room', async () => {

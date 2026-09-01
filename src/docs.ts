@@ -390,11 +390,24 @@ The prerelease configuration names \`tasks.close_room_on_done\` and
 semantics. Older prerelease \`closed\` room records are deleted directly the next
 time \`room list\` reconciles Fleet with Cowork.
 
-\`ours-fleet task delete <id> <id>\` removes only a \`done\` task's Fleet backlog
-record. The exact task ID is required twice for confirmation. Delete rejects every
-other task state, never changes any room state, and reports an already-missing
-task as an idempotent no-op. The Owner-channel equivalent is
-\`/task delete <id> <id>\`.
+\`ours-fleet task delete <id> <id>\` permanently deletes a task in ANY lifecycle
+state — backlog, provisioning, active, blocked, review, done, cancelled, failed,
+or partially settled. The exact task ID is required twice for confirmation. A
+durable deletion intent is persisted before any side effect; the cleanup worker
+then retires managed room members with evidence, closes and deletes an attached
+room (tolerating already-missing remote rooms), releases the sealed launch
+snapshot, and unlinks the task record last. While cleanup settles the task is
+hidden from normal listings and every lifecycle mutation is rejected; if
+cleanup cannot complete (for example Cowork is unreachable), the deletion stays
+in a precise recoverable state — repeat the delete command or run
+\`task recover <id>\` to converge after outages, crashes, or restarts. Deletion
+never fabricates a \`done\` transition. A metadata-only deletion receipt
+(acceptance actor, original state, timestamps, completion) is retained under
+\`deletion-receipts/\` as durable audit evidence. An already-missing task is an
+idempotent no-op. The Owner-channel equivalent is \`/task delete <id> <id>\`; the
+management API equivalent is \`DELETE /api/v1/tasks/<id>?confirm=<id>\` (200 when
+settled, 202 while pending; \`GET /api/v1/tasks?includeDeleting=true\` exposes
+deletion-pending tasks to operators).
 
 ## Permissions
 

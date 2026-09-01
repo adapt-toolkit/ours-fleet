@@ -34,9 +34,9 @@ function commandArgv(command: Command): string[] {
   return (root as Command & { rawArgs?: string[] }).rawArgs ?? process.argv.slice(2);
 }
 import {
-  createTask, getTask, listTasks, startTask, activateTask,
+  createTask, getTask, getDeletingTask, listTasks, startTask, activateTask,
   blockTask, unblockTask, reviewTask,
-  updateTaskRoom, updateTaskTemplate, updateTaskMembers, failTask, deleteTask, TaskStateError,
+  updateTaskRoom, updateTaskTemplate, updateTaskMembers, failTask, TaskStateError,
 } from './task-state.js';
 import {
   createRoomRecord, getRoomRecord, listRoomRecords,
@@ -191,7 +191,7 @@ function isKnownTaskStateMessage(message: string): boolean {
     new RegExp(`^task ${SAFE_ID_WORD} is not tied to room ${SAFE_ID_WORD}$`, 'u'),
     new RegExp(`^task ${SAFE_ID_WORD} has no terminal intent$`, 'u'),
     new RegExp(`^task ${SAFE_ID_WORD} reached terminal state '${TASK_STATE_WORD}' outside its intent$`, 'u'),
-    new RegExp(`^cannot delete a '${TASK_STATE_WORD}' task; only 'done' tasks can be deleted$`, 'u'),
+    new RegExp(`^task ${SAFE_ID_WORD} is pending deletion; run 'ours-fleet task delete ${SAFE_ID_WORD} ${SAFE_ID_WORD}' to retry cleanup$`, 'u'),
   ].some(pattern => pattern.test(message));
 }
 
@@ -434,6 +434,48 @@ async function launchTaskSettleWorker(
     state: task.state, category: 'settlement_pending',
     eventId: task.terminal_intent?.accepted_at ?? task.created_at });
   return { task, timedOut: true };
+}
+
+/** Launch the deletion settle worker and wait boundedly for physical absence. */
+async function launchTaskDeleteWorker(
+  taskId: string, configPath?: string,
+): Promise<{ deleted: boolean; timedOut: boolean }> {
+  const readDeletion = (): { present: boolean; errorAt?: string; error?: string } => {
+    try {
+      const task = getDeletingTask(taskId);
+      return { present: true, errorAt: task.deletion?.error_at, error: task.deletion?.error };
+    } catch (error) {
+      // Only proven physical absence counts as deleted; anything else propagates.
+      if (error instanceof TaskStateError && /task not found/.test(error.message))
+        return { present: false };
+      throw error;
+    }
+  };
+  const before = readDeletion();
+  if (!before.present) return { deleted: true, timedOut: false };
+  try {
+    await launchFleetWorker(['task', '_settle_delete', taskId], `task-delete-${taskId}`, configPath);
+  } catch (error) {
+    await taskRoomService(configPath).recordDeletionError({
+      actor: { kind: 'local_control', surface: 'cli' }, taskId, error: errorText(error),
+      recoveryHint: `External delete worker failed to start. Retry task delete ${taskId} ${taskId}.`,
+    }).catch(() => {});
+    recordFleetAuditPresentation({ kind: 'lifecycle_failure', resource: 'Task', id: taskId,
+      state: 'deleting', category: 'settlement_failed', eventId: new Date().toISOString() });
+    throw error;
+  }
+  const deadline = Date.now() + PUBLIC_SETTLE_WAIT_MS;
+  while (Date.now() < deadline) {
+    const current = readDeletion();
+    if (!current.present) return { deleted: true, timedOut: false };
+    if (current.errorAt !== before.errorAt && current.error) {
+      throw new TaskStateError(current.error);
+    }
+    await sleep(PUBLIC_SETTLE_POLL_MS);
+  }
+  recordFleetAuditPresentation({ kind: 'lifecycle_failure', resource: 'Task', id: taskId,
+    state: 'deleting', category: 'settlement_pending', eventId: new Date().toISOString() });
+  return { deleted: false, timedOut: true };
 }
 
 async function launchRoomDeleteWorker(
@@ -1033,23 +1075,45 @@ export function registerTaskCommands(parent: Command, cOpt: (cmd: Command) => Co
     });
 
   cOpt(taskCmd.command('delete <id> <confirm-id>'))
-    .description('delete a done task from the backlog (requires ID twice for confirmation)')
+    .description('permanently delete a task in any lifecycle state (requires ID twice for confirmation)')
     .option('--json', 'JSON output')
-    .action((id: string, confirmId: string, opts: { json?: boolean }) => {
+    .action(async (id: string, confirmId: string, opts: { configuration?: string; json?: boolean }) => {
       try {
         if (id !== confirmId) throw taskRoomPublicError('task_confirmation_mismatch');
-        let prior: ReturnType<typeof getTask> | undefined;
-        try { prior = getTask(id); } catch { /* idempotent already-absent delete */ }
-        const deleted = taskRoomService().deleteTask({
+        const accepted = await taskRoomService(opts.configuration).requestTaskDeletion({
           actor: { kind: 'local_control', surface: 'cli' }, taskId: id,
         });
-        if (prior) auditTask('delete', prior, prior.state, 'deleted');
+        if (accepted.status === 'already_absent') {
+          if (opts.json) {
+            console.log(JSON.stringify({
+              schema_version: 1, task_id: id, deleted: false, already_absent: true,
+            }, null, 2));
+            return;
+          }
+          console.log(renderMarkdownResult({
+            icon: '🗑️', title: 'Task already absent',
+            fields: [{ label: 'ID', value: id, kind: 'code' }],
+          }));
+          return;
+        }
+        const settled = await launchTaskDeleteWorker(id, opts.configuration);
         if (opts.json) {
-          console.log(JSON.stringify({ schema_version: 1, task_id: id, deleted }, null, 2));
+          console.log(JSON.stringify({
+            schema_version: 1, task_id: id, accepted: true,
+            deleted: settled.deleted, pending: settled.timedOut,
+          }, null, 2));
+          return;
+        }
+        if (!settled.deleted) {
+          console.log(renderMarkdownFailure({
+            kind: 'pending', subject: `task delete ${id} ${id}`,
+            detail: 'The deletion was accepted and cleanup is still settling.',
+            action: `Re-run ours-fleet task delete ${id} ${id} or ours-fleet task recover ${id}.`,
+          }));
           return;
         }
         console.log(renderMarkdownResult({
-          icon: '🗑️', title: deleted ? 'Task deleted' : 'Task already absent',
+          icon: '🗑️', title: 'Task deleted',
           fields: [{ label: 'ID', value: id, kind: 'code' }],
         }));
       } catch (e) { if (opts.json) die(e); dieTaskRoom(e); }
@@ -1064,6 +1128,22 @@ export function registerTaskCommands(parent: Command, cOpt: (cmd: Command) => Co
         const app = taskRoomService(opts.configuration);
         const actor = { kind: 'local_control' as const, surface: 'cli' as const };
         const begin = await app.beginTaskRecovery({ actor, taskId: id });
+        if (begin.kind === 'deletion_worker_required') {
+          const settled = await launchTaskDeleteWorker(id, opts.configuration);
+          const payload = { schema_version: 1, task_id: id, deleted: settled.deleted };
+          if (opts.json) { console.log(JSON.stringify(payload, null, 2)); return; }
+          console.log(settled.deleted
+            ? renderMarkdownResult({
+              icon: '🗑️', title: 'Task deletion completed by recovery',
+              fields: [{ label: 'ID', value: id, kind: 'code' }],
+            })
+            : renderMarkdownFailure({
+              kind: 'pending', subject: `task recover ${id}`,
+              detail: 'The task is pending deletion and cleanup is still settling.',
+              action: `Run ours-fleet task delete ${id} ${id} to retry.`,
+            }));
+          return;
+        }
         const recovered = begin.kind === 'terminal_worker_required'
           ? await (async () => {
             const settled = await launchTaskSettleWorker(id, opts.configuration);
@@ -1130,6 +1210,34 @@ export function registerTaskCommands(parent: Command, cOpt: (cmd: Command) => Co
       }
     });
 
+  cOpt(taskCmd.command('_settle_delete <id>', { hidden: true }))
+    .description('internal: settle a previously accepted task deletion')
+    .option('--json', 'JSON output')
+    .action(async (id: string, opts: { configuration?: string; json?: boolean }) => {
+      try {
+        const app = taskRoomService(opts.configuration);
+        const result = await app.settleTaskDeletion({
+          actor: { kind: 'internal_worker', surface: 'cli' }, taskId: id,
+        });
+        if (opts.json) {
+          console.log(JSON.stringify({ schema_version: 1, ...result }, null, 2));
+          return;
+        }
+        console.log(renderMarkdownResult({
+          icon: '🗑️', title: result.deleted ? 'Task deletion settled' : 'Task already absent',
+          fields: [{ label: 'ID', value: id, kind: 'code' }],
+        }));
+      } catch (e) {
+        await taskRoomService(opts.configuration).recordDeletionError({
+          actor: { kind: 'internal_worker', surface: 'cli' }, taskId: id,
+          error: errorText(e),
+          recoveryHint: `External delete worker failed. Retry task delete ${id} ${id}.`,
+        }).catch(() => {});
+        if (opts.json) die(e);
+        dieTaskRoom(e);
+      }
+    });
+
   cOpt(taskCmd.command('_recover <id>', { hidden: true }))
     .description('internal: settle and continue task recovery')
     .option('--json', 'JSON output')
@@ -1138,6 +1246,11 @@ export function registerTaskCommands(parent: Command, cOpt: (cmd: Command) => Co
       const actor = { kind: 'internal_worker' as const, surface: 'cli' as const };
       try {
         const begin = await app.beginTaskRecovery({ actor, taskId: id });
+        if (begin.kind === 'deletion_worker_required') {
+          const settled = await app.settleTaskDeletion({ actor, taskId: id });
+          console.log(JSON.stringify({ schema_version: 1, deletion: settled }, null, 2));
+          return;
+        }
         const result = begin.kind === 'terminal_worker_required'
           ? await (async () => {
             try { await app.settleTask({ actor, taskId: id }); }

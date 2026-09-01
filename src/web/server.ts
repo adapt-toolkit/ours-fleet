@@ -237,17 +237,45 @@ export async function buildWebServer(
   });
   app.get('/api/v1/tasks', async request => {
     auth.authenticate(request);
-    const query = request.query as { state?: string; list?: string; groupByList?: string };
+    const query = request.query as {
+      state?: string; list?: string; groupByList?: string; includeDeleting?: string;
+    };
     const states = ['backlog', 'provisioning', 'active', 'review', 'done', 'cancelled', 'failed'];
     if (query.state && query.state !== 'all' && !states.includes(query.state))
       throw new FleetError('invalid_request', 'invalid task state filter');
     if (query.groupByList !== undefined && !['true', 'false'].includes(query.groupByList))
       throw new FleetError('invalid_request', 'groupByList must be true or false');
+    if (query.includeDeleting !== undefined && !['true', 'false'].includes(query.includeDeleting))
+      throw new FleetError('invalid_request', 'includeDeleting must be true or false');
     const state = query.state && query.state !== 'all' ? query.state as import('../rooms-tasks/types.js').TaskState : undefined;
-    const filter = { ...(state ? { state } : {}), ...(query.list ? { list: query.list } : {}) };
+    const filter = { ...(state ? { state } : {}), ...(query.list ? { list: query.list } : {}),
+      ...(query.includeDeleting === 'true' ? { includeDeleting: true } : {}) };
     return taskApi(() => query.groupByList === 'true'
       ? { groups: requireTaskRooms().groupedTasks(filter) }
       : { tasks: requireTaskRooms().listTasks(filter) });
+  });
+  app.delete('/api/v1/tasks/:id', async (request, reply) => {
+    auth.authenticate(request, true);
+    const taskId = (request.params as { id: string }).id;
+    const confirm = (request.query as { confirm?: string }).confirm;
+    // Exact-ID-twice confirmation is validated before existence or idempotency.
+    if (confirm !== taskId)
+      throw new FleetError('invalid_request', 'confirm must exactly repeat the task id');
+    const accepted = await taskApi(() => requireTaskRooms().requestTaskDeletion({
+      actor: { kind: 'local_control', surface: 'web' }, taskId,
+    }));
+    if (accepted.status === 'already_absent')
+      return { task_id: taskId, deleted: false, already_absent: true };
+    // Cleanup runs in an external worker outside the request lifecycle; the
+    // request waits boundedly and reports pending — never fabricated success.
+    const outcome = await requireTaskRooms().launchTaskDeletionWorker({ taskId, waitMs: 5_000 });
+    if (outcome.deleted) return { task_id: taskId, deleted: true };
+    reply.code(202);
+    return {
+      task_id: taskId, accepted: true, deletion: 'pending',
+      ...(outcome.error ? { error: outcome.error } : {}),
+      recovery: `Repeat DELETE /api/v1/tasks/${taskId}?confirm=${taskId} or run 'ours-fleet task recover ${taskId}'.`,
+    };
   });
   app.post('/api/v1/tasks', async (request, reply) => {
     auth.authenticate(request, true);

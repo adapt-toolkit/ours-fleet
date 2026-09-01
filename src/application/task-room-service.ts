@@ -11,7 +11,7 @@ import {
 } from '../rooms-tasks/room-state.js';
 import {
   activateTask, blockTask as persistBlockTask, createTask as persistTask,
-  deleteTask as persistDeleteTask, getTask as readTask, listTasks as readTasks,
+  getDeletingTask, getTask as readTask, listTasks as readTasks, taskDeletionState,
   moveTaskToList,
   reviewTask as persistReviewTask, startTask as transitionTask,
   TaskStateError, unblockTask as persistUnblockTask, updateTaskRoom, updateTaskTemplate,
@@ -30,10 +30,19 @@ import {
 } from '../rooms-tasks/close.js';
 import {
   acceptTaskTerminalIntent, recordTaskTerminalIntentError, settleTaskTerminalIntent,
+  TASK_OPERATION_LOCK_STALE_MS, taskOperationLockPath,
 } from '../rooms-tasks/terminal.js';
+import {
+  acceptTaskDeletion, recordTaskDeletionError, settleTaskDeletion,
+  type TaskDeletionSettleResult,
+} from '../rooms-tasks/deletion.js';
+import { withFileLock } from '../atomic-file.js';
+import { launchFleetWorker } from '../rooms-tasks/external-worker.js';
 import type {
-  RoomOrchestrationRecord, TaskListRecord, TaskOrigin, TaskOutcome, TaskRecord, TaskState, TemplateSnapshot,
+  RoomOrchestrationRecord, TaskDeletionActor, TaskListRecord, TaskOrigin, TaskOutcome,
+  TaskRecord, TaskState, TemplateSnapshot,
 } from '../rooms-tasks/types.js';
+import type { TaskDeletionAcceptance } from '../rooms-tasks/task-state.js';
 import { TASK_CANCELLABLE_STATES, TASK_TERMINAL_STATES } from '../rooms-tasks/types.js';
 
 export type TaskRoomActor =
@@ -58,12 +67,13 @@ export interface TaskRecoveryResult {
 }
 export type TaskRecoveryBegin =
   | { kind: 'terminal_worker_required'; taskId: string }
+  | { kind: 'deletion_worker_required'; taskId: string }
   | { kind: 'final'; result: TaskRecoveryResult };
 
 export class TaskRoomApplicationError extends Error {
   constructor(readonly code: 'template_not_found' | 'task_template_drift' | 'template_mismatch'
-    | 'task_terminal' | 'task_terminal_already' | 'task_non_resumable' | 'room_not_found'
-    | 'room_record_not_found', message: string,
+    | 'task_terminal' | 'task_terminal_already' | 'task_non_resumable' | 'task_deleting'
+    | 'room_not_found' | 'room_record_not_found', message: string,
     readonly fields: Readonly<Record<string, string>> = {}) {
     super(message); this.name = 'TaskRoomApplicationError';
   }
@@ -98,6 +108,9 @@ export interface TaskRoomServiceDeps {
   binPath?(): string;
   provisionMembers?: typeof provisionMembers;
   moveTaskToList?: typeof moveTaskToList;
+  launchDeletionWorker?(taskId: string): Promise<void>;
+  sleep?(ms: number): Promise<void>;
+  now?(): number;
 }
 
 function launchSelection(definition: Record<string, unknown> | undefined, key: 'brain' | 'role'): string | undefined {
@@ -256,14 +269,18 @@ export class TaskRoomApplicationService {
     return (await this.ensureTaskWork(input)).task;
   }
 
-  listTasks(filter?: { state?: TaskState | TaskState[]; list?: string }): TaskRecord[] {
+  listTasks(filter?: {
+    state?: TaskState | TaskState[]; list?: string; includeDeleting?: boolean;
+  }): TaskRecord[] {
     const listId = filter?.list === undefined ? undefined : resolveTaskList(filter.list).list_id;
-    return readTasks({ state: filter?.state, listId });
+    return readTasks({ state: filter?.state, listId, includeDeleting: filter?.includeDeleting });
   }
 
   listTaskLists(): TaskListRecord[] { return readTaskLists(); }
 
-  groupedTasks(filter?: { state?: TaskState | TaskState[]; list?: string }): Array<{
+  groupedTasks(filter?: {
+    state?: TaskState | TaskState[]; list?: string; includeDeleting?: boolean;
+  }): Array<{
     list: TaskListRecord; tasks: TaskRecord[];
   }> {
     const tasks = this.listTasks(filter);
@@ -332,8 +349,98 @@ export class TaskRoomApplicationService {
     return persistReviewTask(input.taskId);
   }
 
-  deleteTask(input: { actor: TaskRoomActor; taskId: string }): boolean {
-    return persistDeleteTask(input.taskId);
+  private deletionActor(actor: TaskRoomActor): TaskDeletionActor {
+    if (actor.kind === 'local_control') return { kind: 'local_control', surface: actor.surface };
+    if (actor.kind === 'authenticated_owner')
+      return { kind: 'authenticated_owner', surface: 'messenger', cid: actor.cid };
+    throw new Error('internal workers cannot originate a task deletion acceptance');
+  }
+
+  /** Accept a permanent deletion in any lifecycle state; audit at acceptance. */
+  async requestTaskDeletion(input: {
+    actor: TaskRoomActor; taskId: string;
+  }): Promise<TaskDeletionAcceptance> {
+    const result = await acceptTaskDeletion(input.taskId, this.deletionActor(input.actor));
+    if (result.status === 'accepted') {
+      const task = result.task;
+      recordFleetAuditPresentation({ kind: 'task', operation: 'delete', id: task.task_id,
+        title: task.title, previousState: task.state, newState: 'deleting',
+        revision: task.deletion?.accepted_at ?? task.created_at, list: task.list_name ?? 'default',
+        roomId: task.room_id,
+        template: task.template ? `${task.template.name}@${task.template.version}` : undefined,
+        agents: [] });
+    }
+    return result;
+  }
+
+  /** Worker entry: converge an accepted deletion; Cowork is resolved lazily. */
+  async settleTaskDeletion(input: {
+    actor: { kind: 'internal_worker'; surface: 'cli' }; taskId: string;
+  }): Promise<TaskDeletionSettleResult> {
+    const result = await settleTaskDeletion({
+      taskId: input.taskId,
+      cowork: () => {
+        // Config resolves only when room work exists: a no-room deletion must
+        // settle even with missing or invalid rooms configuration.
+        const cfg = (this.deps.loadConfiguration ?? loadConfig)(this.configurationPath);
+        if (!cfg.rooms)
+          throw new ConfigError('rooms: configuration is required before deleting task rooms');
+        return this.deps.cowork ? this.deps.cowork(cfg)
+          : createCoworkAdapter({ configPath: cfg.rooms.cowork?.config });
+      },
+    });
+    if (result.deleted && result.previous_state) {
+      recordFleetAuditPresentation({ kind: 'task', operation: 'delete', id: result.task_id,
+        title: result.title, previousState: result.previous_state, newState: 'deleted',
+        revision: new Date().toISOString(), list: 'default', roomId: undefined,
+        template: undefined, agents: [] });
+    }
+    return result;
+  }
+
+  /**
+   * Launch the external deletion worker outside the caller's lifecycle and
+   * wait boundedly for physical absence. Timeouts and launch failures report
+   * a pending, recoverable state — never success. A concurrent worker that
+   * already removed the record reads as settled.
+   */
+  async launchTaskDeletionWorker(input: {
+    taskId: string; waitMs?: number;
+  }): Promise<{ deleted: boolean; pending: boolean; error?: string }> {
+    const launch = this.deps.launchDeletionWorker
+      ?? ((taskId: string) => launchFleetWorker(
+        ['task', '_settle_delete', taskId], `task-delete-${taskId}`, this.configurationPath));
+    const errorAtBefore = (() => {
+      try { return getDeletingTask(input.taskId).deletion?.error_at; } catch { return undefined; }
+    })();
+    try { await launch(input.taskId); }
+    catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      await recordTaskDeletionError(input.taskId, message,
+        `External delete worker failed to start. Repeat the delete request for ${input.taskId}.`,
+      ).catch(() => {});
+      return { deleted: false, pending: true, error: message };
+    }
+    const now = this.deps.now ?? Date.now;
+    const sleep = this.deps.sleep
+      ?? ((ms: number) => new Promise<void>(resolve => { setTimeout(resolve, ms); }));
+    const deadline = now() + (input.waitMs ?? 10_000);
+    while (now() < deadline) {
+      if (taskDeletionState(input.taskId) === 'absent') return { deleted: true, pending: false };
+      try {
+        const current = getDeletingTask(input.taskId).deletion;
+        if (current?.error_at !== errorAtBefore && current?.error)
+          return { deleted: false, pending: true, error: current.error };
+      } catch { /* re-checked as absence on the next iteration */ }
+      await sleep(100);
+    }
+    return { deleted: false, pending: true };
+  }
+
+  recordDeletionError(input: {
+    actor: TaskRoomActor; taskId: string; error: string; recoveryHint: string;
+  }): Promise<TaskRecord> {
+    return recordTaskDeletionError(input.taskId, input.error, input.recoveryHint);
   }
 
   async completeTask(input: {
@@ -384,10 +491,24 @@ export class TaskRoomApplicationService {
   }
 
   async beginTaskRecovery(input: { actor: TaskRoomActor; taskId: string }): Promise<TaskRecoveryBegin> {
+    // The deletion-vs-terminal routing decision serializes on the common
+    // task-operation lock and must not require configuration: recovery of a
+    // deletion-pending task continues the deletion and never resurrects.
+    const routed = await withFileLock(
+      taskOperationLockPath(input.taskId),
+      () => {
+        const task = readTask(input.taskId);
+        if (task.deletion?.status === 'pending') return 'deletion' as const;
+        if (task.terminal_intent?.status === 'pending') return 'terminal' as const;
+        return 'none' as const;
+      },
+      {},
+      TASK_OPERATION_LOCK_STALE_MS,
+    );
+    if (routed === 'deletion') return { kind: 'deletion_worker_required', taskId: input.taskId };
     const config = (this.deps.loadConfiguration ?? loadConfig)(this.configurationPath);
     this.recovery = { taskId: input.taskId, config };
-    const task = readTask(input.taskId);
-    if (task.terminal_intent?.status === 'pending')
+    if (routed === 'terminal')
       return { kind: 'terminal_worker_required', taskId: input.taskId };
     return { kind: 'final', result: await this.continueTaskRecovery({
       actor: input.actor, taskId: input.taskId, terminalTimedOut: false,
@@ -806,21 +927,38 @@ export class TaskRoomApplicationService {
     })();
     const unlockSnapshot = template ? acquireLaunchSnapshotLock() : undefined;
     let launchTemplate: TemplateSnapshot | undefined;
-    let created;
     let room: RoomOrchestrationRecord;
     try {
       launchTemplate = template ? (template.launch_snapshot_hash ? template
         : sealTemplateSnapshot(template, cfg.agentTemplates ?? {}, launchDefinitions)) : undefined;
-      created = await cowork.createRoom({
-      room_name: task.title, goal: task.goal?.trim() || task.title,
-      briefing: task.brief?.trim() || launchTemplate?.contract?.trim() || task.goal?.trim() || task.title,
-      quiet_membership: launchTemplate?.room?.quiet_membership,
-      anonymous: launchTemplate?.room?.anonymous,
-    });
-      room = createRoomRecord({
-      room_id: created.room_id, room_name: task.title, room_identity_cid: created.identity_cid,
-      task_id: task.task_id, template_snapshot: launchTemplate,
-    });
+      // Room publication window: for a task-bound room, hold the common
+      // task-operation lock across remote creation, local record creation, and
+      // the task link, so an accepted deletion linearizes strictly before
+      // (bounded task_deleting abort) or strictly after (record visible to the
+      // deletion scan). Lock order stays launch-snapshot → task-operation.
+      const publishRoom = async (): Promise<RoomOrchestrationRecord> => {
+        if (task.task_id) {
+          const fresh = readTask(task.task_id);
+          if (fresh.deletion?.status === 'pending')
+            throw new TaskRoomApplicationError('task_deleting',
+              `task ${task.task_id} is pending deletion`, { task: task.task_id });
+        }
+        const created = await cowork.createRoom({
+          room_name: task.title, goal: task.goal?.trim() || task.title,
+          briefing: task.brief?.trim() || launchTemplate?.contract?.trim() || task.goal?.trim() || task.title,
+          quiet_membership: launchTemplate?.room?.quiet_membership,
+          anonymous: launchTemplate?.room?.anonymous,
+        });
+        const record = createRoomRecord({
+          room_id: created.room_id, room_name: task.title, room_identity_cid: created.identity_cid,
+          task_id: task.task_id, template_snapshot: launchTemplate,
+        });
+        onCreated(record);
+        return record;
+      };
+      room = task.task_id
+        ? await withFileLock(taskOperationLockPath(task.task_id), publishRoom, {}, TASK_OPERATION_LOCK_STALE_MS)
+        : await publishRoom();
     } catch (error) {
       unlockSnapshot?.();
       if (launchTemplate?.launch_snapshot_hash) releaseLaunchSnapshot(launchTemplate.launch_snapshot_hash);
@@ -832,7 +970,6 @@ export class TaskRoomApplicationService {
       revision: room.created_at, taskId: room.task_id,
       template: room.template_snapshot ? `${room.template_snapshot.name}@${room.template_snapshot.version}` : undefined,
       participants: [] });
-    onCreated(room);
     room = advanceSaga(room.room_id, 'create_room', 1);
     if (attachOwner) {
       try {

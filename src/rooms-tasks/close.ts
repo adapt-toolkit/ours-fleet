@@ -53,7 +53,7 @@ function exactMemberIdentity(seat: RoomMemberSeat): void {
   }
 }
 
-async function inspectMember(seat: RoomMemberSeat): Promise<{ launchId: string }> {
+export async function inspectMember(seat: RoomMemberSeat): Promise<{ launchId: string }> {
   exactMemberIdentity(seat);
   const supervisor = readTempSupervisor(agentDir(seat.role_name, true));
   if (!supervisor || supervisor.role !== seat.role_name) {
@@ -62,7 +62,7 @@ async function inspectMember(seat: RoomMemberSeat): Promise<{ launchId: string }
   return { launchId: supervisor.launchId };
 }
 
-async function waitForLivenessAbsent(
+export async function waitForLivenessAbsent(
   role: string, launchId: string, lifecycleDeps: TempLifecycleDeps = {},
 ): Promise<void> {
   const dir = agentDir(role, true);
@@ -96,7 +96,15 @@ function listedIdentity(
   return rows.find(row => row.name === name);
 }
 
-async function removeExactMemberIdentity(seat: RoomMemberSeat): Promise<void> {
+/** Report whether any daemon identity — under any name — carries this exact CID. */
+export async function identityCidPresent(cid: string): Promise<boolean> {
+  return withIdentityClient(async client => {
+    const rows = await client.listIdentities();
+    return rows.some(row => row.cid?.toLowerCase() === cid.toLowerCase());
+  });
+}
+
+export async function removeExactMemberIdentity(seat: RoomMemberSeat): Promise<void> {
   await withIdentityClient(async client => {
     const before = listedIdentity(await client.listIdentities(), seat.role_name);
     if (!before) return;

@@ -12,7 +12,7 @@ import {
 } from '../src/owner-channel/notices.js';
 import type { SessionEvent, SessionSnapshot } from '../src/session/types.js';
 import {
-  blockTask as persistBlockTask, deleteTask as persistDeleteTask,
+  blockTask as persistBlockTask,
   getTask as readTask, listTasks as readTasks, reviewTask as persistReviewTask,
   unblockTask as persistUnblockTask,
 } from '../src/rooms-tasks/task-state.js';
@@ -122,8 +122,22 @@ function context(overrides: Partial<OwnerCommandContext> = {}): OwnerCommandCont
     reviewTask: vi.fn(taskId => {
       return persistReviewTask(taskId);
     }),
-    deleteTask: vi.fn(taskId => {
-      return persistDeleteTask(taskId);
+    deleteTask: vi.fn(async (taskId: string) => {
+      const app = new TaskRoomApplicationService();
+      const accepted = await app.requestTaskDeletion({
+        actor: { kind: 'authenticated_owner', surface: 'messenger', cid: 'f'.repeat(64) }, taskId,
+      });
+      if (accepted.status === 'already_absent') {
+        replies.push(renderMarkdownResult({ icon: '🗑️', title: 'Task already absent',
+          fields: [{ label: 'ID', value: taskId, kind: 'code' }] }));
+        return;
+      }
+      const settled = await app.settleTaskDeletion({
+        actor: { kind: 'internal_worker', surface: 'cli' }, taskId,
+      });
+      replies.push(renderMarkdownResult({
+        icon: '🗑️', title: settled.deleted ? 'Task deleted' : 'Task deletion pending',
+        fields: [{ label: 'ID', value: taskId, kind: 'code' }] }));
     }),
     listRoomQueries: vi.fn(async filter => (await import('../src/rooms-tasks/room-state.js'))
       .listRoomRecords().filter(room => room.state === 'active' || room.state === 'provisioning')
