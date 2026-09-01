@@ -124,6 +124,7 @@ export interface TaskRecord {
   execution_plan?: {
     schema_version: 1;
     snapshot: TemplateSnapshot;
+    room_policy?: RoomLaunchPolicy;
     overrides: Record<string, unknown>;
     overrides_hash: string;
     plan_hash: string;
@@ -274,6 +275,8 @@ export interface RoomOrchestrationRecord {
   goal?: string;
   task_id?: string;
   template_snapshot?: TemplateSnapshot;
+  /** Resolved once at launch; legacy absence means non-anonymous. */
+  room_policy?: RoomLaunchPolicy;
   saga: SagaCursor;
   provisioning_detail?: ProvisioningDetail;
   owner_seat_cid?: string;
@@ -301,6 +304,22 @@ export interface TemplateMemberSlot {
 export interface TemplateRoomConfig {
   quiet_membership?: boolean;
   anonymous?: boolean;
+}
+
+export interface RoomLaunchPolicy {
+  anonymous: boolean;
+}
+
+export const LEGACY_ROOM_LAUNCH_POLICY: Readonly<RoomLaunchPolicy> = Object.freeze({
+  anonymous: false,
+});
+
+/** Validate durable policy before it can influence room creation or recovery. */
+export function storedRoomLaunchPolicy(value: RoomLaunchPolicy | undefined): RoomLaunchPolicy {
+  if (value === undefined) return { ...LEGACY_ROOM_LAUNCH_POLICY };
+  if (typeof value.anonymous !== 'boolean')
+    throw new Error('invalid durable Room launch policy; anonymous must be a boolean');
+  return { ...value };
 }
 
 export interface TemplateDefinition {
@@ -373,5 +392,6 @@ export const ROOMS_COWORK_KEYS = ['config'] as const;
 export const ROOMS_DEFAULTS_KEYS = ['template', 'attach_owner', 'close_when_task_done'] as const;
 export const TASKS_KEYS = ['default_room_template', 'create_mode', 'close_room_on_done', 'retain_completed_for'] as const;
 export const TEMPLATE_KEYS = ['version', 'description', 'room', 'contract', 'members', 'override_builtin'] as const;
+export const TEMPLATE_ROOM_KEYS = ['quiet_membership', 'anonymous'] as const;
 /** `agent` is accepted only so validation can emit its actionable migration error. */
 export const TEMPLATE_MEMBER_KEYS = ['slot', 'role', 'count', 'agent_template', 'agent'] as const;

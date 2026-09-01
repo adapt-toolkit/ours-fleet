@@ -39,11 +39,11 @@ import {
 import { withFileLock } from '../atomic-file.js';
 import { launchFleetWorker } from '../rooms-tasks/external-worker.js';
 import type {
-  RoomOrchestrationRecord, TaskDeletionActor, TaskListRecord, TaskOrigin, TaskOutcome,
-  TaskRecord, TaskState, TemplateSnapshot,
+  RoomLaunchPolicy, RoomOrchestrationRecord, TaskDeletionActor, TaskListRecord,
+  TaskOrigin, TaskOutcome, TaskRecord, TaskState, TemplateSnapshot,
 } from '../rooms-tasks/types.js';
 import type { TaskDeletionAcceptance } from '../rooms-tasks/task-state.js';
-import { TASK_CANCELLABLE_STATES, TASK_TERMINAL_STATES } from '../rooms-tasks/types.js';
+import { storedRoomLaunchPolicy, TASK_CANCELLABLE_STATES, TASK_TERMINAL_STATES } from '../rooms-tasks/types.js';
 
 export type TaskRoomActor =
   | { kind: 'local_control'; surface: 'cli' | 'web' }
@@ -91,6 +91,7 @@ export interface CreateTaskRequest {
   origin: TaskOrigin;
   list?: string;
   members?: MemberOverrides;
+  anonymous?: boolean;
 }
 export interface CreateRoomRequest {
   actor: TaskRoomActor;
@@ -100,6 +101,14 @@ export interface CreateRoomRequest {
   brief?: string;
   briefFile?: string;
   members?: MemberOverrides;
+  anonymous?: boolean;
+}
+
+export function resolveRoomLaunchPolicy(
+  template: TemplateSnapshot | undefined, override: boolean | undefined,
+): RoomLaunchPolicy {
+  const anonymous = override ?? template?.room?.anonymous ?? false;
+  return { anonymous };
 }
 
 export interface TaskRoomServiceDeps {
@@ -176,6 +185,9 @@ export class TaskRoomApplicationService {
   async createTask(request: CreateTaskRequest): Promise<TaskRecord> {
     const cfg = (this.deps.loadConfiguration ?? loadConfig)(this.configurationPath);
     let template = this.createTemplate(cfg, request.template, request.noRoom);
+    if (request.noRoom && request.anonymous !== undefined)
+      throw new ConfigError('--anonymous/--no-anonymous cannot be combined with --no-room');
+    const roomPolicy = resolveRoomLaunchPolicy(template, request.anonymous);
     let launchDefinitions: Record<string, import('../config.js').AgentTemplateDefinition> | undefined;
     let executionPlan: TaskRecord['execution_plan'];
     let preparedPlan: ReturnType<typeof prepareExecutionPlan> | undefined;
@@ -192,7 +204,8 @@ export class TaskRoomApplicationService {
       if (preparedPlan) {
         template = sealTemplateSnapshot(preparedPlan.snapshot, cfg.agentTemplates ?? {}, preparedPlan.launchDefinitions);
         sealedHash = template.launch_snapshot_hash;
-        executionPlan = { schema_version: 1, snapshot: template, overrides: preparedPlan.overrides,
+        executionPlan = { schema_version: 1, snapshot: template, room_policy: roomPolicy,
+          overrides: preparedPlan.overrides,
           overrides_hash: preparedPlan.overridesHash,
           plan_hash: preparedPlan.planHash };
       }
@@ -222,7 +235,7 @@ export class TaskRoomApplicationService {
       try {
         const room = await this.provisionRoom(cfg, task, template!, created => {
           task = updateTaskRoom(task.task_id, created.room_id, created.room_identity_cid!);
-        }, launchDefinitions);
+        }, launchDefinitions, roomPolicy);
         task = readTask(task.task_id);
         if (task.state === 'active' && room.state === 'active') recordFleetAuditPresentation({ kind: 'task', operation: 'work', id: task.task_id,
           title: task.title, previousState: 'provisioning', newState: task.state,
@@ -255,17 +268,21 @@ export class TaskRoomApplicationService {
       if (request.members && Object.keys(request.members).length) {
         const prepared = prepareExecutionPlan(definition, cfg, request.members);
         template = prepared.snapshot;
+        const roomPolicy = resolveRoomLaunchPolicy(template, request.anonymous);
         return this.provisionRoom(cfg, { title: request.name, brief, goal: request.goal },
-          template, () => {}, prepared.launchDefinitions);
+          template, () => {}, prepared.launchDefinitions, roomPolicy);
       }
       template = snapshotTemplate(definition, cfg.agentTemplates);
     }
+    const roomPolicy = resolveRoomLaunchPolicy(template, request.anonymous);
     return this.provisionRoom(cfg, {
       title: request.name, brief, goal: request.goal,
-    }, template, () => {});
+    }, template, () => {}, undefined, roomPolicy);
   }
 
-  async startTask(input: { actor: TaskRoomActor; taskId: string; template?: string; members?: MemberOverrides }): Promise<TaskRecord> {
+  async startTask(input: {
+    actor: TaskRoomActor; taskId: string; template?: string; members?: MemberOverrides; anonymous?: boolean;
+  }): Promise<TaskRecord> {
     return (await this.ensureTaskWork(input)).task;
   }
 
@@ -673,6 +690,16 @@ export class TaskRoomApplicationService {
       return { kind: 'deletion_worker_required', roomId: input.roomId };
     const room = await adapter.recoverRoom(input.roomId);
     orchestration = getRoomRecord(input.roomId);
+    if (orchestration) {
+      const policy = storedRoomLaunchPolicy(orchestration.room_policy);
+      if ((room.anonymous ?? false) !== policy.anonymous) {
+        const error = `Cowork anonymity (${String(room.anonymous ?? false)}) does not match Fleet's durable Room policy (${String(policy.anonymous)})`;
+        setSagaError(input.roomId, error,
+          'Do not respawn members. Repair or upgrade Cowork, then recover the Room without changing its policy.',
+          'waiting_cowork');
+        throw new Error(error);
+      }
+    }
     if (orchestration && !orchestration.owner_seat_cid
       && (orchestration.provisioning_detail === 'waiting_owner_invite'
         || orchestration.provisioning_detail === 'owner_cid_mismatch')) {
@@ -734,10 +761,16 @@ export class TaskRoomApplicationService {
   }
 
   async ensureTaskWork(input: {
-    actor: TaskRoomActor; taskId: string; template?: string; members?: MemberOverrides;
+    actor: TaskRoomActor; taskId: string; template?: string; members?: MemberOverrides; anonymous?: boolean;
   }): Promise<{ task: TaskRecord; status: 'ready' | 'already_active' }> {
     const cfg = (this.deps.loadConfiguration ?? loadConfig)(this.configurationPath);
     let task = readTask(input.taskId);
+    const recordedRoom = task.room_id ? getRoomRecord(task.room_id) : undefined;
+    const recordedPolicy = storedRoomLaunchPolicy(
+      recordedRoom?.room_policy ?? task.execution_plan?.room_policy);
+    if (task.room_id && input.anonymous !== undefined && input.anonymous !== recordedPolicy.anonymous)
+      throw new TaskRoomApplicationError('template_mismatch',
+        'anonymous override does not match the existing Room launch policy', { room: task.room_id });
     if (TASK_TERMINAL_STATES.includes(task.state)) throw new TaskRoomApplicationError(
       'task_terminal', 'task terminal', { task: input.taskId, state: task.state });
     if (task.state === 'active' && task.room_id) {
@@ -780,6 +813,11 @@ export class TaskRoomApplicationService {
     let preparedPlan = !durable && definition
       ? prepareExecutionPlan(definition, cfg, input.members ?? {}) : undefined;
     let snapshot = durable ?? preparedPlan!.snapshot;
+    const roomPolicy = input.anonymous !== undefined
+      ? resolveRoomLaunchPolicy(snapshot, input.anonymous)
+      : task.execution_plan
+        ? storedRoomLaunchPolicy(task.execution_plan.room_policy)
+        : resolveRoomLaunchPolicy(snapshot, undefined);
     if (preparedPlan) launchDefinitions = preparedPlan.launchDefinitions;
     if (input.members && Object.keys(input.members).length && !storedOverridesMatch) {
       if (!definition) throw new TaskRoomApplicationError('template_mismatch',
@@ -818,6 +856,7 @@ export class TaskRoomApplicationService {
       try {
         sealed = sealTemplateSnapshot(snapshot, cfg.agentTemplates ?? {}, launchDefinitions);
         task = updateTaskExecutionPlan(task.task_id, { schema_version: 1, snapshot: sealed,
+          room_policy: roomPolicy,
           overrides: preparedPlan.overrides, overrides_hash: preparedPlan.overridesHash,
           plan_hash: preparedPlan.planHash });
         snapshot = sealed;
@@ -827,6 +866,8 @@ export class TaskRoomApplicationService {
         throw error;
       }
       unlock();
+    } else if (!task.room_id && task.execution_plan && input.anonymous !== undefined) {
+      task = updateTaskExecutionPlan(task.task_id, { ...task.execution_plan, room_policy: roomPolicy });
     } else if (!task.template || task.template.name !== snapshot.name || task.template.content_hash !== snapshot.content_hash)
       task = updateTaskTemplate(task.task_id, { name: snapshot.name, version: snapshot.version, content_hash: snapshot.content_hash });
     if (task.state === 'backlog') {
@@ -840,7 +881,7 @@ export class TaskRoomApplicationService {
       try {
         await this.provisionRoom(cfg, task, snapshot, created => {
           task = updateTaskRoom(task.task_id, created.room_id, created.room_identity_cid!);
-        }, launchDefinitions);
+        }, launchDefinitions, roomPolicy);
         task = readTask(task.task_id);
       } catch (error) {
         if (error instanceof CoworkUnavailableError)
@@ -914,6 +955,7 @@ export class TaskRoomApplicationService {
     template: TemplateSnapshot | undefined,
     onCreated: (room: RoomOrchestrationRecord) => void,
     launchDefinitions?: Record<string, import('../config.js').AgentTemplateDefinition>,
+    policy: RoomLaunchPolicy = resolveRoomLaunchPolicy(template, undefined),
   ): Promise<RoomOrchestrationRecord> {
     const rooms = cfg.rooms;
     if (!rooms) throw new ConfigError('rooms: configuration is required');
@@ -947,11 +989,11 @@ export class TaskRoomApplicationService {
           room_name: task.title, goal: task.goal?.trim() || task.title,
           briefing: task.brief?.trim() || launchTemplate?.contract?.trim() || task.goal?.trim() || task.title,
           quiet_membership: launchTemplate?.room?.quiet_membership,
-          anonymous: launchTemplate?.room?.anonymous,
+          anonymous: policy.anonymous,
         });
         const record = createRoomRecord({
           room_id: created.room_id, room_name: task.title, room_identity_cid: created.identity_cid,
-          task_id: task.task_id, template_snapshot: launchTemplate,
+          task_id: task.task_id, template_snapshot: launchTemplate, room_policy: policy,
         });
         onCreated(record);
         return record;

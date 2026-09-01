@@ -8,6 +8,7 @@ import type {
   MemberRetirementPhase, RoomClosePhase,
   RoomRoleBriefingDefinition, RoomMemberLaunchState,
 } from './types.js';
+import { storedRoomLaunchPolicy } from './types.js';
 import { releaseLaunchSnapshot } from './launch-snapshot.js';
 
 export const roomsDir = () => join(stateRoot(), 'rooms');
@@ -34,11 +35,18 @@ export interface CreateRoomInput {
   room_identity_cid?: string;
   task_id?: string;
   template_snapshot?: import('./types.js').TemplateSnapshot;
+  room_policy?: import('./types.js').RoomLaunchPolicy;
 }
 
 export function createRoomRecord(input: CreateRoomInput): RoomOrchestrationRecord {
   const existing = getRoomRecord(input.room_id);
-  if (existing) return existing;
+  if (existing) {
+    const before = storedRoomLaunchPolicy(existing.room_policy);
+    const requested = storedRoomLaunchPolicy(input.room_policy);
+    if (JSON.stringify(before) !== JSON.stringify(requested))
+      throw new RoomStateError(`room ${input.room_id} launch policy mismatch`);
+    return existing;
+  }
 
   const record: RoomOrchestrationRecord = {
     room_id: input.room_id,
@@ -47,6 +55,7 @@ export function createRoomRecord(input: CreateRoomInput): RoomOrchestrationRecor
     room_identity_cid: input.room_identity_cid,
     task_id: input.task_id,
     template_snapshot: input.template_snapshot,
+    room_policy: input.room_policy,
     saga: { phase: 'persist_intent', step_index: 0 },
     member_seats: [],
     state: 'provisioning',

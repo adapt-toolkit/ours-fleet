@@ -44,4 +44,24 @@ describe('simple room startup contract end to end', () => {
     expect(briefing).not.toContain('briefing_sha256');
     expect(briefing).not.toContain('room_role_briefing');
   });
+
+  it('explicitly keeps an anonymous room member out of the local contact book', () => {
+    const briefing = generateBriefing({
+      name: 'reviewer-1', identity: 'reviewer-1', harness: 'codex', session: 'acp',
+      permissions: { approval: 'allow', filesystem: 'workspace', unattended: 'deny' },
+      permissionsDeclared: true, sourceFile: '(temp)',
+      roomMemberStartup: {
+        room_id: 'room-1', room_identity_cid: 'A'.repeat(64), anonymous: true,
+        identity_name: 'reviewer-1', invite_id: 'invite-1', invite: 'secret-once',
+        role: 'Reviewer', task: 'Review.', owner_seat_cid: null,
+      },
+    } as ResolvedRole, vocab, {
+      stateDir: '/state', worklogPath: '/state/WORKLOG.md',
+      routinesPath: '/state/ROUTINES.md', temporaryIdentity: true,
+    });
+
+    expect(briefing).toContain('name "reviewer-1" and expose_local=false');
+    expect(briefing).not.toContain('local_isolation');
+    expect(briefing).not.toContain('local_auto_accept');
+  });
 });

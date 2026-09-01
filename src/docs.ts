@@ -342,6 +342,13 @@ Cowork role, and task. The agent creates that identity itself with ours MCP
 work immediately. Fleet activates the room from Cowork's authenticated seat; there
 is no briefing hash, startup ACK, or separate role-briefing readiness gate.
 
+Set \`room.anonymous: true\` on a room template, or pass \`--anonymous\` to
+\`task create\`, \`task start\`, \`task work\`, or \`room create\`, to create an
+anonymous Cowork room. \`--no-anonymous\` explicitly overrides an anonymous
+template. Fleet records the resolved value before room creation so retries keep
+the same choice. Temporary members of an anonymous room are instructed to call
+\`create_temporary_identity\` with \`expose_local=false\`.
+
 Human task and room results use the same compact Markdown presentation in the
 CLI and authenticated owner channel: a short heading, icon-plus-word status,
 code-formatted identifiers, bounded summaries, and actionable recovery or error

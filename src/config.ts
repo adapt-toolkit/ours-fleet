@@ -272,6 +272,7 @@ export interface RoomMemberStartup {
   role: string;
   task: string;
   owner_seat_cid: string | null;
+  anonymous?: boolean;
 }
 
 export interface ResolvedRole extends Omit<RoleConfig, 'model' | 'owner_channel' | 'worklog'> {

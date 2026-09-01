@@ -149,7 +149,7 @@ function expectExactJson(value: unknown): void {
   expect(mocks.markdownRender).not.toHaveBeenCalled();
 }
 
-function writeCustomTemplate(include = true): void {
+function writeCustomTemplate(include = true, anonymous = false): void {
   writeV2Fixture(cfgPath,
     'roles: {}\n'
     + 'rooms:\n'
@@ -160,6 +160,7 @@ function writeCustomTemplate(include = true): void {
       '  durable:',
       '    version: 7',
       '    description: durable template',
+      ...(anonymous ? ['    room:', '      anonymous: true'] : []),
       '    members:',
       '      - { slot: dev, role: Developer, count: 1, agent_template: Dev }',
       '',
@@ -413,6 +414,37 @@ describe('public task/room failure presentation', () => {
 });
 
 describe('canonical proxied Task/Room audit metadata', () => {
+  it('parses anonymous overrides as a tri-state and rejects a conflicting pair', async () => {
+    writeCustomTemplate(true, false);
+    await run('create', '--title', 'Template default', '--backlog', '--template', 'durable', '--json');
+    expect(JSON.parse(out.join('\n')).task.execution_plan.room_policy).toEqual({ anonymous: false });
+
+    out = [];
+    await run('create', '--title', 'Explicit anonymous', '--backlog', '--template', 'durable',
+      '--anonymous', '--json');
+    expect(JSON.parse(out.join('\n')).task.execution_plan.room_policy).toEqual({ anonymous: true });
+
+    writeCustomTemplate(true, true);
+    out = [];
+    await run('create', '--title', 'Template anonymous', '--backlog', '--template', 'durable', '--json');
+    expect(JSON.parse(out.join('\n')).task.execution_plan.room_policy).toEqual({ anonymous: true });
+
+    out = [];
+    await run('create', '--title', 'Explicit public', '--backlog', '--template', 'durable',
+      '--no-anonymous', '--json');
+    expect(JSON.parse(out.join('\n')).task.execution_plan.room_policy).toEqual({ anonymous: false });
+
+    out = [];
+    await expect(run('create', '--title', 'Conflict', '--backlog', '--template', 'durable',
+      '--anonymous', '--no-anonymous', '--json')).rejects.toThrow(ExitError);
+    expect(out.join('\n')).toContain('--anonymous and --no-anonymous are mutually exclusive');
+
+    out = [];
+    await expect(run('create', '--title', 'No room', '--no-room', '--anonymous', '--json'))
+      .rejects.toThrow(ExitError);
+    expect(out.join('\n')).toContain('--anonymous/--no-anonymous cannot be combined with --no-room');
+  });
+
   it.each([false, true])('captures real task create/start transitions (json=%s)', async json => {
     writeCustomTemplate();
     beginFleetAuditCollection();

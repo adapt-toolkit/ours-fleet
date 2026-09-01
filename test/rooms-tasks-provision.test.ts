@@ -83,15 +83,15 @@ function template(count = 2): TemplateSnapshot {
   };
 }
 
-function roomInfo(roomId: string, seats: CoworkSeatInfo[]): CoworkRoomInfo {
+function roomInfo(roomId: string, seats: CoworkSeatInfo[], anonymous = false): CoworkRoomInfo {
   return {
     room_id: roomId, identity_name: 'Room', identity_cid: 'room-cid',
-    room_name: 'Room', state: seats.length ? 'active' : 'provisioning',
+    room_name: 'Room', state: seats.length ? 'active' : 'provisioning', anonymous,
     seats, role_briefings: {},
   };
 }
 
-function coworkHarness(options: { acceptOnSpawn?: boolean; failIssueAt?: number } = {}) {
+function coworkHarness(options: { acceptOnSpawn?: boolean; failIssueAt?: number; anonymous?: boolean } = {}) {
   const seats: CoworkSeatInfo[] = [];
   const pending: Array<Record<string, any>> = [];
   let issued = 0;
@@ -130,12 +130,12 @@ function coworkHarness(options: { acceptOnSpawn?: boolean; failIssueAt?: number 
     revokeInvite,
     setRoleBriefing: vi.fn(),
     getHistory: vi.fn().mockResolvedValue({ records: [], raw_count: 0, next_after: 0 }),
-    getRoom: vi.fn(async roomId => roomInfo(roomId, seats)),
+    getRoom: vi.fn(async roomId => roomInfo(roomId, seats, options.anonymous)),
     listRooms: vi.fn().mockResolvedValue([]),
     closeRoom: vi.fn().mockResolvedValue(undefined),
     deleteRoom: vi.fn().mockResolvedValue(undefined),
     getSeats: vi.fn().mockImplementation(async () => seats),
-    recoverRoom: vi.fn(async roomId => roomInfo(roomId, seats)),
+    recoverRoom: vi.fn(async roomId => roomInfo(roomId, seats, options.anonymous)),
   };
   return {
     cowork,
@@ -276,6 +276,20 @@ describe('simple Cowork room member startup', () => {
     expect(spawn.roomMemberStartup.task).toContain('Brief: Keep it simple.');
     expect(spawn.roomMemberStartup.task).toContain('Collaboration contract:');
     expect(spawn).not.toHaveProperty('mission');
+  });
+
+  it('carries the durable anonymous-room flag into the temporary identity startup payload', async () => {
+    createRoomRecord({
+      room_id: 'room-anonymous', room_name: 'Room', room_identity_cid: 'room-cid',
+      room_policy: { anonymous: true },
+    });
+    const h = coworkHarness({ anonymous: true });
+    await provisionMembers({
+      cfg: cfg(), cowork: h.cowork, roomId: 'room-anonymous', template: template(1),
+      binPath: '/usr/bin/ours-fleet', goal: 'Implement it', brief: 'Keep it simple.',
+    });
+
+    expect(mocks.spawnTemp.mock.calls[0][0].roomMemberStartup).toMatchObject({ anonymous: true });
   });
 
   it('waits for seat acceptance without reissuing or relaunching a live member', async () => {

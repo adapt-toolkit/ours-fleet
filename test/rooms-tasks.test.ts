@@ -826,6 +826,19 @@ describe('config validation', () => {
       expect(cfg['my-template'].members).toHaveLength(1);
     });
 
+    it('accepts an anonymous room flag and validates room keys strictly', () => {
+      const cfg = validateRoomTemplatesConfig({
+        'my-template': { ...validTemplate, room: { anonymous: true } },
+      }, 'test');
+      expect(cfg['my-template'].room).toEqual({ anonymous: true, quiet_membership: undefined });
+      expect(() => validateRoomTemplatesConfig({
+        'my-template': { ...validTemplate, room: { anonymous: 'yes' } },
+      }, 'test')).toThrow(/room\.anonymous.*boolean/);
+      expect(() => validateRoomTemplatesConfig({
+        'my-template': { ...validTemplate, room: { hidden: true } },
+      }, 'test')).toThrow(/unknown key.*hidden/);
+    });
+
     it('rejects non-object', () => {
       expect(() => validateRoomTemplatesConfig('nope', 'test'))
         .toThrow(RoomsTasksConfigError);
