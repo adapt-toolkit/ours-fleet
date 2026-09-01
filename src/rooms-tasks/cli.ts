@@ -55,6 +55,7 @@ import { TaskListError } from './task-lists.js';
 import {
   recordFleetAuditFailure, recordFleetAuditPresentation, recordFleetAuditResource,
 } from '../fleet-command-audit.js';
+import { renderAgentConfiguration, type AgentLaunchConfiguration } from '../lifecycle-summary.js';
 
 type TaskRoomPublicErrorCode =
   | 'task_confirmation_mismatch' | 'room_confirmation_mismatch'
@@ -286,6 +287,15 @@ const taskActionMarkdown = (
   ],
   });
 };
+
+/**
+ * Shared launch-configuration line for CLI member listings. Pre-upgrade seats
+ * without a captured presentation keep the minimal listing rather than
+ * claiming resolved facts. Output is already escaped (markdownItems boundary).
+ */
+function seatConfigurationSuffix(presentation: AgentLaunchConfiguration | undefined): string {
+  return presentation ? ` — ${renderAgentConfiguration(presentation)}` : '';
+}
 
 function safeSelectionSummary(definition: Record<string, unknown> | undefined, kind: 'brain' | 'role'): string {
   const selected = definition?.[kind];
@@ -866,7 +876,9 @@ export function registerTaskCommands(parent: Command, cOpt: (cmd: Command) => Co
           sections: [
             ...(t.member_roles.length ? [{
               heading: 'Members', markdownItems: t.member_roles.map(m =>
-                `${markdownCode(m.name)} — ${markdownProse(m.cowork_role)} — ${markdownCode(m.identity_cid)}`),
+                `${markdownCode(m.name)} — ${markdownProse(m.cowork_role)} — ${markdownCode(m.identity_cid)}`
+                + seatConfigurationSuffix(room?.member_seats
+                  .find(seat => seat.role_name === m.name)?.launch?.presentation)),
             }] : []),
             ...(room ? roomStartupSections(room) : []),
           ],
@@ -1340,7 +1352,9 @@ export function registerRoomCommands(parent: Command, cOpt: (cmd: Command) => Co
           sections: [
             ...(cowork.seats.length ? [{
               heading: 'Members', markdownItems: cowork.seats.map(s =>
-                `${markdownCode(s.identity_cid)} — ${markdownProse(s.role)} — ${markdownProse(s.seat_state)}`),
+                `${markdownCode(s.identity_cid)} — ${markdownProse(s.role)} — ${markdownProse(s.seat_state)}`
+                + seatConfigurationSuffix(r?.member_seats
+                  .find(seat => seat.identity_cid === s.identity_cid)?.launch?.presentation)),
             }] : []),
             ...(r ? roomStartupSections(r) : []),
           ],
@@ -1396,7 +1410,9 @@ export function registerRoomCommands(parent: Command, cOpt: (cmd: Command) => Co
           sections: [{
             heading: 'Members',
             ...(members.length ? { markdownItems: members.map(s =>
-              `${markdownCode(s.identity_cid)} — ${markdownProse(s.role)} — ${markdownProse(s.seat_state)}`) }
+              `${markdownCode(s.identity_cid)} — ${markdownProse(s.role)} — ${markdownProse(s.seat_state)}`
+              + seatConfigurationSuffix(r?.member_seats
+                .find(seat => seat.identity_cid === s.identity_cid)?.launch?.presentation)) }
               : { items: ['No members found.'] }),
           }],
         }));
