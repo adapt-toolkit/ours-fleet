@@ -19,13 +19,23 @@ describe('packaged preset bootstrap', () => {
   it('materializes a complete resolvable standard configuration at an explicit root', () => {
     const configPath = join(root, 'alternate.yaml');
     const seeded = bootstrapPresets(configPath);
-    expect(seeded.revision).toBe(4);
+    expect(seeded.revision).toBe(5);
     expect(seeded.created).toHaveLength(61);
     const cfg = loadConfig(configPath);
     expect(listTemplates(cfg.roomTemplates ?? {}).map(template => template.name))
       .toEqual(['pair', 'single', 'team']);
     expect(cfg.sourceDocuments?.filter(source => source.kind === 'RoomTemplate'))
       .toHaveLength(3);
+    const continuity = cfg.agentTemplates?.LocalCoordinator.loops?.continuity;
+    expect(continuity).toMatchObject({ interval: '15m' });
+    expect(continuity?.prompt).toMatch(/scheduled_at minus 15 minutes/);
+    expect(continuity?.prompt).toMatch(/mandatory final history recheck/);
+    expect(continuity?.prompt).toMatch(/CONTINUITY ACTIVE/);
+    expect(continuity?.prompt).toMatch(/CONTINUITY CHECK/);
+    expect(continuity?.prompt).toMatch(/CONTINUITY STALLED/);
+    expect(continuity?.prompt).toMatch(/suppress a semantic duplicate/);
+    expect(cfg.agentTemplates?.Developer.loops).toBeUndefined();
+    expect(cfg.agentTemplates?.Critic.loops).toBeUndefined();
     for (const template of listTemplates(cfg.roomTemplates ?? {})) {
       expect(template.sourceFile).toBe(join(root, 'alternate', 'room_templates', `${template.name}.yaml`));
       for (const member of template.members) {

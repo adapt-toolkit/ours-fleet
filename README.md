@@ -517,6 +517,15 @@ ours-fleet task create --title "Reviewed change" --template pair
 ours-fleet task create --title "Phased delivery" --template team
 ```
 
+The default `team` gives only its LocalCoordinator Agent Template a 15-minute
+continuity loop. Each idle-only pass uses authenticated assigned-room evidence,
+posts at most one missing interval update or status request, and reports `STALLED`
+only after concrete stopped/blocked evidence or the role's documented request/ETA
+window. Stable history/checkpoint fingerprints suppress duplicates; `single` and
+`pair` remain loop-free. This preset does not widen permissions: task planning and
+launch still fail closed when the selected harness cannot supply the configured
+unattended messaging and checkpoint capabilities.
+
 `ours-fleet init -c /path/custom.yaml` reviews the literal resolved manifest and
 `/path/custom/` split directory before doing anything. It requires a TTY and two
 default-No confirmations. You select Codex, Claude, or both; then either one explicit
@@ -547,11 +556,12 @@ task-local `LocalCoordinator`, `Developer`, and `Critic`. The persistent
 `FleetCoordinator` uses the separate packaged `Coordinator` contract and coordination
 model.
 
-Revision-3 role defaults have an explicit fail-closed adoption command: first run
+Revision-3 role defaults and exact revision-4 LocalCoordinator/team defaults have an
+explicit fail-closed adoption command: first run
 `ours-fleet migrate-role-defaults -c FILE` for a zero-write plan, review every removal,
 replacement, addition, preserved custom file, staging path, and recovery path, then rerun
 with `--write`. Only exact semantic matches for packaged-bootstrap and generated
-revision-3 forms are changed; same-named customized files remain byte-identical, and a
+revision-3/4 forms are changed; same-named customized files remain byte-identical, and a
 dangling custom reference refuses publication. Rerunning the migration is a no-op.
 
 For manual adoption of a single newer packaged file, copy the reported source beside the

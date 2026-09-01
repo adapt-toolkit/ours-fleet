@@ -575,6 +575,47 @@ describe('simple Cowork room member startup', () => {
     },
   );
 
+  it('seals the default team continuity loop only onto LocalCoordinator', async () => {
+    process.env[FLEET_PROXY_STATE_DIR_ENV] = '/state/Coordinator';
+    process.env[FLEET_PROXY_CALLER_ENV] = 'Coordinator';
+    const selected: TemplateDefinition = {
+      name: 'team', version: 1, description: 'Default team fixture',
+      members: ['LocalCoordinator', 'Developer', 'Critic'].map(role => ({
+        slot: role === 'LocalCoordinator' ? 'local_coordinator' : role.toLowerCase(),
+        role, count: 1, agent_template: role,
+      })),
+    };
+    const launchCfg = cfg();
+    launchCfg.agentTemplates!.LocalCoordinator.loops = {
+      continuity: { interval: '15m', prompt: 'DEFAULT_CONTINUITY_CANARY' },
+    };
+    const baseSnapshot = snapshotTemplate(selected, launchCfg.agentTemplates);
+    const tpl = { ...baseSnapshot, members: baseSnapshot.members.map(member => ({
+      ...member,
+      loop_source: member.role === 'LocalCoordinator'
+        ? 'agent-template' as const : 'omitted' as const,
+    })) };
+    createRoomRecord({ room_id: 'room-team-continuity', room_name: 'Room', room_identity_cid: 'room-cid' });
+    const h = coworkHarness();
+    mockManagedSpawns();
+
+    await provisionMembers({
+      cfg: launchCfg, cowork: h.cowork, roomId: 'room-team-continuity', template: tpl,
+      binPath: '/usr/bin/ours-fleet',
+    });
+
+    const spawns = mocks.spawnTemp.mock.calls.map(([spawn]) => spawn);
+    const local = spawns.find(spawn => spawn.roomMemberStartup.role === 'LocalCoordinator');
+    expect(local).toMatchObject({ loopSource: 'agent-template', agentDefinition: { loops: {
+      continuity: { interval: '15m', prompt: 'DEFAULT_CONTINUITY_CANARY' },
+    } } });
+    for (const role of ['Developer', 'Critic']) {
+      const spawn = spawns.find(candidate => candidate.roomMemberStartup.role === role);
+      expect(spawn?.loopSource).toBe('omitted');
+      expect(spawn?.agentDefinition.loops).toBeUndefined();
+    }
+  });
+
   it('uses direct temporary spawn safely when authenticated caller context is absent', async () => {
     createRoomRecord({
       room_id: 'room-standalone', room_name: 'Room', room_identity_cid: 'room-cid',

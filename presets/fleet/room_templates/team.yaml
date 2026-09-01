@@ -3,6 +3,7 @@ description: "Locally coordinated team: LocalCoordinator sequences, Developer ex
 room: { quiet_membership: false, anonymous: false }
 contract: |
   LocalCoordinator coordinates sequencing, handoffs, context, and blockers among existing members.
+  LocalCoordinator performs a bounded 15-minute continuity check without taking over implementation.
   Developer owns implementation and verification evidence.
   Critic independently reviews and withholds sign-off on material failures.
   LocalCoordinator has no Fleet lifecycle or agent-management authority.
