@@ -147,24 +147,24 @@ async function spawnRoomMember(
 }
 
 /**
- * Launch-boundary capture for the direct (non-managed) path: the exact
- * ResolvedRole the spawn persisted, whitelisted into the operator-facing
- * presentation. A missing or unreadable snapshot degrades to the legacy
- * rendering; it never fails the launch.
+ * Launch-boundary capture: the exact ResolvedRole the spawn persisted,
+ * whitelisted into the operator-facing presentation. Capture is required for
+ * every launched room member — launchMatches has already proved role.yaml
+ * readable, and effectivePermissionMode is total over registered harnesses —
+ * so a failure here is a capture defect and must surface, not degrade to the
+ * legacy rendering.
  */
 function presentationFromStatePath(
   statePath: string, settings: MemberSettings, coworkRole: string,
-): AgentLaunchConfiguration | undefined {
-  try {
-    const resolved = parse(readFileSync(join(statePath, 'role.yaml'), 'utf8')) as ResolvedRole;
-    return summarizeResolvedLaunch(resolved, {
-      role: selectionOrigin(settings.definition.role),
-      brain: selectionOrigin(settings.definition.brain),
-      template: settings.template,
-      permissionMode: effectivePermissionMode(resolved),
-      missionFallback: coworkRole,
-    });
-  } catch { return undefined; }
+): AgentLaunchConfiguration {
+  const resolved = parse(readFileSync(join(statePath, 'role.yaml'), 'utf8')) as ResolvedRole;
+  return summarizeResolvedLaunch(resolved, {
+    role: selectionOrigin(settings.definition.role),
+    brain: selectionOrigin(settings.definition.brain),
+    template: settings.template,
+    permissionMode: effectivePermissionMode(resolved),
+    missionFallback: coworkRole,
+  });
 }
 
 function shortId(id: string): string { return id.slice(0, 8); }
@@ -271,10 +271,11 @@ function launchMatches(
 async function retainRunningLaunch(input: {
   provision: ProvisionMembersInput;
   member: ExpandedMember;
+  settings: MemberSettings;
   task: string;
   roomIdentityCid: string;
 }): Promise<boolean> {
-  const { provision, member, task, roomIdentityCid } = input;
+  const { provision, member, settings, task, roomIdentityCid } = input;
   let seat = getRoomRecord(provision.roomId)!.member_seats
     .find(candidate => candidate.role_name === member.name)!;
   const dir = agentDir(member.name, true);
@@ -312,9 +313,14 @@ async function retainRunningLaunch(input: {
     if (live === 'unknown') throw new Error(`existing launch for ${member.name} has unknown liveness`);
     const retainedLaunch = seat.launch!;
     if (live === 'running') {
+      // A crash between spawn and the seat update (or a pre-upgrade launch)
+      // can retain a running member without a captured presentation; backfill
+      // it from the same persisted resolved role the match was proved against.
+      const presentation = retainedLaunch.presentation
+        ?? presentationFromStatePath(dir, settings, member.coworkRole);
       updateMemberStartup(provision.roomId, member.name, { launch: {
         ...retainedLaunch, state: 'launched', launch_id: supervisor.launchId,
-        updated_at: new Date().toISOString(),
+        presentation, updated_at: new Date().toISOString(),
       } });
       return true;
     }
@@ -416,7 +422,7 @@ async function launchMember(input: {
     )) {
       throw new Error(`new launch for ${member.name} did not persist matching provenance`);
     }
-    const presentation = launched.configuration
+    const presentation: AgentLaunchConfiguration = launched.configuration
       ? { ...launched.configuration, template: settings.template,
         ...(launched.configuration.mission ? {} : { mission: member.coworkRole }) }
       : presentationFromStatePath(launchedDir, settings, member.coworkRole);
@@ -424,17 +430,17 @@ async function launchMember(input: {
       state: 'launched', attempt, action_id: launched.creationActionId, mission_sha256: taskSha,
       agent_definition: agentDefinition, agent_fingerprint: agentFingerprint,
       agent_template: settings.template, agent_template_hash: settings.templateHash,
-      ...(presentation ? { presentation } : {}),
+      presentation,
       ...(launched.callerRole ? { caller_role: launched.callerRole } : {}),
       launch_id: supervisor.launchId, updated_at: new Date().toISOString(),
     } });
     recordFleetAuditPresentation({ kind: 'agent_started', id: member.name, name: member.name,
       lifetime: 'temporary', brain: selectionSummary(settings.definition.brain),
       role: selectionSummary(settings.definition.role),
-      harness: presentation?.harness ?? 'resolved', session: 'acp',
+      harness: presentation.harness, session: 'acp',
       permissions: permissionSummary(settings.definition), parent: provision.roomId,
       actionId: launched.creationActionId, inherited: [],
-      ...(presentation ? { configuration: presentation } : {}) });
+      configuration: presentation });
   } catch (error) {
     updateMemberStartup(provision.roomId, member.name, { launch: {
       state: 'failed', attempt, action_id: effectiveActionId, mission_sha256: taskSha,
@@ -557,13 +563,15 @@ export async function provisionMembers(
         .find(seat => seat.role_name === member.name)!;
       if (currentSeat.seat_state === 'active') {
         if (!await retainRunningLaunch({
-          provision: input, member, task, roomIdentityCid,
+          provision: input, member, settings: settings.get(member.name)!, task, roomIdentityCid,
         })) {
           throw new Error(`active Cowork seat ${member.name} has no matching live Fleet launch`);
         }
         continue;
       }
-      if (await retainRunningLaunch({ provision: input, member, task, roomIdentityCid })) continue;
+      if (await retainRunningLaunch({
+        provision: input, member, settings: settings.get(member.name)!, task, roomIdentityCid,
+      })) continue;
 
       const issued = await cowork.issueInvite(roomId, {
         mode: 'one_time', role: member.coworkRole, min_accepts: 1,

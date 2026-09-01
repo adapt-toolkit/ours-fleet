@@ -62,18 +62,13 @@ const FINGERPRINT_HEX = 12;
 export const MISSION_LABEL_MAX = 80;
 
 /**
- * `precomputed` must be a full or prefixed lowercase sha256 hex (>= 12 chars)
- * of the canonical inline body; anything else is ignored and the fingerprint
- * is recomputed here so provenance can never be an arbitrary caller string.
+ * The inline fingerprint is always computed here from the canonical inline
+ * body; provenance can never be an arbitrary caller string.
  */
-export function selectionOrigin(
-  selection: AgentSelection | undefined, precomputed?: string,
-): SelectionOrigin {
+export function selectionOrigin(selection: AgentSelection | undefined): SelectionOrigin {
   if (!selection) return { kind: 'unknown' };
   if ('ref' in selection) return { kind: 'named', ref: selection.ref };
-  const fingerprint = precomputed && /^[a-f0-9]{12,64}$/.test(precomputed)
-    ? precomputed
-    : createHash('sha256').update(canonicalJson(selection.inline)).digest('hex');
+  const fingerprint = createHash('sha256').update(canonicalJson(selection.inline)).digest('hex');
   return { kind: 'inline', fingerprint: fingerprint.slice(0, FINGERPRINT_HEX) };
 }
 
@@ -184,14 +179,19 @@ export function renderAgentConfiguration(
           ? `, mounts +${configuration.isolation.read_mounts ?? 0}ro/+${configuration.isolation.write_mounts ?? 0}rw` : ''}`
       : undefined,
   ].filter((part): part is string => Boolean(part));
-  let line = mandatory.join('; ');
+  // Semantic whole-component budgeting: components are appended atomically
+  // (never split mid-component, so Markdown spans stay intact) while the line
+  // stays inside AGENT_LINE_MAX. The markdown.ts field caps keep every
+  // well-formed mandatory join inside the budget already (worst case ≈1,410
+  // code points / ≈4,200 bytes); this loop makes the cap hold by construction
+  // even for hostile-but-validated values, so message assembly can rely on it.
+  let line = '';
   let omitted = false;
-  for (const part of optional) {
-    const next = `${line}; ${part}`;
-    if (codePoints(next) > AGENT_LINE_MAX_CODE_POINTS || utf8(next) > AGENT_LINE_MAX_BYTES) {
-      omitted = true; continue;
-    }
+  for (const part of [...mandatory, ...optional]) {
+    const next = line ? `${line}; ${part}` : part;
+    if (codePoints(`${next}; …`) > AGENT_LINE_MAX_CODE_POINTS
+        || utf8(`${next}; …`) > AGENT_LINE_MAX_BYTES) { omitted = true; continue; }
     line = next;
   }
-  return omitted ? `${line}; …` : line;
+  return omitted ? (line ? `${line}; …` : '…') : line;
 }

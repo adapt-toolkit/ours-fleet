@@ -5,10 +5,11 @@ import { join } from 'node:path';
 
 import { TaskRoomApplicationService } from '../src/application/task-room-service.js';
 import {
-  activateTask, completeTask, createTask, getTask,
+  activateTask, completeTask, createTask, getTask, updateTaskMembers,
 } from '../src/rooms-tasks/task-state.js';
 import {
   activateRoom, advanceSaga, closeRoom, createRoomRecord, getRoomRecord, setSagaError,
+  updateMemberSeats, updateMemberStartup,
 } from '../src/rooms-tasks/room-state.js';
 import { acceptTaskTerminalIntent } from '../src/rooms-tasks/terminal.js';
 import { snapshotTemplate } from '../src/rooms-tasks/templates.js';
@@ -115,6 +116,48 @@ describe('task create/start surface parity', () => {
       expect.objectContaining({ resource: 'Room', category: 'provision_failed', eventId: expect.any(String) }),
       expect.objectContaining({ resource: 'Task', category: 'provision_failed', eventId: expect.any(String) }),
     ]));
+  });
+
+  it('reuses the captured seat launch presentation in Task and Room lifecycle events', async () => {
+    const members: TemplateDefinition = { name: 'members', version: 1, description: 'Members',
+      contract: 'Execute.', members: [{ slot: 'dev', role: 'Developer', count: 1, agent_template: 'Dev' }] };
+    const cfg = { ...config(), roomTemplates: { members } } as FleetConfig;
+    const h = cowork();
+    const presentation = {
+      version: 1 as const, template: 'Dev',
+      role: { kind: 'inline' as const, fingerprint: 'abcdefabcdef' },
+      brain: { kind: 'inline' as const, fingerprint: '0f1e2d3c4b5a' },
+      harness: 'codex', session: 'acp' as const, model: 'gpt-test', effort: 'medium',
+      mission: 'Developer',
+      approval: 'allow' as const, filesystem: 'unrestricted' as const, unattended: 'wait' as const,
+      permissionMode: { fleetMode: 'allow' as const, nativeMode: 'full-access' },
+      monitor: { mode: 'fleet' as const, interrupt: true },
+    };
+    const provision = vi.fn(async ({ roomId, taskId }: { roomId: string; taskId: string }) => {
+      updateMemberSeats(roomId, [{ role_name: 'member-dev', slot: 'dev', cowork_role: 'Developer',
+        identity_cid: 'cid-member-dev', seat_state: 'active' }]);
+      updateMemberStartup(roomId, 'member-dev', { launch: {
+        state: 'launched', attempt: 1, presentation, updated_at: new Date().toISOString() } });
+      updateTaskMembers(taskId, [{ name: 'member-dev', identity_cid: 'cid-member-dev',
+        slot: 'dev', cowork_role: 'Developer' }]);
+      activateTask(taskId);
+      return activateRoom(roomId);
+    });
+    const app = new TaskRoomApplicationService(undefined, { loadConfiguration: () => cfg,
+      cowork: () => h.adapter, binPath: () => '/fleet', provisionMembers: provision as any });
+    beginFleetAuditCollection();
+    const task = await app.createTask({ actor: { kind: 'local_control', surface: 'cli' },
+      title: 'Configured', template: 'members', origin: { type: 'cli' } });
+    const events = consumeFleetAuditCollection().presentations ?? [];
+    expect(task.state).toBe('active');
+    const work = events.find(event => event.kind === 'task' && event.operation === 'work') as
+      Extract<typeof events[number], { kind: 'task' }>;
+    expect(work.agents).toEqual([expect.objectContaining({
+      name: 'member-dev', configuration: presentation })]);
+    const activate = events.find(event => event.kind === 'room' && event.operation === 'activate') as
+      Extract<typeof events[number], { kind: 'room' }>;
+    expect(activate.participants).toEqual([expect.objectContaining({
+      name: 'member-dev', id: 'cid-member-dev', configuration: presentation })]);
   });
 
   it('runs the extracted complete provision flow for create', async () => {

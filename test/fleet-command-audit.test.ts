@@ -294,14 +294,13 @@ describe('human-readable launch configuration', () => {
     expect(line).toContain('``rev`iewer``');
   });
 
-  it('derives inline fingerprints canonically and rejects arbitrary provenance strings', () => {
+  it('always derives inline fingerprints canonically from the inline body', () => {
     const inline = selectionOrigin({ inline: { harness: 'codex', model: 'gpt-5' } });
     expect(inline).toMatchObject({ kind: 'inline' });
     expect((inline as { fingerprint: string }).fingerprint).toMatch(/^[a-f0-9]{12}$/u);
-    const forged = selectionOrigin({ inline: { harness: 'codex', model: 'gpt-5' } }, 'not-a-hash!!');
-    expect(forged).toEqual(inline);
-    const accepted = selectionOrigin({ inline: { a: 1 } }, 'abcdefabcdefabcdef');
-    expect((accepted as { fingerprint: string }).fingerprint).toBe('abcdefabcdef');
+    // Deterministic for the same canonical body, different for a different one.
+    expect(selectionOrigin({ inline: { model: 'gpt-5', harness: 'codex' } })).toEqual(inline);
+    expect(selectionOrigin({ inline: { harness: 'codex' } })).not.toEqual(inline);
     expect(selectionOrigin({ ref: 'reviewer' })).toEqual({ kind: 'named', ref: 'reviewer' });
     expect(selectionOrigin(undefined)).toEqual({ kind: 'unknown' });
   });
@@ -376,8 +375,33 @@ describe('human-readable launch configuration', () => {
     expect(attempt({ ...named(), filesystem: 'everything' })).toThrow();       // bad enum
     expect(attempt({ ...named(), monitor: { mode: 'psychic', interrupt: false } })).toThrow();
     expect(attempt({ ...named(), role: { kind: 'inline', fingerprint: 'XYZ' } })).toThrow();
+    expect(attempt({ ...named(), role: { kind: 'inline', fingerprint: 'abcdef' } })).toThrow();  // exactly 12 hex
     expect(attempt({ ...named(), isolation: { requested: 'bubblewrap', read_mounts: -1 } })).toThrow();
+    expect(attempt({ ...named(), mission: 'M'.repeat(81) })).toThrow();                          // builder cap is 80 cp
     expect(attempt({ ...named(), version: 2 })).toThrow();
+  });
+
+  it('never overflows across the note boundary: whole-line admission sweep', () => {
+    // Sweep mission padding in 1-code-point steps with near-line-budget agent
+    // lines so successive renders cross every residue around the omission
+    // note, including the exact 'candidate fits, candidate+note does not'
+    // window that previously had an unchecked return path.
+    const big = (pad: number): AgentLaunchConfiguration => ({ ...named(),
+      template: '𝕏'.repeat(120), model: '𝕐'.repeat(120),
+      mission: `${'𝕄'.repeat(40)}${'M'.repeat(Math.min(pad, 40))}`,
+      permissionMode: { fleetMode: 'ask', nativeMode: '𝕅'.repeat(60) } });
+    for (let pad = 0; pad <= 40; pad++) {
+      const rendered = renderFleetLifecycleEvent({ kind: 'task', operation: 'work', id: 't1',
+        previousState: 'provisioning', newState: 'active',
+        agents: Array.from({ length: 8 }, (_, index) => ({
+          name: `agent-${index}`, role: 'Member', configuration: big(pad) })) });
+      expect(Array.from(rendered).length).toBeLessThanOrEqual(MARKDOWN_MAX_CODE_POINTS);
+      expect(Buffer.byteLength(rendered, 'utf8')).toBeLessThanOrEqual(MARKDOWN_MAX_BYTES);
+      const shown = [...rendered.matchAll(/- `agent-\d+`/gu)].length;
+      const note = /…and (\d+) more agents? omitted\./u.exec(rendered);
+      expect(shown + (note ? Number(note[1]) : 0)).toBe(8);
+      expect(shown).toBeGreaterThanOrEqual(1);
+    }
   });
 
   it('keeps accepting legacy presentations without a configuration', () => {

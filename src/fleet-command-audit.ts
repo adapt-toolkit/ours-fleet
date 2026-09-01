@@ -345,7 +345,7 @@ const APPROVAL_MODES = new Set(['ask', 'auto', 'allow', 'deny']);
 const FILESYSTEM_MODES = new Set(['read-only', 'workspace', 'unrestricted']);
 const UNATTENDED_MODES = new Set(['deny', 'wait']);
 const FLEET_PERMISSION_MODES = new Set(['ask', 'auto', 'allow']);
-const PRESENTATION_TEXT = /[ --‪-‮⁦-⁩]/u;
+const PRESENTATION_TEXT = /[\u0000-\u001f\u007f-\u009f\u202a-\u202e\u2066-\u2069]/u;
 
 /**
  * Exact-key validation of a current-version launch configuration. A partial
@@ -364,7 +364,7 @@ function validConfiguration(value: unknown): value is AgentLaunchConfiguration {
     if (!record(v)) return false;
     if (v.kind === 'named') return exact(v, ['kind', 'ref']) && text(v.ref, 160);
     if (v.kind === 'inline') return exact(v, ['kind', 'fingerprint'])
-      && (v.fingerprint === undefined || (typeof v.fingerprint === 'string' && /^[a-f0-9]{1,12}$/.test(v.fingerprint)));
+      && (v.fingerprint === undefined || (typeof v.fingerprint === 'string' && /^[a-f0-9]{12}$/.test(v.fingerprint)));
     return v.kind === 'unknown' && exact(v, ['kind']);
   };
   const count = (v: unknown) => v === undefined
@@ -376,7 +376,9 @@ function validConfiguration(value: unknown): value is AgentLaunchConfiguration {
     && (c.model === null || text(c.model, 160))
     && (c.template === undefined || text(c.template, 160))
     && (c.effort === undefined || text(c.effort, 32))
-    && (c.mission === undefined || text(c.mission, 200))
+    // The builder caps the mission label at 80 code points; enforce the same
+    // invariant here so the per-line budget proof holds for wire input too.
+    && (c.mission === undefined || (text(c.mission, 200) && Array.from(String(c.mission)).length <= 80))
     && APPROVAL_MODES.has(String(c.approval))
     && FILESYSTEM_MODES.has(String(c.filesystem))
     && UNATTENDED_MODES.has(String(c.unattended))
@@ -482,11 +484,12 @@ function appendAgentLines(header: string, heading: string, lines: string[]): str
   for (const [index, line] of lines.entries()) {
     const candidate = `${message}\n- ${line}`;
     const remaining = lines.length - index - 1;
-    const fits = remaining
-      ? withinMessageBounds(`${candidate}${note(remaining)}`)
-      : withinMessageBounds(candidate);
-    if (!fits && !(index === 0 && withinMessageBounds(candidate))) {
-      return `${message}${note(lines.length - index)}`;
+    // A candidate is admitted only when it fits together with the note for
+    // every agent still pending, so each stop-return below re-states a bound
+    // that was verified when the current message was admitted.
+    if (!withinMessageBounds(remaining ? `${candidate}${note(remaining)}` : candidate)) {
+      const stopped = `${message}${note(lines.length - index)}`;
+      return withinMessageBounds(stopped) ? stopped : `${header}${note(lines.length)}`;
     }
     message = candidate;
   }

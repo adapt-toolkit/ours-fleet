@@ -318,6 +318,43 @@ describe('owner channel daemon-generation recovery', () => {
     await channel.close();
   });
 
+  it('delivers the human-readable launch configuration in the spawn notification', async () => {
+    const { channel, client } = setup([]);
+    await channel.start();
+    await channel.recover('boot-configured');
+    await channel.notifyFleetSpawn({
+      caller: 'Coordinator', role: 'Dev', lifetime: 'temporary', harness: 'codex',
+      session: 'acp', model: 'gpt-test',
+      monitor: { mode: 'fleet', interrupt: false }, inherited: ['brain'],
+      creationActionId: 'creation-configured',
+      brainSummary: 'ref:codex-high (inherited)', roleSummary: 'ref:reviewer (explicit)',
+      permissionMode: { fleetMode: 'ask', nativeMode: 'read-only' },
+      configuration: {
+        version: 1, role: { kind: 'named', ref: 'reviewer' },
+        brain: { kind: 'named', ref: 'codex-high' },
+        harness: 'codex', session: 'acp', model: 'gpt-test', effort: 'high',
+        mission: 'Review every change',
+        approval: 'ask', filesystem: 'workspace', unattended: 'wait',
+        permissionMode: { fleetMode: 'ask', nativeMode: 'read-only' },
+        monitor: { mode: 'fleet', interrupt: false },
+      },
+    } as never);
+    const sends = client.calls.filter(call => call.name === 'sendMessage');
+    expect(sends).toHaveLength(1);
+    const text = String(sends[0].args?.text);
+    expect(text).toContain('spawned temporary Agent Dev (Dev) — ready');
+    expect(text).toContain('Role preset `reviewer`');
+    expect(text).toContain('mission “Review every change”');
+    expect(text).toContain('Brain preset `codex-high`');
+    expect(text).toContain('harness `codex`');
+    expect(text).toContain('model `gpt-test`');
+    expect(text).toContain('effort high');
+    expect(text).toContain('approval=ask, filesystem=workspace, unattended=wait');
+    expect(text).toContain('mode ask/read-only');
+    expect(text).not.toContain('inline:sha256');
+    await channel.close();
+  });
+
   it('processes a new authenticated Owner wire end-to-end after recovery exactly once', async () => {
     const { channel, client, queuePrompt, dir } = setup([]);
     await channel.start();

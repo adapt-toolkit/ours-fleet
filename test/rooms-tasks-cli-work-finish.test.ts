@@ -16,6 +16,7 @@ const mocks = vi.hoisted(() => ({
   launchFleetWorker: vi.fn(),
   recoverRoom: vi.fn(),
   getRoom: vi.fn(),
+  getSeats: vi.fn(),
   listRooms: vi.fn(),
   markdownRender: vi.fn(),
 }));
@@ -31,7 +32,7 @@ vi.mock('../src/rooms-tasks/cowork-adapter.js', async (importOriginal) => {
       recoverRoom: mocks.recoverRoom,
       getRoom: mocks.getRoom,
       listRooms: mocks.listRooms,
-      getSeats: vi.fn().mockResolvedValue([]),
+      getSeats: mocks.getSeats,
     }),
   };
 });
@@ -194,6 +195,7 @@ beforeEach(() => {
     room_id: ROOM_ID, identity_name: 'room-id', identity_cid: 'c'.repeat(64),
     room_name: 'Fix the parser', state: 'active', seats: [], role_briefings: {},
   });
+  mocks.getSeats.mockReset().mockResolvedValue([]);
   mocks.listRooms.mockReset().mockResolvedValue([]);
   mocks.closeRoom.mockReset().mockResolvedValue(undefined);
   mocks.deleteRoom.mockReset().mockResolvedValue(undefined);
@@ -342,6 +344,59 @@ describe('public task/room failure presentation', () => {
       expectMarkdownFailure(out.join('\n'));
       expect(out.join('\n')).toContain('Run ours-fleet room list');
     }
+  });
+
+  it('appends the shared escaped launch summary to task show and room show/members listings', async () => {
+    const presentation = {
+      version: 1 as const, template: 'Agent',
+      role: { kind: 'named' as const, ref: 'reviewer' },
+      brain: { kind: 'inline' as const, fingerprint: '0f1e2d3c4b5a' },
+      harness: 'codex', session: 'acp' as const, model: 'gpt-test', effort: 'high',
+      mission: '**hostile** [mission](https://x)',
+      approval: 'ask' as const, filesystem: 'workspace' as const, unattended: 'wait' as const,
+      permissionMode: { fleetMode: 'ask' as const, nativeMode: 'read-only' },
+      monitor: { mode: 'fleet' as const, interrupt: false },
+    };
+    createRoomRecord({ room_id: ROOM_ID, room_name: 'Configured room', room_identity_cid: 'c'.repeat(64) });
+    updateMemberSeats(ROOM_ID, [{ role_name: 'member-dev', slot: 'dev', cowork_role: 'Developer',
+      identity_cid: 'cid-dev', seat_state: 'active' }]);
+    const { updateMemberStartup } = await import('../src/rooms-tasks/room-state.js');
+    updateMemberStartup(ROOM_ID, 'member-dev', { launch: {
+      state: 'launched', attempt: 1, presentation, updated_at: new Date().toISOString() } });
+    const task = createTask({ title: 'Configured task', origin: { type: 'cli' },
+      start: true, room_id: ROOM_ID });
+    updateTaskMembers(task.task_id, [{ name: 'member-dev', identity_cid: 'cid-dev',
+      slot: 'dev', cowork_role: 'Developer' }]);
+    const seat = {
+      identity_cid: 'cid-dev', display_name: 'member-dev', invite_id: 'inv-1',
+      role: 'Developer', seat_state: 'active' as const,
+    };
+    mocks.getRoom.mockResolvedValue({ room_id: ROOM_ID, identity_name: 'room-id',
+      identity_cid: 'c'.repeat(64), room_name: 'Configured room', state: 'active',
+      seats: [seat], role_briefings: {} });
+    mocks.getSeats.mockResolvedValue([seat]);
+
+    const expectSummary = (rendered: string): void => {
+      expect(rendered).toContain('template `Agent`');
+      expect(rendered).toContain('Role preset `reviewer`');
+      expect(rendered).toContain('inline Brain (def `0f1e2d3c4b5a`)');
+      expect(rendered).toContain('harness `codex`');
+      expect(rendered).toContain('model `gpt-test`');
+      expect(rendered).toContain('approval=ask, filesystem=workspace, unattended=wait');
+      expect(rendered).toContain('mode ask/read-only');
+      expect(rendered).not.toContain('**hostile**');
+      expect(rendered).not.toContain('[mission](https://x)');
+      expect(rendered).not.toContain('inline:sha256');
+    };
+    out = [];
+    await runLocalTask('show', task.task_id);
+    expectSummary(out.join('\n'));
+    out = [];
+    await runRoom('show', ROOM_ID);
+    expectSummary(out.join('\n'));
+    out = [];
+    await runRoom('members', ROOM_ID);
+    expectSummary(out.join('\n'));
   });
 });
 
