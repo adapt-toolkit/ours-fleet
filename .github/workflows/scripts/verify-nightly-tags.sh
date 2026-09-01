@@ -2,7 +2,10 @@
 set -euo pipefail
 
 expected="${1:?usage: verify-nightly-tags.sh <expected-version>}"
-attempts="${NIGHTLY_VERIFY_ATTEMPTS:-12}"
+# npm may keep a successfully accepted package in processing for several
+# minutes. Sixty attempts fit comfortably inside the job's 20-minute timeout
+# while preserving a bounded failure if the registry never converges.
+attempts="${NIGHTLY_VERIFY_ATTEMPTS:-60}"
 delay="${NIGHTLY_VERIFY_DELAY_SECONDS:-5}"
 packages=(
   "@ours.network/fleet"
