@@ -5,11 +5,13 @@ import type {
   TasksConfig, TemplateDefinition, RoomTemplatesConfig, TemplateMemberSlot,
   ROOMS_KEYS, ROOMS_OWNER_KEYS, ROOMS_COWORK_KEYS, ROOMS_DEFAULTS_KEYS,
   TASKS_KEYS, TEMPLATE_KEYS, TEMPLATE_MEMBER_KEYS,
+  TEMPLATE_ROOM_KEYS,
 } from './types.js';
 import {
   ROOMS_KEYS as RK, ROOMS_OWNER_KEYS as ROK, ROOMS_COWORK_KEYS as RCK,
   ROOMS_DEFAULTS_KEYS as RDK, TASKS_KEYS as TK, TEMPLATE_KEYS as TPK,
   TEMPLATE_MEMBER_KEYS as TMK,
+  TEMPLATE_ROOM_KEYS as TRK,
 } from './types.js';
 
 const isPlainObject = (v: unknown): v is Record<string, unknown> =>
@@ -207,6 +209,9 @@ export function validateRoomTemplatesConfig(
     if (tplRaw.room !== undefined) {
       if (!isPlainObject(tplRaw.room))
         throw new RoomsTasksConfigError(path, `room_templates.${name}.room: must be a mapping`);
+      rejectUnknown(tplRaw.room, TRK as unknown as string[], path, `room_templates.${name}.room`);
+      for (const key of TRK) if (tplRaw.room[key] !== undefined && typeof tplRaw.room[key] !== 'boolean')
+        throw new RoomsTasksConfigError(path, `room_templates.${name}.room.${key}: must be a boolean`);
       room = {
         quiet_membership: tplRaw.room.quiet_membership as boolean | undefined,
         anonymous: tplRaw.room.anonymous as boolean | undefined,

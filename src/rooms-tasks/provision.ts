@@ -14,6 +14,7 @@ import type {
   RoomOrchestrationRecord, RoomMemberSeat, TaskMemberRole,
   TemplateSnapshot, TemplateMemberSlot,
 } from './types.js';
+import { storedRoomLaunchPolicy } from './types.js';
 import { spawnTemp } from '../spawn.js';
 import type { SpawnOpts } from '../spawn.js';
 import { type FleetConfig, type RoomMemberStartup } from '../config.js';
@@ -249,6 +250,7 @@ function launchMatches(
   roomId: string,
   roomIdentityCid: string,
   expectedInviteId?: string,
+  anonymous = false,
 ): boolean {
   const provenance = readProvenance(dir);
   if (provenance?.creationActionId !== actionId || provenance.role !== member.name) return false;
@@ -264,6 +266,7 @@ function launchMatches(
       && startup.room_identity_cid === roomIdentityCid
       && startup.identity_name === member.name
       && startup.role === member.coworkRole
+      && (startup.anonymous ?? false) === anonymous
       && sha256Text(startup.task ?? '') === taskSha
       && (expectedInviteId === undefined || startup.invite_id === expectedInviteId)
       && typeof startup.invite === 'string'
@@ -283,12 +286,14 @@ async function retainRunningLaunch(input: {
     .find(candidate => candidate.role_name === member.name)!;
   const dir = agentDir(member.name, true);
   const taskSha = sha256Text(task);
+  const anonymous = storedRoomLaunchPolicy(
+    getRoomRecord(provision.roomId)?.room_policy).anonymous;
 
   if ((seat.launch?.state === 'intent' || seat.launch?.state === 'launched'
       || seat.launch?.state === 'failed') && existsSync(dir)) {
     if (!seat.launch.action_id || !launchMatches(
       dir, member, seat.launch.action_id, taskSha, provision.roomId,
-      roomIdentityCid, seat.invite_id,
+      roomIdentityCid, seat.invite_id, anonymous,
     )) {
       const provenance = readProvenance(dir);
       const adoptable = (seat.launch.state === 'intent' || seat.launch.state === 'failed')
@@ -298,7 +303,7 @@ async function retainRunningLaunch(input: {
         && typeof provenance.creationActionId === 'string'
         && launchMatches(
           dir, member, provenance.creationActionId, taskSha, provision.roomId,
-          roomIdentityCid, seat.invite_id,
+          roomIdentityCid, seat.invite_id, anonymous,
         );
       if (!adoptable)
         throw new Error(`existing launch for ${member.name} does not match its durable intent`);
@@ -341,7 +346,7 @@ async function retainRunningLaunch(input: {
     const archive = await secureStoppedTempArchive(member.name, seat.launch.launch_id);
     if (!launchMatches(
       archive, member, seat.launch.action_id, taskSha, provision.roomId,
-      roomIdentityCid, seat.invite_id,
+      roomIdentityCid, seat.invite_id, anonymous,
     )) {
       throw new Error(`archive for disappeared ${member.name} does not match its durable intent`);
     }
@@ -357,7 +362,7 @@ async function retainRunningLaunch(input: {
     const archive = tempArchiveForCreationAction(member.name, seat.launch.action_id);
     if (!archive || !launchMatches(
       archive.path, member, seat.launch.action_id, taskSha, provision.roomId,
-      roomIdentityCid, seat.invite_id,
+      roomIdentityCid, seat.invite_id, anonymous,
     )) {
       throw new Error(
         `launch intent for ${member.name} has no exact live or terminated archive evidence`,
@@ -446,7 +451,7 @@ async function launchMemberUnlocked(input: {
     const supervisor = readTempSupervisor(launchedDir);
     if (!supervisor || supervisor.role !== member.name || !launchMatches(
       launchedDir, member, launched.creationActionId, taskSha, provision.roomId,
-      startup.room_identity_cid, startup.invite_id,
+      startup.room_identity_cid, startup.invite_id, startup.anonymous ?? false,
     )) {
       throw new Error(`new launch for ${member.name} did not persist matching provenance`);
     }
@@ -526,6 +531,14 @@ function reconcileMemberSeats(
   return { complete, seats };
 }
 
+function assertCoworkRoomPolicy(
+  room: Awaited<ReturnType<CoworkAdapter['recoverRoom']>>,
+  expectedAnonymous: boolean,
+): void {
+  if ((room.anonymous ?? false) !== expectedAnonymous)
+    throw new Error(`Cowork anonymity (${String(room.anonymous ?? false)}) does not match Fleet's durable Room policy (${String(expectedAnonymous)})`);
+}
+
 export async function provisionMembers(
   input: ProvisionMembersInput,
 ): Promise<RoomOrchestrationRecord> {
@@ -544,6 +557,7 @@ export async function provisionMembers(
     throw new Error(`room ${roomId} has no pinned room identity CID`);
   const roomIdentityCid = existing.room_identity_cid;
   const ownerSeatCid = existing.owner_seat_cid ?? null;
+  const roomPolicy = storedRoomLaunchPolicy(existing.room_policy);
 
   const persistedNames = new Set(existing.member_seats.map(seat => seat.role_name));
   const resuming = members.length > 0
@@ -587,6 +601,7 @@ export async function provisionMembers(
   advanceSaga(roomId, 'join_role_groups', 4);
   try {
     const initialRoom = await cowork.recoverRoom(roomId);
+    assertCoworkRoomPolicy(initialRoom, roomPolicy.anonymous);
     reconcileMemberSeats(roomId, members, initialRoom.seats);
     for (const member of members) {
       const task = tasks.get(member.name)!;
@@ -624,6 +639,7 @@ export async function provisionMembers(
             role: member.coworkRole,
             task,
             owner_seat_cid: ownerSeatCid,
+            anonymous: roomPolicy.anonymous,
           },
         });
       } catch (error) {
@@ -650,6 +666,7 @@ export async function provisionMembers(
   let delay = policy.initialDelayMs;
   for (;;) {
     const remote = await cowork.recoverRoom(roomId);
+    assertCoworkRoomPolicy(remote, roomPolicy.anonymous);
     const reconciled = reconcileMemberSeats(roomId, members, remote.seats);
     if (reconciled.complete) break;
     if (policy.now() >= deadline) {

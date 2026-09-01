@@ -47,6 +47,7 @@ export interface CoworkRoomInfo {
   identity_cid: string;
   room_name: string;
   state: 'provisioning' | 'active' | 'closing' | 'closed';
+  anonymous: boolean;
   seats: CoworkSeatInfo[];
   goal?: string;
   briefing?: string;
@@ -154,6 +155,11 @@ function roomState(value: unknown, operation: string): CoworkRoomInfo['state'] {
   return value;
 }
 
+function boolean(value: unknown, operation: string, label: string): boolean {
+  if (typeof value !== 'boolean') throw new CoworkProtocolError(operation, `${label} must be a boolean`);
+  return value;
+}
+
 function seatState(value: unknown, operation: string): CoworkSeatInfo['seat_state'] {
   if (value !== 'pending' && value !== 'active' && value !== 'removed')
     throw new CoworkProtocolError(operation, 'seat state is invalid');
@@ -197,6 +203,7 @@ function projectRoom(value: unknown, operation: string): CoworkRoomInfo {
     identity_cid: text(room.identity_cid, operation, 'room.identity_cid'),
     room_name: string(room.room_name, operation, 'room.room_name'),
     state: roomState(room.state, operation),
+    anonymous: room.anonymous === undefined ? false : boolean(room.anonymous, operation, 'room.anonymous'),
     seats: room.seats.map((seat) => projectSeat(seat, operation)),
     role_briefings: projectedBriefings,
     ...(typeof mission?.goal === 'string' ? { goal: mission.goal } : {}),

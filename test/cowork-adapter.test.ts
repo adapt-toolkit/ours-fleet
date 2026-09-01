@@ -26,6 +26,7 @@ function room(overrides: Record<string, unknown> = {}) {
     identity_name: 'ours-cowork-01ABCDEF0123456789ABCDEFGH',
     identity_cid: 'A'.repeat(64),
     state: 'provisioning',
+    anonymous: false,
     mission: { goal: 'Ship', briefing: 'Cross-check everything', briefing_version: 1 },
     seats: [],
     ...overrides,

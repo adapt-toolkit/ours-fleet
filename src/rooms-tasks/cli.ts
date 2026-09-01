@@ -33,6 +33,12 @@ function commandArgv(command: Command): string[] {
   while (root.parent) root = root.parent;
   return (root as Command & { rawArgs?: string[] }).rawArgs ?? process.argv.slice(2);
 }
+function cliAnonymousOverride(argv: readonly string[]): boolean | undefined {
+  const enabled = argv.includes('--anonymous');
+  const disabled = argv.includes('--no-anonymous');
+  if (enabled && disabled) throw new Error('--anonymous and --no-anonymous are mutually exclusive');
+  return enabled ? true : disabled ? false : undefined;
+}
 import {
   createTask, getTask, getDeletingTask, listTasks, startTask, activateTask,
   blockTask, unblockTask, reviewTask,
@@ -757,6 +763,8 @@ export function registerTaskCommands(parent: Command, cOpt: (cmd: Command) => Co
     .option('--brief-file <path>', 'task brief from file')
     .option('--backlog', 'create in backlog (do not start immediately)')
     .option('--no-room', 'create task without a room')
+    .option('--anonymous', 'create an anonymous Cowork room')
+    .option('--no-anonymous', 'explicitly disable template anonymous mode')
     .option('--idempotency-key <key>', 'idempotency key')
     .option('--list <name>', 'task list (default: default)')
     .option('--members-file <path>', 'typed YAML member overrides')
@@ -782,6 +790,7 @@ export function registerTaskCommands(parent: Command, cOpt: (cmd: Command) => Co
           actor: { kind: 'local_control', surface: 'cli' }, title: opts.title,
           brief: opts.brief, briefFile: opts.briefFile, template: opts.template,
           backlog: opts.backlog, noRoom: opts.room === false,
+          anonymous: cliAnonymousOverride(commandArgv(command)),
           idempotencyKey: opts.idempotencyKey, origin: { type: 'cli' },
           list: opts.list,
           members,
@@ -931,6 +940,8 @@ export function registerTaskCommands(parent: Command, cOpt: (cmd: Command) => Co
   cOpt(taskCmd.command('start <id>'))
     .description('idempotently select a plan, provision, and start a task')
     .option('--template <name>', 'room template')
+    .option('--anonymous', 'create an anonymous Cowork room')
+    .option('--no-anonymous', 'explicitly disable template anonymous mode')
     .option('--members-file <path>', 'typed YAML member overrides')
     .option('--member <slot>', 'begin a typed member override block')
     .option('--agent-template <id>', 'Agent Template for current member')
@@ -948,6 +959,7 @@ export function registerTaskCommands(parent: Command, cOpt: (cmd: Command) => Co
         const t = await taskRoomService(opts.configuration).startTask({
           actor: { kind: 'local_control', surface: 'cli' }, taskId: id,
           template: opts.template, members: cliMemberOverrides(opts.membersFile, commandArgv(command)),
+          anonymous: cliAnonymousOverride(commandArgv(command)),
         });
         if (opts.json) { console.log(JSON.stringify({ schema_version: 1, task: t }, null, 2)); return; }
         console.log(taskActionMarkdown('Task started', t));
@@ -1271,6 +1283,8 @@ export function registerTaskCommands(parent: Command, cOpt: (cmd: Command) => Co
   cOpt(taskCmd.command('work <id>'))
     .description('deprecated alias for task start')
     .option('--template <name>', 'room template')
+    .option('--anonymous', 'create an anonymous Cowork room')
+    .option('--no-anonymous', 'explicitly disable template anonymous mode')
     .option('--members-file <path>', 'typed YAML member overrides')
     .option('--member <slot>', 'begin a typed member override block')
     .option('--agent-template <id>', 'Agent Template for current member')
@@ -1290,6 +1304,7 @@ export function registerTaskCommands(parent: Command, cOpt: (cmd: Command) => Co
         const result = await taskRoomService(opts.configuration).ensureTaskWork({
           actor: { kind: 'local_control', surface: 'cli' }, taskId: id, template: opts.template,
           members: cliMemberOverrides(opts.membersFile, commandArgv(command)),
+          anonymous: cliAnonymousOverride(commandArgv(command)),
         });
         const t = result.task;
         auditTask('work', t, previous);
@@ -1376,6 +1391,8 @@ export function registerRoomCommands(parent: Command, cOpt: (cmd: Command) => Co
     .description('create a standalone room')
     .requiredOption('--name <name>', 'room name')
     .option('--template <name>', 'room template')
+    .option('--anonymous', 'create an anonymous Cowork room')
+    .option('--no-anonymous', 'explicitly disable template anonymous mode')
     .option('--goal <text>', 'room goal')
     .option('--brief <text>', 'room briefing')
     .option('--brief-file <path>', 'room briefing from file')
@@ -1400,6 +1417,7 @@ export function registerRoomCommands(parent: Command, cOpt: (cmd: Command) => Co
           actor: { kind: 'local_control', surface: 'cli' }, name: opts.name,
           template: opts.template, goal: opts.goal, brief: opts.brief, briefFile: opts.briefFile,
           members: cliMemberOverrides(opts.membersFile, commandArgv(command)),
+          anonymous: cliAnonymousOverride(commandArgv(command)),
         });
 
         if (opts.json) {

@@ -20,10 +20,10 @@ export interface BriefingOpts {
   temporaryIdentity?: boolean;
 }
 
-function temporaryIdentityBootstrap(id: string, v: BriefingVocab): string[] {
+function temporaryIdentityBootstrap(id: string, v: BriefingVocab, anonymous = false): string[] {
   return [
     `2. CREATE your ours identity now: call **${v.temporaryCreateTool}** through ours MCP`,
-    `   with the exact assigned name "${id}". The ours connector owns its cleanup when this`,
+    `   with the exact assigned name "${id}"${anonymous ? ' and expose_local=false' : ''}. The ours connector owns its cleanup when this`,
     '   connector session lifecycle ends.',
     '   Do not inspect, preserve, adopt, or use any pre-existing or persistent identity.',
     '   On a collision, missing tool, or creation error, STOP and',
@@ -50,7 +50,7 @@ function generateRoomMemberBriefing(
   L.push('', '### One-time room invite', '', '```text', startup.invite, '```');
   L.push('', '## Do these NOW, in order');
   L.push(`1. ${v.launchNote(role.name)}`);
-  L.push(...temporaryIdentityBootstrap(startup.identity_name, v));
+  L.push(...temporaryIdentityBootstrap(startup.identity_name, v, startup.anonymous));
   L.push('3. Call **add_contact** through ours MCP with the exact one-time invite above. Confirm');
   L.push(`   that it resolves to room CID \`${startup.room_identity_cid}\`. The contact may remain`);
   L.push('   pending while the room finishes its asynchronous verification.');

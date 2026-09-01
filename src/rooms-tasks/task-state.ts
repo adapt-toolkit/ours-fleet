@@ -8,7 +8,7 @@ import type {
   TaskOutcome, TaskMemberRole, TaskTerminalIntent,
   TaskDeletionActor, TaskDeletionMemberPhase,
 } from './types.js';
-import { TASK_TERMINAL_STATES, TASK_CANCELLABLE_STATES } from './types.js';
+import { storedRoomLaunchPolicy, TASK_TERMINAL_STATES, TASK_CANCELLABLE_STATES } from './types.js';
 import { DEFAULT_TASK_LIST_ID, readTaskLists } from './task-lists.js';
 
 export const tasksDir = () => join(stateRoot(), 'tasks');
@@ -155,7 +155,9 @@ export function createTask(input: CreateTaskInput): TaskRecord {
   if (existing) {
     const existingPlan = existing.execution_plan?.plan_hash;
     const requestedPlan = input.execution_plan?.plan_hash;
-    if (existingPlan !== requestedPlan)
+    const existingPolicy = storedRoomLaunchPolicy(existing.execution_plan?.room_policy);
+    const requestedPolicy = storedRoomLaunchPolicy(input.execution_plan?.room_policy);
+    if (existingPlan !== requestedPlan || JSON.stringify(existingPolicy) !== JSON.stringify(requestedPolicy))
       throw new TaskStateError(`idempotency key '${key}' was already used with a different execution plan`);
     return existing;
   }
@@ -190,8 +192,14 @@ export function updateTaskExecutionPlan(
   return withTaskLock(id, () => {
     const task = readTask(id);
     assertNoPendingDeletion(task);
-    if (task.execution_plan && task.execution_plan.plan_hash !== executionPlan.plan_hash)
-      throw new TaskStateError(`task ${id} execution plan mismatch`);
+    if (task.execution_plan) {
+      if (task.execution_plan.plan_hash !== executionPlan.plan_hash)
+        throw new TaskStateError(`task ${id} execution plan mismatch`);
+      const before = storedRoomLaunchPolicy(task.execution_plan.room_policy);
+      const after = storedRoomLaunchPolicy(executionPlan.room_policy);
+      if (task.room_id && JSON.stringify(before) !== JSON.stringify(after))
+        throw new TaskStateError(`task ${id} Room launch policy cannot change after Room creation`);
+    }
     task.execution_plan = executionPlan;
     task.template = { name: executionPlan.snapshot.name, version: executionPlan.snapshot.version,
       content_hash: executionPlan.snapshot.content_hash };

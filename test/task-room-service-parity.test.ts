@@ -171,6 +171,44 @@ describe('task create/start surface parity', () => {
     expect(h.createRoom).toHaveBeenCalledOnce();
   });
 
+  it('uses the template anonymous flag when no explicit override is supplied', async () => {
+    const cfg = { ...config(), roomTemplates: {
+      'empty-team': { ...definition, room: { anonymous: true } },
+    } } as FleetConfig;
+    const h = cowork();
+    const app = new TaskRoomApplicationService(undefined, {
+      loadConfiguration: () => cfg, cowork: () => h.adapter, binPath: () => '/fleet',
+      provisionMembers: vi.fn(),
+    });
+    const result = await app.createTask({
+      actor: { kind: 'local_control', surface: 'cli' }, title: 'Anonymous from template',
+      template: 'empty-team', origin: { type: 'cli' },
+    });
+
+    expect(h.createRoom).toHaveBeenCalledWith(expect.objectContaining({ anonymous: true }));
+    expect(result.execution_plan?.room_policy).toEqual({ anonymous: true });
+  });
+
+  it('lets an explicit CLI-style override disable template anonymity', async () => {
+    const anonymousDefinition: TemplateDefinition = {
+      ...definition, room: { anonymous: true },
+    };
+    const cfg = { ...config(), roomTemplates: { 'empty-team': anonymousDefinition } } as FleetConfig;
+    const h = cowork();
+    const app = new TaskRoomApplicationService(undefined, {
+      loadConfiguration: () => cfg, cowork: () => h.adapter, binPath: () => '/fleet',
+      provisionMembers: vi.fn(),
+    });
+    const result = await app.createTask({
+      actor: { kind: 'local_control', surface: 'cli' }, title: 'Public override',
+      template: 'empty-team', anonymous: false, origin: { type: 'cli' },
+    });
+
+    expect(h.createRoom).toHaveBeenCalledWith(expect.objectContaining({ anonymous: false }));
+    expect(result.execution_plan?.room_policy).toEqual({ anonymous: false });
+    expect(getRoomRecord(result.room_id!)?.room_policy).toEqual({ anonymous: false });
+  });
+
   it('pins a sealed execution plan for template-only backlog creation and starts after config removal', async () => {
     const h = cowork();
     let current = config();
@@ -179,9 +217,10 @@ describe('task create/start surface parity', () => {
       provisionMembers: vi.fn(),
     });
     const backlog = await app.createTask({ actor: { kind: 'local_control', surface: 'cli' },
-      title: 'Pinned backlog', template: 'empty-team', backlog: true, origin: { type: 'cli' } });
+      title: 'Pinned backlog', template: 'empty-team', backlog: true, anonymous: true,
+      origin: { type: 'cli' } });
     expect(backlog).toMatchObject({ state: 'backlog', execution_plan: {
-      schema_version: 1, plan_hash: expect.any(String), snapshot: {
+      schema_version: 1, plan_hash: expect.any(String), room_policy: { anonymous: true }, snapshot: {
         name: 'empty-team', launch_snapshot_hash: expect.any(String),
       },
     } });
@@ -189,8 +228,9 @@ describe('task create/start surface parity', () => {
     const started = await app.startTask({ actor: { kind: 'local_control', surface: 'cli' },
       taskId: backlog.task_id });
     expect(started).toMatchObject({ state: 'active', room_id: 'room-shared',
-      execution_plan: { plan_hash: backlog.execution_plan!.plan_hash } });
+      execution_plan: { plan_hash: backlog.execution_plan!.plan_hash, room_policy: { anonymous: true } } });
     expect(h.createRoom).toHaveBeenCalledOnce();
+    expect(h.createRoom).toHaveBeenCalledWith(expect.objectContaining({ anonymous: true }));
   });
 
   it('compares the complete active plan when either template or members is supplied', async () => {
