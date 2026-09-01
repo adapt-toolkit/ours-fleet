@@ -91,7 +91,7 @@ equivalent); logs land in `~/.ours-fleet/logs/`.
 
 ```sh
 npm i -g @ours.network/fleet
-ours-fleet init      # units/dirs/linger + missing standard presets
+ours-fleet init      # interactive reviewed defaults + host setup
 ours-fleet doctor    # verifies everything above, with actionable messages
 ```
 
@@ -107,7 +107,7 @@ become that account and repeat.
 ## Quickstart
 
 ```sh
-ours-fleet init               # safe to repeat: creates missing files, never replaces edits
+ours-fleet init               # interactive; reviews and replaces the complete named setup
 ours-fleet config             # validates Agents, Roles, Brains, and Room templates
 $EDITOR ~/fleet/agents/*.yaml # compose Role + Brain and operational settings
 ours-fleet up                 # boot the fleet (staggered)
@@ -486,12 +486,33 @@ ours-fleet task create --title "Reviewed change" --template pair
 ours-fleet task create --title "Phased delivery" --template team
 ```
 
-`ours-fleet init -c /path/custom.yaml` seeds `/path/custom/` instead. Init reports
-the packaged preset revision and source directory and only seeds missing files.
-It never upgrades an edited preset. To adopt a newer packaged file explicitly,
-copy the reported source file beside the existing target as `.new-default`, review
-`diff -u`, then replace the target yourself. This is the sole adoption operation;
-rerunning init is not an update. Users with the exact generated six-worker legacy
+`ours-fleet init -c /path/custom.yaml` reviews the literal resolved manifest and
+`/path/custom/` split directory before doing anything. It requires a TTY and two
+default-No confirmations. You select Codex, Claude, or both; then either one explicit
+model for every job or explicit development/review/coordination models; then one
+Quick/Balanced/Thorough reasoning level (`low`/`medium`/`high`). Catalog entries are
+supported IDs, not recommendations or entitlement claims: use `ours-fleet doctor` for
+local Codex availability, while Claude entitlement is validated at launch. No
+`model_chain` is generated and Fleet never silently substitutes another model.
+
+A successful rerun replaces the complete named manifest and split directory and keeps
+a private recovery record of whichever previous target(s) existed. At either confirmation,
+N, Enter, Escape, Ctrl-C, Ctrl-D, or EOF cancels. In a picker, Escape, Ctrl-C, Ctrl-D,
+or EOF cancels; Enter records the highlighted choice (or continues a non-empty multi-select),
+N is ignored, and an empty subscription selection remains blocked. Every cancellation
+before the final Yes performs no host setup or config publication. Non-TTY use stops with
+the same zero-mutation guarantee. After the final Yes, host integration runs before locked
+publication; a hard kill, power loss, or host crash can therefore leave host integration
+or private stage/recovery evidence to inspect.
+Existing targets and their tree must be owner-private regular files/directories on the
+configuration parent's filesystem; symlinks, foreign ownership, unsafe modes, and a
+non-owner-controlled parent fail closed before host setup and are rechecked under the
+per-setup init lock before publication.
+
+The generated task experiences are fixed consequences, not extra questions: `single`
+uses one development Agent; `pair` uses a development Secretary and independent review
+Critic; `team` phases coordination Architect, development Developer, and review Tester.
+FleetCoordinator uses coordination. Users with the exact generated six-worker legacy
 starter set must migrate explicitly: first run `ours-fleet migrate-agent-templates -c FILE`
 for a zero-write plan, then review every move/addition/recovery path and rerun with
 `--write`. Customized or ambiguous known starters are refused without

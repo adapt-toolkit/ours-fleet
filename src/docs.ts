@@ -82,7 +82,7 @@ PATH order.
 ## Lifecycle and console commands
 
 \`\`\`sh
-ours-fleet init [-c FILE]               # seed missing presets; never replace an existing file
+ours-fleet init [-c FILE]               # interactive reviewed replacement; TTY required
 ours-fleet up|down [Name...]
 ours-fleet restart [Name...]            # preserve/resume harness context
 ours-fleet force-restart [Name...]      # fresh context; briefing is reloaded
@@ -94,6 +94,27 @@ ours-fleet rm Name
 ours-fleet watchdog-report <name> [run-id] [--list] [--json]
 ours-fleet watchdog-run <name>
 \`\`\`
+
+\`init\` is an interactive replacement workflow, not a missing-file seed. It names the
+resolved manifest and split directory, asks a default-No replacement confirmation,
+then subscriptions (Codex, Claude, or both), model assignment (one explicit model for
+every job or explicit development/review/coordination choices), one reasoning level,
+and a final default-No review. Quick/Balanced/Thorough generate low/medium/high.
+Model pickers show packaged supported IDs; catalog membership is not a recommendation
+or entitlement claim. Run \`ours-fleet doctor\` for local Codex availability; Claude
+entitlement is checked when a role launches. The generated brains contain no
+\`model_chain\`, so Fleet never silently substitutes another model.
+
+At either confirmation, N, Enter, Escape, Ctrl-C, Ctrl-D, or EOF cancels. In a picker,
+Escape, Ctrl-C, Ctrl-D, or EOF cancels; Enter records the highlight or continues a
+non-empty multi-select, N is ignored, and an empty subscription selection remains blocked.
+Every cancellation before final approval performs no host or configuration mutation.
+Redirected/non-TTY invocation is refused with the same guarantee. After the final Yes,
+host setup precedes publication. Path ownership/type/mode/symlink and
+same-filesystem checks run before host setup and again under a per-setup lock. Publication
+stages and validates the complete setup, backs up whichever old target(s) exist, and
+retains a private recovery record. A hard process/host termination cannot promise
+rollback; inspect host integration and private init stage/recovery evidence.
 
 \`peek\`, \`attach\`, and text \`send\` use the structured agent session.
 Attachment also accepts \`/permit <permission-id> <option-id>\`, \`/interrupt\`,

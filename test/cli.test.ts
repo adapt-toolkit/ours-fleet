@@ -53,6 +53,18 @@ describe('ours-fleet CLI', () => {
     expect(INIT_COMPLETION_GUIDANCE).toContain('fleet/{agents,agent_templates,roles,brains,room_templates}/*.yaml');
   });
 
+  it('refuses non-TTY init without host or configuration mutation', async () => {
+    const config = join(dir, 'custom.yaml');
+    const r = await run(['init', '-c', config]);
+    expect(r.code).toBe(1);
+    expect(r.stdout).toBe('');
+    expect(r.stderr).toContain('requires an interactive terminal');
+    expect(r.stderr).toContain('no host setup ran and no configuration changed');
+    expect(existsSync(config)).toBe(false);
+    expect(existsSync(join(dir, 'custom'))).toBe(false);
+    expect(existsSync(join(dir, '.ours-fleet'))).toBe(false);
+  });
+
   it('redacts nested harness secrets identically from human and JSON config output', async () => {
     const file = join(dir, 'fleet.yaml');
     const root = join(dir, 'fleet');
