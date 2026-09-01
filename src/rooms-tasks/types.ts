@@ -6,6 +6,8 @@
  * Fleet stores only IDs, CIDs, orchestration state, and saga cursors.
  */
 
+import type { AgentLaunchConfiguration } from '../lifecycle-summary.js';
+
 // ── Task ────────────────────────────────────────────────────────────────
 
 export type TaskState =
@@ -155,6 +157,11 @@ export interface RoomMemberLaunchState {
   agent_fingerprint?: string;
   agent_template?: string;
   agent_template_hash?: string;
+  /**
+   * Operator-facing launch configuration captured from the exact resolved
+   * launch state; the single source for later Task/Room lifecycle reports.
+   */
+  presentation?: AgentLaunchConfiguration;
   launch_id?: string;
   updated_at: string;
   error?: string;

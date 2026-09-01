@@ -441,7 +441,8 @@ export class OwnerChannel implements OwnerChannelHandle {
           lifetime: event.lifetime, brain: event.brainSummary, role: event.roleSummary,
           harness: event.harness, session: event.session, model: event.model,
           permissions: permission, parent: event.caller, actionId: event.creationActionId,
-          inherited: event.inherited }),
+          inherited: event.inherited,
+          ...(event.configuration ? { configuration: event.configuration } : {}) }),
         `fleet-spawn\0${event.creationActionId}`, 0);
     });
   }

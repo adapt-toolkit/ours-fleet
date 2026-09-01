@@ -1,7 +1,12 @@
 import { existsSync, readFileSync } from 'node:fs';
 import { randomUUID } from 'node:crypto';
+import { Buffer } from 'node:buffer';
 import { replaceFileAtomically } from './atomic-file.js';
 import { isSensitiveConfigKey } from './sensitive-config.js';
+import { renderAgentConfiguration, type AgentLaunchConfiguration } from './lifecycle-summary.js';
+import {
+  MARKDOWN_MAX_BYTES, MARKDOWN_MAX_CODE_POINTS, markdownCode, markdownProse,
+} from './rooms-tasks/markdown.js';
 
 export type FleetCommandDecision = 'allow' | 'deny' | 'unsupported';
 export type FleetCommandOutcomeClass =
@@ -17,16 +22,19 @@ export class FleetCliExit extends Error {
 export type FleetAuditPresentation =
   | { kind: 'agent_started'; eventId: string; id: string; name: string; lifetime: 'permanent' | 'temporary'; brain: string;
       role: string; harness: string; session: 'acp'; model?: string; permissions?: string;
-      parent: string; actionId: string; inherited: string[] }
+      parent: string; actionId: string; inherited: string[];
+      configuration?: AgentLaunchConfiguration }
   | { kind: 'task'; operation: 'create' | 'start' | 'work' | 'block' | 'unblock' | 'review'
       | 'done' | 'cancel' | 'finish' | 'delete' | 'settling'; eventId: string; id: string; title?: string; previousState?: string;
       newState: string; template?: string; roomId?: string;
       revision?: string; list?: string;
-      agents: Array<{ name: string; brain?: string; role: string; permissions?: string }> }
+      agents: Array<{ name: string; brain?: string; role: string; permissions?: string;
+        configuration?: AgentLaunchConfiguration }> }
   | { kind: 'room'; operation: 'create' | 'activate' | 'close' | 'delete';
       eventId: string; id: string; previousState?: string; newState: string;
       revision?: string; name?: string; template?: string; taskId?: string;
-      participants: Array<{ name: string; id?: string; brain?: string; role: string; permissions?: string }> }
+      participants: Array<{ name: string; id?: string; brain?: string; role: string; permissions?: string;
+        configuration?: AgentLaunchConfiguration }> }
   | { kind: 'lifecycle_failure'; eventId: string; resource: 'Agent' | 'Task' | 'Room'; id: string; state: string;
       category: 'provision_failed' | 'provision_pending' | 'readiness_failed' | 'settlement_failed' | 'settlement_pending'
         | 'cleanup_failed' | 'cleanup_pending' };
@@ -333,9 +341,65 @@ export function validateFleetAuditFinish(value: unknown): asserts value is {
     throw new Error('invalid fleet audit finish fields');
 }
 
+const APPROVAL_MODES = new Set(['ask', 'auto', 'allow', 'deny']);
+const FILESYSTEM_MODES = new Set(['read-only', 'workspace', 'unrestricted']);
+const UNATTENDED_MODES = new Set(['deny', 'wait']);
+const FLEET_PERMISSION_MODES = new Set(['ask', 'auto', 'allow']);
+const PRESENTATION_TEXT = /[ --‪-‮⁦-⁩]/u;
+
+/**
+ * Exact-key validation of a current-version launch configuration. A partial
+ * v1 configuration is rejected; a legacy presentation simply omits the field.
+ */
+function validConfiguration(value: unknown): value is AgentLaunchConfiguration {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+  const c = value as Record<string, unknown>;
+  const text = (v: unknown, max = 256) => typeof v === 'string' && v.length <= max
+    && !PRESENTATION_TEXT.test(v);
+  const exact = (record: Record<string, unknown>, keys: string[]) =>
+    Object.keys(record).every(key => keys.includes(key));
+  const record = (v: unknown): v is Record<string, unknown> =>
+    !!v && typeof v === 'object' && !Array.isArray(v);
+  const origin = (v: unknown): boolean => {
+    if (!record(v)) return false;
+    if (v.kind === 'named') return exact(v, ['kind', 'ref']) && text(v.ref, 160);
+    if (v.kind === 'inline') return exact(v, ['kind', 'fingerprint'])
+      && (v.fingerprint === undefined || (typeof v.fingerprint === 'string' && /^[a-f0-9]{1,12}$/.test(v.fingerprint)));
+    return v.kind === 'unknown' && exact(v, ['kind']);
+  };
+  const count = (v: unknown) => v === undefined
+    || (Number.isSafeInteger(v) && Number(v) >= 0 && Number(v) <= 4_096);
+  return exact(c, ['version', 'template', 'role', 'brain', 'harness', 'session', 'model',
+    'effort', 'mission', 'approval', 'filesystem', 'unattended', 'permissionMode', 'monitor', 'isolation'])
+    && c.version === 1 && origin(c.role) && origin(c.brain)
+    && text(c.harness, 64) && c.session === 'acp'
+    && (c.model === null || text(c.model, 160))
+    && (c.template === undefined || text(c.template, 160))
+    && (c.effort === undefined || text(c.effort, 32))
+    && (c.mission === undefined || text(c.mission, 200))
+    && APPROVAL_MODES.has(String(c.approval))
+    && FILESYSTEM_MODES.has(String(c.filesystem))
+    && UNATTENDED_MODES.has(String(c.unattended))
+    && record(c.permissionMode)
+    && exact(c.permissionMode, ['fleetMode', 'nativeMode'])
+    && FLEET_PERMISSION_MODES.has(String(c.permissionMode.fleetMode))
+    && text(c.permissionMode.nativeMode, 160)
+    && record(c.monitor) && exact(c.monitor, ['mode', 'interrupt'])
+    && ['fleet', 'native'].includes(String(c.monitor.mode))
+    && (typeof c.monitor.interrupt === 'boolean' || c.monitor.interrupt === 'after_tool')
+    && (c.isolation === undefined || (record(c.isolation)
+      && exact(c.isolation, ['requested', 'on_unavailable', 'network', 'read_mounts', 'write_mounts'])
+      && ['auto', 'bubblewrap', 'podman', 'none'].includes(String(c.isolation.requested))
+      && (c.isolation.on_unavailable === undefined || ['warn', 'strict'].includes(String(c.isolation.on_unavailable)))
+      && (c.isolation.network === undefined || ['broker', 'deny', 'allow', 'allowlist'].includes(String(c.isolation.network)))
+      && count(c.isolation.read_mounts) && count(c.isolation.write_mounts)));
+}
+
 function validPresentation(value: unknown): value is FleetAuditPresentation {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
   const p = value as Record<string, unknown>;
+  const configured = (record: Record<string, unknown>) =>
+    record.configuration === undefined || validConfiguration(record.configuration);
   const safe = (v: unknown) => typeof v === 'string' && SAFE_RESOURCE_ID.test(v);
   const text = (v: unknown) => typeof v === 'string' && v.length <= 256
     && !/[\u0000-\u001f\u007f-\u009f\u202a-\u202e\u2066-\u2069]/u.test(v);
@@ -345,11 +409,11 @@ function validPresentation(value: unknown): value is FleetAuditPresentation {
     typeof p.operation === 'string' && typeof p.newState === 'string'
       && allowed[p.operation]?.includes(`${String(p.previousState ?? 'none')}→${p.newState}`);
   if (p.kind === 'agent_started') return exact(p, ['kind', 'eventId', 'id', 'name', 'lifetime', 'brain', 'role',
-    'harness', 'session', 'model', 'permissions', 'parent', 'actionId', 'inherited'])
+    'harness', 'session', 'model', 'permissions', 'parent', 'actionId', 'inherited', 'configuration'])
     && safe(p.eventId) && safe(p.id) && safe(p.name) && ['permanent', 'temporary'].includes(String(p.lifetime))
     && text(p.brain) && text(p.role) && safe(p.harness) && p.session === 'acp' && safe(p.parent) && safe(p.actionId)
     && (p.model === undefined || text(p.model)) && (p.permissions === undefined || text(p.permissions))
-    && Array.isArray(p.inherited) && p.inherited.every(text);
+    && Array.isArray(p.inherited) && p.inherited.every(text) && configured(p);
   if (p.kind === 'task') return exact(p, ['kind', 'operation', 'eventId', 'id', 'title', 'previousState',
     'newState', 'template', 'roomId', 'revision', 'list', 'agents'])
     && ['create', 'start', 'work', 'block', 'unblock', 'review', 'done',
@@ -367,11 +431,12 @@ function validPresentation(value: unknown): value is FleetAuditPresentation {
     && (p.list === undefined || text(p.list)) && (p.revision === undefined || text(p.revision))
     && Array.isArray(p.agents) && p.agents.length <= 64
     && p.agents.every(a => a && typeof a === 'object'
-      && exact(a as Record<string, unknown>, ['name', 'brain', 'role', 'permissions'])
+      && exact(a as Record<string, unknown>, ['name', 'brain', 'role', 'permissions', 'configuration'])
       && safe((a as Record<string, unknown>).name)
       && text((a as Record<string, unknown>).role)
       && ((a as Record<string, unknown>).brain === undefined || text((a as Record<string, unknown>).brain))
-      && ((a as Record<string, unknown>).permissions === undefined || text((a as Record<string, unknown>).permissions)));
+      && ((a as Record<string, unknown>).permissions === undefined || text((a as Record<string, unknown>).permissions))
+      && configured(a as Record<string, unknown>));
   if (p.kind === 'room') return exact(p, ['kind', 'operation', 'eventId', 'id', 'previousState', 'newState',
     'revision', 'name', 'template', 'taskId', 'participants'])
     && ['create', 'activate', 'close', 'delete'].includes(String(p.operation))
@@ -384,17 +449,48 @@ function validPresentation(value: unknown): value is FleetAuditPresentation {
     && (p.taskId === undefined || safe(p.taskId)) && (p.revision === undefined || text(p.revision))
     && Array.isArray(p.participants) && p.participants.length <= 64
     && p.participants.every(a => a && typeof a === 'object'
-      && exact(a as Record<string, unknown>, ['name', 'id', 'brain', 'role', 'permissions'])
+      && exact(a as Record<string, unknown>, ['name', 'id', 'brain', 'role', 'permissions', 'configuration'])
       && safe((a as Record<string, unknown>).name)
       && text((a as Record<string, unknown>).role)
       && ((a as Record<string, unknown>).id === undefined || safe((a as Record<string, unknown>).id))
       && ((a as Record<string, unknown>).brain === undefined || text((a as Record<string, unknown>).brain))
-      && ((a as Record<string, unknown>).permissions === undefined || text((a as Record<string, unknown>).permissions)));
+      && ((a as Record<string, unknown>).permissions === undefined || text((a as Record<string, unknown>).permissions))
+      && configured(a as Record<string, unknown>));
   if (p.kind === 'lifecycle_failure') return exact(p, ['kind', 'eventId', 'resource', 'id', 'state', 'category'])
     && ['Agent', 'Task', 'Room'].includes(String(p.resource))
     && safe(p.eventId) && safe(p.id) && safe(p.state) && ['provision_failed', 'provision_pending', 'readiness_failed', 'settlement_failed',
       'settlement_pending', 'cleanup_failed', 'cleanup_pending'].includes(String(p.category));
   return false;
+}
+
+const messageCodePoints = (value: string): number => Array.from(value).length;
+const messageBytes = (value: string): number => Buffer.byteLength(value, 'utf8');
+const withinMessageBounds = (value: string): boolean =>
+  messageCodePoints(value) <= MARKDOWN_MAX_CODE_POINTS && messageBytes(value) <= MARKDOWN_MAX_BYTES;
+
+/**
+ * Append per-agent lines to a bounded message. Lines are admitted whole, in
+ * the given (deterministic) order; once the shared Markdown bounds would be
+ * exceeded the remaining agents collapse into an accurate omission note. The
+ * first line is admitted whenever it fits the absolute bounds so an oversized
+ * roster still shows at least one complete agent summary.
+ */
+function appendAgentLines(header: string, heading: string, lines: string[]): string {
+  if (!lines.length) return header;
+  let message = `${header}\n${heading}:`;
+  const note = (count: number): string => `\n…and ${count} more agent${count === 1 ? '' : 's'} omitted.`;
+  for (const [index, line] of lines.entries()) {
+    const candidate = `${message}\n- ${line}`;
+    const remaining = lines.length - index - 1;
+    const fits = remaining
+      ? withinMessageBounds(`${candidate}${note(remaining)}`)
+      : withinMessageBounds(candidate);
+    if (!fits && !(index === 0 && withinMessageBounds(candidate))) {
+      return `${message}${note(lines.length - index)}`;
+    }
+    message = candidate;
+  }
+  return message;
 }
 
 /** Compact Owner presentation. It intentionally has no command, argv, environment, or correlation data. */
@@ -414,27 +510,31 @@ export function renderFleetLifecycleEvent(value: FleetAuditPresentation): string
       + `state ${value.state}. Action: ${actions[value.category]}`;
   }
   if (value.kind === 'agent_started') {
-    const permission = value.permissions ? `; permissions ${value.permissions}` : '';
+    const summary = renderAgentConfiguration(value.configuration, {
+      role: value.role, brain: value.brain, permissions: value.permissions,
+    });
     return `🧑‍💻 ${value.parent} spawned ${value.lifetime} Agent ${value.name} (${value.id}) — ready. `
-      + `Brain ${value.brain ?? 'unresolved'}; Role ${value.role ?? 'unresolved'}${permission}.`;
+      + `${summary}.`;
   }
   if (value.kind === 'task') {
-    const title = value.title ? ` “${value.title}”` : '';
-    const context = [value.list ? `List ${value.list}` : undefined,
-      value.template ? `template ${value.template}` : undefined,
+    const title = value.title ? ` “${markdownProse(value.title)}”` : '';
+    const context = [value.list ? `List ${markdownCode(value.list)}` : undefined,
+      value.template ? `template ${markdownCode(value.template)}` : undefined,
       value.roomId ? `Room ${value.roomId}` : undefined].filter(Boolean).join('; ');
-    const agents = value.agents.length ? ` Agents: ${value.agents.map(agent =>
-      `${agent.name} [Brain ${agent.brain ?? 'unresolved'}; Role ${agent.role}`
-        + `${agent.permissions ? `; permissions ${agent.permissions}` : ''}]`).join('; ')}.` : '';
-    return `📋 Task${title} (${value.id}) ${value.operation}: `
-      + `${value.previousState ?? 'none'} → ${value.newState}.${context ? ` ${context}.` : ''}${agents}`;
+    const header = `📋 Task${title} (${value.id}) ${value.operation}: `
+      + `${value.previousState ?? 'none'} → ${value.newState}.${context ? ` ${context}.` : ''}`;
+    return appendAgentLines(header, 'Agents', value.agents.map(agent =>
+      `${markdownCode(agent.name)}: ${renderAgentConfiguration(agent.configuration, {
+        role: agent.role, brain: agent.brain, permissions: agent.permissions,
+      })}`));
   }
-  const context = [value.template ? `template ${value.template}` : undefined,
+  const context = [value.template ? `template ${markdownCode(value.template)}` : undefined,
     value.taskId ? `Task ${value.taskId}` : undefined].filter(Boolean).join('; ');
-  const participants = value.participants.length ? ` Participants: ${value.participants.map(participant =>
-    `${participant.name}${participant.id ? ` (${participant.id})` : ''} [Role ${participant.role}`
-      + `${participant.brain ? `; Brain ${participant.brain}` : ''}`
-      + `${participant.permissions ? `; permissions ${participant.permissions}` : ''}]`).join('; ')}.` : '';
-  return `🏠 Room${value.name ? ` “${value.name}”` : ''} (${value.id}) ${value.operation}: `
-    + `${value.previousState ?? 'none'} → ${value.newState}.${context ? ` ${context}.` : ''}${participants}`;
+  const header = `🏠 Room${value.name ? ` “${markdownProse(value.name)}”` : ''} (${value.id}) ${value.operation}: `
+    + `${value.previousState ?? 'none'} → ${value.newState}.${context ? ` ${context}.` : ''}`;
+  return appendAgentLines(header, 'Participants', value.participants.map(participant =>
+    `${markdownCode(participant.name)}${participant.id ? ` (${participant.id})` : ''}: `
+      + renderAgentConfiguration(participant.configuration, {
+        role: participant.role, brain: participant.brain, permissions: participant.permissions,
+      })));
 }

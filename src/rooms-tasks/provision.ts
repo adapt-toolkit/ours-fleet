@@ -1,5 +1,6 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { existsSync, readFileSync, realpathSync } from 'node:fs';
+import { join } from 'node:path';
 import { parse } from 'yaml';
 import type { CoworkAdapter, CoworkSeatInfo } from './cowork-adapter.js';
 import {
@@ -16,7 +17,11 @@ import type {
 import { spawnTemp } from '../spawn.js';
 import type { SpawnOpts } from '../spawn.js';
 import { type FleetConfig, type RoomMemberStartup } from '../config.js';
-import type { AgentDefinition } from '../config.js';
+import type { AgentDefinition, ResolvedRole } from '../config.js';
+import { effectivePermissionMode } from '../permissions.js';
+import {
+  selectionOrigin, summarizeResolvedLaunch, type AgentLaunchConfiguration,
+} from '../lifecycle-summary.js';
 import { canonicalJson } from '../canonical-json.js';
 import { readLaunchSnapshot, redactLaunchDefinition } from './launch-snapshot.js';
 import {
@@ -105,6 +110,8 @@ interface RoomMemberSpawnResult {
   statePath: string;
   creationActionId: string;
   callerRole?: string;
+  /** Launch configuration reported by the managed spawn boundary, when available. */
+  configuration?: AgentLaunchConfiguration;
 }
 
 async function spawnRoomMember(
@@ -135,7 +142,29 @@ async function spawnRoomMember(
     statePath: result.statePath,
     creationActionId: result.creationActionId,
     callerRole: result.caller,
+    ...(result.configuration ? { configuration: result.configuration } : {}),
   };
+}
+
+/**
+ * Launch-boundary capture for the direct (non-managed) path: the exact
+ * ResolvedRole the spawn persisted, whitelisted into the operator-facing
+ * presentation. A missing or unreadable snapshot degrades to the legacy
+ * rendering; it never fails the launch.
+ */
+function presentationFromStatePath(
+  statePath: string, settings: MemberSettings, coworkRole: string,
+): AgentLaunchConfiguration | undefined {
+  try {
+    const resolved = parse(readFileSync(join(statePath, 'role.yaml'), 'utf8')) as ResolvedRole;
+    return summarizeResolvedLaunch(resolved, {
+      role: selectionOrigin(settings.definition.role),
+      brain: selectionOrigin(settings.definition.brain),
+      template: settings.template,
+      permissionMode: effectivePermissionMode(resolved),
+      missionFallback: coworkRole,
+    });
+  } catch { return undefined; }
 }
 
 function shortId(id: string): string { return id.slice(0, 8); }
@@ -387,18 +416,25 @@ async function launchMember(input: {
     )) {
       throw new Error(`new launch for ${member.name} did not persist matching provenance`);
     }
+    const presentation = launched.configuration
+      ? { ...launched.configuration, template: settings.template,
+        ...(launched.configuration.mission ? {} : { mission: member.coworkRole }) }
+      : presentationFromStatePath(launchedDir, settings, member.coworkRole);
     updateMemberStartup(provision.roomId, member.name, { launch: {
       state: 'launched', attempt, action_id: launched.creationActionId, mission_sha256: taskSha,
       agent_definition: agentDefinition, agent_fingerprint: agentFingerprint,
       agent_template: settings.template, agent_template_hash: settings.templateHash,
+      ...(presentation ? { presentation } : {}),
       ...(launched.callerRole ? { caller_role: launched.callerRole } : {}),
       launch_id: supervisor.launchId, updated_at: new Date().toISOString(),
     } });
     recordFleetAuditPresentation({ kind: 'agent_started', id: member.name, name: member.name,
       lifetime: 'temporary', brain: selectionSummary(settings.definition.brain),
-      role: selectionSummary(settings.definition.role), harness: 'resolved', session: 'acp',
+      role: selectionSummary(settings.definition.role),
+      harness: presentation?.harness ?? 'resolved', session: 'acp',
       permissions: permissionSummary(settings.definition), parent: provision.roomId,
-      actionId: launched.creationActionId, inherited: [] });
+      actionId: launched.creationActionId, inherited: [],
+      ...(presentation ? { configuration: presentation } : {}) });
   } catch (error) {
     updateMemberStartup(provision.roomId, member.name, { launch: {
       state: 'failed', attempt, action_id: effectiveActionId, mission_sha256: taskSha,

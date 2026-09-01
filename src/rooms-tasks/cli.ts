@@ -325,6 +325,8 @@ function auditTask(operation: string, task: ReturnType<typeof getTask>, previous
   const room = task.room_id ? getRoomRecord(task.room_id) : undefined;
   const definitions = new Map(room?.member_seats.map(seat =>
     [seat.role_name, seat.launch?.agent_definition]) ?? []);
+  const presentations = new Map(room?.member_seats.map(seat =>
+    [seat.role_name, seat.launch?.presentation]) ?? []);
   const semanticOperation = operation === 'recover'
     ? newState === 'active' ? 'work' : newState === 'done' ? 'done'
       : newState === 'cancelled' ? 'cancel' : undefined
@@ -340,7 +342,8 @@ function auditTask(operation: string, task: ReturnType<typeof getTask>, previous
       brain: safeSelectionSummary(definitions.get(member.name), 'brain'),
       role: safeSelectionSummary(definitions.get(member.name), 'role') === 'unresolved'
         ? member.cowork_role : safeSelectionSummary(definitions.get(member.name), 'role'),
-      permissions: safePermissionsSummary(definitions.get(member.name)) })) });
+      permissions: safePermissionsSummary(definitions.get(member.name)),
+      configuration: presentations.get(member.name) })) });
 }
 
 function auditRoom(operation: string, room: RoomOrchestrationRecord, previousState: string,
@@ -360,7 +363,8 @@ function auditRoom(operation: string, room: RoomOrchestrationRecord, previousSta
       brain: safeSelectionSummary(member.launch?.agent_definition, 'brain'),
       role: safeSelectionSummary(member.launch?.agent_definition, 'role') === 'unresolved'
         ? member.cowork_role : safeSelectionSummary(member.launch?.agent_definition, 'role'),
-      permissions: safePermissionsSummary(member.launch?.agent_definition) })) });
+      permissions: safePermissionsSummary(member.launch?.agent_definition),
+      configuration: member.launch?.presentation })) });
 }
 
 

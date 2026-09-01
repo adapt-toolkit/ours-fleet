@@ -22,6 +22,7 @@ import { FleetError, normalizeError } from './errors.js';
 import { inheritCallerSpawnDefaults, type ManagedFleetSpawnResult } from '../fleet-proxy.js';
 import { effectivePermissionMode } from '../permissions.js';
 import { effectiveRoleModel } from '../model-env.js';
+import { selectionOrigin, summarizeResolvedLaunch } from '../lifecycle-summary.js';
 
 export interface CreateRoleSessionRequest {
   name: string;
@@ -195,15 +196,21 @@ export class RoleCreationService {
       const fingerprint = hash(value.inline).slice(0, 16);
       return `inline:sha256:${fingerprint} (${provenance})`;
     };
+    const permissionMode = effectivePermissionMode(plan.preview.resolvedRole);
     return {
       caller: plan.caller, role: plan.options.name,
       lifetime: plan.options.temp ? 'temporary' : 'permanent', statePath,
       harness: plan.preview.resolvedRole.harness, session: plan.preview.resolvedRole.session,
       ...(effectiveRoleModel(plan.preview.resolvedRole) ? { model: effectiveRoleModel(plan.preview.resolvedRole)! } : {}),
       monitor: { mode: plan.preview.resolvedRole.monitor.mode, interrupt: plan.preview.resolvedRole.monitor.interrupt },
-      permissionMode: effectivePermissionMode(plan.preview.resolvedRole), inherited: plan.inherited,
+      permissionMode, inherited: plan.inherited,
       creationActionId,
       brainSummary: selectionSummary('brain'), roleSummary: selectionSummary('role'),
+      configuration: summarizeResolvedLaunch(plan.preview.resolvedRole, {
+        role: selectionOrigin(plan.options.role ?? plan.options.agentDefinition?.role),
+        brain: selectionOrigin(plan.options.brain ?? plan.options.agentDefinition?.brain),
+        permissionMode,
+      }),
     };
   }
 

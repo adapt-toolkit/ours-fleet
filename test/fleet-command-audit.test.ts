@@ -9,6 +9,13 @@ import {
 } from '../src/fleet-command-audit.js';
 import { fleetWorkerEnv } from '../src/rooms-tasks/external-worker.js';
 import { FLEET_PROXY_CALLER_ENV, FLEET_PROXY_STATE_DIR_ENV } from '../src/fleet-proxy.js';
+import {
+  AGENT_LINE_MAX_CODE_POINTS, MISSION_LABEL_MAX, missionLabel, renderAgentConfiguration,
+  selectionOrigin, summarizeResolvedLaunch, type AgentLaunchConfiguration,
+} from '../src/lifecycle-summary.js';
+import { MARKDOWN_MAX_BYTES, MARKDOWN_MAX_CODE_POINTS } from '../src/rooms-tasks/markdown.js';
+import { Buffer } from 'node:buffer';
+import '../src/harness/claude-code.js';
 
 describe('fleet command audit', () => {
   it('does not turn trusted internal workers into nested proxy attempts', () => {
@@ -181,16 +188,18 @@ describe('fleet command audit', () => {
       brain: 'ref:brain (explicit)', role: 'inline:sha256:abcd (inherited)', harness: 'codex',
       session: 'acp', permissions: 'allow/full', parent: 'Coordinator', actionId: 'action-1', inherited: ['role'] });
     expect(agent).toContain('Agent Dev (Dev) — ready');
-    expect(agent).toContain('Brain ref:brain (explicit); Role inline:sha256:abcd (inherited)');
+    expect(agent).toContain('legacy launch; resolved details unavailable');
+    expect(agent).toContain('Role inline:sha256:abcd (inherited)');
+    expect(agent).toContain('Brain ref:brain (explicit)');
     const task = renderFleetLifecycleEvent({ kind: 'task', operation: 'started', id: 't1', title: 'Ship Δ',
       previousState: 'backlog', newState: 'active', template: 'team@1', roomId: 'r1', list: 'default',
       agents: [{ name: 'Dev', brain: 'B', role: 'Developer', permissions: 'allow' }] });
     expect(task).toContain('backlog → active');
-    expect(task).toContain('Brain B; Role Developer; permissions allow');
+    expect(task).toContain('legacy launch; resolved details unavailable (Role Developer; Brain B; permissions allow)');
     const room = renderFleetLifecycleEvent({ kind: 'room', operation: 'activated', id: 'r1',
       previousState: 'provisioning', newState: 'active', taskId: 't1',
       participants: [{ name: 'Critic', id: 'cid-1', role: 'Critic' }] });
-    expect(room).toContain('Participants: Critic (cid-1) [Role Critic]');
+    expect(room).toContain('`Critic` (cid-1): legacy launch; resolved details unavailable (Role Critic)');
   });
 
   it('renders actionable failures from a closed category without exception text', () => {
@@ -218,5 +227,203 @@ describe('fleet command audit', () => {
     expect(bases).toEqual([
       'Agent\0same-id\0same-event', 'Task\0same-id\0same-event', 'Room\0same-id\0same-event',
     ]);
+  });
+});
+
+describe('human-readable launch configuration', () => {
+  const named = (): AgentLaunchConfiguration => ({
+    version: 1, template: 'dev-pair/critic',
+    role: { kind: 'named', ref: 'reviewer' },
+    brain: { kind: 'named', ref: 'codex-high' },
+    harness: 'codex', session: 'acp', model: 'gpt-5', effort: 'high',
+    mission: 'Challenge every material change',
+    approval: 'ask', filesystem: 'workspace', unattended: 'wait',
+    permissionMode: { fleetMode: 'ask', nativeMode: 'read-only' },
+    monitor: { mode: 'fleet', interrupt: false },
+    isolation: { requested: 'bubblewrap', network: 'broker', read_mounts: 2, write_mounts: 1 },
+  });
+
+  it('renders named presets with every resolved material setting, no hashes', () => {
+    const line = renderAgentConfiguration(named());
+    expect(line).toContain('template `dev-pair/critic`');
+    expect(line).toContain('Role preset `reviewer`');
+    expect(line).toContain('mission “Challenge every material change”');
+    expect(line).toContain('Brain preset `codex-high`');
+    expect(line).toContain('harness `codex`');
+    expect(line).toContain('model `gpt-5`');
+    expect(line).toContain('effort high');
+    expect(line).toContain('approval=ask, filesystem=workspace, unattended=wait');
+    expect(line).toContain('mode ask/read-only');
+    expect(line).toContain('monitor fleet/false');
+    expect(line).toContain('isolation requested bubblewrap, net broker, mounts +2ro/+1rw');
+    expect(line).not.toContain('sha256');
+  });
+
+  it('renders inline definitions with a human label and only a short secondary fingerprint', () => {
+    const config: AgentLaunchConfiguration = { ...named(), template: undefined,
+      role: { kind: 'inline', fingerprint: 'a1b2c3d4e5f6' },
+      brain: { kind: 'inline', fingerprint: '0f1e2d3c4b5a' }, model: null };
+    const line = renderAgentConfiguration(config);
+    expect(line).toContain('inline Role (def `a1b2c3d4e5f6`)');
+    expect(line).toContain('inline Brain (def `0f1e2d3c4b5a`)');
+    expect(line).toContain('model harness-default');
+    expect(line).not.toContain('inline:sha256');
+    expect(line).not.toMatch(/[a-f0-9]{16}/u);
+  });
+
+  it('renders mixed overrides: named role with an inline brain override', () => {
+    const config: AgentLaunchConfiguration = { ...named(),
+      brain: { kind: 'inline', fingerprint: 'abcdefabcdef' } };
+    const line = renderAgentConfiguration(config);
+    expect(line).toContain('Role preset `reviewer`');
+    expect(line).toContain('inline Brain (def `abcdefabcdef`)');
+  });
+
+  it('escapes hostile Markdown in every human label', () => {
+    const config: AgentLaunchConfiguration = { ...named(),
+      template: 'evil`template', mission: '**bold** [link](https://x) # heading',
+      role: { kind: 'named', ref: 'rev`iewer' },
+      permissionMode: { fleetMode: 'ask', nativeMode: '*native* _mode_' } };
+    const line = renderAgentConfiguration(config);
+    expect(line).not.toContain('**bold**');
+    expect(line).not.toContain('[link](https://x)');
+    expect(line).toContain('\\*\\*bold\\*\\*');
+    expect(line).toContain('\\*native\\* \\_mode\\_');
+    // hostile backticks stay inside a longer code fence, never close it
+    expect(line).toContain('``evil`template``');
+    expect(line).toContain('``rev`iewer``');
+  });
+
+  it('derives inline fingerprints canonically and rejects arbitrary provenance strings', () => {
+    const inline = selectionOrigin({ inline: { harness: 'codex', model: 'gpt-5' } });
+    expect(inline).toMatchObject({ kind: 'inline' });
+    expect((inline as { fingerprint: string }).fingerprint).toMatch(/^[a-f0-9]{12}$/u);
+    const forged = selectionOrigin({ inline: { harness: 'codex', model: 'gpt-5' } }, 'not-a-hash!!');
+    expect(forged).toEqual(inline);
+    const accepted = selectionOrigin({ inline: { a: 1 } }, 'abcdefabcdefabcdef');
+    expect((accepted as { fingerprint: string }).fingerprint).toBe('abcdefabcdef');
+    expect(selectionOrigin({ ref: 'reviewer' })).toEqual({ kind: 'named', ref: 'reviewer' });
+    expect(selectionOrigin(undefined)).toEqual({ kind: 'unknown' });
+  });
+
+  it('caps the mission label at eighty code points with a visible ellipsis', () => {
+    expect(missionLabel(undefined)).toBeUndefined();
+    expect(missionLabel('  \n\n ')).toBeUndefined();
+    expect(missionLabel('first line\nsecond line')).toBe('first line');
+    const long = '🛰️'.repeat(200);
+    const label = missionLabel(long)!;
+    expect(Array.from(label).length).toBeLessThanOrEqual(MISSION_LABEL_MAX);
+    expect(label.endsWith('…')).toBe(true);
+  });
+
+  it('drops whole optional components past the per-line budget with a visible marker', () => {
+    const config: AgentLaunchConfiguration = { ...named(),
+      mission: 'M'.repeat(80),
+      permissionMode: { fleetMode: 'ask', nativeMode: 'n'.repeat(160) },
+      template: 'T'.repeat(160), model: 'm'.repeat(160) };
+    const line = renderAgentConfiguration(config);
+    expect(Array.from(line).length).toBeLessThanOrEqual(AGENT_LINE_MAX_CODE_POINTS + 2);
+    expect(line).toContain('approval=ask');
+    // mandatory components always survive; oversized optional tail is marked
+    if (!line.includes('monitor')) expect(line.endsWith('; …')).toBe(true);
+  });
+
+  it('admits whole agent lines then reports an accurate omission count', () => {
+    const agents = Array.from({ length: 64 }, (_, index) => ({
+      name: `agent-${String(index).padStart(2, '0')}`, role: 'Member',
+      configuration: { ...named(), mission: `Mission ${'🛰️'.repeat(40)}` },
+    }));
+    const rendered = renderFleetLifecycleEvent({ kind: 'task', operation: 'work', id: 't1',
+      previousState: 'provisioning', newState: 'active', agents });
+    expect(Array.from(rendered).length).toBeLessThanOrEqual(MARKDOWN_MAX_CODE_POINTS);
+    expect(Buffer.byteLength(rendered, 'utf8')).toBeLessThanOrEqual(MARKDOWN_MAX_BYTES);
+    expect(rendered).toContain('- `agent-00`:');
+    const note = /…and (\d+) more agents omitted\./u.exec(rendered);
+    expect(note).not.toBeNull();
+    const shown = [...rendered.matchAll(/- `agent-\d+`/gu)].length;
+    expect(shown + Number(note![1])).toBe(64);
+  });
+
+  it('always shows at least one complete agent summary even for a maximal first line', () => {
+    const big: AgentLaunchConfiguration = { ...named(),
+      template: '𝕏'.repeat(160), model: '𝕐'.repeat(160), mission: '𝕄'.repeat(80),
+      permissionMode: { fleetMode: 'ask', nativeMode: '𝕅'.repeat(80) } };
+    const rendered = renderFleetLifecycleEvent({ kind: 'room', operation: 'activate', id: 'r1',
+      previousState: 'provisioning', newState: 'active',
+      participants: Array.from({ length: 3 }, (_, index) => ({
+        name: `m${index}`, role: 'Member', configuration: big })) });
+    expect(Array.from(rendered).length).toBeLessThanOrEqual(MARKDOWN_MAX_CODE_POINTS);
+    expect(Buffer.byteLength(rendered, 'utf8')).toBeLessThanOrEqual(MARKDOWN_MAX_BYTES);
+    expect(rendered).toContain('- `m0`:');
+  });
+
+  it('accepts a complete v1 configuration through the audit finish boundary', () => {
+    expect(() => validateFleetAuditFinish({ correlationId: '017f22e2-79b0-7cc3-98c4-dc0c0c07398f',
+      class: 'success', effect: 'completed', presentations: [{ kind: 'task', operation: 'work',
+        eventId: 'e1', id: 't1', previousState: 'provisioning', newState: 'active',
+        agents: [{ name: 'Dev', role: 'Member', configuration: named() }] }] })).not.toThrow();
+  });
+
+  it('rejects partial, unknown-key, and bad-enum v1 configurations', () => {
+    const attempt = (configuration: unknown) => () => validateFleetAuditFinish({
+      correlationId: '017f22e2-79b0-7cc3-98c4-dc0c0c07398f', class: 'success', effect: 'completed',
+      presentations: [{ kind: 'task', operation: 'work', eventId: 'e1', id: 't1',
+        previousState: 'provisioning', newState: 'active',
+        agents: [{ name: 'Dev', role: 'Member', configuration }] }] });
+    const { approval: _dropped, ...partial } = named();
+    expect(attempt(partial)).toThrow();                                        // missing approval
+    expect(attempt({ ...named(), extra: true })).toThrow();                    // unknown key
+    expect(attempt({ ...named(), filesystem: 'everything' })).toThrow();       // bad enum
+    expect(attempt({ ...named(), monitor: { mode: 'psychic', interrupt: false } })).toThrow();
+    expect(attempt({ ...named(), role: { kind: 'inline', fingerprint: 'XYZ' } })).toThrow();
+    expect(attempt({ ...named(), isolation: { requested: 'bubblewrap', read_mounts: -1 } })).toThrow();
+    expect(attempt({ ...named(), version: 2 })).toThrow();
+  });
+
+  it('keeps accepting legacy presentations without a configuration', () => {
+    expect(() => validateFleetAuditFinish({ correlationId: '017f22e2-79b0-7cc3-98c4-dc0c0c07398f',
+      class: 'success', effect: 'completed', presentations: [{ kind: 'room', operation: 'activate',
+        eventId: 'e1', id: 'r1', previousState: 'provisioning', newState: 'active',
+        participants: [{ name: 'Critic', id: 'cid', role: 'Critic', brain: 'legacy',
+          permissions: 'approval=ask' }] }] })).not.toThrow();
+  });
+
+  it('summarizes the exact resolved launch state with the whitelist only', () => {
+    const role = {
+      name: 'dev-1', harness: 'claude-code', session: 'acp' as const,
+      permissions: { approval: 'ask', filesystem: 'workspace', unattended: 'wait' },
+      permissionsDeclared: true, identity: 'dev-1', model: 'claude-opus-5',
+      effort: 'high', mission: 'Build the feature\nSecond line ignored',
+      sourceFile: '(temp)', env: { SECRET: 'never' }, cwd: '/private/path',
+      monitor: { mode: 'fleet', enabled: true, wake_sources: [], batch_ms: 5, inject: 'x',
+        interrupt: 'after_tool', turn_fail_threshold: 1 },
+      isolation: { backend: 'podman', on_unavailable: 'strict', network: 'deny',
+        fs: { read: ['/a', '/b'], write: ['/c'] } },
+    } as unknown as import('../src/config.js').ResolvedRole;
+    const summary = summarizeResolvedLaunch(role, {
+      role: { kind: 'named', ref: 'developer' },
+      brain: { kind: 'inline', fingerprint: 'abcdefabcdef' },
+      template: 'squad/dev', missionFallback: 'Developer',
+      permissionMode: { fleetMode: 'ask', nativeMode: 'default' },
+    });
+    expect(summary).toEqual({
+      version: 1, template: 'squad/dev',
+      role: { kind: 'named', ref: 'developer' },
+      brain: { kind: 'inline', fingerprint: 'abcdefabcdef' },
+      harness: 'claude-code', session: 'acp', model: 'claude-opus-5', effort: 'high',
+      mission: 'Build the feature',
+      approval: 'ask', filesystem: 'workspace', unattended: 'wait',
+      permissionMode: { fleetMode: 'ask', nativeMode: 'default' },
+      monitor: { mode: 'fleet', interrupt: 'after_tool' },
+      isolation: { requested: 'podman', on_unavailable: 'strict', network: 'deny',
+        read_mounts: 2, write_mounts: 1 },
+    });
+    expect(JSON.stringify(summary)).not.toContain('SECRET');
+    expect(JSON.stringify(summary)).not.toContain('/private/path');
+    const fallback = summarizeResolvedLaunch({ ...role, mission: undefined } as never, {
+      role: { kind: 'unknown' }, brain: { kind: 'unknown' },
+      permissionMode: { fleetMode: 'ask', nativeMode: 'default' }, missionFallback: 'Developer',
+    });
+    expect(fallback.mission).toBe('Developer');
   });
 });

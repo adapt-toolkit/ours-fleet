@@ -1,4 +1,5 @@
 import type { MonitorConfig, ResolvedRole } from './config.js';
+import type { AgentLaunchConfiguration } from './lifecycle-summary.js';
 import type { SpawnOpts } from './spawn.js';
 import { inheritedPermissionMode } from './permissions.js';
 import { isSensitiveConfigKey } from './sensitive-config.js';
@@ -22,6 +23,8 @@ export interface ManagedFleetSpawnResult {
   creationActionId: string;
   brainSummary: string;
   roleSummary: string;
+  /** Launch configuration captured from the exact resolved role; absent only from pre-upgrade daemons. */
+  configuration?: AgentLaunchConfiguration;
 }
 
 /**
