@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
-import { chmodSync, mkdtempSync, writeFileSync, readFileSync, readdirSync, existsSync, rmSync } from 'node:fs';
+import { chmodSync, mkdtempSync, writeFileSync, readFileSync, readdirSync, existsSync, rmSync, symlinkSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { parse, stringify } from 'yaml';
@@ -344,6 +344,67 @@ describe('spawnTemp', () => {
     const d = await spawnTemp({ name: 'TempLoop', session: 'acp' }, '/b/ours-fleet', () => {});
     const snap = parse(readFileSync(join(d, 'role.yaml'), 'utf8'));
     expect(snap.loops).toBeUndefined();
+  });
+
+  it('launches exact CLI-only temporary loops and preserves explicit disable vs omission', async () => {
+    const loopsFile = join(dir, 'temp-loops.yaml');
+    writeFileSync(loopsFile, stringify({ loops: { progress: {
+      interval: '1m', initial_delay: '0s', jitter: '30s', prompt: 'TEMP_LOOP_CANARY',
+    } } }), { mode: 0o600 });
+    const launched = await spawnTemp({
+      name: 'Looped', temp: true, loopsFile, loopSource: 'cli',
+    }, '/b/ours-fleet', () => {});
+    const role = parse(readFileSync(join(launched, 'role.yaml'), 'utf8'));
+    expect(role.temporaryLoops).toBeUndefined();
+    expect(role.temporaryLoopSource).toBe('cli');
+    expect(role.loops).toMatchObject([{ name: 'progress', intervalMs: 60_000,
+      initialDelayMs: 0, jitterMs: 30_000, prompt: 'TEMP_LOOP_CANARY' }]);
+    const provenance = JSON.parse(readFileSync(join(launched, 'creation.json'), 'utf8'));
+    expect(provenance.settings.loops.source).toBe('cli');
+    expect(JSON.stringify(provenance)).not.toContain('TEMP_LOOP_CANARY');
+
+    const disabled = await spawnTemp({
+      name: 'LoopDisabled', temp: true, noLoops: true, loopSource: 'cli',
+    }, '/b/ours-fleet', () => {});
+    expect(parse(readFileSync(join(disabled, 'role.yaml'), 'utf8'))).toMatchObject({
+      loops: [], temporaryLoopSource: 'cli',
+    });
+
+    const omitted = await spawnTemp({ name: 'LoopOmitted', temp: true }, '/b/ours-fleet', () => {});
+    const omittedRole = parse(readFileSync(join(omitted, 'role.yaml'), 'utf8'));
+    expect(omittedRole.loops).toBeUndefined();
+    expect(omittedRole.temporaryLoopSource).toBe('omitted');
+  });
+
+  it('rejects malformed, unsafe, contradictory, and permanent loop arguments before creation', async () => {
+    const malformed = join(dir, 'malformed-loops.yaml');
+    writeFileSync(malformed, 'loops: {}\n', { mode: 0o600 });
+    await expect(spawnTemp({ name: 'BadLoops', temp: true, loopsFile: malformed }, '/b/ours-fleet', () => {}))
+      .rejects.toThrow('non-empty mapping');
+    expect(existsSync(agentDir('BadLoops', true))).toBe(false);
+    writeFileSync(malformed, 'loops:\n  x: { interval: 59s, prompt: hi }\n', { mode: 0o600 });
+    await expect(spawnTemp({ name: 'ShortLoop', temp: true, loopsFile: malformed }, '/b/ours-fleet', () => {}))
+      .rejects.toThrow('below the minimum');
+    const { d } = fakeDeps();
+    await expect(spawnPermanent({ name: 'PermanentLoop', loopsFile: malformed }, d))
+      .rejects.toThrow('require --temp');
+    expect(existsSync(agentDir('PermanentLoop'))).toBe(false);
+    chmodSync(malformed, 0o400);
+    await expect(spawnTemp({ name: 'PrivateMode', temp: true, loopsFile: malformed }, '/b/ours-fleet', () => {}))
+      .rejects.toThrow('owner-only regular file');
+    chmodSync(malformed, 0o644);
+    await expect(spawnTemp({ name: 'PublicMode', temp: true, loopsFile: malformed }, '/b/ours-fleet', () => {}))
+      .rejects.toThrow('owner-only regular file');
+    chmodSync(malformed, 0o600);
+    const link = join(dir, 'loops-link.yaml'); symlinkSync(malformed, link);
+    await expect(spawnTemp({ name: 'LoopLink', temp: true, loopsFile: link }, '/b/ours-fleet', () => {}))
+      .rejects.toThrow('owner-only regular file');
+    const oversized = join(dir, 'oversized-loops.yaml');
+    writeFileSync(oversized, `loops:\n  x:\n    interval: 1m\n    prompt: ${'x'.repeat(1024 * 1024)}\n`, { mode: 0o600 });
+    await expect(spawnTemp({ name: 'OversizedLoop', temp: true, loopsFile: oversized }, '/b/ours-fleet', () => {}))
+      .rejects.toThrow('no larger than 1 MB');
+    await expect(spawnTemp({ name: 'ContradictLoop', temp: true, loopsFile: malformed, noLoops: true }, '/b/ours-fleet', () => {}))
+      .rejects.toThrow('mutually exclusive');
   });
 });
 

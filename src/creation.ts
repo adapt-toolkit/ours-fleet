@@ -463,7 +463,7 @@ export function writeRoleFile(tx: CreationTransaction, file: string, contents: s
 // ─── Creation provenance ───────────────────────────────────────────────
 
 /** Where a setting's effective value came from. */
-export type ProvenanceSource = 'cli' | 'fleet-default' | 'caller-role' | 'built-in';
+export type ProvenanceSource = 'cli' | 'agent-template' | 'fleet-default' | 'caller-role' | 'built-in';
 
 export interface ProvenanceEntry {
   value: unknown;
@@ -565,11 +565,12 @@ export function creationBuildNote(p: CreationProvenance): string | undefined {
 export function formatProvenance(p: CreationProvenance): string[] {
   const mark = {
     cli: 'explicit', 'fleet-default': 'fleet default', 'caller-role': 'caller role',
-    'built-in': 'built-in',
+    'agent-template': 'Agent Template', 'built-in': 'built-in',
   } as const;
   return Object.entries(p.settings)
     .filter(([, e]) => e.value !== undefined)
-    .map(([k, e]) => `    ${k.padEnd(12)} ${String(e.value)}  (${mark[e.source]})`);
+    .map(([k, e]) => `    ${k.padEnd(12)} ${e.value && typeof e.value === 'object'
+      ? JSON.stringify(e.value) : String(e.value)}  (${mark[e.source]})`);
 }
 
 /** Classify one setting: an explicit CLI value, a fleet default, or built-in. */

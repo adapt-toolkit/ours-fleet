@@ -109,6 +109,12 @@ describe('fleet command audit', () => {
   });
 
   it('redacts attached config paths and preserves untouched URLs byte-for-byte', () => {
+    expect(redactFleetArgv(['task', 'start', 't', '--member', 'dev',
+      '--loops-file', '/private/loops.yaml', '--no-loops']))
+      .toEqual(['task', 'start', 't', '--member', 'dev', '--loops-file',
+        '[REDACTED:value]', '--no-loops']);
+    expect(redactFleetArgv(['spawn', '--loops-file=/private/loops.yaml']))
+      .toEqual(['spawn', '--loops-file=[REDACTED:value]']);
     expect(redactFleetArgv(['-c/private', 'task', 'list']))
       .toEqual(['-c[REDACTED:value]', 'task', 'list']);
     expect(redactFleetArgv(['-c=', 'task', 'list']))
@@ -278,6 +284,23 @@ describe('human-readable launch configuration', () => {
     const line = renderAgentConfiguration(config);
     expect(line).toContain('Role preset `reviewer`');
     expect(line).toContain('inline Brain (def `abcdefabcdef`)');
+  });
+
+  it('renders temporary loop source, fixed policy, timing, and prompt metadata only', () => {
+    const config = { ...named(), loops: {
+      source: 'agent-template', policy: 'skip-if-busy', entries: [{
+        name: 'progress', enabled: true, intervalMs: 60_000, initialDelayMs: 0,
+        jitterMs: 30_000, prompt: { bytes: 15, sha256: 'abcdef0123456789'.padEnd(64, '0') },
+        promptText: 'LOOP_PROMPT_CANARY',
+      }],
+    } } as AgentLaunchConfiguration;
+    const line = renderAgentConfiguration(config);
+    expect(line).toContain('temporary loops progress:enabled');
+    expect(line).toContain('interval=60000ms delay=0ms jitter=30000ms');
+    expect(line).toContain('prompt=15B/abcdef012345');
+    expect(line).toContain('policy skip-if-busy');
+    expect(line).toContain('source agent-template');
+    expect(line).not.toContain('LOOP_PROMPT_CANARY');
   });
 
   it('escapes hostile Markdown in every human label', () => {

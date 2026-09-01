@@ -82,6 +82,10 @@ export interface RunnerDeps {
     stateDir: string, session: AgentSession, log: (line: string) => void,
   ): Pick<RoleControlServer,
     'start' | 'close' | 'setFleetSpawner' | 'setFleetAuditor' | 'setOwnerChannel' | 'setConfigReloader' | 'setLoopManager'>;
+  /** Construct scheduled-loop execution (injectable for fail-closed startup tests). */
+  createLoopManager(
+    ...args: ConstructorParameters<typeof ScheduledLoopManager>
+  ): ScheduledLoopManagerHandle;
   /** Acquire the cross-process owner-channel binder lease before replacing the control socket. */
   acquireOwnerBinder(stateDir: string, role: string, identity: string): Promise<OwnerBinderLease>;
   /** Ask the still-authenticated predecessor to emit the fixed recovery notice. */
@@ -114,6 +118,7 @@ const defaultDeps = (): RunnerDeps => ({
   createOwnerChannel: opts => new OwnerChannel(opts),
   startAgentSession: (adapter, options) => adapter.start(options),
   createControlServer: (stateDir, session, log) => new RoleControlServer(stateDir, session, log),
+  createLoopManager: (...args) => new ScheduledLoopManager(...args),
   acquireOwnerBinder: (stateDir, role, identity) => acquireOwnerBinderLease(
     stateDir, role, identity),
   reportOwnerStartupFailure: async stateDir => {
@@ -886,7 +891,7 @@ export async function runOnce(
       if (generation === loopGeneration && (loopManager || !definitions.length))
         return { changed: false, loops: definitions.length };
       if (!loopManager && definitions.length) {
-        loopManager = new ScheduledLoopManager(name, definitions, dir, arbiter!, {
+        loopManager = deps.createLoopManager(name, definitions, dir, arbiter!, {
           now: deps.now,
           setTimer: (callback, ms) => setTimeout(callback, ms),
           clearTimer: timer => clearTimeout(timer as ReturnType<typeof setTimeout>),
@@ -901,10 +906,11 @@ export async function runOnce(
       deps.log(`[${name}] scheduled loops reloaded (${definitions.length} definitions)`);
       return { changed: true, loops: definitions.length };
     };
-    control.setConfigReloader(reloadLoopConfig);
+    // Temporary agents are immutable launch snapshots: never re-resolve mutable Fleet YAML.
+    if (!temp) control.setConfigReloader(reloadLoopConfig);
     if (role.loops?.length) {
       try {
-        loopManager = new ScheduledLoopManager(name, role.loops, dir, arbiter, {
+        loopManager = deps.createLoopManager(name, role.loops, dir, arbiter, {
           now: deps.now,
           setTimer: (callback, ms) => setTimeout(callback, ms),
           clearTimer: timer => clearTimeout(timer as ReturnType<typeof setTimeout>),
@@ -913,6 +919,16 @@ export async function runOnce(
         control.setLoopManager(loopManager);
         loopManager.start();
       } catch (error) {
+        if (temp) {
+          monitor?.stop();
+          if (monitorLoop) await monitorLoop;
+          await control.close();
+          ownerBinder?.release();
+          await agentSession.close();
+          unsubscribeRecovery?.();
+          throw new Error(`[${name}] configured temporary loop manager failed to start: `
+            + `${(error as Error)?.message ?? String(error)}`);
+        }
         deps.log(`[${name}] scheduled loop manager unavailable: ${(error as Error)?.name ?? 'Error'}`);
       }
     }

@@ -50,6 +50,15 @@ export interface AgentLaunchConfiguration {
     read_mounts?: number;
     write_mounts?: number;
   };
+  /** Present only for temporary agents; prompt bodies are never presented. */
+  loops?: {
+    source: 'agent-template' | 'cli' | 'omitted';
+    policy: 'skip-if-busy';
+    entries: Array<{
+      name: string; enabled: boolean; intervalMs: number; initialDelayMs: number; jitterMs: number;
+      prompt: { bytes: number; sha256: string };
+    }>;
+  };
 }
 
 /** Where a Brain/Role selection came from; labels are human, hashes secondary. */
@@ -118,6 +127,15 @@ export function summarizeResolvedLaunch(role: ResolvedRole, origins: {
       ...(fs?.read?.length ? { read_mounts: fs.read.length } : {}),
       ...(fs?.write?.length ? { write_mounts: fs.write.length } : {}),
     } } : {}),
+    ...(role.temporaryLoopSource ? { loops: {
+      source: role.temporaryLoopSource,
+      policy: 'skip-if-busy' as const,
+      entries: (role.temporaryLoops ?? role.loops ?? []).map(loop => ({
+        name: loop.name, enabled: loop.enabled, intervalMs: loop.intervalMs,
+        initialDelayMs: loop.initialDelayMs, jitterMs: loop.jitterMs,
+        prompt: { bytes: loop.promptBytes, sha256: loop.promptHash },
+      })),
+    } } : {}),
   };
   // A configuration whose complete mandatory rendering cannot fit must never
   // be produced; real resolved values sit far below the budget, so this is a
@@ -177,6 +195,15 @@ function optionalComponents(configuration: AgentLaunchConfiguration): string[] {
         + `${configuration.isolation.on_unavailable ? `, on-unavailable ${configuration.isolation.on_unavailable}` : ''}`
         + `${configuration.isolation.read_mounts || configuration.isolation.write_mounts
           ? `, mounts +${configuration.isolation.read_mounts ?? 0}ro/+${configuration.isolation.write_mounts ?? 0}rw` : ''}`
+      : undefined,
+    configuration.loops
+      ? configuration.loops.source === 'omitted'
+        ? 'temporary loops omitted (legacy behavior)'
+        : configuration.loops.entries.length === 0
+          ? `temporary loops disabled (source ${configuration.loops.source})`
+          : `temporary loops ${configuration.loops.entries.map(loop => `${loop.name}:${loop.enabled ? 'enabled' : 'disabled'}`
+            + ` interval=${loop.intervalMs}ms delay=${loop.initialDelayMs}ms jitter=${loop.jitterMs}ms`
+            + ` prompt=${loop.prompt.bytes}B/${loop.prompt.sha256.slice(0, 12)}`).join(', ')}; policy skip-if-busy; source ${configuration.loops.source}`
       : undefined,
   ].filter((part): part is string => Boolean(part));
 }

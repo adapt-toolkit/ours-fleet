@@ -312,6 +312,45 @@ describe('simple Cowork room member startup', () => {
     expect(mocks.spawnTemp).toHaveBeenCalledTimes(1);
   });
 
+  it('relaunches a stopped member from the sealed loop snapshot after mutable template drift', async () => {
+    const launchCfg = cfg();
+    launchCfg.agentTemplates!.Developer.loops = {
+      progress: { interval: '1m', prompt: 'SEALED_RETRY_LOOP' },
+    };
+    const base = snapshotTemplate({
+      name: 'retry', version: 1, description: 'Retry fixture',
+      members: [{ slot: 'developer', role: 'Developer', count: 1,
+        agent_template: 'Developer' }],
+    }, launchCfg.agentTemplates);
+    const sealed = sealTemplateSnapshot({ ...base, members: base.members.map(member => ({
+      ...member, loop_source: 'agent-template' as const,
+    })) }, launchCfg.agentTemplates!);
+    createRoomRecord({
+      room_id: 'room-loop-retry', room_name: 'Room', room_identity_cid: 'room-cid',
+      template_snapshot: sealed,
+    });
+    const h = coworkHarness({ acceptOnSpawn: false });
+    const input = { cfg: launchCfg, cowork: h.cowork, roomId: 'room-loop-retry',
+      template: sealed, binPath: '/usr/bin/ours-fleet',
+      startupWait: { timeoutMs: 0, now: () => 1 } };
+    await provisionMembers(input);
+    expect(mocks.spawnTemp).toHaveBeenCalledTimes(1);
+
+    launchCfg.agentTemplates!.Developer.loops = {
+      progress: { interval: '2m', prompt: 'MUTATED_TEMPLATE_LOOP' },
+    };
+    mocks.tempLiveness.mockResolvedValueOnce('stopped');
+    await provisionMembers(input);
+
+    expect(mocks.spawnTemp).toHaveBeenCalledTimes(2);
+    for (const [spawn] of mocks.spawnTemp.mock.calls) expect(spawn).toMatchObject({
+      loopSource: 'agent-template', agentDefinition: { loops: {
+        progress: { interval: '1m', prompt: 'SEALED_RETRY_LOOP' },
+      } },
+    });
+    expect(JSON.stringify(mocks.spawnTemp.mock.calls)).not.toContain('MUTATED_TEMPLATE_LOOP');
+  });
+
   it('fails safely when a pending seat Agent definition drifts before recovery', async () => {
     createRoomRecord({ room_id: 'room-drift', room_name: 'Room', room_identity_cid: 'room-cid' });
     const h = coworkHarness({ acceptOnSpawn: false });
@@ -500,7 +539,14 @@ describe('simple Cowork room member startup', () => {
           role, count: 1, agent_template: role,
         })),
       };
-      const tpl = snapshotTemplate(selected);
+      const launchCfg = cfg();
+      for (const definition of Object.values(launchCfg.agentTemplates!)) definition.loops = {
+        progress: { interval: '1m', prompt: `${templateName} sealed progress` },
+      };
+      const baseSnapshot = snapshotTemplate(selected, launchCfg.agentTemplates);
+      const tpl = { ...baseSnapshot, members: baseSnapshot.members.map(member => ({
+        ...member, loop_source: 'agent-template' as const,
+      })) };
       createRoomRecord({
         room_id: `room-${templateName}`, room_name: 'Room', room_identity_cid: 'room-cid',
       });
@@ -508,7 +554,7 @@ describe('simple Cowork room member startup', () => {
       mockManagedSpawns();
 
       await provisionMembers({
-        cfg: cfg(), cowork: h.cowork, roomId: `room-${templateName}`, template: tpl,
+        cfg: launchCfg, cowork: h.cowork, roomId: `room-${templateName}`, template: tpl,
         binPath: '/usr/bin/ours-fleet',
       });
 
@@ -521,8 +567,10 @@ describe('simple Cowork room member startup', () => {
         });
       }
       for (const [spawn] of mocks.spawnTemp.mock.calls) {
-        expect(spawn).toMatchObject({ agentDefinition: cfg().agentTemplates?.[spawn.roomMemberStartup.role],
-          callerRole: 'Coordinator', inheritedFromCaller: [] });
+        expect(spawn).toMatchObject({
+          agentDefinition: launchCfg.agentTemplates?.[spawn.roomMemberStartup.role],
+          loopSource: 'agent-template', callerRole: 'Coordinator', inheritedFromCaller: [],
+        });
       }
     },
   );
@@ -532,13 +580,23 @@ describe('simple Cowork room member startup', () => {
       room_id: 'room-standalone', room_name: 'Room', room_identity_cid: 'room-cid',
     });
     const h = coworkHarness();
+    const singleCfg = cfg();
+    singleCfg.agentTemplates!.Developer.loops = {
+      progress: { interval: '1m', prompt: 'single sealed progress' },
+    };
+    const singleTemplate = { ...template(1), members: template(1).members.map(member => ({
+      ...member, loop_source: 'agent-template' as const,
+    })) };
     await provisionMembers({
-      cfg: cfg(), cowork: h.cowork, roomId: 'room-standalone', template: template(1),
+      cfg: singleCfg, cowork: h.cowork, roomId: 'room-standalone', template: singleTemplate,
       binPath: '/usr/bin/ours-fleet',
     });
     expect(mocks.controlRequest).not.toHaveBeenCalled();
     expect(mocks.spawnTemp).toHaveBeenCalledOnce();
-    expect(mocks.spawnTemp.mock.calls[0][0]).toMatchObject({ surface: 'agent' });
+    expect(mocks.spawnTemp.mock.calls[0][0]).toMatchObject({ surface: 'agent',
+      loopSource: 'agent-template', agentDefinition: { loops: {
+        progress: { interval: '1m', prompt: 'single sealed progress' },
+      } } });
     expect(mocks.spawnTemp.mock.calls[0][0]).not.toHaveProperty('callerRole');
     expect(mocks.spawnTemp.mock.calls[0][0]).not.toHaveProperty('inheritedFromCaller');
     const fallback = spawnDryRun({

@@ -365,7 +365,40 @@ Agent Template document (\`~/fleet/agent_templates/Worker.yaml\`) is inert and r
 role: { ref: developer }
 brain: { ref: claude-default }
 permissions: { approval: ask, filesystem: workspace, unattended: deny }
+loops:                                   # optional; temporary launches only
+  progress:
+    interval: 10m                        # required; 1m..30d
+    initial_delay: 10m                   # default: interval; 0s..30d
+    jitter: 30s                          # default: 0s; < interval and <=1h
+    enabled: true                        # default true
+    prompt: Continue the assigned work and report only material progress.
 ```
+
+Agent Template-local `loops` are limited to 64 entries, implicitly scoped to the temporary agent, and
+reuse Fleet's scheduled-turn semantics: a busy occurrence is skipped, ordinary
+missed occurrences are not backlogged or replayed, and restart recovery may
+preserve at most one recent late occurrence. The trusted authoring file and
+private sealed role snapshot retain exact prompt text; resolved launch, task,
+room, provenance, and audit presentation surfaces show only bytes and SHA-256.
+
+Direct temporary spawn can set the same whole block from an owner-only regular
+file containing exactly a top-level `loops:` mapping, or explicitly disable it:
+
+```sh
+ours-fleet spawn --temp Scout --role 'inline:{mission: inspect}' --brain 'inline:{harness: codex}' --loops-file ./scout-loops.yaml
+ours-fleet spawn --temp Scout --role 'inline:{mission: inspect}' --brain 'inline:{harness: codex}' --no-loops
+ours-fleet task start TASK --member developer --loops-file ./developer-loops.yaml
+ours-fleet task start TASK --member critic --no-loops
+```
+
+`--loops-file` and `--no-loops` are mutually exclusive and temporary-only.
+For room members they override the selected Agent Template as a whole; the
+Agent Template overrides legacy omission. Omission preserves the historical
+no-loop temporary behavior and never inherits manifest `roles: ["*"]` loops.
+The file must be owned by the current user, mode 0600, non-symlink, no larger
+than 1 MB, and contain a non-empty map. Validation completes before identity,
+Cowork, snapshot, or supervisor side effects. Recovery and replacement reuse
+the private sealed normalized definition even if mutable templates later change.
 
 Persistent Agent instance (\`~/fleet/agents/Name.yaml\`) either remains a canonical
 Role/Brain composition or explicitly reuses a template:
@@ -582,8 +615,9 @@ optional `rooms.owner.provider` setting is separate and defaults to
 ### Scheduled agent loops
 
 Top-level `loops` schedule literal prompts from trusted local YAML. Enabled targets
-must use a managed session (`acp` or `codex-app-server`); temporary roles never inherit loops, including `roles:
-["*"]`. Fleet rejects an enabled loop when its explicitly selected base config is
+must use a managed session (`acp` or `codex-app-server`); temporary roles never
+inherit these manifest loops, including `roles: ["*"]`. Only their sealed Agent
+Template/CLI-local `loops` apply. Fleet rejects an enabled loop when its explicitly selected base config is
 a symlink, is owned by another user, or is group/world writable. Prompts are
 bounded and normalized at validation time, but only their size and SHA-256 appear
 in `config`, `list`, logs, or durable state.

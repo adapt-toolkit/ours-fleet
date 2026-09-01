@@ -1105,6 +1105,74 @@ describe('runOnce ACP startup outcome', () => {
     expect(JSON.stringify(state)).not.toContain('bounded health pass');
   }, 20_000);
 
+  it('installs sealed temporary loops without registering mutable config reload', async () => {
+    const name = 'TempLoop';
+    const stateDir = agentDir(name, true);
+    mkdirSync(stateDir, { recursive: true });
+    writeFileSync(join(stateDir, 'role.yaml'), stringify({
+      name, harness: 'fake', session: 'acp', identity: name, sourceFile: '(temp)',
+      permissions: { approval: 'ask', filesystem: 'workspace', unattended: 'deny' },
+      temporaryLoopSource: 'agent-template',
+      loops: [{
+        name: 'progress', role: name, intervalMs: 60_000, initialDelayMs: 60_000,
+        jitterMs: 0, enabled: true, prompt: 'sealed progress pass', promptBytes: 20,
+        promptHash: 'a'.repeat(64), definitionHash: 'b'.repeat(64), sourceFile: '(sealed)',
+      }],
+    }));
+    const world = fakeWorld({ exitCode: '0', exitFile: join(stateDir, '.exit-status') });
+    const installed: unknown[] = [];
+    const reloaders: unknown[] = [];
+    await runOnce(name, { temp: true }, { ...world.deps, createControlServer: () => ({
+      start: async () => {}, close: async () => {}, setFleetSpawner: () => {},
+      setFleetAuditor: () => {}, setOwnerChannel: () => {},
+      setConfigReloader: value => { reloaders.push(value); },
+      setLoopManager: value => { installed.push(value); },
+    }) });
+    expect(installed).toHaveLength(2);
+    expect(installed[0]).toBeDefined();
+    expect(installed[1]).toBeUndefined();
+    expect(reloaders).toEqual([undefined]);
+    const state = JSON.parse(readFileSync(join(stateDir, '.scheduled-loops.json'), 'utf8'));
+    expect(state.loops.progress.definitionHash).toBe('b'.repeat(64));
+    expect(JSON.stringify(state)).not.toContain('sealed progress pass');
+  });
+
+  it('fails closed on temporary loop-manager startup while preserving persistent fallback', async () => {
+    const tempName = 'TempFailedLoop';
+    const tempDir = agentDir(tempName, true);
+    mkdirSync(tempDir, { recursive: true });
+    const loop = {
+      name: 'progress', role: tempName, intervalMs: 60_000, initialDelayMs: 60_000,
+      jitterMs: 0, enabled: true, prompt: 'sealed', promptBytes: 6,
+      promptHash: 'c'.repeat(64), definitionHash: 'd'.repeat(64), sourceFile: '(sealed)',
+    };
+    writeFileSync(join(tempDir, 'role.yaml'), stringify({
+      name: tempName, harness: 'fake', session: 'acp', identity: tempName, sourceFile: '(temp)',
+      permissions: { approval: 'ask', filesystem: 'workspace', unattended: 'deny' },
+      loops: [loop], temporaryLoopSource: 'agent-template',
+    }));
+    const tempWorld = fakeWorld({ exitCode: '0', exitFile: join(tempDir, '.exit-status') });
+    const failManager = () => { throw new Error('injected manager failure'); };
+    await expect(runOnce(tempName, { temp: true }, {
+      ...tempWorld.deps, createLoopManager: failManager,
+    }))
+      .rejects.toThrow('configured temporary loop manager failed to start');
+
+    writeV2Fixture(join(dir, 'fleet.yaml'), {
+      roles: { PersistentLoop: { harness: 'fake', session: 'acp' } },
+      loops: { progress: { roles: ['PersistentLoop'], interval: '1m', prompt: 'persistent' } },
+    });
+    const persistentDir = agentDir('PersistentLoop');
+    mkdirSync(persistentDir, { recursive: true });
+    const logs: string[] = [];
+    const persistentWorld = fakeWorld({ exitCode: '0', exitFile: join(persistentDir, '.exit-status') });
+    await expect(runOnce('PersistentLoop', {}, {
+      ...persistentWorld.deps, log: line => logs.push(line), createLoopManager: failManager,
+    }))
+      .resolves.toBeDefined();
+    expect(logs.some(line => line.includes('scheduled loop manager unavailable'))).toBe(true);
+  });
+
   it('steers an interrupting wake during ACP startup instead of cancelling startup', async () => {
     writeCfg({ A: {
       harness: 'fake-acp',

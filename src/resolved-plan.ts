@@ -1,6 +1,7 @@
 import type { FleetConfig, ResolvedRole } from './config.js';
 import { analyzeRolePermissions } from './permissions.js';
 import { dirname, relative } from 'node:path';
+import { createHash } from 'node:crypto';
 import { isSensitiveConfigKey } from './sensitive-config.js';
 
 export const RESOLVED_PLAN_SCHEMA_VERSION = 2;
@@ -8,6 +9,10 @@ export const RESOLVED_PLAN_SCHEMA_VERSION = 2;
 const sortedObject = <T>(value: Record<string, T>): Record<string, T> =>
   Object.fromEntries(Object.entries(value).sort(([a], [b]) => a.localeCompare(b)));
 export const redactSensitive = (value: unknown, key = ''): unknown => {
+  if (key === 'prompt' && typeof value === 'string') return {
+    bytes: Buffer.byteLength(value, 'utf8'),
+    sha256: createHash('sha256').update(value).digest('hex'),
+  };
   if (isSensitiveConfigKey(key)) return '<redacted>';
   if (Array.isArray(value)) return value.map(item => redactSensitive(item));
   if (value && typeof value === 'object')
@@ -52,6 +57,7 @@ export function resolvedPlan(cfg: FleetConfig): Record<string, unknown> {
 
 export function resolvedRolePlan(role: ResolvedRole, manifestDir = dirname(role.sourceFile)): Record<string, unknown> {
   const analysis = analyzeRolePermissions(role);
+  const effectiveLoops = role.temporaryLoopSource ? (role.temporaryLoops ?? []) : (role.loops ?? []);
   return {
     name: role.name,
     sourceFile: role.sourceFile,
@@ -91,7 +97,8 @@ export function resolvedRolePlan(role: ResolvedRole, manifestDir = dirname(role.
     },
     monitor: role.monitor,
     ownerChannel: role.owner_channel ?? null,
-    loops: (role.loops ?? []).map(loop => ({
+    temporaryLoopSource: role.temporaryLoopSource ?? null,
+    loops: effectiveLoops.map(loop => ({
       name: loop.name, enabled: loop.enabled, intervalMs: loop.intervalMs,
       initialDelayMs: loop.initialDelayMs, jitterMs: loop.jitterMs,
       definitionHash: loop.definitionHash, prompt: { bytes: loop.promptBytes, sha256: loop.promptHash },

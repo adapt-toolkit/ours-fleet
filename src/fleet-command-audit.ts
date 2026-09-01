@@ -179,7 +179,7 @@ export function classifyFleetArgv(argv: readonly string[]): FleetCommandClassifi
 const marker = (value: string): string => value === '' ? '[REDACTED:empty]' : '[REDACTED:value]';
 const sensitiveValueFlags = new Set([
   '--identity', '--invite', '--token', '--api-token', '--password', '--password-file',
-  '--env', '--brief', '--brief-file', '--bio-file', '--persona-file', '--isolation-file',
+  '--env', '--brief', '--brief-file', '--bio-file', '--persona-file', '--isolation-file', '--loops-file',
   '--configuration', '-c', '--public-invite', '--public-invite-file', '--invite-file',
   '--summary-file', '--text', '--message', '--summary', '--reason', '--goal', '--cwd',
   '--identity-cid', '--owner-cid', '--contact-cid', '--codex-config', '--add-dir',
@@ -375,7 +375,7 @@ function validConfiguration(value: unknown): value is AgentLaunchConfiguration {
   const count = (v: unknown) => v === undefined
     || (Number.isSafeInteger(v) && Number(v) >= 0 && Number(v) <= 4_096);
   return exact(c, ['version', 'template', 'role', 'brain', 'harness', 'session', 'model',
-    'effort', 'mission', 'approval', 'filesystem', 'unattended', 'permissionMode', 'monitor', 'isolation'])
+    'effort', 'mission', 'approval', 'filesystem', 'unattended', 'permissionMode', 'monitor', 'isolation', 'loops'])
     && c.version === 1 && origin(c.role) && origin(c.brain)
     && text(c.harness, 64) && SESSION_BACKENDS.has(c.session as SessionBackendId)
     && (c.model === null || text(c.model, 160))
@@ -400,6 +400,18 @@ function validConfiguration(value: unknown): value is AgentLaunchConfiguration {
       && (c.isolation.on_unavailable === undefined || ['warn', 'strict'].includes(String(c.isolation.on_unavailable)))
       && (c.isolation.network === undefined || ['broker', 'deny', 'allow', 'allowlist'].includes(String(c.isolation.network)))
       && count(c.isolation.read_mounts) && count(c.isolation.write_mounts)))
+    && (c.loops === undefined || (record(c.loops)
+      && exact(c.loops, ['source', 'policy', 'entries'])
+      && ['agent-template', 'cli', 'omitted'].includes(String(c.loops.source))
+      && c.loops.policy === 'skip-if-busy'
+      && Array.isArray(c.loops.entries) && c.loops.entries.length <= 64
+      && c.loops.entries.every(entry => record(entry)
+        && exact(entry, ['name', 'enabled', 'intervalMs', 'initialDelayMs', 'jitterMs', 'prompt'])
+        && text(entry.name, 64) && typeof entry.enabled === 'boolean'
+        && [entry.intervalMs, entry.initialDelayMs, entry.jitterMs].every(Number.isSafeInteger)
+        && record(entry.prompt) && exact(entry.prompt, ['bytes', 'sha256'])
+        && Number.isSafeInteger(entry.prompt.bytes) && Number(entry.prompt.bytes) >= 0
+        && typeof entry.prompt.sha256 === 'string' && /^[a-f0-9]{64}$/.test(entry.prompt.sha256))))
     // Escaping and code-fence growth can push a per-field-valid configuration
     // past the line budget; a v1 configuration whose complete mandatory
     // rendering cannot fit is invalid, never silently trimmed.

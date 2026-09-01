@@ -85,6 +85,10 @@ function sweepUnreferencedSnapshotsLocked(): void {
 }
 
 export function redactLaunchDefinition(value: unknown, key = ''): unknown {
+  if (key === 'prompt' && typeof value === 'string') return {
+    bytes: Buffer.byteLength(value, 'utf8'),
+    sha256: createHash('sha256').update(value).digest('hex'),
+  };
   if (['env', 'harness_options', 'session_options', 'owner_channel', 'auth_proxy'].includes(key))
     return '<redacted>';
   if (Array.isArray(value)) return value.map(item => redactLaunchDefinition(item));

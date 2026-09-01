@@ -75,6 +75,7 @@ interface ExpandedMember {
   agentTemplate: string;
   launchDefinitionId: string;
   agentTemplateHash?: string;
+  loopSource: 'agent-template' | 'cli' | 'omitted';
 }
 
 interface MemberSettings {
@@ -82,6 +83,7 @@ interface MemberSettings {
   persona?: string;
   template: string;
   templateHash: string;
+  loopSource: 'agent-template' | 'cli' | 'omitted';
 }
 
 function selectionSummary(selection: AgentDefinition['brain'] | AgentDefinition['role']): string {
@@ -187,6 +189,7 @@ function expandMembers(
         agentTemplate: slot.agent_template,
         launchDefinitionId: slot.launch_definition_id ?? slot.agent_template,
         agentTemplateHash: slot.agent_template_hash,
+        loopSource: slot.loop_source ?? 'omitted',
       });
     }
   }
@@ -211,6 +214,7 @@ function settingsFor(
     template: member.agentTemplate,
     templateHash: member.agentTemplateHash
       ?? createHash('sha256').update(canonicalJson(definition)).digest('hex'),
+    loopSource: member.loopSource,
   };
 }
 
@@ -432,6 +436,9 @@ async function launchMemberUnlocked(input: {
       temp: true,
       identity: member.name,
       agentDefinition: settings.definition,
+      ...(settings.loopSource === 'cli' && settings.definition.loops === undefined
+        ? { noLoops: true } : {}),
+      loopSource: settings.loopSource,
       surface: 'agent',
       creationActionId: actionId,
       roomMemberStartup: startup,

@@ -12,8 +12,8 @@ import { resolveRoleModelEnv } from './model-env.js';
 import type { IsolationConfig, WrapContext } from './isolation/types.js';
 import { resolveWatchdogs } from './watchdog/config.js';
 import type { ResolvedWatchdog } from './watchdog/config.js';
-import { resolveLoops } from './loops/config.js';
-import type { ResolvedLoop, ResolvedRoleLoop } from './loops/config.js';
+import { resolveAgentLoops, resolveLoops } from './loops/config.js';
+import type { AgentLoopsConfig, ResolvedLoop, ResolvedRoleLoop } from './loops/config.js';
 import {
   validateRoomsConfig, validateTasksConfig, validateRoomTemplatesConfig,
 } from './rooms-tasks/config.js';
@@ -256,6 +256,8 @@ export interface AgentDefinition {
   owner_channel?: OwnerChannelConfigInput;
   worklog?: WorklogPolicyInput;
   auth_proxy?: Partial<AuthProxyConfig>;
+  /** Scheduled turns scoped only to temporary launches; persistent Agents reject this field. */
+  loops?: AgentLoopsConfig;
 }
 
 /** Inert, reusable launch definition. It never owns an identity or runtime state. */
@@ -300,6 +302,10 @@ export interface ResolvedRole extends Omit<RoleConfig, 'model' | 'owner_channel'
   worklog?: WorklogPolicy;
   auth_proxy?: AuthProxyConfig;
   loops?: ResolvedRoleLoop[];
+  /** Agent Template-local loops, kept separate from manifest loops until a temp launch. */
+  temporaryLoops?: ResolvedRoleLoop[];
+  /** Durable source of the temporary loop policy; internal and never user-authored. */
+  temporaryLoopSource?: 'agent-template' | 'cli' | 'omitted';
   provenance?: Record<string, FieldProvenance>;
   /** Internal/transient: never accepted as a user-authored RoleConfig key. */
   roomMemberStartup?: RoomMemberStartup;
@@ -409,12 +415,12 @@ export const BRAIN_PRESET_KEYS = [
 ];
 export const AGENT_KEYS = [
   'role', 'brain', 'permissions', 'identity', 'cwd', 'coordinator', 'env', 'oversee',
-  'isolation', 'monitor', 'owner_channel', 'worklog', 'auth_proxy',
+  'isolation', 'monitor', 'owner_channel', 'worklog', 'auth_proxy', 'loops',
 ];
 const AGENT_INSTANCE_KEYS = ['template', 'overrides'];
 const TEMPLATE_FORBIDDEN_KEYS = ['identity'];
 const MERGED_MAP_FIELDS = new Set([
-  'permissions', 'env', 'isolation', 'monitor', 'owner_channel', 'worklog', 'auth_proxy',
+  'permissions', 'env', 'isolation', 'monitor', 'owner_channel', 'worklog', 'auth_proxy', 'loops',
 ]);
 const V2_API_VERSION = 'ours.network/fleet/v2';
 
@@ -493,6 +499,9 @@ export function validateEffectiveAgentTemplate(
 }
 
 function validateAgentScalars(value: BarePreset, file: string, id: string): void {
+  if (value.loops !== undefined) resolveAgentLoops(value.loops, {
+    name: id, harness: 'codex', session: 'acp', permissions: {} as CommonPermissions,
+  } as ResolvedRole, file);
   for (const key of ['identity', 'cwd'] as const) {
     const current = value[key];
     if (current !== undefined && (typeof current !== 'string' || !current.trim()))
@@ -669,7 +678,7 @@ function mergeTemplateDefinition(
 
 function composeSplitRoles(
   base: string, baseDoc: Record<string, unknown>, yamlMode: YamlMode,
-  diagnostics: ConfigDiagnostic[], files: string[], additionalAgent?: { id: string; definition: AgentDefinition },
+  diagnostics: ConfigDiagnostic[], files: string[], additionalAgent?: { id: string; definition: AgentDefinition; temporary?: boolean },
   templateSink: Record<string, AgentTemplateDefinition> = {},
   roleSink: Record<string, Record<string, unknown>> = {},
   brainSink: Record<string, Record<string, unknown>> = {},
@@ -760,6 +769,8 @@ function composeSplitRoles(
       a = assertBareKeys(agent.value, AGENT_KEYS, `${agent.file}: agent '${id}'`);
     }
     if (!('role' in a) || !('brain' in a)) throw new ConfigError(`${agent.file}: agent '${id}' requires role and brain`);
+    if (Object.hasOwn(a, 'loops') && !(additionalAgent?.temporary && additionalAgent.id === id))
+      schemaError(agent.file, `/agents/${id}/loops`, 'is supported only for temporary Agent launches and inert Agent Templates');
     const role = selection(a.role, 'role', agent.file, roles, ROLE_PRESET_KEYS);
     const brain = selection(a.brain, 'brain', agent.file, brains, BRAIN_PRESET_KEYS);
     const operational = deepSubStrict(
@@ -835,8 +846,9 @@ function composeSplitRoles(
       brain: deepSubStrict(a.brain, vars, agent.file, `/agents/${id}/brain`),
       ...operational,
     } as AgentDefinition;
+    const { loops: _temporaryLoops, ...runtimeOperational } = operational;
     documents.push({ file: agent.file,
-      doc: { roles: { [id]: { ...brainValue, ...roleValue, ...operational } } }, provenance,
+      doc: { roles: { [id]: { ...brainValue, ...roleValue, ...runtimeOperational } } }, provenance,
       agentSelections: structuredClone({ role: canonicalDefinition.role, brain: canonicalDefinition.brain }),
       agentDefinition: canonicalDefinition,
       ...(agentTemplate ? { agentTemplate } : {}) });
@@ -856,7 +868,7 @@ function deepSub(v: unknown, vars: Record<string, string>): unknown {
 /** Load a v2 manifest and bare Agent/Role/Brain documents from its stem directory. */
 export function loadConfig(
   configPath?: string,
-  options: { yamlMode?: YamlMode; additionalAgent?: { id: string; definition: AgentDefinition }; skipWatchdogs?: boolean } = {},
+  options: { yamlMode?: YamlMode; additionalAgent?: { id: string; definition: AgentDefinition; temporary?: boolean }; skipWatchdogs?: boolean } = {},
 ): FleetConfig {
   const base = configPath ?? defaultConfigPath();
   const files: string[] = [];
@@ -978,7 +990,7 @@ export function loadConfig(
       defaulted('identity', r.identity !== undefined, r.identity === undefined);
       defaulted('permissions', defaults.permissions !== undefined, defaults.permissions === undefined);
       defaulted('monitor', defaults.monitor !== undefined, defaults.monitor === undefined);
-      roles.push({
+      const resolvedRole: ResolvedRole = {
         ...r,
         name,
         sourceFile: file,
@@ -1002,7 +1014,10 @@ export function loadConfig(
         loops: [],
         ...(agentSelections ? { agentSelections } : {}),
         ...(agentTemplate ? { agentTemplate } : {}),
-      });
+      };
+      if (agentDefinition?.loops !== undefined)
+        resolvedRole.temporaryLoops = resolveAgentLoops(agentDefinition.loops, resolvedRole, file);
+      roles.push(resolvedRole);
       // Forbidden-path enforcement: a mount that would breach the policy
       // is a configuration error, caught by `config` rather than at launch.
       if (isolation !== undefined) {
@@ -1113,7 +1128,7 @@ export function resolveAgentDefinitionDryRun(
   configPath: string, id: string, definition: AgentDefinition,
 ): ResolvedRole {
   return findRole(loadConfig(configPath, {
-    additionalAgent: { id, definition }, skipWatchdogs: true,
+    additionalAgent: { id, definition, temporary: true }, skipWatchdogs: true,
   }), id);
 }
 

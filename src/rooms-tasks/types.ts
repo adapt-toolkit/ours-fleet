@@ -334,6 +334,8 @@ export interface TemplateDefinition {
 }
 
 export interface TemplateSnapshotMember extends TemplateMemberSlot {
+  /** Source of the effective temporary-loop policy, independent of its sealed value. */
+  loop_source?: 'agent-template' | 'cli' | 'omitted';
   /** Secret-safe public projection; launch material lives in the sealed snapshot. */
   agent_projection?: Record<string, unknown>;
   agent_template_hash?: string;

@@ -7,6 +7,9 @@ import { canonicalJson } from '../canonical-json.js';
 import type { TemplateDefinition, TemplateSnapshot } from './types.js';
 import { redactLaunchDefinition } from './launch-snapshot.js';
 import { snapshotTemplate } from './templates.js';
+import { readLoopsFile } from '../spawn.js';
+import type { AgentLoopsConfig } from '../loops/config.js';
+import { canonicalAgentLoops, resolveAgentLoops } from '../loops/config.js';
 
 export interface MemberOverride {
   agent_template?: string;
@@ -18,6 +21,8 @@ export interface MemberOverride {
   cwd?: string;
   model?: string;
   effort?: string;
+  /** Whole-block override; false is the explicit no-loops policy. */
+  loops?: AgentLoopsConfig | false;
   overrides?: Partial<AgentDefinition>;
 }
 export type MemberOverrides = Record<string, MemberOverride>;
@@ -34,21 +39,32 @@ const OPTION_FIELDS: Record<string, keyof MemberOverride> = {
 
 /** Parse only the ordered member-option subsequence supplied by the CLI action. */
 export function parseGroupedMemberArgs(argv: string[]): MemberOverrides {
-  if (argv.length % 2) throw new Error(`${argv.at(-1)}: value required`);
   const result: MemberOverrides = {};
   let current: string | undefined;
-  for (let index = 0; index < argv.length; index += 2) {
-    const flag = argv[index]; const value = argv[index + 1];
-    if (!value) throw new Error(`${flag}: value required`);
+  for (let index = 0; index < argv.length;) {
+    const flag = argv[index];
+    if (flag === '--no-loops') {
+      if (!current) throw new Error(`${flag} must follow --member <slot>`);
+      if (result[current].loops !== undefined) throw new Error(`duplicate loop override for member '${current}'`);
+      result[current].loops = false; index += 1; continue;
+    }
+    const value = argv[index + 1];
+    if (!value || value.startsWith('--')) throw new Error(`${flag}: value required`);
     if (flag === '--member') {
       if (result[value]) throw new Error(`duplicate member slot '${value}'`);
-      current = value; result[current] = {}; continue;
+      current = value; result[current] = {}; index += 2; continue;
+    }
+    if (flag === '--loops-file') {
+      if (!current) throw new Error(`${flag} must follow --member <slot>`);
+      if (result[current].loops !== undefined) throw new Error(`duplicate loop override for member '${current}'`);
+      result[current].loops = readLoopsFile(value); index += 2; continue;
     }
     const field = OPTION_FIELDS[flag];
     if (!field) throw new Error(`unknown member option '${flag}'`);
     if (!current) throw new Error(`${flag} must follow --member <slot>`);
     if (result[current][field] !== undefined) throw new Error(`duplicate ${flag} for member '${current}'`);
     (result[current] as Record<string, unknown>)[field] = value;
+    index += 2;
   }
   for (const [slot, value] of Object.entries(result)) validateMemberOverride(value, `member '${slot}'`);
   return result;
@@ -68,7 +84,7 @@ export function readMembersFile(path: string): MemberOverrides {
   return members;
 }
 
-const MEMBER_KEYS = new Set(['agent_template', 'brain', 'role', 'approval', 'filesystem', 'unattended', 'cwd', 'model', 'effort', 'overrides']);
+const MEMBER_KEYS = new Set(['agent_template', 'brain', 'role', 'approval', 'filesystem', 'unattended', 'cwd', 'model', 'effort', 'overrides', 'loops']);
 function validateMemberOverride(value: unknown, where: string): asserts value is MemberOverride {
   if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error(`${where}: must be a mapping`);
   const item = value as Record<string, unknown>;
@@ -84,6 +100,11 @@ function validateMemberOverride(value: unknown, where: string): asserts value is
       && (typeof item[key] !== 'string' || !(item[key] as string).trim())) throw new Error(`${where}: ${key} must be a non-blank string`);
   if (item.overrides !== undefined && (!item.overrides || typeof item.overrides !== 'object' || Array.isArray(item.overrides)))
     throw new Error(`${where}: overrides must be a mapping`);
+  if (item.overrides && Object.hasOwn(item.overrides as object, 'loops'))
+    throw new Error(`${where}: overrides.loops is unsupported; use the top-level loops member override`);
+  if (item.loops !== undefined && item.loops !== false
+      && (!item.loops || typeof item.loops !== 'object' || Array.isArray(item.loops)))
+    throw new Error(`${where}: loops must be a mapping or false`);
 }
 
 const MAPS = new Set(['permissions', 'env', 'isolation', 'monitor', 'owner_channel', 'worklog', 'auth_proxy']);
@@ -109,6 +130,8 @@ export interface PreparedExecutionPlan {
 export function prepareExecutionPlan(
   template: TemplateDefinition, cfg: FleetConfig, overrides: MemberOverrides = {},
 ): PreparedExecutionPlan {
+  for (const [slot, value] of Object.entries(overrides))
+    validateMemberOverride(value, `member '${slot}'`);
   const slots = new Set(template.members.map(member => member.slot));
   for (const slot of Object.keys(overrides)) if (!slots.has(slot)) throw new Error(`unknown member slot '${slot}'`);
   const snapshot = snapshotTemplate(template, cfg.agentTemplates);
@@ -120,6 +143,8 @@ export function prepareExecutionPlan(
     if (!base) throw new Error(`Agent Template '${source}' not found`);
     let definition = merge(base as unknown as Record<string, unknown>,
       (input.overrides ?? {}) as Record<string, unknown>) as unknown as AgentTemplateDefinition;
+    if (input.loops === false) delete definition.loops;
+    else if (input.loops !== undefined) definition.loops = structuredClone(input.loops);
     const rolePreset = input.role ? cfg.rolePresets?.[input.role] : undefined;
     if (input.role && !rolePreset) throw new Error(`Role '${input.role}' not found`);
     const brainPreset = input.brain ? cfg.brainPresets?.[input.brain] : undefined;
@@ -144,6 +169,10 @@ export function prepareExecutionPlan(
       const role = cfg.resolveAgentDefinition(`RoomMember_${member.slot}`, {
         ...definition, identity: `RoomMember_${member.slot}`,
       });
+      if (definition.loops !== undefined)
+        definition.loops = canonicalAgentLoops(resolveAgentLoops(
+          definition.loops, role, `(member '${member.slot}' resolved loops)`,
+        ));
       const analysis = analyzeRolePermissions(role);
       if (analysis.conflicts?.length) throw new Error(
         `member '${member.slot}' has native permission conflicts: ${analysis.conflicts.map(item => item.warning).join('; ')}`);
@@ -154,6 +183,7 @@ export function prepareExecutionPlan(
     launchDefinitions[id] = definition;
     const hash = createHash('sha256').update(canonicalJson(definition)).digest('hex');
     return { ...member, agent_template: source, launch_definition_id: id,
+      loop_source: input.loops !== undefined ? 'cli' : base.loops !== undefined ? 'agent-template' : 'omitted',
       agent_template_hash: hash,
       ...(input.role ? { role_preset: { id: input.role, hash: createHash('sha256').update(canonicalJson(rolePreset)).digest('hex') } } : {}),
       ...(input.brain ? { brain_preset: { id: input.brain, hash: createHash('sha256').update(canonicalJson(brainPreset)).digest('hex') } } : {}),
