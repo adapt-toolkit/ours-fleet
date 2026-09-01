@@ -29,8 +29,15 @@ type RequestId = string | number;
 const PERMISSION_TIMEOUT_MS = 10 * 60_000;
 const CONTROLLER_GRACE_MS = 12_000;
 const INTERRUPT_SETTLE_MS = 15_000;
+const INTERRUPT_TERMINATE_GRACE_MS = 5_000;
+const TERMINAL_RECONCILE_QUIET_MS = 2_000;
+const TERMINAL_RECONCILE_REQUEST_TIMEOUT_MS = 5_000;
 const SCHEDULED_REDACTION = '[scheduled-loop content redacted]';
 const COMMENTARY_REDACTION = '[assistant commentary redacted]';
+const OWNER_ADMIN_CONTEXT_KEY =
+  'ours-fleet://prompt-provenance?source=owner_admin_console';
+const OWNER_CHANNEL_CONTEXT_KEY =
+  'ours-fleet://prompt-provenance?source=owner_channel';
 
 export interface CodexAppServerSessionOptions {
   name: string;
@@ -50,6 +57,10 @@ export interface CodexAppServerSessionOptions {
   log(line: string): void;
   permissionTimeoutMs?: number;
   controllerGraceMs?: number;
+  interruptSettleMs?: number;
+  interruptTerminateGraceMs?: number;
+  terminalReconcileQuietMs?: number;
+  terminalReconcileRequestTimeoutMs?: number;
 }
 
 interface PendingPermission {
@@ -114,6 +125,27 @@ function outcomeFor(status: unknown): TurnOutcome {
   return 'inconclusive';
 }
 
+/** Server-generated application provenance for authenticated browser prompts only. */
+export function nativePromptAdditionalContext(
+  origin: PromptOrigin | undefined,
+): JsonObject | undefined {
+  if (origin?.kind === 'owner-admin-console') return {
+    [OWNER_ADMIN_CONTEXT_KEY]: {
+      kind: 'application',
+      value: 'Direct owner admin console: server-authenticated paired console provenance; '
+        + 'the accompanying user text is direct owner input.',
+    },
+  };
+  if (origin?.kind === 'owner') return {
+    [OWNER_CHANNEL_CONTEXT_KEY]: {
+      kind: 'application',
+      value: 'Authenticated Fleet owner channel: the supervisor authenticated the sender CID; '
+        + 'the accompanying user text is a direct owner instruction.',
+    },
+  };
+  return undefined;
+}
+
 function toolItem(item: JsonObject): { title: string; status?: string } | undefined {
   switch (item.type) {
     case 'commandExecution': return {
@@ -150,6 +182,7 @@ export class CodexAppServerSession implements AgentSession {
   private readonly threadFile: string;
   private readonly pendingPermissions = new Map<string, PendingPermission>();
   private readonly activeTools = new Set<string>();
+  private readonly activeItems = new Set<string>();
   private readonly itemPhases = new Map<string, 'commentary' | 'final_answer'>();
   private readonly itemText = new Map<string, string>();
   private transport: CodexAppServerConnection;
@@ -165,6 +198,10 @@ export class CodexAppServerSession implements AgentSession {
   private activeTurn?: ActiveTurn;
   private controllerCount = 0;
   private controllerGrace?: ReturnType<typeof setTimeout>;
+  private interruptForceKill?: ReturnType<typeof setTimeout>;
+  private terminalReconcile?: ReturnType<typeof setTimeout>;
+  private terminalReconcileInFlight = false;
+  private finalAnswerObserved = false;
   private closing = false;
 
   private constructor(
@@ -234,12 +271,18 @@ export class CodexAppServerSession implements AgentSession {
 
     let delivery: PromptDelivery | undefined;
     if (options.interrupt && this.activeTurn) {
-      await this.interrupt(options.interruptSource ?? 'local-console');
+      const interrupted = await this.interrupt(options.interruptSource ?? 'local-console');
+      if (interrupted.state === 'forced')
+        throw new SessionControlError(
+          'control-unavailable',
+          'Codex app-server restart is in progress after the cancellation deadline',
+          interrupted.reasonCode ?? CODEX_APP_SERVER_CANCEL_DEADLINE_EXCEEDED,
+        );
       delivery = 'interrupted';
     }
     if (options.steer && this.activeTurn?.nativeTurnId) {
       const promptId = randomUUID();
-      const completion = this.steer(text, this.activeTurn.nativeTurnId);
+      const completion = this.steer(text, this.activeTurn.nativeTurnId, options.origin);
       return { promptId, queuedBehind: 0, completion, origin: options.origin, delivery: 'started' };
     }
 
@@ -293,7 +336,8 @@ export class CodexAppServerSession implements AgentSession {
     const settled = await Promise.race([
       active.settled.then(() => true),
       new Promise<false>(resolveTimeout => {
-        timer = setTimeout(() => resolveTimeout(false), INTERRUPT_SETTLE_MS);
+        timer = setTimeout(
+          () => resolveTimeout(false), this.options.interruptSettleMs ?? INTERRUPT_SETTLE_MS);
         timer.unref?.();
       }),
     ]);
@@ -301,6 +345,15 @@ export class CodexAppServerSession implements AgentSession {
     if (settled) return { state: 'settled' };
     this.lastError = CODEX_APP_SERVER_CANCEL_DEADLINE_EXCEEDED;
     this.transport.child.kill('SIGTERM');
+    this.clearInterruptForceKill();
+    this.interruptForceKill = setTimeout(() => {
+      this.interruptForceKill = undefined;
+      if (this.activeTurn !== active || !this.transport.isAlive()) return;
+      this.options.log(`[${this.options.name}] ${CODEX_APP_SERVER_CANCEL_DEADLINE_EXCEEDED}: `
+        + 'app-server ignored SIGTERM; sending SIGKILL');
+      this.transport.child.kill('SIGKILL');
+    }, this.options.interruptTerminateGraceMs ?? INTERRUPT_TERMINATE_GRACE_MS);
+    this.interruptForceKill.unref?.();
     return { state: 'forced', reasonCode: CODEX_APP_SERVER_CANCEL_DEADLINE_EXCEEDED };
   }
 
@@ -352,6 +405,8 @@ export class CodexAppServerSession implements AgentSession {
     if (this.closing) return;
     this.closing = true;
     if (this.controllerGrace) clearTimeout(this.controllerGrace);
+    this.clearInterruptForceKill();
+    this.cancelTerminalReconciliation();
     for (const [id, pending] of [...this.pendingPermissions])
       this.autoResolvePermission(id, pending, undefined, 'the session closed');
     if (this.activeTurn)
@@ -465,7 +520,10 @@ export class CodexAppServerSession implements AgentSession {
         continue;
       }
       this.queueDepth++;
-      const run = this.promptTail.then(() => this.runPrompt(open.text!, open.promptId));
+      const origin: PromptOrigin | undefined = open.commandId
+        ? { kind: 'owner-admin-console', commandId: open.commandId }
+        : undefined;
+      const run = this.promptTail.then(() => this.runPrompt(open.text!, open.promptId, origin));
       this.promptTail = run.then(() => undefined, () => undefined);
       void run.finally(() => { this.queueDepth = Math.max(0, this.queueDepth - 1); });
     }
@@ -506,6 +564,8 @@ export class CodexAppServerSession implements AgentSession {
     const settled = new Promise<TurnResult>(resolveResult => { settle = resolveResult; });
     const active: ActiveTurn = { promptId, origin, output: '', settled, settle };
     this.activeTurn = active;
+    this.finalAnswerObserved = false;
+    this.activeItems.clear();
     this.readiness = 'running';
     this.events.emit('state', { turnId: promptId, status: 'running', origin });
     this.conversation.appendSafe({
@@ -519,10 +579,13 @@ export class CodexAppServerSession implements AgentSession {
         approvalPolicy: this.options.approvalPolicy,
         model: this.options.model ?? null,
         effort: this.options.effort ?? null,
+        ...(nativePromptAdditionalContext(origin)
+          ? { additionalContext: nativePromptAdditionalContext(origin) } : {}),
       });
       const turn = isObject(response.turn) ? response.turn : undefined;
       active.nativeTurnId ??= string(turn?.id);
       if (!active.nativeTurnId) throw new Error('Codex app-server did not return a turn id');
+      this.scheduleTerminalReconciliation();
       return await settled;
     } catch (error) {
       if (this.activeTurn === active)
@@ -531,12 +594,16 @@ export class CodexAppServerSession implements AgentSession {
     }
   }
 
-  private async steer(text: string, expectedTurnId: string): Promise<TurnResult> {
+  private async steer(
+    text: string, expectedTurnId: string, origin?: PromptOrigin,
+  ): Promise<TurnResult> {
     if (!this.threadId) return turnResult(false, 'failed', 'Codex thread is unavailable');
     try {
       await this.transport.request('turn/steer', {
         threadId: this.threadId, expectedTurnId,
         input: [{ type: 'text', text, text_elements: [] }],
+        ...(nativePromptAdditionalContext(origin)
+          ? { additionalContext: nativePromptAdditionalContext(origin) } : {}),
       });
       return turnResult(true, 'inconclusive', 'injected');
     } catch (error) {
@@ -579,6 +646,9 @@ export class CodexAppServerSession implements AgentSession {
       case 'turn/plan/updated':
         if (this.isActiveNotification(params)) this.planUpdated(params);
         break;
+      case 'serverRequest/resolved':
+        this.serverRequestResolved(params);
+        break;
       case 'warning':
       case 'configWarning': {
         const message = string(params.message) ?? string(params.summary);
@@ -600,7 +670,20 @@ export class CodexAppServerSession implements AgentSession {
       }
       case 'thread/status/changed': {
         const status = isObject(params.status) ? string(params.status.type) : undefined;
-        if (status === 'systemError') this.lastError = 'Codex thread entered systemError';
+        if (status === 'systemError') {
+          this.lastError = 'Codex thread entered systemError';
+          this.cancelTerminalReconciliation();
+          if (this.activeTurn) this.finishTurn('failed', this.lastError, true);
+          else {
+            this.readiness = 'failed';
+            this.events.emit('state', { status: 'failed', text: this.lastError });
+          }
+          this.terminateFailedTransport(this.lastError);
+          break;
+        }
+        if (status === 'idle' && this.activeTurn) {
+          this.scheduleTerminalReconciliation();
+        }
         break;
       }
       default:
@@ -611,11 +694,18 @@ export class CodexAppServerSession implements AgentSession {
   private itemStarted(item: JsonObject): void {
     const id = string(item.id);
     if (!id) return;
+    this.activeItems.add(id);
     if (item.type === 'agentMessage') {
       const phase = item.phase === 'commentary' || item.phase === 'final_answer' ? item.phase : undefined;
       if (phase) this.itemPhases.set(id, phase);
+      if (phase !== 'final_answer') {
+        this.finalAnswerObserved = false;
+        this.cancelTerminalReconciliation();
+      }
       return;
     }
+    this.finalAnswerObserved = false;
+    this.cancelTerminalReconciliation();
     const tool = toolItem(item);
     if (!tool) return;
     this.activeTools.add(id);
@@ -632,6 +722,7 @@ export class CodexAppServerSession implements AgentSession {
   private itemCompleted(item: JsonObject): void {
     const id = string(item.id);
     if (!id) return;
+    this.activeItems.delete(id);
     if (item.type === 'agentMessage') {
       const phase = item.phase === 'commentary' || item.phase === 'final_answer'
         ? item.phase : this.itemPhases.get(id);
@@ -640,6 +731,10 @@ export class CodexAppServerSession implements AgentSession {
       const emitted = this.itemText.get(id) ?? '';
       if (complete.length > emitted.length && complete.startsWith(emitted))
         this.emitMessage(id, complete.slice(emitted.length), phase);
+      if (phase === 'final_answer' && complete.length > 0) {
+        this.finalAnswerObserved = true;
+        this.scheduleTerminalReconciliation();
+      }
       return;
     }
     const tool = toolItem(item);
@@ -653,6 +748,7 @@ export class CodexAppServerSession implements AgentSession {
       status: tool.status ?? 'completed',
     });
     this.recordTool(item, false);
+    this.scheduleTerminalReconciliation();
   }
 
   private messageDelta(params: JsonObject): void {
@@ -731,14 +827,18 @@ export class CodexAppServerSession implements AgentSession {
     });
   }
 
-  private finishTurn(outcome: TurnOutcome, detail?: string): void {
+  private finishTurn(outcome: TurnOutcome, detail?: string, sessionFailed = false): void {
     const active = this.activeTurn;
     if (!active) return;
+    this.cancelTerminalReconciliation();
+    this.clearInterruptForceKill();
     this.activeTurn = undefined;
-    this.readiness = this.transport.isAlive() && !this.closing ? 'idle' : 'failed';
+    this.readiness = !sessionFailed && this.transport.isAlive() && !this.closing ? 'idle' : 'failed';
     this.activeTools.clear();
+    this.activeItems.clear();
     this.itemPhases.clear();
     this.itemText.clear();
+    this.finalAnswerObserved = false;
     const result = turnResult(true, outcome, detail, active.output, active.cancellationSource);
     this.events.emit('turn_stop', {
       turnId: active.promptId, origin: active.origin, stopReason: detail ?? outcome,
@@ -754,6 +854,85 @@ export class CodexAppServerSession implements AgentSession {
       },
     });
     active.settle(result);
+  }
+
+  /**
+   * Some supported Codex versions can persist a completed turn without
+   * emitting `turn/completed`. Reconcile only an exact, quiescent final-answer
+   * candidate against the app-server's authoritative thread snapshot.
+   */
+  private scheduleTerminalReconciliation(): void {
+    this.cancelTerminalReconciliation();
+    if (!this.terminalCandidate()) return;
+    this.terminalReconcile = setTimeout(() => {
+      this.terminalReconcile = undefined;
+      void this.reconcileTerminal();
+    }, this.options.terminalReconcileQuietMs ?? TERMINAL_RECONCILE_QUIET_MS);
+    this.terminalReconcile.unref?.();
+  }
+
+  private terminalCandidate(): boolean {
+    return Boolean(this.activeTurn?.nativeTurnId && this.finalAnswerObserved
+      && this.activeItems.size === 0 && this.pendingPermissions.size === 0
+      && !this.terminalReconcileInFlight && !this.closing && this.transport.isAlive());
+  }
+
+  private async reconcileTerminal(): Promise<void> {
+    if (!this.terminalCandidate() || !this.threadId || !this.activeTurn?.nativeTurnId) return;
+    const active = this.activeTurn;
+    const turnId = active.nativeTurnId;
+    this.terminalReconcileInFlight = true;
+    try {
+      const response = await this.transport.request<JsonObject>('thread/read', {
+        threadId: this.threadId, includeTurns: true,
+      }, this.options.terminalReconcileRequestTimeoutMs
+        ?? TERMINAL_RECONCILE_REQUEST_TIMEOUT_MS);
+      if (this.activeTurn !== active || !this.finalAnswerObserved) return;
+      const thread = isObject(response.thread) ? response.thread : undefined;
+      const turns = thread && Array.isArray(thread.turns) ? thread.turns : [];
+      const turn = turns.find(candidate => isObject(candidate) && candidate.id === turnId);
+      if (!isObject(turn)) return;
+      const status = string(turn.status);
+      const threadStatus = thread && isObject(thread.status) ? string(thread.status.type) : undefined;
+      const terminal = status === 'completed' || status === 'failed' || status === 'interrupted';
+      if (!terminal && threadStatus !== 'idle') return;
+      const error = isObject(turn.error) ? string(turn.error.message) : undefined;
+      const outcome = terminal ? outcomeFor(status) : 'completed';
+      this.options.log(`[${this.options.name}] inferred missing turn/completed after `
+        + `authoritative reconciliation (${this.threadId}/${turnId})`);
+      this.finishTurn(outcome, error ?? (terminal ? status : 'inferred missing turn/completed'));
+    } catch (error) {
+      if (this.activeTurn === active && this.transport.isAlive())
+        this.options.log(`[${this.options.name}] Codex terminal reconciliation failed: `
+          + `${error instanceof Error ? error.message : String(error)}`);
+    } finally {
+      this.terminalReconcileInFlight = false;
+      if (this.activeTurn === active) this.scheduleTerminalReconciliation();
+    }
+  }
+
+  private cancelTerminalReconciliation(): void {
+    if (this.terminalReconcile) clearTimeout(this.terminalReconcile);
+    this.terminalReconcile = undefined;
+  }
+
+  private clearInterruptForceKill(): void {
+    if (this.interruptForceKill) clearTimeout(this.interruptForceKill);
+    this.interruptForceKill = undefined;
+  }
+
+  private terminateFailedTransport(reason: string): void {
+    if (!this.transport.isAlive()) return;
+    this.transport.child.kill('SIGTERM');
+    if (!this.transport.isAlive()) return;
+    this.clearInterruptForceKill();
+    this.interruptForceKill = setTimeout(() => {
+      this.interruptForceKill = undefined;
+      if (!this.transport.isAlive()) return;
+      this.options.log(`[${this.options.name}] ${reason}; app-server ignored SIGTERM; sending SIGKILL`);
+      this.transport.child.kill('SIGKILL');
+    }, this.options.interruptTerminateGraceMs ?? INTERRUPT_TERMINATE_GRACE_MS);
+    this.interruptForceKill.unref?.();
   }
 
   private serverRequest(method: string, id: RequestId, params: JsonObject): void {
@@ -845,6 +1024,20 @@ export class CodexAppServerSession implements AgentSession {
     pending.expiry.unref?.();
   }
 
+  private serverRequestResolved(params: JsonObject): void {
+    const requestId = typeof params.requestId === 'string' || typeof params.requestId === 'number'
+      ? params.requestId : undefined;
+    if (requestId === undefined) return;
+    const entry = [...this.pendingPermissions].find(([, pending]) =>
+      pending.requestId === requestId);
+    if (!entry) return;
+    const [permissionId, pending] = entry;
+    this.pendingPermissions.delete(permissionId);
+    if (pending.expiry) clearTimeout(pending.expiry);
+    this.resolvePermission(permissionId, pending, 'cancelled', 'automatic', undefined, undefined,
+      'Codex resolved the native server request externally');
+  }
+
   private autoResolvePermission(
     permissionId: string, pending: PendingPermission, policy: string | undefined, reason: string,
   ): void {
@@ -874,6 +1067,7 @@ export class CodexAppServerSession implements AgentSession {
     });
     if (!this.pendingPermissions.size && this.readiness === 'awaiting_permission')
       this.readiness = 'running';
+    this.scheduleTerminalReconciliation();
   }
 
   private currentEvent(event: ConversationEventV1): boolean {
@@ -901,6 +1095,8 @@ export class CodexAppServerSession implements AgentSession {
   }
 
   private transportExited(exit: ExitRecord): void {
+    this.clearInterruptForceKill();
+    this.cancelTerminalReconciliation();
     this.exit = this.lastError === CODEX_APP_SERVER_CANCEL_DEADLINE_EXCEEDED
       ? { ...exit, detail: `${this.lastError}; ${exit.detail}` } : exit;
     if (!this.closing) {

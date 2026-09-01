@@ -39,7 +39,7 @@ const LAUNCHERS = ['auto', 'ours-codex', 'codex'];
 const SANDBOX_MODES = ['read-only', 'workspace-write', 'danger-full-access'];
 /** Codex CLI's accepted `--ask-for-approval` values. */
 const APPROVAL_POLICIES = ['untrusted', 'on-request', 'never'];
-const NATIVE_PERMISSION_CONFIG_KEYS = ['approval_policy', 'sandbox_mode', 'default_permissions'];
+const NATIVE_CONFIG_ALLOWLIST = new Set(['model_reasoning_effort']);
 const BUNDLED_CODEX_ACP_VERSION = '1.1.7';
 const CODEX_ACP_PACKAGE = '@agentclientprotocol/codex-acp';
 const CODEX_PROXY_APPROVAL_ENV = 'OURS_FLEET_CODEX_APPROVAL';
@@ -150,6 +150,19 @@ function neutralSandboxMode(role: ResolvedRole): string {
   return 'workspace-write';
 }
 
+/** Native config is fail-closed because Codex adds authority-bearing keys over time. */
+function isNativeConfigKeyAllowed(key: string): boolean {
+  return NATIVE_CONFIG_ALLOWLIST.has(key);
+}
+
+/** Defense in depth for callers which launch a role after validation was bypassed. */
+export function nativeCodexConfig(role: ResolvedRole): Record<string, unknown> | undefined {
+  const options = role.harness_options as CodexOptions | undefined;
+  if (!options?.config) return undefined;
+  return Object.fromEntries(Object.entries(options.config)
+    .filter(([key]) => isNativeConfigKeyAllowed(key)));
+}
+
 function launcherMode(role: ResolvedRole): string {
   return (role.harness_options as CodexOptions | undefined)?.launcher ?? 'auto';
 }
@@ -167,7 +180,6 @@ function codexAgentLaunch(role: ResolvedRole, prep: SessionPrep): AcpLaunch {
     const launcher = launcherMode(role);
     const options = role.harness_options as CodexOptions | undefined;
     const flags = [
-      ...(options?.profile ? ['--profile', options.profile] : []),
       ...(options?.search ? ['--search'] : []),
       'app-server',
     ];
@@ -352,12 +364,7 @@ export function makeCodexAdapter(
       sessionMeta: () => undefined,
       approvalPolicy: neutralApprovalPolicy,
       sandbox: neutralSandboxMode,
-      nativeConfig: role => {
-        const options = role.harness_options as CodexOptions | undefined;
-        if (!options?.config) return undefined;
-        return Object.fromEntries(Object.entries(options.config)
-          .filter(([key]) => !NATIVE_PERMISSION_CONFIG_KEYS.includes(key)));
-      },
+      nativeConfig: nativeCodexConfig,
       addDirs: role => (role.harness_options as CodexOptions | undefined)?.add_dirs,
     }, transport, nativeTransport),
     supportsResume: true,
@@ -406,6 +413,11 @@ export function makeCodexAdapter(
         .map(k => ({ path: `harness_options.${k}`, message: `unknown option; allowed: ${OPTION_KEYS.join(', ')}` }));
       const o = opts as CodexOptions;
       if (role?.session === 'codex-app-server') {
+        if (o.profile != null)
+          errs.push({
+            path: 'harness_options.profile',
+            message: 'is not accepted for codex-app-server; Codex rejects --profile for app-server',
+          });
         if (o.approval != null)
           errs.push({
             path: 'harness_options.approval',
@@ -444,10 +456,10 @@ export function makeCodexAdapter(
         if (typeof o.config !== 'object' || Array.isArray(o.config))
           errs.push({ path: 'harness_options.config', message: 'must be a map of Codex config keys to TOML scalar/array values' });
         else for (const [key, value] of Object.entries(o.config)) {
-          if (role?.session === 'codex-app-server' && NATIVE_PERMISSION_CONFIG_KEYS.includes(key)) {
+          if (role?.session === 'codex-app-server' && !isNativeConfigKeyAllowed(key)) {
             errs.push({
               path: `harness_options.config.${key}`,
-              message: 'is not accepted for codex-app-server; use the neutral permissions.approval and permissions.filesystem fields',
+              message: 'is not accepted for codex-app-server; only model_reasoning_effort is allowed',
             });
             continue;
           }

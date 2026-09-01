@@ -585,20 +585,23 @@ refused at validation rather than accepted and dropped. This narrows a role's
 tool surface; it does not stop the harness deferring tool schemas, which is the
 harness's own decision.
 
-Codex \`harness_options\`: \`launcher\` (auto, ours-codex, codex), \`profile\`,
-\`search\`, \`config\`, \`add_dirs\`, and \`monitor\`. Native app-server roles
+Codex \`harness_options\`: \`launcher\` (auto, ours-codex, codex), \`search\`,
+\`config\`, \`add_dirs\`, and \`monitor\`; Codex ACP additionally supports
+\`profile\`. Native app-server roles reject \`profile\` because Codex does not
+accept \`--profile\` for \`app-server\`. They
 must express approval and filesystem authority through the shared
 \`permissions:\` block, never through harness options. The adapter translates
 \`ask|auto|allow\` to Codex \`untrusted|on-request|never\` and translates
 \`read-only|workspace|unrestricted\` to Codex
-\`read-only|workspace-write|danger-full-access\`.
+\`read-only|workspace-write|danger-full-access\`. Native \`config\` currently
+allows only \`model_reasoning_effort\`; ACP retains the broader Codex config surface.
 
-For Codex, \`session: codex-app-server\` directly runs Codex's native JSONL app
-server behind Fleet's provider-neutral session contract. It supports native item
+For Codex, the opt-in \`session: codex-app-server\` directly runs Codex's native
+JSONL app server behind Fleet's provider-neutral session contract. It supports native item
 streaming, commentary/final phases, prompt admission, steering, interruption,
-permission requests, durable conversation projection, and thread resume. Use
-\`session: acp\` as the Codex compatibility fallback; Claude Code continues to
-use ACP. Native Codex defaults to \`codex app-server\` (or \`ours-codex app-server\`
+permission requests, durable conversation projection, and thread resume. Packaged
+Codex brains and the init wizard continue to select \`session: acp\` for compatibility;
+Claude Code also uses ACP. Native Codex defaults to \`codex app-server\` (or \`ours-codex app-server\`
 when launcher auto finds it). Override the exact command when necessary:
 
 \`session_options: { codex_app_server: { command: [codex, app-server] } }\`

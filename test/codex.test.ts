@@ -3,7 +3,7 @@ import { existsSync, mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
-  codexAcpLaunchForResolution, makeCodexAdapter, codexCapabilities,
+  codexAcpLaunchForResolution, makeCodexAdapter, codexCapabilities, nativeCodexConfig,
 } from '../src/harness/codex.js';
 import { checkUnattendedFloor } from '../src/permissions.js';
 import { agentDir } from '../src/paths.js';
@@ -26,19 +26,19 @@ const execWith = (oursCodex: boolean): Exec => async (cmd, args) => {
 const okExec = execWith(false);
 
 describe('prepareSession', () => {
-  it('launches the direct app-server with native CLI options and exact overrides', () => {
+  it('launches the direct app-server with supported native CLI options and exact overrides', () => {
     const adapter = makeCodexAdapter(okExec).agentSession;
     expect(adapter.prepareLaunch(role({
       session: 'codex-app-server',
-      harness_options: { launcher: 'codex', profile: 'fleet', search: true },
+      harness_options: { launcher: 'codex', search: true },
     }), { env: { TOKEN: 'safe' } })).toEqual({
-      argv: ['codex', '--profile', 'fleet', '--search', 'app-server'],
+      argv: ['codex', '--search', 'app-server'],
       env: { TOKEN: 'safe' },
     });
     expect(adapter.prepareLaunch(role({
       session: 'codex-app-server',
       session_options: { codex_app_server: { command: ['native-shim', '--stdio'] } },
-      harness_options: { profile: 'ignored', search: true },
+      harness_options: { search: true },
     }), { env: {} }).argv).toEqual(['native-shim', '--stdio']);
   });
 
@@ -165,11 +165,16 @@ describe('validateOptions / prereqs', () => {
     const a = makeCodexAdapter(okExec);
     const native = role({ session: 'codex-app-server' });
     expect(a.validateOptions({
+      profile: 'fleet',
       approval: 'on-request',
       sandbox: 'workspace-write',
       config: { approval_policy: 'never', sandbox_mode: 'danger-full-access' },
     }, native))
       .toEqual(expect.arrayContaining([
+        expect.objectContaining({
+          path: 'harness_options.profile',
+          message: expect.stringContaining('rejects --profile'),
+        }),
         expect.objectContaining({
           path: 'harness_options.approval',
           message: expect.stringContaining('permissions.approval: ask|auto|allow'),
@@ -181,6 +186,39 @@ describe('validateOptions / prereqs', () => {
         expect.objectContaining({ path: 'harness_options.config.approval_policy' }),
         expect.objectContaining({ path: 'harness_options.config.sandbox_mode' }),
       ]));
+  });
+  it('allows only explicit harmless native config keys and defensively removes the rest', () => {
+    const a = makeCodexAdapter(okExec);
+    const native = role({
+      session: 'codex-app-server',
+      harness_options: { config: {
+        approval_policy: 'never',
+        approvals_reviewer: 'auto_review',
+        'apps._default.default_tools_approval_mode': 'approve',
+        'mcp_servers.evil.command': '/path/to/executable',
+        notify: ['/path/to/notifier'],
+        'shell_environment_policy.ignore_default_excludes': true,
+        'sandbox_workspace_write.network_access': true,
+        sandbox_permissions: ['disk-full-read-access'],
+        'default_permissions.profile': ':danger-full-access',
+        'permissions.custom.network_access': true,
+        model_reasoning_effort: 'high',
+      } },
+    });
+    expect(a.validateOptions(native.harness_options, native).map(error => error.path))
+      .toEqual(expect.arrayContaining([
+        'harness_options.config.approval_policy',
+        'harness_options.config.approvals_reviewer',
+        'harness_options.config.apps._default.default_tools_approval_mode',
+        'harness_options.config.mcp_servers.evil.command',
+        'harness_options.config.notify',
+        'harness_options.config.shell_environment_policy.ignore_default_excludes',
+        'harness_options.config.sandbox_workspace_write.network_access',
+        'harness_options.config.sandbox_permissions',
+        'harness_options.config.default_permissions.profile',
+        'harness_options.config.permissions.custom.network_access',
+      ]));
+    expect(nativeCodexConfig(native)).toEqual({ model_reasoning_effort: 'high' });
   });
   it('validates launcher/profile/config/add_dirs and conflicting approval aliases', () => {
     const a = makeCodexAdapter(okExec);

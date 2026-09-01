@@ -13,7 +13,8 @@ import { FleetQueryService } from '../application/fleet-query-service.js';
 import { interruptSession, queueSessionPrompt } from '../application/session-mutations.js';
 import { pickBackend } from '../supervisor/index.js';
 import {
-  ACP_CANCEL_DEADLINE_EXCEEDED, SessionControlError,
+  ACP_CANCEL_DEADLINE_EXCEEDED, CODEX_APP_SERVER_CANCEL_DEADLINE_EXCEEDED,
+  SessionControlError,
   type AgentSession, type QueuedPrompt, type SessionEvent, type TurnResult,
 } from '../session/types.js';
 import { VERSION } from '../version.js';
@@ -1322,12 +1323,13 @@ export class OwnerChannel implements OwnerChannelHandle {
     } catch (error) {
       await rm(outbox, { recursive: true, force: true });
       if (error instanceof SessionControlError
-          && error.reasonCode === ACP_CANCEL_DEADLINE_EXCEEDED) {
+          && (error.reasonCode === ACP_CANCEL_DEADLINE_EXCEEDED
+            || error.reasonCode === CODEX_APP_SERVER_CANCEL_DEADLINE_EXCEEDED)) {
         // drainAll journaled this authenticated message before delivery. The
         // adapter generation is terminating, so leave the wire unhandled and
         // body-free: the resumed owner channel recovers it exactly once.
         this.options.log(`[${this.options.role}] owner request ${requestId.slice(0, 12)} `
-          + `held for adapter resume reason=${ACP_CANCEL_DEADLINE_EXCEEDED}`);
+          + `held for adapter resume reason=${error.reasonCode}`);
         return false;
       }
       this.logError('request delivery failed', error);

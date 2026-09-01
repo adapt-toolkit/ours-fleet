@@ -433,7 +433,7 @@ Additional operational field inventory (schematic, not one YAML document):
       # Codex ACP compatibility only: native codex-app-server rejects Codex
       # permission overrides here; use the common permissions block above.
       # launcher: auto                          # codex: auto | ours-codex | codex
-      # profile: fleet                          # codex: $CODEX_HOME/fleet.config.toml
+      # profile: fleet                          # codex ACP only: $CODEX_HOME/fleet.config.toml
       # search: true                            # codex: enable --search (live web search)
       # add_dirs: [/data/shared]                # codex: repeat --add-dir
       # monitor: true                           # explicit persistent consent to arm mail wake
@@ -1122,21 +1122,24 @@ permissions:
   unattended: deny
 harness_options:
   launcher: auto
-  profile: fleet
   monitor: true
   search: true
   add_dirs: [/data/shared]
   config: { model_reasoning_effort: high }
 ```
 
-`codex-app-server` is the direct Codex transport and the recommended Codex
-session type. It streams native items and message phases, maps Codex approval
+`codex-app-server` is the opt-in direct Codex transport. It streams native items
+and message phases, maps Codex approval
 requests into Fleet permissions, supports turn steering/interrupt, and resumes
 the durable Codex thread through Fleet's shared `.session-id` lifecycle.
 Configure its authority only through the shared `permissions:` block;
 `on-request` and other Codex policy names are internal adapter values.
-`session: acp` remains supported as a compatibility fallback and is still the
-session type for Claude Code. Existing durable sessions are not assumed portable
+Codex rejects `--profile` for `app-server`, so native roles also reject
+`harness_options.profile`; use the explicit config map only for non-authority
+settings. Native config currently allows only `model_reasoning_effort`; Codex ACP
+retains its legacy profile and config support.
+Packaged Codex brains and the init wizard continue to select `session: acp` for
+compatibility; Claude Code also uses ACP. Existing durable sessions are not assumed portable
 between unrelated providers; a failed fast resume is handled by Fleet's normal
 bounded fresh-session recovery.
 
