@@ -121,17 +121,20 @@ function launchPermissions(definition: Record<string, unknown> | undefined): str
 
 function roomParticipants(room: RoomOrchestrationRecord): Array<{
   name: string; id?: string; brain?: string; role: string; permissions?: string;
+  configuration?: import('../lifecycle-summary.js').AgentLaunchConfiguration;
 }> {
   return [...room.member_seats].sort((a, b) => a.role_name.localeCompare(b.role_name)).map(seat => ({
     name: seat.role_name, id: seat.identity_cid,
     brain: launchSelection(seat.launch?.agent_definition, 'brain'),
     role: launchSelection(seat.launch?.agent_definition, 'role') ?? seat.cowork_role,
     permissions: launchPermissions(seat.launch?.agent_definition),
+    ...(seat.launch?.presentation ? { configuration: seat.launch.presentation } : {}),
   }));
 }
 
 function taskAgents(task: TaskRecord): Array<{
   name: string; brain?: string; role: string; permissions?: string;
+  configuration?: import('../lifecycle-summary.js').AgentLaunchConfiguration;
 }> {
   const room = task.room_id ? getRoomRecord(task.room_id) : undefined;
   const seats = new Map(room?.member_seats.map(seat => [seat.role_name, seat]) ?? []);
@@ -139,7 +142,8 @@ function taskAgents(task: TaskRecord): Array<{
     const seat = seats.get(member.name);
     return { name: member.name, brain: launchSelection(seat?.launch?.agent_definition, 'brain'),
       role: launchSelection(seat?.launch?.agent_definition, 'role') ?? member.cowork_role,
-      permissions: launchPermissions(seat?.launch?.agent_definition) };
+      permissions: launchPermissions(seat?.launch?.agent_definition),
+      ...(seat?.launch?.presentation ? { configuration: seat.launch.presentation } : {}) };
   });
 }
 

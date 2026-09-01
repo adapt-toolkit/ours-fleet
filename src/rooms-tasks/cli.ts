@@ -55,6 +55,7 @@ import { TaskListError } from './task-lists.js';
 import {
   recordFleetAuditFailure, recordFleetAuditPresentation, recordFleetAuditResource,
 } from '../fleet-command-audit.js';
+import { renderAgentConfiguration, type AgentLaunchConfiguration } from '../lifecycle-summary.js';
 
 type TaskRoomPublicErrorCode =
   | 'task_confirmation_mismatch' | 'room_confirmation_mismatch'
@@ -287,6 +288,15 @@ const taskActionMarkdown = (
   });
 };
 
+/**
+ * Shared launch-configuration line for CLI member listings. Pre-upgrade seats
+ * without a captured presentation keep the minimal listing rather than
+ * claiming resolved facts. Output is already escaped (markdownItems boundary).
+ */
+function seatConfigurationSuffix(presentation: AgentLaunchConfiguration | undefined): string {
+  return presentation ? ` — ${renderAgentConfiguration(presentation)}` : '';
+}
+
 function safeSelectionSummary(definition: Record<string, unknown> | undefined, kind: 'brain' | 'role'): string {
   const selected = definition?.[kind];
   if (!selected || typeof selected !== 'object' || Array.isArray(selected)) return 'unresolved';
@@ -325,6 +335,8 @@ function auditTask(operation: string, task: ReturnType<typeof getTask>, previous
   const room = task.room_id ? getRoomRecord(task.room_id) : undefined;
   const definitions = new Map(room?.member_seats.map(seat =>
     [seat.role_name, seat.launch?.agent_definition]) ?? []);
+  const presentations = new Map(room?.member_seats.map(seat =>
+    [seat.role_name, seat.launch?.presentation]) ?? []);
   const semanticOperation = operation === 'recover'
     ? newState === 'active' ? 'work' : newState === 'done' ? 'done'
       : newState === 'cancelled' ? 'cancel' : undefined
@@ -340,7 +352,8 @@ function auditTask(operation: string, task: ReturnType<typeof getTask>, previous
       brain: safeSelectionSummary(definitions.get(member.name), 'brain'),
       role: safeSelectionSummary(definitions.get(member.name), 'role') === 'unresolved'
         ? member.cowork_role : safeSelectionSummary(definitions.get(member.name), 'role'),
-      permissions: safePermissionsSummary(definitions.get(member.name)) })) });
+      permissions: safePermissionsSummary(definitions.get(member.name)),
+      configuration: presentations.get(member.name) })) });
 }
 
 function auditRoom(operation: string, room: RoomOrchestrationRecord, previousState: string,
@@ -360,7 +373,8 @@ function auditRoom(operation: string, room: RoomOrchestrationRecord, previousSta
       brain: safeSelectionSummary(member.launch?.agent_definition, 'brain'),
       role: safeSelectionSummary(member.launch?.agent_definition, 'role') === 'unresolved'
         ? member.cowork_role : safeSelectionSummary(member.launch?.agent_definition, 'role'),
-      permissions: safePermissionsSummary(member.launch?.agent_definition) })) });
+      permissions: safePermissionsSummary(member.launch?.agent_definition),
+      configuration: member.launch?.presentation })) });
 }
 
 
@@ -862,7 +876,9 @@ export function registerTaskCommands(parent: Command, cOpt: (cmd: Command) => Co
           sections: [
             ...(t.member_roles.length ? [{
               heading: 'Members', markdownItems: t.member_roles.map(m =>
-                `${markdownCode(m.name)} — ${markdownProse(m.cowork_role)} — ${markdownCode(m.identity_cid)}`),
+                `${markdownCode(m.name)} — ${markdownProse(m.cowork_role)} — ${markdownCode(m.identity_cid)}`
+                + seatConfigurationSuffix(room?.member_seats
+                  .find(seat => seat.role_name === m.name)?.launch?.presentation)),
             }] : []),
             ...(room ? roomStartupSections(room) : []),
           ],
@@ -1336,7 +1352,9 @@ export function registerRoomCommands(parent: Command, cOpt: (cmd: Command) => Co
           sections: [
             ...(cowork.seats.length ? [{
               heading: 'Members', markdownItems: cowork.seats.map(s =>
-                `${markdownCode(s.identity_cid)} — ${markdownProse(s.role)} — ${markdownProse(s.seat_state)}`),
+                `${markdownCode(s.identity_cid)} — ${markdownProse(s.role)} — ${markdownProse(s.seat_state)}`
+                + seatConfigurationSuffix(r?.member_seats
+                  .find(seat => seat.identity_cid === s.identity_cid)?.launch?.presentation)),
             }] : []),
             ...(r ? roomStartupSections(r) : []),
           ],
@@ -1392,7 +1410,9 @@ export function registerRoomCommands(parent: Command, cOpt: (cmd: Command) => Co
           sections: [{
             heading: 'Members',
             ...(members.length ? { markdownItems: members.map(s =>
-              `${markdownCode(s.identity_cid)} — ${markdownProse(s.role)} — ${markdownProse(s.seat_state)}`) }
+              `${markdownCode(s.identity_cid)} — ${markdownProse(s.role)} — ${markdownProse(s.seat_state)}`
+              + seatConfigurationSuffix(r?.member_seats
+                .find(seat => seat.identity_cid === s.identity_cid)?.launch?.presentation)) }
               : { items: ['No members found.'] }),
           }],
         }));

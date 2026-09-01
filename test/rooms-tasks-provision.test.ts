@@ -182,9 +182,24 @@ beforeEach(() => {
   mocks.spawnTemp.mockImplementation(async (opts: Record<string, any>) => {
     const dir = join(root, '.ours-fleet', 'tmp', opts.name);
     mkdirSync(dir, { recursive: true });
+    // The persisted role.yaml is the exact ResolvedRole a real spawn writes;
+    // launch presentation capture reads it back, so keep the fake realistic.
+    const definition = opts.agentDefinition ?? {};
     writeFileSync(join(dir, 'role.yaml'), JSON.stringify({
+      name: opts.name,
       identity: opts.identity,
-      mission: opts.mission,
+      harness: definition.brain?.inline?.harness ?? 'codex',
+      session: 'acp',
+      ...(definition.brain?.inline?.model !== undefined ? { model: definition.brain.inline.model } : {}),
+      ...(definition.brain?.inline?.effort !== undefined ? { effort: definition.brain.inline.effort } : {}),
+      ...(definition.role?.inline?.mission !== undefined ? { mission: definition.role.inline.mission } : {}),
+      permissions: { approval: 'ask', filesystem: 'workspace', unattended: 'wait',
+        ...(definition.permissions ?? {}) },
+      permissionsDeclared: Boolean(definition.permissions),
+      monitor: { mode: 'fleet', enabled: true, wake_sources: ['message_received'], batch_ms: 2_000,
+        inject: 'notification', interrupt: true, turn_fail_threshold: 3 },
+      ...(definition.isolation ? { isolation: definition.isolation } : {}),
+      sourceFile: '(temp)',
       roomMemberStartup: opts.roomMemberStartup,
     }));
     writeFileSync(join(dir, 'creation.json'), JSON.stringify({
@@ -414,6 +429,7 @@ describe('simple Cowork room member startup', () => {
       template_snapshot: sealed,
     });
 
+    beginFleetAuditCollection();
     await provisionMembers({
       cfg: configuration, cowork: coworkHarness().cowork, roomId: 'room-sealed-override',
       template: sealed, binPath: '/usr/bin/ours-fleet',
@@ -430,6 +446,30 @@ describe('simple Cowork room member startup', () => {
         brain: { inline: { harness: 'codex', model: 'gpt-test', effort: 'medium' } },
         permissions: { approval: 'allow', filesystem: 'unrestricted', unattended: 'wait' },
       });
+
+    // The mixed-override launch presentation reports the exact resolved values
+    // from the persisted role, with the sealed launch-definition label and
+    // inline origins; the agent_started event reuses the identical object.
+    const seat = getRoomRecord('room-sealed-override')!.member_seats[0]!;
+    const presentation = seat.launch?.presentation;
+    expect(presentation).toMatchObject({
+      version: 1,
+      template: seat.launch?.agent_template,
+      role: { kind: 'inline' },
+      brain: { kind: 'inline' },
+      harness: 'codex', session: 'acp', model: 'gpt-test', effort: 'medium',
+      mission: 'Developer',
+      approval: 'allow', filesystem: 'unrestricted', unattended: 'wait',
+      permissionMode: { fleetMode: expect.any(String), nativeMode: expect.any(String) },
+      monitor: { mode: 'fleet', interrupt: true },
+    });
+    expect((presentation?.role as { fingerprint?: string }).fingerprint).toMatch(/^[a-f0-9]{12}$/u);
+    expect((presentation?.brain as { fingerprint?: string }).fingerprint).toMatch(/^[a-f0-9]{12}$/u);
+    expect(JSON.stringify(presentation)).not.toContain(root);
+    const events = consumeFleetAuditCollection().presentations ?? [];
+    const started = events.find(event => event.kind === 'agent_started');
+    expect(started).toMatchObject({ kind: 'agent_started', harness: 'codex' });
+    expect((started as { configuration?: unknown }).configuration).toEqual(presentation);
   });
 
   it.each(['pair', 'team'] as const)(
@@ -562,6 +602,15 @@ describe('simple Cowork room member startup', () => {
     expect(mocks.controlRequest).not.toHaveBeenCalled();
     expect(getRoomRecord('room-crash')!.member_seats[0].launch).toMatchObject({
       state: 'launched', action_id: supervisorAction, caller_role: 'Coordinator',
+    });
+    // The crash left no captured presentation; retaining the running launch
+    // must backfill it from the same persisted resolved role it matched.
+    expect(getRoomRecord('room-crash')!.member_seats[0].launch!.presentation).toMatchObject({
+      version: 1, role: { kind: 'inline' }, brain: { kind: 'inline' },
+      harness: 'codex', session: 'acp', mission: 'Developer',
+      approval: 'ask', filesystem: 'workspace', unattended: 'wait',
+      permissionMode: { fleetMode: expect.any(String), nativeMode: expect.any(String) },
+      monitor: { mode: 'fleet', interrupt: true },
     });
   });
 });
