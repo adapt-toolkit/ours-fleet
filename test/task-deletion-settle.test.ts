@@ -463,6 +463,33 @@ describe('deletion receipts (durable audit evidence)', () => {
     expect(readTaskDeletionReceipt(t.task_id)?.settled_at).toBeDefined();
   });
 
+  it('backfills a missing acceptance receipt before any cleanup side effect', async () => {
+    let t = createTask({ title: 'receipt-crash', origin: { type: 'cli' } });
+    t = activateTask(t.task_id);
+    updateTaskRoom(t.task_id, 'room-rc', 'a'.repeat(64));
+    createRoomRecord({ room_id: 'room-rc', room_name: 'r', task_id: t.task_id });
+    beginTaskDeletionIntent(t.task_id, CLI_ACTOR);
+    // Crash fixture: intent durable, receipt lost.
+    rmSync(join(stateRoot(), 'deletion-receipts', `${t.task_id}.json`));
+    expect(readTaskDeletionReceipt(t.task_id)).toBeUndefined();
+    let receiptExistedBeforeCowork = false;
+    const calls: CoworkCalls = { closed: [], deleted: [] };
+    const probing = () => ({
+      closeRoom: async (roomId: string) => {
+        receiptExistedBeforeCowork = readTaskDeletionReceipt(t.task_id) !== undefined;
+        calls.closed.push(roomId);
+      },
+      deleteRoom: async (roomId: string) => { calls.deleted.push(roomId); },
+    });
+    const result = await settleTaskDeletion({ taskId: t.task_id, cowork: probing });
+    expect(result.deleted).toBe(true);
+    expect(receiptExistedBeforeCowork).toBe(true); // recreated before Cowork was touched
+    expect(readTaskDeletionReceipt(t.task_id)).toMatchObject({
+      task_id: t.task_id, original_state: 'active', result: 'deleted',
+    });
+    expect(existsSync(taskFile(t.task_id))).toBe(false);
+  });
+
   it('heals a crash between unlink and receipt completion on retry', async () => {
     const t = makeNoRoomTask();
     beginTaskDeletionIntent(t.task_id, CLI_ACTOR);
@@ -505,6 +532,59 @@ describe('gated concurrency and stranger safety', () => {
     expect(result.deleted).toBe(true);
     expect(events).toEqual(['inspect:late-1', 'stop:late-1', 'wait:late-1', 'archive:late-1', 'remove:late-1']);
   });
+
+  it('delete wins a gated member-launch window: no launch intent is ever persisted', async () => {
+    const { sealLaunchSnapshot: seal } = await import('../src/rooms-tasks/launch-snapshot.js');
+    const hash = seal({
+      dev: { role: { inline: { persona: 'dev' } }, brain: { inline: { harness: 'codex' } } } as never,
+    });
+    let t = createTask({ title: 'delete-wins', origin: { type: 'cli' } });
+    t = activateTask(t.task_id);
+    updateTaskRoom(t.task_id, 'room-dw', 'a'.repeat(64));
+    createRoomRecord({
+      room_id: 'room-dw', room_name: 'r', task_id: t.task_id, room_identity_cid: 'f'.repeat(64),
+    });
+    const { provisionMembers } = await import('../src/rooms-tasks/provision.js');
+    let inviteIssued = false;
+    let revoked = false;
+    const cowork = {
+      recoverRoom: async () => ({ seats: [] }),
+      issueInvite: async () => { inviteIssued = true; return { invite_id: 'inv-1', invite: 'blob' }; },
+      revokeInvite: async () => { revoked = true; },
+    } as never;
+    // Hold the operation lock (as an in-flight deletion acceptance would),
+    // let provisioning run up to the gated launch window, then persist the
+    // deletion intent and release: the gate must abort before ANY intent/spawn.
+    let provisioning: Promise<unknown>;
+    let settledEarly: unknown;
+    await withFileLock(taskOperationLockPath(t.task_id), async () => {
+      provisioning = provisionMembers({
+        cfg: {} as never, cowork, roomId: 'room-dw', taskId: t.task_id,
+        template: {
+          name: 'solo', version: 1, description: '', content_hash: 'h',
+          launch_snapshot_hash: hash,
+          members: [{ slot: 'dev', role: 'Developer', count: 1, agent_template: 'dev', launch_definition_id: 'dev' }],
+        },
+        binPath: '/bin/true',
+      }).then(() => 'resolved', error => error as Error);
+      void provisioning.then(value => { settledEarly = value; });
+      const deadline = Date.now() + 5_000;
+      while (!inviteIssued && settledEarly === undefined && Date.now() < deadline)
+        await new Promise(resolve => setTimeout(resolve, 20));
+      if (settledEarly !== undefined && !inviteIssued)
+        throw new Error(`provisioning settled before the gated window: ${String(settledEarly)}`);
+      expect(inviteIssued).toBe(true); // provisioning reached the gated window
+      beginTaskDeletionIntent(t.task_id, CLI_ACTOR); // delete wins the epoch
+    });
+    const outcome = await provisioning!;
+    expect(outcome).toBeInstanceOf(Error);
+    expect((outcome as Error).message).toMatch(/pending deletion/);
+    expect(revoked).toBe(true); // issued invite rolled back
+    const seat = getRoomRecord('room-dw')!.member_seats[0];
+    // Spawn count zero: the durable launch record never left its pre-launch state.
+    expect(seat.launch?.state).toBe('pending');
+    expect(seat.launch?.attempt).toBe(0);
+  }, 20_000);
 
   it('leaves a same-name different-CID stranger identity untouched', async () => {
     let t = createTask({ title: 'stranger-safe', origin: { type: 'cli' } });

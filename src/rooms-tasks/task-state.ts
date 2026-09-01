@@ -567,6 +567,22 @@ function writeDeletionReceiptForIntent(stored: StoredTaskRecord): void {
   replaceFileAtomically(deletionReceiptPath(stored.task_id), JSON.stringify(receipt, null, 2) + '\n');
 }
 
+/**
+ * Ensure the acceptance receipt exists before any cleanup side effect,
+ * backfilling it from the durable intent (heals a crash between the intent
+ * write and the receipt write). Fails closed: a receipt write error aborts
+ * settlement rather than deleting resources without audit evidence.
+ */
+export function ensureTaskDeletionReceipt(id: string): void {
+  return withTaskLock(id, () => {
+  assertCanonicalTaskId(id);
+  const stored = JSON.parse(readFileSync(taskPath(id), 'utf8')) as StoredTaskRecord;
+  if (stored.deletion?.status !== 'pending')
+    throw new TaskStateError(`task ${id} has no pending deletion`);
+  if (!readTaskDeletionReceipt(id)) writeDeletionReceiptForIntent(stored);
+  });
+}
+
 /** Record settlement on the receipt; idempotent, tolerant of legacy absence. */
 export function completeTaskDeletionReceipt(id: string): void {
   const receipt = readTaskDeletionReceipt(id);

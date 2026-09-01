@@ -13,7 +13,8 @@ import { acquireLaunchSnapshotLock, releaseLaunchSnapshotForDeletingTask } from 
 import { TASK_OPERATION_LOCK_STALE_MS, taskOperationLockPath } from './terminal.js';
 import {
   advanceTaskDeletionMember, beginTaskDeletionIntent, completeTaskDeletionReceipt,
-  getDeletingTask, importTaskDeletionRetirementEvidence, setTaskDeletionError, TaskStateError,
+  ensureTaskDeletionReceipt, getDeletingTask, importTaskDeletionRetirementEvidence,
+  setTaskDeletionError, TaskStateError,
   unlinkDeletedTask, upsertTaskDeletionMembersFromSeats,
   type TaskDeletionAcceptance,
 } from './task-state.js';
@@ -202,6 +203,9 @@ export async function settleTaskDeletion(input: {
     if (task.deletion?.status !== 'pending')
       throw new TaskStateError(`task ${taskId} has no pending deletion`);
     try {
+      // Audit evidence precedes every side effect; a receipt write failure
+      // aborts settlement (fail closed).
+      ensureTaskDeletionReceipt(taskId);
       const records = listRoomRecords().filter(room => room.task_id === taskId);
       const recordIds = new Set(records.map(room => room.room_id));
       const recordedRoomId = task.deletion.room_id ?? task.room_id;

@@ -28,7 +28,7 @@ import { SessionControlError } from '../session/types.js';
 import { closeManagedRoom } from './close.js';
 import { withFileLock } from '../atomic-file.js';
 import { TASK_OPERATION_LOCK_STALE_MS, taskOperationLockPath } from './terminal.js';
-import { taskDeletionState } from './task-state.js';
+import { TaskStateError, taskDeletionState } from './task-state.js';
 import { buildRoomMemberTask, sha256Text } from './member-startup.js';
 import { agentDir } from '../paths.js';
 import { readProvenance } from '../creation.js';
@@ -591,7 +591,13 @@ export async function provisionMembers(
     const reason = error instanceof Error ? error.message : String(error);
     setSagaError(roomId, reason,
       'Member invite or launch failed. Retry with `task recover`.', 'member_failed');
-    if (taskId) blockTask(taskId, reason);
+    if (taskId) {
+      // A deletion-pending (or already-terminal) task rejects the block
+      // overlay; the original launch failure must still propagate.
+      try { blockTask(taskId, reason); } catch (blockError) {
+        if (!(blockError instanceof TaskStateError)) throw blockError;
+      }
+    }
     throw error;
   }
 
