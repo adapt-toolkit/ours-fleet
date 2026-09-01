@@ -190,7 +190,7 @@ function isKnownTaskStateMessage(message: string): boolean {
     new RegExp(`^task ${SAFE_ID_WORD} is not tied to room ${SAFE_ID_WORD}$`, 'u'),
     new RegExp(`^task ${SAFE_ID_WORD} has no terminal intent$`, 'u'),
     new RegExp(`^task ${SAFE_ID_WORD} reached terminal state '${TASK_STATE_WORD}' outside its intent$`, 'u'),
-    new RegExp(`^cannot delete a '${TASK_STATE_WORD}' task; only 'done' tasks can be deleted$`, 'u'),
+    new RegExp(`^task ${SAFE_ID_WORD} is pending deletion; run 'ours-fleet task delete ${SAFE_ID_WORD} ${SAFE_ID_WORD}' to retry cleanup$`, 'u'),
   ].some(pattern => pattern.test(message));
 }
 

@@ -859,4 +859,3 @@ export function unlinkDeletedTask(id: string): boolean {
   return true;
   });
 }
-
