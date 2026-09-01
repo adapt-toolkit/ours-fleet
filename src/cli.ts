@@ -8,8 +8,10 @@ import { createInterface } from 'node:readline';
 import { Command } from 'commander';
 import { VERSION } from './version.js';
 import { INIT_COMPLETION_GUIDANCE } from './init-guidance.js';
-import { bootstrapPresets } from './preset-bootstrap.js';
 import { migrateLegacyStarterPresets, migratePackagedRoleDefaults } from './preset-migration.js';
+import {
+  executeInitWizard, isInteractiveTerminal, publishSetup, TerminalPrompter,
+} from './init-wizard.js';
 import {
   analyzeInstalls, buildInfo, buildLabel, discoverInstalls, runningLabel,
 } from './provenance.js';
@@ -1158,14 +1160,33 @@ cOpt(program.command('doctor').description('prerequisite report'))
     if (!rep.ok) throw new FleetCliExit(1);
   });
 
-cOpt(program.command('init').description('idempotent host setup plus missing packaged presets'))
+cOpt(program.command('init').description('interactively add missing Fleet defaults while preserving existing configuration'))
   .action(async (opts: { configuration?: string }) => {
-    for (const d of [agentsRoot(), tmpRoot(), logsRoot()]) mkdirSync(d, { recursive: true });
-    for (const m of await pickBackend().init(binPath)) console.log(m);
-    const seeded = bootstrapPresets(opts.configuration);
-    console.log(`Packaged preset revision ${seeded.revision}: ${seeded.sourceRoot}`);
-    console.log(`Created ${seeded.created.length}; preserved ${seeded.preserved.length} existing file(s).`);
-    console.log(INIT_COMPLETION_GUIDANCE);
+    const configuration = opts.configuration ?? defaultConfigPath();
+    if (!isInteractiveTerminal(process.stdin, process.stdout))
+      die('ours-fleet init requires an interactive terminal; no host setup ran and no configuration changed');
+    try {
+      const result = await executeInitWizard(
+        new TerminalPrompter(process.stdin, process.stdout), configuration, {
+          async hostSetup() {
+            for (const d of [agentsRoot(), tmpRoot(), logsRoot()]) mkdirSync(d, { recursive: true });
+            for (const message of await pickBackend().init(binPath)) console.log(message);
+          },
+          publish: publishSetup,
+        },
+      );
+      if (!result) {
+        console.log('Fleet setup cancelled. No host setup ran and no configuration changed.');
+        return;
+      }
+      const prior = result.manifestExisted && result.rootExisted ? 'manifest and split configuration'
+        : result.manifestExisted ? 'manifest only'
+          : result.rootExisted ? 'split configuration only' : 'no previous targets';
+      console.log(`${result.replacedExisting ? 'Preserved existing files and added missing defaults to' : 'Created'} Fleet setup: ${result.configPath} and ${result.splitRoot}`);
+      console.log(`Previous targets: ${prior}.`);
+      console.log(`Private recovery record: ${result.recoveryPath}`);
+      console.log(INIT_COMPLETION_GUIDANCE);
+    } catch (error) { die(error); }
   });
 
 cOpt(program.command('migrate-agent-templates')

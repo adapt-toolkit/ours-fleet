@@ -620,8 +620,8 @@ describe('owner-channel attachment ingress', () => {
     expect(String(status.queuePrompt.mock.calls[0][0])).toContain('category restart_recovery');
     status.finish({ accepted: true, outcome: 'completed', succeeded: true, output: 'Recovered.' });
     await vi.waitFor(() => expect(status.client.calls.some(call => call.args?.text === 'Recovered.')).toBe(true));
-    expect(JSON.parse(readFileSync(join(status.dir,
-      '.owner-channel-attachment-recovery.json'), 'utf8')).pending).toEqual([]);
+    await vi.waitFor(() => expect(JSON.parse(readFileSync(join(status.dir,
+      '.owner-channel-attachment-recovery.json'), 'utf8')).pending).toEqual([]));
     await status.channel.close();
   });
 

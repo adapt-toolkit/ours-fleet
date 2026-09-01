@@ -2,6 +2,7 @@ import {
   chmodSync, closeSync, constants, existsSync, fsyncSync, lstatSync, mkdirSync,
   openSync, readFileSync, readdirSync, renameSync, rmSync, statSync,
 } from 'node:fs';
+import type { Stats } from 'node:fs';
 import { randomUUID } from 'node:crypto';
 import { basename, dirname, join, resolve } from 'node:path';
 import type { ReadStream, WriteStream } from 'node:tty';
@@ -13,6 +14,7 @@ import { listTemplates } from './rooms-tasks/templates.js';
 export type Subscription = 'codex' | 'claude';
 export type WorkKind = 'development' | 'review' | 'coordination';
 export type ReasoningPreference = 'quick' | 'balanced' | 'thorough';
+export type AssignmentStrategy = 'one-model' | 'per-job';
 
 export interface CatalogModel {
   harness: 'codex' | 'claude-code';
@@ -23,6 +25,7 @@ export interface CatalogModel {
 
 export interface InitAnswers {
   subscriptions: Subscription[];
+  assignmentStrategy: AssignmentStrategy;
   models: Record<WorkKind, CatalogModel>;
   reasoning: ReasoningPreference;
 }
@@ -45,6 +48,8 @@ export interface InitPublishResult {
   splitRoot: string;
   recoveryPath: string;
   replacedExisting: boolean;
+  manifestExisted: boolean;
+  rootExisted: boolean;
 }
 
 const WORK_KINDS: WorkKind[] = ['development', 'review', 'coordination'];
@@ -102,7 +107,7 @@ export async function askInitQuestions(
   const splitRoot = splitRootFor(configPath);
   const confirmed = await prompter.confirm(
     'Add missing default Fleet configuration while preserving existing files. Continue?',
-    `It will add missing defaults under ${configPath} and ${splitRoot}; existing configuration and templates remain byte-identical. Explicit default adoption is a separate migration. Identities and project files are not changed.`,
+    `It will add missing defaults under ${configPath} and ${splitRoot}; existing configuration and templates remain byte-identical. Explicit default adoption is a separate migration. Identities and project files are not changed. Host service setup may also be updated after you finish the questions.`,
   );
   if (!confirmed) return undefined;
 
@@ -115,17 +120,35 @@ export async function askInitQuestions(
 
   const available = catalog().models.filter(model => subscriptions.includes(subscriptionFor(model)));
   if (!available.length) throw new Error('None of the selected subscriptions has a supported model.');
+  prompter.note([
+    'These are exact supported catalog IDs, not recommendations or entitlement claims.',
+    'After setup, run ours-fleet doctor for local Codex availability. Claude entitlement is validated when a role launches.',
+  ].join(' '));
+  const assignmentStrategy = await prompter.select<AssignmentStrategy>(
+    'How should models be assigned?',
+    [
+      { label: 'One model for every job — ordinary setup', value: 'one-model' },
+      { label: 'Different models by job — specialized setup', value: 'per-job' },
+    ], 0,
+  );
+  if (!assignmentStrategy) return undefined;
   const choices = available.map(model => ({
-    label: `${MODEL_LABELS[model.model]} (${subscriptionFor(model) === 'codex' ? 'Codex' : 'Claude'})`,
+    label: `${MODEL_LABELS[model.model]} (${subscriptionFor(model) === 'codex' ? 'Codex' : 'Claude'}) — ${model.model}; supported catalog ID, not a recommendation`,
     value: model,
   }));
   const selected = {} as Record<WorkKind, CatalogModel>;
-  for (const work of WORK_KINDS) {
-    const model = await prompter.select(
-      `Which model should handle ${work}?`, choices, 0,
-    );
+  if (assignmentStrategy === 'one-model') {
+    const model = await prompter.select('Which model should handle every job?', choices, 0);
     if (!model) return undefined;
-    selected[work] = model;
+    for (const work of WORK_KINDS) selected[work] = model;
+  } else {
+    for (const work of WORK_KINDS) {
+      const model = await prompter.select(
+        `Which model should handle ${work}?`, choices, 0,
+      );
+      if (!model) return undefined;
+      selected[work] = model;
+    }
   }
   const reasoning = await prompter.select<ReasoningPreference>(
     'How much reasoning should Fleet use?',
@@ -136,27 +159,48 @@ export async function askInitQuestions(
     ], 1,
   );
   if (!reasoning) return undefined;
-  const answers = { subscriptions: [...subscriptions].sort(), models: selected, reasoning };
-  const summary = formatSetupSummary(answers);
+  const answers = {
+    subscriptions: [...subscriptions].sort(), assignmentStrategy, models: selected, reasoning,
+  };
+  const summary = formatSetupSummary(answers, configuration);
   const finalized = await prompter.confirm(
-    'Add this default Fleet setup?',
+    'Create this default Fleet setup?',
     `${summary}\n\nNo changes have been made yet.`,
   );
   return finalized ? answers : undefined;
 }
 
-export function formatSetupSummary(answers: InitAnswers): string {
-  const friendly = (work: WorkKind) => `${MODEL_LABELS[answers.models[work].model]} via ${
-    subscriptionFor(answers.models[work]) === 'codex' ? 'Codex' : 'Claude'}`;
+export function formatSetupSummary(answers: InitAnswers, configuration: string): string {
+  const configPath = resolve(configuration);
+  const splitRoot = splitRootFor(configPath);
+  const configExists = existsSync(configPath);
+  const rootExists = existsSync(splitRoot);
+  const existing = configExists && rootExists ? 'both targets exist'
+    : configExists ? 'only the manifest exists'
+      : rootExists ? 'only the split configuration directory exists' : 'neither target exists';
+  const friendly = (work: WorkKind) => `${MODEL_LABELS[answers.models[work].model]} (${
+    subscriptionFor(answers.models[work]) === 'codex' ? 'Codex' : 'Claude'}, ${answers.models[work].model})`;
+  const effort = REASONING_EFFORT[answers.reasoning];
   return [
     'Your default Fleet setup:',
+    `  Manifest: ${configPath}`,
+    `  Split configuration: ${splitRoot}`,
+    `  Existing state: ${existing}`,
+    `  Model assignment: ${answers.assignmentStrategy === 'one-model' ? 'one model for every job' : 'different models by job'}`,
     `  Development: ${friendly('development')}`,
     `  Review: ${friendly('review')}`,
     `  Coordination: ${friendly('coordination')}`,
-    `  Reasoning: ${answers.reasoning[0].toUpperCase()}${answers.reasoning.slice(1)}`,
-    '  Solo work: one development agent',
-    '  Reviewed work: a development agent with an independent reviewer',
-    '  Team work: coordination, development, and review specialists',
+    `  Reasoning: ${answers.reasoning[0].toUpperCase()}${answers.reasoning.slice(1)} -> ${effort}`,
+    '  Availability: catalog support is not a recommendation or entitlement claim',
+    '  Entitlement check: run ours-fleet doctor for Codex; Claude is validated when a role launches',
+    '  Automatic model fallback: none (no model_chain is generated)',
+    '  One-agent work: one Developer',
+    '  Reviewed pair: Developer + independent Critic',
+    '  Team: LocalCoordinator + Developer + Critic',
+    '  FleetCoordinator: coordination model',
+    '',
+    'After the final Yes, Fleet performs host service setup before publishing the complete configuration.',
+    'A hard termination after that Yes can leave host integration or private stage/recovery evidence to inspect.',
   ].join('\n');
 }
 
@@ -168,6 +212,8 @@ function preset(relative: string): string {
 export function generateSetup(answers: InitAnswers): GeneratedSetup {
   const effort = REASONING_EFFORT[answers.reasoning];
   if (!effort) throw new Error(`unsupported reasoning preference: ${String(answers.reasoning)}`);
+  if (!['one-model', 'per-job'].includes(answers.assignmentStrategy))
+    throw new Error(`unsupported model assignment strategy: ${String(answers.assignmentStrategy)}`);
   if (!Array.isArray(answers.subscriptions) || answers.subscriptions.length === 0
     || new Set(answers.subscriptions).size !== answers.subscriptions.length
     || answers.subscriptions.some(subscription => !['codex', 'claude'].includes(subscription)))
@@ -200,6 +246,14 @@ export function generateSetup(answers: InitAnswers): GeneratedSetup {
       '',
     ].join('\n'));
   }
+  if (answers.assignmentStrategy === 'one-model') {
+    const tuples = new Set(WORK_KINDS.map(work => {
+      const model = answers.models[work];
+      return `${model.harness}\0${model.session}\0${model.model}`;
+    }));
+    if (tuples.size !== 1)
+      throw new Error('one-model assignment requires the same exact model for development, review, and coordination');
+  }
   for (const role of ['Coordinator', 'LocalCoordinator', 'Developer', 'Critic']) {
     files.set(`roles/${role}.yaml`, preset(`roles/${role}.yaml`));
     if (role === 'Coordinator') continue;
@@ -226,6 +280,7 @@ export async function executeInitWizard(
     hostSetup(): Promise<void>;
     publish(configuration: string, setup: GeneratedSetup): Promise<InitPublishResult>;
     generate?(answers: InitAnswers): GeneratedSetup;
+    preflight?(configuration: string): InitPathState;
   },
 ): Promise<InitPublishResult | undefined> {
   const answers = await askInitQuestions(prompter, configuration);
@@ -234,8 +289,25 @@ export async function executeInitWizard(
   // boundary. Production owns this new map; the optional seam forces failures
   // deterministically in tests.
   const setup = (deps.generate ?? generateSetup)(answers);
-  await deps.hostSetup();
-  return deps.publish(configuration, setup);
+  (deps.preflight ?? preflightInitPaths)(configuration);
+  try {
+    await deps.hostSetup();
+  } catch (error) {
+    throw new Error([
+      'Host setup failed before configuration publication began.',
+      'Host integration or Fleet state directories may have changed; the configuration was not published.',
+      (error as Error).message,
+    ].join(' '), { cause: error });
+  }
+  try {
+    return await deps.publish(configuration, setup);
+  } catch (error) {
+    throw new Error([
+      'Host setup completed, but configuration publication failed.',
+      'Host integration or Fleet state directories may have changed; inspect them and any private init stage/recovery evidence.',
+      (error as Error).message,
+    ].join(' '), { cause: error });
+  }
 }
 
 function canonicalGeneratedSetup(setup: GeneratedSetup): GeneratedSetup {
@@ -267,23 +339,80 @@ function preserveExistingSetup(configPath: string, setup: GeneratedSetup): Gener
   return { files, answers: setup.answers };
 }
 
-function assertOwnerPrivate(path: string, kind: 'file' | 'directory'): void {
-  const stat = lstatSync(path);
-  const uid = process.getuid?.();
+export interface InitPathInspectionDeps {
+  exists?(path: string): boolean;
+  lstat?(path: string): Stats;
+  stat?(path: string): Stats;
+  uid?(): number | undefined;
+  entries?(path: string): string[];
+}
+
+export interface InitPathState {
+  configPath: string;
+  splitRoot: string;
+  parent: string;
+  manifestExisted: boolean;
+  rootExisted: boolean;
+}
+
+function pathDeps(overrides: InitPathInspectionDeps = {}) {
+  return {
+    exists: overrides.exists ?? existsSync,
+    lstat: overrides.lstat ?? lstatSync,
+    stat: overrides.stat ?? statSync,
+    uid: overrides.uid ?? (() => process.getuid?.()),
+    entries: overrides.entries ?? readdirSync,
+  };
+}
+
+function assertOwnerPrivate(
+  path: string, kind: 'file' | 'directory', overrides: InitPathInspectionDeps = {},
+): void {
+  const deps = pathDeps(overrides);
+  const stat = deps.lstat(path);
+  const uid = deps.uid();
   if (stat.isSymbolicLink() || (kind === 'file' ? !stat.isFile() : !stat.isDirectory()))
     throw new Error(`init refuses non-regular ${kind}: ${path}`);
   if (uid !== undefined && stat.uid !== uid) throw new Error(`init refuses path owned by uid ${stat.uid}: ${path}`);
   if ((stat.mode & 0o077) !== 0) throw new Error(`init requires owner-private mode: ${path}`);
 }
 
-function assertPrivateTree(path: string): void {
-  assertOwnerPrivate(path, 'directory');
-  for (const entry of readdirSync(path)) {
+function assertPrivateTree(path: string, overrides: InitPathInspectionDeps = {}): void {
+  const deps = pathDeps(overrides);
+  assertOwnerPrivate(path, 'directory', overrides);
+  for (const entry of deps.entries(path)) {
     const child = join(path, entry);
-    const stat = lstatSync(child);
-    if (stat.isDirectory()) assertPrivateTree(child);
-    else assertOwnerPrivate(child, 'file');
+    const stat = deps.lstat(child);
+    if (stat.isDirectory()) assertPrivateTree(child, overrides);
+    else assertOwnerPrivate(child, 'file', overrides);
   }
+}
+
+/** Read-only safety gate. Run once before host setup and again under the init lock. */
+export function preflightInitPaths(
+  configuration: string, overrides: InitPathInspectionDeps = {},
+): InitPathState {
+  const deps = pathDeps(overrides);
+  const configPath = resolve(configuration);
+  const splitRoot = splitRootFor(configPath);
+  const parent = dirname(configPath);
+  if (dirname(splitRoot) !== parent)
+    throw new Error('manifest and configuration directory must share one parent');
+  if (!deps.exists(parent)) throw new Error(`configuration parent does not exist: ${parent}`);
+  const parentStat = deps.lstat(parent);
+  const uid = deps.uid();
+  if (!parentStat.isDirectory() || parentStat.isSymbolicLink()
+    || (uid !== undefined && parentStat.uid !== uid) || (parentStat.mode & 0o022) !== 0)
+    throw new Error(`init requires an owner-controlled, non-group/world-writable parent: ${parent}`);
+  const manifestExisted = deps.exists(configPath);
+  const rootExisted = deps.exists(splitRoot);
+  if (manifestExisted) assertOwnerPrivate(configPath, 'file', overrides);
+  if (rootExisted) assertPrivateTree(splitRoot, overrides);
+  for (const target of [configPath, splitRoot]) {
+    if (deps.exists(target) && deps.stat(target).dev !== parentStat.dev)
+      throw new Error(`init requires same-filesystem publication: ${target}`);
+  }
+  return { configPath, splitRoot, parent, manifestExisted, rootExisted };
 }
 
 function fsyncPath(path: string): void {
@@ -336,25 +465,13 @@ export async function publishSetup(
   // it as untrusted here: no caller-provided path reaches join()/write before the
   // complete path set and contents are regenerated from the accepted answers.
   let canonicalSetup = canonicalGeneratedSetup(setup);
-  const configPath = resolve(configuration);
-  const splitRoot = splitRootFor(configPath);
-  const parent = dirname(configPath);
-  if (dirname(splitRoot) !== parent) throw new Error('manifest and configuration directory must share one parent');
-  if (!existsSync(parent)) throw new Error(`configuration parent does not exist: ${parent}`);
-  const parentStat = lstatSync(parent);
-  const uid = process.getuid?.();
-  if (!parentStat.isDirectory() || parentStat.isSymbolicLink()
-    || (uid !== undefined && parentStat.uid !== uid) || (parentStat.mode & 0o022) !== 0)
-    throw new Error(`init requires an owner-controlled, non-group/world-writable parent: ${parent}`);
+  const initial = preflightInitPaths(configuration);
+  const { configPath, splitRoot, parent } = initial;
   const stem = basename(splitRoot);
   return withFileLock(join(parent, `.${stem}.init.lock`), async () => {
-    if (existsSync(configPath)) assertOwnerPrivate(configPath, 'file');
-    if (existsSync(splitRoot)) assertPrivateTree(splitRoot);
+    const locked = preflightInitPaths(configuration);
+    const { manifestExisted, rootExisted } = locked;
     canonicalSetup = preserveExistingSetup(configPath, canonicalSetup);
-    for (const target of [configPath, splitRoot]) if (existsSync(target) && statSync(target).dev !== parentStat.dev)
-      throw new Error(`init requires same-filesystem publication: ${target}`);
-    const manifestExisted = existsSync(configPath);
-    const rootExisted = existsSync(splitRoot);
 
     const nonce = `${new Date().toISOString().replace(/[^0-9]/g, '')}-${process.pid}-${randomUUID()}`;
     const stagePath = join(parent, `.${stem}.init-stage-${nonce}`);
@@ -399,7 +516,11 @@ export async function publishSetup(
       validateStaged(configPath);
       rmSync(stagePath, { recursive: true });
       fsyncPath(parent);
-      return { configPath, splitRoot, recoveryPath, replacedExisting: manifestExisted || rootExisted };
+      return {
+        configPath, splitRoot, recoveryPath,
+        replacedExisting: manifestExisted || rootExisted,
+        manifestExisted, rootExisted,
+      };
     } catch (error) {
       const publicationStarted = backedRoot || backedManifest || publishedRoot || publishedManifest;
       if (!publicationStarted) {
@@ -458,9 +579,11 @@ export function updateMultiSelect(state: MultiSelectState, key: Key): MultiSelec
 }
 
 export class TerminalPrompter implements InitPrompter {
+  private readonly notes: string[] = [];
+
   constructor(private readonly input: ReadStream, private readonly output: WriteStream) {}
 
-  note(message: string): void { this.output.write(`${message}\n`); }
+  note(message: string): void { this.notes.push(message); this.output.write(`${message}\n`); }
 
   async confirm(message: string, detail: string): Promise<boolean | undefined> {
     this.output.write(`\n${message}\n${detail}\nPress Y to continue or N to cancel. [N]\n`);
@@ -492,7 +615,8 @@ export class TerminalPrompter implements InitPrompter {
   async select<T>(message: string, choices: Choice<T>[], initial = 0): Promise<T | undefined> {
     let cursor = Math.max(0, Math.min(initial, choices.length - 1));
     for (;;) {
-      this.render(message, choices.map(choice => choice.label), cursor, '↑/↓ move • Enter choose • Esc cancel');
+      this.render(message, choices.map(choice => choice.label), cursor,
+        'Current highlight only — ↑/↓ move • Enter records choice • Esc cancel');
       const key = await this.key();
       if (key === 'escape') return undefined;
       if (key === 'enter') return choices[cursor].value;
@@ -502,7 +626,8 @@ export class TerminalPrompter implements InitPrompter {
   }
 
   private render(message: string, lines: string[], cursor: number, help: string): void {
-    this.output.write(`\u001b[2J\u001b[H${message}\n\n`);
+    const notes = this.notes.length ? `${this.notes.join('\n')}\n\n` : '';
+    this.output.write(`\u001b[2J\u001b[H${notes}${message}\n\n`);
     lines.forEach((line, index) => this.output.write(`${index === cursor ? '❯' : ' '} ${line}\n`));
     this.output.write(`\n${help}\n`);
   }

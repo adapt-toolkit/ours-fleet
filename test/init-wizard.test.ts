@@ -5,9 +5,11 @@ import {
 } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { spawnSync } from 'node:child_process';
 import { EventEmitter } from 'node:events';
 import {
-  askInitQuestions, decodeKey, executeInitWizard, generateSetup, isInteractiveTerminal, publishSetup,
+  askInitQuestions, decodeKey, executeInitWizard, formatSetupSummary, generateSetup,
+  isInteractiveTerminal, preflightInitPaths, publishSetup,
   TerminalPrompter, updateMultiSelect, validateCatalog,
   type CatalogModel, type Choice, type InitAnswers, type InitPrompter, type ReasoningPreference,
   type Subscription, type WorkKind,
@@ -55,6 +57,7 @@ function answers(
     ? model('codex', 'gpt-5.6-sol') : model('claude-code', 'claude-opus-5');
   return {
     subscriptions,
+    assignmentStrategy: 'one-model',
     reasoning,
     models: { development: selected, review: selected, coordination: selected },
   };
@@ -86,36 +89,66 @@ describe('interactive questionnaire', () => {
   });
 
   it.each([
-    { selected: [0], labels: ['Codex'], models: /\(Codex\)/ },
-    { selected: [1], labels: ['Claude'], models: /\(Claude\)/ },
-    { selected: [0, 1], labels: ['Codex', 'Claude'], models: /\((Codex|Claude)\)/ },
-  ])('filters friendly model choices for subscription combination $labels', async ({ selected, models }) => {
-    const prompt = new ScriptedPrompter([true, selected, 0, 0, 0, 1, true]);
+    { selected: [0], labels: ['Codex'], models: /\(Codex\)/, poolSize: 7 },
+    { selected: [1], labels: ['Claude'], models: /\(Claude\)/, poolSize: 3 },
+    { selected: [0, 1], labels: ['Codex', 'Claude'], models: /\((Codex|Claude)\)/, poolSize: 10 },
+  ])('supports one-model subscription combination $labels', async ({ selected, models, poolSize }) => {
+    const prompt = new ScriptedPrompter([true, selected, 0, 0, 1, true]);
     const result = await askInitQuestions(prompt, join(root, 'fleet.yaml'));
     expect(result?.subscriptions.sort()).toEqual(selected.map(index => index ? 'claude' : 'codex').sort());
+    expect(result?.assignmentStrategy).toBe('one-model');
+    expect(new Set(Object.values(result!.models).map(entry => entry.model)).size).toBe(1);
     const selects = prompt.calls.filter(call => call.kind === 'select');
-    expect(selects.slice(0, 3).map(call => call.message)).toEqual([
+    expect(selects.map(call => call.message)).toEqual([
+      'How should models be assigned?',
+      'Which model should handle every job?',
+      'How much reasoning should Fleet use?',
+    ]);
+    expect(selects[1].labels?.every(label => models.test(label))).toBe(true);
+    expect(selects[1].labels).toHaveLength(poolSize);
+    expect(selects[1].labels?.every(label => /— (gpt-|claude-)/.test(label))).toBe(true);
+    expect(prompt.calls.filter(call => call.kind === 'note').at(0)?.message).toMatch(/not recommendations.*entitlement/s);
+    const final = prompt.calls.filter(call => call.kind === 'confirm').at(-1);
+    expect(final).toMatchObject({
+      message: 'Create this default Fleet setup?',
+      detail: expect.stringContaining('One-agent work: one Developer'),
+    });
+    expect(final?.detail).toContain(join(root, 'fleet.yaml'));
+    expect(final?.detail).toContain(splitRootFor(join(root, 'fleet.yaml')));
+    expect(final?.detail).toContain('no model_chain is generated');
+    expect(final?.detail).toContain('run ours-fleet doctor for Codex');
+    expect(final?.detail).toContain('Claude is validated when a role launches');
+    expect(final?.detail).toContain('hard termination');
+    expect(final?.detail?.match(/Your default Fleet setup:/g)).toHaveLength(1);
+  });
+
+  it('supports a deliberate both-provider per-job mix', async () => {
+    const prompt = new ScriptedPrompter([true, [0, 1], 1, 0, 8, 1, 2, true]);
+    const result = await askInitQuestions(prompt, join(root, 'fleet.yaml'));
+    expect(result).toMatchObject({
+      assignmentStrategy: 'per-job', reasoning: 'thorough',
+      models: {
+        development: { harness: 'codex', model: 'gpt-5.6-sol' },
+        review: { harness: 'claude-code', model: 'claude-opus-5' },
+        coordination: { harness: 'codex', model: 'gpt-5.6-terra' },
+      },
+    });
+    expect(prompt.calls.filter(call => call.kind === 'select').map(call => call.message)).toEqual([
+      'How should models be assigned?',
       'Which model should handle development?',
       'Which model should handle review?',
       'Which model should handle coordination?',
+      'How much reasoning should Fleet use?',
     ]);
-    for (const call of selects.slice(0, 3)) {
-      expect(call.labels?.every(label => models.test(label))).toBe(true);
-      expect(call.labels?.every(label => !/gpt-5\.\d-[a-z]|claude-code|brain|preset|harness/i.test(label))).toBe(true);
-    }
-    expect(prompt.calls.filter(call => call.kind === 'note')).toEqual([]);
-    const final = prompt.calls.filter(call => call.kind === 'confirm').at(-1);
-    expect(final).toMatchObject({
-      message: 'Add this default Fleet setup?',
-      detail: expect.stringContaining('Solo work: one development agent'),
-    });
-    expect(final?.detail?.match(/Your default Fleet setup:/g)).toHaveLength(1);
   });
 
   it('cancels at every stage without asking later questions', async () => {
     for (const script of [[false], [true, undefined], [true, [0], undefined],
-      [true, [0], 0, undefined], [true, [0], 0, 0, undefined], [true, [0], 0, 0, 0, undefined],
-      [true, [0], 0, 0, 0, 1, false]]) {
+      [true, [0], 0, undefined], [true, [0], 0, 0, undefined],
+      [true, [0], 0, 0, 1, false],
+      [true, [0], 1, undefined], [true, [0], 1, 0, undefined],
+      [true, [0], 1, 0, 0, undefined], [true, [0], 1, 0, 0, 0, undefined],
+      [true, [0], 1, 0, 0, 0, 1, false]]) {
       const prompt = new ScriptedPrompter(script);
       await expect(askInitQuestions(prompt, join(root, 'fleet.yaml'))).resolves.toBeUndefined();
     }
@@ -169,9 +202,56 @@ describe('interactive questionnaire', () => {
     expect(input.listenerCount('data') + input.listenerCount('end') + input.listenerCount('error')).toBe(0);
   });
 
+  it('labels a single-select cursor as a current highlight until Enter records it', async () => {
+    class Input extends EventEmitter {
+      isTTY = true; isRaw = false;
+      setRawMode(value: boolean) { this.isRaw = value; }
+      resume() { return this; }
+      pause() { return this; }
+    }
+    const input = new Input(); let rendered = '';
+    const output = { isTTY: true, write(chunk: string) { rendered += chunk; return true; } };
+    const prompt = new TerminalPrompter(input as unknown as import('node:tty').ReadStream,
+      output as unknown as import('node:tty').WriteStream);
+    const pending = prompt.select('Choose explicitly', [
+      { label: 'First', value: 'first' }, { label: 'Second', value: 'second' },
+    ], 0);
+    while (input.listenerCount('data') === 0) await new Promise(resolve => setImmediate(resolve));
+    let settled = false; void pending.then(() => { settled = true; });
+    input.emit('data', Buffer.from('n'));
+    await new Promise(resolve => setImmediate(resolve));
+    expect(settled).toBe(false);
+    while (input.listenerCount('data') === 0) await new Promise(resolve => setImmediate(resolve));
+    input.emit('data', Buffer.from('\u001b[B'));
+    while (input.listenerCount('data') === 0) await new Promise(resolve => setImmediate(resolve));
+    input.emit('data', Buffer.from('\r'));
+    await expect(pending).resolves.toBe('second');
+    expect(rendered).toContain('Current highlight only');
+    expect(rendered).toContain('Enter records choice');
+  });
+
+  it('keeps entitlement and recommendation notes visible while pickers redraw', async () => {
+    class Input extends EventEmitter {
+      isTTY = true; isRaw = false;
+      setRawMode(value: boolean) { this.isRaw = value; }
+      resume() { return this; }
+      pause() { return this; }
+    }
+    const input = new Input(); let rendered = '';
+    const output = { isTTY: true, write(chunk: string) { rendered += chunk; return true; } };
+    const prompt = new TerminalPrompter(input as unknown as import('node:tty').ReadStream,
+      output as unknown as import('node:tty').WriteStream);
+    prompt.note('Supported IDs are not recommendations; entitlement is checked later.');
+    const pending = prompt.select('Choose explicitly', [{ label: 'Model', value: 'model' }]);
+    while (input.listenerCount('data') === 0) await new Promise(resolve => setImmediate(resolve));
+    input.emit('data', Buffer.from('\r'));
+    await pending;
+    expect(rendered.match(/not recommendations/g)?.length).toBeGreaterThanOrEqual(2);
+  });
+
   it.each([
     { name: 'first confirmation', script: [false] },
-    { name: 'final confirmation', script: [true, [0], 0, 0, 0, 1, false] },
+    { name: 'final confirmation', script: [true, [0], 0, 0, 1, false] },
   ])('does not cross the mutation boundary after cancellation at $name', async ({ script }) => {
     let hostCalls = 0; let publishCalls = 0;
     const result = await executeInitWizard(
@@ -187,13 +267,35 @@ describe('interactive questionnaire', () => {
   it('resolves the complete setup before host or publication mutation boundaries', async () => {
     let hostCalls = 0; let publishCalls = 0;
     await expect(executeInitWizard(
-      new ScriptedPrompter([true, [0], 0, 0, 0, 1, true]), join(root, 'fleet.yaml'), {
+      new ScriptedPrompter([true, [0], 0, 0, 1, true]), join(root, 'fleet.yaml'), {
         generate() { throw new Error('catalog became invalid'); },
         async hostSetup() { hostCalls++; },
         async publish() { publishCalls++; throw new Error('must not publish'); },
       },
     )).rejects.toThrow('catalog became invalid');
     expect({ hostCalls, publishCalls }).toEqual({ hostCalls: 0, publishCalls: 0 });
+  });
+
+  it('warns that host state may have changed when locked publication revalidation fails', async () => {
+    let hostCalls = 0;
+    await expect(executeInitWizard(
+      new ScriptedPrompter([true, [0], 0, 0, 1, true]), join(root, 'fleet.yaml'), {
+        async hostSetup() { hostCalls++; },
+        async publish() { throw new Error('locked path revalidation refused a symlink'); },
+      },
+    )).rejects.toThrow(/Host setup completed.*may have changed.*locked path revalidation/s);
+    expect(hostCalls).toBe(1);
+  });
+
+  it('warns about partial host state and skips publication when host setup fails', async () => {
+    let publishCalls = 0;
+    await expect(executeInitWizard(
+      new ScriptedPrompter([true, [0], 0, 0, 1, true]), join(root, 'fleet.yaml'), {
+        async hostSetup() { throw new Error('backend reload failed'); },
+        async publish() { publishCalls++; throw new Error('must not publish'); },
+      },
+    )).rejects.toThrow(/Host setup failed.*may have changed.*configuration was not published.*backend reload failed/s);
+    expect(publishCalls).toBe(0);
   });
 
   it('treats terminal EOF as cancellation and restores raw mode/listeners', async () => {
@@ -264,19 +366,37 @@ describe('deterministic default mapping', () => {
 
   it('maps default single/pair/team and coordinator roles to chosen outcomes', () => {
     const generated = generateSetup({
-      subscriptions: ['codex', 'claude'], reasoning: 'balanced',
+      subscriptions: ['codex', 'claude'], assignmentStrategy: 'per-job', reasoning: 'balanced',
       models: {
         development: model('codex', 'gpt-5.6-sol'),
         review: model('claude-code', 'claude-opus-5'),
         coordination: model('codex', 'gpt-5.6-terra'),
       },
     });
-    for (const role of ['Developer'])
-      expect(generated.files.get(`agent_templates/${role}.yaml`)).toContain('brain: { ref: development }');
-    for (const role of ['Critic'])
-      expect(generated.files.get(`agent_templates/${role}.yaml`)).toContain('brain: { ref: review }');
+    expect(generated.files.get('agent_templates/Developer.yaml')).toContain('brain: { ref: development }');
+    expect(generated.files.get('agent_templates/Critic.yaml')).toContain('brain: { ref: review }');
     expect(generated.files.get('agent_templates/LocalCoordinator.yaml')).toContain('brain: { ref: coordination }');
     expect(generated.files.get('agents/FleetCoordinator.yaml')).toContain('brain: { ref: coordination }');
+    expect(generated.files.get('room_templates/single.yaml')).toContain('agent_template: Developer');
+    expect(generated.files.get('room_templates/pair.yaml')).toContain('agent_template: Developer');
+    expect(generated.files.get('room_templates/pair.yaml')).toContain('agent_template: Critic');
+    for (const role of ['LocalCoordinator', 'Developer', 'Critic'])
+      expect(generated.files.get('room_templates/team.yaml')).toContain(`agent_template: ${role}`);
+    for (const obsolete of ['Agent', 'Architect', 'Secretary', 'Tester']) {
+      expect(generated.files.has(`roles/${obsolete}.yaml`)).toBe(false);
+      expect(generated.files.has(`agent_templates/${obsolete}.yaml`)).toBe(false);
+    }
+  });
+
+  it('generates a catalog-valid Claude setup without claiming or inventing entitlement fallback', () => {
+    const generated = generateSetup(answers(['claude'], 'thorough'));
+    for (const work of ['development', 'review', 'coordination'] as WorkKind[]) {
+      const brain = generated.files.get(`brains/${work}.yaml`)!;
+      expect(brain).toContain('harness: claude-code');
+      expect(brain).toContain('model: claude-opus-5');
+      expect(brain).toContain('effort: high');
+      expect(brain).not.toContain('model_chain');
+    }
   });
 
   it('is byte-deterministic and rejects subscription/model or effort mismatches', () => {
@@ -297,12 +417,108 @@ describe('deterministic default mapping', () => {
       .toThrow(/non-empty unique selection/);
     expect(() => generateSetup({ ...answers(), subscriptions: ['codex', 'other' as Subscription] }))
       .toThrow(/non-empty unique selection/);
+    expect(() => generateSetup({ ...answers(), reasoning: 'impossible' as ReasoningPreference }))
+      .toThrow(/unsupported reasoning preference/);
+    expect(() => generateSetup({ ...answers(), assignmentStrategy: 'impossible' as InitAnswers['assignmentStrategy'] }))
+      .toThrow(/unsupported model assignment strategy/);
     for (const work of ['development', 'review', 'coordination'] as WorkKind[])
       expect(generateSetup(answers()).files.get(`brains/${work}.yaml`)?.match(/^model:/gm)).toHaveLength(1);
+  });
+
+  it('blocks an inconsistent one-model answer and allows the same explicit per-job mix', () => {
+    const mixed: InitAnswers = {
+      subscriptions: ['codex', 'claude'], assignmentStrategy: 'one-model', reasoning: 'balanced',
+      models: {
+        development: model('codex', 'gpt-5.6-sol'),
+        review: model('claude-code', 'claude-opus-5'),
+        coordination: model('codex', 'gpt-5.6-terra'),
+      },
+    };
+    expect(() => generateSetup(mixed)).toThrow(/one-model assignment requires the same exact model/);
+    expect(() => generateSetup({ ...mixed, assignmentStrategy: 'per-job' })).not.toThrow();
+  });
+});
+
+describe('review and preflight safety', () => {
+  it.each([
+    { manifest: false, root: false, phrase: 'neither target exists' },
+    { manifest: true, root: false, phrase: 'only the manifest exists' },
+    { manifest: false, root: true, phrase: 'only the split configuration directory exists' },
+    { manifest: true, root: true, phrase: 'both targets exist' },
+  ])('summarizes target state $phrase', ({ manifest, root: hasRoot, phrase }) => {
+    const config = join(root, 'fleet.yaml');
+    if (manifest) writeFileSync(config, 'old\n', { mode: 0o600 });
+    if (hasRoot) mkdirSync(splitRootFor(config), { mode: 0o700 });
+    const summary = formatSetupSummary(answers(), config);
+    expect(summary).toContain(`Manifest: ${config}`);
+    expect(summary).toContain(`Split configuration: ${splitRootFor(config)}`);
+    expect(summary).toContain(phrase);
+    expect(summary).toContain('Balanced -> medium');
+    expect(summary).toContain('catalog support is not a recommendation or entitlement claim');
+    expect(summary).toContain('no model_chain is generated');
+  });
+
+  it('rejects unsafe mode before host setup begins', async () => {
+    chmodSync(root, 0o777);
+    let hostCalls = 0;
+    await expect(executeInitWizard(
+      new ScriptedPrompter([true, [0], 0, 0, 1, true]), join(root, 'fleet.yaml'), {
+        async hostSetup() { hostCalls++; },
+        async publish() { throw new Error('must not publish'); },
+      },
+    )).rejects.toThrow(/owner-controlled/);
+    expect(hostCalls).toBe(0);
+  });
+
+  it('fails closed for injected foreign ownership and cross-device targets', () => {
+    const config = join(root, 'fleet.yaml');
+    writeFileSync(config, 'old\n', { mode: 0o600 });
+    expect(() => preflightInitPaths(config, {
+      lstat: path => {
+        const actual = lstatSync(path);
+        if (path === config) return new Proxy(actual, {
+          get(target, property) { return property === 'uid' ? Number(target.uid) + 1 : Reflect.get(target, property, target); },
+        });
+        return actual;
+      },
+    })).toThrow(/owned by uid/);
+    expect(() => preflightInitPaths(config, {
+      stat: path => {
+        const actual = lstatSync(path);
+        if (path === config) return new Proxy(actual, {
+          get(target, property) { return property === 'dev' ? Number(target.dev) + 1 : Reflect.get(target, property, target); },
+        });
+        return actual;
+      },
+    })).toThrow(/same-filesystem/);
+  });
+
+  it('rejects a missing or symlinked configuration parent', () => {
+    expect(() => preflightInitPaths(join(root, 'missing', 'fleet.yaml'))).toThrow(/parent does not exist/);
+    const real = join(root, 'real-parent');
+    const linked = join(root, 'linked-parent');
+    mkdirSync(real, { mode: 0o700 });
+    symlinkSync(real, linked);
+    expect(() => preflightInitPaths(join(linked, 'fleet.yaml'))).toThrow(/owner-controlled/);
   });
 });
 
 describe('locked replacement transaction', () => {
+  it('serializes on the per-setup init lock', async () => {
+    const config = join(root, 'fleet.yaml');
+    const lock = join(root, '.fleet.init.lock');
+    mkdirSync(lock, { mode: 0o700 });
+    writeFileSync(join(lock, 'ts'), String(Date.now()));
+    writeFileSync(join(lock, 'owner.json'), JSON.stringify({ token: 'contender', pid: process.pid }));
+    const started = Date.now();
+    const release = setTimeout(() => rmSync(lock, { recursive: true, force: true }), 100);
+    try {
+      await publishSetup(config, generateSetup(answers()));
+    } finally { clearTimeout(release); }
+    expect(Date.now() - started).toBeGreaterThanOrEqual(75);
+    expect(readFileSync(config, 'utf8')).toContain('api_version: ours.network/fleet/v2');
+  });
+
   it.each([
     ['traversal', (setup: ReturnType<typeof generateSetup>) => setup.files.set('../victim', 'owned\n')],
     ['absolute', (setup: ReturnType<typeof generateSetup>) => setup.files.set('/tmp/ours-fleet-init-victim', 'owned\n')],
@@ -354,38 +570,45 @@ describe('locked replacement transaction', () => {
       .toMatchObject({ manifestExisted: false, rootExisted: false });
   });
 
+  it.each([
+    { manifest: true, existingRoot: false },
+    { manifest: false, existingRoot: true },
+  ])('backs up exactly the partial prior targets $manifest/$existingRoot and publishes a complete pair', async ({ manifest, existingRoot }) => {
+    const config = join(root, 'fleet.yaml');
+    if (manifest) writeFileSync(config, generateSetup(answers()).files.get('fleet.yaml')!, { mode: 0o600 });
+    if (existingRoot) {
+      mkdirSync(splitRootFor(config), { mode: 0o700 });
+      mkdirSync(join(splitRootFor(config), 'roles'), { mode: 0o700 });
+      writeFileSync(join(splitRootFor(config), 'roles/Custom.yaml'),
+        'mission: Custom role\npersona: Keep custom bytes.\nbio: Custom.\n', { mode: 0o600 });
+    }
+    const result = await publishSetup(config, generateSetup(answers()));
+    const state = JSON.parse(readFileSync(join(result.recoveryPath, 'state.json'), 'utf8'));
+    expect(state).toMatchObject({ manifestExisted: manifest, rootExisted: existingRoot });
+    expect(existsSync(join(result.recoveryPath, 'fleet.yaml'))).toBe(manifest);
+    expect(existsSync(join(result.recoveryPath, 'fleet'))).toBe(existingRoot);
+    expect(existsSync(config)).toBe(true);
+    expect(existsSync(splitRootFor(config))).toBe(true);
+  });
+
   it('reruns without overwriting customized role, agent-template, or room-template bytes', async () => {
     const config = join(root, 'fleet.yaml');
     await publishSetup(config, generateSetup(answers(['codex'], 'quick')));
-    const split = splitRootFor(config);
-    const customized = {
-      role: join(split, 'roles/Developer.yaml'),
-      agent: join(split, 'agent_templates/Developer.yaml'),
-      room: join(split, 'room_templates/single.yaml'),
-    };
     const beforeManifest = readFileSync(config, 'utf8');
-    const extra = join(split, 'roles/MyCustomRole.yaml');
-    const extraAgent = join(split, 'agent_templates/MyCustomAgent.yaml');
-    const extraRoom = join(split, 'room_templates/custom.yaml');
-    writeFileSync(customized.role, 'mission: user role\n', { mode: 0o600 });
-    writeFileSync(customized.agent, 'role: { inline: { mission: user agent } }\nbrain: { ref: development }\n', { mode: 0o600 });
-    writeFileSync(customized.room, 'version: 99\ndescription: user room\nroom: {}\nmembers:\n  - { slot: developer, role: Developer, count: 1, agent_template: Developer }\n', { mode: 0o600 });
-    writeFileSync(extra, 'mission: unrelated custom role\n', { mode: 0o600 });
-    writeFileSync(extraAgent,
-      'role: { inline: { mission: unrelated custom agent } }\nbrain: { ref: development }\n',
-      { mode: 0o600 });
-    writeFileSync(extraRoom,
-      'version: 7\ndescription: unrelated custom room\nroom: {}\nmembers:\n  - { slot: custom, role: Custom, count: 1, agent_template: MyCustomAgent }\n',
-      { mode: 0o600 });
+    const split = splitRootFor(config);
+    writeFileSync(join(split, 'roles/Developer.yaml'), 'mission: custom developer\npersona: custom\nbio: custom\n');
+    writeFileSync(join(split, 'agent_templates/Developer.yaml'),
+      'role: { ref: Developer }\nbrain: { ref: development }\npermissions: { approval: ask, filesystem: workspace, unattended: deny }\n');
+    const single = join(split, 'room_templates/single.yaml');
+    writeFileSync(single, readFileSync(single, 'utf8')
+      .replace('Solo task: one Developer owns implementation and verification',
+        'Customized solo task contract'));
+    const beforeRoot = treeSnapshot(split);
     const result = await publishSetup(config, generateSetup(answers(['claude'], 'thorough')));
-    expect(readFileSync(customized.role, 'utf8')).toBe('mission: user role\n');
-    expect(readFileSync(customized.agent, 'utf8')).toContain('user agent');
-    expect(readFileSync(customized.room, 'utf8')).toContain('user room');
+    expect(readFileSync(join(result.recoveryPath, 'fleet.yaml'), 'utf8')).toBe(beforeManifest);
+    expect(treeSnapshot(join(result.recoveryPath, 'fleet'))).toEqual(beforeRoot);
     expect(readFileSync(config, 'utf8')).toBe(beforeManifest);
-    expect(readFileSync(extra, 'utf8')).toBe('mission: unrelated custom role\n');
-    expect(readFileSync(extraAgent, 'utf8')).toContain('unrelated custom agent');
-    expect(readFileSync(extraRoom, 'utf8')).toContain('unrelated custom room');
-    expect(result.replacedExisting).toBe(true);
+    expect(treeSnapshot(split)).toEqual(beforeRoot);
   });
 
   it('rolls back both targets after an injected second-publication failure', async () => {
@@ -442,5 +665,39 @@ describe('locked replacement transaction', () => {
     mkdirSync(splitRootFor(config), { mode: 0o700 });
     chmodSync(config, 0o644);
     await expect(publishSetup(config, generateSetup(answers()))).rejects.toThrow(/owner-private/);
+  });
+
+  it('refuses a symlink anywhere inside the existing split tree', async () => {
+    const config = join(root, 'fleet.yaml');
+    mkdirSync(splitRootFor(config), { mode: 0o700 });
+    writeFileSync(join(root, 'outside'), 'old\n', { mode: 0o600 });
+    symlinkSync(join(root, 'outside'), join(splitRootFor(config), 'linked'));
+    expect(() => preflightInitPaths(config)).toThrow(/non-regular file/);
+  });
+
+  it.skipIf(process.platform === 'win32')('retains inspectable evidence after a hard kill during publication', async () => {
+    const config = join(root, 'fleet.yaml');
+    await publishSetup(config, generateSetup(answers(['codex'], 'quick')));
+    const before = new Set(readdirSync(root));
+    const child = join(root, 'hard-kill.mjs');
+    const moduleUrl = new URL('../dist/init-wizard.js', import.meta.url).href;
+    const claudeHarnessUrl = new URL('../dist/harness/claude-code.js', import.meta.url).href;
+    const codexHarnessUrl = new URL('../dist/harness/codex.js', import.meta.url).href;
+    writeFileSync(child, [
+      `import ${JSON.stringify(claudeHarnessUrl)};`,
+      `import ${JSON.stringify(codexHarnessUrl)};`,
+      `import { generateSetup, publishSetup } from ${JSON.stringify(moduleUrl)};`,
+      `const model = { harness: 'claude-code', session: 'acp', model: 'claude-opus-5', efforts: ['low','medium','high','xhigh','max'] };`,
+      `const answers = { subscriptions: ['claude'], assignmentStrategy: 'one-model', reasoning: 'thorough', models: { development: model, review: model, coordination: model } };`,
+      `await publishSetup(${JSON.stringify(config)}, generateSetup(answers), { beforePublish(entry) { if (entry === 'manifest') process.kill(process.pid, 'SIGKILL'); } });`,
+    ].join('\n'), { mode: 0o600 });
+    const result = spawnSync(process.execPath, [child], { encoding: 'utf8' });
+    expect(result.signal).toBe('SIGKILL');
+    expect(existsSync(config)).toBe(false);
+    expect(readFileSync(join(splitRootFor(config), 'brains/development.yaml'), 'utf8'))
+      .toContain('model: gpt-5.6-sol');
+    const created = readdirSync(root).filter(name => !before.has(name) && name !== 'hard-kill.mjs');
+    expect(created.some(name => name.includes('init-recovery'))).toBe(true);
+    expect(created.some(name => name.includes('init-stage'))).toBe(true);
   });
 });

@@ -11,7 +11,7 @@ import '../src/harness/claude-code.js';
 import '../src/harness/codex.js';
 
 const answers: InitAnswers = {
-  subscriptions: ['codex'], reasoning: 'balanced',
+  subscriptions: ['codex'], assignmentStrategy: 'one-model', reasoning: 'balanced',
   models: Object.fromEntries(['development', 'review', 'coordination'].map(work => [work, {
     harness: 'codex', session: 'acp', model: 'gpt-5.6-sol',
     efforts: ['low', 'medium', 'high', 'xhigh', 'max', 'ultra'],

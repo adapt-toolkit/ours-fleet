@@ -91,7 +91,7 @@ equivalent); logs land in `~/.ours-fleet/logs/`.
 
 ```sh
 npm i -g @ours.network/fleet
-ours-fleet init      # units/dirs/linger + missing standard presets
+ours-fleet init      # interactive reviewed defaults + host setup
 ours-fleet doctor    # verifies everything above, with actionable messages
 ```
 
@@ -107,7 +107,7 @@ become that account and repeat.
 ## Quickstart
 
 ```sh
-ours-fleet init               # safe to repeat: creates missing files, never replaces edits
+ours-fleet init               # interactive; adds missing defaults and preserves existing files
 ours-fleet config             # validates Agents, Roles, Brains, and Room templates
 $EDITOR ~/fleet/agents/*.yaml # compose Role + Brain and operational settings
 ours-fleet up                 # boot the fleet (staggered)
@@ -486,23 +486,50 @@ ours-fleet task create --title "Reviewed change" --template pair
 ours-fleet task create --title "Phased delivery" --template team
 ```
 
-`ours-fleet init -c /path/custom.yaml` seeds `/path/custom/` instead. Init reports
-the packaged preset revision and source directory and only seeds missing files.
-It never upgrades an edited preset. Revision-3 role defaults have an explicit,
-fail-closed adoption command: first run `ours-fleet migrate-role-defaults -c FILE`
-for a zero-write plan, review every removal, replacement, addition, preserved custom
-file, staging path, and recovery path, then rerun with `--write`. Only exact semantic
-matches for the packaged-bootstrap and generated revision-3 forms are changed;
-same-named customized files remain byte-identical, and a dangling custom reference
-refuses publication. Rerunning the migration is a no-op.
+`ours-fleet init -c /path/custom.yaml` reviews the literal resolved manifest and
+`/path/custom/` split directory before doing anything. It requires a TTY and two
+default-No confirmations. You select Codex, Claude, or both; then either one explicit
+model for every job or explicit development/review/coordination models; then one
+Quick/Balanced/Thorough reasoning level (`low`/`medium`/`high`). Catalog entries are
+supported IDs, not recommendations or entitlement claims: use `ours-fleet doctor` for
+local Codex availability, while Claude entitlement is validated at launch. No
+`model_chain` is generated and Fleet never silently substitutes another model.
 
-For manual adoption of a single newer packaged file, copy the reported source beside
-the target as `.new-default`, inspect `diff -u TARGET TARGET.new-default`, then replace
-the target yourself. Rerunning init is not an update. Users with the still older exact
-generated six-worker starter Agent set must first run
-`ours-fleet migrate-agent-templates -c FILE` for its zero-write plan, review every
-move/addition/recovery path, and rerun with `--write`. Customized or ambiguous known
-starters are refused without mutation; unrelated custom persistent Agents are preserved.
+A successful rerun adds any missing packaged defaults while preserving every existing
+manifest, Role, Agent Template, and Room Template byte. Explicit adoption of newer defaults
+is a separate reviewable migration. At either confirmation,
+N, Enter, Escape, Ctrl-C, Ctrl-D, or EOF cancels. In a picker, Escape, Ctrl-C, Ctrl-D,
+or EOF cancels; Enter records the highlighted choice (or continues a non-empty multi-select),
+N is ignored, and an empty subscription selection remains blocked. Every cancellation
+before the final Yes performs no host setup or config publication. Non-TTY use stops with
+the same zero-mutation guarantee. After the final Yes, host integration runs before locked
+publication; a hard kill, power loss, or host crash can therefore leave host integration
+or private stage/recovery evidence to inspect.
+Existing targets and their tree must be owner-private regular files/directories on the
+configuration parent's filesystem; symlinks, foreign ownership, unsafe modes, and a
+non-owner-controlled parent fail closed before host setup and are rechecked under the
+per-setup init lock before publication.
+
+The generated task experiences are fixed consequences, not extra questions: `single`
+uses `Developer`; `pair` uses `Developer` with an independent `Critic`; and `team` uses
+task-local `LocalCoordinator`, `Developer`, and `Critic`. The persistent
+`FleetCoordinator` uses the separate packaged `Coordinator` contract and coordination
+model.
+
+Revision-3 role defaults have an explicit fail-closed adoption command: first run
+`ours-fleet migrate-role-defaults -c FILE` for a zero-write plan, review every removal,
+replacement, addition, preserved custom file, staging path, and recovery path, then rerun
+with `--write`. Only exact semantic matches for packaged-bootstrap and generated
+revision-3 forms are changed; same-named customized files remain byte-identical, and a
+dangling custom reference refuses publication. Rerunning the migration is a no-op.
+
+For manual adoption of a single newer packaged file, copy the reported source beside the
+target as `.new-default`, inspect `diff -u TARGET TARGET.new-default`, then replace the
+target yourself. Rerunning init is not an update. Users with the still older exact generated
+six-worker starter Agent set must first run `ours-fleet migrate-agent-templates -c FILE`
+for its zero-write plan, review every move/addition/recovery path, and rerun with `--write`.
+Customized or ambiguous known starters are refused without mutation; unrelated custom
+persistent Agents are preserved.
 
 Rooms always use `ours-cowork`; there is no room-provider selector. Configure
 the cowork daemon connection and the room owner directly:
