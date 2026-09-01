@@ -53,6 +53,25 @@ describe('ours-fleet CLI', () => {
     expect(INIT_COMPLETION_GUIDANCE).toContain('fleet/{agents,agent_templates,roles,brains,room_templates}/*.yaml');
   });
 
+  it('exposes the role-default migration as a zero-write reviewable CLI plan', async () => {
+    const file = join(dir, 'adopt.yaml');
+    const root = join(dir, 'adopt');
+    mkdirSync(join(root, 'roles'), { recursive: true, mode: 0o700 });
+    writeFileSync(file, 'api_version: ours.network/fleet/v2\n', { mode: 0o600 });
+    writeFileSync(join(root, 'roles', 'Secretary.yaml'),
+      'mission: Implement the agreed solution and maintain the task\'s shared record.\npersona: |\n  Turn agreed decisions into focused code, documentation, and tests. Keep collaborators\n  informed with compact evidence and preserve unrelated state. Pause material work for\n  required review; do not merge, publish, or widen scope without owner authorization.\nbio: Implementing partner and record keeper; engage to deliver reviewed changes.\n',
+      { mode: 0o600 });
+    const before = readFileSync(join(root, 'roles', 'Secretary.yaml'), 'utf8');
+
+    const result = await run(['migrate-role-defaults', '-c', file]);
+
+    expect(result.code).toBe(0);
+    expect(result.stdout).toContain('Dry run only; no files were changed.');
+    expect(result.stdout).toContain(`Remove ${join(root, 'roles', 'Secretary.yaml')}`);
+    expect(result.stdout).toContain('Re-run with --write');
+    expect(readFileSync(join(root, 'roles', 'Secretary.yaml'), 'utf8')).toBe(before);
+  });
+
   it('refuses non-TTY init without host or configuration mutation', async () => {
     const config = join(dir, 'custom.yaml');
     const r = await run(['init', '-c', config]);

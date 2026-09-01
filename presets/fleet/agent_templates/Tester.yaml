@@ -1,3 +1,0 @@
-role: { ref: Tester }
-brain: { ref: claude-default }
-permissions: { approval: ask, filesystem: workspace, unattended: deny }

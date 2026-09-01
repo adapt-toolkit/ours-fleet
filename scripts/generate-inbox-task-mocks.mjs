@@ -37,7 +37,7 @@ const blocked = {
   blocker: 'Waiting for authenticated Owner visual approval.',
   brief: 'Review the attention-first task report before production integration begins.',
   description: 'Confirm that the selected list is unmistakable, blocked work appears once at the top, active work remains scannable, and full task details stay available without JavaScript.',
-  room: 'rm-review', template: 'pair-review@2', members: 'Secretary — mock owner — blocked/waiting\nCritic — independent reviewer — reviewing/ready',
+  room: 'rm-review', template: 'pair-review@2', members: 'Developer — mock owner — blocked/waiting\nCritic — independent reviewer — reviewing/ready',
   readiness: '1 of 2 waiting for Owner', created: '2026-08-28T09:20:00.000Z', updated: '2026-08-28T09:40:00.000Z', started: '2026-08-28T09:23:00.000Z',
 };
 const activeTasks = [
@@ -52,7 +52,7 @@ const activeTasks = [
     id: 'tsk-release-registry', title: 'Build report registry', status: 'Active', list: 'release',
     brief: 'Build the shared typed registry and deterministic report pipeline.',
     description: 'Create allowlisted collectors, canonical ordering, portable HTML output, bounded artifacts, and common delivery metadata while preserving text and JSON output.',
-    room: 'rm-html', template: 'pair-review@2', members: 'Secretary — implementation owner — working/ready\nCritic — independent reviewer — reviewing/ready', readiness: '2 of 2 ready',
+    room: 'rm-html', template: 'pair-review@2', members: 'Developer — implementation owner — working/ready\nCritic — independent reviewer — reviewing/ready', readiness: '2 of 2 ready',
     created: '2026-08-28T08:00:00.000Z', updated: '2026-08-28T09:52:00.000Z', started: '2026-08-28T08:05:00.000Z',
   },
 ];
@@ -101,7 +101,7 @@ const combined = {
         withGroups({ ...activeTasks[1], id: 'tsk-default-done', list: 'default', title: 'Audit report safety', brief: 'Verify redaction boundaries.', description: 'Verify that reports exclude secrets, prompts, message bodies, raw logs, private paths, control sockets, and sensitive payloads.', status: 'Done' }),
       ] },
       { id: 'archive', name: 'archive', total: 5, shown: 2, description: 'Two of five tasks are included by the report bound; source order is preserved.', tasks: [
-        withGroups({ ...activeTasks[1], id: 'tsk-archive-cancelled', list: 'archive', title: 'Retire obsolete preview', brief: 'Record cancellation of a superseded preview.', description: 'Retire the superseded preview after the unified table design replaced it; retain only safe review evidence.', status: 'Cancelled', room: null, template: 'solo@1', members: 'Secretary — cancellation recorder', readiness: 'Terminal — cancelled' }),
+        withGroups({ ...activeTasks[1], id: 'tsk-archive-cancelled', list: 'archive', title: 'Retire obsolete preview', brief: 'Record cancellation of a superseded preview.', description: 'Retire the superseded preview after the unified table design replaced it; retain only safe review evidence.', status: 'Cancelled', room: null, template: 'solo@1', members: 'Developer — cancellation recorder', readiness: 'Terminal — cancelled' }),
         withGroups({ ...activeTasks[1], id: 'tsk-archive-failed', list: 'archive', title: 'Capture legacy renderer', brief: 'A legacy capture failed before artifact creation.', description: 'The legacy capture could not produce a bounded printable artifact. Record the failure without exposing raw logs or sensitive error payloads.', status: 'Failed', room: 'rm-legacy', template: 'solo@1', members: 'Critic — capture owner — terminal/failed', readiness: 'Terminal — failed' }),
       ] },
       { id: 'waiting', name: 'waiting', total: 0, shown: 0, description: 'This included list contains no tasks.', tasks: [] },

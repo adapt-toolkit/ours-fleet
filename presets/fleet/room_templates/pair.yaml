@@ -1,11 +1,10 @@
 version: 1
-description: "Deliberation pair: Secretary writes code, Critic reviews — every decision deliberated together"
+description: "Implementation pair: Developer executes and Critic independently reviews"
 room: { quiet_membership: false, anonymous: false }
 contract: |
-  Secretary and Critic deliberate every decision together before acting.
-  Secretary writes code; Critic reviews and challenges.
-  No material change lands without both agreeing.
-  Completion requires joint sign-off.
+  Developer owns implementation and verification evidence.
+  Critic independently challenges assumptions and withholds sign-off on material failures.
+  Completion requires Developer evidence and Critic sign-off.
 members:
-  - { slot: secretary, role: Secretary, count: 1, agent_template: Secretary }
+  - { slot: developer, role: Developer, count: 1, agent_template: Developer }
   - { slot: critic, role: Critic, count: 1, agent_template: Critic }

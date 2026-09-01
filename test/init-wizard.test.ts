@@ -77,14 +77,14 @@ function treeSnapshot(path: string): Record<string, string> {
 }
 
 describe('interactive questionnaire', () => {
-  it('begins with the exact destructive warning and names complete overwrite scope', async () => {
+  it('begins with the preservation contract and names the complete seed scope', async () => {
     const config = join(root, 'custom.yaml');
     const prompt = new ScriptedPrompter([false]);
     await expect(askInitQuestions(prompt, config)).resolves.toBeUndefined();
     expect(prompt.calls).toEqual([expect.objectContaining({
       kind: 'confirm',
-      message: 'This command will replace your Fleet configuration with the defaults. Continue?',
-      detail: expect.stringContaining(`${config} and ${splitRootFor(config)}`),
+      message: 'Add missing default Fleet configuration while preserving existing files. Continue?',
+      detail: expect.stringContaining('existing configuration and templates remain byte-identical'),
     })]);
   });
 
@@ -111,7 +111,7 @@ describe('interactive questionnaire', () => {
     const final = prompt.calls.filter(call => call.kind === 'confirm').at(-1);
     expect(final).toMatchObject({
       message: 'Create this default Fleet setup?',
-      detail: expect.stringContaining('One-agent work: one development Agent'),
+      detail: expect.stringContaining('One-agent work: one Developer'),
     });
     expect(final?.detail).toContain(join(root, 'fleet.yaml'));
     expect(final?.detail).toContain(splitRootFor(join(root, 'fleet.yaml')));
@@ -373,17 +373,19 @@ describe('deterministic default mapping', () => {
         coordination: model('codex', 'gpt-5.6-terra'),
       },
     });
-    for (const role of ['Agent', 'Developer', 'Secretary'])
-      expect(generated.files.get(`agent_templates/${role}.yaml`)).toContain('brain: { ref: development }');
-    for (const role of ['Critic', 'Tester'])
-      expect(generated.files.get(`agent_templates/${role}.yaml`)).toContain('brain: { ref: review }');
-    expect(generated.files.get('agent_templates/Architect.yaml')).toContain('brain: { ref: coordination }');
+    expect(generated.files.get('agent_templates/Developer.yaml')).toContain('brain: { ref: development }');
+    expect(generated.files.get('agent_templates/Critic.yaml')).toContain('brain: { ref: review }');
+    expect(generated.files.get('agent_templates/LocalCoordinator.yaml')).toContain('brain: { ref: coordination }');
     expect(generated.files.get('agents/FleetCoordinator.yaml')).toContain('brain: { ref: coordination }');
-    expect(generated.files.get('room_templates/single.yaml')).toContain('agent_template: Agent');
-    expect(generated.files.get('room_templates/pair.yaml')).toContain('agent_template: Secretary');
+    expect(generated.files.get('room_templates/single.yaml')).toContain('agent_template: Developer');
+    expect(generated.files.get('room_templates/pair.yaml')).toContain('agent_template: Developer');
     expect(generated.files.get('room_templates/pair.yaml')).toContain('agent_template: Critic');
-    for (const role of ['Architect', 'Developer', 'Tester'])
+    for (const role of ['LocalCoordinator', 'Developer', 'Critic'])
       expect(generated.files.get('room_templates/team.yaml')).toContain(`agent_template: ${role}`);
+    for (const obsolete of ['Agent', 'Architect', 'Secretary', 'Tester']) {
+      expect(generated.files.has(`roles/${obsolete}.yaml`)).toBe(false);
+      expect(generated.files.has(`agent_templates/${obsolete}.yaml`)).toBe(false);
+    }
   });
 
   it('generates a catalog-valid Claude setup without claiming or inventing entitlement fallback', () => {
@@ -573,10 +575,12 @@ describe('locked replacement transaction', () => {
     { manifest: false, existingRoot: true },
   ])('backs up exactly the partial prior targets $manifest/$existingRoot and publishes a complete pair', async ({ manifest, existingRoot }) => {
     const config = join(root, 'fleet.yaml');
-    if (manifest) writeFileSync(config, 'old manifest\n', { mode: 0o600 });
+    if (manifest) writeFileSync(config, generateSetup(answers()).files.get('fleet.yaml')!, { mode: 0o600 });
     if (existingRoot) {
       mkdirSync(splitRootFor(config), { mode: 0o700 });
-      writeFileSync(join(splitRootFor(config), 'old.yaml'), 'old root\n', { mode: 0o600 });
+      mkdirSync(join(splitRootFor(config), 'roles'), { mode: 0o700 });
+      writeFileSync(join(splitRootFor(config), 'roles/Custom.yaml'),
+        'mission: Custom role\npersona: Keep custom bytes.\nbio: Custom.\n', { mode: 0o600 });
     }
     const result = await publishSetup(config, generateSetup(answers()));
     const state = JSON.parse(readFileSync(join(result.recoveryPath, 'state.json'), 'utf8'));
@@ -587,16 +591,24 @@ describe('locked replacement transaction', () => {
     expect(existsSync(splitRootFor(config))).toBe(true);
   });
 
-  it('reruns deterministically and retains the complete previous configuration', async () => {
+  it('reruns without overwriting customized role, agent-template, or room-template bytes', async () => {
     const config = join(root, 'fleet.yaml');
     await publishSetup(config, generateSetup(answers(['codex'], 'quick')));
     const beforeManifest = readFileSync(config, 'utf8');
-    const beforeRoot = treeSnapshot(splitRootFor(config));
+    const split = splitRootFor(config);
+    writeFileSync(join(split, 'roles/Developer.yaml'), 'mission: custom developer\npersona: custom\nbio: custom\n');
+    writeFileSync(join(split, 'agent_templates/Developer.yaml'),
+      'role: { ref: Developer }\nbrain: { ref: development }\npermissions: { approval: ask, filesystem: workspace, unattended: deny }\n');
+    const single = join(split, 'room_templates/single.yaml');
+    writeFileSync(single, readFileSync(single, 'utf8')
+      .replace('Solo task: one Developer owns implementation and verification',
+        'Customized solo task contract'));
+    const beforeRoot = treeSnapshot(split);
     const result = await publishSetup(config, generateSetup(answers(['claude'], 'thorough')));
     expect(readFileSync(join(result.recoveryPath, 'fleet.yaml'), 'utf8')).toBe(beforeManifest);
     expect(treeSnapshot(join(result.recoveryPath, 'fleet'))).toEqual(beforeRoot);
-    expect(readFileSync(join(splitRootFor(config), 'brains/development.yaml'), 'utf8'))
-      .toContain('model: claude-opus-5');
+    expect(readFileSync(config, 'utf8')).toBe(beforeManifest);
+    expect(treeSnapshot(split)).toEqual(beforeRoot);
   });
 
   it('rolls back both targets after an injected second-publication failure', async () => {
@@ -683,7 +695,7 @@ describe('locked replacement transaction', () => {
     expect(result.signal).toBe('SIGKILL');
     expect(existsSync(config)).toBe(false);
     expect(readFileSync(join(splitRootFor(config), 'brains/development.yaml'), 'utf8'))
-      .toContain('model: claude-opus-5');
+      .toContain('model: gpt-5.6-sol');
     const created = readdirSync(root).filter(name => !before.has(name) && name !== 'hard-kill.mjs');
     expect(created.some(name => name.includes('init-recovery'))).toBe(true);
     expect(created.some(name => name.includes('init-stage'))).toBe(true);

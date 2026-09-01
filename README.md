@@ -107,7 +107,7 @@ become that account and repeat.
 ## Quickstart
 
 ```sh
-ours-fleet init               # interactive; reviews and replaces the complete named setup
+ours-fleet init               # interactive; adds missing defaults and preserves existing files
 ours-fleet config             # validates Agents, Roles, Brains, and Room templates
 $EDITOR ~/fleet/agents/*.yaml # compose Role + Brain and operational settings
 ours-fleet up                 # boot the fleet (staggered)
@@ -495,8 +495,9 @@ supported IDs, not recommendations or entitlement claims: use `ours-fleet doctor
 local Codex availability, while Claude entitlement is validated at launch. No
 `model_chain` is generated and Fleet never silently substitutes another model.
 
-A successful rerun replaces the complete named manifest and split directory and keeps
-a private recovery record of whichever previous target(s) existed. At either confirmation,
+A successful rerun adds any missing packaged defaults while preserving every existing
+manifest, Role, Agent Template, and Room Template byte. Explicit adoption of newer defaults
+is a separate reviewable migration. At either confirmation,
 N, Enter, Escape, Ctrl-C, Ctrl-D, or EOF cancels. In a picker, Escape, Ctrl-C, Ctrl-D,
 or EOF cancels; Enter records the highlighted choice (or continues a non-empty multi-select),
 N is ignored, and an empty subscription selection remains blocked. Every cancellation
@@ -510,13 +511,25 @@ non-owner-controlled parent fail closed before host setup and are rechecked unde
 per-setup init lock before publication.
 
 The generated task experiences are fixed consequences, not extra questions: `single`
-uses one development Agent; `pair` uses a development Secretary and independent review
-Critic; `team` phases coordination Architect, development Developer, and review Tester.
-FleetCoordinator uses coordination. Users with the exact generated six-worker legacy
-starter set must migrate explicitly: first run `ours-fleet migrate-agent-templates -c FILE`
-for a zero-write plan, then review every move/addition/recovery path and rerun with
-`--write`. Customized or ambiguous known starters are refused without
-mutation; unrelated custom persistent Agents are preserved.
+uses `Developer`; `pair` uses `Developer` with an independent `Critic`; and `team` uses
+task-local `LocalCoordinator`, `Developer`, and `Critic`. The persistent
+`FleetCoordinator` uses the separate packaged `Coordinator` contract and coordination
+model.
+
+Revision-3 role defaults have an explicit fail-closed adoption command: first run
+`ours-fleet migrate-role-defaults -c FILE` for a zero-write plan, review every removal,
+replacement, addition, preserved custom file, staging path, and recovery path, then rerun
+with `--write`. Only exact semantic matches for packaged-bootstrap and generated
+revision-3 forms are changed; same-named customized files remain byte-identical, and a
+dangling custom reference refuses publication. Rerunning the migration is a no-op.
+
+For manual adoption of a single newer packaged file, copy the reported source beside the
+target as `.new-default`, inspect `diff -u TARGET TARGET.new-default`, then replace the
+target yourself. Rerunning init is not an update. Users with the still older exact generated
+six-worker starter Agent set must first run `ours-fleet migrate-agent-templates -c FILE`
+for its zero-write plan, review every move/addition/recovery path, and rerun with `--write`.
+Customized or ambiguous known starters are refused without mutation; unrelated custom
+persistent Agents are preserved.
 
 Rooms always use `ours-cowork`; there is no room-provider selector. Configure
 the cowork daemon connection and the room owner directly:

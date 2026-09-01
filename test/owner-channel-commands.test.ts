@@ -23,15 +23,15 @@ import { TaskRoomApplicationError, TaskRoomApplicationService } from '../src/app
 
 const STANDARD_TEMPLATES = {
   single: { name: 'single', version: 1, description: 'Solo agent',
-    members: [{ slot: 'agent', role: 'Agent', count: 1, agent_template: 'Agent' }] },
+    members: [{ slot: 'developer', role: 'Developer', count: 1, agent_template: 'Developer' }] },
   pair: { name: 'pair', version: 1, description: 'Review pair', members: [
-    { slot: 'secretary', role: 'Secretary', count: 1, agent_template: 'Secretary' },
+    { slot: 'developer', role: 'Developer', count: 1, agent_template: 'Developer' },
     { slot: 'critic', role: 'Critic', count: 1, agent_template: 'Critic' },
   ] },
   team: { name: 'team', version: 1, description: 'Delivery team', members: [
-    { slot: 'architect', role: 'Architect', count: 1, agent_template: 'Architect' },
+    { slot: 'local_coordinator', role: 'LocalCoordinator', count: 1, agent_template: 'LocalCoordinator' },
     { slot: 'developer', role: 'Developer', count: 1, agent_template: 'Developer' },
-    { slot: 'tester', role: 'Tester', count: 1, agent_template: 'Tester' },
+    { slot: 'critic', role: 'Critic', count: 1, agent_template: 'Critic' },
   ] },
 };
 

@@ -8,7 +8,7 @@ import { createInterface } from 'node:readline';
 import { Command } from 'commander';
 import { VERSION } from './version.js';
 import { INIT_COMPLETION_GUIDANCE } from './init-guidance.js';
-import { migrateLegacyStarterPresets } from './preset-migration.js';
+import { migrateLegacyStarterPresets, migratePackagedRoleDefaults } from './preset-migration.js';
 import {
   executeInitWizard, isInteractiveTerminal, publishSetup, TerminalPrompter,
 } from './init-wizard.js';
@@ -1160,7 +1160,7 @@ cOpt(program.command('doctor').description('prerequisite report'))
     if (!rep.ok) throw new FleetCliExit(1);
   });
 
-cOpt(program.command('init').description('interactively replace the complete Fleet setup with reviewed defaults'))
+cOpt(program.command('init').description('interactively add missing Fleet defaults while preserving existing configuration'))
   .action(async (opts: { configuration?: string }) => {
     const configuration = opts.configuration ?? defaultConfigPath();
     if (!isInteractiveTerminal(process.stdin, process.stdout))
@@ -1182,7 +1182,7 @@ cOpt(program.command('init').description('interactively replace the complete Fle
       const prior = result.manifestExisted && result.rootExisted ? 'manifest and split configuration'
         : result.manifestExisted ? 'manifest only'
           : result.rootExisted ? 'split configuration only' : 'no previous targets';
-      console.log(`${result.replacedExisting ? 'Replaced' : 'Created'} complete Fleet setup: ${result.configPath} and ${result.splitRoot}`);
+      console.log(`${result.replacedExisting ? 'Preserved existing files and added missing defaults to' : 'Created'} Fleet setup: ${result.configPath} and ${result.splitRoot}`);
       console.log(`Previous targets: ${prior}.`);
       console.log(`Private recovery record: ${result.recoveryPath}`);
       console.log(INIT_COMPLETION_GUIDANCE);
@@ -1201,6 +1201,23 @@ cOpt(program.command('migrate-agent-templates')
       console.log(`Staging path: ${result.stagingPath}`);
       console.log(`Recovery backup: ${result.backupPath}`);
       if (!result.write) console.log('Re-run with --write to apply this exact migration class.');
+    } catch (error) { die(error); }
+  });
+
+cOpt(program.command('migrate-role-defaults')
+  .description('dry-run adoption of exact revision-3 role defaults; add --write to apply atomically')
+  .option('--write', 'apply the reviewed migration and retain a private recovery backup'))
+  .action((opts: { configuration?: string; write?: boolean }) => {
+    try {
+      const result = migratePackagedRoleDefaults(opts.configuration ?? defaultConfigPath(), { write: opts.write });
+      console.log(result.write ? 'Applied packaged role-default migration.' : 'Dry run only; no files were changed.');
+      for (const path of result.removals) console.log(`Remove ${path}`);
+      for (const path of result.replacements) console.log(`Replace ${path}`);
+      for (const path of result.additions) console.log(`Add ${path}`);
+      for (const path of result.preserved) console.log(`Preserve customized ${path}`);
+      console.log(`Staging path: ${result.stagingPath}`);
+      console.log(`Recovery backup: ${result.backupPath}`);
+      if (!result.write) console.log('Re-run with --write to adopt only these exact recognized defaults.');
     } catch (error) { die(error); }
   });
 

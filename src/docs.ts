@@ -82,7 +82,7 @@ PATH order.
 ## Lifecycle and console commands
 
 \`\`\`sh
-ours-fleet init [-c FILE]               # interactive reviewed replacement; TTY required
+ours-fleet init [-c FILE]               # interactive missing-default seed; TTY required
 ours-fleet up|down [Name...]
 ours-fleet restart [Name...]            # preserve/resume harness context
 ours-fleet force-restart [Name...]      # fresh context; briefing is reloaded
@@ -95,8 +95,8 @@ ours-fleet watchdog-report <name> [run-id] [--list] [--json]
 ours-fleet watchdog-run <name>
 \`\`\`
 
-\`init\` is an interactive replacement workflow, not a missing-file seed. It names the
-resolved manifest and split directory, asks a default-No replacement confirmation,
+\`init\` is an interactive missing-default workflow that preserves existing files byte-for-byte.
+It names the resolved manifest and split directory, asks a default-No confirmation,
 then subscriptions (Codex, Claude, or both), model assignment (one explicit model for
 every job or explicit development/review/coordination choices), one reasoning level,
 and a final default-No review. Quick/Balanced/Thorough generate low/medium/high.
@@ -112,8 +112,8 @@ Every cancellation before final approval performs no host or configuration mutat
 Redirected/non-TTY invocation is refused with the same guarantee. After the final Yes,
 host setup precedes publication. Path ownership/type/mode/symlink and
 same-filesystem checks run before host setup and again under a per-setup lock. Publication
-stages and validates the complete setup, backs up whichever old target(s) exist, and
-retains a private recovery record. A hard process/host termination cannot promise
+stages and validates the complete combined setup, backs up whichever old target(s) exist,
+and retains a private recovery record. A hard process/host termination cannot promise
 rollback; inspect host integration and private init stage/recovery evidence.
 
 \`peek\`, \`attach\`, and text \`send\` use the structured agent session.
@@ -322,10 +322,20 @@ ours-fleet task create --title "Phased delivery" --template team [-c FILE]
 
 An alternate manifest \`-c /path/custom.yaml\` uses \`/path/custom/\` as its split
 root. Repeated init only fills missing files and never adopts a newer default.
-For explicit adoption, copy one file from init's reported packaged source beside
-the target as \`.new-default\`, inspect \`diff -u TARGET TARGET.new-default\`, then
-replace TARGET yourself. The exact generated six-worker legacy starter set has an
-explicit fail-closed migration (dry-run by default):
+Revision-3 packaged-bootstrap and generated role defaults have an exact-semantic,
+fail-closed migration (dry-run by default):
+
+\`ours-fleet migrate-role-defaults [-c FILE]\`
+\`ours-fleet migrate-role-defaults [-c FILE] --write\`
+
+Review removals, replacements, additions, preserved custom files, staging path,
+and recovery path. Same-named custom files stay byte-identical; dangling custom
+references refuse publication, and a successful rerun is a no-op. For explicit
+single-file adoption, copy from init's reported packaged source beside the target
+as \`.new-default\`, inspect \`diff -u TARGET TARGET.new-default\`, then replace it.
+
+The exact generated six-worker legacy starter Agent set has its own fail-closed
+migration (dry-run by default):
 
 \`ours-fleet migrate-agent-templates [-c FILE]\`
 \`ours-fleet migrate-agent-templates [-c FILE] --write\`

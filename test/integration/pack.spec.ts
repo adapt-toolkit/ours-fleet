@@ -77,8 +77,9 @@ describe('npm pack from a checkout with no dist', () => {
       'presets/fleet.yaml',
       'presets/fleet/brains/claude-default.yaml',
       'presets/fleet/agents/FleetCoordinator.yaml',
-      ...['Agent', 'Secretary', 'Critic', 'Architect', 'Developer', 'Tester']
+      ...['LocalCoordinator', 'Critic', 'Developer']
         .flatMap(name => [`presets/fleet/agent_templates/${name}.yaml`, `presets/fleet/roles/${name}.yaml`]),
+      'presets/fleet/roles/Coordinator.yaml',
       'presets/fleet/room_templates/single.yaml',
       'presets/fleet/room_templates/pair.yaml',
       'presets/fleet/room_templates/team.yaml',

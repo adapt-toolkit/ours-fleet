@@ -54,9 +54,8 @@ export interface InitPublishResult {
 
 const WORK_KINDS: WorkKind[] = ['development', 'review', 'coordination'];
 const ROLE_WORK: Record<string, WorkKind> = {
-  Agent: 'development', Developer: 'development', Secretary: 'development',
-  Critic: 'review', Tester: 'review',
-  Architect: 'coordination', FleetCoordinator: 'coordination',
+  Developer: 'development', Critic: 'review',
+  LocalCoordinator: 'coordination', Coordinator: 'coordination', FleetCoordinator: 'coordination',
 };
 const REASONING_EFFORT: Record<ReasoningPreference, 'low' | 'medium' | 'high'> = {
   quick: 'low', balanced: 'medium', thorough: 'high',
@@ -107,8 +106,8 @@ export async function askInitQuestions(
   const configPath = resolve(configuration);
   const splitRoot = splitRootFor(configPath);
   const confirmed = await prompter.confirm(
-    'This command will replace your Fleet configuration with the defaults. Continue?',
-    `It will replace ${configPath} and ${splitRoot}. Identities and project files are not changed. Host service setup may also be updated after you finish the questions.`,
+    'Add missing default Fleet configuration while preserving existing files. Continue?',
+    `It will add missing defaults under ${configPath} and ${splitRoot}; existing configuration and templates remain byte-identical. Explicit default adoption is a separate migration. Identities and project files are not changed. Host service setup may also be updated after you finish the questions.`,
   );
   if (!confirmed) return undefined;
 
@@ -195,9 +194,9 @@ export function formatSetupSummary(answers: InitAnswers, configuration: string):
     '  Availability: catalog support is not a recommendation or entitlement claim',
     '  Entitlement check: run ours-fleet doctor for Codex; Claude is validated when a role launches',
     '  Automatic model fallback: none (no model_chain is generated)',
-    '  One-agent work: one development Agent',
-    '  Reviewed pair: Secretary (development) + independent Critic (review)',
-    '  Phased team: Architect (coordination) -> Developer (development) -> Tester (review)',
+    '  One-agent work: one Developer',
+    '  Reviewed pair: Developer + independent Critic',
+    '  Team: LocalCoordinator + Developer + Critic',
     '  FleetCoordinator: coordination model',
     '',
     'After the final Yes, Fleet performs host service setup before publishing the complete configuration.',
@@ -255,23 +254,19 @@ export function generateSetup(answers: InitAnswers): GeneratedSetup {
     if (tuples.size !== 1)
       throw new Error('one-model assignment requires the same exact model for development, review, and coordination');
   }
-  for (const role of ['Agent', 'Architect', 'Critic', 'Developer', 'Secretary', 'Tester']) {
+  for (const role of ['Coordinator', 'LocalCoordinator', 'Developer', 'Critic']) {
     files.set(`roles/${role}.yaml`, preset(`roles/${role}.yaml`));
+    if (role === 'Coordinator') continue;
     files.set(`agent_templates/${role}.yaml`, [
       `role: { ref: ${role} }`,
       `brain: { ref: ${ROLE_WORK[role]} }`,
+      'coordinator: FleetCoordinator',
       'permissions: { approval: ask, filesystem: workspace, unattended: deny }',
       '',
     ].join('\n'));
   }
-  files.set('agents/FleetCoordinator.yaml', [
-    'template: Agent',
-    'overrides:',
-    '  role: { ref: Agent }',
-    '  brain: { ref: coordination }',
-    '  coordinator: FleetCoordinator',
-    '',
-  ].join('\n'));
+  files.set('agents/FleetCoordinator.yaml', preset('agents/FleetCoordinator.yaml')
+    .replace('brain: { ref: claude-default }', 'brain: { ref: coordination }'));
   for (const name of ['single', 'pair', 'team'])
     files.set(`room_templates/${name}.yaml`, preset(`room_templates/${name}.yaml`));
   return { files, answers };
@@ -325,6 +320,23 @@ function canonicalGeneratedSetup(setup: GeneratedSetup): GeneratedSetup {
     throw new Error(`generated setup content does not match the accepted answers: ${path}`);
   // Return the newly generated map, never the caller-owned map checked above.
   return { files: expected, answers: setup.answers };
+}
+
+function preserveExistingSetup(configPath: string, setup: GeneratedSetup): GeneratedSetup {
+  const files = new Map(setup.files);
+  if (existsSync(configPath)) files.set('fleet.yaml', readFileSync(configPath, 'utf8'));
+  const root = splitRootFor(configPath);
+  const visit = (directory: string, prefix = ''): void => {
+    if (!existsSync(directory)) return;
+    for (const entry of readdirSync(directory)) {
+      const absolute = join(directory, entry); const relative = join(prefix, entry);
+      const stat = lstatSync(absolute);
+      if (stat.isDirectory()) visit(absolute, relative);
+      else files.set(relative, readFileSync(absolute, 'utf8'));
+    }
+  };
+  visit(root);
+  return { files, answers: setup.answers };
 }
 
 export interface InitPathInspectionDeps {
@@ -426,7 +438,8 @@ function writeStaged(stageManifest: string, setup: GeneratedSetup): void {
 function validateStaged(stageManifest: string): void {
   const config = loadConfig(stageManifest, { yamlMode: 'strict' });
   const templates = listTemplates(config.roomTemplates ?? {});
-  if (templates.map(template => template.name).join(',') !== 'pair,single,team')
+  const names = new Set(templates.map(template => template.name));
+  if (!['pair', 'single', 'team'].every(name => names.has(name)))
     throw new Error('generated setup did not resolve the default single, pair, and team experiences');
   for (const template of templates) for (const member of template.members)
     if (!config.agentTemplates?.[member.agent_template])
@@ -451,13 +464,14 @@ export async function publishSetup(
   // The setup object is exported for deterministic tests and orchestration. Treat
   // it as untrusted here: no caller-provided path reaches join()/write before the
   // complete path set and contents are regenerated from the accepted answers.
-  const canonicalSetup = canonicalGeneratedSetup(setup);
+  let canonicalSetup = canonicalGeneratedSetup(setup);
   const initial = preflightInitPaths(configuration);
   const { configPath, splitRoot, parent } = initial;
   const stem = basename(splitRoot);
   return withFileLock(join(parent, `.${stem}.init.lock`), async () => {
     const locked = preflightInitPaths(configuration);
     const { manifestExisted, rootExisted } = locked;
+    canonicalSetup = preserveExistingSetup(configPath, canonicalSetup);
 
     const nonce = `${new Date().toISOString().replace(/[^0-9]/g, '')}-${process.pid}-${randomUUID()}`;
     const stagePath = join(parent, `.${stem}.init-stage-${nonce}`);

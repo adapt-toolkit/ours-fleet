@@ -9,7 +9,7 @@ implementation; it does not turn their illustrative model choices into recommend
 
 | Approved behavior | Implementation | Verification |
 |---|---|---|
-| Initial default-No replacement question; literal resolved manifest and split paths; identity/project exclusion | `askInitQuestions`, `splitRootFor`, `TerminalPrompter.confirm` | `begins with the exact destructive warning...`; wizard mutation-boundary tests |
+| Initial default-No preservation question; literal resolved manifest and split paths; identity/project exclusion | `askInitQuestions`, `splitRootFor`, `TerminalPrompter.confirm` | preservation-contract and wizard mutation-boundary tests |
 | Q1 Codex-only, Claude-only, or both; empty selection stays on Q1 | provider-filtered catalog in `askInitQuestions`; `multiSelect` empty guard | parameterized `supports one-model subscription combination`; `drives the real multi-select...` |
 | Catalog IDs are not recommendations or entitlement claims | questionnaire note and README/AI docs | subscription-combination test asserts note; documentation scan |
 | Codex availability is checked by `doctor`; Claude entitlement at launch; unavailable models do not trigger fallback | persistent questionnaire note/review summary, README/AI docs; generated brains omit `model_chain` | real retained-note and questionnaire-summary assertions; deterministic mapping checks |
@@ -30,7 +30,7 @@ implementation; it does not turn their illustrative model choices into recommend
 | Locked rejection after host setup explicitly warns host state may have changed | publication error wrapper in `executeInitWizard` | `warns that host state may have changed...` |
 | Host setup can partially mutate before failing; config publication does not run and the error states both facts | host-setup error boundary in `executeInitWizard` | `warns about partial host state and skips publication...` |
 | Generated file set is exact, canonical, deterministic, and validated before publication | `canonicalGeneratedSetup`, `writeStaged`, `validateStaged` | unsafe/missing/extra/tampered map tests; byte-determinism test |
-| First run and rerun publish a complete pair; whichever prior targets exist are recorded/backed up; success reports create vs replace | recovery `state.json`, atomic renames, `InitPublishResult` existence fields, CLI result copy | absent-marker, rerun, four summary-state tests; CLI output review |
+| First run and rerun publish a complete pair while preserving existing bytes; whichever prior targets exist are recorded/backed up | preservation merge, recovery `state.json`, atomic renames, `InitPublishResult` existence fields | absent-marker, customized-rerun, summary-state tests; CLI output review |
 | Publication failure restores proven originals and never overwrites an unproven path | rollback inode proofs and retained evidence | injected second-publication failure and unproven rollback tests |
 | Hard kill/power loss/host crash does not promise rollback; stage/recovery evidence remains inspectable | durable staging/recovery order and user-facing summary/docs | `retains inspectable evidence after a hard kill during publication` |
 | Successful init does not run legacy missing-preset bootstrap afterward | CLI invokes only `executeInitWizard`/`publishSetup` | CLI source assertion/review; generated setup validation |

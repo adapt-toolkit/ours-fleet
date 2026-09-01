@@ -105,7 +105,7 @@ describe('packed root package', () => {
             revision: seeded.revision,
             created: seeded.created.length,
             team: existsSync(join(process.cwd(), 'seeded', 'alternate', 'room_templates', 'team.yaml')),
-            tester: existsSync(join(process.cwd(), 'seeded', 'alternate', 'roles', 'Tester.yaml')),
+            localCoordinator: existsSync(join(process.cwd(), 'seeded', 'alternate', 'roles', 'LocalCoordinator.yaml')),
           },
         }));
       `;
@@ -130,7 +130,7 @@ describe('packed root package', () => {
         sandbox: 'danger-full-access',
         initialAgentMode: 'agent-full-access',
       });
-      expect(result.presets).toEqual({ revision: 3, created: 66, team: true, tester: true });
+      expect(result.presets).toEqual({ revision: 4, created: 61, team: true, localCoordinator: true });
 
       writeFileSync(join(consumerWithoutOptionalDir, 'package.json'), JSON.stringify({
         private: true,

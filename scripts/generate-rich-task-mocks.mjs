@@ -39,7 +39,7 @@ const tasks = {
         value('ID','tsk-default-active'),value('Status','Active','good'),value('List','default'),value('Blocked',null),
         value('Room','rm-html',null,{section:'room-references',id:'rm-html'}),value('Template','pair-review@2',null,{section:'template-references',id:'pair-review'}),
         value('Created','2026-08-28T08:00:00.000Z'),value('Updated','2026-08-28T09:58:00.000Z'),value('Started','2026-08-28T08:05:00.000Z'),value('Ended',null),
-        value('Members','Secretary — working/ready; Critic — reviewing/ready'),value('Readiness','2/2 ready','good'),value('Outcome',null),
+        value('Members','Developer — working/ready; Critic — reviewing/ready'),value('Readiness','2/2 ready','good'),value('Outcome',null),
       ],['Brief: Build the typed allowlisted registry and deterministic renderer.'],true),
       task('tsk-default-done','tsk-default-done — Audit command inventory','DONE · Terminal · No blocker','good',[
         value('ID','tsk-default-done'),value('Status','Done','good'),value('List','default'),value('Blocked',null),value('Room',null),value('Template','solo@1',null,{section:'template-references',id:'solo'}),
