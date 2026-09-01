@@ -3,7 +3,9 @@ import { randomUUID } from 'node:crypto';
 import { Buffer } from 'node:buffer';
 import { replaceFileAtomically } from './atomic-file.js';
 import { isSensitiveConfigKey } from './sensitive-config.js';
-import { renderAgentConfiguration, type AgentLaunchConfiguration } from './lifecycle-summary.js';
+import {
+  mandatoryConfigurationFits, renderAgentConfiguration, type AgentLaunchConfiguration,
+} from './lifecycle-summary.js';
 import {
   MARKDOWN_MAX_BYTES, MARKDOWN_MAX_CODE_POINTS, markdownCode, markdownProse,
 } from './rooms-tasks/markdown.js';
@@ -378,7 +380,7 @@ function validConfiguration(value: unknown): value is AgentLaunchConfiguration {
     && (c.effort === undefined || text(c.effort, 32))
     // The builder caps the mission label at 80 code points; enforce the same
     // invariant here so the per-line budget proof holds for wire input too.
-    && (c.mission === undefined || (text(c.mission, 200) && Array.from(String(c.mission)).length <= 80))
+    && (c.mission === undefined || (text(c.mission) && Array.from(String(c.mission)).length <= 80))
     && APPROVAL_MODES.has(String(c.approval))
     && FILESYSTEM_MODES.has(String(c.filesystem))
     && UNATTENDED_MODES.has(String(c.unattended))
@@ -394,7 +396,11 @@ function validConfiguration(value: unknown): value is AgentLaunchConfiguration {
       && ['auto', 'bubblewrap', 'podman', 'none'].includes(String(c.isolation.requested))
       && (c.isolation.on_unavailable === undefined || ['warn', 'strict'].includes(String(c.isolation.on_unavailable)))
       && (c.isolation.network === undefined || ['broker', 'deny', 'allow', 'allowlist'].includes(String(c.isolation.network)))
-      && count(c.isolation.read_mounts) && count(c.isolation.write_mounts)));
+      && count(c.isolation.read_mounts) && count(c.isolation.write_mounts)))
+    // Escaping and code-fence growth can push a per-field-valid configuration
+    // past the line budget; a v1 configuration whose complete mandatory
+    // rendering cannot fit is invalid, never silently trimmed.
+    && mandatoryConfigurationFits(c as unknown as AgentLaunchConfiguration);
 }
 
 function validPresentation(value: unknown): value is FleetAuditPresentation {

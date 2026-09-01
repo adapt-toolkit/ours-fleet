@@ -10,8 +10,9 @@ import {
 import { fleetWorkerEnv } from '../src/rooms-tasks/external-worker.js';
 import { FLEET_PROXY_CALLER_ENV, FLEET_PROXY_STATE_DIR_ENV } from '../src/fleet-proxy.js';
 import {
-  AGENT_LINE_MAX_CODE_POINTS, MISSION_LABEL_MAX, missionLabel, renderAgentConfiguration,
-  selectionOrigin, summarizeResolvedLaunch, type AgentLaunchConfiguration,
+  AGENT_LINE_MAX_CODE_POINTS, MISSION_LABEL_MAX, mandatoryConfigurationFits, missionLabel,
+  renderAgentConfiguration, selectionOrigin, summarizeResolvedLaunch,
+  type AgentLaunchConfiguration,
 } from '../src/lifecycle-summary.js';
 import { MARKDOWN_MAX_BYTES, MARKDOWN_MAX_CODE_POINTS } from '../src/rooms-tasks/markdown.js';
 import { Buffer } from 'node:buffer';
@@ -379,6 +380,74 @@ describe('human-readable launch configuration', () => {
     expect(attempt({ ...named(), isolation: { requested: 'bubblewrap', read_mounts: -1 } })).toThrow();
     expect(attempt({ ...named(), mission: 'M'.repeat(81) })).toThrow();                          // builder cap is 80 cp
     expect(attempt({ ...named(), version: 2 })).toThrow();
+  });
+
+  it('rejects a per-field-valid configuration whose mandatory rendering cannot fit', () => {
+    // Every field is within its cap, but all-backtick values more than triple
+    // their code spans (the fence must outgrow the longest backtick run), so
+    // the complete mandatory rendering exceeds the line budget. Such a
+    // configuration must be rejected at the wire and never produced — not
+    // silently trimmed of Brain/model/mode.
+    const hostile: AgentLaunchConfiguration = {
+      version: 1, template: '`'.repeat(160),
+      role: { kind: 'named', ref: '`'.repeat(160) },
+      brain: { kind: 'named', ref: '`'.repeat(160) },
+      harness: '`'.repeat(64), session: 'acp', model: '`'.repeat(160),
+      effort: 'e'.repeat(32), mission: '*'.repeat(80),
+      approval: 'ask', filesystem: 'workspace', unattended: 'wait',
+      permissionMode: { fleetMode: 'ask', nativeMode: 'n'.repeat(160) },
+      monitor: { mode: 'fleet', interrupt: false },
+    };
+    expect(mandatoryConfigurationFits(hostile)).toBe(false);
+    expect(() => validateFleetAuditFinish({ correlationId: '017f22e2-79b0-7cc3-98c4-dc0c0c07398f',
+      class: 'success', effect: 'completed', presentations: [{ kind: 'task', operation: 'work',
+        eventId: 'e1', id: 't1', previousState: 'provisioning', newState: 'active',
+        agents: [{ name: 'Dev', role: 'Member', configuration: hostile }] }] })).toThrow();
+    const role = {
+      name: 'dev', harness: 'claude-code', session: 'acp',
+      permissions: { approval: 'ask', filesystem: 'workspace', unattended: 'wait' },
+      permissionsDeclared: true, identity: 'dev', model: '`'.repeat(160),
+      sourceFile: '(temp)', monitor: { mode: 'fleet', enabled: true, wake_sources: [],
+        batch_ms: 5, inject: 'x', interrupt: false, turn_fail_threshold: 1 },
+    } as unknown as import('../src/config.js').ResolvedRole;
+    expect(() => summarizeResolvedLaunch(role, {
+      role: { kind: 'named', ref: '`'.repeat(160) },
+      brain: { kind: 'named', ref: '`'.repeat(160) },
+      template: '`'.repeat(160),
+      permissionMode: { fleetMode: 'ask', nativeMode: 'n'.repeat(160) },
+    })).toThrow(/mandatory rendering budget/u);
+  });
+
+  it('renders every mandatory component simultaneously for an accepted maximal configuration', () => {
+    // Near-max but genuinely fitting: hostile backticks in one field, long
+    // plain values elsewhere. The validator accepts it, so every mandatory
+    // component must appear at once; only monitor/isolation may drop.
+    const nearMax: AgentLaunchConfiguration = {
+      version: 1, template: 'evil`template',
+      role: { kind: 'named', ref: 'R'.repeat(160) },
+      brain: { kind: 'named', ref: 'B'.repeat(160) },
+      harness: 'h'.repeat(64), session: 'acp', model: 'm'.repeat(160),
+      effort: 'e'.repeat(32), mission: '*'.repeat(80),
+      approval: 'ask', filesystem: 'workspace', unattended: 'wait',
+      permissionMode: { fleetMode: 'ask', nativeMode: 'n'.repeat(160) },
+      monitor: { mode: 'fleet', interrupt: false },
+      isolation: { requested: 'bubblewrap', network: 'broker', read_mounts: 9, write_mounts: 9 },
+    };
+    expect(mandatoryConfigurationFits(nearMax)).toBe(true);
+    expect(() => validateFleetAuditFinish({ correlationId: '017f22e2-79b0-7cc3-98c4-dc0c0c07398f',
+      class: 'success', effect: 'completed', presentations: [{ kind: 'task', operation: 'work',
+        eventId: 'e1', id: 't1', previousState: 'provisioning', newState: 'active',
+        agents: [{ name: 'Dev', role: 'Member', configuration: nearMax }] }] })).not.toThrow();
+    const line = renderAgentConfiguration(nearMax);
+    expect(Array.from(line).length).toBeLessThanOrEqual(AGENT_LINE_MAX_CODE_POINTS);
+    expect(line).toContain('template ``evil`template``');
+    expect(line).toContain(`Role preset \`${'R'.repeat(160)}\``);
+    expect(line).toContain(`Brain preset \`${'B'.repeat(160)}\``);
+    expect(line).toContain(`harness \`${'h'.repeat(64)}\``);
+    expect(line).toContain(`model \`${'m'.repeat(160)}\``);
+    expect(line).toContain(`effort ${'e'.repeat(32)}`);
+    expect(line).toContain('approval=ask, filesystem=workspace, unattended=wait');
+    expect(line).toContain('mode ask/');
   });
 
   it('never overflows across the note boundary: whole-line admission sweep', () => {
