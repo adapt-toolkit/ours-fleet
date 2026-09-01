@@ -107,7 +107,7 @@ function taskRoomPublicFailure(error: TaskRoomPublicError): {
     case 'template_not_found': return {
       legacy: `template not found: ${f.template ?? 'requested-template'}`, kind: 'not_found',
       detail: `The requested template ${f.template ?? ''}`.trim() + ' was not found.',
-      action: 'Run ours-fleet init to seed missing file-backed presets, then run ours-fleet template list.',
+      action: 'Run interactive ours-fleet init to review and create a complete default setup, then run ours-fleet template list.',
     };
     case 'template_mismatch': return {
       legacy: `template ${f.requested ?? 'requested-template'} does not match room ${f.room ?? 'requested-room'}'s provisioned template ${f.provisioned ?? 'recorded-template'}`,
@@ -702,7 +702,7 @@ export function registerTemplateCommands(parent: Command, cOpt: (cmd: Command) =
           return;
         }
         if (!templates.length) {
-          console.log('No templates configured. Run ours-fleet init to seed missing file-backed presets.');
+          console.log('No templates configured. Run interactive ours-fleet init to review and create a complete default setup.');
           return;
         }
         for (const t of templates) {
