@@ -17,7 +17,7 @@ export interface FailureEvidence {
   httpStatus?: number;
   model?: string;
   confidence: 'low' | 'medium' | 'high';
-  source: 'claude-pane' | 'acp' | 'auth-proxy';
+  source: 'claude-pane' | 'acp' | 'codex-app-server' | 'auth-proxy';
   observedAt: string;
 }
 

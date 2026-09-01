@@ -3,6 +3,7 @@ import { lstatSync } from 'node:fs';
 
 import { ConfigError, ROLE_NAME_RE } from '../config.js';
 import type { ResolvedRole } from '../config.js';
+import { sessionBackendCapabilities } from '../session/types.js';
 import { parseDuration } from '../duration.js';
 
 export interface LoopConfig {
@@ -116,8 +117,8 @@ export function resolveLoops(
       throw new ConfigError(`${where}: jitter must be less than interval and no more than 1h`);
     const prompt = normalizePrompt(value.prompt, `${where}: prompt`);
     if (enabled) for (const role of selected) {
-      if (role.session !== 'acp')
-        throw new ConfigError(`${where} selects role '${role.name}' with session '${role.session}'; scheduled loops require session: acp`);
+      if (!sessionBackendCapabilities(role.session, role.harness).promptInput)
+        throw new ConfigError(`${where} selects role '${role.name}' with session '${role.session}'; scheduled loops require managed prompt input`);
     }
     const promptHash = digest(prompt);
     const resolved: ResolvedLoop = {

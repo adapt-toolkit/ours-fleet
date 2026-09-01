@@ -108,7 +108,7 @@ const passthrough = (cmd: string, args: string[]) =>
 
 const program = new Command()
   .name('ours-fleet')
-  .description('Fleet of persistent, identity-bound AI agents — canonical Brain + Role definitions over ACP sessions.')
+  .description('Fleet of persistent, identity-bound AI agents over provider-neutral managed sessions.')
   .enablePositionalOptions()
   .exitOverride()
   .version(VERSION);
@@ -180,8 +180,8 @@ const MAX_OWNER_UPDATE_BYTES = 1_024;
 
 function ownerChannelStateDir(roleName: string, configuration?: string): string {
   const role = findRole(loadConfig(configuration), roleName);
-  if (role.session !== 'acp')
-    throw new Error(`role '${roleName}' uses session '${role.session}', but owner-channel management requires ACP`);
+  if (role.session !== 'acp' && role.session !== 'codex-app-server')
+    throw new Error(`role '${roleName}' uses session '${role.session}', but owner-channel management requires managed control`);
   if (!role.owner_channel)
     throw new Error(`role '${roleName}' has no owner_channel configured`);
   const stateDir = acpStateDir(roleName);
@@ -555,7 +555,7 @@ cOpt(program.command('status <name>').description('declared persistent Agent uni
           // (FLEET-002). Say which question each field answers.
           console.log(describeSessionState(snapshot.readiness, snapshot.activity));
         }
-      } catch { console.log('session: acp control unavailable'); }
+      } catch { console.log('managed session control unavailable'); }
     }
     // Loop health is asked of the live manager first: when its state writes are
     // failing it is the ONLY source that can say so — the stored file is frozen
@@ -692,12 +692,13 @@ cOpt(loopsCommand.command('status [role] [loop]').description('show live or stor
     } catch (error) { loopFailure(error, opts.json === true); }
   });
 
-cOpt(loopsCommand.command('reload <role>').description('reload trusted scheduled-loop config in a live ACP role'))
+cOpt(loopsCommand.command('reload <role>').description('reload trusted scheduled-loop config in a live managed role'))
   .option('--json', 'emit stable JSON')
   .action(async (roleName, opts) => {
     try {
       const { role } = selectLoopConfig(opts.configuration, roleName);
-      if (role.session !== 'acp') throw new Error(`role '${roleName}' is not ACP-compatible`);
+      if (role.session !== 'acp' && role.session !== 'codex-app-server')
+        throw new Error(`role '${roleName}' has no managed session control`);
       const stateDir = permanentLoopControlDir(roleName);
       if (!stateDir) throw new SessionControlError('control-unavailable',
         `role '${roleName}' has no live authenticated ACP control socket`);
@@ -721,7 +722,8 @@ for (const command of ['run-now', 'disable', 'enable'] as const) {
     .action(async (roleName, loopName, opts) => {
       try {
         const { role, definitions } = selectLoopConfig(opts.configuration, roleName, loopName);
-        if (role.session !== 'acp') throw new Error(`role '${roleName}' is not ACP-compatible`);
+        if (role.session !== 'acp' && role.session !== 'codex-app-server')
+          throw new Error(`role '${roleName}' has no managed session control`);
         const definition = definitions.find(loop => loop.name === loopName)!;
         if (command === 'enable' && !definition.enabled)
           throw new Error(`loop '${loopName}' is disabled in YAML; edit the config before enabling it`);

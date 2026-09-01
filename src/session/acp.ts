@@ -18,7 +18,8 @@ import type {
 } from './conversation-types.js';
 import { SessionEvents } from './events.js';
 import {
-  ACP_CANCEL_DEADLINE_EXCEEDED, SessionControlError, classifyChildExit, turnResult,
+  ACP_CANCEL_DEADLINE_EXCEEDED, SessionControlError, classifyChildExit,
+  sessionBackendCapabilities, turnResult,
 } from './types.js';
 import type {
   ConversationHandlePage, ExitRecord, InterruptOutcome, PermissionDecision, PromptDelivery,
@@ -235,6 +236,8 @@ export function runtimeSelector(
 
 export interface AcpSessionOptions {
   name: string;
+  /** Harness identity used only for honest optional capability reporting. */
+  harness?: string;
   argv: string[];
   cwd: string;
   env: Record<string, string>;
@@ -300,6 +303,7 @@ export function classifyStopReason(stopReason: string | undefined): TurnOutcome 
  */
 export class AcpSession implements AgentSession {
   readonly backend = 'acp' as const;
+  readonly capabilities;
   readonly pid: number;
 
   private readonly child: ChildProcessWithoutNullStreams;
@@ -327,7 +331,7 @@ export class AcpSession implements AgentSession {
   private queueDepth = 0;
   private exit: ExitRecord | null = null;
   private steeringSupported = false;
-  private capabilities?: acp.AgentCapabilities;
+  private agentCapabilities?: acp.AgentCapabilities;
   private runtimeModel?: RuntimeSelectorMetadata;
   private reasoningEffort?: RuntimeSelectorMetadata;
   private controllerCount = 0;
@@ -371,6 +375,7 @@ export class AcpSession implements AgentSession {
     this.child = child;
     this.connection = connection;
     this.pid = child.pid ?? -1;
+    this.capabilities = sessionBackendCapabilities('acp', options.harness);
     this.events = new SessionEvents(join(options.stateDir, '.session-events.jsonl'));
     this.conversation = new ConversationEventStore(join(options.stateDir, '.conversation'), {
       roleId: options.name, log: line => options.log(`[${options.name}] ${line}`),
@@ -1119,7 +1124,7 @@ export class AcpSession implements AgentSession {
       this.settlePendingAutomatically(permissionId, pending, 'cancelled', undefined,
         'the session closed while this request was pending');
     this.releaseAllTools();
-    if (this.sessionId && this.capabilities?.sessionCapabilities?.close != null) {
+    if (this.sessionId && this.agentCapabilities?.sessionCapabilities?.close != null) {
       await this.connection.agent.request(
         acp.methods.agent.session.close, { sessionId: this.sessionId }).catch(() => undefined);
     }
@@ -1148,7 +1153,7 @@ export class AcpSession implements AgentSession {
     if (initialized.protocolVersion !== acp.PROTOCOL_VERSION)
       throw new Error(
         `ACP protocol mismatch: agent selected ${initialized.protocolVersion}, client supports ${acp.PROTOCOL_VERSION}`);
-    this.capabilities = initialized.agentCapabilities;
+    this.agentCapabilities = initialized.agentCapabilities;
     const steering = initialized._meta?.steering;
     this.steeringSupported = steering !== null && typeof steering === 'object'
       && (steering as { supported?: unknown }).supported === true;
@@ -1157,7 +1162,7 @@ export class AcpSession implements AgentSession {
       ? readFileSync(this.sessionFile, 'utf8').trim()
       : '';
     let advertisedConfigOptions: acp.SessionConfigOption[] | null | undefined;
-    if (persisted && this.capabilities?.sessionCapabilities?.resume != null) {
+    if (persisted && this.agentCapabilities?.sessionCapabilities?.resume != null) {
       const resumed = await this.connection.agent.request(acp.methods.agent.session.resume, {
         sessionId: persisted,
         cwd: this.options.cwd,
@@ -1166,7 +1171,7 @@ export class AcpSession implements AgentSession {
       advertisedConfigOptions = resumed.configOptions;
       this.captureRuntimeMetadata(advertisedConfigOptions);
       this.sessionId = persisted;
-    } else if (persisted && this.capabilities?.loadSession) {
+    } else if (persisted && this.agentCapabilities?.loadSession) {
       // `session/load` replays prior history as ordinary updates before the
       // response; those records carry `agent_replay` provenance, never `agent`.
       this.replaying = true;

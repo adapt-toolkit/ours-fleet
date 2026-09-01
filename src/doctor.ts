@@ -589,6 +589,23 @@ export async function doctor(
         : `${command} not found or failed — install the ACP adapter or set session_options.acp.command`,
     });
   }
+  for (const role of roles.filter(role => role.session === 'codex-app-server')) {
+    const configured = role.session_options?.codex_app_server?.command;
+    const launcher = (role.harness_options as { launcher?: string } | undefined)?.launcher;
+    const command = Array.isArray(configured)
+      ? configured[0]
+      : typeof configured === 'string'
+        ? configured.trim().split(/\s+/)[0]
+        : launcher === 'ours-codex' ? 'ours-codex' : 'codex';
+    const result = await exec('sh', ['-c', 'command -v "$1" >/dev/null 2>&1', 'sh', command]);
+    checks.push({
+      name: `codex-app-server: ${role.name}`,
+      ok: result.code === 0,
+      detail: result.code === 0
+        ? `${command} available`
+        : `${command} not found — install Codex CLI or set session_options.codex_app_server.command`,
+    });
+  }
 
   return { ok: checks.every(c => c.ok), checks };
 }

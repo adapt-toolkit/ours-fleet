@@ -181,15 +181,18 @@ export class FleetQueryService {
     role: RoleRecord, dir: string | undefined, supervisor: 'running' | 'stopped' | 'unknown',
   ): Promise<RoleStatus['session']> {
     const intended = role.configuredBackend;
-    if (intended === 'acp' && dir) {
+    if (intended && dir) {
       try {
         const response = await this.control(dir, { command: 'snapshot' }, 2_000);
         if (!response.ok) throw new SessionControlError(response.kind ?? 'backend', response.error ?? 'snapshot failed');
         const snapshot = response.result as SessionSnapshot & {
           protocolVersion?: number; features?: string[];
         };
+        if (snapshot.backend !== intended)
+          throw new SessionControlError('backend',
+            `live session reports backend '${String(snapshot.backend)}', expected '${intended}'`);
         return {
-          backend: 'acp', reachability: snapshot.alive ? 'online' : 'offline',
+          backend: intended, reachability: snapshot.alive ? 'online' : 'offline',
           readiness: snapshot.readiness, evidence: 'authoritative',
           sessionId: snapshot.sessionId, lastError: snapshot.lastError,
           pendingPermissionId: snapshot.pendingPermissionId,
@@ -202,7 +205,7 @@ export class FleetQueryService {
         const failure = error instanceof SessionControlError ? error.kind : 'backend';
         const offline = failure === 'offline';
         return {
-          backend: 'acp',
+          backend: intended,
           reachability: offline ? 'offline'
             : failure === 'control-unavailable' ? 'unavailable' : 'unknown',
           readiness: offline ? 'failed' : 'unknown',

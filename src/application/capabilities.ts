@@ -1,4 +1,5 @@
 import type { RoleRecord, RoleCapabilities, RoleStatus } from './types.js';
+import { sessionBackendCapabilities } from '../session/types.js';
 
 export interface CapabilityContext {
   controlProtocolVersion?: number;
@@ -7,9 +8,11 @@ export interface CapabilityContext {
 export function roleCapabilities(
   role: RoleRecord, status: RoleStatus, context: CapabilityContext = {},
 ): RoleCapabilities {
-  const backend = role.configuredBackend ?? (role.detectedBackend === 'acp' ? 'acp' : undefined);
+  const backend = role.configuredBackend
+    ?? (role.detectedBackend === 'acp' || role.detectedBackend === 'codex-app-server'
+      ? role.detectedBackend : undefined);
   const online = status.session.reachability === 'online';
-  const acp = backend === 'acp';
+  const session = backend ? sessionBackendCapabilities(backend, role.config?.harness) : undefined;
   const protocolVersion = context.controlProtocolVersion ?? 1;
   const inactive = status.overall === 'offline'
     || (!online && status.supervisor.liveness === 'stopped');
@@ -18,11 +21,20 @@ export function roleCapabilities(
     inventory: true,
     status: true,
     output: {
-      recent: acp, stream: acp && protocolVersion >= 2,
-      structured: acp, replayCursor: acp && protocolVersion >= 2,
+      recent: Boolean(session?.streaming),
+      stream: Boolean(session?.streaming) && protocolVersion >= 2,
+      structured: Boolean(session?.durableConversation),
+      replayCursor: Boolean(session?.durableConversation) && protocolVersion >= 2,
     },
-    input: { text: online && acp, interrupt: online && acp, steering: false },
-    permissions: { observe: acp, respond: acp && online },
+    input: {
+      text: online && Boolean(session?.promptInput),
+      interrupt: online && Boolean(session?.interrupt),
+      steering: online && Boolean(session?.steering),
+    },
+    permissions: {
+      observe: Boolean(session?.permissions),
+      respond: online && Boolean(session?.permissions),
+    },
     lifecycle: {
       start: role.lifetime === 'permanent' && status.supervisor.liveness !== 'running',
       stop: role.lifetime === 'permanent' && !inactive && status.supervisor.liveness !== 'stopped',

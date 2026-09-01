@@ -9,10 +9,13 @@ import {
 import {
   MARKDOWN_MAX_BYTES, MARKDOWN_MAX_CODE_POINTS, markdownCode, markdownProse,
 } from './rooms-tasks/markdown.js';
+import type { SessionBackendId } from './config.js';
 
 export type FleetCommandDecision = 'allow' | 'deny' | 'unsupported';
 export type FleetCommandOutcomeClass =
   | 'success' | 'validation' | 'denied' | 'runtime' | 'timeout' | 'proxy' | 'delivery';
+
+const SESSION_BACKENDS = new Set<SessionBackendId>(['acp', 'codex-app-server']);
 
 export class FleetCliExit extends Error {
   constructor(readonly exitCode: number, readonly outcomeClass: FleetCommandOutcomeClass = 'runtime',
@@ -23,7 +26,7 @@ export class FleetCliExit extends Error {
 
 export type FleetAuditPresentation =
   | { kind: 'agent_started'; eventId: string; id: string; name: string; lifetime: 'permanent' | 'temporary'; brain: string;
-      role: string; harness: string; session: 'acp'; model?: string; permissions?: string;
+      role: string; harness: string; session: SessionBackendId; model?: string; permissions?: string;
       parent: string; actionId: string; inherited: string[];
       configuration?: AgentLaunchConfiguration }
   | { kind: 'task'; operation: 'create' | 'start' | 'work' | 'block' | 'unblock' | 'review'
@@ -374,7 +377,7 @@ function validConfiguration(value: unknown): value is AgentLaunchConfiguration {
   return exact(c, ['version', 'template', 'role', 'brain', 'harness', 'session', 'model',
     'effort', 'mission', 'approval', 'filesystem', 'unattended', 'permissionMode', 'monitor', 'isolation'])
     && c.version === 1 && origin(c.role) && origin(c.brain)
-    && text(c.harness, 64) && c.session === 'acp'
+    && text(c.harness, 64) && SESSION_BACKENDS.has(c.session as SessionBackendId)
     && (c.model === null || text(c.model, 160))
     && (c.template === undefined || text(c.template, 160))
     && (c.effort === undefined || text(c.effort, 32))
@@ -419,7 +422,8 @@ function validPresentation(value: unknown): value is FleetAuditPresentation {
   if (p.kind === 'agent_started') return exact(p, ['kind', 'eventId', 'id', 'name', 'lifetime', 'brain', 'role',
     'harness', 'session', 'model', 'permissions', 'parent', 'actionId', 'inherited', 'configuration'])
     && safe(p.eventId) && safe(p.id) && safe(p.name) && ['permanent', 'temporary'].includes(String(p.lifetime))
-    && text(p.brain) && text(p.role) && safe(p.harness) && p.session === 'acp' && safe(p.parent) && safe(p.actionId)
+    && text(p.brain) && text(p.role) && safe(p.harness)
+    && SESSION_BACKENDS.has(p.session as SessionBackendId) && safe(p.parent) && safe(p.actionId)
     && (p.model === undefined || text(p.model)) && (p.permissions === undefined || text(p.permissions))
     && Array.isArray(p.inherited) && p.inherited.every(text) && configured(p);
   if (p.kind === 'task') return exact(p, ['kind', 'operation', 'eventId', 'id', 'title', 'previousState',

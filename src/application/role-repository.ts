@@ -4,6 +4,7 @@ import { parse } from 'yaml';
 import {
   loadConfig, resolveMonitorConfig, resolvePermissions, ROLE_NAME_RE,
   type ResolvedRole, type RoleConfig,
+  type SessionBackendId,
 } from '../config.js';
 import { agentsRoot, tmpRoot } from '../paths.js';
 import type { RoleRecord, ResolvedRoleView, Problem } from './types.js';
@@ -15,8 +16,9 @@ export interface RoleRepositoryOptions {
   configPath?: string;
   permanentRoot?: string;
   temporaryRoot?: string;
-  probeBackend?: (name: string, intended?: 'acp') => Promise<{
-    acp: boolean;
+  probeBackend?: (name: string, intended?: SessionBackendId) => Promise<{
+    acp?: boolean;
+    backend?: SessionBackendId;
   }>;
   concurrency?: number;
   timeoutMs?: number;
@@ -60,9 +62,11 @@ function snapshot(path: string, name: string): { role?: ResolvedRole; problem?: 
     if (!raw || typeof raw !== 'object') throw new Error('snapshot must be a mapping');
     if ((raw.session as string | undefined) === 'tmux') throw new Error(
       'session: tmux is no longer supported; use session: acp with the Codex or Claude Code adapter');
-    if (raw.session !== undefined && raw.session !== 'acp')
-      throw new Error(`unsupported session '${String(raw.session)}'; expected session: acp`);
-    const session = 'acp' as const;
+    if (raw.session !== undefined && raw.session !== 'acp'
+        && raw.session !== 'codex-app-server')
+      throw new Error(
+        `unsupported session '${String(raw.session)}'; expected session: acp or codex-app-server`);
+    const session: SessionBackendId = raw.session ?? 'acp';
     return {
       role: {
         ...raw, name, harness: typeof raw.harness === 'string' ? raw.harness : 'claude-code',
@@ -174,14 +178,15 @@ export class RoleRepository {
     } catch { return undefined; }
   }
 
-  private async detect(name: string, intended?: 'acp'): Promise<RoleRecord['detectedBackend']> {
+  private async detect(name: string, intended?: SessionBackendId): Promise<RoleRecord['detectedBackend']> {
     if (!this.options.probeBackend) return intended ?? 'none';
     const timeoutMs = this.options.timeoutMs ?? 2_000;
-    const result = await Promise.race([
+    const result: { acp?: boolean; backend?: SessionBackendId } = await Promise.race([
       this.options.probeBackend(name, intended),
-      new Promise<{ acp: boolean }>(resolve =>
+      new Promise<{ acp?: boolean; backend?: SessionBackendId }>(resolve =>
         setTimeout(() => resolve({ acp: false }), timeoutMs)),
-    ]).catch(() => ({ acp: false }));
+    ]).catch(() => ({ acp: false } as { acp?: boolean; backend?: SessionBackendId }));
+    if (result.backend) return result.backend;
     if (result.acp) return 'acp';
     return 'none';
   }

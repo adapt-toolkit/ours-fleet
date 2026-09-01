@@ -305,6 +305,27 @@ describe('loadConfig', () => {
     expect(() => loadConfig()).toThrow(/tmux is no longer supported.*session: acp/);
   });
 
+  it('accepts native Codex app-server sessions and their exact command override', () => {
+    base([
+      'roles:',
+      '  Native:',
+      '    harness: codex',
+      '    session: codex-app-server',
+      '    session_options:',
+      '      codex_app_server:',
+      '        command: [codex, app-server]',
+      '',
+    ].join('\n'));
+    const native = findRole(loadConfig(), 'Native');
+    expect(native.session).toBe('codex-app-server');
+    expect(native.session_options?.codex_app_server?.command).toEqual(['codex', 'app-server']);
+  });
+
+  it('rejects the Codex-native backend for another harness', () => {
+    base('roles:\n  Wrong:\n    harness: claude-code\n    session: codex-app-server\n');
+    expect(() => loadConfig()).toThrow(/codex-app-server requires harness: codex/);
+  });
+
   it('merges common permission intent and ACP command settings', () => {
     base([
       'defaults:',

@@ -8,7 +8,7 @@ harnesses — from one declarative file.**
 An AI coding agent in a terminal dies when you close the laptop. `ours-fleet`
 turns such sessions into **roles**: long-lived agents that
 
-- **run through structured ACP sessions** behind a shared Codex/Claude Code
+- **run through structured managed sessions** behind one provider-neutral
   agent-session interface, which you can inspect or prompt,
 - are **supervised** — systemd (Linux) or launchd (macOS) restarts them on crash
   and brings them back after a reboot,
@@ -37,7 +37,7 @@ brain: { inline: { harness: claude-code, session: acp } }
 
 # ~/fleet/agents/Prototyper.yaml
 role: { inline: { mission: Build prototypes } }
-brain: { inline: { harness: codex, session: acp } }
+brain: { inline: { harness: codex, session: codex-app-server } }
 ```
 
 ## How it works
@@ -46,7 +46,7 @@ brain: { inline: { harness: codex, session: acp } }
 ~/fleet.yaml + ~/fleet/{agents,agent_templates,roles,brains,room_templates}/*.yaml   your declaration
         │  ours-fleet up
         ▼
-briefing.md per role  ──►  agent session adapter  ──►  ACP client/session  ──►  ACP agent
+briefing.md per role  ──►  agent session adapter  ──►  native app-server or ACP transport
         ▲                        │
  systemd --user / launchd ───────┘   restart on crash, start at boot/login
 ```
@@ -72,7 +72,7 @@ The state dir contract:
 | `.owner-channel-message-recovery.json` | owner-channel bridge | mode-0600 body-free message claim journal: wire ID, history sequence, and claim time only |
 | `.owner-channel-attachment-recovery.json` | owner-channel bridge | mode-0600 attachment route journal; never filenames, paths, transcript text, or bytes |
 | `.owner-channel-binder.lock/`, `.owner-channel-binder.json` | owner-channel supervisor | mode-0600 role/identity + PID/start-marker ownership and release metadata; never mail plaintext or credentials |
-| `.session-events.jsonl`, `.control.sock`, `.control-token` | ACP backend | bounded typed console projection and private attachment control |
+| `.session-events.jsonl`, `.control.sock`, `.control-token` | managed session backend | bounded typed console projection and private attachment control |
 
 ## Prerequisites
 
@@ -95,11 +95,12 @@ ours-fleet init      # interactive reviewed defaults + host setup
 ours-fleet doctor    # verifies everything above, with actionable messages
 ```
 
-The maintained Codex and Claude ACP adapters install as optional dependencies of
-`ours-fleet` and are resolved internally; users do not install adapter commands
-or add them to `PATH`. An explicit `session_options.acp.command` remains
-available for custom adapters. On Node 20–21, Codex ACP remains available,
-while maintained Claude ACP requires upgrading to Node 22.
+Native Codex roles use the logged-in Codex CLI's `app-server` command directly.
+The maintained Codex and Claude ACP adapters remain bundled optional dependencies
+and are resolved internally; users do not install adapter commands or add them to
+`PATH`. Explicit `session_options.codex_app_server.command` and
+`session_options.acp.command` overrides remain available. On Node 20–21, native
+Codex and Codex ACP remain available, while maintained Claude ACP requires Node 22.
 
 Each OS user manages their own fleet — to host roles under a sandboxed account,
 become that account and repeat.
@@ -130,7 +131,7 @@ ours-fleet spawn Coder --brain codex-fleet --role developer \
   --approval ask --filesystem workspace --coordinator FleetCoordinator
 ```
 
-Inside a managed ACP role, `ours-fleet spawn` is transparently routed through
+Inside a managed role, `ours-fleet spawn` is transparently routed through
 that role's live supervisor. `ours-fleet spawn DeveloperX --temp` is the
 minimal form: omitted Brain/Role selections, cwd, coordinator, neutral permissions,
 and fleet monitor policy inherit from the caller. Identity, environment, owner routing,
@@ -403,13 +404,13 @@ Additional operational field inventory (schematic, not one YAML document):
         - file_received                 #   local_contact_request, pending_message)
       batch_ms: 2000                    # coalesce a burst into one line (default 2000)
       inject: notification              # notification (default) | full (bodies inline; roadmap)
-    owner_channel:                      # optional trusted owner ingress; requires session: acp
+    owner_channel:                      # optional trusted owner ingress; requires a managed session
       identity: "Name Owner Channel"     # dedicated identity; fleet creates it with safe local defaults
       owners: [owner-contact-cid]        # authenticated ours contact IDs, never display names
       agent: managed-agent-cid           # exact role CID allowed to relay messages/files outward
       interrupt: false                  # false queues; true cancels current work first
       progress_interval_ms: 30000        # fleet-generated progress notices; 0 disables
-      comments: true                    # relay live "🟡 Live update:" ACP commentary (default true);
+      comments: true                    # relay live "🟡 Live update:" structured commentary (default true);
                                         #   restart baseline for /comments on|off
       attachments:                      # secure inbound documents, images, and voice
         enabled: true
@@ -429,13 +430,10 @@ Additional operational field inventory (schematic, not one YAML document):
       # mem_palace: false                      # claude-code: disable memory plugin
       # permission_mode: dontAsk               # claude-code: launch permission mode —
       #   one of default | acceptEdits | plan | dontAsk | bypassPermissions
-      # sandbox: workspace-write                # codex: --sandbox —
-      #   one of read-only | workspace-write | danger-full-access
-      # approval: never                         # codex: --ask-for-approval —
-      #   one of untrusted | on-request | never
-      # permission_mode: never                  # codex alias for approval
+      # Codex ACP compatibility only: native codex-app-server rejects Codex
+      # permission overrides here; use the common permissions block above.
       # launcher: auto                          # codex: auto | ours-codex | codex
-      # profile: fleet                          # codex: $CODEX_HOME/fleet.config.toml
+      # profile: fleet                          # codex ACP only: $CODEX_HOME/fleet.config.toml
       # search: true                            # codex: enable --search (live web search)
       # add_dirs: [/data/shared]                # codex: repeat --add-dir
       # monitor: true                           # explicit persistent consent to arm mail wake
@@ -584,7 +582,7 @@ optional `rooms.owner.provider` setting is separate and defaults to
 ### Scheduled agent loops
 
 Top-level `loops` schedule literal prompts from trusted local YAML. Enabled targets
-must use `session: acp`; temporary roles never inherit loops, including `roles:
+must use a managed session (`acp` or `codex-app-server`); temporary roles never inherit loops, including `roles:
 ["*"]`. Fleet rejects an enabled loop when its explicitly selected base config is
 a symlink, is owned by another user, or is group/world writable. Prompts are
 bounded and normalized at validation time, but only their size and SHA-256 appear
@@ -671,11 +669,13 @@ native settings actually grant, against a fixed floor:
 those requests with nobody to see it. With `unattended: wait` it **warns**,
 since a human can still attach a console and answer.
 
-**Security meaning.** `ask` maps to Codex `untrusted` / Claude `default`.
-`auto` selects Codex ACP `agent` (`on-request` + `workspace-write`) / Claude
-`acceptEdits`. `allow` selects Codex ACP's fully non-interactive yolo mode,
-reported by the adapter as `agent-full-access` (`never` +
-`danger-full-access`); Claude uses `bypassPermissions`.
+**Security meaning.** For native Codex, Fleet translates `ask` → `untrusted`,
+`auto` → `on-request`, and `allow` → `never`; users configure only the Fleet
+names. `permissions.filesystem` independently maps `read-only` → `read-only`,
+`workspace` → `workspace-write`, and `unrestricted` → `danger-full-access`.
+Claude maps `ask` to `default`, `auto` to `acceptEdits`, and `allow` to
+`bypassPermissions`. Codex ACP retains its adapter-specific coupled modes:
+`auto` selects `agent`, while `allow` selects `agent-full-access`.
 `dontAsk` suppresses only the *prompt*, not the denial, which is why an
 `allow` role previously ran unable to do its job. Legacy `deny` is accepted
 only for compatibility and retains its conservative Codex `on-request` /
@@ -1127,18 +1127,45 @@ The main Codex controls are Brain-owned and also available when spawning:
 ```yaml
 # ~/fleet/brains/codex-review.yaml
 harness: codex
-session: acp
+session: codex-app-server
 model: gpt-5.4
+permissions:
+  approval: auto
+  filesystem: read-only
+  unattended: deny
 harness_options:
   launcher: auto
-  profile: fleet
-  sandbox: read-only
-  approval: on-request
   monitor: true
   search: true
   add_dirs: [/data/shared]
   config: { model_reasoning_effort: high }
 ```
+
+`codex-app-server` is the opt-in direct Codex transport. It streams native items
+and message phases, maps Codex approval
+requests into Fleet permissions, supports turn steering/interrupt, and resumes
+the durable Codex thread through Fleet's shared `.session-id` lifecycle.
+Configure its authority only through the shared `permissions:` block;
+`on-request` and other Codex policy names are internal adapter values.
+Codex rejects `--profile` for `app-server`, so native roles also reject
+`harness_options.profile`; use the explicit config map only for non-authority
+settings. Native config currently allows only `model_reasoning_effort`; Codex ACP
+retains its legacy profile and config support.
+Packaged Codex brains and the init wizard continue to select `session: acp` for
+compatibility; Claude Code also uses ACP. Existing durable sessions are not assumed portable
+between unrelated providers; a failed fast resume is handled by Fleet's normal
+bounded fresh-session recovery.
+
+To replace the default launcher for a native Codex role:
+
+```yaml
+session_options:
+  codex_app_server:
+    command: [codex, app-server]
+```
+
+The command override is exact: Fleet does not append `--profile`, `--search`, or
+`app-server`, so include every required argument in the command itself.
 
 One-off/permanent spawn selects a Brain that owns model, reasoning, native permission,
 sandbox, profile, launcher, search, monitor consent, native config, and additional roots.

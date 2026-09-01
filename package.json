@@ -1,7 +1,7 @@
 {
   "name": "@ours.network/fleet",
   "version": "1.0.5",
-  "description": "Harness-agnostic fleet of persistent, identity-bound AI agents. Declarative fleet.yaml, ACP sessions, supervision, and ours.network messaging.",
+  "description": "Harness-agnostic fleet of persistent, identity-bound AI agents. Declarative fleet.yaml, managed native/ACP sessions, supervision, and ours.network messaging.",
   "type": "module",
   "license": "FSL-1.1-Apache-2.0",
   "repository": {

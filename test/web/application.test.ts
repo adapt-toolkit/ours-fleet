@@ -112,6 +112,23 @@ identity: Temp
     expect(caps.input.text).toBe(true);
   });
 
+  it('exposes native Codex steering through the neutral capability contract', () => {
+    const caps = roleCapabilities({
+      id: 'Native', lifetime: 'permanent', configured: true, stateHealth: 'present',
+      configuredBackend: 'codex-app-server', detectedBackend: 'codex-app-server',
+      compatibility: { compatible: true }, problems: [], config: { harness: 'codex' },
+    }, {
+      roleId: 'Native', observedAt: new Date().toISOString(), overall: 'ready',
+      supervisor: { backend: 'none', liveness: 'running', detail: 'running' },
+      session: { backend: 'codex-app-server', reachability: 'online', readiness: 'idle', evidence: 'authoritative' },
+      restart: { circuit: 'closed', consecutiveImmediateFailures: 0, nextDelayMs: 0 },
+      monitor: { mode: 'unknown', health: 'unknown', stale: true },
+      isolation: { degraded: false }, problems: [],
+    });
+    expect(caps.input).toMatchObject({ text: true, interrupt: true, steering: true });
+    expect(caps.permissions).toMatchObject({ observe: true, respond: true });
+  });
+
   for (const flow of [
     { lifetime: 'permanent', session: 'acp', harness: 'codex', check: false, probe: 'ready' },
     { lifetime: 'permanent', session: 'acp', harness: 'claude-code', check: false, probe: 'attention' },

@@ -5,6 +5,7 @@ import {
   loadConfig, NOTIFY_EVENT_TYPES, resolveMonitorConfig,
   resolvePermissions, ROLE_NAME_RE, validateMonitorConfig,
   type CommonPermissions, type MonitorConfig, type MonitorInterrupt, type NotifyEventType,
+  type SessionBackendId,
 } from '../config.js';
 import {
   daemonIdentityProvisioner,
@@ -70,7 +71,7 @@ export type IdentityPreflight = 'verified' | 'missing' | 'unknown';
 export interface CreationPreview {
   request: CreateRoleSessionRequest;
   effective: {
-    name: string; identity: string; harness: string; session: 'acp';
+    name: string; identity: string; harness: string; session: SessionBackendId;
     model?: string; reasoningEffort?: string; cwd?: string; lifetime: 'permanent' | 'temporary';
     permissions: CommonPermissions;
     monitor: MonitorConfig;
@@ -98,7 +99,7 @@ export interface CreationAction {
   actionId: string;
   requestHash: string;
   roleId: string;
-  session: 'acp';
+  session: SessionBackendId;
   lifetime: 'permanent' | 'temporary';
   state: CreationStage;
   stages: Array<{ stage: CreationStage; at: string; detail?: string }>;
@@ -121,7 +122,7 @@ export interface RoleCreationServiceOptions {
   tempLauncher?: SupervisorLauncher;
   allowedCwdRoots?: string[];
   journalDir?: string;
-  probeReady?: (name: string, session: 'acp') => Promise<'ready' | 'attention' | 'unknown'>;
+  probeReady?: (name: string, session: SessionBackendId) => Promise<'ready' | 'attention' | 'unknown'>;
   onProgress?: (action: CreationAction) => void;
   /** Direct/managed callers must not create or restore the web action journal. */
   journal?: boolean;
@@ -411,7 +412,7 @@ export class RoleCreationService {
   }
 
   private async waitForReady(
-    role: string, session: 'acp',
+    role: string, session: SessionBackendId,
   ): Promise<'ready' | 'attention' | 'unknown'> {
     if (!this.options.probeReady) return 'unknown';
     for (let attempt = 0; attempt < 20; attempt++) {

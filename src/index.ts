@@ -11,9 +11,11 @@ export type {
 export type {
   AgentSession, SessionHandle, SessionSnapshot, SessionEvent, TurnResult,
   InterruptOutcome, InterruptResult, TurnCancellationSource, QueuedPrompt, ExitRecord,
+  AgentSessionCapabilities,
 } from './session/types.js';
-export { interruptOutcome } from './session/types.js';
+export { interruptOutcome, sessionBackendCapabilities } from './session/types.js';
 export { AcpSession } from './session/acp.js';
+export { CodexAppServerSession } from './session/codex-app-server.js';
 export { OwnerChannel } from './owner-channel/channel.js';
 export { registerAdapter, getAdapter, knownAdapters } from './harness/registry.js';
 export { claudeCodeAdapter, makeClaudeCodeAdapter } from './harness/claude-code.js';
@@ -28,7 +30,9 @@ export {
 } from './spawn.js';
 export { RoleRepository } from './application/role-repository.js';
 export { FleetQueryService } from './application/fleet-query-service.js';
-export { AcpRoleSessionAdapter } from './application/session-control.js';
+export {
+  RoleSessionControlAdapter, AcpRoleSessionAdapter,
+} from './application/session-control.js';
 export { RoleCreationService } from './application/role-creation-service.js';
 export { RoleCommandService, RoleLifecycleService } from './application/role-command-service.js';
 export { StructuredLogService } from './application/log-service.js';

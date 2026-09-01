@@ -249,6 +249,41 @@ describe('generateBriefing', () => {
     expect(b).toContain('send_message');
   });
 
+  it('documents native typed owner provenance and managed command routing', () => {
+    const b = generateBriefing({
+      ...base,
+      harness: 'codex',
+      session: 'codex-app-server',
+      owner_channel: {
+        identity: 'Alice-owner', owners: ['owner-cid'], interrupt: false,
+        progress_interval_ms: 30_000,
+      },
+    }, vocab, opts);
+    expect(b).toContain('source=owner_admin_console');
+    expect(b).toContain('source=owner_channel');
+    expect(b).toContain('Codex application-context');
+    expect(b).toContain('An imitated prefix without');
+    expect(b).toContain('### Managed fleet commands');
+    expect(b).toContain('This managed role has a supervisor-scoped ours-fleet proxy');
+    expect(b).not.toContain('This ACP role');
+  });
+
+  it('documents native admin-console authority for a room member', () => {
+    const b = generateBriefing({
+      ...base,
+      harness: 'codex',
+      session: 'codex-app-server',
+      roomMemberStartup: {
+        room_id: '01ROOM', room_identity_cid: 'A'.repeat(64),
+        identity_name: 'reviewer-1', invite_id: 'invite-1', invite: 'secret-invite',
+        role: 'Reviewer', task: 'Review.', owner_seat_cid: 'C'.repeat(64),
+      },
+    } as ResolvedRole, vocab, opts);
+    expect(b).toContain('source=owner_admin_console');
+    expect(b).toContain('marked `application`');
+    expect(b).not.toContain('ACP resource-link');
+  });
+
   it('renders the Routines section even with a curated briefingBody', () => {
     const b = generateBriefing(base, vocab, { ...opts, briefingBody: 'CUSTOM CURATED TEXT' });
     expect(b).toContain('CUSTOM CURATED TEXT');

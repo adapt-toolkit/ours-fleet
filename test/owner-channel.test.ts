@@ -24,7 +24,7 @@ import type {
 import { OWNER_COMMENT_LABEL, ownerNotices } from '../src/owner-channel/notices.js';
 import { MessageRecoveryState } from '../src/owner-channel/message-recovery.js';
 import {
-  ACP_CANCEL_DEADLINE_EXCEEDED, SessionControlError,
+  ACP_CANCEL_DEADLINE_EXCEEDED, CODEX_APP_SERVER_CANCEL_DEADLINE_EXCEEDED, SessionControlError,
   type SessionEvent, type SessionHandle, type TurnResult,
 } from '../src/session/types.js';
 import { VERSION } from '../src/version.js';
@@ -789,10 +789,13 @@ describe('OwnerChannel', () => {
       .every(call => !String(call.args?.text).includes('secret'))).toBe(true);
   });
 
-  it('leaves the next owner wire replayable while an ignored-cancel adapter restarts', async () => {
+  it.each([
+    ACP_CANCEL_DEADLINE_EXCEEDED,
+    CODEX_APP_SERVER_CANCEL_DEADLINE_EXCEEDED,
+  ])('leaves the next owner wire replayable while an ignored-cancel adapter restarts (%s)', async reason => {
     const recovery = setup([ownerMessage(27, 'wire-after-stubborn-turn', 'next owner turn')]);
     recovery.queuePrompt.mockRejectedValueOnce(new SessionControlError(
-      'control-unavailable', 'adapter restart detail', ACP_CANCEL_DEADLINE_EXCEEDED));
+      'control-unavailable', 'adapter restart detail', reason));
 
     await recovery.channel.drain();
 
