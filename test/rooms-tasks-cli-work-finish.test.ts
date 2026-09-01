@@ -214,6 +214,17 @@ beforeEach(() => {
       }, 0);
       return;
     }
+    if (args[0] === 'task' && args[1] === '_settle_delete') {
+      const taskId = args[2];
+      setTimeout(() => {
+        void import('../src/rooms-tasks/deletion.js').then(({ settleTaskDeletion }) =>
+          settleTaskDeletion({
+            taskId,
+            cowork: () => ({ closeRoom: mocks.closeRoom, deleteRoom: mocks.deleteRoom }),
+          }).catch(() => undefined));
+      }, 0);
+      return;
+    }
     if (args[0] !== 'task' || args[1] !== '_settle') return;
     const taskId = args[2];
     setTimeout(() => {
@@ -224,6 +235,7 @@ beforeEach(() => {
         }).catch(() => undefined));
     }, 0);
   });
+  mocks.closeManagedRoom.mockResolvedValue(undefined);
   mocks.markdownRender.mockReset();
   // The real provisionMembers ends by activating the room and the task; the
   // fake preserves exactly that contract so the CLI's state flow is exercised.
@@ -384,8 +396,11 @@ describe('canonical proxied Task/Room audit metadata', () => {
     startTask(done.task_id); activateTask(done.task_id); reviewTask(done.task_id); completeTask(done.task_id);
     beginFleetAuditCollection();
     await runLocalTask('delete', done.task_id, done.task_id, ...(json ? ['--json'] : []));
+    // The command records the truthful acceptance transition; the external
+    // worker records the deleted completion in its own audited process.
     expect(consumeFleetAuditCollection().presentations?.[0]).toMatchObject({ kind: 'task',
-      operation: 'delete', id: done.task_id, previousState: 'done', newState: 'deleted' });
+      operation: 'delete', id: done.task_id, previousState: 'done', newState: 'deleting' });
+    expect(() => getTask(done.task_id)).toThrow(/not found/);
   });
 
   it.each([false, true])('captures room create/recover/delete metadata (json=%s)', async json => {
@@ -1001,15 +1016,25 @@ describe('task delete', () => {
     expect(out.join('\n')).toContain('The two task IDs must match.');
   });
 
-  it('deletes a done task without closing a room', async () => {
+  it('deletes a done task and retires its room through the managed saga', async () => {
     const t = doneTask();
     await run('delete', t.task_id, t.task_id);
     expect(() => getTask(t.task_id)).toThrow(/not found/);
     expect(out.join('\n')).toContain('## 🗑️ Task deleted');
     expect(out.join('\n')).toContain(t.task_id);
-    expect(mocks.closeManagedRoom).not.toHaveBeenCalled();
-    expect(mocks.closeRoom).not.toHaveBeenCalled();
-    expect(getRoomRecord(ROOM_ID)).toMatchObject({ task_id: t.task_id });
+    expect(mocks.closeManagedRoom).toHaveBeenCalled();
+    expect(getRoomRecord(ROOM_ID)).toBeUndefined();
+  });
+
+  it('deletes an active task without requiring a false done transition', async () => {
+    const t = createTask({ title: 'Active work', origin: { type: 'cli' } });
+    updateTaskRoom(t.task_id, ROOM_ID, 'c'.repeat(64));
+    createRoomRecord({ room_id: ROOM_ID, room_name: 'Live room', task_id: t.task_id });
+    activateTask(t.task_id);
+    await run('delete', t.task_id, t.task_id);
+    expect(() => getTask(t.task_id)).toThrow(/not found/);
+    expect(out.join('\n')).toContain('## 🗑️ Task deleted');
+    expect(getRoomRecord(ROOM_ID)).toBeUndefined();
   });
 
   it('reports repeat deletion as an idempotent already-absent result', async () => {
@@ -1018,7 +1043,30 @@ describe('task delete', () => {
     out = [];
     mocks.markdownRender.mockClear();
     await run('delete', t.task_id, t.task_id, '--json');
-    expectExactJson({ schema_version: 1, task_id: t.task_id, deleted: false });
+    expectExactJson({ schema_version: 1, task_id: t.task_id, deleted: false, already_absent: true });
+  });
+
+  it('pins the pending shapes when cleanup cannot settle within the bounded wait', async () => {
+    const t = doneTask();
+    mocks.launchFleetWorker.mockImplementation(async () => { /* worker never completes */ });
+    vi.useFakeTimers();
+    try {
+      const pendingJson = run('delete', t.task_id, t.task_id, '--json');
+      await vi.advanceTimersByTimeAsync(61_000);
+      await pendingJson;
+      expectExactJson({
+        schema_version: 1, task_id: t.task_id, accepted: true, deleted: false, pending: true,
+      });
+      out = [];
+      const pendingHuman = run('delete', t.task_id, t.task_id);
+      await vi.advanceTimersByTimeAsync(61_000);
+      await pendingHuman;
+    } finally { vi.useRealTimers(); }
+    const text = out.join('\n');
+    expect(text).toContain('deletion was accepted and cleanup is still settling');
+    expect(text).toContain(`task recover ${t.task_id}`);
+    expect(text).not.toContain('## 🗑️ Task deleted');
+    expect(getTask(t.task_id).deletion?.status).toBe('pending');
   });
 });
 

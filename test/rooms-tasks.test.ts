@@ -10,7 +10,7 @@ import {
   createTask, getTask, listTasks, findByIdempotencyKey,
   startTask, activateTask, blockTask, unblockTask,
   reviewTask, completeTask, cancelTask, failTask,
-  deleteTask, updateTaskRoom, updateTaskMembers,
+  beginTaskDeletionIntent, unlinkDeletedTask, updateTaskRoom, updateTaskMembers,
   TaskStateError,
 } from '../src/rooms-tasks/task-state.js';
 import {
@@ -380,7 +380,8 @@ describe('task-state', () => {
     });
   });
 
-  describe('deleteTask', () => {
+  describe('task deletion (any state)', () => {
+    const cliActor = { kind: 'local_control', surface: 'cli' } as const;
     function taskInState(state: TaskState) {
       const t = createTask({ title: `${state} task`, origin, start: state === 'backlog' ? false : undefined });
       if (state === 'backlog' || state === 'provisioning') return t;
@@ -394,30 +395,30 @@ describe('task-state', () => {
     }
 
     it.each([
-      'backlog', 'provisioning', 'active', 'review', 'cancelled', 'failed',
-    ] as const)('rejects a %s task', state => {
+      'backlog', 'provisioning', 'active', 'review', 'done', 'cancelled', 'failed',
+    ] as const)('accepts deletion for a %s task and unlinks it', state => {
       const t = taskInState(state);
-      expect(() => deleteTask(t.task_id)).toThrow(
-        `cannot delete a '${state}' task; only 'done' tasks can be deleted`,
-      );
-      expect(getTask(t.task_id).state).toBe(state);
-    });
-
-    it('removes only a done task and is idempotent when repeated', () => {
-      const t = taskInState('done');
-      expect(deleteTask(t.task_id)).toBe(true);
+      expect(beginTaskDeletionIntent(t.task_id, cliActor).status).toBe('accepted');
+      expect(unlinkDeletedTask(t.task_id)).toBe(true);
       expect(() => getTask(t.task_id)).toThrow(/not found/);
-      expect(deleteTask(t.task_id)).toBe(false);
     });
 
-    it('preserves the associated room orchestration record', () => {
+    it('reports a repeat deletion as already absent', () => {
+      const t = taskInState('done');
+      beginTaskDeletionIntent(t.task_id, cliActor);
+      expect(unlinkDeletedTask(t.task_id)).toBe(true);
+      expect(unlinkDeletedTask(t.task_id)).toBe(false);
+      expect(beginTaskDeletionIntent(t.task_id, cliActor)).toEqual({ status: 'already_absent' });
+    });
+
+    it('unlink alone leaves the room orchestration record to the settlement worker', () => {
       const t = taskInState('done');
       updateTaskRoom(t.task_id, 'room-delete-preserve', 'c'.repeat(64));
       const room = createRoomRecord({
         room_id: 'room-delete-preserve', room_name: 'Archived room', task_id: t.task_id,
       });
-
-      expect(deleteTask(t.task_id)).toBe(true);
+      beginTaskDeletionIntent(t.task_id, cliActor);
+      expect(unlinkDeletedTask(t.task_id)).toBe(true);
       expect(getRoomRecord(room.room_id)).toEqual(room);
     });
 
@@ -425,7 +426,8 @@ describe('task-state', () => {
       const outside = join(dir, 'outside.json');
       writeFileSync(outside, JSON.stringify({ state: 'done' }));
 
-      expect(() => deleteTask('../outside')).toThrow(/invalid task ID/);
+      expect(() => beginTaskDeletionIntent('../outside', cliActor)).toThrow(/invalid task ID/);
+      expect(() => unlinkDeletedTask('../outside')).toThrow(/invalid task ID/);
       expect(readFileSync(outside, 'utf8')).toBe(JSON.stringify({ state: 'done' }));
     });
   });

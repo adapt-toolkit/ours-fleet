@@ -33,6 +33,8 @@ export interface OwnerFleetOps {
   closeRoom(roomId: string): Promise<void>;
   /** Resume a task terminal intent outside the caller role's supervisor lifecycle. */
   settleTask(taskId: string): Promise<void>;
+  /** Settle an accepted task deletion outside the caller role's supervisor lifecycle. */
+  settleTaskDeletion(taskId: string): Promise<void>;
   recoverTask(taskId: string): Promise<void>;
 }
 
@@ -85,7 +87,8 @@ export interface OwnerCommandContext {
   blockTask(taskId: string, reason: string): TaskRecord;
   unblockTask(taskId: string): TaskRecord;
   reviewTask(taskId: string): TaskRecord;
-  deleteTask(taskId: string): boolean;
+  /** Accept a permanent any-state deletion, acknowledge it, then launch the external delete worker. */
+  deleteTask(taskId: string): Promise<void>;
   listRoomQueries(filter?: { state?: 'active' | 'provisioning' }): ReturnType<TaskRoomApplicationService['listRooms']>;
   getRoomQuery(id: string): ReturnType<TaskRoomApplicationService['getRoomDetail']>;
   listTemplateQueries(): ReturnType<TaskRoomApplicationService['listTemplates']>;
@@ -572,11 +575,7 @@ export const ownerCommands: OwnerCommand[] = [
           case 'delete': {
             if (rest.length !== 2 || rest[0] !== rest[1])
               throw new OwnerCommandUsageError('destructive: /task delete <id> <id> — provide the task ID twice');
-            const deleted = ctx.deleteTask(rest[0]);
-            await ctx.reply(renderMarkdownResult({
-              icon: '🗑️', title: deleted ? 'Task deleted' : 'Task already absent',
-              fields: [{ label: 'ID', value: rest[0], kind: 'code' }],
-            }));
+            await ctx.deleteTask(rest[0]);
             break;
           }
           case 'recover': {
@@ -848,6 +847,9 @@ export function fleetCliOps(role: string, configPath?: string): OwnerFleetOps {
     ),
     settleTask: taskId => launchFleetWorker(
       ['task', '_settle', taskId], `task-settle-${taskId}`, configPath,
+    ),
+    settleTaskDeletion: taskId => launchFleetWorker(
+      ['task', '_settle_delete', taskId], `task-delete-${taskId}`, configPath,
     ),
     recoverTask: taskId => launchFleetWorker(
       ['task', '_recover', taskId], `task-recover-${taskId}`, configPath,

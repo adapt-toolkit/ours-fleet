@@ -11,7 +11,7 @@ import {
 } from '../rooms-tasks/room-state.js';
 import {
   activateTask, blockTask as persistBlockTask, createTask as persistTask,
-  deleteTask as persistDeleteTask, getTask as readTask, listTasks as readTasks,
+  getDeletingTask, getTask as readTask, listTasks as readTasks, taskDeletionState,
   moveTaskToList,
   reviewTask as persistReviewTask, startTask as transitionTask,
   TaskStateError, unblockTask as persistUnblockTask, updateTaskRoom, updateTaskTemplate,
@@ -37,6 +37,7 @@ import {
   type TaskDeletionSettleResult,
 } from '../rooms-tasks/deletion.js';
 import { withFileLock } from '../atomic-file.js';
+import { launchFleetWorker } from '../rooms-tasks/external-worker.js';
 import type {
   RoomOrchestrationRecord, TaskDeletionActor, TaskListRecord, TaskOrigin, TaskOutcome,
   TaskRecord, TaskState, TemplateSnapshot,
@@ -107,6 +108,9 @@ export interface TaskRoomServiceDeps {
   binPath?(): string;
   provisionMembers?: typeof provisionMembers;
   moveTaskToList?: typeof moveTaskToList;
+  launchDeletionWorker?(taskId: string): Promise<void>;
+  sleep?(ms: number): Promise<void>;
+  now?(): number;
 }
 
 function launchSelection(definition: Record<string, unknown> | undefined, key: 'brain' | 'role'): string | undefined {
@@ -261,14 +265,18 @@ export class TaskRoomApplicationService {
     return (await this.ensureTaskWork(input)).task;
   }
 
-  listTasks(filter?: { state?: TaskState | TaskState[]; list?: string }): TaskRecord[] {
+  listTasks(filter?: {
+    state?: TaskState | TaskState[]; list?: string; includeDeleting?: boolean;
+  }): TaskRecord[] {
     const listId = filter?.list === undefined ? undefined : resolveTaskList(filter.list).list_id;
-    return readTasks({ state: filter?.state, listId });
+    return readTasks({ state: filter?.state, listId, includeDeleting: filter?.includeDeleting });
   }
 
   listTaskLists(): TaskListRecord[] { return readTaskLists(); }
 
-  groupedTasks(filter?: { state?: TaskState | TaskState[]; list?: string }): Array<{
+  groupedTasks(filter?: {
+    state?: TaskState | TaskState[]; list?: string; includeDeleting?: boolean;
+  }): Array<{
     list: TaskListRecord; tasks: TaskRecord[];
   }> {
     const tasks = this.listTasks(filter);
@@ -337,10 +345,6 @@ export class TaskRoomApplicationService {
     return persistReviewTask(input.taskId);
   }
 
-  deleteTask(input: { actor: TaskRoomActor; taskId: string }): boolean {
-    return persistDeleteTask(input.taskId);
-  }
-
   private deletionActor(actor: TaskRoomActor): TaskDeletionActor {
     if (actor.kind === 'local_control') return { kind: 'local_control', surface: actor.surface };
     if (actor.kind === 'authenticated_owner')
@@ -388,6 +392,45 @@ export class TaskRoomApplicationService {
         template: undefined, agents: [] });
     }
     return result;
+  }
+
+  /**
+   * Launch the external deletion worker outside the caller's lifecycle and
+   * wait boundedly for physical absence. Timeouts and launch failures report
+   * a pending, recoverable state — never success. A concurrent worker that
+   * already removed the record reads as settled.
+   */
+  async launchTaskDeletionWorker(input: {
+    taskId: string; waitMs?: number;
+  }): Promise<{ deleted: boolean; pending: boolean; error?: string }> {
+    const launch = this.deps.launchDeletionWorker
+      ?? ((taskId: string) => launchFleetWorker(
+        ['task', '_settle_delete', taskId], `task-delete-${taskId}`, this.configurationPath));
+    const errorAtBefore = (() => {
+      try { return getDeletingTask(input.taskId).deletion?.error_at; } catch { return undefined; }
+    })();
+    try { await launch(input.taskId); }
+    catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      await recordTaskDeletionError(input.taskId, message,
+        `External delete worker failed to start. Repeat the delete request for ${input.taskId}.`,
+      ).catch(() => {});
+      return { deleted: false, pending: true, error: message };
+    }
+    const now = this.deps.now ?? Date.now;
+    const sleep = this.deps.sleep
+      ?? ((ms: number) => new Promise<void>(resolve => { setTimeout(resolve, ms); }));
+    const deadline = now() + (input.waitMs ?? 10_000);
+    while (now() < deadline) {
+      if (taskDeletionState(input.taskId) === 'absent') return { deleted: true, pending: false };
+      try {
+        const current = getDeletingTask(input.taskId).deletion;
+        if (current?.error_at !== errorAtBefore && current?.error)
+          return { deleted: false, pending: true, error: current.error };
+      } catch { /* re-checked as absence on the next iteration */ }
+      await sleep(100);
+    }
+    return { deleted: false, pending: true };
   }
 
   recordDeletionError(input: {

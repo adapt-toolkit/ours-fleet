@@ -860,29 +860,3 @@ export function unlinkDeletedTask(id: string): boolean {
   });
 }
 
-/** Remove a completed task from Fleet's backlog. Missing tasks are an idempotent no-op. */
-export function deleteTask(id: string): boolean {
-  return withTaskLock(id, () => {
-  assertCanonicalTaskId(id);
-  const p = taskPath(id);
-  let task: TaskRecord;
-  try {
-    task = JSON.parse(readFileSync(p, 'utf8')) as TaskRecord;
-  } catch (error) {
-    if (isNotFoundError(error)) return false;
-    throw error;
-  }
-  if (task.state !== 'done') {
-    throw new TaskStateError(
-      `cannot delete a '${task.state}' task; only 'done' tasks can be deleted`,
-    );
-  }
-  try {
-    unlinkSync(p);
-  } catch (error) {
-    if (isNotFoundError(error)) return false;
-    throw error;
-  }
-  return true;
-  });
-}

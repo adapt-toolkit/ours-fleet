@@ -15,7 +15,8 @@ import {
   activateRoom, closeRoom, createRoomRecord, getRoomRecord,
 } from '../src/rooms-tasks/room-state.js';
 import {
-  activateTask, createTask, getTask, reviewTask, startTask,
+  activateTask, createTask, getDeletingTask, getTask, readTaskDeletionReceipt,
+  reviewTask, startTask,
 } from '../src/rooms-tasks/task-state.js';
 import type {
   OursContactsView, OursInboundMessage, OursOps,
@@ -996,6 +997,7 @@ describe('OwnerChannel deterministic command dispatch', () => {
     list: vi.fn(async () => 'Coordinator: acp\nScout: 1 windows (created ...)'),
     closeRoom: vi.fn(async () => undefined),
     settleTask: vi.fn(async () => undefined),
+    settleTaskDeletion: vi.fn(async () => undefined),
     recoverTask: vi.fn(async () => undefined),
   });
 
@@ -1277,6 +1279,74 @@ describe('OwnerChannel deterministic command dispatch', () => {
       state: 'review',
       terminal_intent: { kind: 'done', outcome: { summary: 'shipped' }, status: 'pending' },
     });
+  });
+
+  it('accepts Messenger deletion in any state, records the owner CID, and launches the worker after acknowledgement', async () => {
+    const fleet = fakeFleet();
+    const fleetHome = mkdtempSync(join(tmpdir(), 'ours-owner-task-delete-'));
+    dirs.push(fleetHome);
+    const previousHome = process.env.OURS_FLEET_HOME;
+    process.env.OURS_FLEET_HOME = fleetHome;
+    writeV2Fixture(join(fleetHome, 'fleet.yaml'), {});
+    // Provisioning state — deletion must accept without any terminal transition.
+    const task = createTask({ title: 'Owner delete any state', origin: { type: 'owner_channel' }, start: true });
+    const { channel, client } = setup(
+      [ownerMessage(596, 'wire-task-delete', `/task delete ${task.task_id} ${task.task_id}`)],
+      undefined, { fleet },
+    );
+    let deletionWhenSpawned = '';
+    let sendsWhenSpawned = 0;
+    fleet.settleTaskDeletion.mockImplementation(async () => {
+      deletionWhenSpawned = getDeletingTask(task.task_id).deletion?.status ?? '';
+      sendsWhenSpawned = client.calls.filter(call => call.name === 'sendMessage').length;
+    });
+    try {
+      await channel.drain();
+      expect(getDeletingTask(task.task_id).state).toBe('provisioning'); // no false transition
+      const receipt = readTaskDeletionReceipt(task.task_id);
+      expect(receipt).toMatchObject({
+        task_id: task.task_id, original_state: 'provisioning',
+        actor: { kind: 'authenticated_owner', surface: 'messenger', cid: OWNER_CID },
+      });
+    } finally {
+      if (previousHome === undefined) delete process.env.OURS_FLEET_HOME;
+      else process.env.OURS_FLEET_HOME = previousHome;
+    }
+    expect(fleet.settleTaskDeletion).toHaveBeenCalledWith(task.task_id);
+    expect(deletionWhenSpawned).toBe('pending'); // durable intent precedes the worker
+    expect(sendsWhenSpawned).toBeGreaterThan(0); // acknowledged before launch
+    const texts = client.calls.filter(call => call.name === 'sendMessage')
+      .map(call => String(call.args?.text));
+    expect(texts.some(text => text.includes('deletion was accepted'))).toBe(true);
+    expect(texts.some(text => text.includes('Task deleted'))).toBe(false); // never claims success
+  });
+
+  it('persists external delete-worker launch failure without reporting deletion success', async () => {
+    const fleet = fakeFleet();
+    fleet.settleTaskDeletion.mockRejectedValueOnce(new Error('systemd launch failed'));
+    const fleetHome = mkdtempSync(join(tmpdir(), 'ours-owner-task-delete-fail-'));
+    dirs.push(fleetHome);
+    const previousHome = process.env.OURS_FLEET_HOME;
+    process.env.OURS_FLEET_HOME = fleetHome;
+    writeV2Fixture(join(fleetHome, 'fleet.yaml'), {});
+    const task = createTask({ title: 'Owner delete fail', origin: { type: 'owner_channel' }, start: false });
+    const { channel, client } = setup(
+      [ownerMessage(597, 'wire-task-delete-fail', `/task delete ${task.task_id} ${task.task_id}`)],
+      undefined, { fleet },
+    );
+    try {
+      await channel.drain();
+      const hidden = getDeletingTask(task.task_id);
+      expect(hidden.deletion?.status).toBe('pending');
+      expect(hidden.deletion?.error).toContain('systemd launch failed');
+      expect(hidden.deletion?.recovery_hint).toContain(`/task delete ${task.task_id} ${task.task_id}`);
+    } finally {
+      if (previousHome === undefined) delete process.env.OURS_FLEET_HOME;
+      else process.env.OURS_FLEET_HOME = previousHome;
+    }
+    const texts = client.calls.filter(call => call.name === 'sendMessage')
+      .map(call => String(call.args?.text));
+    expect(texts.some(text => text.includes('Task deleted'))).toBe(false);
   });
 
   it('completes Messenger done without settlement when close_on_done is false', async () => {

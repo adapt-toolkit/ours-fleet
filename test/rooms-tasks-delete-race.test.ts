@@ -12,10 +12,11 @@ vi.mock('node:fs', async importOriginal => {
 });
 
 import {
-  activateTask, completeTask, createTask, deleteTask, getTask, reviewTask,
+  activateTask, beginTaskDeletionIntent, completeTask, createTask, getTask,
+  reviewTask, unlinkDeletedTask,
 } from '../src/rooms-tasks/task-state.js';
 
-describe('deleteTask unlink race', () => {
+describe('deletion unlink race', () => {
   let dir: string;
   let originalHome: string | undefined;
 
@@ -36,11 +37,12 @@ describe('deleteTask unlink race', () => {
     activateTask(task.task_id);
     reviewTask(task.task_id);
     completeTask(task.task_id);
+    beginTaskDeletionIntent(task.task_id, { kind: 'local_control', surface: 'cli' });
     fsMock.unlinkSync.mockImplementationOnce(() => {
       throw Object.assign(new Error('lost delete race'), { code: 'ENOENT' });
     });
 
-    expect(deleteTask(task.task_id)).toBe(false);
+    expect(unlinkDeletedTask(task.task_id)).toBe(false);
     expect(getTask(task.task_id).state).toBe('done');
   });
 });

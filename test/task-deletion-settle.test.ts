@@ -641,6 +641,83 @@ describe('gated concurrency and stranger safety', () => {
   });
 });
 
+describe('launchTaskDeletionWorker (service)', () => {
+  it('launches with the exact task ID and reports settlement as deleted', async () => {
+    const t = makeNoRoomTask();
+    beginTaskDeletionIntent(t.task_id, CLI_ACTOR);
+    let launchedWith: string | undefined;
+    const app = new TaskRoomApplicationService(undefined, {
+      launchDeletionWorker: async taskId => {
+        launchedWith = taskId;
+        await settleTaskDeletion({ taskId, cowork: coworkThatMustNotBeReached });
+      },
+    });
+    const result = await app.launchTaskDeletionWorker({ taskId: t.task_id, waitMs: 1_000 });
+    expect(launchedWith).toBe(t.task_id);
+    expect(result).toEqual({ deleted: true, pending: false });
+  });
+
+  it('reports concurrent physical absence as deleted', async () => {
+    const t = makeNoRoomTask();
+    beginTaskDeletionIntent(t.task_id, CLI_ACTOR);
+    // Another worker already removed the record before this launch waits.
+    await settleTaskDeletion({ taskId: t.task_id, cowork: coworkThatMustNotBeReached });
+    const app = new TaskRoomApplicationService(undefined, {
+      launchDeletionWorker: async () => {},
+    });
+    const result = await app.launchTaskDeletionWorker({ taskId: t.task_id, waitMs: 1_000 });
+    expect(result).toEqual({ deleted: true, pending: false });
+  });
+
+  it('hits the deadline within bounded iterations and reports pending, not success', async () => {
+    const t = makeNoRoomTask();
+    beginTaskDeletionIntent(t.task_id, CLI_ACTOR);
+    let clock = 0;
+    let sleeps = 0;
+    const app = new TaskRoomApplicationService(undefined, {
+      launchDeletionWorker: async () => { /* worker never completes */ },
+      now: () => clock,
+      sleep: async () => { sleeps += 1; clock += 100; },
+    });
+    const result = await app.launchTaskDeletionWorker({ taskId: t.task_id, waitMs: 1_000 });
+    expect(result).toEqual({ deleted: false, pending: true });
+    expect(sleeps).toBeLessThanOrEqual(11);
+    expect(getDeletingTask(t.task_id).deletion?.status).toBe('pending'); // recoverable
+  });
+
+  it('records a durable error with recovery hint when the launch itself fails', async () => {
+    const t = makeNoRoomTask();
+    beginTaskDeletionIntent(t.task_id, CLI_ACTOR);
+    const app = new TaskRoomApplicationService(undefined, {
+      launchDeletionWorker: async () => { throw new Error('systemd unavailable'); },
+    });
+    const result = await app.launchTaskDeletionWorker({ taskId: t.task_id, waitMs: 1_000 });
+    expect(result).toMatchObject({ deleted: false, pending: true, error: 'systemd unavailable' });
+    const hidden = getDeletingTask(t.task_id).deletion;
+    expect(hidden?.error).toBe('systemd unavailable');
+    expect(hidden?.recovery_hint).toContain(t.task_id);
+  });
+
+  it('surfaces a worker-written settlement error as pending, never success', async () => {
+    const t = makeNoRoomTask();
+    beginTaskDeletionIntent(t.task_id, CLI_ACTOR);
+    const { setTaskDeletionError } = await import('../src/rooms-tasks/task-state.js');
+    let clock = 0;
+    const app = new TaskRoomApplicationService(undefined, {
+      launchDeletionWorker: async taskId => {
+        setTaskDeletionError(taskId, 'member ownership evidence missing', `retry ${taskId}`);
+      },
+      now: () => clock,
+      sleep: async () => { clock += 100; },
+    });
+    const result = await app.launchTaskDeletionWorker({ taskId: t.task_id, waitMs: 5_000 });
+    expect(result).toMatchObject({
+      deleted: false, pending: true, error: 'member ownership evidence missing',
+    });
+    expect(existsSync(taskFile(t.task_id))).toBe(true);
+  });
+});
+
 describe('recovery routing', () => {
   it('routes a deletion-pending task to the deletion worker without loading configuration', async () => {
     const t = makeNoRoomTask();

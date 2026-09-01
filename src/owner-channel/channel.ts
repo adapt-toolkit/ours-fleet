@@ -1425,9 +1425,7 @@ export class OwnerChannel implements OwnerChannelHandle {
       reviewTask: taskId => new TaskRoomApplicationService(this.options.configPath).reviewTask({
         actor: { kind: 'authenticated_owner', surface: 'messenger', cid: sender.id }, taskId,
       }),
-      deleteTask: taskId => new TaskRoomApplicationService(this.options.configPath).deleteTask({
-        actor: { kind: 'authenticated_owner', surface: 'messenger', cid: sender.id }, taskId,
-      }),
+      deleteTask: taskId => this.deleteTaskFromOwner(sender, taskId, wireId),
       listRoomQueries: filter => new TaskRoomApplicationService(this.options.configPath).listRooms(filter),
       getRoomQuery: id => new TaskRoomApplicationService(this.options.configPath).getRoomDetail(id),
       listTemplateQueries: () => new TaskRoomApplicationService(this.options.configPath).listTemplates(),
@@ -1608,6 +1606,38 @@ export class OwnerChannel implements OwnerChannelHandle {
         : [{ heading: 'Result', items: ['No automated recovery action is available.'] }],
     }), wireId);
     this.state.remember(wireId);
+  }
+
+  /** Accept a permanent any-state deletion, acknowledge it, then hand cleanup to a durable worker. */
+  private async deleteTaskFromOwner(
+    sender: { id: string; name: string }, taskId: string, wireId: string,
+  ): Promise<void> {
+    const app = new TaskRoomApplicationService(this.options.configPath);
+    const actor = { kind: 'authenticated_owner' as const, surface: 'messenger' as const, cid: sender.id };
+    const accepted = await app.requestTaskDeletion({ actor, taskId });
+    if (accepted.status === 'already_absent') {
+      await this.send(sender.id, renderMarkdownResult({
+        icon: '🗑️', title: 'Task already absent',
+        fields: [{ label: 'ID', value: taskId, kind: 'code' }],
+      }), wireId);
+      this.state.remember(wireId);
+      return;
+    }
+    await this.send(sender.id, renderMarkdownFailure({
+      kind: 'pending', subject: `/task delete ${taskId} ${taskId}`,
+      detail: 'The deletion was accepted; cleanup is settling in the background.',
+      action: `Run /task recover ${taskId} or repeat /task delete ${taskId} ${taskId} if it remains pending.`,
+    }), wireId);
+    this.state.remember(wireId);
+    try {
+      await this.fleetOps.settleTaskDeletion(taskId);
+    } catch (error) {
+      await app.recordDeletionError({
+        actor, taskId, error: error instanceof Error ? error.message : String(error),
+        recoveryHint: `External delete worker failed to start. Retry /task delete ${taskId} ${taskId}.`,
+      });
+      throw error;
+    }
   }
 
   private async terminalTaskFromOwner(
