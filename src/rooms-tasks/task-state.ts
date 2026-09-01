@@ -486,6 +486,96 @@ function presentTaskLenient(record: StoredTaskRecord): TaskRecord {
   }
 }
 
+/**
+ * Lenient read for deletion settlement and status surfaces: a broken list
+ * reference must never make a task unreadable or undeletable. Missing records
+ * throw the canonical task-not-found error; other read failures propagate.
+ */
+export function getDeletingTask(id: string): TaskRecord {
+  return withTaskLock(id, () => {
+  assertCanonicalTaskId(id);
+  try {
+    return presentTaskLenient(JSON.parse(readFileSync(taskPath(id), 'utf8')) as StoredTaskRecord);
+  } catch (error) {
+    if (isNotFoundError(error)) throw new TaskStateError(`task not found: ${id}`);
+    throw error;
+  }
+  });
+}
+
+/** Cheap durable deletion-epoch probe for room/member publication guards. */
+export function taskDeletionState(id: string): 'none' | 'pending' | 'absent' {
+  return withTaskLock(id, () => {
+  assertCanonicalTaskId(id);
+  try {
+    const stored = JSON.parse(readFileSync(taskPath(id), 'utf8')) as StoredTaskRecord;
+    return stored.deletion?.status === 'pending' ? 'pending' : 'none';
+  } catch (error) {
+    if (isNotFoundError(error)) return 'absent';
+    throw error;
+  }
+  });
+}
+
+/**
+ * Durable, surface-independent audit evidence for a permanent deletion. The
+ * receipt outlives the task record: written with the acceptance intent, and
+ * completed before settlement is reported. Metadata only — never brief or
+ * room content.
+ */
+export interface TaskDeletionReceipt {
+  schema_version: 1;
+  task_id: string;
+  title: string;
+  accepted_at: string;
+  actor: TaskDeletionActor;
+  original_state: TaskState;
+  room_id?: string;
+  member_count: number;
+  settled_at?: string;
+  result?: 'deleted';
+}
+
+export const deletionReceiptsDir = () => join(stateRoot(), 'deletion-receipts');
+function deletionReceiptPath(id: string): string {
+  return join(deletionReceiptsDir(), `${id}.json`);
+}
+
+export function readTaskDeletionReceipt(id: string): TaskDeletionReceipt | undefined {
+  assertCanonicalTaskId(id);
+  try {
+    return JSON.parse(readFileSync(deletionReceiptPath(id), 'utf8')) as TaskDeletionReceipt;
+  } catch (error) {
+    if (isNotFoundError(error)) return undefined;
+    throw error;
+  }
+}
+
+function writeDeletionReceiptForIntent(stored: StoredTaskRecord): void {
+  const deletion = stored.deletion!;
+  mkdirSync(deletionReceiptsDir(), { recursive: true });
+  const receipt: TaskDeletionReceipt = {
+    schema_version: 1,
+    task_id: stored.task_id,
+    title: stored.title.slice(0, 256),
+    accepted_at: deletion.accepted_at,
+    actor: deletion.actor,
+    original_state: stored.state,
+    room_id: deletion.room_id,
+    member_count: deletion.members.length,
+  };
+  replaceFileAtomically(deletionReceiptPath(stored.task_id), JSON.stringify(receipt, null, 2) + '\n');
+}
+
+/** Record settlement on the receipt; idempotent, tolerant of legacy absence. */
+export function completeTaskDeletionReceipt(id: string): void {
+  const receipt = readTaskDeletionReceipt(id);
+  if (!receipt || receipt.settled_at) return;
+  receipt.settled_at = new Date().toISOString();
+  receipt.result = 'deleted';
+  replaceFileAtomically(deletionReceiptPath(id), JSON.stringify(receipt, null, 2) + '\n');
+}
+
 export type TaskDeletionAcceptance =
   | { status: 'accepted' | 'pending'; task: TaskRecord }
   | { status: 'already_absent' };
@@ -509,8 +599,11 @@ export function beginTaskDeletionIntent(id: string, actor: TaskDeletionActor): T
     if (isNotFoundError(error)) return { status: 'already_absent' };
     throw error;
   }
-  if (stored.deletion?.status === 'pending')
+  if (stored.deletion?.status === 'pending') {
+    // Heal a crash between the intent write and the receipt write.
+    if (!readTaskDeletionReceipt(id)) writeDeletionReceiptForIntent(stored);
     return { status: 'pending', task: presentTaskLenient(stored) };
+  }
   const now = new Date().toISOString();
   stored.deletion = {
     status: 'pending',
@@ -522,6 +615,7 @@ export function beginTaskDeletionIntent(id: string, actor: TaskDeletionActor): T
     })),
   };
   writeTask(stored);
+  writeDeletionReceiptForIntent(stored);
   return { status: 'accepted', task: presentTaskLenient(stored) };
   });
 }
@@ -552,6 +646,8 @@ const DELETION_MEMBER_PHASE_ORDER: Record<TaskDeletionMemberPhase, number> = {
 
 /** Marker proving a member never launched, mirroring close.ts's short path. */
 export const DELETION_MEMBER_NEVER_LAUNCHED = 'never-launched';
+/** Marker proving absence verified against temp state AND the CID-wide identity scan. */
+export const DELETION_MEMBER_ABSENT_VERIFIED = 'absent-verified';
 
 /**
  * Advance a member retirement cursor carried by the deletion intent. Only
@@ -588,7 +684,7 @@ export function advanceTaskDeletionMember(
     );
   if (step === 0) return presentTaskLenient(stored); // idempotent retry, evidence already verified
   const neverLaunched = cursor.phase === 'pending' && phase === 'identity_absent'
-    && launch === DELETION_MEMBER_NEVER_LAUNCHED;
+    && (launch === DELETION_MEMBER_NEVER_LAUNCHED || launch === DELETION_MEMBER_ABSENT_VERIFIED);
   if (step !== 1 && !neverLaunched)
     throw new TaskStateError(
       `task ${id} deletion member '${name}' cannot skip from '${cursor.phase}' to '${phase}' without evidence`,
@@ -605,6 +701,117 @@ export function advanceTaskDeletionMember(
   cursor.launch_id = launch;
   if (archivePath !== undefined) cursor.archive_path = archivePath;
   cursor.updated_at = new Date().toISOString();
+  writeTask(stored);
+  return presentTaskLenient(stored);
+  });
+}
+
+interface SeatEvidence {
+  role_name: string;
+  identity_cid?: string;
+  retirement?: { phase: TaskDeletionMemberPhase; launch_id: string; archive_path?: string };
+}
+
+function findCursorForSeat(
+  id: string, stored: StoredTaskRecord, seat: SeatEvidence,
+): import('./types.js').TaskDeletionMemberCursor | undefined {
+  const cursor = stored.deletion!.members.find(member => member.name === seat.role_name);
+  if (cursor && seat.identity_cid
+    && cursor.identity_cid.toLowerCase() !== seat.identity_cid.toLowerCase())
+    throw new TaskStateError(
+      `task ${id} deletion member '${seat.role_name}' identity CID mismatch between cursor and room seat`,
+    );
+  return cursor;
+}
+
+/**
+ * Durably register cursors for late-provisioned members before retirement
+ * begins: provisioning publishes room seats before updateTaskMembers, so the
+ * acceptance snapshot can be empty while live seats exist. Seats without a
+ * recorded identity CID are not registered here — until a CID is recorded
+ * there is no managed identity to orphan, and the room record still carries
+ * those seats through the close saga that follows.
+ */
+export function upsertTaskDeletionMembersFromSeats(
+  id: string, seats: ReadonlyArray<SeatEvidence>,
+): TaskRecord {
+  return withTaskLock(id, () => {
+  assertCanonicalTaskId(id);
+  const stored = JSON.parse(readFileSync(taskPath(id), 'utf8')) as StoredTaskRecord;
+  if (stored.deletion?.status !== 'pending')
+    throw new TaskStateError(`task ${id} has no pending deletion`);
+  const now = new Date().toISOString();
+  for (const seat of seats) {
+    if (!seat.identity_cid) continue;
+    if (!findCursorForSeat(id, stored, seat)) {
+      stored.deletion.members.push({
+        name: seat.role_name, identity_cid: seat.identity_cid, phase: 'pending', updated_at: now,
+      });
+    }
+  }
+  writeTask(stored);
+  return presentTaskLenient(stored);
+  });
+}
+
+/**
+ * The pre-room-delete checkpoint: import completed retirement evidence from
+ * room seats into the deletion cursors, so a crash between room-record
+ * deletion and task unlink retries from durable cursors instead of
+ * reconstructing consumed evidence. Call ONLY after closeManagedRoom has
+ * completed retirement and BEFORE cowork.deleteRoom/deleteRoomRecord.
+ *
+ * The room saga is trusted for phase jumps, but partial or corrupt retained
+ * records must not become false success: every seat must be identity_absent;
+ * a real launch requires archive evidence; an identity-less seat is accepted
+ * only via the never-launched proof.
+ */
+export function importTaskDeletionRetirementEvidence(
+  id: string, seats: ReadonlyArray<SeatEvidence>,
+): TaskRecord {
+  return withTaskLock(id, () => {
+  assertCanonicalTaskId(id);
+  const stored = JSON.parse(readFileSync(taskPath(id), 'utf8')) as StoredTaskRecord;
+  if (stored.deletion?.status !== 'pending')
+    throw new TaskStateError(`task ${id} has no pending deletion`);
+  const now = new Date().toISOString();
+  for (const seat of seats) {
+    const evidence = seat.retirement;
+    if (evidence?.phase !== 'identity_absent')
+      throw new TaskStateError(
+        `task ${id} deletion cannot checkpoint member '${seat.role_name}' before completed retirement`,
+      );
+    const neverLaunched = evidence.launch_id === DELETION_MEMBER_NEVER_LAUNCHED;
+    if (!neverLaunched && evidence.archive_path === undefined)
+      throw new TaskStateError(
+        `task ${id} deletion member '${seat.role_name}' retirement evidence lacks its archive`,
+      );
+    if (!seat.identity_cid) {
+      if (neverLaunched) continue; // provably never held a managed identity
+      throw new TaskStateError(
+        `task ${id} deletion member '${seat.role_name}' has retirement evidence but no identity CID`,
+      );
+    }
+    let cursor = findCursorForSeat(id, stored, seat);
+    if (!cursor) {
+      cursor = { name: seat.role_name, identity_cid: seat.identity_cid, phase: 'pending', updated_at: now };
+      stored.deletion.members.push(cursor);
+    }
+    if (DELETION_MEMBER_PHASE_ORDER[evidence.phase] < DELETION_MEMBER_PHASE_ORDER[cursor.phase]) continue;
+    if (cursor.launch_id !== undefined && cursor.launch_id !== evidence.launch_id)
+      throw new TaskStateError(
+        `task ${id} deletion member '${seat.role_name}' launch ownership proof is immutable`,
+      );
+    if (cursor.archive_path !== undefined && evidence.archive_path !== undefined
+      && cursor.archive_path !== evidence.archive_path)
+      throw new TaskStateError(
+        `task ${id} deletion member '${seat.role_name}' archive evidence is immutable`,
+      );
+    cursor.phase = evidence.phase;
+    cursor.launch_id = evidence.launch_id;
+    if (evidence.archive_path !== undefined) cursor.archive_path = evidence.archive_path;
+    cursor.updated_at = now;
+  }
   writeTask(stored);
   return presentTaskLenient(stored);
   });

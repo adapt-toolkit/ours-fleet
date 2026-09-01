@@ -360,7 +360,12 @@ function validPresentation(value: unknown): value is FleetAuditPresentation {
       unblock: ['backlog→backlog', 'provisioning→provisioning', 'active→active', 'review→review'],
       review: ['active→review'], done: ['review→done'], finish: ['active→done', 'review→done'],
       cancel: ['backlog→cancelled', 'provisioning→cancelled', 'active→cancelled', 'review→cancelled'],
-      delete: ['done→deleted'], settling: ['active→active', 'review→review', 'backlog→backlog',
+      delete: [
+        'backlog→deleting', 'provisioning→deleting', 'active→deleting', 'review→deleting',
+        'done→deleting', 'cancelled→deleting', 'failed→deleting',
+        'backlog→deleted', 'provisioning→deleted', 'active→deleted', 'review→deleted',
+        'done→deleted', 'cancelled→deleted', 'failed→deleted',
+      ], settling: ['active→active', 'review→review', 'backlog→backlog',
         'provisioning→provisioning'] })
     && (p.title === undefined || text(p.title)) && (p.previousState === undefined || safe(p.previousState))
     && (p.template === undefined || text(p.template)) && (p.roomId === undefined || safe(p.roomId))

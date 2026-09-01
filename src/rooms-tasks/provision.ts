@@ -26,6 +26,9 @@ import {
 import { controlRequest } from '../session/control.js';
 import { SessionControlError } from '../session/types.js';
 import { closeManagedRoom } from './close.js';
+import { withFileLock } from '../atomic-file.js';
+import { TASK_OPERATION_LOCK_STALE_MS, taskOperationLockPath } from './terminal.js';
+import { taskDeletionState } from './task-state.js';
 import { buildRoomMemberTask, sha256Text } from './member-startup.js';
 import { agentDir } from '../paths.js';
 import { readProvenance } from '../creation.js';
@@ -333,7 +336,32 @@ async function retainRunningLaunch(input: {
   return false;
 }
 
+/**
+ * Member-launch publication window: for a task-bound room, the durable launch
+ * intent, spawn, and launch record publish under the common task-operation
+ * lock so an accepted deletion linearizes strictly before (bounded abort — no
+ * spawn happens) or strictly after (the seat's launch record is visible to
+ * deletion retirement). The lock is held per member only, never across
+ * seat-wait loops.
+ */
 async function launchMember(input: {
+  provision: ProvisionMembersInput;
+  member: ExpandedMember;
+  settings: MemberSettings;
+  startup: RoomMemberStartup;
+}): Promise<void> {
+  const taskId = input.provision.taskId;
+  if (!taskId) return launchMemberUnlocked(input);
+  return withFileLock(taskOperationLockPath(taskId), () => {
+    if (taskDeletionState(taskId) !== 'none')
+      throw new Error(
+        `task ${taskId} is pending deletion; aborting member launch for ${input.member.name}`,
+      );
+    return launchMemberUnlocked(input);
+  }, {}, TASK_OPERATION_LOCK_STALE_MS);
+}
+
+async function launchMemberUnlocked(input: {
   provision: ProvisionMembersInput;
   member: ExpandedMember;
   settings: MemberSettings;
@@ -460,6 +488,9 @@ export async function provisionMembers(
   input: ProvisionMembersInput,
 ): Promise<RoomOrchestrationRecord> {
   const { cfg, cowork, roomId, taskId, template } = input;
+  // Deletion-epoch pre-check; each member launch re-checks under the lock.
+  if (taskId && taskDeletionState(taskId) !== 'none')
+    throw new Error(`task ${taskId} is pending deletion; refusing to provision members`);
   const prefix = taskId ? shortId(taskId) : `room-${shortId(roomId)}`;
   const members = expandMembers(template, prefix);
   // Resolve every Agent before persisting launch intent or touching Cowork membership.

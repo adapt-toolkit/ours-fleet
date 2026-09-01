@@ -61,11 +61,12 @@ export function acquireLaunchSnapshotLock(options: {
   }
 }
 
-function referencedByRetainedState(hash: string): boolean {
+function referencedByRetainedState(hash: string, excludeTaskFile?: string): boolean {
   for (const directory of ['tasks', 'rooms']) {
     const root = join(stateRoot(), directory);
     if (!existsSync(root)) continue;
     for (const name of readdirSync(root).filter(entry => entry.endsWith('.json'))) {
+      if (directory === 'tasks' && excludeTaskFile !== undefined && name === excludeTaskFile) continue;
       try { if (readFileSync(join(root, name), 'utf8').includes(hash)) return true; }
       catch { return true; }
     }
@@ -138,4 +139,18 @@ export function releaseLaunchSnapshot(hash: string): void {
   const path = launchSnapshotPath(hash);
   if (existsSync(path)) unlinkSync(path);
   } finally { release(); }
+}
+
+/**
+ * Deletion-finalization variant: the caller already holds the global
+ * launch-snapshot lock and is about to unlink the deletion-pending task
+ * `taskId`. The reference scan excludes exactly that task file — every other
+ * retained Task/Room reference still protects the snapshot. Deleting the
+ * snapshot BEFORE the task unlink keeps every crash seam recoverable: the
+ * hidden intent survives, and a retry sees the snapshot already absent.
+ */
+export function releaseLaunchSnapshotForDeletingTask(hash: string, taskId: string): void {
+  if (referencedByRetainedState(hash, `${taskId}.json`)) return;
+  const path = launchSnapshotPath(hash);
+  if (existsSync(path)) unlinkSync(path);
 }

@@ -1566,18 +1566,25 @@ export class OwnerChannel implements OwnerChannelHandle {
     const app = new TaskRoomApplicationService(this.options.configPath);
     const actor = { kind: 'authenticated_owner' as const, surface: 'messenger' as const, cid: sender.id };
     const begin = await app.beginTaskRecovery({ actor, taskId });
-    if (begin.kind === 'terminal_worker_required') {
+    if (begin.kind !== 'final') {
+      const deleting = begin.kind === 'deletion_worker_required';
       await this.send(sender.id, renderMarkdownFailure({
         kind: 'pending', subject: `/task recover ${taskId}`,
-        detail: 'The recovery request was accepted and is still being settled.',
+        detail: deleting
+          ? 'The task is pending deletion; recovery continues its cleanup.'
+          : 'The recovery request was accepted and is still being settled.',
         action: `Run /task recover ${taskId} if it remains pending.`,
       }), wireId);
       this.state.remember(wireId);
       try { await this.fleetOps.recoverTask(taskId); }
       catch (error) {
-        await app.recordSettlementError({ actor, taskId,
-          error: error instanceof Error ? error.message : String(error),
-          recoveryHint: `External settle worker failed to start. Retry /task recover ${taskId}.` });
+        const failure = {
+          actor, taskId, error: error instanceof Error ? error.message : String(error),
+          recoveryHint: deleting
+            ? `External delete worker failed to start. Retry /task delete ${taskId} ${taskId}.`
+            : `External settle worker failed to start. Retry /task recover ${taskId}.`,
+        };
+        await (deleting ? app.recordDeletionError(failure) : app.recordSettlementError(failure));
         throw error;
       }
       return;
