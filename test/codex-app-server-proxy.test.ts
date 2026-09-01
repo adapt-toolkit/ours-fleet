@@ -4,12 +4,15 @@ import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { createInterface } from 'node:readline';
 import { fileURLToPath } from 'node:url';
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 
-import { rewriteCodexAppServerRequest } from '../src/harness/codex-app-server-proxy.js';
+import {
+  CodexTerminalRecovery, rewriteCodexAppServerRequest,
+} from '../src/harness/codex-app-server-proxy.js';
 
 const dirs: string[] = [];
 afterEach(() => {
+  vi.useRealTimers();
   for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true });
 });
 
@@ -21,6 +24,52 @@ const request = (sandboxPolicy: Record<string, unknown>, approvalPolicy = 'on-re
 const PROXY_EXIT_TIMEOUT_MS = 2_000;
 const proxy = join(dirname(fileURLToPath(import.meta.url)), '../dist/harness',
   'codex-app-server-proxy.js');
+
+const notification = (method: string, params: Record<string, unknown>): string =>
+  JSON.stringify({ method, params });
+
+function terminalRecovery(quietMs = 25) {
+  const sent: string[] = [];
+  const emitted: string[] = [];
+  const logs: string[] = [];
+  const recovery = new CodexTerminalRecovery({
+    quietMs,
+    sendToCodex: line => sent.push(line),
+    emitToClient: line => emitted.push(line),
+    log: line => logs.push(line),
+  });
+  return { recovery, sent, emitted, logs };
+}
+
+function startTurn(recovery: CodexTerminalRecovery, threadId = 'thread-1', turnId = 'turn-1') {
+  recovery.observeServerLine(notification('turn/started', {
+    threadId,
+    turn: { id: turnId, status: 'inProgress', items: [] },
+  }));
+}
+
+function itemEvent(
+  recovery: CodexTerminalRecovery, method: 'item/started' | 'item/completed',
+  item: Record<string, unknown>, threadId = 'thread-1', turnId = 'turn-1',
+) {
+  recovery.observeServerLine(notification(method, { threadId, turnId, item }));
+}
+
+function answerReconciliation(
+  recovery: CodexTerminalRecovery, requestLine: string,
+  { threadStatus = 'idle', turnStatus = 'inProgress' } = {},
+): boolean {
+  const request = JSON.parse(requestLine);
+  return recovery.observeServerLine(JSON.stringify({
+    id: request.id,
+    result: {
+      thread: {
+        id: 'thread-1', status: { type: threadStatus },
+        turns: [{ id: 'turn-1', status: turnStatus, items: [], error: null }],
+      },
+    },
+  }));
+}
 
 async function runProxy(realCodexPath: string, pendingInput?: string): Promise<{
   code: number | null;
@@ -124,16 +173,17 @@ describe('Codex app-server permission proxy', () => {
     });
     const lines = createInterface({ input: child.stdout });
     const received = new Promise<string>(resolve => lines.once('line', resolve));
+    const exited = new Promise<void>((resolve, reject) => {
+      child.once('exit', code => code === 0 ? resolve() : reject(new Error(`proxy exited ${code}`)));
+      child.once('error', reject);
+    });
     child.stdin.end(JSON.stringify(request({ type: 'workspaceWrite', writableRoots: [] })) + '\n');
     const output = JSON.parse(await received);
     expect(output.params).toMatchObject({
       approvalPolicy: 'never', sandboxPolicy: { type: 'workspaceWrite' },
     });
     expect(output.params.sandboxPolicy.type).not.toBe('dangerFullAccess');
-    await new Promise<void>((resolve, reject) => {
-      child.once('exit', code => code === 0 ? resolve() : reject(new Error(`proxy exited ${code}`)));
-      child.once('error', reject);
-    });
+    await exited;
   });
 
   it('exits promptly with a real child nonzero status after forwarding its error', async () => {
@@ -185,5 +235,123 @@ describe('Codex app-server permission proxy', () => {
     expect(result.stderr).toContain(missingCodex);
     expect(result.stderr).toContain('ENOENT');
     expect(result.elapsedMs).toBeLessThan(PROXY_EXIT_TIMEOUT_MS);
+  });
+});
+
+describe('Codex app-server missing terminal recovery', () => {
+  it('infers the exact missing completion after final output, no live work, and idle reconciliation', () => {
+    vi.useFakeTimers();
+    const { recovery, sent, emitted, logs } = terminalRecovery();
+    startTurn(recovery);
+    itemEvent(recovery, 'item/started', {
+      id: 'tool-1', type: 'commandExecution', status: 'inProgress',
+    });
+    itemEvent(recovery, 'item/completed', {
+      id: 'tool-1', type: 'commandExecution', status: 'completed',
+    });
+    itemEvent(recovery, 'item/completed', {
+      id: 'answer-1', type: 'agentMessage', phase: 'final_answer', text: 'Done.',
+    });
+
+    vi.advanceTimersByTime(25);
+
+    expect(sent).toHaveLength(1);
+    expect(JSON.parse(sent[0])).toMatchObject({
+      method: 'thread/read', params: { threadId: 'thread-1', includeTurns: true },
+    });
+    expect(answerReconciliation(recovery, sent[0])).toBe(false);
+    expect(emitted).toHaveLength(1);
+    expect(JSON.parse(emitted[0])).toMatchObject({
+      method: 'turn/completed',
+      params: { threadId: 'thread-1', turn: { id: 'turn-1', status: 'completed' } },
+      _meta: { oursFleet: { terminalSource: 'inferred_missing_notification' } },
+    });
+    expect(logs.join('\n')).toContain('inferred missing turn/completed');
+  });
+
+  it('does not reconcile while an item or server request remains open', () => {
+    vi.useFakeTimers();
+    const { recovery, sent } = terminalRecovery();
+    startTurn(recovery);
+    itemEvent(recovery, 'item/started', {
+      id: 'tool-1', type: 'commandExecution', status: 'inProgress',
+    });
+    itemEvent(recovery, 'item/completed', {
+      id: 'answer-1', type: 'agentMessage', phase: 'final_answer', text: 'Done.',
+    });
+    vi.advanceTimersByTime(100);
+    expect(sent).toEqual([]);
+
+    itemEvent(recovery, 'item/completed', {
+      id: 'tool-1', type: 'commandExecution', status: 'completed',
+    });
+    recovery.observeServerLine(JSON.stringify({
+      id: 91, method: 'item/commandExecution/requestApproval',
+      params: { threadId: 'thread-1', turnId: 'turn-1' },
+    }));
+    vi.advanceTimersByTime(100);
+    expect(sent).toEqual([]);
+
+    recovery.observeClientLine(JSON.stringify({ id: 91, result: { decision: 'accept' } }));
+    vi.advanceTimersByTime(25);
+    expect(sent).toHaveLength(1);
+  });
+
+  it('does not infer from commentary, an empty final item, or an active thread snapshot', () => {
+    vi.useFakeTimers();
+    const { recovery, sent, emitted } = terminalRecovery();
+    startTurn(recovery);
+    itemEvent(recovery, 'item/completed', {
+      id: 'commentary-1', type: 'agentMessage', phase: 'commentary', text: 'Working.',
+    });
+    itemEvent(recovery, 'item/completed', {
+      id: 'answer-empty', type: 'agentMessage', phase: 'final_answer', text: '',
+    });
+    vi.advanceTimersByTime(100);
+    expect(sent).toEqual([]);
+
+    itemEvent(recovery, 'item/completed', {
+      id: 'answer-1', type: 'agentMessage', phase: 'final_answer', text: 'Done.',
+    });
+    vi.advanceTimersByTime(25);
+    expect(answerReconciliation(recovery, sent[0], { threadStatus: 'active' })).toBe(false);
+    expect(emitted).toEqual([]);
+    vi.advanceTimersByTime(25);
+    expect(sent).toHaveLength(2);
+  });
+
+  it('prefers the real terminal event and cancels pending inference', () => {
+    vi.useFakeTimers();
+    const { recovery, sent, emitted } = terminalRecovery();
+    startTurn(recovery);
+    itemEvent(recovery, 'item/completed', {
+      id: 'answer-1', type: 'agentMessage', phase: 'final_answer', text: 'Done.',
+    });
+    expect(recovery.observeServerLine(notification('turn/completed', {
+      threadId: 'thread-1',
+      turn: { id: 'turn-1', status: 'completed', items: [] },
+    }))).toBe(true);
+
+    vi.advanceTimersByTime(100);
+    expect(sent).toEqual([]);
+    expect(emitted).toEqual([]);
+  });
+
+  it('suppresses a late real terminal event after an inferred completion', () => {
+    vi.useFakeTimers();
+    const { recovery, sent, emitted, logs } = terminalRecovery();
+    startTurn(recovery);
+    itemEvent(recovery, 'item/completed', {
+      id: 'answer-1', type: 'agentMessage', phase: 'final_answer', text: 'Done.',
+    });
+    vi.advanceTimersByTime(25);
+    answerReconciliation(recovery, sent[0]);
+    expect(emitted).toHaveLength(1);
+
+    expect(recovery.observeServerLine(notification('turn/completed', {
+      threadId: 'thread-1',
+      turn: { id: 'turn-1', status: 'completed', items: [] },
+    }))).toBe(false);
+    expect(logs.join('\n')).toContain('suppressed late turn/completed');
   });
 });
