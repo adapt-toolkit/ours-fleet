@@ -1,10 +1,11 @@
 import { spawn as spawnChild } from 'node:child_process';
-import { closeSync, existsSync, mkdirSync, openSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { closeSync, existsSync, lstatSync, mkdirSync, openSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { parse, stringify } from 'yaml';
 import { agentDir, defaultConfigPath } from './paths.js';
 import { validateIsolationConfig } from './isolation/policy.js';
 import type { IsolationConfig } from './isolation/types.js';
+import type { AgentLoopsConfig, ResolvedRoleLoop } from './loops/config.js';
 import {
   loadConfig, findRole, resolveAuthProxy, resolveModelChain, resolveMonitorConfig, resolveOwnerChannelConfig,
   resolvePermissions,
@@ -70,6 +71,12 @@ export interface SpawnOpts {
    * input in this release.
    */
   isolationFile?: string;
+  /** Trusted YAML containing exactly a top-level `loops:` map. Temporary launches only. */
+  loopsFile?: string;
+  /** Explicitly override any selected Agent Template loops with none. */
+  noLoops?: boolean;
+  /** Internal source label retained after room-member plan resolution. */
+  loopSource?: 'agent-template' | 'cli' | 'omitted';
   overseeInterval?: string;
   configPath?: string;
   dryRun?: boolean;
@@ -80,9 +87,12 @@ export function agentDefinitionFromSpawn(o: SpawnOpts): AgentDefinition {
   if (o.agentDefinition) {
     if (o.brain !== undefined || o.role !== undefined || o.cwd !== undefined
         || o.coordinator !== undefined || o.approval !== undefined || o.filesystem !== undefined
-        || o.unattended !== undefined || o.isolationFile !== undefined || o.monitorConfig !== undefined)
+        || o.unattended !== undefined || o.isolationFile !== undefined || o.monitorConfig !== undefined
+        || o.loopsFile !== undefined)
       throw new Error('canonical agentDefinition conflicts with separate Agent fields');
     const definition = structuredClone(o.agentDefinition);
+    if (o.noLoops === true && definition.loops !== undefined)
+      throw new Error('canonical agentDefinition loops conflict with explicit no-loops policy');
     if (o.identity) definition.identity = o.identity;
     return definition;
   }
@@ -101,13 +111,20 @@ export function agentDefinitionFromSpawn(o: SpawnOpts): AgentDefinition {
     ...(permissions ? { permissions } : {}),
     ...(o.isolationFile ? { isolation: readIsolationFile(o.isolationFile) } : {}),
     ...(o.monitorConfig ? { monitor: structuredClone(o.monitorConfig) } : {}),
+    ...(o.loopsFile ? { loops: readLoopsFile(o.loopsFile) } : {}),
   };
 }
 
 function resolvedSpawn(o: SpawnOpts): { definition: AgentDefinition; role: ResolvedRole } {
   const definition = agentDefinitionFromSpawn(o);
-  const cfg = loadConfig(o.configPath, { additionalAgent: { id: o.name, definition } });
-  return { definition, role: findRole(cfg, o.name) };
+  const cfg = loadConfig(o.configPath, {
+    additionalAgent: { id: o.name, definition, temporary: o.temp === true },
+  });
+  const role = findRole(cfg, o.name);
+  if (o.temp) role.temporaryLoopSource = o.loopSource
+    ?? (role.temporaryLoops?.length ? 'agent-template' : 'omitted');
+  if (o.noLoops === true) role.temporaryLoops = [];
+  return { definition, role };
 }
 
 /**
@@ -133,7 +150,33 @@ export function readIsolationFile(path: string): IsolationConfig {
   return cfg;
 }
 
+/** Read a private canonical temporary-loop override before any creation side effect. */
+export function readLoopsFile(path: string): AgentLoopsConfig {
+  const stat = lstatSync(path);
+  const uid = process.getuid?.();
+  if (!stat.isFile() || stat.isSymbolicLink() || stat.size > 1_000_000
+      || (uid !== undefined && stat.uid !== uid) || (stat.mode & 0o777) !== 0o600)
+    throw new Error(`${path}: loops file must be an owner-only regular file no larger than 1 MB`);
+  let raw: unknown;
+  try { raw = parse(readFileSync(path, 'utf8')); }
+  catch (error) { throw new Error(`--loops-file ${path}: ${(error as Error).message}`); }
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)
+      || !Object.hasOwn(raw, 'loops')
+      || Object.keys(raw as Record<string, unknown>).some(key => key !== 'loops'))
+    throw new Error(`${path}: expected exactly a top-level loops: mapping`);
+  const loops = (raw as { loops: unknown }).loops;
+  if (!loops || typeof loops !== 'object' || Array.isArray(loops)
+      || !Object.keys(loops as Record<string, unknown>).length)
+    throw new Error(`${path}: loops must be a non-empty mapping; use --no-loops to disable loops`);
+  return structuredClone(loops as AgentLoopsConfig);
+}
+
 export function validateSpawnOpts(o: SpawnOpts): void {
+  if (o.loopsFile && o.noLoops === true)
+    throw new Error('--loops-file and --no-loops are mutually exclusive');
+  if ((o.loopsFile || o.noLoops === true || o.agentDefinition?.loops !== undefined) && !o.temp)
+    throw new Error('temporary Agent loops require --temp');
+  if (o.loopsFile) readLoopsFile(o.loopsFile);
   if (o.approval && !['ask', 'auto', 'allow', 'deny'].includes(o.approval))
     throw new Error(
       `invalid --approval '${o.approval}'; allowed: ask, auto, allow (deprecated alias: deny)`);
@@ -216,7 +259,7 @@ export function spawnDryRun(o: SpawnOpts): SpawnDryRun {
  * record exists to be read, and must not become a place credentials collect.
  */
 function provenanceSettings(
-  o: SpawnOpts, defaults: Record<string, unknown>,
+  o: SpawnOpts, defaults: Record<string, unknown>, resolvedLoops: ResolvedRoleLoop[] = [],
 ): Record<string, ProvenanceEntry> {
   const perms = (defaults.permissions ?? {}) as Partial<CommonPermissions>;
   const callerDefaults = new Set(o.inheritedFromCaller ?? []);
@@ -239,6 +282,16 @@ function provenanceSettings(
       ? { value: 'declared via --isolation-file', source: 'cli' }
       : { value: defaults.isolation ? 'from fleet defaults' : undefined, source: defaults.isolation ? 'fleet-default' : 'built-in' },
     monitor: tagged('monitorConfig', provenanceOf(o.monitorConfig, defaults.monitor, { mode: 'fleet' })),
+    loops: {
+      value: o.noLoops ? { enabled: false, loops: [] }
+        : resolvedLoops.length ? resolvedLoops.map(loop => ({
+          name: loop.name, enabled: loop.enabled, intervalMs: loop.intervalMs,
+          initialDelayMs: loop.initialDelayMs, jitterMs: loop.jitterMs,
+          prompt: { bytes: loop.promptBytes, sha256: loop.promptHash },
+        })) : 'omitted (legacy no temporary loops)',
+      source: o.loopSource === 'agent-template' ? 'agent-template'
+        : o.loopsFile || o.noLoops || o.loopSource === 'cli' ? 'cli' : 'built-in',
+    },
   };
 }
 
@@ -308,7 +361,7 @@ export async function spawnPermanent(
       // launch still records how it was asked for.
       const provenance = buildProvenance({
         role: o.name, lifetime: 'permanent', fleetVersion: VERSION,
-        settings: provenanceSettings(o, cfg.defaults),
+        settings: provenanceSettings(o, cfg.defaults, prepared.role.temporaryLoops),
         surface: o.surface, creationActionId: o.creationActionId, callerRole: o.callerRole,
       });
       mkdirSync(agentDir(o.name), { recursive: true });
@@ -388,14 +441,19 @@ async function spawnTempInner(
   onStage: CreationDeps['onStage'],
 ): Promise<string> {
   const cfg = loadConfig(o.configPath);
+  const { temporaryLoops, ...launchRole } = preparedRole;
   const role: ResolvedRole = {
-    ...preparedRole, sourceFile: '(temp)', loops: undefined, roomMemberStartup: o.roomMemberStartup,
+    ...launchRole, sourceFile: '(temp)',
+    ...(o.noLoops === true ? { loops: [] as ResolvedRoleLoop[] }
+      : temporaryLoops?.length ? { loops: temporaryLoops } : { loops: undefined }),
+    temporaryLoopSource: o.loopSource ?? (temporaryLoops?.length ? 'agent-template' : 'omitted'),
+    roomMemberStartup: o.roomMemberStartup,
   };
   onStage?.('writing_role');
   const dir = applyRole(role, { temp: true, identityGuarantee: 'unverified' });
   const provenance = buildProvenance({
     role: o.name, lifetime: 'temporary', fleetVersion: VERSION,
-    settings: provenanceSettings(o, cfg.defaults),
+    settings: provenanceSettings(o, cfg.defaults, preparedRole.temporaryLoops),
     surface: o.surface, creationActionId: o.creationActionId, callerRole: o.callerRole,
   });
   writeProvenance(dir, provenance);

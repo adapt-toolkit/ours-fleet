@@ -13,6 +13,7 @@ import {
 } from '../src/rooms-tasks/room-state.js';
 import { acceptTaskTerminalIntent } from '../src/rooms-tasks/terminal.js';
 import { snapshotTemplate } from '../src/rooms-tasks/templates.js';
+import { readLaunchSnapshot } from '../src/rooms-tasks/launch-snapshot.js';
 import type { FleetConfig } from '../src/config.js';
 import { CoworkProtocolError, type CoworkAdapter } from '../src/rooms-tasks/cowork-adapter.js';
 import type { TemplateDefinition } from '../src/rooms-tasks/types.js';
@@ -226,7 +227,7 @@ describe('task create/start surface parity', () => {
     } });
     current = { ...current, roomTemplates: {} };
     const started = await app.startTask({ actor: { kind: 'local_control', surface: 'cli' },
-      taskId: backlog.task_id });
+      taskId: backlog.task_id, template: 'empty-team@1' });
     expect(started).toMatchObject({ state: 'active', room_id: 'room-shared',
       execution_plan: { plan_hash: backlog.execution_plan!.plan_hash, room_policy: { anonymous: true } } });
     expect(h.createRoom).toHaveBeenCalledOnce();
@@ -251,10 +252,14 @@ describe('task create/start surface parity', () => {
     });
     const app = new TaskRoomApplicationService(undefined, { loadConfiguration: () => cfg,
       cowork: () => h.adapter, binPath: () => '/fleet', provisionMembers: provision as any });
-    const members = { dev: { approval: 'allow' as const } };
+    const members = { dev: { approval: 'allow' as const, loops: { progress: {
+      interval: '1m', initial_delay: '0s', prompt: 'SEALED_IDEMPOTENT_LOOP',
+    } } } };
     const active = await app.createTask({ actor: { kind: 'local_control', surface: 'cli' },
       title: 'Active plan', template: 'member-team', members, origin: { type: 'cli' } });
     expect(active.state).toBe('active');
+    const sealedHash = active.execution_plan!.snapshot.launch_snapshot_hash!;
+    expect(JSON.stringify(readLaunchSnapshot(sealedHash))).toContain('SEALED_IDEMPOTENT_LOOP');
     await expect(app.ensureTaskWork({ actor: { kind: 'local_control', surface: 'cli' },
       taskId: active.task_id, template: 'member-team', members }))
       .resolves.toMatchObject({ status: 'already_active' });
@@ -262,12 +267,21 @@ describe('task create/start surface parity', () => {
     await expect(app.ensureTaskWork({ actor: { kind: 'local_control', surface: 'cli' },
       taskId: active.task_id, members }))
       .resolves.toMatchObject({ status: 'already_active' });
+    await expect(app.ensureTaskWork({ actor: { kind: 'local_control', surface: 'cli' },
+      taskId: active.task_id, template: 'member-team@1' }))
+      .resolves.toMatchObject({ status: 'already_active' });
     cfg = { ...config(), roomTemplates: { 'member-team': memberDefinition, 'empty-team': definition },
       agentTemplates: { Dev: { role: { inline: {} }, brain: { inline: { harness: 'codex' } },
         permissions: { approval: 'ask' } } }, resolveAgentDefinition: cfg.resolveAgentDefinition } as FleetConfig;
     await expect(app.ensureTaskWork({ actor: { kind: 'local_control', surface: 'cli' },
       taskId: active.task_id, members: { dev: { approval: 'ask' } } }))
       .rejects.toMatchObject({ code: 'template_mismatch' });
+    await expect(app.ensureTaskWork({ actor: { kind: 'local_control', surface: 'cli' },
+      taskId: active.task_id, members: { dev: { approval: 'allow', loops: { progress: {
+        interval: '2m', prompt: 'DIFFERENT_LOOP',
+      } } } } }))
+      .rejects.toMatchObject({ code: 'template_mismatch' });
+    expect(JSON.stringify(readLaunchSnapshot(sealedHash))).toContain('SEALED_IDEMPOTENT_LOOP');
     await expect(app.ensureTaskWork({ actor: { kind: 'local_control', surface: 'cli' },
       taskId: active.task_id, template: 'empty-team' }))
       .rejects.toMatchObject({ code: 'template_mismatch' });

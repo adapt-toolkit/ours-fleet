@@ -31,6 +31,12 @@ selects one inline/ref Role and Brain and carries its operational fields.
 Agent Templates under \`~/fleet/agent_templates\` are inert reusable launch definitions;
 only explicit files under \`~/fleet/agents\` are persistent lifecycle instances.
 Room members use \`agent_template\` and receive immutable content-addressed snapshots.
+An Agent Template may declare up to 64 temporary-only named \`loops\`; persistent Agent
+instances reject them. Each loop requires \`interval\` (1m..30d) and bounded
+nonblank \`prompt\`, with optional \`enabled\` (default true), \`initial_delay\`
+(default interval, 0s..30d), and \`jitter\` (default 0s, < interval, <=1h).
+Execution is fixed skip-if-busy with no ordinary missed-tick backlog/replay;
+restart recovery may preserve at most one recent late occurrence.
 Legacy top-level \`roles:\` and \`fleet.d\` are rejected. Validate the complete
 trusted source set with \`config\` and \`doctor\` before starting or restarting.
 
@@ -318,7 +324,22 @@ ours-fleet template show team [-c FILE]
 ours-fleet task create --title "Solo task" --template single [-c FILE]
 ours-fleet task create --title "Reviewed change" --template pair [-c FILE]
 ours-fleet task create --title "Phased delivery" --template team [-c FILE]
+ours-fleet spawn --temp Scout --role SELECTION --brain SELECTION --loops-file PRIVATE.yaml
+ours-fleet task start TASK --member developer --loops-file PRIVATE.yaml
+ours-fleet task start TASK --member critic --no-loops
 \`\`\`
+
+\`--loops-file\` must be an owner-only, non-symlink regular file <=1 MB containing
+exactly one top-level non-empty \`loops:\` mapping. \`--no-loops\` explicitly
+disables loops. They are mutually exclusive and rejected for permanent spawn.
+For a grouped room member the whole CLI block overrides its Agent Template;
+the template overrides omission. Omission preserves historical no-loop behavior
+and never inherits manifest wildcard loops. Fleet validates before side effects,
+seals normalized timings plus exact private prompts, and reuses that snapshot for
+idempotent start, retry, recovery, and replacement. Trusted authoring and the
+private sealed runtime retain exact prompts; resolved launch, task, room,
+provenance, and audit presentations show source, policy, timing, prompt bytes,
+and prompt SHA-256 instead of prompt text.
 
 An alternate manifest \`-c /path/custom.yaml\` uses \`/path/custom/\` as its split
 root. Repeated init only fills missing files and never adopts a newer default.

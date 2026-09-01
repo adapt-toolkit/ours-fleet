@@ -773,15 +773,23 @@ export class TaskRoomApplicationService {
         'anonymous override does not match the existing Room launch policy', { room: task.room_id });
     if (TASK_TERMINAL_STATES.includes(task.state)) throw new TaskRoomApplicationError(
       'task_terminal', 'task terminal', { task: input.taskId, state: task.state });
+    const durableTemplate = task.room_id
+      ? getRoomRecord(task.room_id)?.template_snapshot ?? task.execution_plan?.snapshot
+      : task.execution_plan?.snapshot;
+    const templateRequestMatches = !input.template || (durableTemplate !== undefined
+      && (input.template === durableTemplate.name
+        || input.template === `${durableTemplate.name}@${durableTemplate.version}`));
+    const memberRequestMatches = input.members === undefined || (task.execution_plan !== undefined
+      && task.execution_plan.overrides_hash === hashMemberOverrides(input.members));
+    const durableRequestMatches = durableTemplate !== undefined
+      && templateRequestMatches && memberRequestMatches;
     if (task.state === 'active' && task.room_id) {
       if (input.template || input.members) {
-        const pinned = getRoomRecord(task.room_id)?.template_snapshot ?? task.execution_plan?.snapshot;
+        const pinned = durableTemplate;
         if (!pinned) throw new TaskRoomApplicationError('template_mismatch',
           'active task has no durable execution plan', { room: task.room_id });
+        if (durableRequestMatches) return { task, status: 'already_active' };
         const templateName = input.template ?? pinned.name;
-        if ((!input.template || input.template === pinned.name) && input.members
-            && task.execution_plan?.overrides_hash === hashMemberOverrides(input.members))
-          return { task, status: 'already_active' };
         const definition = resolveTemplate(templateName, cfg.roomTemplates ?? {});
         if (!definition) throw new TaskRoomApplicationError('template_not_found',
           'template not found', { template: templateName });
@@ -801,11 +809,10 @@ export class TaskRoomApplicationService {
       throw new Error(`task ${task.task_id} template reference does not match its durable execution snapshot`);
     const templateName = input.template ?? durable?.name ?? task.template?.name
       ?? cfg.tasks?.default_room_template ?? cfg.rooms?.defaults?.template ?? 'single';
-    const storedOverridesMatch = !!(durable && input.members && task.execution_plan?.overrides_hash
-      === hashMemberOverrides(input.members));
-    const definition = durable && !input.template && (!input.members || storedOverridesMatch) ? undefined
+    const storedOverridesMatch = !!(durable && memberRequestMatches);
+    const definition = durable && durableRequestMatches ? undefined
       : resolveTemplate(templateName, cfg.roomTemplates ?? {});
-    if (input.template && !definition) throw new TaskRoomApplicationError(
+    if (input.template && !definition && !durableRequestMatches) throw new TaskRoomApplicationError(
       'template_not_found', 'template not found', { template: templateName });
     if (!durable && !definition) throw new TaskRoomApplicationError(
       'template_not_found', 'template not found', { template: templateName });

@@ -19,7 +19,7 @@ import { agentDir, agentsRoot, tmpRoot, logsRoot, deriveXdgRuntimeDir, defaultCo
 import { findRole, loadConfig, ROLE_NAME_RE, type AgentSelection } from './config.js';
 import type { YamlMode } from './config-yaml.js';
 import { formatDuration } from './duration.js';
-import { redactSensitive, resolvedPlan } from './resolved-plan.js';
+import { redactSensitive, resolvedPlan, resolvedRolePlan } from './resolved-plan.js';
 import { pickBackend } from './supervisor/index.js';
 import { up, down, type OpsDeps } from './ops.js';
 import { readRestartLedger, runSupervised, runTemp } from './runner.js';
@@ -34,13 +34,13 @@ import type { WatchdogReport } from './watchdog/report.js';
 import { watchdogAddressable } from './watchdog/query.js';
 import { lastProvenance, type SpawnOpts } from './spawn.js';
 import { stringify } from 'yaml';
-import { resolvedRolePlan } from './resolved-plan.js';
 import { creationBuildNote, formatProvenance, readProvenance } from './creation.js';
 import { doctor } from './doctor.js';
 import {
   allWarnings, analyzeFleetPermissions, effectivePermissionMode, formatNative,
 } from './permissions.js';
 import { AI_DOCS } from './docs.js';
+import { renderAgentConfiguration, selectionOrigin, summarizeResolvedLaunch } from './lifecycle-summary.js';
 import { classifyActivity, describeSessionState } from './session/activity.js';
 import type { SessionActivity } from './session/types.js';
 import {
@@ -1060,6 +1060,8 @@ cOpt(program.command('spawn [name]').description('spawn a new agent (permanent b
   .option('--filesystem <mode>', 'common filesystem intent: read-only|workspace|unrestricted')
   .option('--unattended <mode>', 'permission behavior without a console: deny|wait')
   .option('--isolation-file <path>', 'file holding an isolation: mapping (same schema as fleet.yaml)')
+  .option('--loops-file <path>', 'owner-only YAML containing exactly loops: for this temporary agent')
+  .option('--no-loops', 'explicitly disable temporary-agent loops')
   .option('--dry-run', 'validate and print without reserving or creating anything')
   .option('--json', 'with --dry-run, emit a stable secret-safe JSON result')
   .action(async (name, opts) => {
@@ -1075,6 +1077,8 @@ cOpt(program.command('spawn [name]').description('spawn a new agent (permanent b
         approval: opts.approval,
         filesystem: opts.filesystem, unattended: opts.unattended,
         isolationFile: opts.isolationFile, configPath: opts.configuration,
+        loopsFile: opts.loopsFile, noLoops: opts.loops === false,
+        loopSource: opts.loopsFile || opts.loops === false ? 'cli' : 'omitted',
         dryRun: opts.dryRun, json: opts.json,
       };
       if (o.json && !o.dryRun) throw new Error('--json is currently valid only with --dry-run');
@@ -1087,7 +1091,7 @@ cOpt(program.command('spawn [name]').description('spawn a new agent (permanent b
           process.stdout.write(`${JSON.stringify({
             schemaVersion: result.schemaVersion,
             warning: result.warning,
-            roleDocument: result.roleDocument,
+            roleDocument: redactSensitive(result.roleDocument),
             resolvedRole: resolvedRolePlan(result.resolvedRole),
           }, null, 2)}\n`);
         } else {
@@ -1100,7 +1104,7 @@ cOpt(program.command('spawn [name]').description('spawn a new agent (permanent b
       if (proxyStateDir) {
         // Paths entered in the agent shell belong to that shell's cwd, not the
         // supervisor process. Normalize before crossing the control boundary.
-        for (const key of ['isolationFile'] as const) {
+        for (const key of ['isolationFile', 'loopsFile'] as const) {
           if (o[key]) o[key] = resolvePath(o[key]!);
         }
         const response = await controlRequest(
@@ -1121,6 +1125,7 @@ cOpt(program.command('spawn [name]').description('spawn a new agent (permanent b
           + `monitor=${result.monitor.mode} interrupt=${result.monitor.interrupt}`);
         if (result.inherited.length)
           console.log(`  inherited omitted defaults from ${result.caller}: ${result.inherited.join(', ')}`);
+        if (result.configuration) console.log(`  ${renderAgentConfiguration(result.configuration)}`);
         console.log(`→ watch it: ours-fleet peek ${result.role}   |   attach: ours-fleet attach ${result.role}`);
         return;
       }
@@ -1143,6 +1148,13 @@ cOpt(program.command('spawn [name]').description('spawn a new agent (permanent b
       }
       console.log(`  permission=${plannedPermissionMode.fleetMode} `
         + `native=${plannedPermissionMode.nativeMode}`);
+      console.log(`  ${renderAgentConfiguration(summarizeResolvedLaunch(
+        created.plan.preview.resolvedRole, {
+          role: selectionOrigin(o.role ?? o.agentDefinition?.role),
+          brain: selectionOrigin(o.brain ?? o.agentDefinition?.brain),
+          permissionMode: plannedPermissionMode,
+        },
+      ))}`);
       console.log(`→ watch it: ours-fleet peek ${roleName}   |   attach: ours-fleet attach ${roleName}`);
     } catch (e) { die(e); }
   });

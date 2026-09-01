@@ -484,19 +484,44 @@ describe('ours-fleet CLI', () => {
       expect(r.stdout).toContain(flag);
   });
 
-  it('spawn offers --isolation-file, the one new operator input', async () => {
+  it('spawn help exposes isolation and temporary-loop inputs', async () => {
     const r = await run(['spawn', '--help']);
     expect(r.code).toBe(0);
     expect(r.stdout).toContain('--isolation-file');
     // Commander wraps help text, so match on words rather than a whole phrase.
     expect(r.stdout).toContain('isolation:');
     expect(r.stdout).toContain('fleet.yaml');
+    expect(r.stdout).toContain('--loops-file');
+    expect(r.stdout).toContain('--no-loops');
   });
 
   it('docs describe creation-time isolation', async () => {
     const r = await run(['docs']);
     expect(r.stdout).toContain('--isolation-file');
     expect(r.stdout).toContain('Creation-time isolation');
+  });
+
+  it('docs describe sealed temporary Agent Template loops and CLI precedence', async () => {
+    const r = await run(['docs']);
+    expect(r.code).toBe(0);
+    for (const text of ['--loops-file', '--no-loops', 'skip-if-busy', 'Agent Template', 'SHA-256'])
+      expect(r.stdout).toContain(text);
+  });
+
+  it('spawn temporary-loop dry-run JSON shows resolved metadata without prompt text', async () => {
+    writeV2Fixture(join(dir, 'fleet.yaml'), { roles: {} });
+    const file = join(dir, 'loops.yaml');
+    writeFileSync(file, 'loops:\n  progress:\n    interval: 1m\n    initial_delay: 0s\n    jitter: 30s\n    prompt: CLI_LOOP_CANARY\n', { mode: 0o600 });
+    const r = await run(['spawn', 'DryLoop', '--temp', '--role', 'inline:{"mission":"work"}',
+      '--brain', 'inline:{"harness":"codex"}', '--loops-file', file, '--dry-run', '--json']);
+    expect(r.code, r.stderr).toBe(0);
+    const output = JSON.parse(r.stdout);
+    expect(output.resolvedRole.temporaryLoopSource).toBe('cli');
+    expect(output.resolvedRole.loops[0]).toMatchObject({
+      name: 'progress', intervalMs: 60_000, initialDelayMs: 0, jitterMs: 30_000,
+      prompt: { bytes: 15, sha256: expect.stringMatching(/^[a-f0-9]{64}$/) },
+    });
+    expect(r.stdout).not.toContain('CLI_LOOP_CANARY');
   });
 
   it('docs describe binary room deletion and legacy config semantics', async () => {

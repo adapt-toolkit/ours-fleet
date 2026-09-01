@@ -53,6 +53,34 @@ describe('typed room member overrides', () => {
     expect(() => parseGroupedMemberArgs(['--brain', 'Fast'])).toThrow('must follow --member');
   });
 
+  it('seals normalized Agent Template loops and supports an explicit member disable', () => {
+    const withLoops = { ...cfg, agentTemplates: structuredClone(cfg.agentTemplates) };
+    withLoops.agentTemplates!.Dev.loops = { progress: {
+      interval: '1m', initial_delay: '0s', prompt: 'LOOP_PROMPT_CANARY',
+    } };
+    const inherited = prepareExecutionPlan(template, withLoops);
+    expect(inherited.launchDefinitions['dev:Dev'].loops).toEqual({ progress: {
+      enabled: true, interval: '1m', initial_delay: '0s', jitter: '0s',
+      prompt: 'LOOP_PROMPT_CANARY',
+    } });
+    expect(inherited.snapshot.members[0].loop_source).toBe('agent-template');
+    expect(JSON.stringify(inherited.snapshot)).not.toContain('LOOP_PROMPT_CANARY');
+    expect(inherited.snapshot.members[0].agent_projection).toMatchObject({
+      loops: { progress: { prompt: { bytes: 18, sha256: expect.stringMatching(/^[a-f0-9]{64}$/) } } },
+    });
+
+    const disabled = prepareExecutionPlan(template, withLoops, { dev: { loops: false } });
+    expect(disabled.launchDefinitions['dev:Dev'].loops).toBeUndefined();
+    expect(disabled.snapshot.members[0].loop_source).toBe('cli');
+    expect(disabled.overrides.dev.loops).toBe(false);
+  });
+
+  it('rejects contradictory generic and typed loop overrides', () => {
+    expect(() => prepareExecutionPlan(template, cfg, { dev: {
+      overrides: { loops: { hidden: { interval: '1m', prompt: 'x' } } },
+    } })).toThrow('overrides.loops is unsupported');
+  });
+
   it('accepts only bounded trusted members files', () => {
     const root = mkdtempSync(join(tmpdir(), 'fleet-members-')); roots.push(root);
     const file = join(root, 'members.yaml');

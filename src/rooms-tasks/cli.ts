@@ -16,13 +16,14 @@ import { parseGroupedMemberArgs, readMembersFile, type MemberOverrides } from '.
 
 const MEMBER_ARG_FLAGS = new Set([
   '--member', '--agent-template', '--brain', '--role', '--approval', '--filesystem', '--unattended',
-  '--cwd', '--model', '--effort',
+  '--cwd', '--model', '--effort', '--loops-file', '--no-loops',
 ]);
 
 export function cliMemberOverrides(membersFile?: string, argv = process.argv.slice(2)): MemberOverrides | undefined {
   const grouped: string[] = [];
   for (let i = 0; i < argv.length; i++) if (MEMBER_ARG_FLAGS.has(argv[i])) {
-    grouped.push(argv[i], argv[i + 1]); i += 1;
+    grouped.push(argv[i]);
+    if (argv[i] !== '--no-loops') { grouped.push(argv[i + 1]); i += 1; }
   }
   if (membersFile && grouped.length) throw new Error('--members-file cannot be combined with grouped --member options');
   if (membersFile) return readMembersFile(membersFile);
@@ -778,6 +779,8 @@ export function registerTaskCommands(parent: Command, cOpt: (cmd: Command) => Co
     .option('--cwd <path>', 'working directory for the current member block')
     .option('--model <id>', 'model for the current member block')
     .option('--effort <level>', 'reasoning effort for the current member block')
+    .option('--loops-file <path>', 'owner-only loops: YAML for the current temporary member')
+    .option('--no-loops', 'disable loops for the current temporary member')
     .option('--json', 'JSON output')
     .action(async (opts: {
       configuration?: string; title: string; template?: string;
@@ -953,6 +956,8 @@ export function registerTaskCommands(parent: Command, cOpt: (cmd: Command) => Co
     .option('--cwd <path>', 'working directory for current member')
     .option('--model <id>', 'model for current member')
     .option('--effort <level>', 'reasoning effort for current member')
+    .option('--loops-file <path>', 'owner-only loops: YAML for current member')
+    .option('--no-loops', 'disable loops for current member')
     .option('--json', 'JSON output')
     .action(async (id: string, opts: { configuration?: string; json?: boolean; template?: string; membersFile?: string }, command: Command) => {
       try {
@@ -1296,6 +1301,8 @@ export function registerTaskCommands(parent: Command, cOpt: (cmd: Command) => Co
     .option('--cwd <path>', 'working directory for current member')
     .option('--model <id>', 'model for current member')
     .option('--effort <level>', 'reasoning effort for current member')
+    .option('--loops-file <path>', 'owner-only loops: YAML for current member')
+    .option('--no-loops', 'disable loops for current member')
     .option('--json', 'JSON output')
     .action(async (id: string, opts: { configuration?: string; template?: string; json?: boolean; membersFile?: string }, command: Command) => {
       try {
@@ -1407,6 +1414,8 @@ export function registerRoomCommands(parent: Command, cOpt: (cmd: Command) => Co
     .option('--cwd <path>', 'working directory for current member')
     .option('--model <id>', 'model for current member')
     .option('--effort <level>', 'reasoning effort for current member')
+    .option('--loops-file <path>', 'owner-only loops: YAML for current member')
+    .option('--no-loops', 'disable loops for current member')
     .option('--json', 'JSON output')
     .action(async (opts: {
       configuration?: string; name: string; template?: string;
