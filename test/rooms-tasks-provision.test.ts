@@ -69,7 +69,7 @@ function cfg(overrides: Partial<FleetConfig> = {}): FleetConfig {
   return {
     roles: [], vars: {}, defaults: {}, files: ['test'], startStaggerMs: 0,
     agentTemplates: Object.fromEntries(
-      ['Agent', 'Secretary', 'Critic', 'Architect', 'Developer', 'Tester']
+      ['LocalCoordinator', 'Developer', 'Critic']
         .map(name => [name, structuredClone(worker)])),
     diagnostics: [], watchdogs: [], loops: [], ...overrides,
   } as FleetConfig;
@@ -492,11 +492,12 @@ describe('simple Cowork room member startup', () => {
       process.env[FLEET_PROXY_STATE_DIR_ENV] = '/state/Coordinator';
       process.env[FLEET_PROXY_CALLER_ENV] = 'Coordinator';
       const roles = templateName === 'pair'
-        ? ['Secretary', 'Critic'] : ['Architect', 'Developer', 'Tester'];
+        ? ['Developer', 'Critic'] : ['LocalCoordinator', 'Developer', 'Critic'];
       const selected = {
         name: templateName, version: 1, description: `${templateName} fixture`,
         members: roles.map(role => ({
-          slot: role.toLowerCase(), role, count: 1, agent_template: role,
+          slot: role === 'LocalCoordinator' ? 'local_coordinator' : role.toLowerCase(),
+          role, count: 1, agent_template: role,
         })),
       };
       const tpl = snapshotTemplate(selected);

@@ -124,7 +124,7 @@ export const fleetProxyCommandInventory = Object.freeze(Object.fromEntries(
   Object.entries(AGENT_SURFACES).map(([surface, commands]) => [surface, [...commands]])));
 const DENIED = new Set([
   'up', 'down', 'restart', 'force-restart', 'attach', 'send', 'loops', 'owner-channel',
-  'watchdog-run', 'watchdog-report', 'rm', 'init', 'migrate-agent-templates', 'web',
+  'watchdog-run', 'watchdog-report', 'rm', 'init', 'migrate-agent-templates', 'migrate-role-defaults', 'web',
 ]);
 export const fleetProxyTopLevelInventory = Object.freeze({
   safeRead: [...SAFE_READ], agent: Object.keys(AGENT_SURFACES), public: [

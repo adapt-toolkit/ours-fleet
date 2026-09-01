@@ -7,8 +7,11 @@ import {
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { spawnSync } from 'node:child_process';
-import { migrateLegacyStarterPresets } from '../src/preset-migration.js';
+import { migrateLegacyStarterPresets, migratePackagedRoleDefaults } from '../src/preset-migration.js';
 import { splitRootFor } from '../src/config.js';
+import { bootstrapPresets } from '../src/preset-bootstrap.js';
+import '../src/harness/claude-code.js';
+import '../src/harness/codex.js';
 
 const names = ['Agent', 'Architect', 'Critic', 'Developer', 'Secretary', 'Tester'];
 let dir: string;
@@ -167,5 +170,152 @@ describe('legacy starter Agent migration', () => {
       },
     })).toThrow(/lock changed during atomic release; foreign lock preserved/);
     expect(readFileSync(lock, 'utf8')).toBe('foreign-token\n');
+  });
+});
+
+describe('packaged v3 role-default adoption', () => {
+  it('recognizes the exact generated-v3 brain selections without matching nearby customization', () => {
+    const config = join(dir, 'generated-v3.yaml');
+    const root = splitRootFor(config);
+    mkdirSync(join(root, 'agent_templates'), { recursive: true, mode: 0o700 });
+    mkdirSync(join(root, 'agents'), { mode: 0o700 });
+    writeFileSync(config, 'api_version: ours.network/fleet/v2\n', { mode: 0o600 });
+    const brains: Record<string, string> = {
+      Agent: 'development', Architect: 'coordination', Critic: 'review',
+      Developer: 'development', Secretary: 'development', Tester: 'review',
+    };
+    for (const [role, brain] of Object.entries(brains)) writeFileSync(
+      join(root, 'agent_templates', `${role}.yaml`),
+      `role: { ref: ${role} }\nbrain: { ref: ${brain} }\npermissions: { approval: ask, filesystem: workspace, unattended: deny }\n`,
+      { mode: 0o600 },
+    );
+    writeFileSync(join(root, 'agents', 'FleetCoordinator.yaml'),
+      'template: Agent\noverrides: { role: Agent, brain: coordination, coordinator: FleetCoordinator }\n',
+      { mode: 0o600 });
+
+    let result = migratePackagedRoleDefaults(config);
+    for (const role of ['Agent', 'Architect', 'Secretary', 'Tester'])
+      expect(result.removals).toContain(join(root, 'agent_templates', `${role}.yaml`));
+    for (const role of ['Critic', 'Developer'])
+      expect(result.replacements).toContain(join(root, 'agent_templates', `${role}.yaml`));
+    expect(result.replacements).toContain(join(root, 'agents', 'FleetCoordinator.yaml'));
+
+    writeFileSync(join(root, 'agent_templates', 'Critic.yaml'),
+      'role: { ref: Critic }\nbrain: { ref: review }\ncoordinator: MyCoordinator\npermissions: { approval: ask, filesystem: workspace, unattended: deny }\n',
+      { mode: 0o600 });
+    result = migratePackagedRoleDefaults(config);
+    expect(result.preserved).toContain(join(root, 'agent_templates', 'Critic.yaml'));
+    expect(result.replacements).not.toContain(join(root, 'agent_templates', 'Critic.yaml'));
+  });
+
+  it('dry-runs exact defaults while preserving customized same-name files byte-for-byte', () => {
+    const config = join(dir, 'adopt.yaml');
+    const root = splitRootFor(config);
+    mkdirSync(join(root, 'roles'), { recursive: true, mode: 0o700 });
+    mkdirSync(join(root, 'agent_templates'), { mode: 0o700 });
+    mkdirSync(join(root, 'room_templates'), { mode: 0o700 });
+    writeFileSync(config, 'api_version: ours.network/fleet/v2\n', { mode: 0o600 });
+    writeFileSync(join(root, 'roles', 'Secretary.yaml'),
+      'mission: Implement the agreed solution and maintain the task\'s shared record.\npersona: |\n  Turn agreed decisions into focused code, documentation, and tests. Keep collaborators\n  informed with compact evidence and preserve unrelated state. Pause material work for\n  required review; do not merge, publish, or widen scope without owner authorization.\nbio: Implementing partner and record keeper; engage to deliver reviewed changes.\n', { mode: 0o600 });
+    writeFileSync(join(root, 'agent_templates', 'Secretary.yaml'),
+      'role: { ref: Secretary }\nbrain: { ref: claude-default }\npermissions: { approval: ask, filesystem: workspace, unattended: deny }\n', { mode: 0o600 });
+    const custom = 'version: 7\ndescription: my pair\nroom: {}\nmembers: []\n';
+    writeFileSync(join(root, 'room_templates', 'pair.yaml'), custom, { mode: 0o600 });
+    const before = snapshot(root);
+    const result = migratePackagedRoleDefaults(config, {}, { nonce: 'role-dry' });
+    expect(result.write).toBe(false);
+    expect(result.removals).toContain(join(root, 'roles', 'Secretary.yaml'));
+    expect(result.removals).toContain(join(root, 'agent_templates', 'Secretary.yaml'));
+    expect(result.preserved).toContain(join(root, 'room_templates', 'pair.yaml'));
+    expect(snapshot(root)).toEqual(before);
+  });
+
+  it('atomically removes exact obsolete files, preserves v4/custom files, and reruns as a no-op', () => {
+    const config = join(dir, 'write.yaml'); bootstrapPresets(config); const root = splitRootFor(config);
+    writeFileSync(join(root, 'roles', 'Secretary.yaml'),
+      'mission: Implement the agreed solution and maintain the task\'s shared record.\npersona: |\n  Turn agreed decisions into focused code, documentation, and tests. Keep collaborators\n  informed with compact evidence and preserve unrelated state. Pause material work for\n  required review; do not merge, publish, or widen scope without owner authorization.\nbio: Implementing partner and record keeper; engage to deliver reviewed changes.\n', { mode: 0o600 });
+    const custom = 'mission: my local coordinator\n';
+    writeFileSync(join(root, 'roles', 'LocalCoordinator.yaml'), custom, { mode: 0o600 });
+    const result = migratePackagedRoleDefaults(config, { write: true }, { nonce: 'role-write' });
+    expect(existsSync(result.backupPath)).toBe(true);
+    expect(existsSync(join(root, 'roles', 'Secretary.yaml'))).toBe(false);
+    expect(readFileSync(join(root, 'roles', 'LocalCoordinator.yaml'), 'utf8')).toBe(custom);
+    const rerun = migratePackagedRoleDefaults(config, { write: true }, { nonce: 'role-rerun' });
+    expect(rerun.removals).toEqual([]); expect(rerun.replacements).toEqual([]);
+    expect(rerun.additions).toEqual([]); expect(existsSync(rerun.backupPath)).toBe(false);
+  });
+
+  it('refuses publication when a preserved custom template would dangle after removal', () => {
+    const config = join(dir, 'dangling.yaml'); bootstrapPresets(config); const root = splitRootFor(config);
+    writeFileSync(join(root, 'roles', 'Secretary.yaml'),
+      'mission: Implement the agreed solution and maintain the task\'s shared record.\npersona: |\n  Turn agreed decisions into focused code, documentation, and tests. Keep collaborators\n  informed with compact evidence and preserve unrelated state. Pause material work for\n  required review; do not merge, publish, or widen scope without owner authorization.\nbio: Implementing partner and record keeper; engage to deliver reviewed changes.\n', { mode: 0o600 });
+    writeFileSync(join(root, 'agent_templates', 'Secretary.yaml'),
+      'role: { ref: Secretary }\nbrain: { ref: claude-default }\npermissions: { approval: ask, filesystem: workspace, unattended: deny }\n', { mode: 0o600 });
+    writeFileSync(join(root, 'room_templates', 'custom.yaml'),
+      'version: 1\ndescription: custom\nroom: {}\nmembers:\n  - { slot: secretary, role: Secretary, count: 1, agent_template: Secretary }\n', { mode: 0o600 });
+    const before = snapshot(root);
+    expect(() => migratePackagedRoleDefaults(config, { write: true }, { nonce: 'role-dangle' }))
+      .toThrow(/staged configuration.*invalid|Agent Template|Role/i);
+    expect(snapshot(root)).toEqual(before);
+  });
+
+  it('retains named recovery evidence when second publication rename and rollback fail', () => {
+    const config = join(dir, 'rollback.yaml'); bootstrapPresets(config); const root = splitRootFor(config);
+    writeFileSync(join(root, 'roles', 'Secretary.yaml'),
+      'mission: Implement the agreed solution and maintain the task\'s shared record.\npersona: |\n  Turn agreed decisions into focused code, documentation, and tests. Keep collaborators\n  informed with compact evidence and preserve unrelated state. Pause material work for\n  required review; do not merge, publish, or widen scope without owner authorization.\nbio: Implementing partner and record keeper; engage to deliver reviewed changes.\n', { mode: 0o600 });
+    let calls = 0;
+    expect(() => migratePackagedRoleDefaults(config, { write: true }, {
+      nonce: 'role-rollback', rename: (from, to) => {
+        calls++; if (calls >= 2) throw new Error(`rename ${calls} failed`); renameSync(from, to);
+      },
+    })).toThrow(/rollback failed.*role-defaults-backup-role-rollback/i);
+    expect(existsSync(join(dir, '.rollback.role-defaults-backup-role-rollback'))).toBe(true);
+  });
+
+  it.each(['custom-tree', 'manifest'] as const)(
+    'refuses publication and preserves a concurrent %s edit', target => {
+    const config = join(dir, `concurrent-${target}.yaml`); bootstrapPresets(config); const root = splitRootFor(config);
+    writeFileSync(join(root, 'roles', 'Secretary.yaml'),
+      'mission: Implement the agreed solution and maintain the task\'s shared record.\npersona: |\n  Turn agreed decisions into focused code, documentation, and tests. Keep collaborators\n  informed with compact evidence and preserve unrelated state. Pause material work for\n  required review; do not merge, publish, or widen scope without owner authorization.\nbio: Implementing partner and record keeper; engage to deliver reviewed changes.\n',
+      { mode: 0o600 });
+    const custom = join(root, 'roles', 'MyCustomRole.yaml');
+    const originalRole = 'mission: before concurrent edit\n';
+    writeFileSync(custom, originalRole, { mode: 0o600 });
+    const originalManifest = readFileSync(config, 'utf8');
+    const newerRole = 'mission: newer concurrent edit\n';
+    const newerManifest = 'api_version: ours.network/fleet/v2\nvars: { concurrent: newer }\n';
+    const nonce = `role-concurrent-${target}`;
+
+    expect(() => migratePackagedRoleDefaults(config, { write: true }, {
+      nonce, beforeRoleDefaultPublish: () => {
+        if (target === 'custom-tree') writeFileSync(custom, newerRole, { mode: 0o600 });
+        else writeFileSync(config, newerManifest, { mode: 0o600 });
+      },
+    })).toThrow(/post-rename verification failed.*live root restored.*staged recovery retained/i);
+    expect(readFileSync(custom, 'utf8')).toBe(target === 'custom-tree' ? newerRole : originalRole);
+    expect(readFileSync(config, 'utf8')).toBe(target === 'manifest' ? newerManifest : originalManifest);
+    expect(existsSync(join(dir, `.concurrent-${target}.role-defaults-stage-${nonce}`))).toBe(true);
+    expect(existsSync(join(dir, `.concurrent-${target}.role-defaults-backup-${nonce}`))).toBe(false);
+  });
+
+  it('restores the live root when post-rename verification encounters a concurrent symlink', () => {
+    const config = join(dir, 'verification-error.yaml'); bootstrapPresets(config); const root = splitRootFor(config);
+    writeFileSync(join(root, 'roles', 'Secretary.yaml'),
+      'mission: Implement the agreed solution and maintain the task\'s shared record.\npersona: |\n  Turn agreed decisions into focused code, documentation, and tests. Keep collaborators\n  informed with compact evidence and preserve unrelated state. Pause material work for\n  required review; do not merge, publish, or widen scope without owner authorization.\nbio: Implementing partner and record keeper; engage to deliver reviewed changes.\n',
+      { mode: 0o600 });
+    const custom = join(root, 'roles', 'MyCustomRole.yaml');
+    const external = join(dir, 'newer-external-role.yaml');
+    writeFileSync(custom, 'mission: old\n', { mode: 0o600 });
+    writeFileSync(external, 'mission: newer external\n', { mode: 0o600 });
+
+    expect(() => migratePackagedRoleDefaults(config, { write: true }, {
+      nonce: 'role-proof-error', beforeRoleDefaultPublish: () => {
+        rmSync(custom); symlinkSync(external, custom);
+      },
+    })).toThrow(/post-rename verification failed.*live root restored.*symlink or special file/i);
+    expect(existsSync(root)).toBe(true);
+    expect(lstatSync(custom).isSymbolicLink()).toBe(true);
+    expect(existsSync(join(dir, '.verification-error.role-defaults-stage-role-proof-error'))).toBe(true);
+    expect(existsSync(join(dir, '.verification-error.role-defaults-backup-role-proof-error'))).toBe(false);
   });
 });

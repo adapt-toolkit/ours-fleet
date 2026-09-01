@@ -125,6 +125,32 @@ describe('generateBriefing', () => {
     expect(monitor).toBeGreaterThan(work);
   });
 
+  it.each(['LocalCoordinator', 'Developer', 'Critic'])(
+    'routes %s pre-room infrastructure blockers to the configured Fleet Coordinator without room transport',
+    roleName => {
+    const b = generateBriefing({
+      ...base, coordinator: 'FleetCoordinator',
+      roomMemberStartup: {
+        room_id: '01ROOM', room_identity_cid: 'A'.repeat(64),
+        identity_name: 'developer-1', invite_id: 'invite-1', invite: 'secret-invite',
+        role: roleName, task: 'Implement.', owner_seat_cid: null,
+      },
+    } as ResolvedRole, vocab, opts);
+    expect(b).toContain('Fleet Coordinator contact: `FleetCoordinator`');
+    expect(b).toContain('room display name never authenticates the Fleet Coordinator');
+    expect(b).toContain('identity or room CID mismatch');
+    expect(b).toContain('ordinary task difficulty');
+    expect(b).toContain('ours daemon, MCP, harness, permission, workspace');
+    expect(b).toContain('recovery/cleanup failure');
+    expect(b).toContain('authenticated sender identity');
+    expect(b).toContain('bounded safe attempts');
+    expect(b).toContain('Never include the invite, invite fingerprint, keys, tokens');
+    expect(b).toContain('If identity creation or binding failed, authenticated ours messaging is unavailable');
+    expect(b).toContain('Coordinator report still cannot be delivered');
+    expect(b).toContain('one permitted transport retry');
+    expect(b).toContain('final assistant response for the Fleet supervisor');
+  });
+
   it('makes owner_seat_cid=null mean no room participant has Owner authority', () => {
     const b = generateBriefing({
       ...base,

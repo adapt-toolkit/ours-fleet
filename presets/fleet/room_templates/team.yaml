@@ -1,12 +1,12 @@
 version: 1
-description: "Phased task pipeline: Architect specifies, Developer implements, Tester verifies"
+description: "Locally coordinated team: LocalCoordinator sequences, Developer executes, Critic reviews"
 room: { quiet_membership: false, anonymous: false }
 contract: |
-  Architect produces a spec and posts it to the room. Work pauses for owner approval.
-  Developer implements per approved spec.
-  Tester verifies spec conformance and test coverage.
-  Completion requires tester sign-off.
+  LocalCoordinator coordinates sequencing, handoffs, context, and blockers among existing members.
+  Developer owns implementation and verification evidence.
+  Critic independently reviews and withholds sign-off on material failures.
+  LocalCoordinator has no Fleet lifecycle or agent-management authority.
 members:
-  - { slot: architect, role: Architect, count: 1, agent_template: Architect }
+  - { slot: local_coordinator, role: LocalCoordinator, count: 1, agent_template: LocalCoordinator }
   - { slot: developer, role: Developer, count: 1, agent_template: Developer }
-  - { slot: tester, role: Tester, count: 1, agent_template: Tester }
+  - { slot: critic, role: Critic, count: 1, agent_template: Critic }

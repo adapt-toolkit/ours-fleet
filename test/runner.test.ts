@@ -176,6 +176,41 @@ const writeCfg = (roles: Record<string, object>) =>
   writeV2Fixture(join(dir, 'fleet.yaml'), { roles });
 
 describe('managed fleet child environment', () => {
+  it('does not register fleet lifecycle spawning for a room member', async () => {
+    const name = 'RoomMember';
+    const d = agentDir(name, true); mkdirSync(d, { recursive: true });
+    writeFileSync(join(d, 'role.yaml'), stringify({
+      name, harness: 'fake', session: 'acp', identity: name, sourceFile: '(temp)',
+      permissions: { approval: 'ask', filesystem: 'workspace', unattended: 'deny' },
+      roomMemberStartup: {
+        room_id: '01ROOM', room_identity_cid: 'A'.repeat(64), identity_name: name,
+        invite_id: 'invite-1', invite: 'secret', role: 'LocalCoordinator',
+        task: 'Coordinate.', owner_seat_cid: null,
+      },
+    }));
+    const { deps } = fakeWorld({ exitCode: '0', exitFile: join(d, '.exit-status') });
+    const registered: unknown[] = [];
+    await runOnce(name, { temp: true }, { ...deps, createControlServer: () => ({
+      start: async () => {}, close: async () => {},
+      setFleetSpawner: value => { registered.push(value); }, setFleetAuditor: () => {},
+      setOwnerChannel: () => {}, setConfigReloader: () => {}, setLoopManager: () => {},
+    }) });
+    expect(registered).toEqual([]);
+  });
+
+  it('keeps fleet lifecycle spawning registered for a persistent Coordinator', async () => {
+    writeCfg({ Coordinator: { harness: 'fake', session: 'acp' } });
+    const d = agentDir('Coordinator'); mkdirSync(d, { recursive: true });
+    const { deps } = fakeWorld({ exitCode: '0', exitFile: join(d, '.exit-status') });
+    const registered: unknown[] = [];
+    await runOnce('Coordinator', {}, { ...deps, createControlServer: () => ({
+      start: async () => {}, close: async () => {},
+      setFleetSpawner: value => { registered.push(value); }, setFleetAuditor: () => {},
+      setOwnerChannel: () => {}, setConfigReloader: () => {}, setLoopManager: () => {},
+    }) });
+    expect(registered).toHaveLength(1); expect(registered[0]).toBeTypeOf('function');
+  });
+
   it.each(['', '0', '1'])
   ('actively omits supervised ACP OURS_AUTOSTART=%j and preserves sibling env', value => {
     const role = {

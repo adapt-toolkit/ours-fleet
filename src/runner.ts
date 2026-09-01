@@ -736,7 +736,7 @@ export async function runOnce(
       unsubscribeRecovery?.();
       throw error;
     }
-    control.setFleetSpawner(async requested => {
+    if (!role.roomMemberStartup) control.setFleetSpawner(async requested => {
       const event = await executeManagedSpawn(role, configPath, requested, deps.log);
       // Room-member launches are collected with their Task/Room transaction so
       // causal delivery is Task → Room → Agents → Room active → Task active.

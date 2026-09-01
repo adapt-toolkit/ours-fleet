@@ -9,7 +9,7 @@ import { Command } from 'commander';
 import { VERSION } from './version.js';
 import { INIT_COMPLETION_GUIDANCE } from './init-guidance.js';
 import { bootstrapPresets } from './preset-bootstrap.js';
-import { migrateLegacyStarterPresets } from './preset-migration.js';
+import { migrateLegacyStarterPresets, migratePackagedRoleDefaults } from './preset-migration.js';
 import {
   analyzeInstalls, buildInfo, buildLabel, discoverInstalls, runningLabel,
 } from './provenance.js';
@@ -1180,6 +1180,23 @@ cOpt(program.command('migrate-agent-templates')
       console.log(`Staging path: ${result.stagingPath}`);
       console.log(`Recovery backup: ${result.backupPath}`);
       if (!result.write) console.log('Re-run with --write to apply this exact migration class.');
+    } catch (error) { die(error); }
+  });
+
+cOpt(program.command('migrate-role-defaults')
+  .description('dry-run adoption of exact revision-3 role defaults; add --write to apply atomically')
+  .option('--write', 'apply the reviewed migration and retain a private recovery backup'))
+  .action((opts: { configuration?: string; write?: boolean }) => {
+    try {
+      const result = migratePackagedRoleDefaults(opts.configuration ?? defaultConfigPath(), { write: opts.write });
+      console.log(result.write ? 'Applied packaged role-default migration.' : 'Dry run only; no files were changed.');
+      for (const path of result.removals) console.log(`Remove ${path}`);
+      for (const path of result.replacements) console.log(`Replace ${path}`);
+      for (const path of result.additions) console.log(`Add ${path}`);
+      for (const path of result.preserved) console.log(`Preserve customized ${path}`);
+      console.log(`Staging path: ${result.stagingPath}`);
+      console.log(`Recovery backup: ${result.backupPath}`);
+      if (!result.write) console.log('Re-run with --write to adopt only these exact recognized defaults.');
     } catch (error) { die(error); }
   });
 

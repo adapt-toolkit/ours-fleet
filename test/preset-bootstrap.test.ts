@@ -19,8 +19,8 @@ describe('packaged preset bootstrap', () => {
   it('materializes a complete resolvable standard configuration at an explicit root', () => {
     const configPath = join(root, 'alternate.yaml');
     const seeded = bootstrapPresets(configPath);
-    expect(seeded.revision).toBe(3);
-    expect(seeded.created).toHaveLength(66);
+    expect(seeded.revision).toBe(4);
+    expect(seeded.created).toHaveLength(61);
     const cfg = loadConfig(configPath);
     expect(listTemplates(cfg.roomTemplates ?? {}).map(template => template.name))
       .toEqual(['pair', 'single', 'team']);
@@ -45,14 +45,14 @@ describe('packaged preset bootstrap', () => {
   it('is repeatable and preserves edited and partial trees byte-for-byte', () => {
     const configPath = join(root, 'fleet.yaml');
     bootstrapPresets(configPath);
-    const role = join(root, 'fleet', 'roles', 'Agent.yaml');
+    const role = join(root, 'fleet', 'roles', 'Developer.yaml');
     writeFileSync(role, 'mission: my edited contract\n', { mode: 0o600 });
-    rmSync(join(root, 'fleet', 'roles', 'Tester.yaml'));
+    rmSync(join(root, 'fleet', 'roles', 'LocalCoordinator.yaml'));
     const second = bootstrapPresets(configPath);
     expect(readFileSync(role, 'utf8')).toBe('mission: my edited contract\n');
-    expect(existsSync(join(root, 'fleet', 'roles', 'Tester.yaml'))).toBe(true);
-    expect(second.created).toEqual([join(root, 'fleet', 'roles', 'Tester.yaml')]);
-    expect(second.preserved).toHaveLength(65);
+    expect(existsSync(join(root, 'fleet', 'roles', 'LocalCoordinator.yaml'))).toBe(true);
+    expect(second.created).toEqual([join(root, 'fleet', 'roles', 'LocalCoordinator.yaml')]);
+    expect(second.preserved).toHaveLength(60);
   });
 
   it('creates private files and refuses symlink targets', () => {

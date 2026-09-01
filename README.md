@@ -488,14 +488,21 @@ ours-fleet task create --title "Phased delivery" --template team
 
 `ours-fleet init -c /path/custom.yaml` seeds `/path/custom/` instead. Init reports
 the packaged preset revision and source directory and only seeds missing files.
-It never upgrades an edited preset. To adopt a newer packaged file explicitly,
-copy the reported source file beside the existing target as `.new-default`, review
-`diff -u`, then replace the target yourself. This is the sole adoption operation;
-rerunning init is not an update. Users with the exact generated six-worker legacy
-starter set must migrate explicitly: first run `ours-fleet migrate-agent-templates -c FILE`
-for a zero-write plan, then review every move/addition/recovery path and rerun with
-`--write`. Customized or ambiguous known starters are refused without
-mutation; unrelated custom persistent Agents are preserved.
+It never upgrades an edited preset. Revision-3 role defaults have an explicit,
+fail-closed adoption command: first run `ours-fleet migrate-role-defaults -c FILE`
+for a zero-write plan, review every removal, replacement, addition, preserved custom
+file, staging path, and recovery path, then rerun with `--write`. Only exact semantic
+matches for the packaged-bootstrap and generated revision-3 forms are changed;
+same-named customized files remain byte-identical, and a dangling custom reference
+refuses publication. Rerunning the migration is a no-op.
+
+For manual adoption of a single newer packaged file, copy the reported source beside
+the target as `.new-default`, inspect `diff -u TARGET TARGET.new-default`, then replace
+the target yourself. Rerunning init is not an update. Users with the still older exact
+generated six-worker starter Agent set must first run
+`ours-fleet migrate-agent-templates -c FILE` for its zero-write plan, review every
+move/addition/recovery path, and rerun with `--write`. Customized or ambiguous known
+starters are refused without mutation; unrelated custom persistent Agents are preserved.
 
 Rooms always use `ours-cowork`; there is no room-provider selector. Configure
 the cowork daemon connection and the room owner directly:

@@ -1,4 +1,3 @@
-template: Agent
-overrides:
-  role: { ref: Agent }
-  coordinator: FleetCoordinator
+role: { ref: Coordinator }
+brain: { ref: claude-default }
+permissions: { approval: ask, filesystem: workspace, unattended: deny }

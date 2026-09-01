@@ -1,3 +1,4 @@
 role: { ref: Critic }
 brain: { ref: claude-default }
+coordinator: FleetCoordinator
 permissions: { approval: ask, filesystem: workspace, unattended: deny }

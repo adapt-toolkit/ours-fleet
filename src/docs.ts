@@ -301,10 +301,20 @@ ours-fleet task create --title "Phased delivery" --template team [-c FILE]
 
 An alternate manifest \`-c /path/custom.yaml\` uses \`/path/custom/\` as its split
 root. Repeated init only fills missing files and never adopts a newer default.
-For explicit adoption, copy one file from init's reported packaged source beside
-the target as \`.new-default\`, inspect \`diff -u TARGET TARGET.new-default\`, then
-replace TARGET yourself. The exact generated six-worker legacy starter set has an
-explicit fail-closed migration (dry-run by default):
+Revision-3 packaged-bootstrap and generated role defaults have an exact-semantic,
+fail-closed migration (dry-run by default):
+
+\`ours-fleet migrate-role-defaults [-c FILE]\`
+\`ours-fleet migrate-role-defaults [-c FILE] --write\`
+
+Review removals, replacements, additions, preserved custom files, staging path,
+and recovery path. Same-named custom files stay byte-identical; dangling custom
+references refuse publication, and a successful rerun is a no-op. For explicit
+single-file adoption, copy from init's reported packaged source beside the target
+as \`.new-default\`, inspect \`diff -u TARGET TARGET.new-default\`, then replace it.
+
+The exact generated six-worker legacy starter Agent set has its own fail-closed
+migration (dry-run by default):
 
 \`ours-fleet migrate-agent-templates [-c FILE]\`
 \`ours-fleet migrate-agent-templates [-c FILE] --write\`

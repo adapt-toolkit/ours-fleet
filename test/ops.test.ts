@@ -292,9 +292,9 @@ describe('up / down / restart', () => {
     await restartRoles(config, [], d, 'fresh', configPath);
     expect(calls.filter(call => call[0] === 'restart')).toEqual([['restart', 'FleetCoordinator']]);
     const before = [...calls];
-    await expect(up(config, ['Secretary'], d, configPath)).rejects.toThrow(/inert Agent Template/);
-    await expect(down(config, ['Secretary'], d)).rejects.toThrow(/inert Agent Template/);
-    await expect(restartRoles(config, ['Secretary'], d, 'keep', configPath))
+    await expect(up(config, ['Developer'], d, configPath)).rejects.toThrow(/inert Agent Template/);
+    await expect(down(config, ['Developer'], d)).rejects.toThrow(/inert Agent Template/);
+    await expect(restartRoles(config, ['Developer'], d, 'keep', configPath))
       .rejects.toThrow(/inert Agent Template/);
     expect(calls).toEqual(before);
     await expect(restartRoles(config, ['DoesNotExist'], d, 'keep', configPath))
@@ -303,13 +303,13 @@ describe('up / down / restart', () => {
 
   it('a persistent Agent reusing a template remains independently lifecycle-targetable', async () => {
     const configPath = join(dir, 'fleet.yaml'); bootstrapPresets(configPath);
-    const instance = join(dir, 'fleet', 'agents', 'SecretaryInstance.yaml');
-    writeFileSync(instance, 'template: Secretary\noverrides:\n  identity: SecretaryInstance\n', { mode: 0o600 });
+    const instance = join(dir, 'fleet', 'agents', 'DeveloperInstance.yaml');
+    writeFileSync(instance, 'template: Developer\noverrides:\n  identity: DeveloperInstance\n', { mode: 0o600 });
     const config = loadConfig(configPath);
     const { calls, backend } = fakeBackend(); const { d } = deps(backend);
-    await restartRoles(config, ['SecretaryInstance'], d, 'keep', configPath);
-    expect(calls).toContainEqual(['restart', 'SecretaryInstance']);
-    expect(calls).not.toContainEqual(['restart', 'Secretary']);
+    await restartRoles(config, ['DeveloperInstance'], d, 'keep', configPath);
+    expect(calls).toContainEqual(['restart', 'DeveloperInstance']);
+    expect(calls).not.toContainEqual(['restart', 'Developer']);
   });
 
   it('up records the given configPath in each role\'s .config-path marker', async () => {

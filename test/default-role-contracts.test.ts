@@ -1,0 +1,105 @@
+import { describe, expect, it } from 'vitest';
+import { mkdtempSync, readFileSync, readdirSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { createHash } from 'node:crypto';
+import { bootstrapPresets } from '../src/preset-bootstrap.js';
+import { loadConfig, splitRootFor } from '../src/config.js';
+import { listTemplates } from '../src/rooms-tasks/templates.js';
+import { generateSetup, type InitAnswers } from '../src/init-wizard.js';
+import '../src/harness/claude-code.js';
+import '../src/harness/codex.js';
+
+const answers: InitAnswers = {
+  subscriptions: ['codex'], reasoning: 'balanced',
+  models: Object.fromEntries(['development', 'review', 'coordination'].map(work => [work, {
+    harness: 'codex', session: 'acp', model: 'gpt-5.6-sol',
+    efforts: ['low', 'medium', 'high', 'xhigh', 'max', 'ultra'],
+  }])) as InitAnswers['models'],
+};
+
+describe('packaged default role contract', () => {
+  it('fresh bootstrap exposes only the three executor roles and exact room layouts', () => {
+    const root = mkdtempSync(join(tmpdir(), 'fleet-default-roles-'));
+    try {
+      const config = join(root, 'fleet.yaml');
+      bootstrapPresets(config);
+      const split = splitRootFor(config);
+      expect(readdirSync(join(split, 'roles')).sort())
+        .toEqual(['Coordinator.yaml', 'Critic.yaml', 'Developer.yaml', 'LocalCoordinator.yaml']);
+      expect(readdirSync(join(split, 'agent_templates')).sort())
+        .toEqual(['Critic.yaml', 'Developer.yaml', 'LocalCoordinator.yaml']);
+      const cfg = loadConfig(config, { yamlMode: 'strict' });
+      const layouts = Object.fromEntries(listTemplates(cfg.roomTemplates ?? {})
+        .map(template => [template.name, template.members.map(member => member.role)]));
+      expect(layouts).toEqual({
+        pair: ['Developer', 'Critic'], single: ['Developer'],
+        team: ['LocalCoordinator', 'Developer', 'Critic'],
+      });
+      const coordinator = cfg.roles.find(role => role.name === 'FleetCoordinator')!;
+      expect(coordinator.agentSelections?.role).toEqual({ ref: 'Coordinator' });
+      expect(coordinator.bio).toMatch(/Fleet workflow coordinator/);
+      expect(coordinator.persona).toMatch(/Own progress and workflow, not execution quality/);
+      expect(coordinator.bio).not.toBe(coordinator.persona);
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+
+  it('generated setup uses the packaged role text as its single source of truth', () => {
+    const files = generateSetup(answers).files;
+    expect([...files.keys()].filter(path => path.startsWith('roles/')).sort()).toEqual([
+      'roles/Coordinator.yaml', 'roles/Critic.yaml', 'roles/Developer.yaml',
+      'roles/LocalCoordinator.yaml',
+    ]);
+    expect([...files.keys()].filter(path => path.startsWith('agent_templates/')).sort()).toEqual([
+      'agent_templates/Critic.yaml', 'agent_templates/Developer.yaml',
+      'agent_templates/LocalCoordinator.yaml',
+    ]);
+    expect(files.get('agents/FleetCoordinator.yaml')).toContain('role: { ref: Coordinator }');
+  });
+
+  it('gives every retained role a distinct public bio and enforces executor escalation boundaries', () => {
+    const root = mkdtempSync(join(tmpdir(), 'fleet-role-contracts-'));
+    try {
+      const config = join(root, 'fleet.yaml');
+      bootstrapPresets(config);
+      const presets = loadConfig(config, { yamlMode: 'strict' }).rolePresets!;
+      for (const name of ['Coordinator', 'LocalCoordinator', 'Developer', 'Critic']) {
+        expect(presets[name].bio, name).toEqual(expect.any(String));
+        expect(presets[name].persona, name).toEqual(expect.any(String));
+        expect(presets[name].bio, name).not.toBe(presets[name].persona);
+      }
+      for (const name of ['LocalCoordinator', 'Developer', 'Critic']) {
+        const persona = String(presets[name].persona);
+        expect(persona, name).toMatch(/configured Fleet Coordinator/);
+        expect(persona, name).toMatch(/authenticated sender/);
+        expect(persona, name).toMatch(/task\/room context/);
+        expect(persona, name).toMatch(/bounded safe attempts/);
+        expect(persona, name).toMatch(/canonical next action/);
+        expect(persona, name).toMatch(/invites or\s+invite fingerprints/);
+        expect(persona, name).toMatch(/transient blocker-report transport.*at most once after backoff/s);
+        expect(persona, name).toMatch(/10 minutes\s+after a direct room attempt/);
+        expect(persona, name).toMatch(/BLOCKED|resting/);
+        expect(persona, name).toMatch(/(?:Leave recover,\s+block\/unblock, review\/finish, deletion, replacement, and respawn decisions to Fleet Coordinator|Only the configured Fleet Coordinator may recover, block, unblock, review, finish, delete, replace,\s+or respawn Fleet resources)/);
+      }
+      const local = String(presets.LocalCoordinator.persona);
+      expect(local).toMatch(/Do not implement task work/);
+      expect(local).toMatch(/spawn, provision, replace, or manage agents/);
+      expect(local).toMatch(/create tasks or rooms/);
+      expect(local).toMatch(/Never claim Owner or Fleet Coordinator authority/);
+      expect(local).toMatch(/continued nonresponse\s+then confirms an orchestration blocker/);
+      expect(local).toMatch(/other confirmed infrastructure or orchestration\s+blocker.*without waiting for the peer window/s);
+      expect(local).toMatch(/your own work state BLOCKED or resting/);
+      expect(local).toMatch(/never invoke a Fleet task block/);
+      const coordinatorBytes = readFileSync('presets/fleet/roles/Coordinator.yaml');
+      expect(createHash('sha256').update(coordinatorBytes).digest('hex'))
+        .toBe('d3755d292924cf29ba88abe68bf084aec91daae2e1c3eb6c64b57019d8c4dc52');
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+
+  it('default presentation generators contain no legacy executor labels', () => {
+    for (const path of [
+      'scripts/generate-report-mocks.mjs', 'scripts/generate-inbox-task-mocks.mjs',
+      'scripts/generate-rich-task-mocks.mjs', 'scripts/generate-table-task-mocks.mjs',
+    ]) expect(readFileSync(path, 'utf8'), path).not.toMatch(/\b(?:Secretary|Architect|Tester)\b/);
+  });
+});
