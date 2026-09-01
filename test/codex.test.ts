@@ -26,6 +26,32 @@ const execWith = (oursCodex: boolean): Exec => async (cmd, args) => {
 const okExec = execWith(false);
 
 describe('prepareSession', () => {
+  it('launches the direct app-server with native CLI options and exact overrides', () => {
+    const adapter = makeCodexAdapter(okExec).agentSession;
+    expect(adapter.prepareLaunch(role({
+      session: 'codex-app-server',
+      harness_options: { launcher: 'codex', profile: 'fleet', search: true },
+    }), { env: { TOKEN: 'safe' } })).toEqual({
+      argv: ['codex', '--profile', 'fleet', '--search', 'app-server'],
+      env: { TOKEN: 'safe' },
+    });
+    expect(adapter.prepareLaunch(role({
+      session: 'codex-app-server',
+      session_options: { codex_app_server: { command: ['native-shim', '--stdio'] } },
+      harness_options: { profile: 'ignored', search: true },
+    }), { env: {} }).argv).toEqual(['native-shim', '--stdio']);
+  });
+
+  it('keeps launcher auto as a signal-safe ours-codex/codex fallback', () => {
+    const launch = makeCodexAdapter(okExec).agentSession.prepareLaunch(role({
+      session: 'codex-app-server', harness_options: { launcher: 'auto' },
+    }), { env: {} });
+    expect(launch.argv.slice(0, 2)).toEqual(['sh', '-c']);
+    expect(launch.argv[2]).toContain('exec ours-codex');
+    expect(launch.argv[2]).toContain('exec codex');
+    expect(launch.argv.at(-1)).toBe('app-server');
+  });
+
   it('maps explicit Brain model and effort to ordered required ACP options', () => {
     const session = makeCodexAdapter(okExec).agentSession;
     expect(session.sessionConfigSelections(role({ model: 'gpt-brain', effort: 'high' })))
@@ -135,6 +161,27 @@ describe('validateOptions / prereqs', () => {
     const a = makeCodexAdapter(okExec);
     expect(a.validateOptions({ sandbox: 'workspace-write', approval: 'never', search: true, monitor: true })).toEqual([]);
   });
+  it('requires native app-server roles to use the neutral permission interface', () => {
+    const a = makeCodexAdapter(okExec);
+    const native = role({ session: 'codex-app-server' });
+    expect(a.validateOptions({
+      approval: 'on-request',
+      sandbox: 'workspace-write',
+      config: { approval_policy: 'never', sandbox_mode: 'danger-full-access' },
+    }, native))
+      .toEqual(expect.arrayContaining([
+        expect.objectContaining({
+          path: 'harness_options.approval',
+          message: expect.stringContaining('permissions.approval: ask|auto|allow'),
+        }),
+        expect.objectContaining({
+          path: 'harness_options.sandbox',
+          message: expect.stringContaining('permissions.filesystem'),
+        }),
+        expect.objectContaining({ path: 'harness_options.config.approval_policy' }),
+        expect.objectContaining({ path: 'harness_options.config.sandbox_mode' }),
+      ]));
+  });
   it('validates launcher/profile/config/add_dirs and conflicting approval aliases', () => {
     const a = makeCodexAdapter(okExec);
     const errs = a.validateOptions({
@@ -202,6 +249,36 @@ describe('Codex neutral permission mapping and the unattended floor', () => {
       { approval: 'allow', filesystem: 'workspace', unattended: 'deny' });
     expect(t).toMatchObject({ supported: true, native: { approval: 'never', sandbox: 'workspace-write' } });
     expect(checkUnattendedFloor((t as { capabilities: never }).capabilities).meets).toBe(true);
+  });
+
+  it('reports native app-server permissions without ACP mode coupling', () => {
+    const native = a.effectivePermissions!(role({
+      session: 'codex-app-server',
+      permissions: { approval: 'allow', filesystem: 'workspace', unattended: 'deny' },
+    }));
+    expect(native).toMatchObject({
+      supported: true, exact: true,
+      native: { approval: 'never', sandbox: 'workspace-write' },
+    });
+    expect(a.effectivePermissionMode!(role({
+      session: 'codex-app-server',
+      permissions: { approval: 'allow', filesystem: 'workspace', unattended: 'deny' },
+    }))).toEqual({ fleetMode: 'allow', nativeMode: 'never' });
+  });
+
+  it('does not let native harness permission aliases override neutral intent', () => {
+    const nativeRole = role({
+      session: 'codex-app-server',
+      permissions: { approval: 'ask', filesystem: 'read-only', unattended: 'deny' },
+      permissionsDeclared: true,
+      harness_options: { approval: 'never', sandbox: 'danger-full-access' },
+    });
+    expect(a.effectivePermissions!(nativeRole)).toMatchObject({
+      exact: true, native: { approval: 'untrusted', sandbox: 'read-only' },
+    });
+    expect(a.nativePermissionOverrides(nativeRole.harness_options, nativeRole)).toEqual({});
+    expect(a.effectivePermissionMode!(nativeRole))
+      .toEqual({ fleetMode: 'ask', nativeMode: 'untrusted' });
   });
 
   it('reports the owner-defined bundled ACP allow and auto modes', () => {

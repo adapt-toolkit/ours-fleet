@@ -6,11 +6,11 @@
  */
 export const AI_DOCS = `# ours-fleet reference
 
-ours-fleet runs persistent or temporary, identity-bound AI roles through the
-structured ACP session path:
+ours-fleet runs persistent or temporary, identity-bound AI roles through a
+provider-neutral managed-session interface:
 
 - harness: \`claude-code\` or \`codex\`
-- session: \`acp\` (default and only supported value)
+- session: \`acp\` (default) or \`codex-app-server\` (Codex only)
 - lifetime: permanent (supervised, restartable) or \`spawn --temp\`
 
 ## Discover and validate
@@ -186,7 +186,7 @@ Permanent spawn writes \`~/fleet/agents/Name.yaml\` and starts a supervised role
 \`--temp\` writes active state under \`~/.ours-fleet/tmp\` and starts an independent
 transient supervisor (a collected systemd unit or submitted launchd job). It is
 not enabled across reboot and does not die when the role that spawned it restarts.
-Brain definitions own the ACP session backend. When a temporary role's bound identity
+Brain definitions own the managed session backend. When a temporary role's bound identity
 closes or its session ends, the supervisor, monitor and live roster entry retire
 together; state moves intact to \`~/.ours-fleet/recovery/temporary\` with a
 termination record. Failed launches use the same archive rather than deleting
@@ -218,7 +218,7 @@ only sustained authoritative absence closes the role. Unreachable, malformed, or
 valid-but-empty daemon indexes are ambiguous and reset closure debounce rather
 than becoming cleanup authority.
 
-Inside a managed ACP role, public \`ours-fleet\` commands cross an authenticated
+Inside a managed role, public \`ours-fleet\` commands cross an authenticated
 supervisor attribution boundary before Commander parsing. The original CLI remains
 the executor inside the role's existing OS sandbox, and ordinary CLI validation is
 the source of truth. Hidden worker entry points remain internal; public lifecycle and
@@ -278,7 +278,7 @@ An Agent is a separate bare document under \`~/fleet/agents/<ID>.yaml\`:
 
 \`\`\`yaml
 role: { inline: { mission: Coordinate work and delegate implementation. } }
-brain: { inline: { harness: codex, session: acp, model: gpt-model-id } }
+brain: { inline: { harness: codex, session: codex-app-server, model: gpt-model-id } }
 identity: Coordinator
 cwd: \${work_root}/project
 oversee: [{ agent: Worker, interval: 5m }]
@@ -444,12 +444,13 @@ Prefer the harness-neutral \`permissions\` block:
 - \`approval: ask|auto|allow\`: portable permission policy. \`deny\` remains a
   deprecated, fail-closed compatibility alias for existing fleet files.
 - \`filesystem: read-only|workspace|unrestricted\`: filesystem intent
-- \`unattended: deny|wait\`: what ACP does when no console can answer a request
+- \`unattended: deny|wait\`: what a managed session does when no console can
+  answer a request
 
-The backend translates this common intent. Harness-native settings in
-\`harness_options\` take precedence where supplied. Do not choose
-\`allow\`/\`unrestricted\`, Codex \`never\`/\`danger-full-access\`, or Claude
-\`bypassPermissions\` without explicit authorization.
+The backend translates this common intent. Native Codex app-server roles reject
+permission aliases in \`harness_options\`; Codex ACP and Claude retain their
+legacy native-override compatibility. Do not choose \`allow\`/\`unrestricted\`
+or Claude \`bypassPermissions\` without explicit authorization.
 
 ### Creation-time isolation
 
@@ -522,12 +523,14 @@ permissions through its harness and check the result against a fixed floor:
 deny those requests with nobody to see it; with \`unattended: wait\` it warns,
 because a human can still attach and answer.
 
-Security meaning: \`ask\` maps to Codex \`untrusted\` and Claude \`default\`.
-\`auto\` selects Codex ACP \`agent\` (\`on-request\` + \`workspace-write\`) and
-Claude \`acceptEdits\`. \`approval: allow\` selects Codex ACP's fully
-non-interactive yolo mode, reported as \`agent-full-access\` (\`never\` +
-\`danger-full-access\`), and Claude \`bypassPermissions\`. These modes genuinely
-permit the actions the role was authorized to take —
+Security meaning: native Codex maps \`ask\` → \`untrusted\`, \`auto\` →
+\`on-request\`, and \`allow\` → \`never\`; its independent filesystem mapping is
+\`read-only\` → \`read-only\`, \`workspace\` → \`workspace-write\`, and
+\`unrestricted\` → \`danger-full-access\`. Users configure only the Fleet names.
+Claude maps \`ask\` to \`default\`, \`auto\` to \`acceptEdits\`, and \`allow\` to
+\`bypassPermissions\`. Codex ACP retains its adapter-specific coupled modes:
+\`auto\` selects \`agent\`, while \`allow\` selects \`agent-full-access\`. These
+modes genuinely permit the actions the role was authorized to take —
 \`dontAsk\` only suppresses the prompt while still refusing the action. Nothing
 other than an explicit \`allow\` becomes non-interactive. Legacy \`deny\` keeps
 its conservative Codex \`on-request\` / Claude \`plan\` translation. \`allow\` is therefore a real grant and
@@ -582,10 +585,28 @@ refused at validation rather than accepted and dropped. This narrows a role's
 tool surface; it does not stop the harness deferring tool schemas, which is the
 harness's own decision.
 
-Codex \`harness_options\`: \`launcher\` (auto, ours-codex, codex), \`sandbox\`
-(read-only, workspace-write, danger-full-access), \`approval\` or
-\`permission_mode\` (untrusted, on-request, never), \`profile\`, \`search\`,
-\`config\`, \`add_dirs\`, and \`monitor\`.
+Codex \`harness_options\`: \`launcher\` (auto, ours-codex, codex), \`profile\`,
+\`search\`, \`config\`, \`add_dirs\`, and \`monitor\`. Native app-server roles
+must express approval and filesystem authority through the shared
+\`permissions:\` block, never through harness options. The adapter translates
+\`ask|auto|allow\` to Codex \`untrusted|on-request|never\` and translates
+\`read-only|workspace|unrestricted\` to Codex
+\`read-only|workspace-write|danger-full-access\`.
+
+For Codex, \`session: codex-app-server\` directly runs Codex's native JSONL app
+server behind Fleet's provider-neutral session contract. It supports native item
+streaming, commentary/final phases, prompt admission, steering, interruption,
+permission requests, durable conversation projection, and thread resume. Use
+\`session: acp\` as the Codex compatibility fallback; Claude Code continues to
+use ACP. Native Codex defaults to \`codex app-server\` (or \`ours-codex app-server\`
+when launcher auto finds it). Override the exact command when necessary:
+
+\`session_options: { codex_app_server: { command: [codex, app-server] } }\`
+
+An exact command override receives no appended profile, search, or subcommand
+arguments. Native sessions persist their Codex thread in Fleet's \`.session-id\`
+and participate in its bounded fresh/resume recovery; cross-provider conversation
+portability is never assumed.
 
 ## ACP adapters
 
@@ -638,7 +659,7 @@ Inspect \`ours-fleet status Name\`, \`peek Name\`, role logs, and
 
 ## Trusted owner channel
 
-An ACP role may declare a separate ours identity which fleet — never the agent —
+Any managed role may declare a separate ours identity which fleet — never the agent —
 creates when missing and binds:
 
 \`\`\`yaml
@@ -739,12 +760,12 @@ provenance checks.
 The channel identity must be unique and must not be a role identity. The bridge
 persists bounded wire IDs only, never message/reply plaintext, and requeues input
 before starting its turn for at-least-once crash recovery. It currently requires
-the structured agent-session interface backed by ACP so correlated final replies
-retain their delivery guarantee.
+the structured agent-session interface so correlated final replies retain their
+delivery guarantee.
 
 ### Live contact and owner administration
 
-The supervisor which is already running the ACP role remains the sole binder of
+The supervisor which is already running the managed role remains the sole binder of
 \`owner_channel.identity\`. The CLI reaches that exact live \`OwnerChannel\`
 through the role's token-authenticated, mode-0600 Unix control socket for contact
 inspection and setup; it never starts another ours client and never force-binds:

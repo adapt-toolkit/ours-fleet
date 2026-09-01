@@ -42,7 +42,8 @@ export class ClaudeCodeAgentSessionAdapter implements AgentSessionAdapter {
   start(options: AgentSessionStartOptions) {
     const { role, prep, launch } = options;
     return this.transport({
-      name: role.name, argv: launch.argv, cwd: options.cwd, env: launch.env,
+      name: role.name, harness: role.harness,
+      argv: launch.argv, cwd: options.cwd, env: launch.env,
       stateDir: options.stateDir, mode: options.mode, permissions: options.permissions,
       modeId: this.strategy.permissionModeId(role),
       mcpServers: this.strategy.mcpServers(role),

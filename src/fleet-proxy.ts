@@ -1,4 +1,4 @@
-import type { MonitorConfig, ResolvedRole } from './config.js';
+import type { MonitorConfig, ResolvedRole, SessionBackendId } from './config.js';
 import type { AgentLaunchConfiguration } from './lifecycle-summary.js';
 import type { SpawnOpts } from './spawn.js';
 import { inheritedPermissionMode } from './permissions.js';
@@ -14,7 +14,7 @@ export interface ManagedFleetSpawnResult {
   lifetime: 'permanent' | 'temporary';
   statePath: string;
   harness: string;
-  session: 'acp';
+  session: SessionBackendId;
   model?: string;
   monitor: Pick<MonitorConfig, 'mode' | 'interrupt'>;
   /** Adapter-resolved portable policy and exact native runtime mode. */

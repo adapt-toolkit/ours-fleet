@@ -4,7 +4,7 @@ import { resolve } from 'node:path';
 import { loadConfig, type FleetConfig } from '../config.js';
 import { RoleRepository } from '../application/role-repository.js';
 import { FleetQueryService } from '../application/fleet-query-service.js';
-import { AcpRoleSessionAdapter } from '../application/session-control.js';
+import { RoleSessionControlAdapter } from '../application/session-control.js';
 import { StructuredLogService } from '../application/log-service.js';
 import { RoleCommandService } from '../application/role-command-service.js';
 import { RoleCreationService } from '../application/role-creation-service.js';
@@ -86,15 +86,20 @@ export async function startWebConsole(options: StartWebOptions): Promise<Running
   const repository = new RoleRepository({
     configPath: options.configPath,
     probeBackend: async name => {
-      let acp = false;
+      let backend: import('../config.js').SessionBackendId | undefined;
       const permanent = resolve(home(), '.ours-fleet', 'agents', name);
       const temporary = resolve(home(), '.ours-fleet', 'tmp', name);
       for (const dir of [permanent, temporary]) {
         if (!existsSync(controlSocketPath(dir))) continue;
-        try { acp = (await controlRequest(dir, { command: 'snapshot' }, 500)).ok; }
+        try {
+          const response = await controlRequest(dir, { command: 'snapshot' }, 500);
+          const snapshot = response.result as { backend?: unknown } | undefined;
+          if (response.ok && (snapshot?.backend === 'acp'
+              || snapshot?.backend === 'codex-app-server')) backend = snapshot.backend;
+        }
         catch { /* stale socket is evidence, not reachability */ }
       }
-      return { acp };
+      return { backend };
     },
   });
   const events = new FleetEventBus();
@@ -179,10 +184,11 @@ export async function startWebConsole(options: StartWebOptions): Promise<Running
     async session(roleId) {
       const role = await repository.get(roleId);
       if (!role) throw new FleetError('role_not_found', `no such role '${roleId}'`);
-      if (role.configuredBackend === 'acp') {
+      if (role.configuredBackend === 'acp'
+          || role.configuredBackend === 'codex-app-server') {
         const dir = repository.stateDir(role);
         if (!dir) throw new FleetError('control_unavailable', 'role state directory is unavailable');
-        return new AcpRoleSessionAdapter(dir);
+        return new RoleSessionControlAdapter(dir);
       }
       throw new FleetError('capability_unavailable', 'role session backend is unavailable');
     },

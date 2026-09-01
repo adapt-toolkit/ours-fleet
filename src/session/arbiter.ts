@@ -45,6 +45,7 @@ function retirementSignal(): { promise: Promise<void>; retire: () => void } {
 export class RoleTurnArbiter implements AgentSession {
   readonly backend;
   readonly pid;
+  readonly capabilities;
   private tail: Promise<void> = Promise.resolve();
   private unsettled = 0;
   private stopping = false;
@@ -56,6 +57,7 @@ export class RoleTurnArbiter implements AgentSession {
   constructor(private readonly session: AgentSession) {
     this.backend = session.backend;
     this.pid = session.pid;
+    this.capabilities = session.capabilities;
   }
 
   /**

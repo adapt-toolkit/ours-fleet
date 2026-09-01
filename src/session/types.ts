@@ -33,7 +33,7 @@ export type PromptOrigin =
   | { kind: 'owner-admin-console'; commandId: string };
 
 export interface RuntimeSelectorMetadata {
-  /** Exact provider/model identifier reported by the live ACP session. */
+  /** Exact provider/model identifier reported by the live managed session. */
   value: string;
   /** Complete provider-supplied label for that exact value, when available. */
   label?: string;
@@ -83,6 +83,9 @@ export type ControlFailureKind =
 
 /** Stable body-free reason shared by ACP recovery and durable ingress. */
 export const ACP_CANCEL_DEADLINE_EXCEEDED = 'ACP_CANCEL_DEADLINE_EXCEEDED';
+/** Native Codex equivalent; kept distinct so diagnostics name the failing transport. */
+export const CODEX_APP_SERVER_CANCEL_DEADLINE_EXCEEDED =
+  'CODEX_APP_SERVER_CANCEL_DEADLINE_EXCEEDED';
 
 export class SessionControlError extends Error {
   constructor(
@@ -225,7 +228,7 @@ export interface SubmitPromptOptions {
   interruptSource?: TurnCancellationSource;
   /** Typed in-process provenance. Text markers never grant this origin. */
   origin?: PromptOrigin;
-  /** Use the ACP steering extension when available; ignored by other backends. */
+  /** Inject into active work when the selected backend supports steering. */
   steer?: boolean;
   /** Audit-grade actor detail persisted with the conversation admission record. */
   actor?: { browserSession?: string };
@@ -255,10 +258,51 @@ export interface SessionSnapshot {
 }
 
 export interface SessionActivity {
-  /** ACP tool calls currently reserved (lifecycle open or permission pending). */
+  /** Tool calls currently reserved (lifecycle open or permission pending). */
   activeToolCalls: number;
   /** When the agent last sent ANY session update, replay excluded. */
   lastUpdateAt?: string;
+}
+
+/** Provider-neutral behavior exposed by a session transport. */
+export interface AgentSessionCapabilities {
+  streaming: boolean;
+  durableConversation: boolean;
+  promptInput: boolean;
+  interrupt: boolean;
+  steering: boolean;
+  permissions: boolean;
+  toolBoundaryDelivery: boolean;
+  messagePhases: boolean;
+  resume: boolean;
+}
+
+/** Conservative static capabilities used before a live session is reachable. */
+export function sessionBackendCapabilities(
+  backend: SessionBackendId, harness?: string,
+): AgentSessionCapabilities {
+  if (backend === 'codex-app-server') return {
+    streaming: true,
+    durableConversation: true,
+    promptInput: true,
+    interrupt: true,
+    steering: true,
+    permissions: true,
+    toolBoundaryDelivery: false,
+    messagePhases: true,
+    resume: true,
+  };
+  return {
+    streaming: true,
+    durableConversation: true,
+    promptInput: true,
+    interrupt: true,
+    steering: false,
+    permissions: true,
+    toolBoundaryDelivery: true,
+    messagePhases: harness === 'codex',
+    resume: true,
+  };
 }
 
 export type SessionEventKind =
@@ -286,7 +330,7 @@ export interface SessionEvent {
   text?: string;
   /**
    * Adapter-authenticated presentation phase for assistant text. Only the
-   * exact Codex ACP marker is promoted; absence/unknown values stay unset.
+   * exact Codex phase marker is promoted; absence/unknown values stay unset.
    */
   messagePhase?: 'commentary' | 'final_answer';
   /** Stable adapter message/item id when supplied. */
@@ -327,14 +371,16 @@ export interface ConversationHandlePage {
 /**
  * The live, harness-neutral contract between Fleet and one agent session.
  * Harness adapters construct this handle; orchestration code must not depend
- * on the ACP transport which currently implements it.
+ * on any concrete transport which implements it.
  */
 export interface AgentSession {
   readonly backend: SessionBackendId;
   readonly pid: number;
+  /** Live capabilities; optional only for source compatibility with external adapters. */
+  readonly capabilities?: AgentSessionCapabilities;
   isAlive(): boolean;
   snapshot(): SessionSnapshot;
-  // ── durable conversation ledger (ACP sessions only) ────────────────────────
+  // ── durable conversation ledger ────────────────────────────────────────────
   conversationPage?(request: { after?: string; limit?: number }): ConversationHandlePage;
   conversationSnapshot?(): ConversationSnapshot;
   subscribeConversation?(listener: (event: ConversationEventV1) => void): () => void;
@@ -347,7 +393,7 @@ export interface AgentSession {
   queuePrompt(text: string, options?: SubmitPromptOptions): Promise<QueuedPrompt>;
   /** Queue a prompt and wait for its terminal result. */
   submitPrompt(text: string, options?: SubmitPromptOptions): Promise<TurnResult>;
-  /** Monitor-only ACP safe-boundary delivery. Never implies human/control cancellation. */
+  /** Monitor-only safe-boundary delivery. Never implies human/control cancellation. */
   submitPromptAfterTool?(text: string, options?: SubmitPromptOptions): Promise<TurnResult>;
   /**
    * Cancel the active turn. Resolves when the cancellation has taken effect —

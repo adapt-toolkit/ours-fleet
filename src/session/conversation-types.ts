@@ -1,12 +1,12 @@
 import type { PromptOrigin, TurnCancellationSource, TurnOutcome } from './types.js';
 
 /**
- * Durable conversation domain schema for the ACP web console.
+ * Durable conversation domain schema for managed-session consoles.
  *
  * `SessionEvent` in ./types.js remains the compact diagnostic projection; the
  * types here describe the durable per-role conversation ledger. Nothing in this
- * file touches the wire: ACP updates are reduced into these shapes by the
- * normalizer, and the store assigns `seq`/`eventId`/timestamps.
+ * file touches the wire: transport updates are reduced into these shapes by a
+ * session adapter, and the store assigns `seq`/`eventId`/timestamps.
  */
 
 export type ConversationEventKind =
@@ -21,7 +21,7 @@ export type ConversationEventKind =
   | 'turn.state' | 'turn.completed'
   | 'session.state' | 'session.info' | 'capabilities.updated'
   | 'error'
-  /** A well-formed ACP update this version cannot represent. Bounded, never a crash. */
+  /** A well-formed transport update this version cannot represent. Bounded, never a crash. */
   | 'unsupported';
 
 /** Where a conversation record came from. Typed provenance, never prompt text. */

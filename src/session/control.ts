@@ -355,6 +355,9 @@ export class RoleControlServer {
               features: [
                 'events_since', 'observer_follow', 'retained_range',
                 ...(this.session.conversationPage ? ['conversation_v3'] : []),
+                ...(this.session.capabilities?.steering ? ['steering'] : []),
+                ...(this.session.capabilities?.permissions ? ['permissions'] : []),
+                ...(this.session.capabilities?.messagePhases ? ['message_phases'] : []),
               ],
             },
           });

@@ -2116,7 +2116,8 @@ export class OwnerChannel implements OwnerChannelHandle {
         startProgress(event);
         // Automatic commentary is an ACP phase extension. Other backends and
         // older adapters retain their established final-only behavior.
-        if (this.options.session.backend === 'acp') acceptCommentary(event);
+        if (this.options.session.capabilities?.messagePhases
+            ?? this.options.session.backend === 'acp') acceptCommentary(event);
       })
       : () => undefined;
     startProgress();
@@ -2151,7 +2152,8 @@ export class OwnerChannel implements OwnerChannelHandle {
       enabled: this.commentsEnabled,
       baseline: this.commentsBaseline,
       // Only the ACP backend emits the phase marker commentary relaying needs.
-      supported: this.options.session.backend === 'acp',
+      supported: this.options.session.capabilities?.messagePhases
+        ?? this.options.session.backend === 'acp',
     };
   }
 

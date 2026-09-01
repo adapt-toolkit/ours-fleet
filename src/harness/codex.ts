@@ -15,6 +15,7 @@ import {
 } from './acp-agent.js';
 import { CodexAgentSessionAdapter } from './codex-session.js';
 import type { AcpSessionTransport } from './acp-session-transport.js';
+import type { CodexAppServerSessionTransport } from './codex-session.js';
 
 interface CodexOptions {
   launcher?: string;
@@ -38,6 +39,7 @@ const LAUNCHERS = ['auto', 'ours-codex', 'codex'];
 const SANDBOX_MODES = ['read-only', 'workspace-write', 'danger-full-access'];
 /** Codex CLI's accepted `--ask-for-approval` values. */
 const APPROVAL_POLICIES = ['untrusted', 'on-request', 'never'];
+const NATIVE_PERMISSION_CONFIG_KEYS = ['approval_policy', 'sandbox_mode', 'default_permissions'];
 const BUNDLED_CODEX_ACP_VERSION = '1.1.7';
 const CODEX_ACP_PACKAGE = '@agentclientprotocol/codex-acp';
 const CODEX_PROXY_APPROVAL_ENV = 'OURS_FLEET_CODEX_APPROVAL';
@@ -134,6 +136,20 @@ function approvalPolicy(role: ResolvedRole): string | undefined {
   return a;
 }
 
+/** Native app-server policy comes only from Fleet's public permission contract. */
+function neutralApprovalPolicy(role: ResolvedRole): string {
+  if (role.permissions?.approval === 'allow') return 'never';
+  if (role.permissions?.approval === 'ask') return 'untrusted';
+  return 'on-request';
+}
+
+/** Native app-server sandbox comes only from Fleet's public filesystem contract. */
+function neutralSandboxMode(role: ResolvedRole): string {
+  if (role.permissions?.filesystem === 'read-only') return 'read-only';
+  if (role.permissions?.filesystem === 'unrestricted') return 'danger-full-access';
+  return 'workspace-write';
+}
+
 function launcherMode(role: ResolvedRole): string {
   return (role.harness_options as CodexOptions | undefined)?.launcher ?? 'auto';
 }
@@ -143,6 +159,35 @@ function bundledCodexAcp() {
 }
 
 function codexAgentLaunch(role: ResolvedRole, prep: SessionPrep): AcpLaunch {
+  if (role.session === 'codex-app-server') {
+    const configured = role.session_options?.codex_app_server?.command;
+    if (Array.isArray(configured)) return { argv: [...configured], env: prep.env };
+    if (typeof configured === 'string')
+      return { argv: ['sh', '-c', configured], env: prep.env };
+    const launcher = launcherMode(role);
+    const options = role.harness_options as CodexOptions | undefined;
+    const flags = [
+      ...(options?.profile ? ['--profile', options.profile] : []),
+      ...(options?.search ? ['--search'] : []),
+      'app-server',
+    ];
+    // Preserve the established `auto` launcher contract without resolving PATH
+    // during synchronous launch preparation. The static shell fragment passes
+    // every dynamic value as an argv element and `exec`s the selected process.
+    if (launcher === 'auto') return {
+      argv: [
+        'sh', '-c',
+        'if command -v ours-codex >/dev/null 2>&1; then exec ours-codex "$@"; else exec codex "$@"; fi',
+        'ours-fleet-codex', ...flags,
+      ],
+      env: prep.env,
+    };
+    const command = launcher === 'ours-codex' ? 'ours-codex' : 'codex';
+    return {
+      argv: [command, ...flags],
+      env: prep.env,
+    };
+  }
   const configured = role.session_options?.acp?.command;
   const resolved = configured == null
     ? codexAcpLaunchForResolution(bundledCodexAcp())
@@ -269,6 +314,7 @@ function hasInstalledOursPlugin(output: string): boolean {
 
 export function makeCodexAdapter(
   exec: Exec = realExec, transport?: AcpSessionTransport,
+  nativeTransport?: CodexAppServerSessionTransport,
 ): HarnessAdapter {
   return {
     id: 'codex',
@@ -304,7 +350,16 @@ export function makeCodexAdapter(
       permissionModeId: role => acpAgentMode(role),
       mcpServers: () => undefined,
       sessionMeta: () => undefined,
-    }, transport),
+      approvalPolicy: neutralApprovalPolicy,
+      sandbox: neutralSandboxMode,
+      nativeConfig: role => {
+        const options = role.harness_options as CodexOptions | undefined;
+        if (!options?.config) return undefined;
+        return Object.fromEntries(Object.entries(options.config)
+          .filter(([key]) => !NATIVE_PERMISSION_CONFIG_KEYS.includes(key)));
+      },
+      addDirs: role => (role.harness_options as CodexOptions | undefined)?.add_dirs,
+    }, transport, nativeTransport),
     supportsResume: true,
 
     async checkPrereqs() {
@@ -342,7 +397,7 @@ export function makeCodexAdapter(
       };
     },
 
-    validateOptions(opts: unknown): ValidationError[] {
+    validateOptions(opts: unknown, role?: ResolvedRole): ValidationError[] {
       if (opts == null) return [];
       if (typeof opts !== 'object' || Array.isArray(opts))
         return [{ path: 'harness_options', message: 'must be a map' }];
@@ -350,6 +405,23 @@ export function makeCodexAdapter(
         .filter(k => !OPTION_KEYS.includes(k))
         .map(k => ({ path: `harness_options.${k}`, message: `unknown option; allowed: ${OPTION_KEYS.join(', ')}` }));
       const o = opts as CodexOptions;
+      if (role?.session === 'codex-app-server') {
+        if (o.approval != null)
+          errs.push({
+            path: 'harness_options.approval',
+            message: 'is not accepted for codex-app-server; use permissions.approval: ask|auto|allow',
+          });
+        if (o.permission_mode != null)
+          errs.push({
+            path: 'harness_options.permission_mode',
+            message: 'is not accepted for codex-app-server; use permissions.approval: ask|auto|allow',
+          });
+        if (o.sandbox != null)
+          errs.push({
+            path: 'harness_options.sandbox',
+            message: 'is not accepted for codex-app-server; use permissions.filesystem: read-only|workspace|unrestricted',
+          });
+      }
       if (o.launcher != null && !LAUNCHERS.includes(o.launcher))
         errs.push({ path: 'harness_options.launcher', message: `must be one of: ${LAUNCHERS.join(', ')}` });
       if (o.sandbox != null && !SANDBOX_MODES.includes(o.sandbox))
@@ -372,6 +444,13 @@ export function makeCodexAdapter(
         if (typeof o.config !== 'object' || Array.isArray(o.config))
           errs.push({ path: 'harness_options.config', message: 'must be a map of Codex config keys to TOML scalar/array values' });
         else for (const [key, value] of Object.entries(o.config)) {
+          if (role?.session === 'codex-app-server' && NATIVE_PERMISSION_CONFIG_KEYS.includes(key)) {
+            errs.push({
+              path: `harness_options.config.${key}`,
+              message: 'is not accepted for codex-app-server; use the neutral permissions.approval and permissions.filesystem fields',
+            });
+            continue;
+          }
           try { encodeTomlValue(value); }
           catch (e) { errs.push({ path: `harness_options.config.${key}`, message: (e as Error).message }); }
         }
@@ -413,7 +492,8 @@ export function makeCodexAdapter(
       };
     },
 
-    nativePermissionOverrides(options: unknown): Record<string, unknown> {
+    nativePermissionOverrides(options: unknown, role?: ResolvedRole): Record<string, unknown> {
+      if (role?.session === 'codex-app-server') return {};
       const o = options as CodexOptions | undefined;
       const approval = o?.approval ?? o?.permission_mode;   // permission_mode is the alias
       return {
@@ -442,6 +522,7 @@ export function makeCodexAdapter(
     effectivePermissions(role) {
       const translated = this.translatePermissions(role.permissions);
       if (!translated.supported) return translated;
+      if (role.session === 'codex-app-server') return translated;
       const approval = approvalPolicy(role) ?? 'on-request';
       const sandbox = sandboxMode(role) ?? 'workspace-write';
       if (role.session === 'acp') {
@@ -466,11 +547,7 @@ export function makeCodexAdapter(
           capabilities: codexCapabilities(actual.approval, actual.sandbox),
         };
       }
-      return {
-        ...translated,
-        native: { approval, sandbox },
-        capabilities: codexCapabilities(approval, sandbox),
-      };
+      return translated;
     },
 
     effectivePermissionMode(role) {
@@ -484,11 +561,13 @@ export function makeCodexAdapter(
           fleetMode: fleetModeForApproval(acpModePermissions(nativeMode).approval), nativeMode,
         };
       }
-      const nativeMode = approvalPolicy(role) ?? 'untrusted';
+      const nativeMode = neutralApprovalPolicy(role);
       return { fleetMode: fleetModeForApproval(nativeMode), nativeMode };
     },
 
     inheritedPermissionMode(role) {
+      if (role.session === 'codex-app-server')
+        return fleetModeForApproval(neutralApprovalPolicy(role));
       return fleetModeForApproval(approvalPolicy(role) ?? 'untrusted');
     },
 

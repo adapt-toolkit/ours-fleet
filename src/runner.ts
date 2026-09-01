@@ -24,7 +24,10 @@ import { resourceArgs, cpuControllerDelegated } from './isolation/resources.js';
 import type { WrapContext } from './isolation/types.js';
 import { resolveLaunchRuntime } from './isolation/runtime.js';
 import { controlRequest, RoleControlServer } from './session/control.js';
-import { ACP_CANCEL_DEADLINE_EXCEEDED, classifyShellStatus } from './session/types.js';
+import {
+  ACP_CANCEL_DEADLINE_EXCEEDED, CODEX_APP_SERVER_CANCEL_DEADLINE_EXCEEDED,
+  classifyShellStatus,
+} from './session/types.js';
 import type { AgentSession, ExitRecord, TurnResult } from './session/types.js';
 import type {
   AgentSessionAdapter, AgentSessionStartOptions,
@@ -579,6 +582,7 @@ export async function runOnce(
   const runCwd = role.cwd && existsSync(role.cwd) ? role.cwd : dir;
   const prep = await adapter.prepareSession(role, { stateDir: dir, runCwd });
   const sessionBackend = role.session ?? 'acp';
+  const sessionLabel = sessionBackend === 'acp' ? 'ACP' : 'Codex app-server';
   let launch = adapter.agentSession.prepareLaunch(role, prep);
 
   // Isolation is additive: only roles that declare `isolation:` are wrapped.
@@ -674,7 +678,7 @@ export async function runOnce(
   let control: ReturnType<RunnerDeps['createControlServer']> | undefined;
   let unsubscribeRecovery: (() => void) | undefined;
   let monitorLoop: Promise<void> | undefined;
-  let acpStartupComplete = false;
+  let sessionStartupComplete = false;
   let sessionClosed = false;
   let ownerChannel: OwnerChannelHandle | undefined;
   let ownerBinder: OwnerBinderLease | undefined;
@@ -705,7 +709,7 @@ export async function runOnce(
     unsubscribeRecovery = agentSession.subscribe(event => {
       if (event.kind !== 'error' || !event.text) return;
       const evidence = classifyFailureText(
-        event.text, 'acp', new Date(deps.now()).toISOString());
+        event.text, sessionBackend, new Date(deps.now()).toISOString());
       if (evidence) resolvedMonitorDeps.onFailureEvidence?.(evidence);
     });
     if (role.owner_channel) {
@@ -759,7 +763,7 @@ export async function runOnce(
         // steer into the live turn instead; after it completes, honor the
         // configured interrupt policy normally.
         const policy = options?.interrupt;
-        const interrupt = policy === true && acpStartupComplete;
+        const interrupt = policy === true && sessionStartupComplete;
         const promptOptions = {
           interrupt, steer: true,
           ...(interrupt ? { interruptSource: 'fleet-monitor' as const } : {}),
@@ -767,7 +771,7 @@ export async function runOnce(
         };
         // Startup is already a protected boundary: as with immediate mode,
         // steer rather than waiting on/cancelling the runner-owned first turn.
-        const result = policy === 'after_tool' && acpStartupComplete
+        const result = policy === 'after_tool' && sessionStartupComplete
           ? await arbiter!.submitPromptAfterTool(text, promptOptions)
           : await arbiter!.submitPrompt(text, promptOptions);
         const steered = result.accepted
@@ -827,20 +831,20 @@ export async function runOnce(
           exit: {
             version: 1,
             class: 'program-exit',
-            detail: `ACP startup triggered model recovery (${modelRecovery})`,
+            detail: `${sessionLabel} startup triggered model recovery (${modelRecovery})`,
           },
           rotated: false,
           mode,
           modelRecovery,
         };
       }
-      throw new Error(`[${name}] ACP startup prompt ${started.outcome}` +
+      throw new Error(`[${name}] ${sessionLabel} startup prompt ${started.outcome}` +
         `${started.detail ? `: ${started.detail}` : ''}`);
     }
     if (interruptedForWake)
-      deps.log(`[${name}] ACP startup prompt cancelled by ${started.cancellationSource}; `
+      deps.log(`[${name}] ${sessionLabel} startup prompt cancelled by ${started.cancellationSource}; `
         + 'keeping temporary supervisor alive');
-    acpStartupComplete = true;
+    sessionStartupComplete = true;
     if (role.owner_channel) {
       ownerChannel = deps.createOwnerChannel({
         role: name,
@@ -1046,7 +1050,8 @@ export async function runOnce(
     rotated = true;
     deps.log(`[${name}] ${why} -> rotated session-id; next start is FRESH`);
   };
-  if (exitRecord.detail.includes(ACP_CANCEL_DEADLINE_EXCEEDED))
+  if (exitRecord.detail.includes(ACP_CANCEL_DEADLINE_EXCEEDED)
+      || exitRecord.detail.includes(CODEX_APP_SERVER_CANCEL_DEADLINE_EXCEEDED))
     // This is a deliberate adapter reclamation, not evidence that resume state
     // is poisoned. Preserve the context even when the resumed generation hits
     // the same bound immediately; runSupervised still counts the fast exit and

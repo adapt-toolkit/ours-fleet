@@ -140,7 +140,7 @@ export interface HarnessAdapter {
    * keyed the same way `translatePermissions().native` is, so the two can be
    * compared directly. Only keys the operator actually wrote appear.
    */
-  nativePermissionOverrides(options: unknown): Record<string, unknown>;
+  nativePermissionOverrides(options: unknown, role?: ResolvedRole): Record<string, unknown>;
   /**
    * Host paths this harness needs inside a sandbox, split into a per-role
    * writable home and shared read-only credentials/config. Omit for a

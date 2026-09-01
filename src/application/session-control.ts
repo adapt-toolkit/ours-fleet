@@ -38,7 +38,7 @@ export interface RoleSessionControl {
   sendText(text: string): Promise<SendReceipt>;
   interrupt?(): Promise<InterruptReceipt>;
   respondPermission?(request: { permissionId: string; optionId: string }): Promise<{ accepted: true }>;
-  // ── conversation v3 (ACP roles that persist a ledger) ──────────────────────
+  // ── conversation v3 (managed sessions that persist a ledger) ───────────────
   conversationPage?(request: { after?: string; limit?: number }): Promise<ConversationPageView>;
   submitPromptV2?(request: {
     commandId: string; text: string; actorBrowserSession: string;
@@ -63,7 +63,7 @@ export interface RoleSessionControl {
 
 const visibleEvents = (events: SessionEvent[]) => events.filter(event => event.kind !== 'thought');
 
-export class AcpRoleSessionAdapter implements RoleSessionControl {
+export class RoleSessionControlAdapter implements RoleSessionControl {
   constructor(
     private readonly stateDir: string,
     private readonly request: typeof controlRequest = controlRequest,
@@ -73,7 +73,7 @@ export class AcpRoleSessionAdapter implements RoleSessionControl {
     const response = await this.call('snapshot');
     const result = response as SessionSnapshot & { protocolVersion?: number; features?: string[] };
     return {
-      backend: 'acp', protocolVersion: result.protocolVersion ?? 1,
+      backend: result.backend, protocolVersion: result.protocolVersion ?? 1,
       features: result.features ?? [], snapshot: result,
     };
   }
@@ -240,3 +240,6 @@ export class AcpRoleSessionAdapter implements RoleSessionControl {
     } catch (error) { throw normalizeError(error); }
   }
 }
+
+/** @deprecated Compatibility name; control is provider-neutral. */
+export { RoleSessionControlAdapter as AcpRoleSessionAdapter };

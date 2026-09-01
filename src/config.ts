@@ -52,7 +52,8 @@ export const NOTIFY_EVENT_TYPES = [
 export type NotifyEventType = (typeof NOTIFY_EVENT_TYPES)[number];
 export type InjectMode = 'notification' | 'full';
 export type MonitorMode = 'fleet' | 'native';
-export type SessionBackendId = 'acp';
+/** Concrete transport selected for a role. Keep provider-native transports explicit. */
+export type SessionBackendId = 'acp' | 'codex-app-server';
 /** Public, harness-neutral permission policy. */
 export type FleetPermissionMode = 'ask' | 'auto' | 'allow';
 /** `deny` is a deprecated, fail-closed compatibility alias retained for old fleet files. */
@@ -71,6 +72,10 @@ export interface CommonPermissions {
 export interface SessionOptions {
   acp?: {
     /** ACP agent command and arguments. Defaults are supplied by the harness adapter. */
+    command?: string | string[];
+  };
+  codex_app_server?: {
+    /** App-server command and arguments. Defaults to `codex app-server`. */
     command?: string | string[];
   };
 }
@@ -932,6 +937,9 @@ export function loadConfig(
       const worklog = resolveWorklogPolicy(defaults.worklog, r.worklog, file, name);
       const authProxy = resolveAuthProxy(defaults.auth_proxy, r.auth_proxy, file, name);
       const harness = r.harness ?? (defaults.harness as string | undefined) ?? 'claude-code';
+      if (session === 'codex-app-server' && harness !== 'codex')
+        throw new ConfigError(
+          `${file}: role '${name}' session: codex-app-server requires harness: codex`);
       const defaultHarness = (defaults.harness as string | undefined) ?? 'claude-code';
       const inheritsModelDefaults = harness === defaultHarness && r.model !== null;
       if (authProxy && harness !== 'claude-code')
@@ -1202,9 +1210,9 @@ export function resolveOwnerChannelConfig(
   if (maxRequestBytes < maxFileBytes)
     throw new ConfigError(
       `${file}: role '${name}' owner_channel.attachments.max_request_bytes must be at least max_file_bytes`);
-  if (session !== 'acp')
+  if (session !== 'acp' && session !== 'codex-app-server')
     throw new ConfigError(
-      `${file}: role '${name}' owner_channel requires session: acp for correlated final replies`);
+      `${file}: role '${name}' owner_channel requires a managed session with correlated final replies`);
   return {
     identity: merged.identity.trim(),
     owners,
@@ -1346,8 +1354,8 @@ function resolveSession(raw: unknown, file: string, name: string): SessionBacken
     throw new ConfigError(
       `${file}: role '${name}' session: tmux is no longer supported; use session: acp `
       + 'with the Codex or Claude Code adapter');
-  if (value !== 'acp')
-    throw new ConfigError(`${file}: role '${name}' session: must be: acp`);
+  if (value !== 'acp' && value !== 'codex-app-server')
+    throw new ConfigError(`${file}: role '${name}' session: must be: acp, codex-app-server`);
   return value;
 }
 
@@ -1366,28 +1374,42 @@ function resolveSessionOptions(
       ...(((defaults as SessionOptions | undefined)?.acp) ?? {}),
       ...(role?.acp ?? {}),
     },
+    codex_app_server: {
+      ...(((defaults as SessionOptions | undefined)?.codex_app_server) ?? {}),
+      ...(role?.codex_app_server ?? {}),
+    },
   };
   if ((defaults as Record<string, unknown> | undefined)?.tmux !== undefined
       || (role as Record<string, unknown> | undefined)?.tmux !== undefined)
     throw new ConfigError(
       `${file}: role '${name}' session_options.tmux is no longer supported; `
       + 'use session: acp with session_options.acp');
-  const bad = Object.keys(merged).filter(k => k !== 'acp');
+  const bad = Object.keys(merged).filter(k => k !== 'acp' && k !== 'codex_app_server');
   if (bad.length)
     throw new ConfigError(`${file}: role '${name}' session_options: unknown key(s) ${bad.join(', ')}`);
   if (!isPlainObject(merged.acp))
-    throw new ConfigError(`${file}: role '${name}' session_options.${session} must be a map`);
+    throw new ConfigError(`${file}: role '${name}' session_options.acp must be a map`);
+  if (!isPlainObject(merged.codex_app_server))
+    throw new ConfigError(`${file}: role '${name}' session_options.codex_app_server must be a map`);
   const acpBad = Object.keys(merged.acp).filter(k => k !== 'command');
   if (acpBad.length)
     throw new ConfigError(`${file}: role '${name}' session_options.acp: unknown key(s) ${acpBad.join(', ')}`);
-  const command = merged.acp.command;
-  if (command !== undefined
-      && !(typeof command === 'string' && command.trim())
-      && !(Array.isArray(command) && command.length > 0
-        && command.every(v => typeof v === 'string' && v.length > 0)))
-    throw new ConfigError(
-      `${file}: role '${name}' session_options.acp.command must be a non-empty string or string list`);
-  return Object.keys(merged.acp).length ? merged : undefined;
+  const nativeBad = Object.keys(merged.codex_app_server).filter(k => k !== 'command');
+  if (nativeBad.length)
+    throw new ConfigError(`${file}: role '${name}' session_options.codex_app_server: unknown key(s) ${nativeBad.join(', ')}`);
+  for (const [key, command] of [
+    ['acp', merged.acp.command],
+    ['codex_app_server', merged.codex_app_server.command],
+  ] as const) {
+    if (command !== undefined
+        && !(typeof command === 'string' && command.trim())
+        && !(Array.isArray(command) && command.length > 0
+          && command.every(v => typeof v === 'string' && v.length > 0)))
+      throw new ConfigError(
+        `${file}: role '${name}' session_options.${key}.command must be a non-empty string or string list`);
+  }
+  return Object.keys(merged.acp).length || Object.keys(merged.codex_app_server).length
+    ? merged : undefined;
 }
 
 export function resolvePermissions(
