@@ -52,7 +52,16 @@ const V3_GENERATED_ROLE_DEFAULT_FINGERPRINTS: Readonly<Record<string, string>> =
   'agents/FleetCoordinator.yaml': '70f90797899828c3669c3914e8f873314e48cb9502aff187d2f1fbc9177f6df9',
 });
 
-const V4_ROLE_DEFAULTS = new Set([
+const V4_ROLE_DEFAULT_FINGERPRINTS: Readonly<Record<string, string>> = Object.freeze({
+  'agent_templates/LocalCoordinator.yaml': 'f04a88b541e655e0039e4dc9834293b5180f6d488a473a6c51b50d0b72dae83b',
+  'room_templates/team.yaml': 'accaa3569781f7acde3f15c89f447f4132f580f936513379c704aad27481e13f',
+});
+
+const V4_GENERATED_ROLE_DEFAULT_FINGERPRINTS: Readonly<Record<string, string>> = Object.freeze({
+  'agent_templates/LocalCoordinator.yaml': 'cb7c83a835dde9d45bac42cadce2f196f561d2460321c690cdef435f7076f97f',
+});
+
+const V5_ROLE_DEFAULTS = new Set([
   'roles/Coordinator.yaml', 'roles/LocalCoordinator.yaml', 'roles/Developer.yaml', 'roles/Critic.yaml',
   'agent_templates/LocalCoordinator.yaml', 'agent_templates/Developer.yaml', 'agent_templates/Critic.yaml',
   'room_templates/single.yaml', 'room_templates/pair.yaml', 'room_templates/team.yaml',
@@ -177,7 +186,7 @@ function validateRoleDefaultMigration(stageManifest: string): void {
   }
 }
 
-/** Explicit adoption of exact packaged revision-3 role defaults; customized files are never changed. */
+/** Explicit adoption of exact packaged revision-3/4 role defaults; customized files are never changed. */
 export function migratePackagedRoleDefaults(
   configuration: string,
   options: { write?: boolean } = {},
@@ -198,15 +207,25 @@ export function migratePackagedRoleDefaults(
     throw new Error('packaged role-default migration requires an owner-controlled same-filesystem parent');
   const classify = () => {
     const removals: string[] = []; const replacements: string[] = []; const preserved: string[] = [];
-    for (const [relative, expected] of Object.entries(V3_ROLE_DEFAULT_FINGERPRINTS)) {
+    const known = new Set([
+      ...Object.keys(V3_ROLE_DEFAULT_FINGERPRINTS),
+      ...Object.keys(V4_ROLE_DEFAULT_FINGERPRINTS),
+    ]);
+    for (const relative of known) {
       const path = join(root, relative); if (!existsSync(path)) continue;
       const actual = fingerprint(path);
-      if (actual === expected || actual === V3_GENERATED_ROLE_DEFAULT_FINGERPRINTS[relative])
-        (V4_ROLE_DEFAULTS.has(relative) ? replacements : removals).push(path);
+      const recognized = [
+        V3_ROLE_DEFAULT_FINGERPRINTS[relative],
+        V3_GENERATED_ROLE_DEFAULT_FINGERPRINTS[relative],
+        V4_ROLE_DEFAULT_FINGERPRINTS[relative],
+        V4_GENERATED_ROLE_DEFAULT_FINGERPRINTS[relative],
+      ].some(expected => expected !== undefined && actual === expected);
+      if (recognized)
+        (V5_ROLE_DEFAULTS.has(relative) ? replacements : removals).push(path);
       else preserved.push(path);
     }
     const additions: string[] = [];
-    for (const relative of V4_ROLE_DEFAULTS) {
+    for (const relative of V5_ROLE_DEFAULTS) {
       const path = join(root, relative);
       if (!existsSync(path)) additions.push(path);
       else if (!replacements.includes(path) && !preserved.includes(path)) preserved.push(path);

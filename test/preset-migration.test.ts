@@ -173,7 +173,70 @@ describe('legacy starter Agent migration', () => {
   });
 });
 
-describe('packaged v3 role-default adoption', () => {
+describe('packaged role-default adoption', () => {
+  it.each([
+    ['packaged', 'claude-default'],
+    ['generated', 'coordination'],
+  ] as const)('adopts the exact revision-4 %s LocalCoordinator and team defaults', (_form, brain) => {
+    const config = join(dir, `adopt-v4-${brain}.yaml`);
+    bootstrapPresets(config);
+    const root = splitRootFor(config);
+    writeFileSync(join(root, 'agent_templates', 'LocalCoordinator.yaml'), [
+      'role: { ref: LocalCoordinator }',
+      `brain: { ref: ${brain} }`,
+      'coordinator: FleetCoordinator',
+      'permissions: { approval: ask, filesystem: workspace, unattended: deny }',
+      '',
+    ].join('\n'), { mode: 0o600 });
+    writeFileSync(join(root, 'room_templates', 'team.yaml'), [
+      'version: 1',
+      'description: "Locally coordinated team: LocalCoordinator sequences, Developer executes, Critic reviews"',
+      'room: { quiet_membership: false, anonymous: false }',
+      'contract: |',
+      '  LocalCoordinator coordinates sequencing, handoffs, context, and blockers among existing members.',
+      '  Developer owns implementation and verification evidence.',
+      '  Critic independently reviews and withholds sign-off on material failures.',
+      '  LocalCoordinator has no Fleet lifecycle or agent-management authority.',
+      'members:',
+      '  - { slot: local_coordinator, role: LocalCoordinator, count: 1, agent_template: LocalCoordinator }',
+      '  - { slot: developer, role: Developer, count: 1, agent_template: Developer }',
+      '  - { slot: critic, role: Critic, count: 1, agent_template: Critic }',
+      '',
+    ].join('\n'), { mode: 0o600 });
+
+    const dry = migratePackagedRoleDefaults(config);
+    expect(dry.replacements).toContain(join(root, 'agent_templates', 'LocalCoordinator.yaml'));
+    expect(dry.replacements).toContain(join(root, 'room_templates', 'team.yaml'));
+
+    const applied = migratePackagedRoleDefaults(config, { write: true }, { nonce: `v4-${brain}` });
+    expect(applied.replacements).toEqual(dry.replacements);
+    expect(readFileSync(join(root, 'agent_templates', 'LocalCoordinator.yaml'), 'utf8'))
+      .toContain('continuity:');
+    expect(readFileSync(join(root, 'room_templates', 'team.yaml'), 'utf8'))
+      .toMatch(/15-minute continuity/i);
+    const rerun = migratePackagedRoleDefaults(config, { write: true }, { nonce: `v5-${brain}` });
+    expect(rerun.replacements).toEqual([]);
+    expect(existsSync(rerun.backupPath)).toBe(false);
+  });
+
+  it('preserves a nearby customized revision-4 LocalCoordinator Agent Template', () => {
+    const config = join(dir, 'custom-v4-local.yaml');
+    bootstrapPresets(config);
+    const root = splitRootFor(config);
+    const custom = [
+      'role: { ref: LocalCoordinator }',
+      'brain: { ref: claude-default }',
+      'coordinator: MyCoordinator',
+      'permissions: { approval: ask, filesystem: workspace, unattended: deny }',
+      '',
+    ].join('\n');
+    writeFileSync(join(root, 'agent_templates', 'LocalCoordinator.yaml'), custom, { mode: 0o600 });
+    const result = migratePackagedRoleDefaults(config);
+    expect(result.preserved).toContain(join(root, 'agent_templates', 'LocalCoordinator.yaml'));
+    expect(result.replacements).not.toContain(join(root, 'agent_templates', 'LocalCoordinator.yaml'));
+    expect(readFileSync(join(root, 'agent_templates', 'LocalCoordinator.yaml'), 'utf8')).toBe(custom);
+  });
+
   it('recognizes the exact generated-v3 brain selections without matching nearby customization', () => {
     const config = join(dir, 'generated-v3.yaml');
     const root = splitRootFor(config);
