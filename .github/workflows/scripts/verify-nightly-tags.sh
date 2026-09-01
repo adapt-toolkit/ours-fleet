@@ -34,7 +34,20 @@ for (( attempt=1; attempt<=attempts; attempt++ )); do
       echo "::error::$package latest unexpectedly points to $latest" >&2
       exit 1
     fi
-    if [[ "$nightly" != "$expected" || -z "$latest" ]]; then
+    if [[ "$nightly" != "$expected" ]]; then
+      # npm publish can return successfully while a package is still being
+      # processed. In that state the version may become readable without the
+      # requested dist-tag moving. Repair only the prerelease channel, and only
+      # after the exact version this run published is visible in the registry.
+      published="$(npm --prefer-online view "$package@$expected" version 2>/dev/null || true)"
+      if [[ "$published" == "$expected" ]]; then
+        if npm dist-tag add "$package@$expected" nightly >/dev/null 2>&1; then
+          observations+=("$package nightly repair requested for $expected")
+        fi
+      fi
+      ready=false
+    fi
+    if [[ -z "$latest" ]]; then
       ready=false
     fi
   done
