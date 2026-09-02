@@ -19,6 +19,7 @@ import { CoworkProtocolError, type CoworkAdapter } from '../src/rooms-tasks/cowo
 import type { TemplateDefinition } from '../src/rooms-tasks/types.js';
 import { writeV2Fixture } from './v2-fixture.js';
 import { beginFleetAuditCollection, consumeFleetAuditCollection } from '../src/fleet-command-audit.js';
+import { deriveTaskRoomName } from '../src/rooms-tasks/task-room-name.js';
 
 const definition: TemplateDefinition = {
   name: 'empty-team', version: 1, description: 'No members', members: [],
@@ -321,6 +322,53 @@ describe('task create/start surface parity', () => {
       expect(existsSync(join(root, 'launch-snapshots'))).toBe(false);
     }
     expect(h.createRoom).not.toHaveBeenCalled();
+  });
+
+  it('keeps the canonical persisted name unchanged through recovery replay', async () => {
+    const title = 'Fix inconsistent local/UTC chat timestamps in messenger-server';
+    const h = cowork();
+    const app = service(h.adapter);
+    const task = await app.createTask({
+      actor: { kind: 'local_control', surface: 'cli' }, title,
+      template: 'empty-team', origin: { type: 'cli' },
+    });
+    const expected = deriveTaskRoomName(title, task.task_id);
+    expect(task.title).toBe(title);
+    expect(getRoomRecord('room-shared')?.room_name).toBe(expected);
+    h.createRoom.mockClear();
+    expect(await app.beginTaskRecovery({
+      actor: { kind: 'local_control', surface: 'cli' }, taskId: task.task_id,
+    })).toMatchObject({ kind: 'final', result: { kind: 'no_op', room: { room_name: expected } } });
+    expect(h.createRoom).not.toHaveBeenCalled();
+    expect(getRoomRecord('room-shared')?.room_name).toBe(expected);
+  });
+
+  it('recovers a pre-room title validation failure through the canonical provision boundary', async () => {
+    const title = 'Fix inconsistent local/UTC chat timestamps in messenger-server';
+    const h = cowork();
+    h.createRoom.mockRejectedValueOnce(new Error('generated room identity name is invalid'));
+    const app = service(h.adapter);
+    await expect(app.createTask({
+      actor: { kind: 'local_control', surface: 'cli' }, title,
+      template: 'empty-team', origin: { type: 'cli' },
+    })).rejects.toThrow('generated room identity name is invalid');
+    const task = app.listTasks()[0]!;
+    expect(task.room_id).toBeUndefined();
+    expect(task.execution_plan?.snapshot.launch_snapshot_hash).toEqual(expect.any(String));
+    const recovery = await app.beginTaskRecovery({
+      actor: { kind: 'local_control', surface: 'cli' }, taskId: task.task_id,
+    });
+    const expected = deriveTaskRoomName(title, task.task_id);
+    expect(recovery).toMatchObject({
+      kind: 'final', result: {
+        kind: 'provisioning_resumed', task: { title, room_id: 'room-shared' },
+        room: { room_name: expected }, issues: [{ code: 'provisioning_resumed' }],
+      },
+    });
+    expect(h.createRoom).toHaveBeenCalledTimes(2);
+    expect(h.createRoom).toHaveBeenLastCalledWith(expect.objectContaining({ room_name: expected }));
+    expect(getTask(task.task_id).title).toBe(title);
+    expect(getRoomRecord('room-shared')?.room_name).toBe(expected);
   });
 
   it('owns normalized list/detail reads including linked orchestration', async () => {
