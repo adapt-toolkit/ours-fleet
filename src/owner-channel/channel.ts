@@ -372,6 +372,7 @@ export class OwnerChannel implements OwnerChannelHandle {
     }
     this.startedOnce = true;
     this.ready = true;
+    await this.flushPendingFleetCommandAudits();
     // Do not make role startup wait for an old owner request to finish a turn.
     // watchLoop itself drains before every establishment, including this first
     // one, so there is no drain-to-tip race.
@@ -476,6 +477,26 @@ export class OwnerChannel implements OwnerChannelHandle {
       });
       if (attempt.outcome?.delivery === 'delivered') return attempt;
       if (attempt.outcome?.delivery === 'uncertain') return attempt;
+      // Before the Owner sink is attached, ordinary commands have nothing to
+      // deliver. Lifecycle presentations remain in the never-attempted
+      // `sending` state and are flushed exactly once when start() makes the
+      // authenticated sink ready. A restart converts them to `uncertain`, so
+      // effects are never replayed after an unproven delivery boundary.
+      if (!attempt.outcome?.presentations?.length)
+        return this.commandAudits.outcome(attempt.correlationId, this.options.role, 'delivered');
+      if (!this.ready) return attempt;
+      return this.deliverFleetCommandOutcome(attempt);
+    });
+    this.managementTail = run.then(() => undefined, () => undefined);
+    return run;
+  }
+
+  private async flushPendingFleetCommandAudits(): Promise<void> {
+    for (const attempt of this.commandAudits.list())
+      if (attempt.outcome?.delivery === 'sending') await this.deliverFleetCommandOutcome(attempt);
+  }
+
+  private async deliverFleetCommandOutcome(attempt: FleetAuditAttempt): Promise<FleetAuditAttempt> {
       let uncertain = false;
       try {
         for (const event of attempt.outcome?.presentations ?? []) {
@@ -498,9 +519,6 @@ export class OwnerChannel implements OwnerChannelHandle {
       attempt = this.commandAudits.outcome(attempt.correlationId, this.options.role,
         uncertain ? 'uncertain' : 'delivered');
       return attempt;
-    });
-    this.managementTail = run.then(() => undefined, () => undefined);
-    return run;
   }
 
   recover(epoch: string): Promise<void> {

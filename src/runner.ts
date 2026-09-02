@@ -57,6 +57,7 @@ import {
   archiveTempState, markTempSupervisorActive, requestedTempStopReason,
   type TempTerminationReason,
 } from './temp-lifecycle.js';
+import { FleetCommandAuditStore } from './fleet-command-audit.js';
 
 export interface RunnerDeps {
   exec: Exec;
@@ -136,6 +137,32 @@ const defaultDeps = (): RunnerDeps => ({
 
 const MONITOR_OWNER_FILE = '.monitor-owner';
 const OBSOLETE_OURS_AUTOSTART_ENV = 'OURS_AUTOSTART';
+
+function localFleetAuditor(stateDir: string, caller: string, log: (line: string) => void) {
+  const store = new FleetCommandAuditStore(join(stateDir, '.fleet-command-audit.json'));
+  return {
+    async begin(requestId: string, argv: string[]) {
+      let attempt = store.begin(requestId, caller, argv);
+      if (attempt.invocation === 'sending') {
+        log(`[${caller}] fleet proxy command ${attempt.correlationId} `
+          + `route=${attempt.classification.route} decision=${attempt.classification.decision}`);
+        attempt = store.invocation(attempt.correlationId, caller, 'delivered');
+      }
+      return attempt;
+    },
+    async finish(input: Parameters<NonNullable<OwnerChannelHandle['finishFleetCommandAudit']>>[0]) {
+      let attempt = store.finish(input.correlationId, caller, {
+        class: input.class, effect: input.effect,
+        ...(input.exitCode === undefined ? {} : { exitCode: input.exitCode }),
+        ...(input.resourceIds ? { resourceIds: input.resourceIds } : {}),
+        ...(input.presentations ? { presentations: input.presentations } : {}),
+      });
+      if (attempt.outcome?.delivery === 'sending')
+        attempt = store.outcome(attempt.correlationId, caller, 'delivered');
+      return attempt;
+    },
+  };
+}
 
 /** Environment injected only into the managed harness process. */
 export function managedFleetProxyEnv(
@@ -737,9 +764,27 @@ export async function runOnce(
           + `${(error as Error)?.message ?? String(error)}`);
       }
     }
-    control = deps.createControlServer(dir, arbiter, deps.log);
-    try { await control.start(); }
+    try {
+      if (role.owner_channel) ownerChannel = deps.createOwnerChannel({
+        role: name,
+        harness: role.harness,
+        config: role.owner_channel,
+        session: arbiter,
+        stateDir: dir,
+        env: role.env,
+        log: deps.log,
+        ...(ownerBinder ? { binderLease: ownerBinder } : {}),
+        ...(configPath ? { configPath } : {}),
+      });
+      control = deps.createControlServer(dir, arbiter, deps.log);
+      control.setFleetAuditor(ownerChannel ? {
+        begin: (requestId, argv) => ownerChannel!.beginFleetCommandAudit!(requestId, argv),
+        finish: input => ownerChannel!.finishFleetCommandAudit!(input),
+      } : localFleetAuditor(dir, name, deps.log));
+      await control.start();
+    }
     catch (error) {
+      await ownerChannel?.close().catch(() => undefined);
       ownerBinder?.release();
       await agentSession.close();
       unsubscribeRecovery?.();
@@ -850,18 +895,7 @@ export async function runOnce(
       deps.log(`[${name}] ${sessionLabel} startup prompt cancelled by ${started.cancellationSource}; `
         + 'keeping temporary supervisor alive');
     sessionStartupComplete = true;
-    if (role.owner_channel) {
-      ownerChannel = deps.createOwnerChannel({
-        role: name,
-        harness: role.harness,
-        config: role.owner_channel,
-        session: arbiter,
-        stateDir: dir,
-        env: role.env,
-        log: deps.log,
-        ...(ownerBinder ? { binderLease: ownerBinder } : {}),
-        ...(configPath ? { configPath } : {}),
-      });
+    if (ownerChannel) {
       try { await ownerChannel.start(); }
       catch (error) {
         monitor?.stop();
@@ -877,10 +911,6 @@ export async function runOnce(
     }
     if (ownerChannel) {
       control.setOwnerChannel(ownerChannel);
-      control.setFleetAuditor({
-        begin: (requestId, argv) => ownerChannel!.beginFleetCommandAudit!(requestId, argv),
-        finish: input => ownerChannel!.finishFleetCommandAudit!(input),
-      });
     }
     reloadLoopConfig = async (): Promise<{ changed: boolean; loops: number }> => {
       const nextRole = findRole(loadConfig(configPath), name);
