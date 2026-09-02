@@ -211,6 +211,89 @@ describe('managed fleet child environment', () => {
     expect(registered).toHaveLength(1); expect(registered[0]).toBeTypeOf('function');
   });
 
+  it('installs a durable local auditor before control startup for a no-owner temporary watchdog role', async () => {
+    const name = 'Watchdog-fleet-health';
+    const d = agentDir(name, true); mkdirSync(d, { recursive: true });
+    writeFileSync(join(d, 'role.yaml'), stringify({
+      name, harness: 'fake', session: 'acp', identity: name, sourceFile: '(temp)',
+      permissions: { approval: 'ask', filesystem: 'workspace', unattended: 'deny' },
+    }));
+    const { deps } = fakeWorld({ exitCode: '0', exitFile: join(d, '.exit-status') });
+    let auditor: any;
+    await runOnce(name, { temp: true }, { ...deps, createControlServer: () => ({
+      start: async () => {
+        expect(auditor).toBeDefined();
+        const begun = await auditor.begin('11111111-1111-4111-8111-111111111111',
+          ['status', '--token', 'private']);
+        await auditor.finish({ correlationId: begun.correlationId,
+          class: 'success', effect: 'completed', exitCode: 0 });
+      },
+      close: async () => {}, setFleetSpawner: () => {},
+      setFleetAuditor: value => { auditor = value; }, setOwnerChannel: () => {},
+      setConfigReloader: () => {}, setLoopManager: () => {},
+    }) });
+    const ledger = JSON.parse(readFileSync(join(d, '.fleet-command-audit.json'), 'utf8'));
+    expect(ledger.attempts).toHaveLength(1);
+    expect(ledger.attempts[0]).toMatchObject({ caller: name, invocation: 'delivered',
+      classification: { route: 'supervisor-proxy/read-only', decision: 'allow' },
+      argv: ['status', '--token', '[REDACTED:value]'],
+      outcome: { class: 'success', effect: 'completed', delivery: 'delivered' } });
+  });
+
+  it('closes the child and never starts control when the local audit ledger is invalid', async () => {
+    writeCfg({ A: { harness: 'fake', session: 'acp' } });
+    const d = agentDir('A'); mkdirSync(d, { recursive: true });
+    writeFileSync(join(d, '.fleet-command-audit.json'), '{"version":2,"attempts":[]}\n');
+    const { deps } = fakeWorld({ exitCode: '0', exitFile: join(d, '.exit-status') });
+    const startSession = deps.startAgentSession;
+    const closed = vi.fn();
+    deps.startAgentSession = async (...args: Parameters<typeof startSession>) => {
+      const session = await startSession(...args);
+      const close = session.close.bind(session);
+      session.close = async () => { closed(); await close(); };
+      return session;
+    };
+    const controlStarted = vi.fn();
+    await expect(runOnce('A', {}, { ...deps, createControlServer: () => ({
+      start: async () => { controlStarted(); }, close: async () => {}, setFleetSpawner: () => {},
+      setFleetAuditor: () => {}, setOwnerChannel: () => {}, setConfigReloader: () => {},
+      setLoopManager: () => {},
+    }) })).rejects.toThrow(/invalid fleet command audit ledger/);
+    expect(closed).toHaveBeenCalledOnce();
+    expect(controlStarted).not.toHaveBeenCalled();
+  });
+
+  it('installs the owner-backed auditor before control startup and never swaps it', async () => {
+    writeCfg({ A: { harness: 'fake', session: 'acp',
+      owner_channel: { identity: 'A-owner', owners: ['owner-cid'] } } });
+    const d = agentDir('A'); mkdirSync(d, { recursive: true });
+    const { deps } = fakeWorld({ exitCode: '0', exitFile: join(d, '.exit-status') });
+    let ownerStarted = false;
+    const begin = vi.fn(async () => {
+      expect(ownerStarted).toBe(false);
+      return { correlationId: 'owner-correlation', invocation: 'delivered' } as any;
+    });
+    deps.createOwnerChannel = () => ({
+      start: async () => { ownerStarted = true; }, drain: async () => {}, close: async () => {},
+      manage: async () => { throw new Error('not used'); }, beginFleetCommandAudit: begin,
+      finishFleetCommandAudit: async () => ({}) as any,
+    });
+    let auditor: any;
+    let registrations = 0;
+    await runOnce('A', {}, { ...deps, createControlServer: () => ({
+      start: async () => {
+        expect(auditor).toBeDefined();
+        await auditor.begin('22222222-2222-4222-8222-222222222222', ['status']);
+      },
+      close: async () => {}, setFleetSpawner: () => {},
+      setFleetAuditor: value => { auditor = value; registrations++; },
+      setOwnerChannel: () => {}, setConfigReloader: () => {}, setLoopManager: () => {},
+    }) });
+    expect(begin).toHaveBeenCalledOnce();
+    expect(ownerStarted).toBe(true);
+    expect(registrations).toBe(1);
+  });
+
   it.each(['', '0', '1'])
   ('actively omits supervised ACP OURS_AUTOSTART=%j and preserves sibling env', value => {
     const role = {
@@ -752,7 +835,7 @@ describe('runOnce ACP startup outcome', () => {
       },
       createControlServer: () => ({
         start: async () => {}, close: async () => {},
-        setFleetSpawner: () => {}, setOwnerChannel: () => {},
+        setFleetSpawner: () => {}, setFleetAuditor: () => {}, setOwnerChannel: () => {},
         setConfigReloader: () => {}, setLoopManager: () => {},
       }),
     };
@@ -855,7 +938,7 @@ describe('runOnce ACP startup outcome', () => {
       controlSession = session;
       return {
         start: async () => {}, close: async () => {},
-        setFleetSpawner: () => {}, setOwnerChannel: () => {},
+        setFleetSpawner: () => {}, setFleetAuditor: () => {}, setOwnerChannel: () => {},
         setConfigReloader: () => {}, setLoopManager: () => {},
       };
     };

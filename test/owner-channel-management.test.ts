@@ -548,6 +548,31 @@ describe('OwnerChannel live management', () => {
     await channel.close();
   });
 
+  it('retains the same ledger before Owner startup and flushes only never-attempted lifecycle delivery', async () => {
+    const { channel, client, dir } = setup({ agent: AGENT });
+    const begun = await channel.beginFleetCommandAudit!('request-before-owner-start', ['task', 'list']);
+    await expect(channel.finishFleetCommandAudit!({ correlationId: begun.correlationId,
+      class: 'success', effect: 'completed', exitCode: 0,
+      presentations: [{ kind: 'task', operation: 'create', eventId: 'startup-task-created',
+        id: 'task-startup', previousState: 'none', newState: 'active', agents: [] }] }))
+      .resolves.toMatchObject({ outcome: { delivery: 'sending' } });
+    expect(client.calls.filter(call => call.name === 'sendMessage')).toHaveLength(0);
+
+    await channel.start();
+    expect(client.calls.filter(call => call.name === 'sendMessage')).toHaveLength(1);
+    const ledger = JSON.parse(readFileSync(join(dir, '.owner-channel-command-audit.json'), 'utf8'));
+    expect(ledger.attempts).toHaveLength(1);
+    expect(ledger.attempts[0]).toMatchObject({ correlationId: begun.correlationId,
+      outcome: { delivery: 'delivered' } });
+
+    await channel.finishFleetCommandAudit!({ correlationId: begun.correlationId,
+      class: 'success', effect: 'completed', exitCode: 0,
+      presentations: [{ kind: 'task', operation: 'create', eventId: 'startup-task-created',
+        id: 'task-startup', previousState: 'none', newState: 'active', agents: [] }] });
+    expect(client.calls.filter(call => call.name === 'sendMessage')).toHaveLength(1);
+    await channel.close();
+  });
+
   it('records outcome delivery uncertainty after a known completed effect without retry', async () => {
     const { channel, client, dir } = setup({ agent: AGENT });
     await channel.start();
