@@ -2,6 +2,7 @@ role: { ref: LocalCoordinator }
 brain: { ref: claude-default }
 coordinator: FleetCoordinator
 permissions: { approval: ask, filesystem: workspace, unattended: deny }
+monitor: { mode: fleet, interrupt: after_tool }
 loops:
   continuity:
     interval: 15m

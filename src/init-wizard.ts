@@ -262,6 +262,7 @@ export function generateSetup(answers: InitAnswers): GeneratedSetup {
       `brain: { ref: ${ROLE_WORK[role]} }`,
       'coordinator: FleetCoordinator',
       'permissions: { approval: ask, filesystem: workspace, unattended: deny }',
+      'monitor: { mode: fleet, interrupt: after_tool }',
       '',
     ].join('\n'));
   }

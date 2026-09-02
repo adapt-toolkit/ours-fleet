@@ -175,6 +175,51 @@ describe('legacy starter Agent migration', () => {
 
 describe('packaged role-default adoption', () => {
   it.each([
+    ['packaged', { LocalCoordinator: 'claude-default', Developer: 'claude-default', Critic: 'claude-default' }],
+    ['generated', { LocalCoordinator: 'coordination', Developer: 'development', Critic: 'review' }],
+  ] as const)('adopts exact revision-5 %s Agent Templates into fleet/after_tool', (_form, brains) => {
+    const config = join(dir, `adopt-v5-${_form}.yaml`);
+    bootstrapPresets(config);
+    const root = splitRootFor(config);
+    for (const [role, brain] of Object.entries(brains)) {
+      const path = join(root, 'agent_templates', `${role}.yaml`);
+      const previous = _form === 'generated' ? [
+        `role: { ref: ${role} }`,
+        `brain: { ref: ${brain} }`,
+        'coordinator: FleetCoordinator',
+        'permissions: { approval: ask, filesystem: workspace, unattended: deny }',
+        '',
+      ].join('\n') : readFileSync(path, 'utf8')
+        .replace('monitor: { mode: fleet, interrupt: after_tool }\n', '');
+      writeFileSync(path, previous, { mode: 0o600 });
+    }
+    const dry = migratePackagedRoleDefaults(config);
+    for (const role of Object.keys(brains))
+      expect(dry.replacements).toContain(join(root, 'agent_templates', `${role}.yaml`));
+    migratePackagedRoleDefaults(config, { write: true }, { nonce: `v5-${_form}` });
+    for (const role of Object.keys(brains))
+      expect(readFileSync(join(root, 'agent_templates', `${role}.yaml`), 'utf8'))
+        .toContain('monitor: { mode: fleet, interrupt: after_tool }');
+    const rerun = migratePackagedRoleDefaults(config, { write: true }, { nonce: `v6-${_form}` });
+    expect(rerun.replacements).toEqual([]);
+  });
+
+  it('preserves a customized revision-5 Agent Template byte-for-byte', () => {
+    const config = join(dir, 'custom-v5-template.yaml');
+    bootstrapPresets(config);
+    const root = splitRootFor(config);
+    const path = join(root, 'agent_templates', 'Developer.yaml');
+    const custom = readFileSync(path, 'utf8')
+      .replace('coordinator: FleetCoordinator', 'coordinator: MyCoordinator')
+      .replace('monitor: { mode: fleet, interrupt: after_tool }\n', '');
+    writeFileSync(path, custom, { mode: 0o600 });
+    const result = migratePackagedRoleDefaults(config);
+    expect(result.preserved).toContain(path);
+    expect(result.replacements).not.toContain(path);
+    expect(readFileSync(path, 'utf8')).toBe(custom);
+  });
+
+  it.each([
     ['packaged', 'claude-default'],
     ['generated', 'coordination'],
   ] as const)('adopts the exact revision-4 %s LocalCoordinator and team defaults', (_form, brain) => {

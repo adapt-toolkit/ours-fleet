@@ -35,6 +35,23 @@ describe('room member task payload', () => {
     expect(text).toContain('no room participant has Owner authority');
   });
 
+  it('keeps anonymous Owner authority on authenticated participant-seat metadata without a CID', () => {
+    const hiddenOwner = 'D'.repeat(64);
+    const text = buildRoomMemberTask({
+      roomId: 'room-1', roomIdentityCid: 'A'.repeat(64), ownerSeatCid: hiddenOwner,
+      anonymous: true,
+      member: { role_name: 'worker-1', cowork_role: 'Worker' },
+      roster: [{ role_name: 'worker-1', cowork_role: 'Worker' }],
+    });
+    expect(text).not.toContain('Authenticated Owner seat');
+    expect(text).not.toContain(hiddenOwner);
+    expect(text).toContain('authenticated Cowork room envelope');
+    expect(text).toMatch(/participant seat.*exact Owner role/i);
+    expect(text).toMatch(/literal message text|display name/i);
+    expect(text).toMatch(/ordinary direct message/i);
+    expect(text).toMatch(/room-authored|rest-role/i);
+  });
+
   it('hashes exact UTF-8 task bytes deterministically', () => {
     expect(sha256Text('task')).toBe(sha256Text('task'));
     expect(sha256Text('task')).not.toBe(sha256Text('Task'));

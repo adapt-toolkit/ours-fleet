@@ -376,6 +376,9 @@ describe('deterministic default mapping', () => {
     expect(generated.files.get('agent_templates/Developer.yaml')).toContain('brain: { ref: development }');
     expect(generated.files.get('agent_templates/Critic.yaml')).toContain('brain: { ref: review }');
     expect(generated.files.get('agent_templates/LocalCoordinator.yaml')).toContain('brain: { ref: coordination }');
+    for (const role of ['LocalCoordinator', 'Developer', 'Critic'])
+      expect(generated.files.get(`agent_templates/${role}.yaml`))
+        .toContain('monitor: { mode: fleet, interrupt: after_tool }');
     expect(generated.files.get('agents/FleetCoordinator.yaml')).toContain('brain: { ref: coordination }');
     expect(generated.files.get('room_templates/single.yaml')).toContain('agent_template: Developer');
     expect(generated.files.get('room_templates/pair.yaml')).toContain('agent_template: Developer');
