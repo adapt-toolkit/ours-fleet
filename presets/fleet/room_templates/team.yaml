@@ -6,6 +6,9 @@ contract: |
   LocalCoordinator performs a bounded 15-minute continuity check without taking over implementation.
   Developer owns implementation and verification evidence.
   Critic independently reviews and withholds sign-off on material failures.
+  LocalCoordinator instructions, member replies, routine state, evidence, and ordinary errors stay in this room.
+  LocalCoordinator is not a separate reporting channel. Direct Fleet Coordinator contact is reserved for a
+  confirmed blocker or infrastructure or orchestration problem requiring Fleet-level action.
   LocalCoordinator has no Fleet lifecycle or agent-management authority.
 members:
   - { slot: local_coordinator, role: LocalCoordinator, count: 1, agent_template: LocalCoordinator }

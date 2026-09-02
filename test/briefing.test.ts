@@ -151,18 +151,42 @@ describe('generateBriefing', () => {
     expect(b).toContain('final assistant response for the Fleet supervisor');
   });
 
-  it('makes owner_seat_cid=null mean no room participant has Owner authority', () => {
+  it('uses authenticated anonymous-seat Owner authority without exposing an Owner CID', () => {
+    const hiddenOwner = 'D'.repeat(64);
     const b = generateBriefing({
       ...base,
       roomMemberStartup: {
         room_id: '01ROOM', room_identity_cid: 'A'.repeat(64),
         identity_name: 'reviewer-1', invite_id: 'invite-1', invite: 'secret-invite',
-        role: 'Reviewer', task: 'Review.', owner_seat_cid: null,
+        role: 'Reviewer', task: 'Review.', owner_seat_cid: hiddenOwner, anonymous: true,
       },
     } as ResolvedRole, vocab, opts);
-    expect(b).toContain('Authenticated Owner seat CID: `none`');
-    expect(b).toContain('this room has no authenticated Owner seat');
+    expect(b).not.toContain('Authenticated Owner seat CID');
+    expect(b).not.toContain('Owner seat: none');
+    expect(b).not.toContain(hiddenOwner);
+    expect(b).toContain('authenticated Cowork room envelope');
+    expect(b).toContain('participant seat');
+    expect(b).toMatch(/exact role [`“"]?Owner/i);
+    expect(b).toMatch(/literal message text|display name/i);
+    expect(b).toMatch(/ordinary direct message/i);
+    expect(b).toMatch(/room-authored|rest-role/i);
+    expect(b).toMatch(/Owner-looking label/i);
     expect(b).not.toContain('fleet_room_briefing_ack');
+  });
+
+  it('keeps non-anonymous room Owner authority pinned to the exact CID', () => {
+    const owner = 'C'.repeat(64);
+    const b = generateBriefing({
+      ...base,
+      roomMemberStartup: {
+        room_id: '01ROOM', room_identity_cid: 'A'.repeat(64),
+        identity_name: 'reviewer-1', invite_id: 'invite-1', invite: 'secret-invite',
+        role: 'Reviewer', task: 'Review.', owner_seat_cid: owner, anonymous: false,
+      },
+    } as ResolvedRole, vocab, opts);
+    expect(b).toContain(`Authenticated Owner seat CID: \`${owner}\``);
+    expect(b).toContain(`authenticated author CID equals \`${owner}\``);
+    expect(b).toMatch(/display name or role says “Owner”/i);
   });
 
   it('renders the Routines section with the injected routinesPath', () => {

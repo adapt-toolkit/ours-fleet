@@ -47,6 +47,22 @@ describe('typed room member overrides', () => {
     } })).toThrow('permissions.filesystem');
   });
 
+  it('preserves explicit custom-template and per-member monitor overrides key by key', () => {
+    const monitored = { ...cfg, agentTemplates: structuredClone(cfg.agentTemplates) };
+    monitored.agentTemplates!.Dev.monitor = {
+      mode: 'native', interrupt: false, batch_ms: 123,
+    } as never;
+    const custom = prepareExecutionPlan(template, monitored);
+    expect(custom.launchDefinitions['dev:Dev'].monitor)
+      .toEqual({ mode: 'native', interrupt: false, batch_ms: 123 });
+
+    const member = prepareExecutionPlan(template, monitored, { dev: {
+      overrides: { monitor: { interrupt: true } },
+    } });
+    expect(member.launchDefinitions['dev:Dev'].monitor)
+      .toEqual({ mode: 'native', interrupt: true, batch_ms: 123 });
+  });
+
   it('parses ordered Brain and Role fields and rejects fields before a member', () => {
     expect(parseGroupedMemberArgs(['--member', 'dev', '--brain', 'Fast', '--role', 'Reviewer']))
       .toEqual({ dev: { brain: 'Fast', role: 'Reviewer' } });

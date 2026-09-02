@@ -7,6 +7,7 @@ import { bootstrapPresets } from '../src/preset-bootstrap.js';
 import { loadConfig, splitRootFor } from '../src/config.js';
 import { listTemplates } from '../src/rooms-tasks/templates.js';
 import { generateSetup, type InitAnswers } from '../src/init-wizard.js';
+import { buildRoomMemberTask } from '../src/rooms-tasks/member-startup.js';
 import '../src/harness/claude-code.js';
 import '../src/harness/codex.js';
 
@@ -70,6 +71,13 @@ describe('packaged default role contract', () => {
       }
       for (const name of ['LocalCoordinator', 'Developer', 'Critic']) {
         const persona = String(presets[name].persona);
+        expect(persona, name).toMatch(/task state, progress, checkpoints, findings, review verdicts, completion, handoffs, and ordinary\s+errors/i);
+        expect(persona, name).toMatch(/only in the assigned Cowork room/i);
+        expect(persona, name).toMatch(/(?:a|the) confirmed blocker or\s+infrastructure or orchestration\s+problem/i);
+        expect(persona, name).toMatch(/prevents safe progress or room communication|requires Fleet-level action/i);
+        expect(persona, name).toMatch(/test failures\s+under active diagnosis/i);
+        expect(persona, name).toMatch(/incomplete work/i);
+        expect(persona, name).toMatch(/not.*routine.*communication.*sink/i);
         expect(persona, name).toMatch(/configured Fleet Coordinator/);
         expect(persona, name).toMatch(/authenticated sender/);
         expect(persona, name).toMatch(/task\/room context/);
@@ -81,7 +89,16 @@ describe('packaged default role contract', () => {
         expect(persona, name).toMatch(/BLOCKED|resting/);
         expect(persona, name).toMatch(/(?:Leave recover,\s+block\/unblock, review\/finish, deletion, replacement, and respawn decisions to Fleet Coordinator|Only the configured Fleet Coordinator may recover, block, unblock, review, finish, delete, replace,\s+or respawn Fleet resources)/);
       }
+      for (const name of ['Developer', 'Critic']) {
+        const persona = String(presets[name].persona);
+        expect(persona, name).toMatch(/follow.*instructions directly in the room/i);
+        expect(persona, name).toMatch(/replies and evidence in that same room/i);
+        expect(persona, name).toMatch(/does not become a separate reporting channel/i);
+      }
       const local = String(presets.LocalCoordinator.persona);
+      expect(local).toMatch(/does not become a separate reporting channel/i);
+      expect(local).toMatch(/follow[\s\S]*instructions[\s\S]*directly in the room/i);
+      expect(local).toMatch(/replies and evidence[\s\S]*same room/i);
       expect(local).toMatch(/Do not implement task work/);
       expect(local).toMatch(/spawn, provision, replace, or manage agents/);
       expect(local).toMatch(/create tasks or rooms/);
@@ -93,6 +110,50 @@ describe('packaged default role contract', () => {
       const coordinatorBytes = readFileSync('presets/fleet/roles/Coordinator.yaml');
       expect(createHash('sha256').update(coordinatorBytes).digest('hex'))
         .toBe('d3755d292924cf29ba88abe68bf084aec91daae2e1c3eb6c64b57019d8c4dc52');
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+
+  it('packages fleet/after_tool on every standard room Agent Template', () => {
+    const root = mkdtempSync(join(tmpdir(), 'fleet-template-monitor-'));
+    try {
+      const config = join(root, 'fleet.yaml');
+      bootstrapPresets(config);
+      const cfg = loadConfig(config, { yamlMode: 'strict' });
+      for (const template of listTemplates(cfg.roomTemplates ?? {})) {
+        for (const member of template.members) {
+          expect(cfg.agentTemplates?.[member.agent_template].monitor,
+            `${template.name}:${member.agent_template}`).toEqual({
+            mode: 'fleet', interrupt: 'after_tool',
+          });
+        }
+      }
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+
+  it('renders room-only reporting into every standard member task with and without LocalCoordinator', () => {
+    const root = mkdtempSync(join(tmpdir(), 'fleet-generated-member-contracts-'));
+    try {
+      const config = join(root, 'fleet.yaml');
+      bootstrapPresets(config);
+      const cfg = loadConfig(config, { yamlMode: 'strict' });
+      for (const template of listTemplates(cfg.roomTemplates ?? {})) {
+        const roster = template.members.map(member => ({
+          role_name: `${template.name}-${member.slot}-1`, cowork_role: member.role,
+        }));
+        for (const [index, member] of template.members.entries()) {
+          const task = buildRoomMemberTask({
+            roomId: `${template.name}-room`, roomIdentityCid: 'A'.repeat(64),
+            ownerSeatCid: 'B'.repeat(64), contract: template.contract,
+            member: { ...roster[index], persona: String(cfg.rolePresets?.[member.role].persona) },
+            roster,
+          });
+          expect(task, `${template.name}:${member.role}`).toMatch(/only in (?:this|the assigned) (?:Cowork )?room/i);
+          expect(task, `${template.name}:${member.role}`).toMatch(/confirmed blocker or\s+infrastructure or orchestration problem/i);
+          if (template.name === 'team')
+            expect(task, member.role).toMatch(/LocalCoordinator.*not.*separate reporting channel/is);
+          else expect(roster.some(item => item.cowork_role === 'LocalCoordinator')).toBe(false);
+        }
+      }
     } finally { rmSync(root, { recursive: true, force: true }); }
   });
 

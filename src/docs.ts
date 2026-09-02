@@ -251,6 +251,12 @@ Brain owns harness, session, model, reasoning effort, token limits, and native h
 options. Removed runtime flags are rejected with migration guidance rather than silently
 reinterpreted. A selection is a stable ID or an explicit \`inline:{...}\` mapping.
 
+Packaged Developer, Critic, and LocalCoordinator Agent Templates set
+\`monitor: { mode: fleet, interrupt: after_tool }\`. Every member of the standard
+\`single\`, \`pair\`, and \`team\` Room Templates therefore resolves to fleet-owned,
+after-tool delivery. Explicit per-member and custom Agent Template values remain
+authoritative and merge key by key.
+
 ## fleet.yaml
 
 \`\`\`yaml
@@ -343,7 +349,7 @@ and prompt SHA-256 instead of prompt text.
 
 An alternate manifest \`-c /path/custom.yaml\` uses \`/path/custom/\` as its split
 root. Repeated init only fills missing files and never adopts a newer default.
-Revision-3 packaged-bootstrap and generated role defaults have an exact-semantic,
+Exact known revision-3 through revision-5 packaged-bootstrap and generated role defaults have an exact-semantic,
 fail-closed migration (dry-run by default):
 
 \`ours-fleet migrate-role-defaults [-c FILE]\`
@@ -399,7 +405,13 @@ Set \`room.anonymous: true\` on a room template, or pass \`--anonymous\` to
 anonymous Cowork room. \`--no-anonymous\` explicitly overrides an anonymous
 template. Fleet records the resolved value before room creation so retries keep
 the same choice. Temporary members of an anonymous room are instructed to call
-\`create_temporary_identity\` with \`expose_local=false\`.
+\`create_temporary_identity\` with \`expose_local=false\`. Their generated briefings
+do not disclose or compare an Owner participant CID. A participant-originated
+instruction has Owner authority only when the authenticated Cowork room envelope
+attributes that participant seat the exact \`Owner\` role. Literal text, display
+names, ordinary direct messages, and room-authored or rest-role messages with an
+Owner-looking label never grant that authority. Non-anonymous rooms remain pinned
+to the exact authenticated Owner CID.
 
 Human task and room results use the same compact Markdown presentation in the
 CLI and authenticated owner channel: a short heading, icon-plus-word status,

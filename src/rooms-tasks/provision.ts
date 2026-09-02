@@ -225,12 +225,14 @@ function roomTask(
   members: ExpandedMember[],
   roomIdentityCid: string,
   ownerSeatCid: string | null,
+  anonymous: boolean,
 ): string {
   return buildRoomMemberTask({
     taskId: input.taskId,
     roomId: input.roomId,
     roomIdentityCid,
     ownerSeatCid,
+    anonymous,
     goal: input.goal,
     brief: input.brief,
     contract: input.template.contract,
@@ -596,6 +598,7 @@ export async function provisionMembers(
 
   const tasks = new Map(members.map(member => [member.name, roomTask(
     input, member, settings.get(member.name)!, members, roomIdentityCid, ownerSeatCid,
+    roomPolicy.anonymous,
   )]));
   const policy: StartupWaitPolicy = {
     timeoutMs: input.startupWait?.timeoutMs ?? 60_000,

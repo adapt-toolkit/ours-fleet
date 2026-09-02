@@ -61,7 +61,25 @@ const V4_GENERATED_ROLE_DEFAULT_FINGERPRINTS: Readonly<Record<string, string>> =
   'agent_templates/LocalCoordinator.yaml': 'cb7c83a835dde9d45bac42cadce2f196f561d2460321c690cdef435f7076f97f',
 });
 
-const V5_ROLE_DEFAULTS = new Set([
+const V5_ROLE_DEFAULT_FINGERPRINTS: Readonly<Record<string, string>> = Object.freeze({
+  'roles/LocalCoordinator.yaml': '52714be635060adca2bc7fe99c27c3184be6c78e3874a77e61a2fb135bac1278',
+  'roles/Developer.yaml': '04278f325c366035e82d8e7f4aff72badb297eaf2fb5afae38a28a5aaf9260c9',
+  'roles/Critic.yaml': 'bcb96c84534ca6fc466a8ee63f679785d347ed1cdf223efcc36ca5ed4ca7f3de',
+  'agent_templates/LocalCoordinator.yaml': 'c59980ab7d94dad4d4961ba308cf62342291d8f1c57cf2faf900e80136fa2e7d',
+  'agent_templates/Developer.yaml': '36f1d010a9c8591ae5ba422ef1ac26335b9f7f3382b6b8532844df754a56287e',
+  'agent_templates/Critic.yaml': '7025b842e260a9c91ebc64dd3a11162a82b025b287457c6cb6f6c8964b38cdfd',
+  'room_templates/single.yaml': '61051917b1f4f53a13687cc69d3f9ad98f1b02558f82b236b22aac942850395f',
+  'room_templates/pair.yaml': 'a20b2145fa84e5d61266385e629892734b98fc61be9d0c7647c3778ec1bb40a8',
+  'room_templates/team.yaml': 'c455f54a1f86106bfac7192299130dabfb91fa6179d2dedcc0573a384a902411',
+});
+
+const V5_GENERATED_ROLE_DEFAULT_FINGERPRINTS: Readonly<Record<string, string>> = Object.freeze({
+  'agent_templates/LocalCoordinator.yaml': 'cb7c83a835dde9d45bac42cadce2f196f561d2460321c690cdef435f7076f97f',
+  'agent_templates/Developer.yaml': 'fdd953aab72d042e62780dd273598745aae59521b39edf4876d7676bb7189c83',
+  'agent_templates/Critic.yaml': '3e98a28f17876061cfadf984351aa59fdbe19629e514eff52c74546545c64a91',
+});
+
+const CURRENT_ROLE_DEFAULTS = new Set([
   'roles/Coordinator.yaml', 'roles/LocalCoordinator.yaml', 'roles/Developer.yaml', 'roles/Critic.yaml',
   'agent_templates/LocalCoordinator.yaml', 'agent_templates/Developer.yaml', 'agent_templates/Critic.yaml',
   'room_templates/single.yaml', 'room_templates/pair.yaml', 'room_templates/team.yaml',
@@ -186,7 +204,7 @@ function validateRoleDefaultMigration(stageManifest: string): void {
   }
 }
 
-/** Explicit adoption of exact packaged revision-3/4 role defaults; customized files are never changed. */
+/** Explicit adoption of exact known packaged role defaults; customized files are never changed. */
 export function migratePackagedRoleDefaults(
   configuration: string,
   options: { write?: boolean } = {},
@@ -210,6 +228,7 @@ export function migratePackagedRoleDefaults(
     const known = new Set([
       ...Object.keys(V3_ROLE_DEFAULT_FINGERPRINTS),
       ...Object.keys(V4_ROLE_DEFAULT_FINGERPRINTS),
+      ...Object.keys(V5_ROLE_DEFAULT_FINGERPRINTS),
     ]);
     for (const relative of known) {
       const path = join(root, relative); if (!existsSync(path)) continue;
@@ -219,13 +238,15 @@ export function migratePackagedRoleDefaults(
         V3_GENERATED_ROLE_DEFAULT_FINGERPRINTS[relative],
         V4_ROLE_DEFAULT_FINGERPRINTS[relative],
         V4_GENERATED_ROLE_DEFAULT_FINGERPRINTS[relative],
+        V5_ROLE_DEFAULT_FINGERPRINTS[relative],
+        V5_GENERATED_ROLE_DEFAULT_FINGERPRINTS[relative],
       ].some(expected => expected !== undefined && actual === expected);
       if (recognized)
-        (V5_ROLE_DEFAULTS.has(relative) ? replacements : removals).push(path);
+        (CURRENT_ROLE_DEFAULTS.has(relative) ? replacements : removals).push(path);
       else preserved.push(path);
     }
     const additions: string[] = [];
-    for (const relative of V5_ROLE_DEFAULTS) {
+    for (const relative of CURRENT_ROLE_DEFAULTS) {
       const path = join(root, relative);
       if (!existsSync(path)) additions.push(path);
       else if (!replacements.includes(path) && !preserved.includes(path)) preserved.push(path);

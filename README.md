@@ -365,6 +365,7 @@ Agent Template document (\`~/fleet/agent_templates/Worker.yaml\`) is inert and r
 role: { ref: developer }
 brain: { ref: claude-default }
 permissions: { approval: ask, filesystem: workspace, unattended: deny }
+monitor: { mode: fleet, interrupt: after_tool }
 loops:                                   # optional; temporary launches only
   progress:
     interval: 10m                        # required; 1m..30d
@@ -380,6 +381,12 @@ missed occurrences are not backlogged or replayed, and restart recovery may
 preserve at most one recent late occurrence. The trusted authoring file and
 private sealed role snapshot retain exact prompt text; resolved launch, task,
 room, provenance, and audit presentation surfaces show only bytes and SHA-256.
+
+Every packaged `Developer`, `Critic`, and `LocalCoordinator` Agent Template uses
+`monitor.mode: fleet` with `monitor.interrupt: after_tool`. Consequently every
+member of the standard `single`, `pair`, and `team` Room Templates resolves to
+that policy. A custom Agent Template or explicit per-member override remains
+authoritative and is merged key by key without rewriting unrelated values.
 
 Direct temporary spawn can set the same whole block from an owner-only regular
 file containing exactly a top-level `loops:` mapping, or explicitly disable it:
@@ -556,12 +563,12 @@ task-local `LocalCoordinator`, `Developer`, and `Critic`. The persistent
 `FleetCoordinator` uses the separate packaged `Coordinator` contract and coordination
 model.
 
-Revision-3 role defaults and exact revision-4 LocalCoordinator/team defaults have an
+Exact known revision-3 through revision-5 role and Agent Template defaults have an
 explicit fail-closed adoption command: first run
 `ours-fleet migrate-role-defaults -c FILE` for a zero-write plan, review every removal,
 replacement, addition, preserved custom file, staging path, and recovery path, then rerun
 with `--write`. Only exact semantic matches for packaged-bootstrap and generated
-revision-3/4 forms are changed; same-named customized files remain byte-identical, and a
+revision-3/4/5 forms are changed; same-named customized files remain byte-identical, and a
 dangling custom reference refuses publication. Rerunning the migration is a no-op.
 
 For manual adoption of a single newer packaged file, copy the reported source beside the
@@ -605,7 +612,13 @@ Set `room.anonymous: true` on a room template, or pass `--anonymous` to
 anonymous Cowork room. `--no-anonymous` explicitly overrides an anonymous
 template. Fleet records the resolved value before room creation so retries keep
 the same choice. Temporary members of an anonymous room are instructed to call
-`create_temporary_identity` with `expose_local=false`.
+`create_temporary_identity` with `expose_local=false`. Their generated briefings
+do not disclose or compare an Owner participant CID. A participant-originated
+instruction has Owner authority only when the authenticated Cowork room envelope
+attributes that participant seat the exact `Owner` role. Literal text, display
+names, ordinary direct messages, and room-authored or rest-role messages with an
+Owner-looking label never grant that authority. Non-anonymous rooms remain pinned
+to the exact authenticated Owner CID.
 
 Human task and room results use the same compact Markdown presentation in the
 CLI and authenticated owner channel: a short heading, icon-plus-word status,
