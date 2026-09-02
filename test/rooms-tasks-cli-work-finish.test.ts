@@ -3,6 +3,7 @@ import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { Command } from 'commander';
+import { deriveTaskRoomName } from '../src/rooms-tasks/task-room-name.js';
 
 // ── Mock setup (vi.hoisted runs before vi.mock factories) ────────────────
 
@@ -550,75 +551,107 @@ afterEach(() => {
 // ── task work ────────────────────────────────────────────────────────────
 
 describe('task title to Cowork room naming', () => {
-  const unicodeTitle = 'Релиз 🚀 — 東京 / naïve café';
+  const unicodeTitle = 'Fix inconsistent local/UTC chat timestamps in messenger-server';
 
-  function expectExactRoomName(): void {
+  function expectCanonicalRoomName(taskId: string): void {
+    const roomName = deriveTaskRoomName(unicodeTitle, taskId);
     expect(mocks.createRoom).toHaveBeenCalledWith(expect.objectContaining({
-      room_name: unicodeTitle,
+      room_name: roomName,
     }));
-    expect(getRoomRecord(ROOM_ID)?.room_name).toBe(unicodeTitle);
+    expect(getRoomRecord(ROOM_ID)?.room_name).toBe(roomName);
   }
 
-  it('preserves an immediate task create title exactly', async () => {
+  it('derives an immediate task room canonically without changing its title', async () => {
     await run('create', '--title', unicodeTitle, '--json');
-    expect(JSON.parse(out.join('\n')).task.title).toBe(unicodeTitle);
-    expectExactRoomName();
+    const task = JSON.parse(out.join('\n')).task;
+    expect(task.title).toBe(unicodeTitle);
+    expectCanonicalRoomName(task.task_id);
   });
 
-  it('preserves a backlog title exactly when task start creates its room', async () => {
+  it('uses the same canonical derivation when task start creates the room', async () => {
     await run('create', '--title', unicodeTitle, '--backlog', '--json');
     const taskId = JSON.parse(out.join('\n')).task.task_id as string;
     out = [];
     mocks.createRoom.mockClear();
     await run('start', taskId, '--json');
     expect(JSON.parse(out.join('\n')).task.title).toBe(unicodeTitle);
-    expectExactRoomName();
+    expectCanonicalRoomName(taskId);
   });
 
-  it('preserves a backlog title exactly when task work creates its room', async () => {
+  it('uses the same canonical derivation when task work creates the room', async () => {
     const task = createTask({
       title: unicodeTitle, origin: { type: 'cli' }, no_room: true, start: false,
     });
     await run('work', task.task_id, '--json');
     expect(JSON.parse(out.join('\n')).task.title).toBe(unicodeTitle);
-    expectExactRoomName();
+    expectCanonicalRoomName(task.task_id);
+  });
+
+  it('replays the same idempotency key without deriving or creating another room', async () => {
+    await run('create', '--title', unicodeTitle, '--idempotency-key', 'same-request', '--json');
+    const first = JSON.parse(out.join('\n')).task;
+    const roomName = getRoomRecord(ROOM_ID)?.room_name;
+    expect(roomName).toBe(deriveTaskRoomName(unicodeTitle, first.task_id));
+    out = [];
+    mocks.createRoom.mockClear();
+    await run('create', '--title', unicodeTitle, '--idempotency-key', 'same-request', '--json');
+    const replay = JSON.parse(out.join('\n')).task;
+    expect(replay).toEqual(first);
+    expect(replay.title).toBe(unicodeTitle);
+    expect(deriveTaskRoomName(replay.title, replay.task_id)).toBe(roomName);
+    expect(getRoomRecord(ROOM_ID)?.room_name).toBe(roomName);
+    expect(mocks.createRoom).not.toHaveBeenCalled();
+  });
+
+  it('canonically bounds the second reported overlong title', async () => {
+    const overlong = 'Fix inconsistent local and UTC chat timestamps in messenger-server';
+    await run('create', '--title', overlong, '--json');
+    const task = JSON.parse(out.join('\n')).task;
+    const roomName = deriveTaskRoomName(overlong, task.task_id);
+    expect(task.title).toBe(overlong);
+    expect(Array.from(roomName)).toHaveLength(52);
+    expect(mocks.createRoom).toHaveBeenCalledWith(expect.objectContaining({ room_name: roomName }));
+    expect(getRoomRecord(ROOM_ID)?.room_name).toBe(roomName);
   });
 });
 
 describe('decomposed task title to Cowork room naming', () => {
   const decomposedTitle = 'Cafe\u0301 release — A\u030Angstro\u0308m';
 
-  function expectExactDecomposedRoomName(): void {
+  function expectCanonicalDecomposedRoomName(taskId: string): void {
     expect(decomposedTitle).not.toBe(decomposedTitle.normalize('NFC'));
+    const roomName = deriveTaskRoomName(decomposedTitle, taskId);
     expect(mocks.createRoom).toHaveBeenCalledWith(expect.objectContaining({
-      room_name: decomposedTitle,
+      room_name: roomName,
     }));
-    expect(getRoomRecord(ROOM_ID)?.room_name).toBe(decomposedTitle);
+    expect(getRoomRecord(ROOM_ID)?.room_name).toBe(roomName);
+    expect(roomName).toBe(roomName.normalize('NFC'));
   }
 
-  it('preserves decomposed code points through task create and room create', async () => {
+  it('normalizes the derived room while preserving the immediate task title', async () => {
     await run('create', '--title', decomposedTitle, '--json');
-    expect(JSON.parse(out.join('\n')).task.title).toBe(decomposedTitle);
-    expectExactDecomposedRoomName();
+    const task = JSON.parse(out.join('\n')).task;
+    expect(task.title).toBe(decomposedTitle);
+    expectCanonicalDecomposedRoomName(task.task_id);
   });
 
-  it('preserves decomposed code points when task start creates the room', async () => {
+  it('normalizes the derived room on task start without changing its title', async () => {
     await run('create', '--title', decomposedTitle, '--backlog', '--json');
     const taskId = JSON.parse(out.join('\n')).task.task_id as string;
     out = [];
     mocks.createRoom.mockClear();
     await run('start', taskId, '--json');
     expect(JSON.parse(out.join('\n')).task.title).toBe(decomposedTitle);
-    expectExactDecomposedRoomName();
+    expectCanonicalDecomposedRoomName(taskId);
   });
 
-  it('preserves decomposed code points when task work creates the room', async () => {
+  it('normalizes the derived room on task work without changing its title', async () => {
     const task = createTask({
       title: decomposedTitle, origin: { type: 'cli' }, no_room: true, start: false,
     });
     await run('work', task.task_id, '--json');
     expect(JSON.parse(out.join('\n')).task.title).toBe(decomposedTitle);
-    expectExactDecomposedRoomName();
+    expectCanonicalDecomposedRoomName(task.task_id);
   });
 });
 

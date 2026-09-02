@@ -44,6 +44,7 @@ import type {
 } from '../rooms-tasks/types.js';
 import type { TaskDeletionAcceptance } from '../rooms-tasks/task-state.js';
 import { storedRoomLaunchPolicy, TASK_CANCELLABLE_STATES, TASK_TERMINAL_STATES } from '../rooms-tasks/types.js';
+import { deriveTaskRoomName } from '../rooms-tasks/task-room-name.js';
 
 export type TaskRoomActor =
   | { kind: 'local_control'; surface: 'cli' | 'web' }
@@ -546,7 +547,26 @@ export class TaskRoomApplicationService {
     if (task.state !== 'provisioning') return {
       kind: TASK_TERMINAL_STATES.includes(task.state) ? 'terminal' : 'no_op', task, room, issues,
     };
-    if (!room) return { kind: 'provisioning_non_resumable', task, room, issues, reason: 'missing_room' };
+    if (!room) {
+      if (!task.template) return {
+        kind: 'provisioning_non_resumable', task, room, issues, reason: 'missing_room',
+      };
+      try {
+        const template = task.execution_plan?.snapshot ?? this.existingTemplate(cfg, task);
+        const roomPolicy = task.execution_plan
+          ? storedRoomLaunchPolicy(task.execution_plan.room_policy)
+          : resolveRoomLaunchPolicy(template, undefined);
+        await this.provisionRoom(cfg, task, template, created => {
+          task = updateTaskRoom(task.task_id, created.room_id, created.room_identity_cid!);
+        }, undefined, roomPolicy);
+        task = readTask(task.task_id);
+        room = task.room_id ? getRoomRecord(task.room_id) : undefined;
+        return { kind: 'provisioning_resumed', task, room, issues: [{ code: 'provisioning_resumed' }] };
+      } catch (error) {
+        issues.push({ code: 'resume_failed', error: error instanceof Error ? error.message : String(error) });
+        return { kind: 'provisioning_resume_failed', task, room, issues };
+      }
+    }
     if (room.provisioning_detail === 'waiting_cowork') issues.push({ code: 'waiting_cowork' });
     if (room.provisioning_detail === 'waiting_owner_invite') issues.push({ code: 'waiting_owner_invite' });
     if (room.provisioning_detail === 'owner_cid_mismatch') issues.push({ code: 'owner_cid_mismatch' });
@@ -974,6 +994,7 @@ export class TaskRoomApplicationService {
         throw new ConfigError('rooms: configuration is required before creating or querying rooms');
       return createCoworkAdapter({ configPath: cfg.rooms.cowork?.config });
     })();
+    const roomName = task.task_id ? deriveTaskRoomName(task.title, task.task_id) : task.title;
     const unlockSnapshot = template ? acquireLaunchSnapshotLock() : undefined;
     let launchTemplate: TemplateSnapshot | undefined;
     let room: RoomOrchestrationRecord;
@@ -993,13 +1014,13 @@ export class TaskRoomApplicationService {
               `task ${task.task_id} is pending deletion`, { task: task.task_id });
         }
         const created = await cowork.createRoom({
-          room_name: task.title, goal: task.goal?.trim() || task.title,
+          room_name: roomName, goal: task.goal?.trim() || task.title,
           briefing: task.brief?.trim() || launchTemplate?.contract?.trim() || task.goal?.trim() || task.title,
           quiet_membership: launchTemplate?.room?.quiet_membership,
           anonymous: policy.anonymous,
         });
         const record = createRoomRecord({
-          room_id: created.room_id, room_name: task.title, room_identity_cid: created.identity_cid,
+          room_id: created.room_id, room_name: roomName, room_identity_cid: created.identity_cid,
           task_id: task.task_id, template_snapshot: launchTemplate, room_policy: policy,
         });
         onCreated(record);
