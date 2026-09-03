@@ -153,6 +153,21 @@ afterEach(() => {
 });
 
 describe('OwnerChannel live management', () => {
+  it('delivers a replayed detached-ready presentation exactly once to the authenticated Owner', async () => {
+    const { channel, client } = setup({ agent: AGENT });
+    await channel.start();
+    const ready = { kind: 'room' as const, operation: 'activate' as const,
+      eventId: 'room-ready:2026-09-03T09:00:00.000Z', id: 'room-detached', name: 'Detached ready',
+      previousState: 'provisioning', newState: 'active', participants: [] };
+    await channel.notifyFleetLifecycle!([ready]);
+    await channel.notifyFleetLifecycle!([ready]);
+    const notices = client.calls.filter(call => call.name === 'sendMessage'
+      && String(call.args?.text).includes('The room Detached ready is ready.'));
+    expect(notices).toHaveLength(1);
+    expect(notices[0]?.args?.contact).toBe(OWNER);
+    await channel.close();
+  });
+
   /** One SDK-watch harness with deterministic retry sleeps. */
   function watchSetup(options: {
     watchState?: string;

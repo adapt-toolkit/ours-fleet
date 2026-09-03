@@ -8,7 +8,7 @@ import {
   acceptManagedRoomClose, deleteLegacyClosedRooms, deleteManagedRoom,
   recordManagedRoomCloseError,
 } from './close.js';
-import { launchFleetWorker } from './external-worker.js';
+import { launchFleetWorker, presentFleetWorkerLifecycle } from './external-worker.js';
 import {
   resolveTemplate, listTemplates, snapshotTemplate, hashTemplate,
 } from './templates.js';
@@ -61,7 +61,8 @@ import {
 } from '../application/task-room-service.js';
 import { TaskListError } from './task-lists.js';
 import {
-  recordFleetAuditFailure, recordFleetAuditPresentation, recordFleetAuditResource,
+  beginFleetAuditCollection, consumeFleetAuditCollection, recordFleetAuditFailure,
+  recordFleetAuditPresentation, recordFleetAuditResource,
 } from '../fleet-command-audit.js';
 import { renderAgentConfiguration, type AgentLaunchConfiguration } from '../lifecycle-summary.js';
 import { withFileLock } from '../atomic-file.js';
@@ -93,6 +94,12 @@ function taskRoomPublicError(
     return PUBLIC_ERROR_FIELD.test(text) ? [[key, text]] : [];
   }));
   return new TaskRoomPublicError(code, validated);
+}
+
+async function presentDetachedProvisioningOutcome(outcome: TaskProvisioningOutcome): Promise<void> {
+  beginFleetAuditCollection();
+  recordTaskProvisioningOutcome(outcome);
+  await presentFleetWorkerLifecycle(consumeFleetAuditCollection().presentations ?? []);
 }
 
 function taskRoomPublicFailure(error: TaskRoomPublicError): {
@@ -1212,7 +1219,10 @@ export function registerTaskCommands(parent: Command, cOpt: (cmd: Command) => Co
           const app = taskRoomService(opts.configuration);
           for (;;) {
             const before = app.taskProvisioningOutcome(id);
-            if (before.kind !== 'in_progress') return;
+            if (before.kind !== 'in_progress') {
+              await presentDetachedProvisioningOutcome(before);
+              return;
+            }
             const recovery = await app.beginTaskRecovery({
               actor: { kind: 'internal_worker', surface: 'cli' }, taskId: id,
             });
@@ -1220,7 +1230,11 @@ export function registerTaskCommands(parent: Command, cOpt: (cmd: Command) => Co
             // intents; explicit task recover retains that broader authority.
             if (recovery.kind !== 'final') return;
             const outcome = app.taskProvisioningOutcome(id);
-            if (outcome.kind !== 'in_progress' || outcome.next_action) return;
+            if (outcome.kind !== 'in_progress') {
+              await presentDetachedProvisioningOutcome(outcome);
+              return;
+            }
+            if (outcome.next_action) return;
             await sleep(1_000);
           }
         }, {}, 10 * 60_000);

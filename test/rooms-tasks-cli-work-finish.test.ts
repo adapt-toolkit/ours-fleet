@@ -18,6 +18,7 @@ const mocks = vi.hoisted(() => ({
   closeManagedRoom: vi.fn(),
   deleteManagedRoom: vi.fn().mockResolvedValue({ room_id: 'room', deleted: true }),
   launchFleetWorker: vi.fn(),
+  presentFleetWorkerLifecycle: vi.fn(),
   recoverRoom: vi.fn(),
   getRoom: vi.fn(),
   getSeats: vi.fn(),
@@ -62,6 +63,7 @@ vi.mock('../src/rooms-tasks/close.js', async (importOriginal) => {
 
 vi.mock('../src/rooms-tasks/external-worker.js', () => ({
   launchFleetWorker: mocks.launchFleetWorker,
+  presentFleetWorkerLifecycle: mocks.presentFleetWorkerLifecycle,
 }));
 
 vi.mock('../src/rooms-tasks/markdown.js', async (importOriginal) => {
@@ -248,6 +250,7 @@ beforeEach(() => {
         }).catch(() => undefined));
     }, 0);
   });
+  mocks.presentFleetWorkerLifecycle.mockReset().mockResolvedValue(undefined);
   mocks.closeManagedRoom.mockResolvedValue(undefined);
   mocks.markdownRender.mockReset();
   // The real provisionMembers ends by activating the room and the task; the
@@ -571,6 +574,31 @@ describe('task provisioning command outcomes', () => {
     expect(getTask(task.task_id).state).toBe('active');
     expect(getRoomRecord(ROOM_ID)?.state).toBe('active');
     expect(mocks.provisionMembers).toHaveBeenCalledTimes(3);
+  });
+
+  it('presents one stable ready event when detached provisioning converges without await or recover', async () => {
+    writeCustomTemplate();
+    const task = createTask({ title: 'Detached ready', origin: { type: 'cli' }, start: false });
+    mocks.provisionMembers.mockImplementationOnce(async ({ roomId }: { roomId: string }) =>
+      getRoomRecord(roomId)!);
+    await run('start', task.task_id, '--template', 'durable', '--json');
+    expect(JSON.parse(out.join('\n')).provisioning.kind).toBe('in_progress');
+
+    mocks.presentFleetWorkerLifecycle.mockClear();
+    out = [];
+    await run('_provision', task.task_id);
+    const first = mocks.presentFleetWorkerLifecycle.mock.calls[0]?.[0] as Array<Record<string, unknown>>;
+    expect(first.filter(event => event.kind === 'room' && event.operation === 'activate')).toEqual([
+      expect.objectContaining({ id: ROOM_ID, eventId: expect.stringMatching(/^room-ready:/) }),
+    ]);
+
+    // A worker replay observes the same durable activation and presents the
+    // same digest; the Owner ledger therefore suppresses a second notice.
+    await run('_provision', task.task_id);
+    const replay = mocks.presentFleetWorkerLifecycle.mock.calls[1]?.[0] as Array<Record<string, unknown>>;
+    expect(replay.find(event => event.operation === 'activate')?.eventId)
+      .toBe(first.find(event => event.operation === 'activate')?.eventId);
+    expect(mocks.launchFleetWorker).toHaveBeenCalledTimes(1);
   });
 
   it('uses the advertised await handle to retry a fixed Owner-action blocker', async () => {
