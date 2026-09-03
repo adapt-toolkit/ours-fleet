@@ -1454,7 +1454,7 @@ export class OwnerChannel implements OwnerChannelHandle {
         if (!input.backlog && !input.noRoom && task.room_id) {
           const outcome = service.taskProvisioningOutcome(task.task_id);
           if (outcome.kind === 'in_progress' && !outcome.next_action)
-            await this.fleetOps.recoverTask(task.task_id);
+            await this.fleetOps.provisionTask(task.task_id);
         }
         return task;
       }),
@@ -1470,14 +1470,13 @@ export class OwnerChannel implements OwnerChannelHandle {
           taskId: task.task_id, waitMs: 0,
         });
         if (outcome.kind === 'in_progress' && !outcome.next_action)
-          await this.fleetOps.recoverTask(task.task_id);
+          await this.fleetOps.provisionTask(task.task_id);
         return outcome;
       }),
       awaitTask: taskId => provisioningCommand(async () => {
         const service = new TaskRoomApplicationService(this.options.configPath);
         const initial = service.taskProvisioningOutcome(taskId);
-        if (initial.kind === 'in_progress' && !initial.next_action)
-          await this.fleetOps.recoverTask(taskId);
+        if (initial.kind === 'in_progress') await this.fleetOps.provisionTask(taskId);
         return service.awaitTaskProvisioning({
           actor: { kind: 'authenticated_owner', surface: 'messenger', cid: sender.id }, taskId,
         });

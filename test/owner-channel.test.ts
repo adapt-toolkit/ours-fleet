@@ -16,7 +16,7 @@ import {
 } from '../src/rooms-tasks/room-state.js';
 import {
   activateTask, createTask, getDeletingTask, getTask, readTaskDeletionReceipt,
-  reviewTask, startTask,
+  reviewTask, startTask, updateTaskRoom,
 } from '../src/rooms-tasks/task-state.js';
 import type {
   OursContactsView, OursInboundMessage, OursOps,
@@ -1038,6 +1038,7 @@ describe('OwnerChannel deterministic command dispatch', () => {
     closeRoom: vi.fn(async () => undefined),
     settleTask: vi.fn(async () => undefined),
     settleTaskDeletion: vi.fn(async () => undefined),
+    provisionTask: vi.fn(async () => undefined),
     recoverTask: vi.fn(async () => undefined),
   });
 
@@ -1265,6 +1266,36 @@ describe('OwnerChannel deterministic command dispatch', () => {
     expect(wireWhenSpawned).toContain('wire-room-recover');
     expect(sendsWhenSpawned).toBeGreaterThan(0);
     expect(lastReply(client)).toContain('deletion recovery is still being settled');
+  });
+
+  it('routes authenticated Owner await through provisioning continuation, not broad recovery', async () => {
+    const fleet = fakeFleet();
+    const fleetHome = mkdtempSync(join(tmpdir(), 'ours-owner-task-await-'));
+    dirs.push(fleetHome);
+    const previousHome = process.env.OURS_FLEET_HOME;
+    process.env.OURS_FLEET_HOME = fleetHome;
+    const task = createTask({ title: 'Owner await', origin: { type: 'owner_channel' }, start: true });
+    const room = createRoomRecord({ room_id: '01hzyk8m0000000000000000ad',
+      room_name: 'Owner await', room_identity_cid: 'c'.repeat(64), task_id: task.task_id });
+    updateTaskRoom(task.task_id, room.room_id, 'c'.repeat(64));
+    fleet.provisionTask.mockImplementation(async () => {
+      activateRoom(room.room_id);
+      activateTask(task.task_id);
+    });
+    const { channel, client } = setup(
+      [ownerMessage(5912, 'wire-task-await', `/task await ${task.task_id}`)], undefined, { fleet });
+    try {
+      await channel.start();
+      await channel.drain();
+    }
+    finally {
+      await channel.close();
+      if (previousHome === undefined) delete process.env.OURS_FLEET_HOME;
+      else process.env.OURS_FLEET_HOME = previousHome;
+    }
+    expect(fleet.provisionTask).toHaveBeenCalledWith(task.task_id);
+    expect(fleet.recoverTask).not.toHaveBeenCalled();
+    expect(lastReply(client)).toContain('Room provisioning complete');
   });
 
   it('persists task terminal intent and the wire before launching its external worker', async () => {

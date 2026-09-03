@@ -4,11 +4,14 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { Command } from 'commander';
 import { deriveTaskRoomName } from '../src/rooms-tasks/task-room-name.js';
+import { loadConfig } from '../src/config.js';
+import { snapshotTemplate } from '../src/rooms-tasks/templates.js';
 
 // ── Mock setup (vi.hoisted runs before vi.mock factories) ────────────────
 
 const mocks = vi.hoisted(() => ({
   createRoom: vi.fn(),
+  acceptInvite: vi.fn(),
   closeRoom: vi.fn().mockResolvedValue(undefined),
   deleteRoom: vi.fn().mockResolvedValue(undefined),
   provisionMembers: vi.fn(),
@@ -28,6 +31,7 @@ vi.mock('../src/rooms-tasks/cowork-adapter.js', async (importOriginal) => {
     ...actual,
     createCoworkAdapter: () => ({
       createRoom: mocks.createRoom,
+      acceptInvite: mocks.acceptInvite,
       closeRoom: mocks.closeRoom,
       deleteRoom: mocks.deleteRoom,
       recoverRoom: mocks.recoverRoom,
@@ -193,6 +197,7 @@ beforeEach(() => {
   exitSpy = vi.spyOn(process, 'exit').mockImplementation((() => { throw new ExitError(); }) as never);
 
   mocks.createRoom.mockReset().mockResolvedValue({ room_id: ROOM_ID, identity_cid: 'c'.repeat(64) });
+  mocks.acceptInvite.mockReset().mockResolvedValue({ seat_cid: 'a'.repeat(64) });
   mocks.recoverRoom.mockReset().mockResolvedValue({
     room_id: ROOM_ID, identity_name: 'room-id', identity_cid: 'c'.repeat(64),
     room_name: 'Fix the parser', state: 'active', seats: [], role_briefings: {},
@@ -566,6 +571,46 @@ describe('task provisioning command outcomes', () => {
     expect(getTask(task.task_id).state).toBe('active');
     expect(getRoomRecord(ROOM_ID)?.state).toBe('active');
     expect(mocks.provisionMembers).toHaveBeenCalledTimes(3);
+  });
+
+  it('uses the advertised await handle to retry a fixed Owner-action blocker', async () => {
+    writeV2Fixture(cfgPath,
+      'roles: {}\n'
+      + 'rooms:\n'
+      + '  owner:\n    expected_cid: ' + 'a'.repeat(64) + '\n'
+      + '    public_invite: repaired-invite\n'
+      + '  defaults:\n    attach_owner: true\n'
+      + [
+        'room_templates:',
+        '  durable:',
+        '    version: 7',
+        '    description: durable template',
+        '    members:',
+        '      - { slot: dev, role: Developer, count: 1, agent_template: Dev }',
+        '',
+      ].join('\n'));
+    const cfg = loadConfig(cfgPath);
+    const snapshot = snapshotTemplate(cfg.roomTemplates!.durable!, cfg.agentTemplates);
+    const task = createTask({ title: 'Owner invite repaired', origin: { type: 'cli' }, start: true,
+      template: { name: snapshot.name, version: snapshot.version, content_hash: snapshot.content_hash } });
+    const room = createRoomRecord({ room_id: ROOM_ID, room_name: 'Owner invite repaired',
+      room_identity_cid: 'c'.repeat(64), task_id: task.task_id, template_snapshot: snapshot,
+      room_policy: { anonymous: false } });
+    updateTaskRoom(task.task_id, room.room_id, 'c'.repeat(64));
+    advanceSaga(room.room_id, 'attach_owner', 2);
+    setSagaError(room.room_id, 'old invite expired', 'rotate invite', 'waiting_owner_invite');
+
+    await run('await', task.task_id, '--wait-ms', '0', '--json');
+    expect(JSON.parse(out.join('\n')).provisioning).toMatchObject({ kind: 'in_progress',
+      next_action: expect.stringContaining('Rotate') });
+    expect(mocks.launchFleetWorker).toHaveBeenCalledWith(
+      ['task', '_provision', task.task_id], `task-provision-${task.task_id}`, cfgPath);
+
+    out = [];
+    await run('_provision', task.task_id);
+    expect(mocks.acceptInvite).toHaveBeenCalledOnce();
+    expect(getTask(task.task_id).state).toBe('active');
+    expect(getRoomRecord(room.room_id)?.state).toBe('active');
   });
 
   it('returns compact human and JSON ready outcomes', async () => {

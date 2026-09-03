@@ -614,6 +614,23 @@ export class TaskRoomApplicationService {
         return { kind: 'provisioning_resume_failed', task, room, issues };
       }
     }
+    if (room.provisioning_detail === 'waiting_owner_invite'
+        || room.provisioning_detail === 'owner_cid_mismatch') {
+      try {
+        await this.recoverRoom({ actor: input.actor, roomId: room.room_id });
+        task = readTask(task.task_id);
+        room = getRoomRecord(room.room_id);
+        if (task.state === 'active' && room?.state === 'active') return {
+          kind: 'provisioning_resumed', task, room, issues: [{ code: 'provisioning_resumed' }],
+        };
+      } catch (error) {
+        issues.push({ code: 'resume_failed', error: error instanceof Error ? error.message : String(error) });
+        return { kind: 'provisioning_resume_failed', task, room, issues };
+      }
+    }
+    if (!room) return {
+      kind: 'provisioning_non_resumable', task, room, issues, reason: 'missing_room',
+    };
     if (room.provisioning_detail === 'waiting_cowork') issues.push({ code: 'waiting_cowork' });
     if (room.provisioning_detail === 'waiting_owner_invite') issues.push({ code: 'waiting_owner_invite' });
     if (room.provisioning_detail === 'owner_cid_mismatch') issues.push({ code: 'owner_cid_mismatch' });

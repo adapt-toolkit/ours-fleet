@@ -938,7 +938,7 @@ export function registerTaskCommands(parent: Command, cOpt: (cmd: Command) => Co
           throw new Error('--wait-ms must be an integer from 0 to 600000');
         const service = taskRoomService(opts.configuration);
         const initial = service.taskProvisioningOutcome(id);
-        if (initial.kind === 'in_progress' && !initial.next_action)
+        if (initial.kind === 'in_progress')
           await continueProvisioningInBackground(id, opts.configuration);
         const outcome = await service.awaitTaskProvisioning({
           actor: { kind: 'local_control', surface: 'cli' }, taskId: id, waitMs,
@@ -1212,10 +1212,13 @@ export function registerTaskCommands(parent: Command, cOpt: (cmd: Command) => Co
           const app = taskRoomService(opts.configuration);
           for (;;) {
             const before = app.taskProvisioningOutcome(id);
-            if (before.kind !== 'in_progress' || before.next_action) return;
-            await app.ensureTaskWork({
+            if (before.kind !== 'in_progress') return;
+            const recovery = await app.beginTaskRecovery({
               actor: { kind: 'internal_worker', surface: 'cli' }, taskId: id,
             });
+            // Provisioning continuation never settles deletion or terminal
+            // intents; explicit task recover retains that broader authority.
+            if (recovery.kind !== 'final') return;
             const outcome = app.taskProvisioningOutcome(id);
             if (outcome.kind !== 'in_progress' || outcome.next_action) return;
             await sleep(1_000);

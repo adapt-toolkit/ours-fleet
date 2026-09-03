@@ -37,6 +37,9 @@ export interface OwnerFleetOps {
   settleTask(taskId: string): Promise<void>;
   /** Settle an accepted task deletion outside the caller role's supervisor lifecycle. */
   settleTaskDeletion(taskId: string): Promise<void>;
+  /** Continue an accepted provisioning saga until convergence. */
+  provisionTask(taskId: string): Promise<void>;
+  /** Explicit recovery may also route terminal and deletion intents. */
   recoverTask(taskId: string): Promise<void>;
 }
 
@@ -886,6 +889,9 @@ export function fleetCliOps(role: string, configPath?: string): OwnerFleetOps {
     ),
     settleTaskDeletion: taskId => launchFleetWorker(
       ['task', '_settle_delete', taskId], `task-delete-${taskId}`, configPath,
+    ),
+    provisionTask: taskId => launchFleetWorker(
+      ['task', '_provision', taskId], `task-provision-${taskId}`, configPath,
     ),
     recoverTask: taskId => launchFleetWorker(
       ['task', '_recover', taskId], `task-recover-${taskId}`, configPath,
