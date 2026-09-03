@@ -13,5 +13,5 @@
   "keywords": ["claude", "claude-code", "plugin", "fleet", "agents", "acp", "spawn", "oversight", "ours"],
   "files": [".claude-plugin", "skills"],
   "publishConfig": { "access": "public" },
-  "engines": { "node": ">=20" }
+  "engines": { "node": ">=22" }
 }

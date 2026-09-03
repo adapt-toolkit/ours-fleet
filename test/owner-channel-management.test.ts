@@ -8,7 +8,7 @@ import { errBoundElsewhere } from '@ours.network/sdk/client';
 
 import { OwnerChannel } from '../src/owner-channel/channel.js';
 import type {
-  OursContactsView, OursInboundMessage, OursOps,
+  OursContactsView, OursInboundMessage, OursOps, OursRegisteredCommand,
 } from '../src/owner-channel/ours-client.js';
 import { OWNER_TASK_MAX_PER_OWNER, OWNER_TASK_TTL_MS } from '../src/owner-channel/tasks.js';
 import type { SessionHandle } from '../src/session/types.js';
@@ -24,6 +24,7 @@ class ManagementClient implements OursOps {
   calls: Array<{ name: string; args?: Record<string, unknown> }> = [];
   batches: unknown[][] = [];
   history = new Map<string, OursInboundMessage>();
+  commands: OursRegisteredCommand[] = [];
   /**
    * Established contacts and pending introductions are separate daemon
    * collections, and neither carries a bio or any other free text.
@@ -48,6 +49,10 @@ class ManagementClient implements OursOps {
   async bindIdentity(name: string) {
     this.calls.push({ name: 'bindIdentity', args: { name } });
     if (this.bindFailures-- > 0) throw this.bindError();
+  }
+  async registerCommands(commands: OursRegisteredCommand[]) {
+    this.commands = commands;
+    this.calls.push({ name: 'registerCommands', args: { count: commands.length } });
   }
   async listContacts() {
     this.calls.push({ name: 'listContacts', args: undefined });
@@ -77,7 +82,8 @@ class ManagementClient implements OursOps {
     const messages = batch.slice(0, limit).map((item, index) => historyMessage(item, index + 1));
     for (const message of messages) this.history.set(message.wire_id, message);
     if (batch.length > limit) this.batches.unshift(batch.slice(limit));
-    return { count: messages.length, messages, remaining: Math.max(0, batch.length - limit) };
+    return { messages, command_results: [], commands_handled: 0,
+      remaining: Math.max(0, batch.length - limit) };
   }
   async getHistoryItem(wireId: string) {
     this.calls.push({ name: 'getHistoryItem', args: { wireId } });
@@ -341,7 +347,8 @@ describe('OwnerChannel live management', () => {
     await vi.waitFor(() => expect(watch.readState().reason).toBe('OWNER_WATCH_CONNECTED'));
     await watch.channel.close();
     expect(watch.logs.some(line => line.includes('OWNER_WATCH_STATE_RECOVERED'))).toBe(true);
-    expect(watch.client.calls[1]?.name).toBe('listIncomingMessages');
+    const calls = watch.client.calls.map(call => call.name);
+    expect(calls.indexOf('listIncomingMessages')).toBeGreaterThan(calls.indexOf('registerCommands'));
     expect(watch.client.watchCalls[0]?.since).toBe(0);
   });
 

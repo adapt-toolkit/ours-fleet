@@ -26,6 +26,7 @@ function fakeSdkClient(overrides: Partial<Record<string, unknown>> = {}) {
   const client = {
     calls,
     chooseIdentity: record('chooseIdentity', { name: 'Role-owner', cid: 'x', switchedFrom: null }),
+    registerCommands: record('registerCommands', undefined),
     listIncomingMessages: record('listIncomingMessages', []),
     getMessages: record('getMessages', { count: 0, messages: [], remaining: 0 }),
     getHistoryItem: record('getHistoryItem', null),
@@ -172,6 +173,16 @@ describe('OursSdkClient send verdicts', () => {
     ]));
   });
 
+  it('registers typed command metadata and handlers through the SDK client', async () => {
+    const client = fakeSdkClient();
+    const sdk = await started(client);
+    const handler = vi.fn(async () => null);
+    const commands = [{ name: 'status', description: 'Session status',
+      input_schema: { type: 'object', properties: {} }, handler }];
+    await sdk.registerCommands(commands);
+    expect(client.calls).toContainEqual({ name: 'registerCommands', args: commands });
+  });
+
   it('settles a half-open SDK notification request at the deadline even if fetch ignores abort', async () => {
     vi.useFakeTimers();
     try {
@@ -233,8 +244,8 @@ describe('owner-channel daemon dependency surface', () => {
   it('is pinned to the reviewed SDK version exactly', () => {
     const pkg = JSON.parse(readFileSync(join(REPO, 'package.json'), 'utf8'));
     const lock = JSON.parse(readFileSync(join(REPO, 'package-lock.json'), 'utf8'));
-    expect(pkg.dependencies['@ours.network/sdk']).toBe('3.0.1');
-    expect(lock.packages['node_modules/@ours.network/sdk'].version).toBe('3.0.1');
+    expect(pkg.dependencies['@ours.network/sdk']).toBe('3.7.0');
+    expect(lock.packages['node_modules/@ours.network/sdk'].version).toBe('3.7.0');
     expect(pkg.dependencies['@ours.network/cli']).toBe('1.0.1');
     expect(lock.packages['node_modules/@ours.network/cli'].version).toBe('1.0.1');
   });

@@ -128,6 +128,12 @@ export interface OwnerCommand {
   execute(ctx: OwnerCommandContext, args: string): Promise<void>;
 }
 
+export interface OwnerTypedCommandDefinition {
+  name: string;
+  description: string;
+  input_schema: Record<string, unknown>;
+}
+
 /** A malformed invocation; the dispatcher answers it with annotated help. */
 class OwnerCommandUsageError extends Error {}
 
@@ -816,6 +822,54 @@ export const ownerCommands: OwnerCommand[] = [
     },
   },
 ];
+
+/**
+ * Project the slash-command registry into the SDK catalog. Only primary names
+ * are advertised: aliases remain accepted by the slash dispatcher without
+ * cluttering the typed menu with duplicate actions.
+ *
+ * Typed arguments deliberately stay as the exact text following the command
+ * name. That adapter is what lets typed and slash invocations share every
+ * existing parser, usage error, lifecycle guard, and result path.
+ */
+export function ownerTypedCommandCatalog(): OwnerTypedCommandDefinition[] {
+  return ownerCommands.map(command => {
+    const usage = command.usage ?? `/${command.name}`;
+    const suffix = usage.slice(usage.indexOf(' ') + 1);
+    const acceptsArguments = usage.includes(' ');
+    const requiresArguments = acceptsArguments && !suffix.startsWith('[');
+    return {
+      name: command.name,
+      description: `${command.summary} (${usage})`,
+      input_schema: {
+        type: 'object',
+        properties: acceptsArguments ? {
+          arguments: {
+            type: 'string', title: 'Arguments',
+            description: `Text after /${command.name}. Usage: ${usage}`,
+          },
+        } : {},
+        ...(requiresArguments ? { required: ['arguments'] } : {}),
+      },
+    };
+  });
+}
+
+/** Convert one typed invocation back into the canonical slash input. */
+export function ownerTypedCommandText(name: string, input: unknown): string {
+  const command = ownerCommands.find(entry => entry.name === name);
+  if (!command) throw new Error(`unknown typed owner command: ${name}`);
+  if (!input || typeof input !== 'object' || Array.isArray(input))
+    throw new Error('typed owner command arguments must be an object');
+  const record = input as Record<string, unknown>;
+  if (Object.keys(record).some(key => key !== 'arguments'))
+    throw new Error('typed owner command arguments contain an unknown field');
+  const value = record.arguments;
+  if (value !== undefined && typeof value !== 'string')
+    throw new Error('typed owner command arguments must be text');
+  const args = value?.trim() ?? '';
+  return `/${command.name}${args ? ` ${args}` : ''}`;
+}
 
 /** Trimmed slash-prefixed text is a command attempt and is never forwarded. */
 export const isOwnerCommandText = (text: string): boolean => text.trim().startsWith('/');

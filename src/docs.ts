@@ -678,8 +678,7 @@ The maintained \`@agentclientprotocol/codex-acp\` and
 \`@agentclientprotocol/claude-agent-acp\` runtimes are bundled automatically as
 optional ours-fleet dependencies. The supervisor resolves their executable
 entrypoints internally, so default ACP roles do not depend on global PATH.
-The maintained Claude adapter requires Node 22; Codex ACP continues to work on
-the ours-fleet core minimum of Node 20.
+ours-fleet and both maintained adapters require Node 22 or newer.
 
 Override an adapter only when necessary with \`session_options.acp.command\`
 (string or argv list). If optional dependencies were deliberately omitted,
@@ -775,6 +774,13 @@ being forwarded; plain messages reach the agent unchanged. \`/clear\`,
 adapter executes them locally (claude-code: all three; codex: \`/compact\`
 only) and are otherwise refused with a notice, so slash text never reaches the
 model as a prompt.
+
+The supervisor advertises the same primary registry entries as recipient-scoped
+ours typed commands. Their single arguments field is converted back to the text
+after the slash command name and enters the same dispatcher; aliases stay
+slash-only. Typed handlers repeat the live authenticated Owner-CID check before
+dispatch and return a null protocol completion because the existing correlated
+owner-channel reply remains the result.
 
 While a request runs, the agent's live ACP commentary is relayed as messages
 prefixed with the single stable label \`🟡 Live update:\`, so an owner can see

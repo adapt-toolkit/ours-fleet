@@ -99,8 +99,8 @@ Native Codex roles use the logged-in Codex CLI's `app-server` command directly.
 The maintained Codex and Claude ACP adapters remain bundled optional dependencies
 and are resolved internally; users do not install adapter commands or add them to
 `PATH`. Explicit `session_options.codex_app_server.command` and
-`session_options.acp.command` overrides remain available. On Node 20–21, native
-Codex and Codex ACP remain available, while maintained Claude ACP requires Node 22.
+`session_options.acp.command` overrides remain available. ours-fleet and its
+maintained adapters require Node 22 or newer.
 
 Each OS user manages their own fleet — to host roles under a sandboxed account,
 become that account and repeat.
@@ -1059,6 +1059,15 @@ text instead of being forwarded; messages without a leading `/` reach the agent
 unchanged. The registry in `src/owner-channel/commands.ts` is the single source
 of truth — `/help` renders exactly that table, so adding an entry there is the
 whole registration step for a new command.
+
+The supervisor also advertises every primary registry entry through ours typed
+commands. The menu's `arguments` field is converted back to the exact text after
+the slash command name and enters the same dispatcher, so validation, replies,
+lifecycle effects, and audit behavior stay identical. Aliases remain available
+as slash commands but are not duplicated in the typed menu. Typed handlers
+re-check the authenticated sender CID against the live Owner boundary before
+dispatch; the SDK completion result is `null` because the existing correlated
+owner-channel reply remains the command result.
 
 | Command | Effect |
 | --- | --- |

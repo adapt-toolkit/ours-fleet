@@ -23,6 +23,7 @@ import {
 } from '../rooms-tasks/markdown.js';
 import {
   dispatchOwnerCommand, fleetCliOps, isOwnerCommandText,
+  ownerTypedCommandCatalog, ownerTypedCommandText,
   type OwnerCommandContext, type OwnerFleetOps,
 } from './commands.js';
 import type { ManagedFleetSpawnResult } from '../fleet-proxy.js';
@@ -34,7 +35,8 @@ import {
 import {
   OURS_BOUND_ELSEWHERE, OursSdkClient, oursErrorCode,
   type OursContactsView, type OursHistoryFile, type OursHistoryMessage,
-  type OursInboundMessage, type OursIncomingMessage, type OursOps,
+  type OursCommandContext, type OursInboundMessage, type OursIncomingMessage, type OursOps,
+  type OursRegisteredCommand,
 } from './ours-client.js';
 import {
   ownerNotices,
@@ -349,6 +351,7 @@ export class OwnerChannel implements OwnerChannelHandle {
       for (;;) {
         try {
           await this.client.bindIdentity(this.options.config.identity);
+          await this.registerTypedCommands();
           break;
         } catch (error) {
           // The predecessor's lease may still be in flight. Only the daemon's
@@ -598,6 +601,8 @@ export class OwnerChannel implements OwnerChannelHandle {
         if (superseded()) throw new Error('owner recovery epoch superseded');
         await this.recoveryStage(
           'bind', this.client.bindIdentity(this.options.config.identity), deadlineAt);
+        if (superseded()) throw new Error('owner recovery epoch superseded');
+        await this.recoveryStage('register_commands', this.registerTypedCommands(), deadlineAt);
         if (superseded()) throw new Error('owner recovery epoch superseded');
         // Journal-aware drain is the only operation allowed to mark owner mail
         // read. The final listing is a typed, read-only channel probe.
@@ -1057,18 +1062,27 @@ export class OwnerChannel implements OwnerChannelHandle {
     if (!Array.isArray(listed)) throw new Error('the ours daemon returned invalid unread message metadata');
     const preflight = listed.slice(0, OWNER_MESSAGE_BATCH_LIMIT);
     const now = Date.now();
-    const claims = preflight.map(item => this.messageClaim(item, now));
+    const metadata = preflight.map(item => ({ item, claim: this.messageClaim(item, now),
+      kind: item.message_kind }));
+    if (metadata.some(item => !['text', 'command', 'command_result'].includes(item.kind)))
+      throw new Error('the ours daemon returned an unknown unread message kind');
+    // SDK typed-command handlers run re-entrantly inside getMessages. Only text
+    // rows belong in Fleet's replay journal; command rows are completed by the
+    // registered handler and command-result rows have no owner-channel action.
+    const claims = metadata.filter(item => item.kind === 'text').map(item => item.claim);
     const claimKeys = new Set(claims.map(item => `${item.seq}\0${item.wireId}`));
-    if (claimKeys.size !== claims.length)
+    const preflightKeys = new Set(metadata.map(item => `${item.claim.seq}\0${item.claim.wireId}`));
+    if (preflightKeys.size !== metadata.length)
       throw new Error('the ours daemon returned duplicate unread message metadata');
     this.messageRecovery.claim(claims);
 
     let fresh: InboundMessage[] = [];
     let remaining = 0;
     // SDK batchLimit rejects zero. An empty preflight is a read-only drain.
-    if (claims.length) {
-      const payload = await this.client.getMessages(claims.length);
-      if (!payload || !Array.isArray(payload.messages)
+    if (preflight.length) {
+      const payload = await this.client.getMessages(preflight.length);
+      if (!payload || !Array.isArray(payload.messages) || !Array.isArray(payload.command_results)
+          || !Number.isSafeInteger(payload.commands_handled) || payload.commands_handled < 0
           || !Number.isSafeInteger(payload.remaining) || payload.remaining < 0)
         throw new Error('the ours daemon returned an invalid claimed message batch');
       fresh = payload.messages.map(message => this.historyMessage(message));
@@ -1079,6 +1093,19 @@ export class OwnerChannel implements OwnerChannelHandle {
           || actual.size !== expected.size
           || [...expected].some(item => !actual.has(item)))
         throw new Error('the ours daemon claimed a different message batch than fleet journaled');
+      const expectedCommands = metadata.filter(item => item.kind === 'command');
+      if (payload.commands_handled !== expectedCommands.length)
+        throw new Error('the ours daemon handled a different typed-command batch than fleet inspected');
+      const expectedResults = new Set(metadata.filter(item => item.kind === 'command_result')
+        .map(item => `${item.claim.seq}\0${item.claim.wireId}`));
+      const actualResults = new Set(payload.command_results
+        .map(item => `${item.seq}\0${item.wire_id}`));
+      if (actualResults.size !== payload.command_results.length
+          || actualResults.size !== expectedResults.size
+          || [...expectedResults].some(item => !actualResults.has(item)))
+        throw new Error('the ours daemon returned a different typed-command result batch than fleet inspected');
+      for (const item of metadata)
+        if (item.kind !== 'text') this.state.remember(item.claim.wireId);
     }
 
     const merged = new Map<string, InboundMessage>();
@@ -1560,6 +1587,41 @@ export class OwnerChannel implements OwnerChannelHandle {
     // Harness commands own their wire until the queued turn settles; everything
     // else is complete now and must never replay.
     if (!this.inFlight.has(wireId)) this.state.remember(wireId);
+  }
+
+  /**
+   * Register one typed adapter per primary slash command. The adapter performs
+   * the live CID check before constructing the same slash text and entering the
+   * existing dispatcher; its null SDK result avoids duplicating the ordinary
+   * owner-channel replies that remain the command's result contract.
+   */
+  private registerTypedCommands(): Promise<void> {
+    const commands: OursRegisteredCommand[] = ownerTypedCommandCatalog().map(definition => ({
+      name: definition.name,
+      description: definition.description,
+      input_schema: definition.input_schema as OursRegisteredCommand['input_schema'],
+      handler: (input, context) => this.handleTypedCommand(definition.name, input, context),
+    }));
+    return this.client.registerCommands(commands);
+  }
+
+  private async handleTypedCommand(
+    name: string, input: unknown, context: Readonly<OursCommandContext>,
+  ): Promise<null> {
+    const sender = { id: context.sender_cid, name: context.sender_name };
+    const wireId = context.request_wire_id;
+    if (!this.isEffectiveOwner(sender.id)) {
+      this.options.log(
+        `[${this.options.role}] owner channel ignored unauthorized typed-command sender `
+        + `${sender.id || '<unknown>'}`);
+      await this.warnOwnerOfUnauthorizedSender(sender.id);
+      if (wireId) this.state.remember(wireId);
+      throw new Error('typed owner command denied');
+    }
+    try { this.conversations.recordInbound(sender.id, wireId); }
+    catch (error) { this.logError('owner conversation route update failed', error); }
+    await this.handleCommand(sender, ownerTypedCommandText(name, input), wireId);
+    return null;
   }
 
   /** Queue raw slash text to the harness and report the turn's outcome. */
