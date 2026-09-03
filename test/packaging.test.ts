@@ -19,6 +19,19 @@ const manifest = () => JSON.parse(readFileSync(join(REPO, 'package.json'), 'utf8
 const read = (file: string) => readFileSync(join(REPO, file), 'utf8');
 
 describe('the pack contract is declared, not incidental', () => {
+  it('keeps the Node 22 floor consistent across packages, CI, and install guidance', () => {
+    expect(manifest().engines.node).toBe('>=22');
+    for (const dir of ['integrations/claude-code', 'integrations/codex/ours-fleet'])
+      expect(JSON.parse(read(`${dir}/package.json`)).engines.node).toBe('>=22');
+    const readme = read('README.md');
+    expect(readme).toContain('| Node ≥ 22 | runs `ours-fleet` and its maintained adapters |');
+    for (const docs of [readme, read('src/docs.ts')])
+      expect(docs).not.toMatch(/Node (?:≥|>=|v?) ?20|Node 20/);
+    const workflow = read('.github/workflows/publish.yml');
+    expect(workflow).not.toContain('node-version: 20');
+    expect(workflow.match(/node-version: 22/g)).toHaveLength(4);
+  });
+
   it('builds on prepack, so packing never depends on a leftover dist', () => {
     expect(manifest().scripts.prepack).toBe('npm run build');
   });

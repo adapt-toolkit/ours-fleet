@@ -247,6 +247,8 @@ export class OwnerChannel implements OwnerChannelHandle {
    * (a crash must replay them) but must not be queued twice while live.
    */
   private readonly inFlight = new Set<string>();
+  /** SDK handlers entered during the current getMessages call. */
+  private readonly typedHandlersEntered = new Set<string>();
   /** Wires already NACKed to the managed agent, so a history replay stays quiet. */
   private readonly relayNacks = new Set<string>();
   /**
@@ -1066,11 +1068,14 @@ export class OwnerChannel implements OwnerChannelHandle {
       kind: item.message_kind }));
     if (metadata.some(item => !['text', 'command', 'command_result'].includes(item.kind)))
       throw new Error('the ours daemon returned an unknown unread message kind');
-    // SDK typed-command handlers run re-entrantly inside getMessages. Only text
-    // rows belong in Fleet's replay journal; command rows are completed by the
-    // registered handler and command-result rows have no owner-channel action.
-    const claims = metadata.filter(item => item.kind === 'text').map(item => item.claim);
-    const claimKeys = new Set(claims.map(item => `${item.seq}\0${item.wireId}`));
+    // The SDK marks the entire batch read before invoking typed handlers. Claim
+    // every text AND command row first: if an earlier lifecycle handler exits
+    // this process, a later command is recovered from persistent history even
+    // though its SDK handler was never entered. Command-result rows are inert.
+    const recoverable = metadata.filter(item => item.kind !== 'command_result');
+    const claims = recoverable.map(item => item.claim);
+    const textClaims = metadata.filter(item => item.kind === 'text').map(item => item.claim);
+    const textClaimKeys = new Set(textClaims.map(item => `${item.seq}\0${item.wireId}`));
     const preflightKeys = new Set(metadata.map(item => `${item.claim.seq}\0${item.claim.wireId}`));
     if (preflightKeys.size !== metadata.length)
       throw new Error('the ours daemon returned duplicate unread message metadata');
@@ -1087,9 +1092,9 @@ export class OwnerChannel implements OwnerChannelHandle {
         throw new Error('the ours daemon returned an invalid claimed message batch');
       fresh = payload.messages.map(message => this.historyMessage(message));
       remaining = payload.remaining;
-      const expected = claimKeys;
+      const expected = textClaimKeys;
       const actual = new Set(fresh.map(item => `${item.seq}\0${item.wire_id}`));
-      if (fresh.length !== claims.length || actual.size !== fresh.length
+      if (fresh.length !== textClaims.length || actual.size !== fresh.length
           || actual.size !== expected.size
           || [...expected].some(item => !actual.has(item)))
         throw new Error('the ours daemon claimed a different message batch than fleet journaled');
@@ -1104,8 +1109,16 @@ export class OwnerChannel implements OwnerChannelHandle {
           || actualResults.size !== expectedResults.size
           || [...expectedResults].some(item => !actualResults.has(item)))
         throw new Error('the ours daemon returned a different typed-command result batch than fleet inspected');
+      for (const item of expectedCommands) {
+        // Invalid envelopes and unregistered commands never enter a handler;
+        // the SDK has already returned handler_failed, so consume those now.
+        // Entered harness commands keep their claim until async completion.
+        if (!this.typedHandlersEntered.has(item.claim.wireId))
+          this.state.remember(item.claim.wireId);
+        this.typedHandlersEntered.delete(item.claim.wireId);
+      }
       for (const item of metadata)
-        if (item.kind !== 'text') this.state.remember(item.claim.wireId);
+        if (item.kind === 'command_result') this.state.remember(item.claim.wireId);
     }
 
     const merged = new Map<string, InboundMessage>();
@@ -1342,6 +1355,8 @@ export class OwnerChannel implements OwnerChannelHandle {
   private async handle(message: InboundMessage): Promise<boolean> {
     const wireId = this.wireId(message);
     if (!wireId || this.state.has(wireId) || this.inFlight.has(wireId)) return false;
+    if (message.message_kind === 'command')
+      return this.handleRecoveredTypedCommand(message, wireId);
     const sender = this.sender(message);
     if (this.isAgentSender(sender.id)) {
       try {
@@ -1600,9 +1615,43 @@ export class OwnerChannel implements OwnerChannelHandle {
       name: definition.name,
       description: definition.description,
       input_schema: definition.input_schema as OursRegisteredCommand['input_schema'],
-      handler: (input, context) => this.handleTypedCommand(definition.name, input, context),
+      handler: (input, context) => {
+        this.typedHandlersEntered.add(context.request_wire_id);
+        return this.handleTypedCommand(definition.name, input, context);
+      },
     }));
     return this.client.registerCommands(commands);
+  }
+
+  private async handleRecoveredTypedCommand(
+    message: InboundMessage, wireId: string,
+  ): Promise<boolean> {
+    let payload: { command: string; arguments: unknown };
+    try {
+      const parsed = JSON.parse(String(message.body ?? message.text ?? '')) as unknown;
+      if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)
+          || Object.keys(parsed).length !== 2
+          || typeof (parsed as { command?: unknown }).command !== 'string'
+          || !('arguments' in parsed))
+        throw new Error('invalid command payload');
+      payload = parsed as { command: string; arguments: unknown };
+    } catch {
+      // The original SDK attempt would have emitted handler_failed without
+      // entering Fleet. Recovery mirrors that terminal no-effect outcome.
+      this.state.remember(wireId);
+      return true;
+    }
+    const sender = this.sender(message);
+    try {
+      await this.handleTypedCommand(payload.command, payload.arguments, {
+        sender_cid: sender.id, sender_name: sender.name, request_wire_id: wireId,
+      });
+    } catch (error) {
+      // Expected handler failures (unauthorized/invalid typed input) are
+      // terminal and already recorded, just as the SDK swallows them.
+      if (!this.state.has(wireId)) throw error;
+    }
+    return true;
   }
 
   private async handleTypedCommand(
@@ -1618,10 +1667,17 @@ export class OwnerChannel implements OwnerChannelHandle {
       if (wireId) this.state.remember(wireId);
       throw new Error('typed owner command denied');
     }
-    try { this.conversations.recordInbound(sender.id, wireId); }
-    catch (error) { this.logError('owner conversation route update failed', error); }
-    await this.handleCommand(sender, ownerTypedCommandText(name, input), wireId);
-    return null;
+    try {
+      try { this.conversations.recordInbound(sender.id, wireId); }
+      catch (error) { this.logError('owner conversation route update failed', error); }
+      await this.handleCommand(sender, ownerTypedCommandText(name, input), wireId);
+      return null;
+    } catch (error) {
+      // Structural typed-input failures are terminal handler_failed outcomes,
+      // not indefinitely replayable work.
+      if (wireId) this.state.remember(wireId);
+      throw error;
+    }
   }
 
   /** Queue raw slash text to the harness and report the turn's outcome. */

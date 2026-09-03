@@ -78,8 +78,7 @@ The state dir contract:
 
 | What | Why | Install |
 |---|---|---|
-| Node ≥ 20 | runs `ours-fleet` itself | nodejs.org, `apt`, or `brew` |
-| Node ≥ 22 | Claude roles using `session: acp` | required by the maintained Claude ACP adapter |
+| Node ≥ 22 | runs `ours-fleet` and its maintained adapters | nodejs.org, `apt`, or `brew` |
 | a harness CLI, logged in | the agent itself | e.g. Claude Code (`claude`) or Codex CLI (`codex`) |
 | `ours` CLI + shared daemon | identity + agent-to-agent messaging | `npm i -g @ours.network/cli && ours daemon start` |
 

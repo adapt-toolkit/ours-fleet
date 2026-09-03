@@ -168,10 +168,11 @@ function setup(messages: unknown[], result = {
   configPath?: string;
   prepareRestart?: (role: string, mode: 'keep' | 'fresh') => Promise<void>;
   recoveryDeps?: OwnerChannelOptions['recoveryDeps'];
+  stateDir?: string; client?: FakeClient;
 } = {}) {
-  const dir = mkdtempSync(join(tmpdir(), 'ours-owner-channel-'));
-  dirs.push(dir);
-  const client = new FakeClient();
+  const dir = options.stateDir ?? mkdtempSync(join(tmpdir(), 'ours-owner-channel-'));
+  if (!options.stateDir) dirs.push(dir);
+  const client = options.client ?? new FakeClient();
   client.batches.push(messages, []);
   const queuePrompt = vi.fn(async () => ({
     promptId: 'prompt-1', queuedBehind: options.queuedBehind ?? 0,
@@ -1132,6 +1133,47 @@ describe('OwnerChannel deterministic command dispatch', () => {
     expect(typed.client.calls.filter(call => call.name === 'sendMessage').map(call => call.args?.text))
       .toEqual(slash.client.calls.filter(call => call.name === 'sendMessage').map(call => call.args?.text));
     await typed.channel.close();
+  });
+
+  it('recovers a later typed command when an earlier lifecycle handler terminates its SDK batch', async () => {
+    const firstFleet = fakeFleet();
+    const first = setup([], undefined, { fleet: firstFleet });
+    const batch = [
+      typedOwnerCommand(44, 'wire-typed-restart-first', 'restart', {}),
+      typedOwnerCommand(45, 'wire-typed-restart-later', 'force-restart', {}),
+    ];
+    first.client.batches.unshift(batch);
+    first.client.getMessages = vi.fn(async limit => {
+      const consumed = batch.slice(0, limit).map((item, index) => historyMessage(item, index + 1));
+      for (const message of consumed) first.client.history.set(message.wire_id, message);
+      const payload = JSON.parse(consumed[0].body) as { command: string; arguments: unknown };
+      const command = first.client.commands.find(entry => entry.name === payload.command)!;
+      await command.handler(payload.arguments, {
+        sender_cid: consumed[0].from.id, sender_name: consumed[0].from.name,
+        request_wire_id: consumed[0].wire_id,
+      });
+      throw new Error('simulated process termination before the second SDK handler');
+    });
+    await (first.channel as unknown as { registerTypedCommands(): Promise<void> })
+      .registerTypedCommands();
+    await expect(first.channel.drain()).rejects.toThrow(/simulated process termination/);
+    expect(firstFleet.restart).toHaveBeenCalledTimes(1);
+    expect(firstFleet.restart).toHaveBeenCalledWith('keep');
+
+    const recoveredClient = new FakeClient();
+    recoveredClient.history = new Map(first.client.history);
+    const recoveredFleet = fakeFleet();
+    const recovered = setup([], undefined, {
+      stateDir: first.dir, client: recoveredClient, fleet: recoveredFleet,
+    });
+    await recovered.channel.drain();
+    expect(recoveredFleet.restart).toHaveBeenCalledTimes(1);
+    expect(recoveredFleet.restart).toHaveBeenCalledWith('fresh');
+    expect(firstFleet.restart).toHaveBeenCalledTimes(1);
+    expect(recoveredClient.calls.filter(call => call.name === 'sendMessage'))
+      .toHaveLength(1);
+    expect(new MessageRecoveryState(join(first.dir, '.owner-channel-message-recovery.json')).list())
+      .toEqual([]);
   });
 
   it('denies unauthorized typed callers before dispatching effects', async () => {
