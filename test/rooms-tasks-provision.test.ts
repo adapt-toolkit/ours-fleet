@@ -26,7 +26,7 @@ vi.mock('../src/temp-lifecycle.js', async importOriginal => ({
 import { provisionMembers } from '../src/rooms-tasks/provision.js';
 import { beginFleetAuditCollection, consumeFleetAuditCollection } from '../src/fleet-command-audit.js';
 import { spawnDryRun } from '../src/spawn.js';
-import { createRoomRecord, getRoomRecord } from '../src/rooms-tasks/room-state.js';
+import { createRoomRecord, getRoomRecord, setOwnerSeat } from '../src/rooms-tasks/room-state.js';
 import { createTask, getTask } from '../src/rooms-tasks/task-state.js';
 import type {
   CoworkAdapter, CoworkRoomInfo, CoworkSeatInfo,
@@ -227,6 +227,26 @@ afterEach(() => {
 });
 
 describe('simple Cowork room member startup', () => {
+  it('does not become ready until the configured Owner seat is active', async () => {
+    createRoomRecord({ room_id: 'room-owner-gate', room_name: 'Room', room_identity_cid: 'room-cid' });
+    setOwnerSeat('room-owner-gate', 'owner-cid', 'fingerprint');
+    let ownerActive = false;
+    const seats = (): CoworkSeatInfo[] => [{
+      identity_cid: 'owner-cid', display_name: 'Owner', invite_id: 'owner-invite', role: 'Owner',
+      seat_state: ownerActive ? 'active' : 'pending',
+    }];
+    const cowork = { ...coworkHarness().cowork,
+      recoverRoom: vi.fn(async roomId => roomInfo(roomId, seats())),
+    } as CoworkAdapter;
+    const input = { cfg: cfg(), cowork, roomId: 'room-owner-gate', template: template(0),
+      binPath: '/usr/bin/ours-fleet', startupWait: { timeoutMs: 0, now: () => 1 } };
+
+    expect((await provisionMembers(input)).state).toBe('provisioning');
+    expect(getRoomRecord('room-owner-gate')?.provisioning_detail).toBe('waiting_seats');
+    ownerActive = true;
+    expect((await provisionMembers(input)).state).toBe('active');
+  });
+
   it('issues one one-time invite per temporary agent and activates from authenticated seats', async () => {
     const task = createTask({ title: 'Ship', origin: { type: 'cli' } });
     createRoomRecord({
@@ -251,12 +271,7 @@ describe('simple Cowork room member startup', () => {
     expect(mocks.spawnTemp).toHaveBeenCalledTimes(2);
     expect(getTask(task.task_id)).toMatchObject({ state: 'active' });
     expect(getTask(task.task_id).member_roles).toHaveLength(2);
-    const lifecycle = consumeFleetAuditCollection().presentations ?? [];
-    expect(lifecycle.map(event => [event.kind, event.kind === 'agent_started' ? event.id : undefined]))
-      .toEqual([
-        ['agent_started', result.member_seats[0]!.role_name],
-        ['agent_started', result.member_seats[1]!.role_name],
-      ]);
+    expect(consumeFleetAuditCollection().presentations ?? []).toEqual([]);
   });
 
   it('puts identity name, invite, role, and full task in the agent-owned startup payload', async () => {
@@ -502,7 +517,8 @@ describe('simple Cowork room member startup', () => {
 
     // The mixed-override launch presentation reports the exact resolved values
     // from the persisted role, with the sealed launch-definition label and
-    // inline origins; the agent_started event reuses the identical object.
+    // Inline origins remain durable for inspection, but member spawns are not
+    // separate Owner lifecycle notices during room provisioning.
     const seat = getRoomRecord('room-sealed-override')!.member_seats[0]!;
     const presentation = seat.launch?.presentation;
     expect(presentation).toMatchObject({
@@ -519,10 +535,7 @@ describe('simple Cowork room member startup', () => {
     expect((presentation?.role as { fingerprint?: string }).fingerprint).toMatch(/^[a-f0-9]{12}$/u);
     expect((presentation?.brain as { fingerprint?: string }).fingerprint).toMatch(/^[a-f0-9]{12}$/u);
     expect(JSON.stringify(presentation)).not.toContain(root);
-    const events = consumeFleetAuditCollection().presentations ?? [];
-    const started = events.find(event => event.kind === 'agent_started');
-    expect(started).toMatchObject({ kind: 'agent_started', harness: 'codex' });
-    expect((started as { configuration?: unknown }).configuration).toEqual(presentation);
+    expect(consumeFleetAuditCollection().presentations ?? []).toEqual([]);
   });
 
   it.each(['pair', 'team'] as const)(
@@ -705,9 +718,7 @@ describe('simple Cowork room member startup', () => {
     expect(getRoomRecord('room-crash')!.member_seats[0].launch).toMatchObject({
       state: 'failed', caller_role: 'Coordinator',
     });
-    expect(consumeFleetAuditCollection().presentations).toContainEqual(expect.objectContaining({
-      kind: 'lifecycle_failure', resource: 'Agent', category: 'readiness_failed',
-    }));
+    expect(consumeFleetAuditCollection().presentations ?? []).toEqual([]);
     mocks.controlRequest.mockReset();
     mockManagedSpawns();
 

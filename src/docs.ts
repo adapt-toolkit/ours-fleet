@@ -397,8 +397,26 @@ Fleet launches each template member with a dedicated one-time Cowork invite.
 The generated temporary-agent briefing contains the exact identity name, invite,
 Cowork role, and task. The agent creates that identity itself with ours MCP
 \`create_temporary_identity\`, accepts the invite with \`add_contact\`, and starts
-work immediately. Fleet activates the room from Cowork's authenticated seat; there
-is no briefing hash, startup ACK, or separate role-briefing readiness gate.
+work immediately. A room is ready only after the Cowork room (and its task, when
+task-bound) is durably active, every configured member seat is authenticated and active with its matching
+live Fleet launch, and the configured Owner seat is active when owner attachment is
+enabled. There is no briefing hash, startup ACK, or separate role-briefing readiness
+gate.
+
+Normal provisioning emits exactly two authenticated Owner lifecycle notices: a
+concise created notice immediately after the Cowork room is visible, and
+\`The room <name> is ready.\` after the ready predicate above is true. Intermediate
+task, saga, member-spawn, timeout, and recoverable-failure transitions stay in local
+state and logs. A terminal failed task emits one actionable failure notice; the
+command result carries the exact blocker and canonical recovery action.
+
+\`task start\` and create-and-start wait for readiness. If their bounded wait expires,
+they return an explicit \`in_progress\` result with the stable
+\`ours-fleet task await <id>\` handle and start a safe continuation. \`task await\`
+waits on that same durable operation and returns \`ready\`, \`in_progress\`, or
+\`failed\` in both human and \`--json\` forms; timeout is not failure. The detached
+continuation is serialized per task and remains alive until convergence or an
+Owner-action blocker; invoking \`task await\` safely re-arms it after a restart.
 
 Set \`room.anonymous: true\` on a room template, or pass \`--anonymous\` to
 \`task create\`, \`task start\`, \`task work\`, or \`room create\`, to create an

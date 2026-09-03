@@ -14,7 +14,9 @@ import {
 } from '../rooms-tasks/markdown.js';
 import { OWNER_COMMENT_LABEL, ownerNotices, type OwnerCommentsState } from './notices.js';
 import { TaskRoomApplicationError } from '../application/task-room-service.js';
-import type { CreateRoomRequest, CreateTaskRequest, TaskRoomApplicationService } from '../application/task-room-service.js';
+import type {
+  CreateRoomRequest, CreateTaskRequest, TaskProvisioningOutcome, TaskRoomApplicationService,
+} from '../application/task-room-service.js';
 import type { TaskState } from '../rooms-tasks/types.js';
 import { TaskListError } from '../rooms-tasks/task-lists.js';
 import { createTasksReport } from '../reports/index.js';
@@ -35,6 +37,9 @@ export interface OwnerFleetOps {
   settleTask(taskId: string): Promise<void>;
   /** Settle an accepted task deletion outside the caller role's supervisor lifecycle. */
   settleTaskDeletion(taskId: string): Promise<void>;
+  /** Continue an accepted provisioning saga until convergence. */
+  provisionTask(taskId: string): Promise<void>;
+  /** Explicit recovery may also route terminal and deletion intents. */
   recoverTask(taskId: string): Promise<void>;
 }
 
@@ -75,7 +80,9 @@ export interface OwnerCommandContext {
   terminalTask(taskId: string, kind: TaskTerminalIntent['kind'], outcome?: TaskOutcome): Promise<void>;
   recoverTask(taskId: string): Promise<void>;
   createTask(input: Omit<CreateTaskRequest, 'actor'>): Promise<TaskRecord>;
-  startTask(taskId: string): Promise<TaskRecord>;
+  startTask(taskId: string): Promise<TaskProvisioningOutcome | TaskRecord>;
+  awaitTask?(taskId: string): Promise<TaskProvisioningOutcome>;
+  taskProvisioningOutcome?(taskId: string): TaskProvisioningOutcome;
   listTasks(filter?: { state?: TaskState | TaskState[]; list?: string }): TaskRecord[];
   groupedTasks(filter?: { state?: TaskState | TaskState[]; list?: string }): Array<{ list: TaskListRecord; tasks: TaskRecord[] }>;
   listTaskLists(): TaskListRecord[];
@@ -221,6 +228,25 @@ const taskAction = (
     ...fields,
   ],
 });
+
+const taskProvisioningAction = (outcome: TaskProvisioningOutcome): string => {
+  if (outcome.kind === 'failed') return renderMarkdownFailure({
+    kind: 'state', subject: `/task await ${outcome.task.task_id}`,
+    detail: outcome.blocker ?? 'Provisioning reached a terminal failure.',
+    action: outcome.next_action ?? `Run /task recover ${outcome.task.task_id}.`,
+  });
+  return taskAction(outcome.kind === 'ready' ? 'Room provisioning complete'
+    : outcome.next_action ? 'Room provisioning needs attention' : 'Room provisioning continues',
+    outcome.task, [
+      ...(outcome.room ? [{ label: 'Room', value: `${outcome.room.room_id} — ${outcome.room.room_name}` }] : []),
+      ...(outcome.launch.template ? [{ label: 'Template', value: outcome.launch.template, kind: 'code' as const }] : []),
+      { label: 'Members', value: `${outcome.members.active}/${outcome.members.expected} active; ${outcome.members.launched}/${outcome.members.expected} launched` },
+      ...(outcome.blocker ? [{ label: 'Blocker', value: outcome.blocker }] : []),
+      ...(outcome.next_action ? [{ label: 'Next action', value: outcome.next_action }] : []),
+      ...(outcome.kind === 'in_progress'
+        ? [{ label: 'Await', value: `/task await ${outcome.task.task_id}`, kind: 'code' as const }] : []),
+    ]);
+};
 
 const roomAction = (
   title: string, room: RoomOrchestrationRecord,
@@ -443,6 +469,12 @@ export const ownerCommands: OwnerCommand[] = [
               title: titleParts.join(' '), origin: { type: 'owner_channel' },
               backlog, template, noRoom, brief: trailingLines, list,
             });
+            const provisioning = !backlog && !noRoom && t.room_id
+              ? ctx.taskProvisioningOutcome?.(t.task_id) : undefined;
+            if (provisioning) {
+              await ctx.reply(taskProvisioningAction(provisioning));
+              break;
+            }
             await ctx.reply(taskAction('Task created', t, [
               { label: 'Title', value: t.title },
               ...(template ? [{ label: 'Template', value: template, kind: 'code' as const }] : []),
@@ -537,8 +569,15 @@ export const ownerCommands: OwnerCommand[] = [
           }
           case 'start': {
             if (!rest[0]) throw new OwnerCommandUsageError('usage: /task start <id>');
-            const t = await ctx.startTask(rest[0]);
-            await ctx.reply(taskAction('Task started', t));
+            const started = await ctx.startTask(rest[0]);
+            await ctx.reply('kind' in started
+              ? taskProvisioningAction(started) : taskAction('Task started', started));
+            break;
+          }
+          case 'await': {
+            if (!rest[0]) throw new OwnerCommandUsageError('usage: /task await <id>');
+            if (!ctx.awaitTask) throw new Error('task await is unavailable');
+            await ctx.reply(taskProvisioningAction(await ctx.awaitTask(rest[0])));
             break;
           }
           case 'block': {
@@ -850,6 +889,9 @@ export function fleetCliOps(role: string, configPath?: string): OwnerFleetOps {
     ),
     settleTaskDeletion: taskId => launchFleetWorker(
       ['task', '_settle_delete', taskId], `task-delete-${taskId}`, configPath,
+    ),
+    provisionTask: taskId => launchFleetWorker(
+      ['task', '_provision', taskId], `task-provision-${taskId}`, configPath,
     ),
     recoverTask: taskId => launchFleetWorker(
       ['task', '_recover', taskId], `task-recover-${taskId}`, configPath,

@@ -38,6 +38,7 @@ export type FleetAuditPresentation =
   | { kind: 'room'; operation: 'create' | 'activate' | 'close' | 'delete';
       eventId: string; id: string; previousState?: string; newState: string;
       revision?: string; name?: string; template?: string; taskId?: string;
+      anonymous?: boolean; memberCount?: number; ownerAttached?: boolean;
       participants: Array<{ name: string; id?: string; brain?: string; role: string; permissions?: string;
         configuration?: AgentLaunchConfiguration }> }
   | { kind: 'lifecycle_failure'; eventId: string; resource: 'Agent' | 'Task' | 'Room'; id: string; state: string;
@@ -58,6 +59,21 @@ export function lifecycleEventDigestBasis(value: FleetAuditPresentation): string
 let collection: { resourceIds: Record<string, string>; presentations: FleetAuditPresentation[];
   failure?: { class: FleetCommandOutcomeClass; effect: 'not_started' | 'completed' | 'unknown' } } | undefined;
 export function beginFleetAuditCollection(): void { collection = { resourceIds: {}, presentations: [] }; }
+let lifecycleCheckpoint: ((presentations: FleetAuditPresentation[]) => Promise<void>) | undefined;
+export function setFleetAuditLifecycleCheckpoint(
+  checkpoint: ((presentations: FleetAuditPresentation[]) => Promise<void>) | undefined,
+): void { lifecycleCheckpoint = checkpoint; }
+/**
+ * Deliver already-recorded lifecycle events while a managed command is still
+ * running. On a failed checkpoint the events remain in the final audit batch,
+ * so a temporary Owner-channel outage loses timing, never the notice itself.
+ */
+export async function checkpointFleetAuditPresentations(): Promise<void> {
+  if (!collection || !lifecycleCheckpoint || !collection.presentations.length) return;
+  const pending = collection.presentations.splice(0);
+  try { await lifecycleCheckpoint(structuredClone(pending)); }
+  catch { collection.presentations.unshift(...pending); }
+}
 export function recordFleetAuditResource(kind: 'agent' | 'task' | 'room', id: string | undefined): void {
   if (id && collection) collection.resourceIds[kind] = id;
 }
@@ -69,7 +85,10 @@ export function recordFleetAuditPresentation(value: FleetAuditPresentationInput)
       : value.kind === 'task' || value.kind === 'room'
         ? `${value.operation}:${value.revision ?? `${value.previousState ?? 'none'}:${value.newState}`}`
         : `${value.category}:${value.state}`);
-    collection.presentations.push(structuredClone({ ...value, eventId: basis }));
+    const presentation = structuredClone({ ...value, eventId: basis }) as FleetAuditPresentation;
+    const digest = lifecycleEventDigestBasis(presentation);
+    if (!collection.presentations.some(existing => lifecycleEventDigestBasis(existing) === digest))
+      collection.presentations.push(presentation);
     if (value.kind === 'task') collection.resourceIds.task = value.id;
     if (value.kind === 'room') collection.resourceIds.room = value.id;
     if (value.kind === 'agent_started') collection.resourceIds.agent = value.id;
@@ -120,7 +139,7 @@ const AGENT_SURFACES: Record<string, ReadonlySet<string>> = {
   spawn: new Set(['<none>']),
   template: new Set(['list', 'show', 'validate']),
   task: new Set(['create', 'list', 'lists', 'list-create', 'list-rename', 'list-delete', 'move',
-    'show', 'start', 'block', 'unblock', 'review', 'done', 'cancel', 'delete', 'recover', 'work', 'finish']),
+    'show', 'start', 'await', 'block', 'unblock', 'review', 'done', 'cancel', 'delete', 'recover', 'work', 'finish']),
   room: new Set(['create', 'list', 'show', 'open', 'members', 'delete', 'close', 'recover']),
 };
 export const fleetProxyCommandInventory = Object.freeze(Object.fromEntries(
@@ -467,7 +486,7 @@ function validPresentation(value: unknown): value is FleetAuditPresentation {
       && ((a as Record<string, unknown>).permissions === undefined || text((a as Record<string, unknown>).permissions))
       && configured(a as Record<string, unknown>));
   if (p.kind === 'room') return exact(p, ['kind', 'operation', 'eventId', 'id', 'previousState', 'newState',
-    'revision', 'name', 'template', 'taskId', 'participants'])
+    'revision', 'name', 'template', 'taskId', 'anonymous', 'memberCount', 'ownerAttached', 'participants'])
     && ['create', 'activate', 'close', 'delete'].includes(String(p.operation))
     && safe(p.eventId) && safe(p.id) && safe(p.newState)
     && transition({ create: ['none→provisioning'], activate: ['provisioning→active'],
@@ -476,6 +495,10 @@ function validPresentation(value: unknown): value is FleetAuditPresentation {
     && (p.previousState === undefined || safe(p.previousState))
     && (p.name === undefined || text(p.name)) && (p.template === undefined || text(p.template))
     && (p.taskId === undefined || safe(p.taskId)) && (p.revision === undefined || text(p.revision))
+    && (p.anonymous === undefined || typeof p.anonymous === 'boolean')
+    && (p.ownerAttached === undefined || typeof p.ownerAttached === 'boolean')
+    && (p.memberCount === undefined || (Number.isSafeInteger(p.memberCount)
+      && Number(p.memberCount) >= 0 && Number(p.memberCount) <= 64))
     && Array.isArray(p.participants) && p.participants.length <= 64
     && p.participants.every(a => a && typeof a === 'object'
       && exact(a as Record<string, unknown>, ['name', 'id', 'brain', 'role', 'permissions', 'configuration'])
@@ -490,6 +513,12 @@ function validPresentation(value: unknown): value is FleetAuditPresentation {
     && safe(p.eventId) && safe(p.id) && safe(p.state) && ['provision_failed', 'provision_pending', 'readiness_failed', 'settlement_failed',
       'settlement_pending', 'cleanup_failed', 'cleanup_pending'].includes(String(p.category));
   return false;
+}
+
+export function validateFleetAuditPresentations(value: unknown): asserts value is FleetAuditPresentation[] {
+  if (!Array.isArray(value) || value.length < 1 || value.length > 128
+      || !value.every(validPresentation))
+    throw new Error('invalid Fleet lifecycle presentations');
 }
 
 const messageCodePoints = (value: string): number => Array.from(value).length;
@@ -558,6 +587,20 @@ export function renderFleetLifecycleEvent(value: FleetAuditPresentation): string
         role: agent.role, brain: agent.brain, permissions: agent.permissions,
       })}`));
   }
+  if (value.operation === 'create') {
+    const params = [
+      `name=${markdownCode(value.name ?? value.id)}`,
+      `room=${markdownCode(value.id)}`,
+      value.taskId ? `task=${markdownCode(value.taskId)}` : undefined,
+      value.template ? `template=${markdownCode(value.template)}` : undefined,
+      value.anonymous === undefined ? undefined : `anonymous=${value.anonymous ? 'yes' : 'no'}`,
+      value.memberCount === undefined ? undefined : `members=${value.memberCount}`,
+      value.ownerAttached === undefined ? undefined : `owner=${value.ownerAttached ? 'attached' : 'not-attached'}`,
+    ].filter(Boolean).join(', ');
+    return `Agent has created the room with these params: ${params}.`;
+  }
+  if (value.operation === 'activate')
+    return `The room ${markdownProse(value.name ?? value.id)} is ready.`;
   const context = [value.template ? `template ${markdownCode(value.template)}` : undefined,
     value.taskId ? `Task ${value.taskId}` : undefined].filter(Boolean).join('; ');
   const header = `🏠 Room${value.name ? ` “${markdownProse(value.name)}”` : ''} (${value.id}) ${value.operation}: `

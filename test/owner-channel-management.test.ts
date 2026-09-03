@@ -122,10 +122,12 @@ class ManagementClient implements OursOps {
   }
 }
 
-function setup(options: { agent?: string; owners?: string[] } = {}) {
-  const dir = mkdtempSync(join(tmpdir(), 'ours-owner-management-'));
+function setup(options: {
+  agent?: string; owners?: string[]; dir?: string; client?: ManagementClient;
+} = {}) {
+  const dir = options.dir ?? mkdtempSync(join(tmpdir(), 'ours-owner-management-'));
   dirs.push(dir);
-  const client = new ManagementClient();
+  const client = options.client ?? new ManagementClient();
   const logs: string[] = [];
   const queuePrompt = vi.fn(async () => ({
     promptId: 'managed-prompt', queuedBehind: 0,
@@ -153,6 +155,65 @@ afterEach(() => {
 });
 
 describe('OwnerChannel live management', () => {
+  it('durably accepts ready while unavailable and flushes once after Owner-channel restart', async () => {
+    const first = setup({ agent: AGENT });
+    const ready = { kind: 'room' as const, operation: 'activate' as const,
+      eventId: 'room-ready:2026-09-03T09:00:00.000Z', id: 'room-restart', name: 'Restart ready',
+      previousState: 'provisioning', newState: 'active', participants: [] };
+
+    // The control server can durably accept this while its Owner sink is not
+    // ready. No await/recover command or live send is involved.
+    await first.channel.notifyFleetLifecycle!([ready]);
+    expect(first.client.calls.filter(call => call.name === 'sendMessage')).toHaveLength(0);
+    expect(JSON.parse(readFileSync(join(first.dir, '.owner-channel-lifecycle-outbox.json'), 'utf8')))
+      .toMatchObject({ entries: [{ delivery: 'pending', presentation: { eventId: ready.eventId } }] });
+
+    const second = setup({ agent: AGENT, dir: first.dir });
+    await second.channel.start();
+    await second.channel.notifyFleetLifecycle!([ready]);
+    const notices = second.client.calls.filter(call => call.name === 'sendMessage'
+      && String(call.args?.text).includes('The room Restart ready is ready.'));
+    expect(notices).toHaveLength(1);
+    expect(notices[0]?.args?.contact).toBe(OWNER);
+    expect(JSON.parse(readFileSync(join(first.dir, '.owner-channel-lifecycle-outbox.json'), 'utf8')))
+      .toMatchObject({ entries: [{ delivery: 'delivered' }] });
+    await second.channel.close();
+  });
+
+  it('never retries a ready notice whose send boundary became uncertain', async () => {
+    const first = setup({ agent: AGENT });
+    await first.channel.start();
+    first.client.failSendTo.add(OWNER);
+    const ready = { kind: 'room' as const, operation: 'activate' as const,
+      eventId: 'room-ready:uncertain', id: 'room-uncertain', name: 'Uncertain ready',
+      previousState: 'provisioning', newState: 'active', participants: [] };
+    await first.channel.notifyFleetLifecycle!([ready]);
+    expect(first.client.calls.filter(call => call.name === 'sendMessage')).toHaveLength(1);
+    await first.channel.close();
+
+    const second = setup({ agent: AGENT, dir: first.dir });
+    await second.channel.start();
+    expect(second.client.calls.filter(call => call.name === 'sendMessage')).toHaveLength(0);
+    expect(JSON.parse(readFileSync(join(first.dir, '.owner-channel-lifecycle-outbox.json'), 'utf8')))
+      .toMatchObject({ entries: [{ delivery: 'uncertain' }] });
+    await second.channel.close();
+  });
+
+  it('delivers a replayed detached-ready presentation exactly once to the authenticated Owner', async () => {
+    const { channel, client } = setup({ agent: AGENT });
+    await channel.start();
+    const ready = { kind: 'room' as const, operation: 'activate' as const,
+      eventId: 'room-ready:2026-09-03T09:00:00.000Z', id: 'room-detached', name: 'Detached ready',
+      previousState: 'provisioning', newState: 'active', participants: [] };
+    await channel.notifyFleetLifecycle!([ready]);
+    await channel.notifyFleetLifecycle!([ready]);
+    const notices = client.calls.filter(call => call.name === 'sendMessage'
+      && String(call.args?.text).includes('The room Detached ready is ready.'));
+    expect(notices).toHaveLength(1);
+    expect(notices[0]?.args?.contact).toBe(OWNER);
+    await channel.close();
+  });
+
   /** One SDK-watch harness with deterministic retry sleeps. */
   function watchSetup(options: {
     watchState?: string;
@@ -524,7 +585,7 @@ describe('OwnerChannel live management', () => {
     expect(texts.filter(text => text.includes('📋 Task'))).toEqual([
       expect.stringContaining('Unicode Δ'),
     ]);
-    expect(texts.filter(text => text.includes('🏠 Room'))).toEqual([
+    expect(texts.filter(text => text.startsWith('Agent has created the room'))).toEqual([
       expect.stringContaining('Room Δ'),
     ]);
     expect(texts.join('\n')).not.toContain('private');
@@ -616,7 +677,7 @@ describe('OwnerChannel live management', () => {
     const texts = client.calls.filter(call => call.name === 'sendMessage')
       .map(call => String(call.args?.text ?? ''));
     expect(texts.filter(text => text.includes('📋 Task'))).toHaveLength(1);
-    expect(texts.filter(text => text.includes('🏠 Room'))).toHaveLength(1);
+    expect(texts.filter(text => text.startsWith('Agent has created the room'))).toHaveLength(1);
     await channel.close();
   });
 

@@ -4,17 +4,21 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { Command } from 'commander';
 import { deriveTaskRoomName } from '../src/rooms-tasks/task-room-name.js';
+import { loadConfig } from '../src/config.js';
+import { snapshotTemplate } from '../src/rooms-tasks/templates.js';
 
 // ── Mock setup (vi.hoisted runs before vi.mock factories) ────────────────
 
 const mocks = vi.hoisted(() => ({
   createRoom: vi.fn(),
+  acceptInvite: vi.fn(),
   closeRoom: vi.fn().mockResolvedValue(undefined),
   deleteRoom: vi.fn().mockResolvedValue(undefined),
   provisionMembers: vi.fn(),
   closeManagedRoom: vi.fn(),
   deleteManagedRoom: vi.fn().mockResolvedValue({ room_id: 'room', deleted: true }),
   launchFleetWorker: vi.fn(),
+  presentFleetWorkerLifecycle: vi.fn(),
   recoverRoom: vi.fn(),
   getRoom: vi.fn(),
   getSeats: vi.fn(),
@@ -28,6 +32,7 @@ vi.mock('../src/rooms-tasks/cowork-adapter.js', async (importOriginal) => {
     ...actual,
     createCoworkAdapter: () => ({
       createRoom: mocks.createRoom,
+      acceptInvite: mocks.acceptInvite,
       closeRoom: mocks.closeRoom,
       deleteRoom: mocks.deleteRoom,
       recoverRoom: mocks.recoverRoom,
@@ -58,6 +63,7 @@ vi.mock('../src/rooms-tasks/close.js', async (importOriginal) => {
 
 vi.mock('../src/rooms-tasks/external-worker.js', () => ({
   launchFleetWorker: mocks.launchFleetWorker,
+  presentFleetWorkerLifecycle: mocks.presentFleetWorkerLifecycle,
 }));
 
 vi.mock('../src/rooms-tasks/markdown.js', async (importOriginal) => {
@@ -84,7 +90,7 @@ vi.mock('../src/rooms-tasks/markdown.js', async (importOriginal) => {
 import { registerRoomCommands, registerTaskCommands } from '../src/rooms-tasks/cli.js';
 import {
   createTask, getTask, startTask, activateTask, reviewTask, completeTask, cancelTask, updateTaskRoom,
-  updateTaskMembers,
+  updateTaskMembers, failTask,
 } from '../src/rooms-tasks/task-state.js';
 import {
   createRoomRecord, activateRoom, getRoomRecord, advanceSaga, updateMemberSeats,
@@ -94,8 +100,7 @@ import { CoworkUnavailableError } from '../src/rooms-tasks/cowork-adapter.js';
 import { TaskRoomApplicationService } from '../src/application/task-room-service.js';
 import { acceptTaskTerminalIntent } from '../src/rooms-tasks/terminal.js';
 import { writeV2Fixture } from './v2-fixture.js';
-import { beginFleetAuditCollection, consumeFleetAuditCollection,
-  recordFleetAuditPresentation } from '../src/fleet-command-audit.js';
+import { beginFleetAuditCollection, consumeFleetAuditCollection } from '../src/fleet-command-audit.js';
 
 const ROOM_ID = '01hzyk8m0000000000000000aa';
 
@@ -194,6 +199,7 @@ beforeEach(() => {
   exitSpy = vi.spyOn(process, 'exit').mockImplementation((() => { throw new ExitError(); }) as never);
 
   mocks.createRoom.mockReset().mockResolvedValue({ room_id: ROOM_ID, identity_cid: 'c'.repeat(64) });
+  mocks.acceptInvite.mockReset().mockResolvedValue({ seat_cid: 'a'.repeat(64) });
   mocks.recoverRoom.mockReset().mockResolvedValue({
     room_id: ROOM_ID, identity_name: 'room-id', identity_cid: 'c'.repeat(64),
     room_name: 'Fix the parser', state: 'active', seats: [], role_briefings: {},
@@ -244,6 +250,7 @@ beforeEach(() => {
         }).catch(() => undefined));
     }, 0);
   });
+  mocks.presentFleetWorkerLifecycle.mockReset().mockResolvedValue(undefined);
   mocks.closeManagedRoom.mockResolvedValue(undefined);
   mocks.markdownRender.mockReset();
   // The real provisionMembers ends by activating the room and the task; the
@@ -258,10 +265,6 @@ beforeEach(() => {
           agent_definition: { brain: { kind: 'ref', id: 'codex' }, role: { kind: 'ref', id: 'Developer' },
             permissions: { approval: 'allow', filesystem: 'full', unattended: 'allow' } },
         } }]);
-      recordFleetAuditPresentation({ kind: 'agent_started', id: member.name, name: member.name,
-        lifetime: 'temporary', brain: 'ref:codex (reference)', role: 'ref:Developer (reference)',
-        harness: 'codex', session: 'acp', permissions: 'approval=allow,filesystem=full,unattended=allow',
-        parent: roomId, actionId: 'action-1', inherited: [] });
       if (taskId) updateTaskMembers(taskId, [member]);
     }
     const record = activateRoom(roomId);
@@ -467,13 +470,8 @@ describe('canonical proxied Task/Room audit metadata', () => {
     expect(consumeFleetAuditCollection()).toMatchObject({
       resourceIds: { task: id, room: ROOM_ID },
       presentations: [
-        { kind: 'task', operation: 'start', id, previousState: 'backlog', newState: 'provisioning' },
         { kind: 'room', operation: 'create', id: ROOM_ID, previousState: 'none', newState: 'provisioning' },
-        { kind: 'agent_started', id: 'dev-1', actionId: 'action-1' },
         { kind: 'room', operation: 'activate', id: ROOM_ID, previousState: 'provisioning', newState: 'active' },
-        { kind: 'task', operation: 'work', id, title: 'Audited task',
-          previousState: 'provisioning', newState: 'active', template: 'durable@7', roomId: ROOM_ID,
-          agents: [{ name: expect.any(String), role: expect.any(String) }] },
       ],
     });
   });
@@ -505,12 +503,9 @@ describe('canonical proxied Task/Room audit metadata', () => {
       presentations: [
         { kind: 'room', operation: 'create', id: ROOM_ID,
           previousState: 'none', newState: 'provisioning', template: 'durable@7', participants: [] },
-        { kind: 'agent_started', id: 'dev-1', actionId: 'action-1' },
         { kind: 'room', operation: 'activate', id: ROOM_ID,
           previousState: 'provisioning', newState: 'active', template: 'durable@7',
-          participants: [{ name: expect.any(String), brain: 'ref:codex (reference)',
-            role: 'ref:Developer (reference)',
-            permissions: 'approval=allow,filesystem=full,unattended=allow' }] },
+          participants: [] },
       ],
     });
 
@@ -538,6 +533,133 @@ describe('canonical proxied Task/Room audit metadata', () => {
     beginFleetAuditCollection();
     await expect(runRoom('show', ROOM_ID, '--json')).rejects.toThrow(ExitError);
     expect(consumeFleetAuditCollection().failure).toEqual({ class: 'runtime', effect: 'unknown' });
+  });
+});
+
+describe('task provisioning command outcomes', () => {
+  it('returns an explicit JSON in-progress handle and starts one continuation', async () => {
+    writeCustomTemplate();
+    const task = createTask({ title: 'Slow launch', origin: { type: 'cli' }, start: false });
+    mocks.provisionMembers.mockImplementationOnce(async ({ roomId }: { roomId: string }) =>
+      getRoomRecord(roomId)!);
+    await run('start', task.task_id, '--template', 'durable', '--json');
+    const payload = JSON.parse(out.join('\n'));
+    expect(payload.provisioning).toMatchObject({
+      kind: 'in_progress', task: { task_id: task.task_id },
+      room: { room_id: ROOM_ID }, handle: { task_id: task.task_id },
+      members: { expected: 1, active: 0, launched: 0 },
+    });
+    expect(payload.provisioning.handle.command).toBe(`ours-fleet task await ${task.task_id}`);
+    expect(mocks.launchFleetWorker).toHaveBeenCalledWith(
+      ['task', '_provision', task.task_id], `task-provision-${task.task_id}`, cfgPath);
+
+    mocks.launchFleetWorker.mockClear();
+    out = [];
+    await run('await', task.task_id, '--wait-ms', '0', '--json');
+    expect(JSON.parse(out.join('\n')).provisioning.kind).toBe('in_progress');
+    expect(mocks.launchFleetWorker).toHaveBeenCalledWith(
+      ['task', '_provision', task.task_id], `task-provision-${task.task_id}`, cfgPath);
+  });
+
+  it('keeps the detached continuation alive until a seat converges after its first attempt', async () => {
+    writeCustomTemplate();
+    const task = createTask({ title: 'Late seat', origin: { type: 'cli' }, start: false });
+    const pending = async ({ roomId }: { roomId: string }) => getRoomRecord(roomId)!;
+    mocks.provisionMembers.mockImplementationOnce(pending).mockImplementationOnce(pending);
+    await run('start', task.task_id, '--template', 'durable', '--json');
+    expect(JSON.parse(out.join('\n')).provisioning.kind).toBe('in_progress');
+
+    out = [];
+    await run('_provision', task.task_id);
+    expect(getTask(task.task_id).state).toBe('active');
+    expect(getRoomRecord(ROOM_ID)?.state).toBe('active');
+    expect(mocks.provisionMembers).toHaveBeenCalledTimes(3);
+  });
+
+  it('presents one stable ready event when detached provisioning converges without await or recover', async () => {
+    writeCustomTemplate();
+    const task = createTask({ title: 'Detached ready', origin: { type: 'cli' }, start: false });
+    mocks.provisionMembers.mockImplementationOnce(async ({ roomId }: { roomId: string }) =>
+      getRoomRecord(roomId)!);
+    await run('start', task.task_id, '--template', 'durable', '--json');
+    expect(JSON.parse(out.join('\n')).provisioning.kind).toBe('in_progress');
+
+    mocks.presentFleetWorkerLifecycle.mockClear();
+    out = [];
+    await run('_provision', task.task_id);
+    const first = mocks.presentFleetWorkerLifecycle.mock.calls[0]?.[0] as Array<Record<string, unknown>>;
+    expect(first.filter(event => event.kind === 'room' && event.operation === 'activate')).toEqual([
+      expect.objectContaining({ id: ROOM_ID, eventId: expect.stringMatching(/^room-ready:/) }),
+    ]);
+
+    // A worker replay observes the same durable activation and presents the
+    // same digest; the Owner ledger therefore suppresses a second notice.
+    await run('_provision', task.task_id);
+    const replay = mocks.presentFleetWorkerLifecycle.mock.calls[1]?.[0] as Array<Record<string, unknown>>;
+    expect(replay.find(event => event.operation === 'activate')?.eventId)
+      .toBe(first.find(event => event.operation === 'activate')?.eventId);
+    expect(mocks.launchFleetWorker).toHaveBeenCalledTimes(1);
+  });
+
+  it('uses the advertised await handle to retry a fixed Owner-action blocker', async () => {
+    writeV2Fixture(cfgPath,
+      'roles: {}\n'
+      + 'rooms:\n'
+      + '  owner:\n    expected_cid: ' + 'a'.repeat(64) + '\n'
+      + '    public_invite: repaired-invite\n'
+      + '  defaults:\n    attach_owner: true\n'
+      + [
+        'room_templates:',
+        '  durable:',
+        '    version: 7',
+        '    description: durable template',
+        '    members:',
+        '      - { slot: dev, role: Developer, count: 1, agent_template: Dev }',
+        '',
+      ].join('\n'));
+    const cfg = loadConfig(cfgPath);
+    const snapshot = snapshotTemplate(cfg.roomTemplates!.durable!, cfg.agentTemplates);
+    const task = createTask({ title: 'Owner invite repaired', origin: { type: 'cli' }, start: true,
+      template: { name: snapshot.name, version: snapshot.version, content_hash: snapshot.content_hash } });
+    const room = createRoomRecord({ room_id: ROOM_ID, room_name: 'Owner invite repaired',
+      room_identity_cid: 'c'.repeat(64), task_id: task.task_id, template_snapshot: snapshot,
+      room_policy: { anonymous: false } });
+    updateTaskRoom(task.task_id, room.room_id, 'c'.repeat(64));
+    advanceSaga(room.room_id, 'attach_owner', 2);
+    setSagaError(room.room_id, 'old invite expired', 'rotate invite', 'waiting_owner_invite');
+
+    await run('await', task.task_id, '--wait-ms', '0', '--json');
+    expect(JSON.parse(out.join('\n')).provisioning).toMatchObject({ kind: 'in_progress',
+      next_action: expect.stringContaining('Rotate') });
+    expect(mocks.launchFleetWorker).toHaveBeenCalledWith(
+      ['task', '_provision', task.task_id], `task-provision-${task.task_id}`, cfgPath);
+
+    out = [];
+    await run('_provision', task.task_id);
+    expect(mocks.acceptInvite).toHaveBeenCalledOnce();
+    expect(getTask(task.task_id).state).toBe('active');
+    expect(getRoomRecord(room.room_id)?.state).toBe('active');
+  });
+
+  it('returns compact human and JSON ready outcomes', async () => {
+    writeCustomTemplate();
+    const task = createTask({ title: 'Ready launch', origin: { type: 'cli' }, start: false });
+    await run('start', task.task_id, '--template', 'durable');
+    expect(out.join('\n')).toContain('Room provisioning complete');
+    expect(out.join('\n')).toContain('1/1 active; 1/1 launched');
+    out = [];
+    await run('await', task.task_id, '--wait-ms', '0', '--json');
+    expect(JSON.parse(out.join('\n')).provisioning.kind).toBe('ready');
+  });
+
+  it('returns a structured terminal blocker with a canonical next action', async () => {
+    const task = backlogTask();
+    startTask(task.task_id);
+    failTask(task.task_id, 'permanent configuration blocker');
+    await run('await', task.task_id, '--wait-ms', '0', '--json');
+    const outcome = JSON.parse(out.join('\n')).provisioning;
+    expect(outcome).toMatchObject({ kind: 'failed', blocker: 'permanent configuration blocker' });
+    expect(outcome.next_action).toContain(`task recover ${task.task_id}`);
   });
 });
 

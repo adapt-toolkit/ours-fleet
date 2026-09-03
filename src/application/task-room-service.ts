@@ -1,5 +1,4 @@
 import { readFileSync } from 'node:fs';
-import { createHash } from 'node:crypto';
 
 import { ConfigError, loadConfig, type FleetConfig } from '../config.js';
 import {
@@ -24,7 +23,9 @@ import {
 import { hashTemplate, listTemplates, resolveTemplate, sealTemplateSnapshot, snapshotTemplate } from '../rooms-tasks/templates.js';
 import { acquireLaunchSnapshotLock, releaseLaunchSnapshot } from '../rooms-tasks/launch-snapshot.js';
 import { hashMemberOverrides, prepareExecutionPlan, type MemberOverrides } from '../rooms-tasks/member-overrides.js';
-import { recordFleetAuditPresentation } from '../fleet-command-audit.js';
+import {
+  checkpointFleetAuditPresentations, recordFleetAuditPresentation, recordFleetAuditResource,
+} from '../fleet-command-audit.js';
 import {
   acceptManagedRoomClose, deleteLegacyClosedRooms, deleteManagedRoom, recordManagedRoomCloseError,
 } from '../rooms-tasks/close.js';
@@ -65,6 +66,54 @@ export interface TaskRecoveryResult {
   room: RoomOrchestrationRecord | undefined;
   issues: TaskRecoveryIssue[];
   reason?: 'missing_room' | 'missing_durable_template' | 'non_resumable_phase';
+}
+export interface TaskProvisioningOutcome {
+  kind: 'ready' | 'in_progress' | 'failed';
+  task: TaskRecord;
+  room?: RoomOrchestrationRecord;
+  handle: { command: string; task_id: string };
+  launch: { template?: string; anonymous: boolean; owner_attached: boolean };
+  members: { expected: number; active: number; launched: number };
+  blocker?: string;
+  next_action?: string;
+}
+
+function recordCanonicalRoomCreated(room: RoomOrchestrationRecord): void {
+  recordFleetAuditPresentation({ kind: 'room', operation: 'create',
+    eventId: `room-created:${room.created_at}`, id: room.room_id,
+    name: room.room_name, previousState: 'none', newState: 'provisioning',
+    revision: room.created_at, taskId: room.task_id,
+    template: room.template_snapshot
+      ? `${room.template_snapshot.name}@${room.template_snapshot.version}` : undefined,
+    anonymous: storedRoomLaunchPolicy(room.room_policy).anonymous,
+    memberCount: room.template_snapshot?.members.reduce((sum, member) => sum + member.count, 0) ?? 0,
+    participants: [] });
+}
+
+/** Repairable terminal observation derived entirely from durable Task/Room state. */
+export function recordTaskProvisioningOutcome(outcome: TaskProvisioningOutcome): void {
+  const room = outcome.room;
+  recordFleetAuditResource('task', outcome.task.task_id);
+  if (room) {
+    recordFleetAuditResource('room', room.room_id);
+    // Always restate created before a later terminal transition. The stable
+    // digest makes this a no-op when the original checkpoint was delivered,
+    // and repairs a crash after Room persistence but before that checkpoint.
+    recordCanonicalRoomCreated(room);
+  }
+  if (outcome.kind === 'ready' && room) recordFleetAuditPresentation({
+    kind: 'room', operation: 'activate', eventId: `room-ready:${room.activated_at ?? room.created_at}`,
+    id: room.room_id, name: room.room_name, previousState: 'provisioning', newState: 'active',
+    revision: room.activated_at ?? room.created_at, taskId: room.task_id,
+    template: outcome.launch.template, anonymous: outcome.launch.anonymous,
+    memberCount: outcome.members.expected, ownerAttached: outcome.launch.owner_attached,
+    participants: [],
+  });
+  if (outcome.kind === 'failed') recordFleetAuditPresentation({
+    kind: 'lifecycle_failure', resource: 'Task', id: outcome.task.task_id,
+    state: outcome.task.state, category: 'provision_failed',
+    eventId: outcome.task.ended_at ?? room?.created_at ?? outcome.task.created_at,
+  });
 }
 export type TaskRecoveryBegin =
   | { kind: 'terminal_worker_required'; taskId: string }
@@ -123,58 +172,6 @@ export interface TaskRoomServiceDeps {
   now?(): number;
 }
 
-function launchSelection(definition: Record<string, unknown> | undefined, key: 'brain' | 'role'): string | undefined {
-  const selected = definition?.[key];
-  if (!selected || typeof selected !== 'object' || Array.isArray(selected)) return undefined;
-  const value = selected as Record<string, unknown>;
-  if (value.kind === 'ref' && typeof value.id === 'string') return `ref:${value.id} (reference)`;
-  if (value.kind === 'inline' && typeof value.fingerprint === 'string')
-    return `inline:${value.fingerprint} (inline)`;
-  return undefined;
-}
-
-function launchPermissions(definition: Record<string, unknown> | undefined): string | undefined {
-  const selected = definition?.permissions;
-  if (!selected || typeof selected !== 'object' || Array.isArray(selected)) return undefined;
-  const value = selected as Record<string, unknown>;
-  const fields = ['approval', 'filesystem', 'unattended'].flatMap(key =>
-    typeof value[key] === 'string' ? [`${key}=${value[key]}`] : []);
-  return fields.length ? fields.join(',') : undefined;
-}
-
-function roomParticipants(room: RoomOrchestrationRecord): Array<{
-  name: string; id?: string; brain?: string; role: string; permissions?: string;
-  configuration?: import('../lifecycle-summary.js').AgentLaunchConfiguration;
-}> {
-  return [...room.member_seats].sort((a, b) => a.role_name.localeCompare(b.role_name)).map(seat => ({
-    name: seat.role_name, id: seat.identity_cid,
-    brain: launchSelection(seat.launch?.agent_definition, 'brain'),
-    role: launchSelection(seat.launch?.agent_definition, 'role') ?? seat.cowork_role,
-    permissions: launchPermissions(seat.launch?.agent_definition),
-    ...(seat.launch?.presentation ? { configuration: seat.launch.presentation } : {}),
-  }));
-}
-
-function taskAgents(task: TaskRecord): Array<{
-  name: string; brain?: string; role: string; permissions?: string;
-  configuration?: import('../lifecycle-summary.js').AgentLaunchConfiguration;
-}> {
-  const room = task.room_id ? getRoomRecord(task.room_id) : undefined;
-  const seats = new Map(room?.member_seats.map(seat => [seat.role_name, seat]) ?? []);
-  return [...task.member_roles].sort((a, b) => a.name.localeCompare(b.name)).map(member => {
-    const seat = seats.get(member.name);
-    return { name: member.name, brain: launchSelection(seat?.launch?.agent_definition, 'brain'),
-      role: launchSelection(seat?.launch?.agent_definition, 'role') ?? member.cowork_role,
-      permissions: launchPermissions(seat?.launch?.agent_definition),
-      ...(seat?.launch?.presentation ? { configuration: seat.launch.presentation } : {}) };
-  });
-}
-
-function roomFailureEventId(room: RoomOrchestrationRecord): string {
-  const evidence = `${room.created_at}\0${room.saga.phase}\0${room.saga.step_index}\0${room.saga.error ?? ''}`;
-  return `sha256:${createHash('sha256').update(evidence).digest('hex')}`;
-}
-
 /** Exact extraction of the previously CLI-owned task create/start behavior. */
 export class TaskRoomApplicationService {
   private recovery?: { taskId: string; config: FleetConfig };
@@ -227,7 +224,10 @@ export class TaskRoomApplicationService {
     }
     unlock?.();
     const ref = template && { name: template.name, version: template.version, content_hash: template.content_hash };
-    recordFleetAuditPresentation({ kind: 'task', operation: 'create', id: task.task_id,
+    // A create-and-start launch is represented to the Owner solely by the
+    // canonical Room created/ready events. Backlog and no-room tasks retain
+    // their useful Task lifecycle notice.
+    if (request.backlog || request.noRoom) recordFleetAuditPresentation({ kind: 'task', operation: 'create', id: task.task_id,
       title: task.title, previousState: 'none', newState: task.state, revision: task.created_at,
       list: task.list_name ?? 'default', roomId: task.room_id,
       template: task.template ? `${task.template.name}@${task.template.version}` : undefined,
@@ -238,21 +238,16 @@ export class TaskRoomApplicationService {
           task = updateTaskRoom(task.task_id, created.room_id, created.room_identity_cid!);
         }, launchDefinitions, roomPolicy);
         task = readTask(task.task_id);
-        if (task.state === 'active' && room.state === 'active') recordFleetAuditPresentation({ kind: 'task', operation: 'work', id: task.task_id,
-          title: task.title, previousState: 'provisioning', newState: task.state,
-          revision: getRoomRecord(task.room_id!)?.activated_at ?? task.started_at ?? task.created_at,
-          list: task.list_name ?? 'default', roomId: task.room_id,
-          template: task.template ? `${task.template.name}@${task.template.version}` : undefined,
-          agents: taskAgents(task) });
-        else recordFleetAuditPresentation({ kind: 'lifecycle_failure', resource: 'Task', id: task.task_id,
-          state: task.state, category: 'provision_pending', eventId: roomFailureEventId(room) });
+        void room;
       } catch (error) {
         if (error instanceof CoworkUnavailableError)
           persistBlockTask(task.task_id, 'Cowork management socket is unavailable');
-        recordFleetAuditPresentation({ kind: 'lifecycle_failure', resource: 'Task',
-          id: task.task_id, state: readTask(task.task_id).state, category: 'provision_failed',
-          eventId: task.room_id ? roomFailureEventId(getRoomRecord(task.room_id)!) : task.created_at });
-        throw error;
+        // Once the durable Room exists, provisioning errors are resumable
+        // saga state. Return that explicit state so the command can launch a
+        // continuation and give the caller a stable await handle.
+        const current = readTask(task.task_id);
+        if (!current.room_id || !getRoomRecord(current.room_id)) throw error;
+        task = current;
       }
     }
     return task;
@@ -353,6 +348,58 @@ export class TaskRoomApplicationService {
   } {
     const task = readTask(taskId);
     return { task, orchestration: task.room_id ? getRoomRecord(task.room_id) : undefined };
+  }
+
+  taskProvisioningOutcome(taskId: string): TaskProvisioningOutcome {
+    const task = readTask(taskId);
+    const room = task.room_id ? getRoomRecord(task.room_id) : undefined;
+    const expected = room?.template_snapshot?.members.reduce((sum, member) => sum + member.count, 0)
+      ?? task.execution_plan?.snapshot.members.reduce((sum, member) => sum + member.count, 0) ?? 0;
+    const active = room?.member_seats.filter(seat => seat.seat_state === 'active').length ?? 0;
+    const launched = room?.member_seats.filter(seat => seat.launch?.state === 'launched').length ?? 0;
+    const failed = task.state === 'failed' || room?.saga.phase === 'failed';
+    const ready = task.state === 'active' && room?.state === 'active'
+      && active === expected && launched === expected;
+    const blocker = task.outcome?.summary ?? task.blocked?.reason ?? room?.saga.error;
+    const nextAction = room?.provisioning_detail === 'waiting_owner_invite'
+      ? 'Rotate rooms.owner.public_invite, then await the same task.'
+      : room?.provisioning_detail === 'owner_cid_mismatch'
+        ? 'Verify rooms.owner.expected_cid, rotate the Owner invite, then await the same task.'
+        : room?.provisioning_detail === 'waiting_cowork'
+          ? 'Restore ours-cowork, then await the same task.'
+          : failed
+            ? `Correct the blocker, then run ours-fleet task recover ${task.task_id}.`
+            : undefined;
+    return {
+      kind: failed ? 'failed' : ready ? 'ready' : 'in_progress', task, room,
+      handle: { command: `ours-fleet task await ${task.task_id}`, task_id: task.task_id },
+      launch: {
+        ...(room?.template_snapshot
+          ? { template: `${room.template_snapshot.name}@${room.template_snapshot.version}` }
+          : task.template ? { template: `${task.template.name}@${task.template.version}` } : {}),
+        anonymous: storedRoomLaunchPolicy(room?.room_policy ?? task.execution_plan?.room_policy).anonymous,
+        owner_attached: Boolean(room?.owner_seat_cid),
+      },
+      members: { expected, active, launched },
+      ...(blocker ? { blocker } : {}),
+      ...(nextAction ? { next_action: nextAction } : {}),
+    };
+  }
+
+  async awaitTaskProvisioning(input: {
+    actor: TaskRoomActor; taskId: string; waitMs?: number;
+  }): Promise<TaskProvisioningOutcome> {
+    const now = this.deps.now ?? Date.now;
+    const sleep = this.deps.sleep ?? (ms => new Promise(resolve => setTimeout(resolve, ms)));
+    const deadline = now() + (input.waitMs ?? 60_000);
+    for (;;) {
+      const outcome = this.taskProvisioningOutcome(input.taskId);
+      if (outcome.kind !== 'in_progress' || now() >= deadline) {
+        recordTaskProvisioningOutcome(outcome);
+        return outcome;
+      }
+      await sleep(100);
+    }
   }
 
   blockTask(input: { actor: TaskRoomActor; taskId: string; reason: string }): TaskRecord {
@@ -567,6 +614,23 @@ export class TaskRoomApplicationService {
         return { kind: 'provisioning_resume_failed', task, room, issues };
       }
     }
+    if (room.provisioning_detail === 'waiting_owner_invite'
+        || room.provisioning_detail === 'owner_cid_mismatch') {
+      try {
+        await this.recoverRoom({ actor: input.actor, roomId: room.room_id });
+        task = readTask(task.task_id);
+        room = getRoomRecord(room.room_id);
+        if (task.state === 'active' && room?.state === 'active') return {
+          kind: 'provisioning_resumed', task, room, issues: [{ code: 'provisioning_resumed' }],
+        };
+      } catch (error) {
+        issues.push({ code: 'resume_failed', error: error instanceof Error ? error.message : String(error) });
+        return { kind: 'provisioning_resume_failed', task, room, issues };
+      }
+    }
+    if (!room) return {
+      kind: 'provisioning_non_resumable', task, room, issues, reason: 'missing_room',
+    };
     if (room.provisioning_detail === 'waiting_cowork') issues.push({ code: 'waiting_cowork' });
     if (room.provisioning_detail === 'waiting_owner_invite') issues.push({ code: 'waiting_owner_invite' });
     if (room.provisioning_detail === 'owner_cid_mismatch') issues.push({ code: 'owner_cid_mismatch' });
@@ -766,6 +830,16 @@ export class TaskRoomApplicationService {
         return { kind: 'provisioning_resume_failed', room, orchestration, issues };
       }
     }
+    if (orchestration?.state === 'provisioning' && !orchestration.template_snapshot) {
+      const seats = await adapter.getSeats(input.roomId);
+      const ownerReady = !orchestration.owner_seat_cid || seats.some(seat =>
+        seat.identity_cid.toLowerCase() === orchestration!.owner_seat_cid!.toLowerCase()
+          && seat.seat_state === 'active');
+      if (ownerReady) {
+        orchestration = activateRoom(input.roomId);
+        if (orchestration.task_id) activateTask(orchestration.task_id);
+      }
+    }
     return { kind: 'recovered', room, orchestration, issues };
   }
 
@@ -782,7 +856,7 @@ export class TaskRoomApplicationService {
 
   async ensureTaskWork(input: {
     actor: TaskRoomActor; taskId: string; template?: string; members?: MemberOverrides; anonymous?: boolean;
-  }): Promise<{ task: TaskRecord; status: 'ready' | 'already_active' }> {
+  }): Promise<{ task: TaskRecord; status: 'ready' | 'already_active' | 'in_progress' }> {
     const cfg = (this.deps.loadConfiguration ?? loadConfig)(this.configurationPath);
     let task = readTask(input.taskId);
     const recordedRoom = task.room_id ? getRoomRecord(task.room_id) : undefined;
@@ -899,10 +973,6 @@ export class TaskRoomApplicationService {
       task = updateTaskTemplate(task.task_id, { name: snapshot.name, version: snapshot.version, content_hash: snapshot.content_hash });
     if (task.state === 'backlog') {
       task = transitionTask(task.task_id);
-      recordFleetAuditPresentation({ kind: 'task', operation: 'start', id: task.task_id,
-        title: task.title, previousState: 'backlog', newState: task.state,
-        revision: task.started_at ?? task.created_at, list: task.list_name ?? 'default',
-        template: `${snapshot.name}@${snapshot.version}`, agents: [] });
     }
     if (!task.room_id) {
       try {
@@ -913,10 +983,9 @@ export class TaskRoomApplicationService {
       } catch (error) {
         if (error instanceof CoworkUnavailableError)
           persistBlockTask(task.task_id, 'Cowork management socket is unavailable');
-        recordFleetAuditPresentation({ kind: 'lifecycle_failure', resource: 'Task',
-          id: task.task_id, state: readTask(task.task_id).state, category: 'provision_failed',
-          eventId: task.room_id ? roomFailureEventId(getRoomRecord(task.room_id)!) : task.created_at });
-        throw error;
+        const current = readTask(task.task_id);
+        if (!current.room_id || !getRoomRecord(current.room_id)) throw error;
+        task = current;
       }
     } else if (task.state === 'provisioning') {
       if (!room || !['create_members','join_role_groups','wait_seats','launch_work','activate'].includes(room.saga.phase))
@@ -931,22 +1000,11 @@ export class TaskRoomApplicationService {
         task = readTask(task.task_id);
       } catch (error) {
         if (error instanceof CoworkUnavailableError) persistBlockTask(task.task_id, 'Cowork management socket is unavailable');
-        recordFleetAuditPresentation({ kind: 'lifecycle_failure', resource: 'Task',
-          id: task.task_id, state: readTask(task.task_id).state, category: 'provision_failed',
-          eventId: roomFailureEventId(getRoomRecord(task.room_id!)!) });
-        throw error;
+        task = readTask(task.task_id);
       }
     }
     const resultingRoom = getRoomRecord(task.room_id!);
-    if (task.state === 'active' && resultingRoom?.state === 'active') recordFleetAuditPresentation({ kind: 'task', operation: 'work', id: task.task_id,
-      title: task.title, previousState: 'provisioning', newState: task.state,
-      revision: getRoomRecord(task.room_id!)?.activated_at ?? task.started_at ?? task.created_at,
-      list: task.list_name ?? 'default', roomId: task.room_id,
-      template: task.template ? `${task.template.name}@${task.template.version}` : undefined,
-      agents: taskAgents(task) });
-    else if (resultingRoom) recordFleetAuditPresentation({ kind: 'lifecycle_failure', resource: 'Task',
-      id: task.task_id, state: task.state, category: 'provision_pending', eventId: roomFailureEventId(resultingRoom) });
-    return { task, status: 'ready' };
+    return { task, status: task.state === 'active' && resultingRoom?.state === 'active' ? 'ready' : 'in_progress' };
   }
 
   private createTemplate(
@@ -1035,11 +1093,10 @@ export class TaskRoomApplicationService {
       throw error;
     }
     unlockSnapshot?.();
-    recordFleetAuditPresentation({ kind: 'room', operation: 'create', id: room.room_id,
-      name: room.room_name, previousState: 'none', newState: 'provisioning',
-      revision: room.created_at, taskId: room.task_id,
-      template: room.template_snapshot ? `${room.template_snapshot.name}@${room.template_snapshot.version}` : undefined,
-      participants: [] });
+    recordCanonicalRoomCreated(room);
+    // The created notice is observable while member admission is still in
+    // progress; it is not delayed behind task-start command completion.
+    await checkpointFleetAuditPresentations();
     room = advanceSaga(room.room_id, 'create_room', 1);
     if (attachOwner) {
       try {
@@ -1054,33 +1111,45 @@ export class TaskRoomApplicationService {
           mismatch ? 'Verify rooms.owner.expected_cid and rotate the configured invite if necessary.'
             : 'Rotate rooms.owner.public_invite or public_invite_file, then run room recover.',
           mismatch ? 'owner_cid_mismatch' : 'waiting_owner_invite');
-        recordFleetAuditPresentation({ kind: 'lifecycle_failure', resource: 'Room',
-          id: room.room_id, state: getRoomRecord(room.room_id)?.state ?? 'provisioning',
-          category: 'provision_failed', eventId: roomFailureEventId(getRoomRecord(room.room_id) ?? room) });
         throw error;
       }
     }
     room = advanceSaga(room.room_id, 'create_members', 3);
-    if (launchTemplate?.members.length) try {
+    if (launchTemplate && (launchTemplate.members.length > 0 || attachOwner)) try {
       room = await (this.deps.provisionMembers ?? provisionMembers)({
         cfg, cowork, roomId: room.room_id, taskId: task.task_id, template: launchTemplate,
         binPath: (this.deps.binPath ?? getBinPath)(), brief: task.brief,
         goal: task.task_id ? task.title : task.goal,
       });
     } catch (error) {
-      const failed = getRoomRecord(room.room_id) ?? room;
-      recordFleetAuditPresentation({ kind: 'lifecycle_failure', resource: 'Room', id: failed.room_id,
-        state: failed.state, category: 'provision_failed', eventId: roomFailureEventId(failed) });
       throw error;
     }
-    else room = activateRoom(room.room_id);
-    if (room.state === 'active') recordFleetAuditPresentation({ kind: 'room', operation: 'activate', id: room.room_id,
+    else if (attachOwner) {
+      const now = this.deps.now ?? Date.now;
+      const sleep = this.deps.sleep ?? (ms => new Promise(resolve => setTimeout(resolve, ms)));
+      const deadline = now() + 60_000;
+      for (;;) {
+        const seats = await cowork.getSeats(room.room_id);
+        if (room.owner_seat_cid && seats.some(seat =>
+          seat.identity_cid.toLowerCase() === room.owner_seat_cid!.toLowerCase()
+            && seat.seat_state === 'active')) {
+          room = activateRoom(room.room_id);
+          break;
+        }
+        if (now() >= deadline) {
+          room = advanceSaga(room.room_id, 'wait_seats', 5, 'waiting_seats');
+          break;
+        }
+        await sleep(250);
+      }
+    } else room = activateRoom(room.room_id);
+    if (room.state === 'active') recordFleetAuditPresentation({ kind: 'room', operation: 'activate',
+      eventId: `room-ready:${room.activated_at ?? room.created_at}`, id: room.room_id,
       name: room.room_name, previousState: 'provisioning', newState: 'active',
       revision: room.activated_at ?? room.created_at, taskId: room.task_id,
       template: room.template_snapshot ? `${room.template_snapshot.name}@${room.template_snapshot.version}` : undefined,
-      participants: roomParticipants(room) });
-    else recordFleetAuditPresentation({ kind: 'lifecycle_failure', resource: 'Room', id: room.room_id,
-      state: room.state, category: 'provision_pending', eventId: roomFailureEventId(room) });
+      anonymous: policy.anonymous, memberCount: room.member_seats.length, ownerAttached: attachOwner,
+      participants: [] });
     if (task.task_id && !launchTemplate?.members.length) activateTask(task.task_id);
     return room;
   }

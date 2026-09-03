@@ -3,11 +3,15 @@ import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { describe, expect, it } from 'vitest';
 import {
-  classifyFleetArgv, FleetCommandAuditStore, redactFleetArgv,
+  beginFleetAuditCollection, checkpointFleetAuditPresentations, classifyFleetArgv,
+  consumeFleetAuditCollection, FleetCommandAuditStore, recordFleetAuditPresentation, redactFleetArgv,
   lifecycleEventDigestBasis, renderFleetLifecycleEvent, fleetProxyCommandInventory,
-  fleetProxyTopLevelInventory, validateFleetAuditBegin, validateFleetAuditFinish,
+  fleetProxyTopLevelInventory, setFleetAuditLifecycleCheckpoint,
+  validateFleetAuditBegin, validateFleetAuditFinish,
 } from '../src/fleet-command-audit.js';
-import { fleetWorkerEnv } from '../src/rooms-tasks/external-worker.js';
+import {
+  FLEET_WORKER_LIFECYCLE_STATE_DIR_ENV, fleetWorkerEnv,
+} from '../src/rooms-tasks/external-worker.js';
 import { FLEET_PROXY_CALLER_ENV, FLEET_PROXY_STATE_DIR_ENV } from '../src/fleet-proxy.js';
 import {
   AGENT_LINE_MAX_CODE_POINTS, MISSION_LABEL_MAX, mandatoryConfigurationFits, missionLabel,
@@ -19,10 +23,37 @@ import { Buffer } from 'node:buffer';
 import '../src/harness/claude-code.js';
 
 describe('fleet command audit', () => {
+  it('checkpoints created before readiness and removes the event from the final batch', async () => {
+    const delivered: string[][] = [];
+    beginFleetAuditCollection();
+    setFleetAuditLifecycleCheckpoint(async presentations => {
+      delivered.push(presentations.map(event => `${event.kind}:${event.eventId}`));
+    });
+    recordFleetAuditPresentation({ kind: 'room', operation: 'create',
+      eventId: 'room-created:2026-01-01T00:00:00.000Z', id: 'room-1', name: 'Room',
+      previousState: 'none', newState: 'provisioning', participants: [] });
+    await checkpointFleetAuditPresentations();
+    expect(delivered).toEqual([['room:room-created:2026-01-01T00:00:00.000Z']]);
+    expect(consumeFleetAuditCollection().presentations).toBeUndefined();
+    setFleetAuditLifecycleCheckpoint(undefined);
+  });
+
+  it('dedupes canonical lifecycle events within one command collection', () => {
+    beginFleetAuditCollection();
+    const event = { kind: 'room' as const, operation: 'activate' as const,
+      eventId: 'room-ready:2026-01-01T00:00:01.000Z', id: 'room-1', name: 'Room',
+      previousState: 'provisioning', newState: 'active', participants: [] };
+    recordFleetAuditPresentation(event);
+    recordFleetAuditPresentation(event);
+    expect(consumeFleetAuditCollection().presentations).toEqual([expect.objectContaining(event)]);
+  });
   it('does not turn trusted internal workers into nested proxy attempts', () => {
     const env = fleetWorkerEnv({ HOME: '/safe', PATH: '/bin',
       [FLEET_PROXY_STATE_DIR_ENV]: '/state/Agent', [FLEET_PROXY_CALLER_ENV]: 'Agent' });
-    expect(env).toEqual({ HOME: '/safe', PATH: '/bin' });
+    expect(env).toEqual({ HOME: '/safe', PATH: '/bin',
+      [FLEET_WORKER_LIFECYCLE_STATE_DIR_ENV]: '/state/Agent' });
+    expect(env).not.toHaveProperty(FLEET_PROXY_STATE_DIR_ENV);
+    expect(env).not.toHaveProperty(FLEET_PROXY_CALLER_ENV);
   });
   it('keeps the explicit task/room/template inventory in parity with Commander registrations', () => {
     const source = readFileSync(join(import.meta.dirname, '../src/rooms-tasks/cli.ts'), 'utf8');
@@ -367,7 +398,7 @@ describe('human-readable launch configuration', () => {
     expect(shown + Number(note![1])).toBe(64);
   });
 
-  it('always shows at least one complete agent summary even for a maximal first line', () => {
+  it('keeps the ready notice concise even when legacy participant details are present', () => {
     const big: AgentLaunchConfiguration = { ...named(),
       template: '𝕏'.repeat(160), model: '𝕐'.repeat(160), mission: '𝕄'.repeat(80),
       permissionMode: { fleetMode: 'ask', nativeMode: '𝕅'.repeat(80) } };
@@ -377,7 +408,7 @@ describe('human-readable launch configuration', () => {
         name: `m${index}`, role: 'Member', configuration: big })) });
     expect(Array.from(rendered).length).toBeLessThanOrEqual(MARKDOWN_MAX_CODE_POINTS);
     expect(Buffer.byteLength(rendered, 'utf8')).toBeLessThanOrEqual(MARKDOWN_MAX_BYTES);
-    expect(rendered).toContain('- `m0`:');
+    expect(rendered).toBe('The room r1 is ready.');
   });
 
   it('accepts a complete v1 configuration through the audit finish boundary', () => {

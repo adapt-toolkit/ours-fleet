@@ -54,7 +54,8 @@ exports[`task/room JSON presentation contract > pins every room --json serialize
 exports[`task/room JSON presentation contract > pins every task --json serializer branch exactly and before Markdown rendering 1`] = `
 [
   "if (opts.json) {
-          console.log(JSON.stringify({ schema_version: 1, task: record }, null, 2));
+          console.log(JSON.stringify({ schema_version: 1, task: record,
+            ...(provisioning ? { provisioning } : {}) }, null, 2));
           return;
         }",
   "if (opts.json) {
@@ -74,7 +75,12 @@ exports[`task/room JSON presentation contract > pins every task --json serialize
           }, null, 2));
           return;
         }",
-  "if (opts.json) { console.log(JSON.stringify({ schema_version: 1, task: t }, null, 2)); return; }",
+  "if (opts.json) {
+          console.log(JSON.stringify({ schema_version: 1, task: t, provisioning }, null, 2)); return;
+        }",
+  "if (opts.json) {
+          console.log(JSON.stringify({ schema_version: 1, provisioning: outcome }, null, 2)); return;
+        }",
   "if (opts.json) { console.log(JSON.stringify({ schema_version: 1, task: t }, null, 2)); return; }",
   "if (opts.json) { console.log(JSON.stringify({ schema_version: 1, task: t }, null, 2)); return; }",
   "if (opts.json) { console.log(JSON.stringify({ schema_version: 1, task: t }, null, 2)); return; }",

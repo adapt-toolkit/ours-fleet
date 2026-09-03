@@ -27,7 +27,8 @@ import {
 } from './commands.js';
 import type { ManagedFleetSpawnResult } from '../fleet-proxy.js';
 import {
-  FleetCommandAuditStore, lifecycleEventDigestBasis, renderFleetLifecycleEvent,
+  beginFleetAuditCollection, consumeFleetAuditCollection, FleetCommandAuditStore,
+  lifecycleEventDigestBasis, renderFleetLifecycleEvent, setFleetAuditLifecycleCheckpoint,
   type FleetAuditAttempt, type FleetAuditPresentation, type FleetCommandOutcomeClass,
 } from '../fleet-command-audit.js';
 import {
@@ -43,6 +44,7 @@ import {
   DuplicateSendError, OwnerAuthorizationState, OwnerChannelState, OwnerConversationState,
   type OwnerEntry,
 } from './state.js';
+import { FleetLifecycleOutbox } from './lifecycle-outbox.js';
 import {
   OwnerTaskState, ownerTaskAuditId, ownerTaskDigest, type OwnerTaskPhase,
 } from './tasks.js';
@@ -112,6 +114,7 @@ export interface OwnerChannelHandle {
   manage(request: OwnerChannelManagementRequest): Promise<OwnerChannelManagementResult>;
   /** Fleet-owned deterministic lifecycle notice; absent on legacy test doubles. */
   notifyFleetSpawn?(event: ManagedFleetSpawnResult): Promise<void>;
+  notifyFleetLifecycle?(presentations: FleetAuditPresentation[]): Promise<void>;
   beginFleetCommandAudit?(requestId: string, argv: string[]): Promise<FleetAuditAttempt>;
   finishFleetCommandAudit?(input: {
     correlationId: string; class: FleetCommandOutcomeClass; exitCode?: number;
@@ -277,6 +280,7 @@ export class OwnerChannel implements OwnerChannelHandle {
   private readonly fleetOps: OwnerFleetOps;
   private readonly prepareRestart: (role: string, mode: 'keep' | 'fresh') => Promise<void>;
   private readonly commandAudits: FleetCommandAuditStore;
+  private readonly lifecycleOutbox: FleetLifecycleOutbox;
 
   constructor(private readonly options: OwnerChannelOptions) {
     this.client = options.client ?? new OursSdkClient(
@@ -295,6 +299,8 @@ export class OwnerChannel implements OwnerChannelHandle {
     this.state = new OwnerChannelState(join(options.stateDir, '.owner-channel-state.json'));
     this.commandAudits = new FleetCommandAuditStore(
       join(options.stateDir, '.owner-channel-command-audit.json'));
+    this.lifecycleOutbox = new FleetLifecycleOutbox(
+      join(options.stateDir, '.owner-channel-lifecycle-outbox.json'));
     this.authorizations = new OwnerAuthorizationState(
       join(options.stateDir, '.owner-channel-owners.json'), options.config.owners);
     this.conversations = new OwnerConversationState(
@@ -324,6 +330,8 @@ export class OwnerChannel implements OwnerChannelHandle {
       options.log(`[${options.role}] owner message recovery state corrupt; message intake disabled`);
     if (!this.attachmentRecovery.integrity())
       options.log(`[${options.role}] owner attachment recovery state corrupt; attachments disabled`);
+    if (!this.lifecycleOutbox.integrity().ok)
+      options.log(`[${options.role}] owner lifecycle outbox corrupt; lifecycle delivery disabled`);
   }
 
   async start(): Promise<void> {
@@ -373,6 +381,7 @@ export class OwnerChannel implements OwnerChannelHandle {
     this.startedOnce = true;
     this.ready = true;
     await this.flushPendingFleetCommandAudits();
+    await this.flushPendingFleetLifecycle();
     // Do not make role startup wait for an old owner request to finish a turn.
     // watchLoop itself drains before every establishment, including this first
     // one, so there is no drain-to-tip race.
@@ -447,6 +456,39 @@ export class OwnerChannel implements OwnerChannelHandle {
           ...(event.configuration ? { configuration: event.configuration } : {}) }),
         `fleet-spawn\0${event.creationActionId}`, 0);
     });
+  }
+
+  notifyFleetLifecycle(presentations: FleetAuditPresentation[]): Promise<void> {
+    const run = this.managementTail.then(async () => {
+      // Acceptance is durable before delivery. A detached worker may exit
+      // while the Owner channel is reconnecting; startup/recovery flushes the
+      // pending event through the existing exactly-once send ledger.
+      this.lifecycleOutbox.enqueue(presentations);
+      if (this.ready && !this.stopping) await this.flushPendingFleetLifecycle();
+    });
+    this.managementTail = run.then(() => undefined, () => undefined);
+    return run;
+  }
+
+  private async flushPendingFleetLifecycle(): Promise<void> {
+    for (const entry of this.lifecycleOutbox.pending()) {
+      try {
+        await this.sendProactiveMessage(renderFleetLifecycleEvent(entry.presentation),
+          `fleet-lifecycle\0${lifecycleEventDigestBasis(entry.presentation)}`, 0);
+        this.lifecycleOutbox.finish(entry.digest, 'delivered');
+      } catch (error) {
+        if (error instanceof DuplicateSendError) {
+          this.lifecycleOutbox.finish(entry.digest,
+            error.status === 'delivered' ? 'delivered' : 'uncertain');
+          this.options.log(`[${this.options.role}] duplicate Fleet lifecycle event suppressed`);
+          continue;
+        }
+        // If the send crossed the uncertain boundary, the proactive ledger
+        // will refuse it on the next flush. A pre-send outage stays pending.
+        this.logError('pending Fleet lifecycle delivery deferred', error);
+        return;
+      }
+    }
   }
 
   beginFleetCommandAudit(requestId: string, argv: string[]): Promise<FleetAuditAttempt> {
@@ -563,6 +605,7 @@ export class OwnerChannel implements OwnerChannelHandle {
         await this.recoveryStage('list', this.client.listIncomingMessages(), deadlineAt);
         if (superseded()) throw new Error('owner recovery epoch superseded');
         this.ready = true;
+        await this.flushPendingFleetLifecycle();
         this.watchTask = this.watchLoop(watchGeneration);
       } catch (error) {
         this.ready = false;
@@ -1391,6 +1434,16 @@ export class OwnerChannel implements OwnerChannelHandle {
   private async handleCommand(
     sender: { id: string; name: string }, text: string, wireId: string,
   ): Promise<void> {
+    const provisioningCommand = async <T>(run: () => Promise<T>): Promise<T> => {
+      beginFleetAuditCollection();
+      setFleetAuditLifecycleCheckpoint(events => this.notifyFleetLifecycle(events));
+      try { return await run(); }
+      finally {
+        setFleetAuditLifecycleCheckpoint(undefined);
+        const remaining = consumeFleetAuditCollection().presentations;
+        if (remaining?.length) await this.notifyFleetLifecycle(remaining);
+      }
+    };
     const ctx: OwnerCommandContext = {
       authenticatedCid: sender.id,
       role: this.options.role,
@@ -1414,13 +1467,44 @@ export class OwnerChannel implements OwnerChannelHandle {
       terminalTask: (taskId, kind, outcome) =>
         this.terminalTaskFromOwner(sender, taskId, kind, outcome, wireId),
       recoverTask: taskId => this.recoverTaskFromOwner(sender, taskId, wireId),
-      createTask: input => new TaskRoomApplicationService(this.options.configPath).createTask({
-        ...input,
-        actor: { kind: 'authenticated_owner', surface: 'messenger', cid: sender.id },
+      createTask: input => provisioningCommand(async () => {
+        const service = new TaskRoomApplicationService(this.options.configPath);
+        const task = await service.createTask({
+          ...input,
+          actor: { kind: 'authenticated_owner', surface: 'messenger', cid: sender.id },
+        });
+        if (!input.backlog && !input.noRoom && task.room_id) {
+          const outcome = service.taskProvisioningOutcome(task.task_id);
+          if (outcome.kind === 'in_progress' && !outcome.next_action)
+            await this.fleetOps.provisionTask(task.task_id);
+        }
+        return task;
       }),
-      startTask: taskId => new TaskRoomApplicationService(this.options.configPath).startTask({
-        actor: { kind: 'authenticated_owner', surface: 'messenger', cid: sender.id }, taskId,
+      startTask: taskId => provisioningCommand(async () => {
+        const service = new TaskRoomApplicationService(this.options.configPath);
+        const task = await service.startTask({
+          actor: { kind: 'authenticated_owner', surface: 'messenger', cid: sender.id }, taskId,
+        });
+        // A zero-duration observation repairs a ready notice after a crash or
+        // duplicate start without extending the start command's existing wait.
+        const outcome = await service.awaitTaskProvisioning({
+          actor: { kind: 'authenticated_owner', surface: 'messenger', cid: sender.id },
+          taskId: task.task_id, waitMs: 0,
+        });
+        if (outcome.kind === 'in_progress' && !outcome.next_action)
+          await this.fleetOps.provisionTask(task.task_id);
+        return outcome;
       }),
+      awaitTask: taskId => provisioningCommand(async () => {
+        const service = new TaskRoomApplicationService(this.options.configPath);
+        const initial = service.taskProvisioningOutcome(taskId);
+        if (initial.kind === 'in_progress') await this.fleetOps.provisionTask(taskId);
+        return service.awaitTaskProvisioning({
+          actor: { kind: 'authenticated_owner', surface: 'messenger', cid: sender.id }, taskId,
+        });
+      }),
+      taskProvisioningOutcome: taskId =>
+        new TaskRoomApplicationService(this.options.configPath).taskProvisioningOutcome(taskId),
       listTasks: filter => new TaskRoomApplicationService(this.options.configPath).listTasks(filter),
       groupedTasks: filter => new TaskRoomApplicationService(this.options.configPath).groupedTasks(filter),
       listTaskLists: () => new TaskRoomApplicationService(this.options.configPath).listTaskLists(),
@@ -1451,9 +1535,10 @@ export class OwnerChannel implements OwnerChannelHandle {
       getRoomQuery: id => new TaskRoomApplicationService(this.options.configPath).getRoomDetail(id),
       listTemplateQueries: () => new TaskRoomApplicationService(this.options.configPath).listTemplates(),
       getTemplateQuery: name => new TaskRoomApplicationService(this.options.configPath).getTemplate(name),
-      createRoom: input => new TaskRoomApplicationService(this.options.configPath).createRoom({
-        ...input, actor: { kind: 'authenticated_owner', surface: 'messenger', cid: sender.id },
-      }),
+      createRoom: input => provisioningCommand(() =>
+        new TaskRoomApplicationService(this.options.configPath).createRoom({
+          ...input, actor: { kind: 'authenticated_owner', surface: 'messenger', cid: sender.id },
+        })),
       recentEvents: limit => this.options.session.eventsSince(0).slice(-limit),
       readWorklogTail: maxChars => this.readWorklogTail(maxChars),
       reply: async replyText => { await this.send(sender.id, replyText, wireId); },

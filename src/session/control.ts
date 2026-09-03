@@ -12,7 +12,7 @@ import type { ScheduledLoopManagerHandle } from '../loops/manager.js';
 import type { SpawnOpts } from '../spawn.js';
 import type { ManagedFleetSpawnResult } from '../fleet-proxy.js';
 import {
-  validateFleetAuditBegin, validateFleetAuditFinish,
+  validateFleetAuditBegin, validateFleetAuditFinish, validateFleetAuditPresentations,
   type FleetAuditAttempt, type FleetAuditPresentation, type FleetCommandOutcomeClass,
 } from '../fleet-command-audit.js';
 import {
@@ -28,7 +28,7 @@ export interface ControlRequest {
   command: 'status' | 'snapshot' | 'submit_prompt' | 'respond_permission' | 'interrupt' | 'follow' | 'events_since' | 'owner_channel_manage'
     | 'loop_status' | 'loop_run_now' | 'loop_disable' | 'loop_enable' | 'reload_config'
     | 'conversation_page' | 'conversation_follow' | 'submit_prompt_v2' | 'interrupt_v2'
-    | 'respond_permission_v2' | 'fleet_spawn' | 'fleet_audit_begin' | 'fleet_audit_finish';
+    | 'respond_permission_v2' | 'fleet_spawn' | 'fleet_audit_begin' | 'fleet_audit_present' | 'fleet_audit_finish';
   text?: string;
   permissionId?: string;
   optionId?: string;
@@ -233,6 +233,7 @@ export class RoleControlServer {
       effect: 'not_started' | 'completed' | 'unknown'; resourceIds?: Record<string, string>;
       presentations?: FleetAuditPresentation[];
     }): Promise<FleetAuditAttempt>;
+    present(presentations: FleetAuditPresentation[]): Promise<void>;
   };
 
   constructor(
@@ -457,6 +458,14 @@ export class RoleControlServer {
             ...(audit.presentations ? { presentations: audit.presentations } : {}),
           });
           this.write(socket, { version: 1, id: request.id, ok: true, result });
+          return;
+        }
+        case 'fleet_audit_present': {
+          if (!this.fleetAuditor) throw new SessionControlError('rejected', 'fleet auditing is unavailable');
+          try { validateFleetAuditPresentations(request.audit?.presentations); }
+          catch { throw new SessionControlError('rejected', 'valid Fleet lifecycle presentations are required'); }
+          await this.fleetAuditor.present(request.audit.presentations);
+          this.write(socket, { version: 1, id: request.id, ok: true, result: { delivered: true } });
           return;
         }
         case 'owner_channel_manage': {
