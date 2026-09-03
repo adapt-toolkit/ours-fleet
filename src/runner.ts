@@ -161,6 +161,7 @@ function localFleetAuditor(stateDir: string, caller: string, log: (line: string)
         attempt = store.outcome(attempt.correlationId, caller, 'delivered');
       return attempt;
     },
+    async present() {},
   };
 }
 
@@ -780,6 +781,7 @@ export async function runOnce(
       control.setFleetAuditor(ownerChannel ? {
         begin: (requestId, argv) => ownerChannel!.beginFleetCommandAudit!(requestId, argv),
         finish: input => ownerChannel!.finishFleetCommandAudit!(input),
+        present: presentations => ownerChannel!.notifyFleetLifecycle!(presentations),
       } : localFleetAuditor(dir, name, deps.log));
       await control.start();
     }

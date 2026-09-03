@@ -42,7 +42,6 @@ import {
   readTempSupervisor, secureStoppedTempArchive, tempArchiveForCreationAction,
   tempSupervisorLiveness,
 } from '../temp-lifecycle.js';
-import { recordFleetAuditPresentation } from '../fleet-command-audit.js';
 
 export function getBinPath(): string {
   try { return realpathSync(process.argv[1]); } catch { return process.argv[1]; }
@@ -84,17 +83,6 @@ interface MemberSettings {
   template: string;
   templateHash: string;
   loopSource: 'agent-template' | 'cli' | 'omitted';
-}
-
-function selectionSummary(selection: AgentDefinition['brain'] | AgentDefinition['role']): string {
-  if ('ref' in selection) return `ref:${selection.ref} (reference)`;
-  return `inline:sha256:${createHash('sha256').update(canonicalJson(selection.inline)).digest('hex').slice(0, 16)} (inline)`;
-}
-
-function permissionSummary(definition: AgentDefinition): string | undefined {
-  const permissions = definition.permissions;
-  if (!permissions) return undefined;
-  return `approval=${permissions.approval},filesystem=${permissions.filesystem},unattended=${permissions.unattended}`;
 }
 
 function launchDefinition(definition: AgentDefinition): {
@@ -476,13 +464,6 @@ async function launchMemberUnlocked(input: {
       ...(launched.callerRole ? { caller_role: launched.callerRole } : {}),
       launch_id: supervisor.launchId, updated_at: new Date().toISOString(),
     } });
-    recordFleetAuditPresentation({ kind: 'agent_started', id: member.name, name: member.name,
-      lifetime: 'temporary', brain: selectionSummary(settings.definition.brain),
-      role: selectionSummary(settings.definition.role),
-      harness: presentation.harness, session: 'acp',
-      permissions: permissionSummary(settings.definition), parent: provision.roomId,
-      actionId: launched.creationActionId, inherited: [],
-      configuration: presentation });
   } catch (error) {
     updateMemberStartup(provision.roomId, member.name, { launch: {
       state: 'failed', attempt, action_id: effectiveActionId, mission_sha256: taskSha,
@@ -492,8 +473,6 @@ async function launchMemberUnlocked(input: {
       updated_at: new Date().toISOString(),
       error: error instanceof Error ? error.message : String(error),
     } });
-    recordFleetAuditPresentation({ kind: 'lifecycle_failure', resource: 'Agent', id: member.name,
-      state: 'failed', category: 'readiness_failed', eventId: effectiveActionId });
     throw error;
   }
 }
@@ -518,10 +497,12 @@ function exactCoworkSeat(
 }
 
 function reconcileMemberSeats(
-  roomId: string, members: ExpandedMember[], observed: CoworkSeatInfo[],
+  roomId: string, members: ExpandedMember[], observed: CoworkSeatInfo[], ownerSeatCid?: string,
 ): { complete: boolean; seats: RoomMemberSeat[] } {
   const current = getRoomRecord(roomId)!;
-  let complete = true;
+  let complete = !ownerSeatCid || observed.some(seat =>
+    seat.identity_cid.toLowerCase() === ownerSeatCid.toLowerCase()
+      && seat.seat_state === 'active');
   const seats = current.member_seats.map(seat => {
     const member = members.find(candidate => candidate.name === seat.role_name)!;
     const found = exactCoworkSeat(observed, member, seat.invite_id);
@@ -612,7 +593,7 @@ export async function provisionMembers(
   try {
     const initialRoom = await cowork.recoverRoom(roomId);
     assertCoworkRoomPolicy(initialRoom, roomPolicy.anonymous);
-    reconcileMemberSeats(roomId, members, initialRoom.seats);
+    reconcileMemberSeats(roomId, members, initialRoom.seats, existing.owner_seat_cid);
     for (const member of members) {
       const task = tasks.get(member.name)!;
       const currentSeat = getRoomRecord(roomId)!.member_seats
@@ -677,7 +658,7 @@ export async function provisionMembers(
   for (;;) {
     const remote = await cowork.recoverRoom(roomId);
     assertCoworkRoomPolicy(remote, roomPolicy.anonymous);
-    const reconciled = reconcileMemberSeats(roomId, members, remote.seats);
+    const reconciled = reconcileMemberSeats(roomId, members, remote.seats, ownerSeatCid ?? undefined);
     if (reconciled.complete) break;
     if (policy.now() >= deadline) {
       advanceSaga(roomId, 'wait_seats', 5, 'waiting_seats');
@@ -686,6 +667,15 @@ export async function provisionMembers(
     advanceSaga(roomId, 'wait_seats', 5, 'waiting_seats');
     await policy.sleep(delay);
     delay = Math.min(policy.maxDelayMs, Math.max(delay + 1, delay * 2));
+  }
+
+  // Admission alone is insufficient: every expected member must still have
+  // the exact live launch that owns its authenticated Cowork seat.
+  for (const member of members) {
+    if (!await retainRunningLaunch({
+      provision: input, member, settings: settings.get(member.name)!,
+      task: tasks.get(member.name)!, roomIdentityCid,
+    })) throw new Error(`active Cowork seat ${member.name} has no matching live Fleet launch`);
   }
 
   if (taskId) {

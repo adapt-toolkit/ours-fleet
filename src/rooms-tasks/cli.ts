@@ -57,7 +57,9 @@ import {
   markdownCode, markdownProse, renderMarkdownFailure, renderMarkdownList,
   renderMarkdownResult, roomStatus, taskStatus,
 } from './markdown.js';
-import { TaskRoomApplicationError, TaskRoomApplicationService } from '../application/task-room-service.js';
+import {
+  TaskRoomApplicationError, TaskRoomApplicationService, type TaskProvisioningOutcome,
+} from '../application/task-room-service.js';
 import { TaskListError } from './task-lists.js';
 import {
   recordFleetAuditFailure, recordFleetAuditPresentation, recordFleetAuditResource,
@@ -294,6 +296,54 @@ const taskActionMarkdown = (
   ],
   });
 };
+
+function provisioningMarkdown(outcome: TaskProvisioningOutcome): string {
+  const room = outcome.room;
+  if (outcome.kind === 'failed') return renderMarkdownFailure({
+    kind: 'state', subject: `task start ${outcome.task.task_id}`,
+    detail: outcome.blocker ?? 'Provisioning reached a terminal failure.',
+    action: outcome.next_action ?? `Run ours-fleet task recover ${outcome.task.task_id}.`,
+  });
+  return renderMarkdownResult({
+    icon: outcome.kind === 'ready' ? '✅' : '⏳',
+    title: outcome.kind === 'ready' ? 'Room provisioning complete' : 'Room provisioning continues',
+    fields: [
+      { label: 'Task', value: `${outcome.task.task_id} — ${outcome.task.title}` },
+      ...(room ? [{ label: 'Room', value: `${room.room_id} — ${room.room_name}` }] : []),
+      ...(outcome.launch.template ? [{ label: 'Template', value: outcome.launch.template, kind: 'code' as const }] : []),
+      { label: 'Launch', value: `anonymous=${outcome.launch.anonymous ? 'yes' : 'no'}, owner=${outcome.launch.owner_attached ? 'attached' : 'not-attached'}` },
+      { label: 'Lifecycle', value: outcome.kind },
+      { label: 'Members', value: `${outcome.members.active}/${outcome.members.expected} active; ${outcome.members.launched}/${outcome.members.expected} launched` },
+      ...(outcome.blocker ? [{ label: 'Blocker', value: outcome.blocker }] : []),
+      ...(outcome.next_action ? [{ label: 'Next action', value: outcome.next_action }] : []),
+      ...(outcome.kind === 'in_progress'
+        ? [{ label: 'Await', value: outcome.handle.command, kind: 'code' as const }] : []),
+    ],
+  });
+}
+
+function auditProvisioningOutcome(outcome: TaskProvisioningOutcome): void {
+  const room = outcome.room;
+  recordFleetAuditResource('task', outcome.task.task_id);
+  if (room) recordFleetAuditResource('room', room.room_id);
+  if (outcome.kind === 'ready' && room) recordFleetAuditPresentation({
+    kind: 'room', operation: 'activate', eventId: `room-ready:${room.activated_at ?? room.created_at}`,
+    id: room.room_id, name: room.room_name, previousState: 'provisioning', newState: 'active',
+    revision: room.activated_at ?? room.created_at, taskId: room.task_id,
+    template: outcome.launch.template, anonymous: outcome.launch.anonymous,
+    memberCount: outcome.members.expected, ownerAttached: outcome.launch.owner_attached,
+    participants: [],
+  });
+  if (outcome.kind === 'failed') recordFleetAuditPresentation({
+    kind: 'lifecycle_failure', resource: 'Task', id: outcome.task.task_id,
+    state: outcome.task.state, category: 'provision_failed',
+    eventId: outcome.task.ended_at ?? outcome.room?.created_at ?? outcome.task.created_at,
+  });
+}
+
+async function continueProvisioningInBackground(taskId: string, configPath?: string): Promise<void> {
+  await launchFleetWorker(['task', '_provision', taskId], `task-provision-${taskId}`, configPath);
+}
 
 /**
  * Shared launch-configuration line for CLI member listings. Pre-upgrade seats
@@ -789,7 +839,8 @@ export function registerTaskCommands(parent: Command, cOpt: (cmd: Command) => Co
     }, command: Command) => {
       try {
         const members = cliMemberOverrides(opts.membersFile, commandArgv(command));
-        const record = await taskRoomService(opts.configuration).createTask({
+        const service = taskRoomService(opts.configuration);
+        const record = await service.createTask({
           actor: { kind: 'local_control', surface: 'cli' }, title: opts.title,
           brief: opts.brief, briefFile: opts.briefFile, template: opts.template,
           backlog: opts.backlog, noRoom: opts.room === false,
@@ -799,10 +850,17 @@ export function registerTaskCommands(parent: Command, cOpt: (cmd: Command) => Co
           members,
         });
 
+        const provisioning = !opts.backlog && opts.room !== false && record.room_id
+          ? service.taskProvisioningOutcome(record.task_id) : undefined;
+        if (provisioning?.kind === 'in_progress')
+          await continueProvisioningInBackground(record.task_id, opts.configuration);
+        if (provisioning) auditProvisioningOutcome(provisioning);
         if (opts.json) {
-          console.log(JSON.stringify({ schema_version: 1, task: record }, null, 2));
+          console.log(JSON.stringify({ schema_version: 1, task: record,
+            ...(provisioning ? { provisioning } : {}) }, null, 2));
           return;
         }
+        if (provisioning) { console.log(provisioningMarkdown(provisioning)); return; }
         console.log(taskActionMarkdown('Task created', record, [
           { label: 'Title', value: record.title },
           ...(record.template ? [{ label: 'Template', value: `${record.template.name}@${record.template.version}`, kind: 'code' as const }] : []),
@@ -961,13 +1019,20 @@ export function registerTaskCommands(parent: Command, cOpt: (cmd: Command) => Co
     .option('--json', 'JSON output')
     .action(async (id: string, opts: { configuration?: string; json?: boolean; template?: string; membersFile?: string }, command: Command) => {
       try {
-        const t = await taskRoomService(opts.configuration).startTask({
+        const service = taskRoomService(opts.configuration);
+        const t = await service.startTask({
           actor: { kind: 'local_control', surface: 'cli' }, taskId: id,
           template: opts.template, members: cliMemberOverrides(opts.membersFile, commandArgv(command)),
           anonymous: cliAnonymousOverride(commandArgv(command)),
         });
-        if (opts.json) { console.log(JSON.stringify({ schema_version: 1, task: t }, null, 2)); return; }
-        console.log(taskActionMarkdown('Task started', t));
+        const provisioning = service.taskProvisioningOutcome(t.task_id);
+        if (provisioning.kind === 'in_progress')
+          await continueProvisioningInBackground(t.task_id, opts.configuration);
+        auditProvisioningOutcome(provisioning);
+        if (opts.json) {
+          console.log(JSON.stringify({ schema_version: 1, task: t, provisioning }, null, 2)); return;
+        }
+        console.log(provisioningMarkdown(provisioning));
       } catch (e) {
         if (e instanceof TaskRoomApplicationError && e.code === 'task_template_drift')
           e = taskRoomPublicError('task_template_drift', {
@@ -976,6 +1041,27 @@ export function registerTaskCommands(parent: Command, cOpt: (cmd: Command) => Co
           });
         if (opts.json) die(e); dieTaskRoom(e);
       }
+    });
+
+  cOpt(taskCmd.command('await <id>'))
+    .description('await the same bounded room-provisioning operation')
+    .option('--wait-ms <ms>', 'bounded wait in milliseconds', '60000')
+    .option('--json', 'JSON output')
+    .action(async (id: string, opts: { configuration?: string; waitMs: string; json?: boolean }) => {
+      try {
+        const waitMs = Number(opts.waitMs);
+        if (!Number.isSafeInteger(waitMs) || waitMs < 0 || waitMs > 600_000)
+          throw new Error('--wait-ms must be an integer from 0 to 600000');
+        const outcome = await taskRoomService(opts.configuration).awaitTaskProvisioning({
+          actor: { kind: 'local_control', surface: 'cli' }, taskId: id, waitMs,
+        });
+        auditProvisioningOutcome(outcome);
+        if (opts.json) {
+          console.log(JSON.stringify({ schema_version: 1, provisioning: outcome }, null, 2)); return;
+        }
+        console.log(provisioningMarkdown(outcome));
+        if (outcome.kind === 'failed') process.exitCode = 1;
+      } catch (e) { if (opts.json) die(e); dieTaskRoom(e); }
     });
 
   taskCmd.command('block <id>')
@@ -1168,8 +1254,10 @@ export function registerTaskCommands(parent: Command, cOpt: (cmd: Command) => Co
           })()
           : begin.result;
         const t = recovered.task;
-        auditTask('recover', t, previous);
         const room = recovered.room;
+        if (previous === 'provisioning' && t.state === 'active' && room?.state === 'active')
+          auditProvisioningOutcome(app.taskProvisioningOutcome(t.task_id));
+        else auditTask('recover', t, previous);
         const recoveryActions = recovered.issues.map(issue => {
           if (issue.code === 'terminal_pending') return `Terminal intent remains pending — retry task recover ${id}`;
           if (issue.code === 'waiting_cowork') return 'Cowork management socket unreachable — check ours-cowork service';
@@ -1225,6 +1313,17 @@ export function registerTaskCommands(parent: Command, cOpt: (cmd: Command) => Co
         if (opts.json) die(e);
         dieTaskRoom(e);
       }
+    });
+
+  cOpt(taskCmd.command('_provision <id>', { hidden: true }))
+    .description('internal: continue an accepted room-provisioning operation')
+    .option('--json', 'JSON output')
+    .action(async (id: string, opts: { configuration?: string; json?: boolean }) => {
+      try {
+        await taskRoomService(opts.configuration).ensureTaskWork({
+          actor: { kind: 'internal_worker', surface: 'cli' }, taskId: id,
+        });
+      } catch (e) { if (opts.json) die(e); dieTaskRoom(e); }
     });
 
   cOpt(taskCmd.command('_settle_delete <id>', { hidden: true }))

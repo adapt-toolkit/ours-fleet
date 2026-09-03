@@ -524,7 +524,7 @@ describe('OwnerChannel live management', () => {
     expect(texts.filter(text => text.includes('📋 Task'))).toEqual([
       expect.stringContaining('Unicode Δ'),
     ]);
-    expect(texts.filter(text => text.includes('🏠 Room'))).toEqual([
+    expect(texts.filter(text => text.startsWith('Agent has created the room'))).toEqual([
       expect.stringContaining('Room Δ'),
     ]);
     expect(texts.join('\n')).not.toContain('private');
@@ -616,7 +616,7 @@ describe('OwnerChannel live management', () => {
     const texts = client.calls.filter(call => call.name === 'sendMessage')
       .map(call => String(call.args?.text ?? ''));
     expect(texts.filter(text => text.includes('📋 Task'))).toHaveLength(1);
-    expect(texts.filter(text => text.includes('🏠 Room'))).toHaveLength(1);
+    expect(texts.filter(text => text.startsWith('Agent has created the room'))).toHaveLength(1);
     await channel.close();
   });
 

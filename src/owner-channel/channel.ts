@@ -27,7 +27,8 @@ import {
 } from './commands.js';
 import type { ManagedFleetSpawnResult } from '../fleet-proxy.js';
 import {
-  FleetCommandAuditStore, lifecycleEventDigestBasis, renderFleetLifecycleEvent,
+  beginFleetAuditCollection, consumeFleetAuditCollection, FleetCommandAuditStore,
+  lifecycleEventDigestBasis, renderFleetLifecycleEvent, setFleetAuditLifecycleCheckpoint,
   type FleetAuditAttempt, type FleetAuditPresentation, type FleetCommandOutcomeClass,
 } from '../fleet-command-audit.js';
 import {
@@ -112,6 +113,7 @@ export interface OwnerChannelHandle {
   manage(request: OwnerChannelManagementRequest): Promise<OwnerChannelManagementResult>;
   /** Fleet-owned deterministic lifecycle notice; absent on legacy test doubles. */
   notifyFleetSpawn?(event: ManagedFleetSpawnResult): Promise<void>;
+  notifyFleetLifecycle?(presentations: FleetAuditPresentation[]): Promise<void>;
   beginFleetCommandAudit?(requestId: string, argv: string[]): Promise<FleetAuditAttempt>;
   finishFleetCommandAudit?(input: {
     correlationId: string; class: FleetCommandOutcomeClass; exitCode?: number;
@@ -446,6 +448,25 @@ export class OwnerChannel implements OwnerChannelHandle {
           inherited: event.inherited,
           ...(event.configuration ? { configuration: event.configuration } : {}) }),
         `fleet-spawn\0${event.creationActionId}`, 0);
+    });
+  }
+
+  notifyFleetLifecycle(presentations: FleetAuditPresentation[]): Promise<void> {
+    return this.queueManagement(async () => {
+      if (!this.ready || this.stopping) throw new Error('owner-channel MCP client is unavailable');
+      for (const event of presentations) {
+        try {
+          await this.sendProactiveMessage(renderFleetLifecycleEvent(event),
+            `fleet-lifecycle\0${lifecycleEventDigestBasis(event)}`, 0);
+        } catch (error) {
+          if (error instanceof DuplicateSendError) {
+            if (error.status !== 'delivered') throw error;
+            this.options.log(`[${this.options.role}] duplicate Fleet lifecycle event suppressed`);
+            continue;
+          }
+          throw error;
+        }
+      }
     });
   }
 
@@ -1391,6 +1412,16 @@ export class OwnerChannel implements OwnerChannelHandle {
   private async handleCommand(
     sender: { id: string; name: string }, text: string, wireId: string,
   ): Promise<void> {
+    const provisioningCommand = async <T>(run: () => Promise<T>): Promise<T> => {
+      beginFleetAuditCollection();
+      setFleetAuditLifecycleCheckpoint(events => this.notifyFleetLifecycle(events));
+      try { return await run(); }
+      finally {
+        setFleetAuditLifecycleCheckpoint(undefined);
+        const remaining = consumeFleetAuditCollection().presentations;
+        if (remaining?.length) await this.notifyFleetLifecycle(remaining);
+      }
+    };
     const ctx: OwnerCommandContext = {
       authenticatedCid: sender.id,
       role: this.options.role,
@@ -1414,13 +1445,37 @@ export class OwnerChannel implements OwnerChannelHandle {
       terminalTask: (taskId, kind, outcome) =>
         this.terminalTaskFromOwner(sender, taskId, kind, outcome, wireId),
       recoverTask: taskId => this.recoverTaskFromOwner(sender, taskId, wireId),
-      createTask: input => new TaskRoomApplicationService(this.options.configPath).createTask({
-        ...input,
-        actor: { kind: 'authenticated_owner', surface: 'messenger', cid: sender.id },
+      createTask: input => provisioningCommand(async () => {
+        const service = new TaskRoomApplicationService(this.options.configPath);
+        const task = await service.createTask({
+          ...input,
+          actor: { kind: 'authenticated_owner', surface: 'messenger', cid: sender.id },
+        });
+        if (!input.backlog && !input.noRoom && task.room_id
+            && service.taskProvisioningOutcome(task.task_id).kind === 'in_progress')
+          await this.fleetOps.recoverTask(task.task_id);
+        return task;
       }),
-      startTask: taskId => new TaskRoomApplicationService(this.options.configPath).startTask({
-        actor: { kind: 'authenticated_owner', surface: 'messenger', cid: sender.id }, taskId,
+      startTask: taskId => provisioningCommand(async () => {
+        const service = new TaskRoomApplicationService(this.options.configPath);
+        const task = await service.startTask({
+          actor: { kind: 'authenticated_owner', surface: 'messenger', cid: sender.id }, taskId,
+        });
+        // A zero-duration observation repairs a ready notice after a crash or
+        // duplicate start without extending the start command's existing wait.
+        const outcome = await service.awaitTaskProvisioning({
+          actor: { kind: 'authenticated_owner', surface: 'messenger', cid: sender.id },
+          taskId: task.task_id, waitMs: 0,
+        });
+        if (outcome.kind === 'in_progress') await this.fleetOps.recoverTask(task.task_id);
+        return outcome;
       }),
+      awaitTask: taskId => provisioningCommand(() =>
+        new TaskRoomApplicationService(this.options.configPath).awaitTaskProvisioning({
+          actor: { kind: 'authenticated_owner', surface: 'messenger', cid: sender.id }, taskId,
+        })),
+      taskProvisioningOutcome: taskId =>
+        new TaskRoomApplicationService(this.options.configPath).taskProvisioningOutcome(taskId),
       listTasks: filter => new TaskRoomApplicationService(this.options.configPath).listTasks(filter),
       groupedTasks: filter => new TaskRoomApplicationService(this.options.configPath).groupedTasks(filter),
       listTaskLists: () => new TaskRoomApplicationService(this.options.configPath).listTaskLists(),
@@ -1451,9 +1506,10 @@ export class OwnerChannel implements OwnerChannelHandle {
       getRoomQuery: id => new TaskRoomApplicationService(this.options.configPath).getRoomDetail(id),
       listTemplateQueries: () => new TaskRoomApplicationService(this.options.configPath).listTemplates(),
       getTemplateQuery: name => new TaskRoomApplicationService(this.options.configPath).getTemplate(name),
-      createRoom: input => new TaskRoomApplicationService(this.options.configPath).createRoom({
-        ...input, actor: { kind: 'authenticated_owner', surface: 'messenger', cid: sender.id },
-      }),
+      createRoom: input => provisioningCommand(() =>
+        new TaskRoomApplicationService(this.options.configPath).createRoom({
+          ...input, actor: { kind: 'authenticated_owner', surface: 'messenger', cid: sender.id },
+        })),
       recentEvents: limit => this.options.session.eventsSince(0).slice(-limit),
       readWorklogTail: maxChars => this.readWorklogTail(maxChars),
       reply: async replyText => { await this.send(sender.id, replyText, wireId); },

@@ -84,7 +84,7 @@ vi.mock('../src/rooms-tasks/markdown.js', async (importOriginal) => {
 import { registerRoomCommands, registerTaskCommands } from '../src/rooms-tasks/cli.js';
 import {
   createTask, getTask, startTask, activateTask, reviewTask, completeTask, cancelTask, updateTaskRoom,
-  updateTaskMembers,
+  updateTaskMembers, failTask,
 } from '../src/rooms-tasks/task-state.js';
 import {
   createRoomRecord, activateRoom, getRoomRecord, advanceSaga, updateMemberSeats,
@@ -94,8 +94,7 @@ import { CoworkUnavailableError } from '../src/rooms-tasks/cowork-adapter.js';
 import { TaskRoomApplicationService } from '../src/application/task-room-service.js';
 import { acceptTaskTerminalIntent } from '../src/rooms-tasks/terminal.js';
 import { writeV2Fixture } from './v2-fixture.js';
-import { beginFleetAuditCollection, consumeFleetAuditCollection,
-  recordFleetAuditPresentation } from '../src/fleet-command-audit.js';
+import { beginFleetAuditCollection, consumeFleetAuditCollection } from '../src/fleet-command-audit.js';
 
 const ROOM_ID = '01hzyk8m0000000000000000aa';
 
@@ -258,10 +257,6 @@ beforeEach(() => {
           agent_definition: { brain: { kind: 'ref', id: 'codex' }, role: { kind: 'ref', id: 'Developer' },
             permissions: { approval: 'allow', filesystem: 'full', unattended: 'allow' } },
         } }]);
-      recordFleetAuditPresentation({ kind: 'agent_started', id: member.name, name: member.name,
-        lifetime: 'temporary', brain: 'ref:codex (reference)', role: 'ref:Developer (reference)',
-        harness: 'codex', session: 'acp', permissions: 'approval=allow,filesystem=full,unattended=allow',
-        parent: roomId, actionId: 'action-1', inherited: [] });
       if (taskId) updateTaskMembers(taskId, [member]);
     }
     const record = activateRoom(roomId);
@@ -467,13 +462,8 @@ describe('canonical proxied Task/Room audit metadata', () => {
     expect(consumeFleetAuditCollection()).toMatchObject({
       resourceIds: { task: id, room: ROOM_ID },
       presentations: [
-        { kind: 'task', operation: 'start', id, previousState: 'backlog', newState: 'provisioning' },
         { kind: 'room', operation: 'create', id: ROOM_ID, previousState: 'none', newState: 'provisioning' },
-        { kind: 'agent_started', id: 'dev-1', actionId: 'action-1' },
         { kind: 'room', operation: 'activate', id: ROOM_ID, previousState: 'provisioning', newState: 'active' },
-        { kind: 'task', operation: 'work', id, title: 'Audited task',
-          previousState: 'provisioning', newState: 'active', template: 'durable@7', roomId: ROOM_ID,
-          agents: [{ name: expect.any(String), role: expect.any(String) }] },
       ],
     });
   });
@@ -505,12 +495,9 @@ describe('canonical proxied Task/Room audit metadata', () => {
       presentations: [
         { kind: 'room', operation: 'create', id: ROOM_ID,
           previousState: 'none', newState: 'provisioning', template: 'durable@7', participants: [] },
-        { kind: 'agent_started', id: 'dev-1', actionId: 'action-1' },
         { kind: 'room', operation: 'activate', id: ROOM_ID,
           previousState: 'provisioning', newState: 'active', template: 'durable@7',
-          participants: [{ name: expect.any(String), brain: 'ref:codex (reference)',
-            role: 'ref:Developer (reference)',
-            permissions: 'approval=allow,filesystem=full,unattended=allow' }] },
+          participants: [] },
       ],
     });
 
@@ -538,6 +525,46 @@ describe('canonical proxied Task/Room audit metadata', () => {
     beginFleetAuditCollection();
     await expect(runRoom('show', ROOM_ID, '--json')).rejects.toThrow(ExitError);
     expect(consumeFleetAuditCollection().failure).toEqual({ class: 'runtime', effect: 'unknown' });
+  });
+});
+
+describe('task provisioning command outcomes', () => {
+  it('returns an explicit JSON in-progress handle and starts one continuation', async () => {
+    writeCustomTemplate();
+    const task = createTask({ title: 'Slow launch', origin: { type: 'cli' }, start: false });
+    mocks.provisionMembers.mockImplementationOnce(async ({ roomId }: { roomId: string }) =>
+      getRoomRecord(roomId)!);
+    await run('start', task.task_id, '--template', 'durable', '--json');
+    const payload = JSON.parse(out.join('\n'));
+    expect(payload.provisioning).toMatchObject({
+      kind: 'in_progress', task: { task_id: task.task_id },
+      room: { room_id: ROOM_ID }, handle: { task_id: task.task_id },
+      members: { expected: 1, active: 0, launched: 0 },
+    });
+    expect(payload.provisioning.handle.command).toBe(`ours-fleet task await ${task.task_id}`);
+    expect(mocks.launchFleetWorker).toHaveBeenCalledWith(
+      ['task', '_provision', task.task_id], `task-provision-${task.task_id}`, cfgPath);
+  });
+
+  it('returns compact human and JSON ready outcomes', async () => {
+    writeCustomTemplate();
+    const task = createTask({ title: 'Ready launch', origin: { type: 'cli' }, start: false });
+    await run('start', task.task_id, '--template', 'durable');
+    expect(out.join('\n')).toContain('Room provisioning complete');
+    expect(out.join('\n')).toContain('1/1 active; 1/1 launched');
+    out = [];
+    await run('await', task.task_id, '--wait-ms', '0', '--json');
+    expect(JSON.parse(out.join('\n')).provisioning.kind).toBe('ready');
+  });
+
+  it('returns a structured terminal blocker with a canonical next action', async () => {
+    const task = backlogTask();
+    startTask(task.task_id);
+    failTask(task.task_id, 'permanent configuration blocker');
+    await run('await', task.task_id, '--wait-ms', '0', '--json');
+    const outcome = JSON.parse(out.join('\n')).provisioning;
+    expect(outcome).toMatchObject({ kind: 'failed', blocker: 'permanent configuration blocker' });
+    expect(outcome.next_action).toContain(`task recover ${task.task_id}`);
   });
 });
 

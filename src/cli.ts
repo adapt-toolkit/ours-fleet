@@ -62,6 +62,7 @@ import {
 } from './fleet-proxy.js';
 import {
   beginFleetAuditCollection, consumeFleetAuditCollection, FleetCliExit,
+  setFleetAuditLifecycleCheckpoint,
   type FleetAuditAttempt, type FleetCommandOutcomeClass,
 } from './fleet-command-audit.js';
 import './harness/claude-code.js';   // registers the claude-code adapter
@@ -1469,6 +1470,13 @@ async function runFleetCli(): Promise<void> {
   let outcomeClass: FleetCommandOutcomeClass = 'success';
   let effect: 'not_started' | 'completed' | 'unknown' = 'completed';
   beginFleetAuditCollection();
+  setFleetAuditLifecycleCheckpoint(async presentations => {
+    const response = await controlRequest(stateDir, {
+      command: 'fleet_audit_present', audit: { presentations },
+    });
+    if (!response.ok) throw new SessionControlError(
+      response.kind ?? 'backend', response.error ?? 'Fleet lifecycle checkpoint delivery failed');
+  });
   if (attempt.classification.decision !== 'allow') {
     exitCode = 1; outcomeClass = 'denied'; effect = 'not_started';
     console.error(`fleet supervisor proxy ${attempt.classification.decision}: ${attempt.classification.command}`);
@@ -1483,6 +1491,7 @@ async function runFleetCli(): Promise<void> {
       if (!(error instanceof FleetCliExit)) console.error(error instanceof Error ? error.message : String(error));
     } finally { process.exit = originalExit; }
   }
+  setFleetAuditLifecycleCheckpoint(undefined);
   const metadata = consumeFleetAuditCollection();
   if (metadata.failure) {
     outcomeClass = metadata.failure.class; effect = metadata.failure.effect;
