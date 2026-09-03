@@ -21,7 +21,7 @@
     "LICENSE"
   ],
   "engines": {
-    "node": ">=20"
+    "node": ">=22"
   },
   "scripts": {
     "clean": "node -e \"require('node:fs').rmSync('dist',{recursive:true,force:true})\"",
@@ -41,7 +41,7 @@
     "@fastify/static": "^10.1.2",
     "@fastify/websocket": "^11.2.0",
     "@ours.network/cli": "1.0.1",
-    "@ours.network/sdk": "3.0.1",
+    "@ours.network/sdk": "3.7.0",
     "commander": "^12.1.0",
     "fastify": "^5.4.0",
     "react": "^19.1.1",

@@ -93,14 +93,15 @@ async function withIdentityClient<T>(work: (client: OursClient) => Promise<T>): 
 function listedIdentity(
   rows: Awaited<ReturnType<OursClient['listIdentities']>>, name: string,
 ): { name: string; cid: string } | undefined {
-  return rows.find(row => row.name === name);
+  return rows.find((row): row is Extract<typeof row, { cid: string }> =>
+    row.name === name && 'cid' in row);
 }
 
 /** Report whether any daemon identity — under any name — carries this exact CID. */
 export async function identityCidPresent(cid: string): Promise<boolean> {
   return withIdentityClient(async client => {
     const rows = await client.listIdentities();
-    return rows.some(row => row.cid?.toLowerCase() === cid.toLowerCase());
+    return rows.some(row => 'cid' in row && row.cid.toLowerCase() === cid.toLowerCase());
   });
 }
 

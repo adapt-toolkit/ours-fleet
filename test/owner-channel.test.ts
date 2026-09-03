@@ -10,7 +10,7 @@ import {
   OWNER_RECOVERY_DEGRADED, OWNER_RECOVERY_QUEUE_CAPACITY, OwnerChannel,
   type OwnerChannelOptions,
 } from '../src/owner-channel/channel.js';
-import { ownerCommandHelp, type OwnerFleetOps } from '../src/owner-channel/commands.js';
+import { ownerCommandHelp, ownerCommands, type OwnerFleetOps } from '../src/owner-channel/commands.js';
 import {
   activateRoom, closeRoom, createRoomRecord, getRoomRecord,
 } from '../src/rooms-tasks/room-state.js';
@@ -19,7 +19,7 @@ import {
   reviewTask, startTask, updateTaskRoom,
 } from '../src/rooms-tasks/task-state.js';
 import type {
-  OursContactsView, OursInboundMessage, OursOps,
+  OursContactsView, OursInboundMessage, OursOps, OursRegisteredCommand,
 } from '../src/owner-channel/ours-client.js';
 import { OWNER_COMMENT_LABEL, ownerNotices } from '../src/owner-channel/notices.js';
 import { MessageRecoveryState } from '../src/owner-channel/message-recovery.js';
@@ -49,9 +49,15 @@ class FakeClient implements OursOps {
   /** Operation names (the `OursOps` methods) that must reject. */
   failTools = new Set<string>();
   history = new Map<string, OursInboundMessage>();
+  commands: OursRegisteredCommand[] = [];
+  typedResults: unknown[] = [];
   async start() {}
   async close() {}
   async bindIdentity(name: string) { this.record('bindIdentity', { name }); }
+  async registerCommands(commands: OursRegisteredCommand[]) {
+    this.commands = commands;
+    this.record('registerCommands', { count: commands.length });
+  }
   async listContacts() { this.record('listContacts'); return EMPTY_CONTACTS; }
   async generateInvite(name?: string) {
     this.record('generateInvite', { name });
@@ -74,10 +80,31 @@ class FakeClient implements OursOps {
   async getMessages(limit: number) {
     this.record('getMessages', { limit });
     const batch = this.batches.shift() ?? [];
-    const messages = batch.slice(0, limit).map((item, index) => historyMessage(item, index + 1));
-    for (const message of messages) this.history.set(message.wire_id, message);
+    const consumed = batch.slice(0, limit).map((item, index) => historyMessage(item, index + 1));
+    for (const message of consumed) this.history.set(message.wire_id, message);
     if (batch.length > limit) this.batches.unshift(batch.slice(limit));
-    return { count: messages.length, messages, remaining: Math.max(0, batch.length - limit) };
+    let commandsHandled = 0;
+    for (const message of consumed.filter(item => item.message_kind === 'command')) {
+      const payload = JSON.parse(message.body) as { command: string; arguments: any };
+      const command = this.commands.find(entry => entry.name === payload.command);
+      if (!command) throw new Error(`missing fake handler: ${payload.command}`);
+      try {
+        this.typedResults.push(await command.handler(payload.arguments, {
+          sender_cid: message.from.id, sender_name: message.from.name,
+          request_wire_id: message.wire_id,
+        }));
+      } catch {
+        // SDK handlers fail closed and emit only its bounded handler_failed result.
+        this.typedResults.push('handler_failed');
+      }
+      commandsHandled++;
+    }
+    return {
+      messages: consumed.filter(item => item.message_kind === 'text'),
+      command_results: consumed.filter(item => item.message_kind === 'command_result') as any,
+      commands_handled: commandsHandled,
+      remaining: Math.max(0, batch.length - limit),
+    };
   }
   async getHistoryItem(wireId: string) {
     this.record('getHistoryItem', { wireId });
@@ -141,10 +168,11 @@ function setup(messages: unknown[], result = {
   configPath?: string;
   prepareRestart?: (role: string, mode: 'keep' | 'fresh') => Promise<void>;
   recoveryDeps?: OwnerChannelOptions['recoveryDeps'];
+  stateDir?: string; client?: FakeClient;
 } = {}) {
-  const dir = mkdtempSync(join(tmpdir(), 'ours-owner-channel-'));
-  dirs.push(dir);
-  const client = new FakeClient();
+  const dir = options.stateDir ?? mkdtempSync(join(tmpdir(), 'ours-owner-channel-'));
+  if (!options.stateDir) dirs.push(dir);
+  const client = options.client ?? new FakeClient();
   client.batches.push(messages, []);
   const queuePrompt = vi.fn(async () => ({
     promptId: 'prompt-1', queuedBehind: options.queuedBehind ?? 0,
@@ -584,6 +612,14 @@ const ownerMessage = (msgId: number, wireId: string, text: string) => ({
   msg_id: msgId, wire_id: wireId, from: { id: OWNER_CID, name: 'Owner' }, text,
 });
 
+const typedOwnerCommand = (
+  msgId: number, wireId: string, command: string, args: unknown,
+  sender = OWNER_CID,
+) => ({
+  msg_id: msgId, wire_id: wireId, from: { id: sender, name: 'Owner' },
+  message_kind: 'command', text: JSON.stringify({ command, arguments: args }),
+});
+
 /** The text of the most recent outward notice, ignoring daemon bookkeeping calls. */
 const lastReply = (client: FakeClient): string =>
   String(client.calls.filter(call => call.name === 'sendMessage').at(-1)?.args?.text);
@@ -605,7 +641,7 @@ describe('OwnerChannel', () => {
     client.getMessages = async limit => {
       client.calls.push({ name: 'getMessages', args: { limit } });
       return {
-        count: 1, remaining: 0,
+        command_results: [], commands_handled: 0, remaining: 0,
         messages: [historyMessage(ownerMessage(11, 'wire-different', '/status'))],
       };
     };
@@ -1040,6 +1076,122 @@ describe('OwnerChannel deterministic command dispatch', () => {
     settleTaskDeletion: vi.fn(async () => undefined),
     provisionTask: vi.fn(async () => undefined),
     recoverTask: vi.fn(async () => undefined),
+  });
+
+  it('registers the registry-derived catalog and preserves read-only slash results', async () => {
+    const slash = setup([ownerMessage(40, 'wire-slash-status', '/status')]);
+    await slash.channel.drain();
+    const slashReplies = slash.client.calls.filter(call => call.name === 'sendMessage')
+      .map(call => call.args?.text);
+
+    const typed = setup([typedOwnerCommand(
+      41, 'wire-typed-status', 'status', {}, OWNER_CID.toLowerCase(),
+    )]);
+    await typed.channel.start();
+    await typed.channel.drain();
+    await vi.waitFor(() => expect(typed.client.typedResults).toEqual([null]));
+    const typedReplies = typed.client.calls.filter(call => call.name === 'sendMessage')
+      .map(call => call.args?.text);
+    expect(typed.client.commands.map(command => command.name))
+      .toEqual(ownerCommands.map(command => command.name));
+    expect(typedReplies).toEqual(slashReplies);
+    expect(typedReplies).toHaveLength(1);
+    await typed.channel.close();
+  });
+
+  it('routes malformed typed arguments through shared validation without effects', async () => {
+    const { channel, client, queuePrompt, interrupt } = setup([
+      typedOwnerCommand(42, 'wire-typed-model-invalid', 'model', { arguments: 'bad model id' }),
+      typedOwnerCommand(43, 'wire-typed-interrupt-invalid', 'interrupt', { arguments: 'now' }),
+    ]);
+    await channel.start();
+    await channel.drain();
+    await vi.waitFor(() => expect(client.typedResults).toEqual([null, null]));
+    expect(queuePrompt).not.toHaveBeenCalled();
+    expect(interrupt).not.toHaveBeenCalled();
+    const replies = client.calls.filter(call => call.name === 'sendMessage');
+    expect(replies).toHaveLength(2);
+    expect(String(replies[0].args?.text)).toContain('model id must be alphanumeric');
+    expect(String(replies[1].args?.text)).toContain('/interrupt takes no arguments');
+    await channel.close();
+  });
+
+  it('preserves lifecycle effects and replies for typed and slash commands', async () => {
+    const slashFleet = fakeFleet();
+    const slash = setup([ownerMessage(43, 'wire-slash-restart', '/force-restart')],
+      undefined, { fleet: slashFleet });
+    await slash.channel.drain();
+
+    const typedFleet = fakeFleet();
+    const typed = setup([typedOwnerCommand(44, 'wire-typed-restart', 'force-restart', {})],
+      undefined, { fleet: typedFleet });
+    await typed.channel.start();
+    await typed.channel.drain();
+    await vi.waitFor(() => expect(typed.client.typedResults).toEqual([null]));
+    expect(slashFleet.restart).toHaveBeenCalledWith('fresh');
+    expect(typedFleet.restart).toHaveBeenCalledWith('fresh');
+    expect(typed.client.calls.filter(call => call.name === 'sendMessage').map(call => call.args?.text))
+      .toEqual(slash.client.calls.filter(call => call.name === 'sendMessage').map(call => call.args?.text));
+    await typed.channel.close();
+  });
+
+  it('recovers a later typed command when an earlier lifecycle handler terminates its SDK batch', async () => {
+    const firstFleet = fakeFleet();
+    const first = setup([], undefined, { fleet: firstFleet });
+    const batch = [
+      typedOwnerCommand(44, 'wire-typed-restart-first', 'restart', {}),
+      typedOwnerCommand(45, 'wire-typed-restart-later', 'force-restart', {}),
+    ];
+    first.client.batches.unshift(batch);
+    first.client.getMessages = vi.fn(async limit => {
+      const consumed = batch.slice(0, limit).map((item, index) => historyMessage(item, index + 1));
+      for (const message of consumed) first.client.history.set(message.wire_id, message);
+      const payload = JSON.parse(consumed[0].body) as { command: string; arguments: unknown };
+      const command = first.client.commands.find(entry => entry.name === payload.command)!;
+      await command.handler(payload.arguments, {
+        sender_cid: consumed[0].from.id, sender_name: consumed[0].from.name,
+        request_wire_id: consumed[0].wire_id,
+      });
+      throw new Error('simulated process termination before the second SDK handler');
+    });
+    await (first.channel as unknown as { registerTypedCommands(): Promise<void> })
+      .registerTypedCommands();
+    await expect(first.channel.drain()).rejects.toThrow(/simulated process termination/);
+    expect(firstFleet.restart).toHaveBeenCalledTimes(1);
+    expect(firstFleet.restart).toHaveBeenCalledWith('keep');
+
+    const recoveredClient = new FakeClient();
+    recoveredClient.history = new Map(first.client.history);
+    const recoveredFleet = fakeFleet();
+    const recovered = setup([], undefined, {
+      stateDir: first.dir, client: recoveredClient, fleet: recoveredFleet,
+    });
+    await recovered.channel.drain();
+    expect(recoveredFleet.restart).toHaveBeenCalledTimes(1);
+    expect(recoveredFleet.restart).toHaveBeenCalledWith('fresh');
+    expect(firstFleet.restart).toHaveBeenCalledTimes(1);
+    expect(recoveredClient.calls.filter(call => call.name === 'sendMessage'))
+      .toHaveLength(1);
+    expect(new MessageRecoveryState(join(first.dir, '.owner-channel-message-recovery.json')).list())
+      .toEqual([]);
+  });
+
+  it('denies unauthorized typed callers before dispatching effects', async () => {
+    const fleet = fakeFleet();
+    const { channel, client, queuePrompt } = setup([
+      typedOwnerCommand(45, 'wire-typed-intruder', 'force-restart', {}, 'E'.repeat(64)),
+    ], undefined, { fleet });
+    await channel.start();
+    await channel.drain();
+    await vi.waitFor(() => expect(client.typedResults).toEqual(['handler_failed']));
+    expect(fleet.restart).not.toHaveBeenCalled();
+    expect(queuePrompt).not.toHaveBeenCalled();
+    const sends = client.calls.filter(call => call.name === 'sendMessage')
+      .map(call => call.args as { contact?: string; text?: string });
+    expect(sends.every(send => send.contact === OWNER_CID)).toBe(true);
+    expect(sends.some(send => String(send.text).includes('rejected a message from unauthorized sender CID')))
+      .toBe(true);
+    await channel.close();
   });
 
   it('sends HTML reports only to the authenticated owner and removes the private temp tree on success and failure', async () => {

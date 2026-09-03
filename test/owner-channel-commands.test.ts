@@ -5,6 +5,7 @@ import { join } from 'node:path';
 
 import {
   dispatchOwnerCommand, isOwnerCommandText, ownerCommandHelp, ownerCommands,
+  ownerTypedCommandCatalog, ownerTypedCommandText,
   type OwnerCommandContext,
 } from '../src/owner-channel/commands.js';
 import {
@@ -177,6 +178,28 @@ function context(overrides: Partial<OwnerCommandContext> = {}): OwnerCommandCont
 }
 
 describe('owner command registry', () => {
+  it('derives one typed catalog entry per primary slash command and keeps aliases slash-only', () => {
+    const catalog = ownerTypedCommandCatalog();
+    expect(catalog.map(command => command.name)).toEqual(ownerCommands.map(command => command.name));
+    expect(new Set(catalog.map(command => command.name)).size).toBe(catalog.length);
+    expect(catalog.some(command => command.name === 'commands')).toBe(false);
+    expect(catalog.some(command => command.name === 'template-list')).toBe(false);
+    expect(catalog.find(command => command.name === 'status')?.input_schema)
+      .toEqual({ type: 'object', properties: {} });
+    expect(catalog.find(command => command.name === 'model')?.input_schema)
+      .toMatchObject({ required: ['arguments'] });
+  });
+
+  it('maps typed arguments back to the exact primary slash input', () => {
+    expect(ownerTypedCommandText('status', {})).toBe('/status');
+    expect(ownerTypedCommandText('model', { arguments: '  claude-sonnet-5  ' }))
+      .toBe('/model claude-sonnet-5');
+    expect(ownerTypedCommandText('task', { arguments: 'create Demo\nLong brief' }))
+      .toBe('/task create Demo\nLong brief');
+    expect(() => ownerTypedCommandText('status', { arguments: 1 })).toThrow(/must be text/);
+    expect(() => ownerTypedCommandText('status', { unexpected: true })).toThrow(/unknown field/);
+  });
+
   it('recognizes only trimmed slash-prefixed text as a command attempt', () => {
     expect(isOwnerCommandText('/help')).toBe(true);
     expect(isOwnerCommandText('  /help  ')).toBe(true);

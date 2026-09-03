@@ -14,6 +14,8 @@ export function historyMessage(value: unknown, defaultSeq = 1): OursHistoryMessa
     from: { id: String(from.id ?? ''), name: String(from.name ?? '') },
     peer: { id: String(from.id ?? ''), name: String(from.name ?? '') },
     direction: 'in', text, body: text, occurred_at_ms: Number(row.occurred_at_ms ?? seq), date,
+    message_kind: row.message_kind === 'command' || row.message_kind === 'command_result'
+      ? row.message_kind : 'text',
     encryption: 'e2e', transport: 'double_ratchet', inbox_state: 'read', status: 'read',
     delivery_state: null, human_read_at_ms: null,
     reply_to: (row.reply_to ?? null) as OursHistoryMessage['reply_to'],
@@ -25,6 +27,7 @@ export function incomingMessage(value: unknown, defaultSeq = 1): OursIncomingMes
   const item = historyMessage(value, defaultSeq);
   return {
     seq: item.seq, msg_id: item.msg_id, wire_id: item.wire_id, from: item.from,
+    message_kind: item.message_kind,
     occurred_at_ms: item.occurred_at_ms, date: item.date, encryption: item.encryption,
     inbox_state: 'unread', status: 'unread', reply_to: item.reply_to,
   };

@@ -400,11 +400,13 @@ export function daemonIdentityProvisioner(
       const before = await client.listIdentities();
       const existing = before.find(identity => identity.name === name);
       if (existing) {
+        if (!('kind' in existing))
+          throw new Error(`identity '${name}' is quarantined; refusing to replace it`);
         if (existing.temp)
           throw new Error(`identity '${name}' exists but is temporary; refusing to convert or adopt it`);
         return; // another reconciler won the create race
       }
-      if (!before.some(identity => identity.kind === 'root'))
+      if (!before.some(identity => 'kind' in identity && identity.kind === 'root'))
         throw new Error(
           `cannot create role identity '${name}': this host has no Human identity; run ours onboarding first`);
 
@@ -422,7 +424,7 @@ export function daemonIdentityProvisioner(
         // accept only the compatible permanent identity now visible.
         const after = await client.listIdentities();
         const raced = after.find(identity => identity.name === name);
-        if (!raced || raced.temp) throw error;
+        if (!raced || !('kind' in raced) || raced.temp) throw error;
       }
       if (createdHere && profile.persona && client.setPersona)
         await client.setPersona({ persona: profile.persona });

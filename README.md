@@ -78,8 +78,7 @@ The state dir contract:
 
 | What | Why | Install |
 |---|---|---|
-| Node ≥ 20 | runs `ours-fleet` itself | nodejs.org, `apt`, or `brew` |
-| Node ≥ 22 | Claude roles using `session: acp` | required by the maintained Claude ACP adapter |
+| Node ≥ 22 | runs `ours-fleet` and its maintained adapters | nodejs.org, `apt`, or `brew` |
 | a harness CLI, logged in | the agent itself | e.g. Claude Code (`claude`) or Codex CLI (`codex`) |
 | `ours` CLI + shared daemon | identity + agent-to-agent messaging | `npm i -g @ours.network/cli && ours daemon start` |
 
@@ -99,8 +98,8 @@ Native Codex roles use the logged-in Codex CLI's `app-server` command directly.
 The maintained Codex and Claude ACP adapters remain bundled optional dependencies
 and are resolved internally; users do not install adapter commands or add them to
 `PATH`. Explicit `session_options.codex_app_server.command` and
-`session_options.acp.command` overrides remain available. On Node 20–21, native
-Codex and Codex ACP remain available, while maintained Claude ACP requires Node 22.
+`session_options.acp.command` overrides remain available. ours-fleet and its
+maintained adapters require Node 22 or newer.
 
 Each OS user manages their own fleet — to host roles under a sandboxed account,
 become that account and repeat.
@@ -1059,6 +1058,15 @@ text instead of being forwarded; messages without a leading `/` reach the agent
 unchanged. The registry in `src/owner-channel/commands.ts` is the single source
 of truth — `/help` renders exactly that table, so adding an entry there is the
 whole registration step for a new command.
+
+The supervisor also advertises every primary registry entry through ours typed
+commands. The menu's `arguments` field is converted back to the exact text after
+the slash command name and enters the same dispatcher, so validation, replies,
+lifecycle effects, and audit behavior stay identical. Aliases remain available
+as slash commands but are not duplicated in the typed menu. Typed handlers
+re-check the authenticated sender CID against the live Owner boundary before
+dispatch; the SDK completion result is `null` because the existing correlated
+owner-channel reply remains the command result.
 
 | Command | Effect |
 | --- | --- |
