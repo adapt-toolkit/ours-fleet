@@ -7,6 +7,8 @@ import { SessionControlError } from '../session/types.js';
 
 /** Lifecycle-only return path for a trusted worker; never authorizes a fresh Fleet attempt. */
 export const FLEET_WORKER_LIFECYCLE_STATE_DIR_ENV = 'OURS_FLEET_WORKER_LIFECYCLE_STATE_DIR';
+const LIFECYCLE_ACCEPT_TIMEOUT_MS = 10 * 60_000;
+const LIFECYCLE_RETRY_MS = 250;
 
 export function fleetWorkerEnv(source: NodeJS.ProcessEnv = process.env): Record<string, string> {
   const inheritedKeys = [
@@ -28,14 +30,30 @@ export function fleetWorkerEnv(source: NodeJS.ProcessEnv = process.env): Record<
 /** Present a detached worker's durable outcome through the authenticated Owner sink. */
 export async function presentFleetWorkerLifecycle(
   presentations: FleetAuditPresentation[],
+  deps: { now(): number; sleep(ms: number): Promise<void> } = {
+    now: Date.now, sleep: ms => new Promise(resolve => setTimeout(resolve, ms)),
+  },
 ): Promise<void> {
   const stateDir = process.env[FLEET_WORKER_LIFECYCLE_STATE_DIR_ENV];
   if (!stateDir || !presentations.length) return;
-  const response = await controlRequest(stateDir, {
-    command: 'fleet_audit_present', audit: { presentations },
-  });
-  if (!response.ok) throw new SessionControlError(
-    response.kind ?? 'backend', response.error ?? 'detached Fleet lifecycle delivery failed');
+  const deadline = deps.now() + LIFECYCLE_ACCEPT_TIMEOUT_MS;
+  for (;;) {
+    try {
+      const response = await controlRequest(stateDir, {
+        command: 'fleet_audit_present', audit: { presentations },
+      }, 15_000);
+      if (!response.ok) throw new SessionControlError(
+        response.kind ?? 'backend', response.error ?? 'detached Fleet lifecycle delivery failed');
+      return;
+    } catch (error) {
+      // Missing token/socket and refused connect are classified before any
+      // request can cross the server boundary, so only this class is safe to
+      // retry. Timeout/backend/response failures may be uncertain and stop.
+      if (!(error instanceof SessionControlError)
+          || error.kind !== 'control-unavailable' || deps.now() >= deadline) throw error;
+      await deps.sleep(LIFECYCLE_RETRY_MS);
+    }
+  }
 }
 
 /** Launch a Fleet CLI operation outside the caller's supervisor/session lifecycle. */
