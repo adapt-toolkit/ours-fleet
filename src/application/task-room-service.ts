@@ -24,7 +24,7 @@ import { hashTemplate, listTemplates, resolveTemplate, sealTemplateSnapshot, sna
 import { acquireLaunchSnapshotLock, releaseLaunchSnapshot } from '../rooms-tasks/launch-snapshot.js';
 import { hashMemberOverrides, prepareExecutionPlan, type MemberOverrides } from '../rooms-tasks/member-overrides.js';
 import {
-  checkpointFleetAuditPresentations, recordFleetAuditPresentation,
+  checkpointFleetAuditPresentations, recordFleetAuditPresentation, recordFleetAuditResource,
 } from '../fleet-command-audit.js';
 import {
   acceptManagedRoomClose, deleteLegacyClosedRooms, deleteManagedRoom, recordManagedRoomCloseError,
@@ -76,6 +76,44 @@ export interface TaskProvisioningOutcome {
   members: { expected: number; active: number; launched: number };
   blocker?: string;
   next_action?: string;
+}
+
+function recordCanonicalRoomCreated(room: RoomOrchestrationRecord): void {
+  recordFleetAuditPresentation({ kind: 'room', operation: 'create',
+    eventId: `room-created:${room.created_at}`, id: room.room_id,
+    name: room.room_name, previousState: 'none', newState: 'provisioning',
+    revision: room.created_at, taskId: room.task_id,
+    template: room.template_snapshot
+      ? `${room.template_snapshot.name}@${room.template_snapshot.version}` : undefined,
+    anonymous: storedRoomLaunchPolicy(room.room_policy).anonymous,
+    memberCount: room.template_snapshot?.members.reduce((sum, member) => sum + member.count, 0) ?? 0,
+    participants: [] });
+}
+
+/** Repairable terminal observation derived entirely from durable Task/Room state. */
+export function recordTaskProvisioningOutcome(outcome: TaskProvisioningOutcome): void {
+  const room = outcome.room;
+  recordFleetAuditResource('task', outcome.task.task_id);
+  if (room) {
+    recordFleetAuditResource('room', room.room_id);
+    // Always restate created before a later terminal transition. The stable
+    // digest makes this a no-op when the original checkpoint was delivered,
+    // and repairs a crash after Room persistence but before that checkpoint.
+    recordCanonicalRoomCreated(room);
+  }
+  if (outcome.kind === 'ready' && room) recordFleetAuditPresentation({
+    kind: 'room', operation: 'activate', eventId: `room-ready:${room.activated_at ?? room.created_at}`,
+    id: room.room_id, name: room.room_name, previousState: 'provisioning', newState: 'active',
+    revision: room.activated_at ?? room.created_at, taskId: room.task_id,
+    template: outcome.launch.template, anonymous: outcome.launch.anonymous,
+    memberCount: outcome.members.expected, ownerAttached: outcome.launch.owner_attached,
+    participants: [],
+  });
+  if (outcome.kind === 'failed') recordFleetAuditPresentation({
+    kind: 'lifecycle_failure', resource: 'Task', id: outcome.task.task_id,
+    state: outcome.task.state, category: 'provision_failed',
+    eventId: outcome.task.ended_at ?? room?.created_at ?? outcome.task.created_at,
+  });
 }
 export type TaskRecoveryBegin =
   | { kind: 'terminal_worker_required'; taskId: string }
@@ -348,23 +386,6 @@ export class TaskRoomApplicationService {
     };
   }
 
-  private recordTaskProvisioningOutcome(outcome: TaskProvisioningOutcome): void {
-    const room = outcome.room;
-    if (outcome.kind === 'ready' && room) recordFleetAuditPresentation({
-      kind: 'room', operation: 'activate', eventId: `room-ready:${room.activated_at ?? room.created_at}`,
-      id: room.room_id, name: room.room_name, previousState: 'provisioning', newState: 'active',
-      revision: room.activated_at ?? room.created_at, taskId: room.task_id,
-      template: outcome.launch.template, anonymous: outcome.launch.anonymous,
-      memberCount: outcome.members.expected, ownerAttached: outcome.launch.owner_attached,
-      participants: [],
-    });
-    if (outcome.kind === 'failed') recordFleetAuditPresentation({
-      kind: 'lifecycle_failure', resource: 'Task', id: outcome.task.task_id,
-      state: outcome.task.state, category: 'provision_failed',
-      eventId: outcome.task.ended_at ?? room?.created_at ?? outcome.task.created_at,
-    });
-  }
-
   async awaitTaskProvisioning(input: {
     actor: TaskRoomActor; taskId: string; waitMs?: number;
   }): Promise<TaskProvisioningOutcome> {
@@ -374,7 +395,7 @@ export class TaskRoomApplicationService {
     for (;;) {
       const outcome = this.taskProvisioningOutcome(input.taskId);
       if (outcome.kind !== 'in_progress' || now() >= deadline) {
-        this.recordTaskProvisioningOutcome(outcome);
+        recordTaskProvisioningOutcome(outcome);
         return outcome;
       }
       await sleep(100);
@@ -1055,14 +1076,7 @@ export class TaskRoomApplicationService {
       throw error;
     }
     unlockSnapshot?.();
-    recordFleetAuditPresentation({ kind: 'room', operation: 'create',
-      eventId: `room-created:${room.created_at}`, id: room.room_id,
-      name: room.room_name, previousState: 'none', newState: 'provisioning',
-      revision: room.created_at, taskId: room.task_id,
-      template: room.template_snapshot ? `${room.template_snapshot.name}@${room.template_snapshot.version}` : undefined,
-      anonymous: policy.anonymous, memberCount: launchTemplate?.members.reduce((sum, member) => sum + member.count, 0) ?? 0,
-      ownerAttached: attachOwner,
-      participants: [] });
+    recordCanonicalRoomCreated(room);
     // The created notice is observable while member admission is still in
     // progress; it is not delayed behind task-start command completion.
     await checkpointFleetAuditPresentations();

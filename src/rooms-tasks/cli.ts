@@ -1,6 +1,7 @@
 import type { Command } from 'commander';
 import { readFileSync } from 'node:fs';
 import { createHash } from 'node:crypto';
+import { join } from 'node:path';
 import { loadConfig, type FleetConfig, ConfigError, findRole } from '../config.js';
 import { provisionMembers, getBinPath } from './provision.js';
 import {
@@ -9,9 +10,8 @@ import {
 } from './close.js';
 import { launchFleetWorker } from './external-worker.js';
 import {
-  resolveTemplate, listTemplates, sealTemplateSnapshot, snapshotTemplate, hashTemplate,
+  resolveTemplate, listTemplates, snapshotTemplate, hashTemplate,
 } from './templates.js';
-import { acquireLaunchSnapshotLock, releaseLaunchSnapshot } from './launch-snapshot.js';
 import { parseGroupedMemberArgs, readMembersFile, type MemberOverrides } from './member-overrides.js';
 
 const MEMBER_ARG_FLAGS = new Set([
@@ -46,11 +46,9 @@ import {
   updateTaskRoom, updateTaskTemplate, updateTaskMembers, failTask, TaskStateError,
 } from './task-state.js';
 import {
-  createRoomRecord, getRoomRecord, listRoomRecords,
-  advanceSaga, setOwnerSeat,
-  setSagaError, activateRoom, updateMemberSeats, RoomStateError,
+  getRoomRecord, listRoomRecords, updateMemberSeats, RoomStateError,
 } from './room-state.js';
-import { createCoworkAdapter, CoworkProtocolError, CoworkUnavailableError } from './cowork-adapter.js';
+import { createCoworkAdapter, CoworkUnavailableError } from './cowork-adapter.js';
 import { TASK_CANCELLABLE_STATES, TASK_TERMINAL_STATES } from './types.js';
 import type { RoomOrchestrationRecord, TaskOrigin, TemplateDefinition, TemplateSnapshot } from './types.js';
 import {
@@ -58,13 +56,16 @@ import {
   renderMarkdownResult, roomStatus, taskStatus,
 } from './markdown.js';
 import {
-  TaskRoomApplicationError, TaskRoomApplicationService, type TaskProvisioningOutcome,
+  recordTaskProvisioningOutcome, TaskRoomApplicationError, TaskRoomApplicationService,
+  type TaskProvisioningOutcome,
 } from '../application/task-room-service.js';
 import { TaskListError } from './task-lists.js';
 import {
   recordFleetAuditFailure, recordFleetAuditPresentation, recordFleetAuditResource,
 } from '../fleet-command-audit.js';
 import { renderAgentConfiguration, type AgentLaunchConfiguration } from '../lifecycle-summary.js';
+import { withFileLock } from '../atomic-file.js';
+import { stateRoot } from '../paths.js';
 
 type TaskRoomPublicErrorCode =
   | 'task_confirmation_mismatch' | 'room_confirmation_mismatch'
@@ -305,8 +306,9 @@ function provisioningMarkdown(outcome: TaskProvisioningOutcome): string {
     action: outcome.next_action ?? `Run ours-fleet task recover ${outcome.task.task_id}.`,
   });
   return renderMarkdownResult({
-    icon: outcome.kind === 'ready' ? '✅' : '⏳',
-    title: outcome.kind === 'ready' ? 'Room provisioning complete' : 'Room provisioning continues',
+    icon: outcome.kind === 'ready' ? '✅' : outcome.next_action ? '⚠️' : '⏳',
+    title: outcome.kind === 'ready' ? 'Room provisioning complete'
+      : outcome.next_action ? 'Room provisioning needs attention' : 'Room provisioning continues',
     fields: [
       { label: 'Task', value: `${outcome.task.task_id} — ${outcome.task.title}` },
       ...(room ? [{ label: 'Room', value: `${room.room_id} — ${room.room_name}` }] : []),
@@ -322,28 +324,12 @@ function provisioningMarkdown(outcome: TaskProvisioningOutcome): string {
   });
 }
 
-function auditProvisioningOutcome(outcome: TaskProvisioningOutcome): void {
-  const room = outcome.room;
-  recordFleetAuditResource('task', outcome.task.task_id);
-  if (room) recordFleetAuditResource('room', room.room_id);
-  if (outcome.kind === 'ready' && room) recordFleetAuditPresentation({
-    kind: 'room', operation: 'activate', eventId: `room-ready:${room.activated_at ?? room.created_at}`,
-    id: room.room_id, name: room.room_name, previousState: 'provisioning', newState: 'active',
-    revision: room.activated_at ?? room.created_at, taskId: room.task_id,
-    template: outcome.launch.template, anonymous: outcome.launch.anonymous,
-    memberCount: outcome.members.expected, ownerAttached: outcome.launch.owner_attached,
-    participants: [],
-  });
-  if (outcome.kind === 'failed') recordFleetAuditPresentation({
-    kind: 'lifecycle_failure', resource: 'Task', id: outcome.task.task_id,
-    state: outcome.task.state, category: 'provision_failed',
-    eventId: outcome.task.ended_at ?? outcome.room?.created_at ?? outcome.task.created_at,
-  });
-}
-
 async function continueProvisioningInBackground(taskId: string, configPath?: string): Promise<void> {
   await launchFleetWorker(['task', '_provision', taskId], `task-provision-${taskId}`, configPath);
 }
+
+const taskProvisioningWorkerLockPath = (taskId: string): string =>
+  join(stateRoot(), 'locks', 'task-provisioning-worker', encodeURIComponent(taskId));
 
 /**
  * Shared launch-configuration line for CLI member listings. Pre-upgrade seats
@@ -637,108 +623,6 @@ function roomStartupSections(
   return sections;
 }
 
-async function provisionRoom(cfg: FleetConfig, input: {
-  name: string;
-  goal?: string;
-  brief?: string;
-  template?: TemplateSnapshot;
-  taskId?: string;
-  onCreated?: (room: RoomOrchestrationRecord) => void;
-}): Promise<RoomOrchestrationRecord> {
-  const rooms = cfg.rooms;
-  if (!rooms) throw new ConfigError('rooms: configuration is required');
-  const attachOwner = rooms.defaults?.attach_owner !== false;
-  if (attachOwner && !cfg.ownerInvite)
-    throw new ConfigError('rooms.owner: public_invite or public_invite_file is required when attach_owner is enabled');
-  const cowork = coworkFor(cfg);
-  const goal = input.goal?.trim() || input.name;
-  const unlockSnapshot = input.template ? acquireLaunchSnapshotLock() : undefined;
-  let launchTemplate: TemplateSnapshot | undefined;
-  let record: RoomOrchestrationRecord;
-  try {
-    launchTemplate = input.template
-      ? sealTemplateSnapshot(input.template, cfg.agentTemplates ?? {}) : undefined;
-    const briefing = input.brief?.trim() || launchTemplate?.contract?.trim() || goal;
-    const created = await cowork.createRoom({
-    room_name: input.name,
-    goal,
-    briefing,
-    quiet_membership: launchTemplate?.room?.quiet_membership,
-    anonymous: launchTemplate?.room?.anonymous,
-  });
-    record = createRoomRecord({
-    room_id: created.room_id,
-    room_name: input.name,
-    room_identity_cid: created.identity_cid,
-    task_id: input.taskId,
-    template_snapshot: launchTemplate,
-  });
-    input.onCreated?.(record);
-  } catch (error) {
-    unlockSnapshot?.();
-    if (launchTemplate?.launch_snapshot_hash) releaseLaunchSnapshot(launchTemplate.launch_snapshot_hash);
-    throw error;
-  }
-  unlockSnapshot?.();
-  record = advanceSaga(record.room_id, 'create_room', 1);
-
-  if (attachOwner) {
-    try {
-      record = advanceSaga(record.room_id, 'attach_owner', 2);
-      const accepted = await cowork.acceptInvite(record.room_id, cfg.ownerInvite!, {
-        role: rooms.owner.role,
-        expected_cid: rooms.owner.expected_cid,
-      });
-      record = setOwnerSeat(
-        record.room_id,
-        accepted.seat_cid,
-        cfg.ownerInviteFingerprint ?? '',
-      );
-    } catch (error) {
-      const mismatch = error instanceof CoworkProtocolError && /CID|expected/i.test(error.message);
-      setSagaError(
-        record.room_id,
-        error instanceof Error ? error.message : String(error),
-        mismatch
-          ? 'Verify rooms.owner.expected_cid and rotate the configured invite if necessary.'
-          : 'Rotate rooms.owner.public_invite or public_invite_file, then run room recover.',
-        mismatch ? 'owner_cid_mismatch' : 'waiting_owner_invite',
-      );
-      const failed = getRoomRecord(record.room_id);
-      if (failed) recordFleetAuditPresentation({ kind: 'lifecycle_failure', resource: 'Room',
-        id: failed.room_id, state: failed.state, category: 'provision_failed',
-        eventId: `${failed.created_at}:${failed.saga.phase}:${failed.saga.step_index}` });
-      throw error;
-    }
-  }
-  record = advanceSaga(record.room_id, 'create_members', 3);
-
-  if (launchTemplate && launchTemplate.members.length > 0) {
-    try {
-      record = await provisionMembers({
-        cfg,
-        cowork,
-        roomId: record.room_id,
-        taskId: input.taskId,
-        template: launchTemplate,
-        binPath: getBinPath(),
-        brief: input.brief,
-        goal: input.goal,
-      });
-    } catch (error) {
-      const failed = getRoomRecord(record.room_id);
-      if (failed) recordFleetAuditPresentation({ kind: 'lifecycle_failure', resource: 'Room',
-        id: failed.room_id, state: failed.state, category: 'provision_failed',
-        eventId: `${failed.created_at}:${failed.saga.phase}:${failed.saga.step_index}` });
-      throw error;
-    }
-  } else {
-    record = activateRoom(record.room_id);
-    if (input.taskId) activateTask(input.taskId);
-  }
-  return record;
-}
-
 export function registerTemplateCommands(parent: Command, cOpt: (cmd: Command) => Command): void {
   const templateCmd = parent.command('template').description('room template operations');
 
@@ -852,9 +736,9 @@ export function registerTaskCommands(parent: Command, cOpt: (cmd: Command) => Co
 
         const provisioning = !opts.backlog && opts.room !== false && record.room_id
           ? service.taskProvisioningOutcome(record.task_id) : undefined;
-        if (provisioning?.kind === 'in_progress')
+        if (provisioning?.kind === 'in_progress' && !provisioning.next_action)
           await continueProvisioningInBackground(record.task_id, opts.configuration);
-        if (provisioning) auditProvisioningOutcome(provisioning);
+        if (provisioning) recordTaskProvisioningOutcome(provisioning);
         if (opts.json) {
           console.log(JSON.stringify({ schema_version: 1, task: record,
             ...(provisioning ? { provisioning } : {}) }, null, 2));
@@ -1026,9 +910,9 @@ export function registerTaskCommands(parent: Command, cOpt: (cmd: Command) => Co
           anonymous: cliAnonymousOverride(commandArgv(command)),
         });
         const provisioning = service.taskProvisioningOutcome(t.task_id);
-        if (provisioning.kind === 'in_progress')
+        if (provisioning.kind === 'in_progress' && !provisioning.next_action)
           await continueProvisioningInBackground(t.task_id, opts.configuration);
-        auditProvisioningOutcome(provisioning);
+        recordTaskProvisioningOutcome(provisioning);
         if (opts.json) {
           console.log(JSON.stringify({ schema_version: 1, task: t, provisioning }, null, 2)); return;
         }
@@ -1052,10 +936,14 @@ export function registerTaskCommands(parent: Command, cOpt: (cmd: Command) => Co
         const waitMs = Number(opts.waitMs);
         if (!Number.isSafeInteger(waitMs) || waitMs < 0 || waitMs > 600_000)
           throw new Error('--wait-ms must be an integer from 0 to 600000');
-        const outcome = await taskRoomService(opts.configuration).awaitTaskProvisioning({
+        const service = taskRoomService(opts.configuration);
+        const initial = service.taskProvisioningOutcome(id);
+        if (initial.kind === 'in_progress' && !initial.next_action)
+          await continueProvisioningInBackground(id, opts.configuration);
+        const outcome = await service.awaitTaskProvisioning({
           actor: { kind: 'local_control', surface: 'cli' }, taskId: id, waitMs,
         });
-        auditProvisioningOutcome(outcome);
+        recordTaskProvisioningOutcome(outcome);
         if (opts.json) {
           console.log(JSON.stringify({ schema_version: 1, provisioning: outcome }, null, 2)); return;
         }
@@ -1256,7 +1144,7 @@ export function registerTaskCommands(parent: Command, cOpt: (cmd: Command) => Co
         const t = recovered.task;
         const room = recovered.room;
         if (previous === 'provisioning' && t.state === 'active' && room?.state === 'active')
-          auditProvisioningOutcome(app.taskProvisioningOutcome(t.task_id));
+          recordTaskProvisioningOutcome(app.taskProvisioningOutcome(t.task_id));
         else auditTask('recover', t, previous);
         const recoveryActions = recovered.issues.map(issue => {
           if (issue.code === 'terminal_pending') return `Terminal intent remains pending — retry task recover ${id}`;
@@ -1320,9 +1208,19 @@ export function registerTaskCommands(parent: Command, cOpt: (cmd: Command) => Co
     .option('--json', 'JSON output')
     .action(async (id: string, opts: { configuration?: string; json?: boolean }) => {
       try {
-        await taskRoomService(opts.configuration).ensureTaskWork({
-          actor: { kind: 'internal_worker', surface: 'cli' }, taskId: id,
-        });
+        await withFileLock(taskProvisioningWorkerLockPath(id), async () => {
+          const app = taskRoomService(opts.configuration);
+          for (;;) {
+            const before = app.taskProvisioningOutcome(id);
+            if (before.kind !== 'in_progress' || before.next_action) return;
+            await app.ensureTaskWork({
+              actor: { kind: 'internal_worker', surface: 'cli' }, taskId: id,
+            });
+            const outcome = app.taskProvisioningOutcome(id);
+            if (outcome.kind !== 'in_progress' || outcome.next_action) return;
+            await sleep(1_000);
+          }
+        }, {}, 10 * 60_000);
       } catch (e) { if (opts.json) die(e); dieTaskRoom(e); }
     });
 

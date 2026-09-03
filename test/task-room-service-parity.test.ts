@@ -161,7 +161,7 @@ describe('task create/start surface parity', () => {
     expect(events.filter(event => event.kind === 'room' && event.operation === 'activate')).toEqual([]);
     expect(events.filter(event => event.kind === 'task' && event.operation === 'work')).toEqual([]);
     expect(events).toEqual([expect.objectContaining({
-      kind: 'room', operation: 'create', memberCount: 1, ownerAttached: false,
+      kind: 'room', operation: 'create', memberCount: 1,
     })]);
   });
 
@@ -183,20 +183,27 @@ describe('task create/start surface parity', () => {
     expect(failures).toEqual([]);
   });
 
-  it('emits the canonical ready notice when awaiting an already-converged operation', async () => {
+  it('repairs created before ready after a crash between durable Room linkage and notification', async () => {
     const h = cowork();
     const app = service(h.adapter);
-    beginFleetAuditCollection();
-    const task = await app.createTask({ actor: { kind: 'local_control', surface: 'cli' },
-      title: 'Await convergence', template: 'empty-team', origin: { type: 'cli' } });
-    consumeFleetAuditCollection();
+    const template = snapshotTemplate(definition, config().agentTemplates);
+    const task = createTask({ title: 'Crash window', origin: { type: 'cli' }, start: true,
+      template: { name: template.name, version: template.version, content_hash: template.content_hash } });
+    const room = createRoomRecord({ room_id: 'room-after-crash', room_name: 'Crash window',
+      room_identity_cid: 'room-cid', task_id: task.task_id, template_snapshot: template,
+      room_policy: { anonymous: false } });
+    updateTaskRoom(task.task_id, room.room_id, 'room-cid');
+    activateRoom(room.room_id);
+    activateTask(task.task_id);
 
     beginFleetAuditCollection();
     await expect(app.awaitTaskProvisioning({ actor: { kind: 'authenticated_owner',
       surface: 'messenger', cid: 'owner' }, taskId: task.task_id, waitMs: 0 }))
       .resolves.toMatchObject({ kind: 'ready' });
     expect(consumeFleetAuditCollection().presentations).toEqual([
-      expect.objectContaining({ kind: 'room', operation: 'activate', id: task.room_id,
+      expect.objectContaining({ kind: 'room', operation: 'create', id: room.room_id,
+        eventId: expect.stringMatching(/^room-created:/) }),
+      expect.objectContaining({ kind: 'room', operation: 'activate', id: room.room_id,
         eventId: expect.stringMatching(/^room-ready:/) }),
     ]);
   });

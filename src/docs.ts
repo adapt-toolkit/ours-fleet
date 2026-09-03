@@ -414,7 +414,9 @@ command result carries the exact blocker and canonical recovery action.
 they return an explicit \`in_progress\` result with the stable
 \`ours-fleet task await <id>\` handle and start a safe continuation. \`task await\`
 waits on that same durable operation and returns \`ready\`, \`in_progress\`, or
-\`failed\` in both human and \`--json\` forms; timeout is not failure.
+\`failed\` in both human and \`--json\` forms; timeout is not failure. The detached
+continuation is serialized per task and remains alive until convergence or an
+Owner-action blocker; invoking \`task await\` safely re-arms it after a restart.
 
 Set \`room.anonymous: true\` on a room template, or pass \`--anonymous\` to
 \`task create\`, \`task start\`, \`task work\`, or \`room create\`, to create an

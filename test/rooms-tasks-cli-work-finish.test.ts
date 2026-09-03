@@ -544,6 +544,28 @@ describe('task provisioning command outcomes', () => {
     expect(payload.provisioning.handle.command).toBe(`ours-fleet task await ${task.task_id}`);
     expect(mocks.launchFleetWorker).toHaveBeenCalledWith(
       ['task', '_provision', task.task_id], `task-provision-${task.task_id}`, cfgPath);
+
+    mocks.launchFleetWorker.mockClear();
+    out = [];
+    await run('await', task.task_id, '--wait-ms', '0', '--json');
+    expect(JSON.parse(out.join('\n')).provisioning.kind).toBe('in_progress');
+    expect(mocks.launchFleetWorker).toHaveBeenCalledWith(
+      ['task', '_provision', task.task_id], `task-provision-${task.task_id}`, cfgPath);
+  });
+
+  it('keeps the detached continuation alive until a seat converges after its first attempt', async () => {
+    writeCustomTemplate();
+    const task = createTask({ title: 'Late seat', origin: { type: 'cli' }, start: false });
+    const pending = async ({ roomId }: { roomId: string }) => getRoomRecord(roomId)!;
+    mocks.provisionMembers.mockImplementationOnce(pending).mockImplementationOnce(pending);
+    await run('start', task.task_id, '--template', 'durable', '--json');
+    expect(JSON.parse(out.join('\n')).provisioning.kind).toBe('in_progress');
+
+    out = [];
+    await run('_provision', task.task_id);
+    expect(getTask(task.task_id).state).toBe('active');
+    expect(getRoomRecord(ROOM_ID)?.state).toBe('active');
+    expect(mocks.provisionMembers).toHaveBeenCalledTimes(3);
   });
 
   it('returns compact human and JSON ready outcomes', async () => {

@@ -1451,9 +1451,11 @@ export class OwnerChannel implements OwnerChannelHandle {
           ...input,
           actor: { kind: 'authenticated_owner', surface: 'messenger', cid: sender.id },
         });
-        if (!input.backlog && !input.noRoom && task.room_id
-            && service.taskProvisioningOutcome(task.task_id).kind === 'in_progress')
-          await this.fleetOps.recoverTask(task.task_id);
+        if (!input.backlog && !input.noRoom && task.room_id) {
+          const outcome = service.taskProvisioningOutcome(task.task_id);
+          if (outcome.kind === 'in_progress' && !outcome.next_action)
+            await this.fleetOps.recoverTask(task.task_id);
+        }
         return task;
       }),
       startTask: taskId => provisioningCommand(async () => {
@@ -1467,13 +1469,19 @@ export class OwnerChannel implements OwnerChannelHandle {
           actor: { kind: 'authenticated_owner', surface: 'messenger', cid: sender.id },
           taskId: task.task_id, waitMs: 0,
         });
-        if (outcome.kind === 'in_progress') await this.fleetOps.recoverTask(task.task_id);
+        if (outcome.kind === 'in_progress' && !outcome.next_action)
+          await this.fleetOps.recoverTask(task.task_id);
         return outcome;
       }),
-      awaitTask: taskId => provisioningCommand(() =>
-        new TaskRoomApplicationService(this.options.configPath).awaitTaskProvisioning({
+      awaitTask: taskId => provisioningCommand(async () => {
+        const service = new TaskRoomApplicationService(this.options.configPath);
+        const initial = service.taskProvisioningOutcome(taskId);
+        if (initial.kind === 'in_progress' && !initial.next_action)
+          await this.fleetOps.recoverTask(taskId);
+        return service.awaitTaskProvisioning({
           actor: { kind: 'authenticated_owner', surface: 'messenger', cid: sender.id }, taskId,
-        })),
+        });
+      }),
       taskProvisioningOutcome: taskId =>
         new TaskRoomApplicationService(this.options.configPath).taskProvisioningOutcome(taskId),
       listTasks: filter => new TaskRoomApplicationService(this.options.configPath).listTasks(filter),

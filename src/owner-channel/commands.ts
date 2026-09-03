@@ -232,7 +232,8 @@ const taskProvisioningAction = (outcome: TaskProvisioningOutcome): string => {
     detail: outcome.blocker ?? 'Provisioning reached a terminal failure.',
     action: outcome.next_action ?? `Run /task recover ${outcome.task.task_id}.`,
   });
-  return taskAction(outcome.kind === 'ready' ? 'Room provisioning complete' : 'Room provisioning continues',
+  return taskAction(outcome.kind === 'ready' ? 'Room provisioning complete'
+    : outcome.next_action ? 'Room provisioning needs attention' : 'Room provisioning continues',
     outcome.task, [
       ...(outcome.room ? [{ label: 'Room', value: `${outcome.room.room_id} — ${outcome.room.room_name}` }] : []),
       ...(outcome.launch.template ? [{ label: 'Template', value: outcome.launch.template, kind: 'code' as const }] : []),
