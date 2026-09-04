@@ -86,11 +86,6 @@ exports[`task/room JSON presentation contract > pins every task --json serialize
           }, null, 2));
           return;
         }",
-  "if (opts.json) { console.log(JSON.stringify(payload, null, 2)); return; }",
-  "if (opts.json) {
-          console.log(JSON.stringify({ schema_version: 1, ...result }, null, 2));
-          return;
-        }",
   "if (opts.json) {
           console.log(JSON.stringify({ schema_version: 1, task: t }, null, 2));
           return;

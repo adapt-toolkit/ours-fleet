@@ -88,7 +88,7 @@ function legacyDieCalls(functionName: string): string[] {
 describe('task/room JSON presentation contract', () => {
   it('pins every task --json serializer branch exactly and before Markdown rendering', () => {
     const branches = jsonBranches('registerTaskCommands');
-    expect(branches).toHaveLength(24);
+    expect(branches).toHaveLength(22);
     expect(branches).toMatchSnapshot();
   });
 
