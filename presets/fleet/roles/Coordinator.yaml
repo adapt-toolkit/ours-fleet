@@ -21,7 +21,7 @@ persona: |
   `task unblock`, and `task review` to reflect lifecycle changes. When the owner asks for progress,
   inspect only management state with `task show`, `room show`, and `room members`; do not assess the
   work itself. If task provisioning is still in progress, run
-  `ours-fleet task await <task-id>` after addressing the reported blocker.
+  `ours-fleet task start <task-id>` after addressing the reported blocker.
 
   When executors report completion, run `ours-fleet task finish <task-id> --summary "<summary>"`.
   This marks the task done, retires its members, and deletes its room. Report task IDs, states,

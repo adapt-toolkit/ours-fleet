@@ -310,7 +310,7 @@ function provisioningMarkdown(outcome: TaskProvisioningOutcome): string {
   if (outcome.kind === 'failed') return renderMarkdownFailure({
     kind: 'state', subject: `task start ${outcome.task.task_id}`,
     detail: outcome.blocker ?? 'Provisioning reached a terminal failure.',
-    action: outcome.next_action ?? `Run ours-fleet task await ${outcome.task.task_id}.`,
+    action: outcome.next_action ?? `Run ours-fleet task start ${outcome.task.task_id}.`,
   });
   return renderMarkdownResult({
     icon: outcome.kind === 'ready' ? '✅' : outcome.next_action ? '⚠️' : '⏳',
@@ -325,8 +325,6 @@ function provisioningMarkdown(outcome: TaskProvisioningOutcome): string {
       { label: 'Members', value: `${outcome.members.active}/${outcome.members.expected} active; ${outcome.members.launched}/${outcome.members.expected} launched` },
       ...(outcome.blocker ? [{ label: 'Blocker', value: outcome.blocker }] : []),
       ...(outcome.next_action ? [{ label: 'Next action', value: outcome.next_action }] : []),
-      ...(outcome.kind === 'in_progress'
-        ? [{ label: 'Await', value: outcome.handle.command, kind: 'code' as const }] : []),
     ],
   });
 }
@@ -934,31 +932,6 @@ export function registerTaskCommands(parent: Command, cOpt: (cmd: Command) => Co
           });
         if (opts.json) die(e); dieTaskRoom(e);
       }
-    });
-
-  cOpt(taskCmd.command('await <id>'))
-    .description('await the same bounded room-provisioning operation')
-    .option('--wait-ms <ms>', 'bounded wait in milliseconds', '60000')
-    .option('--json', 'JSON output')
-    .action(async (id: string, opts: { configuration?: string; waitMs: string; json?: boolean }) => {
-      try {
-        const waitMs = Number(opts.waitMs);
-        if (!Number.isSafeInteger(waitMs) || waitMs < 0 || waitMs > 600_000)
-          throw new Error('--wait-ms must be an integer from 0 to 600000');
-        const service = taskRoomService(opts.configuration);
-        const initial = service.taskProvisioningOutcome(id);
-        if (initial.kind === 'in_progress')
-          await continueProvisioningInBackground(id, opts.configuration);
-        const outcome = await service.awaitTaskProvisioning({
-          actor: { kind: 'local_control', surface: 'cli' }, taskId: id, waitMs,
-        });
-        recordTaskProvisioningOutcome(outcome);
-        if (opts.json) {
-          console.log(JSON.stringify({ schema_version: 1, provisioning: outcome }, null, 2)); return;
-        }
-        console.log(provisioningMarkdown(outcome));
-        if (outcome.kind === 'failed') process.exitCode = 1;
-      } catch (e) { if (opts.json) die(e); dieTaskRoom(e); }
     });
 
   taskCmd.command('block <id>')

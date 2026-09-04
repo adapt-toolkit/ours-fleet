@@ -71,7 +71,6 @@ export interface TaskProvisioningOutcome {
   kind: 'ready' | 'in_progress' | 'failed';
   task: TaskRecord;
   room?: RoomOrchestrationRecord;
-  handle: { command: string; task_id: string };
   launch: { template?: string; anonymous: boolean; owner_attached: boolean };
   members: { expected: number; active: number; launched: number };
   blocker?: string;
@@ -351,17 +350,16 @@ export class TaskRoomApplicationService {
       && active === expected && launched === expected;
     const blocker = task.outcome?.summary ?? task.blocked?.reason ?? room?.saga.error;
     const nextAction = room?.provisioning_detail === 'waiting_owner_invite'
-      ? 'Rotate rooms.owner.public_invite, then await the same task.'
+      ? `Rotate rooms.owner.public_invite, then run ours-fleet task start ${task.task_id}.`
       : room?.provisioning_detail === 'owner_cid_mismatch'
-        ? 'Verify rooms.owner.expected_cid, rotate the Owner invite, then await the same task.'
+        ? `Verify rooms.owner.expected_cid, rotate the Owner invite, then run ours-fleet task start ${task.task_id}.`
         : room?.provisioning_detail === 'waiting_cowork'
-          ? 'Restore ours-cowork, then await the same task.'
+          ? `Restore ours-cowork, then run ours-fleet task start ${task.task_id}.`
           : failed
-            ? `Correct the blocker, then run ours-fleet task await ${task.task_id}.`
+            ? `Correct the blocker, then run ours-fleet task start ${task.task_id}.`
             : undefined;
     return {
       kind: failed ? 'failed' : ready ? 'ready' : 'in_progress', task, room,
-      handle: { command: `ours-fleet task await ${task.task_id}`, task_id: task.task_id },
       launch: {
         ...(room?.template_snapshot
           ? { template: `${room.template_snapshot.name}@${room.template_snapshot.version}` }
@@ -807,7 +805,7 @@ export class TaskRoomApplicationService {
       }
       return { task, status: 'already_active' };
     }
-    const room = task.room_id ? getRoomRecord(task.room_id) : undefined;
+    let room = task.room_id ? getRoomRecord(task.room_id) : undefined;
     const durable = room?.template_snapshot ?? task.execution_plan?.snapshot;
     if (durable && (!task.template || task.template.name !== durable.name
       || task.template.version !== durable.version || task.template.content_hash !== durable.content_hash))
@@ -899,6 +897,18 @@ export class TaskRoomApplicationService {
         task = current;
       }
     } else if (task.state === 'provisioning') {
+      if (room && (room.provisioning_detail === 'waiting_owner_invite'
+          || room.provisioning_detail === 'owner_cid_mismatch')) {
+        try {
+          await this.reconcileProvisioningOwner(cfg, room.room_id);
+          room = getRoomRecord(room.room_id);
+        } catch (error) {
+          if (error instanceof CoworkUnavailableError)
+            persistBlockTask(task.task_id, 'Cowork management socket is unavailable');
+          task = readTask(task.task_id);
+          return { task, status: 'in_progress' };
+        }
+      }
       if (!room || !['create_members','join_role_groups','wait_seats','launch_work','activate'].includes(room.saga.phase))
         throw new TaskRoomApplicationError('task_non_resumable', 'task non-resumable', { task: task.task_id, room: task.room_id });
       try {

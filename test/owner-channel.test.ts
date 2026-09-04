@@ -1429,33 +1429,14 @@ describe('OwnerChannel deterministic command dispatch', () => {
     expect(lastReply(client)).toContain('unknown task subcommand: recover');
   });
 
-  it('routes authenticated Owner await through provisioning continuation', async () => {
+  it('rejects the removed Owner task await command before provisioning', async () => {
     const fleet = fakeFleet();
-    const fleetHome = mkdtempSync(join(tmpdir(), 'ours-owner-task-await-'));
-    dirs.push(fleetHome);
-    const previousHome = process.env.OURS_FLEET_HOME;
-    process.env.OURS_FLEET_HOME = fleetHome;
-    const task = createTask({ title: 'Owner await', origin: { type: 'owner_channel' }, start: true });
-    const room = createRoomRecord({ room_id: '01hzyk8m0000000000000000ad',
-      room_name: 'Owner await', room_identity_cid: 'c'.repeat(64), task_id: task.task_id });
-    updateTaskRoom(task.task_id, room.room_id, 'c'.repeat(64));
-    fleet.provisionTask.mockImplementation(async () => {
-      activateRoom(room.room_id);
-      activateTask(task.task_id);
-    });
     const { channel, client } = setup(
-      [ownerMessage(5912, 'wire-task-await', `/task await ${task.task_id}`)], undefined, { fleet });
-    try {
-      await channel.start();
-      await channel.drain();
-    }
-    finally {
-      await channel.close();
-      if (previousHome === undefined) delete process.env.OURS_FLEET_HOME;
-      else process.env.OURS_FLEET_HOME = previousHome;
-    }
-    expect(fleet.provisionTask).toHaveBeenCalledWith(task.task_id);
-    expect(lastReply(client)).toContain('Room provisioning complete');
+      [ownerMessage(5912, 'wire-task-await', '/task await legacy-task')], undefined, { fleet });
+    await channel.drain();
+    expect(fleet.provisionTask).not.toHaveBeenCalled();
+    expect(lastReply(client)).toContain('Invalid command');
+    expect(lastReply(client)).toContain('unknown task subcommand: await');
   });
 
   it('persists task terminal intent and the wire before launching its external worker', async () => {

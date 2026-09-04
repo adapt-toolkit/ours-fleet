@@ -1535,14 +1535,6 @@ export class OwnerChannel implements OwnerChannelHandle {
           await this.fleetOps.provisionTask(task.task_id);
         return outcome;
       }),
-      awaitTask: taskId => provisioningCommand(async () => {
-        const service = new TaskRoomApplicationService(this.options.configPath);
-        const initial = service.taskProvisioningOutcome(taskId);
-        if (initial.kind === 'in_progress') await this.fleetOps.provisionTask(taskId);
-        return service.awaitTaskProvisioning({
-          actor: { kind: 'authenticated_owner', surface: 'messenger', cid: sender.id }, taskId,
-        });
-      }),
       taskProvisioningOutcome: taskId =>
         new TaskRoomApplicationService(this.options.configPath).taskProvisioningOutcome(taskId),
       listTasks: filter => new TaskRoomApplicationService(this.options.configPath).listTasks(filter),

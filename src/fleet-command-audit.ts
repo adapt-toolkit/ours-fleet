@@ -172,7 +172,7 @@ const AGENT_SURFACES: Record<string, ReadonlySet<string>> = {
   spawn: new Set(['<none>']),
   template: new Set(['list', 'show', 'validate']),
   task: new Set(['create', 'list', 'lists', 'list-create', 'list-rename', 'list-delete', 'move',
-    'show', 'start', 'await', 'block', 'unblock', 'review', 'done', 'cancel', 'delete', 'work', 'finish']),
+    'show', 'start', 'block', 'unblock', 'review', 'done', 'cancel', 'delete', 'work', 'finish']),
   room: new Set(['create', 'list', 'show', 'open', 'members', 'delete', 'close']),
 };
 export const fleetProxyCommandInventory = Object.freeze(Object.fromEntries(
@@ -707,7 +707,7 @@ export function renderFleetLifecycleEvent(value: FleetAuditPresentation): string
       `⏳ ${value.resource} “${label}” is still getting ready`,
       [['Status', 'Waiting for Agents'], ['Resource', value.resource], [`${value.resource} ID`, markdownCode(value.id)]],
       value.resource === 'Task'
-        ? `**Next:** Check member readiness, then run ${markdownCode(`task await ${value.id}`)}.`
+        ? `**Next:** Check member readiness, then run ${markdownCode(`task start ${value.id}`)}.`
         : '**Next:** Check member readiness, then repeat the same Room command.',
     );
     if (value.category === 'readiness_failed') return structuredMessage(

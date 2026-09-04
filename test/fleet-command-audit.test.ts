@@ -369,7 +369,7 @@ describe('fleet command audit', () => {
       - **Resource:** Task
       - **Task ID:** \`T-104\`
 
-      **Next:** Check member readiness, then run \`task await T-104\`.",
+      **Next:** Check member readiness, then run \`task start T-104\`.",
         "taskReview": "🔎 Task ready for review: Inventory API
       - **List:** Product
       - **Task ID:** \`T-104\`",

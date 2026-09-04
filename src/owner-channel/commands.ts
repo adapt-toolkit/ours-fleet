@@ -77,7 +77,6 @@ export interface OwnerCommandContext {
   terminalTask(taskId: string, kind: TaskTerminalIntent['kind'], outcome?: TaskOutcome): Promise<void>;
   createTask(input: Omit<CreateTaskRequest, 'actor'>): Promise<TaskRecord>;
   startTask(taskId: string): Promise<TaskProvisioningOutcome | TaskRecord>;
-  awaitTask?(taskId: string): Promise<TaskProvisioningOutcome>;
   taskProvisioningOutcome?(taskId: string): TaskProvisioningOutcome;
   listTasks(filter?: { state?: TaskState | TaskState[]; list?: string }): TaskRecord[];
   groupedTasks(filter?: { state?: TaskState | TaskState[]; list?: string }): Array<{ list: TaskListRecord; tasks: TaskRecord[] }>;
@@ -233,9 +232,9 @@ const taskAction = (
 
 const taskProvisioningAction = (outcome: TaskProvisioningOutcome): string => {
   if (outcome.kind === 'failed') return renderMarkdownFailure({
-    kind: 'state', subject: `/task await ${outcome.task.task_id}`,
+    kind: 'state', subject: `/task start ${outcome.task.task_id}`,
     detail: outcome.blocker ?? 'Provisioning reached a terminal failure.',
-    action: outcome.next_action ?? `Run /task await ${outcome.task.task_id}.`,
+    action: outcome.next_action ?? `Run /task start ${outcome.task.task_id}.`,
   });
   return taskAction(outcome.kind === 'ready' ? 'Room provisioning complete'
     : outcome.next_action ? 'Room provisioning needs attention' : 'Room provisioning continues',
@@ -245,8 +244,6 @@ const taskProvisioningAction = (outcome: TaskProvisioningOutcome): string => {
       { label: 'Members', value: `${outcome.members.active}/${outcome.members.expected} active; ${outcome.members.launched}/${outcome.members.expected} launched` },
       ...(outcome.blocker ? [{ label: 'Blocker', value: outcome.blocker }] : []),
       ...(outcome.next_action ? [{ label: 'Next action', value: outcome.next_action }] : []),
-      ...(outcome.kind === 'in_progress'
-        ? [{ label: 'Await', value: `/task await ${outcome.task.task_id}`, kind: 'code' as const }] : []),
     ]);
 };
 
@@ -426,7 +423,7 @@ export const ownerCommands: OwnerCommand[] = [
   },
   {
     name: 'task',
-    usage: '/task <create|list|show|start|await|block|unblock|review|done|cancel|delete> ...',
+    usage: '/task <create|list|show|start|block|unblock|review|done|cancel|delete> ...',
     summary: 'task lifecycle subcommands',
     execute: async (ctx, args) => {
       if (!args) throw new OwnerCommandUsageError('usage: /task <subcommand> <id>');
@@ -574,12 +571,6 @@ export const ownerCommands: OwnerCommand[] = [
             const started = await ctx.startTask(rest[0]);
             await ctx.reply('kind' in started
               ? taskProvisioningAction(started) : taskAction('Task started', started));
-            break;
-          }
-          case 'await': {
-            if (!rest[0]) throw new OwnerCommandUsageError('usage: /task await <id>');
-            if (!ctx.awaitTask) throw new Error('task await is unavailable');
-            await ctx.reply(taskProvisioningAction(await ctx.awaitTask(rest[0])));
             break;
           }
           case 'block': {
