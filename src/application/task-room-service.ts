@@ -916,7 +916,9 @@ export class TaskRoomApplicationService {
         task = current;
       }
     } else if (task.state === 'provisioning') {
-      if (room && (room.provisioning_detail === 'waiting_owner_invite'
+      if (room && (room.saga.phase === 'attach_owner'
+          || room.provisioning_detail === 'waiting_owner_authorization'
+          || room.provisioning_detail === 'waiting_owner_invite'
           || room.provisioning_detail === 'owner_cid_mismatch')) {
         try {
           await this.reconcileProvisioningOwner(cfg, room.room_id);

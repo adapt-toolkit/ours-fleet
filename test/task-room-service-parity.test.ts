@@ -583,6 +583,49 @@ describe('task create/start surface parity', () => {
     expect(provision).toHaveBeenCalledOnce();
   });
 
+  it.each([
+    ['an explicit authorization blocker', true],
+    ['a phase-only attach_owner crash', false],
+  ] as const)('uses public task start to resume %s', async (_case, withDetail) => {
+    const expected = 'E'.repeat(64);
+    const cfg = { ...config(), ownerInvite: 'repaired-invite', ownerInviteFingerprint: 'fingerprint',
+      rooms: { owner: { role: 'Owner', expected_cid: expected }, defaults: { attach_owner: true } } } as FleetConfig;
+    const template = snapshotTemplate(definition, cfg.agentTemplates);
+    const task = createTask({ title: _case, origin: { type: 'cli' }, start: true,
+      room_id: `room-public-${String(withDetail)}`, template: { name: template.name,
+        version: template.version, content_hash: template.content_hash } });
+    const room = createRoomRecord({ room_id: task.room_id!, room_name: task.title,
+      task_id: task.task_id, template_snapshot: template, room_policy: { anonymous: false } });
+    advanceSaga(room.room_id, 'attach_owner', 2);
+    if (withDetail)
+      setSagaError(room.room_id, 'policy unavailable', 'restore Cowork', 'waiting_owner_authorization');
+    const h = cowork();
+    h.adapter.recoverRoom = vi.fn(async () => ({
+      room_id: room.room_id, state: 'provisioning', anonymous: false, seats: [],
+    })) as any;
+    h.adapter.getSeats = vi.fn(async () => []) as any;
+    h.adapter.acceptInvite = vi.fn(async () => ({ seat_cid: expected })) as any;
+    const provision = vi.fn(async () => {
+      activateRoom(room.room_id);
+      activateTask(task.task_id);
+      return getRoomRecord(room.room_id)!;
+    });
+    const app = new TaskRoomApplicationService(undefined, { loadConfiguration: () => cfg,
+      cowork: () => h.adapter, binPath: () => '/fleet', provisionMembers: provision as any });
+
+    const started = await app.startTask({
+      actor: { kind: 'local_control', surface: 'cli' }, taskId: task.task_id,
+    });
+
+    expect(started.state).toBe('active');
+    expect(getRoomRecord(room.room_id)).toMatchObject({ state: 'active', owner_seat_cid: expected });
+    expect(h.adapter.setRoleCommands).toHaveBeenCalledWith(room.room_id, {
+      role: 'Owner', commands: ['list-members', 'remove-member'],
+    });
+    expect(h.adapter.acceptInvite).toHaveBeenCalledOnce();
+    expect(provision).toHaveBeenCalledOnce();
+  });
+
   it('persists Owner role commands before accepting the Owner invite', async () => {
     const expected = 'B'.repeat(64);
     const events: string[] = [];
