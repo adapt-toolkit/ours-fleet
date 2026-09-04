@@ -129,6 +129,7 @@ function coworkHarness(options: { acceptOnSpawn?: boolean; failIssueAt?: number;
     issueInvite,
     revokeInvite,
     setRoleBriefing: vi.fn(),
+    setRoleCommands: vi.fn(),
     getHistory: vi.fn().mockResolvedValue({ records: [], raw_count: 0, next_after: 0 }),
     getRoom: vi.fn(async roomId => roomInfo(roomId, seats, options.anonymous)),
     listRooms: vi.fn().mockResolvedValue([]),

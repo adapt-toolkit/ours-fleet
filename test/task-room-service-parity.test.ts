@@ -50,7 +50,7 @@ function cowork() {
     adapter: {
       createRoom,
       acceptInvite: vi.fn(), issueInvite: vi.fn(), revokeInvite: vi.fn(),
-      setRoleBriefing: vi.fn(), getHistory: vi.fn(), getRoom: vi.fn(), listRooms: vi.fn(),
+      setRoleBriefing: vi.fn(), setRoleCommands: vi.fn(), getHistory: vi.fn(), getRoom: vi.fn(), listRooms: vi.fn(),
       closeRoom: vi.fn(), deleteRoom: vi.fn(), getSeats: vi.fn(), recoverRoom: vi.fn(),
       available: vi.fn(),
     } as unknown as CoworkAdapter,
@@ -767,17 +767,108 @@ describe('task create/start surface parity', () => {
       const h = cowork();
       h.adapter.recoverRoom = vi.fn(async () => ({ room_id: id, state: 'active' })) as any;
       h.adapter.getSeats = vi.fn(async () => existing
-        ? [{ identity_cid: expected.toLowerCase(), seat_state: 'joined' }] : []) as any;
+        ? [{ identity_cid: expected.toLowerCase(), role: 'Owner', seat_state: 'active' }] : []) as any;
       h.adapter.acceptInvite = vi.fn(async () => ({ seat_cid: expected })) as any;
       const app = new TaskRoomApplicationService(undefined, { loadConfiguration: () => cfg,
         cowork: () => h.adapter, binPath: () => '/fleet', provisionMembers: vi.fn() });
       await app.recoverRoom({ actor: { kind: 'local_control', surface: 'cli' }, roomId: id });
       expect(getRoomRecord(id)).toMatchObject({
         owner_seat_cid: existing ? expected.toLowerCase() : expected,
-        saga: { phase: 'create_members' },
       });
       expect(h.adapter.acceptInvite).toHaveBeenCalledTimes(existing ? 0 : 1);
+      expect(h.adapter.setRoleCommands).toHaveBeenCalledWith(id, {
+        role: 'Owner', commands: ['list-members', 'remove-member'],
+      });
     }
+  });
+
+  it.each([
+    ['before policy persistence', false, false],
+    ['after policy persistence', true, false],
+    ['after invite acceptance', true, true],
+  ] as const)('resumes an attach_owner crash %s', async (_window, policyPresent, seatPresent) => {
+    const id = `owner-crash-${String(policyPresent)}-${String(seatPresent)}`;
+    const expected = 'D'.repeat(64);
+    createRoomRecord({ room_id: id, room_name: id });
+    advanceSaga(id, 'attach_owner', 2);
+    let durablePolicy = policyPresent;
+    const h = cowork();
+    h.adapter.recoverRoom = vi.fn(async () => ({
+      room_id: id, state: 'provisioning', seats: [], anonymous: false,
+    })) as any;
+    h.adapter.getSeats = vi.fn(async () => seatPresent ? [{
+      identity_cid: expected, display_name: 'owner', invite_id: 'owner-invite',
+      role: 'Owner', seat_state: 'active' as const,
+    }] : []);
+    h.adapter.setRoleCommands = vi.fn(async () => { durablePolicy = true; });
+    h.adapter.acceptInvite = vi.fn(async () => ({
+      seat_cid: expected, seat_state: 'pending' as const,
+    }));
+    const cfg = { ...config(), ownerInvite: 'invite', ownerInviteFingerprint: 'fingerprint',
+      rooms: { owner: { role: 'Owner', expected_cid: expected }, defaults: { attach_owner: true } } } as FleetConfig;
+    const app = new TaskRoomApplicationService(undefined, { loadConfiguration: () => cfg,
+      cowork: () => h.adapter, binPath: () => '/fleet', provisionMembers: vi.fn() });
+
+    await app.recoverRoom({ actor: { kind: 'local_control', surface: 'cli' }, roomId: id });
+
+    expect(durablePolicy).toBe(true);
+    expect(h.adapter.setRoleCommands).toHaveBeenCalledOnce();
+    expect(h.adapter.acceptInvite).toHaveBeenCalledTimes(seatPresent ? 0 : 1);
+    expect(getRoomRecord(id)?.owner_seat_cid).toBe(expected);
+    expect(getRoomRecord(id)?.saga.phase).not.toBe('attach_owner');
+  });
+
+  it('persists Owner role commands before accepting the Owner invite', async () => {
+    const id = 'owner-policy-order';
+    const expected = 'B'.repeat(64);
+    const events: string[] = [];
+    const h = cowork();
+    h.adapter.createRoom = vi.fn(async () => ({
+      room_id: id, identity_name: 'Room', identity_cid: 'room-cid',
+    }));
+    h.adapter.setRoleCommands = vi.fn(async () => { events.push('policy'); });
+    h.adapter.acceptInvite = vi.fn(async () => {
+      events.push('accept');
+      return { seat_cid: expected, seat_state: 'pending' as const };
+    });
+    h.adapter.getSeats = vi.fn(async () => [{
+      identity_cid: expected, display_name: 'owner', invite_id: 'owner-invite',
+      role: 'Principal', seat_state: 'active' as const,
+    }]);
+    const cfg = { ...config(), ownerInvite: 'invite', ownerInviteFingerprint: 'fingerprint',
+      rooms: { owner: { role: 'Principal', expected_cid: expected }, defaults: { attach_owner: true } } } as FleetConfig;
+    const app = new TaskRoomApplicationService(undefined, { loadConfiguration: () => cfg,
+      cowork: () => h.adapter, binPath: () => '/fleet', provisionMembers: vi.fn() });
+
+    await app.createRoom({ actor: { kind: 'local_control', surface: 'cli' }, name: 'Authorized' });
+
+    expect(events).toEqual(['policy', 'accept']);
+    expect(h.adapter.setRoleCommands).toHaveBeenCalledWith(id, {
+      role: 'Principal', commands: ['list-members', 'remove-member'],
+    });
+  });
+
+  it('fails before Owner invite acceptance when role-command policy persistence fails', async () => {
+    const id = 'owner-policy-failure';
+    const expected = 'C'.repeat(64);
+    const h = cowork();
+    h.adapter.createRoom = vi.fn(async () => ({
+      room_id: id, identity_name: 'Room', identity_cid: 'room-cid',
+    }));
+    h.adapter.setRoleCommands = vi.fn(async () => { throw new Error('policy disk unavailable'); });
+    const cfg = { ...config(), ownerInvite: 'invite',
+      rooms: { owner: { role: 'Owner', expected_cid: expected }, defaults: { attach_owner: true } } } as FleetConfig;
+    const app = new TaskRoomApplicationService(undefined, { loadConfiguration: () => cfg,
+      cowork: () => h.adapter, binPath: () => '/fleet', provisionMembers: vi.fn() });
+
+    await expect(app.createRoom({
+      actor: { kind: 'local_control', surface: 'cli' }, name: 'Fail closed',
+    })).rejects.toThrow('policy disk unavailable');
+    expect(h.adapter.acceptInvite).not.toHaveBeenCalled();
+    expect(getRoomRecord(id)).toMatchObject({
+      provisioning_detail: 'waiting_owner_authorization',
+      saga: { error: 'policy disk unavailable' },
+    });
   });
 
   it('activates a task-bound room without a template when recovery proves its seats ready', async () => {

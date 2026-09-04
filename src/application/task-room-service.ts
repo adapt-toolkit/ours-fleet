@@ -47,6 +47,8 @@ import type { TaskDeletionAcceptance } from '../rooms-tasks/task-state.js';
 import { storedRoomLaunchPolicy, TASK_CANCELLABLE_STATES, TASK_TERMINAL_STATES } from '../rooms-tasks/types.js';
 import { deriveTaskRoomName } from '../rooms-tasks/task-room-name.js';
 
+const OWNER_ROOM_COMMANDS = ['list-members', 'remove-member'] as const;
+
 export type TaskRoomActor =
   | { kind: 'local_control'; surface: 'cli' | 'web' }
   | { kind: 'authenticated_owner'; surface: 'messenger'; cid: string }
@@ -57,7 +59,7 @@ export interface TaskSettlementPlan {
   settlementRequired: boolean;
 }
 export type TaskRecoveryIssue =
-  | { code: 'terminal_pending' | 'waiting_cowork' | 'waiting_owner_invite' | 'owner_cid_mismatch' | 'waiting_seats' | 'provisioning_resumed' }
+  | { code: 'terminal_pending' | 'waiting_cowork' | 'waiting_owner_authorization' | 'waiting_owner_invite' | 'owner_cid_mismatch' | 'waiting_seats' | 'provisioning_resumed' }
   | { code: 'member_failed'; stepIndex: number }
   | { code: 'resume_failed'; error: string };
 export interface TaskRecoveryResult {
@@ -361,8 +363,10 @@ export class TaskRoomApplicationService {
     const ready = task.state === 'active' && room?.state === 'active'
       && active === expected && launched === expected;
     const blocker = task.outcome?.summary ?? task.blocked?.reason ?? room?.saga.error;
-    const nextAction = room?.provisioning_detail === 'waiting_owner_invite'
-      ? 'Rotate rooms.owner.public_invite, then await the same task.'
+    const nextAction = room?.provisioning_detail === 'waiting_owner_authorization'
+      ? 'Restore ours-cowork, then await the same task to retry Owner command authorization.'
+      : room?.provisioning_detail === 'waiting_owner_invite'
+        ? 'Rotate rooms.owner.public_invite, then await the same task.'
       : room?.provisioning_detail === 'owner_cid_mismatch'
         ? 'Verify rooms.owner.expected_cid, rotate the Owner invite, then await the same task.'
         : room?.provisioning_detail === 'waiting_cowork'
@@ -614,7 +618,9 @@ export class TaskRoomApplicationService {
         return { kind: 'provisioning_resume_failed', task, room, issues };
       }
     }
-    if (room.provisioning_detail === 'waiting_owner_invite'
+    if (room.saga.phase === 'attach_owner'
+        || room.provisioning_detail === 'waiting_owner_authorization'
+        || room.provisioning_detail === 'waiting_owner_invite'
         || room.provisioning_detail === 'owner_cid_mismatch') {
       try {
         await this.recoverRoom({ actor: input.actor, roomId: room.room_id });
@@ -632,6 +638,7 @@ export class TaskRoomApplicationService {
       kind: 'provisioning_non_resumable', task, room, issues, reason: 'missing_room',
     };
     if (room.provisioning_detail === 'waiting_cowork') issues.push({ code: 'waiting_cowork' });
+    if (room.provisioning_detail === 'waiting_owner_authorization') issues.push({ code: 'waiting_owner_authorization' });
     if (room.provisioning_detail === 'waiting_owner_invite') issues.push({ code: 'waiting_owner_invite' });
     if (room.provisioning_detail === 'owner_cid_mismatch') issues.push({ code: 'owner_cid_mismatch' });
     if (room.provisioning_detail === 'member_failed') issues.push({ code: 'member_failed', stepIndex: room.saga.step_index });
@@ -784,14 +791,27 @@ export class TaskRoomApplicationService {
         throw new Error(error);
       }
     }
+    if (orchestration?.owner_seat_cid) {
+      const ownerCid = orchestration.owner_seat_cid.toLowerCase();
+      const ownerSeat = room.seats.find(seat =>
+        seat.identity_cid.toLowerCase() === ownerCid && seat.seat_state !== 'removed');
+      if (ownerSeat) await adapter.setRoleCommands(input.roomId, {
+        role: ownerSeat.role, commands: [...OWNER_ROOM_COMMANDS],
+      });
+    }
     if (orchestration && !orchestration.owner_seat_cid
-      && (orchestration.provisioning_detail === 'waiting_owner_invite'
+      && (orchestration.saga.phase === 'attach_owner'
+        || orchestration.provisioning_detail === 'waiting_owner_authorization'
+        || orchestration.provisioning_detail === 'waiting_owner_invite'
         || orchestration.provisioning_detail === 'owner_cid_mismatch')) {
       const expected = cfg.rooms.owner.expected_cid.toLowerCase();
       const existing = (await adapter.getSeats(input.roomId))
         .find(seat => seat.identity_cid.toLowerCase() === expected && seat.seat_state !== 'removed');
       if (!existing && !cfg.ownerInvite)
         throw new ConfigError('rooms.owner: configure public_invite or public_invite_file before recovery');
+      await adapter.setRoleCommands(input.roomId, {
+        role: existing?.role ?? cfg.rooms.owner.role, commands: [...OWNER_ROOM_COMMANDS],
+      });
       let acceptedCid = existing?.identity_cid;
       if (!acceptedCid) acceptedCid = (await adapter.acceptInvite(input.roomId, cfg.ownerInvite!, {
         role: cfg.rooms.owner.role, expected_cid: cfg.rooms.owner.expected_cid,
@@ -803,6 +823,7 @@ export class TaskRoomApplicationService {
     if (orchestration?.saga.error) issues.push('A provisioning failure is recorded; inspect role logs for diagnostics.');
     if (orchestration?.saga.recovery_hint) issues.push('Recovery guidance is recorded; inspect role logs for diagnostics.');
     if (orchestration?.provisioning_detail === 'waiting_cowork') issues.push('Check ours-cowork service status');
+    if (orchestration?.provisioning_detail === 'waiting_owner_authorization') issues.push('Restore Cowork availability, then re-run recover');
     if (orchestration?.provisioning_detail === 'waiting_owner_invite') issues.push('Rotate rooms.owner.public_invite in config, then re-run recover');
     if (orchestration?.provisioning_detail === 'waiting_seats') issues.push('Inspect temporary member logs for invite acceptance, then re-run recover');
     if (orchestration?.state === 'provisioning'
@@ -1099,8 +1120,18 @@ export class TaskRoomApplicationService {
     await checkpointFleetAuditPresentations();
     room = advanceSaga(room.room_id, 'create_room', 1);
     if (attachOwner) {
+      room = advanceSaga(room.room_id, 'attach_owner', 2);
       try {
-        room = advanceSaga(room.room_id, 'attach_owner', 2);
+        await cowork.setRoleCommands(room.room_id, {
+          role: rooms.owner.role, commands: [...OWNER_ROOM_COMMANDS],
+        });
+      } catch (error) {
+        setSagaError(room.room_id, error instanceof Error ? error.message : String(error),
+          'Restore Cowork availability, then run room recover to configure Owner command authorization.',
+          'waiting_owner_authorization');
+        throw error;
+      }
+      try {
         const accepted = await cowork.acceptInvite(room.room_id, cfg.ownerInvite!, {
           role: rooms.owner.role, expected_cid: rooms.owner.expected_cid,
         });

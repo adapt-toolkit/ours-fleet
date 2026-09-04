@@ -1813,6 +1813,7 @@ export class OwnerChannel implements OwnerChannelHandle {
     }
     const { task, room, issues } = begin.result;
     const hints = issues.map(issue => issue.code === 'waiting_cowork' ? 'Cowork socket unreachable'
+      : issue.code === 'waiting_owner_authorization' ? 'Owner command authorization is not configured'
       : issue.code === 'waiting_owner_invite' ? 'Owner invite missing or invalid'
       : issue.code === 'owner_cid_mismatch' ? 'Owner CID mismatch'
       : issue.code === 'member_failed' ? `Member failed at step ${issue.stepIndex}`
