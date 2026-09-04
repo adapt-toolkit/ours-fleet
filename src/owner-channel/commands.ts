@@ -742,7 +742,8 @@ export const ownerCommands: OwnerCommand[] = [
           }
           default:
             // bare /room <id> → show
-            if (rest.length) throw new OwnerCommandUsageError(`unknown room subcommand: ${sub}`);
+            if (sub === 'recover' || rest.length)
+              throw new OwnerCommandUsageError(`unknown room subcommand: ${sub}`);
             await showRoom(sub);
         }
       } catch (e) {

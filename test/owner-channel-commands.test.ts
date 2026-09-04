@@ -1156,13 +1156,16 @@ describe('owner-channel room subcommands', () => {
     expect(ctx.replies[0]).not.toContain('Not found');
   });
 
-  it('/room recover fails as an unknown removed subcommand', async () => {
-    const ctx = context();
-    await dispatchOwnerCommand('/room recover legacy-room', ctx);
+  it.each(['/room recover', '/room recover legacy-room'])(
+    '%s fails as an unknown removed subcommand without effects', async command => {
+    const getRoomQuery = vi.fn();
+    const ctx = context({ getRoomQuery });
+    await dispatchOwnerCommand(command, ctx);
     expect(ctx.replies).toHaveLength(1);
     expect(ctx.replies[0]).toContain('Invalid command');
     expect(ctx.replies[0]).toContain('unknown room subcommand: recover');
     expect(ctx.closeRoom).not.toHaveBeenCalled();
+    expect(getRoomQuery).not.toHaveBeenCalled();
   });
 });
 
