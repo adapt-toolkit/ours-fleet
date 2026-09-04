@@ -196,6 +196,7 @@ describe('owner command registry', () => {
     expect(help).toContain('/commands');
     expect(help).not.toContain('/room recover');
     expect(help).not.toContain('/task recover');
+    expect(help).not.toContain('/task await');
   });
 
   it('makes /comments discoverable in help with its label and baseline semantics', () => {
@@ -859,6 +860,18 @@ describe('owner-channel task subcommands', () => {
     await dispatchOwnerCommand(command, ctx);
     expect(ctx.replies).toHaveLength(1);
     expect(ctx.replies[0]).toContain('unknown task subcommand: recover');
+  });
+
+  it.each(['/task await', '/task await legacy-task'])(
+    'rejects the removed task await command before lookup or provisioning: %s', async command => {
+    const getTask = vi.fn();
+    const startTask = vi.fn();
+    const ctx = context({ getTask, startTask });
+    await dispatchOwnerCommand(command, ctx);
+    expect(ctx.replies).toHaveLength(1);
+    expect(ctx.replies[0]).toContain('unknown task subcommand: await');
+    expect(getTask).not.toHaveBeenCalled();
+    expect(startTask).not.toHaveBeenCalled();
   });
 
   it('does not expose CLI-only work or finish as Messenger task actions', async () => {

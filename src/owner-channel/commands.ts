@@ -612,7 +612,7 @@ export const ownerCommands: OwnerCommand[] = [
           }
           default:
             // bare /task <id> → show
-            if (sub === 'recover' || rest.length)
+            if (sub === 'recover' || sub === 'await' || rest.length)
               throw new OwnerCommandUsageError(`unknown task subcommand: ${sub}`);
             await showTask(sub);
         }

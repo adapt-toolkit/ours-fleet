@@ -227,7 +227,7 @@ export class TaskRoomApplicationService {
           persistBlockTask(task.task_id, 'Cowork management socket is unavailable');
         // Once the durable Room exists, provisioning errors are resumable
         // saga state. Return that explicit state so the command can launch a
-        // continuation and give the caller a stable await handle.
+        // continuation and report the durable in-progress outcome.
         const current = readTask(task.task_id);
         if (!current.room_id || !getRoomRecord(current.room_id)) throw error;
         task = current;
