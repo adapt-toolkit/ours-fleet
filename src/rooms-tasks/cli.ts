@@ -1157,6 +1157,7 @@ export function registerTaskCommands(parent: Command, cOpt: (cmd: Command) => Co
           if (issue.code === 'terminal_pending') return `Terminal intent remains pending — retry task recover ${id}`;
           if (issue.code === 'waiting_cowork') return 'Cowork management socket unreachable — check ours-cowork service';
           if (issue.code === 'waiting_owner_invite') return 'Owner invite invalid or expired — rotate rooms.owner.public_invite in config';
+          if (issue.code === 'waiting_owner_authorization') return 'Owner command authorization is not configured — restore ours-cowork and retry';
           if (issue.code === 'owner_cid_mismatch') return 'Owner CID mismatch — verify rooms.owner.expected_cid matches Messenger identity';
           if (issue.code === 'member_failed') return `Member creation failed at saga step ${issue.stepIndex} — inspect and retry`;
           if (issue.code === 'waiting_seats') return 'Members have not accepted their one-time room invites yet — inspect role logs, then retry recovery';

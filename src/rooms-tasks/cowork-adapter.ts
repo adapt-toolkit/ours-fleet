@@ -90,6 +90,10 @@ export interface CoworkAdapter {
     role: string;
     text: string;
   }): Promise<CoworkRoleBriefingInfo>;
+  setRoleCommands(roomId: string, opts: {
+    role: string;
+    commands: Array<'list-members' | 'remove-member'>;
+  }): Promise<void>;
   getHistory(roomId: string, opts?: {
     after?: number;
     limit?: number;
@@ -501,6 +505,13 @@ export function createCoworkAdapter(options: CoworkAdapterOptions = {}): CoworkA
       const result = await call('room.participants', { room_id: roomId });
       if (!Array.isArray(result)) throw new CoworkProtocolError('room.participants', 'result must be an array');
       return result.map((seat) => projectSeat(seat, 'room.participants'));
+    },
+    async setRoleCommands(roomId, opts) {
+      const result = await call('room.command.role.set', {
+        room_id: roomId, role: opts.role, commands: opts.commands,
+      });
+      if (!Array.isArray(result))
+        throw new CoworkProtocolError('room.command.role.set', 'result must be an array');
     },
     async recoverRoom(roomId) {
       // Cowork performs packet/state reconciliation during daemon recovery.

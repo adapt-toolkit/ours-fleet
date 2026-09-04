@@ -175,6 +175,7 @@ export interface SagaCursor {
 
 export type ProvisioningDetail =
   | 'waiting_cowork'
+  | 'waiting_owner_authorization'
   | 'waiting_owner_invite'
   | 'owner_cid_mismatch'
   | 'member_failed'
