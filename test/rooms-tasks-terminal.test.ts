@@ -78,7 +78,7 @@ describe('durable task terminal intent', () => {
       state: 'review',
       terminal_intent: {
         status: 'pending', error: 'cowork unavailable', first_failure: 'cowork unavailable',
-        first_recovery_hint: `Retry 'ours-fleet task recover ${task.task_id}'.`,
+        first_recovery_hint: `Retry 'ours-fleet task done ${task.task_id}'.`,
       },
     });
   });
@@ -120,7 +120,7 @@ describe('durable task terminal intent', () => {
     expect(settled.state).toBe('done');
     expect(settled.terminal_intent).toMatchObject({
       status: 'settled', first_failure: 'crash seam',
-      first_recovery_hint: `Retry 'ours-fleet task recover ${task.task_id}'.`,
+      first_recovery_hint: `Retry 'ours-fleet task done ${task.task_id}'.`,
     });
     expect(settled.terminal_intent?.error).toBeUndefined();
     expect(cowork.closeRoom).toHaveBeenCalledTimes(1);

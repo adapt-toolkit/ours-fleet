@@ -71,11 +71,9 @@ export function settleTaskTerminalIntent(input: {
       }
       return finishTaskTerminalIntent(input.taskId);
     } catch (error) {
-      setTaskTerminalIntentError(
-        input.taskId,
-        errorText(error),
-        `Retry 'ours-fleet task recover ${input.taskId}'.`,
-      );
+      setTaskTerminalIntentError(input.taskId, errorText(error), intent.kind === 'cancelled'
+        ? `Retry 'ours-fleet task cancel ${input.taskId} ${input.taskId}'.`
+        : `Retry 'ours-fleet task done ${input.taskId}'.`);
       throw error;
     }
   }, {}, TASK_OPERATION_LOCK_STALE_MS);
