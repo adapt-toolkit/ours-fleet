@@ -4,7 +4,8 @@ import { tmpdir } from 'node:os';
 import { describe, expect, it } from 'vitest';
 import {
   beginFleetAuditCollection, checkpointFleetAuditPresentations, classifyFleetArgv,
-  consumeFleetAuditCollection, FleetCommandAuditStore, recordFleetAuditPresentation, redactFleetArgv,
+  consumeFleetAuditCollection, FleetCommandAuditStore, fleetPresentationLabel,
+  recordFleetAuditPresentation, redactFleetArgv,
   lifecycleEventDigestBasis, renderFleetLifecycleEvent, fleetProxyCommandInventory,
   fleetProxyTopLevelInventory, setFleetAuditLifecycleCheckpoint,
   validateFleetAuditBegin, validateFleetAuditFinish,
@@ -221,39 +222,201 @@ describe('fleet command audit', () => {
     expect(rendered).not.toContain('secret');
   });
 
-  it('renders compact deterministic Agent, Task, and Room lifecycle vocabulary', () => {
-    const agent = renderFleetLifecycleEvent({ kind: 'agent_started', id: 'Dev', name: 'Dev', lifetime: 'temporary',
-      brain: 'ref:brain (explicit)', role: 'inline:sha256:abcd (inherited)', harness: 'codex',
-      session: 'acp', permissions: 'allow/full', parent: 'Coordinator', actionId: 'action-1', inherited: ['role'] });
-    expect(agent).toContain('Agent Dev (Dev) — ready');
-    expect(agent).toContain('legacy launch; resolved details unavailable');
-    expect(agent).toContain('Role inline:sha256:abcd (inherited)');
-    expect(agent).toContain('Brain ref:brain (explicit)');
-    const task = renderFleetLifecycleEvent({ kind: 'task', operation: 'started', id: 't1', title: 'Ship Δ',
-      previousState: 'backlog', newState: 'active', template: 'team@1', roomId: 'r1', list: 'default',
-      agents: [{ name: 'Dev', brain: 'B', role: 'Developer', permissions: 'allow' }] });
-    expect(task).toContain('backlog → active');
-    expect(task).toContain('legacy launch; resolved details unavailable (Role Developer; Brain B; permissions allow)');
-    const room = renderFleetLifecycleEvent({ kind: 'room', operation: 'activated', id: 'r1',
-      previousState: 'provisioning', newState: 'active', taskId: 't1',
-      participants: [{ name: 'Critic', id: 'cid-1', role: 'Critic' }] });
-    expect(room).toContain('`Critic` (cid-1): legacy launch; resolved details unavailable (Role Critic)');
+  it('pins the approved multiline Owner lifecycle copy exactly', () => {
+    const task = (operation: 'create' | 'work' | 'block' | 'unblock' | 'review' | 'finish' | 'cancel' | 'delete',
+      newState: string, extra: Record<string, unknown> = {}) => renderFleetLifecycleEvent({
+      kind: 'task', operation, eventId: `${operation}-1`, id: 'T-104', title: 'Inventory API',
+      previousState: operation === 'create' ? 'none' : 'active', newState, list: 'Product',
+      agents: [{ name: 'Dev', role: 'Developer' }], ...extra,
+    } as Parameters<typeof renderFleetLifecycleEvent>[0]);
+    const failure = (resource: 'Agent' | 'Task' | 'Room', category:
+      'provision_failed' | 'provision_pending' | 'readiness_failed' | 'settlement_pending' | 'cleanup_failed',
+    ) => renderFleetLifecycleEvent({ kind: 'lifecycle_failure', resource, category,
+      eventId: `${category}-1`, id: resource === 'Task' ? 'T-104' : resource === 'Room' ? 'R-219' : 'acme-developer-1',
+      label: resource === 'Task' ? 'Inventory API' : resource === 'Room' ? 'Release planning' : 'acme-developer-1',
+      state: category.startsWith('provision') ? 'provisioning' : 'pending' });
+    const outputs = {
+      agent: renderFleetLifecycleEvent({ kind: 'agent_started', eventId: 'launch-1', id: 'acme-developer-1',
+        name: 'acme-developer-1', lifetime: 'temporary', brain: 'default', role: 'Developer', harness: 'codex',
+        session: 'acp', parent: 'Coordinator', actionId: 'launch-1', inherited: [], configuration: {
+          version: 1, template: 'coding', role: { kind: 'named', ref: 'Developer' },
+          brain: { kind: 'named', ref: 'default' }, harness: 'codex', session: 'acp', model: 'gpt-5',
+          effort: 'high', mission: 'Implement the inventory API', approval: 'ask', filesystem: 'workspace',
+          unattended: 'wait', permissionMode: { fleetMode: 'auto', nativeMode: 'workspace-write' },
+          monitor: { mode: 'fleet', interrupt: false },
+          isolation: { requested: 'podman', network: 'deny', on_unavailable: 'strict', read_mounts: 2, write_mounts: 1 },
+          loops: { source: 'agent-template', policy: 'skip-if-busy', entries: [{ name: 'status-check', enabled: true,
+            intervalMs: 60_000, initialDelayMs: 5_000, jitterMs: 2_000,
+            prompt: { bytes: 184, sha256: 'a1b2c3d4e5f6'.padEnd(64, '0') } }] },
+        } }),
+      taskBacklog: task('create', 'backlog', { template: 'coding' }),
+      taskStarted: task('work', 'active', { previousState: 'provisioning', roomId: 'R-218', roomName: 'Inventory API' }),
+      taskBlocked: task('block', 'active', { reason: 'Waiting for API credentials' }),
+      taskUnblocked: task('unblock', 'active'),
+      taskReview: task('review', 'review'),
+      taskCompleted: task('finish', 'done'),
+      taskCancelled: task('cancel', 'cancelled'),
+      taskDeletionStarted: task('delete', 'deleting'),
+      roomReady: renderFleetLifecycleEvent({ kind: 'room', operation: 'activate', eventId: 'ready-1', id: 'R-219',
+        name: 'Release planning', previousState: 'provisioning', newState: 'active', template: 'planning',
+        memberCount: 3, participants: [] }),
+      roomDeleted: renderFleetLifecycleEvent({ kind: 'room', operation: 'delete', eventId: 'deleted-1', id: 'R-219',
+        name: 'Release planning', previousState: 'closing', newState: 'deleted', participants: [] }),
+      taskProvisionFailed: failure('Task', 'provision_failed'),
+      taskProvisionPending: failure('Task', 'provision_pending'),
+      agentReadinessFailed: failure('Agent', 'readiness_failed'),
+      taskCleanupPending: failure('Task', 'settlement_pending'),
+      roomCleanupFailed: failure('Room', 'cleanup_failed'),
+    };
+    for (const line of Object.values(outputs).flatMap(output => output.split('\n'))
+      .filter(line => line.startsWith('- **')))
+      expect(line).not.toMatch(/[;·|]/u);
+    expect(outputs).toMatchInlineSnapshot(`
+      {
+        "agent": "🚀 Agent launched: acme-developer-1
+      - **Started by:** Coordinator
+      - **Lifetime:** Temporary
+      - **Template:** \`coding\`
+      - **Role:** Preset \`Developer\`
+      - **Mission:** “Implement the inventory API”
+      - **Brain:** Preset \`default\`
+      - **Harness:** \`codex\`
+      - **Model:** \`gpt-5\`
+      - **Effort:** high
+      - **Approval:** ask
+      - **Filesystem:** workspace
+      - **Wait:** wait
+      - **Fleet mode:** auto
+      - **Native mode:** workspace-write
+      - **Monitor mode:** fleet
+      - **Interrupt:** off
+      - **Isolation:** podman
+      - **Network:** deny
+      - **If unavailable:** Fail
+      - **Read-only mounts:** 2
+      - **Read-write mounts:** 1
+      - **Loop:** \`status-check\`
+      - **Loop status:** Enabled
+      - **Loop interval:** 60,000 ms
+      - **Loop delay:** 5,000 ms
+      - **Loop jitter:** 2,000 ms
+      - **Loop prompt size:** 184 B
+      - **Loop prompt hash:** \`a1b2c3d4e5f6\`
+      - **Loop policy:** Skip if busy
+      - **Loop source:** agent template
+      - **Agent ID:** \`acme-developer-1\`
+
+      Launch was accepted; harness and room-seat readiness converge separately.",
+        "agentReadinessFailed": "⚠️ Agent didn’t become ready: acme-developer-1
+      - **Status:** Readiness failed
+      - **Agent ID:** \`acme-developer-1\`
+
+      **Next:** Check the Agent log, correct its configuration, then create it again.",
+        "roomCleanupFailed": "⚠️ Room cleanup is incomplete: Release planning
+      - **Status:** Deletion pending
+      - **Room ID:** \`R-219\`
+
+      **Next:** Check the Fleet service logs, then repeat the same confirmed Room delete command.",
+        "roomDeleted": "🗑️ Room deleted: Release planning
+      - **Room ID:** \`R-219\`
+
+      Temporary Agents were cleaned up.",
+        "roomReady": "🏠 Room ready: Release planning
+      - **Status:** Active
+      - **Template:** \`planning\`
+      - **Team:** 3 Agents ready
+      - **Room ID:** \`R-219\`",
+        "taskBacklog": "✅ Task added to Backlog
+      - **Task:** “Inventory API”
+      - **Task ID:** \`T-104\`
+      - **List:** Product
+      - **Template:** \`coding\`",
+        "taskBlocked": "⛔ Task blocked: Inventory API
+      - **Status:** Active
+      - **Blocked:** Yes
+      - **Reason:** Waiting for API credentials
+      - **Task ID:** \`T-104\`",
+        "taskCancelled": "🚫 Task cancelled: Inventory API
+      - **Status:** Cancelled
+      - **List:** Product
+      - **Task ID:** \`T-104\`
+
+      The task room and temporary Agents have been cleaned up.",
+        "taskCleanupPending": "⚠️ Task cleanup is incomplete: Inventory API
+      - **Status:** Finish pending
+      - **Task ID:** \`T-104\`
+
+      **Next:** Check the Fleet service logs, then repeat the same \`done\`, \`finish\`, or \`cancel\` command.",
+        "taskCompleted": "🎉 Task completed: Inventory API
+      - **Status:** Done
+      - **List:** Product
+      - **Task ID:** \`T-104\`
+
+      The task room and temporary Agents have been cleaned up.",
+        "taskDeletionStarted": "🗑️ Task deletion started: Inventory API
+      - **Current status:** Deleting
+      - **Task ID:** \`T-104\`
+
+      Fleet is removing the linked room and temporary Agents in the background.",
+        "taskProvisionFailed": "⚠️ Couldn’t prepare Task “Inventory API”
+      - **Status:** Provisioning failed
+      - **Resource:** Task
+      - **Task ID:** \`T-104\`
+
+      **Next:** Check the Fleet service logs, correct the configuration, then run the same start command again.",
+        "taskProvisionPending": "⏳ Task “Inventory API” is still getting ready
+      - **Status:** Waiting for Agents
+      - **Resource:** Task
+      - **Task ID:** \`T-104\`
+
+      **Next:** Check member readiness, then run \`task await T-104\`.",
+        "taskReview": "🔎 Task ready for review: Inventory API
+      - **List:** Product
+      - **Task ID:** \`T-104\`",
+        "taskStarted": "🚀 Task started: Inventory API
+      - **Status:** Active
+      - **List:** Product
+      - **Room:** Inventory API
+      - **Room ID:** \`R-218\`
+      - **Team:** 1 Agent ready
+      - **Task ID:** \`T-104\`
+
+      The task room and its Agents are ready to work.",
+        "taskUnblocked": "✅ Task unblocked: Inventory API
+      - **Status:** Active
+      - **Task ID:** \`T-104\`",
+      }
+    `);
   });
 
-  it('renders actionable failures from a closed category without exception text', () => {
-    const rendered = renderFleetLifecycleEvent({ kind: 'lifecycle_failure', resource: 'Room',
-      eventId: 'episode-1', id: 'room-1', state: 'closing', category: 'cleanup_failed' });
-    expect(rendered).toContain('Room room-1 lifecycle failure (cleanup_failed)');
-    expect(rendered).toContain('retry Room delete');
-    expect(rendered).not.toContain('/private');
-  });
-
-  it('labels actionable pending state without calling it a failure', () => {
-    const rendered = renderFleetLifecycleEvent({ kind: 'lifecycle_failure', resource: 'Room',
-      eventId: 'episode-1', id: 'room-1', state: 'provisioning', category: 'provision_pending' });
-    expect(rendered).toBe('⚠️ Room room-1 lifecycle pending (provision_pending); state provisioning. '
-      + 'Action: Check member readiness, then retry the originating Task or Room command.');
-    expect(rendered).not.toContain('lifecycle failure');
+  it('captures bounded sanitized labels at record time and falls back for legacy events', () => {
+    const hostile = `  Inventory\nAPI\u202e${'🛰️'.repeat(200)}  `;
+    const label = fleetPresentationLabel(hostile)!;
+    expect(label).not.toMatch(/[\u0000-\u001f\u007f-\u009f\u202a-\u202e\u2066-\u2069]/u);
+    expect(Array.from(label).length).toBeLessThanOrEqual(160);
+    expect(Buffer.byteLength(label, 'utf8')).toBeLessThanOrEqual(640);
+    beginFleetAuditCollection();
+    recordFleetAuditPresentation({ kind: 'task', operation: 'block', id: 'task-1',
+      title: hostile, roomName: hostile, reason: hostile, previousState: 'active',
+      newState: 'active', agents: [] });
+    recordFleetAuditPresentation({ kind: 'room', operation: 'activate', id: 'room-1',
+      name: hostile, previousState: 'provisioning', newState: 'active', participants: [] });
+    recordFleetAuditPresentation({ kind: 'lifecycle_failure', resource: 'Task', id: 'task-1',
+      label: hostile, state: 'provisioning', category: 'provision_failed' });
+    expect(consumeFleetAuditCollection().presentations).toEqual([
+      expect.objectContaining({ title: label, roomName: label, reason: label }),
+      expect.objectContaining({ name: label }),
+      expect.objectContaining({ label }),
+    ]);
+    expect(renderFleetLifecycleEvent({ kind: 'lifecycle_failure', resource: 'Room',
+      eventId: 'episode-1', id: 'room-1', state: 'closing', category: 'cleanup_failed' }))
+      .toContain('Room cleanup is incomplete: room-1');
+    expect(renderFleetLifecycleEvent({ kind: 'task', operation: 'review', eventId: 'review-1',
+      id: 'task-legacy', previousState: 'active', newState: 'review', agents: [] }))
+      .toContain('Task ready for review: task-legacy');
+    expect(renderFleetLifecycleEvent({ kind: 'room', operation: 'delete', eventId: 'delete-1',
+      id: 'room-legacy', previousState: 'closing', newState: 'deleted', participants: [] }))
+      .toContain('Room deleted: room-legacy');
   });
 
   it('separates Agent, Task, and Room failure dedupe keys with identical IDs and event IDs', () => {
@@ -382,7 +545,7 @@ describe('human-readable launch configuration', () => {
     if (!line.includes('monitor')) expect(line.endsWith('; …')).toBe(true);
   });
 
-  it('admits whole agent lines then reports an accurate omission count', () => {
+  it('summarizes a large task team without replaying per-Agent configuration', () => {
     const agents = Array.from({ length: 64 }, (_, index) => ({
       name: `agent-${String(index).padStart(2, '0')}`, role: 'Member',
       configuration: { ...named(), mission: `Mission ${'🛰️'.repeat(40)}` },
@@ -391,11 +554,8 @@ describe('human-readable launch configuration', () => {
       previousState: 'provisioning', newState: 'active', agents });
     expect(Array.from(rendered).length).toBeLessThanOrEqual(MARKDOWN_MAX_CODE_POINTS);
     expect(Buffer.byteLength(rendered, 'utf8')).toBeLessThanOrEqual(MARKDOWN_MAX_BYTES);
-    expect(rendered).toContain('- `agent-00`:');
-    const note = /…and (\d+) more agents omitted\./u.exec(rendered);
-    expect(note).not.toBeNull();
-    const shown = [...rendered.matchAll(/- `agent-\d+`/gu)].length;
-    expect(shown + Number(note![1])).toBe(64);
+    expect(rendered).toContain('- **Team:** 64 Agents ready');
+    expect(rendered).not.toContain('agent-00');
   });
 
   it('keeps the ready notice concise even when legacy participant details are present', () => {
@@ -408,7 +568,7 @@ describe('human-readable launch configuration', () => {
         name: `m${index}`, role: 'Member', configuration: big })) });
     expect(Array.from(rendered).length).toBeLessThanOrEqual(MARKDOWN_MAX_CODE_POINTS);
     expect(Buffer.byteLength(rendered, 'utf8')).toBeLessThanOrEqual(MARKDOWN_MAX_BYTES);
-    expect(rendered).toBe('The room r1 is ready.');
+    expect(rendered).toBe('🏠 Room ready: r1\n- **Status:** Active\n- **Team:** 3 Agents ready\n- **Room ID:** `r1`');
   });
 
   it('accepts a complete v1 configuration through the audit finish boundary', () => {
@@ -504,26 +664,20 @@ describe('human-readable launch configuration', () => {
     expect(line).toContain('mode ask/');
   });
 
-  it('never overflows across the note boundary: whole-line admission sweep', () => {
-    // Sweep mission padding in 1-code-point steps with near-line-budget agent
-    // lines so successive renders cross every residue around the omission
-    // note, including the exact 'candidate fits, candidate+note does not'
-    // window that previously had an unchecked return path.
+  it('never overflows while rendering a maximal multiline Agent configuration', () => {
     const big = (pad: number): AgentLaunchConfiguration => ({ ...named(),
       template: '𝕏'.repeat(120), model: '𝕐'.repeat(120),
       mission: `${'𝕄'.repeat(40)}${'M'.repeat(Math.min(pad, 40))}`,
       permissionMode: { fleetMode: 'ask', nativeMode: '𝕅'.repeat(60) } });
     for (let pad = 0; pad <= 40; pad++) {
-      const rendered = renderFleetLifecycleEvent({ kind: 'task', operation: 'work', id: 't1',
-        previousState: 'provisioning', newState: 'active',
-        agents: Array.from({ length: 8 }, (_, index) => ({
-          name: `agent-${index}`, role: 'Member', configuration: big(pad) })) });
+      const rendered = renderFleetLifecycleEvent({ kind: 'agent_started', eventId: `e-${pad}`,
+        id: 'agent-1', name: 'agent-1', lifetime: 'temporary', brain: 'Brain', role: 'Role',
+        harness: 'codex', session: 'acp', parent: 'Coordinator', actionId: `e-${pad}`,
+        inherited: [], configuration: big(pad) });
       expect(Array.from(rendered).length).toBeLessThanOrEqual(MARKDOWN_MAX_CODE_POINTS);
       expect(Buffer.byteLength(rendered, 'utf8')).toBeLessThanOrEqual(MARKDOWN_MAX_BYTES);
-      const shown = [...rendered.matchAll(/- `agent-\d+`/gu)].length;
-      const note = /…and (\d+) more agents? omitted\./u.exec(rendered);
-      expect(shown + (note ? Number(note[1]) : 0)).toBe(8);
-      expect(shown).toBeGreaterThanOrEqual(1);
+      expect(rendered).toContain('\n- **Role:**');
+      expect(rendered).toContain('\n- **Brain:**');
     }
   });
 

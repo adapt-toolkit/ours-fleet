@@ -24,7 +24,7 @@ import { hashTemplate, listTemplates, resolveTemplate, sealTemplateSnapshot, sna
 import { acquireLaunchSnapshotLock, releaseLaunchSnapshot } from '../rooms-tasks/launch-snapshot.js';
 import { hashMemberOverrides, prepareExecutionPlan, type MemberOverrides } from '../rooms-tasks/member-overrides.js';
 import {
-  checkpointFleetAuditPresentations, recordFleetAuditPresentation, recordFleetAuditResource,
+  recordFleetAuditPresentation, recordFleetAuditResource,
 } from '../fleet-command-audit.js';
 import {
   acceptManagedRoomClose, deleteLegacyClosedRooms, deleteManagedRoom, recordManagedRoomCloseError,
@@ -78,41 +78,31 @@ export interface TaskProvisioningOutcome {
   next_action?: string;
 }
 
-function recordCanonicalRoomCreated(room: RoomOrchestrationRecord): void {
-  recordFleetAuditPresentation({ kind: 'room', operation: 'create',
-    eventId: `room-created:${room.created_at}`, id: room.room_id,
-    name: room.room_name, previousState: 'none', newState: 'provisioning',
-    revision: room.created_at, taskId: room.task_id,
-    template: room.template_snapshot
-      ? `${room.template_snapshot.name}@${room.template_snapshot.version}` : undefined,
-    anonymous: storedRoomLaunchPolicy(room.room_policy).anonymous,
-    memberCount: room.template_snapshot?.members.reduce((sum, member) => sum + member.count, 0) ?? 0,
-    participants: [] });
-}
-
 /** Repairable terminal observation derived entirely from durable Task/Room state. */
 export function recordTaskProvisioningOutcome(outcome: TaskProvisioningOutcome): void {
   const room = outcome.room;
   recordFleetAuditResource('task', outcome.task.task_id);
-  if (room) {
-    recordFleetAuditResource('room', room.room_id);
-    // Always restate created before a later terminal transition. The stable
-    // digest makes this a no-op when the original checkpoint was delivered,
-    // and repairs a crash after Room persistence but before that checkpoint.
-    recordCanonicalRoomCreated(room);
-  }
+  if (room) recordFleetAuditResource('room', room.room_id);
   if (outcome.kind === 'ready' && room) recordFleetAuditPresentation({
-    kind: 'room', operation: 'activate', eventId: `room-ready:${room.activated_at ?? room.created_at}`,
-    id: room.room_id, name: room.room_name, previousState: 'provisioning', newState: 'active',
-    revision: room.activated_at ?? room.created_at, taskId: room.task_id,
-    template: outcome.launch.template, anonymous: outcome.launch.anonymous,
-    memberCount: outcome.members.expected, ownerAttached: outcome.launch.owner_attached,
-    participants: [],
+    kind: 'task', operation: 'work', eventId: `task-ready:${room.activated_at ?? room.created_at}`,
+    id: outcome.task.task_id, title: outcome.task.title,
+    previousState: 'provisioning', newState: 'active', revision: room.activated_at ?? room.created_at,
+    list: outcome.task.list_name ?? 'default', roomId: room.room_id, roomName: room.room_name,
+    template: outcome.launch.template,
+    agents: room.member_seats.map(member => ({ name: member.role_name, role: member.cowork_role,
+      configuration: member.launch?.presentation })),
   });
   if (outcome.kind === 'failed') recordFleetAuditPresentation({
     kind: 'lifecycle_failure', resource: 'Task', id: outcome.task.task_id,
+    label: outcome.task.title,
     state: outcome.task.state, category: 'provision_failed',
     eventId: outcome.task.ended_at ?? room?.created_at ?? outcome.task.created_at,
+  });
+  if (outcome.kind === 'in_progress') recordFleetAuditPresentation({
+    kind: 'lifecycle_failure', resource: 'Task', id: outcome.task.task_id,
+    label: outcome.task.title,
+    state: outcome.task.state, category: 'provision_pending',
+    eventId: room?.created_at ?? outcome.task.created_at,
   });
 }
 export class TaskRoomApplicationError extends Error {
@@ -218,9 +208,9 @@ export class TaskRoomApplicationService {
     }
     unlock?.();
     const ref = template && { name: template.name, version: template.version, content_hash: template.content_hash };
-    // A create-and-start launch is represented to the Owner solely by the
-    // canonical Room created/ready events. Backlog and no-room tasks retain
-    // their useful Task lifecycle notice.
+    // A successful create-and-start launch is recorded once by
+    // recordTaskProvisioningOutcome after the linked Room and seats are ready.
+    // Backlog and no-room tasks retain their direct Task lifecycle notice.
     if (request.backlog || request.noRoom) recordFleetAuditPresentation({ kind: 'task', operation: 'create', id: task.task_id,
       title: task.title, previousState: 'none', newState: task.state, revision: task.created_at,
       list: task.list_name ?? 'default', roomId: task.room_id,
@@ -244,6 +234,8 @@ export class TaskRoomApplicationService {
         task = current;
       }
     }
+    if (!request.backlog && !request.noRoom && task.room_id)
+      recordTaskProvisioningOutcome(this.taskProvisioningOutcome(task.task_id));
     return task;
   }
 
@@ -273,7 +265,10 @@ export class TaskRoomApplicationService {
   async startTask(input: {
     actor: TaskRoomActor; taskId: string; template?: string; members?: MemberOverrides; anonymous?: boolean;
   }): Promise<TaskRecord> {
-    return (await this.ensureTaskWork(input)).task;
+    const result = await this.ensureTaskWork(input);
+    if (result.status !== 'already_active')
+      recordTaskProvisioningOutcome(this.taskProvisioningOutcome(result.task.task_id));
+    return result.task;
   }
 
   listTasks(filter?: {
@@ -1009,10 +1004,6 @@ export class TaskRoomApplicationService {
       throw error;
     }
     unlockSnapshot?.();
-    recordCanonicalRoomCreated(room);
-    // The created notice is observable while member admission is still in
-    // progress; it is not delayed behind task-start command completion.
-    await checkpointFleetAuditPresentations();
     room = advanceSaga(room.room_id, 'create_room', 1);
     if (attachOwner) {
       try {
@@ -1027,6 +1018,9 @@ export class TaskRoomApplicationService {
           mismatch ? 'Verify rooms.owner.expected_cid and rotate the configured invite if necessary.'
             : 'Rotate rooms.owner.public_invite or public_invite_file, then retry the originating task or room create command.',
           mismatch ? 'owner_cid_mismatch' : 'waiting_owner_invite');
+        if (!task.task_id) recordFleetAuditPresentation({ kind: 'lifecycle_failure', resource: 'Room',
+          id: room.room_id, label: room.room_name, state: room.state, category: 'provision_failed',
+          eventId: room.created_at });
         throw error;
       }
     }
@@ -1038,6 +1032,9 @@ export class TaskRoomApplicationService {
         goal: task.task_id ? task.title : task.goal,
       });
     } catch (error) {
+      if (!task.task_id) recordFleetAuditPresentation({ kind: 'lifecycle_failure', resource: 'Room',
+        id: room.room_id, label: room.room_name, state: room.state, category: 'provision_failed',
+        eventId: room.created_at });
       throw error;
     }
     else if (attachOwner) {
@@ -1059,13 +1056,18 @@ export class TaskRoomApplicationService {
         await sleep(250);
       }
     } else room = activateRoom(room.room_id);
-    if (room.state === 'active') recordFleetAuditPresentation({ kind: 'room', operation: 'activate',
-      eventId: `room-ready:${room.activated_at ?? room.created_at}`, id: room.room_id,
-      name: room.room_name, previousState: 'provisioning', newState: 'active',
-      revision: room.activated_at ?? room.created_at, taskId: room.task_id,
+    if (!task.task_id && room.state === 'active') recordFleetAuditPresentation({
+      kind: 'room', operation: 'activate', eventId: `room-ready:${room.activated_at ?? room.created_at}`,
+      id: room.room_id, name: room.room_name, previousState: 'provisioning', newState: 'active',
+      revision: room.activated_at ?? room.created_at,
       template: room.template_snapshot ? `${room.template_snapshot.name}@${room.template_snapshot.version}` : undefined,
       anonymous: policy.anonymous, memberCount: room.member_seats.length, ownerAttached: attachOwner,
-      participants: [] });
+      participants: [],
+    });
+    if (!task.task_id && room.state !== 'active') recordFleetAuditPresentation({
+      kind: 'lifecycle_failure', resource: 'Room', id: room.room_id, label: room.room_name,
+      state: room.state, category: 'provision_pending', eventId: room.created_at,
+    });
     if (task.task_id && !launchTemplate?.members.length) activateTask(task.task_id);
     return room;
   }

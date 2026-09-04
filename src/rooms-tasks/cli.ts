@@ -378,6 +378,9 @@ function safePermissionsSummary(definition: Record<string, unknown> | undefined)
 
 function auditTask(operation: string, task: ReturnType<typeof getTask>, previousState: string,
   newState: string = task.state, revision?: string): void {
+  // Accepted terminal intent is internal progress. The Owner receives either
+  // the final outcome or one truthful failure/pending notice, never both.
+  if (operation === 'settling') return;
   const materialSameState = operation === 'block' || operation === 'unblock' || operation === 'settling';
   if (previousState === newState && !materialSameState) return;
   recordFleetAuditResource('task', task.task_id);
@@ -398,7 +401,9 @@ function auditTask(operation: string, task: ReturnType<typeof getTask>, previous
     revision: revision ?? task.blocked?.at ?? task.ended_at ?? task.started_at ?? task.created_at,
     list: task.list_name ?? 'default',
     template: task.template ? `${task.template.name}@${task.template.version}` : undefined,
-    roomId: task.room_id, agents: [...task.member_roles].sort((a, b) => a.name.localeCompare(b.name)).map(member => ({ name: member.name,
+    roomId: task.room_id, roomName: room?.room_name,
+    reason: operation === 'block' ? task.blocked?.reason : undefined,
+    agents: [...task.member_roles].sort((a, b) => a.name.localeCompare(b.name)).map(member => ({ name: member.name,
       brain: safeSelectionSummary(definitions.get(member.name), 'brain'),
       role: safeSelectionSummary(definitions.get(member.name), 'role') === 'unresolved'
         ? member.cowork_role : safeSelectionSummary(definitions.get(member.name), 'role'),
@@ -461,7 +466,7 @@ async function launchTaskSettleWorker(
     });
     const task = getTask(taskId);
     recordFleetAuditPresentation({ kind: 'lifecycle_failure', resource: 'Task', id: taskId,
-      state: task.state, category: 'settlement_failed',
+      label: task.title, state: task.state, category: 'settlement_failed',
       eventId: task.terminal_intent?.error_at ?? task.terminal_intent?.accepted_at ?? task.created_at });
     throw error;
   }
@@ -476,7 +481,7 @@ async function launchTaskSettleWorker(
   }
   const task = getTask(taskId);
   recordFleetAuditPresentation({ kind: 'lifecycle_failure', resource: 'Task', id: taskId,
-    state: task.state, category: 'settlement_pending',
+    label: task.title, state: task.state, category: 'settlement_pending',
     eventId: task.terminal_intent?.accepted_at ?? task.created_at });
   return { task, timedOut: true };
 }
@@ -485,10 +490,11 @@ async function launchTaskSettleWorker(
 async function launchTaskDeleteWorker(
   taskId: string, configPath?: string,
 ): Promise<{ deleted: boolean; timedOut: boolean }> {
-  const readDeletion = (): { present: boolean; errorAt?: string; error?: string } => {
+  const readDeletion = (): { present: boolean; title?: string; errorAt?: string; error?: string } => {
     try {
       const task = getDeletingTask(taskId);
-      return { present: true, errorAt: task.deletion?.error_at, error: task.deletion?.error };
+      return { present: true, title: task.title,
+        errorAt: task.deletion?.error_at, error: task.deletion?.error };
     } catch (error) {
       // Only proven physical absence counts as deleted; anything else propagates.
       if (error instanceof TaskStateError && /task not found/.test(error.message))
@@ -506,7 +512,7 @@ async function launchTaskDeleteWorker(
       recoveryHint: `External delete worker failed to start. Retry task delete ${taskId} ${taskId}.`,
     }).catch(() => {});
     recordFleetAuditPresentation({ kind: 'lifecycle_failure', resource: 'Task', id: taskId,
-      state: 'deleting', category: 'settlement_failed', eventId: new Date().toISOString() });
+      label: before.title, state: 'deleting', category: 'settlement_failed', eventId: new Date().toISOString() });
     throw error;
   }
   const deadline = Date.now() + PUBLIC_SETTLE_WAIT_MS;
@@ -518,8 +524,9 @@ async function launchTaskDeleteWorker(
     }
     await sleep(PUBLIC_SETTLE_POLL_MS);
   }
+  const remaining = readDeletion();
   recordFleetAuditPresentation({ kind: 'lifecycle_failure', resource: 'Task', id: taskId,
-    state: 'deleting', category: 'settlement_pending', eventId: new Date().toISOString() });
+    label: remaining.title ?? before.title, state: 'deleting', category: 'settlement_pending', eventId: new Date().toISOString() });
   return { deleted: false, timedOut: true };
 }
 
@@ -536,7 +543,7 @@ async function launchRoomDeleteWorker(
     });
     const room = getRoomRecord(roomId);
     if (room) recordFleetAuditPresentation({ kind: 'lifecycle_failure', resource: 'Room', id: roomId,
-      state: room.state, category: 'cleanup_failed',
+      label: room.room_name, state: room.state, category: 'cleanup_failed',
       eventId: room.close?.error_at ?? room.close?.accepted_at ?? room.created_at });
     throw error;
   }
@@ -551,7 +558,7 @@ async function launchRoomDeleteWorker(
   }
   const remaining = getRoomRecord(roomId);
   if (remaining) recordFleetAuditPresentation({ kind: 'lifecycle_failure', resource: 'Room', id: roomId,
-    state: remaining.state, category: 'cleanup_pending',
+    label: remaining.room_name, state: remaining.state, category: 'cleanup_pending',
     eventId: remaining.close?.accepted_at ?? remaining.created_at });
   return { deleted: remaining === undefined, timedOut: true };
 }
@@ -1477,8 +1484,6 @@ export function registerRoomCommands(parent: Command, cOpt: (cmd: Command) => Co
           actor: { kind: 'local_control', surface: 'cli' }, roomId: id,
         });
         const closing = getRoomRecord(id);
-        if (previous && closing && previous.state !== closing.state)
-          auditRoom('close', closing, previous.state, closing.state);
         const settled = await launchRoomDeleteWorker(id, opts.configuration);
         if (closing) auditRoom('delete', closing, closing.state,
           settled.deleted ? 'deleted' : 'closing');

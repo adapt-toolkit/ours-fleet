@@ -343,7 +343,7 @@ describe('owner channel daemon-generation recovery', () => {
     await proactive;
     const sends = client.calls.filter(call => call.name === 'sendMessage');
     expect(sends).toHaveLength(1);
-    expect(sends[0].args?.text).toContain('spawned temporary Agent Temp (Temp) — ready');
+    expect(sends[0].args?.text).toContain('🚀 Agent launched: Temp');
     await channel.close();
   });
 
@@ -371,15 +371,18 @@ describe('owner channel daemon-generation recovery', () => {
     const sends = client.calls.filter(call => call.name === 'sendMessage');
     expect(sends).toHaveLength(1);
     const text = String(sends[0].args?.text);
-    expect(text).toContain('spawned temporary Agent Dev (Dev) — ready');
-    expect(text).toContain('Role preset `reviewer`');
-    expect(text).toContain('mission “Review every change”');
-    expect(text).toContain('Brain preset `codex-high`');
-    expect(text).toContain('harness `codex`');
-    expect(text).toContain('model `gpt-test`');
-    expect(text).toContain('effort high');
-    expect(text).toContain('approval=ask, filesystem=workspace, unattended=wait');
-    expect(text).toContain('mode ask/read-only');
+    expect(text).toContain('🚀 Agent launched: Dev');
+    expect(text).toContain('- **Role:** Preset `reviewer`');
+    expect(text).toContain('- **Mission:** “Review every change”');
+    expect(text).toContain('- **Brain:** Preset `codex-high`');
+    expect(text).toContain('- **Harness:** `codex`');
+    expect(text).toContain('- **Model:** `gpt-test`');
+    expect(text).toContain('- **Effort:** high');
+    expect(text).toContain('- **Approval:** ask');
+    expect(text).toContain('- **Filesystem:** workspace');
+    expect(text).toContain('- **Wait:** wait');
+    expect(text).toContain('- **Fleet mode:** ask');
+    expect(text).toContain('- **Native mode:** read-only');
     expect(text).not.toContain('inline:sha256');
     await channel.close();
   });

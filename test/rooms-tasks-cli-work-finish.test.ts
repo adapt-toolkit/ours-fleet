@@ -470,8 +470,9 @@ describe('canonical proxied Task/Room audit metadata', () => {
     expect(consumeFleetAuditCollection()).toMatchObject({
       resourceIds: { task: id, room: ROOM_ID },
       presentations: [
-        { kind: 'room', operation: 'create', id: ROOM_ID, previousState: 'none', newState: 'provisioning' },
-        { kind: 'room', operation: 'activate', id: ROOM_ID, previousState: 'provisioning', newState: 'active' },
+        { kind: 'task', operation: 'work', id, title: 'Audited task',
+          previousState: 'provisioning', newState: 'active', roomId: ROOM_ID,
+          roomName: expect.any(String) },
       ],
     });
   });
@@ -501,8 +502,6 @@ describe('canonical proxied Task/Room audit metadata', () => {
     expect(consumeFleetAuditCollection()).toMatchObject({
       resourceIds: { room: ROOM_ID },
       presentations: [
-        { kind: 'room', operation: 'create', id: ROOM_ID,
-          previousState: 'none', newState: 'provisioning', template: 'durable@7', participants: [] },
         { kind: 'room', operation: 'activate', id: ROOM_ID,
           previousState: 'provisioning', newState: 'active', template: 'durable@7',
           participants: [] },
@@ -513,7 +512,6 @@ describe('canonical proxied Task/Room audit metadata', () => {
     beginFleetAuditCollection();
     await runRoom('delete', ROOM_ID, ROOM_ID, ...(json ? ['--json'] : []));
     expect(consumeFleetAuditCollection().presentations).toMatchObject([
-      { kind: 'room', operation: 'close', id: ROOM_ID, previousState: 'active', newState: 'closing' },
       { kind: 'room', operation: 'delete', id: ROOM_ID, previousState: 'closing', newState: 'deleted',
         template: 'durable@7', participants: [{ name: expect.any(String), role: expect.any(String) }] },
     ]);
@@ -603,16 +601,17 @@ describe('task provisioning command outcomes', () => {
     out = [];
     await run('_provision', task.task_id);
     const first = mocks.presentFleetWorkerLifecycle.mock.calls[0]?.[0] as Array<Record<string, unknown>>;
-    expect(first.filter(event => event.kind === 'room' && event.operation === 'activate')).toEqual([
-      expect.objectContaining({ id: ROOM_ID, eventId: expect.stringMatching(/^room-ready:/) }),
+    expect(first.filter(event => event.kind === 'task' && event.operation === 'work')).toEqual([
+      expect.objectContaining({ id: task.task_id, title: 'Detached ready', roomId: ROOM_ID,
+        roomName: expect.any(String), eventId: expect.stringMatching(/^task-ready:/) }),
     ]);
 
     // A worker replay observes the same durable activation and presents the
     // same digest; the Owner ledger therefore suppresses a second notice.
     await run('_provision', task.task_id);
     const replay = mocks.presentFleetWorkerLifecycle.mock.calls[1]?.[0] as Array<Record<string, unknown>>;
-    expect(replay.find(event => event.operation === 'activate')?.eventId)
-      .toBe(first.find(event => event.operation === 'activate')?.eventId);
+    expect(replay.find(event => event.operation === 'work')?.eventId)
+      .toBe(first.find(event => event.operation === 'work')?.eventId);
     expect(mocks.launchFleetWorker).toHaveBeenCalledTimes(1);
   });
 

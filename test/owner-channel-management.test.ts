@@ -178,7 +178,7 @@ describe('OwnerChannel live management', () => {
     await second.channel.start();
     await second.channel.notifyFleetLifecycle!([ready]);
     const notices = second.client.calls.filter(call => call.name === 'sendMessage'
-      && String(call.args?.text).includes('The room Restart ready is ready.'));
+      && String(call.args?.text).includes('🏠 Room ready: Restart ready'));
     expect(notices).toHaveLength(1);
     expect(notices[0]?.args?.contact).toBe(OWNER);
     expect(JSON.parse(readFileSync(join(first.dir, '.owner-channel-lifecycle-outbox.json'), 'utf8')))
@@ -214,7 +214,7 @@ describe('OwnerChannel live management', () => {
     await channel.notifyFleetLifecycle!([ready]);
     await channel.notifyFleetLifecycle!([ready]);
     const notices = client.calls.filter(call => call.name === 'sendMessage'
-      && String(call.args?.text).includes('The room Detached ready is ready.'));
+      && String(call.args?.text).includes('🏠 Room ready: Detached ready'));
     expect(notices).toHaveLength(1);
     expect(notices[0]?.args?.contact).toBe(OWNER);
     await channel.close();
@@ -589,10 +589,10 @@ describe('OwnerChannel live management', () => {
     const texts = client.calls.filter(call => call.name === 'sendMessage')
       .map(call => String(call.args?.text ?? ''));
     expect(texts.filter(text => text.includes('Fleet command'))).toEqual([]);
-    expect(texts.filter(text => text.includes('📋 Task'))).toEqual([
+    expect(texts.filter(text => text.includes('🚀 Task started:'))).toEqual([
       expect.stringContaining('Unicode Δ'),
     ]);
-    expect(texts.filter(text => text.startsWith('Agent has created the room'))).toEqual([
+    expect(texts.filter(text => text.startsWith('⏳ Room “'))).toEqual([
       expect.stringContaining('Room Δ'),
     ]);
     expect(texts.join('\n')).not.toContain('private');
@@ -683,8 +683,8 @@ describe('OwnerChannel live management', () => {
       .resolves.toMatchObject({ outcome: { delivery: 'uncertain' } });
     const texts = client.calls.filter(call => call.name === 'sendMessage')
       .map(call => String(call.args?.text ?? ''));
-    expect(texts.filter(text => text.includes('📋 Task'))).toHaveLength(1);
-    expect(texts.filter(text => text.startsWith('Agent has created the room'))).toHaveLength(1);
+    expect(texts.filter(text => text.includes('🚀 Task started:'))).toHaveLength(1);
+    expect(texts.filter(text => text.startsWith('⏳ Room “'))).toHaveLength(1);
     await channel.close();
   });
 
