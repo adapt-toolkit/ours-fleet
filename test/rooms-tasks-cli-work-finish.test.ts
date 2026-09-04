@@ -12,6 +12,7 @@ import { snapshotTemplate } from '../src/rooms-tasks/templates.js';
 const mocks = vi.hoisted(() => ({
   createRoom: vi.fn(),
   acceptInvite: vi.fn(),
+  setRoleCommands: vi.fn(),
   closeRoom: vi.fn().mockResolvedValue(undefined),
   deleteRoom: vi.fn().mockResolvedValue(undefined),
   provisionMembers: vi.fn(),
@@ -33,6 +34,7 @@ vi.mock('../src/rooms-tasks/cowork-adapter.js', async (importOriginal) => {
     createCoworkAdapter: () => ({
       createRoom: mocks.createRoom,
       acceptInvite: mocks.acceptInvite,
+      setRoleCommands: mocks.setRoleCommands,
       closeRoom: mocks.closeRoom,
       deleteRoom: mocks.deleteRoom,
       recoverRoom: mocks.recoverRoom,
@@ -200,6 +202,7 @@ beforeEach(() => {
 
   mocks.createRoom.mockReset().mockResolvedValue({ room_id: ROOM_ID, identity_cid: 'c'.repeat(64) });
   mocks.acceptInvite.mockReset().mockResolvedValue({ seat_cid: 'a'.repeat(64) });
+  mocks.setRoleCommands.mockReset().mockResolvedValue(undefined);
   mocks.recoverRoom.mockReset().mockResolvedValue({
     room_id: ROOM_ID, identity_name: 'room-id', identity_cid: 'c'.repeat(64),
     room_name: 'Fix the parser', state: 'active', seats: [], role_briefings: {},
