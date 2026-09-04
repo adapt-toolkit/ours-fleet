@@ -109,7 +109,7 @@ describe('packaged default role contract', () => {
       expect(local).toMatch(/never invoke a Fleet task block/);
       const coordinatorBytes = readFileSync('presets/fleet/roles/Coordinator.yaml');
       expect(createHash('sha256').update(coordinatorBytes).digest('hex'))
-        .toBe('d3755d292924cf29ba88abe68bf084aec91daae2e1c3eb6c64b57019d8c4dc52');
+        .toBe('18b20d31ffe7dc90954a04aec60765102d5c4ea09068deb47729c8e81b22c1cd');
     } finally { rmSync(root, { recursive: true, force: true }); }
   });
 
