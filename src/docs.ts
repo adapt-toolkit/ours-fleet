@@ -488,8 +488,8 @@ room (tolerating already-missing remote rooms), releases the sealed launch
 snapshot, and unlinks the task record last. While cleanup settles the task is
 hidden from normal listings and every lifecycle mutation is rejected; if
 cleanup cannot complete (for example Cowork is unreachable), the deletion stays
-in a precise recoverable state — repeat the delete command or run
-\`task recover <id>\` to converge after outages, crashes, or restarts. Deletion
+in a precise resumable state — repeat the identical delete command to converge
+after outages, crashes, or restarts. Deletion
 never fabricates a \`done\` transition. A metadata-only deletion receipt
 (acceptance actor, original state, timestamps, completion) is retained under
 \`deletion-receipts/\` as durable audit evidence. An already-missing task is an

@@ -56,15 +56,15 @@ export interface TaskSettlementPlan {
   task: TaskRecord;
   settlementRequired: boolean;
 }
-export type TaskRecoveryIssue =
-  | { code: 'terminal_pending' | 'waiting_cowork' | 'waiting_owner_invite' | 'owner_cid_mismatch' | 'waiting_seats' | 'provisioning_resumed' }
+export type TaskProvisioningContinuationIssue =
+  | { code: 'waiting_cowork' | 'waiting_owner_invite' | 'owner_cid_mismatch' | 'waiting_seats' | 'provisioning_resumed' }
   | { code: 'member_failed'; stepIndex: number }
   | { code: 'resume_failed'; error: string };
-export interface TaskRecoveryResult {
-  kind: 'provisioning_resumed' | 'provisioning_resume_failed' | 'provisioning_non_resumable' | 'terminal' | 'no_op';
+export interface TaskProvisioningContinuationResult {
+  kind: 'provisioning_resumed' | 'provisioning_resume_failed' | 'provisioning_non_resumable' | 'no_op';
   task: TaskRecord;
   room: RoomOrchestrationRecord | undefined;
-  issues: TaskRecoveryIssue[];
+  issues: TaskProvisioningContinuationIssue[];
   reason?: 'missing_room' | 'missing_durable_template' | 'non_resumable_phase';
 }
 export interface TaskProvisioningOutcome {
@@ -115,11 +115,6 @@ export function recordTaskProvisioningOutcome(outcome: TaskProvisioningOutcome):
     eventId: outcome.task.ended_at ?? room?.created_at ?? outcome.task.created_at,
   });
 }
-export type TaskRecoveryBegin =
-  | { kind: 'terminal_worker_required'; taskId: string }
-  | { kind: 'deletion_worker_required'; taskId: string }
-  | { kind: 'final'; result: TaskRecoveryResult };
-
 export class TaskRoomApplicationError extends Error {
   constructor(readonly code: 'template_not_found' | 'task_template_drift' | 'template_mismatch'
     | 'task_terminal' | 'task_terminal_already' | 'task_non_resumable' | 'task_deleting'
@@ -174,7 +169,6 @@ export interface TaskRoomServiceDeps {
 
 /** Exact extraction of the previously CLI-owned task create/start behavior. */
 export class TaskRoomApplicationService {
-  private recovery?: { taskId: string; config: FleetConfig };
   constructor(
     private readonly configurationPath?: string,
     private readonly deps: TaskRoomServiceDeps = {},
@@ -368,7 +362,7 @@ export class TaskRoomApplicationService {
         : room?.provisioning_detail === 'waiting_cowork'
           ? 'Restore ours-cowork, then await the same task.'
           : failed
-            ? `Correct the blocker, then run ours-fleet task recover ${task.task_id}.`
+            ? `Correct the blocker, then run ours-fleet task await ${task.task_id}.`
             : undefined;
     return {
       kind: failed ? 'failed' : ready ? 'ready' : 'in_progress', task, room,
@@ -555,44 +549,15 @@ export class TaskRoomApplicationService {
     return recordTaskTerminalIntentError(input.taskId, input.error, input.recoveryHint);
   }
 
-  async beginTaskRecovery(input: { actor: TaskRoomActor; taskId: string }): Promise<TaskRecoveryBegin> {
-    // The deletion-vs-terminal routing decision serializes on the common
-    // task-operation lock and must not require configuration: recovery of a
-    // deletion-pending task continues the deletion and never resurrects.
-    const routed = await withFileLock(
-      taskOperationLockPath(input.taskId),
-      () => {
-        const task = readTask(input.taskId);
-        if (task.deletion?.status === 'pending') return 'deletion' as const;
-        if (task.terminal_intent?.status === 'pending') return 'terminal' as const;
-        return 'none' as const;
-      },
-      {},
-      TASK_OPERATION_LOCK_STALE_MS,
-    );
-    if (routed === 'deletion') return { kind: 'deletion_worker_required', taskId: input.taskId };
-    const config = (this.deps.loadConfiguration ?? loadConfig)(this.configurationPath);
-    this.recovery = { taskId: input.taskId, config };
-    if (routed === 'terminal')
-      return { kind: 'terminal_worker_required', taskId: input.taskId };
-    return { kind: 'final', result: await this.continueTaskRecovery({
-      actor: input.actor, taskId: input.taskId, terminalTimedOut: false,
-    }) };
-  }
-
-  async continueTaskRecovery(input: {
-    actor: TaskRoomActor; taskId: string; terminalTimedOut: boolean;
-  }): Promise<TaskRecoveryResult> {
-    if (!this.recovery || this.recovery.taskId !== input.taskId)
-      throw new Error('task recovery continuation requires a matching begin');
-    const recovery = this.recovery;
-    this.recovery = undefined;
-    const cfg = recovery.config;
+  async continueTaskProvisioning(input: {
+    actor: { kind: 'internal_worker'; surface: 'cli' }; taskId: string;
+  }): Promise<TaskProvisioningContinuationResult> {
+    const cfg = (this.deps.loadConfiguration ?? loadConfig)(this.configurationPath);
     let task = readTask(input.taskId);
     let room = task.room_id ? getRoomRecord(task.room_id) : undefined;
-    const issues: TaskRecoveryIssue[] = input.terminalTimedOut ? [{ code: 'terminal_pending' }] : [];
+    const issues: TaskProvisioningContinuationIssue[] = [];
     if (task.state !== 'provisioning') return {
-      kind: TASK_TERMINAL_STATES.includes(task.state) ? 'terminal' : 'no_op', task, room, issues,
+      kind: 'no_op', task, room, issues,
     };
     if (!room) {
       if (!task.template) return {
@@ -617,7 +582,7 @@ export class TaskRoomApplicationService {
     if (room.provisioning_detail === 'waiting_owner_invite'
         || room.provisioning_detail === 'owner_cid_mismatch') {
       try {
-        await this.recoverRoom({ actor: input.actor, roomId: room.room_id });
+        await this.reconcileProvisioningOwner(cfg, room.room_id);
         task = readTask(task.task_id);
         room = getRoomRecord(room.room_id);
         if (task.state === 'active' && room?.state === 'active') return {
@@ -659,6 +624,39 @@ export class TaskRoomApplicationService {
       issues.push({ code: 'resume_failed', error: error instanceof Error ? error.message : String(error) });
       return { kind: 'provisioning_resume_failed', task, room, issues };
     }
+  }
+
+  private async reconcileProvisioningOwner(cfg: FleetConfig, roomId: string): Promise<void> {
+    if (!cfg.rooms)
+      throw new ConfigError('rooms: configuration is required before creating or querying rooms');
+    const cowork = this.deps.cowork ? this.deps.cowork(cfg)
+      : createCoworkAdapter({ configPath: cfg.rooms.cowork?.config });
+    const remote = await cowork.recoverRoom(roomId);
+    const room = getRoomRecord(roomId);
+    if (!room) throw new Error(`room ${roomId} has no durable orchestration record`);
+    if (room.state === 'closing' || room.state === 'closed')
+      throw new Error(`room ${roomId} is already ${room.state}`);
+    const policy = storedRoomLaunchPolicy(room.room_policy);
+    if ((remote.anonymous ?? false) !== policy.anonymous) {
+      const error = `Cowork anonymity (${String(remote.anonymous ?? false)}) does not match Fleet's durable Room policy (${String(policy.anonymous)})`;
+      setSagaError(roomId, error,
+        'Do not respawn members. Repair or upgrade Cowork, then retry the originating task.',
+        'waiting_cowork');
+      throw new Error(error);
+    }
+    if (room.owner_seat_cid) return;
+    const expected = cfg.rooms.owner.expected_cid?.toLowerCase();
+    if (!expected)
+      throw new ConfigError('rooms.owner.expected_cid is required before continuing Owner-seat provisioning');
+    const existing = (await cowork.getSeats(roomId))
+      .find(seat => seat.identity_cid.toLowerCase() === expected && seat.seat_state !== 'removed');
+    if (!existing && !cfg.ownerInvite)
+      throw new ConfigError('rooms.owner: configure public_invite or public_invite_file before continuing task provisioning');
+    const acceptedCid = existing?.identity_cid ?? (await cowork.acceptInvite(roomId, cfg.ownerInvite!, {
+      role: cfg.rooms.owner.role, expected_cid: cfg.rooms.owner.expected_cid,
+    })).seat_cid;
+    setOwnerSeat(roomId, acceptedCid, cfg.ownerInviteFingerprint ?? '');
+    advanceSaga(roomId, 'create_members', 3);
   }
 
   private async acceptTerminal(

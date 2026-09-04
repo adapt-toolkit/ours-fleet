@@ -39,8 +39,6 @@ export interface OwnerFleetOps {
   settleTaskDeletion(taskId: string): Promise<void>;
   /** Continue an accepted provisioning saga until convergence. */
   provisionTask(taskId: string): Promise<void>;
-  /** Explicit recovery may also route terminal and deletion intents. */
-  recoverTask(taskId: string): Promise<void>;
 }
 
 /**
@@ -77,7 +75,6 @@ export interface OwnerCommandContext {
   closeRoom(roomId: string): Promise<void>;
   /** Persist terminal intent, acknowledge it, then launch the external settle worker. */
   terminalTask(taskId: string, kind: TaskTerminalIntent['kind'], outcome?: TaskOutcome): Promise<void>;
-  recoverTask(taskId: string): Promise<void>;
   createTask(input: Omit<CreateTaskRequest, 'actor'>): Promise<TaskRecord>;
   startTask(taskId: string): Promise<TaskProvisioningOutcome | TaskRecord>;
   awaitTask?(taskId: string): Promise<TaskProvisioningOutcome>;
@@ -238,7 +235,7 @@ const taskProvisioningAction = (outcome: TaskProvisioningOutcome): string => {
   if (outcome.kind === 'failed') return renderMarkdownFailure({
     kind: 'state', subject: `/task await ${outcome.task.task_id}`,
     detail: outcome.blocker ?? 'Provisioning reached a terminal failure.',
-    action: outcome.next_action ?? `Run /task recover ${outcome.task.task_id}.`,
+    action: outcome.next_action ?? `Run /task await ${outcome.task.task_id}.`,
   });
   return taskAction(outcome.kind === 'ready' ? 'Room provisioning complete'
     : outcome.next_action ? 'Room provisioning needs attention' : 'Room provisioning continues',
@@ -429,7 +426,7 @@ export const ownerCommands: OwnerCommand[] = [
   },
   {
     name: 'task',
-    usage: '/task <create|list|show|start|block|unblock|review|done|cancel|delete|recover> ...',
+    usage: '/task <create|list|show|start|await|block|unblock|review|done|cancel|delete> ...',
     summary: 'task lifecycle subcommands',
     execute: async (ctx, args) => {
       if (!args) throw new OwnerCommandUsageError('usage: /task <subcommand> <id>');
@@ -622,13 +619,10 @@ export const ownerCommands: OwnerCommand[] = [
             await ctx.deleteTask(rest[0]);
             break;
           }
-          case 'recover': {
-            if (!rest[0]) throw new OwnerCommandUsageError('usage: /task recover <id>');
-            await ctx.recoverTask(rest[0]);
-            break;
-          }
           default:
             // bare /task <id> → show
+            if (sub === 'recover' || rest.length)
+              throw new OwnerCommandUsageError(`unknown task subcommand: ${sub}`);
             await showTask(sub);
         }
       } catch (e) {
@@ -942,9 +936,6 @@ export function fleetCliOps(role: string, configPath?: string): OwnerFleetOps {
     ),
     provisionTask: taskId => launchFleetWorker(
       ['task', '_provision', taskId], `task-provision-${taskId}`, configPath,
-    ),
-    recoverTask: taskId => launchFleetWorker(
-      ['task', '_recover', taskId], `task-recover-${taskId}`, configPath,
     ),
   };
 }

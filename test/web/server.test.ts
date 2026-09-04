@@ -168,7 +168,7 @@ describe('secure local web host', () => {
     expect(pending.json()).toMatchObject({
       task_id: 'task-id', accepted: true, deletion: 'pending',
       error: 'Cowork management socket is not reachable' });
-    expect(pending.json().recovery).toContain('task recover task-id');
+    expect(pending.json().recovery).toContain('DELETE /api/v1/tasks/task-id?confirm=task-id');
 
     // Concurrent settlement already removed the record → idempotent 200.
     taskRooms.requestTaskDeletion.mockResolvedValueOnce({ status: 'already_absent' });

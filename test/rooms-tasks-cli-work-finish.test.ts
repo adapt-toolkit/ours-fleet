@@ -529,6 +529,16 @@ describe('canonical proxied Task/Room audit metadata', () => {
     expect(room?.helpInformation()).not.toContain('recover');
   });
 
+  it('rejects the removed task recover subcommand before any provisioning effect', async () => {
+    await expect(run('recover', 'legacy-task')).rejects.toMatchObject({
+      code: 'commander.unknownCommand',
+    });
+    expect(out.join('\n')).toContain("unknown command 'recover'");
+    expect(mocks.provisionMembers).not.toHaveBeenCalled();
+    const task = makeProgram().commands.find(command => command.name() === 'task');
+    expect(task?.helpInformation()).not.toContain('recover');
+  });
+
   it('classifies proxied JSON validation separately from unexpected runtime failure', async () => {
     beginFleetAuditCollection();
     await expect(runLocalTask('show', 'definitely-missing', '--json')).rejects.toThrow(ExitError);
@@ -664,7 +674,7 @@ describe('task provisioning command outcomes', () => {
     await run('await', task.task_id, '--wait-ms', '0', '--json');
     const outcome = JSON.parse(out.join('\n')).provisioning;
     expect(outcome).toMatchObject({ kind: 'failed', blocker: 'permanent configuration blocker' });
-    expect(outcome.next_action).toContain(`task recover ${task.task_id}`);
+    expect(outcome.next_action).toContain(`task await ${task.task_id}`);
   });
 });
 
@@ -993,30 +1003,6 @@ describe('task work', () => {
     }));
   });
 
-  it('task recover refreshes output and uses the durable room snapshot after config drift', async () => {
-    writeCustomTemplate(true);
-    mocks.provisionMembers.mockImplementationOnce(async ({ roomId }: { roomId: string }) => {
-      advanceSaga(roomId, 'wait_seats', 5, 'waiting_seats');
-      return getRoomRecord(roomId)!;
-    });
-    const t = backlogTask();
-    await run('work', t.task_id, '--template', 'durable');
-    writeCustomTemplate(false);
-    out = [];
-    mocks.markdownRender.mockClear();
-    await run('recover', t.task_id, '--json');
-    const payload = JSON.parse(out.join('\n'));
-    expect(payload.task.state).toBe('active');
-    expect(payload.room.state).toBe('active');
-    expect(mocks.provisionMembers).toHaveBeenLastCalledWith(expect.objectContaining({
-      template: expect.objectContaining({ name: 'durable', version: 7 }),
-    }));
-    expectExactJson({
-      schema_version: 1, task: getTask(t.task_id), room: getRoomRecord(ROOM_ID),
-      recovery_actions: ['Provisioning resumed successfully'],
-    });
-  });
-
   it('refuses to resume a waiting room under a different --template', async () => {
     mocks.provisionMembers.mockImplementationOnce(async ({ roomId }: { roomId: string }) => {
       advanceSaga(roomId, 'wait_seats', 5, 'waiting_seats');
@@ -1059,7 +1045,7 @@ describe('task work', () => {
     await run('work', t.task_id);
     advanceSaga(ROOM_ID, 'create_room', 1);
     await expect(run('work', t.task_id)).rejects.toThrow(ExitError);
-    expect(out.join('\n')).toContain('task recover');
+    expect(out.join('\n')).toContain(`task start ${t.task_id}`);
   });
 });
 
@@ -1137,9 +1123,9 @@ describe('task finish', () => {
       terminal_intent: {
         status: 'pending',
         first_failure: 'hidden worker failed',
-        first_recovery_hint: `Retry 'ours-fleet task recover ${t.task_id}'.`,
+        first_recovery_hint: `Retry 'ours-fleet task done ${t.task_id}'.`,
         error: 'hidden worker failed',
-        recovery_hint: `External settle worker failed. Retry task recover ${t.task_id}.`,
+        recovery_hint: 'External settle worker failed. Retry the originating task terminal command.',
       },
     });
   });
@@ -1155,37 +1141,6 @@ describe('task finish', () => {
     });
   });
 
-  it('the recovery worker orders begin, settlement, then continuation', async () => {
-    const t = backlogTask();
-    const begin = vi.spyOn(TaskRoomApplicationService.prototype, 'beginTaskRecovery')
-      .mockResolvedValue({ kind: 'terminal_worker_required', taskId: t.task_id });
-    const settle = vi.spyOn(TaskRoomApplicationService.prototype, 'settleTask').mockResolvedValue(t);
-    const continuation = vi.spyOn(TaskRoomApplicationService.prototype, 'continueTaskRecovery')
-      .mockResolvedValue({ kind: 'no_op', task: t, room: undefined, issues: [] });
-    await run('_recover', t.task_id);
-    expect(begin).toHaveBeenCalledOnce();
-    expect(settle).toHaveBeenCalledOnce();
-    expect(continuation).toHaveBeenCalledWith({
-      actor: { kind: 'internal_worker', surface: 'cli' }, taskId: t.task_id, terminalTimedOut: false,
-    });
-    expect(begin.mock.invocationCallOrder[0]).toBeLessThan(settle.mock.invocationCallOrder[0]);
-    expect(settle.mock.invocationCallOrder[0]).toBeLessThan(continuation.mock.invocationCallOrder[0]);
-  });
-
-  it('the recovery worker records settlement failure and never continues', async () => {
-    mocks.deleteManagedRoom.mockRejectedValue(new Error('recovery settle failed'));
-    const t = await activeTask();
-    reviewTask(t.task_id);
-    await acceptTaskTerminalIntent({ taskId: t.task_id, kind: 'done', roomId: t.room_id });
-    const continuation = vi.spyOn(TaskRoomApplicationService.prototype, 'continueTaskRecovery');
-    await expect(run('_recover', t.task_id)).rejects.toThrow(ExitError);
-    expect(continuation).not.toHaveBeenCalled();
-    expect(getTask(t.task_id)).toMatchObject({ terminal_intent: {
-      status: 'pending', error: 'recovery settle failed',
-      recovery_hint: `External settle worker failed. Retry task recover ${t.task_id}.`,
-    } });
-  });
-
   it('records a CLI settlement-worker launch failure through durable terminal state', async () => {
     mocks.launchFleetWorker.mockRejectedValueOnce(new Error('worker spawn failed'));
     const t = createTask({
@@ -1195,12 +1150,12 @@ describe('task finish', () => {
     expect(getTask(t.task_id)).toMatchObject({
       terminal_intent: {
         status: 'pending', error: 'worker spawn failed',
-        recovery_hint: `External settle worker failed to start. Retry task recover ${t.task_id}.`,
+        recovery_hint: `External settle worker failed to start. Retry ours-fleet task cancel ${t.task_id} ${t.task_id}.`,
       },
     });
   });
 
-  it('task recover resumes a pending terminal intent to convergence', async () => {
+  it('repeating task finish resumes a pending terminal intent to convergence', async () => {
     mocks.deleteManagedRoom.mockRejectedValueOnce(new Error('room delete failed'));
     const t = await activeTask();
     await expect(run('finish', t.task_id)).rejects.toThrow(ExitError);
@@ -1210,15 +1165,14 @@ describe('task finish', () => {
       return { room_id: roomId, deleted: true };
     });
     out = [];
-    await run('recover', t.task_id);
+    await run('finish', t.task_id);
     expect(getTask(t.task_id)).toMatchObject({
       state: 'done', terminal_intent: {
         status: 'settled', first_failure: 'room delete failed',
-        first_recovery_hint: `Retry 'ours-fleet task recover ${t.task_id}'.`,
+        first_recovery_hint: `Retry 'ours-fleet task done ${t.task_id}'.`,
       },
     });
-    expect(out.join('\n')).toContain(`**Task:** \`${t.task_id}\``);
-    expect(out.join('\n')).toContain('✅ Done');
+    expect(out.join('\n')).toContain('Task finished');
   });
 
   it('emits the finished task as --json', async () => {
@@ -1297,7 +1251,7 @@ describe('task delete', () => {
     } finally { vi.useRealTimers(); }
     const text = out.join('\n');
     expect(text).toContain('deletion was accepted and cleanup is still settling');
-    expect(text).toContain(`task recover ${t.task_id}`);
+    expect(text).toContain(`task delete ${t.task_id} ${t.task_id}`);
     expect(text).not.toContain('## 🗑️ Task deleted');
     expect(getTask(t.task_id).deletion?.status).toBe('pending');
   });

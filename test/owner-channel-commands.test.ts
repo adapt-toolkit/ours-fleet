@@ -60,17 +60,6 @@ function context(overrides: Partial<OwnerCommandContext> = {}): OwnerCommandCont
     fleetList: vi.fn(async () => 'Coordinator: acp'),
     closeRoom,
     terminalTask: vi.fn(async (taskId, kind) => { replies.push(`terminal:${taskId}:${kind}`); }),
-    recoverTask: vi.fn(async taskId => {
-      const task = readTask(taskId);
-      const room = task.room_id ? getRoomRecord(task.room_id) : undefined;
-      replies.push(renderMarkdownResult({ icon: '🛟', title: 'Task recovery', fields: [
-        { label: 'Task', value: task.task_id, kind: 'code' },
-        { label: 'Status', value: taskStatus(task.state), kind: 'markdown' },
-        ...(room ? [{ label: 'Room', value: room.room_id, kind: 'code' as const },
-          { label: 'Room status', value: roomStatus(room.state), kind: 'markdown' as const },
-          { label: 'Saga', value: room.saga.phase, kind: 'code' as const }] : []),
-      ], sections: [{ heading: 'Result', items: ['No automated recovery action is available.'] }] }));
-    }),
     createTask: vi.fn(async input => {
       const { createTask } = await import('../src/rooms-tasks/task-state.js');
       return createTask({
@@ -206,6 +195,7 @@ describe('owner command registry', () => {
       expect(ownerCommands.some(command => command.name === name)).toBe(true);
     expect(help).toContain('/commands');
     expect(help).not.toContain('/room recover');
+    expect(help).not.toContain('/task recover');
   });
 
   it('makes /comments discoverable in help with its label and baseline semantics', () => {
@@ -519,7 +509,6 @@ describe('owner-channel task subcommands', () => {
       `/task unblock ${t.task_id}`,
       `/task review ${t.task_id}`,
       '/task list all',
-      `/task recover ${t.task_id}`,
     ]) {
       const ctx = context();
       await dispatchOwnerCommand(command, ctx);
@@ -729,27 +718,6 @@ describe('owner-channel task subcommands', () => {
     expect(retry.replies[0]).toContain(t.task_id);
   });
 
-  it('/task recover reschedules an accepted pending terminal intent', async () => {
-    const t = await createTestTask();
-    const {
-      activateTask, reviewTask, startTask, updateTaskRoom,
-    } = await import('../src/rooms-tasks/task-state.js');
-    const { acceptTaskTerminalIntent } = await import('../src/rooms-tasks/terminal.js');
-    startTask(t.task_id);
-    activateTask(t.task_id);
-    reviewTask(t.task_id);
-    updateTaskRoom(t.task_id, 'room-terminal-recover', 'c'.repeat(64));
-    await acceptTaskTerminalIntent({
-      taskId: t.task_id,
-      kind: 'done',
-      roomId: 'room-terminal-recover',
-      outcome: { summary: 'recover me' },
-    });
-    const ctx = context();
-    await dispatchOwnerCommand(`/task recover ${t.task_id}`, ctx);
-    expect(ctx.recoverTask).toHaveBeenCalledWith(t.task_id);
-  });
-
   it('/task start without id returns usage', async () => {
     const ctx = context();
     await dispatchOwnerCommand('/task start', ctx);
@@ -885,31 +853,22 @@ describe('owner-channel task subcommands', () => {
     expect(ctx.replies[0]).toContain('No blocked');
   });
 
-  it('/task recover <id> shows task state', async () => {
-    const t = await createTestTask();
+  it.each(['/task recover', '/task recover legacy-task'])(
+    'rejects the removed task recover command: %s', async command => {
     const ctx = context();
-    await dispatchOwnerCommand(`/task recover ${t.task_id}`, ctx);
+    await dispatchOwnerCommand(command, ctx);
     expect(ctx.replies).toHaveLength(1);
-    expect(ctx.replies[0]).toContain(t.task_id);
-    expect(ctx.replies[0]).toContain('Backlog');
-  });
-
-  it('/task recover without id returns usage', async () => {
-    const ctx = context();
-    await dispatchOwnerCommand('/task recover', ctx);
-    expect(ctx.replies).toHaveLength(1);
-    expect(ctx.replies[0]).toContain('usage');
+    expect(ctx.replies[0]).toContain('unknown task subcommand: recover');
   });
 
   it('does not expose CLI-only work or finish as Messenger task actions', async () => {
     for (const name of ['work', 'finish']) {
-      const createTask = vi.fn(); const startTask = vi.fn(); const recoverTask = vi.fn();
-      const ctx = context({ createTask, startTask, recoverTask,
+      const createTask = vi.fn(); const startTask = vi.fn();
+      const ctx = context({ createTask, startTask,
         getTask: vi.fn(() => { throw new Error('not a supported action'); }) });
       await dispatchOwnerCommand(`/task ${name} some-id`, ctx);
       expect(createTask).not.toHaveBeenCalled();
       expect(startTask).not.toHaveBeenCalled();
-      expect(recoverTask).not.toHaveBeenCalled();
     }
   });
 });

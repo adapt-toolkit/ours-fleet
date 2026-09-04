@@ -139,7 +139,7 @@ const AGENT_SURFACES: Record<string, ReadonlySet<string>> = {
   spawn: new Set(['<none>']),
   template: new Set(['list', 'show', 'validate']),
   task: new Set(['create', 'list', 'lists', 'list-create', 'list-rename', 'list-delete', 'move',
-    'show', 'start', 'await', 'block', 'unblock', 'review', 'done', 'cancel', 'delete', 'recover', 'work', 'finish']),
+    'show', 'start', 'await', 'block', 'unblock', 'review', 'done', 'cancel', 'delete', 'work', 'finish']),
   room: new Set(['create', 'list', 'show', 'open', 'members', 'delete', 'close']),
 };
 export const fleetProxyCommandInventory = Object.freeze(Object.fromEntries(
@@ -556,11 +556,11 @@ function appendAgentLines(header: string, heading: string, lines: string[]): str
 export function renderFleetLifecycleEvent(value: FleetAuditPresentation): string {
   if (value.kind === 'lifecycle_failure') {
     const actions = {
-      provision_failed: 'Inspect Fleet service logs, correct configuration, then recover the resource.',
+      provision_failed: 'Inspect Fleet service logs, correct configuration, then retry the originating command.',
       provision_pending: 'Check member readiness, then retry the originating Task or Room command.',
       readiness_failed: 'Inspect the Agent log, correct its configuration, then retry creation.',
-      settlement_failed: 'Inspect Fleet service logs, then run Task recover.',
-      settlement_pending: 'Run Task recover to continue settlement.',
+      settlement_failed: 'Inspect Fleet service logs, then retry the originating Task command.',
+      settlement_pending: 'Retry the originating Task command to continue settlement.',
       cleanup_failed: 'Inspect Fleet service logs, then retry Room delete.',
       cleanup_pending: 'Retry Room delete to continue cleanup.',
     } as const;

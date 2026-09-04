@@ -128,7 +128,7 @@ function taskRoomPublicFailure(error: TaskRoomPublicError): {
     case 'task_template_drift': return {
       legacy: `task template snapshot no longer matches ${f.template ?? 'the recorded template'}`,
       kind: 'state', detail: 'The task template snapshot no longer matches the recorded template.',
-      action: 'Run the matching show and recover commands before retrying.',
+      action: 'Inspect the matching Task and Room, then retry the originating start command.',
     };
     case 'task_terminal': return {
       legacy: `task ${f.task ?? 'requested-task'} is in terminal state '${f.state ?? 'terminal'}'`,
@@ -141,9 +141,9 @@ function taskRoomPublicFailure(error: TaskRoomPublicError): {
       action: 'Run ours-fleet task show to inspect the completed task.',
     };
     case 'task_non_resumable': return {
-      legacy: `task ${f.task ?? 'requested-task'} has room ${f.room ?? 'requested-room'} in a non-resumable state — run 'task recover ${f.task ?? 'requested-task'}'`,
+      legacy: `task ${f.task ?? 'requested-task'} has room ${f.room ?? 'requested-room'} in a non-resumable state`,
       kind: 'state', detail: 'The task’s room is in a non-resumable state.',
-      action: `Run ours-fleet task recover ${f.task ?? '<id>'}.`,
+      action: `Inspect the Task and Room, then retry ours-fleet task start ${f.task ?? '<id>'}.`,
     };
     case 'room_filter': return {
       legacy: 'room state filter must be active, provisioning, or all', kind: 'usage',
@@ -310,7 +310,7 @@ function provisioningMarkdown(outcome: TaskProvisioningOutcome): string {
   if (outcome.kind === 'failed') return renderMarkdownFailure({
     kind: 'state', subject: `task start ${outcome.task.task_id}`,
     detail: outcome.blocker ?? 'Provisioning reached a terminal failure.',
-    action: outcome.next_action ?? `Run ours-fleet task recover ${outcome.task.task_id}.`,
+    action: outcome.next_action ?? `Run ours-fleet task await ${outcome.task.task_id}.`,
   });
   return renderMarkdownResult({
     icon: outcome.kind === 'ready' ? '✅' : outcome.next_action ? '⚠️' : '⏳',
@@ -449,7 +449,7 @@ function errorText(error: unknown): string {
 }
 
 async function launchTaskSettleWorker(
-  taskId: string, configPath?: string,
+  taskId: string, retryCommand: string, configPath?: string,
 ): Promise<{ task: ReturnType<typeof getTask>; timedOut: boolean }> {
   const previousErrorAt = getTask(taskId).terminal_intent?.error_at;
   try {
@@ -457,7 +457,7 @@ async function launchTaskSettleWorker(
   } catch (error) {
     await taskRoomService(configPath).recordSettlementError({
       actor: { kind: 'local_control', surface: 'cli' }, taskId, error: errorText(error),
-      recoveryHint: `External settle worker failed to start. Retry task recover ${taskId}.`,
+      recoveryHint: `External settle worker failed to start. Retry ${retryCommand}.`,
     });
     const task = getTask(taskId);
     recordFleetAuditPresentation({ kind: 'lifecycle_failure', resource: 'Task', id: taskId,
@@ -1018,7 +1018,7 @@ export function registerTaskCommands(parent: Command, cOpt: (cmd: Command) => Co
         if (plan.task.terminal_intent?.status === 'pending') auditTask('settling', plan.task,
           previous, previous, plan.task.terminal_intent.accepted_at);
         const settled = plan.settlementRequired
-          ? await launchTaskSettleWorker(id, opts.configuration)
+          ? await launchTaskSettleWorker(id, `ours-fleet task done ${id}`, opts.configuration)
           : { task: plan.task, timedOut: false };
         const t = settled.task;
         auditTask('done', t, previous);
@@ -1027,7 +1027,7 @@ export function registerTaskCommands(parent: Command, cOpt: (cmd: Command) => Co
           console.log(renderMarkdownFailure({
             kind: 'pending', subject: `task done ${id}`,
             detail: 'The completion request was accepted and is still being settled.',
-            action: `Run ours-fleet task recover ${id}.`,
+            action: `Re-run ours-fleet task done ${id}.`,
           }));
           return;
         }
@@ -1050,7 +1050,7 @@ export function registerTaskCommands(parent: Command, cOpt: (cmd: Command) => Co
         if (plan.task.terminal_intent?.status === 'pending') auditTask('settling', plan.task,
           previous, previous, plan.task.terminal_intent.accepted_at);
         const settled = plan.settlementRequired
-          ? await launchTaskSettleWorker(id, opts.configuration)
+          ? await launchTaskSettleWorker(id, `ours-fleet task cancel ${id} ${id}`, opts.configuration)
           : { task: plan.task, timedOut: false };
         const t = settled.task;
         auditTask('cancel', t, previous);
@@ -1059,7 +1059,7 @@ export function registerTaskCommands(parent: Command, cOpt: (cmd: Command) => Co
           console.log(renderMarkdownFailure({
             kind: 'pending', subject: `task cancel ${id} ${id}`,
             detail: 'The cancellation request was accepted and is still being settled.',
-            action: `Run ours-fleet task recover ${id}.`,
+            action: `Re-run ours-fleet task cancel ${id} ${id}.`,
           }));
           return;
         }
@@ -1101,82 +1101,13 @@ export function registerTaskCommands(parent: Command, cOpt: (cmd: Command) => Co
           console.log(renderMarkdownFailure({
             kind: 'pending', subject: `task delete ${id} ${id}`,
             detail: 'The deletion was accepted and cleanup is still settling.',
-            action: `Re-run ours-fleet task delete ${id} ${id} or ours-fleet task recover ${id}.`,
+            action: `Re-run ours-fleet task delete ${id} ${id}.`,
           }));
           return;
         }
         console.log(renderMarkdownResult({
           icon: '🗑️', title: 'Task deleted',
           fields: [{ label: 'ID', value: id, kind: 'code' }],
-        }));
-      } catch (e) { if (opts.json) die(e); dieTaskRoom(e); }
-    });
-
-  cOpt(taskCmd.command('recover <id>'))
-    .description('attempt to recover a stuck task')
-    .option('--json', 'JSON output')
-    .action(async (id: string, opts: { configuration?: string; json?: boolean }) => {
-      try {
-        const previous = getTask(id).state;
-        const app = taskRoomService(opts.configuration);
-        const actor = { kind: 'local_control' as const, surface: 'cli' as const };
-        const begin = await app.beginTaskRecovery({ actor, taskId: id });
-        if (begin.kind === 'deletion_worker_required') {
-          const settled = await launchTaskDeleteWorker(id, opts.configuration);
-          const payload = { schema_version: 1, task_id: id, deleted: settled.deleted };
-          if (opts.json) { console.log(JSON.stringify(payload, null, 2)); return; }
-          console.log(settled.deleted
-            ? renderMarkdownResult({
-              icon: '🗑️', title: 'Task deletion completed by recovery',
-              fields: [{ label: 'ID', value: id, kind: 'code' }],
-            })
-            : renderMarkdownFailure({
-              kind: 'pending', subject: `task recover ${id}`,
-              detail: 'The task is pending deletion and cleanup is still settling.',
-              action: `Run ours-fleet task delete ${id} ${id} to retry.`,
-            }));
-          return;
-        }
-        const recovered = begin.kind === 'terminal_worker_required'
-          ? await (async () => {
-            const settled = await launchTaskSettleWorker(id, opts.configuration);
-            return app.continueTaskRecovery({ actor, taskId: id, terminalTimedOut: settled.timedOut });
-          })()
-          : begin.result;
-        const t = recovered.task;
-        const room = recovered.room;
-        if (previous === 'provisioning' && t.state === 'active' && room?.state === 'active')
-          recordTaskProvisioningOutcome(app.taskProvisioningOutcome(t.task_id));
-        else auditTask('recover', t, previous);
-        const recoveryActions = recovered.issues.map(issue => {
-          if (issue.code === 'terminal_pending') return `Terminal intent remains pending — retry task recover ${id}`;
-          if (issue.code === 'waiting_cowork') return 'Cowork management socket unreachable — check ours-cowork service';
-          if (issue.code === 'waiting_owner_invite') return 'Owner invite invalid or expired — rotate rooms.owner.public_invite in config';
-          if (issue.code === 'owner_cid_mismatch') return 'Owner CID mismatch — verify rooms.owner.expected_cid matches Messenger identity';
-          if (issue.code === 'member_failed') return `Member creation failed at saga step ${issue.stepIndex} — inspect and retry`;
-          if (issue.code === 'waiting_seats') return 'Members have not accepted their one-time room invites yet — inspect role logs, then retry recovery';
-          if (issue.code === 'resume_failed') return `Resume failed: ${issue.error}`;
-          return 'Provisioning resumed successfully';
-        });
-        const result = { task: t, room: room ?? null, recovery_actions: recoveryActions };
-        if (opts.json) {
-          console.log(JSON.stringify({ schema_version: 1, ...result }, null, 2));
-          return;
-        }
-        console.log(renderMarkdownResult({
-          icon: '🛟', title: 'Task recovery',
-          fields: [
-            { label: 'Task', value: t.task_id, kind: 'code' },
-            { label: 'Status', value: taskStatus(t.state), kind: 'markdown' },
-            ...(room ? [
-              { label: 'Room', value: room.room_id, kind: 'code' as const },
-              { label: 'Room status', value: roomStatus(room.state), kind: 'markdown' as const },
-              { label: 'Saga', value: room.saga.phase, kind: 'code' as const },
-            ] : []),
-          ],
-          sections: recoveryActions.length
-            ? [{ heading: 'Next steps', items: recoveryActions }]
-            : [{ heading: 'Result', items: ['No automated recovery action is available.'] }],
         }));
       } catch (e) { if (opts.json) die(e); dieTaskRoom(e); }
     });
@@ -1198,7 +1129,7 @@ export function registerTaskCommands(parent: Command, cOpt: (cmd: Command) => Co
       } catch (e) {
         await taskRoomService(opts.configuration).recordSettlementError({
           actor: { kind: 'internal_worker', surface: 'cli' }, taskId: id,
-          error: errorText(e), recoveryHint: `External settle worker failed. Retry task recover ${id}.`,
+          error: errorText(e), recoveryHint: `External settle worker failed. Retry the originating task terminal command.`,
         }).catch(() => {});
         if (opts.json) die(e);
         dieTaskRoom(e);
@@ -1218,12 +1149,9 @@ export function registerTaskCommands(parent: Command, cOpt: (cmd: Command) => Co
               await presentDetachedProvisioningOutcome(before);
               return;
             }
-            const recovery = await app.beginTaskRecovery({
+            await app.continueTaskProvisioning({
               actor: { kind: 'internal_worker', surface: 'cli' }, taskId: id,
             });
-            // Provisioning continuation never settles deletion or terminal
-            // intents; explicit task recover retains that broader authority.
-            if (recovery.kind !== 'final') return;
             const outcome = app.taskProvisioningOutcome(id);
             if (outcome.kind !== 'in_progress') {
               await presentDetachedProvisioningOutcome(outcome);
@@ -1262,36 +1190,6 @@ export function registerTaskCommands(parent: Command, cOpt: (cmd: Command) => Co
         if (opts.json) die(e);
         dieTaskRoom(e);
       }
-    });
-
-  cOpt(taskCmd.command('_recover <id>', { hidden: true }))
-    .description('internal: settle and continue task recovery')
-    .option('--json', 'JSON output')
-    .action(async (id: string, opts: { configuration?: string; json?: boolean }) => {
-      const app = taskRoomService(opts.configuration);
-      const actor = { kind: 'internal_worker' as const, surface: 'cli' as const };
-      try {
-        const begin = await app.beginTaskRecovery({ actor, taskId: id });
-        if (begin.kind === 'deletion_worker_required') {
-          const settled = await app.settleTaskDeletion({ actor, taskId: id });
-          console.log(JSON.stringify({ schema_version: 1, deletion: settled }, null, 2));
-          return;
-        }
-        const result = begin.kind === 'terminal_worker_required'
-          ? await (async () => {
-            try { await app.settleTask({ actor, taskId: id }); }
-            catch (error) {
-              await app.recordSettlementError({
-                actor, taskId: id, error: errorText(error),
-                recoveryHint: `External settle worker failed. Retry task recover ${id}.`,
-              }).catch(() => {});
-              throw error;
-            }
-            return app.continueTaskRecovery({ actor, taskId: id, terminalTimedOut: false });
-          })()
-          : begin.result;
-        console.log(JSON.stringify({ schema_version: 1, recovery: result }, null, 2));
-      } catch (e) { if (opts.json) die(e); dieTaskRoom(e); }
     });
 
   cOpt(taskCmd.command('work <id>'))
@@ -1373,7 +1271,7 @@ export function registerTaskCommands(parent: Command, cOpt: (cmd: Command) => Co
         if (plan.task.terminal_intent?.status === 'pending') auditTask('settling', plan.task,
           previous, previous, plan.task.terminal_intent.accepted_at);
         const settled = plan.settlementRequired
-          ? await launchTaskSettleWorker(id, opts.configuration)
+          ? await launchTaskSettleWorker(id, `ours-fleet task finish ${id}`, opts.configuration)
           : { task: plan.task, timedOut: false };
         const t = settled.task;
         auditTask('finish', t, previous);
@@ -1386,7 +1284,7 @@ export function registerTaskCommands(parent: Command, cOpt: (cmd: Command) => Co
           console.log(renderMarkdownFailure({
             kind: 'pending', subject: `task finish ${id}`,
             detail: 'The finish request was accepted and is still being settled.',
-            action: `Run ours-fleet task recover ${id}.`,
+            action: `Re-run ours-fleet task finish ${id}.`,
           }));
           return;
         }

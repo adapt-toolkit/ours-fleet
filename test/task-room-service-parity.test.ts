@@ -408,7 +408,7 @@ describe('task create/start surface parity', () => {
     expect(h.createRoom).not.toHaveBeenCalled();
   });
 
-  it('keeps the canonical persisted name unchanged through recovery replay', async () => {
+  it('keeps the canonical persisted name unchanged through provisioning replay', async () => {
     const title = 'Fix inconsistent local/UTC chat timestamps in messenger-server';
     const h = cowork();
     const app = service(h.adapter);
@@ -420,14 +420,14 @@ describe('task create/start surface parity', () => {
     expect(task.title).toBe(title);
     expect(getRoomRecord('room-shared')?.room_name).toBe(expected);
     h.createRoom.mockClear();
-    expect(await app.beginTaskRecovery({
-      actor: { kind: 'local_control', surface: 'cli' }, taskId: task.task_id,
-    })).toMatchObject({ kind: 'final', result: { kind: 'no_op', room: { room_name: expected } } });
+    expect(await app.continueTaskProvisioning({
+      actor: { kind: 'internal_worker', surface: 'cli' }, taskId: task.task_id,
+    })).toMatchObject({ kind: 'no_op', room: { room_name: expected } });
     expect(h.createRoom).not.toHaveBeenCalled();
     expect(getRoomRecord('room-shared')?.room_name).toBe(expected);
   });
 
-  it('recovers a pre-room title validation failure through the canonical provision boundary', async () => {
+  it('continues a pre-room title validation failure through the canonical provision boundary', async () => {
     const title = 'Fix inconsistent local/UTC chat timestamps in messenger-server';
     const h = cowork();
     h.createRoom.mockRejectedValueOnce(new Error('generated room identity name is invalid'));
@@ -439,15 +439,13 @@ describe('task create/start surface parity', () => {
     const task = app.listTasks()[0]!;
     expect(task.room_id).toBeUndefined();
     expect(task.execution_plan?.snapshot.launch_snapshot_hash).toEqual(expect.any(String));
-    const recovery = await app.beginTaskRecovery({
-      actor: { kind: 'local_control', surface: 'cli' }, taskId: task.task_id,
+    const continuation = await app.continueTaskProvisioning({
+      actor: { kind: 'internal_worker', surface: 'cli' }, taskId: task.task_id,
     });
     const expected = deriveTaskRoomName(title, task.task_id);
-    expect(recovery).toMatchObject({
-      kind: 'final', result: {
-        kind: 'provisioning_resumed', task: { title, room_id: 'room-shared' },
-        room: { room_name: expected }, issues: [{ code: 'provisioning_resumed' }],
-      },
+    expect(continuation).toMatchObject({
+      kind: 'provisioning_resumed', task: { title, room_id: 'room-shared' },
+      room: { room_name: expected }, issues: [{ code: 'provisioning_resumed' }],
     });
     expect(h.createRoom).toHaveBeenCalledTimes(2);
     expect(h.createRoom).toHaveBeenLastCalledWith(expect.objectContaining({ room_name: expected }));
@@ -541,33 +539,45 @@ describe('task create/start surface parity', () => {
     expect(coworkFactory).not.toHaveBeenCalled();
   });
 
-  it('continues timed-out terminal recovery into provisioning and replaces issues on success', async () => {
-    const template = snapshotTemplate(definition, config().agentTemplates);
-    const task = createTask({ title: 'Compound recovery', origin: { type: 'cli' }, start: true,
-      room_id: 'room-compound', template: { name: template.name, version: template.version,
+  it.each([
+    ['waiting_owner_invite', true],
+    ['owner_cid_mismatch', false],
+  ] as const)('keeps detached provisioning for %s through the internal Owner-seat path', async (detail, existing) => {
+    const expected = 'A'.repeat(64);
+    const cfg = { ...config(), ownerInvite: 'repaired-invite', ownerInviteFingerprint: 'fingerprint',
+      rooms: { owner: { role: 'Owner', expected_cid: expected }, defaults: { attach_owner: false } } } as FleetConfig;
+    const template = snapshotTemplate(definition, cfg.agentTemplates);
+    const task = createTask({ title: detail, origin: { type: 'cli' }, start: true,
+      room_id: `room-${detail}`, template: { name: template.name, version: template.version,
         content_hash: template.content_hash } });
-    createRoomRecord({ room_id: 'room-compound', room_name: task.title, task_id: task.task_id,
-      template_snapshot: template });
-    advanceSaga('room-compound', 'create_room', 1);
-    advanceSaga('room-compound', 'attach_owner', 2);
-    advanceSaga('room-compound', 'create_members', 3);
-    await acceptTaskTerminalIntent({ taskId: task.task_id, kind: 'cancelled', roomId: 'room-compound' });
-    const provision = vi.fn(async () => getRoomRecord('room-compound')!);
-    const app = new TaskRoomApplicationService(undefined, { loadConfiguration: config,
-      cowork: () => cowork().adapter, binPath: () => '/fleet', provisionMembers: provision });
-    expect(await app.beginTaskRecovery({ actor: { kind: 'local_control', surface: 'cli' },
-      taskId: task.task_id })).toMatchObject({ kind: 'terminal_worker_required' });
-    const result = await app.continueTaskRecovery({ actor: { kind: 'local_control', surface: 'cli' },
-      taskId: task.task_id, terminalTimedOut: true });
+    const room = createRoomRecord({ room_id: task.room_id!, room_name: task.title, task_id: task.task_id,
+      template_snapshot: template, room_policy: { anonymous: false } });
+    advanceSaga(room.room_id, 'attach_owner', 2);
+    setSagaError(room.room_id, 'owner unavailable', 'repair owner configuration', detail);
+    const h = cowork();
+    h.adapter.recoverRoom = vi.fn(async () => ({ room_id: room.room_id, state: 'active', anonymous: false })) as any;
+    h.adapter.getSeats = vi.fn(async () => existing
+      ? [{ identity_cid: expected.toLowerCase(), seat_state: 'joined' }] : []) as any;
+    h.adapter.acceptInvite = vi.fn(async () => ({ seat_cid: expected })) as any;
+    const provision = vi.fn(async () => {
+      activateRoom(room.room_id);
+      activateTask(task.task_id);
+      return getRoomRecord(room.room_id)!;
+    });
+    const app = new TaskRoomApplicationService(undefined, { loadConfiguration: () => cfg,
+      cowork: () => h.adapter, binPath: () => '/fleet', provisionMembers: provision as any });
+
+    const result = await app.continueTaskProvisioning({
+      actor: { kind: 'internal_worker', surface: 'cli' }, taskId: task.task_id,
+    });
+
+    expect(result).toMatchObject({ kind: 'provisioning_resumed' });
+    expect(getRoomRecord(room.room_id)).toMatchObject({ owner_seat_cid: existing ? expected.toLowerCase() : expected });
+    expect(h.adapter.acceptInvite).toHaveBeenCalledTimes(existing ? 0 : 1);
     expect(provision).toHaveBeenCalledOnce();
-    expect(result).toMatchObject({ kind: 'provisioning_resumed',
-      issues: [{ code: 'provisioning_resumed' }] });
-    await expect(app.continueTaskRecovery({ actor: { kind: 'local_control', surface: 'cli' },
-      taskId: task.task_id, terminalTimedOut: true }))
-      .rejects.toThrow('task recovery continuation requires a matching begin');
   });
 
-  it('preserves exact recovery errors for missing and mismatched durable templates', async () => {
+  it('preserves exact continuation errors for missing and mismatched durable templates', async () => {
     const template = snapshotTemplate(definition);
     for (const mismatch of [false, true]) {
       const roomId = mismatch ? 'room-mismatch' : 'room-missing';
@@ -579,7 +589,7 @@ describe('task create/start surface parity', () => {
       advanceSaga(roomId, 'create_room', 1); advanceSaga(roomId, 'attach_owner', 2);
       advanceSaga(roomId, 'create_members', 3);
       const app = service(cowork().adapter);
-      await expect(app.beginTaskRecovery({ actor: { kind: 'local_control', surface: 'cli' },
+      await expect(app.continueTaskProvisioning({ actor: { kind: 'internal_worker', surface: 'cli' },
         taskId: task.task_id })).rejects.toThrow(mismatch
         ? `task ${task.task_id} template reference does not match room ${roomId}'s durable snapshot`
         : `room ${roomId} has no durable template snapshot`);
@@ -600,11 +610,11 @@ describe('task create/start surface parity', () => {
       roles: [], vars: {}, defaults: {}, files: [], startStaggerMs: 0, diagnostics: [],
       watchdogs: [], loops: [], roomTemplates: {},
     } as FleetConfig), cowork: coworkFactory, provisionMembers: provision });
-    const begin = await app.beginTaskRecovery({ actor: { kind: 'local_control', surface: 'cli' },
+    const continuation = await app.continueTaskProvisioning({ actor: { kind: 'internal_worker', surface: 'cli' },
       taskId: task.task_id });
-    expect(begin).toMatchObject({ kind: 'final', result: { kind: 'provisioning_resume_failed',
+    expect(continuation).toMatchObject({ kind: 'provisioning_resume_failed',
       issues: [{ code: 'resume_failed',
-        error: 'rooms: configuration is required before creating or querying rooms' }] } });
+        error: 'rooms: configuration is required before creating or querying rooms' }] });
     expect(coworkFactory).not.toHaveBeenCalled(); expect(provision).not.toHaveBeenCalled();
   });
 

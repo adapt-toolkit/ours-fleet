@@ -1075,7 +1075,6 @@ describe('OwnerChannel deterministic command dispatch', () => {
     settleTask: vi.fn(async () => undefined),
     settleTaskDeletion: vi.fn(async () => undefined),
     provisionTask: vi.fn(async () => undefined),
-    recoverTask: vi.fn(async () => undefined),
   });
 
   it('registers the registry-derived catalog and preserves read-only slash results', async () => {
@@ -1412,7 +1411,22 @@ describe('OwnerChannel deterministic command dispatch', () => {
     expect(lastReply(client)).toContain('unknown room subcommand: recover');
   });
 
-  it('routes authenticated Owner await through provisioning continuation, not broad recovery', async () => {
+  it('rejects the removed task recover command without launching a worker', async () => {
+    const fleet = fakeFleet();
+    const { channel, client, queuePrompt } = setup(
+      [ownerMessage(59115, 'wire-task-recover', '/task recover legacy-task')],
+      undefined, { fleet },
+    );
+    await channel.drain();
+    expect(queuePrompt).not.toHaveBeenCalled();
+    expect(fleet.provisionTask).not.toHaveBeenCalled();
+    expect(fleet.settleTask).not.toHaveBeenCalled();
+    expect(fleet.settleTaskDeletion).not.toHaveBeenCalled();
+    expect(lastReply(client)).toContain('Invalid command');
+    expect(lastReply(client)).toContain('unknown task subcommand: recover');
+  });
+
+  it('routes authenticated Owner await through provisioning continuation', async () => {
     const fleet = fakeFleet();
     const fleetHome = mkdtempSync(join(tmpdir(), 'ours-owner-task-await-'));
     dirs.push(fleetHome);
@@ -1438,7 +1452,6 @@ describe('OwnerChannel deterministic command dispatch', () => {
       else process.env.OURS_FLEET_HOME = previousHome;
     }
     expect(fleet.provisionTask).toHaveBeenCalledWith(task.task_id);
-    expect(fleet.recoverTask).not.toHaveBeenCalled();
     expect(lastReply(client)).toContain('Room provisioning complete');
   });
 

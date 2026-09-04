@@ -61,13 +61,5 @@ exports[`owner-channel task subcommands > snapshots the Markdown task lifecycle 
   "## 📋 Tasks
 
 - 🟡 Review \`<TASK_ID>\` — test task — List \`default\`",
-  "## 🛟 Task recovery
-
-- **Task:** \`<TASK_ID>\`
-
-- **Status:** 🟡 Review
-
-### Result
-- No automated recovery action is available.",
 ]
 `;

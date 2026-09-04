@@ -189,8 +189,7 @@ export async function settleTaskDeletion(input: {
 }): Promise<TaskDeletionSettleResult> {
   const { taskId } = input;
   const deps = input.deps ?? {};
-  const recoveryHint =
-    `Re-run 'ours-fleet task delete ${taskId} ${taskId}' or 'ours-fleet task recover ${taskId}'.`;
+  const recoveryHint = `Re-run 'ours-fleet task delete ${taskId} ${taskId}'.`;
 
   const cleanup = await withFileLock(taskOperationLockPath(taskId), async () => {
     let task: TaskRecord;

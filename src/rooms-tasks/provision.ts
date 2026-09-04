@@ -641,7 +641,7 @@ export async function provisionMembers(
   } catch (error) {
     const reason = error instanceof Error ? error.message : String(error);
     setSagaError(roomId, reason,
-      'Member invite or launch failed. Retry with `task recover`.', 'member_failed');
+      'Member invite or launch failed. Inspect role logs, then retry with `task await`.', 'member_failed');
     if (taskId) {
       // A deletion-pending (or already-terminal) task rejects the block
       // overlay; the original launch failure must still propagate.
