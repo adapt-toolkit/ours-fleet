@@ -408,6 +408,23 @@ describe('fleet command audit', () => {
       expect.objectContaining({ name: label }),
       expect.objectContaining({ label }),
     ]);
+    const astral = '😀'.repeat(129);
+    beginFleetAuditCollection();
+    recordFleetAuditPresentation({ kind: 'task', operation: 'block', id: 'task-astral',
+      title: astral, roomName: astral, reason: astral,
+      previousState: 'active', newState: 'active', agents: [] });
+    recordFleetAuditPresentation({ kind: 'room', operation: 'activate', id: 'room-astral',
+      name: astral, previousState: 'provisioning', newState: 'active', participants: [] });
+    recordFleetAuditPresentation({ kind: 'lifecycle_failure', resource: 'Task', id: 'task-astral',
+      label: astral, state: 'provisioning', category: 'provision_failed' });
+    const recorded = consumeFleetAuditCollection().presentations!;
+    expect(recorded).toEqual([
+      expect.objectContaining({ title: astral, roomName: astral, reason: astral }),
+      expect.objectContaining({ name: astral }),
+      expect.objectContaining({ label: astral }),
+    ]);
+    expect(() => validateFleetAuditFinish({ correlationId: '017f22e2-79b0-7cc3-98c4-dc0c0c07398f',
+      class: 'success', effect: 'completed', presentations: recorded })).not.toThrow();
     expect(renderFleetLifecycleEvent({ kind: 'lifecycle_failure', resource: 'Room',
       eventId: 'episode-1', id: 'room-1', state: 'closing', category: 'cleanup_failed' }))
       .toContain('Room cleanup is incomplete: room-1');
@@ -679,6 +696,50 @@ describe('human-readable launch configuration', () => {
       expect(rendered).toContain('\n- **Role:**');
       expect(rendered).toContain('\n- **Brain:**');
     }
+  });
+
+  it('atomically bounds maximal loop details while reserving mandatory Agent output', () => {
+    const configuration: AgentLaunchConfiguration = { ...named(), loops: {
+      source: 'agent-template', policy: 'skip-if-busy',
+      entries: Array.from({ length: 64 }, (_, index) => ({
+        name: `loop-${String(index).padStart(2, '0')}-${'x'.repeat(48)}`,
+        enabled: index % 2 === 0, intervalMs: 60_000 + index,
+        initialDelayMs: 5_000 + index, jitterMs: 2_000 + index,
+        prompt: { bytes: 184 + index, sha256: index.toString(16).padStart(64, '0') },
+      })),
+    } };
+    const presentation = { kind: 'agent_started' as const, eventId: 'max-loops',
+      id: 'agent-max-loops', name: 'agent-max-loops', lifetime: 'temporary' as const,
+      brain: 'Brain', role: 'Role', harness: 'codex', session: 'acp' as const,
+      parent: 'Coordinator', actionId: 'max-loops', inherited: [], configuration };
+    expect(() => validateFleetAuditFinish({ correlationId: '017f22e2-79b0-7cc3-98c4-dc0c0c07398f',
+      class: 'success', effect: 'completed', presentations: [presentation] })).not.toThrow();
+    const rendered = renderFleetLifecycleEvent(presentation);
+    expect(Array.from(rendered).length).toBeLessThanOrEqual(MARKDOWN_MAX_CODE_POINTS);
+    expect(Buffer.byteLength(rendered, 'utf8')).toBeLessThanOrEqual(MARKDOWN_MAX_BYTES);
+    expect(rendered).toContain('- **Template:** `dev-pair/critic`');
+    expect(rendered).toContain('- **Role:** Preset `reviewer`');
+    expect(rendered).toContain('- **Mission:** “Challenge every material change”');
+    expect(rendered).toContain('- **Brain:** Preset `codex-high`');
+    expect(rendered).toContain('- **Harness:** `codex`');
+    expect(rendered).toContain('- **Model:** `gpt-5`');
+    expect(rendered).toContain('- **Effort:** high');
+    expect(rendered).toContain('- **Approval:** ask');
+    expect(rendered).toContain('- **Filesystem:** workspace');
+    expect(rendered).toContain('- **Wait:** wait');
+    expect(rendered).toContain('- **Fleet mode:** ask');
+    expect(rendered).toContain('- **Native mode:** read-only');
+    expect(rendered).toContain('- **Loop policy:** Skip if busy');
+    expect(rendered).toContain('- **Loop source:** agent template');
+    expect(rendered).toContain('- **Details omitted:** Additional optional Agent configuration');
+    expect(rendered).toContain('- **Agent ID:** `agent-max-loops`');
+    expect(rendered).toContain('Launch was accepted; harness and room-seat readiness converge separately.');
+    const count = (label: string) => rendered.split(`- **${label}:**`).length - 1;
+    const loops = count('Loop');
+    expect(loops).toBeGreaterThan(0);
+    expect(loops).toBeLessThan(64);
+    for (const label of ['Loop status', 'Loop interval', 'Loop delay', 'Loop jitter',
+      'Loop prompt size', 'Loop prompt hash']) expect(count(label)).toBe(loops);
   });
 
   it('keeps accepting legacy presentations without a configuration', () => {

@@ -478,6 +478,8 @@ function validPresentation(value: unknown): value is FleetAuditPresentation {
   const safe = (v: unknown) => typeof v === 'string' && SAFE_RESOURCE_ID.test(v);
   const text = (v: unknown) => typeof v === 'string' && v.length <= 256
     && !/[\u0000-\u001f\u007f-\u009f\u202a-\u202e\u2066-\u2069]/u.test(v);
+  const presentationLabel = (v: unknown) => typeof v === 'string'
+    && fleetPresentationLabel(v) === v;
   const exact = (record: Record<string, unknown>, keys: string[]) =>
     Object.keys(record).every(key => keys.includes(key));
   const transition = (allowed: Record<string, readonly string[]>) =>
@@ -507,8 +509,10 @@ function validPresentation(value: unknown): value is FleetAuditPresentation {
         'done→deleted', 'cancelled→deleted', 'failed→deleted',
       ], settling: ['active→active', 'review→review', 'backlog→backlog',
         'provisioning→provisioning'] })
-    && (p.title === undefined || text(p.title)) && (p.roomName === undefined || text(p.roomName))
-    && (p.reason === undefined || text(p.reason)) && (p.previousState === undefined || safe(p.previousState))
+    && (p.title === undefined || presentationLabel(p.title))
+    && (p.roomName === undefined || presentationLabel(p.roomName))
+    && (p.reason === undefined || presentationLabel(p.reason))
+    && (p.previousState === undefined || safe(p.previousState))
     && (p.template === undefined || text(p.template)) && (p.roomId === undefined || safe(p.roomId))
     && (p.list === undefined || text(p.list)) && (p.revision === undefined || text(p.revision))
     && Array.isArray(p.agents) && p.agents.length <= 64
@@ -527,7 +531,7 @@ function validPresentation(value: unknown): value is FleetAuditPresentation {
       close: ['active→closing', 'provisioning→closing'],
       delete: ['closing→deleted'] })
     && (p.previousState === undefined || safe(p.previousState))
-    && (p.name === undefined || text(p.name)) && (p.template === undefined || text(p.template))
+    && (p.name === undefined || presentationLabel(p.name)) && (p.template === undefined || text(p.template))
     && (p.taskId === undefined || safe(p.taskId)) && (p.revision === undefined || text(p.revision))
     && (p.anonymous === undefined || typeof p.anonymous === 'boolean')
     && (p.ownerAttached === undefined || typeof p.ownerAttached === 'boolean')
@@ -545,7 +549,7 @@ function validPresentation(value: unknown): value is FleetAuditPresentation {
   if (p.kind === 'lifecycle_failure') return exact(p, ['kind', 'eventId', 'resource', 'id', 'label', 'state', 'category'])
     && ['Agent', 'Task', 'Room'].includes(String(p.resource))
     && safe(p.eventId) && safe(p.id) && safe(p.state)
-    && (p.label === undefined || (text(p.label) && fleetPresentationLabel(p.label) === p.label))
+    && (p.label === undefined || presentationLabel(p.label))
     && ['provision_failed', 'provision_pending', 'readiness_failed', 'settlement_failed',
       'settlement_pending', 'cleanup_failed', 'cleanup_pending'].includes(String(p.category));
   return false;
@@ -570,23 +574,34 @@ function commaInteger(value: number): string {
   return String(value).replace(/\B(?=(\d{3})+(?!\d))/g, ',');
 }
 
+function renderStructuredMessage(
+  headline: string,
+  fields: Array<[label: string, value: string]>,
+  action?: string,
+): string {
+  return `${headline}`
+    + fields.map(([label, value]) => `\n- **${label}:** ${value}`).join('')
+    + (action ? `\n\n${action}` : '');
+}
+
 function structuredMessage(
   headline: string,
   fields: Array<[label: string, value: string | undefined]>,
   action?: string,
 ): string {
-  let message = headline;
   const visible = fields.filter((field): field is [string, string] => field[1] !== undefined);
-  for (const [label, value] of visible) {
-    const candidate = `${message}\n- **${label}:** ${value}`;
-    const complete = action ? `${candidate}\n\n${action}` : candidate;
-    if (!withinMessageBounds(complete)) {
-      const omitted = `${message}\n- _Additional details omitted._${action ? `\n\n${action}` : ''}`;
-      return withinMessageBounds(omitted) ? omitted : message;
-    }
-    message = candidate;
+  const render = (selected: Array<[string, string]>) => renderStructuredMessage(headline, selected, action);
+  const complete = render(visible);
+  if (withinMessageBounds(complete)) return complete;
+  const marker: [string, string] = ['Details omitted', 'Additional lifecycle details'];
+  const selected: Array<[string, string]> = [];
+  for (const field of visible) {
+    if (!withinMessageBounds(render([...selected, field, marker]))) break;
+    selected.push(field);
   }
-  return action ? `${message}\n\n${action}` : message;
+  const bounded = render([...selected, marker]);
+  if (!withinMessageBounds(bounded)) throw new Error('mandatory lifecycle presentation exceeds message bounds');
+  return bounded;
 }
 
 function originFields(
@@ -604,9 +619,24 @@ function interruptSummary(value: AgentLaunchConfiguration['monitor']['interrupt'
   return value === false ? 'off' : value === true ? 'on' : markdownProse(value);
 }
 
-function agentConfigurationFields(configuration: AgentLaunchConfiguration): Array<[string, string | undefined]> {
-  const loops: Array<[string, string]> = [];
-  for (const entry of configuration.loops?.entries ?? []) loops.push(
+function agentConfigurationFieldGroups(configuration: AgentLaunchConfiguration): {
+  mandatory: Array<[string, string | undefined]>;
+  optional: Array<Array<[string, string | undefined]>>;
+  tail: Array<[string, string | undefined]>;
+} {
+  const optional: Array<Array<[string, string | undefined]>> = [
+    [['Monitor mode', markdownProse(configuration.monitor.mode)],
+      ['Interrupt', interruptSummary(configuration.monitor.interrupt)]],
+  ];
+  if (configuration.isolation) optional.push([
+    ['Isolation', markdownProse(configuration.isolation.requested)],
+    ['Network', configuration.isolation.network ? markdownProse(configuration.isolation.network) : undefined],
+    ['If unavailable', configuration.isolation.on_unavailable
+      ? configuration.isolation.on_unavailable === 'strict' ? 'Fail' : 'Warn' : undefined],
+    ['Read-only mounts', String(configuration.isolation.read_mounts ?? 0)],
+    ['Read-write mounts', String(configuration.isolation.write_mounts ?? 0)],
+  ]);
+  for (const entry of configuration.loops?.entries ?? []) optional.push([
     ['Loop', markdownCode(entry.name)],
     ['Loop status', entry.enabled ? 'Enabled' : 'Disabled'],
     ['Loop interval', `${commaInteger(entry.intervalMs)} ms`],
@@ -614,8 +644,8 @@ function agentConfigurationFields(configuration: AgentLaunchConfiguration): Arra
     ['Loop jitter', `${commaInteger(entry.jitterMs)} ms`],
     ['Loop prompt size', `${entry.prompt.bytes} B`],
     ['Loop prompt hash', markdownCode(entry.prompt.sha256.slice(0, 12))],
-  );
-  return [
+  ]);
+  return { mandatory: [
     ['Template', configuration.template ? markdownCode(configuration.template) : undefined],
     ...originFields('Role', configuration.role),
     ['Mission', configuration.mission ? `“${markdownProse(configuration.mission)}”` : undefined],
@@ -628,19 +658,40 @@ function agentConfigurationFields(configuration: AgentLaunchConfiguration): Arra
     ['Wait', markdownProse(configuration.unattended)],
     ['Fleet mode', markdownProse(configuration.permissionMode.fleetMode)],
     ['Native mode', markdownProse(configuration.permissionMode.nativeMode)],
-    ['Monitor mode', markdownProse(configuration.monitor.mode)],
-    ['Interrupt', interruptSummary(configuration.monitor.interrupt)],
-    ['Isolation', configuration.isolation ? markdownProse(configuration.isolation.requested) : undefined],
-    ['Network', configuration.isolation?.network ? markdownProse(configuration.isolation.network) : undefined],
-    ['If unavailable', configuration.isolation?.on_unavailable
-      ? configuration.isolation.on_unavailable === 'strict' ? 'Fail' : 'Warn' : undefined],
-    ['Read-only mounts', configuration.isolation ? String(configuration.isolation.read_mounts ?? 0) : undefined],
-    ['Read-write mounts', configuration.isolation ? String(configuration.isolation.write_mounts ?? 0) : undefined],
-    ...loops,
+  ], optional, tail: [
     ['Loop policy', configuration.loops ? 'Skip if busy' : undefined],
     ['Loop source', configuration.loops
       ? markdownProse(configuration.loops.source.replace(/-/g, ' ')) : undefined],
-  ];
+  ] };
+}
+
+function boundedAgentMessage(
+  headline: string,
+  prefix: Array<[string, string | undefined]>,
+  optionalGroups: Array<Array<[string, string | undefined]>>,
+  suffix: Array<[string, string | undefined]>,
+  action: string,
+): string {
+  const visible = (fields: Array<[string, string | undefined]>) =>
+    fields.filter((field): field is [string, string] => field[1] !== undefined);
+  const requiredPrefix = visible(prefix);
+  const requiredSuffix = visible(suffix);
+  const groups = optionalGroups.map(visible).filter(group => group.length > 0);
+  const marker: [string, string] = ['Details omitted', 'Additional optional Agent configuration'];
+  const render = (optional: Array<[string, string]>, omitted: boolean) => renderStructuredMessage(
+    headline, [...requiredPrefix, ...optional, ...(omitted ? [marker] : []), ...requiredSuffix], action);
+  const all = groups.flat();
+  const complete = render(all, false);
+  if (withinMessageBounds(complete)) return complete;
+  const included: Array<[string, string]> = [];
+  for (const group of groups) {
+    const candidate = render([...included, ...group], true);
+    if (!withinMessageBounds(candidate)) break;
+    included.push(...group);
+  }
+  const bounded = render(included, true);
+  if (!withinMessageBounds(bounded)) throw new Error('mandatory Agent presentation exceeds message bounds');
+  return bounded;
 }
 
 /** Compact Owner presentation. It intentionally has no command, argv, environment, or correlation data. */
@@ -676,20 +727,25 @@ export function renderFleetLifecycleEvent(value: FleetAuditPresentation): string
     );
   }
   if (value.kind === 'agent_started') {
-    const fields: Array<[string, string | undefined]> = [
+    const prefix: Array<[string, string | undefined]> = [
       ['Started by', markdownProse(value.parent)],
       ['Lifetime', titleCase(value.lifetime)],
-      ...(value.configuration ? agentConfigurationFields(value.configuration) : [
+    ];
+    if (value.configuration) {
+      const configuration = agentConfigurationFieldGroups(value.configuration);
+      return boundedAgentMessage(`🚀 Agent launched: ${markdownProse(value.name)}`,
+        [...prefix, ...configuration.mandatory], configuration.optional,
+        [...configuration.tail, ['Agent ID', markdownCode(value.id)]],
+        'Launch was accepted; harness and room-seat readiness converge separately.');
+    }
+    return structuredMessage(
+      `🚀 Agent launched: ${markdownProse(value.name)}`,
+      [...prefix,
         ['Resolved details', 'Unavailable'] as [string, string],
         ['Role', markdownProse(value.role)] as [string, string],
         ['Brain', markdownProse(value.brain)] as [string, string],
         ...(value.permissions ? [['Permissions', markdownProse(value.permissions)] as [string, string]] : []),
-      ]),
-      ['Agent ID', markdownCode(value.id)],
-    ];
-    return structuredMessage(
-      `🚀 Agent launched: ${markdownProse(value.name)}`,
-      fields,
+        ['Agent ID', markdownCode(value.id)]],
       'Launch was accepted; harness and room-seat readiness converge separately.',
     );
   }
