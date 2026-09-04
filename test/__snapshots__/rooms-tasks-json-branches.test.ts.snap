@@ -32,19 +32,6 @@ exports[`task/room JSON presentation contract > pins every room --json serialize
           return;
         }",
   "if (opts.json) {
-            console.log(JSON.stringify({
-              schema_version: 1, room: null, orchestration: null,
-              recovery_actions: [settled.timedOut
-                ? \`Deletion remains pending — retry room delete \${id} \${id}\`
-                : 'Deletion completed successfully'],
-            }, null, 2));
-            return;
-          }",
-  "if (opts.json) {
-          console.log(JSON.stringify({ schema_version: 1, room: cowork, orchestration: r ?? null, recovery_actions: actions }, null, 2));
-          return;
-        }",
-  "if (opts.json) {
           console.log(JSON.stringify({ schema_version: 1, ...result }, null, 2));
           return;
         }",

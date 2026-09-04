@@ -1384,7 +1384,7 @@ describe('OwnerChannel deterministic command dispatch', () => {
     expect(acknowledgement).not.toContain('Room closed');
   });
 
-  it('acknowledges and remembers closing-room recovery before one worker launch', async () => {
+  it('rejects the removed room recover command without launching a worker', async () => {
     const fleet = fakeFleet();
     const fleetHome = mkdtempSync(join(tmpdir(), 'ours-owner-room-recover-'));
     dirs.push(fleetHome);
@@ -1401,23 +1401,15 @@ describe('OwnerChannel deterministic command dispatch', () => {
       [ownerMessage(5911, 'wire-room-recover', `/room recover ${roomId}`)],
       undefined, { fleet, configPath },
     );
-    let wireWhenSpawned = '';
-    let sendsWhenSpawned = 0;
-    fleet.closeRoom.mockImplementation(async () => {
-      wireWhenSpawned = readFileSync(join(dir, '.owner-channel-state.json'), 'utf8');
-      sendsWhenSpawned = client.calls.filter(call => call.name === 'sendMessage').length;
-    });
     try { await channel.drain(); }
     finally {
       if (previousHome === undefined) delete process.env.OURS_FLEET_HOME;
       else process.env.OURS_FLEET_HOME = previousHome;
     }
     expect(queuePrompt).not.toHaveBeenCalled();
-    expect(fleet.closeRoom).toHaveBeenCalledTimes(1);
-    expect(fleet.closeRoom).toHaveBeenCalledWith(roomId);
-    expect(wireWhenSpawned).toContain('wire-room-recover');
-    expect(sendsWhenSpawned).toBeGreaterThan(0);
-    expect(lastReply(client)).toContain('deletion recovery is still being settled');
+    expect(fleet.closeRoom).not.toHaveBeenCalled();
+    expect(lastReply(client)).toContain('Invalid command');
+    expect(lastReply(client)).toContain('unknown room subcommand: recover');
   });
 
   it('routes authenticated Owner await through provisioning continuation, not broad recovery', async () => {

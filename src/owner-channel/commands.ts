@@ -75,7 +75,6 @@ export interface OwnerCommandContext {
   fleetList(): Promise<string>;
   /** Persist acceptance, acknowledge it, then launch the external close worker. */
   closeRoom(roomId: string): Promise<void>;
-  recoverRoom(roomId: string): Promise<void>;
   /** Persist terminal intent, acknowledge it, then launch the external settle worker. */
   terminalTask(taskId: string, kind: TaskTerminalIntent['kind'], outcome?: TaskOutcome): Promise<void>;
   recoverTask(taskId: string): Promise<void>;
@@ -658,7 +657,7 @@ export const ownerCommands: OwnerCommand[] = [
   },
   {
     name: 'room',
-    usage: '/room <create|list|show|delete|close|recover> ...',
+    usage: '/room <create|list|show|delete|close> ...',
     summary: 'room lifecycle subcommands',
     execute: async (ctx, args) => {
       if (!args) throw new OwnerCommandUsageError('usage: /room <subcommand> <id>');
@@ -741,13 +740,9 @@ export const ownerCommands: OwnerCommand[] = [
             await ctx.closeRoom(rest[0]);
             break;
           }
-          case 'recover': {
-            if (!rest[0]) throw new OwnerCommandUsageError('usage: /room recover <id>');
-            await ctx.recoverRoom(rest[0]);
-            break;
-          }
           default:
             // bare /room <id> → show
+            if (rest.length) throw new OwnerCommandUsageError(`unknown room subcommand: ${sub}`);
             await showRoom(sub);
         }
       } catch (e) {

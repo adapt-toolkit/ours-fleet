@@ -721,7 +721,7 @@ describe('task create/start surface parity', () => {
     }));
   });
 
-  it('accepts room deletion without remote effects and recovery returns a worker plan', async () => {
+  it('accepts room deletion without remote effects', async () => {
     const room = createRoomRecord({ room_id: 'room-delete-plan', room_name: 'Delete plan' });
     activateRoom(room.room_id);
     const h = cowork();
@@ -732,9 +732,6 @@ describe('task create/start surface parity', () => {
     expect(accepted).toMatchObject({ settlementRequired: true, room: { state: 'closing' } });
     expect(h.adapter.closeRoom).not.toHaveBeenCalled();
     expect(h.adapter.deleteRoom).not.toHaveBeenCalled();
-    expect(await app.recoverRoom({ actor: { kind: 'local_control', surface: 'cli' },
-      roomId: room.room_id })).toEqual({ kind: 'deletion_worker_required', roomId: room.room_id });
-    expect(h.adapter.recoverRoom).not.toHaveBeenCalled();
   });
 
   it('constructs Cowork before tracked-room lookup and keeps repeated deletion acceptance first-wins', async () => {
@@ -753,89 +750,6 @@ describe('task create/start surface parity', () => {
       roomId: room.room_id });
     expect(second.room).toEqual(first.room);
     expect(second.room.state).toBe('closing');
-  });
-
-  it('reconciles the owner seat from an existing seat or accepts the configured invite', async () => {
-    const expected = 'A'.repeat(64);
-    const cfg = { ...config(), ownerInvite: 'invite', ownerInviteFingerprint: 'fingerprint',
-      rooms: { owner: { role: 'Owner', expected_cid: expected }, defaults: { attach_owner: false } } } as FleetConfig;
-    for (const existing of [true, false]) {
-      const id = `owner-recovery-${existing}`;
-      createRoomRecord({ room_id: id, room_name: id });
-      advanceSaga(id, 'attach_owner', 2);
-      setSagaError(id, 'owner unavailable', 'retry owner', 'waiting_owner_invite');
-      const h = cowork();
-      h.adapter.recoverRoom = vi.fn(async () => ({ room_id: id, state: 'active' })) as any;
-      h.adapter.getSeats = vi.fn(async () => existing
-        ? [{ identity_cid: expected.toLowerCase(), seat_state: 'joined' }] : []) as any;
-      h.adapter.acceptInvite = vi.fn(async () => ({ seat_cid: expected })) as any;
-      const app = new TaskRoomApplicationService(undefined, { loadConfiguration: () => cfg,
-        cowork: () => h.adapter, binPath: () => '/fleet', provisionMembers: vi.fn() });
-      await app.recoverRoom({ actor: { kind: 'local_control', surface: 'cli' }, roomId: id });
-      expect(getRoomRecord(id)).toMatchObject({
-        owner_seat_cid: existing ? expected.toLowerCase() : expected,
-        saga: { phase: 'create_members' },
-      });
-      expect(h.adapter.acceptInvite).toHaveBeenCalledTimes(existing ? 0 : 1);
-    }
-  });
-
-  it('activates a task-bound room without a template when recovery proves its seats ready', async () => {
-    const task = createTask({ title: 'Legacy untemplated room', origin: { type: 'cli' }, start: true });
-    const room = createRoomRecord({ room_id: 'legacy-untemplated', room_name: 'Legacy',
-      room_identity_cid: 'room-cid', task_id: task.task_id });
-    updateTaskRoom(task.task_id, room.room_id, 'room-cid');
-    const h = cowork();
-    h.adapter.recoverRoom = vi.fn(async () => ({ room_id: room.room_id, state: 'active' })) as any;
-    h.adapter.getSeats = vi.fn(async () => []) as any;
-    const result = await service(h.adapter).recoverRoom({
-      actor: { kind: 'local_control', surface: 'cli' }, roomId: room.room_id,
-    });
-    expect(result).toMatchObject({ kind: 'recovered', orchestration: { state: 'active' } });
-    expect(getTask(task.task_id).state).toBe('active');
-  });
-
-  it('replaces diagnostics on successful provisioning resume and retains them on failure', async () => {
-    const template = snapshotTemplate(definition);
-    for (const succeeds of [true, false]) {
-      const id = `resume-${succeeds}`;
-      createRoomRecord({ room_id: id, room_name: id, template_snapshot: template });
-      advanceSaga(id, 'create_members', 3);
-      setSagaError(id, 'member launch failed', 'inspect members', 'waiting_seats');
-      const h = cowork();
-      h.adapter.recoverRoom = vi.fn(async () => ({ room_id: id, state: 'active' })) as any;
-      const provision = succeeds ? vi.fn(async () => getRoomRecord(id)!)
-        : vi.fn(async () => { throw new Error('launch still unavailable'); });
-      const app = new TaskRoomApplicationService(undefined, { loadConfiguration: config,
-        cowork: () => h.adapter, binPath: () => '/fleet', provisionMembers: provision as any });
-      const result = await app.recoverRoom({ actor: { kind: 'local_control', surface: 'cli' }, roomId: id });
-      if (succeeds) expect(result).toMatchObject({ kind: 'provisioning_resumed',
-        issues: ['Provisioning resumed successfully'] });
-      else {
-        expect(result.kind).toBe('provisioning_resume_failed');
-        expect(result.issues).toEqual(expect.arrayContaining([
-          'A provisioning failure is recorded; inspect role logs for diagnostics.',
-          'Recovery guidance is recorded; inspect role logs for diagnostics.',
-          'Inspect temporary member logs for invite acceptance, then re-run recover',
-          'Resume failed: launch still unavailable',
-        ]));
-      }
-    }
-  });
-
-  it('reports non-resumable provisioning diagnostics without provisioning effects', async () => {
-    const id = 'nonresumable-room';
-    createRoomRecord({ room_id: id, room_name: id });
-    setSagaError(id, 'create failed', 'inspect Cowork', 'waiting_cowork');
-    const h = cowork();
-    h.adapter.recoverRoom = vi.fn(async () => ({ room_id: id, state: 'active' })) as any;
-    const provision = vi.fn();
-    const app = new TaskRoomApplicationService(undefined, { loadConfiguration: config,
-      cowork: () => h.adapter, binPath: () => '/fleet', provisionMembers: provision });
-    const result = await app.recoverRoom({ actor: { kind: 'local_control', surface: 'cli' }, roomId: id });
-    expect(result).toMatchObject({ kind: 'recovered' });
-    expect(result.issues).toContain('Check ours-cowork service status');
-    expect(provision).not.toHaveBeenCalled();
   });
 
   it('runs the extracted complete provision flow for start', async () => {

@@ -1,6 +1,6 @@
 // Vitest Snapshot v1, https://vitest.dev/guide/snapshot.html
 
-exports[`owner-channel room subcommands > snapshots the Markdown room list/show/recovery integration surface 1`] = `
+exports[`owner-channel room subcommands > snapshots the Markdown room list/show integration surface 1`] = `
 [
   "## 🏠 Rooms
 
@@ -16,16 +16,6 @@ exports[`owner-channel room subcommands > snapshots the Markdown room list/show/
 - **Saga:** persist\\_intent (step 0)
 
 - **Created:** \`<ISO_DATE>\`",
-  "## 🛟 Room recovery
-
-- **Room:** \`<ROOM_ID>\`
-
-- **Status:** ⏳ Provisioning
-
-- **Saga:** \`persist_intent\`
-
-### Next step
-- No recovery action is needed.",
 ]
 `;
 

@@ -244,7 +244,7 @@ describe('fleet command audit', () => {
     const rendered = renderFleetLifecycleEvent({ kind: 'lifecycle_failure', resource: 'Room',
       eventId: 'episode-1', id: 'room-1', state: 'closing', category: 'cleanup_failed' });
     expect(rendered).toContain('Room room-1 lifecycle failure (cleanup_failed)');
-    expect(rendered).toContain('run Room recover');
+    expect(rendered).toContain('retry Room delete');
     expect(rendered).not.toContain('/private');
   });
 
@@ -252,7 +252,7 @@ describe('fleet command audit', () => {
     const rendered = renderFleetLifecycleEvent({ kind: 'lifecycle_failure', resource: 'Room',
       eventId: 'episode-1', id: 'room-1', state: 'provisioning', category: 'provision_pending' });
     expect(rendered).toBe('⚠️ Room room-1 lifecycle pending (provision_pending); state provisioning. '
-      + 'Action: Run Task or Room recover after checking member readiness.');
+      + 'Action: Check member readiness, then retry the originating Task or Room command.');
     expect(rendered).not.toContain('lifecycle failure');
   });
 

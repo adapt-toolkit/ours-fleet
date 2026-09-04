@@ -59,20 +59,6 @@ function context(overrides: Partial<OwnerCommandContext> = {}): OwnerCommandCont
     restart: vi.fn(async () => undefined),
     fleetList: vi.fn(async () => 'Coordinator: acp'),
     closeRoom,
-    recoverRoom: vi.fn(async roomId => {
-      const r = getRoomRecord(roomId);
-      if (!r) { replies.push('⚠️ Room not found.'); return; }
-      if (r.state === 'closing' || r.state === 'closed') { await closeRoom(roomId); return; }
-      replies.push(renderMarkdownResult({ icon: '🛟', title: 'Room recovery', fields: [
-        { label: 'Room', value: r.room_id, kind: 'code' },
-        { label: 'Status', value: roomStatus(r.state), kind: 'markdown' },
-        { label: 'Saga', value: r.saga.phase, kind: 'code' },
-        ...(r.saga.error ? [{ label: 'Last error', value: 'Provisioning failure recorded; inspect role logs.' }] : []),
-        ...(r.provisioning_detail ? [{ label: 'Detail', value: r.provisioning_detail }] : []),
-      ], sections: [{ heading: 'Next step', items: [r.saga.error
-        ? 'Run ours-fleet room recover from the CLI for full recovery.'
-        : 'No recovery action is needed.'] }] }));
-    }),
     terminalTask: vi.fn(async (taskId, kind) => { replies.push(`terminal:${taskId}:${kind}`); }),
     recoverTask: vi.fn(async taskId => {
       const task = readTask(taskId);
@@ -219,6 +205,7 @@ describe('owner command registry', () => {
       'restart', 'force-restart', 'ls', 'peek', 'worklog', 'version'])
       expect(ownerCommands.some(command => command.name === name)).toBe(true);
     expect(help).toContain('/commands');
+    expect(help).not.toContain('/room recover');
   });
 
   it('makes /comments discoverable in help with its label and baseline semantics', () => {
@@ -951,10 +938,10 @@ describe('owner-channel room subcommands', () => {
     });
   }
 
-  it('snapshots the Markdown room list/show/recovery integration surface', async () => {
+  it('snapshots the Markdown room list/show integration surface', async () => {
     const r = await createTestRoom('room-snapshot');
     const replies: string[] = [];
-    for (const command of ['/room list', `/room show ${r.room_id}`, `/room recover ${r.room_id}`]) {
+    for (const command of ['/room list', `/room show ${r.room_id}`]) {
       const ctx = context();
       await dispatchOwnerCommand(command, ctx);
       replies.push(...ctx.replies);
@@ -982,19 +969,17 @@ describe('owner-channel room subcommands', () => {
     expect(ctx.replies[0]).toContain(r.room_id);
   });
 
-  it('/room show and recover redact stored saga diagnostics', async () => {
+  it('/room show redacts stored saga diagnostics', async () => {
     const r = await createTestRoom();
     const secret = 'stack at /secret/path token=canary-token';
     const { setSagaError } = await import('../src/rooms-tasks/room-state.js');
     setSagaError(r.room_id, secret, secret, 'member_failed');
-    for (const command of [`/room show ${r.room_id}`, `/room recover ${r.room_id}`]) {
-      const ctx = context();
-      await dispatchOwnerCommand(command, ctx);
-      expect(ctx.replies).toHaveLength(1);
-      expect(ctx.replies[0]).toContain('inspect role logs');
-      expect(ctx.replies[0]).not.toContain('/secret/path');
-      expect(ctx.replies[0]).not.toContain('canary-token');
-    }
+    const ctx = context();
+    await dispatchOwnerCommand(`/room show ${r.room_id}`, ctx);
+    expect(ctx.replies).toHaveLength(1);
+    expect(ctx.replies[0]).toContain('inspect role logs');
+    expect(ctx.replies[0]).not.toContain('/secret/path');
+    expect(ctx.replies[0]).not.toContain('canary-token');
   });
 
   it('keeps arbitrary room effect errors generic and never exposes their text', async () => {
@@ -1171,36 +1156,13 @@ describe('owner-channel room subcommands', () => {
     expect(ctx.replies[0]).not.toContain('Not found');
   });
 
-  it('/room recover migrates a legacy closed record through deletion', async () => {
-    const r = await createTestRoom();
-    const { closeRoom } = await import('../src/rooms-tasks/room-state.js');
-    closeRoom(r.room_id);
+  it('/room recover fails as an unknown removed subcommand', async () => {
     const ctx = context();
-    await dispatchOwnerCommand(`/room recover ${r.room_id}`, ctx);
-    expect(ctx.closeRoom).toHaveBeenCalledWith(r.room_id);
-  });
-
-  it('/room recover <id> shows room saga state', async () => {
-    const r = await createTestRoom();
-    const ctx = context();
-    await dispatchOwnerCommand(`/room recover ${r.room_id}`, ctx);
+    await dispatchOwnerCommand('/room recover legacy-room', ctx);
     expect(ctx.replies).toHaveLength(1);
-    expect(ctx.replies[0]).toContain(r.room_id);
-    expect(ctx.replies[0]).toContain('**Saga:**');
-  });
-
-  it('/room recover nonexistent returns not found', async () => {
-    const ctx = context();
-    await dispatchOwnerCommand('/room recover nonexistent', ctx);
-    expect(ctx.replies).toHaveLength(1);
-    expect(ctx.replies[0]).toContain('⚠️');
-  });
-
-  it('/room recover without id returns usage', async () => {
-    const ctx = context();
-    await dispatchOwnerCommand('/room recover', ctx);
-    expect(ctx.replies).toHaveLength(1);
-    expect(ctx.replies[0]).toContain('usage');
+    expect(ctx.replies[0]).toContain('Invalid command');
+    expect(ctx.replies[0]).toContain('unknown room subcommand: recover');
+    expect(ctx.closeRoom).not.toHaveBeenCalled();
   });
 });
 

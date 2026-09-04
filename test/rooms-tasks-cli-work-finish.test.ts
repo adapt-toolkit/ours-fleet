@@ -494,7 +494,7 @@ describe('canonical proxied Task/Room audit metadata', () => {
     expect(() => getTask(done.task_id)).toThrow(/not found/);
   });
 
-  it.each([false, true])('captures room create/recover/delete metadata (json=%s)', async json => {
+  it.each([false, true])('captures room create/delete metadata (json=%s)', async json => {
     writeCustomTemplate();
     beginFleetAuditCollection();
     await runRoom('create', '--name', 'Audited room', '--template', 'durable', ...(json ? ['--json'] : []));
@@ -511,17 +511,22 @@ describe('canonical proxied Task/Room audit metadata', () => {
 
     out = [];
     beginFleetAuditCollection();
-    await runRoom('recover', ROOM_ID, ...(json ? ['--json'] : []));
-    expect(consumeFleetAuditCollection().presentations).toBeUndefined();
-
-    out = [];
-    beginFleetAuditCollection();
     await runRoom('delete', ROOM_ID, ROOM_ID, ...(json ? ['--json'] : []));
     expect(consumeFleetAuditCollection().presentations).toMatchObject([
       { kind: 'room', operation: 'close', id: ROOM_ID, previousState: 'active', newState: 'closing' },
       { kind: 'room', operation: 'delete', id: ROOM_ID, previousState: 'closing', newState: 'deleted',
         template: 'durable@7', participants: [{ name: expect.any(String), role: expect.any(String) }] },
     ]);
+  });
+
+  it('rejects the removed room recover subcommand before any Cowork effect', async () => {
+    await expect(runRoom('recover', ROOM_ID)).rejects.toMatchObject({
+      code: 'commander.unknownCommand',
+    });
+    expect(out.join('\n')).toContain("unknown command 'recover'");
+    expect(mocks.recoverRoom).not.toHaveBeenCalled();
+    const room = makeProgram().commands.find(command => command.name() === 'room');
+    expect(room?.helpInformation()).not.toContain('recover');
   });
 
   it('classifies proxied JSON validation separately from unexpected runtime failure', async () => {
@@ -872,7 +877,6 @@ describe('task work', () => {
     setSagaError(ROOM_ID, secret, secret, 'member_failed');
     out = [];
     await runRoom('show', ROOM_ID);
-    await runRoom('recover', ROOM_ID);
     const text = out.join('\n');
     expect(text).toContain('inspect role logs');
     expect(text).not.toContain('/secret/path');
@@ -1011,24 +1015,6 @@ describe('task work', () => {
       schema_version: 1, task: getTask(t.task_id), room: getRoomRecord(ROOM_ID),
       recovery_actions: ['Provisioning resumed successfully'],
     });
-  });
-
-  it('room recover uses the task-bound durable snapshot after config removal', async () => {
-    writeCustomTemplate(true);
-    mocks.provisionMembers.mockImplementationOnce(async ({ roomId }: { roomId: string }) => {
-      advanceSaga(roomId, 'wait_seats', 5, 'waiting_seats');
-      return getRoomRecord(roomId)!;
-    });
-    const t = backlogTask();
-    await run('work', t.task_id, '--template', 'durable');
-    writeCustomTemplate(false);
-    out = [];
-    mocks.markdownRender.mockClear();
-    await runRoom('recover', ROOM_ID, '--json');
-    expect(mocks.provisionMembers).toHaveBeenLastCalledWith(expect.objectContaining({
-      template: expect.objectContaining({ name: 'durable', version: 7 }),
-    }));
-    expect(mocks.markdownRender).not.toHaveBeenCalled();
   });
 
   it('refuses to resume a waiting room under a different --template', async () => {

@@ -1505,7 +1505,6 @@ export class OwnerChannel implements OwnerChannelHandle {
       },
       fleetList: () => this.fleetOps.list(),
       closeRoom: roomId => this.closeRoomFromOwner(sender, roomId, wireId),
-      recoverRoom: roomId => this.recoverRoomFromOwner(sender, roomId, wireId),
       terminalTask: (taskId, kind, outcome) =>
         this.terminalTaskFromOwner(sender, taskId, kind, outcome, wireId),
       recoverTask: taskId => this.recoverTaskFromOwner(sender, taskId, wireId),
@@ -1737,7 +1736,7 @@ export class OwnerChannel implements OwnerChannelHandle {
     await this.send(sender.id, renderMarkdownFailure({
       kind: 'pending', subject: `/room delete ${roomId} ${roomId}`,
       detail: 'The deletion request was accepted and is still being settled.',
-      action: `Run /room recover ${roomId} if deletion remains pending.`,
+      action: `Run /room delete ${roomId} ${roomId} again if deletion remains pending.`,
     }), wireId);
     this.state.remember(wireId);
     try {
@@ -1748,37 +1747,6 @@ export class OwnerChannel implements OwnerChannelHandle {
         recoveryHint: `External delete worker failed to start. Retry /room delete ${roomId} ${roomId}.` });
       throw error;
     }
-  }
-
-  private async recoverRoomFromOwner(
-    sender: { id: string; name: string }, roomId: string, wireId: string,
-  ): Promise<void> {
-    const app = new TaskRoomApplicationService(this.options.configPath);
-    const actor = { kind: 'authenticated_owner' as const, surface: 'messenger' as const, cid: sender.id };
-    const result = await app.recoverRoom({ actor, roomId });
-    if (result.kind === 'deletion_worker_required') {
-      await this.send(sender.id, renderMarkdownFailure({ kind: 'pending',
-        subject: `/room recover ${roomId}`,
-        detail: 'The deletion recovery is still being settled.',
-        action: `Run /room recover ${roomId} if deletion remains pending.` }), wireId);
-      this.state.remember(wireId);
-      try { await this.fleetOps.closeRoom(roomId); }
-      catch (error) {
-        await app.recordRoomSettlementError({ actor, roomId,
-          error: error instanceof Error ? error.message : String(error),
-          recoveryHint: `External delete worker failed to start. Retry /room delete ${roomId} ${roomId}.` });
-        throw error;
-      }
-      return;
-    }
-    const r = result.orchestration;
-    await this.send(sender.id, renderMarkdownResult({ icon: '🛟', title: 'Room recovery',
-      fields: [{ label: 'Room', value: result.room.room_id, kind: 'code' },
-        { label: 'Status', value: roomStatus(result.room.state), kind: 'markdown' },
-        ...(r ? [{ label: 'Saga', value: r.saga.phase, kind: 'code' as const }] : [])],
-      sections: result.issues.length ? [{ heading: 'Next steps', items: result.issues }]
-        : [{ heading: 'Result', items: ['No recovery action is needed.'] }] }), wireId);
-    this.state.remember(wireId);
   }
 
   /** Carry a task terminal request through a worker that survives this role. */

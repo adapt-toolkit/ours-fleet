@@ -140,7 +140,7 @@ const AGENT_SURFACES: Record<string, ReadonlySet<string>> = {
   template: new Set(['list', 'show', 'validate']),
   task: new Set(['create', 'list', 'lists', 'list-create', 'list-rename', 'list-delete', 'move',
     'show', 'start', 'await', 'block', 'unblock', 'review', 'done', 'cancel', 'delete', 'recover', 'work', 'finish']),
-  room: new Set(['create', 'list', 'show', 'open', 'members', 'delete', 'close', 'recover']),
+  room: new Set(['create', 'list', 'show', 'open', 'members', 'delete', 'close']),
 };
 export const fleetProxyCommandInventory = Object.freeze(Object.fromEntries(
   Object.entries(AGENT_SURFACES).map(([surface, commands]) => [surface, [...commands]])));
@@ -557,12 +557,12 @@ export function renderFleetLifecycleEvent(value: FleetAuditPresentation): string
   if (value.kind === 'lifecycle_failure') {
     const actions = {
       provision_failed: 'Inspect Fleet service logs, correct configuration, then recover the resource.',
-      provision_pending: 'Run Task or Room recover after checking member readiness.',
+      provision_pending: 'Check member readiness, then retry the originating Task or Room command.',
       readiness_failed: 'Inspect the Agent log, correct its configuration, then retry creation.',
       settlement_failed: 'Inspect Fleet service logs, then run Task recover.',
       settlement_pending: 'Run Task recover to continue settlement.',
-      cleanup_failed: 'Inspect Fleet service logs, then run Room recover.',
-      cleanup_pending: 'Run Room recover to continue cleanup.',
+      cleanup_failed: 'Inspect Fleet service logs, then retry Room delete.',
+      cleanup_pending: 'Retry Room delete to continue cleanup.',
     } as const;
     const lifecycle = value.category.endsWith('_pending') ? 'lifecycle pending' : 'lifecycle failure';
     return `⚠️ ${value.resource} ${value.id} ${lifecycle} (${value.category}); `

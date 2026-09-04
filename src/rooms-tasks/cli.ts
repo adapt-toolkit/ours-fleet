@@ -406,16 +406,11 @@ function auditTask(operation: string, task: ReturnType<typeof getTask>, previous
       configuration: presentations.get(member.name) })) });
 }
 
-function auditRoom(operation: string, room: RoomOrchestrationRecord, previousState: string,
+function auditRoom(operation: 'create' | 'activate' | 'close' | 'delete', room: RoomOrchestrationRecord, previousState: string,
   newState: string = room.state): void {
   if (previousState === newState) return;
   recordFleetAuditResource('room', room.room_id);
-  const semanticOperation = operation === 'recover'
-    ? newState === 'active' ? 'activate' : newState === 'deleted' ? 'delete'
-      : newState === 'closing' ? 'close' : undefined
-    : operation as 'create' | 'activate' | 'close' | 'delete';
-  if (!semanticOperation) return;
-  recordFleetAuditPresentation({ kind: 'room', operation: semanticOperation, id: room.room_id, previousState, newState,
+  recordFleetAuditPresentation({ kind: 'room', operation, id: room.room_id, previousState, newState,
     revision: room.closed_at ?? room.activated_at ?? room.close?.accepted_at ?? room.created_at,
     name: room.room_name, taskId: room.task_id,
     template: room.template_snapshot ? `${room.template_snapshot.name}@${room.template_snapshot.version}` : undefined,
@@ -1597,7 +1592,7 @@ export function registerRoomCommands(parent: Command, cOpt: (cmd: Command) => Co
           console.log(renderMarkdownFailure({
             kind: 'pending', subject: `room delete ${id} ${id}`,
             detail: 'The deletion request was accepted and is still being settled.',
-            action: `Run ours-fleet room delete ${id} ${id} or room recover ${id}.`,
+            action: `Run ours-fleet room delete ${id} ${id} again.`,
           }));
           return;
         }
@@ -1617,57 +1612,6 @@ export function registerRoomCommands(parent: Command, cOpt: (cmd: Command) => Co
     .description('deprecated alias for room delete (requires ID twice for confirmation)')
     .option('--json', 'JSON output')
     .action(deleteAction);
-
-  cOpt(roomCmd.command('recover <id>'))
-    .description('attempt to recover a stuck room')
-    .option('--json', 'JSON output')
-    .action(async (id: string, opts: { configuration?: string; json?: boolean }) => {
-      try {
-        const previous = getRoomRecord(id);
-        const recovered = await taskRoomService(opts.configuration).recoverRoom({
-          actor: { kind: 'local_control', surface: 'cli' }, roomId: id,
-        });
-        if (recovered.kind === 'deletion_worker_required') {
-          const settled = await launchRoomDeleteWorker(id, opts.configuration);
-          if (previous) auditRoom('recover', previous, previous.state,
-            settled.deleted ? 'deleted' : 'closing');
-          if (opts.json) {
-            console.log(JSON.stringify({
-              schema_version: 1, room: null, orchestration: null,
-              recovery_actions: [settled.timedOut
-                ? `Deletion remains pending — retry room delete ${id} ${id}`
-                : 'Deletion completed successfully'],
-            }, null, 2));
-            return;
-          }
-          console.log(renderMarkdownResult({
-            icon: settled.timedOut ? '⏳' : '🗑️',
-            title: settled.timedOut ? 'Room deletion pending' : 'Room deleted',
-            fields: [{ label: 'ID', value: id, kind: 'code' }],
-            sections: [{ heading: 'Next step', items: [settled.timedOut
-              ? `Run ours-fleet room delete ${id} ${id} or room recover ${id} again.`
-              : 'No recovery action is needed.'] }],
-          }));
-          return;
-        }
-        const { room: cowork, orchestration: r, issues: actions } = recovered;
-        if (r) auditRoom('recover', r, previous?.state ?? 'unresolved', r.state);
-        if (opts.json) {
-          console.log(JSON.stringify({ schema_version: 1, room: cowork, orchestration: r ?? null, recovery_actions: actions }, null, 2));
-          return;
-        }
-        console.log(renderMarkdownResult({
-          icon: '🛟', title: 'Room recovery',
-          fields: [
-            { label: 'Room', value: cowork.room_id, kind: 'code' },
-            { label: 'Status', value: roomStatus(cowork.state), kind: 'markdown' },
-            ...(r ? [{ label: 'Saga', value: r.saga.phase, kind: 'code' as const }] : []),
-          ],
-          sections: actions.length ? [{ heading: 'Next steps', items: actions }]
-            : [{ heading: 'Result', items: ['No recovery action is needed.'] }],
-        }));
-      } catch (e) { if (opts.json) die(e); dieTaskRoom(e); }
-    });
 
   const internalDeleteAction = async (
     id: string, opts: { configuration?: string; json?: boolean },

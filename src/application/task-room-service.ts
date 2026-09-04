@@ -761,88 +761,6 @@ export class TaskRoomApplicationService {
     return recordManagedRoomCloseError(input.roomId, input.error, input.recoveryHint);
   }
 
-  async recoverRoom(input: { actor: TaskRoomActor; roomId: string }): Promise<
-    | { kind: 'deletion_worker_required'; roomId: string }
-    | { kind: 'recovered' | 'provisioning_resumed' | 'provisioning_resume_failed'; room: Awaited<ReturnType<CoworkAdapter['recoverRoom']>>; orchestration: RoomOrchestrationRecord | undefined; issues: string[] }
-  > {
-    const cfg = (this.deps.loadConfiguration ?? loadConfig)(this.configurationPath);
-    if (!cfg.rooms) throw new ConfigError('rooms: configuration is required before creating or querying rooms');
-    const adapter = this.deps.cowork ? this.deps.cowork(cfg)
-      : createCoworkAdapter({ configPath: cfg.rooms.cowork?.config });
-    let orchestration = getRoomRecord(input.roomId);
-    if (orchestration?.state === 'closing' || orchestration?.state === 'closed')
-      return { kind: 'deletion_worker_required', roomId: input.roomId };
-    const room = await adapter.recoverRoom(input.roomId);
-    orchestration = getRoomRecord(input.roomId);
-    if (orchestration) {
-      const policy = storedRoomLaunchPolicy(orchestration.room_policy);
-      if ((room.anonymous ?? false) !== policy.anonymous) {
-        const error = `Cowork anonymity (${String(room.anonymous ?? false)}) does not match Fleet's durable Room policy (${String(policy.anonymous)})`;
-        setSagaError(input.roomId, error,
-          'Do not respawn members. Repair or upgrade Cowork, then recover the Room without changing its policy.',
-          'waiting_cowork');
-        throw new Error(error);
-      }
-    }
-    if (orchestration && !orchestration.owner_seat_cid
-      && (orchestration.provisioning_detail === 'waiting_owner_invite'
-        || orchestration.provisioning_detail === 'owner_cid_mismatch')) {
-      const expected = cfg.rooms.owner.expected_cid.toLowerCase();
-      const existing = (await adapter.getSeats(input.roomId))
-        .find(seat => seat.identity_cid.toLowerCase() === expected && seat.seat_state !== 'removed');
-      if (!existing && !cfg.ownerInvite)
-        throw new ConfigError('rooms.owner: configure public_invite or public_invite_file before recovery');
-      let acceptedCid = existing?.identity_cid;
-      if (!acceptedCid) acceptedCid = (await adapter.acceptInvite(input.roomId, cfg.ownerInvite!, {
-        role: cfg.rooms.owner.role, expected_cid: cfg.rooms.owner.expected_cid,
-      })).seat_cid;
-      setOwnerSeat(input.roomId, acceptedCid, cfg.ownerInviteFingerprint ?? '');
-      orchestration = advanceSaga(input.roomId, 'create_members', 3);
-    }
-    const issues: string[] = [];
-    if (orchestration?.saga.error) issues.push('A provisioning failure is recorded; inspect role logs for diagnostics.');
-    if (orchestration?.saga.recovery_hint) issues.push('Recovery guidance is recorded; inspect role logs for diagnostics.');
-    if (orchestration?.provisioning_detail === 'waiting_cowork') issues.push('Check ours-cowork service status');
-    if (orchestration?.provisioning_detail === 'waiting_owner_invite') issues.push('Rotate rooms.owner.public_invite in config, then re-run recover');
-    if (orchestration?.provisioning_detail === 'waiting_seats') issues.push('Inspect temporary member logs for invite acceptance, then re-run recover');
-    if (orchestration?.state === 'provisioning'
-      && ['create_members', 'join_role_groups', 'wait_seats', 'launch_work', 'activate'].includes(orchestration.saga.phase)
-      && orchestration.template_snapshot) {
-      try {
-        let template = orchestration.template_snapshot;
-        let brief: string | undefined;
-        let goal = orchestration.room_name;
-        if (orchestration.task_id) {
-          const task = readTask(orchestration.task_id);
-          if (!task.template || task.template.name !== template.name || task.template.version !== template.version
-            || task.template.content_hash !== template.content_hash)
-            throw new Error(`task ${task.task_id} template reference does not match room ${orchestration.room_id}'s durable snapshot`);
-          brief = task.brief; goal = task.title;
-        }
-        await (this.deps.provisionMembers ?? provisionMembers)({ cfg, cowork: adapter,
-          roomId: orchestration.room_id, taskId: orchestration.task_id, template,
-          binPath: (this.deps.binPath ?? getBinPath)(), brief, goal });
-        orchestration = getRoomRecord(input.roomId);
-        return { kind: 'provisioning_resumed', room, orchestration,
-          issues: ['Provisioning resumed successfully'] };
-      } catch (error) {
-        issues.push(`Resume failed: ${error instanceof Error ? error.message : String(error)}`);
-        return { kind: 'provisioning_resume_failed', room, orchestration, issues };
-      }
-    }
-    if (orchestration?.state === 'provisioning' && !orchestration.template_snapshot) {
-      const seats = await adapter.getSeats(input.roomId);
-      const ownerReady = !orchestration.owner_seat_cid || seats.some(seat =>
-        seat.identity_cid.toLowerCase() === orchestration!.owner_seat_cid!.toLowerCase()
-          && seat.seat_state === 'active');
-      if (ownerReady) {
-        orchestration = activateRoom(input.roomId);
-        if (orchestration.task_id) activateTask(orchestration.task_id);
-      }
-    }
-    return { kind: 'recovered', room, orchestration, issues };
-  }
-
   async finishTask(input: {
     actor: TaskRoomActor; taskId: string; outcome?: TaskOutcome;
   }): Promise<TaskSettlementPlan> {
@@ -1109,7 +1027,7 @@ export class TaskRoomApplicationService {
         const mismatch = error instanceof CoworkProtocolError && /CID|expected/i.test(error.message);
         setSagaError(room.room_id, error instanceof Error ? error.message : String(error),
           mismatch ? 'Verify rooms.owner.expected_cid and rotate the configured invite if necessary.'
-            : 'Rotate rooms.owner.public_invite or public_invite_file, then run room recover.',
+            : 'Rotate rooms.owner.public_invite or public_invite_file, then retry the originating task or room create command.',
           mismatch ? 'owner_cid_mismatch' : 'waiting_owner_invite');
         throw error;
       }
