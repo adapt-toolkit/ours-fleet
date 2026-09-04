@@ -473,8 +473,9 @@ describe('canonical proxied Task/Room audit metadata', () => {
     expect(consumeFleetAuditCollection()).toMatchObject({
       resourceIds: { task: id, room: ROOM_ID },
       presentations: [
-        { kind: 'room', operation: 'create', id: ROOM_ID, previousState: 'none', newState: 'provisioning' },
-        { kind: 'room', operation: 'activate', id: ROOM_ID, previousState: 'provisioning', newState: 'active' },
+        { kind: 'task', operation: 'work', id, title: 'Audited task',
+          previousState: 'provisioning', newState: 'active', roomId: ROOM_ID,
+          roomName: expect.any(String) },
       ],
     });
   });
@@ -497,15 +498,13 @@ describe('canonical proxied Task/Room audit metadata', () => {
     expect(() => getTask(done.task_id)).toThrow(/not found/);
   });
 
-  it.each([false, true])('captures room create/recover/delete metadata (json=%s)', async json => {
+  it.each([false, true])('captures room create/delete metadata (json=%s)', async json => {
     writeCustomTemplate();
     beginFleetAuditCollection();
     await runRoom('create', '--name', 'Audited room', '--template', 'durable', ...(json ? ['--json'] : []));
     expect(consumeFleetAuditCollection()).toMatchObject({
       resourceIds: { room: ROOM_ID },
       presentations: [
-        { kind: 'room', operation: 'create', id: ROOM_ID,
-          previousState: 'none', newState: 'provisioning', template: 'durable@7', participants: [] },
         { kind: 'room', operation: 'activate', id: ROOM_ID,
           previousState: 'provisioning', newState: 'active', template: 'durable@7',
           participants: [] },
@@ -514,17 +513,41 @@ describe('canonical proxied Task/Room audit metadata', () => {
 
     out = [];
     beginFleetAuditCollection();
-    await runRoom('recover', ROOM_ID, ...(json ? ['--json'] : []));
-    expect(consumeFleetAuditCollection().presentations).toBeUndefined();
-
-    out = [];
-    beginFleetAuditCollection();
     await runRoom('delete', ROOM_ID, ROOM_ID, ...(json ? ['--json'] : []));
     expect(consumeFleetAuditCollection().presentations).toMatchObject([
-      { kind: 'room', operation: 'close', id: ROOM_ID, previousState: 'active', newState: 'closing' },
       { kind: 'room', operation: 'delete', id: ROOM_ID, previousState: 'closing', newState: 'deleted',
         template: 'durable@7', participants: [{ name: expect.any(String), role: expect.any(String) }] },
     ]);
+  });
+
+  it('rejects the removed room recover subcommand before any Cowork effect', async () => {
+    await expect(runRoom('recover', ROOM_ID)).rejects.toMatchObject({
+      code: 'commander.unknownCommand',
+    });
+    expect(out.join('\n')).toContain("unknown command 'recover'");
+    expect(mocks.recoverRoom).not.toHaveBeenCalled();
+    const room = makeProgram().commands.find(command => command.name() === 'room');
+    expect(room?.helpInformation()).not.toContain('recover');
+  });
+
+  it('rejects the removed task recover subcommand before any provisioning effect', async () => {
+    await expect(run('recover', 'legacy-task')).rejects.toMatchObject({
+      code: 'commander.unknownCommand',
+    });
+    expect(out.join('\n')).toContain("unknown command 'recover'");
+    expect(mocks.provisionMembers).not.toHaveBeenCalled();
+    const task = makeProgram().commands.find(command => command.name() === 'task');
+    expect(task?.helpInformation()).not.toContain('recover');
+  });
+
+  it('rejects the removed task await subcommand before any provisioning effect', async () => {
+    await expect(run('await', 'legacy-task')).rejects.toMatchObject({
+      code: 'commander.unknownCommand',
+    });
+    expect(out.join('\n')).toContain("unknown command 'await'");
+    expect(mocks.provisionMembers).not.toHaveBeenCalled();
+    const task = makeProgram().commands.find(command => command.name() === 'task');
+    expect(task?.helpInformation()).not.toContain('await');
   });
 
   it('classifies proxied JSON validation separately from unexpected runtime failure', async () => {
@@ -540,7 +563,7 @@ describe('canonical proxied Task/Room audit metadata', () => {
 });
 
 describe('task provisioning command outcomes', () => {
-  it('returns an explicit JSON in-progress handle and starts one continuation', async () => {
+  it('returns an explicit JSON in-progress outcome and starts one continuation', async () => {
     writeCustomTemplate();
     const task = createTask({ title: 'Slow launch', origin: { type: 'cli' }, start: false });
     mocks.provisionMembers.mockImplementationOnce(async ({ roomId }: { roomId: string }) =>
@@ -549,17 +572,10 @@ describe('task provisioning command outcomes', () => {
     const payload = JSON.parse(out.join('\n'));
     expect(payload.provisioning).toMatchObject({
       kind: 'in_progress', task: { task_id: task.task_id },
-      room: { room_id: ROOM_ID }, handle: { task_id: task.task_id },
+      room: { room_id: ROOM_ID },
       members: { expected: 1, active: 0, launched: 0 },
     });
-    expect(payload.provisioning.handle.command).toBe(`ours-fleet task await ${task.task_id}`);
-    expect(mocks.launchFleetWorker).toHaveBeenCalledWith(
-      ['task', '_provision', task.task_id], `task-provision-${task.task_id}`, cfgPath);
-
-    mocks.launchFleetWorker.mockClear();
-    out = [];
-    await run('await', task.task_id, '--wait-ms', '0', '--json');
-    expect(JSON.parse(out.join('\n')).provisioning.kind).toBe('in_progress');
+    expect(payload.provisioning).not.toHaveProperty('handle');
     expect(mocks.launchFleetWorker).toHaveBeenCalledWith(
       ['task', '_provision', task.task_id], `task-provision-${task.task_id}`, cfgPath);
   });
@@ -591,20 +607,21 @@ describe('task provisioning command outcomes', () => {
     out = [];
     await run('_provision', task.task_id);
     const first = mocks.presentFleetWorkerLifecycle.mock.calls[0]?.[0] as Array<Record<string, unknown>>;
-    expect(first.filter(event => event.kind === 'room' && event.operation === 'activate')).toEqual([
-      expect.objectContaining({ id: ROOM_ID, eventId: expect.stringMatching(/^room-ready:/) }),
+    expect(first.filter(event => event.kind === 'task' && event.operation === 'work')).toEqual([
+      expect.objectContaining({ id: task.task_id, title: 'Detached ready', roomId: ROOM_ID,
+        roomName: expect.any(String), eventId: expect.stringMatching(/^task-ready:/) }),
     ]);
 
     // A worker replay observes the same durable activation and presents the
     // same digest; the Owner ledger therefore suppresses a second notice.
     await run('_provision', task.task_id);
     const replay = mocks.presentFleetWorkerLifecycle.mock.calls[1]?.[0] as Array<Record<string, unknown>>;
-    expect(replay.find(event => event.operation === 'activate')?.eventId)
-      .toBe(first.find(event => event.operation === 'activate')?.eventId);
+    expect(replay.find(event => event.operation === 'work')?.eventId)
+      .toBe(first.find(event => event.operation === 'work')?.eventId);
     expect(mocks.launchFleetWorker).toHaveBeenCalledTimes(1);
   });
 
-  it('uses the advertised await handle to retry a fixed Owner-action blocker', async () => {
+  it('uses task start to retry a fixed Owner-action blocker', async () => {
     writeV2Fixture(cfgPath,
       'roles: {}\n'
       + 'rooms:\n'
@@ -631,14 +648,7 @@ describe('task provisioning command outcomes', () => {
     advanceSaga(room.room_id, 'attach_owner', 2);
     setSagaError(room.room_id, 'old invite expired', 'rotate invite', 'waiting_owner_invite');
 
-    await run('await', task.task_id, '--wait-ms', '0', '--json');
-    expect(JSON.parse(out.join('\n')).provisioning).toMatchObject({ kind: 'in_progress',
-      next_action: expect.stringContaining('Rotate') });
-    expect(mocks.launchFleetWorker).toHaveBeenCalledWith(
-      ['task', '_provision', task.task_id], `task-provision-${task.task_id}`, cfgPath);
-
-    out = [];
-    await run('_provision', task.task_id);
+    await run('start', task.task_id, '--json');
     expect(mocks.acceptInvite).toHaveBeenCalledOnce();
     expect(getTask(task.task_id).state).toBe('active');
     expect(getRoomRecord(room.room_id)?.state).toBe('active');
@@ -650,19 +660,15 @@ describe('task provisioning command outcomes', () => {
     await run('start', task.task_id, '--template', 'durable');
     expect(out.join('\n')).toContain('Room provisioning complete');
     expect(out.join('\n')).toContain('1/1 active; 1/1 launched');
-    out = [];
-    await run('await', task.task_id, '--wait-ms', '0', '--json');
-    expect(JSON.parse(out.join('\n')).provisioning.kind).toBe('ready');
   });
 
   it('returns a structured terminal blocker with a canonical next action', async () => {
     const task = backlogTask();
     startTask(task.task_id);
     failTask(task.task_id, 'permanent configuration blocker');
-    await run('await', task.task_id, '--wait-ms', '0', '--json');
-    const outcome = JSON.parse(out.join('\n')).provisioning;
+    const outcome = new TaskRoomApplicationService(cfgPath).taskProvisioningOutcome(task.task_id);
     expect(outcome).toMatchObject({ kind: 'failed', blocker: 'permanent configuration blocker' });
-    expect(outcome.next_action).toContain(`task recover ${task.task_id}`);
+    expect(outcome.next_action).toContain(`task start ${task.task_id}`);
   });
 });
 
@@ -875,7 +881,6 @@ describe('task work', () => {
     setSagaError(ROOM_ID, secret, secret, 'member_failed');
     out = [];
     await runRoom('show', ROOM_ID);
-    await runRoom('recover', ROOM_ID);
     const text = out.join('\n');
     expect(text).toContain('inspect role logs');
     expect(text).not.toContain('/secret/path');
@@ -992,48 +997,6 @@ describe('task work', () => {
     }));
   });
 
-  it('task recover refreshes output and uses the durable room snapshot after config drift', async () => {
-    writeCustomTemplate(true);
-    mocks.provisionMembers.mockImplementationOnce(async ({ roomId }: { roomId: string }) => {
-      advanceSaga(roomId, 'wait_seats', 5, 'waiting_seats');
-      return getRoomRecord(roomId)!;
-    });
-    const t = backlogTask();
-    await run('work', t.task_id, '--template', 'durable');
-    writeCustomTemplate(false);
-    out = [];
-    mocks.markdownRender.mockClear();
-    await run('recover', t.task_id, '--json');
-    const payload = JSON.parse(out.join('\n'));
-    expect(payload.task.state).toBe('active');
-    expect(payload.room.state).toBe('active');
-    expect(mocks.provisionMembers).toHaveBeenLastCalledWith(expect.objectContaining({
-      template: expect.objectContaining({ name: 'durable', version: 7 }),
-    }));
-    expectExactJson({
-      schema_version: 1, task: getTask(t.task_id), room: getRoomRecord(ROOM_ID),
-      recovery_actions: ['Provisioning resumed successfully'],
-    });
-  });
-
-  it('room recover uses the task-bound durable snapshot after config removal', async () => {
-    writeCustomTemplate(true);
-    mocks.provisionMembers.mockImplementationOnce(async ({ roomId }: { roomId: string }) => {
-      advanceSaga(roomId, 'wait_seats', 5, 'waiting_seats');
-      return getRoomRecord(roomId)!;
-    });
-    const t = backlogTask();
-    await run('work', t.task_id, '--template', 'durable');
-    writeCustomTemplate(false);
-    out = [];
-    mocks.markdownRender.mockClear();
-    await runRoom('recover', ROOM_ID, '--json');
-    expect(mocks.provisionMembers).toHaveBeenLastCalledWith(expect.objectContaining({
-      template: expect.objectContaining({ name: 'durable', version: 7 }),
-    }));
-    expect(mocks.markdownRender).not.toHaveBeenCalled();
-  });
-
   it('refuses to resume a waiting room under a different --template', async () => {
     mocks.provisionMembers.mockImplementationOnce(async ({ roomId }: { roomId: string }) => {
       advanceSaga(roomId, 'wait_seats', 5, 'waiting_seats');
@@ -1076,7 +1039,7 @@ describe('task work', () => {
     await run('work', t.task_id);
     advanceSaga(ROOM_ID, 'create_room', 1);
     await expect(run('work', t.task_id)).rejects.toThrow(ExitError);
-    expect(out.join('\n')).toContain('task recover');
+    expect(out.join('\n')).toContain(`task start ${t.task_id}`);
   });
 });
 
@@ -1154,9 +1117,9 @@ describe('task finish', () => {
       terminal_intent: {
         status: 'pending',
         first_failure: 'hidden worker failed',
-        first_recovery_hint: `Retry 'ours-fleet task recover ${t.task_id}'.`,
+        first_recovery_hint: `Retry 'ours-fleet task done ${t.task_id}'.`,
         error: 'hidden worker failed',
-        recovery_hint: `External settle worker failed. Retry task recover ${t.task_id}.`,
+        recovery_hint: 'External settle worker failed. Retry the originating task terminal command.',
       },
     });
   });
@@ -1172,37 +1135,6 @@ describe('task finish', () => {
     });
   });
 
-  it('the recovery worker orders begin, settlement, then continuation', async () => {
-    const t = backlogTask();
-    const begin = vi.spyOn(TaskRoomApplicationService.prototype, 'beginTaskRecovery')
-      .mockResolvedValue({ kind: 'terminal_worker_required', taskId: t.task_id });
-    const settle = vi.spyOn(TaskRoomApplicationService.prototype, 'settleTask').mockResolvedValue(t);
-    const continuation = vi.spyOn(TaskRoomApplicationService.prototype, 'continueTaskRecovery')
-      .mockResolvedValue({ kind: 'no_op', task: t, room: undefined, issues: [] });
-    await run('_recover', t.task_id);
-    expect(begin).toHaveBeenCalledOnce();
-    expect(settle).toHaveBeenCalledOnce();
-    expect(continuation).toHaveBeenCalledWith({
-      actor: { kind: 'internal_worker', surface: 'cli' }, taskId: t.task_id, terminalTimedOut: false,
-    });
-    expect(begin.mock.invocationCallOrder[0]).toBeLessThan(settle.mock.invocationCallOrder[0]);
-    expect(settle.mock.invocationCallOrder[0]).toBeLessThan(continuation.mock.invocationCallOrder[0]);
-  });
-
-  it('the recovery worker records settlement failure and never continues', async () => {
-    mocks.deleteManagedRoom.mockRejectedValue(new Error('recovery settle failed'));
-    const t = await activeTask();
-    reviewTask(t.task_id);
-    await acceptTaskTerminalIntent({ taskId: t.task_id, kind: 'done', roomId: t.room_id });
-    const continuation = vi.spyOn(TaskRoomApplicationService.prototype, 'continueTaskRecovery');
-    await expect(run('_recover', t.task_id)).rejects.toThrow(ExitError);
-    expect(continuation).not.toHaveBeenCalled();
-    expect(getTask(t.task_id)).toMatchObject({ terminal_intent: {
-      status: 'pending', error: 'recovery settle failed',
-      recovery_hint: `External settle worker failed. Retry task recover ${t.task_id}.`,
-    } });
-  });
-
   it('records a CLI settlement-worker launch failure through durable terminal state', async () => {
     mocks.launchFleetWorker.mockRejectedValueOnce(new Error('worker spawn failed'));
     const t = createTask({
@@ -1212,12 +1144,12 @@ describe('task finish', () => {
     expect(getTask(t.task_id)).toMatchObject({
       terminal_intent: {
         status: 'pending', error: 'worker spawn failed',
-        recovery_hint: `External settle worker failed to start. Retry task recover ${t.task_id}.`,
+        recovery_hint: `External settle worker failed to start. Retry ours-fleet task cancel ${t.task_id} ${t.task_id}.`,
       },
     });
   });
 
-  it('task recover resumes a pending terminal intent to convergence', async () => {
+  it('repeating task finish resumes a pending terminal intent to convergence', async () => {
     mocks.deleteManagedRoom.mockRejectedValueOnce(new Error('room delete failed'));
     const t = await activeTask();
     await expect(run('finish', t.task_id)).rejects.toThrow(ExitError);
@@ -1227,15 +1159,14 @@ describe('task finish', () => {
       return { room_id: roomId, deleted: true };
     });
     out = [];
-    await run('recover', t.task_id);
+    await run('finish', t.task_id);
     expect(getTask(t.task_id)).toMatchObject({
       state: 'done', terminal_intent: {
         status: 'settled', first_failure: 'room delete failed',
-        first_recovery_hint: `Retry 'ours-fleet task recover ${t.task_id}'.`,
+        first_recovery_hint: `Retry 'ours-fleet task done ${t.task_id}'.`,
       },
     });
-    expect(out.join('\n')).toContain(`**Task:** \`${t.task_id}\``);
-    expect(out.join('\n')).toContain('✅ Done');
+    expect(out.join('\n')).toContain('Task finished');
   });
 
   it('emits the finished task as --json', async () => {
@@ -1314,7 +1245,7 @@ describe('task delete', () => {
     } finally { vi.useRealTimers(); }
     const text = out.join('\n');
     expect(text).toContain('deletion was accepted and cleanup is still settling');
-    expect(text).toContain(`task recover ${t.task_id}`);
+    expect(text).toContain(`task delete ${t.task_id} ${t.task_id}`);
     expect(text).not.toContain('## 🗑️ Task deleted');
     expect(getTask(t.task_id).deletion?.status).toBe('pending');
   });

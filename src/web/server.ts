@@ -274,7 +274,7 @@ export async function buildWebServer(
     return {
       task_id: taskId, accepted: true, deletion: 'pending',
       ...(outcome.error ? { error: outcome.error } : {}),
-      recovery: `Repeat DELETE /api/v1/tasks/${taskId}?confirm=${taskId} or run 'ours-fleet task recover ${taskId}'.`,
+      recovery: `Repeat DELETE /api/v1/tasks/${taskId}?confirm=${taskId}.`,
     };
   });
   app.post('/api/v1/tasks', async (request, reply) => {

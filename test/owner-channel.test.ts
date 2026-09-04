@@ -343,7 +343,7 @@ describe('owner channel daemon-generation recovery', () => {
     await proactive;
     const sends = client.calls.filter(call => call.name === 'sendMessage');
     expect(sends).toHaveLength(1);
-    expect(sends[0].args?.text).toContain('spawned temporary Agent Temp (Temp) — ready');
+    expect(sends[0].args?.text).toContain('🚀 Agent launched: Temp');
     await channel.close();
   });
 
@@ -371,15 +371,18 @@ describe('owner channel daemon-generation recovery', () => {
     const sends = client.calls.filter(call => call.name === 'sendMessage');
     expect(sends).toHaveLength(1);
     const text = String(sends[0].args?.text);
-    expect(text).toContain('spawned temporary Agent Dev (Dev) — ready');
-    expect(text).toContain('Role preset `reviewer`');
-    expect(text).toContain('mission “Review every change”');
-    expect(text).toContain('Brain preset `codex-high`');
-    expect(text).toContain('harness `codex`');
-    expect(text).toContain('model `gpt-test`');
-    expect(text).toContain('effort high');
-    expect(text).toContain('approval=ask, filesystem=workspace, unattended=wait');
-    expect(text).toContain('mode ask/read-only');
+    expect(text).toContain('🚀 Agent launched: Dev');
+    expect(text).toContain('- **Role:** Preset `reviewer`');
+    expect(text).toContain('- **Mission:** “Review every change”');
+    expect(text).toContain('- **Brain:** Preset `codex-high`');
+    expect(text).toContain('- **Harness:** `codex`');
+    expect(text).toContain('- **Model:** `gpt-test`');
+    expect(text).toContain('- **Effort:** high');
+    expect(text).toContain('- **Approval:** ask');
+    expect(text).toContain('- **Filesystem:** workspace');
+    expect(text).toContain('- **Wait:** wait');
+    expect(text).toContain('- **Fleet mode:** ask');
+    expect(text).toContain('- **Native mode:** read-only');
     expect(text).not.toContain('inline:sha256');
     await channel.close();
   });
@@ -1075,7 +1078,6 @@ describe('OwnerChannel deterministic command dispatch', () => {
     settleTask: vi.fn(async () => undefined),
     settleTaskDeletion: vi.fn(async () => undefined),
     provisionTask: vi.fn(async () => undefined),
-    recoverTask: vi.fn(async () => undefined),
   });
 
   it('registers the registry-derived catalog and preserves read-only slash results', async () => {
@@ -1384,7 +1386,7 @@ describe('OwnerChannel deterministic command dispatch', () => {
     expect(acknowledgement).not.toContain('Room closed');
   });
 
-  it('acknowledges and remembers closing-room recovery before one worker launch', async () => {
+  it('rejects the removed room recover command without launching a worker', async () => {
     const fleet = fakeFleet();
     const fleetHome = mkdtempSync(join(tmpdir(), 'ours-owner-room-recover-'));
     dirs.push(fleetHome);
@@ -1401,53 +1403,40 @@ describe('OwnerChannel deterministic command dispatch', () => {
       [ownerMessage(5911, 'wire-room-recover', `/room recover ${roomId}`)],
       undefined, { fleet, configPath },
     );
-    let wireWhenSpawned = '';
-    let sendsWhenSpawned = 0;
-    fleet.closeRoom.mockImplementation(async () => {
-      wireWhenSpawned = readFileSync(join(dir, '.owner-channel-state.json'), 'utf8');
-      sendsWhenSpawned = client.calls.filter(call => call.name === 'sendMessage').length;
-    });
     try { await channel.drain(); }
     finally {
       if (previousHome === undefined) delete process.env.OURS_FLEET_HOME;
       else process.env.OURS_FLEET_HOME = previousHome;
     }
     expect(queuePrompt).not.toHaveBeenCalled();
-    expect(fleet.closeRoom).toHaveBeenCalledTimes(1);
-    expect(fleet.closeRoom).toHaveBeenCalledWith(roomId);
-    expect(wireWhenSpawned).toContain('wire-room-recover');
-    expect(sendsWhenSpawned).toBeGreaterThan(0);
-    expect(lastReply(client)).toContain('deletion recovery is still being settled');
+    expect(fleet.closeRoom).not.toHaveBeenCalled();
+    expect(lastReply(client)).toContain('Invalid command');
+    expect(lastReply(client)).toContain('unknown room subcommand: recover');
   });
 
-  it('routes authenticated Owner await through provisioning continuation, not broad recovery', async () => {
+  it('rejects the removed task recover command without launching a worker', async () => {
     const fleet = fakeFleet();
-    const fleetHome = mkdtempSync(join(tmpdir(), 'ours-owner-task-await-'));
-    dirs.push(fleetHome);
-    const previousHome = process.env.OURS_FLEET_HOME;
-    process.env.OURS_FLEET_HOME = fleetHome;
-    const task = createTask({ title: 'Owner await', origin: { type: 'owner_channel' }, start: true });
-    const room = createRoomRecord({ room_id: '01hzyk8m0000000000000000ad',
-      room_name: 'Owner await', room_identity_cid: 'c'.repeat(64), task_id: task.task_id });
-    updateTaskRoom(task.task_id, room.room_id, 'c'.repeat(64));
-    fleet.provisionTask.mockImplementation(async () => {
-      activateRoom(room.room_id);
-      activateTask(task.task_id);
-    });
+    const { channel, client, queuePrompt } = setup(
+      [ownerMessage(59115, 'wire-task-recover', '/task recover legacy-task')],
+      undefined, { fleet },
+    );
+    await channel.drain();
+    expect(queuePrompt).not.toHaveBeenCalled();
+    expect(fleet.provisionTask).not.toHaveBeenCalled();
+    expect(fleet.settleTask).not.toHaveBeenCalled();
+    expect(fleet.settleTaskDeletion).not.toHaveBeenCalled();
+    expect(lastReply(client)).toContain('Invalid command');
+    expect(lastReply(client)).toContain('unknown task subcommand: recover');
+  });
+
+  it('rejects the removed Owner task await command before provisioning', async () => {
+    const fleet = fakeFleet();
     const { channel, client } = setup(
-      [ownerMessage(5912, 'wire-task-await', `/task await ${task.task_id}`)], undefined, { fleet });
-    try {
-      await channel.start();
-      await channel.drain();
-    }
-    finally {
-      await channel.close();
-      if (previousHome === undefined) delete process.env.OURS_FLEET_HOME;
-      else process.env.OURS_FLEET_HOME = previousHome;
-    }
-    expect(fleet.provisionTask).toHaveBeenCalledWith(task.task_id);
-    expect(fleet.recoverTask).not.toHaveBeenCalled();
-    expect(lastReply(client)).toContain('Room provisioning complete');
+      [ownerMessage(5912, 'wire-task-await', '/task await legacy-task')], undefined, { fleet });
+    await channel.drain();
+    expect(fleet.provisionTask).not.toHaveBeenCalled();
+    expect(lastReply(client)).toContain('Invalid command');
+    expect(lastReply(client)).toContain('unknown task subcommand: await');
   });
 
   it('persists task terminal intent and the wire before launching its external worker', async () => {

@@ -242,7 +242,7 @@ export async function closeManagedRoom(input: {
       setRoomCloseError(
         input.roomId,
         errorText(error),
-        `Retry 'ours-fleet room delete ${input.roomId} ${input.roomId}' or run room recover.`,
+        `Retry 'ours-fleet room delete ${input.roomId} ${input.roomId}'.`,
       );
       throw error;
     }
@@ -286,7 +286,7 @@ export async function deleteManagedRoom(input: {
     setRoomCloseError(
       input.roomId,
       errorText(error),
-      `Retry 'ours-fleet room delete ${input.roomId} ${input.roomId}' or run room recover.`,
+      `Retry 'ours-fleet room delete ${input.roomId} ${input.roomId}'.`,
     );
     throw error;
   }

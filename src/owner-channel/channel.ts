@@ -1505,10 +1505,8 @@ export class OwnerChannel implements OwnerChannelHandle {
       },
       fleetList: () => this.fleetOps.list(),
       closeRoom: roomId => this.closeRoomFromOwner(sender, roomId, wireId),
-      recoverRoom: roomId => this.recoverRoomFromOwner(sender, roomId, wireId),
       terminalTask: (taskId, kind, outcome) =>
         this.terminalTaskFromOwner(sender, taskId, kind, outcome, wireId),
-      recoverTask: taskId => this.recoverTaskFromOwner(sender, taskId, wireId),
       createTask: input => provisioningCommand(async () => {
         const service = new TaskRoomApplicationService(this.options.configPath);
         const task = await service.createTask({
@@ -1536,14 +1534,6 @@ export class OwnerChannel implements OwnerChannelHandle {
         if (outcome.kind === 'in_progress' && !outcome.next_action)
           await this.fleetOps.provisionTask(task.task_id);
         return outcome;
-      }),
-      awaitTask: taskId => provisioningCommand(async () => {
-        const service = new TaskRoomApplicationService(this.options.configPath);
-        const initial = service.taskProvisioningOutcome(taskId);
-        if (initial.kind === 'in_progress') await this.fleetOps.provisionTask(taskId);
-        return service.awaitTaskProvisioning({
-          actor: { kind: 'authenticated_owner', surface: 'messenger', cid: sender.id }, taskId,
-        });
       }),
       taskProvisioningOutcome: taskId =>
         new TaskRoomApplicationService(this.options.configPath).taskProvisioningOutcome(taskId),
@@ -1737,7 +1727,7 @@ export class OwnerChannel implements OwnerChannelHandle {
     await this.send(sender.id, renderMarkdownFailure({
       kind: 'pending', subject: `/room delete ${roomId} ${roomId}`,
       detail: 'The deletion request was accepted and is still being settled.',
-      action: `Run /room recover ${roomId} if deletion remains pending.`,
+      action: `Run /room delete ${roomId} ${roomId} again if deletion remains pending.`,
     }), wireId);
     this.state.remember(wireId);
     try {
@@ -1748,89 +1738,6 @@ export class OwnerChannel implements OwnerChannelHandle {
         recoveryHint: `External delete worker failed to start. Retry /room delete ${roomId} ${roomId}.` });
       throw error;
     }
-  }
-
-  private async recoverRoomFromOwner(
-    sender: { id: string; name: string }, roomId: string, wireId: string,
-  ): Promise<void> {
-    const app = new TaskRoomApplicationService(this.options.configPath);
-    const actor = { kind: 'authenticated_owner' as const, surface: 'messenger' as const, cid: sender.id };
-    const result = await app.recoverRoom({ actor, roomId });
-    if (result.kind === 'deletion_worker_required') {
-      await this.send(sender.id, renderMarkdownFailure({ kind: 'pending',
-        subject: `/room recover ${roomId}`,
-        detail: 'The deletion recovery is still being settled.',
-        action: `Run /room recover ${roomId} if deletion remains pending.` }), wireId);
-      this.state.remember(wireId);
-      try { await this.fleetOps.closeRoom(roomId); }
-      catch (error) {
-        await app.recordRoomSettlementError({ actor, roomId,
-          error: error instanceof Error ? error.message : String(error),
-          recoveryHint: `External delete worker failed to start. Retry /room delete ${roomId} ${roomId}.` });
-        throw error;
-      }
-      return;
-    }
-    const r = result.orchestration;
-    await this.send(sender.id, renderMarkdownResult({ icon: '🛟', title: 'Room recovery',
-      fields: [{ label: 'Room', value: result.room.room_id, kind: 'code' },
-        { label: 'Status', value: roomStatus(result.room.state), kind: 'markdown' },
-        ...(r ? [{ label: 'Saga', value: r.saga.phase, kind: 'code' as const }] : [])],
-      sections: result.issues.length ? [{ heading: 'Next steps', items: result.issues }]
-        : [{ heading: 'Result', items: ['No recovery action is needed.'] }] }), wireId);
-    this.state.remember(wireId);
-  }
-
-  /** Carry a task terminal request through a worker that survives this role. */
-  private async recoverTaskFromOwner(
-    sender: { id: string; name: string }, taskId: string, wireId: string,
-  ): Promise<void> {
-    const app = new TaskRoomApplicationService(this.options.configPath);
-    const actor = { kind: 'authenticated_owner' as const, surface: 'messenger' as const, cid: sender.id };
-    const begin = await app.beginTaskRecovery({ actor, taskId });
-    if (begin.kind !== 'final') {
-      const deleting = begin.kind === 'deletion_worker_required';
-      await this.send(sender.id, renderMarkdownFailure({
-        kind: 'pending', subject: `/task recover ${taskId}`,
-        detail: deleting
-          ? 'The task is pending deletion; recovery continues its cleanup.'
-          : 'The recovery request was accepted and is still being settled.',
-        action: `Run /task recover ${taskId} if it remains pending.`,
-      }), wireId);
-      this.state.remember(wireId);
-      try { await this.fleetOps.recoverTask(taskId); }
-      catch (error) {
-        const failure = {
-          actor, taskId, error: error instanceof Error ? error.message : String(error),
-          recoveryHint: deleting
-            ? `External delete worker failed to start. Retry /task delete ${taskId} ${taskId}.`
-            : `External settle worker failed to start. Retry /task recover ${taskId}.`,
-        };
-        await (deleting ? app.recordDeletionError(failure) : app.recordSettlementError(failure));
-        throw error;
-      }
-      return;
-    }
-    const { task, room, issues } = begin.result;
-    const hints = issues.map(issue => issue.code === 'waiting_cowork' ? 'Cowork socket unreachable'
-      : issue.code === 'waiting_owner_authorization' ? 'Owner command authorization is not configured'
-      : issue.code === 'waiting_owner_invite' ? 'Owner invite missing or invalid'
-      : issue.code === 'owner_cid_mismatch' ? 'Owner CID mismatch'
-      : issue.code === 'member_failed' ? `Member failed at step ${issue.stepIndex}`
-      : issue.code === 'resume_failed' ? `Resume failed: ${issue.error}`
-      : issue.code === 'provisioning_resumed' ? 'Provisioning resumed successfully'
-      : issue.code);
-    await this.send(sender.id, renderMarkdownResult({
-      icon: '🛟', title: 'Task recovery',
-      fields: [{ label: 'Task', value: task.task_id, kind: 'code' },
-        { label: 'Status', value: taskStatus(task.state), kind: 'markdown' },
-        ...(room ? [{ label: 'Room', value: room.room_id, kind: 'code' as const },
-          { label: 'Room status', value: roomStatus(room.state), kind: 'markdown' as const },
-          { label: 'Saga', value: room.saga.phase, kind: 'code' as const }] : [])],
-      sections: hints.length ? [{ heading: 'Next steps', items: hints }]
-        : [{ heading: 'Result', items: ['No automated recovery action is available.'] }],
-    }), wireId);
-    this.state.remember(wireId);
   }
 
   /** Accept a permanent any-state deletion, acknowledge it, then hand cleanup to a durable worker. */
@@ -1851,7 +1758,7 @@ export class OwnerChannel implements OwnerChannelHandle {
     await this.send(sender.id, renderMarkdownFailure({
       kind: 'pending', subject: `/task delete ${taskId} ${taskId}`,
       detail: 'The deletion was accepted; cleanup is settling in the background.',
-      action: `Run /task recover ${taskId} or repeat /task delete ${taskId} ${taskId} if it remains pending.`,
+      action: `Repeat /task delete ${taskId} ${taskId} if it remains pending.`,
     }), wireId);
     this.state.remember(wireId);
     try {
@@ -1891,7 +1798,7 @@ export class OwnerChannel implements OwnerChannelHandle {
     await this.send(sender.id, renderMarkdownFailure({
       kind: 'pending', subject: `/task ${kind === 'done' ? 'done' : 'cancel'} ${taskId}`,
       detail: 'The terminal request was accepted and is still being settled.',
-      action: `Run /task recover ${taskId} if it remains pending.`,
+      action: `Repeat /task ${kind === 'done' ? 'done' : 'cancel'} ${taskId} if it remains pending.`,
     }), wireId);
     this.state.remember(wireId);
     try {
@@ -1899,7 +1806,7 @@ export class OwnerChannel implements OwnerChannelHandle {
     } catch (error) {
       await app.recordSettlementError({
         actor, taskId, error: error instanceof Error ? error.message : String(error),
-        recoveryHint: `External settle worker failed to start. Retry the identical task command or run task recover ${taskId}.`,
+        recoveryHint: `External settle worker failed to start. Retry the identical task command.`,
       });
       throw error;
     }

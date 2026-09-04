@@ -718,19 +718,7 @@ describe('launchTaskDeletionWorker (service)', () => {
   });
 });
 
-describe('recovery routing', () => {
-  it('routes a deletion-pending task to the deletion worker without loading configuration', async () => {
-    const t = makeNoRoomTask();
-    beginTaskDeletionIntent(t.task_id, CLI_ACTOR);
-    const app = new TaskRoomApplicationService(undefined, {
-      loadConfiguration: () => { throw new Error('configuration must not load for deletion routing'); },
-    });
-    const begin = await app.beginTaskRecovery({
-      actor: { kind: 'local_control', surface: 'cli' }, taskId: t.task_id,
-    });
-    expect(begin).toEqual({ kind: 'deletion_worker_required', taskId: t.task_id });
-  });
-
+describe('deletion and provisioning isolation', () => {
   it('provisionMembers refuses a deletion-pending task before touching Cowork', async () => {
     let t = createTask({ title: 'member-guard', origin: { type: 'cli' } });
     t = activateTask(t.task_id);

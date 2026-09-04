@@ -3,9 +3,7 @@ import { randomUUID } from 'node:crypto';
 import { Buffer } from 'node:buffer';
 import { replaceFileAtomically } from './atomic-file.js';
 import { isSensitiveConfigKey } from './sensitive-config.js';
-import {
-  mandatoryConfigurationFits, renderAgentConfiguration, type AgentLaunchConfiguration,
-} from './lifecycle-summary.js';
+import { mandatoryConfigurationFits, type AgentLaunchConfiguration } from './lifecycle-summary.js';
 import {
   MARKDOWN_MAX_BYTES, MARKDOWN_MAX_CODE_POINTS, markdownCode, markdownProse,
 } from './rooms-tasks/markdown.js';
@@ -32,7 +30,7 @@ export type FleetAuditPresentation =
   | { kind: 'task'; operation: 'create' | 'start' | 'work' | 'block' | 'unblock' | 'review'
       | 'done' | 'cancel' | 'finish' | 'delete' | 'settling'; eventId: string; id: string; title?: string; previousState?: string;
       newState: string; template?: string; roomId?: string;
-      revision?: string; list?: string;
+      roomName?: string; reason?: string; revision?: string; list?: string;
       agents: Array<{ name: string; brain?: string; role: string; permissions?: string;
         configuration?: AgentLaunchConfiguration }> }
   | { kind: 'room'; operation: 'create' | 'activate' | 'close' | 'delete';
@@ -41,7 +39,7 @@ export type FleetAuditPresentation =
       anonymous?: boolean; memberCount?: number; ownerAttached?: boolean;
       participants: Array<{ name: string; id?: string; brain?: string; role: string; permissions?: string;
         configuration?: AgentLaunchConfiguration }> }
-  | { kind: 'lifecycle_failure'; eventId: string; resource: 'Agent' | 'Task' | 'Room'; id: string; state: string;
+  | { kind: 'lifecycle_failure'; eventId: string; resource: 'Agent' | 'Task' | 'Room'; id: string; label?: string; state: string;
       category: 'provision_failed' | 'provision_pending' | 'readiness_failed' | 'settlement_failed' | 'settlement_pending'
         | 'cleanup_failed' | 'cleanup_pending' };
 
@@ -79,13 +77,48 @@ export function recordFleetAuditResource(kind: 'agent' | 'task' | 'room', id: st
 }
 type FleetAuditPresentationInput = FleetAuditPresentation extends infer T
   ? T extends FleetAuditPresentation ? Omit<T, 'eventId'> & { eventId?: string } : never : never;
+
+const PRESENTATION_LABEL_MAX_CODE_POINTS = 160;
+const PRESENTATION_LABEL_MAX_BYTES = 640;
+const PRESENTATION_LABEL_CONTROLS = /[\u0000-\u001f\u007f-\u009f]/gu;
+const PRESENTATION_LABEL_SPOOFING = /[\u200b-\u200f\u202a-\u202e\u2060-\u206f\ufeff]/gu;
+
+/** Immutable, single-line human label captured before mutable Task/Room state can disappear. */
+export function fleetPresentationLabel(value: unknown): string | undefined {
+  const normalized = String(value ?? '')
+    .replace(/\r\n?/gu, '\n')
+    .replace(PRESENTATION_LABEL_SPOOFING, '�')
+    .replace(PRESENTATION_LABEL_CONTROLS, ' ')
+    .replace(/\s+/gu, ' ')
+    .trim();
+  if (!normalized) return undefined;
+  if (Array.from(normalized).length <= PRESENTATION_LABEL_MAX_CODE_POINTS
+      && Buffer.byteLength(normalized, 'utf8') <= PRESENTATION_LABEL_MAX_BYTES) return normalized;
+  let bounded = '';
+  for (const point of normalized) {
+    const candidate = `${bounded}${point}…`;
+    if (Array.from(candidate).length > PRESENTATION_LABEL_MAX_CODE_POINTS
+        || Buffer.byteLength(candidate, 'utf8') > PRESENTATION_LABEL_MAX_BYTES) break;
+    bounded += point;
+  }
+  return `${bounded.replace(/\s+$/u, '')}…`;
+}
+
 export function recordFleetAuditPresentation(value: FleetAuditPresentationInput): void {
   if (collection && (FLEET_LIFECYCLE_EVENT_KINDS as readonly string[]).includes(value.kind)) {
     const basis = value.eventId ?? (value.kind === 'agent_started' ? value.actionId
       : value.kind === 'task' || value.kind === 'room'
         ? `${value.operation}:${value.revision ?? `${value.previousState ?? 'none'}:${value.newState}`}`
         : `${value.category}:${value.state}`);
-    const presentation = structuredClone({ ...value, eventId: basis }) as FleetAuditPresentation;
+    const labels = value.kind === 'task'
+      ? { title: fleetPresentationLabel(value.title), roomName: fleetPresentationLabel(value.roomName),
+        reason: fleetPresentationLabel(value.reason) }
+      : value.kind === 'room'
+        ? { name: fleetPresentationLabel(value.name) }
+        : value.kind === 'lifecycle_failure'
+          ? { label: fleetPresentationLabel(value.label) }
+          : {};
+    const presentation = structuredClone({ ...value, ...labels, eventId: basis }) as FleetAuditPresentation;
     const digest = lifecycleEventDigestBasis(presentation);
     if (!collection.presentations.some(existing => lifecycleEventDigestBasis(existing) === digest))
       collection.presentations.push(presentation);
@@ -139,8 +172,8 @@ const AGENT_SURFACES: Record<string, ReadonlySet<string>> = {
   spawn: new Set(['<none>']),
   template: new Set(['list', 'show', 'validate']),
   task: new Set(['create', 'list', 'lists', 'list-create', 'list-rename', 'list-delete', 'move',
-    'show', 'start', 'await', 'block', 'unblock', 'review', 'done', 'cancel', 'delete', 'recover', 'work', 'finish']),
-  room: new Set(['create', 'list', 'show', 'open', 'members', 'delete', 'close', 'recover']),
+    'show', 'start', 'block', 'unblock', 'review', 'done', 'cancel', 'delete', 'work', 'finish']),
+  room: new Set(['create', 'list', 'show', 'open', 'members', 'delete', 'close']),
 };
 export const fleetProxyCommandInventory = Object.freeze(Object.fromEntries(
   Object.entries(AGENT_SURFACES).map(([surface, commands]) => [surface, [...commands]])));
@@ -445,6 +478,8 @@ function validPresentation(value: unknown): value is FleetAuditPresentation {
   const safe = (v: unknown) => typeof v === 'string' && SAFE_RESOURCE_ID.test(v);
   const text = (v: unknown) => typeof v === 'string' && v.length <= 256
     && !/[\u0000-\u001f\u007f-\u009f\u202a-\u202e\u2066-\u2069]/u.test(v);
+  const presentationLabel = (v: unknown) => typeof v === 'string'
+    && fleetPresentationLabel(v) === v;
   const exact = (record: Record<string, unknown>, keys: string[]) =>
     Object.keys(record).every(key => keys.includes(key));
   const transition = (allowed: Record<string, readonly string[]>) =>
@@ -458,7 +493,7 @@ function validPresentation(value: unknown): value is FleetAuditPresentation {
     && (p.model === undefined || text(p.model)) && (p.permissions === undefined || text(p.permissions))
     && Array.isArray(p.inherited) && p.inherited.every(text) && configured(p);
   if (p.kind === 'task') return exact(p, ['kind', 'operation', 'eventId', 'id', 'title', 'previousState',
-    'newState', 'template', 'roomId', 'revision', 'list', 'agents'])
+    'newState', 'template', 'roomId', 'roomName', 'reason', 'revision', 'list', 'agents'])
     && ['create', 'start', 'work', 'block', 'unblock', 'review', 'done',
       'cancel', 'finish', 'delete', 'settling'].includes(String(p.operation)) && safe(p.eventId) && safe(p.id) && safe(p.newState)
     && transition({ create: ['none→backlog', 'none→provisioning', 'none→active'],
@@ -474,7 +509,10 @@ function validPresentation(value: unknown): value is FleetAuditPresentation {
         'done→deleted', 'cancelled→deleted', 'failed→deleted',
       ], settling: ['active→active', 'review→review', 'backlog→backlog',
         'provisioning→provisioning'] })
-    && (p.title === undefined || text(p.title)) && (p.previousState === undefined || safe(p.previousState))
+    && (p.title === undefined || presentationLabel(p.title))
+    && (p.roomName === undefined || presentationLabel(p.roomName))
+    && (p.reason === undefined || presentationLabel(p.reason))
+    && (p.previousState === undefined || safe(p.previousState))
     && (p.template === undefined || text(p.template)) && (p.roomId === undefined || safe(p.roomId))
     && (p.list === undefined || text(p.list)) && (p.revision === undefined || text(p.revision))
     && Array.isArray(p.agents) && p.agents.length <= 64
@@ -493,7 +531,7 @@ function validPresentation(value: unknown): value is FleetAuditPresentation {
       close: ['active→closing', 'provisioning→closing'],
       delete: ['closing→deleted'] })
     && (p.previousState === undefined || safe(p.previousState))
-    && (p.name === undefined || text(p.name)) && (p.template === undefined || text(p.template))
+    && (p.name === undefined || presentationLabel(p.name)) && (p.template === undefined || text(p.template))
     && (p.taskId === undefined || safe(p.taskId)) && (p.revision === undefined || text(p.revision))
     && (p.anonymous === undefined || typeof p.anonymous === 'boolean')
     && (p.ownerAttached === undefined || typeof p.ownerAttached === 'boolean')
@@ -508,9 +546,11 @@ function validPresentation(value: unknown): value is FleetAuditPresentation {
       && ((a as Record<string, unknown>).brain === undefined || text((a as Record<string, unknown>).brain))
       && ((a as Record<string, unknown>).permissions === undefined || text((a as Record<string, unknown>).permissions))
       && configured(a as Record<string, unknown>));
-  if (p.kind === 'lifecycle_failure') return exact(p, ['kind', 'eventId', 'resource', 'id', 'state', 'category'])
+  if (p.kind === 'lifecycle_failure') return exact(p, ['kind', 'eventId', 'resource', 'id', 'label', 'state', 'category'])
     && ['Agent', 'Task', 'Room'].includes(String(p.resource))
-    && safe(p.eventId) && safe(p.id) && safe(p.state) && ['provision_failed', 'provision_pending', 'readiness_failed', 'settlement_failed',
+    && safe(p.eventId) && safe(p.id) && safe(p.state)
+    && (p.label === undefined || presentationLabel(p.label))
+    && ['provision_failed', 'provision_pending', 'readiness_failed', 'settlement_failed',
       'settlement_pending', 'cleanup_failed', 'cleanup_pending'].includes(String(p.category));
   return false;
 }
@@ -526,88 +566,255 @@ const messageBytes = (value: string): number => Buffer.byteLength(value, 'utf8')
 const withinMessageBounds = (value: string): boolean =>
   messageCodePoints(value) <= MARKDOWN_MAX_CODE_POINTS && messageBytes(value) <= MARKDOWN_MAX_BYTES;
 
-/**
- * Append per-agent lines to a bounded message. Lines are admitted whole, in
- * the given (deterministic) order; once the shared Markdown bounds would be
- * exceeded the remaining agents collapse into an accurate omission note. The
- * first line is admitted whenever it fits the absolute bounds so an oversized
- * roster still shows at least one complete agent summary.
- */
-function appendAgentLines(header: string, heading: string, lines: string[]): string {
-  if (!lines.length) return header;
-  let message = `${header}\n${heading}:`;
-  const note = (count: number): string => `\n…and ${count} more agent${count === 1 ? '' : 's'} omitted.`;
-  for (const [index, line] of lines.entries()) {
-    const candidate = `${message}\n- ${line}`;
-    const remaining = lines.length - index - 1;
-    // A candidate is admitted only when it fits together with the note for
-    // every agent still pending, so each stop-return below re-states a bound
-    // that was verified when the current message was admitted.
-    if (!withinMessageBounds(remaining ? `${candidate}${note(remaining)}` : candidate)) {
-      const stopped = `${message}${note(lines.length - index)}`;
-      return withinMessageBounds(stopped) ? stopped : `${header}${note(lines.length)}`;
-    }
-    message = candidate;
+function titleCase(value: string): string {
+  return value ? `${value[0]!.toUpperCase()}${value.slice(1)}` : value;
+}
+
+function commaInteger(value: number): string {
+  return String(value).replace(/\B(?=(\d{3})+(?!\d))/g, ',');
+}
+
+function renderStructuredMessage(
+  headline: string,
+  fields: Array<[label: string, value: string]>,
+  action?: string,
+): string {
+  return `${headline}`
+    + fields.map(([label, value]) => `\n- **${label}:** ${value}`).join('')
+    + (action ? `\n\n${action}` : '');
+}
+
+function structuredMessage(
+  headline: string,
+  fields: Array<[label: string, value: string | undefined]>,
+  action?: string,
+): string {
+  const visible = fields.filter((field): field is [string, string] => field[1] !== undefined);
+  const render = (selected: Array<[string, string]>) => renderStructuredMessage(headline, selected, action);
+  const complete = render(visible);
+  if (withinMessageBounds(complete)) return complete;
+  const marker: [string, string] = ['Details omitted', 'Additional lifecycle details'];
+  const selected: Array<[string, string]> = [];
+  for (const field of visible) {
+    if (!withinMessageBounds(render([...selected, field, marker]))) break;
+    selected.push(field);
   }
-  return message;
+  const bounded = render([...selected, marker]);
+  if (!withinMessageBounds(bounded)) throw new Error('mandatory lifecycle presentation exceeds message bounds');
+  return bounded;
+}
+
+function originFields(
+  label: 'Role' | 'Brain', origin: AgentLaunchConfiguration['role'],
+): Array<[string, string]> {
+  if (origin.kind === 'named') return [[label, `Preset ${markdownCode(origin.ref)}`]];
+  if (origin.kind === 'inline') return [
+    [label, 'Inline definition'],
+    ...(origin.fingerprint ? [[`${label} fingerprint`, markdownCode(origin.fingerprint)] as [string, string]] : []),
+  ];
+  return [[label, 'Unknown']];
+}
+
+function interruptSummary(value: AgentLaunchConfiguration['monitor']['interrupt']): string {
+  return value === false ? 'off' : value === true ? 'on' : markdownProse(value);
+}
+
+function agentConfigurationFieldGroups(configuration: AgentLaunchConfiguration): {
+  mandatory: Array<[string, string | undefined]>;
+  optional: Array<Array<[string, string | undefined]>>;
+  tail: Array<[string, string | undefined]>;
+} {
+  const optional: Array<Array<[string, string | undefined]>> = [
+    [['Monitor mode', markdownProse(configuration.monitor.mode)],
+      ['Interrupt', interruptSummary(configuration.monitor.interrupt)]],
+  ];
+  if (configuration.isolation) optional.push([
+    ['Isolation', markdownProse(configuration.isolation.requested)],
+    ['Network', configuration.isolation.network ? markdownProse(configuration.isolation.network) : undefined],
+    ['If unavailable', configuration.isolation.on_unavailable
+      ? configuration.isolation.on_unavailable === 'strict' ? 'Fail' : 'Warn' : undefined],
+    ['Read-only mounts', String(configuration.isolation.read_mounts ?? 0)],
+    ['Read-write mounts', String(configuration.isolation.write_mounts ?? 0)],
+  ]);
+  for (const entry of configuration.loops?.entries ?? []) optional.push([
+    ['Loop', markdownCode(entry.name)],
+    ['Loop status', entry.enabled ? 'Enabled' : 'Disabled'],
+    ['Loop interval', `${commaInteger(entry.intervalMs)} ms`],
+    ['Loop delay', `${commaInteger(entry.initialDelayMs)} ms`],
+    ['Loop jitter', `${commaInteger(entry.jitterMs)} ms`],
+    ['Loop prompt size', `${entry.prompt.bytes} B`],
+    ['Loop prompt hash', markdownCode(entry.prompt.sha256.slice(0, 12))],
+  ]);
+  return { mandatory: [
+    ['Template', configuration.template ? markdownCode(configuration.template) : undefined],
+    ...originFields('Role', configuration.role),
+    ['Mission', configuration.mission ? `“${markdownProse(configuration.mission)}”` : undefined],
+    ...originFields('Brain', configuration.brain),
+    ['Harness', markdownCode(configuration.harness)],
+    ['Model', configuration.model === null ? 'Harness default' : markdownCode(configuration.model)],
+    ['Effort', configuration.effort ? markdownProse(configuration.effort) : undefined],
+    ['Approval', markdownProse(configuration.approval)],
+    ['Filesystem', markdownProse(configuration.filesystem)],
+    ['Wait', markdownProse(configuration.unattended)],
+    ['Fleet mode', markdownProse(configuration.permissionMode.fleetMode)],
+    ['Native mode', markdownProse(configuration.permissionMode.nativeMode)],
+  ], optional, tail: [
+    ['Loop policy', configuration.loops ? 'Skip if busy' : undefined],
+    ['Loop source', configuration.loops
+      ? markdownProse(configuration.loops.source.replace(/-/g, ' ')) : undefined],
+  ] };
+}
+
+function boundedAgentMessage(
+  headline: string,
+  prefix: Array<[string, string | undefined]>,
+  optionalGroups: Array<Array<[string, string | undefined]>>,
+  suffix: Array<[string, string | undefined]>,
+  action: string,
+): string {
+  const visible = (fields: Array<[string, string | undefined]>) =>
+    fields.filter((field): field is [string, string] => field[1] !== undefined);
+  const requiredPrefix = visible(prefix);
+  const requiredSuffix = visible(suffix);
+  const groups = optionalGroups.map(visible).filter(group => group.length > 0);
+  const marker: [string, string] = ['Details omitted', 'Additional optional Agent configuration'];
+  const render = (optional: Array<[string, string]>, omitted: boolean) => renderStructuredMessage(
+    headline, [...requiredPrefix, ...optional, ...(omitted ? [marker] : []), ...requiredSuffix], action);
+  const all = groups.flat();
+  const complete = render(all, false);
+  if (withinMessageBounds(complete)) return complete;
+  const included: Array<[string, string]> = [];
+  for (const group of groups) {
+    const candidate = render([...included, ...group], true);
+    if (!withinMessageBounds(candidate)) break;
+    included.push(...group);
+  }
+  const bounded = render(included, true);
+  if (!withinMessageBounds(bounded)) throw new Error('mandatory Agent presentation exceeds message bounds');
+  return bounded;
 }
 
 /** Compact Owner presentation. It intentionally has no command, argv, environment, or correlation data. */
 export function renderFleetLifecycleEvent(value: FleetAuditPresentation): string {
   if (value.kind === 'lifecycle_failure') {
-    const actions = {
-      provision_failed: 'Inspect Fleet service logs, correct configuration, then recover the resource.',
-      provision_pending: 'Run Task or Room recover after checking member readiness.',
-      readiness_failed: 'Inspect the Agent log, correct its configuration, then retry creation.',
-      settlement_failed: 'Inspect Fleet service logs, then run Task recover.',
-      settlement_pending: 'Run Task recover to continue settlement.',
-      cleanup_failed: 'Inspect Fleet service logs, then run Room recover.',
-      cleanup_pending: 'Run Room recover to continue cleanup.',
-    } as const;
-    const lifecycle = value.category.endsWith('_pending') ? 'lifecycle pending' : 'lifecycle failure';
-    return `⚠️ ${value.resource} ${value.id} ${lifecycle} (${value.category}); `
-      + `state ${value.state}. Action: ${actions[value.category]}`;
+    const label = markdownProse(value.label ?? value.id);
+    if (value.category === 'provision_failed') return structuredMessage(
+      `⚠️ Couldn’t prepare ${value.resource} “${label}”`,
+      [['Status', 'Provisioning failed'], ['Resource', value.resource], [`${value.resource} ID`, markdownCode(value.id)]],
+      `**Next:** Check the Fleet service logs, correct the configuration, then run the same ${value.resource === 'Room' ? 'create' : 'start'} command again.`,
+    );
+    if (value.category === 'provision_pending') return structuredMessage(
+      `⏳ ${value.resource} “${label}” is still getting ready`,
+      [['Status', 'Waiting for Agents'], ['Resource', value.resource], [`${value.resource} ID`, markdownCode(value.id)]],
+      value.resource === 'Task'
+        ? `**Next:** Check member readiness, then run ${markdownCode(`task start ${value.id}`)}.`
+        : '**Next:** Check member readiness, then repeat the same Room command.',
+    );
+    if (value.category === 'readiness_failed') return structuredMessage(
+      `⚠️ Agent didn’t become ready: ${label}`,
+      [['Status', 'Readiness failed'], ['Agent ID', markdownCode(value.id)]],
+      '**Next:** Check the Agent log, correct its configuration, then create it again.',
+    );
+    if (value.resource === 'Task') return structuredMessage(
+      `⚠️ Task cleanup is incomplete: ${label}`,
+      [['Status', 'Finish pending'], ['Task ID', markdownCode(value.id)]],
+      '**Next:** Check the Fleet service logs, then repeat the same `done`, `finish`, or `cancel` command.',
+    );
+    return structuredMessage(
+      `⚠️ Room cleanup is incomplete: ${label}`,
+      [['Status', 'Deletion pending'], ['Room ID', markdownCode(value.id)]],
+      '**Next:** Check the Fleet service logs, then repeat the same confirmed Room delete command.',
+    );
   }
   if (value.kind === 'agent_started') {
-    const summary = renderAgentConfiguration(value.configuration, {
-      role: value.role, brain: value.brain, permissions: value.permissions,
-    });
-    return `🧑‍💻 ${value.parent} spawned ${value.lifetime} Agent ${value.name} (${value.id}) — ready. `
-      + `${summary}.`;
+    const prefix: Array<[string, string | undefined]> = [
+      ['Started by', markdownProse(value.parent)],
+      ['Lifetime', titleCase(value.lifetime)],
+    ];
+    if (value.configuration) {
+      const configuration = agentConfigurationFieldGroups(value.configuration);
+      return boundedAgentMessage(`🚀 Agent launched: ${markdownProse(value.name)}`,
+        [...prefix, ...configuration.mandatory], configuration.optional,
+        [...configuration.tail, ['Agent ID', markdownCode(value.id)]],
+        'Launch was accepted; harness and room-seat readiness converge separately.');
+    }
+    return structuredMessage(
+      `🚀 Agent launched: ${markdownProse(value.name)}`,
+      [...prefix,
+        ['Resolved details', 'Unavailable'] as [string, string],
+        ['Role', markdownProse(value.role)] as [string, string],
+        ['Brain', markdownProse(value.brain)] as [string, string],
+        ...(value.permissions ? [['Permissions', markdownProse(value.permissions)] as [string, string]] : []),
+        ['Agent ID', markdownCode(value.id)]],
+      'Launch was accepted; harness and room-seat readiness converge separately.',
+    );
   }
   if (value.kind === 'task') {
-    const title = value.title ? ` “${markdownProse(value.title)}”` : '';
-    const context = [value.list ? `List ${markdownCode(value.list)}` : undefined,
-      value.template ? `template ${markdownCode(value.template)}` : undefined,
-      value.roomId ? `Room ${value.roomId}` : undefined].filter(Boolean).join('; ');
-    const header = `📋 Task${title} (${value.id}) ${value.operation}: `
-      + `${value.previousState ?? 'none'} → ${value.newState}.${context ? ` ${context}.` : ''}`;
-    return appendAgentLines(header, 'Agents', value.agents.map(agent =>
-      `${markdownCode(agent.name)}: ${renderAgentConfiguration(agent.configuration, {
-        role: agent.role, brain: agent.brain, permissions: agent.permissions,
-      })}`));
+    const title = markdownProse(value.title ?? value.id);
+    const id = markdownCode(value.id);
+    const list = value.list ? markdownProse(value.list) : undefined;
+    if (value.operation === 'create' && value.newState === 'backlog') return structuredMessage(
+      '✅ Task added to Backlog',
+      [['Task', `“${title}”`], ['Task ID', id], ['List', list],
+        ['Template', value.template ? markdownCode(value.template) : undefined]],
+    );
+    if (value.operation === 'create' || value.operation === 'start' || value.operation === 'work')
+      return structuredMessage(
+        `🚀 Task started: ${title}`,
+        [['Status', 'Active'], ['List', list], ['Room', value.roomId
+          ? markdownProse(value.roomName ?? value.roomId) : undefined],
+        ['Room ID', value.roomId ? markdownCode(value.roomId) : undefined],
+        ['Team', `${value.agents.length} Agent${value.agents.length === 1 ? '' : 's'} ready`], ['Task ID', id]],
+        'The task room and its Agents are ready to work.',
+      );
+    if (value.operation === 'block') return structuredMessage(
+      `⛔ Task blocked: ${title}`,
+      [['Status', titleCase(value.newState)], ['Blocked', 'Yes'],
+        ['Reason', value.reason ? markdownProse(value.reason) : undefined], ['Task ID', id]],
+    );
+    if (value.operation === 'unblock') return structuredMessage(
+      `✅ Task unblocked: ${title}`,
+      [['Status', titleCase(value.newState)], ['Task ID', id]],
+    );
+    if (value.operation === 'review') return structuredMessage(
+      `🔎 Task ready for review: ${title}`,
+      [['List', list], ['Task ID', id]],
+    );
+    if (value.operation === 'done' || value.operation === 'finish') return structuredMessage(
+      `🎉 Task completed: ${title}`,
+      [['Status', 'Done'], ['List', list], ['Task ID', id]],
+      'The task room and temporary Agents have been cleaned up.',
+    );
+    if (value.operation === 'cancel') return structuredMessage(
+      `🚫 Task cancelled: ${title}`,
+      [['Status', 'Cancelled'], ['List', list], ['Task ID', id]],
+      'The task room and temporary Agents have been cleaned up.',
+    );
+    if (value.operation === 'delete' && value.newState === 'deleting') return structuredMessage(
+      `🗑️ Task deletion started: ${title}`,
+      [['Current status', 'Deleting'], ['Task ID', id]],
+      'Fleet is removing the linked room and temporary Agents in the background.',
+    );
+    if (value.operation === 'delete') return structuredMessage(
+      `🗑️ Task deleted: ${title}`, [['Task ID', id]], 'Temporary Agents were cleaned up.');
+    return structuredMessage(`⚠️ Task cleanup is incomplete: ${title}`,
+      [['Status', 'Finish pending'], ['Task ID', id]],
+      '**Next:** Check the Fleet service logs, then repeat the same `done`, `finish`, or `cancel` command.');
   }
-  if (value.operation === 'create') {
-    const params = [
-      `name=${markdownCode(value.name ?? value.id)}`,
-      `room=${markdownCode(value.id)}`,
-      value.taskId ? `task=${markdownCode(value.taskId)}` : undefined,
-      value.template ? `template=${markdownCode(value.template)}` : undefined,
-      value.anonymous === undefined ? undefined : `anonymous=${value.anonymous ? 'yes' : 'no'}`,
-      value.memberCount === undefined ? undefined : `members=${value.memberCount}`,
-      value.ownerAttached === undefined ? undefined : `owner=${value.ownerAttached ? 'attached' : 'not-attached'}`,
-    ].filter(Boolean).join(', ');
-    return `Agent has created the room with these params: ${params}.`;
-  }
-  if (value.operation === 'activate')
-    return `The room ${markdownProse(value.name ?? value.id)} is ready.`;
-  const context = [value.template ? `template ${markdownCode(value.template)}` : undefined,
-    value.taskId ? `Task ${value.taskId}` : undefined].filter(Boolean).join('; ');
-  const header = `🏠 Room${value.name ? ` “${markdownProse(value.name)}”` : ''} (${value.id}) ${value.operation}: `
-    + `${value.previousState ?? 'none'} → ${value.newState}.${context ? ` ${context}.` : ''}`;
-  return appendAgentLines(header, 'Participants', value.participants.map(participant =>
-    `${markdownCode(participant.name)}${participant.id ? ` (${participant.id})` : ''}: `
-      + renderAgentConfiguration(participant.configuration, {
-        role: participant.role, brain: participant.brain, permissions: participant.permissions,
-      })));
+  const name = markdownProse(value.name ?? value.id);
+  if (value.operation === 'activate') return structuredMessage(
+    `🏠 Room ready: ${name}`,
+    [['Status', 'Active'], ['Template', value.template ? markdownCode(value.template) : undefined],
+      ['Team', `${value.memberCount ?? value.participants.length} Agent${(value.memberCount ?? value.participants.length) === 1 ? '' : 's'} ready`],
+      ['Room ID', markdownCode(value.id)]],
+  );
+  if (value.operation === 'delete') return structuredMessage(
+    `🗑️ Room deleted: ${name}`, [['Room ID', markdownCode(value.id)]], 'Temporary Agents were cleaned up.');
+  if (value.operation === 'close') return structuredMessage(
+    `🗑️ Room deletion started: ${name}`, [['Current status', 'Deleting'], ['Room ID', markdownCode(value.id)]]);
+  return structuredMessage(
+    `⏳ Room “${name}” is still getting ready`,
+    [['Status', 'Waiting for Agents'], ['Resource', 'Room'], ['Room ID', markdownCode(value.id)]],
+    '**Next:** Check member readiness, then repeat the same Room command.',
+  );
 }
