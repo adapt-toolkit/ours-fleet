@@ -89,9 +89,9 @@ describe('interactive questionnaire', () => {
   });
 
   it.each([
-    { selected: [0], labels: ['Codex'], models: /\(Codex\)/, poolSize: 7 },
+    { selected: [0], labels: ['Codex'], models: /\(Codex\)/, poolSize: 8 },
     { selected: [1], labels: ['Claude'], models: /\(Claude\)/, poolSize: 3 },
-    { selected: [0, 1], labels: ['Codex', 'Claude'], models: /\((Codex|Claude)\)/, poolSize: 10 },
+    { selected: [0, 1], labels: ['Codex', 'Claude'], models: /\((Codex|Claude)\)/, poolSize: 11 },
   ])('supports one-model subscription combination $labels', async ({ selected, models, poolSize }) => {
     const prompt = new ScriptedPrompter([true, selected, 0, 0, 1, true]);
     const result = await askInitQuestions(prompt, join(root, 'fleet.yaml'));
@@ -106,6 +106,14 @@ describe('interactive questionnaire', () => {
     ]);
     expect(selects[1].labels?.every(label => models.test(label))).toBe(true);
     expect(selects[1].labels).toHaveLength(poolSize);
+    if (selected.includes(0)) {
+      expect(selects[1].labels).toEqual(expect.arrayContaining([
+        expect.stringContaining('GPT-6 Astra (Codex) — gpt-6-astra;'),
+      ]));
+      const generated = generateSetup(result!);
+      for (const work of ['development', 'review', 'coordination'])
+        expect(generated.files.get(`brains/${work}.yaml`)).toContain('model: gpt-6-astra');
+    }
     expect(selects[1].labels?.every(label => /— (gpt-|claude-)/.test(label))).toBe(true);
     expect(prompt.calls.filter(call => call.kind === 'note').at(0)?.message).toMatch(/not recommendations.*entitlement/s);
     const final = prompt.calls.filter(call => call.kind === 'confirm').at(-1);
@@ -123,7 +131,7 @@ describe('interactive questionnaire', () => {
   });
 
   it('supports a deliberate both-provider per-job mix', async () => {
-    const prompt = new ScriptedPrompter([true, [0, 1], 1, 0, 8, 1, 2, true]);
+    const prompt = new ScriptedPrompter([true, [0, 1], 1, 1, 9, 2, 2, true]);
     const result = await askInitQuestions(prompt, join(root, 'fleet.yaml'));
     expect(result).toMatchObject({
       assignmentStrategy: 'per-job', reasoning: 'thorough',
