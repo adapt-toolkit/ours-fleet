@@ -865,6 +865,60 @@ still up after 2 minutes the monitor gives up on that wake and records
 queued and its cursor is not committed until a later delivery is accepted). The
 agent's briefing tells it **not** to arm a native harness Monitor.
 
+Managed ACP sessions can opt into bounded stall recovery independently of mail delivery:
+
+```yaml
+monitor:
+  mode: fleet
+  stall_recovery: true       # omitted/false preserves existing behavior
+  stall_timeout_ms: 900000   # 15 minutes; integer 60000–86400000
+```
+
+The ACP session measures silence from its last live reasoning, output, plan, or tool
+update, excluding replay and retry/status chatter. It requires observable progress
+before detecting a stall. Repeated structured Codex response-stream retry errors
+can confirm a stall after one window; generic silence requires two windows (30
+minutes by default). Codex ACP 1.1.7 exposes no native-turn mapping, so strong retry
+evidence is used only on the first fresh, unsteered managed turn. Later and resumed
+turns use the generic path. Assistant text and stderr never authenticate a retry.
+
+Active tools, pending permissions, modal/unknown adapter status, unknown tool
+boundaries, in-flight steering, human cancellation, and shutdown prevent automatic
+interruption. Tool IDs are stored as a bounded set of hashes before the watchdog relies on their
+boundaries. Reuse across any ordinary or diagnostic turn, including after resume,
+makes the boundary uncertain; delayed terminal events cannot authorize cancellation.
+Missing, damaged, or exhausted history disables automatic cancellation and reports
+`blocked_evidence` after the conservative silence window.
+An untracked steering-started turn is left alone. A tracked turn with no meaningful
+event reports `blocked_evidence` after two windows from admission; turn age alone
+never authorizes cancellation.
+Native monitoring and non-ACP backends do not run this watchdog.
+
+Recovery sends one explicit ACP cancel, waits at most 15 seconds for settlement,
+and submits a diagnostic continuation in the same session and queue slot. Startup
+and queued prompts remain behind that continuation. It instructs the agent to check
+recorded terminal events and never replay ambiguous or completed side effects.
+The watchdog never kills, restarts, or respawns the adapter. Error/refusal settlement of cancellation reports a blocker without failing startup.
+A refused/failed or re-stalled continuation emits an actionable blocker without another cancellation;
+startup remains supervised when diagnostic recovery reports a blocker.
+
+The durable claim is deliberately stricter than one attempt per turn: at most one
+automatic recovery per ACP session ID, including after a supervisor restart. No
+claim is automatically cleared, even if incomplete. Its queue-only monitor policy
+is restored before admission on supervisor restart. During and after that attempt,
+mail wakes use queued delivery for all `monitor.interrupt` policies; explicit human
+interrupts retain their existing authority and supersede pending recovery. The
+`after_tool` timeout alone never authorizes watchdog cancellation. The feature must
+be enabled explicitly even when mail uses `interrupt: true` or `after_tool`.
+
+Body-free claim and audit records live under `<agentDir>/.stall-recovery/`; typed
+`stall_recovery` events and fixed supervisor log messages expose outcomes. Session
+and turn identifiers are hashed; prompt bodies, tool outputs, credentials, and
+workspace paths are excluded. On `blocked_*`, inspect the structured session events,
+verify completed actions, then continue manually if safe or report the remaining
+blocker. Do not clear a claim to retry an uncertain interruption. No room integration
+or identity binding is needed.
+
 With `monitor.mode: native`, ours-fleet does not start its supervisor monitor;
 the generated briefing instead instructs the harness to arm its own wake
 mechanism (the structured `ours api watch-notifications` JSONL stream for Claude Code,

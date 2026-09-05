@@ -52,6 +52,9 @@ export class ClaudeCodeAgentSessionAdapter implements AgentSessionAdapter {
       permissionMode: options.permissionMode,
       permissionMetadataSource: acpAdapterState(launch.adapterState).permissionMetadataSource,
       scrubObsoleteOursAutostart: true,
+      ...(role.monitor?.mode === 'fleet' && role.monitor.stall_recovery ? {
+        stallRecovery: { timeoutMs: role.monitor.stall_timeout_ms },
+      } : {}),
       log: options.log,
     });
   }

@@ -37,6 +37,29 @@ async function start(
 }
 
 describe('production agent-session adapters', () => {
+  it.each(['codex', 'claude-code'] as const)('passes opt-in recovery only for Fleet-owned ACP in %s', async harness => {
+    const transport = vi.fn(async () => session);
+    const adapter = harness === 'codex' ? makeCodexAdapter(exec, transport) : makeClaudeCodeAdapter(exec, transport);
+    const resolved = role(harness);
+    resolved.monitor = { ...resolved.monitor, mode: 'fleet', enabled: true, stall_recovery: true, stall_timeout_ms: 900_000 };
+    await start(adapter, resolved, { env: {} });
+    expect(transport).toHaveBeenLastCalledWith(expect.objectContaining({ stallRecovery: { timeoutMs: 900_000 } }));
+    resolved.monitor.mode = 'native';
+    await start(adapter, resolved, { env: {} });
+    expect(transport.mock.calls.at(-1)?.[0]).not.toHaveProperty('stallRecovery');
+  });
+
+  it('does not attach the ACP watchdog to a native Codex app-server backend', async () => {
+    const transport = vi.fn(async () => session);
+    const native = vi.fn(async () => session) as any;
+    const adapter = makeCodexAdapter(exec, transport, native);
+    const resolved = role('codex', { session: 'codex-app-server' });
+    resolved.monitor = { ...resolved.monitor, mode: 'fleet', enabled: true, stall_recovery: true };
+    await start(adapter, resolved, { env: {} });
+    expect(transport).not.toHaveBeenCalled();
+    expect(native.mock.calls[0][0]).not.toHaveProperty('stallRecovery');
+  });
+
   it('translates neutral Brain selection through each harness adapter', () => {
     const codex = makeCodexAdapter(exec);
     const claude = makeClaudeCodeAdapter(exec);

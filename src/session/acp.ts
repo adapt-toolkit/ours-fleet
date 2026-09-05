@@ -1,5 +1,5 @@
 import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import {
   existsSync, lstatSync, readFileSync, readlinkSync, realpathSync, writeFileSync,
 } from 'node:fs';
@@ -17,6 +17,8 @@ import type {
   SubmitPromptCommand,
 } from './conversation-types.js';
 import { SessionEvents } from './events.js';
+import { DEFAULT_STALL_TIMEOUT_MS, STALL_RECOVERY_PROMPT, StallWatchdog, StallToolHistory, hasStallRecoveryClaim,
+  type StallObservation, type StallStatus } from './stall-watchdog.js';
 import {
   ACP_CANCEL_DEADLINE_EXCEEDED, SessionControlError, classifyChildExit,
   sessionBackendCapabilities, turnResult,
@@ -201,6 +203,7 @@ function conversationSource(origin: PromptOrigin | undefined): {
 } {
   switch (origin?.kind) {
     case 'owner-admin-console': return { source: 'owner_admin_console', persistBody: true };
+    case 'stall-watchdog': return { source: 'fleet_monitor', persistBody: false };
     case 'startup': return { source: 'startup', persistBody: true };
     case 'owner': return { source: 'owner_channel', persistBody: false };
     case 'fleet-monitor': return { source: 'fleet_monitor', persistBody: false };
@@ -241,6 +244,8 @@ function reasoningFromModelId(modelId: unknown): RuntimeSelectorMetadata | undef
 }
 
 export interface AcpSessionOptions {
+  /** Opt-in Fleet watchdog, owned by this ACP session, never a process restart. */
+  stallRecovery?: { timeoutMs?: number; tickMs?: number; cancelWaitMs?: number };
   name: string;
   /** Harness identity used only for honest optional capability reporting. */
   harness?: string;
@@ -363,8 +368,23 @@ export class AcpSession implements AgentSession {
   private terminate!: (error: Error) => void;
   /** ACP-authenticated in-flight calls, including independently reserved permissions. */
   private readonly activeToolCalls = new Map<string, ActiveToolCall>();
+  private stallWatchdog?: StallWatchdog;
+  private stallToolHistory?: StallToolHistory;
+  private stallRecoveryClaimed = false;
+  private managedTurnCount = 0;
+  private steeringWasUsed = false;
+  private steeringRequests = 0;
+  private retryNativeTurnId?: string;
+  private stallTimer?: ReturnType<typeof setInterval>;
+  private stallAttempt?: {
+    turnId: string; recoveryId: string; ready: Promise<boolean>;
+    superseded: boolean; report(status: StallStatus): void;
+    recoveryStartedAt?: number; resumed: boolean; blocked: boolean;
+  };
   private readonly toolBoundaryWaiters = new Set<() => void>();
   private activeTurn?: {
+    toolEvidence: Map<string, string>; planEvidence?: string;
+    startedAt: number; toolIds: Set<string>; lastProgressAt: number; progressCount: number; transportFailures: number; boundaryUnknown: boolean;
     id: string; output: string; origin?: SubmitPromptOptions['origin'];
     cancellationSource?: TurnCancellationSource;
     cancellationWait?: Promise<void>;
@@ -394,6 +414,8 @@ export class AcpSession implements AgentSession {
     this.terminated.catch(() => undefined);
     child.stderr.on('data', chunk => options.log(`[${options.name}] acp: ${String(chunk).trimEnd()}`));
     child.once('exit', (code, signal) => {
+      if (this.stallTimer) clearInterval(this.stallTimer);
+      this.stallTimer = undefined;
       if (this.cancelForceKill) clearTimeout(this.cancelForceKill);
       this.cancelForceKill = undefined;
       this.releaseSteeringOccupancy('adapter exited');
@@ -449,7 +471,8 @@ export class AcpSession implements AgentSession {
     let instance: AcpSession | undefined;
     const app = acp.client({ name: 'ours-fleet' })
       .onNotification(acp.methods.client.session.update, ({ params }) => {
-        instance?.recordUpdate(params.update);
+        if (instance && (!instance.sessionId || params.sessionId === instance.sessionId))
+          instance.recordUpdate(params.update);
       })
       .onRequest(acp.methods.client.session.requestPermission, ({ params }) => {
         if (!instance) return { outcome: { outcome: 'cancelled' as const } };
@@ -463,6 +486,7 @@ export class AcpSession implements AgentSession {
     instance = new AcpSession(options, child, connection);
     try {
       await instance.initialize();
+      instance.startStallWatchdog();
       instance.recoverOpenPrompts();
       return instance;
     } catch (error) {
@@ -583,10 +607,12 @@ export class AcpSession implements AgentSession {
 
   private reserveTool(toolCallId: string | undefined): void {
     if (toolCallId) this.toolCall(toolCallId).lifecycle = true;
+    else if (this.activeTurn) this.activeTurn.boundaryUnknown = true;
   }
 
   private reservePermission(toolCallId: string | undefined, permissionId: string): void {
     if (toolCallId) this.toolCall(toolCallId).permissions.set(permissionId, 'pending');
+    else if (this.activeTurn) this.activeTurn.boundaryUnknown = true;
   }
 
   private allowPermission(toolCallId: string | undefined, permissionId: string): void {
@@ -672,6 +698,8 @@ export class AcpSession implements AgentSession {
   private async steerOrQueueWake(
     text: string, options: SubmitPromptOptions,
   ): Promise<TurnResult> {
+    if (this.stallRecoveryClaimed)
+      return this.submitPrompt(text, { ...options, interrupt: false, steer: false });
     const steered = await this.steerPrompt(text);
     if (steered.accepted || steered.detail !== 'ACP steering failed'
         || this.closing || !this.isAlive()) return steered;
@@ -738,6 +766,8 @@ export class AcpSession implements AgentSession {
    * for it is what turned a busy agent into a timeout and then into "dead".
    */
   async queuePrompt(text: string, options: SubmitPromptOptions = {}): Promise<QueuedPrompt> {
+    if (this.stallRecoveryClaimed && options.origin?.kind === 'fleet-monitor')
+      options = { ...options, interrupt: false, steer: false };
     if (this.cancelRecoveryReason)
       throw new SessionControlError(
         'control-unavailable',
@@ -906,6 +936,8 @@ export class AcpSession implements AgentSession {
   }
 
   private async cancelActive(source: TurnCancellationSource): Promise<void> {
+    if (this.stallAttempt && source !== 'stall-watchdog' && source !== 'fleet-monitor')
+      this.stallAttempt.superseded = true;
     if (!this.sessionId) return;
     const active = this.activeTurn;
     const previousSource = active?.cancellationSource;
@@ -1119,6 +1151,9 @@ export class AcpSession implements AgentSession {
 
   async close(): Promise<void> {
     this.closing = true;
+    if (this.stallTimer) clearInterval(this.stallTimer);
+    this.stallTimer = undefined;
+    if (this.stallAttempt) this.stallAttempt.superseded = true;
     if (this.cancelEscalation) clearTimeout(this.cancelEscalation);
     this.cancelEscalation = undefined;
     if (this.cancelForceKill) clearTimeout(this.cancelForceKill);
@@ -1266,15 +1301,146 @@ export class AcpSession implements AgentSession {
     this.reasoningEffort = runtimeSelector(options, 'thought_level') ?? reasoningFromModelId(modelId);
   }
 
+  private startStallWatchdog(): void {
+    if (!this.options.stallRecovery) return;
+    const timeoutMs = this.options.stallRecovery.timeoutMs ?? DEFAULT_STALL_TIMEOUT_MS;
+    this.stallRecoveryClaimed = hasStallRecoveryClaim(this.options.stateDir, this.sessionId!);
+    this.stallToolHistory = new StallToolHistory(this.options.stateDir, this.sessionId!, this.options.mode === 'resume');
+    this.stallWatchdog = new StallWatchdog({
+      stateDir: this.options.stateDir, timeoutMs, previouslyClaimed: this.stallRecoveryClaimed, now: () => Date.now(),
+      observe: () => this.stallObservation(),
+      recover: (observed, report) => this.recoverStall(observed, report),
+      diagnostic: diagnostic => {
+        if (['interrupt_requested', 'blocked_previous_attempt', 'blocked_persistence'].includes(diagnostic.status))
+          this.stallRecoveryClaimed = true;
+        this.events.emit('stall_recovery', { status: diagnostic.status, stallDiagnostic: diagnostic });
+        this.options.log(`[${this.options.name}] ACP stall recovery: ${diagnostic.status}; `
+          + 'inspect structured session events before continuing; never replay uncertain side effects');
+      },
+    });
+    this.stallTimer = setInterval(() => this.checkStallWatchdog(),
+      this.options.stallRecovery.tickMs ?? Math.min(10_000, timeoutMs));
+    this.stallTimer.unref?.();
+  }
+
+  private checkStallWatchdog(): void {
+    void this.stallWatchdog?.tick();
+    const attempt = this.stallAttempt;
+    if (attempt?.recoveryStartedAt === undefined || attempt.blocked || attempt.superseded) return;
+    const observed = this.stallObservation();
+    if (!observed?.safe || observed.turnId !== attempt.recoveryId) return;
+    const last = observed.lastProgressAt || attempt.recoveryStartedAt;
+    const timeoutMs = this.options.stallRecovery?.timeoutMs ?? DEFAULT_STALL_TIMEOUT_MS;
+    if (Date.now() - last >= timeoutMs * 2) {
+      attempt.blocked = true;
+      try { attempt.report('blocked_restall'); } catch { /* durable claim already prevents retry */ }
+    }
+  }
+
+  private stallObservation(): StallObservation | undefined {
+    const active = this.activeTurn;
+    if (!active || !this.sessionId) return undefined;
+    return {
+      sessionId: this.sessionId, generation: this.sessionGeneration, turnId: active.id,
+      startedAt: active.startedAt, lastProgressAt: active.lastProgressAt, progressCount: active.progressCount,
+      transportFailures: active.transportFailures,
+      boundaryEvidenceAvailable: this.stallToolHistory?.available() !== false,
+      safe: this.isAlive() && !this.closing && this.readiness === 'running'
+        && !active.cancellationSource && !active.boundaryUnknown && !this.steeringOccupied
+        && this.steeringRequests === 0 && this.stallToolHistory?.available() !== false
+        && this.activeToolCalls.size === 0 && this.pendingPermissions.size === 0,
+    };
+  }
+
+  private async recoverStall(observed: StallObservation, report: (status: StallStatus) => void): Promise<void> {
+    const current = this.stallObservation();
+    if (!current?.safe || current.turnId !== observed.turnId
+        || current.lastProgressAt !== observed.lastProgressAt || current.progressCount !== observed.progressCount) {
+      report('superseded');
+      return;
+    }
+    const active = this.activeTurn!;
+    let resolveReady!: (ready: boolean) => void;
+    const ready = new Promise<boolean>(resolve => { resolveReady = resolve; });
+    const attempt: NonNullable<AcpSession['stallAttempt']> = this.stallAttempt = {
+      turnId: active.id, recoveryId: randomUUID(), ready, superseded: false,
+      report, resumed: false, blocked: false,
+    };
+    active.cancellationSource = 'stall-watchdog';
+    // This intentionally does not use cancelActive: automatic recovery may
+    // never enter its SIGTERM/SIGKILL escalation or settle a permission.
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      const completed = await Promise.race([
+        (async () => {
+          await this.connection.agent.notify(acp.methods.agent.session.cancel, { sessionId: this.sessionId! });
+          await active.settled;
+          return true;
+        })(),
+        new Promise<false>(resolve => {
+          timer = setTimeout(() => resolve(false), this.options.stallRecovery?.cancelWaitMs ?? CANCEL_SETTLE_GRACE_MS);
+          timer.unref?.();
+        }),
+      ]);
+      if (!completed || attempt.superseded || this.closing || !this.isAlive()) {
+        attempt.blocked = true;
+        report(attempt.superseded || this.closing ? 'superseded' : 'blocked_cancel');
+        resolveReady(false);
+      } else resolveReady(true);
+    } catch {
+      attempt.blocked = true;
+      try { report('blocked_cancel'); } finally { resolveReady(false); }
+    } finally { if (timer) clearTimeout(timer); }
+  }
+
+  /** Keep the original queue slot (including startup) until recovery finishes. */
   private async runPrompt(
+    text: string, turnId: string = randomUUID(), origin?: SubmitPromptOptions['origin'],
+  ): Promise<TurnResult> {
+    const result = await this.runSinglePrompt(text, turnId, origin);
+    const attempt = this.stallAttempt;
+    if (!attempt || attempt.turnId !== turnId) return result;
+    const ready = await attempt.ready;
+    if (attempt.superseded || this.closing) return result;
+    if (!ready || result.outcome !== 'cancelled' || result.cancellationSource !== 'stall-watchdog') {
+      // An RPC error/refusal/ambiguous terminal answer to cancellation is not
+      // permission to replay work or to fail startup and restart the process.
+      if (!attempt.blocked) {
+        attempt.blocked = true;
+        try { attempt.report('blocked_cancel'); } catch { /* claim remains durable */ }
+      }
+      return turnResult(true, 'cancelled', 'diagnostic cancellation requires operator attention',
+        undefined, 'stall-watchdog');
+    }
+    try {
+      attempt.report('recovery_started');
+      attempt.recoveryStartedAt = Date.now();
+      const recoveryOrigin: PromptOrigin = origin?.kind === 'scheduled-loop'
+        ? origin : { kind: 'stall-watchdog' };
+      this.admitToLedger(attempt.recoveryId, STALL_RECOVERY_PROMPT, 0, { origin: recoveryOrigin });
+      const recovered = await this.runSinglePrompt(STALL_RECOVERY_PROMPT, attempt.recoveryId, recoveryOrigin);
+      attempt.report(attempt.superseded ? 'superseded'
+        : recovered.succeeded && attempt.resumed ? 'recovery_completed' : 'blocked_recovery');
+      // A failed diagnostic turn must not make startup tear down the session.
+      return recovered.succeeded && attempt.resumed ? recovered : turnResult(true, 'cancelled',
+        'diagnostic recovery requires operator attention', undefined, 'stall-watchdog');
+    } catch {
+      return turnResult(true, 'cancelled', 'diagnostic recovery requires operator attention',
+        undefined, 'stall-watchdog');
+    }
+  }
+
+  private async runSinglePrompt(
     text: string, turnId: string = randomUUID(), origin?: SubmitPromptOptions['origin'],
   ): Promise<TurnResult> {
     if (!this.sessionId || !this.isAlive())
       return turnResult(false, 'failed', this.lastError ?? 'ACP session is offline');
     this.readiness = 'running';
+    this.managedTurnCount++;
+    this.retryNativeTurnId = undefined;
     let settle!: () => void;
     const settled = new Promise<void>(resolve => { settle = resolve; });
-    this.activeTurn = { id: turnId, output: '', origin, settled, settle };
+    this.activeTurn = { toolEvidence: new Map(), startedAt: Date.now(), toolIds: new Set(), lastProgressAt: 0, progressCount: 0, transportFailures: 0, boundaryUnknown: false, id: turnId, output: '', origin, settled, settle };
     this.events.emit('state', { turnId, status: 'running', origin });
     this.conversation.appendSafe({
       kind: 'prompt.started', sessionGeneration: this.sessionGeneration,
@@ -1320,7 +1486,8 @@ export class AcpSession implements AgentSession {
       this.lastError = origin?.kind === 'scheduled-loop' ? 'scheduled-loop turn failed' : detail;
       this.readiness = this.isAlive() ? 'idle' : 'failed';
       this.events.emit('error', {
-        turnId, origin,
+        turnId, origin: this.activeTurn?.cancellationSource === 'stall-watchdog'
+          ? { kind: 'stall-watchdog' } : origin,
         text: origin?.kind === 'scheduled-loop' ? 'scheduled-loop turn failed' : this.lastError,
       });
       if (this.isAlive()) this.events.emit('state', { status: 'idle' });
@@ -1348,8 +1515,10 @@ export class AcpSession implements AgentSession {
   }
 
   private async steerPrompt(text: string): Promise<TurnResult> {
+    this.steeringWasUsed = true;
     if (!this.sessionId || !this.isAlive())
       return turnResult(false, 'failed', this.lastError ?? 'ACP session is offline');
+    this.steeringRequests++;
     try {
       const response = await Promise.race([
         this.connection.agent.request<SteeringResponse, {
@@ -1374,7 +1543,7 @@ export class AcpSession implements AgentSession {
       this.lastError = detail;
       this.events.emit('error', { text: detail });
       return turnResult(false, 'failed', detail);
-    }
+    } finally { this.steeringRequests--; }
   }
 
   private requestPermission(params: acp.RequestPermissionRequest): Promise<acp.RequestPermissionResponse> {
@@ -1565,6 +1734,42 @@ export class AcpSession implements AgentSession {
         option.optionId === 'decline' && option.kind === 'reject_once');
   }
 
+  /** Pinned codex-acp 1.1.7 structured metadata, never stderr or assistant text. */
+  private recordStallMetadata(update: acp.SessionUpdate): void {
+    if (this.options.permissionMetadataSource !== 'codex-acp'
+        || update.sessionUpdate !== 'session_info_update' || !this.activeTurn) return;
+    const meta = update._meta?.codex;
+    if (!meta || typeof meta !== 'object' || Array.isArray(meta)) return;
+    const codex = meta as Record<string, unknown>;
+    const status = codex.threadStatus;
+    if (Object.prototype.hasOwnProperty.call(codex, 'threadStatus')) {
+      const value = status && typeof status === 'object' && !Array.isArray(status)
+        ? status as Record<string, unknown> : {};
+      // Unknown or modal thread status is a permanent conservative fence for
+      // this turn. A later delayed idle/active status must not clear it.
+      if (value.type !== 'active' || !Array.isArray(value.activeFlags)
+          || value.activeFlags.length > 0) this.activeTurn.boundaryUnknown = true;
+    }
+    const error = codex.error;
+    if (!error || typeof error !== 'object' || Array.isArray(error)) return;
+    const value = error as Record<string, unknown>;
+    const info = value.codexErrorInfo;
+    if (value.willRetry !== true || typeof value.turnId !== 'string' || !value.turnId
+        || !info || typeof info !== 'object' || Array.isArray(info)) return;
+    if (!['responseStreamConnectionFailed', 'responseStreamDisconnected']
+      .some(key => Object.prototype.hasOwnProperty.call(info, key))) return;
+    // ACP 1.1.7 does not expose a native-turn-to-prompt mapping. Only the first
+    // fresh managed turn with no steering can be correlated without guessing;
+    // later/resumed turns retain the conservative generic no-progress path.
+    if (this.options.mode !== 'fresh' || this.managedTurnCount !== 1 || this.steeringWasUsed) return;
+    if (this.retryNativeTurnId && this.retryNativeTurnId !== value.turnId) {
+      this.activeTurn.boundaryUnknown = true;
+      return;
+    }
+    this.retryNativeTurnId = value.turnId;
+    this.activeTurn.transportFailures++;
+  }
+
   private recordUpdate(update: acp.SessionUpdate): void {
     // Replayed history is not current activity: `session/load` would otherwise
     // make a cold session look like it had just been working. The same reason
@@ -1573,6 +1778,44 @@ export class AcpSession implements AgentSession {
     if (!this.replaying) {
       this.lastUpdateAt = new Date().toISOString();
       this.refreshSteeringOccupancy();
+    }
+    if (!this.replaying && this.activeTurn) {
+      this.recordStallMetadata(update);
+      const active = this.activeTurn;
+      const kind = update.sessionUpdate;
+      if (this.options.stallRecovery && (kind === 'tool_call' || kind === 'tool_call_update')) {
+        if (!update.toolCallId || active.toolIds.size >= 4096) active.boundaryUnknown = true;
+        else active.toolIds.add(update.toolCallId);
+        if (this.stallToolHistory?.observe(update.toolCallId, active.id) === false)
+          active.boundaryUnknown = true;
+      }
+      let meaningful = ((kind === 'agent_message_chunk' || kind === 'agent_thought_chunk')
+          && (update.content.type !== 'text' || update.content.text.length > 0))
+        || kind === 'tool_call' || kind === 'tool_call_update' || kind === 'plan';
+      if (this.options.stallRecovery && (kind === 'tool_call' || kind === 'tool_call_update' || kind === 'plan')) {
+        const fingerprint = createHash('sha256').update(JSON.stringify(update)).digest('hex');
+        if (kind === 'plan') {
+          meaningful = fingerprint !== active.planEvidence;
+          active.planEvidence = fingerprint;
+        } else if (active.toolEvidence.size < 4096 || active.toolEvidence.has(update.toolCallId)) {
+          meaningful = fingerprint !== active.toolEvidence.get(update.toolCallId);
+          active.toolEvidence.set(update.toolCallId, fingerprint);
+        }
+      }
+      if (this.options.stallRecovery && ![
+        'agent_message_chunk', 'agent_thought_chunk', 'tool_call', 'tool_call_update', 'plan',
+        'available_commands_update', 'current_mode_update', 'config_option_update', 'session_info_update', 'usage_update',
+      ].includes(kind)) active.boundaryUnknown = true;
+      if (meaningful) {
+        active.lastProgressAt = Date.now();
+        active.progressCount++;
+        active.transportFailures = 0;
+        const attempt = this.stallAttempt;
+        if (attempt?.recoveryId === active.id && !attempt.resumed) {
+          attempt.resumed = true;
+          try { attempt.report('progress_resumed'); } catch { attempt.blocked = true; }
+        }
+      }
     }
     const scheduled = this.activeTurn?.origin?.kind === 'scheduled-loop';
     const messagePhase = update.sessionUpdate === 'agent_message_chunk'
@@ -1627,6 +1870,8 @@ export class AcpSession implements AgentSession {
         });
         if (TERMINAL_TOOL_STATUSES.has(update.status ?? '')) this.releaseTool(update.toolCallId);
         else if (update.status !== undefined) this.reserveTool(update.toolCallId);
+        else if (this.options.stallRecovery && this.activeTurn
+            && !this.activeToolCalls.has(update.toolCallId)) this.activeTurn.boundaryUnknown = true;
         break;
       default:
         break;

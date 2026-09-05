@@ -257,6 +257,20 @@ Packaged Developer, Critic, and LocalCoordinator Agent Templates set
 after-tool delivery. Explicit per-member and custom Agent Template values remain
 authoritative and merge key by key.
 
+Managed ACP stall recovery is opt-in: \`monitor: { mode: fleet, stall_recovery: true,
+ stall_timeout_ms: 900000 }\`. The validated timeout is 60000–86400000 milliseconds.
+Omitted/false preserves existing behavior. Silence is measured from meaningful live
+progress; replay and retry chatter do not reset it. Strong authenticated retry
+evidence requires one window, generic silence two. Tools, permissions, modal or
+unknown boundaries, steering and human cancellation protect the turn. Recovery
+uses one bounded cancel and diagnostic continuation in the same ACP session/queue
+slot; it never restarts the adapter. Startup and queued mail wait behind recovery.
+A durable claim permits at most one automatic attempt per ACP session ID, including
+across supervisor restarts; later mail is non-cancelling. Failed or re-stalled
+recovery reports a blocker. Inspect \`.stall-recovery/audit.jsonl\` and recorded
+terminal events before continuing; never replay ambiguous or completed mutations.
+Native monitoring/non-ACP sessions are unchanged. No room or identity coupling.
+
 ## fleet.yaml
 
 \`\`\`yaml

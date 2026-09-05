@@ -23,9 +23,10 @@ export type SessionReadiness =
 
 export type TurnOutcome = 'completed' | 'refused' | 'cancelled' | 'failed' | 'inconclusive';
 export type TurnCancellationSource =
-  | 'owner' | 'local-console' | 'fleet-monitor' | 'scheduled-loop' | 'shutdown';
+  | 'owner' | 'local-console' | 'fleet-monitor' | 'scheduled-loop' | 'shutdown' | 'stall-watchdog';
 export type PromptOrigin =
   | { kind: 'startup' }
+  | { kind: 'stall-watchdog' }
   | { kind: 'local-console' }
   | { kind: 'owner'; requestId: string; displayText?: string }
   | { kind: 'fleet-monitor' }
@@ -312,6 +313,7 @@ export type SessionEventKind =
   | 'tool_call'
   | 'tool_update'
   | 'permission'
+  | 'stall_recovery'
   | 'monitor_delivery'
   | 'turn_stop'
   | 'error';
@@ -355,6 +357,7 @@ export interface SessionEvent {
   /** The option actually selected, when one was. */
   optionId?: string;
   /** Body-free evidence for monitor safe-boundary delivery. */
+  stallDiagnostic?: import('./stall-watchdog.js').StallDiagnostic;
   monitorPolicy?: 'after_tool';
   activeToolCount?: number;
   waitedMs?: number;
