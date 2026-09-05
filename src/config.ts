@@ -98,6 +98,10 @@ export interface MonitorConfig {
    * a positive integer; resolved default is 3. Optional so old snapshots resolve.
    */
   turn_fail_threshold?: number;
+  /** Opt-in bounded ACP no-progress recovery; independent of mail interruption policy. */
+  stall_recovery?: boolean;
+  /** Progress silence window; default 15 minutes. Generic silence requires two windows. */
+  stall_timeout_ms?: number;
 }
 
 /** A trusted, fleet-owned ours mailbox which is never bound inside the agent. */
@@ -142,7 +146,7 @@ export type OwnerChannelConfigInput = Omit<Partial<OwnerChannelConfig>, 'attachm
 export const DEFAULT_WAKE_SOURCES: NotifyEventType[] =
   ['message_received', 'file_received', 'local_contact_request', 'pending_message'];
 const MONITOR_KEYS = [
-  'mode', 'enabled', 'wake_sources', 'batch_ms', 'inject', 'interrupt', 'turn_fail_threshold',
+  'mode', 'enabled', 'wake_sources', 'batch_ms', 'inject', 'interrupt', 'turn_fail_threshold', 'stall_recovery', 'stall_timeout_ms',
 ];
 const INJECT_MODES: InjectMode[] = ['notification', 'full'];
 const MONITOR_MODES: MonitorMode[] = ['fleet', 'native'];
@@ -195,6 +199,12 @@ export function validateMonitorConfig(
       && (typeof m.turn_fail_threshold !== 'number' || !Number.isInteger(m.turn_fail_threshold)
           || m.turn_fail_threshold < 1))
     problems.push('monitor.turn_fail_threshold: must be a positive integer');
+  if (m.stall_recovery !== undefined && typeof m.stall_recovery !== 'boolean')
+    problems.push('monitor.stall_recovery: must be true or false');
+  if (m.stall_timeout_ms !== undefined
+      && (typeof m.stall_timeout_ms !== 'number' || !Number.isSafeInteger(m.stall_timeout_ms)
+        || m.stall_timeout_ms < 60_000 || m.stall_timeout_ms > 86_400_000))
+    problems.push('monitor.stall_timeout_ms: must be an integer between 60000 and 86400000');
   if (m.wake_sources !== undefined) {
     if (!Array.isArray(m.wake_sources)) problems.push('monitor.wake_sources: must be a list');
     else {
@@ -1514,6 +1524,8 @@ export function resolveMonitorConfig(
     batch_ms: (merged.batch_ms as number | undefined) ?? MONITOR_DEFAULT_BATCH_MS,
     inject: (merged.inject as InjectMode | undefined) ?? 'notification',
     interrupt: (merged.interrupt as MonitorInterrupt | undefined) ?? false,
+    ...(merged.stall_recovery !== undefined ? { stall_recovery: merged.stall_recovery as boolean } : {}),
+    ...(merged.stall_timeout_ms !== undefined ? { stall_timeout_ms: merged.stall_timeout_ms as number } : {}),
     turn_fail_threshold:
       (merged.turn_fail_threshold as number | undefined) ?? MONITOR_DEFAULT_TURN_FAIL_THRESHOLD,
   };

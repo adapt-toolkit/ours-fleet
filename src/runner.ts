@@ -740,7 +740,7 @@ export async function runOnce(
     arbiter = new RoleTurnArbiter(agentSession);
     sessionHandle = arbiter;
     unsubscribeRecovery = agentSession.subscribe(event => {
-      if (event.kind !== 'error' || !event.text) return;
+      if (event.kind !== 'error' || !event.text || event.origin?.kind === 'stall-watchdog') return;
       const evidence = classifyFailureText(
         event.text, sessionBackend, new Date(deps.now()).toISOString());
       if (evidence) resolvedMonitorDeps.onFailureEvidence?.(evidence);
@@ -869,7 +869,8 @@ export async function runOnce(
     // valid. Keep every unproven cancellation, refusal, shutdown, and genuine
     // failure terminal so a role that never accepted its briefing is not
     // silently reported as healthy.
-    const interruptedForWake = isRecoverableTempStartupCancellation(temp, started);
+    const interruptedForWake = isRecoverableTempStartupCancellation(temp, started)
+      || (started.outcome === 'cancelled' && started.cancellationSource === 'stall-watchdog');
     if (!started.succeeded && !interruptedForWake) {
       monitor?.stop();
       await control.close();
@@ -893,7 +894,9 @@ export async function runOnce(
       throw new Error(`[${name}] ${sessionLabel} startup prompt ${started.outcome}` +
         `${started.detail ? `: ${started.detail}` : ''}`);
     }
-    if (interruptedForWake)
+    if (started.cancellationSource === 'stall-watchdog')
+      deps.log(`[${name}] ${sessionLabel} startup diagnostic recovery requires operator attention; keeping supervisor alive`);
+    else if (interruptedForWake)
       deps.log(`[${name}] ${sessionLabel} startup prompt cancelled by ${started.cancellationSource}; `
         + 'keeping temporary supervisor alive');
     sessionStartupComplete = true;

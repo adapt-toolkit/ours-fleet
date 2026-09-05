@@ -844,6 +844,36 @@ describe('runOnce ACP startup outcome', () => {
     expect(observedSource).toBe('codex-acp');
   });
 
+  it.each(['normal', 'recovery-refused'])('keeps the same ACP process through startup watchdog recovery (%s)', async mode => {
+    writeCfg({ A: { harness: 'fake-acp', session: 'acp' } });
+    mkdirSync(agentDir('A'), { recursive: true });
+    const { deps, logs } = acpDeps();
+    let session: AcpSession | undefined;
+    let starts = 0;
+    const running = runOnce('A', {}, { ...deps, startAgentSession: async (_adapter, options) => {
+      starts++;
+      session = await AcpSession.start({ name: 'A',
+        argv: [process.execPath, join(dirname(acpFixture), 'stall-acp-agent.mjs')],
+        stateDir: options.stateDir, cwd: options.cwd, mode: 'fresh',
+        env: { STALL_FIXTURE_MODE: mode }, permissions: options.permissions,
+        permissionMetadataSource: 'codex-acp',
+        stallRecovery: { timeoutMs: 500, tickMs: 60_000, cancelWaitMs: 1_000 }, log: deps.log,
+      });
+      return session;
+    } });
+    try {
+      await vi.waitFor(() => expect(session?.conversationPage({ limit: 100 }).events
+        .some(e => JSON.stringify(e).includes('willRetry'))).toBe(true));
+      const live = session as unknown as { activeTurn: { lastProgressAt: number }; stallWatchdog: { tick(): Promise<void> } };
+      live.activeTurn.lastProgressAt -= 2_000;
+      await live.stallWatchdog.tick();
+      await vi.waitFor(() => expect(logs.some(line => line.includes('[A] up;'))).toBe(true));
+      expect(starts).toBe(1); expect(session!.isAlive()).toBe(true);
+      if (mode === 'recovery-refused') expect(logs.some(line => line.includes('requires operator attention; keeping supervisor alive'))).toBe(true);
+    } finally { await session?.close(); }
+    await running;
+  });
+
   it('a refused startup prompt fails the role instead of logging it up', async () => {
     writeCfg({ A: {
       harness: 'fake-acp', session: 'acp',
