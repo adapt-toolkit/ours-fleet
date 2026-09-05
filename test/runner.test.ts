@@ -844,7 +844,7 @@ describe('runOnce ACP startup outcome', () => {
     expect(observedSource).toBe('codex-acp');
   });
 
-  it.each(['normal', 'recovery-refused'])('keeps the same ACP process through startup watchdog recovery (%s)', async mode => {
+  it.each(['normal', 'recovery-refused', 'cancel-error', 'cancel-refused'])('keeps the same ACP process through startup watchdog recovery (%s)', async mode => {
     writeCfg({ A: { harness: 'fake-acp', session: 'acp' } });
     mkdirSync(agentDir('A'), { recursive: true });
     const { deps, logs } = acpDeps();
@@ -869,7 +869,7 @@ describe('runOnce ACP startup outcome', () => {
       await live.stallWatchdog.tick();
       await vi.waitFor(() => expect(logs.some(line => line.includes('[A] up;'))).toBe(true));
       expect(starts).toBe(1); expect(session!.isAlive()).toBe(true);
-      if (mode === 'recovery-refused') expect(logs.some(line => line.includes('requires operator attention; keeping supervisor alive'))).toBe(true);
+      if (mode !== 'normal') expect(logs.some(line => line.includes('requires operator attention; keeping supervisor alive'))).toBe(true);
     } finally { await session?.close(); }
     await running;
   });

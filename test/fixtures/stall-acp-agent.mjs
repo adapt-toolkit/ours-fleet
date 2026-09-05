@@ -42,6 +42,13 @@ createInterface({ input: process.stdin }).on('line', line => {
     }
   } else if (msg.method === 'session/cancel') {
     if (mode === 'ignore-cancel') return;
+    if (mode === 'cancel-error' && active !== undefined) {
+      send({ jsonrpc: '2.0', id: active, error: { code: -32000, message: 'cancel RPC error SECRET' } });
+      active = undefined; return;
+    }
+    if (mode === 'cancel-refused' && active !== undefined) {
+      answer(active, { stopReason: 'refusal' }); active = undefined; return;
+    }
     if (active !== undefined) { answer(active, { stopReason: 'cancelled' }); active = undefined; }
   } else if (msg.method && msg.id !== undefined) answer(msg.id, {});
 });

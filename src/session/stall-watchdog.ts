@@ -1,6 +1,7 @@
 import { createHash } from 'node:crypto';
-import { closeSync, fsyncSync, mkdirSync, openSync, writeFileSync } from 'node:fs';
+import { closeSync, fsyncSync, lstatSync, mkdirSync, openSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
+import { replaceFileAtomically } from '../atomic-file.js';
 
 export const DEFAULT_STALL_TIMEOUT_MS = 15 * 60_000;
 export const STALL_RECOVERY_PROMPT = 'This is a diagnostic interruption. The previous turn showed no progress. '
@@ -30,8 +31,64 @@ export interface StallObservation {
   progressCount: number;
   transportFailures: number;
   safe: boolean;
+  boundaryEvidenceAvailable?: boolean;
 }
 const digest = (text: string) => createHash('sha256').update(text).digest('hex');
+
+/** Presence, including an incomplete claim, restores conservative mail policy. */
+export function hasStallRecoveryClaim(stateDir: string, sessionId: string): boolean {
+  try { lstatSync(join(stateDir, '.stall-recovery', `${digest(sessionId)}.claim`)); return true; }
+  catch (error) { return (error as NodeJS.ErrnoException).code !== 'ENOENT'; }
+}
+
+/** ACP has no turn IDs on tool updates. Reuse across turns is ambiguous. */
+export class StallToolHistory {
+  private readonly turns = new Map<string, string>();
+  private healthy = true;
+  private readonly directory: string;
+  private readonly path: string;
+  private readonly session: string;
+  constructor(stateDir: string, sessionId: string, resume: boolean) {
+    this.session = digest(sessionId);
+    this.directory = join(stateDir, '.stall-recovery');
+    this.path = join(this.directory, `${this.session}.tools.json`);
+    try {
+      const stored = JSON.parse(readFileSync(this.path, 'utf8'));
+      if (stored.version !== 1 || stored.session !== this.session || !Array.isArray(stored.tools)
+          || stored.tools.length > 4096 || !stored.tools.every((id: unknown) =>
+            typeof id === 'string' && /^[a-f0-9]{64}$/.test(id))) throw new Error('invalid history');
+      for (const id of stored.tools) this.turns.set(id, 'previous-generation');
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT' || resume) this.healthy = false;
+      else {
+        try {
+          mkdirSync(this.directory, { recursive: true, mode: 0o700 });
+          this.persist();
+          const fd = openSync(stateDir, 'r');
+          try { fsyncSync(fd); } finally { closeSync(fd); }
+        } catch { this.healthy = false; }
+      }
+    }
+  }
+  available(): boolean { return this.healthy; }
+  /** Record before relying on a tool event. False means cancellation is unsafe. */
+  observe(toolId: string, turnId: string): boolean {
+    if (!this.healthy || !toolId) return false;
+    const id = digest(toolId);
+    const previous = this.turns.get(id);
+    if (previous !== undefined) return previous === turnId;
+    if (this.turns.size >= 4096) { this.healthy = false; return false; }
+    this.turns.set(id, turnId);
+    try { this.persist(); } catch { this.healthy = false; }
+    return this.healthy;
+  }
+  private persist(): void {
+    replaceFileAtomically(this.path, JSON.stringify({ version: 1, session: this.session,
+      tools: [...this.turns.keys()] }) + '\n');
+    const fd = openSync(this.directory, 'r');
+    try { fsyncSync(fd); } finally { closeSync(fd); }
+  }
+}
 
 /**
  * One durable attempt per ACP session, deliberately stricter than one per turn.
@@ -45,6 +102,7 @@ export class StallWatchdog {
   constructor(private readonly options: {
     stateDir: string;
     timeoutMs: number;
+    previouslyClaimed?: boolean;
     now(): number;
     observe(): StallObservation | undefined;
     recover(observed: StallObservation, report: (status: StallStatus) => void): Promise<void>;
@@ -54,14 +112,16 @@ export class StallWatchdog {
   async tick(): Promise<void> {
     if (this.checking || this.disabled) return;
     const observed = this.options.observe();
-    if (!observed?.safe) return;
-    const missingEvidence = observed.progressCount === 0;
+    if (!observed) return;
+    const missingBoundary = observed.boundaryEvidenceAvailable === false;
+    if (!observed.safe && !missingBoundary && !this.options.previouslyClaimed) return;
+    const missingEvidence = observed.progressCount === 0 || missingBoundary;
     // Turn age can only produce an informational blocker, never cancellation.
-    const idleMs = this.options.now() - (missingEvidence ? observed.startedAt : observed.lastProgressAt);
+    const idleMs = this.options.now() - (observed.progressCount === 0 ? observed.startedAt : observed.lastProgressAt);
     // Generic silence needs two full windows. Authenticated repeated transport
     // failures strengthen evidence, but never bypass protected-operation checks.
     const threshold = this.options.timeoutMs * (!missingEvidence && observed.transportFailures >= 2 ? 1 : 2);
-    if (!Number.isFinite(idleMs) || idleMs < threshold) return;
+    if (!Number.isFinite(idleMs) || (idleMs < threshold && !this.options.previouslyClaimed)) return;
     this.checking = true;
     const session = digest(observed.sessionId);
     const turn = digest(observed.generation + '\0' + observed.turnId);
@@ -81,6 +141,11 @@ export class StallWatchdog {
       mkdirSync(directory, { recursive: true, mode: 0o700 });
       const parentFd = openSync(this.options.stateDir, 'r');
       try { fsyncSync(parentFd); } finally { closeSync(parentFd); }
+      if (this.options.previouslyClaimed) {
+        this.disabled = true;
+        report('blocked_previous_attempt');
+        return;
+      }
       if (missingEvidence) {
         if (this.unavailableTurn !== turn) {
           this.unavailableTurn = turn;

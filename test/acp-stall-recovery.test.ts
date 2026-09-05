@@ -204,6 +204,44 @@ describe('ACP-local stall recovery', () => {
     await recovering; expect((await original).succeeded).toBe(true); expect((await wake).succeeded).toBe(true);
     expect((session as unknown as { steeringWasUsed: boolean }).steeringWasUsed).toBe(false);
   });
+  it('old ordinary-turn terminal events cannot authorize cancellation of a later same-ID tool', async () => {
+    const { session } = await fixture(); const first = session.submitPrompt('first'); await running(session);
+    await session.interrupt('owner'); await first;
+    const second = session.submitPrompt('second'); await running(session);
+    internal(session).recordUpdate({ sessionUpdate: 'tool_call', toolCallId: 'mutation', status: 'in_progress', title: 'new operation' });
+    internal(session).recordUpdate({ sessionUpdate: 'tool_call_update', toolCallId: 'mutation', status: 'completed' });
+    expect(internal(session).stallObservation()?.safe).toBe(false);
+    clock(session); await internal(session).stallWatchdog!.tick(); expect(statuses(session)).toEqual([]);
+    await session.close(); await second;
+  });
+  it.each(['cancel-error', 'cancel-refused'])('preserves the session and reports a blocker when cancellation settles as %s', async mode => {
+    const { session } = await fixture(mode); const original = session.submitPrompt('original', { origin: { kind: 'startup' } });
+    await running(session); clock(session); await internal(session).stallWatchdog!.tick();
+    expect(await original).toMatchObject({ succeeded: false, cancellationSource: 'stall-watchdog' });
+    expect(statuses(session)).toEqual(['interrupt_requested', 'blocked_cancel']);
+    expect(session.isAlive()).toBe(true);
+    expect(session.eventsSince(0).filter(e => e.kind === 'state' && e.status === 'running')).toHaveLength(1);
+  });
+  it.each([false, true])('restores queue-only monitor policy before/after a resumed watchdog tick (%s)', async tick => {
+    const first = await fixture(); const original = first.session.submitPrompt('original'); await running(first.session);
+    clock(first.session); await internal(first.session).stallWatchdog!.tick(); await original;
+    await first.session.close(); vi.restoreAllMocks();
+    const next = await fixture('normal', true, true, first.dir); const resumed = next.session.submitPrompt('original'); await running(next.session);
+    if (tick) await internal(next.session).stallWatchdog!.tick();
+    const queued = await next.session.queuePrompt('wake', { origin: { kind: 'fleet-monitor' },
+      interrupt: true, interruptSource: 'fleet-monitor', steer: true });
+    expect(queued.queuedBehind).toBe(1); expect(queued.delivery).toBe('queued');
+    expect(next.session.eventsSince(0).filter(e => e.kind === 'turn_stop' && e.cancellationSource === 'fleet-monitor')).toHaveLength(0);
+    await next.session.interrupt('owner'); await resumed; expect((await queued.completion).succeeded).toBe(true);
+  });
+  it('persists hashed tool history and fences ambiguous IDs after an ordinary resume', async () => {
+    const first = await fixture(); const original = first.session.submitPrompt('original'); await running(first.session);
+    await first.session.interrupt('owner'); await original; await first.session.close();
+    const next = await fixture('normal', true, true, first.dir); const resumed = next.session.submitPrompt('original'); await running(next.session);
+    expect(internal(next.session).stallObservation()?.safe).toBe(false);
+    clock(next.session); await internal(next.session).stallWatchdog!.tick(); expect(statuses(next.session)).toEqual([]);
+    await next.session.close(); await resumed;
+  });
   it('disabled feature creates no watchdog and preserves ordinary explicit interrupts', async () => {
     const { session } = await fixture('normal', false); const original = session.submitPrompt('original'); await running(session);
     expect(internal(session).stallWatchdog).toBeUndefined();

@@ -17,7 +17,7 @@ import type {
   SubmitPromptCommand,
 } from './conversation-types.js';
 import { SessionEvents } from './events.js';
-import { DEFAULT_STALL_TIMEOUT_MS, STALL_RECOVERY_PROMPT, StallWatchdog,
+import { DEFAULT_STALL_TIMEOUT_MS, STALL_RECOVERY_PROMPT, StallWatchdog, StallToolHistory, hasStallRecoveryClaim,
   type StallObservation, type StallStatus } from './stall-watchdog.js';
 import {
   ACP_CANCEL_DEADLINE_EXCEEDED, SessionControlError, classifyChildExit,
@@ -369,13 +369,15 @@ export class AcpSession implements AgentSession {
   /** ACP-authenticated in-flight calls, including independently reserved permissions. */
   private readonly activeToolCalls = new Map<string, ActiveToolCall>();
   private stallWatchdog?: StallWatchdog;
+  private stallToolHistory?: StallToolHistory;
+  private stallRecoveryClaimed = false;
   private managedTurnCount = 0;
   private steeringWasUsed = false;
   private steeringRequests = 0;
   private retryNativeTurnId?: string;
   private stallTimer?: ReturnType<typeof setInterval>;
   private stallAttempt?: {
-    turnId: string; recoveryId: string; ready: Promise<boolean>; retiredToolIds: Set<string>;
+    turnId: string; recoveryId: string; ready: Promise<boolean>;
     superseded: boolean; report(status: StallStatus): void;
     recoveryStartedAt?: number; resumed: boolean; blocked: boolean;
   };
@@ -696,7 +698,7 @@ export class AcpSession implements AgentSession {
   private async steerOrQueueWake(
     text: string, options: SubmitPromptOptions,
   ): Promise<TurnResult> {
-    if (this.stallAttempt)
+    if (this.stallRecoveryClaimed)
       return this.submitPrompt(text, { ...options, interrupt: false, steer: false });
     const steered = await this.steerPrompt(text);
     if (steered.accepted || steered.detail !== 'ACP steering failed'
@@ -764,7 +766,7 @@ export class AcpSession implements AgentSession {
    * for it is what turned a busy agent into a timeout and then into "dead".
    */
   async queuePrompt(text: string, options: SubmitPromptOptions = {}): Promise<QueuedPrompt> {
-    if (this.stallAttempt && options.origin?.kind === 'fleet-monitor')
+    if (this.stallRecoveryClaimed && options.origin?.kind === 'fleet-monitor')
       options = { ...options, interrupt: false, steer: false };
     if (this.cancelRecoveryReason)
       throw new SessionControlError(
@@ -1302,11 +1304,15 @@ export class AcpSession implements AgentSession {
   private startStallWatchdog(): void {
     if (!this.options.stallRecovery) return;
     const timeoutMs = this.options.stallRecovery.timeoutMs ?? DEFAULT_STALL_TIMEOUT_MS;
+    this.stallRecoveryClaimed = hasStallRecoveryClaim(this.options.stateDir, this.sessionId!);
+    this.stallToolHistory = new StallToolHistory(this.options.stateDir, this.sessionId!, this.options.mode === 'resume');
     this.stallWatchdog = new StallWatchdog({
-      stateDir: this.options.stateDir, timeoutMs, now: () => Date.now(),
+      stateDir: this.options.stateDir, timeoutMs, previouslyClaimed: this.stallRecoveryClaimed, now: () => Date.now(),
       observe: () => this.stallObservation(),
       recover: (observed, report) => this.recoverStall(observed, report),
       diagnostic: diagnostic => {
+        if (['interrupt_requested', 'blocked_previous_attempt', 'blocked_persistence'].includes(diagnostic.status))
+          this.stallRecoveryClaimed = true;
         this.events.emit('stall_recovery', { status: diagnostic.status, stallDiagnostic: diagnostic });
         this.options.log(`[${this.options.name}] ACP stall recovery: ${diagnostic.status}; `
           + 'inspect structured session events before continuing; never replay uncertain side effects');
@@ -1338,9 +1344,10 @@ export class AcpSession implements AgentSession {
       sessionId: this.sessionId, generation: this.sessionGeneration, turnId: active.id,
       startedAt: active.startedAt, lastProgressAt: active.lastProgressAt, progressCount: active.progressCount,
       transportFailures: active.transportFailures,
+      boundaryEvidenceAvailable: this.stallToolHistory?.available() !== false,
       safe: this.isAlive() && !this.closing && this.readiness === 'running'
         && !active.cancellationSource && !active.boundaryUnknown && !this.steeringOccupied
-        && this.steeringRequests === 0
+        && this.steeringRequests === 0 && this.stallToolHistory?.available() !== false
         && this.activeToolCalls.size === 0 && this.pendingPermissions.size === 0,
     };
   }
@@ -1356,7 +1363,7 @@ export class AcpSession implements AgentSession {
     let resolveReady!: (ready: boolean) => void;
     const ready = new Promise<boolean>(resolve => { resolveReady = resolve; });
     const attempt: NonNullable<AcpSession['stallAttempt']> = this.stallAttempt = {
-      turnId: active.id, recoveryId: randomUUID(), ready, retiredToolIds: new Set(active.toolIds), superseded: false,
+      turnId: active.id, recoveryId: randomUUID(), ready, superseded: false,
       report, resumed: false, blocked: false,
     };
     active.cancellationSource = 'stall-watchdog';
@@ -1393,9 +1400,17 @@ export class AcpSession implements AgentSession {
     const result = await this.runSinglePrompt(text, turnId, origin);
     const attempt = this.stallAttempt;
     if (!attempt || attempt.turnId !== turnId) return result;
-    if (!await attempt.ready || attempt.superseded || this.closing
-        || result.outcome !== 'cancelled' || result.cancellationSource !== 'stall-watchdog') {
-      return result;
+    const ready = await attempt.ready;
+    if (attempt.superseded || this.closing) return result;
+    if (!ready || result.outcome !== 'cancelled' || result.cancellationSource !== 'stall-watchdog') {
+      // An RPC error/refusal/ambiguous terminal answer to cancellation is not
+      // permission to replay work or to fail startup and restart the process.
+      if (!attempt.blocked) {
+        attempt.blocked = true;
+        try { attempt.report('blocked_cancel'); } catch { /* claim remains durable */ }
+      }
+      return turnResult(true, 'cancelled', 'diagnostic cancellation requires operator attention',
+        undefined, 'stall-watchdog');
     }
     try {
       attempt.report('recovery_started');
@@ -1471,7 +1486,8 @@ export class AcpSession implements AgentSession {
       this.lastError = origin?.kind === 'scheduled-loop' ? 'scheduled-loop turn failed' : detail;
       this.readiness = this.isAlive() ? 'idle' : 'failed';
       this.events.emit('error', {
-        turnId, origin,
+        turnId, origin: this.activeTurn?.cancellationSource === 'stall-watchdog'
+          ? { kind: 'stall-watchdog' } : origin,
         text: origin?.kind === 'scheduled-loop' ? 'scheduled-loop turn failed' : this.lastError,
       });
       if (this.isAlive()) this.events.emit('state', { status: 'idle' });
@@ -1770,8 +1786,8 @@ export class AcpSession implements AgentSession {
       if (this.options.stallRecovery && (kind === 'tool_call' || kind === 'tool_call_update')) {
         if (!update.toolCallId || active.toolIds.size >= 4096) active.boundaryUnknown = true;
         else active.toolIds.add(update.toolCallId);
-        if (this.stallAttempt?.recoveryId === active.id
-            && this.stallAttempt.retiredToolIds.has(update.toolCallId)) active.boundaryUnknown = true;
+        if (this.stallToolHistory?.observe(update.toolCallId, active.id) === false)
+          active.boundaryUnknown = true;
       }
       let meaningful = ((kind === 'agent_message_chunk' || kind === 'agent_thought_chunk')
           && (update.content.type !== 'text' || update.content.text.length > 0))

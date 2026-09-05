@@ -2,7 +2,7 @@ import { mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'n
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { StallWatchdog, type StallDiagnostic, type StallObservation } from '../src/session/stall-watchdog.js';
+import { StallWatchdog, StallToolHistory, hasStallRecoveryClaim, type StallDiagnostic, type StallObservation } from '../src/session/stall-watchdog.js';
 import { resolveMonitorConfig, validateMonitorConfig } from '../src/config.js';
 const dirs: string[] = [];
 afterEach(() => { for (const path of dirs.splice(0)) rmSync(path, { recursive: true, force: true }); });
@@ -47,6 +47,11 @@ describe('bounded durable ACP stall watchdog', () => {
     expect(f.events.map(e => e.status)).toEqual(['blocked_evidence']);
     expect(readdirSync(join(f.stateDir, '.stall-recovery'))).toEqual(['audit.jsonl']);
   });
+  it('missing boundary history emits evidence-unavailable without claiming or cancelling', async () => {
+    const f = setup(); f.observation().safe = false; f.observation().boundaryEvidenceAvailable = false; f.setNow(2_000);
+    await f.watchdog.tick(); expect(f.recover).not.toHaveBeenCalled();
+    expect(f.events.map(e => e.status)).toEqual(['blocked_evidence']);
+  });
   it('generic silence requires two windows; negative clock movement fails conservatively', async () => {
     const f = setup(); f.observation().transportFailures = 0;
     await f.watchdog.tick(); f.setNow(-1); await f.watchdog.tick();
@@ -82,5 +87,30 @@ describe('stall configuration compatibility', () => {
   it('validates enabled and default threshold', () => {
     expect(validateMonitorConfig({ stall_recovery: 'yes' }).length).toBeGreaterThan(0);
     expect(validateMonitorConfig({ stall_recovery: true, stall_timeout_ms: 900_000 })).toEqual([]);
+  });
+});
+
+describe('durable boundary and claim restoration', () => {
+  it('fences reused tool IDs across turns and process generations without storing IDs', () => {
+    const f = setup(); const history = new StallToolHistory(f.stateDir, 'session', false);
+    expect(history.observe('SECRET tool', 'turn1')).toBe(true);
+    expect(history.observe('SECRET tool', 'turn1')).toBe(true);
+    expect(history.observe('SECRET tool', 'turn2')).toBe(false);
+    const resumed = new StallToolHistory(f.stateDir, 'session', true);
+    expect(resumed.observe('SECRET tool', 'turn3')).toBe(false);
+    expect(resumed.observe('new-tool', 'turn3')).toBe(true);
+    const text = readdirSync(join(f.stateDir, '.stall-recovery'))
+      .map(name => readFileSync(join(f.stateDir, '.stall-recovery', name), 'utf8')).join('');
+    expect(text).not.toContain('SECRET'); expect(text).not.toContain('turn1');
+  });
+  it('missing resumed boundary history fails closed', () => {
+    const f = setup(); const history = new StallToolHistory(f.stateDir, 'session', true);
+    expect(history.available()).toBe(false); expect(history.observe('new', 'turn')).toBe(false);
+  });
+  it('an incomplete claim still restores conservative admission policy', async () => {
+    const f = setup(); await f.watchdog.tick();
+    const claim = readdirSync(join(f.stateDir, '.stall-recovery')).find(name => name.endsWith('.claim'))!;
+    writeFileSync(join(f.stateDir, '.stall-recovery', claim), '');
+    expect(hasStallRecoveryClaim(f.stateDir, f.observation().sessionId)).toBe(true);
   });
 });
