@@ -30,7 +30,9 @@ requires Codex >=0.153.3; older runtimes fail with an actionable launch error.
 
 Persistent overrides belong in Agent env; temporary overrides belong in the Agent
 Template before spawning (existing temporary launch snapshots are sealed). Service
-overrides must reach both persistent and temporary services. A shell export does
+overrides must reach both persistent and temporary services. New temporary
+supervisors inherit CODEX_PATH (including empty) from the spawning process through
+systemd-run/launchctl; sealed Agent env still wins. A shell export does
 not update running services; init does not persist CODEX_PATH. After verification,
 restart only affected agents, or coordinate replacement of a temporary agent with
 a stale sealed override. Reinstall Fleet with optional dependencies to repair its

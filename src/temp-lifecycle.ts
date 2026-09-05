@@ -109,6 +109,9 @@ export function makeTempSupervisorLauncher(options: {
   return async (binPath, args, dir) => {
     const inherited = [
       'HOME', 'PATH', 'XDG_RUNTIME_DIR', 'OURS_FLEET_HOME', 'CODEX_HOME',
+      // Preserve runtime selection across the service-manager boundary, including
+      // an explicit empty value which selects the bundle over manager defaults.
+      'CODEX_PATH',
       // The child supervisor performs daemon identity and wake probes itself;
       // it must resolve the same ours profile as the spawning supervisor.
       'OURS_PORT', 'OURS_STATE_DIR', 'OURS_API_TOKEN', 'OURS_CONFIG',

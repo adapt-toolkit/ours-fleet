@@ -1519,7 +1519,10 @@ For a persistent Agent, set `env.CODEX_PATH` in its Agent document. For temporar
 agents, set it in the Agent Template used to create them; existing temporary
 agents retain their sealed launch configuration. Alternatively, configure
 `CODEX_PATH` in both the persistent and temporary service environments (for
-systemd, the corresponding user-unit drop-ins). A shell export does not change
+systemd, the corresponding user-unit drop-ins). Newly launched temporary
+supervisors carry the spawning process’s CODEX_PATH through both systemd-run and
+launchctl, including an explicit empty value. The temporary Agent’s sealed env
+still takes precedence. A shell export does not change
 an existing service's environment, and `ours-fleet init` does not persist this
 variable. Verify the target executable with `--version`, re-run doctor using
 that environment, and restart only affected agents after applying the override.

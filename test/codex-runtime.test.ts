@@ -7,6 +7,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { probeCodexRuntime, codexVersionAtLeast } from '../src/harness/codex-runtime.js';
 import { resolveBundledAcpAgent } from '../src/harness/acp-agent.js';
 import { makeCodexAdapter, codexAcpLaunchForResolution } from '../src/harness/codex.js';
+import { makeTempSupervisorLauncher, prepareTempSupervisor } from '../src/temp-lifecycle.js';
 import { harnessChildEnv } from '../src/runner.js';
 import type { ResolvedRole } from '../src/config.js';
 
@@ -67,6 +68,37 @@ describe('Codex runtime provenance', () => {
       const r = role(env);
       const prep = await makeCodexAdapter().prepareSession(r, { stateDir: dir, runCwd: dir });
       const child = harnessChildEnv(r, prep.env, dir);
+      expect(child.OURS_FLEET_REAL_CODEX_PATH).toBe(expected);
+      expect(child.CODEX_PATH).toBe(prep.env.CODEX_PATH);
+    }
+  });
+  it.each(['linux', 'darwin'] as const)('keeps persistent and temporary runtime precedence through the %s launcher', async platform => {
+    const inherited = binary('0.153.4');
+    const selected = binary('0.153.4');
+    vi.stubEnv('OURS_FLEET_HOME', temp());
+    for (const env of [{}, { CODEX_PATH: selected }, { CODEX_PATH: '' }]) {
+      vi.stubEnv('CODEX_PATH', inherited);
+      const persistentDir = temp();
+      const persistent = await makeCodexAdapter().prepareSession(role(env),
+        { stateDir: persistentDir, runCwd: persistentDir });
+      const expected = harnessChildEnv(role(env), persistent.env, persistentDir).OURS_FLEET_REAL_CODEX_PATH;
+      const dir = temp();
+      prepareTempSupervisor(dir, 'Runtime');
+      let serviceArgs: string[] = [];
+      await makeTempSupervisorLauncher({
+        platform, supervisor: platform === 'linux' ? 'systemd' : 'launchd',
+        exec: async (_command, args) => {
+          serviceArgs = args;
+          return { code: 0, stdout: '', stderr: '' };
+        },
+      })('/fixture/fleet', ['_run-temp', 'Runtime'], dir);
+      const prefix = platform === 'linux' ? '--setenv=CODEX_PATH=' : 'CODEX_PATH=';
+      const entry = serviceArgs.find(arg => arg.startsWith(prefix));
+      expect(entry).toBe(prefix + inherited);
+      // Simulate only the environment explicitly passed to the temporary service.
+      vi.stubEnv('CODEX_PATH', entry?.slice(prefix.length));
+      const prep = await makeCodexAdapter().prepareSession(role(env), { stateDir: dir, runCwd: dir });
+      const child = harnessChildEnv(role(env), prep.env, dir);
       expect(child.OURS_FLEET_REAL_CODEX_PATH).toBe(expected);
       expect(child.CODEX_PATH).toBe(prep.env.CODEX_PATH);
     }
