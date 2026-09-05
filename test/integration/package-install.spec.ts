@@ -11,7 +11,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
 
-const CODEX_ACP_VERSION = '1.1.7';
+const CODEX_ACP_VERSION = '1.10.0';
 
 describe('packed root package', () => {
   it('fresh-installs the gated codex-acp and reports coupled allow full access', () => {
@@ -91,8 +91,16 @@ describe('packed root package', () => {
           log() {},
         });
         const claim = adapter.effectivePermissions(role);
+        const { probeCodexRuntime, codexVersionAtLeast } = await import(
+          pathToFileURL(join(fleetRoot, 'dist', 'harness', 'codex-runtime.js')).href
+        );
+        const runtime = await probeCodexRuntime({ argv: [], bundled: true,
+          manifestPath: join(codexRoot, 'package.json') }, { ...process.env, CODEX_PATH: '' });
+        if (!codexVersionAtLeast(runtime.version, '0.153.3')) throw new Error('stale fresh-install runtime');
+
         process.stdout.write(JSON.stringify({
           version: codex.version,
+          runtime,
           claim,
           permissionMetadataSource: transportOptions.permissionMetadataSource,
           prepared: {
@@ -114,6 +122,8 @@ describe('packed root package', () => {
       ], { cwd: consumerDir, encoding: 'utf8' }));
 
       expect(result.version).toBe(CODEX_ACP_VERSION);
+      expect(result.runtime.source).toBe('bundled');
+      expect(result.runtime.executable).toContain('vendor');
       expect(result.permissionMetadataSource).toBe('codex-acp');
       expect(result.claim).toMatchObject({
         supported: true,

@@ -192,6 +192,13 @@ export function harnessChildEnv(
   role: ResolvedRole, launchEnv: Record<string, string> | undefined, stateDir: string,
 ): Record<string, string> {
   const env = { ...(launchEnv ?? {}), ...managedFleetProxyEnv(role, stateDir) };
+  // CODEX_PATH selects the underlying runtime, not a bypass around Fleet's proxy.
+  if (role.harness === 'codex' && role.session === 'acp'
+      && launchEnv?.OURS_FLEET_CODEX_ACP_MANIFEST && launchEnv.CODEX_PATH) {
+    env.CODEX_PATH = launchEnv.CODEX_PATH;
+    env.OURS_FLEET_REAL_CODEX_PATH = role.env?.CODEX_PATH
+      ?? launchEnv.OURS_FLEET_REAL_CODEX_PATH ?? '';
+  }
   assertModelPinReachesChild(role, env);
   return env;
 }
