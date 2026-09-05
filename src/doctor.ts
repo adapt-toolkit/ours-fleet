@@ -22,6 +22,8 @@ import type { PrereqCheck, PrereqReport } from './harness/types.js';
 import {
   analyzeInstalls, buildInfo, buildLabel, discoverInstalls, BIN_NAME,
 } from './provenance.js';
+import { readDaemonRecoveryStatus } from './daemon-recovery.js';
+import { codexModelCatalog } from './application/model-catalog.js';
 
 /** Which cgroup-v2 controllers are delegated to this user manager (advisory). */
 function cgroupDelegationDetail(): string {
@@ -103,6 +105,8 @@ export async function doctor(
     yamlMode?: YamlMode;
     /** Override PATH / running executable when scanning for installs (tests). */
     installScan?: { path?: string; argv1?: string };
+    /** Override the local Codex model cache path (tests). */
+    codexCatalogPath?: string;
   } = {},
   exec: Exec = realExec,
   platform: NodeJS.Platform = process.platform,
@@ -128,7 +132,7 @@ export async function doctor(
   const loaded = loadConfigResult(opts.configPath, opts.yamlMode);
   const roles = loaded.ok ? loaded.roles : [];
   checks.push(loaded.ok
-    ? { name: 'config', ok: true, detail: loaded.files.join(' + ') || '(none — no fleet.yaml or fleet.d)' }
+    ? { name: 'config', ok: true, detail: loaded.files.join(' + ') }
     : { name: 'config', ok: false, detail: loaded.error });
   checks.push(loaded.ok
     ? { name: 'roles', ok: true, detail: `${roles.length} configured` }
@@ -138,6 +142,36 @@ export async function doctor(
     ok: true,
     detail: `warning: ${diagnostic.message}`,
   });
+  if (loaded.ok) {
+    const packaged = Object.entries(loaded.brainPresets ?? {}).flatMap(([id, brain]) =>
+      brain.harness === 'codex' && typeof brain.model === 'string' && typeof brain.effort === 'string'
+        ? [{ id, model: brain.model, effort: brain.effort }] : [])
+      .sort((a, b) => a.id.localeCompare(b.id));
+    if (packaged.length) {
+      const runtime = codexModelCatalog(opts.codexCatalogPath);
+      const available = new Set(runtime.models.flatMap(model =>
+        model.reasoningEfforts.map(effort => `${model.id}\0${effort}`)));
+      const missing = packaged.filter(({ model, effort }) => !available.has(`${model}\0${effort}`));
+      checks.push({ name: 'brain catalog: Codex runtime drift', ok: true,
+        detail: runtime.models.length
+          ? missing.length ? `warning: packaged Brain preset(s) absent from local Codex catalog: ${missing
+            .map(({ id, model, effort }) => `${id} (${model}/${effort})`).join(', ')}`
+            : `all ${packaged.length} packaged Codex model/effort pairs are present locally`
+          : runtime.warnings.join('; ') });
+    }
+  }
+  for (const role of roles) {
+    const recovery = readDaemonRecoveryStatus(agentDir(role.name));
+    if (!recovery) continue;
+    const paths = (['agent', 'owner'] as const)
+      .map(name => `${name}=${recovery.paths[name].state}`)
+      .join(', ');
+    checks.push({
+      name: `daemon recovery: ${role.name}`,
+      ok: recovery.state === 'recovered',
+      detail: `${recovery.state}; ${paths}; epoch ${recovery.epoch || 'unavailable'}`,
+    });
+  }
 
   // ── Rooms/tasks checks ────────────────────────────────────────
   if (loaded.ok && loaded.rooms) {
@@ -182,16 +216,16 @@ export async function doctor(
     const { listTemplates, resolveTemplate } = await import('./rooms-tasks/templates.js');
     const customs = loaded.roomTemplates ?? {};
     const templates = listTemplates(customs);
-    const roleNames = new Set(roles.map(r => r.name));
+    const agentTemplateNames = new Set(Object.keys(loaded.agentTemplates ?? {}));
     for (const t of templates) {
       const badRefs = t.members
-        .filter(m => m.role_ref && !roleNames.has(m.role_ref))
-        .map(m => m.role_ref);
+        .filter(m => !agentTemplateNames.has(m.agent_template))
+        .map(m => m.agent_template);
       if (badRefs.length) {
         checks.push({
           name: `template: ${t.name}@${t.version}`,
           ok: true,
-          detail: `warning: role_ref(s) ${badRefs.join(', ')} not found in configured roles`,
+          detail: `warning: Agent Template(s) ${badRefs.join(', ')} not found`,
         });
       }
     }
@@ -267,13 +301,6 @@ export async function doctor(
     } catch { /* state dir may not exist yet */ }
   }
 
-  if (roles.length === 0 || roles.some(role => (role.session ?? 'tmux') === 'tmux')) {
-    const tmux = await exec('tmux', ['-V']);
-    checks.push({
-      name: 'tmux', ok: tmux.code === 0,
-      detail: tmux.code === 0 ? tmux.stdout.trim() : 'not found — apt install tmux / brew install tmux',
-    });
-  }
 
   try {
     const client = await attachDaemon({
@@ -562,6 +589,23 @@ export async function doctor(
         : `${command} not found or failed — install the ACP adapter or set session_options.acp.command`,
     });
   }
+  for (const role of roles.filter(role => role.session === 'codex-app-server')) {
+    const configured = role.session_options?.codex_app_server?.command;
+    const launcher = (role.harness_options as { launcher?: string } | undefined)?.launcher;
+    const command = Array.isArray(configured)
+      ? configured[0]
+      : typeof configured === 'string'
+        ? configured.trim().split(/\s+/)[0]
+        : launcher === 'ours-codex' ? 'ours-codex' : 'codex';
+    const result = await exec('sh', ['-c', 'command -v "$1" >/dev/null 2>&1', 'sh', command]);
+    checks.push({
+      name: `codex-app-server: ${role.name}`,
+      ok: result.code === 0,
+      detail: result.code === 0
+        ? `${command} available`
+        : `${command} not found — install Codex CLI or set session_options.codex_app_server.command`,
+    });
+  }
 
   return { ok: checks.every(c => c.ok), checks };
 }
@@ -577,6 +621,8 @@ type ConfigLoad =
       ok: true; roles: ResolvedRole[]; files: string[]; diagnostics: ConfigDiagnostic[];
       rooms?: import('./rooms-tasks/types.js').RoomsConfig;
       roomTemplates?: import('./rooms-tasks/types.js').RoomTemplatesConfig;
+      agentTemplates?: Record<string, import('./config.js').AgentTemplateDefinition>;
+      brainPresets?: Record<string, Record<string, unknown>>;
       tasks?: import('./rooms-tasks/types.js').TasksConfig;
       ownerInviteFingerprint?: string;
     }
@@ -588,6 +634,8 @@ function loadConfigResult(configPath?: string, yamlMode?: YamlMode): ConfigLoad 
     return {
       ok: true, roles: cfg.roles, files: cfg.files, diagnostics: cfg.diagnostics,
       rooms: cfg.rooms, roomTemplates: cfg.roomTemplates, tasks: cfg.tasks,
+      agentTemplates: cfg.agentTemplates,
+      brainPresets: cfg.brainPresets,
       ownerInviteFingerprint: cfg.ownerInviteFingerprint,
     };
   } catch (e) {

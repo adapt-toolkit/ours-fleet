@@ -88,13 +88,13 @@ function legacyDieCalls(functionName: string): string[] {
 describe('task/room JSON presentation contract', () => {
   it('pins every task --json serializer branch exactly and before Markdown rendering', () => {
     const branches = jsonBranches('registerTaskCommands');
-    expect(branches).toHaveLength(20);
+    expect(branches).toHaveLength(21);
     expect(branches).toMatchSnapshot();
   });
 
   it('pins every room --json serializer branch exactly and before Markdown rendering', () => {
     const branches = jsonBranches('registerRoomCommands');
-    expect(branches).toHaveLength(9);
+    expect(branches).toHaveLength(7);
     expect(branches).toMatchSnapshot();
   });
 

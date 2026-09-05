@@ -70,6 +70,22 @@ describe('npm pack from a checkout with no dist', () => {
     expect(entries.some(name => name.startsWith('dist/web-app/'))).toBe(true);
   });
 
+  it('ships the complete split default configuration referenced by init', () => {
+    for (const path of [
+      'presets/manifest.json',
+      'presets/brain-catalog.json',
+      'presets/fleet.yaml',
+      'presets/fleet/brains/claude-default.yaml',
+      'presets/fleet/agents/FleetCoordinator.yaml',
+      ...['LocalCoordinator', 'Critic', 'Developer']
+        .flatMap(name => [`presets/fleet/agent_templates/${name}.yaml`, `presets/fleet/roles/${name}.yaml`]),
+      'presets/fleet/roles/Coordinator.yaml',
+      'presets/fleet/room_templates/single.yaml',
+      'presets/fleet/room_templates/pair.yaml',
+      'presets/fleet/room_templates/team.yaml',
+    ]) expect(entries).toContain(path);
+  });
+
   // What the nightly channel exists to deliver. A tarball that packs and stamps
   // correctly but ships the old transport would publish green and be wrong.
   it('ships the SDK-backed owner-channel client and not the removed MCP transport', () => {
@@ -82,7 +98,7 @@ describe('npm pack from a checkout with no dist', () => {
     const shipped = await run('tar', ['-xzOf', packed, 'package/package.json'],
       { maxBuffer: 32 * 1024 * 1024 });
     const pkg = JSON.parse(shipped.stdout) as { dependencies: Record<string, string> };
-    expect(pkg.dependencies['@ours.network/sdk']).toBe('3.0.1');
+    expect(pkg.dependencies['@ours.network/sdk']).toBe('3.7.0');
     expect(pkg.dependencies['@ours.network/cli']).toBe('1.0.1');
   });
 

@@ -24,7 +24,7 @@ describe('installable PWA cache boundary', () => {
     expect(isCacheableAsset('/assets/index-CCtmtf83.css')).toBe(true);
     for (const path of [
       '/api/v1/auth/session', '/api/v1/auth/exchange', '/api/v1/auth/resume',
-      '/api/v1/roles', '/api/v1/audit', '/api/v1/events', '/api/v1/terminal',
+      '/api/v1/roles', '/api/v1/audit', '/api/v1/events',
       '/assets/index-HASH.js?bootstrap=secret', '/?device=secret', '/#bootstrap=secret',
       '/sw.js', '/manifest.webmanifest', '/offline.html',
     ]) expect(isCacheableAsset(path), path).toBe(false);

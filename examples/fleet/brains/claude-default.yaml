@@ -1,0 +1,5 @@
+harness: claude-code
+session: acp
+model: null
+effort: high
+max_tokens: 500000

@@ -20,6 +20,7 @@ export type TempTerminationReason =
   | 'session-ended'
   | 'operator-stop'
   | 'supervisor-signal'
+  | 'supervisor-recycle'
   | 'startup-failure'
   | 'stale-supervisor';
 

@@ -107,7 +107,7 @@ describe('shipped spawn skills are written from one source of truth', () => {
       const role = roleWith(harness, {
         approval, filesystem: 'workspace', unattended: 'deny',
       });
-      role.session = harness === 'codex' ? 'acp' : 'tmux';
+      role.session = 'acp';
       expect(getAdapter(harness).effectivePermissionMode!(role)).toMatchObject({
         fleetMode: approval,
         nativeMode,

@@ -400,11 +400,13 @@ export function daemonIdentityProvisioner(
       const before = await client.listIdentities();
       const existing = before.find(identity => identity.name === name);
       if (existing) {
+        if (!('kind' in existing))
+          throw new Error(`identity '${name}' is quarantined; refusing to replace it`);
         if (existing.temp)
           throw new Error(`identity '${name}' exists but is temporary; refusing to convert or adopt it`);
         return; // another reconciler won the create race
       }
-      if (!before.some(identity => identity.kind === 'root'))
+      if (!before.some(identity => 'kind' in identity && identity.kind === 'root'))
         throw new Error(
           `cannot create role identity '${name}': this host has no Human identity; run ours onboarding first`);
 
@@ -422,7 +424,7 @@ export function daemonIdentityProvisioner(
         // accept only the compatible permanent identity now visible.
         const after = await client.listIdentities();
         const raced = after.find(identity => identity.name === name);
-        if (!raced || raced.temp) throw error;
+        if (!raced || !('kind' in raced) || raced.temp) throw error;
       }
       if (createdHere && profile.persona && client.setPersona)
         await client.setPersona({ persona: profile.persona });
@@ -448,12 +450,12 @@ export function daemonIdentityInventoryProvisioner(
   });
 }
 
-/** Atomically write a role's fleet.d file, journalling it for rollback. */
+/** Atomically write a bare Agent file, journalling it for rollback. */
 export function writeRoleFile(tx: CreationTransaction, file: string, contents: string): void {
   const existed = existsSync(file);
   replaceFileAtomically(file, contents, 0o644);
   tx.record({
-    stage: `fleet.d file ${file}`,
+    stage: `Agent file ${file}`,
     // Only remove what THIS transaction created; never delete a file the
     // operator already had.
     undo: () => { if (!existed) rmSync(file, { force: true }); },
@@ -463,7 +465,7 @@ export function writeRoleFile(tx: CreationTransaction, file: string, contents: s
 // ─── Creation provenance ───────────────────────────────────────────────
 
 /** Where a setting's effective value came from. */
-export type ProvenanceSource = 'cli' | 'fleet-default' | 'caller-role' | 'built-in';
+export type ProvenanceSource = 'cli' | 'agent-template' | 'fleet-default' | 'caller-role' | 'built-in';
 
 export interface ProvenanceEntry {
   value: unknown;
@@ -565,11 +567,12 @@ export function creationBuildNote(p: CreationProvenance): string | undefined {
 export function formatProvenance(p: CreationProvenance): string[] {
   const mark = {
     cli: 'explicit', 'fleet-default': 'fleet default', 'caller-role': 'caller role',
-    'built-in': 'built-in',
+    'agent-template': 'Agent Template', 'built-in': 'built-in',
   } as const;
   return Object.entries(p.settings)
     .filter(([, e]) => e.value !== undefined)
-    .map(([k, e]) => `    ${k.padEnd(12)} ${String(e.value)}  (${mark[e.source]})`);
+    .map(([k, e]) => `    ${k.padEnd(12)} ${e.value && typeof e.value === 'object'
+      ? JSON.stringify(e.value) : String(e.value)}  (${mark[e.source]})`);
 }
 
 /** Classify one setting: an explicit CLI value, a fleet default, or built-in. */

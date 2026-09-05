@@ -12,6 +12,7 @@ import { FleetConfigService } from '../../src/web/fleet-config-service.js';
 import { TopologyDraftStore, emptyDraft } from '../../src/web/topology-draft-store.js';
 import { TopologyPromoteService } from '../../src/web/topology-promote.js';
 import { mergeTopology } from '../../src/web/topology-model.js';
+import { writeV2Fixture } from '../v2-fixture.js';
 
 const boundary = { origin: 'http://127.0.0.1:49271', host: '127.0.0.1:49271' };
 
@@ -45,7 +46,8 @@ describe('topology draft and promote routes', () => {
     file = join(dir, 'fleet.yaml');
     previousHome = process.env.OURS_FLEET_HOME;
     process.env.OURS_FLEET_HOME = dir;
-    writeFileSync(file, '# operator header\nroles:\n  Alice:\n    session: acp\n    mission: Ship\n', { mode: 0o600 });
+    writeV2Fixture(file, 'roles:\n  Alice:\n    session: acp\n    mission: Ship\n');
+    writeFileSync(file, `# operator header\n${readFileSync(file, 'utf8')}`, { mode: 0o600 });
     drafts = new TopologyDraftStore({ dir });
     configuration = new FleetConfigService({ configPath: file });
   });
@@ -169,7 +171,7 @@ describe('topology draft and promote routes', () => {
       method: 'POST', url: '/api/v1/topology/promote/preview', headers, payload: body,
     });
     expect(preview.statusCode).toBe(200);
-    expect(preview.json().diff).toContain('+  Reviewer:');
+    expect(preview.json().diff).toContain('+++ agents/Reviewer.yaml (proposed)');
     expect(readFileSync(file, 'utf8')).not.toContain('Reviewer');
 
     const promoted = await server.app.inject({

@@ -16,7 +16,7 @@
   "bin": {
     "ours-fleet-codex-install": "bin/ours-fleet-codex-install.mjs"
   },
-  "engines": { "node": ">=20" },
+  "engines": { "node": ">=22" },
   "publishConfig": { "access": "public" },
   "scripts": {
     "test": "node --test"

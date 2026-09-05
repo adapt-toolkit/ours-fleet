@@ -1,7 +1,12 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useMemo, useState } from 'react';
 import { api } from './api';
 
-type Model = Record<string, any>;
+export type FleetSetupModel = {
+  manifest: Record<string, any>;
+  agents: Record<string, any>;
+  agent_templates: Record<string, any>;
+};
+type Model = FleetSetupModel;
 export type ConfigRead = {
   path: string; exists: boolean; firstRun: boolean; revision: string; model: Model; redactions: string[];
 };
@@ -12,8 +17,49 @@ type Preview = {
 };
 
 const entries = (value: unknown) => Object.entries((value && typeof value === 'object' ? value : {}) as Model);
-type ModelOption = { id: string; label: string; reasoningEfforts: string[]; defaultReasoningEffort?: string; source: string };
-type Catalogs = Record<string, ModelOption[]>;
+
+export function agentEditorState(agent: Record<string, any>) {
+  return {
+    templateRef: typeof agent.template === 'string' ? agent.template : undefined,
+    directEditors: typeof agent.template !== 'string',
+    roleRef: typeof agent.role?.ref === 'string' ? agent.role.ref : undefined,
+    brainRef: typeof agent.brain?.ref === 'string' ? agent.brain.ref : undefined,
+    roleInline: agent.role?.inline as Record<string, any> | undefined,
+    brainInline: agent.brain?.inline as Record<string, any> | undefined,
+  };
+}
+
+export const fleetSetupSections = (model: FleetSetupModel) => ({
+  persistentAgents: Object.keys(model.agents).sort(),
+  inertAgentTemplates: Object.keys(model.agent_templates).sort(),
+});
+
+export function addAgentTemplate(model: FleetSetupModel): string {
+  let n = 1; while (model.agent_templates[`Template${n}`]) n++;
+  const id = `Template${n}`;
+  model.agent_templates[id] = { role: { inline: {} }, brain: { inline: { harness: 'claude-code' } } };
+  return id;
+}
+
+export function renameAgentTemplate(model: FleetSetupModel, from: string, to: string): boolean {
+  if (!to || from === to || model.agent_templates[to] || !model.agent_templates[from]) return false;
+  model.agent_templates[to] = model.agent_templates[from]; delete model.agent_templates[from]; return true;
+}
+
+export function removeAgentTemplate(model: FleetSetupModel, id: string): boolean {
+  if (!model.agent_templates[id]) return false;
+  delete model.agent_templates[id]; return true;
+}
+
+/** Ref-backed presets are immutable in this editor; conversion must be explicit elsewhere. */
+export function editInlineAgentField(
+  agent: Record<string, any>, section: 'role' | 'brain', key: string, value: unknown,
+): boolean {
+  const inline = agent[section]?.inline;
+  if (!inline || typeof inline !== 'object' || Array.isArray(inline)) return false;
+  if (value === undefined || value === '') delete inline[key]; else inline[key] = value;
+  return true;
+}
 
 export function FleetSetup({ initial, onSaved }: { initial: ConfigRead; onSaved(next: ConfigRead): void }) {
   const [model, setModel] = useState<Model>(() => structuredClone(initial.model));
@@ -22,16 +68,8 @@ export function FleetSetup({ initial, onSaved }: { initial: ConfigRead; onSaved(
   const [error, setError] = useState('');
   const [busy, setBusy] = useState(false);
   const [advanced, setAdvanced] = useState(false);
-  const [catalogs, setCatalogs] = useState<Catalogs>({});
-  useEffect(() => {
-    const controller = new AbortController();
-    void api.get<any>('/api/v1/creation-capabilities', controller.signal).then(value => {
-      if (!controller.signal.aborted) setCatalogs(Object.fromEntries(
-        (value.harnesses ?? []).map((harness: any) => [harness.id, harness.modelOptions ?? []])));
-    }).catch(() => undefined);
-    return () => controller.abort();
-  }, []);
-  const roles = useMemo(() => entries(model.roles), [model]);
+  const roles = useMemo(() => entries(model.agents), [model]);
+  const templates = useMemo(() => entries(model.agent_templates), [model]);
   const update = (fn: (draft: Model) => void) => setModel(value => {
     const draft = structuredClone(value); fn(draft); return draft;
   });
@@ -59,7 +97,7 @@ export function FleetSetup({ initial, onSaved }: { initial: ConfigRead; onSaved(
       <div className="setup-safety"><strong>No implicit restart</strong><span>Save creates a recovery backup. Secret environment values remain hidden.</span></div>
     </div>
     <ol className="setup-steps" aria-label="Setup progress">
-      {['Defaults', 'Agents', 'Automation', 'Review'].map((name, index) =>
+      {['Defaults', 'Agents & templates', 'Automation', 'Review'].map((name, index) =>
         <li key={name} className={step === index ? 'active' : step > index ? 'done' : ''}>{index + 1}<span>{name}</span></li>)}
     </ol>
     <div className="mode-switch" role="group" aria-label="Configuration detail level">
@@ -69,8 +107,8 @@ export function FleetSetup({ initial, onSaved }: { initial: ConfigRead; onSaved(
     </div>
     {error && <div className="banner error">{error}</div>}
     <div className="panel setup-panel">
-      {step === 0 && <Defaults model={model} catalogs={catalogs} advanced={advanced} update={update} />}
-      {step === 1 && <Agents roles={roles} advanced={advanced} update={update} />}
+      {step === 0 && <Defaults model={model} advanced={advanced} update={update} />}
+      {step === 1 && <Agents roles={roles} templates={templates} advanced={advanced} update={update} />}
       {step === 2 && <Automation model={model} roles={roles.map(([name]) => name)} advanced={advanced} update={update} />}
       {step === 3 && preview && <Review preview={preview} />}
       <div className="setup-actions">
@@ -84,73 +122,74 @@ export function FleetSetup({ initial, onSaved }: { initial: ConfigRead; onSaved(
   </div>;
 }
 
-function Defaults({ model, catalogs, advanced, update }: { model: Model; catalogs: Catalogs; advanced: boolean; update(fn: (draft: Model) => void): void }) {
-  const defaults = model.defaults ?? {};
+function Defaults({ model, advanced, update }: { model: Model; advanced: boolean; update(fn: (draft: Model) => void): void }) {
+  const defaults = model.manifest.defaults ?? {};
   const permissions = defaults.permissions ?? {};
-  const field = (key: string, value: string) => update(draft => {
-    draft.defaults ??= {}; if (value) draft.defaults[key] = value; else delete draft.defaults[key];
-  });
-  const harness = defaults.harness ?? 'claude-code';
-  const options = catalogs[harness] ?? [];
-  const selected = options.find(option => option.id === defaults.model);
-  const effort = harness === 'codex' ? defaults.harness_options?.config?.model_reasoning_effort : defaults.harness_options?.effort;
-  const setEffort = (value: string) => update(draft => {
-    draft.defaults ??= {}; draft.defaults.harness_options ??= {};
-    if (harness === 'codex') {
-      draft.defaults.harness_options.config ??= {};
-      if (value) draft.defaults.harness_options.config.model_reasoning_effort = value;
-      else delete draft.defaults.harness_options.config.model_reasoning_effort;
-    } else if (value) draft.defaults.harness_options.effort = value;
-    else delete draft.defaults.harness_options.effort;
-  });
-  return <><h3>1. Choose how agents run</h3><p className="muted">This becomes the starting point for every agent. Existing sessions are not restarted by saving.</p>
-    <div className="decision-note"><strong>Recommended default</strong><span>ACP gives structured activity; tmux gives a terminal. Pick an exact catalog model, or let the harness resolve its default when a new session launches.</span></div>
+  return <><h3>1. Choose fleet-wide operational defaults</h3><p className="muted">Brain settings belong to each Agent document. These defaults cover operational permissions only.</p>
     <div className="form-grid three">
-      <label>Harness<select value={harness} onChange={event => field('harness', event.target.value)}><option value="codex">Codex</option><option value="claude-code">Claude Code</option></select></label>
-      <label>Session<select value={defaults.session ?? 'tmux'} onChange={event => field('session', event.target.value)}><option value="acp">ACP</option><option value="tmux">tmux</option></select></label>
-      <label>Model<select aria-label="Fleet model" value={selected?.id ?? ''} onChange={event => { field('model', event.target.value); const next = options.find(option => option.id === event.target.value); setEffort(next?.defaultReasoningEffort ?? ''); }}>
-        <option value="">Use harness default (resolved at launch)</option>{options.map(option => <option value={option.id} key={option.id}>{option.label} — {option.id}</option>)}</select></label>
-      <label>Reasoning effort<select aria-label="Fleet reasoning effort" value={effort ?? ''} onChange={event => setEffort(event.target.value)}><option value="">Model default</option>{(selected?.reasoningEfforts ?? []).map(value => <option key={value}>{value}</option>)}</select></label>
-      {advanced && <label>Custom model ID<input value={defaults.model ?? ''} placeholder="exact vendor model ID" onChange={event => field('model', event.target.value)} /></label>}
       {advanced && (['approval', 'filesystem', 'unattended'] as const).map(key => <label key={key}>{key}<select value={permissions[key] ?? (key === 'filesystem' ? 'workspace' : key === 'unattended' ? 'deny' : 'ask')} onChange={event => update(draft => {
-        draft.defaults ??= {}; draft.defaults.permissions ??= {}; draft.defaults.permissions[key] = event.target.value;
+        draft.manifest.defaults ??= {}; draft.manifest.defaults.permissions ??= {}; draft.manifest.defaults.permissions[key] = event.target.value;
       })}>{(key === 'approval' ? ['ask', 'auto', 'allow'] : key === 'filesystem' ? ['read-only', 'workspace', 'unrestricted'] : ['deny', 'wait']).map(value => <option key={value}>{value}</option>)}</select></label>)}
     </div></>;
 }
 
-function Agents({ roles, advanced, update }: { roles: Array<[string, any]>; advanced: boolean; update(fn: (draft: Model) => void): void }) {
-  const add = () => update(draft => { draft.roles ??= {}; let n = 1; while (draft.roles[`Agent${n}`]) n++; draft.roles[`Agent${n}`] = {}; });
+function Agents({ roles, templates, advanced, update }: {
+  roles: Array<[string, any]>; templates: Array<[string, any]>;
+  advanced: boolean; update(fn: (draft: Model) => void): void;
+}) {
+  const add = () => update(draft => { let n = 1; while (draft.agents[`Agent${n}`]) n++; draft.agents[`Agent${n}`] = { role: { inline: {} }, brain: { inline: { harness: 'claude-code' } } }; });
+  const addTemplate = () => update(draft => { addAgentTemplate(draft); });
   return <><div className="section-title"><div><h3>2. Name the agents and give each a job</h3><p className="muted">Example: Researcher — “Find primary sources and summarize evidence.” Saving adds configuration; it does not restart running agents.</p></div><button className="secondary" onClick={add}>＋ Add agent</button></div>
-    <div className="entity-list">{roles.map(([name, role]) => <div className="entity-card" key={name}>
+    <div className="entity-list">{roles.map(([name, role]) => {
+      const editor = agentEditorState(role);
+      return <div className="entity-card" key={name}>
       <div className="form-grid three">
-        <label>Name<input value={name} onChange={event => update(draft => { const next = event.target.value; if (!next || next === name) return; draft.roles[next] = draft.roles[name]; delete draft.roles[name]; })} /></label>
-        {advanced && <label>Coordinator<input value={role.coordinator ?? ''} onChange={event => update(draft => { draft.roles[name].coordinator = event.target.value || undefined; })} /></label>}
-        {advanced && <label>Model override<input value={role.model ?? ''} placeholder="Inherit" onChange={event => update(draft => { if (event.target.value) draft.roles[name].model = event.target.value; else delete draft.roles[name].model; })} /></label>}
-        <label className="wide">Mission<textarea value={role.mission ?? ''} onChange={event => update(draft => { draft.roles[name].mission = event.target.value; })} /></label>
-        {advanced && <label>Oversee roles<input value={(role.oversee ?? []).map((item: any) => item.role).join(', ')} placeholder="Researcher, Reviewer" onChange={event => update(draft => { draft.roles[name].oversee = event.target.value.split(',').map((value: string) => value.trim()).filter(Boolean).map((target: string) => ({ role: target, interval: '5m' })); })} /></label>}
-      </div><button className="text-button danger" onClick={() => update(draft => { delete draft.roles[name]; })}>Remove</button>
-    </div>)}</div>{!roles.length && <div className="empty compact">Add at least one agent to start a fleet.</div>}</>;
+        <label>Name<input value={name} onChange={event => update(draft => { const next = event.target.value; if (!next || next === name) return; draft.agents[next] = draft.agents[name]; delete draft.agents[name]; })} /></label>
+        {role.template
+          ? <label>Agent Template<input value={role.template} disabled readOnly /></label>
+          : advanced && <label>Coordinator<input value={role.coordinator ?? ''} onChange={event => update(draft => { draft.agents[name].coordinator = event.target.value || undefined; })} /></label>}
+        {!role.template && advanced && (editor.brainRef
+          ? <label>Brain preset<input value={editor.brainRef} disabled readOnly /></label>
+          : <label>Harness<select value={editor.brainInline?.harness ?? 'claude-code'} onChange={event => update(draft => { editInlineAgentField(draft.agents[name], 'brain', 'harness', event.target.value); })}><option value="claude-code">Claude Code</option><option value="codex">Codex</option></select></label>)}
+        {!role.template && advanced && <label>Model override<input value={editor.brainRef ? `Preset: ${editor.brainRef}` : editor.brainInline?.model ?? ''} disabled={Boolean(editor.brainRef)} readOnly={Boolean(editor.brainRef)} placeholder="Harness default" onChange={event => update(draft => { editInlineAgentField(draft.agents[name], 'brain', 'model', event.target.value); })} /></label>}
+        {!role.template && <label className="wide">Mission<textarea value={editor.roleRef ? `Preset: ${editor.roleRef}` : editor.roleInline?.mission ?? ''} disabled={Boolean(editor.roleRef)} readOnly={Boolean(editor.roleRef)} onChange={event => update(draft => { editInlineAgentField(draft.agents[name], 'role', 'mission', event.target.value); })} /></label>}
+        {!role.template && advanced && <label>Oversee agents<input value={(role.oversee ?? []).map((item: any) => item.agent).join(', ')} placeholder="Researcher, Reviewer" onChange={event => update(draft => { draft.agents[name].oversee = event.target.value.split(',').map((value: string) => value.trim()).filter(Boolean).map((target: string) => ({ agent: target, interval: '5m' })); })} /></label>}
+      </div><button className="text-button danger" onClick={() => update(draft => { delete draft.agents[name]; })}>Remove</button>
+    </div>;})}</div>{!roles.length && <div className="empty compact">Add at least one persistent Agent to run a fleet.</div>}
+    <div className="section-title"><div><h3>Reusable Agent Templates</h3><p className="muted">Templates are inert launch definitions for room workers or persistent Agents. They never create an identity, session, supervisor, or lifecycle row.</p></div><button className="secondary" onClick={addTemplate}>＋ Add template</button></div>
+    <div className="entity-list">{templates.map(([name, template]) => {
+      const editor = agentEditorState(template);
+      return <div className="entity-card" key={`template-${name}`}><span className="eyebrow">inert Agent Template</span>
+        <div className="form-grid three">
+          <label>Name<input value={name} onChange={event => update(draft => { renameAgentTemplate(draft, name, event.target.value); })} /></label>
+          {advanced && (editor.brainRef
+            ? <label>Brain preset<input value={editor.brainRef} disabled readOnly /></label>
+            : <label>Harness<select value={editor.brainInline?.harness ?? 'claude-code'} onChange={event => update(draft => { editInlineAgentField(draft.agent_templates[name], 'brain', 'harness', event.target.value); })}><option value="claude-code">Claude Code</option><option value="codex">Codex</option></select></label>)}
+          <label className="wide">Mission<textarea value={editor.roleRef ? `Preset: ${editor.roleRef}` : editor.roleInline?.mission ?? ''} disabled={Boolean(editor.roleRef)} readOnly={Boolean(editor.roleRef)} onChange={event => update(draft => { editInlineAgentField(draft.agent_templates[name], 'role', 'mission', event.target.value); })} /></label>
+        </div><button className="text-button danger" onClick={() => update(draft => { removeAgentTemplate(draft, name); })}>Remove template</button>
+      </div>;
+    })}</div>{!templates.length && <div className="empty compact">No reusable templates configured.</div>}</>;
 }
 
 function Automation({ model, roles, advanced, update }: { model: Model; roles: string[]; advanced: boolean; update(fn: (draft: Model) => void): void }) {
-  const addWatchdog = () => update(draft => { draft.watchdogs ??= {}; let n = 1; while (draft.watchdogs[`watch${n}`]) n++; draft.watchdogs[`watch${n}`] = { coordinator: roles[0] ?? '', watch: roles, interval: '10m' }; });
-  const addLoop = () => update(draft => { draft.loops ??= {}; let n = 1; while (draft.loops[`loop${n}`]) n++; draft.loops[`loop${n}`] = { roles: roles.slice(0, 1), interval: '10m', prompt: 'Review current work and act on the next concrete step.' }; });
+  const addWatchdog = () => update(draft => { draft.manifest.watchdogs ??= {}; let n = 1; while (draft.manifest.watchdogs[`watch${n}`]) n++; draft.manifest.watchdogs[`watch${n}`] = { coordinator: roles[0] ?? '', watch: roles, interval: '10m' }; });
+  const addLoop = () => update(draft => { draft.manifest.loops ??= {}; let n = 1; while (draft.manifest.loops[`loop${n}`]) n++; draft.manifest.loops[`loop${n}`] = { roles: roles.slice(0, 1), interval: '10m', prompt: 'Review current work and act on the next concrete step.' }; });
   return <><div className="section-title"><div><h3>3. Add automation only if you need it</h3><p className="muted">Most first fleets can skip this. Watchdogs inspect health; loops send a recurring prompt. Both begin after the scheduler reloads the saved configuration.</p></div><div><button className="secondary" onClick={addWatchdog}>＋ Watchdog</button> <button className="secondary" onClick={addLoop}>＋ Loop</button></div></div>
-    <div className="entity-list">{entries(model.watchdogs).map(([name, item]) => <AutomationCard key={`w-${name}`} kind="watchdog" name={name} item={item} update={update} />)}
-      {entries(model.loops).map(([name, item]) => <AutomationCard key={`l-${name}`} kind="loop" name={name} item={item} update={update} />)}</div>
+    <div className="entity-list">{entries(model.manifest.watchdogs).map(([name, item]) => <AutomationCard key={`w-${name}`} kind="watchdog" name={name} item={item} update={update} />)}
+      {entries(model.manifest.loops).map(([name, item]) => <AutomationCard key={`l-${name}`} kind="loop" name={name} item={item} update={update} />)}</div>
     {!advanced && <p className="decision-note">Switch to Advanced to tune intervals, target lists, and prompts after adding automation.</p>}
-    {!entries(model.watchdogs).length && !entries(model.loops).length && <div className="empty compact">Automation is optional. Continue to review when ready.</div>}</>;
+    {!entries(model.manifest.watchdogs).length && !entries(model.manifest.loops).length && <div className="empty compact">Automation is optional. Continue to review when ready.</div>}</>;
 }
 
 function AutomationCard({ kind, name, item, update }: { kind: 'watchdog' | 'loop'; name: string; item: any; update(fn: (draft: Model) => void): void }) {
   const block = kind === 'watchdog' ? 'watchdogs' : 'loops';
   return <div className="entity-card"><span className="eyebrow">{kind}</span><div className="form-grid three">
     <label>Name<input value={name} readOnly /></label>
-    <label>Interval<input value={item.interval ?? '10m'} onChange={event => update(draft => { draft[block][name].interval = event.target.value; })} /></label>
-    <label>{kind === 'watchdog' ? 'Watch roles' : 'Target roles'}<input value={(kind === 'watchdog' ? item.watch : item.roles ?? []).join(', ')} onChange={event => update(draft => { draft[block][name][kind === 'watchdog' ? 'watch' : 'roles'] = event.target.value.split(',').map((value: string) => value.trim()).filter(Boolean); })} /></label>
-    {kind === 'watchdog' ? <label>Coordinator<input value={item.coordinator ?? ''} onChange={event => update(draft => { draft.watchdogs[name].coordinator = event.target.value; })} /></label>
-      : <label className="wide">Prompt<textarea value={item.prompt ?? ''} onChange={event => update(draft => { draft.loops[name].prompt = event.target.value; })} /></label>}
-  </div><button className="text-button danger" onClick={() => update(draft => { delete draft[block][name]; })}>Remove</button></div>;
+    <label>Interval<input value={item.interval ?? '10m'} onChange={event => update(draft => { draft.manifest[block][name].interval = event.target.value; })} /></label>
+    <label>{kind === 'watchdog' ? 'Watch agents' : 'Target agents'}<input value={(kind === 'watchdog' ? item.watch : item.roles ?? []).join(', ')} onChange={event => update(draft => { draft.manifest[block][name][kind === 'watchdog' ? 'watch' : 'roles'] = event.target.value.split(',').map((value: string) => value.trim()).filter(Boolean); })} /></label>
+    {kind === 'watchdog' ? <label>Coordinator<input value={item.coordinator ?? ''} onChange={event => update(draft => { draft.manifest.watchdogs[name].coordinator = event.target.value; })} /></label>
+      : <label className="wide">Prompt<textarea value={item.prompt ?? ''} onChange={event => update(draft => { draft.manifest.loops[name].prompt = event.target.value; })} /></label>}
+  </div><button className="text-button danger" onClick={() => update(draft => { delete draft.manifest[block][name]; })}>Remove</button></div>;
 }
 
 function Review({ preview }: { preview: Preview }) {

@@ -14,7 +14,7 @@ afterEach(() => rmSync(dir, { recursive: true, force: true }));
 const role = (): ResolvedRole => ({
   name: 'A',
   harness: 'claude-code',
-  session: 'tmux',
+  session: 'acp',
   permissions: { approval: 'allow', filesystem: 'workspace', unattended: 'deny' },
   permissionsDeclared: true,
   identity: 'A',

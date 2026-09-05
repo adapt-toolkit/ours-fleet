@@ -34,6 +34,22 @@ export type OursRetrievedFile = OursRetrievedFiles['files'][number];
 export type OursHistoryFile = NonNullable<Res<'getFileInfo'>>;
 export type OursNotificationEvent = NotificationEvent;
 
+export type OursJsonValue = null | boolean | number | string | OursJsonValue[]
+  | { [key: string]: OursJsonValue };
+export interface OursCommandContext {
+  readonly sender_cid: string;
+  readonly sender_name: string;
+  readonly request_wire_id: string;
+}
+export interface OursRegisteredCommand {
+  name: string;
+  description?: string;
+  input_schema: { [key: string]: OursJsonValue };
+  handler(
+    argumentsValue: OursJsonValue, context: Readonly<OursCommandContext>,
+  ): OursJsonValue | Promise<OursJsonValue>;
+}
+
 // The daemon normally returns a quiet long-poll within 25 seconds. Keep the
 // client-side fence comfortably above it so ordinary quiet periods do not
 // recycle a healthy stream, while a half-open socket still heals on its own.
@@ -120,6 +136,8 @@ export interface OursOps {
   start(): Promise<void>;
   /** Bind this session's identity. Throws `BOUND_ELSEWHERE` when it is held live. */
   bindIdentity(name: string): Promise<void>;
+  /** Replace the bound identity's advertised typed-command catalog and handlers. */
+  registerCommands(commands: OursRegisteredCommand[]): Promise<void>;
   listContacts(): Promise<OursContactsView>;
   generateInvite(name?: string): Promise<OursInviteResult>;
   addContact(a: { invite: string; name?: string }): Promise<OursAddContactResult>;
@@ -217,6 +235,10 @@ export class OursSdkClient implements OursOps {
     // force is pinned off: the owner channel never evicts another live session
     // from an identity, it waits for the bounded handoff window and then fails.
     await this.ops().chooseIdentity({ name, force: false });
+  }
+
+  async registerCommands(commands: OursRegisteredCommand[]): Promise<void> {
+    await this.ops().registerCommands(commands);
   }
 
   async listContacts(): Promise<OursContactsView> {

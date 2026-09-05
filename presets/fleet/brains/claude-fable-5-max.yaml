@@ -1,0 +1,5 @@
+# Generated from presets/brain-catalog.json revision 2.
+harness: claude-code
+session: acp
+model: claude-fable-5
+effort: max

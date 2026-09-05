@@ -2,9 +2,10 @@ import { createHash, randomUUID } from 'node:crypto';
 import { mkdirSync, readFileSync, readdirSync, realpathSync, statSync } from 'node:fs';
 import { isAbsolute, relative } from 'node:path';
 import {
-  loadConfig, NOTIFY_EVENT_TYPES, resolveMonitorConfig, resolveRoleModel,
+  loadConfig, NOTIFY_EVENT_TYPES, resolveMonitorConfig,
   resolvePermissions, ROLE_NAME_RE, validateMonitorConfig,
   type CommonPermissions, type MonitorConfig, type MonitorInterrupt, type NotifyEventType,
+  type SessionBackendId,
 } from '../config.js';
 import {
   daemonIdentityProvisioner,
@@ -13,7 +14,7 @@ import {
 import { replaceFileAtomically } from '../atomic-file.js';
 import { stateRoot } from '../paths.js';
 import {
-  buildRoleConfig, spawnDryRun, spawnPermanent, spawnTemp, validateSpawnOpts,
+  spawnDryRun, spawnPermanent, spawnTemp, validateSpawnOpts,
   type SpawnOpts, type SupervisorLauncher,
 } from '../spawn.js';
 import type { OpsDeps } from '../ops.js';
@@ -22,24 +23,16 @@ import { FleetError, normalizeError } from './errors.js';
 import { inheritCallerSpawnDefaults, type ManagedFleetSpawnResult } from '../fleet-proxy.js';
 import { effectivePermissionMode } from '../permissions.js';
 import { effectiveRoleModel } from '../model-env.js';
-import {
-  claudeModelCatalog, codexModelCatalog, type HarnessModelCatalog, type HarnessModelOption,
-} from './model-catalog.js';
+import { selectionOrigin, summarizeResolvedLaunch } from '../lifecycle-summary.js';
 
 export interface CreateRoleSessionRequest {
   name: string;
-  harness: 'codex' | 'claude-code';
-  /** null means the selected harness's own default; web blank fields send null. */
-  model?: string | null;
-  reasoningEffort?: string | null;
-  session: 'acp' | 'tmux';
+  brain: import('../config.js').AgentSelection;
+  role: import('../config.js').AgentSelection;
   cwd?: string;
   lifetime: 'permanent' | 'temporary';
-  mission?: string;
   coordinator?: string;
   permissions: CommonPermissions;
-  bio?: string;
-  persona?: string;
   monitor?: WebCreationMonitor;
   openAfterCreate: boolean;
   highRiskAcknowledged?: boolean;
@@ -57,12 +50,6 @@ export type WebCreationMonitor =
 export interface CreationCapabilities {
   available: boolean;
   reasons: string[];
-  harnesses: Array<{
-    id: 'codex' | 'claude-code'; available: boolean;
-    sessions: Array<'acp' | 'tmux'>; defaultModel?: string; models: string[];
-    modelOptions: HarnessModelOption[]; catalogSource: string; customModelAllowed: true;
-    warnings: string[];
-  }>;
   lifetimes: Array<'permanent' | 'temporary'>;
   identityBootstrap: {
     mode: 'current-fleet-first-boot';
@@ -84,7 +71,7 @@ export type IdentityPreflight = 'verified' | 'missing' | 'unknown';
 export interface CreationPreview {
   request: CreateRoleSessionRequest;
   effective: {
-    name: string; identity: string; harness: string; session: 'acp' | 'tmux';
+    name: string; identity: string; harness: string; session: SessionBackendId;
     model?: string; reasoningEffort?: string; cwd?: string; lifetime: 'permanent' | 'temporary';
     permissions: CommonPermissions;
     monitor: MonitorConfig;
@@ -112,7 +99,7 @@ export interface CreationAction {
   actionId: string;
   requestHash: string;
   roleId: string;
-  session: 'acp' | 'tmux';
+  session: SessionBackendId;
   lifetime: 'permanent' | 'temporary';
   state: CreationStage;
   stages: Array<{ stage: CreationStage; at: string; detail?: string }>;
@@ -135,9 +122,8 @@ export interface RoleCreationServiceOptions {
   tempLauncher?: SupervisorLauncher;
   allowedCwdRoots?: string[];
   journalDir?: string;
-  probeReady?: (name: string, session: 'acp' | 'tmux') => Promise<'ready' | 'attention' | 'unknown'>;
+  probeReady?: (name: string, session: SessionBackendId) => Promise<'ready' | 'attention' | 'unknown'>;
   onProgress?: (action: CreationAction) => void;
-  modelCatalogs?: Partial<Record<'codex' | 'claude-code', () => HarnessModelCatalog>>;
   /** Direct/managed callers must not create or restore the web action journal. */
   journal?: boolean;
 }
@@ -203,14 +189,29 @@ export class RoleCreationService {
     const creationActionId = randomUUID();
     plan.options.creationActionId = creationActionId;
     const statePath = await this.launchSync(plan.options);
+    const selectionSummary = (kind: 'brain' | 'role'): string => {
+      const value = plan.options[kind];
+      const provenance = plan.inherited.includes(kind) ? 'inherited' : 'explicit';
+      if (!value) return `unresolved (${provenance})`;
+      if ('ref' in value) return `ref:${value.ref} (${provenance})`;
+      const fingerprint = hash(value.inline).slice(0, 16);
+      return `inline:sha256:${fingerprint} (${provenance})`;
+    };
+    const permissionMode = effectivePermissionMode(plan.preview.resolvedRole);
     return {
       caller: plan.caller, role: plan.options.name,
       lifetime: plan.options.temp ? 'temporary' : 'permanent', statePath,
       harness: plan.preview.resolvedRole.harness, session: plan.preview.resolvedRole.session,
       ...(effectiveRoleModel(plan.preview.resolvedRole) ? { model: effectiveRoleModel(plan.preview.resolvedRole)! } : {}),
       monitor: { mode: plan.preview.resolvedRole.monitor.mode, interrupt: plan.preview.resolvedRole.monitor.interrupt },
-      permissionMode: effectivePermissionMode(plan.preview.resolvedRole), inherited: plan.inherited,
+      permissionMode, inherited: plan.inherited,
       creationActionId,
+      brainSummary: selectionSummary('brain'), roleSummary: selectionSummary('role'),
+      configuration: summarizeResolvedLaunch(plan.preview.resolvedRole, {
+        role: selectionOrigin(plan.options.role ?? plan.options.agentDefinition?.role),
+        brain: selectionOrigin(plan.options.brain ?? plan.options.agentDefinition?.brain),
+        permissionMode,
+      }),
     };
   }
 
@@ -223,45 +224,14 @@ export class RoleCreationService {
   async capabilities(): Promise<CreationCapabilities> {
     const reasons: string[] = [];
     let defaults: Record<string, unknown> = {};
-    let roles: ReturnType<typeof loadConfig>['roles'] = [];
     try {
       const config = loadConfig(this.options.configPath);
       defaults = config.defaults;
-      roles = config.roles;
     }
     catch (error) { reasons.push(`configuration is invalid: ${(error as Error).message}`); }
-    const modelsFor = (harness: 'codex' | 'claude-code', catalog: HarnessModelCatalog) => {
-      const configured = roles.filter(role => role.harness === harness)
-        .flatMap(role => [role.model, ...(role.model_chain ?? [])])
-        .filter((model): model is string => Boolean(model));
-      const inherited = resolveRoleModel(undefined, harness, defaults);
-      const configuredOptions: HarnessModelOption[] = [...new Set([...(inherited ? [inherited] : []), ...configured])]
-        .filter(id => !catalog.models.some(model => model.id === id))
-        .map(id => ({ id, label: `${id} (configured)`, reasoningEfforts: [], source: 'fleet-config' as const }));
-      const modelOptions = [...configuredOptions, ...catalog.models];
-      return { modelOptions, models: modelOptions.map(model => model.id) };
-    };
-    const codexCatalog = this.options.modelCatalogs?.codex?.() ?? codexModelCatalog();
-    const claudeCatalog = this.options.modelCatalogs?.['claude-code']?.() ?? claudeModelCatalog();
-    const codexModels = modelsFor('codex', codexCatalog);
-    const claudeModels = modelsFor('claude-code', claudeCatalog);
     return {
       available: reasons.length === 0,
       reasons,
-      harnesses: [
-        {
-          id: 'codex', available: true, sessions: ['acp', 'tmux'],
-          defaultModel: resolveRoleModel(undefined, 'codex', defaults),
-          ...codexModels, catalogSource: 'codex-runtime-catalog', customModelAllowed: true,
-          warnings: codexCatalog.warnings,
-        },
-        {
-          id: 'claude-code', available: true, sessions: ['acp', 'tmux'],
-          defaultModel: resolveRoleModel(undefined, 'claude-code', defaults),
-          ...claudeModels, catalogSource: 'claude-adapter-2.1', customModelAllowed: true,
-          warnings: claudeCatalog.warnings,
-        },
-      ],
       lifetimes: ['permanent', 'temporary'],
       identityBootstrap: {
         mode: 'current-fleet-first-boot',
@@ -286,14 +256,12 @@ export class RoleCreationService {
     const defaults = cfg.defaults;
     const opts = this.spawnOptions(request);
     validateSpawnOpts(opts);
-    buildRoleConfig(opts, defaults.harness as string | undefined);
+    const resolved = spawnDryRun(opts).resolvedRole;
     const cwd = request.cwd ? this.resolveCwd(request.cwd) : undefined;
     const effective = {
       name: request.name, identity: request.name,
-      harness: request.harness ?? (defaults.harness as string | undefined) ?? 'claude-code',
-      session: request.session ?? (defaults.session as 'acp' | 'tmux' | undefined) ?? 'tmux',
-      model: resolveRoleModel(request.model, request.harness, defaults),
-      reasoningEffort: request.reasoningEffort ?? undefined,
+      harness: resolved.harness, session: resolved.session, model: resolved.model,
+      reasoningEffort: resolved.effort,
       cwd, lifetime: request.lifetime,
       permissions: resolvePermissions(defaults.permissions, request.permissions),
       monitor: resolveMonitorConfig(defaults.monitor, request.monitor),
@@ -325,9 +293,7 @@ export class RoleCreationService {
     if (existingIdentity === 'unknown' && !request.unverifiedIdentityAcknowledged)
       prerequisites.push('confirm creation with an unverified identity preflight');
     const provenance = {
-      harness: 'request', session: 'request', identity: 'built-in',
-      model: request.model !== undefined ? 'request'
-        : resolveRoleModel(undefined, request.harness, defaults) ? 'fleet-default' : 'built-in',
+      brain: 'request', role: 'request', identity: 'built-in',
       cwd: request.cwd ? 'request' : 'built-in', permissions: 'request',
       monitor: request.monitor ? 'request' : defaults.monitor ? 'fleet-default' : 'built-in',
     } as const;
@@ -419,9 +385,7 @@ export class RoleCreationService {
       this.stage(action, 'waiting_for_session');
       const ready = await this.waitForReady(action.roleId, action.session);
       if (ready === 'ready') {
-        action.openPath = action.session === 'acp'
-          ? `/roles/${encodeURIComponent(action.roleId)}/activity`
-          : `/roles/${encodeURIComponent(action.roleId)}/terminal`;
+        action.openPath = `/roles/${encodeURIComponent(action.roleId)}/activity`;
         this.stage(
           action, 'session_reachable',
           'session is reachable; identity binding has no structured evidence in this version',
@@ -448,7 +412,7 @@ export class RoleCreationService {
   }
 
   private async waitForReady(
-    role: string, session: 'acp' | 'tmux',
+    role: string, session: SessionBackendId,
   ): Promise<'ready' | 'attention' | 'unknown'> {
     if (!this.options.probeReady) return 'unknown';
     for (let attempt = 0; attempt < 20; attempt++) {
@@ -461,8 +425,8 @@ export class RoleCreationService {
 
   private validate(input: CreateRoleSessionRequest): CreateRoleSessionRequest {
     const allowed = new Set([
-      'name', 'harness', 'model', 'reasoningEffort', 'session', 'cwd', 'lifetime', 'mission',
-      'coordinator', 'permissions', 'bio', 'persona', 'monitor', 'openAfterCreate',
+      'name', 'brain', 'role', 'cwd', 'lifetime',
+      'coordinator', 'permissions', 'monitor', 'openAfterCreate',
       'highRiskAcknowledged', 'reuseExistingIdentityAcknowledged',
       'unverifiedIdentityAcknowledged',
     ]);
@@ -471,20 +435,11 @@ export class RoleCreationService {
     if (unsupported.length)
       throw new FleetError('invalid_request', `unsupported web creation field: ${unsupported[0]}`);
     if (!ROLE_NAME_RE.test(input.name)) throw new FleetError('invalid_request', 'invalid role name');
-    if (!['codex', 'claude-code'].includes(input.harness))
-      throw new FleetError('invalid_request', 'unsupported harness');
-    if (!['acp', 'tmux'].includes(input.session))
-      throw new FleetError('invalid_request', 'unsupported session backend');
+    if (!input.brain || !input.role)
+      throw new FleetError('invalid_request', 'brain and role selections are required');
     if (!['permanent', 'temporary'].includes(input.lifetime))
       throw new FleetError('invalid_request', 'unsupported lifetime');
-    bounded(input.model ?? undefined, 'model', 128);
-    bounded(input.reasoningEffort ?? undefined, 'reasoning effort', 16);
-    if (input.reasoningEffort != null && !['low', 'medium', 'high', 'xhigh', 'max', 'ultra'].includes(input.reasoningEffort))
-      throw new FleetError('invalid_request', 'unsupported reasoning effort');
-    bounded(input.mission, 'mission', 4_096);
     bounded(input.coordinator, 'coordinator', 128);
-    bounded(input.bio, 'bio', 8_192);
-    bounded(input.persona, 'persona', 16_384);
     resolvePermissions(undefined, input.permissions);
     if (input.monitor) {
       const problems = validateMonitorConfig(input.monitor);
@@ -493,10 +448,8 @@ export class RoleCreationService {
         throw new FleetError('invalid_request', 'web creation supports monitor.inject=notification only');
     }
     return {
-      ...input, model: input.model === null ? null : input.model?.trim() || undefined,
-      reasoningEffort: input.reasoningEffort === null ? null : input.reasoningEffort?.trim() || undefined,
-      mission: input.mission?.trim() || undefined, coordinator: input.coordinator?.trim() || undefined,
-      bio: input.bio?.trim() || undefined, persona: input.persona?.trim() || undefined,
+      ...input, brain: structuredClone(input.brain), role: structuredClone(input.role),
+      coordinator: input.coordinator?.trim() || undefined,
       monitor: input.monitor ? structuredClone(input.monitor) : undefined,
     };
   }
@@ -521,12 +474,10 @@ export class RoleCreationService {
   private spawnOptions(request: CreateRoleSessionRequest, creationActionId?: string): SpawnOpts {
     return {
       name: request.name, temp: request.lifetime === 'temporary',
-      identity: request.name, harness: request.harness,
-      model: request.model, session: request.session, cwd: request.cwd,
-      reasoningEffort: request.reasoningEffort,
-      mission: request.mission, coordinator: request.coordinator,
+      identity: request.name, brain: request.brain, role: request.role, cwd: request.cwd,
+      coordinator: request.coordinator,
       approval: request.permissions.approval, filesystem: request.permissions.filesystem,
-      unattended: request.permissions.unattended, bio: request.bio, persona: request.persona,
+      unattended: request.permissions.unattended,
       monitorConfig: request.monitor,
       configPath: this.options.configPath,
       surface: creationActionId ? 'web' : undefined, creationActionId,

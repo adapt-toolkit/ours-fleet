@@ -5,7 +5,7 @@ import { classifyActivity } from '../session/activity.js';
 import { controlRequest } from '../session/control.js';
 import { SessionControlError, type SessionSnapshot } from '../session/types.js';
 import { readExitRecord, readRestartLedger } from '../runner.js';
-import { Tmux } from '../tmux.js';
+import { readDaemonRecoveryStatus } from '../daemon-recovery.js';
 import { roleCapabilities, type CapabilityContext } from './capabilities.js';
 import { FleetError } from './errors.js';
 import { RoleRepository } from './role-repository.js';
@@ -59,9 +59,10 @@ function sessionOverall(
 ): RoleStatus['overall'] {
   if (restart.circuit === 'open' || monitor.health === 'failed' || monitor.health === 'degraded'
       || isolation.degraded
-      || problems.some(problem => problem.severity === 'error' || problem.source === 'watchdog')
+      || problems.some(problem => problem.severity === 'error'
+        || problem.source === 'watchdog' || problem.source === 'daemon-recovery')
       || session.readiness === 'failed') return 'attention';
-  // A reachable ACP/tmux session is the user's live interaction surface. Its
+  // A reachable agent session is the user's live interaction surface. Its
   // evidence remains authoritative even when a service manager no longer owns
   // the process (for example, a detached ACP session with an inactive unit).
   if (session.reachability === 'online'
@@ -80,7 +81,6 @@ function sessionOverall(
 export interface FleetQueryOptions {
   repository: RoleRepository;
   supervisor: SupervisorBackend;
-  tmux?: Tmux;
   control?: typeof controlRequest;
   capabilityContext?: CapabilityContext;
   /**
@@ -93,15 +93,14 @@ export interface FleetQueryOptions {
 }
 
 export class FleetQueryService {
-  private readonly tmux: Tmux;
   private readonly control: typeof controlRequest;
   constructor(private readonly options: FleetQueryOptions) {
-    this.tmux = options.tmux ?? new Tmux();
     this.control = options.control ?? controlRequest;
   }
 
   async list(): Promise<Array<{ role: RoleRecord; status: RoleStatus; capabilities: RoleCapabilities }>> {
-    const roles = await this.options.repository.list();
+    const roles = (await this.options.repository.list())
+      .filter(role => role.configured && role.lifetime === 'permanent');
     return Promise.all(roles.map(async role => {
       const status = await this.status(role);
       return { role, status, capabilities: roleCapabilities(role, status, this.options.capabilityContext) };
@@ -131,6 +130,16 @@ export class FleetQueryService {
     const lastExit = dir ? readExitRecord(join(dir, '.exit-status')) ?? undefined : undefined;
     const session = await this.session(role, dir, live.state);
     const problems = [...role.problems];
+    const recovery = dir ? readDaemonRecoveryStatus(dir) : undefined;
+    if (recovery && recovery.state !== 'recovered') {
+      const paths = (['agent', 'owner'] as const)
+        .filter(name => recovery.paths[name].state !== 'recovered')
+        .map(name => `${name}:${recovery.paths[name].state}`);
+      problems.push({
+        code: 'daemon_recovery', severity: 'warning', source: 'daemon-recovery',
+        detail: `${recovery.state}; ${paths.join(', ') || 'no degraded path'}; epoch ${recovery.epoch || 'unavailable'}`,
+      });
+    }
     if (live.state === 'running' && session.reachability !== 'online')
       problems.push({
         code: 'supervisor_session_disagreement', severity: 'warning',
@@ -172,15 +181,18 @@ export class FleetQueryService {
     role: RoleRecord, dir: string | undefined, supervisor: 'running' | 'stopped' | 'unknown',
   ): Promise<RoleStatus['session']> {
     const intended = role.configuredBackend;
-    if (intended === 'acp' && dir) {
+    if (intended && dir) {
       try {
         const response = await this.control(dir, { command: 'snapshot' }, 2_000);
         if (!response.ok) throw new SessionControlError(response.kind ?? 'backend', response.error ?? 'snapshot failed');
         const snapshot = response.result as SessionSnapshot & {
           protocolVersion?: number; features?: string[];
         };
+        if (snapshot.backend !== intended)
+          throw new SessionControlError('backend',
+            `live session reports backend '${String(snapshot.backend)}', expected '${intended}'`);
         return {
-          backend: 'acp', reachability: snapshot.alive ? 'online' : 'offline',
+          backend: intended, reachability: snapshot.alive ? 'online' : 'offline',
           readiness: snapshot.readiness, evidence: 'authoritative',
           sessionId: snapshot.sessionId, lastError: snapshot.lastError,
           pendingPermissionId: snapshot.pendingPermissionId,
@@ -193,30 +205,11 @@ export class FleetQueryService {
         const failure = error instanceof SessionControlError ? error.kind : 'backend';
         const offline = failure === 'offline';
         return {
-          backend: 'acp',
+          backend: intended,
           reachability: offline ? 'offline'
             : failure === 'control-unavailable' ? 'unavailable' : 'unknown',
           readiness: offline ? 'failed' : 'unknown',
           evidence: 'authoritative', lastError: clean((error as Error).message),
-          activity: { state: 'unobservable' },
-        };
-      }
-    }
-    if (intended === 'tmux' || role.detectedBackend === 'tmux') {
-      try {
-        const has = await this.tmux.has(role.id);
-        return {
-          backend: 'tmux', reachability: has ? 'online' : supervisor === 'stopped' ? 'offline' : 'unknown',
-          readiness: has ? 'idle' : supervisor === 'running' ? 'starting' : 'failed',
-          evidence: 'inferred',
-          // tmux exposes no agent-side evidence at all, and `readiness: idle`
-          // here is a pane-liveness inference, not an activity claim.
-          activity: { state: 'unobservable' },
-        };
-      } catch (error) {
-        return {
-          backend: 'tmux', reachability: 'unknown', readiness: 'unknown',
-          evidence: 'inferred', lastError: clean((error as Error).message),
           activity: { state: 'unobservable' },
         };
       }

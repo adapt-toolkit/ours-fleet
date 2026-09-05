@@ -8,8 +8,8 @@ harnesses — from one declarative file.**
 An AI coding agent in a terminal dies when you close the laptop. `ours-fleet`
 turns such sessions into **roles**: long-lived agents that
 
-- **run through a selectable session backend** — existing detached tmux consoles
-  or structured ACP sessions — which you can attach to, peek at, or prompt,
+- **run through structured managed sessions** behind one provider-neutral
+  agent-session interface, which you can inspect or prompt,
 - are **supervised** — systemd (Linux) or launchd (macOS) restarts them on crash
   and brings them back after a reboot,
 - **resume their context** across restarts (when the harness supports it),
@@ -19,10 +19,10 @@ turns such sessions into **roles**: long-lived agents that
 - can **spawn subagents** (permanent or temporary) and **oversee** them: peek into
   a ward's console, answer a stuck prompt, nudge it back to work.
 
-The whole fleet is described in one hand-written `~/fleet.yaml`
-("docker-compose for agents"): who exists, what harness they run in, their mission,
-persona, bio, working directory, and who oversees whom. `ours-fleet up` makes
-reality match the file.
+The fleet uses a v2 manifest plus typed documents: `~/fleet.yaml` holds
+fleet-wide operational policy and automation, while `~/fleet/agents`,
+`~/fleet/roles`, and `~/fleet/brains` hold bare Agent, Role, and Brain documents.
+`ours-fleet up` makes reality match that trusted split source set.
 
 **Harness-agnostic by design.** The core never assumes a specific agent CLI; each
 harness is a small adapter (how to launch, how to resume, how to wire config).
@@ -31,21 +31,22 @@ public — each additional harness (Gemini CLI, OpenCode, …) is a small adapte
 A single fleet can mix harnesses per role:
 
 ```yaml
-roles:
-  Reviewer:                 # runs in Claude Code
-    harness: claude-code
-  Prototyper:                # runs in Codex CLI
-    harness: codex
+# ~/fleet/agents/Reviewer.yaml
+role: { ref: reviewer }
+brain: { inline: { harness: claude-code, session: acp } }
+
+# ~/fleet/agents/Prototyper.yaml
+role: { inline: { mission: Build prototypes } }
+brain: { inline: { harness: codex, session: codex-app-server } }
 ```
 
 ## How it works
 
 ```
-~/fleet.yaml + ~/fleet.d/*.yaml           your declaration
+~/fleet.yaml + ~/fleet/{agents,agent_templates,roles,brains,room_templates}/*.yaml   your declaration
         │  ours-fleet up
         ▼
-briefing.md per role  ──►  tmux session  ──►  harness CLI (claude …)
-                       └─►  ACP client   ──►  ACP agent (codex-acp …)
+briefing.md per role  ──►  agent session adapter  ──►  native app-server or ACP transport
         ▲                        │
  systemd --user / launchd ───────┘   restart on crash, start at boot/login
 ```
@@ -71,15 +72,13 @@ The state dir contract:
 | `.owner-channel-message-recovery.json` | owner-channel bridge | mode-0600 body-free message claim journal: wire ID, history sequence, and claim time only |
 | `.owner-channel-attachment-recovery.json` | owner-channel bridge | mode-0600 attachment route journal; never filenames, paths, transcript text, or bytes |
 | `.owner-channel-binder.lock/`, `.owner-channel-binder.json` | owner-channel supervisor | mode-0600 role/identity + PID/start-marker ownership and release metadata; never mail plaintext or credentials |
-| `.session-events.jsonl`, `.control.sock`, `.control-token` | ACP backend | bounded typed console projection and private attachment control |
+| `.session-events.jsonl`, `.control.sock`, `.control-token` | managed session backend | bounded typed console projection and private attachment control |
 
 ## Prerequisites
 
 | What | Why | Install |
 |---|---|---|
-| Node ≥ 20 | runs `ours-fleet` itself | nodejs.org, `apt`, or `brew` |
-| tmux | roles using `session: tmux` (the default) | `apt install tmux` / `brew install tmux` |
-| Node ≥ 22 | Claude roles using `session: acp` | required by the maintained Claude ACP adapter |
+| Node ≥ 22 | runs `ours-fleet` and its maintained adapters | nodejs.org, `apt`, or `brew` |
 | a harness CLI, logged in | the agent itself | e.g. Claude Code (`claude`) or Codex CLI (`codex`) |
 | `ours` CLI + shared daemon | identity + agent-to-agent messaging | `npm i -g @ours.network/cli && ours daemon start` |
 
@@ -91,15 +90,16 @@ equivalent); logs land in `~/.ours-fleet/logs/`.
 
 ```sh
 npm i -g @ours.network/fleet
-ours-fleet init      # units/dirs/linger for this user
+ours-fleet init      # interactive reviewed defaults + host setup
 ours-fleet doctor    # verifies everything above, with actionable messages
 ```
 
-The maintained Codex and Claude ACP adapters install as optional dependencies of
-`ours-fleet` and are resolved internally; users do not install adapter commands
-or add them to `PATH`. An explicit `session_options.acp.command` remains
-available for custom adapters. On Node 20–21, tmux and Codex ACP remain
-available, while maintained Claude ACP requires upgrading to Node 22.
+Native Codex roles use the logged-in Codex CLI's `app-server` command directly.
+The maintained Codex and Claude ACP adapters remain bundled optional dependencies
+and are resolved internally; users do not install adapter commands or add them to
+`PATH`. Explicit `session_options.codex_app_server.command` and
+`session_options.acp.command` overrides remain available. ours-fleet and its
+maintained adapters require Node 22 or newer.
 
 Each OS user manages their own fleet — to host roles under a sandboxed account,
 become that account and repeat.
@@ -107,8 +107,9 @@ become that account and repeat.
 ## Quickstart
 
 ```sh
-cp "$(npm root -g)/@ours.network/fleet/examples/fleet.yaml" ~/fleet.yaml
-$EDITOR ~/fleet.yaml          # name your roles, missions, personas
+ours-fleet init               # interactive; adds missing defaults and preserves existing files
+ours-fleet config             # validates Agents, Roles, Brains, and Room templates
+$EDITOR ~/fleet/agents/*.yaml # compose Role + Brain and operational settings
 ours-fleet up                 # boot the fleet (staggered)
 ours-fleet ls                 # running consoles
 ours-fleet attach Alice       # watch one live (Ctrl-b d to leave)
@@ -125,22 +126,19 @@ ours-fleet spawn Worker --mission "own the worker repo" \
 ours-fleet spawn --temp Scout --mission "one-off research"   # gone on exit/reboot
 
 # Codex role: ours-codex is preferred automatically; plain codex is the fallback
-ours-fleet spawn Coder --harness codex --model gpt-5.4 \
-  --session acp --approval ask --filesystem workspace \
-  --profile fleet --search --monitor --coordinator FleetCoordinator
-# Note: --monitor is legacy consent for Codex's native monitor. Choose the
-# wake owner separately in fleet.yaml with monitor.mode: fleet|native.
+ours-fleet spawn Coder --brain codex-fleet --role developer \
+  --approval ask --filesystem workspace --coordinator FleetCoordinator
 ```
 
-Inside a managed ACP role, `ours-fleet spawn` is transparently routed through
-that role's live supervisor. `ours-fleet spawn --role DeveloperX --temp` is the
-minimal form: omitted harness, session, cwd, coordinator, neutral permissions,
-fleet monitor policy, and same-harness model inherit from the caller. Explicit
-flags win; changing harness without a model lets the selected harness/fleet
-defaults choose one. After creation succeeds, fleet can deterministically notify
+Inside a managed role, `ours-fleet spawn` is transparently routed through
+that role's live supervisor. `ours-fleet spawn DeveloperX --temp` is the
+minimal form: omitted Brain/Role selections, cwd, coordinator, neutral permissions,
+and fleet monitor policy inherit from the caller. Identity, environment, owner routing,
+room startup, and sensitive inline Brain values do not. Explicit flags win. After
+creation succeeds, fleet can deterministically notify
 the caller's owner channel with the caller and spawned-role details. This is an
-honest-actor convenience and attribution path, not a security boundary; tmux,
-host shells, and deliberately bypassed absolute binaries retain direct behavior.
+honest-actor convenience and attribution path, not a security boundary; host
+shells and deliberately bypassed absolute binaries retain direct behavior.
 
 ## Local web console
 
@@ -209,8 +207,8 @@ offline shell and no stale fleet state.
 
 The console provides evidence-separated inventory and status, ACP activity and
 permission controls, redacted logs, typed text send, confirmed lifecycle
-actions, transactional permanent/temporary creation, and a shared tmux browser
-terminal. Identity is fixed to the role name. Creation uses the authenticated
+actions, and transactional permanent/temporary creation. Identity is fixed to
+the role name. Creation uses the authenticated
 daemon inventory and reports verified, missing, or unknown evidence. A missing
 permanent role identity is created deterministically before launch with local
 discovery and auto-accept enabled, then the provisioning lease is released so
@@ -243,41 +241,30 @@ never force-adopts or deletes identity state. Permanent roles are
 provisioned by fleet before launch and never delegate normal identity creation
 to the harness.
 
-`node-pty` is optional: if its native module cannot load, ACP and all
-non-terminal features remain available and tmux Terminal is disabled with a
-diagnostic.
+The web console uses structured ACP activity rather than exposing a raw agent terminal.
 
 Security boundaries:
 
 - configured `Host` and `Origin`, CSRF, one-time WebSocket tickets, and explicit
   bind/origin policy are enforced server-side;
 - cwd values must resolve beneath configured local roots;
-- terminal bytes are intentionally unredacted and are never copied into audit
-  records; normal logs are bounded and redacted;
-- tests use temporary fleet homes, fake supervisors/identity providers, and
-  isolated tmux sockets—never active role state.
+- normal logs are bounded and redacted;
+- tests use temporary fleet homes and fake supervisors/identity providers—never
+  active role state.
 
-Permanent spawns are written to `~/fleet.d/<Name>.yaml`; the CLI never edits your
-hand-written `~/fleet.yaml`. `ours-fleet rm <Name>` unspawns.
+Permanent spawns write a bare Agent document to
+`~/fleet/agents/<Name>.yaml`; generated-source ownership is recorded so removal
+never deletes an unproven hand-written neighbor. `ours-fleet rm <Name>` unspawns.
 
-The web console is the one writer that can touch the base file, and it saves the
-file as a whole document: its setup wizard and configuration editor may create,
-change or remove any top-level block, including `vars:`, `defaults:`, `roles:`,
-`watchdogs:` and `loops:`. (`defaults:`, `watchdogs:` and `loops:` can only live
-in the base file — a `~/fleet.d/*.yaml` drop-in may declare `roles:` and nothing
-else.) Top-level keys the console does not recognise are round-tripped untouched.
-
-Console edits are applied as surgical splices against the file's exact bytes, so
-an unchanged save is a byte-for-byte no-op and lines outside the edit keep their
-comments, spacing and quoting. One bounded exception: changing the *length* of a
-block sequence — adding or removing an entry under `watch:`, `oversee:`, `roles:`
-or `wake_sources:` — rewrites that one collection as a whole, which drops inline
-comments written on its individual items. The loss is confined to the collection
-you edited, is shown in the diff before anything is written, and can be declined
-by not saving. Each write is revision-guarded, reviewed as a diff of the real
-file, validated with the real loader, and preceded by a timestamped backup.
-Values under `env:` — and the `vars:` entries they interpolate — are masked in
-the diff and never leave the host.
+The web editor reads and writes the split document model explicitly as
+`{manifest, agents}`. Role and Brain presets are visible through Agent refs but
+remain read-only. Saves use one aggregate revision over the manifest and all
+Agent/Role/Brain sources, validate an exact-stem private staging tree, show a
+deterministic redacted diff per document, and hold one manifest-root lock.
+Changed/deleted files are backed up together; any partial failure restores every
+document or reports the private recovery directory. An unchanged save is a
+byte-for-byte no-op and creates no backup. Nested environment, authentication,
+invite, and isolation secrets never leave the host.
 
 From inside Claude Code, Codex, or Hermes with the core `ours` plugin installed,
 say **"spawn an ours agent …"**. The core skill checks for `ours-fleet`, installs
@@ -292,20 +279,19 @@ them and unsticks them:
 
 ```sh
 ours-fleet peek Worker          # what is it doing?
-ours-fleet send Worker --key 1  # answer the menu it's stuck on
 ours-fleet send Worker "continue with the tests, then report"
 ```
 
-Declare standing assignments in `fleet.yaml` (rendered into the overseer's
+Declare standing assignments in the overseer's bare Agent document (rendered into its
 briefing) — or just write "keep an eye on Alice and Bob every 5 minutes" in a
 persona; the bundled `oversee-agents` skill defines what that means operationally:
 
 ```yaml
-roles:
-  FleetCoordinator:
-    oversee:
-      - { role: Alice, interval: 5m }
-      - { role: Bob,   interval: 5m }
+role: { ref: coordinator }
+brain: { ref: claude-default }
+oversee:
+  - { agent: Alice, interval: 5m }
+  - { agent: Bob,   interval: 5m }
 ```
 
 ## Command reference
@@ -315,8 +301,8 @@ ours-fleet docs | man                 AI-friendly complete reference
 ours-fleet up|down|restart|force-restart [-c FILE] [Name...]
 ours-fleet config [-c FILE]         validate + print merged plan
 ours-fleet ls | attach | peek | logs [-f] | status <Name>
-ours-fleet send <Name> "text" | --key <K>
-ours-fleet spawn [--temp] [<Name> | --role <Name>] [--harness --session --mission --model --approval ...]
+ours-fleet send <Name> "text"
+ours-fleet spawn [--temp] [<Name> | --name <Name>] --brain <ID|inline:{...}> --role <ID|inline:{...}> [--approval ...]
 ours-fleet loops validate|list|status
 ours-fleet loops reload <Role>
 ours-fleet loops run-now|disable|enable <Role> <Loop>
@@ -348,33 +334,104 @@ in its state dir) across supervisor-triggered restarts — systemd/launchd re-in
 agent process with no arguments, so without this the role would silently fall back to
 the default `~/fleet.yaml` on its very first crash-restart and fail to resolve.
 
-## fleet.yaml reference
+## split configuration field reference
 
-```yaml
+The following is a schematic field inventory, not a single YAML document. Host
+settings belong in `~/fleet.yaml`; reusable behavior and harness settings belong
+in `~/fleet/roles/<id>.yaml` and `~/fleet/brains/<id>.yaml`; operational fields
+belong in `~/fleet/agents/<id>.yaml`.
+
+```text
 vars: { work_root: /home/me/work }      # ${var} substitution anywhere below
+api_version: ours.network/fleet/v2
 start_stagger_ms: 0                     # delay between agent LAUNCHES (host-wide, ms); 0 = no stagger
 defaults:
-  harness: claude-code                  # for roles that don't set one
-  session: tmux                         # tmux (default) | acp
   permissions:                         # common intent, translated by each harness/backend
     approval: ask                       # ask | auto | allow (`deny` is a deprecated alias)
     filesystem: workspace               # read-only | workspace | unrestricted
     unattended: deny                    # deny | wait
-  model: claude-fable-5                 # default model for roles that don't set one (per-role model / --model wins)
-  max_tokens: 500000                    # session cap (harness-interpreted)
   monitor:
     mode: fleet                         # fleet (default) | native
   worklog:                              # built-ins shown; set false to opt out
     max_kb: 1024                        # rotate only above this active-log size
     keep_tail_kb: 256                   # UTF-8 tail; line-aligned when one fits
     max_archives: 12                    # recent beside log; older preserved cold
-roles:
-  Name:                                 # [A-Za-z0-9_-]+
-    harness: claude-code
-    session: acp                         # one flag selects ACP; omit for tmux
-    session_options:
-      acp:
-        command: claude-agent-acp        # optional advanced override
+```
+
+Agent Template document (\`~/fleet/agent_templates/Worker.yaml\`) is inert and reusable:
+
+```yaml
+role: { ref: developer }
+brain: { ref: claude-default }
+permissions: { approval: ask, filesystem: workspace, unattended: deny }
+monitor: { mode: fleet, interrupt: after_tool }
+loops:                                   # optional; temporary launches only
+  progress:
+    interval: 10m                        # required; 1m..30d
+    initial_delay: 10m                   # default: interval; 0s..30d
+    jitter: 30s                          # default: 0s; < interval and <=1h
+    enabled: true                        # default true
+    prompt: Continue the assigned work and report only material progress.
+```
+
+Agent Template-local `loops` are limited to 64 entries, implicitly scoped to the temporary agent, and
+reuse Fleet's scheduled-turn semantics: a busy occurrence is skipped, ordinary
+missed occurrences are not backlogged or replayed, and restart recovery may
+preserve at most one recent late occurrence. The trusted authoring file and
+private sealed role snapshot retain exact prompt text; resolved launch, task,
+room, provenance, and audit presentation surfaces show only bytes and SHA-256.
+
+Every packaged `Developer`, `Critic`, and `LocalCoordinator` Agent Template uses
+`monitor.mode: fleet` with `monitor.interrupt: after_tool`. Consequently every
+member of the standard `single`, `pair`, and `team` Room Templates resolves to
+that policy. A custom Agent Template or explicit per-member override remains
+authoritative and is merged key by key without rewriting unrelated values.
+
+Direct temporary spawn can set the same whole block from an owner-only regular
+file containing exactly a top-level `loops:` mapping, or explicitly disable it:
+
+```sh
+ours-fleet spawn --temp Scout --role 'inline:{mission: inspect}' --brain 'inline:{harness: codex}' --loops-file ./scout-loops.yaml
+ours-fleet spawn --temp Scout --role 'inline:{mission: inspect}' --brain 'inline:{harness: codex}' --no-loops
+ours-fleet task start TASK --member developer --loops-file ./developer-loops.yaml
+ours-fleet task start TASK --member critic --no-loops
+```
+
+`--loops-file` and `--no-loops` are mutually exclusive and temporary-only.
+For room members they override the selected Agent Template as a whole; the
+Agent Template overrides legacy omission. Omission preserves the historical
+no-loop temporary behavior and never inherits manifest `roles: ["*"]` loops.
+The file must be owned by the current user, mode 0600, non-symlink, no larger
+than 1 MB, and contain a non-empty map. Validation completes before identity,
+Cowork, snapshot, or supervisor side effects. Recovery and replacement reuse
+the private sealed normalized definition even if mutable templates later change.
+
+Persistent Agent instance (\`~/fleet/agents/Name.yaml\`) either remains a canonical
+Role/Brain composition or explicitly reuses a template:
+
+```yaml
+template: Worker
+overrides:
+  cwd: /work/name
+  permissions: { approval: allow }
+```
+
+Templates never create identities, supervisors, sessions, or lifecycle/status rows.
+Map overrides merge recursively; scalars and arrays replace; null deletion is rejected.
+
+Canonical Agent document (\`~/fleet/agents/Name.yaml\`):
+
+```yaml
+role: { ref: RoleID }
+brain: { ref: BrainID }                  # Brain owns harness/model/session/reasoning
+identity: "Display Name"                # ours identity to bind (default: Name)
+cwd: ${work_root}/repo                   # where the harness process runs
+coordinator: FleetCoordinator            # announce target on boot
+```
+
+Additional operational field inventory (schematic, not one YAML document):
+
+```text
     identity: "Display Name"            # ours identity to bind (default: Name)
     cwd: ${work_root}/repo              # where the harness process runs
     coordinator: FleetCoordinator       # announce target on boot
@@ -386,13 +443,13 @@ roles:
         - file_received                 #   local_contact_request, pending_message)
       batch_ms: 2000                    # coalesce a burst into one line (default 2000)
       inject: notification              # notification (default) | full (bodies inline; roadmap)
-    owner_channel:                      # optional trusted owner ingress; requires session: acp
+    owner_channel:                      # optional trusted owner ingress; requires a managed session
       identity: "Name Owner Channel"     # dedicated identity; fleet creates it with safe local defaults
       owners: [owner-contact-cid]        # authenticated ours contact IDs, never display names
       agent: managed-agent-cid           # exact role CID allowed to relay messages/files outward
       interrupt: false                  # false queues; true cancels current work first
       progress_interval_ms: 30000        # fleet-generated progress notices; 0 disables
-      comments: true                    # relay live "🟡 Live update:" ACP commentary (default true);
+      comments: true                    # relay live "🟡 Live update:" structured commentary (default true);
                                         #   restart baseline for /comments on|off
       attachments:                      # secure inbound documents, images, and voice
         enabled: true
@@ -406,19 +463,16 @@ roles:
     bio: |                              # public card (published as bio)
     briefing_file: curated.md           # replaces the generated narrative
     env: { KEY: value }                 # extra session env
-    oversee: [{ role: X, interval: 5m }]
+    oversee: [{ agent: X, interval: 5m }]
     harness_options:                    # adapter-owned, adapter-validated
       plugins: { "name@marketplace": false }   # claude-code: plugin overrides
       # mem_palace: false                      # claude-code: disable memory plugin
       # permission_mode: dontAsk               # claude-code: launch permission mode —
       #   one of default | acceptEdits | plan | dontAsk | bypassPermissions
-      # sandbox: workspace-write                # codex: --sandbox —
-      #   one of read-only | workspace-write | danger-full-access
-      # approval: never                         # codex: --ask-for-approval —
-      #   one of untrusted | on-request | never
-      # permission_mode: never                  # codex alias for approval
+      # Codex ACP compatibility only: native codex-app-server rejects Codex
+      # permission overrides here; use the common permissions block above.
       # launcher: auto                          # codex: auto | ours-codex | codex
-      # profile: fleet                          # codex: $CODEX_HOME/fleet.config.toml
+      # profile: fleet                          # codex ACP only: $CODEX_HOME/fleet.config.toml
       # search: true                            # codex: enable --search (live web search)
       # add_dirs: [/data/shared]                # codex: repeat --add-dir
       # monitor: true                           # explicit persistent consent to arm mail wake
@@ -444,21 +498,85 @@ loops:                                    # trusted local scheduled ACP turns
       If nothing material changed, complete silently without an owner report.
 ```
 
-Merge order: `fleet.yaml` ← `fleet.d/*.yaml`; a duplicate role name is a hard
-error naming both files. Identities and roles are decoupled — removing a role
-never deletes an identity. `session` is independent of `harness`, so changing a
-role from tmux to ACP does not change its identity, mission, monitor, or permission
-contract. `defaults.harness_options` is shallow-merged with each
-role's `harness_options`, so a fleet can set common Codex permission/profile defaults
-and override individual keys per role. `monitor` merges the same way — a role block
-overrides `defaults.monitor` key-by-key.
+The v2 loader reads the manifest, then sorted bare Role, Brain, and Agent
+documents from its exact stem directory. Duplicate filename-derived IDs are a
+hard error. Identities and Agents are decoupled—removing an Agent never deletes
+an identity. Role, Brain, and operational ownership are composed explicitly;
+there is no generic cross-kind merge. Manifest operational defaults such as
+`monitor` and `permissions` merge only within their owning Agent fields.
 
 Every supervised role is a client of the operator-configured ours daemon. Fleet strips the
-obsolete, presence-sensitive `OURS_AUTOSTART` variable from both tmux and ACP harness
+obsolete, presence-sensitive `OURS_AUTOSTART` variable from ACP harness
 processes. `ours-mcp proxy` is client-only and never starts a daemon; operators and explicit
 installer/setup flows remain responsible for starting it.
 
 ### Rooms and tasks
+
+Init installs editable `single`, `pair`, and `team` definitions under
+`~/fleet/room_templates/`, plus every exact-cased Agent, Role, and Brain they
+reference. Inspect them with `ours-fleet template list` and
+`ours-fleet template show team`. After configuring the authenticated owner below:
+
+```sh
+ours-fleet task create --title "Solo task" --template single
+ours-fleet task create --title "Reviewed change" --template pair
+ours-fleet task create --title "Phased delivery" --template team
+```
+
+The default `team` gives only its LocalCoordinator Agent Template a 15-minute
+continuity loop. Each idle-only pass uses authenticated assigned-room evidence,
+posts at most one missing interval update or status request, and reports `STALLED`
+only after concrete stopped/blocked evidence or the role's documented request/ETA
+window. Stable history/checkpoint fingerprints suppress duplicates; `single` and
+`pair` remain loop-free. This preset does not widen permissions: task planning and
+launch still fail closed when the selected harness cannot supply the configured
+unattended messaging and checkpoint capabilities.
+
+`ours-fleet init -c /path/custom.yaml` reviews the literal resolved manifest and
+`/path/custom/` split directory before doing anything. It requires a TTY and two
+default-No confirmations. You select Codex, Claude, or both; then either one explicit
+model for every job or explicit development/review/coordination models; then one
+Quick/Balanced/Thorough reasoning level (`low`/`medium`/`high`). Catalog entries are
+supported IDs, not recommendations or entitlement claims: use `ours-fleet doctor` for
+local Codex availability, while Claude entitlement is validated at launch. No
+`model_chain` is generated and Fleet never silently substitutes another model.
+
+A successful rerun adds any missing packaged defaults while preserving every existing
+manifest, Role, Agent Template, and Room Template byte. Explicit adoption of newer defaults
+is a separate reviewable migration. At either confirmation,
+N, Enter, Escape, Ctrl-C, Ctrl-D, or EOF cancels. In a picker, Escape, Ctrl-C, Ctrl-D,
+or EOF cancels; Enter records the highlighted choice (or continues a non-empty multi-select),
+N is ignored, and an empty subscription selection remains blocked. Every cancellation
+before the final Yes performs no host setup or config publication. Non-TTY use stops with
+the same zero-mutation guarantee. After the final Yes, host integration runs before locked
+publication; a hard kill, power loss, or host crash can therefore leave host integration
+or private stage/recovery evidence to inspect.
+Existing targets and their tree must be owner-private regular files/directories on the
+configuration parent's filesystem; symlinks, foreign ownership, unsafe modes, and a
+non-owner-controlled parent fail closed before host setup and are rechecked under the
+per-setup init lock before publication.
+
+The generated task experiences are fixed consequences, not extra questions: `single`
+uses `Developer`; `pair` uses `Developer` with an independent `Critic`; and `team` uses
+task-local `LocalCoordinator`, `Developer`, and `Critic`. The persistent
+`FleetCoordinator` uses the separate packaged `Coordinator` contract and coordination
+model.
+
+Exact known revision-3 through revision-5 role and Agent Template defaults have an
+explicit fail-closed adoption command: first run
+`ours-fleet migrate-role-defaults -c FILE` for a zero-write plan, review every removal,
+replacement, addition, preserved custom file, staging path, and recovery path, then rerun
+with `--write`. Only exact semantic matches for packaged-bootstrap and generated
+revision-3/4/5 forms are changed; same-named customized files remain byte-identical, and a
+dangling custom reference refuses publication. Rerunning the migration is a no-op.
+
+For manual adoption of a single newer packaged file, copy the reported source beside the
+target as `.new-default`, inspect `diff -u TARGET TARGET.new-default`, then replace the
+target yourself. Rerunning init is not an update. Users with the still older exact generated
+six-worker starter Agent set must first run `ours-fleet migrate-agent-templates -c FILE`
+for its zero-write plan, review every move/addition/recovery path, and rerun with `--write`.
+Customized or ambiguous known starters are refused without mutation; unrelated custom
+persistent Agents are preserved.
 
 Rooms always use `ours-cowork`; there is no room-provider selector. Configure
 the cowork daemon connection and the room owner directly:
@@ -485,8 +603,37 @@ Fleet launches each template member with a dedicated one-time Cowork invite.
 The generated temporary-agent briefing contains the exact identity name, invite,
 Cowork role, and task. The agent creates that identity itself with ours MCP
 `create_temporary_identity`, accepts the invite with `add_contact`, and starts
-work immediately. Fleet activates the room from Cowork's authenticated seat; there
-is no briefing hash, startup ACK, or separate role-briefing readiness gate.
+work immediately. A room is ready only after the Cowork room (and its task, when
+task-bound) is durably active, every configured member seat is authenticated and active with its matching
+live Fleet launch, and the configured Owner seat is active when owner attachment is
+enabled. There is no briefing hash, startup ACK, or separate role-briefing readiness
+gate.
+
+Normal Task provisioning emits exactly one authenticated Owner lifecycle notice after
+the ready predicate above is true; standalone Room provisioning likewise emits one
+ready notice. Intermediate task, saga, member-spawn, timeout, and recoverable-failure
+transitions stay in local state and logs. A terminal failed Task emits one actionable
+failure notice; the command result carries the exact blocker and canonical recovery
+action.
+
+`task start` and create-and-start wait for readiness. If their bounded wait expires,
+they return an explicit `in_progress` result and start a safe continuation. The detached
+continuation is serialized per Task and remains alive until convergence or an
+Owner-action blocker. Re-running `task start <id>` safely resumes the same durable
+provisioning operation after the blocker is corrected or a process restarts.
+
+Set `room.anonymous: true` on a room template, or pass `--anonymous` to
+`task create`, `task start`, `task work`, or `room create`, to create an
+anonymous Cowork room. `--no-anonymous` explicitly overrides an anonymous
+template. Fleet records the resolved value before room creation so retries keep
+the same choice. Temporary members of an anonymous room are instructed to call
+`create_temporary_identity` with `expose_local=false`. Their generated briefings
+do not disclose or compare an Owner participant CID. A participant-originated
+instruction has Owner authority only when the authenticated Cowork room envelope
+attributes that participant seat the exact `Owner` role. Literal text, display
+names, ordinary direct messages, and room-authored or rest-role messages with an
+Owner-looking label never grant that authority. Non-anonymous rooms remain pinned
+to the exact authenticated Owner CID.
 
 Human task and room results use the same compact Markdown presentation in the
 CLI and authenticated owner channel: a short heading, icon-plus-word status,
@@ -506,8 +653,9 @@ optional `rooms.owner.provider` setting is separate and defaults to
 ### Scheduled agent loops
 
 Top-level `loops` schedule literal prompts from trusted local YAML. Enabled targets
-must use `session: acp`; temporary roles never inherit loops, including `roles:
-["*"]`. Fleet rejects an enabled loop when its explicitly selected base config is
+must use a managed session (`acp` or `codex-app-server`); temporary roles never
+inherit these manifest loops, including `roles: ["*"]`. Only their sealed Agent
+Template/CLI-local `loops` apply. Fleet rejects an enabled loop when its explicitly selected base config is
 a symlink, is owned by another user, or is group/world writable. Prompts are
 bounded and normalized at validation time, but only their size and SHA-256 appear
 in `config`, `list`, logs, or durable state.
@@ -593,13 +741,13 @@ native settings actually grant, against a fixed floor:
 those requests with nobody to see it. With `unattended: wait` it **warns**,
 since a human can still attach a console and answer.
 
-**Security meaning.** `ask` maps to Codex `untrusted` / Claude `default`.
-`auto` selects Codex ACP `agent` (`on-request` + `workspace-write`) / Claude
-`acceptEdits`. `allow` selects Codex ACP's fully non-interactive yolo mode,
-reported by the adapter as `agent-full-access` (`never` +
-`danger-full-access`); Claude uses `bypassPermissions`. For Codex tmux, where the
-approval and sandbox flags remain independent, `auto` is `on-request` and
-`allow` is `never` while `filesystem` still chooses the sandbox.
+**Security meaning.** For native Codex, Fleet translates `ask` → `untrusted`,
+`auto` → `on-request`, and `allow` → `never`; users configure only the Fleet
+names. `permissions.filesystem` independently maps `read-only` → `read-only`,
+`workspace` → `workspace-write`, and `unrestricted` → `danger-full-access`.
+Claude maps `ask` to `default`, `auto` to `acceptEdits`, and `allow` to
+`bypassPermissions`. Codex ACP retains its adapter-specific coupled modes:
+`auto` selects `agent`, while `allow` selects `agent-full-access`.
 `dontAsk` suppresses only the *prompt*, not the denial, which is why an
 `allow` role previously ran unable to do its job. Legacy `deny` is accepted
 only for compatibility and retains its conservative Codex `on-request` /
@@ -689,8 +837,8 @@ their boots ~4 s apart instead of firing all seven at once.
 With `monitor.mode: fleet` (the default), the **ours-fleet supervisor** delivers
 a role's mail wakes: the per-role runner long-polls the ours daemon's notification API and
 submits a single `[fleet-monitor] N new messages from … — run get_messages` prompt
-through the selected backend. ACP uses live steering when its adapter supports it
-and falls back to structured `session/prompt`; tmux uses verified console input.
+through the shared agent session. ACP uses live steering when its adapter supports it
+and falls back to structured `session/prompt`.
 Set `monitor.interrupt: true` on roles where every configured wake should cancel
 the active turn before the notification is delivered. This is intentionally
 content-blind: the supervisor cannot inspect encrypted message bodies, so all
@@ -700,8 +848,7 @@ tool result or pending permission. Fleet waits for terminal ACP tool/update
 evidence, then steers the wake without calling `session.cancel`. If the tool is
 still active after 120 seconds, or the adapter cannot expose authenticated tool
 boundaries/steering, fleet visibly degrades to non-cancelling steering or queued
-delivery. Tmux never receives `C-c` for `after_tool`. Explicit human and control
-interrupts remain immediate.
+delivery. Explicit human and control interrupts remain immediate.
 The default is `false`: a role that must begin a post-readiness mission
 immediately, including second-and-later mail received while it is working, must
 set `monitor.mode: fleet` and `monitor.interrupt: true` explicitly. Readiness and
@@ -794,8 +941,8 @@ invites, message bodies, credentials, or keys. A corrupt overlay fails closed
 (no effective owners and no mutation), and the last effective owner cannot be
 revoked.
 
-These commands require a running ACP role with `owner_channel` enabled. Missing,
-stopped, tmux, disabled, draining, and unavailable-MCP targets fail without
+These commands require a running role with `owner_channel` enabled. Missing,
+stopped, disabled, draining, and unavailable-MCP targets fail without
 starting a second client, binding an identity, or opening a network listener.
 
 The managed agent can use its ordinary ours `send_message` or `send_file` tool to
@@ -910,6 +1057,15 @@ unchanged. The registry in `src/owner-channel/commands.ts` is the single source
 of truth — `/help` renders exactly that table, so adding an entry there is the
 whole registration step for a new command.
 
+The supervisor also advertises every primary registry entry through ours typed
+commands. The menu's `arguments` field is converted back to the exact text after
+the slash command name and enters the same dispatcher, so validation, replies,
+lifecycle effects, and audit behavior stay identical. Aliases remain available
+as slash commands but are not duplicated in the typed menu. Typed handlers
+re-check the authenticated sender CID against the live Owner boundary before
+dispatch; the SDK completion result is `null` because the existing correlated
+owner-channel reply remains the command result.
+
 | Command | Effect |
 | --- | --- |
 | `/help` (alias `/commands`) | list all deterministic owner-channel commands |
@@ -1015,11 +1171,8 @@ gets a durable pre-send marker: a failed/ambiguous send becomes `uncertain` and 
 not blindly retried, while files not yet attempted remain recoverable after restart.
 Logs contain counts and byte totals, never filenames or raw bytes.
 
-Owner channels currently require `session: acp`. Fleet needs structured,
-turn-correlated assistant output for automatic replies; scraping a tmux pane
-cannot reliably distinguish the final answer from thoughts, tool output, or
-unrelated concurrent work. The config rejects tmux instead of silently offering
-weaker semantics.
+Owner channels use the structured agent-session interface for turn-correlated
+assistant output and reliable automatic replies.
 
 ## Codex roles
 
@@ -1050,40 +1203,61 @@ the structured CLI watcher, because a detached process cannot wake a Codex turn.
 wait is re-entered after each handled message; `ours-codex` instead wakes the idle
 session through its App Server integration.
 
-The main Codex controls needed by fleet roles are available declaratively and when spawning:
+The main Codex controls are Brain-owned and also available when spawning:
 
 ```yaml
-defaults:
-  harness: codex
-  model: gpt-5.4
-  harness_options:
-    launcher: auto
-    profile: fleet                 # $CODEX_HOME/fleet.config.toml
-    sandbox: workspace-write
-    approval: on-request
-    monitor: true                  # consent for Codex's native monitor; not the wake-owner selector
-    search: true
-    add_dirs: [/data/shared]
-    config:
-      model_reasoning_effort: high
-
-roles:
-  Reviewer:
-    harness_options:
-      sandbox: read-only           # overrides just this default key
+# ~/fleet/brains/codex-review.yaml
+harness: codex
+session: codex-app-server
+model: gpt-5.4
+permissions:
+  approval: auto
+  filesystem: read-only
+  unattended: deny
+harness_options:
+  launcher: auto
+  monitor: true
+  search: true
+  add_dirs: [/data/shared]
+  config: { model_reasoning_effort: high }
 ```
 
-Equivalent one-off/permanent spawn controls include `--model`, `--permission-mode`,
-`--sandbox`, `--profile`, `--launcher`, `--search`, legacy `--monitor` (native
-Codex monitor consent), repeatable
-`--codex-config key=value`, and repeatable `--add-dir`. Use `env.OURS_PORT`/`env.OURS_CONFIG` for a
+`codex-app-server` is the opt-in direct Codex transport. It streams native items
+and message phases, maps Codex approval
+requests into Fleet permissions, supports turn steering/interrupt, and resumes
+the durable Codex thread through Fleet's shared `.session-id` lifecycle.
+Configure its authority only through the shared `permissions:` block;
+`on-request` and other Codex policy names are internal adapter values.
+Codex rejects `--profile` for `app-server`, so native roles also reject
+`harness_options.profile`; use the explicit config map only for non-authority
+settings. Native config currently allows only `model_reasoning_effort`; Codex ACP
+retains its legacy profile and config support.
+Packaged Codex brains and the init wizard continue to select `session: acp` for
+compatibility; Claude Code also uses ACP. Existing durable sessions are not assumed portable
+between unrelated providers; a failed fast resume is handled by Fleet's normal
+bounded fresh-session recovery.
+
+To replace the default launcher for a native Codex role:
+
+```yaml
+session_options:
+  codex_app_server:
+    command: [codex, app-server]
+```
+
+The command override is exact: Fleet does not append `--profile`, `--search`, or
+`app-server`, so include every required argument in the command itself.
+
+One-off/permanent spawn selects a Brain that owns model, reasoning, native permission,
+sandbox, profile, launcher, search, monitor consent, native config, and additional roots.
+Use `env.OURS_PORT`/`env.OURS_CONFIG` for a
 role-specific ours daemon, or configure the host default in `~/.ours/config.json`.
 
 ## Agent isolation
 
 Each role can be sandboxed at the environment level via an `isolation:` block —
 **fully additive: a role with no block behaves exactly as before.** The agent's
-tmux-pane process is wrapped in [bubblewrap](https://github.com/containers/bubblewrap)
+agent process is wrapped in [bubblewrap](https://github.com/containers/bubblewrap)
 (rootless, no setuid), resource-limited by `systemd-run --user --scope`.
 
 An empty `isolation: {}` gives a sensible default posture: filesystem-confined to

@@ -28,9 +28,20 @@ afterEach(() => {
 const wd = {
   name: 'nightwatch', coordinator: 'FleetCoordinator', enabled: true,
   intervalMs: 600_000, watch: ['Alice'], watchExplicit: false,
-  harness: 'claude-code', session: 'tmux' as const,
+  harness: 'claude-code', session: 'acp' as const,
   identity: 'Watchdog-nightwatch', timeoutMs: 300_000, keepReports: 50,
   alertCooldownMs: 3_600_000, sourceFile: 'f',
+  agentDefinition: {
+    brain: { inline: { harness: 'claude-code', session: 'acp' } }, role: { inline: {} },
+  },
+  resolvedAgent: {
+    name: 'WatchdogAgent', sourceFile: 'f', harness: 'claude-code', session: 'acp' as const,
+    identity: 'WatchdogAgent', permissions: {
+      approval: 'deny' as const, filesystem: 'unrestricted' as const, unattended: 'deny' as const,
+    }, permissionsDeclared: true, monitor: { mode: 'fleet' as const, interrupt: false,
+      batch_ms: 2000, inject: 'notification' as const,
+      wake_sources: ['message_received' as const] }, worklog: false,
+  },
 };
 
 const provisioner = { exists: async () => true as const };
@@ -103,6 +114,8 @@ describe('executeWatchdogRun', () => {
     });
     const isolated = {
       ...wd,
+      resolvedAgent: { ...wd.resolvedAgent,
+        isolation: { backend: 'bubblewrap', network: 'deny', fs: { read: ['/opt/tools'] } } },
       isolation: { backend: 'bubblewrap', network: 'deny', fs: { read: ['/opt/tools'] } },
     };
     await executeWatchdogRun(isolated as never, baseDeps(launch) as never);

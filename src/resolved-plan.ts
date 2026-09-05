@@ -1,12 +1,19 @@
 import type { FleetConfig, ResolvedRole } from './config.js';
 import { analyzeRolePermissions } from './permissions.js';
+import { dirname, relative } from 'node:path';
+import { createHash } from 'node:crypto';
+import { isSensitiveConfigKey } from './sensitive-config.js';
 
-export const RESOLVED_PLAN_SCHEMA_VERSION = 1;
+export const RESOLVED_PLAN_SCHEMA_VERSION = 2;
 
 const sortedObject = <T>(value: Record<string, T>): Record<string, T> =>
   Object.fromEntries(Object.entries(value).sort(([a], [b]) => a.localeCompare(b)));
-const redactSensitive = (value: unknown, key = ''): unknown => {
-  if (/(?:secret|token|password|authorization|api[_-]?key)/i.test(key)) return '<redacted>';
+export const redactSensitive = (value: unknown, key = ''): unknown => {
+  if (key === 'prompt' && typeof value === 'string') return {
+    bytes: Buffer.byteLength(value, 'utf8'),
+    sha256: createHash('sha256').update(value).digest('hex'),
+  };
+  if (isSensitiveConfigKey(key)) return '<redacted>';
   if (Array.isArray(value)) return value.map(item => redactSensitive(item));
   if (value && typeof value === 'object')
     return Object.fromEntries(Object.entries(value as Record<string, unknown>)
@@ -17,12 +24,20 @@ const redactSensitive = (value: unknown, key = ''): unknown => {
 
 /** Stable, secret-safe machine contract consumed by config JSON and spawn dry-run. */
 export function resolvedPlan(cfg: FleetConfig): Record<string, unknown> {
+  const manifestDir = dirname(cfg.files[0] ?? '.');
   return {
     schemaVersion: RESOLVED_PLAN_SCHEMA_VERSION,
+    configMode: cfg.configMode ?? 'split-v2',
     sourceFiles: [...cfg.files],
+    sourceDocuments: (cfg.sourceDocuments ?? []).map(document => ({
+      ...document, path: relative(manifestDir, document.path) || document.path,
+    })),
     startStaggerMs: cfg.startStaggerMs,
     diagnostics: cfg.diagnostics.map(diagnostic => ({ ...diagnostic })),
-    roles: cfg.roles.map(resolvedRolePlan),
+    agentTemplates: Object.fromEntries(Object.entries(cfg.agentTemplates ?? {})
+      .sort(([a], [b]) => a.localeCompare(b))
+      .map(([name, definition]) => [name, redactSensitive(definition)])),
+    roles: cfg.roles.map(role => resolvedRolePlan(role, manifestDir)),
     loops: cfg.loops.map(loop => sortedObject({
       name: loop.name, selectors: [...loop.selectors], roles: [...loop.roleNames],
       intervalMs: loop.intervalMs, initialDelayMs: loop.initialDelayMs, jitterMs: loop.jitterMs,
@@ -40,16 +55,27 @@ export function resolvedPlan(cfg: FleetConfig): Record<string, unknown> {
   };
 }
 
-export function resolvedRolePlan(role: ResolvedRole): Record<string, unknown> {
+export function resolvedRolePlan(role: ResolvedRole, manifestDir = dirname(role.sourceFile)): Record<string, unknown> {
   const analysis = analyzeRolePermissions(role);
+  const effectiveLoops = role.temporaryLoopSource ? (role.temporaryLoops ?? []) : (role.loops ?? []);
   return {
     name: role.name,
     sourceFile: role.sourceFile,
+    agentTemplate: role.agentTemplate ?? null,
+    references: Object.values(role.provenance ?? {}).flatMap(item => item.viaReference ? [item.viaReference] : [])
+      .filter((item, index, all) => all.findIndex(other => JSON.stringify(other) === JSON.stringify(item)) === index)
+      .sort((a, b) => a.kind.localeCompare(b.kind) || a.id.localeCompare(b.id)
+        || a.sourcePointer.localeCompare(b.sourcePointer)),
+    provenance: sortedObject(Object.fromEntries(Object.entries(role.provenance ?? {}).map(([field, item]) => [
+      field, { ...item, sourceFile: item.sourceKind === 'built-in'
+        ? item.sourceFile : relative(manifestDir, item.sourceFile) || item.sourceFile },
+    ]))),
     identity: role.identity,
     harness: role.harness,
     session: role.session,
     sessionOptions: role.session_options ?? null,
     model: role.model ?? null,
+    effort: role.effort ?? null,
     modelChain: role.model_chain ?? null,
     cwd: role.cwd ?? null,
     coordinator: role.coordinator ?? null,
@@ -71,7 +97,8 @@ export function resolvedRolePlan(role: ResolvedRole): Record<string, unknown> {
     },
     monitor: role.monitor,
     ownerChannel: role.owner_channel ?? null,
-    loops: (role.loops ?? []).map(loop => ({
+    temporaryLoopSource: role.temporaryLoopSource ?? null,
+    loops: effectiveLoops.map(loop => ({
       name: loop.name, enabled: loop.enabled, intervalMs: loop.intervalMs,
       initialDelayMs: loop.initialDelayMs, jitterMs: loop.jitterMs,
       definitionHash: loop.definitionHash, prompt: { bytes: loop.promptBytes, sha256: loop.promptHash },

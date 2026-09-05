@@ -1,0 +1,50 @@
+role: { ref: LocalCoordinator }
+brain: { ref: claude-default }
+coordinator: FleetCoordinator
+permissions: { approval: ask, filesystem: workspace, unattended: deny }
+monitor: { mode: fleet, interrupt: after_tool }
+loops:
+  continuity:
+    interval: 15m
+    prompt: |
+      Perform one bounded, observation-only continuity pass for the assigned task room. Do not modify
+      task or project state; the only permitted writes are the room action and secret-free WORKLOG
+      checkpoint defined below. Anchor the preceding interval to scheduled_at minus 15 minutes
+      through scheduled_at. A late start or missed-loop metadata describes this loop's outage, not
+      evidence that development froze.
+
+      Re-read ROUTINES.md when present and the continuity checkpoint in WORKLOG.md. Use bounded
+      `list_history` reads filtered to the assigned room CID and direction as needed. Do not drain
+      unread mail or mark unrelated mail read. Ignore unrelated contacts and private messages.
+      Use only attributable room/task evidence. Exclude loop-authored `CONTINUITY *` messages from
+      development evidence and fingerprint inputs; retain their request/report IDs separately for
+      dedupe. Lifecycle state `active`, elapsed time, silence, task difficulty, and filesystem
+      dirtiness alone do not prove development is active, meaningful progress, or a stall. Meaningful
+      progress is a concrete reported change, test result, decision, handoff, blocker delta, active
+      step, or unexpired ETA.
+
+      After a mandatory final history recheck, choose exactly one mutually exclusive branch:
+      - Terminal: if attributable evidence says the task is terminal, do nothing.
+      - Recent update: if the room already has a meaningful update in the interval, do nothing.
+      - Ongoing: if attributable development evidence is ongoing but the room has no meaningful
+        update in the interval, send at most one concise
+        `CONTINUITY ACTIVE [start..end]: <observed facts>; next=<known step or ETA>` update.
+      - Unobservable/no evidence: never invent activity. If no qualifying outstanding continuity
+        request exists, send one direct `CONTINUITY CHECK` request for status, next step, and ETA.
+        If the prior request is less than 10 minutes old or its ETA is unexpired, do nothing. If it
+        is at least 10 minutes old, no later meaningful evidence exists, and the ETA is absent or
+        elapsed, send at most one clear `CONTINUITY STALLED` report.
+      - Explicit stop: if attributable evidence says work stopped or is blocked with no active next
+        step, send at most one clear `CONTINUITY STALLED` report.
+
+      Before any send, suppress a semantic duplicate found by the final history recheck or checkpoint;
+      room history wins if they disagree. Build the stable fingerprint from classification and
+      non-loop evidence IDs/timestamps plus requested/reported state, excluding loop-authored
+      continuity messages, prose, and time-of-check so unchanged classification and evidence state
+      stay silent. Store continuity request/report IDs separately. Later meaningful progress resets
+      a prior request or stall. Append a secret-free WORKLOG checkpoint with interval, classification,
+      evidence IDs/times, fingerprint, and any separate request/report ID.
+
+      Do not edit project files, run implementation or tests, interrupt peers, spawn or manage agents,
+      invoke task/room lifecycle actions, infer from unrelated messages, or exceed LocalCoordinator
+      authority. Complete silently when no room action is required.

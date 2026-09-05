@@ -16,7 +16,8 @@ import {
 } from '../src/owner-channel/attachments.js';
 import { OwnerChannel } from '../src/owner-channel/channel.js';
 import type {
-  OursContactsView, OursInboundMessage, OursIncomingFile, OursOps, OursRetrievedFile,
+  OursContactsView, OursInboundMessage, OursIncomingFile, OursOps, OursRegisteredCommand,
+  OursRetrievedFile,
 } from '../src/owner-channel/ours-client.js';
 import { OwnerConversationState } from '../src/owner-channel/state.js';
 import type { QueuedPrompt, SessionHandle, TurnResult } from '../src/session/types.js';
@@ -49,6 +50,7 @@ class AttachmentClient implements OursOps {
   async start() {}
   async close() {}
   async bindIdentity(name: string) { this.record('bindIdentity', { name }); }
+  async registerCommands(_commands: OursRegisteredCommand[]) {}
   async listContacts() { this.record('listContacts'); return EMPTY_CONTACTS; }
   async generateInvite(name?: string) {
     this.record('generateInvite', { name });
@@ -74,7 +76,8 @@ class AttachmentClient implements OursOps {
     const messages = batch.slice(0, limit).map((item, index) => historyMessage(item, index + 1));
     for (const message of messages) this.messageHistory.set(message.wire_id, message);
     if (batch.length > limit) this.batches.unshift(batch.slice(limit));
-    return { count: messages.length, messages, remaining: Math.max(0, batch.length - limit) };
+    return { messages, command_results: [], commands_handled: 0,
+      remaining: Math.max(0, batch.length - limit) };
   }
   async getHistoryItem(wireId: string) {
     this.record('getHistoryItem', { wireId });
@@ -620,8 +623,8 @@ describe('owner-channel attachment ingress', () => {
     expect(String(status.queuePrompt.mock.calls[0][0])).toContain('category restart_recovery');
     status.finish({ accepted: true, outcome: 'completed', succeeded: true, output: 'Recovered.' });
     await vi.waitFor(() => expect(status.client.calls.some(call => call.args?.text === 'Recovered.')).toBe(true));
-    expect(JSON.parse(readFileSync(join(status.dir,
-      '.owner-channel-attachment-recovery.json'), 'utf8')).pending).toEqual([]);
+    await vi.waitFor(() => expect(JSON.parse(readFileSync(join(status.dir,
+      '.owner-channel-attachment-recovery.json'), 'utf8')).pending).toEqual([]));
     await status.channel.close();
   });
 

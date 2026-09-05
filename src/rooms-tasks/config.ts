@@ -2,16 +2,17 @@ import { existsSync, readFileSync } from 'node:fs';
 import { createHash } from 'node:crypto';
 import type {
   RoomsConfig, RoomsOwnerConfig, RoomsCoworkConfig, RoomsDefaults,
-  TasksConfig, TemplateDefinition, RoomTemplatesConfig,
+  TasksConfig, TemplateDefinition, RoomTemplatesConfig, TemplateMemberSlot,
   ROOMS_KEYS, ROOMS_OWNER_KEYS, ROOMS_COWORK_KEYS, ROOMS_DEFAULTS_KEYS,
-  TASKS_KEYS, TEMPLATE_KEYS, TEMPLATE_MEMBER_KEYS, TEMPLATE_OVERRIDE_KEYS,
+  TASKS_KEYS, TEMPLATE_KEYS, TEMPLATE_MEMBER_KEYS,
+  TEMPLATE_ROOM_KEYS,
 } from './types.js';
 import {
   ROOMS_KEYS as RK, ROOMS_OWNER_KEYS as ROK, ROOMS_COWORK_KEYS as RCK,
   ROOMS_DEFAULTS_KEYS as RDK, TASKS_KEYS as TK, TEMPLATE_KEYS as TPK,
-  TEMPLATE_MEMBER_KEYS as TMK, TEMPLATE_OVERRIDE_KEYS as TOK,
+  TEMPLATE_MEMBER_KEYS as TMK,
+  TEMPLATE_ROOM_KEYS as TRK,
 } from './types.js';
-import { BUILTIN_TEMPLATES } from './templates.js';
 
 const isPlainObject = (v: unknown): v is Record<string, unknown> =>
   v !== null && typeof v === 'object' && !Array.isArray(v);
@@ -164,13 +165,6 @@ export function validateRoomTemplatesConfig(
       throw new RoomsTasksConfigError(path, `room_templates.${name}: must be a mapping`);
     rejectUnknown(tplRaw, [...TPK, 'name'] as string[], path, `room_templates.${name}`);
 
-    const isBuiltinOverride = BUILTIN_TEMPLATES.some(b => b.name === name);
-    if (isBuiltinOverride && !tplRaw.override_builtin)
-      throw new RoomsTasksConfigError(
-        path,
-        `room_templates.${name}: overrides built-in template; set override_builtin: true and bump version`,
-      );
-
     const version = tplRaw.version as number | undefined;
     if (version === undefined || !Number.isInteger(version) || version < 1)
       throw new RoomsTasksConfigError(path, `room_templates.${name}.version: required positive integer`);
@@ -191,26 +185,33 @@ export function validateRoomTemplatesConfig(
         throw new RoomsTasksConfigError(path, `room_templates.${name}.members[${i}].role: required string`);
       if (!Number.isInteger(m.count) || (m.count as number) < 1)
         throw new RoomsTasksConfigError(path, `room_templates.${name}.members[${i}].count: required positive integer`);
-      if (!m.role_ref || typeof m.role_ref !== 'string')
-        throw new RoomsTasksConfigError(path, `room_templates.${name}.members[${i}].role_ref: required string`);
-      if (m.overrides !== undefined) {
-        if (!isPlainObject(m.overrides))
-          throw new RoomsTasksConfigError(path, `room_templates.${name}.members[${i}].overrides: must be a mapping`);
-        rejectUnknown(m.overrides, TOK as unknown as string[], path, `room_templates.${name}.members[${i}].overrides`);
-      }
+      if (m.agent !== undefined)
+        throw new RoomsTasksConfigError(path,
+          `room_templates.${name}.members[${i}].agent: persistent Agent references are no longer allowed; use agent_template: <ID>`);
+      if (typeof m.agent_template !== 'string' || !m.agent_template.trim())
+        throw new RoomsTasksConfigError(path,
+          `room_templates.${name}.members[${i}].agent_template: required non-blank Agent Template ID`);
       return {
         slot: m.slot as string,
         role: m.role as string,
         count: m.count as number,
-        role_ref: m.role_ref as string,
-        overrides: m.overrides as Record<string, unknown> | undefined,
+        agent_template: m.agent_template,
       };
     });
+    const slots = new Set<string>();
+    for (const member of members) {
+      if (slots.has(member.slot)) throw new RoomsTasksConfigError(path,
+        `room_templates.${name}.members: duplicate slot '${member.slot}'`);
+      slots.add(member.slot);
+    }
 
     let room: { quiet_membership?: boolean; anonymous?: boolean } | undefined;
     if (tplRaw.room !== undefined) {
       if (!isPlainObject(tplRaw.room))
         throw new RoomsTasksConfigError(path, `room_templates.${name}.room: must be a mapping`);
+      rejectUnknown(tplRaw.room, TRK as unknown as string[], path, `room_templates.${name}.room`);
+      for (const key of TRK) if (tplRaw.room[key] !== undefined && typeof tplRaw.room[key] !== 'boolean')
+        throw new RoomsTasksConfigError(path, `room_templates.${name}.room.${key}: must be a boolean`);
       room = {
         quiet_membership: tplRaw.room.quiet_membership as boolean | undefined,
         anonymous: tplRaw.room.anonymous as boolean | undefined,

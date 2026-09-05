@@ -9,7 +9,7 @@ import {
   readTempSupervisor, secureStoppedTempArchive, stopTempSupervisor, tempSupervisorLiveness,
   type TempLifecycleDeps,
 } from '../temp-lifecycle.js';
-import type { CoworkAdapter } from './cowork-adapter.js';
+import { CoworkProtocolError, type CoworkAdapter } from './cowork-adapter.js';
 import {
   advanceMemberRetirement, advanceRoomClose, beginRoomClose, closeRoom,
   deleteRoomRecord, getRoomRecord, listRoomRecords, setRoomCloseError,
@@ -53,7 +53,7 @@ function exactMemberIdentity(seat: RoomMemberSeat): void {
   }
 }
 
-async function inspectMember(seat: RoomMemberSeat): Promise<{ launchId: string }> {
+export async function inspectMember(seat: RoomMemberSeat): Promise<{ launchId: string }> {
   exactMemberIdentity(seat);
   const supervisor = readTempSupervisor(agentDir(seat.role_name, true));
   if (!supervisor || supervisor.role !== seat.role_name) {
@@ -62,7 +62,7 @@ async function inspectMember(seat: RoomMemberSeat): Promise<{ launchId: string }
   return { launchId: supervisor.launchId };
 }
 
-async function waitForLivenessAbsent(
+export async function waitForLivenessAbsent(
   role: string, launchId: string, lifecycleDeps: TempLifecycleDeps = {},
 ): Promise<void> {
   const dir = agentDir(role, true);
@@ -93,10 +93,19 @@ async function withIdentityClient<T>(work: (client: OursClient) => Promise<T>): 
 function listedIdentity(
   rows: Awaited<ReturnType<OursClient['listIdentities']>>, name: string,
 ): { name: string; cid: string } | undefined {
-  return rows.find(row => row.name === name);
+  return rows.find((row): row is Extract<typeof row, { cid: string }> =>
+    row.name === name && 'cid' in row);
 }
 
-async function removeExactMemberIdentity(seat: RoomMemberSeat): Promise<void> {
+/** Report whether any daemon identity — under any name — carries this exact CID. */
+export async function identityCidPresent(cid: string): Promise<boolean> {
+  return withIdentityClient(async client => {
+    const rows = await client.listIdentities();
+    return rows.some(row => 'cid' in row && row.cid.toLowerCase() === cid.toLowerCase());
+  });
+}
+
+export async function removeExactMemberIdentity(seat: RoomMemberSeat): Promise<void> {
   await withIdentityClient(async client => {
     const before = listedIdentity(await client.listIdentities(), seat.role_name);
     if (!before) return;
@@ -233,7 +242,7 @@ export async function closeManagedRoom(input: {
       setRoomCloseError(
         input.roomId,
         errorText(error),
-        `Retry 'ours-fleet room delete ${input.roomId} ${input.roomId}' or run room recover.`,
+        `Retry 'ours-fleet room delete ${input.roomId} ${input.roomId}'.`,
       );
       throw error;
     }
@@ -251,7 +260,13 @@ export async function deleteLegacyClosedRooms(input: {
 }): Promise<string[]> {
   const deleted: string[] = [];
   for (const room of listRoomRecords({ state: 'closed' })) {
-    await input.cowork.deleteRoom(room.room_id);
+    try {
+      await input.cowork.deleteRoom(room.room_id);
+    } catch (error) {
+      // The retained Fleet record is the legacy state being migrated. If the
+      // exact Cowork room is already absent, the desired deletion is complete.
+      if (!(error instanceof CoworkProtocolError && error.code === 'not_found')) throw error;
+    }
     deleteRoomRecord(room.room_id);
     deleted.push(room.room_id);
   }
@@ -271,7 +286,7 @@ export async function deleteManagedRoom(input: {
     setRoomCloseError(
       input.roomId,
       errorText(error),
-      `Retry 'ours-fleet room delete ${input.roomId} ${input.roomId}' or run room recover.`,
+      `Retry 'ours-fleet room delete ${input.roomId} ${input.roomId}'.`,
     );
     throw error;
   }

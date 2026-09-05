@@ -23,8 +23,9 @@ import type { MergedTopology, MergedTopologyNode } from './topology-model.js';
 /** Loop interval when the sketch did not choose one (`resolveLoops` requires it). */
 const DEFAULT_LOOP_INTERVAL = '10m';
 
-/** Scalar draft fields that are valid keys of a role mapping. */
-const ROLE_FIELDS = ['mission', 'bio', 'persona', 'coordinator', 'harness', 'session', 'model', 'identity', 'cwd'] as const;
+const ROLE_FIELDS = ['mission', 'bio', 'persona'] as const;
+const BRAIN_FIELDS = ['harness', 'session', 'model'] as const;
+const AGENT_OP_FIELDS = ['coordinator', 'identity', 'cwd'] as const;
 /** Scalar draft fields that are valid keys of a watchdog mapping. */
 const WATCHDOG_FIELDS = ['coordinator', 'interval', 'enabled'] as const;
 /** Scalar draft fields that are valid keys of a loop mapping. */
@@ -140,16 +141,23 @@ function resolve(merged: MergedTopology, id: string): MergedTopologyNode {
 }
 
 function addNode(model: EditableFleetModel, node: MergedTopologyNode, merged: MergedTopology): void {
-  const block = section(model, node.kind === 'agent' ? 'roles' : node.kind === 'watchdog' ? 'watchdogs' : 'loops');
+  const block = node.kind === 'agent' ? model.agents
+    : manifestSection(model, node.kind === 'watchdog' ? 'watchdogs' : 'loops');
   if (block[node.label] !== undefined)
     throw new FleetError('conflict', `${node.label} already exists in the configuration`);
   block[node.label] = node.kind === 'agent' ? agentEntry(node)
     : node.kind === 'watchdog' ? watchdogEntry(node, merged)
-      : loopEntry(node, merged, model);
+      : loopEntry(node, merged);
 }
 
 function agentEntry(node: MergedTopologyNode): Record<string, unknown> {
-  return pick(node, ROLE_FIELDS);
+  const brain = pick(node, BRAIN_FIELDS);
+  brain.harness ??= 'claude-code';
+  return {
+    role: { inline: pick(node, ROLE_FIELDS) },
+    brain: { inline: brain },
+    ...pick(node, AGENT_OP_FIELDS),
+  };
 }
 
 /**
@@ -160,23 +168,26 @@ function agentEntry(node: MergedTopologyNode): Record<string, unknown> {
  */
 function watchdogEntry(node: MergedTopologyNode, merged: MergedTopology): Record<string, unknown> {
   const scoped = linked(merged, node.id, 'watches');
-  return { ...pick(node, WATCHDOG_FIELDS), ...(scoped.length ? { watch: scoped } : {}) };
+  return {
+    ...pick(node, WATCHDOG_FIELDS),
+    agent: {
+      role: { inline: {} },
+      brain: { inline: { harness: 'claude-code', ...pick(node, BRAIN_FIELDS) } },
+    },
+    ...(scoped.length ? { watch: scoped } : {}),
+  };
 }
 
 function loopEntry(
   node: MergedTopologyNode,
   merged: MergedTopology,
-  model: EditableFleetModel,
 ): Record<string, unknown> {
   const roles = linked(merged, node.id, 'targets');
   const entry: Record<string, unknown> = {
     roles, ...pick(node, LOOP_FIELDS),
   };
   entry.interval ??= DEFAULT_LOOP_INTERVAL;
-  // An enabled loop hard-requires `session: acp` on every target. Adding one to a
-  // tmux agent would make the whole fleet unloadable, so it arrives switched off
-  // and badged instead — the owner turns it on after switching the agent to ACP.
-  if (node.enabled === false || !roles.every(role => sessionOf(model, role) === 'acp')) entry.enabled = false;
+  if (node.enabled === false) entry.enabled = false;
   return entry;
 }
 
@@ -187,18 +198,12 @@ function linked(merged: MergedTopology, id: string, kind: 'watches' | 'targets')
     .map(edge => edge.to.slice('agent:'.length)))].sort();
 }
 
-function sessionOf(model: EditableFleetModel, role: string): string {
-  const roles = model.roles as Record<string, Record<string, unknown> | null> | undefined;
-  const defaults = model.defaults as Record<string, unknown> | undefined;
-  return String(roles?.[role]?.session ?? defaults?.session ?? 'tmux');
-}
-
-function section(model: EditableFleetModel, key: string): Record<string, unknown> {
-  const existing = model[key];
+function manifestSection(model: EditableFleetModel, key: 'watchdogs' | 'loops'): Record<string, unknown> {
+  const existing = model.manifest[key];
   if (existing && typeof existing === 'object' && !Array.isArray(existing))
     return existing as Record<string, unknown>;
   const created: Record<string, unknown> = {};
-  model[key] = created;
+  model.manifest[key] = created;
   return created;
 }
 

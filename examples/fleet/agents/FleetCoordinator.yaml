@@ -1,0 +1,7 @@
+role: { ref: coordinator }
+brain: { ref: claude-default }
+identity: FleetCoordinator
+cwd: ${work_root}
+permissions: { approval: ask, filesystem: workspace, unattended: deny }
+oversee:
+  - { agent: Alice, interval: 5m }

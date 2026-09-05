@@ -47,10 +47,6 @@ export interface WebServices {
   topologyPromote?: TopologyPromoteService;
   removal?: RoleRemovalService;
   taskRooms?: TaskRoomApplicationService;
-  terminalUpgrade?: (
-    socket: WebSocket, request: FastifyRequest, roleId: string,
-    ticket: string, hello: Record<string, unknown>,
-  ) => Promise<void>;
 }
 
 export interface WebServer {
@@ -162,7 +158,7 @@ export async function buildWebServer(
     return {
       version: VERSION, api: { major: 1, minor: 0 },
       websocketProtocols: [
-        'ours-fleet-events.v1', 'ours-fleet-terminal.v1', 'ours-fleet-conversation.v1',
+        'ours-fleet-events.v1', 'ours-fleet-conversation.v1',
       ],
       auditDegraded: audit.degraded,
     };
@@ -241,17 +237,45 @@ export async function buildWebServer(
   });
   app.get('/api/v1/tasks', async request => {
     auth.authenticate(request);
-    const query = request.query as { state?: string; list?: string; groupByList?: string };
+    const query = request.query as {
+      state?: string; list?: string; groupByList?: string; includeDeleting?: string;
+    };
     const states = ['backlog', 'provisioning', 'active', 'review', 'done', 'cancelled', 'failed'];
     if (query.state && query.state !== 'all' && !states.includes(query.state))
       throw new FleetError('invalid_request', 'invalid task state filter');
     if (query.groupByList !== undefined && !['true', 'false'].includes(query.groupByList))
       throw new FleetError('invalid_request', 'groupByList must be true or false');
+    if (query.includeDeleting !== undefined && !['true', 'false'].includes(query.includeDeleting))
+      throw new FleetError('invalid_request', 'includeDeleting must be true or false');
     const state = query.state && query.state !== 'all' ? query.state as import('../rooms-tasks/types.js').TaskState : undefined;
-    const filter = { ...(state ? { state } : {}), ...(query.list ? { list: query.list } : {}) };
+    const filter = { ...(state ? { state } : {}), ...(query.list ? { list: query.list } : {}),
+      ...(query.includeDeleting === 'true' ? { includeDeleting: true } : {}) };
     return taskApi(() => query.groupByList === 'true'
       ? { groups: requireTaskRooms().groupedTasks(filter) }
       : { tasks: requireTaskRooms().listTasks(filter) });
+  });
+  app.delete('/api/v1/tasks/:id', async (request, reply) => {
+    auth.authenticate(request, true);
+    const taskId = (request.params as { id: string }).id;
+    const confirm = (request.query as { confirm?: string }).confirm;
+    // Exact-ID-twice confirmation is validated before existence or idempotency.
+    if (confirm !== taskId)
+      throw new FleetError('invalid_request', 'confirm must exactly repeat the task id');
+    const accepted = await taskApi(() => requireTaskRooms().requestTaskDeletion({
+      actor: { kind: 'local_control', surface: 'web' }, taskId,
+    }));
+    if (accepted.status === 'already_absent')
+      return { task_id: taskId, deleted: false, already_absent: true };
+    // Cleanup runs in an external worker outside the request lifecycle; the
+    // request waits boundedly and reports pending — never fabricated success.
+    const outcome = await requireTaskRooms().launchTaskDeletionWorker({ taskId, waitMs: 5_000 });
+    if (outcome.deleted) return { task_id: taskId, deleted: true };
+    reply.code(202);
+    return {
+      task_id: taskId, accepted: true, deletion: 'pending',
+      ...(outcome.error ? { error: outcome.error } : {}),
+      recovery: `Repeat DELETE /api/v1/tasks/${taskId}?confirm=${taskId}.`,
+    };
   });
   app.post('/api/v1/tasks', async (request, reply) => {
     auth.authenticate(request, true);
@@ -412,7 +436,7 @@ export async function buildWebServer(
     const control = await services.session(request.params.id);
     // The idempotent, durably admitted path — used whenever the caller sends a
     // command id and the role has a conversation ledger. The legacy path stays
-    // for old clients and tmux roles.
+    // for old clients.
     if (control.submitPromptV2) {
       const admittedCommandId = commandId ?? randomBytes(16).toString('hex');
       const receipt = await control.submitPromptV2({
@@ -526,9 +550,9 @@ export async function buildWebServer(
 
   app.post('/api/v1/ws-tickets', async request => {
     const body = request.body as {
-      purpose?: 'events' | 'terminal' | 'conversation'; roleId?: string;
+      purpose?: 'events' | 'conversation'; roleId?: string;
     };
-    if (!body?.purpose || !['events', 'terminal', 'conversation'].includes(body.purpose))
+    if (!body?.purpose || !['events', 'conversation'].includes(body.purpose))
       throw new FleetError('invalid_request', 'ticket purpose is required');
     if (body.purpose === 'conversation' && !body.roleId)
       throw new FleetError('invalid_request', 'a conversation ticket must be bound to a role');
@@ -626,19 +650,6 @@ export async function buildWebServer(
           if (socket.readyState === socket.OPEN) socket.ping();
         }, 30_000);
         socket.on('close', () => { clearInterval(heartbeat); follow.close(); });
-      });
-    });
-
-  app.get<{ Params: { id: string } }>(
-    '/api/v1/roles/:id/terminal', { websocket: true }, (socket, request) => {
-      requireSubprotocol(request, 'ours-fleet-terminal.v1');
-      authorizeSocket(socket, request, async hello => {
-        const ticket = String(hello.ticket ?? '');
-        const session = auth.consumeTicket(request, ticket, 'terminal', request.params.id);
-        auth.bindSocket(session.id, socket);
-        if (!services.terminalUpgrade)
-          throw new FleetError('capability_unavailable', 'terminal PTY support is unavailable');
-        await services.terminalUpgrade(socket, request, request.params.id, ticket, hello);
       });
     });
 

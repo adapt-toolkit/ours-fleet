@@ -8,23 +8,30 @@ import {
   type ResolvedRole,
 } from './config.js';
 import { getAdapter } from './harness/registry.js';
-import type { AcpLaunch, Launch } from './harness/types.js';
-import { Tmux } from './tmux.js';
 import {
   createMonitor, probeIdentityPresence,
   type MonitorDeps, type MonitorHandle, type MonitorOpts, type FetchLike,
 } from './monitor.js';
-import { realExec, shq, type Exec } from './exec.js';
+import {
+  DaemonGenerationObserver, RoleRecoveryController, probeDaemonGeneration,
+  type DaemonGenerationProbe,
+} from './daemon-recovery.js';
+import { recoverAgentIdentity } from './agent-recovery-gate.js';
+import { realExec, type Exec } from './exec.js';
 import { resolveIsolation } from './isolation/policy.js';
 import { selectIsolationBackend } from './isolation/registry.js';
 import { resourceArgs, cpuControllerDelegated } from './isolation/resources.js';
 import type { WrapContext } from './isolation/types.js';
 import { resolveLaunchRuntime } from './isolation/runtime.js';
-import { AcpSession, type AcpSessionOptions } from './session/acp.js';
 import { controlRequest, RoleControlServer } from './session/control.js';
-import { TmuxSession } from './session/tmux.js';
-import { ACP_CANCEL_DEADLINE_EXCEEDED, classifyShellStatus } from './session/types.js';
-import type { ExitRecord, SessionHandle, TurnResult } from './session/types.js';
+import {
+  ACP_CANCEL_DEADLINE_EXCEEDED, CODEX_APP_SERVER_CANCEL_DEADLINE_EXCEEDED,
+  classifyShellStatus,
+} from './session/types.js';
+import type { AgentSession, ExitRecord, TurnResult } from './session/types.js';
+import type {
+  AgentSessionAdapter, AgentSessionStartOptions,
+} from './harness/agent-session.js';
 import {
   effectiveModelForRole, modelRecoveryHeld, reconcileModelRecovery, recordModelFailure,
   classifyFailureText,
@@ -50,9 +57,9 @@ import {
   archiveTempState, markTempSupervisorActive, requestedTempStopReason,
   type TempTerminationReason,
 } from './temp-lifecycle.js';
+import { FleetCommandAuditStore } from './fleet-command-audit.js';
 
 export interface RunnerDeps {
-  tmux: Tmux;
   exec: Exec;
   cpuDelegated(): boolean;
   isAlive(pid: number): boolean;
@@ -61,17 +68,25 @@ export interface RunnerDeps {
   log(line: string): void;
   /** HTTP transport for the monitor's daemon long-poll (injectable for tests). */
   fetch: FetchLike;
+  probeGeneration(env: NodeJS.ProcessEnv): Promise<DaemonGenerationProbe>;
   /** Construct the supervisor mail monitor (injectable so tests stub it out). */
   createMonitor(opts: MonitorOpts): MonitorHandle;
   /** Construct trusted owner ingress (injectable for lifecycle tests). */
   createOwnerChannel(opts: OwnerChannelOptions): OwnerChannelHandle;
   /** Start the ACP transport (injectable for deterministic runner lifecycle tests). */
-  startAcpSession(opts: AcpSessionOptions): Promise<SessionHandle>;
+  /** Neutral construction seam for deterministic runner lifecycle tests. */
+  startAgentSession(
+    adapter: AgentSessionAdapter, options: AgentSessionStartOptions,
+  ): Promise<AgentSession>;
   /** Construct the authenticated role control route (injectable where sockets are unavailable). */
   createControlServer(
-    stateDir: string, session: SessionHandle, log: (line: string) => void,
+    stateDir: string, session: AgentSession, log: (line: string) => void,
   ): Pick<RoleControlServer,
-    'start' | 'close' | 'setFleetSpawner' | 'setOwnerChannel' | 'setConfigReloader' | 'setLoopManager'>;
+    'start' | 'close' | 'setFleetSpawner' | 'setFleetAuditor' | 'setOwnerChannel' | 'setConfigReloader' | 'setLoopManager'>;
+  /** Construct scheduled-loop execution (injectable for fail-closed startup tests). */
+  createLoopManager(
+    ...args: ConstructorParameters<typeof ScheduledLoopManager>
+  ): ScheduledLoopManagerHandle;
   /** Acquire the cross-process owner-channel binder lease before replacing the control socket. */
   acquireOwnerBinder(stateDir: string, role: string, identity: string): Promise<OwnerBinderLease>;
   /** Ask the still-authenticated predecessor to emit the fixed recovery notice. */
@@ -80,8 +95,17 @@ export interface RunnerDeps {
   shouldStop?(): boolean;
 }
 
+export const SUPERVISOR_RECYCLE_REQUIRED = 'OWNER_CHANNEL_SUPERVISOR_RECYCLE_REQUIRED';
+
+export class SupervisorRecycleRequiredError extends Error {
+  readonly code = SUPERVISOR_RECYCLE_REQUIRED;
+  constructor() {
+    super('owner channel requires a fresh supervisor process after unproven client quiescence');
+    this.name = 'SupervisorRecycleRequiredError';
+  }
+}
+
 const defaultDeps = (): RunnerDeps => ({
-  tmux: new Tmux(),
   exec: realExec,
   cpuDelegated: () => cpuControllerDelegated(),
   isAlive: pid => { try { process.kill(pid, 0); return true; } catch { return false; } },
@@ -89,10 +113,13 @@ const defaultDeps = (): RunnerDeps => ({
   now: () => Date.now(),
   log: line => process.stderr.write(line + '\n'),
   fetch: (url, init) => globalThis.fetch(url, init) as unknown as ReturnType<FetchLike>,
+  probeGeneration: env => probeDaemonGeneration(
+    (url, init) => globalThis.fetch(url, init) as unknown as ReturnType<FetchLike>, env),
   createMonitor: opts => createMonitor(opts),
   createOwnerChannel: opts => new OwnerChannel(opts),
-  startAcpSession: opts => AcpSession.start(opts),
+  startAgentSession: (adapter, options) => adapter.start(options),
   createControlServer: (stateDir, session, log) => new RoleControlServer(stateDir, session, log),
+  createLoopManager: (...args) => new ScheduledLoopManager(...args),
   acquireOwnerBinder: (stateDir, role, identity) => acquireOwnerBinderLease(
     stateDir, role, identity),
   reportOwnerStartupFailure: async stateDir => {
@@ -110,6 +137,33 @@ const defaultDeps = (): RunnerDeps => ({
 
 const MONITOR_OWNER_FILE = '.monitor-owner';
 const OBSOLETE_OURS_AUTOSTART_ENV = 'OURS_AUTOSTART';
+
+function localFleetAuditor(stateDir: string, caller: string, log: (line: string) => void) {
+  const store = new FleetCommandAuditStore(join(stateDir, '.fleet-command-audit.json'));
+  return {
+    async begin(requestId: string, argv: string[]) {
+      let attempt = store.begin(requestId, caller, argv);
+      if (attempt.invocation === 'sending') {
+        log(`[${caller}] fleet proxy command ${attempt.correlationId} `
+          + `route=${attempt.classification.route} decision=${attempt.classification.decision}`);
+        attempt = store.invocation(attempt.correlationId, caller, 'delivered');
+      }
+      return attempt;
+    },
+    async finish(input: Parameters<NonNullable<OwnerChannelHandle['finishFleetCommandAudit']>>[0]) {
+      let attempt = store.finish(input.correlationId, caller, {
+        class: input.class, effect: input.effect,
+        ...(input.exitCode === undefined ? {} : { exitCode: input.exitCode }),
+        ...(input.resourceIds ? { resourceIds: input.resourceIds } : {}),
+        ...(input.presentations ? { presentations: input.presentations } : {}),
+      });
+      if (attempt.outcome?.delivery === 'sending')
+        attempt = store.outcome(attempt.correlationId, caller, 'delivered');
+      return attempt;
+    },
+    async present() {},
+  };
+}
 
 /** Environment injected only into the managed harness process. */
 export function managedFleetProxyEnv(
@@ -186,42 +240,10 @@ export function recordMonitorOwner(dir: string, owner: 'fleet' | 'native'): bool
   return owner === 'fleet' && previous === 'native';
 }
 
-/**
- * Compose the tmux pane shell command: env prefix + argv + exit-status capture.
- * `paneArgv` defaults to `launch.argv`; when isolation is active the caller passes
- * the sandbox-wrapped argv (e.g. `bwrap … -- claude …`). The `env` prefix and the
- * `echo $? > exitfile` capture stay host-side, outside the sandbox, so the runner
- * still sees the real exit code.
- */
-export function buildPaneCommand(
-  launch: Launch, roleEnv: Record<string, string> | undefined, exitStatusPath: string,
-  paneArgv: string[] = launch.argv,
-): string {
-  const env: Record<string, string> = {
-    PATH: process.env.PATH ?? '', COLORTERM: 'truecolor', ...launch.env, ...(roleEnv ?? {}),
-  };
-  delete env[OBSOLETE_OURS_AUTOSTART_ENV];
-  // Interactive panes should advertise colour even when the supervisor itself
-  // was launched with NO_COLOR. A role may still deliberately opt back in to
-  // NO_COLOR (or replace COLORTERM) through its explicit env block.
-  const unsetNoColor = Object.prototype.hasOwnProperty.call(roleEnv ?? {}, 'NO_COLOR')
-    ? '' : '-u NO_COLOR ';
-  const envPfx = 'env -u OURS_AUTOSTART ' + unsetNoColor
-    + Object.entries(env).map(([k, v]) => `${k}=${shq(v)}`).join(' ');
-  const cmd = paneArgv.map(shq).join(' ');
-  // Write a structured record, not a bare number: the wait status alone cannot
-  // say whether the file is missing because the program never exited or because
-  // nothing ever wrote it. `printf` is POSIX; no shell branching is needed
-  // because classification happens in one place, in TypeScript.
-  const record = `'{"version":1,"backend":"tmux","status":'"$__ofs"'}'`;
-  return `${envPfx} ${cmd}; __ofs=$?; printf %s ${record} > ${shq(exitStatusPath)}`;
-}
-
 /** Adapt runner deps and the role's daemon-profile overrides for the monitor. */
 function monitorDeps(deps: RunnerDeps, roleEnv?: Record<string, string>): MonitorDeps {
   return {
     fetch: deps.fetch,
-    tmux: deps.tmux,
     isAlive: deps.isAlive,
     sleep: deps.sleep,
     now: deps.now,
@@ -592,17 +614,11 @@ export async function runOnce(
 
   const runCwd = role.cwd && existsSync(role.cwd) ? role.cwd : dir;
   const prep = await adapter.prepareSession(role, { stateDir: dir, runCwd });
-  const sessionBackend = role.session ?? 'tmux';
-  let launch = sessionBackend === 'acp'
-    ? (() => {
-        if (!adapter.buildAcpLaunch)
-          throw new Error(`harness '${role.harness}' does not support the ACP session backend`);
-        return adapter.buildAcpLaunch(role, prep);
-      })()
-    : adapter.buildLaunch(role, mode, { sessionId }, prep);
+  const sessionBackend = role.session ?? 'acp';
+  const sessionLabel = sessionBackend === 'acp' ? 'ACP' : 'Codex app-server';
+  let launch = adapter.agentSession.prepareLaunch(role, prep);
 
-  // Isolation is additive: only roles that declare `isolation:` are wrapped. The
-  // env prefix + exit capture in buildPaneCommand stay host-side.
+  // Isolation is additive: only roles that declare `isolation:` are wrapped.
   let wrappedArgv = launch.argv;
   if (role.isolation) {
     // Start with the same durable context that config validation and doctor judged,
@@ -638,7 +654,7 @@ export async function runOnce(
   // user unit concurrently on boot; `ours-fleet up`/restart-all bulk-start) does not
   // hit the harness/API rate limit at once. Time-based via a shared launch gate, so
   // a lone start or a solo crash-restart waits zero. Applied right before the harness
-  // launch (tmux.newSession); the cheap monitor prime still runs immediately after.
+  // agent-session start; the cheap monitor prime still runs immediately after.
   if (staggerMs > 0) {
     const slot = await reserveLaunchSlot(stateRoot(), staggerMs, deps);
     const wait = slot - deps.now();
@@ -653,7 +669,7 @@ export async function runOnce(
   // (backlog before the tip is the SessionStart hook's job). Native-mode roles
   // leave wake ownership to the harness. Temp snapshots predating `monitor:` are
   // treated as native (monitor may be undefined on an old role.yaml).
-  let sessionHandle: SessionHandle | undefined;
+  let sessionHandle: AgentSession | undefined;
   let modelRecovery: 'advance' | 'hold' | undefined;
   const resolvedMonitorDeps = monitorDeps(deps, role.env);
   resolvedMonitorDeps.onFailureEvidence = evidence => {
@@ -683,26 +699,30 @@ export async function runOnce(
     name, identity: role.identity, agentDir: dir, cfg: role.monitor,
     deps: resolvedMonitorDeps,
   }) : null;
+  const daemonObserver = new DaemonGenerationObserver();
+  const initialDaemon = daemonObserver.observe(
+    await deps.probeGeneration(resolvedMonitorDeps.env));
+  let sessionStartedWithoutDaemonBaseline = initialDaemon.kind !== 'baseline';
   if (monitor) await monitor.prime({ resetCursor: resetMonitorCursor });
 
   rmSync(exitFile, { force: true });
   let pid: number;
-  let acpSession: SessionHandle | undefined;
+  let agentSession: AgentSession | undefined;
   let control: ReturnType<RunnerDeps['createControlServer']> | undefined;
   let unsubscribeRecovery: (() => void) | undefined;
   let monitorLoop: Promise<void> | undefined;
-  let acpStartupComplete = false;
+  let sessionStartupComplete = false;
   let sessionClosed = false;
   let ownerChannel: OwnerChannelHandle | undefined;
   let ownerBinder: OwnerBinderLease | undefined;
-  const pendingFleetSpawnNotices: ManagedFleetSpawnResult[] = [];
   let loopManager: ScheduledLoopManagerHandle | undefined;
   let arbiter: RoleTurnArbiter | undefined;
+  let recoveryController: RoleRecoveryController | undefined;
   let reloadLoopConfig: (() => Promise<{ changed: boolean; loops: number }>) | undefined;
   let loopGeneration = JSON.stringify((role.loops ?? []).map(loop => [
     loop.name, loop.definitionHash, loop.promptHash,
   ]));
-  if (sessionBackend === 'acp') {
+  {
     const perms = role.permissions ?? resolvePermissions(undefined, undefined);
     // Say once, at startup, that this role will decide permission requests by
     // itself. Without it the only trace of an auto-denied tool call is a turn
@@ -710,37 +730,19 @@ export async function runOnce(
     if (perms.unattended === 'deny')
       deps.log(`[${name}] permission policy: unattended=deny — with no console attached, ` +
         `permission requests are automatically denied once each (reject_once) and the turn continues`);
-    acpSession = await deps.startAcpSession({
-      name,
-      argv: wrappedArgv,
-      cwd: runCwd,
-      env: harnessChildEnv(role, launch.env, dir),
-      stateDir: dir,
-      mode,
-      permissions: perms,
-      modeId: adapter.acpPermissionModeId?.(role),
-      // The role's declared MCP servers, and the bundled agent's `_meta`
-      // vocabulary for the options it takes no flag for. Both come from the
-      // ADAPTER and from `prep`: the ACP launch cannot carry `prep.argv`, so this
-      // is the route by which harness_options that used to be silently dropped
-      // for an ACP role actually reach the session.
-      mcpServers: adapter.acpMcpServers?.(role),
-      sessionMeta: adapter.acpSessionMeta?.(role, prep),
-      permissionMode: effectivePermissionMode(role),
-      // Provenance travels with the exact ACP launch. Keeping it out of a
-      // role-only adapter hook prevents a PATH fallback or resolver skew from
-      // claiming metadata trust for an argv it did not authenticate.
-      permissionMetadataSource: (launch as AcpLaunch).permissionMetadataSource,
-      scrubObsoleteOursAutostart: true,
-      log: deps.log,
+    agentSession = await deps.startAgentSession(adapter.agentSession, {
+      role, prep,
+      launch: { ...launch, argv: wrappedArgv, env: harnessChildEnv(role, launch.env, dir) },
+      cwd: runCwd, stateDir: dir, mode, permissions: perms,
+      permissionMode: effectivePermissionMode(role), log: deps.log,
     });
-    pid = acpSession.pid;
-    arbiter = new RoleTurnArbiter(acpSession);
+    pid = agentSession.pid;
+    arbiter = new RoleTurnArbiter(agentSession);
     sessionHandle = arbiter;
-    unsubscribeRecovery = acpSession.subscribe(event => {
+    unsubscribeRecovery = agentSession.subscribe(event => {
       if (event.kind !== 'error' || !event.text) return;
       const evidence = classifyFailureText(
-        event.text, 'acp', new Date(deps.now()).toISOString());
+        event.text, sessionBackend, new Date(deps.now()).toISOString());
       if (evidence) resolvedMonitorDeps.onFailureEvidence?.(evidence);
     });
     if (role.owner_channel) {
@@ -757,30 +759,50 @@ export async function runOnce(
               + `${(notifyError as Error)?.message ?? String(notifyError)}`);
           }
         }
-        await acpSession.close();
+        await agentSession.close();
         unsubscribeRecovery?.();
         throw new Error(`[${name}] owner channel failed to start: `
           + `${(error as Error)?.message ?? String(error)}`);
       }
     }
-    control = deps.createControlServer(dir, arbiter, deps.log);
-    try { await control.start(); }
+    try {
+      if (role.owner_channel) ownerChannel = deps.createOwnerChannel({
+        role: name,
+        harness: role.harness,
+        config: role.owner_channel,
+        session: arbiter,
+        stateDir: dir,
+        env: role.env,
+        log: deps.log,
+        ...(ownerBinder ? { binderLease: ownerBinder } : {}),
+        ...(configPath ? { configPath } : {}),
+      });
+      control = deps.createControlServer(dir, arbiter, deps.log);
+      control.setFleetAuditor(ownerChannel ? {
+        begin: (requestId, argv) => ownerChannel!.beginFleetCommandAudit!(requestId, argv),
+        finish: input => ownerChannel!.finishFleetCommandAudit!(input),
+        present: presentations => ownerChannel!.notifyFleetLifecycle!(presentations),
+      } : localFleetAuditor(dir, name, deps.log));
+      await control.start();
+    }
     catch (error) {
+      await ownerChannel?.close().catch(() => undefined);
       ownerBinder?.release();
-      await acpSession.close();
+      await agentSession.close();
       unsubscribeRecovery?.();
       throw error;
     }
-    control.setFleetSpawner(async requested => {
+    if (!role.roomMemberStartup) control.setFleetSpawner(async requested => {
       const event = await executeManagedSpawn(role, configPath, requested, deps.log);
-      if (!role.owner_channel) return event;
-      if (ownerChannel?.notifyFleetSpawn) {
+      // Room-member launches are collected with their Task/Room transaction so
+      // causal delivery is Task → Room → Agents → Room active → Task active.
+      if (!requested.roomMemberStartup && role.owner_channel && ownerChannel?.notifyFleetSpawn) {
         try { await ownerChannel.notifyFleetSpawn(event); }
         catch (error) {
-          deps.log(`[${name}] spawned-agent owner notice failed: `
+          deps.log(`[${name}] Agent lifecycle notice delivery failed: `
             + `${(error as Error)?.message ?? String(error)}`);
         }
-      } else pendingFleetSpawnNotices.push(event);
+      }
       return event;
     });
     resolvedMonitorDeps.delivery = {
@@ -793,7 +815,7 @@ export async function runOnce(
         // steer into the live turn instead; after it completes, honor the
         // configured interrupt policy normally.
         const policy = options?.interrupt;
-        const interrupt = policy === true && acpStartupComplete;
+        const interrupt = policy === true && sessionStartupComplete;
         const promptOptions = {
           interrupt, steer: true,
           ...(interrupt ? { interruptSource: 'fleet-monitor' as const } : {}),
@@ -801,7 +823,7 @@ export async function runOnce(
         };
         // Startup is already a protected boundary: as with immediate mode,
         // steer rather than waiting on/cancelling the runner-owned first turn.
-        const result = policy === 'after_tool' && acpStartupComplete
+        const result = policy === 'after_tool' && sessionStartupComplete
           ? await arbiter!.submitPromptAfterTool(text, promptOptions)
           : await arbiter!.submitPrompt(text, promptOptions);
         const steered = result.accepted
@@ -843,7 +865,7 @@ export async function runOnce(
     const started = await starting;
     // A temporary role's first turn can be the active turn when an ours wake
     // needs immediate attention. A typed console/monitor cancellation ends
-    // only that turn: the already-live ACP session and any queued wake remain
+    // only that turn: the already-live agent session and any queued wake remain
     // valid. Keep every unproven cancellation, refusal, shutdown, and genuine
     // failure terminal so a role that never accepted its briefing is not
     // silently reported as healthy.
@@ -852,7 +874,7 @@ export async function runOnce(
       monitor?.stop();
       await control.close();
       ownerBinder?.release();
-      await acpSession.close();
+      await agentSession.close();
       unsubscribeRecovery?.();
       if (modelRecovery) {
         if (monitorLoop) await monitorLoop;
@@ -861,32 +883,21 @@ export async function runOnce(
           exit: {
             version: 1,
             class: 'program-exit',
-            detail: `ACP startup triggered model recovery (${modelRecovery})`,
+            detail: `${sessionLabel} startup triggered model recovery (${modelRecovery})`,
           },
           rotated: false,
           mode,
           modelRecovery,
         };
       }
-      throw new Error(`[${name}] ACP startup prompt ${started.outcome}` +
+      throw new Error(`[${name}] ${sessionLabel} startup prompt ${started.outcome}` +
         `${started.detail ? `: ${started.detail}` : ''}`);
     }
     if (interruptedForWake)
-      deps.log(`[${name}] ACP startup prompt cancelled by ${started.cancellationSource}; `
+      deps.log(`[${name}] ${sessionLabel} startup prompt cancelled by ${started.cancellationSource}; `
         + 'keeping temporary supervisor alive');
-    acpStartupComplete = true;
-    if (role.owner_channel) {
-      ownerChannel = deps.createOwnerChannel({
-        role: name,
-        harness: role.harness,
-        config: role.owner_channel,
-        session: arbiter,
-        stateDir: dir,
-        env: role.env,
-        log: deps.log,
-        ...(ownerBinder ? { binderLease: ownerBinder } : {}),
-        ...(configPath ? { configPath } : {}),
-      });
+    sessionStartupComplete = true;
+    if (ownerChannel) {
       try { await ownerChannel.start(); }
       catch (error) {
         monitor?.stop();
@@ -894,20 +905,15 @@ export async function runOnce(
         await ownerChannel.close().catch(() => undefined);
         await control.close();
         ownerBinder?.release();
-        await acpSession.close();
+        await agentSession.close();
         unsubscribeRecovery?.();
         throw new Error(`[${name}] owner channel failed to start: `
           + `${(error as Error)?.message ?? String(error)}`);
       }
-      for (const event of pendingFleetSpawnNotices.splice(0)) {
-        try { await ownerChannel.notifyFleetSpawn?.(event); }
-        catch (error) {
-          deps.log(`[${name}] deferred spawned-agent owner notice failed: `
-            + `${(error as Error)?.message ?? String(error)}`);
-        }
-      }
     }
-    if (ownerChannel) control.setOwnerChannel(ownerChannel);
+    if (ownerChannel) {
+      control.setOwnerChannel(ownerChannel);
+    }
     reloadLoopConfig = async (): Promise<{ changed: boolean; loops: number }> => {
       const nextRole = findRole(loadConfig(configPath), name);
       const definitions = nextRole.loops ?? [];
@@ -917,7 +923,7 @@ export async function runOnce(
       if (generation === loopGeneration && (loopManager || !definitions.length))
         return { changed: false, loops: definitions.length };
       if (!loopManager && definitions.length) {
-        loopManager = new ScheduledLoopManager(name, definitions, dir, arbiter!, {
+        loopManager = deps.createLoopManager(name, definitions, dir, arbiter!, {
           now: deps.now,
           setTimer: (callback, ms) => setTimeout(callback, ms),
           clearTimer: timer => clearTimeout(timer as ReturnType<typeof setTimeout>),
@@ -932,10 +938,11 @@ export async function runOnce(
       deps.log(`[${name}] scheduled loops reloaded (${definitions.length} definitions)`);
       return { changed: true, loops: definitions.length };
     };
-    control.setConfigReloader(reloadLoopConfig);
+    // Temporary agents are immutable launch snapshots: never re-resolve mutable Fleet YAML.
+    if (!temp) control.setConfigReloader(reloadLoopConfig);
     if (role.loops?.length) {
       try {
-        loopManager = new ScheduledLoopManager(name, role.loops, dir, arbiter, {
+        loopManager = deps.createLoopManager(name, role.loops, dir, arbiter, {
           now: deps.now,
           setTimer: (callback, ms) => setTimeout(callback, ms),
           clearTimer: timer => clearTimeout(timer as ReturnType<typeof setTimeout>),
@@ -944,21 +951,19 @@ export async function runOnce(
         control.setLoopManager(loopManager);
         loopManager.start();
       } catch (error) {
+        if (temp) {
+          monitor?.stop();
+          if (monitorLoop) await monitorLoop;
+          await control.close();
+          ownerBinder?.release();
+          await agentSession.close();
+          unsubscribeRecovery?.();
+          throw new Error(`[${name}] configured temporary loop manager failed to start: `
+            + `${(error as Error)?.message ?? String(error)}`);
+        }
         deps.log(`[${name}] scheduled loop manager unavailable: ${(error as Error)?.name ?? 'Error'}`);
       }
     }
-  } else {
-    await deps.tmux.kill(name);
-    await deps.tmux.newSession(
-      name, runCwd, buildPaneCommand(launch, role.env, exitFile, wrappedArgv));
-    let panePid: number | null = null;
-    for (let i = 0; i < 40 && panePid === null; i++) {
-      panePid = await deps.tmux.panePid(name);
-      if (panePid === null) await deps.sleep(250);
-    }
-    if (panePid === null) throw new Error(`[${name}] could not resolve tmux pane pid`);
-    pid = panePid;
-    sessionHandle = new TmuxSession(name, pid, deps.tmux, deps.isAlive);
   }
   deps.log(
     `[${name}] up; pid=${pid} cwd=${runCwd} harness=${role.harness} session=${sessionBackend} mode=${mode}`);
@@ -967,16 +972,47 @@ export async function runOnce(
   // pane pid is known and is stopped when that pid dies (task dies with runner).
   monitorLoop ??= monitor?.run(pid);
 
+  recoveryController = new RoleRecoveryController({
+    role: name, identity: role.identity, stateDir: dir, now: deps.now, sleep: deps.sleep,
+    log: deps.log,
+    recoverAgent: async () => {
+      const evidence = await recoverAgentIdentity(arbiter!, role.identity);
+      return evidence.ok ? { ok: true } : { ok: false, reason: evidence.reason };
+    },
+    recoverOwner: async epoch => {
+      if (!ownerChannel?.recover) return { ok: true };
+      try { await ownerChannel.recover(epoch); return { ok: true }; }
+      catch (error) {
+        return { ok: false, reason: error instanceof Error
+          ? `OWNER_${error.name.toUpperCase()}` : 'OWNER_UNKNOWN_ERROR' };
+      }
+    },
+  });
+
   const start = deps.now();
   let nextLoopReloadAt = deps.now() + 30_000;
   let nextIdentityPollAt = deps.now();
+  let nextDaemonProbeAt = deps.now();
   let lastReloadError = '';
   let identityObserved = false;
   let identityAbsentSince: number | undefined;
   let retirementReason: AttemptResult['retirementReason'];
+  let supervisorRecycleRequired = false;
   while (sessionHandle.isAlive()) {
     await deps.sleep(temp ? 500 : 2000);
     const now = deps.now();
+    if (now >= nextDaemonProbeAt) {
+      nextDaemonProbeAt = now + 2_000;
+      const observation = daemonObserver.observe(
+        await deps.probeGeneration(resolvedMonitorDeps.env));
+      if (observation.kind === 'lost') recoveryController.noteLoss(observation.reason);
+      if (observation.kind === 'changed' || observation.kind === 'available'
+          || (observation.kind === 'baseline' && sessionStartedWithoutDaemonBaseline)) {
+        sessionStartedWithoutDaemonBaseline = false;
+        void recoveryController.recover(observation.generation).catch(error =>
+          deps.log(`[${name}] daemon recovery controller failed: ${(error as Error)?.name ?? 'Error'}`));
+      }
+    }
     if (temp && deps.shouldStop?.()) {
       retirementReason = requestedTempStopReason(dir) ?? 'supervisor-signal';
       deps.log(`[${name}] temporary supervisor retirement requested (${retirementReason})`);
@@ -994,7 +1030,7 @@ export async function runOnce(
       } else if (presence.state === 'absent' && identityObserved) {
         identityAbsentSince ??= now;
         // Require a continuous, time-bounded run of authoritative absence.
-        // The first positive observation is the readiness gate: cold tmux
+        // The first positive observation is the readiness gate: cold harness
         // starts may spend minutes loading the harness and briefing before the
         // agent creates/binds its identity, and absence before then is not a
         // close event. After readiness, debounce a real disappearance.
@@ -1024,6 +1060,11 @@ export async function runOnce(
     control?.setLoopManager(undefined);
     await loopManager.stop();
   }
+  // Let already-settled path operations publish their aggregate result before
+  // the shutdown fence invalidates the epoch. This never waits on I/O.
+  await Promise.resolve();
+  await Promise.resolve();
+  recoveryController?.cancel();
   control?.setConfigReloader(undefined);
   // Close the authenticated control route before releasing the binder lease;
   // otherwise the predecessor can unlink the replacement's new socket.
@@ -1033,21 +1074,19 @@ export async function runOnce(
     control = undefined;
   }
   if (ownerChannel) await ownerChannel.close();
-  ownerBinder?.release();
+  if (ownerChannel?.binderReleaseSafe?.() === false) {
+    deps.log(`[${name}] owner binder retained because client quiescence was not proven at shutdown`);
+    supervisorRecycleRequired = true;
+  } else ownerBinder?.release();
   if (monitor) { monitor.stop(); await monitorLoop; }
   unsubscribeRecovery?.();
-  if (acpSession && !sessionClosed) await acpSession.close();
+  if (agentSession && !sessionClosed) await agentSession.close();
   const elapsed = (deps.now() - start) / 1000;
   // Establish what actually happened before deciding anything. Absence of a
   // record is `unknown` — except when the console itself is gone, which is a
   // different event with a different consequence.
-  const exitRecord: ExitRecord = acpSession
-    ? acpSession.exitResult()
-      ?? { version: 1, class: 'unknown', detail: 'the ACP agent stopped without reporting an exit' }
-    : readExitRecord(exitFile)
-      ?? (await deps.tmux.has(name)
-        ? { version: 1, class: 'unknown', detail: 'the pane process ended without writing an exit record' }
-        : { version: 1, class: 'session-destroyed', detail: `the tmux session '${name}' no longer exists` });
+  const exitRecord: ExitRecord = agentSession.exitResult()
+    ?? { version: 1, class: 'unknown', detail: 'the agent session stopped without reporting an exit' };
   writeFileSync(exitFile, JSON.stringify({
     ...exitRecord, at: new Date(deps.now()).toISOString(), elapsedSecs: Number(elapsed.toFixed(1)),
   }) + '\n');
@@ -1059,7 +1098,8 @@ export async function runOnce(
     rotated = true;
     deps.log(`[${name}] ${why} -> rotated session-id; next start is FRESH`);
   };
-  if (exitRecord.detail.includes(ACP_CANCEL_DEADLINE_EXCEEDED))
+  if (exitRecord.detail.includes(ACP_CANCEL_DEADLINE_EXCEEDED)
+      || exitRecord.detail.includes(CODEX_APP_SERVER_CANCEL_DEADLINE_EXCEEDED))
     // This is a deliberate adapter reclamation, not evidence that resume state
     // is poisoned. Preserve the context even when the resumed generation hits
     // the same bound immediately; runSupervised still counts the fast exit and
@@ -1083,6 +1123,7 @@ export async function runOnce(
   } else deps.log(
     `[${name}] ${exitRecord.detail} (${elapsed.toFixed(0)}s) -> next start RESUMES context`);
 
+  if (supervisorRecycleRequired) throw new SupervisorRecycleRequiredError();
   return {
     elapsedSecs: elapsed, exit: exitRecord, rotated, mode, modelRecovery,
     ...(retirementReason ? { retirementReason } : {}),
@@ -1170,6 +1211,16 @@ export async function runSupervised(
       result = await attempt(
         name, { configPath: opts.configPath, allowResumeRotation: !ledger.resumeDiscarded }, deps);
     } catch (e) {
+      if (e instanceof SupervisorRecycleRequiredError) {
+        writeRestartLedger(dir, {
+          ...ledger,
+          lastReason: SUPERVISOR_RECYCLE_REQUIRED,
+          nextDelayMs: 0,
+          updatedAt: stamp(),
+        });
+        deps.log(`[${name}] supervisor recycle required: ${SUPERVISOR_RECYCLE_REQUIRED}`);
+        throw e;
+      }
       // A session that could not even start is an immediate failure like any
       // other; it must count, or an unstartable role loops forever.
       result = {
@@ -1264,7 +1315,10 @@ function fastFailSecsFor(name: string, configPath?: string): number {
 }
 
 /** Temp-agent entrypoint: run once, journal why it ended, then archive its evidence. */
-export async function runTemp(name: string, deps: Partial<RunnerDeps> = {}): Promise<void> {
+export async function runTemp(
+  name: string, deps: Partial<RunnerDeps> = {},
+  attempt: typeof runOnce = runOnce,
+): Promise<void> {
   const dir = agentDir(name, true);
   await markTempSupervisorActive(dir);
   let signal: NodeJS.Signals | undefined;
@@ -1275,7 +1329,7 @@ export async function runTemp(name: string, deps: Partial<RunnerDeps> = {}): Pro
   let result: AttemptResult | undefined;
   let failure: unknown;
   try {
-    result = await runOnce(name, { temp: true }, {
+    result = await attempt(name, { temp: true }, {
       ...deps,
       shouldStop: () => Boolean(signal) || (deps.shouldStop?.() ?? false),
     });
@@ -1287,6 +1341,7 @@ export async function runTemp(name: string, deps: Partial<RunnerDeps> = {}): Pro
     const requested = requestedTempStopReason(dir);
     const reason: TempTerminationReason = requested
       ?? result?.retirementReason
+      ?? (failure instanceof SupervisorRecycleRequiredError ? 'supervisor-recycle' : undefined)
       ?? (signal ? 'supervisor-signal' : failure ? 'startup-failure' : 'session-ended');
     // A service-manager stop can make the child connection close before the
     // runner reaches its normal loop. That is still a successful requested

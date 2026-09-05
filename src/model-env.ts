@@ -1,31 +1,27 @@
 import type { ResolvedRole } from './config.js';
+import { getAdapter } from './harness/registry.js';
 
 /**
  * Which environment variable a harness reads to pin the model it RUNS.
  *
  * This is not a convenience: for `claude-code` it is the only channel that
- * reaches the ACP backend at all. `buildLaunch` (tmux) passes `--model`, but
- * `buildAcpLaunch` launches the ACP adapter with no model argument, and that
- * adapter resolves its model in this order — ANTHROPIC_MODEL, then
+ * reaches the Claude Code ACP adapter. The adapter resolves its model in this
+ * order — ANTHROPIC_MODEL, then
  * `settings.model`, then a resumed session's live model, then its first
  * catalogue entry. A role's declared model was therefore invisible to every
  * ACP role, and a fleet-wide `defaults.env.ANTHROPIC_MODEL` silently outranked
  * an explicitly requested one.
  */
-export const MODEL_ENV_BY_HARNESS: Readonly<Record<string, string>> = {
-  'claude-code': 'ANTHROPIC_MODEL',
-};
-
 /** The model-pin variable for a harness, or undefined if it pins no model by env. */
 export function modelEnvVar(harness: string | undefined): string | undefined {
-  return harness === undefined ? undefined : MODEL_ENV_BY_HARNESS[harness];
+  return harness === undefined ? undefined : getAdapter(harness).agentSession.modelEnvironmentVariable();
 }
 
 export interface RoleModelEnvInput {
   harness: string;
   /** Already resolved by `resolveRoleModel` — may come from the fleet default. */
   model: string | undefined;
-  /** True when the role (or `--model`) named a model, including `model: null`. */
+  /** True when the resolved Brain named a model, including `model: null`. */
   modelWasExplicit: boolean;
   defaultsEnv?: Record<string, string>;
   roleEnv?: Record<string, string>;
@@ -46,7 +42,7 @@ export interface RoleModelEnv {
  * never disagree.
  *
  * Precedence, highest first:
- *   1. an explicit `model:` / `--model` on the role
+ *   1. an explicit `model:` on the resolved Brain
  *   2. the role's own `env:` pin
  *   3. the fleet `defaults.model`
  *   4. the fleet `defaults.env` pin

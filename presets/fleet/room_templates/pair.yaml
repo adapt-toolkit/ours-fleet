@@ -1,0 +1,13 @@
+version: 1
+description: "Implementation pair: Developer executes and Critic independently reviews"
+room: { quiet_membership: false, anonymous: false }
+contract: |
+  Developer owns implementation and verification evidence.
+  Critic independently challenges assumptions and withholds sign-off on material failures.
+  Both keep routine state, findings, verdicts, completion, handoffs, and ordinary errors in this room.
+  Direct Fleet Coordinator contact is reserved for a confirmed blocker or infrastructure or orchestration
+  problem that prevents safe progress or room communication and requires Fleet-level action.
+  Completion requires Developer evidence and Critic sign-off.
+members:
+  - { slot: developer, role: Developer, count: 1, agent_template: Developer }
+  - { slot: critic, role: Critic, count: 1, agent_template: Critic }

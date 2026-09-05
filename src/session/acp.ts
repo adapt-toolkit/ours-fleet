@@ -18,13 +18,14 @@ import type {
 } from './conversation-types.js';
 import { SessionEvents } from './events.js';
 import {
-  ACP_CANCEL_DEADLINE_EXCEEDED, SessionControlError, classifyChildExit, turnResult,
+  ACP_CANCEL_DEADLINE_EXCEEDED, SessionControlError, classifyChildExit,
+  sessionBackendCapabilities, turnResult,
 } from './types.js';
 import type {
   ConversationHandlePage, ExitRecord, InterruptOutcome, PermissionDecision, PromptDelivery,
   QueuedPrompt,
   SessionEvent,
-  RuntimeSelectorMetadata, SessionHandle, SessionSnapshot, SubmitPromptOptions,
+  AgentSession, RuntimeSelectorMetadata, SessionSnapshot, SubmitPromptOptions,
   TurnCancellationSource, TurnOutcome,
   TurnResult,
 } from './types.js';
@@ -233,8 +234,16 @@ export function runtimeSelector(
   return { value: option.currentValue, ...(selected?.name ? { label: selected.name } : {}) };
 }
 
+function reasoningFromModelId(modelId: unknown): RuntimeSelectorMetadata | undefined {
+  if (typeof modelId !== 'string') return undefined;
+  const match = modelId.match(/\[([^\]]+)\]$/u);
+  return match?.[1] ? { value: match[1] } : undefined;
+}
+
 export interface AcpSessionOptions {
   name: string;
+  /** Harness identity used only for honest optional capability reporting. */
+  harness?: string;
   argv: string[];
   cwd: string;
   env: Record<string, string>;
@@ -243,6 +252,8 @@ export interface AcpSessionOptions {
   permissions: CommonPermissions;
   /** Native permission-mode id to request via session/set_mode; undefined keeps the agent default. */
   modeId?: string;
+  /** Ordered explicit Brain choices that must be applied before readiness. */
+  configSelections?: Array<{ configId: string; value: string }>;
   /** Adapter-resolved live permission policy; separate from ACP agent-specific session modes. */
   permissionMode?: NonNullable<SessionSnapshot['permissionMode']>;
   /** Adapter-authenticated request-metadata vocabulary; never inferred from ACP `_meta`. */
@@ -296,8 +307,9 @@ export function classifyStopReason(stopReason: string | undefined): TurnOutcome 
  * Persistent ACP v1 client. It is the sole owner of the agent's stdio; all
  * human/automation attachment happens through the fleet role-control protocol.
  */
-export class AcpSession implements SessionHandle {
+export class AcpSession implements AgentSession {
   readonly backend = 'acp' as const;
+  readonly capabilities;
   readonly pid: number;
 
   private readonly child: ChildProcessWithoutNullStreams;
@@ -325,7 +337,7 @@ export class AcpSession implements SessionHandle {
   private queueDepth = 0;
   private exit: ExitRecord | null = null;
   private steeringSupported = false;
-  private capabilities?: acp.AgentCapabilities;
+  private agentCapabilities?: acp.AgentCapabilities;
   private runtimeModel?: RuntimeSelectorMetadata;
   private reasoningEffort?: RuntimeSelectorMetadata;
   private controllerCount = 0;
@@ -369,6 +381,7 @@ export class AcpSession implements SessionHandle {
     this.child = child;
     this.connection = connection;
     this.pid = child.pid ?? -1;
+    this.capabilities = sessionBackendCapabilities('acp', options.harness);
     this.events = new SessionEvents(join(options.stateDir, '.session-events.jsonl'));
     this.conversation = new ConversationEventStore(join(options.stateDir, '.conversation'), {
       roleId: options.name, log: line => options.log(`[${options.name}] ${line}`),
@@ -384,8 +397,7 @@ export class AcpSession implements SessionHandle {
       if (this.cancelForceKill) clearTimeout(this.cancelForceKill);
       this.cancelForceKill = undefined;
       this.releaseSteeringOccupancy('adapter exited');
-      // Record the child's real exit code/signal. The tmux path can only see a
-      // shell's `$?`; here the truth is available, so keep it.
+      // Record the child's real exit code/signal while the truth is available.
       const classified = classifyChildExit(code, signal);
       this.exit = this.cancelRecoveryReason
         ? { ...classified, detail: `${this.cancelRecoveryReason}; ${classified.detail}` }
@@ -1118,7 +1130,7 @@ export class AcpSession implements SessionHandle {
       this.settlePendingAutomatically(permissionId, pending, 'cancelled', undefined,
         'the session closed while this request was pending');
     this.releaseAllTools();
-    if (this.sessionId && this.capabilities?.sessionCapabilities?.close != null) {
+    if (this.sessionId && this.agentCapabilities?.sessionCapabilities?.close != null) {
       await this.connection.agent.request(
         acp.methods.agent.session.close, { sessionId: this.sessionId }).catch(() => undefined);
     }
@@ -1147,7 +1159,7 @@ export class AcpSession implements SessionHandle {
     if (initialized.protocolVersion !== acp.PROTOCOL_VERSION)
       throw new Error(
         `ACP protocol mismatch: agent selected ${initialized.protocolVersion}, client supports ${acp.PROTOCOL_VERSION}`);
-    this.capabilities = initialized.agentCapabilities;
+    this.agentCapabilities = initialized.agentCapabilities;
     const steering = initialized._meta?.steering;
     this.steeringSupported = steering !== null && typeof steering === 'object'
       && (steering as { supported?: unknown }).supported === true;
@@ -1155,15 +1167,19 @@ export class AcpSession implements SessionHandle {
     const persisted = this.options.mode === 'resume' && existsSync(this.sessionFile)
       ? readFileSync(this.sessionFile, 'utf8').trim()
       : '';
-    if (persisted && this.capabilities?.sessionCapabilities?.resume != null) {
+    let advertisedConfigOptions: acp.SessionConfigOption[] | null | undefined;
+    let advertisedModelId: string | undefined;
+    if (persisted && this.agentCapabilities?.sessionCapabilities?.resume != null) {
       const resumed = await this.connection.agent.request(acp.methods.agent.session.resume, {
         sessionId: persisted,
         cwd: this.options.cwd,
         mcpServers: this.declaredMcpServers(),
       });
-      this.captureRuntimeMetadata(resumed.configOptions);
+      advertisedConfigOptions = resumed.configOptions;
+      advertisedModelId = (resumed as { models?: { currentModelId?: string } }).models?.currentModelId;
+      this.captureRuntimeMetadata(advertisedConfigOptions, advertisedModelId);
       this.sessionId = persisted;
-    } else if (persisted && this.capabilities?.loadSession) {
+    } else if (persisted && this.agentCapabilities?.loadSession) {
       // `session/load` replays prior history as ordinary updates before the
       // response; those records carry `agent_replay` provenance, never `agent`.
       this.replaying = true;
@@ -1173,7 +1189,9 @@ export class AcpSession implements SessionHandle {
           cwd: this.options.cwd,
           mcpServers: this.declaredMcpServers(),
         }) as { configOptions?: acp.SessionConfigOption[] | null };
-        this.captureRuntimeMetadata(loaded.configOptions);
+        advertisedConfigOptions = loaded.configOptions;
+        advertisedModelId = (loaded as { models?: { currentModelId?: string } }).models?.currentModelId;
+        this.captureRuntimeMetadata(advertisedConfigOptions, advertisedModelId);
       } finally { this.replaying = false; }
       this.sessionId = persisted;
     } else {
@@ -1181,10 +1199,41 @@ export class AcpSession implements SessionHandle {
         cwd: this.options.cwd,
         mcpServers: this.declaredMcpServers(),
         ...(this.options.sessionMeta ? { _meta: this.options.sessionMeta } : {}),
-      }) as { sessionId: string; configOptions?: acp.SessionConfigOption[] | null };
+      }) as { sessionId: string; configOptions?: acp.SessionConfigOption[] | null;
+        models?: { currentModelId?: string } };
       this.sessionId = created.sessionId;
-      this.captureRuntimeMetadata(created.configOptions);
+      advertisedConfigOptions = created.configOptions;
+      advertisedModelId = created.models?.currentModelId;
+      this.captureRuntimeMetadata(advertisedConfigOptions, advertisedModelId);
     }
+    for (const selection of this.options.configSelections ?? []) {
+      if (!advertisedConfigOptions?.some(option => option.id === selection.configId)) {
+        if (selection.configId === 'reasoning_effort'
+            && reasoningFromModelId(advertisedModelId)?.value === selection.value) continue;
+        throw new Error(
+          `ACP agent did not advertise required session config option '${selection.configId}'`);
+      }
+      let configured: { configOptions: acp.SessionConfigOption[] };
+      try {
+        configured = await this.connection.agent.request(
+          acp.methods.agent.session.setConfigOption,
+          { sessionId: this.sessionId, configId: selection.configId, value: selection.value },
+        ) as { configOptions: acp.SessionConfigOption[] };
+      } catch (error) {
+        throw new Error(
+          `ACP agent refused required session config option '${selection.configId}' value '${selection.value}': `
+          + (error instanceof Error ? error.message : String(error)));
+      }
+      advertisedConfigOptions = configured.configOptions;
+      this.captureRuntimeMetadata(advertisedConfigOptions, advertisedModelId);
+      const applied = advertisedConfigOptions.find(option => option.id === selection.configId);
+      if (applied?.currentValue !== selection.value)
+        throw new Error(
+          `ACP agent did not apply required session config option '${selection.configId}' value '${selection.value}'`);
+    }
+    // Do not persist a session until every required Brain choice is live. A
+    // failed startup closes the ACP session; persisting its id first would make
+    // a later resume repeatedly target that invalid session.
     writeFileSync(this.sessionFile, this.sessionId + '\n', { mode: 0o600 });
     // Deliver the configured permission mode whichever way the session came up
     // (new, resume or load) — the launch flag never reaches an ACP agent. A
@@ -1210,9 +1259,11 @@ export class AcpSession implements SessionHandle {
     });
   }
 
-  private captureRuntimeMetadata(options: acp.SessionConfigOption[] | null | undefined): void {
+  private captureRuntimeMetadata(
+    options: acp.SessionConfigOption[] | null | undefined, modelId?: string,
+  ): void {
     this.runtimeModel = runtimeSelector(options, 'model');
-    this.reasoningEffort = runtimeSelector(options, 'thought_level');
+    this.reasoningEffort = runtimeSelector(options, 'thought_level') ?? reasoningFromModelId(modelId);
   }
 
   private async runPrompt(
@@ -1621,7 +1672,7 @@ export class AcpSession implements SessionHandle {
     });
   }
 
-  // ── conversation ledger access (SessionHandle) ─────────────────────────────
+  // ── conversation ledger access (AgentSession) ─────────────────────────────
 
   conversationPage(request: { after?: string; limit?: number } = {}): ConversationHandlePage {
     const floor = Number(this.conversationStartCursor ?? 0);

@@ -1,6 +1,6 @@
 import type {
   ConversationHandlePage, ExitRecord, InterruptOutcome, PromptOrigin, QueuedPrompt, SessionEvent,
-  SessionHandle, SessionSnapshot,
+  AgentSession, SessionSnapshot,
   SubmitPromptOptions, TurnCancellationSource, TurnResult,
 } from './types.js';
 import {
@@ -42,9 +42,10 @@ function retirementSignal(): { promise: Promise<void>; retire: () => void } {
  * producers retain ACP queue semantics while making their unsettled claim
  * visible before another producer can inspect idle state.
  */
-export class RoleTurnArbiter implements SessionHandle {
+export class RoleTurnArbiter implements AgentSession {
   readonly backend;
   readonly pid;
+  readonly capabilities;
   private tail: Promise<void> = Promise.resolve();
   private unsettled = 0;
   private stopping = false;
@@ -53,9 +54,10 @@ export class RoleTurnArbiter implements SessionHandle {
   /** Resolves the instant the CURRENT generation is retired. */
   private retirement = retirementSignal();
 
-  constructor(private readonly session: SessionHandle) {
+  constructor(private readonly session: AgentSession) {
     this.backend = session.backend;
     this.pid = session.pid;
+    this.capabilities = session.capabilities;
   }
 
   /**

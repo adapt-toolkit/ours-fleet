@@ -3,7 +3,8 @@ import { lstatSync } from 'node:fs';
 
 import { ConfigError, ROLE_NAME_RE } from '../config.js';
 import type { ResolvedRole } from '../config.js';
-import { parseDuration } from '../duration.js';
+import { sessionBackendCapabilities } from '../session/types.js';
+import { formatDuration, parseDuration } from '../duration.js';
 
 export interface LoopConfig {
   roles?: string[];
@@ -13,6 +14,10 @@ export interface LoopConfig {
   initial_delay?: string;
   jitter?: string;
 }
+
+/** Agent Template-local loops are implicitly scoped to the temporary agent. */
+export type AgentLoopConfig = Omit<LoopConfig, 'roles'>;
+export type AgentLoopsConfig = Record<string, AgentLoopConfig>;
 
 export interface ResolvedLoop {
   name: string;
@@ -39,6 +44,7 @@ const MAX_DURATION_MS = 30 * 24 * 60 * 60 * 1_000;
 const MAX_JITTER_MS = 60 * 60 * 1_000;
 const MAX_PROMPT_BYTES = 16 * 1024;
 const MAX_PROMPT_SCALARS = 12_000;
+const MAX_AGENT_LOOPS = 64;
 
 function substitute(value: unknown, vars: Record<string, string>): unknown {
   if (typeof value === 'string')
@@ -76,6 +82,7 @@ function digest(value: unknown): string {
 
 export function resolveLoops(
   block: unknown, baseFile: string, roles: ResolvedRole[], vars: Record<string, string>,
+  options: { assertTrustedSource?: boolean } = {},
 ): { loops: ResolvedLoop[]; byRole: Map<string, ResolvedRoleLoop[]> } {
   const byRole = new Map(roles.map(role => [role.name, [] as ResolvedRoleLoop[]]));
   if (block === undefined || block === null) return { loops: [], byRole };
@@ -116,8 +123,8 @@ export function resolveLoops(
       throw new ConfigError(`${where}: jitter must be less than interval and no more than 1h`);
     const prompt = normalizePrompt(value.prompt, `${where}: prompt`);
     if (enabled) for (const role of selected) {
-      if (role.session !== 'acp')
-        throw new ConfigError(`${where} selects role '${role.name}' with session '${role.session}'; scheduled loops require session: acp`);
+      if (!sessionBackendCapabilities(role.session, role.harness).promptInput)
+        throw new ConfigError(`${where} selects role '${role.name}' with session '${role.session}'; scheduled loops require managed prompt input`);
     }
     const promptHash = digest(prompt);
     const resolved: ResolvedLoop = {
@@ -138,8 +145,42 @@ export function resolveLoops(
   }
   for (const values of byRole.values()) values.sort((a, b) => a.name.localeCompare(b.name));
   out.sort((a, b) => a.name.localeCompare(b.name));
-  if (out.some(loop => loop.enabled)) assertSafeLoopConfig(baseFile);
+  if (out.some(loop => loop.enabled) && options.assertTrustedSource !== false)
+    assertSafeLoopConfig(baseFile);
   return { loops: out, byRole };
+}
+
+/** Resolve the canonical Agent Template schema without inventing a second loop language. */
+export function resolveAgentLoops(
+  block: unknown, role: ResolvedRole, sourceFile = '(temporary Agent loop)',
+): ResolvedRoleLoop[] {
+  if (block === undefined) return [];
+  if (!block || typeof block !== 'object' || Array.isArray(block))
+    throw new ConfigError(`${sourceFile}: Agent loops must be a non-empty map`);
+  if (!Object.keys(block as Record<string, unknown>).length)
+    throw new ConfigError(`${sourceFile}: Agent loops must be non-empty; use an explicit no-loops override to disable template loops`);
+  if (Object.keys(block as Record<string, unknown>).length > MAX_AGENT_LOOPS)
+    throw new ConfigError(`${sourceFile}: Agent loops may contain at most ${MAX_AGENT_LOOPS} entries`);
+  const scoped = Object.fromEntries(Object.entries(block as Record<string, unknown>).map(([name, raw]) => {
+    if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return [name, raw];
+    const value = raw as Record<string, unknown>;
+    if (Object.hasOwn(value, 'roles'))
+      throw new ConfigError(`${sourceFile}: Agent loop '${name}' has unknown key roles; Agent loops are implicitly scoped`);
+    return [name, { ...value, roles: [role.name] }];
+  }));
+  return resolveLoops(scoped, sourceFile, [role], {}, { assertTrustedSource: false })
+    .byRole.get(role.name) ?? [];
+}
+
+/** Fully explicit private snapshot form; prompt text is retained for deterministic recovery. */
+export function canonicalAgentLoops(loops: ResolvedRoleLoop[]): AgentLoopsConfig {
+  return Object.fromEntries(loops.map(loop => [loop.name, {
+    enabled: loop.enabled,
+    interval: formatDuration(loop.intervalMs),
+    initial_delay: formatDuration(loop.initialDelayMs),
+    jitter: formatDuration(loop.jitterMs),
+    prompt: loop.prompt,
+  }]));
 }
 
 function assertSafeLoopConfig(path: string): void {

@@ -1,20 +1,25 @@
 #!/usr/bin/env node
 import { spawn as spawnChild } from 'node:child_process';
+import { randomUUID } from 'node:crypto';
 import { existsSync, mkdirSync, readFileSync, readdirSync, statSync } from 'node:fs';
 import { realpathSync } from 'node:fs';
 import { join as joinPath, resolve as resolvePath } from 'node:path';
 import { createInterface } from 'node:readline';
 import { Command } from 'commander';
 import { VERSION } from './version.js';
+import { INIT_COMPLETION_GUIDANCE } from './init-guidance.js';
+import { migrateLegacyStarterPresets, migratePackagedRoleDefaults } from './preset-migration.js';
+import {
+  executeInitWizard, isInteractiveTerminal, publishSetup, TerminalPrompter,
+} from './init-wizard.js';
 import {
   analyzeInstalls, buildInfo, buildLabel, discoverInstalls, runningLabel,
 } from './provenance.js';
-import { agentDir, agentsRoot, tmpRoot, logsRoot, deriveXdgRuntimeDir } from './paths.js';
-import { findRole, loadConfig, ROLE_NAME_RE } from './config.js';
+import { agentDir, agentsRoot, tmpRoot, logsRoot, deriveXdgRuntimeDir, defaultConfigPath } from './paths.js';
+import { findRole, loadConfig, ROLE_NAME_RE, type AgentSelection } from './config.js';
 import type { YamlMode } from './config-yaml.js';
 import { formatDuration } from './duration.js';
-import { resolvedPlan } from './resolved-plan.js';
-import { Tmux, tmuxArgs } from './tmux.js';
+import { redactSensitive, resolvedPlan, resolvedRolePlan } from './resolved-plan.js';
 import { pickBackend } from './supervisor/index.js';
 import { up, down, type OpsDeps } from './ops.js';
 import { readRestartLedger, runSupervised, runTemp } from './runner.js';
@@ -29,13 +34,13 @@ import type { WatchdogReport } from './watchdog/report.js';
 import { watchdogAddressable } from './watchdog/query.js';
 import { lastProvenance, type SpawnOpts } from './spawn.js';
 import { stringify } from 'yaml';
-import { resolvedRolePlan } from './resolved-plan.js';
 import { creationBuildNote, formatProvenance, readProvenance } from './creation.js';
 import { doctor } from './doctor.js';
 import {
   allWarnings, analyzeFleetPermissions, effectivePermissionMode, formatNative,
 } from './permissions.js';
 import { AI_DOCS } from './docs.js';
+import { renderAgentConfiguration, selectionOrigin, summarizeResolvedLaunch } from './lifecycle-summary.js';
 import { classifyActivity, describeSessionState } from './session/activity.js';
 import type { SessionActivity } from './session/types.js';
 import {
@@ -55,6 +60,11 @@ import { WebAccessStore, passwordAccess, validatePublicOrigin } from './web/acce
 import {
   FLEET_PROXY_CALLER_ENV, FLEET_PROXY_STATE_DIR_ENV, type ManagedFleetSpawnResult,
 } from './fleet-proxy.js';
+import {
+  beginFleetAuditCollection, consumeFleetAuditCollection, FleetCliExit,
+  setFleetAuditLifecycleCheckpoint,
+  type FleetAuditAttempt, type FleetCommandOutcomeClass,
+} from './fleet-command-audit.js';
 import './harness/claude-code.js';   // registers the claude-code adapter
 import './harness/codex.js';         // registers the codex adapter
 import { registerTemplateCommands, registerTaskCommands, registerRoomCommands } from './rooms-tasks/cli.js';
@@ -86,7 +96,9 @@ const roleLifecycle = (configPath: string | undefined, operationDeps: OpsDeps) =
     status: async roleId => (await query.detail(roleId)).status });
 };
 
-const die = (e: unknown): never => { console.error(String(e instanceof Error ? e.message : e)); process.exit(1); };
+const die = (e: unknown): never => {
+  console.error(String(e instanceof Error ? e.message : e)); throw new FleetCliExit(1);
+};
 
 /** Exec a child with our stdio (logs/attach). */
 const passthrough = (cmd: string, args: string[]) =>
@@ -97,11 +109,12 @@ const passthrough = (cmd: string, args: string[]) =>
 
 const program = new Command()
   .name('ours-fleet')
-  .description('Fleet of persistent, identity-bound AI agents — selectable harness and tmux/ACP sessions.')
+  .description('Fleet of persistent, identity-bound AI agents over provider-neutral managed sessions.')
   .enablePositionalOptions()
+  .exitOverride()
   .version(VERSION);
 
-const cOpt = (cmd: Command) => cmd.option('-c, --configuration <file>', 'config file (default: ~/fleet.yaml + ~/fleet.d/)');
+const cOpt = (cmd: Command) => cmd.option('-c, --configuration <file>', 'manifest (default: ~/fleet.yaml; documents under ~/fleet/)');
 
 const collect = (value: string, previous: string[]) => [...previous, value];
 
@@ -168,8 +181,8 @@ const MAX_OWNER_UPDATE_BYTES = 1_024;
 
 function ownerChannelStateDir(roleName: string, configuration?: string): string {
   const role = findRole(loadConfig(configuration), roleName);
-  if (role.session !== 'acp')
-    throw new Error(`role '${roleName}' uses session '${role.session}', but owner-channel management requires ACP`);
+  if (role.session !== 'acp' && role.session !== 'codex-app-server')
+    throw new Error(`role '${roleName}' uses session '${role.session}', but owner-channel management requires managed control`);
   if (!role.owner_channel)
     throw new Error(`role '${roleName}' has no owner_channel configured`);
   const stateDir = acpStateDir(roleName);
@@ -238,6 +251,19 @@ function parseCodexConfig(values: string[] | undefined): Record<string, string |
   return out;
 }
 
+function parseAgentSelection(raw: string | undefined, kind: 'brain' | 'role'): AgentSelection | undefined {
+  if (raw === undefined) return undefined;
+  if (ROLE_NAME_RE.test(raw)) return { ref: raw };
+  if (!raw.startsWith('inline:'))
+    throw new Error(`invalid --${kind}; use a declared ID or inline:{...}`);
+  let value: unknown;
+  try { value = JSON.parse(raw.slice('inline:'.length)); }
+  catch { throw new Error(`invalid --${kind} inline mapping`); }
+  if (!value || typeof value !== 'object' || Array.isArray(value))
+    throw new Error(`invalid --${kind} inline mapping`);
+  return { inline: value as Record<string, unknown> };
+}
+
 cOpt(program.command('config').description('validate + print the merged plan (no side effects)'))
   .option('--json', 'emit the stable, versioned, secret-safe resolved plan')
   .option('--yaml-mode <mode>', 'non-plain YAML policy: compat|strict', 'compat')
@@ -277,11 +303,12 @@ cOpt(program.command('config').description('validate + print the merged plan (no
         console.log(`    source:      ${r.sourceFile}`);
         if (r.cwd) console.log(`    cwd:         ${r.cwd}`);
         if (r.model) console.log(`    model:       ${r.model}`);
+        if (r.effort) console.log(`    effort:      ${r.effort}`);
         if (r.harness_options && Object.keys(r.harness_options).length)
-          console.log(`    options:     ${JSON.stringify(r.harness_options)}`);
+          console.log(`    options:     ${JSON.stringify(redactSensitive(r.harness_options))}`);
         if (r.coordinator) console.log(`    coordinator: ${r.coordinator}`);
         if (r.mission) console.log(`    mission:     ${r.mission.split('\n')[0]}`);
-        if (r.oversee?.length) console.log(`    oversees:    ${r.oversee.map(o => `${o.role}@${o.interval}`).join(', ')}`);
+        if (r.oversee?.length) console.log(`    oversees:    ${r.oversee.map(o => `${o.agent}@${o.interval}`).join(', ')}`);
         if (r.isolation) {
           const iso = r.isolation;
           const caps = [
@@ -363,17 +390,12 @@ cOpt(program.command('force-restart [names...]').description('re-sync + bounce F
     } catch (e) { die(e); }
   });
 
-program.command('ls').description('list running fleet sessions')
-  .action(async () => {
-    // Each session has its own tmux server (#32), so there is no single server
-    // to ask: the known role names ARE the list of servers to poll.
-    const names: string[] = [];
+cOpt(program.command('ls').description('list running declared persistent Agent sessions'))
+  .action(async (opts: { configuration?: string }) => {
     const acp: string[] = [];
-    for (const root of [agentsRoot(), tmpRoot()]) {
-      if (!existsSync(root)) continue;
-      for (const name of readdirSync(root)) {
-        names.push(name);
-        const stateDir = joinPath(root, name);
+    const cfg = loadConfig(opts.configuration);
+    for (const { name } of cfg.roles) {
+        const stateDir = agentDir(name);
         if (!existsSync(controlSocketPath(stateDir))) continue;
         try {
           const response = await controlRequest(stateDir, { command: 'status' }, 2_000);
@@ -387,16 +409,14 @@ program.command('ls').description('list running fleet sessions')
               : observed.state === 'quiet' ? ' (no recent agent activity)' : ''}`);
           }
         } catch { /* ignore stale sockets */ }
-      }
     }
-    const tmux = await new Tmux().list(names);
-    console.log([tmux, ...acp].filter(Boolean).join('\n') || '(none)');
+    console.log(acp.join('\n') || '(none)');
   });
 
 program.command('attach <name>').description('open the live console (Ctrl-b d to leave)')
   .action(async name => {
     const stateDir = acpStateDir(name);
-    if (!stateDir) process.exit(await passthrough('tmux', tmuxArgs(name, ['attach', '-t', name])));
+    if (!stateDir) throw new SessionControlError('offline', 'agent session is offline');
     try {
       const { socket, send } = await followControl(stateDir, message => {
         if ('event' in message) renderSessionEvent(message.event as SessionEvent);
@@ -420,7 +440,7 @@ program.command('attach <name>').description('open the live console (Ctrl-b d to
     } catch (e) { die(e); }
   });
 
-/** Classify a raw tmux failure: only "no such session" proves the pane is gone. */
+/** Preserve typed control failures and classify only definite missing-session errors as offline. */
 const asControlError = (e: unknown): SessionControlError => {
   if (e instanceof SessionControlError) return e;
   const message = e instanceof Error ? e.message : String(e);
@@ -449,20 +469,15 @@ program.command('peek <name> [lines]').description('pane snapshot without attach
           throw new SessionControlError(response.kind ?? 'backend', response.error ?? 'peek failed');
         const events = (response.result as { events?: SessionEvent[] } | undefined)?.events ?? [];
         for (const event of events.slice(-(lines ? Number(lines) : 40))) renderSessionEvent(event);
-      } else {
-        console.log(await new Tmux().capture(name, lines ? Number(lines) : 40));
-      }
+      } else throw new SessionControlError('offline', 'agent session is offline');
     }
     catch (e) { die(controlFailure(name, 'peek', e)); }
   });
 
 program.command('send <name> [text...]').description("type into the agent's console")
-  .option('--key <key>', 'send a raw key instead (Escape, Up, C-c, ...)')
   .action(async (name, text, opts) => {
     const stateDir = acpStateDir(name);
-    if (stateDir && opts.key) die('--key is available only for tmux sessions');
-    if (!stateDir && !opts.key && !text?.length) die('nothing to send: give text or --key');
-    if (stateDir && !text?.length) die('nothing to send: give text');
+    if (!text?.length) die('nothing to send: give text');
     try {
       if (stateDir) {
         // Returns on queue acceptance: a turn already running is not a failure.
@@ -474,8 +489,7 @@ program.command('send <name> [text...]').description("type into the agent's cons
         console.log(queued?.queuedBehind
           ? `queued for ${name} behind ${queued.queuedBehind} running turn(s)`
           : `queued for ${name}`);
-      } else if (opts.key) await new Tmux().sendKey(name, opts.key);
-      else await new Tmux().sendText(name, text.join(' '));
+      } else throw new SessionControlError('offline', 'agent session is offline');
     } catch (e) {
       die(controlFailure(name, 'send', e, asControlError(e).kind === 'timeout'
         ? '\n  The prompt may already have been delivered — do not assume it was lost.'
@@ -489,8 +503,9 @@ program.command('logs <name>').description('show the role log').option('-f, --fo
     process.exit(await passthrough(cmd, args));
   });
 
-program.command('status <name>').description('unit/agent state')
-  .action(async name => {
+cOpt(program.command('status <name>').description('declared persistent Agent unit/session state'))
+  .action(async (name, opts: { configuration?: string }) => {
+    findRole(loadConfig(opts.configuration), name);
     console.log(await pickBackend().status(name));
     // A role outlives the artifact that created it. If a different build is
     // reporting now, its settings may resolve differently than at creation.
@@ -541,7 +556,7 @@ program.command('status <name>').description('unit/agent state')
           // (FLEET-002). Say which question each field answers.
           console.log(describeSessionState(snapshot.readiness, snapshot.activity));
         }
-      } catch { console.log('session: acp control unavailable'); }
+      } catch { console.log('managed session control unavailable'); }
     }
     // Loop health is asked of the live manager first: when its state writes are
     // failing it is the ONLY source that can say so — the stored file is frozen
@@ -678,12 +693,13 @@ cOpt(loopsCommand.command('status [role] [loop]').description('show live or stor
     } catch (error) { loopFailure(error, opts.json === true); }
   });
 
-cOpt(loopsCommand.command('reload <role>').description('reload trusted scheduled-loop config in a live ACP role'))
+cOpt(loopsCommand.command('reload <role>').description('reload trusted scheduled-loop config in a live managed role'))
   .option('--json', 'emit stable JSON')
   .action(async (roleName, opts) => {
     try {
       const { role } = selectLoopConfig(opts.configuration, roleName);
-      if (role.session !== 'acp') throw new Error(`role '${roleName}' is not ACP-compatible`);
+      if (role.session !== 'acp' && role.session !== 'codex-app-server')
+        throw new Error(`role '${roleName}' has no managed session control`);
       const stateDir = permanentLoopControlDir(roleName);
       if (!stateDir) throw new SessionControlError('control-unavailable',
         `role '${roleName}' has no live authenticated ACP control socket`);
@@ -707,7 +723,8 @@ for (const command of ['run-now', 'disable', 'enable'] as const) {
     .action(async (roleName, loopName, opts) => {
       try {
         const { role, definitions } = selectLoopConfig(opts.configuration, roleName, loopName);
-        if (role.session !== 'acp') throw new Error(`role '${roleName}' is not ACP-compatible`);
+        if (role.session !== 'acp' && role.session !== 'codex-app-server')
+          throw new Error(`role '${roleName}' has no managed session control`);
         const definition = definitions.find(loop => loop.name === loopName)!;
         if (command === 'enable' && !definition.enabled)
           throw new Error(`loop '${loopName}' is disabled in YAML; edit the config before enabling it`);
@@ -1033,50 +1050,36 @@ cOpt(program.command('rm <name>').description('stop + remove a role (temporary e
   });
 
 cOpt(program.command('spawn [name]').description('spawn a new agent (permanent by default)'))
-  .option('--role <name>', 'role name (alternative to the positional name)')
+  .option('--name <name>', 'agent name (alternative to the positional name)')
+  .option('--brain <selection>', 'Brain ID or inline:{...} definition')
+  .option('--role <selection>', 'Role ID or inline:{...} definition')
   .option('--temp', 'temporary: independent transient supervisor, archived on retirement, gone on reboot')
-  .option('--harness <id>', 'harness adapter (default: defaults.harness)')
-  .option('--session <backend>', 'session backend: tmux|acp (default: defaults.session or tmux)')
-  .option('--mission <text>', 'one-line mission')
-  .option('--mission-file <path>', 'UTF-8 mission text (mutually exclusive with --mission)')
-  .option('--identity <name>', 'ours identity to bind (default: role name)')
+  .option('--identity <name>', 'ours identity to bind (default: Agent name)')
   .option('--cwd <dir>', 'working directory')
   .option('--coordinator <name>', 'announce target')
-  .option('--model <id>', 'model id to launch on (e.g. claude-fable-5); default: launcher default')
-  .option('--permission-mode <mode>', 'harness permission mode (Codex: untrusted|on-request|never; Claude: native values)')
   .option('--approval <mode>', 'fleet permission mode: ask|auto|allow (Codex ACP allow selects agent-full-access; deny is deprecated)')
   .option('--filesystem <mode>', 'common filesystem intent: read-only|workspace|unrestricted')
   .option('--unattended <mode>', 'permission behavior without a console: deny|wait')
-  .option('--sandbox <mode>', 'Codex sandbox: read-only|workspace-write|danger-full-access')
-  .option('--profile <name>', 'Codex profile file name ($CODEX_HOME/<name>.config.toml)')
-  .option('--launcher <mode>', 'Codex launcher: auto|ours-codex|codex (default: auto)')
-  .option('--search', 'enable Codex live web search')
-  .option('--codex-config <key=value>', 'Codex config override (repeatable)', collect, [])
-  .option('--add-dir <dir>', 'additional Codex writable directory (repeatable)', collect, [])
-  .option('--monitor', 'legacy: consent to arm Codex\'s native monitor (wake owner is monitor.mode in YAML)')
-  .option('--bio-file <file>', 'public bio (file)')
-  .option('--persona-file <file>', 'persona / operating contract (file)')
   .option('--isolation-file <path>', 'file holding an isolation: mapping (same schema as fleet.yaml)')
+  .option('--loops-file <path>', 'owner-only YAML containing exactly loops: for this temporary agent')
+  .option('--no-loops', 'explicitly disable temporary-agent loops')
   .option('--dry-run', 'validate and print without reserving or creating anything')
   .option('--json', 'with --dry-run, emit a stable secret-safe JSON result')
   .action(async (name, opts) => {
     try {
-      const roleName = String(name ?? opts.role ?? '');
-      if (!roleName) throw new Error('role name is required (positional or --role)');
-      if (name && opts.role && name !== opts.role)
-        throw new Error(`positional role '${name}' conflicts with --role '${opts.role}'`);
+      const roleName = String(name ?? opts.name ?? '');
+      if (!roleName) throw new Error('agent name is required (positional or --name)');
+      if (name && opts.name && name !== opts.name)
+        throw new Error(`positional agent name conflicts with --name`);
       const o: SpawnOpts = {
-        name: roleName, temp: opts.temp, harness: opts.harness, session: opts.session, mission: opts.mission,
-        missionFile: opts.missionFile,
+        name: roleName, temp: opts.temp,
+        brain: parseAgentSelection(opts.brain, 'brain'), role: parseAgentSelection(opts.role, 'role'),
         identity: opts.identity, cwd: opts.cwd, coordinator: opts.coordinator,
-        model: opts.model,
-        permissionMode: opts.permissionMode, approval: opts.approval,
+        approval: opts.approval,
         filesystem: opts.filesystem, unattended: opts.unattended,
-        sandbox: opts.sandbox, profile: opts.profile,
-        launcher: opts.launcher, search: opts.search,
-        codexConfig: parseCodexConfig(opts.codexConfig), addDirs: opts.addDir, monitor: opts.monitor,
-        bioFile: opts.bioFile, personaFile: opts.personaFile,
         isolationFile: opts.isolationFile, configPath: opts.configuration,
+        loopsFile: opts.loopsFile, noLoops: opts.loops === false,
+        loopSource: opts.loopsFile || opts.loops === false ? 'cli' : 'omitted',
         dryRun: opts.dryRun, json: opts.json,
       };
       if (o.json && !o.dryRun) throw new Error('--json is currently valid only with --dry-run');
@@ -1089,7 +1092,7 @@ cOpt(program.command('spawn [name]').description('spawn a new agent (permanent b
           process.stdout.write(`${JSON.stringify({
             schemaVersion: result.schemaVersion,
             warning: result.warning,
-            roleDocument: result.roleDocument,
+            roleDocument: redactSensitive(result.roleDocument),
             resolvedRole: resolvedRolePlan(result.resolvedRole),
           }, null, 2)}\n`);
         } else {
@@ -1102,7 +1105,7 @@ cOpt(program.command('spawn [name]').description('spawn a new agent (permanent b
       if (proxyStateDir) {
         // Paths entered in the agent shell belong to that shell's cwd, not the
         // supervisor process. Normalize before crossing the control boundary.
-        for (const key of ['missionFile', 'bioFile', 'personaFile', 'isolationFile'] as const) {
+        for (const key of ['isolationFile', 'loopsFile'] as const) {
           if (o[key]) o[key] = resolvePath(o[key]!);
         }
         const response = await controlRequest(
@@ -1123,6 +1126,7 @@ cOpt(program.command('spawn [name]').description('spawn a new agent (permanent b
           + `monitor=${result.monitor.mode} interrupt=${result.monitor.interrupt}`);
         if (result.inherited.length)
           console.log(`  inherited omitted defaults from ${result.caller}: ${result.inherited.join(', ')}`);
+        if (result.configuration) console.log(`  ${renderAgentConfiguration(result.configuration)}`);
         console.log(`→ watch it: ours-fleet peek ${result.role}   |   attach: ours-fleet attach ${result.role}`);
         return;
       }
@@ -1145,6 +1149,13 @@ cOpt(program.command('spawn [name]').description('spawn a new agent (permanent b
       }
       console.log(`  permission=${plannedPermissionMode.fleetMode} `
         + `native=${plannedPermissionMode.nativeMode}`);
+      console.log(`  ${renderAgentConfiguration(summarizeResolvedLaunch(
+        created.plan.preview.resolvedRole, {
+          role: selectionOrigin(o.role ?? o.agentDefinition?.role),
+          brain: selectionOrigin(o.brain ?? o.agentDefinition?.brain),
+          permissionMode: plannedPermissionMode,
+        },
+      ))}`);
       console.log(`→ watch it: ours-fleet peek ${roleName}   |   attach: ours-fleet attach ${roleName}`);
     } catch (e) { die(e); }
   });
@@ -1161,14 +1172,68 @@ cOpt(program.command('doctor').description('prerequisite report'))
       yamlMode: opts.yamlMode as YamlMode,
     });
     for (const c of rep.checks) console.log(`${c.ok ? 'ok  ' : 'MISS'} ${c.name.padEnd(22)} ${c.detail}`);
-    process.exit(rep.ok ? 0 : 1);
+    if (!rep.ok) throw new FleetCliExit(1);
   });
 
-program.command('init').description('one-time host setup (units, dirs, linger)')
-  .action(async () => {
-    for (const d of [agentsRoot(), tmpRoot(), logsRoot()]) mkdirSync(d, { recursive: true });
-    for (const m of await pickBackend().init(binPath)) console.log(m);
-    console.log('\nNext: copy examples/fleet.yaml to ~/fleet.yaml, edit, then: ours-fleet up');
+cOpt(program.command('init').description('interactively add missing Fleet defaults while preserving existing configuration'))
+  .action(async (opts: { configuration?: string }) => {
+    const configuration = opts.configuration ?? defaultConfigPath();
+    if (!isInteractiveTerminal(process.stdin, process.stdout))
+      die('ours-fleet init requires an interactive terminal; no host setup ran and no configuration changed');
+    try {
+      const result = await executeInitWizard(
+        new TerminalPrompter(process.stdin, process.stdout), configuration, {
+          async hostSetup() {
+            for (const d of [agentsRoot(), tmpRoot(), logsRoot()]) mkdirSync(d, { recursive: true });
+            for (const message of await pickBackend().init(binPath)) console.log(message);
+          },
+          publish: publishSetup,
+        },
+      );
+      if (!result) {
+        console.log('Fleet setup cancelled. No host setup ran and no configuration changed.');
+        return;
+      }
+      const prior = result.manifestExisted && result.rootExisted ? 'manifest and split configuration'
+        : result.manifestExisted ? 'manifest only'
+          : result.rootExisted ? 'split configuration only' : 'no previous targets';
+      console.log(`${result.replacedExisting ? 'Preserved existing files and added missing defaults to' : 'Created'} Fleet setup: ${result.configPath} and ${result.splitRoot}`);
+      console.log(`Previous targets: ${prior}.`);
+      console.log(`Private recovery record: ${result.recoveryPath}`);
+      console.log(INIT_COMPLETION_GUIDANCE);
+    } catch (error) { die(error); }
+  });
+
+cOpt(program.command('migrate-agent-templates')
+  .description('dry-run the exact legacy starter split; add --write to apply atomically')
+  .option('--write', 'apply the reviewed migration and retain a private recovery backup'))
+  .action((opts: { configuration?: string; write?: boolean }) => {
+    try {
+      const result = migrateLegacyStarterPresets(opts.configuration ?? defaultConfigPath(), { write: opts.write });
+      console.log(result.write ? 'Applied legacy starter migration.' : 'Dry run only; no files were changed.');
+      for (const move of result.moves) console.log(`Move ${move.from} -> ${move.to}`);
+      for (const addition of result.additions) console.log(`Add ${addition}`);
+      console.log(`Staging path: ${result.stagingPath}`);
+      console.log(`Recovery backup: ${result.backupPath}`);
+      if (!result.write) console.log('Re-run with --write to apply this exact migration class.');
+    } catch (error) { die(error); }
+  });
+
+cOpt(program.command('migrate-role-defaults')
+  .description('dry-run adoption of exact revision-3 role defaults; add --write to apply atomically')
+  .option('--write', 'apply the reviewed migration and retain a private recovery backup'))
+  .action((opts: { configuration?: string; write?: boolean }) => {
+    try {
+      const result = migratePackagedRoleDefaults(opts.configuration ?? defaultConfigPath(), { write: opts.write });
+      console.log(result.write ? 'Applied packaged role-default migration.' : 'Dry run only; no files were changed.');
+      for (const path of result.removals) console.log(`Remove ${path}`);
+      for (const path of result.replacements) console.log(`Replace ${path}`);
+      for (const path of result.additions) console.log(`Add ${path}`);
+      for (const path of result.preserved) console.log(`Preserve customized ${path}`);
+      console.log(`Staging path: ${result.stagingPath}`);
+      console.log(`Recovery backup: ${result.backupPath}`);
+      if (!result.write) console.log('Re-run with --write to adopt only these exact recognized defaults.');
+    } catch (error) { die(error); }
   });
 
 const webCommand = cOpt(program.command('web').description('start or open the secure localhost fleet web console'))
@@ -1371,4 +1436,78 @@ cOpt(program.command('_run-watchdogs', { hidden: true }))
     } catch (e) { die(e); }
   });
 
-program.parseAsync(process.argv);
+async function parseFleetCli(): Promise<void> {
+  const spawnIndex = process.argv.indexOf('spawn');
+  if (spawnIndex >= 0 && process.argv.slice(spawnIndex + 1).some(arg =>
+    arg === '--harness' || arg.startsWith('--harness=') || arg === '--model' || arg.startsWith('--model='))) {
+    console.error('error: --harness and --model were removed; select a Brain with --brain');
+    throw new FleetCliExit(1);
+  }
+  try { await program.parseAsync(process.argv); }
+  catch (error) {
+    const commander = error as { code?: string; exitCode?: number };
+    if (commander.exitCode === 0) return;
+    if (typeof commander.exitCode === 'number') throw new FleetCliExit(
+      commander.exitCode, 'validation', 'not_started');
+    throw error;
+  }
+}
+
+async function runFleetCli(): Promise<void> {
+  const stateDir = process.env[FLEET_PROXY_STATE_DIR_ENV];
+  const caller = process.env[FLEET_PROXY_CALLER_ENV];
+  if (!stateDir || !caller) { await parseFleetCli(); return; }
+  const requestId = randomUUID();
+  let attempt: FleetAuditAttempt;
+  const begun = await controlRequest(stateDir, {
+    command: 'fleet_audit_begin', audit: { requestId, argv: process.argv.slice(2) },
+  });
+  if (!begun.ok) throw new SessionControlError(begun.kind ?? 'rejected', begun.error ?? 'fleet command audit refused');
+  attempt = begun.result as FleetAuditAttempt;
+  if (attempt.caller !== caller)
+    throw new SessionControlError('rejected', `fleet audit caller mismatch: expected '${caller}', got '${attempt.caller}'`);
+  let exitCode = 0;
+  let outcomeClass: FleetCommandOutcomeClass = 'success';
+  let effect: 'not_started' | 'completed' | 'unknown' = 'completed';
+  beginFleetAuditCollection();
+  setFleetAuditLifecycleCheckpoint(async presentations => {
+    const response = await controlRequest(stateDir, {
+      command: 'fleet_audit_present', audit: { presentations },
+    });
+    if (!response.ok) throw new SessionControlError(
+      response.kind ?? 'backend', response.error ?? 'Fleet lifecycle checkpoint delivery failed');
+  });
+  if (attempt.classification.decision !== 'allow') {
+    exitCode = 1; outcomeClass = 'denied'; effect = 'not_started';
+    console.error(`fleet supervisor proxy ${attempt.classification.decision}: ${attempt.classification.command}`);
+  } else {
+    const originalExit = process.exit;
+    process.exit = ((code?: number) => { throw new FleetCliExit(code ?? 0); }) as never;
+    try { await parseFleetCli(); }
+    catch (error) {
+      exitCode = error instanceof FleetCliExit ? error.exitCode : 1;
+      outcomeClass = error instanceof FleetCliExit ? error.outcomeClass : 'runtime';
+      effect = error instanceof FleetCliExit ? error.effect : 'unknown';
+      if (!(error instanceof FleetCliExit)) console.error(error instanceof Error ? error.message : String(error));
+    } finally { process.exit = originalExit; }
+  }
+  setFleetAuditLifecycleCheckpoint(undefined);
+  const metadata = consumeFleetAuditCollection();
+  if (metadata.failure) {
+    outcomeClass = metadata.failure.class; effect = metadata.failure.effect;
+  }
+  const finished = await controlRequest(stateDir, { command: 'fleet_audit_finish', audit: {
+    correlationId: attempt.correlationId, class: outcomeClass, exitCode, effect,
+    ...(metadata.resourceIds ? { resourceIds: metadata.resourceIds } : {}),
+    ...(metadata.presentations ? { presentations: metadata.presentations } : {}),
+  } });
+  if (!finished.ok)
+    throw new SessionControlError(finished.kind ?? 'backend', finished.error ?? `audit delivery failed after execution; effect status=${effect}`);
+  process.exitCode = exitCode;
+}
+
+void runFleetCli().catch(error => {
+  if (!(error instanceof FleetCliExit))
+    console.error(error instanceof Error ? error.message : String(error));
+  process.exitCode = error instanceof FleetCliExit ? error.exitCode : 1;
+});

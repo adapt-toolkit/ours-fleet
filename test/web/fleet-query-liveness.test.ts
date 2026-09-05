@@ -1,4 +1,4 @@
-import { mkdtempSync } from 'node:fs';
+import { mkdtempSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
@@ -46,7 +46,47 @@ async function status(
   return query.status(role(problems));
 }
 
+async function recoveryStatus(body: object) {
+  const stateDir = mkdtempSync(join(tmpdir(), 'fleet-query-recovery-'));
+  writeFileSync(join(stateDir, '.daemon-recovery.json'), JSON.stringify(body));
+  const query = new FleetQueryService({
+    repository: { stateDir: () => stateDir } as never, supervisor,
+    control: async () => ({ ok: true, result: {
+      backend: 'acp', alive: true, readiness: 'idle', sessionId: 'live-session',
+    } }) as never,
+  });
+  return query.status(role());
+}
+
 describe('authoritative session liveness precedence', () => {
+  it('bare query list projects only configured permanent Agents', async () => {
+    const permanent = role();
+    const temporary = { ...role(), id: 'RoomWorker', configured: false,
+      lifetime: 'temporary' as const, stateRef: { lifetime: 'temporary' as const } };
+    const orphan = { ...role(), id: 'OldState', configured: false, lifetime: 'orphan' as const };
+    const query = new FleetQueryService({
+      repository: { list: async () => [permanent, temporary, orphan], stateDir: () => undefined } as never,
+      supervisor,
+    });
+    const listed = await query.list();
+    expect(listed.map(item => item.role.id)).toEqual(['DetachedAcp']);
+  });
+  it('surfaces only redacted daemon recovery diagnostics', async () => {
+    const result = await recoveryStatus({
+      version: 1, identity: 'DetachedAcp', epoch: 'abc123', state: 'degraded', updatedAt: 'now',
+      paths: {
+        agent: { state: 'recovered', attempts: 1 },
+        owner: { state: 'degraded', attempts: 6, reason: 'OWNER_SECRET_BODY' },
+      },
+    });
+    expect(result.overall).toBe('attention');
+    const problem = result.problems.find(item => item.code === 'daemon_recovery');
+    expect(problem).toEqual(expect.objectContaining({
+      severity: 'warning', source: 'daemon-recovery',
+      detail: 'degraded; owner:degraded; epoch abc123',
+    }));
+    expect(JSON.stringify(problem)).not.toContain('OWNER_SECRET_BODY');
+  });
   it('reports stopped-service plus authoritative online/idle ACP as ready', async () => {
     const result = await status('idle');
     expect(result.overall).toBe('ready');

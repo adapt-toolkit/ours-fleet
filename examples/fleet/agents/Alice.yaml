@@ -1,0 +1,11 @@
+role: { ref: developer }
+brain: { ref: claude-default }
+identity: Alice
+coordinator: FleetCoordinator
+cwd: ${work_root}/alice
+permissions: { approval: ask, filesystem: workspace, unattended: deny }
+env:
+  EXAMPLE_FLAG: "1"
+monitor:
+  wake_sources: [message_received, file_received]
+  batch_ms: 2000

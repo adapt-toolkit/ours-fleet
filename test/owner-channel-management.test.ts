@@ -8,7 +8,7 @@ import { errBoundElsewhere } from '@ours.network/sdk/client';
 
 import { OwnerChannel } from '../src/owner-channel/channel.js';
 import type {
-  OursContactsView, OursInboundMessage, OursOps,
+  OursContactsView, OursInboundMessage, OursOps, OursRegisteredCommand,
 } from '../src/owner-channel/ours-client.js';
 import { OWNER_TASK_MAX_PER_OWNER, OWNER_TASK_TTL_MS } from '../src/owner-channel/tasks.js';
 import type { SessionHandle } from '../src/session/types.js';
@@ -24,6 +24,7 @@ class ManagementClient implements OursOps {
   calls: Array<{ name: string; args?: Record<string, unknown> }> = [];
   batches: unknown[][] = [];
   history = new Map<string, OursInboundMessage>();
+  commands: OursRegisteredCommand[] = [];
   /**
    * Established contacts and pending introductions are separate daemon
    * collections, and neither carries a bio or any other free text.
@@ -48,6 +49,10 @@ class ManagementClient implements OursOps {
   async bindIdentity(name: string) {
     this.calls.push({ name: 'bindIdentity', args: { name } });
     if (this.bindFailures-- > 0) throw this.bindError();
+  }
+  async registerCommands(commands: OursRegisteredCommand[]) {
+    this.commands = commands;
+    this.calls.push({ name: 'registerCommands', args: { count: commands.length } });
   }
   async listContacts() {
     this.calls.push({ name: 'listContacts', args: undefined });
@@ -77,7 +82,8 @@ class ManagementClient implements OursOps {
     const messages = batch.slice(0, limit).map((item, index) => historyMessage(item, index + 1));
     for (const message of messages) this.history.set(message.wire_id, message);
     if (batch.length > limit) this.batches.unshift(batch.slice(limit));
-    return { count: messages.length, messages, remaining: Math.max(0, batch.length - limit) };
+    return { messages, command_results: [], commands_handled: 0,
+      remaining: Math.max(0, batch.length - limit) };
   }
   async getHistoryItem(wireId: string) {
     this.calls.push({ name: 'getHistoryItem', args: { wireId } });
@@ -122,10 +128,12 @@ class ManagementClient implements OursOps {
   }
 }
 
-function setup(options: { agent?: string; owners?: string[] } = {}) {
-  const dir = mkdtempSync(join(tmpdir(), 'ours-owner-management-'));
+function setup(options: {
+  agent?: string; owners?: string[]; dir?: string; client?: ManagementClient;
+} = {}) {
+  const dir = options.dir ?? mkdtempSync(join(tmpdir(), 'ours-owner-management-'));
   dirs.push(dir);
-  const client = new ManagementClient();
+  const client = options.client ?? new ManagementClient();
   const logs: string[] = [];
   const queuePrompt = vi.fn(async () => ({
     promptId: 'managed-prompt', queuedBehind: 0,
@@ -153,6 +161,65 @@ afterEach(() => {
 });
 
 describe('OwnerChannel live management', () => {
+  it('durably accepts ready while unavailable and flushes once after Owner-channel restart', async () => {
+    const first = setup({ agent: AGENT });
+    const ready = { kind: 'room' as const, operation: 'activate' as const,
+      eventId: 'room-ready:2026-09-03T09:00:00.000Z', id: 'room-restart', name: 'Restart ready',
+      previousState: 'provisioning', newState: 'active', participants: [] };
+
+    // The control server can durably accept this while its Owner sink is not
+    // ready. No await/recover command or live send is involved.
+    await first.channel.notifyFleetLifecycle!([ready]);
+    expect(first.client.calls.filter(call => call.name === 'sendMessage')).toHaveLength(0);
+    expect(JSON.parse(readFileSync(join(first.dir, '.owner-channel-lifecycle-outbox.json'), 'utf8')))
+      .toMatchObject({ entries: [{ delivery: 'pending', presentation: { eventId: ready.eventId } }] });
+
+    const second = setup({ agent: AGENT, dir: first.dir });
+    await second.channel.start();
+    await second.channel.notifyFleetLifecycle!([ready]);
+    const notices = second.client.calls.filter(call => call.name === 'sendMessage'
+      && String(call.args?.text).includes('🏠 Room ready: Restart ready'));
+    expect(notices).toHaveLength(1);
+    expect(notices[0]?.args?.contact).toBe(OWNER);
+    expect(JSON.parse(readFileSync(join(first.dir, '.owner-channel-lifecycle-outbox.json'), 'utf8')))
+      .toMatchObject({ entries: [{ delivery: 'delivered' }] });
+    await second.channel.close();
+  });
+
+  it('never retries a ready notice whose send boundary became uncertain', async () => {
+    const first = setup({ agent: AGENT });
+    await first.channel.start();
+    first.client.failSendTo.add(OWNER);
+    const ready = { kind: 'room' as const, operation: 'activate' as const,
+      eventId: 'room-ready:uncertain', id: 'room-uncertain', name: 'Uncertain ready',
+      previousState: 'provisioning', newState: 'active', participants: [] };
+    await first.channel.notifyFleetLifecycle!([ready]);
+    expect(first.client.calls.filter(call => call.name === 'sendMessage')).toHaveLength(1);
+    await first.channel.close();
+
+    const second = setup({ agent: AGENT, dir: first.dir });
+    await second.channel.start();
+    expect(second.client.calls.filter(call => call.name === 'sendMessage')).toHaveLength(0);
+    expect(JSON.parse(readFileSync(join(first.dir, '.owner-channel-lifecycle-outbox.json'), 'utf8')))
+      .toMatchObject({ entries: [{ delivery: 'uncertain' }] });
+    await second.channel.close();
+  });
+
+  it('delivers a replayed detached-ready presentation exactly once to the authenticated Owner', async () => {
+    const { channel, client } = setup({ agent: AGENT });
+    await channel.start();
+    const ready = { kind: 'room' as const, operation: 'activate' as const,
+      eventId: 'room-ready:2026-09-03T09:00:00.000Z', id: 'room-detached', name: 'Detached ready',
+      previousState: 'provisioning', newState: 'active', participants: [] };
+    await channel.notifyFleetLifecycle!([ready]);
+    await channel.notifyFleetLifecycle!([ready]);
+    const notices = client.calls.filter(call => call.name === 'sendMessage'
+      && String(call.args?.text).includes('🏠 Room ready: Detached ready'));
+    expect(notices).toHaveLength(1);
+    expect(notices[0]?.args?.contact).toBe(OWNER);
+    await channel.close();
+  });
+
   /** One SDK-watch harness with deterministic retry sleeps. */
   function watchSetup(options: {
     watchState?: string;
@@ -280,7 +347,8 @@ describe('OwnerChannel live management', () => {
     await vi.waitFor(() => expect(watch.readState().reason).toBe('OWNER_WATCH_CONNECTED'));
     await watch.channel.close();
     expect(watch.logs.some(line => line.includes('OWNER_WATCH_STATE_RECOVERED'))).toBe(true);
-    expect(watch.client.calls[1]?.name).toBe('listIncomingMessages');
+    const calls = watch.client.calls.map(call => call.name);
+    expect(calls.indexOf('listIncomingMessages')).toBeGreaterThan(calls.indexOf('registerCommands'));
     expect(watch.client.watchCalls[0]?.since).toBe(0);
   });
 
@@ -491,29 +559,132 @@ describe('OwnerChannel live management', () => {
     await channel.close();
   });
 
-  it('deterministically reports a successful supervisor-proxied spawn to the owner', async () => {
+  it('keeps command invocation silent and delivers only semantic lifecycle events', async () => {
     const { channel, client } = setup({ agent: AGENT });
     await channel.start();
     client.batches.push([{
-      msg_id: 6, wire_id: 'owner-route-for-spawn', from: { id: OWNER }, text: '/status',
+      msg_id: 60, wire_id: 'owner-route-for-audit', from: { id: OWNER }, text: '/status',
     }], []);
     await channel.drain();
-    await channel.notifyFleetSpawn({
-      caller: 'Coordinator', role: 'DeveloperX', lifetime: 'temporary',
-      statePath: '/private/state', harness: 'codex', session: 'acp', model: 'gpt-test',
-      monitor: { mode: 'fleet', interrupt: true },
-      permissionMode: { fleetMode: 'allow', nativeMode: 'agent-full-access' },
-      inherited: ['harness', 'session', 'model'], creationActionId: 'spawn-action-1',
-    });
+    const begun = await channel.beginFleetCommandAudit!('request-audit-1', [
+      'task', 'create', '--title', 'Unicode Δ', '--brief', 'private',
+    ]);
+    const duplicate = await channel.beginFleetCommandAudit!('request-audit-1', [
+      'task', 'create', '--title', 'Unicode Δ', '--brief', 'private',
+    ]);
+    expect(duplicate.correlationId).toBe(begun.correlationId);
+    await channel.finishFleetCommandAudit!({ correlationId: begun.correlationId,
+      class: 'success', effect: 'completed', exitCode: 0, resourceIds: { task: 'task-1' },
+      presentations: [{ kind: 'task', operation: 'create', id: 'task-1', title: 'Unicode Δ',
+        previousState: 'none', newState: 'active', revision: 'created-1', agents: [] }] });
+    const retried = await channel.beginFleetCommandAudit!('request-audit-2', ['task', 'create']);
+    await channel.finishFleetCommandAudit!({ correlationId: retried.correlationId,
+      class: 'success', effect: 'completed', exitCode: 0, resourceIds: { task: 'task-1' },
+      presentations: [
+        { kind: 'task', operation: 'create', id: 'task-1', title: 'Unicode Δ',
+          previousState: 'none', newState: 'active', revision: 'created-1', agents: [] },
+        { kind: 'room', operation: 'create', id: 'room-1', name: 'Room Δ',
+          previousState: 'none', newState: 'provisioning', revision: 'room-created-1', participants: [] },
+      ] });
+    const texts = client.calls.filter(call => call.name === 'sendMessage')
+      .map(call => String(call.args?.text ?? ''));
+    expect(texts.filter(text => text.includes('Fleet command'))).toEqual([]);
+    expect(texts.filter(text => text.includes('🚀 Task started:'))).toEqual([
+      expect.stringContaining('Unicode Δ'),
+    ]);
+    expect(texts.filter(text => text.startsWith('⏳ Room “'))).toEqual([
+      expect.stringContaining('Room Δ'),
+    ]);
+    expect(texts.join('\n')).not.toContain('private');
+    expect(texts.join('\n')).not.toContain('argv');
+    await channel.close();
+  });
 
-    const notice = client.calls.filter(call => call.name === 'sendMessage').at(-1)?.args;
-    expect(notice?.contact).toBe(OWNER);
-    expect(notice?.replyToWireId).toBeUndefined();
-    expect(notice?.text).toContain('Coordinator spawned temporary agent DeveloperX');
-    expect(notice?.text).toContain('codex/acp, model gpt-test');
-    expect(notice?.text).toContain('fleet monitor with interruption');
-    expect(notice?.text).toContain('permission allow, native agent-full-access');
-    expect(notice?.text).not.toContain('/private/state');
+  it('does not depend on Owner delivery for command invocation', async () => {
+    const { channel, client, dir } = setup({ agent: AGENT });
+    await channel.start();
+    client.failSendTo.add(OWNER);
+    await expect(channel.beginFleetCommandAudit!('request-uncertain', ['task', 'list']))
+      .resolves.toMatchObject({ invocation: 'delivered' });
+    client.failSendTo.clear();
+    await expect(channel.beginFleetCommandAudit!('request-uncertain', ['task', 'list']))
+      .resolves.toMatchObject({ invocation: 'delivered' });
+    const ledger = JSON.parse(readFileSync(join(dir, '.owner-channel-command-audit.json'), 'utf8'));
+    expect(ledger.attempts[0]).toMatchObject({ invocation: 'delivered' });
+    expect(ledger.attempts[0]).not.toHaveProperty('outcome');
+    expect(client.calls.filter(call => call.name === 'sendMessage')).toHaveLength(0);
+    await channel.close();
+  });
+
+  it('retains the same ledger before Owner startup and flushes only never-attempted lifecycle delivery', async () => {
+    const { channel, client, dir } = setup({ agent: AGENT });
+    const begun = await channel.beginFleetCommandAudit!('request-before-owner-start', ['task', 'list']);
+    await expect(channel.finishFleetCommandAudit!({ correlationId: begun.correlationId,
+      class: 'success', effect: 'completed', exitCode: 0,
+      presentations: [{ kind: 'task', operation: 'create', eventId: 'startup-task-created',
+        id: 'task-startup', previousState: 'none', newState: 'active', agents: [] }] }))
+      .resolves.toMatchObject({ outcome: { delivery: 'sending' } });
+    expect(client.calls.filter(call => call.name === 'sendMessage')).toHaveLength(0);
+
+    await channel.start();
+    expect(client.calls.filter(call => call.name === 'sendMessage')).toHaveLength(1);
+    const ledger = JSON.parse(readFileSync(join(dir, '.owner-channel-command-audit.json'), 'utf8'));
+    expect(ledger.attempts).toHaveLength(1);
+    expect(ledger.attempts[0]).toMatchObject({ correlationId: begun.correlationId,
+      outcome: { delivery: 'delivered' } });
+
+    await channel.finishFleetCommandAudit!({ correlationId: begun.correlationId,
+      class: 'success', effect: 'completed', exitCode: 0,
+      presentations: [{ kind: 'task', operation: 'create', eventId: 'startup-task-created',
+        id: 'task-startup', previousState: 'none', newState: 'active', agents: [] }] });
+    expect(client.calls.filter(call => call.name === 'sendMessage')).toHaveLength(1);
+    await channel.close();
+  });
+
+  it('records outcome delivery uncertainty after a known completed effect without retry', async () => {
+    const { channel, client, dir } = setup({ agent: AGENT });
+    await channel.start();
+    const begun = await channel.beginFleetCommandAudit!('request-finish-uncertain', ['task', 'list']);
+    client.failSendTo.add(OWNER);
+    await expect(channel.finishFleetCommandAudit!({ correlationId: begun.correlationId,
+      class: 'success', effect: 'completed', exitCode: 0,
+      presentations: [{ kind: 'task', operation: 'started', id: 'task-1',
+        previousState: 'backlog', newState: 'active', agents: [] }] }))
+      .resolves.toMatchObject({ outcome: { delivery: 'uncertain' } });
+    client.failSendTo.clear();
+    await expect(channel.finishFleetCommandAudit!({ correlationId: begun.correlationId,
+      class: 'success', effect: 'completed', exitCode: 0,
+      presentations: [{ kind: 'task', operation: 'started', id: 'task-1',
+        previousState: 'backlog', newState: 'active', agents: [] }] }))
+      .resolves.toMatchObject({ outcome: { delivery: 'uncertain' } });
+    const ledger = JSON.parse(readFileSync(join(dir, '.owner-channel-command-audit.json'), 'utf8'));
+    expect(ledger.attempts[0].outcome).toMatchObject({ effect: 'completed', delivery: 'uncertain' });
+    expect(client.calls.filter(call => call.name === 'sendMessage')).toHaveLength(1);
+    await channel.close();
+  });
+
+  it('continues later lifecycle events after an uncertain duplicate while preserving aggregate uncertainty', async () => {
+    const { channel, client } = setup({ agent: AGENT });
+    await channel.start();
+    const taskEvent = { kind: 'task' as const, operation: 'create' as const, eventId: 'task-created-1',
+      id: 'task-1', title: 'Task', previousState: 'none', newState: 'provisioning', agents: [] };
+    const first = await channel.beginFleetCommandAudit!('request-uncertain-event-1', ['task', 'create']);
+    client.failSendTo.add(OWNER);
+    await expect(channel.finishFleetCommandAudit!({ correlationId: first.correlationId,
+      class: 'success', effect: 'completed', exitCode: 0, presentations: [taskEvent] }))
+      .resolves.toMatchObject({ outcome: { delivery: 'uncertain' } });
+
+    client.failSendTo.clear();
+    const second = await channel.beginFleetCommandAudit!('request-uncertain-event-2', ['task', 'work']);
+    await expect(channel.finishFleetCommandAudit!({ correlationId: second.correlationId,
+      class: 'success', effect: 'completed', exitCode: 0, presentations: [taskEvent,
+        { kind: 'room', operation: 'create', eventId: 'room-created-1', id: 'room-1',
+          name: 'Room', previousState: 'none', newState: 'provisioning', participants: [] }] }))
+      .resolves.toMatchObject({ outcome: { delivery: 'uncertain' } });
+    const texts = client.calls.filter(call => call.name === 'sendMessage')
+      .map(call => String(call.args?.text ?? ''));
+    expect(texts.filter(text => text.includes('🚀 Task started:'))).toHaveLength(1);
+    expect(texts.filter(text => text.startsWith('⏳ Room “'))).toHaveLength(1);
     await channel.close();
   });
 

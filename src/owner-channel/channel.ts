@@ -1,9 +1,10 @@
 import { createHash } from 'node:crypto';
 import { existsSync, readFileSync } from 'node:fs';
-import { mkdir, readFile, readdir, rm } from 'node:fs/promises';
+import { mkdir, readFile, readdir, rm, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 
 import { canonicalCid, type OwnerAttachmentConfig, type OwnerChannelConfig } from '../config.js';
+import { DAEMON_RECOVERY_DEADLINE_MS } from '../daemon-recovery.js';
 import { replaceFileAtomically } from '../atomic-file.js';
 import { TaskRoomApplicationService } from '../application/task-room-service.js';
 import { RoleLifecycleService } from '../application/role-command-service.js';
@@ -12,8 +13,9 @@ import { FleetQueryService } from '../application/fleet-query-service.js';
 import { interruptSession, queueSessionPrompt } from '../application/session-mutations.js';
 import { pickBackend } from '../supervisor/index.js';
 import {
-  ACP_CANCEL_DEADLINE_EXCEEDED, SessionControlError,
-  type QueuedPrompt, type SessionEvent, type SessionHandle, type TurnResult,
+  ACP_CANCEL_DEADLINE_EXCEEDED, CODEX_APP_SERVER_CANCEL_DEADLINE_EXCEEDED,
+  SessionControlError,
+  type AgentSession, type QueuedPrompt, type SessionEvent, type TurnResult,
 } from '../session/types.js';
 import { VERSION } from '../version.js';
 import {
@@ -21,13 +23,20 @@ import {
 } from '../rooms-tasks/markdown.js';
 import {
   dispatchOwnerCommand, fleetCliOps, isOwnerCommandText,
+  ownerTypedCommandCatalog, ownerTypedCommandText,
   type OwnerCommandContext, type OwnerFleetOps,
 } from './commands.js';
 import type { ManagedFleetSpawnResult } from '../fleet-proxy.js';
 import {
+  beginFleetAuditCollection, consumeFleetAuditCollection, FleetCommandAuditStore,
+  lifecycleEventDigestBasis, renderFleetLifecycleEvent, setFleetAuditLifecycleCheckpoint,
+  type FleetAuditAttempt, type FleetAuditPresentation, type FleetCommandOutcomeClass,
+} from '../fleet-command-audit.js';
+import {
   OURS_BOUND_ELSEWHERE, OursSdkClient, oursErrorCode,
   type OursContactsView, type OursHistoryFile, type OursHistoryMessage,
-  type OursInboundMessage, type OursIncomingMessage, type OursOps,
+  type OursCommandContext, type OursInboundMessage, type OursIncomingMessage, type OursOps,
+  type OursRegisteredCommand,
 } from './ours-client.js';
 import {
   ownerNotices,
@@ -37,6 +46,7 @@ import {
   DuplicateSendError, OwnerAuthorizationState, OwnerChannelState, OwnerConversationState,
   type OwnerEntry,
 } from './state.js';
+import { FleetLifecycleOutbox } from './lifecycle-outbox.js';
 import {
   OwnerTaskState, ownerTaskAuditId, ownerTaskDigest, type OwnerTaskPhase,
 } from './tasks.js';
@@ -72,7 +82,7 @@ export interface OwnerChannelOptions {
   /** Harness id of the role (e.g. 'claude-code', 'codex'); gates which slash commands may be forwarded. */
   harness: string;
   config: OwnerChannelConfig;
-  session: SessionHandle;
+  session: AgentSession;
   stateDir: string;
   env?: Record<string, string>;
   log(line: string): void;
@@ -87,15 +97,51 @@ export interface OwnerChannelOptions {
   binderDeps?: OwnerBinderDeps;
   /** Pre-acquired by the runner so the predecessor control socket remains reachable while waiting. */
   binderLease?: OwnerBinderLease;
+  recoveryDeps?: {
+    now(): number;
+    setTimer(fn: () => void, ms: number): ReturnType<typeof setTimeout>;
+    clearTimer(timer: ReturnType<typeof setTimeout>): void;
+    deadlineMs?: number;
+  };
 }
 
 export interface OwnerChannelHandle {
   start(): Promise<void>;
   drain(): Promise<void>;
   close(): Promise<void>;
+  /** Reattach this same supervisor-owned channel after a daemon generation change. */
+  recover?(epoch: string): Promise<void>;
+  /** False when shutdown skipped client disposal because quiescence was unproven. */
+  binderReleaseSafe?(): boolean;
   manage(request: OwnerChannelManagementRequest): Promise<OwnerChannelManagementResult>;
   /** Fleet-owned deterministic lifecycle notice; absent on legacy test doubles. */
   notifyFleetSpawn?(event: ManagedFleetSpawnResult): Promise<void>;
+  notifyFleetLifecycle?(presentations: FleetAuditPresentation[]): Promise<void>;
+  beginFleetCommandAudit?(requestId: string, argv: string[]): Promise<FleetAuditAttempt>;
+  finishFleetCommandAudit?(input: {
+    correlationId: string; class: FleetCommandOutcomeClass; exitCode?: number;
+    effect: 'not_started' | 'completed' | 'unknown'; resourceIds?: Record<string, string>;
+    presentations?: FleetAuditPresentation[];
+  }): Promise<FleetAuditAttempt>;
+}
+
+export const OWNER_RECOVERY_QUEUE_CAPACITY = 32;
+export const OWNER_RECOVERY_DEGRADED = 'OWNER_RECOVERY_DEGRADED';
+
+export class OwnerRecoveryDegradedError extends Error {
+  readonly code = OWNER_RECOVERY_DEGRADED;
+  constructor() {
+    super('owner channel recovery is degraded');
+    this.name = 'OwnerRecoveryDegradedError';
+  }
+}
+
+export class OwnerRecoveryTimeoutError extends Error {
+  readonly code = OWNER_RECOVERY_DEGRADED;
+  constructor(readonly stage: string) {
+    super(`owner channel recovery timed out at ${stage}`);
+    this.name = 'OwnerRecoveryTimeoutError';
+  }
 }
 
 export type OwnerChannelManagementRequest =
@@ -201,6 +247,8 @@ export class OwnerChannel implements OwnerChannelHandle {
    * (a crash must replay them) but must not be queued twice while live.
    */
   private readonly inFlight = new Set<string>();
+  /** SDK handlers entered during the current getMessages call. */
+  private readonly typedHandlersEntered = new Set<string>();
   /** Wires already NACKed to the managed agent, so a history replay stays quiet. */
   private readonly relayNacks = new Set<string>();
   /**
@@ -219,12 +267,24 @@ export class OwnerChannel implements OwnerChannelHandle {
   private readonly completionTasks = new Set<Promise<void>>();
   private readonly activeRequests = new Map<string, ActiveOwnerRequest>();
   private managementTail: Promise<unknown> = Promise.resolve();
+  private recoveryEpoch?: string;
+  private recoveryTask?: Promise<void>;
+  private recoveryToken = 0;
+  private recoveryQueued = 0;
+  private watchGeneration = 0;
+  /** A timed-out client operation that must settle before replacement is safe. */
+  private recoveryQuiescence?: Promise<void>;
+  private releaseSafe = true;
   private ready = false;
+  private startedOnce = false;
+  private shutdownDegraded = false;
   private binder?: OwnerBinderLease;
   private binderOwnedInternally = false;
 
   private readonly fleetOps: OwnerFleetOps;
   private readonly prepareRestart: (role: string, mode: 'keep' | 'fresh') => Promise<void>;
+  private readonly commandAudits: FleetCommandAuditStore;
+  private readonly lifecycleOutbox: FleetLifecycleOutbox;
 
   constructor(private readonly options: OwnerChannelOptions) {
     this.client = options.client ?? new OursSdkClient(
@@ -241,6 +301,10 @@ export class OwnerChannel implements OwnerChannelHandle {
       await lifecycle.prepareRestart({ roleIds: [role], mode });
     });
     this.state = new OwnerChannelState(join(options.stateDir, '.owner-channel-state.json'));
+    this.commandAudits = new FleetCommandAuditStore(
+      join(options.stateDir, '.owner-channel-command-audit.json'));
+    this.lifecycleOutbox = new FleetLifecycleOutbox(
+      join(options.stateDir, '.owner-channel-lifecycle-outbox.json'));
     this.authorizations = new OwnerAuthorizationState(
       join(options.stateDir, '.owner-channel-owners.json'), options.config.owners);
     this.conversations = new OwnerConversationState(
@@ -270,10 +334,13 @@ export class OwnerChannel implements OwnerChannelHandle {
       options.log(`[${options.role}] owner message recovery state corrupt; message intake disabled`);
     if (!this.attachmentRecovery.integrity())
       options.log(`[${options.role}] owner attachment recovery state corrupt; attachments disabled`);
+    if (!this.lifecycleOutbox.integrity().ok)
+      options.log(`[${options.role}] owner lifecycle outbox corrupt; lifecycle delivery disabled`);
   }
 
   async start(): Promise<void> {
     this.stopping = false;
+    this.shutdownDegraded = false;
     this.binderOwnedInternally = !this.options.binderLease;
     this.binder = this.options.binderLease ?? await acquireOwnerBinderLease(
       this.options.stateDir, this.options.role, this.options.config.identity, this.options.binderDeps);
@@ -286,6 +353,7 @@ export class OwnerChannel implements OwnerChannelHandle {
       for (;;) {
         try {
           await this.client.bindIdentity(this.options.config.identity);
+          await this.registerTypedCommands();
           break;
         } catch (error) {
           // The predecessor's lease may still be in flight. Only the daemon's
@@ -315,11 +383,14 @@ export class OwnerChannel implements OwnerChannelHandle {
         this.attachmentRoot, Date.now(), this.attachmentConfig.retention_ms,
       ).catch(error => this.logError('attachment crash cleanup failed', error));
     }
+    this.startedOnce = true;
     this.ready = true;
+    await this.flushPendingFleetCommandAudits();
+    await this.flushPendingFleetLifecycle();
     // Do not make role startup wait for an old owner request to finish a turn.
     // watchLoop itself drains before every establishment, including this first
     // one, so there is no drain-to-tip race.
-    this.watchTask = this.watchLoop();
+    this.watchTask = this.watchLoop(++this.watchGeneration);
   }
 
   drain(): Promise<void> {
@@ -335,45 +406,284 @@ export class OwnerChannel implements OwnerChannelHandle {
   }
 
   async close(): Promise<void> {
+    if (this.recoveryTask) this.shutdownDegraded = true;
     this.stopping = true;
     this.ready = false;
-    this.watchAbort?.abort();
-    await this.watchTask?.catch(error => this.logError('watch shutdown failed', error));
+    this.recoveryToken++;
+    this.watchGeneration++;
+    const staleWatch = this.watchTask;
     this.watchTask = undefined;
-    await this.managementTail;
-    try { await this.client.close(); }
-    finally {
-      if (this.binderOwnedInternally) this.binder?.release();
-      this.binder = undefined;
+    this.watchAbort?.abort();
+    const now = this.options.recoveryDeps?.now ?? (() => Date.now());
+    const deadlineAt = now()
+      + (this.options.recoveryDeps?.deadlineMs ?? DAEMON_RECOVERY_DEADLINE_MS);
+    let disposed = false;
+    try {
+      await this.recoveryStage('shutdown_quiescence', Promise.all([
+        staleWatch?.catch(error => this.logError('watch shutdown failed', error)),
+        this.drainTask?.catch(error => this.logError('drain shutdown failed', error)),
+        this.managementTail.then(() => undefined),
+        this.recoveryQuiescence,
+      ]), deadlineAt);
+      await this.recoveryStage('shutdown_close', this.client.close(), deadlineAt);
+      disposed = true;
+      this.writeShutdownState('closed', 'OWNER_SHUTDOWN_CLOSED', now());
+    } catch (error) {
+      this.shutdownDegraded = true;
+      this.releaseSafe = false;
+      const stage = error instanceof OwnerRecoveryTimeoutError ? error.stage : 'shutdown_unknown';
+      this.writeShutdownState('degraded', `OWNER_${stage.toUpperCase()}_TIMEOUT`, now());
+      this.options.log(`[${this.options.role}] owner shutdown degraded stage=${stage}`);
+    } finally {
+      if (disposed && this.binderOwnedInternally) this.binder?.release();
+      if (disposed) this.binder = undefined;
     }
   }
 
+  binderReleaseSafe(): boolean { return this.releaseSafe; }
+
   manage(request: OwnerChannelManagementRequest): Promise<OwnerChannelManagementResult> {
-    const run = this.managementTail.then(() => this.manageNow(request));
+    return this.queueManagement(() => this.manageNow(request));
+  }
+
+  notifyFleetSpawn(event: ManagedFleetSpawnResult): Promise<void> {
+    return this.queueManagement(async () => {
+      if (!this.ready || this.stopping) throw new Error('owner-channel MCP client is unavailable');
+      const permission = event.permissionMode
+        ? `${event.permissionMode.fleetMode}/${event.permissionMode.nativeMode}` : undefined;
+      await this.sendProactiveMessage(
+        renderFleetLifecycleEvent({ kind: 'agent_started', eventId: event.creationActionId,
+          id: event.role, name: event.role,
+          lifetime: event.lifetime, brain: event.brainSummary, role: event.roleSummary,
+          harness: event.harness, session: event.session, model: event.model,
+          permissions: permission, parent: event.caller, actionId: event.creationActionId,
+          inherited: event.inherited,
+          ...(event.configuration ? { configuration: event.configuration } : {}) }),
+        `fleet-spawn\0${event.creationActionId}`, 0);
+    });
+  }
+
+  notifyFleetLifecycle(presentations: FleetAuditPresentation[]): Promise<void> {
+    const run = this.managementTail.then(async () => {
+      // Acceptance is durable before delivery. A detached worker may exit
+      // while the Owner channel is reconnecting; startup/recovery flushes the
+      // pending event through the existing exactly-once send ledger.
+      this.lifecycleOutbox.enqueue(presentations);
+      if (this.ready && !this.stopping) await this.flushPendingFleetLifecycle();
+    });
     this.managementTail = run.then(() => undefined, () => undefined);
     return run;
   }
 
-  notifyFleetSpawn(event: ManagedFleetSpawnResult): Promise<void> {
+  private async flushPendingFleetLifecycle(): Promise<void> {
+    for (const entry of this.lifecycleOutbox.pending()) {
+      try {
+        await this.sendProactiveMessage(renderFleetLifecycleEvent(entry.presentation),
+          `fleet-lifecycle\0${lifecycleEventDigestBasis(entry.presentation)}`, 0);
+        this.lifecycleOutbox.finish(entry.digest, 'delivered');
+      } catch (error) {
+        if (error instanceof DuplicateSendError) {
+          this.lifecycleOutbox.finish(entry.digest,
+            error.status === 'delivered' ? 'delivered' : 'uncertain');
+          this.options.log(`[${this.options.role}] duplicate Fleet lifecycle event suppressed`);
+          continue;
+        }
+        // If the send crossed the uncertain boundary, the proactive ledger
+        // will refuse it on the next flush. A pre-send outage stays pending.
+        this.logError('pending Fleet lifecycle delivery deferred', error);
+        return;
+      }
+    }
+  }
+
+  beginFleetCommandAudit(requestId: string, argv: string[]): Promise<FleetAuditAttempt> {
     const run = this.managementTail.then(async () => {
-      if (!this.ready || this.stopping) throw new Error('owner-channel MCP client is unavailable');
-      const model = event.model ? `, model ${event.model}` : '';
-      const monitorPolicy = event.monitor.interrupt === true
-        ? ' with interruption'
-        : event.monitor.interrupt === 'after_tool' ? ' with after-tool steering' : '';
-      const monitor = `${event.monitor.mode} monitor${monitorPolicy}`;
-      const permission = event.permissionMode
-        ? `; permission ${event.permissionMode.fleetMode}, native ${event.permissionMode.nativeMode}`
-        : '';
-      const inherited = event.inherited.length
-        ? ` Supervisor inherited omitted defaults: ${event.inherited.join(', ')}.` : '';
-      await this.sendProactiveMessage(
-        `🧑‍💻 ${event.caller} spawned ${event.lifetime} agent ${event.role} `
-          + `(${event.harness}/${event.session}${model}; ${monitor}${permission}).${inherited}`,
-        `fleet-spawn\0${event.creationActionId}`, 0);
+      let attempt = this.commandAudits.begin(requestId, this.options.role, argv);
+      if (attempt.invocation === 'delivered') return attempt;
+      if (attempt.invocation === 'uncertain') return attempt;
+      this.options.log(`[${this.options.role}] fleet proxy command ${attempt.correlationId} `
+        + `route=${attempt.classification.route} decision=${attempt.classification.decision}`);
+      attempt = this.commandAudits.invocation(attempt.correlationId, this.options.role, 'delivered');
+      return attempt;
     });
     this.managementTail = run.then(() => undefined, () => undefined);
     return run;
+  }
+
+  finishFleetCommandAudit(input: {
+    correlationId: string; class: FleetCommandOutcomeClass; exitCode?: number;
+    effect: 'not_started' | 'completed' | 'unknown'; resourceIds?: Record<string, string>;
+    presentations?: FleetAuditPresentation[];
+  }): Promise<FleetAuditAttempt> {
+    const run = this.managementTail.then(async () => {
+      let attempt = this.commandAudits.finish(input.correlationId, this.options.role, {
+        class: input.class, effect: input.effect,
+        ...(input.exitCode === undefined ? {} : { exitCode: input.exitCode }),
+        ...(input.resourceIds ? { resourceIds: input.resourceIds } : {}),
+        ...(input.presentations ? { presentations: input.presentations } : {}),
+      });
+      if (attempt.outcome?.delivery === 'delivered') return attempt;
+      if (attempt.outcome?.delivery === 'uncertain') return attempt;
+      // Before the Owner sink is attached, ordinary commands have nothing to
+      // deliver. Lifecycle presentations remain in the never-attempted
+      // `sending` state and are flushed exactly once when start() makes the
+      // authenticated sink ready. A restart converts them to `uncertain`, so
+      // effects are never replayed after an unproven delivery boundary.
+      if (!attempt.outcome?.presentations?.length)
+        return this.commandAudits.outcome(attempt.correlationId, this.options.role, 'delivered');
+      if (!this.ready) return attempt;
+      return this.deliverFleetCommandOutcome(attempt);
+    });
+    this.managementTail = run.then(() => undefined, () => undefined);
+    return run;
+  }
+
+  private async flushPendingFleetCommandAudits(): Promise<void> {
+    for (const attempt of this.commandAudits.list())
+      if (attempt.outcome?.delivery === 'sending') await this.deliverFleetCommandOutcome(attempt);
+  }
+
+  private async deliverFleetCommandOutcome(attempt: FleetAuditAttempt): Promise<FleetAuditAttempt> {
+      let uncertain = false;
+      try {
+        for (const event of attempt.outcome?.presentations ?? []) {
+          try {
+            await this.sendProactiveMessage(renderFleetLifecycleEvent(event),
+              `fleet-lifecycle\0${lifecycleEventDigestBasis(event)}`, 0);
+          } catch (error) {
+            if (error instanceof DuplicateSendError) {
+              if (error.status !== 'delivered') uncertain = true;
+              this.options.log(`[${this.options.role}] duplicate Fleet lifecycle event suppressed`);
+              continue;
+            }
+            throw error;
+          }
+        }
+      } catch (error) {
+        uncertain = true;
+        this.logError(`fleet lifecycle delivery uncertain correlation=${attempt.correlationId}`, error);
+      }
+      attempt = this.commandAudits.outcome(attempt.correlationId, this.options.role,
+        uncertain ? 'uncertain' : 'delivered');
+      return attempt;
+  }
+
+  recover(epoch: string): Promise<void> {
+    if (this.stopping) return Promise.reject(new Error('owner channel is stopping'));
+    if (this.recoveryEpoch === epoch && this.recoveryTask) return this.recoveryTask;
+    this.recoveryEpoch = epoch;
+    this.ready = false;
+    const token = ++this.recoveryToken;
+    const watchGeneration = ++this.watchGeneration;
+    const staleWatch = this.watchTask;
+    this.watchTask = undefined;
+    this.watchAbort?.abort();
+    const superseded = () => this.stopping || token !== this.recoveryToken;
+    const now = this.options.recoveryDeps?.now ?? (() => Date.now());
+    const deadlineAt = now()
+      + (this.options.recoveryDeps?.deadlineMs ?? DAEMON_RECOVERY_DEADLINE_MS);
+    const run = this.managementTail.then(async () => {
+      if (superseded()) throw new Error('owner recovery epoch superseded');
+      if (this.recoveryQuiescence) {
+        const debt = this.recoveryQuiescence;
+        await this.recoveryStage('prior_quiescence', debt, deadlineAt);
+        if (this.recoveryQuiescence === debt) this.recoveryQuiescence = undefined;
+      }
+      // Quiesce every stale-client reader before replacing its transport. A
+      // watch can be inside the shared drain task when its abort lands.
+      await this.recoveryStage('stale_quiescence', Promise.all([
+        staleWatch?.catch(error => this.logError('stale watch shutdown failed', error)),
+        this.drainTask?.catch(error => this.logError('stale drain shutdown failed', error)),
+      ]), deadlineAt);
+      if (superseded()) throw new Error('owner recovery epoch superseded');
+      await this.recoveryStage('close', this.client.close(), deadlineAt);
+      if (superseded()) throw new Error('owner recovery epoch superseded');
+      try {
+        await this.recoveryStage('start', this.client.start(), deadlineAt);
+        if (superseded()) throw new Error('owner recovery epoch superseded');
+        await this.recoveryStage(
+          'bind', this.client.bindIdentity(this.options.config.identity), deadlineAt);
+        if (superseded()) throw new Error('owner recovery epoch superseded');
+        await this.recoveryStage('register_commands', this.registerTypedCommands(), deadlineAt);
+        if (superseded()) throw new Error('owner recovery epoch superseded');
+        // Journal-aware drain is the only operation allowed to mark owner mail
+        // read. The final listing is a typed, read-only channel probe.
+        await this.recoveryStage('drain', this.drain(), deadlineAt);
+        await this.recoveryStage('list', this.client.listIncomingMessages(), deadlineAt);
+        if (superseded()) throw new Error('owner recovery epoch superseded');
+        this.ready = true;
+        await this.flushPendingFleetLifecycle();
+        this.watchTask = this.watchLoop(watchGeneration);
+      } catch (error) {
+        this.ready = false;
+        if (token === this.recoveryToken) this.recoveryToken++;
+        // A timed-out operation may still be using this client. Never overlap
+        // its disposal; the recorded quiescence debt gates the next retry.
+        if (!this.recoveryQuiescence) {
+          try {
+            await this.recoveryStage('close_after_failure', this.client.close(), deadlineAt);
+          } catch (closeError) {
+            this.logError('recovery client close failed', closeError);
+          }
+        }
+        throw error;
+      }
+    });
+    this.managementTail = run.then(() => undefined, () => undefined);
+    const task = run.finally(() => {
+      if (this.recoveryTask === task) this.recoveryTask = undefined;
+    });
+    this.recoveryTask = task;
+    return task;
+  }
+
+  private recoveryStage<T>(stage: string, operation: Promise<T>, deadlineAt: number): Promise<T> {
+    const now = this.options.recoveryDeps?.now ?? (() => Date.now());
+    const remaining = Math.max(0, deadlineAt - now());
+    const setTimer = this.options.recoveryDeps?.setTimer ?? ((fn, ms) => setTimeout(fn, ms));
+    const clearTimer = this.options.recoveryDeps?.clearTimer ?? (timer => clearTimeout(timer));
+    let timer!: ReturnType<typeof setTimeout>;
+    const timeout = new Promise<never>((_resolve, reject) => {
+      timer = setTimer(() => reject(new OwnerRecoveryTimeoutError(stage)), remaining);
+    });
+    return Promise.race([operation, timeout]).catch(error => {
+      if (error instanceof OwnerRecoveryTimeoutError) {
+        const debt = operation.then(() => undefined, () => undefined);
+        this.recoveryQuiescence = debt;
+      }
+      throw error;
+    }).finally(() => clearTimer(timer));
+  }
+
+  private writeShutdownState(
+    state: 'closed' | 'degraded', reason: string, at: number,
+  ): void {
+    try {
+      replaceFileAtomically(join(this.options.stateDir, '.owner-channel-shutdown.json'),
+        JSON.stringify({ version: 1, state, reason, at: new Date(at).toISOString() }, null, 2) + '\n');
+    } catch (error) {
+      this.logError('shutdown status write failed', error);
+    }
+  }
+
+  private queueManagement<T>(operation: () => Promise<T>): Promise<T> {
+    const deferred = this.recoveryTask !== undefined && !this.ready;
+    if (!this.ready && !deferred) return Promise.reject(
+      !this.startedOnce || (this.stopping && !this.shutdownDegraded)
+        ? new Error('owner-channel MCP client is unavailable')
+        : new OwnerRecoveryDegradedError(),
+    );
+    if (deferred && this.recoveryQueued >= OWNER_RECOVERY_QUEUE_CAPACITY)
+      return Promise.reject(new Error('owner recovery queue is full'));
+    if (deferred) this.recoveryQueued++;
+    const run = this.managementTail.then(() => {
+      if (!this.ready || this.stopping) throw new OwnerRecoveryDegradedError();
+      return operation();
+    });
+    this.managementTail = run.then(() => undefined, () => undefined);
+    return run.finally(() => {
+      if (deferred) this.recoveryQueued = Math.max(0, this.recoveryQueued - 1);
+    });
   }
 
   private async manageNow(
@@ -754,28 +1064,61 @@ export class OwnerChannel implements OwnerChannelHandle {
     if (!Array.isArray(listed)) throw new Error('the ours daemon returned invalid unread message metadata');
     const preflight = listed.slice(0, OWNER_MESSAGE_BATCH_LIMIT);
     const now = Date.now();
-    const claims = preflight.map(item => this.messageClaim(item, now));
-    const claimKeys = new Set(claims.map(item => `${item.seq}\0${item.wireId}`));
-    if (claimKeys.size !== claims.length)
+    const metadata = preflight.map(item => ({ item, claim: this.messageClaim(item, now),
+      kind: item.message_kind }));
+    if (metadata.some(item => !['text', 'command', 'command_result'].includes(item.kind)))
+      throw new Error('the ours daemon returned an unknown unread message kind');
+    // The SDK marks the entire batch read before invoking typed handlers. Claim
+    // every text AND command row first: if an earlier lifecycle handler exits
+    // this process, a later command is recovered from persistent history even
+    // though its SDK handler was never entered. Command-result rows are inert.
+    const recoverable = metadata.filter(item => item.kind !== 'command_result');
+    const claims = recoverable.map(item => item.claim);
+    const textClaims = metadata.filter(item => item.kind === 'text').map(item => item.claim);
+    const textClaimKeys = new Set(textClaims.map(item => `${item.seq}\0${item.wireId}`));
+    const preflightKeys = new Set(metadata.map(item => `${item.claim.seq}\0${item.claim.wireId}`));
+    if (preflightKeys.size !== metadata.length)
       throw new Error('the ours daemon returned duplicate unread message metadata');
     this.messageRecovery.claim(claims);
 
     let fresh: InboundMessage[] = [];
     let remaining = 0;
     // SDK batchLimit rejects zero. An empty preflight is a read-only drain.
-    if (claims.length) {
-      const payload = await this.client.getMessages(claims.length);
-      if (!payload || !Array.isArray(payload.messages)
+    if (preflight.length) {
+      const payload = await this.client.getMessages(preflight.length);
+      if (!payload || !Array.isArray(payload.messages) || !Array.isArray(payload.command_results)
+          || !Number.isSafeInteger(payload.commands_handled) || payload.commands_handled < 0
           || !Number.isSafeInteger(payload.remaining) || payload.remaining < 0)
         throw new Error('the ours daemon returned an invalid claimed message batch');
       fresh = payload.messages.map(message => this.historyMessage(message));
       remaining = payload.remaining;
-      const expected = claimKeys;
+      const expected = textClaimKeys;
       const actual = new Set(fresh.map(item => `${item.seq}\0${item.wire_id}`));
-      if (fresh.length !== claims.length || actual.size !== fresh.length
+      if (fresh.length !== textClaims.length || actual.size !== fresh.length
           || actual.size !== expected.size
           || [...expected].some(item => !actual.has(item)))
         throw new Error('the ours daemon claimed a different message batch than fleet journaled');
+      const expectedCommands = metadata.filter(item => item.kind === 'command');
+      if (payload.commands_handled !== expectedCommands.length)
+        throw new Error('the ours daemon handled a different typed-command batch than fleet inspected');
+      const expectedResults = new Set(metadata.filter(item => item.kind === 'command_result')
+        .map(item => `${item.claim.seq}\0${item.claim.wireId}`));
+      const actualResults = new Set(payload.command_results
+        .map(item => `${item.seq}\0${item.wire_id}`));
+      if (actualResults.size !== payload.command_results.length
+          || actualResults.size !== expectedResults.size
+          || [...expectedResults].some(item => !actualResults.has(item)))
+        throw new Error('the ours daemon returned a different typed-command result batch than fleet inspected');
+      for (const item of expectedCommands) {
+        // Invalid envelopes and unregistered commands never enter a handler;
+        // the SDK has already returned handler_failed, so consume those now.
+        // Entered harness commands keep their claim until async completion.
+        if (!this.typedHandlersEntered.has(item.claim.wireId))
+          this.state.remember(item.claim.wireId);
+        this.typedHandlersEntered.delete(item.claim.wireId);
+      }
+      for (const item of metadata)
+        if (item.kind === 'command_result') this.state.remember(item.claim.wireId);
     }
 
     const merged = new Map<string, InboundMessage>();
@@ -1012,6 +1355,8 @@ export class OwnerChannel implements OwnerChannelHandle {
   private async handle(message: InboundMessage): Promise<boolean> {
     const wireId = this.wireId(message);
     if (!wireId || this.state.has(wireId) || this.inFlight.has(wireId)) return false;
+    if (message.message_kind === 'command')
+      return this.handleRecoveredTypedCommand(message, wireId);
     const sender = this.sender(message);
     if (this.isAgentSender(sender.id)) {
       try {
@@ -1081,12 +1426,13 @@ export class OwnerChannel implements OwnerChannelHandle {
     } catch (error) {
       await rm(outbox, { recursive: true, force: true });
       if (error instanceof SessionControlError
-          && error.reasonCode === ACP_CANCEL_DEADLINE_EXCEEDED) {
+          && (error.reasonCode === ACP_CANCEL_DEADLINE_EXCEEDED
+            || error.reasonCode === CODEX_APP_SERVER_CANCEL_DEADLINE_EXCEEDED)) {
         // drainAll journaled this authenticated message before delivery. The
         // adapter generation is terminating, so leave the wire unhandled and
         // body-free: the resumed owner channel recovers it exactly once.
         this.options.log(`[${this.options.role}] owner request ${requestId.slice(0, 12)} `
-          + `held for adapter resume reason=${ACP_CANCEL_DEADLINE_EXCEEDED}`);
+          + `held for adapter resume reason=${error.reasonCode}`);
         return false;
       }
       this.logError('request delivery failed', error);
@@ -1130,7 +1476,18 @@ export class OwnerChannel implements OwnerChannelHandle {
   private async handleCommand(
     sender: { id: string; name: string }, text: string, wireId: string,
   ): Promise<void> {
+    const provisioningCommand = async <T>(run: () => Promise<T>): Promise<T> => {
+      beginFleetAuditCollection();
+      setFleetAuditLifecycleCheckpoint(events => this.notifyFleetLifecycle(events));
+      try { return await run(); }
+      finally {
+        setFleetAuditLifecycleCheckpoint(undefined);
+        const remaining = consumeFleetAuditCollection().presentations;
+        if (remaining?.length) await this.notifyFleetLifecycle(remaining);
+      }
+    };
     const ctx: OwnerCommandContext = {
+      authenticatedCid: sender.id,
       role: this.options.role,
       harness: this.options.harness,
       version: VERSION,
@@ -1148,17 +1505,38 @@ export class OwnerChannel implements OwnerChannelHandle {
       },
       fleetList: () => this.fleetOps.list(),
       closeRoom: roomId => this.closeRoomFromOwner(sender, roomId, wireId),
-      recoverRoom: roomId => this.recoverRoomFromOwner(sender, roomId, wireId),
       terminalTask: (taskId, kind, outcome) =>
         this.terminalTaskFromOwner(sender, taskId, kind, outcome, wireId),
-      recoverTask: taskId => this.recoverTaskFromOwner(sender, taskId, wireId),
-      createTask: input => new TaskRoomApplicationService(this.options.configPath).createTask({
-        ...input,
-        actor: { kind: 'authenticated_owner', surface: 'messenger', cid: sender.id },
+      createTask: input => provisioningCommand(async () => {
+        const service = new TaskRoomApplicationService(this.options.configPath);
+        const task = await service.createTask({
+          ...input,
+          actor: { kind: 'authenticated_owner', surface: 'messenger', cid: sender.id },
+        });
+        if (!input.backlog && !input.noRoom && task.room_id) {
+          const outcome = service.taskProvisioningOutcome(task.task_id);
+          if (outcome.kind === 'in_progress' && !outcome.next_action)
+            await this.fleetOps.provisionTask(task.task_id);
+        }
+        return task;
       }),
-      startTask: taskId => new TaskRoomApplicationService(this.options.configPath).startTask({
-        actor: { kind: 'authenticated_owner', surface: 'messenger', cid: sender.id }, taskId,
+      startTask: taskId => provisioningCommand(async () => {
+        const service = new TaskRoomApplicationService(this.options.configPath);
+        const task = await service.startTask({
+          actor: { kind: 'authenticated_owner', surface: 'messenger', cid: sender.id }, taskId,
+        });
+        // A zero-duration observation repairs a ready notice after a crash or
+        // duplicate start without extending the start command's existing wait.
+        const outcome = await service.awaitTaskProvisioning({
+          actor: { kind: 'authenticated_owner', surface: 'messenger', cid: sender.id },
+          taskId: task.task_id, waitMs: 0,
+        });
+        if (outcome.kind === 'in_progress' && !outcome.next_action)
+          await this.fleetOps.provisionTask(task.task_id);
+        return outcome;
       }),
+      taskProvisioningOutcome: taskId =>
+        new TaskRoomApplicationService(this.options.configPath).taskProvisioningOutcome(taskId),
       listTasks: filter => new TaskRoomApplicationService(this.options.configPath).listTasks(filter),
       groupedTasks: filter => new TaskRoomApplicationService(this.options.configPath).groupedTasks(filter),
       listTaskLists: () => new TaskRoomApplicationService(this.options.configPath).listTaskLists(),
@@ -1184,19 +1562,27 @@ export class OwnerChannel implements OwnerChannelHandle {
       reviewTask: taskId => new TaskRoomApplicationService(this.options.configPath).reviewTask({
         actor: { kind: 'authenticated_owner', surface: 'messenger', cid: sender.id }, taskId,
       }),
-      deleteTask: taskId => new TaskRoomApplicationService(this.options.configPath).deleteTask({
-        actor: { kind: 'authenticated_owner', surface: 'messenger', cid: sender.id }, taskId,
-      }),
+      deleteTask: taskId => this.deleteTaskFromOwner(sender, taskId, wireId),
       listRoomQueries: filter => new TaskRoomApplicationService(this.options.configPath).listRooms(filter),
       getRoomQuery: id => new TaskRoomApplicationService(this.options.configPath).getRoomDetail(id),
       listTemplateQueries: () => new TaskRoomApplicationService(this.options.configPath).listTemplates(),
       getTemplateQuery: name => new TaskRoomApplicationService(this.options.configPath).getTemplate(name),
-      createRoom: input => new TaskRoomApplicationService(this.options.configPath).createRoom({
-        ...input, actor: { kind: 'authenticated_owner', surface: 'messenger', cid: sender.id },
-      }),
+      createRoom: input => provisioningCommand(() =>
+        new TaskRoomApplicationService(this.options.configPath).createRoom({
+          ...input, actor: { kind: 'authenticated_owner', surface: 'messenger', cid: sender.id },
+        })),
       recentEvents: limit => this.options.session.eventsSince(0).slice(-limit),
       readWorklogTail: maxChars => this.readWorklogTail(maxChars),
       reply: async replyText => { await this.send(sender.id, replyText, wireId); },
+      replyHtml: async (filename, html) => {
+        const directory = join(this.options.stateDir, '.owner-channel-report-outbox', this.requestId(wireId));
+        const path = join(directory, filename);
+        await mkdir(directory, { recursive: true, mode: 0o700 });
+        try {
+          await writeFile(path, html, { flag: 'wx', mode: 0o600 });
+          await this.client.sendFile({ contact: sender.id, path, filename, replyToWireId: wireId });
+        } finally { await rm(directory, { recursive: true, force: true }); }
+      },
     };
     try {
       await dispatchOwnerCommand(text, ctx);
@@ -1206,6 +1592,82 @@ export class OwnerChannel implements OwnerChannelHandle {
     // Harness commands own their wire until the queued turn settles; everything
     // else is complete now and must never replay.
     if (!this.inFlight.has(wireId)) this.state.remember(wireId);
+  }
+
+  /**
+   * Register one typed adapter per primary slash command. The adapter performs
+   * the live CID check before constructing the same slash text and entering the
+   * existing dispatcher; its null SDK result avoids duplicating the ordinary
+   * owner-channel replies that remain the command's result contract.
+   */
+  private registerTypedCommands(): Promise<void> {
+    const commands: OursRegisteredCommand[] = ownerTypedCommandCatalog().map(definition => ({
+      name: definition.name,
+      description: definition.description,
+      input_schema: definition.input_schema as OursRegisteredCommand['input_schema'],
+      handler: (input, context) => {
+        this.typedHandlersEntered.add(context.request_wire_id);
+        return this.handleTypedCommand(definition.name, input, context);
+      },
+    }));
+    return this.client.registerCommands(commands);
+  }
+
+  private async handleRecoveredTypedCommand(
+    message: InboundMessage, wireId: string,
+  ): Promise<boolean> {
+    let payload: { command: string; arguments: unknown };
+    try {
+      const parsed = JSON.parse(String(message.body ?? message.text ?? '')) as unknown;
+      if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)
+          || Object.keys(parsed).length !== 2
+          || typeof (parsed as { command?: unknown }).command !== 'string'
+          || !('arguments' in parsed))
+        throw new Error('invalid command payload');
+      payload = parsed as { command: string; arguments: unknown };
+    } catch {
+      // The original SDK attempt would have emitted handler_failed without
+      // entering Fleet. Recovery mirrors that terminal no-effect outcome.
+      this.state.remember(wireId);
+      return true;
+    }
+    const sender = this.sender(message);
+    try {
+      await this.handleTypedCommand(payload.command, payload.arguments, {
+        sender_cid: sender.id, sender_name: sender.name, request_wire_id: wireId,
+      });
+    } catch (error) {
+      // Expected handler failures (unauthorized/invalid typed input) are
+      // terminal and already recorded, just as the SDK swallows them.
+      if (!this.state.has(wireId)) throw error;
+    }
+    return true;
+  }
+
+  private async handleTypedCommand(
+    name: string, input: unknown, context: Readonly<OursCommandContext>,
+  ): Promise<null> {
+    const sender = { id: context.sender_cid, name: context.sender_name };
+    const wireId = context.request_wire_id;
+    if (!this.isEffectiveOwner(sender.id)) {
+      this.options.log(
+        `[${this.options.role}] owner channel ignored unauthorized typed-command sender `
+        + `${sender.id || '<unknown>'}`);
+      await this.warnOwnerOfUnauthorizedSender(sender.id);
+      if (wireId) this.state.remember(wireId);
+      throw new Error('typed owner command denied');
+    }
+    try {
+      try { this.conversations.recordInbound(sender.id, wireId); }
+      catch (error) { this.logError('owner conversation route update failed', error); }
+      await this.handleCommand(sender, ownerTypedCommandText(name, input), wireId);
+      return null;
+    } catch (error) {
+      // Structural typed-input failures are terminal handler_failed outcomes,
+      // not indefinitely replayable work.
+      if (wireId) this.state.remember(wireId);
+      throw error;
+    }
   }
 
   /** Queue raw slash text to the harness and report the turn's outcome. */
@@ -1265,7 +1727,7 @@ export class OwnerChannel implements OwnerChannelHandle {
     await this.send(sender.id, renderMarkdownFailure({
       kind: 'pending', subject: `/room delete ${roomId} ${roomId}`,
       detail: 'The deletion request was accepted and is still being settled.',
-      action: `Run /room recover ${roomId} if deletion remains pending.`,
+      action: `Run /room delete ${roomId} ${roomId} again if deletion remains pending.`,
     }), wireId);
     this.state.remember(wireId);
     try {
@@ -1278,79 +1740,36 @@ export class OwnerChannel implements OwnerChannelHandle {
     }
   }
 
-  private async recoverRoomFromOwner(
-    sender: { id: string; name: string }, roomId: string, wireId: string,
-  ): Promise<void> {
-    const app = new TaskRoomApplicationService(this.options.configPath);
-    const actor = { kind: 'authenticated_owner' as const, surface: 'messenger' as const, cid: sender.id };
-    const result = await app.recoverRoom({ actor, roomId });
-    if (result.kind === 'deletion_worker_required') {
-      await this.send(sender.id, renderMarkdownFailure({ kind: 'pending',
-        subject: `/room recover ${roomId}`,
-        detail: 'The deletion recovery is still being settled.',
-        action: `Run /room recover ${roomId} if deletion remains pending.` }), wireId);
-      this.state.remember(wireId);
-      try { await this.fleetOps.closeRoom(roomId); }
-      catch (error) {
-        await app.recordRoomSettlementError({ actor, roomId,
-          error: error instanceof Error ? error.message : String(error),
-          recoveryHint: `External delete worker failed to start. Retry /room delete ${roomId} ${roomId}.` });
-        throw error;
-      }
-      return;
-    }
-    const r = result.orchestration;
-    await this.send(sender.id, renderMarkdownResult({ icon: '🛟', title: 'Room recovery',
-      fields: [{ label: 'Room', value: result.room.room_id, kind: 'code' },
-        { label: 'Status', value: roomStatus(result.room.state), kind: 'markdown' },
-        ...(r ? [{ label: 'Saga', value: r.saga.phase, kind: 'code' as const }] : [])],
-      sections: result.issues.length ? [{ heading: 'Next steps', items: result.issues }]
-        : [{ heading: 'Result', items: ['No recovery action is needed.'] }] }), wireId);
-    this.state.remember(wireId);
-  }
-
-  /** Carry a task terminal request through a worker that survives this role. */
-  private async recoverTaskFromOwner(
+  /** Accept a permanent any-state deletion, acknowledge it, then hand cleanup to a durable worker. */
+  private async deleteTaskFromOwner(
     sender: { id: string; name: string }, taskId: string, wireId: string,
   ): Promise<void> {
     const app = new TaskRoomApplicationService(this.options.configPath);
     const actor = { kind: 'authenticated_owner' as const, surface: 'messenger' as const, cid: sender.id };
-    const begin = await app.beginTaskRecovery({ actor, taskId });
-    if (begin.kind === 'terminal_worker_required') {
-      await this.send(sender.id, renderMarkdownFailure({
-        kind: 'pending', subject: `/task recover ${taskId}`,
-        detail: 'The recovery request was accepted and is still being settled.',
-        action: `Run /task recover ${taskId} if it remains pending.`,
+    const accepted = await app.requestTaskDeletion({ actor, taskId });
+    if (accepted.status === 'already_absent') {
+      await this.send(sender.id, renderMarkdownResult({
+        icon: '🗑️', title: 'Task already absent',
+        fields: [{ label: 'ID', value: taskId, kind: 'code' }],
       }), wireId);
       this.state.remember(wireId);
-      try { await this.fleetOps.recoverTask(taskId); }
-      catch (error) {
-        await app.recordSettlementError({ actor, taskId,
-          error: error instanceof Error ? error.message : String(error),
-          recoveryHint: `External settle worker failed to start. Retry /task recover ${taskId}.` });
-        throw error;
-      }
       return;
     }
-    const { task, room, issues } = begin.result;
-    const hints = issues.map(issue => issue.code === 'waiting_cowork' ? 'Cowork socket unreachable'
-      : issue.code === 'waiting_owner_invite' ? 'Owner invite missing or invalid'
-      : issue.code === 'owner_cid_mismatch' ? 'Owner CID mismatch'
-      : issue.code === 'member_failed' ? `Member failed at step ${issue.stepIndex}`
-      : issue.code === 'resume_failed' ? `Resume failed: ${issue.error}`
-      : issue.code === 'provisioning_resumed' ? 'Provisioning resumed successfully'
-      : issue.code);
-    await this.send(sender.id, renderMarkdownResult({
-      icon: '🛟', title: 'Task recovery',
-      fields: [{ label: 'Task', value: task.task_id, kind: 'code' },
-        { label: 'Status', value: taskStatus(task.state), kind: 'markdown' },
-        ...(room ? [{ label: 'Room', value: room.room_id, kind: 'code' as const },
-          { label: 'Room status', value: roomStatus(room.state), kind: 'markdown' as const },
-          { label: 'Saga', value: room.saga.phase, kind: 'code' as const }] : [])],
-      sections: hints.length ? [{ heading: 'Next steps', items: hints }]
-        : [{ heading: 'Result', items: ['No automated recovery action is available.'] }],
+    await this.send(sender.id, renderMarkdownFailure({
+      kind: 'pending', subject: `/task delete ${taskId} ${taskId}`,
+      detail: 'The deletion was accepted; cleanup is settling in the background.',
+      action: `Repeat /task delete ${taskId} ${taskId} if it remains pending.`,
     }), wireId);
     this.state.remember(wireId);
+    try {
+      await this.fleetOps.settleTaskDeletion(taskId);
+    } catch (error) {
+      await app.recordDeletionError({
+        actor, taskId, error: error instanceof Error ? error.message : String(error),
+        recoveryHint: `External delete worker failed to start. Retry /task delete ${taskId} ${taskId}.`,
+      });
+      throw error;
+    }
   }
 
   private async terminalTaskFromOwner(
@@ -1379,7 +1798,7 @@ export class OwnerChannel implements OwnerChannelHandle {
     await this.send(sender.id, renderMarkdownFailure({
       kind: 'pending', subject: `/task ${kind === 'done' ? 'done' : 'cancel'} ${taskId}`,
       detail: 'The terminal request was accepted and is still being settled.',
-      action: `Run /task recover ${taskId} if it remains pending.`,
+      action: `Repeat /task ${kind === 'done' ? 'done' : 'cancel'} ${taskId} if it remains pending.`,
     }), wireId);
     this.state.remember(wireId);
     try {
@@ -1387,7 +1806,7 @@ export class OwnerChannel implements OwnerChannelHandle {
     } catch (error) {
       await app.recordSettlementError({
         actor, taskId, error: error instanceof Error ? error.message : String(error),
-        recoveryHint: `External settle worker failed to start. Retry the identical task command or run task recover ${taskId}.`,
+        recoveryHint: `External settle worker failed to start. Retry the identical task command.`,
       });
       throw error;
     }
@@ -1828,7 +2247,8 @@ export class OwnerChannel implements OwnerChannelHandle {
         startProgress(event);
         // Automatic commentary is an ACP phase extension. Other backends and
         // older adapters retain their established final-only behavior.
-        if (this.options.session.backend === 'acp') acceptCommentary(event);
+        if (this.options.session.capabilities?.messagePhases
+            ?? this.options.session.backend === 'acp') acceptCommentary(event);
       })
       : () => undefined;
     startProgress();
@@ -1863,7 +2283,8 @@ export class OwnerChannel implements OwnerChannelHandle {
       enabled: this.commentsEnabled,
       baseline: this.commentsBaseline,
       // Only the ACP backend emits the phase marker commentary relaying needs.
-      supported: this.options.session.backend === 'acp',
+      supported: this.options.session.capabilities?.messagePhases
+        ?? this.options.session.backend === 'acp',
     };
   }
 
@@ -2041,7 +2462,7 @@ export class OwnerChannel implements OwnerChannelHandle {
     return undefined;
   }
 
-  private async watchLoop(): Promise<void> {
+  private async watchLoop(generation: number): Promise<void> {
     const sleep = this.options.binderDeps?.sleep
       ?? (ms => new Promise<void>(resolve => setTimeout(resolve, ms)));
     const restored = this.readWatchState();
@@ -2050,7 +2471,7 @@ export class OwnerChannel implements OwnerChannelHandle {
       state = this.writeWatchState(state, 'OWNER_WATCH_STATE_RECOVERED');
     let delayMs = 1_000;
     let attempts = 0;
-    while (!this.stopping) {
+    while (!this.stopping && generation === this.watchGeneration) {
       const ctrl = new AbortController();
       this.watchAbort = ctrl;
       try {
@@ -2060,14 +2481,14 @@ export class OwnerChannel implements OwnerChannelHandle {
         // fall into a gap. Persistent history plus fleet's body-free claim
         // journal is authoritative; durable wire-ID dedupe makes hints harmless.
         await this.drain();
-        if (this.stopping) return;
+        if (this.stopping || generation !== this.watchGeneration) return;
         state = this.writeWatchState(
           state, 'OWNER_WATCH_CONNECTING', { reconnected: attempts > 0 });
         attempts++;
         for await (const _event of this.client.watchNotifications(
           this.options.config.identity, { since: 0, signal: ctrl.signal },
         )) {
-          if (this.stopping) return;
+          if (this.stopping || generation !== this.watchGeneration) return;
           state = this.writeWatchState(
             state, 'OWNER_WATCH_CONNECTED', { resetFailures: true });
           delayMs = 1_000;
@@ -2076,9 +2497,10 @@ export class OwnerChannel implements OwnerChannelHandle {
           // recorded before a managed request is dispatched.
           await this.drain();
         }
-        if (!this.stopping) throw new Error('ours SDK notification stream ended');
+        if (!this.stopping && generation === this.watchGeneration)
+          throw new Error('ours SDK notification stream ended');
       } catch (error) {
-        if (this.stopping) return;
+        if (this.stopping || generation !== this.watchGeneration) return;
         // SDK 2 deliberately hides transport status behind its typed stream.
         // Do not parse error prose to rediscover it: every failure follows the
         // same capped retry path forever, and the pre-establishment drain makes

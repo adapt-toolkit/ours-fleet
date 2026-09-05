@@ -12,6 +12,8 @@ import type { Exec, ExecResult } from '../src/exec.js';
 import type { FetchLike } from '../src/monitor.js';
 import type { AttachOursClientOptions, OursClient } from '@ours.network/sdk/client';
 import { cliPath, installPrefix, pkgRoot } from './install-fixtures.js';
+import { writeV2Fixture } from './v2-fixture.js';
+import { bootstrapPresets } from '../src/preset-bootstrap.js';
 
 // A stub daemon API for the monitor reachability probe.
 const stubFetch = (state: 'ok' | '401' | 'down' | 'notdaemon' = 'ok'): FetchLike => async (url) => {
@@ -68,19 +70,19 @@ const execWith = (table: Record<string, ExecResult>): Exec =>
   async (cmd, args) => table[[cmd, args[0] ?? ''].join(' ')] ?? { stdout: '', stderr: '', code: 0 };
 
 describe('doctor', () => {
-  it('flags missing tmux with an install hint', async () => {
-    const rep = await doctor({}, execWith({
-      'tmux -V': { stdout: '', stderr: '', code: 127 },
-      'ours version': { stdout: JSON.stringify({ name: '@ours.network/cli', version: '1.0.1' }), stderr: '', code: 0 },
-      'ours daemon': { stdout: JSON.stringify({ state: 'running' }), stderr: '', code: 0 },
-      'loginctl show-user': { stdout: 'Linger=yes', stderr: '', code: 0 },
-    }), 'linux');
-    const t = rep.checks.find(c => c.name === 'tmux')!;
-    expect(t.ok).toBe(false);
-    expect(t.detail).toContain('apt install tmux');
-    expect(rep.ok).toBe(false);
+  it('warns when packaged Codex Brain model/effort pairs are absent from the local runtime catalog', async () => {
+    const configPath = join(dir, 'catalog.yaml'); bootstrapPresets(configPath);
+    const cache = join(dir, 'models.json');
+    writeFileSync(cache, JSON.stringify({ models: [{ slug: 'gpt-5.6-sol', display_name: 'Sol',
+      visibility: 'list', supported_reasoning_levels: [{ effort: 'low' }] }] }));
+    const rep = await doctor({ configPath, codexCatalogPath: cache }, undefined, 'darwin');
+    const check = rep.checks.find(item => item.name === 'brain catalog: Codex runtime drift')!;
+    expect(check.ok).toBe(true);
+    expect(check.detail).toContain('warning: packaged Brain preset(s) absent');
+    expect(check.detail).toContain('codex-gpt-5-6-terra-low (gpt-5.6-terra/low)');
+    expect(check.detail).toContain('codex-gpt-5-6-sol-medium (gpt-5.6-sol/medium)');
+    expect(check.detail).not.toContain('codex-gpt-5-6-sol-low (gpt-5.6-sol/low)');
   });
-
   it('flags a stopped ours daemon', async () => {
     const rep = await doctor({}, execWith({
       'tmux -V': { stdout: 'tmux 3.6', stderr: '', code: 0 },
@@ -106,6 +108,7 @@ describe('doctor', () => {
   });
 
   it('reports linger only on linux and passes when all green', async () => {
+    writeV2Fixture(join(dir, 'fleet.yaml'), { roles: {} });
     const green = execWith({
       'tmux -V': { stdout: 'tmux 3.6', stderr: '', code: 0 },
       'ours version': { stdout: JSON.stringify({ name: '@ours.network/cli', version: '1.0.1' }), stderr: '', code: 0 },
@@ -131,7 +134,7 @@ describe('doctor', () => {
   });
 
   it('recognizes the ACP adapter bundled with ours-fleet when no global bin is on PATH', async () => {
-    writeFileSync(join(dir, 'fleet.yaml'),
+    writeV2Fixture(join(dir, 'fleet.yaml'),
       'roles:\n  Coder:\n    harness: codex\n    session: acp\n    monitor:\n      enabled: false\n');
     const rep = await doctor({}, execWith({
       'ours version': { stdout: JSON.stringify({ name: '@ours.network/cli', version: '1.0.1' }), stderr: '', code: 0 },
@@ -165,7 +168,7 @@ describe('doctor scheduled-loop checkpoint', () => {
     lastWallMs?: number; health?: string; running?: boolean; operatorDisabled?: boolean;
   } = {}) {
     registerAdapter(fakeAdapter);
-    writeFileSync(join(dir, 'fleet.yaml'), [
+    writeV2Fixture(join(dir, 'fleet.yaml'), [
       'roles:', '  Coordinator: { harness: fake, session: acp, monitor: { enabled: false } }',
       'loops:', '  health:', '    roles: [Coordinator]', '    interval: 10m',
       '    prompt: check in', '',
@@ -265,7 +268,7 @@ describe('doctor isolation reporting', () => {
 
   it('reports per-role effective isolation (backend, net, caps)', async () => {
     registerAdapter(fakeAdapter);
-    writeFileSync(join(dir, 'fleet.yaml'),
+    writeV2Fixture(join(dir, 'fleet.yaml'),
       'roles:\n  Sec:\n    harness: fake\n    isolation:\n      network: deny\n      resources:\n        mem: 2G\n        cpu: "1"\n');
     const rep = await doctor({}, green(), 'linux', stubFetch('ok'));
     const r = rep.checks.find(c => c.name === 'isolation: Sec')!;
@@ -278,7 +281,7 @@ describe('doctor isolation reporting', () => {
 
   it('flags a strict role that cannot be sandboxed as a failed check', async () => {
     registerAdapter(fakeAdapter);
-    writeFileSync(join(dir, 'fleet.yaml'),
+    writeV2Fixture(join(dir, 'fleet.yaml'),
       'roles:\n  Sec:\n    harness: fake\n    isolation:\n      on_unavailable: strict\n');
     const rep = await doctor({}, green({ 'bwrap --version': { stdout: '', stderr: '', code: 127 } }), 'linux', stubFetch('ok'));
     const r = rep.checks.find(c => c.name === 'isolation: Sec')!;
@@ -298,7 +301,7 @@ describe('doctor monitor probe', () => {
   });
   const withRole = (monitorYaml: string) => {
     registerAdapter(fakeAdapter);
-    writeFileSync(join(dir, 'fleet.yaml'), `roles:\n  A:\n    harness: fake\n${monitorYaml}`);
+    writeV2Fixture(join(dir, 'fleet.yaml'), `roles:\n  A:\n    harness: fake\n${monitorYaml}`);
   };
 
   it('reports the daemon API reachable + authorized for a supervised role', async () => {
@@ -366,13 +369,13 @@ describe('doctor monitor probe', () => {
 
   it('deduplicates identical role profiles and probes distinct role.env profiles separately', async () => {
     registerAdapter(fakeAdapter);
-    writeFileSync(join(dir, 'fleet.yaml'), JSON.stringify({
+    writeV2Fixture(join(dir, 'fleet.yaml'), {
       roles: {
         A: { harness: 'fake', env: { OURS_PORT: '4201', OURS_API_TOKEN: 'shared' } },
         B: { harness: 'fake', env: { OURS_PORT: '4201', OURS_API_TOKEN: 'shared' } },
         C: { harness: 'fake', env: { OURS_PORT: '4202', OURS_API_TOKEN: 'other' } },
       },
-    }));
+    });
     const calls: Array<{ url: string; token?: string }> = [];
     const fetch: FetchLike = async (url, init) => {
       calls.push({ url, token: init?.headers?.['x-ours-api-token'] });
@@ -450,7 +453,22 @@ describe('doctor config validity', () => {
   };
   const run = (opts: Parameters<typeof doctor>[0] = {}) =>
     doctor(opts, execWith(HEALTHY_HOST), 'linux', stubFetch());
-  const writeCfg = (yaml: string) => writeFileSync(join(dir, 'fleet.yaml'), yaml);
+  const writeCfg = (yaml: string) => writeFileSync(join(dir, 'fleet.yaml'), yaml, { mode: 0o600 });
+  const writeRejected = (label: string) => {
+    writeV2Fixture(join(dir, 'fleet.yaml'), { roles: {} });
+    if (label === 'a YAML syntax error') {
+      writeCfg('api_version: ours.network/fleet/v2\nvars: [oops\n');
+      return;
+    }
+    const subjects: Record<string, [string, string]> = {
+      'an unknown role key': ['A', 'role: { inline: {} }\nbrain: { inline: { harness: fake } }\nharnes: fake\n'],
+      'a misspelled permission key': ['A', 'role: { inline: {} }\nbrain: { inline: { harness: fake } }\npermissions: { aproval: allow }\n'],
+      'an invalid session backend': ['A', 'role: { inline: {} }\nbrain: { inline: { harness: fake, session: telepathy } }\n'],
+      'a role name with illegal characters': ['bad name', 'role: { inline: {} }\nbrain: { inline: { harness: fake } }\n'],
+    };
+    const [name, source] = subjects[label];
+    writeFileSync(join(dir, 'fleet', 'agents', `${name}.yaml`), source, { mode: 0o600 });
+  };
 
   /** Every configuration `ours-fleet config` refuses. */
   const REJECTED: Array<[string, string, RegExp]> = [
@@ -458,14 +476,15 @@ describe('doctor config validity', () => {
     ['an unknown role key', 'roles:\n  A:\n    harnes: fake\n', /unknown key\(s\) harnes/],
     ['a misspelled permission key', 'roles:\n  A:\n    permissions:\n      aproval: allow\n',
       /permissions: unknown key\(s\) aproval/],
-    ['an invalid session backend', 'roles:\n  A:\n    session: telepathy\n', /session: must be one of/],
+    ['an invalid session backend', 'roles:\n  A:\n    session: telepathy\n', /session: must be: acp/],
     ['a role name with illegal characters', 'roles:\n  "bad name":\n    harness: fake\n',
-      /invalid role name/],
+      /invalid agent id/],
   ];
 
   for (const [label, yaml, cause] of REJECTED) {
     it(`fails on ${label}, naming the same cause as \`config\``, async () => {
-      writeCfg(yaml);
+      void yaml;
+      writeRejected(label);
       // The premise: `config` rejects this exact input.
       expect(() => loadConfig(join(dir, 'fleet.yaml'))).toThrow();
       const parserMessage = (() => {
@@ -485,7 +504,7 @@ describe('doctor config validity', () => {
   it('keeps running the host checks when the config is invalid', async () => {
     writeCfg('roles:\n  A:\n    harnes: fake\n');
     const rep = await run();
-    for (const name of ['node', 'tmux', 'ours daemon', 'linger', 'user bus'])
+    for (const name of ['node', 'ours daemon', 'linger', 'user bus'])
       expect(rep.checks.find(c => c.name === name), name).toBeDefined();
   });
 
@@ -505,13 +524,14 @@ describe('doctor config validity', () => {
   });
 
   it('reports the configured-role count and does not fail an empty fleet', async () => {
-    const rep = await run();                          // no fleet.yaml at all
+    writeV2Fixture(join(dir, 'fleet.yaml'), { roles: {} });
+    const rep = await run();
     expect(rep.checks.find(c => c.name === 'roles')).toMatchObject({ ok: true, detail: '0 configured' });
     expect(rep.checks.find(c => c.name === 'config')!.ok).toBe(true);
   });
 
   it('counts the roles a valid config resolves and names the files', async () => {
-    writeCfg('roles:\n  A:\n    harness: fake\n  B:\n    harness: fake\n');
+    writeV2Fixture(join(dir, 'fleet.yaml'), 'roles:\n  A:\n    harness: fake\n  B:\n    harness: fake\n');
     const rep = await run();
     expect(rep.checks.find(c => c.name === 'roles')!.detail).toBe('2 configured');
     expect(rep.checks.find(c => c.name === 'config')!.detail).toContain('fleet.yaml');
@@ -543,7 +563,7 @@ describe('doctor permission translation', () => {
     'loginctl show-user': { stdout: 'Linger=yes', stderr: '', code: 0 },
   };
   const run = () => doctor({}, execWith(HEALTHY), 'linux', stubFetch());
-  const writeCfg = (yaml: string) => writeFileSync(join(dir, 'fleet.yaml'), yaml);
+  const writeCfg = (yaml: string) => writeV2Fixture(join(dir, 'fleet.yaml'), yaml);
   const check = (rep: Awaited<ReturnType<typeof doctor>>, role: string) =>
     rep.checks.find(c => c.name === `permissions: ${role}`)!;
 
@@ -608,7 +628,7 @@ describe('doctor unattended capability floor', () => {
     'loginctl show-user': { stdout: 'Linger=yes', stderr: '', code: 0 },
   };
   const run = () => doctor({}, execWith(HEALTHY), 'linux', stubFetch());
-  const writeCfg = (yaml: string) => writeFileSync(join(dir, 'fleet.yaml'), yaml);
+  const writeCfg = (yaml: string) => writeV2Fixture(join(dir, 'fleet.yaml'), yaml);
   const floor = (rep: Awaited<ReturnType<typeof doctor>>, role: string) =>
     rep.checks.find(c => c.name === `unattended floor: ${role}`)!;
 
@@ -674,7 +694,7 @@ describe('native overrides contradicting neutral intent', () => {
     'loginctl show-user': { stdout: 'Linger=yes', stderr: '', code: 0 },
   };
   const run = () => doctor({}, execWith(HEALTHY), 'linux', stubFetch());
-  const writeCfg = (yaml: string) => writeFileSync(join(dir, 'fleet.yaml'), yaml);
+  const writeCfg = (yaml: string) => writeV2Fixture(join(dir, 'fleet.yaml'), yaml);
   const conflicts = (rep: Awaited<ReturnType<typeof doctor>>, role: string) =>
     rep.checks.filter(c => c.name === `permission conflict: ${role}`);
 
@@ -813,7 +833,7 @@ describe('doctor rooms-tasks checks', () => {
   const CID_64 = 'a'.repeat(64);
   const run = (opts: Parameters<typeof doctor>[0] = {}) =>
     doctor(opts, execWith(HEALTHY_HOST), 'linux', stubFetch());
-  const writeCfg = (yaml: string) => writeFileSync(join(dir, 'fleet.yaml'), yaml);
+  const writeCfg = (yaml: string) => writeV2Fixture(join(dir, 'fleet.yaml'), yaml);
 
   const ROOMS_YAML = (cid = CID_64, extra = '') =>
     `roles:\n  Developer:\n    harness: fake\n` +
@@ -859,13 +879,14 @@ describe('doctor rooms-tasks checks', () => {
     expect(cw.detail).toMatch(/management socket/);
   });
 
-  it('warns on template role_ref referencing unknown role', async () => {
+  it('warns on template Agent ref referencing an unknown Agent', async () => {
     registerAdapter(fakeAdapter);
-    writeCfg(ROOMS_YAML() + `room_templates:\n  my-team:\n    version: 1\n    description: test\n    members:\n      - slot: dev\n        role: Dev\n        count: 1\n        role_ref: NonExistentRole\n`);
+    writeCfg(ROOMS_YAML() + `room_templates:\n  my-team:\n    version: 1\n    description: test\n    members:\n      - slot: dev\n        role: Dev\n        count: 1\n        agent_template: NonExistentAgent\n`);
+    rmSync(join(dir, 'fleet', 'agent_templates', 'NonExistentAgent.yaml'));
     const rep = await run();
-    const tpl = rep.checks.find(c => c.name?.startsWith('template:') && c.detail?.includes('NonExistentRole'))!;
+    const tpl = rep.checks.find(c => c.name?.startsWith('template:') && c.detail?.includes('NonExistentAgent'))!;
     expect(tpl).toBeTruthy();
-    expect(tpl.detail).toContain('not found in configured roles');
+    expect(tpl.detail).toContain('Agent Template(s) NonExistentAgent not found');
   });
 
   it('validates default template when configured', async () => {
@@ -878,9 +899,15 @@ describe('doctor rooms-tasks checks', () => {
     expect(dt.detail).toContain('not found');
   });
 
-  it('passes default template when it resolves to a builtin', async () => {
+  it('passes default template when it resolves to configured YAML', async () => {
     registerAdapter(fakeAdapter);
-    writeCfg(ROOMS_YAML(CID_64, '  defaults:\n    template: team\n'));
+    writeCfg(ROOMS_YAML(CID_64, '  defaults:\n    template: team\n')
+      + 'room_templates:\n  team:\n    version: 1\n    description: configured team\n'
+      + '    members:\n      - slot: dev\n        role: Dev\n        count: 1\n'
+      + '        agent_template: Developer\n');
+    mkdirSync(join(dir, 'fleet', 'agent_templates'), { recursive: true, mode: 0o700 });
+    writeFileSync(join(dir, 'fleet', 'agent_templates', 'Developer.yaml'),
+      'role: { inline: {} }\nbrain: { inline: { harness: fake } }\n', { mode: 0o600 });
     const rep = await run();
     const dt = rep.checks.find(c => c.name === 'rooms: default template')!;
     expect(dt.ok).toBe(true);

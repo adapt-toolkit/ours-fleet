@@ -188,18 +188,6 @@ test('bootstrap, inventory, live navigation, send, create, and security boundari
 
   await page.getByRole('button', { name: 'Topology' }).click();
   await page.getByLabel('Filter roles').fill('');
-  // Selecting a card now opens the inspector; opening the agent is explicit.
-  await page.locator('[data-node-id="agent:Terminal"]').click();
-  await page.getByRole('button', { name: 'Open', exact: true }).click();
-  await page.getByRole('button', { name: 'terminal' }).click();
-  await expect(page.locator('.terminal-host .xterm')).toBeVisible();
-  await expect(page.locator('.terminal-host')).toContainText('ANSI BOLD');
-  await expect(page.locator('.terminal-host')).toContainText('┌─ █ ');
-  const terminalStyle = await page.locator('.terminal-host .xterm-rows').evaluate(element => ({
-    fontFamily: getComputedStyle(element).fontFamily,
-    fontWeight: getComputedStyle(element).fontWeight,
-  }));
-  expect(terminalStyle.fontFamily).toContain('JetBrainsMono Nerd Font');
 
   const cookies = await page.context().cookies();
   const session = cookies.find(cookie => cookie.name === 'ofs_session')!;

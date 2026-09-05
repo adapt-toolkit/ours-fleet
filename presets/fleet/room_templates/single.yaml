@@ -1,0 +1,9 @@
+version: 1
+description: "Solo task: one Developer owns implementation and verification"
+room: { quiet_membership: false, anonymous: false }
+contract: |
+  Developer owns task execution and reports routine state, evidence, and ordinary errors only in this room.
+  Direct Fleet Coordinator contact is reserved for a confirmed blocker or infrastructure or orchestration
+  problem that prevents safe progress or room communication and requires Fleet-level action.
+members:
+  - { slot: developer, role: Developer, count: 1, agent_template: Developer }

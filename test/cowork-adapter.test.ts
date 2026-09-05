@@ -26,6 +26,7 @@ function room(overrides: Record<string, unknown> = {}) {
     identity_name: 'ours-cowork-01ABCDEF0123456789ABCDEFGH',
     identity_cid: 'A'.repeat(64),
     state: 'provisioning',
+    anonymous: false,
     mission: { goal: 'Ship', briefing: 'Cross-check everything', briefing_version: 1 },
     seats: [],
     ...overrides,
@@ -127,6 +128,23 @@ describe('Cowork management-socket adapter', () => {
       'secret-public-invite',
       { role: 'Owner', expected_cid: 'B'.repeat(64) },
     )).resolves.toEqual({ seat_cid: 'B'.repeat(64), seat_state: 'pending' });
+  });
+
+  it('sets the exact durable role command policy through Cowork', async () => {
+    const socketPath = await rpcServer(request => {
+      expect(request).toMatchObject({
+        method: 'room.command.role.set',
+        params: {
+          room_id: '01ABCDEF0123456789ABCDEFGH', role: 'Owner',
+          commands: ['list-members', 'remove-member'],
+        },
+      });
+      return [{ role: 'Owner', commands: ['list-members', 'remove-member'] }];
+    });
+    await expect(createCoworkAdapter({ socketPath }).setRoleCommands(
+      '01ABCDEF0123456789ABCDEFGH',
+      { role: 'Owner', commands: ['list-members', 'remove-member'] },
+    )).resolves.toBeUndefined();
   });
 
   it('returns Cowork invite IDs and revokes through the existing room.revoke route', async () => {

@@ -155,7 +155,8 @@ export function analyzeRolePermissions(role: ResolvedRole): RolePermissionAnalys
     translation = { ...translation, capabilities: inspection.capabilities };
   }
   const conflicts = neutral.supported
-    ? findConflicts(role, neutral.native, adapter.nativePermissionOverrides(role.harness_options))
+    ? findConflicts(role, neutral.native,
+        adapter.nativePermissionOverrides(role.harness_options, role))
     : [];
   const floor = checkUnattendedFloor(translation.capabilities, requiredUnattendedFloor(role));
   const floorSeverity = role.permissions.unattended === 'deny' ? 'fail' as const : 'warn' as const;

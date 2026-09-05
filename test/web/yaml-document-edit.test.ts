@@ -23,7 +23,7 @@ const COMMENTED = [
   '',
   'defaults:',
   '  harness: claude-code        # adapter for roles that do not set their own',
-  '  session: tmux',
+  '  session: acp',
   '',
   'roles:',
   '',
@@ -31,7 +31,7 @@ const COMMENTED = [
   '  Alice:',
   '    mission: Ship safely',
   '    oversee:',
-  '      - { role: Bob, interval: 5m }',
+  '      - { agent: Bob, interval: 5m }',
   '',
   '  Bob:',
   '    mission: Review',
@@ -79,7 +79,7 @@ describe('surgical fleet YAML document editing', () => {
     expect(next).not.toContain('Bob:');
     expect(next).not.toContain('mission: Review');
     // The oversee entry still references Bob; only the role mapping went away.
-    expect(next).toContain('- { role: Bob, interval: 5m }');
+    expect(next).toContain('- { agent: Bob, interval: 5m }');
     expect(next).toContain('# The coordinator routes work.');
     expect(parse(next)).toEqual(model);
   });
@@ -178,17 +178,17 @@ describe('surgical fleet YAML document editing', () => {
     });
 
     it('changes wake_sources on the shipped example and still parses to the model', () => {
-      const example = readFileSync('examples/fleet.yaml', 'utf8');
+      const example = readFileSync('examples/fleet/agents/Alice.yaml', 'utf8');
       for (const mutate of [
         (list: string[]) => list.push('local_contact_request'),
         (list: string[]) => list.pop(),
       ]) {
         const model = parse(example) as Record<string, any>;
-        mutate(model.roles.Alice.monitor.wake_sources);
+        mutate(model.monitor.wake_sources);
         const next = renderModelOntoSource(example, model);
         expect(parse(next)).toEqual(model);
         // The line that used to be glued on is still its own line.
-        expect(next).toContain('\n      batch_ms: 2000                # coalesce a burst into one console line (default 2000)');
+        expect(next).toContain('\n  batch_ms: 2000');
       }
     });
   });
@@ -312,6 +312,7 @@ describe('surgical fleet YAML document editing', () => {
 
 describe('fidelity against the shipped examples/fleet.yaml', () => {
   const source = readFileSync('examples/fleet.yaml', 'utf8');
+  const agentSource = readFileSync('examples/fleet/agents/Alice.yaml', 'utf8');
 
   it('renders an unchanged model byte-for-byte identically', () => {
     expect(renderModelOntoSource(source, parse(source))).toBe(source);
@@ -319,12 +320,12 @@ describe('fidelity against the shipped examples/fleet.yaml', () => {
 
   it('changes exactly one line when one scalar changes, keeping its inline comment', () => {
     const model = parse(source) as Record<string, any>;
-    model.defaults.harness = 'codex';
+    model.defaults.monitor.interrupt = true;
 
     const next = renderModelOntoSource(source, model);
 
     expect(changedLines(source, next)).toEqual([
-      "  harness: codex        # adapter for roles that don't set their own",
+      '    interrupt: true          # false: queue; true: cancel; after_tool: steer at an ACP tool boundary',
     ]);
     expect(next.split('\n')).toHaveLength(source.split('\n').length);
     expect(parse(next)).toEqual(model);
@@ -349,30 +350,35 @@ describe('fidelity against the shipped examples/fleet.yaml', () => {
 
     const next = renderModelOntoSource(source, model);
 
-    expect(next.startsWith(source.replace(/\n$/, ''))).toBe(true);
+    let cursor = 0;
+    for (const line of source.split('\n')) {
+      const found = next.indexOf(line, cursor);
+      expect(found).toBeGreaterThanOrEqual(0);
+      cursor = found + line.length;
+    }
     expect(changedLines(source, next).join('\n')).toContain('watchdogs:');
     expect(parse(next)).toEqual(model);
   });
 
-  it('removes a role without disturbing anything above it', () => {
-    const model = parse(source) as Record<string, any>;
-    delete model.roles.Alice;
+  it('removes an Agent field without disturbing anything above it', () => {
+    const model = parse(agentSource) as Record<string, any>;
+    delete model.monitor;
 
-    const next = renderModelOntoSource(source, model);
+    const next = renderModelOntoSource(agentSource, model);
 
-    expect(next).not.toContain('Own the alice repository end to end.');
-    expect(next).toContain('  FleetCoordinator:');
-    expect(next.split('\n').length).toBeLessThan(source.split('\n').length);
+    expect(next).not.toContain('wake_sources:');
+    expect(next).toContain('brain: { ref: claude-default }');
+    expect(next.split('\n').length).toBeLessThan(agentSource.split('\n').length);
     expect(parse(next)).toEqual(model);
   });
 
   it('masks secrets without altering any other byte', () => {
-    const redacted = redactSourceSecrets(source, 'MASK');
+    const redacted = redactSourceSecrets(agentSource, 'MASK');
 
-    expect(changedLines(source, redacted)).toEqual([
-      '      EXAMPLE_FLAG: MASK             # extra env passed into the session',
+    expect(changedLines(agentSource, redacted)).toEqual([
+      '  EXAMPLE_FLAG: MASK',
     ]);
-    expect(redacted.split('\n')).toHaveLength(source.split('\n').length);
+    expect(redacted.split('\n')).toHaveLength(agentSource.split('\n').length);
   });
 });
 

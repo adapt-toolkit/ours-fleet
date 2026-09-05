@@ -39,10 +39,10 @@ h1, h2, h3, p { margin-top: 0; }
 header h1 { margin: 4px 0 0; font-size: 29px; letter-spacing: -.8px; }
 .eyebrow { color: var(--mint); text-transform: uppercase; font-size: 10px; letter-spacing: 1.8px; font-weight: 700; }
 .header-actions, .actions { display: flex; gap: 9px; }
-button.primary, button.secondary, .actions button, .terminal-toolbar button { border-radius: 7px; padding: 9px 13px; cursor: pointer; }
+button.primary, button.secondary, .actions button { border-radius: 7px; padding: 9px 13px; cursor: pointer; }
 button.primary { border: 1px solid #83e9b5; color: #07130d; background: var(--mint); font-weight: 700; }
 button.primary:disabled { opacity: .4; cursor: default; }
-button.secondary, .actions button, .terminal-toolbar button { border: 1px solid #30393b; background: #141a1b; }
+button.secondary, .actions button { border: 1px solid #30393b; background: #141a1b; }
 button.secondary:hover, .actions button:hover { border-color: #526064; }
 .content, .workspace { padding: 28px 36px 60px; }
 .toolbar { display: flex; align-items: center; justify-content: space-between; margin-bottom: 16px; color: var(--muted); font-size: 12px; }
@@ -163,12 +163,6 @@ legend { margin-bottom: 13px; color: var(--mint); text-transform: uppercase; fon
 .stage i { z-index: 1; width: 11px; height: 11px; margin-top: 2px; border-radius: 50%; background: var(--mint); box-shadow: 0 0 0 4px #173026; }
 .stage span { display: flex; flex-direction: column; text-transform: capitalize; }
 .stage small { color: var(--muted); margin-top: 3px; }
-.terminal-panel { padding: 0; overflow: hidden; }
-.terminal-toolbar { display: flex; align-items: center; gap: 12px; min-height: 48px; padding: 8px 12px; border-bottom: 1px solid var(--line); color: var(--muted); font-size: 11px; }
-.terminal-toolbar button { margin-left: auto; padding-block: 6px; }
-.terminal-mode { text-transform: uppercase; letter-spacing: 1px; color: var(--amber); }
-.terminal-mode.controlling { color: var(--mint); }
-.terminal-host { height: calc(100vh - 310px); min-height: 360px; padding: 8px; background: #050707; }
 @media (max-width: 1050px) {
   .role-row { grid-template-columns: 1.5fr repeat(3, 1fr); }
   .role-row > span:nth-child(4) { display: none; }

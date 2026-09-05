@@ -7,6 +7,7 @@ import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vite
 import { RoleControlServer } from '../src/session/control.js';
 import type { OwnerChannelHandle, OwnerChannelManagementRequest } from '../src/owner-channel/channel.js';
 import type { SessionHandle } from '../src/session/types.js';
+import { writeV2Fixture } from './v2-fixture.js';
 
 const CLI = resolve('dist/cli.js');
 const A = 'A'.repeat(64);
@@ -30,10 +31,17 @@ afterEach(async () => {
   rmSync(homeDir, { recursive: true, force: true });
 });
 
+const cleanEnv = (extraEnv: Record<string, string> = {}): NodeJS.ProcessEnv => {
+  const env = { ...process.env, OURS_FLEET_HOME: homeDir, ...extraEnv };
+  delete env.OURS_FLEET_PROXY_STATE_DIR;
+  delete env.OURS_FLEET_PROXY_CALLER;
+  return { ...env, ...extraEnv };
+};
+
 const run = (args: string[], extraEnv: Record<string, string> = {}) =>
   new Promise<{ code: number; stdout: string; stderr: string }>(resolveRun => {
   execFile(process.execPath, [CLI, ...args], {
-    env: { ...process.env, OURS_FLEET_HOME: homeDir, ...extraEnv },
+    env: cleanEnv(extraEnv),
   },
     (error, stdout, stderr) => resolveRun({
       code: typeof (error as NodeJS.ErrnoException | null)?.code === 'number'
@@ -45,7 +53,7 @@ const run = (args: string[], extraEnv: Record<string, string> = {}) =>
 const runStdin = (args: string[], stdin: string) =>
   new Promise<{ code: number; stdout: string; stderr: string }>(resolveRun => {
     const child = spawn(process.execPath, [CLI, ...args], {
-      env: { ...process.env, OURS_FLEET_HOME: homeDir }, stdio: ['pipe', 'pipe', 'pipe'],
+      env: cleanEnv(), stdio: ['pipe', 'pipe', 'pipe'],
     });
     let stdout = '';
     let stderr = '';
@@ -59,7 +67,7 @@ function config(body = [
   'roles:', '  PhoneRole:', '    session: acp', '    owner_channel:',
   '      identity: PhoneRole-owner', `      owners: [${A}]`, '',
 ].join('\n')): void {
-  writeFileSync(join(homeDir, 'fleet.yaml'), body);
+  writeV2Fixture(join(homeDir, 'fleet.yaml'), body);
 }
 
 async function startControl(manage: OwnerChannelHandle['manage']): Promise<void> {
@@ -222,15 +230,31 @@ describe('owner-channel CLI', () => {
     const stateDir = join(homeDir, '.ours-fleet', 'agents', 'PhoneRole');
     const spawn = vi.fn(async options => ({
       caller: 'PhoneRole', role: options.name, lifetime: options.temp ? 'temporary' as const : 'permanent' as const,
-      statePath: '/state/ProxyWorker', harness: options.harness ?? 'codex', session: 'acp' as const,
+      statePath: '/state/ProxyWorker', harness: 'claude-code', session: 'acp' as const,
       model: 'gpt-proxy', monitor: { mode: 'fleet' as const, interrupt: true },
       permissionMode: { fleetMode: 'allow' as const, nativeMode: 'bypassPermissions' },
-      inherited: ['session', 'model', 'monitorConfig'], creationActionId: 'proxy-action',
+      inherited: ['brain', 'role', 'monitorConfig'], creationActionId: 'proxy-action',
+      brainSummary: 'inline:sha256:abc (explicit)', roleSummary: 'inline:sha256:def (explicit)',
     }));
     control!.setFleetSpawner(spawn);
+    const audit = {
+      version: 1 as const, correlationId: '123e4567-e89b-42d3-a456-426614174000',
+      requestId: '123e4567-e89b-42d3-a456-426614174001',
+      caller: 'PhoneRole', invokedAt: '2026-01-01T00:00:00.000Z',
+      classification: { command: 'spawn ProxyWorker', route: 'supervisor-proxy/spawn', decision: 'allow' as const },
+      argv: ['spawn', 'ProxyWorker', '--temp'], invocation: 'delivered' as const,
+    };
+    const finishAudit = vi.fn(async (input: Parameters<NonNullable<Parameters<typeof control.setFleetAuditor>[0]>['finish']>[0]) =>
+      ({ ...audit, outcome: { completedAt: '2026-01-01T00:00:01.000Z',
+        class: input.class, exitCode: input.exitCode, effect: input.effect, delivery: 'delivered' as const } }));
+    control!.setFleetAuditor({
+      begin: async () => audit,
+      finish: finishAudit,
+    });
 
     const result = await run([
-      'spawn', '--role', 'ProxyWorker', '--temp', '--harness', 'claude-code',
+      'spawn', 'ProxyWorker', '--temp', '--brain', 'inline:{"harness":"claude-code"}',
+      '--role', 'inline:{}',
     ], {
       OURS_FLEET_PROXY_STATE_DIR: stateDir,
       OURS_FLEET_PROXY_CALLER: 'PhoneRole',
@@ -240,14 +264,60 @@ describe('owner-channel CLI', () => {
     expect(result.stdout).toContain('claude-code/acp');
     expect(result.stdout).toContain('permission=allow native=bypassPermissions');
     expect(spawn).toHaveBeenCalledWith(expect.objectContaining({
-      name: 'ProxyWorker', temp: true, harness: 'claude-code',
+      name: 'ProxyWorker', temp: true,
+      brain: { inline: { harness: 'claude-code' } }, role: { inline: {} },
+    }));
+    expect(finishAudit).toHaveBeenCalledWith(expect.not.objectContaining({ presentations: expect.anything() }));
+  }, CLI_INTEGRATION_TIMEOUT_MS);
+
+  it('forwards real Task metadata and JSON failure classification in audit finish payloads', async () => {
+    config();
+    await startControl(async () => { throw new Error('not used'); });
+    const stateDir = join(homeDir, '.ours-fleet', 'agents', 'PhoneRole');
+    const finishAudit = vi.fn(async (input: Parameters<NonNullable<Parameters<typeof control.setFleetAuditor>[0]>['finish']>[0]) => ({
+      version: 1 as const, correlationId: input.correlationId, requestId: '123e4567-e89b-42d3-a456-426614174001',
+      caller: 'PhoneRole', invokedAt: '2026-01-01T00:00:00.000Z',
+      classification: { command: 'task', route: 'supervisor-proxy/task', decision: 'allow' as const },
+      argv: [], invocation: 'delivered' as const,
+      outcome: { completedAt: '2026-01-01T00:00:01.000Z', class: input.class,
+        exitCode: input.exitCode, effect: input.effect, delivery: 'delivered' as const,
+        ...(input.presentations ? { presentations: input.presentations } : {}) },
+    }));
+    control!.setFleetAuditor({
+      begin: async input => ({ version: 1, correlationId: '123e4567-e89b-42d3-a456-426614174000',
+        requestId: input.requestId, caller: 'PhoneRole', invokedAt: '2026-01-01T00:00:00.000Z',
+        classification: { command: 'task create', route: 'supervisor-proxy/task', decision: 'allow' },
+        argv: input.argv, invocation: 'delivered' }),
+      finish: finishAudit,
+    });
+    const env = { OURS_FLEET_PROXY_STATE_DIR: stateDir, OURS_FLEET_PROXY_CALLER: 'PhoneRole' };
+
+    const created = await run(['task', 'create', '--title', 'Proxy metadata', '--backlog', '--no-room', '--json'], env);
+    expect(created.code).toBe(0);
+    const taskId = JSON.parse(created.stdout).task.task_id as string;
+    expect(finishAudit).toHaveBeenLastCalledWith(expect.objectContaining({ class: 'success',
+      effect: 'completed', resourceIds: { task: taskId }, presentations: [expect.objectContaining({
+        kind: 'task', operation: 'create', id: taskId, title: 'Proxy metadata',
+        previousState: 'none', newState: 'backlog', agents: [],
+      })] }));
+
+    const missing = await run(['task', 'show', 'definitely-missing', '--json'], env);
+    expect(missing.code).toBe(1);
+    expect(finishAudit).toHaveBeenLastCalledWith(expect.objectContaining({
+      class: 'validation', effect: 'not_started', exitCode: 1,
+    }));
+
+    writeFileSync(join(homeDir, '.ours-fleet', 'tasks', `${taskId}.json`), '{corrupt');
+    const broken = await run(['task', 'show', taskId, '--json'], env);
+    expect(broken.code).toBe(1);
+    expect(finishAudit).toHaveBeenLastCalledWith(expect.objectContaining({
+      class: 'runtime', effect: 'unknown', exitCode: 1,
     }));
   }, CLI_INTEGRATION_TIMEOUT_MS);
 
   it('rejects invalid targets, invalid CIDs, conflicting invite sources, and unavailable channels', async () => {
-    config('roles:\n  Wrong: { session: tmux }\n  Plain: { session: acp }\n  PhoneRole:\n    session: acp\n    owner_channel:\n      identity: PhoneRole-owner\n      owners: [' + A + ']\n');
+    config('roles:\n  Plain: { session: acp }\n  PhoneRole:\n    session: acp\n    owner_channel:\n      identity: PhoneRole-owner\n      owners: [' + A + ']\n');
     expect((await run(['owner-channel', 'contact', 'list', 'Missing'])).stderr).toMatch(/no such role/);
-    expect((await run(['owner-channel', 'contact', 'list', 'Wrong'])).stderr).toMatch(/requires ACP/);
     expect((await run(['owner-channel', 'contact', 'list', 'Plain'])).stderr).toMatch(/no owner_channel/);
     expect((await run(['owner-channel', 'contact', 'list', 'PhoneRole'])).stderr).toMatch(/stopped.*control socket/);
     expect((await run(['owner-channel', 'owner', 'authorize', 'PhoneRole', 'not-a-cid'])).stderr)

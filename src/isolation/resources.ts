@@ -4,13 +4,9 @@ import type { IsolationResources } from './types.js';
 export interface ResourceArgs { argv: string[]; warnings: string[] }
 
 /**
- * Build the `systemd-run --user --scope -p … --` prefix that caps the pane's
- * cgroup-v2 scope. Composed OUTSIDE the sandbox wrap: a tmux pane is
- * a child of a tmux SERVER rather than of the role's own runner process, so the
- * only reliable per-agent limit is a transient scope at the pane itself. (Since
- * #32 that server is per role rather than fleet-wide, which is what keeps one
- * role's `stop` off every other role's pane — the limit still belongs on the
- * pane.)
+ * Build the `systemd-run --user --scope -p … --` prefix that caps the agent
+ * process's cgroup-v2 scope. It composes outside the sandbox wrapper so both
+ * the adapter and its sandboxed child remain inside the transient scope.
  *
  * mem/pids are always enforced (their controllers are delegated to `--user` by
  * default). cpu degrades to a warning when the cpu controller is not delegated.

@@ -25,7 +25,7 @@ export const tmuxSocket = (session: string): string => `${TMUX_SOCKET_PREFIX}${s
 export const tmuxArgs = (session: string, args: string[]): string[] =>
   ['-L', tmuxSocket(session), ...args];
 
-/** Thin tmux wrapper; all session handling in the core goes through this. */
+/** Thin tmux wrapper retained only for supervisor=none process containment. */
 export class Tmux {
   constructor(private exec: Exec = realExec) {}
 
@@ -48,53 +48,4 @@ export class Tmux {
     return (await this.exec('tmux', tmuxArgs(name, ['kill-session', '-t', name]))).code === 0;
   }
 
-  async capture(name: string, lines = 40): Promise<string> {
-    const r = await this.exec('tmux', tmuxArgs(name, ['capture-pane', '-t', name, '-p']));
-    if (r.code !== 0) throw new Error(`tmux capture-pane '${name}' failed: ${r.stderr.trim()}`);
-    const all = r.stdout.replace(/\n+$/, '').split('\n');
-    return all.slice(-lines).join('\n');
-  }
-
-  /** Bounded ANSI/history seed for the browser terminal projection. */
-  async captureHistory(name: string, lines = 5_000): Promise<string> {
-    const bounded = Math.min(Math.max(Math.trunc(lines), 1), 20_000);
-    const r = await this.exec(
-      'tmux', tmuxArgs(name, ['capture-pane', '-t', name, '-p', '-e', '-J', '-S', `-${bounded}`]));
-    if (r.code !== 0) throw new Error(`tmux capture-pane '${name}' failed: ${r.stderr.trim()}`);
-    return Buffer.from(r.stdout).subarray(0, 4 * 1024 * 1024).toString();
-  }
-
-  async panePid(name: string): Promise<number | null> {
-    const r = await this.exec('tmux', tmuxArgs(name, ['list-panes', '-t', name, '-F', '#{pane_pid}']));
-    if (r.code !== 0) return null;
-    const pid = parseInt(r.stdout.trim().split('\n')[0], 10);
-    return Number.isFinite(pid) ? pid : null;
-  }
-
-  /**
-   * List the live sessions among `names`, asking each server in turn.
-   * There is no fleet-wide `tmux ls` any more: a session per server means the
-   * caller says which sessions to ask about. A server that is not running
-   * answers non-zero and contributes nothing.
-   */
-  async list(names: readonly string[]): Promise<string> {
-    const lines: string[] = [];
-    for (const name of names) {
-      const r = await this.exec('tmux', tmuxArgs(name, ['ls']));
-      if (r.code === 0 && r.stdout.trim()) lines.push(r.stdout.trimEnd());
-    }
-    return lines.join('\n');
-  }
-
-  async sendText(name: string, text: string): Promise<void> {
-    let r = await this.exec('tmux', tmuxArgs(name, ['send-keys', '-t', name, '-l', text]));
-    if (r.code !== 0) throw new Error(`tmux send-keys '${name}' failed: ${r.stderr.trim()}`);
-    r = await this.exec('tmux', tmuxArgs(name, ['send-keys', '-t', name, 'Enter']));
-    if (r.code !== 0) throw new Error(`tmux send-keys Enter '${name}' failed: ${r.stderr.trim()}`);
-  }
-
-  async sendKey(name: string, key: string): Promise<void> {
-    const r = await this.exec('tmux', tmuxArgs(name, ['send-keys', '-t', name, key]));
-    if (r.code !== 0) throw new Error(`tmux send-keys '${name}' failed: ${r.stderr.trim()}`);
-  }
 }

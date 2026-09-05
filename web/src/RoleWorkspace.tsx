@@ -1,4 +1,4 @@
-import { lazy, Suspense, useCallback, useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { api, idempotencyKey } from './api';
 import { ConversationView } from './ConversationView';
 import { isInactive } from './fleet-presentation';
@@ -8,11 +8,9 @@ import { runtimeMetadata } from './runtime-metadata';
 import { promptReceiptNotice } from './prompt-receipt';
 import { confirmAndRemoveRole } from './remove-role';
 
-const TerminalView = lazy(() => import('./TerminalView').then(module => ({ default: module.TerminalView })));
-
 export function RoleWorkspace({ roleId, onBack, onRemoved }: { roleId: string; onBack(): void; onRemoved?(): void }) {
   const [detail, setDetail] = useState<any>();
-  const [tab, setTab] = useState<'overview' | 'conversation' | 'activity' | 'terminal' | 'logs' | 'diagnostics'>('overview');
+  const [tab, setTab] = useState<'overview' | 'conversation' | 'activity' | 'logs' | 'diagnostics'>('overview');
   // ACP roles land on the structured Conversation view; picked once per role.
   const defaultTabPicked = useRef(false);
   const [output, setOutput] = useState<any>();
@@ -77,10 +75,10 @@ export function RoleWorkspace({ roleId, onBack, onRemoved }: { roleId: string; o
       {([
         'overview',
         ...(status.session.backend === 'acp' ? ['conversation'] as const : []),
-        'activity', 'terminal', 'logs', 'diagnostics',
+        'activity', 'logs', 'diagnostics',
       ] as const).map(name =>
-        <button key={name} className={tab === name ? 'active' : ''} disabled={name === 'terminal' && !capabilities.terminal.available}
-          onClick={() => setTab(name)}>{name === 'terminal' ? 'PTY terminal' : name}{name === 'terminal' && !capabilities.terminal.available ? ' · unavailable' : ''}</button>)}
+        <button key={name} className={tab === name ? 'active' : ''}
+          onClick={() => setTab(name)}>{name}</button>)}
     </div>
     {refreshError && <div className="banner error">Live refresh failed: {refreshError}</div>}
     {notice && <div className="banner info">{notice}</div>}
@@ -123,9 +121,6 @@ export function RoleWorkspace({ roleId, onBack, onRemoved }: { roleId: string; o
         <button className="primary" disabled={!text.trim()} onClick={() => void send()}>Send</button>
         {capabilities.input.interrupt && <button className="danger" onClick={() => confirm('Interrupt the active ACP turn?') && void api.post(`/api/v1/roles/${roleId}/interrupt`, {})}>Interrupt turn</button>}
         <small>Acceptance is not completion. Timeouts remain uncertain.</small></div>}</div>}
-    {tab === 'terminal' && <Suspense fallback={<div className="panel">Loading terminal runtime…</div>}>
-      <TerminalView roleId={roleId} />
-    </Suspense>}
     {tab === 'logs' && <div className="panel log-panel"><h2>Redacted logs</h2><p className="muted">Raw export is disabled.</p>
       {logs?.records?.map((record: any, index: number) => <LogLine record={record} key={index} />)}</div>}
     {tab === 'diagnostics' && <div className="panel"><h2>Capabilities & problems</h2><pre>{JSON.stringify(capabilities, null, 2)}</pre>

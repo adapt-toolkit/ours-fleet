@@ -1,70 +1,56 @@
 import { createHash } from 'node:crypto';
 import type { TemplateDefinition, TemplateSnapshot } from './types.js';
-
-const TEAM: TemplateDefinition = {
-  name: 'team',
-  version: 1,
-  builtin: true,
-  description: 'Phased task pipeline: Architect specifies, Developer implements, Tester verifies',
-  room: { quiet_membership: false, anonymous: false },
-  contract: [
-    'Architect produces a spec and posts it to the room. Work pauses for owner approval.',
-    'Developer implements per approved spec.',
-    'Tester verifies spec conformance and test coverage.',
-    'Completion requires tester sign-off.',
-  ].join('\n'),
-  members: [
-    { slot: 'architect', role: 'Architect', count: 1, role_ref: 'Architect' },
-    { slot: 'developer', role: 'Developer', count: 1, role_ref: 'Developer' },
-    { slot: 'tester', role: 'Tester', count: 1, role_ref: 'Tester' },
-  ],
-};
-
-const PAIR: TemplateDefinition = {
-  name: 'pair',
-  version: 1,
-  builtin: true,
-  description: 'Deliberation pair: Secretary writes code, Critic reviews — every decision deliberated together',
-  room: { quiet_membership: false, anonymous: false },
-  contract: [
-    'Secretary and Critic deliberate every decision together before acting.',
-    'Secretary writes code; Critic reviews and challenges.',
-    'No material change lands without both agreeing.',
-    'Completion requires joint sign-off.',
-  ].join('\n'),
-  members: [
-    { slot: 'secretary', role: 'Secretary', count: 1, role_ref: 'Secretary' },
-    { slot: 'critic', role: 'Critic', count: 1, role_ref: 'Critic' },
-  ],
-};
-
-const SINGLE: TemplateDefinition = {
-  name: 'single',
-  version: 1,
-  builtin: true,
-  description: 'Solo agent: one general-purpose agent works the task with owner oversight',
-  room: { quiet_membership: false, anonymous: false },
-  contract: [
-    'Agent works the task autonomously, consulting the owner when blocked.',
-    'Owner reviews and approves completion.',
-  ].join('\n'),
-  members: [
-    { slot: 'agent', role: 'Agent', count: 1, role_ref: 'Agent' },
-  ],
-};
-
-export const BUILTIN_TEMPLATES: readonly TemplateDefinition[] = [TEAM, PAIR, SINGLE];
+import type { AgentTemplateDefinition } from '../config.js';
+import { canonicalJson } from '../canonical-json.js';
+import { redactLaunchDefinition, sealLaunchSnapshot } from './launch-snapshot.js';
 
 export function hashTemplate(t: TemplateDefinition): string {
-  const canonical = JSON.stringify({
+  const canonical = canonicalJson({
     name: t.name, version: t.version, description: t.description,
     room: t.room, contract: t.contract, members: t.members,
   });
   return createHash('sha256').update(canonical).digest('hex');
 }
 
-export function snapshotTemplate(t: TemplateDefinition): TemplateSnapshot {
-  return { ...t, content_hash: hashTemplate(t) };
+export function snapshotTemplate(
+  t: TemplateDefinition, agentTemplates?: Record<string, AgentTemplateDefinition>,
+): TemplateSnapshot {
+  const { sourceFile: _, ...semantic } = t;
+  return { ...semantic, members: semantic.members.map(member => {
+    const definition = agentTemplates?.[member.agent_template];
+    return {
+      ...member,
+      ...(definition ? {
+        agent_projection: redactLaunchDefinition(definition) as Record<string, unknown>,
+        agent_template_hash: createHash('sha256').update(canonicalJson(definition)).digest('hex'),
+      } : {}),
+    };
+  }), content_hash: agentTemplates ? createHash('sha256').update(canonicalJson({
+    template: hashTemplate(t),
+    members: semantic.members.map(member => ({
+      agent_template: member.agent_template,
+      agent_template_hash: agentTemplates?.[member.agent_template]
+        ? createHash('sha256').update(canonicalJson(agentTemplates[member.agent_template])).digest('hex')
+        : null,
+    })),
+  })).digest('hex') : hashTemplate(t) };
+}
+
+/** Explicit mutation boundary immediately before Task/Room plan persistence. */
+export function sealTemplateSnapshot(
+  snapshot: TemplateSnapshot, agentTemplates: Record<string, AgentTemplateDefinition>,
+  launchDefinitions?: Record<string, AgentTemplateDefinition>,
+): TemplateSnapshot {
+  const referenced = Object.fromEntries([...new Set(snapshot.members.map(member =>
+    member.launch_definition_id ?? member.agent_template))]
+    .sort().map(id => {
+      const member = snapshot.members.find(candidate =>
+        (candidate.launch_definition_id ?? candidate.agent_template) === id)!;
+      const definition = launchDefinitions?.[id] ?? agentTemplates[member.agent_template];
+      if (!definition) throw new Error(`Agent Template '${id}' not found`);
+      return [id, definition];
+    }));
+  return { ...snapshot, launch_snapshot_hash: sealLaunchSnapshot(referenced) };
 }
 
 export function resolveTemplate(
@@ -76,30 +62,15 @@ export function resolveTemplate(
   const versionStr = atIdx > 0 ? name.slice(atIdx + 1) : undefined;
   const version = versionStr ? parseInt(versionStr, 10) : undefined;
 
-  const custom = customTemplates[baseName];
-  if (custom) {
-    if (version !== undefined && custom.version !== version) return undefined;
-    return custom;
-  }
-  const builtin = BUILTIN_TEMPLATES.find(b => b.name === baseName);
-  if (builtin) {
-    if (version !== undefined && builtin.version !== version) return undefined;
-    return builtin;
-  }
-  return undefined;
+  const template = customTemplates[baseName];
+  if (!template || (version !== undefined && template.version !== version)) return undefined;
+  return template;
 }
 
 export function listTemplates(
   customTemplates: Record<string, TemplateDefinition>,
 ): TemplateDefinition[] {
-  const result: TemplateDefinition[] = [];
-  const overridden = new Set<string>();
-  for (const [name, t] of Object.entries(customTemplates)) {
-    result.push({ ...t, name });
-    if (BUILTIN_TEMPLATES.some(b => b.name === name)) overridden.add(name);
-  }
-  for (const b of BUILTIN_TEMPLATES) {
-    if (!overridden.has(b.name)) result.push(b);
-  }
-  return result.sort((a, b) => a.name.localeCompare(b.name));
+  return Object.entries(customTemplates)
+    .map(([name, template]) => ({ ...template, name }))
+    .sort((a, b) => a.name.localeCompare(b.name));
 }

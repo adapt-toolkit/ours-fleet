@@ -22,9 +22,8 @@ export interface ObservedActivity {
 }
 
 /**
- * Classify agent-side activity. `unobservable` is NOT `quiet`: a backend that
- * cannot see the agent (tmux) has no evidence, and no evidence must never be
- * reported as "doing nothing".
+ * Classify agent-side activity. `unobservable` is NOT `quiet`: absent evidence
+ * must never be reported as "doing nothing".
  */
 export function classifyActivity(
   activity: SessionActivity | undefined, now: number = Date.now(),

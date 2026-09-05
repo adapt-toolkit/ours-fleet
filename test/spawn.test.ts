@@ -1,10 +1,11 @@
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
-import { chmodSync, mkdtempSync, writeFileSync, readFileSync, readdirSync, existsSync, rmSync } from 'node:fs';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
+import { chmodSync, mkdtempSync, writeFileSync, readFileSync, readdirSync, existsSync, rmSync, symlinkSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { parse, stringify } from 'yaml';
 import {
-  spawnDryRun, spawnPermanent, spawnTemp, type SupervisorLauncher,
+  spawnDryRun as canonicalSpawnDryRun, spawnPermanent as canonicalSpawnPermanent,
+  spawnTemp as canonicalSpawnTemp, type SpawnOpts, type SupervisorLauncher,
 } from '../src/spawn.js';
 import { creationBuildNote, formatProvenance, type CreationProvenance } from '../src/creation.js';
 import { agentDir, stateRoot } from '../src/paths.js';
@@ -17,13 +18,50 @@ import type { OpsDeps } from '../src/ops.js';
 import type { SupervisorBackend } from '../src/supervisor/types.js';
 import '../src/harness/claude-code.js';
 import '../src/harness/codex.js';
+import { writeV2Fixture } from './v2-fixture.js';
+
+/** Mechanical migration adapter for pre-Brain/Role lifecycle tests. */
+function canonical(input: any): SpawnOpts {
+  if (input.brain && input.role) return input;
+  if (input.mission !== undefined && input.missionFile)
+    throw new Error('--mission and --mission-file are mutually exclusive');
+  const harness = input.harness ?? 'claude-code';
+  const harnessOptions: Record<string, unknown> = {};
+  if (input.permissionMode) harnessOptions[harness === 'claude-code' ? 'permission_mode' : 'approval'] = input.permissionMode;
+  for (const key of ['sandbox', 'profile', 'launcher', 'search', 'monitor'])
+    if (input[key] !== undefined) harnessOptions[key] = input[key];
+  if (input.codexConfig) harnessOptions.config = input.codexConfig;
+  if (input.addDirs) harnessOptions.add_dirs = input.addDirs;
+  const brain = { harness, ...(input.session ? { session: input.session } : {}),
+    ...(input.model === null || (typeof input.model === 'string' && input.model.trim()) ? { model: input.model } : {}),
+    ...(input.reasoningEffort ? { effort: input.reasoningEffort } : {}),
+    ...(Object.keys(harnessOptions).length ? { harness_options: harnessOptions } : {}) };
+  const role = {
+    ...(input.missionFile ? { mission: readFileSync(input.missionFile, 'utf8') }
+      : input.mission !== undefined ? { mission: input.mission } : {}),
+    ...(input.bio !== undefined ? { bio: input.bio } : input.bioFile ? { bio: readFileSync(input.bioFile, 'utf8').trim() } : {}),
+    ...(input.persona !== undefined ? { persona: input.persona }
+      : input.personaFile ? { persona: readFileSync(input.personaFile, 'utf8').trim() } : {}),
+  };
+  const { harness: _h, session: _s, model: _m, reasoningEffort: _e, mission: _mission,
+    missionFile: _mf, bio: _bio, bioFile: _bf, persona: _persona, personaFile: _pf,
+    permissionMode: _pm, sandbox: _sb, profile: _pr, launcher: _la, search: _se,
+    codexConfig: _cc, addDirs: _ad, monitor: _mo, ...rest } = input;
+  if (Array.isArray(rest.inheritedFromCaller)) rest.inheritedFromCaller = [...new Set(
+    rest.inheritedFromCaller.map((key: string) => ['harness', 'session', 'model'].includes(key) ? 'brain' : key),
+  )];
+  return { ...rest, brain: { inline: brain }, role: { inline: role } };
+}
+const spawnDryRun = (o: any) => canonicalSpawnDryRun(canonical(o));
+const spawnPermanent = async (o: any, ...args: any[]) => canonicalSpawnPermanent(canonical(o), args[0], args[1]);
+const spawnTemp = async (o: any, ...args: any[]) => canonicalSpawnTemp(canonical(o), args[0], args[1], args[2]);
 
 let dir: string;
 beforeEach(() => {
   dir = mkdtempSync(join(tmpdir(), 'ours-fleet-spawn-'));
   process.env.OURS_FLEET_HOME = dir;
   registerAdapter(fakeAdapter);
-  writeFileSync(join(dir, 'fleet.yaml'), stringify({ defaults: { harness: 'fake' }, roles: { Coord: {} } }));
+  writeV2Fixture(join(dir, 'fleet.yaml'), { defaults: { harness: 'fake' }, roles: { Coord: {} } });
 });
 afterEach(() => {
   delete process.env.OURS_FLEET_HOME;
@@ -50,11 +88,28 @@ function fakeDeps() {
 }
 
 describe('spawnPermanent', () => {
+  it('rejects unsupported Codex effort before identity, config, state, or service side effects', async () => {
+    const { d, calls } = fakeDeps();
+    const identityExists = vi.fn(async () => true);
+    d.identityProvisioner = { exists: identityExists };
+
+    await expect(spawnPermanent({
+      name: 'InvalidEffort', harness: 'codex', reasoningEffort: 'impossible',
+    }, d)).rejects.toThrow(
+      'Codex Brain effort must be one of: low, medium, high, xhigh, max, ultra',
+    );
+
+    expect(calls).toEqual([]);
+    expect(identityExists).not.toHaveBeenCalled();
+    expect(existsSync(join(dir, 'fleet', 'agents', 'InvalidEffort.yaml'))).toBe(false);
+    expect(existsSync(agentDir('InvalidEffort'))).toBe(false);
+  });
+
   it('rejects an effective identity already owned by a static role', async () => {
     const { d } = fakeDeps();
     await expect(spawnPermanent({ name: 'Other', identity: 'Coord' }, d))
-      .rejects.toThrow(/identity 'Coord'.*role 'Coord'.*fleet\.yaml/s);
-    expect(existsSync(join(dir, 'fleet.d', 'Other.yaml'))).toBe(false);
+      .rejects.toThrow(/identity 'Coord'.*role 'Coord'.*fleet\/agents\/Coord\.yaml/s);
+    expect(existsSync(join(dir, 'fleet', 'agents', 'Other.yaml'))).toBe(false);
   });
 
   it('reads a multiline Unicode mission file verbatim and rejects option conflicts', async () => {
@@ -62,7 +117,7 @@ describe('spawnPermanent', () => {
     writeFileSync(path, 'first line\nžluťoučký kůň\n');
     const { d } = fakeDeps();
     const file = await spawnPermanent({ name: 'Mission', missionFile: path }, d);
-    expect(parse(readFileSync(file, 'utf8')).roles.Mission.mission)
+    expect(parse(readFileSync(file, 'utf8')).role.inline.mission)
       .toBe('first line\nžluťoučký kůň\n');
     await expect(spawnPermanent({
       name: 'Conflict', mission: 'inline', missionFile: path,
@@ -76,8 +131,9 @@ describe('spawnPermanent', () => {
     const result = spawnDryRun({
       name: 'Preview', model: 'approved', missionFile: mission,
     });
-    expect(result.roleDocument.roles.Preview).toMatchObject({
-      model: 'approved', mission: 'long\nmission\n',
+    expect(result.roleDocument).toMatchObject({
+      role: { inline: { mission: 'long\nmission\n' } },
+      brain: { inline: { model: 'approved' } },
     });
     expect(result.resolvedRole.name).toBe('Preview');
     expect(readdirSync(dir).sort()).toEqual(before);
@@ -89,7 +145,7 @@ describe('spawnPermanent', () => {
     expect(result.resolvedRole.permissions.approval).toBe('auto');
   });
 
-  it('writes fleet.d/<Name>.yaml from files and brings the role up', async () => {
+  it('writes fleet/agents/<Name>.yaml from files and brings the role up', async () => {
     writeFileSync(join(dir, 'bio.txt'), 'A public card.');
     writeFileSync(join(dir, 'persona.txt'), 'An operating contract.');
     const { d, calls } = fakeDeps();
@@ -98,9 +154,9 @@ describe('spawnPermanent', () => {
       bioFile: join(dir, 'bio.txt'), personaFile: join(dir, 'persona.txt'),
     }, d);
     const doc = parse(readFileSync(file, 'utf8'));
-    expect(doc.roles.Worker.bio).toBe('A public card.');
-    expect(doc.roles.Worker.persona).toBe('An operating contract.');
-    expect(doc.roles.Worker.coordinator).toBe('Coord');
+    expect(doc.role.inline.bio).toBe('A public card.');
+    expect(doc.role.inline.persona).toBe('An operating contract.');
+    expect(doc.coordinator).toBe('Coord');
     expect(calls).toContainEqual(['install', 'Worker']);
     expect(readFileSync(join(agentDir('Worker'), 'briefing.md'), 'utf8')).toContain('do stuff');
   });
@@ -108,13 +164,13 @@ describe('spawnPermanent', () => {
   it('refuses an existing role name before writing anything', async () => {
     const { d } = fakeDeps();
     await expect(spawnPermanent({ name: 'Coord' }, d)).rejects.toThrowError(/already exists/);
-    expect(existsSync(join(dir, 'fleet.d', 'Coord.yaml'))).toBe(false);
+    expect(existsSync(join(dir, 'fleet', 'agents', 'Coord.yaml'))).toBe(true);
   });
 
   it('records configPath in the .config-path marker so systemd restarts reload the same file', async () => {
     const { d } = fakeDeps();
     const customCfg = join(dir, 'custom.yaml');
-    writeFileSync(customCfg, stringify({ defaults: { harness: 'fake' }, roles: { Coord: {} } }));
+    writeV2Fixture(customCfg, { defaults: { harness: 'fake' }, roles: { Coord: {} } });
     await spawnPermanent({ name: 'Worker2', configPath: customCfg }, d);
     expect(readFileSync(join(agentDir('Worker2'), '.config-path'), 'utf8')).toBe(`${customCfg}\n`);
   });
@@ -124,18 +180,18 @@ describe('spawnPermanent', () => {
     const file = await spawnPermanent({
       name: 'AcpWorker', harness: 'codex', session: 'acp',
     }, d);
-    const role = parse(readFileSync(file, 'utf8')).roles.AcpWorker;
+    const role = parse(readFileSync(file, 'utf8')).brain.inline;
     expect(role.harness).toBe('codex');
     expect(role.session).toBe('acp');
   });
 });
 
 describe('spawn --model', () => {
-  it('persists a permanent role model to fleet.d', async () => {
+  it('persists a permanent role model to the Agent document', async () => {
     const { d } = fakeDeps();
     const file = await spawnPermanent({ name: 'Worker', model: 'claude-fable-5' }, d);
     const doc = parse(readFileSync(file, 'utf8'));
-    expect(doc.roles.Worker.model).toBe('claude-fable-5');
+    expect(doc.brain.inline.model).toBe('claude-fable-5');
   });
 
   it('snapshots a temp role model into role.yaml', async () => {
@@ -152,20 +208,20 @@ describe('spawn --model', () => {
     const { d } = fakeDeps();
     const file = await spawnPermanent({ name: 'Worker2', model: '   ' }, d);
     const doc = parse(readFileSync(file, 'utf8'));
-    expect(doc.roles.Worker2.model).toBeUndefined();
+    expect(doc.brain.inline.model).toBeUndefined();
   });
 
-  it('a temp role without model inherits defaults.model', async () => {
-    writeFileSync(join(dir, 'fleet.yaml'),
-      stringify({ defaults: { harness: 'fake', model: 'claude-fable-5' }, roles: {} }));
+  it('a temp role never inherits a forbidden manifest Brain default', async () => {
+    writeV2Fixture(join(dir, 'fleet.yaml'),
+      { defaults: { harness: 'fake', model: 'claude-fable-5' }, roles: {} });
     const d = await spawnTemp({ name: 'Scout', mission: 'recon' }, '/b/ours-fleet', () => {});
     const snap = parse(readFileSync(join(d, 'role.yaml'), 'utf8'));
-    expect(snap.model).toBe('claude-fable-5');
+    expect(snap.model).toBeUndefined();
   });
 
   it('a temp role model overrides defaults.model', async () => {
-    writeFileSync(join(dir, 'fleet.yaml'),
-      stringify({ defaults: { harness: 'fake', model: 'claude-fable-5' }, roles: {} }));
+    writeV2Fixture(join(dir, 'fleet.yaml'),
+      { defaults: { harness: 'fake', model: 'claude-fable-5' }, roles: {} });
     const d = await spawnTemp(
       { name: 'Scout', model: 'claude-opus-4-8' }, '/b/ours-fleet', () => {});
     const snap = parse(readFileSync(join(d, 'role.yaml'), 'utf8'));
@@ -173,22 +229,22 @@ describe('spawn --model', () => {
   });
 
   it('web harness-default intent suppresses a fleet model in permanent and temp launches', async () => {
-    writeFileSync(join(dir, 'fleet.yaml'), stringify({
+    writeV2Fixture(join(dir, 'fleet.yaml'), {
       defaults: {
         harness: 'codex', model: 'gpt-5.6', model_chain: ['gpt-5.6', 'gpt-fallback'],
       },
       roles: {},
-    }));
+    });
     const { d } = fakeDeps();
     const file = await spawnPermanent({
       name: 'ClaudePermanent', harness: 'claude-code', model: null, surface: 'web',
     }, d);
-    expect(parse(readFileSync(file, 'utf8')).roles.ClaudePermanent.model).toBeNull();
+    expect(parse(readFileSync(file, 'utf8')).brain.inline.model).toBeNull();
     const permanent = findRole(loadConfig(), 'ClaudePermanent');
     expect(permanent.model).toBeUndefined();
     expect(permanent.model_chain).toBeUndefined();
-    expect(getAdapter('claude-code').buildLaunch(
-      permanent, 'fresh', { sessionId: 'SID' }, { argv: [], env: {} },
+    expect(getAdapter('claude-code').agentSession.prepareLaunch(
+      permanent, { env: {} },
     ).argv).not.toContain('--model');
 
     const tempDir = await spawnTemp({
@@ -197,8 +253,8 @@ describe('spawn --model', () => {
     const temporary = parse(readFileSync(join(tempDir, 'role.yaml'), 'utf8'));
     expect(temporary.model).toBeUndefined();
     expect(temporary.model_chain).toBeUndefined();
-    expect(getAdapter('claude-code').buildLaunch(
-      temporary, 'fresh', { sessionId: 'SID' }, { argv: [], env: {} },
+    expect(getAdapter('claude-code').agentSession.prepareLaunch(
+      temporary, { env: {} },
     ).argv).not.toContain('--model');
   });
 });
@@ -211,7 +267,7 @@ describe('spawn Codex options', () => {
       sandbox: 'workspace-write', profile: 'fleet', launcher: 'auto', search: true,
       codexConfig: { model_reasoning_effort: 'high' }, addDirs: ['/data/shared'], monitor: true,
     }, d);
-    const role = parse(readFileSync(file, 'utf8')).roles.Coder;
+    const role = parse(readFileSync(file, 'utf8')).brain.inline;
     expect(role.model).toBe('gpt-5.4');
     expect(role.harness_options).toEqual({
       approval: 'never', sandbox: 'workspace-write', profile: 'fleet', launcher: 'auto',
@@ -225,13 +281,13 @@ describe('spawn Codex options', () => {
     const file = await spawnPermanent({
       name: 'ClaudeWorker', harness: 'claude-code', permissionMode: 'dontAsk',
     }, d);
-    expect(parse(readFileSync(file, 'utf8')).roles.ClaudeWorker.harness_options)
+    expect(parse(readFileSync(file, 'utf8')).brain.inline.harness_options)
       .toEqual({ permission_mode: 'dontAsk' });
   });
 });
 
 describe('spawnTemp', () => {
-  it('snapshots the role and launches the supervisor detached (not in a same-named tmux session)', async () => {
+  it('snapshots the role and launches the supervisor detached', async () => {
     const launched: { binPath: string; args: string[]; dir: string }[] = [];
     const d = await spawnTemp(
       { name: 'Scout', mission: 'recon' },
@@ -240,11 +296,10 @@ describe('spawnTemp', () => {
     );
     expect(d).toBe(agentDir('Scout', true));
     const snap = parse(readFileSync(join(d, 'role.yaml'), 'utf8'));
-    expect(snap.harness).toBe('fake');       // from defaults
+    expect(snap.harness).toBe('claude-code'); // v2 built-in; no manifest Brain defaults
     expect(snap.mission).toBe('recon');
     expect(readFileSync(join(d, 'briefing.md'), 'utf8')).toContain('recon');
-    // Supervisor launched detached with the temp dir as its state — NOT inside a
-    // tmux session named 'Scout' (which runOnce owns and kills for the agent).
+    // Supervisor launched detached with the temp dir as its state.
     expect(launched).toEqual([{ binPath: '/b/ours-fleet', args: ['_run-temp', 'Scout'], dir: d }]);
   });
 
@@ -281,15 +336,75 @@ describe('spawnTemp', () => {
   });
 
   it('never inherits wildcard scheduled loops into a temporary role', async () => {
-    writeFileSync(join(dir, 'fleet.yaml'), stringify({
+    writeV2Fixture(join(dir, 'fleet.yaml'), {
       defaults: { harness: 'fake', session: 'acp' },
       roles: { Permanent: { session: 'acp' } },
       loops: { pass: { roles: ['*'], interval: '5m', prompt: 'permanent-only pass' } },
-    }), { mode: 0o600 });
-    chmodSync(join(dir, 'fleet.yaml'), 0o600);
+    });
     const d = await spawnTemp({ name: 'TempLoop', session: 'acp' }, '/b/ours-fleet', () => {});
     const snap = parse(readFileSync(join(d, 'role.yaml'), 'utf8'));
     expect(snap.loops).toBeUndefined();
+  });
+
+  it('launches exact CLI-only temporary loops and preserves explicit disable vs omission', async () => {
+    const loopsFile = join(dir, 'temp-loops.yaml');
+    writeFileSync(loopsFile, stringify({ loops: { progress: {
+      interval: '1m', initial_delay: '0s', jitter: '30s', prompt: 'TEMP_LOOP_CANARY',
+    } } }), { mode: 0o600 });
+    const launched = await spawnTemp({
+      name: 'Looped', temp: true, loopsFile, loopSource: 'cli',
+    }, '/b/ours-fleet', () => {});
+    const role = parse(readFileSync(join(launched, 'role.yaml'), 'utf8'));
+    expect(role.temporaryLoops).toBeUndefined();
+    expect(role.temporaryLoopSource).toBe('cli');
+    expect(role.loops).toMatchObject([{ name: 'progress', intervalMs: 60_000,
+      initialDelayMs: 0, jitterMs: 30_000, prompt: 'TEMP_LOOP_CANARY' }]);
+    const provenance = JSON.parse(readFileSync(join(launched, 'creation.json'), 'utf8'));
+    expect(provenance.settings.loops.source).toBe('cli');
+    expect(JSON.stringify(provenance)).not.toContain('TEMP_LOOP_CANARY');
+
+    const disabled = await spawnTemp({
+      name: 'LoopDisabled', temp: true, noLoops: true, loopSource: 'cli',
+    }, '/b/ours-fleet', () => {});
+    expect(parse(readFileSync(join(disabled, 'role.yaml'), 'utf8'))).toMatchObject({
+      loops: [], temporaryLoopSource: 'cli',
+    });
+
+    const omitted = await spawnTemp({ name: 'LoopOmitted', temp: true }, '/b/ours-fleet', () => {});
+    const omittedRole = parse(readFileSync(join(omitted, 'role.yaml'), 'utf8'));
+    expect(omittedRole.loops).toBeUndefined();
+    expect(omittedRole.temporaryLoopSource).toBe('omitted');
+  });
+
+  it('rejects malformed, unsafe, contradictory, and permanent loop arguments before creation', async () => {
+    const malformed = join(dir, 'malformed-loops.yaml');
+    writeFileSync(malformed, 'loops: {}\n', { mode: 0o600 });
+    await expect(spawnTemp({ name: 'BadLoops', temp: true, loopsFile: malformed }, '/b/ours-fleet', () => {}))
+      .rejects.toThrow('non-empty mapping');
+    expect(existsSync(agentDir('BadLoops', true))).toBe(false);
+    writeFileSync(malformed, 'loops:\n  x: { interval: 59s, prompt: hi }\n', { mode: 0o600 });
+    await expect(spawnTemp({ name: 'ShortLoop', temp: true, loopsFile: malformed }, '/b/ours-fleet', () => {}))
+      .rejects.toThrow('below the minimum');
+    const { d } = fakeDeps();
+    await expect(spawnPermanent({ name: 'PermanentLoop', loopsFile: malformed }, d))
+      .rejects.toThrow('require --temp');
+    expect(existsSync(agentDir('PermanentLoop'))).toBe(false);
+    chmodSync(malformed, 0o400);
+    await expect(spawnTemp({ name: 'PrivateMode', temp: true, loopsFile: malformed }, '/b/ours-fleet', () => {}))
+      .rejects.toThrow('owner-only regular file');
+    chmodSync(malformed, 0o644);
+    await expect(spawnTemp({ name: 'PublicMode', temp: true, loopsFile: malformed }, '/b/ours-fleet', () => {}))
+      .rejects.toThrow('owner-only regular file');
+    chmodSync(malformed, 0o600);
+    const link = join(dir, 'loops-link.yaml'); symlinkSync(malformed, link);
+    await expect(spawnTemp({ name: 'LoopLink', temp: true, loopsFile: link }, '/b/ours-fleet', () => {}))
+      .rejects.toThrow('owner-only regular file');
+    const oversized = join(dir, 'oversized-loops.yaml');
+    writeFileSync(oversized, `loops:\n  x:\n    interval: 1m\n    prompt: ${'x'.repeat(1024 * 1024)}\n`, { mode: 0o600 });
+    await expect(spawnTemp({ name: 'OversizedLoop', temp: true, loopsFile: oversized }, '/b/ours-fleet', () => {}))
+      .rejects.toThrow('no larger than 1 MB');
+    await expect(spawnTemp({ name: 'ContradictLoop', temp: true, loopsFile: malformed, noLoops: true }, '/b/ours-fleet', () => {}))
+      .rejects.toThrow('mutually exclusive');
   });
 });
 
@@ -334,7 +449,7 @@ describe('atomic role + identity reservation', () => {
     await first;
 
     expect(second).toBeInstanceOf(Error);
-    expect(second!.message).toMatch(/being created by another process/);
+    expect(second!.message).toMatch(/being created by another process|already exists/);
   });
 
   it('two spawns with DIFFERENT roles but the SAME identity: exactly one succeeds', async () => {
@@ -356,7 +471,9 @@ describe('atomic role + identity reservation', () => {
     await first;
 
     expect(second).toBeInstanceOf(Error);
-    expect(second!.message).toMatch(/identity 'Contested' is already taken|being created/);
+    expect(second!.message).toMatch(
+      /identity 'Contested' is already taken|being created|already used by role/,
+    );
   });
 
   it('the same role with a DIFFERENT identity still conflicts on the role name', async () => {
@@ -380,17 +497,17 @@ describe('atomic role + identity reservation', () => {
       .then(() => null, e => e as Error);
 
     expect(err).toBeInstanceOf(Error);
-    expect(existsSync(join(dir, 'fleet.d', 'Loser.yaml'))).toBe(false);
+    expect(existsSync(join(dir, 'fleet', 'agents', 'Loser.yaml'))).toBe(false);
     expect(existsSync(agentDir('Loser'))).toBe(false);
     expect(calls.filter(c => c[0] === 'install')).toEqual([]);   // no service registered
   });
 
-  it('a failure mid-creation rolls the fleet.d file back and frees both names', async () => {
+  it('a failure mid-creation rolls the Agent file back and frees both names', async () => {
     const { d } = fakeDeps();
     d.backend.install = async () => { throw new Error('systemctl refused'); };
     const err = await spawnPermanent({ name: 'Doomed' }, d).then(() => null, e => e as Error);
     expect(err!.message).toContain('systemctl refused');
-    expect(existsSync(join(dir, 'fleet.d', 'Doomed.yaml'))).toBe(false);
+    expect(existsSync(join(dir, 'fleet', 'agents', 'Doomed.yaml'))).toBe(false);
 
     // Both names are immediately reusable — the point of releasing on failure.
     const { d: ok } = fakeDeps();
@@ -468,7 +585,7 @@ describe('identity is established before launch', () => {
 
     expect(err!.message).toContain('daemon refused');
     expect(calls.filter(c => c[0] === 'install')).toEqual([]);    // never started
-    expect(existsSync(join(dir, 'fleet.d', 'Broken.yaml'))).toBe(false);
+    expect(existsSync(join(dir, 'fleet', 'agents', 'Broken.yaml'))).toBe(false);
     expect(existsSync(agentDir('Broken'))).toBe(false);
   });
 
@@ -527,7 +644,7 @@ describe('every failed creation stage rolls back', () => {
   });
 
   const artifacts = (name: string) => ({
-    config: existsSync(join(dir, 'fleet.d', `${name}.yaml`)),
+    config: existsSync(join(dir, 'fleet', 'agents', `${name}.yaml`)),
     state: existsSync(agentDir(name)),
   });
 
@@ -645,7 +762,7 @@ describe('creation-time isolation', () => {
   it('a permanent role is created WITH the policy, round-tripped exactly', async () => {
     const { d } = fakeDeps();
     const file = await spawnPermanent({ name: 'Sec', isolationFile: writePolicy() }, d);
-    const role = parse(readFileSync(file, 'utf8')).roles.Sec;
+    const role = parse(readFileSync(file, 'utf8'));
     // The same schema, not a translation of it.
     expect(role.isolation).toEqual({
       network: 'deny', fs: { read: ['/opt/reference'] }, resources: { mem: '2G' },
@@ -665,7 +782,7 @@ describe('creation-time isolation', () => {
     const { d } = fakeDeps();
     const file = await spawnPermanent(
       { name: 'Defaults', isolationFile: writePolicy('# just a comment\n') }, d);
-    expect(parse(readFileSync(file, 'utf8')).roles.Defaults.isolation).toEqual({});
+    expect(parse(readFileSync(file, 'utf8')).isolation).toEqual({});
   });
 
   it('an invalid policy is rejected BEFORE anything is created', async () => {
@@ -673,7 +790,7 @@ describe('creation-time isolation', () => {
     const bad = writePolicy('network: telepathy\n');
     await expect(spawnPermanent({ name: 'Bad', isolationFile: bad }, d))
       .rejects.toThrowError(/isolation.network: invalid value 'telepathy'/);
-    expect(existsSync(join(dir, 'fleet.d', 'Bad.yaml'))).toBe(false);
+    expect(existsSync(join(dir, 'fleet', 'agents', 'Bad.yaml'))).toBe(false);
     expect(existsSync(agentDir('Bad'))).toBe(false);
     expect(calls.filter(c => c[0] === 'install')).toEqual([]);
   });
@@ -704,7 +821,7 @@ describe('creation-time isolation', () => {
   it('a role without the flag is unchanged — no isolation block appears', async () => {
     const { d } = fakeDeps();
     const file = await spawnPermanent({ name: 'Plain' }, d);
-    expect(parse(readFileSync(file, 'utf8')).roles.Plain.isolation).toBeUndefined();
+    expect(parse(readFileSync(file, 'utf8')).isolation).toBeUndefined();
   });
 });
 
@@ -713,7 +830,7 @@ describe('creation provenance', () => {
     JSON.parse(readFileSync(join(agentDir(name, temp), 'creation.json'), 'utf8'));
 
   it('a default role records every setting as built-in, with version and time', async () => {
-    writeFileSync(join(dir, 'fleet.yaml'), stringify({ roles: {} }));   // no defaults at all
+    writeV2Fixture(join(dir, 'fleet.yaml'), { roles: {} });   // no defaults at all
     const { d } = fakeDeps();
     await spawnPermanent({ name: 'Plain' }, d);
     const p = provenanceOf('Plain');
@@ -727,25 +844,25 @@ describe('creation provenance', () => {
     expect(p.fleetBuild).toBe(buildInfo().buildId);
     expect(Number.isNaN(Date.parse(p.createdAt))).toBe(false);
     expect(p.settings.approval).toEqual({ value: 'ask', source: 'built-in' });
-    expect(p.settings.harness).toEqual({ value: 'claude-code', source: 'built-in' });
+    expect(p.settings.brain).toEqual({ value: 'inline', source: 'cli' });
+    expect(p.settings.role).toEqual({ value: 'inline', source: 'cli' });
     expect(p.settings.identity).toEqual({ value: 'Plain', source: 'built-in' });
   });
 
-  it('distinguishes an explicit CLI value from a fleet default from a built-in', async () => {
-    writeFileSync(join(dir, 'fleet.yaml'), stringify({
+  it('distinguishes explicit CLI and operational fleet defaults from built-ins', async () => {
+    writeV2Fixture(join(dir, 'fleet.yaml'), {
       defaults: { harness: 'fake', model: 'from-defaults', permissions: { filesystem: 'read-only' } },
       roles: {},
-    }));
+    });
     const { d } = fakeDeps();
     await spawnPermanent({ name: 'Mixed', approval: 'allow', identity: 'Explicit' }, d);
     const s = provenanceOf('Mixed').settings;
 
     expect(s.approval).toEqual({ value: 'allow', source: 'cli' });          // typed by the operator
     expect(s.filesystem).toEqual({ value: 'read-only', source: 'fleet-default' });
-    expect(s.model).toEqual({ value: 'from-defaults', source: 'fleet-default' });
     expect(s.unattended).toEqual({ value: 'deny', source: 'built-in' });    // nobody chose it
     expect(s.identity).toEqual({ value: 'Explicit', source: 'cli' });
-    expect(s.harness).toEqual({ value: 'fake', source: 'fleet-default' });
+    expect(s.brain).toEqual({ value: 'inline', source: 'cli' });
   });
 
   it('records creation-time isolation as an explicit choice', async () => {
@@ -763,7 +880,7 @@ describe('creation provenance', () => {
 
   it('persists managed caller inheritance sources while explicit overrides stay explicit', async () => {
     const inherited = [
-      'harness', 'session', 'model', 'cwd', 'coordinator', 'approval', 'filesystem',
+      'brain', 'cwd', 'coordinator', 'approval', 'filesystem',
       'unattended', 'monitorConfig',
     ];
     await spawnTemp({
@@ -776,7 +893,7 @@ describe('creation provenance', () => {
     const p = provenanceOf('Inherited', true);
     expect(p.callerRole).toBe('Coord');
     for (const key of [
-      'harness', 'session', 'model', 'cwd', 'coordinator', 'approval', 'filesystem',
+      'brain', 'cwd', 'coordinator', 'approval', 'filesystem',
       'unattended', 'monitor',
     ]) expect(p.settings[key].source, key).toBe('caller-role');
 
@@ -787,29 +904,28 @@ describe('creation provenance', () => {
     expect(provenanceOf('Explicit', true).settings.approval.source).toBe('cli');
   });
 
-  it('records an explicit --permission-mode, and omits it when unset', async () => {
+  it('records native permission mode only through the selected Brain', async () => {
     const { d } = fakeDeps();
     await spawnPermanent({
       name: 'Moded', harness: 'claude-code', permissionMode: 'dontAsk',
     }, d);
-    expect(provenanceOf('Moded').settings.permission_mode)
-      .toEqual({ value: 'dontAsk', source: 'cli' });
+    expect(provenanceOf('Moded').settings.brain).toEqual({ value: 'inline', source: 'cli' });
 
     await spawnPermanent({ name: 'Unmoded' }, d);
-    expect(provenanceOf('Unmoded').settings.permission_mode.value).toBeUndefined();
-    expect(formatProvenance(provenanceOf('Unmoded')).join('\n')).not.toContain('permission_mode');
+    expect(provenanceOf('Unmoded').settings.brain).toEqual({ value: 'inline', source: 'cli' });
   });
 
   it('NEVER records secrets, env, bio or persona', async () => {
     writeFileSync(join(dir, 'bio.txt'), 'PUBLIC-CARD-TEXT');
     writeFileSync(join(dir, 'persona.txt'), 'PERSONA-CONTRACT-TEXT');
-    writeFileSync(join(dir, 'fleet.yaml'), stringify({
+    writeV2Fixture(join(dir, 'fleet.yaml'), {
       defaults: { harness: 'fake' },
       roles: {},
-    }));
+    });
     const { d } = fakeDeps();
     await spawnPermanent({
       name: 'Careful',
+      harness: 'codex',
       bioFile: join(dir, 'bio.txt'), personaFile: join(dir, 'persona.txt'),
       codexConfig: { api_key_like: 'SUPER-SECRET-VALUE' },
     }, d);

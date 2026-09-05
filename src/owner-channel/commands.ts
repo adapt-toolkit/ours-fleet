@@ -14,9 +14,12 @@ import {
 } from '../rooms-tasks/markdown.js';
 import { OWNER_COMMENT_LABEL, ownerNotices, type OwnerCommentsState } from './notices.js';
 import { TaskRoomApplicationError } from '../application/task-room-service.js';
-import type { CreateRoomRequest, CreateTaskRequest, TaskRoomApplicationService } from '../application/task-room-service.js';
+import type {
+  CreateRoomRequest, CreateTaskRequest, TaskProvisioningOutcome, TaskRoomApplicationService,
+} from '../application/task-room-service.js';
 import type { TaskState } from '../rooms-tasks/types.js';
 import { TaskListError } from '../rooms-tasks/task-lists.js';
+import { createTasksReport } from '../reports/index.js';
 
 /**
  * Fleet-level effects a deterministic owner command may trigger. Production
@@ -32,7 +35,10 @@ export interface OwnerFleetOps {
   closeRoom(roomId: string): Promise<void>;
   /** Resume a task terminal intent outside the caller role's supervisor lifecycle. */
   settleTask(taskId: string): Promise<void>;
-  recoverTask(taskId: string): Promise<void>;
+  /** Settle an accepted task deletion outside the caller role's supervisor lifecycle. */
+  settleTaskDeletion(taskId: string): Promise<void>;
+  /** Continue an accepted provisioning saga until convergence. */
+  provisionTask(taskId: string): Promise<void>;
 }
 
 /**
@@ -41,6 +47,7 @@ export interface OwnerFleetOps {
  * cannot name another agent or another recipient.
  */
 export interface OwnerCommandContext {
+  authenticatedCid?: string;
   role: string;
   /** Harness id of the role (e.g. 'claude-code', 'codex'); gates forwarding. */
   harness: string;
@@ -66,12 +73,11 @@ export interface OwnerCommandContext {
   fleetList(): Promise<string>;
   /** Persist acceptance, acknowledge it, then launch the external close worker. */
   closeRoom(roomId: string): Promise<void>;
-  recoverRoom(roomId: string): Promise<void>;
   /** Persist terminal intent, acknowledge it, then launch the external settle worker. */
   terminalTask(taskId: string, kind: TaskTerminalIntent['kind'], outcome?: TaskOutcome): Promise<void>;
-  recoverTask(taskId: string): Promise<void>;
   createTask(input: Omit<CreateTaskRequest, 'actor'>): Promise<TaskRecord>;
-  startTask(taskId: string): Promise<TaskRecord>;
+  startTask(taskId: string): Promise<TaskProvisioningOutcome | TaskRecord>;
+  taskProvisioningOutcome?(taskId: string): TaskProvisioningOutcome;
   listTasks(filter?: { state?: TaskState | TaskState[]; list?: string }): TaskRecord[];
   groupedTasks(filter?: { state?: TaskState | TaskState[]; list?: string }): Array<{ list: TaskListRecord; tasks: TaskRecord[] }>;
   listTaskLists(): TaskListRecord[];
@@ -83,7 +89,8 @@ export interface OwnerCommandContext {
   blockTask(taskId: string, reason: string): TaskRecord;
   unblockTask(taskId: string): TaskRecord;
   reviewTask(taskId: string): TaskRecord;
-  deleteTask(taskId: string): boolean;
+  /** Accept a permanent any-state deletion, acknowledge it, then launch the external delete worker. */
+  deleteTask(taskId: string): Promise<void>;
   listRoomQueries(filter?: { state?: 'active' | 'provisioning' }): ReturnType<TaskRoomApplicationService['listRooms']>;
   getRoomQuery(id: string): ReturnType<TaskRoomApplicationService['getRoomDetail']>;
   listTemplateQueries(): ReturnType<TaskRoomApplicationService['listTemplates']>;
@@ -92,6 +99,17 @@ export interface OwnerCommandContext {
   recentEvents(limit: number): SessionEvent[];
   readWorklogTail(maxChars: number): Promise<string | undefined>;
   reply(text: string): Promise<void>;
+  replyHtml(filename: string, html: string): Promise<void>;
+}
+
+async function ownerTaskReport(ctx: OwnerCommandContext) {
+  return createTasksReport({
+    viewer: { surface: 'messenger', authenticatedCid: ctx.authenticatedCid ?? 'owner-command-context', roomCids: [] },
+    collect: () => {
+      return { lists: ctx.listTaskLists(), tasks: ctx.listTasks() };
+    },
+    source: { name: 'ours-fleet', version: ctx.version },
+  });
 }
 
 export interface OwnerCommand {
@@ -103,6 +121,12 @@ export interface OwnerCommand {
   /** One-line description shown in help. */
   summary: string;
   execute(ctx: OwnerCommandContext, args: string): Promise<void>;
+}
+
+export interface OwnerTypedCommandDefinition {
+  name: string;
+  description: string;
+  input_schema: Record<string, unknown>;
 }
 
 /** A malformed invocation; the dispatcher answers it with annotated help. */
@@ -131,7 +155,7 @@ function isKnownOwnerTaskState(message: string): boolean {
     /^task is not blocked$/u,
     new RegExp(`^task ${SAFE_ID_WORD} already has a conflicting '(?:done|cancelled)' terminal intent$`, 'u'),
     new RegExp(`^task ${SAFE_ID_WORD} is already in terminal state '${TASK_STATE_WORD}'$`, 'u'),
-    new RegExp(`^cannot delete a '${TASK_STATE_WORD}' task; only 'done' tasks can be deleted$`, 'u'),
+    new RegExp(`^task ${SAFE_ID_WORD} is pending deletion; run 'ours-fleet task delete ${SAFE_ID_WORD} ${SAFE_ID_WORD}' to retry cleanup$`, 'u'),
   ].some(pattern => pattern.test(message));
 }
 
@@ -205,6 +229,23 @@ const taskAction = (
     ...fields,
   ],
 });
+
+const taskProvisioningAction = (outcome: TaskProvisioningOutcome): string => {
+  if (outcome.kind === 'failed') return renderMarkdownFailure({
+    kind: 'state', subject: `/task start ${outcome.task.task_id}`,
+    detail: outcome.blocker ?? 'Provisioning reached a terminal failure.',
+    action: outcome.next_action ?? `Run /task start ${outcome.task.task_id}.`,
+  });
+  return taskAction(outcome.kind === 'ready' ? 'Room provisioning complete'
+    : outcome.next_action ? 'Room provisioning needs attention' : 'Room provisioning continues',
+    outcome.task, [
+      ...(outcome.room ? [{ label: 'Room', value: `${outcome.room.room_id} — ${outcome.room.room_name}` }] : []),
+      ...(outcome.launch.template ? [{ label: 'Template', value: outcome.launch.template, kind: 'code' as const }] : []),
+      { label: 'Members', value: `${outcome.members.active}/${outcome.members.expected} active; ${outcome.members.launched}/${outcome.members.expected} launched` },
+      ...(outcome.blocker ? [{ label: 'Blocker', value: outcome.blocker }] : []),
+      ...(outcome.next_action ? [{ label: 'Next action', value: outcome.next_action }] : []),
+    ]);
+};
 
 const roomAction = (
   title: string, room: RoomOrchestrationRecord,
@@ -362,10 +403,17 @@ export const ownerCommands: OwnerCommand[] = [
     execute: noArgs('/version', async ctx => ctx.reply(`ℹ️ ours-fleet ${ctx.version}`)),
   },
   {
-    name: 'tasks', usage: '/tasks [state]',
-    summary: 'list tasks (optionally filter by state)',
+    name: 'tasks', usage: '/tasks [state|html]',
+    summary: 'list tasks, or attach the HTML report with /tasks html',
     execute: async (ctx, args) => {
       const stateFilter = args?.trim() || undefined;
+      if (stateFilter === 'html') {
+        const artifact = await ownerTaskReport(ctx);
+        await ctx.replyHtml(artifact.metadata.filename, artifact.html);
+        await ctx.reply(`HTML report attached: ${artifact.metadata.filename}`);
+        return;
+      }
+      if (stateFilter && /\s/u.test(stateFilter)) throw new OwnerCommandUsageError('usage: /tasks [state|html]');
       const tasks = ctx.listTasks(stateFilter && stateFilter !== 'all' ? { state: stateFilter as any } : undefined);
       await ctx.reply(renderMarkdownList({
         icon: '📋', title: 'Tasks', empty: 'No tasks found.',
@@ -375,7 +423,7 @@ export const ownerCommands: OwnerCommand[] = [
   },
   {
     name: 'task',
-    usage: '/task <create|list|show|start|block|unblock|review|done|cancel|delete|recover> ...',
+    usage: '/task <create|list|show|start|block|unblock|review|done|cancel|delete> ...',
     summary: 'task lifecycle subcommands',
     execute: async (ctx, args) => {
       if (!args) throw new OwnerCommandUsageError('usage: /task <subcommand> <id>');
@@ -420,6 +468,12 @@ export const ownerCommands: OwnerCommand[] = [
               title: titleParts.join(' '), origin: { type: 'owner_channel' },
               backlog, template, noRoom, brief: trailingLines, list,
             });
+            const provisioning = !backlog && !noRoom && t.room_id
+              ? ctx.taskProvisioningOutcome?.(t.task_id) : undefined;
+            if (provisioning) {
+              await ctx.reply(taskProvisioningAction(provisioning));
+              break;
+            }
             await ctx.reply(taskAction('Task created', t, [
               { label: 'Title', value: t.title },
               ...(template ? [{ label: 'Template', value: template, kind: 'code' as const }] : []),
@@ -428,6 +482,9 @@ export const ownerCommands: OwnerCommand[] = [
             break;
           }
           case 'list': {
+            if (rest.some(value => value.startsWith('--')
+              && value !== '--group-by-list' && !value.startsWith('--list=')))
+              throw new OwnerCommandUsageError('usage: /task list [state] [--list=<name>] [--group-by-list]');
             const listFlag = rest.find(r => r.startsWith('--list='));
             const list = trailingLines ?? listFlag?.slice('--list='.length);
             const grouped = rest.includes('--group-by-list');
@@ -464,6 +521,7 @@ export const ownerCommands: OwnerCommand[] = [
             break;
           }
           case 'lists': {
+            if (rest.length || trailingLines) throw new OwnerCommandUsageError('usage: /task lists');
             const lists = ctx.listTaskLists();
             await ctx.reply(renderMarkdownList({ icon: '📚', title: 'Task lists', empty: 'No task lists found.',
               records: lists.map(list => `${markdownCode(list.name)}${list.built_in ? ' — built-in' : ''}`) }));
@@ -503,14 +561,16 @@ export const ownerCommands: OwnerCommand[] = [
             break;
           }
           case 'show': {
-            if (!rest[0]) throw new OwnerCommandUsageError('usage: /task show <id>');
+            if (rest.length !== 1 || rest[0].startsWith('--'))
+              throw new OwnerCommandUsageError('usage: /task show <id>');
             await showTask(rest[0]);
             break;
           }
           case 'start': {
             if (!rest[0]) throw new OwnerCommandUsageError('usage: /task start <id>');
-            const t = await ctx.startTask(rest[0]);
-            await ctx.reply(taskAction('Task started', t));
+            const started = await ctx.startTask(rest[0]);
+            await ctx.reply('kind' in started
+              ? taskProvisioningAction(started) : taskAction('Task started', started));
             break;
           }
           case 'block': {
@@ -547,20 +607,13 @@ export const ownerCommands: OwnerCommand[] = [
           case 'delete': {
             if (rest.length !== 2 || rest[0] !== rest[1])
               throw new OwnerCommandUsageError('destructive: /task delete <id> <id> — provide the task ID twice');
-            const deleted = ctx.deleteTask(rest[0]);
-            await ctx.reply(renderMarkdownResult({
-              icon: '🗑️', title: deleted ? 'Task deleted' : 'Task already absent',
-              fields: [{ label: 'ID', value: rest[0], kind: 'code' }],
-            }));
-            break;
-          }
-          case 'recover': {
-            if (!rest[0]) throw new OwnerCommandUsageError('usage: /task recover <id>');
-            await ctx.recoverTask(rest[0]);
+            await ctx.deleteTask(rest[0]);
             break;
           }
           default:
             // bare /task <id> → show
+            if (sub === 'recover' || sub === 'await' || rest.length)
+              throw new OwnerCommandUsageError(`unknown task subcommand: ${sub}`);
             await showTask(sub);
         }
       } catch (e) {
@@ -589,7 +642,7 @@ export const ownerCommands: OwnerCommand[] = [
   },
   {
     name: 'room',
-    usage: '/room <create|list|show|delete|close|recover> ...',
+    usage: '/room <create|list|show|delete|close> ...',
     summary: 'room lifecycle subcommands',
     execute: async (ctx, args) => {
       if (!args) throw new OwnerCommandUsageError('usage: /room <subcommand> <id>');
@@ -672,13 +725,10 @@ export const ownerCommands: OwnerCommand[] = [
             await ctx.closeRoom(rest[0]);
             break;
           }
-          case 'recover': {
-            if (!rest[0]) throw new OwnerCommandUsageError('usage: /room recover <id>');
-            await ctx.recoverRoom(rest[0]);
-            break;
-          }
           default:
             // bare /room <id> → show
+            if (sub === 'recover' || rest.length)
+              throw new OwnerCommandUsageError(`unknown room subcommand: ${sub}`);
             await showRoom(sub);
         }
       } catch (e) {
@@ -699,10 +749,8 @@ export const ownerCommands: OwnerCommand[] = [
     execute: noArgs('/templates', async ctx => {
       const templates = ctx.listTemplateQueries();
       if (!templates.length) return ctx.reply('📐 No templates.');
-      const lines = templates.map(t => {
-        const tag = t.builtin ? ' (built-in)' : '';
-        return `${t.name}@${t.version}${tag}  ${t.description}`;
-      });
+      const lines = templates.map(t =>
+        `${t.name}@${t.version}  ${t.description}  [file: ${t.sourceFile ?? 'manifest'}]`);
       await ctx.reply(`📐 Templates:\n${lines.join('\n')}`);
     }),
   },
@@ -725,11 +773,11 @@ export const ownerCommands: OwnerCommand[] = [
         const lines = [
           `📐 Template: ${t.name}@${t.version}`,
           `Description: ${t.description}`,
-          ...(t.builtin ? ['Source: built-in'] : []),
+          `Source: ${t.sourceFile ?? 'manifest'}`,
           ...(t.contract ? [`Contract: ${t.contract}`] : []),
           'Members:',
-          ...t.members.map(m =>
-            `  ${m.slot} (${m.role}) ×${m.count} → role_ref: ${m.role_ref}`),
+          ...t.members.map(m => `  ${m.slot} (${m.role}) ×${m.count} → `
+            + `Agent Template: ${m.agent_template}`),
         ];
         await ctx.reply(lines.join('\n'));
       };
@@ -743,10 +791,8 @@ export const ownerCommands: OwnerCommand[] = [
         case 'list': {
           const templates = ctx.listTemplateQueries();
           if (!templates.length) return ctx.reply('📐 No templates.');
-          const lines = templates.map(t => {
-            const tag = t.builtin ? ' (built-in)' : '';
-            return `${t.name}@${t.version}${tag}  ${t.description}`;
-          });
+          const lines = templates.map(t =>
+            `${t.name}@${t.version}  ${t.description}  [file: ${t.sourceFile ?? 'manifest'}]`);
           await ctx.reply(`📐 Templates:\n${lines.join('\n')}`);
           break;
         }
@@ -757,6 +803,54 @@ export const ownerCommands: OwnerCommand[] = [
     },
   },
 ];
+
+/**
+ * Project the slash-command registry into the SDK catalog. Only primary names
+ * are advertised: aliases remain accepted by the slash dispatcher without
+ * cluttering the typed menu with duplicate actions.
+ *
+ * Typed arguments deliberately stay as the exact text following the command
+ * name. That adapter is what lets typed and slash invocations share every
+ * existing parser, usage error, lifecycle guard, and result path.
+ */
+export function ownerTypedCommandCatalog(): OwnerTypedCommandDefinition[] {
+  return ownerCommands.map(command => {
+    const usage = command.usage ?? `/${command.name}`;
+    const suffix = usage.slice(usage.indexOf(' ') + 1);
+    const acceptsArguments = usage.includes(' ');
+    const requiresArguments = acceptsArguments && !suffix.startsWith('[');
+    return {
+      name: command.name,
+      description: `${command.summary} (${usage})`,
+      input_schema: {
+        type: 'object',
+        properties: acceptsArguments ? {
+          arguments: {
+            type: 'string', title: 'Arguments',
+            description: `Text after /${command.name}. Usage: ${usage}`,
+          },
+        } : {},
+        ...(requiresArguments ? { required: ['arguments'] } : {}),
+      },
+    };
+  });
+}
+
+/** Convert one typed invocation back into the canonical slash input. */
+export function ownerTypedCommandText(name: string, input: unknown): string {
+  const command = ownerCommands.find(entry => entry.name === name);
+  if (!command) throw new Error(`unknown typed owner command: ${name}`);
+  if (!input || typeof input !== 'object' || Array.isArray(input))
+    throw new Error('typed owner command arguments must be an object');
+  const record = input as Record<string, unknown>;
+  if (Object.keys(record).some(key => key !== 'arguments'))
+    throw new Error('typed owner command arguments contain an unknown field');
+  const value = record.arguments;
+  if (value !== undefined && typeof value !== 'string')
+    throw new Error('typed owner command arguments must be text');
+  const args = value?.trim() ?? '';
+  return `/${command.name}${args ? ` ${args}` : ''}`;
+}
 
 /** Trimmed slash-prefixed text is a command attempt and is never forwarded. */
 export const isOwnerCommandText = (text: string): boolean => text.trim().startsWith('/');
@@ -828,8 +922,11 @@ export function fleetCliOps(role: string, configPath?: string): OwnerFleetOps {
     settleTask: taskId => launchFleetWorker(
       ['task', '_settle', taskId], `task-settle-${taskId}`, configPath,
     ),
-    recoverTask: taskId => launchFleetWorker(
-      ['task', '_recover', taskId], `task-recover-${taskId}`, configPath,
+    settleTaskDeletion: taskId => launchFleetWorker(
+      ['task', '_settle_delete', taskId], `task-delete-${taskId}`, configPath,
+    ),
+    provisionTask: taskId => launchFleetWorker(
+      ['task', '_provision', taskId], `task-provision-${taskId}`, configPath,
     ),
   };
 }

@@ -5,6 +5,10 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
 import { loadConfig } from '../src/config.js';
 import { resolvedPlan } from '../src/resolved-plan.js';
+import { canonicalAgentLoops, resolveAgentLoops } from '../src/loops/config.js';
+import type { ResolvedRole } from '../src/config.js';
+import { writeV2Fixture } from './v2-fixture.js';
+import { stringify } from 'yaml';
 
 let dir: string;
 let file: string;
@@ -18,9 +22,48 @@ afterEach(() => {
   rmSync(dir, { recursive: true, force: true });
 });
 
-const write = (yaml: string) => writeFileSync(file, yaml, { mode: 0o600 });
+const write = (yaml: string) => writeV2Fixture(file, yaml);
 
 describe('scheduled loop configuration', () => {
+  it('round-trips canonical temporary-agent loops including duration boundaries', () => {
+    const role = { name: 'Temp', harness: 'codex', session: 'acp' } as ResolvedRole;
+    const resolved = resolveAgentLoops({ edge: {
+      interval: '30d', initial_delay: '0s', jitter: '1h', prompt: 'continue',
+    } }, role, '(test)');
+    const roundTrip = resolveAgentLoops(canonicalAgentLoops(resolved), role, '(sealed)');
+    expect(roundTrip.map(loop => ({
+      intervalMs: loop.intervalMs, initialDelayMs: loop.initialDelayMs,
+      jitterMs: loop.jitterMs, prompt: loop.prompt,
+    }))).toEqual([{ intervalMs: 2_592_000_000, initialDelayMs: 0,
+      jitterMs: 3_600_000, prompt: 'continue' }]);
+  });
+
+  it('accepts 64 Agent loops and rejects 65 at validation time', () => {
+    const role = { name: 'Temp', harness: 'codex', session: 'acp' } as ResolvedRole;
+    const block = Object.fromEntries(Array.from({ length: 65 }, (_, index) => [
+      `loop-${index}`, { interval: '1m', prompt: `pass ${index}` },
+    ]));
+    expect(resolveAgentLoops(Object.fromEntries(Object.entries(block).slice(0, 64)), role, '(64)'))
+      .toHaveLength(64);
+    expect(() => resolveAgentLoops(block, role, '(65)')).toThrow('at most 64 entries');
+  });
+
+  it('accepts loops on inert Agent Templates, redacts prompts, and rejects persistent use', () => {
+    write({ roles: {} });
+    const templatePath = join(dir, 'fleet', 'agent_templates', 'Agent.yaml');
+    writeFileSync(templatePath, stringify({
+      role: { inline: { mission: 'work' } }, brain: { inline: { harness: 'codex' } },
+      loops: { progress: { interval: '1m', prompt: 'CONFIG_LOOP_CANARY' } },
+    }), { mode: 0o600 });
+    const cfg = loadConfig(file);
+    expect(cfg.agentTemplates?.Agent.loops).toMatchObject({ progress: { interval: '1m' } });
+    const plan = JSON.stringify(resolvedPlan(cfg));
+    expect(plan).not.toContain('CONFIG_LOOP_CANARY');
+    expect(plan).toContain('sha256');
+    writeFileSync(join(dir, 'fleet', 'agents', 'Persistent.yaml'), 'template: Agent\n', { mode: 0o600 });
+    expect(() => loadConfig(file)).toThrow('supported only for temporary Agent launches');
+  });
+
   it('resolves exact and permanent-only wildcard roles with full-interval defaults', () => {
     write([
       'vars: { cadence: 2h }',
@@ -54,11 +97,9 @@ describe('scheduled loop configuration', () => {
       .toEqual(['all']);
   });
 
-  it('allows disabled tmux definitions but rejects enabled incompatible targets', () => {
+  it('rejects legacy tmux roles before loop activation', () => {
     write('roles:\n  A: { session: tmux }\nloops:\n  check: { roles: [A], interval: 1m, prompt: hi, enabled: false }\n');
-    expect(loadConfig(file).loops[0].enabled).toBe(false);
-    write('roles:\n  A: { session: tmux }\nloops:\n  check: { roles: [A], interval: 1m, prompt: hi }\n');
-    expect(() => loadConfig(file)).toThrow(/scheduled loops require session: acp/);
+    expect(() => loadConfig(file)).toThrow(/tmux is no longer supported/);
   });
 
   it.each([

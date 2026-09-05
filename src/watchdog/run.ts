@@ -1,9 +1,8 @@
 import {
   closeSync, existsSync, openSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync,
 } from 'node:fs';
-import { spawn as spawnChild, execFile } from 'node:child_process';
+import { spawn as spawnChild } from 'node:child_process';
 import { join } from 'node:path';
-import { promisify } from 'node:util';
 import { stringify } from 'yaml';
 import type { ResolvedWatchdog } from './config.js';
 import type { WatchdogReport } from './report.js';
@@ -18,15 +17,13 @@ import {
 import { runOnce, START_STAGGER_FILE } from '../runner.js';
 import { agentDir, tmpRoot } from '../paths.js';
 import {
-  loadConfig, resolveMonitorConfig, resolveWorklogPolicy, ROLE_NAME_RE,
+  loadConfig, ROLE_NAME_RE,
   type FleetConfig, type ResolvedRole,
 } from '../config.js';
 import { getAdapter } from '../harness/registry.js';
 import { redactLogLine } from '../application/log-service.js';
 import { controlRequest, controlSocketPath } from '../session/control.js';
-import { Tmux } from '../tmux.js';
 
-const execFileAsync = promisify(execFile);
 
 /** How often the deadline loop polls for a completed report or a dead child. */
 const POLL_MS = 1000;
@@ -74,7 +71,6 @@ async function killIfNeeded(
   if (reason === 'stable' || reason === 'timeout') {
     if (reason === 'stable') await sleep(HARVEST_GRACE_MS);
     child.kill();
-    await killTmuxSession(roleName);
   }
 }
 
@@ -123,12 +119,6 @@ function defaultLaunchChild(binPath: string, roleName: string, runDir: string): 
   };
 }
 
-/** Best-effort: the tmux session outlives the supervisor child (`runOnce` created it). */
-async function killTmuxSession(roleName: string): Promise<void> {
-  try { await execFileAsync('tmux', ['kill-session', '-t', roleName]); }
-  catch { /* best effort */ }
-}
-
 /** Last 4096 chars of run.log, redacted — attached to error reports as diagnostic tail. */
 function readTail(runDir: string): string | undefined {
   try {
@@ -138,19 +128,10 @@ function readTail(runDir: string): string | undefined {
 }
 
 /** The temp role every watchdog-family run launches under. Isolation is opt-in. */
-function buildWatchdogRole(wd: ResolvedWatchdog, cfg: FleetConfig): ResolvedRole {
+function buildWatchdogRole(wd: ResolvedWatchdog, _cfg: FleetConfig): ResolvedRole {
   return {
-    name: wd.identity, sourceFile: '(watchdog)',
-    harness: wd.harness, session: wd.session,
-    identity: wd.identity, model: wd.model,
-    // Watchdogs are observe-only by contract, but their sanctioned status commands
-    // must reach host control sockets. Keep approvals/unattended escalation denied
-    // while disabling the harness's native filesystem/network sandbox.
-    permissions: { approval: 'deny', filesystem: 'unrestricted', unattended: 'deny' },
-    permissionsDeclared: true,
-    monitor: resolveMonitorConfig(cfg.defaults.monitor, undefined),
-    worklog: resolveWorklogPolicy(cfg.defaults.worklog, undefined),
-    isolation: wd.isolation,
+    ...structuredClone(wd.resolvedAgent),
+    name: wd.identity, sourceFile: '(watchdog)', identity: wd.identity,
   };
 }
 
@@ -162,19 +143,15 @@ async function discoverLiveTemporaryRoles(): Promise<string[]> {
       .filter(entry => entry.isDirectory() && !entry.isSymbolicLink() && ROLE_NAME_RE.test(entry.name))
       .map(entry => entry.name);
   } catch { return []; }
-  const tmux = new Tmux();
   const live = await Promise.all(names.map(async name => {
     const dir = agentDir(name, true);
-    const [acpAlive, tmuxAlive] = await Promise.all([
-      existsSync(controlSocketPath(dir))
-        ? controlRequest(dir, { command: 'status' }, 2_000)
-            .then(response => response.ok
-              && (response.result as { alive?: boolean } | undefined)?.alive === true)
-            .catch(() => false)
-        : Promise.resolve(false),
-      tmux.has(name).catch(() => false),
-    ]);
-    return acpAlive || tmuxAlive ? name : undefined;
+    const alive = existsSync(controlSocketPath(dir))
+      ? await controlRequest(dir, { command: 'status' }, 2_000)
+          .then(response => response.ok
+            && (response.result as { alive?: boolean } | undefined)?.alive === true)
+          .catch(() => false)
+      : false;
+    return alive ? name : undefined;
   }));
   return live.filter((name): name is string => name !== undefined);
 }

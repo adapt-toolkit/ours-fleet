@@ -1,6 +1,6 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import {
-  mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync, readdirSync, rmSync, statSync,
+  chmodSync, mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync, readdirSync, rmSync, statSync,
 } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -15,6 +15,9 @@ import { makeSystemdBackend } from '../src/supervisor/systemd.js';
 import type { Exec } from '../src/exec.js';
 import type { Liveness, SupervisorBackend } from '../src/supervisor/types.js';
 import { makeTempSupervisorLauncher, prepareTempSupervisor, tempSystemdUnit } from '../src/temp-lifecycle.js';
+import { writeV2Fixture } from './v2-fixture.js';
+import { recordGeneratedAgentSource } from '../src/generated-agent-source.js';
+import { bootstrapPresets } from '../src/preset-bootstrap.js';
 
 let dir: string;
 beforeEach(() => {
@@ -99,7 +102,7 @@ function fakeWatchdogService(opts: { supervised?: boolean; installChanged?: bool
   return { calls, svc };
 }
 const writeCfg = (roles: Record<string, object>) =>
-  writeFileSync(join(dir, 'fleet.yaml'), stringify({ roles }));
+  writeV2Fixture(join(dir, 'fleet.yaml'), { roles });
 
 describe('applyRole', () => {
   it('writes briefing/identity/worklog, preserves session-id on keep', () => {
@@ -131,9 +134,10 @@ describe('applyRole', () => {
   });
 
   it('embeds briefing_file content', () => {
-    const bf = join(dir, 'curated.md');
+    writeCfg({ A: { harness: 'fake', briefing_file: 'curated.md' } });
+    const bf = join(dir, 'fleet', 'agents', 'curated.md');
     writeFileSync(bf, 'CURATED BODY');
-    writeCfg({ A: { harness: 'fake', briefing_file: bf } });
+    chmodSync(bf, 0o600);
     const d1 = applyRole(loadConfig().roles[0]);
     expect(readFileSync(join(d1, 'briefing.md'), 'utf8')).toContain('CURATED BODY');
   });
@@ -245,7 +249,7 @@ describe('up / down / restart', () => {
     expect(logs.join('\n')).not.toContain('maybe not running');   // the old guess
   });
 
-  it('down targets an exact state-backed temporary role absent from merged YAML', async () => {
+  it('down refuses a state-backed temporary role absent from declared persistent Agents', async () => {
     writeCfg({ A: { harness: 'fake' } });
     const tempDir = agentDir('Temp', true);
     mkdirSync(tempDir, { recursive: true });
@@ -262,11 +266,10 @@ describe('up / down / restart', () => {
       return { stdout: '', stderr: '', code: 0 };
     };
 
-    await down(loadConfig(), ['Temp'], d);
-
-    expect(commands).toEqual([['systemctl', '--user', 'stop', tempSystemdUnit('Temp')]]);
-    expect(calls).toEqual([]); // no permanent backend was guessed
-    expect(logs.join('\n')).toContain('temporary role Temp');
+    await expect(down(loadConfig(), ['Temp'], d)).rejects.toThrow(/no such role 'Temp'/);
+    expect(commands).toEqual([]);
+    expect(calls).toEqual([]);
+    expect(logs).toEqual([]);
   });
 
   it('restart fresh clears markers then bounces', async () => {
@@ -279,6 +282,34 @@ describe('up / down / restart', () => {
     await restartRoles(loadConfig(), ['A'], d, 'fresh');
     expect(existsSync(join(stateDir, '.booted'))).toBe(false);
     expect(calls).toContainEqual(['restart', 'A']);
+  });
+
+  it('fresh defaults force-restart only FleetCoordinator and keep templates inert', async () => {
+    const configPath = join(dir, 'fleet.yaml'); bootstrapPresets(configPath);
+    const config = loadConfig(configPath);
+    expect(config.roles.map(role => role.name)).toEqual(['FleetCoordinator']);
+    const { calls, backend } = fakeBackend(); const { d } = deps(backend);
+    await restartRoles(config, [], d, 'fresh', configPath);
+    expect(calls.filter(call => call[0] === 'restart')).toEqual([['restart', 'FleetCoordinator']]);
+    const before = [...calls];
+    await expect(up(config, ['Developer'], d, configPath)).rejects.toThrow(/inert Agent Template/);
+    await expect(down(config, ['Developer'], d)).rejects.toThrow(/inert Agent Template/);
+    await expect(restartRoles(config, ['Developer'], d, 'keep', configPath))
+      .rejects.toThrow(/inert Agent Template/);
+    expect(calls).toEqual(before);
+    await expect(restartRoles(config, ['DoesNotExist'], d, 'keep', configPath))
+      .rejects.toThrow(/no such role 'DoesNotExist'/);
+  });
+
+  it('a persistent Agent reusing a template remains independently lifecycle-targetable', async () => {
+    const configPath = join(dir, 'fleet.yaml'); bootstrapPresets(configPath);
+    const instance = join(dir, 'fleet', 'agents', 'DeveloperInstance.yaml');
+    writeFileSync(instance, 'template: Developer\noverrides:\n  identity: DeveloperInstance\n', { mode: 0o600 });
+    const config = loadConfig(configPath);
+    const { calls, backend } = fakeBackend(); const { d } = deps(backend);
+    await restartRoles(config, ['DeveloperInstance'], d, 'keep', configPath);
+    expect(calls).toContainEqual(['restart', 'DeveloperInstance']);
+    expect(calls).not.toContainEqual(['restart', 'Developer']);
   });
 
   it('up records the given configPath in each role\'s .config-path marker', async () => {
@@ -300,7 +331,7 @@ describe('up / down / restart', () => {
 
 describe('up/down reconcile the supervised watchdog scheduler', () => {
   const withWatchdog = (extra = '') =>
-    writeFileSync(join(dir, 'fleet.yaml'), `roles:\n  A: {}\nwatchdogs:\n  w: { coordinator: A${extra} }\n`);
+    writeV2Fixture(join(dir, 'fleet.yaml'), `roles:\n  A: {}\nwatchdogs:\n  w: { coordinator: A${extra} }\n`);
 
   it('up with an enabled watchdog installs and restarts the supervised scheduler so config changes reach an active unit', async () => {
     withWatchdog();
@@ -513,18 +544,20 @@ describe('up liveness — only a definite stop discards session context', () => 
   });
 
   it('a stopped role boots fresh and reads the briefing `up` just rewrote', async () => {
-    const first = join(dir, 'brief-1.md');
+    writeV2Fixture(join(dir, 'fleet.yaml'), { roles: { A: { harness: 'fake', briefing_file: 'brief-1.md' } } });
+    const first = join(dir, 'fleet', 'agents', 'brief-1.md');
     writeFileSync(first, 'FIRST BRIEFING BODY');
-    writeFileSync(join(dir, 'fleet.yaml'), stringify({ roles: { A: { harness: 'fake', briefing_file: first } } }));
+    chmodSync(first, 0o600);
     const { d: d1 } = deps(systemdSaying('active', 'running'));
     await up(loadConfig(), [], d1);
     const stateDir = agentDir('A');
     writeFileSync(join(stateDir, '.booted'), '');           // role has since booted
     expect(readFileSync(join(stateDir, 'briefing.md'), 'utf8')).toContain('FIRST BRIEFING BODY');
 
-    const second = join(dir, 'brief-2.md');
+    writeV2Fixture(join(dir, 'fleet.yaml'), { roles: { A: { harness: 'fake', briefing_file: 'brief-2.md' } } });
+    const second = join(dir, 'fleet', 'agents', 'brief-2.md');
     writeFileSync(second, 'SECOND BRIEFING BODY');
-    writeFileSync(join(dir, 'fleet.yaml'), stringify({ roles: { A: { harness: 'fake', briefing_file: second } } }));
+    chmodSync(second, 0o600);
     const { d: d2 } = deps(systemdSaying('inactive', 'dead'));
     await up(loadConfig(), [], d2);
 
@@ -577,27 +610,29 @@ describe('explicit operator actions reset the restart circuit', () => {
 });
 
 describe('rmRole', () => {
-  it('removes a spawned role including its fleet.d file', async () => {
-    writeCfg({});
-    mkdirSync(join(dir, 'fleet.d'), { recursive: true });
-    writeFileSync(join(dir, 'fleet.d', 'S.yaml'), stringify({ roles: { S: { harness: 'fake' } } }));
-    const cfg = loadConfig();
-    applyRole(cfg.roles[0]);
+  it('removes a proven generated Agent file under a custom manifest stem', async () => {
+    const manifest = join(dir, 'custom.yml');
+    writeV2Fixture(manifest, { roles: { S: { harness: 'fake' } } });
+    const cfg = loadConfig(manifest);
+    applyRole(cfg.roles[0], { configPath: manifest });
+    recordGeneratedAgentSource(agentDir('S'), manifest, cfg.roles[0].sourceFile);
     const { calls, backend } = fakeBackend();
     const { d } = deps(backend);
     await rmRole(cfg, 'S', d);
     expect(calls).toContainEqual(['uninstall', 'S']);
-    expect(existsSync(join(dir, 'fleet.d', 'S.yaml'))).toBe(false);
+    expect(existsSync(join(dir, 'custom', 'agents', 'S.yaml'))).toBe(false);
     expect(existsSync(agentDir('S'))).toBe(false);
   });
 
-  it('never deletes the hand-written fleet.yaml for base roles', async () => {
+  it('preserves a hand-written Agent in the same agents directory without ownership proof', async () => {
     writeCfg({ A: { harness: 'fake' } });
     const cfg = loadConfig();
+    applyRole(cfg.roles[0]);
     const { backend } = fakeBackend();
     const { d } = deps(backend);
     await rmRole(cfg, 'A', d);
     expect(existsSync(join(dir, 'fleet.yaml'))).toBe(true);
+    expect(existsSync(join(dir, 'fleet', 'agents', 'A.yaml'))).toBe(true);
   });
 
   it('rm stops and archives an exact temporary role absent from merged YAML', async () => {

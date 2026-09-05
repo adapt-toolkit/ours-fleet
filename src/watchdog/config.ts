@@ -1,27 +1,28 @@
 import { existsSync } from 'node:fs';
 import { isAbsolute } from 'node:path';
 import { parseDuration } from '../duration.js';
-import { ConfigError, ROLE_NAME_RE, resolveRoleModel } from '../config.js';
-import type { FleetConfig, ResolvedRole, SessionBackendId } from '../config.js';
-import { validateIsolationConfig } from '../isolation/policy.js';
+import { ConfigError, ROLE_NAME_RE } from '../config.js';
+import type { AgentDefinition, FleetConfig, ResolvedRole } from '../config.js';
+import type { SessionBackendId } from '../config.js';
 import type { IsolationConfig } from '../isolation/types.js';
 
 export interface WatchdogConfig {
   coordinator?: string; enabled?: boolean; interval?: string; watch?: string[];
-  harness?: string; model?: string | null; session?: string; identity?: string;
+  agent?: { ref: string } | AgentDefinition; identity?: string;
   timeout?: string; keep_reports?: number; alert_cooldown?: string; prompt_file?: string;
-  isolation?: IsolationConfig;
 }
 export interface ResolvedWatchdog {
   name: string; coordinator: string; enabled: boolean; intervalMs: number;
-  watch: string[]; watchExplicit: boolean; harness: string; session: SessionBackendId; model?: string;
+  watch: string[]; watchExplicit: boolean; agentDefinition: AgentDefinition; resolvedAgent: ResolvedRole;
+  /** Resolved/read-only runtime facts; never independent authoring fields. */
+  harness: string; session: SessionBackendId; model?: string; isolation?: IsolationConfig;
   identity: string; timeoutMs: number; keepReports: number; alertCooldownMs: number;
-  promptFile?: string; isolation?: IsolationConfig; sourceFile: string;
+  promptFile?: string; sourceFile: string;
 }
 
 const WATCHDOG_KEYS = [
-  'coordinator', 'enabled', 'interval', 'watch', 'harness', 'model', 'session',
-  'identity', 'timeout', 'keep_reports', 'alert_cooldown', 'prompt_file', 'isolation',
+  'coordinator', 'enabled', 'interval', 'watch', 'agent',
+  'identity', 'timeout', 'keep_reports', 'alert_cooldown', 'prompt_file',
 ];
 export const WATCHDOG_DEFAULT_INTERVAL_MS = 600_000;
 export const WATCHDOG_MIN_INTERVAL_MS = 60_000;
@@ -40,7 +41,8 @@ function deepSub(v: unknown, vars: Record<string, string>): unknown {
 
 export function resolveWatchdogs(
   baseDoc: Record<string, unknown>, baseFile: string, roles: ResolvedRole[],
-  vars: Record<string, string>, defaults: Record<string, unknown>,
+  vars: Record<string, string>, agentDefinitions: Record<string, AgentDefinition>,
+  resolveInline: (name: string, definition: AgentDefinition) => ResolvedRole,
 ): ResolvedWatchdog[] {
   const block = baseDoc.watchdogs;
   if (block === undefined || block === null) return [];
@@ -50,7 +52,7 @@ export function resolveWatchdogs(
   const roleIdentities = new Set(roles.map(r => r.identity));
   // Tracks identity -> owning watchdog name across entries:
   // two watchdogs declaring the same identity would otherwise share a temp
-  // dir, tmux session, and run lock with no error until they collide at
+  // dir, agent session, and run lock with no error until they collide at
   // runtime.
   const watchdogIdentities = new Map<string, string>();
   const out: ResolvedWatchdog[] = [];
@@ -61,6 +63,10 @@ export function resolveWatchdogs(
     if (roleNames.has(name))
       throw new ConfigError(`${baseFile}: watchdog '${name}' collides with a role name`);
     const w = deepSub(rawEntry ?? {}, vars) as WatchdogConfig;
+    const legacy = ['harness', 'model', 'session', 'isolation'].filter(key =>
+      Object.hasOwn(w as Record<string, unknown>, key));
+    if (legacy.length)
+      throw new ConfigError(`${where}: E_LEGACY Brain/Agent-owned field(s) ${legacy.join(', ')} are unsupported; select a canonical Agent with agent`);
     const bad = Object.keys(w).filter(k => !WATCHDOG_KEYS.includes(k));
     if (bad.length)
       throw new ConfigError(`${where} has unknown key(s) ${bad.join(', ')}; allowed: ${WATCHDOG_KEYS.join(', ')}`);
@@ -78,19 +84,27 @@ export function resolveWatchdogs(
     if (collidingWatchdog !== undefined)
       throw new ConfigError(`${where}: identity '${identity}' collides with watchdog '${collidingWatchdog}'`);
     watchdogIdentities.set(identity, name);
-    const harness = w.harness ?? (defaults.harness as string | undefined) ?? 'claude-code';
-    const sessionRaw = w.session ?? (defaults.session as string | undefined) ?? 'tmux';
-    if (sessionRaw !== 'tmux' && sessionRaw !== 'acp')
-      throw new ConfigError(`${where}: session must be 'tmux' or 'acp'`);
+    if (!w.agent || typeof w.agent !== 'object' || Array.isArray(w.agent))
+      throw new ConfigError(`${where}: agent is required (Agent ref or canonical Agent definition)`);
+    let agentDefinition: AgentDefinition;
+    let resolvedAgent: ResolvedRole;
+    if ('ref' in w.agent) {
+      const ref = w.agent.ref;
+      if (typeof ref !== 'string' || !ref)
+        throw new ConfigError(`${where}: agent.ref must be a declared Agent ID`);
+      agentDefinition = agentDefinitions[ref];
+      resolvedAgent = roles.find(role => role.name === ref)!;
+      if (!agentDefinition || !resolvedAgent)
+        throw new ConfigError(`${where}: Agent ref '${ref}' was not found`);
+    } else {
+      agentDefinition = structuredClone(w.agent);
+      resolvedAgent = resolveInline(name, agentDefinition);
+    }
     if (w.prompt_file !== undefined) {
       if (typeof w.prompt_file !== 'string' || !isAbsolute(w.prompt_file))
         throw new ConfigError(`${where}: prompt_file must be an absolute path`);
       if (!existsSync(w.prompt_file))
         throw new ConfigError(`${where}: prompt_file not found: ${w.prompt_file}`);
-    }
-    if (w.isolation !== undefined) {
-      const problems = validateIsolationConfig(w.isolation);
-      if (problems.length) throw new ConfigError(`${where} ${problems.join('; ')}`);
     }
     const dur = (v: string | undefined, key: string, fallback: number, minMs?: number) => {
       if (v === undefined) return fallback;
@@ -106,13 +120,15 @@ export function resolveWatchdogs(
       name, coordinator: w.coordinator.trim(),
       enabled: w.enabled ?? true,
       intervalMs: dur(w.interval, 'interval', WATCHDOG_DEFAULT_INTERVAL_MS, WATCHDOG_MIN_INTERVAL_MS),
-      watch, watchExplicit: w.watch !== undefined, harness, session: sessionRaw,
-      model: resolveRoleModel(w.model, w.harness, defaults),
+      watch, watchExplicit: w.watch !== undefined,
+      agentDefinition: structuredClone(agentDefinition), resolvedAgent: structuredClone(resolvedAgent),
+      harness: resolvedAgent.harness, session: resolvedAgent.session,
+      model: resolvedAgent.model, isolation: resolvedAgent.isolation,
       identity,
       timeoutMs: dur(w.timeout, 'timeout', WATCHDOG_DEFAULT_TIMEOUT_MS),
       keepReports,
       alertCooldownMs: dur(w.alert_cooldown, 'alert_cooldown', WATCHDOG_DEFAULT_COOLDOWN_MS),
-      promptFile: w.prompt_file, isolation: w.isolation, sourceFile: baseFile,
+      promptFile: w.prompt_file, sourceFile: baseFile,
     });
   }
   return out;

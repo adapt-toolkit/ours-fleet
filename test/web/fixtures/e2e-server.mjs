@@ -30,9 +30,9 @@ const role = {
   },
 };
 const terminalRole = {
-  ...role, id: 'Terminal', configuredBackend: 'tmux', detectedBackend: 'tmux',
-  config: { ...role.config, name: 'Terminal', identity: 'Terminal', session: 'tmux',
-    mission: 'Verify ANSI and Unicode terminal fidelity', model: undefined },
+  ...role, id: 'Terminal',
+  config: { ...role.config, name: 'Terminal', identity: 'Terminal',
+    mission: 'Verify a second structured agent workspace', model: undefined },
 };
 const inactiveRole = {
   ...role, id: 'Dormant',
@@ -41,17 +41,12 @@ const inactiveRole = {
 const capabilities = {
   protocolVersion: 2, inventory: true, status: true,
   output: { recent: true, stream: true, structured: true, replayCursor: true },
-  input: { text: true, rawKeys: false, interrupt: true, steering: false },
+  input: { text: true, interrupt: true, steering: false },
   permissions: { observe: true, respond: true },
-  terminal: { available: false, reason: 'wrong_backend', multiViewer: false, writerLease: false },
   lifecycle: { start: false, stop: true, restartResume: true, restartFresh: true, remove: false },
   logs: { tail: true, follow: false, cursor: false },
 };
-const terminalCapabilities = {
-  ...capabilities,
-  terminal: { available: true, multiViewer: true, writerLease: true },
-  input: { text: false, rawKeys: true, interrupt: false, steering: false },
-};
+const terminalCapabilities = capabilities;
 const inactiveCapabilities = {
   ...capabilities,
   lifecycle: { start: true, stop: true, restartResume: true, restartFresh: true, remove: false },
@@ -217,8 +212,8 @@ const services = {
   query: {
     async list() { return [
       { role, status: { ...status, observedAt: new Date().toISOString() }, capabilities },
-      { role: terminalRole, status: { ...status, roleId: 'Terminal', observedAt: new Date().toISOString(),
-        session: { ...status.session, backend: 'tmux' } }, capabilities: terminalCapabilities },
+      { role: terminalRole, status: { ...status, roleId: 'Terminal', observedAt: new Date().toISOString() },
+        capabilities: terminalCapabilities },
       { role: inactiveRole, status: { ...inactiveStatus, observedAt: new Date().toISOString() },
         capabilities: inactiveCapabilities },
     ]; },
@@ -228,8 +223,7 @@ const services = {
       return {
         role: inactive ? inactiveRole : terminal ? terminalRole : role,
         status: inactive ? { ...inactiveStatus, observedAt: new Date().toISOString() }
-          : { ...status, roleId: terminal ? 'Terminal' : 'Alpha', observedAt: new Date().toISOString(),
-            session: terminal ? { ...status.session, backend: 'tmux' } : status.session },
+          : { ...status, roleId: terminal ? 'Terminal' : 'Alpha', observedAt: new Date().toISOString() },
         capabilities: inactive ? inactiveCapabilities : terminal ? terminalCapabilities : capabilities,
       };
     },
@@ -290,12 +284,12 @@ const services = {
       return {
         available: true, reasons: [],
         harnesses: [
-          { id: 'codex', available: true, sessions: ['acp', 'tmux'], models: ['gpt-5.6-sol', 'gpt-5.6-terra'],
+          { id: 'codex', available: true, sessions: ['acp'], models: ['gpt-5.6-sol', 'gpt-5.6-terra'],
             modelOptions: [
               { id: 'gpt-5.6-sol', label: 'GPT-5.6-Sol', reasoningEfforts: ['low', 'medium', 'high', 'xhigh', 'max', 'ultra'], defaultReasoningEffort: 'low', source: 'codex-runtime-catalog' },
               { id: 'gpt-5.6-terra', label: 'GPT-5.6-Terra', reasoningEfforts: ['low', 'medium', 'high'], defaultReasoningEffort: 'medium', source: 'codex-runtime-catalog' },
             ], catalogSource: 'codex-runtime-catalog', customModelAllowed: true, warnings: [] },
-          { id: 'claude-code', available: true, sessions: ['acp', 'tmux'], models: ['claude-fable-5', 'claude-opus-5'],
+          { id: 'claude-code', available: true, sessions: ['acp'], models: ['claude-fable-5', 'claude-opus-5'],
             modelOptions: [
               { id: 'claude-fable-5', label: 'Claude Fable 5', reasoningEfforts: ['low', 'medium', 'high', 'xhigh', 'max'], source: 'claude-adapter-2.1' },
               { id: 'claude-opus-5', label: 'Claude Opus 5', reasoningEfforts: ['low', 'medium', 'high', 'xhigh', 'max'], source: 'claude-adapter-2.1' },
@@ -347,13 +341,6 @@ const services = {
         recovery: { available: true, detail: 'Fixture recovery archive is available.' } };
     },
     async removeWeb(input) { return { ...this.previewWeb(input.role), removed: true, recoveryPath: `/fixture/recovery/${input.role}` }; },
-  },
-  async terminalUpgrade(socket) {
-    socket.send(JSON.stringify({
-      type: 'snapshot', bridgeId: 'fixture-terminal', seq: '1',
-      data: '\u001b[1;38;2;123;216;143mANSI BOLD\u001b[0m \u001b[3;4mITALIC UNDERLINE\u001b[0m ┌─ █ ',
-    }));
-    socket.send(JSON.stringify({ type: 'ready', mode: 'viewer', bridgeId: 'fixture-terminal' }));
   },
 };
 
@@ -431,10 +418,10 @@ const editorServer = await buildWebServer({
     .filter(node => node.kind === 'agent' && node.origin === 'config')
     .map(node => ({
       role: { id: node.label, lifetime: 'permanent', configured: true, stateHealth: 'present',
-        configuredBackend: 'tmux', detectedBackend: 'tmux', compatibility: { compatible: true }, problems: [] },
+        configuredBackend: 'acp', detectedBackend: 'acp', compatibility: { compatible: true }, problems: [] },
       status: { roleId: node.label, observedAt: new Date().toISOString(), overall: 'stopped',
         supervisor: { backend: 'none', liveness: 'stopped', detail: 'not started' },
-        session: { backend: 'tmux', reachability: 'offline', readiness: 'unknown', evidence: 'inferred' },
+        session: { backend: 'acp', reachability: 'offline', readiness: 'unknown', evidence: 'inferred' },
         restart: { circuit: 'closed', consecutiveImmediateFailures: 0, nextDelayMs: 0 },
         monitor: { mode: 'fleet', health: 'unknown', stale: true },
         isolation: { degraded: false }, problems: [] },

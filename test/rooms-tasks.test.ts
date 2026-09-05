@@ -5,13 +5,12 @@ import { join } from 'node:path';
 
 import {
   resolveTemplate, listTemplates, hashTemplate, snapshotTemplate,
-  BUILTIN_TEMPLATES,
 } from '../src/rooms-tasks/templates.js';
 import {
   createTask, getTask, listTasks, findByIdempotencyKey,
   startTask, activateTask, blockTask, unblockTask,
   reviewTask, completeTask, cancelTask, failTask,
-  deleteTask, updateTaskRoom, updateTaskMembers,
+  beginTaskDeletionIntent, unlinkDeletedTask, updateTaskRoom, updateTaskMembers,
   TaskStateError,
 } from '../src/rooms-tasks/task-state.js';
 import {
@@ -43,39 +42,45 @@ afterEach(() => {
 
 // ── Templates ──────────────────────────────────────────────────────────────
 
+const TEST_TEMPLATE: TemplateDefinition = {
+  name: 'team', version: 1, description: 'test team', sourceFile: '/config/team.yaml',
+  members: [{ slot: 'dev', role: 'Developer', count: 1, agent_template: 'Developer' }],
+};
+const TEST_TEMPLATES = { team: TEST_TEMPLATE };
+
 describe('templates', () => {
   describe('resolveTemplate', () => {
-    it('resolves built-in by name', () => {
-      const t = resolveTemplate('team', {});
+    it('resolves configured template by name', () => {
+      const t = resolveTemplate('team', TEST_TEMPLATES);
       expect(t).toBeDefined();
       expect(t!.name).toBe('team');
-      expect(t!.builtin).toBe(true);
+      expect(t!.sourceFile).toBe('/config/team.yaml');
     });
 
-    it('resolves built-in by name@version', () => {
-      const t = resolveTemplate('team@1', {});
+    it('resolves configured template by name@version', () => {
+      const t = resolveTemplate('team@1', TEST_TEMPLATES);
       expect(t).toBeDefined();
       expect(t!.version).toBe(1);
     });
 
     it('returns undefined for wrong version', () => {
-      expect(resolveTemplate('team@99', {})).toBeUndefined();
+      expect(resolveTemplate('team@99', TEST_TEMPLATES)).toBeUndefined();
     });
 
-    it('resolves the single builtin as a solo-agent template', () => {
-      const t = resolveTemplate('single', {});
+    it('resolves a solo-agent template', () => {
+      const single = { ...TEST_TEMPLATE, name: 'single', members: [{ slot: 'agent', role: 'Agent', count: 1, agent_template: 'Agent' }] };
+      const t = resolveTemplate('single', { single });
       expect(t).toBeDefined();
-      expect(t!.builtin).toBe(true);
       expect(t!.members).toHaveLength(1);
       expect(t!.members[0].count).toBe(1);
-      expect(resolveTemplate('single@1', {})).toBeDefined();
+      expect(resolveTemplate('single@1', { single })).toBeDefined();
     });
 
     it('returns undefined for unknown name', () => {
       expect(resolveTemplate('nonexistent', {})).toBeUndefined();
     });
 
-    it('custom overrides built-in', () => {
+    it('uses the supplied configured definition', () => {
       const custom: Record<string, TemplateDefinition> = {
         'team': {
           name: 'team', version: 2, description: 'custom dev',
@@ -100,15 +105,12 @@ describe('templates', () => {
   });
 
   describe('listTemplates', () => {
-    it('returns built-ins when no custom templates', () => {
+    it('returns no hidden templates when none are configured', () => {
       const list = listTemplates({});
-      expect(list.length).toBe(BUILTIN_TEMPLATES.length);
-      expect(list.map(t => t.name)).toContain('team');
-      expect(list.map(t => t.name)).toContain('pair');
-      expect(list.map(t => t.name)).toContain('single');
+      expect(list).toEqual([]);
     });
 
-    it('merges custom with built-ins, sorted', () => {
+    it('lists configured templates sorted', () => {
       const custom: Record<string, TemplateDefinition> = {
         'aaa-first': {
           name: 'aaa-first', version: 1, description: 'first alphabetically',
@@ -117,10 +119,10 @@ describe('templates', () => {
       };
       const list = listTemplates(custom);
       expect(list[0].name).toBe('aaa-first');
-      expect(list.length).toBe(BUILTIN_TEMPLATES.length + 1);
+      expect(list.length).toBe(1);
     });
 
-    it('custom with same name as builtin replaces it', () => {
+    it('returns one configured definition per name', () => {
       const custom: Record<string, TemplateDefinition> = {
         'team': {
           name: 'team', version: 2, description: 'override',
@@ -130,32 +132,33 @@ describe('templates', () => {
       const list = listTemplates(custom);
       const dt = list.find(t => t.name === 'team')!;
       expect(dt.version).toBe(2);
-      expect(list.length).toBe(BUILTIN_TEMPLATES.length);
+      expect(list.length).toBe(1);
     });
   });
 
   describe('hashTemplate', () => {
     it('is deterministic', () => {
-      const t = BUILTIN_TEMPLATES[0];
+      const t = TEST_TEMPLATE;
       expect(hashTemplate(t)).toBe(hashTemplate(t));
     });
 
     it('changes when content changes', () => {
-      const t = BUILTIN_TEMPLATES[0];
+      const t = TEST_TEMPLATE;
       const modified = { ...t, description: 'changed' };
       expect(hashTemplate(t)).not.toBe(hashTemplate(modified));
     });
 
     it('is a 64-char hex string', () => {
-      expect(hashTemplate(BUILTIN_TEMPLATES[0])).toMatch(/^[0-9a-f]{64}$/);
+      expect(hashTemplate(TEST_TEMPLATE)).toMatch(/^[0-9a-f]{64}$/);
     });
   });
 
   describe('snapshotTemplate', () => {
     it('adds content_hash field', () => {
-      const snap = snapshotTemplate(BUILTIN_TEMPLATES[0]);
-      expect(snap.content_hash).toBe(hashTemplate(BUILTIN_TEMPLATES[0]));
-      expect(snap.name).toBe(BUILTIN_TEMPLATES[0].name);
+      const snap = snapshotTemplate(TEST_TEMPLATE);
+      expect(snap.content_hash).toBe(hashTemplate(TEST_TEMPLATE));
+      expect(snap.name).toBe(TEST_TEMPLATE.name);
+      expect(snap).not.toHaveProperty('sourceFile');
     });
   });
 });
@@ -377,7 +380,8 @@ describe('task-state', () => {
     });
   });
 
-  describe('deleteTask', () => {
+  describe('task deletion (any state)', () => {
+    const cliActor = { kind: 'local_control', surface: 'cli' } as const;
     function taskInState(state: TaskState) {
       const t = createTask({ title: `${state} task`, origin, start: state === 'backlog' ? false : undefined });
       if (state === 'backlog' || state === 'provisioning') return t;
@@ -391,30 +395,30 @@ describe('task-state', () => {
     }
 
     it.each([
-      'backlog', 'provisioning', 'active', 'review', 'cancelled', 'failed',
-    ] as const)('rejects a %s task', state => {
+      'backlog', 'provisioning', 'active', 'review', 'done', 'cancelled', 'failed',
+    ] as const)('accepts deletion for a %s task and unlinks it', state => {
       const t = taskInState(state);
-      expect(() => deleteTask(t.task_id)).toThrow(
-        `cannot delete a '${state}' task; only 'done' tasks can be deleted`,
-      );
-      expect(getTask(t.task_id).state).toBe(state);
-    });
-
-    it('removes only a done task and is idempotent when repeated', () => {
-      const t = taskInState('done');
-      expect(deleteTask(t.task_id)).toBe(true);
+      expect(beginTaskDeletionIntent(t.task_id, cliActor).status).toBe('accepted');
+      expect(unlinkDeletedTask(t.task_id)).toBe(true);
       expect(() => getTask(t.task_id)).toThrow(/not found/);
-      expect(deleteTask(t.task_id)).toBe(false);
     });
 
-    it('preserves the associated room orchestration record', () => {
+    it('reports a repeat deletion as already absent', () => {
+      const t = taskInState('done');
+      beginTaskDeletionIntent(t.task_id, cliActor);
+      expect(unlinkDeletedTask(t.task_id)).toBe(true);
+      expect(unlinkDeletedTask(t.task_id)).toBe(false);
+      expect(beginTaskDeletionIntent(t.task_id, cliActor)).toEqual({ status: 'already_absent' });
+    });
+
+    it('unlink alone leaves the room orchestration record to the settlement worker', () => {
       const t = taskInState('done');
       updateTaskRoom(t.task_id, 'room-delete-preserve', 'c'.repeat(64));
       const room = createRoomRecord({
         room_id: 'room-delete-preserve', room_name: 'Archived room', task_id: t.task_id,
       });
-
-      expect(deleteTask(t.task_id)).toBe(true);
+      beginTaskDeletionIntent(t.task_id, cliActor);
+      expect(unlinkDeletedTask(t.task_id)).toBe(true);
       expect(getRoomRecord(room.room_id)).toEqual(room);
     });
 
@@ -422,7 +426,8 @@ describe('task-state', () => {
       const outside = join(dir, 'outside.json');
       writeFileSync(outside, JSON.stringify({ state: 'done' }));
 
-      expect(() => deleteTask('../outside')).toThrow(/invalid task ID/);
+      expect(() => beginTaskDeletionIntent('../outside', cliActor)).toThrow(/invalid task ID/);
+      expect(() => unlinkDeletedTask('../outside')).toThrow(/invalid task ID/);
       expect(readFileSync(outside, 'utf8')).toBe(JSON.stringify({ state: 'done' }));
     });
   });
@@ -462,7 +467,7 @@ describe('room-state', () => {
     });
 
     it('accepts task_id and template_snapshot', () => {
-      const snap = snapshotTemplate(BUILTIN_TEMPLATES[0]);
+      const snap = snapshotTemplate(TEST_TEMPLATE);
       const r = createRoomRecord({
         room_id: 'room-full', room_name: 'Full',
         task_id: 'task-1', template_snapshot: snap,
@@ -810,7 +815,7 @@ describe('config validation', () => {
     const validTemplate = {
       version: 1,
       description: 'Test template',
-      members: [{ slot: 'dev', role: 'Developer', count: 2, role_ref: 'Dev' }],
+      members: [{ slot: 'dev', role: 'Developer', count: 2, agent_template: 'Dev' }],
     };
 
     it('accepts valid template', () => {
@@ -819,6 +824,19 @@ describe('config validation', () => {
       expect(cfg['my-template'].name).toBe('my-template');
       expect(cfg['my-template'].version).toBe(1);
       expect(cfg['my-template'].members).toHaveLength(1);
+    });
+
+    it('accepts an anonymous room flag and validates room keys strictly', () => {
+      const cfg = validateRoomTemplatesConfig({
+        'my-template': { ...validTemplate, room: { anonymous: true } },
+      }, 'test');
+      expect(cfg['my-template'].room).toEqual({ anonymous: true, quiet_membership: undefined });
+      expect(() => validateRoomTemplatesConfig({
+        'my-template': { ...validTemplate, room: { anonymous: 'yes' } },
+      }, 'test')).toThrow(/room\.anonymous.*boolean/);
+      expect(() => validateRoomTemplatesConfig({
+        'my-template': { ...validTemplate, room: { hidden: true } },
+      }, 'test')).toThrow(/unknown key.*hidden/);
     });
 
     it('rejects non-object', () => {
@@ -833,13 +851,13 @@ describe('config validation', () => {
 
     it('rejects missing version', () => {
       expect(() => validateRoomTemplatesConfig({
-        't': { description: 'x', members: [{ slot: 'a', role: 'A', count: 1, role_ref: 'A' }] },
+        't': { description: 'x', members: [{ slot: 'a', role: 'A', count: 1, agent_template: 'A' }] },
       }, 'test')).toThrow(/version.*required positive integer/);
     });
 
     it('rejects missing description', () => {
       expect(() => validateRoomTemplatesConfig({
-        't': { version: 1, members: [{ slot: 'a', role: 'A', count: 1, role_ref: 'A' }] },
+        't': { version: 1, members: [{ slot: 'a', role: 'A', count: 1, agent_template: 'A' }] },
       }, 'test')).toThrow(/description.*required string/);
     });
 
@@ -855,13 +873,21 @@ describe('config validation', () => {
       }, 'test')).toThrow(/role.*required string/);
     });
 
-    it('requires override_builtin for builtin name', () => {
-      expect(() => validateRoomTemplatesConfig({
-        'team': { version: 2, description: 'override', members: validTemplate.members },
-      }, 'test')).toThrow(/override_builtin/);
+    it('rejects duplicate member slots', () => {
+      expect(() => validateRoomTemplatesConfig({ t: { ...validTemplate, members: [
+        { slot: 'dev', role: 'Developer', count: 1, agent_template: 'Dev' },
+        { slot: 'dev', role: 'Tester', count: 1, agent_template: 'Test' },
+      ] } }, 'test')).toThrow("duplicate slot 'dev'");
     });
 
-    it('accepts builtin override with override_builtin: true', () => {
+    it('accepts a standard name because authority is file-backed', () => {
+      const cfg = validateRoomTemplatesConfig({
+        'team': { version: 2, description: 'override', members: validTemplate.members },
+      }, 'test');
+      expect(cfg.team.version).toBe(2);
+    });
+
+    it('accepts the deprecated explicit override marker for migration', () => {
       const cfg = validateRoomTemplatesConfig({
         'team': {
           ...validTemplate, version: 2, override_builtin: true,
@@ -876,26 +902,26 @@ describe('config validation', () => {
       }, 'test')).toThrow(/unknown key.*bad_key/);
     });
 
-    it('rejects unknown keys in member overrides', () => {
+    it('rejects the removed task-only override schema', () => {
       expect(() => validateRoomTemplatesConfig({
         't': {
           version: 1, description: 'x',
-          members: [{ slot: 'a', role: 'A', count: 1, role_ref: 'A', overrides: { bad: true } }],
+          members: [{ slot: 'a', role: 'A', count: 1, agent_template: 'A', overrides: { bad: true } }],
         },
-      }, 'test')).toThrow(/unknown key.*bad/);
+      }, 'test')).toThrow(/unknown key.*overrides/);
     });
 
-    it('accepts valid member overrides', () => {
-      const cfg = validateRoomTemplatesConfig({
+    it('rejects legacy inline or persistent Agent coupling actionably', () => {
+      expect(() => validateRoomTemplatesConfig({
         't': {
           version: 1, description: 'x',
           members: [{
-            slot: 'a', role: 'A', count: 1, role_ref: 'A',
-            overrides: { model: 'claude-opus-4-6', persona: 'test' },
+            slot: 'a', role: 'A', count: 1,
+            agent: { brain: { inline: { harness: 'claude-code', model: 'claude-opus-4-6' } },
+              role: { inline: { persona: 'test' } } },
           }],
         },
-      }, 'test');
-      expect(cfg.t.members[0].overrides).toBeDefined();
+      }, 'test')).toThrow(/persistent Agent references are no longer allowed.*agent_template/);
     });
   });
 

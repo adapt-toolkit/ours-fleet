@@ -1,0 +1,5 @@
+# Generated from presets/brain-catalog.json revision 2.
+harness: codex
+session: acp
+model: gpt-5.6-sol
+effort: max

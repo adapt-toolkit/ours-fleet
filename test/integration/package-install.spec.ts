@@ -63,9 +63,15 @@ describe('packed root package', () => {
         const { makeCodexAdapter } = await import(
           pathToFileURL(join(fleetRoot, 'dist', 'harness', 'codex.js')).href
         );
-        const adapter = makeCodexAdapter(async cmd => ({
-          code: cmd === 'sh' ? 1 : 0, stdout: '', stderr: '',
-        }));
+        const { bootstrapPresets } = await import(
+          pathToFileURL(join(fleetRoot, 'dist', 'preset-bootstrap.js')).href
+        );
+        const seeded = bootstrapPresets(join(process.cwd(), 'seeded', 'alternate.yaml'));
+        let transportOptions;
+        const adapter = makeCodexAdapter(
+          async cmd => ({ code: cmd === 'sh' ? 1 : 0, stdout: '', stderr: '' }),
+          async options => { transportOptions = options; return {}; },
+        );
         const role = {
           name: 'PackedConsumer',
           harness: 'codex',
@@ -77,17 +83,29 @@ describe('packed root package', () => {
         const stateDir = join(process.cwd(), 'state');
         mkdirSync(stateDir);
         const prep = await adapter.prepareSession(role, { stateDir, runCwd: process.cwd() });
-        const launch = adapter.buildAcpLaunch(role, prep);
+        const launch = adapter.agentSession.prepareLaunch(role, prep);
+        await adapter.agentSession.start({
+          role, prep, launch, cwd: process.cwd(), stateDir, mode: 'fresh',
+          permissions: role.permissions,
+          permissionMode: { fleetMode: 'allow', nativeMode: 'agent-full-access' },
+          log() {},
+        });
         const claim = adapter.effectivePermissions(role);
         process.stdout.write(JSON.stringify({
           version: codex.version,
           claim,
-          permissionMetadataSource: launch.permissionMetadataSource,
+          permissionMetadataSource: transportOptions.permissionMetadataSource,
           prepared: {
             codeXPathExists: existsSync(prep.env.CODEX_PATH),
             approval: prep.env.OURS_FLEET_CODEX_APPROVAL,
             sandbox: prep.env.OURS_FLEET_CODEX_SANDBOX,
             initialAgentMode: launch.env.INITIAL_AGENT_MODE,
+          },
+          presets: {
+            revision: seeded.revision,
+            created: seeded.created.length,
+            team: existsSync(join(process.cwd(), 'seeded', 'alternate', 'room_templates', 'team.yaml')),
+            localCoordinator: existsSync(join(process.cwd(), 'seeded', 'alternate', 'roles', 'LocalCoordinator.yaml')),
           },
         }));
       `;
@@ -112,6 +130,7 @@ describe('packed root package', () => {
         sandbox: 'danger-full-access',
         initialAgentMode: 'agent-full-access',
       });
+      expect(result.presets).toEqual({ revision: 6, created: 67, team: true, localCoordinator: true });
 
       writeFileSync(join(consumerWithoutOptionalDir, 'package.json'), JSON.stringify({
         private: true,
@@ -136,9 +155,11 @@ describe('packed root package', () => {
         const { makeCodexAdapter } = await import(
           pathToFileURL(join(fleetRoot, 'dist', 'harness', 'codex.js')).href
         );
-        const adapter = makeCodexAdapter(async () => ({
-          code: 1, stdout: '', stderr: '',
-        }));
+        let transportOptions;
+        const adapter = makeCodexAdapter(
+          async () => ({ code: 1, stdout: '', stderr: '' }),
+          async options => { transportOptions = options; return {}; },
+        );
         const role = {
           name: 'PackedFallback',
           harness: 'codex',
@@ -147,11 +168,18 @@ describe('packed root package', () => {
           session: 'acp',
           permissions: { approval: 'allow', filesystem: 'workspace', unattended: 'wait' },
         };
-        const launch = adapter.buildAcpLaunch(role, { argv: [], env: {} });
+        const prep = { env: {} };
+        const launch = adapter.agentSession.prepareLaunch(role, prep);
+        await adapter.agentSession.start({
+          role, prep, launch, cwd: process.cwd(), stateDir: process.cwd(), mode: 'fresh',
+          permissions: role.permissions,
+          permissionMode: { fleetMode: 'allow', nativeMode: 'agent-full-access' },
+          log() {},
+        });
         process.stdout.write(JSON.stringify({
           bundledPresent: existsSync(codexRoot),
           argv: launch.argv,
-          permissionMetadataSource: launch.permissionMetadataSource,
+          permissionMetadataSource: transportOptions.permissionMetadataSource,
         }));
       `;
       const fallback = JSON.parse(execFileSync(process.execPath, [

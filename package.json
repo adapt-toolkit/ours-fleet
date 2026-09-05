@@ -1,7 +1,7 @@
 {
   "name": "@ours.network/fleet",
   "version": "1.0.5",
-  "description": "Harness-agnostic fleet of persistent, identity-bound AI agents. Declarative fleet.yaml, tmux or ACP sessions, supervision, and ours.network messaging.",
+  "description": "Harness-agnostic fleet of persistent, identity-bound AI agents. Declarative fleet.yaml, managed native/ACP sessions, supervision, and ours.network messaging.",
   "type": "module",
   "license": "FSL-1.1-Apache-2.0",
   "repository": {
@@ -15,11 +15,13 @@
   "files": [
     "dist",
     "contrib",
+    "examples",
+    "presets",
     "README.md",
     "LICENSE"
   ],
   "engines": {
-    "node": ">=20"
+    "node": ">=22"
   },
   "scripts": {
     "clean": "node -e \"require('node:fs').rmSync('dist',{recursive:true,force:true})\"",
@@ -39,11 +41,7 @@
     "@fastify/static": "^10.1.2",
     "@fastify/websocket": "^11.2.0",
     "@ours.network/cli": "1.0.1",
-    "@ours.network/sdk": "3.0.1",
-    "@xterm/addon-fit": "0.10.0",
-    "@xterm/addon-serialize": "0.13.0",
-    "@xterm/headless": "5.5.0",
-    "@xterm/xterm": "5.5.0",
+    "@ours.network/sdk": "3.7.0",
     "commander": "^12.1.0",
     "fastify": "^5.4.0",
     "react": "^19.1.1",
@@ -54,8 +52,7 @@
   },
   "optionalDependencies": {
     "@agentclientprotocol/claude-agent-acp": "^0.63.0",
-    "@agentclientprotocol/codex-acp": "1.1.7",
-    "node-pty": "^1.1.0"
+    "@agentclientprotocol/codex-acp": "1.1.7"
   },
   "devDependencies": {
     "@playwright/test": "^1.54.1",

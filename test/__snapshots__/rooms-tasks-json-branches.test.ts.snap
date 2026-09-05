@@ -32,19 +32,6 @@ exports[`task/room JSON presentation contract > pins every room --json serialize
           return;
         }",
   "if (opts.json) {
-            console.log(JSON.stringify({
-              schema_version: 1, room: null, orchestration: null,
-              recovery_actions: [settled.timedOut
-                ? \`Deletion remains pending — retry room delete \${id} \${id}\`
-                : 'Deletion completed successfully'],
-            }, null, 2));
-            return;
-          }",
-  "if (opts.json) {
-          console.log(JSON.stringify({ schema_version: 1, room: cowork, orchestration: r ?? null, recovery_actions: actions }, null, 2));
-          return;
-        }",
-  "if (opts.json) {
           console.log(JSON.stringify({ schema_version: 1, ...result }, null, 2));
           return;
         }",
@@ -54,7 +41,8 @@ exports[`task/room JSON presentation contract > pins every room --json serialize
 exports[`task/room JSON presentation contract > pins every task --json serializer branch exactly and before Markdown rendering 1`] = `
 [
   "if (opts.json) {
-          console.log(JSON.stringify({ schema_version: 1, task: record }, null, 2));
+          console.log(JSON.stringify({ schema_version: 1, task: record,
+            ...(provisioning ? { provisioning } : {}) }, null, 2));
           return;
         }",
   "if (opts.json) {
@@ -74,22 +62,33 @@ exports[`task/room JSON presentation contract > pins every task --json serialize
           }, null, 2));
           return;
         }",
-  "if (opts.json) { console.log(JSON.stringify({ schema_version: 1, task: t }, null, 2)); return; }",
-  "if (opts.json) { console.log(JSON.stringify({ schema_version: 1, task: t }, null, 2)); return; }",
-  "if (opts.json) { console.log(JSON.stringify({ schema_version: 1, task: t }, null, 2)); return; }",
-  "if (opts.json) { console.log(JSON.stringify({ schema_version: 1, task: t }, null, 2)); return; }",
-  "if (opts.json) { console.log(JSON.stringify({ schema_version: 1, task: t }, null, 2)); return; }",
-  "if (opts.json) { console.log(JSON.stringify({ schema_version: 1, task: t }, null, 2)); return; }",
   "if (opts.json) {
-          console.log(JSON.stringify({ schema_version: 1, task_id: id, deleted }, null, 2));
-          return;
+          console.log(JSON.stringify({ schema_version: 1, task: t, provisioning }, null, 2)); return;
         }",
+  "if (opts.json) { console.log(JSON.stringify({ schema_version: 1, task: t }, null, 2)); return; }",
+  "if (opts.json) { console.log(JSON.stringify({ schema_version: 1, task: t }, null, 2)); return; }",
+  "if (opts.json) { console.log(JSON.stringify({ schema_version: 1, task: t }, null, 2)); return; }",
+  "if (opts.json) { console.log(JSON.stringify({ schema_version: 1, task: t }, null, 2)); return; }",
+  "if (opts.json) { console.log(JSON.stringify({ schema_version: 1, task: t }, null, 2)); return; }",
   "if (opts.json) {
-          console.log(JSON.stringify({ schema_version: 1, ...result }, null, 2));
+            console.log(JSON.stringify({
+              schema_version: 1, task_id: id, deleted: false, already_absent: true,
+            }, null, 2));
+            return;
+          }",
+  "if (opts.json) {
+          console.log(JSON.stringify({
+            schema_version: 1, task_id: id, accepted: true,
+            deleted: settled.deleted, pending: settled.timedOut,
+          }, null, 2));
           return;
         }",
   "if (opts.json) {
           console.log(JSON.stringify({ schema_version: 1, task: t }, null, 2));
+          return;
+        }",
+  "if (opts.json) {
+          console.log(JSON.stringify({ schema_version: 1, ...result }, null, 2));
           return;
         }",
   "if (opts.json) {

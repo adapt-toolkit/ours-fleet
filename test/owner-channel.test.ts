@@ -1,30 +1,35 @@
 import {
-  existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync,
+  existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync,
 } from 'node:fs';
 import { createHash } from 'node:crypto';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
-import { OwnerChannel } from '../src/owner-channel/channel.js';
-import { ownerCommandHelp, type OwnerFleetOps } from '../src/owner-channel/commands.js';
+import {
+  OWNER_RECOVERY_DEGRADED, OWNER_RECOVERY_QUEUE_CAPACITY, OwnerChannel,
+  type OwnerChannelOptions,
+} from '../src/owner-channel/channel.js';
+import { ownerCommandHelp, ownerCommands, type OwnerFleetOps } from '../src/owner-channel/commands.js';
 import {
   activateRoom, closeRoom, createRoomRecord, getRoomRecord,
 } from '../src/rooms-tasks/room-state.js';
 import {
-  activateTask, createTask, getTask, reviewTask, startTask,
+  activateTask, createTask, getDeletingTask, getTask, readTaskDeletionReceipt,
+  reviewTask, startTask, updateTaskRoom,
 } from '../src/rooms-tasks/task-state.js';
 import type {
-  OursContactsView, OursInboundMessage, OursOps,
+  OursContactsView, OursInboundMessage, OursOps, OursRegisteredCommand,
 } from '../src/owner-channel/ours-client.js';
 import { OWNER_COMMENT_LABEL, ownerNotices } from '../src/owner-channel/notices.js';
 import { MessageRecoveryState } from '../src/owner-channel/message-recovery.js';
 import {
-  ACP_CANCEL_DEADLINE_EXCEEDED, SessionControlError,
+  ACP_CANCEL_DEADLINE_EXCEEDED, CODEX_APP_SERVER_CANCEL_DEADLINE_EXCEEDED, SessionControlError,
   type SessionEvent, type SessionHandle, type TurnResult,
 } from '../src/session/types.js';
 import { VERSION } from '../src/version.js';
 import { historyMessage, incomingMessage } from './owner-history-fixtures.js';
+import { writeV2Fixture } from './v2-fixture.js';
 
 const OWNER_CID = 'A'.repeat(64);
 const OTHER_OWNER_CID = 'B'.repeat(64);
@@ -35,6 +40,7 @@ export const EMPTY_CONTACTS: OursContactsView = {
 
 class FakeClient implements OursOps {
   calls: Array<{ name: string; args?: Record<string, unknown> }> = [];
+  sentFileModes: Array<{ file: number; directory: number }> = [];
   /**
    * Daemon message batches. Partial envelopes are allowed on purpose: these
    * tests exercise the fields the channel reads, not the daemon's full row.
@@ -43,9 +49,15 @@ class FakeClient implements OursOps {
   /** Operation names (the `OursOps` methods) that must reject. */
   failTools = new Set<string>();
   history = new Map<string, OursInboundMessage>();
+  commands: OursRegisteredCommand[] = [];
+  typedResults: unknown[] = [];
   async start() {}
   async close() {}
   async bindIdentity(name: string) { this.record('bindIdentity', { name }); }
+  async registerCommands(commands: OursRegisteredCommand[]) {
+    this.commands = commands;
+    this.record('registerCommands', { count: commands.length });
+  }
   async listContacts() { this.record('listContacts'); return EMPTY_CONTACTS; }
   async generateInvite(name?: string) {
     this.record('generateInvite', { name });
@@ -68,10 +80,31 @@ class FakeClient implements OursOps {
   async getMessages(limit: number) {
     this.record('getMessages', { limit });
     const batch = this.batches.shift() ?? [];
-    const messages = batch.slice(0, limit).map((item, index) => historyMessage(item, index + 1));
-    for (const message of messages) this.history.set(message.wire_id, message);
+    const consumed = batch.slice(0, limit).map((item, index) => historyMessage(item, index + 1));
+    for (const message of consumed) this.history.set(message.wire_id, message);
     if (batch.length > limit) this.batches.unshift(batch.slice(limit));
-    return { count: messages.length, messages, remaining: Math.max(0, batch.length - limit) };
+    let commandsHandled = 0;
+    for (const message of consumed.filter(item => item.message_kind === 'command')) {
+      const payload = JSON.parse(message.body) as { command: string; arguments: any };
+      const command = this.commands.find(entry => entry.name === payload.command);
+      if (!command) throw new Error(`missing fake handler: ${payload.command}`);
+      try {
+        this.typedResults.push(await command.handler(payload.arguments, {
+          sender_cid: message.from.id, sender_name: message.from.name,
+          request_wire_id: message.wire_id,
+        }));
+      } catch {
+        // SDK handlers fail closed and emit only its bounded handler_failed result.
+        this.typedResults.push('handler_failed');
+      }
+      commandsHandled++;
+    }
+    return {
+      messages: consumed.filter(item => item.message_kind === 'text'),
+      command_results: consumed.filter(item => item.message_kind === 'command_result') as any,
+      commands_handled: commandsHandled,
+      remaining: Math.max(0, batch.length - limit),
+    };
   }
   async getHistoryItem(wireId: string) {
     this.record('getHistoryItem', { wireId });
@@ -99,6 +132,7 @@ class FakeClient implements OursOps {
     this.record('sendMessage', { ...a });
   }
   async sendFile(a: { contact: string; path: string; filename: string; replyToWireId?: string }) {
+    this.sentFileModes.push({ file: statSync(a.path).mode & 0o777, directory: statSync(join(a.path, '..')).mode & 0o777 });
     this.record('sendFile', { ...a });
   }
   private record(name: string, args?: Record<string, unknown>): void {
@@ -114,6 +148,13 @@ afterEach(() => {
   for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true });
 });
 
+function deferred<T = void>() {
+  let resolve!: (value: T | PromiseLike<T>) => void;
+  let reject!: (reason?: unknown) => void;
+  const promise = new Promise<T>((done, fail) => { resolve = done; reject = fail; });
+  return { promise, resolve, reject };
+}
+
 function deferredTurn() {
   let resolve!: (result: TurnResult) => void;
   const completion = new Promise<TurnResult>(done => { resolve = done; });
@@ -126,10 +167,12 @@ function setup(messages: unknown[], result = {
   interrupt?: boolean; queuedBehind?: number; fleet?: OwnerFleetOps; events?: SessionEvent[];
   configPath?: string;
   prepareRestart?: (role: string, mode: 'keep' | 'fresh') => Promise<void>;
+  recoveryDeps?: OwnerChannelOptions['recoveryDeps'];
+  stateDir?: string; client?: FakeClient;
 } = {}) {
-  const dir = mkdtempSync(join(tmpdir(), 'ours-owner-channel-'));
-  dirs.push(dir);
-  const client = new FakeClient();
+  const dir = options.stateDir ?? mkdtempSync(join(tmpdir(), 'ours-owner-channel-'));
+  if (!options.stateDir) dirs.push(dir);
+  const client = options.client ?? new FakeClient();
   client.batches.push(messages, []);
   const queuePrompt = vi.fn(async () => ({
     promptId: 'prompt-1', queuedBehind: options.queuedBehind ?? 0,
@@ -152,9 +195,370 @@ function setup(messages: unknown[], result = {
     ...(options.configPath ? { configPath: options.configPath } : {}),
     prepareRestart: options.prepareRestart ?? (async () => undefined),
     ...(options.fleet ? { fleet: options.fleet } : {}),
+    ...(options.recoveryDeps ? { recoveryDeps: options.recoveryDeps } : {}),
   });
   return { channel, client, queuePrompt, interrupt, dir };
 }
+
+describe('owner channel daemon-generation recovery', () => {
+  it('releases the stale client before fresh attach/bind and performs a journal-safe read probe', async () => {
+    const { channel, client } = setup([]);
+    await channel.start();
+    const order: string[] = [];
+    client.close = vi.fn(async () => { order.push('close'); });
+    client.start = vi.fn(async () => { order.push('start'); });
+    client.bindIdentity = vi.fn(async () => { order.push('bind'); });
+    client.listIncomingMessages = vi.fn(async () => { order.push('list'); return []; });
+
+    await channel.recover('boot-2');
+    expect(order.slice(0, 3)).toEqual(['close', 'start', 'bind']);
+    expect(order.filter(item => item === 'list').length).toBeGreaterThanOrEqual(2);
+    expect(client.calls.some(call => call.name === 'getMessages')).toBe(false);
+    await channel.close();
+  });
+
+  it('quiesces a stale watch drain before closing or starting the replacement client', async () => {
+    const { channel, client } = setup([]);
+    const staleList = deferred<never[]>();
+    const order: string[] = [];
+    let listings = 0;
+    client.listIncomingMessages = vi.fn(async () => {
+      listings++;
+      order.push(listings === 1 ? 'stale-list' : 'fresh-list');
+      return listings === 1 ? staleList.promise : [];
+    });
+    client.close = vi.fn(async () => { order.push('close'); });
+    client.start = vi.fn(async () => { order.push('start'); });
+    client.bindIdentity = vi.fn(async () => { order.push('bind'); });
+    await channel.start();
+    await vi.waitFor(() => expect(order).toEqual(['start', 'bind', 'stale-list']));
+
+    const recovery = channel.recover('boot-2');
+    await new Promise(resolve => setImmediate(resolve));
+    expect(order).toEqual(['start', 'bind', 'stale-list']);
+    staleList.resolve([]);
+    await recovery;
+    expect(order.slice(2, 6)).toEqual(['stale-list', 'close', 'start', 'bind']);
+    expect(order.filter(item => item === 'fresh-list').length).toBeGreaterThanOrEqual(2);
+    await channel.close();
+  });
+
+  it('coalesces one epoch and prevents management from overtaking readiness', async () => {
+    const { channel, client } = setup([]);
+    await channel.start();
+    const attached = deferred();
+    const order: string[] = [];
+    client.close = vi.fn(async () => { order.push('close'); });
+    client.start = vi.fn(async () => { order.push('start'); await attached.promise; });
+    client.bindIdentity = vi.fn(async () => { order.push('bind'); });
+    client.listIncomingMessages = vi.fn(async () => { order.push('list'); return []; });
+    client.listContacts = vi.fn(async () => { order.push('manage'); return EMPTY_CONTACTS; });
+
+    const first = channel.recover('boot-2');
+    const duplicate = channel.recover('boot-2');
+    expect(duplicate).toBe(first);
+    const managed = channel.manage({ action: 'contact_list' });
+    await vi.waitFor(() => expect(order).toEqual(['close', 'start']));
+    expect(order).not.toContain('manage');
+    attached.resolve();
+    await expect(first).resolves.toBeUndefined();
+    await expect(managed).resolves.toMatchObject({ action: 'contact_list' });
+    expect(order.indexOf('manage')).toBeGreaterThan(order.lastIndexOf('list'));
+    await channel.close();
+  });
+
+  it('bounds deferred management and settles overflow deterministically', async () => {
+    const { channel, client } = setup([]);
+    await channel.start();
+    const attached = deferred();
+    client.start = vi.fn(async () => { await attached.promise; });
+    const recovery = channel.recover('boot-2');
+    const queued = Array.from({ length: OWNER_RECOVERY_QUEUE_CAPACITY }, () =>
+      channel.manage({ action: 'contact_list' }));
+    await expect(channel.manage({ action: 'contact_list' })).rejects.toThrow('queue is full');
+    attached.resolve();
+    await recovery;
+    await expect(Promise.all(queued)).resolves.toHaveLength(OWNER_RECOVERY_QUEUE_CAPACITY);
+    await channel.close();
+  });
+
+  it('keeps binder ownership and durable claims intact across a bind failure and retry', async () => {
+    const { channel, client, dir } = setup([]);
+    await channel.start();
+    client.failTools.add('bindIdentity');
+    await expect(channel.recover('boot-2')).rejects.toThrow('bindIdentity failed');
+    expect(existsSync(join(dir, '.owner-channel-message-recovery.json'))).toBe(false);
+    client.failTools.delete('bindIdentity');
+    await expect(channel.recover('boot-2')).resolves.toBeUndefined();
+    expect(client.calls.filter(call => call.name === 'bindIdentity')).toHaveLength(3);
+    await channel.close();
+  });
+
+  it('settles deferred management and proactive work as degraded after recovery failure', async () => {
+    const { channel, client } = setup([]);
+    await channel.start();
+    client.failTools.add('bindIdentity');
+    const contacts = vi.spyOn(client, 'listContacts');
+    const sends = vi.spyOn(client, 'sendMessage');
+    const recovery = channel.recover('boot-2');
+    const managed = channel.manage({ action: 'contact_list' });
+    const proactive = channel.notifyFleetSpawn({
+      caller: 'Coordinator', role: 'Temp', lifetime: 'temporary', harness: 'codex',
+      session: 'acp', monitor: { mode: 'fleet', interrupt: false }, inherited: [],
+      creationActionId: 'creation-1',
+    } as never);
+    await expect(recovery).rejects.toThrow('bindIdentity failed');
+    for (const operation of [managed, proactive]) {
+      const error = await operation.catch(value => value as Error & { code?: string });
+      expect(error).toMatchObject({ code: OWNER_RECOVERY_DEGRADED });
+    }
+    expect(contacts).not.toHaveBeenCalled();
+    expect(sends).not.toHaveBeenCalled();
+    await expect(channel.manage({ action: 'contact_list' }))
+      .rejects.toMatchObject({ code: OWNER_RECOVERY_DEGRADED });
+
+    client.failTools.delete('bindIdentity');
+    await channel.recover('boot-2');
+    await expect(channel.manage({ action: 'contact_list' })).resolves.toMatchObject({
+      action: 'contact_list',
+    });
+    expect(contacts).toHaveBeenCalledTimes(1);
+    await channel.close();
+  });
+
+  it('serializes proactive delivery through successful recovery and sends it exactly once', async () => {
+    const { channel, client } = setup([]);
+    await channel.start();
+    const attached = deferred();
+    client.start = vi.fn(async () => { await attached.promise; });
+    const recovery = channel.recover('boot-proactive');
+    const proactive = channel.notifyFleetSpawn({
+      caller: 'Coordinator', role: 'Temp', lifetime: 'temporary', harness: 'codex',
+      session: 'acp', monitor: { mode: 'fleet', interrupt: false }, inherited: [],
+      creationActionId: 'creation-success',
+    } as never);
+    expect(client.calls.filter(call => call.name === 'sendMessage')).toHaveLength(0);
+    attached.resolve();
+    await recovery;
+    await proactive;
+    const sends = client.calls.filter(call => call.name === 'sendMessage');
+    expect(sends).toHaveLength(1);
+    expect(sends[0].args?.text).toContain('🚀 Agent launched: Temp');
+    await channel.close();
+  });
+
+  it('delivers the human-readable launch configuration in the spawn notification', async () => {
+    const { channel, client } = setup([]);
+    await channel.start();
+    await channel.recover('boot-configured');
+    await channel.notifyFleetSpawn({
+      caller: 'Coordinator', role: 'Dev', lifetime: 'temporary', harness: 'codex',
+      session: 'acp', model: 'gpt-test',
+      monitor: { mode: 'fleet', interrupt: false }, inherited: ['brain'],
+      creationActionId: 'creation-configured',
+      brainSummary: 'ref:codex-high (inherited)', roleSummary: 'ref:reviewer (explicit)',
+      permissionMode: { fleetMode: 'ask', nativeMode: 'read-only' },
+      configuration: {
+        version: 1, role: { kind: 'named', ref: 'reviewer' },
+        brain: { kind: 'named', ref: 'codex-high' },
+        harness: 'codex', session: 'acp', model: 'gpt-test', effort: 'high',
+        mission: 'Review every change',
+        approval: 'ask', filesystem: 'workspace', unattended: 'wait',
+        permissionMode: { fleetMode: 'ask', nativeMode: 'read-only' },
+        monitor: { mode: 'fleet', interrupt: false },
+      },
+    } as never);
+    const sends = client.calls.filter(call => call.name === 'sendMessage');
+    expect(sends).toHaveLength(1);
+    const text = String(sends[0].args?.text);
+    expect(text).toContain('🚀 Agent launched: Dev');
+    expect(text).toContain('- **Role:** Preset `reviewer`');
+    expect(text).toContain('- **Mission:** “Review every change”');
+    expect(text).toContain('- **Brain:** Preset `codex-high`');
+    expect(text).toContain('- **Harness:** `codex`');
+    expect(text).toContain('- **Model:** `gpt-test`');
+    expect(text).toContain('- **Effort:** high');
+    expect(text).toContain('- **Approval:** ask');
+    expect(text).toContain('- **Filesystem:** workspace');
+    expect(text).toContain('- **Wait:** wait');
+    expect(text).toContain('- **Fleet mode:** ask');
+    expect(text).toContain('- **Native mode:** read-only');
+    expect(text).not.toContain('inline:sha256');
+    await channel.close();
+  });
+
+  it('processes a new authenticated Owner wire end-to-end after recovery exactly once', async () => {
+    const { channel, client, queuePrompt, dir } = setup([]);
+    await channel.start();
+    await channel.recover('boot-owner-e2e');
+    await new Promise(resolve => setImmediate(resolve));
+    const message = ownerMessage(44, 'wire-after-recovery', 'Perform safe action');
+    client.batches.splice(0, client.batches.length, [message], []);
+    await channel.drain();
+    await vi.waitFor(() => expect(client.calls.filter(call => call.name === 'sendMessage')).toHaveLength(2));
+    expect(queuePrompt).toHaveBeenCalledOnce();
+    expect(queuePrompt.mock.calls[0][0]).toContain('Perform safe action');
+    expect(client.calls.filter(call => call.name === 'sendMessage').map(call => call.args?.replyToWireId))
+      .toEqual(['wire-after-recovery', 'wire-after-recovery']);
+    const journal = readFileSync(join(dir, '.owner-channel-message-recovery.json'), 'utf8');
+    expect(journal).toContain('wire-after-recovery');
+    expect(journal).not.toContain('Perform safe action');
+    await channel.drain(); // duplicate body-free hint with no new unread body
+    expect(queuePrompt).toHaveBeenCalledOnce();
+    expect(client.calls.filter(call => call.name === 'sendMessage')).toHaveLength(2);
+    for (const name of ['.daemon-recovery.json', '.owner-channel-shutdown.json']) {
+      if (existsSync(join(dir, name))) {
+        const diagnostic = readFileSync(join(dir, name), 'utf8');
+        expect(diagnostic).not.toContain('Perform safe action');
+        expect(diagnostic).not.toContain(OWNER_CID);
+      }
+    }
+    await channel.close();
+  });
+
+  it('bounds stale-drain quiescence and forbids replacement overlap until it settles', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(0);
+    const recoveryDeps = {
+      now: () => Date.now(), setTimer: setTimeout, clearTimer: clearTimeout, deadlineMs: 100,
+    };
+    const { channel, client } = setup([], undefined, { recoveryDeps });
+    const stale = deferred<never[]>();
+    let listings = 0;
+    client.listIncomingMessages = vi.fn(async () => ++listings === 1 ? stale.promise : []);
+    await channel.start();
+    await vi.advanceTimersByTimeAsync(0);
+    const closes = vi.spyOn(client, 'close');
+    const starts = vi.spyOn(client, 'start');
+    const recovery = channel.recover('boot-timeout');
+    const queued = channel.manage({ action: 'contact_list' });
+    const recoveryOutcome = recovery.catch(error => error as Error & { stage?: string });
+    const queuedOutcome = queued.catch(error => error as Error & { code?: string });
+    await vi.advanceTimersByTimeAsync(100);
+    await expect(recoveryOutcome).resolves.toMatchObject({ stage: 'stale_quiescence' });
+    await expect(queuedOutcome).resolves.toMatchObject({ code: OWNER_RECOVERY_DEGRADED });
+    expect(closes).not.toHaveBeenCalled();
+    expect(starts).not.toHaveBeenCalled();
+
+    stale.resolve([]);
+    await vi.advanceTimersByTimeAsync(0);
+    await expect(channel.manage({ action: 'contact_list' }))
+      .rejects.toMatchObject({ code: OWNER_RECOVERY_DEGRADED });
+    await expect(channel.recover('boot-timeout')).resolves.toBeUndefined();
+    expect(closes).toHaveBeenCalledTimes(1);
+    expect(starts).toHaveBeenCalledTimes(1);
+    await channel.close();
+  });
+
+  it('bounds a hanging bind, fences its late completion, and degrades queued work', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(0);
+    const recoveryDeps = {
+      now: () => Date.now(), setTimer: setTimeout, clearTimer: clearTimeout, deadlineMs: 100,
+    };
+    const { channel, client } = setup([], undefined, { recoveryDeps });
+    await channel.start();
+    const hanging = deferred<void>();
+    let binds = 0;
+    client.bindIdentity = vi.fn(async () => {
+      binds++;
+      if (binds === 1) await hanging.promise;
+    });
+    const recovery = channel.recover('boot-bind-timeout');
+    const queued = channel.manage({ action: 'contact_list' });
+    const recoveryOutcome = recovery.catch(error => error as Error & { stage?: string });
+    const queuedOutcome = queued.catch(error => error as Error & { code?: string });
+    await vi.advanceTimersByTimeAsync(100);
+    await expect(recoveryOutcome).resolves.toMatchObject({ stage: 'bind' });
+    await expect(queuedOutcome).resolves.toMatchObject({ code: OWNER_RECOVERY_DEGRADED });
+
+    hanging.resolve();
+    await vi.advanceTimersByTimeAsync(0);
+    await expect(channel.manage({ action: 'contact_list' }))
+      .rejects.toMatchObject({ code: OWNER_RECOVERY_DEGRADED });
+    await expect(channel.recover('boot-bind-timeout')).resolves.toBeUndefined();
+    expect(binds).toBe(2);
+    await channel.close();
+  });
+
+  it('bounds close on a never-settling stale drain without overlapping client disposal', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(0);
+    const recoveryDeps = {
+      now: () => Date.now(), setTimer: setTimeout, clearTimer: clearTimeout, deadlineMs: 100,
+    };
+    const { channel, client, dir } = setup([], undefined, { recoveryDeps });
+    const stale = deferred<never[]>();
+    client.listIncomingMessages = vi.fn(async () => stale.promise);
+    await channel.start();
+    await vi.advanceTimersByTimeAsync(0);
+    const clientClose = vi.spyOn(client, 'close');
+    const closing = channel.close();
+    await vi.advanceTimersByTimeAsync(100);
+    await expect(closing).resolves.toBeUndefined();
+    expect(clientClose).not.toHaveBeenCalled();
+    expect(channel.binderReleaseSafe()).toBe(false);
+    expect(JSON.parse(readFileSync(join(dir, '.owner-channel-shutdown.json'), 'utf8')))
+      .toMatchObject({ state: 'degraded', reason: 'OWNER_SHUTDOWN_QUIESCENCE_TIMEOUT' });
+    await expect(channel.manage({ action: 'contact_list' }))
+      .rejects.toMatchObject({ code: OWNER_RECOVERY_DEGRADED });
+    stale.resolve([]);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(clientClose).not.toHaveBeenCalled();
+  });
+
+  it('does not overlap close with quiescence debt from a timed-out bind', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(0);
+    const recoveryDeps = {
+      now: () => Date.now(), setTimer: setTimeout, clearTimer: clearTimeout, deadlineMs: 100,
+    };
+    const { channel, client } = setup([], undefined, { recoveryDeps });
+    await channel.start();
+    const hanging = deferred<void>();
+    client.bindIdentity = vi.fn(async () => { await hanging.promise; });
+    const closeSpy = vi.spyOn(client, 'close');
+    const recovery = channel.recover('boot-bind-close');
+    const recoveryOutcome = recovery.catch(error => error as Error & { stage?: string });
+    await vi.advanceTimersByTimeAsync(100);
+    await expect(recoveryOutcome).resolves.toMatchObject({ stage: 'bind' });
+    const closeCallsBefore = closeSpy.mock.calls.length;
+    const closing = channel.close();
+    await vi.advanceTimersByTimeAsync(100);
+    await expect(closing).resolves.toBeUndefined();
+    expect(closeSpy).toHaveBeenCalledTimes(closeCallsBefore);
+    expect(channel.binderReleaseSafe()).toBe(false);
+    hanging.resolve();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(closeSpy).toHaveBeenCalledTimes(closeCallsBefore);
+  });
+
+  it('fences a superseded epoch and stop from publishing late readiness', async () => {
+    const { channel, client } = setup([]);
+    await channel.start();
+    const firstAttach = deferred();
+    let starts = 0;
+    client.start = vi.fn(async () => {
+      starts++;
+      if (starts === 1) await firstAttach.promise;
+    });
+    const first = channel.recover('boot-2');
+    const second = channel.recover('boot-3');
+    firstAttach.resolve();
+    await expect(first).rejects.toThrow('superseded');
+    await expect(second).resolves.toBeUndefined();
+
+    const stoppedAttach = deferred();
+    client.start = vi.fn(async () => { await stoppedAttach.promise; });
+    const late = channel.recover('boot-4');
+    const closing = channel.close();
+    stoppedAttach.resolve();
+    await expect(late).rejects.toThrow('superseded');
+    await closing;
+    await expect(channel.manage({ action: 'contact_list' }))
+      .rejects.toMatchObject({ code: OWNER_RECOVERY_DEGRADED });
+  });
+});
 
 function liveSetup(options: {
   interrupt?: boolean; progressIntervalMs?: number; owners?: string[];
@@ -211,6 +615,14 @@ const ownerMessage = (msgId: number, wireId: string, text: string) => ({
   msg_id: msgId, wire_id: wireId, from: { id: OWNER_CID, name: 'Owner' }, text,
 });
 
+const typedOwnerCommand = (
+  msgId: number, wireId: string, command: string, args: unknown,
+  sender = OWNER_CID,
+) => ({
+  msg_id: msgId, wire_id: wireId, from: { id: sender, name: 'Owner' },
+  message_kind: 'command', text: JSON.stringify({ command, arguments: args }),
+});
+
 /** The text of the most recent outward notice, ignoring daemon bookkeeping calls. */
 const lastReply = (client: FakeClient): string =>
   String(client.calls.filter(call => call.name === 'sendMessage').at(-1)?.args?.text);
@@ -232,7 +644,7 @@ describe('OwnerChannel', () => {
     client.getMessages = async limit => {
       client.calls.push({ name: 'getMessages', args: { limit } });
       return {
-        count: 1, remaining: 0,
+        command_results: [], commands_handled: 0, remaining: 0,
         messages: [historyMessage(ownerMessage(11, 'wire-different', '/status'))],
       };
     };
@@ -416,10 +828,13 @@ describe('OwnerChannel', () => {
       .every(call => !String(call.args?.text).includes('secret'))).toBe(true);
   });
 
-  it('leaves the next owner wire replayable while an ignored-cancel adapter restarts', async () => {
+  it.each([
+    ACP_CANCEL_DEADLINE_EXCEEDED,
+    CODEX_APP_SERVER_CANCEL_DEADLINE_EXCEEDED,
+  ])('leaves the next owner wire replayable while an ignored-cancel adapter restarts (%s)', async reason => {
     const recovery = setup([ownerMessage(27, 'wire-after-stubborn-turn', 'next owner turn')]);
     recovery.queuePrompt.mockRejectedValueOnce(new SessionControlError(
-      'control-unavailable', 'adapter restart detail', ACP_CANCEL_DEADLINE_EXCEEDED));
+      'control-unavailable', 'adapter restart detail', reason));
 
     await recovery.channel.drain();
 
@@ -661,7 +1076,143 @@ describe('OwnerChannel deterministic command dispatch', () => {
     list: vi.fn(async () => 'Coordinator: acp\nScout: 1 windows (created ...)'),
     closeRoom: vi.fn(async () => undefined),
     settleTask: vi.fn(async () => undefined),
-    recoverTask: vi.fn(async () => undefined),
+    settleTaskDeletion: vi.fn(async () => undefined),
+    provisionTask: vi.fn(async () => undefined),
+  });
+
+  it('registers the registry-derived catalog and preserves read-only slash results', async () => {
+    const slash = setup([ownerMessage(40, 'wire-slash-status', '/status')]);
+    await slash.channel.drain();
+    const slashReplies = slash.client.calls.filter(call => call.name === 'sendMessage')
+      .map(call => call.args?.text);
+
+    const typed = setup([typedOwnerCommand(
+      41, 'wire-typed-status', 'status', {}, OWNER_CID.toLowerCase(),
+    )]);
+    await typed.channel.start();
+    await typed.channel.drain();
+    await vi.waitFor(() => expect(typed.client.typedResults).toEqual([null]));
+    const typedReplies = typed.client.calls.filter(call => call.name === 'sendMessage')
+      .map(call => call.args?.text);
+    expect(typed.client.commands.map(command => command.name))
+      .toEqual(ownerCommands.map(command => command.name));
+    expect(typedReplies).toEqual(slashReplies);
+    expect(typedReplies).toHaveLength(1);
+    await typed.channel.close();
+  });
+
+  it('routes malformed typed arguments through shared validation without effects', async () => {
+    const { channel, client, queuePrompt, interrupt } = setup([
+      typedOwnerCommand(42, 'wire-typed-model-invalid', 'model', { arguments: 'bad model id' }),
+      typedOwnerCommand(43, 'wire-typed-interrupt-invalid', 'interrupt', { arguments: 'now' }),
+    ]);
+    await channel.start();
+    await channel.drain();
+    await vi.waitFor(() => expect(client.typedResults).toEqual([null, null]));
+    expect(queuePrompt).not.toHaveBeenCalled();
+    expect(interrupt).not.toHaveBeenCalled();
+    const replies = client.calls.filter(call => call.name === 'sendMessage');
+    expect(replies).toHaveLength(2);
+    expect(String(replies[0].args?.text)).toContain('model id must be alphanumeric');
+    expect(String(replies[1].args?.text)).toContain('/interrupt takes no arguments');
+    await channel.close();
+  });
+
+  it('preserves lifecycle effects and replies for typed and slash commands', async () => {
+    const slashFleet = fakeFleet();
+    const slash = setup([ownerMessage(43, 'wire-slash-restart', '/force-restart')],
+      undefined, { fleet: slashFleet });
+    await slash.channel.drain();
+
+    const typedFleet = fakeFleet();
+    const typed = setup([typedOwnerCommand(44, 'wire-typed-restart', 'force-restart', {})],
+      undefined, { fleet: typedFleet });
+    await typed.channel.start();
+    await typed.channel.drain();
+    await vi.waitFor(() => expect(typed.client.typedResults).toEqual([null]));
+    expect(slashFleet.restart).toHaveBeenCalledWith('fresh');
+    expect(typedFleet.restart).toHaveBeenCalledWith('fresh');
+    expect(typed.client.calls.filter(call => call.name === 'sendMessage').map(call => call.args?.text))
+      .toEqual(slash.client.calls.filter(call => call.name === 'sendMessage').map(call => call.args?.text));
+    await typed.channel.close();
+  });
+
+  it('recovers a later typed command when an earlier lifecycle handler terminates its SDK batch', async () => {
+    const firstFleet = fakeFleet();
+    const first = setup([], undefined, { fleet: firstFleet });
+    const batch = [
+      typedOwnerCommand(44, 'wire-typed-restart-first', 'restart', {}),
+      typedOwnerCommand(45, 'wire-typed-restart-later', 'force-restart', {}),
+    ];
+    first.client.batches.unshift(batch);
+    first.client.getMessages = vi.fn(async limit => {
+      const consumed = batch.slice(0, limit).map((item, index) => historyMessage(item, index + 1));
+      for (const message of consumed) first.client.history.set(message.wire_id, message);
+      const payload = JSON.parse(consumed[0].body) as { command: string; arguments: unknown };
+      const command = first.client.commands.find(entry => entry.name === payload.command)!;
+      await command.handler(payload.arguments, {
+        sender_cid: consumed[0].from.id, sender_name: consumed[0].from.name,
+        request_wire_id: consumed[0].wire_id,
+      });
+      throw new Error('simulated process termination before the second SDK handler');
+    });
+    await (first.channel as unknown as { registerTypedCommands(): Promise<void> })
+      .registerTypedCommands();
+    await expect(first.channel.drain()).rejects.toThrow(/simulated process termination/);
+    expect(firstFleet.restart).toHaveBeenCalledTimes(1);
+    expect(firstFleet.restart).toHaveBeenCalledWith('keep');
+
+    const recoveredClient = new FakeClient();
+    recoveredClient.history = new Map(first.client.history);
+    const recoveredFleet = fakeFleet();
+    const recovered = setup([], undefined, {
+      stateDir: first.dir, client: recoveredClient, fleet: recoveredFleet,
+    });
+    await recovered.channel.drain();
+    expect(recoveredFleet.restart).toHaveBeenCalledTimes(1);
+    expect(recoveredFleet.restart).toHaveBeenCalledWith('fresh');
+    expect(firstFleet.restart).toHaveBeenCalledTimes(1);
+    expect(recoveredClient.calls.filter(call => call.name === 'sendMessage'))
+      .toHaveLength(1);
+    expect(new MessageRecoveryState(join(first.dir, '.owner-channel-message-recovery.json')).list())
+      .toEqual([]);
+  });
+
+  it('denies unauthorized typed callers before dispatching effects', async () => {
+    const fleet = fakeFleet();
+    const { channel, client, queuePrompt } = setup([
+      typedOwnerCommand(45, 'wire-typed-intruder', 'force-restart', {}, 'E'.repeat(64)),
+    ], undefined, { fleet });
+    await channel.start();
+    await channel.drain();
+    await vi.waitFor(() => expect(client.typedResults).toEqual(['handler_failed']));
+    expect(fleet.restart).not.toHaveBeenCalled();
+    expect(queuePrompt).not.toHaveBeenCalled();
+    const sends = client.calls.filter(call => call.name === 'sendMessage')
+      .map(call => call.args as { contact?: string; text?: string });
+    expect(sends.every(send => send.contact === OWNER_CID)).toBe(true);
+    expect(sends.some(send => String(send.text).includes('rejected a message from unauthorized sender CID')))
+      .toBe(true);
+    await channel.close();
+  });
+
+  it('sends HTML reports only to the authenticated owner and removes the private temp tree on success and failure', async () => {
+    for (const fail of [false, true]) {
+      const wire = fail ? 'wire-html-fail' : 'wire-html-ok';
+      const { channel, client, dir } = setup([ownerMessage(580 + Number(fail), wire, '/tasks html')]);
+      const previous = process.env.OURS_FLEET_HOME;
+      process.env.OURS_FLEET_HOME = dir;
+      if (fail) client.failTools.add('sendFile');
+      try { await channel.drain(); } finally {
+        if (previous === undefined) delete process.env.OURS_FLEET_HOME; else process.env.OURS_FLEET_HOME = previous;
+      }
+      const requestDir = join(dir, '.owner-channel-report-outbox', createHash('sha256').update(wire).digest('hex'));
+      expect(client.calls.find(call => call.name === 'sendFile')?.args).toMatchObject({
+        contact: OWNER_CID, filename: 'fleet-tasks.html', replyToWireId: wire,
+      });
+      expect(client.sentFileModes).toEqual([{ file: 0o600, directory: 0o700 }]);
+      expect(existsSync(requestDir)).toBe(false);
+    }
   });
 
   it('returns help for an unknown slash command instead of forwarding it', async () => {
@@ -801,7 +1352,7 @@ describe('OwnerChannel deterministic command dispatch', () => {
     process.env.OURS_FLEET_HOME = fleetHome;
     const roomId = '01hzyk8m0000000000000000aa';
     const configPath = join(fleetHome, 'fleet.yaml');
-    writeFileSync(configPath, 'rooms:\n  owner:\n    expected_cid: ' + 'a'.repeat(64)
+    writeV2Fixture(configPath, 'rooms:\n  owner:\n    expected_cid: ' + 'a'.repeat(64)
       + '\n  defaults:\n    attach_owner: false\n');
     createRoomRecord({ room_id: roomId, room_name: 'Owner close' });
     activateRoom(roomId);
@@ -835,7 +1386,7 @@ describe('OwnerChannel deterministic command dispatch', () => {
     expect(acknowledgement).not.toContain('Room closed');
   });
 
-  it('acknowledges and remembers closing-room recovery before one worker launch', async () => {
+  it('rejects the removed room recover command without launching a worker', async () => {
     const fleet = fakeFleet();
     const fleetHome = mkdtempSync(join(tmpdir(), 'ours-owner-room-recover-'));
     dirs.push(fleetHome);
@@ -843,7 +1394,7 @@ describe('OwnerChannel deterministic command dispatch', () => {
     process.env.OURS_FLEET_HOME = fleetHome;
     const roomId = '01hzyk8m0000000000000000ab';
     const configPath = join(fleetHome, 'fleet.yaml');
-    writeFileSync(configPath, 'rooms:\n  owner:\n    expected_cid: ' + 'a'.repeat(64)
+    writeV2Fixture(configPath, 'rooms:\n  owner:\n    expected_cid: ' + 'a'.repeat(64)
       + '\n  defaults:\n    attach_owner: false\n');
     createRoomRecord({ room_id: roomId, room_name: 'Owner recover' });
     activateRoom(roomId);
@@ -852,23 +1403,40 @@ describe('OwnerChannel deterministic command dispatch', () => {
       [ownerMessage(5911, 'wire-room-recover', `/room recover ${roomId}`)],
       undefined, { fleet, configPath },
     );
-    let wireWhenSpawned = '';
-    let sendsWhenSpawned = 0;
-    fleet.closeRoom.mockImplementation(async () => {
-      wireWhenSpawned = readFileSync(join(dir, '.owner-channel-state.json'), 'utf8');
-      sendsWhenSpawned = client.calls.filter(call => call.name === 'sendMessage').length;
-    });
     try { await channel.drain(); }
     finally {
       if (previousHome === undefined) delete process.env.OURS_FLEET_HOME;
       else process.env.OURS_FLEET_HOME = previousHome;
     }
     expect(queuePrompt).not.toHaveBeenCalled();
-    expect(fleet.closeRoom).toHaveBeenCalledTimes(1);
-    expect(fleet.closeRoom).toHaveBeenCalledWith(roomId);
-    expect(wireWhenSpawned).toContain('wire-room-recover');
-    expect(sendsWhenSpawned).toBeGreaterThan(0);
-    expect(lastReply(client)).toContain('deletion recovery is still being settled');
+    expect(fleet.closeRoom).not.toHaveBeenCalled();
+    expect(lastReply(client)).toContain('Invalid command');
+    expect(lastReply(client)).toContain('unknown room subcommand: recover');
+  });
+
+  it('rejects the removed task recover command without launching a worker', async () => {
+    const fleet = fakeFleet();
+    const { channel, client, queuePrompt } = setup(
+      [ownerMessage(59115, 'wire-task-recover', '/task recover legacy-task')],
+      undefined, { fleet },
+    );
+    await channel.drain();
+    expect(queuePrompt).not.toHaveBeenCalled();
+    expect(fleet.provisionTask).not.toHaveBeenCalled();
+    expect(fleet.settleTask).not.toHaveBeenCalled();
+    expect(fleet.settleTaskDeletion).not.toHaveBeenCalled();
+    expect(lastReply(client)).toContain('Invalid command');
+    expect(lastReply(client)).toContain('unknown task subcommand: recover');
+  });
+
+  it('rejects the removed Owner task await command before provisioning', async () => {
+    const fleet = fakeFleet();
+    const { channel, client } = setup(
+      [ownerMessage(5912, 'wire-task-await', '/task await legacy-task')], undefined, { fleet });
+    await channel.drain();
+    expect(fleet.provisionTask).not.toHaveBeenCalled();
+    expect(lastReply(client)).toContain('Invalid command');
+    expect(lastReply(client)).toContain('unknown task subcommand: await');
   });
 
   it('persists task terminal intent and the wire before launching its external worker', async () => {
@@ -889,7 +1457,7 @@ describe('OwnerChannel deterministic command dispatch', () => {
     });
     activateRoom(task.room_id!);
     const configPath = join(fleetHome, 'fleet.yaml');
-    writeFileSync(configPath, 'tasks:\n  close_room_on_done: true\n');
+    writeV2Fixture(configPath, 'tasks:\n  close_room_on_done: true\n');
     const { channel, client, dir } = setup(
       [ownerMessage(592, 'wire-task-settle', `/task done ${task.task_id} shipped`)],
       undefined,
@@ -925,6 +1493,74 @@ describe('OwnerChannel deterministic command dispatch', () => {
     });
   });
 
+  it('accepts Messenger deletion in any state, records the owner CID, and launches the worker after acknowledgement', async () => {
+    const fleet = fakeFleet();
+    const fleetHome = mkdtempSync(join(tmpdir(), 'ours-owner-task-delete-'));
+    dirs.push(fleetHome);
+    const previousHome = process.env.OURS_FLEET_HOME;
+    process.env.OURS_FLEET_HOME = fleetHome;
+    writeV2Fixture(join(fleetHome, 'fleet.yaml'), {});
+    // Provisioning state — deletion must accept without any terminal transition.
+    const task = createTask({ title: 'Owner delete any state', origin: { type: 'owner_channel' }, start: true });
+    const { channel, client } = setup(
+      [ownerMessage(596, 'wire-task-delete', `/task delete ${task.task_id} ${task.task_id}`)],
+      undefined, { fleet },
+    );
+    let deletionWhenSpawned = '';
+    let sendsWhenSpawned = 0;
+    fleet.settleTaskDeletion.mockImplementation(async () => {
+      deletionWhenSpawned = getDeletingTask(task.task_id).deletion?.status ?? '';
+      sendsWhenSpawned = client.calls.filter(call => call.name === 'sendMessage').length;
+    });
+    try {
+      await channel.drain();
+      expect(getDeletingTask(task.task_id).state).toBe('provisioning'); // no false transition
+      const receipt = readTaskDeletionReceipt(task.task_id);
+      expect(receipt).toMatchObject({
+        task_id: task.task_id, original_state: 'provisioning',
+        actor: { kind: 'authenticated_owner', surface: 'messenger', cid: OWNER_CID },
+      });
+    } finally {
+      if (previousHome === undefined) delete process.env.OURS_FLEET_HOME;
+      else process.env.OURS_FLEET_HOME = previousHome;
+    }
+    expect(fleet.settleTaskDeletion).toHaveBeenCalledWith(task.task_id);
+    expect(deletionWhenSpawned).toBe('pending'); // durable intent precedes the worker
+    expect(sendsWhenSpawned).toBeGreaterThan(0); // acknowledged before launch
+    const texts = client.calls.filter(call => call.name === 'sendMessage')
+      .map(call => String(call.args?.text));
+    expect(texts.some(text => text.includes('deletion was accepted'))).toBe(true);
+    expect(texts.some(text => text.includes('Task deleted'))).toBe(false); // never claims success
+  });
+
+  it('persists external delete-worker launch failure without reporting deletion success', async () => {
+    const fleet = fakeFleet();
+    fleet.settleTaskDeletion.mockRejectedValueOnce(new Error('systemd launch failed'));
+    const fleetHome = mkdtempSync(join(tmpdir(), 'ours-owner-task-delete-fail-'));
+    dirs.push(fleetHome);
+    const previousHome = process.env.OURS_FLEET_HOME;
+    process.env.OURS_FLEET_HOME = fleetHome;
+    writeV2Fixture(join(fleetHome, 'fleet.yaml'), {});
+    const task = createTask({ title: 'Owner delete fail', origin: { type: 'owner_channel' }, start: false });
+    const { channel, client } = setup(
+      [ownerMessage(597, 'wire-task-delete-fail', `/task delete ${task.task_id} ${task.task_id}`)],
+      undefined, { fleet },
+    );
+    try {
+      await channel.drain();
+      const hidden = getDeletingTask(task.task_id);
+      expect(hidden.deletion?.status).toBe('pending');
+      expect(hidden.deletion?.error).toContain('systemd launch failed');
+      expect(hidden.deletion?.recovery_hint).toContain(`/task delete ${task.task_id} ${task.task_id}`);
+    } finally {
+      if (previousHome === undefined) delete process.env.OURS_FLEET_HOME;
+      else process.env.OURS_FLEET_HOME = previousHome;
+    }
+    const texts = client.calls.filter(call => call.name === 'sendMessage')
+      .map(call => String(call.args?.text));
+    expect(texts.some(text => text.includes('Task deleted'))).toBe(false);
+  });
+
   it('completes Messenger done without settlement when close_on_done is false', async () => {
     const fleet = fakeFleet();
     const fleetHome = mkdtempSync(join(tmpdir(), 'ours-owner-task-no-close-'));
@@ -932,7 +1568,7 @@ describe('OwnerChannel deterministic command dispatch', () => {
     const previousHome = process.env.OURS_FLEET_HOME;
     process.env.OURS_FLEET_HOME = fleetHome;
     const configPath = join(fleetHome, 'fleet.yaml');
-    writeFileSync(configPath, 'tasks:\n  close_room_on_done: false\n');
+    writeV2Fixture(configPath, 'tasks:\n  close_room_on_done: false\n');
     const task = createTask({
       title: 'Owner done without close', origin: { type: 'owner_channel' }, start: true,
       room_id: '01hzyk8m0000000000000000ae',
@@ -962,6 +1598,7 @@ describe('OwnerChannel deterministic command dispatch', () => {
     dirs.push(fleetHome);
     const previousHome = process.env.OURS_FLEET_HOME;
     process.env.OURS_FLEET_HOME = fleetHome;
+    writeV2Fixture(join(fleetHome, 'fleet.yaml'), {});
     const task = createTask({
       title: 'Owner cancel', origin: { type: 'owner_channel' }, start: false,
       room_id: '01hzyk8m0000000000000000ad',
@@ -1327,13 +1964,6 @@ describe('OwnerChannel notice presentation', () => {
     expect(reply).toContain('Live updates are OFF');
     expect(reply).toContain('fleet.yaml baseline: off');
     expect(reply).not.toContain('changed by /comments');
-  });
-
-  it('reports the setting as inert on a non-ACP backend', async () => {
-    const { channel, client } = liveSetup({ interrupt: false, backend: 'tmux' });
-    client.batches.push([ownerMessage(1, 'wire-tmux', '/comments status')]);
-    await channel.drain();
-    expect(lastReply(client)).toContain('no effect here');
   });
 
   it('pins commentary to the initiating owner when the latest route changes mid-turn', async () => {

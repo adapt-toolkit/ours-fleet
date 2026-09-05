@@ -27,7 +27,7 @@ const FIELDS: Record<NodeKind, Array<{ key: string; label: string; hint?: string
   agent: [
     { key: 'mission', label: 'Mission', hint: 'One sentence about this agent\'s job.', long: true },
     { key: 'harness', label: 'Harness', hint: 'claude-code (default) or codex' },
-    { key: 'session', label: 'Session', hint: 'tmux (default) or acp' },
+    { key: 'session', label: 'Session', hint: 'acp' },
     { key: 'model', label: 'Model', hint: 'Leave blank to inherit the fleet default.' },
     { key: 'identity', label: 'Identity', hint: 'Defaults to the agent name.' },
     { key: 'cwd', label: 'Working directory' },

@@ -26,13 +26,13 @@ async function testServer(overrides: Record<string, unknown> = {}) {
 function services() {
   const role = {
     id: 'Alpha', lifetime: 'permanent', configured: true, stateHealth: 'present',
-    configuredBackend: 'tmux', detectedBackend: 'tmux',
+    configuredBackend: 'acp', detectedBackend: 'acp',
     compatibility: { compatible: true }, problems: [],
   };
   const status = {
     roleId: 'Alpha', observedAt: new Date().toISOString(), overall: 'ready',
     supervisor: { backend: 'none', liveness: 'running', detail: 'running' },
-    session: { backend: 'tmux', reachability: 'online', readiness: 'idle', evidence: 'inferred' },
+    session: { backend: 'acp', reachability: 'online', readiness: 'idle', evidence: 'inferred' },
     restart: { circuit: 'closed', consecutiveImmediateFailures: 0, nextDelayMs: 0 },
     monitor: { mode: 'unknown', health: 'unknown', stale: true },
     isolation: { degraded: false }, problems: [],
@@ -45,8 +45,8 @@ function services() {
     repository: { async get() { return role; } },
     async session() {
       return {
-        async describe() { return { backend: 'tmux', protocolVersion: 1, features: [] }; },
-        async snapshot() { return { backend: 'tmux', alive: true, readiness: 'idle' }; },
+        async describe() { return { backend: 'acp', protocolVersion: 1, features: [] }; },
+        async snapshot() { return { backend: 'acp', alive: true, readiness: 'idle' }; },
         async recentOutput() { return { events: [], text: 'safe', truncated: false }; },
         async sendText() {
           return {
@@ -128,6 +128,66 @@ describe('secure local web host', () => {
     expect(taskRooms.moveTask).toHaveBeenCalledWith(expect.objectContaining({ taskId: 'task-id', list: 'default' }));
     await server.close();
   });
+  it('deletes tasks in any state with exact confirmation, bounded settlement, and mutation auth', async () => {
+    const taskRooms = {
+      listTasks: vi.fn(() => []),
+      requestTaskDeletion: vi.fn(async () => ({ status: 'accepted', task: { task_id: 'task-id' } })),
+      launchTaskDeletionWorker: vi.fn(async () => ({ deleted: true, pending: false })),
+    };
+    const { server, cookie, csrf } = await authenticated({ taskRooms });
+    const readHeaders = { host: boundary.host, cookie };
+    const writeHeaders = { ...readHeaders, origin: boundary.origin, 'x-csrf-token': csrf };
+
+    // Confirmation is validated before existence or idempotency.
+    const mismatch = await server.app.inject({
+      method: 'DELETE', url: '/api/v1/tasks/task-id?confirm=other-id', headers: writeHeaders });
+    expect(mismatch.statusCode).toBe(400);
+    const missingConfirm = await server.app.inject({
+      method: 'DELETE', url: '/api/v1/tasks/task-id', headers: writeHeaders });
+    expect(missingConfirm.statusCode).toBe(400);
+    expect(taskRooms.requestTaskDeletion).not.toHaveBeenCalled();
+
+    // Mutation auth boundary: no CSRF token → rejected.
+    const noCsrf = await server.app.inject({
+      method: 'DELETE', url: '/api/v1/tasks/task-id?confirm=task-id', headers: readHeaders });
+    expect(noCsrf.statusCode).toBe(403);
+    expect(taskRooms.requestTaskDeletion).not.toHaveBeenCalled();
+
+    // Settled within the bounded wait → 200, physical deletion reported.
+    const settled = await server.app.inject({
+      method: 'DELETE', url: '/api/v1/tasks/task-id?confirm=task-id', headers: writeHeaders });
+    expect(settled.statusCode).toBe(200);
+    expect(settled.json()).toEqual({ task_id: 'task-id', deleted: true });
+
+    // Still settling (slow worker/outage) → 202 pending with recovery action, never success.
+    taskRooms.launchTaskDeletionWorker.mockResolvedValueOnce({
+      deleted: false, pending: true, error: 'Cowork management socket is not reachable' });
+    const pending = await server.app.inject({
+      method: 'DELETE', url: '/api/v1/tasks/task-id?confirm=task-id', headers: writeHeaders });
+    expect(pending.statusCode).toBe(202);
+    expect(pending.json()).toMatchObject({
+      task_id: 'task-id', accepted: true, deletion: 'pending',
+      error: 'Cowork management socket is not reachable' });
+    expect(pending.json().recovery).toContain('DELETE /api/v1/tasks/task-id?confirm=task-id');
+
+    // Concurrent settlement already removed the record → idempotent 200.
+    taskRooms.requestTaskDeletion.mockResolvedValueOnce({ status: 'already_absent' });
+    const absent = await server.app.inject({
+      method: 'DELETE', url: '/api/v1/tasks/task-id?confirm=task-id', headers: writeHeaders });
+    expect(absent.statusCode).toBe(200);
+    expect(absent.json()).toEqual({ task_id: 'task-id', deleted: false, already_absent: true });
+
+    // includeDeleting is opt-in, validated, and authenticated.
+    const badFilter = await server.app.inject({
+      method: 'GET', url: '/api/v1/tasks?includeDeleting=maybe', headers: readHeaders });
+    expect(badFilter.statusCode).toBe(400);
+    const withDeleting = await server.app.inject({
+      method: 'GET', url: '/api/v1/tasks?includeDeleting=true', headers: readHeaders });
+    expect(withDeleting.statusCode).toBe(200);
+    expect(taskRooms.listTasks).toHaveBeenCalledWith(expect.objectContaining({ includeDeleting: true }));
+    await server.close();
+  });
+
   it('does not bridge browser device trust into owner-channel authorization management', async () => {
     const { server, cookie } = await authenticated();
     const response = await server.app.inject({
@@ -367,7 +427,7 @@ describe('secure local web host', () => {
 describe('watchdog read endpoints', () => {
   const WATCHDOG: ResolvedWatchdog = {
     name: 'nightwatch', coordinator: 'FleetCoordinator', enabled: true,
-    intervalMs: 600_000, watch: ['Alice'], harness: 'claude-code', session: 'tmux',
+    intervalMs: 600_000, watch: ['Alice'], harness: 'claude-code', session: 'acp',
     identity: 'Watchdog-nightwatch', timeoutMs: 300_000, keepReports: 50,
     alertCooldownMs: 3_600_000, sourceFile: 'fleet.yaml',
   };

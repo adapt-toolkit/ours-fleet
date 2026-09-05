@@ -1,6 +1,6 @@
 ---
 name: spawn-ours-agent
-description: Spawn and configure an ours-fleet agent from Claude Code, using a permanent or temporary lifetime and a tmux or ACP session. Use when the user says "spawn ours agent", "spawn an agent", "create a fleet agent", "start a background agent", or asks for a separate supervised agent.
+description: Spawn and configure an ours-fleet agent from Claude Code, using a permanent or temporary lifetime and an ACP session. Use when the user says "spawn ours agent", "spawn an agent", "create a fleet agent", "start a background agent", or asks for a separate supervised agent.
 ---
 
 # Spawn an ours-fleet agent
@@ -16,7 +16,7 @@ ours-fleet doctor
 ```
 
 `ours-fleet docs` from the INSTALLED CLI is authoritative for supported
-harnesses, session backends, permissions, and flags. This skill ships with a
+harnesses, structured sessions, permissions, and flags. This skill ships with a
 plugin and the CLI is upgraded separately, so where the two differ the installed
 reference wins. Stop at a failed required doctor check.
 
@@ -124,9 +124,7 @@ Permanent, unattended (announce it to yourself if you are its coordinator):
 
 ```sh
 ours-fleet spawn <Name> \
-  --harness claude-code --session <tmux|acp> \
-  --mission "<one-line mission>" \
-  --bio-file /tmp/spawn-bio.md --persona-file /tmp/spawn-persona.md \
+  --brain <BrainId> --role <RoleId> \
   --approval allow --filesystem workspace --unattended deny \
   --isolation-file /tmp/spawn-isolation.yaml \
   [--cwd <dir>] [--coordinator <YourRoleName>]
@@ -136,23 +134,19 @@ Permanent, attended — a human will answer its prompts:
 
 ```sh
 ours-fleet spawn <Name> \
-  --harness claude-code --session <tmux|acp> \
-  --mission "<one-line mission>" \
-  --bio-file /tmp/spawn-bio.md --persona-file /tmp/spawn-persona.md \
+  --brain <BrainId> --role <RoleId> \
   --approval ask --filesystem workspace --unattended wait
 ```
 
-Temporary — add `--temp`; it supports both session backends:
+Temporary — add `--temp`; it uses the same structured session interface:
 
 ```sh
 ours-fleet spawn --temp <Name> \
-  --harness claude-code --session <tmux|acp> \
-  --mission "<one-line mission>" \
-  --bio-file /tmp/spawn-bio.md --persona-file /tmp/spawn-persona.md \
+  --brain <BrainId> --role <RoleId> \
   --approval allow --filesystem workspace --unattended deny
 ```
 
-Pass model, permission, session, and coordinator choices exactly as approved.
+Pass Brain, Role, permission, and coordinator choices exactly as approved.
 Do not persist secrets in fleet YAML.
 
 ## 8. Verify
@@ -169,8 +163,8 @@ settings it translated to; the floor line lists what the role actually grants,
 or names what is missing. A failure there means the role will silently do less
 than its briefing says — fix the permissions rather than starting it.
 
-For ACP, `status` must report `backend: acp`, `alive: true`, and a running/idle
-readiness. For tmux, the pane is authoritative. Confirm the role loaded its
+`status` must report `backend: acp`, `alive: true`, and a running/idle
+readiness. Confirm the role loaded its
 briefing and reached identity binding. Never answer a permission prompt beyond
 the scope already approved by the user.
 

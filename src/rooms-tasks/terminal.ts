@@ -5,15 +5,16 @@ import { stateRoot } from '../paths.js';
 import { deleteManagedRoom, type RoomCloseDeps } from './close.js';
 import type { CoworkAdapter } from './cowork-adapter.js';
 import {
-  beginTaskTerminalIntent, finishTaskTerminalIntent, getTask,
+  assertNoPendingDeletion, beginTaskTerminalIntent, finishTaskTerminalIntent, getTask,
   setTaskTerminalIntentError,
 } from './task-state.js';
 import { getRoomRecord } from './room-state.js';
 import type { TaskOutcome, TaskRecord, TaskTerminalIntent } from './types.js';
 
-const TASK_OPERATION_LOCK_STALE_MS = 10 * 60_000;
+export const TASK_OPERATION_LOCK_STALE_MS = 10 * 60_000;
 
-function taskOperationLockPath(taskId: string): string {
+/** Common per-task operation lock serializing terminal, deletion, and recovery acceptance. */
+export function taskOperationLockPath(taskId: string): string {
   return join(stateRoot(), 'locks', 'task-terminal', encodeURIComponent(taskId));
 }
 
@@ -50,6 +51,9 @@ export function settleTaskTerminalIntent(input: {
 }): Promise<TaskRecord> {
   return withFileLock(taskOperationLockPath(input.taskId), async () => {
     const current = getTask(input.taskId);
+    // Deletion supersedes a pending terminal intent: fail boundedly before any
+    // room side effect so the deletion worker owns all remaining cleanup.
+    assertNoPendingDeletion(current);
     const intent = current.terminal_intent;
     if (!intent) throw new Error(`task ${input.taskId} has no accepted terminal intent`);
     if (intent.status === 'settled') return current;
@@ -67,11 +71,9 @@ export function settleTaskTerminalIntent(input: {
       }
       return finishTaskTerminalIntent(input.taskId);
     } catch (error) {
-      setTaskTerminalIntentError(
-        input.taskId,
-        errorText(error),
-        `Retry 'ours-fleet task recover ${input.taskId}'.`,
-      );
+      setTaskTerminalIntentError(input.taskId, errorText(error), intent.kind === 'cancelled'
+        ? `Retry 'ours-fleet task cancel ${input.taskId} ${input.taskId}'.`
+        : `Retry 'ours-fleet task done ${input.taskId}'.`);
       throw error;
     }
   }, {}, TASK_OPERATION_LOCK_STALE_MS);

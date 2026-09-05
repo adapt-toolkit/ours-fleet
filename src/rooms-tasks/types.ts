@@ -6,6 +6,8 @@
  * Fleet stores only IDs, CIDs, orchestration state, and saga cursors.
  */
 
+import type { AgentLaunchConfiguration } from '../lifecycle-summary.js';
+
 // ── Task ────────────────────────────────────────────────────────────────
 
 export type TaskState =
@@ -62,6 +64,51 @@ export interface TaskTerminalIntent {
   first_recovery_hint?: string;
 }
 
+/** Origin evidence for an accepted deletion; retained until the record is unlinked. */
+export type TaskDeletionActor =
+  | { kind: 'local_control'; surface: 'cli' | 'web' }
+  | { kind: 'authenticated_owner'; surface: 'messenger'; cid: string };
+
+export type TaskDeletionMemberPhase =
+  | 'pending'
+  | 'stop_requested'
+  | 'liveness_absent'
+  | 'archive_secured'
+  | 'identity_absent';
+
+/**
+ * Durable retirement cursor for a managed member when no room orchestration
+ * record exists to carry the equivalent seat cursor.
+ */
+export interface TaskDeletionMemberCursor {
+  name: string;
+  identity_cid: string;
+  phase: TaskDeletionMemberPhase;
+  launch_id?: string;
+  archive_path?: string;
+  updated_at: string;
+}
+
+/**
+ * First-wins durable deletion intent. There is no settled status: settlement
+ * ends by unlinking the task record, so physical absence is the completion
+ * evidence. While pending, the task is hidden from normal operation and every
+ * lifecycle mutation or room publication is rejected.
+ */
+export interface TaskDeletionIntent {
+  status: 'pending';
+  accepted_at: string;
+  actor: TaskDeletionActor;
+  room_id?: string;
+  /** Snapshot of managed members at acceptance; the missing-room retirement evidence. */
+  members: TaskDeletionMemberCursor[];
+  error?: string;
+  error_at?: string;
+  recovery_hint?: string;
+  first_failure?: string;
+  first_recovery_hint?: string;
+}
+
 export interface TaskRecord {
   task_id: string;
   /** Stable organizational list identifier. Missing legacy values mean `default`. */
@@ -74,6 +121,14 @@ export interface TaskRecord {
   state: TaskState;
   blocked?: TaskBlocked;
   template?: TaskTemplateRef;
+  execution_plan?: {
+    schema_version: 1;
+    snapshot: TemplateSnapshot;
+    room_policy?: RoomLaunchPolicy;
+    overrides: Record<string, unknown>;
+    overrides_hash: string;
+    plan_hash: string;
+  };
   no_room?: boolean;
   room_id?: string;
   room_identity_cid?: string;
@@ -85,6 +140,7 @@ export interface TaskRecord {
   ended_at?: string;
   outcome?: TaskOutcome;
   terminal_intent?: TaskTerminalIntent;
+  deletion?: TaskDeletionIntent;
 }
 
 export interface TaskListRecord {
@@ -119,6 +175,7 @@ export interface SagaCursor {
 
 export type ProvisioningDetail =
   | 'waiting_cowork'
+  | 'waiting_owner_authorization'
   | 'waiting_owner_invite'
   | 'owner_cid_mismatch'
   | 'member_failed'
@@ -143,6 +200,16 @@ export interface RoomMemberLaunchState {
   /** Expected authenticated proxy caller while adopting a post-spawn crash. */
   caller_role?: string;
   mission_sha256?: string;
+  /** Redacted, deterministic effective Agent launch definition retained for retry inspection. */
+  agent_definition?: Record<string, unknown>;
+  agent_fingerprint?: string;
+  agent_template?: string;
+  agent_template_hash?: string;
+  /**
+   * Operator-facing launch configuration captured from the exact resolved
+   * launch state; the single source for later Task/Room lifecycle reports.
+   */
+  presentation?: AgentLaunchConfiguration;
   launch_id?: string;
   updated_at: string;
   error?: string;
@@ -209,6 +276,8 @@ export interface RoomOrchestrationRecord {
   goal?: string;
   task_id?: string;
   template_snapshot?: TemplateSnapshot;
+  /** Resolved once at launch; legacy absence means non-anonymous. */
+  room_policy?: RoomLaunchPolicy;
   saga: SagaCursor;
   provisioning_detail?: ProvisioningDetail;
   owner_seat_cid?: string;
@@ -229,20 +298,8 @@ export interface TemplateMemberSlot {
   slot: string;
   role: string;
   count: number;
-  role_ref: string;
-  overrides?: TemplateRoleOverrides;
-}
-
-export interface TemplateRoleOverrides {
-  harness?: string;
-  model?: string;
-  model_chain?: string[];
-  permissions?: Record<string, unknown>;
-  isolation?: Record<string, unknown>;
-  cwd?: string;
-  env?: Record<string, string>;
-  persona?: string;
-  mission?: string;
+  /** Stable reference to an inert Agent Template, never a persistent Agent. */
+  agent_template: string;
 }
 
 export interface TemplateRoomConfig {
@@ -250,18 +307,49 @@ export interface TemplateRoomConfig {
   anonymous?: boolean;
 }
 
+export interface RoomLaunchPolicy {
+  anonymous: boolean;
+}
+
+export const LEGACY_ROOM_LAUNCH_POLICY: Readonly<RoomLaunchPolicy> = Object.freeze({
+  anonymous: false,
+});
+
+/** Validate durable policy before it can influence room creation or recovery. */
+export function storedRoomLaunchPolicy(value: RoomLaunchPolicy | undefined): RoomLaunchPolicy {
+  if (value === undefined) return { ...LEGACY_ROOM_LAUNCH_POLICY };
+  if (typeof value.anonymous !== 'boolean')
+    throw new Error('invalid durable Room launch policy; anonymous must be a boolean');
+  return { ...value };
+}
+
 export interface TemplateDefinition {
   name: string;
   version: number;
   description: string;
-  builtin?: boolean;
+  /** Authoring provenance only; excluded from snapshots and semantic hashes. */
+  sourceFile?: string;
   room?: TemplateRoomConfig;
   contract?: string;
   members: TemplateMemberSlot[];
 }
 
-export interface TemplateSnapshot extends TemplateDefinition {
+export interface TemplateSnapshotMember extends TemplateMemberSlot {
+  /** Source of the effective temporary-loop policy, independent of its sealed value. */
+  loop_source?: 'agent-template' | 'cli' | 'omitted';
+  /** Secret-safe public projection; launch material lives in the sealed snapshot. */
+  agent_projection?: Record<string, unknown>;
+  agent_template_hash?: string;
+  /** Private sealed-snapshot lookup key; harmless provenance, not an identity. */
+  launch_definition_id?: string;
+  role_preset?: { id: string; hash: string };
+  brain_preset?: { id: string; hash: string };
+}
+
+export interface TemplateSnapshot extends Omit<TemplateDefinition, 'members'> {
+  members: TemplateSnapshotMember[];
   content_hash: string;
+  launch_snapshot_hash?: string;
 }
 
 // ── Config sections ─────────────────────────────────────────────────────
@@ -307,7 +395,6 @@ export const ROOMS_COWORK_KEYS = ['config'] as const;
 export const ROOMS_DEFAULTS_KEYS = ['template', 'attach_owner', 'close_when_task_done'] as const;
 export const TASKS_KEYS = ['default_room_template', 'create_mode', 'close_room_on_done', 'retain_completed_for'] as const;
 export const TEMPLATE_KEYS = ['version', 'description', 'room', 'contract', 'members', 'override_builtin'] as const;
-export const TEMPLATE_MEMBER_KEYS = ['slot', 'role', 'count', 'role_ref', 'overrides'] as const;
-export const TEMPLATE_OVERRIDE_KEYS = [
-  'harness', 'model', 'model_chain', 'permissions', 'isolation', 'cwd', 'env', 'persona', 'mission',
-] as const;
+export const TEMPLATE_ROOM_KEYS = ['quiet_membership', 'anonymous'] as const;
+/** `agent` is accepted only so validation can emit its actionable migration error. */
+export const TEMPLATE_MEMBER_KEYS = ['slot', 'role', 'count', 'agent_template', 'agent'] as const;

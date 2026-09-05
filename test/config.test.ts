@@ -4,6 +4,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { loadConfig, findRole, validateMonitorConfig, ConfigError } from '../src/config.js';
 import { runningLabel } from '../src/provenance.js';
+import { writeV2Fixture } from './v2-fixture.js';
 
 let dir: string;
 beforeEach(() => {
@@ -15,7 +16,10 @@ afterEach(() => {
   rmSync(dir, { recursive: true, force: true });
 });
 
-const base = (s: string) => writeFileSync(join(dir, 'fleet.yaml'), s);
+const base = (s: string) => writeV2Fixture(join(dir, 'fleet.yaml'), s);
+const rawBase = (s: string) => writeFileSync(join(dir, 'fleet.yaml'), s, { mode: 0o600 });
+const rawAgent = (name: string, s: string) =>
+  writeFileSync(join(dir, 'fleet', 'agents', `${name}.yaml`), s, { mode: 0o600 });
 const dropin = (name: string, s: string) => {
   mkdirSync(join(dir, 'fleet.d'), { recursive: true });
   writeFileSync(join(dir, 'fleet.d', name), s);
@@ -47,8 +51,8 @@ describe('loadConfig', () => {
         max_request_bytes: 20 * 1024 * 1024, retention_ms: 24 * 60 * 60 * 1_000,
       },
     });
-    base('roles:\n  A:\n    owner_channel: { identity: A-owner, owners: [cid] }\n');
-    expect(() => loadConfig()).toThrow(/requires session: acp/);
+    base('roles:\n  A:\n    session: tmux\n');
+    expect(() => loadConfig()).toThrow(/tmux is no longer supported.*session: acp/);
   });
 
   it('requires an exact managed-agent CID distinct from owner authority', () => {
@@ -170,17 +174,18 @@ describe('loadConfig', () => {
   });
 
   it('always rejects duplicate mapping keys with a source position', () => {
-    base('roles:\n  A:\n    model: first\n    model: second\n');
+    rawBase('api_version: ours.network/fleet/v2\nvars:\n  model: first\n  model: second\n');
     expect(() => loadConfig()).toThrow(/fleet\.yaml:.*Map keys must be unique.*line 4/i);
   });
 
   it.each([
-    ['anchor and alias', 'roles:\n  A: &shared {}\n  B: *shared\n', ['anchor', 'alias']],
-    ['explicit tag', 'roles:\n  A:\n    mission: !!str hello\n', ['explicit-tag']],
-    ['non-scalar key', 'vars:\n  ? [A]\n  : value\nroles: {}\n', ['non-scalar-key']],
-    ['multiple documents', 'roles:\n  A: {}\n---\nroles:\n  B: {}\n', ['multiple-documents']],
+    ['anchor and alias', 'api_version: ours.network/fleet/v2\nvars: &shared { value: yes }\nextra: *shared\n', ['anchor', 'alias']],
+    ['explicit tag', 'api_version: ours.network/fleet/v2\nvars:\n  value: !!str hello\n', ['explicit-tag']],
+    ['non-scalar key', 'api_version: ours.network/fleet/v2\nvars:\n  ? [A]\n  : value\n', ['non-scalar-key']],
+    ['multiple documents', 'api_version: ours.network/fleet/v2\n---\nignored: true\n', ['multiple-documents']],
   ])('warns for %s in compat and rejects it in strict mode', (_name, yaml, kinds) => {
-    base(yaml);
+    base('roles: {}\n'); // create the required trusted split root
+    rawBase(yaml);
     expect(loadConfig(undefined, { yamlMode: 'compat' }).diagnostics.map(d => d.kind))
       .toEqual(expect.arrayContaining(kinds));
     expect(() => loadConfig(undefined, { yamlMode: 'strict' })).toThrow(/non-plain YAML/);
@@ -259,18 +264,16 @@ describe('loadConfig', () => {
     expect(findRole(cfg, 'ExplicitDefault').model_chain).toBeUndefined();
   });
 
-  it('merges fleet.yaml with fleet.d drop-ins', () => {
+  it('rejects legacy fleet.d instead of merging it with v2 configuration', () => {
     base('roles:\n  A:\n    mission: base role\n');
     dropin('b.yaml', 'roles:\n  B:\n    mission: spawned\n');
-    const cfg = loadConfig();
-    expect(cfg.roles.map(r => r.name).sort()).toEqual(['A', 'B']);
-    expect(findRole(cfg, 'B').sourceFile).toContain('fleet.d/b.yaml');
+    expect(() => loadConfig()).toThrow(/legacy fleet\.d configuration is unsupported/);
   });
 
-  it('errors on duplicate role naming both files', () => {
+  it('rejects legacy fleet.d before considering duplicate role names', () => {
     base('roles:\n  A: {}\n');
     dropin('a.yaml', 'roles:\n  A: {}\n');
-    expect(() => loadConfig()).toThrowError(/A.*defined in both.*fleet\.yaml.*a\.yaml/s);
+    expect(() => loadConfig()).toThrowError(/legacy fleet\.d configuration is unsupported/);
   });
 
   it('substitutes ${vars} recursively', () => {
@@ -281,24 +284,46 @@ describe('loadConfig', () => {
   });
 
   it('applies defaults cascade and identity fallback', () => {
-    base('defaults:\n  harness: claude-code\n  max_tokens: 500000\nroles:\n  A: {}\n  B:\n    harness: other\n    max_tokens: 100\n    identity: Bee\n');
+    base('defaults:\n  harness: claude-code\n  max_tokens: 500000\nroles:\n  A: {}\n  B:\n    harness: codex\n    max_tokens: 100\n    identity: Bee\n');
     const cfg = loadConfig();
     const a = findRole(cfg, 'A');
     expect(a.harness).toBe('claude-code');
     expect(a.max_tokens).toBe(500000);
     expect(a.identity).toBe('A');
     const b = findRole(cfg, 'B');
-    expect(b.harness).toBe('other');
+    expect(b.harness).toBe('codex');
     expect(b.max_tokens).toBe(100);
     expect(b.identity).toBe('Bee');
   });
 
-  it('selects the session backend with one setting and defaults to tmux', () => {
-    base('defaults:\n  session: acp\nroles:\n  A: {}\n  B:\n    session: tmux\n');
+  it('defaults to ACP and rejects the legacy tmux backend precisely', () => {
+    base('defaults:\n  session: acp\nroles:\n  A: {}\n');
     expect(findRole(loadConfig(), 'A').session).toBe('acp');
-    expect(findRole(loadConfig(), 'B').session).toBe('tmux');
     base('roles:\n  C: {}\n');
-    expect(findRole(loadConfig(), 'C').session).toBe('tmux');
+    expect(findRole(loadConfig(), 'C').session).toBe('acp');
+    base('roles:\n  Legacy:\n    session: tmux\n');
+    expect(() => loadConfig()).toThrow(/tmux is no longer supported.*session: acp/);
+  });
+
+  it('accepts native Codex app-server sessions and their exact command override', () => {
+    base([
+      'roles:',
+      '  Native:',
+      '    harness: codex',
+      '    session: codex-app-server',
+      '    session_options:',
+      '      codex_app_server:',
+      '        command: [codex, app-server]',
+      '',
+    ].join('\n'));
+    const native = findRole(loadConfig(), 'Native');
+    expect(native.session).toBe('codex-app-server');
+    expect(native.session_options?.codex_app_server?.command).toEqual(['codex', 'app-server']);
+  });
+
+  it('rejects the Codex-native backend for another harness', () => {
+    base('roles:\n  Wrong:\n    harness: claude-code\n    session: codex-app-server\n');
+    expect(() => loadConfig()).toThrow(/codex-app-server requires harness: codex/);
   });
 
   it('merges common permission intent and ACP command settings', () => {
@@ -331,7 +356,7 @@ describe('loadConfig', () => {
 
   it('rejects invalid session and common permission values', () => {
     base('roles:\n  A:\n    session: screen\n');
-    expect(() => loadConfig()).toThrowError(/session.*tmux, acp/);
+    expect(() => loadConfig()).toThrowError(/session.*acp/);
     base('roles:\n  A:\n    permissions:\n      approval: maybe\n');
     expect(() => loadConfig()).toThrowError(/permissions\.approval/);
   });
@@ -363,9 +388,10 @@ describe('loadConfig', () => {
     expect(findRole(cfg, 'B').harness_options).toEqual({ launcher: 'auto', sandbox: 'read-only', search: true });
   });
 
-  it('rejects a non-map defaults.harness_options', () => {
-    base('defaults:\n  harness_options: nope\nroles:\n  A: {}\n');
-    expect(() => loadConfig()).toThrowError(/defaults\.harness_options must be a map/);
+  it('rejects non-map harness_options in an Agent Brain', () => {
+    base('roles:\n  A: {}\n');
+    rawAgent('A', 'role: { inline: {} }\nbrain: { inline: { harness: codex, harness_options: nope } }\n');
+    expect(() => loadConfig()).toThrowError(/harness_options.*map/);
   });
 
   it('defaults harness to claude-code with no defaults section', () => {
@@ -375,11 +401,12 @@ describe('loadConfig', () => {
 
   it('rejects invalid role names', () => {
     base('roles:\n  "foo bar": {}\n');
-    expect(() => loadConfig()).toThrowError(/invalid role name/);
+    expect(() => loadConfig()).toThrowError(/invalid agent id/);
   });
 
   it('rejects unknown role keys with the allowed list', () => {
-    base('roles:\n  A:\n    persnoa: oops\n');
+    base('roles:\n  A: {}\n');
+    rawAgent('A', 'role: { inline: { persnoa: oops } }\nbrain: { inline: { harness: codex } }\n');
     expect(() => loadConfig()).toThrowError(/persnoa.*allowed:.*persona/s);
   });
 
@@ -391,15 +418,16 @@ describe('loadConfig', () => {
   });
 
   it('still rejects an unknown role key', () => {
-    base('roles:\n  A:\n    modell: oops\n');
+    base('roles:\n  A: {}\n');
+    rawAgent('A', 'role: { inline: {} }\nbrain: { inline: { harness: codex, modell: oops } }\n');
     expect(() => loadConfig()).toThrowError(/unknown key/);
   });
 
-  it('a role without model inherits defaults.model', () => {
+  it('materializes a legacy default model into Agents without retaining it in the manifest', () => {
     base('defaults:\n  model: claude-fable-5\nroles:\n  A: {}\n  B:\n    model: claude-opus-4-8\n');
     const cfg = loadConfig();
     expect(findRole(cfg, 'A').model).toBe('claude-fable-5');
-    expect(cfg.defaults.model).toBe('claude-fable-5');
+    expect(cfg.defaults.model).toBeUndefined();
   });
 
   it('a per-role model overrides defaults.model', () => {
@@ -435,10 +463,10 @@ roles:
     expect(findRole(loadConfig(), 'A').model).toBeUndefined();
   });
 
-  it('rejects drop-ins defining more than roles', () => {
+  it('rejects every legacy fleet.d file regardless of its contents', () => {
     base('roles: {}\n');
     dropin('bad.yaml', 'vars:\n  x: 1\nroles: {}\n');
-    expect(() => loadConfig()).toThrowError(/may only define roles/);
+    expect(() => loadConfig()).toThrowError(/legacy fleet\.d configuration is unsupported/);
   });
 
   it('throws for an explicit missing config path', () => {
@@ -639,7 +667,7 @@ describe('loadConfig monitor', () => {
 
 describe('isolation forbidden-path errors surface at config time', () => {
   it('a role asking for a forbidden mount fails `config` by role and path', () => {
-    writeFileSync(join(dir, 'fleet.yaml'),
+    base(
       'roles:\n  Sec:\n    harness: claude-code\n'
       + '    isolation:\n      fs:\n        write:\n          - ' + join(dir, '.ssh') + '\n');
     expect(() => loadConfig()).toThrowError(/role 'Sec'.*refusing to mount/s);
@@ -647,14 +675,14 @@ describe('isolation forbidden-path errors surface at config time', () => {
   });
 
   it('a role with an allowed mount still loads', () => {
-    writeFileSync(join(dir, 'fleet.yaml'),
+    base(
       'roles:\n  Ok:\n    harness: claude-code\n'
       + '    isolation:\n      fs:\n        read:\n          - /opt/reference\n');
     expect(loadConfig().roles).toHaveLength(1);
   });
 
   it('a role with no isolation block is unaffected', () => {
-    writeFileSync(join(dir, 'fleet.yaml'), 'roles:\n  Plain:\n    harness: claude-code\n');
+    base('roles:\n  Plain:\n    harness: claude-code\n');
     expect(loadConfig().roles).toHaveLength(1);
   });
 });
@@ -736,7 +764,7 @@ describe('rooms-tasks split-config backward compat', () => {
     expect(cfg.tasks!.create_mode).toBe('start');
   });
 
-  it('loads room_templates from fleet.d drop-in', () => {
+  it('rejects legacy room_templates fleet.d drop-ins', () => {
     base('roles:\n  A: {}\n');
     dropin('templates.yaml', [
       'room_templates:',
@@ -750,21 +778,18 @@ describe('rooms-tasks split-config backward compat', () => {
       '        role_ref: A',
       '',
     ].join('\n'));
-    const cfg = loadConfig();
-    expect(cfg.roomTemplates).toBeDefined();
-    expect(cfg.roomTemplates!['my-team']).toBeDefined();
-    expect(cfg.roomTemplates!['my-team'].description).toBe('custom team');
+    expect(() => loadConfig()).toThrow(/legacy fleet\.d configuration is unsupported/);
   });
 
-  it('rejects rooms defined in multiple files', () => {
+  it('rejects legacy rooms fleet.d before cross-file merging', () => {
     const cid = 'a'.repeat(64);
     const roomsBlock = `rooms:\n  owner:\n    expected_cid: ${cid}\n    public_invite: inv\n  cowork:\n    config: /tmp/c.toml\n`;
     base(`roles:\n  A: {}\n${roomsBlock}`);
     dropin('rooms.yaml', roomsBlock);
-    expect(() => loadConfig()).toThrow(/rooms:.*defined in multiple files/);
+    expect(() => loadConfig()).toThrow(/legacy fleet\.d configuration is unsupported/);
   });
 
-  it('merges room_templates from multiple fleet.d files by name', () => {
+  it('rejects multiple legacy room_templates fleet.d files', () => {
     base('roles:\n  A: {}\n');
     dropin('a.yaml', [
       'room_templates:',
@@ -784,8 +809,6 @@ describe('rooms-tasks split-config backward compat', () => {
       '      - { slot: b, role: B, count: 1, role_ref: A }',
       '',
     ].join('\n'));
-    const cfg = loadConfig();
-    expect(cfg.roomTemplates!['alpha']).toBeDefined();
-    expect(cfg.roomTemplates!['beta']).toBeDefined();
+    expect(() => loadConfig()).toThrow(/legacy fleet\.d configuration is unsupported/);
   });
 });

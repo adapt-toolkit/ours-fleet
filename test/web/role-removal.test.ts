@@ -5,6 +5,10 @@ import { afterEach, describe, expect, it } from 'vitest';
 import { RoleRemovalService } from '../../src/application/role-removal-service.js';
 import { agentDir } from '../../src/paths.js';
 import { makeTempSupervisorLauncher, prepareTempSupervisor } from '../../src/temp-lifecycle.js';
+import { writeV2Fixture } from '../v2-fixture.js';
+import {
+  GENERATED_AGENT_SOURCE_MARKER, recordGeneratedAgentSource,
+} from '../../src/generated-agent-source.js';
 
 const previous = process.env.OURS_FLEET_HOME;
 afterEach(() => previous === undefined ? delete process.env.OURS_FLEET_HOME : process.env.OURS_FLEET_HOME = previous);
@@ -12,7 +16,7 @@ afterEach(() => previous === undefined ? delete process.env.OURS_FLEET_HOME : pr
 function fixture(roles: string): { root: string; calls: string[]; service: RoleRemovalService } {
   const root = mkdtempSync(join(tmpdir(), 'role-removal-'));
   process.env.OURS_FLEET_HOME = root;
-  writeFileSync(join(root, 'fleet.yaml'), `roles:\n${roles}`);
+  writeV2Fixture(join(root, 'fleet.yaml'), `roles:\n${roles}`);
   const calls: string[] = [];
   const backend: any = {
     id: 'test', async uninstall(name: string) { calls.push(name); return { removed: true, detail: 'removed' }; },
@@ -46,6 +50,20 @@ describe('safe web role removal', () => {
     expect(result.recoveryPath).toContain('-Worker');
     expect(existsSync(join(result.recoveryPath, 'state', 'WORKLOG.md'))).toBe(true);
     expect(existsSync(join(root, 'fleet.yaml'))).toBe(true);
+  });
+
+  it('archives deletion authority and source before removing a proven generated Agent document', async () => {
+    const { root, service } = fixture('  Worker: { harness: codex }\n');
+    const state = agentDir('Worker');
+    mkdirSync(state, { recursive: true });
+    const source = join(root, 'fleet', 'agents', 'Worker.yaml');
+    recordGeneratedAgentSource(state, join(root, 'fleet.yaml'), source);
+
+    const result = await service.removeWeb({ role: 'Worker', confirmation: 'Worker' });
+
+    expect(existsSync(source)).toBe(false);
+    expect(existsSync(join(result.recoveryPath, 'state', GENERATED_AGENT_SOURCE_MARKER))).toBe(true);
+    expect(existsSync(join(result.recoveryPath, 'Worker.yaml'))).toBe(true);
   });
 
   it('fails closed on case-fold collisions and cleans orphaned failed-start state', async () => {

@@ -4,10 +4,16 @@ import type { HarnessAdapter } from '../src/harness/types.js';
 
 export const fakeAdapter: HarnessAdapter = {
   id: 'fake',
+  agentSession: {
+    resolveBrain(brain) { return { model: brain.model, harnessOptions: brain.harnessOptions }; },
+    modelEnvironmentVariable() { return undefined; },
+    prepareLaunch(_role, prep) { return { argv: ['fakebin', '--fake-prep'], env: prep.env }; },
+    async start() { throw new Error('fake agent session must be injected by the test'); },
+  },
   supportsResume: true,
   async checkPrereqs() { return { ok: true, checks: [] }; },
   validateOptions() { return []; },
-  async prepareSession() { return { argv: ['--fake-prep'], env: { FAKE: '1' } }; },
+  async prepareSession() { return { env: { FAKE: '1' } }; },
   nativePermissionOverrides(options: unknown) {
     const mode = (options as { fake_mode?: string } | undefined)?.fake_mode;
     return mode == null ? {} : { fake_mode: mode };
@@ -23,9 +29,11 @@ export const fakeAdapter: HarnessAdapter = {
       ],
     };
   },
-  buildLaunch(role, mode, s, prep) {
-    return { argv: ['fakebin', ...prep.argv, mode === 'fresh' ? '--sid' : '--resume', s.sessionId, 'go'], env: prep.env };
-  },
+  effectivePermissionMode: role => ({
+    fleetMode: role.permissions?.approval === 'allow' ? 'allow'
+      : role.permissions?.approval === 'auto' ? 'auto' : 'ask',
+    nativeMode: 'fake',
+  }),
   vocabulary: {
     bindTool: 'choose_identity', createTool: 'create_identity',
     temporaryCreateTool: 'create_temporary_identity', setBioTool: 'set_bio',
@@ -57,6 +65,20 @@ describe('harness registry', () => {
 });
 
 describe('adapter permission-translation contract', () => {
+  it('refuses an adapter missing the unified Brain selection method', () => {
+    const agentSession = { ...fakeAdapter.agentSession } as Partial<typeof fakeAdapter.agentSession>;
+    delete agentSession.resolveBrain;
+    expect(() => registerAdapter({ ...fakeAdapter, id: 'brainless', agentSession } as unknown as HarnessAdapter))
+      .toThrow(/agentSession\.resolveBrain/);
+  });
+
+  it('refuses an adapter missing its model recovery channel declaration', () => {
+    const agentSession = { ...fakeAdapter.agentSession } as Partial<typeof fakeAdapter.agentSession>;
+    delete agentSession.modelEnvironmentVariable;
+    expect(() => registerAdapter({ ...fakeAdapter, id: 'model-channel-less', agentSession } as unknown as HarnessAdapter))
+      .toThrow(/agentSession\.modelEnvironmentVariable/);
+  });
+
   it('refuses to register an adapter that does not declare translatePermissions', () => {
     const { translatePermissions, ...silent } = fakeAdapter;
     expect(() => registerAdapter({ ...silent, id: 'silent' } as unknown as HarnessAdapter))
