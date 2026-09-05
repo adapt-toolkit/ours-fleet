@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { delimiter, join } from 'node:path';
 import { doctor as doctorImpl } from '../src/doctor.js';
@@ -70,6 +70,23 @@ const execWith = (table: Record<string, ExecResult>): Exec =>
   async (cmd, args) => table[[cmd, args[0] ?? ''].join(' ')] ?? { stdout: '', stderr: '', code: 0 };
 
 describe('doctor', () => {
+  it('reports actual ACP/native paths and an old role override as an unsupported mismatch', async () => {
+    const native = join(dir, 'codex');
+    const old = join(dir, 'old-codex');
+    for (const path of [native, old]) { writeFileSync(path, '#!/bin/sh\n'); chmodSync(path, 0o700); }
+    writeV2Fixture(join(dir, 'fleet.yaml'),
+      `roles:\n  Coder:\n    harness: codex\n    session: acp\n    env:\n      PATH: ${JSON.stringify(dir)}\n      CODEX_PATH: ${JSON.stringify(old)}\n    monitor: { enabled: false }\n`);
+    const exec: Exec = async cmd => ({ code: 0, stderr: '',
+      stdout: cmd === old ? 'codex-cli 0.145.0' : 'codex-cli 0.153.4' });
+    const rep = await doctor({}, exec, 'darwin');
+    const check = rep.checks.find(c => c.name === 'codex ACP runtime: Coder')!;
+    expect(check.ok).toBe(false);
+    expect(check.detail).toContain(old);
+    expect(check.detail).toContain('WARNING version mismatch: native 0.153.4, ACP 0.145.0');
+    expect(check.detail).toContain('CODEX_PATH');
+    expect(rep.checks.find(c => c.name === 'codex native: Coder')?.detail).toContain(native);
+  });
+
   it('warns when packaged Codex Brain model/effort pairs are absent from the local runtime catalog', async () => {
     const configPath = join(dir, 'catalog.yaml'); bootstrapPresets(configPath);
     const cache = join(dir, 'models.json');

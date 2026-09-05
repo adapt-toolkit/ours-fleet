@@ -13,6 +13,7 @@ import { harnessRuntimeDir } from '../isolation/policy.js';
 import {
   resolveBundledAcpAgent, type AcpAgentResolution,
 } from './acp-agent.js';
+import { VERIFIED_CODEX_ACP_VERSIONS, probeCodexRuntime, codexVersionAtLeast } from './codex-runtime.js';
 import { CodexAgentSessionAdapter } from './codex-session.js';
 import type { AcpSessionTransport } from './acp-session-transport.js';
 import type { CodexAppServerSessionTransport } from './codex-session.js';
@@ -40,7 +41,6 @@ const SANDBOX_MODES = ['read-only', 'workspace-write', 'danger-full-access'];
 /** Codex CLI's accepted `--ask-for-approval` values. */
 const APPROVAL_POLICIES = ['untrusted', 'on-request', 'never'];
 const NATIVE_CONFIG_ALLOWLIST = new Set(['model_reasoning_effort']);
-const BUNDLED_CODEX_ACP_VERSION = '1.1.7';
 const CODEX_ACP_PACKAGE = '@agentclientprotocol/codex-acp';
 const CODEX_PROXY_APPROVAL_ENV = 'OURS_FLEET_CODEX_APPROVAL';
 const CODEX_PROXY_SANDBOX_ENV = 'OURS_FLEET_CODEX_SANDBOX';
@@ -223,7 +223,7 @@ export function codexAcpLaunchForResolution(
   resolution: AcpAgentResolution,
 ): Pick<AcpLaunch, 'argv' | 'permissionMetadataSource'> {
   const permissionMetadataSource = resolution.bundled
-    && resolution.version === BUNDLED_CODEX_ACP_VERSION
+    && VERIFIED_CODEX_ACP_VERSIONS.has(resolution.version ?? '')
     && resolution.manifestPath !== undefined
     ? 'codex-acp' as const
     : undefined;
@@ -235,7 +235,7 @@ export function codexAcpLaunchForResolution(
 
 function canOverrideBundledAcpApproval(): boolean {
   const resolution = bundledCodexAcp();
-  return resolution.bundled && resolution.version === BUNDLED_CODEX_ACP_VERSION
+  return resolution.bundled && VERIFIED_CODEX_ACP_VERSIONS.has(resolution.version ?? '')
     && resolution.manifestPath !== undefined && compiledProxyModule() !== undefined;
 }
 
@@ -259,7 +259,7 @@ const shellQuote = (value: string): string => `'${value.replaceAll("'", "'\\''")
 function codexAcpEnvironment(role: ResolvedRole, dirs: RoleDirs): Record<string, string> {
   if (role.session !== 'acp' || role.session_options?.acp?.command != null) return {};
   const resolution = bundledCodexAcp();
-  if (!resolution.bundled || resolution.version !== BUNDLED_CODEX_ACP_VERSION
+  if (!resolution.bundled || !VERIFIED_CODEX_ACP_VERSIONS.has(resolution.version ?? '')
       || !resolution.manifestPath) return {};
   const runtimeDir = harnessRuntimeDir(dirs.stateDir, 'codex');
   mkdirSync(runtimeDir, { recursive: true });
@@ -279,7 +279,7 @@ function codexAcpEnvironment(role: ResolvedRole, dirs: RoleDirs): Record<string,
     [CODEX_PROXY_APPROVAL_ENV]: approvalPolicy(role) ?? 'on-request',
     [CODEX_PROXY_SANDBOX_ENV]: acpRuntimeSandbox(role),
     [CODEX_PROXY_MANIFEST_ENV]: resolution.manifestPath,
-    ...(process.env.CODEX_PATH ? { [CODEX_PROXY_REAL_PATH_ENV]: process.env.CODEX_PATH } : {}),
+    [CODEX_PROXY_REAL_PATH_ENV]: role.env?.CODEX_PATH ?? process.env.CODEX_PATH ?? '',
   };
 }
 
@@ -475,6 +475,21 @@ export function makeCodexAdapter(
       // Only a role that declares `isolation:` gets a sandbox, and only a
       // sandbox needs this directory to exist before entry.
       if (role.isolation) mkdirSync(harnessRuntimeDir(dirs.stateDir, 'codex'), { recursive: true });
+      if (role.session === 'acp' && role.session_options?.acp?.command == null) {
+        const resolution = bundledCodexAcp();
+        if (resolution.bundled && VERIFIED_CODEX_ACP_VERSIONS.has(resolution.version ?? '')) {
+          let runtime;
+          try { runtime = await probeCodexRuntime(resolution, { ...process.env, ...role.env }, realExec, dirs.runCwd); }
+          catch (error) {
+            throw new Error(`Codex ACP runtime check failed: ${(error as Error).message}; check CODEX_PATH or reinstall Fleet with optional dependencies`);
+          }
+          const minimum = role.model === 'gpt-6-astra' || resolution.version === '1.10.0'
+            ? '0.153.3' : '0.145.0';
+          if (!codexVersionAtLeast(runtime.version, minimum))
+            throw new Error(`${role.model ?? 'Codex ACP'} requires a newer Codex (>=${minimum}): ACP selects ${runtime.executable} (${runtime.version}); upgrade Fleet or set CODEX_PATH to a supported executable in the agent/service environment`);
+        }
+      }
+
       return {
         // OURS_BIND_IDENTITY is the connector's startup bind seed — see the note in
         // claude-code.ts's prepareSession. It belongs on EVERY harness that runs a

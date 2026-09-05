@@ -878,7 +878,7 @@ The ACP session measures silence from its last live reasoning, output, plan, or 
 update, excluding replay and retry/status chatter. It requires observable progress
 before detecting a stall. Repeated structured Codex response-stream retry errors
 can confirm a stall after one window; generic silence requires two windows (30
-minutes by default). Codex ACP 1.1.7 exposes no native-turn mapping, so strong retry
+minutes by default). Fleet’s Codex ACP transport exposes no native-turn mapping, so strong retry
 evidence is used only on the first fresh, unsteered managed turn. Later and resumed
 turns use the generic path. Assistant text and stderr never authenticate a retry.
 
@@ -1483,3 +1483,49 @@ Only sustained, high-confidence model entitlement/quota 429 evidence advances
 the chain. Generic rate limits, overload, authentication, policy, and unknown
 errors remain detection-only. Exhaustion holds the role down; fleet never edits
 human-owned YAML or selects a model outside the declared chain.
+
+
+### Codex runtime selection through ACP
+
+Fleet pins `@agentclientprotocol/codex-acp` to `1.10.0`, which depends on
+`@openai/codex ^0.153.3`. A normal installation includes this optional adapter
+and its platform-specific Codex binary. Updating the shell's `codex` alone does
+not update that bundled runtime.
+
+For Fleet's bundled ACP launch, selection is:
+
+1. The Agent's `env.CODEX_PATH`, when set.
+2. `CODEX_PATH` inherited by the agent's supervisor/service.
+3. The Codex npm dependency resolved relative to the bundled ACP adapter.
+
+Use an absolute executable path for `CODEX_PATH`, not a command with arguments.
+Fleet passes this choice through its app-server proxy, which retains Fleet's
+permission handling. An empty override selects the bundle. The native
+`codex-app-server` session and explicit `session_options.acp.command` remain
+separate launch paths; custom commands own their runtime selection and are
+reported as unknown by doctor.
+
+Run `ours-fleet doctor -c <fleet.yaml>` in the same environment as the agent
+service. For each configured Codex ACP Agent it reports the native executable
+and version, ACP adapter version, selected Codex entrypoint and underlying
+platform executable/version, and version/path differences. These are probes of
+the current configuration and environment, not an inspection of already-running
+processes. A custom adapter, broken override, or unsupported runtime is flagged.
+Fleet refuses a configured `gpt-6-astra` launch through an older-than-`0.153.3`
+runtime before starting the bundled ACP session. Model access still depends on
+the account and server catalog.
+
+For a persistent Agent, set `env.CODEX_PATH` in its Agent document. For temporary
+agents, set it in the Agent Template used to create them; existing temporary
+agents retain their sealed launch configuration. Alternatively, configure
+`CODEX_PATH` in both the persistent and temporary service environments (for
+systemd, the corresponding user-unit drop-ins). Newly launched temporary
+supervisors carry the spawning process’s CODEX_PATH through both systemd-run and
+launchctl, including an explicit empty value. The temporary Agent’s sealed env
+still takes precedence. A shell export does not change
+an existing service's environment, and `ours-fleet init` does not persist this
+variable. Verify the target executable with `--version`, re-run doctor using
+that environment, and restart only affected agents after applying the override.
+For temporary agents with a sealed stale override, have the task coordinator
+arrange replacement with the corrected template. Reinstall/upgrade Fleet with
+optional dependencies enabled to repair a missing or stale bundled runtime.

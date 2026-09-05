@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import {
   existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, renameSync, rmSync, writeFileSync,
 } from 'node:fs';
@@ -20,6 +20,7 @@ beforeEach(() => {
   process.env.OURS_FLEET_HOME = home;
 });
 afterEach(() => {
+  vi.unstubAllEnvs();
   delete process.env.OURS_FLEET_HOME;
   rmSync(home, { recursive: true, force: true });
 });
@@ -33,6 +34,26 @@ function temp(name: string): string {
 }
 
 describe('independent temporary supervisor ownership', () => {
+  it.each(['linux', 'darwin'] as const)('preserves CODEX_PATH exactly across the %s service boundary', async platform => {
+    for (const value of ['/fixture/native codex', '', undefined]) {
+      vi.stubEnv('CODEX_PATH', value);
+      const dir = temp('Runtime');
+      let argv: string[] = [];
+      let command = '';
+      await makeTempSupervisorLauncher({
+        platform, supervisor: platform === 'linux' ? 'systemd' : 'launchd',
+        exec: async (cmd, args) => {
+          command = cmd; argv = args;
+          return { stdout: '', stderr: '', code: 0 };
+        },
+      })('/fixture/fleet', ['_run-temp', 'Runtime'], dir);
+      expect(command).toBe(platform === 'linux' ? 'systemd-run' : 'launchctl');
+      const prefix = platform === 'linux' ? '--setenv=CODEX_PATH=' : 'CODEX_PATH=';
+      expect(argv.filter(arg => arg.startsWith(prefix)))
+        .toEqual(value === undefined ? [] : [prefix + value]);
+    }
+  });
+
   it('uses a collected transient systemd unit, outside the caller role unit', async () => {
     const dir = temp('Worker');
     const calls: Array<[string, string[]]> = [];

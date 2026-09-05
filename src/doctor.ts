@@ -23,6 +23,7 @@ import {
   analyzeInstalls, buildInfo, buildLabel, discoverInstalls, BIN_NAME,
 } from './provenance.js';
 import { readDaemonRecoveryStatus } from './daemon-recovery.js';
+import { probeCodexRuntime, codexVersionAtLeast, VERIFIED_CODEX_ACP_VERSIONS } from './harness/codex-runtime.js';
 import { codexModelCatalog } from './application/model-catalog.js';
 
 /** Which cgroup-v2 controllers are delegated to this user manager (advisory). */
@@ -572,6 +573,36 @@ export async function doctor(
         detail: `harness '${role.harness}' has no default ACP agent; set session_options.acp.command`,
       });
       continue;
+    }
+    if (role.harness === 'codex') {
+      const env = { ...process.env, ...role.env };
+      const cwd = role.cwd && existsSync(role.cwd) ? role.cwd : agentDir(role.name);
+      let native: Awaited<ReturnType<typeof probeCodexRuntime>> | undefined;
+      try {
+        native = await probeCodexRuntime({ argv: ['codex'], bundled: false },
+          { ...env, CODEX_PATH: 'codex' }, exec, cwd);
+        checks.push({ name: `codex native: ${role.name}`, ok: true,
+          detail: `${native.executable} (${native.version}); entry ${native.entry}` });
+      } catch (error) {
+        checks.push({ name: `codex native: ${role.name}`, ok: false, detail: (error as Error).message });
+      }
+      try {
+        if (configured != null)
+          throw new Error('Custom ACP command: actual Codex runtime unknown; inspect the command and its service environment (CODEX_PATH support is command-specific)');
+        const runtime = await probeCodexRuntime(bundled ?? { argv: [command], bundled: false }, env, exec, cwd);
+        const verified = bundled?.version != null && VERIFIED_CODEX_ACP_VERSIONS.has(bundled.version);
+        const minimum = role.model === 'gpt-6-astra' || bundled?.version === '1.10.0' ? '0.153.3' : '0.145.0';
+        const supported = verified && codexVersionAtLeast(runtime.version, minimum);
+        checks.push({ name: `codex ACP runtime: ${role.name}`, ok: supported,
+          detail: `${runtime.executable} (${runtime.version}); ${runtime.source}; entry ${runtime.entry}; adapter ${bundled?.version ?? 'unknown'}`
+            + (native && native.version !== runtime.version
+              ? `; WARNING version mismatch: native ${native.version}, ACP ${runtime.version}` : '')
+            + (native && native.executable !== runtime.executable ? '; native and ACP executable paths differ' : '')
+            + (!supported ? `; unsupported/unverified combination (minimum Codex ${minimum}); upgrade Fleet or set CODEX_PATH in the agent/service environment` : '') });
+      } catch (error) {
+        checks.push({ name: `codex ACP runtime: ${role.name}`, ok: false,
+          detail: `${(error as Error).message}; run doctor in the same environment as the persistent or temporary service` });
+      }
     }
     if (bundled?.bundled) {
       checks.push({
