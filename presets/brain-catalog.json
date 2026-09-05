@@ -1,7 +1,8 @@
 {
   "schema_version": 1,
-  "catalog_revision": 1,
+  "catalog_revision": 2,
   "models": [
+    { "harness": "codex", "session": "acp", "model": "gpt-6-astra", "efforts": ["low", "medium", "high", "xhigh", "max", "ultra"] },
     { "harness": "codex", "session": "acp", "model": "gpt-5.6-sol", "efforts": ["low", "medium", "high", "xhigh", "max", "ultra"] },
     { "harness": "codex", "session": "acp", "model": "gpt-5.6-terra", "efforts": ["low", "medium", "high", "xhigh", "max", "ultra"] },
     { "harness": "codex", "session": "acp", "model": "gpt-5.6-luna", "efforts": ["low", "medium", "high", "xhigh", "max"] },
