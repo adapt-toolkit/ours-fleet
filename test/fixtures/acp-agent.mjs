@@ -34,6 +34,9 @@ const STEERING_OCCUPIES = process.env.ACP_FIXTURE_STEERING_OCCUPIES === '1';
 const STEERING_TURN_MS = parseInt(process.env.ACP_FIXTURE_STEERING_TURN_MS ?? '400', 10) || 400;
 let steeringTurnActive = false;
 let fixtureConfigOptions = JSON.parse(process.env.ACP_FIXTURE_CONFIG_OPTIONS ?? '[]');
+const fixtureModels = process.env.ACP_FIXTURE_CURRENT_MODEL_ID
+  ? { currentModelId: process.env.ACP_FIXTURE_CURRENT_MODEL_ID }
+  : undefined;
 
 const stopReasonFor = text =>
   FORCED_STOP_REASON ??
@@ -242,7 +245,7 @@ createInterface({ input: process.stdin }).on('line', line => {
         });
       }
       send({ jsonrpc: '2.0', id: message.id,
-        result: { sessionId, configOptions: fixtureConfigOptions } });
+        result: { sessionId, configOptions: fixtureConfigOptions, ...(fixtureModels ? { models: fixtureModels } : {}) } });
       break;
     case 'session/resume':
       if (process.env.ACP_FIXTURE_REQUIRE_MCP_SERVERS === '1'

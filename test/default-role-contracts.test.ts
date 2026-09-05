@@ -41,6 +41,9 @@ describe('packaged default role contract', () => {
       expect(coordinator.agentSelections?.role).toEqual({ ref: 'Coordinator' });
       expect(coordinator.bio).toMatch(/Fleet workflow coordinator/);
       expect(coordinator.persona).toMatch(/Own progress and workflow, not execution quality/);
+      expect(coordinator.persona).toMatch(/Immediately before room creation/);
+      expect(coordinator.persona).toMatch(/Brain, harness, session, model, reasoning effort/);
+      expect(coordinator.persona).toMatch(/Wait for `send_message` to confirm delivery/);
       expect(coordinator.bio).not.toBe(coordinator.persona);
     } finally { rmSync(root, { recursive: true, force: true }); }
   });
@@ -109,7 +112,7 @@ describe('packaged default role contract', () => {
       expect(local).toMatch(/never invoke a Fleet task block/);
       const coordinatorBytes = readFileSync('presets/fleet/roles/Coordinator.yaml');
       expect(createHash('sha256').update(coordinatorBytes).digest('hex'))
-        .toBe('612c9e9602d09fb6d2bb091c6eb6c8487e91acb914df24f41b91bf755618d49f');
+        .toBe('7093e77e1d4136ba791e9c607922995e3ea689880855657134f2c23e32a80a59');
     } finally { rmSync(root, { recursive: true, force: true }); }
   });
 

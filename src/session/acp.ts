@@ -234,6 +234,12 @@ export function runtimeSelector(
   return { value: option.currentValue, ...(selected?.name ? { label: selected.name } : {}) };
 }
 
+function reasoningFromModelId(modelId: unknown): RuntimeSelectorMetadata | undefined {
+  if (typeof modelId !== 'string') return undefined;
+  const match = modelId.match(/\[([^\]]+)\]$/u);
+  return match?.[1] ? { value: match[1] } : undefined;
+}
+
 export interface AcpSessionOptions {
   name: string;
   /** Harness identity used only for honest optional capability reporting. */
@@ -1162,6 +1168,7 @@ export class AcpSession implements AgentSession {
       ? readFileSync(this.sessionFile, 'utf8').trim()
       : '';
     let advertisedConfigOptions: acp.SessionConfigOption[] | null | undefined;
+    let advertisedModelId: string | undefined;
     if (persisted && this.agentCapabilities?.sessionCapabilities?.resume != null) {
       const resumed = await this.connection.agent.request(acp.methods.agent.session.resume, {
         sessionId: persisted,
@@ -1169,7 +1176,8 @@ export class AcpSession implements AgentSession {
         mcpServers: this.declaredMcpServers(),
       });
       advertisedConfigOptions = resumed.configOptions;
-      this.captureRuntimeMetadata(advertisedConfigOptions);
+      advertisedModelId = (resumed as { models?: { currentModelId?: string } }).models?.currentModelId;
+      this.captureRuntimeMetadata(advertisedConfigOptions, advertisedModelId);
       this.sessionId = persisted;
     } else if (persisted && this.agentCapabilities?.loadSession) {
       // `session/load` replays prior history as ordinary updates before the
@@ -1182,7 +1190,8 @@ export class AcpSession implements AgentSession {
           mcpServers: this.declaredMcpServers(),
         }) as { configOptions?: acp.SessionConfigOption[] | null };
         advertisedConfigOptions = loaded.configOptions;
-        this.captureRuntimeMetadata(advertisedConfigOptions);
+        advertisedModelId = (loaded as { models?: { currentModelId?: string } }).models?.currentModelId;
+        this.captureRuntimeMetadata(advertisedConfigOptions, advertisedModelId);
       } finally { this.replaying = false; }
       this.sessionId = persisted;
     } else {
@@ -1190,15 +1199,20 @@ export class AcpSession implements AgentSession {
         cwd: this.options.cwd,
         mcpServers: this.declaredMcpServers(),
         ...(this.options.sessionMeta ? { _meta: this.options.sessionMeta } : {}),
-      }) as { sessionId: string; configOptions?: acp.SessionConfigOption[] | null };
+      }) as { sessionId: string; configOptions?: acp.SessionConfigOption[] | null;
+        models?: { currentModelId?: string } };
       this.sessionId = created.sessionId;
       advertisedConfigOptions = created.configOptions;
-      this.captureRuntimeMetadata(advertisedConfigOptions);
+      advertisedModelId = created.models?.currentModelId;
+      this.captureRuntimeMetadata(advertisedConfigOptions, advertisedModelId);
     }
     for (const selection of this.options.configSelections ?? []) {
-      if (!advertisedConfigOptions?.some(option => option.id === selection.configId))
+      if (!advertisedConfigOptions?.some(option => option.id === selection.configId)) {
+        if (selection.configId === 'reasoning_effort'
+            && reasoningFromModelId(advertisedModelId)?.value === selection.value) continue;
         throw new Error(
           `ACP agent did not advertise required session config option '${selection.configId}'`);
+      }
       let configured: { configOptions: acp.SessionConfigOption[] };
       try {
         configured = await this.connection.agent.request(
@@ -1211,7 +1225,7 @@ export class AcpSession implements AgentSession {
           + (error instanceof Error ? error.message : String(error)));
       }
       advertisedConfigOptions = configured.configOptions;
-      this.captureRuntimeMetadata(advertisedConfigOptions);
+      this.captureRuntimeMetadata(advertisedConfigOptions, advertisedModelId);
       const applied = advertisedConfigOptions.find(option => option.id === selection.configId);
       if (applied?.currentValue !== selection.value)
         throw new Error(
@@ -1245,9 +1259,11 @@ export class AcpSession implements AgentSession {
     });
   }
 
-  private captureRuntimeMetadata(options: acp.SessionConfigOption[] | null | undefined): void {
+  private captureRuntimeMetadata(
+    options: acp.SessionConfigOption[] | null | undefined, modelId?: string,
+  ): void {
     this.runtimeModel = runtimeSelector(options, 'model');
-    this.reasoningEffort = runtimeSelector(options, 'thought_level');
+    this.reasoningEffort = runtimeSelector(options, 'thought_level') ?? reasoningFromModelId(modelId);
   }
 
   private async runPrompt(

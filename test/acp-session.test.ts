@@ -405,6 +405,35 @@ describe('AcpSession', () => {
     await session.close();
   });
 
+  it('accepts reasoning verified by the ACP model id when no reasoning option is advertised', async () => {
+    const options = JSON.stringify([{
+      id: 'model', name: 'Model', category: 'model', type: 'select',
+      currentValue: 'gpt-6-astra', options: [{ value: 'gpt-6-astra', name: 'GPT-6 Astra' }],
+    }]);
+    const session = await start('allow', {
+      env: {
+        ACP_FIXTURE_CONFIG_OPTIONS: options,
+        ACP_FIXTURE_CURRENT_MODEL_ID: 'gpt-6-astra[medium]',
+      },
+      configSelections: [
+        { configId: 'model', value: 'gpt-6-astra' },
+        { configId: 'reasoning_effort', value: 'medium' },
+      ],
+    });
+    expect(session.snapshot().reasoningEffort).toEqual({ value: 'medium' });
+    expect(session.eventsSince(0).some(event =>
+      event.kind === 'agent_text' && event.text?.startsWith('config:reasoning_effort=')))
+      .toBe(false);
+    await session.close();
+  });
+
+  it('rejects a model-id reasoning default that differs from the required Brain effort', async () => {
+    await expect(start('allow', {
+      env: { ACP_FIXTURE_CURRENT_MODEL_ID: 'gpt-6-astra[low]' },
+      configSelections: [{ configId: 'reasoning_effort', value: 'medium' }],
+    })).rejects.toThrow("did not advertise required session config option 'reasoning_effort'");
+  });
+
   it('fails closed when a required session config is missing or refused', async () => {
     await expect(start('allow', {
       configSelections: [{ configId: 'model', value: 'brain-model' }],
