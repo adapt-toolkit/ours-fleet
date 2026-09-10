@@ -1,4 +1,5 @@
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
+import { EventEmitter } from 'node:events';
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -14,6 +15,7 @@ const roots: string[] = [];
 const servers: Server[] = [];
 
 afterEach(async () => {
+  vi.useRealTimers();
   await Promise.all(servers.splice(0).map(server => new Promise<void>(resolve => server.close(() => resolve()))));
   for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true });
 });
@@ -67,6 +69,25 @@ async function rpcServer(
 }
 
 describe('Cowork management-socket adapter', () => {
+  it('uses a 30-second default RPC timeout', async () => {
+    vi.useFakeTimers();
+    const socket = Object.assign(new EventEmitter(), {
+      setEncoding: () => undefined,
+      write: () => true,
+      destroy: () => undefined,
+    }) as unknown as Socket;
+    let settled = false;
+    const available = createCoworkAdapter({
+      socketPath: '/tmp/cowork-timeout-test.sock',
+      connect: () => socket,
+    }).available().finally(() => { settled = true; });
+
+    await vi.advanceTimersByTimeAsync(10_000);
+    expect(settled).toBe(false);
+    await vi.advanceTimersByTimeAsync(20_000);
+    await expect(available).resolves.toBe(false);
+  });
+
   it('resolves Cowork v1 config and state-dir override', () => {
     const root = mkdtempSync(join(tmpdir(), 'fleet-cowork-config-'));
     roots.push(root);

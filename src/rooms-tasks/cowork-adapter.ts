@@ -13,7 +13,7 @@ import type { Socket } from 'node:net';
 import type { RoomHistoryEvidence } from './types.js';
 
 const RPC_VERSION = 1;
-const DEFAULT_TIMEOUT_MS = 10_000;
+const DEFAULT_TIMEOUT_MS = 30_000;
 const MAX_RESPONSE_BYTES = 4 * 1024 * 1024;
 
 export interface CoworkRoomCreateResult {
