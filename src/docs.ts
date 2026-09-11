@@ -9,7 +9,7 @@ export const AI_DOCS = `# ours-fleet reference
 ours-fleet runs persistent or temporary, identity-bound AI roles through a
 provider-neutral managed-session interface:
 
-- harness: \`claude-code\` or \`codex\`
+- harness: \`claude-code\`, \`codex\` or \`hermes\`
 - session: \`acp\` (default) or \`codex-app-server\` (Codex only)
 - lifetime: permanent (supervised, restartable) or \`spawn --temp\`
 
@@ -40,11 +40,32 @@ bundle. Custom ACP runtime provenance is reported as unknown.
 
 ## Discover and validate
 
+Hermes uses \`harness: hermes\`, \`session: acp\`, and an explicit Brain \`model\`.
+Provision native provider/credentials with the role stopped, pointing HERMES_HOME
+at \`<role-state-dir>/harness/hermes\`. Fleet manages model.default and manual
+dangerous-command approvals; the home retains native memory, skills and state.
+Use a literal native model.provider so startup can detect model/provider fallback.
+Every restart receives the full briefing in a fresh conversation; old ACP IDs
+are not restored. Use Fleet monitoring. Home/plugin MCP providers must be disabled;
+ours and optional extras are declared through ACP. Tool availability is unverified
+until actual use, without a startup probe prompt.
+
+Hermes approval ask/auto/allow maps to default/accept_edits/dont_ask. Terminal and
+write_file/patch approval is not universal mediation of browser, memory, skills,
+delegation or MCP. Fleet waits at most 50 seconds for permission, against the
+tested native dangerous-command timeout of 60 seconds. Workspace confinement is
+approximate without verified OS isolation. Read-only, legacy deny, Fleet provider
+overrides, effort, model_chain, native monitoring and after_tool are unsupported.
+HERMES_HOME is not a complete isolation boundary for native external configuration
+or credential fallbacks. Process supervision uses the existing Fleet lifecycle.
+Tested Hermes: 0.21.1, source d15ed4445207dda418b984e8bda0f68f48b8c6f3,
+Python ACP 0.9.0, protocol 1. Unknown builds need compatibility conformance first.
+
 \`\`\`sh
 ours-fleet docs                         # this complete reference (\`man\` is an alias)
 ours-fleet help <command>               # exact flags for one command
 ours-fleet config [-c FILE]             # validate and print the merged plan; no changes
-ours-fleet doctor [-c FILE] [--harness codex|claude-code]
+ours-fleet doctor [-c FILE] [--harness codex|claude-code|hermes]
 ours-fleet version [--json]             # build identity, capabilities, every install on PATH
 \`\`\`
 

@@ -8,6 +8,7 @@ import { registerAdapter } from '../src/harness/registry.js';
 import { fakeAdapter } from './registry.test.js';
 import '../src/harness/claude-code.js';   // registers the production adapters
 import '../src/harness/codex.js';
+import '../src/harness/hermes.js';
 import type { Exec, ExecResult } from '../src/exec.js';
 import type { FetchLike } from '../src/monitor.js';
 import type { AttachOursClientOptions, OursClient } from '@ours.network/sdk/client';
@@ -70,6 +71,17 @@ const execWith = (table: Record<string, ExecResult>): Exec =>
   async (cmd, args) => table[[cmd, args[0] ?? ''].join(' ')] ?? { stdout: '', stderr: '', code: 0 };
 
 describe('doctor', () => {
+  it('reports the Hermes default executable, selected model and stopped-home prerequisite', async () => {
+    writeV2Fixture(join(dir, 'fleet.yaml'),
+      `roles:\n  HermesWorker:\n    harness: hermes\n    session: acp\n    model: fixture-model\n    permissions: { approval: ask, filesystem: workspace, unattended: wait }\n    monitor: { mode: fleet }\n`);
+    const report = await doctor({}, execWith({}), 'darwin');
+    expect(report.checks.find(c => c.name === 'acp: HermesWorker')?.detail).toContain('hermes-acp');
+    const runtime = report.checks.find(c => c.name === 'hermes runtime: HermesWorker');
+    expect(runtime?.detail).toContain('fixture-model');
+    expect(runtime?.detail).toMatch(/stopped/);
+    expect(runtime?.detail).toMatch(/fresh/);
+    expect(runtime?.detail).toMatch(/unverified/);
+  });
   it('reports actual ACP/native paths and an old role override as an unsupported mismatch', async () => {
     const native = join(dir, 'codex');
     const old = join(dir, 'old-codex');
