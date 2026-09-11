@@ -212,6 +212,8 @@ const COMMENTARY_MAX_CHARS = 1_600;
 const COMMENTARY_MAX_BYTES = 6_400;
 const COMMENTARY_MAX_UPDATES = 32;
 const COMMENTARY_DEDUPE_LIMIT = 512;
+const BACKGROUND_REVIEW_ROUTE_TTL_MS = 60 * 60 * 1_000;
+const BACKGROUND_REVIEW_ROUTE_LIMIT = 128;
 const OWNER_WATCH_BACKOFF_MAX_MS = 30_000;
 const OWNER_MESSAGE_BATCH_LIMIT = 200;
 type OwnerWatchReason = 'OWNER_WATCH_CONNECTING' | 'OWNER_WATCH_CONNECTED'
@@ -266,6 +268,9 @@ export class OwnerChannel implements OwnerChannelHandle {
   private drainRequested = false;
   private readonly completionTasks = new Set<Promise<void>>();
   private readonly activeRequests = new Map<string, ActiveOwnerRequest>();
+  private readonly reviewRoutes = new Map<string, { active: ActiveOwnerRequest; expiresAt: number }>();
+  private unsubscribeReviews?: () => void;
+  private readonly commentarySends = new Set<Promise<void>>();
   private managementTail: Promise<unknown> = Promise.resolve();
   private recoveryEpoch?: string;
   private recoveryTask?: Promise<void>;
@@ -408,6 +413,9 @@ export class OwnerChannel implements OwnerChannelHandle {
   async close(): Promise<void> {
     if (this.recoveryTask) this.shutdownDegraded = true;
     this.stopping = true;
+    this.unsubscribeReviews?.();
+    this.unsubscribeReviews = undefined;
+    this.reviewRoutes.clear();
     this.ready = false;
     this.recoveryToken++;
     this.watchGeneration++;
@@ -424,6 +432,7 @@ export class OwnerChannel implements OwnerChannelHandle {
         this.drainTask?.catch(error => this.logError('drain shutdown failed', error)),
         this.managementTail.then(() => undefined),
         this.recoveryQuiescence,
+        ...this.commentarySends,
       ]), deadlineAt);
       await this.recoveryStage('shutdown_close', this.client.close(), deadlineAt);
       disposed = true;
@@ -2112,9 +2121,114 @@ export class OwnerChannel implements OwnerChannelHandle {
     }
   }
 
+  /** Keep original owner routes while detached reviews can still finish. */
+  private retainReviewRoute(
+    promptId: string, active: ActiveOwnerRequest, activityCursor: number,
+  ): void {
+    if (this.stopping || !this.commentsState().supported) return;
+    const now = Date.now();
+    for (const [id, route] of this.reviewRoutes) {
+      if (route.expiresAt <= now) this.reviewRoutes.delete(id);
+    }
+    this.reviewRoutes.set(promptId, { active, expiresAt: now + BACKGROUND_REVIEW_ROUTE_TTL_MS });
+    while (this.reviewRoutes.size > BACKGROUND_REVIEW_ROUTE_LIMIT)
+      this.reviewRoutes.delete(this.reviewRoutes.keys().next().value as string);
+    const acceptReview = (event: SessionEvent) => {
+      if (this.stopping || !this.commentsEnabled || event.kind !== 'agent_text'
+          || event.messagePhase !== 'commentary' || event.commentarySource !== 'background_review'
+          || event.replayed || !event.turnId || event.origin?.kind !== 'owner'
+          || typeof event.messageId !== 'string' || !event.messageId
+          || typeof event.text !== 'string' || !event.text) return;
+      const route = this.reviewRoutes.get(event.turnId);
+      if (!route) return;
+      if (route.expiresAt <= Date.now()) {
+        this.reviewRoutes.delete(event.turnId);
+        return;
+      }
+      if (event.origin.requestId !== route.active.requestId) return;
+      const eligible = () => this.reviewRoutes.get(event.turnId!) === route
+        && route.expiresAt > Date.now();
+      const key = createHash('sha256').update(`${event.messageId}\0${event.text}`).digest('hex');
+      if (route.active.commentaryKeys.has(key)) return;
+      route.active.commentaryKeys.add(key);
+      if (route.active.commentaryKeys.size > COMMENTARY_DEDUPE_LIMIT)
+        route.active.commentaryKeys.delete(route.active.commentaryKeys.values().next().value as string);
+      // Reviews are complete messages. Split immediately using the same wire
+      // bounds as live commentary, without sharing the live stream's buffer.
+      let batch = '';
+      let chars = 0;
+      let bytes = 0;
+      for (const point of event.text) {
+        const pointBytes = Buffer.byteLength(point);
+        if (chars >= COMMENTARY_MAX_CHARS || bytes + pointBytes > COMMENTARY_MAX_BYTES) {
+          this.queueCommentary(route.active, batch, eligible);
+          batch = '';
+          chars = 0;
+          bytes = 0;
+        }
+        batch += point;
+        chars++;
+        bytes += pointBytes;
+      }
+      this.queueCommentary(route.active, batch, eligible);
+    };
+    this.unsubscribeReviews ??= this.options.session.subscribe?.(acceptReview);
+    // queuePrompt may emit before returning the ID. Recover only live events
+    // from that call's cursor; adapter history replays remain excluded above.
+    for (const event of this.options.session.eventsSince(activityCursor)) {
+      if (event.turnId === promptId) acceptReview(event);
+    }
+  }
+
+  private queueCommentary(
+    active: ActiveOwnerRequest, text: string, eligible: () => boolean = () => true,
+  ): void {
+    if (!text.trim() || this.stopping || !this.commentsEnabled || active.commentaryDisabled) return;
+    if (active.commentaryCount >= COMMENTARY_MAX_UPDATES) {
+      active.commentaryDisabled = true;
+      return;
+    }
+    let safe: string;
+    try { safe = this.safeCommentary(text); }
+    catch (error) {
+      active.commentaryDisabled = true;
+      this.logError('ACP commentary forwarding disabled for unsafe content', error);
+      return;
+    }
+    const digest = createHash('sha256')
+      .update(`owner-commentary\0${active.wireId}\0${safe}`).digest('hex');
+    active.commentaryCount++;
+    const pending = active.outboundTail.then(async () => {
+      // Recheck when the queued operation actually runs: a toggle, revocation,
+      // route expiry, or shutdown may have happened behind another send.
+      if (this.stopping || !this.commentsEnabled || !eligible()
+          || !this.isEffectiveOwner(active.contact)) return;
+      let sending: { id: string };
+      try {
+        sending = this.conversations.beginSend(active.contact, digest, Date.now(), 0, 'all');
+      } catch (error) {
+        if (error instanceof DuplicateSendError) return;
+        active.commentaryDisabled = true;
+        this.logError('ACP commentary forwarding disabled by dedupe state', error);
+        return;
+      }
+      try {
+        await this.send(active.contact, ownerNotices.comment(safe), active.wireId);
+      } catch {
+        this.conversations.finishSend(sending.id, 'uncertain');
+        throw new Error('ACP commentary delivery outcome is uncertain');
+      }
+      this.conversations.finishSend(sending.id, 'delivered');
+    }).catch(error => this.logError('ACP commentary delivery failed', error));
+    active.outboundTail = pending;
+    this.commentarySends.add(pending);
+    void pending.finally(() => this.commentarySends.delete(pending));
+  }
+
   private async complete(
     active: ActiveOwnerRequest, outbox: string, queued: QueuedPrompt, activityCursor: number,
   ): Promise<void> {
+    this.retainReviewRoute(queued.promptId, active, activityCursor);
     const progressMs = this.options.config.progress_interval_ms;
     let lastSeq = activityCursor;
     let startedAt: number | undefined;
@@ -2129,48 +2243,14 @@ export class OwnerChannel implements OwnerChannelHandle {
       // Re-checked at flush time so `/comments off` mid-turn also discards a
       // batch that was buffered while relaying was still on.
       if (!text || !this.commentsEnabled || active.commentaryDisabled || active.finalizing) return;
-      if (active.commentaryCount >= COMMENTARY_MAX_UPDATES) {
-        active.commentaryDisabled = true;
-        return;
-      }
-      let safe: string;
-      try { safe = this.safeCommentary(text); }
-      catch (error) {
-        active.commentaryDisabled = true;
-        this.logError('ACP commentary forwarding disabled for unsafe content', error);
-        return;
-      }
-      const digest = createHash('sha256')
-        .update(`owner-commentary\0${active.wireId}\0${safe}`).digest('hex');
-      let sending: { id: string };
-      try {
-        sending = this.conversations.beginSend(active.contact, digest, Date.now(), 0, 'all');
-      } catch (error) {
-        if (error instanceof DuplicateSendError) return;
-        active.commentaryDisabled = true;
-        this.logError('ACP commentary forwarding disabled by dedupe state', error);
-        return;
-      }
-      active.commentaryCount++;
-      active.outboundTail = active.outboundTail
-        .then(async () => {
-          try {
-            if (!this.isEffectiveOwner(active.contact))
-              throw new Error('initiating owner is no longer authorized');
-            await this.send(active.contact, ownerNotices.comment(safe), active.wireId);
-          } catch {
-            this.conversations.finishSend(sending.id, 'uncertain');
-            throw new Error('ACP commentary delivery outcome is uncertain');
-          }
-          this.conversations.finishSend(sending.id, 'delivered');
-        })
-        .catch(error => this.logError('ACP commentary delivery failed', error));
+      this.queueCommentary(active, text);
     };
 
     const acceptCommentary = (event: SessionEvent) => {
       if (!this.commentsEnabled
           || active.commentaryDisabled || active.finalizing || event.turnId !== queued.promptId
           || event.kind !== 'agent_text' || event.messagePhase !== 'commentary'
+          || event.commentarySource === 'background_review'
           || event.replayed || event.origin?.kind !== 'owner'
           || event.origin.requestId !== active.requestId
           || typeof event.messageId !== 'string' || !event.messageId
@@ -2262,20 +2342,25 @@ export class OwnerChannel implements OwnerChannelHandle {
     }
     flushCommentary();
     active.finalizing = true;
-    await active.outboundTail;
-
-    const output = result.output?.trim();
-    if (result.succeeded && output) await this.sendFinal(active.contact, output, active.wireId);
-    else if (result.succeeded) await this.send(active.contact,
-      ownerNotices.completedWithoutText(), active.wireId);
-    else if (result.outcome === 'cancelled'
-        && ['fleet-monitor', 'scheduled-loop', 'shutdown'].includes(result.cancellationSource ?? ''))
-      this.options.log(`[${this.options.role}] owner request ${active.requestId.slice(0, 12)} `
-        + `interrupted internally (${result.cancellationSource}); owner cancellation notice suppressed`);
-    else await this.send(active.contact, ownerNotices.terminal(result.outcome), active.wireId);
-    if (result.succeeded) await this.sendAttachments(active.contact, outbox, active.wireId);
-    else await rm(outbox, { recursive: true, force: true });
-    for (const wire of active.handledWireIds) this.state.remember(wire);
+    // A detached review can arrive while final transport or attachments are
+    // still in flight. Keep that delivery on the same per-request wire queue.
+    const finalDelivery = active.outboundTail.then(async () => {
+      const output = result.output?.trim();
+      if (result.succeeded && output) await this.sendFinal(active.contact, output, active.wireId);
+      else if (result.succeeded) await this.send(active.contact,
+        ownerNotices.completedWithoutText(), active.wireId);
+      else if (result.outcome === 'cancelled'
+          && ['fleet-monitor', 'scheduled-loop', 'shutdown'].includes(result.cancellationSource ?? ''))
+        this.options.log(`[${this.options.role}] owner request ${active.requestId.slice(0, 12)} `
+          + `interrupted internally (${result.cancellationSource}); owner cancellation notice suppressed`);
+      else await this.send(active.contact, ownerNotices.terminal(result.outcome), active.wireId);
+      if (result.succeeded) await this.sendAttachments(active.contact, outbox, active.wireId);
+      else await rm(outbox, { recursive: true, force: true });
+      for (const wire of active.handledWireIds) this.state.remember(wire);
+    });
+    // complete() still reports a failed final; it must not poison later reviews.
+    active.outboundTail = finalDelivery.catch(() => undefined);
+    await finalDelivery;
   }
 
   private commentsState(): OwnerCommentsState {
