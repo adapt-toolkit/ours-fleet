@@ -47,7 +47,8 @@ import type { TaskDeletionAcceptance } from '../rooms-tasks/task-state.js';
 import { storedRoomLaunchPolicy, TASK_CANCELLABLE_STATES, TASK_TERMINAL_STATES } from '../rooms-tasks/types.js';
 import { deriveTaskRoomName } from '../rooms-tasks/task-room-name.js';
 
-const OWNER_ROOM_COMMANDS = ['list-members', 'remove-member'] as const;
+// Cowork 1.3.0+ stores this selector verbatim and matches future room commands.
+const OWNER_ROOM_COMMANDS = ['*'] as const;
 
 export type TaskRoomActor =
   | { kind: 'local_control'; surface: 'cli' | 'web' }
@@ -352,7 +353,7 @@ export class TaskRoomApplicationService {
       && active === expected && launched === expected;
     const blocker = task.outcome?.summary ?? task.blocked?.reason ?? room?.saga.error;
     const nextAction = room?.provisioning_detail === 'waiting_owner_authorization'
-      ? `Restore ours-cowork, then run ours-fleet task start ${task.task_id}.`
+      ? `Ensure ours-cowork 1.3.0 or newer is running and available, then run ours-fleet task start ${task.task_id}.`
       : room?.provisioning_detail === 'waiting_owner_invite'
         ? `Rotate rooms.owner.public_invite, then run ours-fleet task start ${task.task_id}.`
       : room?.provisioning_detail === 'owner_cid_mismatch'
@@ -626,6 +627,17 @@ export class TaskRoomApplicationService {
     }
   }
 
+  private async setOwnerRoomCommands(cowork: CoworkAdapter, roomId: string, role: string): Promise<void> {
+    try {
+      await cowork.setRoleCommands(roomId, { role, commands: [...OWNER_ROOM_COMMANDS] });
+    } catch (error) {
+      setSagaError(roomId, error instanceof Error ? error.message : String(error),
+        'Ensure ours-cowork 1.3.0 or newer is running and available, then retry the originating task or room create command.',
+        'waiting_owner_authorization');
+      throw error;
+    }
+  }
+
   private async reconcileProvisioningOwner(cfg: FleetConfig, roomId: string): Promise<void> {
     if (!cfg.rooms)
       throw new ConfigError('rooms: configuration is required before creating or querying rooms');
@@ -648,9 +660,7 @@ export class TaskRoomApplicationService {
       const ownerCid = room.owner_seat_cid.toLowerCase();
       const ownerSeat = remote.seats.find(seat =>
         seat.identity_cid.toLowerCase() === ownerCid && seat.seat_state !== 'removed');
-      if (ownerSeat) await cowork.setRoleCommands(roomId, {
-        role: ownerSeat.role, commands: [...OWNER_ROOM_COMMANDS],
-      });
+      if (ownerSeat) await this.setOwnerRoomCommands(cowork, roomId, ownerSeat.role);
       if (room.saga.phase === 'attach_owner') advanceSaga(roomId, 'create_members', 3);
       return;
     }
@@ -661,9 +671,7 @@ export class TaskRoomApplicationService {
       .find(seat => seat.identity_cid.toLowerCase() === expected && seat.seat_state !== 'removed');
     if (!existing && !cfg.ownerInvite)
       throw new ConfigError('rooms.owner: configure public_invite or public_invite_file before continuing task provisioning');
-    await cowork.setRoleCommands(roomId, {
-      role: existing?.role ?? cfg.rooms.owner.role, commands: [...OWNER_ROOM_COMMANDS],
-    });
+    await this.setOwnerRoomCommands(cowork, roomId, existing?.role ?? cfg.rooms.owner.role);
     const acceptedCid = existing?.identity_cid ?? (await cowork.acceptInvite(roomId, cfg.ownerInvite!, {
       role: cfg.rooms.owner.role, expected_cid: cfg.rooms.owner.expected_cid,
     })).seat_cid;
@@ -1038,16 +1046,7 @@ export class TaskRoomApplicationService {
     room = advanceSaga(room.room_id, 'create_room', 1);
     if (attachOwner) {
       room = advanceSaga(room.room_id, 'attach_owner', 2);
-      try {
-        await cowork.setRoleCommands(room.room_id, {
-          role: rooms.owner.role, commands: [...OWNER_ROOM_COMMANDS],
-        });
-      } catch (error) {
-        setSagaError(room.room_id, error instanceof Error ? error.message : String(error),
-          'Restore Cowork availability, then retry the originating task or room create command.',
-          'waiting_owner_authorization');
-        throw error;
-      }
+      await this.setOwnerRoomCommands(cowork, room.room_id, rooms.owner.role);
       try {
         const accepted = await cowork.acceptInvite(room.room_id, cfg.ownerInvite!, {
           role: rooms.owner.role, expected_cid: rooms.owner.expected_cid,
