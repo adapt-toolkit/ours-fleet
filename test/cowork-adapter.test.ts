@@ -151,20 +151,21 @@ describe('Cowork management-socket adapter', () => {
     )).resolves.toEqual({ seat_cid: 'B'.repeat(64), seat_state: 'pending' });
   });
 
-  it('sets the exact durable role command policy through Cowork', async () => {
+  it.each([['Owner', ['*']], ['Reviewer', ['list-members', 'remove-member']]] as const)(
+    'sets the exact durable %s command policy through Cowork', async (role, commands) => {
     const socketPath = await rpcServer(request => {
       expect(request).toMatchObject({
         method: 'room.command.role.set',
         params: {
-          room_id: '01ABCDEF0123456789ABCDEFGH', role: 'Owner',
-          commands: ['list-members', 'remove-member'],
+          room_id: '01ABCDEF0123456789ABCDEFGH', role,
+          commands: [...commands],
         },
       });
-      return [{ role: 'Owner', commands: ['list-members', 'remove-member'] }];
+      return [{ role, commands: [...commands] }];
     });
     await expect(createCoworkAdapter({ socketPath }).setRoleCommands(
       '01ABCDEF0123456789ABCDEFGH',
-      { role: 'Owner', commands: ['list-members', 'remove-member'] },
+      { role, commands: [...commands] },
     )).resolves.toBeUndefined();
   });
 

@@ -9,7 +9,7 @@ import {
 } from '../src/rooms-tasks/task-state.js';
 import {
   activateRoom, advanceSaga, closeRoom, createRoomRecord, getRoomRecord, setSagaError,
-  updateMemberSeats, updateMemberStartup,
+  setOwnerSeat, updateMemberSeats, updateMemberStartup,
 } from '../src/rooms-tasks/room-state.js';
 import { acceptTaskTerminalIntent } from '../src/rooms-tasks/terminal.js';
 import { snapshotTemplate } from '../src/rooms-tasks/templates.js';
@@ -578,7 +578,7 @@ describe('task create/start surface parity', () => {
     expect(getRoomRecord(room.room_id)).toMatchObject({ owner_seat_cid: existing ? expected.toLowerCase() : expected });
     expect(h.adapter.acceptInvite).toHaveBeenCalledTimes(existing ? 0 : 1);
     expect(h.adapter.setRoleCommands).toHaveBeenCalledWith(room.room_id, {
-      role: 'Owner', commands: ['list-members', 'remove-member'],
+      role: 'Owner', commands: ['*'],
     });
     expect(provision).toHaveBeenCalledOnce();
   });
@@ -620,7 +620,7 @@ describe('task create/start surface parity', () => {
     expect(started.state).toBe('active');
     expect(getRoomRecord(room.room_id)).toMatchObject({ state: 'active', owner_seat_cid: expected });
     expect(h.adapter.setRoleCommands).toHaveBeenCalledWith(room.room_id, {
-      role: 'Owner', commands: ['list-members', 'remove-member'],
+      role: 'Owner', commands: ['*'],
     });
     expect(h.adapter.acceptInvite).toHaveBeenCalledOnce();
     expect(provision).toHaveBeenCalledOnce();
@@ -648,8 +648,70 @@ describe('task create/start surface parity', () => {
 
     expect(events).toEqual(['policy', 'accept']);
     expect(h.adapter.setRoleCommands).toHaveBeenCalledWith('room-shared', {
-      role: 'Principal', commands: ['list-members', 'remove-member'],
+      role: 'Principal', commands: ['*'],
     });
+  });
+
+  it.each(['pending', 'active'] as const)(
+    'replays wildcard policy for a durable %s Owner without changing other grants', async (seatState) => {
+      const expected = 'D'.repeat(64);
+      const cfg = { ...config(), rooms: { owner: { role: 'ChangedConfig', expected_cid: expected },
+        defaults: { attach_owner: false } } } as FleetConfig;
+      const template = snapshotTemplate(definition, cfg.agentTemplates);
+      const task = createTask({ title: 'Recover wildcard', origin: { type: 'cli' }, start: true,
+        room_id: 'room-replay', template: { name: template.name, version: template.version,
+          content_hash: template.content_hash } });
+      createRoomRecord({ room_id: task.room_id!, room_name: task.title, task_id: task.task_id,
+        template_snapshot: template, room_policy: { anonymous: false } });
+      advanceSaga(task.room_id!, 'attach_owner', 2);
+      setOwnerSeat(task.room_id!, expected, 'fingerprint');
+      const grants = new Map<string, string[]>([
+        ['Principal', ['*']], ['Reviewer', ['list-members']], ['Developer', []],
+      ]);
+      const h = cowork();
+      h.adapter.recoverRoom = vi.fn(async () => ({
+        room_id: task.room_id!, state: 'provisioning', anonymous: false,
+        seats: [{ identity_cid: expected.toLowerCase(), role: 'Principal', seat_state: seatState }],
+      })) as any;
+      h.adapter.setRoleCommands = vi.fn(async (_id, policy) => {
+        grants.set(policy.role, [...policy.commands]);
+      });
+      const provision = vi.fn(async () => advanceSaga(task.room_id!, 'wait_seats', 5, 'waiting_seats'));
+      const app = new TaskRoomApplicationService(undefined, { loadConfiguration: () => cfg,
+        cowork: () => h.adapter, binPath: () => '/fleet', provisionMembers: provision as any });
+      const resume = () => app.continueTaskProvisioning({
+        actor: { kind: 'internal_worker', surface: 'cli' }, taskId: task.task_id,
+      });
+
+      await resume();
+      // A repeated Owner-authorization recovery reapplies the same exact role selector.
+      setSagaError(task.room_id!, 'retry', 'retry', 'waiting_owner_authorization');
+      await resume();
+      // A later member-only continuation leaves the stored policy intact.
+      await resume();
+
+      expect(h.adapter.setRoleCommands).toHaveBeenCalledTimes(2);
+      expect(h.adapter.setRoleCommands).toHaveBeenNthCalledWith(1, task.room_id, {
+        role: 'Principal', commands: ['*'],
+      });
+      expect(h.adapter.setRoleCommands).toHaveBeenNthCalledWith(2, task.room_id, {
+        role: 'Principal', commands: ['*'],
+      });
+      expect([...grants]).toEqual([
+        ['Principal', ['*']], ['Reviewer', ['list-members']], ['Developer', []],
+      ]);
+      expect(h.adapter.acceptInvite).not.toHaveBeenCalled();
+      expect(h.createRoom).not.toHaveBeenCalled();
+    },
+  );
+
+  it('does not install Owner grants when Owner attachment is disabled', async () => {
+    const h = cowork();
+    await service(h.adapter).createRoom({
+      actor: { kind: 'local_control', surface: 'cli' }, name: 'No Owner',
+    });
+    expect(h.adapter.setRoleCommands).not.toHaveBeenCalled();
+    expect(h.adapter.acceptInvite).not.toHaveBeenCalled();
   });
 
   it('fails before Owner invite acceptance when role-command policy persistence fails', async () => {
@@ -669,6 +731,77 @@ describe('task create/start surface parity', () => {
       provisioning_detail: 'waiting_owner_authorization',
       saga: { error: 'policy disk unavailable' },
     });
+  });
+
+  it('keeps unsupported wildcard authorization resumable with upgrade guidance', async () => {
+    const expected = 'C'.repeat(64);
+    const h = cowork();
+    h.adapter.setRoleCommands = vi.fn(async () => {
+      throw new CoworkProtocolError('room.command.role.set', 'Invalid command selector', 'invalid_request');
+    });
+    const cfg = { ...config(), ownerInvite: 'invite',
+      rooms: { owner: { role: 'Owner', expected_cid: expected }, defaults: { attach_owner: true } } } as FleetConfig;
+    const provision = vi.fn();
+    const app = new TaskRoomApplicationService(undefined, { loadConfiguration: () => cfg,
+      cowork: () => h.adapter, binPath: () => '/fleet', provisionMembers: provision });
+
+    await expect(app.createRoom({
+      actor: { kind: 'local_control', surface: 'cli' }, name: 'Old Cowork',
+    })).rejects.toThrow('Invalid command selector');
+    expect(getRoomRecord('room-shared')).toMatchObject({
+      state: 'provisioning', provisioning_detail: 'waiting_owner_authorization',
+      saga: { phase: 'attach_owner', recovery_hint: expect.stringContaining('ours-cowork 1.3.0 or newer') },
+    });
+    expect(h.adapter.setRoleCommands).toHaveBeenCalledTimes(1);
+    expect(h.adapter.setRoleCommands).toHaveBeenCalledWith('room-shared', {
+      role: 'Owner', commands: ['*'],
+    });
+    expect(h.adapter.acceptInvite).not.toHaveBeenCalled();
+    expect(provision).not.toHaveBeenCalled();
+  });
+
+  it.each([false, true])('retains upgrade guidance on recovery and resumes after repair (pinned=%s)', async pinned => {
+    const expected = 'F'.repeat(64);
+    const cfg = { ...config(), ownerInvite: 'invite', rooms: {
+      owner: { role: 'Owner', expected_cid: expected }, defaults: { attach_owner: true },
+    } } as FleetConfig;
+    const template = snapshotTemplate(definition, cfg.agentTemplates);
+    const task = createTask({ title: 'Retry old Cowork', origin: { type: 'cli' }, start: true,
+      room_id: 'room-upgrade', template: { name: template.name, version: template.version,
+        content_hash: template.content_hash } });
+    createRoomRecord({ room_id: task.room_id!, room_name: task.title, task_id: task.task_id,
+      template_snapshot: template, room_policy: { anonymous: false } });
+    advanceSaga(task.room_id!, 'attach_owner', 2);
+    if (pinned) setOwnerSeat(task.room_id!, expected, 'fingerprint');
+    const h = cowork();
+    h.adapter.recoverRoom = vi.fn(async () => ({
+      room_id: task.room_id!, state: 'provisioning', anonymous: false,
+      seats: pinned ? [{ identity_cid: expected, role: 'Owner', seat_state: 'pending' }] : [],
+    })) as any;
+    h.adapter.getSeats = vi.fn(async () => []);
+    h.adapter.acceptInvite = vi.fn(async () => ({ seat_cid: expected, seat_state: 'pending' }));
+    h.adapter.setRoleCommands = vi.fn().mockRejectedValueOnce(
+      new CoworkProtocolError('room.command.role.set', 'Invalid command selector', 'invalid_request'),
+    ).mockResolvedValue(undefined);
+    const provision = vi.fn(async () => advanceSaga(task.room_id!, 'wait_seats', 5, 'waiting_seats'));
+    const app = new TaskRoomApplicationService(undefined, { loadConfiguration: () => cfg,
+      cowork: () => h.adapter, binPath: () => '/fleet', provisionMembers: provision as any });
+    const resume = () => app.continueTaskProvisioning({
+      actor: { kind: 'internal_worker', surface: 'cli' }, taskId: task.task_id,
+    });
+
+    await expect(resume()).resolves.toMatchObject({ kind: 'provisioning_resume_failed' });
+    expect(getRoomRecord(task.room_id!)).toMatchObject({
+      provisioning_detail: 'waiting_owner_authorization',
+      saga: { phase: 'attach_owner', recovery_hint: expect.stringContaining('ours-cowork 1.3.0 or newer') },
+    });
+    expect(h.adapter.acceptInvite).not.toHaveBeenCalled();
+    expect(provision).not.toHaveBeenCalled();
+    await expect(resume()).resolves.toMatchObject({ kind: 'provisioning_resumed' });
+    expect(h.adapter.setRoleCommands).toHaveBeenCalledTimes(2);
+    expect(h.adapter.setRoleCommands).toHaveBeenNthCalledWith(2, task.room_id, { role: 'Owner', commands: ['*'] });
+    expect(h.adapter.acceptInvite).toHaveBeenCalledTimes(pinned ? 0 : 1);
+    expect(h.createRoom).not.toHaveBeenCalled();
   });
 
   it('preserves exact continuation errors for missing and mismatched durable templates', async () => {

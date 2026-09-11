@@ -92,7 +92,7 @@ export interface CoworkAdapter {
   }): Promise<CoworkRoleBriefingInfo>;
   setRoleCommands(roomId: string, opts: {
     role: string;
-    commands: Array<'list-members' | 'remove-member'>;
+    commands: Array<'*' | 'list-members' | 'remove-member'>;
   }): Promise<void>;
   getHistory(roomId: string, opts?: {
     after?: number;

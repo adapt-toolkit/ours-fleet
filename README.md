@@ -599,6 +599,19 @@ tasks:
   close_room_on_done: true
 ```
 
+Owner-attached rooms require **ours-cowork 1.3.0 or newer**. Fleet sets the
+configured Owner role's command policy to `["*"]` before accepting the Owner
+invite, and reapplies it during Owner-seat recovery. Cowork stores the wildcard
+verbatim, authorizing current and future room runtime commands (including command
+grants and room close/delete) for active seats with that exact role. Other roles'
+grants are unchanged; host/global APIs remain outside this authorization.
+
+Older Cowork versions reject the wildcard. Fleet leaves provisioning at
+`waiting_owner_authorization` with upgrade guidance, without accepting the Owner
+invite or falling back to an enumerated grant list. Upgrade Cowork and retry the
+originating task. Existing active rooms are not retroactively migrated, and rooms
+with Owner attachment disabled receive no Owner grant.
+
 Fleet launches each template member with a dedicated one-time Cowork invite.
 The generated temporary-agent briefing contains the exact identity name, invite,
 Cowork role, and task. The agent creates that identity itself with ours MCP
