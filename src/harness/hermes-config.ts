@@ -59,6 +59,9 @@ function throwErrors(errors: ValidationError[]): void {
   if (errors.length) throw new Error(errors.map(e => `${e.path}: ${e.message}`).join('; '));
 }
 
+// Match the supported native config expander's ${VAR} and ${env:VAR} shapes.
+const hasNativeInterpolation = (value: unknown): boolean => typeof value === 'string' && /\$\{[^}]+\}/.test(value);
+
 function nativeCredentialKeys(config: Record<string, unknown>): Set<string> {
   const keys = new Set<string>();
   const seen = new Set<object>();
@@ -66,7 +69,10 @@ function nativeCredentialKeys(config: Record<string, unknown>): Set<string> {
     if (value === null || typeof value !== 'object' || seen.has(value)) return;
     seen.add(value);
     for (const [key, child] of Object.entries(value)) {
-      if ((key === 'key_env' || key === 'api_key_env') && typeof child === 'string' && child.trim()) keys.add(child.trim());
+      if ((key === 'key_env' || key === 'api_key_env') && typeof child === 'string' && child.trim()) {
+        if (hasNativeInterpolation(child)) throw new Error('Hermes credential variable names do not support interpolation in a Fleet-managed home; provision literal key_env/api_key_env names with the role stopped');
+        keys.add(child.trim());
+      }
       else visit(child);
     }
   };
@@ -129,12 +135,23 @@ function validateHomeDotenv(path: string): void {
   if (!regular(path)) return;
   // Native dotenv accepts export and single-quoted keys. Read keys only; never
   // return credential values or native parser diagnostics that may contain them.
-  const content = readFileSync(path, 'utf8');
-  for (const line of content.split(/\r?\n/)) {
+  // Native startup rewrites UTF-16 and strips NULs before parsing. Refuse those
+  // inputs rather than normalize credentials or validate a different assignment.
+  const bytes = readFileSync(path);
+  let content: string;
+  try {
+    if (bytes.includes(0)) throw new Error();
+    content = new TextDecoder('utf-8', { fatal: true }).decode(bytes);
+    // Python treats these controls as whitespace; JavaScript's key scanner does not.
+    if (/[\u001c-\u001f\u0085]/.test(content)) throw new Error();
+  } catch {
+    throw new Error(`Unsupported Hermes dotenv encoding; use UTF-8 without NUL or unsupported control characters with the role stopped: ${path}`);
+  }
+  for (const line of content.split(/\r\n?|\n/)) {
     const match = /^\s*(?:export\s+)?(?:'([^']+)'|([^\s=#]+))\s*=/.exec(line);
     if (!match) continue;
     const key = match[1] ?? match[2];
-    if (/^OURS_/i.test(key) || /^(?:_?HERMES_(?:HOME|PROFILE|CONFIG(?:_PATH)?|ENV(?:_PATH)?|SHARED_AUTH_DIR|YOLO_MODE|INTERACTIVE|EXEC_ASK|GATEWAY_SESSION|CRON_SESSION|SINGLE_QUERY_SESSION|SESSION_.*|ACP_AUTO_APPROVE|ACP_SKIP_CONFIGURED_MCP|MODEL|ENABLE_PROJECT_PLUGINS|OPTIONAL_MCPS|SAFE_MODE|IGNORE_USER_CONFIG))$/i.test(key)) {
+    if (/^OURS_/i.test(key) || /^(?:_?HERMES_(?:HOME|PROFILE|CONFIG(?:_PATH)?|ENV(?:_PATH)?|SHARED_AUTH_DIR|MANAGED_DIR|YOLO_MODE|INTERACTIVE|EXEC_ASK|GATEWAY_SESSION|CRON_SESSION|SINGLE_QUERY_SESSION|SESSION_.*|ACP_AUTO_APPROVE|ACP_SKIP_CONFIGURED_MCP|MODEL|ENABLE_PROJECT_PLUGINS|OPTIONAL_MCPS|SAFE_MODE|IGNORE_USER_CONFIG))$/i.test(key)) {
       throw new Error(`Hermes home dotenv contains a reserved Fleet/Hermes setting; remove it with the role stopped: ${path}`);
     }
   }
@@ -159,6 +176,12 @@ function validateHomeMcp(config: Record<string, unknown>, home: string): void {
   }
   const plugins = config.plugins;
   if (plugins != null && !mapping(plugins)) throw new Error('Hermes home plugins must be a map');
+  if (mapping(plugins)) {
+    for (const gate of ['enabled', 'disabled']) {
+      const names = plugins[gate];
+      if (Array.isArray(names) && names.some(hasNativeInterpolation)) throw new Error('Hermes plugins.enabled/disabled do not support interpolation in a Fleet-managed home; provision literal plugin names with the role stopped');
+    }
+  }
   const enabled = mapping(plugins) && Array.isArray(plugins.enabled) && plugins.enabled.every(x => typeof x === 'string') ? plugins.enabled : undefined;
   const disabled = mapping(plugins) && Array.isArray(plugins.disabled) ? plugins.disabled : [];
   if (enabled?.length === 0) return;

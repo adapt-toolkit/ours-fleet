@@ -117,6 +117,58 @@ describe('Hermes options and environment', () => {
     writeFileSync(join(home(), name), "'OURS_BIND_IDENTITY'=sensitive-identity\n");
     await expect(prepareHermesConfig(role(), dirs())).rejects.toThrow(/reserved/);
   });
+  describe.each(['.env', '.op.env'])('%s encoding validation', name => {
+    const text = 'HERMES_YOLO_MODE=sensitive-encoding-sentinel\n';
+    const utf16 = Buffer.from(text, 'utf16le');
+    it.each([
+      ['UTF-16 LE BOM', Buffer.concat([Buffer.from([0xff, 0xfe]), utf16])],
+      ['UTF-16 BE BOM', Buffer.concat([Buffer.from([0xfe, 0xff]), Buffer.from(utf16).swap16()])],
+      ['BOM-less UTF-16 padding', utf16],
+      ['NUL inside key', Buffer.from('HERMES_YOLO_\0MODE=sensitive-encoding-sentinel\n')],
+      ['invalid UTF-8', Buffer.concat([Buffer.from('CUSTOM='), Buffer.from([0xff]), Buffer.from('\nHERMES_YOLO_MODE=1\n')])],
+    ] as const)('rejects %s without rewriting credential bytes', async (_encoding, bytes) => {
+      provision({ model: { provider: 'custom:test' } });
+      const before = readFileSync(join(home(), 'config.yaml'));
+      writeFileSync(join(home(), name), bytes);
+      const error = await prepareHermesConfig(role(), dirs()).then(() => undefined, e => e);
+      expect(error).toBeInstanceOf(Error);
+      expect(String(error)).toMatch(/unsupported.*encoding|UTF-8/i);
+      expect(String(error)).not.toContain('sensitive-encoding-sentinel');
+      expect(readFileSync(join(home(), name))).toEqual(bytes);
+      expect(readFileSync(join(home(), 'config.yaml'))).toEqual(before);
+    });
+  });
+  it.each(['.env', '.op.env'])('recognizes native lone carriage-return assignments in %s', async name => {
+    provision({});
+    const bytes = Buffer.from('CUSTOM=sensitive-cr-sentinel\rHERMES_YOLO_MODE=1\r');
+    writeFileSync(join(home(), name), bytes);
+    await expect(prepareHermesConfig(role(), dirs())).rejects.toThrow(/reserved/);
+    expect(readFileSync(join(home(), name))).toEqual(bytes);
+  });
+  it.each(['\u0085', '\u001c', '\u001d', '\u001e', '\u001f'])('recognizes Python-native leading whitespace %j before reserved dotenv keys', async whitespace => {
+    provision({});
+    const bytes = Buffer.from(`CUSTOM=sensitive-whitespace-sentinel\n${whitespace}HERMES_YOLO_MODE=1\n`);
+    writeFileSync(join(home(), '.env'), bytes);
+    await expect(prepareHermesConfig(role(), dirs())).rejects.toThrow(/reserved|unsupported/i);
+    expect(readFileSync(join(home(), '.env'))).toEqual(bytes);
+  });
+  it.each(['.env', '.op.env'])('rejects explicit managed-scope redirection in %s without reading or rewriting it', async name => {
+    provision({});
+    const external = join(root, 'sensitive-managed-sentinel');
+    mkdirSync(external);
+    const externalBytes = Buffer.from('HERMES_YOLO_MODE=1\n');
+    writeFileSync(join(external, '.env'), externalBytes);
+    const bytes = Buffer.from(`HERMES_MANAGED_DIR=${external}\n`);
+    writeFileSync(join(home(), name), bytes);
+    const before = readFileSync(join(home(), 'config.yaml'));
+    const error = await prepareHermesConfig(role(), dirs()).then(() => undefined, e => e);
+    expect(error).toBeInstanceOf(Error);
+    expect(String(error)).toMatch(/reserved/);
+    expect(String(error)).not.toContain('sensitive-managed-sentinel');
+    expect(readFileSync(join(home(), name))).toEqual(bytes);
+    expect(readFileSync(join(home(), 'config.yaml'))).toEqual(before);
+    expect(readFileSync(join(external, '.env'))).toEqual(externalBytes);
+  });
   it.each([{ x: { command: 'x', ignored: true } }, { x: { command: 'x', env: { OURS_BIND_IDENTITY: 'other' } } }, { x: { type: 'http', url: 'invalid url' } }, { x: { type: 'http', url: 'https://example.test', env: { ignored: 'x' } } }])('rejects dropped or reserved MCP options %j', mcp_servers => {
     expect(validateHermesOptions({ mcp_servers }).length).toBeGreaterThan(0);
   });
@@ -126,6 +178,50 @@ describe('Hermes options and environment', () => {
     expect(() => hermesChildEnvironment(role({ env: { PROVIDER_ACCESS: 'sensitive-value' } }), home(), {})).toThrow(/provision/);
     const env = hermesChildEnvironment(role(), home(), {}, { PATH: '/bin', PROVIDER_ACCESS: 'operator-secret' });
     expect(env).not.toHaveProperty('PROVIDER_ACCESS');
+  });
+  describe.each(['${SENSITIVE_FIXTURE_REFERENCE}', '${env:SENSITIVE_FIXTURE_REFERENCE}'])('native interpolation %s', reference => {
+    it.each(['enabled', 'disabled'])('rejects interpolated plugins.%s before accepting the home', async gate => {
+      const plugin = join(home(), 'plugins/example');
+      mkdirSync(plugin, { recursive: true });
+      const manifest = Buffer.from(JSON.stringify({ $schema: 'https://agent-plugins.org/schemas/1.0.0/plugin.schema.json', name: 'example' }));
+      const mcp = Buffer.from(JSON.stringify({ $schema: 'https://agent-plugins.org/schemas/1.0.0/mcp.schema.json', mcpServers: { extra: { type: 'stdio', command: 'fixture-not-executed' } } }));
+      writeFileSync(join(plugin, 'plugin.json'), manifest);
+      writeFileSync(join(plugin, 'mcp.json'), mcp);
+      provision({ plugins: { enabled: gate === 'enabled' ? [reference] : [], disabled: gate === 'disabled' ? [reference] : [] } });
+      const dotenv = Buffer.from('SENSITIVE_FIXTURE_REFERENCE=example\n');
+      writeFileSync(join(home(), '.env'), dotenv);
+      const before = readFileSync(join(home(), 'config.yaml'));
+      const error = await prepareHermesConfig(role(), dirs()).then(() => undefined, e => e);
+      expect(error).toBeInstanceOf(Error);
+      expect(String(error)).toMatch(/plugins.*interpolation|interpolation.*plugins/);
+      expect(String(error)).not.toContain('SENSITIVE_FIXTURE_REFERENCE');
+      expect(readFileSync(join(home(), 'config.yaml'))).toEqual(before);
+      expect(readFileSync(join(home(), '.env'))).toEqual(dotenv);
+      expect(readFileSync(join(plugin, 'plugin.json'))).toEqual(manifest);
+      expect(readFileSync(join(plugin, 'mcp.json'))).toEqual(mcp);
+    });
+    it.each(['key_env', 'api_key_env'])('rejects interpolated credential %s in prep and final environment', async hint => {
+      provision({ model: { provider: 'custom:test' }, custom_providers: [{ name: 'test', [hint]: reference }] });
+      const dotenv = Buffer.from('SENSITIVE_FIXTURE_REFERENCE=PROVIDER_ACCESS\n');
+      writeFileSync(join(home(), '.env'), dotenv);
+      const before = readFileSync(join(home(), 'config.yaml'));
+      const resolved = role({ env: { PROVIDER_ACCESS: 'sensitive-credential-sentinel' } });
+      const error = await prepareHermesConfig(resolved, dirs()).then(() => undefined, e => e);
+      expect(error).toBeInstanceOf(Error);
+      expect(String(error)).toMatch(/credential.*interpolation|interpolation.*credential/);
+      expect(String(error)).not.toMatch(/SENSITIVE_FIXTURE_REFERENCE|sensitive-credential-sentinel/);
+      expect(() => hermesChildEnvironment(resolved, home(), {})).toThrow(/credential.*interpolation|interpolation.*credential/);
+      expect(readFileSync(join(home(), 'config.yaml'))).toEqual(before);
+      expect(readFileSync(join(home(), '.env'))).toEqual(dotenv);
+    });
+  });
+  it('preserves ordinary UTF-8 credential and unrelated native interpolation bytes', async () => {
+    provision({ model: { provider: 'custom:test', key_env: 'PROVIDER_ACCESS', api_key: '${env:PROVISIONED_SECRET}' }, plugins: { enabled: [], disabled: [] } });
+    const bytes = Buffer.from('PROVIDER_ACCESS=fixture-key\nCOMMENT="Unicode café"\n');
+    writeFileSync(join(home(), '.env'), bytes);
+    await prepareHermesConfig(role(), dirs());
+    expect(readFileSync(join(home(), '.env'))).toEqual(bytes);
+    expect(YAML.parse(readFileSync(join(home(), 'config.yaml'), 'utf8')).model.api_key).toBe('${env:PROVISIONED_SECRET}');
   });
   it('filters inherited secrets and bypasses while retaining execution and trusted routing', () => {
     const env = hermesChildEnvironment(role({ env: { CUSTOM_NORMAL: 'ok' } }), '/managed', { OURS_ROUTING_TOKEN: 'trusted' }, { PATH: '/bin', HOME: '/operator', LANG: 'en_US.UTF-8', SystemRoot: 'C:\\Windows', OPENAI_API_KEY: 'secret', HERMES_YOLO_MODE: '1', HERMES_PROFILE: 'operator', OURS_ROUTING_TOKEN: 'untrusted', UNKNOWN_VENDOR_TOKEN: 'secret', COPILOT_CLI_PATH: '/operator/copilot' });
