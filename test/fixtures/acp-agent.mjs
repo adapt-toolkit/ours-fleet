@@ -1,4 +1,5 @@
 import { createInterface } from 'node:readline';
+import { appendFileSync, existsSync } from 'node:fs';
 
 const sessionId = 'fixture-session';
 let permissionRequestId = 10_000;
@@ -197,6 +198,8 @@ createInterface({ input: process.stdin }).on('line', line => {
     else answerPrompt(pending.promptId, FORCED_STOP_REASON ?? 'end_turn');
     return;
   }
+  if (process.env.ACP_FIXTURE_REQUEST_LOG && message.method)
+    appendFileSync(process.env.ACP_FIXTURE_REQUEST_LOG, message.method + '\n');
   switch (message.method) {
     case 'initialize':
       send({
@@ -204,6 +207,7 @@ createInterface({ input: process.stdin }).on('line', line => {
         id: message.id,
         result: {
           protocolVersion: 1,
+          agentInfo: { name: 'fixture-agent', version: 'test-artifact' },
           agentCapabilities: {
             loadSession: process.env.ACP_FIXTURE_LOAD_SESSION === '1',
             sessionCapabilities: {
@@ -234,6 +238,10 @@ createInterface({ input: process.stdin }).on('line', line => {
               mcpServers: message.params?.mcpServers ?? null,
               _meta: message.params?._meta ?? null,
               oursAutostart: process.env.OURS_AUTOSTART ?? null,
+              ...(process.env.ACP_FIXTURE_ECHO_ENV === '1' ? {
+                environmentSentinel: process.env.ACP_TEST_PARENT_SECRET ?? null,
+                explicitEnvironment: process.env.ACP_TEST_EXPLICIT ?? null,
+              } : {}),
               // Mirrors ours-mcp 1.0's presence-sensitive tools/list contract.
               oursMcpTools: Object.prototype.hasOwnProperty.call(process.env, 'OURS_AUTOSTART')
                 ? [] : ['choose_identity', 'get_messages'],
@@ -245,7 +253,10 @@ createInterface({ input: process.stdin }).on('line', line => {
         });
       }
       send({ jsonrpc: '2.0', id: message.id,
-        result: { sessionId, configOptions: fixtureConfigOptions, ...(fixtureModels ? { models: fixtureModels } : {}) } });
+        result: { sessionId, configOptions: fixtureConfigOptions,
+          ...(process.env.ACP_FIXTURE_MODES ? { modes: JSON.parse(process.env.ACP_FIXTURE_MODES) } : {}),
+          ...(fixtureModels ? { models: fixtureModels } : {}),
+          _meta: { provider: 'fixture-provider' } } });
       break;
     case 'session/resume':
       if (process.env.ACP_FIXTURE_REQUIRE_MCP_SERVERS === '1'
@@ -298,7 +309,7 @@ createInterface({ input: process.stdin }).on('line', line => {
       break;
     // Echo the mode as an update BEFORE answering, so a test can observe which
     // modeId actually arrived. ACP_FIXTURE_SET_MODE_FAIL=1 refuses instead.
-    case 'session/set_mode':
+    case 'session/set_mode': {
       if (process.env.ACP_FIXTURE_SET_MODE_FAIL === '1') {
         send({ jsonrpc: '2.0', id: message.id,
           error: { code: -32602, message: 'mode unavailable' } });
@@ -315,8 +326,17 @@ createInterface({ input: process.stdin }).on('line', line => {
           },
         },
       });
-      send({ jsonrpc: '2.0', id: message.id, result: {} });
+      const answerMode = () => {
+        if (process.env.ACP_FIXTURE_SET_MODE_GATE
+            && !existsSync(process.env.ACP_FIXTURE_SET_MODE_GATE)) {
+          setTimeout(answerMode, 10);
+          return;
+        }
+        send({ jsonrpc: '2.0', id: message.id, result: {} });
+      };
+      answerMode();
       break;
+    }
     case 'session/set_config_option': {
       if (process.env.ACP_FIXTURE_SET_CONFIG_FAIL === '1') {
         send({ jsonrpc: '2.0', id: message.id,
