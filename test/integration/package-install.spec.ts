@@ -202,6 +202,32 @@ describe('packed root package', () => {
       expect(existsSync(join(
         consumerWithoutOptionalDir, 'node_modules', '@agentclientprotocol', 'codex-acp',
       ))).toBe(false);
+
+      // Resolve through the installed package's public entry, independently of
+      // this checkout and with both dependency installation postures.
+      const hermesProbe = `
+        import { existsSync } from 'node:fs';
+        import { join } from 'node:path';
+        import { makeHermesAdapter, hermesAdapter, getAdapter } from '@ours.network/fleet';
+        const adapter = makeHermesAdapter();
+        process.stdout.write(JSON.stringify({
+          id: adapter.id,
+          registered: getAdapter('hermes') === hermesAdapter,
+          supportsResume: adapter.supportsResume,
+          selectedBrain: adapter.agentSession.resolveBrain({ model: 'pack-fixture-model' }),
+          example: existsSync(join(process.cwd(), 'node_modules', '@ours.network', 'fleet',
+            'examples', 'fleet', 'brains', 'hermes.yaml')),
+        }));
+      `;
+      for (const installed of [consumerDir, consumerWithoutOptionalDir]) {
+        const hermes = JSON.parse(execFileSync(process.execPath, [
+          '--input-type=module', '--eval', hermesProbe,
+        ], { cwd: installed, encoding: 'utf8' }));
+        expect(hermes).toEqual({
+          id: 'hermes', registered: true, supportsResume: false,
+          selectedBrain: { model: 'pack-fixture-model' }, example: true,
+        });
+      }
     } finally {
       rmSync(root, { recursive: true, force: true });
     }

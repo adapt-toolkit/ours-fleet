@@ -38,7 +38,7 @@ export function knownAdapters(): string[] {
  * registry" is not the same question — this is the set doctor falls back to
  * when a broken configuration names no harness at all.
  */
-const PRODUCTION_ADAPTERS = ['claude-code', 'codex'];
+const PRODUCTION_ADAPTERS = ['claude-code', 'codex', 'hermes'];
 
 /** Production adapters actually registered in this process. */
 export function productionAdapters(): string[] {

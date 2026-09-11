@@ -10,7 +10,8 @@ import { getAdapter, productionAdapters } from './harness/registry.js';
 import { analyzeFleetPermissions, formatNative } from './permissions.js';
 import { resolveBundledAcpAgent } from './harness/acp-agent.js';
 import { agentDir, home, deriveXdgRuntimeDir } from './paths.js';
-import { resolveIsolation } from './isolation/policy.js';
+import { resolveIsolation, harnessRuntimeDir } from './isolation/policy.js';
+import { hermesConfiguredProvider } from './harness/hermes-startup.js';
 import { makeBubblewrapBackend } from './isolation/bubblewrap.js';
 import {
   authResolutionHint, resolveEndpoint,
@@ -548,6 +549,19 @@ export async function doctor(
     }
   }
   for (const role of roles.filter(role => role.session === 'acp')) {
+    if (role.harness === 'hermes') {
+      const runtimeHome = harnessRuntimeDir(agentDir(role.name), 'hermes');
+      let provider: string;
+      let ok = true;
+      try { provider = hermesConfiguredProvider(runtimeHome); }
+      catch { provider = 'not provisioned or not verifiable'; ok = false; }
+      checks.push({ name: `hermes runtime: ${role.name}`, ok,
+        detail: `Brain model ${role.model}; native provider ${provider}; home ${runtimeHome}. `
+          + 'Provision with the role stopped. Every restart uses a fresh conversation; memory and skills persist. '
+          + 'ACP connection leaves MCP availability unverified until actual use. '
+          + 'Approval covers dangerous terminal commands and write_file/patch, not all browser, memory, skills, delegation or MCP effects. '
+          + 'Dedicated HERMES_HOME does not isolate all native external credential/config sources.' });
+    }
     const configured = role.session_options?.acp?.command;
     const bundled = configured == null
       ? role.harness === 'codex'
@@ -566,7 +580,7 @@ export async function doctor(
           ? 'codex-acp'
           : role.harness === 'claude-code'
             ? 'claude-agent-acp'
-            : '';
+            : role.harness === 'hermes' ? 'hermes-acp' : '';
     if (!command) {
       checks.push({
         name: `acp: ${role.name}`, ok: false,

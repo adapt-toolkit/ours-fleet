@@ -7,7 +7,7 @@ import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
-import { AcpSession } from '../src/session/acp.js';
+import { AcpSession, type AcpSessionOptions } from '../src/session/acp.js';
 import {
   RoleControlServer, controlRequest, controlSocketPath, controlTokenPath, livenessNote,
 } from '../src/session/control.js';
@@ -24,6 +24,9 @@ afterEach(() => {
 async function start(
   approval: 'ask' | 'allow' | 'deny' = 'allow',
   extra: {
+    requireMode?: boolean;
+    inheritEnvironment?: boolean;
+    validateStartupResponse?: AcpSessionOptions['validateStartupResponse'];
     modeId?: string; env?: Record<string, string>; log?(line: string): void;
     cancelGraceMs?: number;
     cancelTerminateGraceMs?: number;
@@ -46,6 +49,9 @@ async function start(
       approval, filesystem: 'workspace', unattended: extra.unattended ?? 'deny',
     },
     modeId: extra.modeId,
+    requireMode: extra.requireMode,
+    inheritEnvironment: extra.inheritEnvironment,
+    validateStartupResponse: extra.validateStartupResponse,
     configSelections: extra.configSelections,
     permissionMode: extra.permissionMode,
     log: extra.log ?? (() => {}),
@@ -341,6 +347,124 @@ describe('AcpSession', () => {
     expect(session.eventsSince(0).some(event =>
       event.kind === 'agent_text' && event.text === 'mode:bypassPermissions')).toBe(true);
     await session.close();
+  });
+
+  it.each([undefined, JSON.stringify({ currentModeId: 'other',
+    availableModes: [{ id: 'other', name: 'Other' }] })])(
+    'rejects a required mode absent from advertised modes (%s)', async modes => {
+      await expect(start('allow', { modeId: 'required', requireMode: true,
+        env: modes ? { ACP_FIXTURE_MODES: modes } : {},
+      })).rejects.toThrow("did not advertise required session mode 'required'");
+      expect(existsSync(join(dirs.at(-1)!, '.acp-session-id'))).toBe(false);
+    });
+
+  it('rejects a missing required mode id', async () => {
+    await expect(start('allow', { requireMode: true }))
+      .rejects.toThrow('requires a non-empty modeId');
+  });
+
+  it('fails startup without persisting an id when an advertised required mode is refused', async () => {
+    await expect(start('allow', { modeId: 'required', requireMode: true, env: {
+      ACP_FIXTURE_MODES: JSON.stringify({ currentModeId: 'default', availableModes: [
+        { id: 'default', name: 'Default' }, { id: 'required', name: 'Required' },
+      ] }),
+      ACP_FIXTURE_SET_MODE_FAIL: '1',
+    } })).rejects.toThrow("refused required session mode 'required'");
+    expect(existsSync(join(dirs.at(-1)!, '.acp-session-id'))).toBe(false);
+  });
+
+  it('applies an advertised required mode before returning a ready session', async () => {
+    const session = await start('allow', { modeId: 'required', requireMode: true, env: {
+      ACP_FIXTURE_MODES: JSON.stringify({ currentModeId: 'default', availableModes: [
+        { id: 'default', name: 'Default' }, { id: 'required', name: 'Required' },
+      ] }),
+    } });
+    try {
+      expect(session.eventsSince(0)).toContainEqual(expect.objectContaining({
+        kind: 'agent_text', text: 'mode:required',
+      }));
+      expect(session.snapshot().readiness).toBe('idle');
+      expect(readFileSync(join(dirs.at(-1)!, '.acp-session-id'), 'utf8')).toBe('fixture-session\n');
+    } finally { await session.close(); }
+  });
+
+  it.each([false, true])('preserves session-id persistence timing during pending mode application (required=%s)', async requireMode => {
+    const stateDir = mkdtempSync(join(tmpdir(), 'ours-fleet-acp-mode-gate-'));
+    dirs.push(stateDir);
+    const requestLog = join(stateDir, 'requests');
+    const gate = join(stateDir, 'release-mode');
+    const startup = AcpSession.start({
+      name: 'A', argv: [process.execPath, fixture], cwd: stateDir, stateDir, mode: 'fresh',
+      permissions: { approval: 'allow', filesystem: 'workspace', unattended: 'deny' },
+      env: { ACP_FIXTURE_REQUEST_LOG: requestLog, ACP_FIXTURE_SET_MODE_GATE: gate,
+        ACP_FIXTURE_MODES: JSON.stringify({ currentModeId: 'required',
+          availableModes: [{ id: 'required', name: 'Required' }] }),
+      }, modeId: 'required', requireMode, log: () => {},
+    });
+    try {
+      await vi.waitFor(() => {
+        expect(existsSync(requestLog)).toBe(true);
+        expect(readFileSync(requestLog, 'utf8')).toContain('session/set_mode');
+      });
+      expect(existsSync(join(stateDir, '.acp-session-id'))).toBe(!requireMode);
+    } finally {
+      writeFileSync(gate, 'release');
+      await (await startup).close();
+    }
+  });
+
+  it('awaits fresh startup validation before briefing, readiness and session-id persistence', async () => {
+    const stateDir = mkdtempSync(join(tmpdir(), 'ours-fleet-acp-validator-'));
+    dirs.push(stateDir);
+    const requestLog = join(stateDir, 'requests');
+    let release!: () => void;
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    let entered!: () => void;
+    const validating = new Promise<void>(resolve => { entered = resolve; });
+    const startup = AcpSession.start({
+      name: 'A', argv: [process.execPath, fixture], cwd: stateDir, stateDir, mode: 'fresh',
+      permissions: { approval: 'allow', filesystem: 'workspace', unattended: 'deny' },
+      env: { ACP_FIXTURE_REQUEST_LOG: requestLog, ACP_FIXTURE_CURRENT_MODEL_ID: 'selected-model' },
+      log: () => {},
+      validateStartupResponse: async (initialized, created) => {
+        expect(initialized.agentInfo).toEqual({ name: 'fixture-agent', version: 'test-artifact' });
+        expect(created.models?.currentModelId).toBe('selected-model');
+        expect(created._meta?.provider).toBe('fixture-provider');
+        entered();
+        await gate;
+        throw new Error('incompatible startup report');
+      },
+    });
+    let returned = false;
+    const briefing = startup.then(async session => {
+      returned = true;
+      try { await session.submitPrompt('briefing'); } finally { await session.close(); }
+    });
+    const outcome = briefing.then(() => undefined, error => error);
+    // Bound the signal wait so a missing validator fails instead of hanging the suite.
+    await Promise.race([validating, briefing.catch(() => undefined)]);
+    try {
+      expect(returned).toBe(false);
+      expect(existsSync(join(stateDir, '.acp-session-id'))).toBe(false);
+    } finally { release(); }
+    expect(await outcome).toMatchObject({ message: 'incompatible startup report' });
+    expect(readFileSync(requestLog, 'utf8')).not.toContain('session/prompt');
+    expect(existsSync(join(stateDir, '.acp-session-id'))).toBe(false);
+  });
+
+  it.each([undefined, true, false])('controls final child environment inheritance (%s)', async inheritEnvironment => {
+    vi.stubEnv('ACP_TEST_PARENT_SECRET', 'parent-only-sentinel');
+    let session: AcpSession | undefined;
+    try {
+      session = await start('allow', { inheritEnvironment, env: {
+        ACP_FIXTURE_ECHO_SESSION_PARAMS: '1', ACP_FIXTURE_ECHO_ENV: '1',
+        ACP_TEST_EXPLICIT: 'explicit-value',
+      } });
+      const echoed = session.eventsSince(0).find(event => event.text?.startsWith('new-params:'));
+      const params = JSON.parse(echoed!.text!.slice('new-params:'.length));
+      expect(params.environmentSentinel).toBe(inheritEnvironment === false ? null : 'parent-only-sentinel');
+      expect(params.explicitEnvironment).toBe('explicit-value');
+    } finally { await session?.close(); vi.unstubAllEnvs(); }
   });
 
   it('applies ordered required session config before mode and refreshes runtime metadata', async () => {

@@ -149,6 +149,7 @@ function generateRoomMemberBriefing(
 export function generateBriefing(role: ResolvedRole, v: BriefingVocab, opts: BriefingOpts): string {
   const L: string[] = [];
   const id = role.identity;
+  const bindForce = role.harness === 'hermes' ? 'false' : 'true';
   const hostUser = userInfo().username;
   L.push(`# ${role.name} — Role Briefing`, '');
   const lifetime = opts.temporaryIdentity ? 'temporary' : 'persistent';
@@ -175,12 +176,12 @@ export function generateBriefing(role: ResolvedRole, v: BriefingVocab, opts: Bri
     const guarantee = opts.identityGuarantee ?? 'unverified';
     if (guarantee === 'unverified') {
     L.push(`2. BIND your ours identity: call the **${v.bindTool}** tool with`);
-    L.push(`   name "${id}" force=true (search the deferred tool registry first if needed).`);
+    L.push(`   name "${id}" force=${bindForce} (search the deferred tool registry first if needed).`);
     L.push(`   - This permanent identity was NOT verified before launch. If it does not exist, STOP`);
     L.push('     and report the infrastructure error; identity creation belongs to the fleet lifecycle.');
     } else {
       L.push(`2. BIND your ours identity: call the **${v.bindTool}** tool with`);
-      L.push(`   name "${id}" force=true (search the deferred tool registry first if needed).`);
+      L.push(`   name "${id}" force=${bindForce} (search the deferred tool registry first if needed).`);
       L.push(`   - It was ${guarantee === 'created' ? 'created' : 'verified to exist'} when your role`);
       L.push('     was started, so binding should succeed. If it unexpectedly reports no such identity,');
       L.push('     STOP and report the infrastructure race; do not create or replace it yourself.');
@@ -319,7 +320,7 @@ export function generateBriefing(role: ResolvedRole, v: BriefingVocab, opts: Bri
     L.push('collision or any creation error, STOP and report it; never bind, force-adopt, fall back');
     L.push('to permanent creation, or delete identity state. After successful creation,');
   } else {
-    L.push(`On restart, WITHOUT asking: re-bind (**${v.bindTool}** name "${id}" force=true), then`);
+    L.push(`On restart, WITHOUT asking: re-bind (**${v.bindTool}** name "${id}" force=${bindForce}), then`);
   }
   L.push(`${wakeNote} Then continue from your WORKLOG.`);
   L.push('Do not blindly re-run whatever may have crashed you.');

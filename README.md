@@ -1542,3 +1542,71 @@ that environment, and restart only affected agents after applying the override.
 For temporary agents with a sealed stale override, have the task coordinator
 arrange replacement with the corrected template. Reinstall/upgrade Fleet with
 optional dependencies enabled to repair a missing or stale bundled runtime.
+
+### Hermes ACP
+
+A Hermes Brain uses `harness: hermes`, `session: acp`, and an explicit non-empty
+`model`. See [the example Brain](examples/fleet/brains/hermes.yaml). The model is
+illustrative: select one supported by the native provider provisioned for your
+role. The same Brain can be selected by Coordinator or an ordinary Agent; this
+does not switch an existing Coordinator automatically.
+
+Each role has a private persistent Hermes home at
+`<role-state-dir>/harness/hermes`, separate from its project working directory.
+Stop the role before setup or upgrades. Point Hermes's native setup at that exact
+path using `HERMES_HOME`; provision the provider and credentials there. Do not copy
+or link an operator's active credentials. Fleet creates the home with mode 0700
+and writes its configuration with mode 0600. Fleet owns `model.default` and
+`approvals.mode: manual`; unrelated native configuration, credentials, memory,
+skills and runtime files remain native-owned. Removing the Brain model is an
+error, not a request to restore an old native model.
+
+Every start creates a fresh ACP conversation and receives the full role briefing.
+Memory and skills in the role home survive; the previous conversation is not
+restored. Changing the Brain model takes effect on the next start. Temporary
+homes last for the temporary role's lifetime; persistent homes remain until an
+authorized role operation removes them.
+
+Use Fleet-owned monitoring (`monitor.mode: fleet`). Fleet supplies the reserved
+`ours` connector through ACP, plus optional explicit
+`harness_options.mcp_servers`. An identical explicit
+`ours: { command: ours-mcp, args: [proxy] }` is merged once; a conflicting one is
+rejected. Disable all home-configured MCP servers and MCP-providing plugins in
+this role home. Startup does not silently remove them. An ACP connection means
+MCP availability is **unverified until actual use**; a configured connector name
+or a model's claim does not prove that a tool works. Fleet adds no probe prompt.
+
+| Fleet approval | Hermes edit mode |
+| --- | --- |
+| `ask` | `default` |
+| `auto` | `accept_edits` |
+| `allow` | `dont_ask` |
+
+These modes cover dangerous terminal command prompts and `write_file`/`patch`.
+They do not provide universal approval for browser, memory, skills, delegation
+or MCP side effects. Native protected-action floors remain. Fleet's permission
+wait is 50 seconds, below the tested native dangerous-command timeout of 60
+seconds. Workspace confinement is approximate without verified enforcing Fleet
+isolation; unrestricted filesystem mode is also available. Read-only mode,
+legacy approval `deny`, Fleet provider overrides, effort, model chains, native
+monitoring and `after_tool` are unsupported.
+
+This dedicated home and environment filtering are not a complete isolation
+boundary: native Hermes can also read installation/system configuration and
+provider credential fallbacks outside it. Fleet uses its existing process
+lifecycle without adding a separate process-death barrier. Use the appropriate
+OS/service isolation for stronger separation.
+
+The tested artifact is Hermes 0.21.1 at source commit
+`d15ed4445207dda418b984e8bda0f68f48b8c6f3`, Python ACP 0.9.0, protocol 1.
+Unknown builds require compatibility testing before managed launch. Configure a
+literal native `model.provider` in the stopped home so Fleet can compare the
+reported provider against an independent value; `auto` selection is unsupported.
+
+For an enforcing Linux workspace sandbox, use the existing bubblewrap backend
+with `on_unavailable: strict`. Its allowlist must include read-only access to the
+Hermes source/virtualenv and the Python runtime used by its launcher, including
+any interpreter symlink path. Declare these installation-specific paths in
+`isolation.fs.read`; do not expose an entire operator home. The tested policy
+allowed a project write and refused a write to an outside read-only directory.
+The `broker` network mode retains host networking; it is not network isolation.

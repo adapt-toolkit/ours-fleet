@@ -243,6 +243,11 @@ function reasoningFromModelId(modelId: unknown): RuntimeSelectorMetadata | undef
   return match?.[1] ? { value: match[1] } : undefined;
 }
 
+/** Fresh ACP response including the legacy model report still used by some adapters. */
+export type AcpStartupSessionResponse = acp.NewSessionResponse & {
+  models?: { currentModelId?: string };
+};
+
 export interface AcpSessionOptions {
   /** Opt-in Fleet watchdog, owned by this ACP session, never a process restart. */
   stallRecovery?: { timeoutMs?: number; tickMs?: number; cancelWaitMs?: number };
@@ -252,11 +257,22 @@ export interface AcpSessionOptions {
   argv: string[];
   cwd: string;
   env: Record<string, string>;
+  /** Merge the parent environment before env; false uses only the supplied env. Defaults to true. */
+  inheritEnvironment?: boolean;
   stateDir: string;
   mode: 'fresh' | 'resume';
   permissions: CommonPermissions;
   /** Native permission-mode id to request via session/set_mode; undefined keeps the agent default. */
   modeId?: string;
+  /** Require modeId to be advertised and session/set_mode to succeed before readiness. */
+  requireMode?: boolean;
+  /**
+   * Validate initialize and session/new reports before persistence or readiness.
+   * Throw/reject to fail startup. Not called for session/load or session/resume.
+   */
+  validateStartupResponse?: (
+    initialized: acp.InitializeResponse, created: AcpStartupSessionResponse,
+  ) => void | Promise<void>;
   /** Ordered explicit Brain choices that must be applied before readiness. */
   configSelections?: Array<{ configId: string; value: string }>;
   /** Adapter-resolved live permission policy; separate from ACP agent-specific session modes. */
@@ -448,7 +464,7 @@ export class AcpSession implements AgentSession {
     // Obsolete ours-mcp lifecycle flags are presence-sensitive. The shared
     // daemon remains operator-owned; managed ACP children are clients only.
     const childEnv = {
-      ...process.env,
+      ...(options.inheritEnvironment === false ? {} : process.env),
       ...options.env,
     };
     if (options.scrubObsoleteOursAutostart) delete childEnv.OURS_AUTOSTART;
@@ -1203,6 +1219,7 @@ export class AcpSession implements AgentSession {
       ? readFileSync(this.sessionFile, 'utf8').trim()
       : '';
     let advertisedConfigOptions: acp.SessionConfigOption[] | null | undefined;
+    let advertisedModes: acp.SessionModeState | null | undefined;
     let advertisedModelId: string | undefined;
     if (persisted && this.agentCapabilities?.sessionCapabilities?.resume != null) {
       const resumed = await this.connection.agent.request(acp.methods.agent.session.resume, {
@@ -1211,6 +1228,7 @@ export class AcpSession implements AgentSession {
         mcpServers: this.declaredMcpServers(),
       });
       advertisedConfigOptions = resumed.configOptions;
+      advertisedModes = resumed.modes;
       advertisedModelId = (resumed as { models?: { currentModelId?: string } }).models?.currentModelId;
       this.captureRuntimeMetadata(advertisedConfigOptions, advertisedModelId);
       this.sessionId = persisted;
@@ -1223,8 +1241,9 @@ export class AcpSession implements AgentSession {
           sessionId: persisted,
           cwd: this.options.cwd,
           mcpServers: this.declaredMcpServers(),
-        }) as { configOptions?: acp.SessionConfigOption[] | null };
+        });
         advertisedConfigOptions = loaded.configOptions;
+        advertisedModes = loaded.modes;
         advertisedModelId = (loaded as { models?: { currentModelId?: string } }).models?.currentModelId;
         this.captureRuntimeMetadata(advertisedConfigOptions, advertisedModelId);
       } finally { this.replaying = false; }
@@ -1234,9 +1253,10 @@ export class AcpSession implements AgentSession {
         cwd: this.options.cwd,
         mcpServers: this.declaredMcpServers(),
         ...(this.options.sessionMeta ? { _meta: this.options.sessionMeta } : {}),
-      }) as { sessionId: string; configOptions?: acp.SessionConfigOption[] | null;
-        models?: { currentModelId?: string } };
+      }) as AcpStartupSessionResponse;
       this.sessionId = created.sessionId;
+      await this.options.validateStartupResponse?.(initialized, created);
+      advertisedModes = created.modes;
       advertisedConfigOptions = created.configOptions;
       advertisedModelId = created.models?.currentModelId;
       this.captureRuntimeMetadata(advertisedConfigOptions, advertisedModelId);
@@ -1266,14 +1286,18 @@ export class AcpSession implements AgentSession {
         throw new Error(
           `ACP agent did not apply required session config option '${selection.configId}' value '${selection.value}'`);
     }
-    // Do not persist a session until every required Brain choice is live. A
-    // failed startup closes the ACP session; persisting its id first would make
-    // a later resume repeatedly target that invalid session.
-    writeFileSync(this.sessionFile, this.sessionId + '\n', { mode: 0o600 });
+    if (this.options.requireMode) {
+      if (!this.options.modeId?.trim())
+        throw new Error('ACP required session mode requires a non-empty modeId');
+      if (!advertisedModes?.availableModes.some(mode => mode.id === this.options.modeId))
+        throw new Error(`ACP agent did not advertise required session mode '${this.options.modeId}'`);
+    }
+    // Preserve existing persistence timing for optional permission modes.
+    if (!this.options.requireMode)
+      writeFileSync(this.sessionFile, this.sessionId + '\n', { mode: 0o600 });
     // Deliver the configured permission mode whichever way the session came up
     // (new, resume or load) — the launch flag never reaches an ACP agent. A
-    // refusal is loud but never fatal: the session then simply runs at the
-    // agent's own default.
+    // refusal is fatal only when the adapter explicitly requires this mode.
     if (this.options.modeId) {
       try {
         await this.connection.agent.request(acp.methods.agent.session.setMode, {
@@ -1281,11 +1305,17 @@ export class AcpSession implements AgentSession {
           modeId: this.options.modeId,
         });
       } catch (e) {
+        if (this.options.requireMode)
+          throw new Error(`ACP agent refused required session mode '${this.options.modeId}': `
+            + (e instanceof Error ? e.message : String(e)));
         this.options.log(
           `[${this.options.name}] acp: session/set_mode "${this.options.modeId}" failed ` +
           `(${e instanceof Error ? e.message : String(e)}) — session runs at the agent default permission mode`);
       }
     }
+    // A required mode must succeed before its session becomes resumable.
+    if (this.options.requireMode)
+      writeFileSync(this.sessionFile, this.sessionId + '\n', { mode: 0o600 });
     this.readiness = 'idle';
     this.events.emit('state', { status: 'idle', text: `ACP session ${this.sessionId}` });
     this.conversation.appendSafe({

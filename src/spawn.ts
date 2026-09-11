@@ -29,6 +29,7 @@ import { VERSION } from './version.js';
 import { recordGeneratedAgentSource } from './generated-agent-source.js';
 import './harness/claude-code.js';
 import './harness/codex.js';
+import './harness/hermes.js';
 import { getAdapter } from './harness/registry.js';
 import {
   archiveTempState, makeTempSupervisorLauncher, prepareTempSupervisor, reclaimStaleTempState,

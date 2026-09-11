@@ -17,6 +17,7 @@ import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
+import { parse } from 'yaml';
 
 const run = promisify(execFile);
 
@@ -84,6 +85,17 @@ describe('npm pack from a checkout with no dist', () => {
       'presets/fleet/room_templates/pair.yaml',
       'presets/fleet/room_templates/team.yaml',
     ]) expect(entries).toContain(path);
+  });
+
+  it('ships the Hermes adapter and a usable example Brain', async () => {
+    expect(entries).toContain('dist/harness/hermes.js');
+    expect(entries).toContain('dist/harness/hermes.d.ts');
+    expect(entries).toContain('examples/fleet/brains/hermes.yaml');
+    const shipped = await run('tar', ['-xzOf', packed, 'package/examples/fleet/brains/hermes.yaml']);
+    const brain = parse(shipped.stdout);
+    expect(brain).toMatchObject({ harness: 'hermes', session: 'acp' });
+    expect(typeof brain.model).toBe('string');
+    expect(brain.model.trim().length).toBeGreaterThan(0);
   });
 
   // What the nightly channel exists to deliver. A tarball that packs and stamps

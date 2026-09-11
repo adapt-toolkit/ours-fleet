@@ -67,6 +67,7 @@ import {
 } from './fleet-command-audit.js';
 import './harness/claude-code.js';   // registers the claude-code adapter
 import './harness/codex.js';         // registers the codex adapter
+import './harness/hermes.js';
 import { registerTemplateCommands, registerTaskCommands, registerRoomCommands } from './rooms-tasks/cli.js';
 import { RoleCreationService } from './application/role-creation-service.js';
 import { RoleRemovalService } from './application/role-removal-service.js';

@@ -20,6 +20,7 @@ export { OwnerChannel } from './owner-channel/channel.js';
 export { registerAdapter, getAdapter, knownAdapters } from './harness/registry.js';
 export { claudeCodeAdapter, makeClaudeCodeAdapter } from './harness/claude-code.js';
 export { codexAdapter, makeCodexAdapter } from './harness/codex.js';
+export { hermesAdapter, makeHermesAdapter } from './harness/hermes.js';
 export { generateBriefing } from './briefing.js';
 export { effectivePermissionMode } from './permissions.js';
 export { pickBackend } from './supervisor/index.js';
