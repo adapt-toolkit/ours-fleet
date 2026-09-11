@@ -223,6 +223,129 @@ describe('Hermes options and environment', () => {
     expect(readFileSync(join(home(), '.env'))).toEqual(bytes);
     expect(YAML.parse(readFileSync(join(home(), 'config.yaml'), 'utf8')).model.api_key).toBe('${env:PROVISIONED_SECRET}');
   });
+  describe.each(['${FLEET_FIXTURE_ACCESS}', '${env:FLEET_FIXTURE_ACCESS}'])('credential value reference %s', reference => {
+    it.each(['api_key', 'apikey', 'key', 'token', 'access_token', 'refresh_token', 'id_token', 'secret', 'client_secret', 'password', 'passwd', 'auth', 'authorization', 'private_key', 'bearer', 'jwt'])('rejects role.env supplying native credential field %s', async field => {
+      provision({ model: { provider: 'custom:fixture' }, custom_providers: [{ name: 'fixture', base_url: 'http://127.0.0.1:9/v1', [field]: reference }] });
+      const before = readFileSync(join(home(), 'config.yaml'));
+      const resolved = role({ env: { FLEET_FIXTURE_ACCESS: 'role-injected-sentinel' } });
+      const error = await prepareHermesConfig(resolved, dirs()).then(() => undefined, e => e);
+      expect(error).toBeInstanceOf(Error);
+      expect(String(error)).toMatch(/credential/);
+      expect(String(error)).not.toMatch(/FLEET_FIXTURE_ACCESS|role-injected-sentinel/);
+      expect(() => hermesChildEnvironment(resolved, home(), {})).toThrow(/credential/);
+      expect(readFileSync(join(home(), 'config.yaml'))).toEqual(before);
+    });
+    it.each(['model-api', 'extra-headers'])('protects the native %s credential channel', async channel => {
+      provision({ model: channel === 'model-api' ? { api: reference } : { extra_headers: { 'X-Custom-Auth': `Bearer ${reference}` } } });
+      const resolved = role({ env: { FLEET_FIXTURE_ACCESS: 'role-injected-sentinel' } });
+      await expect(prepareHermesConfig(resolved, dirs())).rejects.toThrow(/credential/);
+      expect(() => hermesChildEnvironment(resolved, home(), {})).toThrow(/credential/);
+    });
+    it('retains native home provisioning and unrelated noncredential config interpolation', async () => {
+      provision({ model: { provider: 'custom:fixture', api_key: reference, base_url: '${ENDPOINT}' } });
+      const bytes = Buffer.from('FLEET_FIXTURE_ACCESS=home-provisioned-sentinel\n');
+      writeFileSync(join(home(), '.env'), bytes);
+      const env = (await prepareHermesConfig(role({ env: { ENDPOINT: 'http://localhost/v1' } }), dirs())).env;
+      expect(env.ENDPOINT).toBe('http://localhost/v1');
+      expect(readFileSync(join(home(), '.env'))).toEqual(bytes);
+      expect(YAML.parse(readFileSync(join(home(), 'config.yaml'), 'utf8')).model.api_key).toBe(reference);
+    });
+  });
+  it.each(['${LANG}', '${env:LANG}'])('removes inherited execution variables used as credential values: %s', async reference => {
+    provision({ model: { api_key: reference } });
+    const env = hermesChildEnvironment(role(), home(), {}, { LANG: 'inherited-secret-sentinel', PATH: '/bin' });
+    expect(env).not.toHaveProperty('LANG');
+    expect(env.PATH).toBe('/bin');
+  });
+  describe.each(['.env', '.op.env'])('%s credential reference provenance', name => {
+    it.each([
+      'OPENAI_API_KEY=${FLEET_FIXTURE_ACCESS}\n',
+      "OPENAI_API_KEY='${FLEET_FIXTURE_ACCESS}'\n",
+      'OPENAI_API_KEY="${FLEET_FIXTURE_ACCESS}"\n',
+      'OPENAI_API_KEY=${FLEET_FIXTURE_ACCESS:-fallback}\n',
+      'ALIAS=${FLEET_FIXTURE_ACCESS}\nOPENAI_API_KEY=${ALIAS}\n',
+    ])('rejects externally supplied dotenv credential sources %j', async raw => {
+      provision({});
+      const bytes = Buffer.from(raw);
+      writeFileSync(join(home(), name), bytes);
+      const before = readFileSync(join(home(), 'config.yaml'));
+      const resolved = role({ env: { FLEET_FIXTURE_ACCESS: 'role-injected-sentinel' } });
+      const error = await prepareHermesConfig(resolved, dirs()).then(() => undefined, e => e);
+      expect(error).toBeInstanceOf(Error);
+      expect(String(error)).toMatch(/credential/);
+      expect(String(error)).not.toMatch(/FLEET_FIXTURE_ACCESS|role-injected-sentinel/);
+      expect(() => hermesChildEnvironment(resolved, home(), {})).toThrow(/credential/);
+      expect(readFileSync(join(home(), name))).toEqual(bytes);
+      expect(readFileSync(join(home(), 'config.yaml'))).toEqual(before);
+    });
+    it('filters inherited credential dependencies while keeping ordinary execution interpolation', () => {
+      provision({});
+      writeFileSync(join(home(), name), 'OPENAI_API_KEY=${LANG}\nPATH=${PATH}:/native/bin\n');
+      const env = hermesChildEnvironment(role({ env: { PATH: '/role/bin' } }), home(), {}, { LANG: 'inherited-secret-sentinel', PATH: '/bin' });
+      expect(env).not.toHaveProperty('LANG');
+      expect(env.PATH).toBe('/role/bin');
+    });
+    it('permits home-native aliases and preserves ordinary dotenv interpolation bytes', async () => {
+      provision({});
+      const bytes = Buffer.from('FLEET_FIXTURE_ACCESS=home-provisioned-sentinel\nALIAS=${FLEET_FIXTURE_ACCESS}\nOPENAI_API_KEY=${ALIAS}\nPATH=${PATH}:/native/bin\n');
+      writeFileSync(join(home(), name), bytes);
+      const env = (await prepareHermesConfig(role({ env: { PATH: '/role/bin' } }), dirs())).env;
+      expect(env.PATH).toBe('/role/bin');
+      expect(readFileSync(join(home(), name))).toEqual(bytes);
+    });
+  });
+  it.each(['api_key', 'key_env'])('follows selected-home dotenv aliases seeded by config %s', async field => {
+    provision({ model: { [field]: field === 'key_env' ? 'ALIAS' : '${env:ALIAS}' } });
+    const bytes = Buffer.from('ALIAS=${FLEET_FIXTURE_ACCESS}\n');
+    writeFileSync(join(home(), '.env'), bytes);
+    const resolved = role({ env: { FLEET_FIXTURE_ACCESS: 'role-injected-sentinel' } });
+    await expect(prepareHermesConfig(resolved, dirs())).rejects.toThrow(/credential/);
+    expect(() => hermesChildEnvironment(resolved, home(), {})).toThrow(/credential/);
+    expect(readFileSync(join(home(), '.env'))).toEqual(bytes);
+  });
+  it('follows aliases across dotenv files and handles cycles without hanging', async () => {
+    provision({ model: { api_key: '${ALIAS}' } });
+    writeFileSync(join(home(), '.env'), 'ALIAS=${SECOND}\n');
+    writeFileSync(join(home(), '.op.env'), 'SECOND=${ALIAS}${FLEET_FIXTURE_ACCESS}\n');
+    const resolved = role({ env: { FLEET_FIXTURE_ACCESS: 'role-injected-sentinel' } });
+    await expect(prepareHermesConfig(resolved, dirs())).rejects.toThrow(/credential/);
+    expect(() => hermesChildEnvironment(resolved, home(), {})).toThrow(/credential/);
+  });
+  it.each(['ALIAS="line\n${FLEET_FIXTURE_ACCESS}"\n', 'ALIAS="${FLEET_FIXTURE_\\nACCESS}"\n'])('refuses ambiguous credential alias interpolation without rewriting bytes', async raw => {
+    provision({ model: { api_key: '${ALIAS}' } });
+    const bytes = Buffer.from(raw);
+    writeFileSync(join(home(), '.env'), bytes);
+    await expect(prepareHermesConfig(role(), dirs())).rejects.toThrow(/credential.*interpolation|interpolation.*credential/);
+    expect(() => hermesChildEnvironment(role(), home(), {})).toThrow(/credential.*interpolation|interpolation.*credential/);
+    expect(readFileSync(join(home(), '.env'))).toEqual(bytes);
+  });
+  describe.each(['GOOGLE_APPLICATION_CREDENTIALS', 'VERTEX_CREDENTIALS_PATH', 'AWS_SHARED_CREDENTIALS_FILE'])('credential path %s', key => {
+    it('rejects a direct role.env credential path without exposing it', async () => {
+      const resolved = role({ env: { [key]: '/sensitive-credential-path-sentinel' } });
+      const error = await prepareHermesConfig(resolved, dirs()).then(() => undefined, e => e);
+      expect(error).toBeInstanceOf(Error);
+      expect(String(error)).toMatch(/reserved|credential/);
+      expect(String(error)).not.toContain('sensitive-credential-path-sentinel');
+      expect(() => hermesChildEnvironment(resolved, home(), {})).toThrow(/reserved|credential/);
+    });
+    it('protects aliased dotenv credential paths and filters inherited sources', async () => {
+      provision({});
+      const bytes = Buffer.from(`${key}=\${PATH_ALIAS}\nPATH_ALIAS=\${LANG}\nPATH=\${PATH}:/native/bin\n`);
+      writeFileSync(join(home(), '.env'), bytes);
+      const before = readFileSync(join(home(), 'config.yaml'));
+      const resolved = role({ env: { LANG: '/sensitive-credential-path-sentinel' } });
+      const error = await prepareHermesConfig(resolved, dirs()).then(() => undefined, e => e);
+      expect(error).toBeInstanceOf(Error);
+      expect(String(error)).toMatch(/credential/);
+      expect(String(error)).not.toContain('sensitive-credential-path-sentinel');
+      expect(() => hermesChildEnvironment(resolved, home(), {})).toThrow(/credential/);
+      const env = hermesChildEnvironment(role(), home(), {}, { LANG: '/inherited-credential-path', PATH: '/bin' });
+      expect(env).not.toHaveProperty('LANG');
+      expect(env.PATH).toBe('/bin');
+      expect(readFileSync(join(home(), '.env'))).toEqual(bytes);
+      expect(readFileSync(join(home(), 'config.yaml'))).toEqual(before);
+    });
+  });
   it('filters inherited secrets and bypasses while retaining execution and trusted routing', () => {
     const env = hermesChildEnvironment(role({ env: { CUSTOM_NORMAL: 'ok' } }), '/managed', { OURS_ROUTING_TOKEN: 'trusted' }, { PATH: '/bin', HOME: '/operator', LANG: 'en_US.UTF-8', SystemRoot: 'C:\\Windows', OPENAI_API_KEY: 'secret', HERMES_YOLO_MODE: '1', HERMES_PROFILE: 'operator', OURS_ROUTING_TOKEN: 'untrusted', UNKNOWN_VENDOR_TOKEN: 'secret', COPILOT_CLI_PATH: '/operator/copilot' });
     expect(env).toMatchObject({ PATH: '/bin', HOME: '/operator', LANG: 'en_US.UTF-8', SystemRoot: 'C:\\Windows', HERMES_HOME: '/managed', OURS_ROUTING_TOKEN: 'trusted', CUSTOM_NORMAL: 'ok' });

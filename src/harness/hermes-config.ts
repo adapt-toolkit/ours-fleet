@@ -11,8 +11,9 @@ import type { AcpMcpServer, RoleDirs, SessionPrep, ValidationError } from './typ
 export interface HermesOptions { mcp_servers?: Record<string, McpServerSpec> }
 
 const mapping = (value: unknown): value is Record<string, unknown> => value !== null && typeof value === 'object' && !Array.isArray(value);
+const credentialPathName = (key: string): boolean => /(?:^|_)CREDENTIALS(?:_PATH|_FILE)?$/i.test(key);
 const reserved = (key: string): boolean => /^(?:_?HERMES_|OURS_|COPILOT_|CODEX_HOME$|TERMINAL_|OPENAI_|ANTHROPIC_|AZURE_|AWS_|GOOGLE_|GEMINI_|GROQ_|OPENROUTER_|NOUS_|TOGETHER_|FIREWORKS_|DEEPSEEK_|XAI_|MISTRAL_|COHERE_|OLLAMA_|LM_STUDIO_|VLLM_)/i.test(key)
-  || /(?:_API_KEY|_TOKEN|_SECRET|_PASSWORD|_BASE_URL|_KEY)$/i.test(key);
+  || /(?:_API_KEY|_TOKEN|_SECRET|_PASSWORD|_BASE_URL|_KEY)$/i.test(key) || credentialPathName(key);
 // Native providers may choose arbitrary credential variable names (key_env).
 // An execution allowlist is therefore the inherited baseline, not a credential denylist.
 const executionKey = (key: string): boolean => /^(?:PATH|HOME|USER|LOGNAME|SHELL|LANG|LANGUAGE|LC_[A-Z_]+|TERM|COLORTERM|TMPDIR|TMP|TEMP|TZ|SystemRoot|SYSTEMROOT|WINDIR|COMSPEC|ComSpec|PATHEXT|USERPROFILE|HOMEDRIVE|HOMEPATH|APPDATA|LOCALAPPDATA|PROGRAMDATA|PROGRAMFILES|ProgramFiles|NUMBER_OF_PROCESSORS|OS|PROCESSOR_ARCHITECTURE)$/i.test(key);
@@ -62,25 +63,84 @@ function throwErrors(errors: ValidationError[]): void {
 // Match the supported native config expander's ${VAR} and ${env:VAR} shapes.
 const hasNativeInterpolation = (value: unknown): boolean => typeof value === 'string' && /\$\{[^}]+\}/.test(value);
 
+// Native config.py's credential vocabulary, plus its model.api alias below.
+const credentialFields = new Set(['api_key', 'apikey', 'key', 'token', 'access_token', 'refresh_token', 'id_token', 'secret', 'client_secret', 'password', 'passwd', 'auth', 'authorization', 'private_key', 'bearer', 'jwt']);
+const credentialEnvName = (key: string): boolean => credentialFields.has(key.toLowerCase()) || /(?:_API_KEY|_TOKEN|_SECRET|_PASSWORD|_PASSWD|_KEY)$/i.test(key) || credentialPathName(key);
+
+function configReferences(value: string): string[] {
+  return [...value.matchAll(/\$\{([^}]+)\}/g)].flatMap(match => {
+    const inner = match[1].trim();
+    const name = inner.startsWith('env:') ? inner.slice(4).trim()
+      : /^[a-z][a-z0-9_-]*:/.test(inner) ? '' : inner;
+    return name ? [name] : [];
+  });
+}
 function nativeCredentialKeys(config: Record<string, unknown>): Set<string> {
   const keys = new Set<string>();
-  const seen = new Set<object>();
-  const visit = (value: unknown): void => {
-    if (value === null || typeof value !== 'object' || seen.has(value)) return;
-    seen.add(value);
+  // YAML aliases can reach the same object through ordinary and credential fields.
+  const seen = [new Set<object>(), new Set<object>()];
+  const visit = (value: unknown, credential = false): void => {
+    if (typeof value === 'string') {
+      if (credential) for (const name of configReferences(value)) keys.add(name);
+      return;
+    }
+    if (value === null || typeof value !== 'object' || seen[Number(credential)].has(value)) return;
+    seen[Number(credential)].add(value);
     for (const [key, child] of Object.entries(value)) {
       if ((key === 'key_env' || key === 'api_key_env') && typeof child === 'string' && child.trim()) {
         if (hasNativeInterpolation(child)) throw new Error('Hermes credential variable names do not support interpolation in a Fleet-managed home; provision literal key_env/api_key_env names with the role stopped');
         keys.add(child.trim());
-      }
-      else visit(child);
+      } else visit(child, credential || credentialFields.has(key.toLowerCase()) || key === 'extra_headers' || (value === config.model && key === 'api'));
     }
   };
   visit(config);
   return keys;
 }
-function validateNativeCredentialOverrides(role: ResolvedRole, config: Record<string, unknown>): Set<string> {
+
+interface DotenvSource { references: Set<string>; ambiguous: boolean }
+function dotenvSources(content: string, sources: Map<string, DotenvSource>): void {
+  const lines = content.split(/\r\n?|\n/);
+  for (let i = 0; i < lines.length; i++) {
+    const assignment = /^\s*(?:export\s+)?(?:'([^']+)'|([^\s=#]+))\s*=/.exec(lines[i]);
+    if (!assignment) continue;
+    const key = assignment[1] ?? assignment[2];
+    let value = lines[i].slice(assignment[0].length).trimStart();
+    let ambiguous = false;
+    if (value.startsWith('"') || value.startsWith("'")) {
+      // Only discover references: do not expand values or resolve assignment precedence.
+      const quoted = value.startsWith('"') ? /^"((?:\\"|[^"])*)"/ : /^'((?:\\'|[^'])*)'/;
+      let match = quoted.exec(value);
+      let last = i;
+      let combined = value;
+      while (!match && last + 1 < lines.length) {
+        combined += '\n' + lines[++last];
+        match = quoted.exec(combined);
+      }
+      if (match) { value = match[1]; ambiguous = last !== i; i = last; }
+      else ambiguous = true;
+    } else value = value.replace(/\s+#.*$/, '').trimEnd();
+    // python-dotenv uses ${NAME} / ${NAME:-default}, not Hermes config's env: prefix.
+    const references = [...value.matchAll(/\$\{([^}:]*)(?::-[^}]*)?\}/g)].map(match => match[1]);
+    const source = sources.get(key) ?? { references: new Set<string>(), ambiguous: false };
+    for (const name of references) source.references.add(name);
+    source.ambiguous ||= references.length > 0 && (ambiguous || value.includes('\\'));
+    sources.set(key, source);
+  }
+}
+function validateNativeCredentialOverrides(role: ResolvedRole, config: Record<string, unknown>, home: string): Set<string> {
   const keys = nativeCredentialKeys(config);
+  const sources = new Map<string, DotenvSource>();
+  for (const name of ['.env', '.op.env']) {
+    const content = validateHomeDotenv(join(home, name));
+    if (content !== undefined) dotenvSources(content, sources);
+  }
+  for (const key of sources.keys()) if (credentialEnvName(key)) keys.add(key);
+  // Set iteration visits newly added dependencies; cycles terminate without evaluating secrets.
+  for (const key of keys) {
+    const source = sources.get(key);
+    if (source?.ambiguous) throw new Error('Hermes credential dotenv interpolation must use single-line assignments without escape encoding; provision it with the role stopped');
+    for (const dependency of source?.references ?? []) keys.add(dependency);
+  }
   for (const key of keys) if (Object.hasOwn(role.env ?? {}, key)) throw new Error('role.env overrides a native credential variable; provision credentials in the stopped Hermes home');
   return keys;
 }
@@ -88,7 +148,7 @@ function validateNativeCredentialOverrides(role: ResolvedRole, config: Record<st
 /** Complete environment: transport MUST use inheritEnvironment:false after this final merge. */
 export function hermesChildEnvironment(role: ResolvedRole, home: string, trustedFleetEnv: Record<string, string>, inherited: NodeJS.ProcessEnv = process.env): Record<string, string> {
   for (const key of Object.keys(role.env ?? {})) if (reserved(key)) throw new Error(`env.${key} is reserved; provision native credentials in the stopped Hermes home`);
-  const credentialKeys = validateNativeCredentialOverrides(role, readConfig(join(home, 'config.yaml')));
+  const credentialKeys = validateNativeCredentialOverrides(role, readConfig(join(home, 'config.yaml')), home);
   const env: Record<string, string> = {};
   for (const [key, value] of Object.entries(inherited)) if (value !== undefined && executionKey(key) && !credentialKeys.has(key)) env[key] = value;
   Object.assign(env, role.env);
@@ -131,7 +191,7 @@ function parseNativeFile(path: string): unknown {
   catch { throw new Error(`Invalid Hermes configuration file; repair it with the role stopped: ${path}`); }
 }
 
-function validateHomeDotenv(path: string): void {
+function validateHomeDotenv(path: string): string | undefined {
   if (!regular(path)) return;
   // Native dotenv accepts export and single-quoted keys. Read keys only; never
   // return credential values or native parser diagnostics that may contain them.
@@ -155,6 +215,7 @@ function validateHomeDotenv(path: string): void {
       throw new Error(`Hermes home dotenv contains a reserved Fleet/Hermes setting; remove it with the role stopped: ${path}`);
     }
   }
+  return content;
 }
 function readConfig(path: string): Record<string, unknown> {
   if (!regular(path)) return {};
@@ -223,10 +284,8 @@ export async function prepareHermesConfig(role: ResolvedRole, dirs: RoleDirs): P
     const config = readConfig(file);
     const model = managedMapping(config, 'model');
     const approvals = managedMapping(config, 'approvals');
-    validateNativeCredentialOverrides(role, config);
+    validateNativeCredentialOverrides(role, config, home);
     validateHomeMcp(config, home);
-    // Inspect only selected-home metadata; opaque credential values remain native-owned.
-    for (const name of ['.env', '.op.env']) validateHomeDotenv(join(home, name));
     config.model = { ...model, default: role.model };
     config.approvals = { ...approvals, mode: 'manual' };
     replaceFileAtomically(file, YAML.stringify(config), 0o600);
