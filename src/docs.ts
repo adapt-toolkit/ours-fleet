@@ -850,6 +850,13 @@ configuration. \`/comments status\` reports the live value, the baseline, and
 whether the backend emits live comments at all. Suppressing live comments never
 suppresses receipts, progress notices, or the final answer.
 
+Hermes ACP servers can opt into the version-1 messagePhases extension. Their
+interim comments and self-improvement summaries use this same owner-only path
+and toggle; ordinary stream/final text is unchanged. Late reviews keep the
+original owner/source wire, using up to 128 in-memory routes for one hour.
+Unknown, expired, replayed, or previous-session notices are dropped rather than
+sent to the latest owner. Older Hermes servers retain their existing behavior.
+
 Owner documents, images, and voice messages use the same authenticated sender
 and source-wire boundary. Fleet inspects body-free metadata first and rejects
 disabled, over-count, or over-size requests before selective

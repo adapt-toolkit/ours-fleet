@@ -1034,7 +1034,8 @@ An owner request follows one ordered lifecycle on its authenticated source wire:
 1. Fleet sends an immediate receipt describing started, queued, or interrupting state.
 2. Periodic fleet-generated summaries may report allowlisted ACP activity shapes.
 3. On maintained Codex ACP adapters, assistant chunks carrying the exact
-   `_meta.codex.phase = "commentary"` marker are automatically batched and forwarded
+   `_meta.codex.phase = "commentary"` marker, and negotiated Hermes commentary
+   copies (`_meta.hermes.messagePhases = 1`), are automatically batched and forwarded
    on this request's fixed owner CID/source wire, each prefixed with the single
    stable label `🟡 Live update:`. Unknown or absent phases are never
    inferred as commentary; thoughts, tools, permissions, prompts, and raw events are
@@ -1062,6 +1063,19 @@ batch, while an uncertain in-flight update may be omitted rather than duplicated
 The `🟡 Live update:` label is fleet-authored and applied after those safety
 checks, so model content can never remove or forge it, and it is presentation
 only — dedupe still keys on the unlabeled batch.
+
+Hermes support requires an ACP server that acknowledges the `hermes.messagePhases`
+version-1 capability. Fleet supplies an opaque turn ID with each prompt; Hermes
+uses it for additional interim comments and self-improvement review summaries.
+The ordinary stream and final answer stay unchanged, so a comment may also appear
+in the final answer. Reviews may arrive after the final or during another request;
+Fleet routes them only to the original authenticated owner/source wire. These
+routes are memory-only, capped at 128 requests and one hour from prompt start;
+unknown, expired, and previous-session tokens are dropped. There is no offline
+replay/retry or fallback to the latest owner. Review notices retain the same
+`🟡 Live update:` label and the `Self-improvement review` text. Raw tool calls are
+not forwarded as comments. Additional commentary copies are redacted from Fleet
+diagnostic logs; ordinary response text keeps its existing storage policy.
 
 Live comments are configurable. `owner_channel.comments` (default `true`, so an
 existing channel keeps relaying exactly as before) is the **restart baseline**.

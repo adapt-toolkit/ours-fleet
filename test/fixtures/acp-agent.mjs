@@ -5,6 +5,8 @@ const sessionId = 'fixture-session';
 let permissionRequestId = 10_000;
 const pendingPermission = new Map();
 let activePromptId;
+let hermesTurn;
+let hermesPhases = false;
 let pendingToolwaitAnswer;
 // A "stubborn" prompt ignores session/cancel entirely: the adapter-misbehavior
 // case the client's cancel-escalation grace period exists for.
@@ -202,6 +204,8 @@ createInterface({ input: process.stdin }).on('line', line => {
     appendFileSync(process.env.ACP_FIXTURE_REQUEST_LOG, message.method + '\n');
   switch (message.method) {
     case 'initialize':
+      hermesPhases = process.env.ACP_FIXTURE_HERMES_PHASES === '1'
+        && message.params.clientCapabilities?._meta?.hermes?.messagePhases === 1;
       send({
         jsonrpc: '2.0',
         id: message.id,
@@ -209,6 +213,7 @@ createInterface({ input: process.stdin }).on('line', line => {
           protocolVersion: 1,
           agentInfo: { name: 'fixture-agent', version: 'test-artifact' },
           agentCapabilities: {
+            ...(hermesPhases ? { _meta: { hermes: { messagePhases: 1 } } } : {}),
             loadSession: process.env.ACP_FIXTURE_LOAD_SESSION === '1',
             sessionCapabilities: {
               close: {},
@@ -360,6 +365,24 @@ createInterface({ input: process.stdin }).on('line', line => {
     }
     case 'session/prompt': {
       const text = message.params.prompt.find(block => block.type === 'text')?.text ?? '';
+      if (text === 'hermes commentary' && hermesPhases) {
+        hermesTurn = message.params._meta?.hermes?.turnId;
+        update({ sessionUpdate: 'agent_message_chunk', messageId: 'hermes-commentary',
+          content: { type: 'text', text: 'Checking the skill.' },
+          _meta: { hermes: { messagePhases: 1, phase: 'commentary', source: 'assistant', turnId: hermesTurn } } });
+      }
+      if (text === 'hermes review flush') {
+        if (hermesTurn) update({ sessionUpdate: 'agent_message_chunk', messageId: 'invalid-review',
+          content: { type: 'text', text: 'MALFORMED_REVIEW' },
+          _meta: { hermes: { messagePhases: 1, phase: 'commentary', source: ['background_review'], turnId: hermesTurn } } });
+        for (const [turnId, messageId] of [[hermesTurn, 'hermes-review'], ['unknown-token', 'unknown-review']]) {
+          if (!turnId) continue;
+          update({ sessionUpdate: 'agent_message_chunk', messageId,
+            content: { type: 'text', text: 'CANARY_HERMES_REVIEW' },
+            _meta: { hermes: { messagePhases: 1, phase: 'commentary', source: 'background_review', turnId } } });
+        }
+      }
+
       // FLEET-003 wire shape: while a steering-started turn owns the adapter,
       // an arriving prompt is folded into that turn. It produces updates but
       // NEVER receives a stopReason of its own — the observed production

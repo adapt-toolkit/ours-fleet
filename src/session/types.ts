@@ -332,9 +332,11 @@ export interface SessionEvent {
   text?: string;
   /**
    * Adapter-authenticated presentation phase for assistant text. Only the
-   * exact Codex phase marker is promoted; absence/unknown values stay unset.
+   * exact Codex marker or negotiated Hermes commentary is promoted.
    */
   messagePhase?: 'commentary' | 'final_answer';
+  /** Background review stays correlated to its original owner request after a turn ends. */
+  commentarySource?: 'assistant' | 'background_review';
   /** Stable adapter message/item id when supplied. */
   messageId?: string;
   /** True when the adapter is replaying history rather than emitting live work. */

@@ -344,6 +344,11 @@ export class AcpSession implements AgentSession {
   private replaying = false;
   private readonly sessionFile: string;
   private readonly pendingPermissions = new Map<string, PendingPermission>();
+  private hermesMessagePhases = false;
+  // Delayed review callbacks must resolve their original owner, never the current turn.
+  private readonly hermesOwnerTurns = new Map<string, {
+    origin: Extract<PromptOrigin, { kind: 'owner' }>; expiresAt: number;
+  }>();
   private connection: acp.ClientConnection;
   private sessionId?: string;
   private readiness: SessionSnapshot['readiness'] = 'starting';
@@ -1204,13 +1209,20 @@ export class AcpSession implements AgentSession {
   private async initialize(): Promise<void> {
     const initialized = await this.connection.agent.request(acp.methods.agent.initialize, {
       protocolVersion: acp.PROTOCOL_VERSION,
-      clientCapabilities: {},
+      clientCapabilities: this.options.harness === 'hermes'
+        ? { _meta: { hermes: { messagePhases: 1 } } } : {},
       clientInfo: { name: 'ours-fleet', version: '1' },
     });
     if (initialized.protocolVersion !== acp.PROTOCOL_VERSION)
       throw new Error(
         `ACP protocol mismatch: agent selected ${initialized.protocolVersion}, client supports ${acp.PROTOCOL_VERSION}`);
     this.agentCapabilities = initialized.agentCapabilities;
+    const hermes = initialized.agentCapabilities?._meta?.hermes;
+    this.hermesOwnerTurns.clear();
+    this.hermesMessagePhases = this.options.harness === 'hermes'
+      && hermes !== null && typeof hermes === 'object' && !Array.isArray(hermes)
+      && (hermes as Record<string, unknown>).messagePhases === 1;
+    if (this.options.harness === 'hermes') this.capabilities.messagePhases = this.hermesMessagePhases;
     const steering = initialized._meta?.steering;
     this.steeringSupported = steering !== null && typeof steering === 'object'
       && (steering as { supported?: unknown }).supported === true;
@@ -1471,6 +1483,15 @@ export class AcpSession implements AgentSession {
     let settle!: () => void;
     const settled = new Promise<void>(resolve => { settle = resolve; });
     this.activeTurn = { toolEvidence: new Map(), startedAt: Date.now(), toolIds: new Set(), lastProgressAt: 0, progressCount: 0, transportFailures: 0, boundaryUnknown: false, id: turnId, output: '', origin, settled, settle };
+    if (this.hermesMessagePhases && origin?.kind === 'owner') {
+      for (const [id, route] of this.hermesOwnerTurns)
+        if (route.expiresAt <= Date.now()) this.hermesOwnerTurns.delete(id);
+      this.hermesOwnerTurns.set(turnId, {
+        origin: { kind: 'owner', requestId: origin.requestId }, expiresAt: Date.now() + 60 * 60_000,
+      });
+      if (this.hermesOwnerTurns.size > 128)
+        this.hermesOwnerTurns.delete(this.hermesOwnerTurns.keys().next().value!);
+    }
     this.events.emit('state', { turnId, status: 'running', origin });
     this.conversation.appendSafe({
       kind: 'prompt.started', sessionGeneration: this.sessionGeneration,
@@ -1482,6 +1503,7 @@ export class AcpSession implements AgentSession {
         this.connection.agent.request(acp.methods.agent.session.prompt, {
           sessionId: this.sessionId,
           prompt: promptContentBlocks(text, origin),
+          ...(this.hermesMessagePhases ? { _meta: { hermes: { turnId } } } : {}),
         }),
         this.terminated,
       ]);
@@ -1800,7 +1822,44 @@ export class AcpSession implements AgentSession {
     this.activeTurn.transportFailures++;
   }
 
+  /** Additional Hermes notices never become ordinary text or another turn's activity. */
+  private recordHermesCommentary(update: acp.SessionUpdate): boolean {
+    if (update.sessionUpdate !== 'agent_message_chunk' || update._meta?.hermes === undefined)
+      return false;
+    const raw = update._meta.hermes;
+    // Drop malformed/unnegotiated extension payloads before any generic persistence.
+    if (!this.hermesMessagePhases || this.replaying || !raw || typeof raw !== 'object'
+        || Array.isArray(raw) || update._meta.codex !== undefined) return true;
+    const meta = raw as Record<string, unknown>;
+    if (meta.messagePhases !== 1 || meta.phase !== 'commentary'
+        || (meta.source !== 'assistant' && meta.source !== 'background_review')
+        || typeof meta.turnId !== 'string' || !meta.turnId
+        || typeof update.messageId !== 'string' || !update.messageId
+        || update.messageId.length > 256 || update.content.type !== 'text'
+        || !update.content.text.trim() || Buffer.byteLength(update.content.text) > 16_384) return true;
+    const route = this.hermesOwnerTurns.get(meta.turnId);
+    if (!route || route.expiresAt <= Date.now()) {
+      this.hermesOwnerTurns.delete(meta.turnId);
+      return true;
+    }
+    if (meta.source === 'assistant' && this.activeTurn?.id !== meta.turnId) return true;
+    this.conversation.appendSafe({
+      kind: 'message.chunk', sessionGeneration: this.sessionGeneration, acpSessionId: this.sessionId,
+      promptId: meta.turnId, turnId: meta.turnId, messageId: update.messageId, source: 'agent',
+      payload: { role: 'assistant', content: {
+        type: 'text', text: OWNER_COMMENTARY_REDACTION, bytes: Buffer.byteLength(OWNER_COMMENTARY_REDACTION),
+      } },
+    });
+    this.events.emit('agent_text', {
+      turnId: meta.turnId, origin: route.origin, text: update.content.text,
+      messageId: update.messageId, messagePhase: 'commentary',
+      commentarySource: meta.source,
+    });
+    return true;
+  }
+
   private recordUpdate(update: acp.SessionUpdate): void {
+    if (this.recordHermesCommentary(update)) return;
     // Replayed history is not current activity: `session/load` would otherwise
     // make a cold session look like it had just been working. The same reason
     // keeps it from extending the steering lease, which is evidence the adapter

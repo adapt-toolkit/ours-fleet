@@ -24,6 +24,7 @@ afterEach(() => {
 async function start(
   approval: 'ask' | 'allow' | 'deny' = 'allow',
   extra: {
+    harness?: string;
     requireMode?: boolean;
     inheritEnvironment?: boolean;
     validateStartupResponse?: AcpSessionOptions['validateStartupResponse'];
@@ -40,6 +41,7 @@ async function start(
   dirs.push(stateDir);
   return AcpSession.start({
     name: 'A',
+    harness: extra.harness,
     argv: [process.execPath, fixture],
     cwd: stateDir,
     env: extra.env ?? {},
@@ -102,6 +104,46 @@ describe('AcpSession', () => {
       }),
     ]));
     await session.close();
+  });
+
+  it('negotiates additive Hermes commentary and keeps a late review on its original owner turn', async () => {
+    const session = await start('allow', { harness: 'hermes', env: { ACP_FIXTURE_HERMES_PHASES: '1' } });
+    try {
+      expect(session.capabilities.messagePhases).toBe(true);
+      const first = await session.submitPrompt('hermes commentary', {
+        origin: { kind: 'owner', requestId: 'owner-A' },
+      });
+      expect(first.output).toBe('echo:hermes commentary');
+      const commentary = session.eventsSince(0).find(event => event.messageId === 'hermes-commentary');
+      expect(commentary).toMatchObject({ messagePhase: 'commentary', origin: { kind: 'owner', requestId: 'owner-A' } });
+      const second = await session.submitPrompt('hermes review flush', {
+        origin: { kind: 'local-console' },
+      });
+      expect(second.output).toBe('echo:hermes review flush');
+      const review = session.eventsSince(0).find(event => event.messageId === 'hermes-review');
+      expect(review).toMatchObject({
+        kind: 'agent_text', messagePhase: 'commentary', commentarySource: 'background_review',
+        turnId: commentary?.turnId, origin: { kind: 'owner', requestId: 'owner-A' },
+        text: 'CANARY_HERMES_REVIEW',
+      });
+      expect(session.eventsSince(0).some(event => event.messageId === 'unknown-review')).toBe(false);
+      expect(session.eventsSince(0).some(event => event.messageId === 'invalid-review')).toBe(false);
+      const persisted = readFileSync(join(dirs.at(-1)!, '.session-events.jsonl'), 'utf8');
+      expect(persisted).not.toContain('CANARY_HERMES_REVIEW');
+      expect(JSON.stringify(session.conversationPage({ limit: 1000 }))).not.toContain('CANARY_HERMES_REVIEW');
+    } finally { await session.close(); }
+  });
+
+  it('does not enable Hermes commentary without negotiation or let another harness opt in', async () => {
+    for (const extra of [{ harness: 'hermes' }, { harness: 'codex', env: { ACP_FIXTURE_HERMES_PHASES: '1' } }]) {
+      const session = await start('allow', extra);
+      try {
+        if (extra.harness === 'hermes') expect(session.capabilities.messagePhases).toBe(false);
+        const result = await session.submitPrompt('hermes review flush');
+        expect(result.output).toBe('echo:hermes review flush');
+        expect(session.eventsSince(0).some(event => event.messageId === 'unknown-review')).toBe(false);
+      } finally { await session.close(); }
+    }
   });
 
   it('fails closed when an adapter supplies an unknown assistant phase', async () => {

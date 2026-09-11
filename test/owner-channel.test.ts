@@ -1767,6 +1767,230 @@ describe('OwnerChannel notice presentation', () => {
       .toBe('🟡 Live update: not fleet-authored');
   });
 
+  it('delivers a late background review only to its original owner after final and during another turn', async () => {
+    vi.useFakeTimers();
+    const { channel, client, completions, emit } = liveSetup({
+      interrupt: false, owners: [OWNER_CID, OTHER_OWNER_CID],
+    });
+    client.batches.push([ownerMessage(1, 'wire-review-a', 'Review A')]);
+    await channel.drain();
+    completions[0](done('A final'));
+    await vi.advanceTimersByTimeAsync(0);
+    client.batches.push([{
+      msg_id: 2, wire_id: 'wire-review-b', from: { id: OTHER_OWNER_CID }, text: 'Review B',
+    }]);
+    await channel.drain();
+    const review = {
+      kind: 'agent_text' as const, turnId: 'prompt-1',
+      origin: { kind: 'owner' as const,
+        requestId: createHash('sha256').update('wire-review-a').digest('hex') },
+      messagePhase: 'commentary' as const, messageId: 'review-a',
+      commentarySource: 'background_review' as const, text: 'A review result.',
+    };
+    emit(review);
+    emit({ ...review, replayed: true });
+    emit({ ...review, messageId: 'duplicate' });
+    emit({ ...review, turnId: 'unknown', text: 'Unknown review.' });
+    emit({ ...review, turnId: 'prompt-2', text: 'Wrong origin.' });
+    emit({ ...review, origin: { kind: 'owner', requestId: 'wrong' }, text: 'Wrong request.' });
+    emit({ ...review, origin: { kind: 'fleet-monitor' }, text: 'Non-owner review.' });
+    await vi.waitFor(() => expect(client.calls.some(call =>
+      call.args?.text === ownerNotices.comment('A review result.'))).toBe(true));
+    const comments = client.calls.filter(call => call.name === 'sendMessage'
+      && String(call.args?.text).startsWith(OWNER_COMMENT_LABEL));
+    expect(comments).toHaveLength(1);
+    expect(comments[0].args).toMatchObject({ contact: OWNER_CID,
+      replyToWireId: 'wire-review-a', text: ownerNotices.comment('A review result.') });
+    completions[1](done('A review result.'));
+    await vi.advanceTimersByTimeAsync(0);
+    expect(client.calls.find(call => call.args?.text === 'A review result.')?.args)
+      .toMatchObject({ contact: OTHER_OWNER_CID, replyToWireId: 'wire-review-b' });
+    await channel.close();
+    emit({ ...review, messageId: 'after-close', text: 'Closed review.' });
+    await vi.advanceTimersByTimeAsync(750);
+    expect(client.calls.some(call => call.args?.text === ownerNotices.comment('Closed review.')))
+      .toBe(false);
+  });
+
+  it.each(['toggle', 'revocation', 'expiry'] as const)(
+    'suppresses a queued background review after %s', async change => {
+      vi.useFakeTimers();
+      const { channel, client, completions, emit } = liveSetup({
+        owners: [OWNER_CID, OTHER_OWNER_CID],
+      });
+      if (change === 'revocation') await channel.start();
+      client.batches.push([ownerMessage(1, 'wire-review-queued', 'Review')]);
+      await channel.drain();
+      completions[0](done('Final'));
+      await vi.advanceTimersByTimeAsync(0);
+      const held = deferred();
+      const sendMessage = client.sendMessage.bind(client);
+      client.sendMessage = async args => {
+        const result = await sendMessage(args);
+        if (args.text === ownerNotices.comment('First review.')) await held.promise;
+        return result;
+      };
+      const review = {
+        kind: 'agent_text' as const, turnId: 'prompt-1',
+        origin: { kind: 'owner' as const,
+          requestId: createHash('sha256').update('wire-review-queued').digest('hex') },
+        messagePhase: 'commentary' as const, commentarySource: 'background_review' as const,
+        messageId: 'review-1', text: 'First review.',
+      };
+      emit(review);
+      await vi.waitFor(() => expect(client.calls.some(call =>
+        call.args?.text === ownerNotices.comment('First review.'))).toBe(true));
+      emit({ ...review, messageId: 'review-2', text: 'Queued review.' });
+      if (change === 'toggle') {
+        client.batches.push([ownerMessage(2, 'wire-disable', '/comments off')]);
+        await channel.drain();
+      } else if (change === 'revocation') {
+        await channel.manage({ action: 'owner_revoke', cid: OWNER_CID });
+      } else {
+        await vi.advanceTimersByTimeAsync(60 * 60 * 1_000);
+      }
+      held.resolve();
+      await vi.advanceTimersByTimeAsync(0);
+      emit({ ...review, messageId: 'review-3', text: 'Later review.' });
+      await vi.advanceTimersByTimeAsync(750);
+      const comments = client.calls.filter(call => call.name === 'sendMessage'
+        && String(call.args?.text).startsWith(OWNER_COMMENT_LABEL));
+      expect(comments.map(call => call.args?.text)).toEqual([ownerNotices.comment('First review.')]);
+      await channel.close();
+    },
+  );
+
+  it('evicts old background review routes when more than 128 owner requests are retained', async () => {
+    vi.useFakeTimers();
+    const { channel, client, completions, emit } = liveSetup({ interrupt: false });
+    for (let i = 1; i <= 129; i++) {
+      client.batches.push([ownerMessage(i, `wire-bounded-${i}`, 'Review')]);
+      await channel.drain();
+      completions[i - 1](done(`Final ${i}`));
+      await vi.advanceTimersByTimeAsync(0);
+    }
+    for (const i of [1, 2, 129]) {
+      emit({ kind: 'agent_text', turnId: `prompt-${i}`,
+        origin: { kind: 'owner',
+          requestId: createHash('sha256').update(`wire-bounded-${i}`).digest('hex') },
+        messagePhase: 'commentary', commentarySource: 'background_review',
+        messageId: `review-${i}`, text: `Review ${i}` });
+    }
+    await vi.waitFor(() => expect(client.calls.filter(call => call.name === 'sendMessage'
+      && String(call.args?.text).startsWith(OWNER_COMMENT_LABEL))).toHaveLength(2));
+    const comments = client.calls.filter(call => call.name === 'sendMessage'
+      && String(call.args?.text).startsWith(OWNER_COMMENT_LABEL));
+    expect(comments.map(call => call.args?.replyToWireId))
+      .toEqual(['wire-bounded-2', 'wire-bounded-129']);
+    await channel.close();
+  }, 20_000);
+
+  it('delivers a live background review emitted before queuePrompt returns', async () => {
+    vi.useFakeTimers();
+    const { channel, client, completions, emit, queuePrompt } = liveSetup();
+    const enqueue = queuePrompt.getMockImplementation()!;
+    queuePrompt.mockImplementationOnce(async (text, options) => {
+      const queued = await enqueue(text, options);
+      emit({ kind: 'agent_text', turnId: queued.promptId,
+        origin: { kind: 'owner',
+          requestId: createHash('sha256').update('wire-early-review').digest('hex') },
+        messagePhase: 'commentary', commentarySource: 'background_review',
+        messageId: 'early-review', text: 'Early review.' });
+      return queued;
+    });
+    client.batches.push([ownerMessage(1, 'wire-early-review', 'Review')]);
+    await channel.drain();
+    await vi.advanceTimersByTimeAsync(0);
+    const comments = client.calls.filter(call => call.args?.text === ownerNotices.comment('Early review.'));
+    expect(comments).toHaveLength(1);
+    expect(comments[0].args).toMatchObject({ contact: OWNER_CID, replyToWireId: 'wire-early-review' });
+    completions[0](done('Final'));
+    await vi.advanceTimersByTimeAsync(0);
+    await channel.close();
+  });
+
+  it('serializes a late review behind an in-flight final answer', async () => {
+    vi.useFakeTimers();
+    const { channel, client, completions, emit } = liveSetup();
+    client.batches.push([ownerMessage(1, 'wire-final-held', 'Review')]);
+    await channel.drain();
+    const held = deferred();
+    const sendMessage = client.sendMessage.bind(client);
+    client.sendMessage = async args => {
+      const result = await sendMessage(args);
+      if (args.text === 'Final held') await held.promise;
+      return result;
+    };
+    completions[0](done('Final held'));
+    await vi.advanceTimersByTimeAsync(0);
+    emit({ kind: 'agent_text', turnId: 'prompt-1',
+      origin: { kind: 'owner',
+        requestId: createHash('sha256').update('wire-final-held').digest('hex') },
+      messagePhase: 'commentary', commentarySource: 'background_review',
+      messageId: 'review', text: 'Review behind final.' });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(client.calls.some(call => call.args?.text === ownerNotices.comment('Review behind final.')))
+      .toBe(false);
+    held.resolve();
+    await vi.advanceTimersByTimeAsync(0);
+    await vi.waitFor(() => expect(client.calls.some(call =>
+      call.args?.text === ownerNotices.comment('Review behind final.'))).toBe(true));
+    await channel.close();
+  });
+
+  it('still delivers a background review after final-answer transport failed', async () => {
+    vi.useFakeTimers();
+    const { channel, client, completions, emit } = liveSetup();
+    client.batches.push([ownerMessage(1, 'wire-final-failed', 'Review')]);
+    await channel.drain();
+    const sendMessage = client.sendMessage.bind(client);
+    client.sendMessage = async args => {
+      if (args.text === 'Failed final') throw new Error('transport failed');
+      return sendMessage(args);
+    };
+    completions[0](done('Failed final'));
+    await vi.advanceTimersByTimeAsync(0);
+    emit({ kind: 'agent_text', turnId: 'prompt-1',
+      origin: { kind: 'owner',
+        requestId: createHash('sha256').update('wire-final-failed').digest('hex') },
+      messagePhase: 'commentary', commentarySource: 'background_review',
+      messageId: 'review', text: 'Review after failed final.' });
+    await vi.waitFor(() => expect(client.calls.some(call =>
+      call.args?.text === ownerNotices.comment('Review after failed final.'))).toBe(true));
+    await channel.close();
+  });
+
+  it('waits for an in-flight background review before closing its client', async () => {
+    vi.useFakeTimers();
+    const { channel, client, completions, emit } = liveSetup();
+    client.batches.push([ownerMessage(1, 'wire-review-close', 'Review')]);
+    await channel.drain();
+    completions[0](done('Final'));
+    await vi.advanceTimersByTimeAsync(0);
+    const held = deferred();
+    const sendMessage = client.sendMessage.bind(client);
+    client.sendMessage = async args => {
+      const result = await sendMessage(args);
+      if (args.text === ownerNotices.comment('Pending review.')) await held.promise;
+      return result;
+    };
+    let closed = false;
+    client.close = async () => { closed = true; };
+    emit({ kind: 'agent_text', turnId: 'prompt-1',
+      origin: { kind: 'owner',
+        requestId: createHash('sha256').update('wire-review-close').digest('hex') },
+      messagePhase: 'commentary', commentarySource: 'background_review',
+      messageId: 'review', text: 'Pending review.' });
+    await vi.waitFor(() => expect(client.calls.some(call =>
+      call.args?.text === ownerNotices.comment('Pending review.'))).toBe(true));
+    const closing = channel.close();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(closed).toBe(false);
+    held.resolve();
+    await closing;
+    expect(closed).toBe(true);
+  });
+
   it('batches only correlated Codex commentary before the final and dedupes replay', async () => {
     vi.useFakeTimers();
     const { channel, client, completions, emit, dir } = liveSetup();
