@@ -212,6 +212,20 @@ describe('ScheduledLoopManager strict cadence', () => {
     expect(status.manager.status().loops.health.counts.skippedBusy ?? 0).toBe(0);
   });
 
+  it('does not abandon healthy compaction after a deferred timeout cancellation', async () => {
+    const status = setup([definition('health', { intervalMs: 10 * 60_000 })], 0, undefined, 30_000);
+    status.session.interrupt = async () => ({ state: 'deferred', reasonCode: 'ACP_COMPACTION_IN_PROGRESS' });
+    status.manager.start();
+    status.setNow(60_000);
+    await status.manager.poll();
+    const runId = status.manager.status().loops.health.activeRunId;
+    status.timers.find(timer => timer.ms === 5 * 60_000 && !timer.cleared)!.callback();
+    await new Promise(resolve => setImmediate(resolve));
+    for (const timer of status.timers.filter(timer => timer.ms === 30_000 && !timer.cleared)) timer.callback();
+    expect(status.manager.status().loops.health.activeRunId).toBe(runId);
+    expect(status.logs.join('\n')).toContain('deferred');
+  });
+
   it('abandons a run whose cancellation never settles, without double-reporting it', async () => {
     const status = setup([definition('health', { intervalMs: 10 * 60_000 })], 0, undefined, 30_000);
     status.manager.start();

@@ -6,8 +6,14 @@ import { realExec, type Exec } from '../exec.js';
 export const TESTED_HERMES_ARTIFACT = {
   commit: 'd15ed4445207dda418b984e8bda0f68f48b8c6f3', hermesVersion: '0.21.1', acpVersion: '0.9.0', protocolVersion: 1,
 } as const;
+export const TESTED_HERMES_COMPACTION_ARTIFACT = {
+  commit: '89c309efb8feb95dfb7d0898a35a76a6faa659f4', hermesVersion: '0.21.1',
+  acpVersion: '0.9.0+ours.compaction1', protocolVersion: 1,
+  acpSourceDigest: '945a8c8c26e214e1fad043fc308026e54b5ade5c3ce636f9bb82255c44998866',
+} as const;
+type TestedHermesArtifact = typeof TESTED_HERMES_ARTIFACT | typeof TESTED_HERMES_COMPACTION_ARTIFACT;
 export interface HermesCompatibilityReport {
-  artifact: typeof TESTED_HERMES_ARTIFACT & { sourceRoot: string; executable: string };
+  artifact: TestedHermesArtifact & { sourceRoot: string; executable: string };
   /** Scoped prerequisite only: ACP connection/tool availability and other launch checks remain separate. */
   pluginMcp: 'absent-in-validated-sources';
 }
@@ -51,12 +57,23 @@ function launcher(request: HermesCompatibilityRequest): { executable: string; so
   return fail('unrecognized hermes-acp launcher; a version string alone does not identify tested code');
 }
 // Standard-library metadata only. No Hermes config, dotenv, plugin module, or credential loader is imported.
-const METADATA_PROBE = `import importlib.metadata as m, importlib.util as u, json
+const METADATA_PROBE = `import importlib.metadata as m, importlib.util as u, json, hashlib
+from pathlib import Path
 s=u.find_spec('acp_adapter')
+a=u.find_spec('acp')
+digest=None
+if a and a.origin:
+    root=Path(a.origin).parent
+    files={}
+    for p in sorted(root.rglob('*')):
+        if p.is_symlink(): raise ValueError('unverified SDK symlink')
+        if p.is_file() and '__pycache__' not in p.relative_to(root).parts:
+            files[p.relative_to(root).as_posix()]=hashlib.sha256(p.read_bytes()).hexdigest()
+    digest=hashlib.sha256(json.dumps(files,sort_keys=True,separators=(',',':')).encode()).hexdigest()
 e=m.entry_points()
 e=e.select(group='hermes_agent.plugins') if hasattr(e,'select') else e.get('hermes_agent.plugins',[])
-print(json.dumps({'hermesVersion':m.version('hermes-agent'),'acpVersion':m.version('agent-client-protocol'),'adapterOrigin':s.origin if s else None,'entryPoints':[{'name':x.name,'value':x.value} for x in e]}))`;
-interface Metadata { hermesVersion: string; acpVersion: string; adapterOrigin: string; entryPoints: { name: string; value: string }[] }
+print(json.dumps({'hermesVersion':m.version('hermes-agent'),'acpVersion':m.version('agent-client-protocol'),'acpSourceDigest':digest,'adapterOrigin':s.origin if s else None,'entryPoints':[{'name':x.name,'value':x.value} for x in e]}))`;
+interface Metadata { acpSourceDigest?: string; hermesVersion: string; acpVersion: string; adapterOrigin: string; entryPoints: { name: string; value: string }[] }
 interface Plugin { key: string; name: string; source: 'bundled' | 'home' | 'entrypoint'; portable: boolean; path?: string }
 function collectPlugins(directory: string, source: Plugin['source'], skip: Set<string> = new Set(), prefix = '', depth = 0): Plugin[] {
   const info = stat(directory);
@@ -124,7 +141,8 @@ export async function inspectHermesCompatibility(request: HermesCompatibilityReq
     exec('git', ['-C', chain.sourceRoot, 'rev-parse', 'HEAD'], opts),
     exec('git', ['-C', chain.sourceRoot, 'status', '--porcelain', '--untracked-files=all'], opts),
   ]);
-  if (head.code || status.code || head.stdout.trim() !== TESTED_HERMES_ARTIFACT.commit || status.stdout.trim()) return fail('source checkout is not the tested clean Git artifact');
+  const artifact = [TESTED_HERMES_ARTIFACT, TESTED_HERMES_COMPACTION_ARTIFACT].find(candidate => candidate.commit === head.stdout.trim());
+  if (head.code || status.code || !artifact || status.stdout.trim()) return fail('source checkout is not the tested clean Git artifact');
   const result = await exec(chain.interpreter, ['-I', '-B', '-c', METADATA_PROBE], opts);
   if (result.code) return fail('could not inspect the tested Python package metadata');
   let metadata: Metadata;
@@ -133,9 +151,10 @@ export async function inspectHermesCompatibility(request: HermesCompatibilityReq
     if (!object(value) || typeof value.adapterOrigin !== 'string' || !Array.isArray(value.entryPoints) || value.entryPoints.some(entry => !object(entry) || typeof entry.name !== 'string' || typeof entry.value !== 'string')) return fail('invalid Python package metadata');
     metadata = value as unknown as Metadata;
   } catch { return fail('invalid Python package metadata'); }
-  if (metadata.hermesVersion !== TESTED_HERMES_ARTIFACT.hermesVersion || metadata.acpVersion !== TESTED_HERMES_ARTIFACT.acpVersion || resolve(metadata.adapterOrigin) !== join(chain.sourceRoot, 'acp_adapter/__init__.py')) return fail('Python packages or ACP source origin differ from the tested build');
+  if (metadata.hermesVersion !== artifact.hermesVersion || metadata.acpVersion !== artifact.acpVersion || resolve(metadata.adapterOrigin) !== join(chain.sourceRoot, 'acp_adapter/__init__.py')) return fail('Python packages or ACP source origin differ from the tested build');
+  if ('acpSourceDigest' in artifact && metadata.acpSourceDigest !== artifact.acpSourceDigest) return fail('SDK source digest differs from the reviewed packaged artifact');
   validatePluginSources(request, chain.sourceRoot, metadata);
-  return { artifact: { ...TESTED_HERMES_ARTIFACT, sourceRoot: chain.sourceRoot, executable: chain.executable }, pluginMcp: 'absent-in-validated-sources' };
+  return { artifact: { ...artifact, sourceRoot: chain.sourceRoot, executable: chain.executable }, pluginMcp: 'absent-in-validated-sources' };
 }
 
 /** Native identity check, separate from session model/provider validation and first actual MCP use. */

@@ -1,0 +1,1295 @@
+diff --git a/acp_adapter/commands.py b/acp_adapter/commands.py
+index d140b2ace6..2863854d8f 100644
+--- a/acp_adapter/commands.py
++++ b/acp_adapter/commands.py
+@@ -7,6 +7,7 @@ import logging
+ from collections import Counter
+ from typing import Any
+ 
++from acp.exceptions import RequestError
+ from acp.schema import AvailableCommand, AvailableCommandsUpdate, UnstructuredCommandInput
+ 
+ from acp_adapter.session import SessionState, _expand_acp_enabled_toolsets
+@@ -85,7 +86,7 @@ class SlashCommandsMixin:
+     def _schedule_available_commands_update(self, session_id: str) -> None:
+         self._schedule_soon(lambda: self._send_available_commands_update(session_id))
+ 
+-    def _handle_slash_command(self, text: str, state: SessionState) -> str | None:
++    def _handle_slash_command(self, text: str, state: SessionState, *, on_compaction_saved=None) -> str | None:
+         """Dispatch a slash command; ``None`` for unknown ones so they fall through to the LLM."""
+         parts = text.split(maxsplit=1)
+         cmd = parts[0].lstrip("/").lower()
+@@ -105,13 +106,15 @@ class SlashCommandsMixin:
+                 set_session_cwd(state.cwd)
+             except Exception:
+                 logger.debug("Could not pin ACP session cwd for slash command", exc_info=True)
++            if cmd == "compress" and on_compaction_saved is not None:
++                return handler(args, state, on_saved=on_compaction_saved)
+             return handler(args, state)
+ 
+         try:
+             return contextvars.copy_context().run(_dispatch)
+         except Exception as e:
+             logger.error("Slash command /%s error: %s", cmd, e, exc_info=True)
+-            return f"Error executing /{cmd}: {e}"
++            raise RequestError(-32603, "Hermes command failed", {"reason": "command_failed", "command": cmd}) from e
+ 
+     def _cmd_help(self, args: str, state: SessionState) -> str:
+         lines = ["Available commands:", ""]
+@@ -220,51 +223,50 @@ class SlashCommandsMixin:
+                 reset_session_state()
+         except Exception:
+             logger.warning("ACP session state reset failed for %s", state.session_id, exc_info=True)
+-            return "Conversation history cleared. Agent session state reset failed; see logs."
++            raise
+         finally:
+             self.session_manager.save_session(state.session_id)
+         return "Conversation history cleared."
+ 
+-    def _cmd_compress(self, args: str, state: SessionState) -> str:
++    def _cmd_compress(self, args: str, state: SessionState, *, on_saved=None) -> str:
+         if not state.history:
+             return "Nothing to compress — conversation is empty."
++        agent = state.agent
++        # No compression_enabled gate: it only disables *automatic* compaction (CLI/gateway parity).
++        if not hasattr(agent, "_compress_context"):
++            return "Context compression not available for this agent."
++
++        original_count = len(state.history)
++        # Include system prompt + tool schemas so the figure reflects real request pressure.
++        # See #6217.
++        # See #6217.
++        _sys_prompt = getattr(agent, "_cached_system_prompt", "") or ""
++        _tools = getattr(agent, "tools", None) or None
++        approx_tokens = _estimate_tokens(state.history, agent, _sys_prompt, _tools)
++        original_session_db = getattr(agent, "_session_db", None)
++
+         try:
+-            agent = state.agent
+-            # No compression_enabled gate: it only disables *automatic* compaction (CLI/gateway parity).
+-            if not hasattr(agent, "_compress_context"):
+-                return "Context compression not available for this agent."
+-
+-            original_count = len(state.history)
+-            # Include system prompt + tool schemas so the figure reflects real request pressure.
+-            # See #6217.
+-            # See #6217.
+-            _sys_prompt = getattr(agent, "_cached_system_prompt", "") or ""
+-            _tools = getattr(agent, "tools", None) or None
+-            approx_tokens = _estimate_tokens(state.history, agent, _sys_prompt, _tools)
+-            original_session_db = getattr(agent, "_session_db", None)
++            # Stable ACP session id: suppress _compress_context's SQLite session split.
++            agent._session_db = None
++            compressed, _ = agent._compress_context(
++                state.history, _sys_prompt, approx_tokens=approx_tokens, task_id=state.session_id, force=True,
++            )
++        finally:
++            agent._session_db = original_session_db
+ 
+-            try:
+-                # Stable ACP session id: suppress _compress_context's SQLite session split.
+-                agent._session_db = None
+-                compressed, _ = agent._compress_context(
+-                    state.history, _sys_prompt, approx_tokens=approx_tokens, task_id=state.session_id, force=True,
+-                )
+-            finally:
+-                agent._session_db = original_session_db
+-
+-            state.history = compressed
+-            self.session_manager.save_session(state.session_id)
++        state.history = compressed
++        self.session_manager.save_session(state.session_id)
++        if on_saved is not None:
++            on_saved()
+ 
+-            new_tokens = _estimate_tokens(
+-                state.history, agent, getattr(agent, "_cached_system_prompt", "") or _sys_prompt,
+-                getattr(agent, "tools", None) or _tools,
+-            )
+-            return (
+-                f"Context compressed: {original_count} -> {len(state.history)} messages\n"
+-                f"~{approx_tokens:,} -> ~{new_tokens:,} tokens"
+-            )
+-        except Exception as e:
+-            return f"Compression failed: {e}"
++        new_tokens = _estimate_tokens(
++            state.history, agent, getattr(agent, "_cached_system_prompt", "") or _sys_prompt,
++            getattr(agent, "tools", None) or _tools,
++        )
++        return (
++            f"Context compressed: {original_count} -> {len(state.history)} messages\n"
++            f"~{approx_tokens:,} -> ~{new_tokens:,} tokens"
++        )
+ 
+     def _cmd_steer(self, args: str, state: SessionState) -> str:
+         steer_text = args.strip()
+diff --git a/acp_adapter/compaction-sdk-requirements.txt b/acp_adapter/compaction-sdk-requirements.txt
+new file mode 100644
+index 0000000000..d47135d4a6
+--- /dev/null
++++ b/acp_adapter/compaction-sdk-requirements.txt
+@@ -0,0 +1,4 @@
++# Experimental local-only SDK prerequisite; not the default ACP dependency.
++# Obtain/build the reviewed wheel described in docs/acp-compaction-prototype.md.
++# This pins the SDK artifact only, not its transitive runtime dependencies.
++agent-client-protocol==0.9.0+ours.compaction1 --hash=sha256:c71ebab39ef7f779135cc93bb00bf434dcaf1740e6e54849062f9546d69d152c
+diff --git a/acp_adapter/compaction.py b/acp_adapter/compaction.py
+new file mode 100644
+index 0000000000..5e1fcdfd3f
+--- /dev/null
++++ b/acp_adapter/compaction.py
+@@ -0,0 +1,90 @@
++"""Negotiated, terminal-only draft compaction output.
++
++The SDK prerequisite is deliberately optional until pinned: stable SDK clients
++retain the legacy surface. No observer of prose or session rotation is used.
++"""
++from dataclasses import replace
++import logging
++import threading
++
++from agent.compaction_events import CompactionTerminal
++
++try:
++    from acp.schema import CompactionCapabilities, CompactionUpdate
++except ImportError:
++    CompactionCapabilities = CompactionUpdate = None
++
++logger = logging.getLogger(__name__)
++
++
++def supports_compaction(capabilities):
++    session = getattr(capabilities, "session", None)
++    return CompactionCapabilities is not None and isinstance(
++        getattr(session, "compaction", None), CompactionCapabilities
++    )
++
++
++class CompactionCollector:
++    """Bind one request generation, then flush terminals after outer persistence.
++
++    Capturing the callback in the runtime attempt prevents late workers from
++    attaching old attempts to a later request's collector.
++    """
++    def __init__(self, agent, conn, session_id):
++        self._agent, self._conn, self._session_id = agent, conn, session_id
++        self._missing = object()
++        self._previous = getattr(agent, "compaction_callback", self._missing)
++        self._callback = self._record
++        self._lock = threading.Lock()
++        self._events = {}
++        self._closed = False
++        self._manual_committed = False
++
++    def __enter__(self):
++        self._agent.compaction_callback = self._callback
++        return self
++
++    def __exit__(self, *_exc):
++        with self._lock:
++            self._closed = True
++        if getattr(self._agent, "compaction_callback", None) is self._callback:
++            if self._previous is self._missing:
++                del self._agent.compaction_callback
++            else:
++                self._agent.compaction_callback = self._previous
++
++    def _record(self, event):
++        if callable(self._previous):
++            try:
++                self._previous(event)
++            except Exception:
++                logger.debug("Previous compaction observer failed", exc_info=True)
++        if not isinstance(event, CompactionTerminal):
++            return
++        with self._lock:
++            if not self._closed:
++                self._events.setdefault(event.compaction_id, event)
++
++    def mark_manual_committed(self):
++        """Record the outer save before fallible response diagnostics."""
++        with self._lock:
++            self._manual_committed = True
++
++    async def flush(self, *, manual=False):
++        with self._lock:
++            events, self._events = list(self._events.values()), {}
++            manual_failed = manual and not self._manual_committed
++        if self._conn is None:
++            return
++        for event in events:
++            if manual_failed and event.status == "completed":
++                event = replace(event, status="failed")
++            try:
++                await self._conn.session_update(
++                    self._session_id,
++                    CompactionUpdate(session_update="compaction_update", compaction_id=event.compaction_id, status=event.status),
++                )
++            except Exception:
++                # An observer transport failure cannot replace a real mutation or
++                # rollback error. No complete-coverage promise is made.
++                logger.warning("Could not emit compaction terminal for ACP session %s", self._session_id, exc_info=True)
+diff --git a/acp_adapter/server.py b/acp_adapter/server.py
+index 4831a9acd0..7d813b659b 100644
+--- a/acp_adapter/server.py
++++ b/acp_adapter/server.py
+@@ -15,6 +15,8 @@ from dataclasses import dataclass
+ from typing import Any, Callable, Deque, Optional
+ 
+ import acp
++from acp.exceptions import RequestError
++from acp_adapter.compaction import CompactionCollector, supports_compaction
+ from acp.schema import (
+     AgentCapabilities, AgentMessageChunk, AuthenticateResponse, ClientCapabilities, ForkSessionResponse,
+     Implementation, InitializeResponse, ListSessionsResponse, LoadSessionResponse, McpServerHttp, McpServerSse,
+@@ -248,6 +250,7 @@ class HermesACPAgent(SlashCommandsMixin, acp.Agent):
+         super().__init__()
+         self.session_manager = session_manager or SessionManager()
+         self._conn: Optional[acp.Client] = None
++        self._compaction_enabled = False
+ 
+     # ---- Connection lifecycle -----------------------------------------------
+ 
+@@ -501,6 +504,7 @@ class HermesACPAgent(SlashCommandsMixin, acp.Agent):
+         self, protocol_version: int | None = None, client_capabilities: ClientCapabilities | None = None,
+         client_info: Implementation | None = None, **kwargs: Any,
+     ) -> InitializeResponse:
++        self._compaction_enabled = supports_compaction(client_capabilities)
+         auth_methods = build_auth_methods()
+         logger.info(
+             "Initialize from %s (protocol v%s)", client_info.name if client_info else "unknown",
+@@ -511,6 +515,9 @@ class HermesACPAgent(SlashCommandsMixin, acp.Agent):
+             protocol_version=acp.PROTOCOL_VERSION,
+             agent_info=Implementation(name="hermes-agent", version=HERMES_VERSION),
+             agent_capabilities=AgentCapabilities(
++                field_meta={"ai.ours/compactionSafety": {
++                    "version": 1, "lifecycle": "completion_only", "guardedCancel": False,
++                }} if self._compaction_enabled else None,
+                 load_session=True,
+                 prompt_capabilities=PromptCapabilities(image=True),
+                 session_capabilities=SessionCapabilities(
+@@ -613,7 +620,9 @@ class HermesACPAgent(SlashCommandsMixin, acp.Agent):
+         if not (state and state.cancel_event):
+             return
+         with state.runtime_lock:
+-            if state.is_running and state.current_prompt_text:
++            if not state.is_running or state.cancel_event.is_set():
++                return
++            if state.current_prompt_text:
+                 state.interrupted_prompt_text = state.current_prompt_text
+             # Cancel + hard-stop under the lock so no other prompt mistakes this turn for
+             # redirectable work.
+@@ -691,26 +700,16 @@ class HermesACPAgent(SlashCommandsMixin, acp.Agent):
+             return (_attach_interrupted_prompt(interrupted_prompt, user_text),) * 2
+         return user_text, user_content
+ 
+-    def _claim_turn_or_queue(
+-        self, state: SessionState, session_id: str, user_text: str, user_content: Any, text_only: bool
+-    ) -> str | None:
+-        """Mark the session running; if a turn is active, redirect it (text-only, supported
+-        runtime) or queue it. Returns the client message when absorbed, else None."""
++    def _claim_turn(self, state: SessionState, user_text: str) -> None:
++        """Clients own pending prompts; a busy rejection has no execution side effect."""
+         with state.runtime_lock:
+-            if not state.is_running:
+-                state.is_running = True
+-                state.current_prompt_text = user_text or "[Image attachment]"
+-                return None
+-            if text_only and isinstance(user_content, str) and hasattr(state.agent, "redirect") and (
+-                getattr(state.agent, "_supports_active_turn_redirect", False) is True
+-            ):
+-                try:
+-                    if state.agent.redirect(user_content):
+-                        return "Redirected the active turn with your correction."
+-                except Exception:
+-                    logger.debug("ACP active-turn redirect failed for %s", session_id, exc_info=True)
+-            state.queued_prompts.append(user_text or "[Image attachment]")
+-            return f"Queued for the next turn. ({len(state.queued_prompts)} queued)"
++            if state.is_running:
++                raise RequestError(-32600, "Session busy; retain the prompt until the active request settles",
++                                   {"reason": "session_busy", "admitted": False})
++            state.is_running = True
++            state.current_prompt_text = user_text or "[Image attachment]"
++            if state.cancel_event:
++                state.cancel_event.clear()
+ 
+     def _run_agent_turn(
+         self, *, state: SessionState, session_id: str, user_text: str, user_content: Any, conn: Any,
+@@ -772,9 +771,9 @@ class HermesACPAgent(SlashCommandsMixin, acp.Agent):
+                     user_message=user_content, conversation_history=state.history, task_id=session_id,
+                     persist_user_message=user_text or "[Image attachment]",
+                 )
+-            except Exception as e:
++            except Exception:
+                 logger.exception("Agent error in session %s", session_id)
+-                return {"final_response": f"Error: {e}", "messages": state.history}
++                raise
+ 
+     async def prompt(self, prompt: list[PromptBlock], session_id: str, **kwargs: Any) -> PromptResponse:
+         """Run Hermes on the user's prompt and stream events back to the editor."""
+@@ -789,50 +788,111 @@ class HermesACPAgent(SlashCommandsMixin, acp.Agent):
+         if not user_text and not (isinstance(user_content, list) and user_content):
+             return PromptResponse(stop_reason="end_turn")
+ 
+-        user_text, user_content = self._rewrite_prompt_for_interrupt(state, user_text, user_content, text_only_prompt)
++        # Match the slash dispatcher's accepted spelling before intercepting queue owners.
++        if text_only_prompt and user_text.startswith("/"):
++            parts = user_text.split(maxsplit=1)
++            command = parts[0].lstrip("/").lower()
++            if command in {"queue", "steer"}:
++                user_text = user_content = "/" + command + (" " + parts[1] if len(parts) > 1 else "")
++        literal_prompt = False
++        # /queue is a client-owned scheduling request, never a detached adapter turn.
++        if text_only_prompt and user_text.split(maxsplit=1)[0] == "/queue":
++            parts = user_text.split(maxsplit=1)
++            if len(parts) > 1:
++                user_text = user_content = parts[1].strip()
++                literal_prompt = True
++
++        # Explicit steering may be accepted by the running runtime. Failed steering
++        # must not fall back to an untracked local queue with a successful receipt.
++        if not literal_prompt and text_only_prompt and user_text.split(maxsplit=1)[0] == "/steer":
++            parts = user_text.split(maxsplit=1)
++            with state.runtime_lock:
++                if state.is_running and len(parts) > 1:
++                    if not state.cancel_event.is_set() and hasattr(state.agent, "steer"):
++                        if state.agent.steer(parts[1].strip()):
++                            return PromptResponse(stop_reason="end_turn")
++                    raise RequestError(-32600, "Session busy; steering was not admitted",
++                                       {"reason": "session_busy", "admitted": False})
++
++        if not literal_prompt:
++            original_text = user_text
++            user_text, user_content = self._rewrite_prompt_for_interrupt(state, user_text, user_content, text_only_prompt)
++            literal_prompt = user_text != original_text
+ 
+         # Slash commands are text-only; a prompt with media goes to the agent even if it starts with "/".
+-        if text_only_prompt and isinstance(user_content, str) and user_text.startswith("/"):
+-            response_text = self._handle_slash_command(user_text, state)
+-            if response_text is not None:
+-                if self._conn:
+-                    await self._conn.session_update(session_id, acp.update_agent_message_text(response_text))
+-                    await self._send_usage_update(state)
+-                return PromptResponse(stop_reason="end_turn")
+-
+-        absorbed = self._claim_turn_or_queue(state, session_id, user_text, user_content, text_only_prompt)
+-        if absorbed is not None:
+-            if self._conn:
+-                await self._conn.session_update(session_id, acp.update_agent_message_text(absorbed))
+-            return PromptResponse(stop_reason="end_turn")
+-
+-        logger.info("Prompt on session %s: %s", session_id, user_text[:100])
+-        conn, loop = self._conn, asyncio.get_running_loop()
+-        if state.cancel_event:
+-            state.cancel_event.clear()
+-        cbs = self._wire_turn_callbacks(state, session_id, conn, loop)
+-
+-        def _run_agent() -> dict:
+-            return self._run_agent_turn(
+-                state=state, session_id=session_id, user_text=user_text, user_content=user_content, conn=conn,
+-                loop=loop, approval_cb=cbs.approval_cb, edit_approval_requester=cbs.edit_approval_requester,
+-            )
+-
++        if not literal_prompt and text_only_prompt and isinstance(user_content, str) and user_text.startswith("/"):
++            parts = user_text.split(maxsplit=1)
++            command = parts[0].lstrip("/").lower()
++            mutating = command in {"compress", "reset"} or (command == "model" and len(parts) > 1)
++            if mutating:
++                self._claim_turn(state, user_text)
++            compactions = None
++            try:
++                if command == "compress" and self._compaction_enabled:
++                    compactions = CompactionCollector(state.agent, self._conn, session_id)
++                with compactions or contextlib.nullcontext():
++                    command_options = {"on_compaction_saved": compactions.mark_manual_committed} if compactions else {}
++                    response_text = self._handle_slash_command(user_text, state, **command_options)
++                    if response_text is not None:
++                        if self._conn:
++                            await self._conn.session_update(session_id, acp.update_agent_message_text(response_text))
++                            await self._send_usage_update(state)
++                        cancelled = mutating and bool(state.cancel_event and state.cancel_event.is_set())
++                        return PromptResponse(stop_reason="cancelled" if cancelled else "end_turn")
++            finally:
++                try:
++                    if compactions:
++                        await compactions.flush(manual=True)
++                finally:
++                    if mutating:
++                        with state.runtime_lock:
++                            state.is_running = False
++                            state.current_prompt_text = ""
++
++        self._claim_turn(state, user_text)
++        compactions = None
+         try:
+-            # ACP `session_id` is the stable handle; agent.session_id is the internal head that
+-            # compression may rotate — snapshot it to detect rotation after the turn.
+-            pre_turn_hermes_id = getattr(state.agent, "session_id", None)
+-            # Fresh context copy: concurrent sessions on the shared executor must not share ContextVars.
+-            ctx = contextvars.copy_context()
+-            result = await loop.run_in_executor(_executor, ctx.run, _run_agent)
+-        except Exception:
+-            logger.exception("Executor error for session %s", session_id)
+-            with state.runtime_lock:
+-                state.is_running = False
+-                state.current_prompt_text = ""
+-            return PromptResponse(stop_reason="end_turn")
++            if self._compaction_enabled:
++                compactions = CompactionCollector(state.agent, self._conn, session_id)
++            with compactions or contextlib.nullcontext():
++                logger.info("Prompt on session %s", session_id)
++                conn, loop = self._conn, asyncio.get_running_loop()
++                cbs = self._wire_turn_callbacks(state, session_id, conn, loop)
++
++                def _run_agent() -> dict:
++                    return self._run_agent_turn(
++                        state=state, session_id=session_id, user_text=user_text, user_content=user_content, conn=conn,
++                        loop=loop, approval_cb=cbs.approval_cb, edit_approval_requester=cbs.edit_approval_requester,
++                    )
+ 
+-        return await self._finish_turn(state, session_id, conn, result, pre_turn_hermes_id, cbs.streamed)
++                pre_turn_hermes_id = getattr(state.agent, "session_id", None)
++                ctx = contextvars.copy_context()
++                worker = loop.run_in_executor(_executor, ctx.run, _run_agent)
++                request_cancelled = False
++                while True:
++                    try:
++                        # Cancelling an asyncio waiter cannot stop the executor thread.
++                        # Retain ownership until it exits; duplicate task cancels coalesce.
++                        result = await asyncio.shield(worker)
++                        break
++                    except asyncio.CancelledError:
++                        request_cancelled = True
++                        await self.cancel(session_id)
++                        if worker.cancelled():
++                            raise
++                response = await self._finish_turn(state, session_id, conn, result, pre_turn_hermes_id, cbs.streamed)
++                if request_cancelled:
++                    raise asyncio.CancelledError
++                return response
++        finally:
++            # Includes callback setup, executor failure, persistence and final output.
++            try:
++                if compactions:
++                    await compactions.flush()
++            finally:
++                with state.runtime_lock:
++                    state.is_running = False
++                    state.current_prompt_text = ""
+ 
+     def _wire_turn_callbacks(
+         self, state: SessionState, session_id: str, conn: Any, loop: asyncio.AbstractEventLoop
+@@ -877,7 +937,7 @@ class HermesACPAgent(SlashCommandsMixin, acp.Agent):
+         self, state: SessionState, session_id: str, conn: Any, result: dict, pre_turn_hermes_id: Any,
+         streamed_message: bool,
+     ) -> PromptResponse:
+-        """Persist, emit provenance/final text, drain queued prompts, report usage."""
++        """Persist, emit provenance/final text and report usage while retaining ownership."""
+         if result.get("messages"):
+             state.history = result["messages"]
+             self.session_manager.save_session(session_id)
+@@ -904,19 +964,6 @@ class HermesACPAgent(SlashCommandsMixin, acp.Agent):
+         if final_response and conn and not suppress and (not streamed_message or result.get("response_transformed")):
+             await conn.session_update(session_id, acp.update_agent_message_text(final_response))
+ 
+-        # Go idle before draining so recursive prompt() calls can acquire the session.
+-        with state.runtime_lock:
+-            state.is_running = False
+-            state.current_prompt_text = ""
+-        while True:
+-            with state.runtime_lock:
+-                if not state.queued_prompts:
+-                    break
+-                next_prompt = state.queued_prompts.pop(0)
+-            if conn:
+-                await conn.session_update(session_id, acp.update_user_message_text(next_prompt))
+-            await self.prompt(prompt=[TextContentBlock(type="text", text=next_prompt)], session_id=session_id)
+-
+         usage = None
+         if any(result.get(k) is not None for k in ("prompt_tokens", "completion_tokens", "total_tokens")):
+             usage = Usage(
+@@ -925,7 +972,10 @@ class HermesACPAgent(SlashCommandsMixin, acp.Agent):
+                 cached_read_tokens=result.get("cache_read_tokens"),
+             )
+         await self._send_usage_update(state)
+-        return PromptResponse(stop_reason="cancelled" if cancelled else "end_turn", usage=usage)
++        interrupted = interrupted or bool(state.cancel_event and state.cancel_event.is_set())
++        if (result.get("failed") or result.get("error")) and not interrupted:
++            raise RequestError(-32603, "Hermes turn failed", {"reason": "turn_failed"})
++        return PromptResponse(stop_reason="cancelled" if interrupted else "end_turn", usage=usage)
+ 
+     # ---- Session settings (ACP protocol methods) -----------------------------
+ 
+@@ -933,11 +983,17 @@ class HermesACPAgent(SlashCommandsMixin, acp.Agent):
+         """Switch the model for a session (called by ACP protocol)."""
+         state = self.session_manager.get_session(session_id)
+         if state:
+-            _old, requested_provider, resolved_model = self._switch_model(state, model_id, keep_endpoint=True)
+-            logger.info(
+-                "Session %s: model switched to %s via provider %s", session_id, resolved_model, requested_provider
+-            )
+-            return SetSessionModelResponse()
++            self._claim_turn(state, "session/set_model")
++            try:
++                _old, requested_provider, resolved_model = self._switch_model(state, model_id, keep_endpoint=True)
++                logger.info(
++                    "Session %s: model switched to %s via provider %s", session_id, resolved_model, requested_provider
++                )
++                return SetSessionModelResponse()
++            finally:
++                with state.runtime_lock:
++                    state.is_running = False
++                    state.current_prompt_text = ""
+         logger.warning("Session %s: model switch requested for missing session", session_id)
+         return None
+ 
+diff --git a/agent/compaction_events.py b/agent/compaction_events.py
+new file mode 100644
+index 0000000000..7cceef3883
+--- /dev/null
++++ b/agent/compaction_events.py
+@@ -0,0 +1,47 @@
++"""Typed terminal observations of local compression attempts, independent of UI text.
++
++These observations do not promise start coverage or guard cancellation. Native
++provider compaction may not pass through this local lifecycle.
++"""
++from dataclasses import dataclass
++import logging
++import threading
++from typing import Literal
++import uuid
++
++logger = logging.getLogger(__name__)
++
++
++@dataclass(frozen=True)
++class CompactionTerminal:
++    compaction_id: str
++    status: Literal["completed", "failed", "cancelled"]
++
++
++class CompactionTerminalReporter:
++    def __init__(self, agent, commit_fence=None):
++        self._callback = getattr(agent, "compaction_callback", None)
++        self._cancel_event = getattr(agent, "_hard_interrupt_requested", None)
++        self._commit_fence = commit_fence
++        self._id = str(uuid.uuid4())
++        self._lock = threading.Lock()
++        self._reported = False
++
++    def emit(self, commit_status):
++        with self._lock:
++            if self._reported:
++                return
++            self._reported = True
++        if not callable(self._callback):
++            return
++        # Commit is authoritative even when a later stop arrives. Aborted lease
++        # admission must never become completed just because a UI phase ended.
++        cancelled = bool(
++            (self._cancel_event is not None and self._cancel_event.is_set())
++            or (self._commit_fence is not None and self._commit_fence.is_cancelled)
++        )
++        status = "completed" if commit_status == "committed" else "cancelled" if cancelled else "failed"
++        try:
++            self._callback(CompactionTerminal(self._id, status))
++        except Exception:
++            logger.debug("Compaction observer failed", exc_info=True)
+diff --git a/agent/conversation_compression.py b/agent/conversation_compression.py
+index 1f49aa9060..300dc0eee6 100644
+--- a/agent/conversation_compression.py
++++ b/agent/conversation_compression.py
+@@ -2257,7 +2257,10 @@ class _CompactionLifecycle:
+     ``commit_status`` is rebound to "committed" only on success and read at ``complete()`` time, so abort
+     paths keep the terminal edge suppressed."""
+ 
+-    def __init__(self, agent: Any, status_emitted: bool) -> None:
++    def __init__(self, agent: Any, status_emitted: bool, commit_fence=None) -> None:
++        from agent.compaction_events import CompactionTerminalReporter
++
++        self._terminal_reporter = CompactionTerminalReporter(agent, commit_fence)
+         self._agent = agent
+         self.status_emitted = status_emitted
+         self._done_emitted = False
+@@ -2267,6 +2270,7 @@ class _CompactionLifecycle:
+         if self._done_emitted:
+             return
+         self._done_emitted = True
++        self._terminal_reporter.emit(self.commit_status)
+         # Suppressed start → no terminal edge. Non-compacting aborts (lock contender,
+         # cancelled fence) opt in via force_terminal so clients can retire their phase.
+         # Failure warnings go through _emit_warning and are never suppressed here.
+@@ -3537,7 +3541,8 @@ def _route_codex_compaction(
+ 
+ 
+ def _announce_compression_start(
+-    agent: Any, *, message_count: int, approx_tokens: Optional[int], focus_topic: Optional[str], force: bool
++    agent: Any, *, message_count: int, approx_tokens: Optional[int], focus_topic: Optional[str], force: bool,
++    commit_fence=None,
+ ) -> _CompactionLifecycle:
+     """Log the attempt, emit the (engine-customisable) compacting status, return the lifecycle."""
+     logger.info(
+@@ -3552,7 +3557,7 @@ def _announce_compression_start(
+         )
+     if status:
+         agent._emit_status(status)
+-    return _CompactionLifecycle(agent, bool(status))
++    return _CompactionLifecycle(agent, bool(status), commit_fence)
+ 
+ 
+ def compress_context(
+@@ -3614,7 +3619,8 @@ def compress_context(
+     # missing attribute must default True, not rotation, which can wedge sessions.
+     in_place = bool(getattr(agent, "compression_in_place", True))
+     lifecycle = _announce_compression_start(
+-        agent, message_count=_pre_msg_count, approx_tokens=approx_tokens, focus_topic=focus_topic, force=force
++        agent, message_count=_pre_msg_count, approx_tokens=approx_tokens, focus_topic=focus_topic, force=force,
++        commit_fence=commit_fence,
+     )
+     lease, _abort_prompt = _acquire_compression_lease(
+         agent, commit_fence=commit_fence, lifecycle=lifecycle, system_message=system_message,
+@@ -3711,6 +3717,10 @@ def compress_context(
+             return messages, commit.refused_prompt
+         compressed = commit.compressed
+         split_status = commit.split_status
++        # The authoritative mutation has finished; diagnostics cannot undo it.
++        lifecycle.commit_status = (
++            "committed" if split_status in {"not_applicable", "in_place_committed", "rotated_committed"} else "aborted"
++        )
+         _compressed_est = _finish_compaction_boundary(
+             agent, compressed, new_system_prompt=new_system_prompt, old_session_id=commit.old_session_id,
+             in_place=in_place, compacted_in_place=commit.compacted_in_place,
+@@ -3723,9 +3733,6 @@ def compress_context(
+             "context compression done: session=%s messages=%d->%d rough_tokens=~%s awaiting_real_usage=true",
+             agent.session_id or "none", _pre_msg_count, len(compressed), f"{_compressed_est:,}",
+         )
+-        lifecycle.commit_status = (
+-            "committed" if split_status in {"not_applicable", "in_place_committed", "rotated_committed"} else "aborted"
+-        )
+         _emit_compression_attempt_telemetry(
+             agent, started_at=attempt.started_at, commit_status=lifecycle.commit_status, split_status=split_status,
+             failure_class=("session_split_failed" if split_status in {"failed_not_indexed", "aborted"} else None),
+diff --git a/docs/acp-compaction-prototype.md b/docs/acp-compaction-prototype.md
+new file mode 100644
+index 0000000000..142e6866fd
+--- /dev/null
++++ b/docs/acp-compaction-prototype.md
+@@ -0,0 +1,45 @@
++# Experimental ACP compaction terminal observations
++
++This increment depends on a separately reviewed, **unpublished local SDK artifact**. The default `acp` dependency remains `agent-client-protocol==0.9.0`. With that SDK, or without typed client opt-in, this increment emits no draft events and preserves the legacy initialization response.
++
++The local SDK prerequisite is `agent-client-protocol==0.9.0+ours.compaction1`, wheel `agent_client_protocol-0.9.0+ours.compaction1-py3-none-any.whl`, SHA-256 `c71ebab39ef7f779135cc93bb00bf434dcaf1740e6e54849062f9546d69d152c`. Its source patch, original manifest, deterministic builder and baseline license are in the separate review artifact at `/home/shakhvit/.hermes/acp-compaction-sdk-prototype`. This document does not designate that unpublished package as a default dependency or authorize deployment.
++
++## Isolated opt-in
++
++The reviewed SDK-only pin is `acp_adapter/compaction-sdk-requirements.txt`. To test without modifying an existing environment, use a fresh target directory and a separately provisioned test Python:
++
++```sh
++python -m pip install --no-deps --no-index --require-hashes \
++  --find-links "$ACP_COMPACTION_WHEELS" --target "$ACP_COMPACTION_TARGET" \
++  -r acp_adapter/compaction-sdk-requirements.txt
++```
++
++`ACP_COMPACTION_WHEELS` is a directory containing the reviewed wheel; `ACP_COMPACTION_TARGET` must be a disposable directory. Runtime dependencies must already be present in the test Python. The hash file does not claim to lock the complete environment.
++
++For the canonical Hermes test runner, use a test-only interpreter wrapper which exports the target directory on `PYTHONPATH`, then executes the test Python with its original arguments. Point `HERMES_PYTHON` at that wrapper. The wrapper is needed because `scripts/run_tests.sh` intentionally clears ambient environment variables. Verify `acp.__file__` and the SDK distribution version resolve to the disposable target before testing. No installation was performed in a live Hermes environment during development.
++
++## Wire contract and scope
++
++When the typed v1 `clientCapabilities.session.compaction: {}` is present, the adapter advertises the experimental metadata:
++
++```json
++{"ai.ours/compactionSafety":{"version":1,"lifecycle":"completion_only","guardedCancel":false}}
++```
++
++It emits standard draft `session/update` notifications containing only `sessionUpdate: compaction_update`, `compactionId`, and terminal `status`. No summaries, prompt bodies, checkpoint material, provider error details, or synthetic starts are included. Omitted/null client support gets no draft updates or safety metadata.
++
++A dedicated typed core callback observes local compression terminal outcomes. It reads actual commit status and cancellation state; it does not parse `compacted` status text, infer success from session rotation, or translate the legacy forced-abort completion banner into successful compaction. Each attempt has its own ID; duplicate terminals coalesce. A reporter captures its request's callback so a late worker cannot attach an old attempt to a later collector.
++
++Terminals are buffered until prompt/command finalization. Manual `/compress` temporarily suppresses the inner session DB and commits history in its outer command, so its completed terminal is released only after that command's save succeeds. Outer save failure produces failed, while the real command exception still propagates. The core records its authoritative commit result before post-commit bookkeeping, and the manual command records its outer save before token-estimate diagnostics. A later diagnostic or output failure does not rewrite an already committed compaction's result; the original exception still propagates. Observer transport errors are logged without replacing actual mutation/rollback errors.
++
++## Coverage limits
++
++This is **completion-only visibility**, with no complete start/terminal coverage or cancellation-protection promise. It does not make automatic interruption safe; Fleet must continue queueing automatic delivery until the active prompt settles.
++
++- No native Codex or Responses compaction start is fabricated. Native paths that bypass the local compression lifecycle remain unobserved by this increment.
++- Early cooldown/feasibility no-ops that never enter the local lifecycle emit no compaction entity.
++- Uninterruptible workers whose results arrive after their owning request closes do not publish into a later request. Missing outcomes are not manufactured as successful completion.
++- Events are live observations, not a durable replay/outbox or a new synchronization/control RPC.
++- The core's existing legacy human-readable status behavior remains unchanged for other hosts; only the typed observer interprets aborted admission truthfully.
++
++Tests exercise actual local automatic/manual compression mutation, provider failure, cancellation and busy-lease abort; adapter negotiation, outer persistence failure, post-commit diagnostic failure at both durable boundaries, ID deduplication, and late callback isolation. Provider calls use deterministic test responses; the real compression/facade/adapter and temporary SessionDB paths run. Draft-specific adapter tests skip when the unpinned SDK prerequisite is absent.
+diff --git a/tests/acp/test_compaction_lifecycle.py b/tests/acp/test_compaction_lifecycle.py
+new file mode 100644
+index 0000000000..c20365ba8b
+--- /dev/null
++++ b/tests/acp/test_compaction_lifecycle.py
+@@ -0,0 +1,173 @@
++"""Negotiated ACP mapping over actual local automatic/manual compression paths.
++
++Draft-specific cases require the explicitly unpinned SDK prerequisite prototype.
++"""
++import threading
++from types import SimpleNamespace
++
++import pytest
++import acp.schema as schema
++from acp.schema import ClientCapabilities, TextContentBlock
++from acp.utils import serialize_params
++
++from acp_adapter.server import HermesACPAgent
++from acp_adapter.session import SessionManager, SessionState
++from tests.agent.test_compression_attempt_lifecycle import _build_agent, _summary_response
++
++pytestmark = [pytest.mark.asyncio, pytest.mark.skipif(not hasattr(schema, "CompactionUpdate"), reason="draft SDK prerequisite not pinned")]
++
++
++@pytest.fixture
++def compression_session(tmp_path, monkeypatch):
++    db, runtime = _build_agent(tmp_path, "acp-compaction")
++    history = [{"role": "user" if i % 2 == 0 else "assistant", "content": f"m{i} " * 400} for i in range(20)]
++    state = SessionState("acp-compaction", runtime, history=history, cancel_event=threading.Event())
++    manager = SessionManager(db=db)
++    manager._sessions[state.session_id] = state
++    adapter = HermesACPAgent(manager)
++    wire, order = [], []
++    async def update(session_id, update):
++        payload = serialize_params(update)
++        wire.append(payload)
++        if payload.get("sessionUpdate") == "compaction_update":
++            order.append("compaction:" + payload["status"])
++    async def permission(*args, **kwargs):
++        raise AssertionError("no permission request expected")
++    adapter._conn = SimpleNamespace(session_update=update, request_permission=permission)
++    monkeypatch.setattr("agent.context_compressor.call_llm", lambda **kwargs: _summary_response("## Goal\nSynthetic summary."))
++    def automatic(**kwargs):
++        messages, _ = runtime._compress_context(kwargs["conversation_history"], "sys", approx_tokens=500_000)
++        return {"messages": messages, "final_response": "done"}
++    monkeypatch.setattr(runtime, "run_conversation", automatic)
++    save = manager.save_session
++    def saved(session_id):
++        save(session_id)
++        order.append("saved")
++    monkeypatch.setattr(manager, "save_session", saved)
++    yield adapter, state, wire, order
++    db.close()
++
++
++async def initialize(adapter, capability):
++    caps = {"auth": {"terminal": False}}
++    if capability == "enabled":
++        caps["session"] = {"compaction": {}}
++    elif capability == "null":
++        caps["session"] = {"compaction": None}
++    return await adapter.initialize(client_capabilities=ClientCapabilities.model_validate(caps))
++
++
++def terminals(wire):
++    return [item for item in wire if item.get("sessionUpdate") == "compaction_update"]
++
++
++@pytest.mark.parametrize("manual", [False, True])
++@pytest.mark.parametrize("capability", ["enabled", "absent", "null"])
++async def test_actual_mutation_is_visible_only_when_negotiated(compression_session, capability, manual):
++    adapter, state, wire, order = compression_session
++    response = await initialize(adapter, capability)
++    before = len(state.history)
++    result = await adapter.prompt([TextContentBlock(type="text", text="/compress" if manual else "continue")], state.session_id)
++    assert result.stop_reason == "end_turn"
++    assert len(state.history) < before
++    events = terminals(wire)
++    if capability == "enabled":
++        assert [event["status"] for event in events] == ["completed"]
++        assert set(events[0]) == {"sessionUpdate", "compactionId", "status"}
++        assert order.index("saved") < order.index("compaction:completed")
++        assert response.agent_capabilities.field_meta["ai.ours/compactionSafety"] == {
++            "version": 1, "lifecycle": "completion_only", "guardedCancel": False,
++        }
++    else:
++        assert events == []
++        assert response.agent_capabilities.field_meta is None
++
++
++@pytest.mark.parametrize("manual", [False, True])
++async def test_compression_failure_is_never_completed(compression_session, monkeypatch, manual):
++    adapter, state, wire, order = compression_session
++    await initialize(adapter, "enabled")
++    def fail(*args, **kwargs):
++        raise RuntimeError("synthetic summary failure")
++    monkeypatch.setattr(state.agent.context_compressor, "compress", fail)
++    with pytest.raises(Exception):
++        await adapter.prompt([TextContentBlock(type="text", text="/compress" if manual else "continue")], state.session_id)
++    assert [event["status"] for event in terminals(wire)] == ["failed"]
++    assert not state.is_running
++
++
++async def test_manual_outer_save_failure_does_not_publish_completion(compression_session, monkeypatch):
++    adapter, state, wire, order = compression_session
++    await initialize(adapter, "enabled")
++    def fail(*args, **kwargs):
++        raise RuntimeError("synthetic persistence failure")
++    monkeypatch.setattr(adapter.session_manager, "save_session", fail)
++    with pytest.raises(Exception):
++        await adapter.prompt([TextContentBlock(type="text", text="/compress")], state.session_id)
++    assert [event["status"] for event in terminals(wire)] == ["failed"]
++    assert not state.is_running
++
++
++async def test_duplicate_and_late_terminals_do_not_cross_request_generations():
++    from acp_adapter.compaction import CompactionCollector
++    from agent.compaction_events import CompactionTerminalReporter
++    agent = SimpleNamespace()
++    updates = []
++    async def send(session_id, update):
++        updates.append(serialize_params(update))
++    connection = SimpleNamespace(session_update=send)
++    with CompactionCollector(agent, connection, "s1") as first:
++        stale = CompactionTerminalReporter(agent)
++        completed = CompactionTerminalReporter(agent)
++        completed.emit("committed")
++        completed.emit("committed")
++    with CompactionCollector(agent, connection, "s1") as second:
++        stale.emit("committed")
++        fresh = CompactionTerminalReporter(agent)
++        fresh.emit("committed")
++    await first.flush()
++    await first.flush()
++    await second.flush()
++    assert [item["status"] for item in updates] == ["completed", "completed"]
++    assert updates[0]["compactionId"] != updates[1]["compactionId"]
++    assert not hasattr(agent, "compaction_callback")
++
++
++@pytest.mark.parametrize("manual", [False, True])
++async def test_actual_cancelled_summary_emits_cancelled(compression_session, monkeypatch, manual):
++    from agent.auxiliary_client import AuxiliaryExplicitCancellation
++    adapter, state, wire, order = compression_session
++    await initialize(adapter, "enabled")
++    def cancel(*args, **kwargs):
++        state.cancel_event.set()
++        state.agent._hard_interrupt_requested.set()
++        raise AuxiliaryExplicitCancellation()
++    monkeypatch.setattr(state.agent.context_compressor, "compress", cancel)
++    response = await adapter.prompt([TextContentBlock(type="text", text="/compress" if manual else "continue")], state.session_id)
++    assert response.stop_reason == "cancelled"
++    assert [event["status"] for event in terminals(wire)] == ["cancelled"]
++    assert not state.is_running
++
++
++async def test_manual_postsave_diagnostic_failure_preserves_completed(compression_session, monkeypatch):
++    from acp.exceptions import RequestError
++    import acp_adapter.commands as commands
++    adapter, state, wire, order = compression_session
++    await initialize(adapter, "enabled")
++    estimate = commands._estimate_tokens
++    failure = RuntimeError("postsave diagnostic failure")
++    calls = 0
++    def diagnostic(*args, **kwargs):
++        nonlocal calls
++        calls += 1
++        if calls == 2:
++            assert "saved" in order
++            raise failure
++        return estimate(*args, **kwargs)
++    monkeypatch.setattr(commands, "_estimate_tokens", diagnostic)
++    with pytest.raises(RequestError) as error:
++        await adapter.prompt([TextContentBlock(type="text", text="/compress")], state.session_id)
++    assert error.value.__cause__ is failure
++    assert [event["status"] for event in terminals(wire)] == ["completed"]
++    assert order.index("saved") < order.index("compaction:completed")
++    assert not state.is_running
+diff --git a/tests/acp/test_turn_ownership.py b/tests/acp/test_turn_ownership.py
+new file mode 100644
+index 0000000000..d2dfa2feda
+--- /dev/null
++++ b/tests/acp/test_turn_ownership.py
+@@ -0,0 +1,309 @@
++"""Exercise the actual prompt/executor/finalization lifecycle without a model API."""
++import asyncio
++import threading
++from types import SimpleNamespace
++
++import pytest
++from acp.exceptions import RequestError
++from acp.schema import TextContentBlock
++
++from acp_adapter.server import HermesACPAgent
++from acp_adapter.session import SessionManager, SessionState
++
++
++class Runtime:
++    session_id = "head"
++
++    def __init__(self):
++        self.calls = []
++        self.result = {"final_response": "done", "messages": []}
++        self.failure = None
++
++    def run_conversation(self, **kwargs):
++        self.calls.append(kwargs["user_message"])
++        if self.failure:
++            raise self.failure
++        return self.result
++
++
++@pytest.fixture
++def setup():
++    runtime = Runtime()
++    state = SessionState("test", runtime, cancel_event=threading.Event())
++    manager = SessionManager()
++    manager._sessions[state.session_id] = state
++    return HermesACPAgent(manager), state, runtime
++
++
++async def send(adapter, text="hello"):
++    return await adapter.prompt([TextContentBlock(type="text", text=text)], "test")
++
++
++@pytest.mark.asyncio
++@pytest.mark.parametrize("boundary", ["callbacks", "persist", "output", "usage"])
++async def test_failure_releases_ownership_and_next_request_runs(setup, monkeypatch, boundary):
++    adapter, state, runtime = setup
++    def fail(*args, **kwargs):
++        raise RuntimeError("injected failure")
++    async def async_fail(*args, **kwargs):
++        fail()
++    with monkeypatch.context() as fault:
++        if boundary == "callbacks":
++            fault.setattr(adapter, "_wire_turn_callbacks", fail)
++        elif boundary == "persist":
++            runtime.result["messages"] = [{"role": "assistant", "content": "done"}]
++            fault.setattr(adapter.session_manager, "save_session", fail)
++        elif boundary == "output":
++            adapter._conn = SimpleNamespace(session_update=async_fail, request_permission=async_fail)
++        else:
++            fault.setattr(adapter, "_send_usage_update", async_fail)
++        with pytest.raises(RuntimeError, match="injected failure"):
++            await send(adapter)
++        assert not state.is_running
++        assert state.current_prompt_text == ""
++    adapter._conn = None
++    runtime.result["messages"] = []
++    assert (await send(adapter, "next")).stop_reason == "end_turn"
++    assert runtime.calls[-1] == "next"
++
++
++@pytest.mark.asyncio
++async def test_runtime_error_is_not_success(setup):
++    adapter, state, runtime = setup
++    runtime.failure = RuntimeError("model failed")
++    with pytest.raises(RuntimeError, match="model failed"):
++        await send(adapter)
++    assert not state.is_running
++
++
++@pytest.mark.asyncio
++@pytest.mark.parametrize("text", ["later", "/queue later", "/steer later", "/QUEUE later", "//queue later", "/STEER later"])
++async def test_busy_requests_remain_client_owned(setup, text):
++    adapter, state, runtime = setup
++    state.is_running = True
++    with pytest.raises(RequestError) as error:
++        await send(adapter, text)
++    assert error.value.data["reason"] == "session_busy"
++    assert not state.queued_prompts
++    assert not runtime.calls
++    assert state.is_running
++
++
++@pytest.mark.asyncio
++async def test_idle_queue_executes_before_receipt(setup):
++    adapter, state, runtime = setup
++    assert (await send(adapter, "/queue later")).stop_reason == "end_turn"
++    assert runtime.calls == ["later"]
++    assert not state.queued_prompts
++
++
++@pytest.mark.asyncio
++async def test_cancel_is_coalesced_and_idle_is_noop(setup, monkeypatch):
++    adapter, state, runtime = setup
++    interrupts = []
++    monkeypatch.setattr("acp_adapter.server.request_hard_interrupt", lambda agent: interrupts.append(agent))
++    await adapter.cancel("test")
++    assert not state.cancel_event.is_set()
++    assert interrupts == []
++    state.is_running = True
++    await adapter.cancel("test")
++    await adapter.cancel("test")
++    assert interrupts == [runtime]
++
++
++@pytest.mark.asyncio
++async def test_ownership_covers_usage_output(setup, monkeypatch):
++    adapter, state, runtime = setup
++    entered, release = asyncio.Event(), asyncio.Event()
++    async def usage(_state):
++        entered.set()
++        await release.wait()
++    monkeypatch.setattr(adapter, "_send_usage_update", usage)
++    task = asyncio.create_task(send(adapter))
++    try:
++        await asyncio.wait_for(entered.wait(), 5)
++        assert state.is_running
++        with pytest.raises(RequestError):
++            await send(adapter, "later")
++    finally:
++        release.set()
++        await task
++    assert not state.is_running
++
++
++@pytest.mark.asyncio
++async def test_task_cancellation_keeps_ownership_until_worker_stops(setup, monkeypatch):
++    adapter, state, runtime = setup
++    loop = asyncio.get_running_loop()
++    entered, interrupted = asyncio.Event(), asyncio.Event()
++    release = threading.Event()
++    def run(**kwargs):
++        loop.call_soon_threadsafe(entered.set)
++        assert release.wait(5)
++        return {"messages": [], "interrupted": True}
++    monkeypatch.setattr(runtime, "run_conversation", run)
++    monkeypatch.setattr("acp_adapter.server.request_hard_interrupt", lambda agent: interrupted.set())
++    task = asyncio.create_task(send(adapter))
++    try:
++        await asyncio.wait_for(entered.wait(), 5)
++        task.cancel()
++        await asyncio.wait_for(interrupted.wait(), 5)
++        assert state.is_running
++        with pytest.raises(RequestError):
++            await send(adapter, "later")
++        task.cancel()
++    finally:
++        release.set()
++        with pytest.raises(asyncio.CancelledError):
++            await task
++    assert not state.is_running
++
++
++@pytest.mark.asyncio
++async def test_executor_failure_is_not_success(setup, monkeypatch):
++    adapter, state, runtime = setup
++    def fail(**kwargs):
++        raise RuntimeError("executor failed")
++    monkeypatch.setattr(adapter, "_run_agent_turn", fail)
++    with pytest.raises(RuntimeError, match="executor failed"):
++        await send(adapter)
++    assert not state.is_running
++
++
++@pytest.mark.asyncio
++async def test_explicit_cancel_reports_cancelled_and_next_turn_clears_it(setup):
++    adapter, state, runtime = setup
++    def run(**kwargs):
++        state.cancel_event.set()
++        return {"messages": [], "interrupted": True}
++    runtime.run_conversation = run
++    assert (await send(adapter)).stop_reason == "cancelled"
++    assert not state.is_running
++    runtime.run_conversation = lambda **kwargs: {"messages": []}
++    assert (await send(adapter, "next")).stop_reason == "end_turn"
++    assert not state.cancel_event.is_set()
++
++
++@pytest.mark.asyncio
++@pytest.mark.parametrize("text", ["/queue /queue later", "/steer /queue later"])
++async def test_prompt_payload_cannot_reenter_local_queue_command(setup, text):
++    adapter, state, runtime = setup
++    assert (await send(adapter, text)).stop_reason == "end_turn"
++    assert runtime.calls == ["/queue later"]
++    assert not state.queued_prompts
++
++
++@pytest.mark.asyncio
++async def test_cancellation_during_final_output_is_not_success(setup, monkeypatch):
++    adapter, state, runtime = setup
++    async def usage(_state):
++        await adapter.cancel("test")
++    monkeypatch.setattr(adapter, "_send_usage_update", usage)
++    assert (await send(adapter)).stop_reason == "cancelled"
++
++
++@pytest.mark.asyncio
++@pytest.mark.parametrize("failure", [
++    {"failed": True, "completed": False, "error": "provider failure", "messages": []},
++    {"partial": True, "completed": False, "error": "compression deferred", "messages": []},
++])
++async def test_runtime_failed_result_is_not_success(setup, failure):
++    adapter, state, runtime = setup
++    runtime.result = failure
++    with pytest.raises(RequestError) as error:
++        await send(adapter)
++    assert error.value.data["reason"] == "turn_failed"
++    assert not state.is_running
++
++
++@pytest.mark.asyncio
++@pytest.mark.parametrize("text", ["/compress", "/reset", "/model new-model", "//COMPRESS"])
++async def test_mutating_commands_reject_busy_without_mutation(setup, monkeypatch, text):
++    adapter, state, runtime = setup
++    state.is_running = True
++    state.history = [{"role": "user", "content": "keep"}]
++    mutations = []
++    runtime._compress_context = lambda *a, **kw: (mutations.append("compress") or [], 0)
++    runtime.reset_session_state = lambda: mutations.append("reset")
++    monkeypatch.setattr(adapter, "_switch_model", lambda *a: mutations.append("model") or ("a", "b", "c"))
++    with pytest.raises(RequestError) as error:
++        await send(adapter, text)
++    assert error.value.data == {"reason": "session_busy", "admitted": False}
++    assert state.history == [{"role": "user", "content": "keep"}]
++    assert not mutations
++    assert state.is_running
++
++
++@pytest.mark.asyncio
++@pytest.mark.parametrize("text", ["/help", "/context", "/version", "/model"])
++async def test_read_only_commands_preserve_active_owner(setup, text):
++    adapter, state, runtime = setup
++    state.is_running = True
++    state.current_prompt_text = "active"
++    assert (await send(adapter, text)).stop_reason == "end_turn"
++    assert state.is_running
++    assert state.current_prompt_text == "active"
++
++
++@pytest.mark.asyncio
++@pytest.mark.parametrize("text", ["/compress", "/reset", "/model new-model"])
++async def test_mutating_command_error_rejects_and_releases_ownership(setup, monkeypatch, text):
++    adapter, state, runtime = setup
++    state.history = [{"role": "user", "content": "keep"}]
++    ownership = []
++    def fail(*args, **kwargs):
++        ownership.append(state.is_running)
++        raise RuntimeError("command failed")
++    runtime._compress_context = fail
++    runtime.reset_session_state = fail
++    monkeypatch.setattr(adapter, "_switch_model", fail)
++    with pytest.raises(RequestError) as error:
++        await send(adapter, text)
++    assert error.value.data["reason"] == "command_failed"
++    assert ownership == [True]
++    assert not state.is_running
++    assert state.current_prompt_text == ""
++    runtime.result["messages"] = []
++    assert (await send(adapter, "next")).stop_reason == "end_turn"
++
++
++@pytest.mark.asyncio
++async def test_mutating_command_output_failure_releases_ownership(setup):
++    adapter, state, runtime = setup
++    async def fail(*args, **kwargs):
++        assert state.is_running
++        raise RuntimeError("output failed")
++    adapter._conn = SimpleNamespace(session_update=fail)
++    with pytest.raises(RuntimeError, match="output failed"):
++        await send(adapter, "/reset")
++    assert not state.is_running
++    assert state.current_prompt_text == ""
++
++
++@pytest.mark.asyncio
++async def test_model_rpc_rejects_busy_without_replacing_runtime(setup, monkeypatch):
++    adapter, state, runtime = setup
++    state.is_running = True
++    replacements = []
++    monkeypatch.setattr(adapter.session_manager, "_make_agent", lambda **kwargs: replacements.append(kwargs))
++    with pytest.raises(RequestError) as error:
++        await adapter.set_session_model("new-model", "test")
++    assert error.value.data == {"reason": "session_busy", "admitted": False}
++    assert state.agent is runtime
++    assert not replacements
++    assert state.is_running
++
++
++@pytest.mark.asyncio
++async def test_model_rpc_failure_releases_ownership(setup, monkeypatch):
++    adapter, state, runtime = setup
++    ownership = []
++    def fail(**kwargs):
++        ownership.append(state.is_running)
++        raise RuntimeError("model construction failed")
++    monkeypatch.setattr(adapter.session_manager, "_make_agent", fail)
++    with pytest.raises(RuntimeError, match="model construction failed"):
++        await adapter.set_session_model("new-model", "test")
++    assert ownership == [True]
++    assert not state.is_running
++    assert state.current_prompt_text == ""
+diff --git a/tests/agent/test_compaction_terminal_events.py b/tests/agent/test_compaction_terminal_events.py
+new file mode 100644
+index 0000000000..4914e9535f
+--- /dev/null
++++ b/tests/agent/test_compaction_terminal_events.py
+@@ -0,0 +1,72 @@
++"""Actual compression commit/abort paths expose typed, terminal-only observations."""
++import copy
++
++import pytest
++
++from agent.auxiliary_client import AuxiliaryExplicitCancellation
++from agent.conversation_compression import compress_context
++from tests.agent.test_compression_attempt_lifecycle import _build_agent, _summary_response
++
++
++@pytest.mark.parametrize("force", [False, True])
++@pytest.mark.parametrize("outcome", ["success", "failure", "cancelled", "busy", "commit_failure"])
++def test_actual_compression_terminal_matches_mutation_outcome(tmp_path, monkeypatch, force, outcome):
++    db, agent = _build_agent(tmp_path, "terminal-events")
++    events = []
++    agent.compaction_callback = events.append
++    messages = [{"role": "user" if i % 2 == 0 else "assistant", "content": f"m{i} " * 400} for i in range(20)]
++    original = copy.deepcopy(messages)
++    monkeypatch.setattr("agent.context_compressor.call_llm", lambda **kwargs: _summary_response("## Goal\nSynthetic summary."))
++    if outcome in {"failure", "cancelled"}:
++        def fail(*args, **kwargs):
++            if outcome == "cancelled":
++                agent._hard_interrupt_requested.set()
++                raise AuxiliaryExplicitCancellation()
++            raise RuntimeError("synthetic compressor failure")
++        monkeypatch.setattr(agent.context_compressor, "compress", fail)
++    if outcome == "commit_failure":
++        def fail_commit(*args, **kwargs):
++            raise RuntimeError("synthetic database commit failure")
++        monkeypatch.setattr(db, "archive_and_compact", fail_commit)
++    if outcome == "busy":
++        assert db.try_acquire_compression_lock(agent.session_id, "other-holder", ttl_seconds=60)
++    try:
++        if outcome == "failure":
++            with pytest.raises(RuntimeError, match="synthetic compressor failure"):
++                compress_context(agent, messages, "sys", approx_tokens=500_000, force=force)
++        else:
++            result, _ = compress_context(agent, messages, "sys", approx_tokens=500_000, force=force)
++            if outcome == "success":
++                assert len(result) < len(original)
++            else:
++                assert result == original
++        expected = {"success": "completed", "failure": "failed", "cancelled": "cancelled", "busy": "failed", "commit_failure": "failed"}[outcome]
++        assert [event.status for event in events] == [expected]
++        assert events[0].compaction_id
++        assert not hasattr(events[0], "summary")
++    finally:
++        db.close()
++
++
++def test_postcommit_diagnostic_error_preserves_completed_terminal(tmp_path, monkeypatch):
++    db, agent = _build_agent(tmp_path, "postcommit-terminal")
++    events = []
++    agent.compaction_callback = events.append
++    messages = [{"role": "user" if i % 2 == 0 else "assistant", "content": f"m{i} " * 400} for i in range(20)]
++    for message in messages:
++        db.append_message(agent.session_id, message["role"], message["content"])
++    monkeypatch.setattr("agent.context_compressor.call_llm", lambda **kwargs: _summary_response("## Goal\nSynthetic summary."))
++    failure = RuntimeError("postcommit diagnostic failure")
++    def fail(*args, **kwargs):
++        # The actual archive transaction has already replaced the durable history.
++        assert 0 < len(db.get_messages(agent.session_id)) < len(messages)
++        raise failure
++    monkeypatch.setattr("agent.conversation_compression._finish_compaction_boundary", fail)
++    try:
++        with pytest.raises(RuntimeError) as error:
++            compress_context(agent, messages, "sys", approx_tokens=500_000)
++        assert error.value is failure
++        assert [event.status for event in events] == ["completed"]
++        assert 0 < len(db.get_messages(agent.session_id)) < len(messages)
++    finally:
++        db.close()

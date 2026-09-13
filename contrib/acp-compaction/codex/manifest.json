@@ -1,0 +1,69 @@
+{
+  "schemaVersion": 1,
+  "adapter": "codex",
+  "repository": "https://github.com/agentclientprotocol/codex-acp",
+  "upstreamCommit": "effb0fe670a49dfbb5071764b5f8a2e3c09e2393",
+  "reviewedCommit": "e44fd1dd46e4e4209d96655412d1fc29a14a4e43",
+  "archiveUrl": "https://codeload.github.com/agentclientprotocol/codex-acp/tar.gz/effb0fe670a49dfbb5071764b5f8a2e3c09e2393",
+  "archiveSha256": "178d9829926a584521d440d9019c1a08c34e04f07942401318cbef405260389c",
+  "patchSha256": "23c6916fbdbf93fa636bf31b31f7dd3e684d43c6e5feb3e9b9627838284d5b4e",
+  "lockfileSha256": "ea5e5a33046415fbc30c14b529de9003d7e6e7b6dfd98d2f2500f52c89925814",
+  "package": "@agentclientprotocol/codex-acp",
+  "packageVersion": "1.11.0",
+  "dependencies": {
+    "@agentclientprotocol/sdk": "1.4.0",
+    "@openai/codex": "0.153.4"
+  },
+  "coverage": {
+    "version": 1,
+    "lifecycle": "completion_only",
+    "guardedCancel": false
+  },
+  "checks": [
+    [
+      "npm",
+      "run",
+      "build"
+    ],
+    [
+      "npm",
+      "run",
+      "typecheck"
+    ],
+    [
+      "npm",
+      "exec",
+      "--offline",
+      "--",
+      "vitest",
+      "run",
+      "src/__tests__/compaction-negotiation.test.ts",
+      "src/__tests__/CodexACPAgent/initialize.test.ts",
+      "src/__tests__/CodexACPAgent/load-session.test.ts",
+      "src/__tests__/CodexACPAgent/typed-session-failure-wire.test.ts"
+    ],
+    [
+      "npm",
+      "exec",
+      "--offline",
+      "--",
+      "vitest",
+      "run",
+      "src/__tests__/CodexACPAgent/CodexAcpClient.test.ts",
+      "-t",
+      "contextCompaction|thread/compacted"
+    ]
+  ],
+  "outcomeEvidence": [
+    {
+      "url": "https://raw.githubusercontent.com/openai/codex/3d2ee51ca2d5db578f328aa75e20aa22c0197c9a/codex-rs/core/src/compact.rs",
+      "filename": "compact.rs",
+      "sha256": "3f3324a1073d6896805c446ea6ebd2983200f0c04eef2188147bfb51b3486567"
+    },
+    {
+      "url": "https://raw.githubusercontent.com/openai/codex/3d2ee51ca2d5db578f328aa75e20aa22c0197c9a/codex-rs/core/src/compact_remote.rs",
+      "filename": "compact_remote.rs",
+      "sha256": "5a51af2ac0a0d083a3e31ff7de5ac1607a91ac20ee904c807faa059dd92bff96"
+    }
+  ]
+}

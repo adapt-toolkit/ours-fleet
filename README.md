@@ -437,7 +437,7 @@ Additional operational field inventory (schematic, not one YAML document):
     coordinator: FleetCoordinator       # announce target on boot
     monitor:
       mode: fleet                       # fleet = ours-fleet supervisor; native = harness monitor
-      interrupt: false                  # false queues; true cancels; after_tool steers at an ACP tool boundary
+      interrupt: false                  # legacy values accepted; automatic mail queues without cancellation
       wake_sources:                     # which daemon events wake the console (default:
         - message_received              #   message_received, file_received,
         - file_received                 #   local_contact_request, pending_message)
@@ -447,7 +447,7 @@ Additional operational field inventory (schematic, not one YAML document):
       identity: "Name Owner Channel"     # dedicated identity; fleet creates it with safe local defaults
       owners: [owner-contact-cid]        # authenticated ours contact IDs, never display names
       agent: managed-agent-cid           # exact role CID allowed to relay messages/files outward
-      interrupt: false                  # false queues; true cancels current work first
+      interrupt: false                  # ordinary owner mail queues; explicit interrupt commands remain available
       progress_interval_ms: 30000        # fleet-generated progress notices; 0 disables
       comments: true                    # relay live "🟡 Live update:" structured commentary (default true);
                                         #   restart baseline for /comments on|off
@@ -850,24 +850,62 @@ their boots ~4 s apart instead of firing all seven at once.
 With `monitor.mode: fleet` (the default), the **ours-fleet supervisor** delivers
 a role's mail wakes: the per-role runner long-polls the ours daemon's notification API and
 submits a single `[fleet-monitor] N new messages from … — run get_messages` prompt
-through the shared agent session. ACP uses live steering when its adapter supports it
-and falls back to structured `session/prompt`.
-Set `monitor.interrupt: true` on roles where every configured wake should cancel
-the active turn before the notification is delivered. This is intentionally
-content-blind: the supervisor cannot inspect encrypted message bodies, so all
-events selected by `wake_sources` receive the same interrupt policy.
-Set `monitor.interrupt: after_tool` when a wake must preserve an in-flight ACP
-tool result or pending permission. Fleet waits for terminal ACP tool/update
-evidence, then steers the wake without calling `session.cancel`. If the tool is
-still active after 120 seconds, or the adapter cannot expose authenticated tool
-boundaries/steering, fleet visibly degrades to non-cancelling steering or queued
-delivery. Explicit human and control interrupts remain immediate.
-The default is `false`: a role that must begin a post-readiness mission
-immediately, including second-and-later mail received while it is working, must
-set `monitor.mode: fleet` and `monitor.interrupt: true` explicitly. Readiness and
-mission delivery still use ordinary ours mail: the role announces readiness,
-waits for a body-free `[fleet-monitor]` wake, then calls `get_messages`; fleet
-does not inject the mission body through ACP.
+through the shared agent session. Automatic mail uses a durable queue and waits
+for the active prompt to settle. It never cancels or steers active work, including
+compaction. Legacy `monitor.interrupt: true` and `after_tool` values remain valid
+configuration, but the effective automatic-mail policy is queue-only until an
+adapter can negotiate atomic compaction-safe cancellation. Ordinary owner-channel
+text and attachments use this same conservative policy; explicit operator
+interrupt commands still request cancellation.
+
+The supervisor records body-free hints in `.monitor-ingress.json` before advancing
+the notification cursor. Admission and execution are distinct: cancelled/refused
+executions are recorded and never replayed as fresh wakes. A saved coverage cursor
+and constituent event keys prevent crash/rebatching duplicates. Never-dispatched
+hints resume after a synchronized startup without waiting for new mail. An RPC
+with an uncertain outcome is retained for operator review, never blindly retried.
+The journal retains all admission keys for the role lifetime; do not delete it to
+clear a status or roll back a release.
+
+Recovery logs identify uncertain rows. Inspect the journal plus source unread/history
+and any already-produced effects before explicitly asking the role to check mail
+again. A new wake does not certify the old execution outcome. Source binding uses
+the local identity directory incarnation (canonical path/device/inode/birth time);
+this is a local filesystem fence, not authenticated CID equivalence. Replacement
+sources archive old pending hints as unknown, and unavailable source metadata stops
+dispatch. A regressed daemon cursor requires explicit stream reconciliation.
+
+Readiness and mission delivery still use ordinary ours mail: the role announces
+readiness, waits for a body-free wake, then calls `get_messages`; Fleet never copies
+the mission body into the monitor journal.
+
+Fleet advertises the unstable ACP v1 `session.compaction` consumer capability and
+renders one timeline row per session and compaction ID. Summary content is discarded.
+Replay rebuilds history without marking the session busy; terminal-only updates do
+not fabricate a start. Future statuses display as unknown and remain unsafe for
+cancellation. Observed live compaction blocks prompt dispatch and steering; ordinary
+Stop returns `deferred` without sending cancellation or scheduling a later Stop.
+Request Stop again after compaction settles, or explicitly use the existing role
+recovery controls when forced recovery is intended. A prompt ending without its
+compaction terminal triggers bounded session recovery and records an unknown outcome.
+
+This is draft compatibility and observed lifecycle protection, not a guarantee that
+an adapter reports every compaction. Automatic mail remains queue-only regardless
+of lifecycle visibility. Legacy adapters keep their existing presentation; Fleet
+does not infer compaction from prose, usage changes or provider names. Adapter
+producer patches, pinned SDK source, and reproducible setup/test commands are included
+in [contrib/acp-compaction](contrib/acp-compaction/README.md). Build the desired
+producer there and select its generated executable in `session_options.acp.command`;
+the default installed adapters retain their current behavior.
+
+Owner push notices are off by default. Set `owner_channel.compaction_notices: true`
+to notify only the authenticated owner who initiated the active request. A durable
+body-free outbox records each session/ID/recipient phase before sending. Completion
+is sent only after a confirmed live start notice; replay and terminal-only history
+stay silent. Unknown send outcomes are not automatically retried. At most eight
+compaction attempts per owner request produce notices. The outbox fails closed on
+corruption or capacity exhaustion and must be retained on rollback. This option
+does not broadcast to task rooms or forward summaries.
 It primes the notification cursor *before* the session launches
 (no missed arrivals), cannot be orphaned or left deaf-but-armed, and writes its
 health to `<agentDir>/.monitor-status` (`armed | degraded | failed`), surfaced in
@@ -1031,7 +1069,7 @@ guard so hostile mail cannot become a notification amplifier.
 
 An owner request follows one ordered lifecycle on its authenticated source wire:
 
-1. Fleet sends an immediate receipt describing started, queued, or interrupting state.
+1. Fleet sends an immediate receipt describing whether the request started or queued.
 2. Periodic fleet-generated summaries may report allowlisted ACP activity shapes.
 3. On maintained Codex ACP adapters, assistant chunks carrying the exact
    `_meta.codex.phase = "commentary"` marker are automatically batched and forwarded

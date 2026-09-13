@@ -1,0 +1,193 @@
+--- a/acp/__init__.py
++++ b/acp/__init__.py
+@@ -41,6 +41,12 @@
+     AuthenticateRequest,
+     AuthenticateResponse,
+     CancelNotification,
++    CompactionId,
++    CompactionStatus,
++    CompactionUpdate,
++    CompactionSummaryChunk,
++    CompactionCapabilities,
++    ClientSessionCapabilities,
+     CreateTerminalRequest,
+     CreateTerminalResponse,
+     InitializeRequest,
+@@ -112,6 +118,12 @@
+     "RequestPermissionRequest",
+     "RequestPermissionResponse",
+     "CancelNotification",
++    "CompactionId",
++    "CompactionStatus",
++    "CompactionUpdate",
++    "CompactionSummaryChunk",
++    "CompactionCapabilities",
++    "ClientSessionCapabilities",
+     "SessionNotification",
+     "SetSessionModeRequest",
+     "SetSessionModeResponse",
+--- a/acp/agent/connection.py
++++ b/acp/agent/connection.py
+@@ -13,6 +13,8 @@
+     AgentThoughtChunk,
+     AvailableCommandsUpdate,
+     ConfigOptionUpdate,
++    CompactionUpdate,
++    CompactionSummaryChunk,
+     CreateTerminalRequest,
+     CreateTerminalResponse,
+     CurrentModeUpdate,
+@@ -90,7 +92,9 @@
+         | CurrentModeUpdate
+         | ConfigOptionUpdate
+         | SessionInfoUpdate
+-        | UsageUpdate,
++        | UsageUpdate
++        | CompactionUpdate
++        | CompactionSummaryChunk,
+         **kwargs: Any,
+     ) -> None:
+         await notify_model(
+--- a/acp/helpers.py
++++ b/acp/helpers.py
+@@ -12,6 +12,8 @@
+     AvailableCommandsUpdate,
+     BlobResourceContents,
+     ContentToolCallContent,
++    CompactionUpdate,
++    CompactionSummaryChunk,
+     CurrentModeUpdate,
+     EmbeddedResourceContentBlock,
+     FileEditToolCallContent,
+@@ -47,6 +49,8 @@
+     | ToolCallStart
+     | ToolCallProgress
+     | SessionInfoUpdate
++    | CompactionUpdate
++    | CompactionSummaryChunk
+ )
+ 
+ ToolCallContentVariant = ContentToolCallContent | FileEditToolCallContent | TerminalToolCallContent
+--- a/acp/interfaces.py
++++ b/acp/interfaces.py
+@@ -15,6 +15,8 @@
+     CloseSessionRequest,
+     CloseSessionResponse,
+     ConfigOptionUpdate,
++    CompactionUpdate,
++    CompactionSummaryChunk,
+     CreateTerminalRequest,
+     CreateTerminalResponse,
+     CurrentModeUpdate,
+@@ -96,7 +98,9 @@
+         | CurrentModeUpdate
+         | ConfigOptionUpdate
+         | SessionInfoUpdate
+-        | UsageUpdate,
++        | UsageUpdate
++        | CompactionUpdate
++        | CompactionSummaryChunk,
+         **kwargs: Any,
+     ) -> None: ...
+ 
+--- a/acp/schema.py
++++ b/acp/schema.py
+@@ -6,7 +6,7 @@
+ from enum import Enum
+ from typing import Annotated, Any, Dict, List, Literal, Optional, Union
+ 
+-from pydantic import BaseModel as _BaseModel, Field, RootModel, ConfigDict
++from pydantic import BaseModel as _BaseModel, Field, RootModel, ConfigDict, model_serializer, model_validator
+ 
+ PermissionOptionKind = Literal["allow_once", "allow_always", "reject_once", "reject_always"]
+ PlanEntryPriority = Literal["high", "medium", "low"]
+@@ -1369,7 +1369,20 @@
+     ] = None
+ 
+ 
++class CompactionCapabilities(BaseModel):
++    """UNSTABLE: support for the draft ID-addressed compaction contract."""
++
++
++class ClientSessionCapabilities(BaseModel):
++    """UNSTABLE client session capabilities; omitted/null compaction is unsupported."""
++
++    compaction: Optional[CompactionCapabilities] = None
++    field_meta: Optional[Dict[str, Any]] = Field(default=None, alias="_meta")
++
++
+ class ClientCapabilities(BaseModel):
++    session: Optional[ClientSessionCapabilities] = None
++
+     # The _meta property is reserved by ACP to allow clients and agents to attach additional
+     # metadata to their interactions. Implementations MUST NOT make assumptions about values at
+     # these keys.
+@@ -3122,6 +3135,59 @@
+     session_update: Annotated[Literal["tool_call"], Field(alias="sessionUpdate")]
+ 
+ 
++# Proposed narrow backport from the pinned unstable v1 compaction schema.
++# Keep the stable update union strict; do not replace it with arbitrary dictionaries.
++CompactionId = str
++CompactionStatus = Union[Literal["in_progress", "completed", "failed", "cancelled"], str]
++_CompactionContentBlock = Annotated[
++    Union[TextContentBlock, ImageContentBlock, AudioContentBlock, ResourceContentBlock, EmbeddedResourceContentBlock],
++    Field(discriminator="type"),
++]
++
++
++class CompactionUpdate(BaseModel):
++    """UNSTABLE compaction upsert; send only after the client's compaction capability.
++
++    Omitted summary/error/_meta leaves state unchanged; explicit null clears it.
++    Unknown string statuses are retained, never coerced into a known terminal state.
++    """
++
++    session_update: Annotated[Literal["compaction_update"], Field(alias="sessionUpdate")]
++    compaction_id: CompactionId = Field(alias="compactionId")
++    status: CompactionStatus
++    summary: Optional[List[_CompactionContentBlock]] = None
++    error: Optional[str] = None
++    field_meta: Optional[Dict[str, Any]] = Field(default=None, alias="_meta")
++
++    @model_validator(mode="after")
++    def _validate_terminal_content(self):
++        if self.summary and self.status != "completed":
++            raise ValueError("Non-empty compaction summary requires completed status")
++        if self.error is not None and self.status != "failed":
++            raise ValueError("Compaction error requires failed status")
++        return self
++
++    @model_serializer(mode="wrap")
++    def _serialize_patch(self, handler, info):
++        payload = handler(self)
++        # The SDK's serializer excludes None/defaults for ordinary payloads. Only
++        # these draft patch fields must retain an explicitly supplied null.
++        for name in ("summary", "error", "field_meta"):
++            if name in self.model_fields_set and getattr(self, name) is None:
++                alias = "_meta" if name == "field_meta" and info.by_alias else name
++                payload[alias] = None
++        return payload
++
++
++class CompactionSummaryChunk(BaseModel):
++    """UNSTABLE summary chunk; only between an in-progress and terminal update."""
++
++    session_update: Annotated[Literal["compaction_summary_chunk"], Field(alias="sessionUpdate")]
++    compaction_id: CompactionId = Field(alias="compactionId")
++    content: _CompactionContentBlock
++    field_meta: Optional[Dict[str, Any]] = Field(default=None, alias="_meta")
++
++
+ class SessionNotification(BaseModel):
+     # The _meta property is reserved by ACP to allow clients and agents to attach additional
+     # metadata to their interactions. Implementations MUST NOT make assumptions about values at
+@@ -3157,6 +3223,8 @@
+             ConfigOptionUpdate,
+             SessionInfoUpdate,
+             UsageUpdate,
++            CompactionUpdate,
++            CompactionSummaryChunk,
+         ],
+         Field(description="The actual update content.", discriminator="session_update"),
+     ]

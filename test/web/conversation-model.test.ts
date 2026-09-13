@@ -30,6 +30,38 @@ const turnEvents = (promptId: string) => [
 ];
 
 describe('conversation browser model', () => {
+  it('keeps one session-addressed compaction row across live updates and replay', () => {
+    const compaction = (status: string, extra = {}) => event('compaction.updated', {
+      sessionId: 's1', compactionId: 'c1', status, replayed: false, ...extra,
+    });
+    const model = applyEvents(emptyModel(), [compaction('in_progress'),
+      compaction('completed'), compaction('completed', { replayed: true }),
+      compaction('in_progress', { replayed: true })]);
+    expect(model.compactions).toHaveLength(1);
+    expect(model.compactions[0].status).toBe('completed');
+    expect(model.turns).toHaveLength(0);
+  });
+
+  it('keeps terminal-only history honest and distinct across session IDs', () => {
+    const model = applyEvents(emptyModel(), [
+      event('compaction.updated', { sessionId: 's1', compactionId: 'same', status: 'failed', replayed: true }),
+      event('compaction.updated', { sessionId: 's2', compactionId: 'same', status: 'future_status', replayed: false }),
+    ]);
+    expect(model.compactions.map(row => [row.sessionId, row.status])).toEqual([
+      ['s1', 'failed'], ['s2', 'unknown'],
+    ]);
+    expect(JSON.stringify(model)).not.toContain('future_status');
+  });
+
+  it('refines locally unknown outcome from authoritative terminal replay without reopening', () => {
+    const item = (status: string) => event('compaction.updated', {
+      sessionId: 's', compactionId: 'c', status, replayed: true,
+    });
+    const model = applyEvents(emptyModel(), [item('unknown_ended'), item('in_progress')]);
+    expect(model.compactions[0].status).toBe('unknown_ended');
+    applyEvents(model, [item('completed')]);
+    expect(model.compactions[0].status).toBe('completed');
+  });
   it('groups a turn and merges assistant chunks by messageId', () => {
     const model = applyEvents(emptyModel(), turnEvents('p1'));
     expect(model.turns).toHaveLength(1);

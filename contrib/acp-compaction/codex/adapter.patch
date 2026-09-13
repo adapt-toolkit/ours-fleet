@@ -1,0 +1,229 @@
+diff --git a/docs/compaction-lifecycle.md b/docs/compaction-lifecycle.md
+new file mode 100644
+index 0000000..4b6076a
+--- /dev/null
++++ b/docs/compaction-lifecycle.md
+@@ -0,0 +1,36 @@
++# Negotiated compaction lifecycle
++
++ACP v1 clients opt in with `clientCapabilities.session.compaction: {}`. The
++adapter uses the SDK 1.4.0 public `session/update` union. Unsupported, null, or
++malformed capabilities retain synthetic tool updates and the deprecated text
++banner. No compaction summaries are forwarded on the negotiated path.
++
++Native item IDs become compaction IDs, including terminal-only history replay.
++The deprecated `thread/compacted` banner is suppressed for opted-in clients;
++that ID-less event cannot be joined reliably to a native item. Genuine tool
++updates without the adapter's context-compaction metadata remain tools.
++
++The proposed `agentCapabilities._meta["ai.ours/compactionSafety"]` advertises
++`version: 1`, `lifecycle: "completion_only"`, and `guardedCancel: false`.
++Observed starts are forwarded, but complete start/failure/cancellation coverage
++is not established. Missing terminals after stream loss or turn failure are
++unknown outcomes, never synthesized success. Consumers must wait for prompt
++settlement and reconcile unresolved starts; no lifecycle event permits automatic
++cancellation.
++
++## Outcome evidence and limits
++
++This patch targets adapter commit `effb0fe670a49dfbb5071764b5f8a2e3c09e2393`
++(package 1.11.0), whose lockfile selects native Codex 0.153.4. At native commit
++`3d2ee51ca2d5db578f328aa75e20aa22c0197c9a` (tag `rust-v0.153.4`):
++
++- `codex-rs/core/src/compact.rs:379-394` awaits history replacement and token
++  recomputation before emitting the context-compaction item completed event.
++- `codex-rs/core/src/compact_remote.rs:295-310` does the same; unsuccessful remote
++  attempts return earlier without this completion.
++
++Thus these item completions represent installed compacted history; a later
++post-compaction hook can still stop the enclosing turn. This is not proof of
++complete runtime coverage, durable filesystem persistence, or equivalent
++semantics in an overridden runtime binary. Deterministic tests cover the
++adapter mapping and SDK v1 wire negotiation, not paid live compaction or v2.
+diff --git a/src/ACPSessionConnection.ts b/src/ACPSessionConnection.ts
+index c04570c..a1ca0b2 100644
+--- a/src/ACPSessionConnection.ts
++++ b/src/ACPSessionConnection.ts
+@@ -6,6 +6,14 @@ import {
+ 
+ export type AcpClientConnection = Pick<acp.AgentContext, "notify" | "request">;
+ 
++// Negotiation belongs to the ACP connection, including session history replay.
++const compactionClients = new WeakMap<AcpClientConnection, boolean>();
++
++export function configureCompaction(connection: AcpClientConnection, capabilities: acp.ClientCapabilities | null | undefined): void {
++    const capability = capabilities?.session?.compaction;
++    compactionClients.set(connection, capability !== null && typeof capability === "object" && !Array.isArray(capability));
++}
++
+ export class ACPSessionConnection {
+     private readonly connection: AcpClientConnection;
+     readonly sessionId: string;
+@@ -15,7 +23,23 @@ export class ACPSessionConnection {
+         this.sessionId = sessionId;
+     }
+ 
++    get supportsCompaction(): boolean {
++        return compactionClients.get(this.connection) === true;
++    }
++
+     async update(update: UpdateSessionEvent, sessionId: string = this.sessionId) {
++        if (this.supportsCompaction
++            && (update.sessionUpdate === "tool_call" || update.sessionUpdate === "tool_call_update")
++            && update._meta?.["contextCompaction"]
++            && (update.status === "in_progress" || update.status === "completed")) {
++            // The native 0.153.4 local/remote compaction implementations emit
++            // completed only after replacing history. Replay is terminal-only.
++            update = {
++                sessionUpdate: "compaction_update",
++                compactionId: update.toolCallId,
++                status: update.status,
++            };
++        }
+         await this.connection.notify(acp.methods.client.session.update, asSdkSessionNotification({
+             sessionId,
+             update: update
+diff --git a/src/CodexAcpServer.ts b/src/CodexAcpServer.ts
+index 4ff0e1b..440bc68 100644
+--- a/src/CodexAcpServer.ts
++++ b/src/CodexAcpServer.ts
+@@ -21,7 +21,7 @@ import {
+ } from "./CodexAcpClient";
+ import {CodexAppServerClient, type McpStartupResult} from "./CodexAppServerClient";
+ import {type CodexConnection, startCodexConnection} from "./CodexJsonRpcConnection";
+-import {type AcpClientConnection, ACPSessionConnection, type UpdateSessionEvent} from "./ACPSessionConnection";
++import {type AcpClientConnection, ACPSessionConnection, configureCompaction, type UpdateSessionEvent} from "./ACPSessionConnection";
+ import type {InputModality, ReasoningEffort, ServerNotification} from "./app-server";
+ import type {
+     Account,
+@@ -332,6 +332,7 @@ export class CodexAcpServer {
+         logger.log("Initialize request received");
+         this.clientInfo = _params.clientInfo ?? null;
+         this.clientCapabilities = _params.clientCapabilities ?? null;
++        configureCompaction(this.connection, this.clientCapabilities);
+         this.initializeRequest = _params;
+         this.terminalOutputMode = resolveTerminalOutputMode(_params.clientCapabilities);
+         this.booleanConfigOptionsSupported = clientSupportsBooleanConfigOptions(_params.clientCapabilities);
+@@ -373,6 +374,8 @@ export class CodexAcpServer {
+                     // Presence means "this agent pushes `_auth/status_update`". It
+                     // never carries a payload, and the client never asks for one.
+                     [AUTH_STATUS_META_KEY]: authStatusCapability(),
++                    // Failed/cancelled native compactions can omit a terminal item.
++                    "ai.ours/compactionSafety": { version: 1, lifecycle: "completion_only", guardedCancel: false },
+                 },
+             },
+             authMethods: getCodexAuthMethods(_params.clientCapabilities),
+diff --git a/src/CodexEventHandler.ts b/src/CodexEventHandler.ts
+index 7b56754..3378cad 100644
+--- a/src/CodexEventHandler.ts
++++ b/src/CodexEventHandler.ts
+@@ -537,7 +537,9 @@ export class CodexEventHandler {
+             case "item/autoApprovalReview/completed":
+                 return this.handleGuardianApprovalReviewCompleted(notification.params);
+             case "thread/compacted":
+-                return this.createContextCompactedEvent();
++                // Native item updates carry identity; the deprecated event has
++                // none and otherwise duplicates the negotiated lifecycle.
++                return this.session.supportsCompaction ? null : this.createContextCompactedEvent();
+             case "item/reasoning/summaryTextDelta":
+                 this.completeRetryIncidentOnTurnProgress();
+                 return this.createReasoningDeltaEvent(notification.params);
+diff --git a/src/__tests__/CodexACPAgent/initialize.test.ts b/src/__tests__/CodexACPAgent/initialize.test.ts
+index e6bdb8b..5366ffa 100644
+--- a/src/__tests__/CodexACPAgent/initialize.test.ts
++++ b/src/__tests__/CodexACPAgent/initialize.test.ts
+@@ -63,6 +63,7 @@ describe('CodexACPAgent - initialize', () => {
+                 },
+                 _meta: {
+                     authStatus: {},
++                    "ai.ours/compactionSafety": { version: 1, lifecycle: "completion_only", guardedCancel: false },
+                 },
+             },
+             authMethods: getCodexAuthMethods(),
+diff --git a/src/__tests__/CodexACPAgent/typed-session-failure-wire.test.ts b/src/__tests__/CodexACPAgent/typed-session-failure-wire.test.ts
+index 115ed58..3a97e69 100644
+--- a/src/__tests__/CodexACPAgent/typed-session-failure-wire.test.ts
++++ b/src/__tests__/CodexACPAgent/typed-session-failure-wire.test.ts
+@@ -503,3 +503,32 @@ function createTurn(status: "inProgress" | "completed") {
+         durationMs: null,
+     };
+ }
++
++describe("compaction over the public ACP SDK transport", () => {
++    it.each([true, false])("negotiates lifecycle and suppresses only its legacy banner: %s", async (supported) => {
++        const fixture = await createIdleFixture("wire-compaction", supported ? { session: { compaction: {} } } : {});
++        fixture.sendServerNotification({ method: "item/started", params: {
++            threadId: fixture.sessionId, turnId: "turn-id", startedAtMs: 0,
++            item: { type: "contextCompaction", id: "compact-wire" },
++        } });
++        fixture.sendServerNotification({ method: "item/completed", params: {
++            threadId: fixture.sessionId, turnId: "turn-id", completedAtMs: 0,
++            item: { type: "contextCompaction", id: "compact-wire" },
++        } });
++        fixture.sendServerNotification({ method: "thread/compacted", params: {
++            threadId: fixture.sessionId, turnId: "turn-id",
++        } });
++        await fixture.codexClient.waitForSessionNotifications(fixture.sessionId);
++        await vi.waitFor(() => expect(fixture.updates).toHaveLength(supported ? 2 : 3));
++        if (supported) {
++            expect(fixture.updates.map(({ update }) => update)).toEqual([
++                { sessionUpdate: "compaction_update", compactionId: "compact-wire", status: "in_progress" },
++                { sessionUpdate: "compaction_update", compactionId: "compact-wire", status: "completed" },
++            ]);
++        } else {
++            expect(fixture.updates.map(({ update }) => update.sessionUpdate)).toEqual([
++                "tool_call", "tool_call_update", "agent_message_chunk",
++            ]);
++        }
++    });
++});
+diff --git a/src/__tests__/compaction-negotiation.test.ts b/src/__tests__/compaction-negotiation.test.ts
+new file mode 100644
+index 0000000..4852958
+--- /dev/null
++++ b/src/__tests__/compaction-negotiation.test.ts
+@@ -0,0 +1,44 @@
++import { describe, expect, it, vi } from "vitest";
++import type { ClientCapabilities } from "@agentclientprotocol/sdk";
++import { ACPSessionConnection, type AcpClientConnection } from "../ACPSessionConnection";
++import { CodexAcpServer } from "../CodexAcpServer";
++import { CodexAcpClient } from "../CodexAcpClient";
++import { CodexAppServerClient } from "../CodexAppServerClient";
++import { createMockConnections } from "./CodexACPAgent/test-utils";
++import { createContextCompactionStartUpdate, createContextCompactionCompleteUpdate, createCompletedContextCompactionUpdate } from "../CodexToolCallMapper";
++
++async function fixture(capabilities?: ClientCapabilities) {
++  const mocks = createMockConnections();
++  mocks.mockAcpConnection.notify = vi.fn().mockResolvedValue(undefined);
++  mocks.mockAcpConnection.request = vi.fn();
++  const client = new CodexAcpClient(new CodexAppServerClient(mocks.mockCodexConnection));
++  const agent = new CodexAcpServer(mocks.mockAcpConnection, client);
++  const response = await agent.initialize({ protocolVersion: 1, ...(capabilities ? { clientCapabilities: capabilities } : {}) });
++  return { response, connection: mocks.mockAcpConnection, session: new ACPSessionConnection(mocks.mockAcpConnection as AcpClientConnection, "s") };
++}
++
++describe("compaction negotiation", () => {
++  it("publishes draft updates via public notify with conservative coverage", async () => {
++    const { session, connection, response } = await fixture({ session: { compaction: {} } });
++    await session.update(createContextCompactionStartUpdate({ type: "contextCompaction", id: "c" }));
++    await session.update(createContextCompactionCompleteUpdate({ type: "contextCompaction", id: "c" }));
++    const notifications = connection.notify.mock.calls.filter((call: unknown[]) => (call[1] as { sessionId?: string })?.sessionId === "s").map((call: unknown[]) => call[1]);
++    expect(notifications).toEqual([
++      { sessionId: "s", update: { sessionUpdate: "compaction_update", compactionId: "c", status: "in_progress" } },
++      { sessionId: "s", update: { sessionUpdate: "compaction_update", compactionId: "c", status: "completed" } },
++    ]);
++    expect(response.agentCapabilities?._meta?.["ai.ours/compactionSafety"]).toEqual({ version: 1, lifecycle: "completion_only", guardedCancel: false });
++  });
++  it.each([undefined, {}, { session: {} }, { session: { compaction: null } }, { session: { compaction: false } }, { session: { compaction: [] } }])("retains legacy updates for unsupported capabilities %j", async (capabilities) => {
++    const { session, connection } = await fixture(capabilities as ClientCapabilities);
++    await session.update(createContextCompactionStartUpdate({ type: "contextCompaction", id: "c" }));
++    expect(connection.notify.mock.calls.at(-1)?.[1].update.sessionUpdate).toBe("tool_call");
++  });
++  it("maps terminal-only history without creating a start and preserves genuine tools", async () => {
++    const { session, connection } = await fixture({ session: { compaction: {} } });
++    await session.update(createCompletedContextCompactionUpdate({ type: "contextCompaction", id: "history" }));
++    expect(connection.notify.mock.calls.at(-1)?.[1]).toEqual({ sessionId: "s", update: { sessionUpdate: "compaction_update", compactionId: "history", status: "completed" } });
++    await session.update({ sessionUpdate: "tool_call", toolCallId: "real", title: "Compact conversation", kind: "think", status: "in_progress" });
++    expect(connection.notify.mock.calls.at(-1)?.[1].update.sessionUpdate).toBe("tool_call");
++  });
++});

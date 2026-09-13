@@ -24,6 +24,7 @@ export interface ConversationEvent {
 }
 
 export interface ConversationSnapshot {
+  activeCompactionIds?: string[];
   sessionGeneration: string;
   readiness: string;
   queueDepth: number;
@@ -102,7 +103,16 @@ export interface TranscriptTurn {
   usage?: { used: number; size: number; cost?: { amount: number; currency: string } };
 }
 
+export interface CompactionRow {
+  key: string;
+  sessionId: string;
+  compactionId: string;
+  firstSeq: number;
+  status: 'in_progress' | 'completed' | 'failed' | 'cancelled' | 'unknown' | 'unknown_ended';
+}
+
 export interface ConversationModel {
+  compactions: CompactionRow[];
   turns: TranscriptTurn[];
   /** Events with no prompt correlation (replay tails, session updates). */
   usage?: { used: number; size: number; cost?: { amount: number; currency: string } };
@@ -115,7 +125,7 @@ export interface ConversationModel {
 }
 
 export const emptyModel = (): ConversationModel => ({
-  turns: [], lastSeq: 0, seenEventIds: {}, historyDegraded: false,
+  turns: [], compactions: [], lastSeq: 0, seenEventIds: {}, historyDegraded: false,
 });
 
 const turnFor = (model: ConversationModel, event: ConversationEvent): TranscriptTurn => {
@@ -148,6 +158,25 @@ function applyEvent(model: ConversationModel, event: ConversationEvent): void {
   model.lastSeq = Math.max(model.lastSeq, event.seq);
   const payload = event.payload ?? {};
   switch (event.kind) {
+    case 'compaction.updated': {
+      const { sessionId, compactionId } = payload;
+      if (typeof sessionId !== 'string' || !sessionId || typeof compactionId !== 'string' || !compactionId) return;
+      const key = JSON.stringify([sessionId, compactionId]);
+      const rawStatus = payload.status;
+      const status: CompactionRow['status'] = rawStatus === 'in_progress' || rawStatus === 'completed'
+        || rawStatus === 'failed' || rawStatus === 'cancelled' || rawStatus === 'unknown_ended'
+        ? rawStatus : 'unknown';
+      const row = model.compactions.find(row => row.key === key);
+      if (row) {
+        row.firstSeq = Math.min(row.firstSeq, event.seq);
+        // Replay and late starts cannot reopen a terminal lifecycle entity.
+        if (row.status === 'in_progress' || row.status === 'unknown'
+            || (row.status === 'unknown_ended' && (status === 'completed' || status === 'failed' || status === 'cancelled')))
+          row.status = status;
+      } else model.compactions.push({ key, sessionId, compactionId, firstSeq: event.seq, status });
+      model.compactions.sort((a, b) => a.firstSeq - b.firstSeq);
+      return;
+    }
     case 'prompt.admitted': {
       const turn = turnFor(model, event);
       const text = (payload.displayText as { text?: string } | undefined)?.text
@@ -318,6 +347,7 @@ export function applyEvents(
 export function cloneModel(model: ConversationModel): ConversationModel {
   return {
     ...model,
+    compactions: model.compactions.map(row => ({ ...row })),
     turns: model.turns.map(turn => ({
       ...turn,
       messages: turn.messages.map(message => ({ ...message })),

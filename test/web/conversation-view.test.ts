@@ -2,9 +2,16 @@ import { createElement } from 'react';
 import { renderToStaticMarkup } from 'react-dom/server';
 import { describe, expect, it } from 'vitest';
 
-import { ToolContent, ToolLocation } from '../../web/src/ConversationView.js';
+import { CompactionStatus, ToolContent, ToolLocation } from '../../web/src/ConversationView.js';
 
 describe('conversation provenance rendering', () => {
+  it('renders terminal-only compaction without a fabricated start or summary', () => {
+    const html = renderToStaticMarkup(createElement(CompactionStatus, { row: {
+      key: 's:c', sessionId: 's', compactionId: 'c', firstSeq: 1, status: 'failed',
+    } }));
+    expect(html).toContain('Compaction failed');
+    expect(html).not.toContain('Compacting the conversation');
+  });
   it('renders every bounded diff provenance field for both changed sides', () => {
     const html = renderToStaticMarkup(createElement(ToolContent, { content: {
       type: 'diff', path: 'WORKLOG.md', operation: 'edit', bounded: true,

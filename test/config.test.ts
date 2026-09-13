@@ -26,6 +26,14 @@ const dropin = (name: string, s: string) => {
 };
 
 describe('loadConfig', () => {
+  it('requires explicit boolean opt-in for owner compaction notices', () => {
+    base('roles:\n  A:\n    session: acp\n    owner_channel: { identity: A-owner, owners: [cid] }\n');
+    expect(findRole(loadConfig(), 'A').owner_channel?.compaction_notices).toBeUndefined();
+    base('roles:\n  A:\n    session: acp\n    owner_channel: { identity: A-owner, owners: [cid], compaction_notices: true }\n');
+    expect(findRole(loadConfig(), 'A').owner_channel?.compaction_notices).toBe(true);
+    base('roles:\n  A:\n    session: acp\n    owner_channel: { identity: A-owner, owners: [cid], compaction_notices: "true" }\n');
+    expect(() => loadConfig()).toThrow(/compaction_notices must be true or false/);
+  });
   it('resolves a trusted owner channel only for ACP', () => {
     const agent = 'A'.repeat(64);
     const ownerOne = 'B'.repeat(64);

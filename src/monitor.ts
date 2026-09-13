@@ -1,4 +1,5 @@
-import { existsSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
+import type { MonitorAdmission, MonitorAdmissionReceipt } from './monitor-delivery.js';
+import { existsSync, readFileSync, renameSync, writeFileSync, statSync, realpathSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 import type { MonitorConfig, MonitorInterrupt, NotifyEventType } from './config.js';
@@ -38,6 +39,8 @@ export type FetchLike = (
 
 export interface MonitorDeps {
   fetch: FetchLike;
+  /** Local source-store incarnation; injectable for isolated transports/tests. */
+  sourceEpoch?(identity: string, stateDir: string): string;
   isAlive(pid: number): boolean;
   sleep(ms: number): Promise<void>;
   now(): number;
@@ -54,6 +57,9 @@ export interface MonitorDeps {
    * not commit the cursor.
    */
   delivery?: {
+    /** Durable body-free responsibility transfer, distinct from execution. */
+    admittedCursor?(scope: string): number | undefined;
+    admit?(batch: MonitorAdmission): Promise<MonitorAdmissionReceipt>;
     submit(
       text: string,
       options?: { interrupt?: MonitorInterrupt },
@@ -484,6 +490,7 @@ export interface MonitorOpts {
 
 /** The lifecycle surface the runner drives: prime pre-launch, run, stop on pid death. */
 export interface MonitorHandle {
+  admissionScope?(): string;
   prime(options?: { resetCursor?: boolean }): Promise<void>;
   run(pid: number): Promise<void>;
   stop(): void;
@@ -499,7 +506,9 @@ export class Monitor {
   private readonly cursorPath: string;
   private readonly statePath: string;
   private cursor: number | null = null;
+  private readonly eventKeys = new WeakMap<NotifyEvent, string>();
   private deliveredCursor: number | null = null;
+  private cursorScope?: string;
   private pendingState: { count: number; eventTypes: string[]; attempts: number } | null = null;
   private fatal = false;
   private stopped = false;
@@ -539,6 +548,7 @@ export class Monitor {
       return;
     }
     try {
+      try { this.cursorScope = this.admissionScope(); } catch { this.cursorScope = undefined; }
       const body = await this.doFetch('tip', LONGPOLL_STALL_MS, 'stall');
       this.cursor = typeof body.cursor === 'number' ? body.cursor : 0;
       this.persistCursor();
@@ -564,6 +574,23 @@ export class Monitor {
       if (!this.deps.isAlive(pid)) { this.degrade('offline', 'session offline'); return; }
       let body: { cursor?: number; events?: NotifyEvent[] };
       try {
+        if (this.deps.delivery?.admit) {
+          const scope = this.admissionScope();
+          if (scope !== this.cursorScope) {
+            // A numeric byte cursor belongs to a particular source store.
+            // On replacement (or migration from an unbound legacy cursor),
+            // read the new source from zero; the journal fences old hints.
+            this.cursorScope = scope;
+            this.cursor = 0; this.deliveredCursor = 0;
+            pending.length = 0; this.pendingState = null;
+            this.persistState();
+          }
+        }
+        const transferred = this.deps.delivery?.admittedCursor?.(this.admissionScope());
+        if (transferred !== undefined && transferred > (this.cursor ?? 0)) {
+          this.cursor = transferred;
+          this.persistCursor();
+        }
         body = await this.doFetch(String(this.cursor ?? 0), LONGPOLL_STALL_MS, 'stall');
         backoff = 0;
         // A poll that worked proves the stream is healthy — and only that.
@@ -576,6 +603,11 @@ export class Monitor {
         await this.deps.sleep(backoff);
         continue;
       }
+      if (typeof body.cursor === 'number' && this.cursor !== null && body.cursor < this.cursor) {
+        this.degrade('delivery', 'notification cursor regressed; stream reconciliation required', 'failed');
+        return;
+      }
+      this.markEventKeys(body);
       this.advance(body.cursor, false);
       const batch = filterEvents(body.events ?? [], this.cfg.wake_sources);
       appendUniqueEvents(pending, batch);
@@ -607,6 +639,19 @@ export class Monitor {
     }
   }
 
+  admissionScope(): string {
+    // The current daemon API exposes names, not identity CIDs. Bind to the
+    // local identity store incarnation without opening any identity/key file.
+    // Recreating a name creates a new directory incarnation and archives old
+    // wake responsibility before the new session may drain it.
+    const epoch = this.deps.sourceEpoch?.(this.identity, this.ep.stateDir) ?? (() => {
+      const path = join(this.ep.stateDir, this.identity);
+      const stat = statSync(path);
+      return JSON.stringify([realpathSync(path), stat.dev, stat.ino, stat.birthtimeMs]);
+    })();
+    return JSON.stringify([this.ep.origin, this.identity, epoch]);
+  }
+
   stop(): void {
     this.stopped = true;
     this.currentAbort?.abort();
@@ -621,9 +666,21 @@ export class Monitor {
     if (this.stopped) return;
     try {
       const more = await this.doFetch(String(this.cursor ?? 0), COALESCE_HOLD_MS, 'coalesce');
+      if (typeof more.cursor === 'number' && this.cursor !== null && more.cursor < this.cursor)
+        throw new Error('notification cursor regressed');
+      this.markEventKeys(more);
       this.advance(more.cursor, false);
       appendUniqueEvents(batch, filterEvents(more.events ?? [], this.cfg.wake_sources));
     } catch { /* no stragglers / abort — deliver what we have */ }
+  }
+
+  private markEventKeys(page: { cursor?: number; events?: NotifyEvent[] }): void {
+    for (const [index, event] of (page.events ?? []).entries()) {
+      const key = notificationKey(event);
+      this.eventKeys.set(event, key === undefined
+        ? JSON.stringify(['page', page.cursor ?? this.cursor, index, event.event, event.date])
+        : JSON.stringify(['event', key, event.date ?? '']));
+    }
   }
 
   private async deliver(pid: number, batch: NotifyEvent[]): Promise<boolean> {
@@ -631,6 +688,15 @@ export class Monitor {
     if (!this.deps.delivery) {
       this.degrade('delivery', 'structured agent-session delivery is unavailable');
       return false;
+    }
+    if (this.deps.delivery.admit) {
+      await this.deps.delivery.admit({
+        scope: this.admissionScope(),
+        ...(this.cursor === null ? {} : { cursor: this.cursor }),
+        events: batch.map(event => ({ key: this.eventKeys.get(event)!, event })),
+      });
+      this.recover('delivery', 'modal', 'safe-boundary');
+      return true;
     }
     {
       const result = await this.deps.delivery.submit(line, { interrupt: this.cfg.interrupt });
@@ -723,11 +789,12 @@ export class Monitor {
     try {
       if (existsSync(this.statePath)) {
         const state = JSON.parse(readFileSync(this.statePath, 'utf8')) as {
-          identity?: string; profileKey?: string; deliveredCursor?: number;
+          identity?: string; profileKey?: string; deliveredCursor?: number; sourceScope?: string;
         };
         if ((state.identity !== undefined && state.identity !== this.identity)
             || (state.profileKey !== undefined && state.profileKey !== this.ep.origin))
           return null;
+        if (typeof state.sourceScope === 'string') this.cursorScope = state.sourceScope;
         if (typeof state.deliveredCursor === 'number') {
           this.deliveredCursor = state.deliveredCursor;
           return state.deliveredCursor;
@@ -748,6 +815,7 @@ export class Monitor {
         version: 1,
         identity: this.identity,
         profileKey: this.ep.origin,
+        sourceScope: this.cursorScope,
         observedCursor: this.cursor,
         deliveredCursor: this.deliveredCursor,
         pending: this.pendingState,

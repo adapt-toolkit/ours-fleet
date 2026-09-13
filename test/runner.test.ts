@@ -24,7 +24,7 @@ import { agentDir, stateRoot } from '../src/paths.js';
 import { fakeAdapter } from './registry.test.js';
 import type { Exec } from '../src/exec.js';
 import type { HarnessAdapter } from '../src/harness/types.js';
-import type { MonitorOpts } from '../src/monitor.js';
+import { createMonitor as createRealMonitor, type MonitorOpts } from '../src/monitor.js';
 import {
   OwnerBinderConflictError, OwnerBinderHandoffTimeoutError,
 } from '../src/owner-channel/binder.js';
@@ -870,8 +870,10 @@ describe('runOnce ACP startup outcome', () => {
       await vi.waitFor(() => expect(logs.some(line => line.includes('[A] up;'))).toBe(true));
       expect(starts).toBe(1); expect(session!.isAlive()).toBe(true);
       if (mode !== 'normal') expect(logs.some(line => line.includes('requires operator attention; keeping supervisor alive'))).toBe(true);
-    } finally { await session?.close(); }
-    await running;
+    } finally {
+      await session?.close();
+      await running;
+    }
   });
 
   it('a refused startup prompt fails the role instead of logging it up', async () => {
@@ -1286,7 +1288,32 @@ describe('runOnce ACP startup outcome', () => {
     expect(logs.some(line => line.includes('scheduled loop manager unavailable'))).toBe(true);
   });
 
-  it('steers an interrupting wake during ACP startup instead of cancelling startup', async () => {
+  it('binds polling and recovered hints to a replacement source with the same name', async () => {
+    writeCfg({ A: { harness: 'fake-acp', session: 'acp', monitor: { mode: 'fleet', batch_ms: 0 },
+      env: { ACP_FIXTURE_EXIT_AFTER: '1', ACP_FIXTURE_PROMPT_DELAY_MS: '100' } } });
+    const d = agentDir('A'); mkdirSync(d, { recursive: true });
+    writeFileSync(join(d, '.monitor-state.json'), JSON.stringify({ version: 1, identity: 'A',
+      profileKey: 'http://127.0.0.1:3050', sourceScope: 'old-source', deliveredCursor: 100, observedCursor: 100 }));
+    writeFileSync(join(d, '.monitor-ingress.json'), JSON.stringify({ version: 1, owner: 'old', scope: 'old-source',
+      coveredCursor: 100, rows: [{ id: 'old-wake', keys: ['old'], text: 'old source hint', state: 'queued' }] }));
+    const { deps } = acpDeps(); const calls: string[] = [];
+    deps.createMonitor = opts => createRealMonitor({ ...opts, deps: { ...opts.deps,
+      get delivery() { return opts.deps.delivery; },
+      sourceEpoch: () => 'replacement-epoch',
+      fetch: async url => {
+        calls.push(url); await new Promise(resolve => setTimeout(resolve, 5));
+        return { status: 200, ok: true, json: async () => ({ cursor: 20,
+          events: [{ event: 'message_received', from: 'peer', msg_id: 1 }] }) };
+      },
+    } });
+    await runOnce('A', {}, deps);
+    expect(calls[0]).toContain('since=0');
+    const journal = JSON.parse(readFileSync(join(d, '.monitor-ingress.json'), 'utf8'));
+    expect(journal.rows[0]).toMatchObject({ state: 'unknown', outcome: 'source_scope_changed' });
+    expect(journal.rows.some((row: { id: string }) => row.id !== 'old-wake')).toBe(true);
+  });
+
+  it('durably queues an interrupting wake during ACP startup without steering', async () => {
     writeCfg({ A: {
       harness: 'fake-acp',
       session: 'acp',
@@ -1303,7 +1330,7 @@ describe('runOnce ACP startup outcome', () => {
       run: async () => {
         const before = readFileSync(join(d, '.session-events.jsonl'), 'utf8');
         startupWasActive = !before.includes('"kind":"turn_stop"');
-        const result = await opts.deps.delivery!.submit('wake during startup', { interrupt: true });
+        const result = await opts.deps.delivery!.admit!({ scope: 'test', events: [{ key: '1', event: { event: 'message_received', msg_id: 1 } }] });
         wakeOutcome = result.outcome;
       },
       stop: () => {},
@@ -1311,13 +1338,14 @@ describe('runOnce ACP startup outcome', () => {
 
     await runOnce('A', {}, deps);
     expect(startupWasActive).toBe(true);
-    expect(['injected', 'startedNewTurn']).toContain(wakeOutcome);
+    expect(wakeOutcome).toBe('queued');
+    expect(JSON.parse(readFileSync(join(d, '.monitor-ingress.json'), 'utf8')).rows).toHaveLength(1);
     const events = readFileSync(join(d, '.session-events.jsonl'), 'utf8');
     expect(events).not.toContain('"stopReason":"cancelled"');
     expect(events).toContain('"kind":"turn_stop"');
   });
 
-  it('steers after_tool directly during ACP startup without waiting or cancelling', async () => {
+  it('durably queues after_tool during ACP startup without steering', async () => {
     writeCfg({ A: {
       harness: 'fake-acp',
       session: 'acp',
@@ -1331,15 +1359,15 @@ describe('runOnce ACP startup outcome', () => {
     deps.createMonitor = opts => ({
       prime: async () => {},
       run: async () => {
-        const result = await opts.deps.delivery!.submit(
-          'after_tool wake during startup', { interrupt: 'after_tool' });
+        const result = await opts.deps.delivery!.admit!({ scope: 'test', events: [{ key: '2', event: { event: 'message_received', msg_id: 2 } }] });
         wakeOutcome = result.outcome;
       },
       stop: () => {},
     });
 
     await runOnce('A', {}, deps);
-    expect(['injected', 'startedNewTurn']).toContain(wakeOutcome);
+    expect(wakeOutcome).toBe('queued');
+    expect(JSON.parse(readFileSync(join(d, '.monitor-ingress.json'), 'utf8')).rows).toHaveLength(1);
     const events = readFileSync(join(d, '.session-events.jsonl'), 'utf8');
     expect(events).not.toContain('"kind":"monitor_delivery"');
     expect(events).not.toContain('"cancellationSource":"fleet-monitor"');

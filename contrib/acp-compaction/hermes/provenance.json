@@ -1,0 +1,12 @@
+{
+  "upstream": "https://github.com/NousResearch/hermes-agent.git",
+  "baseline": "d15ed4445207dda418b984e8bda0f68f48b8c6f3",
+  "reviewed_tip": "89c309efb8feb95dfb7d0898a35a76a6faa659f4",
+  "patch_sha256": "ad6f57b5e147e0b2ada7f073aa5f4171629ad5de84943ed2d6aace650edfa8a7",
+  "commits": [
+    "65c8ca949997a8910588cd626feb0eb6433a0305",
+    "7b6edb8e31b8f71b1769f728c8777661710aecb5",
+    "9e507b7ff6750604612095de713e4fb03873cada",
+    "89c309efb8feb95dfb7d0898a35a76a6faa659f4"
+  ]
+}

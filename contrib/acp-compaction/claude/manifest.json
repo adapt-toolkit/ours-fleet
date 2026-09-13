@@ -1,0 +1,46 @@
+{
+  "schemaVersion": 1,
+  "adapter": "claude",
+  "repository": "https://github.com/agentclientprotocol/claude-agent-acp",
+  "upstreamCommit": "4deace40379a62eb642559454930af4c590b3d49",
+  "reviewedCommit": "b1c35b3e624f3ba6a9c466fd5f402fcfda100a20",
+  "archiveUrl": "https://codeload.github.com/agentclientprotocol/claude-agent-acp/tar.gz/4deace40379a62eb642559454930af4c590b3d49",
+  "archiveSha256": "c3b255a0ef64d24ee58faf7c769cc62da84b7fe5bb9f0dd49978a1779731ef68",
+  "patchSha256": "32baefd144cb5f711649e3c71d6aecc5ebc91e4f61bc892961bf02bea79ba8a8",
+  "lockfileSha256": "35972a5e5d878013566df6fc8b7f3f3be341441863f6988788f3c601ff249698",
+  "package": "@agentclientprotocol/claude-agent-acp",
+  "packageVersion": "0.76.0",
+  "dependencies": {
+    "@agentclientprotocol/sdk": "1.4.0",
+    "@anthropic-ai/claude-agent-sdk": "0.3.257"
+  },
+  "coverage": {
+    "version": 1,
+    "lifecycle": "completion_only",
+    "guardedCancel": false
+  },
+  "checks": [
+    [
+      "npm",
+      "run",
+      "build"
+    ],
+    [
+      "npm",
+      "run",
+      "check"
+    ],
+    [
+      "npm",
+      "exec",
+      "--offline",
+      "--",
+      "vitest",
+      "run",
+      "src/context-compaction.test.ts",
+      "src/tests/acp-agent.test.ts",
+      "-t",
+      "compaction|compact"
+    ]
+  ]
+}

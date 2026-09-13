@@ -6,7 +6,7 @@ import {
 import { join } from 'node:path';
 
 import type {
-  ConversationEventV1, PromptReceipt,
+  CompactionUpdatedPayload, ConversationEventV1, PromptReceipt,
 } from './conversation-types.js';
 
 /**
@@ -70,6 +70,10 @@ export class IdempotencyConflictError extends Error {
   }
 }
 
+export type StoredCompaction = ConversationEventV1 & {
+  kind: 'compaction.updated'; payload: CompactionUpdatedPayload;
+};
+
 type EventDraft = Omit<ConversationEventV1, 'schemaVersion' | 'roleId' | 'eventId' | 'seq' | 'at'>;
 
 export class ConversationEventStore {
@@ -79,6 +83,7 @@ export class ConversationEventStore {
   private readonly listeners = new Set<(event: ConversationEventV1) => void>();
   private readonly commands = new Map<string, CommandRecord>();
   private readonly promptStates = new Map<string, OpenPrompt>();
+  private readonly compactions = new Map<string, StoredCompaction>();
   private activeFd?: number;
   private activeBytes = 0;
   private _degraded = false;
@@ -129,6 +134,7 @@ export class ConversationEventStore {
     this.tail.push(event);
     if (this.tail.length > TAIL_EVENTS) this.tail.shift();
     this.trackPromptState(event);
+    this.trackCompactionState(event);
     for (const listener of this.listeners) listener(event);
     return event;
   }
@@ -191,6 +197,16 @@ export class ConversationEventStore {
     return [...this.promptStates.values()];
   }
 
+  /** Latest lifecycle state per logical session/ID, including cold disk segments. */
+  compactionStates(): StoredCompaction[] {
+    return [...this.compactions.values()].map(event => ({ ...event, payload: { ...event.payload } }));
+  }
+
+  openCompactions(): StoredCompaction[] {
+    return this.compactionStates().filter(event =>
+      event.payload.status === 'in_progress' || event.payload.status === 'unknown');
+  }
+
   lastCursor(): string | undefined {
     return this.nextSeq > 1 ? String(this.nextSeq - 1) : undefined;
   }
@@ -217,6 +233,7 @@ export class ConversationEventStore {
         this.tail.push(event);
         if (this.tail.length > TAIL_EVENTS) this.tail.shift();
         this.trackPromptState(event);
+        this.trackCompactionState(event);
         this.rebuildCommandIndex(event);
       }
     }
@@ -312,6 +329,24 @@ export class ConversationEventStore {
         return;
       default:
     }
+  }
+
+  private trackCompactionState(event: ConversationEventV1): void {
+    if (event.kind !== 'compaction.updated' || !event.payload || typeof event.payload !== 'object'
+        || Array.isArray(event.payload)) return;
+    const payload = event.payload as Partial<CompactionUpdatedPayload>;
+    if (typeof payload.sessionId !== 'string' || !payload.sessionId
+        || payload.sessionId !== event.acpSessionId
+        || typeof payload.compactionId !== 'string' || !payload.compactionId
+        || !['in_progress', 'unknown', 'completed', 'failed', 'cancelled', 'unknown_ended'].includes(payload.status ?? '')
+        || typeof payload.replayed !== 'boolean') return;
+    const key = JSON.stringify([payload.sessionId, payload.compactionId]);
+    const previous = this.compactions.get(key);
+    const knownTerminal = (status: string | undefined) =>
+      status === 'completed' || status === 'failed' || status === 'cancelled';
+    if (previous && (knownTerminal(previous.payload.status)
+        || (previous.payload.status === 'unknown_ended' && !knownTerminal(payload.status)))) return;
+    this.compactions.set(key, event as StoredCompaction);
   }
 
   // ── segment management ─────────────────────────────────────────────────────

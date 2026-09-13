@@ -8,7 +8,7 @@ import { inspectHermesCompatibility, validateHermesInitialize } from '../src/har
 const commit = 'd15ed4445207dda418b984e8bda0f68f48b8c6f3';
 const consoleBody = '# -*- coding: utf-8 -*-\nimport sys\nfrom acp_adapter.entry import main\nif __name__ == "__main__":\n    if sys.argv[0].endswith("-script.pyw"):\n        sys.argv[0] = sys.argv[0][:-11]\n    elif sys.argv[0].endswith(".exe"):\n        sys.argv[0] = sys.argv[0][:-4]\n    sys.exit(main())\n';
 let root: string, source: string, home: string, executable: string;
-let metadata: { hermesVersion: string; acpVersion: string; adapterOrigin: string; entryPoints: { name: string; value: string }[] };
+let metadata: { hermesVersion: string; acpVersion: string; adapterOrigin: string; entryPoints: { name: string; value: string }[]; acpSourceDigest?: string };
 let head: string, status: string;
 let exec: Exec;
 const request = () => ({ argv: [executable], env: { PATH: join(source, 'venv/bin'), HOME: root, HERMES_HOME: home }, home });
@@ -42,6 +42,27 @@ describe('Hermes tested artifact compatibility', () => {
     expect(call[1].join(' ')).not.toMatch(/import.*hermes_cli|import.*plugins|load_config/);
     expect(call[2]?.env).not.toHaveProperty('OPENAI_API_KEY');
   });
+  it('accepts the exact packaged source and verified SDK source digest', async () => {
+    head = '89c309efb8feb95dfb7d0898a35a76a6faa659f4';
+    metadata.acpVersion = '0.9.0+ours.compaction1';
+    metadata.acpSourceDigest = '945a8c8c26e214e1fad043fc308026e54b5ade5c3ce636f9bb82255c44998866';
+    await expect(inspectHermesCompatibility(request(), exec)).resolves.toMatchObject({
+      artifact: { commit: head, acpVersion: metadata.acpVersion },
+    });
+  });
+  it.each(['missing-digest', 'tampered-sdk', 'wrong-sdk', 'dirty-source', 'mixed-baseline'])(
+    'rejects a mismatched packaged artifact: %s', async dimension => {
+      head = '89c309efb8feb95dfb7d0898a35a76a6faa659f4';
+      metadata.acpVersion = '0.9.0+ours.compaction1';
+      metadata.acpSourceDigest = '945a8c8c26e214e1fad043fc308026e54b5ade5c3ce636f9bb82255c44998866';
+      if (dimension === 'missing-digest') delete metadata.acpSourceDigest;
+      if (dimension === 'tampered-sdk') metadata.acpSourceDigest = '0'.repeat(64);
+      if (dimension === 'wrong-sdk') metadata.acpVersion = '0.9.0';
+      if (dimension === 'dirty-source') status = ' M acp_adapter/server.py';
+      if (dimension === 'mixed-baseline') head = commit;
+      await expect(inspectHermesCompatibility(request(), exec)).rejects.toThrow(/compatibility|tested/i);
+    },
+  );
   it('resolves the default executable on final PATH and follows a launcher symlink', async () => {
     const alias = join(root, 'bin'); mkdirSync(alias); symlinkSync(executable, join(alias, 'hermes-acp'));
     const report = await inspectHermesCompatibility({ ...request(), argv: ['hermes-acp'], env: { ...request().env, PATH: alias } }, exec);

@@ -306,6 +306,16 @@ describe('owner command registry', () => {
     expect(ctx.replies).toEqual([ownerNotices.interruptFailed('Coordinator')]);
   });
 
+  it('reports observed compaction as deferred without claiming the turn stopped', async () => {
+    const ctx = context({ interrupt: vi.fn(async () => ({ state: 'deferred' as const,
+      reasonCode: 'ACP_COMPACTION_IN_PROGRESS' })) });
+    await dispatchOwnerCommand('/interrupt', ctx);
+    expect(ctx.replies).toHaveLength(1);
+    expect(ctx.replies[0]).toContain('deferred');
+    expect(ctx.replies[0]).toContain('compaction');
+    expect(ctx.replies[0]).not.toContain('Interrupt sent');
+  });
+
   it('passes /clear and /compact to the harness as raw slash text', async () => {
     for (const name of ['clear', 'compact']) {
       const ctx = context();

@@ -4,6 +4,7 @@ import { mkdir, readFile, readdir, rm, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 
 import { canonicalCid, type OwnerAttachmentConfig, type OwnerChannelConfig } from '../config.js';
+import { CompactionNotices } from './compaction-notices.js';
 import { DAEMON_RECOVERY_DEADLINE_MS } from '../daemon-recovery.js';
 import { replaceFileAtomically } from '../atomic-file.js';
 import { TaskRoomApplicationService } from '../application/task-room-service.js';
@@ -17,6 +18,7 @@ import {
   SessionControlError,
   type AgentSession, type QueuedPrompt, type SessionEvent, type TurnResult,
 } from '../session/types.js';
+import { ACP_PROMPT_NOT_DISPATCHED, ACP_SESSION_RECOVERY_REQUIRED, ACP_STALL_OPERATOR_REQUIRED } from '../session/acp.js';
 import { VERSION } from '../version.js';
 import {
   renderMarkdownFailure, renderMarkdownResult, roomStatus, taskStatus,
@@ -233,6 +235,7 @@ class RelayUnroutableError extends Error {}
  * chooses its reply recipient; both are fixed from authenticated message data.
  */
 export class OwnerChannel implements OwnerChannelHandle {
+  private compactionNotices?: CompactionNotices;
   private readonly client: OursOps;
   private readonly state: OwnerChannelState;
   private readonly authorizations: OwnerAuthorizationState;
@@ -265,6 +268,8 @@ export class OwnerChannel implements OwnerChannelHandle {
   private drainTask?: Promise<void>;
   private drainRequested = false;
   private readonly completionTasks = new Set<Promise<void>>();
+  /** This channel owns one adapter generation; only its successor may retry held ingress. */
+  private adapterRecoveryPending = false;
   private readonly activeRequests = new Map<string, ActiveOwnerRequest>();
   private managementTail: Promise<unknown> = Promise.resolve();
   private recoveryEpoch?: string;
@@ -287,6 +292,8 @@ export class OwnerChannel implements OwnerChannelHandle {
   private readonly lifecycleOutbox: FleetLifecycleOutbox;
 
   constructor(private readonly options: OwnerChannelOptions) {
+    options.log(`[${options.role}] owner channel automatic ingress policy=queue-only `
+      + `configuredInterrupt=${options.config.interrupt}; explicit stop remains available`);
     this.client = options.client ?? new OursSdkClient(
       options.env, line => options.log(`[${options.role}] owner channel ${line}`));
     this.fleetOps = options.fleet ?? fleetCliOps(options.role, options.configPath);
@@ -1260,6 +1267,7 @@ export class OwnerChannel implements OwnerChannelHandle {
       if (group.recovery) try { this.attachmentRecovery.remove(group.recovery.id); } catch {}
       return true;
     }
+    if (this.adapterRecoveryPending) return false;
     // Owner files are requests too: retain their authenticated source wire so
     // a later managed-agent attachment reply cannot drift to a newer owner.
     try { this.conversations.recordInbound(sender.id, originWireId); }
@@ -1304,8 +1312,7 @@ export class OwnerChannel implements OwnerChannelHandle {
       const queued = await queueSessionPrompt(this.options.session,
         this.ownerAttachmentPrompt(sender, originWireId, requestId, admitted, group.caption),
         {
-          interrupt: this.options.config.interrupt,
-          ...(this.options.config.interrupt ? { interruptSource: 'owner' as const } : {}),
+          interrupt: false,
           origin: { kind: 'owner', requestId,
             ...(group.caption ? { displayText: String(group.caption.text ?? '') } : {}) },
         });
@@ -1324,7 +1331,7 @@ export class OwnerChannel implements OwnerChannelHandle {
       const cleanupDir = requestDir;
       let completed = false;
       const task = this.complete(active, outbox, queued, activityCursor)
-        .then(() => { completed = true; })
+        .then(handled => { completed = handled; })
         .catch(error => this.logError(`attachment request ${requestId.slice(0, 12)} completion failed`, error))
         .finally(async () => {
           try { await removeRequestDirectory(cleanupDir); }
@@ -1344,6 +1351,10 @@ export class OwnerChannel implements OwnerChannelHandle {
     } catch (error) {
       if (requestDir) await removeRequestDirectory(requestDir).catch(() => undefined);
       if (outbox) await rm(outbox, { recursive: true, force: true }).catch(() => undefined);
+      if (this.isAdapterRecoveryError(error)) {
+        this.holdForAdapterRecovery(requestId, error.reasonCode!);
+        return false;
+      }
       try { this.attachmentRecovery.remove(recovery.id); } catch {}
       this.logError(`attachment request ${requestId.slice(0, 12)} admission failed`, error);
       await this.send(sender.id, ownerNotices.attachmentFailed(), originWireId);
@@ -1411,6 +1422,7 @@ export class OwnerChannel implements OwnerChannelHandle {
       return true;
     }
 
+    if (this.adapterRecoveryPending) return false;
     const requestId = this.requestId(wireId);
     const outbox = this.outboxDir(wireId);
     await mkdir(outbox, { recursive: true, mode: 0o700 });
@@ -1419,20 +1431,16 @@ export class OwnerChannel implements OwnerChannelHandle {
     try {
       queued = await queueSessionPrompt(this.options.session,
         this.ownerPrompt(sender, text, wireId), {
-        interrupt: this.options.config.interrupt,
-        ...(this.options.config.interrupt ? { interruptSource: 'owner' as const } : {}),
+        interrupt: false,
         origin: { kind: 'owner', requestId, displayText: text },
       });
     } catch (error) {
       await rm(outbox, { recursive: true, force: true });
-      if (error instanceof SessionControlError
-          && (error.reasonCode === ACP_CANCEL_DEADLINE_EXCEEDED
-            || error.reasonCode === CODEX_APP_SERVER_CANCEL_DEADLINE_EXCEEDED)) {
+      if (this.isAdapterRecoveryError(error)) {
         // drainAll journaled this authenticated message before delivery. The
         // adapter generation is terminating, so leave the wire unhandled and
         // body-free: the resumed owner channel recovers it exactly once.
-        this.options.log(`[${this.options.role}] owner request ${requestId.slice(0, 12)} `
-          + `held for adapter resume reason=${error.reasonCode}`);
+        this.holdForAdapterRecovery(requestId, error.reasonCode!);
         return false;
       }
       this.logError('request delivery failed', error);
@@ -1454,6 +1462,7 @@ export class OwnerChannel implements OwnerChannelHandle {
     };
     this.activeRequests.set(requestId, active);
     const task = this.complete(active, outbox, queued, activityCursor)
+      .then(() => undefined)
       .catch(error => this.logError(`request ${wireId} completion failed`, error))
       .finally(() => {
         this.inFlight.delete(wireId);
@@ -2106,20 +2115,45 @@ export class OwnerChannel implements OwnerChannelHandle {
         // the session itself says earlier work remains ahead of it.
         return queued.queuedBehind > 0
           ? ownerNotices.receivedQueued(queued.queuedBehind)
-          : this.options.config.interrupt
-            ? ownerNotices.receivedInterrupting()
-            : ownerNotices.receivedStarted();
+          : ownerNotices.receivedStarted();
     }
   }
 
   private async complete(
     active: ActiveOwnerRequest, outbox: string, queued: QueuedPrompt, activityCursor: number,
-  ): Promise<void> {
+  ): Promise<boolean> {
     const progressMs = this.options.config.progress_interval_ms;
     let lastSeq = activityCursor;
     let startedAt: number | undefined;
     let phase: OwnerProgressPhase = 'starting request';
     let timer: ReturnType<typeof setInterval> | undefined;
+    const compactionStarts = new Set<string>();
+
+    const acceptCompaction = (event: SessionEvent) => {
+      if (this.options.config.compaction_notices !== true || event.kind !== 'compaction'
+          || event.replayed || active.finalizing || event.turnId !== queued.promptId
+          || event.origin?.kind !== 'owner' || event.origin.requestId !== active.requestId
+          || !event.compactionId || !event.status) return;
+      const sessionId = this.options.session.snapshot().sessionId;
+      if (!sessionId) return;
+      // Bound repeated attempts within one owner request; terminal phases for
+      // already observed starts remain eligible after this limit is reached.
+      if (event.status === 'in_progress') {
+        if (compactionStarts.size >= 8 && !compactionStarts.has(event.compactionId)) return;
+        compactionStarts.add(event.compactionId);
+      }
+      this.compactionNotices ??= new CompactionNotices({
+        path: join(this.options.stateDir, '.owner-channel-compactions.json'), enabled: true,
+        authorized: contact => !this.stopping && this.isEffectiveOwner(contact),
+        send: (contact, text, replyTo) => this.send(contact, text, replyTo),
+        log: text => this.options.log(`[${this.options.role}] ${text}`),
+      });
+      const pending = this.compactionNotices.observe({
+        sessionId, compactionId: event.compactionId, status: event.status,
+        contact: active.contact, replyTo: active.wireId,
+      });
+      active.outboundTail = Promise.all([active.outboundTail, pending]).then(() => undefined);
+    };
 
     const flushCommentary = () => {
       if (active.commentaryTimer) clearTimeout(active.commentaryTimer);
@@ -2245,6 +2279,7 @@ export class OwnerChannel implements OwnerChannelHandle {
     const unsubscribe = typeof this.options.session.subscribe === 'function'
       ? this.options.session.subscribe(event => {
         startProgress(event);
+        acceptCompaction(event);
         // Automatic commentary is an ACP phase extension. Other backends and
         // older adapters retain their established final-only behavior.
         if (this.options.session.capabilities?.messagePhases
@@ -2264,6 +2299,12 @@ export class OwnerChannel implements OwnerChannelHandle {
     active.finalizing = true;
     await active.outboundTail;
 
+    if (!result.accepted && result.detail?.startsWith(`${ACP_PROMPT_NOT_DISPATCHED}:`)) {
+      this.holdForAdapterRecovery(active.requestId, ACP_PROMPT_NOT_DISPATCHED);
+      await rm(outbox, { recursive: true, force: true });
+      return false;
+    }
+
     const output = result.output?.trim();
     if (result.succeeded && output) await this.sendFinal(active.contact, output, active.wireId);
     else if (result.succeeded) await this.send(active.contact,
@@ -2276,6 +2317,21 @@ export class OwnerChannel implements OwnerChannelHandle {
     if (result.succeeded) await this.sendAttachments(active.contact, outbox, active.wireId);
     else await rm(outbox, { recursive: true, force: true });
     for (const wire of active.handledWireIds) this.state.remember(wire);
+    return true;
+  }
+
+  private isAdapterRecoveryError(error: unknown): error is SessionControlError {
+    return error instanceof SessionControlError
+      && (error.reasonCode === ACP_CANCEL_DEADLINE_EXCEEDED
+        || error.reasonCode === ACP_SESSION_RECOVERY_REQUIRED
+        || error.reasonCode === ACP_STALL_OPERATOR_REQUIRED
+        || error.reasonCode === CODEX_APP_SERVER_CANCEL_DEADLINE_EXCEEDED);
+  }
+
+  private holdForAdapterRecovery(requestId: string, reason: string): void {
+    this.adapterRecoveryPending = true;
+    this.options.log(`[${this.options.role}] owner request ${requestId.slice(0, 12)} `
+      + `held for adapter resume reason=${reason}`);
   }
 
   private commentsState(): OwnerCommentsState {

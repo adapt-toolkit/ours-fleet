@@ -1,3 +1,5 @@
+import { DurableMonitorDelivery } from './monitor-delivery.js';
+import { ACP_SESSION_RECOVERY_REQUIRED } from './session/acp.js';
 import { existsSync, readFileSync, writeFileSync, rmSync, mkdirSync, realpathSync } from 'node:fs';
 import { join } from 'node:path';
 import { randomUUID } from 'node:crypto';
@@ -718,7 +720,8 @@ export async function runOnce(
   let control: ReturnType<RunnerDeps['createControlServer']> | undefined;
   let unsubscribeRecovery: (() => void) | undefined;
   let monitorLoop: Promise<void> | undefined;
-  let sessionStartupComplete = false;
+  let monitorDelivery: DurableMonitorDelivery | undefined;
+  let monitorReady = false;
   let sessionClosed = false;
   let ownerChannel: OwnerChannelHandle | undefined;
   let ownerBinder: OwnerBinderLease | undefined;
@@ -812,52 +815,28 @@ export async function runOnce(
       }
       return event;
     });
+    monitorDelivery = new DurableMonitorDelivery({ stateDir: dir, session: arbiter, log: deps.log,
+      ...(monitor?.admissionScope ? { currentScope: () => monitor.admissionScope!() } : {}),
+    });
     resolvedMonitorDeps.delivery = {
-      // A wake is only delivered when its turn TERMINATES successfully. A
-      // refusal or a cancellation reached the agent and was not acted on, so
-      // the monitor must keep its cursor and try again.
-      submit: async (text, options) => {
-        // Cancelling the runner-owned startup prompt makes startup look failed
-        // and closes the session before the wake turn can run. During startup,
-        // steer into the live turn instead; after it completes, honor the
-        // configured interrupt policy normally.
-        const policy = options?.interrupt;
-        const interrupt = policy === true && sessionStartupComplete;
-        const promptOptions = {
-          interrupt, steer: true,
-          ...(interrupt ? { interruptSource: 'fleet-monitor' as const } : {}),
-          origin: { kind: 'fleet-monitor' as const },
-        };
-        // Startup is already a protected boundary: as with immediate mode,
-        // steer rather than waiting on/cancelling the runner-owned first turn.
-        const result = policy === 'after_tool' && sessionStartupComplete
-          ? await arbiter!.submitPromptAfterTool(text, promptOptions)
-          : await arbiter!.submitPrompt(text, promptOptions);
-        const steered = result.accepted
-          && (result.detail === 'injected' || result.detail === 'startedNewTurn');
-        const boundary = result.safeBoundary;
-        const queuedAfterSteeringFailure = result.detail?.startsWith('steering rejected;') === true;
-        const boundaryDetail = boundary && queuedAfterSteeringFailure
-          ? boundary.state === 'timeout'
-            ? `after_tool timed out after ${boundary.waitedMs}ms; steering rejected, queued without cancellation`
-            : `after_tool ${boundary.state} boundary after ${boundary.waitedMs}ms; steering rejected, queued without cancellation`
-          : boundary
-          ? boundary.state === 'timeout'
-            ? `after_tool timed out after ${boundary.waitedMs}ms; steered without cancellation`
-            : boundary.state === 'unsupported'
-              ? 'after_tool unsupported; used non-cancelling queued delivery'
-              : `after_tool ${boundary.state} delivery after ${boundary.waitedMs}ms`
-          : result.detail;
-        return {
-          succeeded: result.succeeded || steered,
-          outcome: steered ? result.detail! : result.outcome,
-          detail: result.succeeded || steered || !boundary
-            ? boundaryDetail
-            : [result.detail, boundaryDetail].filter(Boolean).join('; '),
-          ...(boundary ? { safeBoundary: boundary.state } : {}),
-        };
+      admittedCursor: scope => monitorDelivery!.admittedCursor(scope),
+      admit: async batch => {
+        const receipt = await monitorDelivery!.admit(batch);
+        // Startup can finish before the daemon identity directory exists.
+        if (monitorReady) monitorDelivery!.start(batch.scope);
+        return receipt;
+      },
+      // Legacy in-process callers still wait for execution, but automatic
+      // delivery always uses the durable admission path above.
+      submit: async text => {
+        const result = await arbiter!.submitPrompt(text, {
+          interrupt: false, steer: false, origin: { kind: 'fleet-monitor' },
+        });
+        return { succeeded: result.succeeded, outcome: result.outcome, detail: result.detail };
       },
     };
+    if (monitor)
+      deps.log(`[${name}] monitor effective delivery: durable queue at prompt settlement; automatic interrupt/steering disabled`);
     const firstPrompt = mode === 'fresh'
       ? `Read and follow ${join(dir, 'briefing.md')} now.`
       : adapter.vocabulary.restartPrompt(role.identity, join(dir, 'WORKLOG.md'), role);
@@ -865,9 +844,8 @@ export async function runOnce(
     // startup prompt and then refuses it has not started; logging the role as
     // up would hide a role that never read its briefing.
     const starting = arbiter.submitPrompt(firstPrompt, { origin: { kind: 'startup' } });
-    // Monitoring starts immediately. The delivery adapter above downgrades
-    // interruption to steering until this startup turn reaches a terminal
-    // success, so there is neither a deaf gap nor a boot-cancellation loop.
+    // Monitoring admits durably during startup; the pump starts only after
+    // startup settles, so automatic mail cannot cancel or steer the briefing.
     monitorLoop = monitor?.run(pid);
     const started = await starting;
     // A temporary role's first turn can be the active turn when an ours wake
@@ -879,6 +857,7 @@ export async function runOnce(
     const interruptedForWake = isRecoverableTempStartupCancellation(temp, started)
       || (started.outcome === 'cancelled' && started.cancellationSource === 'stall-watchdog');
     if (!started.succeeded && !interruptedForWake) {
+      monitorDelivery?.close();
       monitor?.stop();
       await control.close();
       ownerBinder?.release();
@@ -906,10 +885,17 @@ export async function runOnce(
     else if (interruptedForWake)
       deps.log(`[${name}] ${sessionLabel} startup prompt cancelled by ${started.cancellationSource}; `
         + 'keeping temporary supervisor alive');
-    sessionStartupComplete = true;
+    monitorReady = true;
+    if (monitor?.admissionScope) {
+      try { monitorDelivery?.start(monitor.admissionScope()); }
+      catch {
+        deps.log(`[${name}] monitor ingress source unavailable; pending hints retained until source binding recovers`);
+      }
+    }
     if (ownerChannel) {
       try { await ownerChannel.start(); }
       catch (error) {
+        monitorDelivery?.close();
         monitor?.stop();
         if (monitorLoop) await monitorLoop;
         await ownerChannel.close().catch(() => undefined);
@@ -1011,6 +997,10 @@ export async function runOnce(
   while (sessionHandle.isAlive()) {
     await deps.sleep(temp ? 500 : 2000);
     const now = deps.now();
+    if (monitorReady && monitor?.admissionScope) {
+      try { monitorDelivery?.start(monitor.admissionScope()); }
+      catch { /* startup reported the hold; retry binding without dispatch effects */ }
+    }
     if (now >= nextDaemonProbeAt) {
       nextDaemonProbeAt = now + 2_000;
       const observation = daemonObserver.observe(
@@ -1088,6 +1078,7 @@ export async function runOnce(
     deps.log(`[${name}] owner binder retained because client quiescence was not proven at shutdown`);
     supervisorRecycleRequired = true;
   } else ownerBinder?.release();
+  monitorDelivery?.close();
   if (monitor) { monitor.stop(); await monitorLoop; }
   unsubscribeRecovery?.();
   if (agentSession && !sessionClosed) await agentSession.close();
@@ -1108,7 +1099,8 @@ export async function runOnce(
     rotated = true;
     deps.log(`[${name}] ${why} -> rotated session-id; next start is FRESH`);
   };
-  if (exitRecord.detail.includes(ACP_CANCEL_DEADLINE_EXCEEDED)
+  if (exitRecord.detail.includes(ACP_SESSION_RECOVERY_REQUIRED)
+      || exitRecord.detail.includes(ACP_CANCEL_DEADLINE_EXCEEDED)
       || exitRecord.detail.includes(CODEX_APP_SERVER_CANCEL_DEADLINE_EXCEEDED))
     // This is a deliberate adapter reclamation, not evidence that resume state
     // is poisoned. Preserve the context even when the resumed generation hits

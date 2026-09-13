@@ -7,6 +7,15 @@ import {
 import type { SessionHandle, SubmitPromptOptions, TurnCancellationSource } from '../src/session/types.js';
 
 describe('in-process session mutation kernel', () => {
+  it('preserves deferred Stop through both public control receipt versions', async () => {
+    const request = vi.fn(async () => ({ version: 1 as const, id: 'reply', ok: true,
+      result: { state: 'deferred', reasonCode: 'ACP_COMPACTION_IN_PROGRESS', commandId: 'stop-1' } }));
+    const adapter = new AcpRoleSessionAdapter('/state', request);
+    await expect(adapter.interrupt()).resolves.toMatchObject({ accepted: true, state: 'deferred' });
+    await expect(adapter.interruptV2('stop-1')).resolves.toMatchObject({
+      accepted: true, state: 'deferred', commandId: 'stop-1',
+    });
+  });
   it('delegates exact origins/options and resolves on queue acceptance, not terminal completion', async () => {
     const completion = new Promise<never>(() => {});
     const queuePrompt = vi.fn(async (_text: string, options?: SubmitPromptOptions) => ({

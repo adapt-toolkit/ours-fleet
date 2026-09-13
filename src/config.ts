@@ -122,6 +122,8 @@ export interface OwnerChannelConfig {
    * session's effective value, and a restart returns to this one.
    */
   comments: boolean;
+  /** Opt-in lifecycle notices to the authenticated owner of the active request. */
+  compaction_notices?: boolean;
   attachments: OwnerAttachmentConfig;
 }
 
@@ -1168,7 +1170,7 @@ export function resolveOwnerChannelConfig(
     ...(role ?? {}),
   };
   const allowed = [
-    'identity', 'owners', 'agent', 'interrupt', 'progress_interval_ms', 'comments', 'attachments',
+    'identity', 'owners', 'agent', 'interrupt', 'progress_interval_ms', 'comments', 'compaction_notices', 'attachments',
   ];
   const bad = Object.keys(merged).filter(key => !allowed.includes(key));
   if (bad.length)
@@ -1201,6 +1203,8 @@ export function resolveOwnerChannelConfig(
       `${file}: role '${name}' owner_channel.progress_interval_ms must be a non-negative number`);
   if (merged.comments !== undefined && typeof merged.comments !== 'boolean')
     throw new ConfigError(`${file}: role '${name}' owner_channel.comments must be true or false`);
+  if (merged.compaction_notices !== undefined && typeof merged.compaction_notices !== 'boolean')
+    throw new ConfigError(`${file}: role '${name}' owner_channel.compaction_notices must be true or false`);
   if (defaultInput.attachments !== undefined && !isPlainObject(defaultInput.attachments))
     throw new ConfigError(`${file}: defaults.owner_channel.attachments must be a map`);
   if (role?.attachments !== undefined && !isPlainObject(role.attachments))
@@ -1247,6 +1251,7 @@ export function resolveOwnerChannelConfig(
     // Default true preserves the established live-commentary behavior; an
     // upgrade never silently goes quiet on an owner who relied on it.
     comments: merged.comments ?? true,
+    ...(merged.compaction_notices !== undefined ? { compaction_notices: merged.compaction_notices } : {}),
     attachments: {
       enabled: attachments.enabled ?? true,
       max_files_per_request: attachments.max_files_per_request ?? 4,

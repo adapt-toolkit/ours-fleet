@@ -220,7 +220,14 @@ export class ScheduledLoopManager implements ScheduledLoopManagerHandle {
       this.runTimeouts.delete(timeout);
       if (state.activeRunId !== runId || this.stopping) return;
       this.deps.log(`[${this.role}] loop ${definition.name} timed out run=${runId.slice(0, 11)} after ${timeoutMs}ms; cancelling`);
+      const abandon = this.armAbandon(definition, state, runId);
       void this.arbiter.interrupt('scheduled-loop').then(outcome => {
+        if (outcome?.state === 'deferred') {
+          this.deps.clearTimer(abandon);
+          this.runTimeouts.delete(abandon);
+          this.deps.log(`[${this.role}] loop ${definition.name} cancellation deferred during compaction run=${runId.slice(0, 11)}`);
+          return;
+        }
         // Forced recovery IS a successful cancellation; record how it ended
         // rather than reporting the interrupt itself as a failure.
         if (outcome?.state === 'forced')
@@ -229,7 +236,6 @@ export class ScheduledLoopManager implements ScheduledLoopManagerHandle {
       }).catch(error => {
         this.deps.log(`[${this.role}] loop ${definition.name} timeout cancellation failed: ${(error as Error)?.name ?? 'Error'}`);
       });
-      this.armAbandon(definition, state, runId);
     }, timeoutMs);
     this.runTimeouts.add(timeout);
     void result.queued.completion.then(turn => {
@@ -255,7 +261,7 @@ export class ScheduledLoopManager implements ScheduledLoopManagerHandle {
    */
   private armAbandon(
     definition: ResolvedRoleLoop, state: LoopRuntimeState, runId: string,
-  ): void {
+  ): unknown {
     const abandon = this.deps.setTimer(() => {
       this.runTimeouts.delete(abandon);
       if (state.activeRunId !== runId || this.stopping) return;
@@ -272,6 +278,7 @@ export class ScheduledLoopManager implements ScheduledLoopManagerHandle {
         + 'cancellation never settled; admission released');
     }, this.deps.cancelAbandonMs ?? LOOP_CANCEL_ABANDON_MS);
     this.runTimeouts.add(abandon);
+    return abandon;
   }
 
   private finish(

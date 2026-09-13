@@ -202,6 +202,11 @@ createInterface({ input: process.stdin }).on('line', line => {
     appendFileSync(process.env.ACP_FIXTURE_REQUEST_LOG, message.method + '\n');
   switch (message.method) {
     case 'initialize':
+      if (process.env.ACP_FIXTURE_REQUIRE_COMPACTION === '1'
+          && !message.params?.clientCapabilities?.session?.compaction) {
+        send({ jsonrpc: '2.0', id: message.id, error: { code: -32602, message: 'compaction capability required' } });
+        break;
+      }
       send({
         jsonrpc: '2.0',
         id: message.id,
@@ -220,6 +225,22 @@ createInterface({ input: process.stdin }).on('line', line => {
       });
       break;
     case 'session/new':
+      if (process.env.ACP_FIXTURE_IDLE_COMPACTION) {
+        update({ sessionUpdate: 'compaction_update', compactionId: 'idle-c', status: 'in_progress' });
+        setTimeout(() => {
+          if (process.env.ACP_FIXTURE_IDLE_COMPACTION === 'exit') process.exit(1);
+          else if (process.env.ACP_FIXTURE_IDLE_COMPACTION === 'disconnect'
+              || process.env.ACP_FIXTURE_IDLE_COMPACTION === 'clean-exit') {
+            process.stdout.end();
+            if (process.env.ACP_FIXTURE_IDLE_COMPACTION === 'clean-exit') setTimeout(() => process.exit(0), 10);
+          }
+          else update({ sessionUpdate: 'compaction_update', compactionId: 'idle-c', status: 'completed' });
+        }, 150);
+      }
+      if (process.env.ACP_FIXTURE_PRE_NEW_COMPACTION === '1') {
+        update({ sessionUpdate: 'compaction_update', compactionId: 'startup-c', status: 'in_progress' });
+        update({ sessionUpdate: 'compaction_update', compactionId: 'startup-c', status: 'completed' });
+      }
       if (process.env.ACP_FIXTURE_REQUIRE_MCP_SERVERS === '1'
           && !Array.isArray(message.params?.mcpServers)) {
         send({ jsonrpc: '2.0', id: message.id,
@@ -279,6 +300,13 @@ createInterface({ input: process.stdin }).on('line', line => {
       send({ jsonrpc: '2.0', id: message.id, result: { configOptions: fixtureConfigOptions } });
       break;
     case 'session/load':
+      if (process.env.ACP_FIXTURE_REPLAY_COMPACTION) {
+        update({ sessionUpdate: 'compaction_update', compactionId: 'history-c', status: 'in_progress' });
+        if (process.env.ACP_FIXTURE_REPLAY_COMPACTION !== 'missing') {
+          update({ sessionUpdate: 'compaction_update', compactionId: 'history-c', status: 'completed' });
+          update({ sessionUpdate: 'compaction_update', compactionId: 'history-c', status: 'in_progress' });
+        }
+      }
       if (process.env.ACP_FIXTURE_REQUIRE_MCP_SERVERS === '1'
           && !Array.isArray(message.params?.mcpServers)) {
         send({ jsonrpc: '2.0', id: message.id,
@@ -359,7 +387,37 @@ createInterface({ input: process.stdin }).on('line', line => {
       break;
     }
     case 'session/prompt': {
+      if (process.env.ACP_FIXTURE_WIRE_LOG) appendFileSync(process.env.ACP_FIXTURE_WIRE_LOG, 'prompt\n');
       const text = message.params.prompt.find(block => block.type === 'text')?.text ?? '';
+      if (text.startsWith('compaction ')) {
+        const variant = text.slice('compaction '.length);
+        const status = variant === 'unknown' ? 'future-phase' : 'in_progress';
+        const compactionId = variant === 'malformed' ? '' : 'c1';
+        const frame = { sessionUpdate: 'compaction_update', compactionId, status, summary: 'SECRET-COMPACTION-SUMMARY' };
+        if (variant === 'wrong-session')
+          send({ jsonrpc: '2.0', method: 'session/update', params: { sessionId: 'other-session', update: frame } });
+        else update(frame);
+        update({ sessionUpdate: 'compaction_summary_chunk', compactionId: 'c1', content: { type: 'text', text: 'SECRET-SUMMARY-CHUNK' } });
+        if (variant === 'complete') setTimeout(() => {
+          update({ ...frame, status: 'completed' });
+          update({ ...frame, status: 'completed' });
+        }, 120);
+        setTimeout(() => {
+          if (variant === 'rejected') send({ jsonrpc: '2.0', id: message.id, error: { code: -32602, message: 'rejected' } });
+          else answerPrompt(message.id, 'end_turn');
+        }, 300);
+        break;
+      }
+      if (text === 'rpc-internal-error' || text === 'rpc-invalid-params') {
+        if (process.env.ACP_FIXTURE_PERMISSION_BEFORE_ERROR === '1') requestPermission(message.id);
+        send({ jsonrpc: '2.0', id: message.id, error: {
+          code: text === 'rpc-internal-error' ? -32603 : -32602,
+          message: 'SECRET-MESSAGE', data: { details: 'SECRET-DATA' },
+        } });
+        if (process.env.ACP_FIXTURE_PERMISSION_AFTER_ERROR === '1')
+          setTimeout(() => requestPermission(message.id), 10);
+        break;
+      }
       // FLEET-003 wire shape: while a steering-started turn owns the adapter,
       // an arriving prompt is folded into that turn. It produces updates but
       // NEVER receives a stopReason of its own — the observed production
@@ -464,6 +522,7 @@ createInterface({ input: process.stdin }).on('line', line => {
       break;
     }
     case '_session/steering': {
+      if (process.env.ACP_FIXTURE_WIRE_LOG) appendFileSync(process.env.ACP_FIXTURE_WIRE_LOG, 'steer\n');
       const text = message.params.prompt.find(block => block.type === 'text')?.text ?? '';
       // A steered wake that starts its own turn and runs a tool in it. Fleet
       // never gets a session/prompt response for this turn, so `readiness`
@@ -511,6 +570,7 @@ createInterface({ input: process.stdin }).on('line', line => {
       break;
     }
     case 'session/cancel':
+      if (process.env.ACP_FIXTURE_WIRE_LOG) appendFileSync(process.env.ACP_FIXTURE_WIRE_LOG, 'cancel\n');
       // Cancelling reaches the steering-started turn. The absorbed prompt has
       // no turn of its own to end, so it stays unanswered — this is why the
       // client's settlement deadline expires and escalates to SIGTERM.

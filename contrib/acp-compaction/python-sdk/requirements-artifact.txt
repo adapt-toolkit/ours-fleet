@@ -1,0 +1,1 @@
+agent-client-protocol==0.9.0+ours.compaction1 --hash=sha256:c71ebab39ef7f779135cc93bb00bf434dcaf1740e6e54849062f9546d69d152c

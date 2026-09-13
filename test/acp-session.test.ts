@@ -1,5 +1,5 @@
 import {
-  existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync,
+  existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, symlinkSync, writeFileSync,
 } from 'node:fs';
 import { createConnection, createServer, type Socket } from 'node:net';
 import { tmpdir } from 'node:os';
@@ -70,6 +70,348 @@ async function waitForRunning(session: AcpSession): Promise<void> {
 }
 
 describe('AcpSession', () => {
+  it('negotiates compaction consumption and buffers lifecycle updates before session/new returns', async () => {
+    const session = await start('allow', { env: {
+      ACP_FIXTURE_REQUIRE_COMPACTION: '1', ACP_FIXTURE_PRE_NEW_COMPACTION: '1',
+    } });
+    try {
+      expect(session.snapshot().activeCompactionIds).toEqual([]);
+      expect(session.eventsSince(0).filter(event => event.kind === 'compaction').map(event => event.status))
+        .toEqual(['in_progress', 'completed']);
+    } finally { await session.close(); }
+  });
+
+  it('holds watchdog cancellation RPC uncertainty for the operator without killing or dispatching queued work', async () => {
+    const stateDir = mkdtempSync(join(tmpdir(), 'acp-watchdog-fence-'));
+    dirs.push(stateDir);
+    const session = await AcpSession.start({ name: 'A',
+      argv: [process.execPath, join(dirname(fixture), 'stall-acp-agent.mjs')],
+      stateDir, cwd: stateDir, mode: 'fresh', env: { STALL_FIXTURE_MODE: 'cancel-error' },
+      permissions: { approval: 'allow', filesystem: 'workspace', unattended: 'deny' },
+      permissionMetadataSource: 'codex-acp',
+      stallRecovery: { timeoutMs: 500, tickMs: 60_000, cancelWaitMs: 1_000 }, log: () => {},
+    });
+    try {
+      const original = session.submitPrompt('original');
+      await vi.waitFor(() => expect(session.conversationPage({ limit: 100 }).events
+        .some(event => JSON.stringify(event).includes('willRetry'))).toBe(true));
+      const next = await session.queuePrompt('must not dispatch');
+      const internal = session as unknown as { activeTurn: { lastProgressAt: number };
+        stallWatchdog: { tick(): Promise<void> } };
+      internal.activeTurn.lastProgressAt -= 2_000;
+      await internal.stallWatchdog.tick();
+      expect(await original).toMatchObject({ cancellationSource: 'stall-watchdog' });
+      expect(await next.completion).toMatchObject({ accepted: false, detail: expect.stringContaining('ACP_PROMPT_NOT_DISPATCHED') });
+      await new Promise(resolve => setTimeout(resolve, 100));
+      expect(session.isAlive()).toBe(true);
+      expect(session.snapshot()).toMatchObject({ readiness: 'failed', lastError: expect.stringContaining('operator attention') });
+      await expect(session.queuePrompt('also must not dispatch')).rejects.toThrow('operator attention');
+      expect(session.conversationPage({ limit: 100 }).events.filter(event => event.kind === 'prompt.started')).toHaveLength(1);
+      expect(JSON.stringify(session.eventsSince(0))).not.toContain('cancel RPC error SECRET');
+    } finally { await session.close(); }
+  });
+
+  it('excludes observed compaction from automatic stall cancellation', async () => {
+    const session = await start();
+    try {
+      const turn = session.submitPrompt('compaction complete');
+      await vi.waitFor(() => expect(session.snapshot().activeCompactionIds).toEqual(['c1']));
+      const internal = session as unknown as { stallObservation(): { safe: boolean } };
+      expect(internal.stallObservation().safe).toBe(false);
+      expect(await turn).toMatchObject({ outcome: 'completed' });
+    } finally { await session.close(); }
+  });
+
+  it('defers Stop and queues steering delivery through both compaction and prompt boundaries', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'acp-compaction-wire-'));
+    dirs.push(dir);
+    const wire = join(dir, 'wire');
+    const session = await start('allow', { env: { ACP_FIXTURE_WIRE_LOG: wire } });
+    const stderr = vi.spyOn(console, 'error').mockImplementation(() => {});
+    try {
+      const original = session.submitPrompt('compaction complete');
+      await vi.waitFor(() => expect(session.snapshot().activeCompactionIds).toEqual(['c1']));
+      expect(await session.interrupt('owner')).toMatchObject({ state: 'deferred', reasonCode: 'ACP_COMPACTION_IN_PROGRESS' });
+      const next = await session.queuePrompt('after compaction', { interrupt: true, steer: true });
+      expect(next.delivery).toBe('deferred');
+      await vi.waitFor(() => expect(session.snapshot().activeCompactionIds).toEqual([]));
+      expect(session.snapshot().readiness).toBe('running');
+      expect(readFileSync(wire, 'utf8')).toBe('prompt\n');
+      expect(await original).toMatchObject({ outcome: 'completed' });
+      expect(await next.completion).toMatchObject({ outcome: 'completed', output: 'echo:after compaction' });
+      expect(readFileSync(wire, 'utf8')).toBe('prompt\nprompt\n');
+      expect(session.eventsSince(0).filter(event => event.kind === 'compaction').map(event => event.status))
+        .toEqual(['in_progress', 'completed']);
+      expect(JSON.stringify(session.eventsSince(0))).not.toContain('SECRET-');
+      expect(stderr).not.toHaveBeenCalled();
+    } finally { stderr.mockRestore(); await session.close(); }
+  });
+
+  it.each(['missing', 'unknown', 'rejected'])('fences a prompt ending with %s compaction terminal evidence', async variant => {
+    const session = await start();
+    try {
+      const original = session.submitPrompt(`compaction ${variant}`);
+      await vi.waitFor(() => expect(session.snapshot().activeCompactionIds).toEqual(['c1']));
+      const next = await session.queuePrompt('must remain unstarted');
+      expect(await original).toMatchObject({ outcome: 'failed' });
+      expect((await next.completion).detail).toContain('ACP_PROMPT_NOT_DISPATCHED');
+      expect(session.snapshot().readiness).toBe('failed');
+      expect(session.eventsSince(0).filter(event => event.kind === 'compaction').map(event => event.status))
+        .toEqual([variant === 'unknown' ? 'unknown' : 'in_progress', 'unknown_ended']);
+      expect(session.snapshot().lastError).toContain('compaction terminal missing');
+    } finally { await session.close(); }
+  });
+
+  it('queues after_tool wakes without sending steering into observed compaction', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'acp-compaction-wire-'));
+    dirs.push(dir);
+    const wire = join(dir, 'wire');
+    const session = await start('allow', { env: { ACP_FIXTURE_WIRE_LOG: wire } });
+    try {
+      const original = session.submitPrompt('compaction complete');
+      await vi.waitFor(() => expect(session.snapshot().activeCompactionIds).toEqual(['c1']));
+      const wake = session.submitPromptAfterTool('queued wake', { origin: { kind: 'fleet-monitor' } });
+      await new Promise(resolve => setTimeout(resolve, 30));
+      expect(readFileSync(wire, 'utf8')).toBe('prompt\n');
+      expect(await original).toMatchObject({ outcome: 'completed' });
+      expect(await wake).toMatchObject({ outcome: 'completed', output: 'echo:queued wake' });
+      expect(readFileSync(wire, 'utf8')).toBe('prompt\nprompt\n');
+    } finally { await session.close(); }
+  });
+
+  it('keeps unprompted live compaction busy and gates the first prompt until terminal', async () => {
+    const session = await start('allow', { env: { ACP_FIXTURE_IDLE_COMPACTION: 'complete' } });
+    try {
+      expect(session.snapshot().readiness).toBe('running');
+      expect(session.snapshot().activeCompactionIds).toEqual(['idle-c']);
+      const queued = await session.queuePrompt('first prompt');
+      await new Promise(resolve => setTimeout(resolve, 30));
+      expect(session.eventsSince(0).some(event => event.turnId === queued.promptId)).toBe(false);
+      expect(await queued.completion).toMatchObject({ outcome: 'completed' });
+      expect(session.snapshot().activeCompactionIds).toEqual([]);
+    } finally { await session.close(); }
+  });
+
+  it('records unknown_ended on process loss even without an owned prompt', async () => {
+    const session = await start('allow', { env: { ACP_FIXTURE_IDLE_COMPACTION: 'exit' } });
+    try {
+      expect(session.snapshot().activeCompactionIds).toEqual(['idle-c']);
+      await vi.waitFor(() => expect(session.isAlive()).toBe(false));
+      expect(session.eventsSince(0).filter(event => event.kind === 'compaction').map(event => event.status))
+        .toEqual(['in_progress', 'unknown_ended']);
+    } finally { await session.close(); }
+  });
+
+  it('records unknown_ended and recovers on transport loss while the process stays alive', async () => {
+    const session = await start('allow', { env: { ACP_FIXTURE_IDLE_COMPACTION: 'disconnect' } });
+    try {
+      expect(session.snapshot().activeCompactionIds).toEqual(['idle-c']);
+      await vi.waitFor(() => expect(session.snapshot().readiness).toBe('failed'));
+      await vi.waitFor(() => expect(session.snapshot().lastError).toContain('connection lost'));
+      expect(session.eventsSince(0).filter(event => event.kind === 'compaction').map(event => event.status))
+        .toEqual(['in_progress', 'unknown_ended']);
+      await vi.waitFor(() => expect(session.isAlive()).toBe(false));
+    } finally { await session.close(); }
+  });
+
+  it.each(['clean-exit', 'disconnect'])('preserves queued responsibility across EOF followed by %s', async variant => {
+    const dir = mkdtempSync(join(tmpdir(), 'acp-eof-order-'));
+    dirs.push(dir);
+    const wire = join(dir, 'wire');
+    writeFileSync(wire, '');
+    const logs: string[] = [];
+    const session = await start('allow', { env: {
+      ACP_FIXTURE_IDLE_COMPACTION: variant, ACP_FIXTURE_WIRE_LOG: wire,
+    }, log: line => logs.push(line) });
+    try {
+      const queued = await session.queuePrompt('must stay queued');
+      expect((await queued.completion).detail).toContain('ACP_PROMPT_NOT_DISPATCHED');
+      await vi.waitFor(() => expect(session.isAlive()).toBe(false));
+      expect(readFileSync(wire, 'utf8')).toBe('');
+      const recoveryDecisions = logs.filter(line => line.includes('retiring adapter for recovery'));
+      expect(recoveryDecisions).toHaveLength(variant === 'clean-exit' ? 0 : 1);
+      if (variant === 'clean-exit') {
+        expect(session.exitResult()?.class).toBe('clean');
+        expect(session.exitResult()?.detail).not.toContain('ACP_SESSION_RECOVERY_REQUIRED');
+      } else expect(session.exitResult()?.detail).toContain('ACP_SESSION_RECOVERY_REQUIRED');
+    } finally { await session.close(); }
+  });
+
+  it('ignores compaction notifications for a different session', async () => {
+    const session = await start();
+    try {
+      expect(await session.submitPrompt('compaction wrong-session')).toMatchObject({ outcome: 'completed' });
+      expect(session.eventsSince(0).filter(event => event.kind === 'compaction')).toEqual([]);
+    } finally { await session.close(); }
+  });
+
+  it('fences malformed compaction evidence with a body-free reason', async () => {
+    const session = await start();
+    try {
+      expect(await session.submitPrompt('compaction malformed')).toMatchObject({ outcome: 'failed' });
+      expect(session.snapshot().lastError).toContain('invalid compaction update');
+      expect(JSON.stringify(session.eventsSince(0))).not.toContain('SECRET-COMPACTION');
+    } finally { await session.close(); }
+  });
+
+  it('loads compaction history without live occupancy or duplicate start notices', async () => {
+    const stateDir = mkdtempSync(join(tmpdir(), 'acp-compaction-replay-'));
+    dirs.push(stateDir);
+    writeFileSync(join(stateDir, '.acp-session-id'), 'fixture-session\n');
+    const session = await AcpSession.start({ name: 'A', argv: [process.execPath, fixture],
+      cwd: stateDir, stateDir, mode: 'resume', env: {
+        ACP_FIXTURE_LOAD_SESSION: '1', ACP_FIXTURE_REPLAY_COMPACTION: '1',
+      }, permissions: { approval: 'allow', filesystem: 'workspace', unattended: 'deny' }, log: () => {},
+    });
+    try {
+      expect(session.snapshot().activeCompactionIds).toEqual([]);
+      expect(session.eventsSince(0).filter(event => event.kind === 'compaction')).toEqual([]);
+      const events = readdirSync(join(stateDir, '.conversation')).filter(name => name.endsWith('.jsonl'))
+        .map(name => readFileSync(join(stateDir, '.conversation', name), 'utf8')).join('');
+      expect(events).toContain('compaction.updated');
+      expect(events).toContain('history-c');
+      expect(events).toContain('agent_replay');
+      expect(await session.submitPrompt('hello')).toMatchObject({ outcome: 'completed' });
+    } finally { await session.close(); }
+  });
+
+  it('coalesces concurrent cancellation before writing one wire notification', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'acp-wire-'));
+    dirs.push(dir);
+    const wire = join(dir, 'wire.log');
+    const session = await start('allow', { env: { ACP_FIXTURE_WIRE_LOG: wire } });
+    try {
+      const active = session.submitPrompt('block 60000');
+      await waitForRunning(session);
+      await Promise.all([session.interrupt('fleet-monitor'), session.interrupt('owner')]);
+      expect(await active).toMatchObject({ outcome: 'cancelled', cancellationSource: 'owner' });
+      expect(readFileSync(wire, 'utf8').split('\n').filter(x => x === 'cancel')).toHaveLength(1);
+    } finally { await session.close(); }
+  });
+
+  it('settles cancellation at the turn boundary despite a delayed wire acknowledgement', async () => {
+    const session = await start('ask', { cancelGraceMs: 100 });
+    session.setControllerAttached(true);
+    // Delay only the transport acknowledgement; the real adapter receives the cancel.
+    const agent = (session as unknown as { connection: {
+      agent: { notify: (...args: unknown[]) => Promise<void> };
+    } }).connection.agent;
+    const notify = agent.notify.bind(agent);
+    let acknowledge!: () => void;
+    const acknowledgement = new Promise<void>(resolve => { acknowledge = resolve; });
+    const delayed = vi.spyOn(agent, 'notify').mockImplementation(async (...args) => {
+      await notify(...args);
+      await acknowledgement;
+    });
+    try {
+      const active = session.submitPrompt('block 60000');
+      await waitForRunning(session);
+      let stopped = false;
+      const stop = session.interrupt('owner').then(() => { stopped = true; });
+      expect(await active).toMatchObject({ outcome: 'cancelled' });
+      await vi.waitFor(() => expect(stopped).toBe(true), { timeout: 300 });
+      const replacement = session.submitPrompt('permission');
+      await vi.waitFor(() => expect(session.snapshot().readiness).toBe('awaiting_permission'));
+      acknowledge();
+      await stop;
+      await new Promise(resolve => setTimeout(resolve, 120));
+      expect(session.snapshot().readiness).toBe('awaiting_permission');
+      delayed.mockRestore();
+      await session.interrupt('owner');
+      expect(await replacement).toMatchObject({ outcome: 'cancelled' });
+    } finally { acknowledge(); delayed.mockRestore(); await session.close(); }
+  });
+
+  it('bounds cancellation even if the wire notification never acknowledges', async () => {
+    const session = await start('allow', { cancelGraceMs: 50, cancelTerminateGraceMs: 50 });
+    const agent = (session as unknown as { connection: {
+      agent: { notify: (...args: unknown[]) => Promise<void> };
+    } }).connection.agent;
+    const hung = vi.spyOn(agent, 'notify').mockImplementation(() => new Promise(() => {}));
+    try {
+      const active = session.submitPrompt('stubborn block 60000');
+      await waitForRunning(session);
+      const result = await Promise.race([
+        session.interrupt('owner'),
+        new Promise(resolve => setTimeout(() => resolve('unbounded'), 500)),
+      ]);
+      expect(result).toEqual({ state: 'forced', reasonCode: 'ACP_CANCEL_DEADLINE_EXCEEDED' });
+      expect(await active).toMatchObject({ outcome: 'failed' });
+    } finally { hung.mockRestore(); await session.close(); }
+  });
+
+  it('fences an alive adapter after internal RPC failure and keeps later work unstarted', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'acp-wire-'));
+    dirs.push(dir);
+    const wire = join(dir, 'wire.log');
+    const logs: string[] = [];
+    const session = await start('allow', { cancelTerminateGraceMs: 75,
+      env: { ACP_FIXTURE_WIRE_LOG: wire, ACP_FIXTURE_IGNORE_SIGTERM: '1' },
+      log: line => logs.push(line),
+    });
+    try {
+      const first = await session.queuePrompt('rpc-internal-error');
+      const later = await session.queuePrompt('must remain pending');
+      expect(await first.completion).toMatchObject({ outcome: 'failed',
+        detail: 'ACP_SESSION_RECOVERY_REQUIRED: RPC failed (code -32603)' });
+      expect(await later.completion).toMatchObject({ accepted: false, outcome: 'failed',
+        detail: 'ACP_PROMPT_NOT_DISPATCHED: ACP_SESSION_RECOVERY_REQUIRED: RPC failed (code -32603)' });
+      expect(session.snapshot().readiness).toBe('failed');
+      await expect(session.queuePrompt('no admission')).rejects.toMatchObject({
+        reasonCode: 'ACP_SESSION_RECOVERY_REQUIRED',
+      });
+      expect(readFileSync(wire, 'utf8')).toBe('prompt\n');
+      const visible = JSON.stringify([session.eventsSince(0), session.snapshot(), logs]);
+      expect(visible).not.toContain('SECRET-');
+      await vi.waitFor(() => expect(session.isAlive()).toBe(false), { timeout: 1000 });
+      expect(session.exitResult()?.detail).toContain('ACP_SESSION_RECOVERY_REQUIRED');
+    } finally { await session.close(); }
+  });
+
+  it('settles outstanding permissions when an RPC failure fences their turn', async () => {
+    const session = await start('ask', { cancelTerminateGraceMs: 100,
+      env: { ACP_FIXTURE_IGNORE_SIGTERM: '1', ACP_FIXTURE_PERMISSION_BEFORE_ERROR: '1' },
+    });
+    session.setControllerAttached(true);
+    try {
+      expect(await session.submitPrompt('rpc-internal-error')).toMatchObject({ outcome: 'failed' });
+      const permission = session.eventsSince(0).find(event =>
+        event.kind === 'permission' && event.status === 'pending');
+      expect(permission?.permissionId).toBeDefined();
+      expect(session.respondPermission(permission!.permissionId!, 'allow')).toBe(false);
+      expect(session.snapshot().readiness).toBe('failed');
+      expect(session.eventsSince(0)).toContainEqual(expect.objectContaining({
+        kind: 'permission', permissionId: permission!.permissionId, decision: 'cancelled',
+      }));
+      await vi.waitFor(() => expect(session.isAlive()).toBe(false));
+    } finally { await session.close(); }
+  });
+
+  it('rejects late permission requests from a fenced adapter without reviving readiness', async () => {
+    const session = await start('ask', { cancelTerminateGraceMs: 150,
+      env: { ACP_FIXTURE_IGNORE_SIGTERM: '1', ACP_FIXTURE_PERMISSION_AFTER_ERROR: '1' },
+    });
+    session.setControllerAttached(true);
+    try {
+      expect(await session.submitPrompt('rpc-internal-error')).toMatchObject({ outcome: 'failed' });
+      await new Promise(resolve => setTimeout(resolve, 60));
+      expect(session.snapshot().readiness).toBe('failed');
+      expect(session.eventsSince(0).filter(event => event.kind === 'permission' && event.status === 'pending')).toHaveLength(0);
+      await vi.waitFor(() => expect(session.isAlive()).toBe(false));
+    } finally { await session.close(); }
+  });
+
+  it('keeps a request rejected for invalid params usable without leaking adapter details', async () => {
+    const session = await start();
+    try {
+      expect(await session.submitPrompt('rpc-invalid-params')).toMatchObject({ outcome: 'failed',
+        detail: 'ACP RPC request rejected (code -32602)' });
+      expect(session.snapshot().readiness).toBe('idle');
+      expect(await session.submitPrompt('hello')).toMatchObject({ outcome: 'completed' });
+      expect(JSON.stringify(session.eventsSince(0))).not.toContain('SECRET-');
+    } finally { await session.close(); }
+  });
+
   it('initializes ACP v1, streams typed events, and completes a prompt', async () => {
     const session = await start();
     const result = await session.submitPrompt('hello');

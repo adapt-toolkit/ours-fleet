@@ -220,7 +220,7 @@ describe('AcpSession live delivery', () => {
     expect(calls).toEqual(['session/cancel', '_session/steering']);
   });
 
-  it('can deliver another interrupt while the preceding wake turn is still running', async () => {
+  it('can cancel a replacement tracked turn independently of the preceding cancellation', async () => {
     const calls: string[] = [];
     const session = fakeSession({
       notify: async method => { calls.push(method); },
@@ -231,6 +231,9 @@ describe('AcpSession live delivery', () => {
     }, { activeTurn: trackedTurn() });
 
     const first = await session.submitPrompt('first wake', { interrupt: true, steer: true });
+    // Model a NEW fleet-owned generation; retaining the settled first turn
+    // incorrectly asks for a second cancel of the same generation.
+    Object.assign(session, { activeTurn: { ...trackedTurn(), id: 'turn-2' } });
     const second = await session.submitPrompt('second wake', { interrupt: true, steer: true });
 
     expect(first.detail).toBe('startedNewTurn');

@@ -4,7 +4,7 @@ import {
   applyEvents, cloneModel, collectHistory, describeTurnState, emptyModel, isAtTail,
 } from './conversation-model';
 import type {
-  ConversationEvent, ConversationModel, ConversationPage, PermissionCard, TranscriptTurn,
+  CompactionRow, ConversationEvent, ConversationModel, ConversationPage, PermissionCard, TranscriptTurn,
 } from './conversation-model';
 
 type StreamState = 'connecting' | 'live' | 'reconnecting' | 'offline';
@@ -127,9 +127,11 @@ export function ConversationView({ roleId }: { roleId: string }) {
   const interrupt = async () => {
     if (!confirm('Interrupt the active ACP turn? Queued prompts are preserved.')) return;
     try {
-      await api.post(`/api/v1/roles/${encodeURIComponent(roleId)}/interrupt`,
+      const receipt = await api.post<{ state?: string }>(`/api/v1/roles/${encodeURIComponent(roleId)}/interrupt`,
         { commandId: idempotencyKey() });
-      setNotice('Interrupt requested — the turn ends when the agent confirms.');
+      setNotice(receipt.state === 'deferred'
+        ? 'Stop deferred during compaction. No cancellation was sent; request Stop again after compaction settles.'
+        : receipt.state === 'forced' ? 'Turn stopped through adapter recovery.' : 'Turn stopped.');
     } catch (reason) {
       setNotice(`Interrupt failed: ${(reason as Error).message}`);
     }
@@ -165,9 +167,14 @@ export function ConversationView({ roleId }: { roleId: string }) {
       {notice && <div className="banner info">{notice}</div>}
       <div className="transcript" ref={scrollRef}
         onScroll={event => setAtBottom(isAtTail(event.currentTarget))}>
-        {model.turns.length === 0 &&
+        {model.turns.length === 0 && model.compactions.length === 0 &&
           <p className="muted">No conversation yet. Prompt the live ACP session below.</p>}
-        {model.turns.map(turn => <TurnBlock key={turn.promptId} turn={turn} onDecide={decide} />)}
+        {[
+          ...model.turns.map(turn => ({ seq: turn.firstSeq, key: `turn:${turn.promptId}`,
+            node: <TurnBlock turn={turn} onDecide={decide} /> })),
+          ...model.compactions.map(row => ({ seq: row.firstSeq, key: `compaction:${row.key}`,
+            node: <CompactionStatus row={row} /> })),
+        ].sort((a, b) => a.seq - b.seq).map(item => <div key={item.key}>{item.node}</div>)}
       </div>
       {!atBottom && <button className="secondary jump-latest"
         onClick={() => { setAtBottom(true); }}>Jump to latest</button>}
@@ -377,4 +384,14 @@ function PermissionBlock({ card, onDecide }: {
         <small className="muted">This agent offered no one-shot option; use role policy.</small>}
     </div>
   </div>;
+}
+
+/** Lifecycle metadata only; summaries are never part of this projection. */
+export function CompactionStatus({ row }: { row: CompactionRow }) {
+  const labels: Record<CompactionRow['status'], string> = {
+    in_progress: 'Compacting the conversation…',
+    completed: 'Compaction done', failed: 'Compaction failed', cancelled: 'Compaction cancelled',
+    unknown: 'Compaction status unknown', unknown_ended: 'Compaction outcome unknown — session recovery required',
+  };
+  return <div className="banner info" data-compaction-status={row.status}>{labels[row.status]}</div>;
 }

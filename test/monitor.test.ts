@@ -49,6 +49,7 @@ function makeDeps(fetch: MonitorDeps['fetch'], over: Partial<MonitorDeps> = {}):
   let clock = 0;
   return {
     fetch,
+    sourceEpoch: () => 'test-identity-store-epoch',
     isAlive: () => true,
     // Virtual clock, but yield to the macrotask queue so a runaway loop in the
     // monitor surfaces as a vitest timeout instead of starving timers and hanging
@@ -536,6 +537,38 @@ describe('Monitor.run — delivery', () => {
     await mon.run(1);
     expect(delivered).toEqual(['[fleet-monitor] 1 new message from C (#9) — run get_messages']);
     expect(readFileSync(join(dir, '.notify-cursor'), 'utf8').trim()).toBe('2');
+  });
+
+  it('commits only a durable admission receipt and keeps stable constituent keys across rebatching', async () => {
+    const admissions: unknown[] = [];
+    const { fetch } = scriptedFetch([
+      { cursor: 1, events: [] },
+      { cursor: 2, events: [{ event: 'message_received', from: 'C', msg_id: 9 }] },
+    ]);
+    const mon = createMonitor({ name: 'A', agentDir: dir, cfg: CFG({ batch_ms: 0 }),
+      deps: makeDeps(fetch, { delivery: {
+        submit: async () => { throw new Error('legacy execution path used'); },
+        admit: async batch => { admissions.push(batch); mon.stop(); return { admitted: true, outcome: 'queued' }; },
+      } }),
+    });
+    await mon.prime(); await mon.run(1);
+    expect(admissions).toHaveLength(1);
+    expect(admissions[0]).toMatchObject({ events: [{ event: { msg_id: 9 } }] });
+    expect(readFileSync(join(dir, '.notify-cursor'), 'utf8').trim()).toBe('2');
+  });
+
+  it('resumes from durable admission coverage after a crash before cursor commit', async () => {
+    const { fetch, calls } = scriptedFetch([{ cursor: 1, events: [] }, { cursor: 20, events: [] }],
+      (_url, n) => { if (n === 1) mon.stop(); });
+    const mon = createMonitor({ name: 'A', agentDir: dir, cfg: CFG({ batch_ms: 0 }), deps: makeDeps(fetch, {
+      delivery: {
+        submit: async () => { throw new Error('unexpected dispatch'); },
+        admittedCursor: () => 20,
+        admit: async () => { throw new Error('covered hints must not be replayed'); },
+      },
+    }) });
+    await mon.prime(); await mon.run(1);
+    expect(calls()[1]).toContain('since=20');
   });
 
   it('a refused ACP wake keeps the cursor, degrades with the reason, and replays', async () => {

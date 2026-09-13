@@ -20,6 +20,7 @@ import type {
   OursRetrievedFile,
 } from '../src/owner-channel/ours-client.js';
 import { OwnerConversationState } from '../src/owner-channel/state.js';
+import { SessionControlError } from '../src/session/types.js';
 import type { QueuedPrompt, SessionHandle, TurnResult } from '../src/session/types.js';
 import { historyFile, historyMessage, incomingMessage } from './owner-history-fixtures.js';
 
@@ -183,7 +184,7 @@ async function setup(
     await channel.start();
     await channel.drain();
   }
-  return { dir, client, channel, queuePrompt, logs, ...pending };
+  return { dir, client, channel, queuePrompt, logs, config, ...pending };
 }
 
 afterEach(() => {
@@ -192,6 +193,40 @@ afterEach(() => {
 });
 
 describe('owner-channel attachment ingress', () => {
+  it.each(['admission', 'completion'])('retains attachment source recovery after %s is fenced', async phase => {
+    const status = await setup();
+    status.config.interrupt = true;
+    const source = join(status.dir, 'daemon-source');
+    writeFileSync(source, 'hello');
+    status.client.files = [listed()];
+    status.client.retrieved.set(FILE_WIRE, retrieved(source, Buffer.from('hello')));
+    if (phase === 'admission') status.queuePrompt.mockRejectedValueOnce(new SessionControlError(
+      'control-unavailable', 'body-free recovery', 'ACP_SESSION_RECOVERY_REQUIRED'));
+    await status.channel.drain();
+    if (phase === 'completion') status.finish({ accepted: false, succeeded: false, outcome: 'failed',
+      detail: 'ACP_PROMPT_NOT_DISPATCHED: ACP_SESSION_RECOVERY_REQUIRED: RPC failed' });
+    await new Promise(resolve => setTimeout(resolve, 40));
+    await status.channel.drain();
+    expect(status.queuePrompt).toHaveBeenCalledTimes(1);
+    expect(status.queuePrompt.mock.calls[0][1]).toMatchObject({ interrupt: false });
+    expect(JSON.parse(readFileSync(join(status.dir,
+      '.owner-channel-attachment-recovery.json'), 'utf8')).pending).toHaveLength(1);
+    expect(status.client.calls.filter(call => call.name === 'sendMessage'))
+      .toHaveLength(phase === 'admission' ? 0 : 1);
+    await status.channel.close();
+    const resumed = await setup([OWNER], false, attachmentConfig, undefined, status.dir,
+      client => { client.retrieved = status.client.retrieved; }, false);
+    await resumed.channel.drain();
+    expect(resumed.queuePrompt).toHaveBeenCalledTimes(1);
+    expect(resumed.client.calls).toContainEqual({ name: 'fetchFile', args: { wireId: FILE_WIRE } });
+    resumed.finish({ accepted: true, succeeded: true, outcome: 'completed', output: 'Recovered attachment' });
+    await vi.waitFor(() => expect(JSON.parse(readFileSync(join(status.dir,
+      '.owner-channel-attachment-recovery.json'), 'utf8')).pending).toHaveLength(0));
+    await resumed.channel.drain();
+    expect(resumed.queuePrompt).toHaveBeenCalledTimes(1);
+    await resumed.channel.close();
+  });
+
   it('fails closed when a journaled file is absent from persistent history', async () => {
     const status = await setup(
       [OWNER], true, attachmentConfig, undefined, undefined, undefined, false);

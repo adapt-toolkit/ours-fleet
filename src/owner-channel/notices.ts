@@ -79,6 +79,7 @@ export const ownerNotices = {
     `📊 ${role} status: ${snapshot.readiness}; session is ${snapshot.alive ? 'online' : 'offline'}.`,
 
   interrupted: (role: string) => `🛑 Interrupt sent to ${role}'s active turn.`,
+  interruptDeferred: (role: string) => `⏳ Interrupt deferred while ${role} has active or uncertain compaction. No cancellation was sent; request Stop again after compaction settles.`,
   /** The turn IS cancelled — say how, without implying the owner must retry. */
   interruptForced: (role: string) =>
     `🛑 Interrupt enforced: ${role}'s turn ignored the cancellation, so the session `

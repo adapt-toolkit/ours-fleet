@@ -16,6 +16,8 @@ import type {
   ConversationEventV1, ConversationSnapshot, ConversationSource, PromptOrigin, PromptReceipt,
   SubmitPromptCommand,
 } from './conversation-types.js';
+import { CompactionTracker, interceptCompactionStream, type CompactionLifecycleEvent,
+  type CompactionNotification } from './acp-compaction.js';
 import { SessionEvents } from './events.js';
 import { DEFAULT_STALL_TIMEOUT_MS, STALL_RECOVERY_PROMPT, StallWatchdog, StallToolHistory, hasStallRecoveryClaim,
   type StallObservation, type StallStatus } from './stall-watchdog.js';
@@ -52,6 +54,21 @@ interface ActiveToolCall {
 interface SteeringResponse {
   outcome: 'injected' | 'startedNewTurn' | 'failed';
 }
+
+export const ACP_COMPACTION_IN_PROGRESS = 'ACP_COMPACTION_IN_PROGRESS';
+export const ACP_SESSION_RECOVERY_REQUIRED = 'ACP_SESSION_RECOVERY_REQUIRED';
+export const ACP_STALL_OPERATOR_REQUIRED = 'ACP_STALL_OPERATOR_REQUIRED';
+/** Local admission proof: this generation never wrote the queued prompt RPC. */
+export const ACP_PROMPT_NOT_DISPATCHED = 'ACP_PROMPT_NOT_DISPATCHED';
+
+/** Keep only the structured numeric RPC code, never adapter message/data. */
+function rpcErrorCode(error: unknown): number | undefined {
+  const code = error instanceof acp.RequestError ? error.code : undefined;
+  return Number.isSafeInteger(code) ? code : undefined;
+}
+
+/** Let the OS deliver a definitive child exit after stdio EOF before classifying transport loss. */
+const TRANSPORT_EXIT_OBSERVATION_MS = 50;
 
 const CANCEL_SETTLE_GRACE_MS = 15_000;
 const CANCEL_TERMINATE_GRACE_MS = 5_000;
@@ -336,12 +353,18 @@ export class AcpSession implements AgentSession {
   private readonly child: ChildProcessWithoutNullStreams;
   private readonly events: SessionEvents;
   private readonly conversation: ConversationEventStore;
-  /** Cursor before this runner generation began; older durable events stay off the live console. */
-  private readonly conversationStartCursor?: string;
   /** New on every runner start; permission/turn IDs from prior generations are stale. */
   private readonly sessionGeneration = randomUUID();
   /** True while `session/load` replays history as ordinary updates. */
   private replaying = false;
+  private expectedCompactionSessionId?: string;
+  private readonly pendingCompactions: CompactionNotification[] = [];
+  private compactionTracker?: CompactionTracker;
+  private compactionBoundary?: { promise: Promise<void>; resolve(): void };
+
+  private get compactions(): CompactionTracker {
+    return this.compactionTracker ??= new CompactionTracker();
+  }
   private readonly sessionFile: string;
   private readonly pendingPermissions = new Map<string, PendingPermission>();
   private connection: acp.ClientConnection;
@@ -368,6 +391,8 @@ export class AcpSession implements AgentSession {
   private cancelEscalation?: ReturnType<typeof setTimeout>;
   private cancelForceKill?: ReturnType<typeof setTimeout>;
   private cancelRecoveryReason?: string;
+  private transportClosure?: Promise<void>;
+  private finishTransportObservation?: () => void;
   /**
    * Held while a steering-started turn is believed to own the adapter. It is a
    * lease, not a latch: `steeringRelease` always fires, so the role can never be
@@ -387,6 +412,8 @@ export class AcpSession implements AgentSession {
   private stallWatchdog?: StallWatchdog;
   private stallToolHistory?: StallToolHistory;
   private stallRecoveryClaimed = false;
+  /** A watchdog cancellation rejected by RPC needs an operator, never automatic replay or restart. */
+  private stallBoundaryBlocked = false;
   private managedTurnCount = 0;
   private steeringWasUsed = false;
   private steeringRequests = 0;
@@ -422,18 +449,21 @@ export class AcpSession implements AgentSession {
     this.conversation = new ConversationEventStore(join(options.stateDir, '.conversation'), {
       roleId: options.name, log: line => options.log(`[${options.name}] ${line}`),
     });
-    this.conversationStartCursor = this.conversation.lastCursor();
     this.sessionFile = join(options.stateDir, '.acp-session-id');
     this.terminated = new Promise<never>((_resolve, reject) => { this.terminate = reject; });
     // Nothing awaits this promise until a request races it; an unobserved
     // rejection here must never take the whole runner down.
     this.terminated.catch(() => undefined);
     child.stderr.on('data', chunk => options.log(`[${options.name}] acp: ${String(chunk).trimEnd()}`));
+    void connection.closed.then(() => {
+      this.transportClosure = this.observeTransportClosure();
+    });
     child.once('exit', (code, signal) => {
       if (this.stallTimer) clearInterval(this.stallTimer);
       this.stallTimer = undefined;
       if (this.cancelForceKill) clearTimeout(this.cancelForceKill);
       this.cancelForceKill = undefined;
+      this.endCompactions();
       this.releaseSteeringOccupancy('adapter exited');
       // Record the child's real exit code/signal while the truth is available.
       const classified = classifyChildExit(code, signal);
@@ -455,6 +485,29 @@ export class AcpSession implements AgentSession {
         payload: { status: 'failed', detail: this.lastError },
       });
     });
+  }
+
+  private async observeTransportClosure(): Promise<void> {
+    if (!this.closing && !this.cancelRecoveryReason && this.isAlive()) {
+      // EOF often arrives one event-loop turn before ChildProcess.exit. The
+      // transport is already fenced; this bounded wait only preserves the OS
+      // exit classification, never infers that the disconnected process is safe.
+      await new Promise<void>(resolve => {
+        const finish = () => {
+          clearTimeout(timer);
+          this.child.off('exit', finish);
+          this.finishTransportObservation = undefined;
+          resolve();
+        };
+        const timer = setTimeout(finish, TRANSPORT_EXIT_OBSERVATION_MS);
+        timer.unref?.();
+        this.finishTransportObservation = finish;
+        this.child.once('exit', finish);
+      });
+    }
+    if (!this.closing && !this.cancelRecoveryReason && this.isAlive())
+      this.recoverRpcFailure(undefined, 'connection lost');
+    else this.endCompactions();
   }
 
   static async start(options: AcpSessionOptions): Promise<AcpSession> {
@@ -498,9 +551,12 @@ export class AcpSession implements AgentSession {
       Writable.toWeb(child.stdin) as WritableStream<Uint8Array>,
       Readable.toWeb(child.stdout) as ReadableStream<Uint8Array>,
     );
-    const connection = app.connect(stream);
+    const connection = app.connect(interceptCompactionStream(stream,
+      update => instance?.recordCompaction(update),
+      () => instance?.recoverRpcFailure(undefined, 'invalid compaction update')));
     instance = new AcpSession(options, child, connection);
     try {
+      instance.recoverOpenCompactions();
       await instance.initialize();
       instance.startStallWatchdog();
       instance.recoverOpenPrompts();
@@ -509,6 +565,14 @@ export class AcpSession implements AgentSession {
       instance.fail(error);
       await instance.close();
       throw error;
+    }
+  }
+
+  /** Restart closes historical uncertainty without restoring old live occupancy. */
+  private recoverOpenCompactions(): void {
+    for (const event of this.conversation.openCompactions()) {
+      if (event.sessionGeneration === this.sessionGeneration) continue;
+      this.recordCompactionEvent({ ...event.payload, status: 'unknown_ended', replayed: true });
     }
   }
 
@@ -598,9 +662,10 @@ export class AcpSession implements AgentSession {
       // session idle while it runs is what let the arbiter admit a scheduled
       // prompt into a busy adapter, whose `session/prompt` then never returned
       // a stopReason and ended in a cancellation deadline and a SIGTERM.
-      readiness: this.readiness === 'idle' && this.steeringOccupied
+      readiness: this.transportClosure ? 'failed' : this.readiness === 'idle' && (this.steeringOccupied || this.compactions.activeIds().length > 0)
         ? 'running' : this.readiness,
       sessionId: this.sessionId,
+      activeCompactionIds: this.compactions.activeIds(),
       lastError: this.lastError,
       pendingPermissionId: this.pendingPermissions.keys().next().value as string | undefined,
       runtimeModel: this.runtimeModel,
@@ -714,7 +779,7 @@ export class AcpSession implements AgentSession {
   private async steerOrQueueWake(
     text: string, options: SubmitPromptOptions,
   ): Promise<TurnResult> {
-    if (this.stallRecoveryClaimed)
+    if (this.stallRecoveryClaimed || this.compactions.activeIds().length > 0)
       return this.submitPrompt(text, { ...options, interrupt: false, steer: false });
     const steered = await this.steerPrompt(text);
     if (steered.accepted || steered.detail !== 'ACP steering failed'
@@ -782,16 +847,21 @@ export class AcpSession implements AgentSession {
    * for it is what turned a busy agent into a timeout and then into "dead".
    */
   async queuePrompt(text: string, options: SubmitPromptOptions = {}): Promise<QueuedPrompt> {
+    if (this.stallBoundaryBlocked)
+      throw new SessionControlError('control-unavailable', this.lastError ?? 'ACP requires operator attention',
+        ACP_STALL_OPERATOR_REQUIRED);
     if (this.stallRecoveryClaimed && options.origin?.kind === 'fleet-monitor')
       options = { ...options, interrupt: false, steer: false };
     if (this.cancelRecoveryReason)
       throw new SessionControlError(
         'control-unavailable',
-        'ACP adapter restart is in progress after the cancellation deadline',
-        ACP_CANCEL_DEADLINE_EXCEEDED,
+        this.lastError ?? 'ACP adapter restart is in progress',
+        this.cancelRecoveryReason,
       );
     if (this.closing || !this.sessionId || !this.isAlive())
       throw new SessionControlError('offline', this.lastError ?? 'ACP session is offline');
+    if (this.transportClosure)
+      throw new SessionControlError('control-unavailable', 'ACP transport is closed', ACP_SESSION_RECOVERY_REQUIRED);
     const delivery = options.interrupt
       ? await this.prepareInterruptingDelivery(options.interruptSource ?? 'local-console')
       : undefined;
@@ -799,7 +869,8 @@ export class AcpSession implements AgentSession {
     // live turn, the extension starts one and acknowledges `startedNewTurn`
     // immediately; a normal session/prompt would keep the monitor blocked until
     // the entire wake-triggered turn terminated.
-    if (options.steer && this.steeringSupported) {
+    if (options.steer && this.steeringSupported && delivery !== 'deferred'
+        && this.compactions.activeIds().length === 0) {
       const promptId = randomUUID();
       return {
         promptId, queuedBehind: 0, completion: this.steerPrompt(text), origin: options.origin,
@@ -850,6 +921,7 @@ export class AcpSession implements AgentSession {
     source: TurnCancellationSource,
   ): Promise<PromptDelivery> {
     if (!this.sessionId) return 'started';
+    if (this.compactions.activeIds().length > 0) return 'deferred';
     // No fleet-tracked turn to await. Either the session is idle — cancelling it
     // corrupts the transcript for no gain — or the adapter is running a turn
     // fleet never started, whose settlement nothing here can wait for. Queue in
@@ -858,7 +930,12 @@ export class AcpSession implements AgentSession {
     // A tracked turn IS safe to cancel: cancelActive settles pending permissions
     // and awaits the turn's own settlement before this returns, so the prompt
     // below cannot race the adapter's transcript repair.
-    await this.cancelActive(source);
+    try { await this.cancelActive(source); }
+    catch (error) {
+      if (error instanceof SessionControlError && error.reasonCode === ACP_COMPACTION_IN_PROGRESS)
+        return 'deferred';
+      throw error;
+    }
     return 'interrupted';
   }
 
@@ -944,6 +1021,8 @@ export class AcpSession implements AgentSession {
       await this.cancelActive(source);
       return { state: 'settled' };
     } catch (error) {
+      if (error instanceof SessionControlError && error.reasonCode === ACP_COMPACTION_IN_PROGRESS)
+        return { state: 'deferred', reasonCode: ACP_COMPACTION_IN_PROGRESS };
       if (error instanceof SessionControlError
           && error.reasonCode === ACP_CANCEL_DEADLINE_EXCEEDED)
         return { state: 'forced', reasonCode: ACP_CANCEL_DEADLINE_EXCEEDED };
@@ -955,32 +1034,48 @@ export class AcpSession implements AgentSession {
     if (this.stallAttempt && source !== 'stall-watchdog' && source !== 'fleet-monitor')
       this.stallAttempt.superseded = true;
     if (!this.sessionId) return;
+    if (this.compactions.activeIds().length > 0)
+      throw new SessionControlError('rejected', 'Stop deferred while compaction is active', ACP_COMPACTION_IN_PROGRESS);
     const active = this.activeTurn;
-    const previousSource = active?.cancellationSource;
-    if (active && (source === 'owner' || source === 'local-console' || !previousSource))
+    if (active && (source === 'owner' || source === 'local-console' || !active.cancellationSource))
       active.cancellationSource = source;
-    try {
-      await this.connection.agent.notify(
-        acp.methods.agent.session.cancel, { sessionId: this.sessionId });
-    } catch (error) {
-      if (this.activeTurn === active && active?.cancellationSource === source)
-        active.cancellationSource = previousSource;
-      throw error;
+    if (!active) {
+      // Explicit stop may address an adapter-owned steering turn.
+      if (!this.cancelRecoveryReason)
+        await this.connection.agent.notify(acp.methods.agent.session.cancel, { sessionId: this.sessionId });
+      return;
     }
-    if (active) {
+    // Install ownership BEFORE any wire action or await. Later callers share
+    // this operation and cannot send an old turn's cancel into its replacement.
+    active.cancellationWait ??= Promise.resolve().then(async () => {
+      if (this.activeTurn !== active || this.cancelRecoveryReason) return;
+      if (this.compactions.activeIds().length > 0) {
+        active.cancellationWait = undefined;
+        active.cancellationSource = undefined;
+        throw new SessionControlError('rejected', 'Stop deferred while compaction is active', ACP_COMPACTION_IN_PROGRESS);
+      }
+      const settlement = this.awaitCancellationSettlement(active);
+      // Observe the deadline even when a transport write never acknowledges.
+      const notification = this.connection.agent.notify(
+        acp.methods.agent.session.cancel, { sessionId: this.sessionId! });
       this.conversation.appendSafe({
         kind: 'prompt.interrupt_requested', sessionGeneration: this.sessionGeneration,
         acpSessionId: this.sessionId, promptId: active.id, turnId: active.id,
-        payload: { cancellationSource: source },
+        payload: { cancellationSource: active.cancellationSource },
       });
-    }
-    for (const [permissionId, pending] of [...this.pendingPermissions])
-      this.settlePendingAutomatically(permissionId, pending, 'cancelled', undefined,
-        'the turn was cancelled while this request was pending');
-    if (active && this.activeTurn === active) {
-      active.cancellationWait ??= this.awaitCancellationSettlement(active);
-      await active.cancellationWait;
-    }
+      for (const [permissionId, pending] of [...this.pendingPermissions])
+        this.settlePendingAutomatically(permissionId, pending, 'cancelled', undefined,
+          'the turn was cancelled while this request was pending');
+      await Promise.race([
+        settlement,
+        notification.then(() => settlement, error => {
+          if (this.activeTurn === active) this.recoverRpcFailure(error);
+          throw new SessionControlError('control-unavailable',
+            this.lastError ?? ACP_SESSION_RECOVERY_REQUIRED, ACP_SESSION_RECOVERY_REQUIRED);
+        }),
+      ]);
+    });
+    await active.cancellationWait;
   }
 
   /**
@@ -1170,6 +1265,8 @@ export class AcpSession implements AgentSession {
     if (this.stallTimer) clearInterval(this.stallTimer);
     this.stallTimer = undefined;
     if (this.stallAttempt) this.stallAttempt.superseded = true;
+    this.finishTransportObservation?.();
+    this.endCompactions();
     if (this.cancelEscalation) clearTimeout(this.cancelEscalation);
     this.cancelEscalation = undefined;
     if (this.cancelForceKill) clearTimeout(this.cancelForceKill);
@@ -1204,7 +1301,7 @@ export class AcpSession implements AgentSession {
   private async initialize(): Promise<void> {
     const initialized = await this.connection.agent.request(acp.methods.agent.initialize, {
       protocolVersion: acp.PROTOCOL_VERSION,
-      clientCapabilities: {},
+      clientCapabilities: { session: { compaction: {} } } as acp.ClientCapabilities,
       clientInfo: { name: 'ours-fleet', version: '1' },
     });
     if (initialized.protocolVersion !== acp.PROTOCOL_VERSION)
@@ -1218,6 +1315,7 @@ export class AcpSession implements AgentSession {
     const persisted = this.options.mode === 'resume' && existsSync(this.sessionFile)
       ? readFileSync(this.sessionFile, 'utf8').trim()
       : '';
+    this.expectedCompactionSessionId = persisted || undefined;
     let advertisedConfigOptions: acp.SessionConfigOption[] | null | undefined;
     let advertisedModes: acp.SessionModeState | null | undefined;
     let advertisedModelId: string | undefined;
@@ -1246,7 +1344,10 @@ export class AcpSession implements AgentSession {
         advertisedModes = loaded.modes;
         advertisedModelId = (loaded as { models?: { currentModelId?: string } }).models?.currentModelId;
         this.captureRuntimeMetadata(advertisedConfigOptions, advertisedModelId);
-      } finally { this.replaying = false; }
+      } finally {
+        for (const event of this.compactions.endReplay(persisted)) this.recordCompactionEvent(event);
+        this.replaying = false;
+      }
       this.sessionId = persisted;
     } else {
       const created = await this.connection.agent.request(acp.methods.agent.session.new, {
@@ -1261,6 +1362,9 @@ export class AcpSession implements AgentSession {
       advertisedModelId = created.models?.currentModelId;
       this.captureRuntimeMetadata(advertisedConfigOptions, advertisedModelId);
     }
+    this.expectedCompactionSessionId = this.sessionId;
+    for (const update of this.pendingCompactions.splice(0)) this.recordCompaction(update);
+    if (this.cancelRecoveryReason) throw new Error(this.lastError);
     for (const selection of this.options.configSelections ?? []) {
       if (!advertisedConfigOptions?.some(option => option.id === selection.configId)) {
         if (selection.configId === 'reasoning_effort'
@@ -1376,6 +1480,7 @@ export class AcpSession implements AgentSession {
       transportFailures: active.transportFailures,
       boundaryEvidenceAvailable: this.stallToolHistory?.available() !== false,
       safe: this.isAlive() && !this.closing && this.readiness === 'running'
+        && !this.transportClosure && !this.cancelRecoveryReason && this.compactions.activeIds().length === 0
         && !active.cancellationSource && !active.boundaryUnknown && !this.steeringOccupied
         && this.steeringRequests === 0 && this.stallToolHistory?.available() !== false
         && this.activeToolCalls.size === 0 && this.pendingPermissions.size === 0,
@@ -1463,8 +1568,12 @@ export class AcpSession implements AgentSession {
   private async runSinglePrompt(
     text: string, turnId: string = randomUUID(), origin?: SubmitPromptOptions['origin'],
   ): Promise<TurnResult> {
-    if (!this.sessionId || !this.isAlive())
-      return turnResult(false, 'failed', this.lastError ?? 'ACP session is offline');
+    while (this.compactionBoundary && !this.cancelRecoveryReason && !this.closing) {
+      try { await Promise.race([this.compactionBoundary.promise, this.terminated]); } catch { break; }
+    }
+    if (this.stallBoundaryBlocked || this.transportClosure || this.cancelRecoveryReason || this.closing || !this.sessionId || !this.isAlive())
+      return turnResult(false, 'failed',
+        `${ACP_PROMPT_NOT_DISPATCHED}: ${this.lastError ?? 'ACP session is offline'}`);
     this.readiness = 'running';
     this.managedTurnCount++;
     this.retryNativeTurnId = undefined;
@@ -1485,6 +1594,9 @@ export class AcpSession implements AgentSession {
         }),
         this.terminated,
       ]);
+      if (this.endCompactions().length > 0)
+        this.recoverRpcFailure(undefined, 'compaction terminal missing');
+      if (this.cancelRecoveryReason) throw new Error(this.lastError);
       this.readiness = 'idle';
       const cancellationSource = this.activeTurn?.id === turnId
         ? this.activeTurn.cancellationSource : undefined;
@@ -1508,19 +1620,29 @@ export class AcpSession implements AgentSession {
         this.activeTurn?.id === turnId ? this.activeTurn.output : undefined,
         this.activeTurn?.id === turnId ? this.activeTurn.cancellationSource : undefined);
     } catch (error) {
+      if (this.transportClosure) await this.transportClosure;
+      if (this.endCompactions().length > 0 && !this.cancelRecoveryReason && this.isAlive())
+        this.recoverRpcFailure(undefined, 'compaction terminal missing');
       const escalated = this.activeTurn?.id === turnId
         && this.activeTurn.cancellationDeadlineExceeded;
-      const detail = escalated
-        ? this.lastError ?? ACP_CANCEL_DEADLINE_EXCEEDED
-        : (error as Error)?.message ?? String(error);
-      this.lastError = origin?.kind === 'scheduled-loop' ? 'scheduled-loop turn failed' : detail;
-      this.readiness = this.isAlive() ? 'idle' : 'failed';
-      this.events.emit('error', {
-        turnId, origin: this.activeTurn?.cancellationSource === 'stall-watchdog'
-          ? { kind: 'stall-watchdog' } : origin,
-        text: origin?.kind === 'scheduled-loop' ? 'scheduled-loop turn failed' : this.lastError,
-      });
-      if (this.isAlive()) this.events.emit('state', { status: 'idle' });
+      // The existing watchdog contract deliberately forbids automatic process
+      // retirement after its own ambiguous cancellation. Retain the process for
+      // the operator, but fence all prompt admission rather than assume idle.
+      if (!this.cancelRecoveryReason && !this.transportClosure && this.isAlive()
+          && this.activeTurn?.cancellationSource === 'stall-watchdog'
+          && this.stallAttempt?.turnId === turnId && rpcErrorCode(error) !== undefined) {
+        this.stallBoundaryBlocked = true;
+        this.lastError = `ACP watchdog cancellation requires operator attention (code ${rpcErrorCode(error)})`;
+      }
+      const detail = escalated || this.stallBoundaryBlocked || this.cancelRecoveryReason || !this.isAlive()
+        ? this.lastError ?? 'ACP session is offline'
+        : this.recoverRpcFailure(error);
+      this.lastError = detail;
+      this.readiness = this.stallBoundaryBlocked || this.cancelRecoveryReason || !this.isAlive() ? 'failed' : 'idle';
+      this.events.emit('error', { turnId,
+        origin: this.activeTurn?.cancellationSource === 'stall-watchdog' ? { kind: 'stall-watchdog' } : origin,
+        text: detail });
+      this.events.emit('state', { status: this.readiness, text: detail });
       this.conversation.appendSafe({
         kind: 'turn.completed', sessionGeneration: this.sessionGeneration,
         acpSessionId: this.sessionId, promptId: turnId, turnId,
@@ -1530,6 +1652,7 @@ export class AcpSession implements AgentSession {
         false, 'failed', this.lastError,
         this.activeTurn?.id === turnId ? this.activeTurn.output : undefined);
     } finally {
+      this.endCompactions();
       this.releaseAllTools();
       // A turn this client owned has ended, so the adapter has reported a
       // boundary: whatever a steering call started before it is over too. This
@@ -1544,9 +1667,93 @@ export class AcpSession implements AgentSession {
     }
   }
 
+  /** A live process is not proof of a synchronized prompt boundary after RPC failure. */
+  private recoverRpcFailure(error: unknown, reason: 'RPC failed' | 'invalid compaction update'
+    | 'compaction terminal missing' | 'compaction state capacity exceeded' | 'connection lost' = 'RPC failed'): string {
+    if (this.cancelRecoveryReason) return this.lastError ?? this.cancelRecoveryReason;
+    const code = rpcErrorCode(error);
+    const suffix = code === undefined ? '' : ` (code ${code})`;
+    // These protocol rejections decline the request before execution. Other
+    // errors may have happened after side effects and require a new generation.
+    if (code === -32602 || code === -32601) return `ACP RPC request rejected${suffix}`;
+    this.cancelRecoveryReason = ACP_SESSION_RECOVERY_REQUIRED;
+    this.lastError = `${ACP_SESSION_RECOVERY_REQUIRED}: ${reason}${suffix}`;
+    this.readiness = 'failed';
+    this.endCompactions();
+    for (const [permissionId, pending] of [...this.pendingPermissions])
+      this.settlePendingAutomatically(permissionId, pending, 'cancelled', undefined,
+        'the adapter requires recovery after an RPC failure');
+    this.events.emit('state', { status: 'failed', text: this.lastError });
+    this.conversation.appendSafe({
+      kind: 'session.state', sessionGeneration: this.sessionGeneration,
+      acpSessionId: this.sessionId,
+      payload: { status: 'failed', detail: this.lastError },
+    });
+    this.options.log(`[${this.options.name}] ${this.lastError}; retiring adapter for recovery`);
+    // Settle concurrent requests without waiting for a wedged process to exit.
+    this.terminate(new SessionControlError('control-unavailable',
+      this.lastError, ACP_SESSION_RECOVERY_REQUIRED));
+    this.child.kill('SIGTERM');
+    this.cancelForceKill = setTimeout(() => {
+      if (this.isAlive()) this.child.kill('SIGKILL');
+    }, this.options.cancelTerminateGraceMs ?? CANCEL_TERMINATE_GRACE_MS);
+    this.cancelForceKill.unref?.();
+    return this.lastError;
+  }
+
+  private recordCompaction(update: CompactionNotification): void {
+    if (this.closing || this.cancelRecoveryReason || !this.isAlive()) return;
+    const sessionId = this.expectedCompactionSessionId ?? this.sessionId;
+    if (!sessionId) {
+      if (this.pendingCompactions.length >= 64) {
+        this.recoverRpcFailure(undefined, 'compaction state capacity exceeded');
+        return;
+      }
+      this.pendingCompactions.push(update);
+      return;
+    }
+    const result = this.compactions.observe(update, { sessionId, mode: this.replaying ? 'replay' : 'live' });
+    if (result.recoveryRequired) {
+      this.recoverRpcFailure(undefined, 'compaction state capacity exceeded');
+      return;
+    }
+    if (!result.event) return;
+    this.recordCompactionEvent(result.event);
+    if (this.compactions.activeIds().length > 0 && !this.compactionBoundary) {
+      let resolve!: () => void;
+      const promise = new Promise<void>(done => { resolve = done; });
+      this.compactionBoundary = { promise, resolve };
+    } else if (this.compactions.activeIds().length === 0) {
+      this.compactionBoundary?.resolve();
+      this.compactionBoundary = undefined;
+    }
+  }
+
+  private recordCompactionEvent(event: CompactionLifecycleEvent): void {
+    this.conversation.appendSafe({
+      kind: 'compaction.updated', sessionGeneration: this.sessionGeneration,
+      acpSessionId: event.sessionId,
+      ...(this.activeTurn ? { promptId: this.activeTurn.id, turnId: this.activeTurn.id } : {}),
+      source: event.replayed ? 'agent_replay' : 'agent', payload: event,
+    });
+    if (!event.replayed) {
+      this.lastUpdateAt = new Date().toISOString();
+      this.events.emit('compaction', { compactionId: event.compactionId, status: event.status,
+        turnId: this.activeTurn?.id, origin: this.activeTurn?.origin });
+    }
+  }
+
+  private endCompactions(): CompactionLifecycleEvent[] {
+    const ended = this.compactions.endTurn();
+    for (const event of ended) this.recordCompactionEvent(event);
+    this.compactionBoundary?.resolve();
+    this.compactionBoundary = undefined;
+    return ended;
+  }
+
   private async steerPrompt(text: string): Promise<TurnResult> {
     this.steeringWasUsed = true;
-    if (!this.sessionId || !this.isAlive())
+    if (this.stallBoundaryBlocked || this.transportClosure || this.cancelRecoveryReason || !this.sessionId || !this.isAlive())
       return turnResult(false, 'failed', this.lastError ?? 'ACP session is offline');
     this.steeringRequests++;
     try {
@@ -1569,7 +1776,9 @@ export class AcpSession implements AgentSession {
       if (response.outcome === 'startedNewTurn') this.holdSteeringOccupancy();
       return turnResult(true, 'inconclusive', response.outcome);
     } catch (error) {
-      const detail = (error as Error)?.message ?? String(error);
+      if (this.transportClosure) await this.transportClosure;
+      const detail = this.cancelRecoveryReason || !this.isAlive()
+        ? this.lastError ?? 'ACP session is offline' : this.recoverRpcFailure(error);
       this.lastError = detail;
       this.events.emit('error', { text: detail });
       return turnResult(false, 'failed', detail);
@@ -1577,6 +1786,8 @@ export class AcpSession implements AgentSession {
   }
 
   private requestPermission(params: acp.RequestPermissionRequest): Promise<acp.RequestPermissionResponse> {
+    if (this.stallBoundaryBlocked || this.cancelRecoveryReason || this.closing)
+      return Promise.resolve({ outcome: { outcome: 'cancelled' } });
     // `kinds` is a PRIORITY order. Scanning the agent's option array instead
     // (`options.find(o => kinds.includes(o.kind))`) hands the choice to whatever
     // order the agent happened to list, which is exactly how an automatic denial
@@ -1950,12 +2161,8 @@ export class AcpSession implements AgentSession {
   // ── conversation ledger access (AgentSession) ─────────────────────────────
 
   conversationPage(request: { after?: string; limit?: number } = {}): ConversationHandlePage {
-    const floor = Number(this.conversationStartCursor ?? 0);
     const requested = Number(request.after ?? 0);
-    let after = String(Math.max(
-      Number.isSafeInteger(floor) ? floor : 0,
-      Number.isSafeInteger(requested) ? requested : 0,
-    ));
+    let after = String(Number.isSafeInteger(requested) ? requested : 0);
     const limit = Math.min(Math.max(request.limit ?? 200, 1), 1_000);
     let page = this.conversation.page({ after, limit });
     let visible = page.events.filter(event => this.isCurrentConversationEvent(event));
@@ -1977,7 +2184,8 @@ export class AcpSession implements AgentSession {
   conversationSnapshot(): ConversationSnapshot {
     return {
       sessionGeneration: this.sessionGeneration,
-      readiness: this.isAlive() ? this.readiness : 'offline',
+      readiness: this.isAlive() ? this.snapshot().readiness : 'offline',
+      activeCompactionIds: this.compactions.activeIds(),
       queueDepth: this.queueDepth,
       pendingPermissionIds: [...this.pendingPermissions.keys()],
       ...(this.conversation.degraded ? { historyDegraded: true } : {}),
@@ -1991,6 +2199,10 @@ export class AcpSession implements AgentSession {
   }
 
   private isCurrentConversationEvent(event: ConversationEventV1): boolean {
+    if (event.kind === 'compaction.updated') {
+      const payload = event.payload as { sessionId?: string };
+      return !!this.sessionId && event.acpSessionId === this.sessionId && payload.sessionId === this.sessionId;
+    }
     return event.sessionGeneration === this.sessionGeneration && event.source !== 'agent_replay';
   }
 

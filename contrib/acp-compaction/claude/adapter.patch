@@ -1,0 +1,476 @@
+diff --git a/docs/compaction-lifecycle.md b/docs/compaction-lifecycle.md
+new file mode 100644
+index 0000000..4bacfd0
+--- /dev/null
++++ b/docs/compaction-lifecycle.md
+@@ -0,0 +1,38 @@
++# Negotiated compaction lifecycle
++
++ACP v1 clients opt in with `clientCapabilities.session.compaction: {}`. Using
++SDK 1.4.0's public typed session update, the adapter maps runtime compacting
++status to `in_progress`, explicit success or compact boundary to `completed`,
++and explicit compact failure to `failed`. The opening runtime UUID identifies
++the lifecycle; terminal-only updates use the terminal UUID. Duplicate terminal
++statuses and boundary enrichment are quiet; only an unseen start UUID opens a
++new ID. Structured IDs stay fenced across turn resets, including unresolved
++starts, so replay cannot reopen an old entity or change its terminal outcome.
++Observed terminal-message UUIDs are fenced as aliases of the owning compaction,
++including duplicate statuses and boundary enrichment observed before the next
++start. Aliases consume the same bounded ID capacity. Their replay cannot close a
++later compaction. A never-observed UUID cannot be correlated to a previous
++attempt solely from this SDK stream; no such coverage is claimed.
++The consumer retains at most 1,024 IDs and never evicts them. At capacity, it
++suppresses new lifecycle entities and emits one body-free diagnostic warning;
++existing active entities can still terminalize. Summary/result suppression stays
++active even when lifecycle visibility has stopped. Replace the consumer to
++restore visibility; cancellation and coverage policy are unchanged.
++
++Unsupported, null, or malformed capabilities retain the existing synthetic tool
++lifecycle. The negotiated path sends no summary or raw error/metadata payload.
++The existing narrow suppression of duplicated runtime compaction output stays
++in place; arbitrary assistant text is not classified as lifecycle state.
++
++The proposed `agentCapabilities._meta["ai.ours/compactionSafety"]` advertises
++`version: 1`, `lifecycle: "completion_only"`, and `guardedCancel: false`.
++Complete start coverage and mutation-safe failure/cancellation coverage are not
++proven. A stream abort/reset does not fabricate successful completion or a safe
++cancelled terminal. Consumers reconcile unresolved starts after prompt failure
++or transport loss, and queue automatic messages until a usable prompt boundary.
++
++This patch targets adapter `4deace40379a62eb642559454930af4c590b3d49`
++(package 0.76.0), ACP SDK 1.4.0, and Claude Agent SDK 0.3.257. Deterministic tests
++exercise the real lifecycle and adapter prompt/status routing plus legacy
++regressions; they do not force live manual/automatic compaction or establish v2
++or complete runtime conformance.
+diff --git a/src/acp-agent.ts b/src/acp-agent.ts
+index f8700c5..b7d35e0 100644
+--- a/src/acp-agent.ts
++++ b/src/acp-agent.ts
+@@ -2072,6 +2072,13 @@ export class ClaudeAcpAgent {
+       protocolVersion: 1,
+       agentCapabilities: {
+         _meta: {
++          // Runtime starts are not proven on every automatic/manual path. Stream
++          // loss can leave a start without a safe terminal; clients must reconcile.
++          "ai.ours/compactionSafety": {
++            version: 1,
++            lifecycle: "completion_only",
++            guardedCancel: false,
++          },
+           claudeCode: {
+             promptQueueing: true,
+           },
+@@ -3173,7 +3180,14 @@ export class ClaudeAcpAgent {
+       async (notification) => this.client.sessionUpdate(asSdkSessionNotification(notification)),
+     ));
+ 
+-    const compaction = new ContextCompactionLifecycle((notification) => sendUpdate(notification));
++    const compaction = new ContextCompactionLifecycle(
++      (notification) => sendUpdate(notification),
++      this.clientCapabilities,
++      (message) => {
++        if (this.logger.warn) this.logger.warn(message);
++        else this.logger.error(message);
++      },
++    );
+     const sendUpdate = async (notification: AcpSessionNotification) => {
+       const { update } = notification;
+       const claudeMeta = update._meta?.claudeCode as
+diff --git a/src/context-compaction.test.ts b/src/context-compaction.test.ts
+new file mode 100644
+index 0000000..cd31f78
+--- /dev/null
++++ b/src/context-compaction.test.ts
+@@ -0,0 +1,194 @@
++import { describe, expect, it } from "vitest";
++import { ClientCapabilities, SessionNotification } from "@agentclientprotocol/sdk";
++import { ContextCompactionLifecycle } from "./context-compaction.js";
++
++function fixture(capabilities?: ClientCapabilities) {
++  const updates: SessionNotification[] = [];
++  const warnings: string[] = [];
++  const lifecycle = new ContextCompactionLifecycle(
++    async (update) => {
++      updates.push(update);
++    },
++    capabilities,
++    (message) => {
++      warnings.push(message);
++    },
++  );
++  return { updates, lifecycle, warnings };
++}
++
++describe("negotiated compaction lifecycle", () => {
++  it("emits one ID-addressed start and terminal without tool or summary payload", async () => {
++    const { updates, lifecycle } = fixture({ session: { compaction: {} } });
++    await lifecycle.start("s", "first");
++    await lifecycle.start("s", "duplicate");
++    await lifecycle.heartbeat("s", "heartbeat");
++    await lifecycle.finish("s", "terminal", "completed", { preTokens: 100 });
++    await lifecycle.finish("s", "boundary", "completed", { postTokens: 20 }, true);
++    expect(updates).toEqual([
++      {
++        sessionId: "s",
++        update: {
++          sessionUpdate: "compaction_update",
++          compactionId: "first",
++          status: "in_progress",
++        },
++      },
++      {
++        sessionId: "s",
++        update: { sessionUpdate: "compaction_update", compactionId: "first", status: "completed" },
++      },
++    ]);
++  });
++  it("allows terminal-only failure, redacts diagnostics, and opens a new attempt", async () => {
++    const { updates, lifecycle } = fixture({ session: { compaction: {} } });
++    await lifecycle.finish("s", "orphan", "failed", { error: "private context" });
++    await lifecycle.finish("s", "duplicate", "completed");
++    await lifecycle.start("s", "retry");
++    await lifecycle.finish("s", "done", "completed");
++    expect(updates.map(({ update }) => update)).toEqual([
++      { sessionUpdate: "compaction_update", compactionId: "orphan", status: "failed" },
++      { sessionUpdate: "compaction_update", compactionId: "retry", status: "in_progress" },
++      { sessionUpdate: "compaction_update", compactionId: "retry", status: "completed" },
++    ]);
++    expect(JSON.stringify(updates)).not.toContain("private context");
++  });
++  it.each([
++    undefined,
++    {},
++    { session: {} },
++    { session: { compaction: null } },
++    { session: { compaction: false } },
++    { session: { compaction: [] } },
++  ])("keeps legacy output for unsupported capability %j", async (capability) => {
++    const { updates, lifecycle } = fixture(capability as ClientCapabilities);
++    await lifecycle.start("s", "c");
++    await lifecycle.finish("s", "c", "completed");
++    expect(updates.map(({ update }) => update.sessionUpdate)).toEqual([
++      "tool_call",
++      "tool_call_update",
++    ]);
++  });
++  it("does not manufacture a successful terminal when a stream is reset", async () => {
++    const { updates, lifecycle } = fixture({ session: { compaction: {} } });
++    await lifecycle.start("s", "c");
++    lifecycle.reset();
++    expect(updates.map(({ update }) => update.sessionUpdate)).toEqual(["compaction_update"]);
++  });
++  it("fences terminal IDs against duplicate starts while allowing a distinct retry", async () => {
++    const { updates, lifecycle } = fixture({ session: { compaction: {} } });
++    await lifecycle.start("s", "attempt-1");
++    await lifecycle.finish("s", "attempt-1", "completed");
++    await lifecycle.start("s", "attempt-1");
++    await lifecycle.finish("s", "attempt-1", "failed");
++    await lifecycle.start("s", "attempt-2");
++    await lifecycle.finish("s", "attempt-2", "failed");
++    expect(updates.map(({ update }) => update)).toEqual([
++      { sessionUpdate: "compaction_update", compactionId: "attempt-1", status: "in_progress" },
++      { sessionUpdate: "compaction_update", compactionId: "attempt-1", status: "completed" },
++      { sessionUpdate: "compaction_update", compactionId: "attempt-2", status: "in_progress" },
++      { sessionUpdate: "compaction_update", compactionId: "attempt-2", status: "failed" },
++    ]);
++  });
++  it("retains ID fences across reset, including terminal-only and unresolved entities", async () => {
++    const { updates, lifecycle } = fixture({ session: { compaction: {} } });
++    await lifecycle.finish("s", "terminal-only", "completed");
++    lifecycle.reset();
++    await lifecycle.start("s", "terminal-only");
++    await lifecycle.finish("s", "terminal-only", "failed");
++    lifecycle.reset();
++    await lifecycle.start("s", "unresolved");
++    lifecycle.reset();
++    await lifecycle.start("s", "unresolved");
++    await lifecycle.finish("s", "unresolved", "completed");
++    expect(updates.map(({ update }) => update)).toEqual([
++      { sessionUpdate: "compaction_update", compactionId: "terminal-only", status: "completed" },
++      { sessionUpdate: "compaction_update", compactionId: "unresolved", status: "in_progress" },
++    ]);
++  });
++  it("fails closed when ID capacity is exhausted without evicting the oldest fence", async () => {
++    const { updates, lifecycle, warnings } = fixture({ session: { compaction: {} } });
++    for (let index = 0; index < 1024; index++) {
++      await lifecycle.start("s", `attempt-${index}`);
++      await lifecycle.finish("s", `attempt-${index}`, "completed");
++      lifecycle.reset();
++    }
++    expect(updates).toHaveLength(2048);
++    await lifecycle.start("s", "overflow");
++    await lifecycle.finish("s", "overflow", "failed");
++    lifecycle.reset();
++    await lifecycle.start("s", "attempt-0");
++    await lifecycle.finish("s", "attempt-0", "failed");
++    lifecycle.reset();
++    await lifecycle.finish("s", "terminal-overflow", "completed");
++    expect(updates).toHaveLength(2048);
++    expect(lifecycle.hasDeliveredOutput).toBe(true);
++    expect(warnings).toEqual([
++      "Compaction lifecycle ID capacity reached; suppressing additional lifecycle entities until the consumer is replaced.",
++    ]);
++  });
++  it("does not let a known stale terminal close a newer attempt", async () => {
++    const { updates, lifecycle } = fixture({ session: { compaction: {} } });
++    await lifecycle.start("s", "old");
++    await lifecycle.finish("s", "old", "completed");
++    await lifecycle.start("s", "new");
++    await lifecycle.start("s", "old");
++    await lifecycle.finish("s", "old", "failed");
++    await lifecycle.finish("s", "new", "completed");
++    expect(updates.map(({ update }) => update)).toEqual([
++      { sessionUpdate: "compaction_update", compactionId: "old", status: "in_progress" },
++      { sessionUpdate: "compaction_update", compactionId: "old", status: "completed" },
++      { sessionUpdate: "compaction_update", compactionId: "new", status: "in_progress" },
++      { sessionUpdate: "compaction_update", compactionId: "new", status: "completed" },
++    ]);
++  });
++  it.each(["failed", "completed"] as const)(
++    "fences a stale distinct terminal UUID with status %s",
++    async (status) => {
++      const { updates, lifecycle } = fixture({ session: { compaction: {} } });
++      await lifecycle.start("s", "start-1");
++      await lifecycle.finish("s", "terminal-1", "completed");
++      await lifecycle.start("s", "start-2");
++      await lifecycle.finish("s", "terminal-1", status);
++      expect(updates).toHaveLength(3);
++      await lifecycle.finish("s", "terminal-2", "completed");
++      expect(updates.map(({ update }) => update)).toEqual([
++        { sessionUpdate: "compaction_update", compactionId: "start-1", status: "in_progress" },
++        { sessionUpdate: "compaction_update", compactionId: "start-1", status: "completed" },
++        { sessionUpdate: "compaction_update", compactionId: "start-2", status: "in_progress" },
++        { sessionUpdate: "compaction_update", compactionId: "start-2", status: "completed" },
++      ]);
++    },
++  );
++  it("fences observed duplicate and enrichment UUID aliases across reset", async () => {
++    const { updates, lifecycle } = fixture({ session: { compaction: {} } });
++    await lifecycle.start("s", "start-1");
++    await lifecycle.finish("s", "terminal-1", "completed");
++    await lifecycle.finish("s", "duplicate-1", "completed");
++    await lifecycle.finish("s", "boundary-1", "completed", {}, true);
++    lifecycle.reset();
++    await lifecycle.start("s", "start-2");
++    await lifecycle.finish("s", "terminal-1", "failed");
++    await lifecycle.finish("s", "duplicate-1", "failed");
++    await lifecycle.finish("s", "boundary-1", "failed", {}, true);
++    expect(updates).toHaveLength(3);
++    await lifecycle.finish("s", "terminal-2", "completed");
++    lifecycle.reset();
++    await lifecycle.start("s", "terminal-1");
++    await lifecycle.start("s", "duplicate-1");
++    await lifecycle.start("s", "boundary-1");
++    expect(updates).toHaveLength(4);
++  });
++  it("counts distinct terminal aliases against bounded fence capacity", async () => {
++    const { updates, lifecycle, warnings } = fixture({ session: { compaction: {} } });
++    for (let index = 0; index < 512; index++) {
++      await lifecycle.start("s", `start-${index}`);
++      await lifecycle.finish("s", `terminal-${index}`, "completed");
++      lifecycle.reset();
++    }
++    await lifecycle.start("s", "overflow");
++    await lifecycle.finish("s", "overflow-terminal", "completed");
++    expect(updates).toHaveLength(1024);
++    expect(warnings).toHaveLength(1);
++  });
++});
+diff --git a/src/context-compaction.ts b/src/context-compaction.ts
+index 1f5e1dc..157a5dc 100644
+--- a/src/context-compaction.ts
++++ b/src/context-compaction.ts
+@@ -1,4 +1,4 @@
+-import { SessionNotification } from "@agentclientprotocol/sdk";
++import { ClientCapabilities, SessionNotification } from "@agentclientprotocol/sdk";
+ import {
+   ContextCompactionMetadata,
+   createContextCompactionMeta,
+@@ -12,6 +12,8 @@ type CompactionState = {
+   heartbeatSent: boolean;
+ };
+ 
++const MAX_STRUCTURED_COMPACTION_IDS = 1024;
++
+ type SendUpdate = (notification: SessionNotification) => Promise<void>;
+ 
+ /**
+@@ -19,15 +21,29 @@ type SendUpdate = (notification: SessionNotification) => Promise<void>;
+  *
+  * The SDK can duplicate terminal compact_result messages and can omit the
+  * opening status on replay. State therefore lives until the owning turn's
+- * result (or abort), while a new compacting status after a terminal outcome
+- * starts a fresh lifecycle.
++ * result (or abort), while a new compacting UUID after a terminal outcome
++ * starts a fresh lifecycle. Structured IDs remain fenced across turn resets.
+  */
+ export class ContextCompactionLifecycle {
+   private activeCompaction: CompactionState | undefined;
+   private outputDelivered = false;
+   private duplicateErrorOutput: string | undefined;
+ 
+-  constructor(private readonly sendUpdate: SendUpdate) {}
++  private readonly structured: boolean;
++  // Retain IDs across turn resets: replay must never reopen an emitted entity.
++  // No eviction: at capacity visibility stops instead of recycling old IDs.
++  private readonly structuredIds = new Set<string>();
++  private capacityWarningSent = false;
++
++  constructor(
++    private readonly sendUpdate: SendUpdate,
++    capabilities?: ClientCapabilities,
++    private readonly warn: (message: string) => void = () => {},
++  ) {
++    const capability = capabilities?.session?.compaction;
++    this.structured =
++      capability !== null && typeof capability === "object" && !Array.isArray(capability);
++  }
+ 
+   get hasDeliveredOutput(): boolean {
+     return this.outputDelivered;
+@@ -55,13 +71,44 @@ export class ContextCompactionLifecycle {
+     return true;
+   }
+ 
+-  async start(sessionId: string, toolCallId: string): Promise<CompactionState> {
++  private claimStructuredId(sessionId: string, compactionId: string): boolean {
++    // Also suppress the SDK's result-summary output when an entity is fenced.
++    this.outputDelivered = true;
++    const key = JSON.stringify([sessionId, compactionId]);
++    if (this.structuredIds.has(key)) return false;
++    if (this.structuredIds.size >= MAX_STRUCTURED_COMPACTION_IDS) {
++      if (!this.capacityWarningSent) {
++        this.capacityWarningSent = true;
++        this.warn(
++          "Compaction lifecycle ID capacity reached; suppressing additional lifecycle entities until the consumer is replaced.",
++        );
++      }
++      return false;
++    }
++    this.structuredIds.add(key);
++    return true;
++  }
++
++  async start(sessionId: string, toolCallId: string): Promise<CompactionState | undefined> {
+     if (this.activeCompaction && !this.activeCompaction.terminalStatus) {
+       return this.activeCompaction;
+     }
+ 
++    if (this.structured && !this.claimStructuredId(sessionId, toolCallId)) return;
++
+     this.activeCompaction = { toolCallId, heartbeatSent: false };
+     this.outputDelivered = true;
++    if (this.structured) {
++      await this.sendUpdate({
++        sessionId,
++        update: {
++          sessionUpdate: "compaction_update",
++          compactionId: toolCallId,
++          status: "in_progress",
++        },
++      });
++      return this.activeCompaction;
++    }
+     await this.sendUpdate({
+       sessionId,
+       update: {
+@@ -78,9 +125,10 @@ export class ContextCompactionLifecycle {
+ 
+   async heartbeat(sessionId: string, fallbackId: string): Promise<void> {
+     const state = this.activeCompaction ?? (await this.start(sessionId, fallbackId));
+-    if (state.terminalStatus || state.heartbeatSent) return;
++    if (!state || state.terminalStatus || state.heartbeatSent) return;
+ 
+     state.heartbeatSent = true;
++    if (this.structured) return;
+     await this.sendUpdate({
+       sessionId,
+       update: {
+@@ -99,6 +147,41 @@ export class ContextCompactionLifecycle {
+     metadata: Omit<ContextCompactionMetadata, "version"> = {},
+     enrichTerminal = false,
+   ): Promise<void> {
++    if (this.structured) {
++      if (this.activeCompaction?.terminalStatus) {
++        // SDK statuses and boundary enrichment have their own message UUIDs.
++        // Remember every observed alias while this terminal entity still owns them.
++        this.claimStructuredId(sessionId, fallbackId);
++        return;
++      }
++      if (
++        this.activeCompaction &&
++        fallbackId !== this.activeCompaction.toolCallId &&
++        this.structuredIds.has(JSON.stringify([sessionId, fallbackId]))
++      )
++        return;
++      if (!this.activeCompaction && !this.claimStructuredId(sessionId, fallbackId)) return;
++      if (this.activeCompaction) {
++        // A distinct terminal UUID must not be able to close a later attempt.
++        // At capacity, finish the existing entity; new entities are already blocked.
++        this.claimStructuredId(sessionId, fallbackId);
++      }
++      const state = this.activeCompaction ?? { toolCallId: fallbackId, heartbeatSent: false };
++      state.terminalStatus = status;
++      this.activeCompaction = state;
++      this.outputDelivered = true;
++      if (status === "failed" && metadata.error) this.duplicateErrorOutput = metadata.error;
++      // Runtime diagnostics may contain context. Lifecycle carries no summary or raw error.
++      await this.sendUpdate({
++        sessionId,
++        update: {
++          sessionUpdate: "compaction_update",
++          compactionId: state.toolCallId,
++          status,
++        },
++      });
++      return;
++    }
+     const rawOutput = Object.keys(metadata).length > 0 ? metadata : undefined;
+     if (!this.activeCompaction) {
+       this.activeCompaction = {
+diff --git a/src/tests/acp-agent.test.ts b/src/tests/acp-agent.test.ts
+index 89638d6..ac36855 100644
+--- a/src/tests/acp-agent.test.ts
++++ b/src/tests/acp-agent.test.ts
+@@ -10985,6 +10985,41 @@ describe("assembled assistant text fallback", () => {
+     });
+   });
+ 
++  it("routes negotiated runtime compaction statuses as draft updates", async () => {
++    const { agent, updates } = createMockAgentWithCapture();
++    agent.clientCapabilities = { session: { compaction: {} } };
++    injectSession(agent, [
++      {
++        type: "system",
++        subtype: "status",
++        status: "compacting",
++        uuid: "compact-start",
++        session_id: "test-session",
++      },
++      {
++        type: "system",
++        subtype: "status",
++        status: null,
++        compact_result: "success",
++        uuid: "compact-done",
++        session_id: "test-session",
++      },
++      replayedResult("hidden summary"),
++      idle,
++    ]);
++    await agent.prompt({ sessionId: "test-session", prompt: [{ type: "text", text: "/compact" }] });
++    expect(
++      updates
++        .filter(({ update }) => update.sessionUpdate === "compaction_update")
++        .map(({ update }) => update),
++    ).toEqual([
++      { sessionUpdate: "compaction_update", compactionId: "compact-start", status: "in_progress" },
++      { sessionUpdate: "compaction_update", compactionId: "compact-start", status: "completed" },
++    ]);
++    expect(messageChunkTexts(updates)).toEqual([]);
++    expect(updates.some(({ update }) => update.sessionUpdate === "tool_call")).toBe(false);
++  });
++
+   it("emits one compaction tool lifecycle and ignores duplicate terminal status", async () => {
+     const { agent, updates } = createMockAgentWithCapture();
+     injectSession(agent, [

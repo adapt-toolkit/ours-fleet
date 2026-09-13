@@ -562,7 +562,7 @@ describe('owner channel daemon-generation recovery', () => {
 
 function liveSetup(options: {
   interrupt?: boolean; progressIntervalMs?: number; owners?: string[];
-  comments?: boolean; stateDir?: string; backend?: string;
+  comments?: boolean; compactionNotices?: boolean; stateDir?: string; backend?: string;
 } = {}) {
   const dir = options.stateDir ?? mkdtempSync(join(tmpdir(), 'ours-owner-channel-'));
   if (!options.stateDir) dirs.push(dir);
@@ -582,7 +582,7 @@ function liveSetup(options: {
   });
   const session = {
     backend: options.backend ?? 'acp', pid: 1, isAlive: () => true,
-    snapshot: () => ({ backend: 'acp', alive: true, readiness: 'running' }),
+    snapshot: () => ({ backend: 'acp', alive: true, readiness: 'running', sessionId: 'test-session' }),
     queuePrompt, interrupt,
     eventsSince: (seq: number) => events.filter(event => event.seq > seq),
     subscribe: (listener: (event: SessionEvent) => void) => {
@@ -598,6 +598,7 @@ function liveSetup(options: {
       interrupt: options.interrupt ?? true,
       progress_interval_ms: options.progressIntervalMs ?? 0,
       ...(options.comments === undefined ? {} : { comments: options.comments }),
+      ...(options.compactionNotices === undefined ? {} : { compaction_notices: options.compactionNotices }),
     },
     session, stateDir: dir, client, log: () => undefined,
   });
@@ -745,18 +746,17 @@ describe('OwnerChannel', () => {
     });
   });
 
-  it('acknowledges an interrupting request by explaining the previous task was interrupted', async () => {
+  it('queues ordinary owner input without preemption even when interrupt is configured', async () => {
     const { channel, client, queuePrompt } = setup([{
       msg_id: 13, wire_id: 'wire-preempt', from: { id: OWNER_CID }, text: 'Right now please',
     }], undefined, { interrupt: true });
     await channel.drain();
     expect(queuePrompt.mock.calls[0][1]).toMatchObject({
-      interrupt: true, interruptSource: 'owner', origin: { kind: 'owner' },
+      interrupt: false, origin: { kind: 'owner' },
     });
     expect(client.calls.find(call => call.name === 'sendMessage')?.args).toEqual({
       contact: OWNER_CID,
-      text: "ℹ️ Message received. The agent's previous task was interrupted to prioritize "
-        + 'this request, and it is now working on a response. '
+      text: 'ℹ️ Message received. The agent has started working on this request now. '
         + 'The response will arrive in this channel when ready.',
       replyToWireId: 'wire-preempt',
     });
@@ -842,6 +842,53 @@ describe('OwnerChannel', () => {
       .toContain('wire-after-stubborn-turn');
     expect(recovery.client.calls.some(call => call.name === 'sendMessage')).toBe(false);
     expect(existsSync(join(recovery.dir, '.owner-channel-state.json'))).toBe(false);
+  });
+
+  it.each(['ACP_SESSION_RECOVERY_REQUIRED', 'ACP_STALL_OPERATOR_REQUIRED'])(
+    'retains an owner wire during recovery or operator hold without retrying (%s)', async reason => {
+    const held = setup([ownerMessage(51, 'wire-rpc-recovery', 'private owner body')]);
+    held.queuePrompt.mockRejectedValueOnce(new SessionControlError(
+      'control-unavailable', 'body-free reason', reason));
+    await held.channel.drain();
+    await held.channel.drain();
+    expect(held.queuePrompt).toHaveBeenCalledTimes(1);
+    expect(existsSync(join(held.dir, '.owner-channel-state.json'))).toBe(false);
+    expect(held.client.calls.filter(call => call.name === 'sendMessage')).toHaveLength(0);
+    const journal = readFileSync(join(held.dir, '.owner-channel-message-recovery.json'), 'utf8');
+    expect(journal).toContain('wire-rpc-recovery');
+    expect(journal).not.toContain('private owner body');
+  });
+
+  it('replays proven unstarted owner work in a new generation without treating it as a terminal failure', async () => {
+    const turn = deferredTurn();
+    const held = setup([ownerMessage(52, 'wire-unstarted', 'private pending body')]);
+    held.queuePrompt.mockResolvedValueOnce({ promptId: 'queued', queuedBehind: 1, completion: turn.completion });
+    await held.channel.drain();
+    turn.resolve({ accepted: false, outcome: 'failed', succeeded: false,
+      detail: 'ACP_PROMPT_NOT_DISPATCHED: ACP_SESSION_RECOVERY_REQUIRED: RPC failed (code -32603)' });
+    await new Promise(resolve => setTimeout(resolve, 30));
+    await held.channel.drain();
+    expect(held.queuePrompt).toHaveBeenCalledTimes(1);
+    expect(existsSync(join(held.dir, '.owner-channel-state.json'))).toBe(false);
+    expect(held.client.calls.filter(call => call.name === 'sendMessage')).toHaveLength(1);
+    const resumed = setup([], undefined, { stateDir: held.dir });
+    resumed.client.history = held.client.history;
+    await resumed.channel.drain();
+    await vi.waitFor(() => expect(resumed.client.calls.some(call =>
+      call.name === 'sendMessage' && call.args?.text === 'Agent answer')).toBe(true));
+    await resumed.channel.drain();
+    expect(resumed.queuePrompt).toHaveBeenCalledTimes(1);
+  });
+
+  it('does not replay an owner request that was dispatched before the RPC error', async () => {
+    const held = setup([ownerMessage(53, 'wire-uncertain', 'side effect')], {
+      accepted: false, outcome: 'failed', succeeded: false,
+      detail: 'ACP_SESSION_RECOVERY_REQUIRED: RPC failed (code -32603)',
+    } as TurnResult);
+    await held.channel.drain();
+    await vi.waitFor(() => expect(held.client.calls.filter(call => call.name === 'sendMessage')).toHaveLength(2));
+    await held.channel.drain();
+    expect(held.queuePrompt).toHaveBeenCalledTimes(1);
   });
 
   it('uses precise, redacted terminal notices for every non-text outcome', async () => {
@@ -938,7 +985,7 @@ describe('OwnerChannel', () => {
     }));
   });
 
-  it('delivers a later interrupting owner message while the prior one is unresolved', async () => {
+  it('admits later owner input without cancelling the unresolved prior request', async () => {
     const firstTurn = deferredTurn();
     const secondTurn = deferredTurn();
     const first = {
@@ -959,7 +1006,7 @@ describe('OwnerChannel', () => {
     expect(queuePrompt).toHaveBeenCalledTimes(2);
     expect(queuePrompt.mock.calls[1][0]).toContain('New priority');
     expect(queuePrompt.mock.calls[1][1]).toMatchObject({
-      interrupt: true, interruptSource: 'owner', origin: { kind: 'owner' },
+      interrupt: false, origin: { kind: 'owner' },
     });
 
     firstTurn.resolve({ accepted: true, outcome: 'cancelled', succeeded: false });
@@ -1765,6 +1812,27 @@ describe('OwnerChannel notice presentation', () => {
     expect(spoof.startsWith(`${OWNER_COMMENT_LABEL} `)).toBe(true);
     expect(spoof.slice(OWNER_COMMENT_LABEL.length + 1))
       .toBe('🟡 Live update: not fleet-authored');
+  });
+
+  it('pushes opted-in compaction lifecycle only to the initiating owner', async () => {
+    vi.useFakeTimers();
+    const { channel, client, completions, emit } = liveSetup({ compactionNotices: true });
+    client.batches.push([ownerMessage(1, 'wire-compaction', 'Implement it')]);
+    await channel.drain();
+    const origin = { kind: 'owner' as const,
+      requestId: createHash('sha256').update('wire-compaction').digest('hex') };
+    emit({ kind: 'compaction', turnId: 'foreign', origin, compactionId: 'foreign', status: 'in_progress' });
+    emit({ kind: 'compaction', turnId: 'prompt-1', origin, compactionId: 'c1', status: 'in_progress', replayed: true });
+    emit({ kind: 'compaction', turnId: 'prompt-1', origin, compactionId: 'c1', status: 'in_progress' });
+    emit({ kind: 'compaction', turnId: 'prompt-1', origin, compactionId: 'c1', status: 'completed' });
+    emit({ kind: 'compaction', turnId: 'prompt-1', origin, compactionId: 'c1', status: 'completed' });
+    completions[0](done('Final answer'));
+    await vi.advanceTimersByTimeAsync(0);
+    const notices = client.calls.filter(call => call.name === 'sendMessage'
+      && /Compacting|Compaction done/.test(String(call.args?.text)));
+    expect(notices.map(call => call.args?.text)).toEqual(['Compacting the conversation…', 'Compaction done.']);
+    expect(notices.every(call => call.args?.contact === OWNER_CID && call.args?.replyToWireId === 'wire-compaction')).toBe(true);
+    await channel.close();
   });
 
   it('batches only correlated Codex commentary before the final and dedupes replay', async () => {

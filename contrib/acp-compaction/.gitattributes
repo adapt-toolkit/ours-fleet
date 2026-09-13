@@ -1,0 +1,4 @@
+# Unified-diff context lines intentionally contain one space for empty lines.
+*.patch whitespace=-blank-at-eol
+# Preserve the exact upstream metadata bytes used by the hash-pinned SDK wheel.
+python-sdk/packaging/baseline-dist-info/entry_points.txt whitespace=-blank-at-eof

@@ -748,28 +748,39 @@ ours-fleet falls back to a compatible globally installed \`codex-acp\` or
 \`monitor.mode\` selects exactly one wake owner:
 
 - \`fleet\` (default): the ours-fleet supervisor consumes body-free daemon
-  events and advances its durable cursor only after delivery is accepted. ACP
-  uses live steering when supported and falls back to structured
-  \`session/prompt\`.
+  events and advances its cursor after durable responsibility transfer. Automatic
+  wakes wait for prompt settlement without cancelling or steering active work.
 - \`native\`: ours-fleet starts no supervisor monitor; the generated briefing
   instructs Claude Code or Codex to arm its harness-native wake mechanism.
 
-Set \`monitor.interrupt: true\` in fleet mode to cancel active work before every
-configured wake. Set it to \`after_tool\` to preserve an active ACP tool (and any
-pending permission), then steer the wake at the first tool-terminal boundary
-without cancellation. A hung boundary is bounded at 120 seconds and falls back
-to non-cancelling steering/queueing; adapters without authenticated tool events
-use the same conservative fallback. Explicit human/control interrupts remain
-immediate. The policy is content-blind because the supervisor cannot inspect
-encrypted message bodies. Message bodies are released only when the role calls
-the ours \`get_messages\` tool.
+Automatic monitor wakes and ordinary owner text/attachments use queue-only delivery.
+Legacy \`monitor.interrupt: true\` and \`after_tool\` remain accepted, but cannot
+preempt generation or compaction without negotiated atomic cancellation safety.
+Explicit operator interrupt commands remain available.
 
-The default is \`false\`. For a temporary role whose mission intentionally arrives
-after its readiness announcement, set \`mode: fleet\` and \`interrupt: true\`
-explicitly. The readiness announcement does not change the transport: the
-mission remains ordinary ours mail, fleet injects only the body-free wake, and
-the role calls \`get_messages\` before acting. Every later configured wake uses
-the same interruption policy.
+The body-free \`.monitor-ingress.json\` journal separates durable admission from
+execution, deduplicates event keys and saves admitted cursor coverage. Queued hints
+resume after synchronized startup; uncertain dispatched work is never automatically
+replayed. Inspect source unread/history and effects before explicitly requesting a
+new wake. Keep the journal on rollback. Source-directory incarnation is a local
+filesystem fence, not CID authentication; missing/replaced source metadata stops
+old-source dispatch. Regressed notification cursors require stream reconciliation.
+
+Fleet consumes negotiated unstable ACP v1 compaction lifecycle updates and renders
+one timeline row per session/ID. Summaries are discarded; replay is historical,
+terminal-only events do not fabricate starts, and unknown statuses stay uncertain.
+Observed compaction defers ordinary Stop without a wire cancel or latent interrupt,
+and blocks prompt/steering dispatch. Missing terminal at prompt settlement requests
+bounded recovery with an unknown outcome. Automatic mail stays queue-only even if
+an adapter reports lifecycle events: consumer support is not complete coverage.
+No new cancellation RPC is used. Optional \`owner_channel.compaction_notices: true\`
+sends lifecycle notices only to the active request's authenticated initiating owner.
+Default is off. Durable outbox markers prevent duplicate phases and automatic retries
+after uncertain sends; replay and terminal-only history remain silent. Completion
+requires a confirmed live start notice, no summaries are forwarded, and at most
+eight attempts per owner request produce notices. Preserve the outbox on rollback;
+corruption or capacity exhaustion disables pushes pending reconciliation. Task-room
+broadcasts are not enabled by this option.
 
 Legacy \`monitor.enabled: true|false\` remains accepted as an alias for
 \`mode: fleet|native\`; use \`mode\` in new configuration. Codex's separate

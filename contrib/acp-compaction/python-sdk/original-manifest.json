@@ -1,0 +1,128 @@
+{
+  "source": "agent-client-protocol 0.9.0 distribution source snapshot",
+  "distribution_version": "0.9.0",
+  "files": {
+    "connection.py": {
+      "sha256": "e261425e0ba793ab49cb1d697a2a66731102ed23e0bdf3e4034c11e2b34a221c",
+      "bytes": 10634
+    },
+    "exceptions.py": {
+      "sha256": "da380ab81ec533bf72133dfe05bd9b45577ab344e95d64d31de69e27b2fdc065",
+      "bytes": 1549
+    },
+    "stdio.py": {
+      "sha256": "f353aa5f65d2cf25f35489c698ccb56adb7284b7af12a8d0e8dd85ed958aa023",
+      "bytes": 7119
+    },
+    "helpers.py": {
+      "sha256": "48b12a959116f041f07685471d828267c3e2ac126a9ae78e40298a813ef8e43a",
+      "bytes": 8026
+    },
+    "__init__.py": {
+      "sha256": "d93acd94e0d1a46c6e170b14ffa6f8d5d1c581a73c4ef6772f4cc21ee79dc84a",
+      "bytes": 4783
+    },
+    "interfaces.py": {
+      "sha256": "55e666f5525033787bcc39ad025a96d57605a7af081cc25bedcac7d4ce763372",
+      "bytes": 7375
+    },
+    "transports.py": {
+      "sha256": "9d672d1ef12c8a55e8771150b691a2d985264de4a94ddab46e3dd8f6896c8360",
+      "bytes": 3688
+    },
+    "router.py": {
+      "sha256": "9cf0700c009a6bd6918317a238558859e2f2c190198b36c66142827a6245c16a",
+      "bytes": 6383
+    },
+    "py.typed": {
+      "sha256": "159b8a557ec760020209c8c51141ca12abcd13a40327e78b74642901d44a5ce1",
+      "bytes": 71
+    },
+    "meta.py": {
+      "sha256": "1ef21d5171a2ab4f33f043bec92243fd20abde7310ca9fa4a91619ca03add099",
+      "bytes": 1090
+    },
+    "schema.py": {
+      "sha256": "a01630ca56505a42401d365cadea38ac59d0da9048843a52e7a9bb306a481bcd",
+      "bytes": 156351
+    },
+    "telemetry.py": {
+      "sha256": "1e6417fcd15fe21cdd68212516a3ad4fbac7ec69b530318afc9bca7f80745677",
+      "bytes": 1674
+    },
+    "core.py": {
+      "sha256": "b55dc32b80002e6728b777c709f403f4e04c2fe41f2400b4f143d17bd7bbcd80",
+      "bytes": 3322
+    },
+    "utils.py": {
+      "sha256": "95a43903c2835c893d6dfbb4dc20c44ffda796e7715f1ea60046f66a33108449",
+      "bytes": 9388
+    },
+    "client/connection.py": {
+      "sha256": "35927c719e5036dd1df909bcb0d0b8bdbd010d75c1b6a99dde3adb97ab949912",
+      "bytes": 9974
+    },
+    "client/__init__.py": {
+      "sha256": "4cc9ae4539f5c8d914ffb96d41dfc95fc4f2f4fd988490dd1c0ea01a7dd07eea",
+      "bytes": 81
+    },
+    "client/router.py": {
+      "sha256": "3a6339b77a243213897eef31ea29b1b7f0e4e8fc49435db38449a1c89761ce9f",
+      "bytes": 2885
+    },
+    "task/__init__.py": {
+      "sha256": "ce64fe5093c777b5a804026d4b4ba31675d15738f69deb7830a077199b35d4e5",
+      "bytes": 1020
+    },
+    "task/sender.py": {
+      "sha256": "0cb1a6c578d9aa1eb193d10c1cfefa27106cfb9325511b1dfafff1fd305a48d6",
+      "bytes": 2172
+    },
+    "task/state.py": {
+      "sha256": "a5d975d4ff5e8dbb06b825e6c94498d4fa4dc2413ff58aabcb8e01f54d642b93",
+      "bytes": 2693
+    },
+    "task/queue.py": {
+      "sha256": "bc2cb93a0133ddb176845d368d949e14fec2957165fefaae7acc372634f9348b",
+      "bytes": 1730
+    },
+    "task/dispatcher.py": {
+      "sha256": "efb2b1122665c4ece2228a5fcfc1caf23e21d9461f50240319d7efe12fbb3659",
+      "bytes": 3006
+    },
+    "task/supervisor.py": {
+      "sha256": "ae289178c0e8c7cff62cc62aa8d5b255b80fd52bf2546319b9bc1effb78bd91e",
+      "bytes": 2681
+    },
+    "agent/connection.py": {
+      "sha256": "42a1af6523074d088224192e23ffed65145884fbc3f996803322c002d3075035",
+      "bytes": 7799
+    },
+    "agent/__init__.py": {
+      "sha256": "500c25f8662f0989f91cb5aca607c3a69047612926d5193483aad819374fc188",
+      "bytes": 79
+    },
+    "agent/router.py": {
+      "sha256": "4f1fbc1c702884acae6227f678f5bd3d778fcb0ef3926defcf8ca593d3a34c12",
+      "bytes": 4332
+    },
+    "contrib/__init__.py": {
+      "sha256": "0c87748b378303ec5f9fc2496b13d9f62ea2a9a56f46a4f338482df47873d629",
+      "bytes": 907
+    },
+    "contrib/session_state.py": {
+      "sha256": "7eaf980f8b2157337898478bccf7adbc6efe0fcd41a77ce96f61672c5a910086",
+      "bytes": 10022
+    },
+    "contrib/tool_calls.py": {
+      "sha256": "084c6f4f8d592d7cd59983ec824329c69b64d593f744e447302658a3ec2af334",
+      "bytes": 8828
+    },
+    "contrib/permissions.py": {
+      "sha256": "b21f3c42d750e3d6af98f31141c54425be86449d66267e8ab678398c5794c7a3",
+      "bytes": 3402
+    }
+  },
+  "upstream_repository": "https://github.com/agentclientprotocol/python-sdk",
+  "upstream_git_revision": null
+}

@@ -107,9 +107,9 @@ export class SessionControlError extends Error {
  * that had already done exactly what was asked.
  */
 export interface InterruptOutcome {
-  /** `settled` — the turn (or nothing) ended cooperatively. `forced` — the adapter ignored the cancel and was restarted. */
-  state: 'settled' | 'forced';
-  /** Stable body-free reason present only for a forced recovery. */
+  /** `deferred` sends no cancellation and installs no later interrupt. */
+  state: 'settled' | 'forced' | 'deferred';
+  /** Stable body-free reason for forced recovery or compaction deferral. */
   reasonCode?: string;
 }
 
@@ -236,6 +236,8 @@ export interface SubmitPromptOptions {
 }
 
 export interface SessionSnapshot {
+  /** Observed live compaction only; absence is not a coverage guarantee. */
+  activeCompactionIds?: string[];
   backend: SessionBackendId;
   alive: boolean;
   readiness: SessionReadiness;
@@ -307,6 +309,7 @@ export function sessionBackendCapabilities(
 }
 
 export type SessionEventKind =
+  | 'compaction'
   | 'state'
   | 'agent_text'
   | 'thought'
@@ -322,6 +325,7 @@ export type SessionEventKind =
 export type PermissionDecision = 'allowed' | 'denied' | 'cancelled';
 
 export interface SessionEvent {
+  compactionId?: string;
   version: 1;
   seq: number;
   at: string;

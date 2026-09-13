@@ -340,7 +340,9 @@ export const ownerCommands: OwnerCommand[] = [
       // forced recovery stopped the turn: say so, and say it plainly.
       try { outcome = await ctx.interrupt(); }
       catch { return ctx.reply(ownerNotices.interruptFailed(ctx.role)); }
-      await ctx.reply(outcome?.state === 'forced'
+      await ctx.reply(outcome?.state === 'deferred'
+        ? ownerNotices.interruptDeferred(ctx.role)
+        : outcome?.state === 'forced'
         ? ownerNotices.interruptForced(ctx.role)
         : ownerNotices.interrupted(ctx.role));
     }),

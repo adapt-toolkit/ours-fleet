@@ -18,6 +18,7 @@ export type ConversationEventKind =
   | 'permission.requested' | 'permission.resolved'
   | 'monitor.delivery'
   | 'usage.updated'
+  | 'compaction.updated'
   | 'turn.state' | 'turn.completed'
   | 'session.state' | 'session.info' | 'capabilities.updated'
   | 'error'
@@ -259,7 +260,17 @@ export interface BoundedJson {
   redacted?: true;
 }
 
+export interface CompactionUpdatedPayload {
+  sessionId: string;
+  compactionId: string;
+  status: 'in_progress' | 'completed' | 'failed' | 'cancelled' | 'unknown' | 'unknown_ended';
+  /** Bounded opaque draft status for forward compatibility; never human-facing prose. */
+  wireStatus?: string;
+  replayed: boolean;
+}
+
 export type ConversationPayload =
+  | CompactionUpdatedPayload
   | MessageChunkPayload | ThoughtChunkPayload | PlanReplacePayload | ToolUpsertPayload
   | UsageUpdatedPayload | SessionStatePayload | SessionInfoPayload
   | CapabilitiesUpdatedPayload | UnsupportedPayload | PromptAdmittedPayload
@@ -329,6 +340,7 @@ export interface PermissionDecisionCommand {
 }
 
 export interface ConversationSnapshot {
+  activeCompactionIds?: string[];
   sessionGeneration: string;
   readiness: 'starting' | 'idle' | 'running' | 'awaiting_permission' | 'failed' | 'offline';
   queueDepth: number;

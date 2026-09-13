@@ -27,7 +27,7 @@ export interface ConversationFollowHandle {
  */
 export interface InterruptReceipt {
   accepted: true;
-  state: 'settled' | 'forced';
+  state: 'settled' | 'forced' | 'deferred';
   reasonCode?: string;
 }
 
@@ -121,7 +121,7 @@ export class RoleSessionControlAdapter implements RoleSessionControl {
     // A pre-0.17.1 role control server answers `interrupt` with no result body.
     return {
       accepted: true,
-      state: result?.state === 'forced' ? 'forced' : 'settled',
+      state: result?.state === 'deferred' ? 'deferred' : result?.state === 'forced' ? 'forced' : 'settled',
       ...(typeof result?.reasonCode === 'string' ? { reasonCode: result.reasonCode } : {}),
     };
   }
@@ -159,7 +159,7 @@ export class RoleSessionControlAdapter implements RoleSessionControl {
     return {
       ...receipt,
       accepted: true,
-      state: receipt.state === 'forced' ? 'forced' : 'settled',
+      state: receipt.state === 'deferred' ? 'deferred' : receipt.state === 'forced' ? 'forced' : 'settled',
       ...(typeof receipt.reasonCode === 'string' ? { reasonCode: receipt.reasonCode } : {}),
     };
   }
