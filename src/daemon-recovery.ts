@@ -1,8 +1,12 @@
 import { readFileSync, realpathSync } from 'node:fs';
 import { join, resolve } from 'node:path';
-import { createHash } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
+import {
+  attachOursClient, type AttachOursClientOptions, type OursClient,
+} from '@ours.network/sdk/client';
 
-import { resolveEndpoint, type FetchLike } from './monitor.js';
+import { readDaemonConfig, resolveEndpoint, type FetchLike } from './monitor.js';
+import { readClientProfile, type ExplicitClientProfile } from './client-profile.js';
 import { replaceFileAtomically } from './atomic-file.js';
 
 export const DAEMON_RECOVERY_MAX_ATTEMPTS = 6;
@@ -45,6 +49,9 @@ interface StartupProgress {
 interface GenerationProbeDeps {
   readText?(path: string): string;
   canonicalize?(path: string): string;
+  attachClient?(
+    options: AttachOursClientOptions,
+  ): Pick<OursClient, 'version' | 'identities' | 'close'> | Promise<Pick<OursClient, 'version' | 'identities' | 'close'>>;
 }
 
 function positiveInteger(value: unknown): value is number {
@@ -89,6 +96,8 @@ export async function probeDaemonGeneration(
   env: NodeJS.ProcessEnv,
   deps: GenerationProbeDeps = {},
 ): Promise<DaemonGenerationProbe> {
+  const profile = readClientProfile(env);
+  if (profile || env.OURS_DAEMON_ID) return probeSelectedDaemon(env, deps, profile);
   const endpoint = resolveEndpoint(env);
   let response;
   try {
@@ -172,6 +181,48 @@ export async function probeDaemonGeneration(
       stateDir: reportedStateDir,
     },
   };
+}
+
+/** Container selection uses public SDK reads; daemon paths/PIDs remain opaque metadata. */
+async function probeSelectedDaemon(
+  env: NodeJS.ProcessEnv,
+  deps: GenerationProbeDeps,
+  profile?: ExplicitClientProfile,
+): Promise<DaemonGenerationProbe> {
+  // Defer credential-file access to SDK selection, which checks the configured
+  // daemon identity/capability before it reads or sends the credential.
+  const endpoint = profile ? undefined : resolveEndpoint(env, false);
+  const token = profile ? undefined : env.OURS_API_TOKEN?.trim() || readDaemonConfig(env).apiToken;
+  let client: Pick<OursClient, 'version' | 'identities' | 'close'> | undefined;
+  try {
+    const options: AttachOursClientOptions = profile ? {
+      endpoint: profile.endpoint, expectedInstanceId: profile.expectedInstanceId,
+      credentialPath: profile.credentialPath,
+      sessionMode: 'external', leaseToken: randomUUID(), env: {},
+    } : {
+      endpoint: endpoint!.origin, expectedInstanceId: env.OURS_DAEMON_ID,
+      sessionMode: 'external', leaseToken: randomUUID(),
+      ...(token ? {token} : {credentialPath: join(endpoint!.stateDir, 'daemon-token')}),
+    };
+    client = await (deps.attachClient?.(options) ?? attachOursClient(options));
+    const info = await client.version({startup:true});
+    if (info.name !== 'ours' || !positiveInteger(info.pid)
+        || typeof info.stateDir !== 'string' || !info.stateDir)
+      return {state:'unavailable', reason:'DAEMON_INFO_INVALID'};
+    const progress = startupProgress(info.startup);
+    if (!progress) return {state:'unavailable', reason:'DAEMON_PROGRESS_INVALID'};
+    if (progress.phase !== 'ready') return {state:'unavailable', reason:'DAEMON_PROGRESS_NOT_READY'};
+    if (progress.pid !== info.pid) return {state:'unavailable', reason:'DAEMON_GENERATION_MISMATCH'};
+    const identities = await client.identities();
+    if (!Array.isArray(identities)) return {state:'unavailable', reason:'DAEMON_IDENTITIES_INVALID'};
+    if (!identities.length) return {state:'unavailable', reason:'DAEMON_IDENTITIES_NOT_READY'};
+    return {state:'ready', generation:{
+      bootId:progress.bootId, pid:progress.pid, startedAt:progress.startedAt, stateDir:info.stateDir,
+    }};
+  } catch {
+    // Failed selection, auth or transport is unavailable, never owner death.
+    return {state:'unavailable', reason:'DAEMON_SELECTED_PROBE_UNAVAILABLE'};
+  } finally { await client?.close(); }
 }
 
 export class DaemonGenerationObserver {

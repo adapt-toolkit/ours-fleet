@@ -1,6 +1,7 @@
-import { readFileSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { readdir, readFile } from 'node:fs/promises';
 import { dirname, extname, join, resolve } from 'node:path';
+import { tmpdir } from 'node:os';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { describe, expect, it, vi } from 'vitest';
 
@@ -39,6 +40,7 @@ function fakeSdkClient(overrides: Partial<Record<string, unknown>> = {}) {
     sendFile: record('sendFile', { kind: 'sent', wireId: 'w', filename: 'f', bytes: 1, mime: 'text/plain' }),
     fetchFile: record('fetchFile', new Uint8Array([1, 2, 3])),
     releaseLease: record('releaseLease', { released: ['Role-owner'] }),
+    close: record('close', undefined),
     ...overrides,
   };
   return client as typeof client & OursClient;
@@ -53,6 +55,30 @@ async function started(client: ReturnType<typeof fakeSdkClient>): Promise<OursSd
 }
 
 describe('OursSdkClient send verdicts', () => {
+  it('attaches the owner through the complete explicit client profile only', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'ours-fleet-owner-profile-'));
+    try {
+      const profilePath = join(dir, 'client.json');
+      const credentialPath = join(dir, 'daemon-token');
+      const expectedInstanceId = '329f491c-2a4d-41c4-9ecb-22c590d9a466';
+      writeFileSync(profilePath, JSON.stringify({
+        endpoint: 'http://127.0.0.1:43120', expectedInstanceId, credentialPath,
+      }), { mode: 0o600 });
+      const attached: AttachOursClientOptions[] = [];
+      const sdk = new OursSdkClient({ OURS_CONFIG: profilePath }, () => undefined, {
+        attachClient: options => { attached.push(options); return fakeSdkClient(); },
+      });
+
+      await sdk.start();
+      await sdk.close({ releaseLease: false });
+
+      expect(attached).toEqual([{
+        endpoint: 'http://127.0.0.1:43120', expectedInstanceId, credentialPath,
+        sessionMode: 'external', leaseToken: expect.stringMatching(/^ours-fleet-owner-/), env: {},
+      }]);
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+
   // The legacy connector turned exactly one message verdict into a tool error. The
   // SDK returns every verdict instead, so an adapter that forgot to re-raise
   // would book a refusal as a delivered owner message.
@@ -119,19 +145,38 @@ describe('OursSdkClient send verdicts', () => {
     });
     await sdk.close();
     expect(client.calls.some(call => call.name === 'releaseLease')).toBe(true);
-    // A second close is a no-op, and a shutdown must never fail on the release.
+    // A second close after successful terminal release is a no-op.
     await expect(sdk.close()).resolves.toBeUndefined();
   });
 
-  it('does not throw out of close when the lease release fails', async () => {
+  it('reports failed terminal release so channel shutdown cannot claim closed', async () => {
     const lines: string[] = [];
     const client = fakeSdkClient({
       releaseLease: async () => { throw new Error('daemon unreachable'); },
     });
     const sdk = new OursSdkClient({}, line => lines.push(line), { attachClient: () => client });
     await sdk.start();
-    await expect(sdk.close()).resolves.toBeUndefined();
+    await expect(sdk.close()).rejects.toThrow('daemon unreachable');
     expect(lines.some(line => line.includes('lease release failed'))).toBe(true);
+  });
+
+  it('retains terminal cleanup after a partial release and retries only on explicit close', async () => {
+    let attempts = 0;
+    const ownerIds: Array<string | undefined> = [];
+    const client = fakeSdkClient({
+      releaseLease: async () => ({ released: [], closed: [], attempted: 1,
+        notified: 0, failed: ++attempts === 1 ? 1 : 0 }),
+    });
+    const sdk = new OursSdkClient({}, () => undefined, {
+      attachClient: options => { ownerIds.push(options.leaseToken); return client; },
+    });
+    await sdk.start();
+    await expect(sdk.close()).rejects.toThrow(/incomplete/);
+    expect(attempts).toBe(1);
+    await sdk.close();
+    expect(attempts).toBe(2);
+    expect(ownerIds).toHaveLength(2);
+    expect(ownerIds[1]).toBe(ownerIds[0]);
   });
 
   // A refusal is relayed to the managed agent as `relayRefused(errorText)`, so
@@ -244,8 +289,8 @@ describe('owner-channel daemon dependency surface', () => {
   it('is pinned to the reviewed SDK version exactly', () => {
     const pkg = JSON.parse(readFileSync(join(REPO, 'package.json'), 'utf8'));
     const lock = JSON.parse(readFileSync(join(REPO, 'package-lock.json'), 'utf8'));
-    expect(pkg.dependencies['@ours.network/sdk']).toBe('3.7.0');
-    expect(lock.packages['node_modules/@ours.network/sdk'].version).toBe('3.7.0');
+    expect(pkg.dependencies['@ours.network/sdk']).toBe('3.7.2');
+    expect(lock.packages['node_modules/@ours.network/sdk'].version).toBe('3.7.2');
     expect(pkg.dependencies['@ours.network/cli']).toBe('1.0.1');
     expect(lock.packages['node_modules/@ours.network/cli'].version).toBe('1.0.1');
   });

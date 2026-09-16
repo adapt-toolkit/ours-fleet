@@ -510,6 +510,23 @@ obsolete, presence-sensitive `OURS_AUTOSTART` variable from ACP harness
 processes. `ours-mcp proxy` is client-only and never starts a daemon; operators and explicit
 installer/setup flows remain responsible for starting it.
 
+Fleet selects explicit `OURS_CONFIG` first, otherwise the managed
+`~/.ours-client/profile.json` when present. With a managed profile, ordinary
+`ours-fleet doctor` and `ours-fleet up` need no environment override. Invalid or
+unreadable managed profiles fail rather than select another daemon. If neither
+selection exists, the existing unmanaged behavior remains.
+
+The private profile names the daemon endpoint, retained instance UUID and host
+credential path; Fleet does not need the daemon state directory. An explicit
+override selects a new invocation without rewriting already installed service
+definitions. To select another profile explicitly:
+
+```sh
+export OURS_CONFIG=/absolute/private/ours/client.json
+ours-fleet doctor
+ours-fleet up
+```
+
 ### Rooms and tasks
 
 Init installs editable `single`, `pair`, and `team` definitions under
@@ -548,7 +565,26 @@ N, Enter, Escape, Ctrl-C, Ctrl-D, or EOF cancels. In a picker, Escape, Ctrl-C, C
 or EOF cancels; Enter records the highlighted choice (or continues a non-empty multi-select),
 N is ignored, and an empty subscription selection remains blocked. Every cancellation
 before the final Yes performs no host setup or config publication. Non-TTY use stops with
-the same zero-mutation guarantee. After the final Yes, host integration runs before locked
+the same zero-mutation guarantee unless `--settings PATH` supplies complete JSON answers.
+Prepared settings run without questions and use this strict shape (catalog model capabilities
+must match exactly):
+
+```json
+{
+  "subscriptions": ["codex"],
+  "assignmentStrategy": "one-model",
+  "models": {
+    "development": { "harness": "codex", "session": "acp", "model": "gpt-5.6-sol", "efforts": ["low", "medium", "high", "xhigh", "max", "ultra"] },
+    "review": { "harness": "codex", "session": "acp", "model": "gpt-5.6-sol", "efforts": ["low", "medium", "high", "xhigh", "max", "ultra"] },
+    "coordination": { "harness": "codex", "session": "acp", "model": "gpt-5.6-sol", "efforts": ["low", "medium", "high", "xhigh", "max", "ultra"] }
+  },
+  "reasoning": "balanced"
+}
+```
+
+Run `ours-fleet init --settings settings.json -c /path/custom.yaml`. Unreadable,
+malformed, incomplete, extra, or unsupported values fail before host setup and publication;
+Fleet never falls back to questions. After the final Yes or validated settings, host integration runs before locked
 publication; a hard kill, power loss, or host crash can therefore leave host integration
 or private stage/recovery evidence to inspect.
 Existing targets and their tree must be owner-private regular files/directories on the
@@ -1610,3 +1646,35 @@ any interpreter symlink path. Declare these installation-specific paths in
 `isolation.fs.read`; do not expose an entire operator home. The tested policy
 allowed a project write and refused a write to an outside read-only directory.
 The `broker` network mode retains host networking; it is not network isolation.
+
+## Container-daemon recovery checks
+
+After building Fleet with the selected SDK and CLI artifacts installed, run
+`npm run test:v1-recovery` in an isolated Docker container with external networking
+disabled. The existing test covers retry and terminal failure cases using a
+temporary daemon and no authenticated AI harness. By default both daemon and
+token-update commands use `node_modules/@ours.network/cli/dist/cli.js`;
+`FLEET_DAEMON_CLI` and `FLEET_TOKEN_CLI` can select explicitly prepared CLI entries.
+These package checks do not replace native Fleet/harness or platform acceptance.
+
+### Build with selected SDK and CLI archives
+
+Run in the build container with Node 22+, npm and tar available:
+
+```sh
+node scripts/build-selected.mjs --sdk /artifacts/ours.network-sdk-3.7.2.tgz --cli /artifacts/ours.network-cli-2.7.2.tgz --out-dir /artifacts/consumer
+```
+
+The recipe validates package names, installs and builds in disposable staging,
+then writes one complete portable npm archive. Stdout is a JSON object with its
+actual `filename`; build/npm logs go to stderr. Normal source manifests, locks
+and installed dependencies are preserved. The installer must install the same
+selected SDK and CLI archives alongside this package; its final dependency
+versions come from those archives. Existing bundling choices are unchanged.
+
+Focused build/install verification (two real builds, including changed bytes
+under identical input names and versions, plus a missing-vendor negative check):
+
+```sh
+node scripts/check-build-selected.mjs --sdk /artifacts/ours.network-sdk-3.7.2.tgz --cli /artifacts/ours.network-cli-2.7.2.tgz
+```

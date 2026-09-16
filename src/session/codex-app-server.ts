@@ -66,7 +66,7 @@ export interface CodexAppServerSessionOptions {
 interface PendingPermission {
   requestId: RequestId;
   method: 'item/commandExecution/requestApproval' | 'item/fileChange/requestApproval'
-    | 'item/permissions/requestApproval';
+    | 'item/permissions/requestApproval' | 'mcpServer/elicitation/request';
   toolCallId: string;
   options: Array<{ optionId: string; name: string; kind: string }>;
   requestedPermissions?: JsonObject;
@@ -950,6 +950,21 @@ export class CodexAppServerSession implements AgentSession {
       this.transport.respond(id, { currentTimeAt: Math.floor(Date.now() / 1_000) });
       return;
     }
+    if (method === 'mcpServer/elicitation/request') {
+      const schema = params.requestedSchema;
+      // The permission UI can answer a confirmation, but cannot collect form
+      // fields or perform URL-based verification on the user's behalf.
+      if (params.mode !== 'form' || !isObject(schema) || schema.type !== 'object'
+          || !isObject(schema.properties) || Object.keys(schema.properties).length
+          || (schema.required !== undefined
+            && (!Array.isArray(schema.required) || schema.required.length))) {
+        this.options.log(`[${this.options.name}] codex app-server: unsupported MCP elicitation form`);
+        this.transport.respond(id, { action: 'decline', content: null, _meta: null });
+        return;
+      }
+      this.requestPermission(method, id, params);
+      return;
+    }
     if (method === 'item/tool/requestUserInput') {
       this.options.log(`[${this.options.name}] codex app-server: requestUserInput has no interactive Fleet mapping; returning no answers`);
       this.transport.respond(id, { answers: {} });
@@ -970,7 +985,9 @@ export class CodexAppServerSession implements AgentSession {
       { optionId: 'allow_session', name: 'Allow for session', kind: 'allow_always', native: 'acceptForSession' },
       { optionId: 'deny_once', name: 'Deny', kind: 'reject_once', native: 'decline' },
       { optionId: 'cancel', name: 'Cancel', kind: 'reject_once', native: 'cancel' },
-    ].filter(option => method === 'item/fileChange/requestApproval'
+    ].filter(option => method === 'mcpServer/elicitation/request'
+      ? option.optionId !== 'allow_session'
+      : method === 'item/fileChange/requestApproval'
       || method === 'item/permissions/requestApproval'
       || !available.length || available.includes(option.native))
       .map(({ native: _native, ...option }) => option);
@@ -984,7 +1001,8 @@ export class CodexAppServerSession implements AgentSession {
     // `approval=allow` covers native operations inside the declared boundary;
     // it must never silently widen filesystem or network authority.
     if (this.options.permissions.approval === 'allow'
-        && method !== 'item/permissions/requestApproval') {
+        && method !== 'item/permissions/requestApproval'
+        && method !== 'mcpServer/elicitation/request') {
       this.transport.respond(requestId, this.permissionResponse(pending, 'accept'));
       this.resolvePermission(permissionId, pending, 'allowed', 'automatic', 'allow_once',
         'permissions.approval=allow', 'the native request is inside the configured Codex boundary');
@@ -1004,7 +1022,9 @@ export class CodexAppServerSession implements AgentSession {
     this.readiness = 'awaiting_permission';
     const timeoutMs = this.options.permissionTimeoutMs ?? PERMISSION_TIMEOUT_MS;
     const expiresAt = new Date(Date.now() + timeoutMs).toISOString();
-    const title = string(params.command) ?? string(params.reason)
+    const title = (method === 'mcpServer/elicitation/request'
+      ? `${string(params.serverName) ?? 'MCP'}: ${string(params.message) ?? 'Confirmation requested'}`
+      : undefined) ?? string(params.command) ?? string(params.reason)
       ?? (method === 'item/fileChange/requestApproval' ? 'Apply file changes'
         : method === 'item/permissions/requestApproval' ? 'Grant additional permissions'
           : 'Run command');
@@ -1083,6 +1103,11 @@ export class CodexAppServerSession implements AgentSession {
   private permissionResponse(
     pending: PendingPermission, decision: 'accept' | 'acceptForSession' | 'decline' | 'cancel',
   ): JsonObject {
+    if (pending.method === 'mcpServer/elicitation/request') return {
+      action: decision === 'acceptForSession' ? 'accept' : decision,
+      content: decision.startsWith('accept') ? {} : null,
+      _meta: null,
+    };
     if (pending.method !== 'item/permissions/requestApproval') return { decision };
     const requested = pending.requestedPermissions ?? {};
     const permissions: JsonObject = {};

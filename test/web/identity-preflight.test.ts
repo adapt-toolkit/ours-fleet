@@ -1,14 +1,42 @@
 import { describe, expect, it, vi } from 'vitest';
+import { mkdtempSync, writeFileSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import {
   daemonIdentityInventoryProvisioner, daemonIdentityProvisioner, ensureIdentity,
 } from '../../src/creation.js';
 
 describe('current daemon identity preflight', () => {
+  it('uses the selected network profile for both inventory and permanent creation', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'fleet-identity-profile-'));
+    const configPath = join(root, 'profile.json');
+    const profile = {endpoint:'http://127.0.0.1:39050', expectedInstanceId:'11111111-1111-4111-8111-111111111111', credentialPath:join(root, 'credential')};
+    writeFileSync(configPath, JSON.stringify(profile), {mode:0o600});
+    const releaseLease = vi.fn(async () => []);
+    const attach = vi.fn(async () => ({
+      identities: async () => [{name:'Human'}],
+      listIdentities: async () => [{name:'Human', cid:'b'.repeat(64), kind:'root' as const, temp:null, session:null}],
+      createIdentity: vi.fn(async () => ({info:{cid:'a'.repeat(64)}})),
+      releaseLease,
+    }));
+    try {
+      const provider = daemonIdentityProvisioner({OURS_CONFIG:configPath}, attach);
+      expect(await provider.exists('Human')).toBe(true);
+      await provider.create!('Worker', {});
+      expect(attach).toHaveBeenCalledTimes(2);
+      for (const [options] of attach.mock.calls) {
+        expect(options).toMatchObject({...profile, sessionMode:'external', env:{}});
+        expect(options).not.toHaveProperty('clientPid');
+      }
+      expect(releaseLease).toHaveBeenCalledOnce();
+    } finally { rmSync(root, {recursive:true, force:true}); }
+  });
+
   it('uses the SDK inventory and exposes deterministic permanent creation', async () => {
     const identities = vi.fn(async () => [{ name: 'Existing' }]);
     const attach = vi.fn(async () => ({ identities }));
     const provider = daemonIdentityProvisioner(
-      { OURS_CONFIG: '/operator/ours.json' }, attach,
+      { OURS_STATE_DIR: '/operator/state' }, attach,
     );
     expect(await provider.exists('Existing')).toBe(true);
     expect(await provider.exists('Missing')).toBe(false);
@@ -16,7 +44,7 @@ describe('current daemon identity preflight', () => {
     expect(provider.remove).toBeUndefined();
     expect(identities).toHaveBeenCalledTimes(2);
     expect(attach.mock.calls[0][0]).toMatchObject({
-      env: { OURS_CONFIG: '/operator/ours.json' }, clientPid: process.pid,
+      env: { OURS_STATE_DIR: '/operator/state' }, clientPid: process.pid,
     });
   });
 

@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from 'vitest';
-import { mkdtempSync, readFileSync, rmSync, statSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -146,6 +146,46 @@ const deps = (text: string, paths: string[] = []) => ({
 });
 
 describe('daemon generation observation', () => {
+  it('probes the daemon selected by the explicit client profile without local state reads', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'ours-fleet-generation-profile-'));
+    try {
+      const profilePath = join(dir, 'client.json');
+      const credentialPath = join(dir, 'daemon-token');
+      const expectedInstanceId = '768ebdc7-4f69-4d8f-b174-0285d070f9fa';
+      writeFileSync(profilePath, JSON.stringify({
+        endpoint: 'http://127.0.0.1:43121', expectedInstanceId, credentialPath,
+      }), { mode: 0o600 });
+      const attached: Array<Record<string, unknown>> = [];
+      const result = await probeDaemonGeneration(
+        async () => { throw new Error('legacy/default probe must not run'); },
+        { OURS_CONFIG: profilePath },
+        {
+          readText: () => { throw new Error('daemon state must not be read'); },
+          attachClient: async options => {
+            attached.push(options);
+            return {
+              version: async () => ({
+                name: 'ours', version: '3.7.2', compat: 1, protocol: 1,
+                pid: 57, stateDir: '/opaque/daemon-state',
+                startup: JSON.parse(progress({ pid: 57, bootId: 'selected-boot' })),
+              }),
+              identities: async () => [{ name: 'Root' }],
+              close: async () => undefined,
+            };
+          },
+        },
+      );
+
+      expect(result).toEqual({ state: 'ready', generation: {
+        bootId: 'selected-boot', pid: 57, startedAt: 1_000, stateDir: '/opaque/daemon-state',
+      } });
+      expect(attached).toEqual([{
+        endpoint: 'http://127.0.0.1:43121', expectedInstanceId, credentialPath,
+        sessionMode: 'external', leaseToken: expect.any(String), env: {},
+      }]);
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+
   it('corroborates loopback info, credentialed identity readiness, and a strict boot record', async () => {
     const paths: string[] = [];
     const result = await probeDaemonGeneration(fetchInfo({

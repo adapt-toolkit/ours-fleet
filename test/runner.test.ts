@@ -313,6 +313,38 @@ describe('managed fleet child environment', () => {
 });
 
 describe('runOnce isolation', () => {
+  it('preserves resume state when a permanent session is stopped soon after startup', async () => {
+    writeCfg({ A: { harness: 'fake' } });
+    const d = agentDir('A'); mkdirSync(d, { recursive: true });
+    writeFileSync(join(d, '.booted'), 'previous run\n');
+    writeFileSync(join(d, '.session-id'), 'existing-session\n');
+    const { deps } = fakeWorld({ lifeChecks: 10, exitResult: null });
+    const result = await runOnce('A', {}, { ...deps, shouldStop: () => true });
+    expect(result.mode).toBe('resume');
+    expect(result.rotated).toBe(false);
+    expect(readFileSync(join(d, '.session-id'), 'utf8')).toBe('existing-session\n');
+    expect(existsSync(join(d, '.booted'))).toBe(true);
+  });
+
+  it('stops a permanent session and closes its owner channel when shutdown is requested', async () => {
+    writeCfg({ A: { harness: 'fake', session: 'acp',
+      owner_channel: { identity: 'A-owner', owners: ['owner-cid'] } } });
+    const d = agentDir('A'); mkdirSync(d, { recursive: true });
+    const { deps } = fakeWorld({ lifeChecks: 10 });
+    let closedAt: number | undefined;
+    const result = await runOnce('A', {}, {
+      ...deps,
+      shouldStop: () => true,
+      createOwnerChannel: () => ({
+        start: async () => {}, drain: async () => {},
+        close: async () => { closedAt = deps.now(); },
+      }),
+    });
+    expect(result.elapsedSecs).toBeLessThan(4);
+    expect(closedAt).toBeDefined();
+    expect(existsSync(join(d, '.control.sock'))).toBe(false);
+  });
+
   it('wraps the agent command under bwrap when the role declares isolation', async () => {
     writeCfg({ A: { harness: 'fake', isolation: {} } });
     const d = agentDir('A'); mkdirSync(d, { recursive: true });
@@ -1745,6 +1777,32 @@ describe('restart-loop containment', () => {
     mkdirSync(d, { recursive: true });
     return d;
   };
+
+  it.each(['SIGTERM', 'SIGINT'] as const)
+  ('finishes the current attempt without restarting after %s', async signal => {
+    const d = setup();
+    const before = process.listeners(signal);
+    let attempts = 0;
+    let shutdownObserved = false;
+    const sleeps: number[] = [];
+    await runSupervised('A', {}, {
+      shouldStop: () => attempts >= 2,
+      sleep: async ms => { sleeps.push(ms); },
+      log: () => {},
+    }, async (_name, _opts, deps) => {
+      attempts++;
+      process.emit(signal);
+      shutdownObserved = deps.shouldStop?.() ?? false;
+      return { elapsedSecs: 0, rotated: false, mode: 'resume',
+        exit: { version: 1, class: 'program-exit', code: 0, detail: 'stopped' } };
+    });
+    expect(shutdownObserved).toBe(true);
+    expect(attempts).toBe(1);
+    expect(sleeps).toEqual([]);
+    expect(readRestartLedger(d).consecutiveImmediateFailures).toBe(0);
+    expect(existsSync(join(d, RUN_MARKER_FILE))).toBe(false);
+    expect(process.listeners(signal)).toEqual(before);
+  });
 
   it('grows the delay exponentially, bounded', () => {
     expect(backoffFor(0)).toBe(0);

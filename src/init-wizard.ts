@@ -52,6 +52,13 @@ export interface InitPublishResult {
   rootExisted: boolean;
 }
 
+export interface InitExecutionDeps {
+  hostSetup(): Promise<void>;
+  publish(configuration: string, setup: GeneratedSetup): Promise<InitPublishResult>;
+  generate?(answers: InitAnswers): GeneratedSetup;
+  preflight?(configuration: string): InitPathState;
+}
+
 const WORK_KINDS: WorkKind[] = ['development', 'review', 'coordination'];
 const ROLE_WORK: Record<string, WorkKind> = {
   Developer: 'development', Critic: 'review',
@@ -96,6 +103,34 @@ export function validateCatalog(value: BrainCatalog, path = 'supported model cat
 function catalog(): BrainCatalog {
   const path = join(packagedPresetRoot(), 'brain-catalog.json');
   return validateCatalog(JSON.parse(readFileSync(path, 'utf8')) as BrainCatalog, path);
+}
+
+const hasExactKeys = (value: Record<string, unknown>, keys: string[]): boolean =>
+  Object.keys(value).sort().join('\0') === [...keys].sort().join('\0');
+
+/** Read and validate the complete public InitAnswers JSON shape without side effects. */
+export function readInitSettings(path: string): InitAnswers {
+  let value: unknown;
+  try { value = JSON.parse(readFileSync(resolve(path), 'utf8')); }
+  catch (error) { throw new Error(`cannot read valid Fleet init settings ${path}: ${(error as Error).message}`, { cause: error }); }
+  if (!value || typeof value !== 'object' || Array.isArray(value)
+    || !hasExactKeys(value as Record<string, unknown>, ['subscriptions', 'assignmentStrategy', 'models', 'reasoning']))
+    throw new Error('Fleet init settings must contain exactly subscriptions, assignmentStrategy, models, and reasoning');
+  const candidate = value as Record<string, unknown>;
+  const models = candidate.models;
+  if (!models || typeof models !== 'object' || Array.isArray(models)
+    || !hasExactKeys(models as Record<string, unknown>, WORK_KINDS))
+    throw new Error('Fleet init settings models must contain exactly development, review, and coordination');
+  for (const work of WORK_KINDS) {
+    const model = (models as Record<string, unknown>)[work];
+    if (!model || typeof model !== 'object' || Array.isArray(model)
+      || !hasExactKeys(model as Record<string, unknown>, ['harness', 'session', 'model', 'efforts']))
+      throw new Error(`Fleet init settings ${work} model must contain exactly harness, session, model, and efforts`);
+  }
+  const answers = value as InitAnswers;
+  // Generation is the single semantic/catalog validator for wizard and file input.
+  generateSetup(answers);
+  return answers;
 }
 
 const subscriptionFor = (model: CatalogModel): Subscription =>
@@ -278,15 +313,17 @@ export function generateSetup(answers: InitAnswers): GeneratedSetup {
 export async function executeInitWizard(
   prompter: InitPrompter,
   configuration: string,
-  deps: {
-    hostSetup(): Promise<void>;
-    publish(configuration: string, setup: GeneratedSetup): Promise<InitPublishResult>;
-    generate?(answers: InitAnswers): GeneratedSetup;
-    preflight?(configuration: string): InitPathState;
-  },
+  deps: InitExecutionDeps,
 ): Promise<InitPublishResult | undefined> {
   const answers = await askInitQuestions(prompter, configuration);
   if (!answers) return undefined;
+  return executeInitAnswers(answers, configuration, deps);
+}
+
+/** Execute already-collected answers through the same validation and mutation boundary. */
+export async function executeInitAnswers(
+  answers: InitAnswers, configuration: string, deps: InitExecutionDeps,
+): Promise<InitPublishResult> {
   // Resolve every catalog/preset dependency before crossing the first mutation
   // boundary. Production owns this new map; the optional seam forces failures
   // deterministically in tests.

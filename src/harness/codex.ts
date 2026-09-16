@@ -183,6 +183,10 @@ function codexAgentLaunch(role: ResolvedRole, prep: SessionPrep): AcpLaunch {
       ...(options?.search ? ['--search'] : []),
       'app-server',
     ];
+    // Fleet delivers wakes through the native session itself. The ours-codex
+    // launcher owns a remote TUI and cannot serve this stdio transport.
+    if (launcher === 'auto' && role.monitor?.mode === 'fleet')
+      return { argv: ['codex', ...flags], env: prep.env };
     // Preserve the established `auto` launcher contract without resolving PATH
     // during synchronous launch preparation. The static shell fragment passes
     // every dynamic value as an argv element and `exec`s the selected process.
