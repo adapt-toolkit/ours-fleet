@@ -1,3 +1,5 @@
+import { once } from 'node:events';
+import { spawn } from 'node:child_process';
 import { describe, it, expect, beforeAll, beforeEach, afterEach } from 'vitest';
 import {
   existsSync,
