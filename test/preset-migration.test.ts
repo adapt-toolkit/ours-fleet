@@ -9,7 +9,7 @@ import { join } from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { migrateLegacyStarterPresets, migratePackagedRoleDefaults } from '../src/preset-migration.js';
 import { splitRootFor } from '../src/config.js';
-import { bootstrapPresets } from '../src/preset-bootstrap.js';
+import { bootstrapPresets, packagedPresetRoot } from '../src/preset-bootstrap.js';
 import '../src/harness/claude-code.js';
 import '../src/harness/codex.js';
 
@@ -351,6 +351,23 @@ describe('packaged role-default adoption', () => {
     const rerun = migratePackagedRoleDefaults(config, { write: true }, { nonce: 'role-rerun' });
     expect(rerun.removals).toEqual([]); expect(rerun.replacements).toEqual([]);
     expect(rerun.additions).toEqual([]); expect(existsSync(rerun.backupPath)).toBe(false);
+  });
+
+  it('delivers the engineering starter to an existing install as pure additions', () => {
+    const config = join(dir, 'engineering-adopt.yaml'); bootstrapPresets(config); const root = splitRootFor(config);
+    const added = ['roles/Engineer.yaml', 'agent_templates/Engineer.yaml', 'room_templates/engineering.yaml'];
+    for (const relative of added) rmSync(join(root, relative));
+    const dry = migratePackagedRoleDefaults(config, {}, { nonce: 'eng-dry' });
+    for (const relative of added) expect(dry.additions).toContain(join(root, relative));
+    const result = migratePackagedRoleDefaults(config, { write: true }, { nonce: 'eng-write' });
+    for (const relative of added) {
+      expect(existsSync(join(root, relative))).toBe(true);
+      expect(readFileSync(join(root, relative), 'utf8'))
+        .toBe(readFileSync(join(packagedPresetRoot(), 'fleet', relative), 'utf8'));
+    }
+    expect(result.removals).toEqual([]);
+    const rerun = migratePackagedRoleDefaults(config, { write: true }, { nonce: 'eng-rerun' });
+    expect(rerun.additions).toEqual([]);
   });
 
   it('refuses publication when a preserved custom template would dangle after removal', () => {
