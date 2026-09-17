@@ -381,9 +381,9 @@ preserve at most one recent late occurrence. The trusted authoring file and
 private sealed role snapshot retain exact prompt text; resolved launch, task,
 room, provenance, and audit presentation surfaces show only bytes and SHA-256.
 
-Every packaged `Developer`, `Critic`, and `LocalCoordinator` Agent Template uses
+Every packaged `Developer`, `Engineer`, `Critic`, and `LocalCoordinator` Agent Template uses
 `monitor.mode: fleet` with `monitor.interrupt: after_tool`. Consequently every
-member of the standard `single`, `pair`, and `team` Room Templates resolves to
+member of the standard `single`, `pair`, `team`, and `engineering` Room Templates resolves to
 that policy. A custom Agent Template or explicit per-member override remains
 authoritative and is merged key by key without rewriting unrelated values.
 
@@ -568,8 +568,9 @@ non-owner-controlled parent fail closed before host setup and are rechecked unde
 per-setup init lock before publication.
 
 The generated task experiences are fixed consequences, not extra questions: `single`
-uses `Developer`; `pair` uses `Developer` with an independent `Critic`; and `team` uses
-task-local `LocalCoordinator`, `Developer`, and `Critic`. The persistent
+uses `Developer`; `pair` uses `Developer` with an independent `Critic`; `team` uses
+task-local `LocalCoordinator`, `Developer`, and `Critic`; and `engineering` uses the
+gate-pipeline `Engineer` with an independent `Critic`. The persistent
 `FleetCoordinator` uses the separate packaged `Coordinator` contract and coordination
 model.
 
