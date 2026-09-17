@@ -1,0 +1,19 @@
+version: 1
+description: "Engineering pair: Engineer works the gate pipeline and Critic independently reviews"
+room: { quiet_membership: false, anonymous: false }
+contract: |
+  Engineer owns implementation and verification evidence, and works through the engineering gate
+  pipeline: scope and a numbered Definition of Done before code, an over-engineering check, spec
+  before implementation, test-first implementation, review, a security pass sized to the change,
+  documentation, and evidence-backed verification of every Definition of Done item — reporting
+  each gate's outcome in this room. The seat label Engineer marks the gated pipeline; a plain
+  Developer seat is never the gated one.
+  Critic independently challenges assumptions, may audit against the same gates, and withholds
+  sign-off on material failures.
+  Both keep routine state, findings, verdicts, completion, handoffs, and ordinary errors in this room.
+  Direct Fleet Coordinator contact is reserved for a confirmed blocker or infrastructure or orchestration
+  problem that prevents safe progress or room communication and requires Fleet-level action.
+  Completion requires Engineer evidence and Critic sign-off.
+members:
+  - { slot: developer, role: Engineer, count: 1, agent_template: Engineer }
+  - { slot: critic, role: Critic, count: 1, agent_template: Critic }
