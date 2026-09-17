@@ -67,7 +67,7 @@ describe('packaged default role contract', () => {
     const role = String(files.get('roles/Engineer.yaml'));
     for (const marker of [
       /Definition of Done/, /failing test/, /over-engineering/, /security/i,
-      /walk the same gates by hand/, /gate-pipeline skill/,
+      /walk the same gates by\s+hand/, /gate-pipeline skill/,
     ]) expect(role).toMatch(marker);
     expect(role).not.toMatch(/engineer-mini|8hats/i);
     expect(files.get('agent_templates/Engineer.yaml')).toContain('role: { ref: Engineer }');
