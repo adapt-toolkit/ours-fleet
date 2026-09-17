@@ -61,7 +61,7 @@ export interface InitExecutionDeps {
 
 const WORK_KINDS: WorkKind[] = ['development', 'review', 'coordination'];
 const ROLE_WORK: Record<string, WorkKind> = {
-  Developer: 'development', Critic: 'review',
+  Developer: 'development', Engineer: 'development', Critic: 'review',
   LocalCoordinator: 'coordination', Coordinator: 'coordination', FleetCoordinator: 'coordination',
 };
 const REASONING_EFFORT: Record<ReasoningPreference, 'low' | 'medium' | 'high'> = {
@@ -240,6 +240,7 @@ export function formatSetupSummary(answers: InitAnswers, configuration: string):
     '  One-agent work: one Developer',
     '  Reviewed pair: Developer + independent Critic',
     '  Team: LocalCoordinator + Developer + Critic',
+    '  Gated engineering: Engineer (gate pipeline) + independent Critic',
     '  FleetCoordinator: coordination model',
     '',
     'After the final Yes, Fleet performs host service setup before publishing the complete configuration.',
@@ -297,7 +298,7 @@ export function generateSetup(answers: InitAnswers): GeneratedSetup {
     if (tuples.size !== 1)
       throw new Error('one-model assignment requires the same exact model for development, review, and coordination');
   }
-  for (const role of ['Coordinator', 'LocalCoordinator', 'Developer', 'Critic']) {
+  for (const role of ['Coordinator', 'LocalCoordinator', 'Developer', 'Engineer', 'Critic']) {
     files.set(`roles/${role}.yaml`, preset(`roles/${role}.yaml`));
     if (role === 'Coordinator') continue;
     files.set(`agent_templates/${role}.yaml`, [
@@ -311,7 +312,7 @@ export function generateSetup(answers: InitAnswers): GeneratedSetup {
   }
   files.set('agents/FleetCoordinator.yaml', preset('agents/FleetCoordinator.yaml')
     .replace('brain: { ref: claude-default }', 'brain: { ref: coordination }'));
-  for (const name of ['single', 'pair', 'team'])
+  for (const name of ['single', 'pair', 'team', 'engineering'])
     files.set(`room_templates/${name}.yaml`, preset(`room_templates/${name}.yaml`));
   return { files, answers };
 }
@@ -485,8 +486,8 @@ function validateStaged(stageManifest: string): void {
   const config = loadConfig(stageManifest, { yamlMode: 'strict' });
   const templates = listTemplates(config.roomTemplates ?? {});
   const names = new Set(templates.map(template => template.name));
-  if (!['pair', 'single', 'team'].every(name => names.has(name)))
-    throw new Error('generated setup did not resolve the default single, pair, and team experiences');
+  if (!['pair', 'single', 'team', 'engineering'].every(name => names.has(name)))
+    throw new Error('generated setup did not resolve the default single, pair, team, and engineering experiences');
   for (const template of templates) for (const member of template.members)
     if (!config.agentTemplates?.[member.agent_template])
       throw new Error(`generated setup cannot resolve ${template.name} member ${member.agent_template}`);
