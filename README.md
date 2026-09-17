@@ -512,7 +512,7 @@ installer/setup flows remain responsible for starting it.
 
 ### Rooms and tasks
 
-Init installs editable `single`, `pair`, and `team` definitions under
+Init installs editable `single`, `pair`, `team`, and `engineering` definitions under
 `~/fleet/room_templates/`, plus every exact-cased Agent, Role, and Brain they
 reference. Inspect them with `ours-fleet template list` and
 `ours-fleet template show team`. After configuring the authenticated owner below:
@@ -521,7 +521,18 @@ reference. Inspect them with `ours-fleet template list` and
 ours-fleet task create --title "Solo task" --template single
 ours-fleet task create --title "Reviewed change" --template pair
 ours-fleet task create --title "Phased delivery" --template team
+ours-fleet task create --title "Gated feature build" --template engineering
 ```
+
+`engineering` pairs a gate-pipeline `Engineer` with the standard `Critic`. The
+Engineer works every non-trivial task through ordered gates — scope and a numbered
+Definition of Done before code, an over-engineering check, spec before
+implementation, test-first, review, a sized security pass, docs, and evidence-backed
+DoD verification — invoking an installed gate-pipeline skill when one is present and
+walking the same gates by hand otherwise. The seat is labelled `Engineer`, so a
+gated seat is never mistaken for a plain `Developer`. To make it the default for
+development tasks, set `tasks: { default_room_template: engineering }` in
+`fleet.yaml`.
 
 The default `team` gives only its LocalCoordinator Agent Template a 15-minute
 continuity loop. Each idle-only pass uses authenticated assigned-room evidence,
