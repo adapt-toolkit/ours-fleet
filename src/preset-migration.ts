@@ -81,8 +81,11 @@ const V5_GENERATED_ROLE_DEFAULT_FINGERPRINTS: Readonly<Record<string, string>> =
 
 const CURRENT_ROLE_DEFAULTS = new Set([
   'roles/Coordinator.yaml', 'roles/LocalCoordinator.yaml', 'roles/Developer.yaml', 'roles/Critic.yaml',
+  'roles/Engineer.yaml',
   'agent_templates/LocalCoordinator.yaml', 'agent_templates/Developer.yaml', 'agent_templates/Critic.yaml',
+  'agent_templates/Engineer.yaml',
   'room_templates/single.yaml', 'room_templates/pair.yaml', 'room_templates/team.yaml',
+  'room_templates/engineering.yaml',
   'agents/FleetCoordinator.yaml',
 ]);
 
