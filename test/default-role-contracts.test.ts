@@ -6,7 +6,7 @@ import { createHash } from 'node:crypto';
 import { bootstrapPresets } from '../src/preset-bootstrap.js';
 import { loadConfig, splitRootFor } from '../src/config.js';
 import { listTemplates } from '../src/rooms-tasks/templates.js';
-import { generateSetup, type InitAnswers } from '../src/init-wizard.js';
+import { formatSetupSummary, generateSetup, type InitAnswers } from '../src/init-wizard.js';
 import { buildRoomMemberTask } from '../src/rooms-tasks/member-startup.js';
 import '../src/harness/claude-code.js';
 import '../src/harness/codex.js';
@@ -27,13 +27,14 @@ describe('packaged default role contract', () => {
       bootstrapPresets(config);
       const split = splitRootFor(config);
       expect(readdirSync(join(split, 'roles')).sort())
-        .toEqual(['Coordinator.yaml', 'Critic.yaml', 'Developer.yaml', 'LocalCoordinator.yaml']);
+        .toEqual(['Coordinator.yaml', 'Critic.yaml', 'Developer.yaml', 'Engineer.yaml', 'LocalCoordinator.yaml']);
       expect(readdirSync(join(split, 'agent_templates')).sort())
-        .toEqual(['Critic.yaml', 'Developer.yaml', 'LocalCoordinator.yaml']);
+        .toEqual(['Critic.yaml', 'Developer.yaml', 'Engineer.yaml', 'LocalCoordinator.yaml']);
       const cfg = loadConfig(config, { yamlMode: 'strict' });
       const layouts = Object.fromEntries(listTemplates(cfg.roomTemplates ?? {})
         .map(template => [template.name, template.members.map(member => member.role)]));
       expect(layouts).toEqual({
+        engineering: ['Engineer', 'Critic'],
         pair: ['Developer', 'Critic'], single: ['Developer'],
         team: ['LocalCoordinator', 'Developer', 'Critic'],
       });
@@ -52,13 +53,30 @@ describe('packaged default role contract', () => {
     const files = generateSetup(answers).files;
     expect([...files.keys()].filter(path => path.startsWith('roles/')).sort()).toEqual([
       'roles/Coordinator.yaml', 'roles/Critic.yaml', 'roles/Developer.yaml',
-      'roles/LocalCoordinator.yaml',
+      'roles/Engineer.yaml', 'roles/LocalCoordinator.yaml',
     ]);
     expect([...files.keys()].filter(path => path.startsWith('agent_templates/')).sort()).toEqual([
       'agent_templates/Critic.yaml', 'agent_templates/Developer.yaml',
-      'agent_templates/LocalCoordinator.yaml',
+      'agent_templates/Engineer.yaml', 'agent_templates/LocalCoordinator.yaml',
     ]);
     expect(files.get('agents/FleetCoordinator.yaml')).toContain('role: { ref: Coordinator }');
+  });
+
+  it('ships a vendor-neutral gate-pipeline Engineer as the gated engineering experience', () => {
+    const files = generateSetup(answers).files;
+    const role = String(files.get('roles/Engineer.yaml'));
+    for (const marker of [
+      /Definition of Done/, /failing test/, /over-engineering/, /security/i,
+      /walk the same gates by hand/, /gate-pipeline skill/,
+    ]) expect(role).toMatch(marker);
+    expect(role).not.toMatch(/engineer-mini|8hats/i);
+    expect(files.get('agent_templates/Engineer.yaml')).toContain('role: { ref: Engineer }');
+    expect(files.get('agent_templates/Engineer.yaml')).toContain('brain: { ref: development }');
+    const room = String(files.get('room_templates/engineering.yaml'));
+    expect(room).toContain('role: Engineer');
+    expect(room).toContain('agent_template: Engineer');
+    expect(room).toContain('agent_template: Critic');
+    expect(formatSetupSummary(answers, join(tmpdir(), 'fleet.yaml'))).toContain('Gated engineering');
   });
 
   it('gives every retained role a distinct public bio and enforces executor escalation boundaries', () => {
@@ -67,12 +85,12 @@ describe('packaged default role contract', () => {
       const config = join(root, 'fleet.yaml');
       bootstrapPresets(config);
       const presets = loadConfig(config, { yamlMode: 'strict' }).rolePresets!;
-      for (const name of ['Coordinator', 'LocalCoordinator', 'Developer', 'Critic']) {
+      for (const name of ['Coordinator', 'LocalCoordinator', 'Developer', 'Engineer', 'Critic']) {
         expect(presets[name].bio, name).toEqual(expect.any(String));
         expect(presets[name].persona, name).toEqual(expect.any(String));
         expect(presets[name].bio, name).not.toBe(presets[name].persona);
       }
-      for (const name of ['LocalCoordinator', 'Developer', 'Critic']) {
+      for (const name of ['LocalCoordinator', 'Developer', 'Engineer', 'Critic']) {
         const persona = String(presets[name].persona);
         expect(persona, name).toMatch(/task state, progress, checkpoints, findings, review verdicts, completion, handoffs, and ordinary\s+errors/i);
         expect(persona, name).toMatch(/only in the assigned Cowork room/i);
@@ -92,7 +110,7 @@ describe('packaged default role contract', () => {
         expect(persona, name).toMatch(/BLOCKED|resting/);
         expect(persona, name).toMatch(/(?:Leave recover,\s+block\/unblock, review\/finish, deletion, replacement, and respawn decisions to Fleet Coordinator|Only the configured Fleet Coordinator may recover, block, unblock, review, finish, delete, replace,\s+or respawn Fleet resources)/);
       }
-      for (const name of ['Developer', 'Critic']) {
+      for (const name of ['Developer', 'Engineer', 'Critic']) {
         const persona = String(presets[name].persona);
         expect(persona, name).toMatch(/follow.*instructions directly in the room/i);
         expect(persona, name).toMatch(/replies and evidence in that same room/i);
