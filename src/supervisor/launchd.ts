@@ -46,8 +46,16 @@ const STATE_RE = /^\s*state\s*=\s*(.+?)\s*$/m;
 const agentsDir = () => join(home(), 'Library', 'LaunchAgents');
 const plistPath = (name: string) => join(agentsDir(), `${labelFor(name)}.plist`);
 
+const xml = (value: string) => value
+  .replaceAll('&', '&amp;')
+  .replaceAll('<', '&lt;')
+  .replaceAll('>', '&gt;')
+  .replaceAll('"', '&quot;')
+  .replaceAll("'", '&apos;');
+
 function plist(name: string, binPath: string): string {
   const log = join(logsRoot(), `${name}.log`);
+  const config = process.env.OURS_CONFIG;
   return `<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -55,7 +63,7 @@ function plist(name: string, binPath: string): string {
   <key>Label</key><string>${labelFor(name)}</string>
   <key>ProgramArguments</key>
   <array><string>${binPath}</string><string>_run</string><string>${name}</string></array>
-  <!-- The runner owns the child-session restart loop. launchd must only
+${config ? `  <key>EnvironmentVariables</key><dict><key>OURS_CONFIG</key><string>${xml(config)}</string></dict>\n` : ''}  <!-- The runner owns the child-session restart loop. launchd must only
        recover the runner PROCESS crashing: a bare KeepAlive would resume the
        uncounted relaunch loop and restart a deliberately held-down agent. -->
   <key>KeepAlive</key><dict><key>SuccessfulExit</key><false/></dict>

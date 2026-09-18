@@ -8,9 +8,9 @@ import { join } from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { EventEmitter } from 'node:events';
 import {
-  askInitQuestions, decodeKey, executeInitWizard, formatSetupSummary, generateSetup,
+  askInitQuestions, decodeKey, executeInitAnswers, executeInitWizard, formatSetupSummary, generateSetup,
   isInteractiveTerminal, preflightInitPaths, publishSetup,
-  TerminalPrompter, updateMultiSelect, validateCatalog,
+  readInitSettings, TerminalPrompter, updateMultiSelect, validateCatalog,
   type CatalogModel, type Choice, type InitAnswers, type InitPrompter, type ReasoningPreference,
   type Subscription, type WorkKind,
 } from '../src/init-wizard.js';
@@ -77,6 +77,40 @@ function treeSnapshot(path: string): Record<string, string> {
 }
 
 describe('interactive questionnaire', () => {
+  it('reads a complete strict settings document and rejects malformed, incomplete, extra, and unsupported input', () => {
+    const path = join(root, 'settings.json');
+    writeFileSync(path, JSON.stringify(answers()));
+    expect(readInitSettings(path)).toEqual(answers());
+
+    for (const value of [
+      '{',
+      JSON.stringify({ subscriptions: ['codex'] }),
+      JSON.stringify({ ...answers(), extra: true }),
+      JSON.stringify({ ...answers(), subscriptions: ['codex', 'invented'] }),
+      JSON.stringify({ ...answers(), models: { ...answers().models,
+        review: model('codex', 'invented-model') } }),
+    ]) {
+      writeFileSync(path, value);
+      expect(() => readInitSettings(path)).toThrow();
+    }
+  });
+
+  it('validates supplied answers before host setup or publication and shares the mutation path', async () => {
+    let hostCalls = 0; let publishCalls = 0;
+    const config = join(root, 'fleet.yaml');
+    await expect(executeInitAnswers({ ...answers(), reasoning: 'invented' as ReasoningPreference }, config, {
+      async hostSetup() { hostCalls++; },
+      async publish() { publishCalls++; throw new Error('must not publish'); },
+    })).rejects.toThrow(/unsupported reasoning/);
+    expect({ hostCalls, publishCalls }).toEqual({ hostCalls: 0, publishCalls: 0 });
+
+    const result = await executeInitAnswers(answers(), config, {
+      async hostSetup() { hostCalls++; }, publish: publishSetup,
+    });
+    expect(result.configPath).toBe(config);
+    expect(hostCalls).toBe(1);
+  });
+
   it('begins with the preservation contract and names the complete seed scope', async () => {
     const config = join(root, 'custom.yaml');
     const prompt = new ScriptedPrompter([false]);

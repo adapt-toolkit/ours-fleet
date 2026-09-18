@@ -108,6 +108,25 @@ describe('launchd backend', () => {
     expect(labelFor('A')).toBe('network.ours.fleet.A');
   });
 
+  it('install persists an XML-safe prepared profile selection only when supplied', async () => {
+    const { exec } = recorder();
+    const selected = join(dir, 'profile & <private> "client".json');
+    process.env.OURS_CONFIG = selected;
+    try {
+      await makeLaunchdBackend(exec, 501).install('A', '/usr/local/bin/ours-fleet');
+      const configured = readFileSync(join(dir, 'Library/LaunchAgents/network.ours.fleet.A.plist'), 'utf8');
+      expect(configured).toContain('<key>EnvironmentVariables</key>');
+      expect(configured).toContain(`<key>OURS_CONFIG</key><string>${selected.replaceAll('&', '&amp;').replaceAll('<', '&lt;').replaceAll('>', '&gt;').replaceAll('"', '&quot;')}</string>`);
+      delete process.env.OURS_CONFIG;
+      await makeLaunchdBackend(exec, 501).install('B', '/usr/local/bin/ours-fleet');
+      const defaulted = readFileSync(join(dir, 'Library/LaunchAgents/network.ours.fleet.B.plist'), 'utf8');
+      expect(defaulted).not.toContain('OURS_CONFIG');
+      expect(defaulted).not.toContain('EnvironmentVariables');
+    } finally {
+      delete process.env.OURS_CONFIG;
+    }
+  });
+
   it('logsArgs tails the role log file', () => {
     const { cmd, args } = makeLaunchdBackend(undefined, 501).logsArgs('A', true);
     expect(cmd).toBe('tail');

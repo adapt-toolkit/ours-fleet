@@ -110,8 +110,8 @@ describe('npm pack from a checkout with no dist', () => {
     const shipped = await run('tar', ['-xzOf', packed, 'package/package.json'],
       { maxBuffer: 32 * 1024 * 1024 });
     const pkg = JSON.parse(shipped.stdout) as { dependencies: Record<string, string> };
-    expect(pkg.dependencies['@ours.network/sdk']).toBe('3.7.0');
-    expect(pkg.dependencies['@ours.network/cli']).toBe('1.0.1');
+    expect(pkg.dependencies['@ours.network/sdk']).toBe('3.8.1-nightly.3');
+    expect(pkg.dependencies['@ours.network/cli']).toBe('2.8.1-nightly.1');
   });
 
   it('leaks no environment file, tarball, or node_modules into the package', () => {

@@ -17,6 +17,7 @@ import {
   authResolutionHint, resolveEndpoint,
   type DaemonEndpoint, type FetchLike,
 } from './monitor.js';
+import { readClientProfile, type ExplicitClientProfile } from './client-profile.js';
 import { readScheduledLoops, storedLoopHealth } from './loops/state.js';
 import { controlSocketPath } from './session/control.js';
 import type { PrereqCheck, PrereqReport } from './harness/types.js';
@@ -39,7 +40,8 @@ function cgroupDelegationDetail(): string {
 }
 
 interface MonitorProfile {
-  endpoint: DaemonEndpoint;
+  endpoint?: DaemonEndpoint;
+  client?: ExplicitClientProfile;
   roles: string[];
 }
 
@@ -52,10 +54,20 @@ type AttachDoctorDaemon = (
 function resolveMonitorProfiles(roles: ResolvedRole[]): MonitorProfile[] {
   const profiles: MonitorProfile[] = [];
   for (const role of roles.filter(r => r.monitor?.mode === 'fleet')) {
-    const endpoint = resolveEndpoint({ ...process.env, ...(role.env ?? {}) });
+    const env = { ...process.env, ...(role.env ?? {}) };
+    const client = readClientProfile(env);
+    if (client) {
+      const existing = profiles.find(p => p.client?.endpoint === client.endpoint
+        && p.client.expectedInstanceId === client.expectedInstanceId
+        && p.client.credentialPath === client.credentialPath);
+      if (existing) existing.roles.push(role.name);
+      else profiles.push({ client, roles: [role.name] });
+      continue;
+    }
+    const endpoint = resolveEndpoint(env);
     const token = endpoint.headers['x-ours-api-token'];
     const existing = profiles.find(p =>
-      p.endpoint.origin === endpoint.origin
+      p.endpoint?.origin === endpoint.origin
       && p.endpoint.headers['x-ours-api-token'] === token);
     if (existing) existing.roles.push(role.name);
     else profiles.push({ endpoint, roles: [role.name] });
@@ -460,29 +472,50 @@ export async function doctor(
   // shared-mode misconfig (401) surfaces here rather than as a silent deaf monitor.
   const monitorProfiles = resolveMonitorProfiles(roles);
   for (const profile of monitorProfiles) {
-    const { endpoint } = profile;
+    const { endpoint, client: selected } = profile;
     const checkName = monitorProfiles.length === 1
       ? 'monitor: daemon API'
       : `monitor: daemon API (${profile.roles.join(', ')})`;
     let ok = false, detail: string;
     try {
-      const live = await fetchImpl(`${endpoint.origin}/state-dir`, {});
+      if (selected) {
+        const daemon = await attachOursClient({
+          endpoint: selected.endpoint,
+          expectedInstanceId: selected.expectedInstanceId,
+          credentialPath: selected.credentialPath,
+          sessionMode: 'external', leaseToken: `ours-fleet-doctor-monitor-${process.pid}`,
+          env: {},
+        });
+        try {
+          const [info, identities] = await Promise.all([
+            daemon.version(), daemon.identities(),
+          ]);
+          if (info.name !== 'ours' || !Array.isArray(identities))
+            throw new Error('selected daemon metadata is invalid');
+          ok = true;
+          detail = `reachable at ${selected.endpoint}, authorized — supervisor wake stream available`;
+        } finally { await daemon.close(); }
+        checks.push({ name: checkName, ok, detail });
+        continue;
+      }
+      const live = await fetchImpl(`${endpoint!.origin}/state-dir`, {});
       if (!live.ok) {
-        detail = `daemon on :${endpoint.port} answered /state-dir with HTTP ${live.status} — not the ours daemon?`;
+        detail = `daemon on :${endpoint!.port} answered /state-dir with HTTP ${live.status} — not the ours daemon?`;
       } else {
-        const auth = await fetchImpl(`${endpoint.origin}/identities`, { headers: endpoint.headers });
+        const auth = await fetchImpl(`${endpoint!.origin}/identities`, { headers: endpoint!.headers });
         if (auth.status === 401)
-          detail = `reachable on :${endpoint.port} but the API token was rejected (401) — ` +
-            authResolutionHint(endpoint);
+          detail = `reachable on :${endpoint!.port} but the API token was rejected (401) — ` +
+            authResolutionHint(endpoint!);
         else if (!auth.ok)
-          detail = `reachable on :${endpoint.port} but /identities returned HTTP ${auth.status}`;
+          detail = `reachable on :${endpoint!.port} but /identities returned HTTP ${auth.status}`;
         else {
           ok = true;
-          detail = `reachable on :${endpoint.port}, authorized — supervisor wake stream available`;
+          detail = `reachable on :${endpoint!.port}, authorized — supervisor wake stream available`;
         }
       }
     } catch (e) {
-      detail = `unreachable on :${endpoint.port} — monitored roles run degraded until it is up ` +
+      const target = selected?.endpoint ?? `:${endpoint!.port}`;
+      detail = `unreachable on ${target} — monitored roles run degraded until it is up ` +
         `(start it: ours daemon start) [${(e as Error)?.message ?? e}]`;
     }
     checks.push({ name: checkName, ok, detail });

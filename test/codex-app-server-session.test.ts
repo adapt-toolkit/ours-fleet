@@ -170,6 +170,41 @@ const waitFor = async (predicate: () => boolean) => {
 };
 
 describe('CodexAppServerSession', () => {
+  it.each([
+    ['allow_once', 'accept', {}],
+    ['deny_once', 'decline', null],
+    ['cancel', 'cancel', null],
+  ])('maps MCP confirmation %s to the native elicitation response', async (option, action, content) => {
+    const dir = mkdtempSync(join(tmpdir(), 'ours-codex-mcp-confirm-'));
+    let incoming: CodexAppServerTransportOptions | undefined;
+    const responses: unknown[] = [];
+    const transport: CodexAppServerTransportFactory = async options => {
+      incoming = options;
+      const server = new FakeAppServer(options);
+      server.respond = (_id, result) => { responses.push(result); };
+      return server;
+    };
+    const session = await start(dir, 'fresh', 'allow', transport);
+    try {
+      session.setControllerAttached(true);
+      incoming!.onRequest!('mcpServer/elicitation/request', 90, {
+        threadId: 'thread-native-1', turnId: null, serverName: 'ours',
+        mode: 'form', _meta: null,
+        message: 'Allow the ours MCP server to run tool "list_identities"?',
+        requestedSchema: { type: 'object', properties: {} },
+      });
+      expect(responses).toEqual([]);
+      expect(session.snapshot().readiness).toBe('awaiting_permission');
+      const permissionId = session.snapshot().pendingPermissionId!;
+      expect(session.respondPermission(permissionId, 'allow_session')).toBe(false);
+      expect(session.respondPermission(permissionId, option as string)).toBe(true);
+      expect(responses).toEqual([{ action, content, _meta: null }]);
+    } finally {
+      await session.close();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it('runs a native turn, preserves final phase, and persists its thread id', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'ours-codex-native-'));
     try {

@@ -596,7 +596,9 @@ export class OwnerChannel implements OwnerChannelHandle {
         this.drainTask?.catch(error => this.logError('stale drain shutdown failed', error)),
       ]), deadlineAt);
       if (superseded()) throw new Error('owner recovery epoch superseded');
-      await this.recoveryStage('close', this.client.close(), deadlineAt);
+      // A daemon reconnect is not terminal ownership evidence. Keep the same
+      // owner ID and its temporary/permanent bindings while replacing transport.
+      await this.recoveryStage('close', this.client.close({ releaseLease: false }), deadlineAt);
       if (superseded()) throw new Error('owner recovery epoch superseded');
       try {
         await this.recoveryStage('start', this.client.start(), deadlineAt);
@@ -621,7 +623,7 @@ export class OwnerChannel implements OwnerChannelHandle {
         // its disposal; the recorded quiescence debt gates the next retry.
         if (!this.recoveryQuiescence) {
           try {
-            await this.recoveryStage('close_after_failure', this.client.close(), deadlineAt);
+            await this.recoveryStage('close_after_failure', this.client.close({ releaseLease: false }), deadlineAt);
           } catch (closeError) {
             this.logError('recovery client close failed', closeError);
           }

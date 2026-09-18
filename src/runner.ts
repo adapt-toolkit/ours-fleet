@@ -1023,9 +1023,11 @@ export async function runOnce(
           deps.log(`[${name}] daemon recovery controller failed: ${(error as Error)?.name ?? 'Error'}`));
       }
     }
-    if (temp && deps.shouldStop?.()) {
-      retirementReason = requestedTempStopReason(dir) ?? 'supervisor-signal';
-      deps.log(`[${name}] temporary supervisor retirement requested (${retirementReason})`);
+    if (deps.shouldStop?.()) {
+      if (temp) {
+        retirementReason = requestedTempStopReason(dir) ?? 'supervisor-signal';
+        deps.log(`[${name}] temporary supervisor retirement requested (${retirementReason})`);
+      }
       await sessionHandle.close();
       sessionClosed = true;
       break;
@@ -1108,7 +1110,9 @@ export async function runOnce(
     rotated = true;
     deps.log(`[${name}] ${why} -> rotated session-id; next start is FRESH`);
   };
-  if (exitRecord.detail.includes(ACP_CANCEL_DEADLINE_EXCEEDED)
+  if (!temp && deps.shouldStop?.())
+    deps.log(`[${name}] supervisor stop requested -> next start RESUMES context`);
+  else if (exitRecord.detail.includes(ACP_CANCEL_DEADLINE_EXCEEDED)
       || exitRecord.detail.includes(CODEX_APP_SERVER_CANCEL_DEADLINE_EXCEEDED))
     // This is a deliberate adapter reclamation, not evidence that resume state
     // is poisoned. Preserve the context even when the resumed generation hits
@@ -1161,7 +1165,10 @@ export async function runSupervised(
   const deps = { ...defaultDeps(), ...partialDeps };
   const dir = agentDir(name);
   mkdirSync(dir, { recursive: true });
-  const shouldStop = deps.shouldStop ?? (() => false);
+  let stopping = false;
+  const requestStop = () => { stopping = true; };
+  const shouldStop = () => stopping || (partialDeps.shouldStop?.() ?? false);
+  deps.shouldStop = shouldStop;
   const stamp = () => new Date(deps.now()).toISOString();
 
   // Record how the PREVIOUS supervisor process ended before doing anything
@@ -1185,6 +1192,9 @@ export async function runSupervised(
         + `ended abruptly: ${termination.detail}; abrupt terminations recorded: ${abrupt}`);
   }
 
+  // Service-manager stops must run the same cleanup as a completed session.
+  process.on('SIGTERM', requestStop);
+  process.on('SIGINT', requestStop);
   try {
   while (!shouldStop()) {
     let ledger = readRestartLedger(dir);
@@ -1240,6 +1250,8 @@ export async function runSupervised(
         mode: 'fresh',
       };
     }
+
+    if (stopping) break;
 
     // Re-read: the attempt itself may have taken minutes, and an operator may
     // have reset the ledger meanwhile.
@@ -1306,8 +1318,10 @@ export async function runSupervised(
   }
   return readRestartLedger(dir);
   } finally {
-    // Only an orderly return through this loop clears the marker; a signal or
-    // an OOM-kill leaves it, which is exactly how the successor detects them.
+    process.off('SIGTERM', requestStop);
+    process.off('SIGINT', requestStop);
+    // An orderly shutdown clears the marker; an unhandled signal or OOM-kill
+    // leaves it so the successor can identify an abrupt termination.
     releaseSupervisorRun(dir);
   }
 }

@@ -6,6 +6,7 @@ import {
 } from '@ours.network/sdk/client';
 import { replaceFileAtomically, withFileLock, type LockDeps } from './atomic-file.js';
 import { stateRoot } from './paths.js';
+import { readClientProfile } from './client-profile.js';
 import { buildInfo, UNKNOWN_BUILD } from './provenance.js';
 import type { ResolvedRole } from './config.js';
 
@@ -366,12 +367,17 @@ export function daemonIdentityProvisioner(
   ) => Promise<IdentityInventoryClient> = attachOursClient,
   options: DaemonIdentityProvisionerOptions = {},
 ): IdentityProvisioner {
+  const connect = (leaseToken: string) => {
+    const profile = readClientProfile(env);
+    return attachClient(profile ? {
+      endpoint: profile.endpoint, expectedInstanceId: profile.expectedInstanceId,
+      credentialPath: profile.credentialPath, sessionMode: 'external', leaseToken, env: {},
+    } : { env, leaseToken, clientPid: process.pid });
+  };
   const provisioner: IdentityProvisioner = {
     async exists(name: string) {
       try {
-        const client = await attachClient({
-          env, leaseToken: `ours-fleet-identity-preflight-${process.pid}`, clientPid: process.pid,
-        });
+        const client = await connect(`ours-fleet-identity-preflight-${process.pid}`);
         const identities = await client.identities();
         if (!Array.isArray(identities)) return 'unknown';
         const existing = identities.find(identity => identity.name === name);
@@ -389,10 +395,7 @@ export function daemonIdentityProvisioner(
   if (options.createPermanent === false) return provisioner;
 
   provisioner.create = async (name, profile) => {
-    const client = await attachClient({
-      env, leaseToken: `ours-fleet-identity-create-${process.pid}-${randomUUID()}`,
-      clientPid: process.pid,
-    });
+    const client = await connect(`ours-fleet-identity-create-${process.pid}-${randomUUID()}`);
     if (!client.listIdentities || !client.createIdentity || !client.releaseLease)
       throw new Error('the selected ours SDK client cannot create permanent identities');
 

@@ -42,6 +42,18 @@ describe('prepareSession', () => {
     }), { env: {} }).argv).toEqual(['native-shim', '--stdio']);
   });
 
+  it('uses the stdio app-server when Fleet owns monitoring, even with ours-codex installed', () => {
+    const launch = makeCodexAdapter(execWith(true)).agentSession.prepareLaunch(role({
+      session: 'codex-app-server',
+      monitor: { mode: 'fleet', enabled: true, wake_sources: [], batch_ms: 0, inject: 'notification', interrupt: false },
+      harness_options: { search: true },
+    }), { env: { OURS_BIND_IDENTITY: 'Alice Dev' } });
+    expect(launch).toEqual({
+      argv: ['codex', '--search', 'app-server'],
+      env: { OURS_BIND_IDENTITY: 'Alice Dev' },
+    });
+  });
+
   it('keeps launcher auto as a signal-safe ours-codex/codex fallback', () => {
     const launch = makeCodexAdapter(okExec).agentSession.prepareLaunch(role({
       session: 'codex-app-server', harness_options: { launcher: 'auto' },

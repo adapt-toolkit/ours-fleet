@@ -8,6 +8,7 @@ import {
   type NotifyEvent, type MonitorDeps, type FetchResponse,
 } from '../src/monitor.js';
 import type { MonitorConfig } from '../src/config.js';
+import { readClientProfile } from '../src/client-profile.js';
 
 const CFG = (over: Partial<MonitorConfig> = {}): MonitorConfig => ({
   mode: 'fleet',
@@ -62,12 +63,15 @@ function makeDeps(fetch: MonitorDeps['fetch'], over: Partial<MonitorDeps> = {}):
   };
 }
 
-// Hermetic base env: OURS_CONFIG points at a nonexistent path so no test ever
-// reads the real ~/.ours/config.json, and OURS_STATE_DIR isolates daemon-token.
-const NO_CONFIG = join(tmpdir(), 'ours-fleet-no-such-config-xyz.json');
-const hermetic = (over: NodeJS.ProcessEnv = {}): NodeJS.ProcessEnv => ({
-  OURS_CONFIG: NO_CONFIG, OURS_STATE_DIR: join(tmpdir(), 'ours-fleet-no-such-state-xyz'), ...over,
-});
+// Hermetic legacy config: an explicitly named missing config now fails closed,
+// so use a real empty legacy object while isolating daemon-token resolution.
+const hermetic = (over: NodeJS.ProcessEnv = {}): NodeJS.ProcessEnv => {
+  const configPath = join(dir, 'legacy-config.json');
+  writeFileSync(configPath, '{}', { mode: 0o600 });
+  return {
+    OURS_CONFIG: configPath, OURS_STATE_DIR: join(dir, 'legacy-state'), ...over,
+  };
+};
 
 describe('resolveEndpoint', () => {
   it('defaults to port 3050 and sends no token header when unset', () => {
@@ -85,7 +89,85 @@ describe('resolveEndpoint', () => {
   });
 });
 
+describe('explicit client profile', () => {
+  it('selects the managed default, preserves overrides and rejects broken managed selection', () => {
+    const managedDir = join(dir, '.ours-client');
+    mkdirSync(managedDir, { mode: 0o700 });
+    const path = join(managedDir, 'profile.json');
+    const tuple = { endpoint: 'http://127.0.0.1:43118', expectedInstanceId: '1b8c7fce-f39d-4a78-b72c-e0a772889988', credentialPath: join(dir, 'credential') };
+    writeFileSync(path, JSON.stringify(tuple), { mode: 0o600 });
+    expect(readClientProfile({ HOME: dir })).toEqual({ ...tuple, configPath: path });
+    const explicit = join(dir, 'explicit.json');
+    writeFileSync(explicit, '{}', { mode: 0o600 });
+    expect(readClientProfile({ HOME: dir, OURS_CONFIG: explicit })).toBeUndefined();
+    for (const invalid of ['{}', '{broken', JSON.stringify({ composeFile: '/not-a-fallback' })]) {
+      writeFileSync(path, invalid);
+      expect(() => readClientProfile({ HOME: dir })).toThrow(/client profile/);
+    }
+    writeFileSync(path, JSON.stringify(tuple));
+    chmodSync(path, 0);
+    expect(() => readClientProfile({ HOME: dir })).toThrow(/could not be read/);
+    chmodSync(path, 0o600);
+    chmodSync(managedDir, 0);
+    try { expect(() => readClientProfile({ HOME: dir })).toThrow(/could not be read/); }
+    finally { chmodSync(managedDir, 0o700); }
+    rmSync(path);
+    expect(readClientProfile({ HOME: dir })).toBeUndefined();
+  });
+
+  it('fails closed for partial, malformed, or legacy-conflicted explicit selection', () => {
+    const path = join(dir, 'client-profile.json');
+    const credentialPath = join(dir, 'daemon-token');
+    const endpoint = 'http://127.0.0.1:43118';
+    const expectedInstanceId = '1b8c7fce-f39d-4a78-b72c-e0a772889988';
+    const selected = (value: unknown) => {
+      writeFileSync(path, typeof value === 'string' ? value : JSON.stringify(value), { mode: 0o600 });
+      chmodSync(path, 0o600);
+      return () => readClientProfile({ OURS_CONFIG: path });
+    };
+
+    expect(selected({ endpoint })).toThrow(/invalid or missing expectedInstanceId/);
+    expect(() => readClientProfile({ OURS_CONFIG: join(dir, 'missing-profile.json') }))
+      .toThrow(/could not be read/);
+    expect(selected('{broken')).toThrow(/not valid JSON/);
+    expect(selected({ endpoint, expectedInstanceId: expectedInstanceId.toUpperCase(), credentialPath }))
+      .toThrow(/lowercase UUID/);
+    expect(selected({ endpoint, expectedInstanceId, credentialPath, apiToken: 'must-not-be-read' }))
+      .toThrow(/cannot combine apiToken/);
+    selected({ endpoint, expectedInstanceId, credentialPath });
+    expect(() => readClientProfile({ OURS_CONFIG: path, OURS_PORT: '43118' }))
+      .toThrow(/cannot combine OURS_PORT/);
+  });
+});
+
 describe('probeIdentityPresence', () => {
+  it('reads identity presence from the explicitly selected SDK client', async () => {
+    const profilePath = join(dir, 'client-profile.json');
+    const credentialPath = join(dir, 'daemon-token');
+    const expectedInstanceId = '80947c72-c514-46e8-94e9-c2847bf6e971';
+    writeFileSync(profilePath, JSON.stringify({
+      endpoint: 'http://127.0.0.1:43117', expectedInstanceId, credentialPath,
+    }), { mode: 0o600 });
+    const attached: Array<Record<string, unknown>> = [];
+    const result = await probeIdentityPresence(
+      'Temp', async () => { throw new Error('legacy/default probe must not run'); },
+      { OURS_CONFIG: profilePath },
+      { attachClient: async options => {
+        attached.push(options);
+        return {
+          identities: async () => [{ name: 'Temp', temporary: true, stale: false }],
+          close: async () => undefined,
+        };
+      } },
+    );
+
+    expect(result).toEqual({ state: 'present', temporary: true, stale: false });
+    expect(attached).toEqual([{
+      endpoint: 'http://127.0.0.1:43117', expectedInstanceId, credentialPath,
+      sessionMode: 'external', leaseToken: expect.any(String), env: {},
+    }]);
+  });
+
   it('distinguishes an authoritative present identity from an authoritative absence', async () => {
     const present = await probeIdentityPresence('Temp', async () => ({
       status: 200, ok: true,
@@ -403,6 +485,104 @@ describe('looksApiError / looksRunning (issue #19 turn-outcome heuristics)', () 
 });
 
 describe('Monitor.prime', () => {
+  it('retries an explicit profile after transient credential replacement auth failure', async () => {
+    const profilePath = join(dir, 'client-profile.json');
+    const credentialPath = join(dir, 'daemon-token');
+    writeFileSync(profilePath, JSON.stringify({
+      endpoint: 'http://127.0.0.1:43116',
+      expectedInstanceId: '7f970f0d-0d93-49c7-b6b5-b6cd94415187', credentialPath,
+    }), { mode: 0o600 });
+    let pageCalls = 0;
+    let attachments = 0;
+    let mon: ReturnType<typeof createMonitor>;
+    const deps = makeDeps(async () => { throw new Error('legacy/default probe must not run'); }, {
+      env: { OURS_CONFIG: profilePath },
+      attachClient: async () => {
+        attachments++;
+        return {
+          readNotificationPage: async () => {
+            if (++pageCalls === 1) throw new Error('readNotificationPage: HTTP 401');
+            mon.stop();
+            return { cursor: 19, events: [] };
+          },
+          close: async () => undefined,
+        };
+      },
+    });
+    mon = createMonitor({ name: 'A', agentDir: dir, cfg: CFG({ batch_ms: 0 }), deps });
+
+    await mon.prime();
+    await mon.run(1);
+
+    expect(pageCalls).toBe(2);
+    expect(attachments).toBe(1);
+    expect(readFileSync(join(dir, '.monitor-status'), 'utf8')).toMatch(/^armed at /);
+  });
+
+  it('keeps one file-backed SDK page client across credential replacement', async () => {
+    const profilePath = join(dir, 'client-profile.json');
+    const credentialPath = join(dir, 'daemon-token');
+    const expectedInstanceId = '1b8c7fce-f39d-4a78-b72c-e0a772889988';
+    writeFileSync(profilePath, JSON.stringify({
+      endpoint: 'http://127.0.0.1:43119', expectedInstanceId, credentialPath,
+    }), { mode: 0o600 });
+    writeFileSync(credentialPath, 'first-credential\n', { mode: 0o600 });
+
+    const attached: Array<Record<string, unknown>> = [];
+    const pages: Array<{ identity: string; since: number | 'tip'; credential: string }> = [];
+    const delivered: string[] = [];
+    let mon: ReturnType<typeof createMonitor>;
+    const deps = makeDeps(async () => {
+      mon.stop();
+      return { status: 200, ok: true, json: async () => ({ cursor: 0, events: [] }) };
+    }, {
+      env: { OURS_CONFIG: profilePath },
+      attachClient: async options => {
+        attached.push(options);
+        return {
+          readNotificationPage: async (identity, options = {}) => {
+            const credential = readFileSync(credentialPath, 'utf8').trim();
+            const since = options.since ?? 'tip';
+            pages.push({ identity, since, credential });
+            if (since === 'tip') return { cursor: 41, events: [] };
+            mon.stop();
+            return {
+              cursor: 72,
+              events: [{ event: 'message_received', from: 'Peer', msg_id: 9 }],
+            };
+          },
+          close: async () => undefined,
+        };
+      },
+      delivery: {
+        submit: async text => {
+          delivered.push(text);
+          return { succeeded: true, outcome: 'completed' };
+        },
+      },
+    });
+    mon = createMonitor({
+      name: 'Reviewer', identity: 'ProfileIdentity', agentDir: dir,
+      cfg: CFG({ batch_ms: 0 }), deps,
+    });
+
+    await mon.prime();
+    writeFileSync(credentialPath, 'rotated-credential\n', { mode: 0o600 });
+    await mon.run(1);
+
+    expect(attached).toEqual([{
+      endpoint: 'http://127.0.0.1:43119', expectedInstanceId, credentialPath,
+      sessionMode: 'external', leaseToken: expect.stringMatching(/^ours-fleet-monitor-/), env: {},
+    }]);
+    expect(pages).toEqual([
+      { identity: 'ProfileIdentity', since: 'tip', credential: 'first-credential' },
+      { identity: 'ProfileIdentity', since: 41, credential: 'rotated-credential' },
+    ]);
+    expect(delivered).toEqual([
+      '[fleet-monitor] 1 new message from Peer (#9) — run get_messages',
+    ]);
+  });
+
   it('reports its stall detector explicitly instead of mislabeling its own abort', async () => {
     let timeout: (() => void) | undefined;
     const fetch: MonitorDeps['fetch'] = async (_url, init) => new Promise((_resolve, reject) => {

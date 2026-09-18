@@ -32,7 +32,8 @@ beforeEach(() => {
   dir = mkdtempSync(join(tmpdir(), 'ours-fleet-doc-'));
   process.env.OURS_FLEET_HOME = dir;   // empty config → no harness checks unless --harness
   savedProfileEnv = Object.fromEntries(PROFILE_ENV_KEYS.map(k => [k, process.env[k]]));
-  process.env.OURS_CONFIG = join(dir, 'missing-ours-config.json');
+  process.env.OURS_CONFIG = join(dir, 'ours-config.json');
+  writeFileSync(process.env.OURS_CONFIG, '{}', { mode: 0o600 });
   process.env.OURS_STATE_DIR = join(dir, 'missing-ours-state');
   delete process.env.OURS_PORT;
   delete process.env.OURS_API_TOKEN;
@@ -418,6 +419,35 @@ describe('doctor monitor probe', () => {
     expect(calls.find(c => c.url === 'http://127.0.0.1:4202/identities')?.token).toBe('other');
     expect(rep.checks.some(c => c.name === 'monitor: daemon API (A, B)')).toBe(true);
     expect(rep.checks.some(c => c.name === 'monitor: daemon API (C)')).toBe(true);
+  });
+
+  it('probes selected profiles with different credential paths separately', async () => {
+    delete process.env.OURS_STATE_DIR;
+    const expectedInstanceId = '00000000-0000-4000-8000-000000000001';
+    const profileA = join(dir, 'ours-a.json');
+    const profileB = join(dir, 'ours-b.json');
+    writeFileSync(profileA, JSON.stringify({
+      endpoint: 'http://127.0.0.1:1', expectedInstanceId,
+      credentialPath: join(dir, 'credential-a'),
+    }), { mode: 0o600 });
+    writeFileSync(profileB, JSON.stringify({
+      endpoint: 'http://127.0.0.1:1', expectedInstanceId,
+      credentialPath: join(dir, 'credential-b'),
+    }), { mode: 0o600 });
+    registerAdapter(fakeAdapter);
+    writeV2Fixture(join(dir, 'fleet.yaml'), {
+      roles: {
+        A: { harness: 'fake', env: { OURS_CONFIG: profileA } },
+        B: { harness: 'fake', env: { OURS_CONFIG: profileB } },
+      },
+    });
+
+    const rep = await doctor({}, green(), 'linux', stubFetch('ok'));
+    const monitorChecks = rep.checks.filter(c => c.name.startsWith('monitor: daemon API'));
+    expect(monitorChecks.map(c => c.name)).toEqual([
+      'monitor: daemon API (A)',
+      'monitor: daemon API (B)',
+    ]);
   });
 
   it('uses the selected config path in its 401 hint without exposing the token', async () => {

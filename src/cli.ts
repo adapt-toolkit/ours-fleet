@@ -10,7 +10,8 @@ import { VERSION } from './version.js';
 import { INIT_COMPLETION_GUIDANCE } from './init-guidance.js';
 import { migrateLegacyStarterPresets, migratePackagedRoleDefaults } from './preset-migration.js';
 import {
-  executeInitWizard, isInteractiveTerminal, publishSetup, TerminalPrompter,
+  executeInitAnswers, executeInitWizard, isInteractiveTerminal, publishSetup, readInitSettings,
+  TerminalPrompter,
 } from './init-wizard.js';
 import {
   analyzeInstalls, buildInfo, buildLabel, discoverInstalls, runningLabel,
@@ -1176,24 +1177,28 @@ cOpt(program.command('doctor').description('prerequisite report'))
     if (!rep.ok) throw new FleetCliExit(1);
   });
 
-cOpt(program.command('init').description('interactively add missing Fleet defaults while preserving existing configuration'))
-  .action(async (opts: { configuration?: string }) => {
+cOpt(program.command('init').description('add missing Fleet defaults while preserving existing configuration')
+  .option('--settings <file>', 'validated InitAnswers JSON; runs without interactive questions'))
+  .action(async (opts: { configuration?: string; settings?: string }) => {
     const configuration = opts.configuration ?? defaultConfigPath();
-    if (!isInteractiveTerminal(process.stdin, process.stdout))
+    if (!opts.settings && !isInteractiveTerminal(process.stdin, process.stdout))
       die('ours-fleet init requires an interactive terminal; no host setup ran and no configuration changed');
     try {
-      const result = await executeInitWizard(
-        new TerminalPrompter(process.stdin, process.stdout), configuration, {
-          async hostSetup() {
-            for (const d of [agentsRoot(), tmpRoot(), logsRoot()]) mkdirSync(d, { recursive: true });
-            for (const message of await pickBackend().init(binPath)) console.log(message);
-          },
-          publish: publishSetup,
+      const initDeps = {
+        async hostSetup() {
+          for (const d of [agentsRoot(), tmpRoot(), logsRoot()]) mkdirSync(d, { recursive: true });
+          for (const message of await pickBackend().init(binPath)) console.log(message);
         },
-      );
+        publish: publishSetup,
+      };
+      const result = opts.settings
+        ? await executeInitAnswers(readInitSettings(opts.settings), configuration, initDeps)
+        : await executeInitWizard(
+          new TerminalPrompter(process.stdin, process.stdout), configuration, initDeps,
+        );
       if (!result) {
         console.log('Fleet setup cancelled. No host setup ran and no configuration changed.');
-        return;
+        throw new FleetCliExit(1);
       }
       const prior = result.manifestExisted && result.rootExisted ? 'manifest and split configuration'
         : result.manifestExisted ? 'manifest only'
@@ -1202,7 +1207,10 @@ cOpt(program.command('init').description('interactively add missing Fleet defaul
       console.log(`Previous targets: ${prior}.`);
       console.log(`Private recovery record: ${result.recoveryPath}`);
       console.log(INIT_COMPLETION_GUIDANCE);
-    } catch (error) { die(error); }
+    } catch (error) {
+      if (error instanceof FleetCliExit) throw error;
+      die(error);
+    }
   });
 
 cOpt(program.command('migrate-agent-templates')
