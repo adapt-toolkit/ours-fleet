@@ -1678,3 +1678,22 @@ under identical input names and versions, plus a missing-vendor negative check):
 ```sh
 node scripts/check-build-selected.mjs --sdk /artifacts/ours.network-sdk-3.7.2.tgz --cli /artifacts/ours.network-cli-2.7.2.tgz
 ```
+
+### Remote clients over HTTPS
+
+A client may select an `https://` origin backed by a TLS reverse proxy. Keep the
+daemon listener private and configure the proxy separately with a certificate
+trusted by the client and matching the hostname. Node uses its normal trust
+store; a private CA may be supplied through `NODE_EXTRA_CA_CERTS` before starting
+the client. Certificate verification must remain enabled.
+
+The existing issued client credential works over either transport; changing the
+URL scheme does not require a new credential. Keep the server's master on the
+server. Forward `x-ours-api-token` and the `x-ours-*` session headers unchanged,
+and support streamed request/response bodies and long polling. Client requests
+refuse redirects, including HTTPS-to-HTTP redirects: configure the final HTTPS
+origin directly. UUID/capability checks still precede credential-bearing calls.
+
+This adds client HTTPS support, not an HTTPS daemon listener, certificate
+provisioning or automatic reverse-proxy configuration. Existing local HTTP and
+SSH-tunnel profiles continue to work.
