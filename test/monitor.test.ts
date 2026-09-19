@@ -126,6 +126,10 @@ describe('explicit client profile', () => {
       return () => readClientProfile({ OURS_CONFIG: path });
     };
 
+    expect(selected({ endpoint: 'https://server.example:8443/', expectedInstanceId, credentialPath })()).toEqual({ endpoint: 'https://server.example:8443', expectedInstanceId, credentialPath, configPath: path });
+    for (const bad of ['ftp://server.example', 'wss://server.example', 'https://u:p@server.example', 'https://server.example/path', 'https://server.example?q=1', 'https://server.example#fragment']) {
+      expect(selected({ endpoint: bad, expectedInstanceId, credentialPath })).toThrow(/origin/);
+    }
     expect(selected({ endpoint })).toThrow(/invalid or missing expectedInstanceId/);
     expect(() => readClientProfile({ OURS_CONFIG: join(dir, 'missing-profile.json') }))
       .toThrow(/could not be read/);

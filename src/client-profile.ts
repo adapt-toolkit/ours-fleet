@@ -94,9 +94,9 @@ export function readClientProfile(env: NodeJS.ProcessEnv): ExplicitClientProfile
   let url: URL;
   try { url = new URL(endpoint); }
   catch { throw invalid(configPath, 'has an invalid endpoint'); }
-  if (url.protocol !== 'http:' || url.username || url.password || url.pathname !== '/'
+  if ((url.protocol !== 'http:' && url.protocol !== 'https:') || url.username || url.password || url.pathname !== '/'
       || url.search || url.hash)
-    throw invalid(configPath, 'endpoint must be a local HTTP origin');
+    throw invalid(configPath, 'endpoint must be an HTTP or HTTPS origin');
 
   const expectedInstanceId = (row.expectedInstanceId as string).trim();
   if (!LOWERCASE_UUID.test(expectedInstanceId))
